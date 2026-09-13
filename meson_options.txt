@@ -1,0 +1,5 @@
+option('enable_vaapi', type: 'boolean', value: true, description: 'Enable VA-API hardware video decoding')
+option('enable_io_uring', type: 'boolean', value: true, description: 'Enable Linux io_uring asynchronous event loop')
+option('enable_simd', type: 'boolean', value: true, description: 'Enable AVX-512 / AVX2 / NEON vector kernels')
+option('enable_seccomp', type: 'boolean', value: true, description: 'Enable Seccomp-BPF process sandboxing')
+option('enable_systemd', type: 'boolean', value: false, description: 'Install systemd user service unit')

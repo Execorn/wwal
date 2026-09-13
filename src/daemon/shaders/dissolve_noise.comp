@@ -1,0 +1,44 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform highp sampler2D u_src_a;
+layout(binding = 2) uniform highp sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+
+/* High-efficiency procedural noise generator */
+float hash21(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+
+float noise(vec2 uv) {
+    vec2 i = floor(uv);
+    vec2 f = fract(uv);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash21(i);
+    float b = hash21(i + vec2(1.0, 0.0));
+    float c = hash21(i + vec2(0.0, 1.0));
+    float d = hash21(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    float n = noise(uv * 16.0);
+
+    float edge = 0.05;
+    float alpha = smoothstep(n - edge, n + edge, u_progress);
+
+    vec4 a = texture(u_src_a, uv);
+    vec4 b = texture(u_src_b, uv);
+    imageStore(u_target, coord, mix(a, b, alpha));
+}

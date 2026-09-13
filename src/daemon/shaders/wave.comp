@@ -1,0 +1,35 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform highp sampler2D u_src_a;
+layout(binding = 2) uniform highp sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+uniform float u_angle;
+uniform float u_wave_freq;
+uniform float u_wave_amp;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    vec2 dir = vec2(cos(u_angle), sin(u_angle));
+    vec2 perp = vec2(-dir.y, dir.x);
+
+    float proj = dot(uv - vec2(0.5), dir) / 1.41421356 + 0.5;
+    float cross_proj = dot(uv - vec2(0.5), perp);
+    float wave = sin(cross_proj * u_wave_freq) * u_wave_amp;
+    float d = proj + wave;
+
+    float edge = 0.04;
+    float alpha = smoothstep(d - edge, d + edge, u_progress);
+
+    vec4 a = texture(u_src_a, uv);
+    vec4 b = texture(u_src_b, uv);
+    imageStore(u_target, coord, mix(a, b, alpha));
+}

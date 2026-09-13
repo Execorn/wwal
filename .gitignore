@@ -1,0 +1,39 @@
+# Build directories
+build/
+build-*/
+subprojects/
+.ninja_*
+compile_commands.json
+*.p/
+
+# Binary targets & objects
+*.o
+*.a
+*.so
+src/daemon/waywald
+src/client/waywal
+waywald
+waywal
+
+# Runtime IPC sockets
+*.sock
+
+# Generated Wayland headers and glue code
+*-protocol.c
+*-protocol.h
+*-client-protocol.h
+*-client-protocol.c
+
+# Profiling & BOLT data
+*.fdata
+perf.data*
+*.bolt
+
+# Editor & OS artifacts
+.cache/
+.vscode/
+.idea/
+.VSCodeCounter/
+*.swp
+*~
+.DS_Store
