@@ -1,24 +1,23 @@
 #ifndef WAYWAL_WAYLAND_CORE_H
 #define WAYWAL_WAYLAND_CORE_H
 
-#include <wayland-client.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <stddef.h>
-
-#include "waywal/types.h"
-#include "waywal/arena.h"
-#include "waywal/ipc_proto.h"
-#include "waywal/dmabuf.h"
-#include "waywal/render_engine.h"
-#include "waywal/video_engine.h"
-#include "waywal/presentation.h"
-#include "waywal/uring_loop.h"
-
-#include "wlr-layer-shell-unstable-v1-client-protocol.h"
-#include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
+#include "viewporter-client-protocol.h"
+#include "waywal/arena.h"
+#include "waywal/dmabuf.h"
+#include "waywal/ipc_proto.h"
+#include "waywal/presentation.h"
+#include "waywal/render_engine.h"
+#include "waywal/types.h"
+#include "waywal/uring_loop.h"
+#include "waywal/video_engine.h"
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <wayland-client.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -80,18 +79,17 @@ void daemon_wayland_destroy(daemon_state_t *state);
 bool transition_engine_init(daemon_state_t *state);
 void transition_engine_destroy(daemon_state_t *state);
 void transition_engine_dispatch_tick(daemon_state_t *state);
-bool daemon_start_image_transition(daemon_state_t *state,
-                                   const uint8_t *pixels, uint32_t img_w, uint32_t img_h,
-                                   const waywal_img_metadata_t *meta);
+bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels, uint32_t img_w,
+                                   uint32_t img_h, const waywal_img_metadata_t *meta);
 
 void output_node_create_surface(daemon_state_t *state, output_node_t *node);
 void output_node_destroy_surface(output_node_t *node);
 void output_node_render_color(daemon_state_t *state, output_node_t *node, color_rgba_t color);
-void output_node_render_image(daemon_state_t *state, output_node_t *node,
-                              const uint8_t *pixels, uint32_t img_w, uint32_t img_h);
+void output_node_render_image(daemon_state_t *state, output_node_t *node, const uint8_t *pixels,
+                              uint32_t img_w, uint32_t img_h);
 void output_node_render_image_with_transition(daemon_state_t *state, output_node_t *node,
-                                             const uint8_t *pixels, uint32_t img_w, uint32_t img_h,
-                                             const waywal_img_metadata_t *meta);
+                                              const uint8_t *pixels, uint32_t img_w, uint32_t img_h,
+                                              const waywal_img_metadata_t *meta);
 
 void daemon_clear_all_outputs(daemon_state_t *state, color_rgba_t color);
 void daemon_handle_ipc_connection(daemon_state_t *state);

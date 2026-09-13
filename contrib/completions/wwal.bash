@@ -6,7 +6,7 @@ _wwal_completion() {
 
     local commands="ping query clear img video pause unpause toggle kill help"
     local global_opts="-n --namespace -v --verbose -h --help"
-    local trans_types="none simple fade wipe grow outer wave noise"
+    local trans_types="none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl"
 
     # Find the subcommand if one was already given
     local cmd=""

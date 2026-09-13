@@ -1,0 +1,52 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform sampler2D u_src_a;
+layout(binding = 2) uniform sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+uniform vec2 u_center;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(u_resolution);
+    vec2 center = (u_center.x > 0.0 || u_center.y > 0.0) ? u_center : vec2(0.5, 0.5);
+
+    float aspect = float(u_resolution.x) / float(u_resolution.y);
+    vec2 d = uv - center;
+    d.x *= aspect;
+
+    float r = length(d);
+    float max_r = 0.85;
+
+    // Swirl angle peaks at progress midpoint
+    float angle_amt = sin(u_progress * 3.1415926535) * 8.0;
+
+    vec2 uv_distorted = uv;
+    if (r < max_r) {
+        float factor = (1.0 - r / max_r);
+        float theta = factor * factor * angle_amt;
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        vec2 rotated = vec2(d.x * cos_t - d.y * sin_t, d.x * sin_t + d.y * cos_t);
+        rotated.x /= aspect;
+        uv_distorted = center + rotated;
+    }
+
+    vec4 c1 = texture(u_src_a, uv_distorted);
+    vec4 c2 = texture(u_src_b, uv_distorted);
+
+    vec4 col = mix(c1, c2, u_progress);
+
+    // Format alignment for DRM_FORMAT_ARGB8888 little-endian
+    imageStore(u_target, coord, col.bgra);
+}

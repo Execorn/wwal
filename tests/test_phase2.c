@@ -1,27 +1,30 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <assert.h>
-#include <unistd.h>
-#include <sys/mman.h>
-
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
 
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
 #if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
-__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void) {
+__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+{
     return "leak:<unknown module>\nleak:gbm_create_device\nleak:libgbm\n";
 }
 #endif
 
-static void test_dmabuf_context_and_bo(void) {
+static void test_dmabuf_context_and_bo(void)
+{
     printf("[TEST] Running test_dmabuf_context_and_bo...\n");
 
     dmabuf_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     bool ok = dmabuf_context_init(&ctx);
     if (!ok) {
-        printf("[TEST] DRM node or GBM not available in this environment. Skipping hardware scanout test.\n");
+        printf("[TEST] DRM node or GBM not available in this environment. Skipping hardware "
+               "scanout test.\n");
         return;
     }
 
@@ -34,8 +37,8 @@ static void test_dmabuf_context_and_bo(void) {
     uint32_t height = 1080;
     uint32_t format = DRM_FORMAT_ARGB8888;
 
-    struct gbm_bo *bo = gbm_bo_create(ctx.gbm, width, height, format,
-                                      GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    struct gbm_bo *bo =
+        gbm_bo_create(ctx.gbm, width, height, format, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
     if (!bo) {
         /* Fallback for drivers that don't support simultaneous scanout + render */
         bo = gbm_bo_create(ctx.gbm, width, height, format, GBM_BO_USE_SCANOUT);
@@ -51,8 +54,8 @@ static void test_dmabuf_context_and_bo(void) {
     assert(stride >= width * 4);
 
     uint64_t mod = gbm_bo_get_modifier(bo);
-    printf("  Allocated GBM BO: %ux%u (stride: %u, modifier: 0x%016lx)\n",
-           bo_width, bo_height, stride, (unsigned long)mod);
+    printf("  Allocated GBM BO: %ux%u (stride: %u, modifier: 0x%016lx)\n", bo_width, bo_height,
+           stride, (unsigned long)mod);
 
     int dma_fd = gbm_bo_get_fd(bo);
     assert(dma_fd >= 0 && "Must be able to export DMA-BUF file descriptor from BO");
@@ -91,7 +94,8 @@ static void test_dmabuf_context_and_bo(void) {
     printf("[TEST] test_dmabuf_context_and_bo PASSED.\n");
 }
 
-int main(void) {
+int main(void)
+{
     waywal_log_set_level(WAYWAL_LOG_LEVEL_WARN);
     printf("=========================================\n");
     printf("  Executing WayWal Phase 2 Test Suite\n");

@@ -1,9 +1,9 @@
 #ifndef WAYWAL_ARENA_H
 #define WAYWAL_ARENA_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,14 +11,14 @@ extern "C" {
 
 typedef struct {
     uint8_t *buffer;
-    size_t   capacity;
-    size_t   offset;
-    size_t   committed;
+    size_t capacity;
+    size_t offset;
+    size_t committed;
 } arena_t;
 
 typedef struct {
     arena_t *arena;
-    size_t   offset;
+    size_t offset;
 } arena_temp_t;
 
 #define WAYWAL_PERSISTENT_ARENA_CAPACITY (16 * 1024 * 1024)

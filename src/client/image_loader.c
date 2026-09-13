@@ -1,20 +1,20 @@
 #include "image_loader.h"
+
 #include "waywal/log.h"
 
+#include <png.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include <png.h>
 #include <turbojpeg.h>
 
-void image_free(uint8_t *pixels) {
-    free(pixels);
-}
+void image_free(uint8_t *pixels) { free(pixels); }
 
-static bool load_png(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h) {
+static bool load_png(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
     png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (!png) return false;
+    if (!png)
+        return false;
 
     png_infop info = png_create_info_struct(png);
     if (!info) {
@@ -36,6 +36,10 @@ static bool load_png(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     int color_type = 0;
 
     png_get_IHDR(png, info, &width, &height, &bit_depth, &color_type, NULL, NULL, NULL);
+    if (width == 0 || height == 0 || width > 16384 || height > 16384) {
+        png_destroy_read_struct(&png, &info, NULL);
+        return false;
+    }
 
     if (bit_depth == 16) {
         png_set_strip_16(png);
@@ -49,20 +53,23 @@ static bool load_png(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     if (png_get_valid(png, info, PNG_INFO_tRNS)) {
         png_set_tRNS_to_alpha(png);
     }
-    if (color_type == PNG_COLOR_TYPE_RGB ||
-        color_type == PNG_COLOR_TYPE_GRAY ||
+    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
+        png_set_gray_to_rgb(png);
+    }
+    if (color_type == PNG_COLOR_TYPE_RGB || color_type == PNG_COLOR_TYPE_GRAY ||
         color_type == PNG_COLOR_TYPE_PALETTE) {
         png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
     }
     png_set_bgr(png); /* Normalize to DRM_FORMAT_ARGB8888 little-endian byte order [B, G, R, A] */
-    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
-        png_set_gray_to_rgb(png);
-    }
 
     png_read_update_info(png, info);
 
     size_t rowbytes = png_get_rowbytes(png, info);
     size_t total_bytes = rowbytes * height;
+    if (total_bytes == 0 || total_bytes > (size_t)16384 * 16384 * 4) {
+        png_destroy_read_struct(&png, &info, NULL);
+        return false;
+    }
     uint8_t *pixels = (uint8_t *)malloc(total_bytes);
     if (!pixels) {
         png_destroy_read_struct(&png, &info, NULL);
@@ -92,14 +99,17 @@ static bool load_png(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     return true;
 }
 
-static bool load_jpeg(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h) {
+static bool load_jpeg(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
-    if (fsize <= 0) return false;
+    if (fsize <= 0)
+        return false;
     fseek(fp, 0, SEEK_SET);
 
     uint8_t *jpeg_buf = (uint8_t *)malloc((size_t)fsize);
-    if (!jpeg_buf) return false;
+    if (!jpeg_buf)
+        return false;
 
     if (fread(jpeg_buf, 1, (size_t)fsize, fp) != (size_t)fsize) {
         free(jpeg_buf);
@@ -113,7 +123,9 @@ static bool load_jpeg(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t 
     }
 
     int width = 0, height = 0, jpeg_subsamp = 0, jpeg_colorspace = 0;
-    if (tjDecompressHeader3(tj, jpeg_buf, (unsigned long)fsize, &width, &height, &jpeg_subsamp, &jpeg_colorspace) != 0) {
+    if (tjDecompressHeader3(tj, jpeg_buf, (unsigned long)fsize, &width, &height, &jpeg_subsamp,
+                            &jpeg_colorspace) != 0 ||
+        width <= 0 || height <= 0 || width > 16384 || height > 16384) {
         tjDestroy(tj);
         free(jpeg_buf);
         return false;
@@ -128,7 +140,8 @@ static bool load_jpeg(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t 
     }
 
     /* TJPF_BGRA produces byte order [B, G, R, A] matching little-endian DRM_FORMAT_ARGB8888 */
-    if (tjDecompress2(tj, jpeg_buf, (unsigned long)fsize, pixels, width, 0, height, TJPF_BGRA, 0) != 0) {
+    if (tjDecompress2(tj, jpeg_buf, (unsigned long)fsize, pixels, width, 0, height, TJPF_BGRA, 0) !=
+        0) {
         free(pixels);
         tjDestroy(tj);
         free(jpeg_buf);
@@ -144,18 +157,22 @@ static bool load_jpeg(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t 
     return true;
 }
 
-static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h) {
+static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
     uint8_t header[54];
-    if (fread(header, 1, 54, fp) != 54) return false;
-    if (header[0] != 'B' || header[1] != 'M') return false;
+    if (fread(header, 1, 54, fp) != 54)
+        return false;
+    if (header[0] != 'B' || header[1] != 'M')
+        return false;
 
     uint32_t data_offset = *(uint32_t *)&header[10];
-    int32_t width        = *(int32_t *)&header[18];
-    int32_t height       = *(int32_t *)&header[22];
-    uint16_t bpp         = *(uint16_t *)&header[28];
+    int32_t width = *(int32_t *)&header[18];
+    int32_t height = *(int32_t *)&header[22];
+    uint16_t bpp = *(uint16_t *)&header[28];
     uint32_t compression = *(uint32_t *)&header[30];
 
-    if (width <= 0 || height == 0 || (bpp != 24 && bpp != 32) || compression != 0) {
+    if (width <= 0 || height == 0 || width > 16384 || height > 16384 || height < -16384 ||
+        (bpp != 24 && bpp != 32) || compression != 0) {
         return false;
     }
 
@@ -165,7 +182,8 @@ static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
 
     size_t row_stride = ((size_t)abs_w * (bpp / 8) + 3) & ~3;
     uint8_t *row_buf = (uint8_t *)malloc(row_stride);
-    if (!row_buf) return false;
+    if (!row_buf)
+        return false;
 
     uint8_t *pixels = (uint8_t *)malloc((size_t)abs_w * abs_h * 4);
     if (!pixels) {
@@ -206,8 +224,10 @@ static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     return true;
 }
 
-bool image_load(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h) {
-    if (!filepath || !out_pixels || !out_w || !out_h) return false;
+bool image_load(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
+    if (!filepath || !out_pixels || !out_w || !out_h)
+        return false;
 
     FILE *fp = fopen(filepath, "rb");
     if (!fp) {

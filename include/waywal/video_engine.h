@@ -1,10 +1,11 @@
 #ifndef WAYWAL_VIDEO_ENGINE_H
 #define WAYWAL_VIDEO_ENGINE_H
 
-#include <stdbool.h>
-#include <stdint.h>
 #include "waywal/demuxer.h"
 #include "waywal/vaapi_dec.h"
+
+#include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,19 +22,19 @@ struct output_node;
 
 typedef struct {
     waywal_video_state_t state;
-    demuxer_t           *demuxer;
-    vaapi_decoder_t      decoder;
-    int                  timer_fd;       /* timerfd for frame pacing */
-    int64_t              start_time_us;
-    int64_t              last_pts_us;
-    uint64_t             loop_count;     /* 0 = infinite loop */
-    uint64_t             current_loop;
-    float                playback_speed; /* default 1.0f */
+    demuxer_t *demuxer;
+    vaapi_decoder_t decoder;
+    int timer_fd; /* timerfd for frame pacing */
+    int64_t start_time_us;
+    int64_t last_pts_us;
+    uint64_t loop_count; /* 0 = infinite loop */
+    uint64_t current_loop;
+    float playback_speed; /* default 1.0f */
 
-    struct output_node  *target_output;  /* NULL = all outputs */
+    struct output_node *target_output; /* NULL = all outputs */
     struct daemon_state *daemon_state;
 
-    bool                 seamless_looping;
+    bool seamless_looping;
 } video_engine_t;
 
 bool video_engine_init(video_engine_t *ve, struct daemon_state *state);

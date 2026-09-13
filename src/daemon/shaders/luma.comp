@@ -1,0 +1,74 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform sampler2D u_src_a;
+layout(binding = 2) uniform sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+
+vec2 hash2(vec2 p) {
+    p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+    return -1.0 + 2.0 * fract(sin(p) * 43758.5453123);
+}
+
+float noise2(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(dot(hash2(i + vec2(0.0, 0.0)), f - vec2(0.0, 0.0)),
+                   dot(hash2(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0)), u.x),
+               mix(dot(hash2(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0)),
+                   dot(hash2(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0)), u.x), u.y);
+}
+
+float fbm(vec2 p) {
+    float v = 0.0;
+    float a = 0.5;
+    mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
+    for (int i = 0; i < 4; i++) {
+        v += a * noise2(p);
+        p = rot * p * 2.0 + vec2(100.0);
+        a *= 0.5;
+    }
+    return v * 0.5 + 0.5;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(u_resolution);
+    float aspect = float(u_resolution.x) / float(u_resolution.y);
+
+    // Multi-octave organic luma/fluid pattern
+    float n = fbm(vec2(uv.x * aspect, uv.y) * 4.0);
+
+    // Threshold spans from -0.1 to 1.1 across progress
+    float threshold = u_progress * 1.2 - 0.1;
+    float softness = 0.08;
+
+    float alpha = smoothstep(threshold - softness, threshold + softness, n);
+
+    vec4 c_old = texture(u_src_a, uv);
+    vec4 c_new = texture(u_src_b, uv);
+
+    float mix_val = 1.0 - alpha;
+    vec4 col = mix(c_old, c_new, mix_val);
+
+    // Organic ink bleed edge highlight
+    float edge = 1.0 - abs(n - threshold) / (softness * 2.0);
+    if (edge > 0.0 && u_progress > 0.05 && u_progress < 0.95) {
+        float glow = edge * edge * sin(u_progress * 3.1415926535) * 0.25;
+        col.rgb += vec3(glow * 0.3, glow * 0.6, glow * 1.0);
+    }
+
+    // Format alignment for DRM_FORMAT_ARGB8888 little-endian
+    imageStore(u_target, coord, col.bgra);
+}

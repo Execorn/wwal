@@ -1,0 +1,48 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform sampler2D u_src_a;
+layout(binding = 2) uniform sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+
+float hash11(float p) {
+    p = fract(p * 0.1031);
+    p *= p + 33.33;
+    p *= p + p;
+    return fract(p);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(u_resolution);
+
+    // Group pixels into 4-pixel vertical columns with hash delay
+    float col_idx = floor(float(coord.x) / 4.0);
+    float delay = hash11(col_idx) * 0.35;
+
+    // Shift increases with progress, staggered by delay
+    float shift = clamp((u_progress * 1.35 - delay) / 1.0, 0.0, 1.0);
+    float pixel_shift = shift * float(u_resolution.y);
+
+    vec4 col;
+    if (float(coord.y) < pixel_shift) {
+        col = texture(u_src_b, uv);
+    } else {
+        vec2 melt_uv = uv;
+        melt_uv.y -= shift;
+        col = texture(u_src_a, melt_uv);
+    }
+
+    // Format alignment for DRM_FORMAT_ARGB8888 little-endian
+    imageStore(u_target, coord, col.bgra);
+}

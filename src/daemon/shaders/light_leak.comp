@@ -1,0 +1,53 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform sampler2D u_src_a;
+layout(binding = 2) uniform sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(u_resolution);
+
+    vec4 c1 = texture(u_src_a, uv);
+    vec4 c2 = texture(u_src_b, uv);
+
+    // Smoothstep cross dissolve centered around midpoint
+    float mix_factor = smoothstep(0.25, 0.75, u_progress);
+    vec4 col = mix(c1, c2, mix_factor);
+
+    // Anamorphic flare beam sweeps diagonally across frame
+    float sweep = u_progress * 1.6 - 0.3;
+    float dist = abs(uv.x + uv.y * 0.25 - sweep);
+    float flare_beam = exp(-dist * dist * 32.0);
+
+    // Optical flare secondary orbs
+    vec2 orb1_center = vec2(sweep + 0.1, 0.4);
+    float orb1 = exp(-length(uv - orb1_center) * 6.0);
+
+    vec2 orb2_center = vec2(sweep - 0.2, 0.7);
+    float orb2 = exp(-length(uv - orb2_center) * 8.0);
+
+    // Smooth envelope: 0 at start and end
+    float envelope = sin(u_progress * 3.1415926535);
+    envelope = envelope * envelope;
+
+    vec3 warm_flare = vec3(1.1, 0.65, 0.25) * flare_beam * 1.8;
+    warm_flare += vec3(1.0, 0.85, 0.4) * orb1 * 1.2;
+    warm_flare += vec3(0.9, 0.3, 0.5) * orb2 * 1.0;
+
+    col.rgb = clamp(col.rgb + warm_flare * envelope, 0.0, 1.0);
+
+    // Format alignment for DRM_FORMAT_ARGB8888 little-endian
+    imageStore(u_target, coord, col.bgra);
+}

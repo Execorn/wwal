@@ -66,6 +66,42 @@ echo "[10] Testing grow transition..."
 echo "[11] Testing noise transition..."
 "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type noise --transition-duration 0.05
 
+echo "[12] Testing crosszoom transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type crosszoom --transition-duration 0.05
+
+echo "[13] Testing slide transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type slide --transition-duration 0.05 --transition-angle 90
+
+echo "[14] Testing glitch transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type glitch --transition-duration 0.05
+
+echo "[15] Testing burn transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type burn --transition-duration 0.05
+
+echo "[16] Testing ripple transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type ripple --transition-duration 0.05 --transition-pos 0.5,0.5
+
+echo "[17] Testing pixelate transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type pixelate --transition-duration 0.05
+
+echo "[18] Testing doom transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type doom --transition-duration 0.05
+
+echo "[19] Testing swirl transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type swirl --transition-duration 0.05
+
+echo "[20] Testing cube transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type cube --transition-duration 0.05
+
+echo "[21] Testing luma transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type luma --transition-duration 0.05
+
+echo "[22] Testing light_leak transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type light_leak --transition-duration 0.05
+
+echo "[23] Testing page_curl transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type page_curl --transition-duration 0.05
+
 # 7. Hardware Video wallpaper playback tests
 VIDEO_PATH="$(dirname "${BASH_SOURCE[0]}")/test_video.mp4"
 if [ -f "${VIDEO_PATH}" ]; then

@@ -1,0 +1,61 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform highp sampler2D u_src_a;
+layout(binding = 2) uniform highp sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+uniform float u_angle;
+uniform float u_wave_amp; /* Motion blur intensity */
+
+const float PI = 3.14159265359;
+const int SAMPLES = 8;
+
+vec4 sample_directional_blur(highp sampler2D tex, vec2 base_uv, vec2 blur_vec) {
+    vec4 accum = vec4(0.0);
+    float total_w = 0.0;
+
+    for (int i = 0; i < SAMPLES; ++i) {
+        float step_norm = float(i) / float(SAMPLES - 1) - 0.5;
+        vec2 s_uv = base_uv + blur_vec * step_norm;
+        if (s_uv.x >= 0.0 && s_uv.x <= 1.0 && s_uv.y >= 0.0 && s_uv.y <= 1.0) {
+            float w = 1.0 - abs(step_norm) * 0.8;
+            accum += texture(tex, s_uv) * w;
+            total_w += w;
+        }
+    }
+    return (total_w > 0.0) ? (accum / total_w) : vec4(0.0);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    vec2 dir = vec2(cos(u_angle), sin(u_angle));
+
+    float blur_strength = (u_wave_amp > 0.001) ? u_wave_amp : 0.08;
+    vec2 blur_vec = dir * sin(u_progress * PI) * blur_strength;
+
+    /* A slides away in -dir direction; B slides in from +dir direction */
+    vec2 uv_a = uv + dir * u_progress;
+    vec2 uv_b = uv - dir * (1.0 - u_progress);
+
+    vec4 color_a = sample_directional_blur(u_src_a, uv_a, blur_vec);
+    vec4 color_b = sample_directional_blur(u_src_b, uv_b, blur_vec);
+
+    /* Anti-aliased seam boundary along the translation plane */
+    float proj = dot(uv - vec2(0.5), dir) / 1.41421356 + 0.5;
+    float edge = 0.02 + length(blur_vec) * 0.5;
+    float split = smoothstep(proj - edge, proj + edge, u_progress);
+
+    vec4 final_color = mix(color_a, color_b, split);
+    if (color_a.a == 0.0) final_color = color_b;
+    if (color_b.a == 0.0) final_color = color_a;
+
+    imageStore(u_target, coord, final_color.bgra);
+}

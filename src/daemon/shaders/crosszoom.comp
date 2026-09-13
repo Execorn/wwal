@@ -1,0 +1,60 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform highp sampler2D u_src_a;
+layout(binding = 2) uniform highp sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+uniform vec2  u_center;
+uniform float u_wave_amp; /* Zoom intensity & blur strength */
+
+const float PI = 3.14159265359;
+const int SAMPLES = 10;
+
+vec4 sample_radial_blur(highp sampler2D tex, vec2 uv, vec2 center, float zoom, float blur) {
+    vec4 accum = vec4(0.0);
+    float total_weight = 0.0;
+    vec2 dir = uv - center;
+    vec2 base_uv = center + dir * zoom;
+
+    for (int i = 0; i < SAMPLES; ++i) {
+        float norm_step = float(i) / float(SAMPLES - 1);
+        float offset = (norm_step - 0.5) * blur;
+        vec2 sample_uv = clamp(base_uv + dir * offset, 0.0, 1.0);
+        float weight = 1.0 - abs(norm_step - 0.5) * 1.4;
+        accum += texture(tex, sample_uv) * weight;
+        total_weight += weight;
+    }
+
+    return accum / total_weight;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    vec2 center = (u_center.x > 0.0 || u_center.y > 0.0) ? u_center : vec2(0.5);
+
+    float strength = (u_wave_amp > 0.001) ? u_wave_amp : 0.4;
+    float peak = sin(u_progress * PI);
+    float blur = peak * strength * 0.6;
+
+    float zoom_a = 1.0 - u_progress * strength;
+    float zoom_b = 1.0 + (1.0 - u_progress) * strength;
+
+    vec4 color_a = sample_radial_blur(u_src_a, uv, center, zoom_a, blur);
+    vec4 color_b = sample_radial_blur(u_src_b, uv, center, zoom_b, blur);
+
+    vec4 result = mix(color_a, color_b, u_progress);
+
+    /* Mid-transition exposure flare */
+    float flash = peak * 0.25;
+    result.rgb += vec3(flash);
+
+    imageStore(u_target, coord, clamp(result, 0.0, 1.0).bgra);
+}

@@ -1,29 +1,31 @@
-#include "waywal/presentation.h"
-#include "waywal/uring_loop.h"
-#include "waywal/output_state.h"
-#include "waywal/security.h"
 #include "waywal/log.h"
+#include "waywal/output_state.h"
+#include "waywal/presentation.h"
+#include "waywal/security.h"
+#include "waywal/uring_loop.h"
 
+#include <assert.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <sys/prctl.h>
-#include <sys/wait.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #if defined(__has_feature)
-#  if __has_feature(address_sanitizer)
-const char *__lsan_default_suppressions(void) {
+#if __has_feature(address_sanitizer)
+const char *__lsan_default_suppressions(void)
+{
     return "leak:libnvidia\nleak:libGLX_nvidia\nleak:libEGL_nvidia\nleak:radeonsi\nleak:libva\n";
 }
-#  endif
+#endif
 #endif
 
-static void test_presentation_pll_vrr_tracking(void) {
+static void test_presentation_pll_vrr_tracking(void)
+{
     printf("[TEST] Running test_presentation_pll_vrr_tracking...\n");
 
     waywal_pll_t pll;
@@ -49,13 +51,14 @@ static void test_presentation_pll_vrr_tracking(void) {
 
         presentation_pll_update(&pll, tick_time, refresh_ns,
                                 WP_PRESENTATION_FEEDBACK_KIND_VSYNC |
-                                WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK);
+                                    WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK);
 
         simulated_hw_time += true_period_ns;
     }
 
     double avg_error_us = (double)(total_error_ns / 55) / 1000.0;
-    printf("  PLL steady-state prediction jitter at 144Hz: %.3f us (Target < 50 us)\n", avg_error_us);
+    printf("  PLL steady-state prediction jitter at 144Hz: %.3f us (Target < 50 us)\n",
+           avg_error_us);
     assert(avg_error_us < 50.0); /* Guaranteed sub-50us VRR accuracy */
 
     /* Simulate dynamic VRR rate shift (144Hz -> 60Hz) */
@@ -77,14 +80,18 @@ static void test_presentation_pll_vrr_tracking(void) {
 }
 
 static int g_uring_cb_count = 0;
-static void test_uring_callback(uring_event_type_t type, int fd, uint32_t res, void *user_data) {
-    (void)fd; (void)res; (void)user_data;
+static void test_uring_callback(uring_event_type_t type, int fd, uint32_t res, void *user_data)
+{
+    (void)fd;
+    (void)res;
+    (void)user_data;
     if (type == URING_EV_WAYLAND_READ) {
         g_uring_cb_count++;
     }
 }
 
-static void test_io_uring_event_loop(void) {
+static void test_io_uring_event_loop(void)
+{
     printf("[TEST] Running test_io_uring_event_loop...\n");
 
     uring_loop_t loop;
@@ -122,7 +129,8 @@ static void test_io_uring_event_loop(void) {
     printf("[TEST] test_io_uring_event_loop PASSED.\n");
 }
 
-static void test_output_manager_lifecycle(void) {
+static void test_output_manager_lifecycle(void)
+{
     printf("[TEST] Running test_output_manager_lifecycle...\n");
 
     output_manager_t om;
@@ -158,7 +166,8 @@ static void test_output_manager_lifecycle(void) {
     printf("[TEST] test_output_manager_lifecycle PASSED.\n");
 }
 
-static void test_security_hardening(void) {
+static void test_security_hardening(void)
+{
     printf("[TEST] Running test_security_hardening...\n");
 
     /* 1. Fork a child process to verify that seccomp kills forbidden syscalls */
@@ -167,14 +176,17 @@ static void test_security_hardening(void) {
     if (pid == 0) {
         /* Child: apply security hardening */
         bool sec_ok = security_sandbox_apply(NULL);
-        if (!sec_ok) _exit(1);
+        if (!sec_ok)
+            _exit(1);
 
         int no_new_privs = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
-        if (no_new_privs != 1) _exit(2);
+        if (no_new_privs != 1)
+            _exit(2);
 
         /* Test allowed syscall: getpid() */
         pid_t my_pid = getpid();
-        if (my_pid <= 0) _exit(3);
+        if (my_pid <= 0)
+            _exit(3);
 
 #ifdef HAVE_LIBSECCOMP
         /* Test denied syscall: SCMP_ACT_KILL on execve (SOTA-09) */
@@ -191,16 +203,19 @@ static void test_security_hardening(void) {
 #ifdef HAVE_LIBSECCOMP
     assert(WIFSIGNALED(status));
     assert(WTERMSIG(status) == SIGSYS || WTERMSIG(status) == SIGKILL);
-    printf("  Verified Seccomp-BPF killed thread on denied syscall (SIGSYS=%d)\n", WTERMSIG(status));
+    printf("  Verified Seccomp-BPF killed thread on denied syscall (SIGSYS=%d)\n",
+           WTERMSIG(status));
 #else
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 #endif
 
-    printf("  Verified PR_SET_NO_NEW_PRIVS, Landlock LSM, and Seccomp-BPF sandboxing in isolated process\n");
+    printf("  Verified PR_SET_NO_NEW_PRIVS, Landlock LSM, and Seccomp-BPF sandboxing in isolated "
+           "process\n");
     printf("[TEST] test_security_hardening PASSED.\n");
 }
 
-int main(void) {
+int main(void)
+{
     printf("=========================================\n");
     printf("  Executing WayWal Phase 5 Test Suite\n");
     printf("=========================================\n");

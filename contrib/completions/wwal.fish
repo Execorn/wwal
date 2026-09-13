@@ -22,7 +22,7 @@ complete -c wwal -n "__fish_use_subcommand" -a help -d "Display help message"
 
 # img options
 complete -c wwal -n "__fish_seen_subcommand_from img" -F
-complete -c wwal -n "__fish_seen_subcommand_from img" -l transition-type -a "none simple fade wipe grow outer wave noise" -d "Transition type"
+complete -c wwal -n "__fish_seen_subcommand_from img" -l transition-type -a "none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl" -d "Transition type"
 complete -c wwal -n "__fish_seen_subcommand_from img" -l transition-duration -d "Transition duration in seconds" -r
 complete -c wwal -n "__fish_seen_subcommand_from img" -l transition-fps -d "Target frame rate" -r
 complete -c wwal -n "__fish_seen_subcommand_from img" -l transition-angle -d "Transition angle in degrees" -r

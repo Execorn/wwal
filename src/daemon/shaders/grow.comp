@@ -30,5 +30,5 @@ void main() {
 
     vec4 a = texture(u_src_a, uv);
     vec4 b = texture(u_src_b, uv);
-    imageStore(u_target, coord, mix(a, b, alpha));
+    imageStore(u_target, coord, mix(a, b, alpha).bgra);
 }

@@ -1,17 +1,19 @@
 #include "gpu_compute.h"
 
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
+// clang-format off
 #include <GLES3/gl31.h>
 #include <GLES2/gl2ext.h>
+// clang-format on
 
-#include "waywal/log.h"
 #include "shaders/shaders_embedded.h"
+#include "waywal/log.h"
 
 typedef struct {
     GLint loc_prog;
@@ -32,6 +34,18 @@ struct gpu_compute_ctx {
     GLuint prog_outer;
     GLuint prog_wave;
     GLuint prog_noise;
+    GLuint prog_crosszoom;
+    GLuint prog_slide;
+    GLuint prog_glitch;
+    GLuint prog_burn;
+    GLuint prog_ripple;
+    GLuint prog_pixelate;
+    GLuint prog_doom;
+    GLuint prog_swirl;
+    GLuint prog_cube;
+    GLuint prog_luma;
+    GLuint prog_light_leak;
+    GLuint prog_page_curl;
 
     gpu_program_uniforms_t unif_fade;
     gpu_program_uniforms_t unif_wipe;
@@ -39,6 +53,18 @@ struct gpu_compute_ctx {
     gpu_program_uniforms_t unif_outer;
     gpu_program_uniforms_t unif_wave;
     gpu_program_uniforms_t unif_noise;
+    gpu_program_uniforms_t unif_crosszoom;
+    gpu_program_uniforms_t unif_slide;
+    gpu_program_uniforms_t unif_glitch;
+    gpu_program_uniforms_t unif_burn;
+    gpu_program_uniforms_t unif_ripple;
+    gpu_program_uniforms_t unif_pixelate;
+    gpu_program_uniforms_t unif_doom;
+    gpu_program_uniforms_t unif_swirl;
+    gpu_program_uniforms_t unif_cube;
+    gpu_program_uniforms_t unif_luma;
+    gpu_program_uniforms_t unif_light_leak;
+    gpu_program_uniforms_t unif_page_curl;
 
     PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
     PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
@@ -47,8 +73,10 @@ struct gpu_compute_ctx {
     PFNEGLDESTROYSYNCKHRPROC eglDestroySyncKHR;
 };
 
-static void query_program_uniforms(GLuint prog, gpu_program_uniforms_t *u) {
-    if (!prog || !u) return;
+static void query_program_uniforms(GLuint prog, gpu_program_uniforms_t *u)
+{
+    if (!prog || !u)
+        return;
     u->loc_prog = glGetUniformLocation(prog, "u_progress");
     u->loc_res = glGetUniformLocation(prog, "u_resolution");
     u->loc_angle = glGetUniformLocation(prog, "u_angle");
@@ -57,7 +85,8 @@ static void query_program_uniforms(GLuint prog, gpu_program_uniforms_t *u) {
     u->loc_center = glGetUniformLocation(prog, "u_center");
 }
 
-static GLuint compile_shader_program(const char *src, const char *name) {
+static GLuint compile_shader_program(const char *src, const char *name)
+{
     GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
     if (!shader) {
         WAYWAL_LOG_ERR("glCreateShader failed for %s", name);
@@ -101,7 +130,8 @@ static GLuint compile_shader_program(const char *src, const char *name) {
     return prog;
 }
 
-gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx) {
+gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
+{
     if (!dmabuf_ctx || !dmabuf_ctx->gbm || !dmabuf_ctx->available) {
         return NULL;
     }
@@ -140,11 +170,8 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx) {
         return NULL;
     }
 
-    static const EGLint ctx_attribs[] = {
-        EGL_CONTEXT_MAJOR_VERSION, 3,
-        EGL_CONTEXT_MINOR_VERSION, 1,
-        EGL_NONE
-    };
+    static const EGLint ctx_attribs[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 1,
+                                         EGL_NONE};
 
     EGLContext egl_ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, ctx_attribs);
     if (egl_ctx == EGL_NO_CONTEXT) {
@@ -185,27 +212,54 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx) {
     }
 
     /* Compile embedded compute shaders */
-    ctx->prog_fade  = compile_shader_program(SHADER_SRC_FADE, "fade");
-    ctx->prog_wipe  = compile_shader_program(SHADER_SRC_WIPE, "wipe");
-    ctx->prog_grow  = compile_shader_program(SHADER_SRC_GROW, "grow");
+    ctx->prog_fade = compile_shader_program(SHADER_SRC_FADE, "fade");
+    ctx->prog_wipe = compile_shader_program(SHADER_SRC_WIPE, "wipe");
+    ctx->prog_grow = compile_shader_program(SHADER_SRC_GROW, "grow");
     ctx->prog_outer = compile_shader_program(SHADER_SRC_OUTER, "outer");
-    ctx->prog_wave  = compile_shader_program(SHADER_SRC_WAVE, "wave");
+    ctx->prog_wave = compile_shader_program(SHADER_SRC_WAVE, "wave");
     ctx->prog_noise = compile_shader_program(SHADER_SRC_NOISE, "noise");
+    ctx->prog_crosszoom = compile_shader_program(SHADER_SRC_CROSSZOOM, "crosszoom");
+    ctx->prog_slide = compile_shader_program(SHADER_SRC_SLIDE, "slide");
+    ctx->prog_glitch = compile_shader_program(SHADER_SRC_GLITCH, "glitch");
+    ctx->prog_burn = compile_shader_program(SHADER_SRC_BURN, "burn");
+    ctx->prog_ripple = compile_shader_program(SHADER_SRC_RIPPLE, "ripple");
+    ctx->prog_pixelate = compile_shader_program(SHADER_SRC_PIXELATE, "pixelate");
+    ctx->prog_doom = compile_shader_program(SHADER_SRC_DOOM, "doom");
+    ctx->prog_swirl = compile_shader_program(SHADER_SRC_SWIRL, "swirl");
+    ctx->prog_cube = compile_shader_program(SHADER_SRC_CUBE, "cube");
+    ctx->prog_luma = compile_shader_program(SHADER_SRC_LUMA, "luma");
+    ctx->prog_light_leak = compile_shader_program(SHADER_SRC_LIGHT_LEAK, "light_leak");
+    ctx->prog_page_curl = compile_shader_program(SHADER_SRC_PAGE_CURL, "page_curl");
 
-    if (!ctx->prog_fade || !ctx->prog_wipe || !ctx->prog_grow ||
-        !ctx->prog_outer || !ctx->prog_wave || !ctx->prog_noise) {
+    if (!ctx->prog_fade || !ctx->prog_wipe || !ctx->prog_grow || !ctx->prog_outer ||
+        !ctx->prog_wave || !ctx->prog_noise || !ctx->prog_crosszoom || !ctx->prog_slide ||
+        !ctx->prog_glitch || !ctx->prog_burn || !ctx->prog_ripple || !ctx->prog_pixelate ||
+        !ctx->prog_doom || !ctx->prog_swirl || !ctx->prog_cube || !ctx->prog_luma ||
+        !ctx->prog_light_leak || !ctx->prog_page_curl) {
         WAYWAL_LOG_WARN("One or more compute shader programs failed to compile");
         gpu_compute_destroy(ctx);
         return NULL;
     }
 
     /* Cache uniform locations at compile/link time (PERF-01) */
-    query_program_uniforms(ctx->prog_fade,  &ctx->unif_fade);
-    query_program_uniforms(ctx->prog_wipe,  &ctx->unif_wipe);
-    query_program_uniforms(ctx->prog_grow,  &ctx->unif_grow);
+    query_program_uniforms(ctx->prog_fade, &ctx->unif_fade);
+    query_program_uniforms(ctx->prog_wipe, &ctx->unif_wipe);
+    query_program_uniforms(ctx->prog_grow, &ctx->unif_grow);
     query_program_uniforms(ctx->prog_outer, &ctx->unif_outer);
-    query_program_uniforms(ctx->prog_wave,  &ctx->unif_wave);
+    query_program_uniforms(ctx->prog_wave, &ctx->unif_wave);
     query_program_uniforms(ctx->prog_noise, &ctx->unif_noise);
+    query_program_uniforms(ctx->prog_crosszoom, &ctx->unif_crosszoom);
+    query_program_uniforms(ctx->prog_slide, &ctx->unif_slide);
+    query_program_uniforms(ctx->prog_glitch, &ctx->unif_glitch);
+    query_program_uniforms(ctx->prog_burn, &ctx->unif_burn);
+    query_program_uniforms(ctx->prog_ripple, &ctx->unif_ripple);
+    query_program_uniforms(ctx->prog_pixelate, &ctx->unif_pixelate);
+    query_program_uniforms(ctx->prog_doom, &ctx->unif_doom);
+    query_program_uniforms(ctx->prog_swirl, &ctx->unif_swirl);
+    query_program_uniforms(ctx->prog_cube, &ctx->unif_cube);
+    query_program_uniforms(ctx->prog_luma, &ctx->unif_luma);
+    query_program_uniforms(ctx->prog_light_leak, &ctx->unif_light_leak);
+    query_program_uniforms(ctx->prog_page_curl, &ctx->unif_page_curl);
 
     /* Query fence sync extension entry points (ARCH-03) */
     ctx->eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
@@ -215,45 +269,32 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx) {
     return ctx;
 }
 
-static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo) {
-    if (!ctx || !bo) return false;
+static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
+{
+    if (!ctx || !bo)
+        return false;
     if (bo->egl_image && bo->gl_tex != 0) {
         return true; /* Already imported and cached */
     }
 
-    static const EGLint plane_fd_keys[4] = {
-        EGL_DMA_BUF_PLANE0_FD_EXT,
-        EGL_DMA_BUF_PLANE1_FD_EXT,
-        EGL_DMA_BUF_PLANE2_FD_EXT,
-        EGL_DMA_BUF_PLANE3_FD_EXT
-    };
+    static const EGLint plane_fd_keys[4] = {EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE1_FD_EXT,
+                                            EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE3_FD_EXT};
     static const EGLint plane_offset_keys[4] = {
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-        EGL_DMA_BUF_PLANE1_OFFSET_EXT,
-        EGL_DMA_BUF_PLANE2_OFFSET_EXT,
-        EGL_DMA_BUF_PLANE3_OFFSET_EXT
-    };
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT,
+        EGL_DMA_BUF_PLANE3_OFFSET_EXT};
     static const EGLint plane_pitch_keys[4] = {
-        EGL_DMA_BUF_PLANE0_PITCH_EXT,
-        EGL_DMA_BUF_PLANE1_PITCH_EXT,
-        EGL_DMA_BUF_PLANE2_PITCH_EXT,
-        EGL_DMA_BUF_PLANE3_PITCH_EXT
-    };
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, EGL_DMA_BUF_PLANE1_PITCH_EXT, EGL_DMA_BUF_PLANE2_PITCH_EXT,
+        EGL_DMA_BUF_PLANE3_PITCH_EXT};
     static const EGLint plane_mod_lo_keys[4] = {
-        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
-        EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
-        EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
-        EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT
-    };
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+        EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT};
     static const EGLint plane_mod_hi_keys[4] = {
-        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-        EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
-        EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT,
-        EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT
-    };
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
+        EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT};
 
     uint32_t num_planes = bo->num_planes > 0 ? bo->num_planes : 1;
-    if (num_planes > 4) num_planes = 4;
+    if (num_planes > 4)
+        num_planes = 4;
 
     EGLint attribs[64];
     int n = 0;
@@ -265,7 +306,8 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo) {
     attribs[n++] = (EGLint)bo->drm_format;
 
     for (uint32_t p = 0; p < num_planes; ++p) {
-        if (bo->fd[p] < 0) continue;
+        if (bo->fd[p] < 0)
+            continue;
         attribs[n++] = plane_fd_keys[p];
         attribs[n++] = bo->fd[p];
         attribs[n++] = plane_offset_keys[p];
@@ -282,8 +324,8 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo) {
     }
     attribs[n] = EGL_NONE;
 
-    EGLImageKHR img = ctx->eglCreateImageKHR(ctx->display, EGL_NO_CONTEXT,
-                                            EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
+    EGLImageKHR img =
+        ctx->eglCreateImageKHR(ctx->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
     if (img == EGL_NO_IMAGE_KHR && bo->modifier != DRM_FORMAT_MOD_INVALID) {
         n = 0;
         attribs[n++] = EGL_WIDTH;
@@ -293,7 +335,8 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo) {
         attribs[n++] = EGL_LINUX_DRM_FOURCC_EXT;
         attribs[n++] = (EGLint)bo->drm_format;
         for (uint32_t p = 0; p < num_planes; ++p) {
-            if (bo->fd[p] < 0) continue;
+            if (bo->fd[p] < 0)
+                continue;
             attribs[n++] = plane_fd_keys[p];
             attribs[n++] = bo->fd[p];
             attribs[n++] = plane_offset_keys[p];
@@ -302,13 +345,13 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo) {
             attribs[n++] = (EGLint)bo->stride[p];
         }
         attribs[n] = EGL_NONE;
-        img = ctx->eglCreateImageKHR(ctx->display, EGL_NO_CONTEXT,
-                                    EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
+        img = ctx->eglCreateImageKHR(ctx->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL,
+                                     attribs);
     }
 
     if (img == EGL_NO_IMAGE_KHR) {
-        WAYWAL_LOG_ERR("eglCreateImageKHR failed for BO %ux%u (0x%x)",
-                      bo->width, bo->height, eglGetError());
+        WAYWAL_LOG_ERR("eglCreateImageKHR failed for BO %ux%u (0x%x)", bo->width, bo->height,
+                       eglGetError());
         return false;
     }
 
@@ -326,19 +369,15 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo) {
     return true;
 }
 
-bool gpu_compute_dispatch_transition(
-    gpu_compute_ctx_t *ctx,
-    dmabuf_bo_t *target_bo,
-    dmabuf_bo_t *old_bo,
-    dmabuf_bo_t *new_bo,
-    const waywal_transition_params_t *params
-) {
+bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target_bo,
+                                     dmabuf_bo_t *old_bo, dmabuf_bo_t *new_bo,
+                                     const waywal_transition_params_t *params)
+{
     if (!ctx || !target_bo || !old_bo || !new_bo || !params) {
         return false;
     }
 
-    if (!gpu_compute_import_bo(ctx, target_bo) ||
-        !gpu_compute_import_bo(ctx, old_bo) ||
+    if (!gpu_compute_import_bo(ctx, target_bo) || !gpu_compute_import_bo(ctx, old_bo) ||
         !gpu_compute_import_bo(ctx, new_bo)) {
         return false;
     }
@@ -346,17 +385,80 @@ bool gpu_compute_dispatch_transition(
     GLuint prog = ctx->prog_fade;
     const gpu_program_uniforms_t *u = &ctx->unif_fade;
     switch (params->type) {
-        case WAYWAL_TRANSITION_WIPE:  prog = ctx->prog_wipe;  u = &ctx->unif_wipe; break;
-        case WAYWAL_TRANSITION_GROW:  prog = ctx->prog_grow;  u = &ctx->unif_grow; break;
-        case WAYWAL_TRANSITION_OUTER: prog = ctx->prog_outer; u = &ctx->unif_outer; break;
-        case WAYWAL_TRANSITION_WAVE:  prog = ctx->prog_wave;  u = &ctx->unif_wave; break;
-        case WAYWAL_TRANSITION_NOISE: prog = ctx->prog_noise; u = &ctx->unif_noise; break;
-        case WAYWAL_TRANSITION_FADE:
-        case WAYWAL_TRANSITION_SIMPLE:
-        default:
-            prog = ctx->prog_fade;
-            u = &ctx->unif_fade;
-            break;
+    case WAYWAL_TRANSITION_WIPE:
+        prog = ctx->prog_wipe;
+        u = &ctx->unif_wipe;
+        break;
+    case WAYWAL_TRANSITION_GROW:
+        prog = ctx->prog_grow;
+        u = &ctx->unif_grow;
+        break;
+    case WAYWAL_TRANSITION_OUTER:
+        prog = ctx->prog_outer;
+        u = &ctx->unif_outer;
+        break;
+    case WAYWAL_TRANSITION_WAVE:
+        prog = ctx->prog_wave;
+        u = &ctx->unif_wave;
+        break;
+    case WAYWAL_TRANSITION_NOISE:
+        prog = ctx->prog_noise;
+        u = &ctx->unif_noise;
+        break;
+    case WAYWAL_TRANSITION_CROSSZOOM:
+        prog = ctx->prog_crosszoom;
+        u = &ctx->unif_crosszoom;
+        break;
+    case WAYWAL_TRANSITION_SLIDE:
+        prog = ctx->prog_slide;
+        u = &ctx->unif_slide;
+        break;
+    case WAYWAL_TRANSITION_GLITCH:
+        prog = ctx->prog_glitch;
+        u = &ctx->unif_glitch;
+        break;
+    case WAYWAL_TRANSITION_BURN:
+        prog = ctx->prog_burn;
+        u = &ctx->unif_burn;
+        break;
+    case WAYWAL_TRANSITION_RIPPLE:
+        prog = ctx->prog_ripple;
+        u = &ctx->unif_ripple;
+        break;
+    case WAYWAL_TRANSITION_PIXELATE:
+        prog = ctx->prog_pixelate;
+        u = &ctx->unif_pixelate;
+        break;
+    case WAYWAL_TRANSITION_DOOM:
+        prog = ctx->prog_doom;
+        u = &ctx->unif_doom;
+        break;
+    case WAYWAL_TRANSITION_SWIRL:
+        prog = ctx->prog_swirl;
+        u = &ctx->unif_swirl;
+        break;
+    case WAYWAL_TRANSITION_CUBE:
+        prog = ctx->prog_cube;
+        u = &ctx->unif_cube;
+        break;
+    case WAYWAL_TRANSITION_LUMA:
+        prog = ctx->prog_luma;
+        u = &ctx->unif_luma;
+        break;
+    case WAYWAL_TRANSITION_LIGHT_LEAK:
+        prog = ctx->prog_light_leak;
+        u = &ctx->unif_light_leak;
+        break;
+    case WAYWAL_TRANSITION_PAGE_CURL:
+        prog = ctx->prog_page_curl;
+        u = &ctx->unif_page_curl;
+        break;
+    case WAYWAL_TRANSITION_FADE:
+    case WAYWAL_TRANSITION_SIMPLE:
+    default:
+        prog = ctx->prog_fade;
+        u = &ctx->unif_fade;
+        break;
     }
 
     glUseProgram(prog);
@@ -372,9 +474,12 @@ bool gpu_compute_dispatch_transition(
     glBindTexture(GL_TEXTURE_2D, new_bo->gl_tex);
 
     /* Set uniform parameters from cached locations (PERF-01) */
-    if (u->loc_prog >= 0) glUniform1f(u->loc_prog, params->progress);
-    if (u->loc_res >= 0) glUniform2i(u->loc_res, (GLint)target_bo->width, (GLint)target_bo->height);
-    if (u->loc_angle >= 0) glUniform1f(u->loc_angle, params->angle_rad);
+    if (u->loc_prog >= 0)
+        glUniform1f(u->loc_prog, params->progress);
+    if (u->loc_res >= 0)
+        glUniform2i(u->loc_res, (GLint)target_bo->width, (GLint)target_bo->height);
+    if (u->loc_angle >= 0)
+        glUniform1f(u->loc_angle, params->angle_rad);
     if (u->loc_wave_freq >= 0) {
         glUniform1f(u->loc_wave_freq, params->wave_freq > 0.0f ? params->wave_freq : 20.0f);
     }
@@ -390,33 +495,57 @@ bool gpu_compute_dispatch_transition(
     GLuint groups_y = (target_bo->height + 15) / 16;
     glDispatchCompute(groups_x, groups_y, 1);
 
-    /* Memory barrier ensuring GPU writes are visible for scanout */
-    glMemoryBarrier(GL_ALL_BARRIER_BITS);
-
-    /* Non-blocking sync fence and flush to eliminate glFinish() CPU stall (ARCH-03) */
-    if (ctx->eglCreateSyncKHR && ctx->eglDestroySyncKHR) {
-        EGLSyncKHR sync = ctx->eglCreateSyncKHR(ctx->display, EGL_SYNC_FENCE_KHR, NULL);
-        if (sync != EGL_NO_SYNC_KHR) {
-            ctx->eglDestroySyncKHR(ctx->display, sync);
-        }
-    }
+    /* Targeted memory barrier ensuring GPU storage writes are visible */
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
     glFlush();
 
     return true;
 }
 
-void gpu_compute_destroy(gpu_compute_ctx_t *ctx) {
-    if (!ctx) return;
+void gpu_compute_destroy(gpu_compute_ctx_t *ctx)
+{
+    if (!ctx)
+        return;
 
     if (ctx->display != EGL_NO_DISPLAY) {
         eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
 
-        if (ctx->prog_fade)  glDeleteProgram(ctx->prog_fade);
-        if (ctx->prog_wipe)  glDeleteProgram(ctx->prog_wipe);
-        if (ctx->prog_grow)  glDeleteProgram(ctx->prog_grow);
-        if (ctx->prog_outer) glDeleteProgram(ctx->prog_outer);
-        if (ctx->prog_wave)  glDeleteProgram(ctx->prog_wave);
-        if (ctx->prog_noise) glDeleteProgram(ctx->prog_noise);
+        if (ctx->prog_fade)
+            glDeleteProgram(ctx->prog_fade);
+        if (ctx->prog_wipe)
+            glDeleteProgram(ctx->prog_wipe);
+        if (ctx->prog_grow)
+            glDeleteProgram(ctx->prog_grow);
+        if (ctx->prog_outer)
+            glDeleteProgram(ctx->prog_outer);
+        if (ctx->prog_wave)
+            glDeleteProgram(ctx->prog_wave);
+        if (ctx->prog_noise)
+            glDeleteProgram(ctx->prog_noise);
+        if (ctx->prog_crosszoom)
+            glDeleteProgram(ctx->prog_crosszoom);
+        if (ctx->prog_slide)
+            glDeleteProgram(ctx->prog_slide);
+        if (ctx->prog_glitch)
+            glDeleteProgram(ctx->prog_glitch);
+        if (ctx->prog_burn)
+            glDeleteProgram(ctx->prog_burn);
+        if (ctx->prog_ripple)
+            glDeleteProgram(ctx->prog_ripple);
+        if (ctx->prog_pixelate)
+            glDeleteProgram(ctx->prog_pixelate);
+        if (ctx->prog_doom)
+            glDeleteProgram(ctx->prog_doom);
+        if (ctx->prog_swirl)
+            glDeleteProgram(ctx->prog_swirl);
+        if (ctx->prog_cube)
+            glDeleteProgram(ctx->prog_cube);
+        if (ctx->prog_luma)
+            glDeleteProgram(ctx->prog_luma);
+        if (ctx->prog_light_leak)
+            glDeleteProgram(ctx->prog_light_leak);
+        if (ctx->prog_page_curl)
+            glDeleteProgram(ctx->prog_page_curl);
 
         eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (ctx->context != EGL_NO_CONTEXT) {
@@ -426,4 +555,18 @@ void gpu_compute_destroy(gpu_compute_ctx_t *ctx) {
     }
 
     free(ctx);
+}
+
+void gpu_compute_release_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
+{
+    if (!ctx || !bo)
+        return;
+    if (bo->gl_tex != 0) {
+        glDeleteTextures(1, &bo->gl_tex);
+        bo->gl_tex = 0;
+    }
+    if (bo->egl_image != NULL && ctx->eglDestroyImageKHR && ctx->display != EGL_NO_DISPLAY) {
+        ctx->eglDestroyImageKHR(ctx->display, bo->egl_image);
+        bo->egl_image = NULL;
+    }
 }

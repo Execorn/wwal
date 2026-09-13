@@ -1,0 +1,71 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform highp sampler2D u_src_a;
+layout(binding = 2) uniform highp sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+uniform float u_wave_freq; /* Scanline density */
+uniform float u_wave_amp;  /* Glitch & chromatic aberration intensity */
+
+const float PI = 3.14159265359;
+
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+
+    float bands = (u_wave_freq > 0.0) ? u_wave_freq : 35.0;
+    float intensity = (u_wave_amp > 0.0) ? u_wave_amp : 0.06;
+    float peak = sin(u_progress * PI);
+
+    /* Temporal slice quantization */
+    float step_t = floor(u_progress * 24.0);
+    float slice_idx = floor(uv.y * bands);
+    float h = hash12(vec2(slice_idx, step_t));
+
+    /* Horizontal scanline displacement */
+    float jitter = 0.0;
+    if (h > 0.60) {
+        jitter = (h - 0.80) * 2.5 * intensity * peak;
+    }
+
+    /* Chromatic aberration: split R and B channels */
+    float split = peak * intensity * 0.6;
+    vec2 uv_r = clamp(uv + vec2(jitter + split, 0.0), 0.0, 1.0);
+    vec2 uv_g = clamp(uv + vec2(jitter, 0.0), 0.0, 1.0);
+    vec2 uv_b = clamp(uv + vec2(jitter - split, 0.0), 0.0, 1.0);
+
+    /* Sample separated channels for outgoing image A */
+    vec4 col_a;
+    col_a.r = texture(u_src_a, uv_r).r;
+    col_a.g = texture(u_src_a, uv_g).g;
+    col_a.b = texture(u_src_a, uv_b).b;
+    col_a.a = 1.0;
+
+    /* Sample separated channels for incoming image B */
+    vec4 col_b;
+    col_b.r = texture(u_src_b, uv_r).r;
+    col_b.g = texture(u_src_b, uv_g).g;
+    col_b.b = texture(u_src_b, uv_b).b;
+    col_b.a = 1.0;
+
+    /* Digital block artifact threshold */
+    float block_h = hash12(floor(uv * vec2(24.0, 14.0)) + step_t);
+    float glitch_progress = u_progress + (block_h - 0.5) * peak * 0.35;
+    float mix_val = smoothstep(0.46, 0.54, glitch_progress);
+
+    vec4 result = mix(col_a, col_b, mix_val);
+    imageStore(u_target, coord, result.bgra);
+}

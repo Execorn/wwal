@@ -1,0 +1,61 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform sampler2D u_src_a;
+layout(binding = 2) uniform sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(u_resolution);
+
+    float R = 0.12;
+    // Peel line traverses from beyond 1.0 to below -R
+    float line = 1.02 - u_progress * 1.25;
+
+    // Diagonal curl axis
+    float s = (uv.x + uv.y) * 0.5;
+
+    vec4 col;
+    if (s < line) {
+        // Unpeeled flat old wallpaper
+        col = texture(u_src_a, uv);
+    } else if (s < line + R) {
+        // Active cylindrical curl region
+        float dist = s - line;
+        vec2 uv_curl = uv - 2.0 * dist * vec2(0.5, 0.5);
+
+        if (uv_curl.x >= 0.0 && uv_curl.x <= 1.0 && uv_curl.y >= 0.0 && uv_curl.y <= 1.0) {
+            // Curled back of the peeling canvas with specular cylinder highlight
+            float curl_light = 0.85 + 0.35 * sin((dist / R) * 3.1415926535);
+            vec4 old_col = texture(u_src_a, uv_curl);
+            col = old_col * vec4(vec3(curl_light * 0.9), 1.0);
+        } else {
+            // Beneath curl: revealed new image with contact shadow
+            float shadow = 0.5 + 0.5 * smoothstep(0.0, R, dist);
+            col = texture(u_src_b, uv) * vec4(vec3(shadow), 1.0);
+        }
+    } else {
+        // Revealed new wallpaper with soft contact drop shadow near curl edge
+        float drop_shadow_width = 0.08;
+        if (s < line + R + drop_shadow_width) {
+            float shadow = 0.65 + 0.35 * smoothstep(0.0, drop_shadow_width, s - (line + R));
+            col = texture(u_src_b, uv) * vec4(vec3(shadow), 1.0);
+        } else {
+            col = texture(u_src_b, uv);
+        }
+    }
+
+    // Format alignment for DRM_FORMAT_ARGB8888 little-endian
+    imageStore(u_target, coord, col.bgra);
+}

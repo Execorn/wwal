@@ -1,59 +1,69 @@
 #include "waywal/demuxer.h"
+#include "waywal/log.h"
 #include "waywal/vaapi_dec.h"
 #include "waywal/video_engine.h"
-#include "waywal/log.h"
 
+#include <assert.h>
+#include <drm/drm_fourcc.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <time.h>
 #include <sys/timerfd.h>
-#include <drm/drm_fourcc.h>
+#include <time.h>
+#include <unistd.h>
 
 #if defined(__has_feature)
-#  if __has_feature(address_sanitizer)
-const char *__lsan_default_suppressions(void) {
+#if __has_feature(address_sanitizer)
+const char *__lsan_default_suppressions(void)
+{
     return "leak:libnvidia\nleak:libGLX_nvidia\nleak:libEGL_nvidia\nleak:radeonsi\nleak:libva\n";
 }
-#  endif
+#endif
 #endif
 
-#define FOURCC(a, b, c, d) \
-    (((uint32_t)(uint8_t)(a) << 24) | ((uint32_t)(uint8_t)(b) << 16) | \
-     ((uint32_t)(uint8_t)(c) << 8)  | ((uint32_t)(uint8_t)(d)))
+#define FOURCC(a, b, c, d)                                                                         \
+    (((uint32_t)(uint8_t)(a) << 24) | ((uint32_t)(uint8_t)(b) << 16) |                             \
+     ((uint32_t)(uint8_t)(c) << 8) | ((uint32_t)(uint8_t)(d)))
 
-static inline void write_u32_be(uint8_t *p, uint32_t v) {
+static inline void write_u32_be(uint8_t *p, uint32_t v)
+{
     p[0] = (uint8_t)(v >> 24);
     p[1] = (uint8_t)(v >> 16);
     p[2] = (uint8_t)(v >> 8);
     p[3] = (uint8_t)(v);
 }
 
-static inline void write_u16_be(uint8_t *p, uint16_t v) {
+static inline void write_u16_be(uint8_t *p, uint16_t v)
+{
     p[0] = (uint8_t)(v >> 8);
     p[1] = (uint8_t)(v);
 }
 
 /* Helper to build a minimal valid synthetic MP4 container in memory */
-static size_t build_synthetic_mp4(uint8_t *buf, size_t max_size, uint32_t width, uint32_t height, uint32_t sample_count) {
+static size_t build_synthetic_mp4(uint8_t *buf, size_t max_size, uint32_t width, uint32_t height,
+                                  uint32_t sample_count)
+{
     uint8_t *p = buf;
 
     /* 1. ftyp box */
     uint8_t *ftyp_start = p;
     p += 4; /* size placeholder */
-    write_u32_be(p, FOURCC('f','t','y','p')); p += 4;
-    write_u32_be(p, FOURCC('i','s','o','m')); p += 4; /* major brand */
-    write_u32_be(p, 512); p += 4;                     /* minor version */
-    write_u32_be(p, FOURCC('i','s','o','m')); p += 4; /* compatible brands */
+    write_u32_be(p, FOURCC('f', 't', 'y', 'p'));
+    p += 4;
+    write_u32_be(p, FOURCC('i', 's', 'o', 'm'));
+    p += 4; /* major brand */
+    write_u32_be(p, 512);
+    p += 4; /* minor version */
+    write_u32_be(p, FOURCC('i', 's', 'o', 'm'));
+    p += 4; /* compatible brands */
     write_u32_be(ftyp_start, (uint32_t)(p - ftyp_start));
 
     /* 2. mdat box (raw video samples) */
     uint8_t *mdat_start = p;
     p += 4;
-    write_u32_be(p, FOURCC('m','d','a','t')); p += 4;
+    write_u32_be(p, FOURCC('m', 'd', 'a', 't'));
+    p += 4;
     size_t sample_payload_offset = (size_t)(p - buf);
     size_t sample_size = 64;
 
@@ -64,91 +74,148 @@ static size_t build_synthetic_mp4(uint8_t *buf, size_t max_size, uint32_t width,
     write_u32_be(mdat_start, (uint32_t)(p - mdat_start));
 
     /* 3. moov box */
-    uint8_t *moov_start = p; p += 4;
-    write_u32_be(p, FOURCC('m','o','o','v')); p += 4;
+    uint8_t *moov_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('m', 'o', 'o', 'v'));
+    p += 4;
 
     /* mvhd */
-    uint8_t *mvhd_start = p; p += 4;
-    write_u32_be(p, FOURCC('m','v','h','d')); p += 4;
-    write_u32_be(p, 0); p += 4; /* version + flags */
-    write_u32_be(p, 0); p += 4; /* creation */
-    write_u32_be(p, 0); p += 4; /* mod */
-    write_u32_be(p, 1000); p += 4; /* timescale = 1000 */
-    write_u32_be(p, sample_count * 33); p += 4; /* duration */
-    write_u32_be(p, 0x00010000); p += 4; /* rate 1.0 */
-    write_u16_be(p, 0x0100); p += 2;     /* volume */
-    memset(p, 0, 70); p += 70;           /* reserved + matrix + pre_defined */
-    write_u32_be(p, 2); p += 4;          /* next_track_id */
+    uint8_t *mvhd_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('m', 'v', 'h', 'd'));
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4; /* version + flags */
+    write_u32_be(p, 0);
+    p += 4; /* creation */
+    write_u32_be(p, 0);
+    p += 4; /* mod */
+    write_u32_be(p, 1000);
+    p += 4; /* timescale = 1000 */
+    write_u32_be(p, sample_count * 33);
+    p += 4; /* duration */
+    write_u32_be(p, 0x00010000);
+    p += 4; /* rate 1.0 */
+    write_u16_be(p, 0x0100);
+    p += 2; /* volume */
+    memset(p, 0, 70);
+    p += 70; /* reserved + matrix + pre_defined */
+    write_u32_be(p, 2);
+    p += 4; /* next_track_id */
     write_u32_be(mvhd_start, (uint32_t)(p - mvhd_start));
 
     /* trak */
-    uint8_t *trak_start = p; p += 4;
-    write_u32_be(p, FOURCC('t','r','a','k')); p += 4;
+    uint8_t *trak_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('t', 'r', 'a', 'k'));
+    p += 4;
 
     /* mdia */
-    uint8_t *mdia_start = p; p += 4;
-    write_u32_be(p, FOURCC('m','d','i','a')); p += 4;
+    uint8_t *mdia_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('m', 'd', 'i', 'a'));
+    p += 4;
 
     /* mdhd */
-    uint8_t *mdhd_start = p; p += 4;
-    write_u32_be(p, FOURCC('m','d','h','d')); p += 4;
-    write_u32_be(p, 0); p += 4;
-    write_u32_be(p, 0); p += 4;
-    write_u32_be(p, 0); p += 4;
-    write_u32_be(p, 1000); p += 4; /* timescale */
-    write_u32_be(p, sample_count * 33); p += 4;
-    write_u16_be(p, 0); p += 2;
-    write_u16_be(p, 0); p += 2;
+    uint8_t *mdhd_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('m', 'd', 'h', 'd'));
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4;
+    write_u32_be(p, 1000);
+    p += 4; /* timescale */
+    write_u32_be(p, sample_count * 33);
+    p += 4;
+    write_u16_be(p, 0);
+    p += 2;
+    write_u16_be(p, 0);
+    p += 2;
     write_u32_be(mdhd_start, (uint32_t)(p - mdhd_start));
 
     /* hdlr (vide) */
-    uint8_t *hdlr_start = p; p += 4;
-    write_u32_be(p, FOURCC('h','d','l','r')); p += 4;
-    write_u32_be(p, 0); p += 4;
-    write_u32_be(p, 0); p += 4;
-    write_u32_be(p, FOURCC('v','i','d','e')); p += 4;
-    memset(p, 0, 16); p += 16;
+    uint8_t *hdlr_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('h', 'd', 'l', 'r'));
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4;
+    write_u32_be(p, FOURCC('v', 'i', 'd', 'e'));
+    p += 4;
+    memset(p, 0, 16);
+    p += 16;
     write_u32_be(hdlr_start, (uint32_t)(p - hdlr_start));
 
     /* minf */
-    uint8_t *minf_start = p; p += 4;
-    write_u32_be(p, FOURCC('m','i','n','f')); p += 4;
+    uint8_t *minf_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('m', 'i', 'n', 'f'));
+    p += 4;
 
     /* stbl */
-    uint8_t *stbl_start = p; p += 4;
-    write_u32_be(p, FOURCC('s','t','b','l')); p += 4;
+    uint8_t *stbl_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('s', 't', 'b', 'l'));
+    p += 4;
 
     /* stsd */
-    uint8_t *stsd_start = p; p += 4;
-    write_u32_be(p, FOURCC('s','t','s','d')); p += 4;
-    write_u32_be(p, 0); p += 4; /* version + flags */
-    write_u32_be(p, 1); p += 4; /* entry_count */
+    uint8_t *stsd_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('s', 't', 's', 'd'));
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4; /* version + flags */
+    write_u32_be(p, 1);
+    p += 4; /* entry_count */
 
     /* avc1 sample entry */
-    uint8_t *avc1_start = p; p += 4;
-    write_u32_be(p, FOURCC('a','v','c','1')); p += 4;
-    memset(p, 0, 6); p += 6;    /* reserved */
-    write_u16_be(p, 1); p += 2; /* data_reference_index */
-    memset(p, 0, 16); p += 16;  /* pre_defined + reserved */
-    write_u16_be(p, (uint16_t)width); p += 2;
-    write_u16_be(p, (uint16_t)height); p += 2;
-    memset(p, 0, 50); p += 50;  /* resolution, frame_count, compressorname, depth */
+    uint8_t *avc1_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('a', 'v', 'c', '1'));
+    p += 4;
+    memset(p, 0, 6);
+    p += 6; /* reserved */
+    write_u16_be(p, 1);
+    p += 2; /* data_reference_index */
+    memset(p, 0, 16);
+    p += 16; /* pre_defined + reserved */
+    write_u16_be(p, (uint16_t)width);
+    p += 2;
+    write_u16_be(p, (uint16_t)height);
+    p += 2;
+    memset(p, 0, 50);
+    p += 50; /* resolution, frame_count, compressorname, depth */
     write_u32_be(avc1_start, (uint32_t)(p - avc1_start));
     write_u32_be(stsd_start, (uint32_t)(p - stsd_start));
 
     /* stsz */
-    uint8_t *stsz_start = p; p += 4;
-    write_u32_be(p, FOURCC('s','t','s','z')); p += 4;
-    write_u32_be(p, 0); p += 4;
-    write_u32_be(p, (uint32_t)sample_size); p += 4; /* uniform sample size */
-    write_u32_be(p, sample_count); p += 4;
+    uint8_t *stsz_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('s', 't', 's', 'z'));
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4;
+    write_u32_be(p, (uint32_t)sample_size);
+    p += 4; /* uniform sample size */
+    write_u32_be(p, sample_count);
+    p += 4;
     write_u32_be(stsz_start, (uint32_t)(p - stsz_start));
 
     /* stco */
-    uint8_t *stco_start = p; p += 4;
-    write_u32_be(p, FOURCC('s','t','c','o')); p += 4;
-    write_u32_be(p, 0); p += 4;
-    write_u32_be(p, sample_count); p += 4; /* 1 chunk per sample for simplicity */
+    uint8_t *stco_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('s', 't', 'c', 'o'));
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4;
+    write_u32_be(p, sample_count);
+    p += 4; /* 1 chunk per sample for simplicity */
     for (uint32_t i = 0; i < sample_count; ++i) {
         write_u32_be(p, (uint32_t)(sample_payload_offset + i * sample_size));
         p += 4;
@@ -156,31 +223,50 @@ static size_t build_synthetic_mp4(uint8_t *buf, size_t max_size, uint32_t width,
     write_u32_be(stco_start, (uint32_t)(p - stco_start));
 
     /* stsc */
-    uint8_t *stsc_start = p; p += 4;
-    write_u32_be(p, FOURCC('s','t','s','c')); p += 4;
-    write_u32_be(p, 0); p += 4;
-    write_u32_be(p, 1); p += 4; /* 1 entry */
-    write_u32_be(p, 1); p += 4; /* first_chunk */
-    write_u32_be(p, 1); p += 4; /* samples_per_chunk */
-    write_u32_be(p, 1); p += 4; /* sample_description_index */
+    uint8_t *stsc_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('s', 't', 's', 'c'));
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4;
+    write_u32_be(p, 1);
+    p += 4; /* 1 entry */
+    write_u32_be(p, 1);
+    p += 4; /* first_chunk */
+    write_u32_be(p, 1);
+    p += 4; /* samples_per_chunk */
+    write_u32_be(p, 1);
+    p += 4; /* sample_description_index */
     write_u32_be(stsc_start, (uint32_t)(p - stsc_start));
 
     /* stts */
-    uint8_t *stts_start = p; p += 4;
-    write_u32_be(p, FOURCC('s','t','t','s')); p += 4;
-    write_u32_be(p, 0); p += 4;
-    write_u32_be(p, 1); p += 4;
-    write_u32_be(p, sample_count); p += 4; /* sample count */
-    write_u32_be(p, 33); p += 4;           /* sample delta (33 ms ~ 30fps) */
+    uint8_t *stts_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('s', 't', 't', 's'));
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4;
+    write_u32_be(p, 1);
+    p += 4;
+    write_u32_be(p, sample_count);
+    p += 4; /* sample count */
+    write_u32_be(p, 33);
+    p += 4; /* sample delta (33 ms ~ 30fps) */
     write_u32_be(stts_start, (uint32_t)(p - stts_start));
 
     /* stss (keyframes) */
-    uint8_t *stss_start = p; p += 4;
-    write_u32_be(p, FOURCC('s','t','s','s')); p += 4;
-    write_u32_be(p, 0); p += 4;
-    write_u32_be(p, 2); p += 4;
-    write_u32_be(p, 1); p += 4;            /* sample 1 is keyframe */
-    write_u32_be(p, sample_count / 2 + 1); p += 4; /* middle sample is keyframe */
+    uint8_t *stss_start = p;
+    p += 4;
+    write_u32_be(p, FOURCC('s', 't', 's', 's'));
+    p += 4;
+    write_u32_be(p, 0);
+    p += 4;
+    write_u32_be(p, 2);
+    p += 4;
+    write_u32_be(p, 1);
+    p += 4; /* sample 1 is keyframe */
+    write_u32_be(p, sample_count / 2 + 1);
+    p += 4; /* middle sample is keyframe */
     write_u32_be(stss_start, (uint32_t)(p - stss_start));
 
     write_u32_be(stbl_start, (uint32_t)(p - stbl_start));
@@ -193,7 +279,8 @@ static size_t build_synthetic_mp4(uint8_t *buf, size_t max_size, uint32_t width,
     return (size_t)(p - buf);
 }
 
-static void test_demuxer_zero_allocation(void) {
+static void test_demuxer_zero_allocation(void)
+{
     printf("[TEST] Running test_demuxer_zero_allocation...\n");
 
     uint8_t mp4_buf[65536];
@@ -232,7 +319,8 @@ static void test_demuxer_zero_allocation(void) {
     printf("[TEST] test_demuxer_zero_allocation PASSED.\n");
 }
 
-static void test_real_mp4_demuxing(void) {
+static void test_real_mp4_demuxing(void)
+{
     printf("[TEST] Running test_real_mp4_demuxing...\n");
     demuxer_t *d = demuxer_open_file("tests/test_video.mp4");
     if (!d) {
@@ -270,60 +358,92 @@ static void test_real_mp4_demuxing(void) {
 }
 
 /* Helper to build a minimal valid synthetic WebM/EBML container in memory */
-static size_t build_synthetic_webm(uint8_t *buf, size_t max_size, uint32_t width, uint32_t height, uint32_t sample_count) {
+static size_t build_synthetic_webm(uint8_t *buf, size_t max_size, uint32_t width, uint32_t height,
+                                   uint32_t sample_count)
+{
     uint8_t *p = buf;
 
     /* EBML Header: ID 0x1A45DFA3, size 0 */
-    *p++ = 0x1A; *p++ = 0x45; *p++ = 0xDF; *p++ = 0xA3;
+    *p++ = 0x1A;
+    *p++ = 0x45;
+    *p++ = 0xDF;
+    *p++ = 0xA3;
     *p++ = 0x80; /* size 0 */
 
     /* Segment: ID 0x18538067, 4-byte vint size */
-    *p++ = 0x18; *p++ = 0x53; *p++ = 0x80; *p++ = 0x67;
-    uint8_t *seg_sz = p; p += 4;
+    *p++ = 0x18;
+    *p++ = 0x53;
+    *p++ = 0x80;
+    *p++ = 0x67;
+    uint8_t *seg_sz = p;
+    p += 4;
     uint8_t *seg_content_start = p;
 
     /* Info: ID 0x1549A966 */
-    *p++ = 0x15; *p++ = 0x49; *p++ = 0xA9; *p++ = 0x66;
-    uint8_t *info_sz = p; p += 1;
+    *p++ = 0x15;
+    *p++ = 0x49;
+    *p++ = 0xA9;
+    *p++ = 0x66;
+    uint8_t *info_sz = p;
+    p += 1;
     uint8_t *info_start = p;
     /* TimecodeScale (ID 0x2AD7B1, 4 bytes = 1,000,000 ns / 1 ms) */
-    *p++ = 0x2A; *p++ = 0xD7; *p++ = 0xB1;
+    *p++ = 0x2A;
+    *p++ = 0xD7;
+    *p++ = 0xB1;
     *p++ = 0x84; /* size 4 */
-    write_u32_be(p, 1000000); p += 4;
+    write_u32_be(p, 1000000);
+    p += 4;
     *info_sz = (uint8_t)(0x80 | (p - info_start));
 
     /* Tracks: ID 0x1654AE6B */
-    *p++ = 0x16; *p++ = 0x54; *p++ = 0xAE; *p++ = 0x6B;
-    uint8_t *tracks_sz = p; p += 2;
+    *p++ = 0x16;
+    *p++ = 0x54;
+    *p++ = 0xAE;
+    *p++ = 0x6B;
+    uint8_t *tracks_sz = p;
+    p += 2;
     uint8_t *tracks_start = p;
 
     /* TrackEntry: ID 0xAE */
     *p++ = 0xAE;
-    uint8_t *entry_sz = p; p += 1;
+    uint8_t *entry_sz = p;
+    p += 1;
     uint8_t *entry_start = p;
 
     /* TrackNumber: ID 0xD7, size 1, value 1 */
-    *p++ = 0xD7; *p++ = 0x81; *p++ = 1;
+    *p++ = 0xD7;
+    *p++ = 0x81;
+    *p++ = 1;
 
     /* TrackType: ID 0x83, size 1, value 1 (video) */
-    *p++ = 0x83; *p++ = 0x81; *p++ = 1;
+    *p++ = 0x83;
+    *p++ = 0x81;
+    *p++ = 1;
 
     /* CodecID: ID 0x86, size 5, string "V_VP9" */
-    *p++ = 0x86; *p++ = 0x85;
-    memcpy(p, "V_VP9", 5); p += 5;
+    *p++ = 0x86;
+    *p++ = 0x85;
+    memcpy(p, "V_VP9", 5);
+    p += 5;
 
     /* Video: ID 0xE0 */
     *p++ = 0xE0;
-    uint8_t *vid_sz = p; p += 1;
+    uint8_t *vid_sz = p;
+    p += 1;
     uint8_t *vid_start = p;
 
     /* PixelWidth: ID 0xB0, size 2 */
-    *p++ = 0xB0; *p++ = 0x82;
-    write_u16_be(p, (uint16_t)width); p += 2;
+    *p++ = 0xB0;
+    *p++ = 0x82;
+    write_u16_be(p, (uint16_t)width);
+    p += 2;
 
     /* PixelHeight: ID 0xBA, size 2 */
-    *p++ = 0xBA; *p++ = 0x82;
-    write_u16_be(p, (uint16_t)height); p += 2;
+    *p++ = 0xBA;
+    *p++ = 0x82;
+    write_u16_be(p, (uint16_t)height);
+    p += 2;
 
     *vid_sz = (uint8_t)(0x80 | (p - vid_start));
     *entry_sz = (uint8_t)(0x80 | (p - entry_start));
@@ -334,13 +454,19 @@ static size_t build_synthetic_webm(uint8_t *buf, size_t max_size, uint32_t width
 
     /* Clusters */
     for (uint32_t i = 0; i < sample_count; ++i) {
-        *p++ = 0x1F; *p++ = 0x43; *p++ = 0xB6; *p++ = 0x75;
-        uint8_t *clus_sz = p; p += 2;
+        *p++ = 0x1F;
+        *p++ = 0x43;
+        *p++ = 0xB6;
+        *p++ = 0x75;
+        uint8_t *clus_sz = p;
+        p += 2;
         uint8_t *clus_start = p;
 
         /* ClusterTimecode: ID 0xE7, size 2 */
-        *p++ = 0xE7; *p++ = 0x82;
-        write_u16_be(p, (uint16_t)(i * 33)); p += 2;
+        *p++ = 0xE7;
+        *p++ = 0x82;
+        write_u16_be(p, (uint16_t)(i * 33));
+        p += 2;
 
         /* SimpleBlock: ID 0xA3 */
         *p++ = 0xA3;
@@ -348,9 +474,11 @@ static size_t build_synthetic_webm(uint8_t *buf, size_t max_size, uint32_t width
         *p++ = (uint8_t)(0x80 | block_payload_size);
 
         *p++ = 0x81; /* track 1 */
-        write_u16_be(p, 0); p += 2; /* rel time = 0 */
+        write_u16_be(p, 0);
+        p += 2;                                   /* rel time = 0 */
         *p++ = (i == 0 || i == 10) ? 0x80 : 0x00; /* keyframe flag (0x80 = keyframe) */
-        memset(p, 0xCC, 64); p += 64;
+        memset(p, 0xCC, 64);
+        p += 64;
 
         size_t clus_len = (size_t)(p - clus_start);
         clus_sz[0] = (uint8_t)(0x40 | (clus_len >> 8));
@@ -367,7 +495,8 @@ static size_t build_synthetic_webm(uint8_t *buf, size_t max_size, uint32_t width
     return (size_t)(p - buf);
 }
 
-static void test_webm_demuxer_zero_allocation(void) {
+static void test_webm_demuxer_zero_allocation(void)
+{
     printf("[TEST] Running test_webm_demuxer_zero_allocation...\n");
 
     uint8_t webm_buf[65536];
@@ -408,7 +537,8 @@ static void test_webm_demuxer_zero_allocation(void) {
     printf("[TEST] test_webm_demuxer_zero_allocation PASSED.\n");
 }
 
-static void test_vaapi_decoder_and_prime_export(void) {
+static void test_vaapi_decoder_and_prime_export(void)
+{
     printf("[TEST] Running test_vaapi_decoder_and_prime_export...\n");
 
     vaapi_decoder_t dec;
@@ -422,14 +552,12 @@ static void test_vaapi_decoder_and_prime_export(void) {
     assert(dec.va_profile != VAProfileNone);
 
     /* Submit synthetic I-frame packet (BUG-06 DPB verification) */
-    uint8_t dummy_nalu[32] = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E };
-    demux_packet_t pkt_i = {
-        .data = dummy_nalu,
-        .size = sizeof(dummy_nalu),
-        .pts_us = 0,
-        .dts_us = 0,
-        .is_keyframe = true
-    };
+    uint8_t dummy_nalu[32] = {0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E};
+    demux_packet_t pkt_i = {.data = dummy_nalu,
+                            .size = sizeof(dummy_nalu),
+                            .pts_us = 0,
+                            .dts_us = 0,
+                            .is_keyframe = true};
 
     VASurfaceID surf_i = VA_INVALID_SURFACE;
     bool dec_ok1 = vaapi_decoder_decode_packet(&dec, &pkt_i, &surf_i);
@@ -440,13 +568,11 @@ static void test_vaapi_decoder_and_prime_export(void) {
     assert(dec.dpb.entries[0].is_reference);
 
     /* Submit synthetic P-frame packet (BUG-06 DPB reference tracking) */
-    demux_packet_t pkt_p = {
-        .data = dummy_nalu,
-        .size = sizeof(dummy_nalu),
-        .pts_us = 33333,
-        .dts_us = 33333,
-        .is_keyframe = false
-    };
+    demux_packet_t pkt_p = {.data = dummy_nalu,
+                            .size = sizeof(dummy_nalu),
+                            .pts_us = 33333,
+                            .dts_us = 33333,
+                            .is_keyframe = false};
 
     VASurfaceID surf_p = VA_INVALID_SURFACE;
     bool dec_ok2 = vaapi_decoder_decode_packet(&dec, &pkt_p, &surf_p);
@@ -466,16 +592,18 @@ static void test_vaapi_decoder_and_prime_export(void) {
     assert(prime_frame.width == 1920);
     assert(prime_frame.height == 1080);
 
-    printf("  Exported PRIME 2 DMA-BUF: planes=%u, fd0=%d, mod=0x%016lx, format=0x%08x (DPB count: %zu)\n",
-           prime_frame.num_planes, prime_frame.fds[0],
-           (unsigned long)prime_frame.modifiers[0], prime_frame.drm_format, dec.dpb.count);
+    printf("  Exported PRIME 2 DMA-BUF: planes=%u, fd0=%d, mod=0x%016lx, format=0x%08x (DPB count: "
+           "%zu)\n",
+           prime_frame.num_planes, prime_frame.fds[0], (unsigned long)prime_frame.modifiers[0],
+           prime_frame.drm_format, dec.dpb.count);
 
     vaapi_prime_frame_close(&prime_frame);
     vaapi_decoder_destroy(&dec);
     printf("[TEST] test_vaapi_decoder_and_prime_export PASSED.\n");
 }
 
-static void test_high_precision_monotonic_timer(void) {
+static void test_high_precision_monotonic_timer(void)
+{
     printf("[TEST] Running test_high_precision_monotonic_timer...\n");
 
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -483,10 +611,8 @@ static void test_high_precision_monotonic_timer(void) {
 
     /* Target: 5 ms per tick */
     const int64_t target_interval_ns = 5000000LL;
-    struct itimerspec its = {
-        .it_interval = { 0, 0 },
-        .it_value = { .tv_sec = 0, .tv_nsec = target_interval_ns }
-    };
+    struct itimerspec its = {.it_interval = {0, 0},
+                             .it_value = {.tv_sec = 0, .tv_nsec = target_interval_ns}};
 
     int64_t total_jitter_ns = 0;
     const int num_ticks = 5;
@@ -502,7 +628,7 @@ static void test_high_precision_monotonic_timer(void) {
         FD_ZERO(&rfds);
         FD_SET(tfd, &rfds);
 
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
         int sel = select(tfd + 1, &rfds, NULL, NULL, &tv);
         assert(sel == 1);
 
@@ -513,8 +639,8 @@ static void test_high_precision_monotonic_timer(void) {
         struct timespec t_end;
         clock_gettime(CLOCK_MONOTONIC, &t_end);
 
-        int64_t elapsed_ns = (t_end.tv_sec - t_start.tv_sec) * 1000000000LL +
-                             (t_end.tv_nsec - t_start.tv_nsec);
+        int64_t elapsed_ns =
+            (t_end.tv_sec - t_start.tv_sec) * 1000000000LL + (t_end.tv_nsec - t_start.tv_nsec);
         int64_t jitter_ns = llabs(elapsed_ns - target_interval_ns);
         total_jitter_ns += jitter_ns;
     }
@@ -529,7 +655,8 @@ static void test_high_precision_monotonic_timer(void) {
     printf("[TEST] test_high_precision_monotonic_timer PASSED.\n");
 }
 
-int main(void) {
+int main(void)
+{
     printf("=========================================\n");
     printf("  Executing WayWal Phase 4 Test Suite\n");
     printf("=========================================\n");

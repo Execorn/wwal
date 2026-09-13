@@ -1,0 +1,63 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform highp sampler2D u_src_a;
+layout(binding = 2) uniform highp sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+uniform vec2  u_center;
+uniform float u_wave_freq; /* Ripple frequency */
+uniform float u_wave_amp;  /* Refraction amplitude */
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    vec2 center = (u_center.x > 0.0 || u_center.y > 0.0) ? u_center : vec2(0.5);
+
+    float aspect = float(u_resolution.x) / float(u_resolution.y);
+    vec2 delta = uv - center;
+    delta.x *= aspect;
+    float dist = length(delta);
+
+    float max_dist = length(vec2(max(center.x, 1.0 - center.x) * aspect,
+                                 max(center.y, 1.0 - center.y))) + 0.1;
+
+    float current_radius = u_progress * max_dist;
+    float wave_width = 0.18;
+    float freq = (u_wave_freq > 0.0) ? u_wave_freq : 32.0;
+    float amp = (u_wave_amp > 0.0) ? u_wave_amp : 0.04;
+
+    float diff = dist - current_radius;
+    float decay = (1.0 - u_progress) * (1.0 - u_progress);
+
+    vec2 norm_dir = (dist > 0.0001) ? (delta / dist) : vec2(0.0);
+    norm_dir.x /= aspect; /* Restore UV aspect */
+
+    float wave = 0.0;
+    float crest = 0.0;
+    if (abs(diff) < wave_width) {
+        float window = smoothstep(wave_width, 0.0, abs(diff));
+        wave = sin(diff * freq) * amp * decay * window;
+        crest = max(0.0, -wave / amp) * decay * 0.22;
+    }
+
+    vec2 refracted_uv = clamp(uv + norm_dir * wave, 0.0, 1.0);
+
+    vec4 color_a = texture(u_src_a, refracted_uv);
+    vec4 color_b = texture(u_src_b, refracted_uv);
+
+    /* Reveal incoming image inside the expanding shockwave */
+    float split = smoothstep(current_radius - 0.02, current_radius + 0.02, dist);
+    vec4 result = mix(color_b, color_a, split);
+
+    /* Specular water shimmer on wave crest */
+    result.rgb += vec3(crest);
+
+    imageStore(u_target, coord, clamp(result, 0.0, 1.0).bgra);
+}

@@ -239,6 +239,31 @@ test_phase3_exe = executable('test_phase3',
   ]
 )
 
+bench_transitions_exe = executable('bench_transitions',
+  'tests/bench_transitions.c',
+  'src/daemon/render_engine.c',
+  'src/daemon/gpu_compute.c',
+  'src/daemon/dmabuf_alloc.c',
+  'src/daemon/dmabuf_feedback.c',
+  'src/daemon/simd/simd_blend.c',
+  'src/daemon/simd/blend_scalar.c',
+  'src/daemon/simd/blend_avx2.c',
+  'src/daemon/simd/blend_avx512.c',
+  'src/daemon/simd/blend_neon.c',
+  include_directories: inc_dir,
+  dependencies: [
+    common_dep,
+    proto_dep,
+    wayland_client_dep,
+    libdrm_dep,
+    gbm_dep,
+    egl_dep,
+    glesv2_dep,
+    threads_dep,
+    m_dep
+  ]
+)
+
 test_phase4_exe = executable('test_phase4',
   'tests/test_phase4.c',
   'src/daemon/demuxer.c',

@@ -1,28 +1,29 @@
 #include "wayland_core.h"
+
 #include "waywal/log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static void registry_global(void *data, struct wl_registry *registry,
-                            uint32_t name, const char *interface, uint32_t version) {
+static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
+                            const char *interface, uint32_t version)
+{
     daemon_state_t *state = (daemon_state_t *)data;
 
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
         uint32_t ver = version >= 4 ? 4 : version;
-        state->compositor = (struct wl_compositor *)wl_registry_bind(
-            registry, name, &wl_compositor_interface, ver);
+        state->compositor =
+            (struct wl_compositor *)wl_registry_bind(registry, name, &wl_compositor_interface, ver);
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
-        state->shm = (struct wl_shm *)wl_registry_bind(
-            registry, name, &wl_shm_interface, 1);
+        state->shm = (struct wl_shm *)wl_registry_bind(registry, name, &wl_shm_interface, 1);
     } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
         uint32_t ver = version >= 4 ? 4 : version;
         state->layer_shell = (struct zwlr_layer_shell_v1 *)wl_registry_bind(
             registry, name, &zwlr_layer_shell_v1_interface, ver);
     } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
-        state->viewporter = (struct wp_viewporter *)wl_registry_bind(
-            registry, name, &wp_viewporter_interface, 1);
+        state->viewporter =
+            (struct wp_viewporter *)wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
     } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
         state->fract_manager = (struct wp_fractional_scale_manager_v1 *)wl_registry_bind(
             registry, name, &wp_fractional_scale_manager_v1_interface, 1);
@@ -43,17 +44,25 @@ static void registry_global(void *data, struct wl_registry *registry,
             state->outputs = state->output_mgr.head;
             state->num_outputs = state->output_mgr.count;
             WAYWAL_LOG_INFO("Discovered Wayland output id %u", name);
+            if (state->layer_shell) {
+                output_node_create_surface(state, node);
+                output_node_render_color(state, node, state->current_color);
+            }
         }
     }
 }
 
-static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) {
+static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name)
+{
     (void)registry;
     daemon_state_t *state = (daemon_state_t *)data;
 
     output_node_t *node = output_manager_find_by_id(&state->output_mgr, name);
     if (node) {
         WAYWAL_LOG_INFO("Removing Wayland output id %u (%s)", name, node->name);
+        if (state->video_engine.target_output == node) {
+            state->video_engine.target_output = NULL;
+        }
         output_node_destroy_surface(node);
         output_manager_remove(&state->output_mgr, name);
         state->outputs = state->output_mgr.head;
@@ -62,16 +71,19 @@ static void registry_global_remove(void *data, struct wl_registry *registry, uin
 }
 
 static const struct wl_registry_listener registry_listener = {
-    .global        = registry_global,
+    .global = registry_global,
     .global_remove = registry_global_remove,
 };
 
-bool daemon_wayland_init(daemon_state_t *state) {
-    if (!state) return false;
+bool daemon_wayland_init(daemon_state_t *state)
+{
+    if (!state)
+        return false;
 
     state->display = wl_display_connect(NULL);
     if (!state->display) {
-        WAYWAL_LOG_ERR("Could not connect to Wayland display (check $WAYLAND_DISPLAY / $XDG_RUNTIME_DIR)");
+        WAYWAL_LOG_ERR(
+            "Could not connect to Wayland display (check $WAYLAND_DISPLAY / $XDG_RUNTIME_DIR)");
         return false;
     }
 
@@ -139,14 +151,17 @@ bool daemon_wayland_init(daemon_state_t *state) {
         return false;
     }
 
-    WAYWAL_LOG_INFO("Wayland connection established successfully with %zu output(s) (Direct Scanout: %s)",
-                  state->num_outputs,
-                  (state->dmabuf_ctx.available && state->dmabuf_ctx.dmabuf_proto) ? "ENABLED" : "FALLBACK");
+    WAYWAL_LOG_INFO(
+        "Wayland connection established successfully with %zu output(s) (Direct Scanout: %s)",
+        state->num_outputs,
+        (state->dmabuf_ctx.available && state->dmabuf_ctx.dmabuf_proto) ? "ENABLED" : "FALLBACK");
     return true;
 }
 
-void daemon_wayland_destroy(daemon_state_t *state) {
-    if (!state) return;
+void daemon_wayland_destroy(daemon_state_t *state)
+{
+    if (!state)
+        return;
 
     output_node_t *out = state->outputs;
     while (out) {

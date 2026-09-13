@@ -2,46 +2,49 @@
 #define _GNU_SOURCE
 #endif
 #include "waywal/security.h"
+
 #include "waywal/log.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/landlock.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
-#include <linux/landlock.h>
-#include <sched.h>
+#include <unistd.h>
 
 #ifdef HAVE_LIBSECCOMP
 #include <seccomp.h>
 #endif
 
 #ifndef landlock_create_ruleset
-static inline int landlock_create_ruleset(
-    const struct landlock_ruleset_attr *const attr,
-    const size_t size, const __u32 flags) {
+static inline int landlock_create_ruleset(const struct landlock_ruleset_attr *const attr,
+                                          const size_t size, const __u32 flags)
+{
     return (int)syscall(SYS_landlock_create_ruleset, attr, size, flags);
 }
 #endif
 
 #ifndef landlock_add_rule
-static inline int landlock_add_rule(
-    const int ruleset_fd, const enum landlock_rule_type rule_type,
-    const void *const rule_attr, const __u32 flags) {
+static inline int landlock_add_rule(const int ruleset_fd, const enum landlock_rule_type rule_type,
+                                    const void *const rule_attr, const __u32 flags)
+{
     return (int)syscall(SYS_landlock_add_rule, ruleset_fd, rule_type, rule_attr, flags);
 }
 #endif
 
 #ifndef landlock_restrict_self
-static inline int landlock_restrict_self(const int ruleset_fd, const __u32 flags) {
+static inline int landlock_restrict_self(const int ruleset_fd, const __u32 flags)
+{
     return (int)syscall(SYS_landlock_restrict_self, ruleset_fd, flags);
 }
 #endif
 
-bool security_sandbox_apply(const char *runtime_dir) {
+bool security_sandbox_apply(const char *runtime_dir)
+{
     /* 1. Prevent privilege escalation */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         WAYWAL_LOG_WARN("PR_SET_NO_NEW_PRIVS failed: %s", strerror(errno));
@@ -54,24 +57,21 @@ bool security_sandbox_apply(const char *runtime_dir) {
     if (abi > 0) {
         struct landlock_ruleset_attr attr;
         memset(&attr, 0, sizeof(attr));
-        attr.handled_access_fs =
-            LANDLOCK_ACCESS_FS_EXECUTE |
-            LANDLOCK_ACCESS_FS_READ_FILE |
-            LANDLOCK_ACCESS_FS_READ_DIR |
-            LANDLOCK_ACCESS_FS_WRITE_FILE |
-            LANDLOCK_ACCESS_FS_MAKE_REG |
-            LANDLOCK_ACCESS_FS_REMOVE_FILE;
+        attr.handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE |
+                                 LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_WRITE_FILE |
+                                 LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE;
 
         int ruleset_fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
         if (ruleset_fd >= 0) {
             /* Allow read-only across standard system mounts required for DRM/Mesa/VA-API drivers */
-            const char *ro_paths[] = { "/", "/usr", "/etc", "/sys", "/proc", "/dev", "/home", NULL };
+            const char *ro_paths[] = {"/", "/usr", "/etc", "/sys", "/proc", "/dev", "/home", NULL};
             for (int i = 0; ro_paths[i] != NULL; ++i) {
                 int dir_fd = open(ro_paths[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
                 if (dir_fd >= 0) {
                     struct landlock_path_beneath_attr path_attr = {
-                        .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR,
-                        .parent_fd      = dir_fd,
+                        .allowed_access =
+                            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR,
+                        .parent_fd = dir_fd,
                     };
                     landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
                     close(dir_fd);
@@ -79,7 +79,7 @@ bool security_sandbox_apply(const char *runtime_dir) {
             }
 
             /* Allow read-write strictly for DRI device nodes (/dev/dri) and /tmp (ARCH-07) */
-            const char *rw_paths[] = { "/dev/dri", "/tmp", NULL };
+            const char *rw_paths[] = {"/dev/dri", "/tmp", NULL};
             for (int i = 0; rw_paths[i] != NULL; ++i) {
                 int dir_fd = open(rw_paths[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
                 if (dir_fd < 0 && strcmp(rw_paths[i], "/dev/dri") == 0) {
@@ -88,12 +88,11 @@ bool security_sandbox_apply(const char *runtime_dir) {
                 }
                 if (dir_fd >= 0) {
                     struct landlock_path_beneath_attr path_attr = {
-                        .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE |
-                                          LANDLOCK_ACCESS_FS_READ_DIR |
-                                          LANDLOCK_ACCESS_FS_WRITE_FILE |
-                                          LANDLOCK_ACCESS_FS_MAKE_REG |
-                                          LANDLOCK_ACCESS_FS_REMOVE_FILE,
-                        .parent_fd      = dir_fd,
+                        .allowed_access =
+                            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
+                            LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_MAKE_REG |
+                            LANDLOCK_ACCESS_FS_REMOVE_FILE,
+                        .parent_fd = dir_fd,
                     };
                     landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
                     close(dir_fd);
@@ -106,12 +105,11 @@ bool security_sandbox_apply(const char *runtime_dir) {
                 int rt_fd = open(rt, O_PATH | O_DIRECTORY | O_CLOEXEC);
                 if (rt_fd >= 0) {
                     struct landlock_path_beneath_attr path_attr = {
-                        .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE |
-                                          LANDLOCK_ACCESS_FS_READ_DIR |
-                                          LANDLOCK_ACCESS_FS_WRITE_FILE |
-                                          LANDLOCK_ACCESS_FS_MAKE_REG |
-                                          LANDLOCK_ACCESS_FS_REMOVE_FILE,
-                        .parent_fd      = rt_fd,
+                        .allowed_access =
+                            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
+                            LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_MAKE_REG |
+                            LANDLOCK_ACCESS_FS_REMOVE_FILE,
+                        .parent_fd = rt_fd,
                     };
                     landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
                     close(rt_fd);
@@ -133,22 +131,10 @@ bool security_sandbox_apply(const char *runtime_dir) {
     if (ctx) {
         /* Denied Dangerous Syscalls -> SCMP_ACT_KILL (SOTA-09) */
         const int denied_syscalls[] = {
-            SCMP_SYS(execve),
-            SCMP_SYS(execveat),
-            SCMP_SYS(fork),
-            SCMP_SYS(vfork),
-            SCMP_SYS(ptrace),
-            SCMP_SYS(kill),
-            SCMP_SYS(tkill),
-            SCMP_SYS(tgkill),
-            SCMP_SYS(mount),
-            SCMP_SYS(umount2),
-            SCMP_SYS(chroot),
-            SCMP_SYS(pivot_root),
-            SCMP_SYS(reboot),
-            SCMP_SYS(kexec_load),
-            SCMP_SYS(init_module),
-            SCMP_SYS(delete_module),
+            SCMP_SYS(execve), SCMP_SYS(execveat),   SCMP_SYS(fork),        SCMP_SYS(vfork),
+            SCMP_SYS(ptrace), SCMP_SYS(kill),       SCMP_SYS(tkill),       SCMP_SYS(tgkill),
+            SCMP_SYS(mount),  SCMP_SYS(umount2),    SCMP_SYS(chroot),      SCMP_SYS(pivot_root),
+            SCMP_SYS(reboot), SCMP_SYS(kexec_load), SCMP_SYS(init_module), SCMP_SYS(delete_module),
             SCMP_SYS(bpf),
         };
 
@@ -158,9 +144,11 @@ bool security_sandbox_apply(const char *runtime_dir) {
             }
         }
 
-        /* Clone handling: allow threads (CLONE_THREAD for driver worker threads), kill process forking */
-        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(clone), 1,
-                         SCMP_A0(SCMP_CMP_MASKED_EQ, (scmp_datum_t)CLONE_THREAD, (scmp_datum_t)CLONE_THREAD));
+        /* Clone handling: allow threads (CLONE_THREAD for driver worker threads), kill process
+         * forking */
+        seccomp_rule_add(
+            ctx, SCMP_ACT_ALLOW, SCMP_SYS(clone), 1,
+            SCMP_A0(SCMP_CMP_MASKED_EQ, (scmp_datum_t)CLONE_THREAD, (scmp_datum_t)CLONE_THREAD));
         seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 1,
                          SCMP_A0(SCMP_CMP_MASKED_EQ, (scmp_datum_t)CLONE_THREAD, 0));
 
@@ -218,6 +206,9 @@ bool security_sandbox_apply(const char *runtime_dir) {
             SCMP_SYS(dup3),
             SCMP_SYS(pipe),
             SCMP_SYS(pipe2),
+            SCMP_SYS(ftruncate),
+            SCMP_SYS(unlink),
+            SCMP_SYS(unlinkat),
             SCMP_SYS(open),
             SCMP_SYS(openat),
             SCMP_SYS(access),

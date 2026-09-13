@@ -1,18 +1,19 @@
+#include "waywal/arena.h"
+#include "waywal/ipc_proto.h"
+#include "waywal/log.h"
+#include "waywal/os_compat.h"
+#include "waywal/path.h"
+
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
-#include <unistd.h>
-#include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-#include "waywal/arena.h"
-#include "waywal/path.h"
-#include "waywal/log.h"
-#include "waywal/os_compat.h"
-#include "waywal/ipc_proto.h"
-
-static void test_arena(void) {
+static void test_arena(void)
+{
     printf("[TEST] Running test_arena...\n");
 
     arena_t arena;
@@ -76,7 +77,8 @@ static void test_arena(void) {
     printf("[TEST] test_arena PASSED.\n");
 }
 
-static void test_path(void) {
+static void test_path(void)
+{
     printf("[TEST] Running test_path...\n");
 
     path_buf_t pb;
@@ -152,7 +154,8 @@ static void test_path(void) {
     printf("[TEST] test_path PASSED.\n");
 }
 
-static void test_ipc_roundtrip(void) {
+static void test_ipc_roundtrip(void)
+{
     printf("[TEST] Running test_ipc_roundtrip...\n");
 
     /* Verify fixed 16-byte header size */
@@ -173,9 +176,9 @@ static void test_ipc_roundtrip(void) {
 
     /* Send IPC message with SCM_RIGHTS */
     waywal_ipc_hdr_t send_hdr = {
-        .magic        = WAYWAL_IPC_MAGIC,
-        .version      = WAYWAL_IPC_VERSION,
-        .opcode       = WAYWAL_REQ_SET_IMAGE,
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_SET_IMAGE,
         .payload_size = 4096,
     };
 
@@ -209,7 +212,8 @@ static void test_ipc_roundtrip(void) {
     printf("[TEST] test_ipc_roundtrip PASSED.\n");
 }
 
-int main(void) {
+int main(void)
+{
     waywal_log_set_level(WAYWAL_LOG_LEVEL_WARN);
     printf("=========================================\n");
     printf("  Executing WayWal Phase 1 Test Suite\n");

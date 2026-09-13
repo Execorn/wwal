@@ -1,0 +1,31 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform sampler2D u_src_a;
+layout(binding = 2) uniform sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    // Dynamic mosaic tile scale, peaking at midpoint
+    float d = sin(u_progress * 3.1415926535) * 64.0 + 1.0;
+    vec2 quant_coord = (floor(vec2(coord) / d) * d + vec2(d * 0.5) + vec2(0.5)) / vec2(u_resolution);
+
+    vec4 c1 = texture(u_src_a, quant_coord);
+    vec4 c2 = texture(u_src_b, quant_coord);
+
+    vec4 col = mix(c1, c2, u_progress);
+
+    // Format alignment for DRM_FORMAT_ARGB8888 little-endian
+    imageStore(u_target, coord, col.bgra);
+}

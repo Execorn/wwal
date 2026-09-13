@@ -1,9 +1,9 @@
 #ifndef WAYWAL_TYPES_H
 #define WAYWAL_TYPES_H
 
-#include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,7 +32,7 @@ typedef union {
 } color_rgba_t;
 
 typedef enum {
-    WAYWAL_FORMAT_INVALID  = 0,
+    WAYWAL_FORMAT_INVALID = 0,
     WAYWAL_FORMAT_ARGB8888 = 1,
     WAYWAL_FORMAT_XRGB8888 = 2,
 } waywal_pixel_format_t;

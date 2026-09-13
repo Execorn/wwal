@@ -36,7 +36,7 @@ _wwal() {
                 img)
                     _arguments \
                         $global_opts \
-                        '--transition-type[Transition type]:type:(none simple fade wipe grow outer wave noise)' \
+                        '--transition-type[Transition type]:type:(none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl)' \
                         '--transition-duration[Transition duration in seconds]:duration:' \
                         '--transition-fps[Target frame rate]:fps:' \
                         '--transition-angle[Transition angle in degrees]:angle:' \

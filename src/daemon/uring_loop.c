@@ -1,14 +1,17 @@
 #include "waywal/uring_loop.h"
+
 #include "waywal/log.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
 
-bool uring_loop_init(uring_loop_t *loop, uint32_t depth) {
-    if (!loop) return false;
+bool uring_loop_init(uring_loop_t *loop, uint32_t depth)
+{
+    if (!loop)
+        return false;
     memset(loop, 0, sizeof(*loop));
 
     uint32_t qdepth = depth > 0 ? depth : WAYWAL_URING_QUEUE_DEPTH;
@@ -32,12 +35,15 @@ bool uring_loop_init(uring_loop_t *loop, uint32_t depth) {
     loop->initialized = true;
     loop->running = true;
     loop->multishot_supported = true;
-    WAYWAL_LOG_INFO("Linux io_uring event loop initialized (depth: %u, multishot poll: ENABLED)", qdepth);
+    WAYWAL_LOG_INFO("Linux io_uring event loop initialized (depth: %u, multishot poll: ENABLED)",
+                    qdepth);
     return true;
 }
 
-void uring_loop_destroy(uring_loop_t *loop) {
-    if (!loop || !loop->initialized) return;
+void uring_loop_destroy(uring_loop_t *loop)
+{
+    if (!loop || !loop->initialized)
+        return;
 
     loop->running = false;
     io_uring_queue_exit(&loop->ring);
@@ -45,8 +51,11 @@ void uring_loop_destroy(uring_loop_t *loop) {
     WAYWAL_LOG_INFO("io_uring event loop terminated");
 }
 
-bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_event_type_t type, void *user_data) {
-    if (!loop || !loop->initialized || fd < 0) return false;
+bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_event_type_t type,
+                         void *user_data)
+{
+    if (!loop || !loop->initialized || fd < 0)
+        return false;
 
     /* Find existing or free slot */
     uring_slot_t *slot = NULL;
@@ -67,7 +76,8 @@ bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_e
     }
 
     if (!slot) {
-        WAYWAL_LOG_ERR("No free io_uring event slots available (limit: %d)", WAYWAL_URING_QUEUE_DEPTH);
+        WAYWAL_LOG_ERR("No free io_uring event slots available (limit: %d)",
+                       WAYWAL_URING_QUEUE_DEPTH);
         return false;
     }
 
@@ -99,26 +109,31 @@ bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_e
     return true;
 }
 
-int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler) {
-    if (!loop || !loop->initialized || !handler) return -EINVAL;
+int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
+{
+    if (!loop || !loop->initialized || !handler)
+        return -EINVAL;
 
     struct io_uring_cqe *cqe = NULL;
     int ret = io_uring_wait_cqe(&loop->ring, &cqe);
     if (ret < 0) {
-        if (ret == -EINTR) return 0;
+        if (ret == -EINTR)
+            return 0;
         return ret;
     }
 
     unsigned head;
     unsigned count = 0;
 
-    io_uring_for_each_cqe(&loop->ring, head, cqe) {
+    io_uring_for_each_cqe(&loop->ring, head, cqe)
+    {
         count++;
         uring_slot_t *slot = (uring_slot_t *)io_uring_cqe_get_data(cqe);
         if (slot && slot->active) {
             handler(slot->type, slot->fd, (uint32_t)cqe->res, slot->user_data);
 
-            bool multishot_continues = slot->is_multishot && ((cqe->flags & IORING_CQE_F_MORE) != 0);
+            bool multishot_continues =
+                slot->is_multishot && ((cqe->flags & IORING_CQE_F_MORE) != 0);
 
             /* Re-arm poll if slot remains active and multishot didn't continue */
             if (slot->active && loop->running && !multishot_continues) {
@@ -140,7 +155,8 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler) {
     return (int)count;
 }
 
-void uring_loop_stop(uring_loop_t *loop) {
+void uring_loop_stop(uring_loop_t *loop)
+{
     if (loop) {
         loop->running = false;
     }

@@ -1,8 +1,8 @@
 #ifndef WAYWAL_PATH_H
 #define WAYWAL_PATH_H
 
-#include <stddef.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,7 +11,7 @@ extern "C" {
 #define WAYWAL_PATH_MAX 4096
 
 typedef struct {
-    char   data[WAYWAL_PATH_MAX];
+    char data[WAYWAL_PATH_MAX];
     size_t len; /* Length excluding final null terminator */
 } path_buf_t;
 

@@ -3,13 +3,18 @@
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
 
-void blend_scanline_neon(
-    uint8_t *restrict dst,
-    const uint8_t *restrict src_a,
-    const uint8_t *restrict src_b,
-    uint16_t weight_b,
-    size_t num_bytes
-) {
+void blend_scanline_neon(uint8_t *restrict dst, const uint8_t *restrict src_a,
+                         const uint8_t *restrict src_b, uint16_t weight_b, size_t num_bytes)
+{
+    if (weight_b == 0) {
+        memcpy(dst, src_a, num_bytes);
+        return;
+    }
+    if (weight_b >= 256) {
+        memcpy(dst, src_b, num_bytes);
+        return;
+    }
+
     uint8x8_t wb = vdup_n_u8((uint8_t)weight_b);
     uint8x8_t wa = vdup_n_u8((uint8_t)(256 - weight_b));
 

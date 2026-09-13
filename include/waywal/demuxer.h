@@ -1,9 +1,9 @@
 #ifndef WAYWAL_DEMUXER_H
 #define WAYWAL_DEMUXER_H
 
-#include <stdint.h>
-#include <stddef.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,30 +19,30 @@ typedef enum {
 
 typedef struct {
     const uint8_t *data;
-    size_t         size;
-    int64_t        pts_us;     /* Presentation timestamp in microseconds */
-    int64_t        dts_us;     /* Decode timestamp in microseconds */
-    bool           is_keyframe;
+    size_t size;
+    int64_t pts_us; /* Presentation timestamp in microseconds */
+    int64_t dts_us; /* Decode timestamp in microseconds */
+    bool is_keyframe;
 } demux_packet_t;
 
 typedef struct demuxer demuxer_t;
 
 struct demuxer {
     const uint8_t *mapped_buf;
-    size_t         mapped_size;
+    size_t mapped_size;
     waywal_codec_t codec;
-    uint32_t       width;
-    uint32_t       height;
-    uint32_t       fps_num;
-    uint32_t       fps_den;
-    int64_t        duration_us;
+    uint32_t width;
+    uint32_t height;
+    uint32_t fps_num;
+    uint32_t fps_den;
+    int64_t duration_us;
 
     /* Codec-specific extradata (e.g. SPS/PPS for H.264/HEVC) */
     const uint8_t *extradata;
-    size_t         extradata_size;
+    size_t extradata_size;
 
     /* Internal parser state */
-    void          *internal_state;
+    void *internal_state;
 
     /* Demuxer vtable */
     bool (*read_packet)(demuxer_t *d, demux_packet_t *pkt);
