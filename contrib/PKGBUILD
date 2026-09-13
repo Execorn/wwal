@@ -1,0 +1,44 @@
+# Maintainer: Execorn <execorn@users.noreply.github.com>
+pkgname=wwal-git
+pkgver=1.0.0.r0
+pkgrel=1
+pkgdesc="Modern high-performance Wayland wallpaper daemon and client (C23)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Execorn/wwal"
+license=('MIT')
+depends=(
+  'wayland'
+  'libdrm'
+  'mesa'
+  'libva'
+  'liburing'
+  'libseccomp'
+  'libpng'
+  'libjpeg-turbo'
+)
+makedepends=(
+  'git'
+  'meson'
+  'ninja'
+  'wayland-protocols'
+)
+provides=('wwal' 'wwald')
+conflicts=('wwal')
+
+pkgver() {
+  cd "${srcdir}/.."
+  git describe --long --tags 2>/dev/null | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' || echo "1.0.0.r$(git rev-list --count HEAD).g$(git rev-parse --short HEAD)"
+}
+
+build() {
+  arch-meson "${srcdir}/.." build \
+    -Doptimization=3 \
+    -Db_lto=true \
+    -Db_pie=true \
+    -Denable_systemd=true
+  ninja -C build
+}
+
+package() {
+  DESTDIR="${pkgdir}" ninja -C build install
+}
