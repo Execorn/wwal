@@ -32,7 +32,14 @@ typedef enum {
     WAYWAL_TRANSITION_LUMA = 17,
     WAYWAL_TRANSITION_LIGHT_LEAK = 18,
     WAYWAL_TRANSITION_PAGE_CURL = 19,
+    WAYWAL_TRANSITION_CUSTOM = 20,
+    WAYWAL_TRANSITION_RANDOM = 21,
 } waywal_transition_type_t;
+
+typedef enum {
+    WAYWAL_SYNC_SIMULTANEOUS = 0,
+    WAYWAL_SYNC_STAGGERED = 1,
+} waywal_sync_mode_t;
 
 typedef struct {
     waywal_transition_type_t type;
@@ -57,6 +64,12 @@ bool render_engine_init(render_engine_t *re, dmabuf_context_t *dmabuf_ctx);
 
 /* Destroys render engine and associated GPU compute resources */
 void render_engine_destroy(render_engine_t *re);
+
+/* Releases OpenGL texture and EGLImage associated with a dmabuf BO */
+void render_engine_release_bo(render_engine_t *re, dmabuf_bo_t *bo);
+
+/* Hot-compiles and loads an arbitrary GLSL compute shader for CUSTOM transition */
+bool render_engine_load_custom_shader(render_engine_t *re, const char *shader_src);
 
 /* Executes transition between old_bo and new_bo, outputting directly to target_bo */
 bool render_engine_execute_transition(render_engine_t *re, dmabuf_bo_t *target_bo,

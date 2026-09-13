@@ -50,6 +50,20 @@ void render_engine_destroy(render_engine_t *re)
     }
 }
 
+bool render_engine_load_custom_shader(render_engine_t *re, const char *shader_src)
+{
+    if (!re || !re->has_gpu_compute || !re->gpu_ctx || !shader_src)
+        return false;
+    return gpu_compute_load_custom_shader((gpu_compute_ctx_t *)re->gpu_ctx, shader_src);
+}
+
+void render_engine_release_bo(render_engine_t *re, dmabuf_bo_t *bo)
+{
+    if (!re || !re->has_gpu_compute || !re->gpu_ctx || !bo)
+        return;
+    gpu_compute_release_bo((gpu_compute_ctx_t *)re->gpu_ctx, bo);
+}
+
 static inline float clampf(float v, float min_v, float max_v)
 {
     if (v < min_v)

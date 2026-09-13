@@ -46,6 +46,7 @@ struct gpu_compute_ctx {
     GLuint prog_luma;
     GLuint prog_light_leak;
     GLuint prog_page_curl;
+    GLuint prog_custom;
 
     gpu_program_uniforms_t unif_fade;
     gpu_program_uniforms_t unif_wipe;
@@ -65,6 +66,7 @@ struct gpu_compute_ctx {
     gpu_program_uniforms_t unif_luma;
     gpu_program_uniforms_t unif_light_leak;
     gpu_program_uniforms_t unif_page_curl;
+    gpu_program_uniforms_t unif_custom;
 
     PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
     PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
@@ -453,6 +455,15 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         prog = ctx->prog_page_curl;
         u = &ctx->unif_page_curl;
         break;
+    case WAYWAL_TRANSITION_CUSTOM:
+        if (ctx->prog_custom) {
+            prog = ctx->prog_custom;
+            u = &ctx->unif_custom;
+        } else {
+            prog = ctx->prog_fade;
+            u = &ctx->unif_fade;
+        }
+        break;
     case WAYWAL_TRANSITION_FADE:
     case WAYWAL_TRANSITION_SIMPLE:
     default:
@@ -546,6 +557,8 @@ void gpu_compute_destroy(gpu_compute_ctx_t *ctx)
             glDeleteProgram(ctx->prog_light_leak);
         if (ctx->prog_page_curl)
             glDeleteProgram(ctx->prog_page_curl);
+        if (ctx->prog_custom)
+            glDeleteProgram(ctx->prog_custom);
 
         eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (ctx->context != EGL_NO_CONTEXT) {
@@ -569,4 +582,27 @@ void gpu_compute_release_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
         ctx->eglDestroyImageKHR(ctx->display, bo->egl_image);
         bo->egl_image = NULL;
     }
+}
+
+bool gpu_compute_load_custom_shader(gpu_compute_ctx_t *ctx, const char *src)
+{
+    if (!ctx || !src || ctx->display == EGL_NO_DISPLAY || ctx->context == EGL_NO_CONTEXT)
+        return false;
+
+    eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+
+    if (ctx->prog_custom) {
+        glDeleteProgram(ctx->prog_custom);
+        ctx->prog_custom = 0;
+    }
+
+    ctx->prog_custom = compile_shader_program(src, "custom_user_shader");
+    if (!ctx->prog_custom) {
+        WAYWAL_LOG_ERR("Failed to compile and link custom compute shader");
+        return false;
+    }
+
+    query_program_uniforms(ctx->prog_custom, &ctx->unif_custom);
+    WAYWAL_LOG_INFO("Loaded custom user compute shader successfully (prog=%u)", ctx->prog_custom);
+    return true;
 }

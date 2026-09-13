@@ -5,6 +5,142 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
+                          struct wl_surface *surface, wl_fixed_t surface_x, wl_fixed_t surface_y)
+{
+    (void)pointer;
+    (void)serial;
+    daemon_state_t *state = (daemon_state_t *)data;
+    if (!state || !surface)
+        return;
+
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (out->surface == surface) {
+            out->cursor_x = wl_fixed_to_double(surface_x);
+            out->cursor_y = wl_fixed_to_double(surface_y);
+            out->has_cursor = true;
+            break;
+        }
+    }
+}
+
+static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
+                          struct wl_surface *surface)
+{
+    (void)data;
+    (void)pointer;
+    (void)serial;
+    (void)surface;
+}
+
+static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
+                           wl_fixed_t surface_x, wl_fixed_t surface_y)
+{
+    (void)pointer;
+    (void)time;
+    daemon_state_t *state = (daemon_state_t *)data;
+    if (!state)
+        return;
+
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (out->has_cursor) {
+            out->cursor_x = wl_fixed_to_double(surface_x);
+            out->cursor_y = wl_fixed_to_double(surface_y);
+            break;
+        }
+    }
+}
+
+static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time,
+                           uint32_t button, uint32_t state)
+{
+    (void)data;
+    (void)pointer;
+    (void)serial;
+    (void)time;
+    (void)button;
+    (void)state;
+}
+
+static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis,
+                         wl_fixed_t value)
+{
+    (void)data;
+    (void)pointer;
+    (void)time;
+    (void)axis;
+    (void)value;
+}
+
+static void pointer_frame(void *data, struct wl_pointer *pointer)
+{
+    (void)data;
+    (void)pointer;
+}
+
+static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t axis_source)
+{
+    (void)data;
+    (void)pointer;
+    (void)axis_source;
+}
+
+static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis)
+{
+    (void)data;
+    (void)pointer;
+    (void)time;
+    (void)axis;
+}
+
+static void pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis,
+                                  int32_t discrete)
+{
+    (void)data;
+    (void)pointer;
+    (void)axis;
+    (void)discrete;
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = pointer_enter,
+    .leave = pointer_leave,
+    .motion = pointer_motion,
+    .button = pointer_button,
+    .axis = pointer_axis,
+    .frame = pointer_frame,
+    .axis_source = pointer_axis_source,
+    .axis_stop = pointer_axis_stop,
+    .axis_discrete = pointer_axis_discrete,
+};
+
+static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities)
+{
+    daemon_state_t *state = (daemon_state_t *)data;
+    if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && !state->pointer) {
+        state->pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(state->pointer, &pointer_listener, state);
+    } else if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) && state->pointer) {
+        wl_pointer_destroy(state->pointer);
+        state->pointer = NULL;
+    }
+}
+
+static void seat_name(void *data, struct wl_seat *seat, const char *name)
+{
+    (void)data;
+    (void)seat;
+    (void)name;
+}
+
+static const struct wl_seat_listener seat_listener = {
+    .capabilities = seat_capabilities,
+    .name = seat_name,
+};
 
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
                             const char *interface, uint32_t version)
@@ -37,6 +173,11 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
             registry, name, &wp_presentation_interface, 1);
         state->output_mgr.wp_pres = state->presentation;
         WAYWAL_LOG_INFO("Bound wp_presentation interface");
+    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        uint32_t ver = version >= 5 ? 5 : version;
+        state->seat = (struct wl_seat *)wl_registry_bind(registry, name, &wl_seat_interface, ver);
+        wl_seat_add_listener(state->seat, &seat_listener, state);
+        WAYWAL_LOG_INFO("Bound wl_seat interface version %u", ver);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
         output_node_t *node = output_manager_add(&state->output_mgr, registry, name, version);
         if (node) {
@@ -178,6 +319,14 @@ void daemon_wayland_destroy(daemon_state_t *state)
     /* Destroy hardware scanout context */
     dmabuf_context_destroy(&state->dmabuf_ctx);
 
+    if (state->pointer) {
+        wl_pointer_destroy(state->pointer);
+        state->pointer = NULL;
+    }
+    if (state->seat) {
+        wl_seat_destroy(state->seat);
+        state->seat = NULL;
+    }
     if (state->viewporter) {
         wp_viewporter_destroy(state->viewporter);
         state->viewporter = NULL;
@@ -210,4 +359,62 @@ void daemon_wayland_destroy(daemon_state_t *state)
         wl_display_disconnect(state->display);
         state->display = NULL;
     }
+}
+
+bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *out_x,
+                             double *out_y)
+{
+    if (!state || !out_x || !out_y)
+        return false;
+
+    /* 1. Try Hyprland IPC if active */
+    const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    const char *xrd = getenv("XDG_RUNTIME_DIR");
+    if (his && his[0] && xrd && xrd[0]) {
+        char sock_path[512];
+        snprintf(sock_path, sizeof(sock_path), "%s/hypr/%s/.socket.sock", xrd, his);
+
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd >= 0) {
+            struct sockaddr_un addr = {0};
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+
+            struct timeval tv = {.tv_sec = 0, .tv_usec = 25000}; /* 25ms timeout */
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                if (write(fd, "cursorpos\n", 10) == 10) {
+                    char buf[128] = {0};
+                    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                    if (n > 0) {
+                        buf[n] = '\0';
+                        int x = 0, y = 0;
+                        if (sscanf(buf, "%d, %d", &x, &y) == 2) {
+                            close(fd);
+                            if (out && out->width > 0 && out->height > 0) {
+                                *out_x = (double)(x % out->width);
+                                *out_y = (double)(y % out->height);
+                            } else {
+                                *out_x = (double)x;
+                                *out_y = (double)y;
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+            close(fd);
+        }
+    }
+
+    /* 2. Check native Wayland pointer event cache */
+    if (out && out->has_cursor) {
+        *out_x = out->cursor_x;
+        *out_y = out->cursor_y;
+        return true;
+    }
+
+    return false;
 }

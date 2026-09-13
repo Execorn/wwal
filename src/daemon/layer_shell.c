@@ -140,8 +140,21 @@ void output_node_destroy_surface(output_node_t *node)
     node->shm_buffer_cap = 0;
 
     if (node->use_dmabuf) {
+        for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+            render_engine_release_bo(&node->state->render_engine, &node->dmabuf_ring.buffers[i]);
+        }
         dmabuf_ring_destroy(&node->state->dmabuf_ctx, &node->dmabuf_ring);
         node->use_dmabuf = false;
+    }
+    if (node->has_source_old_bo) {
+        render_engine_release_bo(&node->state->render_engine, &node->source_old_bo);
+        dmabuf_bo_free(&node->source_old_bo);
+        node->has_source_old_bo = false;
+    }
+    if (node->has_source_new_bo) {
+        render_engine_release_bo(&node->state->render_engine, &node->source_new_bo);
+        dmabuf_bo_free(&node->source_new_bo);
+        node->has_source_new_bo = false;
     }
 
     if (node->active_buffer) {
@@ -197,6 +210,9 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
     }
 
     if (node->use_dmabuf) {
+        for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+            render_engine_release_bo(&state->render_engine, &node->dmabuf_ring.buffers[i]);
+        }
         dmabuf_ring_destroy(&state->dmabuf_ctx, &node->dmabuf_ring);
         node->use_dmabuf = false;
     }
@@ -532,15 +548,40 @@ void transition_engine_destroy(daemon_state_t *state)
     state->transitions_in_progress = false;
 }
 
+static bool is_target_output(const output_node_t *node, const waywal_img_metadata_t *meta)
+{
+    if (!meta || meta->num_target_outputs == 0)
+        return true;
+
+    const char *ptr = (const char *)meta + sizeof(waywal_img_metadata_t);
+    for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
+        if (strcmp(node->name, ptr) == 0)
+            return true;
+        ptr += strlen(ptr) + 1;
+    }
+    return false;
+}
+
 bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels, uint32_t img_w,
                                    uint32_t img_h, const waywal_img_metadata_t *meta)
 {
     if (!state || !pixels || img_w == 0 || img_h == 0)
         return false;
 
+    /* If custom shader provided, load it into compute engine */
+    if (meta && meta->transition_type == WAYWAL_TRANSITION_CUSTOM && meta->custom_shader_len > 0) {
+        const char *ptr = (const char *)meta + sizeof(waywal_img_metadata_t);
+        for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
+            ptr += strlen(ptr) + 1;
+        }
+        render_engine_load_custom_shader(&state->render_engine, ptr);
+    }
+
     if (!meta || meta->transition_type == WAYWAL_TRANSITION_NONE ||
         meta->transition_type == WAYWAL_TRANSITION_SIMPLE || meta->transition_duration_ms == 0) {
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            if (!is_target_output(out, meta))
+                continue;
             output_node_render_image(state, out, pixels, img_w, img_h);
         }
         return true;
@@ -552,11 +593,16 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         num_frames = 2;
     uint64_t frame_interval_ns = 1000000000ULL / fps;
 
+    uint32_t stagger_delay_ms = meta->stagger_delay_ms > 0 ? meta->stagger_delay_ms : 150;
+    uint32_t stagger_frames = (stagger_delay_ms * fps) / 1000;
+
     const uint32_t *src = (const uint32_t *)pixels;
     int started_count = 0;
 
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (out->width <= 0 || out->height <= 0)
+            continue;
+        if (!is_target_output(out, meta))
             continue;
 
         if (out->viewport) {
@@ -571,6 +617,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
             if (!out->has_source_new_bo || out->source_new_bo.width != (uint32_t)out->width ||
                 out->source_new_bo.height != (uint32_t)out->height) {
                 if (out->has_source_new_bo) {
+                    render_engine_release_bo(&state->render_engine, &out->source_new_bo);
                     dmabuf_bo_free(&out->source_new_bo);
                     out->has_source_new_bo = false;
                 }
@@ -596,6 +643,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                         out->source_old_bo.width != (uint32_t)out->width ||
                         out->source_old_bo.height != (uint32_t)out->height) {
                         if (out->has_source_old_bo) {
+                            render_engine_release_bo(&state->render_engine, &out->source_old_bo);
                             dmabuf_bo_free(&out->source_old_bo);
                             out->has_source_old_bo = false;
                         }
@@ -646,12 +694,21 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                                 img_w, img_h);
         }
 
-        float cx = (meta->transition_center_x > 0.0f || meta->transition_center_y > 0.0f)
-                       ? meta->transition_center_x
-                       : 0.5f;
-        float cy = (meta->transition_center_x > 0.0f || meta->transition_center_y > 0.0f)
-                       ? meta->transition_center_y
-                       : 0.5f;
+        float cx = 0.5f;
+        float cy = 0.5f;
+        if (meta->transition_center_x < 0.0f || meta->transition_center_y < 0.0f) {
+            /* Dynamic cursor tracking */
+            double qx = 0, qy = 0;
+            if (daemon_query_cursor_pos(state, out, &qx, &qy) && out->width > 0 &&
+                out->height > 0) {
+                cx = (float)(qx / (double)out->width);
+                cy = (float)(qy / (double)out->height);
+            }
+        } else {
+            cx = meta->transition_center_x;
+            cy = meta->transition_center_y;
+        }
+
         float wfreq = meta->transition_wave_freq > 0.0f ? meta->transition_wave_freq : 20.0f;
         float wamp = meta->transition_wave_amp > 0.0f ? meta->transition_wave_amp : 0.05f;
 
@@ -667,6 +724,8 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         };
         out->transition_current_frame = 0;
         out->transition_total_frames = num_frames;
+        out->transition_delay_frames =
+            (meta->sync_mode == 1) ? (started_count * stagger_frames) : 0;
         out->transition_active = true;
         started_count++;
     }
@@ -699,6 +758,12 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (!out->transition_active)
             continue;
+
+        if (out->transition_delay_frames > 0) {
+            out->transition_delay_frames--;
+            active_count++;
+            continue;
+        }
 
         out->transition_current_frame++;
         float t = (float)out->transition_current_frame / (float)out->transition_total_frames;

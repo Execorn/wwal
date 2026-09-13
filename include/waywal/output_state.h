@@ -72,7 +72,13 @@ struct output_node {
     bool transition_active;
     uint32_t transition_current_frame;
     uint32_t transition_total_frames;
+    uint32_t transition_delay_frames;
     waywal_transition_params_t transition_params;
+
+    /* Dynamic Cursor Tracking */
+    double cursor_x;
+    double cursor_y;
+    bool has_cursor;
 
     /* Persistent Video Buffers Pool */
     struct wl_buffer *video_wl_buffers[4];

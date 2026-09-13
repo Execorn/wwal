@@ -41,7 +41,7 @@ if seccomp_dep.found()
   add_project_arguments('-DHAVE_LIBSECCOMP', language: 'c')
 endif
 
-inc_dir = include_directories('include')
+inc_dir = include_directories('include', 'src/client')
 
 # Wayland protocol code generation helper
 wayland_scanner_code = generator(
@@ -132,26 +132,36 @@ daemon_sources = files(
   'src/daemon/uring_loop.c',
   'src/daemon/output_state.c',
   'src/daemon/security.c',
+  'src/daemon/slideshow.c',
+  'src/client/image_loader.c',
 )
+
+daemon_deps = [
+  common_dep,
+  proto_dep,
+  wayland_client_dep,
+  libdrm_dep,
+  gbm_dep,
+  egl_dep,
+  glesv2_dep,
+  vaapi_dep,
+  vaapi_drm_dep,
+  liburing_dep,
+  seccomp_dep,
+  threads_dep,
+  m_dep
+]
+if png_dep.found()
+  daemon_deps += png_dep
+endif
+if turbojpeg_dep.found()
+  daemon_deps += turbojpeg_dep
+endif
 
 wwald = executable('wwald',
   daemon_sources,
   include_directories: inc_dir,
-  dependencies: [
-    common_dep,
-    proto_dep,
-    wayland_client_dep,
-    libdrm_dep,
-    gbm_dep,
-    egl_dep,
-    glesv2_dep,
-    vaapi_dep,
-    vaapi_drm_dep,
-    liburing_dep,
-    seccomp_dep,
-    threads_dep,
-    m_dep
-  ],
+  dependencies: daemon_deps,
   install: true
 )
 
@@ -313,6 +323,26 @@ test_phase5_exe = executable('test_phase5',
 )
 
 test('phase5', test_phase5_exe)
+
+advanced_test_deps = [common_dep, proto_dep, wayland_client_dep, libdrm_dep, gbm_dep, threads_dep, m_dep]
+if png_dep.found()
+  advanced_test_deps += png_dep
+endif
+if turbojpeg_dep.found()
+  advanced_test_deps += turbojpeg_dep
+endif
+
+test_advanced_exe = executable('test_advanced',
+  'tests/test_advanced.c',
+  'src/client/cli_parser.c',
+  'src/client/image_loader.c',
+  'src/daemon/slideshow.c',
+  include_directories: inc_dir,
+  dependencies: advanced_test_deps
+)
+
+test('advanced', test_advanced_exe)
+
 test('integration', find_program('tests/integration_test.sh'),
   depends: [wwald, wwal]
 )

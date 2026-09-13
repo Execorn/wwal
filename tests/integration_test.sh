@@ -102,6 +102,47 @@ echo "[22] Testing light_leak transition..."
 echo "[23] Testing page_curl transition..."
 "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type page_curl --transition-duration 0.05
 
+echo "[24] Testing positional aliases (cursor, center, top-left)..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type grow --transition-duration 0.05 --transition-pos cursor
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type ripple --transition-duration 0.05 --transition-pos center
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type wave --transition-duration 0.05 --transition-pos top-left
+
+echo "[25] Testing custom compute shader transition..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type custom --transition-shader "$(dirname "${BASH_SOURCE[0]}")/custom_test.comp" --transition-duration 0.05
+
+echo "[26] Testing staggered synchronization mode and 10-bit scanout flag..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type fade --transition-duration 0.05 --sync-mode staggered --stagger-delay 50 --10bit
+
+echo "[27] Testing slideshow daemon engine and runtime controls..."
+TMP_SLIDESHOW_DIR=$(mktemp -d /tmp/wwal_integ_slideshow_XXXXXX)
+cp "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" "${TMP_SLIDESHOW_DIR}/slide1.png"
+cp "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" "${TMP_SLIDESHOW_DIR}/slide2.png"
+
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow "${TMP_SLIDESHOW_DIR}" --interval 2 --shuffle --transition-type fade --transition-duration 0.05
+sleep 0.1
+
+echo "[28] Testing slideshow pause..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow pause
+sleep 0.05
+
+echo "[29] Testing slideshow resume..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow resume
+sleep 0.05
+
+echo "[30] Testing slideshow next/prev..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow next
+sleep 0.05
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow prev
+sleep 0.05
+
+echo "[31] Testing slideshow toggle and stop..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow toggle
+sleep 0.05
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow stop
+sleep 0.05
+
+rm -rf "${TMP_SLIDESHOW_DIR}"
+
 # 7. Hardware Video wallpaper playback tests
 VIDEO_PATH="$(dirname "${BASH_SOURCE[0]}")/test_video.mp4"
 if [ -f "${VIDEO_PATH}" ]; then

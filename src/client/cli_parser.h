@@ -1,9 +1,10 @@
 #ifndef WAYWAL_CLI_PARSER_H
 #define WAYWAL_CLI_PARSER_H
 
-#include <stdint.h>
-#include <stdbool.h>
 #include "waywal/types.h"
+
+#include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,6 +20,8 @@ typedef enum {
     CLI_CMD_PAUSE,
     CLI_CMD_UNPAUSE,
     CLI_CMD_TOGGLE,
+    CLI_CMD_SLIDESHOW,
+    CLI_CMD_SLIDESHOW_CTRL,
     CLI_CMD_KILL,
     CLI_CMD_HELP,
 } cli_cmd_type_t;
@@ -34,15 +37,34 @@ typedef struct {
     uint32_t transition_type;        /* waywal_transition_type_t */
     uint32_t transition_duration_ms; /* in milliseconds */
     uint32_t transition_fps;         /* FPS target (default: 60) */
-    float    transition_angle_rad;
-    float    transition_wave_freq;
-    float    transition_wave_amp;
-    float    transition_pos_x;
-    float    transition_pos_y;
+    float transition_angle_rad;
+    float transition_wave_freq;
+    float transition_wave_amp;
+    float transition_pos_x;
+    float transition_pos_y;
+
+    /* Custom shader options */
+    char custom_shader_path[4096];
+    char *custom_shader_src;
+    size_t custom_shader_len;
+
+    /* Multi-monitor targeting and synchronization */
+    uint32_t num_outputs;
+    char outputs[16][64];
+    uint32_t sync_mode;        /* 0 = simultaneous, 1 = staggered */
+    uint32_t stagger_delay_ms; /* delay in ms */
+
+    /* 10-bit color option */
+    bool enable_10bit;
 
     /* Video parameters */
-    uint64_t video_loop_count;     /* 0 = infinite loop */
-    float    video_speed;          /* default 1.0f */
+    uint64_t video_loop_count; /* 0 = infinite loop */
+    float video_speed;         /* default 1.0f */
+
+    /* Slideshow parameters */
+    uint32_t slideshow_action;     /* waywal_slideshow_action_t */
+    uint32_t slideshow_interval_s; /* interval in seconds */
+    bool slideshow_random;         /* random shuffle order */
 } cli_options_t;
 
 bool cli_parse(int argc, char *argv[], cli_options_t *opts);

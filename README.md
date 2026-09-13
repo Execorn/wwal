@@ -89,8 +89,14 @@ meson test -C build
 # Query daemon status via client
 ./build/wwal query
 
-# Set wallpaper with GPU transition
-./build/wwal img /path/to/wallpaper.png --transition-type wave --transition-duration 0.8
+# Slideshow from directory with 10s interval, shuffle, and staggered multi-monitor transition
+./build/wwal slideshow start ~/Pictures/Wallpapers -d 10 -s --transition-type ripple --sync-mode staggered --stagger-delay 150
+
+# Target specific output with cursor-anchored wave transition
+./build/wwal img ~/Pictures/Wallpapers/scenery.png -o DP-1 --transition-type wave --transition-pos cursor
+
+# Custom user GLSL compute shader transition
+./build/wwal img ~/Pictures/Wallpapers/cyberpunk.png --transition-type custom --transition-shader ./shaders/my_effect.comp
 ```
 
 ---
@@ -107,31 +113,81 @@ Commands:
   clear [COLOR]               Clear wallpaper to solid hex color (e.g. 000000 or 00ff00)
   img <PATH> [OPTIONS]        Load and set wallpaper with GPU/SIMD transitions
   video <PATH> [OPTIONS]      Load and play hardware-accelerated video wallpaper (VA-API)
+  slideshow <ACTION> [ARGS]   Manage daemon-native wallpaper slideshow
   pause                       Pause video playback
   unpause                     Resume video playback
   toggle                      Toggle video playback pause/resume
   kill                        Gracefully terminate the running wwald daemon
   help                        Display help message
 
+Slideshow Subcommands:
+  slideshow start <DIR> [OPT] Start daemon-driven wallpaper slideshow with timerfd loop
+  slideshow stop              Stop active slideshow
+  slideshow pause             Pause slideshow timer
+  slideshow resume            Resume slideshow timer
+  slideshow toggle            Toggle slideshow pause/resume
+  slideshow next              Advance immediately to next wallpaper
+  slideshow prev              Return to previous wallpaper
+
+Slideshow Options:
+  -d, --interval <SEC>        Slideshow interval in seconds (default: 300)
+  -s, --shuffle               Randomize wallpaper playback order
+
 Transition Options:
-  --transition-type <TYPE>    none, simple, fade, wipe, grow, outer, wave, noise, crosszoom, slide, glitch, burn, ripple, pixelate, doom, swirl, cube, luma, light_leak, page_curl (default: fade)
+  --transition-type <TYPE>    none, simple, fade, wipe, grow, outer, wave, noise,
+                              crosszoom, slide, glitch, burn, ripple, pixelate,
+                              doom, swirl, cube, luma, light_leak, page_curl, custom (default: fade)
+  --transition-shader <FILE>  Path to custom GLSL compute shader (requires --transition-type custom)
   --transition-duration <S>   Duration in seconds (e.g. 1.0, 0.5) (default: 1.0)
   --transition-fps <FPS>      Target frame rate (default: 60)
   --transition-angle <DEG>    Wipe/wave/slide angle in degrees (default: 0)
   --transition-wave <F,A>     Wave frequency/scale and amplitude/intensity (default: 20,0.05)
-  --transition-pos <X,Y>      Center coordinate 0.0-1.0 (default: 0.5,0.5)
+  --transition-pos <POS>      Center coordinate (0.5,0.5), semantic alias (center, top,
+                              bottom, left, right, top-left, top-right, bottom-left,
+                              bottom-right), or dynamic cursor tracking (cursor / mouse)
+  --10bit                     Force 10-bit wide-gamut direct scanout (DRM_FORMAT_XRGB2101010)
+
+Multi-Monitor & Synchronization Options:
+  -o, --output <NAME>         Target specific monitor(s) (repeatable or comma-separated)
+  --sync-mode <MODE>          simultaneous or staggered (default: simultaneous)
+  --stagger-delay <MS>        Delay in milliseconds between staggered outputs (default: 200)
 
 Global Options:
-  -n, --namespace <NAME>     Socket namespace (default: "default")
-  -v, --verbose              Enable verbose output
-  -h, --help                 Print help information
+  -n, --namespace <NAME>      Socket namespace (default: "default")
+  -v, --verbose               Enable verbose output
+  -h, --help                  Print help information
 ```
+
+---
+
+## Advanced Engine & Daemon Features
+
+### 1. Zero-Idle-CPU Daemon Slideshow Engine
+- **Kernel-Driven Pacing**: Driven by Linux `timerfd` registered directly in the daemon's `io_uring` and `epoll` reactor. Consumes **0.0% CPU and 0 Wakeups** while sleeping between transitions.
+- **Directory Traversal & In-Memory Shuffling**: Automatically traverses directories, ignores hidden files, validates image signatures, and implements Fisher-Yates shuffle with cycle protection.
+- **Dynamic Runtime Controls**: Seamlessly pause, resume, toggle, skip forward (`next`), or rewind (`prev`) via IPC without restarting the slideshow.
+
+### 2. Multi-Monitor Output Targeting & Cascading Synchronization
+- **Output Filtering**: Pin wallpapers or slideshows to designated monitors using `-o DP-1` or `-o DP-1,HDMI-A-1`.
+- **Cascading Delays**: Stagger transitions across panoramic setups using `--sync-mode staggered --stagger-delay 200`. The daemon automatically orders monitors geographically by X-coordinate and schedules frame delays on each output node.
+
+### 3. Cursor-Anchored Transitions & Positional Aliases
+- **Live Cursor Tracking**: Passing `--transition-pos cursor` or `--transition-pos mouse` initiates ripple, grow, burn, and zoom transitions originating precisely from the current pointer location. Uses `wl_pointer` tracking with fallback to Hyprland/Sway IPC query.
+- **Semantic Aliases**: Position animations using clean human-readable keywords (`center`, `top`, `bottom`, `left`, `right`, `top-left`, `top-right`, `bottom-left`, `bottom-right`).
+
+### 4. Custom User Compute Shaders
+- **Runtime Compilation & Reflection**: Pass `--transition-type custom --transition-shader <file.comp>` to execute custom OpenGL ES 3.1 compute shaders.
+- **Uniform Contract**: Custom shaders receive `u_progress`, `u_resolution`, `u_center`, `u_angle`, `u_params`, `u_current` (unit 0), and `u_target` (unit 1), writing directly to `out_image` with full hardware acceleration.
+
+### 5. 10-Bit Color & Wide-Gamut Direct Scanout
+- **Banding-Free Gradients**: Supports native 10-bit-per-channel color (`DRM_FORMAT_XRGB2101010` / `GBM_FORMAT_XRGB2101010`) via DMA-BUF feedback tranche negotiation.
+- **Triple-Buffering Scanout Ring**: Eliminates compositor frame drops and tearing at 144Hz–500Hz refresh rates.
 
 ---
 
 ## Visual Transition Effects
 
-WayWal features a SOTA GPU Compute (`OpenGL ES 3.1` Compute Shaders) and CPU SIMD fallback transition engine supporting 20 transition effects:
+WayWal features a SOTA GPU Compute (`OpenGL ES 3.1` Compute Shaders) and CPU SIMD fallback transition engine supporting 21 transition effects:
 
 | Transition Type | Description | GPU Compute Shader | SIMD / CPU Fallback |
 | :--- | :--- | :--- | :--- |
@@ -154,6 +210,7 @@ WayWal features a SOTA GPU Compute (`OpenGL ES 3.1` Compute Shaders) and CPU SIM
 | `luma` | Luminance-driven wipe using perceptual BT.709 grayscale luma | `luma.comp` | Perceptual luma threshold |
 | `light_leak` | Cinematic anamorphic optical lens flare with warm chromatic overlay | `light_leak.comp` | Multi-source spectral flare |
 | `page_curl` | Anti-aliased conical 3D cylinder page curl with realistic drop shadow | `page_curl.comp` | Conical deformation math |
+| `custom` | Arbitrary user-provided OpenGL ES 3.1 compute shader | User `.comp` file | Custom fallback |
 
 ---
 
@@ -173,7 +230,7 @@ Measured on Intel Core i7-12700H / Iris Xe Graphics (1920x1080 @ 165Hz Wayland s
 | `page_curl` | **0.57 ms** | **1,754 FPS** | **0 KB Delta [PASS]** |
 
 ### 4K UHD (3840x2160) GPU Compute
-- All 18 animated transitions execute in **2.1 ms – 5.7 ms** per frame (**175 – 476 FPS**).
+- All animated transitions execute in **2.1 ms – 5.7 ms** per frame (**175 – 476 FPS**).
 - Zero frame drops at 144Hz / 165Hz / 240Hz refresh rates.
 - Constant memory consumption: 0 KB heap allocation churn during transition playback.
 

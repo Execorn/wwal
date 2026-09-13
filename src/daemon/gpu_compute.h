@@ -27,6 +27,9 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
 /* Releases cached OpenGL texture and EGLImageKHR associated with a BO */
 void gpu_compute_release_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo);
 
+/* Hot-compiles and loads an arbitrary custom GLSL compute shader */
+bool gpu_compute_load_custom_shader(gpu_compute_ctx_t *ctx, const char *src);
+
 #ifdef __cplusplus
 }
 #endif

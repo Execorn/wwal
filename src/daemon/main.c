@@ -148,6 +148,7 @@ void daemon_handle_ipc_connection(daemon_state_t *state)
                     .a = clear_payload.color[3],
                 };
                 daemon_clear_all_outputs(state, color);
+                slideshow_stop(&state->slideshow);
                 WAYWAL_LOG_INFO("Cleared screen with color: #%02x%02x%02x%02x", color.r, color.g,
                                 color.b, color.a);
             }
@@ -167,17 +168,20 @@ void daemon_handle_ipc_connection(daemon_state_t *state)
             if (mapped != MAP_FAILED) {
                 waywal_img_metadata_t *meta = (waywal_img_metadata_t *)mapped;
                 uint64_t expected_size = sizeof(waywal_img_metadata_t) +
+                                         (uint64_t)meta->extra_data_len +
                                          (uint64_t)meta->width * (uint64_t)meta->height * 4ULL;
                 bool ok = false;
                 if (meta->width > 0 && meta->height > 0 && meta->width <= 16384 &&
                     meta->height <= 16384 && req_hdr.payload_size >= expected_size &&
                     (size_t)st.st_size >= expected_size) {
-                    const uint8_t *pixels = (const uint8_t *)mapped + sizeof(waywal_img_metadata_t);
+                    const uint8_t *pixels = (const uint8_t *)mapped +
+                                            sizeof(waywal_img_metadata_t) + meta->extra_data_len;
                     WAYWAL_LOG_INFO("Rendering received image: %ux%u", meta->width, meta->height);
 
                     if (state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED) {
                         video_engine_stop(&state->video_engine);
                     }
+                    slideshow_stop(&state->slideshow);
                     ok = daemon_start_image_transition(state, pixels, meta->width, meta->height,
                                                        meta);
                 } else {
@@ -205,6 +209,7 @@ void daemon_handle_ipc_connection(daemon_state_t *state)
     }
 
     case WAYWAL_REQ_SET_VIDEO: {
+        slideshow_stop(&state->slideshow);
         bool ok = false;
         if (attached_fd >= 0) {
             struct stat st;
@@ -250,6 +255,36 @@ void daemon_handle_ipc_connection(daemon_state_t *state)
             video_engine_resume(&state->video_engine);
         }
         resp_hdr.opcode = WAYWAL_RESP_OK;
+        waywal_ipc_send(client_fd, &resp_hdr, -1);
+        break;
+    }
+
+    case WAYWAL_REQ_SLIDESHOW: {
+        waywal_slideshow_payload_t spay;
+        bool ok = false;
+        if (req_hdr.payload_size >= sizeof(spay)) {
+            if (read_exact(client_fd, &spay, sizeof(spay))) {
+                spay.path[sizeof(spay.path) - 1] = '\0';
+                if (state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED) {
+                    video_engine_stop(&state->video_engine);
+                }
+                ok = slideshow_start(&state->slideshow, &spay);
+            }
+        }
+        resp_hdr.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
+        waywal_ipc_send(client_fd, &resp_hdr, -1);
+        break;
+    }
+
+    case WAYWAL_REQ_SLIDESHOW_CTRL: {
+        waywal_slideshow_ctrl_t sctrl;
+        bool ok = false;
+        if (req_hdr.payload_size >= sizeof(sctrl)) {
+            if (read_exact(client_fd, &sctrl, sizeof(sctrl))) {
+                ok = slideshow_control(&state->slideshow, sctrl.action);
+            }
+        }
+        resp_hdr.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
         break;
     }
@@ -300,6 +335,8 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
             transition_engine_dispatch_tick(st);
         } else if (fd == st->video_engine.timer_fd) {
             video_engine_dispatch_frame(&st->video_engine);
+        } else if (fd == st->slideshow.timer_fd) {
+            slideshow_dispatch_tick(&st->slideshow);
         }
         break;
     case URING_EV_SIGNAL: {
@@ -441,6 +478,9 @@ int main(int argc, char *argv[])
     /* Initialize asynchronous transition engine (BUG-03, BUG-04) */
     transition_engine_init(&state);
 
+    /* Initialize slideshow daemon engine */
+    slideshow_init(&state.slideshow, &state);
+
     if (state.transition_timer_fd >= 0) {
         struct epoll_event ev_trans = {.events = EPOLLIN, .data.fd = state.transition_timer_fd};
         epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.transition_timer_fd, &ev_trans);
@@ -448,6 +488,10 @@ int main(int argc, char *argv[])
     if (state.video_engine.timer_fd >= 0) {
         struct epoll_event ev_vid = {.events = EPOLLIN, .data.fd = state.video_engine.timer_fd};
         epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.video_engine.timer_fd, &ev_vid);
+    }
+    if (state.slideshow.timer_fd >= 0) {
+        struct epoll_event ev_slide = {.events = EPOLLIN, .data.fd = state.slideshow.timer_fd};
+        epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.slideshow.timer_fd, &ev_slide);
     }
 
     /* Modern Linux io_uring asynchronous event loop with cooperative kernel polling */
@@ -465,6 +509,10 @@ int main(int argc, char *argv[])
         }
         if (state.video_engine.timer_fd >= 0) {
             uring_loop_add_poll(&uring_loop, state.video_engine.timer_fd, POLLIN, URING_EV_TIMER,
+                                &state);
+        }
+        if (state.slideshow.timer_fd >= 0) {
+            uring_loop_add_poll(&uring_loop, state.slideshow.timer_fd, POLLIN, URING_EV_TIMER,
                                 &state);
         }
         WAYWAL_LOG_INFO("Event loop running via Linux io_uring (zero-syscall polling)");
@@ -515,6 +563,8 @@ int main(int argc, char *argv[])
                     transition_engine_dispatch_tick(&state);
                 } else if (events[i].data.fd == state.video_engine.timer_fd) {
                     video_engine_dispatch_frame(&state.video_engine);
+                } else if (events[i].data.fd == state.slideshow.timer_fd) {
+                    slideshow_dispatch_tick(&state.slideshow);
                 } else if (events[i].data.fd == state.signal_fd) {
                     struct signalfd_siginfo fdsi;
                     ssize_t s = read(state.signal_fd, &fdsi, sizeof(fdsi));
@@ -554,6 +604,7 @@ int main(int argc, char *argv[])
 
     transition_engine_destroy(&state);
     video_engine_destroy(&state.video_engine);
+    slideshow_destroy(&state.slideshow);
 
     if (state.use_uring) {
         uring_loop_destroy(&uring_loop);

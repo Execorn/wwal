@@ -35,6 +35,8 @@ typedef enum {
     WAYWAL_FORMAT_INVALID = 0,
     WAYWAL_FORMAT_ARGB8888 = 1,
     WAYWAL_FORMAT_XRGB8888 = 2,
+    WAYWAL_FORMAT_XRGB2101010 = 3,
+    WAYWAL_FORMAT_ARGB2101010 = 4,
 } waywal_pixel_format_t;
 
 #ifdef __cplusplus

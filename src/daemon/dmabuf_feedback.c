@@ -107,12 +107,23 @@ static void feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedbac
                 if (ctx->preferred_modifier == DRM_FORMAT_MOD_INVALID ||
                     g_fb_state.is_scanout_tranche) {
                     ctx->preferred_modifier = mod;
+                    ctx->preferred_format = fmt;
                     WAYWAL_LOG_INFO(
                         "Negotiated optimal DMA-BUF scanout modifier: 0x%016lx (format: 0x%08x)",
                         (unsigned long)mod, fmt);
                     if (g_fb_state.is_scanout_tranche) {
                         break;
                     }
+                }
+            } else if (fmt == DRM_FORMAT_XRGB2101010 || fmt == DRM_FORMAT_ARGB2101010 ||
+                       fmt == DRM_FORMAT_XBGR2101010 || fmt == DRM_FORMAT_ABGR2101010) {
+                if (!ctx->has_10bit || g_fb_state.is_scanout_tranche) {
+                    ctx->has_10bit = true;
+                    ctx->format_10bit = fmt;
+                    ctx->modifier_10bit = mod;
+                    WAYWAL_LOG_INFO("Detected 10-bit wide gamut scanout capability: 0x%08x "
+                                    "(modifier: 0x%016lx)",
+                                    fmt, (unsigned long)mod);
                 }
             }
         }

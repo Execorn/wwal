@@ -12,10 +12,10 @@ compile_commands.json
 *.so
 src/daemon/waywald
 src/client/waywal
-waywald
-waywal
-wwald
-wwal
+/waywald
+/waywal
+/wwald
+/wwal
 
 # Runtime IPC sockets
 *.sock

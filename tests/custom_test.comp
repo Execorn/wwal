@@ -1,0 +1,29 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform highp sampler2D u_src_a;
+layout(binding = 2) uniform highp sampler2D u_src_b;
+
+uniform float u_progress;
+uniform ivec2 u_resolution;
+uniform float u_angle;
+uniform vec2 u_center;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= u_resolution.x || coord.y >= u_resolution.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    vec4 a = texture(u_src_a, uv);
+    vec4 b = texture(u_src_b, uv);
+
+    float d = distance(uv, u_center);
+    float threshold = u_progress * 1.5;
+    float factor = smoothstep(threshold - 0.05, threshold + 0.05, d);
+    vec4 col = mix(b, a, factor);
+
+    imageStore(u_target, coord, col.bgra);
+}

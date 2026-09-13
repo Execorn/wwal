@@ -24,6 +24,7 @@ extern "C" {
 #endif
 
 #include "waywal/output_state.h"
+#include "waywal/slideshow.h"
 
 struct daemon_state;
 
@@ -35,6 +36,8 @@ typedef struct daemon_state {
     struct wl_registry *registry;
     struct wl_compositor *compositor;
     struct wl_shm *shm;
+    struct wl_seat *seat;
+    struct wl_pointer *pointer;
     struct zwlr_layer_shell_v1 *layer_shell;
     struct wp_viewporter *viewporter;
     struct wp_fractional_scale_manager_v1 *fract_manager;
@@ -48,6 +51,9 @@ typedef struct daemon_state {
 
     /* Hardware Video Wallpaper Engine (VA-API & Zero-Copy PRIME) */
     video_engine_t video_engine;
+
+    /* Built-in Daemon Slideshow Engine */
+    slideshow_engine_t slideshow;
 
     /* Modern Linux io_uring asynchronous event loop */
     uring_loop_t *uring_loop;
@@ -74,6 +80,8 @@ typedef struct daemon_state {
 bool daemon_wayland_init(daemon_state_t *state);
 void daemon_wayland_dispatch(daemon_state_t *state);
 void daemon_wayland_destroy(daemon_state_t *state);
+bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *out_x,
+                             double *out_y);
 
 /* Asynchronous Transitions Engine API */
 bool transition_engine_init(daemon_state_t *state);

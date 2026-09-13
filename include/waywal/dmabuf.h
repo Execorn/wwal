@@ -17,7 +17,7 @@ extern "C" {
 #endif
 
 #define WAYWAL_MAX_BUFFER_PLANES 4
-#define WAYWAL_DMABUF_RING_SIZE  2 /* Double buffering */
+#define WAYWAL_DMABUF_RING_SIZE  3 /* Triple buffering for tear-free async presentation */
 
 typedef struct dmabuf_bo {
     int fd[WAYWAL_MAX_BUFFER_PLANES];
@@ -42,6 +42,10 @@ typedef struct dmabuf_context {
     struct zwp_linux_dmabuf_v1 *dmabuf_proto;
     struct zwp_linux_dmabuf_feedback_v1 *default_feedback;
     uint64_t preferred_modifier;
+    uint32_t preferred_format;
+    bool has_10bit;
+    uint32_t format_10bit;
+    uint64_t modifier_10bit;
     bool available;
 } dmabuf_context_t;
 

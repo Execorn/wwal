@@ -25,6 +25,8 @@ typedef enum : uint16_t {
     WAYWAL_REQ_PAUSE = 0x0007,
     WAYWAL_REQ_UNPAUSE = 0x0008,
     WAYWAL_REQ_KILL = 0x0009,
+    WAYWAL_REQ_SLIDESHOW = 0x000A,
+    WAYWAL_REQ_SLIDESHOW_CTRL = 0x000B,
 
     WAYWAL_RESP_OK = 0x8001,
     WAYWAL_RESP_PONG = 0x8002,
@@ -55,7 +57,11 @@ typedef struct {
     float transition_center_y;
     uint8_t color[4];
     uint32_t num_target_outputs;
-    /* Followed by num_target_outputs null-terminated strings */
+    uint32_t sync_mode;         /* 0 = simultaneous, 1 = staggered */
+    uint32_t stagger_delay_ms;  /* delay between cascading monitors */
+    uint32_t custom_shader_len; /* bytes of custom shader code following outputs */
+    uint32_t extra_data_len;    /* total length of (outputs strings + custom shader string) */
+    /* Followed by num_target_outputs null-terminated strings, then custom shader GLSL string */
 } waywal_img_metadata_t;
 
 typedef struct {
@@ -70,6 +76,34 @@ typedef struct {
     uint32_t num_target_outputs;
     char filepath[4096];
 } waywal_video_payload_t;
+
+typedef enum : uint32_t {
+    WAYWAL_SLIDESHOW_STOP = 0,
+    WAYWAL_SLIDESHOW_PAUSE = 1,
+    WAYWAL_SLIDESHOW_RESUME = 2,
+    WAYWAL_SLIDESHOW_TOGGLE = 3,
+    WAYWAL_SLIDESHOW_NEXT = 4,
+    WAYWAL_SLIDESHOW_PREV = 5,
+} waywal_slideshow_action_t;
+
+typedef struct {
+    uint32_t action; /* waywal_slideshow_action_t */
+} waywal_slideshow_ctrl_t;
+
+typedef struct {
+    uint32_t interval_s;
+    uint32_t transition_type;
+    uint32_t transition_duration_ms;
+    uint32_t transition_fps;
+    float transition_angle_rad;
+    float transition_wave_freq;
+    float transition_wave_amp;
+    float transition_center_x;
+    float transition_center_y;
+    bool random_order;
+    uint32_t num_target_outputs;
+    char path[4096];
+} waywal_slideshow_payload_t;
 #pragma pack(pop)
 
 /* Resolves runtime socket path: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-wwald.<namespace>.sock */
