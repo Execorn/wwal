@@ -61,6 +61,7 @@ typedef struct {
     uint32_t stagger_delay_ms;  /* delay between cascading monitors */
     uint32_t custom_shader_len; /* bytes of custom shader code following outputs */
     uint32_t extra_data_len;    /* total length of (outputs strings + custom shader string) */
+    uint32_t scaling_mode;      /* waywal_scaling_mode_t (default: 0 = FILL) */
     /* Followed by num_target_outputs null-terminated strings, then custom shader GLSL string */
 } waywal_img_metadata_t;
 
@@ -102,6 +103,7 @@ typedef struct {
     float transition_center_y;
     bool random_order;
     uint32_t num_target_outputs;
+    uint32_t scaling_mode; /* waywal_scaling_mode_t (default: 0 = FILL) */
     char path[4096];
 } waywal_slideshow_payload_t;
 #pragma pack(pop)

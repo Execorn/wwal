@@ -39,6 +39,14 @@ typedef enum {
     WAYWAL_FORMAT_ARGB2101010 = 4,
 } waywal_pixel_format_t;
 
+typedef enum {
+    WAYWAL_SCALING_FILL = 0,    /* Crop to fill / cover preserving aspect ratio (default) */
+    WAYWAL_SCALING_FIT = 1,     /* Fit entire image with letterbox / pillarbox */
+    WAYWAL_SCALING_STRETCH = 2, /* Stretch to exact destination dimensions */
+    WAYWAL_SCALING_CENTER = 3,  /* 1:1 unscaled centered */
+    WAYWAL_SCALING_TILE = 4,    /* Repeated tile */
+} waywal_scaling_mode_t;
+
 #ifdef __cplusplus
 }
 #endif

@@ -56,7 +56,9 @@ void cli_print_usage(const char *prog)
     printf("  --stagger-delay <MS>       Delay in milliseconds between cascading monitors "
            "(default: 150)\n");
     printf("  --10bit                    Enable 10-bit wide-gamut scanout if supported by "
-           "compositor\n\n");
+           "compositor\n");
+    printf("  --scaling-mode, --mode <M> Scaling mode: fill, fit, stretch, center, tile "
+           "(default: fill)\n\n");
     printf("Video Options:\n");
     printf("  --loop <COUNT>             Loop count (0 = infinite) (default: 0)\n");
     printf("  --speed <FLOAT>            Playback speed multiplier (default: 1.0)\n\n");
@@ -313,6 +315,27 @@ static bool parse_transition_flag(int *optind_ptr, int argc, char *argv[], cli_o
         opts->enable_10bit = true;
         return true;
     }
+    if ((strcmp(arg, "--scaling-mode") == 0 || strcmp(arg, "--mode") == 0) &&
+        *optind_ptr + 1 < argc) {
+        (*optind_ptr)++;
+        const char *m = argv[*optind_ptr];
+        if (strcasecmp(m, "fill") == 0 || strcasecmp(m, "crop") == 0 ||
+            strcasecmp(m, "cover") == 0) {
+            opts->scaling_mode = WAYWAL_SCALING_FILL;
+        } else if (strcasecmp(m, "fit") == 0 || strcasecmp(m, "contain") == 0) {
+            opts->scaling_mode = WAYWAL_SCALING_FIT;
+        } else if (strcasecmp(m, "stretch") == 0) {
+            opts->scaling_mode = WAYWAL_SCALING_STRETCH;
+        } else if (strcasecmp(m, "center") == 0) {
+            opts->scaling_mode = WAYWAL_SCALING_CENTER;
+        } else if (strcasecmp(m, "tile") == 0) {
+            opts->scaling_mode = WAYWAL_SCALING_TILE;
+        } else {
+            fprintf(stderr, "Warning: Unknown scaling mode '%s', defaulting to fill\n", m);
+            opts->scaling_mode = WAYWAL_SCALING_FILL;
+        }
+        return true;
+    }
 
     return false;
 }
@@ -334,6 +357,7 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
     opts->transition_pos_y = 0.5f;
     opts->sync_mode = 0;
     opts->stagger_delay_ms = 150;
+    opts->scaling_mode = WAYWAL_SCALING_FILL; /* 0 = Fill / Cover */
     opts->video_loop_count = 0;
     opts->video_speed = 1.0f;
     opts->slideshow_interval_s = 300;

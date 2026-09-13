@@ -29,6 +29,7 @@ typedef struct {
     bool random_order;
     uint32_t num_target_outputs;
     char target_outputs[16][64];
+    uint32_t scaling_mode; /* waywal_scaling_mode_t */
 
     char **file_list;
     size_t num_files;

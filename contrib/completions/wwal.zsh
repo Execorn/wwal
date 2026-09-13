@@ -36,6 +36,7 @@ _wwal() {
         '--sync-mode[Multi-monitor transition sync mode]:mode:(simultaneous staggered)'
         '--stagger-delay[Delay between monitors in ms]:delay:'
         '--10bit[Force 10-bit wide gamut scanout]'
+        '(--scaling-mode --mode)'{--scaling-mode,--mode}'[Aspect ratio scaling mode]:mode:(fill fit stretch center tile crop cover contain)'
     )
 
     _arguments -C \

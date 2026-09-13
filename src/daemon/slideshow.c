@@ -150,6 +150,7 @@ static void display_current_image(slideshow_engine_t *ss)
         .sync_mode = 0,
         .stagger_delay_ms = 0,
         .custom_shader_len = 0,
+        .scaling_mode = ss->scaling_mode,
     };
 
     WAYWAL_LOG_INFO("Slideshow [%zu/%zu]: displaying '%s' (transition: %u)",
@@ -232,6 +233,7 @@ bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *p
     ss->transition_center_y = payload->transition_center_y;
     ss->random_order = payload->random_order;
     ss->num_target_outputs = payload->num_target_outputs;
+    ss->scaling_mode = payload->scaling_mode;
 
     ss->active = true;
     ss->paused = false;

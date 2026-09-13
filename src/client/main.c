@@ -372,6 +372,7 @@ int main(int argc, char *argv[])
         meta.stagger_delay_ms = opts.stagger_delay_ms;
         meta.custom_shader_len = (uint32_t)shader_len;
         meta.extra_data_len = (uint32_t)extra_bytes;
+        meta.scaling_mode = opts.scaling_mode;
 
         uint8_t *dst = (uint8_t *)mapped;
         memcpy(dst, &meta, sizeof(meta));
@@ -432,6 +433,7 @@ int main(int argc, char *argv[])
         spay.transition_center_y = opts.transition_pos_y;
         spay.random_order = opts.slideshow_random;
         spay.num_target_outputs = opts.num_outputs;
+        spay.scaling_mode = opts.scaling_mode;
         strncpy(spay.path, opts.filepath, sizeof(spay.path) - 1);
 
         req_hdr.opcode = WAYWAL_REQ_SLIDESHOW;

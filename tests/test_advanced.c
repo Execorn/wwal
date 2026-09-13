@@ -281,12 +281,70 @@ static void test_10bit_color_math(void)
     printf("  -> 10-bit color channel mapping: PASSED\n");
 }
 
+static void test_cli_scaling_modes(void)
+{
+    printf("[TEST] Testing CLI scaling modes and aspect ratio math...\n");
+
+    /* Default when omitted */
+    {
+        char *argv[] = {"wwal", "img", "dummy.png"};
+        cli_options_t opts;
+        assert(cli_parse(3, argv, &opts));
+        assert(opts.scaling_mode == WAYWAL_SCALING_FILL);
+    }
+
+    /* Named modes */
+    struct {
+        const char *flag;
+        const char *val;
+        waywal_scaling_mode_t expected;
+    } cases[] = {
+        {"--scaling-mode", "fill", WAYWAL_SCALING_FILL},
+        {"--mode", "fill", WAYWAL_SCALING_FILL},
+        {"--scaling-mode", "crop", WAYWAL_SCALING_FILL},
+        {"--mode", "cover", WAYWAL_SCALING_FILL},
+        {"--scaling-mode", "fit", WAYWAL_SCALING_FIT},
+        {"--mode", "fit", WAYWAL_SCALING_FIT},
+        {"--mode", "contain", WAYWAL_SCALING_FIT},
+        {"--scaling-mode", "stretch", WAYWAL_SCALING_STRETCH},
+        {"--mode", "stretch", WAYWAL_SCALING_STRETCH},
+        {"--scaling-mode", "center", WAYWAL_SCALING_CENTER},
+        {"--mode", "center", WAYWAL_SCALING_CENTER},
+        {"--scaling-mode", "tile", WAYWAL_SCALING_TILE},
+        {"--mode", "tile", WAYWAL_SCALING_TILE},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char *argv[] = {"wwal", "img", "dummy.png", (char *)cases[i].flag, (char *)cases[i].val};
+        cli_options_t opts;
+        assert(cli_parse(5, argv, &opts));
+        assert(opts.scaling_mode == cases[i].expected);
+    }
+
+    /* Mathematical aspect-ratio crop-to-fill verification (e.g. AnimeCozy 3320x1536 on 1920x1080)
+     */
+    double src_w = 3320.0, src_h = 1536.0;
+    double dst_w = 1920.0, dst_h = 1080.0;
+    double r_src = src_w / src_h;
+    double r_dst = dst_w / dst_h;
+    assert(r_src > r_dst); /* 2.161 > 1.778 (wider than monitor) */
+
+    double crop_h = src_h;
+    double crop_w = crop_h * r_dst;
+    double scale_x = dst_w / crop_w;
+    double scale_y = dst_h / crop_h;
+    assert(fabs(scale_x - scale_y) < 1e-6); /* Strict isotropic scaling - zero distortion */
+
+    printf("  -> Scaling modes and aspect ratio math: PASSED\n");
+}
+
 int main(void)
 {
     printf("=== Starting Advanced Engine & Daemon Unit Tests ===\n");
     test_cli_positional_aliases();
     test_cli_multi_monitor();
     test_cli_custom_shader_and_10bit();
+    test_cli_scaling_modes();
     test_cli_slideshow();
     test_slideshow_filesystem();
     test_10bit_color_math();

@@ -9,6 +9,7 @@ _wwal_completion() {
     local trans_types="none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom"
     local trans_positions="center top bottom left right top-left top-right bottom-left bottom-right cursor mouse"
     local sync_modes="simultaneous staggered"
+    local scaling_modes="fill fit stretch center tile crop cover contain"
     local slideshow_actions="start stop pause resume toggle next prev"
 
     # Find the subcommand if one was already given
@@ -42,6 +43,10 @@ _wwal_completion() {
             COMPREPLY=( $(compgen -W "${sync_modes}" -- "$cur") )
             return 0
             ;;
+        --scaling-mode|--mode)
+            COMPREPLY=( $(compgen -W "${scaling_modes}" -- "$cur") )
+            return 0
+            ;;
         --transition-shader)
             _filedir '@(comp|glsl)'
             return 0
@@ -51,7 +56,7 @@ _wwal_completion() {
             ;;
     esac
 
-    local trans_opts="--transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --transition-shader -o --output --sync-mode --stagger-delay --10bit"
+    local trans_opts="--transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --transition-shader -o --output --sync-mode --stagger-delay --10bit --scaling-mode --mode"
 
     case "$cmd" in
         img)

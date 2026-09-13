@@ -146,6 +146,7 @@ Transition Options:
                               bottom, left, right, top-left, top-right, bottom-left,
                               bottom-right), or dynamic cursor tracking (cursor / mouse)
   --10bit                     Force 10-bit wide-gamut direct scanout (DRM_FORMAT_XRGB2101010)
+  --scaling-mode, --mode <M>  Aspect-ratio scaling mode: fill, fit, stretch, center, tile (default: fill)
 
 Multi-Monitor & Synchronization Options:
   -o, --output <NAME>         Target specific monitor(s) (repeatable or comma-separated)
@@ -182,6 +183,16 @@ Global Options:
 ### 5. 10-Bit Color & Wide-Gamut Direct Scanout
 - **Banding-Free Gradients**: Supports native 10-bit-per-channel color (`DRM_FORMAT_XRGB2101010` / `GBM_FORMAT_XRGB2101010`) via DMA-BUF feedback tranche negotiation.
 - **Triple-Buffering Scanout Ring**: Eliminates compositor frame drops and tearing at 144Hz–500Hz refresh rates.
+
+### 6. Aspect-Ratio Correct Scaling & Non-Native Dimensions
+- **Windows-Style "Fill" (Default)**: Automatically handles non-16:9 images (ultra-wide 21:9, portrait 9:16, 4:3, square). Scales the image isotropically with zero stretching or squashing, centered, cropping overflow so the wallpaper covers 100% of the display edge-to-edge.
+- **Multiple Scaling Algorithms**:
+  - `fill` / `crop` / `cover` (Default): Crop-to-fill with aspect ratio preservation and centering.
+  - `fit` / `contain`: Proportional scale fitting inside monitor with clean letterboxing/pillarboxing.
+  - `stretch`: Direct mapping to screen width & height.
+  - `center`: 1:1 pixel centered without scaling.
+  - `tile`: Seamless pattern tiling starting at (0,0).
+- **Sub-Pixel Fixed-Point Bilinear Filtering**: Downscaled and upscaled wallpapers are filtered using high-precision integer bilinear interpolation, eliminating aliasing, jaggies, and moiré patterns.
 
 ---
 

@@ -57,6 +57,9 @@ typedef struct {
     /* 10-bit color option */
     bool enable_10bit;
 
+    /* Scaling / aspect ratio mode */
+    uint32_t scaling_mode; /* waywal_scaling_mode_t (default: 0 = WAYWAL_SCALING_FILL) */
+
     /* Video parameters */
     uint64_t video_loop_count; /* 0 = infinite loop */
     float video_speed;         /* default 1.0f */

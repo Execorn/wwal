@@ -84,6 +84,8 @@ struct output_node {
     struct wl_buffer *video_wl_buffers[4];
     bool video_buffer_in_use[4];
 
+    uint32_t scaling_mode; /* waywal_scaling_mode_t */
+
     bool configured;
     struct daemon_state *state;
     struct output_node *next;

@@ -25,6 +25,7 @@ complete -c wwal -n "__fish_use_subcommand" -a help -d "Display help message"
 set -l trans_types "none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom"
 set -l trans_pos "center top bottom left right top-left top-right bottom-left bottom-right cursor mouse"
 set -l sync_modes "simultaneous staggered"
+set -l scaling_modes "fill fit stretch center tile crop cover contain"
 
 # img options
 complete -c wwal -n "__fish_seen_subcommand_from img" -F
@@ -39,6 +40,8 @@ complete -c wwal -n "__fish_seen_subcommand_from img" -s o -l output -d "Target 
 complete -c wwal -n "__fish_seen_subcommand_from img" -l sync-mode -a "$sync_modes" -d "Multi-monitor transition sync mode"
 complete -c wwal -n "__fish_seen_subcommand_from img" -l stagger-delay -d "Stagger delay between monitors in ms" -r
 complete -c wwal -n "__fish_seen_subcommand_from img" -l 10bit -d "Force 10-bit wide gamut scanout"
+complete -c wwal -n "__fish_seen_subcommand_from img" -l scaling-mode -a "$scaling_modes" -d "Aspect ratio scaling mode"
+complete -c wwal -n "__fish_seen_subcommand_from img" -l mode -a "$scaling_modes" -d "Aspect ratio scaling mode"
 
 # clear options
 complete -c wwal -n "__fish_seen_subcommand_from clear" -s o -l output -d "Target monitor name" -r
