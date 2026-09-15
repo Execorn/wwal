@@ -82,6 +82,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                                           uint32_t height, uint32_t stride_bytes,
                                           const waywal_transition_params_t *params);
 
+
 #ifdef __cplusplus
 }
 #endif

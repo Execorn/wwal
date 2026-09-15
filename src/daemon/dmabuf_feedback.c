@@ -3,6 +3,8 @@
 
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #pragma pack(push, 1)
@@ -65,9 +67,17 @@ static void feedback_format_table(void *data, struct zwp_linux_dmabuf_feedback_v
 static void feedback_main_device(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback,
                                  struct wl_array *device)
 {
-    (void)data;
     (void)feedback;
-    (void)device;
+    dmabuf_context_t *ctx = (dmabuf_context_t *)data;
+    if (!ctx || !device || device->size < sizeof(dev_t))
+        return;
+
+    dev_t dev = 0;
+    memcpy(&dev, device->data, sizeof(dev_t));
+    ctx->compositor_dev = dev;
+    ctx->has_compositor_dev = true;
+    WAYWAL_LOG_INFO("Compositor main DRM device: %u:%u (dev_t %lu)",
+                    (unsigned)major(dev), (unsigned)minor(dev), (unsigned long)dev);
 }
 
 static void feedback_tranche_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback)

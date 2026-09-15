@@ -41,6 +41,16 @@ if seccomp_dep.found()
   add_project_arguments('-DHAVE_LIBSECCOMP', language: 'c')
 endif
 
+# OpenMP for multi-threaded CPU transition engine
+openmp_dep = dependency('openmp', required: false, language: 'c')
+if openmp_dep.found()
+  add_project_arguments('-fopenmp', language: 'c')
+  add_project_arguments('-DHAVE_OPENMP', language: 'c')
+  message('OpenMP enabled: CPU transitions will use all available threads')
+else
+  message('OpenMP not found: CPU transitions will be single-threaded')
+endif
+
 inc_dir = include_directories('include', 'src/client')
 
 # Wayland protocol code generation helper
@@ -151,6 +161,9 @@ daemon_deps = [
   threads_dep,
   m_dep
 ]
+if openmp_dep.found()
+  daemon_deps += openmp_dep
+endif
 if png_dep.found()
   daemon_deps += png_dep
 endif
@@ -246,7 +259,7 @@ test_phase3_exe = executable('test_phase3',
     glesv2_dep,
     threads_dep,
     m_dep
-  ]
+  ] + (openmp_dep.found() ? [openmp_dep] : [])
 )
 
 bench_transitions_exe = executable('bench_transitions',
@@ -271,7 +284,7 @@ bench_transitions_exe = executable('bench_transitions',
     glesv2_dep,
     threads_dep,
     m_dep
-  ]
+  ] + (openmp_dep.found() ? [openmp_dep] : [])
 )
 
 test_phase4_exe = executable('test_phase4',
@@ -344,5 +357,6 @@ test_advanced_exe = executable('test_advanced',
 test('advanced', test_advanced_exe)
 
 test('integration', find_program('tests/integration_test.sh'),
-  depends: [wwald, wwal]
+  depends: [wwald, wwal],
+  timeout: 120
 )

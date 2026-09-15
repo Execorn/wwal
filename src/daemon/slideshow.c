@@ -41,8 +41,11 @@ static void add_file_to_list(slideshow_engine_t *ss, const char *filepath)
     ss->file_list[ss->num_files++] = strdup(filepath);
 }
 
-static void scan_path_recursive(slideshow_engine_t *ss, const char *path)
+static void scan_path_recursive_internal(slideshow_engine_t *ss, const char *path, int depth)
 {
+    if (depth > 16)
+        return;
+
     struct stat st;
     if (stat(path, &st) < 0)
         return;
@@ -70,7 +73,7 @@ static void scan_path_recursive(slideshow_engine_t *ss, const char *path)
             struct stat child_st;
             if (stat(full_path, &child_st) == 0) {
                 if (S_ISDIR(child_st.st_mode)) {
-                    scan_path_recursive(ss, full_path);
+                    scan_path_recursive_internal(ss, full_path, depth + 1);
                 } else if (S_ISREG(child_st.st_mode) && has_image_extension(ent->d_name)) {
                     add_file_to_list(ss, full_path);
                 }
@@ -78,6 +81,11 @@ static void scan_path_recursive(slideshow_engine_t *ss, const char *path)
         }
         closedir(dir);
     }
+}
+
+static void scan_path_recursive(slideshow_engine_t *ss, const char *path)
+{
+    scan_path_recursive_internal(ss, path, 0);
 }
 
 static void shuffle_files(slideshow_engine_t *ss)
@@ -97,6 +105,9 @@ static void arm_timer(slideshow_engine_t *ss)
     if (!ss || ss->timer_fd < 0 || ss->interval_s == 0)
         return;
 
+    uint64_t dummy;
+    while (read(ss->timer_fd, &dummy, sizeof(dummy)) > 0);
+
     struct itimerspec its = {
         .it_interval = {.tv_sec = (time_t)ss->interval_s, .tv_nsec = 0},
         .it_value = {.tv_sec = (time_t)ss->interval_s, .tv_nsec = 0},
@@ -111,6 +122,8 @@ static void disarm_timer(slideshow_engine_t *ss)
 
     struct itimerspec its = {0};
     timerfd_settime(ss->timer_fd, 0, &its, NULL);
+    uint64_t dummy;
+    while (read(ss->timer_fd, &dummy, sizeof(dummy)) > 0);
 }
 
 static void display_current_image(slideshow_engine_t *ss)
@@ -321,7 +334,8 @@ void slideshow_dispatch_tick(slideshow_engine_t *ss)
 
     uint64_t expirations = 0;
     ssize_t s = read(ss->timer_fd, &expirations, sizeof(expirations));
-    (void)s;
+    if (s <= 0 || expirations == 0)
+        return;
 
     ss->current_file_idx = (ss->current_file_idx + 1) % ss->num_files;
     display_current_image(ss);

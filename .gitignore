@@ -39,3 +39,11 @@ perf.data*
 *.swp
 *~
 .DS_Store
+
+# Packaging artifacts
+*.pkg.tar*
+contrib/src/
+contrib/pkg/
+
+# Internal AI-generated architecture documents
+CONTEXT.md
