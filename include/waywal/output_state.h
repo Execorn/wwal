@@ -58,15 +58,17 @@ struct output_node {
     /* Presentation synchronization */
     presentation_sync_t pres_sync;
 
-    /* SHM fallback rendering buffer */
-    struct wl_buffer *active_buffer;
+    /* SHM ping-pong double-buffer (eliminates compositor/CPU write races) */
+    struct wl_buffer *shm_buffers[2];   /* [0]=front (compositor), [1]=back (CPU) */
     struct wl_shm_pool *shm_pool;
-    void *shm_data;
-    void *shm_old_data;
-    void *shm_new_data;
-    size_t shm_buffer_cap;
-    size_t shm_size;
+    void *shm_data;                     /* double-sized mmap: frame_size * 2 bytes */
+    void *shm_old_data;                 /* CPU staging: previous frame pixels */
+    void *shm_new_data;                 /* CPU staging: target frame pixels */
+    size_t shm_buffer_cap;              /* capacity of shm_old_data / shm_new_data */
+    size_t shm_size;                    /* total mmap size = frame_size * 2 */
     int shm_fd;
+    int active_buffer_idx;              /* 0 or 1: index currently committed to compositor */
+    bool shm_buffer_released[2];        /* release listener: true when compositor released */
 
     /* Asynchronous Transition State */
     bool transition_active;
@@ -85,6 +87,7 @@ struct output_node {
     bool video_buffer_in_use[4];
 
     uint32_t scaling_mode; /* waywal_scaling_mode_t */
+    bool has_image;
 
     bool configured;
     struct daemon_state *state;

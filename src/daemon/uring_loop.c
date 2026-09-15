@@ -86,7 +86,7 @@ bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_e
     slot->type = type;
     slot->user_data = user_data;
     slot->active = true;
-    slot->is_multishot = loop->multishot_supported;
+    slot->is_multishot = false;
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
     if (!sqe) {
@@ -129,6 +129,13 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
     {
         count++;
         uring_slot_t *slot = (uring_slot_t *)io_uring_cqe_get_data(cqe);
+        static uint64_t s_spin_counter = 0;
+        s_spin_counter++;
+        if (s_spin_counter % 10000 == 0) {
+            WAYWAL_LOG_WARN("uring loop spin: count=%lu slot_fd=%d type=%d res=0x%x",
+                            (unsigned long)s_spin_counter, slot ? slot->fd : -1,
+                            slot ? (int)slot->type : -1, (unsigned)cqe->res);
+        }
         if (slot && slot->active) {
             handler(slot->type, slot->fd, (uint32_t)cqe->res, slot->user_data);
 
@@ -138,6 +145,10 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
             /* Re-arm poll if slot remains active and multishot didn't continue */
             if (slot->active && loop->running && !multishot_continues) {
                 struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
+                if (!sqe) {
+                    io_uring_submit(&loop->ring);
+                    sqe = io_uring_get_sqe(&loop->ring);
+                }
                 if (sqe) {
                     if (slot->is_multishot) {
                         io_uring_prep_poll_multishot(sqe, slot->fd, slot->poll_mask);
@@ -145,6 +156,8 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
                         io_uring_prep_poll_add(sqe, slot->fd, slot->poll_mask);
                     }
                     io_uring_sqe_set_data(sqe, slot);
+                } else {
+                    WAYWAL_LOG_ERR("uring_loop_dispatch: SQ ring full, failed to re-arm fd %d", slot->fd);
                 }
             }
         }

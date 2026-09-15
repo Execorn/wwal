@@ -6,6 +6,7 @@
 #include "waywal/uring_loop.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <poll.h>
 #include <signal.h>
@@ -63,15 +64,8 @@ static bool write_exact(int fd, const void *buf, size_t len)
     return true;
 }
 
-void daemon_handle_ipc_connection(daemon_state_t *state)
+static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 {
-    int client_fd = accept4(state->server_socket_fd, NULL, NULL, SOCK_CLOEXEC);
-    if (client_fd < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            WAYWAL_LOG_ERR("accept4 failed: %s", strerror(errno));
-        }
-        return;
-    }
 
     /* Verify peer credentials (SO_PEERCRED) to prevent unauthorized local hijack */
     struct ucred cred;
@@ -313,6 +307,38 @@ void daemon_handle_ipc_connection(daemon_state_t *state)
     close(client_fd);
 }
 
+void daemon_handle_ipc_connection(daemon_state_t *state)
+{
+    if (!state || state->server_socket_fd < 0)
+        return;
+
+    while (true) {
+        int client_fd = accept4(state->server_socket_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            WAYWAL_LOG_ERR("accept4 failed: %s", strerror(errno));
+            break;
+        }
+
+        /* Clear O_NONBLOCK on client socket so IPC read/write can respect socket timeouts */
+        int flags = fcntl(client_fd, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);
+        }
+
+        daemon_process_ipc_client(state, client_fd);
+
+        if (!state->running) {
+            break;
+        }
+    }
+}
+
 static bool g_daemon_wl_read_ready = false;
 
 static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_t res,
@@ -331,6 +357,8 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
         daemon_handle_ipc_connection(st);
         break;
     case URING_EV_TIMER:
+        if ((res & POLLIN) == 0)
+            break;
         if (fd == st->transition_timer_fd) {
             transition_engine_dispatch_tick(st);
         } else if (fd == st->video_engine.timer_fd) {

@@ -32,9 +32,13 @@ static void output_handle_mode(void *data, struct wl_output *output, uint32_t fl
     (void)output;
     output_state_t *st = (output_state_t *)data;
     if (st && (flags & WL_OUTPUT_MODE_CURRENT)) {
-        st->width = (uint32_t)width;
-        st->height = (uint32_t)height;
-        st->refresh_mhz = (uint32_t)refresh;
+        if (width > 0 && height > 0) {
+            st->width = (uint32_t)width;
+            st->height = (uint32_t)height;
+        }
+        if (refresh > 0) {
+            st->refresh_mhz = (uint32_t)refresh;
+        }
     }
 }
 

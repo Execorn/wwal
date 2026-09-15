@@ -4,13 +4,34 @@
 #include "waywal/log.h"
 #include "waywal/os_compat.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
+
+/* SHM ping-pong buffer release listener: tracks when compositor releases a buffer */
+static void shm_buffer_release(void *data, struct wl_buffer *wl_buffer)
+{
+    (void)wl_buffer;
+    output_node_t *node = (output_node_t *)data;
+    if (!node)
+        return;
+    for (int i = 0; i < 2; ++i) {
+        if (node->shm_buffers[i] == wl_buffer) {
+            node->shm_buffer_released[i] = true;
+            break;
+        }
+    }
+}
+
+static const struct wl_buffer_listener shm_buffer_listener = {
+    .release = shm_buffer_release,
+};
 
 static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *layer_surface,
                                     uint32_t serial, uint32_t width, uint32_t height)
@@ -121,14 +142,6 @@ void output_node_destroy_surface(output_node_t *node)
         }
     }
 
-    if (node->has_source_old_bo) {
-        dmabuf_bo_free(&node->source_old_bo);
-        node->has_source_old_bo = false;
-    }
-    if (node->has_source_new_bo) {
-        dmabuf_bo_free(&node->source_new_bo);
-        node->has_source_new_bo = false;
-    }
     if (node->shm_old_data) {
         free(node->shm_old_data);
         node->shm_old_data = NULL;
@@ -157,9 +170,12 @@ void output_node_destroy_surface(output_node_t *node)
         node->has_source_new_bo = false;
     }
 
-    if (node->active_buffer) {
-        wl_buffer_destroy(node->active_buffer);
-        node->active_buffer = NULL;
+    for (int i = 0; i < 2; ++i) {
+        if (node->shm_buffers[i]) {
+            wl_buffer_destroy(node->shm_buffers[i]);
+            node->shm_buffers[i] = NULL;
+        }
+        node->shm_buffer_released[i] = true;
     }
     if (node->shm_pool) {
         wl_shm_pool_destroy(node->shm_pool);
@@ -174,6 +190,7 @@ void output_node_destroy_surface(output_node_t *node)
         close(node->shm_fd);
         node->shm_fd = -1;
     }
+
 
     if (node->viewport) {
         wp_viewport_destroy(node->viewport);
@@ -193,6 +210,29 @@ void output_node_destroy_surface(output_node_t *node)
         node->surface = NULL;
     }
     node->configured = false;
+    node->transition_active = false;
+    node->transition_current_frame = 0;
+    node->transition_total_frames = 0;
+}
+
+static bool is_multigpu_system(void)
+{
+    static int s_multigpu = -1;
+    if (s_multigpu != -1)
+        return (s_multigpu == 1);
+    DIR *d = opendir("/dev/dri");
+    int count = 0;
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (strncmp(de->d_name, "renderD", 7) == 0) {
+                count++;
+            }
+        }
+        closedir(d);
+    }
+    s_multigpu = (count > 1) ? 1 : 0;
+    return (s_multigpu == 1);
 }
 
 static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32_t width,
@@ -203,6 +243,20 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
     }
     if (width <= 0 || height <= 0)
         return false;
+
+    /* Multi-GPU hybrid topologies (e.g. AMD iGPU + NVIDIA dGPU) drive different outputs
+     * from different DRM devices. Cross-device DMA-BUF sharing causes compositor driver aborts;
+     * use universal zero-copy wl_shm pipeline instead. */
+    if (is_multigpu_system()) {
+        return false;
+    }
+
+    /* CPU blitting into non-linear (tiled or DCC compressed) modifiers corrupts hardware tile
+     * state and trips GPU resets. Only use direct scanout if modifier is linear. */
+    if (state->dmabuf_ctx.preferred_modifier != DRM_FORMAT_MOD_LINEAR &&
+        state->dmabuf_ctx.preferred_modifier != DRM_FORMAT_MOD_INVALID) {
+        return false;
+    }
 
     if (node->use_dmabuf && (int32_t)node->dmabuf_ring.width == width &&
         (int32_t)node->dmabuf_ring.height == height) {
@@ -234,16 +288,30 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
 {
     if (width <= 0 || height <= 0)
         return false;
-    size_t stride = (size_t)width * 4;
-    size_t size = stride * (size_t)height;
+    size_t stride    = (size_t)width * 4;
+    size_t frame_sz  = stride * (size_t)height;
+    size_t total_sz  = frame_sz * 2; /* double-sized: two frames back-to-back */
 
-    if (node->shm_data && node->shm_size == size && node->active_buffer) {
+    /* Guard: wl_shm_create_pool takes int32_t size; ensure no overflow.
+     * For reference: 8K double-buf = 253MB, well below 2GB limit. */
+    if (total_sz > (size_t)INT32_MAX) {
+        WAYWAL_LOG_ERR("Output %s: SHM double-buffer too large (%zu bytes > INT32_MAX)", node->name,
+                       total_sz);
+        return false;
+    }
+
+    if (node->shm_data && node->shm_size == total_sz &&
+        node->shm_buffers[0] && node->shm_buffers[1]) {
         return true;
     }
 
-    if (node->active_buffer) {
-        wl_buffer_destroy(node->active_buffer);
-        node->active_buffer = NULL;
+    /* Tear down existing resources */
+    for (int i = 0; i < 2; ++i) {
+        if (node->shm_buffers[i]) {
+            wl_buffer_destroy(node->shm_buffers[i]);
+            node->shm_buffers[i] = NULL;
+        }
+        node->shm_buffer_released[i] = true;
     }
     if (node->shm_pool) {
         wl_shm_pool_destroy(node->shm_pool);
@@ -257,14 +325,24 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
         close(node->shm_fd);
         node->shm_fd = -1;
     }
+    node->active_buffer_idx = 0;
 
-    node->shm_fd = waywal_create_memfd("waywal-shm-buf", size, 0);
+    /* Guard: wl_shm_create_pool takes int32_t size; ensure no overflow BEFORE
+     * any allocation. For reference: 8K double-buf = 253MB, well below 2GB. */
+    if (total_sz > (size_t)INT32_MAX) {
+        WAYWAL_LOG_ERR("Output %s: SHM double-buffer too large (%zu bytes > INT32_MAX)", node->name,
+                       total_sz);
+        return false;
+    }
+
+    /* Allocate double-sized memfd */
+    node->shm_fd = waywal_create_memfd("waywal-shm-buf", total_sz, 0);
     if (node->shm_fd < 0) {
         WAYWAL_LOG_ERR("Failed to create memfd for output %s buffer", node->name);
         return false;
     }
 
-    node->shm_data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, node->shm_fd, 0);
+    node->shm_data = mmap(NULL, total_sz, PROT_READ | PROT_WRITE, MAP_SHARED, node->shm_fd, 0);
     if (node->shm_data == MAP_FAILED) {
         WAYWAL_LOG_ERR("mmap failed for output %s buffer", node->name);
         close(node->shm_fd);
@@ -272,18 +350,46 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
         node->shm_data = NULL;
         return false;
     }
-    node->shm_size = size;
+    node->shm_size = total_sz;
 
-    node->shm_pool = wl_shm_create_pool(state->shm, node->shm_fd, (int32_t)size);
+    /* Create SHM pool over entire double-sized region */
+    node->shm_pool = wl_shm_create_pool(state->shm, node->shm_fd, (int32_t)total_sz);
     if (!node->shm_pool) {
         WAYWAL_LOG_ERR("wl_shm_create_pool failed");
         return false;
     }
 
-    node->active_buffer = wl_shm_pool_create_buffer(node->shm_pool, 0, width, height,
-                                                    (int32_t)stride, WL_SHM_FORMAT_ARGB8888);
-    if (!node->active_buffer) {
-        WAYWAL_LOG_ERR("wl_shm_pool_create_buffer failed");
+    /* Create two wl_buffers: buf[0] at offset 0, buf[1] at offset frame_sz */
+    bool buf_ok = true;
+    for (int i = 0; i < 2; ++i) {
+        int32_t offset = (int32_t)(i * frame_sz);
+        node->shm_buffers[i] = wl_shm_pool_create_buffer(
+            node->shm_pool, offset, width, height,
+            (int32_t)stride, WL_SHM_FORMAT_ARGB8888);
+        if (!node->shm_buffers[i]) {
+            WAYWAL_LOG_ERR("wl_shm_pool_create_buffer[%d] failed", i);
+            buf_ok = false;
+            break;
+        }
+        wl_buffer_add_listener(node->shm_buffers[i], &shm_buffer_listener, node);
+        node->shm_buffer_released[i] = true;
+    }
+
+    if (!buf_ok) {
+        /* Partial failure: clean up everything allocated so far */
+        for (int i = 0; i < 2; ++i) {
+            if (node->shm_buffers[i]) {
+                wl_buffer_destroy(node->shm_buffers[i]);
+                node->shm_buffers[i] = NULL;
+            }
+        }
+        wl_shm_pool_destroy(node->shm_pool);
+        node->shm_pool = NULL;
+        munmap(node->shm_data, node->shm_size);
+        node->shm_data = NULL;
+        node->shm_size = 0;
+        close(node->shm_fd);
+        node->shm_fd = -1;
         return false;
     }
 
@@ -337,7 +443,10 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
         return;
     }
 
-    uint32_t *pixels = (uint32_t *)node->shm_data;
+    /* Ping-pong: write to back buffer (not the one compositor is reading) */
+    int back_idx = 1 - node->active_buffer_idx;
+    size_t frame_sz = (size_t)node->width * (size_t)node->height * sizeof(uint32_t);
+    uint32_t *pixels = (uint32_t *)((uint8_t *)node->shm_data + back_idx * frame_sz);
     size_t count = (size_t)node->width * (size_t)node->height;
     for (size_t i = 0; i < count; ++i) {
         pixels[i] = pixel;
@@ -349,8 +458,10 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                                wl_fixed_from_int(-1), wl_fixed_from_int(-1));
     }
 
-    wl_surface_attach(node->surface, node->active_buffer, 0, 0);
+    wl_surface_attach(node->surface, node->shm_buffers[back_idx], 0, 0);
     wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
+    node->shm_buffer_released[back_idx] = false;
+    node->active_buffer_idx = back_idx;
     output_commit_frame(node);
     wl_display_flush(state->display);
 }
@@ -577,6 +688,7 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                 wl_surface_attach(node->surface, bo->wl_buffer, 0, 0);
                 wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
                 output_commit_frame(node);
+                node->has_image = true;
                 wl_display_flush(state->display);
                 return;
             }
@@ -585,12 +697,18 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
 
     /* Fallback SHM rendering path */
     if (ensure_shm_buffer(state, node, node->width, node->height)) {
-        copy_or_scale_image((uint32_t *)node->shm_data, (uint32_t)node->width,
+        int back_idx = 1 - node->active_buffer_idx;
+        size_t frame_sz = (size_t)node->width * (size_t)node->height * sizeof(uint32_t);
+        void *back_ptr  = (uint8_t *)node->shm_data + back_idx * frame_sz;
+        copy_or_scale_image((uint32_t *)back_ptr, (uint32_t)node->width,
                             (uint32_t)node->height, (size_t)node->width * sizeof(uint32_t), src,
                             img_w, img_h, node->scaling_mode, state->current_color);
-        wl_surface_attach(node->surface, node->active_buffer, 0, 0);
+        wl_surface_attach(node->surface, node->shm_buffers[back_idx], 0, 0);
         wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
+        node->shm_buffer_released[back_idx] = false;
+        node->active_buffer_idx = back_idx;
         output_commit_frame(node);
+        node->has_image = true;
         wl_display_flush(state->display);
     }
 }
@@ -680,6 +798,28 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         }
         render_engine_load_custom_shader(&state->render_engine, ptr);
     }
+
+    /* ── Priority 5: Preempt any in-progress transition cleanly ─────────────────
+     * Snapshot the last rendered pixel data into shm_old_data so the new
+     * transition starts from the visible frame, not from stale shm_new_data. */
+    for (output_node_t *pout = state->outputs; pout != NULL; pout = pout->next) {
+        if (!pout->transition_active)
+            continue;
+        /* Copy the currently committed (back) buffer into old staging */
+        if (pout->shm_data && pout->shm_old_data && pout->width > 0 && pout->height > 0) {
+            size_t fsz = (size_t)pout->width * (size_t)pout->height * sizeof(uint32_t);
+            void *displayed = (uint8_t *)pout->shm_data + pout->active_buffer_idx * fsz;
+            memcpy(pout->shm_old_data, displayed, fsz);
+        }
+        pout->transition_active = false;
+    }
+    /* Drain any stale timerfd expirations left over from the cancelled transition */
+    if (state->transition_timer_fd >= 0) {
+        uint64_t dummy;
+        while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0)
+            ;
+    }
+    state->transitions_in_progress = false;
 
     if (!meta || meta->transition_type == WAYWAL_TRANSITION_NONE ||
         meta->transition_type == WAYWAL_TRANSITION_SIMPLE || meta->transition_duration_ms == 0) {
@@ -793,13 +933,26 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                 output_node_render_image(state, out, pixels, img_w, img_h);
                 continue;
             }
-            if (out->shm_data) {
-                memcpy(out->shm_old_data, out->shm_data,
-                       (size_t)out->width * (size_t)out->height * sizeof(uint32_t));
+            if (out->has_image && out->shm_data) {
+                /* Snapshot the currently committed (front) buffer as the old frame */
+                size_t fsz = (size_t)out->width * (size_t)out->height * sizeof(uint32_t);
+                void *front_ptr = (uint8_t *)out->shm_data + out->active_buffer_idx * fsz;
+                memcpy(out->shm_old_data, front_ptr, fsz);
+            } else {
+                uint32_t col = ((uint32_t)state->current_color.a << 24) |
+                               ((uint32_t)state->current_color.r << 16) |
+                               ((uint32_t)state->current_color.g << 8) |
+                               (uint32_t)state->current_color.b;
+                uint32_t *old_u32 = (uint32_t *)out->shm_old_data;
+                size_t total_px = (size_t)out->width * (size_t)out->height;
+                for (size_t p = 0; p < total_px; ++p) {
+                    old_u32[p] = col;
+                }
             }
             copy_or_scale_image((uint32_t *)out->shm_new_data, (uint32_t)out->width,
                                 (uint32_t)out->height, (size_t)out->width * sizeof(uint32_t), src,
                                 img_w, img_h, out->scaling_mode, state->current_color);
+            /* GPU-SHM path removed: OpenMP CPU engine is 50x faster than glReadPixels */
         }
 
         float cx = 0.5f;
@@ -846,9 +999,13 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                              .it_value = {.tv_sec = (time_t)(frame_interval_ns / 1000000000ULL),
                                           .tv_nsec = (long)(frame_interval_ns % 1000000000ULL)}};
     if (state->transition_timer_fd >= 0) {
+        uint64_t dummy;
+        while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0);
         timerfd_settime(state->transition_timer_fd, 0, &its, NULL);
     }
     state->transitions_in_progress = true;
+    WAYWAL_LOG_INFO("Transition started: type=%u, duration=%ums, frames=%u, fps=%u",
+                    meta->transition_type, meta->transition_duration_ms, num_frames, fps);
     return true;
 }
 
@@ -859,7 +1016,8 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
 
     uint64_t expirations = 0;
     ssize_t s = read(state->transition_timer_fd, &expirations, sizeof(expirations));
-    (void)s;
+    if (s <= 0 || expirations == 0)
+        return;
 
     int active_count = 0;
 
@@ -891,15 +1049,47 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                 }
             }
         } else {
-            if (out->active_buffer && out->shm_data && out->shm_old_data && out->shm_new_data) {
+            /* SHM ping-pong path: render into back buffer, never touch the front */
+            if (out->shm_buffers[0] && out->shm_buffers[1] &&
+                out->shm_data && out->shm_old_data && out->shm_new_data) {
+                int back_idx = 1 - out->active_buffer_idx;
+
+                /* Safety: if compositor hasn't released the back buffer yet, skip frame */
+                if (!out->shm_buffer_released[back_idx]) {
+                    active_count++;
+                    continue;
+                }
+
+                struct timespec ts0, ts1;
+                clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+                size_t frame_sz = (size_t)out->width * (size_t)out->height * sizeof(uint32_t);
+                void *back_ptr  = (uint8_t *)out->shm_data + back_idx * frame_sz;
+
+                /* OpenMP-parallelized CPU transition (16 threads, ~5–18ms for complex effects) */
                 render_engine_execute_cpu_transition(
-                    (uint32_t *)out->shm_data, (const uint32_t *)out->shm_old_data,
-                    (const uint32_t *)out->shm_new_data, (uint32_t)out->width,
-                    (uint32_t)out->height, (uint32_t)out->width * sizeof(uint32_t),
+                    (uint32_t *)back_ptr,
+                    (const uint32_t *)out->shm_old_data,
+                    (const uint32_t *)out->shm_new_data,
+                    (uint32_t)out->width, (uint32_t)out->height,
+                    (uint32_t)out->width * sizeof(uint32_t),
                     &out->transition_params);
-                wl_surface_attach(out->surface, out->active_buffer, 0, 0);
+
+                clock_gettime(CLOCK_MONOTONIC, &ts1);
+                double render_ms = ((ts1.tv_sec - ts0.tv_sec) * 1000.0) +
+                                   ((ts1.tv_nsec - ts0.tv_nsec) / 1000000.0);
+
+                /* Commit back buffer; swap front/back indices */
+                wl_surface_attach(out->surface, out->shm_buffers[back_idx], 0, 0);
                 wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
+                out->shm_buffer_released[back_idx] = false;
+                out->active_buffer_idx = back_idx;
                 output_commit_frame(out);
+
+                if (out->transition_current_frame <= 2 || out->transition_current_frame % 20 == 0) {
+                    WAYWAL_LOG_INFO("Tick frame %u out %s: render=%.2fms (OpenMP CPU)",
+                                    out->transition_current_frame, out->name, render_ms);
+                }
             }
         }
 
@@ -910,9 +1100,12 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                 out->source_old_bo = out->source_new_bo;
                 out->source_new_bo = tmp;
             } else if (out->shm_old_data && out->shm_new_data) {
-                memcpy(out->shm_old_data, out->shm_new_data,
-                       (size_t)out->width * (size_t)out->height * sizeof(uint32_t));
+                /* Promote new frame -> old so next transition starts from correct state */
+                void *tmp = out->shm_old_data;
+                out->shm_old_data = out->shm_new_data;
+                out->shm_new_data = tmp;
             }
+            out->has_image = true;
         } else {
             active_count++;
         }
@@ -924,7 +1117,10 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
         struct itimerspec its;
         memset(&its, 0, sizeof(its));
         timerfd_settime(state->transition_timer_fd, 0, &its, NULL);
+        uint64_t dummy;
+        while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0);
         state->transitions_in_progress = false;
+        WAYWAL_LOG_INFO("Transition completed successfully across active outputs");
     }
 }
 

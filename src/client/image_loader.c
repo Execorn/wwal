@@ -157,6 +157,22 @@ static bool load_jpeg(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t 
     return true;
 }
 
+static inline uint16_t read_u16_le(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static inline uint32_t read_u32_le(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static inline int32_t read_i32_le(const uint8_t *p)
+{
+    return (int32_t)read_u32_le(p);
+}
+
 static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
 {
     uint8_t header[54];
@@ -165,11 +181,11 @@ static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     if (header[0] != 'B' || header[1] != 'M')
         return false;
 
-    uint32_t data_offset = *(uint32_t *)&header[10];
-    int32_t width = *(int32_t *)&header[18];
-    int32_t height = *(int32_t *)&header[22];
-    uint16_t bpp = *(uint16_t *)&header[28];
-    uint32_t compression = *(uint32_t *)&header[30];
+    uint32_t data_offset = read_u32_le(&header[10]);
+    int32_t width = read_i32_le(&header[18]);
+    int32_t height = read_i32_le(&header[22]);
+    uint16_t bpp = read_u16_le(&header[28]);
+    uint32_t compression = read_u32_le(&header[30]);
 
     if (width <= 0 || height == 0 || width > 16384 || height > 16384 || height < -16384 ||
         (bpp != 24 && bpp != 32) || compression != 0) {

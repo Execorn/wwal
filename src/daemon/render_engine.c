@@ -3,7 +3,11 @@
 #include "gpu_compute.h"
 #include "simd/simd_blend.h"
 #include "waywal/log.h"
+#include "waywal/output_state.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +40,13 @@ bool render_engine_init(render_engine_t *re, dmabuf_context_t *dmabuf_ctx)
 #endif
 
     WAYWAL_LOG_INFO("Render Engine initialized with CPU SIMD fallback (%s)", simd_name);
+
+#ifdef _OPENMP
+#pragma omp parallel
+    {
+        (void)omp_get_thread_num();
+    }
+#endif
     return true;
 }
 
@@ -81,16 +92,17 @@ static inline float smoothstepf(float edge0, float edge1, float x)
 
 static inline float hash21(float x, float y)
 {
-    float px = fmodf(x * 123.34f + y * 456.21f, 1.0f);
-    if (px < 0.0f)
-        px += 1.0f;
+    float px = x * 123.34f + y * 456.21f;
+    px = px - floorf(px);
     float dot = px * (px + 45.32f);
-    float val = fmodf(dot * 1337.5f, 1.0f);
-    return val < 0.0f ? val + 1.0f : val;
+    float val = dot * 1337.5f;
+    return val - floorf(val);
 }
 
 static inline uint32_t blend_pixel_scalar(uint32_t a, uint32_t b, uint16_t wb)
 {
+    if (wb > 256)
+        wb = 256;
     uint32_t wa = 256 - wb;
     uint32_t rb = (((a & 0x00FF00FF) * wa) + ((b & 0x00FF00FF) * wb)) >> 8;
     uint32_t g = (((a & 0x0000FF00) * wa) + ((b & 0x0000FF00) * wb)) >> 8;
@@ -157,6 +169,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         if (weight_b > 256)
             weight_b = 256;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             uint8_t *dst_row = (uint8_t *)(dst + y * stride_pixels);
             const uint8_t *src_a_row = (const uint8_t *)(old_pixels + y * width);
@@ -172,6 +185,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float sin_a = sinf(params->angle_rad);
         float edge = 0.04f;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float ny = (float)y / (float)height - 0.5f;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -205,6 +219,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float r = progress * max_dist;
         float edge = 0.03f * max_dist;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float dy = (float)y / (float)height - cy;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -238,6 +253,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float r = (1.0f - progress) * max_dist;
         float edge = 0.03f * max_dist;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float dy = (float)y / (float)height - cy;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -268,6 +284,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float amp = params->wave_amp > 0.0f ? params->wave_amp : 0.05f;
         float edge = 0.04f;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float ny = (float)y / (float)height - 0.5f;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -296,6 +313,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
     case WAYWAL_TRANSITION_NOISE: {
         float edge = 0.05f;
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             uint32_t *dst_row = dst + y * stride_pixels;
             const uint32_t *a_row = old_pixels + y * width;
@@ -327,6 +345,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float zoom_b = 1.0f + (1.0f - progress) * strength;
         uint16_t wb = (uint16_t)(progress * 256.0f);
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float ny = ((float)y / (float)height - cy);
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -369,6 +388,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float sin_a = sinf(params->angle_rad);
         float edge = 0.04f;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float ny = (float)y / (float)height - 0.5f;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -421,6 +441,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float peak = sinf(progress * 3.14159265f);
         float step_t = floorf(progress * 24.0f);
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float slice_idx = floorf(((float)y / (float)height) * bands);
             float h = hash21(slice_idx, step_t);
@@ -472,6 +493,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float scale = params->wave_freq > 0.0f ? params->wave_freq : 14.0f;
         float flame_width = params->wave_amp > 0.0f ? params->wave_amp : 0.08f;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float ny = (float)y / (float)height;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -517,7 +539,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
     case WAYWAL_TRANSITION_RIPPLE: {
         float cx = (params->center_x > 0.0f || params->center_y > 0.0f) ? params->center_x : 0.5f;
-        float cy = (params->center_y > 0.0f || params->center_y > 0.0f) ? params->center_y : 0.5f;
+        float cy = (params->center_x > 0.0f || params->center_y > 0.0f) ? params->center_y : 0.5f;
         float aspect = (float)width / (float)height;
         float max_x = cx > (1.0f - cx) ? cx : (1.0f - cx);
         float max_y = cy > (1.0f - cy) ? cy : (1.0f - cy);
@@ -528,6 +550,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float amp = params->wave_amp > 0.0f ? params->wave_amp : 0.04f;
         float decay = (1.0f - progress) * (1.0f - progress);
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float dy = (float)y / (float)height - cy;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -573,6 +596,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         uint32_t block_sz = (d >= 1.0f) ? (uint32_t)d : 1u;
         uint16_t wb = (uint16_t)(progress * 256.0f);
 
+#pragma omp parallel for schedule(dynamic)
         for (uint32_t by = 0; by < height; by += block_sz) {
             uint32_t bh = (by + block_sz <= height) ? block_sz : (height - by);
             uint32_t sy = by + bh / 2;
@@ -601,7 +625,8 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
     }
 
     case WAYWAL_TRANSITION_DOOM: {
-        uint32_t col_width = 4;
+        uint32_t col_width = 16;
+#pragma omp parallel for schedule(static)
         for (uint32_t bx = 0; bx < width; bx += col_width) {
             uint32_t bw = (bx + col_width <= width) ? col_width : (width - bx);
             float col_idx = (float)(bx / col_width);
@@ -639,12 +664,13 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
     case WAYWAL_TRANSITION_SWIRL: {
         float cx = (params->center_x > 0.0f || params->center_y > 0.0f) ? params->center_x : 0.5f;
-        float cy = (params->center_y > 0.0f || params->center_y > 0.0f) ? params->center_y : 0.5f;
+        float cy = (params->center_x > 0.0f || params->center_y > 0.0f) ? params->center_y : 0.5f;
         float aspect = (float)width / (float)height;
         float angle_amt = sinf(progress * 3.1415926535f) * 8.0f;
         float max_r = 0.85f;
         uint16_t wb = (uint16_t)(progress * 256.0f);
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float dy = (float)y / (float)height - cy;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -691,6 +717,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float sin_t = sinf(theta);
         float d_cam = 2.5f;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float py = ((float)y / (float)height - 0.5f) * 2.0f;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -783,6 +810,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float softness = 0.08f;
         float aspect = (float)width / (float)height;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float vy = (float)y / (float)height;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -807,6 +835,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float env = sinf(progress * 3.1415926535f);
         env = env * env;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float vy = (float)y / (float)height;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -830,6 +859,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float R = 0.12f;
         float line = 1.02f - progress * 1.25f;
 
+#pragma omp parallel for schedule(static)
         for (uint32_t y = 0; y < height; ++y) {
             float vy = (float)y / (float)height;
             uint32_t *dst_row = dst + y * stride_pixels;
@@ -852,8 +882,8 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                             sy = height - 1;
                         uint32_t col = old_pixels[sy * width + sx];
                         float curl_light = 0.85f + 0.35f * sinf((dist / R) * 3.1415926535f);
-                        dst_row[x] =
-                            blend_pixel_scalar(0xFF000000, col, (uint16_t)(curl_light * 230.0f));
+                        dst_row[x] = blend_pixel_scalar(
+                            0xFF000000, col, (uint16_t)clampf(curl_light * 230.0f, 0.0f, 256.0f));
                     } else {
                         float shadow = 0.5f + 0.5f * smoothstepf(0.0f, R, dist);
                         uint32_t col = new_pixels[y * width + x];
@@ -917,3 +947,5 @@ bool render_engine_execute_transition(render_engine_t *re, dmabuf_bo_t *target_b
 
     return ok;
 }
+
+

@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <wayland-client.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -46,6 +48,9 @@ typedef struct dmabuf_context {
     bool has_10bit;
     uint32_t format_10bit;
     uint64_t modifier_10bit;
+    /* Compositor main device (from zwp_linux_dmabuf_feedback_v1::main_device) */
+    dev_t compositor_dev;
+    bool has_compositor_dev;
     bool available;
 } dmabuf_context_t;
 

@@ -3,29 +3,13 @@ Description=WayWal (Wayland Wallpapers) Daemon
 Documentation=https://github.com/execorn/wwal
 PartOf=graphical-session.target
 After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=simple
-ExecStart=wwald
+ExecStart=/usr/bin/wwald
 Restart=on-failure
 RestartSec=1s
-
-# Sandboxing & Security Hardening
-ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=true
-NoNewPrivileges=true
-ProtectKernelTunables=true
-ProtectControlGroups=true
-RestrictNamespaces=true
-RestrictRealtime=true
-MemoryDenyWriteExecute=false
-LockPersonality=true
-
-# Allow access to graphics / DRM devices and Wayland runtime directory
-DevicePolicy=auto
-DeviceAllow=/dev/dri/card* rw
-DeviceAllow=/dev/dri/renderD* rw
 
 [Install]
 WantedBy=graphical-session.target

@@ -1,13 +1,22 @@
 #include "wayland_core.h"
 
+#include "waywal/dmabuf.h"
 #include "waywal/log.h"
 
+#include <fcntl.h>
+#include <gbm.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+/* Declared in dmabuf_alloc.c — matches compositor dev_t to /dev/dri/renderD* */
+int open_drm_node_by_devt(dev_t target_dev);
 
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface, wl_fixed_t surface_x, wl_fixed_t surface_y)
@@ -274,8 +283,73 @@ bool daemon_wayland_init(daemon_state_t *state)
     /* Initialize DMA-BUF feedback if supported by compositor */
     if (state->dmabuf_ctx.available && state->dmabuf_ctx.dmabuf_proto) {
         dmabuf_feedback_init(&state->dmabuf_ctx);
-        /* Roundtrip to receive format modifier tranches */
+        /* Roundtrip to receive main_device + format modifier tranches */
         (void)wl_display_roundtrip(state->display);
+
+        /* ── Compositor device realignment ───────────────────────────────────
+         * feedback_main_device() now stores the compositor's dev_t. If the GBM
+         * device we opened earlier (via sysfs) doesn't match (e.g. we got
+         * renderD129/NVIDIA instead of renderD128/AMD), reinitialize on the
+         * correct node to avoid cross-device EGL_BAD_ALLOC. */
+        if (state->dmabuf_ctx.has_compositor_dev && state->dmabuf_ctx.drm_fd >= 0) {
+            struct stat st;
+            if (fstat(state->dmabuf_ctx.drm_fd, &st) == 0 &&
+                st.st_rdev != state->dmabuf_ctx.compositor_dev) {
+                WAYWAL_LOG_INFO(
+                    "GBM device mismatch (have %u:%u, compositor wants %u:%u) — reinitializing",
+                    (unsigned)major(st.st_rdev), (unsigned)minor(st.st_rdev),
+                    (unsigned)major(state->dmabuf_ctx.compositor_dev),
+                    (unsigned)minor(state->dmabuf_ctx.compositor_dev));
+
+                /* Preserve protocol objects across GBM tear-down */
+                struct zwp_linux_dmabuf_v1    *saved_proto    = state->dmabuf_ctx.dmabuf_proto;
+                struct zwp_linux_dmabuf_feedback_v1 *saved_fb = state->dmabuf_ctx.default_feedback;
+                uint64_t saved_mod  = state->dmabuf_ctx.preferred_modifier;
+                uint32_t saved_fmt  = state->dmabuf_ctx.preferred_format;
+                dev_t    saved_dev  = state->dmabuf_ctx.compositor_dev;
+                bool     saved_hdev = state->dmabuf_ctx.has_compositor_dev;
+                bool     saved_10   = state->dmabuf_ctx.has_10bit;
+                uint32_t saved_f10  = state->dmabuf_ctx.format_10bit;
+                uint64_t saved_m10  = state->dmabuf_ctx.modifier_10bit;
+
+                /* Destroy old GBM only (not protocol objects) */
+                if (state->dmabuf_ctx.gbm)
+                    gbm_device_destroy(state->dmabuf_ctx.gbm);
+                if (state->dmabuf_ctx.drm_fd >= 0)
+                    close(state->dmabuf_ctx.drm_fd);
+                state->dmabuf_ctx.gbm    = NULL;
+                state->dmabuf_ctx.drm_fd = -1;
+
+                /* Open compositor's actual render node */
+                int new_fd = open_drm_node_by_devt(saved_dev);
+                if (new_fd >= 0) {
+                    struct gbm_device *new_gbm = gbm_create_device(new_fd);
+                    if (new_gbm) {
+                        state->dmabuf_ctx.drm_fd = new_fd;
+                        state->dmabuf_ctx.gbm    = new_gbm;
+                        WAYWAL_LOG_INFO("GBM reinitialized on compositor device %u:%u",
+                                        (unsigned)major(saved_dev), (unsigned)minor(saved_dev));
+                    } else {
+                        WAYWAL_LOG_WARN("gbm_create_device failed on compositor node — staying on fallback");
+                        close(new_fd);
+                    }
+                } else {
+                    WAYWAL_LOG_WARN("Could not open compositor DRM node for GBM reinit");
+                }
+
+                /* Restore protocol/modifier state */
+                state->dmabuf_ctx.dmabuf_proto        = saved_proto;
+                state->dmabuf_ctx.default_feedback     = saved_fb;
+                state->dmabuf_ctx.preferred_modifier   = saved_mod;
+                state->dmabuf_ctx.preferred_format     = saved_fmt;
+                state->dmabuf_ctx.compositor_dev       = saved_dev;
+                state->dmabuf_ctx.has_compositor_dev   = saved_hdev;
+                state->dmabuf_ctx.has_10bit            = saved_10;
+                state->dmabuf_ctx.format_10bit         = saved_f10;
+                state->dmabuf_ctx.modifier_10bit       = saved_m10;
+                state->dmabuf_ctx.available            = (state->dmabuf_ctx.gbm != NULL);
+            }
+        }
     }
 
     /* Initialize GPU Compute & SIMD render engine */

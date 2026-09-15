@@ -4,6 +4,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 static void dmabuf_release_handler(void *data, struct wl_buffer *wl_buffer)
@@ -87,6 +90,37 @@ static bool find_active_drm_render_node(char *out_path, size_t max_len)
     return found;
 }
 
+/* Try to find the DRM render node matching a specific dev_t reported by the compositor */
+int open_drm_node_by_devt(dev_t target_dev)
+{
+    DIR *dir = opendir("/dev/dri");
+    if (!dir)
+        return -1;
+
+    struct dirent *de;
+    int found_fd = -1;
+
+    while ((de = readdir(dir)) != NULL) {
+        if (strncmp(de->d_name, "renderD", 7) != 0)
+            continue;
+
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/dri/%s", de->d_name);
+
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_rdev == target_dev) {
+            found_fd = open(path, O_RDWR | O_CLOEXEC);
+            if (found_fd >= 0) {
+                WAYWAL_LOG_INFO("Matched compositor DRM device %u:%u → %s",
+                                (unsigned)major(target_dev), (unsigned)minor(target_dev), path);
+            }
+            break;
+        }
+    }
+    closedir(dir);
+    return found_fd;
+}
+
 bool dmabuf_context_init(dmabuf_context_t *ctx)
 {
     if (!ctx)
@@ -95,28 +129,36 @@ bool dmabuf_context_init(dmabuf_context_t *ctx)
     ctx->drm_fd = -1;
     ctx->preferred_modifier = DRM_FORMAT_MOD_INVALID;
 
-    /* Discover DRM render node:
-     * 1. Query sysfs for active display connectors to find the GPU driving the display.
-     * 2. Fallback to /dev/dri/renderD128 if accessible.
-     * 3. Fallback to drmGetDevices2.
-     */
-    char active_node[256] = {0};
     int drm_fd = -1;
+    char active_node[256] = {0};
 
-    if (find_active_drm_render_node(active_node, sizeof(active_node))) {
-        drm_fd = open(active_node, O_RDWR | O_CLOEXEC);
+    /* Priority 0: If compositor dev_t already known (feedback arrived before init),
+     * match it directly. This path is not yet reachable at init time because Wayland
+     * roundtrip hasn't happened; the fallback paths below handle first-time init. */
+    if (ctx->has_compositor_dev) {
+        drm_fd = open_drm_node_by_devt(ctx->compositor_dev);
         if (drm_fd >= 0) {
-            WAYWAL_LOG_INFO("Discovered active display DRM render node: %s", active_node);
+            WAYWAL_LOG_INFO("Priority 0: Opened compositor-matched DRM render node");
         }
     }
 
+    /* Priority 1: Active connector sysfs scan */
+    if (drm_fd < 0 && find_active_drm_render_node(active_node, sizeof(active_node))) {
+        drm_fd = open(active_node, O_RDWR | O_CLOEXEC);
+        if (drm_fd >= 0) {
+            WAYWAL_LOG_INFO("Priority 1: Discovered active display DRM render node: %s", active_node);
+        }
+    }
+
+    /* Priority 2: Fallback to renderD128 (AMD compositor default) */
     if (drm_fd < 0) {
         drm_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
         if (drm_fd >= 0) {
-            WAYWAL_LOG_INFO("Discovered fallback primary DRM render node: /dev/dri/renderD128");
+            WAYWAL_LOG_INFO("Priority 2: Fallback DRM render node: /dev/dri/renderD128");
         }
     }
 
+    /* Priority 3: drmGetDevices2 enumeration */
     if (drm_fd < 0) {
         drmDevicePtr devices[8];
         int num_devices = drmGetDevices2(0, devices, 8);
@@ -125,7 +167,7 @@ bool dmabuf_context_init(dmabuf_context_t *ctx)
                 if (devices[i]->available_nodes & (1 << DRM_NODE_RENDER)) {
                     drm_fd = open(devices[i]->nodes[DRM_NODE_RENDER], O_RDWR | O_CLOEXEC);
                     if (drm_fd >= 0) {
-                        WAYWAL_LOG_INFO("Discovered DRM render node: %s",
+                        WAYWAL_LOG_INFO("Priority 3: DRM render node: %s",
                                         devices[i]->nodes[DRM_NODE_RENDER]);
                         break;
                     }

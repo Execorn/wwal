@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 // clang-format off
 #include <GLES3/gl31.h>
@@ -279,6 +280,12 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
         return true; /* Already imported and cached */
     }
 
+    if (ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
+        if (eglGetCurrentContext() != ctx->context) {
+            eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+        }
+    }
+
     static const EGLint plane_fd_keys[4] = {EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE1_FD_EXT,
                                             EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE3_FD_EXT};
     static const EGLint plane_offset_keys[4] = {
@@ -371,6 +378,9 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
     return true;
 }
 
+static void select_transition_program(gpu_compute_ctx_t *ctx, waywal_transition_type_t type,
+                                      GLuint *out_prog, const gpu_program_uniforms_t **out_u);
+
 bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target_bo,
                                      dmabuf_bo_t *old_bo, dmabuf_bo_t *new_bo,
                                      const waywal_transition_params_t *params)
@@ -384,9 +394,57 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         return false;
     }
 
+    GLuint prog = 0;
+    const gpu_program_uniforms_t *u = NULL;
+    select_transition_program(ctx, params->type, &prog, &u);
+
+    glUseProgram(prog);
+
+    /* Bind target storage image to binding point 0 */
+    glBindImageTexture(0, target_bo->gl_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+
+    /* Bind source textures */
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, old_bo->gl_tex);
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, new_bo->gl_tex);
+
+    /* Set uniform parameters from cached locations (PERF-01) */
+    if (u->loc_prog >= 0)
+        glUniform1f(u->loc_prog, params->progress);
+    if (u->loc_res >= 0)
+        glUniform2i(u->loc_res, (GLint)target_bo->width, (GLint)target_bo->height);
+    if (u->loc_angle >= 0)
+        glUniform1f(u->loc_angle, params->angle_rad);
+    if (u->loc_wave_freq >= 0) {
+        glUniform1f(u->loc_wave_freq, params->wave_freq > 0.0f ? params->wave_freq : 20.0f);
+    }
+    if (u->loc_wave_amp >= 0) {
+        glUniform1f(u->loc_wave_amp, params->wave_amp > 0.0f ? params->wave_amp : 0.05f);
+    }
+    if (u->loc_center >= 0) {
+        glUniform2f(u->loc_center, params->center_x, params->center_y);
+    }
+
+    /* Dispatch compute shader (16x16 local workgroups) */
+    GLuint groups_x = (target_bo->width + 15) / 16;
+    GLuint groups_y = (target_bo->height + 15) / 16;
+    glDispatchCompute(groups_x, groups_y, 1);
+
+    /* Targeted memory barrier ensuring GPU storage writes are visible */
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    glFlush();
+
+    return true;
+}
+
+static void select_transition_program(gpu_compute_ctx_t *ctx, waywal_transition_type_t type,
+                                      GLuint *out_prog, const gpu_program_uniforms_t **out_u)
+{
     GLuint prog = ctx->prog_fade;
     const gpu_program_uniforms_t *u = &ctx->unif_fade;
-    switch (params->type) {
+    switch (type) {
     case WAYWAL_TRANSITION_WIPE:
         prog = ctx->prog_wipe;
         u = &ctx->unif_wipe;
@@ -471,24 +529,105 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         u = &ctx->unif_fade;
         break;
     }
+    *out_prog = prog;
+    *out_u = u;
+}
+
+bool gpu_compute_prepare_shm(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t *tex_new,
+                             uint32_t *tex_target, uint32_t *fbo, uint32_t *cur_w, uint32_t *cur_h,
+                             uint32_t width, uint32_t height, const uint32_t *old_pixels,
+                             const uint32_t *new_pixels)
+{
+    if (!ctx || !tex_old || !tex_new || !tex_target || !fbo || !cur_w || !cur_h ||
+        width == 0 || height == 0 || !old_pixels || !new_pixels) {
+        return false;
+    }
+
+    if (ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
+        if (eglGetCurrentContext() != ctx->context) {
+            eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+        }
+    }
+
+    if (*cur_w != width || *cur_h != height || *tex_old == 0 || *tex_new == 0 ||
+        *tex_target == 0 || *fbo == 0) {
+        gpu_compute_release_shm_res(ctx, tex_old, tex_new, tex_target, fbo);
+
+        GLuint texs[3] = {0, 0, 0};
+        glGenTextures(3, texs);
+        *tex_old = texs[0];
+        *tex_new = texs[1];
+        *tex_target = texs[2];
+
+        for (int i = 0; i < 3; ++i) {
+            glBindTexture(GL_TEXTURE_2D, texs[i]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)width, (GLsizei)height);
+        }
+
+        GLuint my_fbo = 0;
+        glGenFramebuffers(1, &my_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, my_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *tex_target, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        *fbo = my_fbo;
+
+        *cur_w = width;
+        *cur_h = height;
+    }
+
+    /* Upload source textures (format GL_RGBA with GL_UNSIGNED_BYTE on little-endian stores ARGB) */
+    glBindTexture(GL_TEXTURE_2D, *tex_old);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA,
+                    GL_UNSIGNED_BYTE, old_pixels);
+
+    glBindTexture(GL_TEXTURE_2D, *tex_new);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA,
+                    GL_UNSIGNED_BYTE, new_pixels);
+
+    return true;
+}
+
+bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_old,
+                                         uint32_t tex_new, uint32_t tex_target,
+                                         uint32_t fbo, uint32_t width, uint32_t height,
+                                         const waywal_transition_params_t *params,
+                                         uint32_t *dst_pixels)
+{
+    if (!ctx || tex_old == 0 || tex_new == 0 || tex_target == 0 || fbo == 0 ||
+        width == 0 || height == 0 || !params || !dst_pixels) {
+        return false;
+    }
+
+    if (ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
+        if (eglGetCurrentContext() != ctx->context) {
+            eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+        }
+    }
+
+    GLuint prog = 0;
+    const gpu_program_uniforms_t *u = NULL;
+    select_transition_program(ctx, params->type, &prog, &u);
 
     glUseProgram(prog);
 
-    /* Bind target storage image to binding point 0 */
-    glBindImageTexture(0, target_bo->gl_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    /* Bind target storage image */
+    glBindImageTexture(0, tex_target, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
 
-    /* Bind source textures */
+    /* Bind sources */
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, old_bo->gl_tex);
+    glBindTexture(GL_TEXTURE_2D, tex_old);
 
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, new_bo->gl_tex);
+    glBindTexture(GL_TEXTURE_2D, tex_new);
 
-    /* Set uniform parameters from cached locations (PERF-01) */
     if (u->loc_prog >= 0)
         glUniform1f(u->loc_prog, params->progress);
     if (u->loc_res >= 0)
-        glUniform2i(u->loc_res, (GLint)target_bo->width, (GLint)target_bo->height);
+        glUniform2i(u->loc_res, (GLint)width, (GLint)height);
     if (u->loc_angle >= 0)
         glUniform1f(u->loc_angle, params->angle_rad);
     if (u->loc_wave_freq >= 0) {
@@ -501,16 +640,59 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         glUniform2f(u->loc_center, params->center_x, params->center_y);
     }
 
-    /* Dispatch compute shader (16x16 local workgroups) */
-    GLuint groups_x = (target_bo->width + 15) / 16;
-    GLuint groups_y = (target_bo->height + 15) / 16;
+    struct timespec t_a, t_b, t_c;
+    clock_gettime(CLOCK_MONOTONIC, &t_a);
+
+    GLuint groups_x = (width + 15) / 16;
+    GLuint groups_y = (height + 15) / 16;
     glDispatchCompute(groups_x, groups_y, 1);
 
-    /* Targeted memory barrier ensuring GPU storage writes are visible */
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
-    glFlush();
+    glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_b);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE, dst_pixels);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_c);
+
+    double comp_ms = (t_b.tv_sec - t_a.tv_sec) * 1000.0 + (t_b.tv_nsec - t_a.tv_nsec) / 1000000.0;
+    double read_ms = (t_c.tv_sec - t_b.tv_sec) * 1000.0 + (t_c.tv_nsec - t_b.tv_nsec) / 1000000.0;
+
+    static int s_log_count = 0;
+    if (++s_log_count <= 6 || s_log_count % 30 == 0) {
+        WAYWAL_LOG_INFO("GPU SHM dispatch (%ux%u): compute=%.2fms readpixels=%.2fms",
+                        width, height, comp_ms, read_ms);
+    }
 
     return true;
+}
+
+void gpu_compute_release_shm_res(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t *tex_new,
+                                 uint32_t *tex_target, uint32_t *fbo)
+{
+    if (ctx && ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
+        if (eglGetCurrentContext() != ctx->context) {
+            eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+        }
+    }
+    if (tex_old && *tex_old != 0) {
+        glDeleteTextures(1, tex_old);
+        *tex_old = 0;
+    }
+    if (tex_new && *tex_new != 0) {
+        glDeleteTextures(1, tex_new);
+        *tex_new = 0;
+    }
+    if (tex_target && *tex_target != 0) {
+        glDeleteTextures(1, tex_target);
+        *tex_target = 0;
+    }
+    if (fbo && *fbo != 0) {
+        glDeleteFramebuffers(1, fbo);
+        *fbo = 0;
+    }
 }
 
 void gpu_compute_destroy(gpu_compute_ctx_t *ctx)

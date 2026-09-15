@@ -209,10 +209,10 @@ void video_engine_dispatch_frame(video_engine_t *ve)
         return;
     }
 
-    /* Drain timerfd notifications */
     uint64_t expirations = 0;
     ssize_t s = read(ve->timer_fd, &expirations, sizeof(expirations));
-    (void)s;
+    if (s <= 0 || expirations == 0)
+        return;
 
     demux_packet_t pkt;
     if (!ve->demuxer->read_packet(ve->demuxer, &pkt)) {
@@ -340,6 +340,8 @@ void video_engine_pause(video_engine_t *ve)
 
     struct itimerspec its = {0};
     timerfd_settime(ve->timer_fd, 0, &its, NULL);
+    uint64_t dummy;
+    while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0);
     ve->state = WAYWAL_VIDEO_STATE_PAUSED;
     WAYWAL_LOG_INFO("Hardware video playback paused (0%% VPU usage)");
 }
@@ -356,6 +358,8 @@ void video_engine_resume(video_engine_t *ve)
     struct itimerspec its = {
         .it_interval = {0, 0}, .it_value = {.tv_sec = 0, .tv_nsec = 1000000L} /* 1ms */
     };
+    uint64_t dummy;
+    while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0);
     timerfd_settime(ve->timer_fd, 0, &its, NULL);
 }
 
@@ -367,6 +371,8 @@ void video_engine_stop(video_engine_t *ve)
     struct itimerspec its = {0};
     if (ve->timer_fd >= 0) {
         timerfd_settime(ve->timer_fd, 0, &its, NULL);
+        uint64_t dummy;
+        while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0);
     }
 
     ve->state = WAYWAL_VIDEO_STATE_STOPPED;
