@@ -33,8 +33,8 @@ void cli_print_usage(const char *prog)
     printf("  kill                       Gracefully terminate the running wwald daemon\n");
     printf("  help                       Display this help message\n\n");
     printf("Slideshow Options:\n");
-    printf("  --interval <SECONDS>       Seconds between wallpaper changes (default: 300)\n");
-    printf("  --shuffle, --random        Shuffle images into random playback order\n\n");
+    printf("  -d, --interval <SECONDS>   Seconds between wallpaper changes (default: 300)\n");
+    printf("  -s, --shuffle, --random    Shuffle images into random playback order\n\n");
     printf("Image & Transition Options:\n");
     printf("  --transition-type <TYPE>   none, simple, fade, wipe, grow, outer, wave, noise,\n");
     printf("                             crosszoom, slide, glitch, burn, ripple, pixelate,\n");
