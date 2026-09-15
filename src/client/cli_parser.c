@@ -476,12 +476,14 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
 
             while (optind < argc) {
                 const char *arg = argv[optind];
-                if (strcmp(arg, "--interval") == 0 && optind + 1 < argc) {
+                if ((strcmp(arg, "--interval") == 0 || strcmp(arg, "-d") == 0) &&
+                    optind + 1 < argc) {
                     optind++;
                     int sec = atoi(argv[optind]);
                     if (sec > 0)
                         opts->slideshow_interval_s = (uint32_t)sec;
-                } else if (strcmp(arg, "--shuffle") == 0 || strcmp(arg, "--random") == 0) {
+                } else if (strcmp(arg, "--shuffle") == 0 || strcmp(arg, "--random") == 0 ||
+                           strcmp(arg, "-s") == 0) {
                     opts->slideshow_random = true;
                 } else if (!parse_transition_flag(&optind, argc, argv, opts)) {
                     fprintf(stderr, "Error: Unknown option '%s'\n", arg);

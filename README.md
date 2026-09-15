@@ -150,7 +150,7 @@ Transition Options:
 Multi-Monitor & Synchronization Options:
   -o, --output <NAME>         Target specific monitor(s) (repeatable or comma-separated)
   --sync-mode <MODE>          simultaneous or staggered (default: simultaneous)
-  --stagger-delay <MS>        Delay in milliseconds between staggered outputs (default: 200)
+  --stagger-delay <MS>        Delay in milliseconds between staggered outputs (default: 150)
 
 Global Options:
   -n, --namespace <NAME>      Socket namespace (default: "default")
@@ -169,7 +169,7 @@ Global Options:
 
 ### 2. Multi-Monitor Output Targeting & Cascading Synchronization
 - **Output Filtering**: Pin wallpapers or slideshows to designated monitors using `-o DP-1` or `-o DP-1,HDMI-A-1`.
-- **Cascading Delays**: Stagger transitions across panoramic setups using `--sync-mode staggered --stagger-delay 200`. The daemon automatically orders monitors geographically by X-coordinate and schedules frame delays on each output node.
+- **Cascading Delays**: Stagger transitions across panoramic setups using `--sync-mode staggered --stagger-delay 150`. The daemon automatically orders monitors geographically by X-coordinate and schedules frame delays on each output node.
 
 ### 3. Cursor-Anchored Transitions & Positional Aliases
 - **Live Cursor Tracking**: Passing `--transition-pos cursor` or `--transition-pos mouse` initiates ripple, grow, burn, and zoom transitions originating precisely from the current pointer location. Uses `wl_pointer` tracking with fallback to Hyprland/Sway IPC query.
