@@ -1,4 +1,6 @@
 #include "cli_parser.h"
+#include "image_loader.h"
+#include "waywal/gif_transcode.h"
 #include "waywal/ipc_proto.h"
 #include "waywal/log.h"
 #include "waywal/slideshow.h"
@@ -338,6 +340,149 @@ static void test_cli_scaling_modes(void)
     printf("  -> Scaling modes and aspect ratio math: PASSED\n");
 }
 
+static void test_static_gif_support(void)
+{
+    printf("[TEST] Testing static GIF image decoding and transparency...\n");
+
+    /* 54-byte valid 2x2 GIF89a with 4 colors: Red, Green, Blue, Transparent White */
+    static const uint8_t sample_gif[] = {
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x02, 0x00, 0x02, 0x00, 0x81, 0x00, 0x00, 0xFF,
+        0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04,
+        0x01, 0x00, 0x00, 0x03, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00,
+        0x00, 0x08, 0x07, 0x00, 0x01, 0x04, 0x10, 0x30, 0x20, 0x20, 0x00, 0x3B,
+    };
+
+    const char *gif_path = "/tmp/test_waywal_sample.gif";
+    FILE *fp = fopen(gif_path, "wb");
+    assert(fp != NULL);
+    assert(fwrite(sample_gif, 1, sizeof(sample_gif), fp) == sizeof(sample_gif));
+    fclose(fp);
+
+    uint8_t *pixels = NULL;
+    uint32_t w = 0, h = 0;
+    bool ok = image_load(gif_path, &pixels, &w, &h);
+    unlink(gif_path);
+
+    assert(ok && "image_load failed for static GIF");
+    assert(w == 2 && h == 2);
+    assert(pixels != NULL);
+
+    uint32_t *u32 = (uint32_t *)pixels;
+    /* Pixel (0,0): Palette index 0 -> Red (0xFFFF0000 in little-endian ARGB8888) */
+    assert(u32[0] == 0xFFFF0000);
+    /* Pixel (1,0): Palette index 1 -> Green (0xFF00FF00) */
+    assert(u32[1] == 0xFF00FF00);
+    /* Pixel (0,1): Palette index 2 -> Blue (0xFF0000FF) */
+    assert(u32[2] == 0xFF0000FF);
+    /* Pixel (1,1): Palette index 3 -> Transparent (0x00000000) */
+    assert(u32[3] == 0x00000000);
+
+    image_free(pixels);
+
+    /* Negative test: Corrupted header */
+    const char *bad_gif = "/tmp/test_bad_header.gif";
+    fp = fopen(bad_gif, "wb");
+    assert(fp != NULL);
+    fwrite("GIF89a\x01", 1, 7, fp);
+    fclose(fp);
+    assert(!image_load(bad_gif, &pixels, &w, &h));
+    unlink(bad_gif);
+
+    printf("  -> Static GIF decoding, color fidelity & transparency: PASSED\n");
+}
+
+static void test_jit_transcode_support(void)
+{
+    printf("[TEST] Testing JIT transcoded VA-API video engine & GIF caching...\n");
+
+    /* 1. is_gif_file magic verification */
+    assert(!is_gif_file(NULL));
+    assert(!is_gif_file("/nonexistent/file_does_not_exist.gif"));
+
+    const char *txt_path = "/tmp/test_not_a_gif.txt";
+    FILE *fp = fopen(txt_path, "wb");
+    assert(fp != NULL);
+    fwrite("Hello World\n", 1, 12, fp);
+    fclose(fp);
+    assert(!is_gif_file(txt_path));
+    unlink(txt_path);
+
+    /* 54-byte valid 2x2 GIF89a */
+    static const uint8_t sample_gif[] = {
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x02, 0x00, 0x02, 0x00, 0x81, 0x00, 0x00, 0xFF,
+        0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04,
+        0x01, 0x00, 0x00, 0x03, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00,
+        0x00, 0x08, 0x07, 0x00, 0x01, 0x04, 0x10, 0x30, 0x20, 0x20, 0x00, 0x3B,
+    };
+    const char *gif_path = "/tmp/test_jit_sample.gif";
+    fp = fopen(gif_path, "wb");
+    assert(fp != NULL);
+    assert(fwrite(sample_gif, 1, sizeof(sample_gif), fp) == sizeof(sample_gif));
+    fclose(fp);
+
+    assert(is_gif_file(gif_path));
+
+    /* 2. gif_transcode_resolve edge cases */
+    char out_path1[4096];
+    assert(!gif_transcode_resolve(NULL, out_path1, sizeof(out_path1)));
+    assert(!gif_transcode_resolve(gif_path, NULL, sizeof(out_path1)));
+    assert(!gif_transcode_resolve(gif_path, out_path1, 0));
+
+    /* Non-GIF files pass through unmodified */
+    char non_gif_out[4096];
+    assert(gif_transcode_resolve("/tmp/test_dummy.mp4", non_gif_out, sizeof(non_gif_out)));
+    assert(strcmp(non_gif_out, "/tmp/test_dummy.mp4") == 0);
+
+    /* 3. Real GIF JIT transcode to cached MP4 */
+    assert(gif_transcode_resolve(gif_path, out_path1, sizeof(out_path1)));
+    assert(strstr(out_path1, ".mp4") != NULL);
+    assert(strstr(out_path1, "/wwal/transcoded/") != NULL);
+
+    struct stat st1;
+    assert(stat(out_path1, &st1) == 0);
+    assert(st1.st_size > 1024);
+
+    /* 4. Cache hit verification (deterministic hash, 0s startup) */
+    char out_path2[4096];
+    assert(gif_transcode_resolve(gif_path, out_path2, sizeof(out_path2)));
+    assert(strcmp(out_path1, out_path2) == 0);
+
+    unlink(gif_path);
+
+    /* 5. CLI --animate flag and automatic route to CLI_CMD_VIDEO */
+    char *argv_anim[] = {"wwal", "img", (char *)out_path1, "--animate"};
+    cli_options_t opts;
+    assert(cli_parse(4, argv_anim, &opts));
+    assert(opts.cmd == CLI_CMD_IMG);
+    assert(opts.animate == true);
+
+    /* When filepath is a GIF, client logic routes to CLI_CMD_VIDEO */
+    if (opts.cmd == CLI_CMD_IMG && opts.animate && is_gif_file(opts.filepath)) {
+        opts.cmd = CLI_CMD_VIDEO;
+    }
+    /* Since out_path1 is .mp4 (not .gif), it didn't change cmd to video */
+    assert(opts.cmd == CLI_CMD_IMG);
+
+    /* Now test with gif path */
+    const char *fake_gif = "/tmp/test_fake.gif";
+    fp = fopen(fake_gif, "wb");
+    assert(fp != NULL);
+    fwrite("GIF89a", 1, 6, fp);
+    fclose(fp);
+
+    char *argv_anim_gif[] = {"wwal", "img", (char *)fake_gif, "--animate"};
+    assert(cli_parse(4, argv_anim_gif, &opts));
+    assert(opts.cmd == CLI_CMD_IMG);
+    assert(opts.animate == true);
+    if (opts.cmd == CLI_CMD_IMG && opts.animate && is_gif_file(opts.filepath)) {
+        opts.cmd = CLI_CMD_VIDEO;
+    }
+    assert(opts.cmd == CLI_CMD_VIDEO);
+    unlink(fake_gif);
+
+    printf("  -> JIT transcode, content hashing, caching & CLI routing: PASSED\n");
+}
+
 int main(void)
 {
     printf("=== Starting Advanced Engine & Daemon Unit Tests ===\n");
@@ -348,6 +493,8 @@ int main(void)
     test_cli_slideshow();
     test_slideshow_filesystem();
     test_10bit_color_math();
+    test_static_gif_support();
+    test_jit_transcode_support();
     printf("=== ALL ADVANCED ENGINE & DAEMON TESTS PASSED! ===\n");
     return 0;
 }

@@ -56,7 +56,7 @@ _wwal_completion() {
             ;;
     esac
 
-    local trans_opts="--transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --transition-shader -o --output --sync-mode --stagger-delay --10bit --scaling-mode --mode"
+    local trans_opts="--transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --transition-shader -o --output --sync-mode --stagger-delay --10bit --scaling-mode --mode --animate"
 
     case "$cmd" in
         img)
@@ -70,7 +70,7 @@ _wwal_completion() {
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=( $(compgen -W "--loop --speed -o --output ${global_opts}" -- "$cur") )
             else
-                _filedir '@(mp4|mkv|webm|avi|mov)'
+                _filedir '@(mp4|mkv|webm|avi|mov|gif)'
             fi
             ;;
         slideshow)

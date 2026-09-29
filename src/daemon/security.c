@@ -64,7 +64,7 @@ bool security_sandbox_apply(const char *runtime_dir)
         int ruleset_fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
         if (ruleset_fd >= 0) {
             /* Allow read-only across standard system mounts required for DRM/Mesa/VA-API drivers */
-            const char *ro_paths[] = {"/", "/usr", "/etc", "/sys", "/proc", "/dev", "/home", NULL};
+            const char *ro_paths[] = {"/usr", "/etc", "/sys", "/proc", "/dev/dri", NULL};
             for (int i = 0; ro_paths[i] != NULL; ++i) {
                 int dir_fd = open(ro_paths[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
                 if (dir_fd >= 0) {

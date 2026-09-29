@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define WAYWAL_VA_SURFACE_POOL_SIZE 4
+#define WAYWAL_VA_SURFACE_POOL_SIZE 20
 
 typedef struct {
     VASurfaceID surface;
@@ -29,6 +29,39 @@ typedef struct {
 } h264_dpb_t;
 
 typedef struct {
+    uint8_t profile_idc;
+    uint8_t level_idc;
+    uint8_t chroma_format_idc;
+    uint8_t log2_max_frame_num_minus4;
+    uint8_t pic_order_cnt_type;
+    uint8_t log2_max_pic_order_cnt_lsb_minus4;
+    uint8_t num_ref_frames;
+    bool frame_mbs_only_flag;
+    bool direct_8x8_inference_flag;
+    uint32_t pic_width_in_mbs_minus1;
+    uint32_t pic_height_in_map_units_minus1;
+    bool valid;
+} parsed_sps_t;
+
+typedef struct {
+    uint8_t entropy_coding_mode_flag;
+    bool bottom_field_pic_order_in_frame_present_flag;
+    uint8_t num_slice_groups_minus1;
+    uint8_t num_ref_idx_l0_default_active_minus1;
+    uint8_t num_ref_idx_l1_default_active_minus1;
+    bool weighted_pred_flag;
+    uint8_t weighted_bipred_idc;
+    int8_t pic_init_qp_minus26;
+    int8_t chroma_qp_index_offset;
+    int8_t second_chroma_qp_index_offset;
+    bool deblocking_filter_control_present_flag;
+    bool constrained_intra_pred_flag;
+    bool redundant_pic_cnt_present_flag;
+    bool transform_8x8_mode_flag;
+    bool valid;
+} parsed_pps_t;
+
+typedef struct {
     VADisplay va_display;
     int drm_fd;
     bool owns_drm_fd;
@@ -42,7 +75,14 @@ typedef struct {
     size_t current_surface_idx;
     uint32_t frame_num;
     h264_dpb_t dpb;
+    parsed_sps_t cached_sps;
+    parsed_pps_t cached_pps;
+    VAConfigID vpp_config;
+    VAContextID vpp_context;
+    VASurfaceID vpp_surfaces[WAYWAL_VA_SURFACE_POOL_SIZE];
+    bool has_vpp;
     bool initialized;
+    const bool *surface_busy_mask; /* External compositor in-use flags (WAYWAL_VA_SURFACE_POOL_SIZE) */
 } vaapi_decoder_t;
 
 /* Exported PRIME 2 DMA-BUF representation */
@@ -62,8 +102,14 @@ typedef struct {
 bool vaapi_decoder_init(vaapi_decoder_t *dec, int drm_render_fd, waywal_codec_t codec,
                         uint32_t width, uint32_t height);
 
+/* Sets codec extradata (e.g. SPS/PPS from MP4 avcC or WebM) */
+bool vaapi_decoder_set_extradata(vaapi_decoder_t *dec, const uint8_t *extradata, size_t size);
+
 /* Destroy VA-API decoder and release all surfaces and context */
 void vaapi_decoder_destroy(vaapi_decoder_t *dec);
+
+/* Reset decoder state (DPB, frame_num) */
+void vaapi_decoder_reset(vaapi_decoder_t *dec);
 
 /* Submits elementary stream packet to hardware ASIC */
 bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt,

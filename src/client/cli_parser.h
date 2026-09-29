@@ -63,6 +63,7 @@ typedef struct {
     /* Video parameters */
     uint64_t video_loop_count; /* 0 = infinite loop */
     float video_speed;         /* default 1.0f */
+    bool animate;              /* route animated GIF to hardware video engine */
 
     /* Slideshow parameters */
     uint32_t slideshow_action;     /* waywal_slideshow_action_t */

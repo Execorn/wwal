@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+void output_node_destroy_surface(output_node_t *node);
+
 static void output_handle_geometry(void *data, struct wl_output *output, int32_t x, int32_t y,
                                    int32_t physical_width, int32_t physical_height,
                                    int32_t subpixel, const char *make, const char *model,
@@ -108,6 +110,8 @@ void output_manager_destroy(output_manager_t *om)
     while (cur) {
         output_state_t *next = cur->next;
 
+        output_node_destroy_surface(cur);
+
         if (cur->use_dmabuf && om->dmabuf_ctx) {
             dmabuf_ring_destroy(om->dmabuf_ctx, &cur->dmabuf_ring);
         }
@@ -172,6 +176,8 @@ void output_manager_remove(output_manager_t *om, uint32_t name)
 
             WAYWAL_LOG_INFO("Hotplug: display unplugged id %u (%s) (remaining: %u)", name,
                             entry->name[0] ? entry->name : "unnamed", om->count);
+
+            output_node_destroy_surface(entry);
 
             if (entry->use_dmabuf && om->dmabuf_ctx) {
                 dmabuf_ring_destroy(om->dmabuf_ctx, &entry->dmabuf_ring);

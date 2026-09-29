@@ -134,7 +134,7 @@ void output_node_destroy_surface(output_node_t *node)
     if (!node)
         return;
 
-    for (uint32_t i = 0; i < 4; ++i) {
+    for (uint32_t i = 0; i < WAYWAL_VA_SURFACE_POOL_SIZE; ++i) {
         if (node->video_wl_buffers[i]) {
             wl_buffer_destroy(node->video_wl_buffers[i]);
             node->video_wl_buffers[i] = NULL;
@@ -776,10 +776,18 @@ static bool is_target_output(const output_node_t *node, const waywal_img_metadat
         return true;
 
     const char *ptr = (const char *)meta + sizeof(waywal_img_metadata_t);
+    uint32_t remaining = meta->extra_data_len;
+
     for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
+        if (remaining == 0)
+            break;
+        size_t len = strnlen(ptr, remaining);
+        if (len == remaining)
+            break;
         if (strcmp(node->name, ptr) == 0)
             return true;
-        ptr += strlen(ptr) + 1;
+        ptr += len + 1;
+        remaining -= (uint32_t)(len + 1);
     }
     return false;
 }

@@ -58,7 +58,8 @@ void cli_print_usage(const char *prog)
     printf("  --10bit                    Enable 10-bit wide-gamut scanout if supported by "
            "compositor\n");
     printf("  --scaling-mode, --mode <M> Scaling mode: fill, fit, stretch, center, tile "
-           "(default: fill)\n\n");
+           "(default: fill)\n");
+    printf("  --animate                  Animate GIF wallpaper using hardware video engine\n\n");
     printf("Video Options:\n");
     printf("  --loop <COUNT>             Loop count (0 = infinite) (default: 0)\n");
     printf("  --speed <FLOAT>            Playback speed multiplier (default: 1.0)\n\n");
@@ -334,6 +335,10 @@ static bool parse_transition_flag(int *optind_ptr, int argc, char *argv[], cli_o
             fprintf(stderr, "Warning: Unknown scaling mode '%s', defaulting to fill\n", m);
             opts->scaling_mode = WAYWAL_SCALING_FILL;
         }
+        return true;
+    }
+    if (strcmp(arg, "--animate") == 0) {
+        opts->animate = true;
         return true;
     }
 

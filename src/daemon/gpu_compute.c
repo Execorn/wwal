@@ -74,6 +74,7 @@ struct gpu_compute_ctx {
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
     PFNEGLCREATESYNCKHRPROC eglCreateSyncKHR;
     PFNEGLDESTROYSYNCKHRPROC eglDestroySyncKHR;
+    PFNEGLCLIENTWAITSYNCKHRPROC eglClientWaitSyncKHR;
 };
 
 static void query_program_uniforms(GLuint prog, gpu_program_uniforms_t *u)
@@ -267,6 +268,7 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
     /* Query fence sync extension entry points (ARCH-03) */
     ctx->eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
     ctx->eglDestroySyncKHR = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+    ctx->eglClientWaitSyncKHR = (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
 
     WAYWAL_LOG_INFO("GPU compute transition engine initialized (GLES 3.1 compute on GBM)");
     return ctx;
@@ -434,7 +436,19 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
 
     /* Targeted memory barrier ensuring GPU storage writes are visible */
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
-    glFlush();
+    
+    if (ctx->eglCreateSyncKHR && ctx->eglClientWaitSyncKHR && ctx->eglDestroySyncKHR) {
+        EGLSyncKHR sync = ctx->eglCreateSyncKHR(ctx->display, EGL_SYNC_FENCE_KHR, NULL);
+        glFlush();
+        if (sync != EGL_NO_SYNC_KHR) {
+            ctx->eglClientWaitSyncKHR(ctx->display, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER_KHR);
+            ctx->eglDestroySyncKHR(ctx->display, sync);
+        } else {
+            glFinish();
+        }
+    } else {
+        glFinish();
+    }
 
     return true;
 }

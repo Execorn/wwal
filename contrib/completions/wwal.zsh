@@ -37,6 +37,7 @@ _wwal() {
         '--stagger-delay[Delay between monitors in ms]:delay:'
         '--10bit[Force 10-bit wide gamut scanout]'
         '(--scaling-mode --mode)'{--scaling-mode,--mode}'[Aspect ratio scaling mode]:mode:(fill fit stretch center tile crop cover contain)'
+        '--animate[Play animated GIF via hardware video engine]'
     )
 
     _arguments -C \
@@ -54,7 +55,7 @@ _wwal() {
                     _arguments \
                         $global_opts \
                         $trans_opts \
-                        '1:image file:_files -g "*.([pP][nN][gG]|[jJ][pP][gG]|[jJ][pP][eE][gG]|[wW][eE][bB][pP]|[bB][mM][pP])"'
+                        '1:image file:_files -g "*.([pP][nN][gG]|[jJ][pP][gG]|[jJ][pP][eE][gG]|[wW][eE][bB][pP]|[bB][mM][pP]|[gG][iI][fF])"'
                     ;;
                 video)
                     _arguments \
@@ -62,7 +63,7 @@ _wwal() {
                         '(-o --output)'{-o,--output}'[Target monitor name]:output:' \
                         '--loop[Loop count (0 = infinite)]:count:' \
                         '--speed[Playback speed multiplier]:speed:' \
-                        '1:video file:_files -g "*.([mM][pP]4|[wW][eE][bB][mM]|[mM][kK][vV])"'
+                        '1:video file:_files -g "*.([mM][pP]4|[wW][eE][bB][mM]|[mM][kK][vV]|[gG][iI][fF])"'
                     ;;
                 slideshow)
                     local -a slideshow_cmds
