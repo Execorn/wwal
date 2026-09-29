@@ -191,8 +191,8 @@ static void parse_stbl(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
                         pt->width = read_u16_be(box_data + entry_off + 32);
                         pt->height = read_u16_be(box_data + entry_off + 34);
 
-                        /* Search for avcC / hvcC sub-boxes */
-                        size_t sub_off = entry_off + 36;
+                        /* Search for avcC / hvcC sub-boxes (VisualSampleEntry fixed header is 86 bytes) */
+                        size_t sub_off = entry_off + (e_size >= 86 ? 86 : 36);
                         while (sub_off + 8 <= entry_off + e_size) {
                             uint32_t sub_size = read_u32_be(box_data + sub_off);
                             uint32_t sub_type = read_u32_be(box_data + sub_off + 4);
@@ -200,7 +200,9 @@ static void parse_stbl(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
                                 break;
 
                             if (sub_type == FOURCC('a', 'v', 'c', 'C') ||
-                                sub_type == FOURCC('h', 'v', 'c', 'C')) {
+                                sub_type == FOURCC('h', 'v', 'c', 'C') ||
+                                sub_type == FOURCC('v', 'p', 'c', 'C') ||
+                                sub_type == FOURCC('a', 'v', '1', 'C')) {
                                 pt->extradata = box_data + sub_off + 8;
                                 pt->extradata_size = sub_size - 8;
                                 break;
@@ -837,10 +839,18 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size)
 
     if (pt.co64_data && pt.co64_size >= 8) {
         chunk_count = read_u32_be(pt.co64_data + 4);
+        if ((uint64_t)chunk_count * 8 > pt.co64_size - 8) {
+            WAYWAL_LOG_ERR("co64 bounds check failed");
+            return NULL;
+        }
         chunk_offsets_ptr = pt.co64_data + 8;
         is_64bit_co = true;
     } else if (pt.stco_data && pt.stco_size >= 8) {
         chunk_count = read_u32_be(pt.stco_data + 4);
+        if ((uint64_t)chunk_count * 4 > pt.stco_size - 8) {
+            WAYWAL_LOG_ERR("stco bounds check failed");
+            return NULL;
+        }
         chunk_offsets_ptr = pt.stco_data + 8;
     }
     if (chunk_count == 0)
@@ -850,6 +860,10 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size)
     if (pt.stsc_size < 8)
         return NULL;
     uint32_t stsc_entry_count = read_u32_be(pt.stsc_data + 4);
+    if ((uint64_t)stsc_entry_count * 12 > pt.stsc_size - 8) {
+        WAYWAL_LOG_ERR("stsc bounds check failed");
+        return NULL;
+    }
     const uint8_t *stsc_entries = pt.stsc_data + 8;
 
     /* Build sample table */
@@ -906,6 +920,11 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size)
     uint32_t stts_sample_idx = 0;
     if (pt.stts_data && pt.stts_size >= 8) {
         uint32_t stts_count = read_u32_be(pt.stts_data + 4);
+        if ((uint64_t)stts_count * 8 > pt.stts_size - 8) {
+            WAYWAL_LOG_ERR("stts bounds check failed");
+            free(samples);
+            return NULL;
+        }
         const uint8_t *stts_entries = pt.stts_data + 8;
         for (uint32_t i = 0; i < stts_count && stts_sample_idx < sample_count; ++i) {
             uint32_t count = read_u32_be(stts_entries + i * 8);
@@ -924,6 +943,11 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size)
     /* Mark keyframes via stss */
     if (pt.stss_data && pt.stss_size >= 8) {
         uint32_t stss_count = read_u32_be(pt.stss_data + 4);
+        if ((uint64_t)stss_count * 4 > pt.stss_size - 8) {
+            WAYWAL_LOG_ERR("stss bounds check failed");
+            free(samples);
+            return NULL;
+        }
         const uint8_t *stss_entries = pt.stss_data + 8;
         for (uint32_t i = 0; i < stss_count; ++i) {
             uint32_t s_idx = read_u32_be(stss_entries + i * 4);

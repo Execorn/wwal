@@ -42,8 +42,12 @@ static struct wl_buffer *ensure_output_video_buffer(video_engine_t *ve, output_n
     if (!dmabuf_proto)
         return NULL;
 
+    VASurfaceID export_surf = (ve->decoder.has_vpp && surf_idx < WAYWAL_VA_SURFACE_POOL_SIZE)
+                                  ? ve->decoder.vpp_surfaces[surf_idx]
+                                  : surface;
     vaapi_prime_frame_t prime_frame;
-    if (!vaapi_decoder_export_prime(&ve->decoder, surface, &prime_frame)) {
+    if (!vaapi_decoder_export_prime(&ve->decoder, export_surf, &prime_frame)) {
+        WAYWAL_LOG_ERR("vaapi_decoder_export_prime failed for surface %u", export_surf);
         return NULL;
     }
 
@@ -66,10 +70,15 @@ static struct wl_buffer *ensure_output_video_buffer(video_engine_t *ve, output_n
     vaapi_prime_frame_close(&prime_frame);
 
     if (wl_buf) {
+        WAYWAL_LOG_INFO("Created video wl_buffer %p for surface %u (idx %u, %ux%u) on output %s",
+                        (void *)wl_buf, export_surf, surf_idx, prime_frame.width,
+                        prime_frame.height, out->name);
         wl_buffer_add_listener(wl_buf, &g_video_buffer_listener,
                                &out->video_buffer_in_use[surf_idx]);
         out->video_wl_buffers[surf_idx] = wl_buf;
         out->video_buffer_in_use[surf_idx] = false;
+    } else {
+        WAYWAL_LOG_ERR("create_immed returned NULL for video surface %u on output %s", surface, out->name);
     }
     return wl_buf;
 }
@@ -134,6 +143,10 @@ static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
         return false;
     }
 
+    if (ve->demuxer->extradata && ve->demuxer->extradata_size > 0) {
+        vaapi_decoder_set_extradata(&ve->decoder, ve->demuxer->extradata, ve->demuxer->extradata_size);
+    }
+
     ve->target_output = out;
     ve->state = WAYWAL_VIDEO_STATE_PLAYING;
     ve->current_loop = 0;
@@ -181,6 +194,7 @@ bool video_engine_load_mem(video_engine_t *ve, int memfd, size_t size, output_no
     void *mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, memfd, 0);
     if (mapped == MAP_FAILED) {
         WAYWAL_LOG_ERR("mmap failed for video memfd: %s", strerror(errno));
+        close(memfd);
         return false;
     }
 
@@ -188,6 +202,7 @@ bool video_engine_load_mem(video_engine_t *ve, int memfd, size_t size, output_no
     if (!ve->demuxer) {
         WAYWAL_LOG_ERR("Failed to demux video from memory buffer");
         munmap(mapped, size);
+        close(memfd);
         return false;
     }
 
@@ -198,6 +213,7 @@ bool video_engine_load_mem(video_engine_t *ve, int memfd, size_t size, output_no
     demuxer_common_state_t *state = (demuxer_common_state_t *)ve->demuxer->internal_state;
     if (state) {
         state->owns_mmap = true;
+        state->file_fd = memfd;
     }
 
     return video_engine_start_playback(ve, out);
@@ -226,6 +242,7 @@ void video_engine_dispatch_frame(video_engine_t *ve)
 
         /* Seamless looping: rewind demuxer and read Frame 0 */
         ve->demuxer->seek_us(ve->demuxer, 0);
+        vaapi_decoder_reset(&ve->decoder);
         if (!ve->demuxer->read_packet(ve->demuxer, &pkt)) {
             WAYWAL_LOG_WARN("Failed to seek to start of stream on video loop");
             video_engine_stop(ve);
@@ -235,16 +252,26 @@ void video_engine_dispatch_frame(video_engine_t *ve)
 
     ve->last_pts_us = pkt.pts_us;
 
-    /* Submit packet to hardware VPU decoder */
+    /* Inform decoder which surfaces the compositor is currently scanning out */
+    output_node_t *primary_out = ve->target_output ? ve->target_output : ve->daemon_state->outputs;
+    ve->decoder.surface_busy_mask = primary_out ? primary_out->video_buffer_in_use : NULL;
+
     VASurfaceID decoded_surface = VA_INVALID_SURFACE;
     if (vaapi_decoder_decode_packet(&ve->decoder, &pkt, &decoded_surface)) {
         /* Determine pool surface index */
         uint32_t surf_idx = 0;
         for (uint32_t i = 0; i < WAYWAL_VA_SURFACE_POOL_SIZE; ++i) {
-            if (ve->decoder.surfaces[i] == decoded_surface) {
+            if (ve->decoder.surfaces[i] == decoded_surface ||
+                (ve->decoder.has_vpp && ve->decoder.vpp_surfaces[i] == decoded_surface)) {
                 surf_idx = i;
                 break;
             }
+        }
+
+        static uint64_t s_disp_count = 0;
+        if (++s_disp_count % 18 == 1) {
+            WAYWAL_LOG_INFO("video_engine_dispatch_frame #%lu: surf=%u, idx=%u",
+                            (unsigned long)s_disp_count, decoded_surface, surf_idx);
         }
 
         /* Attach and commit persistent wl_buffer to target output(s) (BUG-07, ARCH-04) */

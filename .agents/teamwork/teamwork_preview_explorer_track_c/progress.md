@@ -1,0 +1,24 @@
+# Progress — Track C (Linux Security, Sandboxing & IPC Auditor)
+
+- **Status**: Audit completed. Reports and handoff generated.
+- **Last visited**: 2026-09-29T20:28:30Z
+- **Tasks**:
+  - [x] Review DISPATCH.md, ORIGINAL_REQUEST.md, walkthrough.md
+  - [x] Initialize BRIEFING.md and progress.md
+  - [x] Read 100% of lines (no sampling):
+    - [x] `include/waywal/ipc_proto.h` (129 lines)
+    - [x] `src/common/ipc_proto.c` (274 lines)
+    - [x] `src/daemon/security.c` (294 lines)
+    - [x] `src/client/gif_transcode.c` (259 lines)
+    - [x] `src/client/image_loader.c` (602 lines)
+    - [x] `src/client/cli_parser.c` (544 lines)
+    - [x] `src/client/main.c` (532 lines)
+    - [x] `src/common/log.c` (101 lines), `arena.c` (97 lines), `bezier.c` (82 lines), `path.c` (103 lines), `os_compat.c` (44 lines)
+  - [x] Check IPC handling in daemon side (`src/daemon/main.c`, `src/daemon/layer_shell.c`)
+  - [x] Analyze R1 (FD leaks, pipes, sockets, memory leaks in image loading and IPC serialization)
+  - [x] Analyze R3 (FNV-1a hash key derivation, cache cleanup, TOCTOU races in temp file creation and rename)
+  - [x] Analyze R5 (Landlock LSM ABI/paths, Seccomp-BPF filters & socket domain, IPC framing/bounds/RCE/crash-DoS)
+  - [x] Integrate arXiv academic literature search (arXiv:2509.18548, arXiv:2605.26298, arXiv:2606.15137)
+  - [x] Write comprehensive report with compilable drop-in C code fix snippets for ALL Critical and High severity findings (`audit_report_track_c.md`)
+  - [x] Write 5-component handoff report (`handoff.md`)
+  - [ ] Send completion message to orchestrator

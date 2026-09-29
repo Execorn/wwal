@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 void presentation_pll_init(waywal_pll_t *pll, uint32_t default_refresh_hz)
 {
@@ -64,11 +65,17 @@ void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t ref
     }
 
     /* Innovation (prediction error) */
-    int64_t error_ns = hw_time_ns - pll->phase_est_ns;
+    int64_t raw_diff = hw_time_ns - pll->phase_est_ns;
+    int64_t k;
+    if (raw_diff >= 0) {
+        k = (raw_diff + pll->period_est_ns / 2) / pll->period_est_ns;
+    } else {
+        k = (raw_diff - pll->period_est_ns / 2) / pll->period_est_ns;
+    }
+    int64_t error_ns = raw_diff - k * pll->period_est_ns;
     pll->jitter_ns = llabs(error_ns);
 
-    /* Update phase with proportional gain alpha */
-    pll->phase_est_ns += (int64_t)((float)error_ns * pll->alpha);
+    int64_t alpha_correction = (int64_t)((float)error_ns * pll->alpha);
 
     /* Update period with integral/frequency gain beta */
     pll->period_est_ns += (int64_t)((float)error_ns * pll->beta);
@@ -79,8 +86,8 @@ void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t ref
     if (pll->period_est_ns > 100000000LL)
         pll->period_est_ns = 100000000LL;
 
-    /* Project next VBlank */
-    pll->phase_est_ns += pll->period_est_ns;
+    /* Update phase anchor */
+    pll->phase_est_ns = hw_time_ns + alpha_correction + pll->period_est_ns;
     pll->last_hardware_time = hw_time_ns;
     pll->frame_seq++;
 
@@ -92,7 +99,17 @@ int64_t presentation_pll_predict_next_vblank(const waywal_pll_t *pll)
 {
     if (!pll)
         return 0;
-    return pll->phase_est_ns;
+    
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+
+    int64_t next_vblank_ns = pll->phase_est_ns;
+    if (next_vblank_ns <= now_ns && pll->period_est_ns > 0) {
+        int64_t cycles = (now_ns - next_vblank_ns) / pll->period_est_ns + 1;
+        next_vblank_ns += cycles * pll->period_est_ns;
+    }
+    return next_vblank_ns;
 }
 
 static void feedback_sync_output(void *data, struct wp_presentation_feedback *feedback,

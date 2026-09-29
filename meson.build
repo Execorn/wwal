@@ -183,6 +183,7 @@ client_sources = files(
   'src/client/main.c',
   'src/client/cli_parser.c',
   'src/client/image_loader.c',
+  'src/client/gif_transcode.c',
 )
 
 client_deps = [common_dep, threads_dep, m_dep]
@@ -349,6 +350,7 @@ test_advanced_exe = executable('test_advanced',
   'tests/test_advanced.c',
   'src/client/cli_parser.c',
   'src/client/image_loader.c',
+  'src/client/gif_transcode.c',
   'src/daemon/slideshow.c',
   include_directories: inc_dir,
   dependencies: advanced_test_deps

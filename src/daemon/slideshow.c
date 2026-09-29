@@ -23,7 +23,7 @@ static bool has_image_extension(const char *name)
         return false;
     return (strcasecmp(dot, ".png") == 0 || strcasecmp(dot, ".jpg") == 0 ||
             strcasecmp(dot, ".jpeg") == 0 || strcasecmp(dot, ".webp") == 0 ||
-            strcasecmp(dot, ".bmp") == 0);
+            strcasecmp(dot, ".bmp") == 0 || strcasecmp(dot, ".gif") == 0);
 }
 
 static void add_file_to_list(slideshow_engine_t *ss, const char *filepath)
@@ -106,7 +106,8 @@ static void arm_timer(slideshow_engine_t *ss)
         return;
 
     uint64_t dummy;
-    while (read(ss->timer_fd, &dummy, sizeof(dummy)) > 0);
+    while (read(ss->timer_fd, &dummy, sizeof(dummy)) > 0)
+        ;
 
     struct itimerspec its = {
         .it_interval = {.tv_sec = (time_t)ss->interval_s, .tv_nsec = 0},
@@ -123,7 +124,8 @@ static void disarm_timer(slideshow_engine_t *ss)
     struct itimerspec its = {0};
     timerfd_settime(ss->timer_fd, 0, &its, NULL);
     uint64_t dummy;
-    while (read(ss->timer_fd, &dummy, sizeof(dummy)) > 0);
+    while (read(ss->timer_fd, &dummy, sizeof(dummy)) > 0)
+        ;
 }
 
 static void display_current_image(slideshow_engine_t *ss)
@@ -228,6 +230,7 @@ bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *p
     scan_path_recursive(ss, payload->path);
     if (ss->num_files == 0) {
         WAYWAL_LOG_ERR("Slideshow: No supported image files found in '%s'", payload->path);
+        slideshow_stop(ss);
         return false;
     }
 
@@ -329,7 +332,7 @@ void slideshow_prev(slideshow_engine_t *ss)
 
 void slideshow_dispatch_tick(slideshow_engine_t *ss)
 {
-    if (!ss || !ss->active || ss->paused)
+    if (!ss || !ss->active || ss->paused || ss->num_files == 0)
         return;
 
     uint64_t expirations = 0;

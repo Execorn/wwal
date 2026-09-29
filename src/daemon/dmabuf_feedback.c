@@ -28,15 +28,6 @@ static void feedback_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedb
 {
     (void)data;
     (void)feedback;
-    if (g_fb_state.table && g_fb_state.table != MAP_FAILED) {
-        munmap(g_fb_state.table, g_fb_state.num_entries * sizeof(dmabuf_format_table_entry_t));
-        g_fb_state.table = NULL;
-    }
-    if (g_fb_state.table_fd >= 0) {
-        close(g_fb_state.table_fd);
-        g_fb_state.table_fd = -1;
-    }
-    g_fb_state.num_entries = 0;
 }
 
 static void feedback_format_table(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback,
@@ -181,4 +172,14 @@ void dmabuf_feedback_destroy(dmabuf_context_t *ctx)
         return;
     zwp_linux_dmabuf_feedback_v1_destroy(ctx->default_feedback);
     ctx->default_feedback = NULL;
+
+    if (g_fb_state.table && g_fb_state.table != MAP_FAILED) {
+        munmap(g_fb_state.table, g_fb_state.num_entries * sizeof(dmabuf_format_table_entry_t));
+        g_fb_state.table = NULL;
+    }
+    if (g_fb_state.table_fd >= 0) {
+        close(g_fb_state.table_fd);
+        g_fb_state.table_fd = -1;
+    }
+    g_fb_state.num_entries = 0;
 }

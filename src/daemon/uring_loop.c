@@ -137,6 +137,13 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
                             slot ? (int)slot->type : -1, (unsigned)cqe->res);
         }
         if (slot && slot->active) {
+            if (cqe->res < 0) {
+                WAYWAL_LOG_WARN("uring poll error: fd=%d res=%d", slot->fd, cqe->res);
+                if (!(cqe->flags & IORING_CQE_F_MORE)) {
+                    slot->active = false;
+                }
+                continue;
+            }
             handler(slot->type, slot->fd, (uint32_t)cqe->res, slot->user_data);
 
             bool multishot_continues =

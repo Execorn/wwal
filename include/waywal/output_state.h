@@ -4,6 +4,7 @@
 #include "waywal/dmabuf.h"
 #include "waywal/presentation.h"
 #include "waywal/render_engine.h"
+#include "waywal/vaapi_dec.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
 #include <stdbool.h>
@@ -83,8 +84,8 @@ struct output_node {
     bool has_cursor;
 
     /* Persistent Video Buffers Pool */
-    struct wl_buffer *video_wl_buffers[4];
-    bool video_buffer_in_use[4];
+    struct wl_buffer *video_wl_buffers[WAYWAL_VA_SURFACE_POOL_SIZE];
+    bool video_buffer_in_use[WAYWAL_VA_SURFACE_POOL_SIZE];
 
     uint32_t scaling_mode; /* waywal_scaling_mode_t */
     bool has_image;

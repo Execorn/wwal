@@ -79,7 +79,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     }
 
     /* Set socket timeouts to prevent stalled client from hanging daemon event loop */
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -168,16 +168,43 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 if (meta->width > 0 && meta->height > 0 && meta->width <= 16384 &&
                     meta->height <= 16384 && req_hdr.payload_size >= expected_size &&
                     (size_t)st.st_size >= expected_size) {
-                    const uint8_t *pixels = (const uint8_t *)mapped +
-                                            sizeof(waywal_img_metadata_t) + meta->extra_data_len;
-                    WAYWAL_LOG_INFO("Rendering received image: %ux%u", meta->width, meta->height);
-
-                    if (state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED) {
-                        video_engine_stop(&state->video_engine);
+                    
+                    bool valid_strings = true;
+                    if (meta->num_target_outputs > 64) {
+                        valid_strings = false;
+                    } else {
+                        const char *ptr = (const char *)mapped + sizeof(waywal_img_metadata_t);
+                        size_t remaining = meta->extra_data_len;
+                        for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
+                            const char *end = (const char *)memchr(ptr, '\0', remaining);
+                            if (!end) { valid_strings = false; break; }
+                            size_t len = end - ptr + 1;
+                            ptr += len;
+                            remaining -= len;
+                        }
+                        if (valid_strings && meta->custom_shader_len > 0) {
+                            if (meta->custom_shader_len > remaining) {
+                                valid_strings = false;
+                            } else {
+                                const char *end = (const char *)memchr(ptr, '\0', meta->custom_shader_len);
+                                if (!end) { valid_strings = false; }
+                            }
+                        }
                     }
-                    slideshow_stop(&state->slideshow);
-                    ok = daemon_start_image_transition(state, pixels, meta->width, meta->height,
-                                                       meta);
+
+                    if (valid_strings) {
+                        const uint8_t *pixels = (const uint8_t *)mapped +
+                                                sizeof(waywal_img_metadata_t) + meta->extra_data_len;
+                        WAYWAL_LOG_INFO("Rendering received image: %ux%u", meta->width, meta->height);
+                        if (state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED) {
+                            video_engine_stop(&state->video_engine);
+                        }
+                        slideshow_stop(&state->slideshow);
+                        ok = daemon_start_image_transition(state, pixels, meta->width, meta->height,
+                                                           meta);
+                    } else {
+                        WAYWAL_LOG_ERR("IPC image payload string validation failed");
+                    }
                 } else {
                     WAYWAL_LOG_ERR(
                         "IPC image payload bounds check failed: %ux%u, size=%zu, expected=%lu",
@@ -205,6 +232,17 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     case WAYWAL_REQ_SET_VIDEO: {
         slideshow_stop(&state->slideshow);
         bool ok = false;
+        waywal_video_payload_t vpay;
+        bool has_vpay = false;
+        if (req_hdr.payload_size >= sizeof(waywal_video_payload_t)) {
+            if (read_exact(client_fd, &vpay, sizeof(vpay))) {
+                vpay.filepath[sizeof(vpay.filepath) - 1] = '\0';
+                state->video_engine.loop_count = vpay.loop_count;
+                state->video_engine.playback_speed =
+                    vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
+                has_vpay = true;
+            }
+        }
         if (attached_fd >= 0) {
             struct stat st;
             if (fstat(attached_fd, &st) == 0 && st.st_size > 0) {
@@ -213,15 +251,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             }
             close(attached_fd);
             attached_fd = -1;
-        } else if (req_hdr.payload_size >= sizeof(waywal_video_payload_t)) {
-            waywal_video_payload_t vpay;
-            if (read_exact(client_fd, &vpay, sizeof(vpay))) {
-                vpay.filepath[sizeof(vpay.filepath) - 1] = '\0';
-                state->video_engine.loop_count = vpay.loop_count;
-                state->video_engine.playback_speed =
-                    vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
-                ok = video_engine_load_file(&state->video_engine, vpay.filepath, NULL);
-            }
+        } else if (has_vpay) {
+            ok = video_engine_load_file(&state->video_engine, vpay.filepath, NULL);
         }
         resp_hdr.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
@@ -313,7 +344,7 @@ void daemon_handle_ipc_connection(daemon_state_t *state)
         return;
 
     while (true) {
-        int client_fd = accept4(state->server_socket_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+        int client_fd = accept4(state->server_socket_fd, NULL, NULL, SOCK_CLOEXEC);
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -323,12 +354,6 @@ void daemon_handle_ipc_connection(daemon_state_t *state)
             }
             WAYWAL_LOG_ERR("accept4 failed: %s", strerror(errno));
             break;
-        }
-
-        /* Clear O_NONBLOCK on client socket so IPC read/write can respect socket timeouts */
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        if (flags >= 0) {
-            fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);
         }
 
         daemon_process_ipc_client(state, client_fd);

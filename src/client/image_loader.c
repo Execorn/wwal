@@ -22,8 +22,13 @@ static bool load_png(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
         return false;
     }
 
+    uint8_t * volatile pixels = NULL;
+    png_bytep * volatile row_pointers = NULL;
+
     if (setjmp(png_jmpbuf(png))) {
         png_destroy_read_struct(&png, &info, NULL);
+        if (pixels) free(pixels);
+        if (row_pointers) free(row_pointers);
         return false;
     }
 
@@ -70,13 +75,13 @@ static bool load_png(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
         png_destroy_read_struct(&png, &info, NULL);
         return false;
     }
-    uint8_t *pixels = (uint8_t *)malloc(total_bytes);
+    pixels = (uint8_t *)malloc(total_bytes);
     if (!pixels) {
         png_destroy_read_struct(&png, &info, NULL);
         return false;
     }
 
-    png_bytep *row_pointers = (png_bytep *)malloc(sizeof(png_bytep) * height);
+    row_pointers = (png_bytep *)malloc(sizeof(png_bytep) * height);
     if (!row_pointers) {
         free(pixels);
         png_destroy_read_struct(&png, &info, NULL);
@@ -164,14 +169,10 @@ static inline uint16_t read_u16_le(const uint8_t *p)
 
 static inline uint32_t read_u32_le(const uint8_t *p)
 {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static inline int32_t read_i32_le(const uint8_t *p)
-{
-    return (int32_t)read_u32_le(p);
-}
+static inline int32_t read_i32_le(const uint8_t *p) { return (int32_t)read_u32_le(p); }
 
 static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
 {
@@ -240,6 +241,335 @@ static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     return true;
 }
 
+typedef struct {
+    FILE *fp;
+    uint32_t bit_buf;
+    int bit_count;
+    int sub_len;
+    bool eof;
+} gif_bit_reader_t;
+
+static int gif_read_bits(gif_bit_reader_t *br, int num_bits)
+{
+    while (br->bit_count < num_bits) {
+        if (br->sub_len == 0) {
+            int len = fgetc(br->fp);
+            if (len <= 0) {
+                br->eof = true;
+                return -1;
+            }
+            br->sub_len = len;
+        }
+        int b = fgetc(br->fp);
+        if (b == EOF) {
+            br->eof = true;
+            return -1;
+        }
+        br->sub_len--;
+        br->bit_buf |= ((uint32_t)b << br->bit_count);
+        br->bit_count += 8;
+    }
+    int code = (int)(br->bit_buf & ((1U << num_bits) - 1));
+    br->bit_buf >>= num_bits;
+    br->bit_count -= num_bits;
+    return code;
+}
+
+static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
+    uint8_t header[13];
+    if (fread(header, 1, 13, fp) != 13)
+        return false;
+
+    if (strncmp((const char *)header, "GIF87a", 6) != 0 &&
+        strncmp((const char *)header, "GIF89a", 6) != 0) {
+        return false;
+    }
+
+    uint16_t screen_w = read_u16_le(&header[6]);
+    uint16_t screen_h = read_u16_le(&header[8]);
+    uint8_t lsd_packed = header[10];
+    uint8_t bg_color_idx = header[11];
+
+    bool has_gct = (lsd_packed & 0x80) != 0;
+    int gct_entries = has_gct ? (1 << ((lsd_packed & 0x07) + 1)) : 0;
+    uint8_t gct[256][3];
+    memset(gct, 0, sizeof(gct));
+
+    if (has_gct && gct_entries > 0) {
+        if (fread(gct, 3, (size_t)gct_entries, fp) != (size_t)gct_entries)
+            return false;
+    }
+
+    bool has_trans = false;
+    uint8_t trans_idx = 0;
+
+    while (true) {
+        int block_type = fgetc(fp);
+        if (block_type == EOF || block_type == 0x3B)
+            break;
+
+        if (block_type == 0x21) { /* Extension block */
+            int label = fgetc(fp);
+            if (label == EOF)
+                break;
+
+            if (label == 0xF9) { /* Graphic Control Extension */
+                int ext_len = fgetc(fp);
+                if (ext_len != 4)
+                    return false;
+                uint8_t gce[4];
+                if (fread(gce, 1, 4, fp) != 4)
+                    return false;
+                has_trans = (gce[0] & 0x01) != 0;
+                trans_idx = gce[3];
+                int term = fgetc(fp);
+                while (term > 0 && term != EOF) {
+                    if (fseek(fp, term, SEEK_CUR) != 0)
+                        return false;
+                    term = fgetc(fp);
+                }
+            } else {
+                int sub_len;
+                while ((sub_len = fgetc(fp)) > 0) {
+                    if (fseek(fp, sub_len, SEEK_CUR) != 0)
+                        return false;
+                }
+            }
+            continue;
+        }
+
+        if (block_type == 0x2C) { /* Image Descriptor */
+            uint8_t desc[9];
+            if (fread(desc, 1, 9, fp) != 9)
+                return false;
+
+            uint16_t img_left = read_u16_le(&desc[0]);
+            uint16_t img_top = read_u16_le(&desc[2]);
+            uint16_t img_w = read_u16_le(&desc[4]);
+            uint16_t img_h = read_u16_le(&desc[6]);
+            uint8_t img_packed = desc[8];
+
+            if (img_w == 0 || img_h == 0 || img_w > 16384 || img_h > 16384)
+                return false;
+
+            uint32_t canvas_w = screen_w > 0 ? (uint32_t)screen_w : (uint32_t)img_w;
+            uint32_t canvas_h = screen_h > 0 ? (uint32_t)screen_h : (uint32_t)img_h;
+
+            if (canvas_w == 0 || canvas_h == 0 || canvas_w > 16384 || canvas_h > 16384)
+                return false;
+
+            if ((uint32_t)img_left + img_w > canvas_w)
+                canvas_w = (uint32_t)img_left + img_w;
+            if ((uint32_t)img_top + img_h > canvas_h)
+                canvas_h = (uint32_t)img_top + img_h;
+
+            bool has_lct = (img_packed & 0x80) != 0;
+            bool interlace = (img_packed & 0x40) != 0;
+            int lct_entries = has_lct ? (1 << ((img_packed & 0x07) + 1)) : 0;
+            uint8_t lct[256][3];
+            memset(lct, 0, sizeof(lct));
+
+            if (has_lct && lct_entries > 0) {
+                if (fread(lct, 3, (size_t)lct_entries, fp) != (size_t)lct_entries)
+                    return false;
+            }
+
+            uint8_t (*active_pal)[3] = has_lct ? lct : gct;
+
+            /* Pre-compute 32-bit ARGB8888 (native little-endian BGRA) palette */
+            uint32_t u32_palette[256];
+            for (int i = 0; i < 256; ++i) {
+                if (has_trans && i == (int)trans_idx) {
+                    u32_palette[i] = 0x00000000;
+                } else {
+                    uint32_t r = active_pal[i][0];
+                    uint32_t g = active_pal[i][1];
+                    uint32_t b = active_pal[i][2];
+                    u32_palette[i] = (0xFFU << 24) | (r << 16) | (g << 8) | b;
+                }
+            }
+
+            uint32_t *canvas = (uint32_t *)calloc((size_t)canvas_w * canvas_h, sizeof(uint32_t));
+            if (!canvas)
+                return false;
+
+            if (!has_trans) {
+                uint32_t bg_val = u32_palette[bg_color_idx];
+                for (size_t i = 0; i < (size_t)canvas_w * canvas_h; ++i) {
+                    canvas[i] = bg_val;
+                }
+            }
+
+            uint32_t *row_map = (uint32_t *)malloc(sizeof(uint32_t) * img_h);
+            if (!row_map) {
+                free(canvas);
+                return false;
+            }
+
+            if (!interlace) {
+                for (uint32_t r = 0; r < img_h; ++r)
+                    row_map[r] = r;
+            } else {
+                uint32_t cur = 0;
+                for (uint32_t r = 0; r < img_h; r += 8)
+                    row_map[cur++] = r;
+                for (uint32_t r = 4; r < img_h; r += 8)
+                    row_map[cur++] = r;
+                for (uint32_t r = 2; r < img_h; r += 4)
+                    row_map[cur++] = r;
+                for (uint32_t r = 1; r < img_h; r += 2)
+                    row_map[cur++] = r;
+            }
+
+            int min_code_size = fgetc(fp);
+            if (min_code_size < 2 || min_code_size > 11) {
+                free(row_map);
+                free(canvas);
+                return false;
+            }
+
+            int clear_code = 1 << min_code_size;
+            int end_code = clear_code + 1;
+            int code_size = min_code_size + 1;
+            int max_code = 1 << code_size;
+            int next_code = end_code + 1;
+            int old_code = -1;
+
+            uint16_t prefix[4096];
+            uint8_t suffix[4096];
+            uint8_t stack[4096];
+            int stack_ptr = 0;
+
+            for (int i = 0; i < clear_code; ++i) {
+                prefix[i] = 4096;
+                suffix[i] = (uint8_t)i;
+            }
+
+            gif_bit_reader_t br = {
+                .fp = fp,
+                .bit_buf = 0,
+                .bit_count = 0,
+                .sub_len = 0,
+                .eof = false,
+            };
+
+            size_t total_pixels = (size_t)img_w * img_h;
+            size_t pixels_written = 0;
+            uint32_t px = 0;
+            uint32_t py = 0;
+            uint32_t *dst_row = canvas + ((size_t)img_top + row_map[0]) * canvas_w + img_left;
+
+            while (pixels_written < total_pixels) {
+                int code = gif_read_bits(&br, code_size);
+                if (code < 0 || code == end_code)
+                    break;
+
+                if (code == clear_code) {
+                    code_size = min_code_size + 1;
+                    max_code = 1 << code_size;
+                    next_code = end_code + 1;
+                    old_code = -1;
+                    continue;
+                }
+
+                if (old_code == -1) {
+                    if (code >= 4096)
+                        break;
+                    old_code = code;
+                    dst_row[px] = u32_palette[(uint8_t)code];
+                    px++;
+                    if (px == img_w) {
+                        px = 0;
+                        py++;
+                        if (py < img_h)
+                            dst_row =
+                                canvas + ((size_t)img_top + row_map[py]) * canvas_w + img_left;
+                    }
+                    pixels_written++;
+                    continue;
+                }
+
+                int in_code = code;
+                int first_char = 0;
+
+                if (code == next_code) {
+                    stack[stack_ptr++] = 0;
+                    int cur = old_code;
+                    while (cur >= clear_code) {
+                        if (cur >= 4096 || stack_ptr >= 4096)
+                            break;
+                        stack[stack_ptr++] = suffix[cur];
+                        cur = prefix[cur];
+                    }
+                    first_char = cur;
+                    if (stack_ptr < 4096)
+                        stack[stack_ptr++] = (uint8_t)cur;
+                    stack[0] = (uint8_t)first_char;
+                } else if (code < next_code) {
+                    int cur = code;
+                    while (cur >= clear_code) {
+                        if (cur >= 4096 || stack_ptr >= 4096)
+                            break;
+                        stack[stack_ptr++] = suffix[cur];
+                        cur = prefix[cur];
+                    }
+                    first_char = cur;
+                    if (stack_ptr < 4096)
+                        stack[stack_ptr++] = (uint8_t)cur;
+                } else {
+                    break;
+                }
+
+                if (next_code < 4096) {
+                    prefix[next_code] = (uint16_t)old_code;
+                    suffix[next_code] = (uint8_t)first_char;
+                    next_code++;
+                    if (next_code >= max_code && code_size < 12) {
+                        code_size++;
+                        max_code = 1 << code_size;
+                    }
+                }
+                old_code = in_code;
+
+                while (stack_ptr > 0 && pixels_written < total_pixels) {
+                    uint8_t c = stack[--stack_ptr];
+                    dst_row[px] = u32_palette[c];
+                    px++;
+                    if (px == img_w) {
+                        px = 0;
+                        py++;
+                        if (py < img_h)
+                            dst_row =
+                                canvas + ((size_t)img_top + row_map[py]) * canvas_w + img_left;
+                    }
+                    pixels_written++;
+                }
+            }
+
+            /* Drain remaining sub-blocks for this image record */
+            while (br.sub_len > 0) {
+                fgetc(fp);
+                br.sub_len--;
+            }
+            int sub_len;
+            while ((sub_len = fgetc(fp)) > 0) {
+                if (fseek(fp, sub_len, SEEK_CUR) != 0)
+                    break;
+            }
+
+            free(row_map);
+
+            *out_pixels = (uint8_t *)canvas;
+            *out_w = canvas_w;
+            *out_h = canvas_h;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool image_load(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
 {
     if (!filepath || !out_pixels || !out_w || !out_h)
@@ -265,6 +595,8 @@ bool image_load(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uin
         ok = load_jpeg(fp, out_pixels, out_w, out_h);
     } else if (magic[0] == 'B' && magic[1] == 'M') {
         ok = load_bmp(fp, out_pixels, out_w, out_h);
+    } else if (magic[0] == 'G' && magic[1] == 'I' && magic[2] == 'F' && magic[3] == '8') {
+        ok = load_gif(fp, out_pixels, out_w, out_h);
     } else {
         WAYWAL_LOG_ERR("Unsupported image format: %s", filepath);
     }

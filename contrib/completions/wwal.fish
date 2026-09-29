@@ -42,6 +42,7 @@ complete -c wwal -n "__fish_seen_subcommand_from img" -l stagger-delay -d "Stagg
 complete -c wwal -n "__fish_seen_subcommand_from img" -l 10bit -d "Force 10-bit wide gamut scanout"
 complete -c wwal -n "__fish_seen_subcommand_from img" -l scaling-mode -a "$scaling_modes" -d "Aspect ratio scaling mode"
 complete -c wwal -n "__fish_seen_subcommand_from img" -l mode -a "$scaling_modes" -d "Aspect ratio scaling mode"
+complete -c wwal -n "__fish_seen_subcommand_from img" -l animate -d "Play animated GIF via hardware video engine"
 
 # clear options
 complete -c wwal -n "__fish_seen_subcommand_from clear" -s o -l output -d "Target monitor name" -r

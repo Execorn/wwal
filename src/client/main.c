@@ -1,5 +1,6 @@
 #include "cli_parser.h"
 #include "image_loader.h"
+#include "waywal/gif_transcode.h"
 #include "waywal/ipc_proto.h"
 #include "waywal/log.h"
 #include "waywal/os_compat.h"
@@ -57,6 +58,20 @@ int main(int argc, char *argv[])
 
     if (opts.verbose) {
         waywal_log_set_level(WAYWAL_LOG_LEVEL_DEBUG);
+    }
+
+    if (opts.cmd == CLI_CMD_IMG && opts.animate && is_gif_file(opts.filepath)) {
+        opts.cmd = CLI_CMD_VIDEO;
+    }
+
+    char effective_video_path[4096];
+    effective_video_path[0] = '\0';
+    if (opts.cmd == CLI_CMD_VIDEO) {
+        if (!gif_transcode_resolve(opts.filepath, effective_video_path,
+                                   sizeof(effective_video_path))) {
+            fprintf(stderr, "Error: Failed to process video/GIF input: %s\n", opts.filepath);
+            return 1;
+        }
     }
 
     int socket_fd = waywal_ipc_client_connect(opts.namespace_str, 3000);
@@ -182,11 +197,17 @@ int main(int argc, char *argv[])
     }
 
     case CLI_CMD_VIDEO: {
-        int video_fd = open(opts.filepath, O_RDONLY | O_CLOEXEC);
+        int video_fd = open(effective_video_path, O_RDONLY | O_CLOEXEC);
         req_hdr.opcode = WAYWAL_REQ_SET_VIDEO;
 
+        waywal_video_payload_t vpay;
+        memset(&vpay, 0, sizeof(vpay));
+        vpay.loop_count = opts.video_loop_count;
+        vpay.playback_speed = opts.video_speed;
+        strncpy(vpay.filepath, effective_video_path, sizeof(vpay.filepath) - 1);
+        req_hdr.payload_size = sizeof(vpay);
+
         if (video_fd >= 0) {
-            req_hdr.payload_size = 0;
             if (!waywal_ipc_send(socket_fd, &req_hdr, video_fd)) {
                 fprintf(stderr, "Error: Failed to send video fd to daemon\n");
                 close(video_fd);
@@ -194,14 +215,8 @@ int main(int argc, char *argv[])
                 break;
             }
             close(video_fd);
+            (void)write(socket_fd, &vpay, sizeof(vpay));
         } else {
-            waywal_video_payload_t vpay;
-            memset(&vpay, 0, sizeof(vpay));
-            vpay.loop_count = opts.video_loop_count;
-            vpay.playback_speed = opts.video_speed;
-            strncpy(vpay.filepath, opts.filepath, sizeof(vpay.filepath) - 1);
-            req_hdr.payload_size = sizeof(vpay);
-
             if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
                 fprintf(stderr, "Error: Failed to send video request to daemon\n");
                 ret_code = 1;
