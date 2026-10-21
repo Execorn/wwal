@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -121,6 +122,37 @@ int open_drm_node_by_devt(dev_t target_dev)
     return found_fd;
 }
 
+/* NVIDIA's proprietary GBM backend (nvidia-drm_gbm.so) allocates BOs but leaves
+ * bo_map unimplemented, which would cause CPU pixel uploads to fail after
+ * full-screen DMA-BUFs have already been imported into the compositor. */
+bool dmabuf_probe_map_support(dmabuf_context_t *ctx)
+{
+    if (!ctx || !ctx->gbm)
+        return false;
+
+    struct gbm_bo *bo = gbm_bo_create(ctx->gbm, 4, 4, DRM_FORMAT_ARGB8888,
+                                      GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    if (!bo) {
+        bo = gbm_bo_create(ctx->gbm, 4, 4, DRM_FORMAT_ARGB8888, GBM_BO_USE_SCANOUT);
+    }
+    if (!bo) {
+        bo = gbm_bo_create(ctx->gbm, 4, 4, DRM_FORMAT_ARGB8888, GBM_BO_USE_LINEAR);
+    }
+    if (!bo) {
+        return false;
+    }
+
+    uint32_t stride = 0;
+    void *map_data = NULL;
+    void *map = gbm_bo_map(bo, 0, 0, 4, 4, GBM_BO_TRANSFER_WRITE, &stride, &map_data);
+    bool supported = (map != NULL && map != MAP_FAILED);
+    if (supported) {
+        gbm_bo_unmap(bo, map_data);
+    }
+    gbm_bo_destroy(bo);
+    return supported;
+}
+
 bool dmabuf_context_init(dmabuf_context_t *ctx)
 {
     if (!ctx)
@@ -192,7 +224,9 @@ bool dmabuf_context_init(dmabuf_context_t *ctx)
     ctx->drm_fd = drm_fd;
     ctx->gbm = gbm;
     ctx->available = true;
-    WAYWAL_LOG_INFO("GBM device initialized successfully on DRM fd %d", drm_fd);
+    ctx->map_supported = dmabuf_probe_map_support(ctx);
+    WAYWAL_LOG_INFO("GBM device initialized on DRM fd %d (bo_map: %s)", drm_fd,
+                    ctx->map_supported ? "supported" : "unsupported");
     return true;
 }
 
@@ -216,6 +250,7 @@ void dmabuf_context_destroy(dmabuf_context_t *ctx)
         ctx->drm_fd = -1;
     }
     ctx->available = false;
+    ctx->map_supported = false;
 }
 
 bool dmabuf_bo_allocate(dmabuf_context_t *ctx, dmabuf_bo_t *bo, uint32_t width, uint32_t height,

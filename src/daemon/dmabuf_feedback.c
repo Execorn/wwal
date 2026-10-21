@@ -22,7 +22,7 @@ typedef struct {
     bool is_scanout_tranche;
 } feedback_state_t;
 
-static feedback_state_t g_fb_state = {0};
+static feedback_state_t g_fb_state = {.table_fd = -1};
 
 static void feedback_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback)
 {

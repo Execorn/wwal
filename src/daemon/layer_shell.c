@@ -245,10 +245,35 @@ static bool is_multigpu_system(void)
     return (s_multigpu == 1);
 }
 
+static void teardown_output_dmabuf(daemon_state_t *state, output_node_t *node)
+{
+    if (!state || !node)
+        return;
+    if (node->use_dmabuf) {
+        for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+            render_engine_release_bo(&state->render_engine, &node->dmabuf_ring.buffers[i]);
+        }
+        dmabuf_ring_destroy(&state->dmabuf_ctx, &node->dmabuf_ring);
+        node->use_dmabuf = false;
+    }
+    if (node->has_source_old_bo) {
+        render_engine_release_bo(&state->render_engine, &node->source_old_bo);
+        dmabuf_bo_free(&node->source_old_bo);
+        node->has_source_old_bo = false;
+    }
+    if (node->has_source_new_bo) {
+        render_engine_release_bo(&state->render_engine, &node->source_new_bo);
+        dmabuf_bo_free(&node->source_new_bo);
+        node->has_source_new_bo = false;
+    }
+}
+
 static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32_t width,
                                int32_t height)
 {
-    if (!state || !state->dmabuf_ctx.available || !state->dmabuf_ctx.dmabuf_proto) {
+    if (!state || !node || !state->dmabuf_ctx.available || !state->dmabuf_ctx.dmabuf_proto ||
+        !state->dmabuf_ctx.map_supported) {
+        teardown_output_dmabuf(state, node);
         return false;
     }
     if (width <= 0 || height <= 0)
@@ -258,6 +283,7 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
      * from different DRM devices. Cross-device DMA-BUF sharing causes compositor driver aborts;
      * use universal zero-copy wl_shm pipeline instead. */
     if (is_multigpu_system()) {
+        teardown_output_dmabuf(state, node);
         return false;
     }
 
@@ -265,6 +291,7 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
      * state and trips GPU resets. Only use direct scanout if modifier is linear. */
     if (state->dmabuf_ctx.preferred_modifier != DRM_FORMAT_MOD_LINEAR &&
         state->dmabuf_ctx.preferred_modifier != DRM_FORMAT_MOD_INVALID) {
+        teardown_output_dmabuf(state, node);
         return false;
     }
 
@@ -273,13 +300,7 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
         return true;
     }
 
-    if (node->use_dmabuf) {
-        for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
-            render_engine_release_bo(&state->render_engine, &node->dmabuf_ring.buffers[i]);
-        }
-        dmabuf_ring_destroy(&state->dmabuf_ctx, &node->dmabuf_ring);
-        node->use_dmabuf = false;
-    }
+    teardown_output_dmabuf(state, node);
 
     uint64_t modifier = state->dmabuf_ctx.preferred_modifier;
     if (dmabuf_ring_init(&state->dmabuf_ctx, &node->dmabuf_ring, (uint32_t)width, (uint32_t)height,
@@ -445,6 +466,9 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                 wl_display_flush(state->display);
                 return;
             }
+            bo->in_use = false;
+            state->dmabuf_ctx.map_supported = false;
+            teardown_output_dmabuf(state, node);
         }
     }
 
@@ -473,6 +497,11 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
     node->shm_buffer_released[back_idx] = false;
     node->active_buffer_idx = back_idx;
     output_commit_frame(node);
+    int inactive_idx = 1 - back_idx;
+    if (node->shm_buffer_released[inactive_idx]) {
+        void *inactive_ptr = (uint8_t *)node->shm_data + (size_t)inactive_idx * frame_sz;
+        madvise(inactive_ptr, frame_sz, MADV_REMOVE);
+    }
     wl_display_flush(state->display);
 }
 
@@ -702,6 +731,9 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                 wl_display_flush(state->display);
                 return;
             }
+            bo->in_use = false;
+            state->dmabuf_ctx.map_supported = false;
+            teardown_output_dmabuf(state, node);
         }
     }
 
@@ -719,6 +751,11 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
         node->active_buffer_idx = back_idx;
         output_commit_frame(node);
         node->has_image = true;
+        int inactive_idx = 1 - back_idx;
+        if (node->shm_buffer_released[inactive_idx]) {
+            void *inactive_ptr = (uint8_t *)node->shm_data + (size_t)inactive_idx * frame_sz;
+            madvise(inactive_ptr, frame_sz, MADV_REMOVE);
+        }
         wl_display_flush(state->display);
     }
 }
@@ -945,7 +982,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         }
 
         if (!dmabuf_ok) {
-            out->use_dmabuf = false;
+            teardown_output_dmabuf(state, out);
             if (!ensure_shm_buffer(state, out, out->width, out->height) ||
                 !ensure_shm_transition_buffers(out)) {
                 output_node_render_image(state, out, pixels, img_w, img_h);
