@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "wayland_core.h"
 #include "waywal/bezier.h"
 #include "waywal/dmabuf.h"
@@ -7,6 +10,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
+#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -24,6 +28,12 @@ static void shm_buffer_release(void *data, struct wl_buffer *wl_buffer)
     for (int i = 0; i < 2; ++i) {
         if (node->shm_buffers[i] == wl_buffer) {
             node->shm_buffer_released[i] = true;
+            if (!node->transition_active && i != node->active_buffer_idx && node->shm_data &&
+                node->width > 0 && node->height > 0) {
+                size_t frame_sz = (size_t)node->width * (size_t)node->height * sizeof(uint32_t);
+                void *inactive_ptr = (uint8_t *)node->shm_data + (size_t)i * frame_sz;
+                madvise(inactive_ptr, frame_sz, MADV_REMOVE);
+            }
             break;
         }
     }
@@ -1107,11 +1117,20 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                 dmabuf_bo_t tmp = out->source_old_bo;
                 out->source_old_bo = out->source_new_bo;
                 out->source_new_bo = tmp;
-            } else if (out->shm_old_data && out->shm_new_data) {
-                /* Promote new frame -> old so next transition starts from correct state */
-                void *tmp = out->shm_old_data;
-                out->shm_old_data = out->shm_new_data;
-                out->shm_new_data = tmp;
+            } else {
+                free(out->shm_old_data);
+                free(out->shm_new_data);
+                out->shm_old_data = NULL;
+                out->shm_new_data = NULL;
+                out->shm_buffer_cap = 0;
+                int inactive_idx = 1 - out->active_buffer_idx;
+                if (out->shm_buffer_released[inactive_idx] && out->shm_data &&
+                    out->width > 0 && out->height > 0) {
+                    size_t frame_sz = (size_t)out->width * (size_t)out->height * sizeof(uint32_t);
+                    void *inactive_ptr =
+                        (uint8_t *)out->shm_data + (size_t)inactive_idx * frame_sz;
+                    madvise(inactive_ptr, frame_sz, MADV_REMOVE);
+                }
             }
             out->has_image = true;
         } else {
@@ -1128,6 +1147,7 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
         uint64_t dummy;
         while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0);
         state->transitions_in_progress = false;
+        malloc_trim(0);
         WAYWAL_LOG_INFO("Transition completed successfully across active outputs");
     }
 }
