@@ -194,7 +194,9 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
             state->outputs = state->output_mgr.head;
             state->num_outputs = state->output_mgr.count;
             WAYWAL_LOG_INFO("Discovered Wayland output id %u", name);
-            if (state->layer_shell) {
+            /* Defer surface creation during initial startup until dmabuf_feedback_init
+             * has negotiated the compositor's DRM device and format modifiers. */
+            if (state->layer_shell && state->dmabuf_ctx.default_feedback) {
                 output_node_create_surface(state, node);
                 output_node_render_color(state, node, state->current_color);
             }
@@ -348,6 +350,7 @@ bool daemon_wayland_init(daemon_state_t *state)
                 state->dmabuf_ctx.format_10bit         = saved_f10;
                 state->dmabuf_ctx.modifier_10bit       = saved_m10;
                 state->dmabuf_ctx.available            = (state->dmabuf_ctx.gbm != NULL);
+                state->dmabuf_ctx.map_supported        = dmabuf_probe_map_support(&state->dmabuf_ctx);
             }
         }
     }

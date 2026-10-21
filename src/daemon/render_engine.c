@@ -22,6 +22,7 @@ bool render_engine_init(render_engine_t *re, dmabuf_context_t *dmabuf_ctx)
      * modifier is linear (matching ensure_dmabuf_ring); otherwise transitions use the
      * OpenMP/AVX2 CPU SIMD path and we avoid allocating ~67 MiB of unused GPU shader compiler heap. */
     if (dmabuf_ctx && dmabuf_ctx->available &&
+        (dmabuf_ctx->map_supported || !dmabuf_ctx->dmabuf_proto) &&
         (dmabuf_ctx->preferred_modifier == DRM_FORMAT_MOD_LINEAR ||
          dmabuf_ctx->preferred_modifier == DRM_FORMAT_MOD_INVALID)) {
         re->gpu_ctx = gpu_compute_create(dmabuf_ctx);
@@ -47,9 +48,9 @@ bool render_engine_init(render_engine_t *re, dmabuf_context_t *dmabuf_ctx)
     WAYWAL_LOG_INFO("Render Engine initialized with CPU SIMD fallback (%s)", simd_name);
 
 #ifdef _OPENMP
-#pragma omp parallel
-    {
-        (void)omp_get_thread_num();
+    if (!getenv("OMP_NUM_THREADS")) {
+        int max_procs = omp_get_num_procs();
+        omp_set_num_threads(max_procs > 4 ? 4 : max_procs);
     }
 #endif
     return true;

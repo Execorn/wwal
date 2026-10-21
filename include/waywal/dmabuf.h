@@ -52,6 +52,7 @@ typedef struct dmabuf_context {
     dev_t compositor_dev;
     bool has_compositor_dev;
     bool available;
+    bool map_supported;
 } dmabuf_context_t;
 
 typedef struct dmabuf_ring {
@@ -67,6 +68,7 @@ typedef struct dmabuf_ring {
 /* Initialize DRM node and GBM device */
 bool dmabuf_context_init(dmabuf_context_t *ctx);
 void dmabuf_context_destroy(dmabuf_context_t *ctx);
+bool dmabuf_probe_map_support(dmabuf_context_t *ctx);
 
 /* Standalone buffer allocation */
 bool dmabuf_bo_allocate(dmabuf_context_t *ctx, dmabuf_bo_t *bo, uint32_t width, uint32_t height,
