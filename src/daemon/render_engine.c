@@ -18,7 +18,12 @@ bool render_engine_init(render_engine_t *re, dmabuf_context_t *dmabuf_ctx)
         return false;
     memset(re, 0, sizeof(*re));
 
-    if (dmabuf_ctx && dmabuf_ctx->available) {
+    /* Only initialize the EGL/GLES compute shader pipeline when the compositor's preferred
+     * modifier is linear (matching ensure_dmabuf_ring); otherwise transitions use the
+     * OpenMP/AVX2 CPU SIMD path and we avoid allocating ~67 MiB of unused GPU shader compiler heap. */
+    if (dmabuf_ctx && dmabuf_ctx->available &&
+        (dmabuf_ctx->preferred_modifier == DRM_FORMAT_MOD_LINEAR ||
+         dmabuf_ctx->preferred_modifier == DRM_FORMAT_MOD_INVALID)) {
         re->gpu_ctx = gpu_compute_create(dmabuf_ctx);
         if (re->gpu_ctx) {
             re->has_gpu_compute = true;

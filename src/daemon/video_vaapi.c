@@ -121,8 +121,17 @@ bool vaapi_decoder_init(vaapi_decoder_t *dec, int drm_render_fd, waywal_codec_t 
 
         int major = 0, minor = 0;
         VAStatus st = vaInitialize(dpy, &major, &minor);
-        if (st != VA_STATUS_SUCCESS) {
+        if (st != VA_STATUS_SUCCESS && getenv("LIBVA_DRIVER_NAME") != NULL) {
             vaTerminate(dpy);
+            unsetenv("LIBVA_DRIVER_NAME");
+            dpy = vaGetDisplayDRM(fd);
+            if (dpy) {
+                st = vaInitialize(dpy, &major, &minor);
+            }
+        }
+        if (!dpy || st != VA_STATUS_SUCCESS) {
+            if (dpy)
+                vaTerminate(dpy);
             if (owns_fd)
                 close(fd);
             continue;
@@ -1275,9 +1284,13 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
     out_frame->surface_id = surface;
     out_frame->width = prime_desc.width;
     out_frame->height = prime_desc.height;
-    out_frame->drm_format = (prime_desc.num_layers > 0 && prime_desc.layers[0].drm_format != 0)
-                                ? prime_desc.layers[0].drm_format
-                                : DRM_FORMAT_NV12;
+    if (prime_desc.fourcc == VA_FOURCC_NV12) {
+        out_frame->drm_format = DRM_FORMAT_NV12;
+    } else if (prime_desc.num_layers > 0 && prime_desc.layers[0].drm_format != 0) {
+        out_frame->drm_format = prime_desc.layers[0].drm_format;
+    } else {
+        out_frame->drm_format = DRM_FORMAT_NV12;
+    }
 
     uint32_t plane_idx = 0;
     bool obj_used[256] = {false};

@@ -64,7 +64,7 @@ bool security_sandbox_apply(const char *runtime_dir)
         int ruleset_fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
         if (ruleset_fd >= 0) {
             /* Allow read-only across standard system mounts required for DRM/Mesa/VA-API drivers */
-            const char *ro_paths[] = {"/usr", "/etc", "/sys", "/proc", "/dev/dri", NULL};
+            const char *ro_paths[] = {"/usr", "/etc", "/sys", "/proc", "/dev", "/dev/dri", NULL};
             for (int i = 0; ro_paths[i] != NULL; ++i) {
                 int dir_fd = open(ro_paths[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
                 if (dir_fd >= 0) {
@@ -78,8 +78,8 @@ bool security_sandbox_apply(const char *runtime_dir)
                 }
             }
 
-            /* Allow read-write strictly for DRI device nodes (/dev/dri) and /tmp (ARCH-07) */
-            const char *rw_paths[] = {"/dev/dri", "/tmp", NULL};
+            /* Allow read-write strictly for DRI/GPU device nodes (/dev, /dev/dri) and /tmp (ARCH-07) */
+            const char *rw_paths[] = {"/dev", "/dev/dri", "/tmp", NULL};
             for (int i = 0; rw_paths[i] != NULL; ++i) {
                 int dir_fd = open(rw_paths[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
                 if (dir_fd < 0 && strcmp(rw_paths[i], "/dev/dri") == 0) {
@@ -132,15 +132,14 @@ bool security_sandbox_apply(const char *runtime_dir)
         /* Denied Dangerous Syscalls -> SCMP_ACT_KILL (SOTA-09) */
         const int denied_syscalls[] = {
             SCMP_SYS(execve), SCMP_SYS(execveat),   SCMP_SYS(fork),        SCMP_SYS(vfork),
-            SCMP_SYS(ptrace), SCMP_SYS(kill),       SCMP_SYS(tkill),       SCMP_SYS(tgkill),
-            SCMP_SYS(mount),  SCMP_SYS(umount2),    SCMP_SYS(chroot),      SCMP_SYS(pivot_root),
-            SCMP_SYS(reboot), SCMP_SYS(kexec_load), SCMP_SYS(init_module), SCMP_SYS(delete_module),
-            SCMP_SYS(bpf),
+            SCMP_SYS(ptrace), SCMP_SYS(kill),       SCMP_SYS(mount),       SCMP_SYS(umount2),
+            SCMP_SYS(chroot), SCMP_SYS(pivot_root), SCMP_SYS(reboot),      SCMP_SYS(kexec_load),
+            SCMP_SYS(init_module), SCMP_SYS(delete_module), SCMP_SYS(bpf),
         };
 
         for (size_t i = 0; i < sizeof(denied_syscalls) / sizeof(denied_syscalls[0]); ++i) {
             if (denied_syscalls[i] != __NR_SCMP_ERROR) {
-                seccomp_rule_add(ctx, SCMP_ACT_KILL, denied_syscalls[i], 0);
+                seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, denied_syscalls[i], 0);
             }
         }
 
@@ -149,7 +148,7 @@ bool security_sandbox_apply(const char *runtime_dir)
         seccomp_rule_add(
             ctx, SCMP_ACT_ALLOW, SCMP_SYS(clone), 1,
             SCMP_A0(SCMP_CMP_MASKED_EQ, (scmp_datum_t)CLONE_THREAD, (scmp_datum_t)CLONE_THREAD));
-        seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 1,
+        seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(clone), 1,
                          SCMP_A0(SCMP_CMP_MASKED_EQ, (scmp_datum_t)CLONE_THREAD, 0));
 
         /* Route clone3 to ENOSYS so libc falls back to clone(CLONE_THREAD) */
@@ -235,9 +234,12 @@ bool security_sandbox_apply(const char *runtime_dir)
 
             /* Memory */
             SCMP_SYS(mprotect),
+            SCMP_SYS(mremap),
             SCMP_SYS(brk),
             SCMP_SYS(madvise),
             SCMP_SYS(memfd_create),
+            SCMP_SYS(fallocate),
+            SCMP_SYS(flock),
 
             /* Clocks */
             SCMP_SYS(clock_getres),
@@ -249,22 +251,34 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(prctl),
             SCMP_SYS(rt_sigaction),
             SCMP_SYS(rt_sigprocmask),
+            SCMP_SYS(tgkill),
+            SCMP_SYS(tkill),
             SCMP_SYS(futex),
+            SCMP_SYS(set_robust_list),
+            SCMP_SYS(get_robust_list),
             SCMP_SYS(getpid),
             SCMP_SYS(gettid),
             SCMP_SYS(getuid),
             SCMP_SYS(geteuid),
             SCMP_SYS(getgid),
             SCMP_SYS(getegid),
+            SCMP_SYS(getpriority),
+            SCMP_SYS(setpriority),
             SCMP_SYS(sched_yield),
             SCMP_SYS(sched_getaffinity),
             SCMP_SYS(sched_setaffinity),
+            SCMP_SYS(sched_getparam),
+            SCMP_SYS(sched_getscheduler),
+            SCMP_SYS(sched_get_priority_max),
+            SCMP_SYS(sched_get_priority_min),
             SCMP_SYS(rseq),
             SCMP_SYS(getrandom),
             SCMP_SYS(sysinfo),
             SCMP_SYS(uname),
 
             /* Stat & Filesystem */
+            SCMP_SYS(stat),
+            SCMP_SYS(lstat),
             SCMP_SYS(fstat),
             SCMP_SYS(newfstatat),
             SCMP_SYS(statx),
