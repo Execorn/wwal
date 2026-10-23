@@ -27,7 +27,9 @@ void main() {
     float d = proj + wave;
 
     float edge = 0.04;
-    float alpha = smoothstep(d - edge, d + edge, u_progress);
+    float margin = u_wave_amp + edge;
+    float p = u_progress * (1.0 + 2.0 * margin) - margin;
+    float alpha = smoothstep(d - edge, d + edge, p);
 
     vec4 a = texture(u_src_a, uv);
     vec4 b = texture(u_src_b, uv);

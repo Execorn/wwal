@@ -263,7 +263,7 @@ static void test_cpu_transitions(void)
     for (size_t i = 0; i < num_types; ++i) {
         waywal_transition_params_t params = {
             .type = types[i],
-            .progress = 0.5f,
+            .progress = 0.0f,
             .angle_rad = 0.785f,
             .wave_freq = 20.0f,
             .wave_amp = 0.05f,
@@ -271,9 +271,39 @@ static void test_cpu_transitions(void)
             .center_y = 0.5f,
             .bezier = BEZIER_DEFAULT,
         };
+
+        memset(dst, 0, num_pixels * sizeof(uint32_t));
         bool ok = render_engine_execute_cpu_transition(dst, src_a, src_b, width, height,
                                                        width * sizeof(uint32_t), &params);
+        assert(ok);
+        for (size_t p = 0; p < num_pixels; ++p) {
+            assert(dst[p] == src_a[p]);
+        }
+
+        params.progress = 0.5f;
+        ok = render_engine_execute_cpu_transition(dst, src_a, src_b, width, height,
+                                                  width * sizeof(uint32_t), &params);
         assert(ok && "CPU transition execution must succeed for all transition types");
+
+        if (types[i] == WAYWAL_TRANSITION_NOISE || types[i] == WAYWAL_TRANSITION_BURN ||
+            types[i] == WAYWAL_TRANSITION_WIPE || types[i] == WAYWAL_TRANSITION_WAVE) {
+            params.progress = 0.9999f;
+            ok = render_engine_execute_cpu_transition(dst, src_a, src_b, width, height,
+                                                      width * sizeof(uint32_t), &params);
+            assert(ok);
+            for (size_t p = 0; p < num_pixels; ++p) {
+                assert(dst[p] == src_b[p]);
+            }
+        }
+
+        params.progress = 1.0f;
+        memset(dst, 0, num_pixels * sizeof(uint32_t));
+        ok = render_engine_execute_cpu_transition(dst, src_a, src_b, width, height,
+                                                  width * sizeof(uint32_t), &params);
+        assert(ok);
+        for (size_t p = 0; p < num_pixels; ++p) {
+            assert(dst[p] == src_b[p]);
+        }
     }
 
     free(dst);

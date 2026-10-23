@@ -398,7 +398,12 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
 
     GLuint prog = 0;
     const gpu_program_uniforms_t *u = NULL;
-    select_transition_program(ctx, params->type, &prog, &u);
+    if (params->progress <= 0.0f || params->progress >= 1.0f) {
+        prog = ctx->prog_fade;
+        u = &ctx->unif_fade;
+    } else {
+        select_transition_program(ctx, params->type, &prog, &u);
+    }
 
     glUseProgram(prog);
 
@@ -624,7 +629,12 @@ bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_ol
 
     GLuint prog = 0;
     const gpu_program_uniforms_t *u = NULL;
-    select_transition_program(ctx, params->type, &prog, &u);
+    if (params->progress <= 0.0f || params->progress >= 1.0f) {
+        prog = ctx->prog_fade;
+        u = &ctx->unif_fade;
+    } else {
+        select_transition_program(ctx, params->type, &prog, &u);
+    }
 
     glUseProgram(prog);
 
