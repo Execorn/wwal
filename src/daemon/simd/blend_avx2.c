@@ -29,15 +29,7 @@ __attribute__((target("avx2"))) void blend_scanline_avx2(uint8_t *restrict dst,
 
         __m256i packed = _mm256_packus_epi16(r_lo, r_hi);
 
-        if (((uintptr_t)(dst + i) & 31) == 0) {
-            _mm256_stream_si256((__m256i *)(dst + i), packed);
-        } else {
-            _mm256_storeu_si256((__m256i *)(dst + i), packed);
-        }
-    }
-
-    if (i > 0) {
-        _mm_sfence();
+        _mm256_storeu_si256((__m256i *)(dst + i), packed);
     }
 
     if (i < num_bytes) {

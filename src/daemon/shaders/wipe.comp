@@ -24,7 +24,13 @@ void main() {
     float p = u_progress * (1.0 + 2.0 * edge) - edge;
     float alpha = smoothstep(d - edge, d + edge, p);
 
-    vec4 a = texture(u_src_a, uv);
-    vec4 b = texture(u_src_b, uv);
-    imageStore(u_target, coord, mix(a, b, alpha).bgra);
+    vec4 col;
+    if (alpha <= 0.0) {
+        col = texture(u_src_a, uv);
+    } else if (alpha >= 1.0) {
+        col = texture(u_src_b, uv);
+    } else {
+        col = mix(texture(u_src_a, uv), texture(u_src_b, uv), alpha);
+    }
+    imageStore(u_target, coord, col.bgra);
 }

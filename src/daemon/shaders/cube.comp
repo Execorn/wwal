@@ -1,12 +1,9 @@
 #version 310 es
-precision highp float;
-precision highp int;
-
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(binding = 0, rgba8) writeonly uniform highp image2D u_target;
-layout(binding = 1) uniform sampler2D u_src_a;
-layout(binding = 2) uniform sampler2D u_src_b;
+layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform highp sampler2D u_src_a;
+layout(binding = 2) uniform highp sampler2D u_src_b;
 
 uniform float u_progress;
 uniform ivec2 u_resolution;

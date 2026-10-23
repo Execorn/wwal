@@ -10,9 +10,9 @@ uniform ivec2 u_resolution;
 
 /* High-efficiency procedural noise generator */
 float hash21(vec2 p) {
-    p = fract(p * vec2(123.34, 456.21));
-    p += dot(p, p + 45.32);
-    return fract(p.x * p.y);
+    uvec2 q = uvec2(ivec2(p)) * uvec2(1597334677u, 3812015801u);
+    uint n = (q.x ^ q.y) * 1597334677u;
+    return float(n) * (1.0 / 4294967296.0);
 }
 
 float noise(vec2 uv) {
@@ -39,7 +39,13 @@ void main() {
     float p = u_progress * (1.0 + 2.0 * edge) - edge;
     float alpha = smoothstep(n - edge, n + edge, p);
 
-    vec4 a = texture(u_src_a, uv);
-    vec4 b = texture(u_src_b, uv);
-    imageStore(u_target, coord, mix(a, b, alpha).bgra);
+    vec4 col;
+    if (alpha <= 0.0) {
+        col = texture(u_src_a, uv);
+    } else if (alpha >= 1.0) {
+        col = texture(u_src_b, uv);
+    } else {
+        col = mix(texture(u_src_a, uv), texture(u_src_b, uv), alpha);
+    }
+    imageStore(u_target, coord, col.bgra);
 }

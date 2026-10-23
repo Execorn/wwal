@@ -11,24 +11,16 @@ uniform vec2  u_center;
 uniform float u_wave_amp; /* Zoom intensity & blur strength */
 
 const float PI = 3.14159265359;
-const int SAMPLES = 10;
+const float S_OFFSETS[3] = float[3](-0.4, 0.0, 0.4);
+const float S_WEIGHTS[3] = float[3](0.25, 0.50, 0.25);
 
-vec4 sample_radial_blur(highp sampler2D tex, vec2 uv, vec2 center, float zoom, float blur) {
+vec4 sample_radial_blur(highp sampler2D tex, vec2 base_uv, vec2 step_vec) {
     vec4 accum = vec4(0.0);
-    float total_weight = 0.0;
-    vec2 dir = uv - center;
-    vec2 base_uv = center + dir * zoom;
-
-    for (int i = 0; i < SAMPLES; ++i) {
-        float norm_step = float(i) / float(SAMPLES - 1);
-        float offset = (norm_step - 0.5) * blur;
-        vec2 sample_uv = clamp(base_uv + dir * offset, 0.0, 1.0);
-        float weight = 1.0 - abs(norm_step - 0.5) * 1.4;
-        accum += texture(tex, sample_uv) * weight;
-        total_weight += weight;
+    for (int i = 0; i < 3; ++i) {
+        vec2 sample_uv = clamp(base_uv + step_vec * S_OFFSETS[i], 0.0, 1.0);
+        accum += texture(tex, sample_uv) * S_WEIGHTS[i];
     }
-
-    return accum / total_weight;
+    return accum;
 }
 
 void main() {
@@ -46,9 +38,38 @@ void main() {
 
     float zoom_a = 1.0 - u_progress * strength;
     float zoom_b = 1.0 + (1.0 - u_progress) * strength;
+    vec2 dir = uv - center;
 
-    vec4 color_a = sample_radial_blur(u_src_a, uv, center, zoom_a, blur);
-    vec4 color_b = sample_radial_blur(u_src_b, uv, center, zoom_b, blur);
+    /* Single-tap zero-blur bypass when blur weight is negligible */
+    if (blur < 0.001) {
+        vec2 uv_a = clamp(center + dir * zoom_a, 0.0, 1.0);
+        vec2 uv_b = clamp(center + dir * zoom_b, 0.0, 1.0);
+        vec4 color_a = texture(u_src_a, uv_a);
+        vec4 color_b = texture(u_src_b, uv_b);
+        vec4 result = mix(color_a, color_b, u_progress);
+        float flash = peak * 0.25;
+        result.rgb += vec3(flash);
+        imageStore(u_target, coord, clamp(result, 0.0, 1.0).bgra);
+        return;
+    }
+
+    vec2 base_a = clamp(center + dir * zoom_a, 0.0, 1.0);
+    vec2 base_b = clamp(center + dir * zoom_b, 0.0, 1.0);
+    vec2 step_vec = dir * blur;
+
+    /* Center stationary bypass: zero radial blur near focus center */
+    if (dot(step_vec, step_vec) < 1e-5) {
+        vec4 color_a = texture(u_src_a, base_a);
+        vec4 color_b = texture(u_src_b, base_b);
+        vec4 result = mix(color_a, color_b, u_progress);
+        float flash = peak * 0.25;
+        result.rgb += vec3(flash);
+        imageStore(u_target, coord, clamp(result, 0.0, 1.0).bgra);
+        return;
+    }
+
+    vec4 color_a = sample_radial_blur(u_src_a, base_a, step_vec);
+    vec4 color_b = sample_radial_blur(u_src_b, base_b, step_vec);
 
     vec4 result = mix(color_a, color_b, u_progress);
 

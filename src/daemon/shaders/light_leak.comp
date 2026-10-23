@@ -1,12 +1,9 @@
 #version 310 es
-precision highp float;
-precision highp int;
-
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(binding = 0, rgba8) writeonly uniform highp image2D u_target;
-layout(binding = 1) uniform sampler2D u_src_a;
-layout(binding = 2) uniform sampler2D u_src_b;
+layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
+layout(binding = 1) uniform highp sampler2D u_src_a;
+layout(binding = 2) uniform highp sampler2D u_src_b;
 
 uniform float u_progress;
 uniform ivec2 u_resolution;
@@ -19,12 +16,16 @@ void main() {
 
     vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(u_resolution);
 
-    vec4 c1 = texture(u_src_a, uv);
-    vec4 c2 = texture(u_src_b, uv);
-
     // Smoothstep cross dissolve centered around midpoint
     float mix_factor = smoothstep(0.25, 0.75, u_progress);
-    vec4 col = mix(c1, c2, mix_factor);
+    vec4 col;
+    if (mix_factor <= 0.0) {
+        col = texture(u_src_a, uv);
+    } else if (mix_factor >= 1.0) {
+        col = texture(u_src_b, uv);
+    } else {
+        col = mix(texture(u_src_a, uv), texture(u_src_b, uv), mix_factor);
+    }
 
     // Anamorphic flare beam sweeps diagonally across frame
     float sweep = u_progress * 1.6 - 0.3;
