@@ -36,7 +36,8 @@ void main() {
     float n = noise(uv * 16.0);
 
     float edge = 0.05;
-    float alpha = smoothstep(n - edge, n + edge, u_progress);
+    float p = u_progress * (1.0 + 2.0 * edge) - edge;
+    float alpha = smoothstep(n - edge, n + edge, p);
 
     vec4 a = texture(u_src_a, uv);
     vec4 b = texture(u_src_b, uv);
