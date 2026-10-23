@@ -16,23 +16,35 @@ void main() {
     }
 
     vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    if (u_progress <= 0.0) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+    if (u_progress >= 1.0) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
+
     float aspect = float(u_resolution.x) / float(u_resolution.y);
     vec2 delta = uv - u_center;
     delta.x *= aspect;
 
-    float dist = length(delta);
+    float dist2 = dot(delta, delta);
     float max_dist = length(vec2(max(u_center.x, 1.0 - u_center.x) * aspect,
                                  max(u_center.y, 1.0 - u_center.y))) + 0.05;
     float edge = 0.03 * max_dist;
     float r = (1.0 - u_progress) * (max_dist + 2.0 * edge) - edge;
-    float alpha = smoothstep(r - edge, r + edge, dist);
+    float r_inner = r - edge;
+    float r_outer = r + edge;
 
     vec4 col;
-    if (alpha <= 0.0) {
+    if (r_inner > 0.0 && dist2 <= r_inner * r_inner) {
         col = texture(u_src_a, uv);
-    } else if (alpha >= 1.0) {
+    } else if (r_outer <= 0.0 || dist2 >= r_outer * r_outer) {
         col = texture(u_src_b, uv);
     } else {
+        float dist = sqrt(dist2);
+        float alpha = smoothstep(r_inner, r_outer, dist);
         col = mix(texture(u_src_a, uv), texture(u_src_b, uv), alpha);
     }
     imageStore(u_target, coord, col.bgra);

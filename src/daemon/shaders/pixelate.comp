@@ -14,6 +14,16 @@ void main() {
         return;
     }
 
+    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    if (u_progress <= 0.0) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+    if (u_progress >= 1.0) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
+
     // Dynamic mosaic tile scale, peaking at midpoint
     float d = sin(u_progress * 3.1415926535) * 64.0 + 1.0;
     vec2 quant_coord = (floor(vec2(coord) / d) * d + vec2(d * 0.5) + vec2(0.5)) / vec2(u_resolution);

@@ -55,6 +55,14 @@ void main() {
     }
 
     vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    if (u_progress <= 0.0) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+    if (u_progress >= 1.0) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
 
     float scale = (u_wave_freq > 0.0) ? u_wave_freq : 14.0;
     float flame_width = (u_wave_amp > 0.0) ? u_wave_amp : 0.08;

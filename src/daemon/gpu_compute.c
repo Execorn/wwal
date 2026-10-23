@@ -23,6 +23,14 @@ typedef struct {
     GLint loc_wave_freq;
     GLint loc_wave_amp;
     GLint loc_center;
+    float last_prog;
+    GLint last_w;
+    GLint last_h;
+    float last_angle;
+    float last_wave_freq;
+    float last_wave_amp;
+    float last_center_x;
+    float last_center_y;
 } gpu_program_uniforms_t;
 
 struct gpu_compute_ctx {
@@ -69,6 +77,11 @@ struct gpu_compute_ctx {
     gpu_program_uniforms_t unif_page_curl;
     gpu_program_uniforms_t unif_custom;
 
+    GLuint current_prog;
+    GLuint bound_target_tex;
+    GLuint bound_old_tex;
+    GLuint bound_new_tex;
+
     PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
     PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
@@ -88,6 +101,14 @@ static void query_program_uniforms(GLuint prog, gpu_program_uniforms_t *u)
     u->loc_wave_freq = glGetUniformLocation(prog, "u_wave_freq");
     u->loc_wave_amp = glGetUniformLocation(prog, "u_wave_amp");
     u->loc_center = glGetUniformLocation(prog, "u_center");
+    u->last_prog = -1.0f;
+    u->last_w = -1;
+    u->last_h = -1;
+    u->last_angle = -1e9f;
+    u->last_wave_freq = -1.0f;
+    u->last_wave_amp = -1.0f;
+    u->last_center_x = -1e9f;
+    u->last_center_y = -1e9f;
 }
 
 static GLuint compile_shader_program(const char *src, const char *name)
@@ -384,11 +405,14 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
 
     bo->egl_image = img;
     bo->gl_tex = tex;
+    ctx->bound_target_tex = 0;
+    ctx->bound_old_tex = 0;
+    ctx->bound_new_tex = 0;
     return true;
 }
 
 static void select_transition_program(gpu_compute_ctx_t *ctx, waywal_transition_type_t type,
-                                      GLuint *out_prog, const gpu_program_uniforms_t **out_u);
+                                      GLuint *out_prog, gpu_program_uniforms_t **out_u);
 
 bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target_bo,
                                      dmabuf_bo_t *old_bo, dmabuf_bo_t *new_bo,
@@ -404,7 +428,7 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
     }
 
     GLuint prog = 0;
-    const gpu_program_uniforms_t *u = NULL;
+    gpu_program_uniforms_t *u = NULL;
     if (params->progress <= 0.0f || params->progress >= 1.0f) {
         prog = ctx->prog_fade;
         u = &ctx->unif_fade;
@@ -412,33 +436,64 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         select_transition_program(ctx, params->type, &prog, &u);
     }
 
-    glUseProgram(prog);
+    if (ctx->current_prog != prog) {
+        glUseProgram(prog);
+        ctx->current_prog = prog;
+    }
 
     /* Bind target storage image to binding point 0 */
-    glBindImageTexture(0, target_bo->gl_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    if (ctx->bound_target_tex != target_bo->gl_tex) {
+        glBindImageTexture(0, target_bo->gl_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+        ctx->bound_target_tex = target_bo->gl_tex;
+    }
 
     /* Bind source textures */
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, old_bo->gl_tex);
+    if (ctx->bound_old_tex != old_bo->gl_tex) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, old_bo->gl_tex);
+        ctx->bound_old_tex = old_bo->gl_tex;
+    }
 
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, new_bo->gl_tex);
+    if (ctx->bound_new_tex != new_bo->gl_tex) {
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, new_bo->gl_tex);
+        ctx->bound_new_tex = new_bo->gl_tex;
+    }
 
     /* Set uniform parameters from cached locations (PERF-01) */
-    if (u->loc_prog >= 0)
+    if (u->loc_prog >= 0 && u->last_prog != params->progress) {
         glUniform1f(u->loc_prog, params->progress);
-    if (u->loc_res >= 0)
+        u->last_prog = params->progress;
+    }
+    if (u->loc_res >= 0 &&
+        (u->last_w != (GLint)target_bo->width || u->last_h != (GLint)target_bo->height)) {
         glUniform2i(u->loc_res, (GLint)target_bo->width, (GLint)target_bo->height);
-    if (u->loc_angle >= 0)
+        u->last_w = (GLint)target_bo->width;
+        u->last_h = (GLint)target_bo->height;
+    }
+    if (u->loc_angle >= 0 && u->last_angle != params->angle_rad) {
         glUniform1f(u->loc_angle, params->angle_rad);
+        u->last_angle = params->angle_rad;
+    }
     if (u->loc_wave_freq >= 0) {
-        glUniform1f(u->loc_wave_freq, params->wave_freq > 0.0f ? params->wave_freq : 20.0f);
+        float wf = params->wave_freq > 0.0f ? params->wave_freq : 20.0f;
+        if (u->last_wave_freq != wf) {
+            glUniform1f(u->loc_wave_freq, wf);
+            u->last_wave_freq = wf;
+        }
     }
     if (u->loc_wave_amp >= 0) {
-        glUniform1f(u->loc_wave_amp, params->wave_amp > 0.0f ? params->wave_amp : 0.05f);
+        float wa = params->wave_amp > 0.0f ? params->wave_amp : 0.05f;
+        if (u->last_wave_amp != wa) {
+            glUniform1f(u->loc_wave_amp, wa);
+            u->last_wave_amp = wa;
+        }
     }
-    if (u->loc_center >= 0) {
+    if (u->loc_center >= 0 &&
+        (u->last_center_x != params->center_x || u->last_center_y != params->center_y)) {
         glUniform2f(u->loc_center, params->center_x, params->center_y);
+        u->last_center_x = params->center_x;
+        u->last_center_y = params->center_y;
     }
 
     /* Dispatch compute shader (16x16 local workgroups) */
@@ -448,14 +503,15 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
 
     /* Targeted memory barrier ensuring GPU storage writes are visible */
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
-    
+
     if (ctx->eglCreateSyncKHR && ctx->eglClientWaitSyncKHR && ctx->eglDestroySyncKHR) {
         EGLSyncKHR sync = ctx->eglCreateSyncKHR(ctx->display, EGL_SYNC_FENCE_KHR, NULL);
-        glFlush();
         if (sync != EGL_NO_SYNC_KHR) {
-            ctx->eglClientWaitSyncKHR(ctx->display, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER_KHR);
+            ctx->eglClientWaitSyncKHR(ctx->display, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR,
+                                      EGL_FOREVER_KHR);
             ctx->eglDestroySyncKHR(ctx->display, sync);
         } else {
+            glFlush();
             glFinish();
         }
     } else {
@@ -466,10 +522,10 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
 }
 
 static void select_transition_program(gpu_compute_ctx_t *ctx, waywal_transition_type_t type,
-                                      GLuint *out_prog, const gpu_program_uniforms_t **out_u)
+                                      GLuint *out_prog, gpu_program_uniforms_t **out_u)
 {
     GLuint prog = ctx->prog_fade;
-    const gpu_program_uniforms_t *u = &ctx->unif_fade;
+    gpu_program_uniforms_t *u = &ctx->unif_fade;
     switch (type) {
     case WAYWAL_TRANSITION_WIPE:
         prog = ctx->prog_wipe;
@@ -621,6 +677,10 @@ bool gpu_compute_prepare_shm(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA,
                     GL_UNSIGNED_BYTE, new_pixels);
 
+    ctx->bound_target_tex = 0;
+    ctx->bound_old_tex = 0;
+    ctx->bound_new_tex = 0;
+
     return true;
 }
 
@@ -642,7 +702,7 @@ bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_ol
     }
 
     GLuint prog = 0;
-    const gpu_program_uniforms_t *u = NULL;
+    gpu_program_uniforms_t *u = NULL;
     if (params->progress <= 0.0f || params->progress >= 1.0f) {
         prog = ctx->prog_fade;
         u = &ctx->unif_fade;
@@ -651,6 +711,10 @@ bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_ol
     }
 
     glUseProgram(prog);
+    ctx->current_prog = 0;
+    ctx->bound_target_tex = 0;
+    ctx->bound_old_tex = 0;
+    ctx->bound_new_tex = 0;
 
     /* Bind target storage image */
     glBindImageTexture(0, tex_target, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
@@ -662,20 +726,33 @@ bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_ol
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, tex_new);
 
-    if (u->loc_prog >= 0)
+    if (u->loc_prog >= 0) {
         glUniform1f(u->loc_prog, params->progress);
-    if (u->loc_res >= 0)
+        u->last_prog = params->progress;
+    }
+    if (u->loc_res >= 0) {
         glUniform2i(u->loc_res, (GLint)width, (GLint)height);
-    if (u->loc_angle >= 0)
+        u->last_w = (GLint)width;
+        u->last_h = (GLint)height;
+    }
+    if (u->loc_angle >= 0) {
         glUniform1f(u->loc_angle, params->angle_rad);
+        u->last_angle = params->angle_rad;
+    }
     if (u->loc_wave_freq >= 0) {
-        glUniform1f(u->loc_wave_freq, params->wave_freq > 0.0f ? params->wave_freq : 20.0f);
+        float wf = params->wave_freq > 0.0f ? params->wave_freq : 20.0f;
+        glUniform1f(u->loc_wave_freq, wf);
+        u->last_wave_freq = wf;
     }
     if (u->loc_wave_amp >= 0) {
-        glUniform1f(u->loc_wave_amp, params->wave_amp > 0.0f ? params->wave_amp : 0.05f);
+        float wa = params->wave_amp > 0.0f ? params->wave_amp : 0.05f;
+        glUniform1f(u->loc_wave_amp, wa);
+        u->last_wave_amp = wa;
     }
     if (u->loc_center >= 0) {
         glUniform2f(u->loc_center, params->center_x, params->center_y);
+        u->last_center_x = params->center_x;
+        u->last_center_y = params->center_y;
     }
 
     struct timespec t_a, t_b, t_c;
@@ -730,6 +807,11 @@ void gpu_compute_release_shm_res(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint
     if (fbo && *fbo != 0) {
         glDeleteFramebuffers(1, fbo);
         *fbo = 0;
+    }
+    if (ctx) {
+        ctx->bound_target_tex = 0;
+        ctx->bound_old_tex = 0;
+        ctx->bound_new_tex = 0;
     }
 }
 
@@ -798,6 +880,9 @@ void gpu_compute_release_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
         glDeleteTextures(1, &bo->gl_tex);
         bo->gl_tex = 0;
     }
+    ctx->bound_target_tex = 0;
+    ctx->bound_old_tex = 0;
+    ctx->bound_new_tex = 0;
     if (bo->egl_image != NULL && ctx->eglDestroyImageKHR && ctx->display != EGL_NO_DISPLAY) {
         ctx->eglDestroyImageKHR(ctx->display, bo->egl_image);
         bo->egl_image = NULL;
@@ -815,6 +900,7 @@ bool gpu_compute_load_custom_shader(gpu_compute_ctx_t *ctx, const char *src)
         glDeleteProgram(ctx->prog_custom);
         ctx->prog_custom = 0;
     }
+    ctx->current_prog = 0;
 
     ctx->prog_custom = compile_shader_program(src, "custom_user_shader");
     if (!ctx->prog_custom) {

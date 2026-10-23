@@ -15,6 +15,14 @@ void main() {
     }
 
     vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(u_resolution);
+    if (u_progress <= 0.0) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+    if (u_progress >= 1.0) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
 
     // Smoothstep cross dissolve centered around midpoint
     float mix_factor = smoothstep(0.25, 0.75, u_progress);
@@ -29,15 +37,18 @@ void main() {
 
     // Anamorphic flare beam sweeps diagonally across frame
     float sweep = u_progress * 1.6 - 0.3;
-    float dist = abs(uv.x + uv.y * 0.25 - sweep);
-    float flare_beam = exp(-dist * dist * 32.0);
+    float d_beam = uv.x + uv.y * 0.25 - sweep;
+    float t_beam = max(0.0, 1.0 - (d_beam * d_beam) * 10.666667);
+    float flare_beam = t_beam * t_beam * t_beam;
 
     // Optical flare secondary orbs
-    vec2 orb1_center = vec2(sweep + 0.1, 0.4);
-    float orb1 = exp(-length(uv - orb1_center) * 6.0);
+    vec2 d1 = uv - vec2(sweep + 0.1, 0.4);
+    float t1 = max(0.0, 1.0 - dot(d1, d1) * 4.0);
+    float orb1 = t1 * t1 * t1;
 
-    vec2 orb2_center = vec2(sweep - 0.2, 0.7);
-    float orb2 = exp(-length(uv - orb2_center) * 8.0);
+    vec2 d2 = uv - vec2(sweep - 0.2, 0.7);
+    float t2 = max(0.0, 1.0 - dot(d2, d2) * 7.0);
+    float orb2 = t2 * t2 * t2;
 
     // Smooth envelope: 0 at start and end
     float envelope = sin(u_progress * 3.1415926535);

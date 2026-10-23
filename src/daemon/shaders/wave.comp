@@ -18,17 +18,36 @@ void main() {
     }
 
     vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
-    vec2 dir = vec2(cos(u_angle), sin(u_angle));
-    vec2 perp = vec2(-dir.y, dir.x);
+    if (u_progress <= 0.0) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+    if (u_progress >= 1.0) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
 
-    float proj = dot(uv - vec2(0.5), dir) / 1.41421356 + 0.5;
-    float cross_proj = dot(uv - vec2(0.5), perp);
-    float wave = sin(cross_proj * u_wave_freq) * u_wave_amp;
-    float d = proj + wave;
+    vec2 dir = vec2(cos(u_angle), sin(u_angle));
+    vec2 centered = uv - vec2(0.5);
+    float proj = dot(centered, dir) * 0.70710678 + 0.5;
 
     float edge = 0.04;
     float margin = u_wave_amp + edge;
     float p = u_progress * (1.0 + 2.0 * margin) - margin;
+
+    if (proj - p >= margin) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+    if (p - proj >= margin) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
+
+    vec2 perp = vec2(-dir.y, dir.x);
+    float cross_proj = dot(centered, perp);
+    float wave = sin(cross_proj * u_wave_freq) * u_wave_amp;
+    float d = proj + wave;
     float alpha = smoothstep(d - edge, d + edge, p);
 
     vec4 col;
