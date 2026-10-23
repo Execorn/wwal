@@ -47,3 +47,5 @@ contrib/pkg/
 
 # Internal AI-generated architecture documents
 CONTEXT.md
+AUDIT_REPORT.md
+.agents/

@@ -18,34 +18,51 @@ void main() {
     }
 
     vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    if (u_progress <= 0.0) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+    if (u_progress >= 1.0) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
+
     vec2 center = (u_center.x > 0.0 || u_center.y > 0.0) ? u_center : vec2(0.5);
 
     float aspect = float(u_resolution.x) / float(u_resolution.y);
-    vec2 delta = uv - center;
-    delta.x *= aspect;
-    float dist = length(delta);
+    vec2 raw_delta = uv - center;
+    vec2 delta = vec2(raw_delta.x * aspect, raw_delta.y);
+    float dist2 = dot(delta, delta);
 
     float max_dist = length(vec2(max(center.x, 1.0 - center.x) * aspect,
                                  max(center.y, 1.0 - center.y))) + 0.1;
 
     float current_radius = u_progress * max_dist;
-    float wave_width = 0.18;
+    const float wave_width = 0.18;
+    float r_in = current_radius - wave_width;
+    float r_out = current_radius + wave_width;
+
+    if (r_in > 0.0 && dist2 <= r_in * r_in) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
+    if (dist2 >= r_out * r_out) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+
+    float dist = sqrt(dist2);
     float freq = (u_wave_freq > 0.0) ? u_wave_freq : 32.0;
     float amp = (u_wave_amp > 0.0) ? u_wave_amp : 0.04;
 
     float diff = dist - current_radius;
     float decay = (1.0 - u_progress) * (1.0 - u_progress);
 
-    vec2 norm_dir = (dist > 0.0001) ? (delta / dist) : vec2(0.0);
-    norm_dir.x /= aspect; /* Restore UV aspect */
+    vec2 norm_dir = (dist > 0.0001) ? (raw_delta / dist) : vec2(0.0);
 
-    float wave = 0.0;
-    float crest = 0.0;
-    if (abs(diff) < wave_width) {
-        float window = smoothstep(wave_width, 0.0, abs(diff));
-        wave = sin(diff * freq) * amp * decay * window;
-        crest = max(0.0, -wave / amp) * decay * 0.22;
-    }
+    float window = smoothstep(wave_width, 0.0, abs(diff));
+    float wave = sin(diff * freq) * amp * decay * window;
+    float crest = max(0.0, -wave / amp) * decay * 0.22;
 
     vec2 refracted_uv = clamp(uv + norm_dir * wave, 0.0, 1.0);
 

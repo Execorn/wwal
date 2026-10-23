@@ -16,20 +16,30 @@ void main() {
     }
 
     vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(u_resolution);
+    if (u_progress <= 0.0) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+    if (u_progress >= 1.0) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
+
     vec2 center = (u_center.x > 0.0 || u_center.y > 0.0) ? u_center : vec2(0.5, 0.5);
 
     float aspect = float(u_resolution.x) / float(u_resolution.y);
     vec2 d = uv - center;
     d.x *= aspect;
 
-    float r = length(d);
-    float max_r = 0.85;
-
-    // Swirl angle peaks at progress midpoint
-    float angle_amt = sin(u_progress * 3.1415926535) * 8.0;
+    float r2 = dot(d, d);
+    const float max_r = 0.85;
+    const float max_r2 = 0.7225;
 
     vec2 uv_distorted = uv;
-    if (r < max_r) {
+    if (r2 < max_r2) {
+        float r = sqrt(r2);
+        // Swirl angle peaks at progress midpoint
+        float angle_amt = sin(u_progress * 3.1415926535) * 8.0;
         float factor = (1.0 - r / max_r);
         float theta = factor * factor * angle_amt;
         float cos_t = cos(theta);

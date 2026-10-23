@@ -15,22 +15,29 @@ void main() {
     }
 
     vec2 uv = (vec2(coord) + vec2(0.5)) / vec2(u_resolution);
+    if (u_progress <= 0.0) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+    if (u_progress >= 1.0) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
+
     vec2 p_ndc = (uv - 0.5) * 2.0;
 
     float theta = u_progress * 1.57079632679; // 0 to PI/2
     float zoom = 1.0 + 0.35 * sin(u_progress * 3.1415926535);
 
     // Camera setup: eye at (0, 0, -d_cam)
-    float d_cam = 2.5;
-    vec3 ro = vec3(0.0, 0.0, -d_cam);
-    vec3 rd = normalize(vec3(p_ndc.x * zoom, p_ndc.y * zoom, d_cam));
+    const float d_cam = 2.5;
+    vec3 rd = vec3(p_ndc * zoom, d_cam);
 
     // Cube center at (0, 0, 1). Transform ray to cube local space rotated by -theta
     float cos_t = cos(theta);
     float sin_t = sin(theta);
 
-    vec3 ro_rel = ro - vec3(0.0, 0.0, 1.0);
-    vec3 ro_cube = vec3(ro_rel.x * cos_t - ro_rel.z * sin_t, ro_rel.y, ro_rel.x * sin_t + ro_rel.z * cos_t);
+    vec3 ro_cube = vec3(3.5 * sin_t, 0.0, -3.5 * cos_t);
     vec3 rd_cube = vec3(rd.x * cos_t - rd.z * sin_t, rd.y, rd.x * sin_t + rd.z * cos_t);
 
     // Intersect Front face (old image): z_cube = -1.0

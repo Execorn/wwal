@@ -16,6 +16,15 @@ void main() {
     }
 
     vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    if (u_progress <= 0.0) {
+        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        return;
+    }
+    if (u_progress >= 1.0) {
+        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        return;
+    }
+
     vec2 dir = vec2(cos(u_angle), sin(u_angle));
     float proj = dot(uv - vec2(0.5), dir);
     float d = proj / 1.41421356 + 0.5;
