@@ -15,9 +15,14 @@ void main() {
     }
 
     vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
-    vec4 a = texture(u_src_a, uv);
-    vec4 b = texture(u_src_b, uv);
-    vec4 col = mix(a, b, u_progress);
+    vec4 col;
+    if (u_progress <= 0.0) {
+        col = texture(u_src_a, uv);
+    } else if (u_progress >= 1.0) {
+        col = texture(u_src_b, uv);
+    } else {
+        col = mix(texture(u_src_a, uv), texture(u_src_b, uv), u_progress);
+    }
 
     imageStore(u_target, coord, col.bgra);
 }

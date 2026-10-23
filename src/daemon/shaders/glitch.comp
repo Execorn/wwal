@@ -13,9 +13,16 @@ uniform float u_wave_amp;  /* Glitch & chromatic aberration intensity */
 const float PI = 3.14159265359;
 
 float hash12(vec2 p) {
-    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
+    uvec2 q = uvec2(ivec2(p)) * uvec2(1597334677u, 3812015801u);
+    uint n = (q.x ^ q.y) * 1597334677u;
+    return float(n) * (1.0 / 4294967296.0);
+}
+
+vec4 sample_glitch_color(highp sampler2D tex, vec2 uv_r, vec2 uv_g, vec2 uv_b, bool has_split) {
+    if (!has_split) {
+        return vec4(texture(tex, uv_g).rgb, 1.0);
+    }
+    return vec4(texture(tex, uv_r).r, texture(tex, uv_g).g, texture(tex, uv_b).b, 1.0);
 }
 
 void main() {
@@ -47,25 +54,22 @@ void main() {
     vec2 uv_g = clamp(uv + vec2(jitter, 0.0), 0.0, 1.0);
     vec2 uv_b = clamp(uv + vec2(jitter - split, 0.0), 0.0, 1.0);
 
-    /* Sample separated channels for outgoing image A */
-    vec4 col_a;
-    col_a.r = texture(u_src_a, uv_r).r;
-    col_a.g = texture(u_src_a, uv_g).g;
-    col_a.b = texture(u_src_a, uv_b).b;
-    col_a.a = 1.0;
-
-    /* Sample separated channels for incoming image B */
-    vec4 col_b;
-    col_b.r = texture(u_src_b, uv_r).r;
-    col_b.g = texture(u_src_b, uv_g).g;
-    col_b.b = texture(u_src_b, uv_b).b;
-    col_b.a = 1.0;
-
-    /* Digital block artifact threshold */
+    /* Digital block artifact threshold evaluated upfront */
     float block_h = hash12(floor(uv * vec2(24.0, 14.0)) + step_t);
     float glitch_progress = u_progress + (block_h - 0.5) * peak * 0.35;
     float mix_val = smoothstep(0.46, 0.54, glitch_progress);
 
-    vec4 result = mix(col_a, col_b, mix_val);
+    bool has_split = (split >= 0.0005);
+    vec4 result;
+    if (mix_val <= 0.0) {
+        result = sample_glitch_color(u_src_a, uv_r, uv_g, uv_b, has_split);
+    } else if (mix_val >= 1.0) {
+        result = sample_glitch_color(u_src_b, uv_r, uv_g, uv_b, has_split);
+    } else {
+        vec4 col_a = sample_glitch_color(u_src_a, uv_r, uv_g, uv_b, has_split);
+        vec4 col_b = sample_glitch_color(u_src_b, uv_r, uv_g, uv_b, has_split);
+        result = mix(col_a, col_b, mix_val);
+    }
+
     imageStore(u_target, coord, result.bgra);
 }

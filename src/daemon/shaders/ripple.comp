@@ -49,12 +49,18 @@ void main() {
 
     vec2 refracted_uv = clamp(uv + norm_dir * wave, 0.0, 1.0);
 
-    vec4 color_a = texture(u_src_a, refracted_uv);
-    vec4 color_b = texture(u_src_b, refracted_uv);
-
     /* Reveal incoming image inside the expanding shockwave */
     float split = smoothstep(current_radius - 0.02, current_radius + 0.02, dist);
-    vec4 result = mix(color_b, color_a, split);
+    vec4 result;
+    if (split <= 0.0) {
+        result = texture(u_src_b, refracted_uv);
+    } else if (split >= 1.0) {
+        result = texture(u_src_a, refracted_uv);
+    } else {
+        vec4 color_a = texture(u_src_a, refracted_uv);
+        vec4 color_b = texture(u_src_b, refracted_uv);
+        result = mix(color_b, color_a, split);
+    }
 
     /* Specular water shimmer on wave crest */
     result.rgb += vec3(crest);

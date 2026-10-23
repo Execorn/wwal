@@ -362,3 +362,39 @@ test('integration', find_program('tests/integration_test.sh'),
   depends: [wwald, wwal],
   timeout: 120
 )
+
+# E2E Test Suite (Tiers 1-4)
+test_e2e_sources = files(
+  'tests/e2e/test_e2e_runner.c',
+  'tests/e2e/tier1_features.c',
+  'tests/e2e/tier2_boundaries.c',
+  'tests/e2e/tier3_combinations.c',
+  'tests/e2e/tier4_workloads.c',
+  'src/daemon/render_engine.c',
+  'src/daemon/gpu_compute.c',
+  'src/daemon/dmabuf_alloc.c',
+  'src/daemon/dmabuf_feedback.c',
+  'src/daemon/simd/simd_blend.c',
+  'src/daemon/simd/blend_scalar.c',
+  'src/daemon/simd/blend_avx2.c',
+  'src/daemon/simd/blend_avx512.c',
+  'src/daemon/simd/blend_neon.c',
+)
+
+test_e2e_exe = executable('test_e2e',
+  test_e2e_sources,
+  include_directories: inc_dir,
+  dependencies: [
+    common_dep,
+    proto_dep,
+    wayland_client_dep,
+    libdrm_dep,
+    gbm_dep,
+    egl_dep,
+    glesv2_dep,
+    threads_dep,
+    m_dep
+  ] + (openmp_dep.found() ? [openmp_dep] : [])
+)
+
+test('e2e', test_e2e_exe, timeout: 180)

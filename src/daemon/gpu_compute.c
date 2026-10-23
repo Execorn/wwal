@@ -72,6 +72,7 @@ struct gpu_compute_ctx {
     PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
     PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
+    PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC glEGLImageTargetTexStorageEXT;
     PFNEGLCREATESYNCKHRPROC eglCreateSyncKHR;
     PFNEGLDESTROYSYNCKHRPROC eglDestroySyncKHR;
     PFNEGLCLIENTWAITSYNCKHRPROC eglClientWaitSyncKHR;
@@ -205,6 +206,8 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
     ctx->eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
     ctx->glEGLImageTargetTexture2DOES =
         (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    ctx->glEGLImageTargetTexStorageEXT =
+        (PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC)eglGetProcAddress("glEGLImageTargetTexStorageEXT");
 
     if (!ctx->eglCreateImageKHR || !ctx->eglDestroyImageKHR || !ctx->glEGLImageTargetTexture2DOES) {
         WAYWAL_LOG_WARN("Missing required EGLImage extension entry points");
@@ -369,7 +372,11 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    ctx->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
+    if (ctx->glEGLImageTargetTexStorageEXT) {
+        ctx->glEGLImageTargetTexStorageEXT(GL_TEXTURE_2D, (GLeglImageOES)img, NULL);
+    } else {
+        ctx->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
+    }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -585,6 +592,13 @@ bool gpu_compute_prepare_shm(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)width, (GLsizei)height);
+        }
+
+        /* WL_SHM ARGB8888 in little-endian memory is [B, G, R, A]; swizzle sampler channels to present R, G, B, A to compute shaders. */
+        for (int i = 0; i < 2; ++i) {
+            glBindTexture(GL_TEXTURE_2D, texs[i]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
         }
 
         GLuint my_fbo = 0;

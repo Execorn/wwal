@@ -22,13 +22,18 @@ void main() {
 
     float dist = length(delta);
     float max_dist = length(vec2(max(u_center.x, 1.0 - u_center.x) * aspect,
-                                 max(u_center.y, 1.0 - u_center.y)));
-    float r = (1.0 - u_progress) * (max_dist + 0.05);
-
-    float edge = 0.03 * (max_dist + 0.05);
+                                 max(u_center.y, 1.0 - u_center.y))) + 0.05;
+    float edge = 0.03 * max_dist;
+    float r = (1.0 - u_progress) * (max_dist + 2.0 * edge) - edge;
     float alpha = smoothstep(r - edge, r + edge, dist);
 
-    vec4 a = texture(u_src_a, uv);
-    vec4 b = texture(u_src_b, uv);
-    imageStore(u_target, coord, mix(a, b, alpha).bgra);
+    vec4 col;
+    if (alpha <= 0.0) {
+        col = texture(u_src_a, uv);
+    } else if (alpha >= 1.0) {
+        col = texture(u_src_b, uv);
+    } else {
+        col = mix(texture(u_src_a, uv), texture(u_src_b, uv), alpha);
+    }
+    imageStore(u_target, coord, col.bgra);
 }
