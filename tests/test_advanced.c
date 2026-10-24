@@ -449,6 +449,31 @@ static void test_jit_transcode_support(void)
 
     unlink(gif_path);
 
+    /* 4b. video_transcode_optimize passthrough & bounded transcode tests */
+    assert(!video_transcode_optimize(NULL, 1920, 1080, out_path2, sizeof(out_path2)));
+    assert(!video_transcode_optimize("/tmp/test_dummy.mp4", 1920, 1080, NULL, sizeof(out_path2)));
+    assert(!video_transcode_optimize("/tmp/test_dummy.mp4", 1920, 1080, out_path2, 0));
+
+    const char *test_mp4 = "../tests/test_video.mp4";
+    struct stat mp4_st;
+    if (stat(test_mp4, &mp4_st) != 0)
+        test_mp4 = "tests/test_video.mp4";
+    if (stat(test_mp4, &mp4_st) == 0) {
+        /* 640x480 clip should pass through unchanged when max_width=2560, max_height=1440 */
+        char passthrough_out[4096];
+        assert(video_transcode_optimize(test_mp4, 2560, 1440, passthrough_out,
+                                        sizeof(passthrough_out)));
+        assert(strcmp(passthrough_out, test_mp4) == 0);
+
+        /* When max_width=320, max_height=240, 640x480 clip should be transcoded & cached */
+        char scaled_out1[4096];
+        char scaled_out2[4096];
+        assert(video_transcode_optimize(test_mp4, 320, 240, scaled_out1, sizeof(scaled_out1)));
+        assert(strstr(scaled_out1, "/wwal/transcoded/") != NULL);
+        assert(video_transcode_optimize(test_mp4, 320, 240, scaled_out2, sizeof(scaled_out2)));
+        assert(strcmp(scaled_out1, scaled_out2) == 0);
+    }
+
     /* 5. CLI --animate flag and automatic route to CLI_CMD_VIDEO */
     char *argv_anim[] = {"wwal", "img", (char *)out_path1, "--animate"};
     cli_options_t opts;

@@ -3,9 +3,14 @@
 #include "waywal/vaapi_dec.h"
 #include "waywal/video_engine.h"
 
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl31.h>
+#include <GLES2/gl2ext.h>
 #include <assert.h>
 #include <drm/drm_fourcc.h>
 #include <fcntl.h>
+#include <gbm.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -598,7 +603,175 @@ static void test_vaapi_decoder_and_prime_export(void)
            prime_frame.drm_format, dec.dpb.count);
 
     vaapi_prime_frame_close(&prime_frame);
+
+    if (dec.has_vpp) {
+        assert(dec.num_vpp_surfaces == WAYWAL_VA_VPP_POOL_SIZE);
+        bool vpp_ok = vaapi_decoder_vpp_blit(&dec, surf_p, dec.vpp_surfaces[0]);
+        assert(vpp_ok);
+        vaapi_prime_frame_t vpp_prime;
+        assert(vaapi_decoder_export_prime(&dec, dec.vpp_surfaces[0], &vpp_prime));
+        assert(vpp_prime.num_planes == 1);
+        assert(vpp_prime.fds[0] >= 0);
+        assert(vpp_prime.drm_format == DRM_FORMAT_ARGB8888 ||
+               vpp_prime.drm_format == DRM_FORMAT_XRGB8888);
+        assert(vpp_prime.width == 1920);
+        assert(vpp_prime.height == 1080);
+        vaapi_prime_frame_close(&vpp_prime);
+    }
+
     vaapi_decoder_destroy(&dec);
+
+    /* Test dynamic surface pool sizing + direct NV12 mode with real MP4 extradata */
+    demuxer_t *real_demux = demuxer_open_file("../tests/test_video.mp4");
+    if (!real_demux)
+        real_demux = demuxer_open_file("tests/test_video.mp4");
+    if (real_demux) {
+        vaapi_decoder_t vpp_dec;
+        bool vpp_init_ok = vaapi_decoder_init_with_params(
+            &vpp_dec, -1, real_demux->codec, real_demux->width, real_demux->height,
+            real_demux->extradata, real_demux->extradata_size, false);
+        assert(vpp_init_ok);
+        assert(vpp_dec.has_vpp);
+        demux_packet_t vpp_pkt;
+        if (real_demux->read_packet(real_demux, &vpp_pkt)) {
+            VASurfaceID dec_surf = VA_INVALID_SURFACE;
+            assert(vaapi_decoder_decode_packet(&vpp_dec, &vpp_pkt, &dec_surf));
+            assert(vaapi_decoder_vpp_blit(&vpp_dec, dec_surf, vpp_dec.vpp_surfaces[0]));
+
+            vaapi_prime_frame_t vpp_prime;
+            assert(vaapi_decoder_export_prime(&vpp_dec, vpp_dec.vpp_surfaces[0], &vpp_prime));
+            printf("  Real MP4 VPP PRIME: fmt=0x%08x planes=%u stride=%u mod=0x%016lx %ux%u\n",
+                   vpp_prime.drm_format, vpp_prime.num_planes, vpp_prime.strides[0],
+                   (unsigned long)vpp_prime.modifiers[0], vpp_prime.width, vpp_prime.height);
+
+            struct gbm_device *gbm = gbm_create_device(vpp_dec.drm_fd);
+            PFNEGLGETPLATFORMDISPLAYEXTPROC get_dpy =
+                (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+            EGLDisplay edpy = get_dpy(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+            EGLint maj = 0, min = 0;
+            assert(eglInitialize(edpy, &maj, &min));
+            assert(eglBindAPI(EGL_OPENGL_ES_API));
+            const EGLint ctx_attr[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE};
+            EGLContext ectx = eglCreateContext(edpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, ctx_attr);
+            assert(ectx != EGL_NO_CONTEXT);
+            assert(eglMakeCurrent(edpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ectx));
+
+            PFNEGLCREATEIMAGEKHRPROC create_img =
+                (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+            PFNEGLDESTROYIMAGEKHRPROC destroy_img =
+                (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+            PFNGLEGLIMAGETARGETTEXTURE2DOESPROC img_tex =
+                (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+
+            EGLint img_attrs[] = {
+                EGL_WIDTH, (EGLint)vpp_prime.width,
+                EGL_HEIGHT, (EGLint)vpp_prime.height,
+                EGL_LINUX_DRM_FOURCC_EXT, (EGLint)vpp_prime.drm_format,
+                EGL_DMA_BUF_PLANE0_FD_EXT, vpp_prime.fds[0],
+                EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)vpp_prime.offsets[0],
+                EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)vpp_prime.strides[0],
+                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(vpp_prime.modifiers[0] & 0xFFFFFFFF),
+                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(vpp_prime.modifiers[0] >> 32),
+                EGL_NONE
+            };
+            EGLImageKHR eimg = create_img(edpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
+            assert(eimg != EGL_NO_IMAGE_KHR);
+
+            GLuint tex = 0, fbo = 0;
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            img_tex(GL_TEXTURE_2D, eimg);
+            glGenFramebuffers(1, &fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+            GLenum fb_st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            printf("  FBO status: 0x%x (COMPLETE=0x%x)\n", fb_st, GL_FRAMEBUFFER_COMPLETE);
+
+            uint8_t *rgba = calloc((size_t)vpp_prime.width * vpp_prime.height, 4);
+            assert(rgba != NULL);
+            glReadPixels(0, 0, (GLsizei)vpp_prime.width, (GLsizei)vpp_prime.height, GL_RGBA,
+                         GL_UNSIGNED_BYTE, rgba);
+            const struct {
+                int x;
+                uint8_t r, g, b;
+            } expected_bars[8] = {
+                {40, 0, 0, 0},       /* Black */
+                {120, 0, 255, 255},  /* Cyan */
+                {200, 254, 0, 253},  /* Magenta */
+                {280, 0, 0, 254},    /* Blue */
+                {360, 253, 253, 0},  /* Yellow */
+                {440, 0, 255, 0},    /* Green */
+                {520, 253, 0, 0},    /* Red */
+                {600, 255, 255, 255} /* White */
+            };
+            printf("  VPP GL_TEXTURE_2D @ y=120: ");
+            for (int k = 0; k < 8; ++k) {
+                int x = expected_bars[k].x;
+                size_t idx = ((size_t)120 * vpp_prime.width + (size_t)x) * 4;
+                uint8_t r = rgba[idx], g = rgba[idx + 1], b = rgba[idx + 2], a = rgba[idx + 3];
+                printf("(%d: R=%u G=%u B=%u A=%u) ", x, r, g, b, a);
+                assert(abs((int)r - (int)expected_bars[k].r) <= 10);
+                assert(abs((int)g - (int)expected_bars[k].g) <= 10);
+                assert(abs((int)b - (int)expected_bars[k].b) <= 10);
+                assert(a == 255);
+            }
+            printf("\n");
+            free(rgba);
+
+            glDeleteFramebuffers(1, &fbo);
+            glDeleteTextures(1, &tex);
+            destroy_img(edpy, eimg);
+            eglMakeCurrent(edpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            eglDestroyContext(edpy, ectx);
+            eglTerminate(edpy);
+            gbm_device_destroy(gbm);
+            vaapi_prime_frame_close(&vpp_prime);
+        }
+        vaapi_decoder_destroy(&vpp_dec);
+        real_demux->seek_us(real_demux, 0);
+
+        vaapi_decoder_t opt_dec;
+        bool opt_ok = vaapi_decoder_init_with_params(
+            &opt_dec, -1, real_demux->codec, real_demux->width, real_demux->height,
+            real_demux->extradata, real_demux->extradata_size, true);
+        assert(opt_ok);
+        assert(opt_dec.initialized);
+        assert(!opt_dec.has_vpp);
+        assert(opt_dec.iq_valid);
+        assert(opt_dec.num_surfaces >= 4 && opt_dec.num_surfaces <= WAYWAL_VA_SURFACE_POOL_SIZE);
+
+        demux_packet_t real_pkt;
+        if (real_demux->read_packet(real_demux, &real_pkt)) {
+            VASurfaceID real_surf = VA_INVALID_SURFACE;
+            assert(vaapi_decoder_decode_packet(&opt_dec, &real_pkt, &real_surf));
+            assert(real_surf != VA_INVALID_SURFACE);
+
+            vaapi_prime_frame_t nv12_frame;
+            assert(vaapi_decoder_export_prime(&opt_dec, real_surf, &nv12_frame));
+            assert(nv12_frame.drm_format == DRM_FORMAT_NV12);
+            assert(nv12_frame.num_planes >= 1);
+            vaapi_prime_frame_close(&nv12_frame);
+        }
+        vaapi_decoder_destroy(&opt_dec);
+
+        /* Stress rapid back-to-back VA-API context init + decode + destroy cycles */
+        for (int cycle = 0; cycle < 4; ++cycle) {
+            real_demux->seek_us(real_demux, 0);
+            vaapi_decoder_t cyc_dec;
+            assert(vaapi_decoder_init_with_params(
+                &cyc_dec, -1, real_demux->codec, real_demux->width, real_demux->height,
+                real_demux->extradata, real_demux->extradata_size, true));
+            if (real_demux->read_packet(real_demux, &real_pkt)) {
+                VASurfaceID cyc_surf = VA_INVALID_SURFACE;
+                assert(vaapi_decoder_decode_packet(&cyc_dec, &real_pkt, &cyc_surf));
+                assert(cyc_surf != VA_INVALID_SURFACE);
+            }
+            vaapi_decoder_destroy(&cyc_dec);
+        }
+
+        real_demux->destroy(real_demux);
+    }
+
     printf("[TEST] test_vaapi_decoder_and_prime_export PASSED.\n");
 }
 

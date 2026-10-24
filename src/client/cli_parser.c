@@ -499,13 +499,6 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
         }
     } else if (strcmp(cmd_str, "video") == 0) {
         opts->cmd = CLI_CMD_VIDEO;
-        if (optind >= argc) {
-            fprintf(stderr, "Error: 'video' command requires a path to a video file\n");
-            return false;
-        }
-        strncpy(opts->filepath, argv[optind++], sizeof(opts->filepath) - 1);
-        opts->filepath[sizeof(opts->filepath) - 1] = '\0';
-
         while (optind < argc) {
             const char *arg = argv[optind];
             if (strcmp(arg, "--loop") == 0 && optind + 1 < argc) {
@@ -518,11 +511,18 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
                        optind + 1 < argc) {
                 optind++;
                 add_output_target(opts, argv[optind]);
+            } else if (arg[0] != '-' && opts->filepath[0] == '\0') {
+                strncpy(opts->filepath, arg, sizeof(opts->filepath) - 1);
+                opts->filepath[sizeof(opts->filepath) - 1] = '\0';
             } else {
                 fprintf(stderr, "Error: Unknown video option '%s'\n", arg);
                 return false;
             }
             optind++;
+        }
+        if (opts->filepath[0] == '\0') {
+            fprintf(stderr, "Error: 'video' command requires a path to a video file\n");
+            return false;
         }
     } else if (strcmp(cmd_str, "pause") == 0) {
         opts->cmd = CLI_CMD_PAUSE;

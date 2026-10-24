@@ -313,6 +313,8 @@ bool daemon_wayland_init(daemon_state_t *state)
                 bool     saved_10   = state->dmabuf_ctx.has_10bit;
                 uint32_t saved_f10  = state->dmabuf_ctx.format_10bit;
                 uint64_t saved_m10  = state->dmabuf_ctx.modifier_10bit;
+                bool     saved_nv12 = state->dmabuf_ctx.has_nv12;
+                bool     saved_p010 = state->dmabuf_ctx.has_p010;
 
                 /* Destroy old GBM only (not protocol objects) */
                 if (state->dmabuf_ctx.gbm)
@@ -332,7 +334,7 @@ bool daemon_wayland_init(daemon_state_t *state)
                         WAYWAL_LOG_INFO("GBM reinitialized on compositor device %u:%u",
                                         (unsigned)major(saved_dev), (unsigned)minor(saved_dev));
                     } else {
-                        WAYWAL_LOG_WARN("gbm_create_device failed on compositor node — staying on fallback");
+                        WAYWAL_LOG_WARN("gbm_create_device failed on compositor node, staying on fallback");
                         close(new_fd);
                     }
                 } else {
@@ -349,10 +351,21 @@ bool daemon_wayland_init(daemon_state_t *state)
                 state->dmabuf_ctx.has_10bit            = saved_10;
                 state->dmabuf_ctx.format_10bit         = saved_f10;
                 state->dmabuf_ctx.modifier_10bit       = saved_m10;
+                state->dmabuf_ctx.has_nv12             = saved_nv12;
+                state->dmabuf_ctx.has_p010             = saved_p010;
                 state->dmabuf_ctx.available            = (state->dmabuf_ctx.gbm != NULL);
                 state->dmabuf_ctx.map_supported        = dmabuf_probe_map_support(&state->dmabuf_ctx);
             }
         }
+    }
+
+    if (state->dmabuf_ctx.gbm && !state->dmabuf_ctx.map_supported) {
+        WAYWAL_LOG_INFO(
+            "GBM bo_map unsupported on this driver; releasing unused GBM device (keeping drm_fd=%d for VA-API)",
+            state->dmabuf_ctx.drm_fd);
+        gbm_device_destroy(state->dmabuf_ctx.gbm);
+        state->dmabuf_ctx.gbm = NULL;
+        state->dmabuf_ctx.available = false;
     }
 
     /* Initialize GPU Compute & SIMD render engine */

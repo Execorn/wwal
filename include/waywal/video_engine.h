@@ -20,6 +20,17 @@ typedef enum {
 struct daemon_state;
 struct output_node;
 
+#define WAYWAL_VIDEO_REORDER_CAP 6
+
+typedef struct {
+    VASurfaceID surface;
+    uint32_t surf_idx;
+    int64_t pts_us;
+    int32_t poc;
+    uint64_t gop_id;
+    uint64_t loop_id;
+} video_reorder_entry_t;
+
 typedef struct {
     waywal_video_state_t state;
     demuxer_t *demuxer;
@@ -27,11 +38,25 @@ typedef struct {
     int timer_fd; /* timerfd for frame pacing */
     int64_t start_time_us;
     int64_t last_pts_us;
+    int64_t playback_epoch_ns;
+    uint64_t presented_loop_id;
     uint64_t loop_count; /* 0 = infinite loop */
     uint64_t current_loop;
     float playback_speed; /* default 1.0f */
 
-    struct output_node *target_output; /* NULL = all outputs */
+    video_reorder_entry_t reorder_buf[WAYWAL_VIDEO_REORDER_CAP];
+    uint32_t reorder_count;
+    uint64_t current_gop_id;
+    uint64_t next_present_gop;
+    int32_t next_present_poc;
+    bool has_decoded_any;
+    struct wl_buffer *video_wl_buffers[WAYWAL_VA_SURFACE_POOL_SIZE];
+    bool video_buffer_in_use[WAYWAL_VA_SURFACE_POOL_SIZE];
+    bool combined_busy_mask[WAYWAL_VA_SURFACE_POOL_SIZE];
+    uint32_t last_vpp_idx;
+
+    struct output_node *target_output; /* NULL = all or filtered outputs */
+    bool has_target_filter;
     struct daemon_state *daemon_state;
 
     bool seamless_looping;

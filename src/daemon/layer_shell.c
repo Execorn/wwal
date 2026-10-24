@@ -28,8 +28,10 @@ static void shm_buffer_release(void *data, struct wl_buffer *wl_buffer)
     for (int i = 0; i < 2; ++i) {
         if (node->shm_buffers[i] == wl_buffer) {
             node->shm_buffer_released[i] = true;
-            if (!node->transition_active && i != node->active_buffer_idx && node->shm_data &&
-                node->width > 0 && node->height > 0) {
+            bool video_playing =
+                node->state && node->state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED;
+            if (!node->transition_active && (i != node->active_buffer_idx || video_playing) &&
+                node->shm_data && node->width > 0 && node->height > 0) {
                 size_t frame_sz = (size_t)node->width * (size_t)node->height * sizeof(uint32_t);
                 void *inactive_ptr = (uint8_t *)node->shm_data + (size_t)i * frame_sz;
                 madvise(inactive_ptr, frame_sz, MADV_REMOVE);
@@ -55,6 +57,7 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
     if (height > 0)
         node->height = (int32_t)height;
     node->configured = true;
+    node->vp_configured = false;
 
     WAYWAL_LOG_DEBUG("Output %s (%s) configured: %dx%d", node->name, node->description, node->width,
                      node->height);
@@ -115,6 +118,13 @@ void output_node_create_surface(daemon_state_t *state, output_node_t *node)
     wl_surface_set_input_region(node->surface, empty_region);
     wl_region_destroy(empty_region);
 
+    struct wl_region *opaque_region = wl_compositor_create_region(state->compositor);
+    if (opaque_region) {
+        wl_region_add(opaque_region, 0, 0, INT32_MAX, INT32_MAX);
+        wl_surface_set_opaque_region(node->surface, opaque_region);
+        wl_region_destroy(opaque_region);
+    }
+
     zwlr_layer_surface_v1_add_listener(node->layer_surface, &layer_surface_listener, node);
 
     if (state->viewporter) {
@@ -143,14 +153,7 @@ void output_node_destroy_surface(output_node_t *node)
 {
     if (!node)
         return;
-
-    for (uint32_t i = 0; i < WAYWAL_VA_SURFACE_POOL_SIZE; ++i) {
-        if (node->video_wl_buffers[i]) {
-            wl_buffer_destroy(node->video_wl_buffers[i]);
-            node->video_wl_buffers[i] = NULL;
-            node->video_buffer_in_use[i] = false;
-        }
-    }
+    node->vp_configured = false;
 
     if (node->shm_old_data) {
         free(node->shm_old_data);
@@ -459,6 +462,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                     wp_viewport_set_source(node->viewport, wl_fixed_from_int(-1),
                                            wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                            wl_fixed_from_int(-1));
+                    node->vp_configured = false;
                 }
                 wl_surface_attach(node->surface, bo->wl_buffer, 0, 0);
                 wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
@@ -490,6 +494,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
         wp_viewport_set_destination(node->viewport, node->width, node->height);
         wp_viewport_set_source(node->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+        node->vp_configured = false;
     }
 
     wl_surface_attach(node->surface, node->shm_buffers[back_idx], 0, 0);
@@ -708,6 +713,7 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
         wp_viewport_set_destination(node->viewport, node->width, node->height);
         wp_viewport_set_source(node->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+        node->vp_configured = false;
     }
 
     /* Preferred path: Hardware Direct Scanout & Plane Scaling */
@@ -911,6 +917,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
             wp_viewport_set_destination(out->viewport, out->width, out->height);
             wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                    wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+            out->vp_configured = false;
         }
 
         bool dmabuf_ok = false;
