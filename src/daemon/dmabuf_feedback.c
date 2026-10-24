@@ -98,6 +98,7 @@ static void feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedbac
     const uint16_t *idx_ptr = (const uint16_t *)indices->data;
     size_t count = indices->size / sizeof(uint16_t);
 
+    bool locked_scanout_rgb = false;
     for (size_t i = 0; i < count; ++i) {
         uint16_t idx = idx_ptr[i];
         if (idx < g_fb_state.num_entries) {
@@ -105,15 +106,16 @@ static void feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedbac
             uint64_t mod = g_fb_state.table[idx].modifier;
 
             if (fmt == DRM_FORMAT_ARGB8888 || fmt == DRM_FORMAT_XRGB8888) {
-                if (ctx->preferred_modifier == DRM_FORMAT_MOD_INVALID ||
-                    g_fb_state.is_scanout_tranche) {
+                if (!locked_scanout_rgb &&
+                    (ctx->preferred_modifier == DRM_FORMAT_MOD_INVALID ||
+                     g_fb_state.is_scanout_tranche)) {
                     ctx->preferred_modifier = mod;
                     ctx->preferred_format = fmt;
                     WAYWAL_LOG_INFO(
                         "Negotiated optimal DMA-BUF scanout modifier: 0x%016lx (format: 0x%08x)",
                         (unsigned long)mod, fmt);
                     if (g_fb_state.is_scanout_tranche) {
-                        break;
+                        locked_scanout_rgb = true;
                     }
                 }
             } else if (fmt == DRM_FORMAT_XRGB2101010 || fmt == DRM_FORMAT_ARGB2101010 ||
@@ -125,6 +127,20 @@ static void feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedbac
                     WAYWAL_LOG_INFO("Detected 10-bit wide gamut scanout capability: 0x%08x "
                                     "(modifier: 0x%016lx)",
                                     fmt, (unsigned long)mod);
+                }
+            } else if (fmt == DRM_FORMAT_NV12) {
+                if (!ctx->has_nv12) {
+                    ctx->has_nv12 = true;
+                    WAYWAL_LOG_INFO("Detected direct NV12 YUV420 DMA-BUF support "
+                                    "(modifier: 0x%016lx)",
+                                    (unsigned long)mod);
+                }
+            } else if (fmt == DRM_FORMAT_P010) {
+                if (!ctx->has_p010) {
+                    ctx->has_p010 = true;
+                    WAYWAL_LOG_INFO("Detected direct P010 10-bit YUV420 DMA-BUF support "
+                                    "(modifier: 0x%016lx)",
+                                    (unsigned long)mod);
                 }
             }
         }

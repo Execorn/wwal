@@ -48,6 +48,8 @@ typedef struct dmabuf_context {
     bool has_10bit;
     uint32_t format_10bit;
     uint64_t modifier_10bit;
+    bool has_nv12;
+    bool has_p010;
     /* Compositor main device (from zwp_linux_dmabuf_feedback_v1::main_device) */
     dev_t compositor_dev;
     bool has_compositor_dev;

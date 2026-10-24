@@ -83,9 +83,14 @@ struct output_node {
     double cursor_y;
     bool has_cursor;
 
-    /* Persistent Video Buffers Pool */
-    struct wl_buffer *video_wl_buffers[WAYWAL_VA_SURFACE_POOL_SIZE];
-    bool video_buffer_in_use[WAYWAL_VA_SURFACE_POOL_SIZE];
+    /* Cached wp_viewport state to avoid redundant Wayland requests per frame */
+    int32_t vp_dst_w;
+    int32_t vp_dst_h;
+    uint32_t vp_src_w;
+    uint32_t vp_src_h;
+    uint32_t vp_scaling_mode;
+    bool vp_configured;
+    bool video_targeted;
 
     uint32_t scaling_mode; /* waywal_scaling_mode_t */
     bool has_image;

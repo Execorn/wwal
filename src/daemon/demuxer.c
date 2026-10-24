@@ -59,6 +59,22 @@ static bool mp4_read_packet(demuxer_t *d, demux_packet_t *pkt)
         return false; /* End of stream */
     }
 
+    if (st->owns_mmap && st->current_sample_idx > 0) {
+        const mp4_sample_entry_t *prev = &st->samples[st->current_sample_idx - 1];
+        uintptr_t base = (uintptr_t)d->mapped_buf;
+        uintptr_t p_start = (base + prev->offset) & ~(uintptr_t)4095U;
+        uintptr_t p_end = (base + prev->offset + prev->size) & ~(uintptr_t)4095U;
+        if (d->extradata) {
+            uintptr_t ex_page = ((uintptr_t)d->extradata) & ~(uintptr_t)4095U;
+            if (ex_page >= p_start && ex_page < p_end) {
+                p_start = p_end;
+            }
+        }
+        if (p_end > p_start) {
+            madvise((void *)p_start, (size_t)(p_end - p_start), MADV_DONTNEED);
+        }
+    }
+
     const mp4_sample_entry_t *s = &st->samples[st->current_sample_idx++];
     if (s->offset + s->size > d->mapped_size) {
         return false;
@@ -79,6 +95,14 @@ static bool mp4_seek_us(demuxer_t *d, int64_t target_pts_us)
     mp4_state_t *st = (mp4_state_t *)d->internal_state;
     if (st->num_samples == 0)
         return false;
+
+    if (st->owns_mmap && d->mapped_buf && d->mapped_size >= 4096) {
+        uintptr_t base = ((uintptr_t)d->mapped_buf + 4095U) & ~(uintptr_t)4095U;
+        uintptr_t end = ((uintptr_t)d->mapped_buf + d->mapped_size) & ~(uintptr_t)4095U;
+        if (end > base) {
+            madvise((void *)base, (size_t)(end - base), MADV_DONTNEED);
+        }
+    }
 
     if (target_pts_us <= 0) {
         st->current_sample_idx = 0;
@@ -936,6 +960,33 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size)
                 samples[stts_sample_idx].pts_us = cur_dts; /* Default pts = dts */
                 cur_dts += delta_us;
                 stts_sample_idx++;
+            }
+        }
+    }
+
+    /* Apply composition time offsets via ctts (B-frame PTS reordering) */
+    if (pt.ctts_data && pt.ctts_size >= 8 && pt.timescale > 0) {
+        uint32_t ctts_count = read_u32_be(pt.ctts_data + 4);
+        if ((uint64_t)ctts_count * 8 <= pt.ctts_size - 8) {
+            const uint8_t *ctts_entries = pt.ctts_data + 8;
+            uint32_t ctts_sample_idx = 0;
+            int64_t min_pts = INT64_MAX;
+            for (uint32_t i = 0; i < ctts_count && ctts_sample_idx < sample_count; ++i) {
+                uint32_t count = read_u32_be(ctts_entries + i * 8);
+                int32_t offset = (int32_t)read_u32_be(ctts_entries + i * 8 + 4);
+                int64_t offset_us = (int64_t)offset * 1000000LL / (int64_t)pt.timescale;
+                for (uint32_t j = 0; j < count && ctts_sample_idx < sample_count; ++j) {
+                    int64_t pts = samples[ctts_sample_idx].dts_us + offset_us;
+                    samples[ctts_sample_idx].pts_us = pts;
+                    if (pts < min_pts)
+                        min_pts = pts;
+                    ctts_sample_idx++;
+                }
+            }
+            if (ctts_sample_idx > 0 && min_pts != INT64_MAX && min_pts != 0) {
+                for (uint32_t i = 0; i < sample_count; ++i) {
+                    samples[i].pts_us -= min_pts;
+                }
             }
         }
     }

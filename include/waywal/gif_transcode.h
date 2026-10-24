@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,19 +15,16 @@ extern "C" {
 bool is_gif_file(const char *filepath);
 
 /**
- * Resolves a video input path for hardware-accelerated playback.
- * If filepath is an animated GIF, this:
- *  1. Derives a deterministic content-addressed hash based on file size, modification time,
- *     and sample payload bytes.
- *  2. Checks the persistent cache at $XDG_CACHE_HOME/wwal/transcoded/<hash>.mp4
- *  3. On cache hit: returns the cached MP4 path immediately (0s overhead).
- *  4. On cache miss: invokes ffmpeg with fast visually-lossless H.264 YUV420p parameters,
- *     pad filters for even dimensions, and +faststart atom placement, atomically renaming
- *     the result to the cache target.
- *
- * If filepath is not a GIF, filepath is copied to out_path unchanged.
- *
- * Returns true on success, false if file access or transcoding failed.
+ * Optimizes a video or animated GIF input path for low-resource hardware playback.
+ * Transcodes and caches inputs that are GIFs, exceed (max_width x max_height),
+ * or use heavy B-frame / multi-ref encoding into a lightweight H.264 IPPP (refs=1, bf=0)
+ * stream in $XDG_CACHE_HOME/wwal/transcoded/<hash>.mp4.
+ */
+bool video_transcode_optimize(const char *filepath, uint32_t max_width, uint32_t max_height,
+                              char *out_path, size_t out_path_size);
+
+/**
+ * Resolves a video/GIF input path using default 2560x1440 maximum dimensions.
  */
 bool gif_transcode_resolve(const char *filepath, char *out_path, size_t out_path_size);
 

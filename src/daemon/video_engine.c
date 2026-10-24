@@ -6,6 +6,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <malloc.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,23 +30,46 @@ static const struct wl_buffer_listener g_video_buffer_listener = {
     .release = video_buffer_release,
 };
 
-static struct wl_buffer *ensure_output_video_buffer(video_engine_t *ve, output_node_t *out,
-                                                    VASurfaceID surface, uint32_t surf_idx)
+static bool is_output_active_for_video(const video_engine_t *ve, const output_node_t *out)
 {
-    if (!ve || !out || surf_idx >= WAYWAL_VA_SURFACE_POOL_SIZE)
+    if (!ve || !out)
+        return false;
+    if (ve->target_output)
+        return (out == ve->target_output);
+    if (ve->has_target_filter)
+        return out->video_targeted;
+    return true;
+}
+
+static output_node_t *select_pll_reference_output(const video_engine_t *ve)
+{
+    if (!ve || !ve->daemon_state)
+        return NULL;
+    output_node_t *best = NULL;
+    for (output_node_t *out = ve->daemon_state->outputs; out != NULL; out = out->next) {
+        if (!is_output_active_for_video(ve, out) || !out->surface)
+            continue;
+        if (!best || out->refresh_mhz > best->refresh_mhz) {
+            best = out;
+        }
+    }
+    return best;
+}
+
+static struct wl_buffer *ensure_shared_video_buffer(video_engine_t *ve, VASurfaceID export_surf,
+                                                    uint32_t buf_idx)
+{
+    if (!ve || buf_idx >= WAYWAL_VA_SURFACE_POOL_SIZE || export_surf == VA_INVALID_SURFACE)
         return NULL;
 
-    if (out->video_wl_buffers[surf_idx]) {
-        return out->video_wl_buffers[surf_idx];
+    if (ve->video_wl_buffers[buf_idx]) {
+        return ve->video_wl_buffers[buf_idx];
     }
 
     struct zwp_linux_dmabuf_v1 *dmabuf_proto = ve->daemon_state->dmabuf_ctx.dmabuf_proto;
     if (!dmabuf_proto)
         return NULL;
 
-    VASurfaceID export_surf = (ve->decoder.has_vpp && surf_idx < WAYWAL_VA_SURFACE_POOL_SIZE)
-                                  ? ve->decoder.vpp_surfaces[surf_idx]
-                                  : surface;
     vaapi_prime_frame_t prime_frame;
     if (!vaapi_decoder_export_prime(&ve->decoder, export_surf, &prime_frame)) {
         WAYWAL_LOG_ERR("vaapi_decoder_export_prime failed for surface %u", export_surf);
@@ -70,15 +95,15 @@ static struct wl_buffer *ensure_output_video_buffer(video_engine_t *ve, output_n
     vaapi_prime_frame_close(&prime_frame);
 
     if (wl_buf) {
-        WAYWAL_LOG_INFO("Created video wl_buffer %p for surface %u (idx %u, %ux%u) on output %s",
-                        (void *)wl_buf, export_surf, surf_idx, prime_frame.width,
-                        prime_frame.height, out->name);
+        WAYWAL_LOG_INFO("Created shared video wl_buffer %p for surface %u (idx %u, %ux%u, fmt 0x%08x)",
+                        (void *)wl_buf, export_surf, buf_idx, prime_frame.width,
+                        prime_frame.height, prime_frame.drm_format);
         wl_buffer_add_listener(wl_buf, &g_video_buffer_listener,
-                               &out->video_buffer_in_use[surf_idx]);
-        out->video_wl_buffers[surf_idx] = wl_buf;
-        out->video_buffer_in_use[surf_idx] = false;
+                               &ve->video_buffer_in_use[buf_idx]);
+        ve->video_wl_buffers[buf_idx] = wl_buf;
+        ve->video_buffer_in_use[buf_idx] = false;
     } else {
-        WAYWAL_LOG_ERR("create_immed returned NULL for video surface %u on output %s", surface, out->name);
+        WAYWAL_LOG_ERR("create_immed returned NULL for shared video surface %u", export_surf);
     }
     return wl_buf;
 }
@@ -90,6 +115,8 @@ bool video_engine_init(video_engine_t *ve, daemon_state_t *state)
     memset(ve, 0, sizeof(*ve));
     ve->daemon_state = state;
     ve->state = WAYWAL_VIDEO_STATE_STOPPED;
+    ve->reorder_count = 0;
+    ve->has_decoded_any = false;
     ve->playback_speed = 1.0f;
     ve->loop_count = 0; /* infinite loop */
     ve->seamless_looping = true;
@@ -128,29 +155,256 @@ void video_engine_destroy(video_engine_t *ve)
     }
 }
 
+static void reclaim_output_shm_for_video(output_node_t *out)
+{
+    if (!out)
+        return;
+    out->transition_active = false;
+    if (out->shm_old_data) {
+        free(out->shm_old_data);
+        out->shm_old_data = NULL;
+    }
+    if (out->shm_new_data) {
+        free(out->shm_new_data);
+        out->shm_new_data = NULL;
+    }
+    out->shm_buffer_cap = 0;
+
+    if (out->shm_data && out->shm_size > 0) {
+        madvise(out->shm_data, out->shm_size, MADV_REMOVE);
+        madvise(out->shm_data, out->shm_size, MADV_DONTNEED);
+    }
+}
+
+static void configure_output_video_viewport(output_node_t *out, uint32_t vid_w, uint32_t vid_h)
+{
+    if (!out || !out->viewport || out->width <= 0 || out->height <= 0 || vid_w == 0 || vid_h == 0)
+        return;
+
+    if (out->vp_configured && out->vp_dst_w == out->width && out->vp_dst_h == out->height &&
+        out->vp_src_w == vid_w && out->vp_src_h == vid_h &&
+        out->vp_scaling_mode == out->scaling_mode) {
+        return;
+    }
+
+    wp_viewport_set_destination(out->viewport, out->width, out->height);
+
+    if (out->scaling_mode == WAYWAL_SCALING_FILL) {
+        double r_src = (double)vid_w / (double)vid_h;
+        double r_dst = (double)out->width / (double)out->height;
+        double crop_w = (double)vid_w;
+        double crop_h = (double)vid_h;
+        double off_x = 0.0;
+        double off_y = 0.0;
+
+        if (r_src > r_dst + 1e-4) {
+            crop_h = (double)vid_h;
+            crop_w = crop_h * r_dst;
+            off_x = ((double)vid_w - crop_w) * 0.5;
+        } else if (r_dst > r_src + 1e-4) {
+            crop_w = (double)vid_w;
+            crop_h = crop_w / r_dst;
+            off_y = ((double)vid_h - crop_h) * 0.5;
+        }
+
+        if (fabs(crop_w - (double)vid_w) < 0.5 && fabs(crop_h - (double)vid_h) < 0.5) {
+            wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                                   wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+        } else {
+            wp_viewport_set_source(out->viewport, wl_fixed_from_double(off_x),
+                                   wl_fixed_from_double(off_y), wl_fixed_from_double(crop_w),
+                                   wl_fixed_from_double(crop_h));
+        }
+    } else {
+        wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                               wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+    }
+
+    out->vp_dst_w = out->width;
+    out->vp_dst_h = out->height;
+    out->vp_src_w = vid_w;
+    out->vp_src_h = vid_h;
+    out->vp_scaling_mode = out->scaling_mode;
+    out->vp_configured = true;
+}
+
+static void video_engine_release_wl_buffers(video_engine_t *ve)
+{
+    if (!ve)
+        return;
+    bool destroyed_any = false;
+    for (uint32_t i = 0; i < WAYWAL_VA_SURFACE_POOL_SIZE; ++i) {
+        if (ve->video_wl_buffers[i]) {
+            wl_buffer_destroy(ve->video_wl_buffers[i]);
+            ve->video_wl_buffers[i] = NULL;
+            destroyed_any = true;
+        }
+        ve->video_buffer_in_use[i] = false;
+    }
+    if (destroyed_any && ve->daemon_state && ve->daemon_state->display) {
+        wl_display_flush(ve->daemon_state->display);
+    }
+}
+
+static void video_engine_prepare_reload(video_engine_t *ve)
+{
+    if (!ve)
+        return;
+    struct itimerspec its = {0};
+    if (ve->timer_fd >= 0) {
+        timerfd_settime(ve->timer_fd, 0, &its, NULL);
+        uint64_t dummy;
+        while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0);
+    }
+    ve->state = WAYWAL_VIDEO_STATE_STOPPED;
+    ve->reorder_count = 0;
+    ve->has_decoded_any = false;
+    ve->playback_epoch_ns = 0;
+    if (ve->demuxer) {
+        ve->demuxer->destroy(ve->demuxer);
+        ve->demuxer = NULL;
+    }
+}
+
+static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux,
+                                    bool allow_direct_nv12)
+{
+    if (!dec || !dec->initialized || !demux)
+        return false;
+    if (dec->width != demux->width || dec->height != demux->height)
+        return false;
+    if (dec->has_vpp != (!allow_direct_nv12))
+        return false;
+
+    bool profile_matches = false;
+    switch (demux->codec) {
+    case WAYWAL_CODEC_H264:
+        profile_matches = (dec->va_profile == VAProfileH264Main ||
+                           dec->va_profile == VAProfileH264High ||
+                           dec->va_profile == VAProfileH264ConstrainedBaseline);
+        break;
+    case WAYWAL_CODEC_HEVC:
+        profile_matches = (dec->va_profile == VAProfileHEVCMain ||
+                           dec->va_profile == VAProfileHEVCMain10);
+        break;
+    case WAYWAL_CODEC_VP9:
+        profile_matches = (dec->va_profile == VAProfileVP9Profile0 ||
+                           dec->va_profile == VAProfileVP9Profile2);
+        break;
+    case WAYWAL_CODEC_AV1:
+#ifdef VAProfileAV1Profile0
+        profile_matches = (dec->va_profile == VAProfileAV1Profile0);
+#endif
+        break;
+    default:
+        break;
+    }
+    if (!profile_matches)
+        return false;
+
+    memset(&dec->cached_sps, 0, sizeof(dec->cached_sps));
+    memset(&dec->cached_pps, 0, sizeof(dec->cached_pps));
+    dec->is_avcc = false;
+    dec->nal_length_size = 4;
+    memset(&dec->cached_iq, 16, sizeof(dec->cached_iq));
+    dec->iq_valid = true;
+    if (demux->extradata && demux->extradata_size > 0) {
+        vaapi_decoder_set_extradata(dec, demux->extradata, demux->extradata_size);
+    }
+    uint32_t max_refs = 4;
+    if (dec->cached_sps.valid) {
+        max_refs = dec->cached_sps.num_ref_frames;
+        if (max_refs < 1)
+            max_refs = 1;
+        if (max_refs > 16)
+            max_refs = 16;
+    }
+    uint32_t needed_surfaces = max_refs + 3;
+    if (needed_surfaces < 4)
+        needed_surfaces = 4;
+    if (needed_surfaces > WAYWAL_VA_SURFACE_POOL_SIZE)
+        needed_surfaces = WAYWAL_VA_SURFACE_POOL_SIZE;
+
+    return (dec->num_surfaces == needed_surfaces);
+}
+
 static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
 {
     if (!ve || !ve->demuxer)
         return false;
 
-    int drm_fd = ve->daemon_state->dmabuf_ctx.drm_fd;
-    if (!vaapi_decoder_init(&ve->decoder, drm_fd, ve->demuxer->codec, ve->demuxer->width,
-                            ve->demuxer->height)) {
-        WAYWAL_LOG_ERR("Failed to initialize hardware VA-API decoder for video");
-        ve->demuxer->destroy(ve->demuxer);
-        ve->demuxer = NULL;
-        ve->state = WAYWAL_VIDEO_STATE_STOPPED;
-        return false;
-    }
+    int drm_fd = ve->daemon_state ? ve->daemon_state->dmabuf_ctx.drm_fd : -1;
+    /* Wayland compositors (e.g., Hyprland / libhyprgraphics) bind imported DMA-BUF EGLImages
+     * to GL_TEXTURE_2D with RGB shaders rather than GL_TEXTURE_EXTERNAL_OES. Because VA-API
+     * drivers like nvidia_drv_video export NV12 as separate R8 + GR88 layers, GL_TEXTURE_2D
+     * exposes only Plane 0 (R8 Luma) as GL_RED, rendering video as monochrome red.
+     * Use VA-API VPP to convert presented frames to single-plane RGB32 (ARGB8888/XRGB8888). */
+    bool allow_direct_nv12 = false;
 
-    if (ve->demuxer->extradata && ve->demuxer->extradata_size > 0) {
-        vaapi_decoder_set_extradata(&ve->decoder, ve->demuxer->extradata, ve->demuxer->extradata_size);
+    if (can_reuse_vaapi_decoder(&ve->decoder, ve->demuxer, allow_direct_nv12)) {
+        if (ve->decoder.va_display) {
+            for (uint32_t i = 0; i < ve->decoder.num_surfaces; ++i) {
+                if (ve->decoder.surfaces[i] != VA_INVALID_SURFACE) {
+                    vaSyncSurface(ve->decoder.va_display, ve->decoder.surfaces[i]);
+                }
+            }
+            if (ve->decoder.has_vpp) {
+                for (uint32_t i = 0; i < ve->decoder.num_vpp_surfaces; ++i) {
+                    if (ve->decoder.vpp_surfaces[i] != VA_INVALID_SURFACE) {
+                        vaSyncSurface(ve->decoder.va_display, ve->decoder.vpp_surfaces[i]);
+                    }
+                }
+            }
+        }
+        vaapi_decoder_reset(&ve->decoder);
+        ve->decoder.current_surface_idx = 0;
+        WAYWAL_LOG_INFO("Reusing active VA-API decoder context (%ux%u, %u surfaces)",
+                        ve->decoder.width, ve->decoder.height, ve->decoder.num_surfaces);
+    } else {
+        if (ve->decoder.initialized) {
+            if (ve->daemon_state) {
+                daemon_clear_all_outputs(ve->daemon_state, ve->daemon_state->current_color);
+            }
+            video_engine_release_wl_buffers(ve);
+            vaapi_decoder_destroy(&ve->decoder);
+        }
+        if (!vaapi_decoder_init_with_params(&ve->decoder, drm_fd, ve->demuxer->codec,
+                                            ve->demuxer->width, ve->demuxer->height,
+                                            ve->demuxer->extradata, ve->demuxer->extradata_size,
+                                            allow_direct_nv12)) {
+            WAYWAL_LOG_ERR("Failed to initialize hardware VA-API decoder for video");
+            ve->demuxer->destroy(ve->demuxer);
+            ve->demuxer = NULL;
+            ve->state = WAYWAL_VIDEO_STATE_STOPPED;
+            ve->reorder_count = 0;
+            ve->has_decoded_any = false;
+            return false;
+        }
     }
 
     ve->target_output = out;
     ve->state = WAYWAL_VIDEO_STATE_PLAYING;
     ve->current_loop = 0;
+    ve->presented_loop_id = 0;
     ve->last_pts_us = 0;
+    ve->playback_epoch_ns = 0;
+    ve->reorder_count = 0;
+    ve->current_gop_id = 0;
+    ve->next_present_gop = 0;
+    ve->next_present_poc = 0;
+    ve->has_decoded_any = false;
+    ve->last_vpp_idx = 0;
+    memset(ve->combined_busy_mask, 0, sizeof(ve->combined_busy_mask));
+
+    if (ve->daemon_state) {
+        for (output_node_t *node = ve->daemon_state->outputs; node != NULL; node = node->next) {
+            if (is_output_active_for_video(ve, node)) {
+                node->vp_configured = false;
+                reclaim_output_shm_for_video(node);
+            }
+        }
+        malloc_trim(0);
+    }
 
     WAYWAL_LOG_INFO("Hardware video playback started: %ux%u @ %u fps (duration: %.2fs)",
                     ve->demuxer->width, ve->demuxer->height, ve->demuxer->fps_num,
@@ -169,13 +423,17 @@ bool video_engine_load_file(video_engine_t *ve, const char *filepath, output_nod
     if (!ve || !filepath)
         return false;
 
-    if (ve->state != WAYWAL_VIDEO_STATE_STOPPED) {
-        video_engine_stop(ve);
-    }
+    bool saved_filter = ve->has_target_filter;
+    video_engine_prepare_reload(ve);
+    ve->has_target_filter = saved_filter;
 
     ve->demuxer = demuxer_open_file(filepath);
     if (!ve->demuxer) {
         WAYWAL_LOG_ERR("Failed to demux video file '%s'", filepath);
+        video_engine_release_wl_buffers(ve);
+        if (ve->decoder.initialized) {
+            vaapi_decoder_destroy(&ve->decoder);
+        }
         return false;
     }
 
@@ -187,14 +445,18 @@ bool video_engine_load_mem(video_engine_t *ve, int memfd, size_t size, output_no
     if (!ve || memfd < 0 || size == 0)
         return false;
 
-    if (ve->state != WAYWAL_VIDEO_STATE_STOPPED) {
-        video_engine_stop(ve);
-    }
+    bool saved_filter = ve->has_target_filter;
+    video_engine_prepare_reload(ve);
+    ve->has_target_filter = saved_filter;
 
     void *mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, memfd, 0);
     if (mapped == MAP_FAILED) {
         WAYWAL_LOG_ERR("mmap failed for video memfd: %s", strerror(errno));
         close(memfd);
+        video_engine_release_wl_buffers(ve);
+        if (ve->decoder.initialized) {
+            vaapi_decoder_destroy(&ve->decoder);
+        }
         return false;
     }
 
@@ -203,6 +465,10 @@ bool video_engine_load_mem(video_engine_t *ve, int memfd, size_t size, output_no
         WAYWAL_LOG_ERR("Failed to demux video from memory buffer");
         munmap(mapped, size);
         close(memfd);
+        video_engine_release_wl_buffers(ve);
+        if (ve->decoder.initialized) {
+            vaapi_decoder_destroy(&ve->decoder);
+        }
         return false;
     }
 
@@ -219,6 +485,58 @@ bool video_engine_load_mem(video_engine_t *ve, int memfd, size_t size, output_no
     return video_engine_start_playback(ve, out);
 }
 
+static void update_combined_busy_mask(video_engine_t *ve)
+{
+    uint32_t pool_size =
+        ve->decoder.num_surfaces > 0 ? ve->decoder.num_surfaces : WAYWAL_VA_SURFACE_POOL_SIZE;
+    memset(ve->combined_busy_mask, 0, sizeof(ve->combined_busy_mask));
+    if (!ve->decoder.has_vpp) {
+        for (uint32_t i = 0; i < pool_size; ++i) {
+            if (ve->video_buffer_in_use[i]) {
+                ve->combined_busy_mask[i] = true;
+            }
+        }
+    }
+    for (uint32_t r = 0; r < ve->reorder_count; ++r) {
+        uint32_t idx = ve->reorder_buf[r].surf_idx;
+        if (idx < pool_size) {
+            ve->combined_busy_mask[idx] = true;
+        }
+    }
+    ve->decoder.surface_busy_mask = ve->combined_busy_mask;
+}
+
+static bool reorder_has_ready_frame(video_engine_t *ve)
+{
+    if (ve->reorder_count == 0)
+        return false;
+    if (ve->reorder_count >= WAYWAL_VIDEO_REORDER_CAP - 1)
+        return true;
+
+    if (ve->current_gop_id > ve->next_present_gop) {
+        bool has_old_gop = false;
+        for (uint32_t i = 0; i < ve->reorder_count; ++i) {
+            if (ve->reorder_buf[i].gop_id == ve->next_present_gop) {
+                has_old_gop = true;
+                break;
+            }
+        }
+        if (has_old_gop) {
+            return true;
+        }
+        ve->next_present_gop = ve->current_gop_id;
+        ve->next_present_poc = 0;
+    }
+
+    for (uint32_t i = 0; i < ve->reorder_count; ++i) {
+        if (ve->reorder_buf[i].gop_id == ve->next_present_gop &&
+            ve->reorder_buf[i].poc <= ve->next_present_poc) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void video_engine_dispatch_frame(video_engine_t *ve)
 {
     if (!ve || ve->state != WAYWAL_VIDEO_STATE_PLAYING || !ve->demuxer) {
@@ -230,115 +548,178 @@ void video_engine_dispatch_frame(video_engine_t *ve)
     if (s <= 0 || expirations == 0)
         return;
 
-    demux_packet_t pkt;
-    if (!ve->demuxer->read_packet(ve->demuxer, &pkt)) {
-        /* EOF reached: check loop limit */
-        ve->current_loop++;
-        if (ve->loop_count > 0 && ve->current_loop >= ve->loop_count) {
-            WAYWAL_LOG_INFO("Video loop count (%lu) reached, stopping playback", ve->loop_count);
-            video_engine_stop(ve);
-            return;
+    uint32_t pool_size =
+        ve->decoder.num_surfaces > 0 ? ve->decoder.num_surfaces : WAYWAL_VA_SURFACE_POOL_SIZE;
+
+    while (ve->reorder_count < WAYWAL_VIDEO_REORDER_CAP) {
+        if (reorder_has_ready_frame(ve)) {
+            break;
         }
 
-        /* Seamless looping: rewind demuxer and read Frame 0 */
-        ve->demuxer->seek_us(ve->demuxer, 0);
-        vaapi_decoder_reset(&ve->decoder);
+        demux_packet_t pkt;
         if (!ve->demuxer->read_packet(ve->demuxer, &pkt)) {
-            WAYWAL_LOG_WARN("Failed to seek to start of stream on video loop");
-            video_engine_stop(ve);
-            return;
+            if (ve->loop_count > 0 && ve->current_loop + 1 >= ve->loop_count) {
+                if (ve->reorder_count > 0) {
+                    break;
+                }
+                ve->current_loop++;
+                WAYWAL_LOG_INFO("Video loop count (%lu) reached, stopping playback", ve->loop_count);
+                video_engine_stop(ve);
+                return;
+            }
+            ve->current_loop++;
+
+            ve->demuxer->seek_us(ve->demuxer, 0);
+            vaapi_decoder_reset(&ve->decoder);
+            if (!ve->demuxer->read_packet(ve->demuxer, &pkt)) {
+                if (ve->reorder_count > 0) {
+                    break;
+                }
+                WAYWAL_LOG_WARN("Failed to seek to start of stream on video loop");
+                video_engine_stop(ve);
+                return;
+            }
         }
-    }
 
-    ve->last_pts_us = pkt.pts_us;
+        update_combined_busy_mask(ve);
 
-    /* Inform decoder which surfaces the compositor is currently scanning out */
-    output_node_t *primary_out = ve->target_output ? ve->target_output : ve->daemon_state->outputs;
-    ve->decoder.surface_busy_mask = primary_out ? primary_out->video_buffer_in_use : NULL;
+        VASurfaceID decoded_surface = VA_INVALID_SURFACE;
+        if (!vaapi_decoder_decode_packet(&ve->decoder, &pkt, &decoded_surface)) {
+            break;
+        }
 
-    VASurfaceID decoded_surface = VA_INVALID_SURFACE;
-    if (vaapi_decoder_decode_packet(&ve->decoder, &pkt, &decoded_surface)) {
-        /* Determine pool surface index */
+        if (ve->decoder.last_decoded_is_idr && ve->has_decoded_any) {
+            ve->current_gop_id++;
+        }
+        ve->has_decoded_any = true;
+
         uint32_t surf_idx = 0;
-        for (uint32_t i = 0; i < WAYWAL_VA_SURFACE_POOL_SIZE; ++i) {
-            if (ve->decoder.surfaces[i] == decoded_surface ||
-                (ve->decoder.has_vpp && ve->decoder.vpp_surfaces[i] == decoded_surface)) {
+        for (uint32_t i = 0; i < pool_size; ++i) {
+            if (ve->decoder.surfaces[i] == decoded_surface) {
                 surf_idx = i;
                 break;
             }
         }
 
-        static uint64_t s_disp_count = 0;
-        if (++s_disp_count % 18 == 1) {
-            WAYWAL_LOG_INFO("video_engine_dispatch_frame #%lu: surf=%u, idx=%u",
-                            (unsigned long)s_disp_count, decoded_surface, surf_idx);
-        }
-
-        /* Attach and commit persistent wl_buffer to target output(s) (BUG-07, ARCH-04) */
-        output_node_t *out = ve->target_output ? ve->target_output : ve->daemon_state->outputs;
-        while (out != NULL) {
-            if (out->surface) {
-                struct wl_buffer *wl_buf =
-                    ensure_output_video_buffer(ve, out, decoded_surface, surf_idx);
-                if (wl_buf) {
-                    if (out->viewport) {
-                        wp_viewport_set_destination(out->viewport, out->width, out->height);
-                        wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1),
-                                               wl_fixed_from_int(-1), wl_fixed_from_int(-1),
-                                               wl_fixed_from_int(-1));
-                    }
-                    if (out->pres_sync.wp_pres) {
-                        presentation_sync_request(&out->pres_sync);
-                    }
-                    wl_surface_attach(out->surface, wl_buf, 0, 0);
-                    wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
-                    wl_surface_commit(out->surface);
-                    out->video_buffer_in_use[surf_idx] = true;
-                }
-            }
-            out = ve->target_output ? NULL : out->next;
-        }
-
-        wl_display_flush(ve->daemon_state->display);
+        ve->reorder_buf[ve->reorder_count++] = (video_reorder_entry_t){
+            .surface = decoded_surface,
+            .surf_idx = surf_idx,
+            .pts_us = pkt.pts_us,
+            .poc = ve->decoder.last_decoded_poc,
+            .gop_id = ve->current_gop_id,
+            .loop_id = ve->current_loop,
+        };
     }
 
-    /* Compute next frame interval with high monotonic precision */
-    int64_t frame_interval_us = 33333LL; /* Default ~30fps */
+    int64_t frame_interval_us = 33333LL;
     if (ve->demuxer->fps_num > 0) {
         frame_interval_us =
             (1000000LL * (int64_t)ve->demuxer->fps_den) / (int64_t)ve->demuxer->fps_num;
     }
-
-    if (ve->playback_speed > 0.01f) {
-        frame_interval_us = (int64_t)((float)frame_interval_us / ve->playback_speed);
-    }
+    double speed = (ve->playback_speed > 0.01f) ? (double)ve->playback_speed : 1.0;
+    frame_interval_us = (int64_t)((double)frame_interval_us / speed);
     if (frame_interval_us < 1000LL)
         frame_interval_us = 1000LL;
+    int64_t frame_interval_ns = frame_interval_us * 1000LL;
 
-    int64_t next_interval_ns = frame_interval_us * 1000LL;
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    int64_t now_ns = (int64_t)now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
+    int64_t target_pres_ns = now_ns + frame_interval_ns;
 
-    /* VRR PLL VBlank Pacing: snap frame intervals to discrete VBlank multiples */
-    output_node_t *target_out = ve->target_output
-                                    ? ve->target_output
-                                    : (ve->daemon_state ? ve->daemon_state->outputs : NULL);
-    if (target_out && target_out->pres_sync.pll.phase_est_ns > 0 &&
-        target_out->pres_sync.pll.period_est_ns > 0) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
-        int64_t next_vblank_ns = presentation_pll_predict_next_vblank(&target_out->pres_sync.pll);
-        int64_t period_ns = target_out->pres_sync.pll.period_est_ns;
+    output_node_t *pll_ref_out = select_pll_reference_output(ve);
 
-        /* Target presentation timestamp is current time + video frame interval */
-        int64_t target_pres_ns = now_ns + next_interval_ns;
+    if (ve->reorder_count > 0) {
+        uint32_t best_idx = 0;
+        for (uint32_t i = 1; i < ve->reorder_count; ++i) {
+            const video_reorder_entry_t *a = &ve->reorder_buf[i];
+            const video_reorder_entry_t *b = &ve->reorder_buf[best_idx];
+            if (a->gop_id < b->gop_id ||
+                (a->gop_id == b->gop_id && a->poc < b->poc) ||
+                (a->gop_id == b->gop_id && a->poc == b->poc && a->pts_us < b->pts_us)) {
+                best_idx = i;
+            }
+        }
 
-        if (target_pres_ns > next_vblank_ns) {
+        video_reorder_entry_t pres = ve->reorder_buf[best_idx];
+        if (best_idx + 1 < ve->reorder_count) {
+            memmove(&ve->reorder_buf[best_idx], &ve->reorder_buf[best_idx + 1],
+                    (ve->reorder_count - best_idx - 1) * sizeof(video_reorder_entry_t));
+        }
+        ve->reorder_count--;
+
+        int64_t scaled_pts_ns = (int64_t)((double)(pres.pts_us * 1000LL) / speed);
+        if (ve->playback_epoch_ns == 0 || pres.loop_id != ve->presented_loop_id ||
+            pres.pts_us < ve->last_pts_us) {
+            ve->playback_epoch_ns = now_ns - scaled_pts_ns;
+            ve->presented_loop_id = pres.loop_id;
+        }
+        target_pres_ns = ve->playback_epoch_ns + scaled_pts_ns + frame_interval_ns;
+        if (target_pres_ns <= now_ns - 2 * frame_interval_ns) {
+            ve->playback_epoch_ns = now_ns - scaled_pts_ns;
+            target_pres_ns = now_ns + frame_interval_ns;
+        }
+
+        ve->last_pts_us = pres.pts_us;
+        ve->next_present_gop = pres.gop_id;
+        ve->next_present_poc = pres.poc + 2;
+
+        VASurfaceID export_surf = pres.surface;
+        uint32_t buf_idx = pres.surf_idx;
+        if (ve->decoder.has_vpp) {
+            uint32_t vpp_pool = ve->decoder.num_vpp_surfaces > 0 ? ve->decoder.num_vpp_surfaces
+                                                                 : WAYWAL_VA_VPP_POOL_SIZE;
+            /* Always select the lowest-index free VPP surface so nvidia_drv_video's lazy
+             * direct_realiseSurface allocates VRAM only for the 2 ping-pong buffers actually
+             * needed by the compositor. */
+            uint32_t vpp_idx = (ve->last_vpp_idx + 1) % vpp_pool;
+            for (uint32_t k = 0; k < vpp_pool; ++k) {
+                if (!ve->video_buffer_in_use[k]) {
+                    vpp_idx = k;
+                    break;
+                }
+            }
+            ve->last_vpp_idx = vpp_idx;
+            export_surf = ve->decoder.vpp_surfaces[vpp_idx];
+            buf_idx = vpp_idx;
+            vaapi_decoder_vpp_blit(&ve->decoder, pres.surface, export_surf);
+        }
+
+        struct wl_buffer *wl_buf = ensure_shared_video_buffer(ve, export_surf, buf_idx);
+        if (wl_buf && ve->daemon_state) {
+            bool attached_any = false;
+            for (output_node_t *out = ve->daemon_state->outputs; out != NULL; out = out->next) {
+                if (!is_output_active_for_video(ve, out) || !out->surface)
+                    continue;
+                configure_output_video_viewport(out, ve->decoder.width, ve->decoder.height);
+                if (out == pll_ref_out && out->pres_sync.wp_pres) {
+                    presentation_sync_request(&out->pres_sync);
+                }
+                wl_surface_attach(out->surface, wl_buf, 0, 0);
+                wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
+                wl_surface_commit(out->surface);
+                attached_any = true;
+            }
+            if (attached_any) {
+                ve->video_buffer_in_use[buf_idx] = true;
+                wl_display_flush(ve->daemon_state->display);
+            }
+        }
+    }
+
+    int64_t next_interval_ns = target_pres_ns - now_ns;
+
+    if (pll_ref_out && pll_ref_out->pres_sync.pll.phase_est_ns > 0 &&
+        pll_ref_out->pres_sync.pll.period_est_ns > 0) {
+        int64_t next_vblank_ns = presentation_pll_predict_next_vblank(&pll_ref_out->pres_sync.pll);
+        int64_t period_ns = pll_ref_out->pres_sync.pll.period_est_ns;
+
+        if (target_pres_ns >= next_vblank_ns && period_ns > 0) {
             int64_t cycles = (target_pres_ns - next_vblank_ns + (period_ns / 2)) / period_ns;
-            if (cycles < 1)
-                cycles = 1;
+            if (cycles < 0)
+                cycles = 0;
             int64_t aligned_vblank_ns = next_vblank_ns + cycles * period_ns;
 
-            /* Wake up ~1.0 ms (or 1/4 refresh cycle) prior to aligned hardware VBlank */
             int64_t lead_time_ns = period_ns / 4;
             if (lead_time_ns > 1000000LL)
                 lead_time_ns = 1000000LL;
@@ -379,6 +760,7 @@ void video_engine_resume(video_engine_t *ve)
         return;
 
     ve->state = WAYWAL_VIDEO_STATE_PLAYING;
+    ve->playback_epoch_ns = 0;
     WAYWAL_LOG_INFO("Hardware video playback resumed");
 
     /* Arm timer to trigger next frame immediately */
@@ -392,7 +774,7 @@ void video_engine_resume(video_engine_t *ve)
 
 void video_engine_stop(video_engine_t *ve)
 {
-    if (!ve || ve->state == WAYWAL_VIDEO_STATE_STOPPED)
+    if (!ve || (ve->state == WAYWAL_VIDEO_STATE_STOPPED && !ve->decoder.initialized))
         return;
 
     struct itimerspec its = {0};
@@ -403,18 +785,16 @@ void video_engine_stop(video_engine_t *ve)
     }
 
     ve->state = WAYWAL_VIDEO_STATE_STOPPED;
+    ve->reorder_count = 0;
+    ve->has_decoded_any = false;
+    ve->playback_epoch_ns = 0;
 
-    /* Clean up persistent video buffer pool across all outputs (BUG-07, ARCH-04) */
-    output_node_t *out = ve->daemon_state ? ve->daemon_state->outputs : NULL;
-    while (out != NULL) {
-        for (uint32_t i = 0; i < WAYWAL_VA_SURFACE_POOL_SIZE; ++i) {
-            if (out->video_wl_buffers[i]) {
-                wl_buffer_destroy(out->video_wl_buffers[i]);
-                out->video_wl_buffers[i] = NULL;
-                out->video_buffer_in_use[i] = false;
-            }
+    video_engine_release_wl_buffers(ve);
+
+    if (ve->daemon_state) {
+        for (output_node_t *out = ve->daemon_state->outputs; out != NULL; out = out->next) {
+            out->vp_configured = false;
         }
-        out = out->next;
     }
 
     if (ve->decoder.initialized) {
@@ -427,5 +807,7 @@ void video_engine_stop(video_engine_t *ve)
     }
 
     ve->target_output = NULL;
+    ve->has_target_filter = false;
+    malloc_trim(0);
     WAYWAL_LOG_INFO("Hardware video playback stopped");
 }

@@ -43,6 +43,81 @@ static char *read_shader_file(const char *path, size_t *out_len)
     return buf;
 }
 
+static void query_max_target_resolution(const cli_options_t *opts, uint32_t *out_w, uint32_t *out_h)
+{
+    *out_w = 2560;
+    *out_h = 1440;
+
+    int qfd = waywal_ipc_client_connect(opts->namespace_str, 500);
+    if (qfd < 0)
+        return;
+
+    waywal_ipc_hdr_t req = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_QUERY,
+        .payload_size = 0,
+    };
+    if (!waywal_ipc_send(qfd, &req, -1)) {
+        close(qfd);
+        return;
+    }
+
+    waywal_ipc_hdr_t resp;
+    int attached_fd = -1;
+    if (!waywal_ipc_recv(qfd, &resp, &attached_fd) || resp.opcode != WAYWAL_RESP_INFO ||
+        resp.payload_size == 0 || resp.payload_size >= 16384) {
+        if (attached_fd >= 0)
+            close(attached_fd);
+        close(qfd);
+        return;
+    }
+    if (attached_fd >= 0)
+        close(attached_fd);
+
+    char buf[4096];
+    size_t to_read = resp.payload_size < sizeof(buf) - 1 ? resp.payload_size : sizeof(buf) - 1;
+    size_t total = 0;
+    while (total < to_read) {
+        ssize_t r = read(qfd, buf + total, to_read - total);
+        if (r <= 0)
+            break;
+        total += (size_t)r;
+    }
+    close(qfd);
+    buf[total] = '\0';
+
+    uint32_t max_w = 0;
+    uint32_t max_h = 0;
+    char *saveptr = NULL;
+    for (char *line = strtok_r(buf, "\n", &saveptr); line != NULL;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        const char *prefix = strstr(line, "  - ");
+        if (!prefix)
+            continue;
+        const char *name_start = prefix + 4;
+        const char *name_end = strchr(name_start, ' ');
+        if (!name_end)
+            continue;
+
+        const char *colon = strstr(name_end, ": ");
+        if (!colon)
+            continue;
+        unsigned int w = 0, h = 0;
+        if (sscanf(colon + 2, "%ux%u", &w, &h) == 2 && w > 0 && h > 0) {
+            if (w > max_w)
+                max_w = w;
+            if (h > max_h)
+                max_h = h;
+        }
+    }
+
+    if (max_w > 0 && max_h > 0) {
+        *out_w = max_w;
+        *out_h = max_h;
+    }
+}
+
 int main(int argc, char *argv[])
 {
     cli_options_t opts;
@@ -67,8 +142,10 @@ int main(int argc, char *argv[])
     char effective_video_path[4096];
     effective_video_path[0] = '\0';
     if (opts.cmd == CLI_CMD_VIDEO) {
-        if (!gif_transcode_resolve(opts.filepath, effective_video_path,
-                                   sizeof(effective_video_path))) {
+        uint32_t max_w = 2560, max_h = 1440;
+        query_max_target_resolution(&opts, &max_w, &max_h);
+        if (!video_transcode_optimize(opts.filepath, max_w, max_h, effective_video_path,
+                                      sizeof(effective_video_path))) {
             fprintf(stderr, "Error: Failed to process video/GIF input: %s\n", opts.filepath);
             return 1;
         }
@@ -200,30 +277,54 @@ int main(int argc, char *argv[])
         int video_fd = open(effective_video_path, O_RDONLY | O_CLOEXEC);
         req_hdr.opcode = WAYWAL_REQ_SET_VIDEO;
 
-        waywal_video_payload_t vpay;
-        memset(&vpay, 0, sizeof(vpay));
-        vpay.loop_count = opts.video_loop_count;
-        vpay.playback_speed = opts.video_speed;
-        strncpy(vpay.filepath, effective_video_path, sizeof(vpay.filepath) - 1);
-        req_hdr.payload_size = sizeof(vpay);
+        size_t outputs_len = 0;
+        for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+            outputs_len += strlen(opts.outputs[i]) + 1;
+        }
+        size_t video_payload_size = sizeof(waywal_video_payload_t) + outputs_len;
+        uint8_t *video_buf = (uint8_t *)calloc(1, video_payload_size);
+        if (!video_buf) {
+            if (video_fd >= 0)
+                close(video_fd);
+            ret_code = 1;
+            break;
+        }
+
+        waywal_video_payload_t *vpay = (waywal_video_payload_t *)video_buf;
+        vpay->loop_count = opts.video_loop_count;
+        vpay->playback_speed = opts.video_speed;
+        vpay->num_target_outputs = opts.num_outputs;
+        strncpy(vpay->filepath, effective_video_path, sizeof(vpay->filepath) - 1);
+
+        char *optr = (char *)video_buf + sizeof(waywal_video_payload_t);
+        for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+            size_t slen = strlen(opts.outputs[i]) + 1;
+            memcpy(optr, opts.outputs[i], slen);
+            optr += slen;
+        }
+
+        req_hdr.payload_size = video_payload_size;
 
         if (video_fd >= 0) {
             if (!waywal_ipc_send(socket_fd, &req_hdr, video_fd)) {
                 fprintf(stderr, "Error: Failed to send video fd to daemon\n");
                 close(video_fd);
+                free(video_buf);
                 ret_code = 1;
                 break;
             }
             close(video_fd);
-            (void)write(socket_fd, &vpay, sizeof(vpay));
+            (void)write(socket_fd, video_buf, video_payload_size);
         } else {
             if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
                 fprintf(stderr, "Error: Failed to send video request to daemon\n");
+                free(video_buf);
                 ret_code = 1;
                 break;
             }
-            (void)write(socket_fd, &vpay, sizeof(vpay));
+            (void)write(socket_fd, video_buf, video_payload_size);
         }
+        free(video_buf);
 
         waywal_ipc_hdr_t resp;
         int attached_fd = -1;

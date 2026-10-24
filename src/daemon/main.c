@@ -141,7 +141,13 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     .b = clear_payload.color[2],
                     .a = clear_payload.color[3],
                 };
+                bool had_video = (state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED ||
+                                  state->video_engine.decoder.initialized);
+                state->video_engine.state = WAYWAL_VIDEO_STATE_STOPPED;
                 daemon_clear_all_outputs(state, color);
+                if (had_video) {
+                    video_engine_stop(&state->video_engine);
+                }
                 slideshow_stop(&state->slideshow);
                 WAYWAL_LOG_INFO("Cleared screen with color: #%02x%02x%02x%02x", color.r, color.g,
                                 color.b, color.a);
@@ -234,6 +240,12 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         bool ok = false;
         waywal_video_payload_t vpay;
         bool has_vpay = false;
+        output_node_t *target_out = NULL;
+        state->video_engine.has_target_filter = false;
+        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            out->video_targeted = true;
+        }
+
         if (req_hdr.payload_size >= sizeof(waywal_video_payload_t)) {
             if (read_exact(client_fd, &vpay, sizeof(vpay))) {
                 vpay.filepath[sizeof(vpay.filepath) - 1] = '\0';
@@ -241,18 +253,57 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 state->video_engine.playback_speed =
                     vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
                 has_vpay = true;
+
+                size_t extra_len = req_hdr.payload_size - sizeof(waywal_video_payload_t);
+                if (vpay.num_target_outputs > 0 && vpay.num_target_outputs <= 64 &&
+                    extra_len > 0 && extra_len <= 4096) {
+                    char extra_buf[4096];
+                    if (read_exact(client_fd, extra_buf, extra_len)) {
+                        extra_buf[extra_len - 1] = '\0';
+                        state->video_engine.has_target_filter = true;
+                        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                            out->video_targeted = false;
+                        }
+                        const char *ptr = extra_buf;
+                        size_t remaining = extra_len;
+                        uint32_t matched_count = 0;
+                        output_node_t *last_matched = NULL;
+                        for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0; ++i) {
+                            const char *end = (const char *)memchr(ptr, '\0', remaining);
+                            if (!end)
+                                break;
+                            for (output_node_t *out = state->outputs; out != NULL;
+                                 out = out->next) {
+                                if (strcmp(out->name, ptr) == 0) {
+                                    out->video_targeted = true;
+                                    last_matched = out;
+                                    matched_count++;
+                                }
+                            }
+                            size_t step = (size_t)(end - ptr) + 1;
+                            ptr += step;
+                            remaining -= step;
+                        }
+                        if (matched_count == 1) {
+                            target_out = last_matched;
+                        }
+                    }
+                }
             }
         }
         if (attached_fd >= 0) {
             struct stat st;
             if (fstat(attached_fd, &st) == 0 && st.st_size > 0) {
+                /* video_engine_load_mem takes ownership of attached_fd on both success and failure */
                 ok = video_engine_load_mem(&state->video_engine, attached_fd, (size_t)st.st_size,
-                                           NULL);
+                                           target_out);
+                attached_fd = -1;
+            } else {
+                close(attached_fd);
+                attached_fd = -1;
             }
-            close(attached_fd);
-            attached_fd = -1;
         } else if (has_vpay) {
-            ok = video_engine_load_file(&state->video_engine, vpay.filepath, NULL);
+            ok = video_engine_load_file(&state->video_engine, vpay.filepath, target_out);
         }
         resp_hdr.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
@@ -364,7 +415,31 @@ void daemon_handle_ipc_connection(daemon_state_t *state)
     }
 }
 
-static bool g_daemon_wl_read_ready = false;
+static bool g_daemon_wl_ok = true;
+
+static bool daemon_pump_wayland_events(daemon_state_t *st)
+{
+    if (!st || !st->display)
+        return false;
+    while (wl_display_prepare_read(st->display) != 0) {
+        wl_display_dispatch_pending(st->display);
+    }
+    struct pollfd pfd = {.fd = wl_display_get_fd(st->display), .events = POLLIN};
+    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP))) {
+        if (wl_display_read_events(st->display) < 0 && errno != EAGAIN) {
+            g_daemon_wl_ok = false;
+            return false;
+        }
+    } else {
+        wl_display_cancel_read(st->display);
+    }
+    wl_display_dispatch_pending(st->display);
+    if (wl_display_get_error(st->display) != 0) {
+        g_daemon_wl_ok = false;
+        return false;
+    }
+    return true;
+}
 
 static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_t res,
                                         void *user_data)
@@ -376,7 +451,7 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
 
     switch (type) {
     case URING_EV_WAYLAND_READ:
-        g_daemon_wl_read_ready = true;
+        daemon_pump_wayland_events(st);
         break;
     case URING_EV_IPC_ACCEPT:
         daemon_handle_ipc_connection(st);
@@ -384,6 +459,7 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
     case URING_EV_TIMER:
         if ((res & POLLIN) == 0)
             break;
+        daemon_pump_wayland_events(st);
         if (fd == st->transition_timer_fd) {
             transition_engine_dispatch_tick(st);
         } else if (fd == st->video_engine.timer_fd) {
@@ -580,27 +656,20 @@ int main(int argc, char *argv[])
 
     /* Main event loop */
     while (state.running) {
-        while (wl_display_prepare_read(state.display) != 0) {
-            wl_display_dispatch_pending(state.display);
-        }
+        wl_display_dispatch_pending(state.display);
         wl_display_flush(state.display);
-
-        bool wl_read_ready = false;
+        g_daemon_wl_ok = true;
 
         if (state.use_uring) {
-            g_daemon_wl_read_ready = false;
             int ret = uring_loop_dispatch(&uring_loop, daemon_uring_event_callback);
             if (ret < 0 && ret != -EINTR) {
-                wl_display_cancel_read(state.display);
                 WAYWAL_LOG_ERR("io_uring dispatch failed: %s", strerror(-ret));
                 break;
             }
-            wl_read_ready = g_daemon_wl_read_ready;
         } else {
             struct epoll_event events[16];
             int nfds = epoll_wait(state.epoll_fd, events, 16, -1);
             if (nfds < 0) {
-                wl_display_cancel_read(state.display);
                 if (errno == EINTR)
                     continue;
                 WAYWAL_LOG_ERR("epoll_wait failed: %s", strerror(errno));
@@ -609,14 +678,24 @@ int main(int argc, char *argv[])
 
             for (int i = 0; i < nfds; ++i) {
                 if (events[i].data.fd == wl_fd) {
-                    wl_read_ready = true;
+                    daemon_pump_wayland_events(&state);
+                    break;
+                }
+            }
+
+            for (int i = 0; i < nfds; ++i) {
+                if (events[i].data.fd == wl_fd) {
+                    continue;
                 } else if (events[i].data.fd == state.server_socket_fd) {
                     daemon_handle_ipc_connection(&state);
                 } else if (events[i].data.fd == state.transition_timer_fd) {
+                    daemon_pump_wayland_events(&state);
                     transition_engine_dispatch_tick(&state);
                 } else if (events[i].data.fd == state.video_engine.timer_fd) {
+                    daemon_pump_wayland_events(&state);
                     video_engine_dispatch_frame(&state.video_engine);
                 } else if (events[i].data.fd == state.slideshow.timer_fd) {
+                    daemon_pump_wayland_events(&state);
                     slideshow_dispatch_tick(&state.slideshow);
                 } else if (events[i].data.fd == state.signal_fd) {
                     struct signalfd_siginfo fdsi;
@@ -635,15 +714,7 @@ int main(int argc, char *argv[])
             }
         }
 
-        if (wl_read_ready) {
-            if (wl_display_read_events(state.display) < 0) {
-                WAYWAL_LOG_ERR("Wayland display connection lost: %s", strerror(errno));
-                break;
-            }
-        } else {
-            wl_display_cancel_read(state.display);
-        }
-        if (wl_display_get_error(state.display) != 0) {
+        if (!g_daemon_wl_ok || wl_display_get_error(state.display) != 0) {
             WAYWAL_LOG_ERR("Wayland display encountered fatal error");
             break;
         }
