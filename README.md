@@ -2,6 +2,12 @@
 
 [![GitHub Repository](https://img.shields.io/badge/GitHub-execorn%2Fwwal-181717?logo=github)](https://github.com/execorn/wwal)
 
+<p align="center">
+  <a href="assets/demo.mp4">
+    <img src="assets/demo.webp" alt="WayWal Demo" width="100%">
+  </a>
+</p>
+
 **WayWal** (`wwald` daemon and `wwal` CLI) is a fast, low-memory Wayland desktop engine written in modern C (C23 / `gnu2x`). It replaces six separate tools (`swww`/`awww`, `hyprpaper`, `mpvpaper`, `wpaperd`, `shaderbg`/`glava`, and `matugen`/`wallust`) inside one `< 1.5 MB` binary.
 
 Repository: [https://github.com/execorn/wwal](https://github.com/execorn/wwal)
