@@ -1,8 +1,12 @@
 #ifndef WAYWAL_WAYLAND_CORE_H
 #define WAYWAL_WAYLAND_CORE_H
 
+#include "ext-foreign-toplevel-list-v1-client-protocol.h"
+#include "ext-idle-notify-v1-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include "linux-drm-syncobj-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
+#include "single-pixel-buffer-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "waywal/arena.h"
 #include "waywal/dmabuf.h"
@@ -25,8 +29,13 @@ extern "C" {
 
 #include "waywal/output_state.h"
 #include "waywal/slideshow.h"
+#include "waywal/toml_parser.h"
 
 struct daemon_state;
+struct waywal_power_governor;
+struct waywal_shader_engine;
+struct waywal_audio_fft;
+struct waywal_anim_decoder;
 
 typedef struct daemon_state {
     arena_t persistent_arena;
@@ -42,6 +51,11 @@ typedef struct daemon_state {
     struct wp_viewporter *viewporter;
     struct wp_fractional_scale_manager_v1 *fract_manager;
     struct wp_presentation *presentation;
+    struct wp_single_pixel_buffer_manager_v1 *single_pixel_mgr;
+    struct wp_linux_drm_syncobj_manager_v1 *syncobj_mgr;
+    struct ext_idle_notifier_v1 *idle_notifier;
+    struct ext_idle_notification_v1 *idle_notification;
+    struct ext_foreign_toplevel_list_v1 *foreign_toplevel_list;
 
     /* Hardware Direct Scanout context */
     dmabuf_context_t dmabuf_ctx;
@@ -54,6 +68,31 @@ typedef struct daemon_state {
 
     /* Built-in Daemon Slideshow Engine */
     slideshow_engine_t slideshow;
+
+    struct waywal_power_governor *power_gov;
+    struct waywal_shader_engine *shader_eng;
+    struct waywal_audio_fft *audio_fft;
+    int shader_timer_fd;
+    bool shader_active;
+    uint32_t shader_fps;
+    uint64_t shader_frame_idx;
+    uint64_t shader_start_ns;
+    uint64_t shader_last_ns;
+    char shader_target_output[64];
+    char shader_path[4096];
+
+    struct waywal_anim_decoder *anim_dec;
+    int anim_timer_fd;
+    bool anim_active;
+    uint8_t *anim_buf;
+    size_t anim_buf_size;
+    waywal_img_metadata_t anim_meta;
+    char anim_target_output[64];
+
+    uint32_t idle_timeout_sec;
+    waywal_config_t config;
+    void (*on_output_configured)(struct daemon_state *state, output_node_t *out);
+    void (*on_power_state_changed)(struct daemon_state *state);
 
     /* Modern Linux io_uring asynchronous event loop */
     uring_loop_t *uring_loop;
@@ -73,6 +112,9 @@ typedef struct daemon_state {
     int signal_fd;
     bool running;
 
+    bool use_bottom_layer;
+    bool backdrop_auto_blur;
+    char backdrop_path[4096];
     char namespace_str[64];
     color_rgba_t current_color;
 } daemon_state_t;
@@ -101,6 +143,7 @@ void output_node_render_image_with_transition(daemon_state_t *state, output_node
 
 void daemon_clear_all_outputs(daemon_state_t *state, color_rgba_t color);
 void daemon_handle_ipc_connection(daemon_state_t *state);
+void layer_shell_blur_rgba_cpu(const uint8_t *src, uint8_t *dst, uint32_t w, uint32_t h);
 
 #ifdef __cplusplus
 }

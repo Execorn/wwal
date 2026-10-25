@@ -1,6 +1,7 @@
 #ifndef WAYWAL_IPC_PROTO_H
 #define WAYWAL_IPC_PROTO_H
 
+#include "waywal/bezier.h"
 #include "waywal/path.h"
 
 #include <stdbool.h>
@@ -20,19 +21,28 @@ typedef enum : uint16_t {
     WAYWAL_REQ_QUERY = 0x0002,
     WAYWAL_REQ_CLEAR = 0x0003,
     WAYWAL_REQ_SET_IMAGE = 0x0004,
+    WAYWAL_REQ_IMG = WAYWAL_REQ_SET_IMAGE,
     WAYWAL_REQ_SET_VIDEO = 0x0005,
+    WAYWAL_REQ_VIDEO = WAYWAL_REQ_SET_VIDEO,
     WAYWAL_REQ_TOGGLE = 0x0006,
     WAYWAL_REQ_PAUSE = 0x0007,
     WAYWAL_REQ_UNPAUSE = 0x0008,
     WAYWAL_REQ_KILL = 0x0009,
     WAYWAL_REQ_SLIDESHOW = 0x000A,
-    WAYWAL_REQ_SLIDESHOW_CTRL = 0x000B,
+    WAYWAL_REQ_SHADER = 0x000B,
+    WAYWAL_IPC_OP_SHADER = WAYWAL_REQ_SHADER,
+    WAYWAL_REQ_STATS = 0x000C,
+    WAYWAL_IPC_OP_STATS = WAYWAL_REQ_STATS,
+    WAYWAL_REQ_RESTORE = 0x000D,
+    WAYWAL_IPC_OP_RESTORE = WAYWAL_REQ_RESTORE,
+    WAYWAL_REQ_SLIDESHOW_CTRL = 0x000E,
 
     WAYWAL_RESP_OK = 0x8001,
     WAYWAL_RESP_PONG = 0x8002,
     WAYWAL_RESP_INFO = 0x8003,
     WAYWAL_RESP_ERR = 0x8004,
 } waywal_opcode_t;
+typedef waywal_opcode_t waywal_ipc_op_t;
 
 #pragma pack(push, 1)
 typedef struct {
@@ -62,8 +72,14 @@ typedef struct {
     uint32_t custom_shader_len; /* bytes of custom shader code following outputs */
     uint32_t extra_data_len;    /* total length of (outputs strings + custom shader string) */
     uint32_t scaling_mode;      /* waywal_scaling_mode_t (default: 0 = FILL) */
+    uint32_t filter_mode;       /* waywal_filter_mode_t (default: 0 = LANCZOS3) */
+    bezier_curve_t bezier;
+    bool has_custom_bezier;
+    bool ten_bit;
+    char filepath[4096];
     /* Followed by num_target_outputs null-terminated strings, then custom shader GLSL string */
 } waywal_img_metadata_t;
+typedef waywal_img_metadata_t waywal_ipc_img_meta_t;
 
 typedef struct {
     uint8_t color[4];
@@ -104,8 +120,20 @@ typedef struct {
     bool random_order;
     uint32_t num_target_outputs;
     uint32_t scaling_mode; /* waywal_scaling_mode_t (default: 0 = FILL) */
+    uint32_t filter_mode;  /* waywal_filter_mode_t (default: 0 = LANCZOS3) */
+    bezier_curve_t bezier;
+    bool has_custom_bezier;
+    uint8_t color[4];
+    bool ten_bit;
     char path[4096];
 } waywal_slideshow_payload_t;
+
+typedef struct {
+    char output[64];
+    char shader_path[4096];
+    uint32_t fps;
+    bool audio_reactive;
+} waywal_shader_payload_t;
 #pragma pack(pop)
 
 /* Resolves runtime socket path: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-wwald.<namespace>.sock */
@@ -113,6 +141,7 @@ bool waywal_ipc_resolve_socket_path(path_buf_t *out_path, const char *namespace_
 
 /* Server: Create listening non-blocking Unix domain socket */
 int waywal_ipc_server_create(const char *namespace_str);
+bool waywal_ipc_is_socket_activated(void);
 
 /* Client: Connect to running daemon socket */
 int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms);

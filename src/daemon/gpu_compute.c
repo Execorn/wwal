@@ -13,6 +13,13 @@
 #include <GLES2/gl2ext.h>
 // clang-format on
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #include "shaders/shaders_embedded.h"
 #include "waywal/log.h"
 
@@ -56,6 +63,35 @@ struct gpu_compute_ctx {
     GLuint prog_light_leak;
     GLuint prog_page_curl;
     GLuint prog_custom;
+    GLuint prog_scale;
+    GLuint prog_kawase;
+
+    GLint loc_scale_src_res;
+    GLint loc_scale_dst_res;
+    GLint loc_scale_mode;
+    GLint loc_scale_clear;
+    GLint loc_scale_has_src;
+    GLint loc_kawase_src_res;
+    GLint loc_kawase_dst_res;
+    GLint loc_kawase_radius;
+    GLuint upload_src_tex;
+    uint32_t upload_src_w;
+    uint32_t upload_src_h;
+    const void *last_upload_ptr;
+    uint32_t last_upload_w;
+    uint32_t last_upload_h;
+    uint32_t last_upload_first_px;
+    uint32_t last_upload_last_px;
+    GLuint kawase_half_tex;
+    uint32_t kawase_half_w;
+    uint32_t kawase_half_h;
+
+    GLuint scratch_10bit_tex;
+    uint32_t scratch_10bit_w;
+    uint32_t scratch_10bit_h;
+    GLuint blit_10bit_fbo;
+    GLuint prog_blit_10bit;
+    GLuint blit_10bit_vao;
 
     gpu_program_uniforms_t unif_fade;
     gpu_program_uniforms_t unif_wipe;
@@ -156,9 +192,181 @@ static GLuint compile_shader_program(const char *src, const char *name)
     return prog;
 }
 
+static const char *SHADER_SRC_SCALE =
+    "#version 310 es\n"
+    "layout(local_size_x = 16, local_size_y = 16) in;\n"
+    "layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;\n"
+    "layout(binding = 1) uniform highp sampler2D u_src;\n"
+    "uniform ivec2 u_src_res;\n"
+    "uniform ivec2 u_dst_res;\n"
+    "uniform int u_scaling_mode;\n"
+    "uniform highp vec4 u_clear_color;\n"
+    "uniform int u_has_src;\n"
+    "void main() {\n"
+    "    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);\n"
+    "    if (coord.x >= u_dst_res.x || coord.y >= u_dst_res.y) return;\n"
+    "    if (u_has_src == 0 || u_src_res.x <= 0 || u_src_res.y <= 0) {\n"
+    "        imageStore(u_target, coord, u_clear_color.bgra);\n"
+    "        return;\n"
+    "    }\n"
+    "    if (u_dst_res.x == u_src_res.x && u_dst_res.y == u_src_res.y && u_scaling_mode != 4) {\n"
+    "        vec4 c = texelFetch(u_src, coord, 0);\n"
+    "        imageStore(u_target, coord, c.bgra);\n"
+    "        return;\n"
+    "    }\n"
+    "    vec2 src_f = vec2(u_src_res);\n"
+    "    vec2 dst_f = vec2(u_dst_res);\n"
+    "    vec4 out_col = u_clear_color;\n"
+    "    if (u_scaling_mode == 0) {\n"
+    "        float r_src = src_f.x / src_f.y;\n"
+    "        float r_dst = dst_f.x / dst_f.y;\n"
+    "        vec2 crop;\n"
+    "        vec2 off;\n"
+    "        if (r_src > r_dst) {\n"
+    "            crop.y = src_f.y;\n"
+    "            crop.x = crop.y * r_dst;\n"
+    "            off.x = (src_f.x - crop.x) * 0.5;\n"
+    "            off.y = 0.0;\n"
+    "        } else {\n"
+    "            crop.x = src_f.x;\n"
+    "            crop.y = crop.x / r_dst;\n"
+    "            off.x = 0.0;\n"
+    "            off.y = (src_f.y - crop.y) * 0.5;\n"
+    "        }\n"
+    "        vec2 s_px = off + (vec2(coord) + 0.5) * crop / dst_f;\n"
+    "        vec2 uv = clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f;\n"
+    "        out_col = texture(u_src, uv);\n"
+    "    } else if (u_scaling_mode == 1) {\n"
+    "        float r_src = src_f.x / src_f.y;\n"
+    "        float r_dst = dst_f.x / dst_f.y;\n"
+    "        if (r_src > r_dst) {\n"
+    "            int scaled_h = min(int(dst_f.x / r_src + 0.5), u_dst_res.y);\n"
+    "            int pad_y = (u_dst_res.y - scaled_h) / 2;\n"
+    "            if (coord.y >= pad_y && coord.y < pad_y + scaled_h && scaled_h > 0) {\n"
+    "                float sy = (float(coord.y - pad_y) + 0.5) * src_f.y / float(scaled_h);\n"
+    "                float sx = (float(coord.x) + 0.5) * src_f.x / dst_f.x;\n"
+    "                vec2 uv = clamp(vec2(sx, sy) + 0.5, vec2(0.5), src_f - 0.5) / src_f;\n"
+    "                out_col = texture(u_src, uv);\n"
+    "            }\n"
+    "        } else {\n"
+    "            int scaled_w = min(int(dst_f.y * r_src + 0.5), u_dst_res.x);\n"
+    "            int pad_x = (u_dst_res.x - scaled_w) / 2;\n"
+    "            if (coord.x >= pad_x && coord.x < pad_x + scaled_w && scaled_w > 0) {\n"
+    "                float sx = (float(coord.x - pad_x) + 0.5) * src_f.x / float(scaled_w);\n"
+    "                float sy = (float(coord.y) + 0.5) * src_f.y / dst_f.y;\n"
+    "                vec2 uv = clamp(vec2(sx, sy) + 0.5, vec2(0.5), src_f - 0.5) / src_f;\n"
+    "                out_col = texture(u_src, uv);\n"
+    "            }\n"
+    "        }\n"
+    "    } else if (u_scaling_mode == 2) {\n"
+    "        vec2 s_px = (vec2(coord) + 0.5) * src_f / dst_f;\n"
+    "        vec2 uv = clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f;\n"
+    "        out_col = texture(u_src, uv);\n"
+    "    } else if (u_scaling_mode == 3) {\n"
+    "        int off_x = (u_dst_res.x - u_src_res.x) / 2;\n"
+    "        int off_y = (u_dst_res.y - u_src_res.y) / 2;\n"
+    "        int sx = coord.x - off_x;\n"
+    "        int sy = coord.y - off_y;\n"
+    "        if (sx >= 0 && sx < u_src_res.x && sy >= 0 && sy < u_src_res.y) {\n"
+    "            out_col = texelFetch(u_src, ivec2(sx, sy), 0);\n"
+    "        }\n"
+    "    } else if (u_scaling_mode == 4) {\n"
+    "        ivec2 tc = ivec2(coord.x % u_src_res.x, coord.y % u_src_res.y);\n"
+    "        out_col = texelFetch(u_src, tc, 0);\n"
+    "    }\n"
+    "    imageStore(u_target, coord, out_col.bgra);\n"
+    "}\n";
+
+static const char *SHADER_SRC_KAWASE =
+    "#version 310 es\n"
+    "layout(local_size_x = 16, local_size_y = 16) in;\n"
+    "layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;\n"
+    "layout(binding = 1) uniform highp sampler2D u_src;\n"
+    "uniform ivec2 u_src_res;\n"
+    "uniform ivec2 u_dst_res;\n"
+    "uniform highp float u_radius;\n"
+    "void main() {\n"
+    "    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);\n"
+    "    if (coord.x >= u_dst_res.x || coord.y >= u_dst_res.y) return;\n"
+    "    vec2 src_f = max(vec2(u_src_res), vec2(1.0));\n"
+    "    vec2 dst_f = max(vec2(u_dst_res), vec2(1.0));\n"
+    "    vec2 uv = (vec2(coord) + 0.5) / dst_f;\n"
+    "    vec2 step_uv = max(u_radius, 1.0) / src_f;\n"
+    "    vec4 sum = texture(u_src, uv) * 4.0;\n"
+    "    sum += texture(u_src, clamp(uv + vec2(-step_uv.x, -step_uv.y), vec2(0.0), vec2(1.0))) * 2.0;\n"
+    "    sum += texture(u_src, clamp(uv + vec2( step_uv.x, -step_uv.y), vec2(0.0), vec2(1.0))) * 2.0;\n"
+    "    sum += texture(u_src, clamp(uv + vec2(-step_uv.x,  step_uv.y), vec2(0.0), vec2(1.0))) * 2.0;\n"
+    "    sum += texture(u_src, clamp(uv + vec2( step_uv.x,  step_uv.y), vec2(0.0), vec2(1.0))) * 2.0;\n"
+    "    sum += texture(u_src, clamp(uv + vec2(-2.0 * step_uv.x, 0.0), vec2(0.0), vec2(1.0)));\n"
+    "    sum += texture(u_src, clamp(uv + vec2( 2.0 * step_uv.x, 0.0), vec2(0.0), vec2(1.0)));\n"
+    "    sum += texture(u_src, clamp(uv + vec2(0.0, -2.0 * step_uv.y), vec2(0.0), vec2(1.0)));\n"
+    "    sum += texture(u_src, clamp(uv + vec2(0.0,  2.0 * step_uv.y), vec2(0.0), vec2(1.0)));\n"
+    "    vec4 out_col = sum * (1.0 / 16.0);\n"
+    "    imageStore(u_target, coord, out_col.bgra);\n"
+    "}\n";
+
+static GLuint compile_blit_10bit_program(void)
+{
+    static const char *vs_src =
+        "#version 310 es\n"
+        "out highp vec2 v_uv;\n"
+        "void main() {\n"
+        "    vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+        "    v_uv = pos;\n"
+        "    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);\n"
+        "}\n";
+    static const char *fs_src =
+        "#version 310 es\n"
+        "precision highp float;\n"
+        "in highp vec2 v_uv;\n"
+        "layout(binding = 0) uniform highp sampler2D u_tex;\n"
+        "out highp vec4 frag_color;\n"
+        "void main() {\n"
+        "    frag_color = texture(u_tex, v_uv);\n"
+        "}\n";
+
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    if (!vs || !fs) {
+        if (vs)
+            glDeleteShader(vs);
+        if (fs)
+            glDeleteShader(fs);
+        return 0;
+    }
+    glShaderSource(vs, 1, &vs_src, NULL);
+    glCompileShader(vs);
+    glShaderSource(fs, 1, &fs_src, NULL);
+    glCompileShader(fs);
+
+    GLint ok_vs = 0, ok_fs = 0;
+    glGetShaderiv(vs, GL_COMPILE_STATUS, &ok_vs);
+    glGetShaderiv(fs, GL_COMPILE_STATUS, &ok_fs);
+    if (!ok_vs || !ok_fs) {
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        return 0;
+    }
+
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    GLint linked = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        glDeleteProgram(prog);
+        return 0;
+    }
+    return prog;
+}
+
 gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
 {
-    if (!dmabuf_ctx || !dmabuf_ctx->gbm || !dmabuf_ctx->available) {
+    if (!dmabuf_ctx || dmabuf_ctx->drm_fd < 0 || !dmabuf_ctx->gbm) {
         return NULL;
     }
 
@@ -258,16 +466,27 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
     ctx->prog_luma = compile_shader_program(SHADER_SRC_LUMA, "luma");
     ctx->prog_light_leak = compile_shader_program(SHADER_SRC_LIGHT_LEAK, "light_leak");
     ctx->prog_page_curl = compile_shader_program(SHADER_SRC_PAGE_CURL, "page_curl");
+    ctx->prog_scale = compile_shader_program(SHADER_SRC_SCALE, "scale");
+    ctx->prog_kawase = compile_shader_program(SHADER_SRC_KAWASE, "kawase");
 
     if (!ctx->prog_fade || !ctx->prog_wipe || !ctx->prog_grow || !ctx->prog_outer ||
         !ctx->prog_wave || !ctx->prog_noise || !ctx->prog_crosszoom || !ctx->prog_slide ||
         !ctx->prog_glitch || !ctx->prog_burn || !ctx->prog_ripple || !ctx->prog_pixelate ||
         !ctx->prog_doom || !ctx->prog_swirl || !ctx->prog_cube || !ctx->prog_luma ||
-        !ctx->prog_light_leak || !ctx->prog_page_curl) {
+        !ctx->prog_light_leak || !ctx->prog_page_curl || !ctx->prog_scale || !ctx->prog_kawase) {
         WAYWAL_LOG_WARN("One or more compute shader programs failed to compile");
         gpu_compute_destroy(ctx);
         return NULL;
     }
+
+    ctx->loc_scale_src_res = glGetUniformLocation(ctx->prog_scale, "u_src_res");
+    ctx->loc_scale_dst_res = glGetUniformLocation(ctx->prog_scale, "u_dst_res");
+    ctx->loc_scale_mode = glGetUniformLocation(ctx->prog_scale, "u_scaling_mode");
+    ctx->loc_scale_clear = glGetUniformLocation(ctx->prog_scale, "u_clear_color");
+    ctx->loc_scale_has_src = glGetUniformLocation(ctx->prog_scale, "u_has_src");
+    ctx->loc_kawase_src_res = glGetUniformLocation(ctx->prog_kawase, "u_src_res");
+    ctx->loc_kawase_dst_res = glGetUniformLocation(ctx->prog_kawase, "u_dst_res");
+    ctx->loc_kawase_radius = glGetUniformLocation(ctx->prog_kawase, "u_radius");
 
     /* Cache uniform locations at compile/link time (PERF-01) */
     query_program_uniforms(ctx->prog_fade, &ctx->unif_fade);
@@ -298,6 +517,16 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
     return ctx;
 }
 
+void gpu_compute_invalidate_state_cache(gpu_compute_ctx_t *ctx)
+{
+    if (!ctx)
+        return;
+    ctx->current_prog = 0;
+    ctx->bound_target_tex = 0;
+    ctx->bound_old_tex = 0;
+    ctx->bound_new_tex = 0;
+}
+
 static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
 {
     if (!ctx || !bo)
@@ -309,6 +538,7 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
     if (ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
         if (eglGetCurrentContext() != ctx->context) {
             eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+            gpu_compute_invalidate_state_cache(ctx);
         }
     }
 
@@ -361,29 +591,6 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
 
     EGLImageKHR img =
         ctx->eglCreateImageKHR(ctx->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
-    if (img == EGL_NO_IMAGE_KHR && bo->modifier != DRM_FORMAT_MOD_INVALID) {
-        n = 0;
-        attribs[n++] = EGL_WIDTH;
-        attribs[n++] = (EGLint)bo->width;
-        attribs[n++] = EGL_HEIGHT;
-        attribs[n++] = (EGLint)bo->height;
-        attribs[n++] = EGL_LINUX_DRM_FOURCC_EXT;
-        attribs[n++] = (EGLint)bo->drm_format;
-        for (uint32_t p = 0; p < num_planes; ++p) {
-            if (bo->fd[p] < 0)
-                continue;
-            attribs[n++] = plane_fd_keys[p];
-            attribs[n++] = bo->fd[p];
-            attribs[n++] = plane_offset_keys[p];
-            attribs[n++] = (EGLint)bo->offset[p];
-            attribs[n++] = plane_pitch_keys[p];
-            attribs[n++] = (EGLint)bo->stride[p];
-        }
-        attribs[n] = EGL_NONE;
-        img = ctx->eglCreateImageKHR(ctx->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL,
-                                     attribs);
-    }
-
     if (img == EGL_NO_IMAGE_KHR) {
         WAYWAL_LOG_ERR("eglCreateImageKHR failed for BO %ux%u (0x%x)", bo->width, bo->height,
                        eglGetError());
@@ -411,6 +618,92 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
     return true;
 }
 
+static bool is_10bit_drm_format(uint32_t fmt)
+{
+    return fmt == DRM_FORMAT_ARGB2101010 || fmt == DRM_FORMAT_XRGB2101010 ||
+           fmt == DRM_FORMAT_ABGR2101010 || fmt == DRM_FORMAT_XBGR2101010;
+}
+
+static bool needs_scratch_fbo_blit(const gpu_compute_ctx_t *ctx, const dmabuf_bo_t *bo)
+{
+    if (!ctx || !bo)
+        return true;
+    if (is_10bit_drm_format(bo->drm_format))
+        return true;
+    if (ctx->glEGLImageTargetTexStorageEXT == NULL)
+        return true;
+    /* Any vendor-tiled or compressed modifier (DCC, CCS, AFBC, NVIDIA block-linear)
+     * must be written through the FBO render backend so auxiliary compression planes
+     * and tiling swizzles are updated by hardware ROPs. */
+    if (bo->modifier != DRM_FORMAT_MOD_LINEAR && bo->modifier != DRM_FORMAT_MOD_INVALID)
+        return true;
+    if (bo->num_planes > 1)
+        return true;
+    return false;
+}
+
+static GLuint ensure_10bit_scratch_target(gpu_compute_ctx_t *ctx, uint32_t width, uint32_t height)
+{
+    if (ctx->scratch_10bit_tex != 0 && ctx->scratch_10bit_w == width &&
+        ctx->scratch_10bit_h == height) {
+        return ctx->scratch_10bit_tex;
+    }
+    if (ctx->scratch_10bit_tex != 0) {
+        glDeleteTextures(1, &ctx->scratch_10bit_tex);
+        ctx->scratch_10bit_tex = 0;
+    }
+    glGenTextures(1, &ctx->scratch_10bit_tex);
+    glBindTexture(GL_TEXTURE_2D, ctx->scratch_10bit_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)width, (GLsizei)height);
+    ctx->scratch_10bit_w = width;
+    ctx->scratch_10bit_h = height;
+    return ctx->scratch_10bit_tex;
+}
+
+static bool blit_scratch_to_10bit_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target_bo)
+{
+    if (!ctx->prog_blit_10bit) {
+        ctx->prog_blit_10bit = compile_blit_10bit_program();
+        if (!ctx->prog_blit_10bit)
+            return false;
+    }
+    if (!ctx->blit_10bit_fbo) {
+        glGenFramebuffers(1, &ctx->blit_10bit_fbo);
+    }
+    if (!ctx->blit_10bit_vao) {
+        glGenVertexArrays(1, &ctx->blit_10bit_vao);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, ctx->blit_10bit_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target_bo->gl_tex,
+                           0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return false;
+    }
+
+    glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
+    glUseProgram(ctx->prog_blit_10bit);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, ctx->scratch_10bit_tex);
+    glBindVertexArray(ctx->blit_10bit_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindVertexArray(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    ctx->current_prog = 0;
+    ctx->bound_target_tex = 0;
+    ctx->bound_old_tex = 0;
+    ctx->bound_new_tex = 0;
+    return true;
+}
+
 static void select_transition_program(gpu_compute_ctx_t *ctx, waywal_transition_type_t type,
                                       GLuint *out_prog, gpu_program_uniforms_t **out_u);
 
@@ -422,9 +715,24 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         return false;
     }
 
+    if (ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
+        if (eglGetCurrentContext() != ctx->context) {
+            eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+            gpu_compute_invalidate_state_cache(ctx);
+        }
+    }
+
     if (!gpu_compute_import_bo(ctx, target_bo) || !gpu_compute_import_bo(ctx, old_bo) ||
         !gpu_compute_import_bo(ctx, new_bo)) {
         return false;
+    }
+
+    bool use_scratch = needs_scratch_fbo_blit(ctx, target_bo);
+    GLuint dst_image_tex = target_bo->gl_tex;
+    if (use_scratch) {
+        dst_image_tex = ensure_10bit_scratch_target(ctx, target_bo->width, target_bo->height);
+        if (!dst_image_tex)
+            return false;
     }
 
     GLuint prog = 0;
@@ -442,9 +750,9 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
     }
 
     /* Bind target storage image to binding point 0 */
-    if (ctx->bound_target_tex != target_bo->gl_tex) {
-        glBindImageTexture(0, target_bo->gl_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-        ctx->bound_target_tex = target_bo->gl_tex;
+    if (ctx->bound_target_tex != dst_image_tex) {
+        glBindImageTexture(0, dst_image_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+        ctx->bound_target_tex = dst_image_tex;
     }
 
     /* Bind source textures */
@@ -503,6 +811,11 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
 
     /* Targeted memory barrier ensuring GPU storage writes are visible */
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    if (use_scratch) {
+        if (!blit_scratch_to_10bit_bo(ctx, target_bo))
+            return false;
+    }
 
     if (ctx->eglCreateSyncKHR && ctx->eglClientWaitSyncKHR && ctx->eglDestroySyncKHR) {
         EGLSyncKHR sync = ctx->eglCreateSyncKHR(ctx->display, EGL_SYNC_FENCE_KHR, NULL);
@@ -861,6 +1174,22 @@ void gpu_compute_destroy(gpu_compute_ctx_t *ctx)
             glDeleteProgram(ctx->prog_page_curl);
         if (ctx->prog_custom)
             glDeleteProgram(ctx->prog_custom);
+        if (ctx->prog_scale)
+            glDeleteProgram(ctx->prog_scale);
+        if (ctx->prog_kawase)
+            glDeleteProgram(ctx->prog_kawase);
+        if (ctx->prog_blit_10bit)
+            glDeleteProgram(ctx->prog_blit_10bit);
+        if (ctx->upload_src_tex)
+            glDeleteTextures(1, &ctx->upload_src_tex);
+        if (ctx->kawase_half_tex)
+            glDeleteTextures(1, &ctx->kawase_half_tex);
+        if (ctx->scratch_10bit_tex)
+            glDeleteTextures(1, &ctx->scratch_10bit_tex);
+        if (ctx->blit_10bit_fbo)
+            glDeleteFramebuffers(1, &ctx->blit_10bit_fbo);
+        if (ctx->blit_10bit_vao)
+            glDeleteVertexArrays(1, &ctx->blit_10bit_vao);
 
         eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (ctx->context != EGL_NO_CONTEXT) {
@@ -876,13 +1205,16 @@ void gpu_compute_release_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
 {
     if (!ctx || !bo)
         return;
+    if (ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
+        if (eglGetCurrentContext() != ctx->context) {
+            eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+        }
+    }
     if (bo->gl_tex != 0) {
         glDeleteTextures(1, &bo->gl_tex);
         bo->gl_tex = 0;
     }
-    ctx->bound_target_tex = 0;
-    ctx->bound_old_tex = 0;
-    ctx->bound_new_tex = 0;
+    gpu_compute_invalidate_state_cache(ctx);
     if (bo->egl_image != NULL && ctx->eglDestroyImageKHR && ctx->display != EGL_NO_DISPLAY) {
         ctx->eglDestroyImageKHR(ctx->display, bo->egl_image);
         bo->egl_image = NULL;
@@ -911,4 +1243,440 @@ bool gpu_compute_load_custom_shader(gpu_compute_ctx_t *ctx, const char *src)
     query_program_uniforms(ctx->prog_custom, &ctx->unif_custom);
     WAYWAL_LOG_INFO("Loaded custom user compute shader successfully (prog=%u)", ctx->prog_custom);
     return true;
+}
+
+static void upload_source_rgba_dedup(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba,
+                                     uint32_t src_w, uint32_t src_h)
+{
+    uint32_t first_px = 0;
+    uint32_t last_px = 0;
+    memcpy(&first_px, src_rgba, sizeof(uint32_t));
+    memcpy(&last_px, src_rgba + ((size_t)src_w * (size_t)src_h - 1u) * 4u, sizeof(uint32_t));
+
+    if (ctx->upload_src_tex == 0 || ctx->upload_src_w != src_w || ctx->upload_src_h != src_h) {
+        if (ctx->upload_src_tex != 0) {
+            glDeleteTextures(1, &ctx->upload_src_tex);
+            ctx->upload_src_tex = 0;
+        }
+        glGenTextures(1, &ctx->upload_src_tex);
+        glBindTexture(GL_TEXTURE_2D, ctx->upload_src_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        /* Input pixels are little-endian ARGB8888 ([B, G, R, A]); swizzle to RGBA for shader sampling. */
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)src_w, (GLsizei)src_h);
+        ctx->upload_src_w = src_w;
+        ctx->upload_src_h = src_h;
+        ctx->last_upload_ptr = NULL;
+    }
+
+    if (ctx->last_upload_ptr == (const void *)src_rgba && ctx->last_upload_w == src_w &&
+        ctx->last_upload_h == src_h && ctx->last_upload_first_px == first_px &&
+        ctx->last_upload_last_px == last_px) {
+        return;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, ctx->upload_src_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)src_w, (GLsizei)src_h, GL_RGBA,
+                    GL_UNSIGNED_BYTE, src_rgba);
+    ctx->last_upload_ptr = (const void *)src_rgba;
+    ctx->last_upload_w = src_w;
+    ctx->last_upload_h = src_h;
+    ctx->last_upload_first_px = first_px;
+    ctx->last_upload_last_px = last_px;
+}
+
+static GLuint ensure_kawase_half_tex(gpu_compute_ctx_t *ctx, uint32_t width, uint32_t height)
+{
+    if (ctx->kawase_half_tex != 0 && ctx->kawase_half_w == width &&
+        ctx->kawase_half_h == height) {
+        return ctx->kawase_half_tex;
+    }
+    if (ctx->kawase_half_tex != 0) {
+        glDeleteTextures(1, &ctx->kawase_half_tex);
+        ctx->kawase_half_tex = 0;
+    }
+    glGenTextures(1, &ctx->kawase_half_tex);
+    glBindTexture(GL_TEXTURE_2D, ctx->kawase_half_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)width, (GLsizei)height);
+    ctx->kawase_half_w = width;
+    ctx->kawase_half_h = height;
+    return ctx->kawase_half_tex;
+}
+
+bool gpu_compute_upload_static(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, uint32_t src_w,
+                               uint32_t src_h, dmabuf_bo_t *dst_bo, waywal_scaling_mode_t scaling,
+                               uint32_t clear_color)
+{
+    if (!ctx || !dst_bo || dst_bo->width == 0 || dst_bo->height == 0 || !ctx->prog_scale) {
+        return false;
+    }
+
+    if (ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
+        if (eglGetCurrentContext() != ctx->context) {
+            eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+            gpu_compute_invalidate_state_cache(ctx);
+        }
+    }
+
+    if (!gpu_compute_import_bo(ctx, dst_bo)) {
+        return false;
+    }
+
+    bool has_src = (src_rgba != NULL && src_w > 0 && src_h > 0);
+    if (has_src) {
+        upload_source_rgba_dedup(ctx, src_rgba, src_w, src_h);
+    }
+
+    bool use_scratch = needs_scratch_fbo_blit(ctx, dst_bo);
+    GLuint dst_image_tex = dst_bo->gl_tex;
+    if (use_scratch) {
+        dst_image_tex = ensure_10bit_scratch_target(ctx, dst_bo->width, dst_bo->height);
+        if (!dst_image_tex)
+            return false;
+    }
+
+    glUseProgram(ctx->prog_scale);
+    ctx->current_prog = ctx->prog_scale;
+
+    glBindImageTexture(0, dst_image_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    ctx->bound_target_tex = dst_image_tex;
+
+    if (has_src) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, ctx->upload_src_tex);
+        ctx->bound_old_tex = ctx->upload_src_tex;
+    }
+
+    float ca = (float)((clear_color >> 24) & 0xFF) / 255.0f;
+    float cr = (float)((clear_color >> 16) & 0xFF) / 255.0f;
+    float cg = (float)((clear_color >> 8) & 0xFF) / 255.0f;
+    float cb = (float)(clear_color & 0xFF) / 255.0f;
+
+    if (ctx->loc_scale_src_res >= 0)
+        glUniform2i(ctx->loc_scale_src_res, (GLint)src_w, (GLint)src_h);
+    if (ctx->loc_scale_dst_res >= 0)
+        glUniform2i(ctx->loc_scale_dst_res, (GLint)dst_bo->width, (GLint)dst_bo->height);
+    if (ctx->loc_scale_mode >= 0)
+        glUniform1i(ctx->loc_scale_mode, (GLint)scaling);
+    if (ctx->loc_scale_clear >= 0)
+        glUniform4f(ctx->loc_scale_clear, cr, cg, cb, ca);
+    if (ctx->loc_scale_has_src >= 0)
+        glUniform1i(ctx->loc_scale_has_src, has_src ? 1 : 0);
+
+    GLuint groups_x = (dst_bo->width + 15) / 16;
+    GLuint groups_y = (dst_bo->height + 15) / 16;
+    glDispatchCompute(groups_x, groups_y, 1);
+
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    if (use_scratch) {
+        if (!blit_scratch_to_10bit_bo(ctx, dst_bo))
+            return false;
+    }
+
+    if (ctx->eglCreateSyncKHR && ctx->eglClientWaitSyncKHR && ctx->eglDestroySyncKHR) {
+        EGLSyncKHR sync = ctx->eglCreateSyncKHR(ctx->display, EGL_SYNC_FENCE_KHR, NULL);
+        if (sync != EGL_NO_SYNC_KHR) {
+            ctx->eglClientWaitSyncKHR(ctx->display, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR,
+                                      EGL_FOREVER_KHR);
+            ctx->eglDestroySyncKHR(ctx->display, sync);
+        } else {
+            glFlush();
+            glFinish();
+        }
+    } else {
+        glFinish();
+    }
+
+    return true;
+}
+
+bool gpu_compute_render_kawase_blur(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, uint32_t src_w,
+                                    uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t radius)
+{
+    if (!ctx || !src_rgba || src_w == 0 || src_h == 0 || !dst_bo || dst_bo->width == 0 ||
+        dst_bo->height == 0 || !ctx->prog_kawase) {
+        return false;
+    }
+
+    if (ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
+        if (eglGetCurrentContext() != ctx->context) {
+            eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+            gpu_compute_invalidate_state_cache(ctx);
+        }
+    }
+
+    if (!gpu_compute_import_bo(ctx, dst_bo)) {
+        return false;
+    }
+
+    upload_source_rgba_dedup(ctx, src_rgba, src_w, src_h);
+
+    uint32_t half_w = dst_bo->width > 1u ? (dst_bo->width / 2u) : 1u;
+    uint32_t half_h = dst_bo->height > 1u ? (dst_bo->height / 2u) : 1u;
+    GLuint half_tex = ensure_kawase_half_tex(ctx, half_w, half_h);
+    if (!half_tex) {
+        return false;
+    }
+
+    glUseProgram(ctx->prog_kawase);
+    ctx->current_prog = ctx->prog_kawase;
+
+    /* Pass 1: Downsample + Kawase pre-blur into half_tex */
+    glBindImageTexture(0, half_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, ctx->upload_src_tex);
+    if (ctx->loc_kawase_src_res >= 0)
+        glUniform2i(ctx->loc_kawase_src_res, (GLint)src_w, (GLint)src_h);
+    if (ctx->loc_kawase_dst_res >= 0)
+        glUniform2i(ctx->loc_kawase_dst_res, (GLint)half_w, (GLint)half_h);
+    if (ctx->loc_kawase_radius >= 0)
+        glUniform1f(ctx->loc_kawase_radius, (float)(radius > 1u ? (radius / 2u) : 2u));
+
+    glDispatchCompute((half_w + 15u) / 16u, (half_h + 15u) / 16u, 1u);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    /* Pass 2: Upsample + Kawase final blur from half_tex into dst_bo / scratch */
+    bool use_scratch = needs_scratch_fbo_blit(ctx, dst_bo);
+    GLuint dst_image_tex = dst_bo->gl_tex;
+    if (use_scratch) {
+        dst_image_tex = ensure_10bit_scratch_target(ctx, dst_bo->width, dst_bo->height);
+        if (!dst_image_tex)
+            return false;
+    }
+
+    glBindImageTexture(0, dst_image_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    ctx->bound_target_tex = dst_image_tex;
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, half_tex);
+    ctx->bound_old_tex = half_tex;
+
+    if (ctx->loc_kawase_src_res >= 0)
+        glUniform2i(ctx->loc_kawase_src_res, (GLint)half_w, (GLint)half_h);
+    if (ctx->loc_kawase_dst_res >= 0)
+        glUniform2i(ctx->loc_kawase_dst_res, (GLint)dst_bo->width, (GLint)dst_bo->height);
+    if (ctx->loc_kawase_radius >= 0)
+        glUniform1f(ctx->loc_kawase_radius, (float)(radius > 1u ? (radius / 2u) : 2u));
+
+    GLuint groups_x = (dst_bo->width + 15u) / 16u;
+    GLuint groups_y = (dst_bo->height + 15u) / 16u;
+    glDispatchCompute(groups_x, groups_y, 1u);
+
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    if (use_scratch) {
+        if (!blit_scratch_to_10bit_bo(ctx, dst_bo))
+            return false;
+    }
+
+    if (ctx->eglCreateSyncKHR && ctx->eglClientWaitSyncKHR && ctx->eglDestroySyncKHR) {
+        EGLSyncKHR sync = ctx->eglCreateSyncKHR(ctx->display, EGL_SYNC_FENCE_KHR, NULL);
+        if (sync != EGL_NO_SYNC_KHR) {
+            ctx->eglClientWaitSyncKHR(ctx->display, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR,
+                                      EGL_FOREVER_KHR);
+            ctx->eglDestroySyncKHR(ctx->display, sync);
+        } else {
+            glFlush();
+            glFinish();
+        }
+    } else {
+        glFinish();
+    }
+
+    return true;
+}
+
+static inline uint32_t avg_u32_epu8_scalar(uint32_t a, uint32_t b)
+{
+    uint32_t rb = (((a & 0x00FF00FFu) + (b & 0x00FF00FFu) + 0x00010001u) >> 1) & 0x00FF00FFu;
+    uint32_t ag =
+        ((((a >> 8) & 0x00FF00FFu) + ((b >> 8) & 0x00FF00FFu) + 0x00010001u) >> 1) & 0x00FF00FFu;
+    return rb | (ag << 8);
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2"))) static void kawase_pass_row_avx2(uint32_t *restrict dst_row,
+                                                                 const uint32_t *restrict row_up,
+                                                                 const uint32_t *restrict row_cc,
+                                                                 const uint32_t *restrict row_dn,
+                                                                 uint32_t hw)
+{
+    if (hw == 0)
+        return;
+
+    /* x = 0 boundary */
+    {
+        uint32_t x1 = (hw > 1u) ? 1u : 0u;
+        uint32_t d0 = avg_u32_epu8_scalar(row_up[0], row_up[x1]);
+        uint32_t d1 = avg_u32_epu8_scalar(row_dn[0], row_dn[x1]);
+        dst_row[0] = avg_u32_epu8_scalar(row_cc[0], avg_u32_epu8_scalar(d0, d1));
+    }
+
+    uint32_t x = 1u;
+    for (; x + 8u < hw; x += 8u) {
+        __m256i v_ul = _mm256_loadu_si256((const __m256i *)(row_up + x - 1u));
+        __m256i v_ur = _mm256_loadu_si256((const __m256i *)(row_up + x + 1u));
+        __m256i v_dl = _mm256_loadu_si256((const __m256i *)(row_dn + x - 1u));
+        __m256i v_dr = _mm256_loadu_si256((const __m256i *)(row_dn + x + 1u));
+        __m256i v_cc = _mm256_loadu_si256((const __m256i *)(row_cc + x));
+        __m256i v_diag = _mm256_avg_epu8(_mm256_avg_epu8(v_ul, v_ur), _mm256_avg_epu8(v_dl, v_dr));
+        __m256i v_out = _mm256_avg_epu8(v_cc, v_diag);
+        _mm256_storeu_si256((__m256i *)(dst_row + x), v_out);
+    }
+
+    for (; x < hw; ++x) {
+        uint32_t xm = (x > 0u) ? (x - 1u) : 0u;
+        uint32_t xp = (x + 1u < hw) ? (x + 1u) : (hw - 1u);
+        uint32_t d0 = avg_u32_epu8_scalar(row_up[xm], row_up[xp]);
+        uint32_t d1 = avg_u32_epu8_scalar(row_dn[xm], row_dn[xp]);
+        dst_row[x] = avg_u32_epu8_scalar(row_cc[x], avg_u32_epu8_scalar(d0, d1));
+    }
+}
+#endif
+
+static void kawase_pass_row_scalar(uint32_t *restrict dst_row, const uint32_t *restrict row_up,
+                                   const uint32_t *restrict row_cc, const uint32_t *restrict row_dn,
+                                   uint32_t hw)
+{
+    for (uint32_t x = 0; x < hw; ++x) {
+        uint32_t xm = (x > 0u) ? (x - 1u) : 0u;
+        uint32_t xp = (x + 1u < hw) ? (x + 1u) : (hw - 1u);
+        uint32_t d0 = avg_u32_epu8_scalar(row_up[xm], row_up[xp]);
+        uint32_t d1 = avg_u32_epu8_scalar(row_dn[xm], row_dn[xp]);
+        dst_row[x] = avg_u32_epu8_scalar(row_cc[x], avg_u32_epu8_scalar(d0, d1));
+    }
+}
+
+void layer_shell_blur_rgba_cpu(const uint8_t *src, uint8_t *dst, uint32_t w, uint32_t h)
+{
+    if (!src || !dst || w == 0 || h == 0)
+        return;
+
+    size_t total_bytes = (size_t)w * (size_t)h * 4u;
+    uint32_t ds = (w >= 256u && h >= 256u) ? 4u : ((w >= 16u && h >= 16u) ? 2u : 1u);
+    uint32_t hw = (w + ds - 1u) / ds;
+    uint32_t hh = (h + ds - 1u) / ds;
+
+    size_t pyr_bytes = (size_t)hw * (size_t)hh * sizeof(uint32_t);
+    uint32_t *buf_a = (uint32_t *)malloc(pyr_bytes * 2u);
+    if (!buf_a) {
+        if (src != dst)
+            memcpy(dst, src, total_bytes);
+        return;
+    }
+    uint32_t *buf_b = buf_a + (size_t)hw * (size_t)hh;
+    const uint32_t *src_u32 = (const uint32_t *)src;
+    uint32_t *dst_u32 = (uint32_t *)dst;
+
+#if defined(__x86_64__) || defined(_M_X64)
+    bool has_avx2 = __builtin_cpu_supports("avx2");
+#endif
+
+    /* Stage 1: Box Downsample (src -> buf_a) */
+#pragma omp parallel for schedule(static)
+    for (uint32_t hy = 0; hy < hh; ++hy) {
+        uint32_t *out_row = buf_a + (size_t)hy * hw;
+        uint32_t y0 = hy * ds;
+        uint32_t y1 = (y0 + 1u < h) ? (y0 + 1u) : (h - 1u);
+        const uint32_t *r0 = src_u32 + (size_t)y0 * w;
+        const uint32_t *r1 = src_u32 + (size_t)y1 * w;
+
+        if (ds == 4u) {
+            uint32_t y2 = (y0 + 2u < h) ? (y0 + 2u) : (h - 1u);
+            uint32_t y3 = (y0 + 3u < h) ? (y0 + 3u) : (h - 1u);
+            const uint32_t *r2 = src_u32 + (size_t)y2 * w;
+            const uint32_t *r3 = src_u32 + (size_t)y3 * w;
+            for (uint32_t hx = 0; hx < hw; ++hx) {
+                uint32_t x0 = hx * 4u;
+                uint32_t x1 = (x0 + 1u < w) ? (x0 + 1u) : (w - 1u);
+                uint32_t x2 = (x0 + 2u < w) ? (x0 + 2u) : (w - 1u);
+                uint32_t x3 = (x0 + 3u < w) ? (x0 + 3u) : (w - 1u);
+                uint32_t c0 = avg_u32_epu8_scalar(avg_u32_epu8_scalar(r0[x0], r0[x1]),
+                                                  avg_u32_epu8_scalar(r0[x2], r0[x3]));
+                uint32_t c1 = avg_u32_epu8_scalar(avg_u32_epu8_scalar(r1[x0], r1[x1]),
+                                                  avg_u32_epu8_scalar(r1[x2], r1[x3]));
+                uint32_t c2 = avg_u32_epu8_scalar(avg_u32_epu8_scalar(r2[x0], r2[x1]),
+                                                  avg_u32_epu8_scalar(r2[x2], r2[x3]));
+                uint32_t c3 = avg_u32_epu8_scalar(avg_u32_epu8_scalar(r3[x0], r3[x1]),
+                                                  avg_u32_epu8_scalar(r3[x2], r3[x3]));
+                out_row[hx] =
+                    avg_u32_epu8_scalar(avg_u32_epu8_scalar(c0, c1), avg_u32_epu8_scalar(c2, c3));
+            }
+        } else if (ds == 2u) {
+            for (uint32_t hx = 0; hx < hw; ++hx) {
+                uint32_t x0 = hx * 2u;
+                uint32_t x1 = (x0 + 1u < w) ? (x0 + 1u) : (w - 1u);
+                uint32_t c0 = avg_u32_epu8_scalar(r0[x0], r0[x1]);
+                uint32_t c1 = avg_u32_epu8_scalar(r1[x0], r1[x1]);
+                out_row[hx] = avg_u32_epu8_scalar(c0, c1);
+            }
+        } else {
+            memcpy(out_row, r0, (size_t)hw * sizeof(uint32_t));
+        }
+    }
+
+    /* Stage 2: 2-Pass Dual-Filter Kawase Pyramid on hw x hh (buf_a -> buf_b -> buf_a) */
+    for (int pass = 0; pass < 2; ++pass) {
+        const uint32_t *in_pyr = (pass == 0) ? buf_a : buf_b;
+        uint32_t *out_pyr = (pass == 0) ? buf_b : buf_a;
+#pragma omp parallel for schedule(static)
+        for (uint32_t hy = 0; hy < hh; ++hy) {
+            uint32_t y_up = (hy > 0u) ? (hy - 1u) : 0u;
+            uint32_t y_dn = (hy + 1u < hh) ? (hy + 1u) : (hh - 1u);
+            const uint32_t *row_up = in_pyr + (size_t)y_up * hw;
+            const uint32_t *row_cc = in_pyr + (size_t)hy * hw;
+            const uint32_t *row_dn = in_pyr + (size_t)y_dn * hw;
+            uint32_t *dst_row = out_pyr + (size_t)hy * hw;
+#if defined(__x86_64__) || defined(_M_X64)
+            if (has_avx2) {
+                kawase_pass_row_avx2(dst_row, row_up, row_cc, row_dn, hw);
+                continue;
+            }
+#endif
+            kawase_pass_row_scalar(dst_row, row_up, row_cc, row_dn, hw);
+        }
+    }
+
+    /* Stage 3: Bilinear / Kawase Upsample from buf_a (hw x hh) to dst (w x h) */
+#pragma omp parallel for schedule(static)
+    for (uint32_t y = 0; y < h; ++y) {
+        uint32_t *dst_row = dst_u32 + (size_t)y * w;
+        if (ds == 1u) {
+            memcpy(dst_row, buf_a + (size_t)y * hw, (size_t)w * sizeof(uint32_t));
+            continue;
+        }
+        uint32_t hy0 = y / ds;
+        if (hy0 >= hh)
+            hy0 = hh - 1u;
+        uint32_t hy1 = (hy0 + 1u < hh) ? (hy0 + 1u) : (hh - 1u);
+        uint32_t ry = y % ds;
+        const uint32_t *r0 = buf_a + (size_t)hy0 * hw;
+        const uint32_t *r1 = buf_a + (size_t)hy1 * hw;
+
+        for (uint32_t x = 0; x < w; ++x) {
+            uint32_t hx0 = x / ds;
+            if (hx0 >= hw)
+                hx0 = hw - 1u;
+            uint32_t hx1 = (hx0 + 1u < hw) ? (hx0 + 1u) : (hw - 1u);
+            uint32_t rx = x % ds;
+
+            uint32_t top = (rx == 0u) ? r0[hx0] : avg_u32_epu8_scalar(r0[hx0], r0[hx1]);
+            uint32_t bot = (rx == 0u) ? r1[hx0] : avg_u32_epu8_scalar(r1[hx0], r1[hx1]);
+            dst_row[x] = (ry == 0u) ? top : avg_u32_epu8_scalar(top, bot);
+        }
+    }
+
+    free(buf_a);
 }

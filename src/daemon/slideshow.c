@@ -23,7 +23,9 @@ static bool has_image_extension(const char *name)
         return false;
     return (strcasecmp(dot, ".png") == 0 || strcasecmp(dot, ".jpg") == 0 ||
             strcasecmp(dot, ".jpeg") == 0 || strcasecmp(dot, ".webp") == 0 ||
-            strcasecmp(dot, ".bmp") == 0 || strcasecmp(dot, ".gif") == 0);
+            strcasecmp(dot, ".bmp") == 0 || strcasecmp(dot, ".gif") == 0 ||
+            strcasecmp(dot, ".avif") == 0 || strcasecmp(dot, ".jxl") == 0 ||
+            strcasecmp(dot, ".svg") == 0);
 }
 
 static void add_file_to_list(slideshow_engine_t *ss, const char *filepath)
@@ -151,7 +153,7 @@ static void display_current_image(slideshow_engine_t *ss)
     waywal_img_metadata_t meta = {
         .width = img_w,
         .height = img_h,
-        .pixel_format = 0,
+        .pixel_format = ss->ten_bit ? 1 : 0,
         .transition_type = trans_type,
         .transition_duration_ms =
             ss->transition_duration_ms > 0 ? ss->transition_duration_ms : 1000,
@@ -161,11 +163,16 @@ static void display_current_image(slideshow_engine_t *ss)
         .transition_wave_amp = ss->transition_wave_amp > 0.0f ? ss->transition_wave_amp : 0.05f,
         .transition_center_x = ss->transition_center_x,
         .transition_center_y = ss->transition_center_y,
-        .num_target_outputs = ss->num_target_outputs,
+        .color = {ss->color[0], ss->color[1], ss->color[2], ss->color[3]},
+        .num_target_outputs = 0,
         .sync_mode = 0,
         .stagger_delay_ms = 0,
         .custom_shader_len = 0,
         .scaling_mode = ss->scaling_mode,
+        .filter_mode = ss->filter_mode,
+        .bezier = ss->bezier,
+        .has_custom_bezier = ss->has_custom_bezier,
+        .ten_bit = ss->ten_bit,
     };
 
     WAYWAL_LOG_INFO("Slideshow [%zu/%zu]: displaying '%s' (transition: %u)",
@@ -250,6 +257,11 @@ bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *p
     ss->random_order = payload->random_order;
     ss->num_target_outputs = payload->num_target_outputs;
     ss->scaling_mode = payload->scaling_mode;
+    ss->filter_mode = payload->filter_mode;
+    ss->bezier = payload->bezier;
+    ss->has_custom_bezier = payload->has_custom_bezier;
+    memcpy(ss->color, payload->color, sizeof(ss->color));
+    ss->ten_bit = payload->ten_bit;
 
     ss->active = true;
     ss->paused = false;
@@ -332,12 +344,15 @@ void slideshow_prev(slideshow_engine_t *ss)
 
 void slideshow_dispatch_tick(slideshow_engine_t *ss)
 {
-    if (!ss || !ss->active || ss->paused || ss->num_files == 0)
+    if (!ss || ss->timer_fd < 0)
         return;
 
     uint64_t expirations = 0;
     ssize_t s = read(ss->timer_fd, &expirations, sizeof(expirations));
     if (s <= 0 || expirations == 0)
+        return;
+
+    if (!ss->active || ss->paused || ss->num_files == 0)
         return;
 
     ss->current_file_idx = (ss->current_file_idx + 1) % ss->num_files;

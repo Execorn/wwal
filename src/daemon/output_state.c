@@ -1,5 +1,6 @@
 #include "waywal/output_state.h"
 
+#include "fractional-scale-v1-client-protocol.h"
 #include "waywal/log.h"
 
 #include <stdio.h>
@@ -35,8 +36,10 @@ static void output_handle_mode(void *data, struct wl_output *output, uint32_t fl
     output_state_t *st = (output_state_t *)data;
     if (st && (flags & WL_OUTPUT_MODE_CURRENT)) {
         if (width > 0 && height > 0) {
-            st->width = (uint32_t)width;
-            st->height = (uint32_t)height;
+            st->mode_width = width;
+            st->mode_height = height;
+            st->width = width;
+            st->height = height;
         }
         if (refresh > 0) {
             st->refresh_mhz = (uint32_t)refresh;
@@ -112,6 +115,11 @@ void output_manager_destroy(output_manager_t *om)
 
         output_node_destroy_surface(cur);
 
+        if (cur->fract_scale) {
+            wp_fractional_scale_v1_destroy(cur->fract_scale);
+            cur->fract_scale = NULL;
+        }
+
         if (cur->use_dmabuf && om->dmabuf_ctx) {
             dmabuf_ring_destroy(om->dmabuf_ctx, &cur->dmabuf_ring);
         }
@@ -178,6 +186,11 @@ void output_manager_remove(output_manager_t *om, uint32_t name)
                             entry->name[0] ? entry->name : "unnamed", om->count);
 
             output_node_destroy_surface(entry);
+
+            if (entry->fract_scale) {
+                wp_fractional_scale_v1_destroy(entry->fract_scale);
+                entry->fract_scale = NULL;
+            }
 
             if (entry->use_dmabuf && om->dmabuf_ctx) {
                 dmabuf_ring_destroy(om->dmabuf_ctx, &entry->dmabuf_ring);

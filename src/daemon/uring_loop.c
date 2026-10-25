@@ -81,18 +81,22 @@ bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_e
         return false;
     }
 
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
+    if (!sqe) {
+        (void)io_uring_submit(&loop->ring);
+        sqe = io_uring_get_sqe(&loop->ring);
+    }
+    if (!sqe) {
+        WAYWAL_LOG_ERR("io_uring_get_sqe failed: submission queue full");
+        return false;
+    }
+
     slot->fd = fd;
     slot->poll_mask = poll_mask;
     slot->type = type;
     slot->user_data = user_data;
     slot->active = true;
-    slot->is_multishot = false;
-
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
-    if (!sqe) {
-        WAYWAL_LOG_ERR("io_uring_get_sqe failed: submission queue full");
-        return false;
-    }
+    slot->is_multishot = loop->multishot_supported;
 
     if (slot->is_multishot) {
         io_uring_prep_poll_multishot(sqe, fd, poll_mask);
@@ -103,10 +107,38 @@ bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_e
     int ret = io_uring_submit(&loop->ring);
     if (ret < 0) {
         WAYWAL_LOG_ERR("io_uring_submit failed: %s", strerror(-ret));
+        memset(slot, 0, sizeof(*slot));
         return false;
     }
 
     return true;
+}
+
+bool uring_loop_remove_poll(waywal_uring_loop_t *loop, int fd)
+{
+    if (!loop || !loop->initialized || fd < 0)
+        return false;
+
+    bool removed = false;
+    for (size_t i = 0; i < WAYWAL_URING_QUEUE_DEPTH; ++i) {
+        if (loop->slots[i].active && loop->slots[i].fd == fd) {
+            uring_slot_t *slot = &loop->slots[i];
+            slot->active = false;
+            slot->fd = -1;
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
+            if (!sqe) {
+                (void)io_uring_submit(&loop->ring);
+                sqe = io_uring_get_sqe(&loop->ring);
+            }
+            if (sqe) {
+                io_uring_prep_poll_remove(sqe, (__u64)(uintptr_t)slot);
+                io_uring_sqe_set_data(sqe, NULL);
+                (void)io_uring_submit(&loop->ring);
+            }
+            removed = true;
+        }
+    }
+    return removed;
 }
 
 int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
@@ -138,6 +170,20 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
         }
         if (slot && slot->active) {
             if (cqe->res < 0) {
+                if (cqe->res == -EINVAL && slot->is_multishot) {
+                    loop->multishot_supported = false;
+                    slot->is_multishot = false;
+                    struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
+                    if (!sqe) {
+                        (void)io_uring_submit(&loop->ring);
+                        sqe = io_uring_get_sqe(&loop->ring);
+                    }
+                    if (sqe) {
+                        io_uring_prep_poll_add(sqe, slot->fd, slot->poll_mask);
+                        io_uring_sqe_set_data(sqe, slot);
+                    }
+                    continue;
+                }
                 WAYWAL_LOG_WARN("uring poll error: fd=%d res=%d", slot->fd, cqe->res);
                 if (!(cqe->flags & IORING_CQE_F_MORE)) {
                     slot->active = false;

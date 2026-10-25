@@ -3,17 +3,38 @@ set -euo pipefail
 
 NAMESPACE="test_integ_$$"
 BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build" && pwd)"
+TMP_INTEG_STATE="$(mktemp -d /tmp/wwal_integ_state_XXXXXX)"
+TMP_INTEG_CACHE="$(mktemp -d /tmp/wwal_integ_cache_XXXXXX)"
+export WWAL_STATE_DIR="${TMP_INTEG_STATE}"
+export WWAL_CACHE_DIR="${TMP_INTEG_CACHE}"
 
 echo "=== Running WayWal Integration Test ==="
 echo "Build directory: ${BUILD_DIR}"
 echo "Namespace: ${NAMESPACE}"
+
+# Verify standalone CLI commands that do not require an active compositor
+echo "[0] Testing standalone wwal CLI commands (--version, --help, theme)..."
+"${BUILD_DIR}/wwal" --version
+"${BUILD_DIR}/wwal" --help >/dev/null
+TMP_THEME_STATE=$(mktemp -d /tmp/wwal_integ_theme_state_XXXXXX)
+TMP_THEME_CACHE=$(mktemp -d /tmp/wwal_integ_theme_cache_XXXXXX)
+WWAL_STATE_DIR="${TMP_THEME_STATE}" WWAL_CACHE_DIR="${TMP_THEME_CACHE}" \
+    "${BUILD_DIR}/wwal" theme "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png"
+rm -rf "${TMP_THEME_STATE}" "${TMP_THEME_CACHE}"
+
+WL_SOCK="${XDG_RUNTIME_DIR:-/tmp}/${WAYLAND_DISPLAY:-wayland-0}"
+if [ ! -S "${WL_SOCK}" ]; then
+    echo "SKIP: No live Wayland compositor socket at ${WL_SOCK} (headless CI environment)."
+    rm -rf "${TMP_INTEG_STATE}" "${TMP_INTEG_CACHE}"
+    exit 77
+fi
 
 # Start daemon in background
 echo "[1] Starting wwald daemon..."
 "${BUILD_DIR}/wwald" --namespace "${NAMESPACE}" -v &
 DAEMON_PID=$!
 
-trap 'kill -9 ${DAEMON_PID} 2>/dev/null || true' EXIT
+trap 'kill -9 ${DAEMON_PID} 2>/dev/null || true; rm -rf "${TMP_INTEG_STATE}" "${TMP_INTEG_CACHE}"' EXIT
 
 SOCK_PATH="${XDG_RUNTIME_DIR:-/tmp}/${WAYLAND_DISPLAY:-wayland-0}-wwald.${NAMESPACE}.sock"
 
@@ -110,8 +131,8 @@ echo "[24] Testing positional aliases (cursor, center, top-left)..."
 echo "[25] Testing custom compute shader transition..."
 "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type custom --transition-shader "$(dirname "${BASH_SOURCE[0]}")/custom_test.comp" --transition-duration 0.05
 
-echo "[26] Testing staggered synchronization mode and 10-bit scanout flag..."
-"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type fade --transition-duration 0.05 --sync-mode staggered --stagger-delay 50 --10bit
+echo "[26] Testing staggered synchronization mode, custom bezier, fill-color, and 10-bit scanout flag..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type fade --transition-duration 0.05 --transition-bezier 0.42,0.0,0.58,1.0 --fill-color 1a2b3c --scaling-mode fit --sync-mode staggered --stagger-delay 50 --10bit
 
 echo "[27] Testing slideshow daemon engine and runtime controls..."
 TMP_SLIDESHOW_DIR=$(mktemp -d /tmp/wwal_integ_slideshow_XXXXXX)
@@ -163,12 +184,29 @@ if [ -f "${VIDEO_PATH}" ]; then
     sleep 0.05
 fi
 
+echo "[32] Testing wwal stats telemetry..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" stats
+
+echo "[33] Testing wwal theme standalone extraction..."
+TMP_THEME_STATE=$(mktemp -d /tmp/wwal_integ_theme_state_XXXXXX)
+TMP_THEME_CACHE=$(mktemp -d /tmp/wwal_integ_theme_cache_XXXXXX)
+WWAL_STATE_DIR="${TMP_THEME_STATE}" WWAL_CACHE_DIR="${TMP_THEME_CACHE}" \
+    "${BUILD_DIR}/wwal" theme "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png"
+rm -rf "${TMP_THEME_STATE}" "${TMP_THEME_CACHE}"
+
+echo "[34] Testing swww compatibility flags (--resize, --fill-color, --filter)..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --resize crop --fill-color 1e1e2e --filter Lanczos3 --transition-type left --transition-pos tr --transition-duration 0.05
+
+echo "[35] Testing wwal restore..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" restore
+
 # 8. Terminate daemon
-echo "[16] Testing kill command..."
+echo "[36] Testing kill command..."
 "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" kill
 
 # Wait for daemon process to terminate
 wait "${DAEMON_PID}" || true
+rm -rf "${TMP_INTEG_STATE}" "${TMP_INTEG_CACHE}"
 trap - EXIT
 
 echo "=== Integration Test PASSED Successfully! ==="

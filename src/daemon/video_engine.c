@@ -208,16 +208,16 @@ static void configure_output_video_viewport(output_node_t *out, uint32_t vid_w, 
         }
 
         if (fabs(crop_w - (double)vid_w) < 0.5 && fabs(crop_h - (double)vid_h) < 0.5) {
-            wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
-                                   wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+            wp_viewport_set_source(out->viewport, wl_fixed_from_int(0), wl_fixed_from_int(0),
+                                   wl_fixed_from_int((int)vid_w), wl_fixed_from_int((int)vid_h));
         } else {
             wp_viewport_set_source(out->viewport, wl_fixed_from_double(off_x),
                                    wl_fixed_from_double(off_y), wl_fixed_from_double(crop_w),
                                    wl_fixed_from_double(crop_h));
         }
     } else {
-        wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
-                               wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+        wp_viewport_set_source(out->viewport, wl_fixed_from_int(0), wl_fixed_from_int(0),
+                               wl_fixed_from_int((int)vid_w), wl_fixed_from_int((int)vid_h));
     }
 
     out->vp_dst_w = out->width;
@@ -273,8 +273,6 @@ static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux
         return false;
     if (dec->width != demux->width || dec->height != demux->height)
         return false;
-    if (dec->has_vpp != (!allow_direct_nv12))
-        return false;
 
     bool profile_matches = false;
     switch (demux->codec) {
@@ -292,9 +290,7 @@ static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux
                            dec->va_profile == VAProfileVP9Profile2);
         break;
     case WAYWAL_CODEC_AV1:
-#ifdef VAProfileAV1Profile0
         profile_matches = (dec->va_profile == VAProfileAV1Profile0);
-#endif
         break;
     default:
         break;
@@ -304,6 +300,13 @@ static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux
 
     memset(&dec->cached_sps, 0, sizeof(dec->cached_sps));
     memset(&dec->cached_pps, 0, sizeof(dec->cached_pps));
+    memset(&dec->cached_hevc_sps, 0, sizeof(dec->cached_hevc_sps));
+    memset(&dec->cached_hevc_pps, 0, sizeof(dec->cached_hevc_pps));
+    memset(&dec->cached_av1_seq, 0, sizeof(dec->cached_av1_seq));
+    for (int i = 0; i < 8; ++i) {
+        dec->vp9_ref_frames[i] = VA_INVALID_SURFACE;
+        dec->av1_ref_frames[i] = VA_INVALID_SURFACE;
+    }
     dec->is_avcc = false;
     dec->nal_length_size = 4;
     memset(&dec->cached_iq, 16, sizeof(dec->cached_iq));
@@ -311,6 +314,18 @@ static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux
     if (demux->extradata && demux->extradata_size > 0) {
         vaapi_decoder_set_extradata(dec, demux->extradata, demux->extradata_size);
     }
+    bool is_10bit =
+        (dec->va_profile == VAProfileHEVCMain10 || dec->va_profile == VAProfileVP9Profile2 ||
+         (dec->va_profile == VAProfileAV1Profile0 && dec->cached_av1_seq.valid &&
+          dec->cached_av1_seq.high_bitdepth) ||
+         (dec->cached_hevc_sps.valid && (dec->cached_hevc_sps.bit_depth_luma_minus8 == 2 ||
+                                         dec->cached_hevc_sps.bit_depth_chroma_minus8 == 2)));
+    uint32_t expected_fourcc = is_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+    if (dec->fourcc != expected_fourcc)
+        return false;
+    bool want_direct = is_10bit ? (allow_direct_nv12 && dec->allow_direct_p010) : allow_direct_nv12;
+    if (dec->has_vpp != (!want_direct))
+        return false;
     uint32_t max_refs = 4;
     if (dec->cached_sps.valid) {
         max_refs = dec->cached_sps.num_ref_frames;
@@ -318,6 +333,14 @@ static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux
             max_refs = 1;
         if (max_refs > 16)
             max_refs = 16;
+    } else if (dec->cached_hevc_sps.valid) {
+        max_refs = (uint32_t)dec->cached_hevc_sps.sps_max_dec_pic_buffering_minus1 + 1;
+        if (max_refs < 4)
+            max_refs = 4;
+        if (max_refs > 15)
+            max_refs = 15;
+    } else if (demux->codec == WAYWAL_CODEC_VP9 || demux->codec == WAYWAL_CODEC_AV1) {
+        max_refs = 8;
     }
     uint32_t needed_surfaces = max_refs + 3;
     if (needed_surfaces < 4)
@@ -334,12 +357,16 @@ static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
         return false;
 
     int drm_fd = ve->daemon_state ? ve->daemon_state->dmabuf_ctx.drm_fd : -1;
-    /* Wayland compositors (e.g., Hyprland / libhyprgraphics) bind imported DMA-BUF EGLImages
-     * to GL_TEXTURE_2D with RGB shaders rather than GL_TEXTURE_EXTERNAL_OES. Because VA-API
-     * drivers like nvidia_drv_video export NV12 as separate R8 + GR88 layers, GL_TEXTURE_2D
-     * exposes only Plane 0 (R8 Luma) as GL_RED, rendering video as monochrome red.
-     * Use VA-API VPP to convert presented frames to single-plane RGB32 (ARGB8888/XRGB8888). */
-    bool allow_direct_nv12 = false;
+    /* Enable direct NV12/P010 KMS overlay scanout when the compositor advertises NV12 and
+     * the VA-API driver exports composed multi-planar surfaces (Intel iHD/i965, AMD radeonsi).
+     * Keep the 3-surface BGRX VPP ring active on NVIDIA where libva-nvidia-driver exports
+     * separate R8 and GR88 layers. */
+    bool has_nv12 = ve->daemon_state && ve->daemon_state->dmabuf_ctx.has_nv12;
+    bool has_p010 = ve->daemon_state && ve->daemon_state->dmabuf_ctx.has_p010;
+    bool allow_direct_nv12 =
+        has_nv12 && (!ve->decoder.initialized || !ve->decoder.is_nvidia_vaapi);
+    ve->decoder.allow_direct_p010 =
+        has_p010 && (!ve->decoder.initialized || !ve->decoder.is_nvidia_vaapi);
 
     if (can_reuse_vaapi_decoder(&ve->decoder, ve->demuxer, allow_direct_nv12)) {
         if (ve->decoder.va_display) {
@@ -368,6 +395,7 @@ static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
             video_engine_release_wl_buffers(ve);
             vaapi_decoder_destroy(&ve->decoder);
         }
+        ve->decoder.allow_direct_p010 = has_p010;
         if (!vaapi_decoder_init_with_params(&ve->decoder, drm_fd, ve->demuxer->codec,
                                             ve->demuxer->width, ve->demuxer->height,
                                             ve->demuxer->extradata, ve->demuxer->extradata_size,
@@ -539,7 +567,7 @@ static bool reorder_has_ready_frame(video_engine_t *ve)
 
 void video_engine_dispatch_frame(video_engine_t *ve)
 {
-    if (!ve || ve->state != WAYWAL_VIDEO_STATE_PLAYING || !ve->demuxer) {
+    if (!ve || ve->timer_fd < 0) {
         return;
     }
 
@@ -547,6 +575,10 @@ void video_engine_dispatch_frame(video_engine_t *ve)
     ssize_t s = read(ve->timer_fd, &expirations, sizeof(expirations));
     if (s <= 0 || expirations == 0)
         return;
+
+    if (ve->state != WAYWAL_VIDEO_STATE_PLAYING || !ve->demuxer) {
+        return;
+    }
 
     uint32_t pool_size =
         ve->decoder.num_surfaces > 0 ? ve->decoder.num_surfaces : WAYWAL_VA_SURFACE_POOL_SIZE;

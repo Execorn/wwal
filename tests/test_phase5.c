@@ -15,13 +15,21 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-const char *__lsan_default_suppressions(void)
+void output_node_destroy_surface(output_node_t *node)
 {
-    return "leak:libnvidia\nleak:libGLX_nvidia\nleak:libEGL_nvidia\nleak:radeonsi\nleak:libva\n";
+    (void)node;
 }
+
+#ifndef __has_feature
+#define __has_feature(x) 0
 #endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+{
+    return "leak:<unknown module>\nleak:libcuda\nleak:cuInit\nleak:gbm_create_device\nleak:libgbm\n"
+           "leak:libEGL\nleak:libGLESv2\nleak:dri\nleak:libnvidia\nleak:libGLX_nvidia\nleak:"
+           "libEGL_nvidia\nleak:radeonsi\nleak:libva\n";
+}
 #endif
 
 static void test_presentation_pll_vrr_tracking(void)
@@ -106,8 +114,10 @@ static void test_io_uring_event_loop(void)
     /* Register read end with io_uring */
     bool poll_ok = uring_loop_add_poll(&loop, fds[0], POLLIN, URING_EV_WAYLAND_READ, NULL);
     assert(poll_ok);
+    assert(loop.multishot_supported);
+    assert(loop.slots[0].is_multishot);
 
-    /* Write 1 byte to trigger event */
+    /* Write 1 byte to trigger first multishot event */
     char byte = 0x42;
     ssize_t w = write(fds[1], &byte, 1);
     assert(w == 1);
@@ -120,6 +130,14 @@ static void test_io_uring_event_loop(void)
 
     /* Drain pipe */
     char rbuf;
+    read(fds[0], &rbuf, 1);
+
+    /* Write a second byte without calling uring_loop_add_poll again to verify multishot continuation */
+    w = write(fds[1], &byte, 1);
+    assert(w == 1);
+    dispatched = uring_loop_dispatch(&loop, test_uring_callback);
+    assert(dispatched >= 1);
+    assert(g_uring_cb_count == 2);
     read(fds[0], &rbuf, 1);
 
     close(fds[0]);
@@ -188,6 +206,29 @@ static void test_security_hardening(void)
         pid_t my_pid = getpid();
         if (my_pid <= 0)
             _exit(3);
+
+        const char *home = getenv("HOME");
+#ifdef SYS_landlock_create_ruleset
+        int ll_abi = (int)syscall(SYS_landlock_create_ruleset, NULL, 0, 1);
+#else
+        int ll_abi = -1;
+#endif
+        if (ll_abi > 0 && home && home[0]) {
+            char cache_test[4096];
+            snprintf(cache_test, sizeof(cache_test), "%s/.cache/wwal", home);
+            int cfd = open(cache_test, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (cfd < 0)
+                _exit(5);
+            close(cfd);
+
+            char ssh_path[4096];
+            snprintf(ssh_path, sizeof(ssh_path), "%s/.ssh", home);
+            int sfd = open(ssh_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (sfd >= 0) {
+                close(sfd);
+                _exit(6);
+            }
+        }
 
 #ifdef HAVE_LIBSECCOMP
         /* Test denied syscall: SCMP_ACT_KILL on execve (SOTA-09) */

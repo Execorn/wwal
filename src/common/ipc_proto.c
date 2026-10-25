@@ -12,6 +12,12 @@
 #include <string.h>
 #include <poll.h>
 
+static bool g_socket_activated = false;
+
+bool waywal_ipc_is_socket_activated(void) {
+    return g_socket_activated;
+}
+
 bool waywal_ipc_resolve_socket_path(path_buf_t *out_path, const char *namespace_str) {
     if (!out_path) return false;
 
@@ -42,6 +48,25 @@ bool waywal_ipc_resolve_socket_path(path_buf_t *out_path, const char *namespace_
 }
 
 int waywal_ipc_server_create(const char *namespace_str) {
+    const char *listen_pid = getenv("LISTEN_PID");
+    const char *listen_fds = getenv("LISTEN_FDS");
+    if (listen_pid && listen_fds && atoi(listen_pid) == (int)getpid() && atoi(listen_fds) >= 1) {
+        int sfd = 3;
+        int fd_flags = fcntl(sfd, F_GETFD, 0);
+        if (fd_flags >= 0) {
+            fcntl(sfd, F_SETFD, fd_flags | FD_CLOEXEC);
+        }
+        int fl_flags = fcntl(sfd, F_GETFL, 0);
+        if (fl_flags >= 0) {
+            fcntl(sfd, F_SETFL, fl_flags | O_NONBLOCK);
+        }
+        g_socket_activated = true;
+        WAYWAL_LOG_INFO("IPC server using systemd socket activation (fd=%d)", sfd);
+        return sfd;
+    }
+
+    g_socket_activated = false;
+
     path_buf_t sock_path;
     if (!waywal_ipc_resolve_socket_path(&sock_path, namespace_str)) {
         WAYWAL_LOG_ERR("Failed to resolve IPC socket path");
@@ -104,16 +129,18 @@ int waywal_ipc_server_create(const char *namespace_str) {
     return sfd;
 }
 
-int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms) {
-    path_buf_t sock_path;
-    if (!waywal_ipc_resolve_socket_path(&sock_path, namespace_str)) {
+static int connect_unix_socket_path(const char *sock_path, int timeout_ms) {
+    if (!sock_path || sock_path[0] == '\0') {
         return -1;
     }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path_buf_cstr(&sock_path), sizeof(addr.sun_path) - 1);
+    if (strlen(sock_path) >= sizeof(addr.sun_path)) {
+        return -1;
+    }
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
     int cfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (cfd < 0) {
@@ -122,19 +149,22 @@ int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms) {
 
     if (timeout_ms <= 0) {
         if (connect(cfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            int saved_err = errno;
             close(cfd);
+            errno = saved_err;
             return -1;
         }
         return cfd;
     }
 
-    /* Non-blocking connect with timeout */
     int flags = fcntl(cfd, F_GETFL, 0);
     fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
 
     int res = connect(cfd, (struct sockaddr *)&addr, sizeof(addr));
     if (res < 0 && errno != EINPROGRESS) {
+        int saved_err = errno;
         close(cfd);
+        errno = saved_err;
         return -1;
     }
 
@@ -147,6 +177,7 @@ int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms) {
     int poll_res = poll(&pfd, 1, timeout_ms);
     if (poll_res <= 0) {
         close(cfd);
+        errno = ETIMEDOUT;
         return -1;
     }
 
@@ -154,11 +185,41 @@ int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms) {
     socklen_t len = sizeof(so_error);
     if (getsockopt(cfd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0 || so_error != 0) {
         close(cfd);
+        errno = so_error ? so_error : ECONNREFUSED;
         return -1;
     }
 
     fcntl(cfd, F_SETFL, flags);
     return cfd;
+}
+
+int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms) {
+    path_buf_t sock_path;
+    if (!waywal_ipc_resolve_socket_path(&sock_path, namespace_str)) {
+        return -1;
+    }
+
+    int cfd = connect_unix_socket_path(path_buf_cstr(&sock_path), timeout_ms);
+    if (cfd >= 0) {
+        return cfd;
+    }
+
+    if (errno == ENOENT || errno == ECONNREFUSED) {
+        const char *xdg = getenv("XDG_RUNTIME_DIR");
+        if (!xdg || xdg[0] == '\0') {
+            xdg = "/tmp";
+        }
+        path_buf_t fallback_path;
+        path_buf_from_str(&fallback_path, xdg);
+        if (path_buf_push(&fallback_path, "wwald.sock")) {
+            cfd = connect_unix_socket_path(path_buf_cstr(&fallback_path), timeout_ms);
+            if (cfd >= 0) {
+                return cfd;
+            }
+        }
+    }
+
+    return -1;
 }
 
 bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd) {
@@ -230,12 +291,24 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
         return false;
     }
 
-    /* Extract any SCM_RIGHTS FD delivered on the first byte immediately */
+    /* Extract any SCM_RIGHTS FD delivered on the first byte immediately, closing any extra FDs */
     int received_fd = -1;
     for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-            memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
-            break;
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+            cmsg->cmsg_len >= CMSG_LEN(0)) {
+            size_t fd_count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            const unsigned char *data = CMSG_DATA(cmsg);
+            for (size_t i = 0; i < fd_count; ++i) {
+                int fd = -1;
+                memcpy(&fd, data + i * sizeof(int), sizeof(int));
+                if (fd >= 0) {
+                    if (received_fd < 0 && out_attached_fd != NULL) {
+                        received_fd = fd;
+                    } else {
+                        close(fd);
+                    }
+                }
+            }
         }
     }
 

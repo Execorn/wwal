@@ -1,0 +1,273 @@
+.\" Generated from wwal-config.5.scd
+.TH "WWAL-CONFIG" "5" "2026-10-24" "wwal 1.0.0" "WayWal Manual"
+.PP
+.SH NAME
+.PP
+wwal-config - declarative TOML configuration file for wwald(1) and wwal(1)
+.PP
+.SH SYNOPSIS
+.PP
+\fB~/.config/wwal/config.toml\fR
+.PP
+.SH DESCRIPTION
+.PP
+\fBwwal\fR and \fBwwald\fR(1) read their declarative configuration from \fB$XDG_CONFIG_HOME/wwal/config.toml\fR (defaulting to \fB~/.config/wwal/config.toml\fR). The file uses standard TOML syntax and is parsed by \fBwwald\fR's built-in zero-allocation recursive-descent parser at daemon startup and upon receiving \fBSIGHUP\fR.
+.PP
+Command-line flags passed to \fBwwal\fR(1) override values configured in \fBconfig.toml\fR for that invocation.
+.PP
+.SH SECTIONS
+.PP
+.SS [daemon]
+.PP
+Controls core \fBwwald\fR(1) lifecycle, layer-shell behavior, and Zero-Watt power governance.
+.PP
+\fBnamespace\fR = "<string>"
+.RS 4
+Default IPC and Wayland layer-shell namespace (default: \fB"default"\fR).
+.RE
+.PP
+\fBlayer\fR = "<background|bottom>"
+.RS 4
+Wayland \fBzwlr_layer_shell_v1\fR layer used for wallpaper surfaces (default: \fB"background"\fR).
+.RE
+.PP
+\fBbackdrop\fR = "<none|auto-blur|path>"
+.RS 4
+Secondary layer surface (\fBwaywal-backdrop\fR) mode for compositors with overview backdrops such as Niri (default: \fB"none"\fR). Set to \fB"auto-blur"\fR to run the GPU 2-pass Dual-Kawase blur shader automatically.
+.RE
+.PP
+\fB10bit\fR = <bool>
+.RS 4
+Enable 10-bit wide-gamut scanout (\fBXRGB2101010\fR / \fBARGB2101010\fR) when supported by the compositor (default: \fBfalse\fR).
+.RE
+.PP
+\fBrestore_on_start\fR = <bool>
+.RS 4
+Automatically restore per-output state from \fB$XDG_STATE_HOME/wwal/state.bin\fR when \fBwwald\fR starts or when a monitor is hotplugged (default: \fBtrue\fR).
+.RE
+.PP
+\fBpause_on_fullscreen\fR = <bool>
+.RS 4
+Pause video and live shader rendering on an output when a fullscreen window covers it (default: \fBtrue\fR).
+.RE
+.PP
+\fBpause_on_maximized\fR = <bool>
+.RS 4
+Pause video and live shader rendering on an output when a maximized window covers it (default: \fBtrue\fR).
+.RE
+.PP
+\fBpause_on_occluded_workspace\fR = <bool>
+.RS 4
+Pause video and live shader rendering when Hyprland/Sway IPC reports the active workspace is fully tiled and opaque (default: \fBtrue\fR).
+.RE
+.PP
+\fBpause_on_idle\fR = <bool>
+.RS 4
+Pause animations when \fBext_idle_notifier_v1\fR reports the user session is idle or locked (default: \fBtrue\fR).
+.RE
+.PP
+\fBbattery_policy\fR = "<ignore|reduce-fps|pause-video>"
+.RS 4
+Power governor behavior when running on laptop battery power (default: \fB"pause-video"\fR).
+.RE
+.PP
+.SS [theme]
+.PP
+Controls the in-pipeline OKLab Wu quantizer + weighted K-Means++ + CAM16/HCT Material Design 3 palette generator.
+.PP
+\fBenable\fR = <bool>
+.RS 4
+Automatically extract and export color palettes whenever a wallpaper changes (default: \fBtrue\fR).
+.RE
+.PP
+\fBmode\fR = "<dark|light>"
+.RS 4
+Target Material Design 3 tonal scheme polarity (default: \fB"dark"\fR).
+.RE
+.PP
+\fBscheme_variant\fR = "<tonal_spot|vibrant|expressive|neutral|monochrome|fidelity>"
+.RS 4
+CAM16/HCT chroma and hue rotation variant (default: \fB"tonal_spot"\fR).
+.RE
+.PP
+\fBcontrast\fR = <float>
+.RS 4
+Contrast level between \fB-1.0\fR and \fB1.0\fR (default: \fB0.0\fR).
+.RE
+.PP
+\fBcaelestia_sync\fR = <bool>
+.RS 4
+Atomically write \fB~/.local/state/caelestia/scheme.json\fR for Quickshell (\fBcaelestia-shell\fR) live theme synchronization (default: \fBtrue\fR).
+.RE
+.PP
+\fBterminal_osc\fR = <bool>
+.RS 4
+Broadcast non-blocking ANSI \fBOSC 4\fR, \fBOSC 10\fR, and \fBOSC 11\fR escape sequences to active \fB/dev/pts/*\fR terminals (default: \fBtrue\fR).
+.RE
+.PP
+\fBexport_css\fR = <bool>
+.RS 4
+Write \fB~/.cache/wwal/colors.css\fR and \fB~/.cache/wwal/colors.json\fR (default: \fBtrue\fR).
+.RE
+.PP
+\fBexport_hyprland\fR = <bool>
+.RS 4
+Write \fB~/.cache/wwal/colors-hyprland.conf\fR (default: \fBtrue\fR).
+.RE
+.PP
+.SS [transition]
+.PP
+Sets default parameters for GPU compute and CPU SIMD wallpaper transitions.
+.PP
+\fBtype\fR = "<string>"
+.RS 4
+Default transition effect: \fBnone\fR, \fBsimple\fR, \fBfade\fR, \fBwipe\fR, \fBgrow\fR, \fBouter\fR, \fBwave\fR, \fBnoise\fR, \fBcrosszoom\fR, \fBslide\fR, \fBglitch\fR, \fBburn\fR, \fBripple\fR, \fBpixelate\fR, \fBdoom\fR, \fBswirl\fR, \fBcube\fR, \fBluma\fR, \fBlight_leak\fR, \fBpage_curl\fR, \fBcustom\fR, or \fBrandom\fR (default: \fB"fade"\fR).
+.RE
+.PP
+\fBduration\fR = <float>
+.RS 4
+Transition duration in seconds (default: \fB1.0\fR).
+.RE
+.PP
+\fBfps\fR = <int>
+.RS 4
+Target transition frame rate (default: \fB60\fR).
+.RE
+.PP
+\fBangle\fR = <float>
+.RS 4
+Angle in degrees for directional transitions (default: \fB0.0\fR).
+.RE
+.PP
+\fBpos\fR = "<string>"
+.RS 4
+Default anchor position, such as \fB"center"\fR, \fB"cursor"\fR, or \fB"0.5,0.5"\fR (default: \fB"center"\fR).
+.RE
+.PP
+\fBbezier\fR = [ <x1>, <y1>, <x2>, <y2> ]
+.RS 4
+Four-element float array defining the cubic-bezier easing curve (default: \fB[ 0.25, 0.1, 0.25, 1.0 ]\fR).
+.RE
+.PP
+\fBsync_mode\fR = "<simultaneous|staggered>"
+.RS 4
+Multi-monitor transition synchronization mode (default: \fB"simultaneous"\fR).
+.RE
+.PP
+\fBstagger_delay_ms\fR = <int>
+.RS 4
+Delay in milliseconds between monitors in \fBstaggered\fR mode (default: \fB150\fR).
+.RE
+.PP
+.SS [output."<NAME>"]
+.PP
+Configures initial wallpaper, video, shader, or slideshow settings for a specific Wayland output (such as \fB[output."DP-1"]\fR or \fB[output."eDP-1"]\fR). Use \fB[output."\fR"]* as a wildcard fallback for unconfigured monitors.
+.PP
+\fBpath\fR = "<path>"
+.RS 4
+Path to an image, video, shader, or slideshow directory.
+.RE
+.PP
+\fBmode\fR = "<img|video|shader|slideshow|color>"
+.RS 4
+Content mode for this output (default: inferred from \fIpath\fR).
+.RE
+.PP
+\fBscaling\fR = "<fill|fit|stretch|center|tile>"
+.RS 4
+Aspect-ratio scaling mode (default: \fB"fill"\fR).
+.RE
+.PP
+\fBfill_color\fR = "<hex>"
+.RS 4
+Padding color for \fBfit\fR and \fBcenter\fR scaling modes (default: \fB"000000"\fR).
+.RE
+.PP
+\fBinterval\fR = <int>
+.RS 4
+Slideshow interval in seconds when \fBmode = "slideshow"\fR (default: \fB300\fR).
+.RE
+.PP
+\fBshuffle\fR = <bool>
+.RS 4
+Randomize slideshow order on this output (default: \fBtrue\fR).
+.RE
+.PP
+\fBaudio\fR = <bool>
+.RS 4
+Enable PipeWire Bark FFT audio capture when \fBmode = "shader"\fR (default: \fBfalse\fR).
+.RE
+.PP
+.SS [workspace."<NAME>"]
+.PP
+Binds a specific wallpaper, video, or shader to a named or numbered compositor workspace (such as \fB[workspace."1"]\fR or \fB[workspace."gaming"]\fR) on Hyprland, Sway, or Niri.
+.PP
+\fBpath\fR = "<path>"
+.RS 4
+Wallpaper path to activate when switching to this workspace.
+.RE
+.PP
+\fBoutput\fR = "<NAME>"
+.RS 4
+Optional output constraint if the workspace is pinned to a monitor.
+.RE
+.PP
+\fBtransition_type\fR = "<string>"
+.RS 4
+Optional transition override when entering this workspace.
+.RE
+.PP
+.SH EXAMPLE
+.PP
+.nf
+.RS 4
+[daemon]
+namespace = "default"
+layer = "background"
+backdrop = "auto-blur"
+10bit = true
+restore_on_start = true
+pause_on_fullscreen = true
+pause_on_maximized = true
+pause_on_occluded_workspace = true
+pause_on_idle = true
+battery_policy = "pause-video"
+
+[theme]
+enable = true
+mode = "dark"
+scheme_variant = "tonal_spot"
+caelestia_sync = true
+terminal_osc = true
+export_css = true
+export_hyprland = true
+
+[transition]
+type = "grow"
+duration = 0.75
+fps = 144
+pos = "cursor"
+bezier = [ 0.22, 1.0, 0.36, 1.0 ]
+sync_mode = "staggered"
+stagger_delay_ms = 120
+
+[output."DP-1"]
+path = "~/Pictures/Wallpapers/ultrawide-neon.jxl"
+scaling = "fill"
+
+[output."eDP-1"]
+path = "~/Pictures/Wallpapers/Rotating"
+mode = "slideshow"
+interval = 600
+shuffle = true
+
+[workspace."9"]
+path = "~/Shaders/audio_nebula.frag"
+output = "DP-1"
+transition_type = "fade"
+.RE
+.fi
+.PP
+.SH SEE ALSO
+.PP
+\fBwwal\fR(1), \fBwwald\fR(1)

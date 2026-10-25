@@ -31,6 +31,7 @@ egl_dep = dependency('egl')
 glesv2_dep = dependency('glesv2')
 threads_dep = dependency('threads')
 m_dep = cc.find_library('m', required: false)
+dl_dep = cc.find_library('dl', required: false)
 
 # Optional accelerated dependencies
 vaapi_dep = dependency('libva', required: get_option('enable_vaapi'))
@@ -76,6 +77,10 @@ protocols = [
   'protocols/fractional-scale-v1.xml',
   'protocols/presentation-time.xml',
   'protocols/linux-dmabuf-v1.xml',
+  'protocols/single-pixel-buffer-v1.xml',
+  'protocols/linux-drm-syncobj-v1.xml',
+  'protocols/ext-foreign-toplevel-list-v1.xml',
+  'protocols/ext-idle-notify-v1.xml',
 ]
 
 foreach p : protocols
@@ -107,18 +112,21 @@ common_sources = files(
   'src/common/os_compat.c',
   'src/common/ipc_proto.c',
   'src/common/bezier.c',
+  'src/common/palette_hct.c',
+  'src/common/toml_parser.c',
+  'src/common/state_store.c',
 )
 
 common_lib = static_library('waywal_common',
   common_sources,
   include_directories: inc_dir,
-  dependencies: [threads_dep, m_dep]
+  dependencies: [threads_dep, m_dep, dl_dep]
 )
 
 common_dep = declare_dependency(
   link_with: common_lib,
   include_directories: inc_dir,
-  dependencies: [threads_dep, m_dep]
+  dependencies: [threads_dep, m_dep, dl_dep]
 )
 
 # Daemon executable (wwald)
@@ -143,6 +151,10 @@ daemon_sources = files(
   'src/daemon/output_state.c',
   'src/daemon/security.c',
   'src/daemon/slideshow.c',
+  'src/daemon/anim_engine.c',
+  'src/daemon/power_governor.c',
+  'src/daemon/audio_fft.c',
+  'src/daemon/shader_engine.c',
   'src/client/image_loader.c',
 )
 
@@ -210,7 +222,15 @@ if get_option('enable_systemd')
     systemd_user_unit_dir = get_option('prefix') / 'lib/systemd/user'
   endif
   install_data('contrib/systemd/wwald.service', install_dir: systemd_user_unit_dir)
+  install_data('contrib/systemd/wwald.socket', install_dir: systemd_user_unit_dir)
 endif
+
+# Manpages
+install_man(
+  'docs/man/wwal.1',
+  'docs/man/wwald.1',
+  'docs/man/wwal-config.5'
+)
 
 # Shell completions
 install_data('contrib/completions/wwal.bash', install_dir: get_option('datadir') / 'bash-completion/completions', rename: 'wwal')
@@ -292,7 +312,6 @@ test_phase4_exe = executable('test_phase4',
   'tests/test_phase4.c',
   'src/daemon/demuxer.c',
   'src/daemon/video_vaapi.c',
-  'src/daemon/video_engine.c',
   'src/daemon/dmabuf_alloc.c',
   'src/daemon/dmabuf_feedback.c',
   include_directories: inc_dir,
@@ -400,3 +419,82 @@ test_e2e_exe = executable('test_e2e',
 )
 
 test('e2e', test_e2e_exe, timeout: 180)
+
+test_subsystems_deps = [
+  common_dep,
+  proto_dep,
+  wayland_client_dep,
+  libdrm_dep,
+  gbm_dep,
+  egl_dep,
+  glesv2_dep,
+  threads_dep,
+  m_dep,
+  dl_dep
+]
+if openmp_dep.found()
+  test_subsystems_deps += openmp_dep
+endif
+if png_dep.found()
+  test_subsystems_deps += png_dep
+endif
+if turbojpeg_dep.found()
+  test_subsystems_deps += turbojpeg_dep
+endif
+
+test_subsystems_exe = executable('test_subsystems',
+  'tests/test_subsystems.c',
+  'src/client/cli_parser.c',
+  'src/client/image_loader.c',
+  'src/daemon/anim_engine.c',
+  'src/daemon/power_governor.c',
+  'src/daemon/audio_fft.c',
+  'src/daemon/shader_engine.c',
+  'src/daemon/gpu_compute.c',
+  'src/daemon/dmabuf_alloc.c',
+  'src/daemon/dmabuf_feedback.c',
+  include_directories: [inc_dir, include_directories('src/daemon')],
+  dependencies: test_subsystems_deps
+)
+
+test('subsystems', test_subsystems_exe)
+
+fuzz_demuxer_exe = executable('fuzz_demuxer',
+  'tests/fuzz/fuzz_demuxer.c',
+  'src/daemon/demuxer.c',
+  c_args: ['-DWWAL_FUZZ_STANDALONE'],
+  include_directories: inc_dir,
+  dependencies: [common_dep, m_dep]
+)
+
+fuzz_bitstream_exe = executable('fuzz_bitstream',
+  'tests/fuzz/fuzz_bitstream.c',
+  'src/daemon/video_vaapi.c',
+  'src/daemon/dmabuf_alloc.c',
+  'src/daemon/dmabuf_feedback.c',
+  c_args: ['-DWWAL_FUZZ_STANDALONE'],
+  include_directories: inc_dir,
+  dependencies: [
+    common_dep,
+    proto_dep,
+    wayland_client_dep,
+    libdrm_dep,
+    gbm_dep,
+    vaapi_dep,
+    vaapi_drm_dep,
+    threads_dep,
+    m_dep
+  ]
+)
+
+fuzz_config_cli_exe = executable('fuzz_config_cli',
+  'tests/fuzz/fuzz_config_cli.c',
+  'src/client/cli_parser.c',
+  c_args: ['-DWWAL_FUZZ_STANDALONE'],
+  include_directories: inc_dir,
+  dependencies: [common_dep, m_dep]
+)
+
+test('fuzz_demuxer', fuzz_demuxer_exe)
+test('fuzz_bitstream', fuzz_bitstream_exe)
+test('fuzz_config_cli', fuzz_config_cli_exe)

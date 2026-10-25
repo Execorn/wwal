@@ -2,6 +2,7 @@
 
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
+#include "waywal/power_governor.h"
 
 #include <fcntl.h>
 #include <gbm.h>
@@ -32,7 +33,8 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
             out->cursor_x = wl_fixed_to_double(surface_x);
             out->cursor_y = wl_fixed_to_double(surface_y);
             out->has_cursor = true;
-            break;
+        } else {
+            out->has_cursor = false;
         }
     }
 }
@@ -40,10 +42,18 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
 static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface)
 {
-    (void)data;
     (void)pointer;
     (void)serial;
-    (void)surface;
+    daemon_state_t *state = (daemon_state_t *)data;
+    if (!state || !surface)
+        return;
+
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (out->surface == surface) {
+            out->has_cursor = false;
+            break;
+        }
+    }
 }
 
 static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
@@ -151,6 +161,130 @@ static const struct wl_seat_listener seat_listener = {
     .name = seat_name,
 };
 
+static void idle_handle_idled(void *data, struct ext_idle_notification_v1 *notification)
+{
+    (void)notification;
+    daemon_state_t *state = (daemon_state_t *)data;
+    if (state && state->power_gov) {
+        waywal_power_governor_set_global_reason(state->power_gov, WAYWAL_PAUSE_SESSION_IDLE, true);
+        if (state->on_power_state_changed) {
+            state->on_power_state_changed(state);
+        }
+    }
+}
+
+static void idle_handle_resumed(void *data, struct ext_idle_notification_v1 *notification)
+{
+    (void)notification;
+    daemon_state_t *state = (daemon_state_t *)data;
+    if (state && state->power_gov) {
+        waywal_power_governor_set_global_reason(state->power_gov, WAYWAL_PAUSE_SESSION_IDLE, false);
+        if (state->on_power_state_changed) {
+            state->on_power_state_changed(state);
+        }
+    }
+}
+
+static const struct ext_idle_notification_v1_listener idle_notification_listener = {
+    .idled = idle_handle_idled,
+    .resumed = idle_handle_resumed,
+};
+
+static void ensure_idle_notification(daemon_state_t *state)
+{
+    if (!state || state->idle_notification || !state->idle_notifier || !state->seat)
+        return;
+    if (!state->config.daemon.pause_on_idle && state->idle_timeout_sec == 0)
+        return;
+    uint32_t timeout_sec = state->idle_timeout_sec > 0 ? state->idle_timeout_sec : 300U;
+    uint32_t timeout_ms = timeout_sec > 4000000U ? 4000000000U : timeout_sec * 1000U;
+    state->idle_notification =
+        ext_idle_notifier_v1_get_idle_notification(state->idle_notifier, timeout_ms, state->seat);
+    if (state->idle_notification) {
+        ext_idle_notification_v1_add_listener(state->idle_notification, &idle_notification_listener,
+                                              state);
+    }
+}
+
+static void foreign_toplevel_handle_closed(void *data,
+                                           struct ext_foreign_toplevel_handle_v1 *toplevel)
+{
+    (void)data;
+    if (toplevel) {
+        ext_foreign_toplevel_handle_v1_destroy(toplevel);
+    }
+}
+
+static void foreign_toplevel_handle_done(void *data,
+                                         struct ext_foreign_toplevel_handle_v1 *toplevel)
+{
+    (void)data;
+    (void)toplevel;
+}
+
+static void foreign_toplevel_handle_title(void *data,
+                                          struct ext_foreign_toplevel_handle_v1 *toplevel,
+                                          const char *title)
+{
+    (void)data;
+    (void)toplevel;
+    (void)title;
+}
+
+static void foreign_toplevel_handle_app_id(void *data,
+                                           struct ext_foreign_toplevel_handle_v1 *toplevel,
+                                           const char *app_id)
+{
+    (void)data;
+    (void)toplevel;
+    (void)app_id;
+}
+
+static void foreign_toplevel_handle_identifier(void *data,
+                                               struct ext_foreign_toplevel_handle_v1 *toplevel,
+                                               const char *identifier)
+{
+    (void)data;
+    (void)toplevel;
+    (void)identifier;
+}
+
+static const struct ext_foreign_toplevel_handle_v1_listener foreign_toplevel_handle_listener = {
+    .closed = foreign_toplevel_handle_closed,
+    .done = foreign_toplevel_handle_done,
+    .title = foreign_toplevel_handle_title,
+    .app_id = foreign_toplevel_handle_app_id,
+    .identifier = foreign_toplevel_handle_identifier,
+};
+
+static void foreign_toplevel_list_handle_toplevel(void *data,
+                                                  struct ext_foreign_toplevel_list_v1 *list,
+                                                  struct ext_foreign_toplevel_handle_v1 *toplevel)
+{
+    (void)list;
+    if (toplevel) {
+        ext_foreign_toplevel_handle_v1_add_listener(toplevel, &foreign_toplevel_handle_listener,
+                                                    data);
+    }
+}
+
+static void foreign_toplevel_list_handle_finished(void *data,
+                                                  struct ext_foreign_toplevel_list_v1 *list)
+{
+    daemon_state_t *state = (daemon_state_t *)data;
+    if (list) {
+        ext_foreign_toplevel_list_v1_destroy(list);
+    }
+    if (state && state->foreign_toplevel_list == list) {
+        state->foreign_toplevel_list = NULL;
+    }
+}
+
+static const struct ext_foreign_toplevel_list_v1_listener foreign_toplevel_list_listener = {
+    .toplevel = foreign_toplevel_list_handle_toplevel,
+    .finished = foreign_toplevel_list_handle_finished,
+};
+
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
                             const char *interface, uint32_t version)
 {
@@ -172,6 +306,28 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
         state->fract_manager = (struct wp_fractional_scale_manager_v1 *)wl_registry_bind(
             registry, name, &wp_fractional_scale_manager_v1_interface, 1);
+    } else if (strcmp(interface, wp_single_pixel_buffer_manager_v1_interface.name) == 0) {
+        state->single_pixel_mgr = (struct wp_single_pixel_buffer_manager_v1 *)wl_registry_bind(
+            registry, name, &wp_single_pixel_buffer_manager_v1_interface, 1);
+        WAYWAL_LOG_INFO("Bound wp_single_pixel_buffer_manager_v1");
+    } else if (strcmp(interface, wp_linux_drm_syncobj_manager_v1_interface.name) == 0) {
+        state->syncobj_mgr = (struct wp_linux_drm_syncobj_manager_v1 *)wl_registry_bind(
+            registry, name, &wp_linux_drm_syncobj_manager_v1_interface, 1);
+        WAYWAL_LOG_INFO("Bound wp_linux_drm_syncobj_manager_v1");
+    } else if (strcmp(interface, ext_idle_notifier_v1_interface.name) == 0) {
+        uint32_t ver = version >= 2 ? 2 : 1;
+        state->idle_notifier = (struct ext_idle_notifier_v1 *)wl_registry_bind(
+            registry, name, &ext_idle_notifier_v1_interface, ver);
+        ensure_idle_notification(state);
+        WAYWAL_LOG_INFO("Bound ext_idle_notifier_v1 version %u", ver);
+    } else if (strcmp(interface, ext_foreign_toplevel_list_v1_interface.name) == 0) {
+        state->foreign_toplevel_list = (struct ext_foreign_toplevel_list_v1 *)wl_registry_bind(
+            registry, name, &ext_foreign_toplevel_list_v1_interface, 1);
+        if (state->foreign_toplevel_list) {
+            ext_foreign_toplevel_list_v1_add_listener(state->foreign_toplevel_list,
+                                                      &foreign_toplevel_list_listener, state);
+        }
+        WAYWAL_LOG_INFO("Bound ext_foreign_toplevel_list_v1");
     } else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
         uint32_t ver = version >= 4 ? 4 : (version >= 3 ? 3 : version);
         state->dmabuf_ctx.dmabuf_proto = (struct zwp_linux_dmabuf_v1 *)wl_registry_bind(
@@ -186,6 +342,7 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         uint32_t ver = version >= 5 ? 5 : version;
         state->seat = (struct wl_seat *)wl_registry_bind(registry, name, &wl_seat_interface, ver);
         wl_seat_add_listener(state->seat, &seat_listener, state);
+        ensure_idle_notification(state);
         WAYWAL_LOG_INFO("Bound wl_seat interface version %u", ver);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
         output_node_t *node = output_manager_add(&state->output_mgr, registry, name, version);
@@ -198,7 +355,6 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
              * has negotiated the compositor's DRM device and format modifiers. */
             if (state->layer_shell && state->dmabuf_ctx.default_feedback) {
                 output_node_create_surface(state, node);
-                output_node_render_color(state, node, state->current_color);
             }
         }
     }
@@ -359,17 +515,18 @@ bool daemon_wayland_init(daemon_state_t *state)
         }
     }
 
-    if (state->dmabuf_ctx.gbm && !state->dmabuf_ctx.map_supported) {
+    /* Initialize GPU Compute & SIMD render engine */
+    render_engine_init(&state->render_engine, &state->dmabuf_ctx);
+
+    if (state->dmabuf_ctx.gbm && !state->dmabuf_ctx.map_supported &&
+        !state->render_engine.gpu_compute_active) {
         WAYWAL_LOG_INFO(
-            "GBM bo_map unsupported on this driver; releasing unused GBM device (keeping drm_fd=%d for VA-API)",
+            "GBM bo_map and GPU compute unsupported; releasing unused GBM device (keeping drm_fd=%d for VA-API)",
             state->dmabuf_ctx.drm_fd);
         gbm_device_destroy(state->dmabuf_ctx.gbm);
         state->dmabuf_ctx.gbm = NULL;
         state->dmabuf_ctx.available = false;
     }
-
-    /* Initialize GPU Compute & SIMD render engine */
-    render_engine_init(&state->render_engine, &state->dmabuf_ctx);
 
     /* Create layer surfaces for all discovered outputs */
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
@@ -409,6 +566,26 @@ void daemon_wayland_destroy(daemon_state_t *state)
     /* Destroy hardware scanout context */
     dmabuf_context_destroy(&state->dmabuf_ctx);
 
+    if (state->idle_notification) {
+        ext_idle_notification_v1_destroy(state->idle_notification);
+        state->idle_notification = NULL;
+    }
+    if (state->idle_notifier) {
+        ext_idle_notifier_v1_destroy(state->idle_notifier);
+        state->idle_notifier = NULL;
+    }
+    if (state->foreign_toplevel_list) {
+        ext_foreign_toplevel_list_v1_destroy(state->foreign_toplevel_list);
+        state->foreign_toplevel_list = NULL;
+    }
+    if (state->single_pixel_mgr) {
+        wp_single_pixel_buffer_manager_v1_destroy(state->single_pixel_mgr);
+        state->single_pixel_mgr = NULL;
+    }
+    if (state->syncobj_mgr) {
+        wp_linux_drm_syncobj_manager_v1_destroy(state->syncobj_mgr);
+        state->syncobj_mgr = NULL;
+    }
     if (state->pointer) {
         wl_pointer_destroy(state->pointer);
         state->pointer = NULL;
@@ -457,18 +634,26 @@ bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *
     if (!state || !out_x || !out_y)
         return false;
 
-    /* 1. Try Hyprland IPC if active */
+    if (out && out->has_cursor) {
+        *out_x = out->cursor_x;
+        *out_y = out->cursor_y;
+        return true;
+    }
+
+    /* Fallback to Hyprland IPC when pointer focus is on a window above the layer surface */
     const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
     const char *xrd = getenv("XDG_RUNTIME_DIR");
     if (his && his[0] && xrd && xrd[0]) {
-        char sock_path[512];
-        snprintf(sock_path, sizeof(sock_path), "%s/hypr/%s/.socket.sock", xrd, his);
-
         int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (fd >= 0) {
             struct sockaddr_un addr = {0};
             addr.sun_family = AF_UNIX;
-            strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+            int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
+                                    "%s/hypr/%s/.socket.sock", xrd, his);
+            if (path_len < 0 || (size_t)path_len >= sizeof(addr.sun_path)) {
+                close(fd);
+                return false;
+            }
 
             struct timeval tv = {.tv_sec = 0, .tv_usec = 25000}; /* 25ms timeout */
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));

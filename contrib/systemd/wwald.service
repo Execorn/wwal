@@ -1,6 +1,6 @@
 [Unit]
 Description=WayWal (Wayland Wallpapers) Daemon
-Documentation=https://github.com/execorn/wwal
+Documentation=https://github.com/Execorn/wwal
 PartOf=graphical-session.target
 After=graphical-session.target
 ConditionEnvironment=WAYLAND_DISPLAY
@@ -8,8 +8,26 @@ ConditionEnvironment=WAYLAND_DISPLAY
 [Service]
 Type=simple
 ExecStart=/usr/bin/wwald
+Sockets=wwald.socket
 Restart=on-failure
 RestartSec=1s
+SupplementaryGroups=video render
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Mesa and NVIDIA GLSL/compute shader compilers require JIT page mappings on some drivers.
+MemoryDenyWriteExecute=no
 
 [Install]
 WantedBy=graphical-session.target

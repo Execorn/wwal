@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <math.h>
+#include <png.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,7 +97,7 @@ static void test_cli_multi_monitor(void)
 
 static void test_cli_custom_shader_and_10bit(void)
 {
-    printf("[TEST] Testing custom shader and 10-bit options parsing...\n");
+    printf("[TEST] Testing custom shader, bezier, fill-color, and 10-bit options parsing...\n");
 
     char *argv[] = {"wwal",
                     "img",
@@ -105,15 +106,74 @@ static void test_cli_custom_shader_and_10bit(void)
                     "custom",
                     "--transition-shader",
                     "tests/custom_test.comp",
+                    "--transition-bezier",
+                    "0.42,0.0,0.58,1.0",
+                    "--fill-color",
+                    "#1a2b3c",
                     "--10bit"};
     cli_options_t opts;
-    bool ok = cli_parse(8, argv, &opts);
+    bool ok = cli_parse(12, argv, &opts);
     assert(ok);
     assert(opts.transition_type == 20);
     assert(strcmp(opts.custom_shader_path, "tests/custom_test.comp") == 0);
     assert(opts.enable_10bit == true);
+    assert(opts.ten_bit == true);
+    assert(opts.has_custom_bezier == true);
+    assert(fabsf(opts.bezier.p1x - 0.42f) < 1e-5f);
+    assert(fabsf(opts.bezier.p1y - 0.0f) < 1e-5f);
+    assert(fabsf(opts.bezier.p2x - 0.58f) < 1e-5f);
+    assert(fabsf(opts.bezier.p2y - 1.0f) < 1e-5f);
+    assert(opts.clear_color.r == 0x1a);
+    assert(opts.clear_color.g == 0x2b);
+    assert(opts.clear_color.b == 0x3c);
+    assert(opts.clear_color.a == 0xff);
 
-    printf("  -> Custom shader & 10-bit options: PASSED\n");
+    printf("  -> Custom shader, bezier, fill-color & 10-bit options: PASSED\n");
+}
+
+static void test_16bit_png_decode(void)
+{
+    printf("[TEST] Testing 16-bit PNG decoding without strip_16...\n");
+
+    const char *png16_path = "/tmp/test_waywal_16bit.png";
+    FILE *fp = fopen(png16_path, "wb");
+    assert(fp != NULL);
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    assert(png != NULL);
+    png_infop info = png_create_info_struct(png);
+    assert(info != NULL);
+    assert(setjmp(png_jmpbuf(png)) == 0);
+
+    png_init_io(png, fp);
+    png_set_IHDR(png, info, 2, 2, 16, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+    png_set_swap(png);
+
+    uint16_t row0[8] = {65535, 0, 0, 65535, 0, 65535, 0, 65535};
+    uint16_t row1[8] = {0, 0, 65535, 65535, 32768, 32768, 32768, 65535};
+    png_bytep rows[2] = {(png_bytep)row0, (png_bytep)row1};
+    png_write_image(png, rows);
+    png_write_end(png, NULL);
+    png_destroy_write_struct(&png, &info);
+    fclose(fp);
+
+    uint8_t *pixels = NULL;
+    uint32_t w = 0, h = 0;
+    assert(image_load(png16_path, &pixels, &w, &h));
+    unlink(png16_path);
+    assert(w == 2 && h == 2 && pixels != NULL);
+
+    const uint32_t *u32 = (const uint32_t *)pixels;
+    assert(u32[0] == 0xFFFF0000U);
+    assert(u32[1] == 0xFF00FF00U);
+    assert(u32[2] == 0xFF0000FFU);
+    uint8_t mid = (uint8_t)(u32[3] & 0xFF);
+    assert(mid >= 127 && mid <= 128);
+    image_free(pixels);
+
+    printf("  -> 16-bit PNG decoding: PASSED\n");
 }
 
 static void test_cli_slideshow(void)
@@ -518,6 +578,7 @@ int main(void)
     test_cli_slideshow();
     test_slideshow_filesystem();
     test_10bit_color_math();
+    test_16bit_png_decode();
     test_static_gif_support();
     test_jit_transcode_support();
     printf("=== ALL ADVANCED ENGINE & DAEMON TESTS PASSED! ===\n");

@@ -8,10 +8,22 @@ extern "C" {
 #endif
 
 typedef struct {
-    float p1x;
-    float p1y;
-    float p2x;
-    float p2y;
+    union {
+        float p1x;
+        float x1;
+    };
+    union {
+        float p1y;
+        float y1;
+    };
+    union {
+        float p2x;
+        float x2;
+    };
+    union {
+        float p2y;
+        float y2;
+    };
 } bezier_curve_t;
 
 /* Standard CSS easing presets */

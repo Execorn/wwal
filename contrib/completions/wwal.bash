@@ -1,18 +1,19 @@
-# Bash completion for wwal (WayWal)
-
 _wwal_completion() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="ping query clear img video slideshow pause unpause toggle kill help"
-    local global_opts="-n --namespace -v --verbose -h --help"
-    local trans_types="none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom"
+    local commands="img video shader slideshow color clear theme pause resume unpause toggle query stats restore clear-cache ping kill help"
+    local global_opts="-n --namespace -v --verbose -h --help --layer --battery-policy"
+    local trans_types="none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random"
     local trans_positions="center top bottom left right top-left top-right bottom-left bottom-right cursor mouse"
     local sync_modes="simultaneous staggered"
-    local scaling_modes="fill fit stretch center tile crop cover contain"
+    local scaling_modes="fill fit stretch center tile crop cover contain no"
+    local filters="Nearest Bilinear CatmullRom Mitchell Lanczos3"
+    local layers="background bottom"
+    local battery_policies="ignore reduce-fps pause-video"
+    local backdrops="none auto-blur"
     local slideshow_actions="start stop pause resume toggle next prev"
 
-    # Find the subcommand if one was already given
     local cmd=""
     for ((i = 1; i < cword; i++)); do
         if [[ "${commands}" =~ (^|[[:space:]])"${words[i]}"($|[[:space:]]) ]]; then
@@ -43,34 +44,65 @@ _wwal_completion() {
             COMPREPLY=( $(compgen -W "${sync_modes}" -- "$cur") )
             return 0
             ;;
-        --scaling-mode|--mode)
+        --scaling-mode|--mode|--resize)
             COMPREPLY=( $(compgen -W "${scaling_modes}" -- "$cur") )
             return 0
             ;;
-        --transition-shader)
-            _filedir '@(comp|glsl)'
+        --filter)
+            COMPREPLY=( $(compgen -W "${filters}" -- "$cur") )
             return 0
             ;;
-        --transition-duration|--transition-fps|--transition-angle|--transition-wave|--stagger-delay|--interval|--loop|--speed|-n|--namespace|-o|--output)
+        --layer)
+            COMPREPLY=( $(compgen -W "${layers}" -- "$cur") )
+            return 0
+            ;;
+        --battery-policy)
+            COMPREPLY=( $(compgen -W "${battery_policies}" -- "$cur") )
+            return 0
+            ;;
+        --backdrop)
+            COMPREPLY=( $(compgen -W "${backdrops}" -- "$cur") )
+            _filedir '@(png|jpg|jpeg|webp|avif|heic|jxl|svg|bmp)'
+            return 0
+            ;;
+        --transition-shader)
+            _filedir '@(comp|glsl|frag)'
+            return 0
+            ;;
+        --transition-duration|--transition-fps|--transition-angle|--transition-wave|--transition-bezier|--transition-step|--stagger-delay|--fill-color|--interval|-d|--loop|--speed|-n|--namespace|-o|--output|--outputs)
             return 0
             ;;
     esac
 
-    local trans_opts="--transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --transition-shader -o --output --sync-mode --stagger-delay --10bit --scaling-mode --mode --animate"
+    local trans_opts="--transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --transition-bezier --transition-step --transition-shader -o --output --outputs --sync-mode --stagger-delay --10bit --scaling-mode --mode --resize --fill-color --filter --backdrop --layer --battery-policy --theme --no-theme --animate"
 
     case "$cmd" in
         img)
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=( $(compgen -W "${trans_opts} ${global_opts}" -- "$cur") )
             else
-                _filedir '@(png|jpg|jpeg|webp|bmp|gif|pnm|tga)'
+                _filedir '@(png|jpg|jpeg|webp|avif|heic|jxl|svg|bmp|gif|pnm|tga)'
             fi
             ;;
         video)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--loop --speed -o --output ${global_opts}" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--loop --speed --audio --battery-policy --layer --backdrop --theme --no-theme -o --output --outputs ${global_opts}" -- "$cur") )
             else
                 _filedir '@(mp4|mkv|webm|avi|mov|gif)'
+            fi
+            ;;
+        shader)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--audio --speed --battery-policy --layer --backdrop --10bit -o --output --outputs ${global_opts}" -- "$cur") )
+            else
+                _filedir '@(frag|comp|glsl)'
+            fi
+            ;;
+        theme)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "${global_opts}" -- "$cur") )
+            else
+                _filedir '@(png|jpg|jpeg|webp|avif|heic|jxl|svg|bmp)'
             fi
             ;;
         slideshow)
@@ -82,10 +114,15 @@ _wwal_completion() {
                 fi
             done
             if [[ -z "$subcmd" ]]; then
-                COMPREPLY=( $(compgen -W "${slideshow_actions}" -- "$cur") )
+                if [[ "$cur" == -* ]]; then
+                    COMPREPLY=( $(compgen -W "-d --interval -s --shuffle --random ${trans_opts} ${global_opts}" -- "$cur") )
+                else
+                    COMPREPLY=( $(compgen -W "${slideshow_actions}" -- "$cur") )
+                    _filedir -d
+                fi
             elif [[ "$subcmd" == "start" ]]; then
                 if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "--interval --shuffle ${trans_opts} ${global_opts}" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "-d --interval -s --shuffle --random ${trans_opts} ${global_opts}" -- "$cur") )
                 else
                     _filedir -d
                 fi
@@ -95,9 +132,14 @@ _wwal_completion() {
                 fi
             fi
             ;;
-        clear)
+        color|clear)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-o --output ${global_opts}" -- "$cur") )
+                COMPREPLY=( $(compgen -W "-o --output --outputs ${global_opts}" -- "$cur") )
+            fi
+            ;;
+        pause|resume|unpause|toggle|restore)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "-o --output --outputs ${global_opts}" -- "$cur") )
             fi
             ;;
         *)
@@ -108,4 +150,4 @@ _wwal_completion() {
     esac
 }
 
-complete -F _wwal_completion wwal
+complete -F _wwal_completion wwal swww awww

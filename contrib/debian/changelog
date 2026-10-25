@@ -1,0 +1,11 @@
+wwal (1.0.0-1) unstable; urgency=medium
+
+  * Initial release of wwal 1.0.0:
+    - Direct DMA-BUF scanout with non-linear modifier and 10-bit HDR support.
+    - 18 GLES 3.1 compute shader transitions and AVX-512/AVX2/NEON SIMD kernels.
+    - Zero-FFmpeg MP4/WebM demuxer and H.264/HEVC/VP9/AV1 VA-API video playback.
+    - Live Shadertoy fragment/compute engine with PipeWire 64-bin Bark FFT.
+    - Sub-ms OKLab/CAM16/HCT Material Design 3 palette extraction and caelestia sync.
+    - Drop-in swww/awww CLI compatibility and systemd socket activation.
+
+ -- Execorn <execorn@users.noreply.github.com>  Sat, 24 Oct 2026 18:00:00 +0000

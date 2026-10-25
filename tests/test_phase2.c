@@ -8,7 +8,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
 __attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
 {
     return "leak:<unknown module>\nleak:gbm_create_device\nleak:libgbm\n";

@@ -11,6 +11,8 @@
 extern "C" {
 #endif
 
+#ifndef WAYWAL_TRANSITION_TYPE_DEFINED
+#define WAYWAL_TRANSITION_TYPE_DEFINED
 typedef enum {
     WAYWAL_TRANSITION_NONE = 0,
     WAYWAL_TRANSITION_SIMPLE = 1,
@@ -35,6 +37,7 @@ typedef enum {
     WAYWAL_TRANSITION_CUSTOM = 20,
     WAYWAL_TRANSITION_RANDOM = 21,
 } waywal_transition_type_t;
+#endif
 
 typedef enum {
     WAYWAL_SYNC_SIMULTANEOUS = 0,
@@ -55,7 +58,10 @@ typedef struct {
 typedef struct render_engine render_engine_t;
 
 struct render_engine {
-    bool has_gpu_compute;
+    union {
+        bool has_gpu_compute;
+        bool gpu_compute_active;
+    };
     void *gpu_ctx; /* Internal EGL / GLES 3.1 compute context */
 };
 
@@ -67,6 +73,11 @@ void render_engine_destroy(render_engine_t *re);
 
 /* Releases OpenGL texture and EGLImage associated with a dmabuf BO */
 void render_engine_release_bo(render_engine_t *re, dmabuf_bo_t *bo);
+
+/* Uploads and scales static RGBA8/BGRA8 pixels or solid clear color into a DMA-BUF BO via GPU */
+bool render_engine_upload_static(render_engine_t *re, const uint8_t *src_rgba, uint32_t src_w,
+                                 uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t scaling_mode,
+                                 uint32_t clear_color);
 
 /* Hot-compiles and loads an arbitrary GLSL compute shader for CUSTOM transition */
 bool render_engine_load_custom_shader(render_engine_t *re, const char *shader_src);

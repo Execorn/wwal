@@ -19,8 +19,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
-__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+__attribute__((weak, visibility("default"))) const char *__lsan_default_suppressions(void)
 {
     return "leak:<unknown module>\nleak:gbm_create_device\nleak:libgbm\nleak:libEGL\nleak:"
            "libGLESv2\nleak:dri\nleak:libnvidia\n";
@@ -47,8 +50,8 @@ extern e2e_test_stats_t g_stats;
             printf("  [PASS] [%s] %s\n", g_stats.tier_name, (name));                              \
         } else {                                                                                  \
             g_stats.failed++;                                                                     \
-            fprintf(stderr, "  [FAIL] [%s] %s: " fmt "\n", g_stats.tier_name, (name),            \
-                    ##__VA_ARGS__);                                                               \
+            fprintf(stderr, "  [FAIL] [%s] %s: " fmt "\n", g_stats.tier_name, (name)              \
+                    __VA_OPT__(, ) __VA_ARGS__);                                                  \
         }                                                                                         \
     } while (0)
 
@@ -103,7 +106,9 @@ static inline long e2e_get_rss_kb(void)
 static inline uint32_t *e2e_canary_alloc(size_t num_pixels)
 {
     size_t total_words = E2E_CANARY_GUARD_WORDS + num_pixels + E2E_CANARY_GUARD_WORDS;
-    uint32_t *raw = (uint32_t *)aligned_alloc(64, total_words * sizeof(uint32_t));
+    size_t byte_size = total_words * sizeof(uint32_t);
+    size_t alloc_bytes = (byte_size + 63U) & ~(size_t)63U;
+    uint32_t *raw = (uint32_t *)aligned_alloc(64, alloc_bytes);
     if (!raw)
         return NULL;
     for (size_t i = 0; i < E2E_CANARY_GUARD_WORDS; ++i) {

@@ -19,7 +19,10 @@ typedef struct {
     dmabuf_format_table_entry_t *table;
     size_t num_entries;
     int table_fd;
+    dev_t tranche_dev;
+    bool has_tranche_dev;
     bool is_scanout_tranche;
+    bool locked_scanout_rgb;
 } feedback_state_t;
 
 static feedback_state_t g_fb_state = {.table_fd = -1};
@@ -28,6 +31,9 @@ static void feedback_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedb
 {
     (void)data;
     (void)feedback;
+    g_fb_state.is_scanout_tranche = false;
+    g_fb_state.has_tranche_dev = false;
+    g_fb_state.locked_scanout_rgb = false;
 }
 
 static void feedback_format_table(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback,
@@ -76,6 +82,7 @@ static void feedback_tranche_done(void *data, struct zwp_linux_dmabuf_feedback_v
     (void)data;
     (void)feedback;
     g_fb_state.is_scanout_tranche = false;
+    g_fb_state.has_tranche_dev = false;
 }
 
 static void feedback_tranche_target_device(void *data,
@@ -84,7 +91,10 @@ static void feedback_tranche_target_device(void *data,
 {
     (void)data;
     (void)feedback;
-    (void)device;
+    if (!device || device->size < sizeof(dev_t))
+        return;
+    memcpy(&g_fb_state.tranche_dev, device->data, sizeof(dev_t));
+    g_fb_state.has_tranche_dev = true;
 }
 
 static void feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback,
@@ -92,13 +102,17 @@ static void feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedbac
 {
     (void)feedback;
     dmabuf_context_t *ctx = (dmabuf_context_t *)data;
-    if (!ctx || !g_fb_state.table)
+    if (!ctx || !g_fb_state.table || !indices)
         return;
+
+    if (ctx->has_compositor_dev && g_fb_state.has_tranche_dev &&
+        g_fb_state.tranche_dev != ctx->compositor_dev) {
+        return;
+    }
 
     const uint16_t *idx_ptr = (const uint16_t *)indices->data;
     size_t count = indices->size / sizeof(uint16_t);
 
-    bool locked_scanout_rgb = false;
     for (size_t i = 0; i < count; ++i) {
         uint16_t idx = idx_ptr[i];
         if (idx < g_fb_state.num_entries) {
@@ -106,7 +120,7 @@ static void feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedbac
             uint64_t mod = g_fb_state.table[idx].modifier;
 
             if (fmt == DRM_FORMAT_ARGB8888 || fmt == DRM_FORMAT_XRGB8888) {
-                if (!locked_scanout_rgb &&
+                if (!g_fb_state.locked_scanout_rgb &&
                     (ctx->preferred_modifier == DRM_FORMAT_MOD_INVALID ||
                      g_fb_state.is_scanout_tranche)) {
                     ctx->preferred_modifier = mod;
@@ -115,7 +129,7 @@ static void feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedbac
                         "Negotiated optimal DMA-BUF scanout modifier: 0x%016lx (format: 0x%08x)",
                         (unsigned long)mod, fmt);
                     if (g_fb_state.is_scanout_tranche) {
-                        locked_scanout_rgb = true;
+                        g_fb_state.locked_scanout_rgb = true;
                     }
                 }
             } else if (fmt == DRM_FORMAT_XRGB2101010 || fmt == DRM_FORMAT_ARGB2101010 ||

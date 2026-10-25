@@ -3,6 +3,7 @@
 
 #include "waywal/dmabuf.h"
 #include "waywal/render_engine.h"
+#include "waywal/types.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -27,6 +28,9 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
 /* Releases cached OpenGL texture and EGLImageKHR associated with a BO */
 void gpu_compute_release_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo);
 
+/* Invalidates cached GL program and texture bindings after external context use */
+void gpu_compute_invalidate_state_cache(gpu_compute_ctx_t *ctx);
+
 /* Prepares GPU textures and FBO for hardware-accelerated transition on an SHM output */
 bool gpu_compute_prepare_shm(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t *tex_new,
                              uint32_t *tex_target, uint32_t *fbo, uint32_t *cur_w, uint32_t *cur_h,
@@ -46,6 +50,16 @@ void gpu_compute_release_shm_res(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint
 
 /* Hot-compiles and loads an arbitrary custom GLSL compute shader */
 bool gpu_compute_load_custom_shader(gpu_compute_ctx_t *ctx, const char *src);
+
+/* Uploads and scales static RGBA8/BGRA8 pixels or solid color into dst_bo on the GPU */
+bool gpu_compute_upload_static(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, uint32_t src_w,
+                               uint32_t src_h, dmabuf_bo_t *dst_bo, waywal_scaling_mode_t scaling,
+                               uint32_t clear_color);
+
+bool gpu_compute_render_kawase_blur(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, uint32_t src_w,
+                                    uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t radius);
+
+void layer_shell_blur_rgba_cpu(const uint8_t *src, uint8_t *dst, uint32_t w, uint32_t h);
 
 #ifdef __cplusplus
 }

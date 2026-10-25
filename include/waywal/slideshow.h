@@ -30,6 +30,11 @@ typedef struct {
     uint32_t num_target_outputs;
     char target_outputs[16][64];
     uint32_t scaling_mode; /* waywal_scaling_mode_t */
+    uint32_t filter_mode;  /* waywal_filter_mode_t */
+    bezier_curve_t bezier;
+    bool has_custom_bezier;
+    uint8_t color[4];
+    bool ten_bit;
 
     char **file_list;
     size_t num_files;

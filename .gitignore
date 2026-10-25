@@ -45,7 +45,10 @@ perf.data*
 contrib/src/
 contrib/pkg/
 
-# Internal AI-generated architecture documents
+# Internal scratch documents
 CONTEXT.md
 AUDIT_REPORT.md
+MASTER_SPEC.md
+docs/MASTER_SPEC.md
+docs/AUDIT_REPORT.md
 .agents/

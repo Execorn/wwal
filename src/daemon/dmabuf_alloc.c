@@ -105,7 +105,7 @@ int open_drm_node_by_devt(dev_t target_dev)
         if (strncmp(de->d_name, "renderD", 7) != 0)
             continue;
 
-        char path[64];
+        char path[300];
         snprintf(path, sizeof(path), "/dev/dri/%s", de->d_name);
 
         struct stat st;

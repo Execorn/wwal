@@ -1,0 +1,454 @@
+.\" Generated from wwal.1.scd
+.TH "WWAL" "1" "2026-10-24" "wwal 1.0.0" "WayWal Manual"
+.PP
+.SH NAME
+.PP
+wwal - zero-copy Wayland wallpaper, VA-API video, Shadertoy, and Material You client
+.PP
+.SH SYNOPSIS
+.PP
+\fBwwal\fR [GLOBAL OPTIONS] <COMMAND> [ARGUMENTS...]
+.PP
+.SH DESCRIPTION
+.PP
+\fBwwal\fR is the command-line controller for \fBwwald\fR(1), a C23 Wayland wallpaper engine that unifies static DMA-BUF wallpapers, 18 GLES 3.1 compute shader transitions, zero-FFmpeg VA-API hardware video playback, live Shadertoy fragment/compute shaders with PipeWire 64-bin Bark FFT audio reactivity, and sub-millisecond OKLab/CAM16/HCT Material Design 3 color extraction.
+.PP
+When invoked via a symlink named \fBswww\fR or \fBawww\fR, \fBwwal\fR automatically enables full command-line compatibility with \fBswww\fR/\fBawww\fR scripts, pickers, and flags.
+.PP
+.SH GLOBAL OPTIONS
+.PP
+\fB-n, --namespace\fR <NAME>
+.RS 4
+Connect to the daemon socket namespace \fINAME\fR (default: \fBdefault\fR). Also sets the Wayland layer-shell namespace unless overridden.
+.RE
+.PP
+\fB-v, --verbose\fR
+.RS 4
+Enable verbose diagnostic output.
+.RE
+.PP
+\fB-h, --help\fR
+.RS 4
+Display usage information and exit.
+.RE
+.PP
+.SH COMMANDS
+.PP
+\fBimg\fR <PATH|-> [OPTIONS]
+.RS 4
+Decode and display a static or animated image (PNG, JPEG, WebP, AVIF, HEIC, JPEG-XL, SVG, BMP, GIF). Pass \fB-\fR to read image bytes from standard input. File descriptors are passed to \fBwwald\fR(1) via \fBSCM_RIGHTS\fR for zero-copy decoding inside the sandbox.
+.RE
+.PP
+\fBvideo\fR <PATH> [OPTIONS]
+.RS 4
+Play a hardware-accelerated video wallpaper (MP4, WebM, MKV, GIF) using the zero-FFmpeg MP4/WebM demuxer and VA-API hardware decode pipeline (H.264, HEVC, VP9, AV1).
+.RE
+.PP
+\fBshader\fR <PATH> [OPTIONS]
+.RS 4
+Run a live procedural GLSL compute shader (\fB.comp\fR) or Shadertoy fragment shader (\fB.frag\fR) on the background layer with automatic \fBinotify\fR(7) hot-reloading.
+.RE
+.PP
+\fBslideshow\fR <DIR|ACTION> [OPTIONS]
+.RS 4
+Start a zero-idle-CPU \fBtimerfd\fR wallpaper slideshow from \fIDIR\fR, or control an active slideshow using one of the actions: \fBstart\fR, \fBstop\fR, \fBpause\fR, \fBresume\fR, \fBtoggle\fR, \fBnext\fR, \fBprev\fR.
+.RE
+.PP
+\fBcolor\fR <HEX> [OPTIONS]
+.RS 4
+Set the target output(s) to a solid RGB/RGBA hex color (for example, \fB#1e1e2e\fR or \fB1e1e2eff\fR) using \fBwp_single_pixel_buffer_v1\fR when supported by the compositor.
+.RE
+.PP
+\fBclear\fR [HEX] [OPTIONS]
+.RS 4
+Alias for \fBcolor\fR (defaults to \fB000000\fR if no color is given) for \fBswww\fR/\fBawww\fR compatibility.
+.RE
+.PP
+\fBtheme\fR <PATH> [OPTIONS]
+.RS 4
+Extract an OKLab/CAM16/HCT Material Design 3 palette from \fIPATH\fR in under 0.4 ms and write \fB~/.local/state/caelestia/scheme.json\fR, \fB~/.cache/wwal/colors.json\fR, \fB~/.cache/wwal/colors.css\fR, \fB~/.cache/wwal/colors-hyprland.conf\fR, and terminal OSC 4/10/11 sequences.
+.RE
+.PP
+\fBpause\fR
+.RS 4
+Pause active video, animation, or live shader playback.
+.RE
+.PP
+\fBresume\fR, \fBunpause\fR
+.RS 4
+Resume paused video, animation, or live shader playback.
+.RE
+.PP
+\fBtoggle\fR
+.RS 4
+Toggle video, animation, or live shader playback between paused and playing states.
+.RE
+.PP
+\fBquery\fR
+.RS 4
+List all connected Wayland outputs, physical and logical dimensions, scale factors, refresh rates, and active wallpaper state.
+.RE
+.PP
+\fBstats\fR
+.RS 4
+Query real-time daemon telemetry (opcode \fB0x000C\fR), including daemon RSS/PSS memory footprint, active VRAM surface pool count, negotiated DRM FourCC format and modifier (Linear, NVIDIA Block-Linear, ARM AFBC, AMD DCC, Intel CCS), VBlank PLL period/phase jitter estimates, and per-output Zero-Watt \fBpause_mask\fR reasons.
+.RE
+.PP
+\fBrestore\fR
+.RS 4
+Restore the last persisted per-output wallpaper, video, shader, or color state from \fB$XDG_STATE_HOME/wwal/state.bin\fR.
+.RE
+.PP
+\fBclear-cache\fR
+.RS 4
+Remove cached hardware-transcoded animations and palette artifacts from \fB$XDG_CACHE_HOME/wwal\fR.
+.RE
+.PP
+\fBping\fR
+.RS 4
+Check whether \fBwwald\fR(1) is running and responsive over the IPC socket.
+.RE
+.PP
+\fBkill\fR
+.RS 4
+Gracefully terminate the running \fBwwald\fR(1) daemon.
+.RE
+.PP
+\fBhelp\fR
+.RS 4
+Show command-line usage summary.
+.RE
+.PP
+.SH IMAGE & TRANSITION OPTIONS
+.PP
+\fB--transition-type\fR <TYPE>
+.RS 4
+Select transition effect (default: \fBfade\fR). Supported GPU GLES 3.1 compute shader and AVX-512/AVX2/NEON SIMD transition types:
+.RE
+.RS 4
+.IP \(bu 2
+\fBnone\fR: Instant buffer swap with zero transition frames.
+.RE
+.RS 4
+.IP \(bu 2
+\fBsimple\fR: Linear alpha cross-dissolve.
+.RE
+.RS 4
+.IP \(bu 2
+\fBfade\fR: Cubic-bezier eased alpha crossfade.
+.RE
+.RS 4
+.IP \(bu 2
+\fBwipe\fR: Directional linear edge wipe controlled by \fB--transition-angle\fR.
+.RE
+.RS 4
+.IP \(bu 2
+\fBgrow\fR: Expanding circular iris anchored at \fB--transition-pos\fR.
+.RE
+.RS 4
+.IP \(bu 2
+\fBouter\fR: Contracting circular iris toward \fB--transition-pos\fR.
+.RE
+.RS 4
+.IP \(bu 2
+\fBwave\fR: Sinusoidal wave front controlled by \fB--transition-wave\fR and \fB--transition-angle\fR.
+.RE
+.RS 4
+.IP \(bu 2
+\fBnoise\fR: Perlin/simplex procedural noise dissolve.
+.RE
+.RS 4
+.IP \(bu 2
+\fBcrosszoom\fR: Radial motion-blur zoom crossfade.
+.RE
+.RS 4
+.IP \(bu 2
+\fBslide\fR: Directional viewport push transition.
+.RE
+.RS 4
+.IP \(bu 2
+\fBglitch\fR: RGB chromatic aberration and block-shift digital glitch.
+.RE
+.RS 4
+.IP \(bu 2
+\fBburn\fR: Procedural ember/fire edge burn.
+.RE
+.RS 4
+.IP \(bu 2
+\fBripple\fR: Concentric water ripple refraction anchored at \fB--transition-pos\fR.
+.RE
+.RS 4
+.IP \(bu 2
+\fBpixelate\fR: Dynamic mosaic block quantization transition.
+.RE
+.RS 4
+.IP \(bu 2
+\fBdoom\fR: Classic vertical column melt transition.
+.RE
+.RS 4
+.IP \(bu 2
+\fBswirl\fR: Spiral vortex distortion around \fB--transition-pos\fR.
+.RE
+.RS 4
+.IP \(bu 2
+\fBcube\fR: 3D perspective rotating cube face transition.
+.RE
+.RS 4
+.IP \(bu 2
+\fBluma\fR: Luminance threshold ramp transition.
+.RE
+.RS 4
+.IP \(bu 2
+\fBlight_leak\fR: Warm filmic anamorphic flare transition.
+.RE
+.RS 4
+.IP \(bu 2
+\fBpage_curl\fR: 3D cylindrical page curl with specular shading.
+.RE
+.RS 4
+.IP \(bu 2
+\fBcustom\fR: User-supplied GLSL compute shader via \fB--transition-shader\fR.
+.RE
+.RS 4
+.IP \(bu 2
+\fBrandom\fR: Randomly choose one of the 18 built-in shader transitions.
+.RE
+.PP
+\fB--transition-duration\fR <SECONDS>
+.RS 4
+Duration of the transition in seconds (default: \fB1.0\fR).
+.RE
+.PP
+\fB--transition-fps\fR <FPS>
+.RS 4
+Target transition frame rate (default: \fB60\fR; automatically locks to display VBlank via \fBwp_presentation\fR).
+.RE
+.PP
+\fB--transition-bezier\fR <X1,Y1,X2,Y2>
+.RS 4
+Cubic Bezier control points for transition progress easing (default: \fB0.25,0.1,0.25,1.0\fR; \fBswww\fR default: \fB0.54,0,0.34,0.99\fR).
+.RE
+.PP
+\fB--transition-angle\fR <DEGREES>
+.RS 4
+Direction angle in degrees for \fBwipe\fR, \fBwave\fR, and \fBslide\fR transitions (default: \fB0\fR).
+.RE
+.PP
+\fB--transition-wave\fR <FREQ,AMP>
+.RS 4
+Frequency and amplitude for the \fBwave\fR transition (default: \fB20,0.05\fR).
+.RE
+.PP
+\fB--transition-pos\fR <POS>
+.RS 4
+Anchor position for \fBgrow\fR, \fBouter\fR, \fBripple\fR, and \fBswirl\fR transitions. Accepts normalized coordinates \fBX,Y\fR in \fB0.0..1.0\fR, or semantic aliases: \fBcenter\fR, \fBtop\fR, \fBbottom\fR, \fBleft\fR, \fBright\fR, \fBtop-left\fR, \fBtop-right\fR, \fBbottom-left\fR, \fBbottom-right\fR, \fBcursor\fR, \fBmouse\fR.
+.RE
+.PP
+\fB--transition-step\fR <STEP>
+.RS 4
+Per-frame progress step (\fB1..255\fR) for \fBswww\fR/\fBawww\fR compatibility.
+.RE
+.PP
+\fB--transition-shader\fR <FILE>
+.RS 4
+Path to a custom GLSL ES 3.10 compute shader (\fB.comp\fR) when \fB--transition-type custom\fR is selected.
+.RE
+.PP
+\fB-o, --output, --outputs\fR <NAMES>
+.RS 4
+Target specific Wayland output(s) by name (for example, \fBDP-1\fR or \fBDP-1,HDMI-A-1\fR). May be specified multiple times.
+.RE
+.PP
+\fB--sync-mode\fR <simultaneous|staggered>
+.RS 4
+Synchronize transitions across multiple monitors simultaneously or with a cascading delay (default: \fBsimultaneous\fR).
+.RE
+.PP
+\fB--stagger-delay\fR <MS>
+.RS 4
+Cascading delay in milliseconds between outputs when \fB--sync-mode staggered\fR is active (default: \fB150\fR).
+.RE
+.PP
+\fB--scaling-mode, --mode, --resize\fR <MODE>
+.RS 4
+Aspect-ratio scaling mode:
+.RE
+.RS 4
+.IP \(bu 2
+\fBfill\fR, \fBcrop\fR, \fBcover\fR: Scale to fill the entire output, cropping excess edges (default).
+.RE
+.RS 4
+.IP \(bu 2
+\fBfit\fR, \fBcontain\fR: Scale to fit inside the output, padding letterbox/pillarbox bars with \fB--fill-color\fR.
+.RE
+.RS 4
+.IP \(bu 2
+\fBstretch\fR: Stretch non-uniformly to output dimensions.
+.RE
+.RS 4
+.IP \(bu 2
+\fBcenter\fR, \fBno\fR: Center at 1:1 pixel resolution, padding surrounding space with \fB--fill-color\fR.
+.RE
+.RS 4
+.IP \(bu 2
+\fBtile\fR: Repeat image in a tiled grid across the output.
+.RE
+.PP
+\fB--fill-color\fR <HEX>
+.RS 4
+Background padding color in 6- or 8-digit hex for \fBfit\fR and \fBcenter\fR modes (default: \fB000000\fR).
+.RE
+.PP
+\fB--filter\fR <Nearest|Bilinear|CatmullRom|Mitchell|Lanczos3>
+.RS 4
+Sampling filter hint for image scaling (\fBswww\fR/\fBawww\fR compatibility).
+.RE
+.PP
+\fB--10bit\fR
+.RS 4
+Request 10-bit wide-gamut scanout (\fBDRM_FORMAT_XRGB2101010\fR / \fBDRM_FORMAT_ARGB2101010\fR) and preserve 16-bit PNG/AVIF/JXL channel precision when supported by the compositor.
+.RE
+.PP
+\fB--backdrop\fR <none|auto-blur|FILE>
+.RS 4
+Configure a secondary layer-shell surface with namespace \fBwaywal-backdrop\fR for compositors with overview backdrops such as Niri (\fBplace-within-backdrop true\fR). \fBauto-blur\fR renders a 2-pass Dual-Kawase Gaussian blur of the active wallpaper on the GPU at zero extra image-decode cost.
+.RE
+.PP
+\fB--layer\fR <background|bottom>
+.RS 4
+Wayland layer-shell layer placement (default: \fBbackground\fR).
+.RE
+.PP
+\fB--theme, --no-theme\fR
+.RS 4
+Enable or disable automatic Material Design 3 OKLab/CAM16/HCT color extraction and \fBcaelestia\fR/\fBOSC\fR synchronization on wallpaper change.
+.RE
+.PP
+\fB--animate\fR
+.RS 4
+Route animated GIF/WebP/APNG files through the hardware video/animation engine.
+.RE
+.PP
+.SH VIDEO, SHADER & POWER OPTIONS
+.PP
+\fB--loop\fR <COUNT>
+.RS 4
+Number of playback loops for \fBvideo\fR (\fB0\fR for infinite loop, default: \fB0\fR).
+.RE
+.PP
+\fB--speed\fR <MULTIPLIER>
+.RS 4
+Playback speed multiplier for \fBvideo\fR and \fBshader\fR (default: \fB1.0\fR).
+.RE
+.PP
+\fB--audio\fR
+.RS 4
+Enable lock-free PipeWire default sink monitor capture and 64-bin logarithmic Bark-scale FFT uniforms (\fBu_audio_bands[64]\fR, \fBu_audio_envelope\fR, and Shadertoy \fBiChannel0\fR 512x2 audio texture) for \fBshader\fR.
+.RE
+.PP
+\fB--battery-policy\fR <ignore|reduce-fps|pause-video>
+.RS 4
+Configure the laptop battery governor policy when discharging or entering power-saver mode.
+.RE
+.PP
+.SH SLIDESHOW OPTIONS
+.PP
+\fB-d, --interval\fR <SECONDS>
+.RS 4
+Interval in seconds between slideshow transitions (default: \fB300\fR).
+.RE
+.PP
+\fB-s, --shuffle, --random\fR
+.RS 4
+Randomize slideshow traversal order using Fisher-Yates shuffling.
+.RE
+.PP
+.SH ENVIRONMENT
+.PP
+\fBWAYLAND_DISPLAY\fR
+.RS 4
+Wayland compositor socket name.
+.RE
+.PP
+\fBXDG_RUNTIME_DIR\fR
+.RS 4
+Directory containing the \fBwwald\fR(1) IPC socket (\fB$XDG_RUNTIME_DIR/wwald.sock\fR or \fB$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-wwald.<namespace>.sock\fR).
+.RE
+.PP
+\fBXDG_CONFIG_HOME\fR
+.RS 4
+Location of \fBwwal/config.toml\fR (defaults to \fB~/.config\fR).
+.RE
+.PP
+\fBXDG_CACHE_HOME\fR
+.RS 4
+Location of \fBwwal/\fR generated color schemes and cached transcodes (defaults to \fB~/.cache\fR).
+.RE
+.PP
+\fBXDG_STATE_HOME\fR
+.RS 4
+Location of \fBwwal/state.bin\fR persistent output state (defaults to \fB~/.local/state\fR).
+.RE
+.PP
+.SH FILES
+.PP
+\fB~/.config/wwal/config.toml\fR
+.RS 4
+Declarative daemon, theme, transition, output, and workspace configuration. See \fBwwal-config\fR(5).
+.RE
+.PP
+\fB~/.local/state/caelestia/scheme.json\fR
+.RS 4
+Material Design 3 tonal palette output for Quickshell (\fBcaelestia-shell\fR).
+.RE
+.PP
+\fB~/.cache/wwal/colors.json\fR, \fB~/.cache/wwal/colors.css\fR, \fB~/.cache/wwal/colors-hyprland.conf\fR
+.RS 4
+Exported OKLab/HCT palette files for Waybar, GTK, and Hyprland.
+.RE
+.PP
+.SH EXAMPLES
+.PP
+Set a wallpaper with a 144 FPS circular iris transition anchored at the cursor and extract a Material You palette:
+.PP
+.nf
+.RS 4
+wwal img ~/Pictures/cyberpunk.avif --transition-type grow --transition-pos cursor --transition-fps 144 --theme
+.RE
+.fi
+.PP
+Set a wallpaper with a Niri Dual-Kawase blurred overview backdrop and custom cubic-bezier curve:
+.PP
+.nf
+.RS 4
+wwal img ~/Pictures/mountain.jxl --backdrop auto-blur --transition-bezier 0.22,1.0,0.36,1.0
+.RE
+.fi
+.PP
+Play a 4K 60 FPS video wallpaper with zero-copy VA-API decoding:
+.PP
+.nf
+.RS 4
+wwal video ~/Videos/loop.mp4 --output DP-1
+.RE
+.fi
+.PP
+Run an audio-reactive Shadertoy wallpaper fed by PipeWire FFT:
+.PP
+.nf
+.RS 4
+wwal shader ~/Shaders/nebula.frag --audio
+.RE
+.fi
+.PP
+Inspect live DMA-BUF modifiers, VRAM pool usage, and Zero-Watt occlusion state:
+.PP
+.nf
+.RS 4
+wwal stats
+.RE
+.fi
+.PP
+.SH SEE ALSO
+.PP
+\fBwwald\fR(1), \fBwwal-config\fR(5)

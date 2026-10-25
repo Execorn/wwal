@@ -387,9 +387,20 @@ static bool probe_mp4_stream(const char *filepath, mp4_probe_t *out_probe)
     return out_probe->valid;
 }
 
+typedef enum {
+    TRANSCODE_ENC_NVENC = 0,
+    TRANSCODE_ENC_VAAPI,
+    TRANSCODE_ENC_QSV,
+    TRANSCODE_ENC_LIBX264,
+} transcode_encoder_t;
+
 static bool run_ffmpeg_transcode(const char *filepath, const char *tmp_mp4, const char *vf_arg,
-                                 bool use_nvenc)
+                                 transcode_encoder_t enc)
 {
+    if (enc == TRANSCODE_ENC_VAAPI && access("/dev/dri/renderD128", R_OK | W_OK) != 0) {
+        return false;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         WAYWAL_LOG_ERR("fork failed: %s", strerror(errno));
@@ -400,14 +411,14 @@ static bool run_ffmpeg_transcode(const char *filepath, const char *tmp_mp4, cons
         int devnull = open("/dev/null", O_RDWR);
         if (devnull >= 0) {
             dup2(devnull, STDIN_FILENO);
-            if (use_nvenc) {
-                /* Silence NVENC probe failures when falling back to libx264 */
+            if (enc != TRANSCODE_ENC_LIBX264) {
+                /* Silence hardware encoder probe failures when falling back through vendors */
                 dup2(devnull, STDERR_FILENO);
             }
             close(devnull);
         }
 
-        if (use_nvenc) {
+        if (enc == TRANSCODE_ENC_NVENC) {
             char *const args[] = {"ffmpeg",
                                   "-y",
                                   "-v",
@@ -440,6 +451,86 @@ static bool run_ffmpeg_transcode(const char *filepath, const char *tmp_mp4, cons
                                   "60",
                                   "-pix_fmt",
                                   "yuv420p",
+                                  "-colorspace",
+                                  "bt709",
+                                  "-color_primaries",
+                                  "bt709",
+                                  "-color_trc",
+                                  "bt709",
+                                  "-color_range",
+                                  "tv",
+                                  "-movflags",
+                                  "+faststart",
+                                  "-an",
+                                  (char *)tmp_mp4,
+                                  NULL};
+            execvp("ffmpeg", args);
+        } else if (enc == TRANSCODE_ENC_VAAPI) {
+            char vaapi_vf[600];
+            snprintf(vaapi_vf, sizeof(vaapi_vf), "%s,format=nv12,hwupload", vf_arg);
+            char *const args[] = {"ffmpeg",
+                                  "-y",
+                                  "-v",
+                                  "error",
+                                  "-vaapi_device",
+                                  "/dev/dri/renderD128",
+                                  "-i",
+                                  (char *)filepath,
+                                  "-vf",
+                                  vaapi_vf,
+                                  "-c:v",
+                                  "h264_vaapi",
+                                  "-qp",
+                                  "24",
+                                  "-maxrate",
+                                  "10M",
+                                  "-bufsize",
+                                  "20M",
+                                  "-bf",
+                                  "0",
+                                  "-g",
+                                  "60",
+                                  "-colorspace",
+                                  "bt709",
+                                  "-color_primaries",
+                                  "bt709",
+                                  "-color_trc",
+                                  "bt709",
+                                  "-color_range",
+                                  "tv",
+                                  "-movflags",
+                                  "+faststart",
+                                  "-an",
+                                  (char *)tmp_mp4,
+                                  NULL};
+            execvp("ffmpeg", args);
+        } else if (enc == TRANSCODE_ENC_QSV) {
+            char *const args[] = {"ffmpeg",
+                                  "-y",
+                                  "-v",
+                                  "error",
+                                  "-i",
+                                  (char *)filepath,
+                                  "-vf",
+                                  (char *)vf_arg,
+                                  "-c:v",
+                                  "h264_qsv",
+                                  "-preset",
+                                  "medium",
+                                  "-global_quality",
+                                  "24",
+                                  "-maxrate",
+                                  "10M",
+                                  "-bufsize",
+                                  "20M",
+                                  "-bf",
+                                  "0",
+                                  "-refs",
+                                  "1",
+                                  "-g",
+                                  "60",
+                                  "-pix_fmt",
+                                  "nv12",
                                   "-colorspace",
                                   "bt709",
                                   "-color_primaries",
@@ -622,10 +713,16 @@ bool video_transcode_optimize(const char *filepath, uint32_t max_width, uint32_t
 
     bool transcoded = false;
     if (!is_gif && (!probe.valid || (probe.width >= 256 && probe.height >= 256))) {
-        transcoded = run_ffmpeg_transcode(filepath, tmp_mp4, vf_arg, true);
+        transcoded = run_ffmpeg_transcode(filepath, tmp_mp4, vf_arg, TRANSCODE_ENC_NVENC);
+        if (!transcoded) {
+            transcoded = run_ffmpeg_transcode(filepath, tmp_mp4, vf_arg, TRANSCODE_ENC_VAAPI);
+        }
+        if (!transcoded) {
+            transcoded = run_ffmpeg_transcode(filepath, tmp_mp4, vf_arg, TRANSCODE_ENC_QSV);
+        }
     }
     if (!transcoded) {
-        transcoded = run_ffmpeg_transcode(filepath, tmp_mp4, vf_arg, false);
+        transcoded = run_ffmpeg_transcode(filepath, tmp_mp4, vf_arg, TRANSCODE_ENC_LIBX264);
     }
 
     if (!transcoded) {

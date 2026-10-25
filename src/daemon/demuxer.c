@@ -281,13 +281,24 @@ static void parse_minf(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
 {
     size_t offset = 0;
     while (offset + 8 <= size) {
-        uint32_t box_size = read_u32_be(buf + offset);
+        uint64_t box_size = read_u32_be(buf + offset);
         uint32_t box_type = read_u32_be(buf + offset + 4);
-        if (box_size < 8 || offset + box_size > size)
+        size_t hdr_len = 8;
+
+        if (box_size == 1) {
+            if (offset + 16 > size)
+                break;
+            box_size = read_u64_be(buf + offset + 8);
+            hdr_len = 16;
+        } else if (box_size == 0) {
+            box_size = size - offset;
+        }
+
+        if (box_size < hdr_len || offset + box_size > size)
             break;
 
         if (box_type == FOURCC('s', 't', 'b', 'l')) {
-            parse_stbl(buf + offset + 8, box_size - 8, pt);
+            parse_stbl(buf + offset + hdr_len, box_size - hdr_len, pt);
             break;
         }
         offset += box_size;
@@ -298,15 +309,29 @@ static void parse_mdia(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
 {
     size_t offset = 0;
     bool is_video = false;
+    uint32_t mdia_timescale = 0;
+    const uint8_t *minf_data = NULL;
+    size_t minf_len = 0;
 
     while (offset + 8 <= size) {
-        uint32_t box_size = read_u32_be(buf + offset);
+        uint64_t box_size = read_u32_be(buf + offset);
         uint32_t box_type = read_u32_be(buf + offset + 4);
-        if (box_size < 8 || offset + box_size > size)
+        size_t hdr_len = 8;
+
+        if (box_size == 1) {
+            if (offset + 16 > size)
+                break;
+            box_size = read_u64_be(buf + offset + 8);
+            hdr_len = 16;
+        } else if (box_size == 0) {
+            box_size = size - offset;
+        }
+
+        if (box_size < hdr_len || offset + box_size > size)
             break;
 
-        const uint8_t *box_data = buf + offset + 8;
-        size_t payload_len = box_size - 8;
+        const uint8_t *box_data = buf + offset + hdr_len;
+        size_t payload_len = box_size - hdr_len;
 
         if (box_type == FOURCC('h', 'd', 'l', 'r')) {
             if (payload_len >= 12) {
@@ -319,18 +344,26 @@ static void parse_mdia(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
             if (payload_len >= 16) {
                 uint8_t ver = box_data[0];
                 if (ver == 0 && payload_len >= 20) {
-                    pt->timescale = read_u32_be(box_data + 12);
+                    mdia_timescale = read_u32_be(box_data + 12);
                 } else if (ver == 1 && payload_len >= 28) {
-                    pt->timescale = read_u32_be(box_data + 20);
+                    mdia_timescale = read_u32_be(box_data + 20);
                 }
             }
         } else if (box_type == FOURCC('m', 'i', 'n', 'f')) {
-            if (is_video) {
-                parse_minf(box_data, payload_len, pt);
-            }
+            minf_data = box_data;
+            minf_len = payload_len;
         }
 
         offset += box_size;
+    }
+
+    if (is_video) {
+        if (mdia_timescale > 0) {
+            pt->timescale = mdia_timescale;
+        }
+        if (minf_data) {
+            parse_minf(minf_data, minf_len, pt);
+        }
     }
 }
 
@@ -338,13 +371,24 @@ static void parse_trak(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
 {
     size_t offset = 0;
     while (offset + 8 <= size) {
-        uint32_t box_size = read_u32_be(buf + offset);
+        uint64_t box_size = read_u32_be(buf + offset);
         uint32_t box_type = read_u32_be(buf + offset + 4);
-        if (box_size < 8 || offset + box_size > size)
+        size_t hdr_len = 8;
+
+        if (box_size == 1) {
+            if (offset + 16 > size)
+                break;
+            box_size = read_u64_be(buf + offset + 8);
+            hdr_len = 16;
+        } else if (box_size == 0) {
+            box_size = size - offset;
+        }
+
+        if (box_size < hdr_len || offset + box_size > size)
             break;
 
         if (box_type == FOURCC('m', 'd', 'i', 'a')) {
-            parse_mdia(buf + offset + 8, box_size - 8, pt);
+            parse_mdia(buf + offset + hdr_len, box_size - hdr_len, pt);
             if (pt->codec != WAYWAL_CODEC_UNKNOWN) {
                 break; /* Successfully found video track */
             }
@@ -357,13 +401,24 @@ static void parse_moov(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
 {
     size_t offset = 0;
     while (offset + 8 <= size) {
-        uint32_t box_size = read_u32_be(buf + offset);
+        uint64_t box_size = read_u32_be(buf + offset);
         uint32_t box_type = read_u32_be(buf + offset + 4);
-        if (box_size < 8 || offset + box_size > size)
+        size_t hdr_len = 8;
+
+        if (box_size == 1) {
+            if (offset + 16 > size)
+                break;
+            box_size = read_u64_be(buf + offset + 8);
+            hdr_len = 16;
+        } else if (box_size == 0) {
+            box_size = size - offset;
+        }
+
+        if (box_size < hdr_len || offset + box_size > size)
             break;
 
         if (box_type == FOURCC('t', 'r', 'a', 'k')) {
-            parse_trak(buf + offset + 8, box_size - 8, pt);
+            parse_trak(buf + offset + hdr_len, box_size - hdr_len, pt);
             if (pt->codec != WAYWAL_CODEC_UNKNOWN) {
                 break;
             }
@@ -393,9 +448,10 @@ static void parse_moov(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
 #define EBML_ID_PIXEL_HEIGHT   0xBA
 #define EBML_ID_CLUSTER        0x1F43B675
 #define EBML_ID_CLUSTER_TIME   0xE7
-#define EBML_ID_SIMPLE_BLOCK   0xA3
-#define EBML_ID_BLOCK_GROUP    0xA0
-#define EBML_ID_BLOCK          0xA1
+#define EBML_ID_SIMPLE_BLOCK    0xA3
+#define EBML_ID_BLOCK_GROUP     0xA0
+#define EBML_ID_BLOCK           0xA1
+#define EBML_ID_REFERENCE_BLOCK 0xFB
 
 typedef struct {
     size_t offset;
@@ -695,44 +751,84 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
 
                         if (c_id == EBML_ID_CLUSTER_TIME) {
                             cluster_time = ebml_read_uint(data + clus_off, c_size);
-                        } else if (c_id == EBML_ID_SIMPLE_BLOCK) {
+                        } else if (c_id == EBML_ID_SIMPLE_BLOCK || c_id == EBML_ID_BLOCK_GROUP) {
                             size_t blk_off = clus_off;
                             size_t blk_end = blk_off + c_size;
-                            uint64_t blk_track = 0;
-                            if (ebml_read_vint(data, blk_end, &blk_off, &blk_track, NULL, true)) {
-                                if (blk_track == video_track_num && blk_off + 3 <= blk_end) {
-                                    int16_t rel_time = (int16_t)(((uint16_t)data[blk_off] << 8) |
-                                                                 data[blk_off + 1]);
-                                    uint8_t flags = data[blk_off + 2];
-                                    blk_off += 3;
+                            if (blk_end > sub_end) {
+                                blk_end = sub_end;
+                            }
+                            bool is_block_group = (c_id == EBML_ID_BLOCK_GROUP);
+                            bool has_block = !is_block_group;
+                            bool has_reference_block = false;
 
-                                    /* Check lacing bits (bits 2-1): 0 = no lacing */
-                                    uint8_t lacing = (flags >> 1) & 0x03;
-                                    if (lacing == 0 && blk_off < blk_end) {
-                                        int64_t pts_us = (int64_t)(cluster_time + rel_time) *
-                                                         (int64_t)timecode_scale / 1000LL;
-                                        bool is_kf = (flags & 0x80) != 0;
+                            if (is_block_group) {
+                                size_t bg_off = clus_off;
+                                size_t bg_end = blk_end;
+                                while (bg_off < bg_end) {
+                                    uint64_t bg_id = 0, bg_size = 0;
+                                    if (!ebml_read_vint(data, bg_end, &bg_off, &bg_id, NULL, false))
+                                        break;
+                                    if (!ebml_read_vint(data, bg_end, &bg_off, &bg_size, NULL, true))
+                                        break;
+                                    size_t el_end = bg_off + bg_size;
+                                    if (el_end > bg_end) {
+                                        el_end = bg_end;
+                                    }
+                                    if (bg_id == EBML_ID_BLOCK) {
+                                        blk_off = bg_off;
+                                        blk_end = el_end;
+                                        has_block = true;
+                                    } else if (bg_id == EBML_ID_REFERENCE_BLOCK) {
+                                        has_reference_block = true;
+                                    }
+                                    bg_off = el_end;
+                                }
+                            }
 
-                                        if (samples_count >= samples_cap) {
-                                            samples_cap *= 2;
-                                            webm_sample_entry_t *new_s =
-                                                (webm_sample_entry_t *)realloc(
-                                                    samples,
-                                                    samples_cap * sizeof(webm_sample_entry_t));
-                                            if (!new_s) {
-                                                free(samples);
-                                                return NULL;
+                            if (has_block) {
+                                uint64_t blk_track = 0;
+                                if (ebml_read_vint(data, blk_end, &blk_off, &blk_track, NULL,
+                                                   true)) {
+                                    if (blk_track == video_track_num && blk_off + 3 <= blk_end) {
+                                        int16_t rel_time = (int16_t)(((uint16_t)data[blk_off] << 8) |
+                                                                     data[blk_off + 1]);
+                                        uint8_t flags = data[blk_off + 2];
+                                        blk_off += 3;
+
+                                        /* Check lacing bits (bits 2-1): 0 = no lacing */
+                                        uint8_t lacing = (flags >> 1) & 0x03;
+                                        if (lacing == 0 && blk_off < blk_end) {
+                                            int64_t block_time =
+                                                (int64_t)cluster_time + (int64_t)rel_time;
+                                            if (block_time < 0) {
+                                                block_time = 0;
                                             }
-                                            samples = new_s;
-                                        }
+                                            int64_t pts_us =
+                                                (block_time * (int64_t)timecode_scale) / 1000LL;
+                                            bool is_kf = is_block_group ? !has_reference_block
+                                                                        : ((flags & 0x80) != 0);
 
-                                        samples[samples_count++] = (webm_sample_entry_t){
-                                            .offset = blk_off,
-                                            .size = blk_end - blk_off,
-                                            .pts_us = pts_us,
-                                            .dts_us = pts_us,
-                                            .is_keyframe = is_kf,
-                                        };
+                                            if (samples_count >= samples_cap) {
+                                                samples_cap *= 2;
+                                                webm_sample_entry_t *new_s =
+                                                    (webm_sample_entry_t *)realloc(
+                                                        samples,
+                                                        samples_cap * sizeof(webm_sample_entry_t));
+                                                if (!new_s) {
+                                                    free(samples);
+                                                    return NULL;
+                                                }
+                                                samples = new_s;
+                                            }
+
+                                            samples[samples_count++] = (webm_sample_entry_t){
+                                                .offset = blk_off,
+                                                .size = blk_end - blk_off,
+                                                .pts_us = pts_us,
+                                                .dts_us = pts_us,
+                                                .is_keyframe = is_kf,
+                                            };
+                                        }
                                     }
                                 }
                             }

@@ -34,13 +34,17 @@ typedef struct dmabuf_bo {
     struct gbm_bo *gbm_bo;
     struct wl_buffer *wl_buffer;
     void *egl_image;
+    void *map_data;
     uint32_t gl_tex;
     bool in_use;
 } dmabuf_bo_t;
 
 typedef struct dmabuf_context {
     int drm_fd;
-    struct gbm_device *gbm;
+    union {
+        struct gbm_device *gbm;
+        struct gbm_device *gbm_dev;
+    };
     struct zwp_linux_dmabuf_v1 *dmabuf_proto;
     struct zwp_linux_dmabuf_feedback_v1 *default_feedback;
     uint64_t preferred_modifier;

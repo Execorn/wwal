@@ -1,0 +1,44 @@
+Source: wwal
+Section: x11
+Priority: optional
+Maintainer: Execorn <execorn@users.noreply.github.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ meson (>= 0.60),
+ ninja-build,
+ pkgconf,
+ scdoc,
+ wayland-protocols (>= 1.24),
+ libwayland-dev (>= 1.20),
+ libwayland-bin,
+ libdrm-dev (>= 2.4.110),
+ libgbm-dev,
+ libegl-dev,
+ libgles-dev,
+ libva-dev,
+ liburing-dev,
+ libseccomp-dev,
+ libpng-dev,
+ libturbojpeg0-dev,
+ systemd-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/Execorn/wwal
+Rules-Requires-Root: no
+
+Package: wwal
+Architecture: linux-any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends:
+ libwebp7,
+ libavif16,
+ libjxl0.7 | libjxl0.8 | libjxl0.9,
+ librsvg2-2,
+ libpipewire-0.3-0
+Suggests: ffmpeg
+Description: Zero-copy C23 Wayland wallpaper, VA-API video, Shadertoy, and Material You engine
+ wwal (WayWal) is a high-performance Wayland wallpaper daemon (wwald) and
+ client (wwal) written in C23. It provides direct DMA-BUF scanout, 18 GLES 3.1
+ compute shader transitions, zero-FFmpeg VA-API hardware video playback, live
+ Shadertoy shaders with PipeWire 64-bin Bark FFT audio reactivity, Zero-Watt
+ smart occlusion/battery governance, and sub-millisecond OKLab/CAM16/HCT
+ Material Design 3 color extraction.

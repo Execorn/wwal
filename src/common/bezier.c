@@ -1,11 +1,11 @@
 #include "waywal/bezier.h"
 #include <math.h>
 
-const bezier_curve_t BEZIER_LINEAR      = { 0.0f,  0.0f, 1.0f,  1.0f };
-const bezier_curve_t BEZIER_DEFAULT     = { 0.25f, 0.1f, 0.25f, 1.0f };
-const bezier_curve_t BEZIER_EASE_IN     = { 0.42f, 0.0f, 1.0f,  1.0f };
-const bezier_curve_t BEZIER_EASE_OUT    = { 0.0f,  0.0f, 0.58f, 1.0f };
-const bezier_curve_t BEZIER_EASE_IN_OUT = { 0.42f, 0.0f, 0.58f, 1.0f };
+const bezier_curve_t BEZIER_LINEAR      = { .p1x = 0.0f,  .p1y = 0.0f, .p2x = 1.0f,  .p2y = 1.0f };
+const bezier_curve_t BEZIER_DEFAULT     = { .p1x = 0.25f, .p1y = 0.1f, .p2x = 0.25f, .p2y = 1.0f };
+const bezier_curve_t BEZIER_EASE_IN     = { .p1x = 0.42f, .p1y = 0.0f, .p2x = 1.0f,  .p2y = 1.0f };
+const bezier_curve_t BEZIER_EASE_OUT    = { .p1x = 0.0f,  .p1y = 0.0f, .p2x = 0.58f, .p2y = 1.0f };
+const bezier_curve_t BEZIER_EASE_IN_OUT = { .p1x = 0.42f, .p1y = 0.0f, .p2x = 0.58f, .p2y = 1.0f };
 
 bezier_curve_t bezier_create(float p1x, float p1y, float p2x, float p2y) {
     if (p1x < 0.0f) p1x = 0.0f;

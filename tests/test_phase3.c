@@ -1,8 +1,10 @@
+#include "../src/daemon/gpu_compute.h"
 #include "../src/daemon/simd/simd_blend.h"
 #include "waywal/bezier.h"
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
 #include "waywal/render_engine.h"
+#include "waywal/types.h"
 
 #include <assert.h>
 #include <math.h>
@@ -12,7 +14,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
 __attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
 {
     return "leak:<unknown "
@@ -79,11 +84,12 @@ static void test_simd_bit_exactness(void)
     const size_t width = 1920;
     const size_t height = 1080;
     const size_t num_bytes = width * height * 4;
+    const size_t alloc_bytes = (num_bytes + 63U) & ~(size_t)63U;
 
-    uint8_t *src_a = (uint8_t *)aligned_alloc(64, num_bytes);
-    uint8_t *src_b = (uint8_t *)aligned_alloc(64, num_bytes);
-    uint8_t *dst_ref = (uint8_t *)aligned_alloc(64, num_bytes);
-    uint8_t *dst_simd = (uint8_t *)aligned_alloc(64, num_bytes);
+    uint8_t *src_a = (uint8_t *)aligned_alloc(64, alloc_bytes);
+    uint8_t *src_b = (uint8_t *)aligned_alloc(64, alloc_bytes);
+    uint8_t *dst_ref = (uint8_t *)aligned_alloc(64, alloc_bytes);
+    uint8_t *dst_simd = (uint8_t *)aligned_alloc(64, alloc_bytes);
 
     assert(src_a && src_b && dst_ref && dst_simd);
 
@@ -234,6 +240,67 @@ static void test_gpu_compute_transitions(void)
     printf("[TEST] test_gpu_compute_transitions PASSED.\n");
 }
 
+static void test_gpu_compute_nonlinear_and_upload_static(void)
+{
+    printf("[TEST] Running test_gpu_compute_nonlinear_and_upload_static...\n");
+
+    dmabuf_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    if (!dmabuf_context_init(&ctx)) {
+        printf("  DRM/GBM unavailable in this environment. Skipping GPU upload test.\n");
+        return;
+    }
+
+    ctx.preferred_modifier = 0x0300000000606010ULL;
+    ctx.map_supported = false;
+
+    render_engine_t re;
+    assert(render_engine_init(&re, &ctx));
+    if (!re.gpu_compute_active) {
+        render_engine_destroy(&re);
+        dmabuf_context_destroy(&ctx);
+        return;
+    }
+
+    dmabuf_bo_t dst_bo;
+    assert(dmabuf_bo_allocate(&ctx, &dst_bo, 64, 64, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID));
+    assert(dst_bo.map_data == NULL);
+
+    uint32_t src_pixels[32 * 16];
+    for (size_t i = 0; i < 32 * 16; ++i) {
+        src_pixels[i] = 0xFF112233U;
+    }
+
+    assert(render_engine_upload_static(&re, NULL, 0, 0, &dst_bo, WAYWAL_SCALING_FILL, 0xFFAA5511U));
+    assert(render_engine_upload_static(&re, (const uint8_t *)src_pixels, 32, 16, &dst_bo,
+                                       WAYWAL_SCALING_FILL, 0xFF000000U));
+    assert(render_engine_upload_static(&re, (const uint8_t *)src_pixels, 32, 16, &dst_bo,
+                                       WAYWAL_SCALING_FIT, 0xFF1A2B3CU));
+    assert(render_engine_upload_static(&re, (const uint8_t *)src_pixels, 32, 16, &dst_bo,
+                                       WAYWAL_SCALING_STRETCH, 0xFF000000U));
+    assert(render_engine_upload_static(&re, (const uint8_t *)src_pixels, 32, 16, &dst_bo,
+                                       WAYWAL_SCALING_CENTER, 0xFF1A2B3CU));
+    assert(render_engine_upload_static(&re, (const uint8_t *)src_pixels, 32, 16, &dst_bo,
+                                       WAYWAL_SCALING_TILE, 0xFF000000U));
+
+    render_engine_release_bo(&re, &dst_bo);
+    dmabuf_bo_free(&dst_bo);
+
+    dmabuf_bo_t bo_10bit;
+    if (dmabuf_bo_allocate(&ctx, &bo_10bit, 64, 64, DRM_FORMAT_ARGB2101010,
+                           DRM_FORMAT_MOD_INVALID)) {
+        assert(render_engine_upload_static(&re, (const uint8_t *)src_pixels, 32, 16, &bo_10bit,
+                                           WAYWAL_SCALING_FIT, 0xFF1A2B3CU));
+        render_engine_release_bo(&re, &bo_10bit);
+        dmabuf_bo_free(&bo_10bit);
+    }
+
+    render_engine_destroy(&re);
+    dmabuf_context_destroy(&ctx);
+
+    printf("[TEST] test_gpu_compute_nonlinear_and_upload_static PASSED.\n");
+}
+
 static void test_cpu_transitions(void)
 {
     printf("[TEST] Running test_cpu_transitions...\n");
@@ -323,6 +390,7 @@ int main(void)
     test_simd_bit_exactness();
     test_cpu_transitions();
     test_gpu_compute_transitions();
+    test_gpu_compute_nonlinear_and_upload_static();
 
     printf("\n>>> ALL PHASE 3 UNIT TESTS PASSED SUCCESSFULLY! <<<\n\n");
     return 0;

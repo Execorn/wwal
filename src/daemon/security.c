@@ -5,6 +5,7 @@
 
 #include "waywal/log.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/landlock.h>
@@ -13,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -43,6 +45,232 @@ static inline int landlock_restrict_self(const int ruleset_fd, const __u32 flags
 }
 #endif
 
+static void mkdir_p_user_dir(const char *path)
+{
+    if (!path || !path[0])
+        return;
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            (void)mkdir(tmp, 0700);
+            *p = '/';
+        }
+    }
+    (void)mkdir(tmp, 0700);
+}
+
+static void add_landlock_dir_rule(int ruleset_fd, const char *path, __u64 allowed_access)
+{
+    if (ruleset_fd < 0 || !path || !path[0])
+        return;
+    int dir_fd = open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd >= 0) {
+        struct landlock_path_beneath_attr path_attr = {
+            .allowed_access = allowed_access,
+            .parent_fd = dir_fd,
+        };
+        landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
+        close(dir_fd);
+    } else {
+        int file_fd = open(path, O_PATH | O_CLOEXEC);
+        if (file_fd >= 0) {
+            struct landlock_path_beneath_attr path_attr = {
+                .allowed_access = allowed_access & (LANDLOCK_ACCESS_FS_READ_FILE |
+                                                    LANDLOCK_ACCESS_FS_WRITE_FILE |
+                                                    LANDLOCK_ACCESS_FS_EXECUTE),
+                .parent_fd = file_fd,
+            };
+            if (path_attr.allowed_access != 0) {
+                landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
+            }
+            close(file_fd);
+        }
+    }
+}
+
+static bool is_sensitive_home_entry(const char *name)
+{
+    if (!name || name[0] == '\0')
+        return true;
+    return (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || strcmp(name, ".ssh") == 0 ||
+            strcmp(name, ".gnupg") == 0 || strcmp(name, ".aws") == 0 ||
+            strcmp(name, ".pki") == 0 || strcmp(name, ".password-store") == 0);
+}
+
+static void apply_landlock_sandbox(const char *runtime_dir)
+{
+    int abi = landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (abi <= 0) {
+        WAYWAL_LOG_DEBUG("Landlock LSM not available on current kernel");
+        return;
+    }
+
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        char pre_path[4096];
+        const char *pre_dirs[] = {
+            ".cache",
+            ".cache/wwal",
+            ".local",
+            ".local/state",
+            ".local/state/wwal",
+            ".local/state/caelestia",
+            ".config",
+            ".config/wwal",
+        };
+        for (size_t i = 0; i < sizeof(pre_dirs) / sizeof(pre_dirs[0]); ++i) {
+            snprintf(pre_path, sizeof(pre_path), "%s/%s", home, pre_dirs[i]);
+            mkdir_p_user_dir(pre_path);
+        }
+    }
+
+    struct landlock_ruleset_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE |
+                             LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_WRITE_FILE |
+                             LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE;
+
+    int ruleset_fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
+    if (ruleset_fd < 0) {
+        return;
+    }
+
+    const __u64 ro_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+    const __u64 rw_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
+                            LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_MAKE_REG |
+                            LANDLOCK_ACCESS_FS_REMOVE_FILE;
+
+    /* Allow read-only across standard system mounts required for DRM/Mesa/VA-API drivers */
+    const char *ro_paths[] = {"/usr", "/etc", "/sys", "/proc", "/dev", "/dev/dri", "/tmp", NULL};
+    for (int i = 0; ro_paths[i] != NULL; ++i) {
+        add_landlock_dir_rule(ruleset_fd, ro_paths[i], ro_access);
+    }
+
+    /* Allow read-write strictly for DRI/GPU device nodes (/dev, /dev/dri) and /tmp (ARCH-07) */
+    const char *rw_paths[] = {"/dev", "/dev/dri", "/tmp", NULL};
+    for (int i = 0; rw_paths[i] != NULL; ++i) {
+        int dir_fd = open(rw_paths[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (dir_fd < 0 && strcmp(rw_paths[i], "/dev/dri") == 0) {
+            dir_fd = open("/dev", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        }
+        if (dir_fd >= 0) {
+            struct landlock_path_beneath_attr path_attr = {
+                .allowed_access = rw_access,
+                .parent_fd = dir_fd,
+            };
+            landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
+            close(dir_fd);
+        }
+    }
+
+    /* Allow read-write in runtime directory for IPC socket management */
+    const char *rt = runtime_dir ? runtime_dir : getenv("XDG_RUNTIME_DIR");
+    if (rt && rt[0]) {
+        add_landlock_dir_rule(ruleset_fd, rt, rw_access);
+    }
+
+    const char *xdg_cfg = getenv("XDG_CONFIG_HOME");
+    if (xdg_cfg && xdg_cfg[0]) {
+        add_landlock_dir_rule(ruleset_fd, xdg_cfg, ro_access);
+    }
+
+    const char *xdg_pics = getenv("XDG_PICTURES_DIR");
+    if (xdg_pics && xdg_pics[0]) {
+        add_landlock_dir_rule(ruleset_fd, xdg_pics, ro_access);
+    }
+    const char *xdg_vids = getenv("XDG_VIDEOS_DIR");
+    if (xdg_vids && xdg_vids[0]) {
+        add_landlock_dir_rule(ruleset_fd, xdg_vids, ro_access);
+    }
+
+    const char *wwal_cache = getenv("WWAL_CACHE_DIR");
+    if (wwal_cache && wwal_cache[0]) {
+        mkdir_p_user_dir(wwal_cache);
+        add_landlock_dir_rule(ruleset_fd, wwal_cache, rw_access);
+    }
+
+    const char *wwal_state = getenv("WWAL_STATE_DIR");
+    if (wwal_state && wwal_state[0]) {
+        mkdir_p_user_dir(wwal_state);
+        add_landlock_dir_rule(ruleset_fd, wwal_state, rw_access);
+    }
+
+    const char *xdg_cache = getenv("XDG_CACHE_HOME");
+    if (xdg_cache && xdg_cache[0]) {
+        char cache_wwal[4096];
+        snprintf(cache_wwal, sizeof(cache_wwal), "%s/wwal", xdg_cache);
+        mkdir_p_user_dir(cache_wwal);
+        add_landlock_dir_rule(ruleset_fd, cache_wwal, rw_access);
+    }
+
+    const char *xdg_state = getenv("XDG_STATE_HOME");
+    if (xdg_state && xdg_state[0]) {
+        char state_wwal[4096];
+        snprintf(state_wwal, sizeof(state_wwal), "%s/wwal", xdg_state);
+        mkdir_p_user_dir(state_wwal);
+        add_landlock_dir_rule(ruleset_fd, state_wwal, rw_access);
+
+        char state_caelestia[4096];
+        snprintf(state_caelestia, sizeof(state_caelestia), "%s/caelestia", xdg_state);
+        mkdir_p_user_dir(state_caelestia);
+        add_landlock_dir_rule(ruleset_fd, state_caelestia, rw_access);
+    }
+
+    char cwd_buf[4096];
+    if (getcwd(cwd_buf, sizeof(cwd_buf)) != NULL) {
+        if (!home || strcmp(cwd_buf, home) != 0) {
+            add_landlock_dir_rule(ruleset_fd, cwd_buf, ro_access);
+        }
+    }
+
+    if (home && home[0]) {
+        char path_buf[4096];
+
+        /* Grant read-only access across $HOME entries (excluding sensitive keystores like ~/.ssh) */
+        DIR *hdir = opendir(home);
+        if (hdir) {
+            struct dirent *ent;
+            while ((ent = readdir(hdir)) != NULL) {
+                if (is_sensitive_home_entry(ent->d_name))
+                    continue;
+                int n = snprintf(path_buf, sizeof(path_buf), "%s/%s", home, ent->d_name);
+                if (n > 0 && (size_t)n < sizeof(path_buf)) {
+                    add_landlock_dir_rule(ruleset_fd, path_buf, ro_access);
+                }
+            }
+            closedir(hdir);
+        }
+
+        const char *home_ro_subdirs[] = {
+            "Pictures", "Videos", "Wallpapers", "Downloads", ".config", ".local/share/wallpapers",
+        };
+        for (size_t i = 0; i < sizeof(home_ro_subdirs) / sizeof(home_ro_subdirs[0]); ++i) {
+            snprintf(path_buf, sizeof(path_buf), "%s/%s", home, home_ro_subdirs[i]);
+            add_landlock_dir_rule(ruleset_fd, path_buf, ro_access);
+        }
+
+        const char *home_rw_subdirs[] = {
+            ".cache",
+            ".cache/wwal",
+            ".local",
+            ".local/state",
+            ".local/state/wwal",
+            ".local/state/caelestia",
+        };
+        for (size_t i = 0; i < sizeof(home_rw_subdirs) / sizeof(home_rw_subdirs[0]); ++i) {
+            snprintf(path_buf, sizeof(path_buf), "%s/%s", home, home_rw_subdirs[i]);
+            add_landlock_dir_rule(ruleset_fd, path_buf, rw_access);
+        }
+    }
+
+    if (landlock_restrict_self(ruleset_fd, 0) == 0) {
+        WAYWAL_LOG_INFO("Security: Landlock LSM filesystem sandbox engaged (ABI v%d)", abi);
+    }
+    close(ruleset_fd);
+}
+
 bool security_sandbox_apply(const char *runtime_dir)
 {
     /* 1. Prevent privilege escalation */
@@ -53,77 +281,7 @@ bool security_sandbox_apply(const char *runtime_dir)
     }
 
     /* 2. Landlock LSM filesystem sandboxing */
-    int abi = landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
-    if (abi > 0) {
-        struct landlock_ruleset_attr attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE |
-                                 LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_WRITE_FILE |
-                                 LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE;
-
-        int ruleset_fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
-        if (ruleset_fd >= 0) {
-            /* Allow read-only across standard system mounts required for DRM/Mesa/VA-API drivers */
-            const char *ro_paths[] = {"/usr", "/etc", "/sys", "/proc", "/dev", "/dev/dri", NULL};
-            for (int i = 0; ro_paths[i] != NULL; ++i) {
-                int dir_fd = open(ro_paths[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
-                if (dir_fd >= 0) {
-                    struct landlock_path_beneath_attr path_attr = {
-                        .allowed_access =
-                            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR,
-                        .parent_fd = dir_fd,
-                    };
-                    landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
-                    close(dir_fd);
-                }
-            }
-
-            /* Allow read-write strictly for DRI/GPU device nodes (/dev, /dev/dri) and /tmp (ARCH-07) */
-            const char *rw_paths[] = {"/dev", "/dev/dri", "/tmp", NULL};
-            for (int i = 0; rw_paths[i] != NULL; ++i) {
-                int dir_fd = open(rw_paths[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
-                if (dir_fd < 0 && strcmp(rw_paths[i], "/dev/dri") == 0) {
-                    /* Fallback to /dev if /dev/dri not present (e.g. non-DRI container) */
-                    dir_fd = open("/dev", O_PATH | O_DIRECTORY | O_CLOEXEC);
-                }
-                if (dir_fd >= 0) {
-                    struct landlock_path_beneath_attr path_attr = {
-                        .allowed_access =
-                            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
-                            LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_MAKE_REG |
-                            LANDLOCK_ACCESS_FS_REMOVE_FILE,
-                        .parent_fd = dir_fd,
-                    };
-                    landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
-                    close(dir_fd);
-                }
-            }
-
-            /* Allow read-write in runtime directory for IPC socket management */
-            const char *rt = runtime_dir ? runtime_dir : getenv("XDG_RUNTIME_DIR");
-            if (rt) {
-                int rt_fd = open(rt, O_PATH | O_DIRECTORY | O_CLOEXEC);
-                if (rt_fd >= 0) {
-                    struct landlock_path_beneath_attr path_attr = {
-                        .allowed_access =
-                            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
-                            LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_MAKE_REG |
-                            LANDLOCK_ACCESS_FS_REMOVE_FILE,
-                        .parent_fd = rt_fd,
-                    };
-                    landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
-                    close(rt_fd);
-                }
-            }
-
-            if (landlock_restrict_self(ruleset_fd, 0) == 0) {
-                WAYWAL_LOG_INFO("Security: Landlock LSM filesystem sandbox engaged (ABI v%d)", abi);
-            }
-            close(ruleset_fd);
-        }
-    } else {
-        WAYWAL_LOG_DEBUG("Landlock LSM not available on current kernel");
-    }
+    apply_landlock_sandbox(runtime_dir);
 
 #ifdef HAVE_LIBSECCOMP
     /* 3. Seccomp-BPF syscall sandbox (SOTA-09) */
@@ -192,6 +350,12 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(eventfd2),
             SCMP_SYS(signalfd),
             SCMP_SYS(signalfd4),
+#ifdef __NR_inotify_init
+            SCMP_SYS(inotify_init),
+#endif
+            SCMP_SYS(inotify_init1),
+            SCMP_SYS(inotify_add_watch),
+            SCMP_SYS(inotify_rm_watch),
 
             /* File I/O & Dynamic Driver Loading */
             SCMP_SYS(readv),
@@ -206,6 +370,13 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(pipe),
             SCMP_SYS(pipe2),
             SCMP_SYS(ftruncate),
+            SCMP_SYS(fdatasync),
+            SCMP_SYS(fsync),
+            SCMP_SYS(rename),
+            SCMP_SYS(renameat),
+            SCMP_SYS(renameat2),
+            SCMP_SYS(mkdir),
+            SCMP_SYS(mkdirat),
             SCMP_SYS(unlink),
             SCMP_SYS(unlinkat),
             SCMP_SYS(open),
@@ -251,6 +422,7 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(prctl),
             SCMP_SYS(rt_sigaction),
             SCMP_SYS(rt_sigprocmask),
+            SCMP_SYS(sigaltstack),
             SCMP_SYS(tgkill),
             SCMP_SYS(tkill),
             SCMP_SYS(futex),
@@ -268,7 +440,9 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(sched_getaffinity),
             SCMP_SYS(sched_setaffinity),
             SCMP_SYS(sched_getparam),
+            SCMP_SYS(sched_setparam),
             SCMP_SYS(sched_getscheduler),
+            SCMP_SYS(sched_setscheduler),
             SCMP_SYS(sched_get_priority_max),
             SCMP_SYS(sched_get_priority_min),
             SCMP_SYS(rseq),

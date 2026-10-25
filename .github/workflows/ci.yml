@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.compiler }} (${{ matrix.profile }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [ gcc, clang ]
+        profile: [ release, debug-sanitizers ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build and Wayland dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            lld \
+            llvm \
+            meson \
+            ninja-build \
+            pkg-config \
+            scdoc \
+            wayland-protocols \
+            libwayland-dev \
+            libwayland-bin \
+            libdrm-dev \
+            libgbm-dev \
+            libegl-dev \
+            libgles2-mesa-dev \
+            libva-dev \
+            liburing-dev \
+            libseccomp-dev \
+            libpng-dev \
+            libturbojpeg0-dev \
+            libwebp-dev \
+            libavif-dev \
+            libjxl-dev \
+            librsvg2-dev \
+            libpipewire-0.3-dev \
+            systemd-dev \
+            weston \
+            ffmpeg
+
+      - name: Configure Meson (${{ matrix.compiler }} / ${{ matrix.profile }})
+        env:
+          CC: ${{ matrix.compiler }}
+        run: |
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            meson setup build \
+              --buildtype=release \
+              -Doptimization=3 \
+              -Db_lto=true \
+              -Db_pie=true \
+              -Denable_vaapi=true \
+              -Denable_io_uring=true \
+              -Denable_simd=true \
+              -Denable_seccomp=true \
+              -Denable_systemd=true
+          else
+            meson setup build \
+              --buildtype=debug \
+              -Doptimization=1 \
+              -Db_lto=false \
+              -Db_lundef=false \
+              -Db_sanitize=address,undefined \
+              -Denable_vaapi=true \
+              -Denable_io_uring=true \
+              -Denable_simd=true \
+              -Denable_seccomp=true \
+              -Denable_systemd=true
+          fi
+
+      - name: Compile targets
+        run: meson compile -C build
+
+      - name: Run Meson test suite
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: meson test -C build --print-errorlogs
+
+      - name: Run standalone fuzz smoke tests
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ./build/fuzz_demuxer
+          ./build/fuzz_bitstream
+          ./build/fuzz_config_cli

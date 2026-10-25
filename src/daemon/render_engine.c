@@ -21,13 +21,7 @@ bool render_engine_init(render_engine_t *re, dmabuf_context_t *dmabuf_ctx)
         return false;
     memset(re, 0, sizeof(*re));
 
-    /* Only initialize the EGL/GLES compute shader pipeline when the compositor's preferred
-     * modifier is linear (matching ensure_dmabuf_ring); otherwise transitions use the
-     * OpenMP/AVX2 CPU SIMD path and we avoid allocating ~67 MiB of unused GPU shader compiler heap. */
-    if (dmabuf_ctx && dmabuf_ctx->available &&
-        (dmabuf_ctx->map_supported || !dmabuf_ctx->dmabuf_proto) &&
-        (dmabuf_ctx->preferred_modifier == DRM_FORMAT_MOD_LINEAR ||
-         dmabuf_ctx->preferred_modifier == DRM_FORMAT_MOD_INVALID)) {
+    if (dmabuf_ctx && dmabuf_ctx->drm_fd >= 0 && dmabuf_ctx->gbm_dev != NULL) {
         re->gpu_ctx = gpu_compute_create(dmabuf_ctx);
         if (re->gpu_ctx) {
             re->has_gpu_compute = true;
@@ -82,6 +76,16 @@ void render_engine_release_bo(render_engine_t *re, dmabuf_bo_t *bo)
     if (!re || !re->has_gpu_compute || !re->gpu_ctx || !bo)
         return;
     gpu_compute_release_bo((gpu_compute_ctx_t *)re->gpu_ctx, bo);
+}
+
+bool render_engine_upload_static(render_engine_t *re, const uint8_t *src_rgba, uint32_t src_w,
+                                 uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t scaling_mode,
+                                 uint32_t clear_color)
+{
+    if (!re || !re->has_gpu_compute || !re->gpu_ctx || !dst_bo)
+        return false;
+    return gpu_compute_upload_static((gpu_compute_ctx_t *)re->gpu_ctx, src_rgba, src_w, src_h,
+                                     dst_bo, (waywal_scaling_mode_t)scaling_mode, clear_color);
 }
 
 static inline float clampf(float v, float min_v, float max_v)
@@ -258,29 +262,19 @@ shade8_argb_const_avx2(__m256i v_c, __m256i v_wb16)
 
 __attribute__((target("avx2,fma"))) static void
 swirl_span_avx2(uint32_t *restrict dst_row, const uint32_t *restrict old_pixels,
-                const uint32_t *restrict new_pixels, int x_start, int x_end, float cx_pixel,
-                float cy_pixel, float y_rel, float y_rel2, float inv_max_dist, float angle_amt,
-                int max_x, int max_y, int width, uint32_t wa, uint32_t wb)
+                const uint32_t *restrict new_pixels, const float *restrict swirl_sin,
+                const float *restrict swirl_cos, int x_start, int x_end, float cx_pixel,
+                float cy_pixel, float y_rel, float y_rel2, float dist_scale, int lut_max, int max_x,
+                int max_y, int width, uint32_t wa, uint32_t wb)
 {
     __m256 v_cx = _mm256_set1_ps(cx_pixel);
     __m256 v_cy = _mm256_set1_ps(cy_pixel);
     __m256 v_y_rel = _mm256_set1_ps(y_rel);
     __m256 v_y_rel2 = _mm256_set1_ps(y_rel2);
-    __m256 v_inv_max_d = _mm256_set1_ps(inv_max_dist);
-    __m256 v_angle_amt = _mm256_set1_ps(angle_amt);
+    __m256 v_dist_scale = _mm256_set1_ps(dist_scale);
     __m256 v_eps = _mm256_set1_ps(1e-8f);
-    __m256 v_zero_ps = _mm256_setzero_ps();
-    __m256 v_one_ps = _mm256_set1_ps(1.0f);
     __m256 v_eight = _mm256_set1_ps(8.0f);
-    __m256 v_two_over_pi = _mm256_set1_ps(0.63661977236758134308f);
-    __m256 v_pi_over_2_hi = _mm256_set1_ps(1.5707962512969970703125f);
-    __m256 v_pi_over_2_lo = _mm256_set1_ps(7.54978941586159635335e-8f);
-    __m256 v_sin_c3 = _mm256_set1_ps(-0.166666567f);
-    __m256 v_sin_c5 = _mm256_set1_ps(0.008332075f);
-    __m256 v_cos_c2 = _mm256_set1_ps(-0.49999905f);
-    __m256 v_cos_c4 = _mm256_set1_ps(0.04166358f);
-    __m256i v_sign_mask = _mm256_set1_epi32((int)0x80000000U);
-    __m256i v_one_i = _mm256_set1_epi32(1);
+    __m256i v_lut_max = _mm256_set1_epi32(lut_max);
     __m256i v_max_x = _mm256_set1_epi32(max_x);
     __m256i v_max_y = _mm256_set1_epi32(max_y);
     __m256i v_width = _mm256_set1_epi32(width);
@@ -299,32 +293,11 @@ swirl_span_avx2(uint32_t *restrict dst_row, const uint32_t *restrict old_pixels,
         __m256 vd2 = _mm256_fmadd_ps(vx_rel, vx_rel, v_y_rel2);
         __m256 v_inv_d = _mm256_rsqrt_ps(_mm256_max_ps(vd2, v_eps));
         __m256 vdist = _mm256_mul_ps(vd2, v_inv_d);
-        __m256 vfactor =
-            _mm256_max_ps(v_zero_ps, _mm256_fnmadd_ps(vdist, v_inv_max_d, v_one_ps));
-        __m256 vtheta = _mm256_mul_ps(_mm256_mul_ps(vfactor, vfactor), v_angle_amt);
+        __m256i v_idx = _mm256_cvttps_epi32(_mm256_mul_ps(vdist, v_dist_scale));
+        v_idx = _mm256_max_epi32(v_zero, _mm256_min_epi32(v_idx, v_lut_max));
 
-        __m256 vqf = _mm256_round_ps(_mm256_mul_ps(vtheta, v_two_over_pi),
-                                     _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-        __m256i vq = _mm256_cvtps_epi32(vqf);
-        __m256 vr = _mm256_fnmadd_ps(vqf, v_pi_over_2_lo,
-                                     _mm256_fnmadd_ps(vqf, v_pi_over_2_hi, vtheta));
-        __m256 vr2 = _mm256_mul_ps(vr, vr);
-
-        __m256 vsin_r =
-            _mm256_fmadd_ps(_mm256_mul_ps(vr, vr2), _mm256_fmadd_ps(vr2, v_sin_c5, v_sin_c3), vr);
-        __m256 vcos_r =
-            _mm256_fmadd_ps(vr2, _mm256_fmadd_ps(vr2, v_cos_c4, v_cos_c2), v_one_ps);
-
-        __m256 swap_mask = _mm256_castsi256_ps(_mm256_slli_epi32(vq, 31));
-        __m256 vsin = _mm256_blendv_ps(vsin_r, vcos_r, swap_mask);
-        __m256 vcos = _mm256_blendv_ps(vcos_r, vsin_r, swap_mask);
-
-        __m256 sin_sign =
-            _mm256_castsi256_ps(_mm256_and_si256(_mm256_slli_epi32(vq, 30), v_sign_mask));
-        __m256 cos_sign = _mm256_castsi256_ps(
-            _mm256_and_si256(_mm256_slli_epi32(_mm256_add_epi32(vq, v_one_i), 30), v_sign_mask));
-        vsin = _mm256_xor_ps(vsin, sin_sign);
-        vcos = _mm256_xor_ps(vcos, cos_sign);
+        __m256 vsin = _mm256_i32gather_ps(swirl_sin, v_idx, 4);
+        __m256 vcos = _mm256_i32gather_ps(swirl_cos, v_idx, 4);
 
         __m256 vpx =
             _mm256_add_ps(v_cx, _mm256_fmsub_ps(vx_rel, vcos, _mm256_mul_ps(v_y_rel, vsin)));
@@ -1032,11 +1005,6 @@ static inline float value_noise2(float x, float y)
     float c = hash21(ix, iy + 1.0f);
     float d = hash21(ix + 1.0f, iy + 1.0f);
     return (a * (1.0f - fx) + b * fx) * (1.0f - fy) + (c * (1.0f - fx) + d * fx) * fy;
-}
-
-static inline float fbm2(float x, float y)
-{
-    return 0.65f * value_noise2(x, y) + 0.35f * value_noise2(x * 2.1f + 1.7f, y * 2.1f + 3.2f);
 }
 
 bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pixels,
@@ -2265,7 +2233,6 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
         int max_x = (int)width - 1;
         int max_y = (int)height - 1;
-        float inv_max_dist = 1.0f / max_dist;
 #if defined(__x86_64__) || defined(_M_X64)
         bool has_avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #endif
@@ -2300,9 +2267,9 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             if (has_avx2) {
                 int avx_count = (x_end - x_start) & ~7;
                 if (avx_count > 0) {
-                    swirl_span_avx2(dst_row, old_pixels, new_pixels, x_start, x_start + avx_count,
-                                    cx_pixel, cy_pixel, y_rel, y_rel2, inv_max_dist, angle_amt,
-                                    max_x, max_y, (int)width, wa, wb);
+                    swirl_span_avx2(dst_row, old_pixels, new_pixels, swirl_sin, swirl_cos, x_start,
+                                    x_start + avx_count, cx_pixel, cy_pixel, y_rel, y_rel2,
+                                    dist_scale, SWIRL_LUT_SIZE, max_x, max_y, (int)width, wa, wb);
                     x = x_start + avx_count;
                 }
             }
@@ -2757,6 +2724,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
     case WAYWAL_TRANSITION_PAGE_CURL: {
         float R = 0.12f;
+        float r2 = R * R;
         float line = 1.02f - progress * 1.25f;
         float inv_w = 1.0f / (float)width;
         float inv_h = 1.0f / (float)height;
@@ -2764,8 +2732,12 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
         uint16_t curl_wb_lut[256];
         uint16_t shadow_wb_lut[256];
+        float curl_offset_lut[256];
         for (int i = 0; i < 256; ++i) {
             float t = (float)i / 255.0f;
+            float dist = t * R;
+            float rad2 = r2 - dist * dist;
+            curl_offset_lut[i] = (rad2 > 0.0f) ? (R - sqrtf(rad2)) : R;
             float curl_light = 0.85f + 0.35f * sinf(t * 3.1415926535f);
             curl_wb_lut[i] = (uint16_t)clampf(curl_light * 230.0f, 0.0f, 256.0f);
             float sm = t * t * (3.0f - 2.0f * t);
@@ -2804,8 +2776,9 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                     else if (lut_idx > 255)
                         lut_idx = 255;
 
-                    float curl_u = vx - dist;
-                    float curl_v = vy - dist;
+                    float curl_off = curl_offset_lut[lut_idx];
+                    float curl_u = vx - curl_off;
+                    float curl_v = vy - curl_off;
                     if (curl_u >= 0.0f && curl_u <= 1.0f && curl_v >= 0.0f && curl_v <= 1.0f) {
                         int sx = (int)(curl_u * (float)width);
                         int sy = (int)(curl_v * (float)height);

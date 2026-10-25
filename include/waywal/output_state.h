@@ -4,6 +4,7 @@
 #include "waywal/dmabuf.h"
 #include "waywal/presentation.h"
 #include "waywal/render_engine.h"
+#include "waywal/types.h"
 #include "waywal/vaapi_dec.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
@@ -32,6 +33,14 @@ struct output_node {
     char description[128];
     int32_t width;
     int32_t height;
+    int32_t mode_width;
+    int32_t mode_height;
+    int32_t shm_width;
+    int32_t shm_height;
+    int32_t staging_width;
+    int32_t staging_height;
+    uint32_t logical_width;
+    uint32_t logical_height;
     union {
         int32_t scale_factor;
         int32_t scale;
@@ -45,6 +54,13 @@ struct output_node {
     struct zwlr_layer_surface_v1 *layer_surface;
     struct wp_viewport *viewport;
     struct wp_fractional_scale_v1 *fract_scale;
+
+    struct wl_surface *backdrop_surface;
+    struct zwlr_layer_surface_v1 *backdrop_layer_surface;
+    struct wp_viewport *backdrop_viewport;
+    dmabuf_bo_t backdrop_bo;
+    bool has_backdrop_bo;
+    bool backdrop_configured;
 
     /* Hardware Direct Scanout ring */
     dmabuf_ring_t dmabuf_ring;
@@ -93,6 +109,12 @@ struct output_node {
     bool video_targeted;
 
     uint32_t scaling_mode; /* waywal_scaling_mode_t */
+    uint32_t filter_mode;  /* waywal_filter_mode_t */
+    color_rgba_t fill_color;
+    bool has_fill_color;
+    bool ten_bit;
+    dev_t target_dev;
+    bool has_target_dev;
     bool has_image;
 
     bool configured;
@@ -115,6 +137,9 @@ output_node_t *output_manager_add(output_manager_t *om, struct wl_registry *reg,
 void output_manager_remove(output_manager_t *om, uint32_t name);
 output_node_t *output_manager_find_by_name(output_manager_t *om, const char *name);
 output_node_t *output_manager_find_by_id(output_manager_t *om, uint32_t name);
+
+bool layer_shell_ensure_dmabuf_ring(struct daemon_state *state, output_node_t *node, int32_t width,
+                                    int32_t height);
 
 #ifdef __cplusplus
 }

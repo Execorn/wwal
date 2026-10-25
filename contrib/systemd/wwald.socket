@@ -1,0 +1,12 @@
+[Unit]
+Description=WayWal (Wayland Wallpapers) Daemon IPC Socket
+Documentation=https://github.com/Execorn/wwal
+PartOf=graphical-session.target
+
+[Socket]
+ListenStream=%t/wwald.sock
+SocketMode=0600
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target graphical-session.target

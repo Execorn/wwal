@@ -1,0 +1,131 @@
+.\" Generated from wwald.1.scd
+.TH "WWALD" "1" "2026-10-24" "wwal 1.0.0" "WayWal Manual"
+.PP
+.SH NAME
+.PP
+wwald - zero-copy Wayland wallpaper, VA-API video, Shadertoy, and Material You daemon
+.PP
+.SH SYNOPSIS
+.PP
+\fBwwald\fR [OPTIONS]
+.PP
+.SH DESCRIPTION
+.PP
+\fBwwald\fR is the background rendering daemon for \fBwwal\fR(1). Written in ISO C23 with a binary size under 1.5 MB, \fBwwald\fR replaces separate static wallpaper daemons, video wallpaper players, GLSL shader backgrounds, and color scheme generators within a single sandboxed process.
+.PP
+.SH ARCHITECTURE
+.PP
+.SS Event Loop & Systemd Socket Activation
+.PP
+\fBwwald\fR drives all Wayland protocol events, IPC client connections, \fBtimerfd\fR frame clocks, \fBsignalfd\fR, and compositor occlusion sockets through a Linux \fBio_uring\fR(7) event loop using multishot poll (\fBIORING_POLL_ADD_MULTI\fR), with an automatic \fBepoll\fR(7) fallback on older kernels.
+.PP
+When started via \fBsystemd\fR(1) socket activation (\fBwwald.socket\fR), \fBwwald\fR inherits the listening socket from \fBSD_LISTEN_FDS\fR (\fBLISTEN_FDS\fR / \fBLISTEN_PID\fR, file descriptor 3) at \fB$XDG_RUNTIME_DIR/wwald.sock\fR and skips \fBunlink\fR(2) on shutdown so the socket unit remains reusable across restarts. When started standalone, it binds \fB$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-wwald.<namespace>.sock\fR (or \fB$XDG_RUNTIME_DIR/wwald.sock\fR).
+.PP
+.SS Zero-Copy DMA-BUF & HiDPI Rendering Pipeline
+.PP
+\fBwwald\fR negotiates hardware scanout formats and DRM format modifiers directly with the Wayland compositor via \fBzwp_linux_dmabuf_feedback_v1\fR:
+.IP \(bu 2
+Matches the compositor's exact primary DRM device (\fBdev_t\fR) and per-surface scanout tranches across single-GPU and hybrid iGPU+dGPU systems.
+.IP \(bu 2
+Allocates GBM buffer objects using optimal vendor-tiled or compressed modifiers (NVIDIA Block-Linear, AMD DCC, Intel CCS, ARM AFBC) when GPU compute is active, or \fBDRM_FORMAT_MOD_LINEAR\fR for CPU SIMD fallback (\fBAVX-512\fR, \fBAVX2\fR, \fBARM NEON\fR).
+.IP \(bu 2
+Supports true 10-bit HDR10 wide-gamut surfaces (\fBDRM_FORMAT_XRGB2101010\fR / \fBDRM_FORMAT_ARGB2101010\fR), zero-RAM solid colors via \fBwp_single_pixel_buffer_v1\fR, and explicit GPU fence synchronization via \fBwp_linux_drm_syncobj_v1\fR.
+.IP \(bu 2
+Separates physical pixel dimensions from logical surface dimensions using \fBwp_fractional_scale_v1\fR and \fBwp_viewporter\fR, guaranteeing crisp 1:1 physical pixel rendering on fractionally scaled 4K/5K displays.
+.PP
+.SS Zero-FFmpeg Hardware Video Engine
+.PP
+\fBwwald\fR contains a native, zero-allocation MP4 (\fBisobmff\fR) and WebM/Matroska (\fBEBML\fR) demuxer coupled directly to \fBlibva\fR (\fBVA-API\fR):
+.IP \(bu 2
+Parses H.264 (SPS/PPS/VUI/Slice/DPB), HEVC (VPS/SPS/PPS/RPS), VP9, and AV1 bitstreams in-process without linking \fBlibavformat\fR or \fBlibavcodec\fR.
+.IP \(bu 2
+Evicts already-played file pages from the Linux page cache via \fBmadvise\fR(2) \fBMADV_DONTNEED\fR.
+.IP \(bu 2
+On AMD (\fBradeonsi\fR) and Intel (\fBiHD\fR) GPUs, exports decoded \fBDRM_FORMAT_NV12\fR and \fBDRM_FORMAT_P010\fR surfaces via \fBVA_EXPORT_SURFACE_COMPOSED_LAYERS\fR for direct zero-VPP KMS hardware overlay plane scanout.
+.IP \(bu 2
+On NVIDIA GPUs (\fBlibva-nvidia-driver\fR), exports separate layers into a compact 3-surface VA-API Video Post-Processing (VPP) \fBBGRX\fR ring.
+.IP \(bu 2
+Synchronizes frame presentation to display VBlank using a Phase-Locked Loop (PLL) fed by \fBwp_presentation_feedback\fR timestamps.
+.PP
+.SS Zero-Watt Smart Occlusion & Battery Governor
+.PP
+\fBwwald\fR maintains a per-output pause bitmask (\fBwaywal_pause_reason_t\fR):
+.IP \(bu 2
+\fBWAYWAL_PAUSE_DPMS_OR_UNMAPPED\fR (\fB1 << 0\fR): Output is unmapped or in DPMS sleep.
+.IP \(bu 2
+\fBWAYWAL_PAUSE_TOPLEVEL_FULLSCREEN\fR (\fB1 << 1\fR): Fullscreen window covers the output (tracked via \fBzwlr_foreign_toplevel_manager_v1\fR, \fBext_foreign_toplevel_list_v1\fR, or Hyprland/Sway IPC sockets).
+.IP \(bu 2
+\fBWAYWAL_PAUSE_TOPLEVEL_MAXIMIZED\fR (\fB1 << 2\fR): Maximized window covers the output.
+.IP \(bu 2
+\fBWAYWAL_PAUSE_WORKSPACE_OCCLUDED\fR (\fB1 << 3\fR): Active workspace on the output is fully tiled/opaque.
+.IP \(bu 2
+\fBWAYWAL_PAUSE_SESSION_IDLE\fR (\fB1 << 4\fR): Session idle notification received via \fBext_idle_notifier_v1\fR.
+.IP \(bu 2
+\fBWAYWAL_PAUSE_BATTERY_SAVER\fR (\fB1 << 5\fR): Laptop battery discharging or power-saver profile active (monitored via \fBinotify\fR on \fB/sys/class/power_supply/\fR).
+.IP \(bu 2
+\fBWAYWAL_PAUSE_USER_MANUAL\fR (\fB1 << 6\fR): Paused explicitly via \fBwwal pause\fR.
+.PP
+Whenever all active outputs have a non-zero \fBpause_mask\fR, \fBwwald\fR disarms its frame \fBtimerfd\fR, dropping CPU, GPU, and NVDEC utilization to strictly \fB0.00%\fR (\fB0 wakeups/sec\fR).
+.PP
+.SS Landlock & Seccomp-BPF Sandboxing
+.PP
+At startup, after initializing DRM/GBM and Wayland connections, \fBwwald\fR locks itself down using:
+.IP \(bu 2
+\fBPR_SET_NO_NEW_PRIVS\fR and \fBPR_SET_DUMPABLE = 0\fR.
+.IP \(bu 2
+Linux \fBLandlock\fR (\fBABI v1..v4\fR): Restricts filesystem visibility to read-only system libraries, device nodes, \fB$XDG_RUNTIME_DIR\fR, and configured wallpaper/cache directories, blocking access to sensitive user data (\fB~/.ssh\fR, \fB~/.gnupg\fR, etc.).
+.IP \(bu 2
+\fBSeccomp-BPF\fR syscall allowlist: Blocks network socket creation (\fBAF_INET\fR, \fBAF_INET6\fR), process execution (\fBexecve\fR outside pre-sandbox helpers), \fBptrace\fR, and privilege escalation syscalls.
+.PP
+.SH OPTIONS
+.PP
+\fB-n, --namespace\fR <NAME>
+.RS 4
+Set the IPC socket and Wayland layer-shell namespace (default: \fBdefault\fR).
+.RE
+.PP
+\fB-c, --config\fR <PATH>
+.RS 4
+Load declarative configuration from \fIPATH\fR instead of \fB~/.config/wwal/config.toml\fR.
+.RE
+.PP
+\fB--layer\fR <background|bottom>
+.RS 4
+Set default Wayland layer-shell placement (default: \fBbackground\fR).
+.RE
+.PP
+\fB--battery-policy\fR <ignore|reduce-fps|pause-video>
+.RS 4
+Set laptop battery power governance policy (default: \fBpause-video\fR).
+.RE
+.PP
+\fB--no-sandbox\fR
+.RS 4
+Disable Landlock and Seccomp-BPF sandboxing (for debugging under \fBgdb\fR or \fBvalgrind\fR only).
+.RE
+.PP
+\fB-v, --verbose\fR
+.RS 4
+Enable verbose logging.
+.RE
+.PP
+\fB-h, --help\fR
+.RS 4
+Display help message and exit.
+.RE
+.PP
+.SH SIGNALS
+.PP
+\fBSIGTERM\fR, \fBSIGINT\fR
+.RS 4
+Gracefully tear down Wayland surfaces, release GBM/VA-API buffers, and exit.
+.RE
+.PP
+\fBSIGHUP\fR
+.RS 4
+Reload \fB~/.config/wwal/config.toml\fR.
+.RE
+.PP
+.SH SEE ALSO
+.PP
+\fBwwal\fR(1), \fBwwal-config\fR(5)
