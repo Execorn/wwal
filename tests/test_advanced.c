@@ -289,6 +289,24 @@ static void test_slideshow_filesystem(void)
     ctrl_ok = slideshow_control(&ss, WAYWAL_SLIDESHOW_RESUME);
     assert(ctrl_ok && !ss.paused);
 
+    /* Advance to index 1, add a new file (img0_early.png), and verify slideshow_rescan preserves
+     * current_file_idx on the same active wallpaper file */
+    ss.current_file_idx = 1;
+    char active_before[4096];
+    strncpy(active_before, ss.file_list[ss.current_file_idx], sizeof(active_before) - 1);
+    active_before[sizeof(active_before) - 1] = '\0';
+
+    char f0[512];
+    snprintf(f0, sizeof(f0), "%s/img0_early.png", tmp_dir);
+    fp = fopen(f0, "w");
+    fputs("dummy", fp);
+    fclose(fp);
+
+    assert(slideshow_rescan(&ss));
+    assert(ss.num_files == 4);
+    assert(strcmp(ss.file_list[ss.current_file_idx], active_before) == 0);
+    unlink(f0);
+
     slideshow_stop(&ss);
     assert(!ss.active);
 
@@ -378,6 +396,8 @@ static void test_cli_scaling_modes(void)
         {"--mode", "center", WAYWAL_SCALING_CENTER},
         {"--scaling-mode", "tile", WAYWAL_SCALING_TILE},
         {"--mode", "tile", WAYWAL_SCALING_TILE},
+        {"--scaling-mode", "span", WAYWAL_SCALING_SPAN},
+        {"--mode", "span", WAYWAL_SCALING_SPAN},
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {

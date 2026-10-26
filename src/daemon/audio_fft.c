@@ -7,8 +7,15 @@
 #include "waywal/log.h"
 
 #include <dlfcn.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#pragma GCC push_options
+#pragma GCC target("avx2,fma")
 #include <immintrin.h>
+#pragma GCC pop_options
+#define WAYWAL_HAVE_X86_AVX2_TARGET 1
+#endif
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,11 +101,14 @@ struct spa_audio_format_pod {
 
 struct waywal_audio_fft {
     uint32_t sample_rate;
+    bool has_avx2;
 
     _Alignas(64) float ring[WAYWAL_AUDIO_RING_SIZE];
-    _Atomic uint32_t write_idx;
-    _Atomic uint32_t read_idx;
+    _Atomic uint32_t write_pos;
+    _Atomic uint32_t total_pushed;
+    uint32_t last_consumed;
 
+    _Alignas(32) float scratch_samples[WAYWAL_AUDIO_FFT_SIZE];
     _Alignas(32) float history[WAYWAL_AUDIO_FFT_SIZE];
     _Alignas(32) float hann_window[WAYWAL_AUDIO_FFT_SIZE];
     _Alignas(32) float twiddle_re[COMPLEX_FFT_N];
@@ -148,10 +158,18 @@ static float hz_to_bark(float f)
     return term1 + term2;
 }
 
-static void init_fft_tables(waywal_audio_fft_t *fft)
+static _Alignas(32) float s_hann_window[WAYWAL_AUDIO_FFT_SIZE];
+static _Alignas(32) float s_twiddle_re[COMPLEX_FFT_N];
+static _Alignas(32) float s_twiddle_im[COMPLEX_FFT_N];
+static _Alignas(32) float s_unpack_re[COMPLEX_FFT_N];
+static _Alignas(32) float s_unpack_im[COMPLEX_FFT_N];
+static uint16_t s_bit_rev[COMPLEX_FFT_N];
+static pthread_once_t s_fft_tables_once = PTHREAD_ONCE_INIT;
+
+static void init_static_fft_tables_once(void)
 {
     for (uint32_t n = 0; n < WAYWAL_AUDIO_FFT_SIZE; ++n) {
-        fft->hann_window[n] =
+        s_hann_window[n] =
             0.5f *
             (1.0f - cosf((2.0f * (float)M_PI * (float)n) / (float)(WAYWAL_AUDIO_FFT_SIZE - 1u)));
     }
@@ -163,7 +181,7 @@ static void init_fft_tables(waywal_audio_fft_t *fft)
             rev = (rev << 1u) | (val & 1u);
             val >>= 1u;
         }
-        fft->bit_rev[i] = (uint16_t)rev;
+        s_bit_rev[i] = (uint16_t)rev;
     }
 
     for (uint32_t stage = 1; stage <= 10u; ++stage) {
@@ -171,16 +189,27 @@ static void init_fft_tables(waywal_audio_fft_t *fft)
         uint32_t half = m >> 1u;
         for (uint32_t j = 0; j < half; ++j) {
             float angle = -2.0f * (float)M_PI * (float)j / (float)m;
-            fft->twiddle_re[half + j] = cosf(angle);
-            fft->twiddle_im[half + j] = sinf(angle);
+            s_twiddle_re[half + j] = cosf(angle);
+            s_twiddle_im[half + j] = sinf(angle);
         }
     }
 
     for (uint32_t k = 0; k < COMPLEX_FFT_N; ++k) {
         float angle = -(float)M_PI * (float)k / (float)COMPLEX_FFT_N;
-        fft->unpack_re[k] = cosf(angle);
-        fft->unpack_im[k] = sinf(angle);
+        s_unpack_re[k] = cosf(angle);
+        s_unpack_im[k] = sinf(angle);
     }
+}
+
+static void init_fft_tables(waywal_audio_fft_t *fft)
+{
+    pthread_once(&s_fft_tables_once, init_static_fft_tables_once);
+    memcpy(fft->hann_window, s_hann_window, sizeof(s_hann_window));
+    memcpy(fft->twiddle_re, s_twiddle_re, sizeof(s_twiddle_re));
+    memcpy(fft->twiddle_im, s_twiddle_im, sizeof(s_twiddle_im));
+    memcpy(fft->unpack_re, s_unpack_re, sizeof(s_unpack_re));
+    memcpy(fft->unpack_im, s_unpack_im, sizeof(s_unpack_im));
+    memcpy(fft->bit_rev, s_bit_rev, sizeof(s_bit_rev));
 
     float max_freq = 0.5f * (float)fft->sample_rate;
     float max_bark = hz_to_bark(max_freq);
@@ -223,8 +252,9 @@ static void init_fft_tables(waywal_audio_fft_t *fft)
     }
 }
 
-static void execute_complex_fft_1024(const waywal_audio_fft_t *fft, float *restrict zr,
-                                     float *restrict zi)
+#ifdef WAYWAL_HAVE_X86_AVX2_TARGET
+__attribute__((target("avx2,fma"))) static void
+execute_complex_fft_1024_avx2(const waywal_audio_fft_t *fft, float *restrict zr, float *restrict zi)
 {
     for (uint32_t stage = 1; stage <= 10u; ++stage) {
         uint32_t m = 1u << stage;
@@ -232,7 +262,6 @@ static void execute_complex_fft_1024(const waywal_audio_fft_t *fft, float *restr
         const float *w_re = &fft->twiddle_re[half];
         const float *w_im = &fft->twiddle_im[half];
 
-#ifdef __AVX2__
         if (half == 1u) {
             const __m256i idx_u = _mm256_setr_epi32(0, 0, 2, 2, 4, 4, 6, 6);
             const __m256i idx_v = _mm256_setr_epi32(1, 1, 3, 3, 5, 5, 7, 7);
@@ -313,7 +342,57 @@ static void execute_complex_fft_1024(const waywal_audio_fft_t *fft, float *restr
             }
             continue;
         }
+    }
+}
+
+__attribute__((target("avx2,fma"))) static uint32_t
+unpack_real_fft_avx2(waywal_audio_fft_t *fft, const float *zr, const float *zi, float norm)
+{
+    uint32_t k = 1;
+    const __m256i rev_idx = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    const __m256 v_half = _mm256_set1_ps(0.5f);
+    const __m256 v_neghalf = _mm256_set1_ps(-0.5f);
+    const __m256 v_norm = _mm256_set1_ps(norm);
+    for (; k + 8u <= COMPLEX_FFT_N; k += 8u) {
+        uint32_t nk_base = COMPLEX_FFT_N - k - 7u;
+        __m256 zrk = _mm256_loadu_ps(zr + k);
+        __m256 zik = _mm256_loadu_ps(zi + k);
+        __m256 zrnk = _mm256_permutevar8x32_ps(_mm256_loadu_ps(zr + nk_base), rev_idx);
+        __m256 zink = _mm256_permutevar8x32_ps(_mm256_loadu_ps(zi + nk_base), rev_idx);
+
+        __m256 er = _mm256_mul_ps(v_half, _mm256_add_ps(zrk, zrnk));
+        __m256 ei = _mm256_mul_ps(v_half, _mm256_sub_ps(zik, zink));
+        __m256 or_v = _mm256_mul_ps(v_half, _mm256_add_ps(zik, zink));
+        __m256 oi_v = _mm256_mul_ps(v_neghalf, _mm256_sub_ps(zrk, zrnk));
+
+        __m256 wr = _mm256_loadu_ps(fft->unpack_re + k);
+        __m256 wi = _mm256_loadu_ps(fft->unpack_im + k);
+
+        __m256 xr = _mm256_add_ps(er, _mm256_fmsub_ps(wr, or_v, _mm256_mul_ps(wi, oi_v)));
+        __m256 xi = _mm256_add_ps(ei, _mm256_fmadd_ps(wr, oi_v, _mm256_mul_ps(wi, or_v)));
+
+        __m256 mag =
+            _mm256_mul_ps(_mm256_sqrt_ps(_mm256_fmadd_ps(xr, xr, _mm256_mul_ps(xi, xi))), v_norm);
+        _mm256_storeu_ps(fft->current_frame.linear_bins + k, mag);
+    }
+    return k;
+}
 #endif
+
+static void execute_complex_fft_1024(const waywal_audio_fft_t *fft, float *restrict zr,
+                                     float *restrict zi)
+{
+#ifdef WAYWAL_HAVE_X86_AVX2_TARGET
+    if (fft->has_avx2) {
+        execute_complex_fft_1024_avx2(fft, zr, zi);
+        return;
+    }
+#endif
+    for (uint32_t stage = 1; stage <= 10u; ++stage) {
+        uint32_t m = 1u << stage;
+        uint32_t half = m >> 1u;
+        const float *w_re = &fft->twiddle_re[half];
+        const float *w_im = &fft->twiddle_im[half];
 
         for (uint32_t k = 0; k < COMPLEX_FFT_N; k += m) {
             for (uint32_t j = 0; j < half; ++j) {
@@ -374,8 +453,12 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
     }
     memset(fft, 0, sizeof(*fft));
     fft->sample_rate = (sample_rate == 0) ? 48000u : sample_rate;
-    atomic_init(&fft->write_idx, 0u);
-    atomic_init(&fft->read_idx, 0u);
+#ifdef WAYWAL_HAVE_X86_AVX2_TARGET
+    fft->has_avx2 = (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"));
+#endif
+    atomic_init(&fft->write_pos, 0u);
+    atomic_init(&fft->total_pushed, 0u);
+    fft->last_consumed = 0u;
 
     init_fft_tables(fft);
 
@@ -436,10 +519,18 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
             }
 
             const char *xdg_rt = getenv("XDG_RUNTIME_DIR");
+            const char *pw_remote = getenv("PIPEWIRE_REMOTE");
+            if (!pw_remote || pw_remote[0] == '\0') {
+                pw_remote = "pipewire-0";
+            }
             char pw_sock[512];
             bool daemon_running = false;
-            if (xdg_rt && xdg_rt[0] != '\0') {
-                snprintf(pw_sock, sizeof(pw_sock), "%s/pipewire-0", xdg_rt);
+            if (pw_remote[0] == '/') {
+                if (access(pw_remote, F_OK) == 0) {
+                    daemon_running = true;
+                }
+            } else if (xdg_rt && xdg_rt[0] != '\0') {
+                snprintf(pw_sock, sizeof(pw_sock), "%s/%s", xdg_rt, pw_remote);
                 if (access(pw_sock, F_OK) == 0) {
                     daemon_running = true;
                 }
@@ -558,19 +649,12 @@ size_t waywal_audio_fft_push_samples(waywal_audio_fft_t *fft, const float *sampl
         return 0;
     }
 
-    uint32_t w = atomic_load_explicit(&fft->write_idx, memory_order_relaxed);
-    uint32_t r = atomic_load_explicit(&fft->read_idx, memory_order_acquire);
-
+    uint32_t wp = atomic_load_explicit(&fft->write_pos, memory_order_relaxed);
     for (size_t i = 0; i < count; ++i) {
-        if (w - r >= WAYWAL_AUDIO_RING_SIZE) {
-            r++;
-            atomic_store_explicit(&fft->read_idx, r, memory_order_release);
-        }
-        fft->ring[w & (WAYWAL_AUDIO_RING_SIZE - 1u)] = samples[i];
-        w++;
+        fft->ring[(wp + (uint32_t)i) & (WAYWAL_AUDIO_RING_SIZE - 1u)] = samples[i];
     }
-
-    atomic_store_explicit(&fft->write_idx, w, memory_order_release);
+    atomic_store_explicit(&fft->write_pos, wp + (uint32_t)count, memory_order_release);
+    atomic_fetch_add_explicit(&fft->total_pushed, (uint32_t)count, memory_order_release);
     return count;
 }
 
@@ -580,14 +664,13 @@ void waywal_audio_fft_synthesize_signal(waywal_audio_fft_t *fft, float freq_hz, 
     if (!fft) {
         return;
     }
-    float buf[WAYWAL_AUDIO_FFT_SIZE];
     float omega = 2.0f * (float)M_PI * freq_hz / (float)fft->sample_rate;
     float phase0 = 2.0f * (float)M_PI * freq_hz * time_sec;
 
     for (uint32_t i = 0; i < WAYWAL_AUDIO_FFT_SIZE; ++i) {
-        buf[i] = amplitude * sinf(phase0 + omega * (float)i);
+        fft->scratch_samples[i] = amplitude * sinf(phase0 + omega * (float)i);
     }
-    waywal_audio_fft_push_samples(fft, buf, WAYWAL_AUDIO_FFT_SIZE);
+    waywal_audio_fft_push_samples(fft, fft->scratch_samples, WAYWAL_AUDIO_FFT_SIZE);
 }
 
 bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out_frame)
@@ -596,26 +679,24 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
         return false;
     }
 
-    uint32_t r = atomic_load_explicit(&fft->read_idx, memory_order_relaxed);
-    uint32_t w = atomic_load_explicit(&fft->write_idx, memory_order_acquire);
-    uint32_t avail = w - r;
+    uint32_t wp = atomic_load_explicit(&fft->write_pos, memory_order_acquire);
+    uint32_t avail = wp - fft->last_consumed;
 
     if (avail > 0) {
         if (avail >= WAYWAL_AUDIO_FFT_SIZE) {
-            r = w - WAYWAL_AUDIO_FFT_SIZE;
+            uint32_t r = wp - WAYWAL_AUDIO_FFT_SIZE;
             for (uint32_t i = 0; i < WAYWAL_AUDIO_FFT_SIZE; ++i) {
                 fft->history[i] = fft->ring[(r + i) & (WAYWAL_AUDIO_RING_SIZE - 1u)];
             }
-            r = w;
         } else {
             uint32_t keep = WAYWAL_AUDIO_FFT_SIZE - avail;
+            uint32_t r = wp - avail;
             memmove(fft->history, fft->history + avail, keep * sizeof(float));
             for (uint32_t i = 0; i < avail; ++i) {
                 fft->history[keep + i] = fft->ring[(r + i) & (WAYWAL_AUDIO_RING_SIZE - 1u)];
             }
-            r += avail;
         }
-        atomic_store_explicit(&fft->read_idx, r, memory_order_release);
+        fft->last_consumed = wp;
     }
 
     _Alignas(32) float zr[COMPLEX_FFT_N];
@@ -633,32 +714,9 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
     fft->current_frame.linear_bins[0] = fabsf(zr[0] + zi[0]) * (0.5f * norm);
 
     uint32_t k = 1;
-#ifdef __AVX2__
-    const __m256i rev_idx = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256 v_half = _mm256_set1_ps(0.5f);
-    const __m256 v_neghalf = _mm256_set1_ps(-0.5f);
-    const __m256 v_norm = _mm256_set1_ps(norm);
-    for (; k + 8u <= COMPLEX_FFT_N; k += 8u) {
-        uint32_t nk_base = COMPLEX_FFT_N - k - 7u;
-        __m256 zrk = _mm256_loadu_ps(zr + k);
-        __m256 zik = _mm256_loadu_ps(zi + k);
-        __m256 zrnk = _mm256_permutevar8x32_ps(_mm256_loadu_ps(zr + nk_base), rev_idx);
-        __m256 zink = _mm256_permutevar8x32_ps(_mm256_loadu_ps(zi + nk_base), rev_idx);
-
-        __m256 er = _mm256_mul_ps(v_half, _mm256_add_ps(zrk, zrnk));
-        __m256 ei = _mm256_mul_ps(v_half, _mm256_sub_ps(zik, zink));
-        __m256 or_v = _mm256_mul_ps(v_half, _mm256_add_ps(zik, zink));
-        __m256 oi_v = _mm256_mul_ps(v_neghalf, _mm256_sub_ps(zrk, zrnk));
-
-        __m256 wr = _mm256_loadu_ps(fft->unpack_re + k);
-        __m256 wi = _mm256_loadu_ps(fft->unpack_im + k);
-
-        __m256 xr = _mm256_add_ps(er, _mm256_fmsub_ps(wr, or_v, _mm256_mul_ps(wi, oi_v)));
-        __m256 xi = _mm256_add_ps(ei, _mm256_fmadd_ps(wr, oi_v, _mm256_mul_ps(wi, or_v)));
-
-        __m256 mag =
-            _mm256_mul_ps(_mm256_sqrt_ps(_mm256_fmadd_ps(xr, xr, _mm256_mul_ps(xi, xi))), v_norm);
-        _mm256_storeu_ps(fft->current_frame.linear_bins + k, mag);
+#ifdef WAYWAL_HAVE_X86_AVX2_TARGET
+    if (fft->has_avx2) {
+        k = unpack_real_fft_avx2(fft, zr, zi, norm);
     }
 #endif
     for (; k < COMPLEX_FFT_N; ++k) {

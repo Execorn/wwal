@@ -13,3 +13,5 @@ option('jxl', type: 'feature', value: 'auto', description: 'Optional JPEG-XL ima
 option('svg', type: 'feature', value: 'auto', description: 'Optional librsvg SVG rasterization support')
 option('pipewire', type: 'feature', value: 'auto', description: 'Optional PipeWire audio-reactive FFT capture')
 option('shaderc', type: 'feature', value: 'auto', description: 'Optional libshaderc SPIR-V runtime compilation')
+option('ffmpeg_swdec', type: 'feature', value: 'auto', description: 'Optional FFmpeg software video decode fallback')
+

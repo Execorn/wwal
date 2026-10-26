@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -107,12 +108,22 @@ static void arm_oneshot_timer_ms(int timer_fd, uint32_t delay_ms)
     (void)timerfd_settime(timer_fd, 0, &its, NULL);
 }
 
+static void daemon_reconcile_power_state(daemon_state_t *state);
+
 static void shader_engine_stop_playback(daemon_state_t *state)
 {
     if (!state)
         return;
+    bool was_active = state->shader_active;
     state->shader_active = false;
     disarm_timer_fd(state->shader_timer_fd);
+    if (state->audio_fft) {
+        waywal_audio_fft_destroy(state->audio_fft);
+        state->audio_fft = NULL;
+    }
+    if (was_active) {
+        layer_shell_update_input_regions(state, false);
+    }
 }
 
 static void anim_engine_stop_playback(daemon_state_t *state)
@@ -246,10 +257,10 @@ static bool try_start_native_animation(daemon_state_t *state, const char *filepa
     }
 
     waywal_anim_decoder_t *dec = waywal_anim_create(buf, sz);
+    free(buf);
     if (!dec || waywal_anim_frame_count(dec) <= 1) {
         if (dec)
             waywal_anim_destroy(dec);
-        free(buf);
         return false;
     }
 
@@ -257,14 +268,13 @@ static bool try_start_native_animation(daemon_state_t *state, const char *filepa
     uint32_t fw = 0, fh = 0, delay_ms = 100;
     if (!waywal_anim_next_frame(dec, &f_rgba, &fw, &fh, &delay_ms)) {
         waywal_anim_destroy(dec);
-        free(buf);
         return false;
     }
 
     anim_engine_stop_playback(state);
     state->anim_dec = dec;
-    state->anim_buf = buf;
-    state->anim_buf_size = sz;
+    state->anim_buf = NULL;
+    state->anim_buf_size = 0;
     state->anim_active = true;
     if (meta) {
         state->anim_meta = *meta;
@@ -291,6 +301,11 @@ static void daemon_anim_dispatch_frame(daemon_state_t *state)
     drain_timer_fd(state->anim_timer_fd);
     if (!state->anim_active || !state->anim_dec)
         return;
+
+    if (state->transitions_in_progress) {
+        arm_oneshot_timer_ms(state->anim_timer_fd, 33U);
+        return;
+    }
 
     if (state->power_gov && waywal_power_governor_should_pause_all(state->power_gov)) {
         disarm_timer_fd(state->anim_timer_fd);
@@ -355,6 +370,138 @@ static void daemon_anim_dispatch_frame(daemon_state_t *state)
     }
 }
 
+static void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t *bgra_pixels,
+                                            uint32_t w, uint32_t h,
+                                            const waywal_img_metadata_t *meta,
+                                            bool export_and_hooks)
+{
+    if (!state || !bgra_pixels || w == 0 || h == 0)
+        return;
+
+    size_t count = (size_t)w * (size_t)h;
+    uint8_t *rgba = (uint8_t *)malloc(count * 4U);
+    if (rgba) {
+        for (size_t i = 0; i < count; ++i) {
+            rgba[i * 4 + 0] = bgra_pixels[i * 4 + 2];
+            rgba[i * 4 + 1] = bgra_pixels[i * 4 + 1];
+            rgba[i * 4 + 2] = bgra_pixels[i * 4 + 0];
+            rgba[i * 4 + 3] = bgra_pixels[i * 4 + 3];
+        }
+        free(state->wallpaper_rgba);
+        state->wallpaper_rgba = rgba;
+        state->wallpaper_w = w;
+        state->wallpaper_h = h;
+        if (state->shader_eng) {
+            waywal_shader_engine_set_wallpaper(state->shader_eng, state->wallpaper_rgba, w, h);
+        }
+    }
+
+    if (meta && meta->no_theme)
+        return;
+
+    waywal_scheme_variant_t variant =
+        waywal_scheme_variant_from_str(state->config.theme.scheme_variant);
+    waywal_theme_mode_t tmode =
+        (meta && meta->theme_light_mode) ? WAYWAL_THEME_LIGHT : state->config.theme.theme_mode;
+    if (waywal_palette_extract_ex(bgra_pixels, w, h, w * 4U, true, tmode, variant,
+                                  state->config.theme.contrast, &state->active_palette)) {
+        state->has_active_palette = true;
+
+        bool should_export =
+            export_and_hooks && ((meta && meta->extract_theme) || state->config.theme.enabled);
+        if (should_export) {
+            (void)waywal_palette_export_filtered(
+                &state->active_palette, NULL, state->config.theme.caelestia_sync,
+                state->config.theme.export_css, state->config.theme.export_hyprland);
+            if (state->config.theme.tty_sequences) {
+                (void)waywal_palette_broadcast_tty(&state->active_palette);
+            }
+            if (state->config.hooks.on_theme_change[0] != '\0') {
+                (void)waywal_palette_run_hook(state->config.hooks.on_theme_change);
+            }
+        }
+    }
+}
+
+static void daemon_on_wallpaper_loaded(daemon_state_t *state, const uint8_t *bgra_pixels,
+                                       uint32_t w, uint32_t h, const waywal_img_metadata_t *meta)
+{
+    daemon_update_palette_from_bgra(state, bgra_pixels, w, h, meta, true);
+}
+
+static bool daemon_activate_depth_parallax(daemon_state_t *state, const uint8_t *bgra_pixels,
+                                           uint32_t w, uint32_t h,
+                                           const waywal_img_metadata_t *meta,
+                                           const char *target_output)
+{
+    if (!state || !bgra_pixels || !meta || meta->depth_map_path[0] == '\0' || w == 0 || h == 0)
+        return false;
+
+    if (!state->shader_eng && state->dmabuf_ctx.available) {
+        state->shader_eng = waywal_shader_engine_create(&state->dmabuf_ctx);
+    }
+    if (!state->shader_eng)
+        return false;
+
+    uint8_t *depth_bgra = NULL;
+    uint32_t dw = 0, dh = 0;
+    if (!image_load(meta->depth_map_path, &depth_bgra, &dw, &dh) || !depth_bgra || dw == 0 ||
+        dh == 0) {
+        return false;
+    }
+
+    const uint8_t *base_rgba = NULL;
+    uint8_t *alloc_base_rgba = NULL;
+    if (state->wallpaper_rgba && state->wallpaper_w == w && state->wallpaper_h == h) {
+        base_rgba = state->wallpaper_rgba;
+    } else {
+        size_t base_count = (size_t)w * (size_t)h;
+        alloc_base_rgba = (uint8_t *)malloc(base_count * 4U);
+        if (!alloc_base_rgba) {
+            image_free(depth_bgra);
+            return false;
+        }
+        for (size_t i = 0; i < base_count; ++i) {
+            alloc_base_rgba[i * 4 + 0] = bgra_pixels[i * 4 + 2];
+            alloc_base_rgba[i * 4 + 1] = bgra_pixels[i * 4 + 1];
+            alloc_base_rgba[i * 4 + 2] = bgra_pixels[i * 4 + 0];
+            alloc_base_rgba[i * 4 + 3] = bgra_pixels[i * 4 + 3];
+        }
+        base_rgba = alloc_base_rgba;
+    }
+
+    size_t depth_count = (size_t)dw * (size_t)dh;
+    for (size_t i = 0; i < depth_count; ++i) {
+        uint8_t b = depth_bgra[i * 4 + 0];
+        uint8_t r = depth_bgra[i * 4 + 2];
+        depth_bgra[i * 4 + 0] = r;
+        depth_bgra[i * 4 + 2] = b;
+    }
+
+    waywal_shader_engine_set_depth_strength(
+        state->shader_eng, meta->depth_strength > 0.0f ? meta->depth_strength : 1.0f);
+    bool ok = waywal_shader_engine_load_depth_parallax(state->shader_eng, base_rgba, w, h,
+                                                       depth_bgra, dw, dh);
+    free(alloc_base_rgba);
+    image_free(depth_bgra);
+
+    if (!ok)
+        return false;
+
+    state->shader_active = true;
+    state->shader_fps = meta->transition_fps > 0 ? meta->transition_fps : 60U;
+    state->shader_frame_idx = 0;
+    state->shader_start_ns = now_ns();
+    state->shader_last_ns = state->shader_start_ns;
+    memset(state->shader_target_output, 0, sizeof(state->shader_target_output));
+    strncpy(state->shader_target_output, (target_output && target_output[0]) ? target_output : "*",
+            sizeof(state->shader_target_output) - 1);
+
+    layer_shell_update_input_regions(state, true);
+    daemon_reconcile_power_state(state);
+    return true;
+}
+
 static void daemon_shader_render_once(daemon_state_t *state)
 {
     if (!state || !state->shader_eng || !state->render_engine.gpu_compute_active)
@@ -370,20 +517,50 @@ static void daemon_shader_render_once(daemon_state_t *state)
     memset(&fparams, 0, sizeof(fparams));
     fparams.time_sec = (float)(t_now - state->shader_start_ns) * 1e-9f;
     float dt = (float)(t_now - state->shader_last_ns) * 1e-9f;
-    if (dt <= 0.0f) {
+    if (dt <= 0.0f || dt > 0.25f) {
         dt = 1.0f / (float)(state->shader_fps > 0 ? state->shader_fps : 60);
     }
     fparams.time_delta_sec = dt;
     fparams.frame_index = (int32_t)(state->shader_frame_idx++);
     state->shader_last_ns = t_now;
 
-    time_t wall_sec = time(NULL);
+    struct timespec wall_ts;
+    clock_gettime(CLOCK_REALTIME, &wall_ts);
     struct tm tm_val;
-    if (localtime_r(&wall_sec, &tm_val)) {
+    if (localtime_r(&wall_ts.tv_sec, &tm_val)) {
         fparams.date[0] = (float)(tm_val.tm_year + 1900);
         fparams.date[1] = (float)tm_val.tm_mon;
         fparams.date[2] = (float)tm_val.tm_mday;
-        fparams.date[3] = (float)(tm_val.tm_hour * 3600 + tm_val.tm_min * 60 + tm_val.tm_sec);
+        fparams.date[3] = (float)(tm_val.tm_hour * 3600 + tm_val.tm_min * 60 + tm_val.tm_sec) +
+                          (float)wall_ts.tv_nsec * 1e-9f;
+    }
+
+    if (state->has_active_palette) {
+        fparams.palette_primary[0] = (float)state->active_palette.primary.r / 255.0f;
+        fparams.palette_primary[1] = (float)state->active_palette.primary.g / 255.0f;
+        fparams.palette_primary[2] = (float)state->active_palette.primary.b / 255.0f;
+        fparams.palette_secondary[0] = (float)state->active_palette.secondary.r / 255.0f;
+        fparams.palette_secondary[1] = (float)state->active_palette.secondary.g / 255.0f;
+        fparams.palette_secondary[2] = (float)state->active_palette.secondary.b / 255.0f;
+        fparams.palette_tertiary[0] = (float)state->active_palette.tertiary.r / 255.0f;
+        fparams.palette_tertiary[1] = (float)state->active_palette.tertiary.g / 255.0f;
+        fparams.palette_tertiary[2] = (float)state->active_palette.tertiary.b / 255.0f;
+    }
+
+    /* Critically damped spring for workspace parallax offset */
+    {
+        float ws_omega = 14.0f;
+        float ws_exp = expf(-ws_omega * dt);
+        float wdx = state->smooth_workspace_x - state->workspace_target_x;
+        float wdy = state->smooth_workspace_y - state->workspace_target_y;
+        float wtx = (state->workspace_vel_x + ws_omega * wdx) * dt;
+        float wty = (state->workspace_vel_y + ws_omega * wdy) * dt;
+        state->workspace_vel_x = (state->workspace_vel_x - ws_omega * wtx) * ws_exp;
+        state->workspace_vel_y = (state->workspace_vel_y - ws_omega * wty) * ws_exp;
+        state->smooth_workspace_x = state->workspace_target_x + (wdx + wtx) * ws_exp;
+        state->smooth_workspace_y = state->workspace_target_y + (wdy + wty) * ws_exp;
+        fparams.workspace_offset[0] = state->smooth_workspace_x;
+        fparams.workspace_offset[1] = state->smooth_workspace_y;
     }
 
     if (state->audio_fft) {
@@ -406,8 +583,54 @@ static void daemon_shader_render_once(daemon_state_t *state)
 
         double mx = 0.0, my = 0.0;
         if (daemon_query_cursor_pos(state, out, &mx, &my)) {
-            fparams.mouse[0] = (float)mx;
-            fparams.mouse[1] = (float)my;
+            double scale_x = (out->logical_width > 0 && out->width > 0)
+                                 ? ((double)out->width / (double)out->logical_width)
+                                 : (double)(out->scale_factor > 0 ? out->scale_factor : 1);
+            double scale_y = (out->logical_height > 0 && out->height > 0)
+                                 ? ((double)out->height / (double)out->logical_height)
+                                 : (double)(out->scale_factor > 0 ? out->scale_factor : 1);
+            float phys_x = (float)(mx * scale_x);
+            float phys_y = (float)out->height - (float)(my * scale_y);
+            fparams.mouse[0] = phys_x;
+            fparams.mouse[1] = phys_y;
+
+            float click_x = (float)(out->click_x * scale_x);
+            float click_y = (float)out->height - (float)(out->click_y * scale_y);
+            if (out->button_down) {
+                fparams.mouse[2] = click_x;
+                fparams.mouse[3] = click_y;
+            } else {
+                fparams.mouse[2] = -fabsf(click_x);
+                fparams.mouse[3] = -fabsf(click_y);
+            }
+
+            if (out->last_spring_ns == 0) {
+                out->smooth_mouse_x = phys_x;
+                out->smooth_mouse_y = phys_y;
+                out->mouse_vel_x = 0.0f;
+                out->mouse_vel_y = 0.0f;
+                out->last_spring_ns = t_now;
+            } else {
+                float omega = 18.0f;
+                float exp_t = expf(-omega * dt);
+                float dx = out->smooth_mouse_x - phys_x;
+                float dy = out->smooth_mouse_y - phys_y;
+                float temp_x = (out->mouse_vel_x + omega * dx) * dt;
+                float temp_y = (out->mouse_vel_y + omega * dy) * dt;
+                out->mouse_vel_x = (out->mouse_vel_x - omega * temp_x) * exp_t;
+                out->mouse_vel_y = (out->mouse_vel_y - omega * temp_y) * exp_t;
+                out->smooth_mouse_x = phys_x + (dx + temp_x) * exp_t;
+                out->smooth_mouse_y = phys_y + (dy + temp_y) * exp_t;
+                out->last_spring_ns = t_now;
+            }
+            state->smooth_mouse_x = out->smooth_mouse_x;
+            state->smooth_mouse_y = out->smooth_mouse_y;
+            state->mouse_vel_x = out->mouse_vel_x;
+            state->mouse_vel_y = out->mouse_vel_y;
+            fparams.mouse_smooth[0] = out->smooth_mouse_x;
+            fparams.mouse_smooth[1] = out->smooth_mouse_y;
+            fparams.mouse_vel[0] = out->mouse_vel_x;
+            fparams.mouse_vel[1] = out->mouse_vel_y;
         }
 
         if (layer_shell_ensure_dmabuf_ring(state, out, out->width, out->height) &&
@@ -446,7 +669,7 @@ static void daemon_shader_dispatch_frame(daemon_state_t *state)
     if (!state || state->shader_timer_fd < 0)
         return;
     drain_timer_fd(state->shader_timer_fd);
-    if (!state->shader_active || !state->shader_eng)
+    if (!state->shader_active || !state->shader_eng || state->transitions_in_progress)
         return;
     if (state->power_gov && waywal_power_governor_should_pause_all(state->power_gov)) {
         disarm_timer_fd(state->shader_timer_fd);
@@ -542,6 +765,11 @@ static bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_pa
 
     if (!state->shader_eng && state->dmabuf_ctx.available) {
         state->shader_eng = waywal_shader_engine_create(&state->dmabuf_ctx);
+        if (state->shader_eng && state->wallpaper_rgba && state->wallpaper_w > 0 &&
+            state->wallpaper_h > 0) {
+            waywal_shader_engine_set_wallpaper(state->shader_eng, state->wallpaper_rgba,
+                                               state->wallpaper_w, state->wallpaper_h);
+        }
     }
 
     if (spay->audio_reactive) {
@@ -559,7 +787,7 @@ static bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_pa
             ok = true;
             int inotify_fd = waywal_shader_engine_get_inotify_fd(state->shader_eng);
             if (inotify_fd >= 0 && inotify_fd != g_registered_shader_inotify_fd) {
-                register_fd_in_loops(state, inotify_fd, URING_EV_TIMER);
+                register_fd_in_loops(state, inotify_fd, URING_EV_SHADER_INOTIFY);
                 g_registered_shader_inotify_fd = inotify_fd;
             }
         }
@@ -583,6 +811,7 @@ static bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_pa
     memset(state->shader_path, 0, sizeof(state->shader_path));
     strncpy(state->shader_path, spay->shader_path, sizeof(state->shader_path) - 1);
 
+    layer_shell_update_input_regions(state, true);
     daemon_shader_render_once(state);
     daemon_reconcile_power_state(state);
     return true;
@@ -626,9 +855,13 @@ static bool daemon_render_image_on_target(daemon_state_t *state, const char *fil
         memcpy(meta_storage + sizeof(waywal_img_metadata_t), target_output, extra_len);
     }
 
+    daemon_update_palette_from_bgra(state, px, w, h, meta, true);
     bool ok = daemon_start_image_transition(state, px, w, h, meta);
     image_free(px);
     if (ok) {
+        if (state->config.hooks.on_wallpaper_change[0] != '\0') {
+            (void)waywal_palette_run_hook(state->config.hooks.on_wallpaper_change);
+        }
         (void)try_start_native_animation(state, filepath, meta,
                                          target_output ? target_output : "*");
     }
@@ -680,6 +913,24 @@ static bool daemon_restore_output_entry(daemon_state_t *state,
         spay.scaling_mode = saved->scaling;
         spay.filter_mode = saved->filter;
         spay.ten_bit = saved->ten_bit;
+        spay.transition_type = state->config.transition.type_enum;
+        spay.transition_duration_ms = (uint32_t)(state->config.transition.duration * 1000.0f);
+        spay.transition_fps = state->config.transition.fps;
+        spay.transition_angle_rad =
+            state->config.transition.angle * (3.14159265358979323846f / 180.0f);
+        spay.transition_wave_freq = state->config.transition.wave_x;
+        spay.transition_wave_amp = state->config.transition.wave_y;
+        spay.transition_center_x = state->config.transition.pos_x;
+        spay.transition_center_y = state->config.transition.pos_y;
+        spay.bezier.p1x = state->config.transition.bezier[0];
+        spay.bezier.p1y = state->config.transition.bezier[1];
+        spay.bezier.p2x = state->config.transition.bezier[2];
+        spay.bezier.p2y = state->config.transition.bezier[3];
+        spay.has_custom_bezier = true;
+        if (strcmp(target, "*") != 0) {
+            spay.num_target_outputs = 1;
+            strncpy(spay.target_outputs[0], target, sizeof(spay.target_outputs[0]) - 1);
+        }
         strncpy(spay.path, saved->media_path, sizeof(spay.path) - 1);
         return slideshow_start(&state->slideshow, &spay);
     }
@@ -735,6 +986,25 @@ static bool daemon_apply_output_config_rule(daemon_state_t *state, const waywal_
         spay.random_order = rule->shuffle;
         spay.scaling_mode = (uint32_t)rule->scaling;
         spay.filter_mode = (uint32_t)rule->filter;
+        spay.ten_bit = state->config.daemon.ten_bit;
+        spay.transition_type = state->config.transition.type_enum;
+        spay.transition_duration_ms = (uint32_t)(state->config.transition.duration * 1000.0f);
+        spay.transition_fps = state->config.transition.fps;
+        spay.transition_angle_rad =
+            state->config.transition.angle * (3.14159265358979323846f / 180.0f);
+        spay.transition_wave_freq = state->config.transition.wave_x;
+        spay.transition_wave_amp = state->config.transition.wave_y;
+        spay.transition_center_x = state->config.transition.pos_x;
+        spay.transition_center_y = state->config.transition.pos_y;
+        spay.bezier.p1x = state->config.transition.bezier[0];
+        spay.bezier.p1y = state->config.transition.bezier[1];
+        spay.bezier.p2x = state->config.transition.bezier[2];
+        spay.bezier.p2y = state->config.transition.bezier[3];
+        spay.has_custom_bezier = true;
+        if (strcmp(target, "*") != 0) {
+            spay.num_target_outputs = 1;
+            strncpy(spay.target_outputs[0], target, sizeof(spay.target_outputs[0]) - 1);
+        }
         strncpy(spay.path, rule->path, sizeof(spay.path) - 1);
         return slideshow_start(&state->slideshow, &spay);
     }
@@ -777,10 +1047,33 @@ static void daemon_handle_power_gov_events(daemon_state_t *state, int fd)
 
     if (fd == ipc_fd) {
         waywal_power_governor_dispatch_ipc(state->power_gov);
+        int new_ipc_fd = waywal_power_governor_get_ipc_fd(state->power_gov);
+        bool reconnected = waywal_power_governor_consume_ipc_reconnected(state->power_gov);
+        if (new_ipc_fd != ipc_fd || reconnected) {
+            if (ipc_fd >= 0) {
+                if (state->epoll_fd >= 0 && new_ipc_fd != ipc_fd) {
+                    epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL, ipc_fd, NULL);
+                }
+                if (state->use_uring && state->uring_loop) {
+                    (void)uring_loop_remove_poll(state->uring_loop, ipc_fd);
+                }
+            }
+            if (new_ipc_fd >= 0) {
+                register_fd_in_loops(state, new_ipc_fd, URING_EV_TIMER);
+            }
+        }
         char ws[64];
         char mon[64];
         while (waywal_power_governor_pop_workspace_change(state->power_gov, ws, sizeof(ws), mon,
                                                           sizeof(mon))) {
+            int ws_idx = atoi(ws);
+            if (ws_idx > 0) {
+                state->workspace_target_x = (float)((ws_idx - 1) % 10) * 0.1f;
+            } else {
+                state->workspace_target_x += 0.1f;
+                if (state->workspace_target_x > 1.0f)
+                    state->workspace_target_x -= 1.0f;
+            }
             for (size_t i = 0; i < state->config.workspace_count; ++i) {
                 const waywal_workspace_rule_t *wrule = &state->config.workspaces[i];
                 if (strcmp(wrule->workspace_name, ws) == 0 && wrule->path[0] != '\0') {
@@ -997,25 +1290,50 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
     case WAYWAL_REQ_SET_IMAGE: {
         struct stat st;
+        const size_t min_hdr_size = 72u; /* Legacy v0.x metadata header prefix */
         if (attached_fd >= 0 && fstat(attached_fd, &st) == 0 &&
-            (size_t)st.st_size >= sizeof(waywal_img_metadata_t) &&
-            req_hdr.payload_size >= sizeof(waywal_img_metadata_t) &&
+            (size_t)st.st_size >= min_hdr_size && req_hdr.payload_size >= min_hdr_size &&
             (size_t)st.st_size >= req_hdr.payload_size) {
             void *mapped = mmap(NULL, req_hdr.payload_size, PROT_READ, MAP_PRIVATE, attached_fd, 0);
             if (mapped != MAP_FAILED) {
-                waywal_img_metadata_t *meta = (waywal_img_metadata_t *)mapped;
-                uint64_t expected_size = sizeof(waywal_img_metadata_t) +
-                                         (uint64_t)meta->extra_data_len +
-                                         (uint64_t)meta->width * (uint64_t)meta->height * 4ULL;
+                const waywal_img_metadata_t *raw_meta = (const waywal_img_metadata_t *)mapped;
+                uint64_t pixel_bytes =
+                    (uint64_t)raw_meta->width * (uint64_t)raw_meta->height * 4ULL;
+                uint64_t tail_bytes = (uint64_t)raw_meta->extra_data_len + pixel_bytes;
+                size_t hdr_size = sizeof(waywal_img_metadata_t);
+                if (req_hdr.payload_size >= tail_bytes) {
+                    uint64_t inferred_hdr = req_hdr.payload_size - tail_bytes;
+                    if (inferred_hdr >= min_hdr_size &&
+                        inferred_hdr < sizeof(waywal_img_metadata_t)) {
+                        hdr_size = (size_t)inferred_hdr;
+                    }
+                }
+                uint64_t expected_size = (uint64_t)hdr_size + tail_bytes;
                 bool ok = false;
-                if (meta->width > 0 && meta->height > 0 && meta->width <= 16384 &&
-                    meta->height <= 16384 && req_hdr.payload_size >= expected_size &&
+                if (raw_meta->width > 0 && raw_meta->height > 0 && raw_meta->width <= 16384 &&
+                    raw_meta->height <= 16384 && req_hdr.payload_size >= expected_size &&
                     (size_t)st.st_size >= expected_size) {
+                    uint8_t *compat_buf = NULL;
+                    waywal_img_metadata_t *meta = (waywal_img_metadata_t *)mapped;
+                    if (hdr_size < sizeof(waywal_img_metadata_t)) {
+                        compat_buf = (uint8_t *)calloc(1, sizeof(waywal_img_metadata_t) +
+                                                              raw_meta->extra_data_len + 1u);
+                        if (compat_buf) {
+                            memcpy(compat_buf, mapped, hdr_size);
+                            if (raw_meta->extra_data_len > 0) {
+                                memcpy(compat_buf + sizeof(waywal_img_metadata_t),
+                                       (const uint8_t *)mapped + hdr_size,
+                                       raw_meta->extra_data_len);
+                            }
+                            meta = (waywal_img_metadata_t *)compat_buf;
+                        }
+                    }
+
                     bool valid_strings = true;
                     if (meta->num_target_outputs > 64) {
                         valid_strings = false;
                     } else {
-                        const char *ptr = (const char *)mapped + sizeof(waywal_img_metadata_t);
+                        const char *ptr = (const char *)meta + sizeof(waywal_img_metadata_t);
                         size_t remaining = meta->extra_data_len;
                         for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
                             const char *end = (const char *)memchr(ptr, '\0', remaining);
@@ -1041,9 +1359,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     }
 
                     if (valid_strings) {
-                        const uint8_t *pixels = (const uint8_t *)mapped +
-                                                sizeof(waywal_img_metadata_t) +
-                                                meta->extra_data_len;
+                        const uint8_t *pixels =
+                            (const uint8_t *)mapped + hdr_size + meta->extra_data_len;
                         WAYWAL_LOG_INFO("Rendering received image: %ux%u", meta->width,
                                         meta->height);
                         if (state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED) {
@@ -1052,16 +1369,61 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         slideshow_stop(&state->slideshow);
                         shader_engine_stop_playback(state);
                         anim_engine_stop_playback(state);
+                        if (state->power_gov) {
+                            waywal_power_governor_set_global_reason(
+                                state->power_gov, WAYWAL_PAUSE_USER_MANUAL, false);
+                        }
+
+                        if (meta->backdrop[0] != '\0') {
+                            state->backdrop_auto_blur =
+                                (strcasecmp(meta->backdrop, "auto-blur") == 0);
+                            if (strcasecmp(meta->backdrop, "none") == 0) {
+                                state->backdrop_path[0] = '\0';
+                            } else if (!state->backdrop_auto_blur) {
+                                strncpy(state->backdrop_path, meta->backdrop,
+                                        sizeof(state->backdrop_path) - 1);
+                                state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+                            }
+                        }
+                        if (meta->layer_name[0] != '\0') {
+                            state->use_bottom_layer = (strcasecmp(meta->layer_name, "bottom") == 0);
+                            for (output_node_t *out = state->outputs; out != NULL;
+                                 out = out->next) {
+                                if (out->layer_surface && out->surface) {
+                                    zwlr_layer_surface_v1_set_layer(
+                                        out->layer_surface,
+                                        state->use_bottom_layer
+                                            ? ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM
+                                            : ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND);
+                                }
+                            }
+                        }
+                        if (meta->battery_policy[0] != '\0' && state->power_gov) {
+                            waywal_battery_policy_t bpol = WAYWAL_BATTERY_REDUCE_FPS;
+                            if (strcasecmp(meta->battery_policy, "ignore") == 0) {
+                                bpol = WAYWAL_BATTERY_IGNORE;
+                            } else if (strcasecmp(meta->battery_policy, "pause-video") == 0) {
+                                bpol = WAYWAL_BATTERY_PAUSE_VIDEO;
+                            }
+                            waywal_power_governor_set_battery_policy(state->power_gov, bpol);
+                        }
+
+                        daemon_update_palette_from_bgra(state, pixels, meta->width, meta->height,
+                                                        meta, false);
 
                         ok = daemon_start_image_transition(state, pixels, meta->width, meta->height,
                                                            meta);
                         if (ok) {
                             const char *first_target = "*";
                             if (meta->num_target_outputs > 0) {
-                                first_target = (const char *)mapped + sizeof(waywal_img_metadata_t);
+                                first_target = (const char *)meta + sizeof(waywal_img_metadata_t);
                             }
                             bool is_anim = try_start_native_animation(state, meta->filepath, meta,
                                                                       first_target);
+                            if (!is_anim && meta->depth_map_path[0] != '\0') {
+                                (void)daemon_activate_depth_parallax(
+                                    state, pixels, meta->width, meta->height, meta, first_target);
+                            }
 
                             waywal_output_saved_state_t s_entry;
                             memset(&s_entry, 0, sizeof(s_entry));
@@ -1079,7 +1441,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
                             if (meta->num_target_outputs > 0) {
                                 const char *ptr =
-                                    (const char *)mapped + sizeof(waywal_img_metadata_t);
+                                    (const char *)meta + sizeof(waywal_img_metadata_t);
                                 for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
                                     memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
                                     strncpy(s_entry.output_name, ptr,
@@ -1107,10 +1469,11 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     } else {
                         WAYWAL_LOG_ERR("IPC image payload string validation failed");
                     }
+                    free(compat_buf);
                 } else {
                     WAYWAL_LOG_ERR(
                         "IPC image payload bounds check failed: %ux%u, size=%zu, expected=%lu",
-                        meta->width, meta->height, req_hdr.payload_size,
+                        raw_meta->width, raw_meta->height, req_hdr.payload_size,
                         (unsigned long)expected_size);
                 }
                 resp_hdr.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
@@ -1266,10 +1629,33 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     }
 
     case WAYWAL_REQ_TOGGLE: {
-        if (state->video_engine.state == WAYWAL_VIDEO_STATE_PLAYING) {
-            video_engine_pause(&state->video_engine);
-        } else if (state->video_engine.state == WAYWAL_VIDEO_STATE_PAUSED) {
-            video_engine_resume(&state->video_engine);
+        bool manual_paused =
+            (state->video_engine.state == WAYWAL_VIDEO_STATE_PAUSED) ||
+            (state->power_gov && (waywal_power_governor_get_output_mask(state->power_gov, NULL) &
+                                  WAYWAL_PAUSE_USER_MANUAL) != 0);
+        if (manual_paused) {
+            if (state->power_gov) {
+                waywal_power_governor_set_global_reason(state->power_gov, WAYWAL_PAUSE_USER_MANUAL,
+                                                        false);
+            }
+            if (state->video_engine.state == WAYWAL_VIDEO_STATE_PAUSED) {
+                video_engine_resume(&state->video_engine);
+            }
+            daemon_reconcile_power_state(state);
+        } else {
+            if (state->video_engine.state == WAYWAL_VIDEO_STATE_PLAYING) {
+                video_engine_pause(&state->video_engine);
+            }
+            if (state->shader_active) {
+                disarm_timer_fd(state->shader_timer_fd);
+            }
+            if (state->anim_active) {
+                disarm_timer_fd(state->anim_timer_fd);
+            }
+            if (state->power_gov) {
+                waywal_power_governor_set_global_reason(state->power_gov, WAYWAL_PAUSE_USER_MANUAL,
+                                                        true);
+            }
         }
         resp_hdr.opcode = WAYWAL_RESP_OK;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
@@ -1530,6 +1916,47 @@ static void daemon_reload_config(daemon_state_t *st)
         if (st->power_gov) {
             waywal_power_governor_set_battery_policy(st->power_gov,
                                                      st->config.daemon.battery_policy_mode);
+            waywal_power_governor_set_pause_policies(st->power_gov,
+                                                     st->config.daemon.auto_pause_fullscreen,
+                                                     st->config.daemon.auto_pause_maximized,
+                                                     st->config.daemon.pause_on_occluded_workspace);
+        }
+        bool slideshow_rule_applied = false;
+        for (size_t i = 0; i < st->config.output_count; ++i) {
+            if (strcasecmp(st->config.outputs[i].mode, "slideshow") == 0) {
+                slideshow_rule_applied = true;
+            }
+            (void)daemon_apply_output_config_rule(st, &st->config.outputs[i]);
+        }
+        if (st->slideshow.active && !slideshow_rule_applied) {
+            st->slideshow.transition_type = st->config.transition.type_enum;
+            st->slideshow.transition_duration_ms =
+                (uint32_t)(st->config.transition.duration * 1000.0f);
+            st->slideshow.transition_fps = st->config.transition.fps;
+            st->slideshow.transition_angle_rad =
+                st->config.transition.angle * (3.14159265358979323846f / 180.0f);
+            st->slideshow.transition_wave_freq = st->config.transition.wave_x;
+            st->slideshow.transition_wave_amp = st->config.transition.wave_y;
+            st->slideshow.transition_center_x = st->config.transition.pos_x;
+            st->slideshow.transition_center_y = st->config.transition.pos_y;
+            st->slideshow.bezier.p1x = st->config.transition.bezier[0];
+            st->slideshow.bezier.p1y = st->config.transition.bezier[1];
+            st->slideshow.bezier.p2x = st->config.transition.bezier[2];
+            st->slideshow.bezier.p2y = st->config.transition.bezier[3];
+            st->slideshow.has_custom_bezier = true;
+            st->slideshow.ten_bit = st->config.daemon.ten_bit;
+            (void)slideshow_rescan(&st->slideshow);
+        }
+        if (st->config.theme.enabled && st->has_active_palette) {
+            (void)waywal_palette_export_filtered(
+                &st->active_palette, NULL, st->config.theme.caelestia_sync,
+                st->config.theme.export_css, st->config.theme.export_hyprland);
+            if (st->config.theme.tty_sequences) {
+                (void)waywal_palette_broadcast_tty(&st->active_palette);
+            }
+            if (st->config.hooks.on_theme_change[0] != '\0') {
+                (void)waywal_palette_run_hook(st->config.hooks.on_theme_change);
+            }
         }
         daemon_reconcile_power_state(st);
         WAYWAL_LOG_INFO("Reloaded configuration on SIGHUP");
@@ -1550,7 +1977,26 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
     case URING_EV_IPC_ACCEPT:
         daemon_handle_ipc_connection(st);
         break;
+    case URING_EV_SHADER_INOTIFY:
+    case URING_EV_INOTIFY:
+        if ((res & POLLIN) == 0)
+            break;
+        daemon_pump_wayland_events(st);
+        if (st->shader_eng && fd == waywal_shader_engine_get_inotify_fd(st->shader_eng)) {
+            if (waywal_shader_engine_poll_hot_reload(st->shader_eng) && st->shader_active) {
+                daemon_shader_render_once(st);
+            }
+        }
+        break;
+    case URING_EV_POWER_IPC:
+    case URING_EV_POWER_INOTIFY:
+        if ((res & POLLIN) == 0)
+            break;
+        daemon_handle_power_gov_events(st, fd);
+        break;
     case URING_EV_TIMER:
+    case URING_EV_SHADER_TIMER:
+    case URING_EV_ANIM_TIMER:
         if ((res & POLLIN) == 0)
             break;
         daemon_pump_wayland_events(st);
@@ -1666,6 +2112,12 @@ int main(int argc, char *argv[])
     }
 
     state.power_gov = waywal_power_governor_create(battery_policy);
+    if (state.power_gov) {
+        waywal_power_governor_set_pause_policies(state.power_gov,
+                                                 state.config.daemon.auto_pause_fullscreen,
+                                                 state.config.daemon.auto_pause_maximized,
+                                                 state.config.daemon.pause_on_occluded_workspace);
+    }
     waywal_state_store_init(&g_saved_state);
     (void)waywal_state_store_load(&g_saved_state, NULL);
 
@@ -1759,10 +2211,6 @@ int main(int argc, char *argv[])
         struct epoll_event ev_trans = {.events = EPOLLIN, .data.fd = state.transition_timer_fd};
         epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.transition_timer_fd, &ev_trans);
     }
-    if (state.video_engine.timer_fd >= 0) {
-        struct epoll_event ev_vid = {.events = EPOLLIN, .data.fd = state.video_engine.timer_fd};
-        epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.video_engine.timer_fd, &ev_vid);
-    }
     if (state.slideshow.timer_fd >= 0) {
         struct epoll_event ev_slide = {.events = EPOLLIN, .data.fd = state.slideshow.timer_fd};
         epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.slideshow.timer_fd, &ev_slide);
@@ -1822,6 +2270,7 @@ int main(int argc, char *argv[])
     }
 
     state.on_output_configured = daemon_on_output_configured;
+    state.on_wallpaper_loaded = daemon_on_wallpaper_loaded;
     if (state.config.output_count > 0) {
         for (size_t i = 0; i < state.config.output_count; ++i) {
             (void)daemon_apply_output_config_rule(&state, &state.config.outputs[i]);
@@ -1933,6 +2382,8 @@ int main(int argc, char *argv[])
         waywal_shader_engine_destroy(state.shader_eng);
         state.shader_eng = NULL;
     }
+    free(state.wallpaper_rgba);
+    state.wallpaper_rgba = NULL;
     if (state.audio_fft) {
         waywal_audio_fft_destroy(state.audio_fft);
         state.audio_fft = NULL;

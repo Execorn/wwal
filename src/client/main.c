@@ -88,12 +88,17 @@ static void apply_config_defaults_to_cli(int argc, char *argv[], const waywal_co
 }
 
 static bool extract_palette_from_bgra(const uint8_t *bgra_pixels, uint32_t width, uint32_t height,
-                                      waywal_theme_mode_t mode, waywal_palette_t *out_pal)
+                                      waywal_theme_mode_t mode, const waywal_config_t *cfg,
+                                      waywal_palette_t *out_pal)
 {
     if (!bgra_pixels || width == 0 || height == 0 || !out_pal)
         return false;
 
-    return waywal_palette_extract_bgra(bgra_pixels, width, height, width * 4U, mode, out_pal);
+    waywal_scheme_variant_t variant =
+        waywal_scheme_variant_from_str(cfg ? cfg->theme.scheme_variant : NULL);
+    float contrast = cfg ? cfg->theme.contrast : 0.0f;
+    return waywal_palette_extract_ex(bgra_pixels, width, height, width * 4U, true, mode, variant,
+                                     contrast, out_pal);
 }
 
 static size_t clear_cache_dir_files(const char *dir_path)
@@ -237,7 +242,7 @@ static int handle_cmd_theme(const cli_options_t *opts, const waywal_config_t *cf
 
     waywal_theme_mode_t mode = opts->theme_light_mode ? WAYWAL_THEME_LIGHT : WAYWAL_THEME_DARK;
     waywal_palette_t pal;
-    bool ok = extract_palette_from_bgra(pixels, width, height, mode, &pal);
+    bool ok = extract_palette_from_bgra(pixels, width, height, mode, cfg, &pal);
     image_free(pixels);
 
     if (!ok) {
@@ -245,7 +250,9 @@ static int handle_cmd_theme(const cli_options_t *opts, const waywal_config_t *cf
         return 1;
     }
 
-    (void)waywal_palette_export_all(&pal, NULL);
+    (void)waywal_palette_export_filtered(&pal, NULL, cfg ? cfg->theme.caelestia_sync : true,
+                                         cfg ? cfg->theme.export_css : true,
+                                         cfg ? cfg->theme.export_hyprland : true);
     if (!cfg || cfg->theme.tty_sequences) {
         (void)waywal_palette_broadcast_tty(&pal);
     }
@@ -804,8 +811,10 @@ int main(int argc, char *argv[])
             waywal_theme_mode_t tmode =
                 opts.theme_light_mode ? WAYWAL_THEME_LIGHT : WAYWAL_THEME_DARK;
             waywal_palette_t pal;
-            if (extract_palette_from_bgra(pixels, width, height, tmode, &pal)) {
-                (void)waywal_palette_export_all(&pal, NULL);
+            if (extract_palette_from_bgra(pixels, width, height, tmode, &cfg, &pal)) {
+                (void)waywal_palette_export_filtered(&pal, NULL, cfg.theme.caelestia_sync,
+                                                     cfg.theme.export_css,
+                                                     cfg.theme.export_hyprland);
                 if (cfg.theme.tty_sequences) {
                     (void)waywal_palette_broadcast_tty(&pal);
                 }
@@ -868,6 +877,20 @@ int main(int argc, char *argv[])
         meta.bezier = opts.bezier;
         meta.has_custom_bezier = opts.has_custom_bezier;
         meta.ten_bit = opts.ten_bit;
+        meta.extract_theme = opts.extract_theme;
+        meta.no_theme = opts.no_theme;
+        meta.theme_light_mode = opts.theme_light_mode;
+        if (opts.depth_map_path[0] != '\0') {
+            char resolved_dm[PATH_MAX];
+            if (realpath(opts.depth_map_path, resolved_dm)) {
+                strncpy(meta.depth_map_path, resolved_dm, sizeof(meta.depth_map_path) - 1);
+            } else {
+                strncpy(meta.depth_map_path, opts.depth_map_path, sizeof(meta.depth_map_path) - 1);
+            }
+        }
+        strncpy(meta.backdrop, opts.backdrop, sizeof(meta.backdrop) - 1);
+        strncpy(meta.layer_name, opts.layer_name, sizeof(meta.layer_name) - 1);
+        strncpy(meta.battery_policy, opts.battery_policy, sizeof(meta.battery_policy) - 1);
         if (!opts.read_stdin && opts.filepath[0] != '\0') {
             char resolved_img[PATH_MAX];
             if (realpath(opts.filepath, resolved_img)) {
@@ -876,6 +899,7 @@ int main(int argc, char *argv[])
                 strncpy(meta.filepath, opts.filepath, sizeof(meta.filepath) - 1);
             }
         }
+        meta.depth_strength = opts.depth_strength > 0.0f ? opts.depth_strength : 1.0f;
 
         uint8_t *dst = (uint8_t *)mapped;
         memcpy(dst, &meta, sizeof(meta));
@@ -940,6 +964,9 @@ int main(int argc, char *argv[])
         spay.transition_center_y = opts.transition_pos_y;
         spay.random_order = opts.slideshow_random;
         spay.num_target_outputs = opts.num_outputs;
+        for (uint32_t i = 0; i < opts.num_outputs && i < 16; ++i) {
+            strncpy(spay.target_outputs[i], opts.outputs[i], sizeof(spay.target_outputs[i]) - 1);
+        }
         spay.scaling_mode = opts.scaling_mode;
         spay.filter_mode = (uint32_t)opts.filter;
         spay.bezier = opts.bezier;

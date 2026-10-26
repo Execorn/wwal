@@ -61,6 +61,9 @@ typedef struct {
     struct daemon_state *daemon_state;
 
     bool seamless_looping;
+    bool eof_draining;
+    bool using_swdec;
+    void *swdec_ctx;
 } video_engine_t;
 
 bool video_engine_init(video_engine_t *ve, struct daemon_state *state);

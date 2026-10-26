@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -179,8 +180,8 @@ static inline bool linear_rgb_in_gamut(float r, float g, float b)
             b <= 1.0f + eps);
 }
 
-#ifdef __AVX2__
-static inline __m256 avx2_cbrt_ps(__m256 x)
+#if defined(__x86_64__) && !defined(WAYWAL_DISABLE_SIMD)
+__attribute__((target("avx2,fma"))) static inline __m256 avx2_cbrt_ps(__m256 x)
 {
     const __m256 eps = _mm256_set1_ps(1e-24f);
     __m256 valid_mask = _mm256_cmp_ps(x, eps, _CMP_GT_OQ);
@@ -223,8 +224,10 @@ static inline void wu_accum_pixel(wu_hist_t *hist, float l, float a, float b)
     bin->m2 += (l * l + a * a + b * b);
 }
 
-static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint32_t width,
-                                    uint32_t height, uint32_t stride_bytes, bool is_bgra)
+#if defined(__x86_64__) && !defined(WAYWAL_DISABLE_SIMD)
+__attribute__((target("avx2,fma"))) static size_t
+wu_populate_histogram_avx2(wu_hist_t *hist, const uint8_t *pixels, uint32_t width, uint32_t height,
+                           uint32_t stride_bytes, bool is_bgra)
 {
     memset(hist, 0, sizeof(*hist));
 
@@ -239,7 +242,6 @@ static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint
     const int r_off = is_bgra ? 2 : 0;
     const int b_off = is_bgra ? 0 : 2;
 
-#ifdef __AVX2__
     int32_t r_idx[8] __attribute__((aligned(32)));
     int32_t g_idx[8] __attribute__((aligned(32)));
     int32_t b_idx[8] __attribute__((aligned(32)));
@@ -247,7 +249,6 @@ static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint
     float out_a[8] __attribute__((aligned(32)));
     float out_b[8] __attribute__((aligned(32)));
     int batch_count = 0;
-#endif
 
     for (uint32_t y = 0; y < height; y += step_y) {
         const uint8_t *row = pixels + (size_t)y * stride_bytes;
@@ -258,7 +259,6 @@ static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint
             }
             valid_samples++;
 
-#ifdef __AVX2__
             r_idx[batch_count] = px[r_off];
             g_idx[batch_count] = px[1];
             b_idx[batch_count] = px[b_off];
@@ -310,17 +310,9 @@ static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint
                 }
                 batch_count = 0;
             }
-#else
-            float r = g_srgb_to_linear[px[r_off]];
-            float g = g_srgb_to_linear[px[1]];
-            float b = g_srgb_to_linear[px[b_off]];
-            waywal_oklab_t ok = linear_rgb_to_oklab(r, g, b);
-            wu_accum_pixel(hist, ok.l, ok.a, ok.b);
-#endif
         }
     }
 
-#ifdef __AVX2__
     for (int i = 0; i < batch_count; ++i) {
         float r = g_srgb_to_linear[r_idx[i]];
         float g = g_srgb_to_linear[g_idx[i]];
@@ -328,14 +320,12 @@ static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint
         waywal_oklab_t ok = linear_rgb_to_oklab(r, g, b);
         wu_accum_pixel(hist, ok.l, ok.a, ok.b);
     }
-#endif
 
     return valid_samples;
 }
 
-static void wu_compute_moments(wu_hist_t *hist)
+__attribute__((target("avx2,fma"))) static void wu_compute_moments_avx2(wu_hist_t *hist)
 {
-#ifdef __AVX2__
     for (int l = 1; l <= WU_BINS; ++l) {
         __m256 area[WU_GRID];
         for (int b = 0; b < WU_GRID; ++b) {
@@ -353,7 +343,58 @@ static void wu_compute_moments(wu_hist_t *hist)
             }
         }
     }
-#else
+}
+#endif
+
+static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint32_t width,
+                                    uint32_t height, uint32_t stride_bytes, bool is_bgra)
+{
+#if defined(__x86_64__) && !defined(WAYWAL_DISABLE_SIMD)
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        return wu_populate_histogram_avx2(hist, pixels, width, height, stride_bytes, is_bgra);
+    }
+#endif
+    memset(hist, 0, sizeof(*hist));
+
+    uint32_t step_x = width > SUBSAMPLE_DIM ? (width / SUBSAMPLE_DIM) : 1U;
+    uint32_t step_y = height > SUBSAMPLE_DIM ? (height / SUBSAMPLE_DIM) : 1U;
+    if (step_x == 0U)
+        step_x = 1U;
+    if (step_y == 0U)
+        step_y = 1U;
+
+    size_t valid_samples = 0;
+    const int r_off = is_bgra ? 2 : 0;
+    const int b_off = is_bgra ? 0 : 2;
+
+    for (uint32_t y = 0; y < height; y += step_y) {
+        const uint8_t *row = pixels + (size_t)y * stride_bytes;
+        for (uint32_t x = 0; x < width; x += step_x) {
+            const uint8_t *px = row + (size_t)x * 4U;
+            if (px[3] == 0U) {
+                continue;
+            }
+            valid_samples++;
+
+            float r = g_srgb_to_linear[px[r_off]];
+            float g = g_srgb_to_linear[px[1]];
+            float b = g_srgb_to_linear[px[b_off]];
+            waywal_oklab_t ok = linear_rgb_to_oklab(r, g, b);
+            wu_accum_pixel(hist, ok.l, ok.a, ok.b);
+        }
+    }
+
+    return valid_samples;
+}
+
+static void wu_compute_moments(wu_hist_t *hist)
+{
+#if defined(__x86_64__) && !defined(WAYWAL_DISABLE_SIMD)
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        wu_compute_moments_avx2(hist);
+        return;
+    }
+#endif
     for (int l = 1; l <= WU_BINS; ++l) {
         wu_bin_t area[WU_GRID];
         memset(area, 0, sizeof(area));
@@ -388,7 +429,6 @@ static void wu_compute_moments(wu_hist_t *hist)
             }
         }
     }
-#endif
 }
 
 static inline wu_bin_t wu_vol_bin(const wu_box_t *box, const wu_hist_t *hist)
@@ -756,10 +796,8 @@ static size_t weighted_kmeans_pp(const weighted_point_t *pts, size_t n_pts,
 }
 
 /* Algebraic CAM16 correlates under standard sRGB D65 viewing conditions (Li et al. 2017). */
-static waywal_cam16_t oklab_to_cam16(float l, float a, float b)
+static waywal_cam16_t linear_rgb_to_cam16(float r_lin, float g_lin, float b_lin, float *out_y)
 {
-    float r_lin, g_lin, b_lin;
-    oklab_to_linear_rgb(l, a, b, &r_lin, &g_lin, &b_lin);
     r_lin = clamp_f(r_lin, 0.0f, 1.0f);
     g_lin = clamp_f(g_lin, 0.0f, 1.0f);
     b_lin = clamp_f(b_lin, 0.0f, 1.0f);
@@ -767,6 +805,9 @@ static waywal_cam16_t oklab_to_cam16(float l, float a, float b)
     float x = (0.41233895f * r_lin + 0.35762064f * g_lin + 0.18051042f * b_lin) * 100.0f;
     float y = (0.2126f * r_lin + 0.7152f * g_lin + 0.0722f * b_lin) * 100.0f;
     float z = (0.01932141f * r_lin + 0.11916382f * g_lin + 0.95034478f * b_lin) * 100.0f;
+    if (out_y) {
+        *out_y = y;
+    }
 
     float r_c = 0.401288f * x + 0.650173f * y - 0.051461f * z;
     float g_c = -0.250268f * x + 1.204414f * y + 0.045854f * z;
@@ -777,17 +818,17 @@ static waywal_cam16_t oklab_to_cam16(float l, float a, float b)
     const float d_b = 0.9339605f;
     const float fl = 0.38848145f;
 
-    float r_d = fabsf(r_c * d_r);
-    float g_d = fabsf(g_c * d_g);
-    float b_d = fabsf(b_c * d_b);
+    float r_d = r_c * d_r;
+    float g_d = g_c * d_g;
+    float b_d = b_c * d_b;
 
-    float p_r = powf(fl * r_d * 0.01f, 0.42f);
-    float p_g = powf(fl * g_d * 0.01f, 0.42f);
-    float p_b = powf(fl * b_d * 0.01f, 0.42f);
+    float p_r = powf(fl * fabsf(r_d) * 0.01f, 0.42f);
+    float p_g = powf(fl * fabsf(g_d) * 0.01f, 0.42f);
+    float p_b = powf(fl * fabsf(b_d) * 0.01f, 0.42f);
 
-    float r_a = 400.0f * p_r / (p_r + 27.13f);
-    float g_a = 400.0f * p_g / (p_g + 27.13f);
-    float b_a = 400.0f * p_b / (p_b + 27.13f);
+    float r_a = copysignf(400.0f * p_r / (p_r + 27.13f), r_d);
+    float g_a = copysignf(400.0f * p_g / (p_g + 27.13f), g_d);
+    float b_a = copysignf(400.0f * p_b / (p_b + 27.13f), b_d);
 
     float cam_a = r_a - (12.0f * g_a - b_a) / 11.0f;
     float cam_b = (r_a + g_a - 2.0f * b_a) / 9.0f;
@@ -814,86 +855,190 @@ static waywal_cam16_t oklab_to_cam16(float l, float a, float b)
     return out;
 }
 
-static float tone_to_oklab_l(float l_target)
+static waywal_cam16_t oklab_to_cam16(float l, float a, float b)
 {
-    if (l_target <= 0.0f) {
-        return 0.0f;
-    }
-    if (l_target <= 1.0f) {
-        return l_target;
-    }
-    if (l_target >= 100.0f) {
-        return 1.0f;
-    }
-    /* Convert Material 3 CIE L* tone (0..100) to relative luminance Y, then to OKLab L = Y^(1/3).
-     */
-    float f = (l_target + 16.0f) * (1.0f / 116.0f);
-    float y = (l_target > 8.0f) ? (f * f * f) : (l_target * (1.0f / 903.296296f));
-    return fast_cbrtf_scalar(y);
+    float r_lin, g_lin, b_lin;
+    oklab_to_linear_rgb(l, a, b, &r_lin, &g_lin, &b_lin);
+    return linear_rgb_to_cam16(r_lin, g_lin, b_lin, NULL);
 }
 
-static inline void oklab_ray_to_linear_rgb(float l_ok, float c, float dl, float dm, float ds,
-                                           float *out_r, float *out_g, float *out_b)
+static void cam16_jch_to_linear_rgb_precomp(float j, float c, float cos_h, float sin_h,
+                                            float p1_star, float *out_r, float *out_g, float *out_b,
+                                            float *out_y)
 {
-    float l_ = l_ok + c * dl;
-    float m_ = l_ok + c * dm;
-    float s_ = l_ok + c * ds;
+    if (j <= 1e-6f) {
+        *out_r = 0.0f;
+        *out_g = 0.0f;
+        *out_b = 0.0f;
+        if (out_y) {
+            *out_y = 0.0f;
+        }
+        return;
+    }
 
-    float l = l_ * l_ * l_;
-    float m = m_ * m_ * m_;
-    float s = s_ * s_ * s_;
+    const float a_w = 29.981f;
+    const float n_bb = 1.016919f;
+    const float d_r = 1.0211777f;
+    const float d_g = 0.9863077f;
+    const float d_b = 0.9339605f;
+    const float fl = 0.38848145f;
 
-    *out_r = +4.0767416621f * l - 3.3077115913f * m + 0.2309699292f * s;
-    *out_g = -1.2684380046f * l + 2.6097574011f * m - 0.3413193965f * s;
-    *out_b = -0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s;
+    float j_norm = j * 0.01f;
+    float a_achrom = a_w * powf(j_norm, 1.0f / (0.69f * 1.48f));
+    float p2 = a_achrom * (1.0f / n_bb);
+
+    float alpha = (c <= 1e-6f) ? 0.0f : (c / sqrtf(j_norm));
+    float t = (alpha <= 1e-6f) ? 0.0f : powf(alpha * (1.0f / 0.789f), 1.0f / 0.9f);
+
+    float cam_a = 0.0f;
+    float cam_b = 0.0f;
+
+    if (t > 1e-6f) {
+        float denom = 23.0f * p1_star + t * (11.0f * cos_h + 108.0f * sin_h);
+        if (fabsf(denom) > 1e-6f) {
+            float gamma = (23.0f * (p2 + 0.305f) * t) / denom;
+            cam_a = gamma * cos_h;
+            cam_b = gamma * sin_h;
+        }
+    }
+
+    float r_a = (460.0f * p2 + 451.0f * cam_a + 288.0f * cam_b) * (1.0f / 1403.0f);
+    float g_a = (460.0f * p2 - 891.0f * cam_a - 261.0f * cam_b) * (1.0f / 1403.0f);
+    float b_a = (460.0f * p2 - 220.0f * cam_a - 6300.0f * cam_b) * (1.0f / 1403.0f);
+
+    float abs_ra = clamp_f(fabsf(r_a), 0.0f, 399.99f);
+    float abs_ga = clamp_f(fabsf(g_a), 0.0f, 399.99f);
+    float abs_ba = clamp_f(fabsf(b_a), 0.0f, 399.99f);
+
+    float p_r = (27.13f * abs_ra) / (400.0f - abs_ra);
+    float p_g = (27.13f * abs_ga) / (400.0f - abs_ga);
+    float p_b = (27.13f * abs_ba) / (400.0f - abs_ba);
+
+    const float inv_042 = 1.0f / 0.42f;
+    const float scale_fl = 100.0f / fl;
+    float r_d = copysignf(scale_fl * powf(p_r, inv_042), r_a);
+    float g_d = copysignf(scale_fl * powf(p_g, inv_042), g_a);
+    float b_d = copysignf(scale_fl * powf(p_b, inv_042), b_a);
+
+    float r_c = r_d * (1.0f / d_r);
+    float g_c = g_d * (1.0f / d_g);
+    float b_c = b_d * (1.0f / d_b);
+
+    float x = 1.86206786f * r_c - 1.01125463f * g_c + 0.14918677f * b_c;
+    float y = 0.38752654f * r_c + 0.62144744f * g_c - 0.00897398f * b_c;
+    float z = -0.01584150f * r_c - 0.03412294f * g_c + 1.04996444f * b_c;
+
+    if (out_y) {
+        *out_y = y;
+    }
+
+    *out_r = (3.24100326f * x - 1.53739899f * y - 0.49861587f * z) * 0.01f;
+    *out_g = (-0.96922426f * x + 1.87592999f * y + 0.04155422f * z) * 0.01f;
+    *out_b = (0.05563942f * x - 0.20401120f * y + 1.05714897f * z) * 0.01f;
 }
 
-color_rgba_t waywal_palette_generate_tone(float l_target, float chroma, float hue_rad)
+static void solve_cam16_rgb_at_y(float cos_h, float sin_h, float p1_star, float c_cam16,
+                                 float y_target, float j_init, float *out_r, float *out_g,
+                                 float *out_b)
 {
-    if (l_target <= 0.0f) {
+    float j_lo = 0.0f;
+    float j_hi = 100.0f;
+    float j_cur = clamp_f(j_init, 0.5f, 99.5f);
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+
+    for (int i = 0; i < 5; ++i) {
+        float y_eval = 0.0f;
+        cam16_jch_to_linear_rgb_precomp(j_cur, c_cam16, cos_h, sin_h, p1_star, &r, &g, &b, &y_eval);
+        if (y_eval < y_target) {
+            j_lo = j_cur;
+        } else {
+            j_hi = j_cur;
+        }
+        if (fabsf(y_eval - y_target) < 0.02f) {
+            break;
+        }
+        if (y_eval > 1e-4f) {
+            float j_est = j_cur * sqrtf(y_target / y_eval);
+            if (j_est > j_lo + 0.05f && j_est < j_hi - 0.05f) {
+                j_cur = j_est;
+                continue;
+            }
+        }
+        j_cur = 0.5f * (j_lo + j_hi);
+    }
+    *out_r = r;
+    *out_g = g;
+    *out_b = b;
+}
+
+void waywal_rgba_to_hct(color_rgba_t rgba, float *out_h_deg, float *out_c_cam16, float *out_t_lstar)
+{
+    ensure_srgb_lut();
+    float r_lin = g_srgb_to_linear[rgba.r];
+    float g_lin = g_srgb_to_linear[rgba.g];
+    float b_lin = g_srgb_to_linear[rgba.b];
+
+    float y = 0.0f;
+    waywal_cam16_t cam = linear_rgb_to_cam16(r_lin, g_lin, b_lin, &y);
+    float y_norm = y * 0.01f;
+    float lstar = (y_norm > 0.0088564516f) ? (116.0f * fast_cbrtf_scalar(y_norm) - 16.0f)
+                                           : (903.296296f * y_norm);
+    lstar = clamp_f(lstar, 0.0f, 100.0f);
+
+    if (out_h_deg) {
+        *out_h_deg = cam.h_deg;
+    }
+    if (out_c_cam16) {
+        *out_c_cam16 = cam.c;
+    }
+    if (out_t_lstar) {
+        *out_t_lstar = lstar;
+    }
+}
+
+color_rgba_t waywal_hct_to_rgba(float h_deg, float c_cam16, float t_lstar)
+{
+    if (t_lstar <= 0.0f) {
         return (color_rgba_t){.r = 0, .g = 0, .b = 0, .a = 255};
     }
-    if (l_target >= 100.0f) {
+    if (t_lstar >= 100.0f) {
         return (color_rgba_t){.r = 255, .g = 255, .b = 255, .a = 255};
     }
 
-    float l_ok = tone_to_oklab_l(l_target);
-    if (l_ok <= 0.0f) {
-        return (color_rgba_t){.r = 0, .g = 0, .b = 0, .a = 255};
+    float f = (t_lstar + 16.0f) * (1.0f / 116.0f);
+    float y_target = (t_lstar > 8.0f) ? (100.0f * f * f * f) : (t_lstar * (100.0f / 903.296296f));
+    if (c_cam16 < 1.0f) {
+        uint8_t v = linear_to_srgb_u8(y_target * 0.01f);
+        return (color_rgba_t){.r = v, .g = v, .b = v, .a = 255};
     }
-    if (l_ok >= 1.0f) {
-        return (color_rgba_t){.r = 255, .g = 255, .b = 255, .a = 255};
-    }
+    float h_rad = wrap_radians(h_deg * DEG_TO_RAD_F);
+    float cos_h = cosf(h_rad);
+    float sin_h = sinf(h_rad);
+    float e_t = 0.25f * (cosf(h_rad + 2.0f) + 3.8f);
+    float p1_star = (50000.0f / 13.0f) * 1.016919f * e_t;
+    float target_c = c_cam16;
 
-    float target_c = chroma > 0.0f ? chroma : 0.0f;
-    float cos_h = cosf(hue_rad);
-    float sin_h = sinf(hue_rad);
-
-    /* Pre-project unit hue vector (cos_h, sin_h) onto LMS cube-root axes once per tone. */
-    float dl = +0.3963377774f * cos_h + 0.2158037573f * sin_h;
-    float dm = -0.1055613458f * cos_h - 0.0638541728f * sin_h;
-    float ds = -0.0894841775f * cos_h - 1.2914855480f * sin_h;
-
-    float r, g, b;
-    oklab_ray_to_linear_rgb(l_ok, target_c, dl, dm, ds, &r, &g, &b);
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    solve_cam16_rgb_at_y(cos_h, sin_h, p1_star, target_c, y_target, t_lstar, &r, &g, &b);
 
     if (!linear_rgb_in_gamut(r, g, b)) {
-        float lo = 0.0f;
-        float hi = target_c;
-        float best_r = l_ok * l_ok * l_ok;
+        float c_lo = 0.0f;
+        float c_hi = target_c;
+        float best_r = y_target * 0.01f;
         float best_g = best_r;
         float best_b = best_r;
-        for (int i = 0; i < 6; ++i) {
-            float mid = 0.5f * (lo + hi);
+
+        for (int iter = 0; iter < 7; ++iter) {
+            float c_mid = 0.5f * (c_lo + c_hi);
             float mr, mg, mb;
-            oklab_ray_to_linear_rgb(l_ok, mid, dl, dm, ds, &mr, &mg, &mb);
+            solve_cam16_rgb_at_y(cos_h, sin_h, p1_star, c_mid, y_target, t_lstar, &mr, &mg, &mb);
             if (linear_rgb_in_gamut(mr, mg, mb)) {
-                lo = mid;
+                c_lo = c_mid;
                 best_r = mr;
                 best_g = mg;
                 best_b = mb;
             } else {
-                hi = mid;
+                c_hi = c_mid;
             }
         }
         r = best_r;
@@ -907,6 +1052,170 @@ color_rgba_t waywal_palette_generate_tone(float l_target, float chroma, float hu
     out.b = linear_to_srgb_u8(b);
     out.a = 255;
     return out;
+}
+
+color_rgba_t waywal_palette_generate_tone(float l_target, float chroma, float hue_rad)
+{
+    /* Convert OKLab-scaled chroma (0..0.4) to CAM16 chroma (0..120), or pass CAM16 chroma directly
+     */
+    float c_cam16 = (chroma <= 0.5f) ? (chroma * 320.0f) : chroma;
+    float h_deg = wrap_radians(hue_rad) * RAD_TO_DEG_F;
+    return waywal_hct_to_rgba(h_deg, c_cam16, l_target);
+}
+
+waywal_scheme_variant_t waywal_scheme_variant_from_str(const char *str)
+{
+    if (!str || str[0] == '\0') {
+        return WAYWAL_SCHEME_TONAL_SPOT;
+    }
+    if (strcasecmp(str, "tonal-spot") == 0 || strcasecmp(str, "tonal_spot") == 0 ||
+        strcasecmp(str, "tonalspot") == 0) {
+        return WAYWAL_SCHEME_TONAL_SPOT;
+    }
+    if (strcasecmp(str, "vibrant") == 0) {
+        return WAYWAL_SCHEME_VIBRANT;
+    }
+    if (strcasecmp(str, "expressive") == 0) {
+        return WAYWAL_SCHEME_EXPRESSIVE;
+    }
+    if (strcasecmp(str, "content") == 0) {
+        return WAYWAL_SCHEME_CONTENT;
+    }
+    if (strcasecmp(str, "fidelity") == 0) {
+        return WAYWAL_SCHEME_FIDELITY;
+    }
+    if (strcasecmp(str, "neutral") == 0) {
+        return WAYWAL_SCHEME_NEUTRAL;
+    }
+    if (strcasecmp(str, "monochrome") == 0) {
+        return WAYWAL_SCHEME_MONOCHROME;
+    }
+    if (strcasecmp(str, "rainbow") == 0) {
+        return WAYWAL_SCHEME_RAINBOW;
+    }
+    if (strcasecmp(str, "fruit-salad") == 0 || strcasecmp(str, "fruit_salad") == 0 ||
+        strcasecmp(str, "fruitsalad") == 0) {
+        return WAYWAL_SCHEME_FRUIT_SALAD;
+    }
+    return WAYWAL_SCHEME_TONAL_SPOT;
+}
+
+static const char *scheme_variant_to_caelestia_str(waywal_scheme_variant_t v)
+{
+    switch (v) {
+    case WAYWAL_SCHEME_VIBRANT:
+        return "vibrant";
+    case WAYWAL_SCHEME_EXPRESSIVE:
+        return "expressive";
+    case WAYWAL_SCHEME_CONTENT:
+        return "content";
+    case WAYWAL_SCHEME_FIDELITY:
+        return "fidelity";
+    case WAYWAL_SCHEME_NEUTRAL:
+        return "neutral";
+    case WAYWAL_SCHEME_MONOCHROME:
+        return "monochrome";
+    case WAYWAL_SCHEME_RAINBOW:
+        return "rainbow";
+    case WAYWAL_SCHEME_FRUIT_SALAD:
+        return "fruitsalad";
+    case WAYWAL_SCHEME_TONAL_SPOT:
+    default:
+        return "tonalspot";
+    }
+}
+
+static void apply_scheme_variant_seeds(waywal_scheme_variant_t variant, float src_c_ok,
+                                       waywal_oklch_t *p_seed, waywal_oklch_t *s_seed,
+                                       waywal_oklch_t *t_seed, waywal_oklch_t *n_seed,
+                                       waywal_oklch_t *nv_seed, bool *is_mono)
+{
+    float p_h = p_seed->h_rad;
+    switch (variant) {
+    case WAYWAL_SCHEME_TONAL_SPOT:
+        break;
+    case WAYWAL_SCHEME_VIBRANT:
+        *is_mono = false;
+        p_seed->c = 0.25f;
+        s_seed->c = 0.08f;
+        s_seed->h_rad = wrap_radians(p_h + 18.0f * DEG_TO_RAD_F);
+        t_seed->c = 0.11f;
+        t_seed->h_rad = wrap_radians(p_h + 35.0f * DEG_TO_RAD_F);
+        n_seed->c = 0.032f;
+        nv_seed->c = 0.042f;
+        break;
+    case WAYWAL_SCHEME_EXPRESSIVE:
+        *is_mono = false;
+        p_seed->h_rad = wrap_radians(p_h + 240.0f * DEG_TO_RAD_F);
+        p_seed->c = 0.13f;
+        s_seed->h_rad = wrap_radians(p_h + 45.0f * DEG_TO_RAD_F);
+        s_seed->c = 0.08f;
+        t_seed->h_rad = wrap_radians(p_h + 120.0f * DEG_TO_RAD_F);
+        t_seed->c = 0.11f;
+        n_seed->h_rad = wrap_radians(p_h + 15.0f * DEG_TO_RAD_F);
+        n_seed->c = 0.025f;
+        nv_seed->h_rad = wrap_radians(p_h + 15.0f * DEG_TO_RAD_F);
+        nv_seed->c = 0.04f;
+        break;
+    case WAYWAL_SCHEME_CONTENT:
+        p_seed->c = clamp_f(src_c_ok, 0.04f, 0.26f);
+        s_seed->h_rad = p_h;
+        s_seed->c = clamp_f(src_c_ok * 0.33f, 0.02f, 0.10f);
+        t_seed->h_rad = p_h;
+        t_seed->c = clamp_f(src_c_ok * 0.66f, 0.03f, 0.16f);
+        n_seed->c = clamp_f(src_c_ok * 0.125f, 0.008f, 0.03f);
+        nv_seed->c = clamp_f(src_c_ok * 0.25f, 0.014f, 0.05f);
+        break;
+    case WAYWAL_SCHEME_FIDELITY:
+        p_seed->c = clamp_f(src_c_ok, 0.05f, 0.28f);
+        s_seed->h_rad = p_h;
+        s_seed->c = clamp_f(fmaxf(src_c_ok - 0.10f, src_c_ok * 0.5f), 0.03f, 0.14f);
+        t_seed->h_rad = wrap_radians(p_h + 180.0f * DEG_TO_RAD_F);
+        t_seed->c = clamp_f(src_c_ok * 0.8f, 0.05f, 0.18f);
+        n_seed->c = clamp_f(src_c_ok * 0.125f, 0.01f, 0.035f);
+        nv_seed->c = clamp_f(src_c_ok * 0.25f, 0.018f, 0.055f);
+        break;
+    case WAYWAL_SCHEME_NEUTRAL:
+        p_seed->c = 0.038f;
+        s_seed->h_rad = p_h;
+        s_seed->c = 0.025f;
+        t_seed->h_rad = p_h;
+        t_seed->c = 0.05f;
+        n_seed->c = 0.006f;
+        nv_seed->c = 0.006f;
+        break;
+    case WAYWAL_SCHEME_MONOCHROME:
+        *is_mono = true;
+        p_seed->c = 0.0f;
+        s_seed->c = 0.0f;
+        t_seed->c = 0.0f;
+        n_seed->c = 0.0f;
+        nv_seed->c = 0.0f;
+        break;
+    case WAYWAL_SCHEME_RAINBOW:
+        *is_mono = false;
+        p_seed->c = 0.15f;
+        s_seed->h_rad = p_h;
+        s_seed->c = 0.05f;
+        t_seed->h_rad = wrap_radians(p_h + 60.0f * DEG_TO_RAD_F);
+        t_seed->c = 0.08f;
+        n_seed->c = 0.0f;
+        nv_seed->c = 0.0f;
+        break;
+    case WAYWAL_SCHEME_FRUIT_SALAD:
+        *is_mono = false;
+        p_seed->h_rad = wrap_radians(p_h - 50.0f * DEG_TO_RAD_F);
+        p_seed->c = 0.15f;
+        s_seed->h_rad = wrap_radians(p_h - 50.0f * DEG_TO_RAD_F);
+        s_seed->c = 0.11f;
+        t_seed->h_rad = p_h;
+        t_seed->c = 0.11f;
+        n_seed->h_rad = p_h;
+        n_seed->c = 0.03f;
+        nv_seed->h_rad = p_h;
+        nv_seed->c = 0.05f;
+        break;
+    }
 }
 
 static color_rgba_t harmonize_semantic_color(float base_hue_deg, float base_chroma, float tone,
@@ -926,19 +1235,24 @@ static color_rgba_t harmonize_semantic_color(float base_hue_deg, float base_chro
     return waywal_palette_generate_tone(tone, c, h_rad);
 }
 
-static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode, bool is_mono,
+static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode,
+                                 waywal_scheme_variant_t variant, float contrast, bool is_mono,
                                  waywal_oklch_t p_seed, waywal_oklch_t s_seed,
                                  waywal_oklch_t t_seed, waywal_oklch_t n_seed,
                                  waywal_oklch_t nv_seed)
 {
     memset(pal, 0, sizeof(*pal));
     pal->mode = mode;
+    pal->variant = variant;
+    pal->contrast = clamp_f(contrast, -1.0f, 1.0f);
     pal->is_monochrome = is_mono;
     pal->primary_seed = p_seed;
     pal->secondary_seed = s_seed;
     pal->tertiary_seed = t_seed;
     pal->neutral_seed = n_seed;
     pal->neutral_variant_seed = nv_seed;
+
+    float c_shift = pal->contrast * 12.0f;
 
     pal->primary_paletteKeyColor = waywal_palette_generate_tone(40.0f, p_seed.c, p_seed.h_rad);
     pal->secondary_paletteKeyColor = waywal_palette_generate_tone(40.0f, s_seed.c, s_seed.h_rad);
@@ -969,8 +1283,10 @@ static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode
     pal->onTertiaryFixedVariant = waywal_palette_generate_tone(30.0f, t_seed.c, t_seed.h_rad);
 
     if (mode == WAYWAL_THEME_DARK) {
-        pal->background = waywal_palette_generate_tone(6.0f, n_seed.c, n_seed.h_rad);
-        pal->onBackground = waywal_palette_generate_tone(90.0f, n_seed.c, n_seed.h_rad);
+        pal->background = waywal_palette_generate_tone(clamp_f(6.0f - c_shift * 0.4f, 0.0f, 18.0f),
+                                                       n_seed.c, n_seed.h_rad);
+        pal->onBackground = waywal_palette_generate_tone(
+            clamp_f(90.0f + c_shift * 0.8f, 75.0f, 100.0f), n_seed.c, n_seed.h_rad);
         pal->surface = pal->background;
         pal->surfaceDim = pal->background;
         pal->surfaceBright = waywal_palette_generate_tone(24.0f, n_seed.c, n_seed.h_rad);
@@ -987,9 +1303,11 @@ static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode
         pal->outline = waywal_palette_generate_tone(60.0f, nv_seed.c, nv_seed.h_rad);
         pal->outlineVariant = pal->surfaceVariant;
 
-        pal->primary = pal->primaryFixedDim;
+        pal->primary = waywal_palette_generate_tone(clamp_f(80.0f + c_shift, 65.0f, 95.0f),
+                                                    p_seed.c, p_seed.h_rad);
         pal->surfaceTint = pal->primary;
-        pal->onPrimary = waywal_palette_generate_tone(20.0f, p_seed.c, p_seed.h_rad);
+        pal->onPrimary = waywal_palette_generate_tone(clamp_f(20.0f - c_shift, 5.0f, 35.0f),
+                                                      p_seed.c, p_seed.h_rad);
         pal->primaryContainer = waywal_palette_generate_tone(30.0f, p_seed.c, p_seed.h_rad);
         pal->onPrimaryContainer = pal->primaryFixed;
         pal->inversePrimary = pal->primary_paletteKeyColor;
@@ -1023,7 +1341,8 @@ static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode
         pal->crust = pal->surfaceContainerLowest;
     } else {
         pal->background = waywal_palette_generate_tone(98.0f, n_seed.c, n_seed.h_rad);
-        pal->onBackground = waywal_palette_generate_tone(10.0f, n_seed.c, n_seed.h_rad);
+        pal->onBackground = waywal_palette_generate_tone(
+            clamp_f(10.0f - c_shift * 0.8f, 0.0f, 25.0f), n_seed.c, n_seed.h_rad);
         pal->surface = pal->background;
         pal->surfaceDim = waywal_palette_generate_tone(87.0f, n_seed.c, n_seed.h_rad);
         pal->surfaceBright = pal->background;
@@ -1040,7 +1359,8 @@ static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode
         pal->outline = waywal_palette_generate_tone(50.0f, nv_seed.c, nv_seed.h_rad);
         pal->outlineVariant = waywal_palette_generate_tone(80.0f, nv_seed.c, nv_seed.h_rad);
 
-        pal->primary = pal->primary_paletteKeyColor;
+        pal->primary = waywal_palette_generate_tone(clamp_f(40.0f - c_shift, 15.0f, 55.0f),
+                                                    p_seed.c, p_seed.h_rad);
         pal->surfaceTint = pal->primary;
         pal->onPrimary = waywal_palette_generate_tone(100.0f, p_seed.c, p_seed.h_rad);
         pal->primaryContainer = pal->primaryFixed;
@@ -1140,7 +1460,8 @@ static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode
 }
 
 static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t height,
-                              uint32_t stride_bytes, bool is_bgra, waywal_palette_t *out_dark,
+                              uint32_t stride_bytes, bool is_bgra, waywal_scheme_variant_t variant,
+                              float contrast, waywal_palette_t *out_dark,
                               waywal_palette_t *out_light)
 {
     if (!pixels || width == 0U || height == 0U || (!out_dark && !out_light)) {
@@ -1161,12 +1482,12 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
         waywal_oklch_t def_n = {.l = 0.6f, .c = 0.01f, .h_rad = 4.5f};
         waywal_oklch_t def_nv = {.l = 0.6f, .c = 0.02f, .h_rad = 4.5f};
         if (out_dark) {
-            synthesize_m3_scheme(out_dark, WAYWAL_THEME_DARK, true, def_p, def_s, def_t, def_n,
-                                 def_nv);
+            synthesize_m3_scheme(out_dark, WAYWAL_THEME_DARK, variant, contrast, true, def_p, def_s,
+                                 def_t, def_n, def_nv);
         }
         if (out_light) {
-            synthesize_m3_scheme(out_light, WAYWAL_THEME_LIGHT, true, def_p, def_s, def_t, def_n,
-                                 def_nv);
+            synthesize_m3_scheme(out_light, WAYWAL_THEME_LIGHT, variant, contrast, true, def_p,
+                                 def_s, def_t, def_n, def_nv);
         }
         return true;
     }
@@ -1331,13 +1652,17 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
         nv_seed = (waywal_oklch_t){.l = 0.5f, .c = 0.036f, .h_rad = p_h};
     }
 
+    float src_c_ok = (n_clusters > 0) ? cands[0].c_ok : 0.0f;
+    apply_scheme_variant_seeds(variant, src_c_ok, &p_seed, &s_seed, &t_seed, &n_seed, &nv_seed,
+                               &is_mono);
+
     if (out_dark) {
-        synthesize_m3_scheme(out_dark, WAYWAL_THEME_DARK, is_mono, p_seed, s_seed, t_seed, n_seed,
-                             nv_seed);
+        synthesize_m3_scheme(out_dark, WAYWAL_THEME_DARK, variant, contrast, is_mono, p_seed,
+                             s_seed, t_seed, n_seed, nv_seed);
     }
     if (out_light) {
-        synthesize_m3_scheme(out_light, WAYWAL_THEME_LIGHT, is_mono, p_seed, s_seed, t_seed, n_seed,
-                             nv_seed);
+        synthesize_m3_scheme(out_light, WAYWAL_THEME_LIGHT, variant, contrast, is_mono, p_seed,
+                             s_seed, t_seed, n_seed, nv_seed);
     }
     return true;
 }
@@ -1346,41 +1671,48 @@ bool waywal_palette_extract_dual(const uint8_t *rgba_pixels, uint32_t width, uin
                                  uint32_t stride_bytes, waywal_palette_t *out_dark,
                                  waywal_palette_t *out_light)
 {
-    return extract_dual_impl(rgba_pixels, width, height, stride_bytes, false, out_dark, out_light);
+    return extract_dual_impl(rgba_pixels, width, height, stride_bytes, false,
+                             WAYWAL_SCHEME_TONAL_SPOT, 0.0f, out_dark, out_light);
 }
 
 bool waywal_palette_extract_dual_bgra(const uint8_t *bgra_pixels, uint32_t width, uint32_t height,
                                       uint32_t stride_bytes, waywal_palette_t *out_dark,
                                       waywal_palette_t *out_light)
 {
-    return extract_dual_impl(bgra_pixels, width, height, stride_bytes, true, out_dark, out_light);
+    return extract_dual_impl(bgra_pixels, width, height, stride_bytes, true,
+                             WAYWAL_SCHEME_TONAL_SPOT, 0.0f, out_dark, out_light);
+}
+
+bool waywal_palette_extract_ex(const uint8_t *pixels, uint32_t width, uint32_t height,
+                               uint32_t stride_bytes, bool is_bgra, waywal_theme_mode_t mode,
+                               waywal_scheme_variant_t variant, float contrast,
+                               waywal_palette_t *out_palette)
+{
+    if (!out_palette) {
+        return false;
+    }
+    if (mode == WAYWAL_THEME_LIGHT) {
+        return extract_dual_impl(pixels, width, height, stride_bytes, is_bgra, variant, contrast,
+                                 NULL, out_palette);
+    }
+    return extract_dual_impl(pixels, width, height, stride_bytes, is_bgra, variant, contrast,
+                             out_palette, NULL);
 }
 
 bool waywal_palette_extract(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
                             uint32_t stride_bytes, waywal_theme_mode_t mode,
                             waywal_palette_t *out_palette)
 {
-    if (!out_palette) {
-        return false;
-    }
-    if (mode == WAYWAL_THEME_LIGHT) {
-        return extract_dual_impl(rgba_pixels, width, height, stride_bytes, false, NULL,
-                                 out_palette);
-    }
-    return extract_dual_impl(rgba_pixels, width, height, stride_bytes, false, out_palette, NULL);
+    return waywal_palette_extract_ex(rgba_pixels, width, height, stride_bytes, false, mode,
+                                     WAYWAL_SCHEME_TONAL_SPOT, 0.0f, out_palette);
 }
 
 bool waywal_palette_extract_bgra(const uint8_t *bgra_pixels, uint32_t width, uint32_t height,
                                  uint32_t stride_bytes, waywal_theme_mode_t mode,
                                  waywal_palette_t *out_palette)
 {
-    if (!out_palette) {
-        return false;
-    }
-    if (mode == WAYWAL_THEME_LIGHT) {
-        return extract_dual_impl(bgra_pixels, width, height, stride_bytes, true, NULL, out_palette);
-    }
-    return extract_dual_impl(bgra_pixels, width, height, stride_bytes, true, out_palette, NULL);
+    return waywal_palette_extract_ex(bgra_pixels, width, height, stride_bytes, true, mode,
+                                     WAYWAL_SCHEME_TONAL_SPOT, 0.0f, out_palette);
 }
 
 typedef struct {
@@ -1635,10 +1967,11 @@ static size_t format_caelestia_json(const waywal_palette_t *pal, const named_col
                                     size_t n_slots, char *buf, size_t cap)
 {
     const char *mode_str = (pal->mode == WAYWAL_THEME_LIGHT) ? "light" : "dark";
+    const char *variant_str = scheme_variant_to_caelestia_str(pal->variant);
     int n = snprintf(buf, cap,
                      "{\"name\": \"dynamic\", \"flavour\": \"default\", \"mode\": \"%s\", "
-                     "\"variant\": \"tonalspot\", \"colours\": {",
-                     mode_str);
+                     "\"variant\": \"%s\", \"colours\": {",
+                     mode_str, variant_str);
     if (n < 0 || (size_t)n >= cap)
         return 0;
     size_t pos = (size_t)n;
@@ -1939,13 +2272,20 @@ bool waywal_palette_run_hook(const char *cmd)
         return false;
     }
 
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    }
+
     pid_t pid = 0;
     char *const argv[] = {(char *)"sh", (char *)"-c", (char *)cmd, NULL};
     int rc = posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ);
+
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    }
     return (rc == 0);
 }
 
-bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override_base_dir)
+bool waywal_palette_export_filtered(const waywal_palette_t *pal, const char *override_base_dir,
+                                    bool caelestia_sync, bool export_css, bool export_hyprland)
 {
     if (!pal) {
         return false;
@@ -1985,25 +2325,31 @@ bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override
         path_buf_push(&cache_dir, "wwal");
 
         path_buf_t flat;
-        path_buf_from_str(&flat, override_base_dir);
-        path_buf_push(&flat, "scheme.json");
-        atomic_write_file(flat.data, scheme_json, scheme_len);
+        if (caelestia_sync) {
+            path_buf_from_str(&flat, override_base_dir);
+            path_buf_push(&flat, "scheme.json");
+            atomic_write_file(flat.data, scheme_json, scheme_len);
 
-        path_buf_from_str(&flat, override_base_dir);
-        path_buf_push(&flat, "sequences.txt");
-        atomic_write_file(flat.data, seq_txt, seq_len);
+            path_buf_from_str(&flat, override_base_dir);
+            path_buf_push(&flat, "sequences.txt");
+            atomic_write_file(flat.data, seq_txt, seq_len);
+        }
 
         path_buf_from_str(&flat, override_base_dir);
         path_buf_push(&flat, "colors.json");
         atomic_write_file(flat.data, colors_json, cjson_len);
 
-        path_buf_from_str(&flat, override_base_dir);
-        path_buf_push(&flat, "colors.css");
-        atomic_write_file(flat.data, colors_css, ccss_len);
+        if (export_css) {
+            path_buf_from_str(&flat, override_base_dir);
+            path_buf_push(&flat, "colors.css");
+            atomic_write_file(flat.data, colors_css, ccss_len);
+        }
 
-        path_buf_from_str(&flat, override_base_dir);
-        path_buf_push(&flat, "colors-hyprland.conf");
-        atomic_write_file(flat.data, colors_hypr, chypr_len);
+        if (export_hyprland) {
+            path_buf_from_str(&flat, override_base_dir);
+            path_buf_push(&flat, "colors-hyprland.conf");
+            atomic_write_file(flat.data, colors_hypr, chypr_len);
+        }
     } else {
         const char *home = getenv("HOME");
         if (env_state && env_state[0] != '\0') {
@@ -2039,16 +2385,18 @@ bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override
 
     path_buf_t target;
 
-    target = state_dir;
-    if (!path_buf_push(&target, "scheme.json") ||
-        !atomic_write_file(target.data, scheme_json, scheme_len)) {
-        return false;
-    }
+    if (caelestia_sync) {
+        target = state_dir;
+        if (!path_buf_push(&target, "scheme.json") ||
+            !atomic_write_file(target.data, scheme_json, scheme_len)) {
+            return false;
+        }
 
-    target = state_dir;
-    if (!path_buf_push(&target, "sequences.txt") ||
-        !atomic_write_file(target.data, seq_txt, seq_len)) {
-        return false;
+        target = state_dir;
+        if (!path_buf_push(&target, "sequences.txt") ||
+            !atomic_write_file(target.data, seq_txt, seq_len)) {
+            return false;
+        }
     }
 
     target = cache_dir;
@@ -2057,16 +2405,20 @@ bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override
         return false;
     }
 
-    target = cache_dir;
-    if (!path_buf_push(&target, "colors.css") ||
-        !atomic_write_file(target.data, colors_css, ccss_len)) {
-        return false;
+    if (export_css) {
+        target = cache_dir;
+        if (!path_buf_push(&target, "colors.css") ||
+            !atomic_write_file(target.data, colors_css, ccss_len)) {
+            return false;
+        }
     }
 
-    target = cache_dir;
-    if (!path_buf_push(&target, "colors-hyprland.conf") ||
-        !atomic_write_file(target.data, colors_hypr, chypr_len)) {
-        return false;
+    if (export_hyprland) {
+        target = cache_dir;
+        if (!path_buf_push(&target, "colors-hyprland.conf") ||
+            !atomic_write_file(target.data, colors_hypr, chypr_len)) {
+            return false;
+        }
     }
 
     if (override_base_dir && override_base_dir[0] != '\0') {
@@ -2081,6 +2433,11 @@ bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override
     }
 
     return true;
+}
+
+bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override_base_dir)
+{
+    return waywal_palette_export_filtered(pal, override_base_dir, true, true, true);
 }
 
 static bool is_numeric_name(const char *s)

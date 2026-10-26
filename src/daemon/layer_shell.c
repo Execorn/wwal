@@ -8,6 +8,7 @@
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
 #include "waywal/os_compat.h"
+#include "waywal/shader_engine.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -218,6 +219,36 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
     .closed = layer_surface_closed,
 };
 
+void layer_shell_update_input_regions(daemon_state_t *state, bool interactive)
+{
+    if (!state || !state->compositor)
+        return;
+
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (!out->surface)
+            continue;
+        if (out->layer_surface) {
+            zwlr_layer_surface_v1_set_keyboard_interactivity(
+                out->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+        }
+        struct wl_region *region = wl_compositor_create_region(state->compositor);
+        if (region) {
+            if (interactive) {
+                wl_region_add(region, 0, 0, INT32_MAX, INT32_MAX);
+            }
+            wl_surface_set_input_region(out->surface, region);
+            wl_region_destroy(region);
+        }
+        if (out->configured) {
+            wl_surface_commit(out->surface);
+        }
+    }
+
+    if (state->display) {
+        wl_display_flush(state->display);
+    }
+}
+
 void output_node_create_surface(daemon_state_t *state, output_node_t *node)
 {
     if (!state || !node || node->surface)
@@ -253,10 +284,16 @@ void output_node_create_surface(daemon_state_t *state, output_node_t *node)
         node->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
     zwlr_layer_surface_v1_set_size(node->layer_surface, 0, 0);
 
-    /* Input passthrough: set empty input region */
-    struct wl_region *empty_region = wl_compositor_create_region(state->compositor);
-    wl_surface_set_input_region(node->surface, empty_region);
-    wl_region_destroy(empty_region);
+    /* Dynamic input region: full-surface when interactive shader/depth-map active, empty otherwise
+     */
+    struct wl_region *input_region = wl_compositor_create_region(state->compositor);
+    if (input_region) {
+        if (state->shader_active) {
+            wl_region_add(input_region, 0, 0, INT32_MAX, INT32_MAX);
+        }
+        wl_surface_set_input_region(node->surface, input_region);
+        wl_region_destroy(input_region);
+    }
 
     struct wl_region *opaque_region = wl_compositor_create_region(state->compositor);
     if (opaque_region) {
@@ -448,22 +485,34 @@ static void teardown_output_dmabuf(daemon_state_t *state, output_node_t *node)
         return;
     if (node->use_dmabuf) {
         for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+            if (state->shader_eng) {
+                waywal_shader_engine_forget_bo(state->shader_eng, &node->dmabuf_ring.buffers[i]);
+            }
             render_engine_release_bo(&state->render_engine, &node->dmabuf_ring.buffers[i]);
         }
         dmabuf_ring_destroy(&state->dmabuf_ctx, &node->dmabuf_ring);
         node->use_dmabuf = false;
     }
     if (node->has_source_old_bo) {
+        if (state->shader_eng) {
+            waywal_shader_engine_forget_bo(state->shader_eng, &node->source_old_bo);
+        }
         render_engine_release_bo(&state->render_engine, &node->source_old_bo);
         dmabuf_bo_free(&node->source_old_bo);
         node->has_source_old_bo = false;
     }
     if (node->has_source_new_bo) {
+        if (state->shader_eng) {
+            waywal_shader_engine_forget_bo(state->shader_eng, &node->source_new_bo);
+        }
         render_engine_release_bo(&state->render_engine, &node->source_new_bo);
         dmabuf_bo_free(&node->source_new_bo);
         node->has_source_new_bo = false;
     }
     if (node->has_backdrop_bo) {
+        if (state->shader_eng) {
+            waywal_shader_engine_forget_bo(state->shader_eng, &node->backdrop_bo);
+        }
         render_engine_release_bo(&state->render_engine, &node->backdrop_bo);
         dmabuf_bo_free(&node->backdrop_bo);
         node->has_backdrop_bo = false;
@@ -1054,10 +1103,85 @@ static void scale_bilinear_rect(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
     free(fx4_tbl);
 }
 
-static void copy_or_scale_image(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
-                                size_t dst_stride_bytes, const uint32_t *src, uint32_t src_w,
-                                uint32_t src_h, uint32_t scaling_mode, uint32_t filter_mode,
-                                color_rgba_t bg_color)
+static void compute_output_span_bounds(const daemon_state_t *state, output_node_t *target)
+{
+    if (!target)
+        return;
+
+    int32_t t_lw = target->logical_width > 0 ? (int32_t)target->logical_width : target->width;
+    int32_t t_lh = target->logical_height > 0 ? (int32_t)target->logical_height : target->height;
+    if (t_lw <= 0)
+        t_lw = 1;
+    if (t_lh <= 0)
+        t_lh = 1;
+
+    if (!state || !state->outputs) {
+        target->span_off_x = 0;
+        target->span_off_y = 0;
+        target->span_total_w = target->width;
+        target->span_total_h = target->height;
+        return;
+    }
+
+    bool any_global_pos = false;
+    for (const output_node_t *o = state->outputs; o != NULL; o = o->next) {
+        if (o->global_x != 0 || o->global_y != 0) {
+            any_global_pos = true;
+            break;
+        }
+    }
+
+    int32_t min_x = INT32_MAX;
+    int32_t min_y = INT32_MAX;
+    int32_t max_x = INT32_MIN;
+    int32_t max_y = INT32_MIN;
+    int32_t accum_x = 0;
+    int32_t target_ox = target->global_x;
+    int32_t target_oy = target->global_y;
+
+    for (const output_node_t *o = state->outputs; o != NULL; o = o->next) {
+        int32_t lw = o->logical_width > 0 ? (int32_t)o->logical_width : o->width;
+        int32_t lh = o->logical_height > 0 ? (int32_t)o->logical_height : o->height;
+        if (lw <= 0 || lh <= 0)
+            continue;
+        int32_t ox = any_global_pos ? o->global_x : accum_x;
+        int32_t oy = any_global_pos ? o->global_y : 0;
+        if (o == target) {
+            target_ox = ox;
+            target_oy = oy;
+        }
+        if (ox < min_x)
+            min_x = ox;
+        if (oy < min_y)
+            min_y = oy;
+        if (ox + lw > max_x)
+            max_x = ox + lw;
+        if (oy + lh > max_y)
+            max_y = oy + lh;
+        accum_x += lw;
+    }
+
+    if (min_x >= max_x || min_y >= max_y) {
+        target->span_off_x = 0;
+        target->span_off_y = 0;
+        target->span_total_w = target->width;
+        target->span_total_h = target->height;
+        return;
+    }
+
+    double sx = (double)target->width / (double)t_lw;
+    double sy = (double)target->height / (double)t_lh;
+    target->span_off_x = (int32_t)((double)(target_ox - min_x) * sx + 0.5);
+    target->span_off_y = (int32_t)((double)(target_oy - min_y) * sy + 0.5);
+    target->span_total_w = (int32_t)((double)(max_x - min_x) * sx + 0.5);
+    target->span_total_h = (int32_t)((double)(max_y - min_y) * sy + 0.5);
+}
+
+void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
+                                 size_t dst_stride_bytes, const uint32_t *src, uint32_t src_w,
+                                 uint32_t src_h, int32_t span_off_x, int32_t span_off_y,
+                                 int32_t span_total_w, int32_t span_total_h, uint32_t filter_mode,
+                                 color_rgba_t bg_color)
 {
     if (!dst || !src || dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0)
         return;
@@ -1065,7 +1189,46 @@ static void copy_or_scale_image(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
     uint32_t bg_packed = ((uint32_t)bg_color.a << 24) | ((uint32_t)bg_color.r << 16) |
                          ((uint32_t)bg_color.g << 8) | (uint32_t)bg_color.b;
 
-    if (dst_w == src_w && dst_h == src_h && scaling_mode != WAYWAL_SCALING_TILE) {
+    double tot_w = (span_total_w > 0) ? (double)span_total_w : (double)dst_w;
+    double tot_h = (span_total_h > 0) ? (double)span_total_h : (double)dst_h;
+    double r_src = (double)src_w / (double)src_h;
+    double r_dst = tot_w / tot_h;
+    double crop_w, crop_h, off_x, off_y;
+
+    if (r_src > r_dst) {
+        crop_h = (double)src_h;
+        crop_w = crop_h * r_dst;
+        off_x = ((double)src_w - crop_w) * 0.5;
+        off_y = 0.0;
+    } else {
+        crop_w = (double)src_w;
+        crop_h = crop_w / r_dst;
+        off_x = 0.0;
+        off_y = ((double)src_h - crop_h) * 0.5;
+    }
+
+    double sub_off_x = off_x + ((double)span_off_x / tot_w) * crop_w;
+    double sub_off_y = off_y + ((double)span_off_y / tot_h) * crop_h;
+    double sub_crop_w = ((double)dst_w / tot_w) * crop_w;
+    double sub_crop_h = ((double)dst_h / tot_h) * crop_h;
+
+    scale_bilinear_rect(dst, dst_w, dst_h, dst_stride_bytes, src, src_w, src_h, 0, 0, dst_w, dst_h,
+                        sub_off_x, sub_off_y, sub_crop_w, sub_crop_h, bg_packed, filter_mode);
+}
+
+static void copy_or_scale_image_ex(const output_node_t *node, uint32_t *dst, uint32_t dst_w,
+                                   uint32_t dst_h, size_t dst_stride_bytes, const uint32_t *src,
+                                   uint32_t src_w, uint32_t src_h, uint32_t scaling_mode,
+                                   uint32_t filter_mode, color_rgba_t bg_color)
+{
+    if (!dst || !src || dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0)
+        return;
+
+    uint32_t bg_packed = ((uint32_t)bg_color.a << 24) | ((uint32_t)bg_color.r << 16) |
+                         ((uint32_t)bg_color.g << 8) | (uint32_t)bg_color.b;
+
+    if (dst_w == src_w && dst_h == src_h && scaling_mode != WAYWAL_SCALING_TILE &&
+        scaling_mode != WAYWAL_SCALING_SPAN) {
         for (uint32_t y = 0; y < dst_h; ++y) {
             uint32_t *dst_row = (uint32_t *)((uint8_t *)dst + (size_t)y * dst_stride_bytes);
             memcpy(dst_row, src + (size_t)y * src_w, (size_t)src_w * sizeof(uint32_t));
@@ -1162,6 +1325,16 @@ static void copy_or_scale_image(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
         }
         break;
     }
+
+    case WAYWAL_SCALING_SPAN: {
+        int32_t off_x = node ? node->span_off_x : 0;
+        int32_t off_y = node ? node->span_off_y : 0;
+        int32_t tot_w = (node && node->span_total_w > 0) ? node->span_total_w : (int32_t)dst_w;
+        int32_t tot_h = (node && node->span_total_h > 0) ? node->span_total_h : (int32_t)dst_h;
+        waywal_scale_image_span_cpu(dst, dst_w, dst_h, dst_stride_bytes, src, src_w, src_h, off_x,
+                                    off_y, tot_w, tot_h, filter_mode, bg_color);
+        break;
+    }
     }
 }
 
@@ -1214,6 +1387,10 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
     if (node->width <= 0 || node->height <= 0 || img_w == 0 || img_h == 0)
         return;
 
+    compute_output_span_bounds(state, node);
+    render_engine_set_span_bounds(&state->render_engine, node->span_off_x, node->span_off_y,
+                                  node->span_total_w, node->span_total_h);
+
     const uint32_t *src = (const uint32_t *)src_pixels;
     color_rgba_t fill_col = get_output_fill_color(state, node);
     uint32_t clear_color = pack_color_argb(fill_col);
@@ -1248,9 +1425,9 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                     gbm_bo_map(bo->gbm_bo, 0, 0, (uint32_t)node->width, (uint32_t)node->height,
                                GBM_BO_TRANSFER_WRITE, &stride, &map_data);
                 if (map && map != MAP_FAILED) {
-                    copy_or_scale_image((uint32_t *)map, (uint32_t)node->width,
-                                        (uint32_t)node->height, stride, src, img_w, img_h,
-                                        node->scaling_mode, node->filter_mode, fill_col);
+                    copy_or_scale_image_ex(node, (uint32_t *)map, (uint32_t)node->width,
+                                           (uint32_t)node->height, stride, src, img_w, img_h,
+                                           node->scaling_mode, node->filter_mode, fill_col);
                     gbm_bo_unmap(bo->gbm_bo, map_data);
                     uploaded = true;
                 }
@@ -1295,9 +1472,9 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
         int back_idx = 1 - node->active_buffer_idx;
         size_t frame_sz = (size_t)node->width * (size_t)node->height * sizeof(uint32_t);
         void *back_ptr = (uint8_t *)node->shm_data + back_idx * frame_sz;
-        copy_or_scale_image((uint32_t *)back_ptr, (uint32_t)node->width, (uint32_t)node->height,
-                            (size_t)node->width * sizeof(uint32_t), src, img_w, img_h,
-                            node->scaling_mode, node->filter_mode, fill_col);
+        copy_or_scale_image_ex(node, (uint32_t *)back_ptr, (uint32_t)node->width,
+                               (uint32_t)node->height, (size_t)node->width * sizeof(uint32_t), src,
+                               img_w, img_h, node->scaling_mode, node->filter_mode, fill_col);
         wl_surface_attach(node->surface, node->shm_buffers[back_idx], 0, 0);
         wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
         node->shm_buffer_released[back_idx] = false;
@@ -1438,7 +1615,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
     state->transitions_in_progress = false;
 
     if (!meta || meta->transition_type == WAYWAL_TRANSITION_NONE ||
-        meta->transition_type == WAYWAL_TRANSITION_SIMPLE || meta->transition_duration_ms == 0) {
+        meta->transition_duration_ms == 0) {
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
             if (!is_target_output(out, meta))
                 continue;
@@ -1459,6 +1636,11 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
             output_node_render_image(state, out, pixels, img_w, img_h);
         }
         return true;
+    }
+
+    uint32_t resolved_type = meta->transition_type;
+    if (resolved_type == WAYWAL_TRANSITION_RANDOM) {
+        resolved_type = 1u + ((uint32_t)rand() % 19u);
     }
 
     uint32_t fps = meta->transition_fps > 0 ? meta->transition_fps : 60;
@@ -1493,6 +1675,10 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         out->ten_bit = meta ? meta->ten_bit : false;
         color_rgba_t fill_col = get_output_fill_color(state, out);
         uint32_t clear_color = pack_color_argb(fill_col);
+
+        compute_output_span_bounds(state, out);
+        render_engine_set_span_bounds(&state->render_engine, out->span_off_x, out->span_off_y,
+                                      out->span_total_w, out->span_total_h);
 
         if (out->viewport) {
             int32_t dst_w = out->logical_width > 0 ? (int32_t)out->logical_width : out->width;
@@ -1542,9 +1728,9 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                                                (uint32_t)out->width, (uint32_t)out->height,
                                                GBM_BO_TRANSFER_WRITE, &stride_new, &map_data_new);
                     if (map_new && map_new != MAP_FAILED) {
-                        copy_or_scale_image((uint32_t *)map_new, (uint32_t)out->width,
-                                            (uint32_t)out->height, stride_new, src, img_w, img_h,
-                                            out->scaling_mode, out->filter_mode, fill_col);
+                        copy_or_scale_image_ex(out, (uint32_t *)map_new, (uint32_t)out->width,
+                                               (uint32_t)out->height, stride_new, src, img_w, img_h,
+                                               out->scaling_mode, out->filter_mode, fill_col);
                         gbm_bo_unmap(out->source_new_bo.gbm_bo, map_data_new);
                         new_uploaded = true;
                     }
@@ -1619,9 +1805,10 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                     old_u32[p] = clear_color;
                 }
             }
-            copy_or_scale_image((uint32_t *)out->shm_new_data, (uint32_t)out->width,
-                                (uint32_t)out->height, (size_t)out->width * sizeof(uint32_t), src,
-                                img_w, img_h, out->scaling_mode, out->filter_mode, fill_col);
+            copy_or_scale_image_ex(out, (uint32_t *)out->shm_new_data, (uint32_t)out->width,
+                                   (uint32_t)out->height, (size_t)out->width * sizeof(uint32_t),
+                                   src, img_w, img_h, out->scaling_mode, out->filter_mode,
+                                   fill_col);
         }
 
         float cx = 0.5f;
@@ -1641,8 +1828,8 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
             cy = meta->transition_center_y;
         }
 
-        float wfreq = meta->transition_wave_freq > 0.0f ? meta->transition_wave_freq : 20.0f;
-        float wamp = meta->transition_wave_amp > 0.0f ? meta->transition_wave_amp : 0.05f;
+        float wfreq = meta->transition_wave_freq;
+        float wamp = meta->transition_wave_amp;
 
         bezier_curve_t bz = BEZIER_DEFAULT;
         if (meta &&
@@ -1652,7 +1839,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         }
 
         out->transition_params = (waywal_transition_params_t){
-            .type = (waywal_transition_type_t)meta->transition_type,
+            .type = (waywal_transition_type_t)resolved_type,
             .progress = 0.0f,
             .angle_rad = meta->transition_angle_rad,
             .wave_freq = wfreq,
@@ -1683,8 +1870,8 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         timerfd_settime(state->transition_timer_fd, 0, &its, NULL);
     }
     state->transitions_in_progress = true;
-    WAYWAL_LOG_INFO("Transition started: type=%u, duration=%ums, frames=%u, fps=%u",
-                    meta->transition_type, meta->transition_duration_ms, num_frames, fps);
+    WAYWAL_LOG_INFO("Transition started: type=%u, duration=%ums, frames=%u, fps=%u", resolved_type,
+                    meta->transition_duration_ms, num_frames, fps);
     return true;
 }
 
@@ -1714,7 +1901,9 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
         float t = (float)out->transition_current_frame / (float)out->transition_total_frames;
         if (t > 1.0f)
             t = 1.0f;
-        out->transition_params.progress = bezier_eval(&out->transition_params.bezier, t);
+        out->transition_params.progress = (out->transition_params.type == WAYWAL_TRANSITION_SIMPLE)
+                                              ? t
+                                              : bezier_eval(&out->transition_params.bezier, t);
 
         if (out->use_dmabuf) {
             if ((int32_t)out->dmabuf_ring.width != out->width ||

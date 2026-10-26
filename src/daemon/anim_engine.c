@@ -90,6 +90,8 @@ struct waywal_anim_decoder {
 
     uint8_t *canvas;
     uint8_t *prev_canvas;
+    uint8_t *scratch_buf;
+    size_t scratch_cap;
 
     uint8_t prev_disposal;
     uint32_t prev_rect_x;
@@ -598,6 +600,20 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
     return dec->canvas != NULL && dec->prev_canvas != NULL;
 }
 
+static uint8_t *ensure_scratch_buf(waywal_anim_decoder_t *dec, size_t needed)
+{
+    if (!dec || needed == 0)
+        return NULL;
+    if (dec->scratch_buf && dec->scratch_cap >= needed)
+        return dec->scratch_buf;
+    uint8_t *nb = (uint8_t *)realloc(dec->scratch_buf, needed);
+    if (!nb)
+        return NULL;
+    dec->scratch_buf = nb;
+    dec->scratch_cap = needed;
+    return dec->scratch_buf;
+}
+
 static bool step_gif_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba, uint32_t *out_w,
                            uint32_t *out_h, uint32_t *out_delay_ms)
 {
@@ -613,13 +629,12 @@ static bool step_gif_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba,
     }
 
     size_t num_pixels = (size_t)f->width * f->height;
-    uint8_t *indices = (uint8_t *)malloc(num_pixels);
+    uint8_t *indices = ensure_scratch_buf(dec, num_pixels);
     if (!indices) {
         return false;
     }
 
     if (!decode_gif_lzw(dec->raw_data, dec->raw_size, f->lzw_offset, indices, num_pixels)) {
-        free(indices);
         return false;
     }
 
@@ -662,8 +677,6 @@ static bool step_gif_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba,
             }
         }
     }
-
-    free(indices);
 
     /* GIF disposal 2 clears to background/transparent; map 2->1 and 3->3 in shared state. */
     dec->prev_disposal = (f->disposal == 2) ? 1 : (f->disposal == 3 ? 3 : 0);
@@ -1136,13 +1149,12 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
         ckd_mul(&raw_len, stride_plus_1, (size_t)f->height)) {
         return false;
     }
-    uint8_t *raw_scan = (uint8_t *)malloc(raw_len);
+    uint8_t *raw_scan = ensure_scratch_buf(dec, raw_len);
     if (!raw_scan) {
         return false;
     }
 
     if (!zlib_inflate_buf(f->zdata, f->zsize, raw_scan, raw_len)) {
-        free(raw_scan);
         return false;
     }
 
@@ -1173,7 +1185,6 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
                 cur[i] = (uint8_t)(cur[i] + paeth_predictor(a, b, c));
                 break;
             default:
-                free(raw_scan);
                 return false;
             }
         }
@@ -1229,19 +1240,25 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
                 uint32_t dg = dec->canvas[dst_off + 1];
                 uint32_t db = dec->canvas[dst_off + 2];
                 uint32_t da = dec->canvas[dst_off + 3];
-                uint32_t u = (255u - sa) * da;
-                uint32_t out_a = sa * 255u + u;
-                if (out_a > 0) {
-                    dec->canvas[dst_off + 0] = (uint8_t)((sr * sa * 255u + dr * u) / out_a);
-                    dec->canvas[dst_off + 1] = (uint8_t)((sg * sa * 255u + dg * u) / out_a);
-                    dec->canvas[dst_off + 2] = (uint8_t)((sb * sa * 255u + db * u) / out_a);
-                    dec->canvas[dst_off + 3] = (uint8_t)(out_a / 255u);
+                if (da == 255u) {
+                    uint32_t inv_sa = 255u - sa;
+                    dec->canvas[dst_off + 0] = (uint8_t)((sr * sa + dr * inv_sa + 127u) / 255u);
+                    dec->canvas[dst_off + 1] = (uint8_t)((sg * sa + dg * inv_sa + 127u) / 255u);
+                    dec->canvas[dst_off + 2] = (uint8_t)((sb * sa + db * inv_sa + 127u) / 255u);
+                    dec->canvas[dst_off + 3] = 255u;
+                } else {
+                    uint32_t u = (255u - sa) * da;
+                    uint32_t out_a = sa * 255u + u;
+                    if (out_a > 0) {
+                        dec->canvas[dst_off + 0] = (uint8_t)((sr * sa * 255u + dr * u) / out_a);
+                        dec->canvas[dst_off + 1] = (uint8_t)((sg * sa * 255u + dg * u) / out_a);
+                        dec->canvas[dst_off + 2] = (uint8_t)((sb * sa * 255u + db * u) / out_a);
+                        dec->canvas[dst_off + 3] = (uint8_t)(out_a / 255u);
+                    }
                 }
             }
         }
     }
-
-    free(raw_scan);
 
     dec->prev_disposal = (f->dispose_op == 1) ? 1 : (f->dispose_op == 2 ? 3 : 0);
     dec->prev_rect_x = f->x_offset;
@@ -1489,6 +1506,7 @@ void waywal_anim_destroy(waywal_anim_decoder_t *dec)
         free(dec->apng_frames);
     }
     free(dec->gif_frames);
+    free(dec->scratch_buf);
     free(dec->canvas);
     free(dec->prev_canvas);
     free(dec->raw_data);

@@ -2,6 +2,7 @@
 #ifndef WAYWAL_WAYLAND_CORE_H
 #define WAYWAL_WAYLAND_CORE_H
 
+#include "cursor-shape-v1-client-protocol.h"
 #include "ext-foreign-toplevel-list-v1-client-protocol.h"
 #include "ext-idle-notify-v1-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
@@ -12,12 +13,15 @@
 #include "waywal/arena.h"
 #include "waywal/dmabuf.h"
 #include "waywal/ipc_proto.h"
+#include "waywal/palette_hct.h"
 #include "waywal/presentation.h"
 #include "waywal/render_engine.h"
 #include "waywal/types.h"
 #include "waywal/uring_loop.h"
 #include "waywal/video_engine.h"
+#include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#include "xdg-output-unstable-v1-client-protocol.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -57,6 +61,20 @@ typedef struct daemon_state {
     struct ext_idle_notifier_v1 *idle_notifier;
     struct ext_idle_notification_v1 *idle_notification;
     struct ext_foreign_toplevel_list_v1 *foreign_toplevel_list;
+    struct zxdg_output_manager_v1 *xdg_output_mgr;
+    struct wp_cursor_shape_manager_v1 *cursor_shape_mgr;
+    union {
+        struct wp_cursor_shape_device_v1 *cursor_shape_dev;
+        struct wp_cursor_shape_device_v1 *cursor_shape_device;
+    };
+    struct zwlr_foreign_toplevel_manager_v1 *wlr_foreign_toplevel_mgr;
+    void *wlr_toplevels;
+
+    int cursor_ipc_fd;
+    uint64_t last_cursor_ipc_ns;
+    double cached_ipc_cursor_x;
+    double cached_ipc_cursor_y;
+    bool has_cached_ipc_cursor;
 
     /* Hardware Direct Scanout context */
     dmabuf_context_t dmabuf_ctx;
@@ -81,6 +99,20 @@ typedef struct daemon_state {
     uint64_t shader_last_ns;
     char shader_target_output[64];
     char shader_path[4096];
+    char shader_depth_map_path[256];
+    uint8_t *wallpaper_rgba;
+    uint32_t wallpaper_w;
+    uint32_t wallpaper_h;
+    float smooth_mouse_x;
+    float smooth_mouse_y;
+    float mouse_vel_x;
+    float mouse_vel_y;
+    float smooth_workspace_x;
+    float smooth_workspace_y;
+    float workspace_vel_x;
+    float workspace_vel_y;
+    float workspace_target_x;
+    float workspace_target_y;
 
     struct waywal_anim_decoder *anim_dec;
     int anim_timer_fd;
@@ -92,8 +124,12 @@ typedef struct daemon_state {
 
     uint32_t idle_timeout_sec;
     waywal_config_t config;
+    waywal_palette_t active_palette;
+    bool has_active_palette;
     void (*on_output_configured)(struct daemon_state *state, output_node_t *out);
     void (*on_power_state_changed)(struct daemon_state *state);
+    void (*on_wallpaper_loaded)(struct daemon_state *state, const uint8_t *bgra_pixels, uint32_t w,
+                                uint32_t h, const waywal_img_metadata_t *meta);
 
     /* Modern Linux io_uring asynchronous event loop */
     uring_loop_t *uring_loop;
@@ -141,6 +177,13 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
 void output_node_render_image_with_transition(daemon_state_t *state, output_node_t *node,
                                               const uint8_t *pixels, uint32_t img_w, uint32_t img_h,
                                               const waywal_img_metadata_t *meta);
+
+void layer_shell_update_input_regions(daemon_state_t *state, bool interactive);
+void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
+                                 size_t dst_stride_bytes, const uint32_t *src, uint32_t src_w,
+                                 uint32_t src_h, int32_t span_off_x, int32_t span_off_y,
+                                 int32_t span_total_w, int32_t span_total_h, uint32_t filter_mode,
+                                 color_rgba_t bg_color);
 
 void daemon_clear_all_outputs(daemon_state_t *state, color_rgba_t color);
 void daemon_handle_ipc_connection(daemon_state_t *state);

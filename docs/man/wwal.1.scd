@@ -145,6 +145,10 @@ When invoked via a symlink named *swww* or *awww*, *wwal* automatically enables 
 	- *stretch*: Stretch non-uniformly to output dimensions.
 	- *center*, *no*: Center at 1:1 pixel resolution, padding surrounding space with *--fill-color*.
 	- *tile*: Repeat image in a tiled grid across the output.
+	- *span*: Span a single panoramic canvas across the combined logical layout of all active monitors.
+
+*--depth-map* <FILE>
+	Enable interactive 3D Parallax Occlusion Mapping (POM) on a 2D image using the grayscale depth map at _FILE_, driven by smoothed cursor tracking and workspace-slide inertia.
 
 *--fill-color* <HEX>
 	Background padding color in 6- or 8-digit hex for *fit* and *center* modes (default: *000000*).

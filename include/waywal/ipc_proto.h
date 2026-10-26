@@ -77,7 +77,15 @@ typedef struct {
     bezier_curve_t bezier;
     bool has_custom_bezier;
     bool ten_bit;
+    bool extract_theme;
+    bool no_theme;
+    bool theme_light_mode;
+    char depth_map_path[256];
+    char backdrop[256];
+    char layer_name[32];
+    char battery_policy[32];
     char filepath[4096];
+    float depth_strength;
     /* Followed by num_target_outputs null-terminated strings, then custom shader GLSL string */
 } waywal_img_metadata_t;
 typedef waywal_img_metadata_t waywal_ipc_img_meta_t;
@@ -120,6 +128,7 @@ typedef struct {
     float transition_center_y;
     bool random_order;
     uint32_t num_target_outputs;
+    char target_outputs[16][64];
     uint32_t scaling_mode; /* waywal_scaling_mode_t (default: 0 = FILL) */
     uint32_t filter_mode;  /* waywal_filter_mode_t (default: 0 = LANCZOS3) */
     bezier_curve_t bezier;

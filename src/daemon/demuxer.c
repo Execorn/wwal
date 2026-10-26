@@ -470,6 +470,10 @@ typedef struct {
     webm_sample_entry_t *samples;
     size_t num_samples;
     size_t current_sample_idx;
+
+    webm_sample_entry_t lace_queue[64];
+    uint32_t lace_head;
+    uint32_t lace_count;
 } webm_state_t;
 
 static bool ebml_read_vint(const uint8_t *data, size_t size, size_t *offset, uint64_t *out_val,
@@ -521,6 +525,22 @@ static bool webm_read_packet(demuxer_t *d, demux_packet_t *pkt)
         return false;
     webm_state_t *st = (webm_state_t *)d->internal_state;
 
+    if (st->lace_head < st->lace_count && st->lace_head < 64) {
+        const webm_sample_entry_t *ls = &st->lace_queue[st->lace_head++];
+        if (st->lace_head >= st->lace_count) {
+            st->lace_head = 0;
+            st->lace_count = 0;
+        }
+        if (ls->offset + ls->size > d->mapped_size)
+            return false;
+        pkt->data = d->mapped_buf + ls->offset;
+        pkt->size = ls->size;
+        pkt->pts_us = ls->pts_us;
+        pkt->dts_us = ls->dts_us;
+        pkt->is_keyframe = ls->is_keyframe;
+        return true;
+    }
+
     if (st->current_sample_idx >= st->num_samples) {
         return false; /* End of stream */
     }
@@ -543,6 +563,8 @@ static bool webm_seek_us(demuxer_t *d, int64_t target_pts_us)
     if (!d || !d->internal_state)
         return false;
     webm_state_t *st = (webm_state_t *)d->internal_state;
+    st->lace_head = 0;
+    st->lace_count = 0;
     if (st->num_samples == 0)
         return false;
 
@@ -592,6 +614,8 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
 
     size_t offset = 0;
     uint64_t timecode_scale = 1000000; /* default 1 ms in ns */
+    double raw_duration = 0.0;
+    uint64_t default_duration_ns = 0;
     uint64_t video_track_num = 1;
     waywal_codec_t codec = WAYWAL_CODEC_UNKNOWN;
     uint32_t width = 0, height = 0;
@@ -616,10 +640,9 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
             break;
 
         size_t content_start = offset;
-        size_t content_end = content_start + elem_size;
-        if (elem_size == 0xFFFFFFFFFFFFFFULL || content_end > size) {
-            content_end = size;
-        }
+        size_t content_end = (elem_size == 0xFFFFFFFFFFFFFFULL || elem_size > size - content_start)
+                                 ? size
+                                 : content_start + (size_t)elem_size;
 
         if (elem_id == EBML_ID_HEADER) {
             offset = content_end;
@@ -638,10 +661,10 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                     break;
 
                 size_t sub_start = seg_offset;
-                size_t sub_end = sub_start + sub_size;
-                if (sub_size == 0xFFFFFFFFFFFFFFULL || sub_end > content_end) {
-                    sub_end = content_end;
-                }
+                size_t sub_end =
+                    (sub_size == 0xFFFFFFFFFFFFFFULL || sub_size > content_end - sub_start)
+                        ? content_end
+                        : sub_start + (size_t)sub_size;
 
                 if (sub_id == EBML_ID_INFO) {
                     size_t info_off = sub_start;
@@ -651,10 +674,28 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                             break;
                         if (!ebml_read_vint(data, sub_end, &info_off, &inf_size, NULL, true))
                             break;
+                        if (inf_size > sub_end - info_off)
+                            break;
                         if (inf_id == EBML_ID_TIMECODE_SCALE) {
                             timecode_scale = ebml_read_uint(data + info_off, inf_size);
+                        } else if (inf_id == EBML_ID_DURATION) {
+                            if (inf_size == 4) {
+                                uint32_t bits = read_u32_be(data + info_off);
+                                float f_dur = 0.0f;
+                                memcpy(&f_dur, &bits, sizeof(f_dur));
+                                if (f_dur > 0.0f) {
+                                    raw_duration = (double)f_dur;
+                                }
+                            } else if (inf_size == 8) {
+                                uint64_t bits = read_u64_be(data + info_off);
+                                double d_dur = 0.0;
+                                memcpy(&d_dur, &bits, sizeof(d_dur));
+                                if (d_dur > 0.0) {
+                                    raw_duration = d_dur;
+                                }
+                            }
                         }
-                        info_off += inf_size;
+                        info_off += (size_t)inf_size;
                     }
                 } else if (sub_id == EBML_ID_TRACKS) {
                     size_t trk_off = sub_start;
@@ -665,11 +706,17 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                         if (!ebml_read_vint(data, sub_end, &trk_off, &trk_size, NULL, true))
                             break;
 
+                        size_t trk_end =
+                            (trk_size == 0xFFFFFFFFFFFFFFULL || trk_size > sub_end - trk_off)
+                                ? sub_end
+                                : trk_off + (size_t)trk_size;
+
                         if (trk_id == EBML_ID_TRACK_ENTRY) {
                             size_t entry_off = trk_off;
-                            size_t entry_end = entry_off + trk_size;
+                            size_t entry_end = trk_end;
                             uint64_t cur_track_num = 0;
                             uint64_t track_type = 0;
+                            uint64_t cur_def_dur = 0;
                             waywal_codec_t cur_codec = WAYWAL_CODEC_UNKNOWN;
                             uint32_t cur_w = 0, cur_h = 0;
                             const uint8_t *cur_extra = NULL;
@@ -683,11 +730,15 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                 if (!ebml_read_vint(data, entry_end, &entry_off, &f_size, NULL,
                                                     true))
                                     break;
+                                if (f_size > entry_end - entry_off)
+                                    break;
 
                                 if (f_id == EBML_ID_TRACK_NUMBER) {
                                     cur_track_num = ebml_read_uint(data + entry_off, f_size);
                                 } else if (f_id == EBML_ID_TRACK_TYPE) {
                                     track_type = ebml_read_uint(data + entry_off, f_size);
+                                } else if (f_id == 0x23E383 /* DefaultDuration */) {
+                                    cur_def_dur = ebml_read_uint(data + entry_off, f_size);
                                 } else if (f_id == EBML_ID_CODEC_ID) {
                                     if (f_size >= 5 && memcmp(data + entry_off, "V_VP9", 5) == 0) {
                                         cur_codec = WAYWAL_CODEC_VP9;
@@ -704,10 +755,10 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                     }
                                 } else if (f_id == EBML_ID_CODEC_PRIVATE) {
                                     cur_extra = data + entry_off;
-                                    cur_extra_sz = f_size;
+                                    cur_extra_sz = (size_t)f_size;
                                 } else if (f_id == EBML_ID_VIDEO) {
                                     size_t vid_off = entry_off;
-                                    size_t vid_end = vid_off + f_size;
+                                    size_t vid_end = vid_off + (size_t)f_size;
                                     while (vid_off < vid_end) {
                                         uint64_t v_id = 0, v_size = 0;
                                         if (!ebml_read_vint(data, vid_end, &vid_off, &v_id, NULL,
@@ -716,6 +767,8 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                         if (!ebml_read_vint(data, vid_end, &vid_off, &v_size, NULL,
                                                             true))
                                             break;
+                                        if (v_size > vid_end - vid_off)
+                                            break;
                                         if (v_id == EBML_ID_PIXEL_WIDTH) {
                                             cur_w =
                                                 (uint32_t)ebml_read_uint(data + vid_off, v_size);
@@ -723,10 +776,10 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                             cur_h =
                                                 (uint32_t)ebml_read_uint(data + vid_off, v_size);
                                         }
-                                        vid_off += v_size;
+                                        vid_off += (size_t)v_size;
                                     }
                                 }
-                                entry_off += f_size;
+                                entry_off += (size_t)f_size;
                             }
 
                             if (track_type == 1 /* Video */ && cur_codec != WAYWAL_CODEC_UNKNOWN) {
@@ -736,9 +789,10 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                 height = cur_h;
                                 extradata = cur_extra;
                                 extradata_size = cur_extra_sz;
+                                default_duration_ns = cur_def_dur;
                             }
                         }
-                        trk_off += trk_size;
+                        trk_off = trk_end;
                     }
                 } else if (sub_id == EBML_ID_CLUSTER) {
                     size_t clus_off = sub_start;
@@ -751,14 +805,18 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                         if (!ebml_read_vint(data, sub_end, &clus_off, &c_size, NULL, true))
                             break;
 
+                        size_t c_end =
+                            (c_size == 0xFFFFFFFFFFFFFFULL || c_size > sub_end - clus_off)
+                                ? sub_end
+                                : clus_off + (size_t)c_size;
+
                         if (c_id == EBML_ID_CLUSTER_TIME) {
+                            if (c_size > c_end - clus_off)
+                                break;
                             cluster_time = ebml_read_uint(data + clus_off, c_size);
                         } else if (c_id == EBML_ID_SIMPLE_BLOCK || c_id == EBML_ID_BLOCK_GROUP) {
                             size_t blk_off = clus_off;
-                            size_t blk_end = blk_off + c_size;
-                            if (blk_end > sub_end) {
-                                blk_end = sub_end;
-                            }
+                            size_t blk_end = c_end;
                             bool is_block_group = (c_id == EBML_ID_BLOCK_GROUP);
                             bool has_block = !is_block_group;
                             bool has_reference_block = false;
@@ -773,10 +831,10 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                     if (!ebml_read_vint(data, bg_end, &bg_off, &bg_size, NULL,
                                                         true))
                                         break;
-                                    size_t el_end = bg_off + bg_size;
-                                    if (el_end > bg_end) {
-                                        el_end = bg_end;
-                                    }
+                                    size_t el_end = (bg_size == 0xFFFFFFFFFFFFFFULL ||
+                                                     bg_size > bg_end - bg_off)
+                                                        ? bg_end
+                                                        : bg_off + (size_t)bg_size;
                                     if (bg_id == EBML_ID_BLOCK) {
                                         blk_off = bg_off;
                                         blk_end = el_end;
@@ -799,19 +857,24 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                         uint8_t flags = data[blk_off + 2];
                                         blk_off += 3;
 
-                                        /* Check lacing bits (bits 2-1): 0 = no lacing */
+                                        int64_t block_time =
+                                            (int64_t)cluster_time + (int64_t)rel_time;
+                                        if (block_time < 0) {
+                                            block_time = 0;
+                                        }
+                                        int64_t pts_us =
+                                            (block_time * (int64_t)timecode_scale) / 1000LL;
+                                        bool is_kf = is_block_group ? !has_reference_block
+                                                                    : ((flags & 0x80) != 0);
+                                        int64_t lace_step_us =
+                                            (default_duration_ns > 0)
+                                                ? (int64_t)(default_duration_ns / 1000ULL)
+                                                : 33333LL;
+
+                                        /* Check lacing bits (bits 2-1):
+                                         * 0 = no lacing, 1 = Xiph, 2 = fixed-size, 3 = EBML */
                                         uint8_t lacing = (flags >> 1) & 0x03;
                                         if (lacing == 0 && blk_off < blk_end) {
-                                            int64_t block_time =
-                                                (int64_t)cluster_time + (int64_t)rel_time;
-                                            if (block_time < 0) {
-                                                block_time = 0;
-                                            }
-                                            int64_t pts_us =
-                                                (block_time * (int64_t)timecode_scale) / 1000LL;
-                                            bool is_kf = is_block_group ? !has_reference_block
-                                                                        : ((flags & 0x80) != 0);
-
                                             if (samples_count >= samples_cap) {
                                                 samples_cap *= 2;
                                                 webm_sample_entry_t *new_s =
@@ -832,12 +895,140 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                                 .dts_us = pts_us,
                                                 .is_keyframe = is_kf,
                                             };
+                                        } else if (lacing != 0 && blk_off < blk_end) {
+                                            uint32_t lace_count = (uint32_t)data[blk_off++] + 1U;
+                                            size_t lace_sizes[256];
+                                            bool lace_valid = true;
+                                            size_t sum_sizes = 0;
+
+                                            if (lacing == 1) {
+                                                /* Xiph lacing */
+                                                for (uint32_t li = 0; li + 1 < lace_count; ++li) {
+                                                    size_t lsz = 0;
+                                                    while (true) {
+                                                        if (blk_off >= blk_end) {
+                                                            lace_valid = false;
+                                                            break;
+                                                        }
+                                                        uint8_t b = data[blk_off++];
+                                                        lsz += b;
+                                                        if (b < 255)
+                                                            break;
+                                                    }
+                                                    if (!lace_valid ||
+                                                        sum_sizes > blk_end - blk_off ||
+                                                        lsz > (blk_end - blk_off) - sum_sizes) {
+                                                        lace_valid = false;
+                                                        break;
+                                                    }
+                                                    lace_sizes[li] = lsz;
+                                                    sum_sizes += lsz;
+                                                }
+                                                if (lace_valid && sum_sizes <= blk_end - blk_off) {
+                                                    lace_sizes[lace_count - 1] =
+                                                        (blk_end - blk_off) - sum_sizes;
+                                                } else {
+                                                    lace_valid = false;
+                                                }
+                                            } else if (lacing == 2) {
+                                                /* Fixed-size lacing */
+                                                size_t rem = blk_end - blk_off;
+                                                if (rem >= lace_count) {
+                                                    size_t fsz = rem / lace_count;
+                                                    for (uint32_t li = 0; li + 1 < lace_count;
+                                                         ++li) {
+                                                        lace_sizes[li] = fsz;
+                                                        sum_sizes += fsz;
+                                                    }
+                                                    lace_sizes[lace_count - 1] = rem - sum_sizes;
+                                                } else {
+                                                    lace_valid = false;
+                                                }
+                                            } else if (lacing == 3) {
+                                                /* EBML lacing */
+                                                uint64_t first_sz = 0;
+                                                if (!ebml_read_vint(data, blk_end, &blk_off,
+                                                                    &first_sz, NULL, true) ||
+                                                    first_sz > blk_end - blk_off) {
+                                                    lace_valid = false;
+                                                } else {
+                                                    lace_sizes[0] = (size_t)first_sz;
+                                                    sum_sizes = lace_sizes[0];
+                                                    for (uint32_t li = 1; li + 1 < lace_count;
+                                                         ++li) {
+                                                        uint64_t raw_vint = 0;
+                                                        uint32_t vlen = 0;
+                                                        if (!ebml_read_vint(data, blk_end, &blk_off,
+                                                                            &raw_vint, &vlen,
+                                                                            true) ||
+                                                            vlen == 0 || vlen > 8) {
+                                                            lace_valid = false;
+                                                            break;
+                                                        }
+                                                        int64_t bias =
+                                                            (1LL << (7 * vlen - 1)) - 1LL;
+                                                        int64_t delta = (int64_t)raw_vint - bias;
+                                                        int64_t next_sz =
+                                                            (int64_t)lace_sizes[li - 1] + delta;
+                                                        if (next_sz <= 0 ||
+                                                            sum_sizes > blk_end - blk_off ||
+                                                            (size_t)next_sz >
+                                                                (blk_end - blk_off) - sum_sizes) {
+                                                            lace_valid = false;
+                                                            break;
+                                                        }
+                                                        lace_sizes[li] = (size_t)next_sz;
+                                                        sum_sizes += lace_sizes[li];
+                                                    }
+                                                    if (lace_valid &&
+                                                        sum_sizes <= blk_end - blk_off) {
+                                                        lace_sizes[lace_count - 1] =
+                                                            (blk_end - blk_off) - sum_sizes;
+                                                    } else {
+                                                        lace_valid = false;
+                                                    }
+                                                }
+                                            }
+
+                                            if (lace_valid) {
+                                                size_t frame_off = blk_off;
+                                                for (uint32_t li = 0; li < lace_count; ++li) {
+                                                    size_t fsz = lace_sizes[li];
+                                                    if (fsz == 0 || fsz > blk_end - frame_off)
+                                                        break;
+                                                    if (samples_count >= samples_cap) {
+                                                        samples_cap *= 2;
+                                                        webm_sample_entry_t *new_s =
+                                                            (webm_sample_entry_t *)realloc(
+                                                                samples,
+                                                                samples_cap *
+                                                                    sizeof(webm_sample_entry_t));
+                                                        if (!new_s) {
+                                                            free(samples);
+                                                            return NULL;
+                                                        }
+                                                        samples = new_s;
+                                                    }
+                                                    int64_t f_pts =
+                                                        pts_us + (int64_t)li * lace_step_us;
+                                                    samples[samples_count++] =
+                                                        (webm_sample_entry_t){
+                                                            .offset = frame_off,
+                                                            .size = fsz,
+                                                            .pts_us = f_pts,
+                                                            .dts_us = f_pts,
+                                                            .is_keyframe =
+                                                                (li == 0) ? is_kf : false,
+                                                    };
+                                                    frame_off += fsz;
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                        clus_off += c_size;
+                        clus_off = c_end;
                     }
                 }
 
@@ -873,19 +1064,28 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
     st->current_sample_idx = 0;
 
     int64_t last_pts = samples[samples_count - 1].pts_us;
+    int64_t info_duration_us =
+        (raw_duration > 0.0) ? (int64_t)(raw_duration * (double)timecode_scale / 1000.0 + 0.5) : 0;
+    int64_t total_duration_us = (info_duration_us > last_pts) ? info_duration_us : last_pts;
 
     d->mapped_buf = data;
     d->mapped_size = size;
     d->codec = codec;
     d->width = width;
     d->height = height;
-    d->fps_num = (samples_count > 1 && last_pts > 0)
-                     ? (uint32_t)((int64_t)samples_count * 1000000LL / last_pts)
-                     : 30;
+    if (info_duration_us > last_pts && total_duration_us > 0) {
+        d->fps_num = (uint32_t)(((int64_t)samples_count * 1000000LL + total_duration_us / 2) /
+                                total_duration_us);
+    } else if (samples_count > 1 && last_pts > 0) {
+        d->fps_num =
+            (uint32_t)(((int64_t)(samples_count - 1) * 1000000LL + last_pts / 2) / last_pts);
+    } else {
+        d->fps_num = 30;
+    }
     if (d->fps_num == 0)
         d->fps_num = 30;
     d->fps_den = 1;
-    d->duration_us = last_pts;
+    d->duration_us = total_duration_us;
     d->extradata = extradata;
     d->extradata_size = extradata_size;
     d->internal_state = st;
@@ -1064,8 +1264,9 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size)
         }
     }
 
-    /* Apply composition time offsets via ctts (B-frame PTS reordering) */
+    /* Apply composition time offsets via ctts (B-frame PTS reordering, ISO 14496-12 v0 & v1) */
     if (pt.ctts_data && pt.ctts_size >= 8 && pt.timescale > 0) {
+        uint8_t ctts_version = pt.ctts_data[0];
         uint32_t ctts_count = read_u32_be(pt.ctts_data + 4);
         if ((uint64_t)ctts_count * 8 <= pt.ctts_size - 8) {
             const uint8_t *ctts_entries = pt.ctts_data + 8;
@@ -1073,8 +1274,11 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size)
             int64_t min_pts = INT64_MAX;
             for (uint32_t i = 0; i < ctts_count && ctts_sample_idx < sample_count; ++i) {
                 uint32_t count = read_u32_be(ctts_entries + i * 8);
-                int32_t offset = (int32_t)read_u32_be(ctts_entries + i * 8 + 4);
-                int64_t offset_us = (int64_t)offset * 1000000LL / (int64_t)pt.timescale;
+                uint32_t raw_off = read_u32_be(ctts_entries + i * 8 + 4);
+                int64_t sample_offset = (ctts_version == 0 && (raw_off & 0x80000000U) == 0)
+                                            ? (int64_t)raw_off
+                                            : (int64_t)(int32_t)raw_off;
+                int64_t offset_us = sample_offset * 1000000LL / (int64_t)pt.timescale;
                 for (uint32_t j = 0; j < count && ctts_sample_idx < sample_count; ++j) {
                     int64_t pts = samples[ctts_sample_idx].dts_us + offset_us;
                     samples[ctts_sample_idx].pts_us = pts;
@@ -1138,8 +1342,10 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size)
     d->width = pt.width;
     d->height = pt.height;
     d->fps_num = (sample_count > 1 && cur_dts > 0)
-                     ? (uint32_t)((int64_t)sample_count * 1000000LL / cur_dts)
+                     ? (uint32_t)(((int64_t)sample_count * 1000000LL + cur_dts / 2) / cur_dts)
                      : 30;
+    if (d->fps_num == 0)
+        d->fps_num = 30;
     d->fps_den = 1;
     d->duration_us = cur_dts;
     d->extradata = pt.extradata;

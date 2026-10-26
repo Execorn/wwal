@@ -16,13 +16,15 @@ static void output_handle_geometry(void *data, struct wl_output *output, int32_t
                                    int32_t transform)
 {
     (void)output;
-    (void)x;
-    (void)y;
     (void)physical_width;
     (void)physical_height;
     (void)subpixel;
     output_state_t *st = (output_state_t *)data;
     if (st) {
+        if (!st->has_logical_pos) {
+            st->global_x = x;
+            st->global_y = y;
+        }
         st->transform = transform;
         if (make && model && !st->description[0]) {
             snprintf(st->description, sizeof(st->description), "%s %s", make, model);
@@ -116,6 +118,11 @@ void output_manager_destroy(output_manager_t *om)
 
         output_node_destroy_surface(cur);
 
+        if (cur->xdg_output) {
+            zxdg_output_v1_destroy(cur->xdg_output);
+            cur->xdg_output = NULL;
+        }
+
         if (cur->fract_scale) {
             wp_fractional_scale_v1_destroy(cur->fract_scale);
             cur->fract_scale = NULL;
@@ -187,6 +194,11 @@ void output_manager_remove(output_manager_t *om, uint32_t name)
                             entry->name[0] ? entry->name : "unnamed", om->count);
 
             output_node_destroy_surface(entry);
+
+            if (entry->xdg_output) {
+                zxdg_output_v1_destroy(entry->xdg_output);
+                entry->xdg_output = NULL;
+            }
 
             if (entry->fract_scale) {
                 wp_fractional_scale_v1_destroy(entry->fract_scale);

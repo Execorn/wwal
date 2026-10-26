@@ -10,6 +10,7 @@
 #include <omp.h>
 #endif
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -35,7 +36,7 @@ bool render_engine_init(render_engine_t *re, dmabuf_context_t *dmabuf_ctx)
     const char *simd_name = "Scalar";
 #if defined(__x86_64__) || defined(_M_X64)
     if (fn == blend_scanline_avx512)
-        simd_name = "AVX-512 VBMI2";
+        simd_name = "AVX-512 BW";
     else if (fn == blend_scanline_avx2)
         simd_name = "AVX2";
 #elif defined(__aarch64__) || defined(_M_ARM64)
@@ -87,6 +88,14 @@ bool render_engine_upload_static(render_engine_t *re, const uint8_t *src_rgba, u
         return false;
     return gpu_compute_upload_static((gpu_compute_ctx_t *)re->gpu_ctx, src_rgba, src_w, src_h,
                                      dst_bo, (waywal_scaling_mode_t)scaling_mode, clear_color);
+}
+
+void render_engine_set_span_bounds(render_engine_t *re, int32_t off_x, int32_t off_y,
+                                   int32_t total_w, int32_t total_h)
+{
+    if (!re || !re->has_gpu_compute || !re->gpu_ctx)
+        return;
+    gpu_compute_set_span_bounds((gpu_compute_ctx_t *)re->gpu_ctx, off_x, off_y, total_w, total_h);
 }
 
 static inline float clampf(float v, float min_v, float max_v)
@@ -1004,6 +1013,29 @@ static inline float value_noise2(float x, float y)
     return (a * (1.0f - fx) + b * fx) * (1.0f - fy) + (c * (1.0f - fx) + d * fx) * fy;
 }
 
+static float s_unit_sine_lut[1024];
+static pthread_once_t s_sine_lut_once = PTHREAD_ONCE_INIT;
+
+static void init_unit_sine_lut(void)
+{
+    for (int i = 0; i < 1024; ++i) {
+        s_unit_sine_lut[i] = sinf((float)i * (6.28318530718f / 1024.0f));
+    }
+}
+
+static inline const float *get_unit_sine_lut(void)
+{
+    pthread_once(&s_sine_lut_once, init_unit_sine_lut);
+    return s_unit_sine_lut;
+}
+
+static inline void simd_stream_fence(void)
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_sfence();
+#endif
+}
+
 bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pixels,
                                           const uint32_t *new_pixels, uint32_t width,
                                           uint32_t height, uint32_t stride_bytes,
@@ -1032,7 +1064,12 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         return true;
     }
 
-    switch (params->type) {
+    waywal_transition_type_t eff_type = params->type;
+    if (eff_type == WAYWAL_TRANSITION_RANDOM) {
+        eff_type = (waywal_transition_type_t)(1 + (rand() % 19));
+    }
+
+    switch (eff_type) {
     case WAYWAL_TRANSITION_FADE:
     case WAYWAL_TRANSITION_SIMPLE: {
         uint16_t weight_b = (uint16_t)(progress * 256.0f);
@@ -1047,6 +1084,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
             blend_fn(dst_row, src_a_row, src_b_row, weight_b, (size_t)width * sizeof(uint32_t));
         }
+        simd_stream_fence();
         return true;
     }
 
@@ -1137,7 +1175,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
     case WAYWAL_TRANSITION_GROW:
     case WAYWAL_TRANSITION_OUTER: {
-        bool is_grow = (params->type == WAYWAL_TRANSITION_GROW);
+        bool is_grow = (eff_type == WAYWAL_TRANSITION_GROW);
         float cx = params->center_x > 0.0f ? params->center_x : 0.5f;
         float cy = params->center_y > 0.0f ? params->center_y : 0.5f;
         float aspect = (float)width / (float)height;
@@ -1271,10 +1309,10 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float p_plus_edge = p + edge;
         float inv_2edge = 1.0f / (2.0f * edge);
 
+        const float *unit_sin = get_unit_sine_lut();
         float sine_lut[1024];
         for (int i = 0; i < 1024; ++i) {
-            float theta = (float)i * (6.28318530718f / 1024.0f);
-            sine_lut[i] = sinf(theta) * amp;
+            sine_lut[i] = unit_sin[i] * amp;
         }
 
         float d_proj = cos_a / (1.41421356f * (float)width);
@@ -1747,6 +1785,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
         if (wb_lut != wb_stack)
             free(wb_lut);
+        simd_stream_fence();
         return true;
     }
 
@@ -1962,12 +2001,15 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float r_inner2 = r_inner > 0.0f ? r_inner * r_inner : 0.0f;
         float r_outer2 = r_outer * r_outer;
 
+        const float *unit_sin = get_unit_sine_lut();
         float wave_lut[512];
         float inv_span = 511.0f / (2.0f * wave_width);
+        const float rad_to_lut = 1024.0f / 6.28318530718f;
         for (int k = 0; k < 512; ++k) {
             float diff = -wave_width + ((float)k / 511.0f) * (2.0f * wave_width);
             float window = smoothstepf(wave_width, 0.0f, fabsf(diff));
-            wave_lut[k] = sinf(diff * freq) * amp * decay * window;
+            int sidx = ((int)floorf(diff * freq * rad_to_lut)) & 1023;
+            wave_lut[k] = unit_sin[sidx] * amp * decay * window;
         }
 
         float xc_px = cx * (float)width;
@@ -2099,6 +2141,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                          (const uint8_t *)(new_pixels + (size_t)y * width), wb,
                          (size_t)width * sizeof(uint32_t));
             }
+            simd_stream_fence();
             return true;
         }
 
@@ -2202,6 +2245,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                          (const uint8_t *)(new_pixels + (size_t)y * width), wb,
                          (size_t)width * sizeof(uint32_t));
             }
+            simd_stream_fence();
             return true;
         }
 
@@ -2211,6 +2255,8 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float cy_pixel = cy * (float)height;
 
 #define SWIRL_LUT_SIZE 1024
+        const float *unit_sin = get_unit_sine_lut();
+        const float rad_to_lut = 1024.0f / 6.28318530718f;
         float swirl_sin[SWIRL_LUT_SIZE + 1];
         float swirl_cos[SWIRL_LUT_SIZE + 1];
         float dist_scale = (float)SWIRL_LUT_SIZE / max_dist;
@@ -2219,7 +2265,9 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             float dist = (float)i * inv_dist_scale;
             float factor = (1.0f - dist / max_dist);
             float theta = factor * factor * angle_amt;
-            sincosf(theta, &swirl_sin[i], &swirl_cos[i]);
+            int sidx = ((int)floorf(theta * rad_to_lut)) & 1023;
+            swirl_sin[i] = unit_sin[sidx];
+            swirl_cos[i] = unit_sin[(sidx + 256) & 1023];
         }
         swirl_sin[SWIRL_LUT_SIZE] = 0.0f;
         swirl_cos[SWIRL_LUT_SIZE] = 1.0f;
@@ -2308,6 +2356,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             }
         }
 #undef SWIRL_LUT_SIZE
+        simd_stream_fence();
         return true;
     }
 
@@ -2632,6 +2681,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                          (const uint8_t *)(new_pixels + (size_t)y * width), wb,
                          (size_t)width * sizeof(uint32_t));
             }
+            simd_stream_fence();
             return true;
         }
 
@@ -2712,6 +2762,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             }
         }
 #undef LIGHT_LEAK_LUT_SIZE
+        simd_stream_fence();
         return true;
     }
 

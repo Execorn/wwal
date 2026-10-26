@@ -136,6 +136,8 @@ static waywal_scaling_mode_t parse_scaling_str(const char *s)
         return WAYWAL_SCALING_CENTER;
     if (strcasecmp(s, "tile") == 0)
         return WAYWAL_SCALING_TILE;
+    if (strcasecmp(s, "span") == 0)
+        return WAYWAL_SCALING_SPAN;
     return WAYWAL_SCALING_FILL;
 }
 
@@ -202,8 +204,8 @@ void waywal_config_init_defaults(waywal_config_t *out_cfg)
     out_cfg->transition.angle = 0.0f;
     out_cfg->transition.pos_x = 0.5f;
     out_cfg->transition.pos_y = 0.5f;
-    out_cfg->transition.wave_x = 20.0f;
-    out_cfg->transition.wave_y = 20.0f;
+    out_cfg->transition.wave_x = 0.0f;
+    out_cfg->transition.wave_y = 0.0f;
     out_cfg->transition.step = 90U;
     copy_str_safe(out_cfg->transition.pos, sizeof(out_cfg->transition.pos), "center");
     copy_str_safe(out_cfg->transition.sync_mode, sizeof(out_cfg->transition.sync_mode),

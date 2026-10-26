@@ -17,6 +17,18 @@ typedef enum : uint32_t {
     WAYWAL_THEME_LIGHT = 1,
 } waywal_theme_mode_t;
 
+typedef enum : uint32_t {
+    WAYWAL_SCHEME_TONAL_SPOT = 0,
+    WAYWAL_SCHEME_VIBRANT = 1,
+    WAYWAL_SCHEME_EXPRESSIVE = 2,
+    WAYWAL_SCHEME_CONTENT = 3,
+    WAYWAL_SCHEME_FIDELITY = 4,
+    WAYWAL_SCHEME_NEUTRAL = 5,
+    WAYWAL_SCHEME_MONOCHROME = 6,
+    WAYWAL_SCHEME_RAINBOW = 7,
+    WAYWAL_SCHEME_FRUIT_SALAD = 8,
+} waywal_scheme_variant_t;
+
 typedef struct {
     float l;
     float a;
@@ -37,6 +49,8 @@ typedef struct {
 
 typedef struct {
     waywal_theme_mode_t mode;
+    waywal_scheme_variant_t variant;
+    float contrast;
     bool is_monochrome;
 
     waywal_oklch_t primary_seed;
@@ -175,11 +189,20 @@ typedef struct {
     color_rgba_t onSuccessContainer;
 } waywal_palette_t;
 
+waywal_scheme_variant_t waywal_scheme_variant_from_str(const char *str);
+color_rgba_t waywal_hct_to_rgba(float h_deg, float c_cam16, float t_lstar);
+void waywal_rgba_to_hct(color_rgba_t rgba, float *out_h_deg, float *out_c_cam16,
+                        float *out_t_lstar);
 color_rgba_t waywal_palette_generate_tone(float l_target, float chroma, float hue_rad);
 
 bool waywal_palette_extract(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
                             uint32_t stride_bytes, waywal_theme_mode_t mode,
                             waywal_palette_t *out_palette);
+
+bool waywal_palette_extract_ex(const uint8_t *pixels, uint32_t width, uint32_t height,
+                               uint32_t stride_bytes, bool is_bgra, waywal_theme_mode_t mode,
+                               waywal_scheme_variant_t variant, float contrast,
+                               waywal_palette_t *out_palette);
 
 bool waywal_palette_extract_dual(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
                                  uint32_t stride_bytes, waywal_palette_t *out_dark,
@@ -196,6 +219,9 @@ bool waywal_palette_extract_dual_bgra(const uint8_t *bgra_pixels, uint32_t width
 size_t waywal_palette_format_sequences(const waywal_palette_t *pal, char *out_buf, size_t buf_cap);
 
 bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override_base_dir);
+
+bool waywal_palette_export_filtered(const waywal_palette_t *pal, const char *override_base_dir,
+                                    bool caelestia_sync, bool export_css, bool export_hyprland);
 
 bool waywal_palette_render_templates(const waywal_palette_t *pal, const char *templates_dir,
                                      const char *out_dir);

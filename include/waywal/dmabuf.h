@@ -37,6 +37,7 @@ typedef struct dmabuf_bo {
     void *egl_image;
     void *map_data;
     uint32_t gl_tex;
+    bool is_10bit;
     bool in_use;
 } dmabuf_bo_t;
 

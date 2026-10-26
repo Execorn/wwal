@@ -72,6 +72,8 @@ struct gpu_compute_ctx {
     GLint loc_scale_mode;
     GLint loc_scale_clear;
     GLint loc_scale_has_src;
+    GLint loc_scale_span_bounds;
+    int32_t span_bounds[4];
     GLint loc_kawase_src_res;
     GLint loc_kawase_dst_res;
     GLint loc_kawase_radius;
@@ -203,6 +205,7 @@ static const char *SHADER_SRC_SCALE =
     "uniform int u_scaling_mode;\n"
     "uniform highp vec4 u_clear_color;\n"
     "uniform int u_has_src;\n"
+    "uniform ivec4 u_span_bounds;\n"
     "void main() {\n"
     "    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);\n"
     "    if (coord.x >= u_dst_res.x || coord.y >= u_dst_res.y) return;\n"
@@ -210,70 +213,53 @@ static const char *SHADER_SRC_SCALE =
     "        imageStore(u_target, coord, u_clear_color.bgra);\n"
     "        return;\n"
     "    }\n"
-    "    if (u_dst_res.x == u_src_res.x && u_dst_res.y == u_src_res.y && u_scaling_mode != 4) {\n"
+    "    if (u_dst_res.x == u_src_res.x && u_dst_res.y == u_src_res.y && u_scaling_mode != 4 && "
+    "u_scaling_mode != 5) {\n"
     "        vec4 c = texelFetch(u_src, coord, 0);\n"
     "        imageStore(u_target, coord, c.bgra);\n"
     "        return;\n"
     "    }\n"
-    "    vec2 src_f = vec2(u_src_res);\n"
-    "    vec2 dst_f = vec2(u_dst_res);\n"
+    "    vec2 src_f = vec2(u_src_res), dst_f = vec2(u_dst_res);\n"
     "    vec4 out_col = u_clear_color;\n"
-    "    if (u_scaling_mode == 0) {\n"
-    "        float r_src = src_f.x / src_f.y;\n"
-    "        float r_dst = dst_f.x / dst_f.y;\n"
-    "        vec2 crop;\n"
-    "        vec2 off;\n"
-    "        if (r_src > r_dst) {\n"
-    "            crop.y = src_f.y;\n"
-    "            crop.x = crop.y * r_dst;\n"
-    "            off.x = (src_f.x - crop.x) * 0.5;\n"
-    "            off.y = 0.0;\n"
-    "        } else {\n"
-    "            crop.x = src_f.x;\n"
-    "            crop.y = crop.x / r_dst;\n"
-    "            off.x = 0.0;\n"
-    "            off.y = (src_f.y - crop.y) * 0.5;\n"
-    "        }\n"
-    "        vec2 s_px = off + (vec2(coord) + 0.5) * crop / dst_f;\n"
-    "        vec2 uv = clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f;\n"
-    "        out_col = texture(u_src, uv);\n"
+    "    if (u_scaling_mode == 0 || u_scaling_mode == 5) {\n"
+    "        vec2 tot = (u_scaling_mode == 5 && u_span_bounds.z > 0 && u_span_bounds.w > 0) ? "
+    "vec2(u_span_bounds.zw) : dst_f;\n"
+    "        vec2 soff = (u_scaling_mode == 5) ? vec2(u_span_bounds.xy) : vec2(0.0);\n"
+    "        float r_src = src_f.x / src_f.y, r_dst = tot.x / tot.y;\n"
+    "        vec2 crop = (r_src > r_dst) ? vec2(src_f.y * r_dst, src_f.y) : vec2(src_f.x, src_f.x "
+    "/ r_dst);\n"
+    "        vec2 off = (src_f - crop) * 0.5;\n"
+    "        vec2 s_px = off + (soff + vec2(coord) + 0.5) * crop / tot;\n"
+    "        out_col = texture(u_src, clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f);\n"
     "    } else if (u_scaling_mode == 1) {\n"
-    "        float r_src = src_f.x / src_f.y;\n"
-    "        float r_dst = dst_f.x / dst_f.y;\n"
+    "        float r_src = src_f.x / src_f.y, r_dst = dst_f.x / dst_f.y;\n"
     "        if (r_src > r_dst) {\n"
-    "            int scaled_h = min(int(dst_f.x / r_src + 0.5), u_dst_res.y);\n"
-    "            int pad_y = (u_dst_res.y - scaled_h) / 2;\n"
-    "            if (coord.y >= pad_y && coord.y < pad_y + scaled_h && scaled_h > 0) {\n"
-    "                float sy = (float(coord.y - pad_y) + 0.5) * src_f.y / float(scaled_h);\n"
-    "                float sx = (float(coord.x) + 0.5) * src_f.x / dst_f.x;\n"
-    "                vec2 uv = clamp(vec2(sx, sy) + 0.5, vec2(0.5), src_f - 0.5) / src_f;\n"
-    "                out_col = texture(u_src, uv);\n"
+    "            int sh = min(int(dst_f.x / r_src + 0.5), u_dst_res.y), py = (u_dst_res.y - sh) / "
+    "2;\n"
+    "            if (coord.y >= py && coord.y < py + sh && sh > 0) {\n"
+    "                vec2 s_px = vec2((float(coord.x) + 0.5) * src_f.x / dst_f.x, (float(coord.y - "
+    "py) + 0.5) * src_f.y / float(sh));\n"
+    "                out_col = texture(u_src, clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f);\n"
     "            }\n"
     "        } else {\n"
-    "            int scaled_w = min(int(dst_f.y * r_src + 0.5), u_dst_res.x);\n"
-    "            int pad_x = (u_dst_res.x - scaled_w) / 2;\n"
-    "            if (coord.x >= pad_x && coord.x < pad_x + scaled_w && scaled_w > 0) {\n"
-    "                float sx = (float(coord.x - pad_x) + 0.5) * src_f.x / float(scaled_w);\n"
-    "                float sy = (float(coord.y) + 0.5) * src_f.y / dst_f.y;\n"
-    "                vec2 uv = clamp(vec2(sx, sy) + 0.5, vec2(0.5), src_f - 0.5) / src_f;\n"
-    "                out_col = texture(u_src, uv);\n"
+    "            int sw = min(int(dst_f.y * r_src + 0.5), u_dst_res.x), px = (u_dst_res.x - sw) / "
+    "2;\n"
+    "            if (coord.x >= px && coord.x < px + sw && sw > 0) {\n"
+    "                vec2 s_px = vec2((float(coord.x - px) + 0.5) * src_f.x / float(sw), "
+    "(float(coord.y) + 0.5) * src_f.y / dst_f.y);\n"
+    "                out_col = texture(u_src, clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f);\n"
     "            }\n"
     "        }\n"
     "    } else if (u_scaling_mode == 2) {\n"
     "        vec2 s_px = (vec2(coord) + 0.5) * src_f / dst_f;\n"
-    "        vec2 uv = clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f;\n"
-    "        out_col = texture(u_src, uv);\n"
+    "        out_col = texture(u_src, clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f);\n"
     "    } else if (u_scaling_mode == 3) {\n"
-    "        int off_x = (u_dst_res.x - u_src_res.x) / 2;\n"
-    "        int off_y = (u_dst_res.y - u_src_res.y) / 2;\n"
-    "        int sx = coord.x - off_x;\n"
-    "        int sy = coord.y - off_y;\n"
-    "        if (sx >= 0 && sx < u_src_res.x && sy >= 0 && sy < u_src_res.y) {\n"
+    "        int sx = coord.x - (u_dst_res.x - u_src_res.x) / 2, sy = coord.y - (u_dst_res.y - "
+    "u_src_res.y) / 2;\n"
+    "        if (sx >= 0 && sx < u_src_res.x && sy >= 0 && sy < u_src_res.y)\n"
     "            out_col = texelFetch(u_src, ivec2(sx, sy), 0);\n"
-    "        }\n"
     "    } else if (u_scaling_mode == 4) {\n"
-    "        ivec2 tc = ivec2(coord.x % u_src_res.x, coord.y % u_src_res.y);\n"
-    "        out_col = texelFetch(u_src, tc, 0);\n"
+    "        out_col = texelFetch(u_src, ivec2(coord.x % u_src_res.x, coord.y % u_src_res.y), 0);\n"
     "    }\n"
     "    imageStore(u_target, coord, out_col.bgra);\n"
     "}\n";
@@ -487,6 +473,7 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
     ctx->loc_scale_mode = glGetUniformLocation(ctx->prog_scale, "u_scaling_mode");
     ctx->loc_scale_clear = glGetUniformLocation(ctx->prog_scale, "u_clear_color");
     ctx->loc_scale_has_src = glGetUniformLocation(ctx->prog_scale, "u_has_src");
+    ctx->loc_scale_span_bounds = glGetUniformLocation(ctx->prog_scale, "u_span_bounds");
     ctx->loc_kawase_src_res = glGetUniformLocation(ctx->prog_kawase, "u_src_res");
     ctx->loc_kawase_dst_res = glGetUniformLocation(ctx->prog_kawase, "u_dst_res");
     ctx->loc_kawase_radius = glGetUniformLocation(ctx->prog_kawase, "u_radius");
@@ -788,14 +775,14 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         u->last_angle = params->angle_rad;
     }
     if (u->loc_wave_freq >= 0) {
-        float wf = params->wave_freq > 0.0f ? params->wave_freq : 20.0f;
+        float wf = params->wave_freq;
         if (u->last_wave_freq != wf) {
             glUniform1f(u->loc_wave_freq, wf);
             u->last_wave_freq = wf;
         }
     }
     if (u->loc_wave_amp >= 0) {
-        float wa = params->wave_amp > 0.0f ? params->wave_amp : 0.05f;
+        float wa = params->wave_amp;
         if (u->last_wave_amp != wa) {
             glUniform1f(u->loc_wave_amp, wa);
             u->last_wave_amp = wa;
@@ -841,6 +828,9 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
 static void select_transition_program(gpu_compute_ctx_t *ctx, waywal_transition_type_t type,
                                       GLuint *out_prog, gpu_program_uniforms_t **out_u)
 {
+    if (type == WAYWAL_TRANSITION_RANDOM) {
+        type = (waywal_transition_type_t)(1 + (rand() % 19));
+    }
     GLuint prog = ctx->prog_fade;
     gpu_program_uniforms_t *u = &ctx->unif_fade;
     switch (type) {
@@ -1057,12 +1047,12 @@ bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_ol
         u->last_angle = params->angle_rad;
     }
     if (u->loc_wave_freq >= 0) {
-        float wf = params->wave_freq > 0.0f ? params->wave_freq : 20.0f;
+        float wf = params->wave_freq;
         glUniform1f(u->loc_wave_freq, wf);
         u->last_wave_freq = wf;
     }
     if (u->loc_wave_amp >= 0) {
-        float wa = params->wave_amp > 0.0f ? params->wave_amp : 0.05f;
+        float wa = params->wave_amp;
         glUniform1f(u->loc_wave_amp, wa);
         u->last_wave_amp = wa;
     }
@@ -1072,31 +1062,15 @@ bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_ol
         u->last_center_y = params->center_y;
     }
 
-    struct timespec t_a, t_b, t_c;
-    clock_gettime(CLOCK_MONOTONIC, &t_a);
-
     GLuint groups_x = (width + 15) / 16;
     GLuint groups_y = (height + 15) / 16;
     glDispatchCompute(groups_x, groups_y, 1);
 
     glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
 
-    clock_gettime(CLOCK_MONOTONIC, &t_b);
-
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE, dst_pixels);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    clock_gettime(CLOCK_MONOTONIC, &t_c);
-
-    double comp_ms = (t_b.tv_sec - t_a.tv_sec) * 1000.0 + (t_b.tv_nsec - t_a.tv_nsec) / 1000000.0;
-    double read_ms = (t_c.tv_sec - t_b.tv_sec) * 1000.0 + (t_c.tv_nsec - t_b.tv_nsec) / 1000000.0;
-
-    static int s_log_count = 0;
-    if (++s_log_count <= 6 || s_log_count % 30 == 0) {
-        WAYWAL_LOG_INFO("GPU SHM dispatch (%ux%u): compute=%.2fms readpixels=%.2fms", width, height,
-                        comp_ms, read_ms);
-    }
 
     return true;
 }
@@ -1318,6 +1292,17 @@ static GLuint ensure_kawase_half_tex(gpu_compute_ctx_t *ctx, uint32_t width, uin
     return ctx->kawase_half_tex;
 }
 
+void gpu_compute_set_span_bounds(gpu_compute_ctx_t *ctx, int32_t off_x, int32_t off_y,
+                                 int32_t total_w, int32_t total_h)
+{
+    if (!ctx)
+        return;
+    ctx->span_bounds[0] = off_x;
+    ctx->span_bounds[1] = off_y;
+    ctx->span_bounds[2] = total_w;
+    ctx->span_bounds[3] = total_h;
+}
+
 bool gpu_compute_upload_static(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, uint32_t src_w,
                                uint32_t src_h, dmabuf_bo_t *dst_bo, waywal_scaling_mode_t scaling,
                                uint32_t clear_color)
@@ -1377,6 +1362,9 @@ bool gpu_compute_upload_static(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, 
         glUniform4f(ctx->loc_scale_clear, cr, cg, cb, ca);
     if (ctx->loc_scale_has_src >= 0)
         glUniform1i(ctx->loc_scale_has_src, has_src ? 1 : 0);
+    if (ctx->loc_scale_span_bounds >= 0)
+        glUniform4i(ctx->loc_scale_span_bounds, ctx->span_bounds[0], ctx->span_bounds[1],
+                    ctx->span_bounds[2], ctx->span_bounds[3]);
 
     GLuint groups_x = (dst_bo->width + 15) / 16;
     GLuint groups_y = (dst_bo->height + 15) / 16;

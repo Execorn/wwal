@@ -5,6 +5,7 @@
 #include "waywal/log.h"
 #include "waywal/power_governor.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
 #include <stdio.h>
@@ -15,19 +16,35 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Declared in dmabuf_alloc.c — matches compositor dev_t to /dev/dri/renderD* */
 int open_drm_node_by_devt(dev_t target_dev);
 
+typedef struct wlr_toplevel_entry {
+    struct zwlr_foreign_toplevel_handle_v1 *handle;
+    daemon_state_t *state;
+    struct wl_output *outputs[8];
+    size_t num_outputs;
+    bool maximized;
+    bool fullscreen;
+    bool minimized;
+    struct wlr_toplevel_entry *next;
+} wlr_toplevel_entry_t;
+
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface, wl_fixed_t surface_x, wl_fixed_t surface_y)
 {
     (void)pointer;
-    (void)serial;
     daemon_state_t *state = (daemon_state_t *)data;
     if (!state || !surface)
         return;
+
+    if (state->cursor_shape_dev) {
+        wp_cursor_shape_device_v1_set_shape(state->cursor_shape_dev, serial,
+                                            WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+    }
 
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (out->surface == surface) {
@@ -52,6 +69,7 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (out->surface == surface) {
             out->has_cursor = false;
+            out->button_down = false;
             break;
         }
     }
@@ -76,14 +94,29 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
 }
 
 static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time,
-                           uint32_t button, uint32_t state)
+                           uint32_t button, uint32_t state_val)
 {
-    (void)data;
     (void)pointer;
     (void)serial;
     (void)time;
     (void)button;
-    (void)state;
+    daemon_state_t *state = (daemon_state_t *)data;
+    if (!state)
+        return;
+
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (out->has_cursor) {
+            if (state_val == WL_POINTER_BUTTON_STATE_PRESSED) {
+                out->button_down = true;
+                out->click_pulse = true;
+                out->click_x = out->cursor_x;
+                out->click_y = out->cursor_y;
+            } else if (state_val == WL_POINTER_BUTTON_STATE_RELEASED) {
+                out->button_down = false;
+            }
+            break;
+        }
+    }
 }
 
 static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis,
@@ -144,7 +177,15 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabil
     if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && !state->pointer) {
         state->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(state->pointer, &pointer_listener, state);
+        if (state->cursor_shape_mgr && !state->cursor_shape_dev) {
+            state->cursor_shape_dev =
+                wp_cursor_shape_manager_v1_get_pointer(state->cursor_shape_mgr, state->pointer);
+        }
     } else if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) && state->pointer) {
+        if (state->cursor_shape_dev) {
+            wp_cursor_shape_device_v1_destroy(state->cursor_shape_dev);
+            state->cursor_shape_dev = NULL;
+        }
         wl_pointer_destroy(state->pointer);
         state->pointer = NULL;
     }
@@ -161,6 +202,73 @@ static const struct wl_seat_listener seat_listener = {
     .capabilities = seat_capabilities,
     .name = seat_name,
 };
+
+static void xdg_output_handle_logical_position(void *data, struct zxdg_output_v1 *xdg_output,
+                                               int32_t x, int32_t y)
+{
+    (void)xdg_output;
+    output_node_t *out = (output_node_t *)data;
+    if (out) {
+        out->logical_x = x;
+        out->logical_y = y;
+        out->has_logical_pos = true;
+    }
+}
+
+static void xdg_output_handle_logical_size(void *data, struct zxdg_output_v1 *xdg_output,
+                                           int32_t width, int32_t height)
+{
+    (void)xdg_output;
+    output_node_t *out = (output_node_t *)data;
+    if (out && width > 0 && height > 0) {
+        out->logical_width = (uint32_t)width;
+        out->logical_height = (uint32_t)height;
+    }
+}
+
+static void xdg_output_handle_done(void *data, struct zxdg_output_v1 *xdg_output)
+{
+    (void)data;
+    (void)xdg_output;
+}
+
+static void xdg_output_handle_name(void *data, struct zxdg_output_v1 *xdg_output, const char *name)
+{
+    (void)xdg_output;
+    output_node_t *out = (output_node_t *)data;
+    if (out && name && !out->name[0]) {
+        snprintf(out->name, sizeof(out->name), "%s", name);
+    }
+}
+
+static void xdg_output_handle_description(void *data, struct zxdg_output_v1 *xdg_output,
+                                          const char *description)
+{
+    (void)xdg_output;
+    output_node_t *out = (output_node_t *)data;
+    if (out && description && !out->description[0]) {
+        snprintf(out->description, sizeof(out->description), "%s", description);
+    }
+}
+
+static const struct zxdg_output_v1_listener xdg_output_listener = {
+    .logical_position = xdg_output_handle_logical_position,
+    .logical_size = xdg_output_handle_logical_size,
+    .done = xdg_output_handle_done,
+    .name = xdg_output_handle_name,
+    .description = xdg_output_handle_description,
+};
+
+static void bind_xdg_output_for_node(daemon_state_t *state, output_node_t *node)
+{
+    if (!state || !state->xdg_output_mgr || !node || !node->wl_output || node->xdg_output)
+        return;
+    node->xdg_output =
+        zxdg_output_manager_v1_get_xdg_output(state->xdg_output_mgr, node->wl_output);
+    if (node->xdg_output) {
+        zxdg_output_v1_add_listener(node->xdg_output, &xdg_output_listener, node);
+    }
+}
 
 static void idle_handle_idled(void *data, struct ext_idle_notification_v1 *notification)
 {
@@ -206,6 +314,210 @@ static void ensure_idle_notification(daemon_state_t *state)
                                               state);
     }
 }
+
+static void recompute_wlr_toplevel_power_state(daemon_state_t *state)
+{
+    if (!state || !state->power_gov)
+        return;
+
+    bool changed = false;
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (!out->name[0])
+            continue;
+        bool any_fs = false;
+        bool any_max = false;
+        for (wlr_toplevel_entry_t *e = (wlr_toplevel_entry_t *)state->wlr_toplevels; e != NULL;
+             e = e->next) {
+            if (e->minimized)
+                continue;
+            bool on_out = (e->num_outputs == 0);
+            for (size_t i = 0; i < e->num_outputs; ++i) {
+                if (e->outputs[i] == out->wl_output) {
+                    on_out = true;
+                    break;
+                }
+            }
+            if (!on_out)
+                continue;
+            if (e->fullscreen)
+                any_fs = true;
+            if (e->maximized)
+                any_max = true;
+        }
+        bool pause_fs = any_fs && state->config.daemon.auto_pause_fullscreen;
+        bool pause_max = any_max && state->config.daemon.auto_pause_maximized;
+        uint32_t prev_mask = waywal_power_governor_get_output_mask(state->power_gov, out->name);
+        waywal_power_governor_set_output_reason(state->power_gov, out->name,
+                                                WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, pause_fs);
+        waywal_power_governor_set_output_reason(state->power_gov, out->name,
+                                                WAYWAL_PAUSE_TOPLEVEL_MAXIMIZED, pause_max);
+        uint32_t new_mask = waywal_power_governor_get_output_mask(state->power_gov, out->name);
+        if (prev_mask != new_mask)
+            changed = true;
+    }
+
+    if (changed && state->on_power_state_changed) {
+        state->on_power_state_changed(state);
+    }
+}
+
+static void wlr_toplevel_handle_title(void *data, struct zwlr_foreign_toplevel_handle_v1 *toplevel,
+                                      const char *title)
+{
+    (void)data;
+    (void)toplevel;
+    (void)title;
+}
+
+static void wlr_toplevel_handle_app_id(void *data, struct zwlr_foreign_toplevel_handle_v1 *toplevel,
+                                       const char *app_id)
+{
+    (void)data;
+    (void)toplevel;
+    (void)app_id;
+}
+
+static void wlr_toplevel_handle_output_enter(void *data,
+                                             struct zwlr_foreign_toplevel_handle_v1 *toplevel,
+                                             struct wl_output *output)
+{
+    (void)toplevel;
+    wlr_toplevel_entry_t *e = (wlr_toplevel_entry_t *)data;
+    if (!e || !output)
+        return;
+    for (size_t i = 0; i < e->num_outputs; ++i) {
+        if (e->outputs[i] == output)
+            return;
+    }
+    if (e->num_outputs < 8) {
+        e->outputs[e->num_outputs++] = output;
+    }
+}
+
+static void wlr_toplevel_handle_output_leave(void *data,
+                                             struct zwlr_foreign_toplevel_handle_v1 *toplevel,
+                                             struct wl_output *output)
+{
+    (void)toplevel;
+    wlr_toplevel_entry_t *e = (wlr_toplevel_entry_t *)data;
+    if (!e || !output)
+        return;
+    for (size_t i = 0; i < e->num_outputs; ++i) {
+        if (e->outputs[i] == output) {
+            e->outputs[i] = e->outputs[e->num_outputs - 1];
+            e->num_outputs--;
+            return;
+        }
+    }
+}
+
+static void wlr_toplevel_handle_state(void *data, struct zwlr_foreign_toplevel_handle_v1 *toplevel,
+                                      struct wl_array *state_arr)
+{
+    (void)toplevel;
+    wlr_toplevel_entry_t *e = (wlr_toplevel_entry_t *)data;
+    if (!e || !state_arr)
+        return;
+    e->maximized = false;
+    e->fullscreen = false;
+    e->minimized = false;
+    const uint32_t *vals = (const uint32_t *)state_arr->data;
+    size_t count = state_arr->size / sizeof(uint32_t);
+    for (size_t i = 0; i < count; ++i) {
+        if (vals[i] == ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_MAXIMIZED)
+            e->maximized = true;
+        else if (vals[i] == ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_MINIMIZED)
+            e->minimized = true;
+        else if (vals[i] == ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_FULLSCREEN)
+            e->fullscreen = true;
+    }
+}
+
+static void wlr_toplevel_handle_done(void *data, struct zwlr_foreign_toplevel_handle_v1 *toplevel)
+{
+    (void)toplevel;
+    wlr_toplevel_entry_t *e = (wlr_toplevel_entry_t *)data;
+    if (e && e->state) {
+        recompute_wlr_toplevel_power_state(e->state);
+    }
+}
+
+static void wlr_toplevel_handle_closed(void *data, struct zwlr_foreign_toplevel_handle_v1 *toplevel)
+{
+    wlr_toplevel_entry_t *e = (wlr_toplevel_entry_t *)data;
+    daemon_state_t *state = e ? e->state : NULL;
+    if (state && e) {
+        wlr_toplevel_entry_t **pp = (wlr_toplevel_entry_t **)&state->wlr_toplevels;
+        while (*pp) {
+            if (*pp == e) {
+                *pp = e->next;
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+    }
+    if (toplevel) {
+        zwlr_foreign_toplevel_handle_v1_destroy(toplevel);
+    }
+    free(e);
+    if (state) {
+        recompute_wlr_toplevel_power_state(state);
+    }
+}
+
+static void wlr_toplevel_handle_parent(void *data, struct zwlr_foreign_toplevel_handle_v1 *toplevel,
+                                       struct zwlr_foreign_toplevel_handle_v1 *parent)
+{
+    (void)data;
+    (void)toplevel;
+    (void)parent;
+}
+
+static const struct zwlr_foreign_toplevel_handle_v1_listener wlr_toplevel_handle_listener = {
+    .title = wlr_toplevel_handle_title,
+    .app_id = wlr_toplevel_handle_app_id,
+    .output_enter = wlr_toplevel_handle_output_enter,
+    .output_leave = wlr_toplevel_handle_output_leave,
+    .state = wlr_toplevel_handle_state,
+    .done = wlr_toplevel_handle_done,
+    .closed = wlr_toplevel_handle_closed,
+    .parent = wlr_toplevel_handle_parent,
+};
+
+static void wlr_toplevel_mgr_handle_toplevel(void *data,
+                                             struct zwlr_foreign_toplevel_manager_v1 *manager,
+                                             struct zwlr_foreign_toplevel_handle_v1 *toplevel)
+{
+    (void)manager;
+    daemon_state_t *state = (daemon_state_t *)data;
+    if (!state || !toplevel)
+        return;
+    wlr_toplevel_entry_t *e = (wlr_toplevel_entry_t *)calloc(1, sizeof(wlr_toplevel_entry_t));
+    if (!e)
+        return;
+    e->handle = toplevel;
+    e->state = state;
+    e->next = (wlr_toplevel_entry_t *)state->wlr_toplevels;
+    state->wlr_toplevels = e;
+    zwlr_foreign_toplevel_handle_v1_add_listener(toplevel, &wlr_toplevel_handle_listener, e);
+}
+
+static void wlr_toplevel_mgr_handle_finished(void *data,
+                                             struct zwlr_foreign_toplevel_manager_v1 *manager)
+{
+    daemon_state_t *state = (daemon_state_t *)data;
+    if (manager) {
+        zwlr_foreign_toplevel_manager_v1_destroy(manager);
+    }
+    if (state && state->wlr_foreign_toplevel_mgr == manager) {
+        state->wlr_foreign_toplevel_mgr = NULL;
+    }
+}
+
+static const struct zwlr_foreign_toplevel_manager_v1_listener wlr_toplevel_mgr_listener = {
+    .toplevel = wlr_toplevel_mgr_handle_toplevel,
+    .finished = wlr_toplevel_mgr_handle_finished,
+};
 
 static void foreign_toplevel_handle_closed(void *data,
                                            struct ext_foreign_toplevel_handle_v1 *toplevel)
@@ -315,6 +627,32 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         state->syncobj_mgr = (struct wp_linux_drm_syncobj_manager_v1 *)wl_registry_bind(
             registry, name, &wp_linux_drm_syncobj_manager_v1_interface, 1);
         WAYWAL_LOG_INFO("Bound wp_linux_drm_syncobj_manager_v1");
+    } else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
+        uint32_t ver = version >= 3 ? 3 : version;
+        state->xdg_output_mgr = (struct zxdg_output_manager_v1 *)wl_registry_bind(
+            registry, name, &zxdg_output_manager_v1_interface, ver);
+        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            bind_xdg_output_for_node(state, out);
+        }
+        WAYWAL_LOG_INFO("Bound zxdg_output_manager_v1 version %u", ver);
+    } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
+        state->cursor_shape_mgr = (struct wp_cursor_shape_manager_v1 *)wl_registry_bind(
+            registry, name, &wp_cursor_shape_manager_v1_interface, 1);
+        if (state->cursor_shape_mgr && state->pointer && !state->cursor_shape_dev) {
+            state->cursor_shape_dev =
+                wp_cursor_shape_manager_v1_get_pointer(state->cursor_shape_mgr, state->pointer);
+        }
+        WAYWAL_LOG_INFO("Bound wp_cursor_shape_manager_v1");
+    } else if (strcmp(interface, zwlr_foreign_toplevel_manager_v1_interface.name) == 0) {
+        uint32_t ver = version >= 3 ? 3 : version;
+        state->wlr_foreign_toplevel_mgr =
+            (struct zwlr_foreign_toplevel_manager_v1 *)wl_registry_bind(
+                registry, name, &zwlr_foreign_toplevel_manager_v1_interface, ver);
+        if (state->wlr_foreign_toplevel_mgr) {
+            zwlr_foreign_toplevel_manager_v1_add_listener(state->wlr_foreign_toplevel_mgr,
+                                                          &wlr_toplevel_mgr_listener, state);
+        }
+        WAYWAL_LOG_INFO("Bound zwlr_foreign_toplevel_manager_v1 version %u", ver);
     } else if (strcmp(interface, ext_idle_notifier_v1_interface.name) == 0) {
         uint32_t ver = version >= 2 ? 2 : 1;
         state->idle_notifier = (struct ext_idle_notifier_v1 *)wl_registry_bind(
@@ -351,6 +689,7 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
             node->state = state;
             state->outputs = state->output_mgr.head;
             state->num_outputs = state->output_mgr.count;
+            bind_xdg_output_for_node(state, node);
             WAYWAL_LOG_INFO("Discovered Wayland output id %u", name);
             /* Defer surface creation during initial startup until dmabuf_feedback_init
              * has negotiated the compositor's DRM device and format modifiers. */
@@ -389,6 +728,7 @@ bool daemon_wayland_init(daemon_state_t *state)
     if (!state)
         return false;
 
+    state->cursor_ipc_fd = -1;
     state->display = wl_display_connect(NULL);
     if (!state->display) {
         WAYWAL_LOG_ERR(
@@ -553,6 +893,20 @@ void daemon_wayland_destroy(daemon_state_t *state)
     if (!state)
         return;
 
+    if (state->cursor_ipc_fd >= 0) {
+        close(state->cursor_ipc_fd);
+        state->cursor_ipc_fd = -1;
+    }
+
+    while (state->wlr_toplevels) {
+        wlr_toplevel_entry_t *e = (wlr_toplevel_entry_t *)state->wlr_toplevels;
+        state->wlr_toplevels = e->next;
+        if (e->handle) {
+            zwlr_foreign_toplevel_handle_v1_destroy(e->handle);
+        }
+        free(e);
+    }
+
     output_node_t *out = state->outputs;
     while (out) {
         output_node_destroy_surface(out);
@@ -568,6 +922,22 @@ void daemon_wayland_destroy(daemon_state_t *state)
     /* Destroy hardware scanout context */
     dmabuf_context_destroy(&state->dmabuf_ctx);
 
+    if (state->wlr_foreign_toplevel_mgr) {
+        zwlr_foreign_toplevel_manager_v1_destroy(state->wlr_foreign_toplevel_mgr);
+        state->wlr_foreign_toplevel_mgr = NULL;
+    }
+    if (state->cursor_shape_dev) {
+        wp_cursor_shape_device_v1_destroy(state->cursor_shape_dev);
+        state->cursor_shape_dev = NULL;
+    }
+    if (state->cursor_shape_mgr) {
+        wp_cursor_shape_manager_v1_destroy(state->cursor_shape_mgr);
+        state->cursor_shape_mgr = NULL;
+    }
+    if (state->xdg_output_mgr) {
+        zxdg_output_manager_v1_destroy(state->xdg_output_mgr);
+        state->xdg_output_mgr = NULL;
+    }
     if (state->idle_notification) {
         ext_idle_notification_v1_destroy(state->idle_notification);
         state->idle_notification = NULL;
@@ -630,24 +1000,30 @@ void daemon_wayland_destroy(daemon_state_t *state)
     }
 }
 
-bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *out_x,
-                             double *out_y)
+static bool query_hyprland_cursor_global(daemon_state_t *state, double *gx, double *gy)
 {
-    if (!state || !out_x || !out_y)
-        return false;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
-    if (out && out->has_cursor) {
-        *out_x = out->cursor_x;
-        *out_y = out->cursor_y;
+    /* Throttle IPC query to 60Hz (~16.6ms) */
+    if (state->has_cached_ipc_cursor && state->last_cursor_ipc_ns > 0 &&
+        (now_ns - state->last_cursor_ipc_ns) < 16666666ULL) {
+        *gx = state->cached_ipc_cursor_x;
+        *gy = state->cached_ipc_cursor_y;
         return true;
     }
 
-    /* Fallback to Hyprland IPC when pointer focus is on a window above the layer surface */
     const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
     const char *xrd = getenv("XDG_RUNTIME_DIR");
-    if (his && his[0] && xrd && xrd[0]) {
-        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd >= 0) {
+    if (!his || !his[0] || !xrd || !xrd[0])
+        return false;
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (state->cursor_ipc_fd < 0) {
+            int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0)
+                return false;
             struct sockaddr_un addr = {0};
             addr.sun_family = AF_UNIX;
             int path_len =
@@ -656,40 +1032,100 @@ bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *
                 close(fd);
                 return false;
             }
-
-            struct timeval tv = {.tv_sec = 0, .tv_usec = 25000}; /* 25ms timeout */
+            struct timeval tv = {.tv_sec = 0, .tv_usec = 10000};
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+                close(fd);
+                return false;
+            }
+            state->cursor_ipc_fd = fd;
+        }
 
-            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-                if (write(fd, "cursorpos\n", 10) == 10) {
-                    char buf[128] = {0};
-                    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-                    if (n > 0) {
-                        buf[n] = '\0';
-                        int x = 0, y = 0;
-                        if (sscanf(buf, "%d, %d", &x, &y) == 2) {
-                            close(fd);
-                            if (out && out->width > 0 && out->height > 0) {
-                                *out_x = (double)(x % out->width);
-                                *out_y = (double)(y % out->height);
-                            } else {
-                                *out_x = (double)x;
-                                *out_y = (double)y;
-                            }
-                            return true;
-                        }
-                    }
+        ssize_t w = send(state->cursor_ipc_fd, "cursorpos", 9, MSG_NOSIGNAL);
+        if (w == 9) {
+            char buf[128] = {0};
+            ssize_t n = recv(state->cursor_ipc_fd, buf, sizeof(buf) - 1, 0);
+            if (n > 0) {
+                buf[n] = '\0';
+                int x = 0, y = 0;
+                if (sscanf(buf, "%d, %d", &x, &y) == 2) {
+                    close(state->cursor_ipc_fd);
+                    state->cursor_ipc_fd = -1;
+                    state->cached_ipc_cursor_x = (double)x;
+                    state->cached_ipc_cursor_y = (double)y;
+                    state->has_cached_ipc_cursor = true;
+                    state->last_cursor_ipc_ns = now_ns;
+                    *gx = (double)x;
+                    *gy = (double)y;
+                    return true;
                 }
             }
-            close(fd);
         }
+        close(state->cursor_ipc_fd);
+        state->cursor_ipc_fd = -1;
     }
 
-    /* 2. Check native Wayland pointer event cache */
+    return false;
+}
+
+bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *out_x,
+                             double *out_y)
+{
+    if (!state || !out_x || !out_y)
+        return false;
+
+    /* Tier 1: Direct Wayland wl_pointer focus on wallpaper layer surface */
     if (out && out->has_cursor) {
         *out_x = out->cursor_x;
         *out_y = out->cursor_y;
+        return true;
+    }
+
+    double ref_w =
+        out ? (out->logical_width > 0 ? (double)out->logical_width : (double)out->width) : 1920.0;
+    double ref_h =
+        out ? (out->logical_height > 0 ? (double)out->logical_height : (double)out->height)
+            : 1080.0;
+
+    /* Tier 2: Compositor IPC Fallback when occluded, throttled to 60Hz */
+    double gx = 0.0, gy = 0.0;
+    if (query_hyprland_cursor_global(state, &gx, &gy)) {
+        if (out) {
+            double lx = gx - (double)out->global_x;
+            double ly = gy - (double)out->global_y;
+            if (ref_w > 0.0 && ref_h > 0.0) {
+                if (lx < 0.0)
+                    lx = 0.0;
+                else if (lx > ref_w)
+                    lx = ref_w;
+                if (ly < 0.0)
+                    ly = 0.0;
+                else if (ly > ref_h)
+                    ly = ref_h;
+            }
+            out->cursor_x = lx;
+            out->cursor_y = ly;
+            *out_x = lx;
+            *out_y = ly;
+        } else {
+            *out_x = gx;
+            *out_y = gy;
+        }
+        return true;
+    }
+
+    /* Tier 3: Last-known cached wl_pointer coordinates */
+    if (out && (out->cursor_x > 0.0 || out->cursor_y > 0.0)) {
+        *out_x = out->cursor_x;
+        *out_y = out->cursor_y;
+        return true;
+    }
+
+    /* Tier 4: Screen center fallback */
+    if (ref_w > 0.0 && ref_h > 0.0) {
+        *out_x = ref_w * 0.5;
+        *out_y = ref_h * 0.5;
         return true;
     }
 

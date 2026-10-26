@@ -22,7 +22,7 @@
 - **True Physical HiDPI Sharpness**: Binds `wp_fractional_scale_v1` and `wp_viewporter` so 4K and 5K monitors at `1.25x`, `1.5x`, or `1.75x` scale render at exact physical pixel dimensions without blurry compositor upscaling.
 - **Hardware Video & Native Animations**: Plays H.264, HEVC, VP9, and AV1 videos without FFmpeg runtime dependencies using VA-API (`libva`), direct `NV12`/`P010` KMS scanout on Intel/AMD, a 3-surface `BGRX` VPP ring on NVIDIA, and an in-process GIF/APNG/WebP delta-frame engine.
 - **Zero-Watt Smart Occlusion & Battery Governor**: Pauses video and shader rendering down to **0.00% CPU and GPU** when a monitor has a fullscreen or maximized window (`ext-foreign-toplevel-list-v1` + Hyprland/Sway IPC), when the session is idle (`ext-idle-notify-v1`), or when running on laptop battery power.
-- **Live Shadertoy & Audio-Reactive Wallpapers**: Runs GLSL ES 3.1 `.comp` and Shadertoy `.frag` shaders (`wwal shader`) with a binary shader cache (`< 0.08 ms` warm load), live `inotify` hot-reload, and a lock-free PipeWire 2048-point AVX2 64-bin Bark-scale audio FFT (`--audio`).
+- **Live Multi-Pass Shadertoy, Depth Parallax & Audio-Reactive Wallpapers**: Runs GLSL ES 3.1 `.comp` and multi-pass Shadertoy `.frag` shaders (`BUFFER_A`..`BUFFER_D` `GL_RGBA16F` ping-pong feedback, `iChannel0`..`iChannel3`, `iMouse`, `iDate`), 2.5D depth-map parallax (`--depth-map`, `--depth-strength`), a binary shader cache (`< 0.08 ms` warm load), live `inotify` hot-reload, and a lock-free PipeWire 2048-point AVX2 64-bin Bark-scale audio FFT (`--audio`).
 - **Sub-Millisecond Material You & Quickshell (`caelestia`) Theming**: Extracts Material Design 3 (`CAM16`/`HCT`) and `OKLab` palettes from 4K images in **0.32 ms** using AVX2 Wu 3D moment quantization and weighted K-Means++, writing `~/.local/state/caelestia/scheme.json`, `~/.cache/wwal/colors.{json,css,hyprland.conf}`, and `/dev/pts/*` terminal OSC sequences.
 - **Drop-In `swww` / `awww` Compatibility**: Works as a drop-in replacement for `swww` and `awww` scripts (`waypaper`, Rofi pickers) and decodes PNG, JPEG, BMP, WebP, AVIF (including macOS Solar Dynamic multi-frame files), JPEG-XL, GIF, APNG, and SVG.
 
@@ -176,6 +176,8 @@ Key Options:
   --fill-color <RRGGBB>      Padding color for fit/center modes
   --filter <FILTER>          Nearest, Bilinear, CatmullRom, Mitchell, Lanczos3
   --backdrop <MODE>          none, auto-blur (Dual-Kawase blur for Niri overview), or image path
+  --depth-map <PATH>         2.5D depth map image for cursor/workspace parallax
+  --depth-strength <FLOAT>   Depth parallax displacement multiplier (default: 1.0)
   --layer <LAYER>            background or bottom
   --battery-policy <POLICY>  ignore, reduce-fps, or pause-video
   --audio                    Enable PipeWire 64-bin Bark FFT uniforms & iChannel0 for shaders
@@ -209,8 +211,7 @@ wwal/
 │   ├── void/template                  # Void Linux xbps-src template
 │   ├── systemd/                       # wwald.service and wwald.socket user units
 │   └── completions/                   # Bash, Zsh, and Fish completions
-├── protocols/
-│   └── wlr-layer-shell-unstable-v1.xml # wlroots Layer Shell XML protocol
+├── protocols/                         # Wayland XML protocols (wlr-layer-shell, wlr-foreign-toplevel)
 ├── scripts/
 │   ├── embed_shaders.py               # Build-time GLSL compute shader embedding script
 │   ├── build_optimized.sh             # PGO + LTO + LLVM BOLT build pipeline

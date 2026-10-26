@@ -89,13 +89,19 @@ static void test_presentation_pll_vrr_tracking(void)
 }
 
 static int g_uring_cb_count = 0;
+static bool g_uring_readd_in_cb = false;
 static void test_uring_callback(uring_event_type_t type, int fd, uint32_t res, void *user_data)
 {
-    (void)fd;
     (void)res;
-    (void)user_data;
     if (type == URING_EV_WAYLAND_READ) {
         g_uring_cb_count++;
+        if (g_uring_readd_in_cb && user_data) {
+            uring_loop_t *lp = (uring_loop_t *)user_data;
+            char tmp;
+            (void)read(fd, &tmp, 1);
+            assert(uring_loop_remove_poll(lp, fd));
+            assert(uring_loop_add_poll(lp, fd, POLLIN, URING_EV_WAYLAND_READ, lp));
+        }
     }
 }
 
@@ -111,19 +117,24 @@ static void test_io_uring_event_loop(void)
     int ret = pipe2(fds, O_NONBLOCK | O_CLOEXEC);
     assert(ret == 0);
 
-    /* Register read end with io_uring */
-    bool poll_ok = uring_loop_add_poll(&loop, fds[0], POLLIN, URING_EV_WAYLAND_READ, NULL);
+    /* Register read end with io_uring and verify duplicate registration does not submit duplicate
+     * SQEs */
+    bool poll_ok = uring_loop_add_poll(&loop, fds[0], POLLIN, URING_EV_WAYLAND_READ, &loop);
     assert(poll_ok);
+    assert(uring_loop_add_poll(&loop, fds[0], POLLIN, URING_EV_WAYLAND_READ, &loop));
     assert(loop.multishot_supported);
     assert(loop.slots[0].is_multishot);
+    assert(loop.slots[0].in_flight);
+    assert(!loop.slots[1].active);
 
-    /* Write 1 byte to trigger first multishot event */
+    /* Write 1 byte to trigger first event */
     char byte = 0x42;
     ssize_t w = write(fds[1], &byte, 1);
     assert(w == 1);
 
     /* Dispatch loop */
     g_uring_cb_count = 0;
+    g_uring_readd_in_cb = false;
     int dispatched = uring_loop_dispatch(&loop, test_uring_callback);
     assert(dispatched >= 1);
     assert(g_uring_cb_count == 1);
@@ -132,13 +143,31 @@ static void test_io_uring_event_loop(void)
     char rbuf;
     read(fds[0], &rbuf, 1);
 
-    /* Write a second byte without calling uring_loop_add_poll again to verify multishot
-     * continuation */
+    /* Write a second byte without calling uring_loop_add_poll again to verify continuation */
     w = write(fds[1], &byte, 1);
     assert(w == 1);
     dispatched = uring_loop_dispatch(&loop, test_uring_callback);
     assert(dispatched >= 1);
     assert(g_uring_cb_count == 2);
+    read(fds[0], &rbuf, 1);
+
+    /* Test remove + re-add of same fd inside dispatch callback (power_governor reconnect pattern)
+     */
+    g_uring_readd_in_cb = true;
+    w = write(fds[1], &byte, 1);
+    assert(w == 1);
+    dispatched = uring_loop_dispatch(&loop, test_uring_callback);
+    assert(dispatched >= 1);
+    assert(g_uring_cb_count == 3);
+    assert(loop.slots[0].active && loop.slots[0].in_flight);
+    g_uring_readd_in_cb = false;
+
+    /* Verify that a subsequent write triggers exactly 1 callback (no duplicate SQE armed) */
+    w = write(fds[1], &byte, 1);
+    assert(w == 1);
+    dispatched = uring_loop_dispatch(&loop, test_uring_callback);
+    assert(dispatched >= 1);
+    assert(g_uring_cb_count == 4);
     read(fds[0], &rbuf, 1);
 
     close(fds[0]);

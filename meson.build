@@ -64,6 +64,14 @@ if seccomp_dep.found()
   add_project_arguments('-DHAVE_LIBSECCOMP', language: 'c')
 endif
 
+avcodec_dep = dependency('libavcodec', required: get_option('ffmpeg_swdec'))
+avutil_dep = dependency('libavutil', required: get_option('ffmpeg_swdec'))
+swscale_dep = dependency('libswscale', required: get_option('ffmpeg_swdec'))
+have_ffmpeg_swdec = avcodec_dep.found() and avutil_dep.found() and swscale_dep.found()
+if have_ffmpeg_swdec
+  add_project_arguments('-DHAVE_FFMPEG_SWDEC=1', language: 'c')
+endif
+
 # Optional runtime dlopen plugin probing
 webp_dep = dependency('libwebp', required: get_option('webp').enabled())
 avif_dep = dependency('libavif', required: get_option('avif').enabled())
@@ -155,7 +163,11 @@ protocols = [
   wl_protocol_dir / 'staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml',
   wl_protocol_dir / 'staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml',
   wl_protocol_dir / 'staging/ext-idle-notify/ext-idle-notify-v1.xml',
+  wl_protocol_dir / 'unstable/xdg-output/xdg-output-unstable-v1.xml',
+  wl_protocol_dir / 'staging/cursor-shape/cursor-shape-v1.xml',
+  wl_protocol_dir / 'unstable/tablet/tablet-unstable-v2.xml',
   'protocols/wlr-layer-shell-unstable-v1.xml',
+  'protocols/wlr-foreign-toplevel-management-unstable-v1.xml',
 ]
 
 proto_sources = []
@@ -252,6 +264,13 @@ daemon_deps = [
   threads_dep,
   m_dep
 ]
+if have_ffmpeg_swdec
+  daemon_deps += [
+    avcodec_dep.partial_dependency(compile_args: true, includes: true),
+    avutil_dep.partial_dependency(compile_args: true, includes: true),
+    swscale_dep.partial_dependency(compile_args: true, includes: true),
+  ]
+endif
 if openmp_dep.found()
   daemon_deps += openmp_dep
 endif

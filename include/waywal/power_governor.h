@@ -39,10 +39,12 @@ void waywal_power_governor_destroy(waywal_power_governor_t *gov);
 
 int waywal_power_governor_get_ipc_fd(const waywal_power_governor_t *gov);
 int waywal_power_governor_get_inotify_fd(const waywal_power_governor_t *gov);
+bool waywal_power_governor_consume_ipc_reconnected(waywal_power_governor_t *gov);
 
 void waywal_power_governor_dispatch_ipc(waywal_power_governor_t *gov);
 void waywal_power_governor_feed_hyprland_event(waywal_power_governor_t *gov, const char *line);
 void waywal_power_governor_feed_sway_payload(waywal_power_governor_t *gov, const char *json);
+void waywal_power_governor_feed_niri_event(waywal_power_governor_t *gov, const char *json);
 bool waywal_power_governor_pop_workspace_change(waywal_power_governor_t *gov, char *out_ws,
                                                 size_t ws_cap, char *out_mon, size_t mon_cap);
 
@@ -51,6 +53,9 @@ void waywal_power_governor_set_on_battery(waywal_power_governor_t *gov, bool on_
 bool waywal_power_governor_is_on_battery(const waywal_power_governor_t *gov);
 void waywal_power_governor_set_battery_policy(waywal_power_governor_t *gov,
                                               waywal_battery_policy_t policy);
+void waywal_power_governor_set_pause_policies(waywal_power_governor_t *gov,
+                                              bool auto_pause_fullscreen, bool auto_pause_maximized,
+                                              bool pause_on_occluded_workspace);
 
 void waywal_power_governor_set_output_reason(waywal_power_governor_t *gov, const char *output_name,
                                              waywal_pause_reason_t reason, bool active);

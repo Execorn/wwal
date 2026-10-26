@@ -56,6 +56,9 @@ bool gpu_compute_upload_static(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, 
                                uint32_t src_h, dmabuf_bo_t *dst_bo, waywal_scaling_mode_t scaling,
                                uint32_t clear_color);
 
+void gpu_compute_set_span_bounds(gpu_compute_ctx_t *ctx, int32_t off_x, int32_t off_y,
+                                 int32_t total_w, int32_t total_h);
+
 bool gpu_compute_render_kawase_blur(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, uint32_t src_w,
                                     uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t radius);
 

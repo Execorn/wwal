@@ -841,6 +841,310 @@ static void test_high_precision_monotonic_timer(void)
     printf("[TEST] test_high_precision_monotonic_timer PASSED.\n");
 }
 
+static void test_webm_duration_and_lacing(void)
+{
+    printf("[TEST] Running test_webm_duration_and_lacing...\n");
+
+    uint8_t buf[8192];
+    uint8_t *p = buf;
+
+    /* EBML Header */
+    *p++ = 0x1A;
+    *p++ = 0x45;
+    *p++ = 0xDF;
+    *p++ = 0xA3;
+    *p++ = 0x80;
+
+    /* Segment */
+    *p++ = 0x18;
+    *p++ = 0x53;
+    *p++ = 0x80;
+    *p++ = 0x67;
+    uint8_t *seg_sz = p;
+    p += 4;
+    uint8_t *seg_start = p;
+
+    /* Info (0x1549A966) with TimecodeScale = 1,000,000 ns (1ms) and Duration = 300.0 ms */
+    *p++ = 0x15;
+    *p++ = 0x49;
+    *p++ = 0xA9;
+    *p++ = 0x66;
+    uint8_t *info_sz = p;
+    p += 1;
+    uint8_t *info_start = p;
+
+    *p++ = 0x2A;
+    *p++ = 0xD7;
+    *p++ = 0xB1;
+    *p++ = 0x84;
+    write_u32_be(p, 1000000);
+    p += 4;
+
+    /* Duration (0x4489), float32 = 300.0f (0x43960000) -> 300,000 us for 9 frames (~30 fps) */
+    *p++ = 0x44;
+    *p++ = 0x89;
+    *p++ = 0x84;
+    write_u32_be(p, 0x43960000U);
+    p += 4;
+    *info_sz = (uint8_t)(0x80 | (p - info_start));
+
+    /* Tracks (0x1654AE6B) */
+    *p++ = 0x16;
+    *p++ = 0x54;
+    *p++ = 0xAE;
+    *p++ = 0x6B;
+    uint8_t *tracks_sz = p;
+    p += 1;
+    uint8_t *tracks_start = p;
+
+    *p++ = 0xAE;
+    uint8_t *entry_sz = p;
+    p += 1;
+    uint8_t *entry_start = p;
+
+    *p++ = 0xD7;
+    *p++ = 0x81;
+    *p++ = 1;
+    *p++ = 0x83;
+    *p++ = 0x81;
+    *p++ = 1;
+    *p++ = 0x86;
+    *p++ = 0x85;
+    memcpy(p, "V_VP9", 5);
+    p += 5;
+
+    *p++ = 0xE0;
+    *p++ = 0x88;
+    *p++ = 0xB0;
+    *p++ = 0x82;
+    write_u16_be(p, 1280);
+    p += 2;
+    *p++ = 0xBA;
+    *p++ = 0x82;
+    write_u16_be(p, 720);
+    p += 2;
+
+    *entry_sz = (uint8_t)(0x80 | (p - entry_start));
+    *tracks_sz = (uint8_t)(0x80 | (p - tracks_start));
+
+    /* Cluster 1: 3 laced SimpleBlocks (Xiph, Fixed, EBML) = 9 frames total */
+    *p++ = 0x1F;
+    *p++ = 0x43;
+    *p++ = 0xB6;
+    *p++ = 0x75;
+    uint8_t *clus_sz = p;
+    p += 2;
+    uint8_t *clus_start = p;
+
+    /* ClusterTimecode = 0 */
+    *p++ = 0xE7;
+    *p++ = 0x82;
+    write_u16_be(p, 0);
+    p += 2;
+
+    /* SimpleBlock 1: Xiph lacing (flags = 0x82 = keyframe + Xiph lacing), 3 frames (32, 48, 64) */
+    *p++ = 0xA3;
+    size_t sb1_len = 4 + 1 + 2 + 32 + 48 + 64;
+    *p++ = (uint8_t)(0x40 | (sb1_len >> 8));
+    *p++ = (uint8_t)(sb1_len & 0xFF);
+    *p++ = 0x81; /* track 1 */
+    write_u16_be(p, 0);
+    p += 2;
+    *p++ = 0x82; /* keyframe + Xiph lacing (01b << 1) */
+    *p++ = 2;    /* num_frames - 1 = 2 (3 frames) */
+    *p++ = 32;   /* frame 0 size */
+    *p++ = 48;   /* frame 1 size */
+    memset(p, 0x11, 32);
+    p += 32;
+    memset(p, 0x22, 48);
+    p += 48;
+    memset(p, 0x33, 64);
+    p += 64;
+
+    /* SimpleBlock 2: Fixed-size lacing (flags = 0x04), 3 frames of 40 bytes each */
+    *p++ = 0xA3;
+    size_t sb2_len = 4 + 1 + 40 * 3;
+    *p++ = (uint8_t)(0x40 | (sb2_len >> 8));
+    *p++ = (uint8_t)(sb2_len & 0xFF);
+    *p++ = 0x81;
+    write_u16_be(p, 100);
+    p += 2;
+    *p++ = 0x04; /* Fixed-size lacing (10b << 1) */
+    *p++ = 2;    /* 3 frames */
+    memset(p, 0x44, 40 * 3);
+    p += 40 * 3;
+
+    /* SimpleBlock 3: EBML lacing (flags = 0x06), 3 frames: 50, 60 (+10), 50 (-10) */
+    *p++ = 0xA3;
+    size_t sb3_len = 4 + 1 + 2 + 50 + 60 + 50;
+    *p++ = (uint8_t)(0x40 | (sb3_len >> 8));
+    *p++ = (uint8_t)(sb3_len & 0xFF);
+    *p++ = 0x81;
+    write_u16_be(p, 200);
+    p += 2;
+    *p++ = 0x06;                        /* EBML lacing (11b << 1) */
+    *p++ = 2;                           /* 3 frames */
+    *p++ = (uint8_t)(0x80 | 50);        /* frame 0 size = 50 (1-byte vint) */
+    *p++ = (uint8_t)(0x80 | (10 + 63)); /* frame 1 delta = +10 (1-byte signed vint bias 63) */
+    memset(p, 0x55, 50 + 60 + 50);
+    p += 50 + 60 + 50;
+
+    /* SimpleBlock 4 (malformed Xiph lacing): 3 frames where frame 0 size (1) equals remaining
+     * bytes before reading frame 1 lace byte, which previously underflowed (blk_end - blk_off) -
+     * sum_sizes to SIZE_MAX */
+    *p++ = 0xA3;
+    size_t sb4_len = 4 + 1 + 2;
+    *p++ = (uint8_t)(0x40 | (sb4_len >> 8));
+    *p++ = (uint8_t)(sb4_len & 0xFF);
+    *p++ = 0x81;
+    write_u16_be(p, 250);
+    p += 2;
+    *p++ = 0x02; /* Xiph lacing */
+    *p++ = 2;    /* 3 frames */
+    *p++ = 1;    /* frame 0 size = 1 */
+    *p++ = 1;    /* frame 1 size = 1 (advances blk_off to blk_end while sum_sizes == 1) */
+
+    /* SimpleBlock 5 (malformed EBML lacing): 3 frames where first_sz (1) equals remaining bytes
+     * before reading frame 1 signed vint, which previously underflowed (blk_end - blk_off) -
+     * sum_sizes to SIZE_MAX */
+    *p++ = 0xA3;
+    size_t sb5_len = 4 + 1 + 2;
+    *p++ = (uint8_t)(0x40 | (sb5_len >> 8));
+    *p++ = (uint8_t)(sb5_len & 0xFF);
+    *p++ = 0x81;
+    write_u16_be(p, 260);
+    p += 2;
+    *p++ = 0x06;                 /* EBML lacing */
+    *p++ = 2;                    /* 3 frames */
+    *p++ = (uint8_t)(0x80 | 1);  /* first_sz = 1 */
+    *p++ = (uint8_t)(0x80 | 63); /* delta = 0 -> next_sz = 1 at blk_off == blk_end */
+
+    size_t clus_len = (size_t)(p - clus_start);
+    clus_sz[0] = (uint8_t)(0x40 | (clus_len >> 8));
+    clus_sz[1] = (uint8_t)(clus_len & 0xFF);
+
+    size_t seg_len = (size_t)(p - seg_start);
+    seg_sz[0] = (uint8_t)(0x10 | (seg_len >> 24));
+    seg_sz[1] = (uint8_t)((seg_len >> 16) & 0xFF);
+    seg_sz[2] = (uint8_t)((seg_len >> 8) & 0xFF);
+    seg_sz[3] = (uint8_t)(seg_len & 0xFF);
+
+    demuxer_t *d = demuxer_open_mem(buf, (size_t)(p - buf));
+    assert(d != NULL);
+    assert(d->duration_us == 300000);
+    assert(d->fps_den == 1);
+    assert(d->fps_num == 30);
+
+    const size_t expected_sizes[9] = {32, 48, 64, 40, 40, 40, 50, 60, 50};
+    demux_packet_t pkt;
+    for (int i = 0; i < 9; ++i) {
+        assert(d->read_packet(d, &pkt));
+        assert(pkt.size == expected_sizes[i]);
+        if (i == 0)
+            assert(pkt.is_keyframe);
+        else
+            assert(!pkt.is_keyframe);
+    }
+    assert(!d->read_packet(d, &pkt));
+    d->destroy(d);
+
+    printf("  -> WebM EBML_ID_DURATION & Xiph/Fixed/EBML block lacing: PASSED\n");
+}
+
+static void test_mp4_ctts_v0_and_v1(void)
+{
+    printf("[TEST] Running test_mp4_ctts_v0_and_v1...\n");
+
+    uint8_t base_mp4[8192];
+    size_t base_sz = build_synthetic_mp4(base_mp4, sizeof(base_mp4), 640, 360, 3);
+    assert(base_sz > 0 && base_sz + 64 <= sizeof(base_mp4));
+
+    /* Append a ctts v0 box inside stbl with positive offsets: [count=1, off=33], [count=1, off=66],
+     * [count=1, off=0] */
+    /* Find stss start by scanning for 'stss' fourcc */
+    size_t stss_off = 0;
+    for (size_t i = 0; i + 8 < base_sz; ++i) {
+        if (memcmp(base_mp4 + i + 4, "stss", 4) == 0) {
+            stss_off = i;
+            break;
+        }
+    }
+    assert(stss_off > 0);
+
+    uint8_t ctts_box[40];
+    uint8_t *cp = ctts_box;
+    write_u32_be(cp, 40);
+    cp += 4;
+    write_u32_be(cp, FOURCC('c', 't', 't', 's'));
+    cp += 4;
+    write_u32_be(cp, 0); /* version 0, flags 0 */
+    cp += 4;
+    write_u32_be(cp, 3); /* 3 entries */
+    cp += 4;
+    write_u32_be(cp, 1);
+    cp += 4;
+    write_u32_be(cp, 33); /* sample 0: dts=0 + 33ms = 33000us */
+    cp += 4;
+    write_u32_be(cp, 1);
+    cp += 4;
+    write_u32_be(cp, 66); /* sample 1: dts=33 + 66ms = 99000us */
+    cp += 4;
+    write_u32_be(cp, 1);
+    cp += 4;
+    write_u32_be(cp, 0); /* sample 2: dts=66 + 0ms = 66000us */
+    cp += 4;
+
+    uint8_t mp4_v0[8192];
+    memcpy(mp4_v0, base_mp4, base_sz);
+    memcpy(mp4_v0 + base_sz, ctts_box, sizeof(ctts_box));
+
+    /* Update parent box sizes (moov, trak, mdia, minf, stbl) by +40 */
+    const char *parents[] = {"moov", "trak", "mdia", "minf", "stbl"};
+    for (size_t b = 0; b < 5; ++b) {
+        for (size_t i = 0; i + 8 < base_sz; ++i) {
+            if (memcmp(mp4_v0 + i + 4, parents[b], 4) == 0) {
+                uint32_t old_len = ((uint32_t)mp4_v0[i] << 24) | ((uint32_t)mp4_v0[i + 1] << 16) |
+                                   ((uint32_t)mp4_v0[i + 2] << 8) | (uint32_t)mp4_v0[i + 3];
+                write_u32_be(mp4_v0 + i, old_len + (uint32_t)sizeof(ctts_box));
+                break;
+            }
+        }
+    }
+
+    demuxer_t *d0 = demuxer_open_mem(mp4_v0, base_sz + sizeof(ctts_box));
+    assert(d0 != NULL);
+    demux_packet_t pkt;
+    assert(d0->read_packet(d0, &pkt));
+    assert(pkt.pts_us == 0);
+    assert(d0->read_packet(d0, &pkt));
+    assert(pkt.pts_us == 66000);
+    assert(d0->read_packet(d0, &pkt));
+    assert(pkt.pts_us == 33000);
+    d0->destroy(d0);
+
+    /* Now test ctts v1 with signed negative offset: sample 0 off=0, sample 1 off=+33, sample 2
+     * off=-99 (min_pts = -33000us -> shifted by +33000us) */
+    uint8_t mp4_v1[8192];
+    memcpy(mp4_v1, mp4_v0, base_sz + sizeof(ctts_box));
+    uint8_t *v1_ctts = mp4_v1 + base_sz;
+    v1_ctts[8] = 1;                              /* version 1 */
+    write_u32_be(v1_ctts + 20, 0);               /* sample 0: dts=0 + 0 = 0 */
+    write_u32_be(v1_ctts + 28, 33);              /* sample 1: dts=33 + 33 = 66000 */
+    write_u32_be(v1_ctts + 36, (uint32_t)(-99)); /* sample 2: dts=66 - 99 = -33000 -> min_pts */
+
+    demuxer_t *d1 = demuxer_open_mem(mp4_v1, base_sz + sizeof(ctts_box));
+    assert(d1 != NULL);
+    assert(d1->read_packet(d1, &pkt));
+    assert(pkt.pts_us == 33000);
+    assert(d1->read_packet(d1, &pkt));
+    assert(pkt.pts_us == 99000);
+    assert(d1->read_packet(d1, &pkt));
+    assert(pkt.pts_us == 0);
+    d1->destroy(d1);
+
+    printf("  -> MP4 ctts v0 positive offsets & v1 signed negative offsets: PASSED\n");
+}
+
 int main(void)
 {
     printf("=========================================\n");
@@ -849,6 +1153,8 @@ int main(void)
 
     test_demuxer_zero_allocation();
     test_webm_demuxer_zero_allocation();
+    test_webm_duration_and_lacing();
+    test_mp4_ctts_v0_and_v1();
     test_real_mp4_demuxing();
     test_vaapi_decoder_and_prime_export();
     test_high_precision_monotonic_timer();

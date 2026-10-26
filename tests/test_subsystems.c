@@ -23,7 +23,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -684,6 +686,348 @@ static void test_extended_subsystems(void)
     printf("  -> Extended subsystem verifications: PASSED\n");
 }
 
+static void test_phase1_phase2_subsystems(void)
+{
+    printf("[TEST] Testing CAM16/HCT Solver, 9 Material You Variants, Multi-Pass Shaders & Power "
+           "Governor Policies...\n");
+
+    /* 1. Exact CAM16 + CIE L* forward & inverse HCT solver roundtrip */
+    color_rgba_t black = waywal_hct_to_rgba(120.0f, 50.0f, 0.0f);
+    assert(black.r == 0 && black.g == 0 && black.b == 0 && black.a == 255);
+
+    color_rgba_t white = waywal_hct_to_rgba(240.0f, 50.0f, 100.0f);
+    assert(white.r == 255 && white.g == 255 && white.b == 255 && white.a == 255);
+
+    color_rgba_t grey = waywal_hct_to_rgba(45.0f, 0.0f, 50.0f);
+    assert(grey.r == grey.g && grey.g == grey.b && grey.r > 100 && grey.r < 140);
+
+    const color_rgba_t test_colors[] = {
+        {.r = 220, .g = 50, .b = 70, .a = 255},
+        {.r = 40, .g = 180, .b = 90, .a = 255},
+        {.r = 50, .g = 110, .b = 230, .a = 255},
+        {.r = 240, .g = 180, .b = 40, .a = 255},
+    };
+    for (size_t i = 0; i < sizeof(test_colors) / sizeof(test_colors[0]); ++i) {
+        float h = 0.0f, c = 0.0f, t = 0.0f;
+        waywal_rgba_to_hct(test_colors[i], &h, &c, &t);
+        assert(h >= 0.0f && h < 360.0f);
+        assert(c > 15.0f);
+        assert(t > 10.0f && t < 95.0f);
+
+        color_rgba_t rt = waywal_hct_to_rgba(h, c, t);
+        float h_rt = 0.0f, c_rt = 0.0f, t_rt = 0.0f;
+        waywal_rgba_to_hct(rt, &h_rt, &c_rt, &t_rt);
+        assert(fabsf(t - t_rt) < 1.5f);
+        assert(abs((int)test_colors[i].r - (int)rt.r) <= 3);
+        assert(abs((int)test_colors[i].g - (int)rt.g) <= 3);
+        assert(abs((int)test_colors[i].b - (int)rt.b) <= 3);
+    }
+
+    /* 2. All 9 Material You scheme variants & contrast levels */
+    uint8_t vibrant_img[16 * 16 * 4];
+    for (size_t i = 0; i < 16 * 16; ++i) {
+        vibrant_img[i * 4 + 0] = 230;
+        vibrant_img[i * 4 + 1] = 60;
+        vibrant_img[i * 4 + 2] = 90;
+        vibrant_img[i * 4 + 3] = 255;
+    }
+
+    const char *variants[] = {"tonalspot", "vibrant", "expressive", "neutral",   "monochrome",
+                              "fidelity",  "content", "rainbow",    "fruitsalad"};
+    for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); ++i) {
+        waywal_palette_t pal;
+        waywal_scheme_variant_t v_enum = waywal_scheme_variant_from_str(variants[i]);
+        assert(waywal_palette_extract_ex(vibrant_img, 16, 16, 16 * 4, false, WAYWAL_THEME_DARK,
+                                         v_enum, 0.0f, &pal));
+        assert(pal.variant == v_enum);
+        if (v_enum == WAYWAL_SCHEME_MONOCHROME) {
+            assert(pal.primary.r == pal.primary.g && pal.primary.g == pal.primary.b);
+        }
+    }
+
+    waywal_palette_t pal_std, pal_hc;
+    assert(waywal_palette_extract_ex(vibrant_img, 16, 16, 16 * 4, false, WAYWAL_THEME_DARK,
+                                     WAYWAL_SCHEME_TONAL_SPOT, 0.0f, &pal_std));
+    assert(waywal_palette_extract_ex(vibrant_img, 16, 16, 16 * 4, false, WAYWAL_THEME_DARK,
+                                     WAYWAL_SCHEME_TONAL_SPOT, 1.0f, &pal_hc));
+    float h_std = 0.0f, c_std = 0.0f, t_std = 0.0f;
+    float h_hc = 0.0f, c_hc = 0.0f, t_hc = 0.0f;
+    waywal_rgba_to_hct(pal_std.primary, &h_std, &c_std, &t_std);
+    waywal_rgba_to_hct(pal_hc.primary, &h_hc, &c_hc, &t_hc);
+    assert(t_hc > t_std);
+
+    /* 3. Multi-pass Shadertoy pass extraction & extended uniforms */
+    const char *multipass_src =
+        "// #pragma waywal pass BUFFER_A\n"
+        "// iChannel0: bufferA\n"
+        "// iChannel1: audio\n"
+        "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
+        "    fragColor = texture(iChannel0, fragCoord / iResolution.xy);\n"
+        "}\n"
+        "// #pragma waywal pass IMAGE\n"
+        "// iChannel0: bufferA\n"
+        "// iChannel1: noise\n"
+        "// iChannel2: wallpaper\n"
+        "// iChannel3: image(\"/tmp/custom_lut.png\")\n"
+        "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
+        "    vec2 uv = (fragCoord + u_mouse_smooth.xy + u_workspace_offset) / iResolution.xy;\n"
+        "    fragColor = texture(iChannel0, uv) + vec4(u_palette_primary, 1.0);\n"
+        "}\n";
+
+    char *wrapped_buf_a = waywal_shader_wrap_pass_source(multipass_src, 0);
+    assert(wrapped_buf_a != NULL);
+    assert(strstr(wrapped_buf_a, "#version 310 es") != NULL);
+    assert(strstr(wrapped_buf_a, "texture(iChannel0, uv)") == NULL); /* Only in IMAGE pass body */
+    free(wrapped_buf_a);
+
+    /* Pass 1 (BUFFER_B) is not defined in multipass_src -> returns NULL */
+    assert(waywal_shader_wrap_pass_source(multipass_src, 1) == NULL);
+
+    char *wrapped_img = waywal_shader_wrap_pass_source(multipass_src, 4);
+    assert(wrapped_img != NULL);
+    assert(strstr(wrapped_img, "uniform highp sampler2D iChannel3;") != NULL);
+    assert(strstr(wrapped_img, "uniform vec3 iChannelResolution[4];") != NULL);
+    assert(strstr(wrapped_img, "uniform float iChannelTime[4];") != NULL);
+    assert(strstr(wrapped_img, "uniform float iSampleRate;") != NULL);
+    assert(strstr(wrapped_img, "uniform vec3 u_palette_primary;") != NULL);
+    assert(strstr(wrapped_img, "uniform vec4 u_mouse_smooth;") != NULL);
+    assert(strstr(wrapped_img, "uniform vec2 u_mouse_vel;") != NULL);
+    assert(strstr(wrapped_img, "uniform vec2 u_workspace_offset;") != NULL);
+    free(wrapped_img);
+
+    /* 4. Power governor wildcard fullscreen clearing & policy gating */
+    waywal_power_governor_t *gov = waywal_power_governor_create(WAYWAL_BATTERY_IGNORE);
+    assert(gov != NULL);
+    /* Fullscreen event before any focusedmon event uses wildcard output "*" and must clear cleanly
+     */
+    waywal_power_governor_feed_hyprland_event(gov, "fullscreen>>1");
+    assert(waywal_power_governor_should_pause_output(gov, "DP-1"));
+    waywal_power_governor_feed_hyprland_event(gov, "fullscreen>>0");
+    assert(!waywal_power_governor_should_pause_output(gov, "DP-1"));
+
+    /* Policy gating: disabling auto_pause_fullscreen prevents fullscreen from pausing */
+    waywal_power_governor_set_pause_policies(gov, false, false, false);
+    waywal_power_governor_feed_hyprland_event(gov, "focusedmon>>DP-1,1");
+    waywal_power_governor_feed_hyprland_event(gov, "fullscreen>>1");
+    assert(!waywal_power_governor_should_pause_output(gov, "DP-1"));
+
+    /* Niri JSON event parsing */
+    waywal_power_governor_set_pause_policies(gov, true, true, true);
+    waywal_power_governor_feed_niri_event(gov,
+                                          "{\"WorkspaceFocused\":{\"id\":7,\"focused\":true}}\n");
+    char niri_ws[64] = {0}, niri_mon[64] = {0};
+    assert(waywal_power_governor_pop_workspace_change(gov, niri_ws, sizeof(niri_ws), niri_mon,
+                                                      sizeof(niri_mon)));
+    assert(strcmp(niri_ws, "7") == 0);
+    waywal_power_governor_destroy(gov);
+
+    /* 4b. Power governor Unix domain socket EOF + reconnect + failed reconnect */
+    {
+        const char *sock_path = "/tmp/wwal_pgov_ipc_test.sock";
+        unlink(sock_path);
+        int srv_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        assert(srv_fd >= 0);
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+        assert(bind(srv_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+        assert(listen(srv_fd, 4) == 0);
+
+        char old_hypr[256] = {0}, old_niri[256] = {0};
+        const char *eh = getenv("HYPRLAND_INSTANCE_SIGNATURE");
+        const char *en = getenv("NIRI_SOCKET");
+        if (eh)
+            strncpy(old_hypr, eh, sizeof(old_hypr) - 1);
+        if (en)
+            strncpy(old_niri, en, sizeof(old_niri) - 1);
+        unsetenv("HYPRLAND_INSTANCE_SIGNATURE");
+        setenv("NIRI_SOCKET", sock_path, 1);
+
+        waywal_power_governor_t *ipc_gov = waywal_power_governor_create(WAYWAL_BATTERY_IGNORE);
+        assert(ipc_gov != NULL);
+        assert(waywal_power_governor_get_ipc_fd(ipc_gov) >= 0);
+
+        int conn1 = accept4(srv_fd, NULL, NULL, SOCK_CLOEXEC);
+        assert(conn1 >= 0);
+        const char *msg1 = "{\"WorkspaceFocused\":{\"id\":3,\"focused\":true}}\n";
+        assert(write(conn1, msg1, strlen(msg1)) == (ssize_t)strlen(msg1));
+        waywal_power_governor_dispatch_ipc(ipc_gov);
+        assert(waywal_power_governor_pop_workspace_change(ipc_gov, niri_ws, sizeof(niri_ws),
+                                                          niri_mon, sizeof(niri_mon)));
+        assert(strcmp(niri_ws, "3") == 0);
+
+        /* Close server peer conn1 -> triggers EOF and automatic reconnect to srv_fd */
+        close(conn1);
+        waywal_power_governor_dispatch_ipc(ipc_gov);
+        assert(waywal_power_governor_consume_ipc_reconnected(ipc_gov));
+        assert(!waywal_power_governor_consume_ipc_reconnected(ipc_gov));
+        assert(waywal_power_governor_get_ipc_fd(ipc_gov) >= 0);
+
+        int conn2 = accept4(srv_fd, NULL, NULL, SOCK_CLOEXEC);
+        assert(conn2 >= 0);
+        const char *msg2 = "{\"WorkspaceFocused\":{\"id\":9,\"focused\":true}}\n";
+        assert(write(conn2, msg2, strlen(msg2)) == (ssize_t)strlen(msg2));
+        waywal_power_governor_dispatch_ipc(ipc_gov);
+        assert(waywal_power_governor_pop_workspace_change(ipc_gov, niri_ws, sizeof(niri_ws),
+                                                          niri_mon, sizeof(niri_mon)));
+        assert(strcmp(niri_ws, "9") == 0);
+
+        /* Close listening socket and peer conn2 -> reconnect must fail cleanly with ipc_fd == -1
+         * and ipc_reconnected == false */
+        close(srv_fd);
+        unlink(sock_path);
+        close(conn2);
+        waywal_power_governor_dispatch_ipc(ipc_gov);
+        assert(!waywal_power_governor_consume_ipc_reconnected(ipc_gov));
+        assert(waywal_power_governor_get_ipc_fd(ipc_gov) == -1);
+
+        waywal_power_governor_destroy(ipc_gov);
+        if (old_hypr[0])
+            setenv("HYPRLAND_INSTANCE_SIGNATURE", old_hypr, 1);
+        if (old_niri[0])
+            setenv("NIRI_SOCKET", old_niri, 1);
+        else
+            unsetenv("NIRI_SOCKET");
+    }
+
+    /* 5. CLI --depth-map, --depth-strength, --backdrop, --layer, --battery-policy & simple/fade */
+    {
+        char *argv_depth[] = {"wwal",
+                              "img",
+                              "/tmp/wall.png",
+                              "--depth-map",
+                              "/tmp/wall_depth.png",
+                              "--depth-strength",
+                              "2.5",
+                              "--backdrop",
+                              "auto-blur",
+                              "--layer",
+                              "bottom",
+                              "--battery-policy",
+                              "reduce-fps",
+                              "--transition-type",
+                              "simple"};
+        cli_options_t opts;
+        assert(cli_parse(15, argv_depth, &opts));
+        assert(strcmp(opts.depth_map_path, "/tmp/wall_depth.png") == 0);
+        assert(fabsf(opts.depth_strength - 2.5f) < 1e-4f);
+        assert(strcmp(opts.backdrop, "auto-blur") == 0);
+        assert(strcmp(opts.layer_name, "bottom") == 0);
+        assert(strcmp(opts.battery_policy, "reduce-fps") == 0);
+        assert(opts.transition_type == WAYWAL_TRANSITION_SIMPLE);
+
+        char *argv_fade[] = {"wwal", "img", "/tmp/wall.png", "--transition-type", "fade"};
+        assert(cli_parse(5, argv_fade, &opts));
+        assert(opts.transition_type == WAYWAL_TRANSITION_FADE);
+    }
+
+    /* 6. Headless GPU Shader Engine: multi-pass, relative image(), depth-parallax & 10-bit FBO blit
+     */
+    {
+        dmabuf_context_t dctx;
+        memset(&dctx, 0, sizeof(dctx));
+        if (dmabuf_context_init(&dctx) && dctx.available) {
+            waywal_shader_engine_t *seng = waywal_shader_engine_create(&dctx);
+            if (seng) {
+                /* Verify // iChannelN: directive target resolution inside multi-pass sections */
+                assert(waywal_shader_engine_load_source(seng, multipass_src,
+                                                        "/tmp/wwal_mp_Syntax.frag"));
+                assert(waywal_shader_engine_get_channel_target(seng, 0, 0) == 1); /* bufferA */
+                assert(waywal_shader_engine_get_channel_target(seng, 0, 1) == 0); /* audio */
+                assert(waywal_shader_engine_get_channel_target(seng, 4, 0) == 1); /* bufferA */
+                assert(waywal_shader_engine_get_channel_target(seng, 4, 1) == 5); /* noise */
+                assert(waywal_shader_engine_get_channel_target(seng, 4, 2) == 6); /* wallpaper */
+                assert(waywal_shader_engine_get_channel_target(seng, 4, 3) == 8); /* image(...) */
+
+                /* Write a 1x1 uncompressed 32-bit BMP in /tmp for relative image() resolution */
+                const char *bmp_path = "/tmp/wwal_rel_lut_test.bmp";
+                uint8_t bmp[58] = {'B', 'M', 58, 0, 0, 0, 0, 0, 0, 0, 54, 0,   0,  0,  40,
+                                   0,   0,   0,  1, 0, 0, 0, 1, 0, 0, 0,  1,   0,  32, 0,
+                                   0,   0,   0,  0, 4, 0, 0, 0, 0, 0, 0,  0,   0,  0,  0,
+                                   0,   0,   0,  0, 0, 0, 0, 0, 0, 0, 0,  255, 255};
+                FILE *bfp = fopen(bmp_path, "wb");
+                assert(bfp != NULL);
+                assert(fwrite(bmp, 1, sizeof(bmp), bfp) == sizeof(bmp));
+                fclose(bfp);
+
+                uint8_t wall_rgba[16] = {255, 0, 0,   255, 0,   255, 0,   255,
+                                         0,   0, 255, 255, 255, 255, 255, 255};
+                waywal_shader_engine_set_wallpaper(seng, wall_rgba, 2, 2);
+
+                const char *gpu_mp_src =
+                    "// #pragma waywal pass BUFFER_A\n"
+                    "// #pragma waywal bufferA.channel0 = wallpaper\n"
+                    "// #pragma waywal bufferA.channel1 = image(\"wwal_rel_lut_test.bmp\")\n"
+                    "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
+                    "    vec2 uv = fragCoord / iResolution.xy;\n"
+                    "    fragColor = 0.5 * (texture(iChannel0, uv) + texture(iChannel1, uv));\n"
+                    "}\n"
+                    "// #pragma waywal pass IMAGE\n"
+                    "// #pragma waywal image.channel0 = bufferA\n"
+                    "// #pragma waywal image.channel1 = noise\n"
+                    "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
+                    "    vec2 uv = fragCoord / iResolution.xy;\n"
+                    "    fragColor = texture(iChannel0, uv) + 0.01 * texture(iChannel1, uv);\n"
+                    "}\n";
+
+                assert(waywal_shader_engine_load_source(seng, gpu_mp_src,
+                                                        "/tmp/wwal_rel_shader.frag"));
+                assert(waywal_shader_engine_get_channel_target(seng, 0, 0) == 6);
+                assert(waywal_shader_engine_get_channel_target(seng, 0, 1) == 8);
+                assert(waywal_shader_engine_get_channel_target(seng, 4, 0) == 1);
+                assert(waywal_shader_engine_get_channel_target(seng, 4, 1) == 5);
+
+                dmabuf_bo_t bo8;
+                memset(&bo8, 0, sizeof(bo8));
+                bool has_bo8 = dmabuf_bo_allocate(&dctx, &bo8, 64, 64, DRM_FORMAT_XRGB8888,
+                                                  DRM_FORMAT_MOD_LINEAR);
+                if (has_bo8) {
+                    waywal_shader_frame_params_t fp;
+                    memset(&fp, 0, sizeof(fp));
+                    fp.time_sec = 0.5f;
+                    fp.time_delta_sec = 0.016f;
+                    fp.frame_index = 1;
+                    assert(waywal_shader_engine_render_frame(seng, &bo8, &fp));
+                    bo8.is_10bit = true;
+                    assert(waywal_shader_engine_render_frame(seng, &bo8, &fp));
+                    bo8.is_10bit = false;
+
+                    waywal_shader_engine_set_depth_strength(seng, 2.5f);
+                    assert(waywal_shader_engine_load_depth_parallax(seng, wall_rgba, 2, 2,
+                                                                    wall_rgba, 2, 2));
+                    assert(waywal_shader_engine_render_frame(seng, &bo8, &fp));
+                }
+
+                dmabuf_bo_t bo10;
+                memset(&bo10, 0, sizeof(bo10));
+                bool has_bo10 = dmabuf_bo_allocate(&dctx, &bo10, 64, 64, DRM_FORMAT_ARGB2101010,
+                                                   DRM_FORMAT_MOD_INVALID);
+                if (has_bo10) {
+                    bo10.is_10bit = true;
+                    waywal_shader_frame_params_t fp;
+                    memset(&fp, 0, sizeof(fp));
+                    fp.time_sec = 1.0f;
+                    fp.time_delta_sec = 0.016f;
+                    fp.frame_index = 2;
+                    assert(waywal_shader_engine_render_frame(seng, &bo10, &fp));
+                }
+
+                unlink(bmp_path);
+                waywal_shader_engine_destroy(seng);
+                if (has_bo10)
+                    dmabuf_bo_free(&bo10);
+                if (has_bo8)
+                    dmabuf_bo_free(&bo8);
+            }
+            dmabuf_context_destroy(&dctx);
+        }
+    }
+
+    printf(
+        "  -> CAM16/HCT solver, 9 scheme variants, multi-pass shaders & power governor: PASSED\n");
+}
+
 int main(void)
 {
     waywal_log_set_level(WAYWAL_LOG_LEVEL_WARN);
@@ -698,6 +1042,7 @@ int main(void)
     test_power_governor();
     test_audio_fft_and_shader();
     test_extended_subsystems();
+    test_phase1_phase2_subsystems();
 
     printf("\n>>> ALL CORE SUBSYSTEMS UNIT TESTS PASSED! <<<\n\n");
     return 0;

@@ -14,36 +14,6 @@
 extern "C" {
 #endif
 
-#ifndef WAYWAL_RENDER_ENGINE_H
-#ifndef WAYWAL_TRANSITION_TYPE_DEFINED
-#define WAYWAL_TRANSITION_TYPE_DEFINED
-typedef enum {
-    WAYWAL_TRANSITION_NONE = 0,
-    WAYWAL_TRANSITION_SIMPLE = 1,
-    WAYWAL_TRANSITION_FADE = 2,
-    WAYWAL_TRANSITION_WIPE = 3,
-    WAYWAL_TRANSITION_GROW = 4,
-    WAYWAL_TRANSITION_OUTER = 5,
-    WAYWAL_TRANSITION_WAVE = 6,
-    WAYWAL_TRANSITION_NOISE = 7,
-    WAYWAL_TRANSITION_CROSSZOOM = 8,
-    WAYWAL_TRANSITION_SLIDE = 9,
-    WAYWAL_TRANSITION_GLITCH = 10,
-    WAYWAL_TRANSITION_BURN = 11,
-    WAYWAL_TRANSITION_RIPPLE = 12,
-    WAYWAL_TRANSITION_PIXELATE = 13,
-    WAYWAL_TRANSITION_DOOM = 14,
-    WAYWAL_TRANSITION_SWIRL = 15,
-    WAYWAL_TRANSITION_CUBE = 16,
-    WAYWAL_TRANSITION_LUMA = 17,
-    WAYWAL_TRANSITION_LIGHT_LEAK = 18,
-    WAYWAL_TRANSITION_PAGE_CURL = 19,
-    WAYWAL_TRANSITION_CUSTOM = 20,
-    WAYWAL_TRANSITION_RANDOM = 21,
-} waywal_transition_type_t;
-#endif
-#endif
-
 typedef enum {
     CLI_CMD_NONE,
     CLI_CMD_PING,
@@ -127,6 +97,8 @@ typedef struct {
     char custom_shader_path[4096];
     char *custom_shader_src;
     size_t custom_shader_len;
+    char depth_map_path[256];
+    float depth_strength;
 
     /* Multi-monitor targeting and synchronization */
     uint32_t num_outputs;

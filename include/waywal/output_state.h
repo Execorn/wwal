@@ -8,6 +8,7 @@
 #include "waywal/types.h"
 #include "waywal/vaapi_dec.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#include "xdg-output-unstable-v1-client-protocol.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -43,6 +44,19 @@ struct output_node {
     uint32_t logical_width;
     uint32_t logical_height;
     union {
+        int32_t global_x;
+        int32_t logical_x;
+    };
+    union {
+        int32_t global_y;
+        int32_t logical_y;
+    };
+    bool has_logical_pos;
+    int32_t span_off_x;
+    int32_t span_off_y;
+    int32_t span_total_w;
+    int32_t span_total_h;
+    union {
         int32_t scale_factor;
         int32_t scale;
     };
@@ -55,6 +69,7 @@ struct output_node {
     struct zwlr_layer_surface_v1 *layer_surface;
     struct wp_viewport *viewport;
     struct wp_fractional_scale_v1 *fract_scale;
+    struct zxdg_output_v1 *xdg_output;
 
     struct wl_surface *backdrop_surface;
     struct zwlr_layer_surface_v1 *backdrop_layer_surface;
@@ -95,10 +110,21 @@ struct output_node {
     uint32_t transition_delay_frames;
     waywal_transition_params_t transition_params;
 
-    /* Dynamic Cursor Tracking */
+    /* Dynamic Cursor Tracking & Spring Filter */
     double cursor_x;
     double cursor_y;
+    double click_x;
+    double click_y;
     bool has_cursor;
+    bool button_down;
+    bool click_pulse;
+    float smooth_mouse_x;
+    float smooth_mouse_y;
+    float mouse_vel_x;
+    float mouse_vel_y;
+    float smooth_workspace;
+    float workspace_vel;
+    uint64_t last_spring_ns;
 
     /* Cached wp_viewport state to avoid redundant Wayland requests per frame */
     int32_t vp_dst_w;

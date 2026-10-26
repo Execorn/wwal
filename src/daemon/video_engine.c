@@ -4,6 +4,8 @@
 #include "linux-dmabuf-v1-client-protocol.h"
 #include "wayland_core.h"
 #include "waywal/log.h"
+#include "waywal/power_governor.h"
+#include "waywal/render_engine.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -30,6 +32,410 @@ static void video_buffer_release(void *data, struct wl_buffer *wl_buffer)
 static const struct wl_buffer_listener g_video_buffer_listener = {
     .release = video_buffer_release,
 };
+
+#ifdef HAVE_FFMPEG_SWDEC
+#include <dlfcn.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+
+#define SWDEC_GBM_RING_SIZE 4
+
+typedef struct {
+    void *lib_avcodec;
+    void *lib_avutil;
+    void *lib_swscale;
+
+    const AVCodec *(*p_avcodec_find_decoder)(enum AVCodecID id);
+    AVCodecContext *(*p_avcodec_alloc_context3)(const AVCodec *codec);
+    void (*p_avcodec_free_context)(AVCodecContext **avctx);
+    int (*p_avcodec_open2)(AVCodecContext *avctx, const AVCodec *codec, AVDictionary **options);
+    int (*p_avcodec_send_packet)(AVCodecContext *avctx, const AVPacket *avpkt);
+    int (*p_avcodec_receive_frame)(AVCodecContext *avctx, AVFrame *frame);
+    void (*p_avcodec_flush_buffers)(AVCodecContext *avctx);
+
+    AVPacket *(*p_av_packet_alloc)(void);
+    void (*p_av_packet_free)(AVPacket **pkt);
+    void (*p_av_packet_unref)(AVPacket *pkt);
+    AVFrame *(*p_av_frame_alloc)(void);
+    void (*p_av_frame_free)(AVFrame **frame);
+    void (*p_av_frame_unref)(AVFrame *frame);
+    void *(*p_av_mallocz)(size_t size);
+
+    struct SwsContext *(*p_sws_getContext)(int srcW, int srcH, enum AVPixelFormat srcFormat,
+                                           int dstW, int dstH, enum AVPixelFormat dstFormat,
+                                           int flags, SwsFilter *srcFilter, SwsFilter *dstFilter,
+                                           const double *param);
+    int (*p_sws_scale)(struct SwsContext *c, const uint8_t *const srcSlice[], const int srcStride[],
+                       int srcSliceY, int srcSliceH, uint8_t *const dst[], const int dstStride[]);
+    void (*p_sws_freeContext)(struct SwsContext *swsContext);
+
+    AVCodecContext *codec_ctx;
+    AVPacket *pkt;
+    AVFrame *frame;
+    struct SwsContext *sws_ctx;
+    uint8_t *rgba_buf;
+    struct gbm_bo *gbm_bos[SWDEC_GBM_RING_SIZE];
+    struct wl_buffer *wl_bufs[SWDEC_GBM_RING_SIZE];
+    bool buf_busy[SWDEC_GBM_RING_SIZE];
+    uint32_t ring_idx;
+    int last_ready_ring_idx;
+    bool has_gbm_ring;
+    bool eof_flushing;
+    uint32_t width;
+    uint32_t height;
+    int last_src_fmt;
+} ffmpeg_swdec_t;
+
+static void *dlopen_any(const char *const *names, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        void *h = dlopen(names[i], RTLD_LAZY | RTLD_LOCAL);
+        if (h) {
+            return h;
+        }
+    }
+    return NULL;
+}
+
+static bool swdec_load_symbols(ffmpeg_swdec_t *sw)
+{
+    static const char *const avcodec_names[] = {"libavcodec.so.61", "libavcodec.so.60",
+                                                "libavcodec.so.59", "libavcodec.so"};
+    static const char *const avutil_names[] = {"libavutil.so.59", "libavutil.so.58",
+                                               "libavutil.so.57", "libavutil.so"};
+    static const char *const swscale_names[] = {"libswscale.so.8", "libswscale.so.7",
+                                                "libswscale.so.6", "libswscale.so"};
+
+    sw->lib_avutil = dlopen_any(avutil_names, sizeof(avutil_names) / sizeof(avutil_names[0]));
+    sw->lib_avcodec = dlopen_any(avcodec_names, sizeof(avcodec_names) / sizeof(avcodec_names[0]));
+    sw->lib_swscale = dlopen_any(swscale_names, sizeof(swscale_names) / sizeof(swscale_names[0]));
+    if (!sw->lib_avutil || !sw->lib_avcodec || !sw->lib_swscale) {
+        return false;
+    }
+
+#define RESOLVE_SYM(handle, field, sym)                                                            \
+    do {                                                                                           \
+        *(void **)(&sw->field) = dlsym(handle, sym);                                               \
+        if (!sw->field)                                                                            \
+            return false;                                                                          \
+    } while (0)
+
+    RESOLVE_SYM(sw->lib_avcodec, p_avcodec_find_decoder, "avcodec_find_decoder");
+    RESOLVE_SYM(sw->lib_avcodec, p_avcodec_alloc_context3, "avcodec_alloc_context3");
+    RESOLVE_SYM(sw->lib_avcodec, p_avcodec_free_context, "avcodec_free_context");
+    RESOLVE_SYM(sw->lib_avcodec, p_avcodec_open2, "avcodec_open2");
+    RESOLVE_SYM(sw->lib_avcodec, p_avcodec_send_packet, "avcodec_send_packet");
+    RESOLVE_SYM(sw->lib_avcodec, p_avcodec_receive_frame, "avcodec_receive_frame");
+    RESOLVE_SYM(sw->lib_avcodec, p_avcodec_flush_buffers, "avcodec_flush_buffers");
+    RESOLVE_SYM(sw->lib_avcodec, p_av_packet_alloc, "av_packet_alloc");
+    RESOLVE_SYM(sw->lib_avcodec, p_av_packet_free, "av_packet_free");
+    RESOLVE_SYM(sw->lib_avcodec, p_av_packet_unref, "av_packet_unref");
+
+    RESOLVE_SYM(sw->lib_avutil, p_av_frame_alloc, "av_frame_alloc");
+    RESOLVE_SYM(sw->lib_avutil, p_av_frame_free, "av_frame_free");
+    RESOLVE_SYM(sw->lib_avutil, p_av_frame_unref, "av_frame_unref");
+    RESOLVE_SYM(sw->lib_avutil, p_av_mallocz, "av_mallocz");
+
+    RESOLVE_SYM(sw->lib_swscale, p_sws_getContext, "sws_getContext");
+    RESOLVE_SYM(sw->lib_swscale, p_sws_scale, "sws_scale");
+    RESOLVE_SYM(sw->lib_swscale, p_sws_freeContext, "sws_freeContext");
+
+#undef RESOLVE_SYM
+    return true;
+}
+
+static void swdec_destroy(video_engine_t *ve)
+{
+    if (!ve || !ve->swdec_ctx)
+        return;
+    ffmpeg_swdec_t *sw = (ffmpeg_swdec_t *)ve->swdec_ctx;
+    for (int i = 0; i < SWDEC_GBM_RING_SIZE; ++i) {
+        if (sw->wl_bufs[i]) {
+            wl_buffer_destroy(sw->wl_bufs[i]);
+            sw->wl_bufs[i] = NULL;
+        }
+        if (sw->gbm_bos[i]) {
+            gbm_bo_destroy(sw->gbm_bos[i]);
+            sw->gbm_bos[i] = NULL;
+        }
+    }
+    if (sw->sws_ctx && sw->p_sws_freeContext) {
+        sw->p_sws_freeContext(sw->sws_ctx);
+    }
+    if (sw->frame && sw->p_av_frame_free) {
+        sw->p_av_frame_free(&sw->frame);
+    }
+    if (sw->pkt && sw->p_av_packet_free) {
+        sw->p_av_packet_free(&sw->pkt);
+    }
+    if (sw->codec_ctx && sw->p_avcodec_free_context) {
+        sw->p_avcodec_free_context(&sw->codec_ctx);
+    }
+    if (sw->lib_swscale) {
+        dlclose(sw->lib_swscale);
+    }
+    if (sw->lib_avcodec) {
+        dlclose(sw->lib_avcodec);
+    }
+    if (sw->lib_avutil) {
+        dlclose(sw->lib_avutil);
+    }
+    free(sw->rgba_buf);
+    free(sw);
+    ve->swdec_ctx = NULL;
+    ve->using_swdec = false;
+}
+
+static bool swdec_init(video_engine_t *ve, const demuxer_t *demux)
+{
+    if (!ve || !demux || demux->width == 0 || demux->height == 0)
+        return false;
+
+    enum AVCodecID cid = AV_CODEC_ID_NONE;
+    switch (demux->codec) {
+    case WAYWAL_CODEC_H264:
+        cid = AV_CODEC_ID_H264;
+        break;
+    case WAYWAL_CODEC_HEVC:
+        cid = AV_CODEC_ID_HEVC;
+        break;
+    case WAYWAL_CODEC_VP9:
+        cid = AV_CODEC_ID_VP9;
+        break;
+    case WAYWAL_CODEC_AV1:
+        cid = AV_CODEC_ID_AV1;
+        break;
+    default:
+        return false;
+    }
+
+    ffmpeg_swdec_t *sw = (ffmpeg_swdec_t *)calloc(1, sizeof(ffmpeg_swdec_t));
+    if (!sw)
+        return false;
+
+    if (!swdec_load_symbols(sw)) {
+        ve->swdec_ctx = sw;
+        swdec_destroy(ve);
+        return false;
+    }
+
+    const AVCodec *codec = sw->p_avcodec_find_decoder(cid);
+    if (!codec) {
+        ve->swdec_ctx = sw;
+        swdec_destroy(ve);
+        return false;
+    }
+
+    sw->codec_ctx = sw->p_avcodec_alloc_context3(codec);
+    sw->pkt = sw->p_av_packet_alloc();
+    sw->frame = sw->p_av_frame_alloc();
+    sw->width = demux->width;
+    sw->height = demux->height;
+    sw->last_src_fmt = -1;
+    sw->last_ready_ring_idx = -1;
+
+    if (!sw->codec_ctx || !sw->pkt || !sw->frame) {
+        ve->swdec_ctx = sw;
+        swdec_destroy(ve);
+        return false;
+    }
+
+    sw->codec_ctx->width = (int)demux->width;
+    sw->codec_ctx->height = (int)demux->height;
+    sw->codec_ctx->thread_count = 2;
+
+    if (demux->extradata && demux->extradata_size > 0) {
+        sw->codec_ctx->extradata =
+            (uint8_t *)sw->p_av_mallocz(demux->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (sw->codec_ctx->extradata) {
+            memcpy(sw->codec_ctx->extradata, demux->extradata, demux->extradata_size);
+            sw->codec_ctx->extradata_size = (int)demux->extradata_size;
+        }
+    }
+
+    if (sw->p_avcodec_open2(sw->codec_ctx, codec, NULL) < 0) {
+        ve->swdec_ctx = sw;
+        swdec_destroy(ve);
+        return false;
+    }
+
+    if (ve->daemon_state && ve->daemon_state->dmabuf_ctx.gbm &&
+        ve->daemon_state->dmabuf_ctx.dmabuf_proto && ve->daemon_state->dmabuf_ctx.map_supported) {
+        bool ring_ok = true;
+        for (int i = 0; i < SWDEC_GBM_RING_SIZE; ++i) {
+            sw->gbm_bos[i] =
+                gbm_bo_create(ve->daemon_state->dmabuf_ctx.gbm, sw->width, sw->height,
+                              DRM_FORMAT_XRGB8888, GBM_BO_USE_LINEAR | GBM_BO_USE_WRITE);
+            if (!sw->gbm_bos[i]) {
+                ring_ok = false;
+                break;
+            }
+            int bo_fd = gbm_bo_get_fd(sw->gbm_bos[i]);
+            if (bo_fd < 0) {
+                ring_ok = false;
+                break;
+            }
+            uint32_t stride = gbm_bo_get_stride(sw->gbm_bos[i]);
+            uint64_t mod = DRM_FORMAT_MOD_LINEAR;
+            struct zwp_linux_buffer_params_v1 *params =
+                zwp_linux_dmabuf_v1_create_params(ve->daemon_state->dmabuf_ctx.dmabuf_proto);
+            if (!params) {
+                close(bo_fd);
+                ring_ok = false;
+                break;
+            }
+            zwp_linux_buffer_params_v1_add(params, bo_fd, 0, 0, stride, (uint32_t)(mod >> 32),
+                                           (uint32_t)(mod & 0xFFFFFFFFULL));
+            sw->wl_bufs[i] = zwp_linux_buffer_params_v1_create_immed(
+                params, (int32_t)sw->width, (int32_t)sw->height, DRM_FORMAT_XRGB8888, 0);
+            zwp_linux_buffer_params_v1_destroy(params);
+            close(bo_fd);
+            if (!sw->wl_bufs[i]) {
+                ring_ok = false;
+                break;
+            }
+            wl_buffer_add_listener(sw->wl_bufs[i], &g_video_buffer_listener, &sw->buf_busy[i]);
+        }
+        if (!ring_ok) {
+            for (int i = 0; i < SWDEC_GBM_RING_SIZE; ++i) {
+                if (sw->wl_bufs[i]) {
+                    wl_buffer_destroy(sw->wl_bufs[i]);
+                    sw->wl_bufs[i] = NULL;
+                }
+                if (sw->gbm_bos[i]) {
+                    gbm_bo_destroy(sw->gbm_bos[i]);
+                    sw->gbm_bos[i] = NULL;
+                }
+                sw->buf_busy[i] = false;
+            }
+        }
+        sw->has_gbm_ring = ring_ok;
+    }
+
+    if (!sw->has_gbm_ring) {
+        sw->rgba_buf = (uint8_t *)malloc((size_t)demux->width * (size_t)demux->height * 4ULL);
+        if (!sw->rgba_buf) {
+            ve->swdec_ctx = sw;
+            swdec_destroy(ve);
+            return false;
+        }
+    }
+
+    ve->swdec_ctx = sw;
+    ve->using_swdec = true;
+    WAYWAL_LOG_INFO(
+        "Initialized FFmpeg software video decoder fallback (%ux%u, codec=%d, gbm_ring=%d)",
+        sw->width, sw->height, (int)demux->codec, (int)sw->has_gbm_ring);
+    return true;
+}
+
+static bool swdec_decode_and_present(video_engine_t *ve, int64_t *out_pts_us)
+{
+    if (!ve || !ve->swdec_ctx || !ve->demuxer)
+        return false;
+    ffmpeg_swdec_t *sw = (ffmpeg_swdec_t *)ve->swdec_ctx;
+
+    for (int tries = 0; tries < 32; ++tries) {
+        if (sw->p_avcodec_receive_frame(sw->codec_ctx, sw->frame) == 0) {
+            if (sw->frame->format != sw->last_src_fmt || !sw->sws_ctx) {
+                if (sw->sws_ctx) {
+                    sw->p_sws_freeContext(sw->sws_ctx);
+                }
+                sw->sws_ctx = sw->p_sws_getContext((int)sw->width, (int)sw->height,
+                                                   (enum AVPixelFormat)sw->frame->format,
+                                                   (int)sw->width, (int)sw->height, AV_PIX_FMT_BGRA,
+                                                   SWS_BILINEAR, NULL, NULL, NULL);
+                sw->last_src_fmt = sw->frame->format;
+            }
+            if (sw->sws_ctx) {
+                sw->last_ready_ring_idx = -1;
+                bool mapped_gbm = false;
+                if (sw->has_gbm_ring) {
+                    int chosen = -1;
+                    for (int i = 0; i < SWDEC_GBM_RING_SIZE; ++i) {
+                        int cand = (int)((sw->ring_idx + (uint32_t)i) % SWDEC_GBM_RING_SIZE);
+                        if (!sw->buf_busy[cand]) {
+                            chosen = cand;
+                            break;
+                        }
+                    }
+                    if (chosen < 0) {
+                        chosen = (int)(sw->ring_idx % SWDEC_GBM_RING_SIZE);
+                    }
+                    sw->ring_idx = (uint32_t)(chosen + 1) % SWDEC_GBM_RING_SIZE;
+
+                    uint32_t map_stride = 0;
+                    void *map_data = NULL;
+                    void *ptr = gbm_bo_map(sw->gbm_bos[chosen], 0, 0, sw->width, sw->height,
+                                           GBM_BO_TRANSFER_WRITE, &map_stride, &map_data);
+                    if (ptr && map_data && map_stride >= sw->width * 4U) {
+                        uint8_t *dst_planes[4] = {(uint8_t *)ptr, NULL, NULL, NULL};
+                        int dst_strides[4] = {(int)map_stride, 0, 0, 0};
+                        sw->p_sws_scale(sw->sws_ctx, (const uint8_t *const *)sw->frame->data,
+                                        sw->frame->linesize, 0, (int)sw->height, dst_planes,
+                                        dst_strides);
+                        gbm_bo_unmap(sw->gbm_bos[chosen], map_data);
+                        sw->last_ready_ring_idx = chosen;
+                        mapped_gbm = true;
+                    }
+                }
+                if (!mapped_gbm) {
+                    if (!sw->rgba_buf) {
+                        sw->rgba_buf =
+                            (uint8_t *)malloc((size_t)sw->width * (size_t)sw->height * 4U);
+                    }
+                    if (!sw->rgba_buf) {
+                        sw->p_av_frame_unref(sw->frame);
+                        return false;
+                    }
+                    uint8_t *dst_planes[4] = {sw->rgba_buf, NULL, NULL, NULL};
+                    int dst_strides[4] = {(int)(sw->width * 4U), 0, 0, 0};
+                    sw->p_sws_scale(sw->sws_ctx, (const uint8_t *const *)sw->frame->data,
+                                    sw->frame->linesize, 0, (int)sw->height, dst_planes,
+                                    dst_strides);
+                }
+                if (out_pts_us) {
+                    *out_pts_us = sw->frame->pts;
+                }
+                sw->p_av_frame_unref(sw->frame);
+                return true;
+            }
+            sw->p_av_frame_unref(sw->frame);
+        }
+
+        demux_packet_t dpkt;
+        if (!ve->demuxer->read_packet(ve->demuxer, &dpkt)) {
+            if (!sw->eof_flushing) {
+                sw->eof_flushing = true;
+                sw->p_avcodec_send_packet(sw->codec_ctx, NULL);
+                continue;
+            }
+            sw->eof_flushing = false;
+            if (ve->loop_count > 0 && ve->current_loop + 1 >= ve->loop_count) {
+                ve->current_loop++;
+                video_engine_stop(ve);
+                return false;
+            }
+            ve->current_loop++;
+            ve->demuxer->seek_us(ve->demuxer, 0);
+            sw->p_avcodec_flush_buffers(sw->codec_ctx);
+            if (!ve->demuxer->read_packet(ve->demuxer, &dpkt)) {
+                video_engine_stop(ve);
+                return false;
+            }
+        }
+
+        sw->p_av_packet_unref(sw->pkt);
+        sw->pkt->data = (uint8_t *)(uintptr_t)dpkt.data;
+        sw->pkt->size = (int)dpkt.size;
+        sw->pkt->pts = dpkt.pts_us;
+        sw->pkt->dts = dpkt.dts_us;
+        sw->p_avcodec_send_packet(sw->codec_ctx, sw->pkt);
+    }
+    return false;
+}
+#endif
 
 static bool is_output_active_for_video(const video_engine_t *ve, const output_node_t *out)
 {
@@ -260,8 +666,12 @@ static void video_engine_prepare_reload(video_engine_t *ve)
     }
     ve->state = WAYWAL_VIDEO_STATE_STOPPED;
     ve->reorder_count = 0;
+    ve->eof_draining = false;
     ve->has_decoded_any = false;
     ve->playback_epoch_ns = 0;
+#ifdef HAVE_FFMPEG_SWDEC
+    swdec_destroy(ve);
+#endif
     if (ve->demuxer) {
         ve->demuxer->destroy(ve->demuxer);
         ve->demuxer = NULL;
@@ -400,6 +810,18 @@ static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
         if (!vaapi_decoder_init_with_params(
                 &ve->decoder, drm_fd, ve->demuxer->codec, ve->demuxer->width, ve->demuxer->height,
                 ve->demuxer->extradata, ve->demuxer->extradata_size, allow_direct_nv12)) {
+#ifdef HAVE_FFMPEG_SWDEC
+            if (!swdec_init(ve, ve->demuxer)) {
+                WAYWAL_LOG_ERR(
+                    "Failed to initialize both VA-API hardware and FFmpeg software video decoder");
+                ve->demuxer->destroy(ve->demuxer);
+                ve->demuxer = NULL;
+                ve->state = WAYWAL_VIDEO_STATE_STOPPED;
+                ve->reorder_count = 0;
+                ve->has_decoded_any = false;
+                return false;
+            }
+#else
             WAYWAL_LOG_ERR("Failed to initialize hardware VA-API decoder for video");
             ve->demuxer->destroy(ve->demuxer);
             ve->demuxer = NULL;
@@ -407,6 +829,7 @@ static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
             ve->reorder_count = 0;
             ve->has_decoded_any = false;
             return false;
+#endif
         }
     }
 
@@ -417,6 +840,7 @@ static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
     ve->last_pts_us = 0;
     ve->playback_epoch_ns = 0;
     ve->reorder_count = 0;
+    ve->eof_draining = false;
     ve->current_gop_id = 0;
     ve->next_present_gop = 0;
     ve->next_present_poc = 0;
@@ -424,7 +848,7 @@ static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
     ve->last_vpp_idx = 0;
     memset(ve->combined_busy_mask, 0, sizeof(ve->combined_busy_mask));
 
-    if (ve->daemon_state) {
+    if (ve->daemon_state && !ve->using_swdec) {
         for (output_node_t *node = ve->daemon_state->outputs; node != NULL; node = node->next) {
             if (is_output_active_for_video(ve, node)) {
                 node->vp_configured = false;
@@ -538,6 +962,8 @@ static bool reorder_has_ready_frame(video_engine_t *ve)
 {
     if (ve->reorder_count == 0)
         return false;
+    if (ve->eof_draining)
+        return true;
     if (ve->reorder_count >= WAYWAL_VIDEO_REORDER_CAP - 1)
         return true;
 
@@ -580,20 +1006,111 @@ void video_engine_dispatch_frame(video_engine_t *ve)
         return;
     }
 
+    output_node_t *pll_ref_out = select_pll_reference_output(ve);
+
+    uint32_t base_fps = (ve->demuxer->fps_num > 0 && ve->demuxer->fps_den > 0)
+                            ? (ve->demuxer->fps_num / ve->demuxer->fps_den)
+                            : 30U;
+    if (base_fps == 0)
+        base_fps = 30U;
+
+    uint32_t eff_fps = base_fps;
+    if (ve->daemon_state && ve->daemon_state->power_gov) {
+        eff_fps = waywal_power_governor_effective_fps(
+            ve->daemon_state->power_gov, pll_ref_out ? pll_ref_out->name : NULL, base_fps);
+        if (eff_fps == 0) {
+            /* Output occluded or paused by power governor: check again in 250ms */
+            struct itimerspec its_idle = {.it_interval = {0, 0},
+                                          .it_value = {.tv_sec = 0, .tv_nsec = 250000000L}};
+            timerfd_settime(ve->timer_fd, 0, &its_idle, NULL);
+            return;
+        }
+    }
+
+#ifdef HAVE_FFMPEG_SWDEC
+    if (ve->using_swdec && ve->swdec_ctx) {
+        int64_t sw_pts_us = 0;
+        if (swdec_decode_and_present(ve, &sw_pts_us)) {
+            ffmpeg_swdec_t *sw = (ffmpeg_swdec_t *)ve->swdec_ctx;
+            if (ve->daemon_state) {
+                for (output_node_t *out = ve->daemon_state->outputs; out != NULL; out = out->next) {
+                    if (!is_output_active_for_video(ve, out) || !out->surface)
+                        continue;
+                    if (sw->has_gbm_ring && sw->last_ready_ring_idx >= 0 &&
+                        sw->wl_bufs[sw->last_ready_ring_idx]) {
+                        int r_idx = sw->last_ready_ring_idx;
+                        sw->buf_busy[r_idx] = true;
+                        if (out->viewport) {
+                            int32_t dst_w =
+                                out->logical_width > 0 ? (int32_t)out->logical_width : out->width;
+                            int32_t dst_h = out->logical_height > 0 ? (int32_t)out->logical_height
+                                                                    : out->height;
+                            wp_viewport_set_destination(out->viewport, dst_w, dst_h);
+                            wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1),
+                                                   wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                                                   wl_fixed_from_int(-1));
+                        }
+                        wl_surface_attach(out->surface, sw->wl_bufs[r_idx], 0, 0);
+                        wl_surface_damage_buffer(out->surface, 0, 0, (int32_t)sw->width,
+                                                 (int32_t)sw->height);
+                        wl_surface_commit(out->surface);
+                    } else if (sw->rgba_buf) {
+                        output_node_render_image(ve->daemon_state, out, sw->rgba_buf, sw->width,
+                                                 sw->height);
+                    }
+                }
+                wl_display_flush(ve->daemon_state->display);
+            }
+        }
+        if (ve->state != WAYWAL_VIDEO_STATE_PLAYING)
+            return;
+
+        int64_t sw_interval_us = 1000000LL / (int64_t)eff_fps;
+        double sw_speed = (ve->playback_speed > 0.01f) ? (double)ve->playback_speed : 1.0;
+        sw_interval_us = (int64_t)((double)sw_interval_us / sw_speed);
+        if (sw_interval_us < 1000LL)
+            sw_interval_us = 1000LL;
+        int64_t sw_interval_ns = sw_interval_us * 1000LL;
+        struct itimerspec sw_its = {.it_interval = {0, 0},
+                                    .it_value = {
+                                        .tv_sec = sw_interval_ns / 1000000000LL,
+                                        .tv_nsec = sw_interval_ns % 1000000000LL,
+                                    }};
+        timerfd_settime(ve->timer_fd, 0, &sw_its, NULL);
+        return;
+    }
+#endif
+
     uint32_t pool_size =
         ve->decoder.num_surfaces > 0 ? ve->decoder.num_surfaces : WAYWAL_VA_SURFACE_POOL_SIZE;
 
-    while (ve->reorder_count < WAYWAL_VIDEO_REORDER_CAP) {
+    if (ve->eof_draining && ve->reorder_count == 0) {
+        ve->eof_draining = false;
+        if (ve->loop_count > 0 && ve->current_loop + 1 >= ve->loop_count) {
+            ve->current_loop++;
+            WAYWAL_LOG_INFO("Video loop count (%lu) reached, stopping playback", ve->loop_count);
+            video_engine_stop(ve);
+            return;
+        }
+        ve->current_loop++;
+        ve->demuxer->seek_us(ve->demuxer, 0);
+        vaapi_decoder_reset(&ve->decoder);
+        ve->current_gop_id++;
+    }
+
+    while (!ve->eof_draining && ve->reorder_count < WAYWAL_VIDEO_REORDER_CAP) {
         if (reorder_has_ready_frame(ve)) {
             break;
         }
 
         demux_packet_t pkt;
         if (!ve->demuxer->read_packet(ve->demuxer, &pkt)) {
+            if (ve->reorder_count > 0) {
+                /* Drain remaining B-frame / reorder_buf frames in POC order before looping */
+                ve->eof_draining = true;
+                break;
+            }
             if (ve->loop_count > 0 && ve->current_loop + 1 >= ve->loop_count) {
-                if (ve->reorder_count > 0) {
-                    break;
-                }
                 ve->current_loop++;
                 WAYWAL_LOG_INFO("Video loop count (%lu) reached, stopping playback",
                                 ve->loop_count);
@@ -604,10 +1121,8 @@ void video_engine_dispatch_frame(video_engine_t *ve)
 
             ve->demuxer->seek_us(ve->demuxer, 0);
             vaapi_decoder_reset(&ve->decoder);
+            ve->current_gop_id++;
             if (!ve->demuxer->read_packet(ve->demuxer, &pkt)) {
-                if (ve->reorder_count > 0) {
-                    break;
-                }
                 WAYWAL_LOG_WARN("Failed to seek to start of stream on video loop");
                 video_engine_stop(ve);
                 return;
@@ -649,6 +1164,12 @@ void video_engine_dispatch_frame(video_engine_t *ve)
         frame_interval_us =
             (1000000LL * (int64_t)ve->demuxer->fps_den) / (int64_t)ve->demuxer->fps_num;
     }
+    if (eff_fps < base_fps && eff_fps > 0) {
+        int64_t throttled_us = 1000000LL / (int64_t)eff_fps;
+        if (throttled_us > frame_interval_us) {
+            frame_interval_us = throttled_us;
+        }
+    }
     double speed = (ve->playback_speed > 0.01f) ? (double)ve->playback_speed : 1.0;
     frame_interval_us = (int64_t)((double)frame_interval_us / speed);
     if (frame_interval_us < 1000LL)
@@ -659,8 +1180,6 @@ void video_engine_dispatch_frame(video_engine_t *ve)
     clock_gettime(CLOCK_MONOTONIC, &now_ts);
     int64_t now_ns = (int64_t)now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
     int64_t target_pres_ns = now_ns + frame_interval_ns;
-
-    output_node_t *pll_ref_out = select_pll_reference_output(ve);
 
     if (ve->reorder_count > 0) {
         uint32_t best_idx = 0;
@@ -808,7 +1327,8 @@ void video_engine_resume(video_engine_t *ve)
 
 void video_engine_stop(video_engine_t *ve)
 {
-    if (!ve || (ve->state == WAYWAL_VIDEO_STATE_STOPPED && !ve->decoder.initialized))
+    if (!ve ||
+        (ve->state == WAYWAL_VIDEO_STATE_STOPPED && !ve->decoder.initialized && !ve->using_swdec))
         return;
 
     struct itimerspec its = {0};
@@ -821,10 +1341,15 @@ void video_engine_stop(video_engine_t *ve)
 
     ve->state = WAYWAL_VIDEO_STATE_STOPPED;
     ve->reorder_count = 0;
+    ve->eof_draining = false;
     ve->has_decoded_any = false;
     ve->playback_epoch_ns = 0;
 
     video_engine_release_wl_buffers(ve);
+
+#ifdef HAVE_FFMPEG_SWDEC
+    swdec_destroy(ve);
+#endif
 
     if (ve->daemon_state) {
         for (output_node_t *out = ve->daemon_state->outputs; out != NULL; out = out->next) {

@@ -4,40 +4,13 @@
 
 #include "waywal/bezier.h"
 #include "waywal/dmabuf.h"
+#include "waywal/types.h"
 
 #include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
-#endif
-
-#ifndef WAYWAL_TRANSITION_TYPE_DEFINED
-#define WAYWAL_TRANSITION_TYPE_DEFINED
-typedef enum {
-    WAYWAL_TRANSITION_NONE = 0,
-    WAYWAL_TRANSITION_SIMPLE = 1,
-    WAYWAL_TRANSITION_FADE = 2,
-    WAYWAL_TRANSITION_WIPE = 3,
-    WAYWAL_TRANSITION_GROW = 4,
-    WAYWAL_TRANSITION_OUTER = 5,
-    WAYWAL_TRANSITION_WAVE = 6,
-    WAYWAL_TRANSITION_NOISE = 7,
-    WAYWAL_TRANSITION_CROSSZOOM = 8,
-    WAYWAL_TRANSITION_SLIDE = 9,
-    WAYWAL_TRANSITION_GLITCH = 10,
-    WAYWAL_TRANSITION_BURN = 11,
-    WAYWAL_TRANSITION_RIPPLE = 12,
-    WAYWAL_TRANSITION_PIXELATE = 13,
-    WAYWAL_TRANSITION_DOOM = 14,
-    WAYWAL_TRANSITION_SWIRL = 15,
-    WAYWAL_TRANSITION_CUBE = 16,
-    WAYWAL_TRANSITION_LUMA = 17,
-    WAYWAL_TRANSITION_LIGHT_LEAK = 18,
-    WAYWAL_TRANSITION_PAGE_CURL = 19,
-    WAYWAL_TRANSITION_CUSTOM = 20,
-    WAYWAL_TRANSITION_RANDOM = 21,
-} waywal_transition_type_t;
 #endif
 
 typedef enum {
@@ -79,6 +52,9 @@ void render_engine_release_bo(render_engine_t *re, dmabuf_bo_t *bo);
 bool render_engine_upload_static(render_engine_t *re, const uint8_t *src_rgba, uint32_t src_w,
                                  uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t scaling_mode,
                                  uint32_t clear_color);
+
+void render_engine_set_span_bounds(render_engine_t *re, int32_t off_x, int32_t off_y,
+                                   int32_t total_w, int32_t total_h);
 
 /* Hot-compiles and loads an arbitrary GLSL compute shader for CUSTOM transition */
 bool render_engine_load_custom_shader(render_engine_t *re, const char *shader_src);

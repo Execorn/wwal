@@ -297,6 +297,8 @@ bool dmabuf_bo_allocate(dmabuf_context_t *ctx, dmabuf_bo_t *bo, uint32_t width, 
     bo->drm_format = drm_format;
     bo->modifier = actual_mod;
     bo->num_planes = (uint32_t)num_planes;
+    bo->is_10bit = (drm_format == DRM_FORMAT_XRGB2101010 || drm_format == DRM_FORMAT_ARGB2101010 ||
+                    drm_format == DRM_FORMAT_XBGR2101010 || drm_format == DRM_FORMAT_ABGR2101010);
 
     struct zwp_linux_buffer_params_v1 *params = NULL;
     if (ctx->dmabuf_proto) {

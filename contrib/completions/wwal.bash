@@ -8,7 +8,7 @@ _wwal_completion() {
     local trans_types="none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random"
     local trans_positions="center top bottom left right top-left top-right bottom-left bottom-right cursor mouse"
     local sync_modes="simultaneous staggered"
-    local scaling_modes="fill fit stretch center tile crop cover contain no"
+    local scaling_modes="fill fit stretch center tile span crop cover contain no"
     local filters="Nearest Bilinear CatmullRom Mitchell Lanczos3"
     local layers="background bottom"
     local battery_policies="ignore reduce-fps pause-video"
@@ -70,12 +70,16 @@ _wwal_completion() {
             _filedir '@(comp|glsl|frag)'
             return 0
             ;;
+        --depth-map)
+            _filedir '@(png|jpg|jpeg|webp|avif|heic|jxl|bmp|pnm|tga)'
+            return 0
+            ;;
         --transition-duration|--transition-fps|--transition-angle|--transition-wave|--transition-bezier|--transition-step|--stagger-delay|--fill-color|--interval|-d|--loop|--speed|-n|--namespace|-o|--output|--outputs)
             return 0
             ;;
     esac
 
-    local trans_opts="--transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --transition-bezier --transition-step --transition-shader -o --output --outputs --sync-mode --stagger-delay --10bit --scaling-mode --mode --resize --fill-color --filter --backdrop --layer --battery-policy --theme --no-theme --animate"
+    local trans_opts="--transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --transition-bezier --transition-step --transition-shader -o --output --outputs --sync-mode --stagger-delay --10bit --scaling-mode --mode --resize --fill-color --filter --backdrop --depth-map --layer --battery-policy --theme --no-theme --animate"
 
     case "$cmd" in
         img)

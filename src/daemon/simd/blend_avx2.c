@@ -86,10 +86,6 @@ __attribute__((target("avx2"))) void blend_scanline_avx2(uint8_t *restrict dst,
         }
     }
 
-    if (i > 0) {
-        _mm_sfence();
-    }
-
     if (i < num_bytes) {
         blend_scanline_scalar(dst + i, src_a + i, src_b + i, weight_b, num_bytes - i);
     }

@@ -37,6 +37,7 @@ typedef struct {
     uint8_t color[4];
     bool ten_bit;
 
+    char root_path[4096];
     char **file_list;
     size_t num_files;
     size_t capacity_files;
@@ -49,6 +50,7 @@ bool slideshow_init(slideshow_engine_t *ss, struct daemon_state *state);
 void slideshow_destroy(slideshow_engine_t *ss);
 
 bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *payload);
+bool slideshow_rescan(slideshow_engine_t *ss);
 void slideshow_stop(slideshow_engine_t *ss);
 void slideshow_pause(slideshow_engine_t *ss);
 void slideshow_resume(slideshow_engine_t *ss);

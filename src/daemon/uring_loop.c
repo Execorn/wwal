@@ -63,6 +63,19 @@ bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_e
     for (size_t i = 0; i < WAYWAL_URING_QUEUE_DEPTH; ++i) {
         if (loop->slots[i].active && loop->slots[i].fd == fd && loop->slots[i].type == type) {
             slot = &loop->slots[i];
+            slot->user_data = user_data;
+            if (slot->poll_mask == poll_mask && slot->in_flight) {
+                return true;
+            }
+            if (slot->in_flight) {
+                struct io_uring_sqe *rm_sqe = io_uring_get_sqe(&loop->ring);
+                if (rm_sqe) {
+                    io_uring_prep_poll_remove(rm_sqe, (__u64)(uintptr_t)slot);
+                    io_uring_sqe_set_data(rm_sqe, NULL);
+                    (void)io_uring_submit(&loop->ring);
+                }
+                slot->in_flight = false;
+            }
             break;
         }
     }
@@ -98,12 +111,9 @@ bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_e
     slot->user_data = user_data;
     slot->active = true;
     slot->is_multishot = loop->multishot_supported;
+    slot->in_flight = true;
 
-    if (slot->is_multishot) {
-        io_uring_prep_poll_multishot(sqe, fd, poll_mask);
-    } else {
-        io_uring_prep_poll_add(sqe, fd, poll_mask);
-    }
+    io_uring_prep_poll_add(sqe, fd, poll_mask);
     io_uring_sqe_set_data(sqe, slot);
     int ret = io_uring_submit(&loop->ring);
     if (ret < 0) {
@@ -124,17 +134,21 @@ bool uring_loop_remove_poll(waywal_uring_loop_t *loop, int fd)
     for (size_t i = 0; i < WAYWAL_URING_QUEUE_DEPTH; ++i) {
         if (loop->slots[i].active && loop->slots[i].fd == fd) {
             uring_slot_t *slot = &loop->slots[i];
+            bool was_in_flight = slot->in_flight;
             slot->active = false;
+            slot->in_flight = false;
             slot->fd = -1;
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
-            if (!sqe) {
-                (void)io_uring_submit(&loop->ring);
-                sqe = io_uring_get_sqe(&loop->ring);
-            }
-            if (sqe) {
-                io_uring_prep_poll_remove(sqe, (__u64)(uintptr_t)slot);
-                io_uring_sqe_set_data(sqe, NULL);
-                (void)io_uring_submit(&loop->ring);
+            if (was_in_flight) {
+                struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
+                if (!sqe) {
+                    (void)io_uring_submit(&loop->ring);
+                    sqe = io_uring_get_sqe(&loop->ring);
+                }
+                if (sqe) {
+                    io_uring_prep_poll_remove(sqe, (__u64)(uintptr_t)slot);
+                    io_uring_sqe_set_data(sqe, NULL);
+                    (void)io_uring_submit(&loop->ring);
+                }
             }
             removed = true;
         }
@@ -162,53 +176,34 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
     {
         count++;
         uring_slot_t *slot = (uring_slot_t *)io_uring_cqe_get_data(cqe);
-        static uint64_t s_spin_counter = 0;
-        s_spin_counter++;
-        if (s_spin_counter % 10000 == 0) {
-            WAYWAL_LOG_WARN("uring loop spin: count=%lu slot_fd=%d type=%d res=0x%x",
-                            (unsigned long)s_spin_counter, slot ? slot->fd : -1,
-                            slot ? (int)slot->type : -1, (unsigned)cqe->res);
-        }
         if (slot && slot->active) {
+            bool multishot_continues = ((cqe->flags & IORING_CQE_F_MORE) != 0);
             if (cqe->res < 0) {
-                if (cqe->res == -EINVAL && slot->is_multishot) {
-                    loop->multishot_supported = false;
-                    slot->is_multishot = false;
-                    struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
-                    if (!sqe) {
-                        (void)io_uring_submit(&loop->ring);
-                        sqe = io_uring_get_sqe(&loop->ring);
-                    }
-                    if (sqe) {
-                        io_uring_prep_poll_add(sqe, slot->fd, slot->poll_mask);
-                        io_uring_sqe_set_data(sqe, slot);
-                    }
+                if (cqe->res == -ECANCELED) {
                     continue;
                 }
                 WAYWAL_LOG_WARN("uring poll error: fd=%d res=%d", slot->fd, cqe->res);
-                if (!(cqe->flags & IORING_CQE_F_MORE)) {
+                if (!multishot_continues) {
+                    slot->in_flight = false;
                     slot->active = false;
                 }
                 continue;
             }
+            if (!multishot_continues) {
+                slot->in_flight = false;
+            }
             handler(slot->type, slot->fd, (uint32_t)cqe->res, slot->user_data);
 
-            bool multishot_continues =
-                slot->is_multishot && ((cqe->flags & IORING_CQE_F_MORE) != 0);
-
-            /* Re-arm poll if slot remains active and multishot didn't continue */
-            if (slot->active && loop->running && !multishot_continues) {
+            /* Re-arm poll if slot remains active and no SQE is currently in flight */
+            if (slot->active && loop->running && !slot->in_flight) {
                 struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
                 if (!sqe) {
                     io_uring_submit(&loop->ring);
                     sqe = io_uring_get_sqe(&loop->ring);
                 }
                 if (sqe) {
-                    if (slot->is_multishot) {
-                        io_uring_prep_poll_multishot(sqe, slot->fd, slot->poll_mask);
-                    } else {
-                        io_uring_prep_poll_add(sqe, slot->fd, slot->poll_mask);
-                    }
+                    slot->in_flight = true;
+                    io_uring_prep_poll_add(sqe, slot->fd, slot->poll_mask);
                     io_uring_sqe_set_data(sqe, slot);
                 } else {
                     WAYWAL_LOG_ERR("uring_loop_dispatch: SQ ring full, failed to re-arm fd %d",

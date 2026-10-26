@@ -33,6 +33,7 @@ typedef struct {
     void *user_data;
     bool active;
     bool is_multishot;
+    bool in_flight;
 } uring_slot_t;
 
 typedef struct {

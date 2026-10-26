@@ -4,7 +4,7 @@ complete -c wwal -f
 set -l trans_types "none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random"
 set -l trans_pos "center top bottom left right top-left top-right bottom-left bottom-right cursor mouse"
 set -l sync_modes "simultaneous staggered"
-set -l scaling_modes "fill fit stretch center tile crop cover contain no"
+set -l scaling_modes "fill fit stretch center tile span crop cover contain no"
 set -l filters "Nearest Bilinear CatmullRom Mitchell Lanczos3"
 set -l layers "background bottom"
 set -l battery_policies "ignore reduce-fps pause-video"
@@ -56,6 +56,7 @@ for subcmd in img slideshow
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l fill-color -d "Padding hex color for fit/center modes" -r
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l filter -a "$filters" -d "Scaling filter hint" -r
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l backdrop -a "$backdrops" -d "Overview backdrop mode or file" -r -F
+    complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l depth-map -d "Depth-map image for 3D Parallax Occlusion Mapping" -r -F
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l theme -d "Extract Material You palette and sync caelestia/OSC"
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l no-theme -d "Disable automatic Material You palette extraction"
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l animate -d "Play animated GIF/WebP/APNG via video engine"

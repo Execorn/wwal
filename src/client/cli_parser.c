@@ -8,6 +8,7 @@
 #include "waywal/ipc_proto.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,6 +79,8 @@ void cli_print_usage(const char *prog)
     printf("  --theme / --no-theme       Enable or disable automatic theme extraction\n");
     printf("  --theme-mode <dark|light>  Select dark or light Material You palette mode\n");
     printf("  --backdrop <MODE>          Backdrop mode: none, auto-blur, or file path\n");
+    printf("  --depth-map <FILE>         Path to 8-bit depth map for 2.5D parallax\n");
+    printf("  --depth-strength <FLOAT>   Depth parallax strength multiplier (default: 1.0)\n");
     printf("  --layer <LAYER>            Layer-shell target: background or bottom\n");
     printf("  --battery-policy <POLICY>  Battery policy: ignore, reduce-fps, pause-video\n\n");
     printf("Shader Options:\n");
@@ -153,7 +156,9 @@ static void apply_transition_type(cli_options_t *opts, const char *str)
     }
     if (strcasecmp(str, "none") == 0) {
         opts->transition_type = WAYWAL_TRANSITION_NONE;
-    } else if (strcasecmp(str, "simple") == 0 || strcasecmp(str, "fade") == 0) {
+    } else if (strcasecmp(str, "simple") == 0) {
+        opts->transition_type = WAYWAL_TRANSITION_SIMPLE;
+    } else if (strcasecmp(str, "fade") == 0) {
         opts->transition_type = WAYWAL_TRANSITION_FADE;
     } else if (strcasecmp(str, "wipe") == 0) {
         opts->transition_type = WAYWAL_TRANSITION_WIPE;
@@ -321,6 +326,8 @@ static void apply_scaling_mode(cli_options_t *opts, const char *m)
         opts->scaling_mode = WAYWAL_SCALING_CENTER;
     } else if (strcasecmp(m, "tile") == 0) {
         opts->scaling_mode = WAYWAL_SCALING_TILE;
+    } else if (strcasecmp(m, "span") == 0) {
+        opts->scaling_mode = WAYWAL_SCALING_SPAN;
     } else {
         fprintf(stderr, "Warning: Unknown scaling mode '%s', defaulting to fill\n", m);
         opts->scaling_mode = WAYWAL_SCALING_FILL;
@@ -452,6 +459,14 @@ static bool parse_common_flag(int *optind_ptr, int argc, char *argv[], cli_optio
         opts->transition_type = WAYWAL_TRANSITION_CUSTOM;
         return true;
     }
+    if (match_opt_val(arg, "--depth-map", optind_ptr, argc, argv, &val)) {
+        if (!val || val[0] == '\0') {
+            return false;
+        }
+        strncpy(opts->depth_map_path, val, sizeof(opts->depth_map_path) - 1);
+        opts->depth_map_path[sizeof(opts->depth_map_path) - 1] = '\0';
+        return true;
+    }
     if (match_opt_val(arg, "-o", optind_ptr, argc, argv, &val) ||
         match_opt_val(arg, "--output", optind_ptr, argc, argv, &val) ||
         match_opt_val(arg, "--outputs", optind_ptr, argc, argv, &val)) {
@@ -544,6 +559,20 @@ static bool parse_common_flag(int *optind_ptr, int argc, char *argv[], cli_optio
         opts->battery_policy[sizeof(opts->battery_policy) - 1] = '\0';
         return true;
     }
+    if (match_opt_val(arg, "--depth-strength", optind_ptr, argc, argv, &val)) {
+        if (!val || val[0] == '\0') {
+            fprintf(stderr, "Error: Invalid --depth-strength value\n");
+            return false;
+        }
+        char *endptr = NULL;
+        float strength = strtof(val, &endptr);
+        if (endptr == val || *endptr != '\0' || !isfinite(strength) || strength <= 0.0f) {
+            fprintf(stderr, "Error: Invalid --depth-strength value\n");
+            return false;
+        }
+        opts->depth_strength = strength;
+        return true;
+    }
 
     return false;
 }
@@ -563,12 +592,13 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
     opts->transition_step = 0;
     opts->transition_angle_rad = 0.0f;
     opts->transition_angle = 0.0f;
-    opts->transition_wave_freq = 20.0f;
-    opts->transition_wave_amp = 0.05f;
+    opts->transition_wave_freq = 0.0f;
+    opts->transition_wave_amp = 0.0f;
     opts->transition_pos_x = 0.5f;
     opts->transition_pos_y = 0.5f;
     opts->bezier = BEZIER_DEFAULT;
     opts->has_custom_bezier = false;
+    opts->depth_strength = 1.0f;
     opts->sync_mode = 0;
     opts->stagger_delay_ms = 150;
     opts->scaling_mode = WAYWAL_SCALING_FILL;

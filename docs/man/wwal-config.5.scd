@@ -60,7 +60,7 @@ Controls the in-pipeline OKLab Wu quantizer + weighted K-Means++ + CAM16/HCT Mat
 *mode* = "<dark|light>"
 	Target Material Design 3 tonal scheme polarity (default: *"dark"*).
 
-*scheme_variant* = "<tonal_spot|vibrant|expressive|neutral|monochrome|fidelity>"
+*scheme_variant* = "<tonal_spot|vibrant|expressive|neutral|monochrome|fidelity|content|rainbow|fruit_salad>"
 	CAM16/HCT chroma and hue rotation variant (default: *"tonal_spot"*).
 
 *contrast* = <float>
@@ -116,7 +116,7 @@ Configures initial wallpaper, video, shader, or slideshow settings for a specifi
 *mode* = "<img|video|shader|slideshow|color>"
 	Content mode for this output (default: inferred from _path_).
 
-*scaling* = "<fill|fit|stretch|center|tile>"
+*scaling* = "<fill|fit|stretch|center|tile|span>"
 	Aspect-ratio scaling mode (default: *"fill"*).
 
 *fill_color* = "<hex>"

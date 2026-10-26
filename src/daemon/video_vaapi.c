@@ -431,9 +431,10 @@ void vaapi_decoder_destroy(vaapi_decoder_t *dec)
         }
         /* nvidia_drv_video.so wakes vaSyncSurface before cuvidUnmapVideoFrame finishes and before
          * its resolveSurfaces worker thread re-locks ctx->mutex and enters pthread_cond_wait;
-         * destroyContext signals ctx->cond without locking ctx->mutex. Waiting 1ms guarantees
-         * resolveSurfaces is parked in pthread_cond_wait before vaDestroyContext signals it. */
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000L};
+         * destroyContext signals ctx->cond without locking ctx->mutex. Waiting 15ms guarantees
+         * resolveSurfaces is parked in pthread_cond_wait before vaDestroyContext signals it even
+         * under heavy concurrent GPU contention. */
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 15000000L};
         nanosleep(&ts, NULL);
     }
 

@@ -21,6 +21,7 @@ typedef enum {
     IPC_BACKEND_NONE = 0,
     IPC_BACKEND_HYPRLAND = 1,
     IPC_BACKEND_SWAY = 2,
+    IPC_BACKEND_NIRI = 3,
 } ipc_backend_t;
 
 typedef struct {
@@ -29,10 +30,16 @@ typedef struct {
     bool in_use;
 } governed_output_t;
 
+#define WAYWAL_SYSFS_BAT_COUNT 2
+#define WAYWAL_SYSFS_AC_COUNT  3
+
 struct waywal_power_governor {
     waywal_battery_policy_t battery_policy;
     bool on_battery;
     uint32_t global_mask;
+    bool auto_pause_fullscreen;
+    bool auto_pause_maximized;
+    bool pause_on_occluded_workspace;
 
     governed_output_t outputs[WAYWAL_MAX_GOVERNED_OUTPUTS];
     size_t output_count;
@@ -42,11 +49,33 @@ struct waywal_power_governor {
 
     ipc_backend_t ipc_backend;
     int ipc_fd;
+    bool ipc_reconnected;
     char ipc_buf[4096];
     size_t ipc_buf_len;
 
     int inotify_fd;
+    int bat_fds[WAYWAL_SYSFS_BAT_COUNT];
+    int ac_fds[WAYWAL_SYSFS_AC_COUNT];
+    int profile_fd;
+    bool battery_polled_once;
 };
+
+static uint32_t policy_allowed_mask(const waywal_power_governor_t *gov)
+{
+    if (!gov)
+        return 0xFFFFFFFFu;
+    uint32_t mask = 0xFFFFFFFFu;
+    if (!gov->auto_pause_fullscreen) {
+        mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+    }
+    if (!gov->auto_pause_maximized) {
+        mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_MAXIMIZED;
+    }
+    if (!gov->pause_on_occluded_workspace) {
+        mask &= ~(uint32_t)WAYWAL_PAUSE_WORKSPACE_OCCLUDED;
+    }
+    return mask;
+}
 
 static governed_output_t *find_or_create_output(waywal_power_governor_t *gov, const char *name,
                                                 bool create)
@@ -162,18 +191,30 @@ static void init_compositor_ipc(waywal_power_governor_t *gov)
             (void)wr;
             gov->ipc_backend = IPC_BACKEND_SWAY;
             WAYWAL_LOG_INFO("Power governor attached to Sway/i3 IPC socket");
+            return;
+        }
+    }
+
+    const char *nirisock = getenv("NIRI_SOCKET");
+    if (nirisock && nirisock[0] != '\0') {
+        gov->ipc_fd = connect_unix_nonblock(nirisock);
+        if (gov->ipc_fd >= 0) {
+            static const char niri_sub[] = "\"EventStream\"\n";
+            ssize_t wr = send(gov->ipc_fd, niri_sub, sizeof(niri_sub) - 1, MSG_NOSIGNAL);
+            (void)wr;
+            gov->ipc_backend = IPC_BACKEND_NIRI;
+            WAYWAL_LOG_INFO("Power governor attached to Niri IPC event socket");
+            return;
         }
     }
 }
 
-static bool read_first_line(const char *path, char *out, size_t out_sz)
+static bool pread_first_line(int fd, char *out, size_t out_sz)
 {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
+    if (fd < 0 || !out || out_sz == 0) {
         return false;
     }
-    ssize_t n = read(fd, out, out_sz - 1);
-    close(fd);
+    ssize_t n = pread(fd, out, out_sz - 1, 0);
     if (n <= 0) {
         return false;
     }
@@ -189,21 +230,42 @@ static bool read_first_line(const char *path, char *out, size_t out_sz)
 
 static void init_battery_inotify(waywal_power_governor_t *gov)
 {
-    gov->inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (gov->inotify_fd < 0) {
-        return;
+    for (size_t i = 0; i < WAYWAL_SYSFS_BAT_COUNT; ++i) {
+        gov->bat_fds[i] = -1;
     }
+    for (size_t i = 0; i < WAYWAL_SYSFS_AC_COUNT; ++i) {
+        gov->ac_fds[i] = -1;
+    }
+    gov->profile_fd = -1;
 
-    static const char *const watch_paths[] = {
-        "/sys/class/power_supply/BAT0/status", "/sys/class/power_supply/BAT1/status",
-        "/sys/class/power_supply/AC/online",   "/sys/class/power_supply/ACAD/online",
-        "/sys/class/power_supply/ADP1/online", "/sys/firmware/acpi/platform_profile",
+    static const char *const bat_paths[WAYWAL_SYSFS_BAT_COUNT] = {
+        "/sys/class/power_supply/BAT0/status",
+        "/sys/class/power_supply/BAT1/status",
     };
+    static const char *const ac_paths[WAYWAL_SYSFS_AC_COUNT] = {
+        "/sys/class/power_supply/AC/online",
+        "/sys/class/power_supply/ACAD/online",
+        "/sys/class/power_supply/ADP1/online",
+    };
+    static const char *const profile_path = "/sys/firmware/acpi/platform_profile";
 
-    for (size_t i = 0; i < sizeof(watch_paths) / sizeof(watch_paths[0]); ++i) {
-        if (access(watch_paths[i], R_OK) == 0) {
-            inotify_add_watch(gov->inotify_fd, watch_paths[i], IN_MODIFY | IN_CLOSE_WRITE);
+    gov->inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+
+    for (size_t i = 0; i < WAYWAL_SYSFS_BAT_COUNT; ++i) {
+        gov->bat_fds[i] = open(bat_paths[i], O_RDONLY | O_CLOEXEC);
+        if (gov->bat_fds[i] >= 0 && gov->inotify_fd >= 0) {
+            inotify_add_watch(gov->inotify_fd, bat_paths[i], IN_MODIFY | IN_CLOSE_WRITE);
         }
+    }
+    for (size_t i = 0; i < WAYWAL_SYSFS_AC_COUNT; ++i) {
+        gov->ac_fds[i] = open(ac_paths[i], O_RDONLY | O_CLOEXEC);
+        if (gov->ac_fds[i] >= 0 && gov->inotify_fd >= 0) {
+            inotify_add_watch(gov->inotify_fd, ac_paths[i], IN_MODIFY | IN_CLOSE_WRITE);
+        }
+    }
+    gov->profile_fd = open(profile_path, O_RDONLY | O_CLOEXEC);
+    if (gov->profile_fd >= 0 && gov->inotify_fd >= 0) {
+        inotify_add_watch(gov->inotify_fd, profile_path, IN_MODIFY | IN_CLOSE_WRITE);
     }
 }
 
@@ -215,6 +277,9 @@ waywal_power_governor_t *waywal_power_governor_create(waywal_battery_policy_t po
         return NULL;
     }
     gov->battery_policy = policy;
+    gov->auto_pause_fullscreen = true;
+    gov->auto_pause_maximized = true;
+    gov->pause_on_occluded_workspace = true;
     gov->ipc_fd = -1;
     gov->inotify_fd = -1;
 
@@ -234,6 +299,19 @@ void waywal_power_governor_destroy(waywal_power_governor_t *gov)
     }
     if (gov->inotify_fd >= 0) {
         close(gov->inotify_fd);
+    }
+    for (size_t i = 0; i < WAYWAL_SYSFS_BAT_COUNT; ++i) {
+        if (gov->bat_fds[i] >= 0) {
+            close(gov->bat_fds[i]);
+        }
+    }
+    for (size_t i = 0; i < WAYWAL_SYSFS_AC_COUNT; ++i) {
+        if (gov->ac_fds[i] >= 0) {
+            close(gov->ac_fds[i]);
+        }
+    }
+    if (gov->profile_fd >= 0) {
+        close(gov->profile_fd);
     }
     free(gov);
 }
@@ -268,7 +346,15 @@ void waywal_power_governor_feed_hyprland_event(waywal_power_governor_t *gov, con
         if (mon_len > 0 && mon_len < sizeof(gov->focused_output)) {
             memcpy(gov->focused_output, arg, mon_len);
             gov->focused_output[mon_len] = '\0';
-            find_or_create_output(gov, gov->focused_output, true);
+            governed_output_t *out = find_or_create_output(gov, gov->focused_output, true);
+            if (out && (gov->global_mask &
+                        (WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN | WAYWAL_PAUSE_TOPLEVEL_MAXIMIZED))) {
+                /* Migrate any early global fullscreen/maximized bit onto the newly known output */
+                out->mask |= gov->global_mask &
+                             (WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN | WAYWAL_PAUSE_TOPLEVEL_MAXIMIZED);
+                gov->global_mask &=
+                    ~(uint32_t)(WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN | WAYWAL_PAUSE_TOPLEVEL_MAXIMIZED);
+            }
         }
         if (comma && comma[1] != '\0') {
             snprintf(gov->active_workspace, sizeof(gov->active_workspace), "%s", comma + 1);
@@ -276,6 +362,9 @@ void waywal_power_governor_feed_hyprland_event(waywal_power_governor_t *gov, con
         }
     } else if (ev_len == 10 && memcmp(line, "fullscreen", 10) == 0) {
         bool is_fs = (arg[0] == '1');
+        if (!is_fs) {
+            gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+        }
         if (gov->focused_output[0] != '\0') {
             waywal_power_governor_set_output_reason(gov, gov->focused_output,
                                                     WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, is_fs);
@@ -287,6 +376,7 @@ void waywal_power_governor_feed_hyprland_event(waywal_power_governor_t *gov, con
             snprintf(gov->active_workspace, sizeof(gov->active_workspace), "%s", arg);
             gov->workspace_changed = true;
         }
+        gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
         if (gov->focused_output[0] != '\0') {
             waywal_power_governor_set_output_reason(gov, gov->focused_output,
                                                     WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
@@ -298,6 +388,7 @@ void waywal_power_governor_feed_hyprland_event(waywal_power_governor_t *gov, con
             snprintf(gov->active_workspace, sizeof(gov->active_workspace), "%s", ws_name);
             gov->workspace_changed = true;
         }
+        gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
         if (gov->focused_output[0] != '\0') {
             waywal_power_governor_set_output_reason(gov, gov->focused_output,
                                                     WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
@@ -374,6 +465,9 @@ void waywal_power_governor_feed_sway_payload(waywal_power_governor_t *gov, const
         p++;
     }
     bool is_fs = (*p == '1' || *p == '2');
+    if (!is_fs) {
+        gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+    }
 
     const char *out_name = target_output[0] != '\0' ? target_output : gov->focused_output;
     if (out_name[0] != '\0') {
@@ -381,6 +475,36 @@ void waywal_power_governor_feed_sway_payload(waywal_power_governor_t *gov, const
                                                 is_fs);
     } else {
         waywal_power_governor_set_global_reason(gov, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, is_fs);
+    }
+}
+
+void waywal_power_governor_feed_niri_event(waywal_power_governor_t *gov, const char *json)
+{
+    if (!gov || !json) {
+        return;
+    }
+
+    if (strstr(json, "\"WorkspaceActivated\"") || strstr(json, "\"WorkspaceFocused\"")) {
+        const char *id_key = strstr(json, "\"id\"");
+        if (id_key) {
+            const char *colon = strchr(id_key + 4, ':');
+            if (colon) {
+                const char *p = colon + 1;
+                while (*p && isspace((unsigned char)*p)) {
+                    p++;
+                }
+                size_t len = 0;
+                while (p[len] && isdigit((unsigned char)p[len]) &&
+                       len < sizeof(gov->active_workspace) - 1) {
+                    gov->active_workspace[len] = p[len];
+                    len++;
+                }
+                if (len > 0) {
+                    gov->active_workspace[len] = '\0';
+                    gov->workspace_changed = true;
+                }
+            }
+        }
     }
 }
 
@@ -400,10 +524,27 @@ bool waywal_power_governor_pop_workspace_change(waywal_power_governor_t *gov, ch
     return gov->active_workspace[0] != '\0';
 }
 
+bool waywal_power_governor_consume_ipc_reconnected(waywal_power_governor_t *gov)
+{
+    if (!gov) {
+        return false;
+    }
+    bool reconnected = gov->ipc_reconnected;
+    gov->ipc_reconnected = false;
+    return reconnected;
+}
+
 void waywal_power_governor_dispatch_ipc(waywal_power_governor_t *gov)
 {
-    if (!gov || gov->ipc_fd < 0) {
+    if (!gov) {
         return;
+    }
+    if (gov->ipc_fd < 0) {
+        init_compositor_ipc(gov);
+        if (gov->ipc_fd < 0) {
+            return;
+        }
+        gov->ipc_reconnected = true;
     }
 
     for (;;) {
@@ -412,18 +553,30 @@ void waywal_power_governor_dispatch_ipc(waywal_power_governor_t *gov)
         }
         ssize_t n = recv(gov->ipc_fd, gov->ipc_buf + gov->ipc_buf_len,
                          sizeof(gov->ipc_buf) - 1 - gov->ipc_buf_len, MSG_DONTWAIT);
-        if (n <= 0) {
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+            close(gov->ipc_fd);
+            gov->ipc_fd = -1;
+            gov->ipc_buf_len = 0;
+            init_compositor_ipc(gov);
+            gov->ipc_reconnected = (gov->ipc_fd >= 0);
+            break;
+        }
+        if (n < 0) {
             break;
         }
         gov->ipc_buf_len += (size_t)n;
         gov->ipc_buf[gov->ipc_buf_len] = '\0';
 
-        if (gov->ipc_backend == IPC_BACKEND_HYPRLAND) {
+        if (gov->ipc_backend == IPC_BACKEND_HYPRLAND || gov->ipc_backend == IPC_BACKEND_NIRI) {
             char *start = gov->ipc_buf;
             char *nl = NULL;
             while ((nl = strchr(start, '\n')) != NULL) {
                 *nl = '\0';
-                waywal_power_governor_feed_hyprland_event(gov, start);
+                if (gov->ipc_backend == IPC_BACKEND_HYPRLAND) {
+                    waywal_power_governor_feed_hyprland_event(gov, start);
+                } else {
+                    waywal_power_governor_feed_niri_event(gov, start);
+                }
                 start = nl + 1;
             }
             size_t rem = (size_t)(gov->ipc_buf + gov->ipc_buf_len - start);
@@ -472,19 +625,20 @@ bool waywal_power_governor_poll_battery(waywal_power_governor_t *gov)
 
     if (gov->inotify_fd >= 0) {
         uint8_t ev_buf[256];
+        bool changed = false;
         while (read(gov->inotify_fd, ev_buf, sizeof(ev_buf)) > 0) {
+            changed = true;
+        }
+        if (gov->battery_polled_once && !changed) {
+            return gov->on_battery;
         }
     }
 
     bool discharging = false;
     char buf[64];
 
-    static const char *const bat_paths[] = {
-        "/sys/class/power_supply/BAT0/status",
-        "/sys/class/power_supply/BAT1/status",
-    };
-    for (size_t i = 0; i < sizeof(bat_paths) / sizeof(bat_paths[0]); ++i) {
-        if (read_first_line(bat_paths[i], buf, sizeof(buf))) {
+    for (size_t i = 0; i < WAYWAL_SYSFS_BAT_COUNT; ++i) {
+        if (pread_first_line(gov->bat_fds[i], buf, sizeof(buf))) {
             if (strcasecmp(buf, "Discharging") == 0) {
                 discharging = true;
                 break;
@@ -493,13 +647,8 @@ bool waywal_power_governor_poll_battery(waywal_power_governor_t *gov)
     }
 
     if (!discharging) {
-        static const char *const ac_paths[] = {
-            "/sys/class/power_supply/AC/online",
-            "/sys/class/power_supply/ACAD/online",
-            "/sys/class/power_supply/ADP1/online",
-        };
-        for (size_t i = 0; i < sizeof(ac_paths) / sizeof(ac_paths[0]); ++i) {
-            if (read_first_line(ac_paths[i], buf, sizeof(buf))) {
+        for (size_t i = 0; i < WAYWAL_SYSFS_AC_COUNT; ++i) {
+            if (pread_first_line(gov->ac_fds[i], buf, sizeof(buf))) {
                 if (buf[0] == '0') {
                     discharging = true;
                 }
@@ -509,13 +658,14 @@ bool waywal_power_governor_poll_battery(waywal_power_governor_t *gov)
     }
 
     if (!discharging) {
-        if (read_first_line("/sys/firmware/acpi/platform_profile", buf, sizeof(buf))) {
+        if (pread_first_line(gov->profile_fd, buf, sizeof(buf))) {
             if (strcasecmp(buf, "low-power") == 0) {
                 discharging = true;
             }
         }
     }
 
+    gov->battery_polled_once = true;
     gov->on_battery = discharging;
     sync_battery_mask(gov);
     return gov->on_battery;
@@ -545,6 +695,18 @@ void waywal_power_governor_set_battery_policy(waywal_power_governor_t *gov,
     sync_battery_mask(gov);
 }
 
+void waywal_power_governor_set_pause_policies(waywal_power_governor_t *gov,
+                                              bool auto_pause_fullscreen, bool auto_pause_maximized,
+                                              bool pause_on_occluded_workspace)
+{
+    if (!gov) {
+        return;
+    }
+    gov->auto_pause_fullscreen = auto_pause_fullscreen;
+    gov->auto_pause_maximized = auto_pause_maximized;
+    gov->pause_on_occluded_workspace = pause_on_occluded_workspace;
+}
+
 void waywal_power_governor_set_output_reason(waywal_power_governor_t *gov, const char *output_name,
                                              waywal_pause_reason_t reason, bool active)
 {
@@ -563,6 +725,11 @@ void waywal_power_governor_set_output_reason(waywal_power_governor_t *gov, const
         out->mask |= (uint32_t)reason;
     } else {
         out->mask &= ~(uint32_t)reason;
+        /* Also clear any stale early global reason bit for window state */
+        if (reason == WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN ||
+            reason == WAYWAL_PAUSE_TOPLEVEL_MAXIMIZED) {
+            gov->global_mask &= ~(uint32_t)reason;
+        }
     }
 }
 
@@ -587,7 +754,8 @@ uint32_t waywal_power_governor_get_output_mask(const waywal_power_governor_t *go
     }
     const governed_output_t *out = find_output_const(gov, output_name);
     uint32_t out_mask = out ? out->mask : 0u;
-    return gov->global_mask | out_mask;
+    uint32_t allowed = policy_allowed_mask(gov);
+    return (gov->global_mask | out_mask) & allowed;
 }
 
 bool waywal_power_governor_should_pause_output(const waywal_power_governor_t *gov,
@@ -601,14 +769,15 @@ bool waywal_power_governor_should_pause_all(const waywal_power_governor_t *gov)
     if (!gov) {
         return false;
     }
-    if (gov->global_mask != 0u) {
+    uint32_t allowed = policy_allowed_mask(gov);
+    if ((gov->global_mask & allowed) != 0u) {
         return true;
     }
     if (gov->output_count == 0) {
         return false;
     }
     for (size_t i = 0; i < gov->output_count; ++i) {
-        if (gov->outputs[i].in_use && gov->outputs[i].mask == 0u) {
+        if (gov->outputs[i].in_use && (gov->outputs[i].mask & allowed) == 0u) {
             return false;
         }
     }

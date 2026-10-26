@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Multi-pass Shadertoy rendering (`BUFFER_A`..`BUFFER_D` `GL_RGBA16F` ping-pong passes, `iChannel0`..`iChannel3` bindings, `iMouse`, `iDate`, and live `u_palette_*` uniforms).
+- 2.5D depth-map parallax wallpaper mode (`--depth-map <PATH>` and `--depth-strength <FLOAT>`) driven by smooth cursor and compositor workspace offsets.
+- `zwlr_foreign_toplevel_manager_v1` occlusion tracking (`protocols/wlr-foreign-toplevel-management-unstable-v1.xml`) and `--battery-policy` CLI flag.
+- WebM `EBML_ID_DURATION` parsing, Xiph/Fixed/EBML block lacing expansion, and MP4 `ctts` v0/v1 composition time offset support in `demuxer.c`.
+
+### Fixed
+
+- Backward-compatible IPC header parsing in `WAYWAL_REQ_SET_IMAGE` for legacy `waywal_img_metadata_t` payloads.
+- Deduplicated client/daemon HCT palette extraction, theme file exports, `/dev/pts/*` broadcasts, and hook execution on `wwal img`, while wiring daemon-side theme/hook updates and `SIGHUP` directory rescanning into `slideshow.c`.
+- Preserved per-effect wave/blur defaults in `crosszoom`, `slide`, `glitch`, `burn`, `ripple`, and `wave`, fixed `--transition-type simple` and `random`, and eliminated double Cubic-Bezier easing.
+- Added `in_flight` poll SQE tracking in `uring_loop.c` and forced `epoll`/`io_uring` re-registration on compositor IPC reconnect.
+
+### Performance
+
+- Vectorized AVX2 and AVX-512 BW scanline alpha blending without per-scanline `_mm_sfence()` stalls, cached GLSL uniform locations across all 19 transition compute shaders, and eliminated redundant 4K RGBA heap buffers in `video_engine.c` and `main.c`.
+
 ## [1.0.0] - 2026-10-26
 
 ### Added
