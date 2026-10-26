@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "e2e_common.h"
 
 void run_tier4_workload_scenarios(void)
@@ -124,7 +125,8 @@ void run_tier4_workload_scenarios(void)
         e2e_canary_free(d2_dst);
     }
 
-    /* T4_03: Multi-output triple-monitor workstation setup (4K + 1080p landscape + 1080p portrait) */
+    /* T4_03: Multi-output triple-monitor workstation setup (4K + 1080p landscape + 1080p portrait)
+     */
     {
         /* Primary: 3840x2160 */
         const uint32_t w1 = 3840, h1 = 2160;
@@ -165,16 +167,15 @@ void run_tier4_workload_scenarios(void)
                                          .progress = 0.5f,
                                          .angle_rad = 0.0f,
                                          .bezier = BEZIER_DEFAULT};
-        waywal_transition_params_t p3 = {.type = WAYWAL_TRANSITION_PAGE_CURL,
-                                         .progress = 0.5f,
-                                         .bezier = BEZIER_DEFAULT};
+        waywal_transition_params_t p3 = {
+            .type = WAYWAL_TRANSITION_PAGE_CURL, .progress = 0.5f, .bezier = BEZIER_DEFAULT};
 
-        bool ok1 =
-            render_engine_execute_cpu_transition(d1_dst, d1_a, d1_b, w1, h1, w1 * sizeof(uint32_t), &p1);
-        bool ok2 =
-            render_engine_execute_cpu_transition(d2_dst, d2_a, d2_b, w2, h2, w2 * sizeof(uint32_t), &p2);
-        bool ok3 =
-            render_engine_execute_cpu_transition(d3_dst, d3_a, d3_b, w3, h3, w3 * sizeof(uint32_t), &p3);
+        bool ok1 = render_engine_execute_cpu_transition(d1_dst, d1_a, d1_b, w1, h1,
+                                                        w1 * sizeof(uint32_t), &p1);
+        bool ok2 = render_engine_execute_cpu_transition(d2_dst, d2_a, d2_b, w2, h2,
+                                                        w2 * sizeof(uint32_t), &p2);
+        bool ok3 = render_engine_execute_cpu_transition(d3_dst, d3_a, d3_b, w3, h3,
+                                                        w3 * sizeof(uint32_t), &p3);
 
         bool triple_ok = ok1 && ok2 && ok3 && e2e_canary_check(d1_dst, n1) &&
                          e2e_canary_check(d2_dst, n2) && e2e_canary_check(d3_dst, n3);
@@ -217,8 +218,8 @@ void run_tier4_workload_scenarios(void)
             .center_y = 0.5f,
             .bezier = BEZIER_DEFAULT,
         };
-        bool ok_p1 = render_engine_execute_cpu_transition(mid_buf, a, b, w, h,
-                                                          w * sizeof(uint32_t), &p_part1);
+        bool ok_p1 = render_engine_execute_cpu_transition(mid_buf, a, b, w, h, w * sizeof(uint32_t),
+                                                          &p_part1);
 
         /* 2. User interrupts! Now transition from mid_buf -> C, concluding at 1.0 */
         waywal_transition_params_t p_part2 = {
@@ -273,8 +274,8 @@ void run_tier4_workload_scenarios(void)
                     .center_y = 0.5f,
                     .bezier = BEZIER_DEFAULT,
                 };
-                bool ok = render_engine_execute_cpu_transition(d, a, b, w, h,
-                                                               w * sizeof(uint32_t), &p);
+                bool ok =
+                    render_engine_execute_cpu_transition(d, a, b, w, h, w * sizeof(uint32_t), &p);
                 if (!ok || !e2e_canary_check(d, n)) {
                     slideshow_ok = false;
                     break;
@@ -315,8 +316,7 @@ void run_tier4_workload_scenarios(void)
                 .center_y = 0.5f,
                 .bezier = BEZIER_DEFAULT,
             };
-            bool ok = render_engine_execute_cpu_transition(d, a, b, w, h,
-                                                           w * sizeof(uint32_t), &p);
+            bool ok = render_engine_execute_cpu_transition(d, a, b, w, h, w * sizeof(uint32_t), &p);
             if (!ok || !e2e_canary_check(d, n)) {
                 endurance_ok = false;
                 break;
@@ -331,7 +331,8 @@ void run_tier4_workload_scenarios(void)
         e2e_canary_free(d);
     }
 
-    /* T4_07: Memory leak verification (ZERO LEAK PASS: delta RSS <= 128 KB after 500 transitions) */
+    /* T4_07: Memory leak verification (ZERO LEAK PASS: delta RSS <= 128 KB after 500 transitions)
+     */
     {
         const uint32_t w = 640, h = 360;
         size_t n = (size_t)w * h;
@@ -390,9 +391,8 @@ void run_tier4_workload_scenarios(void)
         printf("    [RSS Monitor] Baseline RSS: %ld KB | Final RSS: %ld KB | Delta: %ld KB [%s]\n",
                rss_before, rss_after, delta_kb, zero_leak_pass ? "ZERO LEAK PASS" : "FAIL");
 
-        E2E_CHECK(zero_leak_pass, "T4_07_memory_leak_zero_leak_pass",
-                  "delta_kb=%ld (max=%ld) [%s]", delta_kb, max_delta_kb,
-                  zero_leak_pass ? "ZERO LEAK PASS" : "LEAK DETECTED");
+        E2E_CHECK(zero_leak_pass, "T4_07_memory_leak_zero_leak_pass", "delta_kb=%ld (max=%ld) [%s]",
+                  delta_kb, max_delta_kb, zero_leak_pass ? "ZERO LEAK PASS" : "LEAK DETECTED");
 
         free(a);
         free(b);

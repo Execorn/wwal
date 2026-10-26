@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_DMABUF_H
 #define WAYWAL_DMABUF_H
 
@@ -75,6 +76,7 @@ typedef struct dmabuf_ring {
 bool dmabuf_context_init(dmabuf_context_t *ctx);
 void dmabuf_context_destroy(dmabuf_context_t *ctx);
 bool dmabuf_probe_map_support(dmabuf_context_t *ctx);
+int open_drm_node_by_devt(dev_t target_dev);
 
 /* Standalone buffer allocation */
 bool dmabuf_bo_allocate(dmabuf_context_t *ctx, dmabuf_bo_t *bo, uint32_t width, uint32_t height,

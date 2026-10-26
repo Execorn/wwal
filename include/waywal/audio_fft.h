@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_AUDIO_FFT_H
 #define WAYWAL_AUDIO_FFT_H
 

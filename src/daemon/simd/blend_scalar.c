@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "simd_blend.h"
 
 void blend_scanline_scalar(uint8_t *restrict dst, const uint8_t *restrict src_a,

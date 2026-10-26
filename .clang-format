@@ -1,7 +1,7 @@
 ---
 BasedOnStyle: LLVM
 Language: Cpp
-Standard: c++20
+Standard: Latest
 
 # Alignment & Indentation
 IndentWidth: 4
@@ -39,8 +39,8 @@ SpacesInParentheses: false
 SpacesInSquareBrackets: false
 
 # Includes
-SortIncludes: CaseSensitive
-IncludeBlocks: Regroup
+SortIncludes: Never
+IncludeBlocks: Preserve
 
 # Whitespace & Comments
 AlignConsecutiveMacros: true

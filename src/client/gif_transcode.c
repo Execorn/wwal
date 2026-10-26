@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/gif_transcode.h"
 
 #include "waywal/log.h"
@@ -122,8 +123,7 @@ static bool get_cache_dir(char *out_dir, size_t out_size)
 
 static inline uint32_t read_be32(const uint8_t *p)
 {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) |
-           (uint32_t)p[3];
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
 static inline uint64_t read_be64(const uint8_t *p)
@@ -642,7 +642,8 @@ bool video_transcode_optimize(const char *filepath, uint32_t max_width, uint32_t
 
         if (probe_mp4_stream(filepath, &probe)) {
             bool fits_bounds = (probe.width <= max_width && probe.height <= max_height);
-            bool is_small_clip = ((uint64_t)probe.width * (uint64_t)probe.height < 1920ULL * 1080ULL);
+            bool is_small_clip =
+                ((uint64_t)probe.width * (uint64_t)probe.height < 1920ULL * 1080ULL);
             bool is_optimal_stream =
                 (probe.is_h264 && probe.num_ref_frames <= 1 && !probe.has_bframes &&
                  (probe.bitrate_bps == 0 || probe.bitrate_bps <= 15000000ULL));

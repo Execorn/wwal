@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "wayland_core.h"
 
 #include "waywal/dmabuf.h"
@@ -460,24 +461,24 @@ bool daemon_wayland_init(daemon_state_t *state)
                     (unsigned)minor(state->dmabuf_ctx.compositor_dev));
 
                 /* Preserve protocol objects across GBM tear-down */
-                struct zwp_linux_dmabuf_v1    *saved_proto    = state->dmabuf_ctx.dmabuf_proto;
+                struct zwp_linux_dmabuf_v1 *saved_proto = state->dmabuf_ctx.dmabuf_proto;
                 struct zwp_linux_dmabuf_feedback_v1 *saved_fb = state->dmabuf_ctx.default_feedback;
-                uint64_t saved_mod  = state->dmabuf_ctx.preferred_modifier;
-                uint32_t saved_fmt  = state->dmabuf_ctx.preferred_format;
-                dev_t    saved_dev  = state->dmabuf_ctx.compositor_dev;
-                bool     saved_hdev = state->dmabuf_ctx.has_compositor_dev;
-                bool     saved_10   = state->dmabuf_ctx.has_10bit;
-                uint32_t saved_f10  = state->dmabuf_ctx.format_10bit;
-                uint64_t saved_m10  = state->dmabuf_ctx.modifier_10bit;
-                bool     saved_nv12 = state->dmabuf_ctx.has_nv12;
-                bool     saved_p010 = state->dmabuf_ctx.has_p010;
+                uint64_t saved_mod = state->dmabuf_ctx.preferred_modifier;
+                uint32_t saved_fmt = state->dmabuf_ctx.preferred_format;
+                dev_t saved_dev = state->dmabuf_ctx.compositor_dev;
+                bool saved_hdev = state->dmabuf_ctx.has_compositor_dev;
+                bool saved_10 = state->dmabuf_ctx.has_10bit;
+                uint32_t saved_f10 = state->dmabuf_ctx.format_10bit;
+                uint64_t saved_m10 = state->dmabuf_ctx.modifier_10bit;
+                bool saved_nv12 = state->dmabuf_ctx.has_nv12;
+                bool saved_p010 = state->dmabuf_ctx.has_p010;
 
                 /* Destroy old GBM only (not protocol objects) */
                 if (state->dmabuf_ctx.gbm)
                     gbm_device_destroy(state->dmabuf_ctx.gbm);
                 if (state->dmabuf_ctx.drm_fd >= 0)
                     close(state->dmabuf_ctx.drm_fd);
-                state->dmabuf_ctx.gbm    = NULL;
+                state->dmabuf_ctx.gbm = NULL;
                 state->dmabuf_ctx.drm_fd = -1;
 
                 /* Open compositor's actual render node */
@@ -486,11 +487,12 @@ bool daemon_wayland_init(daemon_state_t *state)
                     struct gbm_device *new_gbm = gbm_create_device(new_fd);
                     if (new_gbm) {
                         state->dmabuf_ctx.drm_fd = new_fd;
-                        state->dmabuf_ctx.gbm    = new_gbm;
+                        state->dmabuf_ctx.gbm = new_gbm;
                         WAYWAL_LOG_INFO("GBM reinitialized on compositor device %u:%u",
                                         (unsigned)major(saved_dev), (unsigned)minor(saved_dev));
                     } else {
-                        WAYWAL_LOG_WARN("gbm_create_device failed on compositor node, staying on fallback");
+                        WAYWAL_LOG_WARN(
+                            "gbm_create_device failed on compositor node, staying on fallback");
                         close(new_fd);
                     }
                 } else {
@@ -498,19 +500,19 @@ bool daemon_wayland_init(daemon_state_t *state)
                 }
 
                 /* Restore protocol/modifier state */
-                state->dmabuf_ctx.dmabuf_proto        = saved_proto;
-                state->dmabuf_ctx.default_feedback     = saved_fb;
-                state->dmabuf_ctx.preferred_modifier   = saved_mod;
-                state->dmabuf_ctx.preferred_format     = saved_fmt;
-                state->dmabuf_ctx.compositor_dev       = saved_dev;
-                state->dmabuf_ctx.has_compositor_dev   = saved_hdev;
-                state->dmabuf_ctx.has_10bit            = saved_10;
-                state->dmabuf_ctx.format_10bit         = saved_f10;
-                state->dmabuf_ctx.modifier_10bit       = saved_m10;
-                state->dmabuf_ctx.has_nv12             = saved_nv12;
-                state->dmabuf_ctx.has_p010             = saved_p010;
-                state->dmabuf_ctx.available            = (state->dmabuf_ctx.gbm != NULL);
-                state->dmabuf_ctx.map_supported        = dmabuf_probe_map_support(&state->dmabuf_ctx);
+                state->dmabuf_ctx.dmabuf_proto = saved_proto;
+                state->dmabuf_ctx.default_feedback = saved_fb;
+                state->dmabuf_ctx.preferred_modifier = saved_mod;
+                state->dmabuf_ctx.preferred_format = saved_fmt;
+                state->dmabuf_ctx.compositor_dev = saved_dev;
+                state->dmabuf_ctx.has_compositor_dev = saved_hdev;
+                state->dmabuf_ctx.has_10bit = saved_10;
+                state->dmabuf_ctx.format_10bit = saved_f10;
+                state->dmabuf_ctx.modifier_10bit = saved_m10;
+                state->dmabuf_ctx.has_nv12 = saved_nv12;
+                state->dmabuf_ctx.has_p010 = saved_p010;
+                state->dmabuf_ctx.available = (state->dmabuf_ctx.gbm != NULL);
+                state->dmabuf_ctx.map_supported = dmabuf_probe_map_support(&state->dmabuf_ctx);
             }
         }
     }
@@ -520,9 +522,9 @@ bool daemon_wayland_init(daemon_state_t *state)
 
     if (state->dmabuf_ctx.gbm && !state->dmabuf_ctx.map_supported &&
         !state->render_engine.gpu_compute_active) {
-        WAYWAL_LOG_INFO(
-            "GBM bo_map and GPU compute unsupported; releasing unused GBM device (keeping drm_fd=%d for VA-API)",
-            state->dmabuf_ctx.drm_fd);
+        WAYWAL_LOG_INFO("GBM bo_map and GPU compute unsupported; releasing unused GBM device "
+                        "(keeping drm_fd=%d for VA-API)",
+                        state->dmabuf_ctx.drm_fd);
         gbm_device_destroy(state->dmabuf_ctx.gbm);
         state->dmabuf_ctx.gbm = NULL;
         state->dmabuf_ctx.available = false;
@@ -648,8 +650,8 @@ bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *
         if (fd >= 0) {
             struct sockaddr_un addr = {0};
             addr.sun_family = AF_UNIX;
-            int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
-                                    "%s/hypr/%s/.socket.sock", xrd, his);
+            int path_len =
+                snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/hypr/%s/.socket.sock", xrd, his);
             if (path_len < 0 || (size_t)path_len >= sizeof(addr.sun_path)) {
                 close(fd);
                 return false;

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 _wwal_completion() {
     local cur prev words cword
     _init_completion || return

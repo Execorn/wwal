@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/presentation.h"
 
 #include "waywal/log.h"
@@ -99,7 +100,7 @@ int64_t presentation_pll_predict_next_vblank(const waywal_pll_t *pll)
 {
     if (!pll)
         return 0;
-    
+
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;

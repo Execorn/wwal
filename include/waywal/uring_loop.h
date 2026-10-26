@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_URING_LOOP_H
 #define WAYWAL_URING_LOOP_H
 

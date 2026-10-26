@@ -1,17 +1,24 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/bezier.h"
+
 #include <math.h>
 
-const bezier_curve_t BEZIER_LINEAR      = { .p1x = 0.0f,  .p1y = 0.0f, .p2x = 1.0f,  .p2y = 1.0f };
-const bezier_curve_t BEZIER_DEFAULT     = { .p1x = 0.25f, .p1y = 0.1f, .p2x = 0.25f, .p2y = 1.0f };
-const bezier_curve_t BEZIER_EASE_IN     = { .p1x = 0.42f, .p1y = 0.0f, .p2x = 1.0f,  .p2y = 1.0f };
-const bezier_curve_t BEZIER_EASE_OUT    = { .p1x = 0.0f,  .p1y = 0.0f, .p2x = 0.58f, .p2y = 1.0f };
-const bezier_curve_t BEZIER_EASE_IN_OUT = { .p1x = 0.42f, .p1y = 0.0f, .p2x = 0.58f, .p2y = 1.0f };
+const bezier_curve_t BEZIER_LINEAR = {.p1x = 0.0f, .p1y = 0.0f, .p2x = 1.0f, .p2y = 1.0f};
+const bezier_curve_t BEZIER_DEFAULT = {.p1x = 0.25f, .p1y = 0.1f, .p2x = 0.25f, .p2y = 1.0f};
+const bezier_curve_t BEZIER_EASE_IN = {.p1x = 0.42f, .p1y = 0.0f, .p2x = 1.0f, .p2y = 1.0f};
+const bezier_curve_t BEZIER_EASE_OUT = {.p1x = 0.0f, .p1y = 0.0f, .p2x = 0.58f, .p2y = 1.0f};
+const bezier_curve_t BEZIER_EASE_IN_OUT = {.p1x = 0.42f, .p1y = 0.0f, .p2x = 0.58f, .p2y = 1.0f};
 
-bezier_curve_t bezier_create(float p1x, float p1y, float p2x, float p2y) {
-    if (p1x < 0.0f) p1x = 0.0f;
-    if (p1x > 1.0f) p1x = 1.0f;
-    if (p2x < 0.0f) p2x = 0.0f;
-    if (p2x > 1.0f) p2x = 1.0f;
+bezier_curve_t bezier_create(float p1x, float p1y, float p2x, float p2y)
+{
+    if (p1x < 0.0f)
+        p1x = 0.0f;
+    if (p1x > 1.0f)
+        p1x = 1.0f;
+    if (p2x < 0.0f)
+        p2x = 0.0f;
+    if (p2x > 1.0f)
+        p2x = 1.0f;
 
     return (bezier_curve_t){
         .p1x = p1x,
@@ -21,10 +28,14 @@ bezier_curve_t bezier_create(float p1x, float p1y, float p2x, float p2y) {
     };
 }
 
-float bezier_eval(const bezier_curve_t *curve, float progress) {
-    if (!curve) return progress;
-    if (progress <= 0.0f) return 0.0f;
-    if (progress >= 1.0f) return 1.0f;
+float bezier_eval(const bezier_curve_t *curve, float progress)
+{
+    if (!curve)
+        return progress;
+    if (progress <= 0.0f)
+        return 0.0f;
+    if (progress >= 1.0f)
+        return 1.0f;
 
     /* Check for linear identity curve */
     if (curve->p1x == curve->p1y && curve->p2x == curve->p2y) {

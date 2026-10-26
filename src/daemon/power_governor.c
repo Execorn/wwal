@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include "waywal/power_governor.h"
+
 #include "waywal/log.h"
 
 #include <ctype.h>
@@ -16,9 +18,9 @@
 #include <unistd.h>
 
 typedef enum {
-    IPC_BACKEND_NONE     = 0,
+    IPC_BACKEND_NONE = 0,
     IPC_BACKEND_HYPRLAND = 1,
-    IPC_BACKEND_SWAY     = 2,
+    IPC_BACKEND_SWAY = 2,
 } ipc_backend_t;
 
 typedef struct {
@@ -193,12 +195,9 @@ static void init_battery_inotify(waywal_power_governor_t *gov)
     }
 
     static const char *const watch_paths[] = {
-        "/sys/class/power_supply/BAT0/status",
-        "/sys/class/power_supply/BAT1/status",
-        "/sys/class/power_supply/AC/online",
-        "/sys/class/power_supply/ACAD/online",
-        "/sys/class/power_supply/ADP1/online",
-        "/sys/firmware/acpi/platform_profile",
+        "/sys/class/power_supply/BAT0/status", "/sys/class/power_supply/BAT1/status",
+        "/sys/class/power_supply/AC/online",   "/sys/class/power_supply/ACAD/online",
+        "/sys/class/power_supply/ADP1/online", "/sys/firmware/acpi/platform_profile",
     };
 
     for (size_t i = 0; i < sizeof(watch_paths) / sizeof(watch_paths[0]); ++i) {
@@ -350,7 +349,8 @@ void waywal_power_governor_feed_sway_payload(waywal_power_governor_t *gov, const
                 const char *q1 = strchr(colon + 1, '"');
                 if (q1) {
                     const char *q2 = strchr(q1 + 1, '"');
-                    if (q2 && q2 > q1 + 1 && (size_t)(q2 - (q1 + 1)) < sizeof(gov->active_workspace)) {
+                    if (q2 && q2 > q1 + 1 &&
+                        (size_t)(q2 - (q1 + 1)) < sizeof(gov->active_workspace)) {
                         size_t len = (size_t)(q2 - (q1 + 1));
                         memcpy(gov->active_workspace, q1 + 1, len);
                         gov->active_workspace[len] = '\0';

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_PRESENTATION_H
 #define WAYWAL_PRESENTATION_H
 

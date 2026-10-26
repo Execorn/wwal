@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: Bug Report
+description: Report a crash, rendering glitch, hardware decoding issue, or Wayland protocol bug
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue. Please fill out the details below so we can reproduce the bug.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior vs. what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps or CLI Command to Reproduce
+      description: Exact `wwal` command or `~/.config/wwal/config.toml` section that triggers the issue.
+      placeholder: |
+        wwald --verbose &
+        wwal img ~/wallpaper.png --transition-type ripple
+    validations:
+      required: true
+  - type: dropdown
+    id: compositor
+    attributes:
+      label: Wayland Compositor
+      options:
+        - Hyprland
+        - Niri
+        - Sway
+        - River
+        - labwc
+        - MangoWC / dwl
+        - KDE Plasma (KWin)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: gpu_driver
+    attributes:
+      label: GPU & Driver Version
+      description: GPU model, Mesa or NVIDIA driver version, and `vainfo` driver if reporting a video issue.
+      placeholder: "AMD RX 7900 XTX (Mesa 25.0, radeonsi) / NVIDIA RTX 4080 (570.86)"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Linux Distribution, Kernel & wwal Version
+      placeholder: "Arch Linux, Linux 6.14, wwal 1.0.0"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Daemon Logs & Telemetry (`wwal stats` / `wwald --verbose`)
+      description: Paste output from `wwal stats` and `wwald --verbose` (or `WAYLAND_DEBUG=1` if relevant).
+      render: shell
+    validations:
+      required: false

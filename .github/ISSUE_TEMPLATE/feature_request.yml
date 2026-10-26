@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: Feature Request
+description: Propose a new transition shader, CLI option, compositor integration, or theme output format
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Use Case / Problem Statement
+      description: What workflow or desktop setup are you trying to support?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe how the CLI flag, `config.toml` key, or subsystem should behave.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context or Prior Art
+      description: Links to Wayland protocol specs, Shadertoy examples, or related tools.
+    validations:
+      required: false

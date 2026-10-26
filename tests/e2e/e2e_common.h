@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef E2E_COMMON_H
 #define E2E_COMMON_H
 
@@ -23,7 +24,8 @@
 #define __has_feature(x) 0
 #endif
 #if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
-__attribute__((weak, visibility("default"))) const char *__lsan_default_suppressions(void)
+__attribute__((weak, visibility("default"))) const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void)
 {
     return "leak:<unknown module>\nleak:gbm_create_device\nleak:libgbm\nleak:libEGL\nleak:"
            "libGLESv2\nleak:dri\nleak:libnvidia\n";
@@ -31,7 +33,7 @@ __attribute__((weak, visibility("default"))) const char *__lsan_default_suppress
 #endif
 
 #define E2E_CANARY_GUARD_WORDS 16
-#define E2E_CANARY_PATTERN 0xDEADBEEFU
+#define E2E_CANARY_PATTERN     0xDEADBEEFU
 
 typedef struct {
     int total;
@@ -42,17 +44,17 @@ typedef struct {
 
 extern e2e_test_stats_t g_stats;
 
-#define E2E_CHECK(cond, name, fmt, ...)                                                           \
-    do {                                                                                          \
-        g_stats.total++;                                                                          \
-        if (cond) {                                                                               \
-            g_stats.passed++;                                                                     \
-            printf("  [PASS] [%s] %s\n", g_stats.tier_name, (name));                              \
-        } else {                                                                                  \
-            g_stats.failed++;                                                                     \
-            fprintf(stderr, "  [FAIL] [%s] %s: " fmt "\n", g_stats.tier_name, (name)              \
-                    __VA_OPT__(, ) __VA_ARGS__);                                                  \
-        }                                                                                         \
+#define E2E_CHECK(cond, name, fmt, ...)                                                            \
+    do {                                                                                           \
+        g_stats.total++;                                                                           \
+        if (cond) {                                                                                \
+            g_stats.passed++;                                                                      \
+            printf("  [PASS] [%s] %s\n", g_stats.tier_name, (name));                               \
+        } else {                                                                                   \
+            g_stats.failed++;                                                                      \
+            fprintf(stderr, "  [FAIL] [%s] %s: " fmt "\n", g_stats.tier_name,                      \
+                    (name)__VA_OPT__(, ) __VA_ARGS__);                                             \
+        }                                                                                          \
     } while (0)
 
 typedef struct {
@@ -142,7 +144,7 @@ static inline void e2e_canary_free(uint32_t *buf)
 }
 
 static inline void e2e_generate_pattern_a(uint32_t *buf, uint32_t width, uint32_t height,
-                                         uint32_t stride_pixels)
+                                          uint32_t stride_pixels)
 {
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
@@ -156,7 +158,7 @@ static inline void e2e_generate_pattern_a(uint32_t *buf, uint32_t width, uint32_
 }
 
 static inline void e2e_generate_pattern_b(uint32_t *buf, uint32_t width, uint32_t height,
-                                         uint32_t stride_pixels)
+                                          uint32_t stride_pixels)
 {
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
@@ -170,7 +172,7 @@ static inline void e2e_generate_pattern_b(uint32_t *buf, uint32_t width, uint32_
 }
 
 static inline void e2e_generate_pattern_c(uint32_t *buf, uint32_t width, uint32_t height,
-                                         uint32_t stride_pixels)
+                                          uint32_t stride_pixels)
 {
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
@@ -220,7 +222,7 @@ static inline int e2e_max_channel_diff(const uint32_t *p1, const uint32_t *p2, u
 }
 
 static inline bool e2e_is_valid_argb_buffer(const uint32_t *buf, uint32_t width, uint32_t height,
-                                           uint32_t stride_pixels)
+                                            uint32_t stride_pixels)
 {
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/demuxer.h"
 
 #include "waywal/log.h"
@@ -215,7 +216,8 @@ static void parse_stbl(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
                         pt->width = read_u16_be(box_data + entry_off + 32);
                         pt->height = read_u16_be(box_data + entry_off + 34);
 
-                        /* Search for avcC / hvcC sub-boxes (VisualSampleEntry fixed header is 86 bytes) */
+                        /* Search for avcC / hvcC sub-boxes (VisualSampleEntry fixed header is 86
+                         * bytes) */
                         size_t sub_off = entry_off + (e_size >= 86 ? 86 : 36);
                         while (sub_off + 8 <= entry_off + e_size) {
                             uint32_t sub_size = read_u32_be(box_data + sub_off);
@@ -431,23 +433,23 @@ static void parse_moov(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
  * EBML / Matroska / WebM Demuxer Implementation (PERF-07)
  * ========================================================================= */
 
-#define EBML_ID_HEADER         0x1A45DFA3
-#define EBML_ID_SEGMENT        0x18538067
-#define EBML_ID_SEEK_HEAD      0x114D9B74
-#define EBML_ID_INFO           0x1549A966
-#define EBML_ID_TIMECODE_SCALE 0x2AD7B1
-#define EBML_ID_DURATION       0x4489
-#define EBML_ID_TRACKS         0x1654AE6B
-#define EBML_ID_TRACK_ENTRY    0xAE
-#define EBML_ID_TRACK_NUMBER   0xD7
-#define EBML_ID_TRACK_TYPE     0x83
-#define EBML_ID_CODEC_ID       0x86
-#define EBML_ID_CODEC_PRIVATE  0x63A2
-#define EBML_ID_VIDEO          0xE0
-#define EBML_ID_PIXEL_WIDTH    0xB0
-#define EBML_ID_PIXEL_HEIGHT   0xBA
-#define EBML_ID_CLUSTER        0x1F43B675
-#define EBML_ID_CLUSTER_TIME   0xE7
+#define EBML_ID_HEADER          0x1A45DFA3
+#define EBML_ID_SEGMENT         0x18538067
+#define EBML_ID_SEEK_HEAD       0x114D9B74
+#define EBML_ID_INFO            0x1549A966
+#define EBML_ID_TIMECODE_SCALE  0x2AD7B1
+#define EBML_ID_DURATION        0x4489
+#define EBML_ID_TRACKS          0x1654AE6B
+#define EBML_ID_TRACK_ENTRY     0xAE
+#define EBML_ID_TRACK_NUMBER    0xD7
+#define EBML_ID_TRACK_TYPE      0x83
+#define EBML_ID_CODEC_ID        0x86
+#define EBML_ID_CODEC_PRIVATE   0x63A2
+#define EBML_ID_VIDEO           0xE0
+#define EBML_ID_PIXEL_WIDTH     0xB0
+#define EBML_ID_PIXEL_HEIGHT    0xBA
+#define EBML_ID_CLUSTER         0x1F43B675
+#define EBML_ID_CLUSTER_TIME    0xE7
 #define EBML_ID_SIMPLE_BLOCK    0xA3
 #define EBML_ID_BLOCK_GROUP     0xA0
 #define EBML_ID_BLOCK           0xA1
@@ -768,7 +770,8 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                     uint64_t bg_id = 0, bg_size = 0;
                                     if (!ebml_read_vint(data, bg_end, &bg_off, &bg_id, NULL, false))
                                         break;
-                                    if (!ebml_read_vint(data, bg_end, &bg_off, &bg_size, NULL, true))
+                                    if (!ebml_read_vint(data, bg_end, &bg_off, &bg_size, NULL,
+                                                        true))
                                         break;
                                     size_t el_end = bg_off + bg_size;
                                     if (el_end > bg_end) {
@@ -790,8 +793,9 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                 if (ebml_read_vint(data, blk_end, &blk_off, &blk_track, NULL,
                                                    true)) {
                                     if (blk_track == video_track_num && blk_off + 3 <= blk_end) {
-                                        int16_t rel_time = (int16_t)(((uint16_t)data[blk_off] << 8) |
-                                                                     data[blk_off + 1]);
+                                        int16_t rel_time =
+                                            (int16_t)(((uint16_t)data[blk_off] << 8) |
+                                                      data[blk_off + 1]);
                                         uint8_t flags = data[blk_off + 2];
                                         blk_off += 3;
 

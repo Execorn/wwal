@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/render_engine.h"
 
 #include "gpu_compute.h"
@@ -244,8 +245,8 @@ blend8_argb_var_avx2(__m256i v_ca, __m256i v_cb, __m256i v_wb32)
     return _mm256_or_si256(_mm256_or_si256(rb, g), v_alpha);
 }
 
-__attribute__((target("avx2"))) static inline __m256i
-shade8_argb_const_avx2(__m256i v_c, __m256i v_wb16)
+__attribute__((target("avx2"))) static inline __m256i shade8_argb_const_avx2(__m256i v_c,
+                                                                             __m256i v_wb16)
 {
     const __m256i v_mask_rb = _mm256_set1_epi32(0x00FF00FF);
     const __m256i v_mask_g = _mm256_set1_epi32(0x0000FF00);
@@ -304,10 +305,8 @@ swirl_span_avx2(uint32_t *restrict dst_row, const uint32_t *restrict old_pixels,
         __m256 vpy =
             _mm256_add_ps(v_cy, _mm256_fmadd_ps(vx_rel, vsin, _mm256_mul_ps(v_y_rel, vcos)));
 
-        __m256i vsx =
-            _mm256_max_epi32(v_zero, _mm256_min_epi32(_mm256_cvttps_epi32(vpx), v_max_x));
-        __m256i vsy =
-            _mm256_max_epi32(v_zero, _mm256_min_epi32(_mm256_cvttps_epi32(vpy), v_max_y));
+        __m256i vsx = _mm256_max_epi32(v_zero, _mm256_min_epi32(_mm256_cvttps_epi32(vpx), v_max_x));
+        __m256i vsy = _mm256_max_epi32(v_zero, _mm256_min_epi32(_mm256_cvttps_epi32(vpy), v_max_y));
 
         __m256i v_off = _mm256_add_epi32(_mm256_mullo_epi32(vsy, v_width), vsx);
 
@@ -368,8 +367,8 @@ wipe_seam_avx2(uint32_t *restrict dst_row, const uint32_t *restrict a_row,
 
 __attribute__((target("avx2,fma"))) static int
 radial_annulus_avx2(uint32_t *restrict dst_row, const uint32_t *restrict a_row,
-                    const uint32_t *restrict b_row, int x_start, int x_end, float cx,
-                    float step_dx, float dy2, float r_ref, float signed_inv_2edge)
+                    const uint32_t *restrict b_row, int x_start, int x_end, float cx, float step_dx,
+                    float dy2, float r_ref, float signed_inv_2edge)
 {
     __m256 v_step8 = _mm256_set1_ps(8.0f * step_dx);
     __m256 v_dy2 = _mm256_set1_ps(dy2);
@@ -455,9 +454,8 @@ ripple_annulus_avx2(uint32_t *restrict dst_row, const uint32_t *restrict old_pix
 
         /* One Newton-Raphson step on rsqrt(d^2) yields both 1/dist and dist = d^2 * (1/dist). */
         __m256 y0 = _mm256_rsqrt_ps(vd2_safe);
-        __m256 y1 = _mm256_mul_ps(
-            y0, _mm256_fnmadd_ps(_mm256_mul_ps(v_half, vd2_safe), _mm256_mul_ps(y0, y0),
-                                 v_three_half));
+        __m256 y1 = _mm256_mul_ps(y0, _mm256_fnmadd_ps(_mm256_mul_ps(v_half, vd2_safe),
+                                                       _mm256_mul_ps(y0, y0), v_three_half));
         __m256 v_inv_dist = _mm256_and_ps(y1, v_valid);
         __m256 vdist = _mm256_and_ps(_mm256_mul_ps(vdist2, y1), v_valid);
 
@@ -641,8 +639,8 @@ noise_row_avx2(uint32_t *restrict dst_row, const uint32_t *restrict a_row,
 __attribute__((target("avx2,fma"))) static void
 luma_row_avx2(uint32_t *restrict dst_row, const uint32_t *restrict a_row,
               const uint32_t *restrict b_row, const float *restrict v, const float *restrict dv,
-              const int *restrict lut_ix, const float *restrict lut_cx, uint32_t width,
-              float edge0, float inv_span)
+              const int *restrict lut_ix, const float *restrict lut_cx, uint32_t width, float edge0,
+              float inv_span)
 {
     const __m256 v_edge0 = _mm256_set1_ps(edge0);
     const __m256 v_inv_span = _mm256_set1_ps(inv_span);
@@ -714,7 +712,8 @@ burn_row_avx2(uint32_t *restrict dst_row, const uint32_t *restrict a_row,
     const __m256 v_inv_fw = _mm256_set1_ps(1.0f / flame_width);
     const __m256 v_w1 = _mm256_set1_ps(0.65f);
     const __m256 v_w2 = _mm256_set1_ps(0.35f);
-    /* Clamp noise below 0.99989 so progress = 0.9999 (p - flame_width = 0.99989) converges to new_pixels. */
+    /* Clamp noise below 0.99989 so progress = 0.9999 (p - flame_width = 0.99989) converges to
+     * new_pixels. */
     const __m256 v_n_clamp = _mm256_set1_ps(0.99988f);
     const __m256 v_zero_ps = _mm256_setzero_ps();
     const __m256 v_one_ps = _mm256_set1_ps(1.0f);
@@ -755,8 +754,7 @@ burn_row_avx2(uint32_t *restrict dst_row, const uint32_t *restrict a_row,
         }
 
         __m256 v_t = _mm256_min_ps(
-            _mm256_max_ps(_mm256_mul_ps(_mm256_sub_ps(v_fw, v_d), v_inv_2fw), v_zero_ps),
-            v_one_ps);
+            _mm256_max_ps(_mm256_mul_ps(_mm256_sub_ps(v_fw, v_d), v_inv_2fw), v_zero_ps), v_one_ps);
         __m256 v_burn =
             _mm256_mul_ps(_mm256_mul_ps(v_t, v_t), _mm256_fnmadd_ps(v_two_ps, v_t, v_three_ps));
         __m256i v_wb_32 = _mm256_cvttps_epi32(_mm256_mul_ps(v_burn, v_256_ps));
@@ -911,12 +909,12 @@ glitch_block_avx2(uint32_t *restrict dst_row, const uint32_t *restrict a_row,
                 __m256i b_lo = _mm256_unpacklo_epi8(cb, v_zero);
                 __m256i b_hi = _mm256_unpackhi_epi8(cb, v_zero);
 
-                __m256i r_lo = _mm256_srli_epi16(
-                    _mm256_add_epi16(_mm256_mullo_epi16(a_lo, v_wa), _mm256_mullo_epi16(b_lo, v_wb)),
-                    8);
-                __m256i r_hi = _mm256_srli_epi16(
-                    _mm256_add_epi16(_mm256_mullo_epi16(a_hi, v_wa), _mm256_mullo_epi16(b_hi, v_wb)),
-                    8);
+                __m256i r_lo = _mm256_srli_epi16(_mm256_add_epi16(_mm256_mullo_epi16(a_lo, v_wa),
+                                                                  _mm256_mullo_epi16(b_lo, v_wb)),
+                                                 8);
+                __m256i r_hi = _mm256_srli_epi16(_mm256_add_epi16(_mm256_mullo_epi16(a_hi, v_wa),
+                                                                  _mm256_mullo_epi16(b_hi, v_wb)),
+                                                 8);
                 _mm256_storeu_si256((__m256i *)&dst_row[x],
                                     _mm256_or_si256(_mm256_packus_epi16(r_lo, r_hi), v_mask_a));
             }
@@ -967,8 +965,7 @@ light_leak_span_avx2(uint32_t *restrict dst_row, const uint32_t *restrict a_row,
     for (; x + 8 <= x_end; x += 8) {
         __m256 vx = _mm256_set_ps((float)(x + 7), (float)(x + 6), (float)(x + 5), (float)(x + 4),
                                   (float)(x + 3), (float)(x + 2), (float)(x + 1), (float)x);
-        __m256 v_dist =
-            _mm256_andnot_ps(v_sign_mask, _mm256_fmadd_ps(vx, v_inv_w, v_row_offset));
+        __m256 v_dist = _mm256_andnot_ps(v_sign_mask, _mm256_fmadd_ps(vx, v_inv_w, v_row_offset));
         __m256i v_idx =
             _mm256_min_epi32(_mm256_cvttps_epi32(_mm256_mul_ps(v_dist, v_lut_scale)), v_lut_max);
         __m256i v_flash = _mm256_i32gather_epi32((const int *)flare_lut, v_idx, 4);
@@ -1665,9 +1662,8 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         uint32_t num_by = (height + 13U) / 14U;
         uint16_t wb_stack[4096];
         size_t total_blocks = (size_t)num_bx * num_by;
-        uint16_t *wb_lut = (total_blocks <= 4096)
-                               ? wb_stack
-                               : (uint16_t *)malloc(total_blocks * sizeof(uint16_t));
+        uint16_t *wb_lut =
+            (total_blocks <= 4096) ? wb_stack : (uint16_t *)malloc(total_blocks * sizeof(uint16_t));
         if (!wb_lut)
             return false;
 
@@ -1713,8 +1709,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
                 if (jitter == 0 && split == 0) {
                     blend_fn((uint8_t *)(dst_row + bx_start), (const uint8_t *)(a_row + bx_start),
-                             (const uint8_t *)(b_row + bx_start), wb,
-                             blk_len * sizeof(uint32_t));
+                             (const uint8_t *)(b_row + bx_start), wb, blk_len * sizeof(uint32_t));
                 } else {
 #if defined(__x86_64__) || defined(_M_X64)
                     if (has_avx2) {
@@ -1801,10 +1796,8 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         int lut_ix2_stack[4096];
         float lut_cx1_stack[4096];
         float lut_cx2_stack[4096];
-        int *lut_ix1 =
-            (width <= 4096) ? lut_ix1_stack : (int *)malloc((size_t)width * sizeof(int));
-        int *lut_ix2 =
-            (width <= 4096) ? lut_ix2_stack : (int *)malloc((size_t)width * sizeof(int));
+        int *lut_ix1 = (width <= 4096) ? lut_ix1_stack : (int *)malloc((size_t)width * sizeof(int));
+        int *lut_ix2 = (width <= 4096) ? lut_ix2_stack : (int *)malloc((size_t)width * sizeof(int));
         float *lut_cx1 =
             (width <= 4096) ? lut_cx1_stack : (float *)malloc((size_t)width * sizeof(float));
         float *lut_cx2 =
@@ -2854,5 +2847,3 @@ bool render_engine_execute_transition(render_engine_t *re, dmabuf_bo_t *target_b
 
     return ok;
 }
-
-

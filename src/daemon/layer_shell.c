@@ -1,8 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-#include "wayland_core.h"
 #include "gpu_compute.h"
+#include "wayland_core.h"
 #include "waywal/bezier.h"
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
@@ -98,8 +99,9 @@ static bool recompute_output_dimensions(output_node_t *out)
     return (out->width != old_w || out->height != old_h);
 }
 
-static void fractional_scale_preferred_scale(
-    void *data, struct wp_fractional_scale_v1 *wp_fractional_scale_v1, uint32_t scale)
+static void fractional_scale_preferred_scale(void *data,
+                                             struct wp_fractional_scale_v1 *wp_fractional_scale_v1,
+                                             uint32_t scale)
 {
     (void)wp_fractional_scale_v1;
     output_node_t *out = (output_node_t *)data;
@@ -270,8 +272,8 @@ void output_node_create_surface(daemon_state_t *state, output_node_t *node)
     }
 
     if (state->fract_manager && !node->fract_scale) {
-        node->fract_scale =
-            wp_fractional_scale_manager_v1_get_fractional_scale(state->fract_manager, node->surface);
+        node->fract_scale = wp_fractional_scale_manager_v1_get_fractional_scale(
+            state->fract_manager, node->surface);
         if (node->fract_scale) {
             wp_fractional_scale_v1_add_listener(node->fract_scale, &fractional_scale_listener,
                                                 node);
@@ -498,14 +500,13 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
     uint32_t drm_format = DRM_FORMAT_ARGB8888;
     uint64_t modifier = gpu_ok ? state->dmabuf_ctx.preferred_modifier : DRM_FORMAT_MOD_LINEAR;
     if (node->ten_bit && state->dmabuf_ctx.has_10bit) {
-        drm_format =
-            state->dmabuf_ctx.format_10bit ? state->dmabuf_ctx.format_10bit : DRM_FORMAT_ARGB2101010;
+        drm_format = state->dmabuf_ctx.format_10bit ? state->dmabuf_ctx.format_10bit
+                                                    : DRM_FORMAT_ARGB2101010;
         modifier = gpu_ok ? state->dmabuf_ctx.modifier_10bit : DRM_FORMAT_MOD_LINEAR;
     }
 
     if (node->use_dmabuf && (int32_t)node->dmabuf_ring.width == width &&
-        (int32_t)node->dmabuf_ring.height == height &&
-        node->dmabuf_ring.drm_format == drm_format) {
+        (int32_t)node->dmabuf_ring.height == height && node->dmabuf_ring.drm_format == drm_format) {
         return true;
     }
 
@@ -546,9 +547,9 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
 {
     if (width <= 0 || height <= 0)
         return false;
-    size_t stride    = (size_t)width * 4;
-    size_t frame_sz  = stride * (size_t)height;
-    size_t total_sz  = frame_sz * 2; /* double-sized: two frames back-to-back */
+    size_t stride = (size_t)width * 4;
+    size_t frame_sz = stride * (size_t)height;
+    size_t total_sz = frame_sz * 2; /* double-sized: two frames back-to-back */
 
     /* Guard: wl_shm_create_pool takes int32_t size; ensure no overflow.
      * For reference: 8K double-buf = 253MB, well below 2GB limit. */
@@ -558,9 +559,8 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
         return false;
     }
 
-    if (node->shm_data && node->shm_size == total_sz &&
-        node->shm_width == width && node->shm_height == height &&
-        node->shm_buffers[0] && node->shm_buffers[1]) {
+    if (node->shm_data && node->shm_size == total_sz && node->shm_width == width &&
+        node->shm_height == height && node->shm_buffers[0] && node->shm_buffers[1]) {
         return true;
     }
 
@@ -622,9 +622,8 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
     bool buf_ok = true;
     for (int i = 0; i < 2; ++i) {
         int32_t offset = (int32_t)(i * frame_sz);
-        node->shm_buffers[i] = wl_shm_pool_create_buffer(
-            node->shm_pool, offset, width, height,
-            (int32_t)stride, WL_SHM_FORMAT_ARGB8888);
+        node->shm_buffers[i] = wl_shm_pool_create_buffer(node->shm_pool, offset, width, height,
+                                                         (int32_t)stride, WL_SHM_FORMAT_ARGB8888);
         if (!node->shm_buffers[i]) {
             WAYWAL_LOG_ERR("wl_shm_pool_create_buffer[%d] failed", i);
             buf_ok = false;
@@ -710,8 +709,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                                                        WAYWAL_SCALING_FILL, pixel);
             }
             if (!uploaded && state->dmabuf_ctx.map_supported &&
-                (bo->modifier == DRM_FORMAT_MOD_LINEAR ||
-                 bo->modifier == DRM_FORMAT_MOD_INVALID)) {
+                (bo->modifier == DRM_FORMAT_MOD_LINEAR || bo->modifier == DRM_FORMAT_MOD_INVALID)) {
                 uint32_t stride = 0;
                 void *map_data = NULL;
                 void *map =
@@ -1015,8 +1013,8 @@ static void scale_bilinear_rect(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
 
 #if defined(__x86_64__) || defined(_M_X64)
         if (use_avx2) {
-            scale_bilinear_row_avx2(dst_span, row0, row1, x0_tbl, x1_tbl, fx4_tbl, fx_tbl,
-                                    scaled_w, fy, ify);
+            scale_bilinear_row_avx2(dst_span, row0, row1, x0_tbl, x1_tbl, fx4_tbl, fx_tbl, scaled_w,
+                                    fy, ify);
             continue;
         }
 #endif
@@ -1243,8 +1241,7 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                                                        img_h, bo, node->scaling_mode, clear_color);
             }
             if (!uploaded && state->dmabuf_ctx.map_supported &&
-                (bo->modifier == DRM_FORMAT_MOD_LINEAR ||
-                 bo->modifier == DRM_FORMAT_MOD_INVALID)) {
+                (bo->modifier == DRM_FORMAT_MOD_LINEAR || bo->modifier == DRM_FORMAT_MOD_INVALID)) {
                 uint32_t stride = 0;
                 void *map_data = NULL;
                 void *map =
@@ -1297,10 +1294,10 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
     if (ensure_shm_buffer(state, node, node->width, node->height)) {
         int back_idx = 1 - node->active_buffer_idx;
         size_t frame_sz = (size_t)node->width * (size_t)node->height * sizeof(uint32_t);
-        void *back_ptr  = (uint8_t *)node->shm_data + back_idx * frame_sz;
-        copy_or_scale_image((uint32_t *)back_ptr, (uint32_t)node->width,
-                            (uint32_t)node->height, (size_t)node->width * sizeof(uint32_t), src,
-                            img_w, img_h, node->scaling_mode, node->filter_mode, fill_col);
+        void *back_ptr = (uint8_t *)node->shm_data + back_idx * frame_sz;
+        copy_or_scale_image((uint32_t *)back_ptr, (uint32_t)node->width, (uint32_t)node->height,
+                            (size_t)node->width * sizeof(uint32_t), src, img_w, img_h,
+                            node->scaling_mode, node->filter_mode, fill_col);
         wl_surface_attach(node->surface, node->shm_buffers[back_idx], 0, 0);
         wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
         node->shm_buffer_released[back_idx] = false;
@@ -1532,19 +1529,18 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                 if ((out->source_new_bo.map_data == NULL || !state->dmabuf_ctx.map_supported ||
                      out->source_new_bo.modifier != DRM_FORMAT_MOD_LINEAR) &&
                     gpu_ok) {
-                    new_uploaded = render_engine_upload_static(
-                        &state->render_engine, pixels, img_w, img_h, &out->source_new_bo,
-                        out->scaling_mode, clear_color);
+                    new_uploaded = render_engine_upload_static(&state->render_engine, pixels, img_w,
+                                                               img_h, &out->source_new_bo,
+                                                               out->scaling_mode, clear_color);
                 }
                 if (!new_uploaded && state->dmabuf_ctx.map_supported &&
                     (out->source_new_bo.modifier == DRM_FORMAT_MOD_LINEAR ||
                      out->source_new_bo.modifier == DRM_FORMAT_MOD_INVALID)) {
                     uint32_t stride_new = 0;
                     void *map_data_new = NULL;
-                    void *map_new =
-                        gbm_bo_map(out->source_new_bo.gbm_bo, 0, 0, (uint32_t)out->width,
-                                   (uint32_t)out->height, GBM_BO_TRANSFER_WRITE, &stride_new,
-                                   &map_data_new);
+                    void *map_new = gbm_bo_map(out->source_new_bo.gbm_bo, 0, 0,
+                                               (uint32_t)out->width, (uint32_t)out->height,
+                                               GBM_BO_TRANSFER_WRITE, &stride_new, &map_data_new);
                     if (map_new && map_new != MAP_FAILED) {
                         copy_or_scale_image((uint32_t *)map_new, (uint32_t)out->width,
                                             (uint32_t)out->height, stride_new, src, img_w, img_h,
@@ -1579,10 +1575,10 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                             if (!old_uploaded && state->dmabuf_ctx.map_supported) {
                                 uint32_t stride_old = 0;
                                 void *map_data_old = NULL;
-                                void *map_old = gbm_bo_map(
-                                    out->source_old_bo.gbm_bo, 0, 0, (uint32_t)out->width,
-                                    (uint32_t)out->height, GBM_BO_TRANSFER_WRITE, &stride_old,
-                                    &map_data_old);
+                                void *map_old =
+                                    gbm_bo_map(out->source_old_bo.gbm_bo, 0, 0,
+                                               (uint32_t)out->width, (uint32_t)out->height,
+                                               GBM_BO_TRANSFER_WRITE, &stride_old, &map_data_old);
                                 if (map_old && map_old != MAP_FAILED) {
                                     for (int32_t y = 0; y < out->height; ++y) {
                                         uint32_t *dst_row = (uint32_t *)((uint8_t *)map_old +
@@ -1633,8 +1629,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         if (meta->transition_center_x < 0.0f || meta->transition_center_y < 0.0f) {
             /* Dynamic cursor tracking: daemon_query_cursor_pos returns logical coordinates */
             double qx = 0, qy = 0;
-            double ref_w =
-                out->logical_width > 0 ? (double)out->logical_width : (double)out->width;
+            double ref_w = out->logical_width > 0 ? (double)out->logical_width : (double)out->width;
             double ref_h =
                 out->logical_height > 0 ? (double)out->logical_height : (double)out->height;
             if (daemon_query_cursor_pos(state, out, &qx, &qy) && ref_w > 0.0 && ref_h > 0.0) {
@@ -1650,9 +1645,9 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         float wamp = meta->transition_wave_amp > 0.0f ? meta->transition_wave_amp : 0.05f;
 
         bezier_curve_t bz = BEZIER_DEFAULT;
-        if (meta && (meta->has_custom_bezier || meta->bezier.x1 != 0.0f ||
-                     meta->bezier.y1 != 0.0f || meta->bezier.x2 != 0.0f ||
-                     meta->bezier.y2 != 0.0f)) {
+        if (meta &&
+            (meta->has_custom_bezier || meta->bezier.x1 != 0.0f || meta->bezier.y1 != 0.0f ||
+             meta->bezier.x2 != 0.0f || meta->bezier.y2 != 0.0f)) {
             bz = meta->bezier;
         }
 
@@ -1683,7 +1678,8 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                                           .tv_nsec = (long)(frame_interval_ns % 1000000000ULL)}};
     if (state->transition_timer_fd >= 0) {
         uint64_t dummy;
-        while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0);
+        while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0)
+            ;
         timerfd_settime(state->transition_timer_fd, 0, &its, NULL);
     }
     state->transitions_in_progress = true;
@@ -1768,11 +1764,9 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
 
                 /* OpenMP-parallelized CPU transition (16 threads, ~5–18ms for complex effects) */
                 render_engine_execute_cpu_transition(
-                    (uint32_t *)back_ptr,
-                    (const uint32_t *)out->shm_old_data,
-                    (const uint32_t *)out->shm_new_data,
-                    (uint32_t)out->width, (uint32_t)out->height,
-                    (uint32_t)out->width * sizeof(uint32_t),
+                    (uint32_t *)back_ptr, (const uint32_t *)out->shm_old_data,
+                    (const uint32_t *)out->shm_new_data, (uint32_t)out->width,
+                    (uint32_t)out->height, (uint32_t)out->width * sizeof(uint32_t),
                     &out->transition_params);
 
                 clock_gettime(CLOCK_MONOTONIC, &ts1);
@@ -1808,11 +1802,9 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                 out->staging_width = 0;
                 out->staging_height = 0;
                 int inactive_idx = 1 - out->active_buffer_idx;
-                if (out->shm_buffer_released[inactive_idx] && out->shm_data &&
-                    out->shm_size >= 8) {
+                if (out->shm_buffer_released[inactive_idx] && out->shm_data && out->shm_size >= 8) {
                     size_t frame_sz = out->shm_size / 2;
-                    void *inactive_ptr =
-                        (uint8_t *)out->shm_data + (size_t)inactive_idx * frame_sz;
+                    void *inactive_ptr = (uint8_t *)out->shm_data + (size_t)inactive_idx * frame_sz;
                     madvise(inactive_ptr, frame_sz, MADV_REMOVE);
                 }
             }
@@ -1829,7 +1821,8 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
         memset(&its, 0, sizeof(its));
         timerfd_settime(state->transition_timer_fd, 0, &its, NULL);
         uint64_t dummy;
-        while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0);
+        while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0)
+            ;
         state->transitions_in_progress = false;
         malloc_trim(0);
         WAYWAL_LOG_INFO("Transition completed successfully across active outputs");

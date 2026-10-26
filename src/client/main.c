@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "cli_parser.h"
 #include "image_loader.h"
 #include "waywal/gif_transcode.h"
@@ -68,9 +69,8 @@ static void apply_config_defaults_to_cli(int argc, char *argv[], const waywal_co
         opts->transition_wave_amp = cfg->transition.wave_y;
     }
     if (!argv_has_flag(argc, argv, "--transition-bezier")) {
-        opts->bezier =
-            bezier_create(cfg->transition.bezier[0], cfg->transition.bezier[1],
-                          cfg->transition.bezier[2], cfg->transition.bezier[3]);
+        opts->bezier = bezier_create(cfg->transition.bezier[0], cfg->transition.bezier[1],
+                                     cfg->transition.bezier[2], cfg->transition.bezier[3]);
     }
     if (!argv_has_flag(argc, argv, "--10bit") && cfg->daemon.ten_bit) {
         opts->enable_10bit = true;
@@ -110,9 +110,8 @@ static size_t clear_cache_dir_files(const char *dir_path)
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue;
         size_t nlen = strlen(ent->d_name);
-        bool is_cached_ext =
-            (nlen > 4 && (strcasecmp(ent->d_name + nlen - 4, ".mp4") == 0 ||
-                          strcasecmp(ent->d_name + nlen - 4, ".bin") == 0));
+        bool is_cached_ext = (nlen > 4 && (strcasecmp(ent->d_name + nlen - 4, ".mp4") == 0 ||
+                                           strcasecmp(ent->d_name + nlen - 4, ".bin") == 0));
         if (!is_cached_ext)
             continue;
 
@@ -204,7 +203,8 @@ static bool resolve_theme_default_wallpaper(char *out_path, size_t cap)
     waywal_state_store_t st;
     if (waywal_state_store_load(&st, NULL)) {
         for (uint32_t i = 0; i < st.count; ++i) {
-            if (st.outputs[i].media_path[0] != '\0' && access(st.outputs[i].media_path, R_OK) == 0) {
+            if (st.outputs[i].media_path[0] != '\0' &&
+                access(st.outputs[i].media_path, R_OK) == 0) {
                 strncpy(out_path, st.outputs[i].media_path, cap - 1);
                 out_path[cap - 1] = '\0';
                 return true;
@@ -818,8 +818,8 @@ int main(int argc, char *argv[])
         size_t pixel_bytes = (size_t)width * height * 4;
         size_t total_payload_size = sizeof(waywal_img_metadata_t) + extra_bytes + pixel_bytes;
 
-        int memfd = waywal_create_memfd("wwal-client-img", total_payload_size,
-                                        F_SEAL_SHRINK | F_SEAL_GROW);
+        int memfd =
+            waywal_create_memfd("wwal-client-img", total_payload_size, F_SEAL_SHRINK | F_SEAL_GROW);
         if (memfd < 0) {
             fprintf(stderr, "Error: Failed to create sealed memfd for image\n");
             image_free(pixels);

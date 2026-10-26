@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -179,39 +180,38 @@ static void test_toml_cli_formats(void)
 {
     printf("[TEST] Testing TOML Parser, swww/awww CLI Compatibility & In-Memory SVG/PNG/BMP...\n");
 
-    const char *toml_doc =
-        "# WayWal Declarative Configuration\n"
-        "[daemon]\n"
-        "layer = \"bottom\"\n"
-        "namespace = \"custom-ns\"\n"
-        "battery_policy = \"pause-video\"\n"
-        "auto_pause_fullscreen = true\n"
-        "auto_pause_maximized = true\n"
-        "idle_timeout_sec = 180\n"
-        "ten_bit = true\n"
-        "backdrop = \"auto-blur\"\n\n"
-        "[theme]\n"
-        "enabled = true\n"
-        "mode = \"light\"\n"
-        "caelestia_sync = true\n"
-        "tty_sequences = false\n\n"
-        "[transition]\n"
-        "type = \"grow\"\n"
-        "duration = 1.25\n"
-        "fps = 165\n"
-        "bezier = [0.22, 1.0, 0.36, 1.0]\n"
-        "angle = 45.0\n"
-        "pos_x = 0.25\n"
-        "pos_y = 0.75\n\n"
-        "[output.\"DP-1\"]\n"
-        "path = \"/tmp/dp1_wall.png\"\n"
-        "scaling = \"fit\"\n"
-        "filter = \"mitchell\"\n"
-        "fill_color = \"#1e1e2e\"\n"
-        "fps = 144\n\n"
-        "[workspace.\"1\"]\n"
-        "output = \"DP-1\"\n"
-        "path = \"/tmp/ws1.png\"\n";
+    const char *toml_doc = "# WayWal Declarative Configuration\n"
+                           "[daemon]\n"
+                           "layer = \"bottom\"\n"
+                           "namespace = \"custom-ns\"\n"
+                           "battery_policy = \"pause-video\"\n"
+                           "auto_pause_fullscreen = true\n"
+                           "auto_pause_maximized = true\n"
+                           "idle_timeout_sec = 180\n"
+                           "ten_bit = true\n"
+                           "backdrop = \"auto-blur\"\n\n"
+                           "[theme]\n"
+                           "enabled = true\n"
+                           "mode = \"light\"\n"
+                           "caelestia_sync = true\n"
+                           "tty_sequences = false\n\n"
+                           "[transition]\n"
+                           "type = \"grow\"\n"
+                           "duration = 1.25\n"
+                           "fps = 165\n"
+                           "bezier = [0.22, 1.0, 0.36, 1.0]\n"
+                           "angle = 45.0\n"
+                           "pos_x = 0.25\n"
+                           "pos_y = 0.75\n\n"
+                           "[output.\"DP-1\"]\n"
+                           "path = \"/tmp/dp1_wall.png\"\n"
+                           "scaling = \"fit\"\n"
+                           "filter = \"mitchell\"\n"
+                           "fill_color = \"#1e1e2e\"\n"
+                           "fps = 144\n\n"
+                           "[workspace.\"1\"]\n"
+                           "output = \"DP-1\"\n"
+                           "path = \"/tmp/ws1.png\"\n";
 
     waywal_config_t cfg;
     char err_buf[256] = {0};
@@ -314,11 +314,11 @@ static void test_toml_cli_formats(void)
         assert(opts.cmd == CLI_CMD_RESTORE);
     }
 
-    const char *svg_xml =
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\" viewBox=\"0 0 64 64\">"
-        "<rect x=\"0\" y=\"0\" width=\"64\" height=\"64\" fill=\"#ff3366\"/>"
-        "<circle cx=\"32\" cy=\"32\" r=\"16\" fill=\"#33ccff\"/>"
-        "</svg>";
+    const char *svg_xml = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\" "
+                          "viewBox=\"0 0 64 64\">"
+                          "<rect x=\"0\" y=\"0\" width=\"64\" height=\"64\" fill=\"#ff3366\"/>"
+                          "<circle cx=\"32\" cy=\"32\" r=\"16\" fill=\"#33ccff\"/>"
+                          "</svg>";
     raw_image_t svg_img;
     memset(&svg_img, 0, sizeof(svg_img));
     assert(image_load_from_memory((const uint8_t *)svg_xml, strlen(svg_xml), &svg_img));
@@ -410,8 +410,7 @@ static void test_state_and_kawase_blur(void)
     assert(waywal_state_store_load(&loaded, tmp_dir));
     assert(loaded.count == 2U);
 
-    const waywal_output_saved_state_t *found_dp1 =
-        waywal_state_store_find_output(&loaded, "DP-1");
+    const waywal_output_saved_state_t *found_dp1 = waywal_state_store_find_output(&loaded, "DP-1");
     assert(found_dp1 != NULL);
     assert(found_dp1->kind == WAYWAL_CONTENT_STATIC_IMAGE);
     assert(strcmp(found_dp1->media_path, "/tmp/wallpaper_dp1.png") == 0);
@@ -460,15 +459,12 @@ static void test_anim_engine(void)
     printf("[TEST] Testing Native Zero-Dependency Animated GIF89a Delta-Frame Engine...\n");
 
     static const uint8_t anim_gif89a[] = {
-        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x02, 0x00, 0x02, 0x00, 0x81, 0x00, 0x00,
-        0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
-        0x21, 0xF9, 0x04, 0x01, 0x05, 0x00, 0x03, 0x00,
-        0x2C, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00,
-        0x08, 0x07, 0x00, 0x01, 0x04, 0x10, 0x30, 0x20, 0x20, 0x00,
-        0x21, 0xF9, 0x04, 0x01, 0x08, 0x00, 0x03, 0x00,
-        0x2C, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00,
-        0x08, 0x07, 0x00, 0x01, 0x04, 0x10, 0x30, 0x20, 0x20, 0x00,
-        0x3B,
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x02, 0x00, 0x02, 0x00, 0x81, 0x00, 0x00, 0xFF,
+        0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04,
+        0x01, 0x05, 0x00, 0x03, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00,
+        0x00, 0x08, 0x07, 0x00, 0x01, 0x04, 0x10, 0x30, 0x20, 0x20, 0x00, 0x21, 0xF9, 0x04,
+        0x01, 0x08, 0x00, 0x03, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00,
+        0x00, 0x08, 0x07, 0x00, 0x01, 0x04, 0x10, 0x30, 0x20, 0x20, 0x00, 0x3B,
     };
 
     assert(waywal_anim_probe(anim_gif89a, sizeof(anim_gif89a)));
@@ -544,8 +540,8 @@ static void test_audio_fft_and_shader(void)
     float samples[2048];
     for (size_t i = 0; i < 2048; ++i) {
         float t = (float)i / 48000.0f;
-        samples[i] =
-            0.7f * sinf(2.0f * 3.14159265f * 100.0f * t) + 0.5f * sinf(2.0f * 3.14159265f * 440.0f * t);
+        samples[i] = 0.7f * sinf(2.0f * 3.14159265f * 100.0f * t) +
+                     0.5f * sinf(2.0f * 3.14159265f * 440.0f * t);
     }
 
     assert(waywal_audio_fft_push_samples(fft, samples, 2048) == 2048U);
@@ -573,12 +569,11 @@ static void test_audio_fft_and_shader(void)
     assert(non_zero_tex > 64U);
     waywal_audio_fft_destroy(fft);
 
-    const char *shadertoy_frag =
-        "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
-        "    vec2 uv = fragCoord / iResolution.xy;\n"
-        "    float fft = texture(iChannel0, vec2(uv.x, 0.25)).r;\n"
-        "    fragColor = vec4(uv, fft + u_audio_bands[0], 1.0);\n"
-        "}\n";
+    const char *shadertoy_frag = "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
+                                 "    vec2 uv = fragCoord / iResolution.xy;\n"
+                                 "    float fft = texture(iChannel0, vec2(uv.x, 0.25)).r;\n"
+                                 "    fragColor = vec4(uv, fft + u_audio_bands[0], 1.0);\n"
+                                 "}\n";
 
     char *wrapped = waywal_shader_wrap_source(shadertoy_frag);
     assert(wrapped != NULL);
@@ -619,33 +614,32 @@ static void test_extended_subsystems(void)
     assert(pal_rgba.primary.b == pal_bgra.primary.b);
 
     /* 2. Verify all 15 man-page TOML keys & 64-bit integer overflow guard */
-    const char *full_toml =
-        "[daemon]\n"
-        "restore_on_start = false\n"
-        "pause_on_occluded_workspace = true\n"
-        "pause_on_idle = true\n"
-        "idle_timeout_sec = 180\n"
-        "[theme]\n"
-        "scheme_variant = \"vibrant\"\n"
-        "contrast = 0.5\n"
-        "export_css = true\n"
-        "export_hyprland = true\n"
-        "[transition]\n"
-        "pos = \"top-right\"\n"
-        "sync_mode = \"staggered\"\n"
-        "stagger_delay_ms = 200\n"
-        "[hooks]\n"
-        "on_theme_change = \"pkill -USR2 waybar\"\n"
-        "on_wallpaper_change = \"notify-send wwal\"\n"
-        "[output.\"DP-2\"]\n"
-        "path = \"/tmp/shader.frag\"\n"
-        "mode = \"shader\"\n"
-        "interval = 120\n"
-        "shuffle = true\n"
-        "audio = true\n"
-        "[workspace.\"3\"]\n"
-        "path = \"/tmp/ws3.png\"\n"
-        "transition_type = \"wipe\"\n";
+    const char *full_toml = "[daemon]\n"
+                            "restore_on_start = false\n"
+                            "pause_on_occluded_workspace = true\n"
+                            "pause_on_idle = true\n"
+                            "idle_timeout_sec = 180\n"
+                            "[theme]\n"
+                            "scheme_variant = \"vibrant\"\n"
+                            "contrast = 0.5\n"
+                            "export_css = true\n"
+                            "export_hyprland = true\n"
+                            "[transition]\n"
+                            "pos = \"top-right\"\n"
+                            "sync_mode = \"staggered\"\n"
+                            "stagger_delay_ms = 200\n"
+                            "[hooks]\n"
+                            "on_theme_change = \"pkill -USR2 waybar\"\n"
+                            "on_wallpaper_change = \"notify-send wwal\"\n"
+                            "[output.\"DP-2\"]\n"
+                            "path = \"/tmp/shader.frag\"\n"
+                            "mode = \"shader\"\n"
+                            "interval = 120\n"
+                            "shuffle = true\n"
+                            "audio = true\n"
+                            "[workspace.\"3\"]\n"
+                            "path = \"/tmp/ws3.png\"\n"
+                            "transition_type = \"wipe\"\n";
 
     waywal_config_t cfg;
     char err[256] = {0};

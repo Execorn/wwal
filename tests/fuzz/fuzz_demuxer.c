@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/demuxer.h"
 
 #include <fcntl.h>
@@ -76,6 +77,7 @@ static bool ebml_subelements_within_bounds(const uint8_t *data, size_t start, si
     return off == end;
 }
 
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (!data || size > 65536)

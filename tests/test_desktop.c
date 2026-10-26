@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/log.h"
 #include "waywal/output_state.h"
 #include "waywal/presentation.h"
@@ -15,16 +16,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-void output_node_destroy_surface(output_node_t *node)
-{
-    (void)node;
-}
+void output_node_destroy_surface(output_node_t *node);
+void output_node_destroy_surface(output_node_t *node) { (void)node; }
 
 #ifndef __has_feature
 #define __has_feature(x) 0
 #endif
 #if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
-__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void)
 {
     return "leak:<unknown module>\nleak:libcuda\nleak:cuInit\nleak:gbm_create_device\nleak:libgbm\n"
            "leak:libEGL\nleak:libGLESv2\nleak:dri\nleak:libnvidia\nleak:libGLX_nvidia\nleak:"
@@ -132,7 +132,8 @@ static void test_io_uring_event_loop(void)
     char rbuf;
     read(fds[0], &rbuf, 1);
 
-    /* Write a second byte without calling uring_loop_add_poll again to verify multishot continuation */
+    /* Write a second byte without calling uring_loop_add_poll again to verify multishot
+     * continuation */
     w = write(fds[1], &byte, 1);
     assert(w == 1);
     dispatched = uring_loop_dispatch(&loop, test_uring_callback);
@@ -259,7 +260,7 @@ static void test_security_hardening(void)
 int main(void)
 {
     printf("=========================================\n");
-    printf("  Executing WayWal Phase 5 Test Suite\n");
+    printf("  Executing WayWal Desktop & Runtime Test Suite\n");
     printf("=========================================\n");
 
     test_presentation_pll_vrr_tracking();
@@ -267,6 +268,6 @@ int main(void)
     test_output_manager_lifecycle();
     test_security_hardening();
 
-    printf("\n>>> ALL PHASE 5 UNIT TESTS PASSED SUCCESSFULLY! <<<\n");
+    printf("\n>>> ALL DESKTOP UNIT TESTS PASSED SUCCESSFULLY! <<<\n");
     return 0;
 }

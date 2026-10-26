@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "gpu_compute.h"
 
 #include <EGL/egl.h>
@@ -20,7 +21,7 @@
 #include <immintrin.h>
 #endif
 
-#include "shaders/shaders_embedded.h"
+#include "shaders_embedded.h"
 #include "waywal/log.h"
 
 typedef struct {
@@ -293,10 +294,14 @@ static const char *SHADER_SRC_KAWASE =
     "    vec2 uv = (vec2(coord) + 0.5) / dst_f;\n"
     "    vec2 step_uv = max(u_radius, 1.0) / src_f;\n"
     "    vec4 sum = texture(u_src, uv) * 4.0;\n"
-    "    sum += texture(u_src, clamp(uv + vec2(-step_uv.x, -step_uv.y), vec2(0.0), vec2(1.0))) * 2.0;\n"
-    "    sum += texture(u_src, clamp(uv + vec2( step_uv.x, -step_uv.y), vec2(0.0), vec2(1.0))) * 2.0;\n"
-    "    sum += texture(u_src, clamp(uv + vec2(-step_uv.x,  step_uv.y), vec2(0.0), vec2(1.0))) * 2.0;\n"
-    "    sum += texture(u_src, clamp(uv + vec2( step_uv.x,  step_uv.y), vec2(0.0), vec2(1.0))) * 2.0;\n"
+    "    sum += texture(u_src, clamp(uv + vec2(-step_uv.x, -step_uv.y), vec2(0.0), vec2(1.0))) * "
+    "2.0;\n"
+    "    sum += texture(u_src, clamp(uv + vec2( step_uv.x, -step_uv.y), vec2(0.0), vec2(1.0))) * "
+    "2.0;\n"
+    "    sum += texture(u_src, clamp(uv + vec2(-step_uv.x,  step_uv.y), vec2(0.0), vec2(1.0))) * "
+    "2.0;\n"
+    "    sum += texture(u_src, clamp(uv + vec2( step_uv.x,  step_uv.y), vec2(0.0), vec2(1.0))) * "
+    "2.0;\n"
     "    sum += texture(u_src, clamp(uv + vec2(-2.0 * step_uv.x, 0.0), vec2(0.0), vec2(1.0)));\n"
     "    sum += texture(u_src, clamp(uv + vec2( 2.0 * step_uv.x, 0.0), vec2(0.0), vec2(1.0)));\n"
     "    sum += texture(u_src, clamp(uv + vec2(0.0, -2.0 * step_uv.y), vec2(0.0), vec2(1.0)));\n"
@@ -307,23 +312,21 @@ static const char *SHADER_SRC_KAWASE =
 
 static GLuint compile_blit_10bit_program(void)
 {
-    static const char *vs_src =
-        "#version 310 es\n"
-        "out highp vec2 v_uv;\n"
-        "void main() {\n"
-        "    vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
-        "    v_uv = pos;\n"
-        "    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);\n"
-        "}\n";
-    static const char *fs_src =
-        "#version 310 es\n"
-        "precision highp float;\n"
-        "in highp vec2 v_uv;\n"
-        "layout(binding = 0) uniform highp sampler2D u_tex;\n"
-        "out highp vec4 frag_color;\n"
-        "void main() {\n"
-        "    frag_color = texture(u_tex, v_uv);\n"
-        "}\n";
+    static const char *vs_src = "#version 310 es\n"
+                                "out highp vec2 v_uv;\n"
+                                "void main() {\n"
+                                "    vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+                                "    v_uv = pos;\n"
+                                "    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);\n"
+                                "}\n";
+    static const char *fs_src = "#version 310 es\n"
+                                "precision highp float;\n"
+                                "in highp vec2 v_uv;\n"
+                                "layout(binding = 0) uniform highp sampler2D u_tex;\n"
+                                "out highp vec4 frag_color;\n"
+                                "void main() {\n"
+                                "    frag_color = texture(u_tex, v_uv);\n"
+                                "}\n";
 
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
     GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
@@ -511,7 +514,8 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
     /* Query fence sync extension entry points (ARCH-03) */
     ctx->eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
     ctx->eglDestroySyncKHR = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
-    ctx->eglClientWaitSyncKHR = (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
+    ctx->eglClientWaitSyncKHR =
+        (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
 
     WAYWAL_LOG_INFO("GPU compute transition engine initialized (GLES 3.1 compute on GBM)");
     return ctx;
@@ -933,8 +937,8 @@ bool gpu_compute_prepare_shm(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t
                              uint32_t width, uint32_t height, const uint32_t *old_pixels,
                              const uint32_t *new_pixels)
 {
-    if (!ctx || !tex_old || !tex_new || !tex_target || !fbo || !cur_w || !cur_h ||
-        width == 0 || height == 0 || !old_pixels || !new_pixels) {
+    if (!ctx || !tex_old || !tex_new || !tex_target || !fbo || !cur_w || !cur_h || width == 0 ||
+        height == 0 || !old_pixels || !new_pixels) {
         return false;
     }
 
@@ -944,8 +948,8 @@ bool gpu_compute_prepare_shm(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t
         }
     }
 
-    if (*cur_w != width || *cur_h != height || *tex_old == 0 || *tex_new == 0 ||
-        *tex_target == 0 || *fbo == 0) {
+    if (*cur_w != width || *cur_h != height || *tex_old == 0 || *tex_new == 0 || *tex_target == 0 ||
+        *fbo == 0) {
         gpu_compute_release_shm_res(ctx, tex_old, tex_new, tex_target, fbo);
 
         GLuint texs[3] = {0, 0, 0};
@@ -963,7 +967,8 @@ bool gpu_compute_prepare_shm(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t
             glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)width, (GLsizei)height);
         }
 
-        /* WL_SHM ARGB8888 in little-endian memory is [B, G, R, A]; swizzle sampler channels to present R, G, B, A to compute shaders. */
+        /* WL_SHM ARGB8888 in little-endian memory is [B, G, R, A]; swizzle sampler channels to
+         * present R, G, B, A to compute shaders. */
         for (int i = 0; i < 2; ++i) {
             glBindTexture(GL_TEXTURE_2D, texs[i]);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
@@ -997,14 +1002,13 @@ bool gpu_compute_prepare_shm(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t
     return true;
 }
 
-bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_old,
-                                         uint32_t tex_new, uint32_t tex_target,
-                                         uint32_t fbo, uint32_t width, uint32_t height,
-                                         const waywal_transition_params_t *params,
+bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_old, uint32_t tex_new,
+                                         uint32_t tex_target, uint32_t fbo, uint32_t width,
+                                         uint32_t height, const waywal_transition_params_t *params,
                                          uint32_t *dst_pixels)
 {
-    if (!ctx || tex_old == 0 || tex_new == 0 || tex_target == 0 || fbo == 0 ||
-        width == 0 || height == 0 || !params || !dst_pixels) {
+    if (!ctx || tex_old == 0 || tex_new == 0 || tex_target == 0 || fbo == 0 || width == 0 ||
+        height == 0 || !params || !dst_pixels) {
         return false;
     }
 
@@ -1090,8 +1094,8 @@ bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_ol
 
     static int s_log_count = 0;
     if (++s_log_count <= 6 || s_log_count % 30 == 0) {
-        WAYWAL_LOG_INFO("GPU SHM dispatch (%ux%u): compute=%.2fms readpixels=%.2fms",
-                        width, height, comp_ms, read_ms);
+        WAYWAL_LOG_INFO("GPU SHM dispatch (%ux%u): compute=%.2fms readpixels=%.2fms", width, height,
+                        comp_ms, read_ms);
     }
 
     return true;
@@ -1264,7 +1268,8 @@ static void upload_source_rgba_dedup(gpu_compute_ctx_t *ctx, const uint8_t *src_
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        /* Input pixels are little-endian ARGB8888 ([B, G, R, A]); swizzle to RGBA for shader sampling. */
+        /* Input pixels are little-endian ARGB8888 ([B, G, R, A]); swizzle to RGBA for shader
+         * sampling. */
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
         glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)src_w, (GLsizei)src_h);
@@ -1292,8 +1297,7 @@ static void upload_source_rgba_dedup(gpu_compute_ctx_t *ctx, const uint8_t *src_
 
 static GLuint ensure_kawase_half_tex(gpu_compute_ctx_t *ctx, uint32_t width, uint32_t height)
 {
-    if (ctx->kawase_half_tex != 0 && ctx->kawase_half_w == width &&
-        ctx->kawase_half_h == height) {
+    if (ctx->kawase_half_tex != 0 && ctx->kawase_half_w == width && ctx->kawase_half_h == height) {
         return ctx->kawase_half_tex;
     }
     if (ctx->kawase_half_tex != 0) {
@@ -1507,11 +1511,9 @@ static inline uint32_t avg_u32_epu8_scalar(uint32_t a, uint32_t b)
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
-__attribute__((target("avx2"))) static void kawase_pass_row_avx2(uint32_t *restrict dst_row,
-                                                                 const uint32_t *restrict row_up,
-                                                                 const uint32_t *restrict row_cc,
-                                                                 const uint32_t *restrict row_dn,
-                                                                 uint32_t hw)
+__attribute__((target("avx2"))) static void
+kawase_pass_row_avx2(uint32_t *restrict dst_row, const uint32_t *restrict row_up,
+                     const uint32_t *restrict row_cc, const uint32_t *restrict row_dn, uint32_t hw)
 {
     if (hw == 0)
         return;

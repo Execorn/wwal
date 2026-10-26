@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "cli_parser.h"
 #include "image_loader.h"
 #include "waywal/gif_transcode.h"
@@ -16,6 +17,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+bool daemon_start_image_transition(struct daemon_state *state, const uint8_t *pixels,
+                                   uint32_t img_w, uint32_t img_h,
+                                   const waywal_img_metadata_t *meta);
 bool daemon_start_image_transition(struct daemon_state *state, const uint8_t *pixels,
                                    uint32_t img_w, uint32_t img_h,
                                    const waywal_img_metadata_t *meta)

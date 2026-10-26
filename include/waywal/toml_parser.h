@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_TOML_PARSER_H
 #define WAYWAL_TOML_PARSER_H
 
@@ -14,7 +15,7 @@
 extern "C" {
 #endif
 
-#define WAYWAL_CONFIG_MAX_OUTPUTS 16U
+#define WAYWAL_CONFIG_MAX_OUTPUTS    16U
 #define WAYWAL_CONFIG_MAX_WORKSPACES 32U
 
 typedef enum : uint32_t {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
 
@@ -73,7 +74,7 @@ static bool find_active_drm_render_node(char *out_path, size_t max_len)
                         struct dirent *drm_entry;
                         while ((drm_entry = readdir(drm_dir)) != NULL) {
                             if (strncmp(drm_entry->d_name, "renderD", 7) == 0) {
-                                snprintf(out_path, max_len, "/dev/dri/%s", drm_entry->d_name);
+                                snprintf(out_path, max_len, "/dev/dri/%.64s", drm_entry->d_name);
                                 found = true;
                                 break;
                             }
@@ -178,7 +179,8 @@ bool dmabuf_context_init(dmabuf_context_t *ctx)
     if (drm_fd < 0 && find_active_drm_render_node(active_node, sizeof(active_node))) {
         drm_fd = open(active_node, O_RDWR | O_CLOEXEC);
         if (drm_fd >= 0) {
-            WAYWAL_LOG_INFO("Priority 1: Discovered active display DRM render node: %s", active_node);
+            WAYWAL_LOG_INFO("Priority 1: Discovered active display DRM render node: %s",
+                            active_node);
         }
     }
 

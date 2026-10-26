@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/output_state.h"
 
 #include "fractional-scale-v1-client-protocol.h"

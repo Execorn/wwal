@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_STATE_STORE_H
 #define WAYWAL_STATE_STORE_H
 
@@ -12,8 +13,8 @@
 extern "C" {
 #endif
 
-#define WAYWAL_STATE_MAGIC 0x57575354U
-#define WAYWAL_STATE_VERSION 1U
+#define WAYWAL_STATE_MAGIC       0x57575354U
+#define WAYWAL_STATE_VERSION     1U
 #define WAYWAL_STATE_MAX_OUTPUTS 16U
 
 typedef enum : uint32_t {
@@ -78,20 +79,20 @@ bool waywal_state_store_load_dir(waywal_state_store_t *store, const char *overri
 #ifndef __cplusplus
 #define WAYWAL_STATE_SAVE_SEL(_1, _2, NAME, ...) NAME
 #define waywal_state_store_save(...)                                                               \
-    WAYWAL_STATE_SAVE_SEL(__VA_ARGS__, waywal_state_store_save_dir, waywal_state_store_save, 0)(   \
-        __VA_ARGS__)
+    WAYWAL_STATE_SAVE_SEL(__VA_ARGS__, waywal_state_store_save_dir, waywal_state_store_save,       \
+                          0)(__VA_ARGS__)
 
 #define WAYWAL_STATE_LOAD_SEL(_1, _2, NAME, ...) NAME
 #define waywal_state_store_load(...)                                                               \
-    WAYWAL_STATE_LOAD_SEL(__VA_ARGS__, waywal_state_store_load_dir, waywal_state_store_load, 0)(   \
-        __VA_ARGS__)
+    WAYWAL_STATE_LOAD_SEL(__VA_ARGS__, waywal_state_store_load_dir, waywal_state_store_load,       \
+                          0)(__VA_ARGS__)
 #endif
 
 bool waywal_state_store_update_output(waywal_state_store_t *store,
                                       const waywal_output_saved_state_t *state);
 
-const waywal_output_saved_state_t *waywal_state_store_find_output(
-    const waywal_state_store_t *store, const char *output_name);
+const waywal_output_saved_state_t *waywal_state_store_find_output(const waywal_state_store_t *store,
+                                                                  const char *output_name);
 
 #ifdef __cplusplus
 }

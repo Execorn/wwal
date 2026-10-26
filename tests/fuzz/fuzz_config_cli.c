@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "cli_parser.h"
 #include "waywal/bezier.h"
 #include "waywal/ipc_proto.h"
@@ -24,7 +25,8 @@ static void silence_stdio_once(void)
     if (silenced)
         return;
     silenced = true;
-    /* Redirect stdout/stderr during fuzzing so cli_parse error messages do not bottleneck exec/s. */
+    /* Redirect stdout/stderr during fuzzing so cli_parse error messages do not bottleneck exec/s.
+     */
     int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
     if (null_fd >= 0) {
         dup2(null_fd, STDOUT_FILENO);
@@ -94,6 +96,7 @@ static void fuzz_bezier_and_ipc(const uint8_t *data, size_t size)
     }
 }
 
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (!data || size > 65536)
@@ -160,7 +163,8 @@ int main(int argc, char **argv)
     static const char *corpus[] = {
         "[daemon]\nlayer = \"background\"\nbattery_policy = \"pause-video\"\n10bit = true\n"
         "[theme]\nenable = true\nmode = \"dark\"\ncaelestia_sync = true\n"
-        "[transition]\ntype = \"grow\"\nduration = 0.8\nfps = 144\nbezier = [0.25, 0.1, 0.25, 1.0]\n"
+        "[transition]\ntype = \"grow\"\nduration = 0.8\nfps = 144\nbezier = [0.25, 0.1, 0.25, "
+        "1.0]\n"
         "[output.\"DP-1\"]\npath = \"/tmp/wall.png\"\nscaling = \"fill\"\n"
         "[workspace.\"1\"]\npath = \"/tmp/ws1.png\"\noutput = \"DP-1\"\n",
         "img /tmp/test.png --transition-type grow --transition-pos cursor --transition-fps 144 "

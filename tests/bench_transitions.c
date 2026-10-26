@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/bezier.h"
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
@@ -15,7 +16,8 @@
 #define __has_feature(x) 0
 #endif
 #if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
-__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void)
 {
     return "leak:<unknown module>\nleak:gbm_create_device\nleak:libgbm\nleak:libEGL\nleak:"
            "libGLESv2\nleak:dri\nleak:libnvidia\n";

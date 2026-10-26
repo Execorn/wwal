@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -878,7 +879,8 @@ static bool load_avif_from_memory(const uint8_t *buf, size_t size, raw_image_t *
     if (!decoder)
         return false;
 
-    if (g_fn_avifDecoderSetIOMemory(decoder, buf, size) != 0 || g_fn_avifDecoderParse(decoder) != 0) {
+    if (g_fn_avifDecoderSetIOMemory(decoder, buf, size) != 0 ||
+        g_fn_avifDecoderParse(decoder) != 0) {
         g_fn_avifDecoderDestroy(decoder);
         return false;
     }
@@ -1432,10 +1434,10 @@ static bool svg_parse_color(const char *str, svg_rgba_t *out)
         const char *name;
         uint8_t r, g, b;
     } named_colors[] = {
-        {"black", 0, 0, 0},       {"white", 255, 255, 255}, {"red", 255, 0, 0},
-        {"lime", 0, 255, 0},      {"green", 0, 128, 0},     {"blue", 0, 0, 255},
-        {"yellow", 255, 255, 0},  {"cyan", 0, 255, 255},    {"magenta", 255, 0, 255},
-        {"orange", 255, 165, 0},  {"purple", 128, 0, 128},  {"gray", 128, 128, 128},
+        {"black", 0, 0, 0},      {"white", 255, 255, 255}, {"red", 255, 0, 0},
+        {"lime", 0, 255, 0},     {"green", 0, 128, 0},     {"blue", 0, 0, 255},
+        {"yellow", 255, 255, 0}, {"cyan", 0, 255, 255},    {"magenta", 255, 0, 255},
+        {"orange", 255, 165, 0}, {"purple", 128, 0, 128},  {"gray", 128, 128, 128},
         {"grey", 128, 128, 128},
     };
     for (size_t i = 0; i < sizeof(named_colors) / sizeof(named_colors[0]); ++i) {
@@ -1838,10 +1840,9 @@ static bool is_svg_magic(const uint8_t *buf, size_t size)
         off++;
     if (off + 4 <= size && strncasecmp((const char *)(buf + off), "<svg", 4) == 0)
         return true;
-    if (off + 5 <= size &&
-        (strncasecmp((const char *)(buf + off), "<?xml", 5) == 0 ||
-         strncasecmp((const char *)(buf + off), "<!doc", 5) == 0 ||
-         strncasecmp((const char *)(buf + off), "<!--", 4) == 0)) {
+    if (off + 5 <= size && (strncasecmp((const char *)(buf + off), "<?xml", 5) == 0 ||
+                            strncasecmp((const char *)(buf + off), "<!doc", 5) == 0 ||
+                            strncasecmp((const char *)(buf + off), "<!--", 4) == 0)) {
         size_t scan_len = size - off;
         if (scan_len > 4096)
             scan_len = 4096;

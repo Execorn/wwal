@@ -1,6 +1,10 @@
-# `WayWal` (`wwal`): Modern C23 Wayland Wallpaper, Video, Shader & Theme Engine
+# `WayWal` (`wwal`): C23 Wayland Wallpaper, Video, Shader & Theme Engine
 
-[![GitHub Repository](https://img.shields.io/badge/GitHub-execorn%2Fwwal-181717?logo=github)](https://github.com/execorn/wwal)
+[![CI](https://github.com/Execorn/wwal/actions/workflows/ci.yml/badge.svg)](https://github.com/Execorn/wwal/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Execorn/wwal?color=007ec6)](https://github.com/Execorn/wwal/releases)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![Language: C23](https://img.shields.io/badge/Language-C23-00599C?logo=c)](meson.build)
+[![Platform: Wayland](https://img.shields.io/badge/Platform-Wayland%20%7C%20Linux-FFBC00?logo=wayland)](https://wayland.freedesktop.org/)
 
 <p align="center">
   <a href="assets/demo.mp4">
@@ -8,24 +12,36 @@
   </a>
 </p>
 
-**WayWal** (`wwald` daemon and `wwal` CLI) is a fast, low-memory Wayland desktop engine written in modern C (C23 / `gnu2x`). It replaces six separate tools (`swww`/`awww`, `hyprpaper`, `mpvpaper`, `wpaperd`, `shaderbg`/`glava`, and `matugen`/`wallust`) inside one `< 1.5 MB` binary.
-
-Repository: [https://github.com/execorn/wwal](https://github.com/execorn/wwal)
+**WayWal** (`wwald` daemon and `wwal` CLI) is a fast, low-memory Wayland desktop engine written in C23 (`gnu2x`). It replaces six separate tools (`swww`/`awww`, `hyprpaper`, `mpvpaper`, `wpaperd`, `shaderbg`/`glava`, and `matugen`/`wallust`) inside a single `< 1.5 MB` binary pair.
 
 ---
 
 ## Why Use WayWal?
 
 - **Zero-Copy Direct Scanout**: Renders static wallpapers into GPU DMA-BUFs (`zwp_linux_dmabuf_v1` with linear, NVIDIA block-linear, AMD DCC, and Intel CCS modifiers) and 1×1 solid color buffers (`wp_single_pixel_buffer_v1`) with **0.0% GPU 3D load**.
-- **True Physical HiDPI Sharpness**: Binds `wp_fractional_scale_v1` and `wp_viewporter` so 4K and 5K monitors at `1.25x`, `1.5x`, or `1.75x` scale render at exact physical pixel dimensions without blurry upscaling.
-- **Hardware Video & Native Animations**: Plays H.264, HEVC, VP9, and AV1 videos with zero FFmpeg runtime dependencies using VA-API (`libva`), direct `NV12`/`P010` KMS scanout on Intel/AMD, a 3-surface `BGRX` VPP ring on NVIDIA, and an in-process GIF/APNG/WebP delta-frame engine.
+- **True Physical HiDPI Sharpness**: Binds `wp_fractional_scale_v1` and `wp_viewporter` so 4K and 5K monitors at `1.25x`, `1.5x`, or `1.75x` scale render at exact physical pixel dimensions without blurry compositor upscaling.
+- **Hardware Video & Native Animations**: Plays H.264, HEVC, VP9, and AV1 videos without FFmpeg runtime dependencies using VA-API (`libva`), direct `NV12`/`P010` KMS scanout on Intel/AMD, a 3-surface `BGRX` VPP ring on NVIDIA, and an in-process GIF/APNG/WebP delta-frame engine.
 - **Zero-Watt Smart Occlusion & Battery Governor**: Pauses video and shader rendering down to **0.00% CPU and GPU** when a monitor has a fullscreen or maximized window (`ext-foreign-toplevel-list-v1` + Hyprland/Sway IPC), when the session is idle (`ext-idle-notify-v1`), or when running on laptop battery power.
 - **Live Shadertoy & Audio-Reactive Wallpapers**: Runs GLSL ES 3.1 `.comp` and Shadertoy `.frag` shaders (`wwal shader`) with a binary shader cache (`< 0.08 ms` warm load), live `inotify` hot-reload, and a lock-free PipeWire 2048-point AVX2 64-bin Bark-scale audio FFT (`--audio`).
 - **Sub-Millisecond Material You & Quickshell (`caelestia`) Theming**: Extracts Material Design 3 (`CAM16`/`HCT`) and `OKLab` palettes from 4K images in **0.32 ms** using AVX2 Wu 3D moment quantization and weighted K-Means++, writing `~/.local/state/caelestia/scheme.json`, `~/.cache/wwal/colors.{json,css,hyprland.conf}`, and `/dev/pts/*` terminal OSC sequences.
-- **100% Drop-In `swww` / `awww` Compatibility**: Works as a drop-in replacement for `swww` and `awww` scripts (`waypaper`, Rofi pickers) and decodes PNG, JPEG, BMP, WebP, AVIF (including macOS Solar Dynamic multi-frame files), JPEG-XL, GIF, APNG, and SVG.
+- **Drop-In `swww` / `awww` Compatibility**: Works as a drop-in replacement for `swww` and `awww` scripts (`waypaper`, Rofi pickers) and decodes PNG, JPEG, BMP, WebP, AVIF (including macOS Solar Dynamic multi-frame files), JPEG-XL, GIF, APNG, and SVG.
 
 > [!TIP]
 > WayWal runs 18 built-in transition shaders on the GPU via OpenGL ES 3.1 compute shaders (`0.09–0.17 ms` at 1080p, `0.20–0.41 ms` at 4K) and includes an OpenMP + AVX-512 / AVX2 / NEON CPU fallback engine that renders 720p transitions at **1,548 – 26,087 FPS**.
+
+---
+
+## Dependencies & Requirements
+
+Building from source requires a C compiler supporting C23 (`GCC >= 13` or `Clang >= 17`), `meson >= 0.60`, `ninja`, `pkg-config`, and `python3`.
+
+| Category | `pkg-config` / Package Names | Role |
+| :--- | :--- | :--- |
+| **Core Wayland & DRM** | `wayland-client >= 1.20`, `wayland-protocols >= 1.34`, `wayland-scanner`, `libdrm >= 2.4.110`, `gbm`, `egl`, `glesv2` | Layer-shell surfaces, DMA-BUF allocation, and GLES 3.1 compute shaders |
+| **Hardware Video & Kernel** | `libva`, `libva-drm`, `liburing`, `libseccomp` | VA-API video decoding, `io_uring` event loop, and Seccomp-BPF sandbox |
+| **Base Image Codecs** | `libpng`, `libturbojpeg` | Fast native PNG, APNG, and JPEG decoding |
+| **Optional Runtime Plugins (`dlopen`)** | `libwebp`, `libavif`, `libjxl`, `librsvg-2.0`, `libpipewire-0.3`, `shaderc` | Loaded on demand at runtime when decoding WebP, AVIF, JXL, SVG, or capturing PipeWire audio |
+| **Optional Build Tools** | `scdoc`, `systemd` | Compiles `docs/man/*.scd` manual pages and resolves systemd user unit paths |
 
 ---
 
@@ -34,20 +50,20 @@ Repository: [https://github.com/execorn/wwal](https://github.com/execorn/wwal)
 ### Build from Source
 
 ```bash
-git clone https://github.com/execorn/wwal.git
+git clone https://github.com/Execorn/wwal.git
 cd wwal
 
 # Configure release build with Link-Time Optimization (LTO)
-meson setup build --buildtype=release -Doptimization=3 -Db_lto=true
+meson setup build --prefix="$HOME/.local" --buildtype=release -Doptimization=3 -Db_lto=true
 
 # Compile wwald (daemon) and wwal (client)
-ninja -C build
+meson compile -C build
 
-# Run all unit, integration, fuzz, and E2E test suites
+# Run unit, subsystem, fuzz, and E2E test suites
 meson test -C build --print-errorlogs
 
-# Install binaries to ~/.local/bin
-install -m 755 build/wwal build/wwald ~/.local/bin/
+# Install binaries, manual pages, shell completions, and systemd user units
+meson install -C build
 ```
 
 ### Distribution Packages
@@ -58,7 +74,7 @@ install -m 755 build/wwal build/wwald ~/.local/bin/
   ```
 - **NixOS / Home Manager (`flake.nix`)**:
   ```bash
-  nix run github:execorn/wwal -- query
+  nix run github:Execorn/wwal -- query
   ```
 - **Fedora / RHEL**: Build with `contrib/fedora/wwal.spec`.
 - **Debian / Ubuntu**: Build with `contrib/debian/`.
@@ -74,7 +90,7 @@ wwald &
 # Set a wallpaper with a radial ripple transition from the mouse cursor and generate a Material 3 theme
 wwal img ~/Pictures/Wallpapers/scenery.jpg --transition-type ripple --transition-pos cursor --theme
 
-# Set a wallpaper with ablurred overview backdrop for the Niri compositor
+# Set a wallpaper with a blurred overview backdrop for the Niri compositor
 wwal img ~/Pictures/Wallpapers/scenery.jpg --backdrop auto-blur
 
 # Play a hardware-accelerated 4K video wallpaper
@@ -173,11 +189,18 @@ Key Options:
 
 ```text
 wwal/
-├── README.md                          # Project overview, usage, and benchmarks
-├── docs/
-│   └── man/                           # scdoc manual pages (wwal.1, wwald.1, wwal-config.5)
+├── README.md                          # Project overview, quickstart, and benchmarks
+├── LICENSE                            # GNU General Public License v3.0
+├── CHANGELOG.md                       # Release history
+├── CONTRIBUTING.md                    # Developer workflow, sanitizers, and style guide
+├── SECURITY.md                        # Sandbox architecture and vulnerability reporting
+├── SUPPORT.md                         # Troubleshooting and diagnostic guide
+├── CODE_OF_CONDUCT.md                 # Contributor Covenant v2.1
 ├── flake.nix                          # NixOS Flake package, devShell, and Home Manager module
 ├── meson.build                        # Meson build configuration and test targets
+├── meson_options.txt                  # Feature and codec build options
+├── docs/
+│   └── man/                           # scdoc manual pages (wwal.1, wwald.1, wwal-config.5)
 ├── contrib/
 │   ├── PKGBUILD                       # Arch Linux package build script
 │   ├── fedora/wwal.spec               # Fedora / RPM spec file
@@ -186,8 +209,13 @@ wwal/
 │   ├── void/template                  # Void Linux xbps-src template
 │   ├── systemd/                       # wwald.service and wwald.socket user units
 │   └── completions/                   # Bash, Zsh, and Fish completions
-├── protocols/                         # Bundled Wayland XML protocol definitions
-├── include/waywal/                    # Public subsystem headers
+├── protocols/
+│   └── wlr-layer-shell-unstable-v1.xml # wlroots Layer Shell XML protocol
+├── scripts/
+│   ├── embed_shaders.py               # Build-time GLSL compute shader embedding script
+│   ├── build_optimized.sh             # PGO + LTO + LLVM BOLT build pipeline
+│   └── benchmark.py                   # Live daemon transition and RSS benchmark
+├── include/waywal/                    # Subsystem headers
 ├── src/
 │   ├── common/                        # Arena, IPC, Bezier, OKLab/HCT palette, TOML, state store
 │   ├── daemon/                        # Wayland core, GBM/DMA-BUF, VA-API, Shaders, Audio FFT, Power Gov
@@ -212,15 +240,6 @@ Measured with `./build/bench_transitions 60` (`OMP_NUM_THREADS=4`):
 
 ---
 
-## Contributing & Verification
+## Contributing & Security
 
-> [!IMPORTANT]
-> If you edit any standalone compute shader in `src/daemon/shaders/*.comp`, update its matching `SHADER_SRC_*` string in `src/daemon/shaders/shaders_embedded.h`. The `waywal:e2e` test suite verifies byte-for-byte equality between the standalone `.comp` files and `shaders_embedded.h`.
-
-Run the full test suite before submitting pull requests:
-
-```bash
-ninja -C build
-meson test -C build --print-errorlogs
-OMP_NUM_THREADS=4 ./build/bench_transitions 60
-```
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, AddressSanitizer/UBSan test commands, and code formatting guidelines. To report a security issue, follow the instructions in [`SECURITY.md`](SECURITY.md).

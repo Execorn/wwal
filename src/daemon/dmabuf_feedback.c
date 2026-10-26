@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
 
@@ -73,8 +74,8 @@ static void feedback_main_device(void *data, struct zwp_linux_dmabuf_feedback_v1
     memcpy(&dev, device->data, sizeof(dev_t));
     ctx->compositor_dev = dev;
     ctx->has_compositor_dev = true;
-    WAYWAL_LOG_INFO("Compositor main DRM device: %u:%u (dev_t %lu)",
-                    (unsigned)major(dev), (unsigned)minor(dev), (unsigned long)dev);
+    WAYWAL_LOG_INFO("Compositor main DRM device: %u:%u (dev_t %lu)", (unsigned)major(dev),
+                    (unsigned)minor(dev), (unsigned long)dev);
 }
 
 static void feedback_tranche_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback)

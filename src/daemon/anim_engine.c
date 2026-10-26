@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include "waywal/anim_engine.h"
+
 #include "waywal/log.h"
 
 #include <dlfcn.h>
@@ -15,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define GIF_MAX_LZW_BITS 12
+#define GIF_MAX_LZW_BITS   12
 #define GIF_LZW_TABLE_SIZE (1 << GIF_MAX_LZW_BITS)
 
 typedef struct {
@@ -68,7 +70,8 @@ typedef struct {
 } webp_anim_info_t;
 
 typedef int (*pfn_WebPAnimDecoderOptionsInitInternal)(webp_anim_options_t *, int);
-typedef void *(*pfn_WebPAnimDecoderNewInternal)(const webp_data_t *, const webp_anim_options_t *, int);
+typedef void *(*pfn_WebPAnimDecoderNewInternal)(const webp_data_t *, const webp_anim_options_t *,
+                                                int);
 typedef int (*pfn_WebPAnimDecoderGetInfo)(const void *, webp_anim_info_t *);
 typedef int (*pfn_WebPAnimDecoderGetNext)(void *, uint8_t **, int *);
 typedef int (*pfn_WebPAnimDecoderHasMoreFrames)(const void *);
@@ -119,20 +122,14 @@ struct waywal_anim_decoder {
     pfn_WebPAnimDecoderDelete fn_webp_delete;
 };
 
-static uint16_t read_le16(const uint8_t *p)
-{
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
+static uint16_t read_le16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
 static uint32_t read_le32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static uint16_t read_be16(const uint8_t *p)
-{
-    return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
-}
+static uint16_t read_be16(const uint8_t *p) { return ((uint16_t)p[0] << 8) | (uint16_t)p[1]; }
 
 static uint32_t read_be32(const uint8_t *p)
 {
@@ -154,7 +151,8 @@ static bool skip_gif_subblocks(const uint8_t *data, size_t size, size_t *pos)
     return false;
 }
 
-static bool probe_gif_frames(const uint8_t *data, size_t size, uint32_t *out_frames, bool *out_has_anim_ext)
+static bool probe_gif_frames(const uint8_t *data, size_t size, uint32_t *out_frames,
+                             bool *out_has_anim_ext)
 {
     if (size < 14) {
         return false;
@@ -471,7 +469,8 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
 
     dec->canvas_w = read_le16(data + 6);
     dec->canvas_h = read_le16(data + 8);
-    if (dec->canvas_w == 0 || dec->canvas_h == 0 || dec->canvas_w > 16384 || dec->canvas_h > 16384) {
+    if (dec->canvas_w == 0 || dec->canvas_h == 0 || dec->canvas_w > 16384 ||
+        dec->canvas_h > 16384) {
         return false;
     }
 
@@ -599,8 +598,8 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
     return dec->canvas != NULL && dec->prev_canvas != NULL;
 }
 
-static bool step_gif_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba,
-                           uint32_t *out_w, uint32_t *out_h, uint32_t *out_delay_ms)
+static bool step_gif_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba, uint32_t *out_w,
+                           uint32_t *out_h, uint32_t *out_delay_ms)
 {
     if (dec->current_frame >= dec->frame_count) {
         waywal_anim_reset(dec);
@@ -786,21 +785,18 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
         .bitcnt = 0,
     };
 
-    static const uint16_t len_base[29] = {
-        3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
-        31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
-    static const uint8_t len_extra[29] = {
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
-        2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static const uint16_t len_base[29] = {3,  4,  5,  6,   7,   8,   9,   10,  11, 13,
+                                          15, 17, 19, 23,  27,  31,  35,  43,  51, 59,
+                                          67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static const uint8_t len_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
+                                          2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
     static const uint16_t dist_base[30] = {
-        1,    2,    3,    4,    5,    7,    9,    13,    17,    25,
-        33,   49,   65,   97,   129,  193,  257,  385,   513,   769,
-        1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
-    static const uint8_t dist_extra[30] = {
-        0, 0, 0,  0,  1,  1,  2,  2,  3,  3,  4,  4,  5,  5,  6,
-        6, 7, 7,  8,  8,  9,  9, 10, 10, 11, 11, 12, 12, 13, 13};
-    static const uint8_t clen_order[19] = {
-        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+        1,   2,   3,   4,   5,   7,    9,    13,   17,   25,   33,   49,   65,    97,    129,
+        193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+    static const uint8_t dist_extra[30] = {0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
+                                           6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+    static const uint8_t clen_order[19] = {16, 17, 18, 0, 8,  7, 9,  6, 10, 5,
+                                           11, 4,  12, 3, 13, 2, 14, 1, 15};
 
     size_t out_pos = 0;
     uint32_t bfinal = 0;
@@ -833,11 +829,16 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
             uint8_t lengths[320];
 
             if (btype == 1) {
-                for (int i = 0; i < 144; ++i) lengths[i] = 8;
-                for (int i = 144; i < 256; ++i) lengths[i] = 9;
-                for (int i = 256; i < 280; ++i) lengths[i] = 7;
-                for (int i = 280; i < 288; ++i) lengths[i] = 8;
-                for (int i = 0; i < 32; ++i) lengths[288 + i] = 5;
+                for (int i = 0; i < 144; ++i)
+                    lengths[i] = 8;
+                for (int i = 144; i < 256; ++i)
+                    lengths[i] = 9;
+                for (int i = 256; i < 280; ++i)
+                    lengths[i] = 7;
+                for (int i = 280; i < 288; ++i)
+                    lengths[i] = 8;
+                for (int i = 0; i < 32; ++i)
+                    lengths[288 + i] = 5;
                 huff_build(&litlen_tab, lengths, 288);
                 huff_build(&dist_tab, lengths + 288, 32);
             } else {
@@ -1025,8 +1026,8 @@ static bool init_apng_decoder(waywal_anim_decoder_t *dec)
             }
             if (dec->frame_count >= cap) {
                 uint32_t new_cap = cap * 2u;
-                apng_frame_t *nf =
-                    (apng_frame_t *)realloc(dec->apng_frames, (size_t)new_cap * sizeof(apng_frame_t));
+                apng_frame_t *nf = (apng_frame_t *)realloc(dec->apng_frames,
+                                                           (size_t)new_cap * sizeof(apng_frame_t));
                 if (!nf) {
                     return false;
                 }
@@ -1107,8 +1108,8 @@ static uint32_t png_bytes_per_pixel(uint8_t color_type)
     }
 }
 
-static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba,
-                            uint32_t *out_w, uint32_t *out_h, uint32_t *out_delay_ms)
+static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba, uint32_t *out_w,
+                            uint32_t *out_h, uint32_t *out_delay_ms)
 {
     if (dec->current_frame >= dec->frame_count) {
         waywal_anim_reset(dec);
@@ -1331,8 +1332,8 @@ static bool init_webp_decoder(waywal_anim_decoder_t *dec)
     return true;
 }
 
-static bool step_webp_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba,
-                            uint32_t *out_w, uint32_t *out_h, uint32_t *out_delay_ms)
+static bool step_webp_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba, uint32_t *out_w,
+                            uint32_t *out_h, uint32_t *out_delay_ms)
 {
     if (!dec->webp_dec) {
         return false;
@@ -1415,8 +1416,8 @@ waywal_anim_decoder_t *waywal_anim_create(const uint8_t *data, size_t size)
     return dec;
 }
 
-bool waywal_anim_next_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba,
-                            uint32_t *out_w, uint32_t *out_h, uint32_t *out_delay_ms)
+bool waywal_anim_next_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba, uint32_t *out_w,
+                            uint32_t *out_h, uint32_t *out_delay_ms)
 {
     if (!dec) {
         return false;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
 
@@ -12,7 +13,8 @@
 #define __has_feature(x) 0
 #endif
 #if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
-__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void)
 {
     return "leak:<unknown module>\nleak:gbm_create_device\nleak:libgbm\n";
 }
@@ -101,11 +103,11 @@ int main(void)
 {
     waywal_log_set_level(WAYWAL_LOG_LEVEL_WARN);
     printf("=========================================\n");
-    printf("  Executing WayWal Phase 2 Test Suite\n");
+    printf("  Executing WayWal DMA-BUF Subsystem Test Suite\n");
     printf("=========================================\n");
 
     test_dmabuf_context_and_bo();
 
-    printf("\n>>> ALL PHASE 2 UNIT TESTS PASSED SUCCESSFULLY! <<<\n\n");
+    printf("\n>>> ALL DMA-BUF UNIT TESTS PASSED SUCCESSFULLY! <<<\n\n");
     return 0;
 }

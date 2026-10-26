@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "e2e_common.h"
 
 void run_tier1_feature_coverage(void)
@@ -57,8 +58,7 @@ void run_tier1_feature_coverage(void)
                   "execution=%d canary=%d valid_argb=%d", ok1, canary_ok1, valid_argb1);
 
         /* Test 2: Angle variation configuration */
-        snprintf(test_name, sizeof(test_name), "T1_%02zu_%s_angle_sweep", i * 5 + 2,
-                 effect->name);
+        snprintf(test_name, sizeof(test_name), "T1_%02zu_%s_angle_sweep", i * 5 + 2, effect->name);
         memset(dst, 0, standard_pixels * sizeof(uint32_t));
         waywal_transition_params_t p2 = {
             .type = effect->type,
@@ -133,9 +133,8 @@ void run_tier1_feature_coverage(void)
             .center_y = 0.20f,
             .bezier = BEZIER_EASE_OUT,
         };
-        bool ok5 = render_engine_execute_cpu_transition(dst_aniso, src_a_aniso, src_b_aniso,
-                                                        aniso_w, aniso_h,
-                                                        aniso_w * sizeof(uint32_t), &p5);
+        bool ok5 = render_engine_execute_cpu_transition(
+            dst_aniso, src_a_aniso, src_b_aniso, aniso_w, aniso_h, aniso_w * sizeof(uint32_t), &p5);
         bool canary_ok5 = e2e_canary_check(dst_aniso, aniso_pixels);
         bool valid_argb5 = e2e_is_valid_argb_buffer(dst_aniso, aniso_w, aniso_h, aniso_w);
         E2E_CHECK(ok5 && canary_ok5 && valid_argb5, test_name,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_POWER_GOVERNOR_H
 #define WAYWAL_POWER_GOVERNOR_H
 
@@ -12,21 +13,21 @@ extern "C" {
 #define WAYWAL_MAX_GOVERNED_OUTPUTS 16
 
 typedef enum {
-    WAYWAL_PAUSE_NONE                = 0,
-    WAYWAL_PAUSE_DPMS_OR_UNMAPPED    = (1u << 0),
+    WAYWAL_PAUSE_NONE = 0,
+    WAYWAL_PAUSE_DPMS_OR_UNMAPPED = (1u << 0),
     WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN = (1u << 1),
-    WAYWAL_PAUSE_TOPLEVEL_MAXIMIZED  = (1u << 2),
-    WAYWAL_PAUSE_WORKSPACE_OCCLUDED  = (1u << 3),
-    WAYWAL_PAUSE_SESSION_IDLE        = (1u << 4),
-    WAYWAL_PAUSE_BATTERY_SAVER       = (1u << 5),
-    WAYWAL_PAUSE_USER_MANUAL         = (1u << 6),
+    WAYWAL_PAUSE_TOPLEVEL_MAXIMIZED = (1u << 2),
+    WAYWAL_PAUSE_WORKSPACE_OCCLUDED = (1u << 3),
+    WAYWAL_PAUSE_SESSION_IDLE = (1u << 4),
+    WAYWAL_PAUSE_BATTERY_SAVER = (1u << 5),
+    WAYWAL_PAUSE_USER_MANUAL = (1u << 6),
 } waywal_pause_reason_t;
 
 #ifndef WAYWAL_BATTERY_POLICY_DEFINED
 #define WAYWAL_BATTERY_POLICY_DEFINED
 typedef enum : uint32_t {
-    WAYWAL_BATTERY_IGNORE      = 0,
-    WAYWAL_BATTERY_REDUCE_FPS  = 1,
+    WAYWAL_BATTERY_IGNORE = 0,
+    WAYWAL_BATTERY_REDUCE_FPS = 1,
     WAYWAL_BATTERY_PAUSE_VIDEO = 2,
 } waywal_battery_policy_t;
 #endif

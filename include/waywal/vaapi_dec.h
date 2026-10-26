@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_VAAPI_DEC_H
 #define WAYWAL_VAAPI_DEC_H
 
@@ -14,7 +15,7 @@ extern "C" {
 #endif
 
 #define WAYWAL_VA_SURFACE_POOL_SIZE 20
-#define WAYWAL_VA_VPP_POOL_SIZE 3
+#define WAYWAL_VA_VPP_POOL_SIZE     3
 
 typedef struct {
     VASurfaceID surface;
@@ -258,7 +259,8 @@ typedef struct {
     bool has_vpp;
     bool vpp_warmed_up;
     bool initialized;
-    const bool *surface_busy_mask; /* External compositor in-use flags (WAYWAL_VA_SURFACE_POOL_SIZE) */
+    const bool
+        *surface_busy_mask; /* External compositor in-use flags (WAYWAL_VA_SURFACE_POOL_SIZE) */
 } vaapi_decoder_t;
 
 /* Exported PRIME 2 DMA-BUF representation */

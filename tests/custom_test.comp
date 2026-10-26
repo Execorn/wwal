@@ -1,4 +1,5 @@
 #version 310 es
+// SPDX-License-Identifier: GPL-3.0-or-later
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;

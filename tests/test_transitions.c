@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/daemon/gpu_compute.h"
 #include "../src/daemon/simd/simd_blend.h"
 #include "waywal/bezier.h"
@@ -18,7 +19,8 @@
 #define __has_feature(x) 0
 #endif
 #if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
-__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void)
 {
     return "leak:<unknown "
            "module>\nleak:gbm_create_device\nleak:libgbm\nleak:libEGL\nleak:libGLESv2\nleak:"
@@ -383,7 +385,7 @@ int main(void)
 {
     waywal_log_set_level(WAYWAL_LOG_LEVEL_WARN);
     printf("=========================================\n");
-    printf("  Executing WayWal Phase 3 Test Suite\n");
+    printf("  Executing WayWal Transitions Test Suite\n");
     printf("=========================================\n");
 
     test_bezier_accuracy_and_bench();
@@ -392,6 +394,6 @@ int main(void)
     test_gpu_compute_transitions();
     test_gpu_compute_nonlinear_and_upload_static();
 
-    printf("\n>>> ALL PHASE 3 UNIT TESTS PASSED SUCCESSFULLY! <<<\n\n");
+    printf("\n>>> ALL TRANSITIONS UNIT TESTS PASSED SUCCESSFULLY! <<<\n\n");
     return 0;
 }

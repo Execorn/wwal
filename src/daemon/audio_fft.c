@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include "waywal/audio_fft.h"
+
 #include "waywal/log.h"
 
 #include <dlfcn.h>
@@ -150,7 +152,8 @@ static void init_fft_tables(waywal_audio_fft_t *fft)
 {
     for (uint32_t n = 0; n < WAYWAL_AUDIO_FFT_SIZE; ++n) {
         fft->hann_window[n] =
-            0.5f * (1.0f - cosf((2.0f * (float)M_PI * (float)n) / (float)(WAYWAL_AUDIO_FFT_SIZE - 1u)));
+            0.5f *
+            (1.0f - cosf((2.0f * (float)M_PI * (float)n) / (float)(WAYWAL_AUDIO_FFT_SIZE - 1u)));
     }
 
     for (uint32_t i = 0; i < COMPLEX_FFT_N; ++i) {
@@ -451,10 +454,9 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
                 fn_pw_init(NULL, NULL);
                 fft->pw_loop = fn_pw_thread_loop_new("waywal-audio-fft", NULL);
                 if (fft->pw_loop) {
-                    void *props =
-                        fn_pw_properties_new("media.type", "Audio", "media.category", "Capture",
-                                             "media.role", "Music", "stream.capture.sink", "true",
-                                             NULL);
+                    void *props = fn_pw_properties_new("media.type", "Audio", "media.category",
+                                                       "Capture", "media.role", "Music",
+                                                       "stream.capture.sink", "true", NULL);
                     fft->pw_events.version = 2u;
                     fft->pw_events.process = on_pw_process;
                     fft->pw_stream = fn_pw_stream_new_simple(
@@ -494,7 +496,8 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
                                                .pad = 0u},
                         };
                         const struct spa_pod *params[1] = {&fmt_pod.pod};
-                        int flags = (1 << 0) | (1 << 2) | (1 << 4); /* AUTOCONNECT | MAP_BUFFERS | RT_PROCESS */
+                        int flags = (1 << 0) | (1 << 2) |
+                                    (1 << 4); /* AUTOCONNECT | MAP_BUFFERS | RT_PROCESS */
                         if (fn_pw_stream_connect(fft->pw_stream, 0 /* PW_DIRECTION_INPUT */,
                                                  0xFFFFFFFFu /* PW_ID_ANY */, flags, params,
                                                  1u) >= 0) {
@@ -653,8 +656,8 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
         __m256 xr = _mm256_add_ps(er, _mm256_fmsub_ps(wr, or_v, _mm256_mul_ps(wi, oi_v)));
         __m256 xi = _mm256_add_ps(ei, _mm256_fmadd_ps(wr, oi_v, _mm256_mul_ps(wi, or_v)));
 
-        __m256 mag = _mm256_mul_ps(
-            _mm256_sqrt_ps(_mm256_fmadd_ps(xr, xr, _mm256_mul_ps(xi, xi))), v_norm);
+        __m256 mag =
+            _mm256_mul_ps(_mm256_sqrt_ps(_mm256_fmadd_ps(xr, xr, _mm256_mul_ps(xi, xi))), v_norm);
         _mm256_storeu_ps(fft->current_frame.linear_bins + k, mag);
     }
 #endif

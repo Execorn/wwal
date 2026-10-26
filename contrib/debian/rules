@@ -1,4 +1,5 @@
 #!/usr/bin/make -f
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
@@ -13,12 +14,5 @@ override_dh_auto_configure:
 		-Denable_seccomp=true \
 		-Denable_systemd=true
 
-override_dh_auto_install:
-	dh_auto_install
-	install -D -m 0644 contrib/systemd/wwald.socket debian/wwal/usr/lib/systemd/user/wwald.socket
-	install -D -m 0644 docs/man/wwal.1 debian/wwal/usr/share/man/man1/wwal.1
-	install -D -m 0644 docs/man/wwald.1 debian/wwal/usr/share/man/man1/wwald.1
-	install -D -m 0644 docs/man/wwal-config.5 debian/wwal/usr/share/man/man5/wwal-config.5
-
 override_dh_auto_test:
-	meson test -C obj-$(DEB_HOST_GNU_TYPE) phase1
+	meson test -C obj-$(DEB_HOST_GNU_TYPE) core
