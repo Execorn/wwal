@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_VIDEO_DECODER_H
 #define WAYWAL_VIDEO_DECODER_H
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "e2e_common.h"
 
 void run_tier2_boundary_corner(void)
@@ -41,8 +42,8 @@ void run_tier2_boundary_corner(void)
                                                         width * sizeof(uint32_t), &p0);
         bool match_a = (memcmp(dst, src_a, buf_bytes) == 0);
         bool canary_ok0 = e2e_canary_check(dst, num_pixels);
-        E2E_CHECK(ok0 && match_a && canary_ok0, test_name,
-                  "execution=%d bit_exact_a=%d canary=%d", ok0, match_a, canary_ok0);
+        E2E_CHECK(ok0 && match_a && canary_ok0, test_name, "execution=%d bit_exact_a=%d canary=%d",
+                  ok0, match_a, canary_ok0);
 
         /* Test 2: Bit-exact convergence at progress = 1.0f */
         snprintf(test_name, sizeof(test_name), "T2_%02zu_%s_p1_bit_exact", i * 5 + 2, effect->name);
@@ -61,8 +62,8 @@ void run_tier2_boundary_corner(void)
                                                         width * sizeof(uint32_t), &p1);
         bool match_b = (memcmp(dst, src_b, buf_bytes) == 0);
         bool canary_ok1 = e2e_canary_check(dst, num_pixels);
-        E2E_CHECK(ok1 && match_b && canary_ok1, test_name,
-                  "execution=%d bit_exact_b=%d canary=%d", ok1, match_b, canary_ok1);
+        E2E_CHECK(ok1 && match_b && canary_ok1, test_name, "execution=%d bit_exact_b=%d canary=%d",
+                  ok1, match_b, canary_ok1);
 
         /* Test 3: Convergence at progress = 0.9999f (Threshold bit-exact / Continuous converged) */
         snprintf(test_name, sizeof(test_name), "T2_%02zu_%s_p09999_convergence", i * 5 + 3,
@@ -86,7 +87,8 @@ void run_tier2_boundary_corner(void)
             /* Procedural threshold effects (noise, burn, wipe, wave) MUST match src_b bit-exact */
             conv_pass = (memcmp(dst, src_b, buf_bytes) == 0);
         } else {
-            /* Continuous blend/warp effects: valid ARGB output and majority transitioned away from src_a */
+            /* Continuous blend/warp effects: valid ARGB output and majority transitioned away from
+             * src_a */
             bool valid_argb = e2e_is_valid_argb_buffer(dst, width, height, width);
             size_t diff_a = e2e_count_diff_pixels(dst, src_a, width, height, width);
             conv_pass = valid_argb && (diff_a >= (num_pixels * 50 / 100));
@@ -115,7 +117,8 @@ void run_tier2_boundary_corner(void)
         size_t diff_a = e2e_count_diff_pixels(dst, src_a, width, height, width);
         size_t diff_b = e2e_count_diff_pixels(dst, src_b, width, height, width);
         /* Non-trivial blend implies significant difference from both solid sources */
-        bool nontrivial = (diff_a >= (num_pixels * 15 / 100)) && (diff_b >= (num_pixels * 15 / 100));
+        bool nontrivial =
+            (diff_a >= (num_pixels * 15 / 100)) && (diff_b >= (num_pixels * 15 / 100));
         E2E_CHECK(ok_mid && canary_ok_mid && nontrivial, test_name,
                   "execution=%d diff_a=%zu diff_b=%zu (min=%zu) canary=%d", ok_mid, diff_a, diff_b,
                   (num_pixels * 15 / 100), canary_ok_mid);

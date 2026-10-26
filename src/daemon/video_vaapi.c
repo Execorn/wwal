@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/log.h"
 #include "waywal/vaapi_dec.h"
 #include "waywal/video_decoder.h"
@@ -27,8 +28,7 @@ static void evict_cold_driver_pages(void)
         return;
     char line[512];
     while (fgets(line, sizeof(line), maps)) {
-        if (!strstr(line, "libnvidia-gpucomp.so") &&
-            !strstr(line, "libnvidia-ptxjitcompiler.so"))
+        if (!strstr(line, "libnvidia-gpucomp.so") && !strstr(line, "libnvidia-ptxjitcompiler.so"))
             continue;
         unsigned long start = 0, end = 0;
         char perms[8] = {0};
@@ -213,10 +213,9 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
         dec->va_display = dpy;
         dec->va_profile = prof;
         const char *vendor = vaQueryVendorString(dec->va_display);
-        dec->is_nvidia_vaapi = vendor && (strstr(vendor, "nvidia") != NULL ||
-                                          strstr(vendor, "NVIDIA") != NULL ||
-                                          strstr(vendor, "NVDEC") != NULL ||
-                                          strstr(vendor, "vdpau") != NULL);
+        dec->is_nvidia_vaapi =
+            vendor && (strstr(vendor, "nvidia") != NULL || strstr(vendor, "NVIDIA") != NULL ||
+                       strstr(vendor, "NVDEC") != NULL || strstr(vendor, "vdpau") != NULL);
         if (dec->is_nvidia_vaapi && drm_render_fd >= 0) {
             allow_direct_nv12 = false;
         }
@@ -354,9 +353,9 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
                 if (vpp_st == VA_STATUS_SUCCESS) {
                     dec->has_vpp = true;
                     dec->num_vpp_surfaces = vpp_pool;
-                    WAYWAL_LOG_INFO(
-                        "VA-API VPP active (NV12 -> BGRX, %u decode surfaces + %u VPP surfaces @ %ux%u)",
-                        dec->num_surfaces, dec->num_vpp_surfaces, width, height);
+                    WAYWAL_LOG_INFO("VA-API VPP active (NV12 -> BGRX, %u decode surfaces + %u VPP "
+                                    "surfaces @ %ux%u)",
+                                    dec->num_surfaces, dec->num_vpp_surfaces, width, height);
                 } else {
                     vaDestroySurfaces(dec->va_display, dec->vpp_surfaces, vpp_pool);
                     vaDestroyConfig(dec->va_display, dec->vpp_config);
@@ -368,10 +367,10 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
             }
         }
     } else {
-        WAYWAL_LOG_INFO(
-            "VA-API direct %s DMA-BUF export active (%u surfaces @ %ux%u, max_refs=%u, VPP bypassed)",
-            dec->fourcc == VA_FOURCC_P010 ? "P010" : "NV12", dec->num_surfaces, width, height,
-            max_refs);
+        WAYWAL_LOG_INFO("VA-API direct %s DMA-BUF export active (%u surfaces @ %ux%u, max_refs=%u, "
+                        "VPP bypassed)",
+                        dec->fourcc == VA_FOURCC_P010 ? "P010" : "NV12", dec->num_surfaces, width,
+                        height, max_refs);
     }
 
     /* Evict cold executable text pages of the PTX shader compiler mapped during driver init */
@@ -384,7 +383,8 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
 
 void vaapi_decoder_reset(vaapi_decoder_t *dec)
 {
-    if (!dec) return;
+    if (!dec)
+        return;
     dec->frame_num = 0;
     dec->prev_poc_msb = 0;
     dec->prev_poc_lsb = 0;
@@ -414,8 +414,7 @@ void vaapi_decoder_destroy(vaapi_decoder_t *dec)
         return;
 
     uint32_t pool_size = dec->num_surfaces > 0 ? dec->num_surfaces : WAYWAL_VA_SURFACE_POOL_SIZE;
-    uint32_t vpp_pool =
-        dec->num_vpp_surfaces > 0 ? dec->num_vpp_surfaces : WAYWAL_VA_VPP_POOL_SIZE;
+    uint32_t vpp_pool = dec->num_vpp_surfaces > 0 ? dec->num_vpp_surfaces : WAYWAL_VA_VPP_POOL_SIZE;
 
     if (dec->va_display) {
         for (uint32_t i = 0; i < pool_size; ++i) {
@@ -518,10 +517,7 @@ static inline void bit_reader_init(bit_reader_t *br, const uint8_t *data, size_t
     bit_reader_init_rbsp(br, data, size);
 }
 
-static inline bool more_rbsp_data(const bit_reader_t *br)
-{
-    return br->bit_pos < br->end_bit_pos;
-}
+static inline bool more_rbsp_data(const bit_reader_t *br) { return br->bit_pos < br->end_bit_pos; }
 
 static inline uint32_t read_bit(bit_reader_t *br)
 {
@@ -561,7 +557,8 @@ static inline uint32_t read_ue(bit_reader_t *br)
 static inline int32_t read_se(bit_reader_t *br)
 {
     uint32_t ue = read_ue(br);
-    if (ue == 0xFFFFFFFFU) return 0;
+    if (ue == 0xFFFFFFFFU)
+        return 0;
     if (ue % 2 == 1) {
         return (int32_t)((ue + 1) / 2);
     } else {
@@ -574,7 +571,8 @@ static size_t unescape_rbsp(const uint8_t *src, size_t src_len, uint8_t *dst, si
     size_t si = 0, di = 0;
     while (si < src_len && di < dst_len) {
         if (si + 2 < src_len && src[si] == 0 && src[si + 1] == 0 && src[si + 2] == 3) {
-            if (di + 2 > dst_len) break;
+            if (di + 2 > dst_len)
+                break;
             dst[di++] = 0;
             dst[di++] = 0;
             si += 3;
@@ -608,24 +606,18 @@ static size_t rbsp_bit_offset_to_ebsp_bits(const uint8_t *ebsp, size_t ebsp_len,
 }
 
 /* ITU-T H.264 Table 7-3 and Table 7-4 default scaling lists */
-static const uint8_t g_default_4x4_intra[16] = {
-    6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42
-};
-static const uint8_t g_default_4x4_inter[16] = {
-    10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34
-};
+static const uint8_t g_default_4x4_intra[16] = {6,  13, 13, 20, 20, 20, 28, 28,
+                                                28, 28, 32, 32, 32, 37, 37, 42};
+static const uint8_t g_default_4x4_inter[16] = {10, 14, 14, 20, 20, 20, 24, 24,
+                                                24, 24, 27, 27, 27, 30, 30, 34};
 static const uint8_t g_default_8x8_intra[64] = {
-     6, 10, 10, 13, 11, 13, 16, 16, 16, 16, 18, 18, 18, 18, 18, 23,
-    23, 23, 23, 23, 23, 25, 25, 25, 25, 25, 25, 25, 27, 27, 27, 27,
-    27, 27, 27, 27, 29, 29, 29, 29, 29, 29, 29, 31, 31, 31, 31, 31,
-    31, 33, 33, 33, 33, 33, 36, 36, 36, 36, 38, 38, 38, 40, 40, 42
-};
+    6,  10, 10, 13, 11, 13, 16, 16, 16, 16, 18, 18, 18, 18, 18, 23, 23, 23, 23, 23, 23, 25,
+    25, 25, 25, 25, 25, 25, 27, 27, 27, 27, 27, 27, 27, 27, 29, 29, 29, 29, 29, 29, 29, 31,
+    31, 31, 31, 31, 31, 33, 33, 33, 33, 33, 36, 36, 36, 36, 38, 38, 38, 40, 40, 42};
 static const uint8_t g_default_8x8_inter[64] = {
-     9, 13, 13, 15, 13, 15, 17, 17, 17, 17, 19, 19, 19, 19, 19, 21,
-    21, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 24, 24, 24, 24,
-    24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 27, 27, 27, 27, 27,
-    27, 28, 28, 28, 28, 28, 30, 30, 30, 30, 32, 32, 32, 33, 33, 35
-};
+    9,  13, 13, 15, 13, 15, 17, 17, 17, 17, 19, 19, 19, 19, 19, 21, 21, 21, 21, 21, 21, 22,
+    22, 22, 22, 22, 22, 22, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 27,
+    27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 30, 30, 30, 30, 32, 32, 32, 33, 33, 35};
 
 static void parse_h264_scaling_list(bit_reader_t *br, uint8_t *dst, uint32_t size,
                                     const uint8_t *default_list)
@@ -713,8 +705,9 @@ static bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps
             for (uint32_t i = 0; i < num_lists; ++i) {
                 uint8_t *dst = (i < 6) ? sps->scaling_list_4x4[i]
                                        : ((i < 8) ? sps->scaling_list_8x8[i - 6] : NULL);
-                const uint8_t *def = (i < 6) ? ((i < 3) ? g_default_4x4_intra : g_default_4x4_inter)
-                                             : ((i % 2 == 0) ? g_default_8x8_intra : g_default_8x8_inter);
+                const uint8_t *def =
+                    (i < 6) ? ((i < 3) ? g_default_4x4_intra : g_default_4x4_inter)
+                            : ((i % 2 == 0) ? g_default_8x8_intra : g_default_8x8_inter);
                 if (read_bit(&br)) {
                     parse_h264_scaling_list(&br, dst, (i < 6) ? 16 : 64, def);
                 } else if (i < 6) {
@@ -843,8 +836,9 @@ static bool parse_h264_pps(const uint8_t *nal, size_t nal_len, const parsed_sps_
             for (uint32_t i = 0; i < count; ++i) {
                 uint8_t *dst = (i < 6) ? pps->scaling_list_4x4[i]
                                        : ((i < 8) ? pps->scaling_list_8x8[i - 6] : NULL);
-                const uint8_t *def = (i < 6) ? ((i < 3) ? g_default_4x4_intra : g_default_4x4_inter)
-                                             : ((i % 2 == 0) ? g_default_8x8_intra : g_default_8x8_inter);
+                const uint8_t *def =
+                    (i < 6) ? ((i < 3) ? g_default_4x4_intra : g_default_4x4_inter)
+                            : ((i % 2 == 0) ? g_default_8x8_intra : g_default_8x8_inter);
                 if (read_bit(&br)) {
                     parse_h264_scaling_list(&br, dst, (i < 6) ? 16 : 64, def);
                 } else if (i < 6) {
@@ -876,9 +870,8 @@ typedef struct {
     int32_t unmark_pic_nums[16];
 } slice_header_meta_t;
 
-static bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len,
-                                    const parsed_sps_t *sps, const parsed_pps_t *pps,
-                                    VASliceParameterBufferH264 *sp,
+static bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sps_t *sps,
+                                    const parsed_pps_t *pps, VASliceParameterBufferH264 *sp,
                                     slice_header_meta_t *meta)
 {
     if (!nal || nal_len < 2 || !sps || !pps || !sp)
@@ -949,8 +942,10 @@ static bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len,
             sp->num_ref_idx_l0_active_minus1 = pps->num_ref_idx_l0_default_active_minus1;
             sp->num_ref_idx_l1_active_minus1 = pps->num_ref_idx_l1_default_active_minus1;
         }
-        if (sp->num_ref_idx_l0_active_minus1 > 31) sp->num_ref_idx_l0_active_minus1 = 31;
-        if (sp->num_ref_idx_l1_active_minus1 > 31) sp->num_ref_idx_l1_active_minus1 = 31;
+        if (sp->num_ref_idx_l0_active_minus1 > 31)
+            sp->num_ref_idx_l0_active_minus1 = 31;
+        if (sp->num_ref_idx_l1_active_minus1 > 31)
+            sp->num_ref_idx_l1_active_minus1 = 31;
     }
 
     /* ref_pic_list_modification() */
@@ -1025,7 +1020,8 @@ static bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len,
                         }
                     } else {
                         for (int j = 0; j < 2; ++j) {
-                            sp->chroma_weight_l1[i][j] = (int16_t)(1 << sp->chroma_log2_weight_denom);
+                            sp->chroma_weight_l1[i][j] =
+                                (int16_t)(1 << sp->chroma_log2_weight_denom);
                             sp->chroma_offset_l1[i][j] = 0;
                         }
                     }
@@ -1048,7 +1044,8 @@ static bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len,
                     if (mmco == 1 || mmco == 3) {
                         uint32_t diff_minus1 = read_ue(&br);
                         if (mmco == 1 && meta && meta->num_unmark < 16) {
-                            int32_t pn = ((int32_t)slice_fn - (int32_t)(diff_minus1 + 1)) & (max_fn - 1);
+                            int32_t pn =
+                                ((int32_t)slice_fn - (int32_t)(diff_minus1 + 1)) & (max_fn - 1);
                             meta->unmark_pic_nums[meta->num_unmark++] = pn;
                         }
                     }
@@ -1119,9 +1116,8 @@ static bool next_h264_nal(const uint8_t *data, size_t size, bool is_avcc, uint8_
 
     /* Annex-B start code or fallback 4-byte length */
     size_t off = *scan_off;
-    if (off + 4 <= size &&
-        !(data[off] == 0 && data[off + 1] == 0 &&
-          (data[off + 2] == 1 || (data[off + 2] == 0 && data[off + 3] == 1)))) {
+    if (off + 4 <= size && !(data[off] == 0 && data[off + 1] == 0 &&
+                             (data[off + 2] == 1 || (data[off + 2] == 0 && data[off + 3] == 1)))) {
         uint32_t len = ((uint32_t)data[off] << 24) | ((uint32_t)data[off + 1] << 16) |
                        ((uint32_t)data[off + 2] << 8) | (uint32_t)data[off + 3];
         if (len > 0 && off + 4 + len <= size) {
@@ -1145,8 +1141,8 @@ static bool next_h264_nal(const uint8_t *data, size_t size, bool is_avcc, uint8_
                 size_t next_sc = nal_start;
                 while (next_sc + 3 <= size) {
                     if (data[next_sc] == 0 && data[next_sc + 1] == 0 &&
-                        (data[next_sc + 2] == 1 ||
-                         (next_sc + 3 < size && data[next_sc + 2] == 0 && data[next_sc + 3] == 1))) {
+                        (data[next_sc + 2] == 1 || (next_sc + 3 < size && data[next_sc + 2] == 0 &&
+                                                    data[next_sc + 3] == 1))) {
                         break;
                     }
                     next_sc++;
@@ -1178,8 +1174,7 @@ static void fill_va_pic_h264(VAPictureH264 *vp, const h264_dpb_entry_t *e)
 }
 
 static void build_h264_ref_lists(const h264_dpb_t *dpb, uint8_t slice_type, int32_t curr_fn,
-                                 int32_t max_fn, int32_t curr_poc,
-                                 VASliceParameterBufferH264 *sp)
+                                 int32_t max_fn, int32_t curr_poc, VASliceParameterBufferH264 *sp)
 {
     for (int i = 0; i < 32; ++i) {
         sp->RefPicList0[i].picture_id = VA_INVALID_SURFACE;
@@ -1245,12 +1240,16 @@ static void build_h264_ref_lists(const h264_dpb_t *dpb, uint8_t slice_type, int3
         }
 
         size_t idx0 = 0;
-        for (size_t i = 0; i < n_before; ++i) fill_va_pic_h264(&sp->RefPicList0[idx0++], &before[i]);
-        for (size_t i = 0; i < n_after; ++i) fill_va_pic_h264(&sp->RefPicList0[idx0++], &after[i]);
+        for (size_t i = 0; i < n_before; ++i)
+            fill_va_pic_h264(&sp->RefPicList0[idx0++], &before[i]);
+        for (size_t i = 0; i < n_after; ++i)
+            fill_va_pic_h264(&sp->RefPicList0[idx0++], &after[i]);
 
         size_t idx1 = 0;
-        for (size_t i = 0; i < n_after; ++i) fill_va_pic_h264(&sp->RefPicList1[idx1++], &after[i]);
-        for (size_t i = 0; i < n_before; ++i) fill_va_pic_h264(&sp->RefPicList1[idx1++], &before[i]);
+        for (size_t i = 0; i < n_after; ++i)
+            fill_va_pic_h264(&sp->RefPicList1[idx1++], &after[i]);
+        for (size_t i = 0; i < n_before; ++i)
+            fill_va_pic_h264(&sp->RefPicList1[idx1++], &before[i]);
 
         if (idx1 > 1 && idx0 == idx1) {
             bool identical = true;
@@ -1344,8 +1343,7 @@ static void skip_hevc_scaling_list_data(bs_t *br)
 
 static void parse_hevc_st_ref_pic_set(bs_t *br, uint32_t st_rps_idx,
                                       uint32_t num_short_term_ref_pic_sets,
-                                      hevc_st_rps_t *rps_table, uint8_t *num_neg,
-                                      uint8_t *num_pos)
+                                      hevc_st_rps_t *rps_table, uint8_t *num_neg, uint8_t *num_pos)
 {
     if (!rps_table || st_rps_idx > 64)
         return;
@@ -1360,8 +1358,7 @@ static void parse_hevc_st_ref_pic_set(bs_t *br, uint32_t st_rps_idx,
         }
         uint32_t delta_rps_sign = read_bit(br);
         uint32_t abs_delta_rps_minus1 = read_ue(br);
-        int32_t delta_rps =
-            (1 - 2 * (int32_t)delta_rps_sign) * ((int32_t)abs_delta_rps_minus1 + 1);
+        int32_t delta_rps = (1 - 2 * (int32_t)delta_rps_sign) * ((int32_t)abs_delta_rps_minus1 + 1);
 
         uint32_t ref_idx =
             (st_rps_idx > delta_idx_minus1) ? (st_rps_idx - (delta_idx_minus1 + 1)) : 0;
@@ -1643,9 +1640,8 @@ static bool parse_hevc_pps(const uint8_t *nal, size_t nal_len, parsed_hevc_pps_t
     return true;
 }
 
-static void skip_hevc_pred_weight_table(bs_t *br, const parsed_hevc_sps_t *sps,
-                                        uint32_t slice_type, uint32_t num_ref_l0,
-                                        uint32_t num_ref_l1)
+static void skip_hevc_pred_weight_table(bs_t *br, const parsed_hevc_sps_t *sps, uint32_t slice_type,
+                                        uint32_t num_ref_l0, uint32_t num_ref_l1)
 {
     uint32_t chroma_array_type =
         (sps && !sps->separate_colour_plane_flag) ? sps->chroma_format_idc : 0;
@@ -1727,10 +1723,9 @@ static bool parse_hevc_slice_header(const uint8_t *nal, size_t nal_len,
         if (pps->dependent_slice_segments_enabled_flag) {
             dependent_slice = (read_bit(&br) != 0);
         }
-        uint32_t ctb_log2 =
-            (sps->valid ? (sps->log2_min_luma_coding_block_size_minus3 + 3 +
-                           sps->log2_diff_max_min_luma_coding_block_size)
-                        : 6);
+        uint32_t ctb_log2 = (sps->valid ? (sps->log2_min_luma_coding_block_size_minus3 + 3 +
+                                           sps->log2_diff_max_min_luma_coding_block_size)
+                                        : 6);
         if (ctb_log2 < 4)
             ctb_log2 = 4;
         if (ctb_log2 > 6)
@@ -1931,8 +1926,8 @@ static bool parse_hevc_slice_header(const uint8_t *nal, size_t nal_len,
             if (num_entry_point_offsets > 0) {
                 uint32_t offset_len_minus1 = read_ue(&br);
                 if (offset_len_minus1 < 32) {
-                    for (uint32_t i = 0;
-                         i < num_entry_point_offsets && br.bit_pos < br.end_bit_pos; ++i) {
+                    for (uint32_t i = 0; i < num_entry_point_offsets && br.bit_pos < br.end_bit_pos;
+                         ++i) {
                         read_bits(&br, offset_len_minus1 + 1);
                     }
                 }
@@ -2024,22 +2019,22 @@ static void build_hevc_ref_lists(const h264_dpb_t *dpb, uint8_t slice_type, int3
 }
 
 static const int16_t g_vp9_dc_qlookup[256] = {
-    4,    8,    8,    9,    10,   11,   12,   12,   13,   14,   15,   16,   17,   18,   19,   19,
-    20,   21,   22,   23,   24,   25,   26,   26,   27,   28,   29,   30,   31,   32,   32,   33,
-    34,   35,   36,   37,   38,   38,   39,   40,   41,   42,   43,   43,   44,   45,   46,   47,
-    48,   48,   49,   50,   51,   52,   53,   53,   54,   55,   56,   57,   57,   58,   59,   60,
-    61,   62,   62,   63,   64,   65,   66,   66,   67,   68,   69,   70,   70,   71,   72,   73,
-    74,   74,   75,   76,   77,   78,   78,   79,   80,   81,   81,   82,   83,   84,   85,   85,
-    87,   88,   90,   92,   93,   95,   96,   98,   99,   101,  102,  104,  105,  107,  108,  110,
-    111,  113,  114,  116,  117,  118,  120,  121,  123,  125,  127,  129,  131,  134,  136,  138,
-    140,  142,  144,  146,  148,  150,  152,  154,  156,  158,  161,  164,  166,  169,  172,  174,
-    177,  180,  182,  185,  187,  190,  192,  195,  199,  202,  205,  208,  211,  214,  217,  220,
-    223,  226,  230,  233,  237,  240,  243,  247,  250,  253,  257,  261,  265,  269,  272,  276,
-    280,  284,  288,  292,  296,  300,  304,  309,  313,  317,  322,  326,  330,  335,  340,  344,
-    349,  354,  359,  364,  369,  374,  379,  384,  389,  395,  400,  406,  411,  417,  423,  429,
-    435,  441,  447,  454,  461,  467,  475,  482,  489,  497,  505,  513,  522,  530,  539,  549,
-    559,  569,  579,  590,  602,  614,  626,  640,  654,  668,  684,  700,  717,  736,  755,  775,
-    796,  819,  843,  869,  896,  925,  955,  988,  1022, 1058, 1098, 1139, 1184, 1232, 1282, 1336,
+    4,   8,   8,   9,   10,  11,  12,  12,  13,   14,   15,   16,   17,   18,   19,   19,
+    20,  21,  22,  23,  24,  25,  26,  26,  27,   28,   29,   30,   31,   32,   32,   33,
+    34,  35,  36,  37,  38,  38,  39,  40,  41,   42,   43,   43,   44,   45,   46,   47,
+    48,  48,  49,  50,  51,  52,  53,  53,  54,   55,   56,   57,   57,   58,   59,   60,
+    61,  62,  62,  63,  64,  65,  66,  66,  67,   68,   69,   70,   70,   71,   72,   73,
+    74,  74,  75,  76,  77,  78,  78,  79,  80,   81,   81,   82,   83,   84,   85,   85,
+    87,  88,  90,  92,  93,  95,  96,  98,  99,   101,  102,  104,  105,  107,  108,  110,
+    111, 113, 114, 116, 117, 118, 120, 121, 123,  125,  127,  129,  131,  134,  136,  138,
+    140, 142, 144, 146, 148, 150, 152, 154, 156,  158,  161,  164,  166,  169,  172,  174,
+    177, 180, 182, 185, 187, 190, 192, 195, 199,  202,  205,  208,  211,  214,  217,  220,
+    223, 226, 230, 233, 237, 240, 243, 247, 250,  253,  257,  261,  265,  269,  272,  276,
+    280, 284, 288, 292, 296, 300, 304, 309, 313,  317,  322,  326,  330,  335,  340,  344,
+    349, 354, 359, 364, 369, 374, 379, 384, 389,  395,  400,  406,  411,  417,  423,  429,
+    435, 441, 447, 454, 461, 467, 475, 482, 489,  497,  505,  513,  522,  530,  539,  549,
+    559, 569, 579, 590, 602, 614, 626, 640, 654,  668,  684,  700,  717,  736,  755,  775,
+    796, 819, 843, 869, 896, 925, 955, 988, 1022, 1058, 1098, 1139, 1184, 1232, 1282, 1336,
 };
 
 static const int16_t g_vp9_ac_qlookup[256] = {
@@ -2607,8 +2602,7 @@ static void av1_read_global_param(bs_t *br, VAAV1TransformationType type, int id
     int32_t sub = (idx % 3) == 2 ? (1 << prec_bits) : 0;
     int32_t mx = 1 << abs_bits;
     int32_t r = (wm->wmmat[idx] >> prec_diff) - sub;
-    wm->wmmat[idx] =
-        (av1_decode_signed_subexp_with_ref(br, -mx, mx + 1, r) << prec_diff) + round;
+    wm->wmmat[idx] = (av1_decode_signed_subexp_with_ref(br, -mx, mx + 1, r) << prec_diff) + round;
 }
 
 static bool parse_av1_sequence_header(const uint8_t *payload, size_t len, parsed_av1_seq_t *seq)
@@ -2777,8 +2771,8 @@ static bool parse_av1_sequence_header(const uint8_t *payload, size_t len, parsed
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-static uint32_t parse_av1_tile_group_obu(const uint8_t *obu_data, size_t obu_size,
-                                         size_t tg_offset, uint32_t base_obu_offset,
+static uint32_t parse_av1_tile_group_obu(const uint8_t *obu_data, size_t obu_size, size_t tg_offset,
+                                         uint32_t base_obu_offset,
                                          const VADecPictureParameterBufferAV1 *pic_param,
                                          uint8_t tile_size_bytes_minus_1,
                                          VASliceParameterBufferAV1 *out_slices, uint32_t max_slices)
@@ -2893,9 +2887,9 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
     }
 
     uint32_t disable_cdf_update = read_bit(&br);
-    uint32_t allow_screen_content_tools =
-        (seq->seq_force_screen_content_tools == 2) ? read_bit(&br)
-                                                   : seq->seq_force_screen_content_tools;
+    uint32_t allow_screen_content_tools = (seq->seq_force_screen_content_tools == 2)
+                                              ? read_bit(&br)
+                                              : seq->seq_force_screen_content_tools;
     uint32_t force_integer_mv = (frame_type == 0 || frame_type == 2) ? 1 : 0;
     if (allow_screen_content_tools) {
         force_integer_mv =
@@ -2903,17 +2897,16 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
     }
 
     if (seq->frame_id_numbers_present_flag) {
-        uint32_t id_len =
-            (uint32_t)seq->delta_frame_id_length_minus_2 + 2 +
-            (uint32_t)seq->additional_frame_id_length_minus_1 + 1;
+        uint32_t id_len = (uint32_t)seq->delta_frame_id_length_minus_2 + 2 +
+                          (uint32_t)seq->additional_frame_id_length_minus_1 + 1;
         read_bits(&br, id_len);
     }
 
     uint32_t frame_size_override =
         (frame_type == 3) ? 1 : (seq->reduced_still_picture_header ? 0 : read_bit(&br));
-    uint8_t order_hint =
-        seq->enable_order_hint ? (uint8_t)read_bits(&br, (uint32_t)seq->order_hint_bits_minus_1 + 1)
-                               : 0;
+    uint8_t order_hint = seq->enable_order_hint
+                             ? (uint8_t)read_bits(&br, (uint32_t)seq->order_hint_bits_minus_1 + 1)
+                             : 0;
     uint8_t primary_ref_frame =
         (frame_type == 0 || frame_type == 2 || error_resilient) ? 7 : (uint8_t)read_bits(&br, 3);
 
@@ -2924,10 +2917,8 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
         refresh_frame_flags = (uint8_t)read_bits(&br, 8);
     }
 
-    uint16_t width_m1 =
-        seq->valid ? seq->max_frame_width_minus_1 : (uint16_t)(dec->width - 1);
-    uint16_t height_m1 =
-        seq->valid ? seq->max_frame_height_minus_1 : (uint16_t)(dec->height - 1);
+    uint16_t width_m1 = seq->valid ? seq->max_frame_width_minus_1 : (uint16_t)(dec->width - 1);
+    uint16_t height_m1 = seq->valid ? seq->max_frame_height_minus_1 : (uint16_t)(dec->height - 1);
     uint32_t allow_intrabc = 0;
     uint32_t use_superres = 0;
     uint8_t superres_denom = 8;
@@ -3071,8 +3062,8 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
         uint32_t start_sb = 0;
         uint32_t i = 0;
         while (start_sb < sb_cols && i < 64) {
-            uint32_t max_w = (sb_cols - start_sb) < max_tile_width_sb ? (sb_cols - start_sb)
-                                                                      : max_tile_width_sb;
+            uint32_t max_w =
+                (sb_cols - start_sb) < max_tile_width_sb ? (sb_cols - start_sb) : max_tile_width_sb;
             uint32_t size_sb = av1_read_ns(&br, max_w) + 1;
             if (size_sb > widest_tile_sb)
                 widest_tile_sb = size_sb;
@@ -3175,7 +3166,8 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
                         if (seg_feature_bits[j] > 0) {
                             if (seg_feature_signed[j]) {
                                 val = (int16_t)av1_read_su(&br, (uint32_t)seg_feature_bits[j] + 1U);
-                                val = (int16_t)clamp_i32(val, -seg_feature_max[j], seg_feature_max[j]);
+                                val = (int16_t)clamp_i32(val, -seg_feature_max[j],
+                                                         seg_feature_max[j]);
                             } else {
                                 val = (int16_t)read_bits(&br, seg_feature_bits[j]);
                                 val = (int16_t)clamp_i32(val, 0, seg_feature_max[j]);
@@ -3269,8 +3261,7 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
         }
         pic_param->loop_filter_info_fields.bits.mode_ref_delta_enabled =
             lf_ref_delta_enabled ? 1 : 0;
-        pic_param->loop_filter_info_fields.bits.mode_ref_delta_update =
-            lf_ref_delta_update ? 1 : 0;
+        pic_param->loop_filter_info_fields.bits.mode_ref_delta_update = lf_ref_delta_update ? 1 : 0;
     }
 
     /* 4. cdef_params() (AV1 Spec 5.9.19) */
@@ -3410,8 +3401,8 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
                 if (read_bit(&br)) {
                     type = VAAV1TransformationRotzoom;
                 } else {
-                    type = read_bit(&br) ? VAAV1TransformationTranslation
-                                         : VAAV1TransformationAffine;
+                    type =
+                        read_bit(&br) ? VAAV1TransformationTranslation : VAAV1TransformationAffine;
                 }
             }
             pic_param->wm[ref].wmtype = type;
@@ -3465,16 +3456,14 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
                         num_cb_points = 10;
                     for (uint8_t i = 0; i < num_cb_points; ++i) {
                         pic_param->film_grain_info.point_cb_value[i] = (uint8_t)read_bits(&br, 8);
-                        pic_param->film_grain_info.point_cb_scaling[i] =
-                            (uint8_t)read_bits(&br, 8);
+                        pic_param->film_grain_info.point_cb_scaling[i] = (uint8_t)read_bits(&br, 8);
                     }
                     num_cr_points = (uint8_t)read_bits(&br, 4);
                     if (num_cr_points > 10)
                         num_cr_points = 10;
                     for (uint8_t i = 0; i < num_cr_points; ++i) {
                         pic_param->film_grain_info.point_cr_value[i] = (uint8_t)read_bits(&br, 8);
-                        pic_param->film_grain_info.point_cr_scaling[i] =
-                            (uint8_t)read_bits(&br, 8);
+                        pic_param->film_grain_info.point_cr_scaling[i] = (uint8_t)read_bits(&br, 8);
                     }
                 }
                 pic_param->film_grain_info.num_cb_points = num_cb_points;
@@ -3537,8 +3526,7 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
         seq->enable_intra_edge_filter ? 1 : 0;
     pic_param->seq_info_fields.fields.enable_interintra_compound =
         seq->enable_interintra_compound ? 1 : 0;
-    pic_param->seq_info_fields.fields.enable_masked_compound =
-        seq->enable_masked_compound ? 1 : 0;
+    pic_param->seq_info_fields.fields.enable_masked_compound = seq->enable_masked_compound ? 1 : 0;
     pic_param->seq_info_fields.fields.enable_dual_filter = seq->enable_dual_filter ? 1 : 0;
     pic_param->seq_info_fields.fields.enable_order_hint = seq->enable_order_hint ? 1 : 0;
     pic_param->seq_info_fields.fields.enable_jnt_comp = seq->enable_jnt_comp ? 1 : 0;
@@ -3841,10 +3829,11 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         pic_param.CurrPic.flags = is_ref_pic ? VA_PICTURE_H264_SHORT_TERM_REFERENCE : 0;
         pic_param.CurrPic.TopFieldOrderCnt = curr_poc;
         pic_param.CurrPic.BottomFieldOrderCnt = curr_poc;
-        pic_param.picture_width_in_mbs_minus1 =
-            sps.valid ? (uint16_t)sps.pic_width_in_mbs_minus1 : (uint16_t)((dec->width + 15) / 16 - 1);
-        pic_param.picture_height_in_mbs_minus1 =
-            sps.valid ? (uint16_t)sps.pic_height_in_map_units_minus1 : (uint16_t)((dec->height + 15) / 16 - 1);
+        pic_param.picture_width_in_mbs_minus1 = sps.valid ? (uint16_t)sps.pic_width_in_mbs_minus1
+                                                          : (uint16_t)((dec->width + 15) / 16 - 1);
+        pic_param.picture_height_in_mbs_minus1 = sps.valid
+                                                     ? (uint16_t)sps.pic_height_in_map_units_minus1
+                                                     : (uint16_t)((dec->height + 15) / 16 - 1);
         pic_param.bit_depth_luma_minus8 = sps.valid ? sps.bit_depth_luma_minus8 : 0;
         pic_param.bit_depth_chroma_minus8 = sps.valid ? sps.bit_depth_chroma_minus8 : 0;
         pic_param.num_ref_frames = sps.valid ? (sps.num_ref_frames ? sps.num_ref_frames : 1) : 1;
@@ -3950,12 +3939,12 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                                      curr_poc, &slice_param);
 
                 VABufferID slice_bufs[2] = {VA_INVALID_ID, VA_INVALID_ID};
-                VAStatus s1 = vaCreateBuffer(dec->va_display, dec->va_context,
-                                             VASliceParameterBufferType, sizeof(slice_param), 1,
-                                             &slice_param, &slice_bufs[0]);
-                VAStatus s2 = vaCreateBuffer(dec->va_display, dec->va_context,
-                                             VASliceDataBufferType, nal_len, 1, (void *)nal_ptr,
-                                             &slice_bufs[1]);
+                VAStatus s1 =
+                    vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
+                                   sizeof(slice_param), 1, &slice_param, &slice_bufs[0]);
+                VAStatus s2 =
+                    vaCreateBuffer(dec->va_display, dec->va_context, VASliceDataBufferType, nal_len,
+                                   1, (void *)nal_ptr, &slice_bufs[1]);
                 if (s1 == VA_STATUS_SUCCESS && s2 == VA_STATUS_SUCCESS) {
                     vaRenderPicture(dec->va_display, dec->va_context, slice_bufs, 2);
                 }
@@ -3978,8 +3967,9 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             build_h264_ref_lists(&dec->dpb, slice_param.slice_type, curr_frame_num, max_fn,
                                  curr_poc, &slice_param);
             VABufferID slice_bufs[2] = {VA_INVALID_ID, VA_INVALID_ID};
-            VAStatus s1 = vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
-                                         sizeof(slice_param), 1, &slice_param, &slice_bufs[0]);
+            VAStatus s1 =
+                vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
+                               sizeof(slice_param), 1, &slice_param, &slice_bufs[0]);
             VAStatus s2 = vaCreateBuffer(dec->va_display, dec->va_context, VASliceDataBufferType,
                                          pkt->size - 4, 1, (void *)(pkt->data + 4), &slice_bufs[1]);
             if (s1 == VA_STATUS_SUCCESS && s2 == VA_STATUS_SUCCESS) {
@@ -4075,10 +4065,9 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             if (i < (int)dec->dpb.count && i < 8) {
                 pic_param.ReferenceFrames[i].picture_id = dec->dpb.entries[i].surface;
                 pic_param.ReferenceFrames[i].pic_order_cnt = dec->dpb.entries[i].pic_order_cnt;
-                pic_param.ReferenceFrames[i].flags =
-                    (dec->dpb.entries[i].pic_order_cnt <= curr_poc)
-                        ? VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE
-                        : VA_PICTURE_HEVC_RPS_ST_CURR_AFTER;
+                pic_param.ReferenceFrames[i].flags = (dec->dpb.entries[i].pic_order_cnt <= curr_poc)
+                                                         ? VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE
+                                                         : VA_PICTURE_HEVC_RPS_ST_CURR_AFTER;
             } else {
                 pic_param.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
                 pic_param.ReferenceFrames[i].flags = VA_PICTURE_HEVC_INVALID;
@@ -4224,12 +4213,12 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                                      curr_poc, &slice_param);
 
                 VABufferID slice_bufs[2] = {VA_INVALID_ID, VA_INVALID_ID};
-                VAStatus s1 = vaCreateBuffer(dec->va_display, dec->va_context,
-                                             VASliceParameterBufferType, sizeof(slice_param), 1,
-                                             &slice_param, &slice_bufs[0]);
-                VAStatus s2 = vaCreateBuffer(dec->va_display, dec->va_context,
-                                             VASliceDataBufferType, nal_len, 1, (void *)nal_ptr,
-                                             &slice_bufs[1]);
+                VAStatus s1 =
+                    vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
+                                   sizeof(slice_param), 1, &slice_param, &slice_bufs[0]);
+                VAStatus s2 =
+                    vaCreateBuffer(dec->va_display, dec->va_context, VASliceDataBufferType, nal_len,
+                                   1, (void *)nal_ptr, &slice_bufs[1]);
                 if (s1 == VA_STATUS_SUCCESS && s2 == VA_STATUS_SUCCESS) {
                     vaRenderPicture(dec->va_display, dec->va_context, slice_bufs, 2);
                 }
@@ -4338,13 +4327,13 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             VABufferID sf_bufs[3] = {VA_INVALID_ID, VA_INVALID_ID, VA_INVALID_ID};
             uint32_t sf_num_bufs = 0;
             if (vaCreateBuffer(dec->va_display, dec->va_context, VAPictureParameterBufferType,
-                               sizeof(pic_param), 1, &pic_param, &sf_bufs[sf_num_bufs]) ==
-                VA_STATUS_SUCCESS) {
+                               sizeof(pic_param), 1, &pic_param,
+                               &sf_bufs[sf_num_bufs]) == VA_STATUS_SUCCESS) {
                 sf_num_bufs++;
             }
             if (vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
-                               sizeof(slice_param), 1, &slice_param, &sf_bufs[sf_num_bufs]) ==
-                VA_STATUS_SUCCESS) {
+                               sizeof(slice_param), 1, &slice_param,
+                               &sf_bufs[sf_num_bufs]) == VA_STATUS_SUCCESS) {
                 sf_num_bufs++;
             }
             if (sub_sizes[sf] > 0 && sub_ptrs[sf] &&
@@ -4401,8 +4390,7 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             size_t obu_sz = pkt->size - off;
             if (has_size) {
                 size_t leb_bytes = 0;
-                uint64_t parsed_sz =
-                    av1_read_leb128(pkt->data + off, pkt->size - off, &leb_bytes);
+                uint64_t parsed_sz = av1_read_leb128(pkt->data + off, pkt->size - off, &leb_bytes);
                 off += leb_bytes;
                 if (parsed_sz > pkt->size - off)
                     break;
@@ -4524,7 +4512,8 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         for (uint32_t u = 0; u < sh_meta.num_unmark; ++u) {
             int32_t target_pn = sh_meta.unmark_pic_nums[u];
             for (size_t d = 0; d < dec->dpb.count; ++d) {
-                if (!dec->dpb.entries[d].is_long_term && dec->dpb.entries[d].frame_num == target_pn) {
+                if (!dec->dpb.entries[d].is_long_term &&
+                    dec->dpb.entries[d].frame_num == target_pn) {
                     if (d + 1 < dec->dpb.count) {
                         memmove(&dec->dpb.entries[d], &dec->dpb.entries[d + 1],
                                 (dec->dpb.count - d - 1) * sizeof(h264_dpb_entry_t));
@@ -4644,9 +4633,9 @@ bool vaapi_decoder_vpp_blit(vaapi_decoder_t *dec, VASurfaceID src_surface,
     vpp_param.output_color_standard = VAProcColorStandardNone;
 
     VABufferID vpp_buf = VA_INVALID_ID;
-    VAStatus vpp_st = vaCreateBuffer(dec->va_display, dec->vpp_context,
-                                     VAProcPipelineParameterBufferType, sizeof(vpp_param), 1,
-                                     &vpp_param, &vpp_buf);
+    VAStatus vpp_st =
+        vaCreateBuffer(dec->va_display, dec->vpp_context, VAProcPipelineParameterBufferType,
+                       sizeof(vpp_param), 1, &vpp_param, &vpp_buf);
     if (vpp_st != VA_STATUS_SUCCESS) {
         WAYWAL_LOG_WARN("VPP vaCreateBuffer failed: %s", vaErrorStr(vpp_st));
         return false;
@@ -4682,7 +4671,8 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
         return false;
     }
     memset(out_frame, 0, sizeof(*out_frame));
-    for (int i = 0; i < 4; ++i) out_frame->fds[i] = -1;
+    for (int i = 0; i < 4; ++i)
+        out_frame->fds[i] = -1;
 
     VADRMPRIMESurfaceDescriptor prime_desc;
     memset(&prime_desc, 0, sizeof(prime_desc));
@@ -4691,9 +4681,9 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
     if (!dec->has_vpp && !dec->is_nvidia_vaapi) {
         /* Intel iHD/i965 and AMD radeonsi export a single multi-planar NV12/P010 descriptor
          * via COMPOSED_LAYERS that Wayland compositors scan out directly on KMS YUV planes. */
-        st = vaExportSurfaceHandle(
-            dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-            VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS, &prime_desc);
+        st = vaExportSurfaceHandle(dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                   VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+                                   &prime_desc);
         if (st != VA_STATUS_SUCCESS) {
             st = vaExportSurfaceHandle(
                 dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
@@ -4701,9 +4691,9 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
         }
     } else {
         /* nvidia_drv_video.so only supports VA_EXPORT_SURFACE_SEPARATE_LAYERS for NV12/P010 */
-        st = vaExportSurfaceHandle(
-            dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-            VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &prime_desc);
+        st = vaExportSurfaceHandle(dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                   VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+                                   &prime_desc);
         if (st != VA_STATUS_SUCCESS) {
             st = vaExportSurfaceHandle(
                 dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
@@ -4745,7 +4735,8 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
                 out_frame->modifiers[plane_idx] = prime_desc.objects[obj_idx].drm_format_modifier;
                 out_frame->offsets[plane_idx] = prime_desc.layers[l].offset[p];
                 out_frame->strides[plane_idx] = prime_desc.layers[l].pitch[p];
-                if (obj_idx < 256) obj_used[obj_idx] = true;
+                if (obj_idx < 256)
+                    obj_used[obj_idx] = true;
                 plane_idx++;
             }
         }
@@ -4798,15 +4789,9 @@ static bool vaapi_ops_export_prime(void *ctx, uint32_t surface, vaapi_prime_fram
     return vaapi_decoder_export_prime((vaapi_decoder_t *)ctx, (VASurfaceID)surface, out_frame);
 }
 
-static void vaapi_ops_reset(void *ctx)
-{
-    vaapi_decoder_reset((vaapi_decoder_t *)ctx);
-}
+static void vaapi_ops_reset(void *ctx) { vaapi_decoder_reset((vaapi_decoder_t *)ctx); }
 
-static void vaapi_ops_destroy(void *ctx)
-{
-    vaapi_decoder_destroy((vaapi_decoder_t *)ctx);
-}
+static void vaapi_ops_destroy(void *ctx) { vaapi_decoder_destroy((vaapi_decoder_t *)ctx); }
 
 const waywal_video_decoder_ops_t g_waywal_vaapi_decoder_ops = {
     .backend_name = "VA-API",

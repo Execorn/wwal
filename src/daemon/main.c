@@ -1,6 +1,7 @@
-#include "wayland_core.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "gpu_compute.h"
 #include "image_loader.h"
+#include "wayland_core.h"
 #include "waywal/anim_engine.h"
 #include "waywal/arena.h"
 #include "waywal/audio_fft.h"
@@ -202,8 +203,7 @@ static bool validate_shader_file_headless(const char *filepath)
     src[sz] = '\0';
     free(buf);
 
-    bool has_entry =
-        (strstr(src, "mainImage") != NULL || strstr(src, "void main") != NULL);
+    bool has_entry = (strstr(src, "mainImage") != NULL || strstr(src, "void main") != NULL);
     bool valid_syntax = true;
     /* Check balanced braces and reject obvious syntax corruption */
     int brace_depth = 0;
@@ -323,8 +323,7 @@ static void daemon_anim_dispatch_frame(daemon_state_t *state)
     }
 
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-        if (state->anim_target_output[0] != '\0' &&
-            strcmp(state->anim_target_output, "*") != 0 &&
+        if (state->anim_target_output[0] != '\0' && strcmp(state->anim_target_output, "*") != 0 &&
             strcmp(state->anim_target_output, out->name) != 0) {
             continue;
         }
@@ -338,12 +337,12 @@ static void daemon_anim_dispatch_frame(daemon_state_t *state)
     if (heap_bgra)
         free(bgra);
 
-    uint32_t eff_fps = state->power_gov
-                           ? waywal_power_governor_effective_fps(
-                                 state->power_gov,
-                                 state->anim_target_output[0] ? state->anim_target_output : "*",
-                                 delay_ms > 0 ? (1000U / delay_ms) : 10U)
-                           : (delay_ms > 0 ? (1000U / delay_ms) : 10U);
+    uint32_t eff_fps =
+        state->power_gov
+            ? waywal_power_governor_effective_fps(
+                  state->power_gov, state->anim_target_output[0] ? state->anim_target_output : "*",
+                  delay_ms > 0 ? (1000U / delay_ms) : 10U)
+            : (delay_ms > 0 ? (1000U / delay_ms) : 10U);
     if (eff_fps == 0) {
         disarm_timer_fd(state->anim_timer_fd);
     } else {
@@ -384,8 +383,7 @@ static void daemon_shader_render_once(daemon_state_t *state)
         fparams.date[0] = (float)(tm_val.tm_year + 1900);
         fparams.date[1] = (float)tm_val.tm_mon;
         fparams.date[2] = (float)tm_val.tm_mday;
-        fparams.date[3] =
-            (float)(tm_val.tm_hour * 3600 + tm_val.tm_min * 60 + tm_val.tm_sec);
+        fparams.date[3] = (float)(tm_val.tm_hour * 3600 + tm_val.tm_min * 60 + tm_val.tm_sec);
     }
 
     if (state->audio_fft) {
@@ -491,8 +489,7 @@ static void daemon_reconcile_power_state(daemon_state_t *state)
 
     /* Reconcile live shader engine timer */
     if (state->shader_active && state->shader_timer_fd >= 0) {
-        const char *s_out =
-            state->shader_target_output[0] ? state->shader_target_output : "*";
+        const char *s_out = state->shader_target_output[0] ? state->shader_target_output : "*";
         uint32_t target_s_fps = state->shader_fps > 0 ? state->shader_fps : 60U;
         uint32_t eff_s_fps =
             pause_all ? 0U
@@ -671,16 +668,15 @@ static bool daemon_restore_output_entry(daemon_state_t *state,
     case WAYWAL_CONTENT_STATIC_IMAGE:
     case WAYWAL_CONTENT_ANIMATION: {
         return daemon_render_image_on_target(state, saved->media_path, target, saved->scaling,
-                                             saved->filter, saved->ten_bit,
-                                             WAYWAL_TRANSITION_NONE, 0);
+                                             saved->filter, saved->ten_bit, WAYWAL_TRANSITION_NONE,
+                                             0);
     }
     case WAYWAL_CONTENT_SLIDESHOW: {
         if (saved->media_path[0] == '\0')
             return false;
         waywal_slideshow_payload_t spay;
         memset(&spay, 0, sizeof(spay));
-        spay.interval_s =
-            saved->slideshow_interval_sec > 0 ? saved->slideshow_interval_sec : 300;
+        spay.interval_s = saved->slideshow_interval_sec > 0 ? saved->slideshow_interval_sec : 300;
         spay.scaling_mode = saved->scaling;
         spay.filter_mode = saved->filter;
         spay.ten_bit = saved->ten_bit;
@@ -727,9 +723,9 @@ static bool daemon_apply_output_config_rule(daemon_state_t *state, const waywal_
         return daemon_activate_shader(state, &spay);
     }
     if (strcasecmp(rule->mode, "video") == 0) {
-        output_node_t *target_out =
-            (strcmp(target, "*") != 0) ? output_manager_find_by_name(&state->output_mgr, target)
-                                       : NULL;
+        output_node_t *target_out = (strcmp(target, "*") != 0)
+                                        ? output_manager_find_by_name(&state->output_mgr, target)
+                                        : NULL;
         return video_engine_load_file(&state->video_engine, rule->path, target_out);
     }
     if (strcasecmp(rule->mode, "slideshow") == 0) {
@@ -790,10 +786,9 @@ static void daemon_handle_power_gov_events(daemon_state_t *state, int fd)
                 if (strcmp(wrule->workspace_name, ws) == 0 && wrule->path[0] != '\0') {
                     const char *target =
                         wrule->output_name[0] ? wrule->output_name : (mon[0] ? mon : "*");
-                    uint32_t dur_ms =
-                        (uint32_t)(state->config.transition.duration > 0.0f
-                                       ? state->config.transition.duration * 1000.0f
-                                       : 500.0f);
+                    uint32_t dur_ms = (uint32_t)(state->config.transition.duration > 0.0f
+                                                     ? state->config.transition.duration * 1000.0f
+                                                     : 500.0f);
                     (void)daemon_render_image_on_target(
                         state, wrule->path, target, WAYWAL_SCALING_FILL, WAYWAL_FILTER_LANCZOS3,
                         state->config.daemon.ten_bit, wrule->transition_type_enum, dur_ms);
@@ -1006,8 +1001,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             (size_t)st.st_size >= sizeof(waywal_img_metadata_t) &&
             req_hdr.payload_size >= sizeof(waywal_img_metadata_t) &&
             (size_t)st.st_size >= req_hdr.payload_size) {
-            void *mapped =
-                mmap(NULL, req_hdr.payload_size, PROT_READ, MAP_PRIVATE, attached_fd, 0);
+            void *mapped = mmap(NULL, req_hdr.payload_size, PROT_READ, MAP_PRIVATE, attached_fd, 0);
             if (mapped != MAP_FAILED) {
                 waywal_img_metadata_t *meta = (waywal_img_metadata_t *)mapped;
                 uint64_t expected_size = sizeof(waywal_img_metadata_t) +
@@ -1059,21 +1053,20 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         shader_engine_stop_playback(state);
                         anim_engine_stop_playback(state);
 
-                        ok = daemon_start_image_transition(state, pixels, meta->width,
-                                                           meta->height, meta);
+                        ok = daemon_start_image_transition(state, pixels, meta->width, meta->height,
+                                                           meta);
                         if (ok) {
                             const char *first_target = "*";
                             if (meta->num_target_outputs > 0) {
-                                first_target =
-                                    (const char *)mapped + sizeof(waywal_img_metadata_t);
+                                first_target = (const char *)mapped + sizeof(waywal_img_metadata_t);
                             }
                             bool is_anim = try_start_native_animation(state, meta->filepath, meta,
                                                                       first_target);
 
                             waywal_output_saved_state_t s_entry;
                             memset(&s_entry, 0, sizeof(s_entry));
-                            s_entry.kind = is_anim ? WAYWAL_CONTENT_ANIMATION
-                                                   : WAYWAL_CONTENT_STATIC_IMAGE;
+                            s_entry.kind =
+                                is_anim ? WAYWAL_CONTENT_ANIMATION : WAYWAL_CONTENT_STATIC_IMAGE;
                             snprintf(s_entry.media_path, sizeof(s_entry.media_path), "%.*s",
                                      (int)(sizeof(meta->filepath) - 1), meta->filepath);
                             s_entry.scaling = (waywal_scaling_mode_t)meta->scaling_mode;
@@ -1101,8 +1094,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                 for (output_node_t *out = state->outputs; out != NULL;
                                      out = out->next) {
                                     if (out->name[0] != '\0') {
-                                        memset(s_entry.output_name, 0,
-                                               sizeof(s_entry.output_name));
+                                        memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
                                         strncpy(s_entry.output_name, out->name,
                                                 sizeof(s_entry.output_name) - 1);
                                         (void)waywal_state_store_update_output(&g_saved_state,
@@ -1378,33 +1370,35 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
         char stats_buf[4096];
         size_t off = 0;
-        off += (size_t)snprintf(
-            stats_buf + off, sizeof(stats_buf) - off,
-            "=== WayWal Daemon Telemetry ===\n"
-            "RSS Memory:     %lu KiB (%.2f MiB)\n"
-            "GPU Compute:    %s\n"
-            "DMA-BUF Scanout:%s (modifier=0x%016lx, 10bit=%s, nv12=%s)\n"
-            "Outputs (%zu):\n",
-            rss_kib, (double)rss_kib / 1024.0,
-            state->render_engine.gpu_compute_active ? "active" : "cpu-simd-fallback",
-            state->dmabuf_ctx.available ? "enabled" : "shm-fallback",
-            (unsigned long)state->dmabuf_ctx.preferred_modifier,
-            state->dmabuf_ctx.has_10bit ? "yes" : "no",
-            state->dmabuf_ctx.has_nv12 ? "yes" : "no", state->num_outputs);
+        off += (size_t)snprintf(stats_buf + off, sizeof(stats_buf) - off,
+                                "=== WayWal Daemon Telemetry ===\n"
+                                "RSS Memory:     %lu KiB (%.2f MiB)\n"
+                                "GPU Compute:    %s\n"
+                                "DMA-BUF Scanout:%s (modifier=0x%016lx, 10bit=%s, nv12=%s)\n"
+                                "Outputs (%zu):\n",
+                                rss_kib, (double)rss_kib / 1024.0,
+                                state->render_engine.gpu_compute_active ? "active"
+                                                                        : "cpu-simd-fallback",
+                                state->dmabuf_ctx.available ? "enabled" : "shm-fallback",
+                                (unsigned long)state->dmabuf_ctx.preferred_modifier,
+                                state->dmabuf_ctx.has_10bit ? "yes" : "no",
+                                state->dmabuf_ctx.has_nv12 ? "yes" : "no", state->num_outputs);
 
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
             if (off >= sizeof(stats_buf))
                 break;
             uint32_t pmask =
-                state->power_gov ? waywal_power_governor_get_output_mask(state->power_gov, out->name)
-                                 : 0;
+                state->power_gov
+                    ? waywal_power_governor_get_output_mask(state->power_gov, out->name)
+                    : 0;
             int32_t fscale =
                 out->fractional_scale > 0 ? out->fractional_scale : (out->scale_factor * 120);
-            off += (size_t)snprintf(
-                stats_buf + off, sizeof(stats_buf) - off,
-                "  - %s: physical=%dx%d logical=%ux%u scale=%d/120 vblank_period=%lldns pause_mask=0x%02x\n",
-                out->name[0] ? out->name : "unknown", out->width, out->height, out->logical_width,
-                out->logical_height, fscale, (long long)out->pres_sync.pll.period_est_ns, pmask);
+            off += (size_t)snprintf(stats_buf + off, sizeof(stats_buf) - off,
+                                    "  - %s: physical=%dx%d logical=%ux%u scale=%d/120 "
+                                    "vblank_period=%lldns pause_mask=0x%02x\n",
+                                    out->name[0] ? out->name : "unknown", out->width, out->height,
+                                    out->logical_width, out->logical_height, fscale,
+                                    (long long)out->pres_sync.pll.period_est_ns, pmask);
         }
 
         resp_hdr.opcode = WAYWAL_RESP_OK;
@@ -1574,9 +1568,8 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
             if (waywal_shader_engine_poll_hot_reload(st->shader_eng) && st->shader_active) {
                 daemon_shader_render_once(st);
             }
-        } else if (st->power_gov &&
-                   (fd == waywal_power_governor_get_ipc_fd(st->power_gov) ||
-                    fd == waywal_power_governor_get_inotify_fd(st->power_gov))) {
+        } else if (st->power_gov && (fd == waywal_power_governor_get_ipc_fd(st->power_gov) ||
+                                     fd == waywal_power_governor_get_inotify_fd(st->power_gov))) {
             daemon_handle_power_gov_events(st, fd);
         }
         break;
@@ -1618,8 +1611,7 @@ int main(int argc, char *argv[])
     state.idle_timeout_sec = state.config.daemon.idle_timeout_sec;
     if (state.config.daemon.backdrop[0] != '\0' &&
         strcasecmp(state.config.daemon.backdrop, "none") != 0 && !state.backdrop_auto_blur) {
-        strncpy(state.backdrop_path, state.config.daemon.backdrop,
-                sizeof(state.backdrop_path) - 1);
+        strncpy(state.backdrop_path, state.config.daemon.backdrop, sizeof(state.backdrop_path) - 1);
     }
     if (state.config.daemon.namespace_str[0] != '\0' &&
         strcmp(state.config.daemon.namespace_str, "waywal") != 0) {
@@ -1813,8 +1805,7 @@ int main(int argc, char *argv[])
                                 &state);
         }
         if (state.shader_timer_fd >= 0) {
-            uring_loop_add_poll(&uring_loop, state.shader_timer_fd, POLLIN, URING_EV_TIMER,
-                                &state);
+            uring_loop_add_poll(&uring_loop, state.shader_timer_fd, POLLIN, URING_EV_TIMER, &state);
         }
         if (state.anim_timer_fd >= 0) {
             uring_loop_add_poll(&uring_loop, state.anim_timer_fd, POLLIN, URING_EV_TIMER, &state);

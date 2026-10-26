@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/video_engine.h"
 
 #include "linux-dmabuf-v1-client-protocol.h"
@@ -95,11 +96,11 @@ static struct wl_buffer *ensure_shared_video_buffer(video_engine_t *ve, VASurfac
     vaapi_prime_frame_close(&prime_frame);
 
     if (wl_buf) {
-        WAYWAL_LOG_INFO("Created shared video wl_buffer %p for surface %u (idx %u, %ux%u, fmt 0x%08x)",
-                        (void *)wl_buf, export_surf, buf_idx, prime_frame.width,
-                        prime_frame.height, prime_frame.drm_format);
-        wl_buffer_add_listener(wl_buf, &g_video_buffer_listener,
-                               &ve->video_buffer_in_use[buf_idx]);
+        WAYWAL_LOG_INFO(
+            "Created shared video wl_buffer %p for surface %u (idx %u, %ux%u, fmt 0x%08x)",
+            (void *)wl_buf, export_surf, buf_idx, prime_frame.width, prime_frame.height,
+            prime_frame.drm_format);
+        wl_buffer_add_listener(wl_buf, &g_video_buffer_listener, &ve->video_buffer_in_use[buf_idx]);
         ve->video_wl_buffers[buf_idx] = wl_buf;
         ve->video_buffer_in_use[buf_idx] = false;
     } else {
@@ -254,7 +255,8 @@ static void video_engine_prepare_reload(video_engine_t *ve)
     if (ve->timer_fd >= 0) {
         timerfd_settime(ve->timer_fd, 0, &its, NULL);
         uint64_t dummy;
-        while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0);
+        while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0)
+            ;
     }
     ve->state = WAYWAL_VIDEO_STATE_STOPPED;
     ve->reorder_count = 0;
@@ -277,17 +279,17 @@ static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux
     bool profile_matches = false;
     switch (demux->codec) {
     case WAYWAL_CODEC_H264:
-        profile_matches = (dec->va_profile == VAProfileH264Main ||
-                           dec->va_profile == VAProfileH264High ||
-                           dec->va_profile == VAProfileH264ConstrainedBaseline);
+        profile_matches =
+            (dec->va_profile == VAProfileH264Main || dec->va_profile == VAProfileH264High ||
+             dec->va_profile == VAProfileH264ConstrainedBaseline);
         break;
     case WAYWAL_CODEC_HEVC:
-        profile_matches = (dec->va_profile == VAProfileHEVCMain ||
-                           dec->va_profile == VAProfileHEVCMain10);
+        profile_matches =
+            (dec->va_profile == VAProfileHEVCMain || dec->va_profile == VAProfileHEVCMain10);
         break;
     case WAYWAL_CODEC_VP9:
-        profile_matches = (dec->va_profile == VAProfileVP9Profile0 ||
-                           dec->va_profile == VAProfileVP9Profile2);
+        profile_matches =
+            (dec->va_profile == VAProfileVP9Profile0 || dec->va_profile == VAProfileVP9Profile2);
         break;
     case WAYWAL_CODEC_AV1:
         profile_matches = (dec->va_profile == VAProfileAV1Profile0);
@@ -363,8 +365,7 @@ static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
      * separate R8 and GR88 layers. */
     bool has_nv12 = ve->daemon_state && ve->daemon_state->dmabuf_ctx.has_nv12;
     bool has_p010 = ve->daemon_state && ve->daemon_state->dmabuf_ctx.has_p010;
-    bool allow_direct_nv12 =
-        has_nv12 && (!ve->decoder.initialized || !ve->decoder.is_nvidia_vaapi);
+    bool allow_direct_nv12 = has_nv12 && (!ve->decoder.initialized || !ve->decoder.is_nvidia_vaapi);
     ve->decoder.allow_direct_p010 =
         has_p010 && (!ve->decoder.initialized || !ve->decoder.is_nvidia_vaapi);
 
@@ -396,10 +397,9 @@ static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
             vaapi_decoder_destroy(&ve->decoder);
         }
         ve->decoder.allow_direct_p010 = has_p010;
-        if (!vaapi_decoder_init_with_params(&ve->decoder, drm_fd, ve->demuxer->codec,
-                                            ve->demuxer->width, ve->demuxer->height,
-                                            ve->demuxer->extradata, ve->demuxer->extradata_size,
-                                            allow_direct_nv12)) {
+        if (!vaapi_decoder_init_with_params(
+                &ve->decoder, drm_fd, ve->demuxer->codec, ve->demuxer->width, ve->demuxer->height,
+                ve->demuxer->extradata, ve->demuxer->extradata_size, allow_direct_nv12)) {
             WAYWAL_LOG_ERR("Failed to initialize hardware VA-API decoder for video");
             ve->demuxer->destroy(ve->demuxer);
             ve->demuxer = NULL;
@@ -595,7 +595,8 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                     break;
                 }
                 ve->current_loop++;
-                WAYWAL_LOG_INFO("Video loop count (%lu) reached, stopping playback", ve->loop_count);
+                WAYWAL_LOG_INFO("Video loop count (%lu) reached, stopping playback",
+                                ve->loop_count);
                 video_engine_stop(ve);
                 return;
             }
@@ -666,8 +667,7 @@ void video_engine_dispatch_frame(video_engine_t *ve)
         for (uint32_t i = 1; i < ve->reorder_count; ++i) {
             const video_reorder_entry_t *a = &ve->reorder_buf[i];
             const video_reorder_entry_t *b = &ve->reorder_buf[best_idx];
-            if (a->gop_id < b->gop_id ||
-                (a->gop_id == b->gop_id && a->poc < b->poc) ||
+            if (a->gop_id < b->gop_id || (a->gop_id == b->gop_id && a->poc < b->poc) ||
                 (a->gop_id == b->gop_id && a->poc == b->poc && a->pts_us < b->pts_us)) {
                 best_idx = i;
             }
@@ -781,7 +781,8 @@ void video_engine_pause(video_engine_t *ve)
     struct itimerspec its = {0};
     timerfd_settime(ve->timer_fd, 0, &its, NULL);
     uint64_t dummy;
-    while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0);
+    while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0)
+        ;
     ve->state = WAYWAL_VIDEO_STATE_PAUSED;
     WAYWAL_LOG_INFO("Hardware video playback paused (0%% VPU usage)");
 }
@@ -800,7 +801,8 @@ void video_engine_resume(video_engine_t *ve)
         .it_interval = {0, 0}, .it_value = {.tv_sec = 0, .tv_nsec = 1000000L} /* 1ms */
     };
     uint64_t dummy;
-    while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0);
+    while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0)
+        ;
     timerfd_settime(ve->timer_fd, 0, &its, NULL);
 }
 
@@ -813,7 +815,8 @@ void video_engine_stop(video_engine_t *ve)
     if (ve->timer_fd >= 0) {
         timerfd_settime(ve->timer_fd, 0, &its, NULL);
         uint64_t dummy;
-        while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0);
+        while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0)
+            ;
     }
 
     ve->state = WAYWAL_VIDEO_STATE_STOPPED;

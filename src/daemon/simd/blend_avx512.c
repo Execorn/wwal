@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "simd_blend.h"
 
 #if defined(__x86_64__) || defined(_M_X64)

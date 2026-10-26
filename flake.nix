@@ -26,6 +26,7 @@
               meson
               ninja
               pkg-config
+              python3
               wayland-scanner
               scdoc
               makeWrapper
@@ -55,19 +56,6 @@
               "-Denable_seccomp=true"
               "-Denable_systemd=true"
             ];
-
-            postInstall = ''
-              install -Dm644 ${self}/contrib/systemd/wwald.socket $out/lib/systemd/user/wwald.socket
-              if [ -d ${self}/docs/man ]; then
-                mkdir -p $out/share/man/man1 $out/share/man/man5
-                for f in ${self}/docs/man/*.1; do
-                  [ -f "$f" ] && install -Dm644 "$f" "$out/share/man/man1/$(basename "$f")"
-                done
-                for f in ${self}/docs/man/*.5; do
-                  [ -f "$f" ] && install -Dm644 "$f" "$out/share/man/man5/$(basename "$f")"
-                done
-              fi
-            '';
 
             meta = with pkgs.lib; {
               description = "Zero-copy C23 Wayland wallpaper, hardware video, GLSL shader, and Material You engine";

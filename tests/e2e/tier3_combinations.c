@@ -1,5 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "e2e_common.h"
-
 
 void run_tier3_cross_feature(void)
 {
@@ -88,8 +88,8 @@ void run_tier3_cross_feature(void)
         bool ok = render_engine_execute_cpu_transition(d, a, b, w, h, w * sizeof(uint32_t), &p);
         bool c_ok = e2e_canary_check(d, n);
         bool v_ok = e2e_is_valid_argb_buffer(d, w, h, w);
-        E2E_CHECK(ok && c_ok && v_ok, "T3_03_res_4k_standard", "ok=%d canary=%d valid=%d", ok,
-                  c_ok, v_ok);
+        E2E_CHECK(ok && c_ok && v_ok, "T3_03_res_4k_standard", "ok=%d canary=%d valid=%d", ok, c_ok,
+                  v_ok);
         e2e_canary_free(a);
         e2e_canary_free(b);
         e2e_canary_free(d);
@@ -268,11 +268,12 @@ void run_tier3_cross_feature(void)
             .bezier = BEZIER_DEFAULT,
         };
 
-        bool ok = render_engine_execute_cpu_transition(d, a, b, w, h,
-                                                       stride_px * sizeof(uint32_t), &p);
+        bool ok =
+            render_engine_execute_cpu_transition(d, a, b, w, h, stride_px * sizeof(uint32_t), &p);
         bool c_ok = e2e_canary_check(d, total_px);
 
-        /* Check that active area has rendered alpha=0xFF, while padding is untouched (0x55555555) */
+        /* Check that active area has rendered alpha=0xFF, while padding is untouched (0x55555555)
+         */
         bool pad_untouched = true;
         bool active_valid = true;
         for (uint32_t y = 0; y < h; ++y) {
@@ -322,8 +323,8 @@ void run_tier3_cross_feature(void)
             .bezier = BEZIER_DEFAULT,
         };
 
-        bool ok = render_engine_execute_cpu_transition(d, a, b, w, h,
-                                                       stride_px * sizeof(uint32_t), &p);
+        bool ok =
+            render_engine_execute_cpu_transition(d, a, b, w, h, stride_px * sizeof(uint32_t), &p);
         bool c_ok = e2e_canary_check(d, total_px);
 
         bool pad_untouched = true;
@@ -360,9 +361,9 @@ void run_tier3_cross_feature(void)
         e2e_generate_pattern_a(curr, w, h, w);
 
         waywal_transition_type_t chain_effects[10] = {
-            WAYWAL_TRANSITION_FADE,   WAYWAL_TRANSITION_WIPE,      WAYWAL_TRANSITION_GROW,
-            WAYWAL_TRANSITION_WAVE,   WAYWAL_TRANSITION_CROSSZOOM, WAYWAL_TRANSITION_SLIDE,
-            WAYWAL_TRANSITION_BURN,   WAYWAL_TRANSITION_RIPPLE,    WAYWAL_TRANSITION_SWIRL,
+            WAYWAL_TRANSITION_FADE, WAYWAL_TRANSITION_WIPE,      WAYWAL_TRANSITION_GROW,
+            WAYWAL_TRANSITION_WAVE, WAYWAL_TRANSITION_CROSSZOOM, WAYWAL_TRANSITION_SLIDE,
+            WAYWAL_TRANSITION_BURN, WAYWAL_TRANSITION_RIPPLE,    WAYWAL_TRANSITION_SWIRL,
             WAYWAL_TRANSITION_DOOM,
         };
 
@@ -383,8 +384,8 @@ void run_tier3_cross_feature(void)
                 .bezier = BEZIER_DEFAULT,
             };
 
-            bool ok =
-                render_engine_execute_cpu_transition(out, curr, next, w, h, w * sizeof(uint32_t), &p);
+            bool ok = render_engine_execute_cpu_transition(out, curr, next, w, h,
+                                                           w * sizeof(uint32_t), &p);
             if (!ok || !e2e_canary_check(out, n)) {
                 chain_pass = false;
                 break;
@@ -501,9 +502,8 @@ void run_tier3_cross_feature(void)
         e2e_generate_pattern_a(a, w, h, w);
         e2e_generate_pattern_b(b, w, h, w);
 
-        waywal_transition_type_t switch_types[4] = {
-            WAYWAL_TRANSITION_FADE, WAYWAL_TRANSITION_WAVE, WAYWAL_TRANSITION_BURN,
-            WAYWAL_TRANSITION_LUMA};
+        waywal_transition_type_t switch_types[4] = {WAYWAL_TRANSITION_FADE, WAYWAL_TRANSITION_WAVE,
+                                                    WAYWAL_TRANSITION_BURN, WAYWAL_TRANSITION_LUMA};
         float switch_progress[4] = {0.25f, 0.50f, 0.75f, 1.0f};
 
         bool mid_switch_ok = true;
@@ -637,7 +637,8 @@ void run_tier3_cross_feature(void)
                         .center_y = 0.5f,
                         .bezier = BEZIER_DEFAULT,
                     };
-                    gpu_ran = render_engine_execute_transition(&re, &target_bo, &old_bo, &new_bo, &p);
+                    gpu_ran =
+                        render_engine_execute_transition(&re, &target_bo, &old_bo, &new_bo, &p);
                     dmabuf_bo_free(&target_bo);
                     dmabuf_bo_free(&old_bo);
                     dmabuf_bo_free(&new_bo);
@@ -647,7 +648,8 @@ void run_tier3_cross_feature(void)
             dmabuf_context_destroy(&ctx);
         }
 
-        /* Test passes if either GPU compute executed successfully or CPU fallback operates nominally */
+        /* Test passes if either GPU compute executed successfully or CPU fallback operates
+         * nominally */
         bool parity_ok = gpu_avail ? gpu_ran : true;
         E2E_CHECK(parity_ok, "T3_18_gpu_compute_or_simd_parity", "gpu_avail=%d gpu_ran=%d",
                   gpu_avail, gpu_ran);

@@ -1,8 +1,9 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Maintainer: Execorn <execorn@users.noreply.github.com>
 pkgname=wwal-git
-pkgver=1.0.0.r8.gfc7ae4a
+pkgver=1.0.0.r0.g0000000
 pkgrel=1
-pkgdesc="Modern high-performance Wayland wallpaper, video, shader, and Material You engine (C23)"
+pkgdesc="High-performance Wayland wallpaper, video, shader, and Material You engine (C23)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/Execorn/wwal"
 license=('GPL-3.0-or-later')
@@ -29,6 +30,7 @@ makedepends=(
   'git'
   'meson'
   'ninja'
+  'python'
   'scdoc'
   'wayland-protocols'
 )
@@ -61,26 +63,13 @@ build() {
 }
 
 check() {
-  meson test -C "${srcdir}/build" --print-errorlogs --suite waywal:phase1 --suite waywal:advanced || \
+  meson test -C "${srcdir}/build" --print-errorlogs --suite waywal:core --suite waywal:advanced || \
     meson test -C "${srcdir}/build" --print-errorlogs
 }
 
 package() {
   DESTDIR="${pkgdir}" meson install -C "${srcdir}/build"
-
-  install -Dm644 "${startdir}/systemd/wwald.service" \
-    "${pkgdir}/usr/lib/systemd/user/wwald.service"
-  install -Dm644 "${startdir}/systemd/wwald.socket" \
-    "${pkgdir}/usr/lib/systemd/user/wwald.socket"
-
-  if [[ -d "${startdir}/../docs/man" ]]; then
-    for manfile in "${startdir}/../docs/man/"*.1; do
-      [[ -f "$manfile" ]] && install -Dm644 "$manfile" "${pkgdir}/usr/share/man/man1/$(basename "$manfile")"
-    done
-    for manfile in "${startdir}/../docs/man/"*.5; do
-      [[ -f "$manfile" ]] && install -Dm644 "$manfile" "${pkgdir}/usr/share/man/man5/$(basename "$manfile")"
-    done
-  fi
+  install -Dm644 "${startdir}/../LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 
   if [[ "${_enable_swww_compat}" == "1" ]]; then
     provides+=('swww' 'awww')

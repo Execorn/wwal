@@ -1,19 +1,25 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/path.h"
 
 #include <string.h>
 
-void path_buf_init(path_buf_t *pb) {
-    if (!pb) return;
+void path_buf_init(path_buf_t *pb)
+{
+    if (!pb)
+        return;
     pb->len = 0;
     pb->data[0] = '\0';
 }
 
-void path_buf_from_str(path_buf_t *pb, const char *str) {
-    if (!pb) return;
+void path_buf_from_str(path_buf_t *pb, const char *str)
+{
+    if (!pb)
+        return;
     pb->len = 0;
     pb->data[0] = '\0';
 
-    if (!str) return;
+    if (!str)
+        return;
 
     size_t slen = strlen(str);
     if (slen >= WAYWAL_PATH_MAX) {
@@ -25,12 +31,16 @@ void path_buf_from_str(path_buf_t *pb, const char *str) {
     pb->data[pb->len] = '\0';
 }
 
-bool path_buf_push(path_buf_t *pb, const char *component) {
-    if (!pb) return false;
-    if (!component || component[0] == '\0') return true;
+bool path_buf_push(path_buf_t *pb, const char *component)
+{
+    if (!pb)
+        return false;
+    if (!component || component[0] == '\0')
+        return true;
 
     size_t comp_len = strlen(component);
-    if (comp_len == 0) return true;
+    if (comp_len == 0)
+        return true;
 
     bool need_sep = (pb->len > 0 && pb->data[pb->len - 1] != '/' && component[0] != '/');
     size_t needed = pb->len + comp_len + (need_sep ? 1 : 0) + 1;
@@ -48,9 +58,12 @@ bool path_buf_push(path_buf_t *pb, const char *component) {
     return true;
 }
 
-bool path_buf_append(path_buf_t *pb, const char *suffix) {
-    if (!pb) return false;
-    if (!suffix || suffix[0] == '\0') return true;
+bool path_buf_append(path_buf_t *pb, const char *suffix)
+{
+    if (!pb)
+        return false;
+    if (!suffix || suffix[0] == '\0')
+        return true;
 
     size_t suf_len = strlen(suffix);
     if (pb->len + suf_len + 1 > WAYWAL_PATH_MAX) {
@@ -63,8 +76,10 @@ bool path_buf_append(path_buf_t *pb, const char *suffix) {
     return true;
 }
 
-bool path_buf_parent(path_buf_t *pb) {
-    if (!pb || pb->len == 0) return false;
+bool path_buf_parent(path_buf_t *pb)
+{
+    if (!pb || pb->len == 0)
+        return false;
 
     /* Trim trailing slashes if len > 1 */
     while (pb->len > 1 && pb->data[pb->len - 1] == '/') {
@@ -96,7 +111,9 @@ bool path_buf_parent(path_buf_t *pb) {
     return true;
 }
 
-const char *path_buf_cstr(const path_buf_t *pb) {
-    if (!pb) return "";
+const char *path_buf_cstr(const path_buf_t *pb)
+{
+    if (!pb)
+        return "";
     return pb->data;
 }

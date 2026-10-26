@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 option('enable_vaapi', type: 'boolean', value: true, description: 'Enable VA-API hardware video decoding')
 option('enable_io_uring', type: 'boolean', value: true, description: 'Enable Linux io_uring asynchronous event loop')
 option('enable_simd', type: 'boolean', value: true, description: 'Enable AVX-512 / AVX2 / NEON vector kernels')
 option('enable_seccomp', type: 'boolean', value: true, description: 'Enable Seccomp-BPF process sandboxing')
-option('enable_systemd', type: 'boolean', value: false, description: 'Install systemd user service and socket units')
+option('enable_systemd', type: 'boolean', value: true, description: 'Install systemd user service and socket units')
+option('man-pages', type: 'feature', value: 'auto', description: 'Generate and install manual pages')
+option('tests', type: 'boolean', value: true, description: 'Build unit, subsystem, fuzz, and E2E test suites')
 option('webp', type: 'feature', value: 'auto', description: 'Optional WebP image and animation support')
 option('avif', type: 'feature', value: 'auto', description: 'Optional AVIF/HEIC and Solar Dynamic image support')
 option('jxl', type: 'feature', value: 'auto', description: 'Optional JPEG-XL image support')

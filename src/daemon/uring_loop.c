@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/uring_loop.h"
 
 #include "waywal/log.h"
@@ -210,7 +211,8 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
                     }
                     io_uring_sqe_set_data(sqe, slot);
                 } else {
-                    WAYWAL_LOG_ERR("uring_loop_dispatch: SQ ring full, failed to re-arm fd %d", slot->fd);
+                    WAYWAL_LOG_ERR("uring_loop_dispatch: SQ ring full, failed to re-arm fd %d",
+                                   slot->fd);
                 }
             }
         }

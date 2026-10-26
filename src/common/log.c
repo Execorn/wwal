@@ -1,22 +1,20 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/log.h"
 
-#include <stdio.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/uio.h>
+#include <unistd.h>
 
 static waywal_log_level_t g_current_level = WAYWAL_LOG_LEVEL_INFO;
 
-void waywal_log_set_level(waywal_log_level_t level) {
-    g_current_level = level;
-}
+void waywal_log_set_level(waywal_log_level_t level) { g_current_level = level; }
 
-waywal_log_level_t waywal_log_get_level(void) {
-    return g_current_level;
-}
+waywal_log_level_t waywal_log_get_level(void) { return g_current_level; }
 
-void waywal_log(waywal_log_level_t level, const char *file, int line, const char *fmt, ...) {
+void waywal_log(waywal_log_level_t level, const char *file, int line, const char *fmt, ...)
+{
     (void)file;
     (void)line;
 
@@ -34,43 +32,43 @@ void waywal_log(waywal_log_level_t level, const char *file, int line, const char
 
     if (is_tty) {
         switch (level) {
-            case WAYWAL_LOG_LEVEL_DEBUG:
-                prefix = "\033[90m[DEBUG]\033[0m ";
-                prefix_len = 16;
-                break;
-            case WAYWAL_LOG_LEVEL_INFO:
-                prefix = "\033[32m[INFO]\033[0m ";
-                prefix_len = 15;
-                break;
-            case WAYWAL_LOG_LEVEL_WARN:
-                prefix = "\033[33m[WARN]\033[0m ";
-                prefix_len = 15;
-                break;
-            case WAYWAL_LOG_LEVEL_ERR:
-            default:
-                prefix = "\033[31m[ERROR]\033[0m ";
-                prefix_len = 16;
-                break;
+        case WAYWAL_LOG_LEVEL_DEBUG:
+            prefix = "\033[90m[DEBUG]\033[0m ";
+            prefix_len = 16;
+            break;
+        case WAYWAL_LOG_LEVEL_INFO:
+            prefix = "\033[32m[INFO]\033[0m ";
+            prefix_len = 15;
+            break;
+        case WAYWAL_LOG_LEVEL_WARN:
+            prefix = "\033[33m[WARN]\033[0m ";
+            prefix_len = 15;
+            break;
+        case WAYWAL_LOG_LEVEL_ERR:
+        default:
+            prefix = "\033[31m[ERROR]\033[0m ";
+            prefix_len = 16;
+            break;
         }
     } else {
         switch (level) {
-            case WAYWAL_LOG_LEVEL_DEBUG:
-                prefix = "[DEBUG] ";
-                prefix_len = 8;
-                break;
-            case WAYWAL_LOG_LEVEL_INFO:
-                prefix = "[INFO] ";
-                prefix_len = 7;
-                break;
-            case WAYWAL_LOG_LEVEL_WARN:
-                prefix = "[WARN] ";
-                prefix_len = 7;
-                break;
-            case WAYWAL_LOG_LEVEL_ERR:
-            default:
-                prefix = "[ERROR] ";
-                prefix_len = 8;
-                break;
+        case WAYWAL_LOG_LEVEL_DEBUG:
+            prefix = "[DEBUG] ";
+            prefix_len = 8;
+            break;
+        case WAYWAL_LOG_LEVEL_INFO:
+            prefix = "[INFO] ";
+            prefix_len = 7;
+            break;
+        case WAYWAL_LOG_LEVEL_WARN:
+            prefix = "[WARN] ";
+            prefix_len = 7;
+            break;
+        case WAYWAL_LOG_LEVEL_ERR:
+        default:
+            prefix = "[ERROR] ";
+            prefix_len = 8;
+            break;
         }
     }
 
@@ -90,11 +88,9 @@ void waywal_log(waywal_log_level_t level, const char *file, int line, const char
 
     static const char newline[] = "\n";
 
-    struct iovec iov[3] = {
-        { .iov_base = (void *)prefix, .iov_len = prefix_len },
-        { .iov_base = msg_buf,         .iov_len = msg_len },
-        { .iov_base = (void *)newline,.iov_len = 1 }
-    };
+    struct iovec iov[3] = {{.iov_base = (void *)prefix, .iov_len = prefix_len},
+                           {.iov_base = msg_buf, .iov_len = msg_len},
+                           {.iov_base = (void *)newline, .iov_len = 1}};
 
     (void)writev(STDERR_FILENO, iov, 3);
 }

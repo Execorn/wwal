@@ -108,7 +108,7 @@ Sets default parameters for GPU compute and CPU SIMD wallpaper transitions.
 
 ## [output."<NAME>"]
 
-Configures initial wallpaper, video, shader, or slideshow settings for a specific Wayland output (such as *[output."DP-1"]* or *[output."eDP-1"]*). Use *[output."*"]* as a wildcard fallback for unconfigured monitors.
+Configures initial wallpaper, video, shader, or slideshow settings for a specific Wayland output (such as *[output."DP-1"]* or *[output."eDP-1"]*). Use *[output."\*"]* as a wildcard fallback for unconfigured monitors.
 
 *path* = "<path>"
 	Path to an image, video, shader, or slideshow directory.

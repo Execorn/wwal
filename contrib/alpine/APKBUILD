@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Maintainer: Execorn <execorn@users.noreply.github.com>
 pkgname=wwal
 pkgver=1.0.0
@@ -10,6 +11,7 @@ makedepends="
 	meson
 	ninja
 	pkgconf
+	python3
 	scdoc
 	wayland-dev
 	wayland-protocols
@@ -43,12 +45,9 @@ build() {
 }
 
 check() {
-	meson test --no-rebuild --print-errorlogs -C output phase1
+	meson test --no-rebuild --print-errorlogs -C output core
 }
 
 package() {
 	DESTDIR="$pkgdir" meson install --no-rebuild -C output
-	install -Dm644 docs/man/wwal.1 "$pkgdir"/usr/share/man/man1/wwal.1
-	install -Dm644 docs/man/wwald.1 "$pkgdir"/usr/share/man/man1/wwald.1
-	install -Dm644 docs/man/wwal-config.5 "$pkgdir"/usr/share/man/man5/wwal-config.5
 }

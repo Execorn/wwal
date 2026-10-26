@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 Name:           wwal
 Version:        1.0.0
 Release:        1%{?dist}
@@ -9,8 +11,10 @@ Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 BuildRequires:  gcc >= 13
 BuildRequires:  meson >= 0.60
 BuildRequires:  ninja-build
+BuildRequires:  python3
+BuildRequires:  scdoc
 BuildRequires:  pkgconfig(wayland-client) >= 1.20
-BuildRequires:  pkgconfig(wayland-protocols) >= 1.24
+BuildRequires:  pkgconfig(wayland-protocols) >= 1.34
 BuildRequires:  pkgconfig(wayland-scanner)
 BuildRequires:  pkgconfig(libdrm) >= 2.4.110
 BuildRequires:  pkgconfig(gbm)
@@ -62,10 +66,6 @@ symlinks backed by wwal and wwald.
 
 %install
 %meson_install
-install -Dpm0644 contrib/systemd/wwald.socket %{buildroot}%{_userunitdir}/wwald.socket
-install -Dpm0644 docs/man/wwal.1 %{buildroot}%{_mandir}/man1/wwal.1
-install -Dpm0644 docs/man/wwald.1 %{buildroot}%{_mandir}/man1/wwald.1
-install -Dpm0644 docs/man/wwal-config.5 %{buildroot}%{_mandir}/man5/wwal-config.5
 
 ln -s wwal %{buildroot}%{_bindir}/swww
 ln -s wwald %{buildroot}%{_bindir}/swww-daemon
@@ -73,7 +73,7 @@ ln -s wwal %{buildroot}%{_bindir}/awww
 ln -s wwald %{buildroot}%{_bindir}/awww-daemon
 
 %check
-%meson_test --suite waywal:phase1
+%meson_test --suite waywal:core
 
 %post
 %systemd_user_post wwald.service wwald.socket
@@ -83,7 +83,7 @@ ln -s wwald %{buildroot}%{_bindir}/awww-daemon
 
 %files
 %license LICENSE
-%doc README.md
+%doc README.md CHANGELOG.md
 %{_bindir}/wwal
 %{_bindir}/wwald
 %{_userunitdir}/wwald.service
@@ -102,5 +102,5 @@ ln -s wwald %{buildroot}%{_bindir}/awww-daemon
 %{_bindir}/awww-daemon
 
 %changelog
-* Sat Oct 24 2026 Execorn <execorn@users.noreply.github.com> - 1.0.0-1
+* Mon Oct 26 2026 Execorn <execorn@users.noreply.github.com> - 1.0.0-1
 - Initial release of wwal 1.0.0

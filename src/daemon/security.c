@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -77,9 +78,9 @@ static void add_landlock_dir_rule(int ruleset_fd, const char *path, __u64 allowe
         int file_fd = open(path, O_PATH | O_CLOEXEC);
         if (file_fd >= 0) {
             struct landlock_path_beneath_attr path_attr = {
-                .allowed_access = allowed_access & (LANDLOCK_ACCESS_FS_READ_FILE |
-                                                    LANDLOCK_ACCESS_FS_WRITE_FILE |
-                                                    LANDLOCK_ACCESS_FS_EXECUTE),
+                .allowed_access =
+                    allowed_access & (LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE |
+                                      LANDLOCK_ACCESS_FS_EXECUTE),
                 .parent_fd = file_fd,
             };
             if (path_attr.allowed_access != 0) {
@@ -95,8 +96,8 @@ static bool is_sensitive_home_entry(const char *name)
     if (!name || name[0] == '\0')
         return true;
     return (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || strcmp(name, ".ssh") == 0 ||
-            strcmp(name, ".gnupg") == 0 || strcmp(name, ".aws") == 0 ||
-            strcmp(name, ".pki") == 0 || strcmp(name, ".password-store") == 0);
+            strcmp(name, ".gnupg") == 0 || strcmp(name, ".aws") == 0 || strcmp(name, ".pki") == 0 ||
+            strcmp(name, ".password-store") == 0);
 }
 
 static void apply_landlock_sandbox(const char *runtime_dir)
@@ -111,14 +112,9 @@ static void apply_landlock_sandbox(const char *runtime_dir)
     if (home && home[0]) {
         char pre_path[4096];
         const char *pre_dirs[] = {
-            ".cache",
-            ".cache/wwal",
-            ".local",
-            ".local/state",
-            ".local/state/wwal",
-            ".local/state/caelestia",
-            ".config",
-            ".config/wwal",
+            ".cache",       ".cache/wwal",       ".local",
+            ".local/state", ".local/state/wwal", ".local/state/caelestia",
+            ".config",      ".config/wwal",
         };
         for (size_t i = 0; i < sizeof(pre_dirs) / sizeof(pre_dirs[0]); ++i) {
             snprintf(pre_path, sizeof(pre_path), "%s/%s", home, pre_dirs[i]);
@@ -228,7 +224,8 @@ static void apply_landlock_sandbox(const char *runtime_dir)
     if (home && home[0]) {
         char path_buf[4096];
 
-        /* Grant read-only access across $HOME entries (excluding sensitive keystores like ~/.ssh) */
+        /* Grant read-only access across $HOME entries (excluding sensitive keystores like ~/.ssh)
+         */
         DIR *hdir = opendir(home);
         if (hdir) {
             struct dirent *ent;
@@ -252,12 +249,8 @@ static void apply_landlock_sandbox(const char *runtime_dir)
         }
 
         const char *home_rw_subdirs[] = {
-            ".cache",
-            ".cache/wwal",
-            ".local",
-            ".local/state",
-            ".local/state/wwal",
-            ".local/state/caelestia",
+            ".cache",       ".cache/wwal",       ".local",
+            ".local/state", ".local/state/wwal", ".local/state/caelestia",
         };
         for (size_t i = 0; i < sizeof(home_rw_subdirs) / sizeof(home_rw_subdirs[0]); ++i) {
             snprintf(path_buf, sizeof(path_buf), "%s/%s", home, home_rw_subdirs[i]);
@@ -289,9 +282,9 @@ bool security_sandbox_apply(const char *runtime_dir)
     if (ctx) {
         /* Denied Dangerous Syscalls -> SCMP_ACT_KILL (SOTA-09) */
         const int denied_syscalls[] = {
-            SCMP_SYS(execve), SCMP_SYS(execveat),   SCMP_SYS(fork),        SCMP_SYS(vfork),
-            SCMP_SYS(ptrace), SCMP_SYS(kill),       SCMP_SYS(mount),       SCMP_SYS(umount2),
-            SCMP_SYS(chroot), SCMP_SYS(pivot_root), SCMP_SYS(reboot),      SCMP_SYS(kexec_load),
+            SCMP_SYS(execve),      SCMP_SYS(execveat),      SCMP_SYS(fork),   SCMP_SYS(vfork),
+            SCMP_SYS(ptrace),      SCMP_SYS(kill),          SCMP_SYS(mount),  SCMP_SYS(umount2),
+            SCMP_SYS(chroot),      SCMP_SYS(pivot_root),    SCMP_SYS(reboot), SCMP_SYS(kexec_load),
             SCMP_SYS(init_module), SCMP_SYS(delete_module), SCMP_SYS(bpf),
         };
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_SHADER_ENGINE_H
 #define WAYWAL_SHADER_ENGINE_H
 

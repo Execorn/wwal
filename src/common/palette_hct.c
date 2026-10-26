@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include "waywal/palette_hct.h"
+
 #include "waywal/path.h"
 
 #include <ctype.h>
@@ -20,15 +22,15 @@
 
 extern char **environ;
 
-#define WU_BINS 32
-#define WU_GRID 33
-#define WU_MAX_BOXES 64
-#define KMEANS_K 16
-#define KMEANS_ITERS 6
+#define WU_BINS       32
+#define WU_GRID       33
+#define WU_MAX_BOXES  64
+#define KMEANS_K      16
+#define KMEANS_ITERS  6
 #define SUBSAMPLE_DIM 128
 
-#define PI_F 3.14159265358979323846f
-#define TWO_PI_F 6.28318530717958647692f
+#define PI_F         3.14159265358979323846f
+#define TWO_PI_F     6.28318530717958647692f
 #define DEG_TO_RAD_F (PI_F / 180.0f)
 #define RAD_TO_DEG_F (180.0f / PI_F)
 
@@ -59,11 +61,10 @@ static float g_srgb_to_linear[256];
 static uint8_t g_linear_to_srgb_lut[4097];
 static atomic_bool g_srgb_lut_ready = false;
 
-static inline int clamp_i(int x, int lo, int hi) {
-    return x < lo ? lo : (x > hi ? hi : x);
-}
+static inline int clamp_i(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
 
-static void ensure_srgb_lut(void) {
+static void ensure_srgb_lut(void)
+{
     if (atomic_load_explicit(&g_srgb_lut_ready, memory_order_acquire)) {
         return;
     }
@@ -85,15 +86,12 @@ static void ensure_srgb_lut(void) {
     atomic_store_explicit(&g_srgb_lut_ready, true, memory_order_release);
 }
 
-__attribute__((constructor)) static void init_palette_lut_ctor(void) {
-    ensure_srgb_lut();
-}
+__attribute__((constructor)) static void init_palette_lut_ctor(void) { ensure_srgb_lut(); }
 
-static inline float clamp_f(float x, float lo, float hi) {
-    return x < lo ? lo : (x > hi ? hi : x);
-}
+static inline float clamp_f(float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); }
 
-static inline float wrap_radians(float h) {
+static inline float wrap_radians(float h)
+{
     h = fmodf(h, TWO_PI_F);
     if (h < 0.0f) {
         h += TWO_PI_F;
@@ -101,7 +99,8 @@ static inline float wrap_radians(float h) {
     return h;
 }
 
-static inline float hue_diff_deg(float h1_deg, float h2_deg) {
+static inline float hue_diff_deg(float h1_deg, float h2_deg)
+{
     float d = fabsf(h1_deg - h2_deg);
     if (d > 180.0f) {
         d = 360.0f - d;
@@ -109,7 +108,8 @@ static inline float hue_diff_deg(float h1_deg, float h2_deg) {
     return d;
 }
 
-static inline float fast_cbrtf_scalar(float x) {
+static inline float fast_cbrtf_scalar(float x)
+{
     if (x <= 1e-24f) {
         return 0.0f;
     }
@@ -126,7 +126,8 @@ static inline float fast_cbrtf_scalar(float x) {
     return x * (r * r);
 }
 
-static inline uint8_t linear_to_srgb_u8(float c) {
+static inline uint8_t linear_to_srgb_u8(float c)
+{
     if (c <= 0.0f) {
         return 0;
     }
@@ -138,7 +139,8 @@ static inline uint8_t linear_to_srgb_u8(float c) {
     return g_linear_to_srgb_lut[clamp_i(idx, 0, 4096)];
 }
 
-static inline waywal_oklab_t linear_rgb_to_oklab(float r, float g, float b) {
+static inline waywal_oklab_t linear_rgb_to_oklab(float r, float g, float b)
+{
     float l = 0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b;
     float m = 0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b;
     float s = 0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * b;
@@ -155,7 +157,8 @@ static inline waywal_oklab_t linear_rgb_to_oklab(float r, float g, float b) {
 }
 
 static inline void oklab_to_linear_rgb(float l, float a, float b, float *out_r, float *out_g,
-                                       float *out_b) {
+                                       float *out_b)
+{
     float l_ = l + 0.3963377774f * a + 0.2158037573f * b;
     float m_ = l - 0.1055613458f * a - 0.0638541728f * b;
     float s_ = l - 0.0894841775f * a - 1.2914855480f * b;
@@ -169,14 +172,16 @@ static inline void oklab_to_linear_rgb(float l, float a, float b, float *out_r, 
     *out_b = -0.0041960863f * l3 - 0.7034186147f * m3 + 1.7076147010f * s3;
 }
 
-static inline bool linear_rgb_in_gamut(float r, float g, float b) {
+static inline bool linear_rgb_in_gamut(float r, float g, float b)
+{
     const float eps = 1e-4f;
     return (r >= -eps && r <= 1.0f + eps && g >= -eps && g <= 1.0f + eps && b >= -eps &&
             b <= 1.0f + eps);
 }
 
 #ifdef __AVX2__
-static inline __m256 avx2_cbrt_ps(__m256 x) {
+static inline __m256 avx2_cbrt_ps(__m256 x)
+{
     const __m256 eps = _mm256_set1_ps(1e-24f);
     __m256 valid_mask = _mm256_cmp_ps(x, eps, _CMP_GT_OQ);
     __m256 xc = _mm256_max_ps(x, eps);
@@ -204,7 +209,8 @@ static inline __m256 avx2_cbrt_ps(__m256 x) {
 }
 #endif
 
-static inline void wu_accum_pixel(wu_hist_t *hist, float l, float a, float b) {
+static inline void wu_accum_pixel(wu_hist_t *hist, float l, float a, float b)
+{
     int bl = clamp_i((int)(l * (float)WU_BINS) + 1, 1, WU_BINS);
     int ba = clamp_i((int)(((a + 0.4f) * (1.0f / 0.8f)) * (float)WU_BINS) + 1, 1, WU_BINS);
     int bb = clamp_i((int)(((b + 0.4f) * (1.0f / 0.8f)) * (float)WU_BINS) + 1, 1, WU_BINS);
@@ -218,13 +224,16 @@ static inline void wu_accum_pixel(wu_hist_t *hist, float l, float a, float b) {
 }
 
 static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint32_t width,
-                                    uint32_t height, uint32_t stride_bytes, bool is_bgra) {
+                                    uint32_t height, uint32_t stride_bytes, bool is_bgra)
+{
     memset(hist, 0, sizeof(*hist));
 
     uint32_t step_x = width > SUBSAMPLE_DIM ? (width / SUBSAMPLE_DIM) : 1U;
     uint32_t step_y = height > SUBSAMPLE_DIM ? (height / SUBSAMPLE_DIM) : 1U;
-    if (step_x == 0U) step_x = 1U;
-    if (step_y == 0U) step_y = 1U;
+    if (step_x == 0U)
+        step_x = 1U;
+    if (step_y == 0U)
+        step_y = 1U;
 
     size_t valid_samples = 0;
     const int r_off = is_bgra ? 2 : 0;
@@ -324,7 +333,8 @@ static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint
     return valid_samples;
 }
 
-static void wu_compute_moments(wu_hist_t *hist) {
+static void wu_compute_moments(wu_hist_t *hist)
+{
 #ifdef __AVX2__
     for (int l = 1; l <= WU_BINS; ++l) {
         __m256 area[WU_GRID];
@@ -381,7 +391,8 @@ static void wu_compute_moments(wu_hist_t *hist) {
 #endif
 }
 
-static inline wu_bin_t wu_vol_bin(const wu_box_t *box, const wu_hist_t *hist) {
+static inline wu_bin_t wu_vol_bin(const wu_box_t *box, const wu_hist_t *hist)
+{
     wu_bin_t out;
 #ifdef __AVX2__
     __m256 v = _mm256_load_ps(&hist->bins[box->l1][box->a1][box->b1].w);
@@ -411,7 +422,8 @@ static inline wu_bin_t wu_vol_bin(const wu_box_t *box, const wu_hist_t *hist) {
     return out;
 }
 
-static inline wu_bin_t wu_bottom_bin(const wu_box_t *box, int dir, const wu_hist_t *hist) {
+static inline wu_bin_t wu_bottom_bin(const wu_box_t *box, int dir, const wu_hist_t *hist)
+{
     wu_bin_t out;
     const wu_bin_t *p0, *p1, *p2, *p3;
     if (dir == 0) {
@@ -445,7 +457,8 @@ static inline wu_bin_t wu_bottom_bin(const wu_box_t *box, int dir, const wu_hist
     return out;
 }
 
-static inline wu_bin_t wu_top_bin(const wu_box_t *box, int dir, int pos, const wu_hist_t *hist) {
+static inline wu_bin_t wu_top_bin(const wu_box_t *box, int dir, int pos, const wu_hist_t *hist)
+{
     wu_bin_t out;
     const wu_bin_t *p0, *p1, *p2, *p3;
     if (dir == 0) {
@@ -479,7 +492,8 @@ static inline wu_bin_t wu_top_bin(const wu_box_t *box, int dir, int pos, const w
     return out;
 }
 
-static float wu_box_variance(const wu_hist_t *hist, const wu_box_t *box) {
+static float wu_box_variance(const wu_hist_t *hist, const wu_box_t *box)
+{
     wu_bin_t vol = wu_vol_bin(box, hist);
     if (vol.w <= 0.0f) {
         return 0.0f;
@@ -489,8 +503,8 @@ static float wu_box_variance(const wu_hist_t *hist, const wu_box_t *box) {
 }
 
 static float wu_maximize(const wu_hist_t *hist, const wu_box_t *box, int dir, int first, int last,
-                         int *out_cut, float whole_w, float whole_l, float whole_a,
-                         float whole_b) {
+                         int *out_cut, float whole_w, float whole_l, float whole_a, float whole_b)
+{
     wu_bin_t base = wu_bottom_bin(box, dir, hist);
 
     float max_score = -1.0f;
@@ -525,7 +539,8 @@ static float wu_maximize(const wu_hist_t *hist, const wu_box_t *box, int dir, in
     return max_score;
 }
 
-static bool wu_cut(const wu_hist_t *hist, wu_box_t *set1, wu_box_t *set2) {
+static bool wu_cut(const wu_hist_t *hist, wu_box_t *set1, wu_box_t *set2)
+{
     wu_bin_t whole = wu_vol_bin(set1, hist);
     if (whole.w <= 0.0f) {
         return false;
@@ -572,7 +587,8 @@ static bool wu_cut(const wu_hist_t *hist, wu_box_t *set1, wu_box_t *set2) {
     return true;
 }
 
-static size_t wu_partition(const wu_hist_t *hist, weighted_point_t *out_points, size_t max_boxes) {
+static size_t wu_partition(const wu_hist_t *hist, weighted_point_t *out_points, size_t max_boxes)
+{
     wu_box_t boxes[WU_MAX_BOXES];
     memset(boxes, 0, sizeof(boxes));
 
@@ -620,7 +636,8 @@ static size_t wu_partition(const wu_hist_t *hist, weighted_point_t *out_points, 
     return count;
 }
 
-static inline float oklab_dist_sq(float l1, float a1, float b1, float l2, float a2, float b2) {
+static inline float oklab_dist_sq(float l1, float a1, float b1, float l2, float a2, float b2)
+{
     float dl = l1 - l2;
     float da = a1 - a2;
     float db = b1 - b2;
@@ -628,7 +645,8 @@ static inline float oklab_dist_sq(float l1, float a1, float b1, float l2, float 
 }
 
 static size_t weighted_kmeans_pp(const weighted_point_t *pts, size_t n_pts,
-                                 weighted_point_t *centroids, size_t max_k) {
+                                 weighted_point_t *centroids, size_t max_k)
+{
     if (n_pts == 0) {
         return 0;
     }
@@ -738,7 +756,8 @@ static size_t weighted_kmeans_pp(const weighted_point_t *pts, size_t n_pts,
 }
 
 /* Algebraic CAM16 correlates under standard sRGB D65 viewing conditions (Li et al. 2017). */
-static waywal_cam16_t oklab_to_cam16(float l, float a, float b) {
+static waywal_cam16_t oklab_to_cam16(float l, float a, float b)
+{
     float r_lin, g_lin, b_lin;
     oklab_to_linear_rgb(l, a, b, &r_lin, &g_lin, &b_lin);
     r_lin = clamp_f(r_lin, 0.0f, 1.0f);
@@ -795,7 +814,8 @@ static waywal_cam16_t oklab_to_cam16(float l, float a, float b) {
     return out;
 }
 
-static float tone_to_oklab_l(float l_target) {
+static float tone_to_oklab_l(float l_target)
+{
     if (l_target <= 0.0f) {
         return 0.0f;
     }
@@ -805,14 +825,16 @@ static float tone_to_oklab_l(float l_target) {
     if (l_target >= 100.0f) {
         return 1.0f;
     }
-    /* Convert Material 3 CIE L* tone (0..100) to relative luminance Y, then to OKLab L = Y^(1/3). */
+    /* Convert Material 3 CIE L* tone (0..100) to relative luminance Y, then to OKLab L = Y^(1/3).
+     */
     float f = (l_target + 16.0f) * (1.0f / 116.0f);
     float y = (l_target > 8.0f) ? (f * f * f) : (l_target * (1.0f / 903.296296f));
     return fast_cbrtf_scalar(y);
 }
 
 static inline void oklab_ray_to_linear_rgb(float l_ok, float c, float dl, float dm, float ds,
-                                           float *out_r, float *out_g, float *out_b) {
+                                           float *out_r, float *out_g, float *out_b)
+{
     float l_ = l_ok + c * dl;
     float m_ = l_ok + c * dm;
     float s_ = l_ok + c * ds;
@@ -826,7 +848,8 @@ static inline void oklab_ray_to_linear_rgb(float l_ok, float c, float dl, float 
     *out_b = -0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s;
 }
 
-color_rgba_t waywal_palette_generate_tone(float l_target, float chroma, float hue_rad) {
+color_rgba_t waywal_palette_generate_tone(float l_target, float chroma, float hue_rad)
+{
     if (l_target <= 0.0f) {
         return (color_rgba_t){.r = 0, .g = 0, .b = 0, .a = 255};
     }
@@ -887,11 +910,14 @@ color_rgba_t waywal_palette_generate_tone(float l_target, float chroma, float hu
 }
 
 static color_rgba_t harmonize_semantic_color(float base_hue_deg, float base_chroma, float tone,
-                                             float primary_hue_rad, float primary_chroma) {
+                                             float primary_hue_rad, float primary_chroma)
+{
     float primary_deg = wrap_radians(primary_hue_rad) * RAD_TO_DEG_F;
     float diff = primary_deg - base_hue_deg;
-    while (diff > 180.0f) diff -= 360.0f;
-    while (diff < -180.0f) diff += 360.0f;
+    while (diff > 180.0f)
+        diff -= 360.0f;
+    while (diff < -180.0f)
+        diff += 360.0f;
 
     float max_rot = 22.0f;
     float shift = clamp_f(diff * 0.35f, -max_rot, max_rot);
@@ -903,7 +929,8 @@ static color_rgba_t harmonize_semantic_color(float base_hue_deg, float base_chro
 static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode, bool is_mono,
                                  waywal_oklch_t p_seed, waywal_oklch_t s_seed,
                                  waywal_oklch_t t_seed, waywal_oklch_t n_seed,
-                                 waywal_oklch_t nv_seed) {
+                                 waywal_oklch_t nv_seed)
+{
     memset(pal, 0, sizeof(*pal));
     pal->mode = mode;
     pal->is_monochrome = is_mono;
@@ -1062,14 +1089,15 @@ static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode
     pal->term[15] = (color_rgba_t){.r = 255, .g = 255, .b = 255, .a = 255};
 
     for (int i = 0; i < 6; ++i) {
-        pal->term[1 + i] = harmonize_semantic_color(ansi_hues[i], 0.14f, base_tone, p_seed.h_rad,
-                                                    p_seed.c);
-        pal->term[9 + i] = harmonize_semantic_color(ansi_hues[i], 0.16f, bright_tone, p_seed.h_rad,
-                                                    p_seed.c);
+        pal->term[1 + i] =
+            harmonize_semantic_color(ansi_hues[i], 0.14f, base_tone, p_seed.h_rad, p_seed.c);
+        pal->term[9 + i] =
+            harmonize_semantic_color(ansi_hues[i], 0.16f, bright_tone, p_seed.h_rad, p_seed.c);
     }
 
     float cat_tone = (mode == WAYWAL_THEME_DARK) ? 82.0f : 44.0f;
-    pal->rosewater = harmonize_semantic_color(15.0f, 0.06f, cat_tone + 8.0f, p_seed.h_rad, p_seed.c);
+    pal->rosewater =
+        harmonize_semantic_color(15.0f, 0.06f, cat_tone + 8.0f, p_seed.h_rad, p_seed.c);
     pal->flamingo = harmonize_semantic_color(12.0f, 0.09f, cat_tone + 5.0f, p_seed.h_rad, p_seed.c);
     pal->pink = harmonize_semantic_color(335.0f, 0.12f, cat_tone + 3.0f, p_seed.h_rad, p_seed.c);
     pal->mauve = harmonize_semantic_color(295.0f, 0.15f, cat_tone, p_seed.h_rad, p_seed.c);
@@ -1082,7 +1110,8 @@ static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode
     pal->sky = harmonize_semantic_color(210.0f, 0.13f, cat_tone + 3.0f, p_seed.h_rad, p_seed.c);
     pal->sapphire = harmonize_semantic_color(225.0f, 0.14f, cat_tone, p_seed.h_rad, p_seed.c);
     pal->blue = harmonize_semantic_color(255.0f, 0.15f, cat_tone, p_seed.h_rad, p_seed.c);
-    pal->lavender = harmonize_semantic_color(275.0f, 0.11f, cat_tone + 3.0f, p_seed.h_rad, p_seed.c);
+    pal->lavender =
+        harmonize_semantic_color(275.0f, 0.11f, cat_tone + 3.0f, p_seed.h_rad, p_seed.c);
 
     pal->klink = harmonize_semantic_color(250.0f, 0.14f, 62.0f, p_seed.h_rad, p_seed.c);
     pal->klinkSelection = pal->klink;
@@ -1112,7 +1141,8 @@ static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode
 
 static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t height,
                               uint32_t stride_bytes, bool is_bgra, waywal_palette_t *out_dark,
-                              waywal_palette_t *out_light) {
+                              waywal_palette_t *out_light)
+{
     if (!pixels || width == 0U || height == 0U || (!out_dark && !out_light)) {
         return false;
     }
@@ -1122,8 +1152,8 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
 
     ensure_srgb_lut();
 
-    size_t valid_samples = wu_populate_histogram(&tls_wu_hist, pixels, width, height,
-                                                 stride_bytes, is_bgra);
+    size_t valid_samples =
+        wu_populate_histogram(&tls_wu_hist, pixels, width, height, stride_bytes, is_bgra);
     if (valid_samples == 0) {
         waywal_oklch_t def_p = {.l = 0.6f, .c = 0.02f, .h_rad = 4.5f};
         waywal_oklch_t def_s = {.l = 0.6f, .c = 0.015f, .h_rad = 4.5f};
@@ -1230,10 +1260,13 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
     waywal_oklch_t p_seed, s_seed, t_seed, n_seed, nv_seed;
 
     if (is_mono || n_clusters == 0) {
-        float h = (n_clusters > 0 && cands[0].c_ok > 1e-4f) ? cands[0].h_rad : (250.0f * DEG_TO_RAD_F);
+        float h =
+            (n_clusters > 0 && cands[0].c_ok > 1e-4f) ? cands[0].h_rad : (250.0f * DEG_TO_RAD_F);
         p_seed = (waywal_oklch_t){.l = 0.65f, .c = 0.02f, .h_rad = h};
-        s_seed = (waywal_oklch_t){.l = 0.65f, .c = 0.015f, .h_rad = wrap_radians(h + 60.0f * DEG_TO_RAD_F)};
-        t_seed = (waywal_oklch_t){.l = 0.65f, .c = 0.02f, .h_rad = wrap_radians(h + 120.0f * DEG_TO_RAD_F)};
+        s_seed = (waywal_oklch_t){
+            .l = 0.65f, .c = 0.015f, .h_rad = wrap_radians(h + 60.0f * DEG_TO_RAD_F)};
+        t_seed = (waywal_oklch_t){
+            .l = 0.65f, .c = 0.02f, .h_rad = wrap_radians(h + 120.0f * DEG_TO_RAD_F)};
         n_seed = (waywal_oklch_t){.l = 0.65f, .c = 0.008f, .h_rad = h};
         nv_seed = (waywal_oklch_t){.l = 0.65f, .c = 0.014f, .h_rad = h};
     } else {
@@ -1303,27 +1336,30 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
                              nv_seed);
     }
     if (out_light) {
-        synthesize_m3_scheme(out_light, WAYWAL_THEME_LIGHT, is_mono, p_seed, s_seed, t_seed,
-                             n_seed, nv_seed);
+        synthesize_m3_scheme(out_light, WAYWAL_THEME_LIGHT, is_mono, p_seed, s_seed, t_seed, n_seed,
+                             nv_seed);
     }
     return true;
 }
 
 bool waywal_palette_extract_dual(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
                                  uint32_t stride_bytes, waywal_palette_t *out_dark,
-                                 waywal_palette_t *out_light) {
+                                 waywal_palette_t *out_light)
+{
     return extract_dual_impl(rgba_pixels, width, height, stride_bytes, false, out_dark, out_light);
 }
 
 bool waywal_palette_extract_dual_bgra(const uint8_t *bgra_pixels, uint32_t width, uint32_t height,
                                       uint32_t stride_bytes, waywal_palette_t *out_dark,
-                                      waywal_palette_t *out_light) {
+                                      waywal_palette_t *out_light)
+{
     return extract_dual_impl(bgra_pixels, width, height, stride_bytes, true, out_dark, out_light);
 }
 
 bool waywal_palette_extract(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
                             uint32_t stride_bytes, waywal_theme_mode_t mode,
-                            waywal_palette_t *out_palette) {
+                            waywal_palette_t *out_palette)
+{
     if (!out_palette) {
         return false;
     }
@@ -1336,7 +1372,8 @@ bool waywal_palette_extract(const uint8_t *rgba_pixels, uint32_t width, uint32_t
 
 bool waywal_palette_extract_bgra(const uint8_t *bgra_pixels, uint32_t width, uint32_t height,
                                  uint32_t stride_bytes, waywal_theme_mode_t mode,
-                                 waywal_palette_t *out_palette) {
+                                 waywal_palette_t *out_palette)
+{
     if (!out_palette) {
         return false;
     }
@@ -1351,7 +1388,8 @@ typedef struct {
     color_rgba_t color;
 } named_color_slot_t;
 
-static size_t collect_color_slots(const waywal_palette_t *pal, named_color_slot_t *slots) {
+static size_t collect_color_slots(const waywal_palette_t *pal, named_color_slot_t *slots)
+{
     size_t n = 0;
 #define ADD_SLOT(field)                                                                            \
     do {                                                                                           \
@@ -1474,7 +1512,8 @@ static size_t collect_color_slots(const waywal_palette_t *pal, named_color_slot_
     return n;
 }
 
-size_t waywal_palette_format_sequences(const waywal_palette_t *pal, char *out_buf, size_t buf_cap) {
+size_t waywal_palette_format_sequences(const waywal_palette_t *pal, char *out_buf, size_t buf_cap)
+{
     if (!pal || !out_buf || buf_cap == 0) {
         return 0;
     }
@@ -1484,7 +1523,8 @@ size_t waywal_palette_format_sequences(const waywal_palette_t *pal, char *out_bu
     do {                                                                                           \
         int w = snprintf(out_buf + pos, (pos < buf_cap) ? (buf_cap - pos) : 0,                     \
                          "\033]" code_str ";rgb:%02x/%02x/%02x\033\\", (col).r, (col).g, (col).b); \
-        if (w < 0) return 0;                                                                       \
+        if (w < 0)                                                                                 \
+            return 0;                                                                              \
         pos += (size_t)w;                                                                          \
     } while (0)
 
@@ -1497,7 +1537,8 @@ size_t waywal_palette_format_sequences(const waywal_palette_t *pal, char *out_bu
         int w = snprintf(out_buf + pos, (pos < buf_cap) ? (buf_cap - pos) : 0,
                          "\033]4;%d;rgb:%02x/%02x/%02x\033\\", i, pal->term[i].r, pal->term[i].g,
                          pal->term[i].b);
-        if (w < 0) return 0;
+        if (w < 0)
+            return 0;
         pos += (size_t)w;
     }
 
@@ -1513,7 +1554,8 @@ size_t waywal_palette_format_sequences(const waywal_palette_t *pal, char *out_bu
     return pos;
 }
 
-static bool mkdir_parents(const char *file_path) {
+static bool mkdir_parents(const char *file_path)
+{
     path_buf_t dir;
     path_buf_from_str(&dir, file_path);
     if (!path_buf_parent(&dir)) {
@@ -1542,7 +1584,8 @@ static bool mkdir_parents(const char *file_path) {
     return true;
 }
 
-static bool atomic_write_file(const char *target_path, const char *data, size_t len) {
+static bool atomic_write_file(const char *target_path, const char *data, size_t len)
+{
     if (!target_path || !data) {
         return false;
     }
@@ -1567,7 +1610,8 @@ static bool atomic_write_file(const char *target_path, const char *data, size_t 
     while (rem > 0) {
         ssize_t w = write(fd, p, rem);
         if (w < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             ok = false;
             break;
         }
@@ -1588,76 +1632,90 @@ static bool atomic_write_file(const char *target_path, const char *data, size_t 
 }
 
 static size_t format_caelestia_json(const waywal_palette_t *pal, const named_color_slot_t *slots,
-                                    size_t n_slots, char *buf, size_t cap) {
+                                    size_t n_slots, char *buf, size_t cap)
+{
     const char *mode_str = (pal->mode == WAYWAL_THEME_LIGHT) ? "light" : "dark";
     int n = snprintf(buf, cap,
                      "{\"name\": \"dynamic\", \"flavour\": \"default\", \"mode\": \"%s\", "
                      "\"variant\": \"tonalspot\", \"colours\": {",
                      mode_str);
-    if (n < 0 || (size_t)n >= cap) return 0;
+    if (n < 0 || (size_t)n >= cap)
+        return 0;
     size_t pos = (size_t)n;
 
     for (size_t i = 0; i < n_slots; ++i) {
         const char *sep = (i + 1 < n_slots) ? ", " : "";
         n = snprintf(buf + pos, cap - pos, "\"%s\": \"%02x%02x%02x\"%s", slots[i].name,
                      slots[i].color.r, slots[i].color.g, slots[i].color.b, sep);
-        if (n < 0 || pos + (size_t)n >= cap) return 0;
+        if (n < 0 || pos + (size_t)n >= cap)
+            return 0;
         pos += (size_t)n;
     }
 
     n = snprintf(buf + pos, cap - pos, "}}");
-    if (n < 0 || pos + (size_t)n >= cap) return 0;
+    if (n < 0 || pos + (size_t)n >= cap)
+        return 0;
     pos += (size_t)n;
     return pos;
 }
 
 static size_t format_wwal_colors_json(const waywal_palette_t *pal, const named_color_slot_t *slots,
-                                      size_t n_slots, char *buf, size_t cap) {
+                                      size_t n_slots, char *buf, size_t cap)
+{
     const char *mode_str = (pal->mode == WAYWAL_THEME_LIGHT) ? "light" : "dark";
     int n = snprintf(buf, cap, "{\n  \"mode\": \"%s\",\n  \"colors\": {\n", mode_str);
-    if (n < 0 || (size_t)n >= cap) return 0;
+    if (n < 0 || (size_t)n >= cap)
+        return 0;
     size_t pos = (size_t)n;
 
     for (size_t i = 0; i < n_slots; ++i) {
         const char *comma = (i + 1 < n_slots) ? "," : "";
         n = snprintf(buf + pos, cap - pos, "    \"%s\": \"#%02x%02x%02x\"%s\n", slots[i].name,
                      slots[i].color.r, slots[i].color.g, slots[i].color.b, comma);
-        if (n < 0 || pos + (size_t)n >= cap) return 0;
+        if (n < 0 || pos + (size_t)n >= cap)
+            return 0;
         pos += (size_t)n;
     }
 
     n = snprintf(buf + pos, cap - pos, "  }\n}\n");
-    if (n < 0 || pos + (size_t)n >= cap) return 0;
+    if (n < 0 || pos + (size_t)n >= cap)
+        return 0;
     pos += (size_t)n;
     return pos;
 }
 
 static size_t format_wwal_css(const named_color_slot_t *slots, size_t n_slots, char *buf,
-                              size_t cap) {
+                              size_t cap)
+{
     int n = snprintf(buf, cap, ":root {\n");
-    if (n < 0 || (size_t)n >= cap) return 0;
+    if (n < 0 || (size_t)n >= cap)
+        return 0;
     size_t pos = (size_t)n;
 
     for (size_t i = 0; i < n_slots; ++i) {
         n = snprintf(buf + pos, cap - pos, "  --%s: #%02x%02x%02x;\n", slots[i].name,
                      slots[i].color.r, slots[i].color.g, slots[i].color.b);
-        if (n < 0 || pos + (size_t)n >= cap) return 0;
+        if (n < 0 || pos + (size_t)n >= cap)
+            return 0;
         pos += (size_t)n;
     }
 
     n = snprintf(buf + pos, cap - pos, "}\n");
-    if (n < 0 || pos + (size_t)n >= cap) return 0;
+    if (n < 0 || pos + (size_t)n >= cap)
+        return 0;
     pos += (size_t)n;
     return pos;
 }
 
 static size_t format_wwal_hyprland(const named_color_slot_t *slots, size_t n_slots, char *buf,
-                                   size_t cap) {
+                                   size_t cap)
+{
     size_t pos = 0;
     for (size_t i = 0; i < n_slots; ++i) {
         int n = snprintf(buf + pos, cap - pos, "$%s = rgba(%02x%02x%02xff)\n", slots[i].name,
                          slots[i].color.r, slots[i].color.g, slots[i].color.b);
-        if (n < 0 || pos + (size_t)n >= cap) return 0;
+        if (n < 0 || pos + (size_t)n >= cap)
+            return 0;
         pos += (size_t)n;
     }
     return pos;
@@ -1665,7 +1723,8 @@ static size_t format_wwal_hyprland(const named_color_slot_t *slots, size_t n_slo
 
 static bool render_single_template(const waywal_palette_t *pal, const named_color_slot_t *slots,
                                    size_t n_slots, const char *src, size_t src_len,
-                                   const char *out_path) {
+                                   const char *out_path)
+{
     size_t cap = src_len * 2 + 4096;
     char *out = (char *)malloc(cap);
     if (!out) {
@@ -1689,7 +1748,8 @@ static bool render_single_template(const waywal_palette_t *pal, const named_colo
 
                 /* Trim whitespace inside {{ ... }} */
                 char *start_p = expr;
-                while (*start_p && isspace((unsigned char)*start_p)) start_p++;
+                while (*start_p && isspace((unsigned char)*start_p))
+                    start_p++;
                 char *end_p = start_p + strlen(start_p);
                 while (end_p > start_p && isspace((unsigned char)end_p[-1])) {
                     *(--end_p) = '\0';
@@ -1715,11 +1775,11 @@ static bool render_single_template(const waywal_palette_t *pal, const named_colo
                                 rep_len = snprintf(replacement, sizeof(replacement),
                                                    "#%02x%02x%02x", c.r, c.g, c.b);
                             } else if (strcmp(fmt, "strip") == 0) {
-                                rep_len = snprintf(replacement, sizeof(replacement),
-                                                   "%02x%02x%02x", c.r, c.g, c.b);
+                                rep_len = snprintf(replacement, sizeof(replacement), "%02x%02x%02x",
+                                                   c.r, c.g, c.b);
                             } else if (strcmp(fmt, "rgb") == 0) {
-                                rep_len = snprintf(replacement, sizeof(replacement),
-                                                   "%u, %u, %u", c.r, c.g, c.b);
+                                rep_len = snprintf(replacement, sizeof(replacement), "%u, %u, %u",
+                                                   c.r, c.g, c.b);
                             } else if (strcmp(fmt, "rgba") == 0) {
                                 rep_len = snprintf(replacement, sizeof(replacement),
                                                    "rgba(%u, %u, %u, 1.0)", c.r, c.g, c.b);
@@ -1767,7 +1827,8 @@ static bool render_single_template(const waywal_palette_t *pal, const named_colo
 }
 
 bool waywal_palette_render_templates(const waywal_palette_t *pal, const char *templates_dir,
-                                     const char *out_dir) {
+                                     const char *out_dir)
+{
     if (!pal) {
         return false;
     }
@@ -1850,10 +1911,12 @@ bool waywal_palette_render_templates(const waywal_palette_t *pal, const char *te
         while (nread_total < fsize) {
             ssize_t r = read(fd, buf + nread_total, fsize - nread_total);
             if (r < 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR)
+                    continue;
                 break;
             }
-            if (r == 0) break;
+            if (r == 0)
+                break;
             nread_total += (size_t)r;
         }
         close(fd);
@@ -1870,7 +1933,8 @@ bool waywal_palette_render_templates(const waywal_palette_t *pal, const char *te
     return true;
 }
 
-bool waywal_palette_run_hook(const char *cmd) {
+bool waywal_palette_run_hook(const char *cmd)
+{
     if (!cmd || cmd[0] == '\0') {
         return false;
     }
@@ -1881,7 +1945,8 @@ bool waywal_palette_run_hook(const char *cmd) {
     return (rc == 0);
 }
 
-bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override_base_dir) {
+bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override_base_dir)
+{
     if (!pal) {
         return false;
     }
@@ -1895,9 +1960,11 @@ bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override
     char colors_css[16384];
     char colors_hypr[16384];
 
-    size_t scheme_len = format_caelestia_json(pal, slots, n_slots, scheme_json, sizeof(scheme_json));
+    size_t scheme_len =
+        format_caelestia_json(pal, slots, n_slots, scheme_json, sizeof(scheme_json));
     size_t seq_len = waywal_palette_format_sequences(pal, seq_txt, sizeof(seq_txt));
-    size_t cjson_len = format_wwal_colors_json(pal, slots, n_slots, colors_json, sizeof(colors_json));
+    size_t cjson_len =
+        format_wwal_colors_json(pal, slots, n_slots, colors_json, sizeof(colors_json));
     size_t ccss_len = format_wwal_css(slots, n_slots, colors_css, sizeof(colors_css));
     size_t chypr_len = format_wwal_hyprland(slots, n_slots, colors_hypr, sizeof(colors_hypr));
 
@@ -2016,7 +2083,8 @@ bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override
     return true;
 }
 
-static bool is_numeric_name(const char *s) {
+static bool is_numeric_name(const char *s)
+{
     if (!s || *s == '\0') {
         return false;
     }
@@ -2028,7 +2096,8 @@ static bool is_numeric_name(const char *s) {
     return true;
 }
 
-bool waywal_palette_broadcast_tty(const waywal_palette_t *pal) {
+bool waywal_palette_broadcast_tty(const waywal_palette_t *pal)
+{
     if (!pal) {
         return false;
     }

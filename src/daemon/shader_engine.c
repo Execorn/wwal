@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include "waywal/shader_engine.h"
+
 #include "waywal/log.h"
 
 #if __has_include("linux-dmabuf-v1-client-protocol.h")
@@ -415,9 +417,7 @@ waywal_shader_engine_t *waywal_shader_engine_create(dmabuf_context_t *dmabuf_ctx
         }
 
         static const EGLint ctx_attribs[] = {
-            EGL_CONTEXT_MAJOR_VERSION, 3,
-            EGL_CONTEXT_MINOR_VERSION, 1,
-            EGL_NONE,
+            EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE,
         };
         EGLContext ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, ctx_attribs);
         if (ctx == EGL_NO_CONTEXT || !eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {

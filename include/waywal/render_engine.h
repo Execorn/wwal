@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_RENDER_ENGINE_H
 #define WAYWAL_RENDER_ENGINE_H
 
@@ -92,7 +93,6 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                                           const uint32_t *new_pixels, uint32_t width,
                                           uint32_t height, uint32_t stride_bytes,
                                           const waywal_transition_params_t *params);
-
 
 #ifdef __cplusplus
 }

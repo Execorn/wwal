@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Default to text with LF normalization
+* text=auto eol=lf
+
+# Source code & build scripts
+*.c      text diff=cpp
+*.h      text diff=cpp
+*.comp   text
+*.scd    text
+*.1      text
+*.5      text
+*.sh     text eol=lf
+*.py     text diff=python
+*.xml    text
+*.yml    text
+*.yaml   text
+*.md     text
+*.nix    text
+meson.build       text
+meson_options.txt text
+
+# Binary test vectors and showcase media
+*.bmp    binary
+*.png    binary
+*.webp   binary
+*.mp4    binary
+
+# Exclude repo/CI metadata and heavy README demo assets from release tarballs (git archive / meson dist)
+.clang-format     export-ignore
+.clang-tidy       export-ignore
+.editorconfig     export-ignore
+.gitattributes    export-ignore
+.gitignore        export-ignore
+.github/          export-ignore
+assets/           export-ignore

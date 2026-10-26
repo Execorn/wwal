@@ -1,25 +1,27 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/ipc_proto.h"
+
 #include "waywal/log.h"
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
+#include <fcntl.h>
 #include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 static bool g_socket_activated = false;
 
-bool waywal_ipc_is_socket_activated(void) {
-    return g_socket_activated;
-}
+bool waywal_ipc_is_socket_activated(void) { return g_socket_activated; }
 
-bool waywal_ipc_resolve_socket_path(path_buf_t *out_path, const char *namespace_str) {
-    if (!out_path) return false;
+bool waywal_ipc_resolve_socket_path(path_buf_t *out_path, const char *namespace_str)
+{
+    if (!out_path)
+        return false;
 
     const char *xdg = getenv("XDG_RUNTIME_DIR");
     if (!xdg || xdg[0] == '\0') {
@@ -47,7 +49,8 @@ bool waywal_ipc_resolve_socket_path(path_buf_t *out_path, const char *namespace_
     return path_buf_push(out_path, filename);
 }
 
-int waywal_ipc_server_create(const char *namespace_str) {
+int waywal_ipc_server_create(const char *namespace_str)
+{
     const char *listen_pid = getenv("LISTEN_PID");
     const char *listen_fds = getenv("LISTEN_FDS");
     if (listen_pid && listen_fds && atoi(listen_pid) == (int)getpid() && atoi(listen_fds) >= 1) {
@@ -100,7 +103,8 @@ int waywal_ipc_server_create(const char *namespace_str) {
                 WAYWAL_LOG_WARN("Unlinking stale IPC socket at %s", addr.sun_path);
                 unlink(addr.sun_path);
             } else {
-                WAYWAL_LOG_ERR("Failed to test existing socket %s: %s", addr.sun_path, strerror(err));
+                WAYWAL_LOG_ERR("Failed to test existing socket %s: %s", addr.sun_path,
+                               strerror(err));
                 return -1;
             }
         }
@@ -129,7 +133,8 @@ int waywal_ipc_server_create(const char *namespace_str) {
     return sfd;
 }
 
-static int connect_unix_socket_path(const char *sock_path, int timeout_ms) {
+static int connect_unix_socket_path(const char *sock_path, int timeout_ms)
+{
     if (!sock_path || sock_path[0] == '\0') {
         return -1;
     }
@@ -173,7 +178,7 @@ static int connect_unix_socket_path(const char *sock_path, int timeout_ms) {
         return cfd;
     }
 
-    struct pollfd pfd = { .fd = cfd, .events = POLLOUT };
+    struct pollfd pfd = {.fd = cfd, .events = POLLOUT};
     int poll_res = poll(&pfd, 1, timeout_ms);
     if (poll_res <= 0) {
         close(cfd);
@@ -193,7 +198,8 @@ static int connect_unix_socket_path(const char *sock_path, int timeout_ms) {
     return cfd;
 }
 
-int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms) {
+int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms)
+{
     path_buf_t sock_path;
     if (!waywal_ipc_resolve_socket_path(&sock_path, namespace_str)) {
         return -1;
@@ -222,16 +228,15 @@ int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms) {
     return -1;
 }
 
-bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd) {
-    if (socket_fd < 0 || !hdr) return false;
+bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd)
+{
+    if (socket_fd < 0 || !hdr)
+        return false;
 
     struct msghdr msg;
     memset(&msg, 0, sizeof(msg));
 
-    struct iovec iov = {
-        .iov_base = (void *)hdr,
-        .iov_len  = sizeof(waywal_ipc_hdr_t)
-    };
+    struct iovec iov = {.iov_base = (void *)hdr, .iov_len = sizeof(waywal_ipc_hdr_t)};
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
 
@@ -247,8 +252,8 @@ bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd
 
         struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
         cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type  = SCM_RIGHTS;
-        cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(cmsg), &attached_fd, sizeof(int));
     }
 
@@ -260,17 +265,17 @@ bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd
     return (sent == (ssize_t)sizeof(waywal_ipc_hdr_t));
 }
 
-bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached_fd) {
-    if (socket_fd < 0 || !out_hdr) return false;
-    if (out_attached_fd) *out_attached_fd = -1;
+bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached_fd)
+{
+    if (socket_fd < 0 || !out_hdr)
+        return false;
+    if (out_attached_fd)
+        *out_attached_fd = -1;
 
     struct msghdr msg;
     memset(&msg, 0, sizeof(msg));
 
-    struct iovec iov = {
-        .iov_base = (void *)out_hdr,
-        .iov_len  = sizeof(waywal_ipc_hdr_t)
-    };
+    struct iovec iov = {.iov_base = (void *)out_hdr, .iov_len = sizeof(waywal_ipc_hdr_t)};
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
 
@@ -316,23 +321,28 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
     size_t total_read = (size_t)r;
     uint8_t *hdr_bytes = (uint8_t *)out_hdr;
     while (total_read < sizeof(waywal_ipc_hdr_t)) {
-        ssize_t rem = recv(socket_fd, hdr_bytes + total_read, sizeof(waywal_ipc_hdr_t) - total_read, 0);
+        ssize_t rem =
+            recv(socket_fd, hdr_bytes + total_read, sizeof(waywal_ipc_hdr_t) - total_read, 0);
         if (rem < 0) {
-            if (errno == EINTR) continue;
-            if (received_fd >= 0) close(received_fd);
+            if (errno == EINTR)
+                continue;
+            if (received_fd >= 0)
+                close(received_fd);
             return false;
         }
         if (rem == 0) {
-            if (received_fd >= 0) close(received_fd);
+            if (received_fd >= 0)
+                close(received_fd);
             return false;
         }
         total_read += (size_t)rem;
     }
 
     if (out_hdr->magic != WAYWAL_IPC_MAGIC || out_hdr->version != WAYWAL_IPC_VERSION) {
-        WAYWAL_LOG_ERR("IPC header magic/version mismatch: magic=0x%08x ver=%u",
-                     out_hdr->magic, out_hdr->version);
-        if (received_fd >= 0) close(received_fd);
+        WAYWAL_LOG_ERR("IPC header magic/version mismatch: magic=0x%08x ver=%u", out_hdr->magic,
+                       out_hdr->version);
+        if (received_fd >= 0)
+            close(received_fd);
         return false;
     }
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 complete -c wwal -f
 
 set -l trans_types "none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random"

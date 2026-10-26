@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_GPU_COMPUTE_H
 #define WAYWAL_GPU_COMPUTE_H
 
@@ -38,10 +39,9 @@ bool gpu_compute_prepare_shm(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t
                              const uint32_t *new_pixels);
 
 /* Dispatches compute shader to target texture and reads back result into dst_pixels */
-bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_old,
-                                         uint32_t tex_new, uint32_t tex_target,
-                                         uint32_t fbo, uint32_t width, uint32_t height,
-                                         const waywal_transition_params_t *params,
+bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_old, uint32_t tex_new,
+                                         uint32_t tex_target, uint32_t fbo, uint32_t width,
+                                         uint32_t height, const waywal_transition_params_t *params,
                                          uint32_t *dst_pixels);
 
 /* Releases GL textures and FBO allocated for SHM output */

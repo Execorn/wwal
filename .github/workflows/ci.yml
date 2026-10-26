@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 name: CI
 
 on:
@@ -8,6 +10,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-test:
@@ -21,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install build and Wayland dependencies
         run: |
@@ -62,6 +68,7 @@ jobs:
         run: |
           if [ "${{ matrix.profile }}" = "release" ]; then
             meson setup build \
+              --prefix=/usr \
               --buildtype=release \
               -Doptimization=3 \
               -Db_lto=true \
@@ -73,6 +80,7 @@ jobs:
               -Denable_systemd=true
           else
             meson setup build \
+              --prefix=/usr \
               --buildtype=debug \
               -Doptimization=1 \
               -Db_lto=false \
@@ -87,6 +95,10 @@ jobs:
 
       - name: Compile targets
         run: meson compile -C build
+
+      - name: Verify Meson installation staging
+        if: matrix.profile == 'release'
+        run: DESTDIR=/tmp/wwal-stage meson install -C build
 
       - name: Run Meson test suite
         env:

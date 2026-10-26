@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include "waywal/toml_parser.h"
+
 #include "waywal/log.h"
 
 #include <ctype.h>
@@ -37,7 +39,8 @@ typedef struct {
 static void set_error(toml_lexer_t *lex, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
-static void set_error(toml_lexer_t *lex, const char *fmt, ...) {
+static void set_error(toml_lexer_t *lex, const char *fmt, ...)
+{
     if (!lex || !lex->err_buf || lex->err_cap == 0) {
         return;
     }
@@ -51,7 +54,8 @@ static void set_error(toml_lexer_t *lex, const char *fmt, ...) {
     va_end(ap);
 }
 
-static void copy_str_safe(char *dst, size_t cap, const char *src) {
+static void copy_str_safe(char *dst, size_t cap, const char *src)
+{
     if (!dst || cap == 0) {
         return;
     }
@@ -67,45 +71,78 @@ static void copy_str_safe(char *dst, size_t cap, const char *src) {
     dst[n] = '\0';
 }
 
-static uint32_t parse_transition_type_str(const char *s) {
-    if (!s) return 2U;
-    if (strcasecmp(s, "none") == 0) return 0U;
-    if (strcasecmp(s, "simple") == 0) return 1U;
-    if (strcasecmp(s, "fade") == 0) return 2U;
-    if (strcasecmp(s, "wipe") == 0) return 3U;
-    if (strcasecmp(s, "grow") == 0) return 4U;
-    if (strcasecmp(s, "outer") == 0) return 5U;
-    if (strcasecmp(s, "wave") == 0) return 6U;
-    if (strcasecmp(s, "noise") == 0 || strcasecmp(s, "dissolve") == 0) return 7U;
-    if (strcasecmp(s, "crosszoom") == 0) return 8U;
-    if (strcasecmp(s, "slide") == 0) return 9U;
-    if (strcasecmp(s, "glitch") == 0) return 10U;
-    if (strcasecmp(s, "burn") == 0) return 11U;
-    if (strcasecmp(s, "ripple") == 0) return 12U;
-    if (strcasecmp(s, "pixelate") == 0) return 13U;
-    if (strcasecmp(s, "doom") == 0) return 14U;
-    if (strcasecmp(s, "swirl") == 0) return 15U;
-    if (strcasecmp(s, "cube") == 0) return 16U;
-    if (strcasecmp(s, "luma") == 0) return 17U;
-    if (strcasecmp(s, "light_leak") == 0 || strcasecmp(s, "light-leak") == 0) return 18U;
-    if (strcasecmp(s, "page_curl") == 0 || strcasecmp(s, "page-curl") == 0) return 19U;
-    if (strcasecmp(s, "custom") == 0) return 20U;
-    if (strcasecmp(s, "random") == 0 || strcasecmp(s, "any") == 0) return 21U;
+static uint32_t parse_transition_type_str(const char *s)
+{
+    if (!s)
+        return 2U;
+    if (strcasecmp(s, "none") == 0)
+        return 0U;
+    if (strcasecmp(s, "simple") == 0)
+        return 1U;
+    if (strcasecmp(s, "fade") == 0)
+        return 2U;
+    if (strcasecmp(s, "wipe") == 0)
+        return 3U;
+    if (strcasecmp(s, "grow") == 0)
+        return 4U;
+    if (strcasecmp(s, "outer") == 0)
+        return 5U;
+    if (strcasecmp(s, "wave") == 0)
+        return 6U;
+    if (strcasecmp(s, "noise") == 0 || strcasecmp(s, "dissolve") == 0)
+        return 7U;
+    if (strcasecmp(s, "crosszoom") == 0)
+        return 8U;
+    if (strcasecmp(s, "slide") == 0)
+        return 9U;
+    if (strcasecmp(s, "glitch") == 0)
+        return 10U;
+    if (strcasecmp(s, "burn") == 0)
+        return 11U;
+    if (strcasecmp(s, "ripple") == 0)
+        return 12U;
+    if (strcasecmp(s, "pixelate") == 0)
+        return 13U;
+    if (strcasecmp(s, "doom") == 0)
+        return 14U;
+    if (strcasecmp(s, "swirl") == 0)
+        return 15U;
+    if (strcasecmp(s, "cube") == 0)
+        return 16U;
+    if (strcasecmp(s, "luma") == 0)
+        return 17U;
+    if (strcasecmp(s, "light_leak") == 0 || strcasecmp(s, "light-leak") == 0)
+        return 18U;
+    if (strcasecmp(s, "page_curl") == 0 || strcasecmp(s, "page-curl") == 0)
+        return 19U;
+    if (strcasecmp(s, "custom") == 0)
+        return 20U;
+    if (strcasecmp(s, "random") == 0 || strcasecmp(s, "any") == 0)
+        return 21U;
     return 2U;
 }
 
-static waywal_scaling_mode_t parse_scaling_str(const char *s) {
-    if (!s) return WAYWAL_SCALING_FILL;
-    if (strcasecmp(s, "fill") == 0 || strcasecmp(s, "crop") == 0) return WAYWAL_SCALING_FILL;
-    if (strcasecmp(s, "fit") == 0) return WAYWAL_SCALING_FIT;
-    if (strcasecmp(s, "stretch") == 0) return WAYWAL_SCALING_STRETCH;
-    if (strcasecmp(s, "center") == 0 || strcasecmp(s, "no") == 0) return WAYWAL_SCALING_CENTER;
-    if (strcasecmp(s, "tile") == 0) return WAYWAL_SCALING_TILE;
+static waywal_scaling_mode_t parse_scaling_str(const char *s)
+{
+    if (!s)
+        return WAYWAL_SCALING_FILL;
+    if (strcasecmp(s, "fill") == 0 || strcasecmp(s, "crop") == 0)
+        return WAYWAL_SCALING_FILL;
+    if (strcasecmp(s, "fit") == 0)
+        return WAYWAL_SCALING_FIT;
+    if (strcasecmp(s, "stretch") == 0)
+        return WAYWAL_SCALING_STRETCH;
+    if (strcasecmp(s, "center") == 0 || strcasecmp(s, "no") == 0)
+        return WAYWAL_SCALING_CENTER;
+    if (strcasecmp(s, "tile") == 0)
+        return WAYWAL_SCALING_TILE;
     return WAYWAL_SCALING_FILL;
 }
 
-static waywal_filter_mode_t parse_filter_str(const char *s) {
-    if (!s) return WAYWAL_FILTER_LANCZOS3;
+static waywal_filter_mode_t parse_filter_str(const char *s)
+{
+    if (!s)
+        return WAYWAL_FILTER_LANCZOS3;
     if (strcasecmp(s, "lanczos3") == 0 || strcasecmp(s, "lanczos") == 0) {
         return WAYWAL_FILTER_LANCZOS3;
     }
@@ -121,7 +158,8 @@ static waywal_filter_mode_t parse_filter_str(const char *s) {
     return WAYWAL_FILTER_LANCZOS3;
 }
 
-void waywal_config_init_defaults(waywal_config_t *out_cfg) {
+void waywal_config_init_defaults(waywal_config_t *out_cfg)
+{
     if (!out_cfg) {
         return;
     }
@@ -173,7 +211,8 @@ void waywal_config_init_defaults(waywal_config_t *out_cfg) {
     out_cfg->transition.stagger_delay_ms = 0U;
 }
 
-static void skip_horizontal_ws(toml_lexer_t *lex) {
+static void skip_horizontal_ws(toml_lexer_t *lex)
+{
     while (lex->pos < lex->len) {
         char c = lex->src[lex->pos];
         if (c == ' ' || c == '\t' || c == '\r') {
@@ -184,7 +223,8 @@ static void skip_horizontal_ws(toml_lexer_t *lex) {
     }
 }
 
-static void skip_ws_and_comments(toml_lexer_t *lex) {
+static void skip_ws_and_comments(toml_lexer_t *lex)
+{
     while (lex->pos < lex->len) {
         char c = lex->src[lex->pos];
         if (c == ' ' || c == '\t' || c == '\r') {
@@ -202,11 +242,10 @@ static void skip_ws_and_comments(toml_lexer_t *lex) {
     }
 }
 
-static bool is_bare_key_char(char c) {
-    return isalnum((unsigned char)c) || c == '_' || c == '-';
-}
+static bool is_bare_key_char(char c) { return isalnum((unsigned char)c) || c == '_' || c == '-'; }
 
-static bool parse_quoted_string(toml_lexer_t *lex, char *out_buf, size_t out_cap) {
+static bool parse_quoted_string(toml_lexer_t *lex, char *out_buf, size_t out_cap)
+{
     if (lex->pos >= lex->len) {
         set_error(lex, "unexpected end of input while expecting string");
         return false;
@@ -271,7 +310,8 @@ static bool parse_quoted_string(toml_lexer_t *lex, char *out_buf, size_t out_cap
     return false;
 }
 
-static bool parse_key_segment(toml_lexer_t *lex, char *out_buf, size_t out_cap) {
+static bool parse_key_segment(toml_lexer_t *lex, char *out_buf, size_t out_cap)
+{
     skip_horizontal_ws(lex);
     if (lex->pos >= lex->len) {
         set_error(lex, "expected key");
@@ -304,7 +344,8 @@ static bool parse_key_segment(toml_lexer_t *lex, char *out_buf, size_t out_cap) 
     return true;
 }
 
-static bool parse_number_token(toml_lexer_t *lex, char *num_buf, size_t num_cap) {
+static bool parse_number_token(toml_lexer_t *lex, char *num_buf, size_t num_cap)
+{
     skip_horizontal_ws(lex);
     size_t w = 0;
     while (lex->pos < lex->len) {
@@ -330,7 +371,8 @@ static bool parse_number_token(toml_lexer_t *lex, char *num_buf, size_t num_cap)
     return true;
 }
 
-static bool parse_bool_val(toml_lexer_t *lex, bool *out_val) {
+static bool parse_bool_val(toml_lexer_t *lex, bool *out_val)
+{
     skip_horizontal_ws(lex);
     if (lex->pos + 4 <= lex->len && strncmp(lex->src + lex->pos, "true", 4) == 0 &&
         (lex->pos + 4 == lex->len || !is_bare_key_char(lex->src[lex->pos + 4]))) {
@@ -348,7 +390,8 @@ static bool parse_bool_val(toml_lexer_t *lex, bool *out_val) {
     return false;
 }
 
-static bool parse_uint32_val(toml_lexer_t *lex, uint32_t *out_val) {
+static bool parse_uint32_val(toml_lexer_t *lex, uint32_t *out_val)
+{
     char buf[64];
     if (!parse_number_token(lex, buf, sizeof(buf))) {
         return false;
@@ -368,7 +411,8 @@ static bool parse_uint32_val(toml_lexer_t *lex, uint32_t *out_val) {
     return true;
 }
 
-static bool parse_float_val(toml_lexer_t *lex, float *out_val) {
+static bool parse_float_val(toml_lexer_t *lex, float *out_val)
+{
     char buf[64];
     if (!parse_number_token(lex, buf, sizeof(buf))) {
         return false;
@@ -384,7 +428,8 @@ static bool parse_float_val(toml_lexer_t *lex, float *out_val) {
     return true;
 }
 
-static bool parse_float_array(toml_lexer_t *lex, float *out_arr, size_t expected_count) {
+static bool parse_float_array(toml_lexer_t *lex, float *out_arr, size_t expected_count)
+{
     skip_horizontal_ws(lex);
     if (lex->pos >= lex->len || lex->src[lex->pos] != '[') {
         set_error(lex, "expected '[' to start float array");
@@ -429,7 +474,8 @@ static bool parse_float_array(toml_lexer_t *lex, float *out_arr, size_t expected
     return false;
 }
 
-static bool parse_color_val(toml_lexer_t *lex, uint32_t *out_color) {
+static bool parse_color_val(toml_lexer_t *lex, uint32_t *out_color)
+{
     skip_horizontal_ws(lex);
     if (lex->pos < lex->len && (lex->src[lex->pos] == '"' || lex->src[lex->pos] == '\'')) {
         char s[64];
@@ -437,8 +483,10 @@ static bool parse_color_val(toml_lexer_t *lex, uint32_t *out_color) {
             return false;
         }
         const char *p = s;
-        if (*p == '#') p++;
-        else if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+        if (*p == '#')
+            p++;
+        else if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+            p += 2;
         size_t hex_len = strlen(p);
         if (hex_len != 6 && hex_len != 8) {
             set_error(lex, "invalid hex color string '%s'", s);
@@ -466,7 +514,8 @@ static bool parse_color_val(toml_lexer_t *lex, uint32_t *out_color) {
     return parse_uint32_val(lex, out_color);
 }
 
-static void apply_pos_string(waywal_transition_config_t *tr) {
+static void apply_pos_string(waywal_transition_config_t *tr)
+{
     if (!tr || tr->pos[0] == '\0') {
         return;
     }
@@ -514,7 +563,8 @@ static void apply_pos_string(waywal_transition_config_t *tr) {
     }
 }
 
-static bool consume_line_remainder(toml_lexer_t *lex) {
+static bool consume_line_remainder(toml_lexer_t *lex)
+{
     skip_horizontal_ws(lex);
     if (lex->pos >= lex->len) {
         return true;
@@ -534,7 +584,8 @@ static bool consume_line_remainder(toml_lexer_t *lex) {
 }
 
 static waywal_output_rule_t *get_or_create_output_rule(waywal_config_t *cfg, const char *name,
-                                                       toml_lexer_t *lex) {
+                                                       toml_lexer_t *lex)
+{
     for (size_t i = 0; i < cfg->output_count; ++i) {
         if (strcmp(cfg->outputs[i].output_name, name) == 0) {
             return &cfg->outputs[i];
@@ -559,9 +610,9 @@ static waywal_output_rule_t *get_or_create_output_rule(waywal_config_t *cfg, con
     return rule;
 }
 
-static waywal_workspace_rule_t *get_or_create_workspace_rule(waywal_config_t *cfg,
-                                                             const char *name,
-                                                             toml_lexer_t *lex) {
+static waywal_workspace_rule_t *get_or_create_workspace_rule(waywal_config_t *cfg, const char *name,
+                                                             toml_lexer_t *lex)
+{
     for (size_t i = 0; i < cfg->workspace_count; ++i) {
         if (strcmp(cfg->workspaces[i].workspace_name, name) == 0) {
             return &cfg->workspaces[i];
@@ -580,7 +631,8 @@ static waywal_workspace_rule_t *get_or_create_workspace_rule(waywal_config_t *cf
 }
 
 bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, char *err_buf,
-                                size_t err_cap) {
+                                size_t err_cap)
+{
     if (err_buf && err_cap > 0) {
         err_buf[0] = '\0';
     }
@@ -736,32 +788,40 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                 }
             } else if (strcmp(key, "auto_pause_fullscreen") == 0 ||
                        strcmp(key, "pause_on_fullscreen") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->daemon.auto_pause_fullscreen)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->daemon.auto_pause_fullscreen))
+                    return false;
             } else if (strcmp(key, "auto_pause_maximized") == 0 ||
                        strcmp(key, "pause_on_maximized") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->daemon.auto_pause_maximized)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->daemon.auto_pause_maximized))
+                    return false;
             } else if (strcmp(key, "idle_timeout_sec") == 0) {
-                if (!parse_uint32_val(&lex, &out_cfg->daemon.idle_timeout_sec)) return false;
+                if (!parse_uint32_val(&lex, &out_cfg->daemon.idle_timeout_sec))
+                    return false;
             } else if (strcmp(key, "ten_bit") == 0 || strcmp(key, "10bit") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->daemon.ten_bit)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->daemon.ten_bit))
+                    return false;
             } else if (strcmp(key, "backdrop") == 0) {
                 if (!parse_quoted_string(&lex, out_cfg->daemon.backdrop,
                                          sizeof(out_cfg->daemon.backdrop))) {
                     return false;
                 }
             } else if (strcmp(key, "restore_on_start") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->daemon.restore_on_start)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->daemon.restore_on_start))
+                    return false;
             } else if (strcmp(key, "pause_on_occluded_workspace") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->daemon.pause_on_occluded_workspace)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->daemon.pause_on_occluded_workspace))
+                    return false;
             } else if (strcmp(key, "pause_on_idle") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->daemon.pause_on_idle)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->daemon.pause_on_idle))
+                    return false;
             } else {
                 set_error(&lex, "unknown key '%s' in [daemon]", key);
                 return false;
             }
         } else if (section == SECTION_THEME) {
             if (strcmp(key, "enabled") == 0 || strcmp(key, "enable") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->theme.enabled)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->theme.enabled))
+                    return false;
             } else if (strcmp(key, "mode") == 0) {
                 if (!parse_quoted_string(&lex, out_cfg->theme.mode, sizeof(out_cfg->theme.mode))) {
                     return false;
@@ -776,20 +836,25 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                     return false;
                 }
             } else if (strcmp(key, "caelestia_sync") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->theme.caelestia_sync)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->theme.caelestia_sync))
+                    return false;
             } else if (strcmp(key, "tty_sequences") == 0 || strcmp(key, "terminal_osc") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->theme.tty_sequences)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->theme.tty_sequences))
+                    return false;
             } else if (strcmp(key, "scheme_variant") == 0) {
                 if (!parse_quoted_string(&lex, out_cfg->theme.scheme_variant,
                                          sizeof(out_cfg->theme.scheme_variant))) {
                     return false;
                 }
             } else if (strcmp(key, "contrast") == 0) {
-                if (!parse_float_val(&lex, &out_cfg->theme.contrast)) return false;
+                if (!parse_float_val(&lex, &out_cfg->theme.contrast))
+                    return false;
             } else if (strcmp(key, "export_css") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->theme.export_css)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->theme.export_css))
+                    return false;
             } else if (strcmp(key, "export_hyprland") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->theme.export_hyprland)) return false;
+                if (!parse_bool_val(&lex, &out_cfg->theme.export_hyprland))
+                    return false;
             } else {
                 set_error(&lex, "unknown key '%s' in [theme]", key);
                 return false;
@@ -802,13 +867,17 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                 }
                 out_cfg->transition.type_enum = parse_transition_type_str(out_cfg->transition.type);
             } else if (strcmp(key, "duration") == 0) {
-                if (!parse_float_val(&lex, &out_cfg->transition.duration)) return false;
+                if (!parse_float_val(&lex, &out_cfg->transition.duration))
+                    return false;
             } else if (strcmp(key, "fps") == 0) {
-                if (!parse_uint32_val(&lex, &out_cfg->transition.fps)) return false;
+                if (!parse_uint32_val(&lex, &out_cfg->transition.fps))
+                    return false;
             } else if (strcmp(key, "bezier") == 0) {
-                if (!parse_float_array(&lex, out_cfg->transition.bezier, 4)) return false;
+                if (!parse_float_array(&lex, out_cfg->transition.bezier, 4))
+                    return false;
             } else if (strcmp(key, "angle") == 0) {
-                if (!parse_float_val(&lex, &out_cfg->transition.angle)) return false;
+                if (!parse_float_val(&lex, &out_cfg->transition.angle))
+                    return false;
             } else if (strcmp(key, "pos") == 0) {
                 if (!parse_quoted_string(&lex, out_cfg->transition.pos,
                                          sizeof(out_cfg->transition.pos))) {
@@ -816,22 +885,28 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                 }
                 apply_pos_string(&out_cfg->transition);
             } else if (strcmp(key, "pos_x") == 0) {
-                if (!parse_float_val(&lex, &out_cfg->transition.pos_x)) return false;
+                if (!parse_float_val(&lex, &out_cfg->transition.pos_x))
+                    return false;
             } else if (strcmp(key, "pos_y") == 0) {
-                if (!parse_float_val(&lex, &out_cfg->transition.pos_y)) return false;
+                if (!parse_float_val(&lex, &out_cfg->transition.pos_y))
+                    return false;
             } else if (strcmp(key, "wave_x") == 0) {
-                if (!parse_float_val(&lex, &out_cfg->transition.wave_x)) return false;
+                if (!parse_float_val(&lex, &out_cfg->transition.wave_x))
+                    return false;
             } else if (strcmp(key, "wave_y") == 0) {
-                if (!parse_float_val(&lex, &out_cfg->transition.wave_y)) return false;
+                if (!parse_float_val(&lex, &out_cfg->transition.wave_y))
+                    return false;
             } else if (strcmp(key, "step") == 0) {
-                if (!parse_uint32_val(&lex, &out_cfg->transition.step)) return false;
+                if (!parse_uint32_val(&lex, &out_cfg->transition.step))
+                    return false;
             } else if (strcmp(key, "sync_mode") == 0) {
                 if (!parse_quoted_string(&lex, out_cfg->transition.sync_mode,
                                          sizeof(out_cfg->transition.sync_mode))) {
                     return false;
                 }
             } else if (strcmp(key, "stagger_delay_ms") == 0) {
-                if (!parse_uint32_val(&lex, &out_cfg->transition.stagger_delay_ms)) return false;
+                if (!parse_uint32_val(&lex, &out_cfg->transition.stagger_delay_ms))
+                    return false;
             } else {
                 set_error(&lex, "unknown key '%s' in [transition]", key);
                 return false;
@@ -935,7 +1010,8 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
 }
 
 bool waywal_config_load_file(const char *file_path, waywal_config_t *out_cfg, char *err_buf,
-                             size_t err_cap) {
+                             size_t err_cap)
+{
     if (!file_path || !out_cfg) {
         return false;
     }
@@ -968,12 +1044,14 @@ bool waywal_config_load_file(const char *file_path, waywal_config_t *out_cfg, ch
     while (off < sz) {
         ssize_t r = read(fd, buf + off, sz - off);
         if (r < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             free(buf);
             close(fd);
             return false;
         }
-        if (r == 0) break;
+        if (r == 0)
+            break;
         off += (size_t)r;
     }
     buf[off] = '\0';
@@ -984,7 +1062,8 @@ bool waywal_config_load_file(const char *file_path, waywal_config_t *out_cfg, ch
     return ok;
 }
 
-bool waywal_config_load_default(waywal_config_t *out_cfg) {
+bool waywal_config_load_default(waywal_config_t *out_cfg)
+{
     if (!out_cfg) {
         return false;
     }

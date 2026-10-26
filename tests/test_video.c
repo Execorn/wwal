@@ -1,11 +1,14 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/demuxer.h"
 #include "waywal/log.h"
 #include "waywal/vaapi_dec.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+// clang-format off
 #include <GLES3/gl31.h>
 #include <GLES2/gl2ext.h>
+// clang-format on
 #include <assert.h>
 #include <drm/drm_fourcc.h>
 #include <fcntl.h>
@@ -21,7 +24,8 @@
 #define __has_feature(x) 0
 #endif
 #if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
-__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void)
 {
     return "leak:<unknown module>\nleak:libcuda\nleak:cuInit\nleak:gbm_create_device\nleak:libgbm\n"
            "leak:libEGL\nleak:libGLESv2\nleak:dri\nleak:libnvidia\nleak:libGLX_nvidia\nleak:"
@@ -663,20 +667,28 @@ static void test_vaapi_decoder_and_prime_export(void)
             PFNEGLDESTROYIMAGEKHRPROC destroy_img =
                 (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
             PFNGLEGLIMAGETARGETTEXTURE2DOESPROC img_tex =
-                (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+                (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress(
+                    "glEGLImageTargetTexture2DOES");
 
-            EGLint img_attrs[] = {
-                EGL_WIDTH, (EGLint)vpp_prime.width,
-                EGL_HEIGHT, (EGLint)vpp_prime.height,
-                EGL_LINUX_DRM_FOURCC_EXT, (EGLint)vpp_prime.drm_format,
-                EGL_DMA_BUF_PLANE0_FD_EXT, vpp_prime.fds[0],
-                EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)vpp_prime.offsets[0],
-                EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)vpp_prime.strides[0],
-                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(vpp_prime.modifiers[0] & 0xFFFFFFFF),
-                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(vpp_prime.modifiers[0] >> 32),
-                EGL_NONE
-            };
-            EGLImageKHR eimg = create_img(edpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
+            EGLint img_attrs[] = {EGL_WIDTH,
+                                  (EGLint)vpp_prime.width,
+                                  EGL_HEIGHT,
+                                  (EGLint)vpp_prime.height,
+                                  EGL_LINUX_DRM_FOURCC_EXT,
+                                  (EGLint)vpp_prime.drm_format,
+                                  EGL_DMA_BUF_PLANE0_FD_EXT,
+                                  vpp_prime.fds[0],
+                                  EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                                  (EGLint)vpp_prime.offsets[0],
+                                  EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                                  (EGLint)vpp_prime.strides[0],
+                                  EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+                                  (EGLint)(vpp_prime.modifiers[0] & 0xFFFFFFFF),
+                                  EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+                                  (EGLint)(vpp_prime.modifiers[0] >> 32),
+                                  EGL_NONE};
+            EGLImageKHR eimg =
+                create_img(edpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
             assert(eimg != EGL_NO_IMAGE_KHR);
 
             GLuint tex = 0, fbo = 0;
@@ -823,8 +835,7 @@ static void test_high_precision_monotonic_timer(void)
     close(tfd);
 
     double avg_jitter_us = (double)(total_jitter_ns / num_ticks) / 1000.0;
-    printf("  Average timerfd pacing jitter across %d ticks: %.3f us\n",
-           num_ticks, avg_jitter_us);
+    printf("  Average timerfd pacing jitter across %d ticks: %.3f us\n", num_ticks, avg_jitter_us);
     assert(avg_jitter_us < 15000.0);
 
     printf("[TEST] test_high_precision_monotonic_timer PASSED.\n");
@@ -833,7 +844,7 @@ static void test_high_precision_monotonic_timer(void)
 int main(void)
 {
     printf("=========================================\n");
-    printf("  Executing WayWal Phase 4 Test Suite\n");
+    printf("  Executing WayWal Video & Demuxer Test Suite\n");
     printf("=========================================\n");
 
     test_demuxer_zero_allocation();
@@ -842,6 +853,6 @@ int main(void)
     test_vaapi_decoder_and_prime_export();
     test_high_precision_monotonic_timer();
 
-    printf("\n>>> ALL PHASE 4 UNIT TESTS PASSED SUCCESSFULLY! <<<\n");
+    printf("\n>>> ALL VIDEO UNIT TESTS PASSED SUCCESSFULLY! <<<\n");
     return 0;
 }

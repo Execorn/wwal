@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/slideshow.h"
 
 #include "image_loader.h"

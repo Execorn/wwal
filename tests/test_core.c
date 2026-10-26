@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/arena.h"
 #include "waywal/ipc_proto.h"
 #include "waywal/log.h"
@@ -216,13 +217,13 @@ int main(void)
 {
     waywal_log_set_level(WAYWAL_LOG_LEVEL_WARN);
     printf("=========================================\n");
-    printf("  Executing WayWal Phase 1 Test Suite\n");
+    printf("  Executing WayWal Core Subsystem Test Suite\n");
     printf("=========================================\n");
 
     test_arena();
     test_path();
     test_ipc_roundtrip();
 
-    printf("\n>>> ALL PHASE 1 UNIT TESTS PASSED SUCCESSFULLY! <<<\n\n");
+    printf("\n>>> ALL CORE UNIT TESTS PASSED SUCCESSFULLY! <<<\n\n");
     return 0;
 }

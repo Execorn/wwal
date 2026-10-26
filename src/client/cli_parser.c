@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -23,7 +24,8 @@ void cli_print_usage(const char *prog)
            "00ff00)\n");
     printf("  restore                    Restore last saved wallpaper state\n");
     printf("  clear-cache                Clear cached transcoded media and palettes\n");
-    printf("  init                       Launch or initialize wallpaper daemon (swww/awww alias)\n");
+    printf(
+        "  init                       Launch or initialize wallpaper daemon (swww/awww alias)\n");
     printf("  img <PATH|-> [OPTIONS]     Load and set wallpaper with GPU/SIMD transitions\n");
     printf("  shader <PATH> [OPTIONS]    Run live GLSL fragment shader wallpaper\n");
     printf("  theme [PATH] [OPTIONS]     Extract HCT Material You theme palette\n");
@@ -47,7 +49,8 @@ void cli_print_usage(const char *prog)
     printf("Image & Transition Options:\n");
     printf("  --transition-type <TYPE>   none, simple, fade, wipe, grow, outer, wave, noise,\n");
     printf("                             crosszoom, slide, glitch, burn, ripple, pixelate,\n");
-    printf("                             doom, swirl, cube, luma, light_leak, page_curl, custom,\n");
+    printf(
+        "                             doom, swirl, cube, luma, light_leak, page_curl, custom,\n");
     printf("                             random, left, right, top, bottom, center, any\n");
     printf("  --transition-duration <S>  Duration in seconds (e.g. 1.0, 0.5) (default: 1.0)\n");
     printf("  --transition-step <N>      Transition step speed (swww/awww compatibility)\n");
@@ -55,12 +58,14 @@ void cli_print_usage(const char *prog)
     printf("  --transition-angle <DEG>   Wipe/wave/slide angle in degrees (default: 0)\n");
     printf("  --transition-wave <F,A>    Wave frequency and amplitude (default: 20,0.05)\n");
     printf("  --transition-pos <POS>     Transition anchor: cursor, center, top, bottom, left,\n");
-    printf("                             right, top-left (tl), top-right (tr), bottom-left (bl),\n");
+    printf(
+        "                             right, top-left (tl), top-right (tr), bottom-left (bl),\n");
     printf("                             bottom-right (br), or <X,Y> coordinates\n");
     printf("  --transition-bezier <C>    Cubic bezier control points X1,Y1,X2,Y2\n");
     printf("  --fill-color <HEX>         Background fill color for fit/center scaling\n");
     printf("  --resize <MODE>            swww resize mode: crop, fit, no, stretch\n");
-    printf("  --no-resize                Center image without scaling (equivalent to --resize no)\n");
+    printf(
+        "  --no-resize                Center image without scaling (equivalent to --resize no)\n");
     printf("  --filter <FILTER>          Nearest, Bilinear, CatmullRom, Mitchell, Lanczos3\n");
     printf("  --transition-shader <FILE> Path to GLSL compute shader (*.comp) for custom "
            "transitions\n");

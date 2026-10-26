@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include "waywal/state_store.h"
+
 #include "waywal/log.h"
 
 #include <errno.h>
@@ -12,7 +14,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static bool ensure_parent_dirs(const char *file_path) {
+static bool ensure_parent_dirs(const char *file_path)
+{
     if (!file_path || file_path[0] == '\0') {
         return false;
     }
@@ -50,7 +53,8 @@ static bool ensure_parent_dirs(const char *file_path) {
     return true;
 }
 
-static bool write_all_bytes(int fd, const void *buf, size_t len) {
+static bool write_all_bytes(int fd, const void *buf, size_t len)
+{
     const uint8_t *p = (const uint8_t *)buf;
     size_t remaining = len;
     while (remaining > 0) {
@@ -67,7 +71,8 @@ static bool write_all_bytes(int fd, const void *buf, size_t len) {
     return true;
 }
 
-static bool read_all_bytes(int fd, void *buf, size_t len) {
+static bool read_all_bytes(int fd, void *buf, size_t len)
+{
     uint8_t *p = (uint8_t *)buf;
     size_t remaining = len;
     while (remaining > 0) {
@@ -87,7 +92,8 @@ static bool read_all_bytes(int fd, void *buf, size_t len) {
     return true;
 }
 
-void waywal_state_store_init(waywal_state_store_t *store) {
+void waywal_state_store_init(waywal_state_store_t *store)
+{
     if (!store) {
         return;
     }
@@ -96,7 +102,8 @@ void waywal_state_store_init(waywal_state_store_t *store) {
     store->version = WAYWAL_STATE_VERSION;
 }
 
-bool waywal_state_store_resolve_path(path_buf_t *out_path, const char *override_dir) {
+bool waywal_state_store_resolve_path(path_buf_t *out_path, const char *override_dir)
+{
     if (!out_path) {
         return false;
     }
@@ -133,7 +140,8 @@ bool waywal_state_store_resolve_path(path_buf_t *out_path, const char *override_
     return path_buf_push(out_path, "state.bin");
 }
 
-bool waywal_state_store_save_at(const waywal_state_store_t *store, const char *file_path) {
+bool waywal_state_store_save_at(const waywal_state_store_t *store, const char *file_path)
+{
     if (!store || !file_path || file_path[0] == '\0') {
         return false;
     }
@@ -178,7 +186,8 @@ bool waywal_state_store_save_at(const waywal_state_store_t *store, const char *f
     return true;
 }
 
-bool waywal_state_store_load_at(waywal_state_store_t *store, const char *file_path) {
+bool waywal_state_store_load_at(waywal_state_store_t *store, const char *file_path)
+{
     if (!store || !file_path || file_path[0] == '\0') {
         return false;
     }
@@ -209,7 +218,8 @@ bool waywal_state_store_load_at(waywal_state_store_t *store, const char *file_pa
     return true;
 }
 
-bool (waywal_state_store_save)(const waywal_state_store_t *store) {
+bool(waywal_state_store_save)(const waywal_state_store_t *store)
+{
     path_buf_t path;
     if (!waywal_state_store_resolve_path(&path, NULL)) {
         return false;
@@ -217,7 +227,8 @@ bool (waywal_state_store_save)(const waywal_state_store_t *store) {
     return waywal_state_store_save_at(store, path_buf_cstr(&path));
 }
 
-bool (waywal_state_store_load)(waywal_state_store_t *store) {
+bool(waywal_state_store_load)(waywal_state_store_t *store)
+{
     path_buf_t path;
     if (!waywal_state_store_resolve_path(&path, NULL)) {
         return false;
@@ -225,7 +236,8 @@ bool (waywal_state_store_load)(waywal_state_store_t *store) {
     return waywal_state_store_load_at(store, path_buf_cstr(&path));
 }
 
-bool waywal_state_store_save_dir(const waywal_state_store_t *store, const char *override_dir) {
+bool waywal_state_store_save_dir(const waywal_state_store_t *store, const char *override_dir)
+{
     if (override_dir && strlen(override_dir) >= 4 &&
         strcmp(override_dir + strlen(override_dir) - 4, ".bin") == 0) {
         return waywal_state_store_save_at(store, override_dir);
@@ -237,7 +249,8 @@ bool waywal_state_store_save_dir(const waywal_state_store_t *store, const char *
     return waywal_state_store_save_at(store, path_buf_cstr(&path));
 }
 
-bool waywal_state_store_load_dir(waywal_state_store_t *store, const char *override_dir) {
+bool waywal_state_store_load_dir(waywal_state_store_t *store, const char *override_dir)
+{
     if (override_dir && strlen(override_dir) >= 4 &&
         strcmp(override_dir + strlen(override_dir) - 4, ".bin") == 0) {
         return waywal_state_store_load_at(store, override_dir);
@@ -250,7 +263,8 @@ bool waywal_state_store_load_dir(waywal_state_store_t *store, const char *overri
 }
 
 bool waywal_state_store_update_output(waywal_state_store_t *store,
-                                      const waywal_output_saved_state_t *state) {
+                                      const waywal_output_saved_state_t *state)
+{
     if (!store || !state || state->output_name[0] == '\0') {
         return false;
     }
@@ -280,10 +294,10 @@ bool waywal_state_store_update_output(waywal_state_store_t *store,
     return true;
 }
 
-const waywal_output_saved_state_t *waywal_state_store_find_output(
-    const waywal_state_store_t *store, const char *output_name) {
-    if (!store || store->magic != WAYWAL_STATE_MAGIC ||
-        store->count > WAYWAL_STATE_MAX_OUTPUTS) {
+const waywal_output_saved_state_t *waywal_state_store_find_output(const waywal_state_store_t *store,
+                                                                  const char *output_name)
+{
+    if (!store || store->magic != WAYWAL_STATE_MAGIC || store->count > WAYWAL_STATE_MAX_OUTPUTS) {
         return NULL;
     }
 

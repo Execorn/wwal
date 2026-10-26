@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_BEZIER_H
 #define WAYWAL_BEZIER_H
 

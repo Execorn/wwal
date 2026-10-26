@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_IMAGE_LOADER_H
 #define WAYWAL_IMAGE_LOADER_H
 
@@ -56,8 +57,8 @@ void raw_image_free(raw_image_t *img);
 
 #define WAYWAL_IMG_LOAD_FD_SEL(_1, _2, _3, _4, NAME, ...) NAME
 #define image_load_fd(...)                                                                         \
-    WAYWAL_IMG_LOAD_FD_SEL(__VA_ARGS__, image_load_fd_rgba, image_load_fd, image_load_fd, 0)(      \
-        __VA_ARGS__)
+    WAYWAL_IMG_LOAD_FD_SEL(__VA_ARGS__, image_load_fd_rgba, image_load_fd, image_load_fd,          \
+                           0)(__VA_ARGS__)
 
 #define WAYWAL_IMG_LOAD_MEM_SEL(_1, _2, _3, _4, _5, NAME, ...) NAME
 #define image_load_from_memory(...)                                                                \

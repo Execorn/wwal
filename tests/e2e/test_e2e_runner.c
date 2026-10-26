@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "e2e_common.h"
 
 e2e_test_stats_t g_stats = {0, 0, 0, ""};
