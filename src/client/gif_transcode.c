@@ -766,7 +766,7 @@ bool video_transcode_optimize(const char *filepath, uint32_t max_width, uint32_t
         return false;
     }
 
-    char target_mp4[4096];
+    char target_mp4[4200];
     snprintf(target_mp4, sizeof(target_mp4), "%s/%s.mp4", cache_dir, hash_str);
 
     if (strlen(target_mp4) >= out_path_size) {
@@ -782,7 +782,7 @@ bool video_transcode_optimize(const char *filepath, uint32_t max_width, uint32_t
         return true;
     }
 
-    char lock_path[4096];
+    char lock_path[4200];
     snprintf(lock_path, sizeof(lock_path), "%s/%s.lock", cache_dir, hash_str);
     int lock_fd = open(lock_path, O_RDWR | O_CREAT, 0644);
     if (lock_fd >= 0) {
@@ -801,7 +801,7 @@ bool video_transcode_optimize(const char *filepath, uint32_t max_width, uint32_t
     WAYWAL_LOG_INFO("Optimizing media via ffmpeg (target max %ux%u, IPPP refs=1)...", max_width,
                     max_height);
 
-    char tmp_mp4[4096];
+    char tmp_mp4[4200];
     snprintf(tmp_mp4, sizeof(tmp_mp4), "%s/%s.tmp.%d.mp4", cache_dir, hash_str, (int)getpid());
 
     char vf_arg[512];

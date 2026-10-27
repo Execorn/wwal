@@ -580,8 +580,10 @@ void we_shader_extract_metadata(const char *src, we_shader_meta_t *inout_meta)
                     if (!um && inout_meta->uniform_count < WE_SHADER_MAX_UNIFORMS) {
                         um = &inout_meta->uniforms[inout_meta->uniform_count++];
                         memset(um, 0, sizeof(*um));
-                        snprintf(um->name, sizeof(um->name), "%s", clean_name);
-                        snprintf(um->type, sizeof(um->type), "%s", utype);
+                        snprintf(um->name, sizeof(um->name), "%.*s", (int)(sizeof(um->name) - 1),
+                                 clean_name);
+                        snprintf(um->type, sizeof(um->type), "%.*s", (int)(sizeof(um->type) - 1),
+                                 utype);
                         um->sampler_slot = -1;
                         if (strncmp(clean_name, "g_Texture", 9) == 0 && clean_name[9] >= '0' &&
                             clean_name[9] <= '7' && clean_name[10] == '\0') {

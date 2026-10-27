@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-28
+
 ### Added
 
 - Native Wallpaper Engine Workshop runtime (`we_pkg.c`, `we_tex.c`, `we_puppet.c`, `we_shader.c`, `we_scene.c`, `we_particle.c`, `we_script.c`): zero-extraction `mmap` `PKGV0001..22` archives, hardware `BC1`/`BC2`/`BC3`/`BC7` and `LZ4` `TEXV0005` textures, 2D Puppet Warp skeletal `.mdl` meshes, AVX2 Structure-of-Arrays particle simulation, multi-pass GLSL effect chains, sandboxed `SceneScript` VM, and `wwal workshop list / info / apply`.
@@ -68,5 +70,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - CRC32-verified binary state persistence (`state.bin`), declarative `~/.config/wwal/config.toml` parser with per-output and per-workspace rules, and real-time telemetry (`wwal stats`).
   - Linux `io_uring` event loop (`uring_loop.c`) and Seccomp-BPF + Landlock v3 process sandboxing (`security.c`).
 
-[Unreleased]: https://github.com/Execorn/wwal/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/Execorn/wwal/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/Execorn/wwal/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Execorn/wwal/releases/tag/v1.0.0

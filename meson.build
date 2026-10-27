@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 project('waywal', 'c',
-  version: '1.0.0',
+  version: '1.1.0',
   license: 'GPL-3.0-or-later',
   meson_version: '>= 0.60.0',
   default_options: [

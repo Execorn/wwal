@@ -3,6 +3,7 @@
 #include "waywal/output_state.h"
 #include "waywal/presentation.h"
 #include "waywal/security.h"
+#include "waywal/shader_engine.h"
 #include "waywal/uring_loop.h"
 
 #include <assert.h>
@@ -18,6 +19,12 @@
 
 void output_node_destroy_surface(output_node_t *node);
 void output_node_destroy_surface(output_node_t *node) { (void)node; }
+
+void waywal_shader_engine_forget_bo(waywal_shader_engine_t *eng, const struct dmabuf_bo *bo)
+{
+    (void)eng;
+    (void)bo;
+}
 
 #ifndef __has_feature
 #define __has_feature(x) 0

@@ -1,4 +1,4 @@
-wwal-config(5) "wwal 1.0.0" "WayWal Manual"
+wwal-config(5) "wwal 1.1.0" "WayWal Manual"
 
 # NAME
 

@@ -608,7 +608,7 @@ static void test_scene_graph_and_cli(void)
                             "  }\n"
                             "}\n";
 
-    char proj_path[4096];
+    char proj_path[4200];
     snprintf(proj_path, sizeof(proj_path), "%s/project.json", item_dir);
     FILE *fp = fopen(proj_path, "wb");
     assert(fp != NULL);
@@ -701,7 +701,7 @@ static void test_scene_graph_and_cli(void)
     byte_buf_t pkg_buf;
     build_synthetic_pkg(&pkg_buf, "PKGV0002", pkg_items, 5);
 
-    char pkg_path[4096];
+    char pkg_path[4200];
     snprintf(pkg_path, sizeof(pkg_path), "%s/scene.pkg", item_dir);
     fp = fopen(pkg_path, "wb");
     assert(fp != NULL);
