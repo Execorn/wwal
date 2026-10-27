@@ -282,9 +282,13 @@ void reconcile_global_engine_flags(daemon_state_t *state)
         layer_shell_update_input_regions(state, any_shader);
     }
 
+    bool was_anim_active = state->anim_active;
     state->anim_active = any_anim;
     if (!any_anim) {
         disarm_timer_fd(state->anim_timer_fd);
+        if (was_anim_active && !state->transitions_in_progress) {
+            render_engine_release_upload_cache(&state->render_engine);
+        }
     }
 }
 
@@ -1284,12 +1288,19 @@ static void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t
             const uint32_t *src32 = (const uint32_t *)bgra_pixels;
             uint32_t *dst32 = (uint32_t *)state->wallpaper_rgba;
             for (uint32_t dy = 0; dy < thumb_h; ++dy) {
-                uint32_t sy = (uint32_t)(((uint64_t)dy * h) / thumb_h);
-                const uint32_t *srow = src32 + (size_t)sy * w;
+                uint32_t sy0 = (uint32_t)(((uint64_t)dy * h) / thumb_h);
+                uint32_t sy1 = sy0 + 1U < h ? sy0 + 1U : sy0;
+                const uint32_t *srow0 = src32 + (size_t)sy0 * w;
+                const uint32_t *srow1 = src32 + (size_t)sy1 * w;
                 uint32_t *drow = dst32 + (size_t)dy * thumb_w;
                 for (uint32_t dx = 0; dx < thumb_w; ++dx) {
-                    uint32_t sx = (uint32_t)(((uint64_t)dx * w) / thumb_w);
-                    drow[dx] = srow[sx];
+                    uint32_t sx0 = (uint32_t)(((uint64_t)dx * w) / thumb_w);
+                    uint32_t sx1 = sx0 + 1U < w ? sx0 + 1U : sx0;
+                    uint32_t p0 =
+                        (((srow0[sx0] & 0xFEFEFEFEU) >> 1) + ((srow0[sx1] & 0xFEFEFEFEU) >> 1));
+                    uint32_t p1 =
+                        (((srow1[sx0] & 0xFEFEFEFEU) >> 1) + ((srow1[sx1] & 0xFEFEFEFEU) >> 1));
+                    drow[dx] = ((p0 & 0xFEFEFEFEU) >> 1) + ((p1 & 0xFEFEFEFEU) >> 1);
                 }
             }
         }
@@ -1312,8 +1323,10 @@ static void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t
         gpu_compute_invalidate_state_cache((gpu_compute_ctx_t *)state->render_engine.gpu_ctx);
     }
 
-    if (meta && meta->no_theme)
+    if (meta && meta->no_theme) {
+        state->has_saved_wallpaper_palette = false;
         return;
+    }
 
     waywal_scheme_variant_t variant =
         waywal_scheme_variant_from_str(state->config.theme.scheme_variant);

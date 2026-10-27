@@ -234,12 +234,19 @@ static void display_current_image(slideshow_engine_t *ss)
                 const uint32_t *src32 = (const uint32_t *)pixels;
                 uint32_t *dst32 = (uint32_t *)st->wallpaper_rgba;
                 for (uint32_t dy = 0; dy < thumb_h; ++dy) {
-                    uint32_t sy = (uint32_t)(((uint64_t)dy * img_h) / thumb_h);
-                    const uint32_t *srow = src32 + (size_t)sy * img_w;
+                    uint32_t sy0 = (uint32_t)(((uint64_t)dy * img_h) / thumb_h);
+                    uint32_t sy1 = sy0 + 1U < img_h ? sy0 + 1U : sy0;
+                    const uint32_t *srow0 = src32 + (size_t)sy0 * img_w;
+                    const uint32_t *srow1 = src32 + (size_t)sy1 * img_w;
                     uint32_t *drow = dst32 + (size_t)dy * thumb_w;
                     for (uint32_t dx = 0; dx < thumb_w; ++dx) {
-                        uint32_t sx = (uint32_t)(((uint64_t)dx * img_w) / thumb_w);
-                        drow[dx] = srow[sx];
+                        uint32_t sx0 = (uint32_t)(((uint64_t)dx * img_w) / thumb_w);
+                        uint32_t sx1 = sx0 + 1U < img_w ? sx0 + 1U : sx0;
+                        uint32_t p0 =
+                            (((srow0[sx0] & 0xFEFEFEFEU) >> 1) + ((srow0[sx1] & 0xFEFEFEFEU) >> 1));
+                        uint32_t p1 =
+                            (((srow1[sx0] & 0xFEFEFEFEU) >> 1) + ((srow1[sx1] & 0xFEFEFEFEU) >> 1));
+                        drow[dx] = ((p0 & 0xFEFEFEFEU) >> 1) + ((p1 & 0xFEFEFEFEU) >> 1);
                     }
                 }
             }
