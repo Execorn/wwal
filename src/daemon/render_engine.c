@@ -149,6 +149,13 @@ void render_engine_bump_upload_gen(render_engine_t *re)
     gpu_compute_bump_upload_gen((gpu_compute_ctx_t *)re->gpu_ctx);
 }
 
+void render_engine_release_upload_cache(render_engine_t *re)
+{
+    if (!re || !re->has_gpu_compute || !re->gpu_ctx)
+        return;
+    gpu_compute_release_upload_cache((gpu_compute_ctx_t *)re->gpu_ctx);
+}
+
 static inline float clampf(float v, float min_v, float max_v)
 {
     if (v < min_v)

@@ -1000,7 +1000,7 @@ static void make_context_current(waywal_shader_engine_t *eng)
 }
 
 static GLuint create_texture_ex(const uint8_t *pixels, uint32_t w, uint32_t h, GLint wrap_mode,
-                                bool is_bgra)
+                                bool is_bgra, bool want_mipmaps)
 {
     if (!pixels || w == 0 || h == 0) {
         return 0;
@@ -1008,10 +1008,14 @@ static GLuint create_texture_ex(const uint8_t *pixels, uint32_t w, uint32_t h, G
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    want_mipmaps ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_mode);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_mode);
+    if (!want_mipmaps) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    }
     if (is_bgra) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
@@ -1019,13 +1023,15 @@ static GLuint create_texture_ex(const uint8_t *pixels, uint32_t w, uint32_t h, G
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                  pixels);
-    glGenerateMipmap(GL_TEXTURE_2D);
+    if (want_mipmaps) {
+        glGenerateMipmap(GL_TEXTURE_2D);
+    }
     return tex;
 }
 
 static GLuint create_rgba_texture(const uint8_t *rgba, uint32_t w, uint32_t h, GLint wrap_mode)
 {
-    return create_texture_ex(rgba, w, h, wrap_mode, false);
+    return create_texture_ex(rgba, w, h, wrap_mode, false, true);
 }
 
 static GLuint create_r8_depth_texture(const uint8_t *depth_px, uint32_t w, uint32_t h)
@@ -1033,10 +1039,11 @@ static GLuint create_r8_depth_texture(const uint8_t *depth_px, uint32_t w, uint3
     if (!depth_px || w == 0 || h == 0) {
         return 0;
     }
+    bool want_mipmaps = (w <= 64u && h <= 64u);
     size_t npx = (size_t)w * (size_t)h;
     uint8_t *r8 = (uint8_t *)malloc(npx);
     if (!r8) {
-        return create_rgba_texture(depth_px, w, h, GL_CLAMP_TO_EDGE);
+        return create_texture_ex(depth_px, w, h, GL_CLAMP_TO_EDGE, false, want_mipmaps);
     }
     /* Channel 0 (R in RGBA) or Channel 1 (G in both RGBA and BGRA grayscale depth maps) */
     for (size_t i = 0; i < npx; ++i) {
@@ -1045,7 +1052,8 @@ static GLuint create_r8_depth_texture(const uint8_t *depth_px, uint32_t w, uint3
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    want_mipmaps ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -1055,7 +1063,9 @@ static GLuint create_r8_depth_texture(const uint8_t *depth_px, uint32_t w, uint3
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, (GLsizei)w, (GLsizei)h, 0, GL_RED, GL_UNSIGNED_BYTE, r8);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glGenerateMipmap(GL_TEXTURE_2D);
+    if (want_mipmaps) {
+        glGenerateMipmap(GL_TEXTURE_2D);
+    }
     free(r8);
     return tex;
 }
@@ -1604,7 +1614,8 @@ void waywal_shader_engine_set_wallpaper(waywal_shader_engine_t *eng, const uint8
         glDeleteTextures(1, &eng->wallpaper_tex);
         eng->wallpaper_tex = 0;
     }
-    eng->wallpaper_tex = create_texture_ex(rgba, w, h, GL_CLAMP_TO_EDGE, false);
+    eng->wallpaper_tex =
+        create_texture_ex(rgba, w, h, GL_CLAMP_TO_EDGE, false, (w <= 64u && h <= 64u));
     eng->wallpaper_w = w;
     eng->wallpaper_h = h;
 }
@@ -1620,7 +1631,8 @@ void waywal_shader_engine_set_wallpaper_bgra(waywal_shader_engine_t *eng, const 
         glDeleteTextures(1, &eng->wallpaper_tex);
         eng->wallpaper_tex = 0;
     }
-    eng->wallpaper_tex = create_texture_ex(bgra, w, h, GL_CLAMP_TO_EDGE, true);
+    eng->wallpaper_tex =
+        create_texture_ex(bgra, w, h, GL_CLAMP_TO_EDGE, true, (w <= 64u && h <= 64u));
     eng->wallpaper_w = w;
     eng->wallpaper_h = h;
 }
@@ -1646,7 +1658,8 @@ void waywal_shader_engine_set_album_art(waywal_shader_engine_t *eng, const uint8
             eng->album_art_tex = 0;
         }
         if (rgba && w > 0 && h > 0) {
-            eng->album_art_tex = create_texture_ex(rgba, w, h, GL_CLAMP_TO_EDGE, false);
+            eng->album_art_tex =
+                create_texture_ex(rgba, w, h, GL_CLAMP_TO_EDGE, false, (w <= 64u && h <= 64u));
         }
     }
     if (rgba && w > 0 && h > 0) {
@@ -1671,7 +1684,8 @@ void waywal_shader_engine_set_album_art_bgra(waywal_shader_engine_t *eng, const 
             eng->album_art_tex = 0;
         }
         if (bgra && w > 0 && h > 0) {
-            eng->album_art_tex = create_texture_ex(bgra, w, h, GL_CLAMP_TO_EDGE, true);
+            eng->album_art_tex =
+                create_texture_ex(bgra, w, h, GL_CLAMP_TO_EDGE, true, (w <= 64u && h <= 64u));
         }
     }
     if (bgra && w > 0 && h > 0) {

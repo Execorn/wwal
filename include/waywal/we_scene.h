@@ -127,7 +127,7 @@ typedef struct {
     we_rt_fbo_t fbos[WE_MAX_EFFECT_FBOS];
     uint32_t fbo_count;
 
-    we_material_pass_t passes[WE_MAX_EFFECT_PASSES];
+    we_material_pass_t *passes;
     uint32_t pass_count;
 } we_effect_t;
 

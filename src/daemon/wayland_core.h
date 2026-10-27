@@ -44,7 +44,6 @@ struct waywal_anim_decoder;
 struct waywal_mpris;
 
 typedef struct daemon_state {
-    arena_t persistent_arena;
     arena_t frame_arena;
 
     struct wl_display *display;
@@ -131,6 +130,8 @@ typedef struct daemon_state {
     waywal_config_t config;
     waywal_palette_t active_palette;
     bool has_active_palette;
+    waywal_palette_t saved_wallpaper_palette;
+    bool has_saved_wallpaper_palette;
     void (*on_output_configured)(struct daemon_state *state, output_node_t *out);
     void (*on_power_state_changed)(struct daemon_state *state);
     void (*on_wallpaper_loaded)(struct daemon_state *state, const uint8_t *bgra_pixels, uint32_t w,

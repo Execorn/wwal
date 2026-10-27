@@ -1604,6 +1604,20 @@ bool we_tex_upload_gl(we_tex_t *tex)
     glPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack_align);
     glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex2d);
 
+    if (tex->gl_tex != 0 && !tex->is_video_mp4) {
+        for (uint32_t i = 0; i < tex->image_count; ++i) {
+            for (uint32_t m = 0; m < tex->images[i].mip_count; ++m) {
+                free(tex->images[i].mips[m].data);
+                tex->images[i].mips[m].data = NULL;
+                tex->images[i].mips[m].data_size = 0;
+                if (tex->images[i].mips[m].rgba8) {
+                    image_free(tex->images[i].mips[m].rgba8);
+                    tex->images[i].mips[m].rgba8 = NULL;
+                }
+            }
+        }
+    }
+
     return tex->gl_tex != 0;
 }
 

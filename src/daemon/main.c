@@ -1199,11 +1199,17 @@ static void daemon_apply_mpris_album_art_and_theme(daemon_state_t *state,
         }
     } else if (state->media_palette_active) {
         state->media_palette_active = false;
-        if (state->wallpaper_rgba && state->wallpaper_w > 0 && state->wallpaper_h > 0) {
+        if (state->has_saved_wallpaper_palette) {
+            state->active_palette = state->saved_wallpaper_palette;
+            state->has_active_palette = true;
+            updated_theme = true;
+        } else if (state->wallpaper_rgba && state->wallpaper_w > 0 && state->wallpaper_h > 0) {
             if (waywal_palette_extract_ex(state->wallpaper_rgba, state->wallpaper_w,
                                           state->wallpaper_h, state->wallpaper_w * 4U, true, tmode,
                                           variant, state->config.theme.contrast,
                                           &state->active_palette)) {
+                state->saved_wallpaper_palette = state->active_palette;
+                state->has_saved_wallpaper_palette = true;
                 state->has_active_palette = true;
                 updated_theme = true;
             }
@@ -1247,27 +1253,58 @@ static void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t
     if (!state || !bgra_pixels || w == 0 || h == 0)
         return;
 
-    size_t byte_len = (size_t)w * (size_t)h * 4U;
-    if (!state->wallpaper_rgba || state->wallpaper_w != w || state->wallpaper_h != h) {
+    uint32_t thumb_w = w;
+    uint32_t thumb_h = h;
+    if (thumb_w > 1920U || thumb_h > 1080U) {
+        double scale_x = 1920.0 / (double)w;
+        double scale_y = 1080.0 / (double)h;
+        double scale = (scale_x < scale_y) ? scale_x : scale_y;
+        thumb_w = (uint32_t)((double)w * scale + 0.5);
+        thumb_h = (uint32_t)((double)h * scale + 0.5);
+        if (thumb_w == 0U)
+            thumb_w = 1U;
+        if (thumb_h == 0U)
+            thumb_h = 1U;
+    }
+
+    size_t byte_len = (size_t)thumb_w * (size_t)thumb_h * 4U;
+    if (!state->wallpaper_rgba || state->wallpaper_w != thumb_w || state->wallpaper_h != thumb_h) {
         uint8_t *buf = (uint8_t *)malloc(byte_len);
         if (buf) {
             free(state->wallpaper_rgba);
             state->wallpaper_rgba = buf;
-            state->wallpaper_w = w;
-            state->wallpaper_h = h;
+            state->wallpaper_w = thumb_w;
+            state->wallpaper_h = thumb_h;
         }
     }
-    if (state->wallpaper_rgba && state->wallpaper_w == w && state->wallpaper_h == h) {
-        memcpy(state->wallpaper_rgba, bgra_pixels, byte_len);
+    if (state->wallpaper_rgba && state->wallpaper_w == thumb_w && state->wallpaper_h == thumb_h) {
+        if (thumb_w == w && thumb_h == h) {
+            memcpy(state->wallpaper_rgba, bgra_pixels, byte_len);
+        } else {
+            const uint32_t *src32 = (const uint32_t *)bgra_pixels;
+            uint32_t *dst32 = (uint32_t *)state->wallpaper_rgba;
+            for (uint32_t dy = 0; dy < thumb_h; ++dy) {
+                uint32_t sy = (uint32_t)(((uint64_t)dy * h) / thumb_h);
+                const uint32_t *srow = src32 + (size_t)sy * w;
+                uint32_t *drow = dst32 + (size_t)dy * thumb_w;
+                for (uint32_t dx = 0; dx < thumb_w; ++dx) {
+                    uint32_t sx = (uint32_t)(((uint64_t)dx * w) / thumb_w);
+                    drow[dx] = srow[sx];
+                }
+            }
+        }
     }
+    const uint8_t *sh_px = state->wallpaper_rgba ? state->wallpaper_rgba : bgra_pixels;
+    uint32_t sh_w = state->wallpaper_rgba ? state->wallpaper_w : w;
+    uint32_t sh_h = state->wallpaper_rgba ? state->wallpaper_h : h;
     bool uploaded_gl = false;
     if (state->shader_eng) {
-        waywal_shader_engine_set_wallpaper_bgra(state->shader_eng, bgra_pixels, w, h);
+        waywal_shader_engine_set_wallpaper_bgra(state->shader_eng, sh_px, sh_w, sh_h);
         uploaded_gl = true;
     }
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (out->shader_eng && out->shader_eng != state->shader_eng) {
-            waywal_shader_engine_set_wallpaper_bgra(out->shader_eng, bgra_pixels, w, h);
+            waywal_shader_engine_set_wallpaper_bgra(out->shader_eng, sh_px, sh_w, sh_h);
             uploaded_gl = true;
         }
     }
@@ -1278,15 +1315,20 @@ static void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t
     if (meta && meta->no_theme)
         return;
 
-    if (state->theme_from_media && state->media_palette_active)
-        return;
-
     waywal_scheme_variant_t variant =
         waywal_scheme_variant_from_str(state->config.theme.scheme_variant);
     waywal_theme_mode_t tmode =
         (meta && meta->theme_light_mode) ? WAYWAL_THEME_LIGHT : state->config.theme.theme_mode;
+    waywal_palette_t extracted_pal;
     if (waywal_palette_extract_ex(bgra_pixels, w, h, w * 4U, true, tmode, variant,
-                                  state->config.theme.contrast, &state->active_palette)) {
+                                  state->config.theme.contrast, &extracted_pal)) {
+        state->saved_wallpaper_palette = extracted_pal;
+        state->has_saved_wallpaper_palette = true;
+
+        if (state->theme_from_media && state->media_palette_active)
+            return;
+
+        state->active_palette = extracted_pal;
         state->has_active_palette = true;
 
         bool should_export =
@@ -4451,13 +4493,8 @@ int main(int argc, char *argv[])
     waywal_state_store_init(&g_saved_state);
     (void)waywal_state_store_load(&g_saved_state, NULL);
 
-    if (!arena_init(&state.persistent_arena, WAYWAL_PERSISTENT_ARENA_CAPACITY)) {
-        fprintf(stderr, "Fatal: failed to initialize persistent memory arena\n");
-        return 1;
-    }
     if (!arena_init(&state.frame_arena, WAYWAL_FRAME_ARENA_CAPACITY)) {
         fprintf(stderr, "Fatal: failed to initialize frame memory arena\n");
-        arena_destroy(&state.persistent_arena);
         return 1;
     }
 
@@ -4478,7 +4515,6 @@ int main(int argc, char *argv[])
     if (sigprocmask(SIG_BLOCK, &sigmask, NULL) < 0) {
         WAYWAL_LOG_ERR("sigprocmask failed: %s", strerror(errno));
         arena_destroy(&state.frame_arena);
-        arena_destroy(&state.persistent_arena);
         return 1;
     }
 
@@ -4486,7 +4522,6 @@ int main(int argc, char *argv[])
     if (state.signal_fd < 0) {
         WAYWAL_LOG_ERR("signalfd failed: %s", strerror(errno));
         arena_destroy(&state.frame_arena);
-        arena_destroy(&state.persistent_arena);
         return 1;
     }
 
@@ -4494,7 +4529,6 @@ int main(int argc, char *argv[])
         WAYWAL_LOG_ERR("Failed to initialize Wayland subsystem");
         close(state.signal_fd);
         arena_destroy(&state.frame_arena);
-        arena_destroy(&state.persistent_arena);
         return 1;
     }
 
@@ -4504,7 +4538,6 @@ int main(int argc, char *argv[])
         daemon_wayland_destroy(&state);
         close(state.signal_fd);
         arena_destroy(&state.frame_arena);
-        arena_destroy(&state.persistent_arena);
         return 1;
     }
 
@@ -4515,7 +4548,6 @@ int main(int argc, char *argv[])
         daemon_wayland_destroy(&state);
         close(state.signal_fd);
         arena_destroy(&state.frame_arena);
-        arena_destroy(&state.persistent_arena);
         return 1;
     }
 
@@ -4792,7 +4824,6 @@ int main(int argc, char *argv[])
     close(state.signal_fd);
     daemon_wayland_destroy(&state);
     arena_destroy(&state.frame_arena);
-    arena_destroy(&state.persistent_arena);
 
     WAYWAL_LOG_INFO("Clean shutdown complete.");
     return 0;

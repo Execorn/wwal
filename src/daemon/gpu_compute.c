@@ -1238,6 +1238,25 @@ void gpu_compute_bump_upload_gen(gpu_compute_ctx_t *ctx)
         ctx->upload_gen = 1;
 }
 
+void gpu_compute_release_upload_cache(gpu_compute_ctx_t *ctx)
+{
+    if (!ctx || ctx->upload_src_tex == 0)
+        return;
+    gpu_compute_make_current(ctx);
+    if (ctx->bound_old_tex == ctx->upload_src_tex)
+        ctx->bound_old_tex = 0;
+    if (ctx->bound_new_tex == ctx->upload_src_tex)
+        ctx->bound_new_tex = 0;
+    glDeleteTextures(1, &ctx->upload_src_tex);
+    ctx->upload_src_tex = 0;
+    ctx->upload_src_w = 0;
+    ctx->upload_src_h = 0;
+    ctx->last_upload_ptr = NULL;
+    ctx->last_upload_w = 0;
+    ctx->last_upload_h = 0;
+    ctx->last_upload_gen = 0;
+}
+
 static void upload_source_rgba_dedup(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba,
                                      uint32_t src_w, uint32_t src_h)
 {

@@ -2227,53 +2227,60 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
 
                     const we_jval_t *epasses = jobj_get(eroot, "passes");
                     const we_jval_t *opasses = jobj_get(enode, "passes");
-                    if (epasses && epasses->type == JVAL_ARR) {
-                        for (size_t p = 0;
-                             p < epasses->arr.count && eff->pass_count < WE_MAX_EFFECT_PASSES;
-                             p++) {
-                            const we_jval_t *epn = epasses->arr.items[p];
-                            we_material_pass_t *mp = &eff->passes[eff->pass_count++];
-                            memset(mp, 0, sizeof(*mp));
-                            mp->blending = WE_BLEND_DISABLED;
+                    if (epasses && epasses->type == JVAL_ARR && epasses->arr.count > 0) {
+                        size_t cap_passes = epasses->arr.count < WE_MAX_EFFECT_PASSES
+                                                ? epasses->arr.count
+                                                : WE_MAX_EFFECT_PASSES;
+                        eff->passes =
+                            (we_material_pass_t *)calloc(cap_passes, sizeof(we_material_pass_t));
+                        if (eff->passes) {
+                            for (size_t p = 0; p < cap_passes; p++) {
+                                const we_jval_t *epn = epasses->arr.items[p];
+                                we_material_pass_t *mp = &eff->passes[eff->pass_count++];
+                                memset(mp, 0, sizeof(*mp));
+                                mp->blending = WE_BLEND_DISABLED;
 
-                            snprintf(mp->command, sizeof(mp->command), "%s",
-                                     jval_str(jobj_get(epn, "command"), ""));
-                            snprintf(mp->target_fbo, sizeof(mp->target_fbo), "%s",
-                                     jval_str(jobj_get(epn, "target"), ""));
+                                snprintf(mp->command, sizeof(mp->command), "%s",
+                                         jval_str(jobj_get(epn, "command"), ""));
+                                snprintf(mp->target_fbo, sizeof(mp->target_fbo), "%s",
+                                         jval_str(jobj_get(epn, "target"), ""));
 
-                            const we_jval_t *binds = jobj_get(epn, "bind");
-                            if (binds && binds->type == JVAL_ARR) {
-                                for (size_t b = 0;
-                                     b < binds->arr.count && mp->bind_count < WE_MAX_PASS_TEXTURES;
-                                     b++) {
-                                    const we_jval_t *bn = binds->arr.items[b];
-                                    const char *bname = jval_str(jobj_get(bn, "name"), NULL);
-                                    int32_t bidx = (int32_t)jval_float(
-                                        jobj_get(bn, "index"), &scene->project, 0.0f, NULL, 0);
-                                    if (bname && bidx >= 0 &&
-                                        bidx < (int32_t)WE_MAX_PASS_TEXTURES) {
-                                        snprintf(mp->binds[mp->bind_count].target_name,
-                                                 sizeof(mp->binds[0].target_name), "%s", bname);
-                                        mp->binds[mp->bind_count].slot = bidx;
-                                        mp->bind_count++;
+                                const we_jval_t *binds = jobj_get(epn, "bind");
+                                if (binds && binds->type == JVAL_ARR) {
+                                    for (size_t b = 0; b < binds->arr.count &&
+                                                       mp->bind_count < WE_MAX_PASS_TEXTURES;
+                                         b++) {
+                                        const we_jval_t *bn = binds->arr.items[b];
+                                        const char *bname = jval_str(jobj_get(bn, "name"), NULL);
+                                        int32_t bidx = (int32_t)jval_float(
+                                            jobj_get(bn, "index"), &scene->project, 0.0f, NULL, 0);
+                                        if (bname && bidx >= 0 &&
+                                            bidx < (int32_t)WE_MAX_PASS_TEXTURES) {
+                                            snprintf(mp->binds[mp->bind_count].target_name,
+                                                     sizeof(mp->binds[0].target_name), "%s", bname);
+                                            mp->binds[mp->bind_count].slot = bidx;
+                                            mp->bind_count++;
+                                        }
                                     }
                                 }
-                            }
 
-                            const char *emat = jval_str(jobj_get(epn, "material"), NULL);
-                            if (emat) {
-                                load_material_pass_from_file(mp, scene->pkg, emat, &scene->project);
-                            }
-                            parse_pass_json_overrides(mp, epn, &scene->project);
-                            if (opasses && opasses->type == JVAL_ARR && p < opasses->arr.count) {
-                                parse_pass_json_overrides(mp, opasses->arr.items[p],
-                                                          &scene->project);
-                            }
-                            if (strcasecmp(mp->command, "copy") != 0 &&
-                                strcasecmp(mp->command, "swap") != 0) {
-                                finalize_material_pass_cpu(mp, scene->pkg);
-                                if (pass_uses_audio_spectrum(mp)) {
-                                    scene->uses_audio = true;
+                                const char *emat = jval_str(jobj_get(epn, "material"), NULL);
+                                if (emat) {
+                                    load_material_pass_from_file(mp, scene->pkg, emat,
+                                                                 &scene->project);
+                                }
+                                parse_pass_json_overrides(mp, epn, &scene->project);
+                                if (opasses && opasses->type == JVAL_ARR &&
+                                    p < opasses->arr.count) {
+                                    parse_pass_json_overrides(mp, opasses->arr.items[p],
+                                                              &scene->project);
+                                }
+                                if (strcasecmp(mp->command, "copy") != 0 &&
+                                    strcasecmp(mp->command, "swap") != 0) {
+                                    finalize_material_pass_cpu(mp, scene->pkg);
+                                    if (pass_uses_audio_spectrum(mp)) {
+                                        scene->uses_audio = true;
+                                    }
                                 }
                             }
                         }
@@ -2595,6 +2602,10 @@ static void upload_pass_gl(we_material_pass_t *pass)
                 we_shader_preprocessed_free(&fb);
             }
         }
+        free(pass->prep.vert_glsl);
+        pass->prep.vert_glsl = NULL;
+        free(pass->prep.frag_glsl);
+        pass->prep.frag_glsl = NULL;
     }
 }
 
@@ -2611,21 +2622,23 @@ bool we_scene_init_gl(we_scene_t *scene, dmabuf_context_t *dmabuf_ctx)
         return true;
     }
 
-    EGLDisplay dpy = EGL_NO_DISPLAY;
-    EGLContext ctx = EGL_NO_CONTEXT;
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLContext ctx = eglGetCurrentContext();
     bool owns_egl = false;
 
-    if (s_we_shared_refcount > 0 && s_we_shared_dpy != EGL_NO_DISPLAY &&
-        s_we_shared_ctx != EGL_NO_CONTEXT) {
+    if (dpy != EGL_NO_DISPLAY && ctx != EGL_NO_CONTEXT) {
+        if (s_we_shared_refcount > 0 && dpy == s_we_shared_dpy && ctx == s_we_shared_ctx) {
+            owns_egl = true;
+            s_we_shared_refcount++;
+        }
+    } else if (s_we_shared_refcount > 0 && s_we_shared_dpy != EGL_NO_DISPLAY &&
+               s_we_shared_ctx != EGL_NO_CONTEXT) {
         if (eglMakeCurrent(s_we_shared_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, s_we_shared_ctx)) {
             dpy = s_we_shared_dpy;
             ctx = s_we_shared_ctx;
             owns_egl = true;
             s_we_shared_refcount++;
         }
-    } else if (!dmabuf_ctx) {
-        dpy = eglGetCurrentDisplay();
-        ctx = eglGetCurrentContext();
     }
 
     if (dpy == EGL_NO_DISPLAY || ctx == EGL_NO_CONTEXT) {
@@ -2808,6 +2821,11 @@ bool we_scene_init_gl(we_scene_t *scene, dmabuf_context_t *dmabuf_ctx)
                 upload_pass_gl(&obj->effects[e].passes[p]);
             }
         }
+    }
+
+    if (scene->pkg) {
+        we_pkg_close(scene->pkg);
+        scene->pkg = NULL;
     }
 
     scene->gl_initialized = true;
@@ -4663,8 +4681,11 @@ void we_scene_destroy(we_scene_t *scene)
                             }
                         }
                     }
-                    for (uint32_t p = 0; p < eff->pass_count; p++) {
-                        free_material_pass(&eff->passes[p], scene->gl_initialized);
+                    if (eff->passes) {
+                        for (uint32_t p = 0; p < eff->pass_count; p++) {
+                            free_material_pass(&eff->passes[p], scene->gl_initialized);
+                        }
+                        free(eff->passes);
                     }
                 }
                 free(obj->effects);

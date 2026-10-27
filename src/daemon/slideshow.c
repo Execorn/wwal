@@ -204,24 +204,53 @@ static void display_current_image(slideshow_engine_t *ss)
     if (st->on_wallpaper_loaded) {
         st->on_wallpaper_loaded(st, pixels, img_w, img_h, meta);
     } else if (img_w > 0 && img_h > 0) {
-        size_t byte_len = (size_t)img_w * (size_t)img_h * 4U;
-        if (!st->wallpaper_rgba || st->wallpaper_w != img_w || st->wallpaper_h != img_h) {
+        uint32_t thumb_w = img_w;
+        uint32_t thumb_h = img_h;
+        if (thumb_w > 1920U || thumb_h > 1080U) {
+            double scale_x = 1920.0 / (double)img_w;
+            double scale_y = 1080.0 / (double)img_h;
+            double scale = (scale_x < scale_y) ? scale_x : scale_y;
+            thumb_w = (uint32_t)((double)img_w * scale + 0.5);
+            thumb_h = (uint32_t)((double)img_h * scale + 0.5);
+            if (thumb_w == 0U)
+                thumb_w = 1U;
+            if (thumb_h == 0U)
+                thumb_h = 1U;
+        }
+        size_t byte_len = (size_t)thumb_w * (size_t)thumb_h * 4U;
+        if (!st->wallpaper_rgba || st->wallpaper_w != thumb_w || st->wallpaper_h != thumb_h) {
             uint8_t *buf = (uint8_t *)malloc(byte_len);
             if (buf) {
                 free(st->wallpaper_rgba);
                 st->wallpaper_rgba = buf;
-                st->wallpaper_w = img_w;
-                st->wallpaper_h = img_h;
+                st->wallpaper_w = thumb_w;
+                st->wallpaper_h = thumb_h;
             }
         }
-        if (st->wallpaper_rgba && st->wallpaper_w == img_w && st->wallpaper_h == img_h) {
-            memcpy(st->wallpaper_rgba, pixels, byte_len);
+        if (st->wallpaper_rgba && st->wallpaper_w == thumb_w && st->wallpaper_h == thumb_h) {
+            if (thumb_w == img_w && thumb_h == img_h) {
+                memcpy(st->wallpaper_rgba, pixels, byte_len);
+            } else {
+                const uint32_t *src32 = (const uint32_t *)pixels;
+                uint32_t *dst32 = (uint32_t *)st->wallpaper_rgba;
+                for (uint32_t dy = 0; dy < thumb_h; ++dy) {
+                    uint32_t sy = (uint32_t)(((uint64_t)dy * img_h) / thumb_h);
+                    const uint32_t *srow = src32 + (size_t)sy * img_w;
+                    uint32_t *drow = dst32 + (size_t)dy * thumb_w;
+                    for (uint32_t dx = 0; dx < thumb_w; ++dx) {
+                        uint32_t sx = (uint32_t)(((uint64_t)dx * img_w) / thumb_w);
+                        drow[dx] = srow[sx];
+                    }
+                }
+            }
         }
         waywal_scheme_variant_t variant =
             waywal_scheme_variant_from_str(st->config.theme.scheme_variant);
         if (waywal_palette_extract_ex(pixels, img_w, img_h, img_w * 4U, true,
                                       st->config.theme.theme_mode, variant,
                                       st->config.theme.contrast, &st->active_palette)) {
+            st->saved_wallpaper_palette = st->active_palette;
+            st->has_saved_wallpaper_palette = true;
             st->has_active_palette = true;
             if (st->config.theme.enabled) {
                 (void)waywal_palette_export_filtered(

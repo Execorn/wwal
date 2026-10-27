@@ -1618,6 +1618,53 @@ static void test_particle_simulator_avx2(void)
         }
         we_particle_destroy(osys);
     }
+
+    /* Verify AVX2 8-wide sprite vertex builder + scalar tail (27 particles = 3x8 + 3) */
+    {
+        const char *sprite_json =
+            "{\n"
+            "  \"maxcount\": 32,\n"
+            "  \"renderer\": [{\"name\": \"sprite\"}],\n"
+            "  \"emitter\": [{\"name\": \"boxrandom\", \"rate\": 0, \"instantaneous\": 27, "
+            "\"distancemin\": \"0 0 0\", \"distancemax\": \"0 0 0\"}],\n"
+            "  \"initializer\": [{\"name\": \"lifetimerandom\", \"min\": 100.0, \"max\": 100.0}]\n"
+            "}\n";
+        we_particle_sys_t *ssys = we_particle_create_from_json(sprite_json, strlen(sprite_json));
+        assert(ssys != NULL);
+        we_particle_update(ssys, 0.001f);
+        assert(ssys->alive_count == 27u);
+        for (uint32_t i = 0; i < 27u; ++i) {
+            ssys->pos_x[i] = (float)i * 10.0f;
+            ssys->pos_y[i] = (float)i * 5.0f;
+            ssys->pos_z[i] = (float)i;
+            ssys->size[i] = 4.0f; /* half-size = 2.0f */
+            ssys->rot_z[i] = (float)i * 0.25f;
+            ssys->r[i] = 0.25f;
+            ssys->g[i] = 0.5f;
+            ssys->b[i] = 0.75f;
+            ssys->a[i] = 1.0f;
+        }
+        we_particle_vertex_t *sverts = NULL;
+        uint32_t snverts = we_particle_build_vertices(ssys, &sverts);
+        assert(snverts == 27u * 4u && sverts != NULL);
+        for (uint32_t i = 0; i < 27u; ++i) {
+            float c = cosf(ssys->rot_z[i]) * 2.0f;
+            float s = sinf(ssys->rot_z[i]) * 2.0f;
+            float px = ssys->pos_x[i];
+            float py = ssys->pos_y[i];
+            const we_particle_vertex_t *v = &sverts[i * 4u];
+            assert(fabsf(v[0].pos[0] - (px - c + s)) < 1e-3f);
+            assert(fabsf(v[0].pos[1] - (py - s - c)) < 1e-3f);
+            assert(fabsf(v[1].pos[0] - (px + c + s)) < 1e-3f);
+            assert(fabsf(v[1].pos[1] - (py + s - c)) < 1e-3f);
+            assert(fabsf(v[2].pos[0] - (px + c - s)) < 1e-3f);
+            assert(fabsf(v[2].pos[1] - (py + s + c)) < 1e-3f);
+            assert(fabsf(v[3].pos[0] - (px - c - s)) < 1e-3f);
+            assert(fabsf(v[3].pos[1] - (py - s + c)) < 1e-3f);
+            assert(fabsf(v[0].color[0] - 0.25f) < 1e-5f && fabsf(v[0].color[3] - 1.0f) < 1e-5f);
+        }
+        we_particle_destroy(ssys);
+    }
 }
 
 /* =========================================================================

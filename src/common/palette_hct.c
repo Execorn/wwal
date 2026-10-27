@@ -57,7 +57,6 @@ typedef struct {
     float weight;
 } weighted_point_t;
 
-static _Thread_local wu_hist_t tls_wu_hist;
 static float g_srgb_to_linear[256];
 static uint8_t g_linear_to_srgb_lut[4097];
 static atomic_bool g_srgb_lut_ready = false;
@@ -1473,9 +1472,15 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
 
     ensure_srgb_lut();
 
+    wu_hist_t *hist = (wu_hist_t *)aligned_alloc(32, sizeof(wu_hist_t));
+    if (!hist) {
+        return false;
+    }
+
     size_t valid_samples =
-        wu_populate_histogram(&tls_wu_hist, pixels, width, height, stride_bytes, is_bgra);
+        wu_populate_histogram(hist, pixels, width, height, stride_bytes, is_bgra);
     if (valid_samples == 0) {
+        free(hist);
         waywal_oklch_t def_p = {.l = 0.6f, .c = 0.02f, .h_rad = 4.5f};
         waywal_oklch_t def_s = {.l = 0.6f, .c = 0.015f, .h_rad = 4.5f};
         waywal_oklch_t def_t = {.l = 0.6f, .c = 0.02f, .h_rad = 5.5f};
@@ -1492,10 +1497,11 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
         return true;
     }
 
-    wu_compute_moments(&tls_wu_hist);
+    wu_compute_moments(hist);
 
     weighted_point_t wu_boxes[WU_MAX_BOXES];
-    size_t n_boxes = wu_partition(&tls_wu_hist, wu_boxes, WU_MAX_BOXES);
+    size_t n_boxes = wu_partition(hist, wu_boxes, WU_MAX_BOXES);
+    free(hist);
 
     weighted_point_t clusters[KMEANS_K];
     size_t n_clusters = weighted_kmeans_pp(wu_boxes, n_boxes, clusters, KMEANS_K);

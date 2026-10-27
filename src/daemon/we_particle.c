@@ -1360,7 +1360,7 @@ __attribute__((target("avx2,fma"))) static inline __m256 vsin256_ps(__m256 x)
     return _mm256_fmadd_ps(poly, _mm256_mul_ps(r2, r), r);
 }
 
-__attribute__((unused, target("avx2,fma"))) static inline __m256 vcos256_ps(__m256 x)
+__attribute__((target("avx2,fma"))) static inline __m256 vcos256_ps(__m256 x)
 {
     return vsin256_ps(_mm256_add_ps(x, _mm256_set1_ps(1.57079632679489661923f)));
 }
@@ -1795,6 +1795,82 @@ static void compute_rope_joint_normal(const we_particle_sys_t *sys, uint32_t idx
     }
 }
 
+#if !defined(WWAL_DISABLE_SIMD) && (defined(__x86_64__) || defined(_M_X64))
+__attribute__((target("avx2,fma"))) static uint32_t
+particle_build_sprites_avx2(we_particle_sys_t *sys, uint32_t count)
+{
+    const __m256 v_half = _mm256_set1_ps(0.5f);
+    float rx_x_arr[8] __attribute__((aligned(32)));
+    float rx_y_arr[8] __attribute__((aligned(32)));
+    uint32_t i = 0;
+    for (; i + 8u <= count; i += 8u) {
+        __m256 v_hs = _mm256_mul_ps(_mm256_load_ps(sys->size + i), v_half);
+        __m256 v_rz = _mm256_load_ps(sys->rot_z + i);
+        __m256 v_cs = vcos256_ps(v_rz);
+        __m256 v_sn = vsin256_ps(v_rz);
+        _mm256_store_ps(rx_x_arr, _mm256_mul_ps(v_cs, v_hs));
+        _mm256_store_ps(rx_y_arr, _mm256_mul_ps(v_sn, v_hs));
+
+        for (uint32_t k = 0; k < 8u; ++k) {
+            uint32_t idx = i + k;
+            float px = sys->pos_x[idx];
+            float py = sys->pos_y[idx];
+            float pz = sys->pos_z[idx];
+            float rx_x = rx_x_arr[k];
+            float rx_y = rx_y_arr[k];
+            float ry_x = -rx_y;
+            float ry_y = rx_x;
+
+            we_particle_vertex_t *v = &sys->vert_buf[sys->quad_count * 4u];
+            float cr = sys->r[idx], cg = sys->g[idx], cb = sys->b[idx], ca = sys->a[idx];
+
+            v[0].pos[0] = px - rx_x - ry_x;
+            v[0].pos[1] = py - rx_y - ry_y;
+            v[0].pos[2] = pz;
+            v[0].uv[0] = 0.0f;
+            v[0].uv[1] = 0.0f;
+            v[0].color[0] = cr;
+            v[0].color[1] = cg;
+            v[0].color[2] = cb;
+            v[0].color[3] = ca;
+
+            v[1].pos[0] = px + rx_x - ry_x;
+            v[1].pos[1] = py + rx_y - ry_y;
+            v[1].pos[2] = pz;
+            v[1].uv[0] = 1.0f;
+            v[1].uv[1] = 0.0f;
+            v[1].color[0] = cr;
+            v[1].color[1] = cg;
+            v[1].color[2] = cb;
+            v[1].color[3] = ca;
+
+            v[2].pos[0] = px + rx_x + ry_x;
+            v[2].pos[1] = py + rx_y + ry_y;
+            v[2].pos[2] = pz;
+            v[2].uv[0] = 1.0f;
+            v[2].uv[1] = 1.0f;
+            v[2].color[0] = cr;
+            v[2].color[1] = cg;
+            v[2].color[2] = cb;
+            v[2].color[3] = ca;
+
+            v[3].pos[0] = px - rx_x + ry_x;
+            v[3].pos[1] = py - rx_y + ry_y;
+            v[3].pos[2] = pz;
+            v[3].uv[0] = 0.0f;
+            v[3].uv[1] = 1.0f;
+            v[3].color[0] = cr;
+            v[3].color[1] = cg;
+            v[3].color[2] = cb;
+            v[3].color[3] = ca;
+
+            sys->quad_count++;
+        }
+    }
+    return i;
+}
+#endif
+
 uint32_t we_particle_build_vertices(we_particle_sys_t *sys, we_particle_vertex_t **out_verts)
 {
     if (!sys || !sys->vert_buf) {
@@ -1887,7 +1963,14 @@ uint32_t we_particle_build_vertices(we_particle_sys_t *sys, we_particle_vertex_t
         }
     } else {
         uint32_t count = n < sys->quad_cap ? n : sys->quad_cap;
-        for (uint32_t i = 0; i < count; i++) {
+        uint32_t i = 0;
+#if !defined(WWAL_DISABLE_SIMD) && (defined(__x86_64__) || defined(_M_X64))
+        if (sys->renderer_type != WE_RENDERER_SPRITETRAIL && __builtin_cpu_supports("avx2") &&
+            __builtin_cpu_supports("fma")) {
+            i = particle_build_sprites_avx2(sys, count);
+        }
+#endif
+        for (; i < count; i++) {
             float px = sys->pos_x[i];
             float py = sys->pos_y[i];
             float pz = sys->pos_z[i];

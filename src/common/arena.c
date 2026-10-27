@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "waywal/arena.h"
 
 #include <stdint.h>
@@ -90,6 +93,14 @@ void arena_reset(arena_t *arena)
 {
     if (!arena)
         return;
+    if (arena->buffer && arena->offset > 1024 * 1024) {
+        size_t page_size = get_page_size();
+        size_t len = (arena->offset + page_size - 1) & ~(page_size - 1);
+        if (len > arena->capacity) {
+            len = arena->capacity;
+        }
+        (void)madvise(arena->buffer, len, MADV_DONTNEED);
+    }
     arena->offset = 0;
 }
 

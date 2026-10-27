@@ -1661,6 +1661,9 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                 }
             }
             if (uploaded) {
+                if (!state->transitions_in_progress && state->num_outputs <= 1) {
+                    render_engine_release_upload_cache(&state->render_engine);
+                }
                 wl_surface_attach(node->surface, bo->wl_buffer, 0, 0);
                 wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
                 output_commit_frame(node);
@@ -1867,6 +1870,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
             }
             output_node_render_image(state, out, pixels, img_w, img_h);
         }
+        render_engine_release_upload_cache(&state->render_engine);
         return true;
     }
 
@@ -2087,6 +2091,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         out->transition_active = true;
         started_count++;
     }
+    render_engine_release_upload_cache(&state->render_engine);
 
     if (started_count == 0)
         return false;

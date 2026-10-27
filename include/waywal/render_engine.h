@@ -62,6 +62,7 @@ void render_engine_set_span_bounds(render_engine_t *re, int32_t off_x, int32_t o
                                    int32_t total_w, int32_t total_h);
 
 void render_engine_bump_upload_gen(render_engine_t *re);
+void render_engine_release_upload_cache(render_engine_t *re);
 
 /* Hot-compiles and loads an arbitrary GLSL compute shader for CUSTOM transition */
 bool render_engine_load_custom_shader(render_engine_t *re, const char *shader_src);
