@@ -46,6 +46,10 @@ Want the deep technical details? Read [**Technical Architecture & Full CLI Refer
 
 ### Arch Linux (AUR)
 ```bash
+# Prebuilt binary (fast install)
+yay -S wwal-bin
+
+# Or build latest from source
 yay -S wwal-git
 ```
 
@@ -53,6 +57,19 @@ yay -S wwal-git
 ```bash
 sudo dnf copr enable execorn/wwal
 sudo dnf install wwal
+```
+
+### openSUSE Tumbleweed (Copr)
+```bash
+sudo zypper addrepo https://download.copr.fedorainfracloud.org/results/execorn/wwal/opensuse-tumbleweed-\$basearch/ execorn-wwal
+sudo zypper --gpg-auto-import-keys refresh
+sudo zypper install wwal
+```
+
+### Ubuntu / Debian (`.deb`)
+```bash
+curl -LO https://github.com/Execorn/wwal/releases/latest/download/wwal_1.1.0_amd64.deb
+sudo apt install ./wwal_1.1.0_amd64.deb
 ```
 
 ### NixOS / Nix (`flake.nix`)

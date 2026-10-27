@@ -59,20 +59,66 @@ jobs:
           DESTDIR="${RUNNER_TEMP}/pkg" meson install -C build
           strip --strip-unneeded "${RUNNER_TEMP}/pkg/usr/bin/wwal" "${RUNNER_TEMP}/pkg/usr/bin/wwald"
 
-      - name: Package release archive & checksums
+      - name: Package release archive, Debian package & checksums
         run: |
           TAG="${GITHUB_REF_NAME}"
-          ARCHIVE="wwal-${TAG}-linux-x86_64.tar.gz"
+          VERSION="${TAG#v}"
+
+          rm -rf deb-pkg
+          mkdir -p deb-pkg/DEBIAN
+          install -Dm755 "${RUNNER_TEMP}/pkg/usr/bin/wwal" deb-pkg/usr/bin/wwal
+          install -Dm755 "${RUNNER_TEMP}/pkg/usr/bin/wwald" deb-pkg/usr/bin/wwald
+          install -Dm644 "${RUNNER_TEMP}/pkg/usr/lib/systemd/user/wwald.service" deb-pkg/usr/lib/systemd/user/wwald.service
+          sed -i 's|^ExecStart=wwald$|ExecStart=/usr/bin/wwald|' deb-pkg/usr/lib/systemd/user/wwald.service
+          install -Dm644 "${RUNNER_TEMP}/pkg/usr/lib/systemd/user/wwald.socket" deb-pkg/usr/lib/systemd/user/wwald.socket
+          install -Dm644 "${RUNNER_TEMP}/pkg/usr/share/man/man1/wwal.1" deb-pkg/usr/share/man/man1/wwal.1
+          install -Dm644 "${RUNNER_TEMP}/pkg/usr/share/man/man1/wwald.1" deb-pkg/usr/share/man/man1/wwald.1
+          install -Dm644 "${RUNNER_TEMP}/pkg/usr/share/man/man5/wwal-config.5" deb-pkg/usr/share/man/man5/wwal-config.5
+          install -Dm644 "${RUNNER_TEMP}/pkg/usr/share/bash-completion/completions/wwal" deb-pkg/usr/share/bash-completion/completions/wwal
+          install -Dm644 "${RUNNER_TEMP}/pkg/usr/share/zsh/site-functions/_wwal" deb-pkg/usr/share/zsh/site-functions/_wwal
+          install -Dm644 "${RUNNER_TEMP}/pkg/usr/share/fish/vendor_completions.d/wwal.fish" deb-pkg/usr/share/fish/vendor_completions.d/wwal.fish
+          install -Dm644 LICENSE deb-pkg/usr/share/doc/wwal/copyright
+
+          printf '%s\n' \
+            "Package: wwal" \
+            "Version: ${VERSION}" \
+            "Section: x11" \
+            "Priority: optional" \
+            "Architecture: amd64" \
+            "Maintainer: Biryukov Nikita <n.biryukov.04@gmail.com>" \
+            "Homepage: https://github.com/Execorn/wwal" \
+            "Depends: libc6, libwayland-client0, libdrm2, libgbm1, libegl1, libgles2, libva2, libva-drm2, liburing2, libseccomp2, libpng16-16t64 | libpng16-16, libturbojpeg0, libgomp1" \
+            "Recommends: libwebp7, libavif16, librsvg2-2, libpipewire-0.3-0, ffmpeg" \
+            "Description: Fast Wayland wallpaper, video, shader, and Steam Workshop engine" \
+            " WayWal (wwal) is a fast Wayland wallpaper engine supporting static images," \
+            " hardware-accelerated video, live GLSL shaders, Steam Workshop scenes, and" \
+            " instant Material You color extraction." \
+            > deb-pkg/DEBIAN/control
+
+          DEB_PKG="wwal_${VERSION}_amd64.deb"
+          dpkg-deb --build --root-owner-group deb-pkg "${DEB_PKG}"
+
+          ARCHIVE_TAG="wwal-${TAG}-linux-x86_64.tar.gz"
+          ARCHIVE_VER="wwal-${VERSION}-linux-x86_64.tar.gz"
           cp LICENSE README.md CHANGELOG.md "${RUNNER_TEMP}/pkg/"
-          tar -C "${RUNNER_TEMP}/pkg" -czf "${ARCHIVE}" .
-          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          tar -C "${RUNNER_TEMP}/pkg" -czf "${ARCHIVE_TAG}" .
+          cp "${ARCHIVE_TAG}" "${ARCHIVE_VER}"
+          sha256sum "${ARCHIVE_TAG}" > "${ARCHIVE_TAG}.sha256"
+          sha256sum "${ARCHIVE_VER}" "${ARCHIVE_TAG}" "${DEB_PKG}" > SHA256SUMS.txt
 
       - name: Attach artifacts to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
           if ! gh release view "${TAG}" >/dev/null 2>&1; then
             gh release create "${TAG}" --generate-notes --title "wwal ${TAG}"
           fi
-          gh release upload "${TAG}" "wwal-${TAG}-linux-x86_64.tar.gz" "wwal-${TAG}-linux-x86_64.tar.gz.sha256" --clobber
+          gh release upload "${TAG}" \
+            "wwal-${TAG}-linux-x86_64.tar.gz" \
+            "wwal-${TAG}-linux-x86_64.tar.gz.sha256" \
+            "wwal-${VERSION}-linux-x86_64.tar.gz" \
+            "wwal_${VERSION}_amd64.deb" \
+            "SHA256SUMS.txt" \
+            --clobber
