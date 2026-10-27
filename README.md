@@ -44,6 +44,11 @@ Want the deep technical details? Read [**Technical Architecture & Full CLI Refer
 
 ## Install
 
+### Arch Linux (AUR)
+```bash
+yay -S wwal-git
+```
+
 ### NixOS / Nix (`flake.nix`)
 ```bash
 nix profile install github:Execorn/wwal
