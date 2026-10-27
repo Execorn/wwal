@@ -3,6 +3,7 @@
 
 #if !defined(WWAL_DISABLE_SIMD) && (defined(__aarch64__) || defined(_M_ARM64))
 #include <arm_neon.h>
+#include <string.h>
 
 void blend_scanline_neon(uint8_t *restrict dst, const uint8_t *restrict src_a,
                          const uint8_t *restrict src_b, uint16_t weight_b, size_t num_bytes)
