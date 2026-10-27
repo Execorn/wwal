@@ -66,9 +66,29 @@ Pause video and live shader rendering when Hyprland/Sway IPC reports the active 
 Pause animations when \fBext_idle_notifier_v1\fR reports the user session is idle or locked (default: \fBtrue\fR).
 .RE
 .PP
+\fBidle_timeout_sec\fR = <int>
+.RS 4
+Idle timeout in seconds before \fBext_idle_notifier_v1\fR pauses animations (default: \fB300\fR).
+.RE
+.PP
 \fBbattery_policy\fR = "<ignore|reduce-fps|pause-video>"
 .RS 4
-Power governor behavior when running on laptop battery power (default: \fB"pause-video"\fR).
+Power governor behavior when running on laptop battery power (default: \fB"reduce-fps"\fR).
+.RE
+.PP
+\fBworkshop_dir\fR = "<path>"
+.RS 4
+Custom Steam Workshop (\fB431960\fR) directory path override for \fBwwal workshop\fR.
+.RE
+.PP
+\fBvolume\fR = <float>
+.RS 4
+Default wallpaper audio playback volume in \fB0.0..1.0\fR (default: \fB0.0\fR).
+.RE
+.PP
+\fBmute_on_audio\fR = <bool>
+.RS 4
+Automatically duck wallpaper audio volume when another application plays audio via PipeWire (default: \fBfalse\fR).
 .RE
 .PP
 .SS [theme]
@@ -115,6 +135,11 @@ Write \fB~/.cache/wwal/colors.css\fR and \fB~/.cache/wwal/colors.json\fR (defaul
 Write \fB~/.cache/wwal/colors-hyprland.conf\fR (default: \fBtrue\fR).
 .RE
 .PP
+\fBtheme_from_media\fR = <bool>
+.RS 4
+Dynamically extract Material Design 3 palettes from active D-Bus \fBMPRIS2\fR media player album art (default: \fBfalse\fR).
+.RE
+.PP
 .SS [transition]
 .PP
 Sets default parameters for GPU compute and CPU SIMD wallpaper transitions.
@@ -159,16 +184,30 @@ Multi-monitor transition synchronization mode (default: \fB"simultaneous"\fR).
 Delay in milliseconds between monitors in \fBstaggered\fR mode (default: \fB150\fR).
 .RE
 .PP
+.SS [hooks]
+.PP
+Configures optional shell commands executed asynchronously by \fBwwald\fR(1) on state changes.
+.PP
+\fBon_wallpaper_change\fR = "<command>"
+.RS 4
+Command executed after a wallpaper transition completes.
+.RE
+.PP
+\fBon_theme_change\fR = "<command>"
+.RS 4
+Command executed after a Material Design 3 palette is exported.
+.RE
+.PP
 .SS [output."<NAME>"]
 .PP
-Configures initial wallpaper, video, shader, or slideshow settings for a specific Wayland output (such as \fB[output."DP-1"]\fR or \fB[output."eDP-1"]\fR). Use \fB[output."\fR"]* as a wildcard fallback for unconfigured monitors.
+Configures initial wallpaper, video, shader, Workshop scene, or slideshow settings for a specific Wayland output (such as \fB[output."DP-1"]\fR or \fB[output."eDP-1"]\fR). Use \fB[output."*"]\fR as a wildcard fallback for unconfigured monitors.
 .PP
 \fBpath\fR = "<path>"
 .RS 4
-Path to an image, video, shader, or slideshow directory.
+Path to an image, video, shader, Workshop scene, or slideshow directory.
 .RE
 .PP
-\fBmode\fR = "<img|video|shader|slideshow|color>"
+\fBmode\fR = "<img|video|shader|workshop|slideshow|color>"
 .RS 4
 Content mode for this output (default: inferred from \fIpath\fR).
 .RE
@@ -195,7 +234,17 @@ Randomize slideshow order on this output (default: \fBtrue\fR).
 .PP
 \fBaudio\fR = <bool>
 .RS 4
-Enable PipeWire Bark FFT audio capture when \fBmode = "shader"\fR (default: \fBfalse\fR).
+Enable PipeWire Bark FFT audio capture when \fBmode = "shader"\fR or \fBmode = "workshop"\fR (default: \fBfalse\fR).
+.RE
+.PP
+\fBvolume\fR = <float>
+.RS 4
+Per-output wallpaper audio playback volume in \fB0.0..1.0\fR (default: \fB0.0\fR).
+.RE
+.PP
+\fBmute_on_audio\fR = <bool>
+.RS 4
+Per-output automatic volume ducking when external audio plays (default: \fBfalse\fR).
 .RE
 .PP
 .SS [workspace."<NAME>"]

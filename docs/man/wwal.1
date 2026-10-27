@@ -333,6 +333,11 @@ Aspect-ratio scaling mode:
 Enable interactive 3D Parallax Occlusion Mapping (POM) on a 2D image using the grayscale depth map at \fIFILE\fR, driven by smoothed cursor tracking and workspace-slide inertia.
 .RE
 .PP
+\fB--depth-strength\fR <FLOAT>
+.RS 4
+Depth parallax displacement multiplier when \fB--depth-map\fR is active (default: \fB1.0\fR).
+.RE
+.PP
 \fB--fill-color\fR <HEX>
 .RS 4
 Background padding color in 6- or 8-digit hex for \fBfit\fR and \fBcenter\fR modes (default: \fB000000\fR).
@@ -363,12 +368,22 @@ Wayland layer-shell layer placement (default: \fBbackground\fR).
 Enable or disable automatic Material Design 3 OKLab/CAM16/HCT color extraction and \fBcaelestia\fR/\fBOSC\fR synchronization on wallpaper change.
 .RE
 .PP
+\fB--theme-from-media, --no-theme-from-media\fR
+.RS 4
+Enable or disable dynamic Material Design 3 palette extraction from active D-Bus \fBMPRIS2\fR album art.
+.RE
+.PP
 \fB--animate\fR
 .RS 4
 Route animated GIF/WebP/APNG files through the hardware video/animation engine.
 .RE
 .PP
 .SH VIDEO, SHADER & POWER OPTIONS
+.PP
+\fB-p, --prop\fR <KEY=VALUE>
+.RS 4
+Override a Wallpaper Engine Workshop user property when applying a scene (repeatable).
+.RE
 .PP
 \fB--loop\fR <COUNT>
 .RS 4
@@ -380,9 +395,24 @@ Number of playback loops for \fBvideo\fR (\fB0\fR for infinite loop, default: \f
 Playback speed multiplier for \fBvideo\fR and \fBshader\fR (default: \fB1.0\fR).
 .RE
 .PP
+\fB--fps\fR <FPS>
+.RS 4
+Target rendering frame rate for \fBshader\fR and \fBworkshop\fR scenes (default: \fB60\fR).
+.RE
+.PP
 \fB--audio\fR
 .RS 4
-Enable lock-free PipeWire default sink monitor capture and 64-bin logarithmic Bark-scale FFT uniforms (\fBu_audio_bands[64]\fR, \fBu_audio_envelope\fR, and Shadertoy \fBiChannel0\fR 512x2 audio texture) for \fBshader\fR.
+Enable lock-free PipeWire default sink monitor capture and 64-bin logarithmic Bark-scale FFT uniforms (\fBu_audio_bands[64]\fR, \fBu_audio_envelope\fR, and Shadertoy \fBiChannel0\fR 512x2 audio texture) for \fBshader\fR and \fBworkshop\fR.
+.RE
+.PP
+\fB--volume\fR <0.0..1.0>
+.RS 4
+Set wallpaper audio playback volume for \fBvideo\fR, \fBshader\fR, \fBworkshop\fR, and \fBaudio\fR (default: \fB0.0\fR).
+.RE
+.PP
+\fB--mute-on-audio, --no-mute-on-audio\fR
+.RS 4
+Enable or disable automatic exponential volume ducking when another application plays audio via PipeWire.
 .RE
 .PP
 \fB--battery-policy\fR <ignore|reduce-fps|pause-video>

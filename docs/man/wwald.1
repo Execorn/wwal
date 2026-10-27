@@ -47,6 +47,16 @@ On NVIDIA GPUs (\fBlibva-nvidia-driver\fR), exports separate layers into a compa
 .IP \(bu 2
 Synchronizes frame presentation to display VBlank using a Phase-Locked Loop (PLL) fed by \fBwp_presentation_feedback\fR timestamps.
 .PP
+.SS Native Wallpaper Engine, Multi-Pass Shadertoy & Reactive Audio/MPRIS2
+.PP
+\fBwwald\fR includes a native Wallpaper Engine (\fB431960\fR) Workshop runtime, a multi-pass Shadertoy pipeline, and reactive desktop bridges:
+.IP \(bu 2
+Maps \fBPKGV0001..PKGV0022\fR \fBscene.pkg\fR archives directly via \fBmmap\fR(2) without temporary disk extraction, decoding \fBTEXV0005\fR (\fBBC1\fR, \fBBC2\fR, \fBBC3\fR, \fBBC7\fR, and \fBLZ4\fR) textures, 2D Puppet Warp (\fB.mdl\fR) skeletal meshes, 32-byte-aligned AVX2 Structure-of-Arrays particle systems, and sandboxed \fBSceneScript\fR logic.
+.IP \(bu 2
+Executes multi-pass Shadertoy fragment shaders (\fBBuffer A\fR..\fBBuffer D\fR \fBGL_RGBA16F\fR ping-pong passes, \fBiChannel0\fR..\fBiChannel3\fR, \fB#pragma waywal\fR, hardware derivatives) and 2.5D Depth-Map Parallax Occlusion Mapping driven by cursor and workspace-slide spring physics.
+.IP \(bu 2
+Streams lock-free PipeWire 2048-point AVX2 64-bin Bark-scale FFT spectrum data, automatically ducks wallpaper audio when external media plays, and listens to D-Bus \fBMPRIS2\fR signals with zero idle polling to expose \fBu_album_art\fR, \fBu_media_playing\fR, and live album art Material Design 3 palettes.
+.PP
 .SS Zero-Watt Smart Occlusion & Battery Governor
 .PP
 \fBwwald\fR maintains a per-output pause bitmask (\fBwaywal_pause_reason_t\fR):

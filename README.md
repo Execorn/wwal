@@ -12,38 +12,38 @@
   </a>
 </p>
 
-**WayWal** (`wwald` daemon and `wwal` CLI) is a fast, low-memory Wayland desktop engine written in C23 (`gnu2x`). It replaces static wallpaper daemons (`swww`/`awww`, `hyprpaper`, `wpaperd`), video players (`mpvpaper`), Shadertoy and audio visualizers (`shaderbg`, `glava`), Linux Wallpaper Engine ports, and Material Design 3 theme generators (`matugen`, `wallust`) inside a single `< 2 MB` binary pair.
+**WayWal** (`wwald` daemon and `wwal` CLI) is a fast, low-memory Wayland desktop engine written in C23 (`gnu2x`). It replaces static wallpaper tools (`swww`/`awww`, `hyprpaper`, `wpaperd`), video players (`mpvpaper`), Shadertoy and audio tools (`shaderbg`, `glava`), Linux Wallpaper Engine ports, and Material Design 3 theme tools (`matugen`, `wallust`). Everything runs inside a single `< 2 MB` binary pair.
 
 ---
 
 ## Why Use WayWal?
 
-- **Zero-Copy Direct Scanout**: Renders static wallpapers into GPU DMA-BUFs (`zwp_linux_dmabuf_v1` with linear, NVIDIA block-linear, AMD DCC, and Intel CCS modifiers) and 1×1 solid color buffers (`wp_single_pixel_buffer_v1`) with **0.0% GPU 3D load**.
-- **True Physical HiDPI & Panoramic Spanning**: Binds `wp_fractional_scale_v1` and `wp_viewporter` so 4K and 5K monitors at fractional scales (`1.25x`, `1.5x`, `1.75x`) render at exact physical pixel dimensions, and supports `--scaling-mode span` across multi-monitor layouts.
-- **Native Wallpaper Engine Workshop Runtime**: Loads Steam Workshop (`431960`) wallpapers directly via `mmap` (`PKGV0001..22` archives, `TEXV0005` `BC1`/`BC2`/`BC3`/`BC7` & `LZ4` textures, `.mdl` Puppet Warp skeletal meshes, AVX2 SoA particle systems, multi-pass effect chains, and a sandboxed `SceneScript` VM) without extracting archives to disk.
-- **Hardware Video & Native Animations**: Plays H.264, HEVC, VP9, and AV1 videos without FFmpeg runtime dependencies using VA-API (`libva`), direct `NV12`/`P010` KMS scanout on Intel/AMD, a 3-surface `BGRX` VPP ring on NVIDIA, and an in-process GIF/APNG/WebP delta-frame engine.
-- **Live Multi-Pass Shadertoy & 2.5D Depth Parallax**: Runs GLSL ES 3.1 `.comp` and multi-pass Shadertoy `.frag` shaders (`Buffer A`..`Buffer D` `GL_RGBA16F` ping-pong passes, `iChannel0`..`iChannel3`, `#pragma waywal`, hardware derivatives `dFdx`/`dFdy`/`fwidth`), 2.5D Depth-Map Parallax Occlusion Mapping (`--depth-map`, `--depth-strength`), and 4-tier Wayland cursor and workspace-slide spring parallax.
-- **PipeWire Bark FFT, Smart Audio Ducking & D-Bus MPRIS2**: Streams lock-free PipeWire 2048-point AVX2 64-bin Bark-scale audio spectrum data (`--audio`), supports background audio volume and automatic ducking when external media plays (`--volume`, `--mute-on-audio`, `wwal audio`), and binds D-Bus `MPRIS2` metadata and album art (`u_album_art`, `u_media_playing`, `--theme-from-media`) with zero idle polling.
-- **Universal Live-to-Live GPU Transitions & Material 3 Theming**: Runs 18 built-in GLES 3.1 compute transitions seamlessly across static images, hardware videos, live shaders, and Workshop scenes, while extracting `CAM16`/`HCT` and `OKLab` palettes from 4K images in **0.32 ms** for Quickshell (`caelestia`), Waybar, Hyprland, and `/dev/pts/*` terminals.
-- **Zero-Watt Smart Occlusion & Battery Governor**: Pauses video, shader, and Workshop scene rendering down to **0.00% CPU and GPU** when a monitor is covered by a fullscreen or maximized window (`ext-foreign-toplevel-list-v1` + Hyprland/Sway/Niri IPC), when the session is idle (`ext-idle-notify-v1`), or on laptop battery power.
-- **Drop-In `swww` / `awww` Compatibility & Live JSON IPC**: Works as a drop-in replacement for `swww` and `awww` scripts (`waypaper`, Rofi pickers) and exposes real-time JSON inspection (`wwal status --json`, `wwal query --json`), live uniform mutation (`wwal set-uniform`), and event streaming (`wwal subscribe`).
+- **Zero-Copy Direct Scanout**: Draws static wallpapers directly into GPU DMA-BUFs (`zwp_linux_dmabuf_v1` with linear, NVIDIA block-linear, AMD DCC, and Intel CCS formats). Solid colors use 1×1 buffers (`wp_single_pixel_buffer_v1`) with **0.0% GPU 3D load**.
+- **True Physical HiDPI & Panoramic Span**: Uses `wp_fractional_scale_v1` and `wp_viewporter`. Your 4K and 5K screens at fractional scales (`1.25x`, `1.5x`, `1.75x`) draw at exact pixel size. Use `--scaling-mode span` to stretch one wide image across all screens.
+- **Native Wallpaper Engine Workshop Runtime**: Loads Steam Workshop (`431960`) wallpapers directly from disk via `mmap` (`wwal workshop list / info / apply <id|path> [--prop key=val]`). It reads `scene.pkg` (`PKGV0001..22`) archives and `.tex` (`TEXV0005` `BC1`/`BC2`/`BC3`/`BC7` and `LZ4`) textures without unpacking files. It also runs `.mdl` Puppet Warp skeletal mesh models, an AVX2 SoA particle simulator, multi-pass effects, and a safe `SceneScript` VM.
+- **Hardware Video & Native Animations**: Plays H.264, HEVC, VP9, and AV1 videos without FFmpeg at runtime. It uses VA-API (`libva`) with direct `NV12`/`P010` KMS scanout on Intel and AMD. On NVIDIA, it uses a 3-surface `BGRX` VPP ring. It also includes a built-in GIF, APNG, and WebP engine.
+- **Multi-Pass Shadertoy & 2.5D Depth Parallax**: Runs GLSL ES 3.1 `.comp` and multi-pass Shadertoy `.frag` shaders (`Buffer A`..`Buffer D` `GL_RGBA16F` passes, `iChannel0`..`iChannel3`, `#pragma waywal`, and hardware derivatives `dFdx`/`dFdy`/`fwidth`). It also supports 2.5D Depth-Map Parallax Occlusion Mapping (`--depth-map`, `--depth-strength`). Both modes react to 4-tier Wayland cursor tracking and workspace-slide spring motion.
+- **PipeWire Audio Ducking & D-Bus MPRIS2**: Streams lock-free PipeWire 2048-point AVX2 64-bin Bark-scale audio data (`--audio`). You can set wallpaper audio volume and auto-duck sound when other apps play media (`--volume`, `--mute-on-audio`, `wwal audio`). It also listens to D-Bus `MPRIS2` events with zero idle polling. This feeds `u_album_art`, `u_media_playing`, and live album art themes (`--theme-from-media`).
+- **Live-to-Live GPU Transitions & Fast Themes**: Runs 18 built-in GLES 3.1 compute transitions smoothly between static images, videos, live shaders, and Workshop scenes. When the wallpaper changes, it builds `CAM16`/`HCT` and `OKLab` color themes from 4K images in **0.32 ms**. It syncs themes to Quickshell (`caelestia`), Waybar, Hyprland, and `/dev/pts/*` terminals.
+- **Zero-Watt Smart Pause & Battery Saver**: Pauses video, shader, and Workshop scenes down to **0.00% CPU and GPU** when a screen is covered by a full-screen or full-size window (`ext-foreign-toplevel-list-v1` + Hyprland/Sway/Niri IPC). It also pauses when the session is idle (`ext-idle-notify-v1`) or when your laptop runs on battery power.
+- **Drop-In `swww` / `awww` Support & Live JSON IPC**: Works as a drop-in replacement for `swww` and `awww` scripts (`waypaper`, Rofi menus). You can query live JSON state (`wwal status --json`, `wwal query --json`, `wwal stats --json`). You can also change live shader uniforms (`wwal set-uniform`) and watch state events (`wwal subscribe`).
 
 > [!TIP]
-> WayWal runs 18 built-in transition shaders on the GPU via OpenGL ES 3.1 compute shaders (`0.09–0.17 ms` at 1080p, `0.20–0.41 ms` at 4K) and includes an OpenMP + AVX-512 / AVX2 / NEON CPU fallback engine that renders 720p transitions at **1,548 – 26,087 FPS**.
+> WayWal runs 18 built-in transition shaders on the GPU via OpenGL ES 3.1 compute shaders (`0.09–0.17 ms` at 1080p, `0.20–0.41 ms` at 4K). If no GPU is present, its OpenMP + AVX-512 / AVX2 / NEON CPU fallback draws 720p transitions at **1,548 – 26,087 FPS**.
 
 ---
 
 ## Dependencies & Requirements
 
-Building from source requires a C compiler supporting C23 (`GCC >= 13` or `Clang >= 17`), `meson >= 0.60`, `ninja`, `pkg-config`, and `python3`.
+To build from source, you need a C23 compiler (`GCC >= 13` or `Clang >= 17`), `meson >= 0.60`, `ninja`, `pkg-config`, and `python3`.
 
-| Category | `pkg-config` / Package Names | Role |
+| Group | `pkg-config` / Package Names | Role |
 | :--- | :--- | :--- |
-| **Core Wayland & DRM** | `wayland-client >= 1.20`, `wayland-protocols >= 1.34`, `wayland-scanner`, `libdrm >= 2.4.110`, `gbm`, `egl`, `glesv2` | Layer-shell surfaces, DMA-BUF allocation, and GLES 3.1 compute/fragment pipelines |
-| **Hardware Video & Kernel** | `libva`, `libva-drm`, `liburing`, `libseccomp` | VA-API video decoding, `io_uring` event loop, and Seccomp-BPF sandbox |
-| **Base Image Codecs** | `libpng`, `libturbojpeg` | Fast native PNG, APNG, and JPEG decoding |
-| **Optional Runtime Plugins (`dlopen`)** | `libwebp`, `libavif`, `libjxl`, `librsvg-2.0`, `libpipewire-0.3`, `libdbus-1`, `libquickjs` | Loaded on demand at runtime for WebP, AVIF, JXL, SVG, PipeWire audio/ducking, D-Bus `MPRIS2`, or QuickJS acceleration |
-| **Optional Build Tools** | `scdoc`, `systemd` | Compiles `docs/man/*.scd` manual pages and resolves systemd user unit paths |
+| **Core Wayland & DRM** | `wayland-client >= 1.20`, `wayland-protocols >= 1.34`, `wayland-scanner`, `libdrm >= 2.4.110`, `gbm`, `egl`, `glesv2` | Layer surfaces, DMA-BUF buffers, and GLES 3.1 pipelines |
+| **Video & Kernel** | `libva`, `libva-drm`, `liburing`, `libseccomp` | VA-API video decode, `io_uring` loop, and Seccomp sandbox |
+| **Base Image Formats** | `libpng`, `libturbojpeg` | Fast native PNG, APNG, and JPEG decode |
+| **Optional Plugins (`dlopen`)** | `libwebp`, `libavif`, `libjxl`, `librsvg-2.0`, `libpipewire-0.3`, `libdbus-1`, `libquickjs` | Loaded on demand for WebP, AVIF, JXL, SVG, PipeWire audio, D-Bus `MPRIS2`, or QuickJS |
+| **Optional Build Tools** | `scdoc`, `systemd` | Builds `docs/man/*.scd` man pages and sets systemd unit paths |
 
 ---
 
@@ -68,7 +68,7 @@ meson test -C build --print-errorlogs
 meson install -C build
 ```
 
-### Distribution Packages
+### Packages
 
 - **Arch Linux (`PKGBUILD`)**:
   ```bash
@@ -120,7 +120,7 @@ wwal restore
 
 ## Configuration (`~/.config/wwal/config.toml`)
 
-WayWal works with zero configuration out of the box. You can optionally create `~/.config/wwal/config.toml` to set persistent defaults:
+WayWal works out of the box with no setup. Create `~/.config/wwal/config.toml` if you want to save default settings:
 
 ```toml
 [daemon]
@@ -132,12 +132,15 @@ auto_pause_maximized = false
 idle_timeout_sec = 300            # Pause animations when session is idle
 ten_bit = false                   # Enable 10-bit XRGB2101010 scanout
 backdrop = "none"                 # "none", "auto-blur" (for Niri overview), or file path
+volume = 0.0                      # Default wallpaper audio volume (0.0 .. 1.0)
+mute_on_audio = true              # Auto-duck volume when another app plays audio
 
 [theme]
 enabled = true                    # Extract Material 3 palette on every wallpaper change
 mode = "dark"                     # "dark" or "light"
 caelestia_sync = true             # Write ~/.local/state/caelestia/scheme.json
 tty_sequences = true              # Broadcast OSC 4/10/11 palette to active /dev/pts/* terminals
+theme_from_media = false          # Extract palette from active D-Bus MPRIS2 album art
 
 [transition]
 type = "grow"
@@ -260,4 +263,4 @@ Measured with `./build/bench_transitions 60` (`OMP_NUM_THREADS=4`):
 
 ## Contributing & Security
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, AddressSanitizer/UBSan test commands, and code formatting guidelines. To report a security issue, follow the instructions in [`SECURITY.md`](SECURITY.md).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for build steps, test tools, and code style rules. To report a bug or security issue, read [`SECURITY.md`](SECURITY.md).

@@ -37,6 +37,13 @@ When started via *systemd*(1) socket activation (*wwald.socket*), *wwald* inheri
 - On NVIDIA GPUs (*libva-nvidia-driver*), exports separate layers into a compact 3-surface VA-API Video Post-Processing (VPP) *BGRX* ring.
 - Synchronizes frame presentation to display VBlank using a Phase-Locked Loop (PLL) fed by *wp_presentation_feedback* timestamps.
 
+## Native Wallpaper Engine, Multi-Pass Shadertoy & Reactive Audio/MPRIS2
+
+*wwald* includes a native Wallpaper Engine (*431960*) Workshop runtime, a multi-pass Shadertoy pipeline, and reactive desktop bridges:
+- Maps *PKGV0001..PKGV0022* *scene.pkg* archives directly via *mmap*(2) without temporary disk extraction, decoding *TEXV0005* (*BC1*, *BC2*, *BC3*, *BC7*, and *LZ4*) textures, 2D Puppet Warp (*.mdl*) skeletal meshes, 32-byte-aligned AVX2 Structure-of-Arrays particle systems, and sandboxed *SceneScript* logic.
+- Executes multi-pass Shadertoy fragment shaders (*Buffer A*..*Buffer D* *GL_RGBA16F* ping-pong passes, *iChannel0*..*iChannel3*, *#pragma waywal*, hardware derivatives) and 2.5D Depth-Map Parallax Occlusion Mapping driven by cursor and workspace-slide spring physics.
+- Streams lock-free PipeWire 2048-point AVX2 64-bin Bark-scale FFT spectrum data, automatically ducks wallpaper audio when external media plays, and listens to D-Bus *MPRIS2* signals with zero idle polling to expose *u_album_art*, *u_media_playing*, and live album art Material Design 3 palettes.
+
 ## Zero-Watt Smart Occlusion & Battery Governor
 
 *wwald* maintains a per-output pause bitmask (*waywal_pause_reason_t*):

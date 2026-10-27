@@ -93,7 +93,8 @@ void cli_print_usage(const char *prog)
     printf("  --depth-strength <FLOAT>   Depth parallax strength multiplier (default: 1.0)\n");
     printf("  --layer <LAYER>            Layer-shell target: background or bottom\n");
     printf("  --battery-policy <POLICY>  Battery policy: ignore, reduce-fps, pause-video\n\n");
-    printf("Shader & Audio Options:\n");
+    printf("Workshop, Shader & Audio Options:\n");
+    printf("  -p, --prop <KEY=VAL>       Override Wallpaper Engine Workshop user property\n");
     printf("  --audio                    Enable PipeWire/PulseAudio FFT audio reactivity\n");
     printf("  --volume <0.0..1.0>        Wallpaper audio volume (default: 0.0)\n");
     printf("  --mute-on-audio            Auto-duck volume when another app plays audio\n");

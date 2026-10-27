@@ -168,6 +168,9 @@ When invoked via a symlink named *swww* or *awww*, *wwal* automatically enables 
 *--depth-map* <FILE>
 	Enable interactive 3D Parallax Occlusion Mapping (POM) on a 2D image using the grayscale depth map at _FILE_, driven by smoothed cursor tracking and workspace-slide inertia.
 
+*--depth-strength* <FLOAT>
+	Depth parallax displacement multiplier when *--depth-map* is active (default: *1.0*).
+
 *--fill-color* <HEX>
 	Background padding color in 6- or 8-digit hex for *fit* and *center* modes (default: *000000*).
 
@@ -186,10 +189,16 @@ When invoked via a symlink named *swww* or *awww*, *wwal* automatically enables 
 *--theme, --no-theme*
 	Enable or disable automatic Material Design 3 OKLab/CAM16/HCT color extraction and *caelestia*/*OSC* synchronization on wallpaper change.
 
+*--theme-from-media, --no-theme-from-media*
+	Enable or disable dynamic Material Design 3 palette extraction from active D-Bus *MPRIS2* album art.
+
 *--animate*
 	Route animated GIF/WebP/APNG files through the hardware video/animation engine.
 
 # VIDEO, SHADER & POWER OPTIONS
+
+*-p, --prop* <KEY=VALUE>
+	Override a Wallpaper Engine Workshop user property when applying a scene (repeatable).
 
 *--loop* <COUNT>
 	Number of playback loops for *video* (*0* for infinite loop, default: *0*).
@@ -197,8 +206,17 @@ When invoked via a symlink named *swww* or *awww*, *wwal* automatically enables 
 *--speed* <MULTIPLIER>
 	Playback speed multiplier for *video* and *shader* (default: *1.0*).
 
+*--fps* <FPS>
+	Target rendering frame rate for *shader* and *workshop* scenes (default: *60*).
+
 *--audio*
-	Enable lock-free PipeWire default sink monitor capture and 64-bin logarithmic Bark-scale FFT uniforms (*u_audio_bands[64]*, *u_audio_envelope*, and Shadertoy *iChannel0* 512x2 audio texture) for *shader*.
+	Enable lock-free PipeWire default sink monitor capture and 64-bin logarithmic Bark-scale FFT uniforms (*u_audio_bands[64]*, *u_audio_envelope*, and Shadertoy *iChannel0* 512x2 audio texture) for *shader* and *workshop*.
+
+*--volume* <0.0..1.0>
+	Set wallpaper audio playback volume for *video*, *shader*, *workshop*, and *audio* (default: *0.0*).
+
+*--mute-on-audio, --no-mute-on-audio*
+	Enable or disable automatic exponential volume ducking when another application plays audio via PipeWire.
 
 *--battery-policy* <ignore|reduce-fps|pause-video>
 	Configure the laptop battery governor policy when discharging or entering power-saver mode.

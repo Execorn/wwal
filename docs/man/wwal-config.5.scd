@@ -47,8 +47,20 @@ Controls core *wwald*(1) lifecycle, layer-shell behavior, and Zero-Watt power go
 *pause_on_idle* = <bool>
 	Pause animations when *ext_idle_notifier_v1* reports the user session is idle or locked (default: *true*).
 
+*idle_timeout_sec* = <int>
+	Idle timeout in seconds before *ext_idle_notifier_v1* pauses animations (default: *300*).
+
 *battery_policy* = "<ignore|reduce-fps|pause-video>"
-	Power governor behavior when running on laptop battery power (default: *"pause-video"*).
+	Power governor behavior when running on laptop battery power (default: *"reduce-fps"*).
+
+*workshop_dir* = "<path>"
+	Custom Steam Workshop (*431960*) directory path override for *wwal workshop*.
+
+*volume* = <float>
+	Default wallpaper audio playback volume in *0.0..1.0* (default: *0.0*).
+
+*mute_on_audio* = <bool>
+	Automatically duck wallpaper audio volume when another application plays audio via PipeWire (default: *false*).
 
 ## [theme]
 
@@ -78,6 +90,9 @@ Controls the in-pipeline OKLab Wu quantizer + weighted K-Means++ + CAM16/HCT Mat
 *export_hyprland* = <bool>
 	Write *~/.cache/wwal/colors-hyprland.conf* (default: *true*).
 
+*theme_from_media* = <bool>
+	Dynamically extract Material Design 3 palettes from active D-Bus *MPRIS2* media player album art (default: *false*).
+
 ## [transition]
 
 Sets default parameters for GPU compute and CPU SIMD wallpaper transitions.
@@ -106,14 +121,24 @@ Sets default parameters for GPU compute and CPU SIMD wallpaper transitions.
 *stagger_delay_ms* = <int>
 	Delay in milliseconds between monitors in *staggered* mode (default: *150*).
 
+## [hooks]
+
+Configures optional shell commands executed asynchronously by *wwald*(1) on state changes.
+
+*on_wallpaper_change* = "<command>"
+	Command executed after a wallpaper transition completes.
+
+*on_theme_change* = "<command>"
+	Command executed after a Material Design 3 palette is exported.
+
 ## [output."<NAME>"]
 
-Configures initial wallpaper, video, shader, or slideshow settings for a specific Wayland output (such as *[output."DP-1"]* or *[output."eDP-1"]*). Use *[output."\*"]* as a wildcard fallback for unconfigured monitors.
+Configures initial wallpaper, video, shader, Workshop scene, or slideshow settings for a specific Wayland output (such as *[output."DP-1"]* or *[output."eDP-1"]*). Use *[output."\*"]* as a wildcard fallback for unconfigured monitors.
 
 *path* = "<path>"
-	Path to an image, video, shader, or slideshow directory.
+	Path to an image, video, shader, Workshop scene, or slideshow directory.
 
-*mode* = "<img|video|shader|slideshow|color>"
+*mode* = "<img|video|shader|workshop|slideshow|color>"
 	Content mode for this output (default: inferred from _path_).
 
 *scaling* = "<fill|fit|stretch|center|tile|span>"
@@ -129,7 +154,13 @@ Configures initial wallpaper, video, shader, or slideshow settings for a specifi
 	Randomize slideshow order on this output (default: *true*).
 
 *audio* = <bool>
-	Enable PipeWire Bark FFT audio capture when *mode = "shader"* (default: *false*).
+	Enable PipeWire Bark FFT audio capture when *mode = "shader"* or *mode = "workshop"* (default: *false*).
+
+*volume* = <float>
+	Per-output wallpaper audio playback volume in *0.0..1.0* (default: *0.0*).
+
+*mute_on_audio* = <bool>
+	Per-output automatic volume ducking when external audio plays (default: *false*).
 
 ## [workspace."<NAME>"]
 

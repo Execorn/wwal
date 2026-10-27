@@ -8,11 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Native Wallpaper Engine Workshop runtime (`we_pkg.c`, `we_tex.c`, `we_mdl.c`, `we_shader.c`, `we_scene.c`, `we_particle.c`, `we_script.c`, `we_workshop.c`): zero-extraction `mmap` `PKGV0001..22` archives, hardware `BC1`/`BC2`/`BC3`/`BC7` and `LZ4` `TEXV0005` textures, 2D Puppet Warp skeletal `.mdl` meshes, AVX2 Structure-of-Arrays particle simulation, multi-pass GLSL effect chains, sandboxed `SceneScript` VM, and `wwal workshop list / info / apply`.
+- Native Wallpaper Engine Workshop runtime (`we_pkg.c`, `we_tex.c`, `we_puppet.c`, `we_shader.c`, `we_scene.c`, `we_particle.c`, `we_script.c`): zero-extraction `mmap` `PKGV0001..22` archives, hardware `BC1`/`BC2`/`BC3`/`BC7` and `LZ4` `TEXV0005` textures, 2D Puppet Warp skeletal `.mdl` meshes, AVX2 Structure-of-Arrays particle simulation, multi-pass GLSL effect chains, sandboxed `SceneScript` VM, and `wwal workshop list / info / apply`.
 - Multi-pass Shadertoy rendering (`Buffer A`..`Buffer D` `GL_RGBA16F` ping-pong passes, `iChannel0`..`iChannel3` bindings, `#pragma waywal`, hardware derivatives, `iMouse`, `iDate`, and live `u_palette_*` uniforms).
-- 2.5D depth-map parallax wallpaper mode (`--depth-map <PATH>` and `--depth-strength <FLOAT>`) and 4-tier Wayland cursor and workspace-slide spring parallax.
+- 2.5D depth-map parallax wallpaper mode (`--depth-map <PATH>` and `--depth-strength <FLOAT>`) and Wayland cursor and workspace-slide spring parallax.
 - Universal live-to-live cross-mode GPU transitions across static images, hardware videos, live shaders, and Workshop scenes, plus panoramic `--scaling-mode span`.
-- Event-driven D-Bus `MPRIS2` integration (`mpris_bridge.c`) exposing `u_album_art`, `u_media_playing`, `u_media_position`, `u_media_Color0..4`, and `--theme-from-media` dynamic album art theming.
+- Event-driven D-Bus `MPRIS2` integration (`mpris.c`) exposing `u_album_art`, `u_media_playing`, `u_media_position`, `u_media_Color0..4`, and `--theme-from-media` dynamic album art theming.
 - PipeWire background audio volume control and automatic external playback ducking (`--volume`, `--mute-on-audio`, `wwal audio`).
 - Rich JSON IPC inspection (`wwal status [--json]`, `wwal query --json`, `wwal stats --json`), live uniform and Workshop property mutation (`wwal set-uniform`), and newline-delimited JSON event streaming (`wwal subscribe`).
 - `zwlr_foreign_toplevel_manager_v1` occlusion tracking (`protocols/wlr-foreign-toplevel-management-unstable-v1.xml`) and `--battery-policy` CLI flag.

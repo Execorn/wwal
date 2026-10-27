@@ -63,16 +63,21 @@ for subcmd in img slideshow
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l filter -a "$filters" -d "Scaling filter hint" -r
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l backdrop -a "$backdrops" -d "Overview backdrop mode or file" -r -F
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l depth-map -d "Depth-map image for 3D Parallax Occlusion Mapping" -r -F
+    complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l depth-strength -d "Depth parallax displacement multiplier" -r
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l theme -d "Extract Material You palette and sync caelestia/OSC"
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l no-theme -d "Disable automatic Material You palette extraction"
+    complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l theme-from-media -d "Extract Material You palette dynamically from MPRIS2 album art"
+    complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l no-theme-from-media -d "Disable MPRIS2 album art theme extraction"
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l animate -d "Play animated GIF/WebP/APNG via video engine"
 end
 
 complete -c wwal -n "__fish_seen_subcommand_from img" -F
 complete -c wwal -n "__fish_seen_subcommand_from theme" -F
+complete -c wwal -n "__fish_seen_subcommand_from theme" -l theme-from-media -d "Extract Material You palette dynamically from MPRIS2 album art"
+complete -c wwal -n "__fish_seen_subcommand_from theme" -l no-theme-from-media -d "Disable MPRIS2 album art theme extraction"
 
-complete -c wwal -n "__fish_seen_subcommand_from color clear pause resume unpause toggle restore" -s o -l output -d "Target monitor name(s)" -r
-complete -c wwal -n "__fish_seen_subcommand_from color clear pause resume unpause toggle restore" -l outputs -d "Target monitor name(s)" -r
+complete -c wwal -n "__fish_seen_subcommand_from color clear pause resume unpause toggle restore set-uniform" -s o -l output -d "Target monitor name(s)" -r
+complete -c wwal -n "__fish_seen_subcommand_from color clear pause resume unpause toggle restore set-uniform" -l outputs -d "Target monitor name(s)" -r
 
 complete -c wwal -n "__fish_seen_subcommand_from video" -F
 complete -c wwal -n "__fish_seen_subcommand_from video" -s o -l output -d "Target monitor name(s)" -r
@@ -80,17 +85,50 @@ complete -c wwal -n "__fish_seen_subcommand_from video" -l outputs -d "Target mo
 complete -c wwal -n "__fish_seen_subcommand_from video" -l loop -d "Loop count (0 = infinite)" -r
 complete -c wwal -n "__fish_seen_subcommand_from video" -l speed -d "Playback speed multiplier" -r
 complete -c wwal -n "__fish_seen_subcommand_from video" -l audio -d "Enable PipeWire audio capture"
+complete -c wwal -n "__fish_seen_subcommand_from video" -l volume -d "Wallpaper audio volume (0.0..1.0)" -r
+complete -c wwal -n "__fish_seen_subcommand_from video" -l mute-on-audio -d "Auto-duck volume when another app plays audio"
+complete -c wwal -n "__fish_seen_subcommand_from video" -l no-mute-on-audio -d "Disable automatic audio ducking"
 complete -c wwal -n "__fish_seen_subcommand_from video" -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r
 complete -c wwal -n "__fish_seen_subcommand_from video" -l theme -d "Extract Material You palette and sync caelestia/OSC"
 complete -c wwal -n "__fish_seen_subcommand_from video" -l no-theme -d "Disable automatic Material You palette extraction"
+complete -c wwal -n "__fish_seen_subcommand_from video" -l theme-from-media -d "Extract Material You palette dynamically from MPRIS2 album art"
+complete -c wwal -n "__fish_seen_subcommand_from video" -l no-theme-from-media -d "Disable MPRIS2 album art theme extraction"
 
 complete -c wwal -n "__fish_seen_subcommand_from shader" -F
 complete -c wwal -n "__fish_seen_subcommand_from shader" -s o -l output -d "Target monitor name(s)" -r
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l outputs -d "Target monitor name(s)" -r
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l audio -d "Enable PipeWire 64-bin Bark FFT audio uniforms"
+complete -c wwal -n "__fish_seen_subcommand_from shader" -l volume -d "Wallpaper audio volume (0.0..1.0)" -r
+complete -c wwal -n "__fish_seen_subcommand_from shader" -l mute-on-audio -d "Auto-duck volume when another app plays audio"
+complete -c wwal -n "__fish_seen_subcommand_from shader" -l no-mute-on-audio -d "Disable automatic audio ducking"
+complete -c wwal -n "__fish_seen_subcommand_from shader" -l fps -d "Target shader frame rate" -r
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l speed -d "Shader time speed multiplier" -r
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l 10bit -d "Request 10-bit wide-gamut scanout"
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r
+complete -c wwal -n "__fish_seen_subcommand_from shader" -l theme-from-media -d "Extract Material You palette dynamically from MPRIS2 album art"
+complete -c wwal -n "__fish_seen_subcommand_from shader" -l no-theme-from-media -d "Disable MPRIS2 album art theme extraction"
+
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -a "list info apply"
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -F
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -s o -l output -d "Target monitor name(s)" -r
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l outputs -d "Target monitor name(s)" -r
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -s p -l prop -d "Override Workshop user property (key=value)" -r
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l audio -d "Enable PipeWire 64-bin Bark FFT audio reactivity"
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l volume -d "Wallpaper audio volume (0.0..1.0)" -r
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l mute-on-audio -d "Auto-duck volume when another app plays audio"
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l no-mute-on-audio -d "Disable automatic audio ducking"
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l fps -d "Target frame rate" -r
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l theme -d "Extract Material You palette and sync caelestia/OSC"
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l no-theme -d "Disable automatic Material You palette extraction"
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l theme-from-media -d "Extract Material You palette dynamically from MPRIS2 album art"
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l no-theme-from-media -d "Disable MPRIS2 album art theme extraction"
+
+complete -c wwal -n "__fish_seen_subcommand_from audio" -l volume -d "Wallpaper audio volume (0.0..1.0)" -r
+complete -c wwal -n "__fish_seen_subcommand_from audio" -l mute-on-audio -d "Auto-duck volume when another app plays audio"
+complete -c wwal -n "__fish_seen_subcommand_from audio" -l no-mute-on-audio -d "Disable automatic audio ducking"
+complete -c wwal -n "__fish_seen_subcommand_from audio" -l theme-from-media -d "Extract Material You palette dynamically from MPRIS2 album art"
+complete -c wwal -n "__fish_seen_subcommand_from audio" -l no-theme-from-media -d "Disable MPRIS2 album art theme extraction"
 
 complete -c wwal -n "__fish_seen_subcommand_from slideshow" -a "start stop pause resume toggle next prev"
 complete -c wwal -n "__fish_seen_subcommand_from slideshow" -s d -l interval -d "Slideshow interval in seconds" -r

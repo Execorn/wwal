@@ -75,7 +75,7 @@ _wwal_completion() {
             _filedir '@(png|jpg|jpeg|webp|avif|heic|jxl|bmp|pnm|tga)'
             return 0
             ;;
-        --transition-duration|--transition-fps|--transition-angle|--transition-wave|--transition-bezier|--transition-step|--stagger-delay|--fill-color|--depth-strength|--prop|--volume|--interval|-d|--loop|--speed|-n|--namespace|-o|--output|--outputs)
+        --transition-duration|--transition-fps|--transition-angle|--transition-wave|--transition-bezier|--transition-step|--stagger-delay|--fill-color|--depth-strength|-p|--prop|--volume|--fps|--interval|-d|--loop|--speed|-n|--namespace|-o|--output|--outputs)
             return 0
             ;;
     esac
@@ -106,7 +106,7 @@ _wwal_completion() {
             ;;
         workshop)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--prop --audio --volume --mute-on-audio --no-mute-on-audio --fps --battery-policy --layer --backdrop --theme --no-theme --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
+                COMPREPLY=( $(compgen -W "-p --prop --audio --volume --mute-on-audio --no-mute-on-audio --fps --battery-policy --layer --backdrop --theme --no-theme --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
             else
                 COMPREPLY=( $(compgen -W "${workshop_actions}" -- "$cur") )
                 _filedir
@@ -114,7 +114,7 @@ _wwal_completion() {
             ;;
         audio)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--volume --mute-on-audio --no-mute-on-audio ${global_opts}" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--volume --mute-on-audio --no-mute-on-audio --theme-from-media --no-theme-from-media ${global_opts}" -- "$cur") )
             fi
             ;;
         theme)
@@ -156,7 +156,7 @@ _wwal_completion() {
                 COMPREPLY=( $(compgen -W "-o --output --outputs ${global_opts}" -- "$cur") )
             fi
             ;;
-        pause|resume|unpause|toggle|restore)
+        pause|resume|unpause|toggle|restore|set-uniform)
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=( $(compgen -W "-o --output --outputs ${global_opts}" -- "$cur") )
             fi

@@ -91,9 +91,14 @@ _wwal() {
                         '--loop[Loop count (0 = infinite)]:count:' \
                         '--speed[Playback speed multiplier]:speed:' \
                         '--audio[Enable PipeWire audio capture]' \
+                        '--volume[Wallpaper audio volume (0.0..1.0)]:volume:' \
+                        '--mute-on-audio[Auto-duck volume when another app plays audio]' \
+                        '--no-mute-on-audio[Disable automatic audio ducking]' \
                         '--backdrop[Secondary overview backdrop surface mode]:backdrop:(none auto-blur)' \
                         '--theme[Extract Material You palette and sync caelestia/OSC]' \
                         '--no-theme[Disable automatic Material You palette extraction]' \
+                        '--theme-from-media[Extract Material You palette dynamically from MPRIS2 album art]' \
+                        '--no-theme-from-media[Disable MPRIS2 album art theme extraction]' \
                         '1:video file:_files -g "*.([mM][pP]4|[wW][eE][bB][mM]|[mM][kK][vV]|[aA][vV][iI]|[mM][oO][vV]|[gG][iI][fF])"'
                     ;;
                 shader)
@@ -101,14 +106,66 @@ _wwal() {
                         $global_opts \
                         '*'{-o,--output,--outputs}'[Target monitor name(s)]:output:' \
                         '--audio[Enable PipeWire 64-bin Bark FFT audio uniforms]' \
+                        '--volume[Wallpaper audio volume (0.0..1.0)]:volume:' \
+                        '--mute-on-audio[Auto-duck volume when another app plays audio]' \
+                        '--no-mute-on-audio[Disable automatic audio ducking]' \
+                        '--fps[Target shader frame rate]:fps:' \
                         '--speed[Time speed multiplier]:speed:' \
                         '--10bit[Request 10-bit wide-gamut scanout]' \
                         '--backdrop[Secondary overview backdrop surface mode]:backdrop:(none auto-blur)' \
+                        '--theme-from-media[Extract Material You palette dynamically from MPRIS2 album art]' \
+                        '--no-theme-from-media[Disable MPRIS2 album art theme extraction]' \
                         '1:shader file:_files -g "*.([fF][rR][aA][gG]|[cC][oO][mM][pP]|[gG][lL][sS][lL])"'
+                    ;;
+                workshop)
+                    local -a workshop_cmds
+                    workshop_cmds=(
+                        'list:List installed Steam Workshop (431960) wallpapers'
+                        'info:Inspect Workshop project.json, scene.pkg, and user properties'
+                        'apply:Render native Wallpaper Engine scene, video, or web wallpaper'
+                    )
+                    if (( CURRENT == 2 )); then
+                        _describe -t workshop_cmds 'workshop subcommands' workshop_cmds
+                        _files -/
+                    else
+                        _arguments \
+                            $global_opts \
+                            '*'{-o,--output,--outputs}'[Target monitor name(s)]:output:' \
+                            '*'{-p,--prop}'[Override Workshop user property (key=value)]:prop:' \
+                            '--audio[Enable PipeWire 64-bin Bark FFT audio reactivity]' \
+                            '--volume[Wallpaper audio volume (0.0..1.0)]:volume:' \
+                            '--mute-on-audio[Auto-duck volume when another app plays audio]' \
+                            '--no-mute-on-audio[Disable automatic audio ducking]' \
+                            '--fps[Target frame rate]:fps:' \
+                            '--backdrop[Secondary overview backdrop surface mode]:backdrop:(none auto-blur)' \
+                            '--theme[Extract Material You palette and sync caelestia/OSC]' \
+                            '--no-theme[Disable automatic Material You palette extraction]' \
+                            '--theme-from-media[Extract Material You palette dynamically from MPRIS2 album art]' \
+                            '--no-theme-from-media[Disable MPRIS2 album art theme extraction]' \
+                            '*:workshop ID or directory:_files'
+                    fi
+                    ;;
+                audio)
+                    _arguments \
+                        $global_opts \
+                        '--volume[Wallpaper audio volume (0.0..1.0)]:volume:' \
+                        '--mute-on-audio[Auto-duck volume when another app plays audio]' \
+                        '--no-mute-on-audio[Disable automatic audio ducking]' \
+                        '--theme-from-media[Extract Material You palette dynamically from MPRIS2 album art]' \
+                        '--no-theme-from-media[Disable MPRIS2 album art theme extraction]'
+                    ;;
+                set-uniform)
+                    _arguments \
+                        $global_opts \
+                        '*'{-o,--output,--outputs}'[Target monitor name(s)]:output:' \
+                        '1:uniform or property name:' \
+                        '*:float values:'
                     ;;
                 theme)
                     _arguments \
                         $global_opts \
+                        '--theme-from-media[Extract Material You palette dynamically from MPRIS2 album art]' \
+                        '--no-theme-from-media[Disable MPRIS2 album art theme extraction]' \
                         '1:image file:_files -g "*.([pP][nN][gG]|[jJ][pP][gG]|[jJ][pP][eE][gG]|[wW][eE][bB][pP]|[aA][vV][iI][fF]|[hH][eE][iI][cC]|[jJ][xX][lL]|[sS][vV][gG]|[bB][mM][pP])"'
                     ;;
                 slideshow)

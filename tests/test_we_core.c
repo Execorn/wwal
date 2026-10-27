@@ -120,7 +120,7 @@ static void build_synthetic_pkg(byte_buf_t *out, const char *version_magic,
 
 static void test_pkg_vfs(void)
 {
-    printf("  [1/5] Testing scene.pkg VFS (PKGV0001..PKGV0022, FNV-1a, path normalization)...\n");
+    printf("  [TEST] Testing scene.pkg VFS (PKGV0001..PKGV0022, FNV-1a, path normalization)...\n");
 
     char norm[256];
     assert(we_pkg_normalize_path("\\Materials\\Models//Bg.json", 26, norm, sizeof(norm)));
@@ -210,7 +210,7 @@ static void test_pkg_vfs(void)
 
 static void test_tex_loader(void)
 {
-    printf("  [2/5] Testing .tex container loader (TEXV/TEXI/TEXB/TEXS, LZ4, BC1/2/3/7)...\n");
+    printf("  [TEST] Testing .tex container loader (TEXV/TEXI/TEXB/TEXS, LZ4, BC1/2/3/7)...\n");
 
     /* Dual-mode magic reader test (9-byte NUL-padded, 8-byte unpadded, and [u32 len=8]["TEX..."])
      */
@@ -447,8 +447,8 @@ static void test_tex_loader(void)
 
 static void test_shader_preprocessor(void)
 {
-    printf(
-        "  [3/5] Testing GLSL/HLSL shader preprocessor (combos, #include, varying promotion)...\n");
+    printf("  [TEST] Testing GLSL/HLSL shader preprocessor (combos, #include, varying "
+           "promotion)...\n");
 
     const char *vert_src =
         "// [COMBO] {\"material\":\"ui_mode\",\"combo\":\"MODE\",\"default\":1}\n"
@@ -576,8 +576,8 @@ static void build_top_blue_bottom_red_tex(byte_buf_t *tb)
 
 static void test_scene_graph_and_cli(void)
 {
-    printf(
-        "  [4/5] Testing project.json, scene.json renderer & Top-Down Orientation Invariant...\n");
+    printf("  [TEST] Testing project.json, scene.json renderer & Top-Down Orientation "
+           "Invariant...\n");
 
     char tmp_root[] = "/tmp/wwal_test_workshop_XXXXXX";
     assert(mkdtemp(tmp_root) != NULL);
@@ -781,7 +781,7 @@ static void test_scene_graph_and_cli(void)
     assert(top_px[2] == 0 && bot_px[0] == 0 && top_px[3] == 255);
     we_scene_destroy(scene_ov);
 
-    printf("  [5/5] Testing wwal workshop CLI parser and subcommands...\n");
+    printf("  [TEST] Testing wwal workshop CLI parser and subcommands...\n");
     cli_options_t copts;
     char *argv_list[] = {"wwal", "workshop", "list", NULL};
     assert(cli_parse(3, argv_list, &copts));
@@ -811,7 +811,7 @@ static void test_scene_graph_and_cli(void)
 
 static void test_pkg_tex_shader_and_scene_edge_cases(void)
 {
-    printf("  [6/12] Testing VFS path traversal guards, unpadded TEX magic, shader combos, and "
+    printf("  [TEST] Testing VFS path traversal guards, unpadded TEX magic, shader combos, and "
            "effect chains...\n");
 
     /* Segment-aware '..' path validation */
@@ -1297,7 +1297,7 @@ static void build_synthetic_mdl(byte_buf_t *out, int32_t mdl_flag, bool alt_80b_
 
 static void test_puppet_warp_mdl(void)
 {
-    printf("  [6/9] Testing 2D Puppet Warp (.mdl) parser & Two-Pass Skinning Invariant...\n");
+    printf("  [TEST] Testing 2D Puppet Warp (.mdl) parser & Two-Pass Skinning Invariant...\n");
 
     /* 1. mdl_flag == 9 stub mesh must be rejected gracefully */
     byte_buf_t stub_mdl;
@@ -1435,7 +1435,7 @@ static void test_puppet_warp_mdl(void)
 
 static void test_particle_simulator_avx2(void)
 {
-    printf("  [7/12] Testing 32-Byte-Aligned AVX2 SoA Particle Simulator & Rope Compaction...\n");
+    printf("  [TEST] Testing 32-Byte-Aligned AVX2 SoA Particle Simulator & Rope Compaction...\n");
 
     const char *pjson =
         "{\n"
@@ -1626,7 +1626,7 @@ static void test_particle_simulator_avx2(void)
 
 static void test_scenescript_engine_and_watchdog(void)
 {
-    printf("  [8/12] Testing Sandboxed SceneScript Engine (QuickJS-NG ES2023) & Infinite-Loop "
+    printf("  [TEST] Testing Sandboxed SceneScript Engine (QuickJS-NG ES2023) & Infinite-Loop "
            "Watchdog...\n");
 
     we_script_shared_t shared;
@@ -1786,7 +1786,7 @@ static void test_scenescript_engine_and_watchdog(void)
 
 static void test_puppet_particle_script_scene_integration(void)
 {
-    printf("  [9/12] Testing E2E Scene Integration (.mdl Puppet + Particles + "
+    printf("  [TEST] Testing E2E Scene Integration (.mdl Puppet + Particles + "
            "SceneScript)...\n");
 
     const char *scn_s =
@@ -1926,7 +1926,7 @@ static void test_puppet_particle_script_scene_integration(void)
 
 static void test_script_gc_puppet_pose_and_particle_operators(void)
 {
-    printf("  [10/12] Testing SceneScript Cyclic GC, Recursion Guard, "
+    printf("  [TEST] Testing SceneScript Cyclic GC, Recursion Guard, "
            "Cross-Layer Access, Puppet Pose, and Particle Vortex/Oscillate...\n");
 
     we_script_shared_t shared;
@@ -2368,7 +2368,7 @@ static void write_test_bmp_4x4(const char *path)
 
 static void test_mpris_audio_ducking_and_live_uniforms(void)
 {
-    printf("  [11/12] Testing MPRIS2 URI decoding, album art, PipeWire ducking, live uniforms & "
+    printf("  [TEST] Testing MPRIS2 URI decoding, album art, PipeWire ducking, live uniforms & "
            "CLI...\n");
 
     /* 1. Safe file:// URI decoding & security boundaries */
@@ -2667,7 +2667,7 @@ static void test_mpris_audio_ducking_and_live_uniforms(void)
 
 static void test_mpris_arbitration_and_scene_uniform_overrides(void)
 {
-    printf("  [12/12] Testing MPRIS multi-player arbitration, audio un-ducking, and scene uniform "
+    printf("  [TEST] Testing MPRIS multi-player arbitration, audio un-ducking, and scene uniform "
            "overrides...\n");
 
     /* 0. Multi-player arbitration, duplicate slot merging, and Stopped metadata/art clearing */

@@ -990,8 +990,8 @@ static void test_webm_duration_and_lacing(void)
     p += 50 + 60 + 50;
 
     /* SimpleBlock 4 (malformed Xiph lacing): 3 frames where frame 0 size (1) equals remaining
-     * bytes before reading frame 1 lace byte, which previously underflowed (blk_end - blk_off) -
-     * sum_sizes to SIZE_MAX */
+     * bytes before reading frame 1 lace byte, verifying that (blk_end - blk_off) - sum_sizes
+     * does not underflow to SIZE_MAX */
     *p++ = 0xA3;
     size_t sb4_len = 4 + 1 + 2;
     *p++ = (uint8_t)(0x40 | (sb4_len >> 8));
@@ -1005,8 +1005,8 @@ static void test_webm_duration_and_lacing(void)
     *p++ = 1;    /* frame 1 size = 1 (advances blk_off to blk_end while sum_sizes == 1) */
 
     /* SimpleBlock 5 (malformed EBML lacing): 3 frames where first_sz (1) equals remaining bytes
-     * before reading frame 1 signed vint, which previously underflowed (blk_end - blk_off) -
-     * sum_sizes to SIZE_MAX */
+     * before reading frame 1 signed vint, verifying that (blk_end - blk_off) - sum_sizes
+     * does not underflow to SIZE_MAX */
     *p++ = 0xA3;
     size_t sb5_len = 4 + 1 + 2;
     *p++ = (uint8_t)(0x40 | (sb5_len >> 8));

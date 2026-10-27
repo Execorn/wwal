@@ -807,7 +807,7 @@ bool daemon_wayland_init(daemon_state_t *state)
             if (fstat(state->dmabuf_ctx.drm_fd, &st) == 0 &&
                 st.st_rdev != state->dmabuf_ctx.compositor_dev) {
                 WAYWAL_LOG_INFO(
-                    "GBM device mismatch (have %u:%u, compositor wants %u:%u) — reinitializing",
+                    "GBM device mismatch (have %u:%u, compositor wants %u:%u); reinitializing",
                     (unsigned)major(st.st_rdev), (unsigned)minor(st.st_rdev),
                     (unsigned)major(state->dmabuf_ctx.compositor_dev),
                     (unsigned)minor(state->dmabuf_ctx.compositor_dev));
@@ -1096,7 +1096,7 @@ bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *
     if (!state || !out_x || !out_y)
         return false;
 
-    /* Tier 1: Direct Wayland wl_pointer focus on wallpaper layer surface */
+    /* Prefer direct Wayland wl_pointer focus on the wallpaper layer surface when unoccluded */
     if (out && out->has_cursor) {
         *out_x = out->cursor_x;
         *out_y = out->cursor_y;
@@ -1109,8 +1109,8 @@ bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *
         out ? (out->logical_height > 0 ? (double)out->logical_height : (double)out->height)
             : 1080.0;
 
-    /* Tier 2: Compositor IPC Fallback when occluded, whenever shader/workshop is active and
-     * not paused by power_gov ([STAGE0-RES-02]) */
+    /* Fall back to compositor IPC cursor query when windows occlude wl_pointer focus,
+     * provided an interactive shader or Workshop scene is active and unpaused */
     const waywal_shader_engine_t *active_se =
         (out && out->shader_eng) ? out->shader_eng : state->shader_eng;
     bool shader_running = (out && (out->shader_active || out->workshop_active)) ||
