@@ -706,7 +706,8 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
             cur_workspace = NULL;
 
             if (!has_subkey) {
-                if (strcmp(primary, "daemon") == 0) {
+                if (strcmp(primary, "daemon") == 0 || strcmp(primary, "audio") == 0 ||
+                    strcmp(primary, "mpris") == 0) {
                     section = SECTION_DAEMON;
                 } else if (strcmp(primary, "theme") == 0) {
                     section = SECTION_THEME;
@@ -807,6 +808,11 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                                          sizeof(out_cfg->daemon.backdrop))) {
                     return false;
                 }
+            } else if (strcmp(key, "workshop_dir") == 0 || strcmp(key, "workshop_path") == 0) {
+                if (!parse_quoted_string(&lex, out_cfg->daemon.workshop_dir,
+                                         sizeof(out_cfg->daemon.workshop_dir))) {
+                    return false;
+                }
             } else if (strcmp(key, "restore_on_start") == 0) {
                 if (!parse_bool_val(&lex, &out_cfg->daemon.restore_on_start))
                     return false;
@@ -816,6 +822,20 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
             } else if (strcmp(key, "pause_on_idle") == 0) {
                 if (!parse_bool_val(&lex, &out_cfg->daemon.pause_on_idle))
                     return false;
+            } else if (strcmp(key, "volume") == 0) {
+                if (!parse_float_val(&lex, &out_cfg->daemon.volume))
+                    return false;
+                if (out_cfg->daemon.volume < 0.0f)
+                    out_cfg->daemon.volume = 0.0f;
+                if (out_cfg->daemon.volume > 1.0f)
+                    out_cfg->daemon.volume = 1.0f;
+            } else if (strcmp(key, "mute_on_audio") == 0) {
+                if (!parse_bool_val(&lex, &out_cfg->daemon.mute_on_audio))
+                    return false;
+            } else if (strcmp(key, "theme_from_media") == 0) {
+                if (!parse_bool_val(&lex, &out_cfg->daemon.theme_from_media))
+                    return false;
+                out_cfg->theme.theme_from_media = out_cfg->daemon.theme_from_media;
             } else {
                 set_error(&lex, "unknown key '%s' in [daemon]", key);
                 return false;
@@ -857,6 +877,10 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
             } else if (strcmp(key, "export_hyprland") == 0) {
                 if (!parse_bool_val(&lex, &out_cfg->theme.export_hyprland))
                     return false;
+            } else if (strcmp(key, "theme_from_media") == 0) {
+                if (!parse_bool_val(&lex, &out_cfg->theme.theme_from_media))
+                    return false;
+                out_cfg->daemon.theme_from_media = out_cfg->theme.theme_from_media;
             } else {
                 set_error(&lex, "unknown key '%s' in [theme]", key);
                 return false;
@@ -968,6 +992,18 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                 }
             } else if (strcmp(key, "audio") == 0) {
                 if (!parse_bool_val(&lex, &cur_output->audio)) {
+                    return false;
+                }
+            } else if (strcmp(key, "volume") == 0) {
+                if (!parse_float_val(&lex, &cur_output->volume)) {
+                    return false;
+                }
+                if (cur_output->volume < 0.0f)
+                    cur_output->volume = 0.0f;
+                if (cur_output->volume > 1.0f)
+                    cur_output->volume = 1.0f;
+            } else if (strcmp(key, "mute_on_audio") == 0) {
+                if (!parse_bool_val(&lex, &cur_output->mute_on_audio)) {
                     return false;
                 }
             } else {

@@ -29,8 +29,16 @@ void cli_print_usage(const char *prog)
         "  init                       Launch or initialize wallpaper daemon (swww/awww alias)\n");
     printf("  img <PATH|-> [OPTIONS]     Load and set wallpaper with GPU/SIMD transitions\n");
     printf("  shader <PATH> [OPTIONS]    Run live GLSL fragment shader wallpaper\n");
+    printf("  workshop list              List installed Steam Workshop (431960) wallpapers\n");
+    printf(
+        "  workshop info <ID|PATH>    Inspect Workshop project.json, scene.pkg, and properties\n");
+    printf("  workshop [apply] <ID|PATH> Render native Wallpaper Engine scene or video\n");
     printf("  theme [PATH] [OPTIONS]     Extract HCT Material You theme palette\n");
-    printf("  stats                      Display daemon telemetry and frame timing statistics\n");
+    printf("  stats [--json]             Display daemon telemetry and frame timing statistics\n");
+    printf("  status [--json]            Inspect outputs, active media, MPRIS, and telemetry\n");
+    printf("  set-uniform <NAME> <V...>  Mutate live shader uniform or Workshop property\n");
+    printf("  subscribe                  Stream newline-delimited JSON state change events\n");
+    printf("  audio [OPTIONS]            Update live audio volume and auto-mute ducking\n");
     printf("  slideshow <DIR> [OPTIONS]  Start zero-idle-CPU timerfd wallpaper slideshow\n");
     printf("  slideshow stop             Stop active wallpaper slideshow\n");
     printf("  slideshow pause            Pause active slideshow\n");
@@ -74,22 +82,28 @@ void cli_print_usage(const char *prog)
     printf("  --sync-mode <MODE>         Multi-monitor sync: simultaneous or staggered\n");
     printf("  --stagger-delay <MS>       Delay in milliseconds between cascading monitors\n");
     printf("  --10bit                    Enable 10-bit wide-gamut scanout if supported\n");
-    printf("  --scaling-mode, --mode <M> Scaling mode: fill, fit, stretch, center, tile\n");
+    printf("  --scaling-mode, --mode <M> Scaling mode: fill, fit, stretch, center, tile, span\n");
     printf("  --animate                  Animate GIF wallpaper using hardware video engine\n");
     printf("  --theme / --no-theme       Enable or disable automatic theme extraction\n");
+    printf("  --theme-from-media         Extract theme dynamically from MPRIS2 album art\n");
+    printf("  --no-theme-from-media      Disable MPRIS2 album art theme extraction\n");
     printf("  --theme-mode <dark|light>  Select dark or light Material You palette mode\n");
     printf("  --backdrop <MODE>          Backdrop mode: none, auto-blur, or file path\n");
     printf("  --depth-map <FILE>         Path to 8-bit depth map for 2.5D parallax\n");
     printf("  --depth-strength <FLOAT>   Depth parallax strength multiplier (default: 1.0)\n");
     printf("  --layer <LAYER>            Layer-shell target: background or bottom\n");
     printf("  --battery-policy <POLICY>  Battery policy: ignore, reduce-fps, pause-video\n\n");
-    printf("Shader Options:\n");
+    printf("Shader & Audio Options:\n");
     printf("  --audio                    Enable PipeWire/PulseAudio FFT audio reactivity\n");
+    printf("  --volume <0.0..1.0>        Wallpaper audio volume (default: 0.0)\n");
+    printf("  --mute-on-audio            Auto-duck volume when another app plays audio\n");
+    printf("  --no-mute-on-audio         Disable automatic audio ducking\n");
     printf("  --fps <FPS>                Target shader frame rate (default: 60)\n\n");
     printf("Video Options:\n");
     printf("  --loop <COUNT>             Loop count (0 = infinite) (default: 0)\n");
     printf("  --speed <FLOAT>            Playback speed multiplier (default: 1.0)\n\n");
     printf("Global Options:\n");
+    printf("  -j, --json                 Format query/status/stats output as JSON\n");
     printf("  -n, --namespace <NAME>     Socket namespace (default: \"default\")\n");
     printf("  -v, --verbose              Enable verbose debug output\n");
     printf("  -h, --help                 Print help information\n");
@@ -573,6 +587,58 @@ static bool parse_common_flag(int *optind_ptr, int argc, char *argv[], cli_optio
         opts->depth_strength = strength;
         return true;
     }
+    if (match_opt_val(arg, "--prop", optind_ptr, argc, argv, &val) ||
+        match_opt_val(arg, "-p", optind_ptr, argc, argv, &val)) {
+        if (!val || val[0] == '\0' || strchr(val, '=') == NULL) {
+            fprintf(stderr, "Error: Invalid --prop format (expected key=value)\n");
+            return false;
+        }
+        size_t cur_len = strlen(opts->workshop_props);
+        if (cur_len > 0 && cur_len + 1 < sizeof(opts->workshop_props)) {
+            opts->workshop_props[cur_len++] = ';';
+            opts->workshop_props[cur_len] = '\0';
+        }
+        snprintf(opts->workshop_props + cur_len, sizeof(opts->workshop_props) - cur_len, "%s", val);
+        return true;
+    }
+    if (strcmp(arg, "--json") == 0 || strcmp(arg, "-j") == 0) {
+        opts->json_output = true;
+        return true;
+    }
+    if (match_opt_val(arg, "--volume", optind_ptr, argc, argv, &val)) {
+        if (!val || val[0] == '\0') {
+            fprintf(stderr, "Error: Invalid --volume value\n");
+            return false;
+        }
+        char *endptr = NULL;
+        float vol = strtof(val, &endptr);
+        if (endptr == val || *endptr != '\0' || !isfinite(vol)) {
+            fprintf(stderr, "Error: Invalid --volume value\n");
+            return false;
+        }
+        if (vol < 0.0f)
+            vol = 0.0f;
+        if (vol > 1.0f)
+            vol = 1.0f;
+        opts->volume = vol;
+        return true;
+    }
+    if (strcmp(arg, "--mute-on-audio") == 0) {
+        opts->mute_on_audio = 1;
+        return true;
+    }
+    if (strcmp(arg, "--no-mute-on-audio") == 0) {
+        opts->mute_on_audio = 0;
+        return true;
+    }
+    if (strcmp(arg, "--theme-from-media") == 0) {
+        opts->theme_from_media = 1;
+        return true;
+    }
+    if (strcmp(arg, "--no-theme-from-media") == 0) {
+        opts->theme_from_media = 0;
+        return true;
+    }
 
     return false;
 }
@@ -607,6 +673,9 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
     opts->video_speed = 1.0f;
     opts->slideshow_interval_s = 300;
     opts->slideshow_random = false;
+    opts->volume = -1.0f;
+    opts->mute_on_audio = -1;
+    opts->theme_from_media = -1;
 
     const char *prog = argv[0] ? argv[0] : "wwal";
     const char *base = strrchr(prog, '/');
@@ -658,6 +727,74 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
             if (!parse_common_flag(&optind, argc, argv, opts))
                 return false;
             optind++;
+        }
+    } else if (strcmp(cmd_str, "status") == 0) {
+        opts->cmd = CLI_CMD_STATUS;
+        opts->json_output = true;
+        while (optind < argc) {
+            if (!parse_common_flag(&optind, argc, argv, opts))
+                return false;
+            optind++;
+        }
+    } else if (strcmp(cmd_str, "subscribe") == 0) {
+        opts->cmd = CLI_CMD_SUBSCRIBE;
+        while (optind < argc) {
+            if (!parse_common_flag(&optind, argc, argv, opts))
+                return false;
+            optind++;
+        }
+    } else if (strcmp(cmd_str, "audio") == 0) {
+        opts->cmd = CLI_CMD_AUDIO;
+        while (optind < argc) {
+            if (!parse_common_flag(&optind, argc, argv, opts))
+                return false;
+            optind++;
+        }
+        if (opts->volume < 0.0f && opts->mute_on_audio == -1 && opts->theme_from_media == -1) {
+            fprintf(stderr, "Error: 'audio' requires at least one of --volume, --mute-on-audio, "
+                            "or --theme-from-media\n");
+            return false;
+        }
+    } else if (strcmp(cmd_str, "set-uniform") == 0 || strcmp(cmd_str, "uniform") == 0) {
+        opts->cmd = CLI_CMD_SET_UNIFORM;
+        while (optind < argc) {
+            const char *arg = argv[optind];
+            bool is_neg_number =
+                (arg[0] == '-' && (isdigit((unsigned char)arg[1]) || arg[1] == '.'));
+            if (arg[0] == '-' && !is_neg_number) {
+                if (!parse_common_flag(&optind, argc, argv, opts)) {
+                    fprintf(stderr, "Error: Unknown set-uniform option '%s'\n", arg);
+                    return false;
+                }
+            } else if (opts->uniform_name[0] == '\0') {
+                size_t name_len = strlen(arg);
+                if (name_len == 0 || name_len >= sizeof(opts->uniform_name) ||
+                    !(isalpha((unsigned char)arg[0]) || arg[0] == '_')) {
+                    fprintf(stderr,
+                            "Error: Invalid uniform name '%s' (must start with letter/underscore "
+                            "and be < %zu chars)\n",
+                            arg, sizeof(opts->uniform_name));
+                    return false;
+                }
+                memcpy(opts->uniform_name, arg, name_len + 1);
+            } else {
+                if (opts->uniform_components >= 4) {
+                    fprintf(stderr, "Error: Too many uniform components (max 4)\n");
+                    return false;
+                }
+                char *endptr = NULL;
+                float v = strtof(arg, &endptr);
+                if (endptr == arg || *endptr != '\0' || !isfinite(v)) {
+                    fprintf(stderr, "Error: Invalid uniform float value '%s'\n", arg);
+                    return false;
+                }
+                opts->uniform_values[opts->uniform_components++] = v;
+            }
+            optind++;
+        }
+        if (opts->uniform_name[0] == '\0' || opts->uniform_components == 0) {
+            fprintf(stderr, "Error: 'set-uniform' requires <NAME> and 1..4 float values\n");
+            return false;
         }
     } else if (strcmp(cmd_str, "restore") == 0) {
         opts->cmd = CLI_CMD_RESTORE;
@@ -759,6 +896,79 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
         if (!has_path) {
             fprintf(stderr, "Error: 'shader' command requires a path to a shader file\n");
             return false;
+        }
+    } else if (strcmp(cmd_str, "workshop") == 0) {
+        opts->cmd = CLI_CMD_WORKSHOP;
+        if (optind >= argc) {
+            fprintf(stderr,
+                    "Error: 'workshop' requires a subcommand (list, info, apply) or ID/path\n");
+            return false;
+        }
+        const char *sub = argv[optind];
+        if (strcmp(sub, "list") == 0) {
+            opts->workshop_subcmd = WAYWAL_WORKSHOP_LIST;
+            optind++;
+            while (optind < argc) {
+                if (!parse_common_flag(&optind, argc, argv, opts)) {
+                    fprintf(stderr, "Error: Unknown workshop option '%s'\n", argv[optind]);
+                    return false;
+                }
+                optind++;
+            }
+        } else if (strcmp(sub, "info") == 0) {
+            opts->workshop_subcmd = WAYWAL_WORKSHOP_INFO;
+            optind++;
+            bool has_id = false;
+            while (optind < argc) {
+                const char *arg = argv[optind];
+                if (arg[0] == '-') {
+                    if (!parse_common_flag(&optind, argc, argv, opts)) {
+                        fprintf(stderr, "Error: Unknown workshop option '%s'\n", arg);
+                        return false;
+                    }
+                } else if (!has_id) {
+                    strncpy(opts->filepath, arg, sizeof(opts->filepath) - 1);
+                    opts->filepath[sizeof(opts->filepath) - 1] = '\0';
+                    has_id = true;
+                } else {
+                    fprintf(stderr, "Error: Unexpected argument '%s'\n", arg);
+                    return false;
+                }
+                optind++;
+            }
+            if (!has_id) {
+                fprintf(stderr,
+                        "Error: 'workshop info' requires a Workshop ID or directory path\n");
+                return false;
+            }
+        } else {
+            opts->workshop_subcmd = WAYWAL_WORKSHOP_APPLY;
+            if (strcmp(sub, "apply") == 0) {
+                optind++;
+            }
+            bool has_id = false;
+            while (optind < argc) {
+                const char *arg = argv[optind];
+                if (arg[0] == '-') {
+                    if (!parse_common_flag(&optind, argc, argv, opts)) {
+                        fprintf(stderr, "Error: Unknown workshop option '%s'\n", arg);
+                        return false;
+                    }
+                } else if (!has_id) {
+                    strncpy(opts->filepath, arg, sizeof(opts->filepath) - 1);
+                    opts->filepath[sizeof(opts->filepath) - 1] = '\0';
+                    has_id = true;
+                } else {
+                    fprintf(stderr, "Error: Unexpected argument '%s'\n", arg);
+                    return false;
+                }
+                optind++;
+            }
+            if (!has_id) {
+                fprintf(stderr,
+                        "Error: 'workshop apply' requires a Workshop ID or directory path\n");
+                return false;
+            }
         }
     } else if (strcmp(cmd_str, "theme") == 0) {
         opts->cmd = CLI_CMD_THEME;

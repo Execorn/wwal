@@ -16,6 +16,9 @@ When invoked via a symlink named *swww* or *awww*, *wwal* automatically enables 
 
 # GLOBAL OPTIONS
 
+*-j, --json*
+	Format *query*, *status*, and *stats* output as structured JSON.
+
 *-n, --namespace* <NAME>
 	Connect to the daemon socket namespace _NAME_ (default: *default*). Also sets the Wayland layer-shell namespace unless overridden.
 
@@ -34,7 +37,10 @@ When invoked via a symlink named *swww* or *awww*, *wwal* automatically enables 
 	Play a hardware-accelerated video wallpaper (MP4, WebM, MKV, GIF) using the zero-FFmpeg MP4/WebM demuxer and VA-API hardware decode pipeline (H.264, HEVC, VP9, AV1).
 
 *shader* <PATH> [OPTIONS]
-	Run a live procedural GLSL compute shader (*.comp*) or Shadertoy fragment shader (*.frag*) on the background layer with automatic *inotify*(7) hot-reloading.
+	Run a live procedural GLSL compute shader (*.comp*) or multi-pass Shadertoy fragment shader (*.frag*) on the background layer with automatic *inotify*(7) hot-reloading.
+
+*workshop* <list|info|apply> [ID|PATH] [OPTIONS]
+	Discover, inspect, or render native Steam Workshop (*431960* Wallpaper Engine) scenes, videos, web wallpapers, `.pkg` archives, `.tex` textures, `.mdl` Puppet Warp skeletal meshes, AVX2 particle systems, and `SceneScript` logic. Use *--prop key=val* to override user properties.
 
 *slideshow* <DIR|ACTION> [OPTIONS]
 	Start a zero-idle-CPU *timerfd* wallpaper slideshow from _DIR_, or control an active slideshow using one of the actions: *start*, *stop*, *pause*, *resume*, *toggle*, *next*, *prev*.
@@ -48,23 +54,35 @@ When invoked via a symlink named *swww* or *awww*, *wwal* automatically enables 
 *theme* <PATH> [OPTIONS]
 	Extract an OKLab/CAM16/HCT Material Design 3 palette from _PATH_ in under 0.4 ms and write *~/.local/state/caelestia/scheme.json*, *~/.cache/wwal/colors.json*, *~/.cache/wwal/colors.css*, *~/.cache/wwal/colors-hyprland.conf*, and terminal OSC 4/10/11 sequences.
 
+*audio* [OPTIONS]
+	Configure live wallpaper audio playback volume (*--volume 0.0..1.0*) and external application auto-ducking (*--mute-on-audio* / *--no-mute-on-audio*).
+
+*set-uniform* <NAME> <VALUES...>
+	Mutate a live shader uniform or Workshop user property (1 to 4 float values) without reloading the active scene.
+
+*status* [--json]
+	Inspect connected outputs, active wallpaper/video/shader/Workshop paths, D-Bus MPRIS2 media metadata, and daemon telemetry.
+
+*subscribe*
+	Stream newline-delimited JSON events whenever wallpapers, themes, or media states change.
+
 *pause*
-	Pause active video, animation, or live shader playback.
+	Pause active video, animation, live shader, or Workshop scene playback.
 
 *resume*, *unpause*
-	Resume paused video, animation, or live shader playback.
+	Resume paused video, animation, live shader, or Workshop scene playback.
 
 *toggle*
-	Toggle video, animation, or live shader playback between paused and playing states.
+	Toggle video, animation, live shader, or Workshop scene playback between paused and playing states.
 
-*query*
+*query* [--json]
 	List all connected Wayland outputs, physical and logical dimensions, scale factors, refresh rates, and active wallpaper state.
 
-*stats*
+*stats* [--json]
 	Query real-time daemon telemetry (opcode *0x000C*), including daemon RSS/PSS memory footprint, active VRAM surface pool count, negotiated DRM FourCC format and modifier (Linear, NVIDIA Block-Linear, ARM AFBC, AMD DCC, Intel CCS), VBlank PLL period/phase jitter estimates, and per-output Zero-Watt *pause_mask* reasons.
 
 *restore*
-	Restore the last persisted per-output wallpaper, video, shader, or color state from *$XDG_STATE_HOME/wwal/state.bin*.
+	Restore the last persisted per-output wallpaper, video, shader, Workshop scene, or color state from *$XDG_STATE_HOME/wwal/state.bin*.
 
 *clear-cache*
 	Remove cached hardware-transcoded animations and palette artifacts from *$XDG_CACHE_HOME/wwal*.

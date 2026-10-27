@@ -3,8 +3,8 @@ _wwal_completion() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="img video shader slideshow color clear theme pause resume unpause toggle query stats restore clear-cache ping kill help"
-    local global_opts="-n --namespace -v --verbose -h --help --layer --battery-policy"
+    local commands="img video shader workshop slideshow color clear theme audio set-uniform status subscribe pause resume unpause toggle query stats restore clear-cache ping kill help"
+    local global_opts="-j --json -n --namespace -v --verbose -h --help --layer --battery-policy"
     local trans_types="none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random"
     local trans_positions="center top bottom left right top-left top-right bottom-left bottom-right cursor mouse"
     local sync_modes="simultaneous staggered"
@@ -14,6 +14,7 @@ _wwal_completion() {
     local battery_policies="ignore reduce-fps pause-video"
     local backdrops="none auto-blur"
     local slideshow_actions="start stop pause resume toggle next prev"
+    local workshop_actions="list info apply"
 
     local cmd=""
     for ((i = 1; i < cword; i++)); do
@@ -74,12 +75,12 @@ _wwal_completion() {
             _filedir '@(png|jpg|jpeg|webp|avif|heic|jxl|bmp|pnm|tga)'
             return 0
             ;;
-        --transition-duration|--transition-fps|--transition-angle|--transition-wave|--transition-bezier|--transition-step|--stagger-delay|--fill-color|--interval|-d|--loop|--speed|-n|--namespace|-o|--output|--outputs)
+        --transition-duration|--transition-fps|--transition-angle|--transition-wave|--transition-bezier|--transition-step|--stagger-delay|--fill-color|--depth-strength|--prop|--volume|--interval|-d|--loop|--speed|-n|--namespace|-o|--output|--outputs)
             return 0
             ;;
     esac
 
-    local trans_opts="--transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --transition-bezier --transition-step --transition-shader -o --output --outputs --sync-mode --stagger-delay --10bit --scaling-mode --mode --resize --fill-color --filter --backdrop --depth-map --layer --battery-policy --theme --no-theme --animate"
+    local trans_opts="--transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --transition-bezier --transition-step --transition-shader -o --output --outputs --sync-mode --stagger-delay --10bit --scaling-mode --mode --resize --fill-color --filter --backdrop --depth-map --depth-strength --layer --battery-policy --theme --no-theme --theme-from-media --no-theme-from-media --animate"
 
     case "$cmd" in
         img)
@@ -91,21 +92,34 @@ _wwal_completion() {
             ;;
         video)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--loop --speed --audio --battery-policy --layer --backdrop --theme --no-theme -o --output --outputs ${global_opts}" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--loop --speed --audio --volume --mute-on-audio --no-mute-on-audio --battery-policy --layer --backdrop --theme --no-theme --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
             else
                 _filedir '@(mp4|mkv|webm|avi|mov|gif)'
             fi
             ;;
         shader)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--audio --speed --battery-policy --layer --backdrop --10bit -o --output --outputs ${global_opts}" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--audio --volume --mute-on-audio --no-mute-on-audio --speed --fps --battery-policy --layer --backdrop --10bit --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
             else
                 _filedir '@(frag|comp|glsl)'
             fi
             ;;
+        workshop)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--prop --audio --volume --mute-on-audio --no-mute-on-audio --fps --battery-policy --layer --backdrop --theme --no-theme --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -W "${workshop_actions}" -- "$cur") )
+                _filedir
+            fi
+            ;;
+        audio)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--volume --mute-on-audio --no-mute-on-audio ${global_opts}" -- "$cur") )
+            fi
+            ;;
         theme)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "${global_opts}" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--theme-from-media --no-theme-from-media ${global_opts}" -- "$cur") )
             else
                 _filedir '@(png|jpg|jpeg|webp|avif|heic|jxl|svg|bmp)'
             fi

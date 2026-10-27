@@ -326,6 +326,11 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
         if (rem < 0) {
             if (errno == EINTR)
                 continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = {.fd = socket_fd, .events = POLLIN};
+                if (poll(&pfd, 1, 100) > 0)
+                    continue;
+            }
             if (received_fd >= 0)
                 close(received_fd);
             return false;

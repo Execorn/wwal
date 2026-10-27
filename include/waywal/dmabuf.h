@@ -52,6 +52,7 @@ typedef struct dmabuf_context {
     uint64_t preferred_modifier;
     uint32_t preferred_format;
     bool has_10bit;
+    bool locked_scanout_10bit;
     uint32_t format_10bit;
     uint64_t modifier_10bit;
     bool has_nv12;

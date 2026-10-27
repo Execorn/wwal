@@ -83,8 +83,8 @@ struct gpu_compute_ctx {
     const void *last_upload_ptr;
     uint32_t last_upload_w;
     uint32_t last_upload_h;
-    uint32_t last_upload_first_px;
-    uint32_t last_upload_last_px;
+    uint64_t upload_gen;
+    uint64_t last_upload_gen;
     GLuint kawase_half_tex;
     uint32_t kawase_half_w;
     uint32_t kawase_half_h;
@@ -225,12 +225,17 @@ static const char *SHADER_SRC_SCALE =
     "        vec2 tot = (u_scaling_mode == 5 && u_span_bounds.z > 0 && u_span_bounds.w > 0) ? "
     "vec2(u_span_bounds.zw) : dst_f;\n"
     "        vec2 soff = (u_scaling_mode == 5) ? vec2(u_span_bounds.xy) : vec2(0.0);\n"
-    "        float r_src = src_f.x / src_f.y, r_dst = tot.x / tot.y;\n"
-    "        vec2 crop = (r_src > r_dst) ? vec2(src_f.y * r_dst, src_f.y) : vec2(src_f.x, src_f.x "
-    "/ r_dst);\n"
-    "        vec2 off = (src_f - crop) * 0.5;\n"
-    "        vec2 s_px = off + (soff + vec2(coord) + 0.5) * crop / tot;\n"
-    "        out_col = texture(u_src, clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f);\n"
+    "        if (int(tot.x) == u_src_res.x && int(tot.y) == u_src_res.y) {\n"
+    "            ivec2 sc = clamp(ivec2(soff) + coord, ivec2(0), u_src_res - ivec2(1));\n"
+    "            out_col = texelFetch(u_src, sc, 0);\n"
+    "        } else {\n"
+    "            float r_src = src_f.x / src_f.y, r_dst = tot.x / tot.y;\n"
+    "            vec2 crop = (r_src > r_dst) ? vec2(src_f.y * r_dst, src_f.y) : vec2(src_f.x, "
+    "src_f.x / r_dst);\n"
+    "            vec2 off = (src_f - crop) * 0.5;\n"
+    "            vec2 s_px = off + (soff + vec2(coord) + 0.5) * crop / tot;\n"
+    "            out_col = texture(u_src, clamp(s_px, vec2(0.5), src_f - 0.5) / src_f);\n"
+    "        }\n"
     "    } else if (u_scaling_mode == 1) {\n"
     "        float r_src = src_f.x / src_f.y, r_dst = dst_f.x / dst_f.y;\n"
     "        if (r_src > r_dst) {\n"
@@ -239,7 +244,7 @@ static const char *SHADER_SRC_SCALE =
     "            if (coord.y >= py && coord.y < py + sh && sh > 0) {\n"
     "                vec2 s_px = vec2((float(coord.x) + 0.5) * src_f.x / dst_f.x, (float(coord.y - "
     "py) + 0.5) * src_f.y / float(sh));\n"
-    "                out_col = texture(u_src, clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f);\n"
+    "                out_col = texture(u_src, clamp(s_px, vec2(0.5), src_f - 0.5) / src_f);\n"
     "            }\n"
     "        } else {\n"
     "            int sw = min(int(dst_f.y * r_src + 0.5), u_dst_res.x), px = (u_dst_res.x - sw) / "
@@ -247,12 +252,12 @@ static const char *SHADER_SRC_SCALE =
     "            if (coord.x >= px && coord.x < px + sw && sw > 0) {\n"
     "                vec2 s_px = vec2((float(coord.x - px) + 0.5) * src_f.x / float(sw), "
     "(float(coord.y) + 0.5) * src_f.y / dst_f.y);\n"
-    "                out_col = texture(u_src, clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f);\n"
+    "                out_col = texture(u_src, clamp(s_px, vec2(0.5), src_f - 0.5) / src_f);\n"
     "            }\n"
     "        }\n"
     "    } else if (u_scaling_mode == 2) {\n"
     "        vec2 s_px = (vec2(coord) + 0.5) * src_f / dst_f;\n"
-    "        out_col = texture(u_src, clamp(s_px + 0.5, vec2(0.5), src_f - 0.5) / src_f);\n"
+    "        out_col = texture(u_src, clamp(s_px, vec2(0.5), src_f - 0.5) / src_f);\n"
     "    } else if (u_scaling_mode == 3) {\n"
     "        int sx = coord.x - (u_dst_res.x - u_src_res.x) / 2, sy = coord.y - (u_dst_res.y - "
     "u_src_res.y) / 2;\n"
@@ -478,7 +483,7 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
     ctx->loc_kawase_dst_res = glGetUniformLocation(ctx->prog_kawase, "u_dst_res");
     ctx->loc_kawase_radius = glGetUniformLocation(ctx->prog_kawase, "u_radius");
 
-    /* Cache uniform locations at compile/link time (PERF-01) */
+    /* Cache uniform locations at compile/link time to avoid per-frame driver lookups */
     query_program_uniforms(ctx->prog_fade, &ctx->unif_fade);
     query_program_uniforms(ctx->prog_wipe, &ctx->unif_wipe);
     query_program_uniforms(ctx->prog_grow, &ctx->unif_grow);
@@ -498,7 +503,7 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
     query_program_uniforms(ctx->prog_light_leak, &ctx->unif_light_leak);
     query_program_uniforms(ctx->prog_page_curl, &ctx->unif_page_curl);
 
-    /* Query fence sync extension entry points (ARCH-03) */
+    /* Query fence sync extension entry points for GPU-to-Wayland handoff synchronization */
     ctx->eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
     ctx->eglDestroySyncKHR = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
     ctx->eglClientWaitSyncKHR =
@@ -644,6 +649,7 @@ static GLuint ensure_10bit_scratch_target(gpu_compute_ctx_t *ctx, uint32_t width
         ctx->scratch_10bit_tex = 0;
     }
     glGenTextures(1, &ctx->scratch_10bit_tex);
+    glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx->scratch_10bit_tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -759,7 +765,7 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         ctx->bound_new_tex = new_bo->gl_tex;
     }
 
-    /* Set uniform parameters from cached locations (PERF-01) */
+    /* Update uniforms only when values change to minimize driver validation overhead */
     if (u->loc_prog >= 0 && u->last_prog != params->progress) {
         glUniform1f(u->loc_prog, params->progress);
         u->last_prog = params->progress;
@@ -1223,20 +1229,25 @@ bool gpu_compute_load_custom_shader(gpu_compute_ctx_t *ctx, const char *src)
     return true;
 }
 
+void gpu_compute_bump_upload_gen(gpu_compute_ctx_t *ctx)
+{
+    if (!ctx)
+        return;
+    ctx->upload_gen++;
+    if (ctx->upload_gen == 0)
+        ctx->upload_gen = 1;
+}
+
 static void upload_source_rgba_dedup(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba,
                                      uint32_t src_w, uint32_t src_h)
 {
-    uint32_t first_px = 0;
-    uint32_t last_px = 0;
-    memcpy(&first_px, src_rgba, sizeof(uint32_t));
-    memcpy(&last_px, src_rgba + ((size_t)src_w * (size_t)src_h - 1u) * 4u, sizeof(uint32_t));
-
     if (ctx->upload_src_tex == 0 || ctx->upload_src_w != src_w || ctx->upload_src_h != src_h) {
         if (ctx->upload_src_tex != 0) {
             glDeleteTextures(1, &ctx->upload_src_tex);
             ctx->upload_src_tex = 0;
         }
         glGenTextures(1, &ctx->upload_src_tex);
+        glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, ctx->upload_src_tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1250,14 +1261,16 @@ static void upload_source_rgba_dedup(gpu_compute_ctx_t *ctx, const uint8_t *src_
         ctx->upload_src_w = src_w;
         ctx->upload_src_h = src_h;
         ctx->last_upload_ptr = NULL;
+        ctx->last_upload_gen = 0;
     }
 
-    if (ctx->last_upload_ptr == (const void *)src_rgba && ctx->last_upload_w == src_w &&
-        ctx->last_upload_h == src_h && ctx->last_upload_first_px == first_px &&
-        ctx->last_upload_last_px == last_px) {
+    if (ctx->upload_gen != 0 && ctx->last_upload_gen == ctx->upload_gen &&
+        ctx->last_upload_ptr == (const void *)src_rgba && ctx->last_upload_w == src_w &&
+        ctx->last_upload_h == src_h) {
         return;
     }
 
+    glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx->upload_src_tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)src_w, (GLsizei)src_h, GL_RGBA,
@@ -1265,8 +1278,7 @@ static void upload_source_rgba_dedup(gpu_compute_ctx_t *ctx, const uint8_t *src_
     ctx->last_upload_ptr = (const void *)src_rgba;
     ctx->last_upload_w = src_w;
     ctx->last_upload_h = src_h;
-    ctx->last_upload_first_px = first_px;
-    ctx->last_upload_last_px = last_px;
+    ctx->last_upload_gen = ctx->upload_gen;
 }
 
 static GLuint ensure_kawase_half_tex(gpu_compute_ctx_t *ctx, uint32_t width, uint32_t height)
@@ -1279,6 +1291,7 @@ static GLuint ensure_kawase_half_tex(gpu_compute_ctx_t *ctx, uint32_t width, uin
         ctx->kawase_half_tex = 0;
     }
     glGenTextures(1, &ctx->kawase_half_tex);
+    glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx->kawase_half_tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1394,6 +1407,109 @@ bool gpu_compute_upload_static(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, 
     return true;
 }
 
+void gpu_compute_make_current(gpu_compute_ctx_t *ctx)
+{
+    if (!ctx || ctx->display == EGL_NO_DISPLAY || ctx->context == EGL_NO_CONTEXT)
+        return;
+    if (eglGetCurrentContext() != ctx->context) {
+        eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+        gpu_compute_invalidate_state_cache(ctx);
+    }
+}
+
+bool gpu_compute_scale_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *src_bo, dmabuf_bo_t *dst_bo,
+                          waywal_scaling_mode_t scaling, uint32_t clear_color, bool release_src_gl)
+{
+    if (!ctx || !src_bo || !dst_bo || src_bo->width == 0 || src_bo->height == 0 ||
+        dst_bo->width == 0 || dst_bo->height == 0 || !ctx->prog_scale) {
+        return false;
+    }
+
+    gpu_compute_make_current(ctx);
+
+    if (!gpu_compute_import_bo(ctx, src_bo) || !gpu_compute_import_bo(ctx, dst_bo)) {
+        if (release_src_gl) {
+            gpu_compute_release_bo(ctx, src_bo);
+        }
+        return false;
+    }
+
+    bool use_scratch = needs_scratch_fbo_blit(ctx, dst_bo);
+    GLuint dst_image_tex = dst_bo->gl_tex;
+    if (use_scratch) {
+        dst_image_tex = ensure_10bit_scratch_target(ctx, dst_bo->width, dst_bo->height);
+        if (!dst_image_tex) {
+            if (release_src_gl) {
+                gpu_compute_release_bo(ctx, src_bo);
+            }
+            return false;
+        }
+    }
+
+    glUseProgram(ctx->prog_scale);
+    ctx->current_prog = ctx->prog_scale;
+
+    glBindImageTexture(0, dst_image_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    ctx->bound_target_tex = dst_image_tex;
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, src_bo->gl_tex);
+    ctx->bound_old_tex = src_bo->gl_tex;
+
+    float ca = (float)((clear_color >> 24) & 0xFF) / 255.0f;
+    float cr = (float)((clear_color >> 16) & 0xFF) / 255.0f;
+    float cg = (float)((clear_color >> 8) & 0xFF) / 255.0f;
+    float cb = (float)(clear_color & 0xFF) / 255.0f;
+
+    if (ctx->loc_scale_src_res >= 0)
+        glUniform2i(ctx->loc_scale_src_res, (GLint)src_bo->width, (GLint)src_bo->height);
+    if (ctx->loc_scale_dst_res >= 0)
+        glUniform2i(ctx->loc_scale_dst_res, (GLint)dst_bo->width, (GLint)dst_bo->height);
+    if (ctx->loc_scale_mode >= 0)
+        glUniform1i(ctx->loc_scale_mode, (GLint)scaling);
+    if (ctx->loc_scale_clear >= 0)
+        glUniform4f(ctx->loc_scale_clear, cr, cg, cb, ca);
+    if (ctx->loc_scale_has_src >= 0)
+        glUniform1i(ctx->loc_scale_has_src, 1);
+    if (ctx->loc_scale_span_bounds >= 0)
+        glUniform4i(ctx->loc_scale_span_bounds, ctx->span_bounds[0], ctx->span_bounds[1],
+                    ctx->span_bounds[2], ctx->span_bounds[3]);
+
+    GLuint groups_x = (dst_bo->width + 15) / 16;
+    GLuint groups_y = (dst_bo->height + 15) / 16;
+    glDispatchCompute(groups_x, groups_y, 1);
+
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    if (use_scratch) {
+        if (!blit_scratch_to_10bit_bo(ctx, dst_bo)) {
+            if (release_src_gl) {
+                gpu_compute_release_bo(ctx, src_bo);
+            }
+            return false;
+        }
+    }
+
+    if (ctx->eglCreateSyncKHR && ctx->eglClientWaitSyncKHR && ctx->eglDestroySyncKHR) {
+        EGLSyncKHR sync = ctx->eglCreateSyncKHR(ctx->display, EGL_SYNC_FENCE_KHR, NULL);
+        if (sync != EGL_NO_SYNC_KHR) {
+            ctx->eglClientWaitSyncKHR(ctx->display, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR,
+                                      EGL_FOREVER_KHR);
+            ctx->eglDestroySyncKHR(ctx->display, sync);
+        } else {
+            glFlush();
+            glFinish();
+        }
+    } else {
+        glFinish();
+    }
+
+    if (release_src_gl) {
+        gpu_compute_release_bo(ctx, src_bo);
+    }
+    return true;
+}
+
 bool gpu_compute_render_kawase_blur(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, uint32_t src_w,
                                     uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t radius)
 {
@@ -1427,8 +1543,10 @@ bool gpu_compute_render_kawase_blur(gpu_compute_ctx_t *ctx, const uint8_t *src_r
 
     /* Pass 1: Downsample + Kawase pre-blur into half_tex */
     glBindImageTexture(0, half_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    ctx->bound_target_tex = half_tex;
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, ctx->upload_src_tex);
+    ctx->bound_old_tex = ctx->upload_src_tex;
     if (ctx->loc_kawase_src_res >= 0)
         glUniform2i(ctx->loc_kawase_src_res, (GLint)src_w, (GLint)src_h);
     if (ctx->loc_kawase_dst_res >= 0)

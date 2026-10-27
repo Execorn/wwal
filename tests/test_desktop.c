@@ -261,8 +261,19 @@ static void test_security_hardening(void)
         }
 
 #ifdef HAVE_LIBSECCOMP
-        /* Test denied syscall: SCMP_ACT_KILL on execve (SOTA-09) */
-        syscall(SYS_execve, "/bin/invalid_prog", NULL, NULL);
+        /* Verify fork + wait4 are allowed for on_wallpaper_change / on_theme_change hooks */
+        pid_t hook_pid = fork();
+        if (hook_pid < 0)
+            _exit(7);
+        if (hook_pid == 0)
+            _exit(0);
+        int hook_st = 0;
+        if (waitpid(hook_pid, &hook_st, 0) != hook_pid || !WIFEXITED(hook_st) ||
+            WEXITSTATUS(hook_st) != 0)
+            _exit(8);
+
+        /* Verify denied syscall triggers SCMP_ACT_KILL_PROCESS on ptrace */
+        syscall(SYS_ptrace, 0, 0, 0, 0);
         /* If not killed by SIGSYS, exit with error code 4 */
         _exit(4);
 #else

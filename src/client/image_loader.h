@@ -38,6 +38,7 @@ typedef struct {
  * Returns true on success, filling *out_pixels, *out_w, *out_h.
  * Memory allocated for *out_pixels must be freed with image_free(). */
 bool image_load(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h);
+bool image_load_rgba(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h);
 bool image_load_raw(const char *filepath, raw_image_t *out_img);
 
 bool image_load_fd(int fd, raw_image_t *out_img);

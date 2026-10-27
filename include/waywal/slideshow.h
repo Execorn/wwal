@@ -14,7 +14,7 @@ extern "C" {
 
 struct daemon_state;
 
-typedef struct {
+typedef struct slideshow_engine {
     bool active;
     bool paused;
     int timer_fd;

@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -90,12 +91,62 @@ bool render_engine_upload_static(render_engine_t *re, const uint8_t *src_rgba, u
                                      dst_bo, (waywal_scaling_mode_t)scaling_mode, clear_color);
 }
 
+bool render_engine_copy_bo(render_engine_t *re, dmabuf_bo_t *dst_bo, dmabuf_bo_t *src_bo,
+                           uint32_t scaling_mode, uint32_t clear_color, bool release_src_gl)
+{
+    if (!re || !dst_bo || !src_bo || dst_bo == src_bo)
+        return false;
+    if (re->has_gpu_compute && re->gpu_ctx) {
+        return gpu_compute_scale_bo((gpu_compute_ctx_t *)re->gpu_ctx, src_bo, dst_bo,
+                                    (waywal_scaling_mode_t)scaling_mode, clear_color,
+                                    release_src_gl);
+    }
+    if (src_bo->gbm_bo && dst_bo->gbm_bo && src_bo->width == dst_bo->width &&
+        src_bo->height == dst_bo->height) {
+        uint32_t src_stride = 0, dst_stride = 0;
+        void *map_src = NULL, *map_dst = NULL;
+        void *src_ptr = gbm_bo_map(src_bo->gbm_bo, 0, 0, src_bo->width, src_bo->height,
+                                   GBM_BO_TRANSFER_READ, &src_stride, &map_src);
+        void *dst_ptr = gbm_bo_map(dst_bo->gbm_bo, 0, 0, dst_bo->width, dst_bo->height,
+                                   GBM_BO_TRANSFER_WRITE, &dst_stride, &map_dst);
+        if (src_ptr && src_ptr != MAP_FAILED && dst_ptr && dst_ptr != MAP_FAILED) {
+            size_t row_bytes = (size_t)dst_bo->width * 4u;
+            for (uint32_t y = 0; y < dst_bo->height; ++y) {
+                memcpy((uint8_t *)dst_ptr + (size_t)y * dst_stride,
+                       (const uint8_t *)src_ptr + (size_t)y * src_stride, row_bytes);
+            }
+            gbm_bo_unmap(dst_bo->gbm_bo, map_dst);
+            gbm_bo_unmap(src_bo->gbm_bo, map_src);
+            return true;
+        }
+        if (dst_ptr && dst_ptr != MAP_FAILED)
+            gbm_bo_unmap(dst_bo->gbm_bo, map_dst);
+        if (src_ptr && src_ptr != MAP_FAILED)
+            gbm_bo_unmap(src_bo->gbm_bo, map_src);
+    }
+    return false;
+}
+
+void render_engine_make_current(render_engine_t *re)
+{
+    if (!re || !re->has_gpu_compute || !re->gpu_ctx)
+        return;
+    gpu_compute_make_current((gpu_compute_ctx_t *)re->gpu_ctx);
+}
+
 void render_engine_set_span_bounds(render_engine_t *re, int32_t off_x, int32_t off_y,
                                    int32_t total_w, int32_t total_h)
 {
     if (!re || !re->has_gpu_compute || !re->gpu_ctx)
         return;
     gpu_compute_set_span_bounds((gpu_compute_ctx_t *)re->gpu_ctx, off_x, off_y, total_w, total_h);
+}
+
+void render_engine_bump_upload_gen(render_engine_t *re)
+{
+    if (!re || !re->has_gpu_compute || !re->gpu_ctx)
+        return;
+    gpu_compute_bump_upload_gen((gpu_compute_ctx_t *)re->gpu_ctx);
 }
 
 static inline float clampf(float v, float min_v, float max_v)
@@ -2177,23 +2228,20 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
     }
 
     case WAYWAL_TRANSITION_DOOM: {
-        const uint32_t col_width = 16;
+        const uint32_t col_width = 4;
         uint32_t num_cols = (width + col_width - 1) / col_width;
-        int shift_stack[1024];
+        int shift_stack[2048];
         int *pixel_shift_lut =
-            (num_cols <= 1024) ? shift_stack : (int *)malloc((size_t)num_cols * sizeof(int));
+            (num_cols <= 2048) ? shift_stack : (int *)malloc((size_t)num_cols * sizeof(int));
         if (!pixel_shift_lut)
             return false;
 
         for (uint32_t c = 0; c < num_cols; ++c) {
-            float col_idx = (float)c;
-            float delay = fmodf(col_idx * 123.34f + 45.32f, 1.0f);
-            if (delay < 0.0f)
-                delay += 1.0f;
-            delay = fmodf(delay * (delay + 33.33f) * 1337.5f, 1.0f);
-            if (delay < 0.0f)
-                delay += 1.0f;
-            delay *= 0.35f;
+            float p_hash = (float)c * 0.1031f;
+            p_hash -= floorf(p_hash);
+            p_hash *= p_hash + 33.33f;
+            p_hash *= p_hash + p_hash;
+            float delay = (p_hash - floorf(p_hash)) * 0.35f;
 
             float shift = clampf((progress * 1.35f - delay) / 1.0f, 0.0f, 1.0f);
             pixel_shift_lut[c] = (int)(shift * (float)height);
@@ -2607,6 +2655,9 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
         float edge0 = threshold - softness;
         float inv_span = 1.0f / (2.0f * softness);
+        float glow_env = (progress > 0.05f && progress < 0.95f)
+                             ? (sinf(progress * 3.1415926535f) * 0.25f)
+                             : 0.0f;
 #if defined(__x86_64__) || defined(_M_X64)
         bool has_avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #endif
@@ -2637,7 +2688,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             const uint32_t *b_row = new_pixels + (size_t)y * width;
 
 #if defined(__x86_64__) || defined(_M_X64)
-            if (has_avx2) {
+            if (has_avx2 && glow_env <= 0.0f) {
                 luma_row_avx2(dst_row, a_row, b_row, v, dv, lut_ix, lut_cx, width, edge0, inv_span);
                 continue;
             }
@@ -2647,14 +2698,35 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                 float n = v[ix] + dv[ix] * lut_cx[x];
                 float alpha = smoothstepf(threshold - softness, threshold + softness, n);
                 float mix_val = 1.0f - alpha;
+                uint32_t base;
                 if (mix_val <= 0.0f) {
-                    dst_row[x] = a_row[x];
+                    base = a_row[x];
                 } else if (mix_val >= 1.0f) {
-                    dst_row[x] = b_row[x];
+                    base = b_row[x];
                 } else {
                     uint16_t wb = (uint16_t)(mix_val * 256.0f);
-                    dst_row[x] = blend_pixel_scalar(a_row[x], b_row[x], wb);
+                    base = blend_pixel_scalar(a_row[x], b_row[x], wb);
                 }
+                if (glow_env > 0.0f) {
+                    float edge = 1.0f - fabsf(n - threshold) * inv_span;
+                    if (edge > 0.0f) {
+                        float glow = edge * edge * glow_env;
+                        int gr = (int)(glow * 0.3f * 255.0f);
+                        int gg = (int)(glow * 0.6f * 255.0f);
+                        int gb = (int)(glow * 1.0f * 255.0f);
+                        int r = (int)((base >> 16) & 0xFF) + gr;
+                        int g = (int)((base >> 8) & 0xFF) + gg;
+                        int b = (int)(base & 0xFF) + gb;
+                        if (r > 255)
+                            r = 255;
+                        if (g > 255)
+                            g = 255;
+                        if (b > 255)
+                            b = 255;
+                        base = 0xFF000000U | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                    }
+                }
+                dst_row[x] = base;
             }
         }
 
@@ -2773,6 +2845,10 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         float inv_w = 1.0f / (float)width;
         float inv_h = 1.0f / (float)height;
         float inv_R_lut = 255.0f / R;
+        float angle = (fabsf(params->angle_rad) > 1e-5f) ? params->angle_rad : 0.78539816f;
+        float dir_x = cosf(angle);
+        float dir_y = -sinf(angle);
+        float drop_shadow_width = 0.08f;
 
         uint16_t curl_wb_lut[256];
         uint16_t shadow_wb_lut[256];
@@ -2795,21 +2871,9 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             const uint32_t *a_row = old_pixels + (size_t)y * width;
             const uint32_t *b_row = new_pixels + (size_t)y * width;
 
-            float x_curl_start_f = (2.0f * line - vy) * (float)width;
-            float x_curl_end_f = (2.0f * (line + R) - vy) * (float)width;
-
-            int x_curl_L = span_floor_clamp(x_curl_start_f, (int)width);
-            int x_curl_R = span_ceil_clamp(x_curl_end_f, (int)width);
-            if (x_curl_L > x_curl_R)
-                x_curl_L = x_curl_R;
-
-            if (x_curl_L > 0) {
-                memcpy(dst_row, a_row, (size_t)x_curl_L * sizeof(uint32_t));
-            }
-
-            for (int x = x_curl_L; x < x_curl_R; ++x) {
+            for (int x = 0; x < (int)width; ++x) {
                 float vx = (float)x * inv_w;
-                float s = (vx + vy) * 0.5f;
+                float s = ((vx - 0.5f) * dir_x + (vy - 0.5f) * dir_y) * 0.70710678f + 0.5f;
                 if (s < line) {
                     dst_row[x] = a_row[x];
                 } else if (s < line + R) {
@@ -2820,9 +2884,9 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                     else if (lut_idx > 255)
                         lut_idx = 255;
 
-                    float curl_off = curl_offset_lut[lut_idx];
-                    float curl_u = vx - curl_off;
-                    float curl_v = vy - curl_off;
+                    float curl_off = curl_offset_lut[lut_idx] * 1.41421356f;
+                    float curl_u = vx - curl_off * dir_x;
+                    float curl_v = vy - curl_off * dir_y;
                     if (curl_u >= 0.0f && curl_u <= 1.0f && curl_v >= 0.0f && curl_v <= 1.0f) {
                         int sx = (int)(curl_u * (float)width);
                         int sy = (int)(curl_v * (float)height);
@@ -2836,14 +2900,14 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                         dst_row[x] =
                             blend_pixel_scalar(0xFF000000, b_row[x], shadow_wb_lut[lut_idx]);
                     }
+                } else if (s < line + R + drop_shadow_width) {
+                    float t_sh = clampf((s - (line + R)) / drop_shadow_width, 0.0f, 1.0f);
+                    float sm = t_sh * t_sh * (3.0f - 2.0f * t_sh);
+                    uint16_t wb_sh = (uint16_t)((0.65f + 0.35f * sm) * 256.0f);
+                    dst_row[x] = blend_pixel_scalar(0xFF000000, b_row[x], wb_sh);
                 } else {
                     dst_row[x] = b_row[x];
                 }
-            }
-
-            if (x_curl_R < (int)width) {
-                memcpy(dst_row + x_curl_R, b_row + x_curl_R,
-                       (size_t)((int)width - x_curl_R) * sizeof(uint32_t));
             }
         }
         return true;

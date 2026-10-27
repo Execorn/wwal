@@ -562,7 +562,7 @@ static void test_vaapi_decoder_and_prime_export(void)
     assert(dec.initialized);
     assert(dec.va_profile != VAProfileNone);
 
-    /* Submit synthetic I-frame packet (BUG-06 DPB verification) */
+    /* Submit synthetic I-frame packet for DPB verification */
     uint8_t dummy_nalu[32] = {0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E};
     demux_packet_t pkt_i = {.data = dummy_nalu,
                             .size = sizeof(dummy_nalu),
@@ -578,7 +578,7 @@ static void test_vaapi_decoder_and_prime_export(void)
     assert(dec.dpb.entries[0].surface == surf_i);
     assert(dec.dpb.entries[0].is_reference);
 
-    /* Submit synthetic P-frame packet (BUG-06 DPB reference tracking) */
+    /* Submit synthetic P-frame packet for DPB reference tracking */
     demux_packet_t pkt_p = {.data = dummy_nalu,
                             .size = sizeof(dummy_nalu),
                             .pts_us = 33333,

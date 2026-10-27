@@ -24,17 +24,22 @@ typedef struct {
     bool has_tranche_dev;
     bool is_scanout_tranche;
     bool locked_scanout_rgb;
+    bool locked_scanout_10bit;
 } feedback_state_t;
 
 static feedback_state_t g_fb_state = {.table_fd = -1};
 
 static void feedback_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback)
 {
-    (void)data;
+    dmabuf_context_t *ctx = (dmabuf_context_t *)data;
     (void)feedback;
     g_fb_state.is_scanout_tranche = false;
     g_fb_state.has_tranche_dev = false;
     g_fb_state.locked_scanout_rgb = false;
+    g_fb_state.locked_scanout_10bit = false;
+    if (ctx) {
+        ctx->locked_scanout_10bit = false;
+    }
 }
 
 static void feedback_format_table(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback,
@@ -133,15 +138,19 @@ static void feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedbac
                         g_fb_state.locked_scanout_rgb = true;
                     }
                 }
-            } else if (fmt == DRM_FORMAT_XRGB2101010 || fmt == DRM_FORMAT_ARGB2101010 ||
-                       fmt == DRM_FORMAT_XBGR2101010 || fmt == DRM_FORMAT_ABGR2101010) {
-                if (!ctx->has_10bit || g_fb_state.is_scanout_tranche) {
+            } else if (fmt == DRM_FORMAT_XRGB2101010 || fmt == DRM_FORMAT_ARGB2101010) {
+                if (!g_fb_state.locked_scanout_10bit && !ctx->locked_scanout_10bit &&
+                    (!ctx->has_10bit || g_fb_state.is_scanout_tranche)) {
                     ctx->has_10bit = true;
                     ctx->format_10bit = fmt;
                     ctx->modifier_10bit = mod;
                     WAYWAL_LOG_INFO("Detected 10-bit wide gamut scanout capability: 0x%08x "
                                     "(modifier: 0x%016lx)",
                                     fmt, (unsigned long)mod);
+                    if (g_fb_state.is_scanout_tranche) {
+                        g_fb_state.locked_scanout_10bit = true;
+                        ctx->locked_scanout_10bit = true;
+                    }
                 }
             } else if (fmt == DRM_FORMAT_NV12) {
                 if (!ctx->has_nv12) {

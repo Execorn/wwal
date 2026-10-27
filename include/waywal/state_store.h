@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 #define WAYWAL_STATE_MAGIC       0x57575354U
-#define WAYWAL_STATE_VERSION     1U
+#define WAYWAL_STATE_VERSION     4U
 #define WAYWAL_STATE_MAX_OUTPUTS 16U
 
 typedef enum : uint32_t {
@@ -24,6 +24,7 @@ typedef enum : uint32_t {
     WAYWAL_CONTENT_SLIDESHOW = 3,
     WAYWAL_CONTENT_SHADER = 4,
     WAYWAL_CONTENT_ANIMATION = 5,
+    WAYWAL_CONTENT_WORKSHOP = 6,
 
     STATIC_IMAGE = WAYWAL_CONTENT_STATIC_IMAGE,
     SOLID_COLOR = WAYWAL_CONTENT_SOLID_COLOR,
@@ -31,6 +32,7 @@ typedef enum : uint32_t {
     SLIDESHOW = WAYWAL_CONTENT_SLIDESHOW,
     SHADER = WAYWAL_CONTENT_SHADER,
     ANIMATION = WAYWAL_CONTENT_ANIMATION,
+    WORKSHOP = WAYWAL_CONTENT_WORKSHOP,
 } waywal_content_kind_t;
 
 #ifndef WAYWAL_FILTER_MODE_DEFINED
@@ -54,6 +56,7 @@ typedef struct {
     uint32_t target_fps;
     uint32_t slideshow_interval_sec;
     bool audio_reactive;
+    char prop_overrides[2048];
 } waywal_output_saved_state_t;
 
 typedef struct {

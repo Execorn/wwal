@@ -37,11 +37,22 @@ typedef enum : uint16_t {
     WAYWAL_REQ_RESTORE = 0x000D,
     WAYWAL_IPC_OP_RESTORE = WAYWAL_REQ_RESTORE,
     WAYWAL_REQ_SLIDESHOW_CTRL = 0x000E,
+    WAYWAL_REQ_WORKSHOP = 0x000F,
+    WAYWAL_IPC_OP_WORKSHOP = WAYWAL_REQ_WORKSHOP,
+    WAYWAL_REQ_QUERY_JSON = 0x0010,
+    WAYWAL_IPC_OP_QUERY_JSON = WAYWAL_REQ_QUERY_JSON,
+    WAYWAL_REQ_SET_UNIFORM = 0x0011,
+    WAYWAL_IPC_OP_SET_UNIFORM = WAYWAL_REQ_SET_UNIFORM,
+    WAYWAL_REQ_SUBSCRIBE = 0x0012,
+    WAYWAL_IPC_OP_SUBSCRIBE = WAYWAL_REQ_SUBSCRIBE,
+    WAYWAL_REQ_AUDIO_CTRL = 0x0013,
+    WAYWAL_IPC_OP_AUDIO_CTRL = WAYWAL_REQ_AUDIO_CTRL,
 
     WAYWAL_RESP_OK = 0x8001,
     WAYWAL_RESP_PONG = 0x8002,
     WAYWAL_RESP_INFO = 0x8003,
     WAYWAL_RESP_ERR = 0x8004,
+    WAYWAL_RESP_EVENT = 0x8005,
 } waywal_opcode_t;
 typedef waywal_opcode_t waywal_ipc_op_t;
 
@@ -101,6 +112,7 @@ typedef struct {
     float playback_speed; /* default 1.0f */
     uint32_t num_target_outputs;
     char filepath[4096];
+    uint32_t scaling_mode;
 } waywal_video_payload_t;
 
 typedef enum : uint32_t {
@@ -143,7 +155,55 @@ typedef struct {
     char shader_path[4096];
     uint32_t fps;
     bool audio_reactive;
+    uint32_t scaling_mode;
+    uint32_t transition_type;
+    uint32_t transition_duration_ms;
+    uint32_t transition_fps;
+    float transition_angle_rad;
+    float transition_wave_freq;
+    float transition_wave_amp;
+    float transition_center_x;
+    float transition_center_y;
+    bezier_curve_t bezier;
+    bool has_custom_bezier;
 } waywal_shader_payload_t;
+
+typedef struct {
+    char output[64];
+    char workshop_dir[4096];
+    char prop_overrides[2048];
+    uint32_t fps;
+    bool audio_reactive;
+    uint32_t scaling_mode;
+    uint32_t transition_type;
+    uint32_t transition_duration_ms;
+    uint32_t transition_fps;
+    float transition_angle_rad;
+    float transition_wave_freq;
+    float transition_wave_amp;
+    float transition_center_x;
+    float transition_center_y;
+    bezier_curve_t bezier;
+    bool has_custom_bezier;
+} waywal_workshop_payload_t;
+
+typedef struct {
+    char output[64];         /* Empty string "" = apply to all outputs */
+    char name[64];           /* GLSL uniform name or WE property key */
+    uint32_t num_components; /* 1..4 */
+    float values[4];
+} waywal_set_uniform_payload_t;
+static_assert(sizeof(waywal_set_uniform_payload_t) == 148,
+              "waywal_set_uniform_payload_t must be 148 bytes");
+
+typedef struct {
+    float volume;            /* < 0.0f = unchanged, 0.0..1.0 = set master volume */
+    int8_t mute_on_audio;    /* -1 = unchanged, 0 = disable, 1 = enable */
+    int8_t theme_from_media; /* -1 = unchanged, 0 = disable, 1 = enable */
+    uint8_t reserved[2];
+} waywal_audio_ctrl_payload_t;
+static_assert(sizeof(waywal_audio_ctrl_payload_t) == 8,
+              "waywal_audio_ctrl_payload_t must be 8 bytes");
 #pragma pack(pop)
 
 /* Resolves runtime socket path: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-wwald.<namespace>.sock */

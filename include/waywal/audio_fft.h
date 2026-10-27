@@ -38,6 +38,20 @@ void waywal_audio_fft_synthesize_signal(waywal_audio_fft_t *fft, float freq_hz, 
 bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out_frame);
 const waywal_audio_frame_t *waywal_audio_fft_get_frame(const waywal_audio_fft_t *fft);
 
+void waywal_audio_fft_set_volume(waywal_audio_fft_t *fft, float volume);
+float waywal_audio_fft_get_volume(const waywal_audio_fft_t *fft);
+
+void waywal_audio_fft_set_mute_on_audio(waywal_audio_fft_t *fft, bool mute_on_audio);
+bool waywal_audio_fft_get_mute_on_audio(const waywal_audio_fft_t *fft);
+
+bool waywal_audio_fft_is_pipewire_active(const waywal_audio_fft_t *fft);
+bool waywal_audio_fft_is_external_audio_active(const waywal_audio_fft_t *fft);
+bool waywal_audio_fft_is_ducked(const waywal_audio_fft_t *fft);
+float waywal_audio_fft_get_effective_gain(const waywal_audio_fft_t *fft);
+float waywal_audio_fft_get_effective_volume(const waywal_audio_fft_t *fft);
+float waywal_audio_fft_update_ducking(waywal_audio_fft_t *fft, float dt_sec);
+void waywal_audio_fft_set_external_audio_for_test(waywal_audio_fft_t *fft, bool active);
+
 #ifdef __cplusplus
 }
 #endif

@@ -4,6 +4,7 @@
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
 #include "waywal/power_governor.h"
+#include "waywal/shader_engine.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -19,7 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Declared in dmabuf_alloc.c — matches compositor dev_t to /dev/dri/renderD* */
+/* Declared in dmabuf_alloc.c to match the compositor dev_t against /dev/dri/renderD* */
 int open_drm_node_by_devt(dev_t target_dev);
 
 typedef struct wlr_toplevel_entry {
@@ -320,6 +321,9 @@ static void recompute_wlr_toplevel_power_state(daemon_state_t *state)
     if (!state || !state->power_gov)
         return;
 
+    bool single_output = (state->outputs != NULL && state->outputs->next == NULL);
+    bool has_compositor_ipc = (waywal_power_governor_get_ipc_fd(state->power_gov) >= 0);
+
     bool changed = false;
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (!out->name[0])
@@ -330,7 +334,7 @@ static void recompute_wlr_toplevel_power_state(daemon_state_t *state)
              e = e->next) {
             if (e->minimized)
                 continue;
-            bool on_out = (e->num_outputs == 0);
+            bool on_out = (e->num_outputs == 0 && single_output && !has_compositor_ipc);
             for (size_t i = 0; i < e->num_outputs; ++i) {
                 if (e->outputs[i] == out->wl_output) {
                     on_out = true;
@@ -347,8 +351,12 @@ static void recompute_wlr_toplevel_power_state(daemon_state_t *state)
         bool pause_fs = any_fs && state->config.daemon.auto_pause_fullscreen;
         bool pause_max = any_max && state->config.daemon.auto_pause_maximized;
         uint32_t prev_mask = waywal_power_governor_get_output_mask(state->power_gov, out->name);
-        waywal_power_governor_set_output_reason(state->power_gov, out->name,
-                                                WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, pause_fs);
+        /* When compositor IPC (Hyprland/Sway/Niri) is active, it tracks workspace-visible
+         * per-output fullscreen state accurately; do not let wlr_toplevel overwrite it. */
+        if (!has_compositor_ipc) {
+            waywal_power_governor_set_output_reason(state->power_gov, out->name,
+                                                    WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, pause_fs);
+        }
         waywal_power_governor_set_output_reason(state->power_gov, out->name,
                                                 WAYWAL_PAUSE_TOPLEVEL_MAXIMIZED, pause_max);
         uint32_t new_mask = waywal_power_governor_get_output_mask(state->power_gov, out->name);
@@ -711,10 +719,14 @@ static void registry_global_remove(void *data, struct wl_registry *registry, uin
         if (state->video_engine.target_output == node) {
             state->video_engine.target_output = NULL;
         }
-        output_node_destroy_surface(node);
+        if (state->power_gov && node->name[0] != '\0') {
+            waywal_power_governor_remove_output(state->power_gov, node->name);
+        }
         output_manager_remove(&state->output_mgr, name);
         state->outputs = state->output_mgr.head;
         state->num_outputs = state->output_mgr.count;
+        reconcile_global_engine_flags(state);
+        daemon_reconcile_power_state(state);
     }
 }
 
@@ -739,7 +751,7 @@ bool daemon_wayland_init(daemon_state_t *state)
     /* Initialize hardware DRM/GBM context */
     dmabuf_context_init(&state->dmabuf_ctx);
 
-    /* Initialize display output manager (ARCH-05) */
+    /* Initialize display output manager */
     output_manager_init(&state->output_mgr, &state->dmabuf_ctx, state->presentation);
     state->outputs = state->output_mgr.head;
     state->num_outputs = state->output_mgr.count;
@@ -907,11 +919,6 @@ void daemon_wayland_destroy(daemon_state_t *state)
         free(e);
     }
 
-    output_node_t *out = state->outputs;
-    while (out) {
-        output_node_destroy_surface(out);
-        out = out->next;
-    }
     output_manager_destroy(&state->output_mgr);
     state->outputs = NULL;
     state->num_outputs = 0;
@@ -1015,27 +1022,41 @@ static bool query_hyprland_cursor_global(daemon_state_t *state, double *gx, doub
     }
 
     const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
-    const char *xrd = getenv("XDG_RUNTIME_DIR");
-    if (!his || !his[0] || !xrd || !xrd[0])
+    if (!his || !his[0])
         return false;
+    const char *xrd = getenv("XDG_RUNTIME_DIR");
 
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (state->cursor_ipc_fd < 0) {
             int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
             if (fd < 0)
                 return false;
-            struct sockaddr_un addr = {0};
-            addr.sun_family = AF_UNIX;
-            int path_len =
-                snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/hypr/%s/.socket.sock", xrd, his);
-            if (path_len < 0 || (size_t)path_len >= sizeof(addr.sun_path)) {
-                close(fd);
-                return false;
-            }
             struct timeval tv = {.tv_sec = 0, .tv_usec = 10000};
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+
+            struct sockaddr_un addr = {0};
+            addr.sun_family = AF_UNIX;
+            bool connected = false;
+            if (xrd && xrd[0]) {
+                int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
+                                        "%s/hypr/%s/.socket.sock", xrd, his);
+                if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
+                    connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                    connected = true;
+                }
+            }
+            if (!connected) {
+                memset(&addr, 0, sizeof(addr));
+                addr.sun_family = AF_UNIX;
+                int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
+                                        "/tmp/hypr/%s/.socket.sock", his);
+                if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
+                    connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                    connected = true;
+                }
+            }
+            if (!connected) {
                 close(fd);
                 return false;
             }
@@ -1088,45 +1109,43 @@ bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *
         out ? (out->logical_height > 0 ? (double)out->logical_height : (double)out->height)
             : 1080.0;
 
-    /* Tier 2: Compositor IPC Fallback when occluded, throttled to 60Hz */
-    double gx = 0.0, gy = 0.0;
-    if (query_hyprland_cursor_global(state, &gx, &gy)) {
-        if (out) {
-            double lx = gx - (double)out->global_x;
-            double ly = gy - (double)out->global_y;
-            if (ref_w > 0.0 && ref_h > 0.0) {
-                if (lx < 0.0)
-                    lx = 0.0;
-                else if (lx > ref_w)
-                    lx = ref_w;
-                if (ly < 0.0)
-                    ly = 0.0;
-                else if (ly > ref_h)
-                    ly = ref_h;
-            }
-            out->cursor_x = lx;
-            out->cursor_y = ly;
-            *out_x = lx;
-            *out_y = ly;
+    /* Tier 2: Compositor IPC Fallback when occluded, whenever shader/workshop is active and
+     * not paused by power_gov ([STAGE0-RES-02]) */
+    const waywal_shader_engine_t *active_se =
+        (out && out->shader_eng) ? out->shader_eng : state->shader_eng;
+    bool shader_running = (out && (out->shader_active || out->workshop_active)) ||
+                          state->shader_active || state->workshop_active ||
+                          waywal_shader_engine_uses_mouse(active_se);
+    bool is_paused = false;
+    if (state->power_gov) {
+        if (out && out->name[0] != '\0') {
+            is_paused = waywal_power_governor_should_pause_output(state->power_gov, out->name);
         } else {
-            *out_x = gx;
-            *out_y = gy;
+            is_paused = waywal_power_governor_should_pause_all(state->power_gov);
         }
-        return true;
     }
-
-    /* Tier 3: Last-known cached wl_pointer coordinates */
-    if (out && (out->cursor_x > 0.0 || out->cursor_y > 0.0)) {
-        *out_x = out->cursor_x;
-        *out_y = out->cursor_y;
-        return true;
-    }
-
-    /* Tier 4: Screen center fallback */
-    if (ref_w > 0.0 && ref_h > 0.0) {
-        *out_x = ref_w * 0.5;
-        *out_y = ref_h * 0.5;
-        return true;
+    if (shader_running && !is_paused) {
+        double gx = 0.0, gy = 0.0;
+        if (query_hyprland_cursor_global(state, &gx, &gy)) {
+            if (out) {
+                double lx = gx - (double)out->global_x;
+                double ly = gy - (double)out->global_y;
+                if (ref_w > 0.0 && ref_h > 0.0) {
+                    if (lx < 0.0 || lx > ref_w || ly < 0.0 || ly > ref_h) {
+                        /* Cursor is on another monitor */
+                        return false;
+                    }
+                }
+                out->cursor_x = lx;
+                out->cursor_y = ly;
+                *out_x = lx;
+                *out_y = ly;
+            } else {
+                *out_x = gx;
+                *out_y = gy;
+            }
+            return true;
+        }
     }
 
     return false;

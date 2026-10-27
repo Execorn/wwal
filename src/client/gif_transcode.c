@@ -268,6 +268,7 @@ static uint32_t parse_avcc_num_ref_frames(const uint8_t *avcc, size_t size)
 typedef struct {
     bool valid;
     bool is_h264;
+    bool is_supported_codec;
     bool has_bframes;
     uint32_t width;
     uint32_t height;
@@ -336,6 +337,7 @@ static void parse_mp4_boxes(const uint8_t *data, size_t start, size_t end, mp4_p
                         probe->width = (uint32_t)((vse[24] << 8) | vse[25]);
                         probe->height = (uint32_t)((vse[26] << 8) | vse[27]);
                         probe->valid = (probe->width > 0 && probe->height > 0);
+                        probe->is_supported_codec = true;
                         if (entry_type == 0x61766331 || entry_type == 0x61766333) {
                             probe->is_h264 = true;
                             parse_mp4_boxes(data, entry_pos + 86, entry_pos + entry_size, probe,
@@ -380,6 +382,38 @@ static bool probe_mp4_stream(const char *filepath, mp4_probe_t *out_probe)
         if (out_probe->duration_us > 0) {
             out_probe->bitrate_bps =
                 ((uint64_t)st.st_size * 8ULL * 1000000ULL) / out_probe->duration_us;
+        }
+    } else if (read_be32(data) == 0x1A45DFA3) {
+        /* EBML / WebM / Matroska header: scan initial TrackEntry header for PixelWidth/Height */
+        size_t scan_lim = map_size < 65536 ? map_size : 65536;
+        bool has_codec = false;
+        for (size_t i = 0; i + 8 < scan_lim; ++i) {
+            if (!has_codec &&
+                ((memcmp(data + i, "V_VP9", 5) == 0) || (memcmp(data + i, "V_AV1", 5) == 0) ||
+                 (i + 15 <= scan_lim && memcmp(data + i, "V_MPEG4/ISO/AVC", 15) == 0) ||
+                 (i + 16 <= scan_lim && memcmp(data + i, "V_MPEGH/ISO/HEVC", 16) == 0))) {
+                has_codec = true;
+            }
+            if (data[i] == 0xB0 && (data[i + 1] == 0x82 || data[i + 1] == 0x81) &&
+                out_probe->width == 0) {
+                uint32_t w = (data[i + 1] == 0x82) ? (uint32_t)((data[i + 2] << 8) | data[i + 3])
+                                                   : (uint32_t)data[i + 2];
+                size_t next = i + (data[i + 1] == 0x82 ? 4 : 3);
+                if (next + 3 < scan_lim && data[next] == 0xBA &&
+                    (data[next + 1] == 0x82 || data[next + 1] == 0x81)) {
+                    uint32_t h = (data[next + 1] == 0x82)
+                                     ? (uint32_t)((data[next + 2] << 8) | data[next + 3])
+                                     : (uint32_t)data[next + 2];
+                    if (w > 0 && w <= 16384 && h > 0 && h <= 16384) {
+                        out_probe->width = w;
+                        out_probe->height = h;
+                    }
+                }
+            }
+        }
+        if (has_codec && out_probe->width > 0 && out_probe->height > 0) {
+            out_probe->valid = true;
+            out_probe->is_supported_codec = true;
         }
     }
 
@@ -642,13 +676,10 @@ bool video_transcode_optimize(const char *filepath, uint32_t max_width, uint32_t
 
         if (probe_mp4_stream(filepath, &probe)) {
             bool fits_bounds = (probe.width <= max_width && probe.height <= max_height);
-            bool is_small_clip =
-                ((uint64_t)probe.width * (uint64_t)probe.height < 1920ULL * 1080ULL);
-            bool is_optimal_stream =
-                (probe.is_h264 && probe.num_ref_frames <= 1 && !probe.has_bframes &&
-                 (probe.bitrate_bps == 0 || probe.bitrate_bps <= 15000000ULL));
+            bool is_supported_hw_stream =
+                (probe.is_supported_codec && (!probe.is_h264 || probe.num_ref_frames <= 16));
 
-            if (fits_bounds && (is_small_clip || is_optimal_stream)) {
+            if (fits_bounds && is_supported_hw_stream) {
                 strncpy(out_path, filepath, out_path_size - 1);
                 out_path[out_path_size - 1] = '\0';
                 return true;

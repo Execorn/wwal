@@ -83,19 +83,29 @@ static governed_output_t *find_or_create_output(waywal_power_governor_t *gov, co
     if (!gov || !name || name[0] == '\0') {
         return NULL;
     }
+    governed_output_t *free_slot = NULL;
     for (size_t i = 0; i < gov->output_count; ++i) {
-        if (gov->outputs[i].in_use && strcmp(gov->outputs[i].name, name) == 0) {
-            return &gov->outputs[i];
+        if (gov->outputs[i].in_use) {
+            if (strcmp(gov->outputs[i].name, name) == 0) {
+                return &gov->outputs[i];
+            }
+        } else if (!free_slot) {
+            free_slot = &gov->outputs[i];
         }
     }
-    if (!create || gov->output_count >= WAYWAL_MAX_GOVERNED_OUTPUTS) {
+    if (!create) {
         return NULL;
     }
-    governed_output_t *slot = &gov->outputs[gov->output_count++];
-    memset(slot, 0, sizeof(*slot));
-    snprintf(slot->name, sizeof(slot->name), "%s", name);
-    slot->in_use = true;
-    return slot;
+    if (!free_slot) {
+        if (gov->output_count >= WAYWAL_MAX_GOVERNED_OUTPUTS) {
+            return NULL;
+        }
+        free_slot = &gov->outputs[gov->output_count++];
+    }
+    memset(free_slot, 0, sizeof(*free_slot));
+    snprintf(free_slot->name, sizeof(free_slot->name), "%s", name);
+    free_slot->in_use = true;
+    return free_slot;
 }
 
 static const governed_output_t *find_output_const(const waywal_power_governor_t *gov,
@@ -733,6 +743,23 @@ void waywal_power_governor_set_output_reason(waywal_power_governor_t *gov, const
     }
 }
 
+void waywal_power_governor_remove_output(waywal_power_governor_t *gov, const char *output_name)
+{
+    if (!gov || !output_name || output_name[0] == '\0') {
+        return;
+    }
+    for (size_t i = 0; i < gov->output_count; ++i) {
+        if (gov->outputs[i].in_use && strcmp(gov->outputs[i].name, output_name) == 0) {
+            gov->outputs[i].in_use = false;
+            gov->outputs[i].mask = 0u;
+            gov->outputs[i].name[0] = '\0';
+        }
+    }
+    while (gov->output_count > 0 && !gov->outputs[gov->output_count - 1].in_use) {
+        gov->output_count--;
+    }
+}
+
 void waywal_power_governor_set_global_reason(waywal_power_governor_t *gov,
                                              waywal_pause_reason_t reason, bool active)
 {
@@ -773,15 +800,16 @@ bool waywal_power_governor_should_pause_all(const waywal_power_governor_t *gov)
     if ((gov->global_mask & allowed) != 0u) {
         return true;
     }
-    if (gov->output_count == 0) {
-        return false;
-    }
+    size_t active_outputs = 0;
     for (size_t i = 0; i < gov->output_count; ++i) {
-        if (gov->outputs[i].in_use && (gov->outputs[i].mask & allowed) == 0u) {
-            return false;
+        if (gov->outputs[i].in_use) {
+            active_outputs++;
+            if ((gov->outputs[i].mask & allowed) == 0u) {
+                return false;
+            }
         }
     }
-    return true;
+    return active_outputs > 0;
 }
 
 uint32_t waywal_power_governor_effective_fps(const waywal_power_governor_t *gov,

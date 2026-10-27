@@ -115,6 +115,7 @@ void output_manager_destroy(output_manager_t *om)
     output_state_t *cur = om->head;
     while (cur) {
         output_state_t *next = cur->next;
+        om->head = next;
 
         output_node_destroy_surface(cur);
 

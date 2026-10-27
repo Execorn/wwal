@@ -8,6 +8,7 @@ layout(binding = 2) uniform highp sampler2D u_src_b;
 
 uniform float u_progress;
 uniform ivec2 u_resolution;
+uniform float u_angle;
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
@@ -29,8 +30,10 @@ void main() {
     // Peel line traverses from beyond 1.0 to below -R
     float line = 1.02 - u_progress * 1.25;
 
-    // Diagonal curl axis
-    float s = (uv.x + uv.y) * 0.5;
+    // Curl axis along u_angle (defaults to 45-degree diagonal when 0)
+    float angle = (abs(u_angle) > 1e-5) ? u_angle : 0.78539816;
+    vec2 dir = vec2(cos(angle), -sin(angle));
+    float s = dot(uv - vec2(0.5), dir) * 0.70710678 + 0.5;
 
     vec4 col;
     if (s < line) {
@@ -39,7 +42,7 @@ void main() {
     } else if (s < line + R) {
         // Active cylindrical curl region
         float dist = s - line;
-        vec2 uv_curl = uv - 2.0 * dist * vec2(0.5, 0.5);
+        vec2 uv_curl = uv - 1.41421356 * dist * dir;
 
         if (uv_curl.x >= 0.0 && uv_curl.x <= 1.0 && uv_curl.y >= 0.0 && uv_curl.y <= 1.0) {
             // Curled back of the peeling canvas with specular cylinder highlight

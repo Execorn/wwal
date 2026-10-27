@@ -106,7 +106,7 @@ static void test_palette_hct_engine(void)
     assert(light_pal.background.r > 200 && light_pal.background.g > 200 &&
            light_pal.background.b > 200);
 
-    char tmp_dir[] = "/tmp/wwal_test_m5_XXXXXX";
+    char tmp_dir[] = "/tmp/wwal_test_theme_XXXXXX";
     assert(mkdtemp(tmp_dir) != NULL);
 
     assert(waywal_palette_export_all(&dark_pal, tmp_dir));
@@ -495,6 +495,7 @@ static void test_power_governor(void)
 
     waywal_power_governor_t *gov = waywal_power_governor_create(WAYWAL_BATTERY_REDUCE_FPS);
     assert(gov != NULL);
+    waywal_power_governor_set_on_battery(gov, false);
 
     assert(!waywal_power_governor_should_pause_output(gov, "DP-1"));
     assert(waywal_power_governor_effective_fps(gov, "DP-1", 60) == 60U);
@@ -527,6 +528,16 @@ static void test_power_governor(void)
     waywal_power_governor_set_on_battery(gov, false);
     assert(!waywal_power_governor_should_pause_all(gov));
     assert(waywal_power_governor_effective_fps(gov, "DP-1", 60) == 60U);
+
+    /* Verify hotplug output removal and slot reuse */
+    waywal_power_governor_set_output_reason(gov, "DP-1", WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, true);
+    waywal_power_governor_set_output_reason(gov, "HDMI-A-1", WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN,
+                                            false);
+    assert(!waywal_power_governor_should_pause_all(gov));
+    waywal_power_governor_remove_output(gov, "HDMI-A-1");
+    assert(waywal_power_governor_should_pause_all(gov));
+    waywal_power_governor_remove_output(gov, "DP-1");
+    assert(!waywal_power_governor_should_pause_all(gov));
 
     waywal_power_governor_destroy(gov);
     printf("  -> Per-output/global pause bitmasks & battery FPS governor: PASSED\n");
@@ -569,6 +580,12 @@ static void test_audio_fft_and_shader(void)
         }
     }
     assert(non_zero_tex > 64U);
+
+    /* Verify zero-push idle frame exponentially decays without re-running DFT */
+    waywal_audio_frame_t idle_frame;
+    memset(&idle_frame, 0, sizeof(idle_frame));
+    assert(waywal_audio_fft_process(fft, &idle_frame));
+    assert(idle_frame.envelope < frame.envelope && idle_frame.envelope > 0.0f);
     waywal_audio_fft_destroy(fft);
 
     const char *shadertoy_frag = "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
@@ -584,6 +601,20 @@ static void test_audio_fft_and_shader(void)
     assert(strstr(wrapped, "iChannel0") != NULL);
     assert(strstr(wrapped, "void main()") != NULL);
     free(wrapped);
+
+    /* Verify shader wrapper handles hundreds of #pragma waywal lines without overflow */
+    char many_lines[32768];
+    size_t off = 0;
+    for (int i = 0; i < 600 && off + 48 < sizeof(many_lines); ++i) {
+        off += (size_t)snprintf(many_lines + off, sizeof(many_lines) - off,
+                                "#pragma waywal channel0 = audio // %d\n", i + 1);
+    }
+    snprintf(many_lines + off, sizeof(many_lines) - off,
+             "void mainImage(out vec4 c, in vec2 f) { c = vec4(1.0); }\n");
+    char *wrapped_many = waywal_shader_wrap_source(many_lines);
+    assert(wrapped_many != NULL);
+    assert(strstr(wrapped_many, "//pragma waywal channel0 = audio // 600") != NULL);
+    free(wrapped_many);
 
     printf("  -> 2048-pt AVX2 Bark FFT & Shadertoy GLES 3.1 compute transpiler: PASSED\n");
 }
@@ -667,7 +698,7 @@ static void test_extended_subsystems(void)
     assert(cfg.workspace_count == 1U);
     assert(strcmp(cfg.workspaces[0].transition_type, "wipe") == 0);
 
-    /* Verify > UINT32_MAX is rejected by TOML parser (TOML-01) */
+    /* Verify values exceeding UINT32_MAX are rejected by the TOML parser */
     waywal_config_t bad_cfg;
     assert(!waywal_config_parse_string("[transition]\nfps = 4294967356\n", &bad_cfg, err,
                                        sizeof(err)));
@@ -920,10 +951,28 @@ static void test_phase1_phase2_subsystems(void)
         char *argv_fade[] = {"wwal", "img", "/tmp/wall.png", "--transition-type", "fade"};
         assert(cli_parse(5, argv_fade, &opts));
         assert(opts.transition_type == WAYWAL_TRANSITION_FADE);
+
+        char *argv_span_img[] = {"wwal", "img", "/tmp/wall.png", "--scaling-mode", "span"};
+        assert(cli_parse(5, argv_span_img, &opts));
+        assert(opts.scaling_mode == WAYWAL_SCALING_SPAN);
+
+        char *argv_span_sh[] = {"wwal", "shader", "/tmp/s.frag", "--scaling-mode", "span"};
+        assert(cli_parse(5, argv_span_sh, &opts));
+        assert(opts.cmd == CLI_CMD_SHADER);
+        assert(opts.scaling_mode == WAYWAL_SCALING_SPAN);
+
+        waywal_config_t span_cfg;
+        char span_err[128] = {0};
+        assert(waywal_config_parse_string("[output.\"DP-1\"]\npath = \"/tmp/a.png\"\nscaling = "
+                                          "\"span\"\n",
+                                          &span_cfg, span_err, sizeof(span_err)));
+        assert(span_cfg.output_count == 1U);
+        assert(span_cfg.outputs[0].scaling == WAYWAL_SCALING_SPAN);
     }
 
-    /* 6. Headless GPU Shader Engine: multi-pass, relative image(), depth-parallax & 10-bit FBO blit
-     */
+    /* 6. Headless GPU Shader Engine: multi-pass, relative image(), depth-parallax, 10-bit FBO blit,
+     *    GL_FRAGMENT_SHADER derivatives (dFdx/dFdy/fwidth) + mipmaps, span_rect, and multi-engine
+     *    concurrency */
     {
         dmabuf_context_t dctx;
         memset(&dctx, 0, sizeof(dctx));
@@ -997,6 +1046,81 @@ static void test_phase1_phase2_subsystems(void)
                     assert(waywal_shader_engine_load_depth_parallax(seng, wall_rgba, 2, 2,
                                                                     wall_rgba, 2, 2));
                     assert(waywal_shader_engine_render_frame(seng, &bo8, &fp));
+
+                    /* Test GL_FRAGMENT_SHADER hardware derivatives (dFdx/dFdy/fwidth) + mipmap
+                     * LOD bias + span_rect coordinate offset */
+                    const char *deriv_shader =
+                        "// #pragma waywal image.channel0 = noise\n"
+                        "// #pragma waywal image.channel1 = wallpaper\n"
+                        "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
+                        "    vec2 uv = fragCoord / iResolution.xy;\n"
+                        "    float dx = dFdx(fragCoord.x);\n"
+                        "    float dy = abs(dFdy(fragCoord.y));\n"
+                        "    float fw = fwidth(uv.x);\n"
+                        "    vec4 mip = textureLod(iChannel0, uv, 1.0) + texture(iChannel1, uv, "
+                        "0.5);\n"
+                        "    fragColor = vec4(clamp(dx * dy, 0.0, 1.0), uv.x, uv.y, 1.0) + 0.001 * "
+                        "(mip + fw);\n"
+                        "}\n";
+                    assert(waywal_shader_engine_load_source(seng, deriv_shader,
+                                                            "/tmp/wwal_deriv_shader.frag"));
+                    fp.span_rect[0] = 64.0f;
+                    fp.span_rect[1] = 0.0f;
+                    fp.span_rect[2] = 128.0f;
+                    fp.span_rect[3] = 64.0f;
+                    assert(waywal_shader_engine_render_frame(seng, &bo8, &fp));
+                    if (bo8.map_data) {
+                        const uint8_t *px = (const uint8_t *)bo8.map_data;
+                        /* Format is BGRA in little-endian XRGB8888: B=uv.y, G=uv.x, R=dx*dy */
+                        assert(px[2] > 200); /* dx * dy ~= 1.0 -> R > 200 */
+                        assert(px[1] > 120); /* span_rect.x=64 / 128 -> uv.x >= 0.5 -> G > 120 */
+                    }
+
+                    /* Test per-output multi-engine concurrency sharing dmabuf_context_t */
+                    waywal_shader_engine_t *seng2 = waywal_shader_engine_create(&dctx);
+                    assert(seng2 != NULL);
+                    const char *red_sh =
+                        "void mainImage(out vec4 c, in vec2 f) { c = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+                    const char *green_sh =
+                        "void mainImage(out vec4 c, in vec2 f) { c = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+                    assert(waywal_shader_engine_load_source(seng, red_sh, "/tmp/wwal_red.frag"));
+                    assert(
+                        waywal_shader_engine_load_source(seng2, green_sh, "/tmp/wwal_green.frag"));
+
+                    dmabuf_bo_t bo_second;
+                    memset(&bo_second, 0, sizeof(bo_second));
+                    if (dmabuf_bo_allocate(&dctx, &bo_second, 64, 64, DRM_FORMAT_XRGB8888,
+                                           DRM_FORMAT_MOD_LINEAR)) {
+                        memset(&fp, 0, sizeof(fp));
+                        fp.time_sec = 0.25f;
+                        fp.time_delta_sec = 0.016f;
+                        for (uint32_t iter = 0; iter < 3; ++iter) {
+                            fp.frame_index = iter;
+                            assert(waywal_shader_engine_render_frame(seng, &bo8, &fp));
+                            assert(waywal_shader_engine_render_frame(seng2, &bo_second, &fp));
+                        }
+                        if (bo8.map_data && bo_second.map_data) {
+                            const uint8_t *p1 = (const uint8_t *)bo8.map_data;
+                            const uint8_t *p2 = (const uint8_t *)bo_second.map_data;
+                            /* bo8 is pure red (B=0, G=0, R=255), bo_second is pure green (B=0,
+                             * G=255, R=0) */
+                            assert(p1[2] > 240 && p1[1] < 16 && p1[0] < 16);
+                            assert(p2[1] > 240 && p2[2] < 16 && p2[0] < 16);
+                        }
+                        waywal_shader_engine_forget_bo(seng2, &bo_second);
+                        dmabuf_bo_free(&bo_second);
+                    }
+                    assert(!waywal_shader_engine_uses_mouse(seng));
+                    assert(!waywal_shader_engine_uses_mouse(seng2));
+                    const char *mouse_sh = "void mainImage(out vec4 c, in vec2 f) { c = "
+                                           "vec4(iMouse.xy, 0.0, 1.0); }\n";
+                    assert(
+                        waywal_shader_engine_load_source(seng2, mouse_sh, "/tmp/wwal_mouse.frag"));
+                    assert(waywal_shader_engine_uses_mouse(seng2));
+                    assert(waywal_shader_engine_load_depth_parallax_bgra(seng2, wall_rgba, 2, 2,
+                                                                         wall_rgba, 2, 2));
+                    assert(waywal_shader_engine_uses_mouse(seng2));
+                    waywal_shader_engine_destroy(seng2);
                 }
 
                 dmabuf_bo_t bo10;
@@ -1011,8 +1135,11 @@ static void test_phase1_phase2_subsystems(void)
                     fp.time_delta_sec = 0.016f;
                     fp.frame_index = 2;
                     assert(waywal_shader_engine_render_frame(seng, &bo10, &fp));
+                    waywal_shader_engine_forget_bo(seng, &bo10);
                 }
 
+                if (has_bo8)
+                    waywal_shader_engine_forget_bo(seng, &bo8);
                 unlink(bmp_path);
                 waywal_shader_engine_destroy(seng);
                 if (has_bo10)

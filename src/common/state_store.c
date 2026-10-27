@@ -212,6 +212,7 @@ bool waywal_state_store_load_at(waywal_state_store_t *store, const char *file_pa
     for (uint32_t i = 0; i < loaded.count; ++i) {
         loaded.outputs[i].output_name[sizeof(loaded.outputs[i].output_name) - 1] = '\0';
         loaded.outputs[i].media_path[sizeof(loaded.outputs[i].media_path) - 1] = '\0';
+        loaded.outputs[i].prop_overrides[sizeof(loaded.outputs[i].prop_overrides) - 1] = '\0';
     }
 
     *store = loaded;
@@ -279,6 +280,7 @@ bool waywal_state_store_update_output(waywal_state_store_t *store,
             store->outputs[i] = *state;
             store->outputs[i].output_name[sizeof(store->outputs[i].output_name) - 1] = '\0';
             store->outputs[i].media_path[sizeof(store->outputs[i].media_path) - 1] = '\0';
+            store->outputs[i].prop_overrides[sizeof(store->outputs[i].prop_overrides) - 1] = '\0';
             return true;
         }
     }
@@ -290,6 +292,8 @@ bool waywal_state_store_update_output(waywal_state_store_t *store,
     store->outputs[store->count] = *state;
     store->outputs[store->count].output_name[sizeof(store->outputs[0].output_name) - 1] = '\0';
     store->outputs[store->count].media_path[sizeof(store->outputs[0].media_path) - 1] = '\0';
+    store->outputs[store->count].prop_overrides[sizeof(store->outputs[0].prop_overrides) - 1] =
+        '\0';
     store->count++;
     return true;
 }

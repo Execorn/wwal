@@ -123,6 +123,10 @@ typedef struct {
     uint8_t num_long_term_ref_pics_sps;
     bool sps_temporal_mvp_enabled_flag;
     bool strong_intra_smoothing_enabled_flag;
+    uint8_t colour_primaries;
+    uint8_t transfer_characteristics;
+    uint8_t matrix_coefficients;
+    bool video_full_range_flag;
     bool valid;
 } parsed_hevc_sps_t;
 

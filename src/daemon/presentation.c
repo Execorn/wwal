@@ -73,13 +73,15 @@ void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t ref
     } else {
         k = (raw_diff - pll->period_est_ns / 2) / pll->period_est_ns;
     }
-    int64_t error_ns = raw_diff - k * pll->period_est_ns;
+    int64_t predicted_hw_ns = pll->phase_est_ns + k * pll->period_est_ns;
+    int64_t error_ns = hw_time_ns - predicted_hw_ns;
     pll->jitter_ns = llabs(error_ns);
 
     int64_t alpha_correction = (int64_t)((float)error_ns * pll->alpha);
 
-    /* Update period with integral/frequency gain beta */
-    pll->period_est_ns += (int64_t)((float)error_ns * pll->beta);
+    /* Update period with integral/frequency gain beta (normalized by elapsed cycles) */
+    int64_t elapsed_cycles = (k >= 0) ? (k + 1) : 1;
+    pll->period_est_ns += (int64_t)(((float)error_ns * pll->beta) / (float)elapsed_cycles);
 
     /* Clamp estimated period: 1ms (1000Hz) to 100ms (10Hz) */
     if (pll->period_est_ns < 1000000LL)
@@ -87,8 +89,8 @@ void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t ref
     if (pll->period_est_ns > 100000000LL)
         pll->period_est_ns = 100000000LL;
 
-    /* Update phase anchor */
-    pll->phase_est_ns = hw_time_ns + alpha_correction + pll->period_est_ns;
+    /* Update phase anchor from prior prediction rather than noisy measurement */
+    pll->phase_est_ns = predicted_hw_ns + alpha_correction + pll->period_est_ns;
     pll->last_hardware_time = hw_time_ns;
     pll->frame_seq++;
 

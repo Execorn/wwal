@@ -204,19 +204,18 @@ static void display_current_image(slideshow_engine_t *ss)
     if (st->on_wallpaper_loaded) {
         st->on_wallpaper_loaded(st, pixels, img_w, img_h, meta);
     } else if (img_w > 0 && img_h > 0) {
-        size_t count = (size_t)img_w * (size_t)img_h;
-        uint8_t *rgba = (uint8_t *)malloc(count * 4U);
-        if (rgba) {
-            for (size_t i = 0; i < count; ++i) {
-                rgba[i * 4 + 0] = pixels[i * 4 + 2];
-                rgba[i * 4 + 1] = pixels[i * 4 + 1];
-                rgba[i * 4 + 2] = pixels[i * 4 + 0];
-                rgba[i * 4 + 3] = pixels[i * 4 + 3];
+        size_t byte_len = (size_t)img_w * (size_t)img_h * 4U;
+        if (!st->wallpaper_rgba || st->wallpaper_w != img_w || st->wallpaper_h != img_h) {
+            uint8_t *buf = (uint8_t *)malloc(byte_len);
+            if (buf) {
+                free(st->wallpaper_rgba);
+                st->wallpaper_rgba = buf;
+                st->wallpaper_w = img_w;
+                st->wallpaper_h = img_h;
             }
-            free(st->wallpaper_rgba);
-            st->wallpaper_rgba = rgba;
-            st->wallpaper_w = img_w;
-            st->wallpaper_h = img_h;
+        }
+        if (st->wallpaper_rgba && st->wallpaper_w == img_w && st->wallpaper_h == img_h) {
+            memcpy(st->wallpaper_rgba, pixels, byte_len);
         }
         waywal_scheme_variant_t variant =
             waywal_scheme_variant_from_str(st->config.theme.scheme_variant);

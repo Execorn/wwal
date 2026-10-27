@@ -205,6 +205,7 @@ common_sources = files(
   'src/common/palette_hct.c',
   'src/common/toml_parser.c',
   'src/common/state_store.c',
+  'src/daemon/we_pkg.c',
 )
 
 common_lib = static_library('waywal_common',
@@ -244,7 +245,14 @@ daemon_sources = files(
   'src/daemon/anim_engine.c',
   'src/daemon/power_governor.c',
   'src/daemon/audio_fft.c',
+  'src/daemon/mpris.c',
   'src/daemon/shader_engine.c',
+  'src/daemon/we_tex.c',
+  'src/daemon/we_shader.c',
+  'src/daemon/we_puppet.c',
+  'src/daemon/we_particle.c',
+  'src/daemon/we_script.c',
+  'src/daemon/we_scene.c',
   'src/client/image_loader.c',
 )
 
@@ -294,6 +302,7 @@ client_sources = files(
   'src/client/cli_parser.c',
   'src/client/image_loader.c',
   'src/client/gif_transcode.c',
+  'src/daemon/we_scene.c',
 )
 
 client_deps = [common_dep, threads_dep, m_dep]
@@ -306,6 +315,7 @@ endif
 
 wwal = executable('wwal',
   client_sources,
+  c_args: ['-DWWAL_WE_PROJECT_ONLY'],
   include_directories: inc_dir,
   dependencies: client_deps,
   install: true
@@ -556,6 +566,13 @@ if get_option('tests')
     m_dep,
     dl_dep
   ]
+  if have_ffmpeg_swdec
+    test_subsystems_deps += [
+      avcodec_dep.partial_dependency(compile_args: true, includes: true),
+      avutil_dep.partial_dependency(compile_args: true, includes: true),
+      swscale_dep.partial_dependency(compile_args: true, includes: true),
+    ]
+  endif
   if openmp_dep.found()
     test_subsystems_deps += openmp_dep
   endif
@@ -573,6 +590,7 @@ if get_option('tests')
     'src/daemon/anim_engine.c',
     'src/daemon/power_governor.c',
     'src/daemon/audio_fft.c',
+    'src/daemon/mpris.c',
     'src/daemon/shader_engine.c',
     'src/daemon/gpu_compute.c',
     'src/daemon/dmabuf_alloc.c',
@@ -582,6 +600,29 @@ if get_option('tests')
   )
 
   test('subsystems', test_subsystems_exe)
+
+  test_we_core_exe = executable('test_we_core',
+    'tests/test_we_core.c',
+    'src/client/cli_parser.c',
+    'src/client/image_loader.c',
+    'src/daemon/demuxer.c',
+    'src/daemon/audio_fft.c',
+    'src/daemon/mpris.c',
+    'src/daemon/shader_engine.c',
+    'src/daemon/gpu_compute.c',
+    'src/daemon/we_tex.c',
+    'src/daemon/we_shader.c',
+    'src/daemon/we_puppet.c',
+    'src/daemon/we_particle.c',
+    'src/daemon/we_script.c',
+    'src/daemon/we_scene.c',
+    'src/daemon/dmabuf_alloc.c',
+    'src/daemon/dmabuf_feedback.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: test_subsystems_deps
+  )
+
+  test('we_core', test_we_core_exe, depends: [wwal, wwald], timeout: 120)
 
   fuzz_demuxer_exe = executable('fuzz_demuxer',
     'tests/fuzz/fuzz_demuxer.c',

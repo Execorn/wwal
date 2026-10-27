@@ -59,6 +59,7 @@ void waywal_power_governor_set_pause_policies(waywal_power_governor_t *gov,
 
 void waywal_power_governor_set_output_reason(waywal_power_governor_t *gov, const char *output_name,
                                              waywal_pause_reason_t reason, bool active);
+void waywal_power_governor_remove_output(waywal_power_governor_t *gov, const char *output_name);
 void waywal_power_governor_set_global_reason(waywal_power_governor_t *gov,
                                              waywal_pause_reason_t reason, bool active);
 

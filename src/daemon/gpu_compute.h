@@ -56,11 +56,17 @@ bool gpu_compute_upload_static(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, 
                                uint32_t src_h, dmabuf_bo_t *dst_bo, waywal_scaling_mode_t scaling,
                                uint32_t clear_color);
 
+bool gpu_compute_scale_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *src_bo, dmabuf_bo_t *dst_bo,
+                          waywal_scaling_mode_t scaling, uint32_t clear_color, bool release_src_gl);
+
+void gpu_compute_make_current(gpu_compute_ctx_t *ctx);
+
 void gpu_compute_set_span_bounds(gpu_compute_ctx_t *ctx, int32_t off_x, int32_t off_y,
                                  int32_t total_w, int32_t total_h);
 
 bool gpu_compute_render_kawase_blur(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, uint32_t src_w,
                                     uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t radius);
+void gpu_compute_bump_upload_gen(gpu_compute_ctx_t *ctx);
 
 void layer_shell_blur_rgba_cpu(const uint8_t *src, uint8_t *dst, uint32_t w, uint32_t h);
 

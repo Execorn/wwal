@@ -284,6 +284,80 @@ static void test_gpu_compute_nonlinear_and_upload_static(void)
                                        WAYWAL_SCALING_CENTER, 0xFF1A2B3CU));
     assert(render_engine_upload_static(&re, (const uint8_t *)src_pixels, 32, 16, &dst_bo,
                                        WAYWAL_SCALING_TILE, 0xFF000000U));
+    render_engine_set_span_bounds(&re, 64, 0, 128, 64);
+    assert(render_engine_upload_static(&re, (const uint8_t *)src_pixels, 32, 16, &dst_bo,
+                                       WAYWAL_SCALING_SPAN, 0xFF000000U));
+
+    /* Verify WAYWAL_SCALING_SPAN pixel partitioning across left and right monitors + copy_bo */
+    ctx.map_supported = true;
+    dmabuf_bo_t left_bo, right_bo, copy_bo;
+    if (dmabuf_bo_allocate(&ctx, &left_bo, 64, 64, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR) &&
+        dmabuf_bo_allocate(&ctx, &right_bo, 64, 64, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR) &&
+        dmabuf_bo_allocate(&ctx, &copy_bo, 64, 64, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR)) {
+        uint32_t span_src[4 * 2] = {
+            0xFFFF0000U, 0xFFFF0000U, 0xFF0000FFU, 0xFF0000FFU,
+            0xFFFF0000U, 0xFFFF0000U, 0xFF0000FFU, 0xFF0000FFU,
+        };
+        render_engine_set_span_bounds(&re, 0, 0, 128, 64);
+        assert(render_engine_upload_static(&re, (const uint8_t *)span_src, 4, 2, &left_bo,
+                                           WAYWAL_SCALING_SPAN, 0xFF000000U));
+        render_engine_set_span_bounds(&re, 64, 0, 128, 64);
+        assert(render_engine_upload_static(&re, (const uint8_t *)span_src, 4, 2, &right_bo,
+                                           WAYWAL_SCALING_SPAN, 0xFF000000U));
+        assert(render_engine_copy_bo(&re, &copy_bo, &left_bo, WAYWAL_SCALING_STRETCH, 0xFF000000U,
+                                     false));
+        if (left_bo.map_data && right_bo.map_data && copy_bo.map_data) {
+            const uint8_t *pl = (const uint8_t *)left_bo.map_data;
+            const uint8_t *pr = (const uint8_t *)right_bo.map_data;
+            const uint8_t *pc = (const uint8_t *)copy_bo.map_data;
+            assert(pl[2] > 200 && pl[0] < 32);
+            assert(pr[0] > 200 && pr[2] < 32);
+            assert(pc[2] > 200 && pc[0] < 32);
+        }
+        /* Verify texel-center symmetry when scaling 2x2 [Red, Blue] to 64x64 */
+        uint32_t sym_src[2 * 2] = {
+            0xFFFF0000U,
+            0xFF0000FFU,
+            0xFFFF0000U,
+            0xFF0000FFU,
+        };
+        assert(render_engine_upload_static(&re, (const uint8_t *)sym_src, 2, 2, &left_bo,
+                                           WAYWAL_SCALING_STRETCH, 0xFF000000U));
+        if (left_bo.map_data) {
+            const uint8_t *row0 = (const uint8_t *)left_bo.map_data;
+            /* At x=15 (s_px.x = 0.484 <= 0.5), texel must be 100% Red, not shifted toward Blue */
+            const uint8_t *px15 = row0 + 15 * 4;
+            const uint8_t *px48 = row0 + 48 * 4;
+            assert(px15[2] > 240 && px15[0] < 16);
+            assert(px48[0] > 240 && px48[2] < 16);
+        }
+        render_engine_release_bo(&re, &left_bo);
+        render_engine_release_bo(&re, &right_bo);
+        render_engine_release_bo(&re, &copy_bo);
+        dmabuf_bo_free(&left_bo);
+        dmabuf_bo_free(&right_bo);
+        dmabuf_bo_free(&copy_bo);
+    }
+    ctx.map_supported = false;
+
+    /* Test live cross-mode GPU snapshot (render_engine_copy_bo) + transition */
+    dmabuf_bo_t snapshot_bo, new_bo;
+    assert(dmabuf_bo_allocate(&ctx, &snapshot_bo, 64, 64, DRM_FORMAT_ARGB8888,
+                              DRM_FORMAT_MOD_INVALID));
+    assert(dmabuf_bo_allocate(&ctx, &new_bo, 64, 64, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID));
+    assert(render_engine_copy_bo(&re, &snapshot_bo, &dst_bo, WAYWAL_SCALING_STRETCH, 0xFF000000U,
+                                 false));
+    assert(render_engine_upload_static(&re, NULL, 0, 0, &new_bo, WAYWAL_SCALING_FILL, 0xFF00FF00U));
+    waywal_transition_params_t cross_params = {
+        .type = WAYWAL_TRANSITION_FADE,
+        .progress = 0.5f,
+        .bezier = BEZIER_DEFAULT,
+    };
+    assert(render_engine_execute_transition(&re, &dst_bo, &snapshot_bo, &new_bo, &cross_params));
+    render_engine_release_bo(&re, &snapshot_bo);
+    render_engine_release_bo(&re, &new_bo);
+    dmabuf_bo_free(&snapshot_bo);
+    dmabuf_bo_free(&new_bo);
 
     render_engine_release_bo(&re, &dst_bo);
     dmabuf_bo_free(&dst_bo);
@@ -374,6 +448,26 @@ static void test_cpu_transitions(void)
             assert(dst[p] == src_b[p]);
         }
     }
+
+    /* Verify WAYWAL_TRANSITION_PAGE_CURL respects angle_rad */
+    uint32_t *dst_angle0 = (uint32_t *)calloc(num_pixels, sizeof(uint32_t));
+    uint32_t *dst_angle90 = (uint32_t *)calloc(num_pixels, sizeof(uint32_t));
+    assert(dst_angle0 && dst_angle90);
+    waywal_transition_params_t curl0 = {
+        .type = WAYWAL_TRANSITION_PAGE_CURL,
+        .progress = 0.45f,
+        .angle_rad = 0.0f,
+        .bezier = BEZIER_DEFAULT,
+    };
+    waywal_transition_params_t curl90 = curl0;
+    curl90.angle_rad = 1.5707963f;
+    assert(render_engine_execute_cpu_transition(dst_angle0, src_a, src_b, width, height,
+                                                width * sizeof(uint32_t), &curl0));
+    assert(render_engine_execute_cpu_transition(dst_angle90, src_a, src_b, width, height,
+                                                width * sizeof(uint32_t), &curl90));
+    assert(memcmp(dst_angle0, dst_angle90, num_pixels * sizeof(uint32_t)) != 0);
+    free(dst_angle0);
+    free(dst_angle90);
 
     free(dst);
     free(src_a);

@@ -41,6 +41,7 @@ struct waywal_power_governor;
 struct waywal_shader_engine;
 struct waywal_audio_fft;
 struct waywal_anim_decoder;
+struct waywal_mpris;
 
 typedef struct daemon_state {
     arena_t persistent_arena;
@@ -90,6 +91,10 @@ typedef struct daemon_state {
 
     struct waywal_power_governor *power_gov;
     struct waywal_shader_engine *shader_eng;
+    struct we_scene *we_scene;
+    bool workshop_active;
+    char workshop_dir[4096];
+    char workshop_props[2048];
     struct waywal_audio_fft *audio_fft;
     int shader_timer_fd;
     bool shader_active;
@@ -135,12 +140,12 @@ typedef struct daemon_state {
     uring_loop_t *uring_loop;
     bool use_uring;
 
-    /* Unified Display Output Manager (ARCH-05) */
+    /* Unified display output manager */
     output_manager_t output_mgr;
     output_node_t *outputs;
     size_t num_outputs;
 
-    /* Asynchronous Transitions Engine (BUG-03, BUG-04) */
+    /* Asynchronous transitions timer state */
     int transition_timer_fd;
     bool transitions_in_progress;
 
@@ -154,6 +159,14 @@ typedef struct daemon_state {
     char backdrop_path[4096];
     char namespace_str[64];
     color_rgba_t current_color;
+
+    struct waywal_mpris *mpris;
+    int subscriber_fds[16];
+    size_t num_subscribers;
+    bool theme_from_media;
+    bool media_palette_active;
+    float audio_volume;
+    bool mute_on_audio;
 } daemon_state_t;
 
 bool daemon_wayland_init(daemon_state_t *state);
@@ -179,6 +192,8 @@ void output_node_render_image_with_transition(daemon_state_t *state, output_node
                                               const waywal_img_metadata_t *meta);
 
 void layer_shell_update_input_regions(daemon_state_t *state, bool interactive);
+void layer_shell_compute_span_bounds(daemon_state_t *state, output_node_t *target);
+void layer_shell_snapshot_live_output(daemon_state_t *state, output_node_t *out);
 void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
                                  size_t dst_stride_bytes, const uint32_t *src, uint32_t src_w,
                                  uint32_t src_h, int32_t span_off_x, int32_t span_off_y,
@@ -188,6 +203,8 @@ void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
 void daemon_clear_all_outputs(daemon_state_t *state, color_rgba_t color);
 void daemon_handle_ipc_connection(daemon_state_t *state);
 void layer_shell_blur_rgba_cpu(const uint8_t *src, uint8_t *dst, uint32_t w, uint32_t h);
+void reconcile_global_engine_flags(daemon_state_t *state);
+void daemon_reconcile_power_state(daemon_state_t *state);
 
 #ifdef __cplusplus
 }

@@ -461,6 +461,8 @@ done:
     return out_pos > 0;
 }
 
+static uint8_t *ensure_scratch_buf(waywal_anim_decoder_t *dec, size_t needed);
+
 static bool init_gif_decoder(waywal_anim_decoder_t *dec)
 {
     const uint8_t *data = dec->raw_data;
@@ -596,8 +598,21 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
         return false;
     }
     dec->canvas = (uint8_t *)calloc(1, canvas_bytes);
-    dec->prev_canvas = (uint8_t *)calloc(1, canvas_bytes);
-    return dec->canvas != NULL && dec->prev_canvas != NULL;
+    if (!dec->canvas) {
+        return false;
+    }
+
+    size_t max_frame_pixels = 0;
+    for (uint32_t i = 0; i < dec->frame_count; ++i) {
+        size_t fp = (size_t)dec->gif_frames[i].width * (size_t)dec->gif_frames[i].height;
+        if (fp > max_frame_pixels) {
+            max_frame_pixels = fp;
+        }
+    }
+    if (max_frame_pixels > 0 && !ensure_scratch_buf(dec, max_frame_pixels)) {
+        return false;
+    }
+    return true;
 }
 
 static uint8_t *ensure_scratch_buf(waywal_anim_decoder_t *dec, size_t needed)
@@ -625,7 +640,13 @@ static bool step_gif_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba,
 
     const gif_frame_meta_t *f = &dec->gif_frames[dec->current_frame];
     if (f->disposal == 3) {
-        memcpy(dec->prev_canvas, dec->canvas, (size_t)dec->canvas_w * dec->canvas_h * 4u);
+        size_t canvas_bytes = (size_t)dec->canvas_w * dec->canvas_h * 4u;
+        if (!dec->prev_canvas) {
+            dec->prev_canvas = (uint8_t *)calloc(1, canvas_bytes);
+        }
+        if (dec->prev_canvas) {
+            memcpy(dec->prev_canvas, dec->canvas, canvas_bytes);
+        }
     }
 
     size_t num_pixels = (size_t)f->width * f->height;
@@ -1099,8 +1120,15 @@ static bool init_apng_decoder(waywal_anim_decoder_t *dec)
         return false;
     }
     dec->canvas = (uint8_t *)calloc(1, canvas_bytes);
-    dec->prev_canvas = (uint8_t *)calloc(1, canvas_bytes);
-    return dec->canvas != NULL && dec->prev_canvas != NULL;
+    if (!dec->canvas) {
+        return false;
+    }
+
+    /* All compressed frame chunks are stored in apng_frames[i].zdata; free raw_data immediately */
+    free(dec->raw_data);
+    dec->raw_data = NULL;
+    dec->raw_size = 0;
+    return true;
 }
 
 static uint32_t png_bytes_per_pixel(uint8_t color_type)
@@ -1132,7 +1160,13 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
 
     const apng_frame_t *f = &dec->apng_frames[dec->current_frame];
     if (f->dispose_op == 2) {
-        memcpy(dec->prev_canvas, dec->canvas, (size_t)dec->canvas_w * dec->canvas_h * 4u);
+        size_t canvas_bytes = (size_t)dec->canvas_w * dec->canvas_h * 4u;
+        if (!dec->prev_canvas) {
+            dec->prev_canvas = (uint8_t *)calloc(1, canvas_bytes);
+        }
+        if (dec->prev_canvas) {
+            memcpy(dec->prev_canvas, dec->canvas, canvas_bytes);
+        }
     }
 
     uint32_t bpp = png_bytes_per_pixel(dec->png_color_type);

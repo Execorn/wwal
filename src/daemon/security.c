@@ -134,17 +134,25 @@ static void apply_landlock_sandbox(const char *runtime_dir)
     }
 
     const __u64 ro_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+    const __u64 rx_access = ro_access | LANDLOCK_ACCESS_FS_EXECUTE;
     const __u64 rw_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
                             LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_MAKE_REG |
-                            LANDLOCK_ACCESS_FS_REMOVE_FILE;
+                            LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_EXECUTE;
+
+    /* Allow read+execute on standard system binary/library mounts for DRM/Mesa/VA-API and user
+     * hooks */
+    const char *rx_paths[] = {"/usr", "/bin", "/sbin", "/lib", "/lib64", NULL};
+    for (int i = 0; rx_paths[i] != NULL; ++i) {
+        add_landlock_dir_rule(ruleset_fd, rx_paths[i], rx_access);
+    }
 
     /* Allow read-only across standard system mounts required for DRM/Mesa/VA-API drivers */
-    const char *ro_paths[] = {"/usr", "/etc", "/sys", "/proc", "/dev", "/dev/dri", "/tmp", NULL};
+    const char *ro_paths[] = {"/etc", "/sys", "/proc", "/dev", "/dev/dri", "/tmp", NULL};
     for (int i = 0; ro_paths[i] != NULL; ++i) {
         add_landlock_dir_rule(ruleset_fd, ro_paths[i], ro_access);
     }
 
-    /* Allow read-write strictly for DRI/GPU device nodes (/dev, /dev/dri) and /tmp (ARCH-07) */
+    /* Allow read-write strictly for DRI/GPU device nodes (/dev, /dev/dri) and /tmp */
     const char *rw_paths[] = {"/dev", "/dev/dri", "/tmp", NULL};
     for (int i = 0; rw_paths[i] != NULL; ++i) {
         int dir_fd = open(rw_paths[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
@@ -169,7 +177,13 @@ static void apply_landlock_sandbox(const char *runtime_dir)
 
     const char *xdg_cfg = getenv("XDG_CONFIG_HOME");
     if (xdg_cfg && xdg_cfg[0]) {
-        add_landlock_dir_rule(ruleset_fd, xdg_cfg, ro_access);
+        mkdir_p_user_dir(xdg_cfg);
+        add_landlock_dir_rule(ruleset_fd, xdg_cfg, rw_access);
+    }
+
+    const char *xdg_data = getenv("XDG_DATA_HOME");
+    if (xdg_data && xdg_data[0]) {
+        add_landlock_dir_rule(ruleset_fd, xdg_data, ro_access);
     }
 
     const char *xdg_pics = getenv("XDG_PICTURES_DIR");
@@ -195,6 +209,8 @@ static void apply_landlock_sandbox(const char *runtime_dir)
 
     const char *xdg_cache = getenv("XDG_CACHE_HOME");
     if (xdg_cache && xdg_cache[0]) {
+        mkdir_p_user_dir(xdg_cache);
+        add_landlock_dir_rule(ruleset_fd, xdg_cache, rw_access);
         char cache_wwal[4096];
         snprintf(cache_wwal, sizeof(cache_wwal), "%s/wwal", xdg_cache);
         mkdir_p_user_dir(cache_wwal);
@@ -203,6 +219,8 @@ static void apply_landlock_sandbox(const char *runtime_dir)
 
     const char *xdg_state = getenv("XDG_STATE_HOME");
     if (xdg_state && xdg_state[0]) {
+        mkdir_p_user_dir(xdg_state);
+        add_landlock_dir_rule(ruleset_fd, xdg_state, rw_access);
         char state_wwal[4096];
         snprintf(state_wwal, sizeof(state_wwal), "%s/wwal", xdg_state);
         mkdir_p_user_dir(state_wwal);
@@ -241,7 +259,14 @@ static void apply_landlock_sandbox(const char *runtime_dir)
         }
 
         const char *home_ro_subdirs[] = {
-            "Pictures", "Videos", "Wallpapers", "Downloads", ".config", ".local/share/wallpapers",
+            "Pictures",
+            "Videos",
+            "Wallpapers",
+            "Downloads",
+            ".config",
+            ".local",
+            ".local/share/wallpapers",
+            ".local/share/Steam",
         };
         for (size_t i = 0; i < sizeof(home_ro_subdirs) / sizeof(home_ro_subdirs[0]); ++i) {
             snprintf(path_buf, sizeof(path_buf), "%s/%s", home, home_ro_subdirs[i]);
@@ -251,6 +276,7 @@ static void apply_landlock_sandbox(const char *runtime_dir)
         const char *home_rw_subdirs[] = {
             ".cache",       ".cache/wwal",       ".local",
             ".local/state", ".local/state/wwal", ".local/state/caelestia",
+            ".config",      ".config/wwal",
         };
         for (size_t i = 0; i < sizeof(home_rw_subdirs) / sizeof(home_rw_subdirs[0]); ++i) {
             snprintf(path_buf, sizeof(path_buf), "%s/%s", home, home_rw_subdirs[i]);
@@ -277,13 +303,12 @@ bool security_sandbox_apply(const char *runtime_dir)
     apply_landlock_sandbox(runtime_dir);
 
 #ifdef HAVE_LIBSECCOMP
-    /* 3. Seccomp-BPF syscall sandbox (SOTA-09) */
+    /* 3. Seccomp-BPF syscall sandbox */
     scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ERRNO(EPERM));
     if (ctx) {
-        /* Denied Dangerous Syscalls -> SCMP_ACT_KILL (SOTA-09) */
+        /* Immediately terminate process on high-risk kernel/namespace syscalls */
         const int denied_syscalls[] = {
-            SCMP_SYS(execve),      SCMP_SYS(execveat),      SCMP_SYS(fork),   SCMP_SYS(vfork),
-            SCMP_SYS(ptrace),      SCMP_SYS(kill),          SCMP_SYS(mount),  SCMP_SYS(umount2),
+            SCMP_SYS(execveat),    SCMP_SYS(ptrace),        SCMP_SYS(mount),  SCMP_SYS(umount2),
             SCMP_SYS(chroot),      SCMP_SYS(pivot_root),    SCMP_SYS(reboot), SCMP_SYS(kexec_load),
             SCMP_SYS(init_module), SCMP_SYS(delete_module), SCMP_SYS(bpf),
         };
@@ -294,22 +319,23 @@ bool security_sandbox_apply(const char *runtime_dir)
             }
         }
 
-        /* Clone handling: allow threads (CLONE_THREAD for driver worker threads), kill process
-         * forking */
-        seccomp_rule_add(
-            ctx, SCMP_ACT_ALLOW, SCMP_SYS(clone), 1,
-            SCMP_A0(SCMP_CMP_MASKED_EQ, (scmp_datum_t)CLONE_THREAD, (scmp_datum_t)CLONE_THREAD));
-        seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, SCMP_SYS(clone), 1,
-                         SCMP_A0(SCMP_CMP_MASKED_EQ, (scmp_datum_t)CLONE_THREAD, 0));
-
-        /* Route clone3 to ENOSYS so libc falls back to clone(CLONE_THREAD) */
-        if (SCMP_SYS(clone3) != __NR_SCMP_ERROR) {
-            seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(clone3), 0);
-        }
-
-        /* Explicitly Allowed Syscalls -> SCMP_ACT_ALLOW (SOTA-09) */
+        /* Explicitly allowed syscalls for Wayland, DRM/GBM, PipeWire, and user hooks */
         const int allowed_syscalls[] = {
-            /* Core SOTA-09 allowlist */
+            /* Process spawning for user-configured wallpaper/theme hooks */
+            SCMP_SYS(clone),
+            SCMP_SYS(clone3),
+            SCMP_SYS(fork),
+            SCMP_SYS(vfork),
+            SCMP_SYS(execve),
+            SCMP_SYS(kill),
+            SCMP_SYS(arch_prctl),
+            SCMP_SYS(set_tid_address),
+            SCMP_SYS(getppid),
+            SCMP_SYS(getpgrp),
+            SCMP_SYS(getpgid),
+            SCMP_SYS(setpgid),
+            SCMP_SYS(setsid),
+            /* Core I/O, memory, and event loop allowlist */
             SCMP_SYS(read),
             SCMP_SYS(write),
             SCMP_SYS(recvmsg),
@@ -331,6 +357,8 @@ bool security_sandbox_apply(const char *runtime_dir)
 
             /* Extended async/polling support */
             SCMP_SYS(ppoll),
+            SCMP_SYS(select),
+            SCMP_SYS(pselect6),
             SCMP_SYS(epoll_create1),
             SCMP_SYS(epoll_create),
             SCMP_SYS(epoll_ctl),
@@ -381,9 +409,14 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(getdents64),
             SCMP_SYS(readlink),
             SCMP_SYS(readlinkat),
+            SCMP_SYS(getcwd),
+            SCMP_SYS(chdir),
+            SCMP_SYS(fchdir),
+            SCMP_SYS(umask),
 
             /* Sockets & IPC */
             SCMP_SYS(socket),
+            SCMP_SYS(socketpair),
             SCMP_SYS(connect),
             SCMP_SYS(bind),
             SCMP_SYS(listen),
@@ -439,6 +472,11 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(sched_get_priority_max),
             SCMP_SYS(sched_get_priority_min),
             SCMP_SYS(rseq),
+            SCMP_SYS(prlimit64),
+            SCMP_SYS(getrlimit),
+            SCMP_SYS(setrlimit),
+            SCMP_SYS(wait4),
+            SCMP_SYS(waitid),
             SCMP_SYS(getrandom),
             SCMP_SYS(sysinfo),
             SCMP_SYS(uname),

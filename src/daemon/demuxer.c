@@ -32,6 +32,7 @@ typedef struct {
     mp4_sample_entry_t *samples;
     size_t num_samples;
     size_t current_sample_idx;
+    size_t last_evicted_offset;
 } mp4_state_t;
 
 static inline uint16_t read_u16_be(const uint8_t *p)
@@ -50,6 +51,37 @@ static inline uint64_t read_u64_be(const uint8_t *p)
     return ((uint64_t)read_u32_be(p) << 32) | (uint64_t)read_u32_be(p + 4);
 }
 
+static void evict_mmap_chunk(const demuxer_t *d, size_t *last_evicted_offset, size_t consumed_end)
+{
+    if (!d || !d->mapped_buf || !last_evicted_offset)
+        return;
+    if (consumed_end < *last_evicted_offset) {
+        *last_evicted_offset = consumed_end & ~(size_t)4095U;
+        return;
+    }
+    if (consumed_end - *last_evicted_offset < (256U * 1024U))
+        return;
+
+    uintptr_t base = (uintptr_t)d->mapped_buf;
+    uintptr_t p_start = (base + *last_evicted_offset) & ~(uintptr_t)4095U;
+    uintptr_t p_end = (base + consumed_end) & ~(uintptr_t)4095U;
+    if (d->extradata) {
+        uintptr_t ex_start = ((uintptr_t)d->extradata) & ~(uintptr_t)4095U;
+        uintptr_t ex_end =
+            ((uintptr_t)d->extradata + d->extradata_size + 4095U) & ~(uintptr_t)4095U;
+        if (ex_start < p_end && ex_end > p_start) {
+            if (ex_start > p_start) {
+                madvise((void *)p_start, (size_t)(ex_start - p_start), MADV_DONTNEED);
+            }
+            p_start = ex_end;
+        }
+    }
+    if (p_end > p_start) {
+        madvise((void *)p_start, (size_t)(p_end - p_start), MADV_DONTNEED);
+    }
+    *last_evicted_offset = consumed_end & ~(size_t)4095U;
+}
+
 static bool mp4_read_packet(demuxer_t *d, demux_packet_t *pkt)
 {
     if (!d || !d->internal_state || !pkt)
@@ -62,18 +94,7 @@ static bool mp4_read_packet(demuxer_t *d, demux_packet_t *pkt)
 
     if (st->owns_mmap && st->current_sample_idx > 0) {
         const mp4_sample_entry_t *prev = &st->samples[st->current_sample_idx - 1];
-        uintptr_t base = (uintptr_t)d->mapped_buf;
-        uintptr_t p_start = (base + prev->offset) & ~(uintptr_t)4095U;
-        uintptr_t p_end = (base + prev->offset + prev->size) & ~(uintptr_t)4095U;
-        if (d->extradata) {
-            uintptr_t ex_page = ((uintptr_t)d->extradata) & ~(uintptr_t)4095U;
-            if (ex_page >= p_start && ex_page < p_end) {
-                p_start = p_end;
-            }
-        }
-        if (p_end > p_start) {
-            madvise((void *)p_start, (size_t)(p_end - p_start), MADV_DONTNEED);
-        }
+        evict_mmap_chunk(d, &st->last_evicted_offset, prev->offset + prev->size);
     }
 
     const mp4_sample_entry_t *s = &st->samples[st->current_sample_idx++];
@@ -107,6 +128,7 @@ static bool mp4_seek_us(demuxer_t *d, int64_t target_pts_us)
 
     if (target_pts_us <= 0) {
         st->current_sample_idx = 0;
+        st->last_evicted_offset = 0;
         return true;
     }
 
@@ -122,6 +144,7 @@ static bool mp4_seek_us(demuxer_t *d, int64_t target_pts_us)
     }
 
     st->current_sample_idx = best_idx;
+    st->last_evicted_offset = st->samples[best_idx].offset & ~(size_t)4095U;
     return true;
 }
 
@@ -430,7 +453,7 @@ static void parse_moov(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
 }
 
 /* =========================================================================
- * EBML / Matroska / WebM Demuxer Implementation (PERF-07)
+ * EBML / Matroska / WebM Demuxer Implementation
  * ========================================================================= */
 
 #define EBML_ID_HEADER          0x1A45DFA3
@@ -470,6 +493,7 @@ typedef struct {
     webm_sample_entry_t *samples;
     size_t num_samples;
     size_t current_sample_idx;
+    size_t last_evicted_offset;
 
     webm_sample_entry_t lace_queue[64];
     uint32_t lace_head;
@@ -545,6 +569,11 @@ static bool webm_read_packet(demuxer_t *d, demux_packet_t *pkt)
         return false; /* End of stream */
     }
 
+    if (st->owns_mmap && st->current_sample_idx > 0) {
+        const webm_sample_entry_t *prev = &st->samples[st->current_sample_idx - 1];
+        evict_mmap_chunk(d, &st->last_evicted_offset, prev->offset + prev->size);
+    }
+
     const webm_sample_entry_t *s = &st->samples[st->current_sample_idx++];
     if (s->offset + s->size > d->mapped_size) {
         return false;
@@ -568,8 +597,17 @@ static bool webm_seek_us(demuxer_t *d, int64_t target_pts_us)
     if (st->num_samples == 0)
         return false;
 
+    if (st->owns_mmap && d->mapped_buf && d->mapped_size >= 4096) {
+        uintptr_t base = ((uintptr_t)d->mapped_buf + 4095U) & ~(uintptr_t)4095U;
+        uintptr_t end = ((uintptr_t)d->mapped_buf + d->mapped_size) & ~(uintptr_t)4095U;
+        if (end > base) {
+            madvise((void *)base, (size_t)(end - base), MADV_DONTNEED);
+        }
+    }
+
     if (target_pts_us <= 0) {
         st->current_sample_idx = 0;
+        st->last_evicted_offset = 0;
         return true;
     }
 
@@ -584,6 +622,7 @@ static bool webm_seek_us(demuxer_t *d, int64_t target_pts_us)
     }
 
     st->current_sample_idx = best_idx;
+    st->last_evicted_offset = st->samples[best_idx].offset & ~(size_t)4095U;
     return true;
 }
 

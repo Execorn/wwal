@@ -32,7 +32,7 @@ typedef struct {
     uint64_t loop_id;
 } video_reorder_entry_t;
 
-typedef struct {
+typedef struct video_engine {
     waywal_video_state_t state;
     demuxer_t *demuxer;
     vaapi_decoder_t decoder;
@@ -52,9 +52,10 @@ typedef struct {
     int32_t next_present_poc;
     bool has_decoded_any;
     struct wl_buffer *video_wl_buffers[WAYWAL_VA_SURFACE_POOL_SIZE];
-    bool video_buffer_in_use[WAYWAL_VA_SURFACE_POOL_SIZE];
+    int video_buffer_in_use[WAYWAL_VA_SURFACE_POOL_SIZE];
     bool combined_busy_mask[WAYWAL_VA_SURFACE_POOL_SIZE];
     uint32_t last_vpp_idx;
+    VASurfaceID last_export_surf;
 
     struct output_node *target_output; /* NULL = all or filtered outputs */
     bool has_target_filter;
@@ -64,6 +65,7 @@ typedef struct {
     bool eof_draining;
     bool using_swdec;
     void *swdec_ctx;
+    char filepath[4096];
 } video_engine_t;
 
 bool video_engine_init(video_engine_t *ve, struct daemon_state *state);
@@ -78,6 +80,7 @@ void video_engine_dispatch_frame(video_engine_t *ve);
 void video_engine_pause(video_engine_t *ve);
 void video_engine_resume(video_engine_t *ve);
 void video_engine_stop(video_engine_t *ve);
+bool video_engine_snapshot_output(video_engine_t *ve, struct output_node *out);
 
 #ifdef __cplusplus
 }

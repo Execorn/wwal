@@ -7,14 +7,19 @@ _wwal() {
         'img:Decode and set wallpaper with GPU compute or SIMD transitions'
         'video:Play hardware-accelerated video wallpaper via VA-API'
         'shader:Run live Shadertoy fragment or GLES 3.1 compute shader wallpaper'
+        'workshop:List, inspect, or apply native Steam Workshop (431960) wallpapers'
         'slideshow:Manage daemon-native timerfd wallpaper slideshow'
         'color:Set wallpaper to solid hex color via wp_single_pixel_buffer_v1'
         'clear:Clear wallpaper to solid hex color (swww/awww alias)'
         'theme:Extract OKLab/CAM16/HCT Material Design 3 palette and sync caelestia/OSC'
-        'pause:Pause video, animation, or live shader playback'
-        'resume:Resume paused video, animation, or live shader playback'
-        'unpause:Resume paused video, animation, or live shader playback'
-        'toggle:Toggle video, animation, or live shader playback pause/resume'
+        'audio:Configure live wallpaper audio volume and external playback auto-ducking'
+        'set-uniform:Mutate live shader uniform or Workshop property'
+        'status:Inspect outputs, active media, MPRIS metadata, and telemetry'
+        'subscribe:Stream newline-delimited JSON state change events'
+        'pause:Pause video, animation, live shader, or Workshop scene playback'
+        'resume:Resume paused video, animation, live shader, or Workshop scene playback'
+        'unpause:Resume paused video, animation, live shader, or Workshop scene playback'
+        'toggle:Toggle video, animation, live shader, or Workshop scene playback pause/resume'
         'query:List connected Wayland outputs, scale factors, and geometry'
         'stats:Report real-time RSS/PSS, DMA-BUF modifiers, VBlank PLL, and pause_mask telemetry'
         'restore:Restore last persisted per-output state from state.bin'
@@ -26,6 +31,7 @@ _wwal() {
 
     local -a global_opts
     global_opts=(
+        '(-j --json)'{-j,--json}'[Format query/status/stats output as JSON]'
         '(-n --namespace)'{-n,--namespace}'[Socket and layer-shell namespace]:namespace:'
         '--layer[Wayland layer-shell layer]:layer:(background bottom)'
         '--battery-policy[Laptop battery power governor policy]:policy:(ignore reduce-fps pause-video)'
@@ -53,8 +59,11 @@ _wwal() {
         '--filter[Scaling filter hint]:filter:(Nearest Bilinear CatmullRom Mitchell Lanczos3)'
         '--backdrop[Secondary overview backdrop surface mode]:backdrop:(none auto-blur)'
         '--depth-map[2D depth-map image for 3D Parallax Occlusion Mapping]:depth_map:_files -g "*.([pP][nN][gG]|[jJ][pP][gG]|[jJ][pP][eE][gG]|[wW][eE][bB][pP]|[aA][vV][iI][fF]|[jJ][xX][lL]|[bB][mM][pP])"'
+        '--depth-strength[Depth parallax displacement multiplier]:depth_strength:'
         '--theme[Extract Material You palette and sync caelestia/OSC]'
         '--no-theme[Disable automatic Material You palette extraction]'
+        '--theme-from-media[Extract Material You palette dynamically from MPRIS2 album art]'
+        '--no-theme-from-media[Disable MPRIS2 album art theme extraction]'
         '--animate[Play animated GIF/WebP/APNG via video/animation engine]'
     )
 

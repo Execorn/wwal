@@ -17,6 +17,11 @@ When invoked via a symlink named \fBswww\fR or \fBawww\fR, \fBwwal\fR automatica
 .PP
 .SH GLOBAL OPTIONS
 .PP
+\fB-j, --json\fR
+.RS 4
+Format \fBquery\fR, \fBstatus\fR, and \fBstats\fR output as structured JSON.
+.RE
+.PP
 \fB-n, --namespace\fR <NAME>
 .RS 4
 Connect to the daemon socket namespace \fINAME\fR (default: \fBdefault\fR). Also sets the Wayland layer-shell namespace unless overridden.
@@ -46,7 +51,12 @@ Play a hardware-accelerated video wallpaper (MP4, WebM, MKV, GIF) using the zero
 .PP
 \fBshader\fR <PATH> [OPTIONS]
 .RS 4
-Run a live procedural GLSL compute shader (\fB.comp\fR) or Shadertoy fragment shader (\fB.frag\fR) on the background layer with automatic \fBinotify\fR(7) hot-reloading.
+Run a live procedural GLSL compute shader (\fB.comp\fR) or multi-pass Shadertoy fragment shader (\fB.frag\fR) on the background layer with automatic \fBinotify\fR(7) hot-reloading.
+.RE
+.PP
+\fBworkshop\fR <list|info|apply> [ID|PATH] [OPTIONS]
+.RS 4
+Discover, inspect, or render native Steam Workshop (\fB431960\fR Wallpaper Engine) scenes, videos, web wallpapers, \fB.pkg\fR archives, \fB.tex\fR textures, \fB.mdl\fR Puppet Warp skeletal meshes, AVX2 particle systems, and \fBSceneScript\fR logic. Use \fB--prop key=val\fR to override user properties.
 .RE
 .PP
 \fBslideshow\fR <DIR|ACTION> [OPTIONS]
@@ -69,34 +79,54 @@ Alias for \fBcolor\fR (defaults to \fB000000\fR if no color is given) for \fBsww
 Extract an OKLab/CAM16/HCT Material Design 3 palette from \fIPATH\fR in under 0.4 ms and write \fB~/.local/state/caelestia/scheme.json\fR, \fB~/.cache/wwal/colors.json\fR, \fB~/.cache/wwal/colors.css\fR, \fB~/.cache/wwal/colors-hyprland.conf\fR, and terminal OSC 4/10/11 sequences.
 .RE
 .PP
+\fBaudio\fR [OPTIONS]
+.RS 4
+Configure live wallpaper audio playback volume (\fB--volume 0.0..1.0\fR) and external application auto-ducking (\fB--mute-on-audio\fR / \fB--no-mute-on-audio\fR).
+.RE
+.PP
+\fBset-uniform\fR <NAME> <VALUES...>
+.RS 4
+Mutate a live shader uniform or Workshop user property (1 to 4 float values) without reloading the active scene.
+.RE
+.PP
+\fBstatus\fR [--json]
+.RS 4
+Inspect connected outputs, active wallpaper/video/shader/Workshop paths, D-Bus MPRIS2 media metadata, and daemon telemetry.
+.RE
+.PP
+\fBsubscribe\fR
+.RS 4
+Stream newline-delimited JSON events whenever wallpapers, themes, or media states change.
+.RE
+.PP
 \fBpause\fR
 .RS 4
-Pause active video, animation, or live shader playback.
+Pause active video, animation, live shader, or Workshop scene playback.
 .RE
 .PP
 \fBresume\fR, \fBunpause\fR
 .RS 4
-Resume paused video, animation, or live shader playback.
+Resume paused video, animation, live shader, or Workshop scene playback.
 .RE
 .PP
 \fBtoggle\fR
 .RS 4
-Toggle video, animation, or live shader playback between paused and playing states.
+Toggle video, animation, live shader, or Workshop scene playback between paused and playing states.
 .RE
 .PP
-\fBquery\fR
+\fBquery\fR [--json]
 .RS 4
 List all connected Wayland outputs, physical and logical dimensions, scale factors, refresh rates, and active wallpaper state.
 .RE
 .PP
-\fBstats\fR
+\fBstats\fR [--json]
 .RS 4
 Query real-time daemon telemetry (opcode \fB0x000C\fR), including daemon RSS/PSS memory footprint, active VRAM surface pool count, negotiated DRM FourCC format and modifier (Linear, NVIDIA Block-Linear, ARM AFBC, AMD DCC, Intel CCS), VBlank PLL period/phase jitter estimates, and per-output Zero-Watt \fBpause_mask\fR reasons.
 .RE
 .PP
 \fBrestore\fR
 .RS 4
-Restore the last persisted per-output wallpaper, video, shader, or color state from \fB$XDG_STATE_HOME/wwal/state.bin\fR.
+Restore the last persisted per-output wallpaper, video, shader, Workshop scene, or color state from \fB$XDG_STATE_HOME/wwal/state.bin\fR.
 .RE
 .PP
 \fBclear-cache\fR

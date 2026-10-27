@@ -56,9 +56,13 @@ typedef struct {
     uint32_t idle_timeout_sec;
     bool ten_bit;
     char backdrop[WAYWAL_PATH_MAX];
+    char workshop_dir[WAYWAL_PATH_MAX];
     bool restore_on_start;
     bool pause_on_occluded_workspace;
     bool pause_on_idle;
+    float volume;
+    bool mute_on_audio;
+    bool theme_from_media;
 } waywal_daemon_config_t;
 
 typedef struct {
@@ -77,6 +81,7 @@ typedef struct {
     float contrast;
     bool export_css;
     bool export_hyprland;
+    bool theme_from_media;
 } waywal_theme_config_t;
 
 typedef struct {
@@ -112,6 +117,8 @@ typedef struct {
     uint32_t interval;
     bool shuffle;
     bool audio;
+    float volume;
+    bool mute_on_audio;
 } waywal_output_rule_t;
 
 typedef struct {

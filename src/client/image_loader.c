@@ -2027,6 +2027,15 @@ bool image_load(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uin
     return ok;
 }
 
+bool image_load_rgba(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
+    if (!image_load(filepath, out_pixels, out_w, out_h))
+        return false;
+    size_t num_bytes = (size_t)(*out_w) * (size_t)(*out_h) * 4U;
+    swizzle_rgba_to_bgra_inplace(*out_pixels, num_bytes);
+    return true;
+}
+
 bool image_load_raw(const char *filepath, raw_image_t *out_img)
 {
     if (!filepath || !out_img)

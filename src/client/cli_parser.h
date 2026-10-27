@@ -35,7 +35,18 @@ typedef enum {
     CLI_CMD_RESTORE,
     CLI_CMD_CLEAR_CACHE,
     CLI_CMD_DAEMON_ALIAS,
+    CLI_CMD_WORKSHOP,
+    CLI_CMD_STATUS,
+    CLI_CMD_SET_UNIFORM,
+    CLI_CMD_SUBSCRIBE,
+    CLI_CMD_AUDIO,
 } cli_cmd_type_t;
+
+typedef enum {
+    WAYWAL_WORKSHOP_APPLY = 0,
+    WAYWAL_WORKSHOP_LIST = 1,
+    WAYWAL_WORKSHOP_INFO = 2,
+} waywal_workshop_subcmd_t;
 
 typedef cli_cmd_type_t waywal_cli_cmd_t;
 
@@ -134,6 +145,19 @@ typedef struct {
     uint32_t slideshow_action;     /* waywal_slideshow_action_t */
     uint32_t slideshow_interval_s; /* interval in seconds */
     bool slideshow_random;         /* random shuffle order */
+
+    /* Workshop parameters */
+    uint32_t workshop_subcmd; /* waywal_workshop_subcmd_t */
+    char workshop_props[2048];
+
+    /* JSON inspection, audio ducking, MPRIS theme extraction, and live uniforms */
+    bool json_output;
+    float volume;            /* -1.0f if unspecified, otherwise [0.0, 1.0] */
+    int8_t mute_on_audio;    /* -1 = unspecified, 0 = false, 1 = true */
+    int8_t theme_from_media; /* -1 = unspecified, 0 = false, 1 = true */
+    char uniform_name[64];
+    float uniform_values[4];
+    uint32_t uniform_components;
 } cli_options_t;
 
 typedef cli_options_t waywal_cli_opts_t;

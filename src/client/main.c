@@ -8,6 +8,8 @@
 #include "waywal/palette_hct.h"
 #include "waywal/state_store.h"
 #include "waywal/toml_parser.h"
+#include "waywal/we_pkg.h"
+#include "waywal/we_scene.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -273,19 +275,81 @@ static int handle_cmd_theme(const cli_options_t *opts, const waywal_config_t *cf
     return 0;
 }
 
-static void drain_and_print_reply(int socket_fd, size_t payload_size)
+static bool client_write_exact(int fd, const void *buf, size_t len)
+{
+    size_t total = 0;
+    const uint8_t *p = (const uint8_t *)buf;
+    while (total < len) {
+        ssize_t w = write(fd, p + total, len - total);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (w == 0)
+            return false;
+        total += (size_t)w;
+    }
+    return true;
+}
+
+static bool drain_and_print_reply(int socket_fd, size_t payload_size, bool print_out)
 {
     char buf[4096];
     size_t remaining = payload_size;
     while (remaining > 0) {
-        size_t to_read = remaining < sizeof(buf) - 1 ? remaining : sizeof(buf) - 1;
+        size_t to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
         ssize_t r = read(socket_fd, buf, to_read);
-        if (r <= 0)
-            break;
-        buf[r] = '\0';
-        fputs(buf, stdout);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (r == 0)
+            return false;
+        if (print_out) {
+            (void)fwrite(buf, 1, (size_t)r, stdout);
+        }
         remaining -= (size_t)r;
     }
+    return true;
+}
+
+static bool send_audio_ctrl_request(const cli_options_t *opts, bool print_reply)
+{
+    if (!opts)
+        return false;
+    int afd = waywal_ipc_client_connect(opts->namespace_str, 3000);
+    if (afd < 0)
+        return false;
+
+    waywal_audio_ctrl_payload_t apay;
+    memset(&apay, 0, sizeof(apay));
+    apay.volume = opts->volume;
+    apay.mute_on_audio = opts->mute_on_audio;
+    apay.theme_from_media = opts->theme_from_media;
+
+    waywal_ipc_hdr_t req = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_AUDIO_CTRL,
+        .payload_size = sizeof(apay),
+    };
+    if (!waywal_ipc_send(afd, &req, -1) || !client_write_exact(afd, &apay, sizeof(apay))) {
+        close(afd);
+        return false;
+    }
+
+    waywal_ipc_hdr_t resp;
+    int attached_fd = -1;
+    bool ok = waywal_ipc_recv(afd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK;
+    if (ok && print_reply && resp.payload_size > 0 && resp.payload_size <= 16384) {
+        (void)drain_and_print_reply(afd, (size_t)resp.payload_size, true);
+    }
+    if (attached_fd >= 0)
+        close(attached_fd);
+    close(afd);
+    return ok;
 }
 
 static char *read_shader_file(const char *path, size_t *out_len)
@@ -355,7 +419,12 @@ static void query_max_target_resolution(const cli_options_t *opts, uint32_t *out
     size_t total = 0;
     while (total < to_read) {
         ssize_t r = read(qfd, buf + total, to_read - total);
-        if (r <= 0)
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (r == 0)
             break;
         total += (size_t)r;
     }
@@ -393,6 +462,93 @@ static void query_max_target_resolution(const cli_options_t *opts, uint32_t *out
     }
 }
 
+static int handle_cmd_workshop_list(void)
+{
+    we_project_t *items = NULL;
+    size_t count = 0;
+    if (!we_workshop_scan_all(&items, &count) || count == 0) {
+        printf("ID             TYPE       TITLE                                PATH\n");
+        printf("(No Steam Workshop 431960 items found)\n");
+        free(items);
+        return 0;
+    }
+
+    printf("%-14s %-10s %-36s %s\n", "ID", "TYPE", "TITLE", "PATH");
+    for (size_t i = 0; i < count; ++i) {
+        printf("%-14s %-10s %-36.36s %s\n", items[i].workshop_id,
+               items[i].type[0] ? items[i].type : "scene",
+               items[i].title[0] ? items[i].title : "Untitled", items[i].workshop_dir);
+    }
+    free(items);
+    return 0;
+}
+
+static const char *prop_type_to_str(we_prop_type_t t)
+{
+    switch (t) {
+    case WE_PROP_BOOL:
+        return "bool";
+    case WE_PROP_INT:
+        return "int";
+    case WE_PROP_COLOR:
+        return "color";
+    case WE_PROP_TEXT:
+        return "text";
+    case WE_PROP_FLOAT:
+    default:
+        return "float";
+    }
+}
+
+static int handle_cmd_workshop_info(const cli_options_t *opts)
+{
+    char dir[4096];
+    if (!we_workshop_resolve_dir(opts->filepath, dir, sizeof(dir))) {
+        fprintf(stderr, "Error: Workshop item '%s' not found\n", opts->filepath);
+        return 1;
+    }
+
+    we_project_t proj;
+    if (!we_project_load_dir(dir, &proj)) {
+        fprintf(stderr, "Error: Failed to parse project.json in '%s'\n", dir);
+        return 1;
+    }
+    if (opts->workshop_props[0] != '\0') {
+        we_project_apply_overrides_str(&proj, opts->workshop_props);
+    }
+
+    we_pkg_t *pkg = we_pkg_open_dir(dir);
+    uint32_t pkg_entries = pkg ? pkg->entry_count : 0;
+    char pkg_magic[16];
+    snprintf(pkg_magic, sizeof(pkg_magic), "%s", pkg ? pkg->version_magic : "NONE");
+    if (pkg) {
+        we_pkg_close(pkg);
+    }
+
+    printf("Workshop ID:   %s\n", proj.workshop_id);
+    printf("Title:         %s\n", proj.title);
+    printf("Type:          %s\n", proj.type);
+    printf("File:          %s\n", proj.file);
+    printf("Preview:       %s\n", proj.preview);
+    printf("Directory:     %s\n", dir);
+    printf("scene.pkg:     %s (%u entries)\n", pkg_magic, pkg_entries);
+    printf("Properties (%u):\n", proj.prop_count);
+    for (uint32_t i = 0; i < proj.prop_count; ++i) {
+        const we_user_prop_t *p = &proj.props[i];
+        printf("  - %s (%s) [\"%s\"]: ", p->key, prop_type_to_str(p->type), p->text);
+        if (p->type == WE_PROP_BOOL) {
+            printf("%s\n", (p->val[0] != 0.0f) ? "true" : "false");
+        } else if (p->type == WE_PROP_TEXT && p->str_val[0] != '\0') {
+            printf("\"%s\"\n", p->str_val);
+        } else if (p->num_components >= 3) {
+            printf("%.3f %.3f %.3f\n", (double)p->val[0], (double)p->val[1], (double)p->val[2]);
+        } else {
+            printf("%.3f\n", (double)p->val[0]);
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     waywal_config_t cfg;
@@ -421,6 +577,65 @@ int main(int argc, char *argv[])
 
     if (opts.cmd == CLI_CMD_CLEAR_CACHE) {
         return handle_cmd_clear_cache();
+    }
+
+    if (opts.cmd == CLI_CMD_WORKSHOP) {
+        if (opts.workshop_subcmd == WAYWAL_WORKSHOP_LIST) {
+            return handle_cmd_workshop_list();
+        }
+        if (opts.workshop_subcmd == WAYWAL_WORKSHOP_INFO) {
+            return handle_cmd_workshop_info(&opts);
+        }
+
+        char resolved_dir[4096];
+        if (!we_workshop_resolve_dir(opts.filepath, resolved_dir, sizeof(resolved_dir))) {
+            fprintf(stderr, "Error: Workshop item '%s' not found\n", opts.filepath);
+            return 1;
+        }
+        char abs_dir[PATH_MAX];
+        if (realpath(resolved_dir, abs_dir)) {
+            snprintf(resolved_dir, sizeof(resolved_dir), "%s", abs_dir);
+        }
+
+        we_project_t proj;
+        if (!we_project_load_dir(resolved_dir, &proj)) {
+            fprintf(stderr, "Error: Failed to parse project.json in '%s'\n", resolved_dir);
+            return 1;
+        }
+
+        if (proj.preview[0] != '\0' &&
+            (opts.extract_theme || (cfg.theme.enabled && !opts.no_theme))) {
+            char prev_path[4600];
+            snprintf(prev_path, sizeof(prev_path), "%s/%s", resolved_dir, proj.preview);
+            uint8_t *px = NULL;
+            uint32_t pw = 0, ph = 0;
+            if (image_load(prev_path, &px, &pw, &ph) && px && pw > 0 && ph > 0) {
+                waywal_theme_mode_t tmode =
+                    opts.theme_light_mode ? WAYWAL_THEME_LIGHT : WAYWAL_THEME_DARK;
+                waywal_palette_t pal;
+                if (extract_palette_from_bgra(px, pw, ph, tmode, &cfg, &pal)) {
+                    (void)waywal_palette_export_filtered(&pal, NULL, cfg.theme.caelestia_sync,
+                                                         cfg.theme.export_css,
+                                                         cfg.theme.export_hyprland);
+                    if (cfg.theme.tty_sequences) {
+                        (void)waywal_palette_broadcast_tty(&pal);
+                    }
+                    if (cfg.hooks.on_theme_change[0] != '\0') {
+                        (void)waywal_palette_run_hook(cfg.hooks.on_theme_change);
+                    }
+                }
+            }
+            if (px) {
+                image_free(px);
+            }
+        }
+
+        if (strcasecmp(proj.type, "video") == 0 && proj.file[0] != '\0') {
+            snprintf(opts.filepath, sizeof(opts.filepath), "%s/%s", resolved_dir, proj.file);
+            opts.cmd = CLI_CMD_VIDEO;
+        } else {
+            snprintf(opts.filepath, sizeof(opts.filepath), "%s", resolved_dir);
+        }
     }
 
     if (opts.cmd == CLI_CMD_DAEMON_ALIAS) {
@@ -458,6 +673,11 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
+    }
+
+    if (opts.cmd != CLI_CMD_AUDIO &&
+        (opts.volume >= 0.0f || opts.mute_on_audio >= 0 || opts.theme_from_media >= 0)) {
+        (void)send_audio_ctrl_request(&opts, false);
     }
 
     int socket_fd = waywal_ipc_client_connect(opts.namespace_str, 3000);
@@ -500,8 +720,10 @@ int main(int argc, char *argv[])
         break;
     }
 
+    case CLI_CMD_STATUS:
     case CLI_CMD_QUERY: {
-        req_hdr.opcode = WAYWAL_REQ_QUERY;
+        req_hdr.opcode = (opts.cmd == CLI_CMD_STATUS || opts.json_output) ? WAYWAL_REQ_QUERY_JSON
+                                                                          : WAYWAL_REQ_QUERY;
         if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
             fprintf(stderr, "Error: Failed to send query request\n");
             ret_code = 1;
@@ -510,17 +732,10 @@ int main(int argc, char *argv[])
 
         waywal_ipc_hdr_t resp;
         int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_INFO) {
-            char buf[4096];
-            size_t remaining = resp.payload_size;
-            while (remaining > 0) {
-                size_t to_read = remaining < sizeof(buf) - 1 ? remaining : sizeof(buf) - 1;
-                ssize_t r = read(socket_fd, buf, to_read);
-                if (r <= 0)
-                    break;
-                buf[r] = '\0';
-                fputs(buf, stdout);
-                remaining -= (size_t)r;
+        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) &&
+            (resp.opcode == WAYWAL_RESP_INFO || resp.opcode == WAYWAL_RESP_OK)) {
+            if (resp.payload_size > 0 && resp.payload_size <= 65536) {
+                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
             }
         } else {
             fprintf(stderr, "Error: Failed to query outputs from daemon\n");
@@ -559,13 +774,13 @@ int main(int argc, char *argv[])
         req_hdr.opcode = WAYWAL_REQ_CLEAR;
         req_hdr.payload_size = clear_payload_size;
 
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+            !client_write_exact(socket_fd, clear_buf, clear_payload_size)) {
             fprintf(stderr, "Error: Failed to send clear request\n");
             free(clear_buf);
             ret_code = 1;
             break;
         }
-        (void)write(socket_fd, clear_buf, clear_payload_size);
         free(clear_buf);
 
         waywal_ipc_hdr_t resp;
@@ -603,7 +818,13 @@ int main(int argc, char *argv[])
         vpay->loop_count = opts.video_loop_count;
         vpay->playback_speed = opts.video_speed;
         vpay->num_target_outputs = opts.num_outputs;
-        strncpy(vpay->filepath, effective_video_path, sizeof(vpay->filepath) - 1);
+        vpay->scaling_mode = opts.scaling_mode;
+        char resolved_vid[PATH_MAX];
+        if (realpath(effective_video_path, resolved_vid)) {
+            strncpy(vpay->filepath, resolved_vid, sizeof(vpay->filepath) - 1);
+        } else {
+            strncpy(vpay->filepath, effective_video_path, sizeof(vpay->filepath) - 1);
+        }
 
         char *optr = (char *)video_buf + sizeof(waywal_video_payload_t);
         for (uint32_t i = 0; i < opts.num_outputs; ++i) {
@@ -623,15 +844,15 @@ int main(int argc, char *argv[])
                 break;
             }
             close(video_fd);
-            (void)write(socket_fd, video_buf, video_payload_size);
+            (void)client_write_exact(socket_fd, video_buf, video_payload_size);
         } else {
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+                !client_write_exact(socket_fd, video_buf, video_payload_size)) {
                 fprintf(stderr, "Error: Failed to send video request to daemon\n");
                 free(video_buf);
                 ret_code = 1;
                 break;
             }
-            (void)write(socket_fd, video_buf, video_payload_size);
         }
         free(video_buf);
 
@@ -976,17 +1197,22 @@ int main(int argc, char *argv[])
         spay.color[2] = opts.clear_color.b;
         spay.color[3] = opts.clear_color.a;
         spay.ten_bit = opts.ten_bit;
-        strncpy(spay.path, opts.filepath, sizeof(spay.path) - 1);
+        char resolved_ss[PATH_MAX];
+        if (realpath(opts.filepath, resolved_ss)) {
+            strncpy(spay.path, resolved_ss, sizeof(spay.path) - 1);
+        } else {
+            strncpy(spay.path, opts.filepath, sizeof(spay.path) - 1);
+        }
 
         req_hdr.opcode = WAYWAL_REQ_SLIDESHOW;
         req_hdr.payload_size = sizeof(spay);
 
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+            !client_write_exact(socket_fd, &spay, sizeof(spay))) {
             fprintf(stderr, "Error: Failed to send slideshow request to daemon\n");
             ret_code = 1;
             break;
         }
-        (void)write(socket_fd, &spay, sizeof(spay));
 
         waywal_ipc_hdr_t resp;
         int attached_fd = -1;
@@ -1008,12 +1234,12 @@ int main(int argc, char *argv[])
         req_hdr.opcode = WAYWAL_REQ_SLIDESHOW_CTRL;
         req_hdr.payload_size = sizeof(sctrl);
 
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+            !client_write_exact(socket_fd, &sctrl, sizeof(sctrl))) {
             fprintf(stderr, "Error: Failed to send slideshow control request\n");
             ret_code = 1;
             break;
         }
-        (void)write(socket_fd, &sctrl, sizeof(sctrl));
 
         waywal_ipc_hdr_t resp;
         int attached_fd = -1;
@@ -1054,7 +1280,14 @@ int main(int argc, char *argv[])
         memset(&spay, 0, sizeof(spay));
 
         if (opts.num_outputs > 0) {
-            strncpy(spay.output, opts.outputs[0], sizeof(spay.output) - 1);
+            size_t pos = 0;
+            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                int n = snprintf(spay.output + pos, sizeof(spay.output) - pos, "%s%s",
+                                 (i > 0) ? "," : "", opts.outputs[i]);
+                if (n < 0 || (size_t)n >= sizeof(spay.output) - pos)
+                    break;
+                pos += (size_t)n;
+            }
         } else {
             strncpy(spay.output, "*", sizeof(spay.output) - 1);
         }
@@ -1067,22 +1300,33 @@ int main(int argc, char *argv[])
         }
         spay.fps = opts.transition_fps > 0 ? opts.transition_fps : 60;
         spay.audio_reactive = opts.audio_reactive;
+        spay.scaling_mode = opts.scaling_mode;
+        spay.transition_type = opts.transition_type;
+        spay.transition_duration_ms = opts.transition_duration_ms;
+        spay.transition_fps = opts.transition_fps;
+        spay.transition_angle_rad = opts.transition_angle_rad;
+        spay.transition_wave_freq = opts.transition_wave_freq;
+        spay.transition_wave_amp = opts.transition_wave_amp;
+        spay.transition_center_x = opts.transition_pos_x;
+        spay.transition_center_y = opts.transition_pos_y;
+        spay.bezier = opts.bezier;
+        spay.has_custom_bezier = opts.has_custom_bezier;
 
         req_hdr.opcode = WAYWAL_REQ_SHADER;
         req_hdr.payload_size = sizeof(spay);
 
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+            !client_write_exact(socket_fd, &spay, sizeof(spay))) {
             fprintf(stderr, "Error: Failed to send shader request to daemon\n");
             ret_code = 1;
             break;
         }
-        (void)write(socket_fd, &spay, sizeof(spay));
 
         waywal_ipc_hdr_t resp;
         int attached_fd = -1;
         if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
             if (resp.payload_size > 0 && resp.payload_size <= 16384) {
-                drain_and_print_reply(socket_fd, (size_t)resp.payload_size);
+                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
             } else {
                 printf("Shader wallpaper active: %s\n", spay.shader_path);
             }
@@ -1095,8 +1339,71 @@ int main(int argc, char *argv[])
         break;
     }
 
+    case CLI_CMD_WORKSHOP: {
+        waywal_workshop_payload_t wpay;
+        memset(&wpay, 0, sizeof(wpay));
+
+        if (opts.num_outputs > 0) {
+            size_t pos = 0;
+            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                int n = snprintf(wpay.output + pos, sizeof(wpay.output) - pos, "%s%s",
+                                 (i > 0) ? "," : "", opts.outputs[i]);
+                if (n < 0 || (size_t)n >= sizeof(wpay.output) - pos)
+                    break;
+                pos += (size_t)n;
+            }
+        } else {
+            strncpy(wpay.output, "*", sizeof(wpay.output) - 1);
+        }
+
+        strncpy(wpay.workshop_dir, opts.filepath, sizeof(wpay.workshop_dir) - 1);
+        strncpy(wpay.prop_overrides, opts.workshop_props, sizeof(wpay.prop_overrides) - 1);
+        wpay.fps = opts.transition_fps > 0 ? opts.transition_fps : 60;
+        wpay.audio_reactive = opts.audio_reactive;
+        wpay.scaling_mode = opts.scaling_mode;
+        wpay.transition_type = opts.transition_type;
+        wpay.transition_duration_ms = opts.transition_duration_ms;
+        wpay.transition_fps = opts.transition_fps;
+        wpay.transition_angle_rad = opts.transition_angle_rad;
+        wpay.transition_wave_freq = opts.transition_wave_freq;
+        wpay.transition_wave_amp = opts.transition_wave_amp;
+        wpay.transition_center_x = opts.transition_pos_x;
+        wpay.transition_center_y = opts.transition_pos_y;
+        wpay.bezier = opts.bezier;
+        wpay.has_custom_bezier = opts.has_custom_bezier;
+
+        req_hdr.opcode = WAYWAL_REQ_WORKSHOP;
+        req_hdr.payload_size = sizeof(wpay);
+
+        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+            !client_write_exact(socket_fd, &wpay, sizeof(wpay))) {
+            fprintf(stderr, "Error: Failed to send workshop request to daemon\n");
+            ret_code = 1;
+            break;
+        }
+
+        waywal_ipc_hdr_t resp;
+        int attached_fd = -1;
+        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+            } else {
+                printf("Workshop wallpaper active: %s\n", wpay.workshop_dir);
+            }
+            if (cfg.hooks.on_wallpaper_change[0] != '\0') {
+                (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
+            }
+        } else {
+            fprintf(stderr, "Error: Daemon rejected workshop request\n");
+            ret_code = 1;
+        }
+        if (attached_fd >= 0)
+            close(attached_fd);
+        break;
+    }
+
     case CLI_CMD_STATS: {
-        req_hdr.opcode = WAYWAL_REQ_STATS;
+        req_hdr.opcode = opts.json_output ? WAYWAL_REQ_QUERY_JSON : WAYWAL_REQ_STATS;
         req_hdr.payload_size = 0;
 
         if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
@@ -1110,7 +1417,7 @@ int main(int argc, char *argv[])
         if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) &&
             (resp.opcode == WAYWAL_RESP_OK || resp.opcode == WAYWAL_RESP_INFO)) {
             if (resp.payload_size > 0 && resp.payload_size <= 65536) {
-                drain_and_print_reply(socket_fd, (size_t)resp.payload_size);
+                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
             }
         } else {
             fprintf(stderr, "Error: Failed to query telemetry stats from daemon\n");
@@ -1118,6 +1425,139 @@ int main(int argc, char *argv[])
         }
         if (attached_fd >= 0)
             close(attached_fd);
+        break;
+    }
+
+    case CLI_CMD_SET_UNIFORM: {
+        waywal_set_uniform_payload_t upay;
+        memset(&upay, 0, sizeof(upay));
+        if (opts.num_outputs > 0) {
+            size_t pos = 0;
+            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                int n = snprintf(upay.output + pos, sizeof(upay.output) - pos, "%s%s",
+                                 (i > 0) ? "," : "", opts.outputs[i]);
+                if (n < 0 || (size_t)n >= sizeof(upay.output) - pos)
+                    break;
+                pos += (size_t)n;
+            }
+        } else {
+            strncpy(upay.output, "*", sizeof(upay.output) - 1);
+        }
+        strncpy(upay.name, opts.uniform_name, sizeof(upay.name) - 1);
+        for (uint32_t i = 0; i < opts.uniform_components && i < 4; ++i) {
+            upay.values[i] = opts.uniform_values[i];
+        }
+        upay.num_components = opts.uniform_components;
+
+        req_hdr.opcode = WAYWAL_REQ_SET_UNIFORM;
+        req_hdr.payload_size = sizeof(upay);
+        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+            !client_write_exact(socket_fd, &upay, sizeof(upay))) {
+            fprintf(stderr, "Error: Failed to send set-uniform request\n");
+            ret_code = 1;
+            break;
+        }
+
+        waywal_ipc_hdr_t resp;
+        int attached_fd = -1;
+        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+            }
+        } else {
+            fprintf(stderr, "Error: Daemon rejected set-uniform request\n");
+            ret_code = 1;
+        }
+        if (attached_fd >= 0)
+            close(attached_fd);
+        break;
+    }
+
+    case CLI_CMD_AUDIO: {
+        waywal_audio_ctrl_payload_t apay;
+        memset(&apay, 0, sizeof(apay));
+        apay.volume = opts.volume;
+        apay.mute_on_audio = opts.mute_on_audio;
+        apay.theme_from_media = opts.theme_from_media;
+
+        req_hdr.opcode = WAYWAL_REQ_AUDIO_CTRL;
+        req_hdr.payload_size = sizeof(apay);
+        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+            !client_write_exact(socket_fd, &apay, sizeof(apay))) {
+            fprintf(stderr, "Error: Failed to send audio control request\n");
+            ret_code = 1;
+            break;
+        }
+
+        waywal_ipc_hdr_t resp;
+        int attached_fd = -1;
+        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+            }
+        } else {
+            fprintf(stderr, "Error: Daemon rejected audio control request\n");
+            ret_code = 1;
+        }
+        if (attached_fd >= 0)
+            close(attached_fd);
+        break;
+    }
+
+    case CLI_CMD_SUBSCRIBE: {
+        req_hdr.opcode = WAYWAL_REQ_SUBSCRIBE;
+        req_hdr.payload_size = 0;
+        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            fprintf(stderr, "Error: Failed to send subscribe request\n");
+            ret_code = 1;
+            break;
+        }
+
+        waywal_ipc_hdr_t resp;
+        int attached_fd = -1;
+        if (!waywal_ipc_recv(socket_fd, &resp, &attached_fd) || resp.opcode != WAYWAL_RESP_OK) {
+            if (attached_fd >= 0)
+                close(attached_fd);
+            fprintf(stderr, "Error: Daemon rejected event subscription\n");
+            ret_code = 1;
+            break;
+        }
+        if (attached_fd >= 0)
+            close(attached_fd);
+        if (resp.payload_size > 65536) {
+            fprintf(stderr, "Error: Oversized initial subscribe payload\n");
+            ret_code = 1;
+            break;
+        }
+        if (resp.payload_size > 0) {
+            if (!drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true)) {
+                ret_code = 1;
+                break;
+            }
+            fflush(stdout);
+        }
+
+        for (;;) {
+            waywal_ipc_hdr_t ev_hdr;
+            int ev_fd = -1;
+            if (!waywal_ipc_recv(socket_fd, &ev_hdr, &ev_fd)) {
+                break;
+            }
+            if (ev_fd >= 0)
+                close(ev_fd);
+            if (ev_hdr.payload_size > 65536) {
+                break;
+            }
+            if (ev_hdr.payload_size > 0) {
+                bool print_ev = (ev_hdr.opcode == WAYWAL_RESP_EVENT);
+                if (!drain_and_print_reply(socket_fd, (size_t)ev_hdr.payload_size, print_ev)) {
+                    break;
+                }
+                if (print_ev) {
+                    fflush(stdout);
+                }
+            }
+        }
         break;
     }
 
@@ -1135,7 +1575,7 @@ int main(int argc, char *argv[])
         int attached_fd = -1;
         if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
             if (resp.payload_size > 0 && resp.payload_size <= 16384) {
-                drain_and_print_reply(socket_fd, (size_t)resp.payload_size);
+                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
             } else {
                 printf("OK: State restored\n");
             }

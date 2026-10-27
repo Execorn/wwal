@@ -198,8 +198,72 @@ rm -rf "${TMP_THEME_STATE}" "${TMP_THEME_CACHE}"
 echo "[34] Testing swww compatibility flags (--resize, --fill-color, --filter)..."
 "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --resize crop --fill-color 1e1e2e --filter Lanczos3 --transition-type left --transition-pos tr --transition-duration 0.05
 
+echo "[34b] Testing --scaling-mode span and live cross-mode GPU transitions (Image <-> Shader)..."
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --scaling-mode span --transition-type fade --transition-duration 0.05
+TMP_INTEG_SHADER="${TMP_INTEG_CACHE}/integ_deriv_span.frag"
+cat > "${TMP_INTEG_SHADER}" << 'EOF'
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 uv = fragCoord / iResolution.xy;
+    float edge = fwidth(uv.x) + abs(dFdx(uv.x)) + abs(dFdy(uv.y));
+    fragColor = vec4(uv.x, uv.y, clamp(edge * 100.0, 0.0, 1.0), 1.0);
+}
+EOF
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" shader "${TMP_INTEG_SHADER}" --scaling-mode span --transition-type wipe --transition-duration 0.05
+sleep 0.08
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" --transition-type grow --transition-duration 0.05
+sleep 0.08
+
+echo "[34c] Testing per-output multi-engine concurrency (shader, video, slideshow isolation)..."
+mapfile -t OUT_NAMES < <("${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" query | awk '/^  - /{print $2}')
+if [ "${#OUT_NAMES[@]}" -ge 2 ]; then
+    OUT_A="${OUT_NAMES[0]}"
+    OUT_B="${OUT_NAMES[1]}"
+    "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" shader "${TMP_INTEG_SHADER}" -o "${OUT_A}" --fps 60 --transition-type fade --transition-duration 0.05
+    if [ -f "${VIDEO_PATH}" ]; then
+        "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" video "${VIDEO_PATH}" -o "${OUT_A}" --loop 0
+        "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" video "${VIDEO_PATH}" -o "${OUT_B}" --loop 0
+        sleep 0.1
+        "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" img "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" -o "${OUT_A}" --transition-type fade --transition-duration 0.05
+        sleep 0.1
+        STATS_OUT=$("${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" stats)
+        echo "${STATS_OUT}" | grep -q "  - ${OUT_A}:.*engine=static"
+        echo "${STATS_OUT}" | grep -q "  - ${OUT_B}:.*engine=video"
+    fi
+fi
+
 echo "[35] Testing wwal restore..."
 "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" restore
+
+echo "[35b] Testing JSON IPC inspection, live uniform control, audio ducking & event subscription..."
+STATUS_JSON=$("${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" status)
+echo "${STATUS_JSON}" | grep -q '"pid":'
+echo "${STATUS_JSON}" | grep -q '"outputs":'
+echo "${STATUS_JSON}" | grep -q '"scale":'
+echo "${STATUS_JSON}" | grep -q '"paused":'
+echo "${STATUS_JSON}" | grep -q '"asset":'
+echo "${STATUS_JSON}" | grep -q '"mpris":'
+echo "${STATUS_JSON}" | grep -q '"playing":'
+echo "${STATUS_JSON}" | grep -q '"length_us":'
+echo "${STATUS_JSON}" | grep -q '"audio":'
+echo "${STATUS_JSON}" | grep -q '"external_active":'
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" query --json | grep -q '"outputs":'
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" stats --json | grep -q '"outputs":'
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" audio --volume 0.5 --mute-on-audio --theme-from-media
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" status | grep -q '"volume":0.500'
+
+SUB_LOG="${TMP_INTEG_CACHE}/sub_events.jsonl"
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" subscribe > "${SUB_LOG}" &
+SUB_PID=$!
+sleep 0.05
+grep -q '"event":"initial"' "${SUB_LOG}"
+
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" shader "${TMP_INTEG_SHADER}" --fps 60 --transition-type none
+"${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" set-uniform u_Speed 2.5
+sleep 0.05
+kill "${SUB_PID}" 2>/dev/null || true
+wait "${SUB_PID}" 2>/dev/null || true
+grep -q '"event":"wallpaper_changed"' "${SUB_LOG}"
+grep -q '"event":"uniform_changed"' "${SUB_LOG}"
 
 # 8. Terminate daemon
 echo "[36] Testing kill command..."

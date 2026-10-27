@@ -4,11 +4,14 @@
 #endif
 #include "gpu_compute.h"
 #include "wayland_core.h"
+#include "waywal/anim_engine.h"
 #include "waywal/bezier.h"
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
 #include "waywal/os_compat.h"
 #include "waywal/shader_engine.h"
+#include "waywal/uring_loop.h"
+#include "waywal/we_scene.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -17,6 +20,7 @@
 #include <spawn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
@@ -361,11 +365,212 @@ void output_node_create_surface(daemon_state_t *state, output_node_t *node)
     wl_display_flush(state->display);
 }
 
+static void release_output_bo_refs(daemon_state_t *state, output_node_t *node, dmabuf_bo_t *bo)
+{
+    if (!bo) {
+        return;
+    }
+    if (node) {
+        if (node->shader_eng) {
+            waywal_shader_engine_forget_bo(node->shader_eng, bo);
+        }
+        if (node->we_scene) {
+            waywal_we_scene_forget_bo(node->we_scene, bo);
+        }
+    }
+    if (state) {
+        if (state->shader_eng && (!node || state->shader_eng != node->shader_eng)) {
+            waywal_shader_engine_forget_bo(state->shader_eng, bo);
+        }
+        if (state->we_scene && (!node || state->we_scene != node->we_scene)) {
+            waywal_we_scene_forget_bo(state->we_scene, bo);
+        }
+        for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
+            if (o == node) {
+                continue;
+            }
+            if (o->shader_eng && o->shader_eng != state->shader_eng &&
+                (!node || o->shader_eng != node->shader_eng)) {
+                waywal_shader_engine_forget_bo(o->shader_eng, bo);
+            }
+            if (o->we_scene && o->we_scene != state->we_scene &&
+                (!node || o->we_scene != node->we_scene)) {
+                waywal_we_scene_forget_bo(o->we_scene, bo);
+            }
+        }
+        render_engine_release_bo(&state->render_engine, bo);
+    }
+}
+
 void output_node_destroy_surface(output_node_t *node)
 {
     if (!node)
         return;
     node->vp_configured = false;
+    node->last_presented_bo = NULL;
+
+    if (node->use_dmabuf) {
+        for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+            release_output_bo_refs(node->state, node, &node->dmabuf_ring.buffers[i]);
+        }
+        if (node->state) {
+            dmabuf_ring_destroy(&node->state->dmabuf_ctx, &node->dmabuf_ring);
+        }
+        node->use_dmabuf = false;
+    }
+    if (node->has_source_old_bo) {
+        release_output_bo_refs(node->state, node, &node->source_old_bo);
+        dmabuf_bo_free(&node->source_old_bo);
+        node->has_source_old_bo = false;
+    }
+    if (node->has_source_new_bo) {
+        release_output_bo_refs(node->state, node, &node->source_new_bo);
+        dmabuf_bo_free(&node->source_new_bo);
+        node->has_source_new_bo = false;
+    }
+    if (node->has_backdrop_bo) {
+        release_output_bo_refs(node->state, node, &node->backdrop_bo);
+        dmabuf_bo_free(&node->backdrop_bo);
+        node->has_backdrop_bo = false;
+    }
+
+    if (node->we_scene) {
+        bool shared = false;
+        if (node->state) {
+            for (output_node_t *o = node->state->outputs; o != NULL; o = o->next) {
+                if (o != node && o->we_scene == node->we_scene) {
+                    shared = true;
+                    break;
+                }
+            }
+        }
+        if (!shared) {
+            if (node->state && node->state->we_scene == node->we_scene) {
+                node->state->we_scene = NULL;
+                for (output_node_t *o = node->state->outputs; o != NULL; o = o->next) {
+                    if (o != node && o->we_scene != NULL) {
+                        node->state->we_scene = o->we_scene;
+                        break;
+                    }
+                }
+            }
+            we_scene_destroy(node->we_scene);
+        }
+        node->we_scene = NULL;
+        node->workshop_active = false;
+    }
+
+    if (node->shader_eng) {
+        bool shared = false;
+        if (node->state) {
+            for (output_node_t *o = node->state->outputs; o != NULL; o = o->next) {
+                if (o != node && o->shader_eng == node->shader_eng) {
+                    shared = true;
+                    break;
+                }
+            }
+        }
+        if (!shared) {
+            if (node->state && node->state->shader_eng == node->shader_eng) {
+                node->state->shader_eng = NULL;
+                for (output_node_t *o = node->state->outputs; o != NULL; o = o->next) {
+                    if (o != node && o->shader_eng != NULL) {
+                        node->state->shader_eng = o->shader_eng;
+                        break;
+                    }
+                }
+            }
+            int ino_fd = waywal_shader_engine_get_inotify_fd(node->shader_eng);
+            if (ino_fd >= 0 && node->state) {
+                if (node->state->epoll_fd >= 0) {
+                    (void)epoll_ctl(node->state->epoll_fd, EPOLL_CTL_DEL, ino_fd, NULL);
+                }
+                if (node->state->use_uring && node->state->uring_loop) {
+                    (void)uring_loop_remove_poll(node->state->uring_loop, ino_fd);
+                }
+            }
+            waywal_shader_engine_destroy(node->shader_eng);
+        }
+        node->shader_eng = NULL;
+    }
+    node->shader_active = false;
+
+    if (node->anim_dec) {
+        bool shared = false;
+        if (node->state) {
+            for (output_node_t *o = node->state->outputs; o != NULL; o = o->next) {
+                if (o != node && o->anim_dec == node->anim_dec) {
+                    shared = true;
+                    break;
+                }
+            }
+        }
+        if (!shared) {
+            if (node->state && node->state->anim_dec == node->anim_dec) {
+                node->state->anim_dec = NULL;
+            }
+            waywal_anim_destroy(node->anim_dec);
+        }
+        node->anim_dec = NULL;
+    }
+    node->anim_active = false;
+
+    if (node->video_eng) {
+        if (node->video_eng->target_output == node) {
+            node->video_eng->target_output = NULL;
+        }
+        bool shared = false;
+        if (node->state) {
+            for (output_node_t *o = node->state->outputs; o != NULL; o = o->next) {
+                if (o != node && o->video_eng == node->video_eng) {
+                    shared = true;
+                    break;
+                }
+            }
+        }
+        if (!shared && node->state && node->video_eng != &node->state->video_engine) {
+            if (node->video_eng->timer_fd >= 0) {
+                if (node->state->epoll_fd >= 0) {
+                    (void)epoll_ctl(node->state->epoll_fd, EPOLL_CTL_DEL, node->video_eng->timer_fd,
+                                    NULL);
+                }
+                if (node->state->use_uring && node->state->uring_loop) {
+                    (void)uring_loop_remove_poll(node->state->uring_loop,
+                                                 node->video_eng->timer_fd);
+                }
+            }
+            video_engine_destroy(node->video_eng);
+            free(node->video_eng);
+        }
+        node->video_eng = NULL;
+    }
+
+    if (node->slideshow_eng) {
+        bool shared = false;
+        if (node->state) {
+            for (output_node_t *o = node->state->outputs; o != NULL; o = o->next) {
+                if (o != node && o->slideshow_eng == node->slideshow_eng) {
+                    shared = true;
+                    break;
+                }
+            }
+        }
+        if (!shared && node->state && node->slideshow_eng != &node->state->slideshow) {
+            if (node->slideshow_eng->timer_fd >= 0) {
+                if (node->state->epoll_fd >= 0) {
+                    (void)epoll_ctl(node->state->epoll_fd, EPOLL_CTL_DEL,
+                                    node->slideshow_eng->timer_fd, NULL);
+                }
+                if (node->state->use_uring && node->state->uring_loop) {
+                    (void)uring_loop_remove_poll(node->state->uring_loop,
+                                                 node->slideshow_eng->timer_fd);
+                }
+            }
+            slideshow_destroy(node->slideshow_eng);
+            free(node->slideshow_eng);
+        }
+        node->slideshow_eng = NULL;
+    }
 
     if (node->shm_old_data) {
         free(node->shm_old_data);
@@ -378,29 +583,6 @@ void output_node_destroy_surface(output_node_t *node)
     node->shm_buffer_cap = 0;
     node->staging_width = 0;
     node->staging_height = 0;
-
-    if (node->use_dmabuf) {
-        for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
-            render_engine_release_bo(&node->state->render_engine, &node->dmabuf_ring.buffers[i]);
-        }
-        dmabuf_ring_destroy(&node->state->dmabuf_ctx, &node->dmabuf_ring);
-        node->use_dmabuf = false;
-    }
-    if (node->has_source_old_bo) {
-        render_engine_release_bo(&node->state->render_engine, &node->source_old_bo);
-        dmabuf_bo_free(&node->source_old_bo);
-        node->has_source_old_bo = false;
-    }
-    if (node->has_source_new_bo) {
-        render_engine_release_bo(&node->state->render_engine, &node->source_new_bo);
-        dmabuf_bo_free(&node->source_new_bo);
-        node->has_source_new_bo = false;
-    }
-    if (node->has_backdrop_bo) {
-        render_engine_release_bo(&node->state->render_engine, &node->backdrop_bo);
-        dmabuf_bo_free(&node->backdrop_bo);
-        node->has_backdrop_bo = false;
-    }
 
     for (int i = 0; i < 2; ++i) {
         if (node->shm_buffers[i]) {
@@ -483,37 +665,26 @@ static void teardown_output_dmabuf(daemon_state_t *state, output_node_t *node)
 {
     if (!state || !node)
         return;
+    node->last_presented_bo = NULL;
     if (node->use_dmabuf) {
         for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
-            if (state->shader_eng) {
-                waywal_shader_engine_forget_bo(state->shader_eng, &node->dmabuf_ring.buffers[i]);
-            }
-            render_engine_release_bo(&state->render_engine, &node->dmabuf_ring.buffers[i]);
+            release_output_bo_refs(state, node, &node->dmabuf_ring.buffers[i]);
         }
         dmabuf_ring_destroy(&state->dmabuf_ctx, &node->dmabuf_ring);
         node->use_dmabuf = false;
     }
     if (node->has_source_old_bo) {
-        if (state->shader_eng) {
-            waywal_shader_engine_forget_bo(state->shader_eng, &node->source_old_bo);
-        }
-        render_engine_release_bo(&state->render_engine, &node->source_old_bo);
+        release_output_bo_refs(state, node, &node->source_old_bo);
         dmabuf_bo_free(&node->source_old_bo);
         node->has_source_old_bo = false;
     }
     if (node->has_source_new_bo) {
-        if (state->shader_eng) {
-            waywal_shader_engine_forget_bo(state->shader_eng, &node->source_new_bo);
-        }
-        render_engine_release_bo(&state->render_engine, &node->source_new_bo);
+        release_output_bo_refs(state, node, &node->source_new_bo);
         dmabuf_bo_free(&node->source_new_bo);
         node->has_source_new_bo = false;
     }
     if (node->has_backdrop_bo) {
-        if (state->shader_eng) {
-            waywal_shader_engine_forget_bo(state->shader_eng, &node->backdrop_bo);
-        }
-        render_engine_release_bo(&state->render_engine, &node->backdrop_bo);
+        release_output_bo_refs(state, node, &node->backdrop_bo);
         dmabuf_bo_free(&node->backdrop_bo);
         node->has_backdrop_bo = false;
     }
@@ -790,6 +961,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                 wl_surface_attach(node->surface, bo->wl_buffer, 0, 0);
                 wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
                 output_commit_frame(node);
+                node->last_presented_bo = bo;
                 wl_display_flush(state->display);
                 return;
             }
@@ -975,6 +1147,8 @@ static void scale_bilinear_rect(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
         fx4_tbl = malloc((size_t)scaled_w * sizeof(uint64_t));
     }
 
+    const double center_shift = (filter_mode == 3u) ? 0.0 : 0.5;
+
     if (!x0_tbl || !x1_tbl || !fx_tbl || !fx4_tbl) {
         free(x0_tbl);
         free(x1_tbl);
@@ -989,13 +1163,15 @@ static void scale_bilinear_rect(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
                 for (uint32_t x = 0; x < dst_w; ++x)
                     dst_row[x] = bg_packed;
             } else {
-                double sy = off_y + ((double)(y - dst_y_start) + 0.5) * crop_h / (double)scaled_h;
+                double sy = off_y + ((double)(y - dst_y_start) + 0.5) * crop_h / (double)scaled_h -
+                            center_shift;
                 for (uint32_t x = 0; x < dst_w; ++x) {
                     if (x < dst_x_start || x >= dst_x_start + scaled_w) {
                         dst_row[x] = bg_packed;
                     } else {
-                        double sx =
-                            off_x + ((double)(x - dst_x_start) + 0.5) * crop_w / (double)scaled_w;
+                        double sx = off_x +
+                                    ((double)(x - dst_x_start) + 0.5) * crop_w / (double)scaled_w -
+                                    center_shift;
                         dst_row[x] = sample_bilinear(src, src_w, src_h, sx, sy);
                     }
                 }
@@ -1005,7 +1181,7 @@ static void scale_bilinear_rect(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
     }
 
     for (uint32_t x = 0; x < scaled_w; ++x) {
-        double sx = off_x + ((double)x + 0.5) * crop_w / (double)scaled_w;
+        double sx = off_x + ((double)x + 0.5) * crop_w / (double)scaled_w - center_shift;
         if (sx < 0.0)
             sx = 0.0;
         if (sx > (double)(src_w - 1))
@@ -1039,7 +1215,8 @@ static void scale_bilinear_rect(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
         for (uint32_t x = dst_x_start + scaled_w; x < dst_w; ++x)
             dst_row[x] = bg_packed;
 
-        double sy = off_y + ((double)(y - dst_y_start) + 0.5) * crop_h / (double)scaled_h;
+        double sy =
+            off_y + ((double)(y - dst_y_start) + 0.5) * crop_h / (double)scaled_h - center_shift;
         if (sy < 0.0)
             sy = 0.0;
         if (sy > (double)(src_h - 1))
@@ -1175,6 +1352,57 @@ static void compute_output_span_bounds(const daemon_state_t *state, output_node_
     target->span_off_y = (int32_t)((double)(target_oy - min_y) * sy + 0.5);
     target->span_total_w = (int32_t)((double)(max_x - min_x) * sx + 0.5);
     target->span_total_h = (int32_t)((double)(max_y - min_y) * sy + 0.5);
+}
+
+void layer_shell_compute_span_bounds(daemon_state_t *state, output_node_t *target)
+{
+    compute_output_span_bounds(state, target);
+}
+
+void layer_shell_snapshot_live_output(daemon_state_t *state, output_node_t *out)
+{
+    if (!state || !out || out->width <= 0 || out->height <= 0)
+        return;
+
+    if (out->video_eng && out->video_eng->state != WAYWAL_VIDEO_STATE_STOPPED) {
+        if (video_engine_snapshot_output(out->video_eng, out))
+            return;
+    } else if (state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED && !out->shader_active &&
+               !out->anim_active && !out->workshop_active &&
+               (state->video_engine.target_output == out ||
+                (!state->video_engine.target_output &&
+                 (!state->video_engine.has_target_filter || out->video_targeted)))) {
+        if (video_engine_snapshot_output(&state->video_engine, out))
+            return;
+    }
+
+    if (out->last_presented_bo && out->last_presented_bo != &out->source_old_bo) {
+        uint32_t w = (uint32_t)out->width;
+        uint32_t h = (uint32_t)out->height;
+        uint64_t src_mod = state->dmabuf_ctx.preferred_modifier;
+        if (!out->has_source_old_bo || out->source_old_bo.width != w ||
+            out->source_old_bo.height != h) {
+            if (out->has_source_old_bo) {
+                release_output_bo_refs(state, out, &out->source_old_bo);
+                dmabuf_bo_free(&out->source_old_bo);
+                out->has_source_old_bo = false;
+            }
+            if (dmabuf_bo_allocate(&state->dmabuf_ctx, &out->source_old_bo, w, h,
+                                   DRM_FORMAT_ARGB8888, src_mod)) {
+                out->has_source_old_bo = true;
+            }
+        }
+        if (out->has_source_old_bo) {
+            color_rgba_t fill_col = get_output_fill_color(state, out);
+            uint32_t clear_color = pack_color_argb(fill_col);
+            if (render_engine_copy_bo(&state->render_engine, &out->source_old_bo,
+                                      out->last_presented_bo, WAYWAL_SCALING_STRETCH, clear_color,
+                                      false)) {
+                out->has_image = true;
+                out->last_presented_bo = &out->source_old_bo;
+            }
+        }
+    }
 }
 
 void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
@@ -1350,7 +1578,7 @@ static void render_backdrop_surface(daemon_state_t *state, output_node_t *node,
     if (!node->has_backdrop_bo || node->backdrop_bo.width != (uint32_t)node->width ||
         node->backdrop_bo.height != (uint32_t)node->height) {
         if (node->has_backdrop_bo) {
-            render_engine_release_bo(&state->render_engine, &node->backdrop_bo);
+            release_output_bo_refs(state, node, &node->backdrop_bo);
             dmabuf_bo_free(&node->backdrop_bo);
             node->has_backdrop_bo = false;
         }
@@ -1433,32 +1661,11 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                 }
             }
             if (uploaded) {
-                if (state->render_engine.gpu_compute_active) {
-                    uint64_t src_mod = state->dmabuf_ctx.preferred_modifier;
-                    if (!node->has_source_old_bo ||
-                        node->source_old_bo.width != (uint32_t)node->width ||
-                        node->source_old_bo.height != (uint32_t)node->height) {
-                        if (node->has_source_old_bo) {
-                            render_engine_release_bo(&state->render_engine, &node->source_old_bo);
-                            dmabuf_bo_free(&node->source_old_bo);
-                            node->has_source_old_bo = false;
-                        }
-                        if (dmabuf_bo_allocate(&state->dmabuf_ctx, &node->source_old_bo,
-                                               (uint32_t)node->width, (uint32_t)node->height,
-                                               DRM_FORMAT_ARGB8888, src_mod)) {
-                            node->has_source_old_bo = true;
-                        }
-                    }
-                    if (node->has_source_old_bo) {
-                        render_engine_upload_static(&state->render_engine, src_pixels, img_w, img_h,
-                                                    &node->source_old_bo, node->scaling_mode,
-                                                    clear_color);
-                    }
-                }
                 wl_surface_attach(node->surface, bo->wl_buffer, 0, 0);
                 wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
                 output_commit_frame(node);
                 node->has_image = true;
+                node->last_presented_bo = bo;
                 wl_display_flush(state->display);
                 return;
             }
@@ -1579,19 +1786,43 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
     if (!state || !pixels || img_w == 0 || img_h == 0)
         return false;
 
+    render_engine_bump_upload_gen(&state->render_engine);
+
     /* If custom shader provided, load it into compute engine */
     if (meta && meta->transition_type == WAYWAL_TRANSITION_CUSTOM && meta->custom_shader_len > 0) {
         const char *ptr = (const char *)meta + sizeof(waywal_img_metadata_t);
+        size_t rem = meta->extra_data_len;
+        bool valid = true;
         for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
-            ptr += strlen(ptr) + 1;
+            const char *nul = (const char *)memchr(ptr, '\0', rem);
+            if (!nul) {
+                valid = false;
+                break;
+            }
+            size_t step = (size_t)(nul - ptr) + 1u;
+            ptr += step;
+            rem -= step;
         }
-        render_engine_load_custom_shader(&state->render_engine, ptr);
+        if (valid && rem >= meta->custom_shader_len && memchr(ptr, '\0', rem) != NULL) {
+            render_engine_load_custom_shader(&state->render_engine, ptr);
+        }
     }
 
-    /* ── Priority 5: Preempt any in-progress transition cleanly ─────────────────
-     * Snapshot the last rendered pixel data into shm_old_data so the new
-     * transition starts from the visible frame, not from stale shm_new_data. */
+    /* Snapshot outgoing live frames (shader, animation, video, or mid-transition) on targeted
+     * outputs so transitions blend smoothly from the visible frame. */
+    bool any_other_transition = false;
+    bool has_transition =
+        meta && meta->transition_type != WAYWAL_TRANSITION_NONE && meta->transition_duration_ms > 0;
     for (output_node_t *pout = state->outputs; pout != NULL; pout = pout->next) {
+        if (!is_target_output(pout, meta)) {
+            if (pout->transition_active) {
+                any_other_transition = true;
+            }
+            continue;
+        }
+        if (has_transition) {
+            layer_shell_snapshot_live_output(state, pout);
+        }
         if (!pout->transition_active)
             continue;
         /* Copy the currently committed (back) buffer into old staging */
@@ -1606,13 +1837,14 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         }
         pout->transition_active = false;
     }
-    /* Drain any stale timerfd expirations left over from the cancelled transition */
-    if (state->transition_timer_fd >= 0) {
-        uint64_t dummy;
-        while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0)
-            ;
+    if (!any_other_transition) {
+        if (state->transition_timer_fd >= 0) {
+            uint64_t dummy;
+            while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0)
+                ;
+        }
+        state->transitions_in_progress = false;
     }
-    state->transitions_in_progress = false;
 
     if (!meta || meta->transition_type == WAYWAL_TRANSITION_NONE ||
         meta->transition_duration_ms == 0) {
@@ -1699,7 +1931,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
             if (!out->has_source_new_bo || out->source_new_bo.width != (uint32_t)out->width ||
                 out->source_new_bo.height != (uint32_t)out->height) {
                 if (out->has_source_new_bo) {
-                    render_engine_release_bo(&state->render_engine, &out->source_new_bo);
+                    release_output_bo_refs(state, out, &out->source_new_bo);
                     dmabuf_bo_free(&out->source_new_bo);
                     out->has_source_new_bo = false;
                 }
@@ -1741,7 +1973,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                         out->source_old_bo.width != (uint32_t)out->width ||
                         out->source_old_bo.height != (uint32_t)out->height) {
                         if (out->has_source_old_bo) {
-                            render_engine_release_bo(&state->render_engine, &out->source_old_bo);
+                            release_output_bo_refs(state, out, &out->source_old_bo);
                             dmabuf_bo_free(&out->source_old_bo);
                             out->has_source_old_bo = false;
                         }
@@ -1922,6 +2154,7 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                         wl_surface_attach(out->surface, target_bo->wl_buffer, 0, 0);
                         wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
                         output_commit_frame(out);
+                        out->last_presented_bo = target_bo;
                     } else {
                         target_bo->in_use = false;
                     }
@@ -1982,6 +2215,9 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                 dmabuf_bo_t tmp = out->source_old_bo;
                 out->source_old_bo = out->source_new_bo;
                 out->source_new_bo = tmp;
+                if (!out->shader_active && !out->anim_active && !out->workshop_active) {
+                    out->last_presented_bo = &out->source_old_bo;
+                }
             } else {
                 free(out->shm_old_data);
                 free(out->shm_new_data);

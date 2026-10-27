@@ -166,8 +166,10 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
         if (i == 0) {
             if (drm_render_fd < 0)
                 continue;
-            fd = drm_render_fd;
-            owns_fd = false;
+            fd = fcntl(drm_render_fd, F_DUPFD_CLOEXEC, 0);
+            if (fd < 0)
+                continue;
+            owns_fd = true;
         } else {
             fd = open(candidate_nodes[i], O_RDWR | O_CLOEXEC);
             if (fd < 0)
@@ -435,7 +437,8 @@ void vaapi_decoder_destroy(vaapi_decoder_t *dec)
          * resolveSurfaces is parked in pthread_cond_wait before vaDestroyContext signals it even
          * under heavy concurrent GPU contention. */
         struct timespec ts = {.tv_sec = 0, .tv_nsec = 15000000L};
-        nanosleep(&ts, NULL);
+        while (nanosleep(&ts, &ts) == -1 && errno == EINTR)
+            ;
     }
 
     if (dec->has_vpp) {
@@ -1557,6 +1560,27 @@ static bool parse_hevc_sps(const uint8_t *nal, size_t nal_len, parsed_hevc_sps_t
 
     sps->sps_temporal_mvp_enabled_flag = (read_bit(&br) != 0);
     sps->strong_intra_smoothing_enabled_flag = (read_bit(&br) != 0);
+    if (read_bit(&br) && more_rbsp_data(&br)) { /* vui_parameters_present_flag */
+        if (read_bit(&br)) {                    /* aspect_ratio_info_present_flag */
+            uint32_t ar_idc = read_bits(&br, 8);
+            if (ar_idc == 255) {
+                read_bits(&br, 16);
+                read_bits(&br, 16);
+            }
+        }
+        if (read_bit(&br)) { /* overscan_info_present_flag */
+            read_bit(&br);
+        }
+        if (read_bit(&br)) { /* video_signal_type_present_flag */
+            read_bits(&br, 3);
+            sps->video_full_range_flag = (read_bit(&br) != 0);
+            if (read_bit(&br)) { /* colour_description_present_flag */
+                sps->colour_primaries = (uint8_t)read_bits(&br, 8);
+                sps->transfer_characteristics = (uint8_t)read_bits(&br, 8);
+                sps->matrix_coefficients = (uint8_t)read_bits(&br, 8);
+            }
+        }
+    }
     sps->valid = (sps->pic_width_in_luma_samples > 0 && sps->pic_height_in_luma_samples > 0);
     return sps->valid;
 }
@@ -2917,6 +2941,12 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
     } else if (!show_frame) {
         refresh_frame_flags = (uint8_t)read_bits(&br, 8);
     }
+    if ((!(frame_type == 0 || frame_type == 2) || refresh_frame_flags != 0xFF) && error_resilient &&
+        seq->enable_order_hint) {
+        for (int i = 0; i < 8; ++i) {
+            read_bits(&br, (uint32_t)seq->order_hint_bits_minus_1 + 1);
+        }
+    }
 
     uint16_t width_m1 = seq->valid ? seq->max_frame_width_minus_1 : (uint16_t)(dec->width - 1);
     uint16_t height_m1 = seq->valid ? seq->max_frame_height_minus_1 : (uint16_t)(dec->height - 1);
@@ -2945,11 +2975,6 @@ static bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload,
             allow_intrabc = read_bit(&br);
         }
     } else {
-        if (frame_type == 2 && refresh_frame_flags != 0xFF && seq->enable_order_hint) {
-            for (int i = 0; i < 8; ++i) {
-                read_bits(&br, (uint32_t)seq->order_hint_bits_minus_1 + 1);
-            }
-        }
         bool short_signaling = false;
         if (seq->enable_order_hint) {
             short_signaling = (read_bit(&br) != 0);
@@ -3696,6 +3721,90 @@ bool vaapi_decoder_set_extradata(vaapi_decoder_t *dec, const uint8_t *extradata,
     return true;
 }
 
+static bool submit_av1_frame_to_va(vaapi_decoder_t *dec, uint32_t pool_size,
+                                   VADecPictureParameterBufferAV1 *pic_param,
+                                   VASliceParameterBufferAV1 *av1_slices, uint32_t av1_slice_count,
+                                   const demux_packet_t *pkt, uint8_t refresh_flags,
+                                   bool av1_show_existing, uint8_t av1_show_existing_idx,
+                                   VASurfaceID *io_target)
+{
+    if (av1_show_existing) {
+        VASurfaceID ref_surf = dec->av1_ref_frames[av1_show_existing_idx & 7];
+        if (ref_surf != VA_INVALID_SURFACE) {
+            *io_target = ref_surf;
+        }
+        return true;
+    }
+
+    VASurfaceID target = *io_target;
+    for (uint32_t idx = 0; idx < pool_size; ++idx) {
+        VASurfaceID s = dec->surfaces[idx];
+        bool in_dpb = false;
+        for (int r = 0; r < 8; ++r) {
+            if (dec->av1_ref_frames[r] == s) {
+                in_dpb = true;
+                break;
+            }
+        }
+        bool compositor_busy = dec->surface_busy_mask && dec->surface_busy_mask[idx];
+        if (!in_dpb && !compositor_busy) {
+            dec->current_surface_idx = idx;
+            target = s;
+            break;
+        }
+    }
+    *io_target = target;
+    pic_param->current_frame = target;
+    pic_param->current_display_picture = target;
+    for (int i = 0; i < 8; ++i) {
+        pic_param->ref_frame_map[i] = dec->av1_ref_frames[i];
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (refresh_flags & (1U << i)) {
+            dec->av1_ref_frames[i] = target;
+            dec->av1_ref_order_hints[i] = pic_param->order_hint;
+        }
+    }
+    if (av1_slice_count == 0) {
+        av1_slices[0].slice_data_size = (uint32_t)pkt->size;
+        av1_slices[0].slice_data_offset = 0;
+        av1_slices[0].slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+        av1_slice_count = 1;
+    }
+
+    VAStatus st = vaBeginPicture(dec->va_display, dec->va_context, target);
+    if (st != VA_STATUS_SUCCESS) {
+        WAYWAL_LOG_ERR("vaBeginPicture failed: %s", vaErrorStr(st));
+        return false;
+    }
+
+    VABufferID av1_bufs[3] = {VA_INVALID_ID, VA_INVALID_ID, VA_INVALID_ID};
+    uint32_t av1_num_bufs = 0;
+    if (vaCreateBuffer(dec->va_display, dec->va_context, VAPictureParameterBufferType,
+                       sizeof(*pic_param), 1, pic_param,
+                       &av1_bufs[av1_num_bufs]) == VA_STATUS_SUCCESS) {
+        av1_num_bufs++;
+    }
+    if (vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
+                       sizeof(VASliceParameterBufferAV1), av1_slice_count, av1_slices,
+                       &av1_bufs[av1_num_bufs]) == VA_STATUS_SUCCESS) {
+        av1_num_bufs++;
+    }
+    if (pkt->size > 0 && pkt->data &&
+        vaCreateBuffer(dec->va_display, dec->va_context, VASliceDataBufferType, (uint32_t)pkt->size,
+                       1, (void *)pkt->data, &av1_bufs[av1_num_bufs]) == VA_STATUS_SUCCESS) {
+        av1_num_bufs++;
+    }
+    if (av1_num_bufs > 0) {
+        vaRenderPicture(dec->va_display, dec->va_context, av1_bufs, (int)av1_num_bufs);
+        for (uint32_t b = 0; b < av1_num_bufs; ++b) {
+            vaDestroyBuffer(dec->va_display, av1_bufs[b]);
+        }
+    }
+    vaEndPicture(dec->va_display, dec->va_context);
+    return true;
+}
+
 bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt,
                                  VASurfaceID *out_surface)
 {
@@ -3703,6 +3812,9 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         return false;
 
     uint32_t pool_size = dec->num_surfaces > 0 ? dec->num_surfaces : WAYWAL_VA_SURFACE_POOL_SIZE;
+    bool is_vp9 =
+        (dec->va_profile == VAProfileVP9Profile0 || dec->va_profile == VAProfileVP9Profile2);
+    bool is_av1 = (dec->va_profile == VAProfileAV1Profile0);
 
     /* Pick the lowest-index free surface not in DPB or held by reorder/compositor
      * so nvidia_drv_video's lazy direct_realiseSurface allocates VRAM only for the
@@ -3710,16 +3822,20 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
     for (uint32_t idx = 0; idx < pool_size; ++idx) {
         VASurfaceID s = dec->surfaces[idx];
         bool in_dpb = false;
-        for (size_t d = 0; d < dec->dpb.count; ++d) {
-            if (dec->dpb.entries[d].surface == s) {
-                in_dpb = true;
-                break;
+        if (!is_vp9 && !is_av1) {
+            for (size_t d = 0; d < dec->dpb.count; ++d) {
+                if (dec->dpb.entries[d].surface == s) {
+                    in_dpb = true;
+                    break;
+                }
             }
-        }
-        for (int r = 0; r < 8 && !in_dpb; ++r) {
-            if (dec->vp9_ref_frames[r] == s || dec->av1_ref_frames[r] == s) {
-                in_dpb = true;
-                break;
+        } else {
+            for (int r = 0; r < 8; ++r) {
+                if ((is_vp9 && dec->vp9_ref_frames[r] == s) ||
+                    (is_av1 && dec->av1_ref_frames[r] == s)) {
+                    in_dpb = true;
+                    break;
+                }
             }
         }
         bool compositor_busy = dec->surface_busy_mask && dec->surface_busy_mask[idx];
@@ -3731,11 +3847,9 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
 
     VASurfaceID target = dec->surfaces[dec->current_surface_idx];
     bool picture_begun = false;
-    bool is_vp9 =
-        (dec->va_profile == VAProfileVP9Profile0 || dec->va_profile == VAProfileVP9Profile2);
 
     VAStatus st = VA_STATUS_SUCCESS;
-    if (!is_vp9) {
+    if (!is_vp9 && !is_av1) {
         st = vaBeginPicture(dec->va_display, dec->va_context, target);
         if (st != VA_STATUS_SUCCESS) {
             WAYWAL_LOG_ERR("vaBeginPicture failed: %s", vaErrorStr(st));
@@ -4063,7 +4177,7 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         pic_param.pic_height_in_luma_samples =
             sps.valid ? sps.pic_height_in_luma_samples : (uint16_t)dec->height;
         for (int i = 0; i < 15; ++i) {
-            if (i < (int)dec->dpb.count && i < 8) {
+            if (i < (int)dec->dpb.count && i < 15) {
                 pic_param.ReferenceFrames[i].picture_id = dec->dpb.entries[i].surface;
                 pic_param.ReferenceFrames[i].pic_order_cnt = dec->dpb.entries[i].pic_order_cnt;
                 pic_param.ReferenceFrames[i].flags = (dec->dpb.entries[i].pic_order_cnt <= curr_poc)
@@ -4247,7 +4361,7 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                 bufs[num_bufs++] = slice_buf;
             }
         }
-    } else if (dec->va_profile == VAProfileVP9Profile0 || dec->va_profile == VAProfileVP9Profile2) {
+    } else if (is_vp9) {
         const uint8_t *sub_ptrs[8];
         size_t sub_sizes[8];
         uint32_t num_subframes = vp9_split_superframe(pkt->data, pkt->size, sub_ptrs, sub_sizes);
@@ -4351,7 +4465,6 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                 }
             }
             vaEndPicture(dec->va_display, dec->va_context);
-            vaSyncSurface(dec->va_display, target);
         }
 
         if (is_idr_pic) {
@@ -4359,13 +4472,15 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             curr_frame_num = 0;
             curr_poc = 0;
         }
-    } else if (dec->va_profile == VAProfileAV1Profile0) {
+    } else if (is_av1) {
         VADecPictureParameterBufferAV1 pic_param;
         VASliceParameterBufferAV1 av1_slices[64];
         uint32_t av1_slice_count = 0;
         uint8_t tile_size_bytes_minus_1 = 0;
         bool av1_show_existing = false;
         uint8_t av1_show_existing_idx = 0;
+        bool av1_frame_active = false;
+        bool submitted_any_av1 = false;
         memset(&pic_param, 0, sizeof(pic_param));
         memset(av1_slices, 0, sizeof(av1_slices));
         pic_param.current_frame = target;
@@ -4400,10 +4515,45 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             if (obu_type == 1) {
                 parse_av1_sequence_header(pkt->data + off, obu_sz, &dec->cached_av1_seq);
             } else if (obu_type == 3 || obu_type == 6) {
+                if (av1_frame_active) {
+                    if (!submit_av1_frame_to_va(
+                            dec, pool_size, &pic_param, av1_slices, av1_slice_count, pkt,
+                            refresh_flags, av1_show_existing, av1_show_existing_idx, &target)) {
+                        return false;
+                    }
+                    submitted_any_av1 = true;
+                    av1_frame_active = false;
+                    av1_slice_count = 0;
+                }
+                memset(&pic_param, 0, sizeof(pic_param));
+                memset(av1_slices, 0, sizeof(av1_slices));
+                pic_param.current_frame = target;
+                pic_param.current_display_picture = target;
+                pic_param.frame_width_minus1 = (uint16_t)(dec->width - 1);
+                pic_param.frame_height_minus1 = (uint16_t)(dec->height - 1);
+                for (int i = 0; i < 8; ++i) {
+                    pic_param.ref_frame_map[i] = dec->av1_ref_frames[i];
+                }
+                bool frame_is_idr = false;
                 parse_av1_frame_header(dec, pkt->data + off, obu_sz, obu_type, (uint32_t)off,
                                        &pic_param, av1_slices, 64, &av1_slice_count,
-                                       &tile_size_bytes_minus_1, &refresh_flags, &is_idr_pic,
+                                       &tile_size_bytes_minus_1, &refresh_flags, &frame_is_idr,
                                        &av1_show_existing, &av1_show_existing_idx);
+                if (frame_is_idr) {
+                    is_idr_pic = true;
+                }
+                if (obu_type == 6 || av1_show_existing) {
+                    if (!submit_av1_frame_to_va(
+                            dec, pool_size, &pic_param, av1_slices, av1_slice_count, pkt,
+                            refresh_flags, av1_show_existing, av1_show_existing_idx, &target)) {
+                        return false;
+                    }
+                    submitted_any_av1 = true;
+                    av1_frame_active = false;
+                    av1_slice_count = 0;
+                } else {
+                    av1_frame_active = true;
+                }
             } else if (obu_type == 4 && obu_sz > 0 && av1_slice_count < 64) {
                 av1_slice_count += parse_av1_tile_group_obu(
                     pkt->data + off, obu_sz, 0, (uint32_t)off, &pic_param, tile_size_bytes_minus_1,
@@ -4412,37 +4562,12 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             off += obu_sz;
         }
 
-        if (av1_show_existing) {
-            VASurfaceID ref_surf = dec->av1_ref_frames[av1_show_existing_idx & 7];
-            if (ref_surf != VA_INVALID_SURFACE) {
-                target = ref_surf;
+        if (av1_frame_active || !submitted_any_av1) {
+            if (!submit_av1_frame_to_va(dec, pool_size, &pic_param, av1_slices, av1_slice_count,
+                                        pkt, refresh_flags, av1_show_existing,
+                                        av1_show_existing_idx, &target)) {
+                return false;
             }
-        } else {
-            for (int i = 0; i < 8; ++i) {
-                if (refresh_flags & (1U << i)) {
-                    dec->av1_ref_frames[i] = target;
-                    dec->av1_ref_order_hints[i] = pic_param.order_hint;
-                }
-            }
-            if (av1_slice_count == 0) {
-                av1_slices[0].slice_data_size = (uint32_t)pkt->size;
-                av1_slices[0].slice_data_offset = 0;
-                av1_slices[0].slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
-                av1_slice_count = 1;
-            }
-
-            VABufferID pic_buf = VA_INVALID_ID;
-            st = vaCreateBuffer(dec->va_display, dec->va_context, VAPictureParameterBufferType,
-                                sizeof(pic_param), 1, &pic_param, &pic_buf);
-            if (st == VA_STATUS_SUCCESS)
-                bufs[num_bufs++] = pic_buf;
-
-            VABufferID slice_buf = VA_INVALID_ID;
-            st = vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
-                                sizeof(VASliceParameterBufferAV1), av1_slice_count, av1_slices,
-                                &slice_buf);
-            if (st == VA_STATUS_SUCCESS)
-                bufs[num_bufs++] = slice_buf;
         }
 
         if (is_idr_pic) {
@@ -4478,68 +4603,65 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         if (st != VA_STATUS_SUCCESS) {
             WAYWAL_LOG_WARN("vaEndPicture returned: %s", vaErrorStr(st));
         }
+    }
 
-        st = vaSyncSurface(dec->va_display, target);
-        if (st != VA_STATUS_SUCCESS) {
-            WAYWAL_LOG_WARN("vaSyncSurface returned: %s", vaErrorStr(st));
+    if (!is_vp9 && !is_av1) {
+        /* Update DPB state machine with MMCO and FIFO sliding-window eviction */
+        uint32_t max_refs = 8;
+        if (dec->cached_sps.valid && dec->cached_sps.num_ref_frames > 0) {
+            max_refs = dec->cached_sps.num_ref_frames;
+        } else if (dec->cached_hevc_sps.valid) {
+            max_refs = (uint32_t)dec->cached_hevc_sps.sps_max_dec_pic_buffering_minus1 + 1;
+            if (max_refs > 15)
+                max_refs = 15;
         }
-    }
-
-    /* Update DPB state machine with MMCO and FIFO sliding-window eviction */
-    uint32_t max_refs = 8;
-    if (dec->cached_sps.valid && dec->cached_sps.num_ref_frames > 0) {
-        max_refs = dec->cached_sps.num_ref_frames;
-    } else if (dec->cached_hevc_sps.valid) {
-        max_refs = (uint32_t)dec->cached_hevc_sps.sps_max_dec_pic_buffering_minus1 + 1;
-        if (max_refs > 8)
-            max_refs = 8;
-    }
-    if (max_refs > 16) {
-        max_refs = 16;
-    }
-    if (max_refs < 1) {
-        max_refs = 1;
-    }
-
-    if (is_idr_pic || sh_meta.mmco_reset) {
-        dec->dpb.count = 0;
-        if (sh_meta.mmco_reset) {
-            curr_frame_num = 0;
-            curr_poc = 0;
-            dec->prev_poc_msb = 0;
-            dec->prev_poc_lsb = 0;
+        if (max_refs > 16) {
+            max_refs = 16;
         }
-    } else if (sh_meta.num_unmark > 0) {
-        for (uint32_t u = 0; u < sh_meta.num_unmark; ++u) {
-            int32_t target_pn = sh_meta.unmark_pic_nums[u];
-            for (size_t d = 0; d < dec->dpb.count; ++d) {
-                if (!dec->dpb.entries[d].is_long_term &&
-                    dec->dpb.entries[d].frame_num == target_pn) {
-                    if (d + 1 < dec->dpb.count) {
-                        memmove(&dec->dpb.entries[d], &dec->dpb.entries[d + 1],
-                                (dec->dpb.count - d - 1) * sizeof(h264_dpb_entry_t));
+        if (max_refs < 1) {
+            max_refs = 1;
+        }
+
+        if (is_idr_pic || sh_meta.mmco_reset) {
+            dec->dpb.count = 0;
+            if (sh_meta.mmco_reset) {
+                curr_frame_num = 0;
+                curr_poc = 0;
+                dec->prev_poc_msb = 0;
+                dec->prev_poc_lsb = 0;
+            }
+        } else if (sh_meta.num_unmark > 0) {
+            for (uint32_t u = 0; u < sh_meta.num_unmark; ++u) {
+                int32_t target_pn = sh_meta.unmark_pic_nums[u];
+                for (size_t d = 0; d < dec->dpb.count; ++d) {
+                    if (!dec->dpb.entries[d].is_long_term &&
+                        dec->dpb.entries[d].frame_num == target_pn) {
+                        if (d + 1 < dec->dpb.count) {
+                            memmove(&dec->dpb.entries[d], &dec->dpb.entries[d + 1],
+                                    (dec->dpb.count - d - 1) * sizeof(h264_dpb_entry_t));
+                        }
+                        dec->dpb.count--;
+                        break;
                     }
-                    dec->dpb.count--;
-                    break;
                 }
             }
         }
-    }
 
-    if (is_ref_pic) {
-        while (dec->dpb.count >= max_refs) {
-            memmove(&dec->dpb.entries[0], &dec->dpb.entries[1],
-                    (dec->dpb.count - 1) * sizeof(h264_dpb_entry_t));
-            dec->dpb.count--;
+        if (is_ref_pic) {
+            while (dec->dpb.count >= max_refs) {
+                memmove(&dec->dpb.entries[0], &dec->dpb.entries[1],
+                        (dec->dpb.count - 1) * sizeof(h264_dpb_entry_t));
+                dec->dpb.count--;
+            }
+
+            dec->dpb.entries[dec->dpb.count++] = (h264_dpb_entry_t){
+                .surface = target,
+                .frame_num = curr_frame_num,
+                .pic_order_cnt = curr_poc,
+                .is_reference = true,
+                .is_long_term = false,
+            };
         }
-
-        dec->dpb.entries[dec->dpb.count++] = (h264_dpb_entry_t){
-            .surface = target,
-            .frame_num = curr_frame_num,
-            .pic_order_cnt = curr_poc,
-            .is_reference = true,
-            .is_long_term = false,
-        };
     }
     dec->last_decoded_poc = curr_poc;
     dec->last_decoded_is_idr = is_idr_pic;
@@ -4557,6 +4679,8 @@ bool vaapi_decoder_vpp_blit(vaapi_decoder_t *dec, VASurfaceID src_surface,
         dst_vpp_surface == VA_INVALID_SURFACE) {
         return false;
     }
+
+    vaSyncSurface(dec->va_display, src_surface);
 
     VARectangle in_rect = {
         .x = 0, .y = 0, .width = (uint16_t)dec->width, .height = (uint16_t)dec->height};
@@ -4587,6 +4711,26 @@ bool vaapi_decoder_vpp_blit(vaapi_decoder_t *dec, VASurfaceID src_surface,
             break;
         }
         if (dec->cached_sps.video_full_range_flag) {
+            vpp_param.input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
+        }
+    } else if (dec->cached_hevc_sps.valid) {
+        switch (dec->cached_hevc_sps.matrix_coefficients) {
+        case 1:
+            color_std = VAProcColorStandardBT709;
+            break;
+        case 5:
+        case 6:
+            color_std = VAProcColorStandardBT601;
+            break;
+        case 9:
+        case 10:
+            color_std = VAProcColorStandardBT2020;
+            break;
+        default:
+            color_std = VAProcColorStandardNone;
+            break;
+        }
+        if (dec->cached_hevc_sps.video_full_range_flag) {
             vpp_param.input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
         }
     } else if (dec->cached_av1_seq.valid) {
@@ -4671,6 +4815,7 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
     if (!dec || !dec->initialized || surface == VA_INVALID_SURFACE || !out_frame) {
         return false;
     }
+    vaSyncSurface(dec->va_display, surface);
     memset(out_frame, 0, sizeof(*out_frame));
     for (int i = 0; i < 4; ++i)
         out_frame->fds[i] = -1;

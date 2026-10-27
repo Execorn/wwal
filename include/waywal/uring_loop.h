@@ -10,7 +10,8 @@
 extern "C" {
 #endif
 
-#define WAYWAL_URING_QUEUE_DEPTH 64
+#define WAYWAL_URING_QUEUE_DEPTH  128
+#define WAYWAL_URING_MAX_HANDLERS 128
 
 typedef enum {
     URING_EV_WAYLAND_READ = 1,
@@ -31,6 +32,8 @@ typedef struct {
     uint32_t poll_mask;
     uring_event_type_t type;
     void *user_data;
+    uint32_t gen;
+    uint64_t in_flight_tag;
     bool active;
     bool is_multishot;
     bool in_flight;
@@ -38,7 +41,7 @@ typedef struct {
 
 typedef struct {
     struct io_uring ring;
-    uring_slot_t slots[WAYWAL_URING_QUEUE_DEPTH];
+    uring_slot_t slots[WAYWAL_URING_MAX_HANDLERS];
     size_t num_slots;
     bool initialized;
     bool running;

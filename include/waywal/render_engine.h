@@ -53,8 +53,15 @@ bool render_engine_upload_static(render_engine_t *re, const uint8_t *src_rgba, u
                                  uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t scaling_mode,
                                  uint32_t clear_color);
 
+bool render_engine_copy_bo(render_engine_t *re, dmabuf_bo_t *dst_bo, dmabuf_bo_t *src_bo,
+                           uint32_t scaling_mode, uint32_t clear_color, bool release_src_gl);
+
+void render_engine_make_current(render_engine_t *re);
+
 void render_engine_set_span_bounds(render_engine_t *re, int32_t off_x, int32_t off_y,
                                    int32_t total_w, int32_t total_h);
+
+void render_engine_bump_upload_gen(render_engine_t *re);
 
 /* Hot-compiles and loads an arbitrary GLSL compute shader for CUSTOM transition */
 bool render_engine_load_custom_shader(render_engine_t *re, const char *shader_src);

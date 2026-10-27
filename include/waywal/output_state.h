@@ -3,6 +3,7 @@
 #define WAYWAL_OUTPUT_STATE_H
 
 #include "waywal/dmabuf.h"
+#include "waywal/ipc_proto.h"
 #include "waywal/presentation.h"
 #include "waywal/render_engine.h"
 #include "waywal/types.h"
@@ -19,6 +20,10 @@ extern "C" {
 #endif
 
 struct daemon_state;
+struct waywal_shader_engine;
+struct waywal_anim_decoder;
+struct video_engine;
+struct slideshow_engine;
 typedef struct output_node output_node_t;
 typedef struct output_node output_state_t;
 
@@ -87,6 +92,30 @@ struct output_node {
     dmabuf_bo_t source_new_bo;
     bool has_source_old_bo;
     bool has_source_new_bo;
+    dmabuf_bo_t *last_presented_bo;
+
+    struct waywal_shader_engine *shader_eng;
+    bool shader_active;
+    bool shader_audio_reactive;
+    uint32_t shader_fps;
+    uint64_t shader_frame_idx;
+    uint64_t shader_start_ns;
+    uint64_t shader_last_ns;
+    char shader_path[4096];
+
+    struct we_scene *we_scene;
+    bool workshop_active;
+    char workshop_dir[4096];
+    char workshop_props[2048];
+
+    struct waywal_anim_decoder *anim_dec;
+    bool anim_active;
+    uint32_t anim_delay_ms;
+    uint64_t anim_next_ns;
+    waywal_img_metadata_t anim_meta;
+
+    struct video_engine *video_eng;
+    struct slideshow_engine *slideshow_eng;
 
     /* Presentation synchronization */
     presentation_sync_t pres_sync;

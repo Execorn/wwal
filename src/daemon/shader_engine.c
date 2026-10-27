@@ -68,9 +68,19 @@ struct dmabuf_context {
 #include <GLES2/gl2ext.h>
 // clang-format on
 
-#define SHADER_CACHE_MAGIC 0x57534842u /* "WSHB" */
-#define SHADER_NUM_PASSES  5           /* 0..3 = BUFFER_A..D, 4 = IMAGE */
-#define SHADER_NOISE_DIM   256u
+#define SHADER_CACHE_MAGIC         0x57534842u /* "WSHB" */
+#define SHADER_NUM_PASSES          5           /* 0..3 = BUFFER_A..D, 4 = IMAGE */
+#define SHADER_NOISE_DIM           256u
+#define SHADER_MAX_CUSTOM_UNIFORMS 64
+
+typedef struct {
+    bool active;
+    char name[64];
+    uint32_t num_components;
+    float values[4];
+    GLint locations[SHADER_NUM_PASSES];
+    GLenum types[SHADER_NUM_PASSES];
+} shader_custom_uniform_t;
 
 typedef enum {
     SHADER_CHAN_AUDIO = 0,
@@ -82,6 +92,7 @@ typedef enum {
     SHADER_CHAN_WALLPAPER = 6,
     SHADER_CHAN_DEPTH = 7,
     SHADER_CHAN_IMAGE = 8,
+    SHADER_CHAN_ALBUM_ART = 9,
 } shader_channel_target_t;
 
 typedef struct {
@@ -112,8 +123,12 @@ typedef struct {
     GLint u_mouse_vel;
     GLint u_workspace_offset;
     GLint u_depth_strength;
+    GLint u_span_rect;
+    GLint u_local_size;
     GLint u_swap_rb;
     GLint u_flip_y;
+    GLint u_album_art;
+    GLint u_media_playing;
 } shader_uniforms_t;
 
 typedef struct {
@@ -126,6 +141,7 @@ typedef struct {
 
 typedef struct {
     bool active;
+    bool is_compute;
     GLuint prog;
     shader_uniforms_t uniforms;
     shader_channel_binding_t channels[4];
@@ -136,10 +152,14 @@ typedef struct {
     bool uniforms_initialized;
     uint32_t cached_res_w;
     uint32_t cached_res_h;
+    uint32_t cached_local_w;
+    uint32_t cached_local_h;
     int cached_swap_rb;
     int cached_flip_y;
     float cached_depth_strength;
     float cached_workspace_offset[2];
+    float cached_span_rect[4];
+    bool needs_mipmap;
 } shader_pass_t;
 
 struct waywal_shader_engine {
@@ -153,10 +173,17 @@ struct waywal_shader_engine {
     GLuint wallpaper_tex;
     uint32_t wallpaper_w;
     uint32_t wallpaper_h;
+    GLuint album_art_tex;
+    uint32_t album_art_w;
+    uint32_t album_art_h;
+    float media_playing;
     GLuint depth_tex;
     uint32_t depth_w;
     uint32_t depth_h;
     float depth_strength;
+
+    shader_custom_uniform_t custom_uniforms[SHADER_MAX_CUSTOM_UNIFORMS];
+    uint32_t num_custom_uniforms;
 
     GLuint scratch_tex;
     uint32_t scratch_w;
@@ -165,6 +192,7 @@ struct waywal_shader_engine {
     GLuint draw_fbo;
     GLuint prog_blit;
     GLuint blit_vao;
+    GLuint last_complete_bo_tex;
 
     bool last_from_cache;
 
@@ -188,75 +216,70 @@ struct waywal_shader_engine {
         dmabuf_bo_t *bo;
         GLuint gl_tex;
         EGLImageKHR egl_image;
+        bool owns_egl;
     } imported_bos[32];
     size_t num_imported_bos;
 };
 
-static const char SHADERTOY_PROLOGUE[] =
-    "precision highp float;\n"
-    "precision highp int;\n"
-    "layout(local_size_x = 16, local_size_y = 16) in;\n"
-    "#ifdef IMAGE_PASS\n"
-    "layout(rgba8, binding = 0) writeonly uniform highp image2D u_dst;\n"
-    "#else\n"
-    "layout(rgba16f, binding = 0) writeonly uniform highp image2D u_dst;\n"
-    "#endif\n"
-    "uniform vec3 iResolution;\n"
-    "uniform float iTime;\n"
-    "uniform float iTimeDelta;\n"
-    "uniform int iFrame;\n"
-    "uniform vec4 iMouse;\n"
-    "uniform vec4 iDate;\n"
-    "uniform float iSampleRate;\n"
-    "uniform highp sampler2D iChannel0;\n"
-    "uniform highp sampler2D iChannel1;\n"
-    "uniform highp sampler2D iChannel2;\n"
-    "uniform highp sampler2D iChannel3;\n"
-    "uniform vec3 iChannelResolution[4];\n"
-    "uniform float iChannelTime[4];\n"
-    "uniform float u_audio_bands[64];\n"
-    "uniform float u_audio_envelope;\n"
-    "uniform float u_audio_beat;\n"
-    "uniform vec3 u_palette_primary;\n"
-    "uniform vec3 u_palette_secondary;\n"
-    "uniform vec3 u_palette_tertiary;\n"
-    "uniform vec4 u_mouse_smooth;\n"
-    "uniform vec2 u_mouse_vel;\n"
-    "uniform vec2 u_workspace_offset;\n"
-    "uniform float u_depth_strength;\n"
-    "uniform int u_swap_rb;\n"
-    "uniform int u_flip_y;\n"
-    "\n";
+static const char SHADERTOY_PROLOGUE[] = "precision highp float;\n"
+                                         "precision highp int;\n"
+                                         "out highp vec4 waywal_FragColor;\n"
+                                         "uniform vec3 iResolution;\n"
+                                         "uniform float iTime;\n"
+                                         "uniform float iTimeDelta;\n"
+                                         "uniform int iFrame;\n"
+                                         "uniform vec4 iMouse;\n"
+                                         "uniform vec4 iDate;\n"
+                                         "uniform float iSampleRate;\n"
+                                         "uniform highp sampler2D iChannel0;\n"
+                                         "uniform highp sampler2D iChannel1;\n"
+                                         "uniform highp sampler2D iChannel2;\n"
+                                         "uniform highp sampler2D iChannel3;\n"
+                                         "uniform vec3 iChannelResolution[4];\n"
+                                         "uniform float iChannelTime[4];\n"
+                                         "uniform float u_audio_bands[64];\n"
+                                         "uniform float u_audio_envelope;\n"
+                                         "uniform float u_audio_beat;\n"
+                                         "uniform vec3 u_palette_primary;\n"
+                                         "uniform vec3 u_palette_secondary;\n"
+                                         "uniform vec3 u_palette_tertiary;\n"
+                                         "uniform vec4 u_mouse_smooth;\n"
+                                         "uniform vec2 u_mouse_vel;\n"
+                                         "uniform vec2 u_workspace_offset;\n"
+                                         "uniform float u_depth_strength;\n"
+                                         "uniform vec4 u_span_rect;\n"
+                                         "uniform vec2 u_local_size;\n"
+                                         "uniform int u_swap_rb;\n"
+                                         "uniform int u_flip_y;\n"
+                                         "uniform highp sampler2D u_album_art;\n"
+                                         "uniform float u_media_playing;\n"
+                                         "\n";
 
 static const char SHADERTOY_EPILOGUE[] =
     "\n"
     "void main() {\n"
-    "    ivec2 px = ivec2(gl_GlobalInvocationID.xy);\n"
-    "    int w = int(iResolution.x);\n"
-    "    int h = int(iResolution.y);\n"
-    "    if (px.x >= w || px.y >= h) {\n"
-    "        return;\n"
-    "    }\n"
-    "    float fy = (u_flip_y != 0) ? float(h - 1 - px.y) : float(px.y);\n"
-    "    vec2 fragCoord = vec2(float(px.x) + 0.5, fy + 0.5);\n"
+    "    float local_y = (u_flip_y != 0) ? (u_local_size.y - gl_FragCoord.y) : gl_FragCoord.y;\n"
+    "    vec2 fragCoord = vec2(gl_FragCoord.x, local_y) + u_span_rect.xy;\n"
     "    vec4 fragColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
     "    mainImage(fragColor, fragCoord);\n"
     "#ifdef IMAGE_PASS\n"
     "    fragColor = clamp(fragColor, 0.0, 1.0);\n"
     "    if (u_swap_rb != 0) {\n"
-    "        imageStore(u_dst, px, vec4(fragColor.bgr, 1.0));\n"
+    "        waywal_FragColor = vec4(fragColor.bgr, 1.0);\n"
     "    } else {\n"
-    "        imageStore(u_dst, px, vec4(fragColor.rgb, 1.0));\n"
+    "        waywal_FragColor = vec4(fragColor.rgb, 1.0);\n"
     "    }\n"
     "#else\n"
-    "    imageStore(u_dst, px, fragColor);\n"
+    "    waywal_FragColor = fragColor;\n"
     "#endif\n"
     "}\n";
 
 static const char DEPTH_PARALLAX_POM_SHADER[] =
     "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
     "    vec2 dst_res = max(iResolution.xy, vec2(1.0));\n"
-    "    vec2 src_res = max(iChannelResolution[0].xy, dst_res);\n"
+    "    vec2 src_res = (iChannelResolution[0].x > 1.0 && iChannelResolution[0].y > 1.0)\n"
+    "                       ? iChannelResolution[0].xy\n"
+    "                       : dst_res;\n"
     "    vec2 uv = fragCoord / dst_res;\n"
     "    uv.y = 1.0 - uv.y;\n"
     "    float r_src = src_res.x / src_res.y;\n"
@@ -268,31 +291,48 @@ static const char DEPTH_PARALLAX_POM_SHADER[] =
     "        float scale = r_src / r_dst;\n"
     "        uv.y = (uv.y - 0.5) * scale + 0.5;\n"
     "    }\n"
-    "    vec2 mouse_norm = (u_mouse_smooth.xy / dst_res) - vec2(0.5);\n"
+    "    vec2 mouse_pos = (u_mouse_smooth.x > 0.0 || u_mouse_smooth.y > 0.0)\n"
+    "                         ? u_mouse_smooth.xy\n"
+    "                         : (dst_res * 0.5);\n"
+    "    vec2 mouse_norm = (mouse_pos / dst_res) - vec2(0.5);\n"
     "    mouse_norm.y = -mouse_norm.y;\n"
     "    float strength = (u_depth_strength > 0.0) ? u_depth_strength : 1.0;\n"
     "    vec2 parallax = (mouse_norm * 0.045 + u_workspace_offset * 0.025) * strength;\n"
     "    uv = (uv - 0.5) * 0.94 + 0.5;\n"
-    "    const int NUM_STEPS = 16;\n"
-    "    float step_size = 1.0 / float(NUM_STEPS);\n"
-    "    vec2 delta_uv = parallax / float(NUM_STEPS);\n"
+    "    vec2 ddx = dFdx(uv);\n"
+    "    vec2 ddy = dFdy(uv);\n"
+    "    int num_steps = int(mix(6.0, 20.0, clamp(length(parallax) / 0.04, 0.0, 1.0)));\n"
+    "    float step_size = 1.0 / float(num_steps);\n"
+    "    vec2 delta_uv = parallax * step_size;\n"
     "    vec2 cur_uv = uv;\n"
     "    float cur_layer = 0.0;\n"
-    "    float cur_depth = 1.0 - texture(iChannel1, clamp(cur_uv, 0.0, 1.0)).r;\n"
-    "    for (int i = 0; i < NUM_STEPS; ++i) {\n"
-    "        if (cur_layer >= cur_depth) {\n"
+    "    float cur_depth = 1.0 - textureGrad(iChannel1, clamp(cur_uv, 0.0, 1.0), ddx, ddy).r;\n"
+    "    float prev_depth = cur_depth;\n"
+    "    for (int i = 0; i < 20; ++i) {\n"
+    "        if (i >= num_steps || cur_layer >= cur_depth) {\n"
     "            break;\n"
     "        }\n"
+    "        prev_depth = cur_depth;\n"
     "        cur_uv -= delta_uv;\n"
-    "        cur_depth = 1.0 - texture(iChannel1, clamp(cur_uv, 0.0, 1.0)).r;\n"
+    "        cur_depth = 1.0 - textureGrad(iChannel1, clamp(cur_uv, 0.0, 1.0), ddx, ddy).r;\n"
     "        cur_layer += step_size;\n"
     "    }\n"
     "    vec2 prev_uv = cur_uv + delta_uv;\n"
     "    float after_depth = cur_depth - cur_layer;\n"
-    "    float before_depth = (1.0 - texture(iChannel1, clamp(prev_uv, 0.0, 1.0)).r) -\n"
-    "                         cur_layer + step_size;\n"
+    "    float before_depth = prev_depth - cur_layer + step_size;\n"
     "    float weight = clamp(after_depth / max(after_depth - before_depth, 1e-4), 0.0, 1.0);\n"
     "    vec2 final_uv = clamp(mix(cur_uv, prev_uv, weight), 0.0, 1.0);\n"
+    "    float mid_depth = 1.0 - textureGrad(iChannel1, final_uv, ddx, ddy).r;\n"
+    "    float mid_layer = mix(cur_layer, cur_layer - step_size, weight);\n"
+    "    if (mid_depth < mid_layer) {\n"
+    "        float w2 = clamp((mid_depth - mid_layer) /\n"
+    "                         max((mid_depth - mid_layer) - before_depth, 1e-4), 0.0, 1.0);\n"
+    "        final_uv = clamp(mix(final_uv, prev_uv, w2), 0.0, 1.0);\n"
+    "    } else {\n"
+    "        float w2 = clamp(after_depth /\n"
+    "                         max(after_depth - (mid_depth - mid_layer), 1e-4), 0.0, 1.0);\n"
+    "        final_uv = clamp(mix(cur_uv, final_uv, w2), 0.0, 1.0);\n"
+    "    }\n"
     "    fragColor = vec4(texture(iChannel0, final_uv).rgb, 1.0);\n"
     "}\n";
 
@@ -455,18 +495,25 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
     bool sec_present[SHADER_NUM_PASSES];
     bool use_sections = has_any_section_markers(user_src, sec_present);
 
+    static const char ver_hdr[] = "#version 310 es\n";
+    size_t ver_len = sizeof(ver_hdr) - 1u;
     size_t pro_len = sizeof(SHADERTOY_PROLOGUE) - 1u;
     size_t def_len = strlen(pass_defines[pass_idx]);
     size_t src_len = strlen(user_src);
     size_t epi_len = sizeof(SHADERTOY_EPILOGUE) - 1u;
 
-    char *wrapped = (char *)malloc(pro_len + def_len + src_len + epi_len + 32u);
+    size_t num_lines = 1u;
+    for (size_t i = 0; i < src_len; ++i) {
+        if (user_src[i] == '\n') {
+            num_lines++;
+        }
+    }
+
+    char *wrapped =
+        (char *)malloc(ver_len + pro_len + def_len + src_len + num_lines * 2u + epi_len + 32u);
     if (!wrapped) {
         return NULL;
     }
-
-    static const char ver_hdr[] = "#version 310 es\n";
-    size_t ver_len = sizeof(ver_hdr) - 1u;
     size_t out_off = 0;
     memcpy(wrapped + out_off, ver_hdr, ver_len);
     out_off += ver_len;
@@ -567,6 +614,9 @@ static void parse_channel_target_value(const char *val_str, size_t val_len,
         binding->target = SHADER_CHAN_NOISE;
     } else if (val_len == 9 && strncasecmp(val_str, "wallpaper", 9) == 0) {
         binding->target = SHADER_CHAN_WALLPAPER;
+    } else if ((val_len == 9 && strncasecmp(val_str, "mpris_art", 9) == 0) ||
+               (val_len == 9 && strncasecmp(val_str, "album_art", 9) == 0)) {
+        binding->target = SHADER_CHAN_ALBUM_ART;
     } else if (val_len == 5 && strncasecmp(val_str, "depth", 5) == 0) {
         binding->target = SHADER_CHAN_DEPTH;
     } else if (val_len > 6 && strncasecmp(val_str, "image(", 6) == 0) {
@@ -928,9 +978,17 @@ static void cache_uniform_locations(GLuint prog, shader_uniforms_t *u)
     u->u_mouse_vel = glGetUniformLocation(prog, "u_mouse_vel");
     u->u_workspace_offset = glGetUniformLocation(prog, "u_workspace_offset");
     u->u_depth_strength = glGetUniformLocation(prog, "u_depth_strength");
+    u->u_span_rect = glGetUniformLocation(prog, "u_span_rect");
+    u->u_local_size = glGetUniformLocation(prog, "u_local_size");
     u->u_swap_rb = glGetUniformLocation(prog, "u_swap_rb");
     u->u_flip_y = glGetUniformLocation(prog, "u_flip_y");
+    u->u_album_art = glGetUniformLocation(prog, "u_album_art");
+    u->u_media_playing = glGetUniformLocation(prog, "u_media_playing");
 }
+
+static EGLDisplay s_shared_dpy = EGL_NO_DISPLAY;
+static EGLContext s_shared_ctx = EGL_NO_CONTEXT;
+static uint32_t s_shared_egl_refcount = 0;
 
 static void make_context_current(waywal_shader_engine_t *eng)
 {
@@ -941,21 +999,64 @@ static void make_context_current(waywal_shader_engine_t *eng)
     }
 }
 
-static GLuint create_rgba_texture(const uint8_t *rgba, uint32_t w, uint32_t h, GLint wrap_mode)
+static GLuint create_texture_ex(const uint8_t *pixels, uint32_t w, uint32_t h, GLint wrap_mode,
+                                bool is_bgra)
 {
-    if (!rgba || w == 0 || h == 0) {
+    if (!pixels || w == 0 || h == 0) {
         return 0;
     }
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_mode);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_mode);
+    if (is_bgra) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+    }
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                 rgba);
+                 pixels);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    return tex;
+}
+
+static GLuint create_rgba_texture(const uint8_t *rgba, uint32_t w, uint32_t h, GLint wrap_mode)
+{
+    return create_texture_ex(rgba, w, h, wrap_mode, false);
+}
+
+static GLuint create_r8_depth_texture(const uint8_t *depth_px, uint32_t w, uint32_t h)
+{
+    if (!depth_px || w == 0 || h == 0) {
+        return 0;
+    }
+    size_t npx = (size_t)w * (size_t)h;
+    uint8_t *r8 = (uint8_t *)malloc(npx);
+    if (!r8) {
+        return create_rgba_texture(depth_px, w, h, GL_CLAMP_TO_EDGE);
+    }
+    /* Channel 0 (R in RGBA) or Channel 1 (G in both RGBA and BGRA grayscale depth maps) */
+    for (size_t i = 0; i < npx; ++i) {
+        r8[i] = depth_px[i * 4u];
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_RED);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, (GLsizei)w, (GLsizei)h, 0, GL_RED, GL_UNSIGNED_BYTE, r8);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    free(r8);
     return tex;
 }
 
@@ -1002,8 +1103,27 @@ waywal_shader_engine_t *waywal_shader_engine_create(dmabuf_context_t *dmabuf_ctx
     eng->display = eglGetCurrentDisplay();
     eng->context = eglGetCurrentContext();
 
+    if (eng->display != EGL_NO_DISPLAY && eng->context != EGL_NO_CONTEXT) {
+        if (s_shared_egl_refcount > 0 && eng->display == s_shared_dpy &&
+            eng->context == s_shared_ctx) {
+            eng->owns_egl = true;
+            s_shared_egl_refcount++;
+        }
+    } else if (s_shared_egl_refcount > 0 && s_shared_dpy != EGL_NO_DISPLAY &&
+               s_shared_ctx != EGL_NO_CONTEXT) {
+        if (eglMakeCurrent(s_shared_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, s_shared_ctx)) {
+            eng->display = s_shared_dpy;
+            eng->context = s_shared_ctx;
+            eng->owns_egl = true;
+            s_shared_egl_refcount++;
+        }
+    }
+
     if (eng->display == EGL_NO_DISPLAY || eng->context == EGL_NO_CONTEXT) {
-        if (!dmabuf_ctx || !dmabuf_ctx->gbm || !dmabuf_ctx->available) {
+        if (!dmabuf_ctx) {
+            return eng;
+        }
+        if (!dmabuf_ctx->gbm || !dmabuf_ctx->available) {
             free(eng);
             return NULL;
         }
@@ -1045,6 +1165,9 @@ waywal_shader_engine_t *waywal_shader_engine_create(dmabuf_context_t *dmabuf_ctx
         eng->display = dpy;
         eng->context = ctx;
         eng->owns_egl = true;
+        s_shared_dpy = dpy;
+        s_shared_ctx = ctx;
+        s_shared_egl_refcount = 1;
     }
 
     eng->eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
@@ -1122,7 +1245,27 @@ void waywal_shader_engine_forget_bo(waywal_shader_engine_t *eng, const dmabuf_bo
     }
     size_t dst = 0;
     for (size_t i = 0; i < eng->num_imported_bos; ++i) {
-        if (eng->imported_bos[i].bo != bo) {
+        if (eng->imported_bos[i].bo == bo) {
+            if (eng->last_complete_bo_tex == eng->imported_bos[i].gl_tex) {
+                eng->last_complete_bo_tex = 0;
+            }
+            if (eng->imported_bos[i].owns_egl && eng->display != EGL_NO_DISPLAY &&
+                eng->context != EGL_NO_CONTEXT) {
+                make_context_current(eng);
+                if (eng->imported_bos[i].gl_tex) {
+                    glDeleteTextures(1, &eng->imported_bos[i].gl_tex);
+                    if (eng->imported_bos[i].bo->gl_tex == eng->imported_bos[i].gl_tex) {
+                        eng->imported_bos[i].bo->gl_tex = 0;
+                    }
+                }
+                if (eng->imported_bos[i].egl_image && eng->eglDestroyImageKHR) {
+                    eng->eglDestroyImageKHR(eng->display, eng->imported_bos[i].egl_image);
+                    if (eng->imported_bos[i].bo->egl_image == eng->imported_bos[i].egl_image) {
+                        eng->imported_bos[i].bo->egl_image = NULL;
+                    }
+                }
+            }
+        } else {
             if (dst != i) {
                 eng->imported_bos[dst] = eng->imported_bos[i];
             }
@@ -1150,26 +1293,31 @@ void waywal_shader_engine_destroy(waywal_shader_engine_t *eng)
     if (eng->wallpaper_tex) {
         glDeleteTextures(1, &eng->wallpaper_tex);
     }
+    if (eng->album_art_tex) {
+        glDeleteTextures(1, &eng->album_art_tex);
+    }
     if (eng->depth_tex) {
         glDeleteTextures(1, &eng->depth_tex);
     }
     if (eng->scratch_tex) {
         glDeleteTextures(1, &eng->scratch_tex);
     }
-    if (eng->owns_egl) {
+    if (eng->display != EGL_NO_DISPLAY && eng->context != EGL_NO_CONTEXT) {
         for (size_t i = 0; i < eng->num_imported_bos; ++i) {
+            if (!eng->imported_bos[i].owns_egl) {
+                continue;
+            }
             if (eng->imported_bos[i].gl_tex) {
                 glDeleteTextures(1, &eng->imported_bos[i].gl_tex);
-            }
-            if (eng->imported_bos[i].egl_image && eng->eglDestroyImageKHR &&
-                eng->display != EGL_NO_DISPLAY) {
-                eng->eglDestroyImageKHR(eng->display, eng->imported_bos[i].egl_image);
-            }
-            if (eng->imported_bos[i].bo) {
-                if (eng->imported_bos[i].bo->gl_tex == eng->imported_bos[i].gl_tex) {
+                if (eng->imported_bos[i].bo &&
+                    eng->imported_bos[i].bo->gl_tex == eng->imported_bos[i].gl_tex) {
                     eng->imported_bos[i].bo->gl_tex = 0;
                 }
-                if (eng->imported_bos[i].bo->egl_image == eng->imported_bos[i].egl_image) {
+            }
+            if (eng->imported_bos[i].egl_image && eng->eglDestroyImageKHR) {
+                eng->eglDestroyImageKHR(eng->display, eng->imported_bos[i].egl_image);
+                if (eng->imported_bos[i].bo &&
+                    eng->imported_bos[i].bo->egl_image == eng->imported_bos[i].egl_image) {
                     eng->imported_bos[i].bo->egl_image = NULL;
                 }
             }
@@ -1189,9 +1337,16 @@ void waywal_shader_engine_destroy(waywal_shader_engine_t *eng)
         glDeleteVertexArrays(1, &eng->blit_vao);
     }
     if (eng->owns_egl) {
-        eglMakeCurrent(eng->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        eglDestroyContext(eng->display, eng->context);
-        eglTerminate(eng->display);
+        if (s_shared_egl_refcount > 0) {
+            s_shared_egl_refcount--;
+        }
+        if (s_shared_egl_refcount == 0) {
+            eglMakeCurrent(eng->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            eglDestroyContext(eng->display, eng->context);
+            eglTerminate(eng->display);
+            s_shared_dpy = EGL_NO_DISPLAY;
+            s_shared_ctx = EGL_NO_CONTEXT;
+        }
     }
     if (eng->inotify_fd >= 0) {
         close(eng->inotify_fd);
@@ -1200,8 +1355,15 @@ void waywal_shader_engine_destroy(waywal_shader_engine_t *eng)
 }
 
 static GLuint compile_or_load_pass(waywal_shader_engine_t *eng, const char *wrapped,
-                                   const char *debug_name, bool *out_from_cache)
+                                   const char *debug_name, bool *out_from_cache,
+                                   bool *out_is_compute)
 {
+    bool is_compute =
+        (strstr(wrapped, "local_size_x") != NULL && strstr(wrapped, "waywal_FragColor") == NULL);
+    if (out_is_compute) {
+        *out_is_compute = is_compute;
+    }
+
     uint64_t key = waywal_shader_compute_cache_key(wrapped, eng->gpu_id);
     GLuint prog = try_load_cached_program(key);
     if (prog != 0) {
@@ -1214,36 +1376,88 @@ static GLuint compile_or_load_pass(waywal_shader_engine_t *eng, const char *wrap
         *out_from_cache = false;
     }
 
-    GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
-    if (!shader) {
-        return 0;
-    }
+    if (is_compute) {
+        GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+        if (!shader) {
+            return 0;
+        }
 
-    const char *src_ptr = wrapped;
-    glShaderSource(shader, 1, &src_ptr, NULL);
-    glCompileShader(shader);
+        const char *src_ptr = wrapped;
+        glShaderSource(shader, 1, &src_ptr, NULL);
+        glCompileShader(shader);
 
-    GLint compiled = 0;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
-    if (!compiled) {
-        char log_buf[1024];
-        glGetShaderInfoLog(shader, sizeof(log_buf), NULL, log_buf);
-        WAYWAL_LOG_ERR("Shader compilation failed (%s): %s", debug_name ? debug_name : "live",
-                       log_buf);
+        GLint compiled = 0;
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+        if (!compiled) {
+            char log_buf[1024];
+            glGetShaderInfoLog(shader, sizeof(log_buf), NULL, log_buf);
+            WAYWAL_LOG_ERR("Shader compilation failed (%s): %s", debug_name ? debug_name : "live",
+                           log_buf);
+            glDeleteShader(shader);
+            return 0;
+        }
+
+        prog = glCreateProgram();
+        if (!prog) {
+            glDeleteShader(shader);
+            return 0;
+        }
+
+        glProgramParameteri(prog, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+        glAttachShader(prog, shader);
+        glLinkProgram(prog);
         glDeleteShader(shader);
-        return 0;
-    }
+    } else {
+        static const char *vs_src =
+            "#version 310 es\n"
+            "void main() {\n"
+            "    vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
 
-    prog = glCreateProgram();
-    if (!prog) {
-        glDeleteShader(shader);
-        return 0;
-    }
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+        GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+        if (!vs || !fs) {
+            if (vs)
+                glDeleteShader(vs);
+            if (fs)
+                glDeleteShader(fs);
+            return 0;
+        }
 
-    glProgramParameteri(prog, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
-    glAttachShader(prog, shader);
-    glLinkProgram(prog);
-    glDeleteShader(shader);
+        glShaderSource(vs, 1, &vs_src, NULL);
+        glCompileShader(vs);
+
+        const char *fs_ptr = wrapped;
+        glShaderSource(fs, 1, &fs_ptr, NULL);
+        glCompileShader(fs);
+
+        GLint compiled = 0;
+        glGetShaderiv(fs, GL_COMPILE_STATUS, &compiled);
+        if (!compiled) {
+            char log_buf[1024];
+            glGetShaderInfoLog(fs, sizeof(log_buf), NULL, log_buf);
+            WAYWAL_LOG_ERR("Shader compilation failed (%s): %s", debug_name ? debug_name : "live",
+                           log_buf);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            return 0;
+        }
+
+        prog = glCreateProgram();
+        if (!prog) {
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            return 0;
+        }
+
+        glProgramParameteri(prog, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+        glAttachShader(prog, vs);
+        glAttachShader(prog, fs);
+        glLinkProgram(prog);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+    }
 
     GLint linked = 0;
     glGetProgramiv(prog, GL_LINK_STATUS, &linked);
@@ -1328,7 +1542,8 @@ bool waywal_shader_engine_load_source(waywal_shader_engine_t *eng, const char *u
             return false;
         }
         bool from_cache = false;
-        GLuint prog = compile_or_load_pass(eng, wrapped, debug_name, &from_cache);
+        bool is_compute = false;
+        GLuint prog = compile_or_load_pass(eng, wrapped, debug_name, &from_cache, &is_compute);
         free(wrapped);
         if (!prog) {
             for (int j = 0; j < p; ++j) {
@@ -1340,6 +1555,7 @@ bool waywal_shader_engine_load_source(waywal_shader_engine_t *eng, const char *u
             all_cached = false;
         }
         new_passes[p].active = true;
+        new_passes[p].is_compute = is_compute;
         new_passes[p].prog = prog;
         cache_uniform_locations(prog, &new_passes[p].uniforms);
     }
@@ -1361,9 +1577,17 @@ bool waywal_shader_engine_load_source(waywal_shader_engine_t *eng, const char *u
     }
     load_custom_channel_images(eng, new_passes, base_dir);
 
+    bool uses_lod = (strstr(user_src, "textureLod") != NULL);
     for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
+        new_passes[p].needs_mipmap = uses_lod;
         destroy_pass_resources(&eng->passes[p]);
         eng->passes[p] = new_passes[p];
+    }
+    for (int i = 0; i < SHADER_MAX_CUSTOM_UNIFORMS; ++i) {
+        for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
+            eng->custom_uniforms[i].locations[p] = -2;
+            eng->custom_uniforms[i].types[p] = 0;
+        }
     }
     eng->last_from_cache = all_cached;
     return true;
@@ -1380,7 +1604,23 @@ void waywal_shader_engine_set_wallpaper(waywal_shader_engine_t *eng, const uint8
         glDeleteTextures(1, &eng->wallpaper_tex);
         eng->wallpaper_tex = 0;
     }
-    eng->wallpaper_tex = create_rgba_texture(rgba, w, h, GL_CLAMP_TO_EDGE);
+    eng->wallpaper_tex = create_texture_ex(rgba, w, h, GL_CLAMP_TO_EDGE, false);
+    eng->wallpaper_w = w;
+    eng->wallpaper_h = h;
+}
+
+void waywal_shader_engine_set_wallpaper_bgra(waywal_shader_engine_t *eng, const uint8_t *bgra,
+                                             uint32_t w, uint32_t h)
+{
+    if (!eng || !bgra || w == 0 || h == 0) {
+        return;
+    }
+    make_context_current(eng);
+    if (eng->wallpaper_tex) {
+        glDeleteTextures(1, &eng->wallpaper_tex);
+        eng->wallpaper_tex = 0;
+    }
+    eng->wallpaper_tex = create_texture_ex(bgra, w, h, GL_CLAMP_TO_EDGE, true);
     eng->wallpaper_w = w;
     eng->wallpaper_h = h;
 }
@@ -1393,6 +1633,190 @@ void waywal_shader_engine_set_depth_strength(waywal_shader_engine_t *eng, float 
     eng->depth_strength = (strength > 0.0f) ? strength : 1.0f;
 }
 
+void waywal_shader_engine_set_album_art(waywal_shader_engine_t *eng, const uint8_t *rgba,
+                                        uint32_t w, uint32_t h)
+{
+    if (!eng) {
+        return;
+    }
+    if (eng->display != EGL_NO_DISPLAY && eng->context != EGL_NO_CONTEXT) {
+        make_context_current(eng);
+        if (eng->album_art_tex) {
+            glDeleteTextures(1, &eng->album_art_tex);
+            eng->album_art_tex = 0;
+        }
+        if (rgba && w > 0 && h > 0) {
+            eng->album_art_tex = create_texture_ex(rgba, w, h, GL_CLAMP_TO_EDGE, false);
+        }
+    }
+    if (rgba && w > 0 && h > 0) {
+        eng->album_art_w = w;
+        eng->album_art_h = h;
+    } else {
+        eng->album_art_w = 0;
+        eng->album_art_h = 0;
+    }
+}
+
+void waywal_shader_engine_set_album_art_bgra(waywal_shader_engine_t *eng, const uint8_t *bgra,
+                                             uint32_t w, uint32_t h)
+{
+    if (!eng) {
+        return;
+    }
+    if (eng->display != EGL_NO_DISPLAY && eng->context != EGL_NO_CONTEXT) {
+        make_context_current(eng);
+        if (eng->album_art_tex) {
+            glDeleteTextures(1, &eng->album_art_tex);
+            eng->album_art_tex = 0;
+        }
+        if (bgra && w > 0 && h > 0) {
+            eng->album_art_tex = create_texture_ex(bgra, w, h, GL_CLAMP_TO_EDGE, true);
+        }
+    }
+    if (bgra && w > 0 && h > 0) {
+        eng->album_art_w = w;
+        eng->album_art_h = h;
+    } else {
+        eng->album_art_w = 0;
+        eng->album_art_h = 0;
+    }
+}
+
+void waywal_shader_engine_set_media_playing(waywal_shader_engine_t *eng, float playing)
+{
+    if (!eng) {
+        return;
+    }
+    eng->media_playing = playing;
+}
+
+static void query_custom_uniform_loc_and_type(GLuint prog, const char *name, GLint *out_loc,
+                                              GLenum *out_type)
+{
+    *out_loc = -1;
+    *out_type = GL_FLOAT;
+    if (!prog || !name || name[0] == '\0') {
+        return;
+    }
+    *out_loc = glGetUniformLocation(prog, name);
+    if (*out_loc < 0) {
+        return;
+    }
+    const GLchar *u_names[1] = {name};
+    GLuint u_idx = GL_INVALID_INDEX;
+    glGetUniformIndices(prog, 1, u_names, &u_idx);
+    if (u_idx != GL_INVALID_INDEX) {
+        GLint u_size = 0;
+        GLenum u_type = GL_FLOAT;
+        glGetActiveUniform(prog, u_idx, 0, NULL, &u_size, &u_type, NULL);
+        if (u_type != 0) {
+            *out_type = u_type;
+        }
+    }
+}
+
+bool waywal_shader_engine_set_custom_uniform(waywal_shader_engine_t *eng, const char *name,
+                                             const float *values, uint32_t num_components)
+{
+    if (!eng || !name || name[0] == '\0' || !values || num_components < 1 || num_components > 4) {
+        return false;
+    }
+    if (!isalpha((unsigned char)name[0]) && name[0] != '_') {
+        return false;
+    }
+    for (size_t k = 1; name[k] != '\0'; ++k) {
+        if (!isalnum((unsigned char)name[k]) && name[k] != '_') {
+            return false;
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (i < (int)num_components && !isfinite(values[i])) {
+            return false;
+        }
+    }
+    if (strcmp(name, "u_depth_strength") == 0 && num_components == 1) {
+        eng->depth_strength = values[0];
+    } else if (strcmp(name, "u_media_playing") == 0 && num_components == 1) {
+        eng->media_playing = values[0];
+    }
+
+    int slot = -1;
+    for (int i = 0; i < SHADER_MAX_CUSTOM_UNIFORMS; ++i) {
+        if (eng->custom_uniforms[i].active && strcmp(eng->custom_uniforms[i].name, name) == 0) {
+            slot = i;
+            break;
+        }
+        if (slot < 0 && !eng->custom_uniforms[i].active) {
+            slot = i;
+        }
+    }
+    if (slot < 0) {
+        return false;
+    }
+    shader_custom_uniform_t *cu = &eng->custom_uniforms[slot];
+    if (!cu->active || strcmp(cu->name, name) != 0) {
+        snprintf(cu->name, sizeof(cu->name), "%s", name);
+        for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
+            cu->locations[p] = -2;
+            cu->types[p] = 0;
+        }
+    }
+    cu->num_components = num_components;
+    memset(cu->values, 0, sizeof(cu->values));
+    memcpy(cu->values, values, num_components * sizeof(float));
+    cu->active = true;
+
+    if (eng->display != EGL_NO_DISPLAY && eng->context != EGL_NO_CONTEXT) {
+        make_context_current(eng);
+        for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
+            if (eng->passes[p].active && eng->passes[p].prog) {
+                query_custom_uniform_loc_and_type(eng->passes[p].prog, cu->name, &cu->locations[p],
+                                                  &cu->types[p]);
+            } else {
+                cu->locations[p] = -1;
+                cu->types[p] = 0;
+            }
+        }
+    }
+    return true;
+}
+
+bool waywal_shader_engine_get_custom_uniform(const waywal_shader_engine_t *eng, const char *name,
+                                             float *out_values, uint32_t *out_num_components)
+{
+    if (!eng || !name) {
+        return false;
+    }
+    for (int i = 0; i < SHADER_MAX_CUSTOM_UNIFORMS; ++i) {
+        if (eng->custom_uniforms[i].active && strcmp(eng->custom_uniforms[i].name, name) == 0) {
+            if (out_values) {
+                memcpy(out_values, eng->custom_uniforms[i].values, 4 * sizeof(float));
+            }
+            if (out_num_components) {
+                *out_num_components = eng->custom_uniforms[i].num_components;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void waywal_shader_engine_copy_custom_uniforms(waywal_shader_engine_t *dst,
+                                               const waywal_shader_engine_t *src)
+{
+    if (!dst || !src || dst == src) {
+        return;
+    }
+    for (int i = 0; i < SHADER_MAX_CUSTOM_UNIFORMS; ++i) {
+        if (src->custom_uniforms[i].active) {
+            (void)waywal_shader_engine_set_custom_uniform(dst, src->custom_uniforms[i].name,
+                                                          src->custom_uniforms[i].values,
+                                                          src->custom_uniforms[i].num_components);
+        }
+    }
+}
+
 int waywal_shader_engine_get_channel_target(const waywal_shader_engine_t *eng, int pass_idx,
                                             int chan_idx)
 {
@@ -1402,12 +1826,11 @@ int waywal_shader_engine_get_channel_target(const waywal_shader_engine_t *eng, i
     return (int)eng->passes[pass_idx].channels[chan_idx].target;
 }
 
-bool waywal_shader_engine_load_depth_parallax(waywal_shader_engine_t *eng, const uint8_t *base_rgba,
-                                              uint32_t base_w, uint32_t base_h,
-                                              const uint8_t *depth_rgba, uint32_t depth_w,
-                                              uint32_t depth_h)
+static bool load_depth_parallax_internal(waywal_shader_engine_t *eng, const uint8_t *base_px,
+                                         uint32_t base_w, uint32_t base_h, const uint8_t *depth_px,
+                                         uint32_t depth_w, uint32_t depth_h, bool is_bgra)
 {
-    if (!eng || !base_rgba || !depth_rgba || base_w == 0 || base_h == 0 || depth_w == 0 ||
+    if (!eng || !base_px || !depth_px || base_w == 0 || base_h == 0 || depth_w == 0 ||
         depth_h == 0) {
         return false;
     }
@@ -1426,13 +1849,17 @@ bool waywal_shader_engine_load_depth_parallax(waywal_shader_engine_t *eng, const
     eng->watched_dir[0] = '\0';
     eng->watched_base[0] = '\0';
 
-    waywal_shader_engine_set_wallpaper(eng, base_rgba, base_w, base_h);
+    if (is_bgra) {
+        waywal_shader_engine_set_wallpaper_bgra(eng, base_px, base_w, base_h);
+    } else {
+        waywal_shader_engine_set_wallpaper(eng, base_px, base_w, base_h);
+    }
 
     if (eng->depth_tex) {
         glDeleteTextures(1, &eng->depth_tex);
         eng->depth_tex = 0;
     }
-    eng->depth_tex = create_rgba_texture(depth_rgba, depth_w, depth_h, GL_CLAMP_TO_EDGE);
+    eng->depth_tex = create_r8_depth_texture(depth_px, depth_w, depth_h);
     eng->depth_w = depth_w;
     eng->depth_h = depth_h;
 
@@ -1442,6 +1869,24 @@ bool waywal_shader_engine_load_depth_parallax(waywal_shader_engine_t *eng, const
     eng->passes[4].channels[0].target = SHADER_CHAN_WALLPAPER;
     eng->passes[4].channels[1].target = SHADER_CHAN_DEPTH;
     return true;
+}
+
+bool waywal_shader_engine_load_depth_parallax(waywal_shader_engine_t *eng, const uint8_t *base_rgba,
+                                              uint32_t base_w, uint32_t base_h,
+                                              const uint8_t *depth_rgba, uint32_t depth_w,
+                                              uint32_t depth_h)
+{
+    return load_depth_parallax_internal(eng, base_rgba, base_w, base_h, depth_rgba, depth_w,
+                                        depth_h, false);
+}
+
+bool waywal_shader_engine_load_depth_parallax_bgra(waywal_shader_engine_t *eng,
+                                                   const uint8_t *base_bgra, uint32_t base_w,
+                                                   uint32_t base_h, const uint8_t *depth_bgra,
+                                                   uint32_t depth_w, uint32_t depth_h)
+{
+    return load_depth_parallax_internal(eng, base_bgra, base_w, base_h, depth_bgra, depth_w,
+                                        depth_h, true);
 }
 
 static char *read_entire_file(const char *filepath)
@@ -1576,12 +2021,76 @@ bool waywal_shader_engine_poll_hot_reload(waywal_shader_engine_t *eng)
     return ok;
 }
 
+static void record_imported_bo(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLuint tex,
+                               EGLImageKHR img, bool owns_egl)
+{
+    if (!eng || !bo) {
+        return;
+    }
+    for (size_t i = 0; i < eng->num_imported_bos; ++i) {
+        if (eng->imported_bos[i].bo == bo) {
+            if (eng->imported_bos[i].gl_tex == tex && eng->imported_bos[i].egl_image == img) {
+                if (owns_egl) {
+                    eng->imported_bos[i].owns_egl = true;
+                }
+                return;
+            }
+            if (eng->last_complete_bo_tex == eng->imported_bos[i].gl_tex &&
+                eng->imported_bos[i].gl_tex != tex) {
+                eng->last_complete_bo_tex = 0;
+            }
+            if (eng->imported_bos[i].owns_egl) {
+                if (eng->imported_bos[i].gl_tex && eng->imported_bos[i].gl_tex != tex) {
+                    glDeleteTextures(1, &eng->imported_bos[i].gl_tex);
+                }
+                if (eng->imported_bos[i].egl_image && eng->imported_bos[i].egl_image != img &&
+                    eng->eglDestroyImageKHR) {
+                    eng->eglDestroyImageKHR(eng->display, eng->imported_bos[i].egl_image);
+                }
+            }
+            eng->imported_bos[i].gl_tex = tex;
+            eng->imported_bos[i].egl_image = img;
+            eng->imported_bos[i].owns_egl = owns_egl;
+            return;
+        }
+    }
+    if (eng->num_imported_bos >= 32u) {
+        if (eng->last_complete_bo_tex == eng->imported_bos[0].gl_tex) {
+            eng->last_complete_bo_tex = 0;
+        }
+        if (eng->imported_bos[0].owns_egl) {
+            if (eng->imported_bos[0].gl_tex) {
+                glDeleteTextures(1, &eng->imported_bos[0].gl_tex);
+                if (eng->imported_bos[0].bo &&
+                    eng->imported_bos[0].bo->gl_tex == eng->imported_bos[0].gl_tex) {
+                    eng->imported_bos[0].bo->gl_tex = 0;
+                }
+            }
+            if (eng->imported_bos[0].egl_image && eng->eglDestroyImageKHR) {
+                eng->eglDestroyImageKHR(eng->display, eng->imported_bos[0].egl_image);
+                if (eng->imported_bos[0].bo &&
+                    eng->imported_bos[0].bo->egl_image == eng->imported_bos[0].egl_image) {
+                    eng->imported_bos[0].bo->egl_image = NULL;
+                }
+            }
+        }
+        memmove(&eng->imported_bos[0], &eng->imported_bos[1], 31u * sizeof(eng->imported_bos[0]));
+        eng->num_imported_bos = 31u;
+    }
+    size_t slot = eng->num_imported_bos++;
+    eng->imported_bos[slot].bo = bo;
+    eng->imported_bos[slot].gl_tex = tex;
+    eng->imported_bos[slot].egl_image = img;
+    eng->imported_bos[slot].owns_egl = owns_egl;
+}
+
 static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo)
 {
     if (!eng || !bo) {
         return false;
     }
     if (bo->egl_image && bo->gl_tex != 0) {
+        record_imported_bo(eng, bo, bo->gl_tex, (EGLImageKHR)bo->egl_image, false);
         return true;
     }
     if (!eng->eglCreateImageKHR || !eng->glEGLImageTargetTexture2DOES) {
@@ -1668,14 +2177,13 @@ static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo)
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     bo->egl_image = img;
     bo->gl_tex = tex;
-    if (eng->owns_egl && eng->num_imported_bos < 32u) {
-        eng->imported_bos[eng->num_imported_bos].bo = bo;
-        eng->imported_bos[eng->num_imported_bos].gl_tex = tex;
-        eng->imported_bos[eng->num_imported_bos].egl_image = img;
-        eng->num_imported_bos++;
+    if (eng->display != EGL_NO_DISPLAY) {
+        record_imported_bo(eng, bo, tex, img, true);
     }
     return true;
 }
@@ -1691,20 +2199,32 @@ static void ensure_pass_ping_pong_textures(waywal_shader_engine_t *eng, shader_p
         *shared_zero_half = (uint16_t *)calloc((size_t)w * (size_t)h * 4u, sizeof(uint16_t));
     }
     const uint16_t *zero_half = shared_zero_half ? *shared_zero_half : NULL;
+    GLsizei levels = 1;
+    if (pass->needs_mipmap && !pass->is_compute) {
+        uint32_t max_dim = w > h ? w : h;
+        while (max_dim > 1u) {
+            max_dim >>= 1u;
+            levels++;
+        }
+    }
     for (int i = 0; i < 2; ++i) {
         if (pass->ping_pong_tex[i]) {
             glDeleteTextures(1, &pass->ping_pong_tex[i]);
         }
         glGenTextures(1, &pass->ping_pong_tex[i]);
         glBindTexture(GL_TEXTURE_2D, pass->ping_pong_tex[i]);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                        levels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA16F, (GLsizei)w, (GLsizei)h);
+        glTexStorage2D(GL_TEXTURE_2D, levels, GL_RGBA16F, (GLsizei)w, (GLsizei)h);
         if (zero_half) {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_HALF_FLOAT,
                             zero_half);
+            if (levels > 1) {
+                glGenerateMipmap(GL_TEXTURE_2D);
+            }
         }
     }
     pass->tex_w = w;
@@ -1778,6 +2298,22 @@ static void resolve_channel_texture(const waywal_shader_engine_t *eng,
             return;
         }
         break;
+    case SHADER_CHAN_ALBUM_ART:
+        if (eng->album_art_tex) {
+            *out_tex = eng->album_art_tex;
+            out_res[0] = (float)eng->album_art_w;
+            out_res[1] = (float)eng->album_art_h;
+            out_res[2] = 1.0f;
+            return;
+        }
+        if (eng->wallpaper_tex) {
+            *out_tex = eng->wallpaper_tex;
+            out_res[0] = (float)eng->wallpaper_w;
+            out_res[1] = (float)eng->wallpaper_h;
+            out_res[2] = 1.0f;
+            return;
+        }
+        break;
     case SHADER_CHAN_IMAGE:
         if (b->custom_tex) {
             *out_tex = b->custom_tex;
@@ -1840,10 +2376,15 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         params->mouse_smooth[3],
     };
     if (mouse_smooth_vals[0] == 0.0f && mouse_smooth_vals[1] == 0.0f) {
-        mouse_smooth_vals[0] = params->mouse[0];
-        mouse_smooth_vals[1] = params->mouse[1];
-        mouse_smooth_vals[2] = params->mouse[2];
-        mouse_smooth_vals[3] = params->mouse[3];
+        if (params->mouse[0] > 0.0f || params->mouse[1] > 0.0f) {
+            mouse_smooth_vals[0] = params->mouse[0];
+            mouse_smooth_vals[1] = params->mouse[1];
+            mouse_smooth_vals[2] = params->mouse[2];
+            mouse_smooth_vals[3] = params->mouse[3];
+        } else {
+            mouse_smooth_vals[0] = (float)target_bo->width * 0.5f;
+            mouse_smooth_vals[1] = (float)target_bo->height * 0.5f;
+        }
     }
 
     bool is_10bit_fmt = target_bo->is_10bit || target_bo->drm_format == DRM_FORMAT_XRGB2101010 ||
@@ -1858,9 +2399,15 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         ensure_scratch_texture(eng, target_bo->width, target_bo->height);
     }
 
+    if (!eng->blit_vao) {
+        glGenVertexArrays(1, &eng->blit_vao);
+    }
+
+    bool has_multipass = false;
     uint16_t *shared_zero_half = NULL;
     for (int p = 0; p < 4; ++p) {
         if (eng->passes[p].active) {
+            has_multipass = true;
             ensure_pass_ping_pong_textures(eng, &eng->passes[p], target_bo->width,
                                            target_bo->height, &shared_zero_half);
         }
@@ -1873,6 +2420,16 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
     GLuint groups_x = (target_bo->width + 15u) / 16u;
     GLuint groups_y = (target_bo->height + 15u) / 16u;
 
+    bool has_span = (params->span_rect[2] > 0.0f && params->span_rect[3] > 0.0f);
+    uint32_t span_res_w = has_span ? (uint32_t)(params->span_rect[2] + 0.5f) : target_bo->width;
+    uint32_t span_res_h = has_span ? (uint32_t)(params->span_rect[3] + 0.5f) : target_bo->height;
+    float span_vec[4] = {
+        has_span ? params->span_rect[0] : 0.0f,
+        has_span ? params->span_rect[1] : 0.0f,
+        has_span ? params->span_rect[2] : 0.0f,
+        has_span ? params->span_rect[3] : 0.0f,
+    };
+
     for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
         shader_pass_t *pass = &eng->passes[p];
         if (!pass->active || !pass->prog) {
@@ -1883,11 +2440,30 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         const shader_uniforms_t *u = &pass->uniforms;
         bool init_u = !pass->uniforms_initialized;
 
-        if (u->iResolution >= 0 && (init_u || pass->cached_res_w != target_bo->width ||
-                                    pass->cached_res_h != target_bo->height)) {
-            glUniform3f(u->iResolution, (float)target_bo->width, (float)target_bo->height, 1.0f);
-            pass->cached_res_w = target_bo->width;
-            pass->cached_res_h = target_bo->height;
+        bool use_span_on_pass = (p == 4 && !has_multipass);
+        uint32_t pass_res_w = use_span_on_pass ? span_res_w : target_bo->width;
+        uint32_t pass_res_h = use_span_on_pass ? span_res_h : target_bo->height;
+        const float *pass_span =
+            use_span_on_pass ? span_vec : (const float[4]){0.0f, 0.0f, 0.0f, 0.0f};
+
+        if (u->iResolution >= 0 &&
+            (init_u || pass->cached_res_w != pass_res_w || pass->cached_res_h != pass_res_h)) {
+            glUniform3f(u->iResolution, (float)pass_res_w, (float)pass_res_h, 1.0f);
+            pass->cached_res_w = pass_res_w;
+            pass->cached_res_h = pass_res_h;
+        }
+        if (u->u_local_size >= 0 && (init_u || pass->cached_local_w != target_bo->width ||
+                                     pass->cached_local_h != target_bo->height)) {
+            glUniform2f(u->u_local_size, (float)target_bo->width, (float)target_bo->height);
+            pass->cached_local_w = target_bo->width;
+            pass->cached_local_h = target_bo->height;
+        }
+        if (u->u_span_rect >= 0 && (init_u || pass->cached_span_rect[0] != pass_span[0] ||
+                                    pass->cached_span_rect[1] != pass_span[1] ||
+                                    pass->cached_span_rect[2] != pass_span[2] ||
+                                    pass->cached_span_rect[3] != pass_span[3])) {
+            glUniform4fv(u->u_span_rect, 1, pass_span);
+            memcpy(pass->cached_span_rect, pass_span, sizeof(pass->cached_span_rect));
         }
         if (u->iTime >= 0) {
             glUniform1f(u->iTime, params->time_sec);
@@ -1898,8 +2474,42 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         if (u->iFrame >= 0) {
             glUniform1i(u->iFrame, params->frame_index);
         }
+        float pass_mouse[4] = {
+            params->mouse[0],
+            params->mouse[1],
+            params->mouse[2],
+            params->mouse[3],
+        };
+        float pass_mouse_smooth[4] = {
+            mouse_smooth_vals[0],
+            mouse_smooth_vals[1],
+            mouse_smooth_vals[2],
+            mouse_smooth_vals[3],
+        };
+        if (has_span && !use_span_on_pass) {
+            pass_mouse[0] -= span_vec[0];
+            pass_mouse[1] -= span_vec[1];
+            pass_mouse_smooth[0] -= span_vec[0];
+            pass_mouse_smooth[1] -= span_vec[1];
+            if (pass_mouse[2] > 0.0f)
+                pass_mouse[2] -= span_vec[0];
+            else if (pass_mouse[2] < 0.0f)
+                pass_mouse[2] += span_vec[0];
+            if (pass_mouse[3] > 0.0f)
+                pass_mouse[3] -= span_vec[1];
+            else if (pass_mouse[3] < 0.0f)
+                pass_mouse[3] += span_vec[1];
+            if (pass_mouse_smooth[2] > 0.0f)
+                pass_mouse_smooth[2] -= span_vec[0];
+            else if (pass_mouse_smooth[2] < 0.0f)
+                pass_mouse_smooth[2] += span_vec[0];
+            if (pass_mouse_smooth[3] > 0.0f)
+                pass_mouse_smooth[3] -= span_vec[1];
+            else if (pass_mouse_smooth[3] < 0.0f)
+                pass_mouse_smooth[3] += span_vec[1];
+        }
         if (u->iMouse >= 0) {
-            glUniform4fv(u->iMouse, 1, params->mouse);
+            glUniform4fv(u->iMouse, 1, pass_mouse);
         }
         if (u->iDate >= 0) {
             glUniform4fv(u->iDate, 1, date_vals);
@@ -1917,7 +2527,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             glUniform3fv(u->u_palette_tertiary, 1, params->palette_tertiary);
         }
         if (u->u_mouse_smooth >= 0) {
-            glUniform4fv(u->u_mouse_smooth, 1, mouse_smooth_vals);
+            glUniform4fv(u->u_mouse_smooth, 1, pass_mouse_smooth);
         }
         if (u->u_mouse_vel >= 0) {
             glUniform2fv(u->u_mouse_vel, 1, params->mouse_vel);
@@ -1934,6 +2544,21 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             glUniform1f(u->u_depth_strength, d_strength);
             pass->cached_depth_strength = d_strength;
         }
+        if (u->u_media_playing >= 0) {
+            float mplay =
+                (params->media_playing > 0.0f) ? params->media_playing : eng->media_playing;
+            glUniform1f(u->u_media_playing, mplay);
+        }
+        if (u->u_album_art >= 0) {
+            GLuint atex = eng->album_art_tex
+                              ? eng->album_art_tex
+                              : (eng->wallpaper_tex ? eng->wallpaper_tex : eng->audio_tex);
+            glActiveTexture(GL_TEXTURE4);
+            glBindTexture(GL_TEXTURE_2D, atex);
+            if (init_u) {
+                glUniform1i(u->u_album_art, 4);
+            }
+        }
         if (params->audio) {
             if (u->u_audio_bands >= 0) {
                 glUniform1fv(u->u_audio_bands, WAYWAL_AUDIO_BARK_BANDS, params->audio->bands);
@@ -1943,6 +2568,74 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             }
             if (u->u_audio_beat >= 0) {
                 glUniform1f(u->u_audio_beat, params->audio->beat_pulse);
+            }
+        }
+
+        for (int cu_idx = 0; cu_idx < SHADER_MAX_CUSTOM_UNIFORMS; ++cu_idx) {
+            shader_custom_uniform_t *cu = &eng->custom_uniforms[cu_idx];
+            if (!cu->active) {
+                continue;
+            }
+            if (cu->locations[p] == -2) {
+                query_custom_uniform_loc_and_type(pass->prog, cu->name, &cu->locations[p],
+                                                  &cu->types[p]);
+            }
+            GLint loc = cu->locations[p];
+            if (loc >= 0) {
+                GLenum ut = cu->types[p];
+                float fvals[4] = {
+                    cu->values[0],
+                    (cu->num_components >= 2) ? cu->values[1] : cu->values[0],
+                    (cu->num_components >= 3) ? cu->values[2] : cu->values[0],
+                    (cu->num_components >= 4) ? cu->values[3] : cu->values[0],
+                };
+                GLint ivals[4] = {
+                    (GLint)lroundf(fvals[0]),
+                    (GLint)lroundf(fvals[1]),
+                    (GLint)lroundf(fvals[2]),
+                    (GLint)lroundf(fvals[3]),
+                };
+                switch (ut) {
+                case GL_INT:
+                case GL_BOOL:
+                    glUniform1i(loc, ivals[0]);
+                    break;
+                case GL_INT_VEC2:
+                case GL_BOOL_VEC2:
+                    glUniform2iv(loc, 1, ivals);
+                    break;
+                case GL_INT_VEC3:
+                case GL_BOOL_VEC3:
+                    glUniform3iv(loc, 1, ivals);
+                    break;
+                case GL_INT_VEC4:
+                case GL_BOOL_VEC4:
+                    glUniform4iv(loc, 1, ivals);
+                    break;
+                case GL_FLOAT:
+                    glUniform1f(loc, fvals[0]);
+                    break;
+                case GL_FLOAT_VEC2:
+                    glUniform2fv(loc, 1, fvals);
+                    break;
+                case GL_FLOAT_VEC3:
+                    glUniform3fv(loc, 1, fvals);
+                    break;
+                case GL_FLOAT_VEC4:
+                    glUniform4fv(loc, 1, fvals);
+                    break;
+                default:
+                    if (cu->num_components == 1) {
+                        glUniform1f(loc, cu->values[0]);
+                    } else if (cu->num_components == 2) {
+                        glUniform2fv(loc, 1, cu->values);
+                    } else if (cu->num_components == 3) {
+                        glUniform3fv(loc, 1, cu->values);
+                    } else if (cu->num_components == 4) {
+                        glUniform4fv(loc, 1, cu->values);
+                    }
+                    break;
+                }
             }
         }
 
@@ -1981,12 +2674,27 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                 pass->cached_flip_y = 0;
             }
             pass->uniforms_initialized = true;
-            glBindImageTexture(0, pass->ping_pong_tex[write_idx], 0, GL_FALSE, 0, GL_WRITE_ONLY,
-                               GL_RGBA16F);
-            glDispatchCompute(groups_x, groups_y, 1u);
-            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+            if (pass->is_compute) {
+                glBindImageTexture(0, pass->ping_pong_tex[write_idx], 0, GL_FALSE, 0, GL_WRITE_ONLY,
+                                   GL_RGBA16F);
+                glDispatchCompute(groups_x, groups_y, 1u);
+                glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+            } else {
+                glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                       pass->ping_pong_tex[write_idx], 0);
+                glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
+                glBindVertexArray(eng->blit_vao);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                glBindVertexArray(0);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                if (pass->needs_mipmap) {
+                    glBindTexture(GL_TEXTURE_2D, pass->ping_pong_tex[write_idx]);
+                    glGenerateMipmap(GL_TEXTURE_2D);
+                }
+            }
             pass->read_idx = write_idx;
-        } else {
+        } else if (pass->is_compute) {
             GLuint dst_tex = use_scratch_blit ? eng->scratch_tex : target_bo->gl_tex;
             int swap_rb = use_scratch_blit ? 0 : 1;
             if (u->u_swap_rb >= 0 && (init_u || pass->cached_swap_rb != swap_rb)) {
@@ -2002,6 +2710,38 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             glDispatchCompute(groups_x, groups_y, 1u);
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT |
                             GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+        } else {
+            glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
+            if (!use_scratch_blit) {
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                       target_bo->gl_tex, 0);
+                if (eng->last_complete_bo_tex != target_bo->gl_tex) {
+                    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                        use_scratch_blit = true;
+                        ensure_scratch_texture(eng, target_bo->width, target_bo->height);
+                    } else {
+                        eng->last_complete_bo_tex = target_bo->gl_tex;
+                    }
+                }
+            }
+            if (use_scratch_blit) {
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                       eng->scratch_tex, 0);
+            }
+            if (u->u_swap_rb >= 0 && (init_u || pass->cached_swap_rb != 0)) {
+                glUniform1i(u->u_swap_rb, 0);
+                pass->cached_swap_rb = 0;
+            }
+            if (u->u_flip_y >= 0 && (init_u || pass->cached_flip_y != 1)) {
+                glUniform1i(u->u_flip_y, 1);
+                pass->cached_flip_y = 1;
+            }
+            pass->uniforms_initialized = true;
+            glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
+            glBindVertexArray(eng->blit_vao);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glBindVertexArray(0);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
     }
 
@@ -2056,7 +2796,12 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                                target_bo->gl_tex, 0);
-        if (eng->prog_blit && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        bool fbo_ok = (eng->last_complete_bo_tex == target_bo->gl_tex);
+        if (!fbo_ok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+            eng->last_complete_bo_tex = target_bo->gl_tex;
+            fbo_ok = true;
+        }
+        if (eng->prog_blit && fbo_ok) {
             glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
             glUseProgram(eng->prog_blit);
             glActiveTexture(GL_TEXTURE0);
@@ -2075,6 +2820,14 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         }
+
+        /* Discard transient scratch attachment after blit to avoid writeback traffic */
+        glBindFramebuffer(GL_FRAMEBUFFER, eng->read_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                               eng->scratch_tex, 0);
+        const GLenum discard_att = GL_COLOR_ATTACHMENT0;
+        glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &discard_att);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
     glUseProgram((GLuint)prev_prog);
@@ -2100,6 +2853,23 @@ bool waywal_shader_engine_has_active_program(const waywal_shader_engine_t *eng)
     return eng && eng->passes[4].active && eng->passes[4].prog != 0;
 }
 
+bool waywal_shader_engine_uses_mouse(const waywal_shader_engine_t *eng)
+{
+    if (!eng) {
+        return false;
+    }
+    for (int i = 0; i < SHADER_NUM_PASSES; ++i) {
+        if (!eng->passes[i].active || !eng->passes[i].prog) {
+            continue;
+        }
+        const shader_uniforms_t *u = &eng->passes[i].uniforms;
+        if (u->iMouse >= 0 || u->u_mouse_smooth >= 0 || u->u_mouse_vel >= 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool waywal_shader_engine_last_load_from_cache(const waywal_shader_engine_t *eng)
 {
     return eng && eng->last_from_cache;
@@ -2117,4 +2887,13 @@ uint32_t waywal_shader_engine_active_pass_mask(const waywal_shader_engine_t *eng
         }
     }
     return mask;
+}
+
+bool waywal_shader_engine_shares_egl_context(const waywal_shader_engine_t *a,
+                                             const waywal_shader_engine_t *b)
+{
+    if (!a || !b || a->display == EGL_NO_DISPLAY || a->context == EGL_NO_CONTEXT) {
+        return false;
+    }
+    return a->display == b->display && a->context == b->context;
 }
