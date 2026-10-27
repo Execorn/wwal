@@ -49,6 +49,12 @@ Want the deep technical details? Read [**Technical Architecture & Full CLI Refer
 yay -S wwal-git
 ```
 
+### Fedora (Copr)
+```bash
+sudo dnf copr enable execorn/wwal
+sudo dnf install wwal
+```
+
 ### NixOS / Nix (`flake.nix`)
 ```bash
 nix profile install github:Execorn/wwal
