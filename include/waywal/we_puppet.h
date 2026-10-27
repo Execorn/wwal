@@ -66,6 +66,8 @@ typedef struct {
     int32_t unk2;
     uint32_t track_count;
     we_mdl_bone_track_t *tracks;
+    int16_t bone_to_track[WE_MDL_MAX_BONES];
+    bool bone_lut_valid;
 } we_mdl_anim_t;
 
 typedef struct {
@@ -124,6 +126,10 @@ typedef struct we_puppet {
     uint32_t gl_ebo;
     bool gl_uploaded;
     bool vbo_has_bind_pose;
+    uint32_t cached_gl_prog;
+    int32_t cached_loc_bones;
+    uint32_t cached_bone_utype;
+    uint32_t cached_blend_idx_atype;
 } we_puppet_t;
 
 /* Dual-mode magic reader: supports 9-byte NUL-terminated ("MDLV0013\0".."MDLV0023\0",

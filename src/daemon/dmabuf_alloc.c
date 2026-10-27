@@ -158,9 +158,13 @@ bool dmabuf_context_init(dmabuf_context_t *ctx)
 {
     if (!ctx)
         return false;
+    dev_t saved_compositor_dev = ctx->compositor_dev;
+    bool saved_has_compositor_dev = ctx->has_compositor_dev;
     memset(ctx, 0, sizeof(*ctx));
     ctx->drm_fd = -1;
     ctx->preferred_modifier = DRM_FORMAT_MOD_INVALID;
+    ctx->compositor_dev = saved_compositor_dev;
+    ctx->has_compositor_dev = saved_has_compositor_dev;
 
     int drm_fd = -1;
     char active_node[256] = {0};
@@ -310,11 +314,26 @@ bool dmabuf_bo_allocate(dmabuf_context_t *ctx, dmabuf_bo_t *bo, uint32_t width, 
         if (plane_fd < 0) {
             plane_fd = gbm_bo_get_fd(gbm_bo);
         }
+        if (plane_fd < 0) {
+            WAYWAL_LOG_ERR("Failed to export DMA-BUF fd for plane %d", p);
+            if (params) {
+                zwp_linux_buffer_params_v1_destroy(params);
+            }
+            for (int j = 0; j < p; ++j) {
+                if (bo->fd[j] >= 0) {
+                    close(bo->fd[j]);
+                    bo->fd[j] = -1;
+                }
+            }
+            gbm_bo_destroy(gbm_bo);
+            bo->gbm_bo = NULL;
+            return false;
+        }
         bo->fd[p] = plane_fd;
         bo->stride[p] = gbm_bo_get_stride_for_plane(gbm_bo, p);
         bo->offset[p] = gbm_bo_get_offset(gbm_bo, p);
 
-        if (params && plane_fd >= 0) {
+        if (params) {
             zwp_linux_buffer_params_v1_add(params, plane_fd, (uint32_t)p, bo->offset[p],
                                            bo->stride[p], (uint32_t)(actual_mod >> 32),
                                            (uint32_t)(actual_mod & 0xFFFFFFFF));

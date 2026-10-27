@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cli_parser.h"
-#include "image_loader.h"
 #include "waywal/gif_transcode.h"
+#include "waywal/image_loader.h"
 #include "waywal/ipc_proto.h"
 #include "waywal/log.h"
 #include "waywal/os_compat.h"
@@ -10,6 +10,10 @@
 #include "waywal/toml_parser.h"
 #include "waywal/we_pkg.h"
 #include "waywal/we_scene.h"
+
+#ifndef WAYWAL_VERSION
+#define WAYWAL_VERSION "0.2.0"
+#endif
 
 #include <dirent.h>
 #include <errno.h>
@@ -73,6 +77,7 @@ static void apply_config_defaults_to_cli(int argc, char *argv[], const waywal_co
     if (!argv_has_flag(argc, argv, "--transition-bezier")) {
         opts->bezier = bezier_create(cfg->transition.bezier[0], cfg->transition.bezier[1],
                                      cfg->transition.bezier[2], cfg->transition.bezier[3]);
+        opts->has_custom_bezier = true;
     }
     if (!argv_has_flag(argc, argv, "--10bit") && cfg->daemon.ten_bit) {
         opts->enable_10bit = true;
@@ -81,10 +86,12 @@ static void apply_config_defaults_to_cli(int argc, char *argv[], const waywal_co
         !argv_has_flag(argc, argv, "--dark") && !argv_has_flag(argc, argv, "--mode")) {
         opts->theme_light_mode = (cfg->theme.theme_mode == WAYWAL_THEME_LIGHT);
     }
-    if (!argv_has_flag(argc, argv, "--sync") && cfg->transition.sync_mode[0] != '\0') {
+    if (!argv_has_flag(argc, argv, "--sync") && !argv_has_flag(argc, argv, "--sync-mode") &&
+        cfg->transition.sync_mode[0] != '\0') {
         opts->sync_mode = (strcasecmp(cfg->transition.sync_mode, "staggered") == 0) ? 1U : 0U;
     }
-    if (!argv_has_flag(argc, argv, "--stagger") && cfg->transition.stagger_delay_ms > 0) {
+    if (!argv_has_flag(argc, argv, "--stagger") && !argv_has_flag(argc, argv, "--stagger-delay") &&
+        cfg->transition.stagger_delay_ms > 0) {
         opts->stagger_delay_ms = cfg->transition.stagger_delay_ms;
     }
 }
@@ -560,6 +567,11 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    if (opts.cmd == CLI_CMD_VERSION) {
+        printf("wwal %s\n", WAYWAL_VERSION);
+        return 0;
+    }
+
     if (opts.cmd == CLI_CMD_HELP || opts.cmd == CLI_CMD_NONE) {
         cli_print_usage(argv[0]);
         return 0;
@@ -664,6 +676,12 @@ int main(int argc, char *argv[])
     if (opts.cmd == CLI_CMD_VIDEO) {
         uint32_t max_w = 2560, max_h = 1440;
         query_max_target_resolution(&opts, &max_w, &max_h);
+        if (!is_gif_file(opts.filepath)) {
+            if (max_w < 3840U)
+                max_w = 3840U;
+            if (max_h < 2160U)
+                max_h = 2160U;
+        }
         if (!video_transcode_optimize(opts.filepath, max_w, max_h, effective_video_path,
                                       sizeof(effective_video_path))) {
             if (is_gif_file(opts.filepath)) {

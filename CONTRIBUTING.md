@@ -17,7 +17,7 @@ Required build packages (`pkg-config` names):
 
 Optional packages:
 - `scdoc` (builds manual pages from `docs/man/*.scd`)
-- `libwebp`, `libavif`, `libjxl`, `librsvg-2.0`, `libpipewire-0.3`, `shaderc` (loaded at runtime via `dlopen()`)
+- `libwebp`, `libavif`, `libjxl`, `librsvg-2.0`, `libpipewire-0.3`, `libdbus-1`, `libsystemd` / `libelogind`, `liblz4`, `libquickjs` (loaded at runtime via `dlopen()`)
 
 ## Development Workflow
 
@@ -64,7 +64,7 @@ OMP_NUM_THREADS=4 ./build/bench_transitions 60
 - All source and header files must start with `// SPDX-License-Identifier: GPL-3.0-or-later`.
 - Format C and header files with `clang-format` before committing:
   ```bash
-  clang-format -i src/*/*.c src/daemon/simd/*.c include/waywal/*.h tests/*.c tests/*/*.c
+  clang-format -i src/*/*.c src/daemon/*.h src/client/*.h src/daemon/simd/*.c src/daemon/simd/*.h include/waywal/*.h tests/*.c tests/*/*.c
   ```
 - Keep hot paths (`uring_loop.c`, `render_engine.c`, `video_engine.c`, `audio_fft.c`) free of per-frame heap allocations. Use the bump arena (`waywal/arena.h`) or pre-allocated fixed rings.
 - When adding a new syscall to the daemon runtime path, check `src/daemon/security.c` to make sure the Seccomp-BPF allowlist permits it.

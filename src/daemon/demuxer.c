@@ -51,6 +51,27 @@ static inline uint64_t read_u64_be(const uint8_t *p)
     return ((uint64_t)read_u32_be(p) << 32) | (uint64_t)read_u32_be(p + 4);
 }
 
+static void evict_mmap_range_preserving_extradata(const demuxer_t *d, uintptr_t p_start,
+                                                  uintptr_t p_end)
+{
+    if (p_end <= p_start)
+        return;
+    if (d->extradata && d->extradata_size > 0) {
+        uintptr_t ex_start = ((uintptr_t)d->extradata) & ~(uintptr_t)4095U;
+        uintptr_t ex_end =
+            ((uintptr_t)d->extradata + d->extradata_size + 4095U) & ~(uintptr_t)4095U;
+        if (ex_start < p_end && ex_end > p_start) {
+            if (ex_start > p_start) {
+                madvise((void *)p_start, (size_t)(ex_start - p_start), MADV_DONTNEED);
+            }
+            p_start = ex_end;
+        }
+    }
+    if (p_end > p_start) {
+        madvise((void *)p_start, (size_t)(p_end - p_start), MADV_DONTNEED);
+    }
+}
+
 static void evict_mmap_chunk(const demuxer_t *d, size_t *last_evicted_offset, size_t consumed_end)
 {
     if (!d || !d->mapped_buf || !last_evicted_offset)
@@ -65,21 +86,36 @@ static void evict_mmap_chunk(const demuxer_t *d, size_t *last_evicted_offset, si
     uintptr_t base = (uintptr_t)d->mapped_buf;
     uintptr_t p_start = (base + *last_evicted_offset) & ~(uintptr_t)4095U;
     uintptr_t p_end = (base + consumed_end) & ~(uintptr_t)4095U;
-    if (d->extradata) {
-        uintptr_t ex_start = ((uintptr_t)d->extradata) & ~(uintptr_t)4095U;
-        uintptr_t ex_end =
-            ((uintptr_t)d->extradata + d->extradata_size + 4095U) & ~(uintptr_t)4095U;
-        if (ex_start < p_end && ex_end > p_start) {
-            if (ex_start > p_start) {
-                madvise((void *)p_start, (size_t)(ex_start - p_start), MADV_DONTNEED);
-            }
-            p_start = ex_end;
-        }
-    }
-    if (p_end > p_start) {
-        madvise((void *)p_start, (size_t)(p_end - p_start), MADV_DONTNEED);
-    }
+    evict_mmap_range_preserving_extradata(d, p_start, p_end);
     *last_evicted_offset = consumed_end & ~(size_t)4095U;
+}
+
+static void evict_mmap_for_seek(const demuxer_t *d, size_t keep_offset)
+{
+    if (!d || !d->mapped_buf || d->mapped_size < 4096)
+        return;
+    uintptr_t raw_base = (uintptr_t)d->mapped_buf;
+    uintptr_t map_base = (raw_base + 4095U) & ~(uintptr_t)4095U;
+    uintptr_t map_end = (raw_base + d->mapped_size) & ~(uintptr_t)4095U;
+    if (map_end <= map_base)
+        return;
+
+    size_t clamped_off = keep_offset <= d->mapped_size ? keep_offset : d->mapped_size;
+    size_t window_len = (2U << 20);
+    size_t keep_end_off =
+        (d->mapped_size > window_len && clamped_off <= d->mapped_size - window_len)
+            ? (clamped_off + window_len)
+            : d->mapped_size;
+
+    uintptr_t keep_start = (raw_base + clamped_off) & ~(uintptr_t)4095U;
+    uintptr_t keep_end = (raw_base + keep_end_off + 4095U) & ~(uintptr_t)4095U;
+    if (keep_start < map_base)
+        keep_start = map_base;
+    if (keep_end > map_end)
+        keep_end = map_end;
+
+    evict_mmap_range_preserving_extradata(d, map_base, keep_start);
+    evict_mmap_range_preserving_extradata(d, keep_end, map_end);
 }
 
 static bool mp4_read_packet(demuxer_t *d, demux_packet_t *pkt)
@@ -94,11 +130,13 @@ static bool mp4_read_packet(demuxer_t *d, demux_packet_t *pkt)
 
     if (st->owns_mmap && st->current_sample_idx > 0) {
         const mp4_sample_entry_t *prev = &st->samples[st->current_sample_idx - 1];
-        evict_mmap_chunk(d, &st->last_evicted_offset, prev->offset + prev->size);
+        if (prev->offset <= d->mapped_size && prev->size <= d->mapped_size - prev->offset) {
+            evict_mmap_chunk(d, &st->last_evicted_offset, prev->offset + prev->size);
+        }
     }
 
     const mp4_sample_entry_t *s = &st->samples[st->current_sample_idx++];
-    if (s->offset + s->size > d->mapped_size) {
+    if (s->offset > d->mapped_size || s->size > d->mapped_size - s->offset) {
         return false;
     }
 
@@ -118,33 +156,26 @@ static bool mp4_seek_us(demuxer_t *d, int64_t target_pts_us)
     if (st->num_samples == 0)
         return false;
 
-    if (st->owns_mmap && d->mapped_buf && d->mapped_size >= 4096) {
-        uintptr_t base = ((uintptr_t)d->mapped_buf + 4095U) & ~(uintptr_t)4095U;
-        uintptr_t end = ((uintptr_t)d->mapped_buf + d->mapped_size) & ~(uintptr_t)4095U;
-        if (end > base) {
-            madvise((void *)base, (size_t)(end - base), MADV_DONTNEED);
-        }
-    }
-
-    if (target_pts_us <= 0) {
-        st->current_sample_idx = 0;
-        st->last_evicted_offset = 0;
-        return true;
-    }
-
-    /* Find nearest keyframe at or before target_pts_us */
     size_t best_idx = 0;
-    for (size_t i = 0; i < st->num_samples; ++i) {
-        if (st->samples[i].pts_us > target_pts_us) {
-            break;
+    if (target_pts_us > 0) {
+        /* Find nearest keyframe at or before target_pts_us */
+        for (size_t i = 0; i < st->num_samples; ++i) {
+            if (st->samples[i].is_keyframe) {
+                if (st->samples[i].pts_us > target_pts_us) {
+                    break;
+                }
+                best_idx = i;
+            }
         }
-        if (st->samples[i].is_keyframe) {
-            best_idx = i;
-        }
+    }
+
+    if (st->owns_mmap) {
+        evict_mmap_for_seek(d, st->samples[best_idx].offset);
     }
 
     st->current_sample_idx = best_idx;
-    st->last_evicted_offset = st->samples[best_idx].offset & ~(size_t)4095U;
+    st->last_evicted_offset =
+        (target_pts_us <= 0) ? 0 : (st->samples[best_idx].offset & ~(size_t)4095U);
     return true;
 }
 
@@ -443,6 +474,8 @@ static void parse_moov(const uint8_t *buf, size_t size, mp4_parser_temp_t *pt)
             break;
 
         if (box_type == FOURCC('t', 'r', 'a', 'k')) {
+            memset(pt, 0, sizeof(*pt));
+            pt->timescale = 1000;
             parse_trak(buf + offset + hdr_len, box_size - hdr_len, pt);
             if (pt->codec != WAYWAL_CODEC_UNKNOWN) {
                 break;
@@ -494,10 +527,6 @@ typedef struct {
     size_t num_samples;
     size_t current_sample_idx;
     size_t last_evicted_offset;
-
-    webm_sample_entry_t lace_queue[64];
-    uint32_t lace_head;
-    uint32_t lace_count;
 } webm_state_t;
 
 static bool ebml_read_vint(const uint8_t *data, size_t size, size_t *offset, uint64_t *out_val,
@@ -549,33 +578,19 @@ static bool webm_read_packet(demuxer_t *d, demux_packet_t *pkt)
         return false;
     webm_state_t *st = (webm_state_t *)d->internal_state;
 
-    if (st->lace_head < st->lace_count && st->lace_head < 64) {
-        const webm_sample_entry_t *ls = &st->lace_queue[st->lace_head++];
-        if (st->lace_head >= st->lace_count) {
-            st->lace_head = 0;
-            st->lace_count = 0;
-        }
-        if (ls->offset + ls->size > d->mapped_size)
-            return false;
-        pkt->data = d->mapped_buf + ls->offset;
-        pkt->size = ls->size;
-        pkt->pts_us = ls->pts_us;
-        pkt->dts_us = ls->dts_us;
-        pkt->is_keyframe = ls->is_keyframe;
-        return true;
-    }
-
     if (st->current_sample_idx >= st->num_samples) {
         return false; /* End of stream */
     }
 
     if (st->owns_mmap && st->current_sample_idx > 0) {
         const webm_sample_entry_t *prev = &st->samples[st->current_sample_idx - 1];
-        evict_mmap_chunk(d, &st->last_evicted_offset, prev->offset + prev->size);
+        if (prev->offset <= d->mapped_size && prev->size <= d->mapped_size - prev->offset) {
+            evict_mmap_chunk(d, &st->last_evicted_offset, prev->offset + prev->size);
+        }
     }
 
     const webm_sample_entry_t *s = &st->samples[st->current_sample_idx++];
-    if (s->offset + s->size > d->mapped_size) {
+    if (s->offset > d->mapped_size || s->size > d->mapped_size - s->offset) {
         return false;
     }
 
@@ -592,37 +607,28 @@ static bool webm_seek_us(demuxer_t *d, int64_t target_pts_us)
     if (!d || !d->internal_state)
         return false;
     webm_state_t *st = (webm_state_t *)d->internal_state;
-    st->lace_head = 0;
-    st->lace_count = 0;
     if (st->num_samples == 0)
         return false;
 
-    if (st->owns_mmap && d->mapped_buf && d->mapped_size >= 4096) {
-        uintptr_t base = ((uintptr_t)d->mapped_buf + 4095U) & ~(uintptr_t)4095U;
-        uintptr_t end = ((uintptr_t)d->mapped_buf + d->mapped_size) & ~(uintptr_t)4095U;
-        if (end > base) {
-            madvise((void *)base, (size_t)(end - base), MADV_DONTNEED);
-        }
-    }
-
-    if (target_pts_us <= 0) {
-        st->current_sample_idx = 0;
-        st->last_evicted_offset = 0;
-        return true;
-    }
-
     size_t best_idx = 0;
-    for (size_t i = 0; i < st->num_samples; ++i) {
-        if (st->samples[i].pts_us > target_pts_us) {
-            break;
+    if (target_pts_us > 0) {
+        for (size_t i = 0; i < st->num_samples; ++i) {
+            if (st->samples[i].is_keyframe) {
+                if (st->samples[i].pts_us > target_pts_us) {
+                    break;
+                }
+                best_idx = i;
+            }
         }
-        if (st->samples[i].is_keyframe) {
-            best_idx = i;
-        }
+    }
+
+    if (st->owns_mmap) {
+        evict_mmap_for_seek(d, st->samples[best_idx].offset);
     }
 
     st->current_sample_idx = best_idx;
-    st->last_evicted_offset = st->samples[best_idx].offset & ~(size_t)4095U;
+    st->last_evicted_offset =
+        (target_pts_us <= 0) ? 0 : (st->samples[best_idx].offset & ~(size_t)4095U);
     return true;
 }
 
@@ -1287,6 +1293,9 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size)
             WAYWAL_LOG_ERR("stts bounds check failed");
             free(samples);
             return NULL;
+        }
+        if (pt.timescale == 0) {
+            pt.timescale = 1000;
         }
         const uint8_t *stts_entries = pt.stts_data + 8;
         for (uint32_t i = 0; i < stts_count && stts_sample_idx < sample_count; ++i) {

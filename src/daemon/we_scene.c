@@ -1,52 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "waywal/we_scene.h"
+#include "we_scene_internal.h"
 
-#include "waywal/log.h"
-#include "waywal/toml_parser.h"
-
-#ifndef WWAL_WE_PROJECT_ONLY
-#if __has_include("linux-dmabuf-v1-client-protocol.h")
 #include "waywal/dmabuf.h"
-#else
-#include <drm_fourcc.h>
-#include <gbm.h>
-#include <sys/types.h>
-#define WAYWAL_MAX_BUFFER_PLANES 4
-struct dmabuf_bo {
-    int fd[WAYWAL_MAX_BUFFER_PLANES];
-    uint32_t stride[WAYWAL_MAX_BUFFER_PLANES];
-    uint32_t offset[WAYWAL_MAX_BUFFER_PLANES];
-    uint64_t modifier;
-    uint32_t num_planes;
-    uint32_t width;
-    uint32_t height;
-    uint32_t drm_format;
-    struct gbm_bo *gbm_bo;
-    struct wl_buffer *wl_buffer;
-    void *egl_image;
-    void *map_data;
-    uint32_t gl_tex;
-    bool is_10bit;
-    bool in_use;
-};
-struct dmabuf_context {
-    int drm_fd;
-    struct gbm_device *gbm;
-    void *dmabuf_proto;
-    void *default_feedback;
-    uint64_t preferred_modifier;
-    uint32_t preferred_format;
-    bool has_10bit;
-    uint32_t format_10bit;
-    uint64_t modifier_10bit;
-    bool has_nv12;
-    bool has_p010;
-    dev_t compositor_dev;
-    bool has_compositor_dev;
-    bool available;
-    bool map_supported;
-};
-#endif
+#include "waywal/log.h"
+
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <drm_fourcc.h>
@@ -54,2360 +11,12 @@ struct dmabuf_context {
 #include <GLES3/gl31.h>
 #include <GLES2/gl2ext.h>
 // clang-format on
-#endif
 #include <ctype.h>
-#include <dirent.h>
-#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-/* =========================================================================
- * Lightweight Recursive-Descent JSON DOM Parser
- * ========================================================================= */
-
-typedef enum {
-    JVAL_NULL = 0,
-    JVAL_BOOL,
-    JVAL_NUM,
-    JVAL_STR,
-    JVAL_ARR,
-    JVAL_OBJ,
-} we_jtype_t;
-
-typedef struct we_jval we_jval_t;
-
-typedef struct {
-    char *key;
-    we_jval_t *val;
-} we_jkv_t;
-
-struct we_jval {
-    we_jtype_t type;
-    bool bval;
-    double num;
-    char *str;
-    struct {
-        we_jval_t **items;
-        size_t count;
-    } arr;
-    struct {
-        we_jkv_t *entries;
-        size_t count;
-    } obj;
-};
-
-typedef struct {
-    const char *src;
-    size_t len;
-    size_t pos;
-} json_lexer_t;
-
-static void jval_free(we_jval_t *v)
-{
-    if (!v) {
-        return;
-    }
-    if (v->type == JVAL_STR) {
-        free(v->str);
-    } else if (v->type == JVAL_ARR) {
-        for (size_t i = 0; i < v->arr.count; i++) {
-            jval_free(v->arr.items[i]);
-        }
-        free(v->arr.items);
-    } else if (v->type == JVAL_OBJ) {
-        for (size_t i = 0; i < v->obj.count; i++) {
-            free(v->obj.entries[i].key);
-            jval_free(v->obj.entries[i].val);
-        }
-        free(v->obj.entries);
-    }
-    free(v);
-}
-
-static void json_skip_ws(json_lexer_t *lx)
-{
-    while (lx->pos < lx->len) {
-        char c = lx->src[lx->pos];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            lx->pos++;
-        } else if (c == '/' && lx->pos + 1 < lx->len && lx->src[lx->pos + 1] == '/') {
-            lx->pos += 2;
-            while (lx->pos < lx->len && lx->src[lx->pos] != '\n') {
-                lx->pos++;
-            }
-        } else if (c == '/' && lx->pos + 1 < lx->len && lx->src[lx->pos + 1] == '*') {
-            lx->pos += 2;
-            while (lx->pos + 1 < lx->len &&
-                   !(lx->src[lx->pos] == '*' && lx->src[lx->pos + 1] == '/')) {
-                lx->pos++;
-            }
-            if (lx->pos + 1 < lx->len) {
-                lx->pos += 2;
-            } else {
-                lx->pos = lx->len;
-            }
-        } else {
-            break;
-        }
-    }
-}
-
-static char *json_parse_raw_string(json_lexer_t *lx)
-{
-    json_skip_ws(lx);
-    if (lx->pos >= lx->len || lx->src[lx->pos] != '"') {
-        return NULL;
-    }
-    lx->pos++; /* skip '"' */
-
-    size_t cap = 64;
-    size_t len = 0;
-    char *out = malloc(cap);
-    if (!out) {
-        return NULL;
-    }
-
-    while (lx->pos < lx->len) {
-        char c = lx->src[lx->pos++];
-        if (c == '"') {
-            out[len] = '\0';
-            return out;
-        }
-        if (c == '\\' && lx->pos < lx->len) {
-            char esc = lx->src[lx->pos++];
-            switch (esc) {
-            case '"':
-                c = '"';
-                break;
-            case '\\':
-                c = '\\';
-                break;
-            case '/':
-                c = '/';
-                break;
-            case 'b':
-                c = '\b';
-                break;
-            case 'f':
-                c = '\f';
-                break;
-            case 'n':
-                c = '\n';
-                break;
-            case 'r':
-                c = '\r';
-                break;
-            case 't':
-                c = '\t';
-                break;
-            case 'u':
-                if (lx->pos + 4 <= lx->len) {
-                    char hex[5];
-                    memcpy(hex, lx->src + lx->pos, 4);
-                    hex[4] = '\0';
-                    unsigned int cp = (unsigned int)strtoul(hex, NULL, 16);
-                    lx->pos += 4;
-                    c = (cp < 0x80 && cp > 0) ? (char)cp : '?';
-                }
-                break;
-            default:
-                c = esc;
-                break;
-            }
-        }
-        if (len + 2 > cap) {
-            size_t ncap = cap * 2;
-            char *nb = realloc(out, ncap);
-            if (!nb) {
-                free(out);
-                return NULL;
-            }
-            out = nb;
-            cap = ncap;
-        }
-        out[len++] = c;
-    }
-
-    free(out);
-    return NULL;
-}
-
-static we_jval_t *json_parse_value(json_lexer_t *lx, int depth);
-
-static we_jval_t *json_parse_array(json_lexer_t *lx, int depth)
-{
-    lx->pos++; /* skip '[' */
-    we_jval_t *arr = calloc(1, sizeof(we_jval_t));
-    if (!arr) {
-        return NULL;
-    }
-    arr->type = JVAL_ARR;
-
-    size_t cap = 0;
-    while (lx->pos < lx->len) {
-        json_skip_ws(lx);
-        if (lx->pos < lx->len && lx->src[lx->pos] == ']') {
-            lx->pos++;
-            return arr;
-        }
-        we_jval_t *elem = json_parse_value(lx, depth + 1);
-        if (!elem) {
-            jval_free(arr);
-            return NULL;
-        }
-        if (arr->arr.count + 1 > cap) {
-            size_t ncap = cap == 0 ? 8 : cap * 2;
-            we_jval_t **ni = realloc(arr->arr.items, ncap * sizeof(we_jval_t *));
-            if (!ni) {
-                jval_free(elem);
-                jval_free(arr);
-                return NULL;
-            }
-            arr->arr.items = ni;
-            cap = ncap;
-        }
-        arr->arr.items[arr->arr.count++] = elem;
-
-        json_skip_ws(lx);
-        if (lx->pos < lx->len && lx->src[lx->pos] == ',') {
-            lx->pos++;
-        }
-    }
-
-    jval_free(arr);
-    return NULL;
-}
-
-static we_jval_t *json_parse_object(json_lexer_t *lx, int depth)
-{
-    lx->pos++; /* skip '{' */
-    we_jval_t *obj = calloc(1, sizeof(we_jval_t));
-    if (!obj) {
-        return NULL;
-    }
-    obj->type = JVAL_OBJ;
-
-    size_t cap = 0;
-    while (lx->pos < lx->len) {
-        json_skip_ws(lx);
-        if (lx->pos < lx->len && lx->src[lx->pos] == '}') {
-            lx->pos++;
-            return obj;
-        }
-        char *key = json_parse_raw_string(lx);
-        if (!key) {
-            jval_free(obj);
-            return NULL;
-        }
-        json_skip_ws(lx);
-        if (lx->pos >= lx->len || lx->src[lx->pos] != ':') {
-            free(key);
-            jval_free(obj);
-            return NULL;
-        }
-        lx->pos++; /* skip ':' */
-
-        we_jval_t *val = json_parse_value(lx, depth + 1);
-        if (!val) {
-            free(key);
-            jval_free(obj);
-            return NULL;
-        }
-
-        if (obj->obj.count + 1 > cap) {
-            size_t ncap = cap == 0 ? 8 : cap * 2;
-            we_jkv_t *ne = realloc(obj->obj.entries, ncap * sizeof(we_jkv_t));
-            if (!ne) {
-                free(key);
-                jval_free(val);
-                jval_free(obj);
-                return NULL;
-            }
-            obj->obj.entries = ne;
-            cap = ncap;
-        }
-        obj->obj.entries[obj->obj.count].key = key;
-        obj->obj.entries[obj->obj.count].val = val;
-        obj->obj.count++;
-
-        json_skip_ws(lx);
-        if (lx->pos < lx->len && lx->src[lx->pos] == ',') {
-            lx->pos++;
-        }
-    }
-
-    jval_free(obj);
-    return NULL;
-}
-
-static we_jval_t *json_parse_value(json_lexer_t *lx, int depth)
-{
-    if (depth > 64) {
-        return NULL;
-    }
-    json_skip_ws(lx);
-    if (lx->pos >= lx->len) {
-        return NULL;
-    }
-
-    char c = lx->src[lx->pos];
-    if (c == '{') {
-        return json_parse_object(lx, depth);
-    }
-    if (c == '[') {
-        return json_parse_array(lx, depth);
-    }
-    if (c == '"') {
-        char *s = json_parse_raw_string(lx);
-        if (!s) {
-            return NULL;
-        }
-        we_jval_t *v = calloc(1, sizeof(we_jval_t));
-        if (!v) {
-            free(s);
-            return NULL;
-        }
-        v->type = JVAL_STR;
-        v->str = s;
-        return v;
-    }
-    if (lx->len - lx->pos >= 4 && strncmp(lx->src + lx->pos, "true", 4) == 0) {
-        lx->pos += 4;
-        we_jval_t *v = calloc(1, sizeof(we_jval_t));
-        if (v) {
-            v->type = JVAL_BOOL;
-            v->bval = true;
-        }
-        return v;
-    }
-    if (lx->len - lx->pos >= 5 && strncmp(lx->src + lx->pos, "false", 5) == 0) {
-        lx->pos += 5;
-        we_jval_t *v = calloc(1, sizeof(we_jval_t));
-        if (v) {
-            v->type = JVAL_BOOL;
-            v->bval = false;
-        }
-        return v;
-    }
-    if (lx->len - lx->pos >= 4 && strncmp(lx->src + lx->pos, "null", 4) == 0) {
-        lx->pos += 4;
-        we_jval_t *v = calloc(1, sizeof(we_jval_t));
-        if (v) {
-            v->type = JVAL_NULL;
-        }
-        return v;
-    }
-    if (c == '-' || c == '+' || (c >= '0' && c <= '9') || c == '.') {
-        size_t rem = lx->len - lx->pos;
-        size_t copy_len = rem < 63 ? rem : 63;
-        char num_buf[64];
-        memcpy(num_buf, lx->src + lx->pos, copy_len);
-        num_buf[copy_len] = '\0';
-        char *endptr = NULL;
-        double num = strtod(num_buf, &endptr);
-        if (endptr == num_buf) {
-            return NULL;
-        }
-        lx->pos += (size_t)(endptr - num_buf);
-        we_jval_t *v = calloc(1, sizeof(we_jval_t));
-        if (v) {
-            v->type = JVAL_NUM;
-            v->num = num;
-        }
-        return v;
-    }
-    return NULL;
-}
-
-static we_jval_t *json_parse_root(const char *src, size_t len)
-{
-    if (!src || len == 0) {
-        return NULL;
-    }
-    /* Skip optional UTF-8 BOM */
-    size_t offset = 0;
-    if (len >= 3 && (uint8_t)src[0] == 0xEF && (uint8_t)src[1] == 0xBB && (uint8_t)src[2] == 0xBF) {
-        offset = 3;
-    }
-    json_lexer_t lx = {.src = src + offset, .len = len - offset, .pos = 0};
-    return json_parse_value(&lx, 0);
-}
-
-static const we_jval_t *jobj_get(const we_jval_t *obj, const char *key)
-{
-    if (!obj || obj->type != JVAL_OBJ || !key) {
-        return NULL;
-    }
-    for (size_t i = 0; i < obj->obj.count; i++) {
-        if (strcmp(obj->obj.entries[i].key, key) == 0) {
-            return obj->obj.entries[i].val;
-        }
-    }
-    for (size_t i = 0; i < obj->obj.count; i++) {
-        if (strcasecmp(obj->obj.entries[i].key, key) == 0) {
-            return obj->obj.entries[i].val;
-        }
-    }
-    return NULL;
-}
-
-static const char *jval_str(const we_jval_t *v, const char *def)
-{
-    if (!v) {
-        return def;
-    }
-    if (v->type == JVAL_STR && v->str) {
-        return v->str;
-    }
-    if (v->type == JVAL_OBJ) {
-        const we_jval_t *inner = jobj_get(v, "value");
-        if (inner && inner->type == JVAL_STR && inner->str) {
-            return inner->str;
-        }
-    }
-    return def;
-}
-
-static const we_user_prop_t *project_find_prop(const we_project_t *proj, const char *key)
-{
-    if (!proj || !key || key[0] == '\0') {
-        return NULL;
-    }
-    for (uint32_t i = 0; i < proj->prop_count; i++) {
-        if (strcasecmp(proj->props[i].key, key) == 0) {
-            return &proj->props[i];
-        }
-    }
-    return NULL;
-}
-
-static uint32_t parse_float_str(const char *s, float *out, uint32_t max_n)
-{
-    if (!s || !out || max_n == 0) {
-        return 0;
-    }
-    const char *p = s;
-    uint32_t count = 0;
-    while (*p && count < max_n) {
-        while (*p && (isspace((unsigned char)*p) || *p == ',')) {
-            p++;
-        }
-        if (!*p) {
-            break;
-        }
-        char *endptr = NULL;
-        float v = strtof(p, &endptr);
-        if (endptr == p) {
-            break;
-        }
-        out[count++] = v;
-        p = endptr;
-    }
-    return count;
-}
-
-static uint32_t jval_floats(const we_jval_t *v, const we_project_t *proj, float *out,
-                            uint32_t max_n, char *out_user_prop, size_t prop_cap)
-{
-    if (out_user_prop && prop_cap > 0) {
-        out_user_prop[0] = '\0';
-    }
-    if (!v || !out || max_n == 0) {
-        return 0;
-    }
-
-    if (v->type == JVAL_OBJ) {
-        const we_jval_t *u = jobj_get(v, "user");
-        const char *ukey = NULL;
-        if (u && u->type == JVAL_STR) {
-            ukey = u->str;
-        } else if (u && u->type == JVAL_OBJ) {
-            ukey = jval_str(jobj_get(u, "name"), NULL);
-        }
-        if (ukey && ukey[0] != '\0') {
-            if (out_user_prop && prop_cap > 0) {
-                snprintf(out_user_prop, prop_cap, "%s", ukey);
-            }
-            const we_user_prop_t *up = project_find_prop(proj, ukey);
-            if (up && up->num_components > 0) {
-                uint32_t n = up->num_components < max_n ? up->num_components : max_n;
-                for (uint32_t i = 0; i < n; i++) {
-                    out[i] = up->val[i];
-                }
-                return n;
-            }
-        }
-        const we_jval_t *inner = jobj_get(v, "value");
-        if (inner) {
-            return jval_floats(inner, proj, out, max_n, NULL, 0);
-        }
-        return 0;
-    }
-
-    if (v->type == JVAL_NUM) {
-        out[0] = (float)v->num;
-        return 1;
-    }
-    if (v->type == JVAL_BOOL) {
-        out[0] = v->bval ? 1.0f : 0.0f;
-        return 1;
-    }
-    if (v->type == JVAL_STR && v->str) {
-        if (strcasecmp(v->str, "true") == 0) {
-            out[0] = 1.0f;
-            return 1;
-        }
-        if (strcasecmp(v->str, "false") == 0) {
-            out[0] = 0.0f;
-            return 1;
-        }
-        return parse_float_str(v->str, out, max_n);
-    }
-    if (v->type == JVAL_ARR) {
-        uint32_t n = (uint32_t)v->arr.count < max_n ? (uint32_t)v->arr.count : max_n;
-        for (uint32_t i = 0; i < n; i++) {
-            float tmp = 0.0f;
-            jval_floats(v->arr.items[i], proj, &tmp, 1, NULL, 0);
-            out[i] = tmp;
-        }
-        return n;
-    }
-    return 0;
-}
-
-#ifndef WWAL_WE_PROJECT_ONLY
-static float jval_float(const we_jval_t *v, const we_project_t *proj, float def,
-                        char *out_user_prop, size_t prop_cap)
-{
-    float tmp = def;
-    if (jval_floats(v, proj, &tmp, 1, out_user_prop, prop_cap) >= 1) {
-        return tmp;
-    }
-    return def;
-}
-
-static bool jval_bool_resolved(const we_jval_t *v, const we_project_t *proj, bool def,
-                               char *out_user_prop, size_t prop_cap)
-{
-    float tmp = def ? 1.0f : 0.0f;
-    if (jval_floats(v, proj, &tmp, 1, out_user_prop, prop_cap) >= 1) {
-        return tmp != 0.0f;
-    }
-    return def;
-}
-#endif
-
-/* =========================================================================
- * project.json Parsing & User Property Overrides
- * ========================================================================= */
-
-bool we_project_parse(const char *json_str, size_t len, we_project_t *out_proj)
-{
-    if (!json_str || len == 0 || !out_proj) {
-        return false;
-    }
-    we_jval_t *root = json_parse_root(json_str, len);
-    if (!root || root->type != JVAL_OBJ) {
-        jval_free(root);
-        return false;
-    }
-
-    snprintf(out_proj->title, sizeof(out_proj->title), "%s",
-             jval_str(jobj_get(root, "title"), "Untitled Wallpaper"));
-    snprintf(out_proj->type, sizeof(out_proj->type), "%s",
-             jval_str(jobj_get(root, "type"), "scene"));
-    snprintf(out_proj->file, sizeof(out_proj->file), "%s",
-             jval_str(jobj_get(root, "file"), "scene.json"));
-    snprintf(out_proj->preview, sizeof(out_proj->preview), "%s",
-             jval_str(jobj_get(root, "preview"), "preview.jpg"));
-
-    const we_jval_t *gen = jobj_get(root, "general");
-    const we_jval_t *props = gen ? jobj_get(gen, "properties") : jobj_get(root, "properties");
-    if (props && props->type == JVAL_OBJ) {
-        for (size_t i = 0; i < props->obj.count && out_proj->prop_count < WE_MAX_USER_PROPS; i++) {
-            const char *pkey = props->obj.entries[i].key;
-            const we_jval_t *pval = props->obj.entries[i].val;
-            if (!pkey || !pval || pval->type != JVAL_OBJ) {
-                continue;
-            }
-
-            we_user_prop_t *up = &out_proj->props[out_proj->prop_count++];
-            memset(up, 0, sizeof(*up));
-            snprintf(up->key, sizeof(up->key), "%s", pkey);
-            snprintf(up->text, sizeof(up->text), "%s", jval_str(jobj_get(pval, "text"), pkey));
-
-            const char *ptype = jval_str(jobj_get(pval, "type"), "slider");
-            if (strcasecmp(ptype, "bool") == 0) {
-                up->type = WE_PROP_BOOL;
-            } else if (strcasecmp(ptype, "color") == 0) {
-                up->type = WE_PROP_COLOR;
-            } else if (strcasecmp(ptype, "combo") == 0 || strcasecmp(ptype, "int") == 0) {
-                up->type = WE_PROP_INT;
-            } else if (strcasecmp(ptype, "text") == 0 || strcasecmp(ptype, "file") == 0) {
-                up->type = WE_PROP_TEXT;
-            } else {
-                up->type = WE_PROP_FLOAT;
-            }
-
-            const we_jval_t *vnode = jobj_get(pval, "value");
-            if (vnode) {
-                if (vnode->type == JVAL_STR && vnode->str) {
-                    snprintf(up->str_val, sizeof(up->str_val), "%s", vnode->str);
-                }
-                up->num_components = jval_floats(vnode, NULL, up->val, 4, NULL, 0);
-                if (up->num_components == 0 && up->type == WE_PROP_BOOL) {
-                    up->num_components = 1;
-                }
-            }
-        }
-    }
-
-    jval_free(root);
-    return true;
-}
-
-bool we_project_load_dir(const char *workshop_dir, we_project_t *out_proj)
-{
-    if (!workshop_dir || !out_proj) {
-        return false;
-    }
-    memset(out_proj, 0, sizeof(*out_proj));
-    snprintf(out_proj->workshop_dir, sizeof(out_proj->workshop_dir), "%s", workshop_dir);
-
-    /* Extract trailing directory basename as default workshop_id */
-    size_t dlen = strlen(workshop_dir);
-    while (dlen > 1 && workshop_dir[dlen - 1] == '/') {
-        dlen--;
-    }
-    const char *slash = memrchr(workshop_dir, '/', dlen);
-    const char *id_start = slash ? (slash + 1) : workshop_dir;
-    size_t id_len = dlen - (size_t)(id_start - workshop_dir);
-    if (id_len >= sizeof(out_proj->workshop_id)) {
-        id_len = sizeof(out_proj->workshop_id) - 1;
-    }
-    memcpy(out_proj->workshop_id, id_start, id_len);
-    out_proj->workshop_id[id_len] = '\0';
-
-    char json_path[4096];
-    if (snprintf(json_path, sizeof(json_path), "%s/project.json", workshop_dir) >=
-        (int)sizeof(json_path)) {
-        return false;
-    }
-
-    int fd = open(json_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        /* Fallback if directory only has scene.pkg without project.json */
-        snprintf(json_path, sizeof(json_path), "%s/scene.pkg", workshop_dir);
-        struct stat st;
-        if (stat(json_path, &st) == 0 && S_ISREG(st.st_mode)) {
-            snprintf(out_proj->title, sizeof(out_proj->title), "%s", out_proj->workshop_id);
-            snprintf(out_proj->type, sizeof(out_proj->type), "scene");
-            snprintf(out_proj->file, sizeof(out_proj->file), "scene.json");
-            snprintf(out_proj->preview, sizeof(out_proj->preview), "preview.jpg");
-            return true;
-        }
-        return false;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > (16 * 1024 * 1024)) {
-        close(fd);
-        return false;
-    }
-
-    char *buf = malloc((size_t)st.st_size + 1);
-    if (!buf) {
-        close(fd);
-        return false;
-    }
-
-    ssize_t rd = read(fd, buf, (size_t)st.st_size);
-    close(fd);
-    if (rd != st.st_size) {
-        free(buf);
-        return false;
-    }
-    buf[st.st_size] = '\0';
-
-    bool ok = we_project_parse(buf, (size_t)st.st_size, out_proj);
-    free(buf);
-    return ok;
-}
-
-bool we_project_apply_override(we_project_t *proj, const char *key, const char *val_str)
-{
-    if (!proj || !key || key[0] == '\0' || !val_str) {
-        return false;
-    }
-
-    we_user_prop_t *target = NULL;
-    for (uint32_t i = 0; i < proj->prop_count; i++) {
-        if (strcasecmp(proj->props[i].key, key) == 0) {
-            target = &proj->props[i];
-            break;
-        }
-    }
-    if (!target) {
-        if (proj->prop_count >= WE_MAX_USER_PROPS) {
-            return false;
-        }
-        target = &proj->props[proj->prop_count++];
-        memset(target, 0, sizeof(*target));
-        snprintf(target->key, sizeof(target->key), "%s", key);
-        snprintf(target->text, sizeof(target->text), "%s", key);
-        target->type = WE_PROP_FLOAT;
-    }
-
-    snprintf(target->str_val, sizeof(target->str_val), "%s", val_str);
-    if (strcasecmp(val_str, "true") == 0 || strcmp(val_str, "1") == 0) {
-        target->val[0] = 1.0f;
-        target->num_components = 1;
-        return true;
-    }
-    if (strcasecmp(val_str, "false") == 0 || strcmp(val_str, "0") == 0) {
-        target->val[0] = 0.0f;
-        target->num_components = 1;
-        return true;
-    }
-
-    uint32_t nf = parse_float_str(val_str, target->val, 4);
-    if (nf > 0) {
-        target->num_components = nf;
-        if (nf == 3) {
-            target->type = WE_PROP_COLOR;
-        }
-    }
-    return true;
-}
-
-void we_project_apply_overrides_str(we_project_t *proj, const char *overrides_str)
-{
-    if (!proj || !overrides_str || overrides_str[0] == '\0') {
-        return;
-    }
-    const char *p = overrides_str;
-    while (*p) {
-        while (*p && (*p == ';' || *p == '\n' || *p == '\r' || isspace((unsigned char)*p))) {
-            p++;
-        }
-        if (!*p) {
-            break;
-        }
-        const char *end = p;
-        while (*end && *end != ';' && *end != '\n' && *end != '\r') {
-            end++;
-        }
-        const char *eq = memchr(p, '=', (size_t)(end - p));
-        if (eq && eq > p) {
-            char kbuf[64] = {0};
-            char vbuf[256] = {0};
-            size_t klen = (size_t)(eq - p);
-            while (klen > 0 && isspace((unsigned char)p[klen - 1])) {
-                klen--;
-            }
-            if (klen >= sizeof(kbuf)) {
-                klen = sizeof(kbuf) - 1;
-            }
-            memcpy(kbuf, p, klen);
-            kbuf[klen] = '\0';
-
-            const char *vstart = eq + 1;
-            while (vstart < end && isspace((unsigned char)*vstart)) {
-                vstart++;
-            }
-            size_t vlen = (size_t)(end - vstart);
-            if (vlen >= sizeof(vbuf)) {
-                vlen = sizeof(vbuf) - 1;
-            }
-            memcpy(vbuf, vstart, vlen);
-            vbuf[vlen] = '\0';
-
-            we_project_apply_override(proj, kbuf, vbuf);
-        }
-        p = end;
-    }
-}
-
-/* =========================================================================
- * Steam Workshop 431960 Directory Discovery
- * ========================================================================= */
-
-static void append_colon_paths(const char *path_list, char roots[12][4096], size_t *inout_count,
-                               size_t max_roots)
-{
-    if (!path_list || path_list[0] == '\0' || !inout_count) {
-        return;
-    }
-    const char *p = path_list;
-    while (*p && *inout_count < max_roots) {
-        const char *colon = strchr(p, ':');
-        size_t len = colon ? (size_t)(colon - p) : strlen(p);
-        if (len > 0 && len < 4096) {
-            memcpy(roots[*inout_count], p, len);
-            roots[*inout_count][len] = '\0';
-            (*inout_count)++;
-        }
-        if (!colon) {
-            break;
-        }
-        p = colon + 1;
-    }
-}
-
-static size_t collect_workshop_roots(char roots[12][4096])
-{
-    size_t count = 0;
-    const char *env_dir = getenv("WWAL_WORKSHOP_DIR");
-    append_colon_paths(env_dir, roots, &count, 6);
-
-    waywal_config_t cfg;
-    if (waywal_config_load_default(&cfg) && cfg.daemon.workshop_dir[0] != '\0') {
-        append_colon_paths(cfg.daemon.workshop_dir, roots, &count, 8);
-    }
-
-    const char *home = getenv("HOME");
-    if (home && home[0] != '\0') {
-        static const char *const rel_roots[] = {
-            ".local/share/Steam/steamapps/workshop/content/431960",
-            ".steam/steam/steamapps/workshop/content/431960",
-            ".steam/root/steamapps/workshop/content/431960",
-            ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/workshop/content/431960",
-            "snap/steam/common/.local/share/Steam/steamapps/workshop/content/431960",
-        };
-        for (size_t i = 0; i < sizeof(rel_roots) / sizeof(rel_roots[0]) && count < 12; i++) {
-            snprintf(roots[count++], 4096, "%s/%s", home, rel_roots[i]);
-        }
-    }
-    return count;
-}
-
-static bool dir_has_workshop_files(const char *dir)
-{
-    char probe[4096];
-    struct stat st;
-    if (snprintf(probe, sizeof(probe), "%s/project.json", dir) < (int)sizeof(probe) &&
-        stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
-        return true;
-    }
-    if (snprintf(probe, sizeof(probe), "%s/scene.pkg", dir) < (int)sizeof(probe) &&
-        stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
-        return true;
-    }
-    return false;
-}
-
-bool we_workshop_resolve_dir(const char *id_or_path, char *out_dir, size_t out_cap)
-{
-    if (!id_or_path || id_or_path[0] == '\0' || !out_dir || out_cap == 0) {
-        return false;
-    }
-
-    struct stat st;
-    if (stat(id_or_path, &st) == 0) {
-        if (S_ISDIR(st.st_mode) && dir_has_workshop_files(id_or_path)) {
-            snprintf(out_dir, out_cap, "%s", id_or_path);
-            return true;
-        }
-        if (S_ISREG(st.st_mode)) {
-            const char *slash = strrchr(id_or_path, '/');
-            if (slash && slash > id_or_path) {
-                size_t dlen = (size_t)(slash - id_or_path);
-                if (dlen < out_cap) {
-                    memcpy(out_dir, id_or_path, dlen);
-                    out_dir[dlen] = '\0';
-                    if (dir_has_workshop_files(out_dir)) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    /* Search across candidate Steam Workshop 431960 roots */
-    char roots[12][4096];
-    size_t root_count = collect_workshop_roots(roots);
-    for (size_t i = 0; i < root_count; i++) {
-        char candidate[4096];
-        if (snprintf(candidate, sizeof(candidate), "%s/%s", roots[i], id_or_path) <
-                (int)sizeof(candidate) &&
-            dir_has_workshop_files(candidate)) {
-            snprintf(out_dir, out_cap, "%s", candidate);
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static int cmp_projects_by_id(const void *a, const void *b)
-{
-    const we_project_t *pa = (const we_project_t *)a;
-    const we_project_t *pb = (const we_project_t *)b;
-    return strcmp(pa->workshop_id, pb->workshop_id);
-}
-
-bool we_workshop_scan_all(we_project_t **out_items, size_t *out_count)
-{
-    if (!out_items || !out_count) {
-        return false;
-    }
-    *out_items = NULL;
-    *out_count = 0;
-
-    char roots[12][4096];
-    size_t root_count = collect_workshop_roots(roots);
-
-    size_t cap = 0;
-    size_t count = 0;
-    we_project_t *items = NULL;
-
-    for (size_t r = 0; r < root_count; r++) {
-        /* If root itself is a single workshop item dir, include it directly */
-        if (dir_has_workshop_files(roots[r])) {
-            we_project_t proj;
-            if (we_project_load_dir(roots[r], &proj)) {
-                bool dup = false;
-                for (size_t k = 0; k < count; k++) {
-                    if (strcmp(items[k].workshop_id, proj.workshop_id) == 0) {
-                        dup = true;
-                        break;
-                    }
-                }
-                if (!dup) {
-                    if (count + 1 > cap) {
-                        size_t ncap = cap == 0 ? 16 : cap * 2;
-                        we_project_t *ni = realloc(items, ncap * sizeof(we_project_t));
-                        if (!ni) {
-                            free(items);
-                            return false;
-                        }
-                        items = ni;
-                        cap = ncap;
-                    }
-                    items[count++] = proj;
-                }
-            }
-        }
-
-        DIR *d = opendir(roots[r]);
-        if (!d) {
-            continue;
-        }
-        struct dirent *de;
-        while ((de = readdir(d)) != NULL) {
-            if (de->d_name[0] == '.') {
-                continue;
-            }
-            char subdir[4096];
-            if (snprintf(subdir, sizeof(subdir), "%s/%s", roots[r], de->d_name) >=
-                (int)sizeof(subdir)) {
-                continue;
-            }
-            if (!dir_has_workshop_files(subdir)) {
-                continue;
-            }
-            we_project_t proj;
-            if (!we_project_load_dir(subdir, &proj)) {
-                continue;
-            }
-            bool dup = false;
-            for (size_t k = 0; k < count; k++) {
-                if (strcmp(items[k].workshop_id, proj.workshop_id) == 0) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (dup) {
-                continue;
-            }
-            if (count + 1 > cap) {
-                size_t ncap = cap == 0 ? 16 : cap * 2;
-                we_project_t *ni = realloc(items, ncap * sizeof(we_project_t));
-                if (!ni) {
-                    closedir(d);
-                    free(items);
-                    return false;
-                }
-                items = ni;
-                cap = ncap;
-            }
-            items[count++] = proj;
-        }
-        closedir(d);
-    }
-
-    if (count > 1) {
-        qsort(items, count, sizeof(we_project_t), cmp_projects_by_id);
-    }
-    *out_items = items;
-    *out_count = count;
-    return true;
-}
-
-#ifndef WWAL_WE_PROJECT_ONLY
-
-/* =========================================================================
- * Material, Effect, and Scene Graph Parsing
- * ========================================================================= */
-
-static we_blend_mode_t parse_blend_mode(const char *str)
-{
-    if (!str) {
-        return WE_BLEND_NORMAL;
-    }
-    if (strcasecmp(str, "additive") == 0 || strcasecmp(str, "add") == 0) {
-        return WE_BLEND_ADDITIVE;
-    }
-    if (strcasecmp(str, "multiply") == 0 || strcasecmp(str, "mult") == 0) {
-        return WE_BLEND_MULTIPLY;
-    }
-    if (strcasecmp(str, "screen") == 0) {
-        return WE_BLEND_SCREEN;
-    }
-    if (strcasecmp(str, "disabled") == 0 || strcasecmp(str, "opaque") == 0 ||
-        strcasecmp(str, "none") == 0) {
-        return WE_BLEND_DISABLED;
-    }
-    return WE_BLEND_NORMAL;
-}
-
-static void pass_set_combo(we_material_pass_t *pass, const char *name, int32_t val)
-{
-    if (!pass || !name || name[0] == '\0') {
-        return;
-    }
-    for (uint32_t i = 0; i < pass->combo_count; i++) {
-        if (strcmp(pass->combos[i].name, name) == 0) {
-            pass->combos[i].value = val;
-            return;
-        }
-    }
-    if (pass->combo_count < WE_SHADER_MAX_COMBOS) {
-        snprintf(pass->combos[pass->combo_count].name, sizeof(pass->combos[0].name), "%s", name);
-        pass->combos[pass->combo_count].value = val;
-        pass->combo_count++;
-    }
-}
-
-static void pass_set_const_val(we_material_pass_t *pass, const char *name, const we_jval_t *v,
-                               const we_project_t *proj)
-{
-    if (!pass || !name || name[0] == '\0' || !v) {
-        return;
-    }
-    we_const_val_t *cv = NULL;
-    for (uint32_t i = 0; i < pass->const_val_count; i++) {
-        if (strcmp(pass->const_vals[i].name, name) == 0) {
-            cv = &pass->const_vals[i];
-            break;
-        }
-    }
-    if (!cv && pass->const_val_count < WE_MAX_CONST_VALS) {
-        cv = &pass->const_vals[pass->const_val_count++];
-        memset(cv, 0, sizeof(*cv));
-        snprintf(cv->name, sizeof(cv->name), "%s", name);
-    }
-    if (cv) {
-        cv->num_components = jval_floats(v, proj, cv->val, 4, cv->user_prop, sizeof(cv->user_prop));
-        if (v->type == JVAL_OBJ) {
-            const char *sc = jval_str(jobj_get(v, "script"), NULL);
-            if (sc && sc[0] != '\0') {
-                free(cv->script_src);
-                cv->script_src = strdup(sc);
-            }
-        }
-    }
-}
-
-static void parse_pass_json_overrides(we_material_pass_t *pass, const we_jval_t *pnode,
-                                      const we_project_t *proj)
-{
-    if (!pass || !pnode || pnode->type != JVAL_OBJ) {
-        return;
-    }
-
-    const char *sh = jval_str(jobj_get(pnode, "shader"), NULL);
-    if (sh && sh[0] != '\0') {
-        snprintf(pass->shader_name, sizeof(pass->shader_name), "%s", sh);
-    }
-    const char *bl = jval_str(jobj_get(pnode, "blending"), NULL);
-    if (bl) {
-        pass->blending = parse_blend_mode(bl);
-    }
-    const char *dt = jval_str(jobj_get(pnode, "depthtest"), NULL);
-    if (dt) {
-        pass->depthtest_enabled = (strcasecmp(dt, "enabled") == 0);
-    }
-    const char *cm = jval_str(jobj_get(pnode, "cullmode"), NULL);
-    if (cm) {
-        pass->cull_enabled = (strcasecmp(cm, "nocull") != 0 && strcasecmp(cm, "disabled") != 0);
-    }
-
-    const we_jval_t *texs = jobj_get(pnode, "textures");
-    if (texs && texs->type == JVAL_ARR) {
-        for (size_t i = 0; i < texs->arr.count && i < WE_MAX_PASS_TEXTURES; i++) {
-            const char *tpath = jval_str(texs->arr.items[i], NULL);
-            if (tpath && tpath[0] != '\0') {
-                snprintf(pass->tex_paths[i], sizeof(pass->tex_paths[i]), "%s", tpath);
-            }
-        }
-    }
-
-    const we_jval_t *combos = jobj_get(pnode, "combos");
-    if (combos && combos->type == JVAL_OBJ) {
-        for (size_t i = 0; i < combos->obj.count; i++) {
-            const char *ck = combos->obj.entries[i].key;
-            float cv = jval_float(combos->obj.entries[i].val, proj, 0.0f, NULL, 0);
-            pass_set_combo(pass, ck, (int32_t)cv);
-        }
-    }
-
-    const we_jval_t *cvals = jobj_get(pnode, "constantshadervalues");
-    if (cvals && cvals->type == JVAL_OBJ) {
-        for (size_t i = 0; i < cvals->obj.count; i++) {
-            pass_set_const_val(pass, cvals->obj.entries[i].key, cvals->obj.entries[i].val, proj);
-        }
-    }
-}
-
-static we_jval_t *pkg_load_json(const we_pkg_t *pkg, const char *rel_path)
-{
-    if (!pkg || !rel_path || rel_path[0] == '\0') {
-        return NULL;
-    }
-    size_t sz = 0;
-    bool owned = false;
-    const uint8_t *data = we_pkg_resolve(pkg, rel_path, &sz, &owned);
-    if (!data || sz == 0) {
-        if (owned && data) {
-            free((void *)data);
-        }
-        return NULL;
-    }
-    we_jval_t *root = json_parse_root((const char *)data, sz);
-    if (owned) {
-        free((void *)data);
-    }
-    return root;
-}
-
-static we_tex_t *pkg_load_tex_cpu(const we_pkg_t *pkg, const char *tex_name)
-{
-    if (!pkg || !tex_name || tex_name[0] == '\0') {
-        return NULL;
-    }
-    if (strncmp(tex_name, "_rt_", 4) == 0 || strncasecmp(tex_name, "util/", 5) == 0) {
-        return NULL;
-    }
-
-    char candidates[4][320];
-    size_t len = strlen(tex_name);
-    bool has_ext = (len > 4 && strcasecmp(tex_name + len - 4, ".tex") == 0);
-    if (has_ext) {
-        snprintf(candidates[0], sizeof(candidates[0]), "%s", tex_name);
-        snprintf(candidates[1], sizeof(candidates[1]), "materials/%s", tex_name);
-        candidates[2][0] = '\0';
-        candidates[3][0] = '\0';
-    } else {
-        snprintf(candidates[0], sizeof(candidates[0]), "%s.tex", tex_name);
-        snprintf(candidates[1], sizeof(candidates[1]), "materials/%s.tex", tex_name);
-        snprintf(candidates[2], sizeof(candidates[2]), "%s", tex_name);
-        snprintf(candidates[3], sizeof(candidates[3]), "materials/%s", tex_name);
-    }
-
-    for (int i = 0; i < 4; i++) {
-        if (candidates[i][0] == '\0') {
-            continue;
-        }
-        size_t sz = 0;
-        bool owned = false;
-        const uint8_t *data = we_pkg_resolve(pkg, candidates[i], &sz, &owned);
-        if (data && sz > 0) {
-            we_tex_t *tex = we_tex_parse_cpu(data, sz);
-            if (owned) {
-                free((void *)data);
-            }
-            if (tex) {
-                return tex;
-            }
-        } else if (owned && data) {
-            free((void *)data);
-        }
-    }
-    return NULL;
-}
-
-static char *pkg_load_shader_stage_raw(const we_pkg_t *pkg, const char *shader_name, bool is_frag)
-{
-    if (!shader_name || shader_name[0] == '\0') {
-        shader_name = "genericimage2";
-    }
-    const char *ext = is_frag ? ".frag" : ".vert";
-    char candidates[3][320];
-    snprintf(candidates[0], sizeof(candidates[0]), "shaders/%s%s", shader_name, ext);
-    snprintf(candidates[1], sizeof(candidates[1]), "shaders/effects/%s%s", shader_name, ext);
-    snprintf(candidates[2], sizeof(candidates[2]), "%s%s", shader_name, ext);
-
-    if (pkg) {
-        for (int i = 0; i < 3; i++) {
-            size_t sz = 0;
-            bool owned = false;
-            const uint8_t *data = we_pkg_resolve(pkg, candidates[i], &sz, &owned);
-            if (data && sz > 0) {
-                char *str = malloc(sz + 1);
-                if (str) {
-                    memcpy(str, data, sz);
-                    str[sz] = '\0';
-                }
-                if (owned) {
-                    free((void *)data);
-                }
-                if (str) {
-                    return str;
-                }
-            } else if (owned && data) {
-                free((void *)data);
-            }
-        }
-    }
-
-    const char *builtin = we_shader_get_builtin(candidates[2]);
-    if (!builtin) {
-        builtin = we_shader_get_builtin(is_frag ? "genericimage2.frag" : "genericimage2.vert");
-    }
-    return builtin ? strdup(builtin) : NULL;
-}
-
-static void finalize_material_pass_cpu(we_material_pass_t *pass, const we_pkg_t *pkg)
-{
-    if (!pass) {
-        return;
-    }
-    if (pass->shader_name[0] == '\0') {
-        snprintf(pass->shader_name, sizeof(pass->shader_name), "genericimage2");
-    }
-
-    pass->bound_tex_mask = 0;
-    for (uint32_t s = 0; s < WE_MAX_PASS_TEXTURES; s++) {
-        if (pass->tex_paths[s][0] != '\0') {
-            pass->bound_tex_mask |= (1u << s);
-            if (!pass->textures[s]) {
-                pass->textures[s] = pkg_load_tex_cpu(pkg, pass->tex_paths[s]);
-            }
-        }
-    }
-    for (uint32_t b = 0; b < pass->bind_count; b++) {
-        if (pass->binds[b].slot >= 0 && pass->binds[b].slot < (int32_t)WE_MAX_PASS_TEXTURES) {
-            pass->bound_tex_mask |= (1u << pass->binds[b].slot);
-        }
-    }
-
-    bool tex0_is_gif = false;
-    if (pass->textures[0]) {
-        if ((pass->textures[0]->flags & WE_TEX_FLAG_IS_GIF) != 0) {
-            tex0_is_gif = true;
-        }
-        if (pass->textures[0]->format == WE_TEX_FMT_RG88) {
-            pass_set_combo(pass, "TEX0FORMAT", 8);
-        } else if (pass->textures[0]->format == WE_TEX_FMT_R8) {
-            pass_set_combo(pass, "TEX0FORMAT", 9);
-        }
-    }
-
-    char *v_raw = pkg_load_shader_stage_raw(pkg, pass->shader_name, false);
-    char *f_raw = pkg_load_shader_stage_raw(pkg, pass->shader_name, true);
-    we_shader_preprocess_pair(v_raw, f_raw, pkg, pass->combos, pass->combo_count,
-                              pass->bound_tex_mask, tex0_is_gif, &pass->prep);
-
-    /* Load any default textures declared in shader inline uniform JSON */
-    bool loaded_default_tex = false;
-    for (uint32_t u = 0; u < pass->prep.meta.uniform_count; u++) {
-        const we_shader_uniform_meta_t *um = &pass->prep.meta.uniforms[u];
-        if (um->sampler_slot >= 0 && um->sampler_slot < (int32_t)WE_MAX_PASS_TEXTURES &&
-            um->default_tex[0] != '\0' && pass->tex_paths[um->sampler_slot][0] == '\0') {
-            snprintf(pass->tex_paths[um->sampler_slot], sizeof(pass->tex_paths[um->sampler_slot]),
-                     "%s", um->default_tex);
-            pass->textures[um->sampler_slot] = pkg_load_tex_cpu(pkg, um->default_tex);
-            pass->bound_tex_mask |= (1u << (uint32_t)um->sampler_slot);
-            loaded_default_tex = true;
-        }
-    }
-
-    if (loaded_default_tex) {
-        if (pass->textures[0]) {
-            if ((pass->textures[0]->flags & WE_TEX_FLAG_IS_GIF) != 0) {
-                tex0_is_gif = true;
-            }
-            if (pass->textures[0]->format == WE_TEX_FMT_RG88) {
-                pass_set_combo(pass, "TEX0FORMAT", 8);
-            } else if (pass->textures[0]->format == WE_TEX_FMT_R8) {
-                pass_set_combo(pass, "TEX0FORMAT", 9);
-            }
-        }
-        we_shader_preprocessed_free(&pass->prep);
-        we_shader_preprocess_pair(v_raw, f_raw, pkg, pass->combos, pass->combo_count,
-                                  pass->bound_tex_mask, tex0_is_gif, &pass->prep);
-    }
-
-    free(v_raw);
-    free(f_raw);
-}
-
-static bool pass_uses_audio_spectrum(const we_material_pass_t *pass)
-{
-    if (!pass) {
-        return false;
-    }
-    for (uint32_t u = 0; u < pass->prep.meta.uniform_count; u++) {
-        if (strncmp(pass->prep.meta.uniforms[u].name, "g_AudioSpectrum", 15) == 0) {
-            return true;
-        }
-    }
-    if (pass->prep.vert_glsl && strstr(pass->prep.vert_glsl, "g_AudioSpectrum") != NULL) {
-        return true;
-    }
-    if (pass->prep.frag_glsl && strstr(pass->prep.frag_glsl, "g_AudioSpectrum") != NULL) {
-        return true;
-    }
-    return false;
-}
-
-static bool load_material_pass_from_file(we_material_pass_t *pass, const we_pkg_t *pkg,
-                                         const char *mat_path, const we_project_t *proj)
-{
-    if (!pass || !pkg || !mat_path || mat_path[0] == '\0') {
-        return false;
-    }
-    we_jval_t *mroot = pkg_load_json(pkg, mat_path);
-    if (!mroot) {
-        return false;
-    }
-    const we_jval_t *passes = jobj_get(mroot, "passes");
-    if (passes && passes->type == JVAL_ARR && passes->arr.count > 0) {
-        parse_pass_json_overrides(pass, passes->arr.items[0], proj);
-    } else {
-        parse_pass_json_overrides(pass, mroot, proj);
-    }
-    jval_free(mroot);
-    return true;
-}
-
-static we_puppet_t *pkg_load_puppet_cpu(const we_pkg_t *pkg, const char *mdl_path)
-{
-    if (!pkg || !mdl_path || mdl_path[0] == '\0') {
-        return NULL;
-    }
-    char candidates[2][320];
-    snprintf(candidates[0], sizeof(candidates[0]), "%s", mdl_path);
-    snprintf(candidates[1], sizeof(candidates[1]), "models/%s", mdl_path);
-    for (int i = 0; i < 2; i++) {
-        size_t sz = 0;
-        bool owned = false;
-        const uint8_t *data = we_pkg_resolve(pkg, candidates[i], &sz, &owned);
-        if (data && sz > 0) {
-            we_puppet_t *p = we_puppet_parse_cpu(data, sz);
-            if (owned) {
-                free((void *)data);
-            }
-            if (p) {
-                return p;
-            }
-        } else if (owned && data) {
-            free((void *)data);
-        }
-    }
-    return NULL;
-}
-
-static void apply_puppet_layers_json(we_puppet_t *puppet, const we_jval_t *lnode,
-                                     const we_project_t *proj)
-{
-    if (!puppet || !lnode || lnode->type != JVAL_ARR || lnode->arr.count == 0) {
-        return;
-    }
-    uint32_t count = 0;
-    for (size_t i = 0; i < lnode->arr.count && count < WE_MDL_MAX_LAYERS; i++) {
-        const we_jval_t *it = lnode->arr.items[i];
-        if (!it || it->type != JVAL_OBJ) {
-            continue;
-        }
-        we_puppet_layer_t *ly = &puppet->layers[count++];
-        memset(ly, 0, sizeof(*ly));
-        const we_jval_t *anim_node = jobj_get(it, "animation");
-        const char *aname = jval_str(anim_node, NULL);
-        if (aname && aname[0] != '\0' && !isdigit((unsigned char)aname[0])) {
-            snprintf(ly->anim_name, sizeof(ly->anim_name), "%s", aname);
-            ly->anim_id = -1;
-        } else {
-            ly->anim_id = (int32_t)jval_float(anim_node, proj, 0.0f, NULL, 0);
-        }
-        const char *name_field = jval_str(jobj_get(it, "name"), NULL);
-        if (name_field && name_field[0] != '\0' && ly->anim_name[0] == '\0') {
-            snprintf(ly->anim_name, sizeof(ly->anim_name), "%s", name_field);
-        }
-        ly->rate = jval_float(jobj_get(it, "rate"), proj, 1.0f, NULL, 0);
-        ly->blend = jval_float(jobj_get(it, "blend"), proj, 1.0f, NULL, 0);
-        ly->visible = jval_bool_resolved(jobj_get(it, "visible"), proj, true, NULL, 0);
-    }
-    if (count > 0) {
-        puppet->layer_count = count;
-    }
-}
-
-static we_particle_sys_t *pkg_load_particle_cpu(const we_pkg_t *pkg, const char *part_path)
-{
-    if (!pkg || !part_path || part_path[0] == '\0') {
-        return NULL;
-    }
-    char candidates[2][320];
-    snprintf(candidates[0], sizeof(candidates[0]), "%s", part_path);
-    snprintf(candidates[1], sizeof(candidates[1]), "particles/%s", part_path);
-    for (int i = 0; i < 2; i++) {
-        size_t sz = 0;
-        bool owned = false;
-        const uint8_t *data = we_pkg_resolve(pkg, candidates[i], &sz, &owned);
-        if (data && sz > 0) {
-            we_particle_sys_t *ps = we_particle_create_from_json((const char *)data, sz);
-            if (owned) {
-                free((void *)data);
-            }
-            if (ps) {
-                return ps;
-            }
-        } else if (owned && data) {
-            free((void *)data);
-        }
-    }
-    return NULL;
-}
-
-static void apply_particle_instance_override(we_particle_sys_t *psys, const we_jval_t *iovr,
-                                             const we_project_t *proj)
-{
-    if (!psys || !iovr || iovr->type != JVAL_OBJ) {
-        return;
-    }
-    float rate_mul = jval_float(jobj_get(iovr, "rate"), proj, 1.0f, NULL, 0);
-    float count_mul = jval_float(jobj_get(iovr, "count"), proj, 1.0f, NULL, 0);
-    float size_mul = jval_float(jobj_get(iovr, "size"), proj, 1.0f, NULL, 0);
-    float life_mul = jval_float(jobj_get(iovr, "lifetime"), proj, 1.0f, NULL, 0);
-    float speed_mul = jval_float(jobj_get(iovr, "speed"), proj, 1.0f, NULL, 0);
-    float alpha_mul = jval_float(jobj_get(iovr, "alpha"), proj, 1.0f, NULL, 0);
-
-    bool has_color = false;
-    float col_ovr[3] = {1.0f, 1.0f, 1.0f};
-    if (jval_floats(jobj_get(iovr, "colorn"), proj, col_ovr, 3, NULL, 0) >= 3 ||
-        jval_floats(jobj_get(iovr, "color"), proj, col_ovr, 3, NULL, 0) >= 3) {
-        if (col_ovr[0] > 1.0f || col_ovr[1] > 1.0f || col_ovr[2] > 1.0f) {
-            col_ovr[0] /= 255.0f;
-            col_ovr[1] /= 255.0f;
-            col_ovr[2] /= 255.0f;
-        }
-        has_color = true;
-    }
-
-    if (count_mul > 0.0f && fabsf(count_mul - 1.0f) > 1e-4f) {
-        uint32_t nc = (uint32_t)((float)psys->max_count * count_mul + 0.5f);
-        if (nc < 1u) {
-            nc = 1u;
-        }
-        if (nc > WE_PARTICLE_MAX_CAP) {
-            nc = WE_PARTICLE_MAX_CAP;
-        }
-        if (nc > psys->padded_cap) {
-            (void)we_particle_realloc_capacity(psys, nc);
-        } else {
-            psys->max_count = nc;
-        }
-    }
-    for (uint32_t e = 0; e < psys->emitter_count; e++) {
-        psys->emitters[e].rate *= rate_mul;
-        if (psys->emitters[e].instantaneous > 0 && count_mul > 0.0f) {
-            uint32_t inst = (uint32_t)((float)psys->emitters[e].instantaneous * count_mul + 0.5f);
-            psys->emitters[e].instantaneous = inst > 0 ? inst : 1u;
-        }
-    }
-
-    bool found_size = false;
-    bool found_life = false;
-    bool found_alpha = false;
-    bool found_vel = false;
-    bool found_color = false;
-
-    for (uint32_t i = 0; i < psys->initializer_count; i++) {
-        we_particle_initializer_t *in = &psys->initializers[i];
-        switch (in->type) {
-        case WE_INIT_SIZE_RANDOM:
-            in->min_val[0] *= size_mul;
-            in->max_val[0] *= size_mul;
-            found_size = true;
-            break;
-        case WE_INIT_LIFETIME_RANDOM:
-            in->min_val[0] *= life_mul;
-            in->max_val[0] *= life_mul;
-            found_life = true;
-            break;
-        case WE_INIT_ALPHA_RANDOM:
-            in->min_val[0] *= alpha_mul;
-            in->max_val[0] *= alpha_mul;
-            found_alpha = true;
-            break;
-        case WE_INIT_VELOCITY_RANDOM:
-            for (int k = 0; k < 3; k++) {
-                in->min_val[k] *= speed_mul;
-                in->max_val[k] *= speed_mul;
-            }
-            found_vel = true;
-            break;
-        case WE_INIT_TURBULENT_VELOCITY_RANDOM:
-            in->min_val[0] *= speed_mul;
-            in->max_val[0] *= speed_mul;
-            in->scale *= speed_mul;
-            found_vel = true;
-            break;
-        case WE_INIT_COLOR_RANDOM:
-            if (has_color) {
-                for (int k = 0; k < 3; k++) {
-                    in->min_val[k] = col_ovr[k];
-                    in->max_val[k] = col_ovr[k];
-                }
-            }
-            found_color = true;
-            break;
-        default:
-            break;
-        }
-    }
-
-    if (!found_size && fabsf(size_mul - 1.0f) > 1e-4f &&
-        psys->initializer_count < WE_PARTICLE_MAX_INITIALIZERS) {
-        we_particle_initializer_t *in = &psys->initializers[psys->initializer_count++];
-        memset(in, 0, sizeof(*in));
-        in->type = WE_INIT_SIZE_RANDOM;
-        in->min_val[0] = 20.0f * size_mul;
-        in->max_val[0] = 20.0f * size_mul;
-        in->exponent = 1.0f;
-    }
-    if (!found_life && fabsf(life_mul - 1.0f) > 1e-4f &&
-        psys->initializer_count < WE_PARTICLE_MAX_INITIALIZERS) {
-        we_particle_initializer_t *in = &psys->initializers[psys->initializer_count++];
-        memset(in, 0, sizeof(*in));
-        in->type = WE_INIT_LIFETIME_RANDOM;
-        in->min_val[0] = 1.0f * life_mul;
-        in->max_val[0] = 1.0f * life_mul;
-        in->exponent = 1.0f;
-    }
-    if (!found_alpha && fabsf(alpha_mul - 1.0f) > 1e-4f &&
-        psys->initializer_count < WE_PARTICLE_MAX_INITIALIZERS) {
-        we_particle_initializer_t *in = &psys->initializers[psys->initializer_count++];
-        memset(in, 0, sizeof(*in));
-        in->type = WE_INIT_ALPHA_RANDOM;
-        in->min_val[0] = alpha_mul;
-        in->max_val[0] = alpha_mul;
-        in->exponent = 1.0f;
-    }
-    if (!found_vel && fabsf(speed_mul - 1.0f) > 1e-4f &&
-        psys->initializer_count < WE_PARTICLE_MAX_INITIALIZERS) {
-        we_particle_initializer_t *in = &psys->initializers[psys->initializer_count++];
-        memset(in, 0, sizeof(*in));
-        in->type = WE_INIT_VELOCITY_RANDOM;
-        in->exponent = 1.0f;
-    }
-    if (!found_color && has_color && psys->initializer_count < WE_PARTICLE_MAX_INITIALIZERS) {
-        we_particle_initializer_t *in = &psys->initializers[psys->initializer_count++];
-        memset(in, 0, sizeof(*in));
-        in->type = WE_INIT_COLOR_RANDOM;
-        for (int k = 0; k < 3; k++) {
-            in->min_val[k] = col_ovr[k];
-            in->max_val[k] = col_ovr[k];
-        }
-        in->exponent = 1.0f;
-    }
-
-    we_particle_reset_and_prewarm(psys);
-}
-
-static void sync_layer_from_obj(const we_scene_object_t *obj, we_script_layer_state_t *ls)
-{
-    memset(ls, 0, sizeof(*ls));
-    memcpy(ls->origin, obj->origin, sizeof(ls->origin));
-    memcpy(ls->scale, obj->scale, sizeof(ls->scale));
-    memcpy(ls->angles, obj->angles, sizeof(ls->angles));
-    memcpy(ls->size, obj->size, sizeof(ls->size));
-    ls->alpha = obj->alpha;
-    memcpy(ls->color, obj->color, sizeof(ls->color));
-    ls->visible = obj->visible;
-    snprintf(ls->name, sizeof(ls->name), "%s", obj->name);
-    ls->id = obj->id;
-    ls->dirty_mask = 0;
-}
-
-static void sync_obj_from_layer(we_scene_object_t *obj, const we_script_layer_state_t *ls)
-{
-    if (!obj || !ls || ls->dirty_mask == 0) {
-        return;
-    }
-    if (ls->dirty_mask & WE_LAYER_DIRTY_ORIGIN) {
-        memcpy(obj->origin, ls->origin, sizeof(obj->origin));
-    }
-    if (ls->dirty_mask & WE_LAYER_DIRTY_SCALE) {
-        memcpy(obj->scale, ls->scale, sizeof(obj->scale));
-    }
-    if (ls->dirty_mask & WE_LAYER_DIRTY_ANGLES) {
-        memcpy(obj->angles, ls->angles, sizeof(obj->angles));
-    }
-    if (ls->dirty_mask & WE_LAYER_DIRTY_SIZE) {
-        memcpy(obj->size, ls->size, sizeof(obj->size));
-    }
-    if (ls->dirty_mask & WE_LAYER_DIRTY_ALPHA) {
-        obj->alpha = ls->alpha;
-        obj->alpha_user_prop[0] = '\0';
-    }
-    if (ls->dirty_mask & WE_LAYER_DIRTY_COLOR) {
-        memcpy(obj->color, ls->color, sizeof(obj->color));
-        obj->color_user_prop[0] = '\0';
-    }
-    if (ls->dirty_mask & WE_LAYER_DIRTY_VISIBLE) {
-        obj->visible = ls->visible;
-        obj->visible_user_prop[0] = '\0';
-    }
-}
-
-static void sync_scene_layers_to_vm(const we_scene_t *scene, we_script_t *vm)
-{
-    if (!scene || !vm) {
-        return;
-    }
-    uint32_t count = scene->object_count < WE_SCRIPT_MAX_SCENE_LAYERS ? scene->object_count
-                                                                      : WE_SCRIPT_MAX_SCENE_LAYERS;
-    for (uint32_t i = 0; i < count; i++) {
-        we_script_layer_state_t ls;
-        sync_layer_from_obj(&scene->objects[i], &ls);
-        we_script_register_scene_layer(vm, i, &ls);
-    }
-}
-
-static void sync_scene_layers_from_vm(we_scene_t *scene, const we_script_t *vm)
-{
-    if (!scene || !vm) {
-        return;
-    }
-    uint32_t count = scene->object_count < WE_SCRIPT_MAX_SCENE_LAYERS ? scene->object_count
-                                                                      : WE_SCRIPT_MAX_SCENE_LAYERS;
-    for (uint32_t i = 0; i < count; i++) {
-        we_script_layer_state_t ls;
-        if (we_script_read_scene_layer(vm, i, &ls)) {
-            sync_obj_from_layer(&scene->objects[i], &ls);
-        }
-    }
-}
-
-static void build_script_env(const we_scene_t *scene, uint32_t canvas_w, uint32_t canvas_h,
-                             float dt_sec, float time_sec,
-                             const waywal_shader_frame_params_t *params, we_script_env_t *env)
-{
-    memset(env, 0, sizeof(*env));
-    env->frametime = dt_sec;
-    env->runtime = time_sec;
-    env->time_of_day = params ? (params->date[3] / 86400.0f) : 0.5f;
-    float cw = canvas_w > 0 ? (float)canvas_w : scene->ortho_width;
-    float ch = canvas_h > 0 ? (float)canvas_h : scene->ortho_height;
-    env->screen_resolution[0] = cw;
-    env->screen_resolution[1] = ch;
-    env->canvas_size[0] = scene->ortho_width;
-    env->canvas_size[1] = scene->ortho_height;
-
-    float ptr_x = 0.5f, ptr_y = 0.5f;
-    if (params && cw > 0.0f && ch > 0.0f && (params->mouse[0] > 0.0f || params->mouse[1] > 0.0f)) {
-        ptr_x = params->mouse[0] / cw;
-        ptr_y = params->mouse[1] / ch;
-    }
-    env->cursor_screen[0] = ptr_x * cw;
-    env->cursor_screen[1] = ptr_y * ch;
-    env->cursor_world[0] = ptr_x * scene->ortho_width;
-    env->cursor_world[1] = (1.0f - ptr_y) * scene->ortho_height;
-    env->cursor_world[2] = 0.0f;
-    env->cursor_left_down = (params && (params->mouse[2] > 0.0f || params->mouse[3] > 0.0f));
-
-    if (params && params->audio) {
-        for (int i = 0; i < 64; i++) {
-            int band = (i * (int)WAYWAL_AUDIO_BARK_BANDS) / 64;
-            float v = params->audio->bands[band];
-            env->audio_left[i] = v;
-            env->audio_right[i] = v;
-            env->audio_average[i] = v;
-        }
-    }
-}
-
-static void bind_project_props_to_script(we_script_t *vm, const we_project_t *proj)
-{
-    if (!vm || !proj) {
-        return;
-    }
-    for (uint32_t i = 0; i < proj->prop_count; i++) {
-        const we_user_prop_t *up = &proj->props[i];
-        const char *sv =
-            (up->type == WE_PROP_TEXT || (up->num_components == 0 && up->str_val[0] != '\0'))
-                ? up->str_val
-                : NULL;
-        we_script_set_prop(vm, up->key, up->val, up->num_components, sv);
-    }
-}
-
-static void attach_object_script(we_scene_t *scene, we_scene_object_t *obj,
-                                 we_script_prop_target_t target, const char *uniform_name,
-                                 const we_jval_t *pnode, const char *explicit_src)
-{
-    if (!scene || !obj || obj->script_count >= WE_MAX_OBJECT_SCRIPTS) {
-        return;
-    }
-    const char *src = explicit_src;
-    if (!src && pnode && pnode->type == JVAL_OBJ) {
-        src = jval_str(jobj_get(pnode, "script"), NULL);
-    }
-    if (!src || src[0] == '\0') {
-        return;
-    }
-
-    we_script_t *vm = we_script_create(src, strlen(src), &scene->script_shared);
-    if (!vm) {
-        return;
-    }
-
-    bind_project_props_to_script(vm, &scene->project);
-
-    if (pnode && pnode->type == JVAL_OBJ) {
-        const we_jval_t *sp = jobj_get(pnode, "scriptproperties");
-        if (sp && sp->type == JVAL_OBJ) {
-            for (size_t i = 0; i < sp->obj.count; i++) {
-                const char *k = sp->obj.entries[i].key;
-                const we_jval_t *v = sp->obj.entries[i].val;
-                if (!k || !v) {
-                    continue;
-                }
-                float fvals[4] = {0};
-                uint32_t n = jval_floats(v, &scene->project, fvals, 4, NULL, 0);
-                const char *sv = (n == 0) ? jval_str(v, NULL) : NULL;
-                we_script_set_prop(vm, k, fvals, n, sv);
-            }
-        }
-    }
-
-    if (we_script_uses_audio(vm)) {
-        scene->uses_audio = true;
-    }
-
-    if (target == WE_SCRIPT_PROP_ALPHA) {
-        obj->alpha_user_prop[0] = '\0';
-    } else if (target == WE_SCRIPT_PROP_COLOR) {
-        obj->color_user_prop[0] = '\0';
-    } else if (target == WE_SCRIPT_PROP_VISIBLE) {
-        obj->visible_user_prop[0] = '\0';
-    }
-
-    we_obj_script_t *slot = &obj->scripts[obj->script_count++];
-    slot->target = target;
-    if (uniform_name && uniform_name[0] != '\0') {
-        snprintf(slot->uniform_name, sizeof(slot->uniform_name), "%s", uniform_name);
-    } else {
-        slot->uniform_name[0] = '\0';
-    }
-    slot->vm = vm;
-}
-
-static void apply_scene_script_user_properties(we_scene_t *scene)
-{
-    if (!scene) {
-        return;
-    }
-    we_script_env_t env;
-    build_script_env(scene, (uint32_t)scene->ortho_width, (uint32_t)scene->ortho_height,
-                     1.0f / 60.0f, 0.0f, NULL, &env);
-
-    for (uint32_t i = 0; i < scene->object_count; i++) {
-        we_scene_object_t *obj = &scene->objects[i];
-        for (uint32_t s = 0; s < obj->script_count; s++) {
-            we_obj_script_t *sc = &obj->scripts[s];
-            if (!sc->vm) {
-                continue;
-            }
-            we_script_layer_state_t ls;
-            sync_scene_layers_to_vm(scene, sc->vm);
-            sync_layer_from_obj(obj, &ls);
-            if (we_script_eval_apply_user_properties(sc->vm, &env, &ls)) {
-                sync_obj_from_layer(obj, &ls);
-                sync_scene_layers_from_vm(scene, sc->vm);
-            }
-        }
-    }
-}
-
-static void init_scene_scripts(we_scene_t *scene)
-{
-    if (!scene) {
-        return;
-    }
-    we_script_env_t env;
-    build_script_env(scene, (uint32_t)scene->ortho_width, (uint32_t)scene->ortho_height,
-                     1.0f / 60.0f, 0.0f, NULL, &env);
-
-    for (uint32_t i = 0; i < scene->object_count; i++) {
-        we_scene_object_t *obj = &scene->objects[i];
-        for (uint32_t s = 0; s < obj->script_count; s++) {
-            we_obj_script_t *sc = &obj->scripts[s];
-            if (!sc->vm) {
-                continue;
-            }
-            we_script_layer_state_t ls;
-            sync_scene_layers_to_vm(scene, sc->vm);
-            sync_layer_from_obj(obj, &ls);
-            if (we_script_eval_apply_user_properties(sc->vm, &env, &ls)) {
-                sync_obj_from_layer(obj, &ls);
-                sync_scene_layers_from_vm(scene, sc->vm);
-            }
-
-            sync_scene_layers_to_vm(scene, sc->vm);
-            sync_layer_from_obj(obj, &ls);
-
-            float in_val[4] = {0};
-            float out_val[4] = {0};
-            uint32_t ncomp = 1;
-            we_const_val_t *target_cv = NULL;
-
-            switch (sc->target) {
-            case WE_SCRIPT_PROP_ORIGIN:
-                memcpy(in_val, obj->origin, 3 * sizeof(float));
-                ncomp = 3;
-                break;
-            case WE_SCRIPT_PROP_SCALE:
-                memcpy(in_val, obj->scale, 3 * sizeof(float));
-                ncomp = 3;
-                break;
-            case WE_SCRIPT_PROP_ANGLES:
-                memcpy(in_val, obj->angles, 3 * sizeof(float));
-                ncomp = 3;
-                break;
-            case WE_SCRIPT_PROP_ALPHA:
-                in_val[0] = obj->alpha;
-                ncomp = 1;
-                break;
-            case WE_SCRIPT_PROP_COLOR:
-                memcpy(in_val, obj->color, 3 * sizeof(float));
-                ncomp = 3;
-                break;
-            case WE_SCRIPT_PROP_VISIBLE:
-                in_val[0] = obj->visible ? 1.0f : 0.0f;
-                ncomp = 1;
-                break;
-            case WE_SCRIPT_PROP_UNIFORM:
-                for (uint32_t c = 0; c < obj->base_pass.const_val_count; c++) {
-                    if (strcasecmp(obj->base_pass.const_vals[c].name, sc->uniform_name) == 0) {
-                        target_cv = &obj->base_pass.const_vals[c];
-                        break;
-                    }
-                }
-                if (target_cv) {
-                    ncomp = target_cv->num_components > 0 ? target_cv->num_components : 1u;
-                    memcpy(in_val, target_cv->val, ncomp * sizeof(float));
-                }
-                break;
-            }
-
-            memcpy(out_val, in_val, ncomp * sizeof(float));
-            if (we_script_eval_init(sc->vm, &env, &ls, in_val, ncomp, out_val)) {
-                if (sc->target == WE_SCRIPT_PROP_UNIFORM ||
-                    memcmp(out_val, in_val, ncomp * sizeof(float)) != 0) {
-                    switch (sc->target) {
-                    case WE_SCRIPT_PROP_ORIGIN:
-                        memcpy(obj->origin, out_val, 3 * sizeof(float));
-                        break;
-                    case WE_SCRIPT_PROP_SCALE:
-                        memcpy(obj->scale, out_val, 3 * sizeof(float));
-                        break;
-                    case WE_SCRIPT_PROP_ANGLES:
-                        memcpy(obj->angles, out_val, 3 * sizeof(float));
-                        break;
-                    case WE_SCRIPT_PROP_ALPHA:
-                        obj->alpha = out_val[0];
-                        break;
-                    case WE_SCRIPT_PROP_COLOR:
-                        memcpy(obj->color, out_val, 3 * sizeof(float));
-                        break;
-                    case WE_SCRIPT_PROP_VISIBLE:
-                        obj->visible = (out_val[0] != 0.0f);
-                        break;
-                    case WE_SCRIPT_PROP_UNIFORM:
-                        if (target_cv) {
-                            memcpy(target_cv->val, out_val, ncomp * sizeof(float));
-                        }
-                        break;
-                    }
-                }
-                sync_obj_from_layer(obj, &ls);
-                sync_scene_layers_from_vm(scene, sc->vm);
-            }
-        }
-    }
-}
-
-static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_scene_object_t *obj)
-{
-    memset(obj, 0, sizeof(*obj));
-    obj->id = (int32_t)jval_float(jobj_get(onode, "id"), &scene->project, -1.0f, NULL, 0);
-    obj->parent_id =
-        (int32_t)jval_float(jobj_get(onode, "parent"), &scene->project, -1.0f, NULL, 0);
-    snprintf(obj->name, sizeof(obj->name), "%s", jval_str(jobj_get(onode, "name"), "layer"));
-
-    if (obj->parent_id >= 0) {
-        obj->origin[0] = 0.0f;
-        obj->origin[1] = 0.0f;
-        obj->origin[2] = 0.0f;
-    } else {
-        obj->origin[0] = scene->ortho_width * 0.5f;
-        obj->origin[1] = scene->ortho_height * 0.5f;
-        obj->origin[2] = 0.0f;
-    }
-    jval_floats(jobj_get(onode, "origin"), &scene->project, obj->origin, 3, NULL, 0);
-
-    obj->scale[0] = 1.0f;
-    obj->scale[1] = 1.0f;
-    obj->scale[2] = 1.0f;
-    jval_floats(jobj_get(onode, "scale"), &scene->project, obj->scale, 3, NULL, 0);
-
-    jval_floats(jobj_get(onode, "angles"), &scene->project, obj->angles, 3, NULL, 0);
-
-    obj->size[0] = scene->ortho_width;
-    obj->size[1] = scene->ortho_height;
-    bool has_explicit_size =
-        (jval_floats(jobj_get(onode, "size"), &scene->project, obj->size, 2, NULL, 0) >= 2);
-
-    jval_floats(jobj_get(onode, "parallaxDepth"), &scene->project, obj->parallax_depth, 2, NULL, 0);
-
-    obj->alpha = jval_float(jobj_get(onode, "alpha"), &scene->project, 1.0f, obj->alpha_user_prop,
-                            sizeof(obj->alpha_user_prop));
-    obj->brightness = jval_float(jobj_get(onode, "brightness"), &scene->project, 1.0f, NULL, 0);
-
-    obj->color[0] = 1.0f;
-    obj->color[1] = 1.0f;
-    obj->color[2] = 1.0f;
-    jval_floats(jobj_get(onode, "color"), &scene->project, obj->color, 3, obj->color_user_prop,
-                sizeof(obj->color_user_prop));
-
-    obj->color_blend_mode =
-        (int32_t)jval_float(jobj_get(onode, "colorBlendMode"), &scene->project, 0.0f, NULL, 0);
-    obj->visible = jval_bool_resolved(jobj_get(onode, "visible"), &scene->project, true,
-                                      obj->visible_user_prop, sizeof(obj->visible_user_prop));
-    obj->copybackground =
-        jval_bool_resolved(jobj_get(onode, "copybackground"), &scene->project, false, NULL, 0);
-
-    char mat_path[256] = {0};
-    char mdl_path[256] = {0};
-    char part_path[256] = {0};
-
-    const char *direct_puppet = jval_str(jobj_get(onode, "puppet"), NULL);
-    if (!direct_puppet) {
-        direct_puppet = jval_str(jobj_get(onode, "model"), NULL);
-    }
-    if (direct_puppet && direct_puppet[0] != '\0') {
-        snprintf(mdl_path, sizeof(mdl_path), "%s", direct_puppet);
-    }
-
-    const char *direct_part = jval_str(jobj_get(onode, "particle"), NULL);
-    if (direct_part && direct_part[0] != '\0') {
-        snprintf(part_path, sizeof(part_path), "%s", direct_part);
-    }
-
-    const char *img_path = jval_str(jobj_get(onode, "image"), NULL);
-    if (img_path && img_path[0] != '\0') {
-        snprintf(obj->image_path, sizeof(obj->image_path), "%s", img_path);
-        size_t ilen = strlen(img_path);
-        if (ilen > 4 && strcasecmp(img_path + ilen - 4, ".mdl") == 0) {
-            snprintf(mdl_path, sizeof(mdl_path), "%s", img_path);
-        } else {
-            we_jval_t *mdl = pkg_load_json(scene->pkg, img_path);
-            if (mdl) {
-                const char *m = jval_str(jobj_get(mdl, "material"), NULL);
-                if (m) {
-                    snprintf(mat_path, sizeof(mat_path), "%s", m);
-                }
-                const char *p = jval_str(jobj_get(mdl, "puppet"), NULL);
-                if (p && p[0] != '\0') {
-                    snprintf(mdl_path, sizeof(mdl_path), "%s", p);
-                }
-                if (jobj_get(mdl, "emitter") || jobj_get(mdl, "initializer") ||
-                    jobj_get(mdl, "operator")) {
-                    snprintf(part_path, sizeof(part_path), "%s", img_path);
-                }
-                obj->fullscreen = jval_bool_resolved(jobj_get(mdl, "fullscreen"), &scene->project,
-                                                     false, NULL, 0);
-                obj->passthrough = jval_bool_resolved(jobj_get(mdl, "passthrough"), &scene->project,
-                                                      false, NULL, 0);
-                float mw = jval_float(jobj_get(mdl, "width"), &scene->project, 0.0f, NULL, 0);
-                float mh = jval_float(jobj_get(mdl, "height"), &scene->project, 0.0f, NULL, 0);
-                if (mw > 0.0f && mh > 0.0f && !has_explicit_size) {
-                    obj->size[0] = mw;
-                    obj->size[1] = mh;
-                    has_explicit_size = true;
-                }
-                jval_free(mdl);
-            } else {
-                snprintf(mat_path, sizeof(mat_path), "%s", img_path);
-            }
-        }
-    }
-
-    /* Load 2D Puppet Warp .mdl skeletal mesh if referenced */
-    if (mdl_path[0] != '\0') {
-        obj->puppet = pkg_load_puppet_cpu(scene->pkg, mdl_path);
-        if (obj->puppet) {
-            const we_jval_t *pl = jobj_get(onode, "puppet_layers");
-            if (!pl) {
-                pl = jobj_get(onode, "puppetlayers");
-            }
-            if (!pl) {
-                pl = jobj_get(onode, "animationlayers");
-            }
-            if (pl) {
-                apply_puppet_layers_json(obj->puppet, pl, &scene->project);
-            }
-            if (mat_path[0] == '\0' && obj->puppet->mat_json_file[0] != '\0') {
-                snprintf(mat_path, sizeof(mat_path), "%s", obj->puppet->mat_json_file);
-            }
-            if (!has_explicit_size) {
-                float bw = obj->puppet->max_pos[0] - obj->puppet->min_pos[0];
-                float bh = obj->puppet->max_pos[1] - obj->puppet->min_pos[1];
-                if (bw > 1.0f && bh > 1.0f) {
-                    obj->size[0] = bw;
-                    obj->size[1] = bh;
-                    has_explicit_size = true;
-                }
-            }
-        }
-    }
-
-    /* Load SIMD SoA Particle System if referenced */
-    if (part_path[0] != '\0') {
-        obj->particle_sys = pkg_load_particle_cpu(scene->pkg, part_path);
-        if (obj->particle_sys) {
-            apply_particle_instance_override(obj->particle_sys, jobj_get(onode, "instanceoverride"),
-                                             &scene->project);
-            if (mat_path[0] == '\0' && obj->particle_sys->material_path[0] != '\0') {
-                snprintf(mat_path, sizeof(mat_path), "%s", obj->particle_sys->material_path);
-            }
-        }
-    }
-
-    if (obj->puppet && obj->puppet->bone_count > 0u) {
-        pass_set_combo(&obj->base_pass, "SKINNING", 1);
-    }
-
-    if (mat_path[0] != '\0' && !obj->passthrough) {
-        if (load_material_pass_from_file(&obj->base_pass, scene->pkg, mat_path, &scene->project)) {
-            obj->has_base_pass = true;
-            parse_pass_json_overrides(&obj->base_pass, onode, &scene->project);
-            if (obj->color_blend_mode > 0) {
-                pass_set_combo(&obj->base_pass, "BLENDMODE", obj->color_blend_mode);
-            }
-            finalize_material_pass_cpu(&obj->base_pass, scene->pkg);
-            if (pass_uses_audio_spectrum(&obj->base_pass)) {
-                scene->uses_audio = true;
-            }
-            if (!has_explicit_size && !obj->fullscreen && obj->base_pass.textures[0]) {
-                if (obj->base_pass.textures[0]->image_width > 0 &&
-                    obj->base_pass.textures[0]->image_height > 0) {
-                    obj->size[0] = (float)obj->base_pass.textures[0]->image_width;
-                    obj->size[1] = (float)obj->base_pass.textures[0]->image_height;
-                }
-            }
-        }
-    }
-
-    if (obj->particle_sys && !obj->has_base_pass) {
-        obj->has_base_pass = true;
-        obj->base_pass.blending = WE_BLEND_ADDITIVE;
-        finalize_material_pass_cpu(&obj->base_pass, scene->pkg);
-    }
-
-    if (obj->puppet && !obj->has_base_pass && !obj->passthrough) {
-        obj->has_base_pass = true;
-        obj->base_pass.blending = WE_BLEND_NORMAL;
-        finalize_material_pass_cpu(&obj->base_pass, scene->pkg);
-    }
-
-    /* Attach SceneScript VMs for object properties and material uniforms */
-    attach_object_script(scene, obj, WE_SCRIPT_PROP_ORIGIN, NULL, jobj_get(onode, "origin"), NULL);
-    attach_object_script(scene, obj, WE_SCRIPT_PROP_SCALE, NULL, jobj_get(onode, "scale"), NULL);
-    attach_object_script(scene, obj, WE_SCRIPT_PROP_ANGLES, NULL, jobj_get(onode, "angles"), NULL);
-    attach_object_script(scene, obj, WE_SCRIPT_PROP_ALPHA, NULL, jobj_get(onode, "alpha"), NULL);
-    attach_object_script(scene, obj, WE_SCRIPT_PROP_COLOR, NULL, jobj_get(onode, "color"), NULL);
-    attach_object_script(scene, obj, WE_SCRIPT_PROP_VISIBLE, NULL, jobj_get(onode, "visible"),
-                         NULL);
-    const we_jval_t *top_script = jobj_get(onode, "script");
-    if (top_script) {
-        attach_object_script(scene, obj, WE_SCRIPT_PROP_ORIGIN, NULL, top_script,
-                             jval_str(top_script, NULL));
-    }
-    for (uint32_t c = 0; c < obj->base_pass.const_val_count; c++) {
-        we_const_val_t *cv = &obj->base_pass.const_vals[c];
-        if (cv->num_components == 0) {
-            for (uint32_t u = 0; u < obj->base_pass.prep.meta.uniform_count; u++) {
-                const we_shader_uniform_meta_t *um = &obj->base_pass.prep.meta.uniforms[u];
-                if ((um->material_key[0] != '\0' && strcasecmp(cv->name, um->material_key) == 0) ||
-                    strcasecmp(cv->name, um->name) == 0) {
-                    if (um->num_components > 0) {
-                        cv->num_components = um->num_components;
-                        if (um->has_default_val) {
-                            memcpy(cv->val, um->default_val, um->num_components * sizeof(float));
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-        if (cv->script_src && cv->script_src[0] != '\0') {
-            if (cv->num_components == 0) {
-                cv->num_components = 1u;
-            }
-            attach_object_script(scene, obj, WE_SCRIPT_PROP_UNIFORM, cv->name, NULL,
-                                 cv->script_src);
-        }
-    }
-
-    /* Parse object effects[] */
-    const we_jval_t *effs = jobj_get(onode, "effects");
-    if (effs && effs->type == JVAL_ARR && effs->arr.count > 0) {
-        obj->effects = calloc(effs->arr.count, sizeof(we_effect_t));
-        if (obj->effects) {
-            for (size_t e = 0; e < effs->arr.count; e++) {
-                const we_jval_t *enode = effs->arr.items[e];
-                if (!enode || enode->type != JVAL_OBJ) {
-                    continue;
-                }
-                const char *efile = jval_str(jobj_get(enode, "file"), NULL);
-                if (!efile || efile[0] == '\0') {
-                    continue;
-                }
-
-                we_effect_t *eff = &obj->effects[obj->effect_count];
-                snprintf(eff->file_path, sizeof(eff->file_path), "%s", efile);
-                snprintf(eff->name, sizeof(eff->name), "%s",
-                         jval_str(jobj_get(enode, "name"), efile));
-                eff->visible =
-                    jval_bool_resolved(jobj_get(enode, "visible"), &scene->project, true,
-                                       eff->visible_user_prop, sizeof(eff->visible_user_prop));
-
-                we_jval_t *eroot = pkg_load_json(scene->pkg, efile);
-                if (eroot) {
-                    snprintf(eff->replacement_key, sizeof(eff->replacement_key), "%s",
-                             jval_str(jobj_get(eroot, "replacementkey"), ""));
-
-                    const we_jval_t *fbos = jobj_get(eroot, "fbos");
-                    if (fbos && fbos->type == JVAL_ARR) {
-                        for (size_t f = 0;
-                             f < fbos->arr.count && eff->fbo_count < WE_MAX_EFFECT_FBOS; f++) {
-                            const we_jval_t *fn = fbos->arr.items[f];
-                            const char *fname = jval_str(jobj_get(fn, "name"), NULL);
-                            if (fname) {
-                                we_rt_fbo_t *rt = &eff->fbos[eff->fbo_count++];
-                                snprintf(rt->name, sizeof(rt->name), "%s", fname);
-                                rt->scale = (uint32_t)jval_float(jobj_get(fn, "scale"),
-                                                                 &scene->project, 1.0f, NULL, 0);
-                                if (rt->scale == 0) {
-                                    rt->scale = 1;
-                                }
-                            }
-                        }
-                    }
-
-                    const we_jval_t *epasses = jobj_get(eroot, "passes");
-                    const we_jval_t *opasses = jobj_get(enode, "passes");
-                    if (epasses && epasses->type == JVAL_ARR && epasses->arr.count > 0) {
-                        size_t cap_passes = epasses->arr.count < WE_MAX_EFFECT_PASSES
-                                                ? epasses->arr.count
-                                                : WE_MAX_EFFECT_PASSES;
-                        eff->passes =
-                            (we_material_pass_t *)calloc(cap_passes, sizeof(we_material_pass_t));
-                        if (eff->passes) {
-                            for (size_t p = 0; p < cap_passes; p++) {
-                                const we_jval_t *epn = epasses->arr.items[p];
-                                we_material_pass_t *mp = &eff->passes[eff->pass_count++];
-                                memset(mp, 0, sizeof(*mp));
-                                mp->blending = WE_BLEND_DISABLED;
-
-                                snprintf(mp->command, sizeof(mp->command), "%s",
-                                         jval_str(jobj_get(epn, "command"), ""));
-                                snprintf(mp->target_fbo, sizeof(mp->target_fbo), "%s",
-                                         jval_str(jobj_get(epn, "target"), ""));
-
-                                const we_jval_t *binds = jobj_get(epn, "bind");
-                                if (binds && binds->type == JVAL_ARR) {
-                                    for (size_t b = 0; b < binds->arr.count &&
-                                                       mp->bind_count < WE_MAX_PASS_TEXTURES;
-                                         b++) {
-                                        const we_jval_t *bn = binds->arr.items[b];
-                                        const char *bname = jval_str(jobj_get(bn, "name"), NULL);
-                                        int32_t bidx = (int32_t)jval_float(
-                                            jobj_get(bn, "index"), &scene->project, 0.0f, NULL, 0);
-                                        if (bname && bidx >= 0 &&
-                                            bidx < (int32_t)WE_MAX_PASS_TEXTURES) {
-                                            snprintf(mp->binds[mp->bind_count].target_name,
-                                                     sizeof(mp->binds[0].target_name), "%s", bname);
-                                            mp->binds[mp->bind_count].slot = bidx;
-                                            mp->bind_count++;
-                                        }
-                                    }
-                                }
-
-                                const char *emat = jval_str(jobj_get(epn, "material"), NULL);
-                                if (emat) {
-                                    load_material_pass_from_file(mp, scene->pkg, emat,
-                                                                 &scene->project);
-                                }
-                                parse_pass_json_overrides(mp, epn, &scene->project);
-                                if (opasses && opasses->type == JVAL_ARR &&
-                                    p < opasses->arr.count) {
-                                    parse_pass_json_overrides(mp, opasses->arr.items[p],
-                                                              &scene->project);
-                                }
-                                if (strcasecmp(mp->command, "copy") != 0 &&
-                                    strcasecmp(mp->command, "swap") != 0) {
-                                    finalize_material_pass_cpu(mp, scene->pkg);
-                                    if (pass_uses_audio_spectrum(mp)) {
-                                        scene->uses_audio = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    jval_free(eroot);
-                }
-                obj->effect_count++;
-            }
-        }
-    }
-}
-
-we_scene_t *we_scene_load_cpu(const char *workshop_dir, const char *prop_overrides)
-{
-    if (!workshop_dir || workshop_dir[0] == '\0') {
-        return NULL;
-    }
-
-    char resolved_dir[4096];
-    if (!we_workshop_resolve_dir(workshop_dir, resolved_dir, sizeof(resolved_dir))) {
-        snprintf(resolved_dir, sizeof(resolved_dir), "%s", workshop_dir);
-    }
-
-    we_scene_t *scene = calloc(1, sizeof(we_scene_t));
-    if (!scene) {
-        return NULL;
-    }
-
-    if (!we_project_load_dir(resolved_dir, &scene->project)) {
-        snprintf(scene->project.workshop_dir, sizeof(scene->project.workshop_dir), "%s",
-                 resolved_dir);
-        snprintf(scene->project.type, sizeof(scene->project.type), "scene");
-        snprintf(scene->project.file, sizeof(scene->project.file), "scene.json");
-    }
-    if (prop_overrides && prop_overrides[0] != '\0') {
-        we_project_apply_overrides_str(&scene->project, prop_overrides);
-    }
-
-    scene->pkg = we_pkg_open_dir(resolved_dir);
-    if (!scene->pkg) {
-        free(scene);
-        return NULL;
-    }
-
-    scene->ortho_width = 1920.0f;
-    scene->ortho_height = 1080.0f;
-    scene->clear_enabled = true;
-    scene->camera_up[1] = 1.0f;
-
-    we_jval_t *sroot = pkg_load_json(scene->pkg, scene->project.file);
-    if (!sroot && strcasecmp(scene->project.file, "scene.json") != 0) {
-        sroot = pkg_load_json(scene->pkg, "scene.json");
-    }
-    if (!sroot) {
-        sroot = pkg_load_json(scene->pkg, "gifscene.json");
-    }
-
-    if (sroot && sroot->type == JVAL_OBJ) {
-        const we_jval_t *gen = jobj_get(sroot, "general");
-        if (gen && gen->type == JVAL_OBJ) {
-            const we_jval_t *ortho = jobj_get(gen, "orthogonalprojection");
-            if (ortho && ortho->type == JVAL_OBJ) {
-                scene->ortho_width =
-                    jval_float(jobj_get(ortho, "width"), &scene->project, 1920.0f, NULL, 0);
-                scene->ortho_height =
-                    jval_float(jobj_get(ortho, "height"), &scene->project, 1080.0f, NULL, 0);
-                if (scene->ortho_width <= 0.0f) {
-                    scene->ortho_width = 1920.0f;
-                }
-                if (scene->ortho_height <= 0.0f) {
-                    scene->ortho_height = 1080.0f;
-                }
-            }
-            jval_floats(jobj_get(gen, "clearcolor"), &scene->project, scene->clear_color, 3, NULL,
-                        0);
-            scene->clear_enabled =
-                jval_bool_resolved(jobj_get(gen, "clearenabled"), &scene->project, true, NULL, 0);
-            scene->camera_parallax = jval_bool_resolved(jobj_get(gen, "cameraparallax"),
-                                                        &scene->project, false, NULL, 0);
-            scene->camera_parallax_amount =
-                jval_float(jobj_get(gen, "cameraparallaxamount"), &scene->project, 0.5f, NULL, 0);
-            scene->camera_parallax_delay =
-                jval_float(jobj_get(gen, "cameraparallaxdelay"), &scene->project, 0.1f, NULL, 0);
-            scene->camera_parallax_mouse_influence = jval_float(
-                jobj_get(gen, "cameraparallaxmouseinfluence"), &scene->project, 1.0f, NULL, 0);
-            scene->camera_shake =
-                jval_bool_resolved(jobj_get(gen, "camerashake"), &scene->project, false, NULL, 0);
-            scene->camera_shake_amp =
-                jval_float(jobj_get(gen, "camerashakeamplitude"), &scene->project, 0.5f, NULL, 0);
-            scene->camera_shake_roughness =
-                jval_float(jobj_get(gen, "camerashakeroughness"), &scene->project, 1.0f, NULL, 0);
-            scene->camera_shake_speed =
-                jval_float(jobj_get(gen, "camerashakespeed"), &scene->project, 1.0f, NULL, 0);
-        }
-
-        scene->camera_eye[0] = scene->ortho_width * 0.5f;
-        scene->camera_eye[1] = scene->ortho_height * 0.5f;
-        scene->camera_eye[2] = -1000.0f;
-        scene->camera_center[0] = scene->ortho_width * 0.5f;
-        scene->camera_center[1] = scene->ortho_height * 0.5f;
-        scene->camera_center[2] = 0.0f;
-
-        const we_jval_t *cam = jobj_get(sroot, "camera");
-        if (cam && cam->type == JVAL_OBJ) {
-            jval_floats(jobj_get(cam, "eye"), &scene->project, scene->camera_eye, 3, NULL, 0);
-            jval_floats(jobj_get(cam, "center"), &scene->project, scene->camera_center, 3, NULL, 0);
-            jval_floats(jobj_get(cam, "up"), &scene->project, scene->camera_up, 3, NULL, 0);
-        }
-
-        const we_jval_t *objs = jobj_get(sroot, "objects");
-        if (objs && objs->type == JVAL_ARR && objs->arr.count > 0) {
-            scene->objects = calloc(objs->arr.count, sizeof(we_scene_object_t));
-            if (scene->objects) {
-                for (size_t i = 0; i < objs->arr.count; i++) {
-                    if (objs->arr.items[i] && objs->arr.items[i]->type == JVAL_OBJ) {
-                        parse_scene_object(scene, objs->arr.items[i],
-                                           &scene->objects[scene->object_count++]);
-                    }
-                }
-                init_scene_scripts(scene);
-            }
-        }
-        jval_free(sroot);
-    }
-
-    return scene;
-}
 
 /* =========================================================================
  * OpenGL ES 3.1 Initialization, Matrix Math & Scene Graph Rendering
@@ -2580,6 +189,145 @@ static uint32_t create_noise_tex_64(void)
     return (uint32_t)tex;
 }
 
+static GLint get_audio_uniform_loc(GLuint prog, const char *base_name)
+{
+    GLint loc = glGetUniformLocation(prog, base_name);
+    if (loc < 0) {
+        char arr_name[64];
+        snprintf(arr_name, sizeof(arr_name), "%s[0]", base_name);
+        loc = glGetUniformLocation(prog, arr_name);
+    }
+    return loc;
+}
+
+static void cache_pass_uniform_locs(we_material_pass_t *pass)
+{
+    if (!pass || pass->gl_prog == 0) {
+        return;
+    }
+    GLuint prog = pass->gl_prog;
+    we_pass_uniform_locs_t *ul = &pass->ulocs;
+    memset(ul, 0xFF, sizeof(*ul));
+    ul->initialized = true;
+
+    ul->time = glGetUniformLocation(prog, "g_Time");
+    ul->daytime = glGetUniformLocation(prog, "g_Daytime");
+    ul->frametime = glGetUniformLocation(prog, "g_Frametime");
+    ul->media_playing = glGetUniformLocation(prog, "u_media_playing");
+    ul->pointer_pos = glGetUniformLocation(prog, "g_PointerPosition");
+    ul->pointer_pos_last = glGetUniformLocation(prog, "g_PointerPositionLast");
+    ul->texel_size = glGetUniformLocation(prog, "g_TexelSize");
+    ul->texel_size_half = glGetUniformLocation(prog, "g_TexelSizeHalf");
+    ul->screen = glGetUniformLocation(prog, "g_Screen");
+    ul->view_up = glGetUniformLocation(prog, "g_ViewUp");
+    ul->view_right = glGetUniformLocation(prog, "g_ViewRight");
+    ul->orient_up = glGetUniformLocation(prog, "g_OrientationUp");
+    ul->orient_right = glGetUniformLocation(prog, "g_OrientationRight");
+    ul->orient_forward = glGetUniformLocation(prog, "g_OrientationForward");
+    ul->eye_pos = glGetUniformLocation(prog, "g_EyePosition");
+    ul->model_matrix = glGetUniformLocation(prog, "g_ModelMatrix");
+    ul->view_proj_matrix = glGetUniformLocation(prog, "g_ViewProjectionMatrix");
+    ul->mvp = glGetUniformLocation(prog, "g_ModelViewProjectionMatrix");
+    ul->model_matrix_inv = glGetUniformLocation(prog, "g_ModelViewProjectionMatrixInverse");
+    ul->vp_matrix = glGetUniformLocation(prog, "g_EffectTextureProjectionMatrix");
+    ul->parallax_pos = glGetUniformLocation(prog, "g_EffectTextureProjectionMatrixInverse");
+    ul->alpha = glGetUniformLocation(prog, "g_Alpha");
+    ul->user_alpha = glGetUniformLocation(prog, "g_UserAlpha");
+    ul->brightness = glGetUniformLocation(prog, "g_Brightness");
+    ul->view_forward = glGetUniformLocation(prog, "g_Contrast");
+    ul->color = glGetUniformLocation(prog, "g_Color");
+    ul->color4 = glGetUniformLocation(prog, "g_Color4");
+    ul->album_art = glGetUniformLocation(prog, "u_album_art");
+
+    ul->audio_l16 = get_audio_uniform_loc(prog, "g_AudioSpectrum16Left");
+    ul->audio_r16 = get_audio_uniform_loc(prog, "g_AudioSpectrum16Right");
+    ul->audio_l32 = get_audio_uniform_loc(prog, "g_AudioSpectrum32Left");
+    ul->audio_r32 = get_audio_uniform_loc(prog, "g_AudioSpectrum32Right");
+    ul->audio_l64 = get_audio_uniform_loc(prog, "g_AudioSpectrum64Left");
+    ul->audio_r64 = get_audio_uniform_loc(prog, "g_AudioSpectrum64Right");
+
+    for (uint32_t s = 0; s < WE_MAX_PASS_TEXTURES; s++) {
+        char uname[64];
+        snprintf(uname, sizeof(uname), "g_Texture%u", s);
+        ul->tex_sampler[s] = glGetUniformLocation(prog, uname);
+        snprintf(uname, sizeof(uname), "g_Texture%uResolution", s);
+        ul->tex_resolution[s] = glGetUniformLocation(prog, uname);
+        snprintf(uname, sizeof(uname), "g_Texture%uTranslation", s);
+        ul->tex_translation[s] = glGetUniformLocation(prog, uname);
+        snprintf(uname, sizeof(uname), "g_Texture%uRotation", s);
+        ul->tex_rotation[s] = glGetUniformLocation(prog, uname);
+    }
+
+    for (uint32_t u = 0; u < pass->prep.meta.uniform_count && u < WE_SHADER_MAX_UNIFORMS; u++) {
+        const we_shader_uniform_meta_t *um = &pass->prep.meta.uniforms[u];
+        if (um->sampler_slot < 0 && um->name[0] != '\0') {
+            ul->custom_uniforms[u] = glGetUniformLocation(prog, um->name);
+        }
+    }
+
+    /* Pre-initialize invariant program uniforms once */
+    glUseProgram(prog);
+    float ident[16];
+    mat4_identity(ident);
+    if (ul->view_up >= 0) {
+        glUniform3f(ul->view_up, 0.0f, 1.0f, 0.0f);
+    }
+    if (ul->view_right >= 0) {
+        glUniform3f(ul->view_right, 1.0f, 0.0f, 0.0f);
+    }
+    if (ul->orient_up >= 0) {
+        glUniform3f(ul->orient_up, 0.0f, 1.0f, 0.0f);
+    }
+    if (ul->orient_right >= 0) {
+        glUniform3f(ul->orient_right, 1.0f, 0.0f, 0.0f);
+    }
+    if (ul->orient_forward >= 0) {
+        glUniform3f(ul->orient_forward, 0.0f, 0.0f, 1.0f);
+    }
+    if (ul->model_matrix_inv >= 0) {
+        glUniformMatrix4fv(ul->model_matrix_inv, 1, GL_FALSE, ident);
+    }
+    if (ul->vp_matrix >= 0) {
+        glUniformMatrix4fv(ul->vp_matrix, 1, GL_FALSE, ident);
+    }
+    if (ul->parallax_pos >= 0) {
+        glUniformMatrix4fv(ul->parallax_pos, 1, GL_FALSE, ident);
+    }
+    if (ul->user_alpha >= 0) {
+        glUniform1f(ul->user_alpha, 1.0f);
+    }
+    if (ul->view_forward >= 0) {
+        glUniform1f(ul->view_forward, 1.0f);
+    }
+    GLint loc_sat = glGetUniformLocation(prog, "g_Saturation");
+    if (loc_sat >= 0) {
+        glUniform1f(loc_sat, 1.0f);
+    }
+    for (uint32_t s = 0; s < WE_MAX_PASS_TEXTURES; s++) {
+        if (ul->tex_sampler[s] >= 0) {
+            glUniform1i(ul->tex_sampler[s], (GLint)s);
+        }
+    }
+}
+
+static void ensure_egl_procs(we_scene_t *scene)
+{
+    if (!scene || scene->egl_procs_resolved) {
+        return;
+    }
+    scene->fn_eglCreateImageKHR = __extension__(void *) eglGetProcAddress("eglCreateImageKHR");
+    scene->fn_eglDestroyImageKHR = __extension__(void *) eglGetProcAddress("eglDestroyImageKHR");
+    scene->fn_glEGLImageTargetTexture2DOES =
+        __extension__(void *) eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    scene->fn_glEGLImageTargetTexStorageEXT =
+        __extension__(void *) eglGetProcAddress("glEGLImageTargetTexStorageEXT");
+    scene->fn_eglCreateSyncKHR = __extension__(void *) eglGetProcAddress("eglCreateSyncKHR");
+    scene->fn_eglClientWaitSyncKHR =
+        __extension__(void *) eglGetProcAddress("eglClientWaitSyncKHR");
+    scene->fn_eglDestroySyncKHR = __extension__(void *) eglGetProcAddress("eglDestroySyncKHR");
+    scene->egl_procs_resolved = true;
+}
+
 static void upload_pass_gl(we_material_pass_t *pass)
 {
     if (!pass) {
@@ -2601,6 +349,9 @@ static void upload_pass_gl(we_material_pass_t *pass)
                     we_shader_compile_program(fb.vert_glsl, fb.frag_glsl, "genericimage2_fallback");
                 we_shader_preprocessed_free(&fb);
             }
+        }
+        if (pass->gl_prog != 0) {
+            cache_pass_uniform_locs(pass);
         }
         free(pass->prep.vert_glsl);
         pass->prep.vert_glsl = NULL;
@@ -2681,6 +432,7 @@ bool we_scene_init_gl(we_scene_t *scene, dmabuf_context_t *dmabuf_ctx)
     scene->egl_display = dpy;
     scene->egl_context = ctx;
     scene->owns_egl = owns_egl;
+    ensure_egl_procs(scene);
 
     /* Unit quad VAO/VBO (Top-Down Orientation Invariant:
      * v0: (-1,-1,0) uv(0,0), v1: (+1,-1,0) uv(1,0), v2: (+1,+1,0) uv(1,1), v3: (-1,+1,0) uv(0,1))
@@ -2726,6 +478,8 @@ bool we_scene_init_gl(we_scene_t *scene, dmabuf_context_t *dmabuf_ctx)
                                      "    fragColor = vec4(c.rgb, 1.0);\n"
                                      "}\n";
     scene->prog_present = we_shader_compile_program(present_vs, present_fs, "we_present");
+    scene->present_u_tex_loc =
+        scene->prog_present ? glGetUniformLocation(scene->prog_present, "u_tex") : -1;
 
     /* Default composite shader: draws an effect-processed RGBA texture into scene_fbo */
     static const char default_vs[] =
@@ -2748,6 +502,14 @@ bool we_scene_init_gl(we_scene_t *scene, dmabuf_context_t *dmabuf_ctx)
                                      "    fragColor = texture(g_Texture0, v_uv);\n"
                                      "}\n";
     scene->default_program = we_shader_compile_program(default_vs, default_fs, "we_default");
+    memset(&scene->default_prog_ulocs, 0xFF, sizeof(scene->default_prog_ulocs));
+    if (scene->default_program) {
+        scene->default_prog_ulocs.initialized = true;
+        scene->default_prog_ulocs.mvp =
+            glGetUniformLocation(scene->default_program, "g_ModelViewProjectionMatrix");
+        scene->default_prog_ulocs.tex_sampler[0] =
+            glGetUniformLocation(scene->default_program, "g_Texture0");
+    }
 
     /* Batched SIMD Particle shader: supports per-vertex color/alpha at location = 2 */
     static const char particle_vs[] =
@@ -2779,6 +541,18 @@ bool we_scene_init_gl(we_scene_t *scene, dmabuf_context_t *dmabuf_ctx)
                                       "    fragColor = tex * v_Color * g_Color4;\n"
                                       "}\n";
     scene->particle_program = we_shader_compile_program(particle_vs, particle_fs, "we_particle");
+    if (scene->particle_program) {
+        scene->part_mvp_loc =
+            glGetUniformLocation(scene->particle_program, "g_ModelViewProjectionMatrix");
+        scene->part_color4_loc = glGetUniformLocation(scene->particle_program, "g_Color4");
+        scene->part_trans_loc =
+            glGetUniformLocation(scene->particle_program, "g_Texture0Translation");
+        scene->part_rot_loc = glGetUniformLocation(scene->particle_program, "g_Texture0Rotation");
+        scene->part_tex0_loc = glGetUniformLocation(scene->particle_program, "g_Texture0");
+    } else {
+        scene->part_mvp_loc = scene->part_color4_loc = scene->part_trans_loc = scene->part_rot_loc =
+            scene->part_tex0_loc = -1;
+    }
 
     GLuint tfbo = 0;
     glGenFramebuffers(1, &tfbo);
@@ -2970,27 +744,30 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
                                const waywal_shader_frame_params_t *params)
 {
     GLuint prog = pass->gl_prog;
+    if (!pass->ulocs.initialized && prog != 0) {
+        cache_pass_uniform_locs(pass);
+    }
+    const we_pass_uniform_locs_t *ul = &pass->ulocs;
     glUseProgram(prog);
 
     float time_sec = params ? params->time_sec : 0.0f;
     float dt_sec =
         (params && params->time_delta_sec > 0.0f) ? params->time_delta_sec : (1.0f / 60.0f);
 
-    GLint loc;
-    if ((loc = glGetUniformLocation(prog, "g_Time")) >= 0) {
-        glUniform1f(loc, time_sec);
+    if (ul->time >= 0) {
+        glUniform1f(ul->time, time_sec);
     }
-    if ((loc = glGetUniformLocation(prog, "g_Daytime")) >= 0) {
+    if (ul->daytime >= 0) {
         float daytime = params ? (params->date[3] / 86400.0f) : 0.5f;
-        glUniform1f(loc, daytime);
+        glUniform1f(ul->daytime, daytime);
     }
-    if ((loc = glGetUniformLocation(prog, "g_Frametime")) >= 0) {
-        glUniform1f(loc, dt_sec);
+    if (ul->frametime >= 0) {
+        glUniform1f(ul->frametime, dt_sec);
     }
-    if ((loc = glGetUniformLocation(prog, "u_media_playing")) >= 0) {
+    if (ul->media_playing >= 0) {
         float mplay =
             (params && params->media_playing > 0.0f) ? params->media_playing : scene->media_playing;
-        glUniform1f(loc, mplay);
+        glUniform1f(ul->media_playing, mplay);
     }
 
     uint32_t norm_w = target_w > 0 ? target_w : rt_w;
@@ -3001,113 +778,81 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
         ptr[0] = params->mouse[0] / (float)norm_w;
         ptr[1] = params->mouse[1] / (float)norm_h;
     }
-    if ((loc = glGetUniformLocation(prog, "g_PointerPosition")) >= 0) {
-        glUniform2f(loc, ptr[0], ptr[1]);
+    if (ul->pointer_pos >= 0) {
+        glUniform2f(ul->pointer_pos, ptr[0], ptr[1]);
     }
-    if ((loc = glGetUniformLocation(prog, "g_PointerPositionLast")) >= 0) {
-        glUniform2f(loc, scene->last_pointer[0], scene->last_pointer[1]);
+    if (ul->pointer_pos_last >= 0) {
+        glUniform2f(ul->pointer_pos_last, scene->last_pointer[0], scene->last_pointer[1]);
     }
 
     float fw = rt_w > 0 ? (float)rt_w : 1920.0f;
     float fh = rt_h > 0 ? (float)rt_h : 1080.0f;
-    if ((loc = glGetUniformLocation(prog, "g_TexelSize")) >= 0) {
-        glUniform2f(loc, 1.0f / fw, 1.0f / fh);
+    if (ul->texel_size >= 0) {
+        glUniform2f(ul->texel_size, 1.0f / fw, 1.0f / fh);
     }
-    if ((loc = glGetUniformLocation(prog, "g_TexelSizeHalf")) >= 0) {
-        glUniform2f(loc, 0.5f / fw, 0.5f / fh);
+    if (ul->texel_size_half >= 0) {
+        glUniform2f(ul->texel_size_half, 0.5f / fw, 0.5f / fh);
     }
-    if ((loc = glGetUniformLocation(prog, "g_Screen")) >= 0) {
-        glUniform3f(loc, fw, fh, fw / fh);
+    if (ul->screen >= 0) {
+        glUniform3f(ul->screen, fw, fh, fw / fh);
     }
-
-    if ((loc = glGetUniformLocation(prog, "g_ViewUp")) >= 0) {
-        glUniform3f(loc, 0.0f, 1.0f, 0.0f);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_ViewRight")) >= 0) {
-        glUniform3f(loc, 1.0f, 0.0f, 0.0f);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_OrientationUp")) >= 0) {
-        glUniform3f(loc, 0.0f, 1.0f, 0.0f);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_OrientationRight")) >= 0) {
-        glUniform3f(loc, 1.0f, 0.0f, 0.0f);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_OrientationForward")) >= 0) {
-        glUniform3f(loc, 0.0f, 0.0f, 1.0f);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_EyePosition")) >= 0) {
-        glUniform3fv(loc, 1, scene->camera_eye);
+    if (ul->eye_pos >= 0) {
+        glUniform3fv(ul->eye_pos, 1, scene->camera_eye);
     }
 
     float ident[16];
     mat4_identity(ident);
-    if ((loc = glGetUniformLocation(prog, "g_ModelMatrix")) >= 0) {
-        glUniformMatrix4fv(loc, 1, GL_FALSE, model ? model : ident);
+    if (ul->model_matrix >= 0) {
+        glUniformMatrix4fv(ul->model_matrix, 1, GL_FALSE, model ? model : ident);
     }
-    if ((loc = glGetUniformLocation(prog, "g_ViewProjectionMatrix")) >= 0) {
-        glUniformMatrix4fv(loc, 1, GL_FALSE, vp ? vp : ident);
+    if (ul->view_proj_matrix >= 0) {
+        glUniformMatrix4fv(ul->view_proj_matrix, 1, GL_FALSE, vp ? vp : ident);
     }
-    if ((loc = glGetUniformLocation(prog, "g_ModelViewProjectionMatrix")) >= 0) {
-        glUniformMatrix4fv(loc, 1, GL_FALSE, mvp ? mvp : ident);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_ModelViewProjectionMatrixInverse")) >= 0) {
-        glUniformMatrix4fv(loc, 1, GL_FALSE, ident);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_EffectTextureProjectionMatrix")) >= 0) {
-        glUniformMatrix4fv(loc, 1, GL_FALSE, ident);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_EffectTextureProjectionMatrixInverse")) >= 0) {
-        glUniformMatrix4fv(loc, 1, GL_FALSE, ident);
+    if (ul->mvp >= 0) {
+        glUniformMatrix4fv(ul->mvp, 1, GL_FALSE, mvp ? mvp : ident);
     }
 
     /* Object color & alpha uniforms */
     float alpha = obj ? obj->alpha : 1.0f;
     float brightness = obj ? obj->brightness : 1.0f;
     const float *col = obj ? obj->color : (const float[]){1.0f, 1.0f, 1.0f};
-    if ((loc = glGetUniformLocation(prog, "g_Alpha")) >= 0) {
-        glUniform1f(loc, alpha);
+    if (ul->alpha >= 0) {
+        glUniform1f(ul->alpha, alpha);
     }
-    if ((loc = glGetUniformLocation(prog, "g_UserAlpha")) >= 0) {
-        glUniform1f(loc, 1.0f);
+    if (ul->brightness >= 0) {
+        glUniform1f(ul->brightness, brightness);
     }
-    if ((loc = glGetUniformLocation(prog, "g_Brightness")) >= 0) {
-        glUniform1f(loc, brightness);
+    if (ul->color >= 0) {
+        glUniform3fv(ul->color, 1, col);
     }
-    if ((loc = glGetUniformLocation(prog, "g_Contrast")) >= 0) {
-        glUniform1f(loc, 1.0f);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_Saturation")) >= 0) {
-        glUniform1f(loc, 1.0f);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_Color")) >= 0) {
-        glUniform3fv(loc, 1, col);
-    }
-    if ((loc = glGetUniformLocation(prog, "g_Color4")) >= 0) {
-        glUniform4f(loc, col[0], col[1], col[2], alpha);
+    if (ul->color4 >= 0) {
+        glUniform4f(ul->color4, col[0], col[1], col[2], alpha);
     }
 
     /* Audio spectrum uniforms */
-    float spec64[64] = {0};
-    if (params && params->audio) {
-        for (int i = 0; i < 64; i++) {
-            int band = (i * (int)WAYWAL_AUDIO_BARK_BANDS) / 64;
-            spec64[i] = params->audio->bands[band];
+    const int32_t audio_locs[6] = {
+        ul->audio_l16, ul->audio_r16, ul->audio_l32, ul->audio_r32, ul->audio_l64, ul->audio_r64,
+    };
+    bool any_audio_loc = false;
+    for (int a = 0; a < 6; a++) {
+        if (audio_locs[a] >= 0) {
+            any_audio_loc = true;
+            break;
         }
     }
-    static const char *const audio_unames[] = {
-        "g_AudioSpectrum16Left",  "g_AudioSpectrum16Right", "g_AudioSpectrum32Left",
-        "g_AudioSpectrum32Right", "g_AudioSpectrum64Left",  "g_AudioSpectrum64Right",
-    };
-    static const int audio_counts[] = {16, 16, 32, 32, 64, 64};
-    for (int a = 0; a < 6; a++) {
-        loc = glGetUniformLocation(prog, audio_unames[a]);
-        if (loc < 0) {
-            char arr_name[64];
-            snprintf(arr_name, sizeof(arr_name), "%s[0]", audio_unames[a]);
-            loc = glGetUniformLocation(prog, arr_name);
+    if (any_audio_loc) {
+        float spec64[64] = {0};
+        if (params && params->audio) {
+            for (int i = 0; i < 64; i++) {
+                int band = (i * (int)WAYWAL_AUDIO_BARK_BANDS) / 64;
+                spec64[i] = params->audio->bands[band];
+            }
         }
-        if (loc >= 0) {
-            glUniform1fv(loc, audio_counts[a], spec64);
+        static const int audio_counts[6] = {16, 16, 32, 32, 64, 64};
+        for (int a = 0; a < 6; a++) {
+            if (audio_locs[a] >= 0) {
+                glUniform1fv(audio_locs[a], audio_counts[a], spec64);
+            }
         }
     }
 
@@ -3115,6 +860,8 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
     for (uint32_t s = 0; s < WE_MAX_PASS_TEXTURES; s++) {
         GLuint tex_id = scene->tex_util_white;
         float res[4] = {fw, fh, fw, fh};
+        float trans[2] = {0.0f, 0.0f};
+        float rot[4] = {1.0f, 0.0f, 0.0f, 1.0f};
 
         if (s == 0 && prev_tex != 0) {
             tex_id = prev_tex;
@@ -3124,38 +871,21 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
                 res[2] = res[0];
                 res[3] = res[1];
             }
-            const float trans[2] = {0.0f, 0.0f};
-            const float rot[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-            if ((loc = glGetUniformLocation(prog, "g_Texture0Translation")) >= 0) {
-                glUniform2fv(loc, 1, trans);
-            }
-            if ((loc = glGetUniformLocation(prog, "g_Texture0Rotation")) >= 0) {
-                glUniform4fv(loc, 1, rot);
-            }
         } else if (pass->textures[s] && pass->textures[s]->gl_tex != 0) {
             we_tex_t *wt = pass->textures[s];
-            if (wt->is_video_mp4) {
+            bool should_advance = (wt->last_advance_frame != scene->frame_counter);
+            wt->last_advance_frame = scene->frame_counter;
+            if (wt->is_video_mp4 && should_advance) {
                 (void)we_tex_advance_video(wt, dt_sec);
             }
-            float trans[2] = {0.0f, 0.0f};
-            float rot[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-            if (s == 0 && (wt->flags & WE_TEX_FLAG_IS_GIF) != 0 && wt->frame_count > 0) {
-                we_tex_advance_spritesheet(wt, dt_sec, trans, rot);
+            if ((wt->flags & WE_TEX_FLAG_IS_GIF) != 0 && wt->frame_count > 0) {
+                we_tex_advance_spritesheet(wt, should_advance ? dt_sec : 0.0f, trans, rot);
             }
             tex_id = wt->gl_tex;
             res[0] = (float)wt->texture_width;
             res[1] = (float)wt->texture_height;
             res[2] = (float)wt->image_width;
             res[3] = (float)wt->image_height;
-
-            if (s == 0) {
-                if ((loc = glGetUniformLocation(prog, "g_Texture0Translation")) >= 0) {
-                    glUniform2fv(loc, 1, trans);
-                }
-                if ((loc = glGetUniformLocation(prog, "g_Texture0Rotation")) >= 0) {
-                    glUniform4fv(loc, 1, rot);
-                }
-            }
         } else if (pass->tex_paths[s][0] != '\0') {
             tex_id = resolve_named_rt_tex(scene, eff, pass->tex_paths[s], prev_tex, res);
         }
@@ -3167,34 +897,38 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
             }
         }
 
+        if (ul->tex_translation[s] >= 0) {
+            glUniform2fv(ul->tex_translation[s], 1, trans);
+        }
+        if (ul->tex_rotation[s] >= 0) {
+            glUniform4fv(ul->tex_rotation[s], 1, rot);
+        }
+
         glActiveTexture(GL_TEXTURE0 + s);
         glBindTexture(GL_TEXTURE_2D, tex_id);
 
-        char uname[64];
-        snprintf(uname, sizeof(uname), "g_Texture%u", s);
-        if ((loc = glGetUniformLocation(prog, uname)) >= 0) {
-            glUniform1i(loc, (GLint)s);
+        if (ul->tex_sampler[s] >= 0) {
+            glUniform1i(ul->tex_sampler[s], (GLint)s);
         }
-        snprintf(uname, sizeof(uname), "g_Texture%uResolution", s);
-        if ((loc = glGetUniformLocation(prog, uname)) >= 0) {
-            glUniform4fv(loc, 1, res);
+        if (ul->tex_resolution[s] >= 0) {
+            glUniform4fv(ul->tex_resolution[s], 1, res);
         }
     }
-    if ((loc = glGetUniformLocation(prog, "u_album_art")) >= 0) {
+    if (ul->album_art >= 0) {
         GLuint art_tex = scene->tex_album_art ? scene->tex_album_art : scene->tex_util_black;
         glActiveTexture(GL_TEXTURE0 + WE_MAX_PASS_TEXTURES);
         glBindTexture(GL_TEXTURE_2D, art_tex);
-        glUniform1i(loc, (GLint)WE_MAX_PASS_TEXTURES);
+        glUniform1i(ul->album_art, (GLint)WE_MAX_PASS_TEXTURES);
     }
     glActiveTexture(GL_TEXTURE0);
 
     /* Apply inline uniform defaults and material constantshadervalues */
-    for (uint32_t u = 0; u < pass->prep.meta.uniform_count; u++) {
+    for (uint32_t u = 0; u < pass->prep.meta.uniform_count && u < WE_SHADER_MAX_UNIFORMS; u++) {
         const we_shader_uniform_meta_t *um = &pass->prep.meta.uniforms[u];
         if (um->sampler_slot >= 0) {
             continue;
         }
-        loc = glGetUniformLocation(prog, um->name);
+        GLint loc = ul->custom_uniforms[u];
         if (loc < 0) {
             continue;
         }
@@ -3205,6 +939,7 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
         bool has_explicit_cv = false;
 
         /* Check if overridden in pass->const_vals by material_key or uniform name */
+        float cond_val[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (uint32_t c = 0; c < pass->const_val_count; c++) {
             const we_const_val_t *cv = &pass->const_vals[c];
             if ((um->material_key[0] != '\0' && strcasecmp(cv->name, um->material_key) == 0) ||
@@ -3214,6 +949,13 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
                     ncomp = cv->num_components;
                     has_script_cv = true;
                     has_explicit_cv = true;
+                } else if (cv->user_prop[0] != '\0' && strchr(cv->user_prop, '=') != NULL) {
+                    bool bval = (cv->num_components > 0) ? (cv->val[0] > 0.5f) : false;
+                    (void)we_project_eval_prop_bool(&scene->project, cv->user_prop, &bval);
+                    cond_val[0] = bval ? 1.0f : 0.0f;
+                    val = cond_val;
+                    ncomp = 1;
+                    has_explicit_cv = true;
                 } else {
                     const we_user_prop_t *up =
                         cv->user_prop[0] ? project_find_prop(&scene->project, cv->user_prop) : NULL;
@@ -3221,7 +963,7 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
                         val = up->val;
                         ncomp = up->num_components;
                         has_explicit_cv = true;
-                    } else if (cv->user_prop[0] == '\0' && cv->num_components > 0) {
+                    } else if (cv->num_components > 0) {
                         val = cv->val;
                         ncomp = cv->num_components;
                         has_explicit_cv = true;
@@ -3420,6 +1162,11 @@ static void step_object_scripts(we_scene_t *scene, we_scene_object_t *obj, uint3
 static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t target_h,
                                 const waywal_shader_frame_params_t *params)
 {
+    scene->frame_counter++;
+    if (scene->frame_counter == 0) {
+        scene->frame_counter = 1;
+    }
+
     uint32_t sw = (uint32_t)(scene->ortho_width > 1.0f ? scene->ortho_width : (float)target_w);
     uint32_t sh = (uint32_t)(scene->ortho_height > 1.0f ? scene->ortho_height : (float)target_h);
     if (sw == 0) {
@@ -3498,10 +1245,7 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
 
         /* Refresh dynamic user-bound properties */
         if (obj->visible_user_prop[0] != '\0') {
-            const we_user_prop_t *up = project_find_prop(&scene->project, obj->visible_user_prop);
-            if (up && up->num_components > 0) {
-                obj->visible = (up->val[0] != 0.0f);
-            }
+            (void)we_project_eval_prop_bool(&scene->project, obj->visible_user_prop, &obj->visible);
         }
         if (obj->alpha_user_prop[0] != '\0') {
             const we_user_prop_t *up = project_find_prop(&scene->project, obj->alpha_user_prop);
@@ -3558,13 +1302,11 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                 apply_gl_blend_mode(obj->base_pass.blending);
                 glUseProgram(scene->particle_program);
 
-                GLint loc;
-                if ((loc = glGetUniformLocation(scene->particle_program,
-                                                "g_ModelViewProjectionMatrix")) >= 0) {
-                    glUniformMatrix4fv(loc, 1, GL_FALSE, mvp);
+                if (scene->part_mvp_loc >= 0) {
+                    glUniformMatrix4fv(scene->part_mvp_loc, 1, GL_FALSE, mvp);
                 }
-                if ((loc = glGetUniformLocation(scene->particle_program, "g_Color4")) >= 0) {
-                    glUniform4f(loc, obj->color[0] * obj->brightness,
+                if (scene->part_color4_loc >= 0) {
+                    glUniform4f(scene->part_color4_loc, obj->color[0] * obj->brightness,
                                 obj->color[1] * obj->brightness, obj->color[2] * obj->brightness,
                                 obj->alpha);
                 }
@@ -3573,26 +1315,26 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                 float rot[4] = {1.0f, 0.0f, 0.0f, 1.0f};
                 if (obj->base_pass.textures[0] && obj->base_pass.textures[0]->gl_tex != 0) {
                     we_tex_t *wt = obj->base_pass.textures[0];
-                    if (wt->is_video_mp4) {
+                    bool should_advance = (wt->last_advance_frame != scene->frame_counter);
+                    wt->last_advance_frame = scene->frame_counter;
+                    if (wt->is_video_mp4 && should_advance) {
                         (void)we_tex_advance_video(wt, dt_sec);
                     }
                     if ((wt->flags & WE_TEX_FLAG_IS_GIF) != 0 && wt->frame_count > 0) {
-                        we_tex_advance_spritesheet(wt, dt_sec, trans, rot);
+                        we_tex_advance_spritesheet(wt, should_advance ? dt_sec : 0.0f, trans, rot);
                     }
                     ptex = wt->gl_tex;
                 }
-                if ((loc = glGetUniformLocation(scene->particle_program,
-                                                "g_Texture0Translation")) >= 0) {
-                    glUniform2fv(loc, 1, trans);
+                if (scene->part_trans_loc >= 0) {
+                    glUniform2fv(scene->part_trans_loc, 1, trans);
                 }
-                if ((loc = glGetUniformLocation(scene->particle_program, "g_Texture0Rotation")) >=
-                    0) {
-                    glUniform4fv(loc, 1, rot);
+                if (scene->part_rot_loc >= 0) {
+                    glUniform4fv(scene->part_rot_loc, 1, rot);
                 }
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, ptex);
-                if ((loc = glGetUniformLocation(scene->particle_program, "g_Texture0")) >= 0) {
-                    glUniform1i(loc, 0);
+                if (scene->part_tex0_loc >= 0) {
+                    glUniform1i(scene->part_tex0_loc, 0);
                 }
                 we_particle_draw_gl(obj->particle_sys, scene->particle_program);
                 glBindVertexArray(scene->quad_vao);
@@ -3608,18 +1350,15 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
         uint32_t active_effs = 0;
         for (uint32_t e = 0; e < obj->effect_count; e++) {
             if (obj->effects[e].visible_user_prop[0] != '\0') {
-                const we_user_prop_t *up =
-                    project_find_prop(&scene->project, obj->effects[e].visible_user_prop);
-                if (up && up->num_components > 0) {
-                    obj->effects[e].visible = (up->val[0] != 0.0f);
-                }
+                (void)we_project_eval_prop_bool(&scene->project, obj->effects[e].visible_user_prop,
+                                                &obj->effects[e].visible);
             }
             if (obj->effects[e].visible && obj->effects[e].pass_count > 0) {
                 active_effs++;
             }
         }
 
-        if (obj->copybackground || active_effs > 0) {
+        if (obj->needs_full_fb_copy) {
             ensure_fbo_pair(&scene->full_fb_fbo, &scene->full_fb_tex, &scene->full_fb_w,
                             &scene->full_fb_h, sw, sh);
             glBindFramebuffer(GL_READ_FRAMEBUFFER, scene->scene_fbo);
@@ -3802,14 +1541,11 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
             apply_gl_blend_mode(obj->base_pass.blending);
             if (scene->default_program != 0) {
                 glUseProgram(scene->default_program);
-                GLint loc_mvp =
-                    glGetUniformLocation(scene->default_program, "g_ModelViewProjectionMatrix");
-                if (loc_mvp >= 0) {
-                    glUniformMatrix4fv(loc_mvp, 1, GL_FALSE, mvp);
+                if (scene->default_prog_ulocs.mvp >= 0) {
+                    glUniformMatrix4fv(scene->default_prog_ulocs.mvp, 1, GL_FALSE, mvp);
                 }
-                GLint loc_t0 = glGetUniformLocation(scene->default_program, "g_Texture0");
-                if (loc_t0 >= 0) {
-                    glUniform1i(loc_t0, 0);
+                if (scene->default_prog_ulocs.tex_sampler[0] >= 0) {
+                    glUniform1i(scene->default_prog_ulocs.tex_sampler[0], 0);
                 }
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, cur_tex);
@@ -3821,6 +1557,15 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                 glBindTexture(GL_TEXTURE_2D, cur_tex);
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
             }
+
+            static const GLenum k_color_attachment = GL_COLOR_ATTACHMENT0;
+            for (int k = 0; k < 2; k++) {
+                if (obj->ping_fbo[k] != 0) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, obj->ping_fbo[k]);
+                    glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &k_color_attachment);
+                }
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
         }
     }
 
@@ -3848,14 +1593,15 @@ static bool import_scene_bo_tex(we_scene_t *scene, dmabuf_bo_t *bo, GLuint *out_
         }
     }
 
+    ensure_egl_procs(scene);
     PFNEGLCREATEIMAGEKHRPROC create_img =
-        (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+        __extension__(PFNEGLCREATEIMAGEKHRPROC) scene->fn_eglCreateImageKHR;
     PFNEGLDESTROYIMAGEKHRPROC destroy_img =
-        (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+        __extension__(PFNEGLDESTROYIMAGEKHRPROC) scene->fn_eglDestroyImageKHR;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC target_tex2d =
-        (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+        __extension__(PFNGLEGLIMAGETARGETTEXTURE2DOESPROC) scene->fn_glEGLImageTargetTexture2DOES;
     PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC target_storage =
-        (PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC)eglGetProcAddress("glEGLImageTargetTexStorageEXT");
+        __extension__(PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC) scene->fn_glEGLImageTargetTexStorageEXT;
 
     if (!create_img || !target_tex2d) {
         return false;
@@ -4021,9 +1767,8 @@ bool we_scene_render_frame(we_scene_t *scene, dmabuf_bo_t *target_bo,
     glUseProgram(scene->prog_present);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, scene->scene_fbo_tex);
-    GLint loc_tex = glGetUniformLocation(scene->prog_present, "u_tex");
-    if (loc_tex >= 0) {
-        glUniform1i(loc_tex, 0);
+    if (scene->present_u_tex_loc >= 0) {
+        glUniform1i(scene->present_u_tex_loc, 0);
     }
     glBindVertexArray(scene->quad_vao);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
@@ -4032,12 +1777,13 @@ bool we_scene_render_frame(we_scene_t *scene, dmabuf_bo_t *target_bo,
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     /* Synchronize GPU completion before returning the DMA-BUF to Wayland */
+    ensure_egl_procs(scene);
     PFNEGLCREATESYNCKHRPROC create_sync =
-        (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
+        __extension__(PFNEGLCREATESYNCKHRPROC) scene->fn_eglCreateSyncKHR;
     PFNEGLCLIENTWAITSYNCKHRPROC wait_sync =
-        (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
+        __extension__(PFNEGLCLIENTWAITSYNCKHRPROC) scene->fn_eglClientWaitSyncKHR;
     PFNEGLDESTROYSYNCKHRPROC destroy_sync =
-        (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+        __extension__(PFNEGLDESTROYSYNCKHRPROC) scene->fn_eglDestroySyncKHR;
 
     if (create_sync && wait_sync && destroy_sync && scene->egl_display != EGL_NO_DISPLAY) {
         EGLSyncKHR sync = create_sync(scene->egl_display, EGL_SYNC_FENCE_KHR, NULL);
@@ -4225,6 +1971,11 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
     }
 
     /* Software CPU compositor fallback when running headless without an EGL/GLES context */
+    scene->frame_counter++;
+    if (scene->frame_counter == 0) {
+        scene->frame_counter = 1;
+    }
+
     uint8_t cr = (uint8_t)(fminf(fmaxf(scene->clear_color[0], 0.0f), 1.0f) * 255.0f + 0.5f);
     uint8_t cg = (uint8_t)(fminf(fmaxf(scene->clear_color[1], 0.0f), 1.0f) * 255.0f + 0.5f);
     uint8_t cb = (uint8_t)(fminf(fmaxf(scene->clear_color[2], 0.0f), 1.0f) * 255.0f + 0.5f);
@@ -4263,10 +2014,7 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
     for (uint32_t i = 0; i < scene->object_count; i++) {
         we_scene_object_t *obj = &scene->objects[i];
         if (obj->visible_user_prop[0] != '\0') {
-            const we_user_prop_t *up = project_find_prop(&scene->project, obj->visible_user_prop);
-            if (up && up->num_components > 0) {
-                obj->visible = (up->val[0] != 0.0f);
-            }
+            (void)we_project_eval_prop_bool(&scene->project, obj->visible_user_prop, &obj->visible);
         }
         if (obj->alpha_user_prop[0] != '\0') {
             const we_user_prop_t *up = project_find_prop(&scene->project, obj->alpha_user_prop);
@@ -4305,7 +2053,12 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
         const uint8_t *src_rgba = white_px;
         uint32_t tw = 1, th = 1;
         we_tex_t *tex0 = obj->base_pass.textures[0];
-        if (tex0 && tex0->is_video_mp4) {
+        bool should_advance_tex0 = false;
+        if (tex0) {
+            should_advance_tex0 = (tex0->last_advance_frame != scene->frame_counter);
+            tex0->last_advance_frame = scene->frame_counter;
+        }
+        if (tex0 && tex0->is_video_mp4 && should_advance_tex0) {
             (void)we_tex_advance_video(tex0, dt_sec);
         }
         if (tex0 && we_tex_decode_rgba8(tex0, &decoded_rgba, &tw, &th) && decoded_rgba && tw > 0 &&
@@ -4333,7 +2086,7 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
             float trans[2] = {0.0f, 0.0f};
             float rot[4] = {1.0f, 0.0f, 0.0f, 1.0f};
             if (tex0 && (tex0->flags & WE_TEX_FLAG_IS_GIF) != 0 && tex0->frame_count > 0) {
-                we_tex_advance_spritesheet(tex0, dt_sec, trans, rot);
+                we_tex_advance_spritesheet(tex0, should_advance_tex0 ? dt_sec : 0.0f, trans, rot);
             }
 
             we_particle_vertex_t *pverts = NULL;
@@ -4457,6 +2210,29 @@ static void sync_project_prop_vec(we_project_t *proj, const char *key, const cha
     }
 }
 
+static bool user_prop_matches_key(const char *prop_expr, const char *key)
+{
+    if (!prop_expr || !key || prop_expr[0] == '\0' || key[0] == '\0') {
+        return false;
+    }
+    const char *p = prop_expr;
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    while (*p == '!') {
+        p++;
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+    }
+    const char *end = p;
+    while (*end && *end != '!' && *end != '=' && !isspace((unsigned char)*end)) {
+        end++;
+    }
+    size_t len = (size_t)(end - p);
+    return len > 0 && strlen(key) == len && strncasecmp(p, key, len) == 0;
+}
+
 static void update_pass_uniform_override(we_scene_t *scene, we_material_pass_t *mp,
                                          const char *name, const char *val_str, const float *values,
                                          uint32_t num_components)
@@ -4467,12 +2243,21 @@ static void update_pass_uniform_override(we_scene_t *scene, we_material_pass_t *
     bool matched_cv = false;
     for (uint32_t c = 0; c < mp->const_val_count; ++c) {
         we_const_val_t *cv = &mp->const_vals[c];
-        if (strcasecmp(cv->name, name) == 0 ||
-            (cv->user_prop[0] != '\0' && strcasecmp(cv->user_prop, name) == 0)) {
+        if (cv->user_prop[0] != '\0' && strchr(cv->user_prop, '=') != NULL &&
+            user_prop_matches_key(cv->user_prop, name)) {
+            bool bval = (cv->num_components > 0) ? (cv->val[0] > 0.5f) : false;
+            if (we_project_eval_prop_bool(&scene->project, cv->user_prop, &bval)) {
+                memset(cv->val, 0, sizeof(cv->val));
+                cv->val[0] = bval ? 1.0f : 0.0f;
+                cv->num_components = 1;
+            }
+            matched_cv = true;
+        } else if (strcasecmp(cv->name, name) == 0 ||
+                   (cv->user_prop[0] != '\0' && strcasecmp(cv->user_prop, name) == 0)) {
             memset(cv->val, 0, sizeof(cv->val));
             memcpy(cv->val, values, num_components * sizeof(float));
             cv->num_components = num_components;
-            if (cv->user_prop[0] != '\0') {
+            if (cv->user_prop[0] != '\0' && strchr(cv->user_prop, '=') == NULL) {
                 sync_project_prop_vec(&scene->project, cv->user_prop, val_str, values,
                                       num_components);
             }
@@ -4495,7 +2280,7 @@ static void update_pass_uniform_override(we_scene_t *scene, we_material_pass_t *
                     memset(cv->val, 0, sizeof(cv->val));
                     memcpy(cv->val, values, num_components * sizeof(float));
                     cv->num_components = num_components;
-                    if (cv->user_prop[0] != '\0') {
+                    if (cv->user_prop[0] != '\0' && strchr(cv->user_prop, '=') == NULL) {
                         sync_project_prop_vec(&scene->project, cv->user_prop, val_str, values,
                                               num_components);
                     }
@@ -4553,8 +2338,9 @@ bool we_scene_set_uniform_override(we_scene_t *scene, const char *name, const fl
         if (obj->alpha_user_prop[0] != '\0' && strcasecmp(obj->alpha_user_prop, name) == 0) {
             obj->alpha = values[0];
         }
-        if (obj->visible_user_prop[0] != '\0' && strcasecmp(obj->visible_user_prop, name) == 0) {
-            obj->visible = (values[0] != 0.0f);
+        if (obj->visible_user_prop[0] != '\0' &&
+            user_prop_matches_key(obj->visible_user_prop, name)) {
+            (void)we_project_eval_prop_bool(&scene->project, obj->visible_user_prop, &obj->visible);
         }
         if (obj->has_base_pass) {
             update_pass_uniform_override(scene, &obj->base_pass, name, val_str, values,
@@ -4563,8 +2349,9 @@ bool we_scene_set_uniform_override(we_scene_t *scene, const char *name, const fl
         for (uint32_t e = 0; e < obj->effect_count; ++e) {
             we_effect_t *eff = &obj->effects[e];
             if (eff->visible_user_prop[0] != '\0' &&
-                strcasecmp(eff->visible_user_prop, name) == 0) {
-                eff->visible = (values[0] != 0.0f);
+                user_prop_matches_key(eff->visible_user_prop, name)) {
+                (void)we_project_eval_prop_bool(&scene->project, eff->visible_user_prop,
+                                                &eff->visible);
             }
             for (uint32_t p = 0; p < eff->pass_count; ++p) {
                 update_pass_uniform_override(scene, &eff->passes[p], name, val_str, values,
@@ -4587,8 +2374,9 @@ void waywal_we_scene_forget_bo(we_scene_t *scene, const dmabuf_bo_t *bo)
     if (!scene || !bo) {
         return;
     }
+    ensure_egl_procs(scene);
     PFNEGLDESTROYIMAGEKHRPROC destroy_img =
-        (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+        __extension__(PFNEGLDESTROYIMAGEKHRPROC) scene->fn_eglDestroyImageKHR;
 
     for (size_t i = 0; i < scene->num_imported_bos; i++) {
         if (scene->imported_bos[i].bo == bo) {
@@ -4705,8 +2493,9 @@ void we_scene_destroy(we_scene_t *scene)
     }
 
     if (scene->gl_initialized) {
+        ensure_egl_procs(scene);
         PFNEGLDESTROYIMAGEKHRPROC destroy_img =
-            (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+            __extension__(PFNEGLDESTROYIMAGEKHRPROC) scene->fn_eglDestroyImageKHR;
         for (size_t i = 0; i < scene->num_imported_bos; i++) {
             if (!scene->imported_bos[i].owns_egl) {
                 continue;
@@ -4876,5 +2665,3 @@ void we_scene_set_media_playing(we_scene_t *scene, float playing)
     }
     scene->media_playing = playing;
 }
-
-#endif /* !WWAL_WE_PROJECT_ONLY */

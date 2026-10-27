@@ -107,6 +107,7 @@ void cli_print_usage(const char *prog)
     printf("  -j, --json                 Format query/status/stats output as JSON\n");
     printf("  -n, --namespace <NAME>     Socket namespace (default: \"default\")\n");
     printf("  -v, --verbose              Enable verbose debug output\n");
+    printf("  -V, --version              Print version information\n");
     printf("  -h, --help                 Print help information\n");
 }
 
@@ -388,9 +389,12 @@ static bool parse_common_flag(int *optind_ptr, int argc, char *argv[], cli_optio
     const char *arg = argv[*optind_ptr];
     const char *val = NULL;
 
-    if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0 || strcmp(arg, "-V") == 0 ||
-        strcmp(arg, "--version") == 0) {
+    if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
         opts->cmd = CLI_CMD_HELP;
+        return true;
+    }
+    if (strcmp(arg, "-V") == 0 || strcmp(arg, "--version") == 0) {
+        opts->cmd = CLI_CMD_VERSION;
         return true;
     }
     if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
@@ -693,7 +697,7 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
             if (!parse_common_flag(&idx, argc, argv, opts)) {
                 return false;
             }
-            if (opts->cmd == CLI_CMD_HELP)
+            if (opts->cmd == CLI_CMD_HELP || opts->cmd == CLI_CMD_VERSION)
                 return true;
         }
         return true;
@@ -704,7 +708,7 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
         if (!parse_common_flag(&optind, argc, argv, opts)) {
             return false;
         }
-        if (opts->cmd == CLI_CMD_HELP)
+        if (opts->cmd == CLI_CMD_HELP || opts->cmd == CLI_CMD_VERSION)
             return true;
         optind++;
     }
@@ -1087,6 +1091,8 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
         opts->cmd = CLI_CMD_KILL;
     } else if (strcmp(cmd_str, "help") == 0) {
         opts->cmd = CLI_CMD_HELP;
+    } else if (strcmp(cmd_str, "version") == 0) {
+        opts->cmd = CLI_CMD_VERSION;
     } else {
         fprintf(stderr, "Error: Unknown command '%s'\n", cmd_str);
         return false;

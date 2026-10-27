@@ -84,6 +84,9 @@ At startup, after initializing DRM/GBM and Wayland connections, *wwald* locks it
 *-v, --verbose*
 	Enable verbose logging.
 
+*-V, --version*
+	Print version information and exit.
+
 *-h, --help*
 	Display help message and exit.
 

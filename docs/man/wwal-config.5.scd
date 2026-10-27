@@ -29,17 +29,17 @@ Controls core *wwald*(1) lifecycle, layer-shell behavior, and Zero-Watt power go
 *backdrop* = "<none|auto-blur|path>"
 	Secondary layer surface (*waywal-backdrop*) mode for compositors with overview backdrops such as Niri (default: *"none"*). Set to *"auto-blur"* to run the GPU 2-pass Dual-Kawase blur shader automatically.
 
-*10bit* = <bool>
+*ten_bit*, *10bit* = <bool>
 	Enable 10-bit wide-gamut scanout (*XRGB2101010* / *ARGB2101010*) when supported by the compositor (default: *false*).
 
 *restore_on_start* = <bool>
 	Automatically restore per-output state from *$XDG_STATE_HOME/wwal/state.bin* when *wwald* starts or when a monitor is hotplugged (default: *true*).
 
-*pause_on_fullscreen* = <bool>
+*auto_pause_fullscreen*, *pause_on_fullscreen* = <bool>
 	Pause video and live shader rendering on an output when a fullscreen window covers it (default: *true*).
 
-*pause_on_maximized* = <bool>
-	Pause video and live shader rendering on an output when a maximized window covers it (default: *true*).
+*auto_pause_maximized*, *pause_on_maximized* = <bool>
+	Pause video and live shader rendering on an output when a maximized window covers it (default: *false*).
 
 *pause_on_occluded_workspace* = <bool>
 	Pause video and live shader rendering when Hyprland/Sway IPC reports the active workspace is fully tiled and opaque (default: *true*).
@@ -66,7 +66,7 @@ Controls core *wwald*(1) lifecycle, layer-shell behavior, and Zero-Watt power go
 
 Controls the in-pipeline OKLab Wu quantizer + weighted K-Means++ + CAM16/HCT Material Design 3 palette generator.
 
-*enable* = <bool>
+*enabled*, *enable* = <bool>
 	Automatically extract and export color palettes whenever a wallpaper changes (default: *true*).
 
 *mode* = "<dark|light>"
@@ -81,7 +81,7 @@ Controls the in-pipeline OKLab Wu quantizer + weighted K-Means++ + CAM16/HCT Mat
 *caelestia_sync* = <bool>
 	Atomically write *~/.local/state/caelestia/scheme.json* for Quickshell (*caelestia-shell*) live theme synchronization (default: *true*).
 
-*terminal_osc* = <bool>
+*tty_sequences*, *terminal_osc* = <bool>
 	Broadcast non-blocking ANSI *OSC 4*, *OSC 10*, and *OSC 11* escape sequences to active */dev/pts/\** terminals (default: *true*).
 
 *export_css* = <bool>
@@ -98,7 +98,7 @@ Controls the in-pipeline OKLab Wu quantizer + weighted K-Means++ + CAM16/HCT Mat
 Sets default parameters for GPU compute and CPU SIMD wallpaper transitions.
 
 *type* = "<string>"
-	Default transition effect: *none*, *simple*, *fade*, *wipe*, *grow*, *outer*, *wave*, *noise*, *crosszoom*, *slide*, *glitch*, *burn*, *ripple*, *pixelate*, *doom*, *swirl*, *cube*, *luma*, *light_leak*, *page_curl*, *custom*, or *random* (default: *"fade"*).
+	Default transition effect: *none*, *simple*, *fade*, *wipe*, *grow*, *outer*, *wave*, *noise*, *crosszoom*, *slide*, *glitch*, *burn*, *ripple*, *pixelate*, *doom*, *swirl*, *cube*, *luma*, *light_leak*, *page_curl*, *custom*, *left*, *right*, *top*, *bottom*, *center*, *any*, or *random* (default: *"fade"*).
 
 *duration* = <float>
 	Transition duration in seconds (default: *1.0*).

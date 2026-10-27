@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Rich JSON IPC inspection (`wwal status [--json]`, `wwal query --json`, `wwal stats --json`), live uniform and Workshop property mutation (`wwal set-uniform`), and newline-delimited JSON event streaming (`wwal subscribe`).
 - `zwlr_foreign_toplevel_manager_v1` occlusion tracking (`protocols/wlr-foreign-toplevel-management-unstable-v1.xml`) and `--battery-policy` CLI flag.
 - WebM `EBML_ID_DURATION` parsing, Xiph/Fixed/EBML block lacing expansion, and MP4 `ctts` v0/v1 composition time offset support in `demuxer.c`.
+- `--version` / `-V` / `version` CLI support in `wwal` and `wwald` wired to `meson.project_version()`, plus `contrib/config.toml.example` and starter GLSL shaders (`contrib/shaders/plasma.frag`, `contrib/shaders/audio_spectrum.frag`).
 
 ### Fixed
 
@@ -24,10 +25,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Deduplicated client/daemon HCT palette extraction, theme file exports, `/dev/pts/*` broadcasts, and hook execution on `wwal img`, while wiring daemon-side theme/hook updates and `SIGHUP` directory rescanning into `slideshow.c`.
 - Preserved per-effect wave/blur defaults in `crosszoom`, `slide`, `glitch`, `burn`, `ripple`, and `wave`, fixed `--transition-type simple` and `random`, and eliminated double Cubic-Bezier easing.
 - Added `in_flight` poll SQE tracking in `uring_loop.c` and forced `epoll`/`io_uring` re-registration on compositor IPC reconnect.
+- Wired `meson_options.txt` feature toggles (`WWAL_DISABLE_{WEBP,AVIF,JXL,SVG,PIPEWIRE,SIMD}`) across runtime `dlopen` loaders and SIMD dispatch tables, and removed the unused `shaderc` build dependency.
+- Hardened VA-API H.264/HEVC/VP9/AV1 bitstream parsers (`pred_weight_table`, multi-command RPLM, dependent slice inheritance, per-slot AV1 `PrevGmParams`/loop-filter/segmentation persistence, and hidden alt-ref frame suppression), multi-plane `NV12`/`P010` GPU video transition snapshots, EGLImage per-scene BO tracking, and Seccomp-BPF / `SceneScript` / JSON / `.pkg` bounds safety.
 
 ### Performance
 
-- Vectorized AVX2 and AVX-512 BW scanline alpha blending without per-scanline `_mm_sfence()` stalls, cached GLSL uniform locations across all 19 transition compute shaders, and eliminated redundant 4K RGBA heap buffers in `video_engine.c` and `main.c`.
+- Vectorized AVX2 and AVX-512 BW scanline alpha blending without per-scanline `_mm_sfence()` stalls, cached GLSL uniform locations across all 19 transition compute shaders and Wallpaper Engine passes, and eliminated redundant 4K RGBA heap buffers in `video_engine.c`, `we_tex.c`, and `main.c`.
+- Added AVX2-accelerated Annex-B start-code / RBSP unescaping, AVX2 FMA3 turbulent curl-noise and skeletal puppet skinning, hoisted `OKLab` `cbrtf` out of K-Means inner loops, gated PipeWire FFT and Hyprland cursor IPC on active shader consumers, and added zero-fork ISO-BMFF/WebM stream probing before `ffmpeg` transcoding.
+- Reclaimed `source_old_bo` DMA-BUFs immediately upon transition completion and released `GL_RGBA16F` multi-pass ping-pong and scratch textures when stopping shader playback, reducing steady-state VRAM consumption by ~32–96 MB per 4K output.
+- Consolidated `image_loader.c`, `we_pkg.c`, `we_json.c`, and `we_project.c` into `libwaywal_common.a` and decomposed `video_vaapi.c`, `we_scene.c`, `main.c`, `we_script.c`, and `render_engine.c` into focused modules.
 
 ## [1.0.0] - 2026-10-26
 

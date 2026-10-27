@@ -567,7 +567,7 @@ static int open_case_insensitive_rel(const char *base_dir, const char *rel_path)
         p += seg_len;
     }
 
-    return open(cur_path, O_RDONLY | O_CLOEXEC);
+    return open(cur_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 }
 
 static uint8_t *read_loose_file_with_case(const char *base_dir, const char *norm_rel,
@@ -583,11 +583,11 @@ static uint8_t *read_loose_file_with_case(const char *base_dir, const char *norm
         return NULL;
     }
 
-    int fd = open(full_path, O_RDONLY | O_CLOEXEC);
+    int fd = open(full_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0 && case_rel && case_rel[0] != '\0' && strcmp(case_rel, norm_rel) != 0) {
         n = snprintf(full_path, sizeof(full_path), "%s/%s", base_dir, case_rel);
         if (n > 0 && (size_t)n < sizeof(full_path)) {
-            fd = open(full_path, O_RDONLY | O_CLOEXEC);
+            fd = open(full_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
         }
     }
     if (fd < 0) {

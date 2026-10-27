@@ -2,10 +2,11 @@
 #include "waywal/we_particle.h"
 
 #include "waywal/log.h"
+#include "waywal/we_json.h"
 
 #include <GLES3/gl31.h>
 #include <ctype.h>
-#if defined(__x86_64__) || defined(_M_X64)
+#if !defined(WWAL_DISABLE_SIMD) && (defined(__x86_64__) || defined(_M_X64))
 #include <immintrin.h>
 #endif
 #include <math.h>
@@ -14,413 +15,27 @@
 #include <string.h>
 #include <strings.h>
 
-/* =========================================================================
- * Lightweight JSON DOM Helper for Particle System Definitions
- * ========================================================================= */
+typedef we_jval_t pj_val_t;
+#define PJ_ARR JVAL_ARR
+#define PJ_OBJ JVAL_OBJ
 
-typedef enum {
-    PJ_NULL = 0,
-    PJ_BOOL,
-    PJ_NUM,
-    PJ_STR,
-    PJ_ARR,
-    PJ_OBJ,
-} pj_type_t;
+static inline void pj_free(pj_val_t *v) { we_jval_free(v); }
 
-typedef struct pj_val pj_val_t;
-
-typedef struct {
-    char *key;
-    pj_val_t *val;
-} pj_kv_t;
-
-struct pj_val {
-    pj_type_t type;
-    bool bval;
-    double num;
-    char *str;
-    struct {
-        pj_val_t **items;
-        size_t count;
-    } arr;
-    struct {
-        pj_kv_t *entries;
-        size_t count;
-    } obj;
-};
-
-typedef struct {
-    const char *src;
-    size_t len;
-    size_t pos;
-} pj_lexer_t;
-
-static void pj_free(pj_val_t *v)
+static inline const pj_val_t *pj_get(const pj_val_t *obj, const char *key)
 {
-    if (!v) {
-        return;
-    }
-    if (v->type == PJ_STR) {
-        free(v->str);
-    } else if (v->type == PJ_ARR) {
-        for (size_t i = 0; i < v->arr.count; i++) {
-            pj_free(v->arr.items[i]);
-        }
-        free(v->arr.items);
-    } else if (v->type == PJ_OBJ) {
-        for (size_t i = 0; i < v->obj.count; i++) {
-            free(v->obj.entries[i].key);
-            pj_free(v->obj.entries[i].val);
-        }
-        free(v->obj.entries);
-    }
-    free(v);
+    return we_jobj_get(obj, key);
 }
 
-static void pj_skip_ws(pj_lexer_t *lx)
+static inline const char *pj_str(const pj_val_t *v, const char *def) { return we_jval_str(v, def); }
+
+static inline uint32_t pj_floats(const pj_val_t *v, float *out, uint32_t max_n)
 {
-    while (lx->pos < lx->len) {
-        char c = lx->src[lx->pos];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            lx->pos++;
-        } else if (c == '/' && lx->pos + 1 < lx->len && lx->src[lx->pos + 1] == '/') {
-            lx->pos += 2;
-            while (lx->pos < lx->len && lx->src[lx->pos] != '\n') {
-                lx->pos++;
-            }
-        } else if (c == '/' && lx->pos + 1 < lx->len && lx->src[lx->pos + 1] == '*') {
-            lx->pos += 2;
-            while (lx->pos + 1 < lx->len &&
-                   !(lx->src[lx->pos] == '*' && lx->src[lx->pos + 1] == '/')) {
-                lx->pos++;
-            }
-            lx->pos = (lx->pos + 1 < lx->len) ? (lx->pos + 2) : lx->len;
-        } else {
-            break;
-        }
-    }
+    return we_jval_floats(v, NULL, out, max_n, NULL, 0);
 }
 
-static char *pj_parse_raw_str(pj_lexer_t *lx)
+static inline float pj_float(const pj_val_t *v, float def)
 {
-    pj_skip_ws(lx);
-    if (lx->pos >= lx->len || lx->src[lx->pos] != '"') {
-        return NULL;
-    }
-    lx->pos++;
-    size_t cap = 64, len = 0;
-    char *out = malloc(cap);
-    if (!out) {
-        return NULL;
-    }
-    while (lx->pos < lx->len) {
-        char c = lx->src[lx->pos++];
-        if (c == '"') {
-            out[len] = '\0';
-            return out;
-        }
-        if (c == '\\' && lx->pos < lx->len) {
-            char esc = lx->src[lx->pos++];
-            switch (esc) {
-            case 'n':
-                c = '\n';
-                break;
-            case 'r':
-                c = '\r';
-                break;
-            case 't':
-                c = '\t';
-                break;
-            default:
-                c = esc;
-                break;
-            }
-        }
-        if (len + 2 > cap) {
-            size_t ncap = cap * 2;
-            char *nb = realloc(out, ncap);
-            if (!nb) {
-                free(out);
-                return NULL;
-            }
-            out = nb;
-            cap = ncap;
-        }
-        out[len++] = c;
-    }
-    free(out);
-    return NULL;
-}
-
-static pj_val_t *pj_parse_val(pj_lexer_t *lx, int depth);
-
-static pj_val_t *pj_parse_arr(pj_lexer_t *lx, int depth)
-{
-    lx->pos++;
-    pj_val_t *arr = calloc(1, sizeof(pj_val_t));
-    if (!arr) {
-        return NULL;
-    }
-    arr->type = PJ_ARR;
-    size_t cap = 0;
-    while (lx->pos < lx->len) {
-        pj_skip_ws(lx);
-        if (lx->pos < lx->len && lx->src[lx->pos] == ']') {
-            lx->pos++;
-            return arr;
-        }
-        pj_val_t *el = pj_parse_val(lx, depth + 1);
-        if (!el) {
-            pj_free(arr);
-            return NULL;
-        }
-        if (arr->arr.count + 1 > cap) {
-            size_t ncap = cap == 0 ? 8 : cap * 2;
-            pj_val_t **ni = realloc(arr->arr.items, ncap * sizeof(pj_val_t *));
-            if (!ni) {
-                pj_free(el);
-                pj_free(arr);
-                return NULL;
-            }
-            arr->arr.items = ni;
-            cap = ncap;
-        }
-        arr->arr.items[arr->arr.count++] = el;
-        pj_skip_ws(lx);
-        if (lx->pos < lx->len && lx->src[lx->pos] == ',') {
-            lx->pos++;
-        }
-    }
-    pj_free(arr);
-    return NULL;
-}
-
-static pj_val_t *pj_parse_obj(pj_lexer_t *lx, int depth)
-{
-    lx->pos++;
-    pj_val_t *obj = calloc(1, sizeof(pj_val_t));
-    if (!obj) {
-        return NULL;
-    }
-    obj->type = PJ_OBJ;
-    size_t cap = 0;
-    while (lx->pos < lx->len) {
-        pj_skip_ws(lx);
-        if (lx->pos < lx->len && lx->src[lx->pos] == '}') {
-            lx->pos++;
-            return obj;
-        }
-        char *k = pj_parse_raw_str(lx);
-        if (!k) {
-            pj_free(obj);
-            return NULL;
-        }
-        pj_skip_ws(lx);
-        if (lx->pos >= lx->len || lx->src[lx->pos] != ':') {
-            free(k);
-            pj_free(obj);
-            return NULL;
-        }
-        lx->pos++;
-        pj_val_t *v = pj_parse_val(lx, depth + 1);
-        if (!v) {
-            free(k);
-            pj_free(obj);
-            return NULL;
-        }
-        if (obj->obj.count + 1 > cap) {
-            size_t ncap = cap == 0 ? 8 : cap * 2;
-            pj_kv_t *ne = realloc(obj->obj.entries, ncap * sizeof(pj_kv_t));
-            if (!ne) {
-                free(k);
-                pj_free(v);
-                pj_free(obj);
-                return NULL;
-            }
-            obj->obj.entries = ne;
-            cap = ncap;
-        }
-        obj->obj.entries[obj->obj.count].key = k;
-        obj->obj.entries[obj->obj.count].val = v;
-        obj->obj.count++;
-        pj_skip_ws(lx);
-        if (lx->pos < lx->len && lx->src[lx->pos] == ',') {
-            lx->pos++;
-        }
-    }
-    pj_free(obj);
-    return NULL;
-}
-
-static pj_val_t *pj_parse_val(pj_lexer_t *lx, int depth)
-{
-    if (depth > 64) {
-        return NULL;
-    }
-    pj_skip_ws(lx);
-    if (lx->pos >= lx->len) {
-        return NULL;
-    }
-    char c = lx->src[lx->pos];
-    if (c == '{') {
-        return pj_parse_obj(lx, depth);
-    }
-    if (c == '[') {
-        return pj_parse_arr(lx, depth);
-    }
-    if (c == '"') {
-        char *s = pj_parse_raw_str(lx);
-        if (!s) {
-            return NULL;
-        }
-        pj_val_t *v = calloc(1, sizeof(pj_val_t));
-        if (!v) {
-            free(s);
-            return NULL;
-        }
-        v->type = PJ_STR;
-        v->str = s;
-        return v;
-    }
-    if (lx->len - lx->pos >= 4 && strncmp(lx->src + lx->pos, "true", 4) == 0) {
-        lx->pos += 4;
-        pj_val_t *v = calloc(1, sizeof(pj_val_t));
-        if (v) {
-            v->type = PJ_BOOL;
-            v->bval = true;
-        }
-        return v;
-    }
-    if (lx->len - lx->pos >= 5 && strncmp(lx->src + lx->pos, "false", 5) == 0) {
-        lx->pos += 5;
-        pj_val_t *v = calloc(1, sizeof(pj_val_t));
-        if (v) {
-            v->type = PJ_BOOL;
-            v->bval = false;
-        }
-        return v;
-    }
-    if (lx->len - lx->pos >= 4 && strncmp(lx->src + lx->pos, "null", 4) == 0) {
-        lx->pos += 4;
-        pj_val_t *v = calloc(1, sizeof(pj_val_t));
-        if (v) {
-            v->type = PJ_NULL;
-        }
-        return v;
-    }
-    if (c == '-' || c == '+' || (c >= '0' && c <= '9') || c == '.') {
-        size_t rem = lx->len - lx->pos;
-        size_t clen = rem < 63 ? rem : 63;
-        char nbuf[64];
-        memcpy(nbuf, lx->src + lx->pos, clen);
-        nbuf[clen] = '\0';
-        char *endptr = NULL;
-        double num = strtod(nbuf, &endptr);
-        if (endptr == nbuf) {
-            return NULL;
-        }
-        lx->pos += (size_t)(endptr - nbuf);
-        pj_val_t *v = calloc(1, sizeof(pj_val_t));
-        if (v) {
-            v->type = PJ_NUM;
-            v->num = num;
-        }
-        return v;
-    }
-    return NULL;
-}
-
-static const pj_val_t *pj_get(const pj_val_t *obj, const char *key)
-{
-    if (!obj || obj->type != PJ_OBJ || !key) {
-        return NULL;
-    }
-    for (size_t i = 0; i < obj->obj.count; i++) {
-        if (strcasecmp(obj->obj.entries[i].key, key) == 0) {
-            return obj->obj.entries[i].val;
-        }
-    }
-    return NULL;
-}
-
-static const char *pj_str(const pj_val_t *v, const char *def)
-{
-    if (!v) {
-        return def;
-    }
-    if (v->type == PJ_STR && v->str) {
-        return v->str;
-    }
-    if (v->type == PJ_OBJ) {
-        const pj_val_t *in = pj_get(v, "value");
-        if (in && in->type == PJ_STR && in->str) {
-            return in->str;
-        }
-    }
-    return def;
-}
-
-static uint32_t pj_floats(const pj_val_t *v, float *out, uint32_t max_n)
-{
-    if (!v || !out || max_n == 0) {
-        return 0;
-    }
-    if (v->type == PJ_OBJ) {
-        const pj_val_t *in = pj_get(v, "value");
-        return in ? pj_floats(in, out, max_n) : 0;
-    }
-    if (v->type == PJ_NUM) {
-        out[0] = (float)v->num;
-        return 1;
-    }
-    if (v->type == PJ_BOOL) {
-        out[0] = v->bval ? 1.0f : 0.0f;
-        return 1;
-    }
-    if (v->type == PJ_STR && v->str) {
-        if (strcasecmp(v->str, "true") == 0) {
-            out[0] = 1.0f;
-            return 1;
-        }
-        if (strcasecmp(v->str, "false") == 0) {
-            out[0] = 0.0f;
-            return 1;
-        }
-        const char *p = v->str;
-        uint32_t cnt = 0;
-        while (*p && cnt < max_n) {
-            while (*p && (isspace((unsigned char)*p) || *p == ',')) {
-                p++;
-            }
-            if (!*p) {
-                break;
-            }
-            char *endptr = NULL;
-            float f = strtof(p, &endptr);
-            if (endptr == p) {
-                break;
-            }
-            out[cnt++] = f;
-            p = endptr;
-        }
-        return cnt;
-    }
-    if (v->type == PJ_ARR) {
-        uint32_t cnt = (uint32_t)v->arr.count < max_n ? (uint32_t)v->arr.count : max_n;
-        for (uint32_t i = 0; i < cnt; i++) {
-            float tmp = 0.0f;
-            pj_floats(v->arr.items[i], &tmp, 1);
-            out[i] = tmp;
-        }
-        return cnt;
-    }
-    return 0;
-}
-
-static float pj_float(const pj_val_t *v, float def)
-{
-    float tmp = def;
-    return (pj_floats(v, &tmp, 1) >= 1) ? tmp : def;
+    return we_jval_float(v, NULL, def, NULL, 0);
 }
 
 static void pj_vec3(const pj_val_t *v, float out[3], float d0, float d1, float d2)
@@ -609,8 +224,7 @@ we_particle_sys_t *we_particle_create_from_json(const char *json_str, size_t len
         return NULL;
     }
 
-    pj_lexer_t lx = {.src = json_str, .len = len, .pos = 0};
-    pj_val_t *root = pj_parse_val(&lx, 0);
+    pj_val_t *root = we_json_parse_root(json_str, len);
     if (!root || root->type != PJ_OBJ) {
         pj_free(root);
         return NULL;
@@ -1377,6 +991,16 @@ __attribute__((target("avx2,fma"))) static void particle_reset_and_ops_avx2(we_p
         vec_n = sys->padded_cap;
     }
 
+    for (uint32_t a = 0; a < WE_PARTICLE_SOA_ARRAYS; a++) {
+        float *arr = sys->soa_block + (size_t)a * sys->padded_cap;
+        for (uint32_t tail = n; tail < vec_n; tail++) {
+            arr[tail] = 0.0f;
+        }
+    }
+    for (uint32_t tail = n; tail < vec_n; tail++) {
+        sys->max_life[tail] = 1.0f;
+    }
+
     /* 1. AVX2 Pre-Operator Reset across 32B-aligned SoA arrays */
     for (uint32_t i = 0; i < vec_n; i += 8u) {
         _mm256_store_ps(sys->size + i, _mm256_load_ps(sys->init_size + i));
@@ -1657,13 +1281,33 @@ __attribute__((target("avx2,fma"))) static void particle_reset_and_ops_avx2(we_p
             float sc = op->turb_scale > 0.0f ? op->turb_scale : 0.01f;
             float t_off = (float)sys->sim_time * op->turb_timescale;
             float spd = op->turb_speed * dt;
-            for (uint32_t i = 0; i < n; i++) {
-                float curl[3];
-                eval_curl_noise_3d(sys->pos_x[i] * sc + t_off, sys->pos_y[i] * sc + t_off,
-                                   sys->pos_z[i] * sc + t_off, curl);
-                sys->vel_x[i] += curl[0] * spd * op->mask[0];
-                sys->vel_y[i] += curl[1] * spd * op->mask[1];
-                sys->vel_z[i] += curl[2] * spd * op->mask[2];
+            __m256 v_sc = _mm256_set1_ps(sc);
+            __m256 v_toff = _mm256_set1_ps(t_off);
+            __m256 v_spdx = _mm256_set1_ps(spd * op->mask[0]);
+            __m256 v_spdy = _mm256_set1_ps(spd * op->mask[1]);
+            __m256 v_spdz = _mm256_set1_ps(spd * op->mask[2]);
+            for (uint32_t i = 0; i < vec_n; i += 8u) {
+                __m256 x = _mm256_fmadd_ps(_mm256_load_ps(sys->pos_x + i), v_sc, v_toff);
+                __m256 y = _mm256_fmadd_ps(_mm256_load_ps(sys->pos_y + i), v_sc, v_toff);
+                __m256 z = _mm256_fmadd_ps(_mm256_load_ps(sys->pos_z + i), v_sc, v_toff);
+
+                __m256 sx = vsin256_ps(x);
+                __m256 cx = vcos256_ps(x);
+                __m256 sy = vsin256_ps(y);
+                __m256 cy = vcos256_ps(y);
+                __m256 sz = vsin256_ps(z);
+                __m256 cz = vcos256_ps(z);
+
+                __m256 curl_x = _mm256_sub_ps(_mm256_sub_ps(v_zero, sy), cz);
+                __m256 curl_y = _mm256_sub_ps(_mm256_sub_ps(v_zero, sz), cx);
+                __m256 curl_z = _mm256_sub_ps(_mm256_sub_ps(v_zero, sx), cy);
+
+                _mm256_store_ps(sys->vel_x + i,
+                                _mm256_fmadd_ps(curl_x, v_spdx, _mm256_load_ps(sys->vel_x + i)));
+                _mm256_store_ps(sys->vel_y + i,
+                                _mm256_fmadd_ps(curl_y, v_spdy, _mm256_load_ps(sys->vel_y + i)));
+                _mm256_store_ps(sys->vel_z + i,
+                                _mm256_fmadd_ps(curl_z, v_spdz, _mm256_load_ps(sys->vel_z + i)));
             }
             break;
         }
@@ -1672,6 +1316,13 @@ __attribute__((target("avx2,fma"))) static void particle_reset_and_ops_avx2(we_p
 
     for (uint32_t i = 0; i < vec_n; i += 8u) {
         _mm256_store_ps(sys->age + i, _mm256_add_ps(_mm256_load_ps(sys->age + i), v_dt));
+    }
+
+    for (uint32_t a = 0; a < WE_PARTICLE_SOA_ARRAYS; a++) {
+        float *arr = sys->soa_block + (size_t)a * sys->padded_cap;
+        for (uint32_t tail = n; tail < vec_n; tail++) {
+            arr[tail] = 0.0f;
+        }
     }
 }
 #endif
@@ -1704,8 +1355,14 @@ void we_particle_update(we_particle_sys_t *sys, float dt_sec)
                 spawn_single_particle(sys, em);
             }
         }
-        if (em->rate > 0.0f) {
+        if (em->rate > 0.0f && isfinite(em->rate)) {
             em->emit_accum += em->rate * dt;
+            if (!isfinite(em->emit_accum) || em->emit_accum < 0.0f) {
+                em->emit_accum = 0.0f;
+            }
+            if (em->emit_accum > (float)sys->max_count) {
+                em->emit_accum = (float)sys->max_count;
+            }
             uint32_t to_spawn = (uint32_t)em->emit_accum;
             em->emit_accum -= (float)to_spawn;
             for (uint32_t s = 0; s < to_spawn && sys->alive_count < sys->max_count; s++) {

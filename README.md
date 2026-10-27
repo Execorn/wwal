@@ -42,7 +42,7 @@ To build from source, you need a C23 compiler (`GCC >= 13` or `Clang >= 17`), `m
 | **Core Wayland & DRM** | `wayland-client >= 1.20`, `wayland-protocols >= 1.34`, `wayland-scanner`, `libdrm >= 2.4.110`, `gbm`, `egl`, `glesv2` | Layer surfaces, DMA-BUF buffers, and GLES 3.1 pipelines |
 | **Video & Kernel** | `libva`, `libva-drm`, `liburing`, `libseccomp` | VA-API video decode, `io_uring` loop, and Seccomp sandbox |
 | **Base Image Formats** | `libpng`, `libturbojpeg` | Fast native PNG, APNG, and JPEG decode |
-| **Optional Plugins (`dlopen`)** | `libwebp`, `libavif`, `libjxl`, `librsvg-2.0`, `libpipewire-0.3`, `libdbus-1`, `libquickjs` | Loaded on demand for WebP, AVIF, JXL, SVG, PipeWire audio, D-Bus `MPRIS2`, or QuickJS |
+| **Optional Plugins (`dlopen`)** | `libwebp`, `libavif`, `libjxl`, `librsvg-2.0`, `libpipewire-0.3`, `libdbus-1`, `libsystemd` / `libelogind`, `liblz4`, `libquickjs` | Loaded on demand for WebP, AVIF, JXL, SVG, PipeWire audio, D-Bus `MPRIS2`, sd-bus fallback, LZ4 `.tex` decode, or QuickJS |
 | **Optional Build Tools** | `scdoc`, `systemd` | Builds `docs/man/*.scd` man pages and sets systemd unit paths |
 
 ---
@@ -120,7 +120,7 @@ wwal restore
 
 ## Configuration (`~/.config/wwal/config.toml`)
 
-WayWal works out of the box with no setup. Create `~/.config/wwal/config.toml` if you want to save default settings:
+WayWal works out of the box with no setup. Create `~/.config/wwal/config.toml` (see `contrib/config.toml.example`) if you want to save default settings:
 
 ```toml
 [daemon]
@@ -147,6 +147,10 @@ type = "grow"
 duration = 1.0
 fps = 120
 bezier = [0.25, 0.1, 0.25, 1.0]
+
+[hooks]
+on_wallpaper_change = ""          # Optional shell command run after transition completes
+on_theme_change = ""              # Optional shell command run after Material 3 palette export
 
 [output."DP-1"]
 path = "~/Pictures/Wallpapers/ultrawide.jxl"
@@ -179,7 +183,7 @@ Commands:
   restore                        Restore saved per-output wallpapers from state.bin
   pause / unpause / toggle       Control active video, shader, or Workshop scene playback
   clear-cache                    Purge cached video transcodes and compiled shader binaries
-  ping / kill                    Check responsiveness or gracefully terminate the running wwald daemon
+  ping / kill / version          Check responsiveness, stop wwald, or print version info
 
 Key Options:
   --transition-type <TYPE>       none, simple, fade, wipe, grow, outer, wave, noise, crosszoom,
@@ -203,6 +207,7 @@ Key Options:
   --battery-policy <POLICY>      ignore, reduce-fps, or pause-video
   --10bit                        Enable 10-bit wide-gamut scanout (XRGB2101010 / ARGB2101010)
   -j, --json                     Format query, status, or stats output as structured JSON
+  -V, --version                  Print version information
 ```
 
 ---
@@ -224,6 +229,8 @@ wwal/
 ├── docs/
 │   └── man/                           # scdoc manual pages (wwal.1, wwald.1, wwal-config.5)
 ├── contrib/
+│   ├── config.toml.example            # Annotated example configuration file
+│   ├── shaders/                       # Ready-to-run sample Shadertoy (.frag) wallpapers
 │   ├── PKGBUILD                       # Arch Linux package build script
 │   ├── fedora/wwal.spec               # Fedora / RPM spec file
 │   ├── debian/                        # Debian / Ubuntu packaging
@@ -236,11 +243,11 @@ wwal/
 │   ├── embed_shaders.py               # Build-time GLSL compute shader embedding script
 │   ├── build_optimized.sh             # PGO + LTO + LLVM BOLT build pipeline
 │   └── benchmark.py                   # Live daemon transition and RSS benchmark
-├── include/waywal/                    # Subsystem headers (IPC, Workshop PKG/TEX/MDL/Scene/Script, MPRIS)
+├── include/waywal/                    # Subsystem headers (IPC, JSON, image loader, Workshop runtime, MPRIS)
 ├── src/
-│   ├── common/                        # Arena, IPC, Bezier, OKLab/HCT palette, TOML, state store
-│   ├── daemon/                        # Wayland core, GBM/DMA-BUF, VA-API, Shaders, Workshop runtime, MPRIS, Audio
-│   └── client/                        # CLI parser (wwal + swww/awww), multi-format image loader
+│   ├── common/                        # Arena, IPC, Bezier, OKLab/HCT palette, TOML, JSON, image loader, Workshop PKG/project
+│   ├── daemon/                        # Wayland core, IPC server, GBM/DMA-BUF, VA-API codecs, Shaders, Workshop runtime, MPRIS, Audio
+│   └── client/                        # CLI parser (wwal + swww/awww) and client dispatch
 └── tests/                             # Unit, subsystem, Workshop scene/script/particle, LibFuzzer, and E2E suites
 ```
 

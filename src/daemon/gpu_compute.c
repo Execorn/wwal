@@ -17,7 +17,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
 #include <immintrin.h>
 #endif
 
@@ -31,6 +31,8 @@ typedef struct {
     GLint loc_wave_freq;
     GLint loc_wave_amp;
     GLint loc_center;
+    GLint loc_smoothness;
+    GLint loc_step;
     float last_prog;
     GLint last_w;
     GLint last_h;
@@ -39,6 +41,8 @@ typedef struct {
     float last_wave_amp;
     float last_center_x;
     float last_center_y;
+    float last_smoothness;
+    float last_step;
 } gpu_program_uniforms_t;
 
 struct gpu_compute_ctx {
@@ -140,6 +144,8 @@ static void query_program_uniforms(GLuint prog, gpu_program_uniforms_t *u)
     u->loc_wave_freq = glGetUniformLocation(prog, "u_wave_freq");
     u->loc_wave_amp = glGetUniformLocation(prog, "u_wave_amp");
     u->loc_center = glGetUniformLocation(prog, "u_center");
+    u->loc_smoothness = glGetUniformLocation(prog, "u_smoothness");
+    u->loc_step = glGetUniformLocation(prog, "u_step");
     u->last_prog = -1.0f;
     u->last_w = -1;
     u->last_h = -1;
@@ -148,6 +154,8 @@ static void query_program_uniforms(GLuint prog, gpu_program_uniforms_t *u)
     u->last_wave_amp = -1.0f;
     u->last_center_x = -1e9f;
     u->last_center_y = -1e9f;
+    u->last_smoothness = -1.0f;
+    u->last_step = -1.0f;
 }
 
 static GLuint compile_shader_program(const char *src, const char *name)
@@ -624,7 +632,7 @@ static bool needs_scratch_fbo_blit(const gpu_compute_ctx_t *ctx, const dmabuf_bo
 {
     if (!ctx || !bo)
         return true;
-    if (is_10bit_drm_format(bo->drm_format))
+    if (bo->is_10bit || is_10bit_drm_format(bo->drm_format))
         return true;
     if (ctx->glEGLImageTargetTexStorageEXT == NULL)
         return true;
@@ -724,7 +732,8 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         return false;
     }
 
-    bool use_scratch = needs_scratch_fbo_blit(ctx, target_bo);
+    bool use_scratch = needs_scratch_fbo_blit(ctx, target_bo) ||
+                       needs_scratch_fbo_blit(ctx, old_bo) || needs_scratch_fbo_blit(ctx, new_bo);
     GLuint dst_image_tex = target_bo->gl_tex;
     if (use_scratch) {
         dst_image_tex = ensure_10bit_scratch_target(ctx, target_bo->width, target_bo->height);
@@ -799,6 +808,20 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         glUniform2f(u->loc_center, params->center_x, params->center_y);
         u->last_center_x = params->center_x;
         u->last_center_y = params->center_y;
+    }
+    if (u->loc_smoothness >= 0) {
+        float sm = params->wave_amp > 0.0f ? params->wave_amp : 0.2f;
+        if (u->last_smoothness != sm) {
+            glUniform1f(u->loc_smoothness, sm);
+            u->last_smoothness = sm;
+        }
+    }
+    if (u->loc_step >= 0) {
+        float st = params->wave_freq > 0.0f ? params->wave_freq : 1.0f;
+        if (u->last_step != st) {
+            glUniform1f(u->loc_step, st);
+            u->last_step = st;
+        }
     }
 
     /* Dispatch compute shader (16x16 local workgroups) */
@@ -941,6 +964,7 @@ bool gpu_compute_prepare_shm(gpu_compute_ctx_t *ctx, uint32_t *tex_old, uint32_t
     if (ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
         if (eglGetCurrentContext() != ctx->context) {
             eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+            gpu_compute_invalidate_state_cache(ctx);
         }
     }
 
@@ -1011,6 +1035,7 @@ bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_ol
     if (ctx->display != EGL_NO_DISPLAY && ctx->context != EGL_NO_CONTEXT) {
         if (eglGetCurrentContext() != ctx->context) {
             eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
+            gpu_compute_invalidate_state_cache(ctx);
         }
     }
 
@@ -1023,49 +1048,70 @@ bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_ol
         select_transition_program(ctx, params->type, &prog, &u);
     }
 
-    glUseProgram(prog);
-    ctx->current_prog = 0;
-    ctx->bound_target_tex = 0;
-    ctx->bound_old_tex = 0;
-    ctx->bound_new_tex = 0;
+    if (ctx->current_prog != prog) {
+        glUseProgram(prog);
+        ctx->current_prog = prog;
+    }
 
     /* Bind target storage image */
-    glBindImageTexture(0, tex_target, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    if (ctx->bound_target_tex != tex_target) {
+        glBindImageTexture(0, tex_target, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+        ctx->bound_target_tex = tex_target;
+    }
 
     /* Bind sources */
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, tex_old);
+    if (ctx->bound_old_tex != tex_old) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, tex_old);
+        ctx->bound_old_tex = tex_old;
+    }
 
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, tex_new);
+    if (ctx->bound_new_tex != tex_new) {
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, tex_new);
+        ctx->bound_new_tex = tex_new;
+    }
 
-    if (u->loc_prog >= 0) {
+    if (u->loc_prog >= 0 && u->last_prog != params->progress) {
         glUniform1f(u->loc_prog, params->progress);
         u->last_prog = params->progress;
     }
-    if (u->loc_res >= 0) {
+    if (u->loc_res >= 0 && (u->last_w != (GLint)width || u->last_h != (GLint)height)) {
         glUniform2i(u->loc_res, (GLint)width, (GLint)height);
         u->last_w = (GLint)width;
         u->last_h = (GLint)height;
     }
-    if (u->loc_angle >= 0) {
+    if (u->loc_angle >= 0 && u->last_angle != params->angle_rad) {
         glUniform1f(u->loc_angle, params->angle_rad);
         u->last_angle = params->angle_rad;
     }
-    if (u->loc_wave_freq >= 0) {
-        float wf = params->wave_freq;
-        glUniform1f(u->loc_wave_freq, wf);
-        u->last_wave_freq = wf;
+    if (u->loc_wave_freq >= 0 && u->last_wave_freq != params->wave_freq) {
+        glUniform1f(u->loc_wave_freq, params->wave_freq);
+        u->last_wave_freq = params->wave_freq;
     }
-    if (u->loc_wave_amp >= 0) {
-        float wa = params->wave_amp;
-        glUniform1f(u->loc_wave_amp, wa);
-        u->last_wave_amp = wa;
+    if (u->loc_wave_amp >= 0 && u->last_wave_amp != params->wave_amp) {
+        glUniform1f(u->loc_wave_amp, params->wave_amp);
+        u->last_wave_amp = params->wave_amp;
     }
-    if (u->loc_center >= 0) {
+    if (u->loc_center >= 0 &&
+        (u->last_center_x != params->center_x || u->last_center_y != params->center_y)) {
         glUniform2f(u->loc_center, params->center_x, params->center_y);
         u->last_center_x = params->center_x;
         u->last_center_y = params->center_y;
+    }
+    if (u->loc_smoothness >= 0) {
+        float sm = params->wave_amp > 0.0f ? params->wave_amp : 0.2f;
+        if (u->last_smoothness != sm) {
+            glUniform1f(u->loc_smoothness, sm);
+            u->last_smoothness = sm;
+        }
+    }
+    if (u->loc_step >= 0) {
+        float st = params->wave_freq > 0.0f ? params->wave_freq : 1.0f;
+        if (u->last_step != st) {
+            glUniform1f(u->loc_step, st);
+            u->last_step = st;
+        }
     }
 
     GLuint groups_x = (width + 15) / 16;
@@ -1635,7 +1681,7 @@ static inline uint32_t avg_u32_epu8_scalar(uint32_t a, uint32_t b)
     return rb | (ag << 8);
 }
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
 __attribute__((target("avx2"))) static void
 kawase_pass_row_avx2(uint32_t *restrict dst_row, const uint32_t *restrict row_up,
                      const uint32_t *restrict row_cc, const uint32_t *restrict row_dn, uint32_t hw)
@@ -1707,7 +1753,7 @@ void layer_shell_blur_rgba_cpu(const uint8_t *src, uint8_t *dst, uint32_t w, uin
     const uint32_t *src_u32 = (const uint32_t *)src;
     uint32_t *dst_u32 = (uint32_t *)dst;
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
     bool has_avx2 = __builtin_cpu_supports("avx2");
 #endif
 
@@ -1766,7 +1812,7 @@ void layer_shell_blur_rgba_cpu(const uint8_t *src, uint8_t *dst, uint32_t w, uin
             const uint32_t *row_cc = in_pyr + (size_t)hy * hw;
             const uint32_t *row_dn = in_pyr + (size_t)y_dn * hw;
             uint32_t *dst_row = out_pyr + (size_t)hy * hw;
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
             if (has_avx2) {
                 kawase_pass_row_avx2(dst_row, row_up, row_cc, row_dn, hw);
                 continue;

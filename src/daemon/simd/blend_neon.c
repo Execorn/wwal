@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "simd_blend.h"
 
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if !defined(WWAL_DISABLE_SIMD) && (defined(__aarch64__) || defined(_M_ARM64))
 #include <arm_neon.h>
 
 void blend_scanline_neon(uint8_t *restrict dst, const uint8_t *restrict src_a,

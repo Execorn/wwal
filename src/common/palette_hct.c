@@ -10,7 +10,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#if defined(__x86_64__) && !defined(WWAL_DISABLE_SIMD)
 #include <immintrin.h>
+#endif
 #include <math.h>
 #include <spawn.h>
 #include <stdatomic.h>
@@ -48,6 +50,11 @@ typedef struct {
 
 typedef struct {
     wu_bin_t bins[WU_GRID][WU_GRID][WU_GRID] __attribute__((aligned(32)));
+    uint16_t active_bins[WU_BINS * WU_BINS * WU_BINS];
+    uint32_t num_active;
+    int min_l, max_l;
+    int min_a, max_a;
+    int min_b, max_b;
 } wu_hist_t;
 
 typedef struct {
@@ -179,7 +186,7 @@ static inline bool linear_rgb_in_gamut(float r, float g, float b)
             b <= 1.0f + eps);
 }
 
-#if defined(__x86_64__) && !defined(WAYWAL_DISABLE_SIMD)
+#if defined(__x86_64__) && !defined(WWAL_DISABLE_SIMD)
 __attribute__((target("avx2,fma"))) static inline __m256 avx2_cbrt_ps(__m256 x)
 {
     const __m256 eps = _mm256_set1_ps(1e-24f);
@@ -209,6 +216,18 @@ __attribute__((target("avx2,fma"))) static inline __m256 avx2_cbrt_ps(__m256 x)
 }
 #endif
 
+static inline void wu_hist_reset(wu_hist_t *hist)
+{
+    memset(hist->bins, 0, sizeof(hist->bins));
+    hist->num_active = 0;
+    hist->min_l = WU_BINS;
+    hist->max_l = 1;
+    hist->min_a = WU_BINS;
+    hist->max_a = 1;
+    hist->min_b = WU_BINS;
+    hist->max_b = 1;
+}
+
 static inline void wu_accum_pixel(wu_hist_t *hist, float l, float a, float b)
 {
     int bl = clamp_i((int)(l * (float)WU_BINS) + 1, 1, WU_BINS);
@@ -216,6 +235,24 @@ static inline void wu_accum_pixel(wu_hist_t *hist, float l, float a, float b)
     int bb = clamp_i((int)(((b + 0.4f) * (1.0f / 0.8f)) * (float)WU_BINS) + 1, 1, WU_BINS);
 
     wu_bin_t *bin = &hist->bins[bl][ba][bb];
+    if (bin->w == 0.0f) {
+        if (hist->num_active < (uint32_t)(WU_BINS * WU_BINS * WU_BINS)) {
+            hist->active_bins[hist->num_active++] =
+                (uint16_t)(((bl - 1) << 10) | ((ba - 1) << 5) | (bb - 1));
+        }
+        if (bl < hist->min_l)
+            hist->min_l = bl;
+        if (bl > hist->max_l)
+            hist->max_l = bl;
+        if (ba < hist->min_a)
+            hist->min_a = ba;
+        if (ba > hist->max_a)
+            hist->max_a = ba;
+        if (bb < hist->min_b)
+            hist->min_b = bb;
+        if (bb > hist->max_b)
+            hist->max_b = bb;
+    }
     bin->w += 1.0f;
     bin->l += l;
     bin->a += a;
@@ -223,12 +260,12 @@ static inline void wu_accum_pixel(wu_hist_t *hist, float l, float a, float b)
     bin->m2 += (l * l + a * a + b * b);
 }
 
-#if defined(__x86_64__) && !defined(WAYWAL_DISABLE_SIMD)
+#if defined(__x86_64__) && !defined(WWAL_DISABLE_SIMD)
 __attribute__((target("avx2,fma"))) static size_t
 wu_populate_histogram_avx2(wu_hist_t *hist, const uint8_t *pixels, uint32_t width, uint32_t height,
                            uint32_t stride_bytes, bool is_bgra)
 {
-    memset(hist, 0, sizeof(*hist));
+    wu_hist_reset(hist);
 
     uint32_t step_x = width > SUBSAMPLE_DIM ? (width / SUBSAMPLE_DIM) : 1U;
     uint32_t step_y = height > SUBSAMPLE_DIM ? (height / SUBSAMPLE_DIM) : 1U;
@@ -241,9 +278,9 @@ wu_populate_histogram_avx2(wu_hist_t *hist, const uint8_t *pixels, uint32_t widt
     const int r_off = is_bgra ? 2 : 0;
     const int b_off = is_bgra ? 0 : 2;
 
-    int32_t r_idx[8] __attribute__((aligned(32)));
-    int32_t g_idx[8] __attribute__((aligned(32)));
-    int32_t b_idx[8] __attribute__((aligned(32)));
+    float r_lin[8] __attribute__((aligned(32)));
+    float g_lin[8] __attribute__((aligned(32)));
+    float b_lin[8] __attribute__((aligned(32)));
     float out_l[8] __attribute__((aligned(32)));
     float out_a[8] __attribute__((aligned(32)));
     float out_b[8] __attribute__((aligned(32)));
@@ -258,19 +295,15 @@ wu_populate_histogram_avx2(wu_hist_t *hist, const uint8_t *pixels, uint32_t widt
             }
             valid_samples++;
 
-            r_idx[batch_count] = px[r_off];
-            g_idx[batch_count] = px[1];
-            b_idx[batch_count] = px[b_off];
+            r_lin[batch_count] = g_srgb_to_linear[px[r_off]];
+            g_lin[batch_count] = g_srgb_to_linear[px[1]];
+            b_lin[batch_count] = g_srgb_to_linear[px[b_off]];
             batch_count++;
 
             if (batch_count == 8) {
-                __m256i vr_i = _mm256_load_si256((const __m256i *)r_idx);
-                __m256i vg_i = _mm256_load_si256((const __m256i *)g_idx);
-                __m256i vb_i = _mm256_load_si256((const __m256i *)b_idx);
-
-                __m256 vr = _mm256_i32gather_ps(g_srgb_to_linear, vr_i, 4);
-                __m256 vg = _mm256_i32gather_ps(g_srgb_to_linear, vg_i, 4);
-                __m256 vb = _mm256_i32gather_ps(g_srgb_to_linear, vb_i, 4);
+                __m256 vr = _mm256_load_ps(r_lin);
+                __m256 vg = _mm256_load_ps(g_lin);
+                __m256 vb = _mm256_load_ps(b_lin);
 
                 __m256 vl = _mm256_mul_ps(_mm256_set1_ps(0.4122214708f), vr);
                 vl = _mm256_fmadd_ps(_mm256_set1_ps(0.5363325363f), vg, vl);
@@ -313,10 +346,7 @@ wu_populate_histogram_avx2(wu_hist_t *hist, const uint8_t *pixels, uint32_t widt
     }
 
     for (int i = 0; i < batch_count; ++i) {
-        float r = g_srgb_to_linear[r_idx[i]];
-        float g = g_srgb_to_linear[g_idx[i]];
-        float b = g_srgb_to_linear[b_idx[i]];
-        waywal_oklab_t ok = linear_rgb_to_oklab(r, g, b);
+        waywal_oklab_t ok = linear_rgb_to_oklab(r_lin[i], g_lin[i], b_lin[i]);
         wu_accum_pixel(hist, ok.l, ok.a, ok.b);
     }
 
@@ -325,15 +355,22 @@ wu_populate_histogram_avx2(wu_hist_t *hist, const uint8_t *pixels, uint32_t widt
 
 __attribute__((target("avx2,fma"))) static void wu_compute_moments_avx2(wu_hist_t *hist)
 {
-    for (int l = 1; l <= WU_BINS; ++l) {
+    int l0 = hist->min_l <= hist->max_l ? hist->min_l : 1;
+    int l1 = hist->min_l <= hist->max_l ? hist->max_l : WU_BINS;
+    int a0 = hist->min_a <= hist->max_a ? hist->min_a : 1;
+    int a1 = hist->min_a <= hist->max_a ? hist->max_a : WU_BINS;
+    int b0 = hist->min_b <= hist->max_b ? hist->min_b : 1;
+    int b1 = hist->min_b <= hist->max_b ? hist->max_b : WU_BINS;
+
+    for (int l = l0; l <= l1; ++l) {
         __m256 area[WU_GRID];
-        for (int b = 0; b < WU_GRID; ++b) {
+        for (int b = b0; b <= b1; ++b) {
             area[b] = _mm256_setzero_ps();
         }
 
-        for (int a = 1; a <= WU_BINS; ++a) {
+        for (int a = a0; a <= a1; ++a) {
             __m256 line = _mm256_setzero_ps();
-            for (int b = 1; b <= WU_BINS; ++b) {
+            for (int b = b0; b <= b1; ++b) {
                 __m256 cur = _mm256_load_ps(&hist->bins[l][a][b].w);
                 line = _mm256_add_ps(line, cur);
                 area[b] = _mm256_add_ps(area[b], line);
@@ -348,12 +385,12 @@ __attribute__((target("avx2,fma"))) static void wu_compute_moments_avx2(wu_hist_
 static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint32_t width,
                                     uint32_t height, uint32_t stride_bytes, bool is_bgra)
 {
-#if defined(__x86_64__) && !defined(WAYWAL_DISABLE_SIMD)
+#if defined(__x86_64__) && !defined(WWAL_DISABLE_SIMD)
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
         return wu_populate_histogram_avx2(hist, pixels, width, height, stride_bytes, is_bgra);
     }
 #endif
-    memset(hist, 0, sizeof(*hist));
+    wu_hist_reset(hist);
 
     uint32_t step_x = width > SUBSAMPLE_DIM ? (width / SUBSAMPLE_DIM) : 1U;
     uint32_t step_y = height > SUBSAMPLE_DIM ? (height / SUBSAMPLE_DIM) : 1U;
@@ -388,24 +425,34 @@ static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint
 
 static void wu_compute_moments(wu_hist_t *hist)
 {
-#if defined(__x86_64__) && !defined(WAYWAL_DISABLE_SIMD)
+    if (hist->num_active <= WU_MAX_BOXES) {
+        return;
+    }
+#if defined(__x86_64__) && !defined(WWAL_DISABLE_SIMD)
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
         wu_compute_moments_avx2(hist);
         return;
     }
 #endif
-    for (int l = 1; l <= WU_BINS; ++l) {
+    int l0 = hist->min_l <= hist->max_l ? hist->min_l : 1;
+    int l1 = hist->min_l <= hist->max_l ? hist->max_l : WU_BINS;
+    int a0 = hist->min_a <= hist->max_a ? hist->min_a : 1;
+    int a1 = hist->min_a <= hist->max_a ? hist->max_a : WU_BINS;
+    int b0 = hist->min_b <= hist->max_b ? hist->min_b : 1;
+    int b1 = hist->min_b <= hist->max_b ? hist->max_b : WU_BINS;
+
+    for (int l = l0; l <= l1; ++l) {
         wu_bin_t area[WU_GRID];
         memset(area, 0, sizeof(area));
 
-        for (int a = 1; a <= WU_BINS; ++a) {
+        for (int a = a0; a <= a1; ++a) {
             float line_w = 0.0f;
             float line_l = 0.0f;
             float line_a = 0.0f;
             float line_b = 0.0f;
             float line_2 = 0.0f;
 
-            for (int b = 1; b <= WU_BINS; ++b) {
+            for (int b = b0; b <= b1; ++b) {
                 wu_bin_t *cur = &hist->bins[l][a][b];
                 const wu_bin_t *prev = &hist->bins[l - 1][a][b];
                 line_w += cur->w;
@@ -433,7 +480,7 @@ static void wu_compute_moments(wu_hist_t *hist)
 static inline wu_bin_t wu_vol_bin(const wu_box_t *box, const wu_hist_t *hist)
 {
     wu_bin_t out;
-#ifdef __AVX2__
+#if defined(__AVX2__) && !defined(WWAL_DISABLE_SIMD)
     __m256 v = _mm256_load_ps(&hist->bins[box->l1][box->a1][box->b1].w);
     v = _mm256_sub_ps(v, _mm256_load_ps(&hist->bins[box->l1][box->a1][box->b0].w));
     v = _mm256_sub_ps(v, _mm256_load_ps(&hist->bins[box->l1][box->a0][box->b1].w));
@@ -481,7 +528,7 @@ static inline wu_bin_t wu_bottom_bin(const wu_box_t *box, int dir, const wu_hist
         p2 = &hist->bins[box->l0][box->a1][box->b0];
         p3 = &hist->bins[box->l0][box->a0][box->b0];
     }
-#ifdef __AVX2__
+#if defined(__AVX2__) && !defined(WWAL_DISABLE_SIMD)
     __m256 v = _mm256_sub_ps(_mm256_load_ps(&p1->w), _mm256_load_ps(&p0->w));
     v = _mm256_add_ps(v, _mm256_load_ps(&p2->w));
     v = _mm256_sub_ps(v, _mm256_load_ps(&p3->w));
@@ -516,7 +563,7 @@ static inline wu_bin_t wu_top_bin(const wu_box_t *box, int dir, int pos, const w
         p2 = &hist->bins[box->l0][box->a1][pos];
         p3 = &hist->bins[box->l0][box->a0][pos];
     }
-#ifdef __AVX2__
+#if defined(__AVX2__) && !defined(WWAL_DISABLE_SIMD)
     __m256 v = _mm256_sub_ps(_mm256_load_ps(&p0->w), _mm256_load_ps(&p1->w));
     v = _mm256_sub_ps(v, _mm256_load_ps(&p2->w));
     v = _mm256_add_ps(v, _mm256_load_ps(&p3->w));
@@ -628,15 +675,36 @@ static bool wu_cut(const wu_hist_t *hist, wu_box_t *set1, wu_box_t *set2)
 
 static size_t wu_partition(const wu_hist_t *hist, weighted_point_t *out_points, size_t max_boxes)
 {
+    if (hist->num_active <= max_boxes) {
+        size_t count = 0;
+        for (uint32_t i = 0; i < hist->num_active && count < max_boxes; ++i) {
+            uint16_t packed = hist->active_bins[i];
+            int bl = ((packed >> 10) & 31) + 1;
+            int ba = ((packed >> 5) & 31) + 1;
+            int bb = (packed & 31) + 1;
+            const wu_bin_t *bin = &hist->bins[bl][ba][bb];
+            if (bin->w <= 0.0f) {
+                continue;
+            }
+            float inv_w = 1.0f / bin->w;
+            out_points[count].l = bin->l * inv_w;
+            out_points[count].a = bin->a * inv_w;
+            out_points[count].b = bin->b * inv_w;
+            out_points[count].weight = bin->w;
+            count++;
+        }
+        return count;
+    }
+
     wu_box_t boxes[WU_MAX_BOXES];
     memset(boxes, 0, sizeof(boxes));
 
-    boxes[0].l0 = 0;
-    boxes[0].l1 = WU_BINS;
-    boxes[0].a0 = 0;
-    boxes[0].a1 = WU_BINS;
-    boxes[0].b0 = 0;
-    boxes[0].b1 = WU_BINS;
+    boxes[0].l0 = (hist->min_l <= hist->max_l) ? (hist->min_l - 1) : 0;
+    boxes[0].l1 = (hist->min_l <= hist->max_l) ? hist->max_l : WU_BINS;
+    boxes[0].a0 = (hist->min_a <= hist->max_a) ? (hist->min_a - 1) : 0;
+    boxes[0].a1 = (hist->min_a <= hist->max_a) ? hist->max_a : WU_BINS;
+    boxes[0].b0 = (hist->min_b <= hist->max_b) ? (hist->min_b - 1) : 0;
+    boxes[0].b1 = (hist->min_b <= hist->max_b) ? hist->max_b : WU_BINS;
     boxes[0].vol_variance = wu_box_variance(hist, &boxes[0]);
 
     size_t num_boxes = 1;

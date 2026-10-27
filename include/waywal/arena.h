@@ -23,7 +23,7 @@ typedef struct {
 } arena_temp_t;
 
 #define WAYWAL_PERSISTENT_ARENA_CAPACITY (16 * 1024 * 1024)
-#define WAYWAL_FRAME_ARENA_CAPACITY      (4 * 1024 * 1024)
+#define WAYWAL_FRAME_ARENA_CAPACITY      (16 * 1024 * 1024)
 
 /* Initialize arena using virtual memory reserve + demand-paging */
 bool arena_init(arena_t *arena, size_t reserve_capacity);

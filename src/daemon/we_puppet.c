@@ -9,6 +9,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
 
 static uint16_t read_u16_le(const uint8_t *p)
 {
@@ -468,14 +471,19 @@ bool we_mat4_inverse(const float m[16], float out_inv[16])
               s[8] * s[1] * s[6] - s[8] * s[2] * s[5];
 
     double det = s[0] * inv[0] + s[1] * inv[4] + s[2] * inv[8] + s[3] * inv[12];
-    if (fabs(det) < 1e-12) {
+    if (!isfinite(det) || fabs(det) < 1e-12) {
         mat4_identity(out_inv);
         return false;
     }
 
     double inv_det = 1.0 / det;
     for (int i = 0; i < 16; i++) {
-        out_inv[i] = (float)(inv[i] * inv_det);
+        float v = (float)(inv[i] * inv_det);
+        if (!isfinite(v)) {
+            mat4_identity(out_inv);
+            return false;
+        }
+        out_inv[i] = v;
     }
     return true;
 }
@@ -1144,6 +1152,17 @@ we_puppet_t *we_puppet_parse_cpu(const uint8_t *data, size_t size)
                         }
                     }
                 }
+
+                for (uint32_t b = 0; b < WE_MDL_MAX_BONES; b++) {
+                    anim->bone_to_track[b] = -1;
+                }
+                for (uint32_t t = 0; t < b_num; t++) {
+                    int32_t bi = anim->tracks[t].bone_index;
+                    if (bi >= 0 && bi < (int32_t)WE_MDL_MAX_BONES && anim->bone_to_track[bi] < 0) {
+                        anim->bone_to_track[bi] = (int16_t)t;
+                    }
+                }
+                anim->bone_lut_valid = true;
             }
         }
     }
@@ -1268,6 +1287,19 @@ void we_puppet_eval_skin_matrices(const we_puppet_t *puppet, const we_puppet_lay
         active_layers = &default_layer;
         active_count = 1u;
     }
+    if (active_count > WE_MDL_MAX_LAYERS) {
+        active_count = WE_MDL_MAX_LAYERS;
+    }
+
+    const we_mdl_anim_t *layer_anims[WE_MDL_MAX_LAYERS];
+    for (uint32_t l = 0; l < active_count; l++) {
+        const we_puppet_layer_t *lay = &active_layers[l];
+        if (!lay->visible || lay->blend <= 0.0f) {
+            layer_anims[l] = NULL;
+        } else {
+            layer_anims[l] = find_puppet_anim(puppet, lay);
+        }
+    }
 
     float anim_local[WE_MDL_MAX_BONES][16];
     float world_mats[WE_MDL_MAX_BONES][16];
@@ -1281,33 +1313,43 @@ void we_puppet_eval_skin_matrices(const we_puppet_t *puppet, const we_puppet_lay
 
         for (uint32_t l = 0; l < active_count; l++) {
             const we_puppet_layer_t *lay = &active_layers[l];
-            if (!lay->visible || lay->blend <= 0.0f) {
-                continue;
-            }
-            const we_mdl_anim_t *anim = find_puppet_anim(puppet, lay);
+            const we_mdl_anim_t *anim = layer_anims[l];
             if (!anim) {
                 continue;
             }
-            for (uint32_t t = 0; t < anim->track_count; t++) {
-                if (anim->tracks[t].bone_index == (int32_t)k && anim->tracks[t].kf_count > 0u) {
-                    float t_pos[3], t_ang[3], t_scl[3];
-                    float rate = isfinite(lay->rate) ? lay->rate : 1.0f;
-                    eval_track_at_time(anim, &anim->tracks[t], time_sec * (double)rate, t_pos,
-                                       t_ang, t_scl);
-                    float w = fminf(fmaxf(lay->blend, 0.0f), 1.0f);
-                    for (int c = 0; c < 3; c++) {
-                        pos[c] = pos[c] + w * (t_pos[c] - pos[c]);
-                        if (w >= 0.9999f) {
-                            angle[c] = t_ang[c];
-                        } else {
-                            float da = remainderf(t_ang[c] - angle[c], 6.28318530717958647692f);
-                            angle[c] = angle[c] + w * da;
-                        }
-                        scale[c] = scale[c] + w * (t_scl[c] - scale[c]);
-                    }
-                    animated = true;
-                    break;
+            const we_mdl_bone_track_t *tr = NULL;
+            if (k < WE_MDL_MAX_BONES) {
+                int16_t tidx = anim->bone_to_track[k];
+                if (tidx >= 0 && (uint32_t)tidx < anim->track_count &&
+                    anim->tracks[tidx].bone_index == (int32_t)k &&
+                    anim->tracks[tidx].kf_count > 0u) {
+                    tr = &anim->tracks[tidx];
                 }
+            }
+            if (!tr && !anim->bone_lut_valid) {
+                for (uint32_t t = 0; t < anim->track_count; t++) {
+                    if (anim->tracks[t].bone_index == (int32_t)k && anim->tracks[t].kf_count > 0u) {
+                        tr = &anim->tracks[t];
+                        break;
+                    }
+                }
+            }
+            if (tr) {
+                float t_pos[3], t_ang[3], t_scl[3];
+                float rate = isfinite(lay->rate) ? lay->rate : 1.0f;
+                eval_track_at_time(anim, tr, time_sec * (double)rate, t_pos, t_ang, t_scl);
+                float w = fminf(fmaxf(lay->blend, 0.0f), 1.0f);
+                for (int c = 0; c < 3; c++) {
+                    pos[c] = pos[c] + w * (t_pos[c] - pos[c]);
+                    if (w >= 0.9999f) {
+                        angle[c] = t_ang[c];
+                    } else {
+                        float da = remainderf(t_ang[c] - angle[c], 6.28318530717958647692f);
+                        angle[c] = angle[c] + w * da;
+                    }
+                    scale[c] = scale[c] + w * (t_scl[c] - scale[c]);
+                }
+                animated = true;
             }
         }
 
@@ -1342,17 +1384,84 @@ void we_puppet_skin_vertices_cpu(const we_puppet_t *puppet, const float (*skin_m
         return;
     }
 
+    if (!skin_mats || puppet->bone_count == 0u) {
+        for (uint32_t i = 0; i < puppet->vertex_count; i++) {
+            const we_mdl_vertex_t *v = &puppet->vertices[i];
+            out_verts[i].pos[0] = v->pos[0];
+            out_verts[i].pos[1] = v->pos[1];
+            out_verts[i].pos[2] = v->pos[2];
+            out_verts[i].uv[0] = v->texcoord[0];
+            out_verts[i].uv[1] = v->texcoord[1];
+        }
+        return;
+    }
+
+    uint32_t bcnt = puppet->bone_count;
     for (uint32_t i = 0; i < puppet->vertex_count; i++) {
         const we_mdl_vertex_t *v = &puppet->vertices[i];
         out_verts[i].uv[0] = v->texcoord[0];
         out_verts[i].uv[1] = v->texcoord[1];
 
-        if (!skin_mats || puppet->bone_count == 0u) {
-            out_verts[i].pos[0] = v->pos[0];
-            out_verts[i].pos[1] = v->pos[1];
-            out_verts[i].pos[2] = v->pos[2];
+#if defined(__AVX2__) && defined(__FMA__)
+        float w0 = v->weight[0];
+        float w1 = v->weight[1];
+        float w2 = v->weight[2];
+        float w3 = v->weight[3];
+        uint32_t b0 = (w0 > 0.0f) ? v->blend_indices[0] : 0u;
+        uint32_t b1 = (w1 > 0.0f) ? v->blend_indices[1] : 0u;
+        uint32_t b2 = (w2 > 0.0f) ? v->blend_indices[2] : 0u;
+        uint32_t b3 = (w3 > 0.0f) ? v->blend_indices[3] : 0u;
+        if (b0 < bcnt && b1 < bcnt && b2 < bcnt && b3 < bcnt) {
+            __m256 acc_01 = _mm256_setzero_ps();
+            __m256 acc_23 = _mm256_setzero_ps();
+            float w_accum = 0.0f;
+
+            if (w0 > 0.0f) {
+                __m256 vw = _mm256_set1_ps(w0);
+                acc_01 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(&skin_mats[b0][0]), acc_01);
+                acc_23 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(&skin_mats[b0][8]), acc_23);
+                w_accum += w0;
+            }
+            if (w1 > 0.0f) {
+                __m256 vw = _mm256_set1_ps(w1);
+                acc_01 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(&skin_mats[b1][0]), acc_01);
+                acc_23 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(&skin_mats[b1][8]), acc_23);
+                w_accum += w1;
+            }
+            if (w2 > 0.0f) {
+                __m256 vw = _mm256_set1_ps(w2);
+                acc_01 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(&skin_mats[b2][0]), acc_01);
+                acc_23 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(&skin_mats[b2][8]), acc_23);
+                w_accum += w2;
+            }
+            if (w3 > 0.0f) {
+                __m256 vw = _mm256_set1_ps(w3);
+                acc_01 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(&skin_mats[b3][0]), acc_01);
+                acc_23 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(&skin_mats[b3][8]), acc_23);
+                w_accum += w3;
+            }
+
+            if (w_accum > 1e-6f) {
+                __m128 col0 = _mm256_castps256_ps128(acc_01);
+                __m128 col1 = _mm256_extractf128_ps(acc_01, 1);
+                __m128 col2 = _mm256_castps256_ps128(acc_23);
+                __m128 col3 = _mm256_extractf128_ps(acc_23, 1);
+                __m128 res = _mm_fmadd_ps(col0, _mm_set1_ps(v->pos[0]), col3);
+                res = _mm_fmadd_ps(col1, _mm_set1_ps(v->pos[1]), res);
+                res = _mm_fmadd_ps(col2, _mm_set1_ps(v->pos[2]), res);
+                float tmp[4];
+                _mm_storeu_ps(tmp, res);
+                out_verts[i].pos[0] = tmp[0];
+                out_verts[i].pos[1] = tmp[1];
+                out_verts[i].pos[2] = tmp[2];
+            } else {
+                out_verts[i].pos[0] = v->pos[0];
+                out_verts[i].pos[1] = v->pos[1];
+                out_verts[i].pos[2] = v->pos[2];
+            }
             continue;
         }
+#endif
 
         float sx = 0.0f, sy = 0.0f, sz = 0.0f;
         float w_accum = 0.0f;
@@ -1364,7 +1473,7 @@ void we_puppet_skin_vertices_cpu(const we_puppet_t *puppet, const float (*skin_m
                 continue;
             }
             uint32_t bidx = v->blend_indices[j];
-            if (bidx < puppet->bone_count) {
+            if (bidx < bcnt) {
                 const float *m = skin_mats[bidx];
                 float tx = m[0] * px + m[4] * py + m[8] * pz + m[12];
                 float ty = m[1] * px + m[5] * py + m[9] * pz + m[13];
@@ -1486,53 +1595,66 @@ void we_puppet_draw_gl(we_puppet_t *puppet, uint32_t gl_prog, double time_sec)
     GLint loc_bones = -1;
     GLenum bone_utype = GL_FLOAT_MAT4;
     if (gl_prog != 0) {
-        loc_bones = glGetUniformLocation((GLuint)gl_prog, "g_Bones");
-        if (loc_bones < 0) {
-            loc_bones = glGetUniformLocation((GLuint)gl_prog, "g_Bones[0]");
-        }
-        if (loc_bones >= 0) {
-            GLint active_uniforms = 0;
-            glGetProgramiv((GLuint)gl_prog, GL_ACTIVE_UNIFORMS, &active_uniforms);
-            for (GLint u = 0; u < active_uniforms; u++) {
-                char uname[64];
-                GLsizei ulen = 0;
-                GLint usize = 0;
-                GLenum utype = 0;
-                glGetActiveUniform((GLuint)gl_prog, (GLuint)u, (GLsizei)sizeof(uname), &ulen,
-                                   &usize, &utype, uname);
-                if (strcmp(uname, "g_Bones") == 0 || strcmp(uname, "g_Bones[0]") == 0) {
-                    bone_utype = utype;
+        if (puppet->cached_gl_prog != gl_prog) {
+            loc_bones = glGetUniformLocation((GLuint)gl_prog, "g_Bones");
+            if (loc_bones < 0) {
+                loc_bones = glGetUniformLocation((GLuint)gl_prog, "g_Bones[0]");
+            }
+            if (loc_bones >= 0) {
+                GLint active_uniforms = 0;
+                glGetProgramiv((GLuint)gl_prog, GL_ACTIVE_UNIFORMS, &active_uniforms);
+                for (GLint u = 0; u < active_uniforms; u++) {
+                    char uname[64];
+                    GLsizei ulen = 0;
+                    GLint usize = 0;
+                    GLenum utype = 0;
+                    glGetActiveUniform((GLuint)gl_prog, (GLuint)u, (GLsizei)sizeof(uname), &ulen,
+                                       &usize, &utype, uname);
+                    if (strcmp(uname, "g_Bones") == 0 || strcmp(uname, "g_Bones[0]") == 0) {
+                        bone_utype = utype;
+                        break;
+                    }
+                }
+            }
+
+            GLint active_attribs = 0;
+            glGetProgramiv((GLuint)gl_prog, GL_ACTIVE_ATTRIBUTES, &active_attribs);
+            GLenum blend_idx_atype = GL_FLOAT_VEC4;
+            for (GLint a = 0; a < active_attribs; a++) {
+                char aname[64];
+                GLsizei alen = 0;
+                GLint asize = 0;
+                GLenum atype = 0;
+                glGetActiveAttrib((GLuint)gl_prog, (GLuint)a, (GLsizei)sizeof(aname), &alen, &asize,
+                                  &atype, aname);
+                if (strcmp(aname, "a_BlendIndices") == 0) {
+                    blend_idx_atype = atype;
                     break;
                 }
             }
-        }
 
-        GLint active_attribs = 0;
-        glGetProgramiv((GLuint)gl_prog, GL_ACTIVE_ATTRIBUTES, &active_attribs);
-        GLenum blend_idx_atype = GL_FLOAT_VEC4;
-        for (GLint a = 0; a < active_attribs; a++) {
-            char aname[64];
-            GLsizei alen = 0;
-            GLint asize = 0;
-            GLenum atype = 0;
-            glGetActiveAttrib((GLuint)gl_prog, (GLuint)a, (GLsizei)sizeof(aname), &alen, &asize,
-                              &atype, aname);
-            if (strcmp(aname, "a_BlendIndices") == 0) {
-                blend_idx_atype = atype;
-                break;
+            puppet->cached_gl_prog = gl_prog;
+            puppet->cached_loc_bones = loc_bones;
+            puppet->cached_bone_utype = bone_utype;
+            puppet->cached_blend_idx_atype = blend_idx_atype;
+
+            glBindBuffer(GL_ARRAY_BUFFER, puppet->gl_vbo_skin);
+            if (blend_idx_atype == GL_UNSIGNED_INT_VEC4 || blend_idx_atype == GL_INT_VEC4 ||
+                blend_idx_atype == GL_UNSIGNED_INT || blend_idx_atype == GL_INT) {
+                GLenum itype = (blend_idx_atype == GL_INT_VEC4 || blend_idx_atype == GL_INT)
+                                   ? GL_INT
+                                   : GL_UNSIGNED_INT;
+                glVertexAttribIPointer(
+                    5, 4, itype, sizeof(we_gpu_skin_attrib_t),
+                    (const void *)offsetof(we_gpu_skin_attrib_t, blend_indices_u));
+            } else {
+                glVertexAttribPointer(
+                    5, 4, GL_FLOAT, GL_FALSE, sizeof(we_gpu_skin_attrib_t),
+                    (const void *)offsetof(we_gpu_skin_attrib_t, blend_indices_f));
             }
-        }
-        glBindBuffer(GL_ARRAY_BUFFER, puppet->gl_vbo_skin);
-        if (blend_idx_atype == GL_UNSIGNED_INT_VEC4 || blend_idx_atype == GL_INT_VEC4 ||
-            blend_idx_atype == GL_UNSIGNED_INT || blend_idx_atype == GL_INT) {
-            GLenum itype = (blend_idx_atype == GL_INT_VEC4 || blend_idx_atype == GL_INT)
-                               ? GL_INT
-                               : GL_UNSIGNED_INT;
-            glVertexAttribIPointer(5, 4, itype, sizeof(we_gpu_skin_attrib_t),
-                                   (const void *)offsetof(we_gpu_skin_attrib_t, blend_indices_u));
         } else {
-            glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, sizeof(we_gpu_skin_attrib_t),
-                                  (const void *)offsetof(we_gpu_skin_attrib_t, blend_indices_f));
+            loc_bones = puppet->cached_loc_bones;
+            bone_utype = puppet->cached_bone_utype;
         }
     }
 

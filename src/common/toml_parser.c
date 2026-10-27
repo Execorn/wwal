@@ -83,7 +83,7 @@ static uint32_t parse_transition_type_str(const char *s)
         return 2U;
     if (strcasecmp(s, "wipe") == 0)
         return 3U;
-    if (strcasecmp(s, "grow") == 0)
+    if (strcasecmp(s, "grow") == 0 || strcasecmp(s, "center") == 0)
         return 4U;
     if (strcasecmp(s, "outer") == 0)
         return 5U;
@@ -93,7 +93,8 @@ static uint32_t parse_transition_type_str(const char *s)
         return 7U;
     if (strcasecmp(s, "crosszoom") == 0)
         return 8U;
-    if (strcasecmp(s, "slide") == 0)
+    if (strcasecmp(s, "slide") == 0 || strcasecmp(s, "left") == 0 || strcasecmp(s, "right") == 0 ||
+        strcasecmp(s, "top") == 0 || strcasecmp(s, "bottom") == 0)
         return 9U;
     if (strcasecmp(s, "glitch") == 0)
         return 10U;
@@ -892,6 +893,18 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                     return false;
                 }
                 out_cfg->transition.type_enum = parse_transition_type_str(out_cfg->transition.type);
+                if (strcasecmp(out_cfg->transition.type, "left") == 0) {
+                    out_cfg->transition.angle = 180.0f;
+                } else if (strcasecmp(out_cfg->transition.type, "right") == 0) {
+                    out_cfg->transition.angle = 0.0f;
+                } else if (strcasecmp(out_cfg->transition.type, "top") == 0) {
+                    out_cfg->transition.angle = 90.0f;
+                } else if (strcasecmp(out_cfg->transition.type, "bottom") == 0) {
+                    out_cfg->transition.angle = 270.0f;
+                } else if (strcasecmp(out_cfg->transition.type, "center") == 0) {
+                    out_cfg->transition.pos_x = 0.5f;
+                    out_cfg->transition.pos_y = 0.5f;
+                }
             } else if (strcmp(key, "duration") == 0) {
                 if (!parse_float_val(&lex, &out_cfg->transition.duration))
                     return false;

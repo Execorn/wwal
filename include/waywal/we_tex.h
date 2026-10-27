@@ -94,7 +94,12 @@ typedef struct we_tex {
     size_t mp4_size;
     demuxer_t *demuxer;
     double video_pts_sec;
+    double video_next_pts_sec;
+    bool video_has_first_frame;
     void *video_swdec;
+
+    /* Per-frame advance guard to prevent multi-pass speedups */
+    uint64_t last_advance_frame;
 
     /* OpenGL ES 3.1 texture handle (0 if not uploaded) */
     uint32_t gl_tex;

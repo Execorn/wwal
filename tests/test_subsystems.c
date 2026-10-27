@@ -4,10 +4,11 @@
 #endif
 
 #include "cli_parser.h"
-#include "image_loader.h"
+#include "gpu_compute.h"
 #include "wayland_core.h"
 #include "waywal/anim_engine.h"
 #include "waywal/audio_fft.h"
+#include "waywal/image_loader.h"
 #include "waywal/ipc_proto.h"
 #include "waywal/log.h"
 #include "waywal/palette_hct.h"

@@ -69,6 +69,7 @@ bool waywal_shader_engine_get_custom_uniform(const waywal_shader_engine_t *eng, 
 void waywal_shader_engine_copy_custom_uniforms(waywal_shader_engine_t *dst,
                                                const waywal_shader_engine_t *src);
 void waywal_shader_engine_forget_bo(waywal_shader_engine_t *eng, const dmabuf_bo_t *bo);
+void waywal_shader_engine_release_scratch(waywal_shader_engine_t *eng);
 int waywal_shader_engine_get_channel_target(const waywal_shader_engine_t *eng, int pass_idx,
                                             int chan_idx);
 

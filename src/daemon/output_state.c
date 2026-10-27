@@ -3,6 +3,7 @@
 
 #include "fractional-scale-v1-client-protocol.h"
 #include "waywal/log.h"
+#include "waywal/shader_engine.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,14 +130,26 @@ void output_manager_destroy(output_manager_t *om)
             cur->fract_scale = NULL;
         }
 
-        if (cur->use_dmabuf && om->dmabuf_ctx) {
+        if (cur->use_dmabuf) {
+            if (cur->shader_eng) {
+                for (int i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+                    waywal_shader_engine_forget_bo((waywal_shader_engine_t *)cur->shader_eng,
+                                                   &cur->dmabuf_ring.buffers[i]);
+                }
+            }
             dmabuf_ring_destroy(om->dmabuf_ctx, &cur->dmabuf_ring);
+            cur->use_dmabuf = false;
         }
 
         presentation_sync_destroy(&cur->pres_sync);
 
         if (cur->output) {
-            wl_output_destroy(cur->output);
+            if (wl_output_get_version(cur->output) >= WL_OUTPUT_RELEASE_SINCE_VERSION) {
+                wl_output_release(cur->output);
+            } else {
+                wl_output_destroy(cur->output);
+            }
+            cur->output = NULL;
         }
 
         free(cur);
@@ -206,14 +219,26 @@ void output_manager_remove(output_manager_t *om, uint32_t name)
                 entry->fract_scale = NULL;
             }
 
-            if (entry->use_dmabuf && om->dmabuf_ctx) {
+            if (entry->use_dmabuf) {
+                if (entry->shader_eng) {
+                    for (int i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+                        waywal_shader_engine_forget_bo((waywal_shader_engine_t *)entry->shader_eng,
+                                                       &entry->dmabuf_ring.buffers[i]);
+                    }
+                }
                 dmabuf_ring_destroy(om->dmabuf_ctx, &entry->dmabuf_ring);
+                entry->use_dmabuf = false;
             }
 
             presentation_sync_destroy(&entry->pres_sync);
 
             if (entry->output) {
-                wl_output_destroy(entry->output);
+                if (wl_output_get_version(entry->output) >= WL_OUTPUT_RELEASE_SINCE_VERSION) {
+                    wl_output_release(entry->output);
+                } else {
+                    wl_output_destroy(entry->output);
+                }
+                entry->output = NULL;
             }
 
             free(entry);

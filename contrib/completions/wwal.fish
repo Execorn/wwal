@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 complete -c wwal -f
+complete -c swww -w wwal
+complete -c awww -w wwal
 
-set -l trans_types "none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random"
+set -l trans_types "none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random left right top bottom center any"
 set -l trans_pos "center top bottom left right top-left top-right bottom-left bottom-right cursor mouse"
 set -l sync_modes "simultaneous staggered"
 set -l scaling_modes "fill fit stretch center tile span crop cover contain no"
@@ -15,6 +17,7 @@ complete -c wwal -s n -l namespace -d "Socket and layer-shell namespace" -r
 complete -c wwal -l layer -a "$layers" -d "Wayland layer-shell layer" -r
 complete -c wwal -l battery-policy -a "$battery_policies" -d "Laptop battery power governor policy" -r
 complete -c wwal -s v -l verbose -d "Enable verbose output"
+complete -c wwal -s V -l version -d "Print version information"
 complete -c wwal -s h -l help -d "Display help message"
 
 complete -c wwal -n "__fish_use_subcommand" -a img -d "Decode and set wallpaper with GPU/SIMD transitions"
@@ -37,8 +40,10 @@ complete -c wwal -n "__fish_use_subcommand" -a query -d "List connected Wayland 
 complete -c wwal -n "__fish_use_subcommand" -a stats -d "Report real-time RSS/PSS, DMA-BUF, VBlank PLL, and pause_mask telemetry"
 complete -c wwal -n "__fish_use_subcommand" -a restore -d "Restore last persisted per-output state"
 complete -c wwal -n "__fish_use_subcommand" -a clear-cache -d "Remove cached hardware transcodes and palette files"
+complete -c wwal -n "__fish_use_subcommand" -a init -d "Launch or initialize wallpaper daemon (swww/awww alias)"
 complete -c wwal -n "__fish_use_subcommand" -a ping -d "Check if wwald daemon is running and responsive"
 complete -c wwal -n "__fish_use_subcommand" -a kill -d "Gracefully terminate the running wwald daemon"
+complete -c wwal -n "__fish_use_subcommand" -a version -d "Print version information"
 complete -c wwal -n "__fish_use_subcommand" -a help -d "Display help message"
 
 for subcmd in img slideshow

@@ -823,9 +823,9 @@ static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux
     } else if (demux->codec == WAYWAL_CODEC_VP9 || demux->codec == WAYWAL_CODEC_AV1) {
         max_refs = 8;
     }
-    uint32_t needed_surfaces = max_refs + 3;
-    if (needed_surfaces < 4)
-        needed_surfaces = 4;
+    uint32_t needed_surfaces = max_refs + 6;
+    if (needed_surfaces < 8)
+        needed_surfaces = 8;
     if (needed_surfaces > WAYWAL_VA_SURFACE_POOL_SIZE)
         needed_surfaces = WAYWAL_VA_SURFACE_POOL_SIZE;
 
@@ -1256,6 +1256,9 @@ void video_engine_dispatch_frame(video_engine_t *ve)
             break;
         }
 
+        if (decoded_surface == VA_INVALID_SURFACE) {
+            continue;
+        }
         if (ve->decoder.last_decoded_is_idr && ve->has_decoded_any) {
             ve->current_gop_id++;
         }
@@ -1571,7 +1574,9 @@ bool video_engine_snapshot_output(video_engine_t *ve, output_node_t *out)
             bool ok = false;
             if (prime_frame.num_planes >= 1 && prime_frame.num_planes <= WAYWAL_MAX_BUFFER_PLANES &&
                 (prime_frame.drm_format == DRM_FORMAT_XRGB8888 ||
-                 prime_frame.drm_format == DRM_FORMAT_ARGB8888)) {
+                 prime_frame.drm_format == DRM_FORMAT_ARGB8888 ||
+                 prime_frame.drm_format == DRM_FORMAT_NV12 ||
+                 prime_frame.drm_format == DRM_FORMAT_P010)) {
                 dmabuf_bo_t tmp_bo;
                 memset(&tmp_bo, 0, sizeof(tmp_bo));
                 for (int p = 0; p < WAYWAL_MAX_BUFFER_PLANES; ++p)

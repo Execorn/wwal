@@ -5,9 +5,11 @@ Runtime transition and idle resource benchmark for WayWal (wwald / wwal).
 Measures binary sizes, idle RSS and CPU usage, and per-transition daemon CPU/GPU load.
 """
 
+import glob
 import os
-import time
+import shutil
 import subprocess
+import time
 import psutil
 
 WAYWAL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -18,24 +20,51 @@ DEFAULT_IMG = f"{WAYWAL_DIR}/tests/test_pattern.png"
 IMG1 = os.environ.get("WWAL_BENCH_IMG1", DEFAULT_IMG)
 IMG2 = os.environ.get("WWAL_BENCH_IMG2", DEFAULT_IMG)
 
-SYSFS_GPU_BUSY = "/sys/class/drm/card1/device/gpu_busy_percent"
-SYSFS_VRAM_USED = "/sys/class/drm/card1/device/mem_info_vram_used"
+_GPU_BUSY_PATHS = sorted(glob.glob("/sys/class/drm/card*/device/gpu_busy_percent"))
+_VRAM_USED_PATHS = sorted(glob.glob("/sys/class/drm/card*/device/mem_info_vram_used"))
+_HAS_NVIDIA_SMI = shutil.which("nvidia-smi") is not None
 
 
-def get_gpu_busy():
-    try:
-        with open(SYSFS_GPU_BUSY, "r", encoding="utf-8") as f:
-            return int(f.read().strip())
-    except Exception:
-        return 0
+def get_gpu_busy() -> int:
+    for path in _GPU_BUSY_PATHS:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return int(f.read().strip())
+        except Exception:
+            continue
+    if _HAS_NVIDIA_SMI:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=0.5,
+            )
+            return int(out.strip().splitlines()[0])
+        except Exception:
+            pass
+    return 0
 
 
-def get_vram_mb():
-    try:
-        with open(SYSFS_VRAM_USED, "r", encoding="utf-8") as f:
-            return int(f.read().strip()) / (1024 * 1024)
-    except Exception:
-        return 0.0
+def get_vram_mb() -> float:
+    for path in _VRAM_USED_PATHS:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return int(f.read().strip()) / (1024 * 1024)
+        except Exception:
+            continue
+    if _HAS_NVIDIA_SMI:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=0.5,
+            )
+            return float(out.strip().splitlines()[0])
+        except Exception:
+            pass
+    return 0.0
 
 
 def get_proc_stats(proc):

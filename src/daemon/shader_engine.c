@@ -4,51 +4,9 @@
 #endif
 #include "waywal/shader_engine.h"
 
-#include "image_loader.h"
-#include "waywal/log.h"
-
-#if __has_include("linux-dmabuf-v1-client-protocol.h")
 #include "waywal/dmabuf.h"
-#else
-#include <drm_fourcc.h>
-#include <gbm.h>
-#include <sys/types.h>
-#define WAYWAL_MAX_BUFFER_PLANES 4
-struct dmabuf_bo {
-    int fd[WAYWAL_MAX_BUFFER_PLANES];
-    uint32_t stride[WAYWAL_MAX_BUFFER_PLANES];
-    uint32_t offset[WAYWAL_MAX_BUFFER_PLANES];
-    uint64_t modifier;
-    uint32_t num_planes;
-    uint32_t width;
-    uint32_t height;
-    uint32_t drm_format;
-    struct gbm_bo *gbm_bo;
-    struct wl_buffer *wl_buffer;
-    void *egl_image;
-    void *map_data;
-    uint32_t gl_tex;
-    bool is_10bit;
-    bool in_use;
-};
-struct dmabuf_context {
-    int drm_fd;
-    struct gbm_device *gbm;
-    void *dmabuf_proto;
-    void *default_feedback;
-    uint64_t preferred_modifier;
-    uint32_t preferred_format;
-    bool has_10bit;
-    uint32_t format_10bit;
-    uint64_t modifier_10bit;
-    bool has_nv12;
-    bool has_p010;
-    dev_t compositor_dev;
-    bool has_compositor_dev;
-    bool available;
-    bool map_supported;
-};
-#endif
+#include "waywal/image_loader.h"
+#include "waywal/log.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -159,6 +117,14 @@ typedef struct {
     float cached_depth_strength;
     float cached_workspace_offset[2];
     float cached_span_rect[4];
+    float cached_mouse[4];
+    float cached_mouse_smooth[4];
+    float cached_mouse_vel[2];
+    float cached_palette_primary[3];
+    float cached_palette_secondary[3];
+    float cached_palette_tertiary[3];
+    float cached_media_playing;
+    float cached_chan_res[12];
     bool needs_mipmap;
 } shader_pass_t;
 
@@ -191,6 +157,7 @@ struct waywal_shader_engine {
     GLuint read_fbo;
     GLuint draw_fbo;
     GLuint prog_blit;
+    GLint loc_blit_swap_rb;
     GLuint blit_vao;
     GLuint last_complete_bo_tex;
 
@@ -213,7 +180,11 @@ struct waywal_shader_engine {
     PFNEGLCLIENTWAITSYNCKHRPROC eglClientWaitSyncKHR;
 
     struct {
-        dmabuf_bo_t *bo;
+        const dmabuf_bo_t *bo;
+        int fd0;
+        uint32_t width;
+        uint32_t height;
+        uint32_t drm_format;
         GLuint gl_tex;
         EGLImageKHR egl_image;
         bool owns_egl;
@@ -989,6 +960,7 @@ static void cache_uniform_locations(GLuint prog, shader_uniforms_t *u)
 static EGLDisplay s_shared_dpy = EGL_NO_DISPLAY;
 static EGLContext s_shared_ctx = EGL_NO_CONTEXT;
 static uint32_t s_shared_egl_refcount = 0;
+static bool s_shared_dpy_borrowed = false;
 
 static void make_context_current(waywal_shader_engine_t *eng)
 {
@@ -1109,24 +1081,21 @@ waywal_shader_engine_t *waywal_shader_engine_create(dmabuf_context_t *dmabuf_ctx
     eng->inotify_fd = -1;
     eng->watch_file_wd = -1;
     eng->watch_dir_wd = -1;
+    eng->loc_blit_swap_rb = -1;
     eng->depth_strength = 1.0f;
-    eng->display = eglGetCurrentDisplay();
-    eng->context = eglGetCurrentContext();
 
-    if (eng->display != EGL_NO_DISPLAY && eng->context != EGL_NO_CONTEXT) {
-        if (s_shared_egl_refcount > 0 && eng->display == s_shared_dpy &&
-            eng->context == s_shared_ctx) {
-            eng->owns_egl = true;
-            s_shared_egl_refcount++;
-        }
-    } else if (s_shared_egl_refcount > 0 && s_shared_dpy != EGL_NO_DISPLAY &&
-               s_shared_ctx != EGL_NO_CONTEXT) {
-        if (eglMakeCurrent(s_shared_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, s_shared_ctx)) {
+    if (s_shared_egl_refcount > 0 && s_shared_dpy != EGL_NO_DISPLAY &&
+        s_shared_ctx != EGL_NO_CONTEXT) {
+        if (eglGetCurrentContext() == s_shared_ctx ||
+            eglMakeCurrent(s_shared_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, s_shared_ctx)) {
             eng->display = s_shared_dpy;
             eng->context = s_shared_ctx;
             eng->owns_egl = true;
             s_shared_egl_refcount++;
         }
+    } else if (!dmabuf_ctx) {
+        eng->display = eglGetCurrentDisplay();
+        eng->context = eglGetCurrentContext();
     }
 
     if (eng->display == EGL_NO_DISPLAY || eng->context == EGL_NO_CONTEXT) {
@@ -1154,7 +1123,6 @@ waywal_shader_engine_t *waywal_shader_engine_create(dmabuf_context_t *dmabuf_ctx
 
         EGLint major = 0, minor = 0;
         if (!eglInitialize(dpy, &major, &minor) || !eglBindAPI(EGL_OPENGL_ES_API)) {
-            eglTerminate(dpy);
             free(eng);
             return NULL;
         }
@@ -1167,7 +1135,6 @@ waywal_shader_engine_t *waywal_shader_engine_create(dmabuf_context_t *dmabuf_ctx
             if (ctx != EGL_NO_CONTEXT) {
                 eglDestroyContext(dpy, ctx);
             }
-            eglTerminate(dpy);
             free(eng);
             return NULL;
         }
@@ -1178,6 +1145,7 @@ waywal_shader_engine_t *waywal_shader_engine_create(dmabuf_context_t *dmabuf_ctx
         s_shared_dpy = dpy;
         s_shared_ctx = ctx;
         s_shared_egl_refcount = 1;
+        s_shared_dpy_borrowed = true;
     }
 
     eng->eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
@@ -1264,15 +1232,9 @@ void waywal_shader_engine_forget_bo(waywal_shader_engine_t *eng, const dmabuf_bo
                 make_context_current(eng);
                 if (eng->imported_bos[i].gl_tex) {
                     glDeleteTextures(1, &eng->imported_bos[i].gl_tex);
-                    if (eng->imported_bos[i].bo->gl_tex == eng->imported_bos[i].gl_tex) {
-                        eng->imported_bos[i].bo->gl_tex = 0;
-                    }
                 }
                 if (eng->imported_bos[i].egl_image && eng->eglDestroyImageKHR) {
                     eng->eglDestroyImageKHR(eng->display, eng->imported_bos[i].egl_image);
-                    if (eng->imported_bos[i].bo->egl_image == eng->imported_bos[i].egl_image) {
-                        eng->imported_bos[i].bo->egl_image = NULL;
-                    }
                 }
             }
         } else {
@@ -1283,6 +1245,42 @@ void waywal_shader_engine_forget_bo(waywal_shader_engine_t *eng, const dmabuf_bo
         }
     }
     eng->num_imported_bos = dst;
+}
+
+void waywal_shader_engine_release_scratch(waywal_shader_engine_t *eng)
+{
+    if (!eng || eng->display == EGL_NO_DISPLAY || eng->context == EGL_NO_CONTEXT) {
+        return;
+    }
+    make_context_current(eng);
+    if (eng->draw_fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    }
+    if (eng->read_fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, eng->read_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    eng->last_complete_bo_tex = 0;
+    for (int i = 0; i < 4; ++i) {
+        shader_pass_t *pass = &eng->passes[i];
+        for (int j = 0; j < 2; ++j) {
+            if (pass->ping_pong_tex[j]) {
+                glDeleteTextures(1, &pass->ping_pong_tex[j]);
+                pass->ping_pong_tex[j] = 0;
+            }
+        }
+        pass->tex_w = 0;
+        pass->tex_h = 0;
+        pass->read_idx = 0;
+    }
+    if (eng->scratch_tex) {
+        glDeleteTextures(1, &eng->scratch_tex);
+        eng->scratch_tex = 0;
+        eng->scratch_w = 0;
+        eng->scratch_h = 0;
+    }
 }
 
 void waywal_shader_engine_destroy(waywal_shader_engine_t *eng)
@@ -1319,17 +1317,9 @@ void waywal_shader_engine_destroy(waywal_shader_engine_t *eng)
             }
             if (eng->imported_bos[i].gl_tex) {
                 glDeleteTextures(1, &eng->imported_bos[i].gl_tex);
-                if (eng->imported_bos[i].bo &&
-                    eng->imported_bos[i].bo->gl_tex == eng->imported_bos[i].gl_tex) {
-                    eng->imported_bos[i].bo->gl_tex = 0;
-                }
             }
             if (eng->imported_bos[i].egl_image && eng->eglDestroyImageKHR) {
                 eng->eglDestroyImageKHR(eng->display, eng->imported_bos[i].egl_image);
-                if (eng->imported_bos[i].bo &&
-                    eng->imported_bos[i].bo->egl_image == eng->imported_bos[i].egl_image) {
-                    eng->imported_bos[i].bo->egl_image = NULL;
-                }
             }
         }
     }
@@ -1353,9 +1343,12 @@ void waywal_shader_engine_destroy(waywal_shader_engine_t *eng)
         if (s_shared_egl_refcount == 0) {
             eglMakeCurrent(eng->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             eglDestroyContext(eng->display, eng->context);
-            eglTerminate(eng->display);
+            if (!s_shared_dpy_borrowed) {
+                eglTerminate(eng->display);
+            }
             s_shared_dpy = EGL_NO_DISPLAY;
             s_shared_ctx = EGL_NO_CONTEXT;
+            s_shared_dpy_borrowed = false;
         }
     }
     if (eng->inotify_fd >= 0) {
@@ -2035,7 +2028,7 @@ bool waywal_shader_engine_poll_hot_reload(waywal_shader_engine_t *eng)
     return ok;
 }
 
-static void record_imported_bo(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLuint tex,
+static void record_imported_bo(waywal_shader_engine_t *eng, const dmabuf_bo_t *bo, GLuint tex,
                                EGLImageKHR img, bool owns_egl)
 {
     if (!eng || !bo) {
@@ -2047,6 +2040,10 @@ static void record_imported_bo(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLu
                 if (owns_egl) {
                     eng->imported_bos[i].owns_egl = true;
                 }
+                eng->imported_bos[i].fd0 = bo->fd[0];
+                eng->imported_bos[i].width = bo->width;
+                eng->imported_bos[i].height = bo->height;
+                eng->imported_bos[i].drm_format = bo->drm_format;
                 return;
             }
             if (eng->last_complete_bo_tex == eng->imported_bos[i].gl_tex &&
@@ -2062,6 +2059,10 @@ static void record_imported_bo(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLu
                     eng->eglDestroyImageKHR(eng->display, eng->imported_bos[i].egl_image);
                 }
             }
+            eng->imported_bos[i].fd0 = bo->fd[0];
+            eng->imported_bos[i].width = bo->width;
+            eng->imported_bos[i].height = bo->height;
+            eng->imported_bos[i].drm_format = bo->drm_format;
             eng->imported_bos[i].gl_tex = tex;
             eng->imported_bos[i].egl_image = img;
             eng->imported_bos[i].owns_egl = owns_egl;
@@ -2075,17 +2076,9 @@ static void record_imported_bo(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLu
         if (eng->imported_bos[0].owns_egl) {
             if (eng->imported_bos[0].gl_tex) {
                 glDeleteTextures(1, &eng->imported_bos[0].gl_tex);
-                if (eng->imported_bos[0].bo &&
-                    eng->imported_bos[0].bo->gl_tex == eng->imported_bos[0].gl_tex) {
-                    eng->imported_bos[0].bo->gl_tex = 0;
-                }
             }
             if (eng->imported_bos[0].egl_image && eng->eglDestroyImageKHR) {
                 eng->eglDestroyImageKHR(eng->display, eng->imported_bos[0].egl_image);
-                if (eng->imported_bos[0].bo &&
-                    eng->imported_bos[0].bo->egl_image == eng->imported_bos[0].egl_image) {
-                    eng->imported_bos[0].bo->egl_image = NULL;
-                }
             }
         }
         memmove(&eng->imported_bos[0], &eng->imported_bos[1], 31u * sizeof(eng->imported_bos[0]));
@@ -2093,19 +2086,34 @@ static void record_imported_bo(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLu
     }
     size_t slot = eng->num_imported_bos++;
     eng->imported_bos[slot].bo = bo;
+    eng->imported_bos[slot].fd0 = bo->fd[0];
+    eng->imported_bos[slot].width = bo->width;
+    eng->imported_bos[slot].height = bo->height;
+    eng->imported_bos[slot].drm_format = bo->drm_format;
     eng->imported_bos[slot].gl_tex = tex;
     eng->imported_bos[slot].egl_image = img;
     eng->imported_bos[slot].owns_egl = owns_egl;
 }
 
-static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo)
+static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLuint *out_tex)
 {
-    if (!eng || !bo) {
+    if (!eng || !bo || !out_tex) {
         return false;
     }
-    if (bo->egl_image && bo->gl_tex != 0) {
-        record_imported_bo(eng, bo, bo->gl_tex, (EGLImageKHR)bo->egl_image, false);
-        return true;
+    for (size_t i = 0; i < eng->num_imported_bos; ++i) {
+        if (eng->imported_bos[i].bo == bo && eng->imported_bos[i].fd0 == bo->fd[0] &&
+            eng->imported_bos[i].width == bo->width && eng->imported_bos[i].height == bo->height &&
+            eng->imported_bos[i].drm_format == bo->drm_format && eng->imported_bos[i].gl_tex != 0) {
+            *out_tex = eng->imported_bos[i].gl_tex;
+            return true;
+        }
+    }
+    if (bo->fd[0] < 0) {
+        if (bo->gl_tex != 0) {
+            *out_tex = bo->gl_tex;
+            return true;
+        }
+        return false;
     }
     if (!eng->eglCreateImageKHR || !eng->glEGLImageTargetTexture2DOES) {
         return false;
@@ -2194,11 +2202,10 @@ static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    bo->egl_image = img;
-    bo->gl_tex = tex;
     if (eng->display != EGL_NO_DISPLAY) {
         record_imported_bo(eng, bo, tex, img, true);
     }
+    *out_tex = tex;
     return true;
 }
 
@@ -2214,7 +2221,7 @@ static void ensure_pass_ping_pong_textures(waywal_shader_engine_t *eng, shader_p
     }
     const uint16_t *zero_half = shared_zero_half ? *shared_zero_half : NULL;
     GLsizei levels = 1;
-    if (pass->needs_mipmap && !pass->is_compute) {
+    if (pass->needs_mipmap) {
         uint32_t max_dim = w > h ? w : h;
         while (max_dim > 1u) {
             max_dim >>= 1u;
@@ -2358,7 +2365,8 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
     }
 
     make_context_current(eng);
-    if (!ensure_bo_imported(eng, target_bo)) {
+    GLuint target_tex = 0;
+    if (!ensure_bo_imported(eng, target_bo, &target_tex)) {
         return false;
     }
 
@@ -2522,8 +2530,10 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             else if (pass_mouse_smooth[3] < 0.0f)
                 pass_mouse_smooth[3] += span_vec[1];
         }
-        if (u->iMouse >= 0) {
+        if (u->iMouse >= 0 &&
+            (init_u || memcmp(pass->cached_mouse, pass_mouse, sizeof(pass_mouse)) != 0)) {
             glUniform4fv(u->iMouse, 1, pass_mouse);
+            memcpy(pass->cached_mouse, pass_mouse, sizeof(pass_mouse));
         }
         if (u->iDate >= 0) {
             glUniform4fv(u->iDate, 1, date_vals);
@@ -2531,20 +2541,37 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         if (u->iSampleRate >= 0 && init_u) {
             glUniform1f(u->iSampleRate, 48000.0f);
         }
-        if (u->u_palette_primary >= 0) {
+        if (u->u_palette_primary >= 0 &&
+            (init_u || memcmp(pass->cached_palette_primary, params->palette_primary,
+                              sizeof(pass->cached_palette_primary)) != 0)) {
             glUniform3fv(u->u_palette_primary, 1, params->palette_primary);
+            memcpy(pass->cached_palette_primary, params->palette_primary,
+                   sizeof(pass->cached_palette_primary));
         }
-        if (u->u_palette_secondary >= 0) {
+        if (u->u_palette_secondary >= 0 &&
+            (init_u || memcmp(pass->cached_palette_secondary, params->palette_secondary,
+                              sizeof(pass->cached_palette_secondary)) != 0)) {
             glUniform3fv(u->u_palette_secondary, 1, params->palette_secondary);
+            memcpy(pass->cached_palette_secondary, params->palette_secondary,
+                   sizeof(pass->cached_palette_secondary));
         }
-        if (u->u_palette_tertiary >= 0) {
+        if (u->u_palette_tertiary >= 0 &&
+            (init_u || memcmp(pass->cached_palette_tertiary, params->palette_tertiary,
+                              sizeof(pass->cached_palette_tertiary)) != 0)) {
             glUniform3fv(u->u_palette_tertiary, 1, params->palette_tertiary);
+            memcpy(pass->cached_palette_tertiary, params->palette_tertiary,
+                   sizeof(pass->cached_palette_tertiary));
         }
-        if (u->u_mouse_smooth >= 0) {
+        if (u->u_mouse_smooth >= 0 &&
+            (init_u || memcmp(pass->cached_mouse_smooth, pass_mouse_smooth,
+                              sizeof(pass_mouse_smooth)) != 0)) {
             glUniform4fv(u->u_mouse_smooth, 1, pass_mouse_smooth);
+            memcpy(pass->cached_mouse_smooth, pass_mouse_smooth, sizeof(pass_mouse_smooth));
         }
-        if (u->u_mouse_vel >= 0) {
+        if (u->u_mouse_vel >= 0 && (init_u || memcmp(pass->cached_mouse_vel, params->mouse_vel,
+                                                     sizeof(pass->cached_mouse_vel)) != 0)) {
             glUniform2fv(u->u_mouse_vel, 1, params->mouse_vel);
+            memcpy(pass->cached_mouse_vel, params->mouse_vel, sizeof(pass->cached_mouse_vel));
         }
         if (u->u_workspace_offset >= 0 &&
             (init_u || pass->cached_workspace_offset[0] != params->workspace_offset[0] ||
@@ -2561,7 +2588,10 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         if (u->u_media_playing >= 0) {
             float mplay =
                 (params->media_playing > 0.0f) ? params->media_playing : eng->media_playing;
-            glUniform1f(u->u_media_playing, mplay);
+            if (init_u || pass->cached_media_playing != mplay) {
+                glUniform1f(u->u_media_playing, mplay);
+                pass->cached_media_playing = mplay;
+            }
         }
         if (u->u_album_art >= 0) {
             GLuint atex = eng->album_art_tex
@@ -2670,8 +2700,10 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                 glUniform1i(u->iChannel[c], c);
             }
         }
-        if (u->iChannelResolution >= 0) {
+        if (u->iChannelResolution >= 0 &&
+            (init_u || memcmp(pass->cached_chan_res, chan_res, sizeof(chan_res)) != 0)) {
             glUniform3fv(u->iChannelResolution, 4, chan_res);
+            memcpy(pass->cached_chan_res, chan_res, sizeof(chan_res));
         }
         if (u->iChannelTime >= 0) {
             glUniform1fv(u->iChannelTime, 4, chan_time);
@@ -2693,6 +2725,10 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                                    GL_RGBA16F);
                 glDispatchCompute(groups_x, groups_y, 1u);
                 glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+                if (pass->needs_mipmap) {
+                    glBindTexture(GL_TEXTURE_2D, pass->ping_pong_tex[write_idx]);
+                    glGenerateMipmap(GL_TEXTURE_2D);
+                }
             } else {
                 glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
@@ -2709,8 +2745,8 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             }
             pass->read_idx = write_idx;
         } else if (pass->is_compute) {
-            GLuint dst_tex = use_scratch_blit ? eng->scratch_tex : target_bo->gl_tex;
-            int swap_rb = use_scratch_blit ? 0 : 1;
+            GLuint dst_tex = use_scratch_blit ? eng->scratch_tex : target_tex;
+            int swap_rb = 1;
             if (u->u_swap_rb >= 0 && (init_u || pass->cached_swap_rb != swap_rb)) {
                 glUniform1i(u->u_swap_rb, swap_rb);
                 pass->cached_swap_rb = swap_rb;
@@ -2728,13 +2764,13 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
             if (!use_scratch_blit) {
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                                       target_bo->gl_tex, 0);
-                if (eng->last_complete_bo_tex != target_bo->gl_tex) {
+                                       target_tex, 0);
+                if (eng->last_complete_bo_tex != target_tex) {
                     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
                         use_scratch_blit = true;
                         ensure_scratch_texture(eng, target_bo->width, target_bo->height);
                     } else {
-                        eng->last_complete_bo_tex = target_bo->gl_tex;
+                        eng->last_complete_bo_tex = target_tex;
                     }
                 }
             }
@@ -2773,9 +2809,11 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                                         "precision highp float;\n"
                                         "in highp vec2 v_uv;\n"
                                         "layout(binding = 0) uniform highp sampler2D u_tex;\n"
+                                        "uniform int u_swap_rb;\n"
                                         "out highp vec4 frag_color;\n"
                                         "void main() {\n"
-                                        "    frag_color = texture(u_tex, v_uv);\n"
+                                        "    vec4 c = texture(u_tex, v_uv);\n"
+                                        "    frag_color = (u_swap_rb != 0) ? c.bgra : c;\n"
                                         "}\n";
             GLuint vs = glCreateShader(GL_VERTEX_SHADER);
             GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
@@ -2793,6 +2831,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                     glGetProgramiv(p, GL_LINK_STATUS, &ok);
                     if (ok) {
                         eng->prog_blit = p;
+                        eng->loc_blit_swap_rb = glGetUniformLocation(p, "u_swap_rb");
                     } else {
                         glDeleteProgram(p);
                     }
@@ -2808,16 +2847,18 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         }
 
         glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                               target_bo->gl_tex, 0);
-        bool fbo_ok = (eng->last_complete_bo_tex == target_bo->gl_tex);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target_tex, 0);
+        bool fbo_ok = (eng->last_complete_bo_tex == target_tex);
         if (!fbo_ok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
-            eng->last_complete_bo_tex = target_bo->gl_tex;
+            eng->last_complete_bo_tex = target_tex;
             fbo_ok = true;
         }
         if (eng->prog_blit && fbo_ok) {
             glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
             glUseProgram(eng->prog_blit);
+            if (eng->loc_blit_swap_rb >= 0) {
+                glUniform1i(eng->loc_blit_swap_rb, eng->passes[4].is_compute ? 1 : 0);
+            }
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, eng->scratch_tex);
             glBindVertexArray(eng->blit_vao);

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cli_parser.h"
-#include "image_loader.h"
 #include "waywal/gif_transcode.h"
+#include "waywal/image_loader.h"
 #include "waywal/ipc_proto.h"
 #include "waywal/log.h"
 #include "waywal/slideshow.h"
+#include "waywal/toml_parser.h"
 #include "waywal/types.h"
 
 #include <assert.h>
@@ -558,6 +559,27 @@ static void test_jit_transcode_support(void)
         assert(strcmp(scaled_out1, scaled_out2) == 0);
     }
 
+    /* 4c. Synthetic WebM EBML probe test (TrackUID 0xB0 collision + DisplayWidth + H-before-W) */
+    const uint8_t sample_webm[64] = {
+        0x1A, 0x45, 0xDF, 0xA3,                   /* EBML magic */
+        'V',  '_',  'V',  'P',  '9',  0x00,       /* CodecID V_VP9 */
+        0x73, 0xC5, 0x84, 0xB0, 0x82, 0x1E, 0x00, /* TrackUID with 0xB0 0x82 7680 payload */
+        0xE0, 0x90,                               /* TrackVideo master element (16 bytes) */
+        0x54, 0xB0, 0x82, 0x1E, 0x00,             /* DisplayWidth = 7680 (ignored) */
+        0xBA, 0x82, 0x04, 0x38,                   /* PixelHeight = 1080 (preceding W) */
+        0x9A, 0x81, 0x00,                         /* FlagInterlaced = 0 between H and W */
+        0xB0, 0x82, 0x07, 0x80,                   /* PixelWidth = 1920 */
+    };
+    const char *webm_path = "/tmp/test_jit_probe.webm";
+    fp = fopen(webm_path, "wb");
+    assert(fp != NULL);
+    assert(fwrite(sample_webm, 1, sizeof(sample_webm), fp) == sizeof(sample_webm));
+    fclose(fp);
+    char webm_out[4096];
+    assert(video_transcode_optimize(webm_path, 0, 0, webm_out, sizeof(webm_out)));
+    assert(strcmp(webm_out, webm_path) == 0);
+    unlink(webm_path);
+
     /* 5. CLI --animate flag and automatic route to CLI_CMD_VIDEO */
     char *argv_anim[] = {"wwal", "img", (char *)out_path1, "--animate"};
     cli_options_t opts;
@@ -592,6 +614,54 @@ static void test_jit_transcode_support(void)
     printf("  -> JIT transcode, content hashing, caching & CLI routing: PASSED\n");
 }
 
+static void test_cli_version_and_example_config(void)
+{
+    printf("[TEST] Testing --version/-V/version CLI flags and contrib/config.toml.example...\n");
+
+    const char *ver_cases[][2] = {
+        {"wwal", "--version"}, {"wwal", "-V"}, {"wwal", "version"},
+        {"swww", "--version"}, {"awww", "-V"},
+    };
+    for (size_t i = 0; i < sizeof(ver_cases) / sizeof(ver_cases[0]); ++i) {
+        char *argv[] = {(char *)ver_cases[i][0], (char *)ver_cases[i][1]};
+        cli_options_t opts;
+        assert(cli_parse(2, argv, &opts));
+        assert(opts.cmd == CLI_CMD_VERSION);
+    }
+
+    waywal_config_t cfg;
+    char err_buf[256] = {0};
+    assert(waywal_config_parse_string("[transition]\ntype = \"left\"\n", &cfg, err_buf,
+                                      sizeof(err_buf)));
+    assert(cfg.transition.type_enum == 9U);
+    assert(cfg.transition.angle == 180.0f);
+    assert(waywal_config_parse_string("[transition]\ntype = \"top\"\n", &cfg, err_buf,
+                                      sizeof(err_buf)));
+    assert(cfg.transition.type_enum == 9U);
+    assert(cfg.transition.angle == 90.0f);
+    assert(waywal_config_parse_string("[transition]\ntype = \"bottom\"\n", &cfg, err_buf,
+                                      sizeof(err_buf)));
+    assert(cfg.transition.type_enum == 9U);
+    assert(cfg.transition.angle == 270.0f);
+    assert(waywal_config_parse_string("[transition]\ntype = \"center\"\n", &cfg, err_buf,
+                                      sizeof(err_buf)));
+    assert(cfg.transition.type_enum == 4U);
+    assert(cfg.transition.pos_x == 0.5f && cfg.transition.pos_y == 0.5f);
+
+    const char *example_cfg = "../contrib/config.toml.example";
+    struct stat st;
+    if (stat(example_cfg, &st) != 0)
+        example_cfg = "contrib/config.toml.example";
+    if (stat(example_cfg, &st) == 0) {
+        assert(waywal_config_load_file(example_cfg, &cfg, err_buf, sizeof(err_buf)));
+        assert(cfg.daemon.idle_timeout_sec == 300U);
+        assert(cfg.theme.enabled == true);
+        assert(cfg.transition.fps == 144U);
+    }
+
+    printf("  -> CLI --version flags and contrib/config.toml.example: PASSED\n");
+}
+
 int main(void)
 {
     printf("=== Starting Advanced Engine & Daemon Unit Tests ===\n");
@@ -605,6 +675,7 @@ int main(void)
     test_16bit_png_decode();
     test_static_gif_support();
     test_jit_transcode_support();
+    test_cli_version_and_example_config();
     printf("=== ALL ADVANCED ENGINE & DAEMON TESTS PASSED! ===\n");
     return 0;
 }

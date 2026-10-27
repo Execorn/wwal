@@ -1246,7 +1246,12 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
                 sr = cur[x * 3u + 0];
                 sg = cur[x * 3u + 1];
                 sb = cur[x * 3u + 2];
-                sa = 255;
+                if (dec->png_trns_count >= 6 && sr == dec->png_trns[1] && sg == dec->png_trns[3] &&
+                    sb == dec->png_trns[5]) {
+                    sa = 0;
+                } else {
+                    sa = 255;
+                }
             } else if (dec->png_color_type == 3) {
                 uint8_t idx = cur[x];
                 if (idx < dec->png_plte_count) {
@@ -1260,7 +1265,7 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
                 sa = cur[x * 2u + 1];
             } else if (dec->png_color_type == 0) {
                 sr = sg = sb = cur[x];
-                sa = 255;
+                sa = (dec->png_trns_count >= 2 && cur[x] == dec->png_trns[1]) ? 0 : 255;
             }
 
             size_t dst_off = ((size_t)dst_y * dec->canvas_w + dst_x) * 4u;
@@ -1318,6 +1323,10 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
 
 static bool init_webp_decoder(waywal_anim_decoder_t *dec)
 {
+#ifdef WWAL_DISABLE_WEBP
+    (void)dec;
+    return false;
+#else
     dec->webp_dl_codec = dlopen("libwebp.so.7", RTLD_LAZY | RTLD_GLOBAL);
     if (!dec->webp_dl_codec) {
         dec->webp_dl_codec = dlopen("libwebp.so", RTLD_LAZY | RTLD_GLOBAL);
@@ -1381,6 +1390,7 @@ static bool init_webp_decoder(waywal_anim_decoder_t *dec)
     dec->frame_count = info.frame_count;
     dec->webp_prev_timestamp = 0;
     return true;
+#endif
 }
 
 static bool step_webp_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba, uint32_t *out_w,

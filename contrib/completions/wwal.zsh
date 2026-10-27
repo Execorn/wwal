@@ -24,8 +24,10 @@ _wwal() {
         'stats:Report real-time RSS/PSS, DMA-BUF modifiers, VBlank PLL, and pause_mask telemetry'
         'restore:Restore last persisted per-output state from state.bin'
         'clear-cache:Remove cached hardware transcodes and palette files'
+        'init:Launch or initialize wallpaper daemon (swww/awww alias)'
         'ping:Check if wwald daemon is running and responsive'
         'kill:Gracefully terminate the running wwald daemon'
+        'version:Print version information'
         'help:Display help message'
     )
 
@@ -36,12 +38,13 @@ _wwal() {
         '--layer[Wayland layer-shell layer]:layer:(background bottom)'
         '--battery-policy[Laptop battery power governor policy]:policy:(ignore reduce-fps pause-video)'
         '(-v --verbose)'{-v,--verbose}'[Enable verbose output]'
+        '(-V --version)'{-V,--version}'[Print version information]'
         '(-h --help)'{-h,--help}'[Print help information]'
     )
 
     local -a trans_opts
     trans_opts=(
-        '--transition-type[Transition effect]:type:(none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random)'
+        '--transition-type[Transition effect]:type:(none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random left right top bottom center any)'
         '--transition-duration[Transition duration in seconds]:duration:'
         '--transition-fps[Target frame rate]:fps:'
         '--transition-bezier[Cubic Bezier control points X1,Y1,X2,Y2]:bezier:'

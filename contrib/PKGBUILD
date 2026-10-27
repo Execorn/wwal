@@ -23,7 +23,8 @@ optdepends=(
   'libjxl: JPEG-XL next-generation image decoding'
   'librsvg: Native SVG vector wallpaper rasterization'
   'pipewire: Lock-free audio capture for 64-bin Bark FFT reactive shaders'
-  'shaderc: Offline SPIR-V shader validation'
+  'dbus: Zero-idle D-Bus MPRIS2 media metadata integration'
+  'lz4: Fast native Wallpaper Engine .tex LZ4 decompression'
   'ffmpeg: Hardware-accelerated pre-transcoding for non-native animated formats'
 )
 makedepends=(

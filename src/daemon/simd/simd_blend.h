@@ -16,7 +16,7 @@ typedef void (*simd_blend_scanline_fn)(uint8_t *restrict dst, const uint8_t *res
 void blend_scanline_scalar(uint8_t *restrict dst, const uint8_t *restrict src_a,
                            const uint8_t *restrict src_b, uint16_t weight_b, size_t num_bytes);
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if !defined(WWAL_DISABLE_SIMD) && (defined(__x86_64__) || defined(_M_X64))
 void blend_scanline_avx2(uint8_t *restrict dst, const uint8_t *restrict src_a,
                          const uint8_t *restrict src_b, uint16_t weight_b, size_t num_bytes);
 
@@ -24,7 +24,7 @@ void blend_scanline_avx512(uint8_t *restrict dst, const uint8_t *restrict src_a,
                            const uint8_t *restrict src_b, uint16_t weight_b, size_t num_bytes);
 #endif
 
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if !defined(WWAL_DISABLE_SIMD) && (defined(__aarch64__) || defined(_M_ARM64))
 void blend_scanline_neon(uint8_t *restrict dst, const uint8_t *restrict src_a,
                          const uint8_t *restrict src_b, uint16_t weight_b, size_t num_bytes);
 #endif

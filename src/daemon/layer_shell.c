@@ -30,7 +30,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
 #include <immintrin.h>
 #endif
 
@@ -181,6 +181,8 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
     zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
 
     bool was_configured = out->configured;
+    int32_t old_w = out->width;
+    int32_t old_h = out->height;
     if (width > 0 && height > 0) {
         out->logical_width = width;
         out->logical_height = height;
@@ -203,7 +205,33 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
             out->state->on_output_configured(out->state, out);
         }
     } else {
-        output_commit_frame(out);
+        bool dims_changed = (out->width != old_w || out->height != old_h);
+        bool anim_active =
+            out->transition_active || out->shader_active || out->anim_active ||
+            out->workshop_active ||
+            (out->video_eng && out->video_eng->state != WAYWAL_VIDEO_STATE_STOPPED) ||
+            (out->state &&
+             (out->state->shader_active || out->state->anim_active || out->state->workshop_active ||
+              out->state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED));
+        if (dims_changed && !anim_active && out->state) {
+            if (out->has_image && out->state->wallpaper_rgba) {
+                output_node_render_image(out->state, out, out->state->wallpaper_rgba,
+                                         out->state->wallpaper_w, out->state->wallpaper_h);
+                if (out->state->on_output_configured) {
+                    out->state->on_output_configured(out->state, out);
+                }
+            } else if (out->has_image && out->state->on_output_configured) {
+                out->state->on_output_configured(out->state, out);
+            } else if (!out->has_image) {
+                color_rgba_t col =
+                    out->has_fill_color ? out->fill_color : out->state->current_color;
+                output_node_render_color(out->state, out, col);
+            } else {
+                output_commit_frame(out);
+            }
+        } else {
+            output_commit_frame(out);
+        }
         if (out->state && out->state->display) {
             wl_display_flush(out->state->display);
         }
@@ -371,6 +399,9 @@ static void release_output_bo_refs(daemon_state_t *state, output_node_t *node, d
         return;
     }
     if (node) {
+        if (node->last_presented_bo == bo) {
+            node->last_presented_bo = NULL;
+        }
         if (node->shader_eng) {
             waywal_shader_engine_forget_bo(node->shader_eng, bo);
         }
@@ -413,9 +444,7 @@ void output_node_destroy_surface(output_node_t *node)
         for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
             release_output_bo_refs(node->state, node, &node->dmabuf_ring.buffers[i]);
         }
-        if (node->state) {
-            dmabuf_ring_destroy(&node->state->dmabuf_ctx, &node->dmabuf_ring);
-        }
+        dmabuf_ring_destroy(node->state ? &node->state->dmabuf_ctx : NULL, &node->dmabuf_ring);
         node->use_dmabuf = false;
     }
     if (node->has_source_old_bo) {
@@ -899,10 +928,17 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
         struct wl_buffer *sp_buf = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
             state->single_pixel_mgr, r32, g32, b32, a32);
         if (sp_buf) {
-            if (node->has_source_old_bo && state->render_engine.gpu_compute_active) {
-                render_engine_upload_static(&state->render_engine, NULL, 0, 0, &node->source_old_bo,
-                                            WAYWAL_SCALING_FILL, pixel);
+            if (node->has_source_old_bo) {
+                release_output_bo_refs(state, node, &node->source_old_bo);
+                dmabuf_bo_free(&node->source_old_bo);
+                node->has_source_old_bo = false;
             }
+            if (node->has_source_new_bo) {
+                release_output_bo_refs(state, node, &node->source_new_bo);
+                dmabuf_bo_free(&node->source_new_bo);
+                node->has_source_new_bo = false;
+            }
+            node->last_presented_bo = NULL;
             node->has_image = false;
             wp_viewport_set_source(node->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                    wl_fixed_from_int(-1), wl_fixed_from_int(-1));
@@ -961,6 +997,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                 wl_surface_attach(node->surface, bo->wl_buffer, 0, 0);
                 wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
                 output_commit_frame(node);
+                node->has_image = false;
                 node->last_presented_bo = bo;
                 wl_display_flush(state->display);
                 return;
@@ -996,6 +1033,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
     node->shm_buffer_released[back_idx] = false;
     node->active_buffer_idx = back_idx;
     output_commit_frame(node);
+    node->has_image = false;
     int inactive_idx = 1 - back_idx;
     if (node->shm_buffer_released[inactive_idx]) {
         void *inactive_ptr = (uint8_t *)node->shm_data + (size_t)inactive_idx * frame_sz;
@@ -1052,7 +1090,7 @@ static inline uint32_t sample_bilinear(const uint32_t *src, uint32_t src_w, uint
     return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
 __attribute__((target("avx2"))) static inline void
 scale_bilinear_row_avx2(uint32_t *restrict dst_span, const uint32_t *restrict row0,
                         const uint32_t *restrict row1, const int32_t *restrict x0_tbl,
@@ -1195,7 +1233,7 @@ static void scale_bilinear_rect(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
         fx4_tbl[x] = (uint64_t)fx * 0x0001000100010001ULL;
     }
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
     const bool use_avx2 = __builtin_cpu_supports("avx2");
 #endif
 
@@ -1237,7 +1275,7 @@ static void scale_bilinear_rect(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
             continue;
         }
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
         if (use_avx2) {
             scale_bilinear_row_avx2(dst_span, row0, row1, x0_tbl, x1_tbl, fx4_tbl, fx_tbl, scaled_w,
                                     fy, ify);
@@ -1379,7 +1417,9 @@ void layer_shell_snapshot_live_output(daemon_state_t *state, output_node_t *out)
     if (out->last_presented_bo && out->last_presented_bo != &out->source_old_bo) {
         uint32_t w = (uint32_t)out->width;
         uint32_t h = (uint32_t)out->height;
-        uint64_t src_mod = state->dmabuf_ctx.preferred_modifier;
+        uint64_t src_mod = state->render_engine.gpu_compute_active
+                               ? state->dmabuf_ctx.preferred_modifier
+                               : DRM_FORMAT_MOD_LINEAR;
         if (!out->has_source_old_bo || out->source_old_bo.width != w ||
             out->source_old_bo.height != h) {
             if (out->has_source_old_bo) {
@@ -1400,6 +1440,10 @@ void layer_shell_snapshot_live_output(daemon_state_t *state, output_node_t *out)
                                       false)) {
                 out->has_image = true;
                 out->last_presented_bo = &out->source_old_bo;
+            } else {
+                release_output_bo_refs(state, out, &out->source_old_bo);
+                dmabuf_bo_free(&out->source_old_bo);
+                out->has_source_old_bo = false;
             }
         }
     }
@@ -1900,6 +1944,8 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
 
         out->scaling_mode = meta ? meta->scaling_mode : WAYWAL_SCALING_FILL;
         out->filter_mode = meta ? meta->filter_mode : 0u;
+        color_rgba_t prev_fill_col = get_output_fill_color(state, out);
+        uint32_t prev_clear_color = pack_color_argb(prev_fill_col);
         if (meta && (meta->color[0] || meta->color[1] || meta->color[2] || meta->color[3])) {
             out->fill_color = (color_rgba_t){
                 .r = meta->color[0],
@@ -1974,6 +2020,10 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                 }
 
                 if (new_uploaded) {
+                    bool copied_old =
+                        (out->has_source_old_bo && out->last_presented_bo == &out->source_old_bo &&
+                         out->source_old_bo.width == (uint32_t)out->width &&
+                         out->source_old_bo.height == (uint32_t)out->height);
                     if (!out->has_source_old_bo ||
                         out->source_old_bo.width != (uint32_t)out->width ||
                         out->source_old_bo.height != (uint32_t)out->height) {
@@ -1986,32 +2036,34 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                                                (uint32_t)out->width, (uint32_t)out->height,
                                                DRM_FORMAT_ARGB8888, modifier)) {
                             out->has_source_old_bo = true;
-                            bool old_uploaded = false;
-                            if ((out->source_old_bo.map_data == NULL ||
-                                 !state->dmabuf_ctx.map_supported ||
-                                 out->source_old_bo.modifier != DRM_FORMAT_MOD_LINEAR) &&
-                                gpu_ok) {
-                                old_uploaded = render_engine_upload_static(
-                                    &state->render_engine, NULL, 0, 0, &out->source_old_bo,
-                                    WAYWAL_SCALING_FILL, clear_color);
-                            }
-                            if (!old_uploaded && state->dmabuf_ctx.map_supported) {
-                                uint32_t stride_old = 0;
-                                void *map_data_old = NULL;
-                                void *map_old =
-                                    gbm_bo_map(out->source_old_bo.gbm_bo, 0, 0,
-                                               (uint32_t)out->width, (uint32_t)out->height,
-                                               GBM_BO_TRANSFER_WRITE, &stride_old, &map_data_old);
-                                if (map_old && map_old != MAP_FAILED) {
-                                    for (int32_t y = 0; y < out->height; ++y) {
-                                        uint32_t *dst_row = (uint32_t *)((uint8_t *)map_old +
-                                                                         (size_t)y * stride_old);
-                                        for (int32_t x = 0; x < out->width; ++x) {
-                                            dst_row[x] = clear_color;
-                                        }
+                        }
+                    }
+                    if (out->has_source_old_bo && !copied_old) {
+                        bool old_uploaded = false;
+                        if ((out->source_old_bo.map_data == NULL ||
+                             !state->dmabuf_ctx.map_supported ||
+                             out->source_old_bo.modifier != DRM_FORMAT_MOD_LINEAR) &&
+                            gpu_ok) {
+                            old_uploaded = render_engine_upload_static(
+                                &state->render_engine, NULL, 0, 0, &out->source_old_bo,
+                                WAYWAL_SCALING_FILL, prev_clear_color);
+                        }
+                        if (!old_uploaded && state->dmabuf_ctx.map_supported) {
+                            uint32_t stride_old = 0;
+                            void *map_data_old = NULL;
+                            void *map_old =
+                                gbm_bo_map(out->source_old_bo.gbm_bo, 0, 0, (uint32_t)out->width,
+                                           (uint32_t)out->height, GBM_BO_TRANSFER_WRITE,
+                                           &stride_old, &map_data_old);
+                            if (map_old && map_old != MAP_FAILED) {
+                                for (int32_t y = 0; y < out->height; ++y) {
+                                    uint32_t *dst_row =
+                                        (uint32_t *)((uint8_t *)map_old + (size_t)y * stride_old);
+                                    for (int32_t x = 0; x < out->width; ++x) {
+                                        dst_row[x] = prev_clear_color;
                                     }
-                                    gbm_bo_unmap(out->source_old_bo.gbm_bo, map_data_old);
                                 }
+                                gbm_bo_unmap(out->source_old_bo.gbm_bo, map_data_old);
                             }
                         }
                     }
@@ -2039,7 +2091,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                 uint32_t *old_u32 = (uint32_t *)out->shm_old_data;
                 size_t total_px = (size_t)out->width * (size_t)out->height;
                 for (size_t p = 0; p < total_px; ++p) {
-                    old_u32[p] = clear_color;
+                    old_u32[p] = prev_clear_color;
                 }
             }
             copy_or_scale_image_ex(out, (uint32_t *)out->shm_new_data, (uint32_t)out->width,
@@ -2152,6 +2204,7 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                 (int32_t)out->source_new_bo.height != out->height) {
                 out->transition_current_frame = out->transition_total_frames;
             } else {
+                bool committed = false;
                 dmabuf_bo_t *target_bo = dmabuf_ring_acquire(&out->dmabuf_ring);
                 if (target_bo && target_bo->wl_buffer) {
                     if (render_engine_execute_transition(&state->render_engine, target_bo,
@@ -2159,11 +2212,18 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                                                          &out->transition_params)) {
                         wl_surface_attach(out->surface, target_bo->wl_buffer, 0, 0);
                         wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
+                        presentation_sync_request(&out->pres_sync);
                         output_commit_frame(out);
                         out->last_presented_bo = target_bo;
+                        committed = true;
                     } else {
                         target_bo->in_use = false;
                     }
+                }
+                if (!committed && out->transition_current_frame >= out->transition_total_frames) {
+                    out->transition_current_frame = out->transition_total_frames - 1;
+                    active_count++;
+                    continue;
                 }
             }
         } else {
@@ -2206,6 +2266,7 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                 wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
                 out->shm_buffer_released[back_idx] = false;
                 out->active_buffer_idx = back_idx;
+                presentation_sync_request(&out->pres_sync);
                 output_commit_frame(out);
 
                 if (out->transition_current_frame <= 2 || out->transition_current_frame % 20 == 0) {
@@ -2218,11 +2279,15 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
         if (out->transition_current_frame >= out->transition_total_frames) {
             out->transition_active = false;
             if (out->use_dmabuf) {
-                dmabuf_bo_t tmp = out->source_old_bo;
-                out->source_old_bo = out->source_new_bo;
-                out->source_new_bo = tmp;
-                if (!out->shader_active && !out->anim_active && !out->workshop_active) {
-                    out->last_presented_bo = &out->source_old_bo;
+                if (out->has_source_old_bo) {
+                    release_output_bo_refs(state, out, &out->source_old_bo);
+                    dmabuf_bo_free(&out->source_old_bo);
+                    out->has_source_old_bo = false;
+                }
+                if (out->has_source_new_bo) {
+                    release_output_bo_refs(state, out, &out->source_new_bo);
+                    dmabuf_bo_free(&out->source_new_bo);
+                    out->has_source_new_bo = false;
                 }
             } else {
                 free(out->shm_old_data);

@@ -7,6 +7,7 @@
 
 #include <stdbool.h>
 #include <va/va.h>
+#include <va/va_dec_av1.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
 
@@ -14,7 +15,7 @@
 extern "C" {
 #endif
 
-#define WAYWAL_VA_SURFACE_POOL_SIZE 20
+#define WAYWAL_VA_SURFACE_POOL_SIZE 24
 #define WAYWAL_VA_VPP_POOL_SIZE     3
 
 typedef struct {
@@ -241,6 +242,12 @@ typedef struct {
     VASurfaceID vp9_ref_frames[8];
     VASurfaceID av1_ref_frames[8];
     uint8_t av1_ref_order_hints[8];
+    VAWarpedMotionParamsAV1 wm[8][7];
+    int8_t loop_filter_ref_deltas[8][8];
+    int8_t loop_filter_mode_deltas[8][2];
+    int16_t seg_feature_data[8][8][8];
+    uint8_t seg_feature_mask[8][8];
+    VAFilmGrainStructAV1 film_grain[8];
     uint8_t vp9_subsampling_x;
     uint8_t vp9_subsampling_y;
     uint8_t vp9_bit_depth;

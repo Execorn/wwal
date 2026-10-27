@@ -7,7 +7,7 @@
 #include "waywal/log.h"
 
 #include <dlfcn.h>
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
 #pragma GCC push_options
 #pragma GCC target("avx2,fma")
 #include <immintrin.h>
@@ -202,12 +202,6 @@ struct waywal_audio_fft {
 
     _Alignas(32) float scratch_samples[WAYWAL_AUDIO_FFT_SIZE];
     _Alignas(32) float history[WAYWAL_AUDIO_FFT_SIZE];
-    _Alignas(32) float hann_window[WAYWAL_AUDIO_FFT_SIZE];
-    _Alignas(32) float twiddle_re[COMPLEX_FFT_N];
-    _Alignas(32) float twiddle_im[COMPLEX_FFT_N];
-    _Alignas(32) float unpack_re[COMPLEX_FFT_N];
-    _Alignas(32) float unpack_im[COMPLEX_FFT_N];
-    uint16_t bit_rev[COMPLEX_FFT_N];
 
     uint16_t bark_bin_start[WAYWAL_AUDIO_BARK_BANDS];
     uint16_t bark_bin_end[WAYWAL_AUDIO_BARK_BANDS];
@@ -351,12 +345,6 @@ static void init_static_fft_tables_once(void)
 static void init_fft_tables(waywal_audio_fft_t *fft)
 {
     pthread_once(&s_fft_tables_once, init_static_fft_tables_once);
-    memcpy(fft->hann_window, s_hann_window, sizeof(s_hann_window));
-    memcpy(fft->twiddle_re, s_twiddle_re, sizeof(s_twiddle_re));
-    memcpy(fft->twiddle_im, s_twiddle_im, sizeof(s_twiddle_im));
-    memcpy(fft->unpack_re, s_unpack_re, sizeof(s_unpack_re));
-    memcpy(fft->unpack_im, s_unpack_im, sizeof(s_unpack_im));
-    memcpy(fft->bit_rev, s_bit_rev, sizeof(s_bit_rev));
 
     float max_freq = 0.5f * (float)fft->sample_rate;
     float max_bark = hz_to_bark(max_freq);
@@ -403,91 +391,88 @@ static void init_fft_tables(waywal_audio_fft_t *fft)
 __attribute__((target("avx2,fma"))) static void
 execute_complex_fft_1024_avx2(const waywal_audio_fft_t *fft, float *restrict zr, float *restrict zi)
 {
-    for (uint32_t stage = 1; stage <= 10u; ++stage) {
+    (void)fft;
+    {
+        const __m256i idx_u1 = _mm256_setr_epi32(0, 0, 2, 2, 4, 4, 6, 6);
+        const __m256i idx_v1 = _mm256_setr_epi32(1, 1, 3, 3, 5, 5, 7, 7);
+        const __m256 sign1 = _mm256_setr_ps(1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f);
+
+        const float *w2_re = &s_twiddle_re[2];
+        const float *w2_im = &s_twiddle_im[2];
+        const __m256i idx_u2 = _mm256_setr_epi32(0, 1, 0, 1, 4, 5, 4, 5);
+        const __m256i idx_v2 = _mm256_setr_epi32(2, 3, 2, 3, 6, 7, 6, 7);
+        const __m256 wr2 = _mm256_setr_ps(w2_re[0], w2_re[1], -w2_re[0], -w2_re[1], w2_re[0],
+                                          w2_re[1], -w2_re[0], -w2_re[1]);
+        const __m256 wi2 = _mm256_setr_ps(w2_im[0], w2_im[1], -w2_im[0], -w2_im[1], w2_im[0],
+                                          w2_im[1], -w2_im[0], -w2_im[1]);
+
+        const float *w4_re = &s_twiddle_re[4];
+        const float *w4_im = &s_twiddle_im[4];
+        const __m256i idx_u4 = _mm256_setr_epi32(0, 1, 2, 3, 0, 1, 2, 3);
+        const __m256i idx_v4 = _mm256_setr_epi32(4, 5, 6, 7, 4, 5, 6, 7);
+        const __m256 wr4 = _mm256_setr_ps(w4_re[0], w4_re[1], w4_re[2], w4_re[3], -w4_re[0],
+                                          -w4_re[1], -w4_re[2], -w4_re[3]);
+        const __m256 wi4 = _mm256_setr_ps(w4_im[0], w4_im[1], w4_im[2], w4_im[3], -w4_im[0],
+                                          -w4_im[1], -w4_im[2], -w4_im[3]);
+
+        for (uint32_t k = 0; k < COMPLEX_FFT_N; k += 8u) {
+            __m256 r = _mm256_load_ps(zr + k);
+            __m256 i = _mm256_load_ps(zi + k);
+
+            /* Stage 1 (half = 1) */
+            __m256 ur = _mm256_permutevar8x32_ps(r, idx_u1);
+            __m256 ui = _mm256_permutevar8x32_ps(i, idx_u1);
+            __m256 vr = _mm256_permutevar8x32_ps(r, idx_v1);
+            __m256 vi = _mm256_permutevar8x32_ps(i, idx_v1);
+            r = _mm256_fmadd_ps(sign1, vr, ur);
+            i = _mm256_fmadd_ps(sign1, vi, ui);
+
+            /* Stage 2 (half = 2) */
+            ur = _mm256_permutevar8x32_ps(r, idx_u2);
+            ui = _mm256_permutevar8x32_ps(i, idx_u2);
+            vr = _mm256_permutevar8x32_ps(r, idx_v2);
+            vi = _mm256_permutevar8x32_ps(i, idx_v2);
+            __m256 tr = _mm256_fmsub_ps(wr2, vr, _mm256_mul_ps(wi2, vi));
+            __m256 ti = _mm256_fmadd_ps(wr2, vi, _mm256_mul_ps(wi2, vr));
+            r = _mm256_add_ps(ur, tr);
+            i = _mm256_add_ps(ui, ti);
+
+            /* Stage 3 (half = 4) */
+            ur = _mm256_permutevar8x32_ps(r, idx_u4);
+            ui = _mm256_permutevar8x32_ps(i, idx_u4);
+            vr = _mm256_permutevar8x32_ps(r, idx_v4);
+            vi = _mm256_permutevar8x32_ps(i, idx_v4);
+            tr = _mm256_fmsub_ps(wr4, vr, _mm256_mul_ps(wi4, vi));
+            ti = _mm256_fmadd_ps(wr4, vi, _mm256_mul_ps(wi4, vr));
+            _mm256_store_ps(zr + k, _mm256_add_ps(ur, tr));
+            _mm256_store_ps(zi + k, _mm256_add_ps(ui, ti));
+        }
+    }
+
+    for (uint32_t stage = 4; stage <= 10u; ++stage) {
         uint32_t m = 1u << stage;
         uint32_t half = m >> 1u;
-        const float *w_re = &fft->twiddle_re[half];
-        const float *w_im = &fft->twiddle_im[half];
+        const float *w_re = &s_twiddle_re[half];
+        const float *w_im = &s_twiddle_im[half];
 
-        if (half == 1u) {
-            const __m256i idx_u = _mm256_setr_epi32(0, 0, 2, 2, 4, 4, 6, 6);
-            const __m256i idx_v = _mm256_setr_epi32(1, 1, 3, 3, 5, 5, 7, 7);
-            const __m256 sign = _mm256_setr_ps(1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f);
-            for (uint32_t k = 0; k < COMPLEX_FFT_N; k += 8u) {
-                __m256 r = _mm256_load_ps(zr + k);
-                __m256 i = _mm256_load_ps(zi + k);
-                __m256 ur = _mm256_permutevar8x32_ps(r, idx_u);
-                __m256 ui = _mm256_permutevar8x32_ps(i, idx_u);
-                __m256 vr = _mm256_permutevar8x32_ps(r, idx_v);
-                __m256 vi = _mm256_permutevar8x32_ps(i, idx_v);
-                _mm256_store_ps(zr + k, _mm256_fmadd_ps(sign, vr, ur));
-                _mm256_store_ps(zi + k, _mm256_fmadd_ps(sign, vi, ui));
-            }
-            continue;
-        }
-        if (half == 2u) {
-            const __m256i idx_u = _mm256_setr_epi32(0, 1, 0, 1, 4, 5, 4, 5);
-            const __m256i idx_v = _mm256_setr_epi32(2, 3, 2, 3, 6, 7, 6, 7);
-            const __m256 wr = _mm256_setr_ps(w_re[0], w_re[1], -w_re[0], -w_re[1], w_re[0], w_re[1],
-                                             -w_re[0], -w_re[1]);
-            const __m256 wi = _mm256_setr_ps(w_im[0], w_im[1], -w_im[0], -w_im[1], w_im[0], w_im[1],
-                                             -w_im[0], -w_im[1]);
-            for (uint32_t k = 0; k < COMPLEX_FFT_N; k += 8u) {
-                __m256 r = _mm256_load_ps(zr + k);
-                __m256 i = _mm256_load_ps(zi + k);
-                __m256 ur = _mm256_permutevar8x32_ps(r, idx_u);
-                __m256 ui = _mm256_permutevar8x32_ps(i, idx_u);
-                __m256 vr = _mm256_permutevar8x32_ps(r, idx_v);
-                __m256 vi = _mm256_permutevar8x32_ps(i, idx_v);
+        for (uint32_t k = 0; k < COMPLEX_FFT_N; k += m) {
+            for (uint32_t j = 0; j < half; j += 8u) {
+                __m256 wr = _mm256_loadu_ps(w_re + j);
+                __m256 wi = _mm256_loadu_ps(w_im + j);
+
+                __m256 ur = _mm256_load_ps(zr + k + j);
+                __m256 ui = _mm256_load_ps(zi + k + j);
+                __m256 vr = _mm256_load_ps(zr + k + j + half);
+                __m256 vi = _mm256_load_ps(zi + k + j + half);
+
                 __m256 tr = _mm256_fmsub_ps(wr, vr, _mm256_mul_ps(wi, vi));
                 __m256 ti = _mm256_fmadd_ps(wr, vi, _mm256_mul_ps(wi, vr));
-                _mm256_store_ps(zr + k, _mm256_add_ps(ur, tr));
-                _mm256_store_ps(zi + k, _mm256_add_ps(ui, ti));
-            }
-            continue;
-        }
-        if (half == 4u) {
-            const __m256i idx_u = _mm256_setr_epi32(0, 1, 2, 3, 0, 1, 2, 3);
-            const __m256i idx_v = _mm256_setr_epi32(4, 5, 6, 7, 4, 5, 6, 7);
-            const __m256 wr = _mm256_setr_ps(w_re[0], w_re[1], w_re[2], w_re[3], -w_re[0], -w_re[1],
-                                             -w_re[2], -w_re[3]);
-            const __m256 wi = _mm256_setr_ps(w_im[0], w_im[1], w_im[2], w_im[3], -w_im[0], -w_im[1],
-                                             -w_im[2], -w_im[3]);
-            for (uint32_t k = 0; k < COMPLEX_FFT_N; k += 8u) {
-                __m256 r = _mm256_load_ps(zr + k);
-                __m256 i = _mm256_load_ps(zi + k);
-                __m256 ur = _mm256_permutevar8x32_ps(r, idx_u);
-                __m256 ui = _mm256_permutevar8x32_ps(i, idx_u);
-                __m256 vr = _mm256_permutevar8x32_ps(r, idx_v);
-                __m256 vi = _mm256_permutevar8x32_ps(i, idx_v);
-                __m256 tr = _mm256_fmsub_ps(wr, vr, _mm256_mul_ps(wi, vi));
-                __m256 ti = _mm256_fmadd_ps(wr, vi, _mm256_mul_ps(wi, vr));
-                _mm256_store_ps(zr + k, _mm256_add_ps(ur, tr));
-                _mm256_store_ps(zi + k, _mm256_add_ps(ui, ti));
-            }
-            continue;
-        }
-        if (half >= 8u) {
-            for (uint32_t k = 0; k < COMPLEX_FFT_N; k += m) {
-                for (uint32_t j = 0; j < half; j += 8u) {
-                    __m256 wr = _mm256_loadu_ps(w_re + j);
-                    __m256 wi = _mm256_loadu_ps(w_im + j);
 
-                    __m256 ur = _mm256_load_ps(zr + k + j);
-                    __m256 ui = _mm256_load_ps(zi + k + j);
-                    __m256 vr = _mm256_load_ps(zr + k + j + half);
-                    __m256 vi = _mm256_load_ps(zi + k + j + half);
-
-                    __m256 tr = _mm256_fmsub_ps(wr, vr, _mm256_mul_ps(wi, vi));
-                    __m256 ti = _mm256_fmadd_ps(wr, vi, _mm256_mul_ps(wi, vr));
-
-                    _mm256_store_ps(zr + k + j, _mm256_add_ps(ur, tr));
-                    _mm256_store_ps(zi + k + j, _mm256_add_ps(ui, ti));
-                    _mm256_store_ps(zr + k + j + half, _mm256_sub_ps(ur, tr));
-                    _mm256_store_ps(zi + k + j + half, _mm256_sub_ps(ui, ti));
-                }
+                _mm256_store_ps(zr + k + j, _mm256_add_ps(ur, tr));
+                _mm256_store_ps(zi + k + j, _mm256_add_ps(ui, ti));
+                _mm256_store_ps(zr + k + j + half, _mm256_sub_ps(ur, tr));
+                _mm256_store_ps(zi + k + j + half, _mm256_sub_ps(ui, ti));
             }
-            continue;
         }
     }
 }
@@ -512,8 +497,8 @@ unpack_real_fft_avx2(waywal_audio_fft_t *fft, const float *zr, const float *zi, 
         __m256 or_v = _mm256_mul_ps(v_half, _mm256_add_ps(zik, zink));
         __m256 oi_v = _mm256_mul_ps(v_neghalf, _mm256_sub_ps(zrk, zrnk));
 
-        __m256 wr = _mm256_loadu_ps(fft->unpack_re + k);
-        __m256 wi = _mm256_loadu_ps(fft->unpack_im + k);
+        __m256 wr = _mm256_loadu_ps(s_unpack_re + k);
+        __m256 wi = _mm256_loadu_ps(s_unpack_im + k);
 
         __m256 xr = _mm256_add_ps(er, _mm256_fmsub_ps(wr, or_v, _mm256_mul_ps(wi, oi_v)));
         __m256 xi = _mm256_add_ps(ei, _mm256_fmadd_ps(wr, oi_v, _mm256_mul_ps(wi, or_v)));
@@ -535,11 +520,12 @@ static void execute_complex_fft_1024(const waywal_audio_fft_t *fft, float *restr
         return;
     }
 #endif
+    (void)fft;
     for (uint32_t stage = 1; stage <= 10u; ++stage) {
         uint32_t m = 1u << stage;
         uint32_t half = m >> 1u;
-        const float *w_re = &fft->twiddle_re[half];
-        const float *w_im = &fft->twiddle_im[half];
+        const float *w_re = &s_twiddle_re[half];
+        const float *w_im = &s_twiddle_im[half];
 
         for (uint32_t k = 0; k < COMPLEX_FFT_N; k += m) {
             for (uint32_t j = 0; j < half; ++j) {
@@ -810,7 +796,9 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
     }
 
     if (enable_pipewire) {
+#ifndef WWAL_DISABLE_PIPEWIRE
         fft->pw_lib = dlopen("libpipewire-0.3.so.0", RTLD_LAZY | RTLD_NODELETE);
+#endif
         if (fft->pw_lib) {
             void (*fn_pw_init)(int *, char ***) = NULL;
             void *(*fn_pw_thread_loop_new)(const char *, const void *) = NULL;
@@ -1076,6 +1064,19 @@ void waywal_audio_fft_destroy(waywal_audio_fft_t *fft)
     free(fft);
 }
 
+static void copy_from_ring(const float *ring, uint32_t start_pos, float *dst, uint32_t count)
+{
+    uint32_t idx = start_pos & (WAYWAL_AUDIO_RING_SIZE - 1u);
+    uint32_t first = WAYWAL_AUDIO_RING_SIZE - idx;
+    if (first > count) {
+        first = count;
+    }
+    memcpy(dst, ring + idx, first * sizeof(float));
+    if (count > first) {
+        memcpy(dst + first, ring, (count - first) * sizeof(float));
+    }
+}
+
 size_t waywal_audio_fft_push_samples(waywal_audio_fft_t *fft, const float *samples, size_t count)
 {
     if (!fft || !samples || count == 0) {
@@ -1083,8 +1084,23 @@ size_t waywal_audio_fft_push_samples(waywal_audio_fft_t *fft, const float *sampl
     }
 
     uint32_t wp = atomic_load_explicit(&fft->write_pos, memory_order_relaxed);
-    for (size_t i = 0; i < count; ++i) {
-        fft->ring[(wp + (uint32_t)i) & (WAYWAL_AUDIO_RING_SIZE - 1u)] = samples[i];
+    const float *src = samples;
+    size_t copy_cnt = count;
+    uint32_t dst_wp = wp;
+    if (copy_cnt > WAYWAL_AUDIO_RING_SIZE) {
+        size_t skip = copy_cnt - WAYWAL_AUDIO_RING_SIZE;
+        src += skip;
+        copy_cnt = WAYWAL_AUDIO_RING_SIZE;
+        dst_wp += (uint32_t)skip;
+    }
+    uint32_t idx = dst_wp & (WAYWAL_AUDIO_RING_SIZE - 1u);
+    size_t first = WAYWAL_AUDIO_RING_SIZE - idx;
+    if (first > copy_cnt) {
+        first = copy_cnt;
+    }
+    memcpy(fft->ring + idx, src, first * sizeof(float));
+    if (copy_cnt > first) {
+        memcpy(fft->ring, src + first, (copy_cnt - first) * sizeof(float));
     }
     atomic_store_explicit(&fft->write_pos, wp + (uint32_t)count, memory_order_release);
     atomic_fetch_add_explicit(&fft->total_pushed, (uint32_t)count, memory_order_release);
@@ -1123,6 +1139,16 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
             fft->current_frame.bands[b] = fft->smoothed_bands[b];
             env_sum += fft->smoothed_bands[b];
         }
+        for (uint32_t k = 0; k < WAYWAL_AUDIO_FREQ_BINS; ++k) {
+            fft->current_frame.linear_bins[k] *= 0.94f;
+        }
+        uint8_t *row_fft = &fft->current_frame.shadertoy_tex[0];
+        uint8_t *row_wav = &fft->current_frame.shadertoy_tex[WAYWAL_AUDIO_TEX_WIDTH];
+        for (uint32_t x = 0; x < WAYWAL_AUDIO_TEX_WIDTH; ++x) {
+            row_fft[x] = (uint8_t)(((uint32_t)row_fft[x] * 240u) >> 8);
+            int d = (int)row_wav[x] - 128;
+            row_wav[x] = (uint8_t)(128 + (d * 240) / 256);
+        }
         fft->current_frame.envelope = clampf(env_sum / (float)WAYWAL_AUDIO_BARK_BANDS, 0.0f, 1.0f);
         fft->current_frame.bass_energy *= 0.94f;
         fft->beat_val *= 0.85f;
@@ -1139,17 +1165,11 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
     }
 
     if (avail >= WAYWAL_AUDIO_FFT_SIZE) {
-        uint32_t r = wp - WAYWAL_AUDIO_FFT_SIZE;
-        for (uint32_t i = 0; i < WAYWAL_AUDIO_FFT_SIZE; ++i) {
-            fft->history[i] = fft->ring[(r + i) & (WAYWAL_AUDIO_RING_SIZE - 1u)];
-        }
+        copy_from_ring(fft->ring, wp - WAYWAL_AUDIO_FFT_SIZE, fft->history, WAYWAL_AUDIO_FFT_SIZE);
     } else {
         uint32_t keep = WAYWAL_AUDIO_FFT_SIZE - avail;
-        uint32_t r = wp - avail;
         memmove(fft->history, fft->history + avail, keep * sizeof(float));
-        for (uint32_t i = 0; i < avail; ++i) {
-            fft->history[keep + i] = fft->ring[(r + i) & (WAYWAL_AUDIO_RING_SIZE - 1u)];
-        }
+        copy_from_ring(fft->ring, wp - avail, fft->history + keep, avail);
     }
     fft->last_consumed = wp;
 
@@ -1157,9 +1177,9 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
     _Alignas(32) float zi[COMPLEX_FFT_N];
 
     for (uint32_t k = 0; k < COMPLEX_FFT_N; ++k) {
-        uint16_t j = fft->bit_rev[k];
-        zr[j] = fft->history[2u * k] * fft->hann_window[2u * k];
-        zi[j] = fft->history[2u * k + 1u] * fft->hann_window[2u * k + 1u];
+        uint16_t j = s_bit_rev[k];
+        zr[j] = fft->history[2u * k] * s_hann_window[2u * k];
+        zi[j] = fft->history[2u * k + 1u] * s_hann_window[2u * k + 1u];
     }
 
     execute_complex_fft_1024(fft, zr, zi);
@@ -1181,8 +1201,8 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
         float or_v = 0.5f * (zi[k] + zi[nk]);
         float oi_v = -0.5f * (zr[k] - zr[nk]);
 
-        float wr = fft->unpack_re[k];
-        float wi = fft->unpack_im[k];
+        float wr = s_unpack_re[k];
+        float wi = s_unpack_im[k];
 
         float xr = er + wr * or_v - wi * oi_v;
         float xi = ei + wr * oi_v + wi * or_v;

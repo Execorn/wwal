@@ -36,7 +36,7 @@ Wayland \fBzwlr_layer_shell_v1\fR layer used for wallpaper surfaces (default: \f
 Secondary layer surface (\fBwaywal-backdrop\fR) mode for compositors with overview backdrops such as Niri (default: \fB"none"\fR). Set to \fB"auto-blur"\fR to run the GPU 2-pass Dual-Kawase blur shader automatically.
 .RE
 .PP
-\fB10bit\fR = <bool>
+\fBten_bit\fR, \fB10bit\fR = <bool>
 .RS 4
 Enable 10-bit wide-gamut scanout (\fBXRGB2101010\fR / \fBARGB2101010\fR) when supported by the compositor (default: \fBfalse\fR).
 .RE
@@ -46,14 +46,14 @@ Enable 10-bit wide-gamut scanout (\fBXRGB2101010\fR / \fBARGB2101010\fR) when su
 Automatically restore per-output state from \fB$XDG_STATE_HOME/wwal/state.bin\fR when \fBwwald\fR starts or when a monitor is hotplugged (default: \fBtrue\fR).
 .RE
 .PP
-\fBpause_on_fullscreen\fR = <bool>
+\fBauto_pause_fullscreen\fR, \fBpause_on_fullscreen\fR = <bool>
 .RS 4
 Pause video and live shader rendering on an output when a fullscreen window covers it (default: \fBtrue\fR).
 .RE
 .PP
-\fBpause_on_maximized\fR = <bool>
+\fBauto_pause_maximized\fR, \fBpause_on_maximized\fR = <bool>
 .RS 4
-Pause video and live shader rendering on an output when a maximized window covers it (default: \fBtrue\fR).
+Pause video and live shader rendering on an output when a maximized window covers it (default: \fBfalse\fR).
 .RE
 .PP
 \fBpause_on_occluded_workspace\fR = <bool>
@@ -95,7 +95,7 @@ Automatically duck wallpaper audio volume when another application plays audio v
 .PP
 Controls the in-pipeline OKLab Wu quantizer + weighted K-Means++ + CAM16/HCT Material Design 3 palette generator.
 .PP
-\fBenable\fR = <bool>
+\fBenabled\fR, \fBenable\fR = <bool>
 .RS 4
 Automatically extract and export color palettes whenever a wallpaper changes (default: \fBtrue\fR).
 .RE
@@ -120,7 +120,7 @@ Contrast level between \fB-1.0\fR and \fB1.0\fR (default: \fB0.0\fR).
 Atomically write \fB~/.local/state/caelestia/scheme.json\fR for Quickshell (\fBcaelestia-shell\fR) live theme synchronization (default: \fBtrue\fR).
 .RE
 .PP
-\fBterminal_osc\fR = <bool>
+\fBtty_sequences\fR, \fBterminal_osc\fR = <bool>
 .RS 4
 Broadcast non-blocking ANSI \fBOSC 4\fR, \fBOSC 10\fR, and \fBOSC 11\fR escape sequences to active \fB/dev/pts/*\fR terminals (default: \fBtrue\fR).
 .RE
@@ -146,7 +146,7 @@ Sets default parameters for GPU compute and CPU SIMD wallpaper transitions.
 .PP
 \fBtype\fR = "<string>"
 .RS 4
-Default transition effect: \fBnone\fR, \fBsimple\fR, \fBfade\fR, \fBwipe\fR, \fBgrow\fR, \fBouter\fR, \fBwave\fR, \fBnoise\fR, \fBcrosszoom\fR, \fBslide\fR, \fBglitch\fR, \fBburn\fR, \fBripple\fR, \fBpixelate\fR, \fBdoom\fR, \fBswirl\fR, \fBcube\fR, \fBluma\fR, \fBlight_leak\fR, \fBpage_curl\fR, \fBcustom\fR, or \fBrandom\fR (default: \fB"fade"\fR).
+Default transition effect: \fBnone\fR, \fBsimple\fR, \fBfade\fR, \fBwipe\fR, \fBgrow\fR, \fBouter\fR, \fBwave\fR, \fBnoise\fR, \fBcrosszoom\fR, \fBslide\fR, \fBglitch\fR, \fBburn\fR, \fBripple\fR, \fBpixelate\fR, \fBdoom\fR, \fBswirl\fR, \fBcube\fR, \fBluma\fR, \fBlight_leak\fR, \fBpage_curl\fR, \fBcustom\fR, \fBleft\fR, \fBright\fR, \fBtop\fR, \fBbottom\fR, \fBcenter\fR, \fBany\fR, or \fBrandom\fR (default: \fB"fade"\fR).
 .RE
 .PP
 \fBduration\fR = <float>

@@ -4,7 +4,7 @@
 #endif
 #include "waywal/we_tex.h"
 
-#include "image_loader.h"
+#include "waywal/image_loader.h"
 #include "waywal/log.h"
 
 #include <ctype.h>
@@ -1174,7 +1174,7 @@ we_tex_t *we_tex_parse_cpu(const uint8_t *data, size_t size)
                 mip->rgba8 = dec_px;
                 mip->width = dw;
                 mip->height = dh;
-                mip->is_bgra_swiz = true;
+                mip->is_bgra_swiz = false;
                 if (img_idx == 0 && m == 0) {
                     tex->image_width = dw;
                     tex->image_height = dh;
@@ -1407,7 +1407,7 @@ static GLuint upload_single_image_gl(const we_tex_t *tex, const we_tex_image_t *
 
         if (mip->rgba8) {
             if (level == 0 && mip->is_bgra_swiz) {
-                /* image_load_from_memory_rgba returns BGRA [B, G, R, A]: swizzle R<->B on GPU */
+                /* BGRA [B, G, R, A] mip layout: swizzle R<->B on GPU */
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
             }
@@ -1923,8 +1923,21 @@ bool we_tex_advance_video(we_tex_t *tex, float dt_sec)
     if (!tex || !tex->demuxer) {
         return false;
     }
-    if (dt_sec > 0.0f) {
+
+    double frame_dur = 1.0 / 30.0;
+    if (tex->demuxer->fps_num > 0 && tex->demuxer->fps_den > 0) {
+        frame_dur = (double)tex->demuxer->fps_den / (double)tex->demuxer->fps_num;
+        if (frame_dur < (1.0 / 240.0) || frame_dur > 2.0) {
+            frame_dur = 1.0 / 30.0;
+        }
+    }
+
+    if (dt_sec > 0.0f && isfinite(dt_sec)) {
         tex->video_pts_sec += (double)dt_sec;
+    }
+
+    if (tex->video_has_first_frame && tex->video_pts_sec < tex->video_next_pts_sec) {
+        return true;
     }
 
 #ifdef HAVE_FFMPEG_SWDEC
@@ -1990,7 +2003,17 @@ bool we_tex_advance_video(we_tex_t *tex, float dt_sec)
                         }
                     }
                 }
+                int64_t f_pts_us = sw->frame->pts;
                 sw->p_av_frame_unref(sw->frame);
+                if (f_pts_us > 0) {
+                    tex->video_next_pts_sec = (double)f_pts_us * 1e-6 + frame_dur;
+                } else {
+                    tex->video_next_pts_sec += frame_dur;
+                }
+                if (tex->video_next_pts_sec < tex->video_pts_sec) {
+                    tex->video_next_pts_sec = tex->video_pts_sec + frame_dur;
+                }
+                tex->video_has_first_frame = true;
                 return true;
             }
 
@@ -1999,6 +2022,7 @@ bool we_tex_advance_video(we_tex_t *tex, float dt_sec)
                 if (tex->demuxer->seek_us) {
                     (void)tex->demuxer->seek_us(tex->demuxer, 0);
                     tex->video_pts_sec = 0.0;
+                    tex->video_next_pts_sec = 0.0;
                 }
                 sw->p_avcodec_flush_buffers(sw->codec_ctx);
                 if (!tex->demuxer->read_packet(tex->demuxer, &pkt)) {
@@ -2021,9 +2045,16 @@ bool we_tex_advance_video(we_tex_t *tex, float dt_sec)
         if (tex->demuxer->seek_us) {
             (void)tex->demuxer->seek_us(tex->demuxer, 0);
             tex->video_pts_sec = 0.0;
+            tex->video_next_pts_sec = 0.0;
             (void)tex->demuxer->read_packet(tex->demuxer, &pkt);
         }
     }
+    if (pkt.pts_us > 0) {
+        tex->video_next_pts_sec = (double)pkt.pts_us * 1e-6 + frame_dur;
+    } else {
+        tex->video_next_pts_sec += frame_dur;
+    }
+    tex->video_has_first_frame = true;
     return true;
 }
 

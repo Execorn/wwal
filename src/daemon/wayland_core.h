@@ -203,7 +203,6 @@ void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
 
 void daemon_clear_all_outputs(daemon_state_t *state, color_rgba_t color);
 void daemon_handle_ipc_connection(daemon_state_t *state);
-void layer_shell_blur_rgba_cpu(const uint8_t *src, uint8_t *dst, uint32_t w, uint32_t h);
 void reconcile_global_engine_flags(daemon_state_t *state);
 void daemon_reconcile_power_state(daemon_state_t *state);
 

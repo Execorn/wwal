@@ -81,7 +81,6 @@
               gdb
               valgrind
               ffmpeg
-              shaderc
               weston
             ];
           };
@@ -123,11 +122,12 @@
                     layer = "background";
                     battery_policy = "reduce-fps";
                     restore_on_start = true;
+                    idle_timeout_sec = 300;
                   };
                   theme = {
-                    enable = true;
+                    enabled = true;
                     caelestia_sync = true;
-                    terminal_osc = true;
+                    tty_sequences = true;
                   };
                   transition = {
                     type = "fade";
@@ -185,6 +185,10 @@
                 Sockets = lib.mkIf cfg.systemdSocketActivation [ "wwald.socket" ];
                 Restart = "on-failure";
                 RestartSec = "1s";
+                NoNewPrivileges = true;
+                LockPersonality = true;
+                RestrictSUIDSGID = true;
+                MemoryDenyWriteExecute = false;
               };
               Install = {
                 WantedBy = [ "graphical-session.target" ];

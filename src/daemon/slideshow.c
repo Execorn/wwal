@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/slideshow.h"
 
-#include "image_loader.h"
 #include "wayland_core.h"
+#include "waywal/image_loader.h"
 #include "waywal/log.h"
 
 #include <dirent.h>
@@ -15,6 +15,10 @@
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
+
+extern bool try_start_native_animation(daemon_state_t *state, const char *filepath,
+                                       const waywal_img_metadata_t *meta, const char *target_out)
+    __attribute__((weak));
 
 static bool has_image_extension(const char *name)
 {
@@ -42,7 +46,10 @@ static void add_file_to_list(slideshow_engine_t *ss, const char *filepath)
         ss->file_list = new_list;
         ss->capacity_files = new_cap;
     }
-    ss->file_list[ss->num_files++] = strdup(filepath);
+    char *dup = strdup(filepath);
+    if (!dup)
+        return;
+    ss->file_list[ss->num_files++] = dup;
 }
 
 static void scan_path_recursive_internal(slideshow_engine_t *ss, const char *path, int depth)
@@ -275,8 +282,14 @@ static void display_current_image(slideshow_engine_t *ss)
 
     bool ok = daemon_start_image_transition(st, pixels, img_w, img_h, meta);
     image_free(pixels);
-    if (ok && st->config.hooks.on_wallpaper_change[0] != '\0') {
-        (void)waywal_palette_run_hook(st->config.hooks.on_wallpaper_change);
+    if (ok) {
+        if (st->config.hooks.on_wallpaper_change[0] != '\0') {
+            (void)waywal_palette_run_hook(st->config.hooks.on_wallpaper_change);
+        }
+        if (try_start_native_animation) {
+            const char *first_target = (meta->num_target_outputs > 0) ? extra_ptr : "*";
+            (void)try_start_native_animation(st, filepath, meta, first_target);
+        }
     }
 }
 

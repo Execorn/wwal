@@ -146,8 +146,10 @@ static void apply_landlock_sandbox(const char *runtime_dir)
         add_landlock_dir_rule(ruleset_fd, rx_paths[i], rx_access);
     }
 
-    /* Allow read-only across standard system mounts required for DRM/Mesa/VA-API drivers */
-    const char *ro_paths[] = {"/etc", "/sys", "/proc", "/dev", "/dev/dri", "/tmp", NULL};
+    /* Allow read-only across standard system and external media mounts required for DRM/Mesa/VA-API
+     * drivers and wallpaper repositories */
+    const char *ro_paths[] = {"/etc",       "/sys",      "/proc", "/mnt", "/media",
+                              "/run/media", "/var/home", "/nix",  NULL};
     for (int i = 0; ro_paths[i] != NULL; ++i) {
         add_landlock_dir_rule(ruleset_fd, ro_paths[i], ro_access);
     }
@@ -363,6 +365,9 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(epoll_create),
             SCMP_SYS(epoll_ctl),
             SCMP_SYS(epoll_pwait),
+#ifdef __NR_epoll_pwait2
+            SCMP_SYS(epoll_pwait2),
+#endif
             SCMP_SYS(io_uring_setup),
             SCMP_SYS(io_uring_register),
             SCMP_SYS(timerfd_create),
@@ -383,6 +388,15 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(writev),
             SCMP_SYS(pread64),
             SCMP_SYS(pwrite64),
+#ifdef __NR_preadv2
+            SCMP_SYS(preadv2),
+#endif
+#ifdef __NR_pwritev2
+            SCMP_SYS(pwritev2),
+#endif
+#ifdef __NR_fadvise64
+            SCMP_SYS(fadvise64),
+#endif
             SCMP_SYS(lseek),
             SCMP_SYS(fcntl),
             SCMP_SYS(dup),
@@ -393,6 +407,12 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(ftruncate),
             SCMP_SYS(fdatasync),
             SCMP_SYS(fsync),
+#ifdef __NR_fchmod
+            SCMP_SYS(fchmod),
+#endif
+#ifdef __NR_close_range
+            SCMP_SYS(close_range),
+#endif
             SCMP_SYS(rename),
             SCMP_SYS(renameat),
             SCMP_SYS(renameat2),
@@ -427,6 +447,12 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(getpeername),
             SCMP_SYS(sendto),
             SCMP_SYS(recvfrom),
+#ifdef __NR_sendmmsg
+            SCMP_SYS(sendmmsg),
+#endif
+#ifdef __NR_recvmmsg
+            SCMP_SYS(recvmmsg),
+#endif
             SCMP_SYS(shutdown),
 
             /* Memory */
@@ -437,6 +463,12 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(memfd_create),
             SCMP_SYS(fallocate),
             SCMP_SYS(flock),
+#ifdef __NR_kcmp
+            SCMP_SYS(kcmp),
+#endif
+#ifdef __NR_membarrier
+            SCMP_SYS(membarrier),
+#endif
 
             /* Clocks */
             SCMP_SYS(clock_getres),
@@ -452,6 +484,9 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(tgkill),
             SCMP_SYS(tkill),
             SCMP_SYS(futex),
+#ifdef __NR_futex_waitv
+            SCMP_SYS(futex_waitv),
+#endif
             SCMP_SYS(set_robust_list),
             SCMP_SYS(get_robust_list),
             SCMP_SYS(getpid),
@@ -460,6 +495,18 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(geteuid),
             SCMP_SYS(getgid),
             SCMP_SYS(getegid),
+#ifdef __NR_getresuid
+            SCMP_SYS(getresuid),
+#endif
+#ifdef __NR_getresgid
+            SCMP_SYS(getresgid),
+#endif
+#ifdef __NR_getgroups
+            SCMP_SYS(getgroups),
+#endif
+#ifdef __NR_capget
+            SCMP_SYS(capget),
+#endif
             SCMP_SYS(getpriority),
             SCMP_SYS(setpriority),
             SCMP_SYS(sched_yield),
@@ -469,6 +516,12 @@ bool security_sandbox_apply(const char *runtime_dir)
             SCMP_SYS(sched_setparam),
             SCMP_SYS(sched_getscheduler),
             SCMP_SYS(sched_setscheduler),
+#ifdef __NR_sched_setattr
+            SCMP_SYS(sched_setattr),
+#endif
+#ifdef __NR_sched_getattr
+            SCMP_SYS(sched_getattr),
+#endif
             SCMP_SYS(sched_get_priority_max),
             SCMP_SYS(sched_get_priority_min),
             SCMP_SYS(rseq),

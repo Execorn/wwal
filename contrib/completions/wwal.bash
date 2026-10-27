@@ -3,9 +3,9 @@ _wwal_completion() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="img video shader workshop slideshow color clear theme audio set-uniform status subscribe pause resume unpause toggle query stats restore clear-cache ping kill help"
-    local global_opts="-j --json -n --namespace -v --verbose -h --help --layer --battery-policy"
-    local trans_types="none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random"
+    local commands="img video shader workshop slideshow color clear theme audio set-uniform status subscribe pause resume unpause toggle query stats restore clear-cache init ping kill version help"
+    local global_opts="-j --json -n --namespace -v --verbose -V --version -h --help --layer --battery-policy"
+    local trans_types="none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random left right top bottom center any"
     local trans_positions="center top bottom left right top-left top-right bottom-left bottom-right cursor mouse"
     local sync_modes="simultaneous staggered"
     local scaling_modes="fill fit stretch center tile span crop cover contain no"

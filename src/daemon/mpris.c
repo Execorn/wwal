@@ -5,7 +5,7 @@
 
 #include "waywal/mpris.h"
 
-#include "../client/image_loader.h"
+#include "waywal/image_loader.h"
 #include "waywal/log.h"
 
 #include <ctype.h>
@@ -244,7 +244,7 @@ static void update_album_art_from_url(waywal_mpris_t *mpris, const char *new_art
 
     const char *safe_url = new_art_url ? new_art_url : "";
     if (strcmp(mpris->meta.art_url, safe_url) == 0 &&
-        (safe_url[0] == '\0' || (mpris->meta.has_art_pixels && mpris->meta.art_rgba != NULL))) {
+        (safe_url[0] == '\0' || (mpris->meta.has_art_pixels && mpris->meta.art_bgra != NULL))) {
         return;
     }
 
@@ -286,26 +286,10 @@ static void update_album_art_from_url(waywal_mpris_t *mpris, const char *new_art
     if (!ok || !raw.data || raw.width == 0 || raw.height == 0)
         return;
 
-    size_t px_bytes = (size_t)raw.width * (size_t)raw.height * 4U;
-    uint8_t *rgba = (uint8_t *)malloc(px_bytes);
-    if (!rgba) {
-        raw_image_free(&raw);
-        return;
-    }
-
-    const uint8_t *bgra = raw.data;
-    size_t npx = (size_t)raw.width * (size_t)raw.height;
-    for (size_t i = 0; i < npx; ++i) {
-        rgba[i * 4 + 0] = bgra[i * 4 + 2];
-        rgba[i * 4 + 1] = bgra[i * 4 + 1];
-        rgba[i * 4 + 2] = bgra[i * 4 + 0];
-        rgba[i * 4 + 3] = bgra[i * 4 + 3];
-    }
-
     strncpy(mpris->meta.art_local_path, local_path, sizeof(mpris->meta.art_local_path) - 1);
     mpris->meta.art_local_path[sizeof(mpris->meta.art_local_path) - 1] = '\0';
     mpris->meta.art_bgra = raw.data;
-    mpris->meta.art_rgba = rgba;
+    mpris->meta.art_rgba = NULL;
     mpris->meta.art_w = raw.width;
     mpris->meta.art_h = raw.height;
     mpris->meta.has_art_pixels = true;
@@ -1000,7 +984,8 @@ waywal_mpris_t *waywal_mpris_create(waywal_mpris_change_cb_t on_change, void *us
 
     (void)mpris->api.add_match(mpris->bus, &mpris->owner_match_slot,
                                "type='signal',sender='org.freedesktop.DBus',"
-                               "interface='org.freedesktop.DBus',member='NameOwnerChanged'",
+                               "interface='org.freedesktop.DBus',member='NameOwnerChanged',"
+                               "arg0namespace='org.mpris.MediaPlayer2'",
                                on_name_owner_changed, mpris);
 
     (void)mpris->api.call_method_async(mpris->bus, &mpris->list_names_slot, "org.freedesktop.DBus",
@@ -1113,6 +1098,7 @@ void waywal_mpris_inject_state_for_test(waywal_mpris_t *mpris, const waywal_mpri
     if (!mpris || !state)
         return;
 
+    mpris->test_mode = true;
     mpris->meta.playing = state->playing || (state->status == WAYWAL_MPRIS_PLAYING) ||
                           (strcmp(state->playback_status, "Playing") == 0);
     if (state->status != WAYWAL_MPRIS_STOPPED) {

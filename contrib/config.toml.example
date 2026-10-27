@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# WayWal (wwald / wwal) Declarative Configuration Example
+# Copy to ~/.config/wwal/config.toml
+
+[daemon]
+layer = "background"                  # "background" or "bottom"
+namespace = "waywal"                  # Wayland layer-shell & IPC namespace
+battery_policy = "reduce-fps"         # "ignore", "reduce-fps" (24 FPS), or "pause-video"
+restore_on_start = true               # Restore saved per-output wallpapers on startup/hotplug
+auto_pause_fullscreen = true          # Pause video/shader/Workshop when output is covered by fullscreen window
+auto_pause_maximized = false          # Pause when output is covered by a maximized window
+pause_on_occluded_workspace = true    # Pause when active workspace is fully tiled/opaque
+pause_on_idle = true                  # Pause when ext-idle-notify-v1 reports session idle
+idle_timeout_sec = 300                # Seconds before session is considered idle
+ten_bit = false                       # Request 10-bit wide-gamut scanout (XRGB2101010 / ARGB2101010)
+backdrop = "none"                     # "none", "auto-blur" (Dual-Kawase for Niri overview), or image path
+volume = 0.0                          # Default wallpaper audio playback volume (0.0 .. 1.0)
+mute_on_audio = true                  # Auto-duck wallpaper volume when another app plays audio
+
+[theme]
+enabled = true                        # Extract Material Design 3 palette on every wallpaper change
+mode = "dark"                         # "dark" or "light"
+scheme_variant = "tonal_spot"         # tonal_spot, vibrant, expressive, neutral, monochrome, fidelity, content
+contrast = 0.0                        # Contrast adjustment (-1.0 .. 1.0)
+caelestia_sync = true                 # Write ~/.local/state/caelestia/scheme.json for Quickshell
+tty_sequences = true                  # Broadcast OSC 4/10/11 palette to active /dev/pts/* terminals
+export_css = true                     # Write ~/.cache/wwal/colors.css and colors.json
+export_hyprland = true                # Write ~/.cache/wwal/colors-hyprland.conf
+theme_from_media = false              # Dynamically extract palette from D-Bus MPRIS2 album art
+
+[transition]
+type = "grow"                         # none, simple, fade, wipe, grow, outer, wave, noise, crosszoom,
+                                      # slide, glitch, burn, ripple, pixelate, doom, swirl, cube, luma,
+                                      # light_leak, page_curl, custom, left, right, top, bottom, center, any, random
+duration = 0.8                        # Transition duration in seconds
+fps = 144                             # Target transition frame rate
+pos = "cursor"                        # center, cursor, top, bottom, left, right, tl, tr, bl, br, or "0.5,0.5"
+angle = 0.0                           # Angle in degrees for directional transitions (wipe, slide, wave)
+bezier = [0.25, 0.1, 0.25, 1.0]       # Cubic-bezier control points [x1, y1, x2, y2]
+sync_mode = "simultaneous"            # "simultaneous" or "staggered"
+stagger_delay_ms = 120                # Delay between monitors in staggered mode (ms)
+
+[hooks]
+on_wallpaper_change = ""              # Optional command executed after wallpaper transition finishes
+on_theme_change = ""                  # Optional command executed after Material 3 palette export
+
+# Optional per-output startup rules:
+# [output."DP-1"]
+# path = "~/Pictures/Wallpapers/ultrawide.jxl"
+# mode = "img"
+# scaling = "fill"
+#
+# [output."eDP-1"]
+# path = "~/Pictures/Wallpapers/Slideshow"
+# mode = "slideshow"
+# interval = 600
+# shuffle = true

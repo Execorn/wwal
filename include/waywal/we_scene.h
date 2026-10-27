@@ -25,6 +25,7 @@ extern "C" {
 #define WE_MAX_EFFECT_FBOS    8u
 #define WE_MAX_SCENE_RT_FBOS  16u
 #define WE_MAX_OBJECT_SCRIPTS 8u
+#define WE_SCENE_MAX_OBJECTS  512u
 
 typedef struct {
     we_script_prop_target_t target;
@@ -82,6 +83,49 @@ typedef struct {
 } we_pass_bind_t;
 
 typedef struct {
+    bool initialized;
+    int32_t mvp;
+    int32_t model_matrix;
+    int32_t model_matrix_inv;
+    int32_t vp_matrix;
+    int32_t view_proj_matrix;
+    int32_t time;
+    int32_t daytime;
+    int32_t frametime;
+    int32_t pointer_pos;
+    int32_t pointer_pos_last;
+    int32_t parallax_pos;
+    int32_t screen;
+    int32_t texel_size;
+    int32_t texel_size_half;
+    int32_t alpha;
+    int32_t brightness;
+    int32_t user_alpha;
+    int32_t color;
+    int32_t color4;
+    int32_t eye_pos;
+    int32_t view_up;
+    int32_t view_forward;
+    int32_t view_right;
+    int32_t orient_up;
+    int32_t orient_right;
+    int32_t orient_forward;
+    int32_t media_playing;
+    int32_t album_art;
+    int32_t audio_l16;
+    int32_t audio_r16;
+    int32_t audio_l32;
+    int32_t audio_r32;
+    int32_t audio_l64;
+    int32_t audio_r64;
+    int32_t tex_sampler[WE_MAX_PASS_TEXTURES];
+    int32_t tex_resolution[WE_MAX_PASS_TEXTURES];
+    int32_t tex_translation[WE_MAX_PASS_TEXTURES];
+    int32_t tex_rotation[WE_MAX_PASS_TEXTURES];
+    int32_t custom_uniforms[WE_SHADER_MAX_UNIFORMS];
+} we_pass_uniform_locs_t;
+
+typedef struct {
     char shader_name[128];
     we_blend_mode_t blending;
     bool depthtest_enabled;
@@ -106,6 +150,7 @@ typedef struct {
     /* Preprocessed & compiled GL program */
     we_shader_preprocessed_t prep;
     uint32_t gl_prog;
+    we_pass_uniform_locs_t ulocs;
 } we_material_pass_t;
 
 typedef struct {
@@ -152,6 +197,7 @@ typedef struct we_scene_object {
     bool visible;
     char visible_user_prop[64];
     bool copybackground;
+    bool needs_full_fb_copy;
     bool fullscreen;
     bool passthrough;
 
@@ -214,6 +260,23 @@ typedef struct we_scene {
     uint32_t default_program;
     uint32_t particle_program;
     uint32_t target_fbo;
+    int32_t present_u_tex_loc;
+    int32_t part_mvp_loc;
+    int32_t part_color4_loc;
+    int32_t part_trans_loc;
+    int32_t part_rot_loc;
+    int32_t part_tex0_loc;
+    we_pass_uniform_locs_t default_prog_ulocs;
+
+    /* Cached EGL/GL extension function pointers */
+    void *fn_eglCreateImageKHR;
+    void *fn_eglDestroyImageKHR;
+    void *fn_glEGLImageTargetTexture2DOES;
+    void *fn_glEGLImageTargetTexStorageEXT;
+    void *fn_eglCreateSyncKHR;
+    void *fn_eglClientWaitSyncKHR;
+    void *fn_eglDestroySyncKHR;
+    bool egl_procs_resolved;
 
     uint32_t scene_fbo;
     uint32_t scene_fbo_tex;
@@ -244,6 +307,7 @@ typedef struct we_scene {
     float last_pointer[2];
     float smooth_parallax[2];
     float sim_time;
+    uint64_t frame_counter;
     bool first_frame_done;
     bool uses_audio;
     we_script_shared_t script_shared;

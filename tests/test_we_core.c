@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cli_parser.h"
-#include "image_loader.h"
 #include "waywal/audio_fft.h"
 #include "waywal/dmabuf.h"
+#include "waywal/image_loader.h"
 #include "waywal/ipc_proto.h"
 #include "waywal/mpris.h"
 #include "waywal/palette_hct.h"
 #include "waywal/shader_engine.h"
 #include "waywal/toml_parser.h"
+#include "waywal/we_json.h"
 #include "waywal/we_particle.h"
 #include "waywal/we_pkg.h"
 #include "waywal/we_puppet.h"
@@ -2472,6 +2473,7 @@ static void test_mpris_audio_ducking_and_live_uniforms(void)
         strncpy(fake_st.art_url, art_uri, sizeof(fake_st.art_url) - 1);
         fake_st.length_us = 258000000;
 
+        mctx.call_count = 0;
         waywal_mpris_inject_state_for_test(mpris, &fake_st);
         assert(mctx.call_count == 1);
         assert(waywal_mpris_is_playing(mpris));
@@ -2532,6 +2534,7 @@ static void test_mpris_audio_ducking_and_live_uniforms(void)
         assert(waywal_shader_engine_get_custom_uniform(seng, "u_Speed", read_v, &read_comp));
         assert(read_comp == 1 && fabsf(read_v[0] - 4.0f) < 1e-5f);
 
+        waywal_shader_engine_release_scratch(seng);
         waywal_shader_engine_destroy(seng);
         image_free(bgra);
         waywal_mpris_destroy(mpris);
@@ -2995,6 +2998,39 @@ static void test_mpris_arbitration_and_scene_uniform_overrides(void)
     }
 }
 
+static void test_shared_we_json_dom(void)
+{
+    printf("  [TEST] Testing shared we_json DOM parser and edge cases...\n");
+    assert(we_json_parse_root(NULL, 0) == NULL);
+    assert(we_json_parse_root("", 0) == NULL);
+
+    const char *doc_src = "{\n"
+                          "  \"name\": \"quote \\\"escaped\\\"\\nline\",\n"
+                          "  \"count\": 42,\n"
+                          "  \"active\": true,\n"
+                          "  \"vec\": \"0.25 0.5 0.75\",\n"
+                          "  \"items\": [1.5, -2.5, {\"nested\": false}]\n"
+                          "}\n";
+    we_jval_t *root = we_json_parse_root(doc_src, strlen(doc_src));
+    assert(root != NULL && root->type == JVAL_OBJ);
+    assert(strcmp(we_jval_str(we_jobj_get(root, "name"), ""), "quote \"escaped\"\nline") == 0);
+    assert(fabsf(we_jval_float(we_jobj_get(root, "count"), NULL, 0.0f, NULL, 0) - 42.0f) < 1e-5f);
+    assert(we_jval_bool_resolved(we_jobj_get(root, "active"), NULL, false, NULL, 0) == true);
+
+    float v3[3] = {0.0f, 0.0f, 0.0f};
+    assert(we_jval_floats(we_jobj_get(root, "vec"), NULL, v3, 3, NULL, 0) == 3);
+    assert(fabsf(v3[0] - 0.25f) < 1e-5f);
+    assert(fabsf(v3[1] - 0.50f) < 1e-5f);
+    assert(fabsf(v3[2] - 0.75f) < 1e-5f);
+
+    const we_jval_t *items = we_jobj_get(root, "items");
+    assert(items != NULL && items->type == JVAL_ARR && items->arr.count == 3);
+    const we_jval_t *elem2 = items->arr.items[2];
+    assert(elem2 != NULL && elem2->type == JVAL_OBJ);
+    assert(we_jval_bool_resolved(we_jobj_get(elem2, "nested"), NULL, true, NULL, 0) == false);
+    we_jval_free(root);
+}
+
 int main(void)
 {
     printf("=== Running Wallpaper Engine Core Test Suite ===\n");
@@ -3010,6 +3046,7 @@ int main(void)
     test_script_gc_puppet_pose_and_particle_operators();
     test_mpris_audio_ducking_and_live_uniforms();
     test_mpris_arbitration_and_scene_uniform_overrides();
+    test_shared_we_json_dom();
     printf("=== All Wallpaper Engine Core Tests Passed! ===\n");
     return 0;
 }

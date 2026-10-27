@@ -46,12 +46,16 @@ struct waywal_power_governor {
     char focused_output[64];
     char active_workspace[64];
     bool workspace_changed;
+    uint64_t niri_fs_win_id;
+    char niri_fs_output[64];
 
     ipc_backend_t ipc_backend;
     int ipc_fd;
     bool ipc_reconnected;
-    char ipc_buf[4096];
+    char ipc_buf[16384];
     size_t ipc_buf_len;
+    size_t ipc_skip_bytes;
+    bool ipc_drop_line;
 
     int inotify_fd;
     int bat_fds[WAYWAL_SYSFS_BAT_COUNT];
@@ -494,10 +498,45 @@ void waywal_power_governor_feed_niri_event(waywal_power_governor_t *gov, const c
         return;
     }
 
+    char target_output[64];
+    target_output[0] = '\0';
+    const char *out_key = strstr(json, "\"output\"");
+    if (out_key) {
+        const char *colon = strchr(out_key + 8, ':');
+        if (colon) {
+            const char *q1 = strchr(colon + 1, '"');
+            if (q1) {
+                const char *q2 = strchr(q1 + 1, '"');
+                if (q2 && (size_t)(q2 - (q1 + 1)) < sizeof(target_output)) {
+                    size_t len = (size_t)(q2 - (q1 + 1));
+                    memcpy(target_output, q1 + 1, len);
+                    target_output[len] = '\0';
+                }
+            }
+        }
+    }
+    if (target_output[0] != '\0') {
+        snprintf(gov->focused_output, sizeof(gov->focused_output), "%s", target_output);
+        find_or_create_output(gov, gov->focused_output, true);
+    }
+
+    uint64_t ev_win_id = 0;
+    const char *id_field = strstr(json, "\"id\"");
+    if (id_field) {
+        const char *colon = strchr(id_field + 4, ':');
+        if (colon) {
+            const char *p = colon + 1;
+            while (*p && isspace((unsigned char)*p))
+                p++;
+            if (isdigit((unsigned char)*p)) {
+                ev_win_id = (uint64_t)strtoull(p, NULL, 10);
+            }
+        }
+    }
+
     if (strstr(json, "\"WorkspaceActivated\"") || strstr(json, "\"WorkspaceFocused\"")) {
-        const char *id_key = strstr(json, "\"id\"");
-        if (id_key) {
-            const char *colon = strchr(id_key + 4, ':');
+        if (id_field) {
+            const char *colon = strchr(id_field + 4, ':');
             if (colon) {
                 const char *p = colon + 1;
                 while (*p && isspace((unsigned char)*p)) {
@@ -513,6 +552,103 @@ void waywal_power_governor_feed_niri_event(waywal_power_governor_t *gov, const c
                     gov->active_workspace[len] = '\0';
                     gov->workspace_changed = true;
                 }
+            }
+        }
+        gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+        const char *out_name = target_output[0] != '\0' ? target_output : gov->focused_output;
+        if (out_name[0] != '\0') {
+            waywal_power_governor_set_output_reason(gov, out_name, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN,
+                                                    false);
+        }
+    } else if (strstr(json, "\"WindowClosed\"")) {
+        gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+        if (gov->niri_fs_output[0] != '\0' &&
+            (ev_win_id == 0 || gov->niri_fs_win_id == 0 || ev_win_id == gov->niri_fs_win_id)) {
+            waywal_power_governor_set_output_reason(gov, gov->niri_fs_output,
+                                                    WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
+            gov->niri_fs_output[0] = '\0';
+            gov->niri_fs_win_id = 0;
+        }
+        if (gov->focused_output[0] != '\0') {
+            waywal_power_governor_set_output_reason(gov, gov->focused_output,
+                                                    WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
+        }
+    }
+
+    if (strstr(json, "\"WindowsChanged\"")) {
+        gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+        for (size_t i = 0; i < gov->output_count; ++i) {
+            if (gov->outputs[i].in_use) {
+                gov->outputs[i].mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+            }
+        }
+        gov->niri_fs_output[0] = '\0';
+        gov->niri_fs_win_id = 0;
+    }
+
+    bool saw_fs_field = false;
+    bool is_fs = false;
+    const char *scan = json;
+    while (*scan) {
+        const char *k1 = strstr(scan, "\"is_fullscreen\"");
+        const char *k2 = strstr(scan, "\"fullscreen\"");
+        const char *fs_key = NULL;
+        size_t key_len = 0;
+        if (k1 && (!k2 || k1 <= k2)) {
+            fs_key = k1;
+            key_len = 15;
+        } else if (k2) {
+            fs_key = k2;
+            key_len = 12;
+        } else {
+            break;
+        }
+        const char *colon = strchr(fs_key + key_len, ':');
+        if (!colon)
+            break;
+        const char *p = colon + 1;
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (strncmp(p, "true", 4) == 0 || *p == '1') {
+            saw_fs_field = true;
+            is_fs = true;
+            break;
+        } else if (strncmp(p, "false", 5) == 0 || *p == '0') {
+            saw_fs_field = true;
+        }
+        scan = colon + 1;
+    }
+
+    if (saw_fs_field) {
+        const char *out_name = target_output[0] != '\0' ? target_output : gov->focused_output;
+        if (is_fs) {
+            if (gov->niri_fs_output[0] != '\0' && out_name[0] != '\0' &&
+                strcmp(gov->niri_fs_output, out_name) != 0 &&
+                (ev_win_id == 0 || gov->niri_fs_win_id == 0 || ev_win_id == gov->niri_fs_win_id)) {
+                waywal_power_governor_set_output_reason(gov, gov->niri_fs_output,
+                                                        WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
+            }
+            if (out_name[0] != '\0') {
+                snprintf(gov->niri_fs_output, sizeof(gov->niri_fs_output), "%s", out_name);
+                gov->niri_fs_win_id = ev_win_id;
+                waywal_power_governor_set_output_reason(gov, out_name,
+                                                        WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, true);
+            } else {
+                waywal_power_governor_set_global_reason(gov, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN,
+                                                        true);
+            }
+        } else {
+            gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+            if (gov->niri_fs_output[0] != '\0' &&
+                (ev_win_id == 0 || gov->niri_fs_win_id == 0 || ev_win_id == gov->niri_fs_win_id)) {
+                waywal_power_governor_set_output_reason(gov, gov->niri_fs_output,
+                                                        WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
+                gov->niri_fs_output[0] = '\0';
+                gov->niri_fs_win_id = 0;
+            }
+            if (out_name[0] != '\0') {
+                waywal_power_governor_set_output_reason(gov, out_name,
+                                                        WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
             }
         }
     }
@@ -559,6 +695,9 @@ void waywal_power_governor_dispatch_ipc(waywal_power_governor_t *gov)
 
     for (;;) {
         if (gov->ipc_buf_len >= sizeof(gov->ipc_buf) - 1) {
+            if (gov->ipc_backend == IPC_BACKEND_HYPRLAND || gov->ipc_backend == IPC_BACKEND_NIRI) {
+                gov->ipc_drop_line = true;
+            }
             gov->ipc_buf_len = 0;
         }
         ssize_t n = recv(gov->ipc_fd, gov->ipc_buf + gov->ipc_buf_len,
@@ -567,6 +706,8 @@ void waywal_power_governor_dispatch_ipc(waywal_power_governor_t *gov)
             close(gov->ipc_fd);
             gov->ipc_fd = -1;
             gov->ipc_buf_len = 0;
+            gov->ipc_skip_bytes = 0;
+            gov->ipc_drop_line = false;
             init_compositor_ipc(gov);
             gov->ipc_reconnected = (gov->ipc_fd >= 0);
             break;
@@ -582,7 +723,9 @@ void waywal_power_governor_dispatch_ipc(waywal_power_governor_t *gov)
             char *nl = NULL;
             while ((nl = strchr(start, '\n')) != NULL) {
                 *nl = '\0';
-                if (gov->ipc_backend == IPC_BACKEND_HYPRLAND) {
+                if (gov->ipc_drop_line) {
+                    gov->ipc_drop_line = false;
+                } else if (gov->ipc_backend == IPC_BACKEND_HYPRLAND) {
                     waywal_power_governor_feed_hyprland_event(gov, start);
                 } else {
                     waywal_power_governor_feed_niri_event(gov, start);
@@ -596,7 +739,13 @@ void waywal_power_governor_dispatch_ipc(waywal_power_governor_t *gov)
             gov->ipc_buf_len = rem;
         } else if (gov->ipc_backend == IPC_BACKEND_SWAY) {
             size_t offset = 0;
-            while (gov->ipc_buf_len - offset >= 14) {
+            if (gov->ipc_skip_bytes > 0) {
+                size_t skip =
+                    gov->ipc_buf_len < gov->ipc_skip_bytes ? gov->ipc_buf_len : gov->ipc_skip_bytes;
+                offset += skip;
+                gov->ipc_skip_bytes -= skip;
+            }
+            while (gov->ipc_skip_bytes == 0 && gov->ipc_buf_len - offset >= 14) {
                 if (memcmp(gov->ipc_buf + offset, "i3-ipc", 6) != 0) {
                     offset++;
                     continue;
@@ -604,8 +753,12 @@ void waywal_power_governor_dispatch_ipc(waywal_power_governor_t *gov)
                 uint32_t msg_len = 0;
                 memcpy(&msg_len, gov->ipc_buf + offset + 6, 4);
                 if (msg_len > sizeof(gov->ipc_buf) - 16) {
-                    gov->ipc_buf_len = 0;
-                    return;
+                    offset += 14u;
+                    size_t avail = gov->ipc_buf_len - offset;
+                    size_t skip = avail < (size_t)msg_len ? avail : (size_t)msg_len;
+                    offset += skip;
+                    gov->ipc_skip_bytes = (size_t)msg_len - skip;
+                    break;
                 }
                 if (gov->ipc_buf_len - offset < 14u + msg_len) {
                     break;

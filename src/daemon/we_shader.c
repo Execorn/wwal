@@ -93,42 +93,7 @@ static const char WE_BUILTIN_COMMON_FRAGMENT_H[] =
 static const char WE_BUILTIN_COMMON_BLENDING_H[] =
     "#ifndef WE_COMMON_BLENDING_H_INCLUDED\n"
     "#define WE_COMMON_BLENDING_H_INCLUDED\n"
-    "#ifndef WE_COMMON_H_INCLUDED\n"
-    "#define WE_COMMON_H_INCLUDED\n"
-    "#ifndef M_PI\n"
-    "#define M_PI 3.14159265358979323846\n"
-    "#endif\n"
-    "#ifndef M_PI_2\n"
-    "#define M_PI_2 1.57079632679489661923\n"
-    "#endif\n"
-    "#ifndef M_TWO_PI\n"
-    "#define M_TWO_PI 6.28318530717958647692\n"
-    "#endif\n"
-    "vec3 rgb2hsv(vec3 c) {\n"
-    "    vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);\n"
-    "    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));\n"
-    "    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));\n"
-    "    float d = q.x - min(q.w, q.y);\n"
-    "    float e = 1.0e-10;\n"
-    "    return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);\n"
-    "}\n"
-    "vec3 hsv2rgb(vec3 c) {\n"
-    "    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);\n"
-    "    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);\n"
-    "    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);\n"
-    "}\n"
-    "vec2 rotateVec2(vec2 v, float r) {\n"
-    "    float cs = cos(r);\n"
-    "    float sn = sin(r);\n"
-    "    return vec2(v.x * cs - v.y * sn, v.x * sn + v.y * cs);\n"
-    "}\n"
-    "vec2 rotateVec2(vec4 v, float r) {\n"
-    "    return rotateVec2(v.xy, r);\n"
-    "}\n"
-    "float greyscale(vec3 c) {\n"
-    "    return dot(c, vec3(0.11, 0.59, 0.3));\n"
-    "}\n"
-    "#endif\n"
+    "#include \"common.h\"\n"
     "#ifndef BLENDMODE\n"
     "#define BLENDMODE 0\n"
     "#endif\n"
@@ -831,11 +796,246 @@ static int type_to_width(const char *type)
     return 0;
 }
 
-static void collect_varyings(const char *src, we_varying_info_t *list, uint32_t *inout_count)
+static bool pp_lookup_macro(const char *name, size_t len, const we_shader_meta_t *meta,
+                            const we_shader_combo_t *local_defs, uint32_t local_count, int *out_val)
+{
+    if (out_val) {
+        *out_val = 0;
+    }
+    if (!name || len == 0) {
+        return false;
+    }
+    for (uint32_t i = local_count; i > 0; i--) {
+        const we_shader_combo_t *c = &local_defs[i - 1];
+        if (strlen(c->name) == len && strncmp(c->name, name, len) == 0) {
+            if (out_val) {
+                *out_val = c->value;
+            }
+            return true;
+        }
+    }
+    if (meta) {
+        for (uint32_t i = 0; i < meta->combo_count; i++) {
+            const we_shader_combo_t *c = &meta->combos[i];
+            if (strlen(c->name) == len && strncmp(c->name, name, len) == 0) {
+                if (out_val) {
+                    *out_val = c->value;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void pp_skip_ws(const char **pp, const char *end)
+{
+    while (*pp < end && (**pp == ' ' || **pp == '\t' || **pp == '\r')) {
+        (*pp)++;
+    }
+}
+
+static int eval_pp_or(const char **pp, const char *end, const we_shader_meta_t *meta,
+                      const we_shader_combo_t *local_defs, uint32_t local_count);
+
+static int eval_pp_primary(const char **pp, const char *end, const we_shader_meta_t *meta,
+                           const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    pp_skip_ws(pp, end);
+    if (*pp >= end) {
+        return 0;
+    }
+    if (**pp == '(') {
+        (*pp)++;
+        int v = eval_pp_or(pp, end, meta, local_defs, local_count);
+        pp_skip_ws(pp, end);
+        if (*pp < end && **pp == ')') {
+            (*pp)++;
+        }
+        return v;
+    }
+    if (isdigit((unsigned char)**pp)) {
+        char *next = NULL;
+        long v = strtol(*pp, &next, 0);
+        if (next && next > *pp) {
+            *pp = (next <= end) ? next : end;
+        } else {
+            (*pp)++;
+        }
+        return (int)v;
+    }
+    if (isalpha((unsigned char)**pp) || **pp == '_') {
+        const char *id_start = *pp;
+        while (*pp < end && (isalnum((unsigned char)**pp) || **pp == '_')) {
+            (*pp)++;
+        }
+        int val = 0;
+        pp_lookup_macro(id_start, (size_t)(*pp - id_start), meta, local_defs, local_count, &val);
+        return val;
+    }
+    return 0;
+}
+
+static int eval_pp_unary(const char **pp, const char *end, const we_shader_meta_t *meta,
+                         const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    pp_skip_ws(pp, end);
+    if (*pp >= end) {
+        return 0;
+    }
+    if (**pp == '!' && (*pp + 1 >= end || (*pp)[1] != '=')) {
+        (*pp)++;
+        return !eval_pp_unary(pp, end, meta, local_defs, local_count);
+    }
+    if (**pp == '+') {
+        (*pp)++;
+        return eval_pp_unary(pp, end, meta, local_defs, local_count);
+    }
+    if (**pp == '-') {
+        (*pp)++;
+        return -eval_pp_unary(pp, end, meta, local_defs, local_count);
+    }
+    if (end - *pp >= 7 && strncmp(*pp, "defined", 7) == 0 &&
+        (*pp + 7 == end || !(isalnum((unsigned char)(*pp)[7]) || (*pp)[7] == '_'))) {
+        *pp += 7;
+        pp_skip_ws(pp, end);
+        bool has_paren = false;
+        if (*pp < end && **pp == '(') {
+            has_paren = true;
+            (*pp)++;
+            pp_skip_ws(pp, end);
+        }
+        const char *id_start = *pp;
+        while (*pp < end && (isalnum((unsigned char)**pp) || **pp == '_')) {
+            (*pp)++;
+        }
+        size_t id_len = (size_t)(*pp - id_start);
+        if (has_paren) {
+            pp_skip_ws(pp, end);
+            if (*pp < end && **pp == ')') {
+                (*pp)++;
+            }
+        }
+        return pp_lookup_macro(id_start, id_len, meta, local_defs, local_count, NULL) ? 1 : 0;
+    }
+    return eval_pp_primary(pp, end, meta, local_defs, local_count);
+}
+
+static int eval_pp_add(const char **pp, const char *end, const we_shader_meta_t *meta,
+                       const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int lhs = eval_pp_unary(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (*pp < end && **pp == '+') {
+            (*pp)++;
+            lhs += eval_pp_unary(pp, end, meta, local_defs, local_count);
+        } else if (*pp < end && **pp == '-') {
+            (*pp)++;
+            lhs -= eval_pp_unary(pp, end, meta, local_defs, local_count);
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int eval_pp_rel(const char **pp, const char *end, const we_shader_meta_t *meta,
+                       const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int lhs = eval_pp_add(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (end - *pp >= 2 && (*pp)[0] == '<' && (*pp)[1] == '=') {
+            *pp += 2;
+            lhs = (lhs <= eval_pp_add(pp, end, meta, local_defs, local_count)) ? 1 : 0;
+        } else if (end - *pp >= 2 && (*pp)[0] == '>' && (*pp)[1] == '=') {
+            *pp += 2;
+            lhs = (lhs >= eval_pp_add(pp, end, meta, local_defs, local_count)) ? 1 : 0;
+        } else if (*pp < end && **pp == '<') {
+            (*pp)++;
+            lhs = (lhs < eval_pp_add(pp, end, meta, local_defs, local_count)) ? 1 : 0;
+        } else if (*pp < end && **pp == '>') {
+            (*pp)++;
+            lhs = (lhs > eval_pp_add(pp, end, meta, local_defs, local_count)) ? 1 : 0;
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int eval_pp_eq(const char **pp, const char *end, const we_shader_meta_t *meta,
+                      const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int lhs = eval_pp_rel(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (end - *pp >= 2 && (*pp)[0] == '=' && (*pp)[1] == '=') {
+            *pp += 2;
+            lhs = (lhs == eval_pp_rel(pp, end, meta, local_defs, local_count)) ? 1 : 0;
+        } else if (end - *pp >= 2 && (*pp)[0] == '!' && (*pp)[1] == '=') {
+            *pp += 2;
+            lhs = (lhs != eval_pp_rel(pp, end, meta, local_defs, local_count)) ? 1 : 0;
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int eval_pp_and(const char **pp, const char *end, const we_shader_meta_t *meta,
+                       const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int lhs = eval_pp_eq(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (end - *pp >= 2 && (*pp)[0] == '&' && (*pp)[1] == '&') {
+            *pp += 2;
+            int rhs = eval_pp_eq(pp, end, meta, local_defs, local_count);
+            lhs = (lhs && rhs) ? 1 : 0;
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int eval_pp_or(const char **pp, const char *end, const we_shader_meta_t *meta,
+                      const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int lhs = eval_pp_and(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (end - *pp >= 2 && (*pp)[0] == '|' && (*pp)[1] == '|') {
+            *pp += 2;
+            int rhs = eval_pp_and(pp, end, meta, local_defs, local_count);
+            lhs = (lhs || rhs) ? 1 : 0;
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static void collect_varyings(const char *src, const we_shader_meta_t *meta, we_varying_info_t *list,
+                             uint32_t *inout_count)
 {
     if (!src || !list || !inout_count) {
         return;
     }
+
+    typedef struct {
+        bool parent_active;
+        bool branch_active;
+        bool seen_true;
+    } pp_cond_frame_t;
+
+    pp_cond_frame_t cond_stack[32];
+    uint32_t cond_depth = 0;
+    we_shader_combo_t local_defs[64];
+    uint32_t local_count = 0;
+
     const char *line = src;
     while (*line) {
         const char *eol = strchr(line, '\n');
@@ -843,10 +1043,105 @@ static void collect_varyings(const char *src, we_varying_info_t *list, uint32_t 
 
         const char *p = line;
         const char *end = line + line_len;
+        /* Strip trailing // comments before parsing directives or declarations */
+        for (const char *c = line; c + 1 < end; c++) {
+            if (c[0] == '/' && c[1] == '/') {
+                end = c;
+                break;
+            }
+        }
         while (p < end && (*p == ' ' || *p == '\t')) {
             p++;
         }
-        if (end - p > 8 && strncmp(p, "varying", 7) == 0 && isspace((unsigned char)p[7])) {
+
+        bool cur_active = (cond_depth == 0) ? true : cond_stack[cond_depth - 1].branch_active;
+
+        if (p < end && *p == '#') {
+            p++;
+            pp_skip_ws(&p, end);
+            const char *kw = p;
+            while (p < end && isalpha((unsigned char)*p)) {
+                p++;
+            }
+            size_t kw_len = (size_t)(p - kw);
+            pp_skip_ws(&p, end);
+
+            if (kw_len == 5 && strncmp(kw, "ifdef", 5) == 0) {
+                const char *id = p;
+                while (p < end && (isalnum((unsigned char)*p) || *p == '_')) {
+                    p++;
+                }
+                bool cond = cur_active && pp_lookup_macro(id, (size_t)(p - id), meta, local_defs,
+                                                          local_count, NULL);
+                if (cond_depth < 32) {
+                    cond_stack[cond_depth++] = (pp_cond_frame_t){
+                        .parent_active = cur_active, .branch_active = cond, .seen_true = cond};
+                }
+            } else if (kw_len == 6 && strncmp(kw, "ifndef", 6) == 0) {
+                const char *id = p;
+                while (p < end && (isalnum((unsigned char)*p) || *p == '_')) {
+                    p++;
+                }
+                bool cond = cur_active && !pp_lookup_macro(id, (size_t)(p - id), meta, local_defs,
+                                                           local_count, NULL);
+                if (cond_depth < 32) {
+                    cond_stack[cond_depth++] = (pp_cond_frame_t){
+                        .parent_active = cur_active, .branch_active = cond, .seen_true = cond};
+                }
+            } else if (kw_len == 2 && strncmp(kw, "if", 2) == 0) {
+                bool cond = cur_active && (eval_pp_or(&p, end, meta, local_defs, local_count) != 0);
+                if (cond_depth < 32) {
+                    cond_stack[cond_depth++] = (pp_cond_frame_t){
+                        .parent_active = cur_active, .branch_active = cond, .seen_true = cond};
+                }
+            } else if (kw_len == 4 && strncmp(kw, "elif", 4) == 0 && cond_depth > 0) {
+                pp_cond_frame_t *top = &cond_stack[cond_depth - 1];
+                if (!top->parent_active || top->seen_true) {
+                    top->branch_active = false;
+                } else {
+                    bool cond = (eval_pp_or(&p, end, meta, local_defs, local_count) != 0);
+                    top->branch_active = cond;
+                    top->seen_true = cond;
+                }
+            } else if (kw_len == 4 && strncmp(kw, "else", 4) == 0 && cond_depth > 0) {
+                pp_cond_frame_t *top = &cond_stack[cond_depth - 1];
+                top->branch_active = top->parent_active && !top->seen_true;
+                top->seen_true = true;
+            } else if (kw_len == 5 && strncmp(kw, "endif", 5) == 0 && cond_depth > 0) {
+                cond_depth--;
+            } else if (cur_active && kw_len == 6 && strncmp(kw, "define", 6) == 0) {
+                const char *id = p;
+                while (p < end && (isalnum((unsigned char)*p) || *p == '_')) {
+                    p++;
+                }
+                size_t id_len = (size_t)(p - id);
+                if (id_len > 0 && id_len < sizeof(local_defs[0].name) && (p >= end || *p != '(')) {
+                    pp_skip_ws(&p, end);
+                    int val = (p < end) ? eval_pp_or(&p, end, meta, local_defs, local_count) : 1;
+                    if (local_count < 64) {
+                        memcpy(local_defs[local_count].name, id, id_len);
+                        local_defs[local_count].name[id_len] = '\0';
+                        local_defs[local_count].value = val;
+                        local_count++;
+                    }
+                }
+            } else if (cur_active && kw_len == 5 && strncmp(kw, "undef", 5) == 0) {
+                const char *id = p;
+                while (p < end && (isalnum((unsigned char)*p) || *p == '_')) {
+                    p++;
+                }
+                size_t id_len = (size_t)(p - id);
+                for (uint32_t i = 0; i < local_count;) {
+                    if (strlen(local_defs[i].name) == id_len &&
+                        strncmp(local_defs[i].name, id, id_len) == 0) {
+                        local_defs[i] = local_defs[--local_count];
+                    } else {
+                        i++;
+                    }
+                }
+            }
+        } else if (cur_active && end - p > 8 && strncmp(p, "varying", 7) == 0 &&
+                   isspace((unsigned char)p[7])) {
             char decl[256];
             size_t dlen = (size_t)(end - (p + 7));
             if (dlen >= sizeof(decl)) {
@@ -873,10 +1168,20 @@ static void collect_varyings(const char *src, we_varying_info_t *list, uint32_t 
             }
             if (vtype && vname && strchr(vname, '[') == NULL) {
                 int w = type_to_width(vtype);
-                if (w > 0 && *inout_count < WE_SHADER_MAX_VARYINGS) {
-                    snprintf(list[*inout_count].name, sizeof(list[0].name), "%s", vname);
-                    list[*inout_count].width = w;
-                    (*inout_count)++;
+                if (w > 0) {
+                    bool updated = false;
+                    for (uint32_t i = 0; i < *inout_count; i++) {
+                        if (strcmp(list[i].name, vname) == 0) {
+                            list[i].width = w;
+                            updated = true;
+                            break;
+                        }
+                    }
+                    if (!updated && *inout_count < WE_SHADER_MAX_VARYINGS) {
+                        snprintf(list[*inout_count].name, sizeof(list[0].name), "%s", vname);
+                        list[*inout_count].width = w;
+                        (*inout_count)++;
+                    }
                 }
             }
         }
@@ -887,6 +1192,106 @@ static void collect_varyings(const char *src, we_varying_info_t *list, uint32_t 
     }
 }
 
+typedef struct {
+    char name[64];
+    char swiz[8];
+} we_varying_swizzle_t;
+
+static bool append_line_with_varying_swizzles(we_strbuf_t *sb, const char *line, size_t line_len,
+                                              const we_varying_swizzle_t *swizzles,
+                                              uint32_t swizzle_count)
+{
+    const char *end = line + line_len;
+    const char *code_end = end;
+    for (const char *c = line; c + 1 < end; c++) {
+        if (c[0] == '/' && c[1] == '/') {
+            code_end = c;
+            break;
+        }
+    }
+
+    const char *cur = line;
+    const char *seg_start = line;
+    while (cur < code_end) {
+        if (isalpha((unsigned char)*cur) || *cur == '_') {
+            bool after_dot_or_id = (cur > line && (isalnum((unsigned char)cur[-1]) ||
+                                                   cur[-1] == '_' || cur[-1] == '.'));
+            const char *id_start = cur;
+            while (cur < code_end && (isalnum((unsigned char)*cur) || *cur == '_')) {
+                cur++;
+            }
+            size_t id_len = (size_t)(cur - id_start);
+
+            if (!after_dot_or_id) {
+                /* Check for user function definition `float saturate(` to avoid macro expansion */
+                if (id_len == 8 && strncmp(id_start, "saturate", 8) == 0) {
+                    const char *after = cur;
+                    while (after < code_end && (*after == ' ' || *after == '\t')) {
+                        after++;
+                    }
+                    if (after < code_end && *after == '(') {
+                        /* Check if preceded by a GLSL type token on the same line (never `return`)
+                         */
+                        const char *prev_end = id_start;
+                        while (prev_end > line && (prev_end[-1] == ' ' || prev_end[-1] == '\t')) {
+                            prev_end--;
+                        }
+                        const char *prev_start = prev_end;
+                        while (prev_start > line &&
+                               (isalnum((unsigned char)prev_start[-1]) || prev_start[-1] == '_')) {
+                            prev_start--;
+                        }
+                        size_t tlen = (size_t)(prev_end - prev_start);
+                        bool is_type = (tlen == 5 && strncmp(prev_start, "float", 5) == 0) ||
+                                       (tlen == 4 && (strncmp(prev_start, "vec2", 4) == 0 ||
+                                                      strncmp(prev_start, "vec3", 4) == 0 ||
+                                                      strncmp(prev_start, "vec4", 4) == 0 ||
+                                                      strncmp(prev_start, "half", 4) == 0)) ||
+                                       (tlen == 5 && (strncmp(prev_start, "half2", 5) == 0 ||
+                                                      strncmp(prev_start, "half3", 5) == 0 ||
+                                                      strncmp(prev_start, "half4", 5) == 0)) ||
+                                       (tlen == 6 && (strncmp(prev_start, "float2", 6) == 0 ||
+                                                      strncmp(prev_start, "float3", 6) == 0 ||
+                                                      strncmp(prev_start, "float4", 6) == 0));
+                        if (is_type) {
+                            if (!sb_append_len(sb, seg_start, (size_t)(id_start - seg_start)) ||
+                                !sb_append(sb, "we_user_saturate")) {
+                                return false;
+                            }
+                            seg_start = cur;
+                            continue;
+                        }
+                    }
+                }
+
+                for (uint32_t i = 0; i < swizzle_count; i++) {
+                    if (swizzles[i].swiz[0] != '\0' && strlen(swizzles[i].name) == id_len &&
+                        strncmp(swizzles[i].name, id_start, id_len) == 0) {
+                        const char *after = cur;
+                        while (after < code_end && (*after == ' ' || *after == '\t')) {
+                            after++;
+                        }
+                        /* Only append .<swiz> if the shader didn't already write <vname>.<member>
+                         */
+                        if (after >= code_end || *after != '.') {
+                            if (!sb_append_len(sb, seg_start, (size_t)(cur - seg_start)) ||
+                                !sb_append(sb, ".") || !sb_append(sb, swizzles[i].swiz)) {
+                                return false;
+                            }
+                            seg_start = cur;
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            cur++;
+        }
+    }
+
+    return sb_append_len(sb, seg_start, (size_t)(end - seg_start)) && sb_append(sb, "\n");
+}
+
 /* Rewrites legacy attribute/varying lines and optionally promotes specific varyings to vec4 */
 static char *transform_stage_declarations(const char *expanded_src, bool is_frag,
                                           const we_varying_info_t *promoted_varyings,
@@ -895,6 +1300,26 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
     we_strbuf_t sb;
     if (!sb_init(&sb, strlen(expanded_src) + 512)) {
         return NULL;
+    }
+
+    we_varying_swizzle_t active_swizzles[WE_SHADER_MAX_VARYINGS];
+    uint32_t active_swizzle_count = 0;
+    for (uint32_t i = 0; i < promoted_count && active_swizzle_count < WE_SHADER_MAX_VARYINGS; i++) {
+        const char *swiz = "";
+        if (promoted_varyings[i].width == 1) {
+            swiz = "x";
+        } else if (promoted_varyings[i].width == 2) {
+            swiz = "xy";
+        } else if (promoted_varyings[i].width == 3) {
+            swiz = "xyz";
+        }
+        if (swiz[0] != '\0') {
+            snprintf(active_swizzles[active_swizzle_count].name, sizeof(active_swizzles[0].name),
+                     "%s", promoted_varyings[i].name);
+            snprintf(active_swizzles[active_swizzle_count].swiz, sizeof(active_swizzles[0].swiz),
+                     "%s", swiz);
+            active_swizzle_count++;
+        }
     }
 
     const char *line = expanded_src;
@@ -947,12 +1372,24 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
                 for (uint32_t i = 0; i < promoted_count; i++) {
                     if (strcmp(promoted_varyings[i].name, vname) == 0) {
                         promote_to_vec4 = true;
+                        if (promoted_varyings[i].width > 0) {
+                            orig_width = promoted_varyings[i].width;
+                        }
                         break;
                     }
                 }
             }
 
             if (promote_to_vec4 && vname) {
+                const char *swiz = "";
+                if (orig_width == 1) {
+                    swiz = "x";
+                } else if (orig_width == 2) {
+                    swiz = "xy";
+                } else if (orig_width == 3) {
+                    swiz = "xyz";
+                }
+
                 ok = sb_append(&sb, "#undef ") && sb_append(&sb, vname) && sb_append(&sb, "\n") &&
                      sb_append_len(&sb, line, (size_t)(p - line)) &&
                      sb_append(&sb, is_frag ? "in " : "out ");
@@ -961,23 +1398,37 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
                 }
                 ok =
                     ok && sb_append(&sb, "vec4 ") && sb_append(&sb, vname) && sb_append(&sb, ";\n");
-                if (ok && orig_width == 1) {
+                if (ok && swiz[0] != '\0') {
                     ok = sb_append(&sb, "#define ") && sb_append(&sb, vname) &&
-                         sb_append(&sb, " ") && sb_append(&sb, vname) && sb_append(&sb, ".x\n");
-                } else if (ok && orig_width == 2) {
-                    ok = sb_append(&sb, "#define ") && sb_append(&sb, vname) &&
-                         sb_append(&sb, " ") && sb_append(&sb, vname) && sb_append(&sb, ".xy\n");
-                } else if (ok && orig_width == 3) {
-                    ok = sb_append(&sb, "#define ") && sb_append(&sb, vname) &&
-                         sb_append(&sb, " ") && sb_append(&sb, vname) && sb_append(&sb, ".xyz\n");
+                         sb_append(&sb, " ") && sb_append(&sb, vname) && sb_append(&sb, ".") &&
+                         sb_append(&sb, swiz) && sb_append(&sb, "\n#undef ") &&
+                         sb_append(&sb, vname) && sb_append(&sb, "\n");
                 }
             } else {
                 ok = sb_append_len(&sb, line, (size_t)(p - line)) &&
                      sb_append(&sb, is_frag ? "in" : "out") &&
                      sb_append_len(&sb, p + 7, (size_t)(end - (p + 7))) && sb_append(&sb, "\n");
             }
+        } else if (p < end && *p == '#') {
+            /* If user shader defines #define saturate, undefine preamble saturate first */
+            const char *q = p + 1;
+            while (q < end && (*q == ' ' || *q == '\t')) {
+                q++;
+            }
+            if (end - q > 7 && strncmp(q, "define", 6) == 0 && isspace((unsigned char)q[6])) {
+                q += 6;
+                while (q < end && (*q == ' ' || *q == '\t')) {
+                    q++;
+                }
+                if (end - q >= 8 && strncmp(q, "saturate", 8) == 0 &&
+                    (end - q == 8 || !(isalnum((unsigned char)q[8]) || q[8] == '_'))) {
+                    ok = sb_append(&sb, "#undef saturate\n");
+                }
+            }
+            ok = ok && sb_append_len(&sb, line, line_len) && sb_append(&sb, "\n");
         } else {
-            ok = sb_append_len(&sb, line, line_len) && sb_append(&sb, "\n");
+            ok = append_line_with_varying_swizzles(&sb, line, line_len, active_swizzles,
+                                                   active_swizzle_count);
         }
         if (!ok) {
             free(sb.buf);
@@ -1035,7 +1486,9 @@ static const char WE_GLSL_PREAMBLE_COMMON[] =
     "#define fmod(x, y) mod(x, y)\n"
     "#define rsqrt(x) inversesqrt(x)\n"
     "#define lerp(x, y, s) mix(x, y, s)\n"
+    "#ifndef saturate\n"
     "#define saturate(x) clamp(x, 0.0, 1.0)\n"
+    "#endif\n"
     "#define log10(x) (log(x) * 0.4342944819032518)\n"
     "void sincos(float x, out float s, out float c) { s = sin(x); c = cos(x); }\n"
     "void sincos(vec2 x, out vec2 s, out vec2 c) { s = sin(x); c = cos(x); }\n"
@@ -1253,18 +1706,18 @@ bool we_shader_preprocess_pair(const char *vert_raw, const char *frag_raw, const
     we_varying_info_t v_vars[WE_SHADER_MAX_VARYINGS];
     we_varying_info_t f_vars[WE_SHADER_MAX_VARYINGS];
     uint32_t v_var_count = 0, f_var_count = 0;
-    collect_varyings(v_exp.buf, v_vars, &v_var_count);
-    collect_varyings(f_exp.buf, f_vars, &f_var_count);
+    collect_varyings(v_exp.buf, &out_prep->meta, v_vars, &v_var_count);
+    collect_varyings(f_exp.buf, &out_prep->meta, f_vars, &f_var_count);
 
-    we_varying_info_t promoted[WE_SHADER_MAX_VARYINGS];
+    we_varying_info_t promoted_v[WE_SHADER_MAX_VARYINGS];
+    we_varying_info_t promoted_f[WE_SHADER_MAX_VARYINGS];
     uint32_t promoted_count = 0;
     for (uint32_t i = 0; i < v_var_count; i++) {
         for (uint32_t j = 0; j < f_var_count; j++) {
             if (strcmp(v_vars[i].name, f_vars[j].name) == 0 && v_vars[i].width != f_vars[j].width) {
                 if (promoted_count < WE_SHADER_MAX_VARYINGS) {
-                    snprintf(promoted[promoted_count].name, sizeof(promoted[0].name), "%s",
-                             v_vars[i].name);
-                    promoted[promoted_count].width = 4;
+                    promoted_v[promoted_count] = v_vars[i];
+                    promoted_f[promoted_count] = f_vars[j];
                     promoted_count++;
                 }
                 break;
@@ -1272,8 +1725,8 @@ bool we_shader_preprocess_pair(const char *vert_raw, const char *frag_raw, const
         }
     }
 
-    char *v_trans = transform_stage_declarations(v_exp.buf, false, promoted, promoted_count);
-    char *f_trans = transform_stage_declarations(f_exp.buf, true, promoted, promoted_count);
+    char *v_trans = transform_stage_declarations(v_exp.buf, false, promoted_v, promoted_count);
+    char *f_trans = transform_stage_declarations(f_exp.buf, true, promoted_f, promoted_count);
     free(v_exp.buf);
     free(f_exp.buf);
 

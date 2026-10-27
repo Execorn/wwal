@@ -8,6 +8,7 @@ configure_args="-Denable_vaapi=true -Denable_io_uring=true -Denable_simd=true -D
 hostmakedepends="pkg-config python3 wayland-devel scdoc"
 makedepends="wayland-devel wayland-protocols libdrm-devel MesaLib-devel
  libva-devel liburing-devel libseccomp-devel libpng-devel libjpeg-turbo-devel"
+# Optional runtime plugins loaded via dlopen(): libwebp, libavif, libjxl, librsvg, pipewire, dbus-libs, elogind-libs, liblz4
 short_desc="Zero-copy C23 Wayland wallpaper, VA-API video, Shadertoy, and Material You engine"
 maintainer="Execorn <execorn@users.noreply.github.com>"
 license="GPL-3.0-or-later"

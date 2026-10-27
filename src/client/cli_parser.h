@@ -40,6 +40,7 @@ typedef enum {
     CLI_CMD_SET_UNIFORM,
     CLI_CMD_SUBSCRIBE,
     CLI_CMD_AUDIO,
+    CLI_CMD_VERSION,
 } cli_cmd_type_t;
 
 typedef enum {

@@ -93,13 +93,17 @@ void arena_reset(arena_t *arena)
 {
     if (!arena)
         return;
-    if (arena->buffer && arena->offset > 1024 * 1024) {
+    const size_t warm_keep = 8 * 1024 * 1024;
+    if (arena->buffer && arena->offset > warm_keep) {
         size_t page_size = get_page_size();
+        size_t keep_aligned = (warm_keep + page_size - 1) & ~(page_size - 1);
         size_t len = (arena->offset + page_size - 1) & ~(page_size - 1);
         if (len > arena->capacity) {
             len = arena->capacity;
         }
-        (void)madvise(arena->buffer, len, MADV_DONTNEED);
+        if (len > keep_aligned) {
+            (void)madvise(arena->buffer + keep_aligned, len - keep_aligned, MADV_DONTNEED);
+        }
     }
     arena->offset = 0;
 }

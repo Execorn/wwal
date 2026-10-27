@@ -187,7 +187,11 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabil
             wp_cursor_shape_device_v1_destroy(state->cursor_shape_dev);
             state->cursor_shape_dev = NULL;
         }
-        wl_pointer_destroy(state->pointer);
+        if (wl_pointer_get_version(state->pointer) >= WL_POINTER_RELEASE_SINCE_VERSION) {
+            wl_pointer_release(state->pointer);
+        } else {
+            wl_pointer_destroy(state->pointer);
+        }
         state->pointer = NULL;
     }
 }
@@ -414,6 +418,9 @@ static void wlr_toplevel_handle_output_leave(void *data,
         if (e->outputs[i] == output) {
             e->outputs[i] = e->outputs[e->num_outputs - 1];
             e->num_outputs--;
+            if (e->state) {
+                recompute_wlr_toplevel_power_state(e->state);
+            }
             return;
         }
     }
@@ -527,10 +534,28 @@ static const struct zwlr_foreign_toplevel_manager_v1_listener wlr_toplevel_mgr_l
     .finished = wlr_toplevel_mgr_handle_finished,
 };
 
+typedef struct ext_toplevel_entry {
+    struct ext_foreign_toplevel_handle_v1 *handle;
+    daemon_state_t *state;
+    struct ext_toplevel_entry *next;
+} ext_toplevel_entry_t;
+
+static ext_toplevel_entry_t *g_ext_toplevels = NULL;
+
 static void foreign_toplevel_handle_closed(void *data,
                                            struct ext_foreign_toplevel_handle_v1 *toplevel)
 {
-    (void)data;
+    ext_toplevel_entry_t *target = (ext_toplevel_entry_t *)data;
+    ext_toplevel_entry_t **pp = &g_ext_toplevels;
+    while (*pp) {
+        if (*pp == target || (*pp)->handle == toplevel) {
+            ext_toplevel_entry_t *victim = *pp;
+            *pp = victim->next;
+            free(victim);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
     if (toplevel) {
         ext_foreign_toplevel_handle_v1_destroy(toplevel);
     }
@@ -583,10 +608,18 @@ static void foreign_toplevel_list_handle_toplevel(void *data,
                                                   struct ext_foreign_toplevel_handle_v1 *toplevel)
 {
     (void)list;
-    if (toplevel) {
-        ext_foreign_toplevel_handle_v1_add_listener(toplevel, &foreign_toplevel_handle_listener,
-                                                    data);
+    if (!toplevel)
+        return;
+    ext_toplevel_entry_t *e = (ext_toplevel_entry_t *)calloc(1, sizeof(*e));
+    if (!e) {
+        ext_foreign_toplevel_handle_v1_destroy(toplevel);
+        return;
     }
+    e->handle = toplevel;
+    e->state = (daemon_state_t *)data;
+    e->next = g_ext_toplevels;
+    g_ext_toplevels = e;
+    ext_foreign_toplevel_handle_v1_add_listener(toplevel, &foreign_toplevel_handle_listener, e);
 }
 
 static void foreign_toplevel_list_handle_finished(void *data,
@@ -668,13 +701,7 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         ensure_idle_notification(state);
         WAYWAL_LOG_INFO("Bound ext_idle_notifier_v1 version %u", ver);
     } else if (strcmp(interface, ext_foreign_toplevel_list_v1_interface.name) == 0) {
-        state->foreign_toplevel_list = (struct ext_foreign_toplevel_list_v1 *)wl_registry_bind(
-            registry, name, &ext_foreign_toplevel_list_v1_interface, 1);
-        if (state->foreign_toplevel_list) {
-            ext_foreign_toplevel_list_v1_add_listener(state->foreign_toplevel_list,
-                                                      &foreign_toplevel_list_listener, state);
-        }
-        WAYWAL_LOG_INFO("Bound ext_foreign_toplevel_list_v1");
+        (void)foreign_toplevel_list_listener;
     } else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
         uint32_t ver = version >= 4 ? 4 : (version >= 3 ? 3 : version);
         state->dmabuf_ctx.dmabuf_proto = (struct zwp_linux_dmabuf_v1 *)wl_registry_bind(
@@ -719,12 +746,25 @@ static void registry_global_remove(void *data, struct wl_registry *registry, uin
         if (state->video_engine.target_output == node) {
             state->video_engine.target_output = NULL;
         }
+        for (wlr_toplevel_entry_t *e = (wlr_toplevel_entry_t *)state->wlr_toplevels; e != NULL;
+             e = e->next) {
+            for (size_t i = 0; i < e->num_outputs;) {
+                if (e->outputs[i] == node->wl_output) {
+                    e->outputs[i] = e->outputs[e->num_outputs - 1];
+                    e->num_outputs--;
+                } else {
+                    ++i;
+                }
+            }
+        }
+        recompute_wlr_toplevel_power_state(state);
         if (state->power_gov && node->name[0] != '\0') {
             waywal_power_governor_remove_output(state->power_gov, node->name);
         }
         output_manager_remove(&state->output_mgr, name);
         state->outputs = state->output_mgr.head;
         state->num_outputs = state->output_mgr.count;
+        recompute_wlr_toplevel_power_state(state);
         reconcile_global_engine_flags(state);
         daemon_reconcile_power_state(state);
     }
@@ -919,6 +959,20 @@ void daemon_wayland_destroy(daemon_state_t *state)
         free(e);
     }
 
+    ext_toplevel_entry_t **pp = &g_ext_toplevels;
+    while (*pp) {
+        ext_toplevel_entry_t *e = *pp;
+        if (e->state == state) {
+            *pp = e->next;
+            if (e->handle) {
+                ext_foreign_toplevel_handle_v1_destroy(e->handle);
+            }
+            free(e);
+        } else {
+            pp = &e->next;
+        }
+    }
+
     output_manager_destroy(&state->output_mgr);
     state->outputs = NULL;
     state->num_outputs = 0;
@@ -966,11 +1020,19 @@ void daemon_wayland_destroy(daemon_state_t *state)
         state->syncobj_mgr = NULL;
     }
     if (state->pointer) {
-        wl_pointer_destroy(state->pointer);
+        if (wl_pointer_get_version(state->pointer) >= WL_POINTER_RELEASE_SINCE_VERSION) {
+            wl_pointer_release(state->pointer);
+        } else {
+            wl_pointer_destroy(state->pointer);
+        }
         state->pointer = NULL;
     }
     if (state->seat) {
-        wl_seat_destroy(state->seat);
+        if (wl_seat_get_version(state->seat) >= WL_SEAT_RELEASE_SINCE_VERSION) {
+            wl_seat_release(state->seat);
+        } else {
+            wl_seat_destroy(state->seat);
+        }
         state->seat = NULL;
     }
     if (state->viewporter) {
@@ -1026,6 +1088,10 @@ static bool query_hyprland_cursor_global(daemon_state_t *state, double *gx, doub
         return false;
     const char *xrd = getenv("XDG_RUNTIME_DIR");
 
+    static struct sockaddr_un s_cached_addr;
+    static char s_cached_his[128];
+    static bool s_has_cached_addr = false;
+
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (state->cursor_ipc_fd < 0) {
             int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -1035,25 +1101,40 @@ static bool query_hyprland_cursor_global(daemon_state_t *state, double *gx, doub
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-            struct sockaddr_un addr = {0};
-            addr.sun_family = AF_UNIX;
             bool connected = false;
-            if (xrd && xrd[0]) {
-                int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
-                                        "%s/hypr/%s/.socket.sock", xrd, his);
-                if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
-                    connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            if (s_has_cached_addr && strcmp(s_cached_his, his) == 0) {
+                if (connect(fd, (struct sockaddr *)&s_cached_addr, sizeof(s_cached_addr)) == 0) {
                     connected = true;
+                } else {
+                    s_has_cached_addr = false;
                 }
             }
+
             if (!connected) {
-                memset(&addr, 0, sizeof(addr));
+                struct sockaddr_un addr = {0};
                 addr.sun_family = AF_UNIX;
-                int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
-                                        "/tmp/hypr/%s/.socket.sock", his);
-                if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
-                    connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-                    connected = true;
+                if (xrd && xrd[0]) {
+                    int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
+                                            "%s/hypr/%s/.socket.sock", xrd, his);
+                    if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
+                        connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                        connected = true;
+                    }
+                }
+                if (!connected) {
+                    memset(&addr, 0, sizeof(addr));
+                    addr.sun_family = AF_UNIX;
+                    int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
+                                            "/tmp/hypr/%s/.socket.sock", his);
+                    if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
+                        connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                        connected = true;
+                    }
+                }
+                if (connected) {
+                    s_cached_addr = addr;
+                    snprintf(s_cached_his, sizeof(s_cached_his), "%s", his);
+                    s_has_cached_addr = true;
                 }
             }
             if (!connected) {
@@ -1113,9 +1194,9 @@ bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *
      * provided an interactive shader or Workshop scene is active and unpaused */
     const waywal_shader_engine_t *active_se =
         (out && out->shader_eng) ? out->shader_eng : state->shader_eng;
-    bool shader_running = (out && (out->shader_active || out->workshop_active)) ||
-                          state->shader_active || state->workshop_active ||
-                          waywal_shader_engine_uses_mouse(active_se);
+    bool shader_running = (out && out->workshop_active) || state->workshop_active ||
+                          (((out && out->shader_active) || state->shader_active) &&
+                           waywal_shader_engine_uses_mouse(active_se));
     bool is_paused = false;
     if (state->power_gov) {
         if (out && out->name[0] != '\0') {

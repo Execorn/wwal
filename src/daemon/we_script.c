@@ -1,1749 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-#include "waywal/we_script.h"
-
-#include "waywal/log.h"
-
-#include <ctype.h>
-#include <dlfcn.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-#include <sys/mman.h>
-#include <time.h>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-#ifndef M_E
-#define M_E 2.71828182845904523536
-#endif
-
-/* =========================================================================
- * Runtime Value Representation & Fixed 16 MiB Arena
- * ========================================================================= */
-
-typedef enum {
-    VAL_UNDEF = 0,
-    VAL_NULL,
-    VAL_BOOL,
-    VAL_NUM,
-    VAL_STR,
-    VAL_VEC,
-    VAL_ARR,
-    VAL_OBJ,
-    VAL_FUNC,
-    VAL_BUILTIN_OBJ,
-    VAL_SCENE_LAYER,
-    VAL_AUDIO_BUFFERS,
-    VAL_AUDIO_CHANNEL,
-} js_val_type_t;
-
-typedef enum {
-    BUILTIN_MATH = 1,
-    BUILTIN_WEMATH,
-    BUILTIN_WECOLOR,
-    BUILTIN_ENGINE,
-    BUILTIN_INPUT,
-    BUILTIN_THIS_LAYER,
-    BUILTIN_SCENE,
-    BUILTIN_SHARED,
-    BUILTIN_CONSOLE,
-    BUILTIN_SCRIPT_PROPS_BUILDER,
-} js_builtin_id_t;
-
-typedef struct js_vec_obj {
-    uint8_t dim;        /* 2, 3, or 4 */
-    uint8_t bind_tag;   /* 0=none, 1=layer.origin, 2=layer.scale, 3=layer.angles, 4=layer.color,
-                           5=layer.size */
-    uint8_t layer_slot; /* 0=thisLayer, 1..WE_SCRIPT_MAX_SCENE_LAYERS=scene_layers[slot-1] */
-    float v[4];
-} js_vec_obj_t;
-
-typedef struct js_val js_val_t;
-typedef struct js_obj js_obj_t;
-typedef struct js_arr js_arr_t;
-typedef struct ast_node ast_node_t;
-
-struct js_val {
-    js_val_type_t type;
-    union {
-        bool bval;
-        double num;
-        const char *str;
-        js_vec_obj_t *vec;
-        js_arr_t *arr;
-        js_obj_t *obj;
-        const ast_node_t *func;
-        js_builtin_id_t builtin_id;
-        uint32_t layer_slot;
-        struct {
-            uint32_t res;
-            uint8_t channel; /* 0=average, 1=left, 2=right */
-        } audio;
-    } u;
-};
-
-typedef struct {
-    const char *key;
-    js_val_t val;
-} js_prop_t;
-
-struct js_obj {
-    js_prop_t *props;
-    uint32_t count;
-    uint32_t cap;
-};
-
-struct js_arr {
-    js_val_t *items;
-    uint32_t count;
-    uint32_t cap;
-};
-
-/* =========================================================================
- * Lexer & Tokens
- * ========================================================================= */
-
-typedef enum {
-    TOK_EOF = 0,
-    TOK_IDENT,
-    TOK_NUM,
-    TOK_STR,
-    TOK_TRUE,
-    TOK_FALSE,
-    TOK_NULL,
-    TOK_UNDEF,
-    TOK_VAR,
-    TOK_LET,
-    TOK_CONST,
-    TOK_FUNCTION,
-    TOK_EXPORT,
-    TOK_RETURN,
-    TOK_IF,
-    TOK_ELSE,
-    TOK_FOR,
-    TOK_WHILE,
-    TOK_DO,
-    TOK_SWITCH,
-    TOK_CASE,
-    TOK_DEFAULT,
-    TOK_TRY,
-    TOK_CATCH,
-    TOK_FINALLY,
-    TOK_THROW,
-    TOK_BREAK,
-    TOK_CONTINUE,
-    TOK_NEW,
-    TOK_THIS,
-    TOK_TYPEOF,
-    TOK_LPAREN,
-    TOK_RPAREN,
-    TOK_LBRACE,
-    TOK_RBRACE,
-    TOK_LBRACK,
-    TOK_RBRACK,
-    TOK_SEMI,
-    TOK_COMMA,
-    TOK_DOT,
-    TOK_COLON,
-    TOK_QUESTION,
-    TOK_PLUS,
-    TOK_MINUS,
-    TOK_STAR,
-    TOK_SLASH,
-    TOK_PERCENT,
-    TOK_INC,
-    TOK_DEC,
-    TOK_ASSIGN,
-    TOK_PLUS_ASSIGN,
-    TOK_MINUS_ASSIGN,
-    TOK_STAR_ASSIGN,
-    TOK_SLASH_ASSIGN,
-    TOK_PERCENT_ASSIGN,
-    TOK_SHL_ASSIGN,
-    TOK_SHR_ASSIGN,
-    TOK_USHR_ASSIGN,
-    TOK_AND_ASSIGN,
-    TOK_OR_ASSIGN,
-    TOK_XOR_ASSIGN,
-    TOK_EQ,
-    TOK_STRICT_EQ,
-    TOK_NEQ,
-    TOK_STRICT_NEQ,
-    TOK_LT,
-    TOK_LE,
-    TOK_GT,
-    TOK_GE,
-    TOK_AND,
-    TOK_OR,
-    TOK_NULLISH,
-    TOK_NOT,
-    TOK_BIT_AND,
-    TOK_BIT_OR,
-    TOK_BIT_XOR,
-    TOK_BIT_NOT,
-    TOK_SHL,
-    TOK_SHR,
-    TOK_USHR,
-} js_tok_type_t;
-
-typedef struct {
-    js_tok_type_t type;
-    const char *text;
-    double num;
-} js_token_t;
-
-typedef enum {
-    AST_PROGRAM = 0,
-    AST_BLOCK,
-    AST_VAR_DECL,
-    AST_FUNC_DECL,
-    AST_IF,
-    AST_WHILE,
-    AST_DO_WHILE,
-    AST_FOR,
-    AST_SWITCH,
-    AST_TRY,
-    AST_THROW,
-    AST_RETURN,
-    AST_BREAK,
-    AST_CONTINUE,
-    AST_EXPR_STMT,
-    AST_LITERAL,
-    AST_IDENT,
-    AST_THIS,
-    AST_ARRAY_LIT,
-    AST_OBJ_LIT,
-    AST_UNARY,
-    AST_UPDATE, /* ++ / -- */
-    AST_BINARY,
-    AST_ASSIGN,
-    AST_TERNARY,
-    AST_MEMBER,
-    AST_INDEX,
-    AST_CALL,
-    AST_NEW,
-} ast_type_t;
-
-typedef struct {
-    const char *name;
-    ast_node_t *init;
-} ast_var_item_t;
-
-struct ast_node {
-    ast_type_t type;
-    js_tok_type_t op;
-    bool prefix;
-    bool is_exported;
-    const char *name;
-    js_val_t lit;
-    ast_node_t *left;
-    ast_node_t *right;
-    ast_node_t *cond;
-    ast_node_t *then_branch;
-    ast_node_t *else_branch;
-    ast_node_t *init;
-    ast_node_t *step;
-    ast_node_t *body;
-    const char **params;
-    uint32_t param_count;
-    ast_node_t **children;
-    ast_node_t **case_exprs;
-    const char **keys;
-    uint32_t child_count;
-    ast_var_item_t *decls;
-    uint32_t decl_count;
-};
-
-#define WE_SCRIPT_MAX_GLOBALS  96u
-#define WE_SCRIPT_MAX_LOCALS   64u
-#define WE_SCRIPT_MAX_PROPS    64u
-#define WE_SCRIPT_SCRATCH_SIZE (256u * 1024u)
-
-typedef struct {
-    const char *name;
-    js_val_t val;
-} js_var_slot_t;
-
-typedef struct {
-    char name[64];
-    float val[4];
-    uint32_t num_components;
-    char str_val[128];
-} we_script_prop_item_t;
-
-typedef struct {
-    bool valid;
-    bool accessed;
-    we_script_layer_state_t state;
-    js_vec_obj_t origin_vec;
-    js_vec_obj_t scale_vec;
-    js_vec_obj_t angles_vec;
-    js_vec_obj_t color_vec;
-    js_vec_obj_t size_vec;
-} we_script_scene_layer_slot_t;
-
-struct we_script {
-    uint8_t *arena_base;
-    size_t arena_cap;
-    size_t arena_used;
-    size_t ast_watermark;
-
-    void *quickjs_dl;
-    we_script_shared_t *shared;
-    uint64_t rng_state;
-
-    ast_node_t *root_ast;
-    const ast_node_t *fn_init;
-    const ast_node_t *fn_update;
-    const ast_node_t *fn_cursor_move;
-    const ast_node_t *fn_apply_user_props;
-
-    js_var_slot_t globals[WE_SCRIPT_MAX_GLOBALS];
-    uint32_t global_count;
-
-    js_var_slot_t this_props[WE_SCRIPT_MAX_PROPS];
-    uint32_t this_prop_count;
-
-    we_script_prop_item_t user_props[WE_SCRIPT_MAX_PROPS];
-    uint32_t user_prop_count;
-
-    we_script_scene_layer_slot_t scene_layers[WE_SCRIPT_MAX_SCENE_LAYERS];
-
-    we_script_env_t env;
-    we_script_layer_state_t layer;
-    js_vec_obj_t layer_origin_vec;
-    js_vec_obj_t layer_scale_vec;
-    js_vec_obj_t layer_angles_vec;
-    js_vec_obj_t layer_color_vec;
-    js_vec_obj_t layer_size_vec;
-
-    /* Watchdog telemetry */
-    struct timespec start_ts;
-    uint32_t step_count;
-    uint32_t last_steps;
-    uint32_t eval_depth;
-    bool aborted;
-    bool timed_out;
-    bool oom;
-    bool uses_audio;
-    bool parse_error;
-    bool depth_exceeded;
-};
-
-static void *script_arena_alloc(we_script_t *vm, size_t size)
-{
-    if (!vm || !vm->arena_base) {
-        return NULL;
-    }
-    size_t aligned = (size + 7u) & ~(size_t)7u;
-    if (aligned == 0) {
-        aligned = 8u;
-    }
-    if (vm->arena_used + aligned > vm->arena_cap) {
-        vm->oom = true;
-        vm->aborted = true;
-        return NULL;
-    }
-    void *ptr = vm->arena_base + vm->arena_used;
-    vm->arena_used += aligned;
-    memset(ptr, 0, aligned);
-    return ptr;
-}
-
-static char *script_arena_strdup(we_script_t *vm, const char *s, size_t len)
-{
-    char *dst = (char *)script_arena_alloc(vm, len + 1u);
-    if (!dst) {
-        return NULL;
-    }
-    if (len > 0 && s) {
-        memcpy(dst, s, len);
-    }
-    dst[len] = '\0';
-    return dst;
-}
-
-/* =========================================================================
- * Tokenizer
- * ========================================================================= */
-
-typedef struct {
-    we_script_t *vm;
-    const char *src;
-    size_t len;
-    size_t pos;
-    uint32_t depth;
-    js_token_t cur;
-} js_parser_t;
-
-static void lexer_skip_ws_and_comments(js_parser_t *p)
-{
-    while (p->pos < p->len) {
-        char c = p->src[p->pos];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            p->pos++;
-        } else if (c == '/' && p->pos + 1 < p->len && p->src[p->pos + 1] == '/') {
-            p->pos += 2;
-            while (p->pos < p->len && p->src[p->pos] != '\n') {
-                p->pos++;
-            }
-        } else if (c == '/' && p->pos + 1 < p->len && p->src[p->pos + 1] == '*') {
-            p->pos += 2;
-            while (p->pos + 1 < p->len && !(p->src[p->pos] == '*' && p->src[p->pos + 1] == '/')) {
-                p->pos++;
-            }
-            p->pos = (p->pos + 1 < p->len) ? (p->pos + 2) : p->len;
-        } else {
-            break;
-        }
-    }
-}
-
-static void lexer_next(js_parser_t *p)
-{
-    lexer_skip_ws_and_comments(p);
-    memset(&p->cur, 0, sizeof(p->cur));
-    if (p->pos >= p->len) {
-        p->cur.type = TOK_EOF;
-        return;
-    }
-
-    char c = p->src[p->pos];
-
-    /* Identifiers & keywords */
-    if (isalpha((unsigned char)c) || c == '_' || c == '$') {
-        size_t start = p->pos++;
-        while (p->pos < p->len && (isalnum((unsigned char)p->src[p->pos]) ||
-                                   p->src[p->pos] == '_' || p->src[p->pos] == '$')) {
-            p->pos++;
-        }
-        size_t ilen = p->pos - start;
-        const char *s = p->src + start;
-        if (ilen == 3 && strncmp(s, "var", 3) == 0) {
-            p->cur.type = TOK_VAR;
-        } else if (ilen == 3 && strncmp(s, "let", 3) == 0) {
-            p->cur.type = TOK_LET;
-        } else if (ilen == 5 && strncmp(s, "const", 5) == 0) {
-            p->cur.type = TOK_CONST;
-        } else if (ilen == 8 && strncmp(s, "function", 8) == 0) {
-            p->cur.type = TOK_FUNCTION;
-        } else if (ilen == 6 && strncmp(s, "export", 6) == 0) {
-            p->cur.type = TOK_EXPORT;
-        } else if (ilen == 6 && strncmp(s, "return", 6) == 0) {
-            p->cur.type = TOK_RETURN;
-        } else if (ilen == 2 && strncmp(s, "if", 2) == 0) {
-            p->cur.type = TOK_IF;
-        } else if (ilen == 4 && strncmp(s, "else", 4) == 0) {
-            p->cur.type = TOK_ELSE;
-        } else if (ilen == 3 && strncmp(s, "for", 3) == 0) {
-            p->cur.type = TOK_FOR;
-        } else if (ilen == 5 && strncmp(s, "while", 5) == 0) {
-            p->cur.type = TOK_WHILE;
-        } else if (ilen == 2 && strncmp(s, "do", 2) == 0) {
-            p->cur.type = TOK_DO;
-        } else if (ilen == 6 && strncmp(s, "switch", 6) == 0) {
-            p->cur.type = TOK_SWITCH;
-        } else if (ilen == 4 && strncmp(s, "case", 4) == 0) {
-            p->cur.type = TOK_CASE;
-        } else if (ilen == 7 && strncmp(s, "default", 7) == 0) {
-            p->cur.type = TOK_DEFAULT;
-        } else if (ilen == 3 && strncmp(s, "try", 3) == 0) {
-            p->cur.type = TOK_TRY;
-        } else if (ilen == 5 && strncmp(s, "catch", 5) == 0) {
-            p->cur.type = TOK_CATCH;
-        } else if (ilen == 7 && strncmp(s, "finally", 7) == 0) {
-            p->cur.type = TOK_FINALLY;
-        } else if (ilen == 5 && strncmp(s, "throw", 5) == 0) {
-            p->cur.type = TOK_THROW;
-        } else if (ilen == 5 && strncmp(s, "break", 5) == 0) {
-            p->cur.type = TOK_BREAK;
-        } else if (ilen == 8 && strncmp(s, "continue", 8) == 0) {
-            p->cur.type = TOK_CONTINUE;
-        } else if (ilen == 3 && strncmp(s, "new", 3) == 0) {
-            p->cur.type = TOK_NEW;
-        } else if (ilen == 4 && strncmp(s, "this", 4) == 0) {
-            p->cur.type = TOK_THIS;
-        } else if (ilen == 6 && strncmp(s, "typeof", 6) == 0) {
-            p->cur.type = TOK_TYPEOF;
-        } else if (ilen == 4 && strncmp(s, "true", 4) == 0) {
-            p->cur.type = TOK_TRUE;
-        } else if (ilen == 5 && strncmp(s, "false", 5) == 0) {
-            p->cur.type = TOK_FALSE;
-        } else if (ilen == 4 && strncmp(s, "null", 4) == 0) {
-            p->cur.type = TOK_NULL;
-        } else if (ilen == 9 && strncmp(s, "undefined", 9) == 0) {
-            p->cur.type = TOK_UNDEF;
-        } else {
-            p->cur.type = TOK_IDENT;
-            p->cur.text = script_arena_strdup(p->vm, s, ilen);
-        }
-        return;
-    }
-
-    /* Numeric literals */
-    if (isdigit((unsigned char)c) ||
-        (c == '.' && p->pos + 1 < p->len && isdigit((unsigned char)p->src[p->pos + 1]))) {
-        size_t rem = p->len - p->pos;
-        size_t clen = rem < 63 ? rem : 63;
-        char nbuf[64];
-        memcpy(nbuf, p->src + p->pos, clen);
-        nbuf[clen] = '\0';
-        char *endptr = NULL;
-        double val = 0.0;
-        if (clen > 2 && nbuf[0] == '0' && (nbuf[1] == 'x' || nbuf[1] == 'X')) {
-            val = (double)strtoull(nbuf, &endptr, 16);
-        } else {
-            val = strtod(nbuf, &endptr);
-        }
-        if (endptr && endptr > nbuf) {
-            p->pos += (size_t)(endptr - nbuf);
-        } else {
-            p->pos++;
-        }
-        p->cur.type = TOK_NUM;
-        p->cur.num = val;
-        return;
-    }
-
-    /* String literals ('...', "...", `...`) */
-    if (c == '\'' || c == '"' || c == '`') {
-        char quote = c;
-        p->pos++;
-        size_t start = p->pos;
-        char tmp[1024];
-        size_t tlen = 0;
-        while (p->pos < p->len && p->src[p->pos] != quote) {
-            char ch = p->src[p->pos++];
-            if (ch == '\\' && p->pos < p->len) {
-                char esc = p->src[p->pos++];
-                switch (esc) {
-                case 'n':
-                    ch = '\n';
-                    break;
-                case 'r':
-                    ch = '\r';
-                    break;
-                case 't':
-                    ch = '\t';
-                    break;
-                default:
-                    ch = esc;
-                    break;
-                }
-            }
-            if (tlen + 1 < sizeof(tmp)) {
-                tmp[tlen++] = ch;
-            }
-        }
-        if (p->pos < p->len && p->src[p->pos] == quote) {
-            p->pos++;
-        }
-        (void)start;
-        p->cur.type = TOK_STR;
-        p->cur.text = script_arena_strdup(p->vm, tmp, tlen);
-        return;
-    }
-
-    /* Multi-character operators */
-    char c2 = (p->pos + 1 < p->len) ? p->src[p->pos + 1] : '\0';
-    char c3 = (p->pos + 2 < p->len) ? p->src[p->pos + 2] : '\0';
-    char c4 = (p->pos + 3 < p->len) ? p->src[p->pos + 3] : '\0';
-
-    if (c == '>' && c2 == '>' && c3 == '>' && c4 == '=') {
-        p->pos += 4;
-        p->cur.type = TOK_USHR_ASSIGN;
-        return;
-    }
-    if (c == '>' && c2 == '>' && c3 == '>') {
-        p->pos += 3;
-        p->cur.type = TOK_USHR;
-        return;
-    }
-    if (c == '<' && c2 == '<' && c3 == '=') {
-        p->pos += 3;
-        p->cur.type = TOK_SHL_ASSIGN;
-        return;
-    }
-    if (c == '>' && c2 == '>' && c3 == '=') {
-        p->pos += 3;
-        p->cur.type = TOK_SHR_ASSIGN;
-        return;
-    }
-    if (c == '=' && c2 == '=' && c3 == '=') {
-        p->pos += 3;
-        p->cur.type = TOK_STRICT_EQ;
-        return;
-    }
-    if (c == '!' && c2 == '=' && c3 == '=') {
-        p->pos += 3;
-        p->cur.type = TOK_STRICT_NEQ;
-        return;
-    }
-    if (c == '+' && c2 == '+') {
-        p->pos += 2;
-        p->cur.type = TOK_INC;
-        return;
-    }
-    if (c == '-' && c2 == '-') {
-        p->pos += 2;
-        p->cur.type = TOK_DEC;
-        return;
-    }
-    if (c == '+' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_PLUS_ASSIGN;
-        return;
-    }
-    if (c == '-' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_MINUS_ASSIGN;
-        return;
-    }
-    if (c == '*' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_STAR_ASSIGN;
-        return;
-    }
-    if (c == '/' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_SLASH_ASSIGN;
-        return;
-    }
-    if (c == '%' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_PERCENT_ASSIGN;
-        return;
-    }
-    if (c == '&' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_AND_ASSIGN;
-        return;
-    }
-    if (c == '|' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_OR_ASSIGN;
-        return;
-    }
-    if (c == '^' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_XOR_ASSIGN;
-        return;
-    }
-    if (c == '=' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_EQ;
-        return;
-    }
-    if (c == '!' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_NEQ;
-        return;
-    }
-    if (c == '<' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_LE;
-        return;
-    }
-    if (c == '>' && c2 == '=') {
-        p->pos += 2;
-        p->cur.type = TOK_GE;
-        return;
-    }
-    if (c == '&' && c2 == '&') {
-        p->pos += 2;
-        p->cur.type = TOK_AND;
-        return;
-    }
-    if (c == '|' && c2 == '|') {
-        p->pos += 2;
-        p->cur.type = TOK_OR;
-        return;
-    }
-    if (c == '?' && c2 == '?') {
-        p->pos += 2;
-        p->cur.type = TOK_NULLISH;
-        return;
-    }
-    if (c == '<' && c2 == '<') {
-        p->pos += 2;
-        p->cur.type = TOK_SHL;
-        return;
-    }
-    if (c == '>' && c2 == '>') {
-        p->pos += 2;
-        p->cur.type = TOK_SHR;
-        return;
-    }
-
-    p->pos++;
-    switch (c) {
-    case '(':
-        p->cur.type = TOK_LPAREN;
-        break;
-    case ')':
-        p->cur.type = TOK_RPAREN;
-        break;
-    case '{':
-        p->cur.type = TOK_LBRACE;
-        break;
-    case '}':
-        p->cur.type = TOK_RBRACE;
-        break;
-    case '[':
-        p->cur.type = TOK_LBRACK;
-        break;
-    case ']':
-        p->cur.type = TOK_RBRACK;
-        break;
-    case ';':
-        p->cur.type = TOK_SEMI;
-        break;
-    case ',':
-        p->cur.type = TOK_COMMA;
-        break;
-    case '.':
-        p->cur.type = TOK_DOT;
-        break;
-    case ':':
-        p->cur.type = TOK_COLON;
-        break;
-    case '?':
-        p->cur.type = TOK_QUESTION;
-        break;
-    case '+':
-        p->cur.type = TOK_PLUS;
-        break;
-    case '-':
-        p->cur.type = TOK_MINUS;
-        break;
-    case '*':
-        p->cur.type = TOK_STAR;
-        break;
-    case '/':
-        p->cur.type = TOK_SLASH;
-        break;
-    case '%':
-        p->cur.type = TOK_PERCENT;
-        break;
-    case '=':
-        p->cur.type = TOK_ASSIGN;
-        break;
-    case '<':
-        p->cur.type = TOK_LT;
-        break;
-    case '>':
-        p->cur.type = TOK_GT;
-        break;
-    case '!':
-        p->cur.type = TOK_NOT;
-        break;
-    case '&':
-        p->cur.type = TOK_BIT_AND;
-        break;
-    case '|':
-        p->cur.type = TOK_BIT_OR;
-        break;
-    case '^':
-        p->cur.type = TOK_BIT_XOR;
-        break;
-    case '~':
-        p->cur.type = TOK_BIT_NOT;
-        break;
-    default:
-        p->vm->parse_error = true;
-        p->cur.type = TOK_EOF;
-        break;
-    }
-}
-
-/* =========================================================================
- * Recursive-Descent AST Parser
- * ========================================================================= */
-
-static ast_node_t *alloc_node(js_parser_t *p, ast_type_t type)
-{
-    ast_node_t *n = (ast_node_t *)script_arena_alloc(p->vm, sizeof(ast_node_t));
-    if (n) {
-        n->type = type;
-    }
-    return n;
-}
-
-static ast_node_t *parse_expr(js_parser_t *p);
-static ast_node_t *parse_stmt(js_parser_t *p);
-static ast_node_t *parse_func_decl(js_parser_t *p, bool is_exported);
-
-static ast_node_t *parse_primary(js_parser_t *p)
-{
-    js_tok_type_t t = p->cur.type;
-    if (t == TOK_FUNCTION) {
-        return parse_func_decl(p, false);
-    }
-    if (t == TOK_NUM) {
-        ast_node_t *n = alloc_node(p, AST_LITERAL);
-        if (n) {
-            n->lit.type = VAL_NUM;
-            n->lit.u.num = p->cur.num;
-        }
-        lexer_next(p);
-        return n;
-    }
-    if (t == TOK_STR) {
-        ast_node_t *n = alloc_node(p, AST_LITERAL);
-        if (n) {
-            n->lit.type = VAL_STR;
-            n->lit.u.str = p->cur.text ? p->cur.text : "";
-        }
-        lexer_next(p);
-        return n;
-    }
-    if (t == TOK_TRUE || t == TOK_FALSE) {
-        ast_node_t *n = alloc_node(p, AST_LITERAL);
-        if (n) {
-            n->lit.type = VAL_BOOL;
-            n->lit.u.bval = (t == TOK_TRUE);
-        }
-        lexer_next(p);
-        return n;
-    }
-    if (t == TOK_NULL) {
-        ast_node_t *n = alloc_node(p, AST_LITERAL);
-        if (n) {
-            n->lit.type = VAL_NULL;
-        }
-        lexer_next(p);
-        return n;
-    }
-    if (t == TOK_UNDEF) {
-        ast_node_t *n = alloc_node(p, AST_LITERAL);
-        if (n) {
-            n->lit.type = VAL_UNDEF;
-        }
-        lexer_next(p);
-        return n;
-    }
-    if (t == TOK_THIS) {
-        ast_node_t *n = alloc_node(p, AST_THIS);
-        lexer_next(p);
-        return n;
-    }
-    if (t == TOK_IDENT) {
-        ast_node_t *n = alloc_node(p, AST_IDENT);
-        if (n) {
-            n->name = p->cur.text;
-        }
-        lexer_next(p);
-        return n;
-    }
-    if (t == TOK_LPAREN) {
-        lexer_next(p);
-        ast_node_t *e = parse_expr(p);
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
-        return e;
-    }
-    if (t == TOK_LBRACK) {
-        lexer_next(p);
-        ast_node_t *n = alloc_node(p, AST_ARRAY_LIT);
-        ast_node_t *items[256];
-        uint32_t cnt = 0;
-        while (p->cur.type != TOK_RBRACK && p->cur.type != TOK_EOF) {
-            ast_node_t *elem = parse_expr(p);
-            if (cnt < 256u) {
-                items[cnt++] = elem;
-            }
-            if (p->cur.type == TOK_COMMA) {
-                lexer_next(p);
-            } else {
-                break;
-            }
-        }
-        if (p->cur.type == TOK_RBRACK) {
-            lexer_next(p);
-        }
-        if (n && cnt > 0) {
-            n->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
-            if (n->children) {
-                memcpy(n->children, items, cnt * sizeof(ast_node_t *));
-                n->child_count = cnt;
-            }
-        }
-        return n;
-    }
-    if (t == TOK_LBRACE) {
-        lexer_next(p);
-        ast_node_t *n = alloc_node(p, AST_OBJ_LIT);
-        const char *keys[256];
-        ast_node_t *vals[256];
-        uint32_t cnt = 0;
-        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF) {
-            const char *k = NULL;
-            if (p->cur.type == TOK_IDENT || p->cur.type == TOK_STR) {
-                k = p->cur.text;
-                lexer_next(p);
-            } else if (p->cur.type == TOK_NUM) {
-                char kbuf[32];
-                snprintf(kbuf, sizeof(kbuf), "%g", p->cur.num);
-                k = script_arena_strdup(p->vm, kbuf, strlen(kbuf));
-                lexer_next(p);
-            } else {
-                break;
-            }
-            if (p->cur.type == TOK_COLON) {
-                lexer_next(p);
-            }
-            ast_node_t *vnode = parse_expr(p);
-            if (cnt < 256u) {
-                keys[cnt] = k;
-                vals[cnt] = vnode;
-                cnt++;
-            }
-            if (p->cur.type == TOK_COMMA) {
-                lexer_next(p);
-            } else {
-                break;
-            }
-        }
-        if (p->cur.type == TOK_RBRACE) {
-            lexer_next(p);
-        }
-        if (n && cnt > 0) {
-            n->keys = (const char **)script_arena_alloc(p->vm, cnt * sizeof(const char *));
-            n->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
-            if (n->keys && n->children) {
-                memcpy(n->keys, keys, cnt * sizeof(const char *));
-                memcpy(n->children, vals, cnt * sizeof(ast_node_t *));
-                n->child_count = cnt;
-            }
-        }
-        return n;
-    }
-    if (t == TOK_NEW) {
-        lexer_next(p);
-        ast_node_t *n = alloc_node(p, AST_NEW);
-        if (p->cur.type == TOK_IDENT && n) {
-            n->name = p->cur.text;
-            lexer_next(p);
-        }
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-            ast_node_t *args[16];
-            uint32_t cnt = 0;
-            while (p->cur.type != TOK_RPAREN && p->cur.type != TOK_EOF && cnt < 16) {
-                args[cnt++] = parse_expr(p);
-                if (p->cur.type == TOK_COMMA) {
-                    lexer_next(p);
-                } else {
-                    break;
-                }
-            }
-            if (p->cur.type == TOK_RPAREN) {
-                lexer_next(p);
-            }
-            if (n && cnt > 0) {
-                n->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
-                if (n->children) {
-                    memcpy(n->children, args, cnt * sizeof(ast_node_t *));
-                    n->child_count = cnt;
-                }
-            }
-        }
-        return n;
-    }
-
-    p->vm->parse_error = true;
-    lexer_next(p);
-    return alloc_node(p, AST_LITERAL);
-}
-
-static bool parser_step_chain(js_parser_t *p, uint32_t *chain_steps)
-{
-    if (++(*chain_steps) > 256u) {
-        p->vm->parse_error = true;
-        p->vm->depth_exceeded = true;
-        p->vm->aborted = true;
-        p->cur.type = TOK_EOF;
-        return false;
-    }
-    return true;
-}
-
-static ast_node_t *parse_postfix(js_parser_t *p)
-{
-    ast_node_t *lhs = parse_primary(p);
-    uint32_t chain_steps = 0;
-    while (p->cur.type != TOK_EOF) {
-        if (!parser_step_chain(p, &chain_steps)) {
-            break;
-        }
-        if (p->cur.type == TOK_DOT) {
-            lexer_next(p);
-            const char *prop = p->cur.text;
-            if (p->cur.type == TOK_IDENT) {
-                lexer_next(p);
-            }
-            ast_node_t *m = alloc_node(p, AST_MEMBER);
-            if (m) {
-                m->left = lhs;
-                m->name = prop;
-            }
-            lhs = m;
-        } else if (p->cur.type == TOK_LBRACK) {
-            lexer_next(p);
-            ast_node_t *idx = parse_expr(p);
-            if (p->cur.type == TOK_RBRACK) {
-                lexer_next(p);
-            }
-            ast_node_t *ix = alloc_node(p, AST_INDEX);
-            if (ix) {
-                ix->left = lhs;
-                ix->right = idx;
-            }
-            lhs = ix;
-        } else if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-            ast_node_t *args[16];
-            uint32_t cnt = 0;
-            while (p->cur.type != TOK_RPAREN && p->cur.type != TOK_EOF && cnt < 16) {
-                args[cnt++] = parse_expr(p);
-                if (p->cur.type == TOK_COMMA) {
-                    lexer_next(p);
-                } else {
-                    break;
-                }
-            }
-            if (p->cur.type == TOK_RPAREN) {
-                lexer_next(p);
-            }
-            ast_node_t *call = alloc_node(p, AST_CALL);
-            if (call) {
-                call->left = lhs;
-                if (cnt > 0) {
-                    call->children =
-                        (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
-                    if (call->children) {
-                        memcpy(call->children, args, cnt * sizeof(ast_node_t *));
-                        call->child_count = cnt;
-                    }
-                }
-            }
-            lhs = call;
-        } else if (p->cur.type == TOK_INC || p->cur.type == TOK_DEC) {
-            js_tok_type_t op = p->cur.type;
-            lexer_next(p);
-            ast_node_t *u = alloc_node(p, AST_UPDATE);
-            if (u) {
-                u->op = op;
-                u->prefix = false;
-                u->left = lhs;
-            }
-            lhs = u;
-        } else {
-            break;
-        }
-    }
-    return lhs;
-}
-
-static ast_node_t *parse_unary(js_parser_t *p)
-{
-    if (++p->depth > 64u) {
-        p->depth--;
-        p->vm->parse_error = true;
-        p->vm->depth_exceeded = true;
-        p->vm->aborted = true;
-        p->cur.type = TOK_EOF;
-        return alloc_node(p, AST_LITERAL);
-    }
-    if (p->cur.type == TOK_INC || p->cur.type == TOK_DEC) {
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *u = alloc_node(p, AST_UPDATE);
-        if (u) {
-            u->op = op;
-            u->prefix = true;
-            u->left = parse_unary(p);
-        }
-        p->depth--;
-        return u;
-    }
-    if (p->cur.type == TOK_PLUS || p->cur.type == TOK_MINUS || p->cur.type == TOK_NOT ||
-        p->cur.type == TOK_BIT_NOT || p->cur.type == TOK_TYPEOF) {
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *u = alloc_node(p, AST_UNARY);
-        if (u) {
-            u->op = op;
-            u->left = parse_unary(p);
-        }
-        p->depth--;
-        return u;
-    }
-    ast_node_t *res = parse_postfix(p);
-    p->depth--;
-    return res;
-}
-
-static ast_node_t *parse_mul(js_parser_t *p)
-{
-    ast_node_t *lhs = parse_unary(p);
-    uint32_t chain_steps = 0;
-    while (p->cur.type == TOK_STAR || p->cur.type == TOK_SLASH || p->cur.type == TOK_PERCENT) {
-        if (!parser_step_chain(p, &chain_steps)) {
-            break;
-        }
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *rhs = parse_unary(p);
-        ast_node_t *b = alloc_node(p, AST_BINARY);
-        if (b) {
-            b->op = op;
-            b->left = lhs;
-            b->right = rhs;
-        }
-        lhs = b;
-    }
-    return lhs;
-}
-
-static ast_node_t *parse_add(js_parser_t *p)
-{
-    ast_node_t *lhs = parse_mul(p);
-    uint32_t chain_steps = 0;
-    while (p->cur.type == TOK_PLUS || p->cur.type == TOK_MINUS) {
-        if (!parser_step_chain(p, &chain_steps)) {
-            break;
-        }
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *rhs = parse_mul(p);
-        ast_node_t *b = alloc_node(p, AST_BINARY);
-        if (b) {
-            b->op = op;
-            b->left = lhs;
-            b->right = rhs;
-        }
-        lhs = b;
-    }
-    return lhs;
-}
-
-static ast_node_t *parse_shift(js_parser_t *p)
-{
-    ast_node_t *lhs = parse_add(p);
-    uint32_t chain_steps = 0;
-    while (p->cur.type == TOK_SHL || p->cur.type == TOK_SHR || p->cur.type == TOK_USHR) {
-        if (!parser_step_chain(p, &chain_steps)) {
-            break;
-        }
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *rhs = parse_add(p);
-        ast_node_t *b = alloc_node(p, AST_BINARY);
-        if (b) {
-            b->op = op;
-            b->left = lhs;
-            b->right = rhs;
-        }
-        lhs = b;
-    }
-    return lhs;
-}
-
-static ast_node_t *parse_rel(js_parser_t *p)
-{
-    ast_node_t *lhs = parse_shift(p);
-    uint32_t chain_steps = 0;
-    while (p->cur.type == TOK_LT || p->cur.type == TOK_LE || p->cur.type == TOK_GT ||
-           p->cur.type == TOK_GE) {
-        if (!parser_step_chain(p, &chain_steps)) {
-            break;
-        }
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *rhs = parse_shift(p);
-        ast_node_t *b = alloc_node(p, AST_BINARY);
-        if (b) {
-            b->op = op;
-            b->left = lhs;
-            b->right = rhs;
-        }
-        lhs = b;
-    }
-    return lhs;
-}
-
-static ast_node_t *parse_eq(js_parser_t *p)
-{
-    ast_node_t *lhs = parse_rel(p);
-    uint32_t chain_steps = 0;
-    while (p->cur.type == TOK_EQ || p->cur.type == TOK_STRICT_EQ || p->cur.type == TOK_NEQ ||
-           p->cur.type == TOK_STRICT_NEQ) {
-        if (!parser_step_chain(p, &chain_steps)) {
-            break;
-        }
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *rhs = parse_rel(p);
-        ast_node_t *b = alloc_node(p, AST_BINARY);
-        if (b) {
-            b->op = op;
-            b->left = lhs;
-            b->right = rhs;
-        }
-        lhs = b;
-    }
-    return lhs;
-}
-
-static ast_node_t *parse_bit(js_parser_t *p)
-{
-    ast_node_t *lhs = parse_eq(p);
-    uint32_t chain_steps = 0;
-    while (p->cur.type == TOK_BIT_AND || p->cur.type == TOK_BIT_XOR || p->cur.type == TOK_BIT_OR) {
-        if (!parser_step_chain(p, &chain_steps)) {
-            break;
-        }
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *rhs = parse_eq(p);
-        ast_node_t *b = alloc_node(p, AST_BINARY);
-        if (b) {
-            b->op = op;
-            b->left = lhs;
-            b->right = rhs;
-        }
-        lhs = b;
-    }
-    return lhs;
-}
-
-static ast_node_t *parse_logic_and(js_parser_t *p)
-{
-    ast_node_t *lhs = parse_bit(p);
-    uint32_t chain_steps = 0;
-    while (p->cur.type == TOK_AND) {
-        if (!parser_step_chain(p, &chain_steps)) {
-            break;
-        }
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *rhs = parse_bit(p);
-        ast_node_t *b = alloc_node(p, AST_BINARY);
-        if (b) {
-            b->op = op;
-            b->left = lhs;
-            b->right = rhs;
-        }
-        lhs = b;
-    }
-    return lhs;
-}
-
-static ast_node_t *parse_logic_or(js_parser_t *p)
-{
-    ast_node_t *lhs = parse_logic_and(p);
-    uint32_t chain_steps = 0;
-    while (p->cur.type == TOK_OR || p->cur.type == TOK_NULLISH) {
-        if (!parser_step_chain(p, &chain_steps)) {
-            break;
-        }
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *rhs = parse_logic_and(p);
-        ast_node_t *b = alloc_node(p, AST_BINARY);
-        if (b) {
-            b->op = op;
-            b->left = lhs;
-            b->right = rhs;
-        }
-        lhs = b;
-    }
-    return lhs;
-}
-
-static ast_node_t *parse_ternary(js_parser_t *p)
-{
-    ast_node_t *cond = parse_logic_or(p);
-    if (p->cur.type == TOK_QUESTION) {
-        lexer_next(p);
-        ast_node_t *t_br = parse_expr(p);
-        if (p->cur.type == TOK_COLON) {
-            lexer_next(p);
-        }
-        ast_node_t *e_br = parse_expr(p);
-        ast_node_t *tn = alloc_node(p, AST_TERNARY);
-        if (tn) {
-            tn->cond = cond;
-            tn->then_branch = t_br;
-            tn->else_branch = e_br;
-        }
-        return tn;
-    }
-    return cond;
-}
-
-static ast_node_t *parse_expr(js_parser_t *p)
-{
-    if (++p->depth > 64u) {
-        p->depth--;
-        p->vm->parse_error = true;
-        p->vm->depth_exceeded = true;
-        p->vm->aborted = true;
-        p->cur.type = TOK_EOF;
-        return alloc_node(p, AST_LITERAL);
-    }
-    ast_node_t *lhs = parse_ternary(p);
-    if (p->cur.type == TOK_ASSIGN || p->cur.type == TOK_PLUS_ASSIGN ||
-        p->cur.type == TOK_MINUS_ASSIGN || p->cur.type == TOK_STAR_ASSIGN ||
-        p->cur.type == TOK_SLASH_ASSIGN || p->cur.type == TOK_PERCENT_ASSIGN ||
-        p->cur.type == TOK_SHL_ASSIGN || p->cur.type == TOK_SHR_ASSIGN ||
-        p->cur.type == TOK_USHR_ASSIGN || p->cur.type == TOK_AND_ASSIGN ||
-        p->cur.type == TOK_OR_ASSIGN || p->cur.type == TOK_XOR_ASSIGN) {
-        js_tok_type_t op = p->cur.type;
-        lexer_next(p);
-        ast_node_t *rhs = parse_expr(p);
-        ast_node_t *a = alloc_node(p, AST_ASSIGN);
-        if (a) {
-            a->op = op;
-            a->left = lhs;
-            a->right = rhs;
-        }
-        p->depth--;
-        return a;
-    }
-    p->depth--;
-    return lhs;
-}
-
-static ast_node_t *parse_var_decl(js_parser_t *p, bool consume_semi)
-{
-    lexer_next(p); /* skip var/let/const */
-    ast_node_t *n = alloc_node(p, AST_VAR_DECL);
-    ast_var_item_t items[16];
-    uint32_t cnt = 0;
-
-    while (p->cur.type == TOK_IDENT && cnt < 16) {
-        items[cnt].name = p->cur.text;
-        items[cnt].init = NULL;
-        lexer_next(p);
-        if (p->cur.type == TOK_ASSIGN) {
-            lexer_next(p);
-            items[cnt].init = parse_expr(p);
-        }
-        cnt++;
-        if (p->cur.type == TOK_COMMA) {
-            lexer_next(p);
-        } else {
-            break;
-        }
-    }
-    if (consume_semi && p->cur.type == TOK_SEMI) {
-        lexer_next(p);
-    }
-    if (n && cnt > 0) {
-        n->decls = (ast_var_item_t *)script_arena_alloc(p->vm, cnt * sizeof(ast_var_item_t));
-        if (n->decls) {
-            memcpy(n->decls, items, cnt * sizeof(ast_var_item_t));
-            n->decl_count = cnt;
-        }
-    }
-    return n;
-}
-
-static ast_node_t *parse_func_decl(js_parser_t *p, bool is_exported)
-{
-    lexer_next(p); /* skip 'function' */
-    ast_node_t *fn = alloc_node(p, AST_FUNC_DECL);
-    if (fn) {
-        fn->is_exported = is_exported;
-    }
-    if (p->cur.type == TOK_IDENT) {
-        if (fn) {
-            fn->name = p->cur.text;
-        }
-        lexer_next(p);
-    }
-    if (p->cur.type == TOK_LPAREN) {
-        lexer_next(p);
-        const char *params[16];
-        uint32_t cnt = 0;
-        while (p->cur.type == TOK_IDENT && cnt < 16) {
-            params[cnt++] = p->cur.text;
-            lexer_next(p);
-            if (p->cur.type == TOK_COMMA) {
-                lexer_next(p);
-            } else {
-                break;
-            }
-        }
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
-        if (fn && cnt > 0) {
-            fn->params = (const char **)script_arena_alloc(p->vm, cnt * sizeof(const char *));
-            if (fn->params) {
-                memcpy(fn->params, params, cnt * sizeof(const char *));
-                fn->param_count = cnt;
-            }
-        }
-    }
-    if (fn) {
-        fn->body = parse_stmt(p);
-    }
-    return fn;
-}
-
-static ast_node_t *parse_stmt_inner(js_parser_t *p)
-{
-    if (p->cur.type == TOK_SEMI) {
-        lexer_next(p);
-        return alloc_node(p, AST_BLOCK);
-    }
-    if (p->cur.type == TOK_LBRACE) {
-        lexer_next(p);
-        ast_node_t *blk = alloc_node(p, AST_BLOCK);
-        ast_node_t *stmts[256];
-        uint32_t cnt = 0;
-        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->vm->aborted) {
-            ast_node_t *st = parse_stmt(p);
-            if (cnt < 256u) {
-                stmts[cnt++] = st;
-            } else {
-                break;
-            }
-        }
-        if (p->cur.type == TOK_RBRACE) {
-            lexer_next(p);
-        }
-        if (blk && cnt > 0) {
-            blk->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
-            if (blk->children) {
-                memcpy(blk->children, stmts, cnt * sizeof(ast_node_t *));
-                blk->child_count = cnt;
-            }
-        }
-        return blk;
-    }
-    if (p->cur.type == TOK_EXPORT) {
-        lexer_next(p);
-        if (p->cur.type == TOK_FUNCTION) {
-            return parse_func_decl(p, true);
-        }
-        if (p->cur.type == TOK_VAR || p->cur.type == TOK_LET || p->cur.type == TOK_CONST) {
-            ast_node_t *vd = parse_var_decl(p, true);
-            if (vd) {
-                vd->is_exported = true;
-            }
-            return vd;
-        }
-    }
-    if (p->cur.type == TOK_FUNCTION) {
-        return parse_func_decl(p, false);
-    }
-    if (p->cur.type == TOK_VAR || p->cur.type == TOK_LET || p->cur.type == TOK_CONST) {
-        return parse_var_decl(p, true);
-    }
-    if (p->cur.type == TOK_IF) {
-        lexer_next(p);
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-        }
-        ast_node_t *cond = parse_expr(p);
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
-        ast_node_t *t_br = parse_stmt(p);
-        ast_node_t *e_br = NULL;
-        if (p->cur.type == TOK_ELSE) {
-            lexer_next(p);
-            e_br = parse_stmt(p);
-        }
-        ast_node_t *n = alloc_node(p, AST_IF);
-        if (n) {
-            n->cond = cond;
-            n->then_branch = t_br;
-            n->else_branch = e_br;
-        }
-        return n;
-    }
-    if (p->cur.type == TOK_SWITCH) {
-        lexer_next(p);
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-        }
-        ast_node_t *disc = parse_expr(p);
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
-        if (p->cur.type == TOK_LBRACE) {
-            lexer_next(p);
-        }
-        ast_node_t *n = alloc_node(p, AST_SWITCH);
-        if (n) {
-            n->cond = disc;
-        }
-        ast_node_t *case_exprs[64];
-        ast_node_t *case_bodies[64];
-        uint32_t case_cnt = 0;
-        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->vm->aborted) {
-            ast_node_t *cexpr = NULL;
-            if (p->cur.type == TOK_CASE) {
-                lexer_next(p);
-                cexpr = parse_expr(p);
-                if (p->cur.type == TOK_COLON) {
-                    lexer_next(p);
-                }
-            } else if (p->cur.type == TOK_DEFAULT) {
-                lexer_next(p);
-                if (p->cur.type == TOK_COLON) {
-                    lexer_next(p);
-                }
-            } else {
-                (void)parse_stmt(p);
-                continue;
-            }
-            ast_node_t *cblk = alloc_node(p, AST_BLOCK);
-            ast_node_t *cstmts[64];
-            uint32_t scnt = 0;
-            while (p->cur.type != TOK_CASE && p->cur.type != TOK_DEFAULT &&
-                   p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->vm->aborted) {
-                ast_node_t *st = parse_stmt(p);
-                if (scnt < 64u) {
-                    cstmts[scnt++] = st;
-                }
-            }
-            if (cblk && scnt > 0) {
-                cblk->children =
-                    (ast_node_t **)script_arena_alloc(p->vm, scnt * sizeof(ast_node_t *));
-                if (cblk->children) {
-                    memcpy(cblk->children, cstmts, scnt * sizeof(ast_node_t *));
-                    cblk->child_count = scnt;
-                }
-            }
-            if (case_cnt < 64u) {
-                case_exprs[case_cnt] = cexpr;
-                case_bodies[case_cnt] = cblk;
-                case_cnt++;
-            }
-        }
-        if (p->cur.type == TOK_RBRACE) {
-            lexer_next(p);
-        }
-        if (n && case_cnt > 0) {
-            n->case_exprs =
-                (ast_node_t **)script_arena_alloc(p->vm, case_cnt * sizeof(ast_node_t *));
-            n->children = (ast_node_t **)script_arena_alloc(p->vm, case_cnt * sizeof(ast_node_t *));
-            if (n->case_exprs && n->children) {
-                memcpy(n->case_exprs, case_exprs, case_cnt * sizeof(ast_node_t *));
-                memcpy(n->children, case_bodies, case_cnt * sizeof(ast_node_t *));
-                n->child_count = case_cnt;
-            }
-        }
-        return n;
-    }
-    if (p->cur.type == TOK_TRY) {
-        lexer_next(p);
-        ast_node_t *try_body = parse_stmt(p);
-        const char *catch_var = NULL;
-        ast_node_t *catch_body = NULL;
-        ast_node_t *finally_body = NULL;
-        if (p->cur.type == TOK_CATCH) {
-            lexer_next(p);
-            if (p->cur.type == TOK_LPAREN) {
-                lexer_next(p);
-                if (p->cur.type == TOK_IDENT) {
-                    catch_var = p->cur.text;
-                    lexer_next(p);
-                }
-                if (p->cur.type == TOK_RPAREN) {
-                    lexer_next(p);
-                }
-            }
-            catch_body = parse_stmt(p);
-        }
-        if (p->cur.type == TOK_FINALLY) {
-            lexer_next(p);
-            finally_body = parse_stmt(p);
-        }
-        ast_node_t *n = alloc_node(p, AST_TRY);
-        if (n) {
-            n->body = try_body;
-            n->name = catch_var;
-            n->else_branch = catch_body;
-            n->step = finally_body;
-        }
-        return n;
-    }
-    if (p->cur.type == TOK_THROW) {
-        lexer_next(p);
-        ast_node_t *n = alloc_node(p, AST_THROW);
-        if (p->cur.type != TOK_SEMI && p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF) {
-            if (n) {
-                n->left = parse_expr(p);
-            }
-        }
-        if (p->cur.type == TOK_SEMI) {
-            lexer_next(p);
-        }
-        return n;
-    }
-    if (p->cur.type == TOK_WHILE) {
-        lexer_next(p);
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-        }
-        ast_node_t *cond = parse_expr(p);
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
-        ast_node_t *body = parse_stmt(p);
-        ast_node_t *n = alloc_node(p, AST_WHILE);
-        if (n) {
-            n->cond = cond;
-            n->body = body;
-        }
-        return n;
-    }
-    if (p->cur.type == TOK_DO) {
-        lexer_next(p);
-        ast_node_t *body = parse_stmt(p);
-        if (p->cur.type == TOK_WHILE) {
-            lexer_next(p);
-        }
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-        }
-        ast_node_t *cond = parse_expr(p);
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
-        if (p->cur.type == TOK_SEMI) {
-            lexer_next(p);
-        }
-        ast_node_t *n = alloc_node(p, AST_DO_WHILE);
-        if (n) {
-            n->body = body;
-            n->cond = cond;
-        }
-        return n;
-    }
-    if (p->cur.type == TOK_FOR) {
-        lexer_next(p);
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-        }
-        ast_node_t *init = NULL;
-        if (p->cur.type == TOK_VAR || p->cur.type == TOK_LET || p->cur.type == TOK_CONST) {
-            init = parse_var_decl(p, false);
-        } else if (p->cur.type != TOK_SEMI) {
-            init = parse_expr(p);
-        }
-        if (p->cur.type == TOK_SEMI) {
-            lexer_next(p);
-        }
-        ast_node_t *cond = NULL;
-        if (p->cur.type != TOK_SEMI) {
-            cond = parse_expr(p);
-        }
-        if (p->cur.type == TOK_SEMI) {
-            lexer_next(p);
-        }
-        ast_node_t *step = NULL;
-        if (p->cur.type != TOK_RPAREN) {
-            step = parse_expr(p);
-        }
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
-        ast_node_t *body = parse_stmt(p);
-        ast_node_t *n = alloc_node(p, AST_FOR);
-        if (n) {
-            n->init = init;
-            n->cond = cond;
-            n->step = step;
-            n->body = body;
-        }
-        return n;
-    }
-    if (p->cur.type == TOK_RETURN) {
-        lexer_next(p);
-        ast_node_t *n = alloc_node(p, AST_RETURN);
-        if (p->cur.type != TOK_SEMI && p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF) {
-            if (n) {
-                n->left = parse_expr(p);
-            }
-        }
-        if (p->cur.type == TOK_SEMI) {
-            lexer_next(p);
-        }
-        return n;
-    }
-    if (p->cur.type == TOK_BREAK) {
-        lexer_next(p);
-        if (p->cur.type == TOK_SEMI) {
-            lexer_next(p);
-        }
-        return alloc_node(p, AST_BREAK);
-    }
-    if (p->cur.type == TOK_CONTINUE) {
-        lexer_next(p);
-        if (p->cur.type == TOK_SEMI) {
-            lexer_next(p);
-        }
-        return alloc_node(p, AST_CONTINUE);
-    }
-
-    ast_node_t *e = parse_expr(p);
-    if (p->cur.type == TOK_SEMI) {
-        lexer_next(p);
-    }
-    ast_node_t *es = alloc_node(p, AST_EXPR_STMT);
-    if (es) {
-        es->left = e;
-    }
-    return es;
-}
-
-static ast_node_t *parse_stmt(js_parser_t *p)
-{
-    if (++p->depth > 64u) {
-        p->depth--;
-        p->vm->parse_error = true;
-        p->vm->depth_exceeded = true;
-        p->vm->aborted = true;
-        p->cur.type = TOK_EOF;
-        return alloc_node(p, AST_BLOCK);
-    }
-    ast_node_t *res = parse_stmt_inner(p);
-    p->depth--;
-    return res;
-}
-
-static ast_node_t *parse_program(js_parser_t *p)
-{
-    ast_node_t *prog = alloc_node(p, AST_PROGRAM);
-    ast_node_t *stmts[256];
-    uint32_t cnt = 0;
-    while (p->cur.type != TOK_EOF && cnt < 256 && !p->vm->aborted) {
-        stmts[cnt++] = parse_stmt(p);
-    }
-    if (prog && cnt > 0) {
-        prog->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
-        if (prog->children) {
-            memcpy(prog->children, stmts, cnt * sizeof(ast_node_t *));
-            prog->child_count = cnt;
-        }
-    }
-    return prog;
-}
+#include "we_script_internal.h"
 
 /* =========================================================================
  * Watchdog, Value Helpers & Built-in Objects (Vec2/3/4, Math, WEMath, etc.)
@@ -1787,8 +43,29 @@ static inline js_val_t val_num(double n)
     js_val_t v;
     memset(&v, 0, sizeof(v));
     v.type = VAL_NUM;
-    v.u.num = isfinite(n) ? n : 0.0;
+    v.u.num = (isfinite(n) || isnan(n)) ? n : 0.0;
     return v;
+}
+
+static inline js_val_t val_nan(void)
+{
+    js_val_t v;
+    memset(&v, 0, sizeof(v));
+    v.type = VAL_NUM;
+    v.u.num = (double)NAN;
+    return v;
+}
+
+static inline int32_t num_to_i32(double d)
+{
+    if (!isfinite(d) || d == 0.0) {
+        return 0;
+    }
+    double r = fmod(trunc(d), 4294967296.0);
+    if (r < 0.0) {
+        r += 4294967296.0;
+    }
+    return (int32_t)(uint32_t)r;
 }
 
 static inline js_val_t val_bool(bool b)
@@ -1844,12 +121,77 @@ static double val_to_num(js_val_t v)
         return v.u.num;
     case VAL_BOOL:
         return v.u.bval ? 1.0 : 0.0;
-    case VAL_STR:
-        return v.u.str ? strtod(v.u.str, NULL) : 0.0;
+    case VAL_STR: {
+        if (!v.u.str) {
+            return 0.0;
+        }
+        const char *p = v.u.str;
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (*p == '\0') {
+            return 0.0;
+        }
+        char *end = NULL;
+        double d = strtod(p, &end);
+        if (end == p) {
+            return (double)NAN;
+        }
+        while (*end && isspace((unsigned char)*end)) {
+            end++;
+        }
+        return (*end == '\0') ? d : (double)NAN;
+    }
     case VAL_VEC:
         return v.u.vec ? (double)v.u.vec->v[0] : 0.0;
     default:
         return 0.0;
+    }
+}
+
+static bool val_is_nan(js_val_t v)
+{
+    switch (v.type) {
+    case VAL_UNDEF:
+        return true;
+    case VAL_NULL:
+    case VAL_BOOL:
+        return false;
+    case VAL_NUM:
+        return isnan(v.u.num);
+    case VAL_STR: {
+        if (!v.u.str) {
+            return false;
+        }
+        const char *p = v.u.str;
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (*p == '\0') {
+            return false;
+        }
+        char *end = NULL;
+        double d = strtod(p, &end);
+        if (end == p) {
+            return true;
+        }
+        while (*end && isspace((unsigned char)*end)) {
+            end++;
+        }
+        return *end != '\0' || isnan(d);
+    }
+    case VAL_VEC:
+        return !v.u.vec || isnan(v.u.vec->v[0]);
+    case VAL_ARR:
+        if (!v.u.arr || v.u.arr->count == 0) {
+            return false;
+        }
+        if (v.u.arr->count == 1) {
+            return val_is_nan(v.u.arr->items[0]);
+        }
+        return true;
+    default:
+        return true;
     }
 }
 
@@ -1888,7 +230,11 @@ static void val_to_str_buf(js_val_t v, char *buf, size_t cap)
         snprintf(buf, cap, "%s", v.u.str ? v.u.str : "");
         break;
     case VAL_NUM:
-        snprintf(buf, cap, "%g", isfinite(v.u.num) ? v.u.num : 0.0);
+        if (isnan(v.u.num)) {
+            snprintf(buf, cap, "NaN");
+        } else {
+            snprintf(buf, cap, "%g", isfinite(v.u.num) ? v.u.num : 0.0);
+        }
         break;
     case VAL_BOOL:
         snprintf(buf, cap, "%s", v.u.bval ? "true" : "false");
@@ -1960,6 +306,9 @@ static bool js_val_equals(js_val_t lv, js_val_t rv, bool strict)
     }
     double a = val_to_num(lv);
     double b = val_to_num(rv);
+    if (isnan(a) || isnan(b)) {
+        return false;
+    }
     return fabs(a - b) <= 1e-9;
 }
 
@@ -2102,7 +451,7 @@ static void shared_set_val(we_script_shared_t *sh, const char *key, js_val_t val
         snprintf(ent->str_val, sizeof(ent->str_val), "%s", val.u.str);
     } else {
         ent->num_components = 1;
-        ent->val[0] = (float)val_to_num(val);
+        ent->val[0] = sanitize_f((float)val_to_num(val), 0.0f);
     }
 }
 
@@ -2498,7 +847,7 @@ static js_val_t call_builtin_method(we_script_t *vm, js_builtin_id_t bid, const 
     } else if (bid == BUILTIN_ENGINE) {
         if (strcmp(method, "registerAudioBuffers") == 0) {
             vm->uses_audio = true;
-            uint32_t res = (argc >= 1) ? (uint32_t)val_to_num(args[0]) : 64u;
+            uint32_t res = (argc >= 1) ? (uint32_t)num_to_i32(val_to_num(args[0])) : 64u;
             if (res != 16u && res != 32u && res != 64u) {
                 res = 64u;
             }
@@ -2884,21 +1233,24 @@ static js_val_t apply_assign_op(we_script_t *vm, js_tok_type_t op, js_val_t cur,
     case TOK_STAR_ASSIGN:
         return val_num(a * b);
     case TOK_SLASH_ASSIGN:
-        return val_num(fabs(b) > 1e-12 ? (a / b) : 0.0);
+        if (fabs(b) > 1e-12) {
+            return val_num(a / b);
+        }
+        return (fabs(a) <= 1e-12 || isnan(a) || isnan(b)) ? val_nan() : val_num(0.0);
     case TOK_PERCENT_ASSIGN:
-        return val_num(fabs(b) > 1e-12 ? fmod(a, b) : 0.0);
+        return fabs(b) > 1e-12 ? val_num(fmod(a, b)) : val_nan();
     case TOK_SHL_ASSIGN:
-        return val_num((double)((int32_t)a << ((int32_t)b & 31)));
+        return val_num((double)(num_to_i32(a) << (num_to_i32(b) & 31)));
     case TOK_SHR_ASSIGN:
-        return val_num((double)((int32_t)a >> ((int32_t)b & 31)));
+        return val_num((double)(num_to_i32(a) >> (num_to_i32(b) & 31)));
     case TOK_USHR_ASSIGN:
-        return val_num((double)((uint32_t)(int32_t)a >> ((uint32_t)(int32_t)b & 31u)));
+        return val_num((double)((uint32_t)num_to_i32(a) >> ((uint32_t)num_to_i32(b) & 31u)));
     case TOK_AND_ASSIGN:
-        return val_num((double)((int32_t)a & (int32_t)b));
+        return val_num((double)(num_to_i32(a) & num_to_i32(b)));
     case TOK_OR_ASSIGN:
-        return val_num((double)((int32_t)a | (int32_t)b));
+        return val_num((double)(num_to_i32(a) | num_to_i32(b)));
     case TOK_XOR_ASSIGN:
-        return val_num((double)((int32_t)a ^ (int32_t)b));
+        return val_num((double)(num_to_i32(a) ^ num_to_i32(b)));
     default:
         return rhs;
     }
@@ -2987,7 +1339,7 @@ static js_val_t eval_lvalue_update(we_script_t *vm, exec_scope_t *scope, const a
         js_val_t base = eval_node(vm, scope, lhs->left);
         js_val_t idx_v = eval_node(vm, scope, lhs->right);
         if (base.type == VAL_ARR && base.u.arr) {
-            int32_t idx = (int32_t)val_to_num(idx_v);
+            int32_t idx = num_to_i32(val_to_num(idx_v));
             if (idx >= 0 && idx < 4096) {
                 js_arr_t *arr = base.u.arr;
                 if ((uint32_t)idx >= arr->cap) {
@@ -3089,7 +1441,7 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
     }
     if (strcmp(method, "indexOf") == 0) {
         js_val_t needle = argc >= 1 ? args[0] : val_undef();
-        int32_t from = argc >= 2 ? (int32_t)val_to_num(args[1]) : 0;
+        int32_t from = argc >= 2 ? num_to_i32(val_to_num(args[1])) : 0;
         if (from < 0) {
             from = (int32_t)arr->count + from;
             if (from < 0) {
@@ -3114,8 +1466,9 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
     }
     if (strcmp(method, "slice") == 0) {
         int32_t len = (int32_t)arr->count;
-        int32_t start = argc >= 1 ? (int32_t)val_to_num(args[0]) : 0;
-        int32_t end = (argc >= 2 && args[1].type != VAL_UNDEF) ? (int32_t)val_to_num(args[1]) : len;
+        int32_t start = argc >= 1 ? num_to_i32(val_to_num(args[0])) : 0;
+        int32_t end =
+            (argc >= 2 && args[1].type != VAL_UNDEF) ? num_to_i32(val_to_num(args[1])) : len;
         if (start < 0) {
             start = len + start;
         }
@@ -3146,7 +1499,7 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
     }
     if (strcmp(method, "splice") == 0) {
         int32_t len = (int32_t)arr->count;
-        int32_t start = argc >= 1 ? (int32_t)val_to_num(args[0]) : len;
+        int32_t start = argc >= 1 ? num_to_i32(val_to_num(args[0])) : len;
         if (start < 0) {
             start = len + start;
         }
@@ -3156,8 +1509,8 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
         if (start > len) {
             start = len;
         }
-        int32_t del_cnt =
-            (argc >= 2 && args[1].type != VAL_UNDEF) ? (int32_t)val_to_num(args[1]) : (len - start);
+        int32_t del_cnt = (argc >= 2 && args[1].type != VAL_UNDEF) ? num_to_i32(val_to_num(args[1]))
+                                                                   : (len - start);
         if (del_cnt < 0) {
             del_cnt = 0;
         }
@@ -3315,7 +1668,7 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
         if (strcmp(node->name, "console") == 0)
             return val_builtin(BUILTIN_CONSOLE);
         if (strcmp(node->name, "NaN") == 0)
-            return val_num(0.0);
+            return val_nan();
         if (strcmp(node->name, "Infinity") == 0)
             return val_num(1e30);
         return val_undef();
@@ -3440,7 +1793,7 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
         js_val_t base = eval_node(vm, scope, node->left);
         js_val_t idx_v = eval_node(vm, scope, node->right);
         if (base.type == VAL_AUDIO_CHANNEL) {
-            int32_t i = (int32_t)val_to_num(idx_v);
+            int32_t i = num_to_i32(val_to_num(idx_v));
             uint32_t res = base.u.audio.res > 0 ? base.u.audio.res : 64u;
             if (i >= 0 && (uint32_t)i < res) {
                 uint32_t band = ((uint32_t)i * 64u) / res;
@@ -3456,14 +1809,14 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
             return val_num(0.0);
         }
         if (base.type == VAL_ARR && base.u.arr) {
-            int32_t i = (int32_t)val_to_num(idx_v);
+            int32_t i = num_to_i32(val_to_num(idx_v));
             if (i >= 0 && (uint32_t)i < base.u.arr->count) {
                 return base.u.arr->items[i];
             }
             return val_undef();
         }
         if (base.type == VAL_VEC && base.u.vec) {
-            int32_t i = (int32_t)val_to_num(idx_v);
+            int32_t i = num_to_i32(val_to_num(idx_v));
             if (i >= 0 && i < 4) {
                 return val_num((double)base.u.vec->v[i]);
             }
@@ -3535,12 +1888,80 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
                 return construct_vec(vm, 3, args, argc);
             if (strcmp(fname, "Vec4") == 0)
                 return construct_vec(vm, 4, args, argc);
-            if (strcmp(fname, "parseFloat") == 0 || strcmp(fname, "Number") == 0)
-                return val_num(argc >= 1 ? val_to_num(args[0]) : 0.0);
-            if (strcmp(fname, "parseInt") == 0)
-                return val_num(argc >= 1 ? trunc(val_to_num(args[0])) : 0.0);
+            if (strcmp(fname, "parseFloat") == 0) {
+                if (argc == 0) {
+                    return val_nan();
+                }
+                if (args[0].type == VAL_NUM) {
+                    return val_num(args[0].u.num);
+                }
+                if (args[0].type == VAL_STR) {
+                    const char *p = args[0].u.str ? args[0].u.str : "";
+                    while (*p && isspace((unsigned char)*p)) {
+                        p++;
+                    }
+                    if (*p == '\0') {
+                        return val_nan();
+                    }
+                    char *end = NULL;
+                    double d = strtod(p, &end);
+                    if (end == p) {
+                        return val_nan();
+                    }
+                    return val_num(d);
+                }
+                if (val_is_nan(args[0])) {
+                    return val_nan();
+                }
+                return val_num(val_to_num(args[0]));
+            }
+            if (strcmp(fname, "Number") == 0) {
+                if (argc == 0) {
+                    return val_num(0.0);
+                }
+                if (val_is_nan(args[0])) {
+                    return val_nan();
+                }
+                return val_num(val_to_num(args[0]));
+            }
+            if (strcmp(fname, "parseInt") == 0) {
+                if (argc == 0) {
+                    return val_nan();
+                }
+                int radix =
+                    (argc >= 2 && args[1].type != VAL_UNDEF) ? num_to_i32(val_to_num(args[1])) : 0;
+                if (radix != 0 && (radix < 2 || radix > 36)) {
+                    return val_nan();
+                }
+                if (args[0].type == VAL_STR) {
+                    const char *p = args[0].u.str ? args[0].u.str : "";
+                    while (*p && isspace((unsigned char)*p)) {
+                        p++;
+                    }
+                    if (*p == '\0') {
+                        return val_nan();
+                    }
+                    if (radix == 0) {
+                        const char *q = (*p == '+' || *p == '-') ? (p + 1) : p;
+                        radix = (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) ? 16 : 10;
+                    }
+                    char *end = NULL;
+                    long lv = strtol(p, &end, radix);
+                    if (end == p) {
+                        return val_nan();
+                    }
+                    return val_num((double)lv);
+                }
+                if (args[0].type == VAL_NUM) {
+                    if (!isfinite(args[0].u.num)) {
+                        return val_nan();
+                    }
+                    return val_num(trunc(args[0].u.num));
+                }
+                return val_nan();
+            }
             if (strcmp(fname, "isNaN") == 0)
-                return val_bool(argc >= 1 ? isnan(val_to_num(args[0])) : false);
+                return val_bool(argc >= 1 ? val_is_nan(args[0]) : true);
             if (strcmp(fname, "createScriptProperties") == 0) {
                 js_obj_t *obj = (js_obj_t *)script_arena_alloc(vm, sizeof(js_obj_t));
                 js_val_t v = {.type = VAL_OBJ, .u.obj = obj};
@@ -3566,7 +1987,7 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
         case TOK_NOT:
             return val_bool(!val_to_bool(v));
         case TOK_BIT_NOT:
-            return val_num((double)(~(int32_t)val_to_num(v)));
+            return val_num((double)(~num_to_i32(val_to_num(v))));
         case TOK_TYPEOF:
             switch (v.type) {
             case VAL_NUM:
@@ -3654,9 +2075,12 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
         case TOK_STAR:
             return val_num(a * b);
         case TOK_SLASH:
-            return val_num(fabs(b) > 1e-12 ? (a / b) : 0.0);
+            if (fabs(b) > 1e-12) {
+                return val_num(a / b);
+            }
+            return (fabs(a) <= 1e-12 || isnan(a) || isnan(b)) ? val_nan() : val_num(0.0);
         case TOK_PERCENT:
-            return val_num(fabs(b) > 1e-12 ? fmod(a, b) : 0.0);
+            return fabs(b) > 1e-12 ? val_num(fmod(a, b)) : val_nan();
         case TOK_LT:
             return val_bool(a < b);
         case TOK_LE:
@@ -3666,17 +2090,17 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
         case TOK_GE:
             return val_bool(a >= b);
         case TOK_BIT_AND:
-            return val_num((double)((int32_t)a & (int32_t)b));
+            return val_num((double)(num_to_i32(a) & num_to_i32(b)));
         case TOK_BIT_OR:
-            return val_num((double)((int32_t)a | (int32_t)b));
+            return val_num((double)(num_to_i32(a) | num_to_i32(b)));
         case TOK_BIT_XOR:
-            return val_num((double)((int32_t)a ^ (int32_t)b));
+            return val_num((double)(num_to_i32(a) ^ num_to_i32(b)));
         case TOK_SHL:
-            return val_num((double)((int32_t)a << ((int32_t)b & 31)));
+            return val_num((double)(num_to_i32(a) << (num_to_i32(b) & 31)));
         case TOK_SHR:
-            return val_num((double)((int32_t)a >> ((int32_t)b & 31)));
+            return val_num((double)(num_to_i32(a) >> (num_to_i32(b) & 31)));
         case TOK_USHR:
-            return val_num((double)((uint32_t)(int32_t)a >> ((uint32_t)(int32_t)b & 31u)));
+            return val_num((double)((uint32_t)num_to_i32(a) >> ((uint32_t)num_to_i32(b) & 31u)));
         default:
             return val_undef();
         }
@@ -4046,15 +2470,7 @@ we_script_t *we_script_create(const char *src, size_t len, we_script_shared_t *s
 
     reset_watchdog(vm);
 
-    js_parser_t parser = {
-        .vm = vm,
-        .src = src,
-        .len = len,
-        .pos = 0,
-        .depth = 0,
-    };
-    lexer_next(&parser);
-    vm->root_ast = parse_program(&parser);
+    vm->root_ast = we_script_parse_program(vm, src, len);
     if (!vm->root_ast || vm->oom) {
         we_script_destroy(vm);
         return NULL;
@@ -4169,7 +2585,7 @@ void we_script_register_scene_layer(we_script_t *script, uint32_t slot,
     sl->state = *layer;
     sl->state.dirty_mask = 0;
 
-    uint8_t lslot = (uint8_t)(slot + 1u);
+    uint16_t lslot = (uint16_t)(slot + 1u);
     sl->origin_vec.dim = 3;
     sl->origin_vec.bind_tag = 1;
     sl->origin_vec.layer_slot = lslot;
@@ -4311,6 +2727,8 @@ static void evacuate_val_to_scratch(const we_script_t *vm, js_val_t *v, uint8_t 
                 if (nv) {
                     v->u.vec = nv;
                     fwd_record(fwd, orig_vec, nv);
+                } else {
+                    *v = val_undef();
                 }
             }
         }
@@ -4327,9 +2745,11 @@ static void evacuate_val_to_scratch(const we_script_t *vm, js_val_t *v, uint8_t 
             if (ptr_above_watermark(vm, orig_arr)) {
                 js_arr_t *copy = (js_arr_t *)scratch_alloc_copy(scratch, scratch_cap, scratch_used,
                                                                 orig_arr, sizeof(js_arr_t));
-                if (copy) {
-                    na = copy;
+                if (!copy) {
+                    *v = val_undef();
+                    return;
                 }
+                na = copy;
             }
             v->u.arr = na;
             fwd_record(fwd, orig_arr, na);
@@ -4339,6 +2759,11 @@ static void evacuate_val_to_scratch(const we_script_t *vm, js_val_t *v, uint8_t 
                         scratch, scratch_cap, scratch_used, na->items, na->cap * sizeof(js_val_t));
                     if (ni) {
                         na->items = ni;
+                    } else {
+                        na->items = NULL;
+                        na->count = 0;
+                        na->cap = 0;
+                        return;
                     }
                 }
                 for (uint32_t i = 0; i < na->count; i++) {
@@ -4360,9 +2785,11 @@ static void evacuate_val_to_scratch(const we_script_t *vm, js_val_t *v, uint8_t 
             if (ptr_above_watermark(vm, orig_obj)) {
                 js_obj_t *copy = (js_obj_t *)scratch_alloc_copy(scratch, scratch_cap, scratch_used,
                                                                 orig_obj, sizeof(js_obj_t));
-                if (copy) {
-                    no = copy;
+                if (!copy) {
+                    *v = val_undef();
+                    return;
                 }
+                no = copy;
             }
             v->u.obj = no;
             fwd_record(fwd, orig_obj, no);
@@ -4372,6 +2799,11 @@ static void evacuate_val_to_scratch(const we_script_t *vm, js_val_t *v, uint8_t 
                         scratch, scratch_cap, scratch_used, no->props, no->cap * sizeof(js_prop_t));
                     if (np) {
                         no->props = np;
+                    } else {
+                        no->props = NULL;
+                        no->count = 0;
+                        no->cap = 0;
+                        return;
                     }
                 }
                 for (uint32_t i = 0; i < no->count; i++) {
@@ -4394,7 +2826,8 @@ static const char *promote_str_from_scratch(we_script_t *vm, const char *s, cons
     if (!ptr_in_scratch(scratch, scratch_used, s)) {
         return s;
     }
-    return script_arena_strdup(vm, s, strlen(s));
+    const char *dup = script_arena_strdup(vm, s, strlen(s));
+    return dup ? dup : "";
 }
 
 static void promote_val_from_scratch(we_script_t *vm, js_val_t *v, const uint8_t *scratch,
@@ -4421,6 +2854,8 @@ static void promote_val_from_scratch(we_script_t *vm, js_val_t *v, const uint8_t
                     *nv = *orig_vec;
                     v->u.vec = nv;
                     fwd_record(fwd, orig_vec, nv);
+                } else {
+                    *v = val_undef();
                 }
             }
         }
@@ -4436,10 +2871,12 @@ static void promote_val_from_scratch(we_script_t *vm, js_val_t *v, const uint8_t
             js_arr_t *na = orig_arr;
             if (ptr_in_scratch(scratch, scratch_used, orig_arr)) {
                 js_arr_t *copy = (js_arr_t *)script_arena_alloc(vm, sizeof(js_arr_t));
-                if (copy) {
-                    *copy = *orig_arr;
-                    na = copy;
+                if (!copy) {
+                    *v = val_undef();
+                    return;
                 }
+                *copy = *orig_arr;
+                na = copy;
             }
             v->u.arr = na;
             fwd_record(fwd, orig_arr, na);
@@ -4449,6 +2886,11 @@ static void promote_val_from_scratch(we_script_t *vm, js_val_t *v, const uint8_t
                     if (ni) {
                         memcpy(ni, na->items, na->count * sizeof(js_val_t));
                         na->items = ni;
+                    } else {
+                        na->items = NULL;
+                        na->count = 0;
+                        na->cap = 0;
+                        return;
                     }
                 }
                 for (uint32_t i = 0; i < na->count; i++) {
@@ -4469,10 +2911,12 @@ static void promote_val_from_scratch(we_script_t *vm, js_val_t *v, const uint8_t
             js_obj_t *no = orig_obj;
             if (ptr_in_scratch(scratch, scratch_used, orig_obj)) {
                 js_obj_t *copy = (js_obj_t *)script_arena_alloc(vm, sizeof(js_obj_t));
-                if (copy) {
-                    *copy = *orig_obj;
-                    no = copy;
+                if (!copy) {
+                    *v = val_undef();
+                    return;
                 }
+                *copy = *orig_obj;
+                no = copy;
             }
             v->u.obj = no;
             fwd_record(fwd, orig_obj, no);
@@ -4483,6 +2927,11 @@ static void promote_val_from_scratch(we_script_t *vm, js_val_t *v, const uint8_t
                     if (np) {
                         memcpy(np, no->props, no->count * sizeof(js_prop_t));
                         no->props = np;
+                    } else {
+                        no->props = NULL;
+                        no->count = 0;
+                        no->cap = 0;
+                        return;
                     }
                 }
                 for (uint32_t i = 0; i < no->count; i++) {

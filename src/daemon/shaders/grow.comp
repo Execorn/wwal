@@ -26,13 +26,14 @@ void main() {
         return;
     }
 
+    vec2 center = (u_center.x > 0.0 || u_center.y > 0.0) ? u_center : vec2(0.5);
     float aspect = float(u_resolution.x) / float(u_resolution.y);
-    vec2 delta = uv - u_center;
+    vec2 delta = uv - center;
     delta.x *= aspect;
 
     float dist2 = dot(delta, delta);
-    float max_dist = length(vec2(max(u_center.x, 1.0 - u_center.x) * aspect,
-                                 max(u_center.y, 1.0 - u_center.y))) + 0.05;
+    float max_dist = length(vec2(max(center.x, 1.0 - center.x) * aspect,
+                                 max(center.y, 1.0 - center.y))) + 0.05;
     float edge = 0.03 * max_dist;
     float r = u_progress * (max_dist + 2.0 * edge) - edge;
     float r_inner = r - edge;

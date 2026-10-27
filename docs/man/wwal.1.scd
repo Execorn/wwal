@@ -25,6 +25,9 @@ When invoked via a symlink named *swww* or *awww*, *wwal* automatically enables 
 *-v, --verbose*
 	Enable verbose diagnostic output.
 
+*-V, --version*
+	Print version information and exit.
+
 *-h, --help*
 	Display usage information and exit.
 
@@ -87,11 +90,17 @@ When invoked via a symlink named *swww* or *awww*, *wwal* automatically enables 
 *clear-cache*
 	Remove cached hardware-transcoded animations and palette artifacts from *$XDG_CACHE_HOME/wwal*.
 
+*init*
+	Launch or initialize the *wwald*(1) daemon (*swww*/*awww* compatibility alias).
+
 *ping*
 	Check whether *wwald*(1) is running and responsive over the IPC socket.
 
 *kill*
 	Gracefully terminate the running *wwald*(1) daemon.
+
+*version*
+	Print version information and exit.
 
 *help*
 	Show command-line usage summary.
@@ -121,6 +130,8 @@ When invoked via a symlink named *swww* or *awww*, *wwal* automatically enables 
 	- *light_leak*: Warm filmic anamorphic flare transition.
 	- *page_curl*: 3D cylindrical page curl with specular shading.
 	- *custom*: User-supplied GLSL compute shader via *--transition-shader*.
+	- *left*, *right*, *top*, *bottom*: Directional slide transition aliases (*swww*/*awww* compatibility).
+	- *center*, *any*: Centered or arbitrary radial iris grow aliases (*swww*/*awww* compatibility).
 	- *random*: Randomly choose one of the 18 built-in shader transitions.
 
 *--transition-duration* <SECONDS>

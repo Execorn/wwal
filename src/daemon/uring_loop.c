@@ -81,6 +81,10 @@ bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_e
             }
             if (slot->in_flight && slot->in_flight_tag != 0) {
                 struct io_uring_sqe *rm_sqe = io_uring_get_sqe(&loop->ring);
+                if (!rm_sqe) {
+                    (void)io_uring_submit(&loop->ring);
+                    rm_sqe = io_uring_get_sqe(&loop->ring);
+                }
                 if (rm_sqe) {
                     io_uring_prep_poll_remove(rm_sqe, (__u64)slot->in_flight_tag);
                     io_uring_sqe_set_data64(rm_sqe, 0);

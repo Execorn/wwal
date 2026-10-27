@@ -24,6 +24,8 @@ makedepends="
 	libjpeg-turbo-dev
 	linux-headers
 	"
+# Optional runtime dependencies loaded on demand via dlopen():
+# libwebp, libavif, libjxl, librsvg, pipewire-libs, dbus-libs, elogind-libs, lz4-libs
 subpackages="
 	$pkgname-doc
 	$pkgname-bash-completion

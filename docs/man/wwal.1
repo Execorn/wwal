@@ -32,6 +32,11 @@ Connect to the daemon socket namespace \fINAME\fR (default: \fBdefault\fR). Also
 Enable verbose diagnostic output.
 .RE
 .PP
+\fB-V, --version\fR
+.RS 4
+Print version information and exit.
+.RE
+.PP
 \fB-h, --help\fR
 .RS 4
 Display usage information and exit.
@@ -134,6 +139,11 @@ Restore the last persisted per-output wallpaper, video, shader, Workshop scene, 
 Remove cached hardware-transcoded animations and palette artifacts from \fB$XDG_CACHE_HOME/wwal\fR.
 .RE
 .PP
+\fBinit\fR
+.RS 4
+Launch or initialize the \fBwwald\fR(1) daemon (\fBswww\fR/\fBawww\fR compatibility alias).
+.RE
+.PP
 \fBping\fR
 .RS 4
 Check whether \fBwwald\fR(1) is running and responsive over the IPC socket.
@@ -142,6 +152,11 @@ Check whether \fBwwald\fR(1) is running and responsive over the IPC socket.
 \fBkill\fR
 .RS 4
 Gracefully terminate the running \fBwwald\fR(1) daemon.
+.RE
+.PP
+\fBversion\fR
+.RS 4
+Print version information and exit.
 .RE
 .PP
 \fBhelp\fR
@@ -238,6 +253,14 @@ Select transition effect (default: \fBfade\fR). Supported GPU GLES 3.1 compute s
 .RS 4
 .IP \(bu 2
 \fBcustom\fR: User-supplied GLSL compute shader via \fB--transition-shader\fR.
+.RE
+.RS 4
+.IP \(bu 2
+\fBleft\fR, \fBright\fR, \fBtop\fR, \fBbottom\fR: Directional slide transition aliases (\fBswww\fR/\fBawww\fR compatibility).
+.RE
+.RS 4
+.IP \(bu 2
+\fBcenter\fR, \fBany\fR: Centered or arbitrary radial iris grow aliases (\fBswww\fR/\fBawww\fR compatibility).
 .RE
 .RS 4
 .IP \(bu 2

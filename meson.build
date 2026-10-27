@@ -23,6 +23,7 @@ add_project_arguments(
   '-fvisibility=hidden',
   '-fstrict-aliasing',
   '-D_GNU_SOURCE',
+  '-DWAYWAL_VERSION="' + meson.project_version() + '"',
   language: 'c'
 )
 
@@ -78,7 +79,6 @@ avif_dep = dependency('libavif', required: get_option('avif').enabled())
 jxl_dep = dependency('libjxl', required: get_option('jxl').enabled())
 svg_dep = dependency('librsvg-2.0', required: get_option('svg').enabled())
 pipewire_dep = dependency('libpipewire-0.3', required: get_option('pipewire').enabled())
-shaderc_dep = dependency('shaderc', required: get_option('shaderc').enabled())
 
 if get_option('webp').disabled()
   add_project_arguments('-DWWAL_DISABLE_WEBP', language: 'c')
@@ -94,9 +94,6 @@ if get_option('svg').disabled()
 endif
 if get_option('pipewire').disabled()
   add_project_arguments('-DWWAL_DISABLE_PIPEWIRE', language: 'c')
-endif
-if get_option('shaderc').disabled()
-  add_project_arguments('-DWWAL_DISABLE_SHADERC', language: 'c')
 endif
 
 # OpenMP for multi-threaded CPU transition engine
@@ -190,7 +187,7 @@ proto_dep = declare_dependency(
   dependencies: [wayland_client_dep]
 )
 
-# Image dependencies for client
+# Image dependencies for common loader
 png_dep = dependency('libpng', required: false)
 turbojpeg_dep = dependency('libturbojpeg', required: false)
 
@@ -205,24 +202,39 @@ common_sources = files(
   'src/common/palette_hct.c',
   'src/common/toml_parser.c',
   'src/common/state_store.c',
-  'src/daemon/we_pkg.c',
+  'src/common/image_loader.c',
+  'src/common/we_pkg.c',
+  'src/common/we_json.c',
+  'src/common/we_project.c',
 )
+
+common_deps = [threads_dep, m_dep, dl_dep]
+if png_dep.found()
+  common_deps += png_dep
+endif
+if turbojpeg_dep.found()
+  common_deps += turbojpeg_dep
+endif
+if openmp_dep.found()
+  common_deps += openmp_dep
+endif
 
 common_lib = static_library('waywal_common',
   common_sources,
   include_directories: inc_dir,
-  dependencies: [threads_dep, m_dep, dl_dep]
+  dependencies: common_deps
 )
 
 common_dep = declare_dependency(
   link_with: common_lib,
   include_directories: inc_dir,
-  dependencies: [threads_dep, m_dep, dl_dep]
+  dependencies: common_deps
 )
 
 # Daemon executable (wwald)
 daemon_sources = files(
   'src/daemon/main.c',
+  'src/daemon/ipc_server.c',
   'src/daemon/wayland_core.c',
   'src/daemon/layer_shell.c',
   'src/daemon/dmabuf_alloc.c',
@@ -234,8 +246,13 @@ daemon_sources = files(
   'src/daemon/simd/blend_avx2.c',
   'src/daemon/simd/blend_avx512.c',
   'src/daemon/simd/blend_neon.c',
+  'src/daemon/simd/cpu_transitions.c',
   'src/daemon/demuxer.c',
   'src/daemon/video_vaapi.c',
+  'src/daemon/vaapi_h264.c',
+  'src/daemon/vaapi_hevc.c',
+  'src/daemon/vaapi_vp9.c',
+  'src/daemon/vaapi_av1.c',
   'src/daemon/video_engine.c',
   'src/daemon/presentation.c',
   'src/daemon/uring_loop.c',
@@ -251,9 +268,10 @@ daemon_sources = files(
   'src/daemon/we_shader.c',
   'src/daemon/we_puppet.c',
   'src/daemon/we_particle.c',
+  'src/daemon/we_script_parse.c',
   'src/daemon/we_script.c',
+  'src/daemon/we_scene_parse.c',
   'src/daemon/we_scene.c',
-  'src/client/image_loader.c',
 )
 
 daemon_deps = [
@@ -282,12 +300,6 @@ endif
 if openmp_dep.found()
   daemon_deps += openmp_dep
 endif
-if png_dep.found()
-  daemon_deps += png_dep
-endif
-if turbojpeg_dep.found()
-  daemon_deps += turbojpeg_dep
-endif
 
 wwald = executable('wwald',
   daemon_sources,
@@ -300,22 +312,13 @@ wwald = executable('wwald',
 client_sources = files(
   'src/client/main.c',
   'src/client/cli_parser.c',
-  'src/client/image_loader.c',
   'src/client/gif_transcode.c',
-  'src/daemon/we_scene.c',
 )
 
 client_deps = [common_dep, threads_dep, m_dep]
-if png_dep.found()
-  client_deps += png_dep
-endif
-if turbojpeg_dep.found()
-  client_deps += turbojpeg_dep
-endif
 
 wwal = executable('wwal',
   client_sources,
-  c_args: ['-DWWAL_WE_PROJECT_ONLY'],
   include_directories: inc_dir,
   dependencies: client_deps,
   install: true
@@ -400,6 +403,7 @@ if get_option('tests')
     'src/daemon/simd/blend_avx2.c',
     'src/daemon/simd/blend_avx512.c',
     'src/daemon/simd/blend_neon.c',
+    'src/daemon/simd/cpu_transitions.c',
     include_directories: inc_dir,
     dependencies: [
       common_dep,
@@ -426,6 +430,7 @@ if get_option('tests')
     'src/daemon/simd/blend_avx2.c',
     'src/daemon/simd/blend_avx512.c',
     'src/daemon/simd/blend_neon.c',
+    'src/daemon/simd/cpu_transitions.c',
     include_directories: inc_dir,
     dependencies: [
       common_dep,
@@ -445,6 +450,10 @@ if get_option('tests')
     'tests/test_video.c',
     'src/daemon/demuxer.c',
     'src/daemon/video_vaapi.c',
+    'src/daemon/vaapi_h264.c',
+    'src/daemon/vaapi_hevc.c',
+    'src/daemon/vaapi_vp9.c',
+    'src/daemon/vaapi_av1.c',
     'src/daemon/dmabuf_alloc.c',
     'src/daemon/dmabuf_feedback.c',
     include_directories: inc_dir,
@@ -492,17 +501,10 @@ if get_option('tests')
   test('desktop', test_desktop_exe)
 
   advanced_test_deps = [common_dep, proto_dep, wayland_client_dep, libdrm_dep, gbm_dep, threads_dep, m_dep]
-  if png_dep.found()
-    advanced_test_deps += png_dep
-  endif
-  if turbojpeg_dep.found()
-    advanced_test_deps += turbojpeg_dep
-  endif
 
   test_advanced_exe = executable('test_advanced',
     'tests/test_advanced.c',
     'src/client/cli_parser.c',
-    'src/client/image_loader.c',
     'src/client/gif_transcode.c',
     'src/daemon/slideshow.c',
     include_directories: inc_dir,
@@ -532,6 +534,7 @@ if get_option('tests')
     'src/daemon/simd/blend_avx2.c',
     'src/daemon/simd/blend_avx512.c',
     'src/daemon/simd/blend_neon.c',
+    'src/daemon/simd/cpu_transitions.c',
   )
 
   test_e2e_exe = executable('test_e2e',
@@ -576,17 +579,10 @@ if get_option('tests')
   if openmp_dep.found()
     test_subsystems_deps += openmp_dep
   endif
-  if png_dep.found()
-    test_subsystems_deps += png_dep
-  endif
-  if turbojpeg_dep.found()
-    test_subsystems_deps += turbojpeg_dep
-  endif
 
   test_subsystems_exe = executable('test_subsystems',
     'tests/test_subsystems.c',
     'src/client/cli_parser.c',
-    'src/client/image_loader.c',
     'src/daemon/anim_engine.c',
     'src/daemon/power_governor.c',
     'src/daemon/audio_fft.c',
@@ -604,7 +600,6 @@ if get_option('tests')
   test_we_core_exe = executable('test_we_core',
     'tests/test_we_core.c',
     'src/client/cli_parser.c',
-    'src/client/image_loader.c',
     'src/daemon/demuxer.c',
     'src/daemon/audio_fft.c',
     'src/daemon/mpris.c',
@@ -614,7 +609,9 @@ if get_option('tests')
     'src/daemon/we_shader.c',
     'src/daemon/we_puppet.c',
     'src/daemon/we_particle.c',
+    'src/daemon/we_script_parse.c',
     'src/daemon/we_script.c',
+    'src/daemon/we_scene_parse.c',
     'src/daemon/we_scene.c',
     'src/daemon/dmabuf_alloc.c',
     'src/daemon/dmabuf_feedback.c',
@@ -635,6 +632,10 @@ if get_option('tests')
   fuzz_bitstream_exe = executable('fuzz_bitstream',
     'tests/fuzz/fuzz_bitstream.c',
     'src/daemon/video_vaapi.c',
+    'src/daemon/vaapi_h264.c',
+    'src/daemon/vaapi_hevc.c',
+    'src/daemon/vaapi_vp9.c',
+    'src/daemon/vaapi_av1.c',
     'src/daemon/dmabuf_alloc.c',
     'src/daemon/dmabuf_feedback.c',
     c_args: ['-DWWAL_FUZZ_STANDALONE'],

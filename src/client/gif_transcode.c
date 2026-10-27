@@ -355,6 +355,31 @@ static void parse_mp4_boxes(const uint8_t *data, size_t start, size_t end, mp4_p
     }
 }
 
+static bool ebml_probe_vint(const uint8_t *data, size_t limit, size_t *pos, uint64_t *out_val,
+                            bool strip_marker)
+{
+    if (*pos >= limit)
+        return false;
+    uint8_t first = data[*pos];
+    if (first == 0)
+        return false;
+    uint32_t len = 1;
+    uint8_t mask = 0x80;
+    while (len <= 4 && (first & mask) == 0) {
+        len++;
+        mask >>= 1;
+    }
+    if (len > 4 || *pos + len > limit)
+        return false;
+    uint64_t val = strip_marker ? (uint64_t)(first & (mask - 1U)) : (uint64_t)first;
+    for (uint32_t k = 1; k < len; ++k) {
+        val = (val << 8) | data[*pos + k];
+    }
+    *pos += len;
+    *out_val = val;
+    return true;
+}
+
 static bool probe_mp4_stream(const char *filepath, mp4_probe_t *out_probe)
 {
     memset(out_probe, 0, sizeof(*out_probe));
@@ -384,7 +409,6 @@ static bool probe_mp4_stream(const char *filepath, mp4_probe_t *out_probe)
                 ((uint64_t)st.st_size * 8ULL * 1000000ULL) / out_probe->duration_us;
         }
     } else if (read_be32(data) == 0x1A45DFA3) {
-        /* EBML / WebM / Matroska header: scan initial TrackEntry header for PixelWidth/Height */
         size_t scan_lim = map_size < 65536 ? map_size : 65536;
         bool has_codec = false;
         for (size_t i = 0; i + 8 < scan_lim; ++i) {
@@ -394,19 +418,62 @@ static bool probe_mp4_stream(const char *filepath, mp4_probe_t *out_probe)
                  (i + 16 <= scan_lim && memcmp(data + i, "V_MPEGH/ISO/HEVC", 16) == 0))) {
                 has_codec = true;
             }
-            if (data[i] == 0xB0 && (data[i + 1] == 0x82 || data[i + 1] == 0x81) &&
-                out_probe->width == 0) {
-                uint32_t w = (data[i + 1] == 0x82) ? (uint32_t)((data[i + 2] << 8) | data[i + 3])
-                                                   : (uint32_t)data[i + 2];
-                size_t next = i + (data[i + 1] == 0x82 ? 4 : 3);
-                if (next + 3 < scan_lim && data[next] == 0xBA &&
-                    (data[next + 1] == 0x82 || data[next + 1] == 0x81)) {
-                    uint32_t h = (data[next + 1] == 0x82)
-                                     ? (uint32_t)((data[next + 2] << 8) | data[next + 3])
-                                     : (uint32_t)data[next + 2];
-                    if (w > 0 && w <= 16384 && h > 0 && h <= 16384) {
+            if (data[i] == 0xE0 && out_probe->width == 0) {
+                size_t vpos = i + 1;
+                uint64_t vsize = 0;
+                if (ebml_probe_vint(data, scan_lim, &vpos, &vsize, true) && vsize >= 6 &&
+                    vsize <= 4096 && vpos + vsize <= scan_lim) {
+                    size_t vid_end = vpos + (size_t)vsize;
+                    uint32_t w = 0, h = 0;
+                    while (vpos < vid_end) {
+                        uint64_t cid = 0, csz = 0;
+                        if (!ebml_probe_vint(data, vid_end, &vpos, &cid, false) ||
+                            !ebml_probe_vint(data, vid_end, &vpos, &csz, true) ||
+                            csz > vid_end - vpos) {
+                            w = 0;
+                            h = 0;
+                            break;
+                        }
+                        if ((cid == 0xB0 || cid == 0xBA) && csz >= 1 && csz <= 4) {
+                            uint32_t val = 0;
+                            for (uint64_t b = 0; b < csz; ++b)
+                                val = (val << 8) | data[vpos + b];
+                            if (cid == 0xB0)
+                                w = val;
+                            else
+                                h = val;
+                        }
+                        vpos += (size_t)csz;
+                    }
+                    if (vpos == vid_end && w > 0 && w <= 16384 && h > 0 && h <= 16384) {
                         out_probe->width = w;
                         out_probe->height = h;
+                    }
+                }
+            }
+        }
+        /* Fallback for synthetic/truncated EBML streams lacking a framing TrackVideo (0xE0) box */
+        if (out_probe->width == 0 || out_probe->height == 0) {
+            for (size_t i = 0; i + 8 < scan_lim; ++i) {
+                if (data[i] == 0xB0 && (i == 0 || (data[i - 1] != 0x54 && data[i - 1] != 0x55)) &&
+                    (data[i + 1] == 0x82 || data[i + 1] == 0x81) && out_probe->width == 0) {
+                    uint32_t w = (data[i + 1] == 0x82)
+                                     ? (uint32_t)((data[i + 2] << 8) | data[i + 3])
+                                     : (uint32_t)data[i + 2];
+                    size_t next = i + (data[i + 1] == 0x82 ? 4 : 3);
+                    size_t win_end = next + 32 < scan_lim ? next + 32 : scan_lim;
+                    for (size_t j = next; j + 3 < win_end; ++j) {
+                        if (data[j] == 0xBA && data[j - 1] != 0x54 &&
+                            (data[j + 1] == 0x82 || data[j + 1] == 0x81)) {
+                            uint32_t h = (data[j + 1] == 0x82)
+                                             ? (uint32_t)((data[j + 2] << 8) | data[j + 3])
+                                             : (uint32_t)data[j + 2];
+                            if (w > 0 && w <= 16384 && h > 0 && h <= 16384) {
+                                out_probe->width = w;
+                                out_probe->height = h;
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -657,9 +724,9 @@ bool video_transcode_optimize(const char *filepath, uint32_t max_width, uint32_t
         return false;
 
     if (max_width == 0)
-        max_width = 2560;
+        max_width = 3840;
     if (max_height == 0)
-        max_height = 1440;
+        max_height = 2160;
 
     bool is_gif = is_gif_file(filepath);
     mp4_probe_t probe;
