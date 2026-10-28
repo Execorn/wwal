@@ -204,78 +204,93 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
         unsigned head;
         unsigned count = 0;
 
-        io_uring_for_each_cqe(&loop->ring, head, cqe)
-        {
-            count++;
-            uint64_t tag = io_uring_cqe_get_data64(cqe);
-            if (tag == 0) {
-                continue;
-            }
-            uint32_t idx = (uint32_t)(tag & 0xFFFFFFFFU) - 1U;
-            if (idx >= WAYWAL_URING_MAX_HANDLERS) {
-                continue;
-            }
-            uring_slot_t *slot = &loop->slots[idx];
-            if (!slot->active || slot->in_flight_tag != tag) {
-                continue;
-            }
-
-            bool multishot_continues = ((cqe->flags & IORING_CQE_F_MORE) != 0);
-            if (cqe->res < 0) {
-                if (cqe->res == -ECANCELED) {
-                    slot->in_flight = false;
-                    slot->in_flight_tag = 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            unsigned cqe_idx = 0;
+            io_uring_for_each_cqe(&loop->ring, head, cqe)
+            {
+                if (pass == 0) {
+                    count++;
+                } else {
+                    if (cqe_idx >= count) {
+                        break;
+                    }
+                    cqe_idx++;
+                }
+                uint64_t tag = io_uring_cqe_get_data64(cqe);
+                if (tag == 0) {
                     continue;
                 }
-                if (cqe->res == -EINTR || cqe->res == -EAGAIN) {
+                uint32_t idx = (uint32_t)(tag & 0xFFFFFFFFU) - 1U;
+                if (idx >= WAYWAL_URING_MAX_HANDLERS) {
+                    continue;
+                }
+                uring_slot_t *slot = &loop->slots[idx];
+                if (!slot->active || slot->in_flight_tag != tag) {
+                    continue;
+                }
+                bool is_wayland = (slot->type == URING_EV_WAYLAND_READ);
+                if ((pass == 0 && !is_wayland) || (pass == 1 && is_wayland)) {
+                    continue;
+                }
+
+                bool multishot_continues = ((cqe->flags & IORING_CQE_F_MORE) != 0);
+                if (cqe->res < 0) {
+                    if (cqe->res == -ECANCELED) {
+                        slot->in_flight = false;
+                        slot->in_flight_tag = 0;
+                        continue;
+                    }
+                    if (cqe->res == -EINTR || cqe->res == -EAGAIN) {
+                        if (!multishot_continues) {
+                            slot->in_flight = false;
+                        }
+                    } else {
+                        if (cqe->res == -EINVAL && slot->is_multishot) {
+                            loop->multishot_supported = false;
+                            slot->is_multishot = false;
+                            slot->in_flight = false;
+                        } else {
+                            WAYWAL_LOG_WARN("uring poll error: fd=%d res=%d", slot->fd, cqe->res);
+                            if (!multishot_continues) {
+                                slot->in_flight = false;
+                                slot->in_flight_tag = 0;
+                                slot->active = false;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
                     if (!multishot_continues) {
                         slot->in_flight = false;
                     }
-                } else {
-                    if (cqe->res == -EINVAL && slot->is_multishot) {
-                        loop->multishot_supported = false;
-                        slot->is_multishot = false;
-                        slot->in_flight = false;
-                    } else {
-                        WAYWAL_LOG_WARN("uring poll error: fd=%d res=%d", slot->fd, cqe->res);
-                        if (!multishot_continues) {
-                            slot->in_flight = false;
-                            slot->in_flight_tag = 0;
-                            slot->active = false;
-                        }
-                        continue;
-                    }
+                    dispatched_events++;
+                    handler(slot->type, slot->fd, (uint32_t)cqe->res, slot->user_data);
                 }
-            } else {
-                if (!multishot_continues) {
-                    slot->in_flight = false;
-                }
-                dispatched_events++;
-                handler(slot->type, slot->fd, (uint32_t)cqe->res, slot->user_data);
-            }
 
-            /* Re-arm poll if the same slot generation remains active and no SQE is in flight */
-            if (slot->active && slot->in_flight_tag == tag && loop->running && !slot->in_flight) {
-                struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
-                if (!sqe) {
-                    io_uring_submit(&loop->ring);
-                    sqe = io_uring_get_sqe(&loop->ring);
-                }
-                if (sqe) {
-                    slot->gen++;
-                    if (slot->gen == 0)
-                        slot->gen = 1;
-                    slot->in_flight_tag = ((uint64_t)slot->gen << 32) | (uint64_t)(idx + 1U);
-                    slot->in_flight = true;
-                    if (slot->is_multishot) {
-                        io_uring_prep_poll_multishot(sqe, slot->fd, slot->poll_mask);
-                    } else {
-                        io_uring_prep_poll_add(sqe, slot->fd, slot->poll_mask);
+                /* Re-arm poll if the same slot generation remains active and no SQE is in flight */
+                if (slot->active && slot->in_flight_tag == tag && loop->running &&
+                    !slot->in_flight) {
+                    struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->ring);
+                    if (!sqe) {
+                        io_uring_submit(&loop->ring);
+                        sqe = io_uring_get_sqe(&loop->ring);
                     }
-                    io_uring_sqe_set_data64(sqe, slot->in_flight_tag);
-                } else {
-                    WAYWAL_LOG_ERR("uring_loop_dispatch: SQ ring full, failed to re-arm fd %d",
-                                   slot->fd);
+                    if (sqe) {
+                        slot->gen++;
+                        if (slot->gen == 0)
+                            slot->gen = 1;
+                        slot->in_flight_tag = ((uint64_t)slot->gen << 32) | (uint64_t)(idx + 1U);
+                        slot->in_flight = true;
+                        if (slot->is_multishot) {
+                            io_uring_prep_poll_multishot(sqe, slot->fd, slot->poll_mask);
+                        } else {
+                            io_uring_prep_poll_add(sqe, slot->fd, slot->poll_mask);
+                        }
+                        io_uring_sqe_set_data64(sqe, slot->in_flight_tag);
+                    } else {
+                        WAYWAL_LOG_ERR("uring_loop_dispatch: SQ ring full, failed to re-arm fd %d",
+                                       slot->fd);
+                    }
                 }
             }
         }

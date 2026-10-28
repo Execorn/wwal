@@ -184,7 +184,7 @@ _wwal_completion() {
             done
             if [[ -z "$subcmd" ]]; then
                 if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --interval --duration -s --shuffle --random --sort --sorting ${trans_opts} ${global_opts}" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "-d --interval --duration -s --shuffle --random --sort --sorting --recursive --no-recursive ${trans_opts} ${global_opts}" -- "$cur") )
                 else
                     COMPREPLY=( $(compgen -W "${slideshow_actions}" -- "$cur") )
                     _filedir '@(xml)'
@@ -192,7 +192,7 @@ _wwal_completion() {
                 fi
             elif [[ "$subcmd" == "start" ]]; then
                 if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --interval --duration -s --shuffle --random --sort --sorting ${trans_opts} ${global_opts}" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "-d --interval --duration -s --shuffle --random --sort --sorting --recursive --no-recursive ${trans_opts} ${global_opts}" -- "$cur") )
                 else
                     _filedir '@(xml)'
                     _filedir -d

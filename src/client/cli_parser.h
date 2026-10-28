@@ -168,6 +168,8 @@ typedef struct {
         waywal_sort_mode_t sort_mode;
     };
     bool has_slideshow_sort;
+    bool slideshow_recursive;
+    bool has_slideshow_recursive;
 
     /* Workshop parameters */
     uint32_t workshop_subcmd; /* waywal_workshop_subcmd_t */

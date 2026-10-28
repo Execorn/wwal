@@ -290,6 +290,8 @@ _wwal() {
                                     '(-d --interval --duration)'{-d,--interval,--duration}'[Slideshow interval (seconds or 30m, 1h)]:interval:' \
                                     '(-s --shuffle --random)'{-s,--shuffle,--random}'[Shuffle wallpapers randomly]' \
                                     '(--sort --sorting)'{--sort,--sorting}'[Slideshow traversal sort order]:sort:(ascending descending name mtime random)' \
+                                    '--recursive[Scan slideshow directory recursively]' \
+                                    '--no-recursive[Do not scan slideshow subdirectories]' \
                                     '1:directory or XML schedule:_files -/ -g "*.([xX][mM][lL])"'
                                 ;;
                         esac

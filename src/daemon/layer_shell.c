@@ -671,6 +671,11 @@ void output_node_destroy_surface(output_node_t *node)
     node->transition_active = false;
     node->transition_current_frame = 0;
     node->transition_total_frames = 0;
+    node->transition_start_ns = 0;
+    node->transition_last_tick_ns = 0;
+    node->transition_duration_ns = 0;
+    node->transition_progress_linear = 0.0f;
+    node->last_committed_ring_idx = -1;
 }
 
 static color_rgba_t get_output_fill_color(const daemon_state_t *state, const output_node_t *node)
@@ -695,6 +700,7 @@ static void teardown_output_dmabuf(daemon_state_t *state, output_node_t *node)
     if (!state || !node)
         return;
     node->last_presented_bo = NULL;
+    node->last_committed_ring_idx = -1;
     if (node->use_dmabuf) {
         for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
             release_output_bo_refs(state, node, &node->dmabuf_ring.buffers[i]);
@@ -764,6 +770,7 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
     if (dmabuf_ring_init(&state->dmabuf_ctx, &node->dmabuf_ring, (uint32_t)width, (uint32_t)height,
                          drm_format, modifier)) {
         node->use_dmabuf = true;
+        node->last_committed_ring_idx = -1;
         WAYWAL_LOG_INFO("Direct Scanout active for output %s (%ux%u, fmt=0x%08x, mod=0x%016lx)",
                         node->name, width, height, drm_format, (unsigned long)modifier);
         return true;
@@ -775,6 +782,7 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
                              (uint32_t)height, DRM_FORMAT_ARGB8888, modifier)) {
             node->ten_bit = false;
             node->use_dmabuf = true;
+            node->last_committed_ring_idx = -1;
             WAYWAL_LOG_INFO("Direct Scanout active for output %s (%ux%u, 8-bit fallback)",
                             node->name, width, height);
             return true;
@@ -910,6 +918,10 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
     if (!state || !node)
         return;
     node->transition_active = false;
+    node->transition_current_frame = 0;
+    node->transition_start_ns = 0;
+    node->transition_last_tick_ns = 0;
+    node->transition_progress_linear = 0.0f;
     node->displaying_color = true;
     node->active_color = color;
     node->active_media_path[0] = '\0';
@@ -945,6 +957,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                 node->has_source_new_bo = false;
             }
             node->last_presented_bo = NULL;
+            node->last_committed_ring_idx = -1;
             node->has_image = false;
             wp_viewport_set_source(node->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                    wl_fixed_from_int(-1), wl_fixed_from_int(-1));
@@ -1005,6 +1018,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                 output_commit_frame(node);
                 node->has_image = false;
                 node->last_presented_bo = bo;
+                node->last_committed_ring_idx = (int)(bo - node->dmabuf_ring.buffers);
                 wl_display_flush(state->display);
                 return;
             }
@@ -1420,7 +1434,14 @@ void layer_shell_snapshot_live_output(daemon_state_t *state, output_node_t *out)
             return;
     }
 
-    if (out->last_presented_bo && out->last_presented_bo != &out->source_old_bo) {
+    dmabuf_bo_t *src_bo = out->last_presented_bo;
+    if (out->use_dmabuf && out->last_committed_ring_idx >= 0 &&
+        out->last_committed_ring_idx < WAYWAL_DMABUF_RING_SIZE &&
+        out->dmabuf_ring.bos[out->last_committed_ring_idx].fd[0] >= 0) {
+        src_bo = &out->dmabuf_ring.bos[out->last_committed_ring_idx];
+    }
+
+    if (src_bo && src_bo != &out->source_old_bo) {
         uint32_t w = (uint32_t)out->width;
         uint32_t h = (uint32_t)out->height;
         uint64_t src_mod = state->render_engine.gpu_compute_active
@@ -1441,11 +1462,11 @@ void layer_shell_snapshot_live_output(daemon_state_t *state, output_node_t *out)
         if (out->has_source_old_bo) {
             color_rgba_t fill_col = get_output_fill_color(state, out);
             uint32_t clear_color = pack_color_argb(fill_col);
-            if (render_engine_copy_bo(&state->render_engine, &out->source_old_bo,
-                                      out->last_presented_bo, WAYWAL_SCALING_STRETCH, clear_color,
-                                      false)) {
+            if (render_engine_copy_bo(&state->render_engine, &out->source_old_bo, src_bo,
+                                      WAYWAL_SCALING_STRETCH, clear_color, false)) {
                 out->has_image = true;
                 out->last_presented_bo = &out->source_old_bo;
+                out->last_committed_ring_idx = -1;
             } else {
                 release_output_bo_refs(state, out, &out->source_old_bo);
                 dmabuf_bo_free(&out->source_old_bo);
@@ -1681,6 +1702,10 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
         return;
 
     node->transition_active = false;
+    node->transition_current_frame = 0;
+    node->transition_start_ns = 0;
+    node->transition_last_tick_ns = 0;
+    node->transition_progress_linear = 0.0f;
     node->displaying_color = false;
     compute_output_span_bounds(state, node);
     render_engine_set_span_bounds(&state->render_engine, node->span_off_x, node->span_off_y,
@@ -1740,6 +1765,7 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                 output_commit_frame(node);
                 node->has_image = true;
                 node->last_presented_bo = bo;
+                node->last_committed_ring_idx = (int)(bo - node->dmabuf_ring.buffers);
                 wl_display_flush(state->display);
                 return;
             }
@@ -1868,6 +1894,8 @@ static bool is_target_output(const output_node_t *node, const waywal_img_metadat
     return false;
 }
 
+static void transition_engine_step(daemon_state_t *state);
+
 bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels, uint32_t img_w,
                                    uint32_t img_h, const waywal_img_metadata_t *meta)
 {
@@ -1948,6 +1976,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                 pout->staging_width == pout->width && pout->staging_height == pout->height) {
                 void *displayed = (uint8_t *)pout->shm_data + (size_t)pout->active_buffer_idx * fsz;
                 memcpy(pout->shm_old_data, displayed, fsz);
+                pout->has_image = true;
             }
         }
         pout->transition_active = false;
@@ -2235,6 +2264,10 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         out->transition_total_frames = num_frames;
         out->transition_delay_frames =
             (meta->sync_mode == 1) ? (started_count * stagger_frames) : 0;
+        out->transition_start_ns = 0;
+        out->transition_last_tick_ns = 0;
+        out->transition_duration_ns = (uint64_t)meta->transition_duration_ms * 1000000ULL;
+        out->transition_progress_linear = 0.0f;
         out->transition_active = true;
         started_count++;
     }
@@ -2243,31 +2276,36 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
     if (started_count == 0)
         return false;
 
-    struct itimerspec its = {.it_interval = {.tv_sec = (time_t)(frame_interval_ns / 1000000000ULL),
-                                             .tv_nsec = (long)(frame_interval_ns % 1000000000ULL)},
-                             .it_value = {.tv_sec = (time_t)(frame_interval_ns / 1000000000ULL),
-                                          .tv_nsec = (long)(frame_interval_ns % 1000000000ULL)}};
-    if (state->transition_timer_fd >= 0) {
+    state->transitions_in_progress = true;
+    WAYWAL_LOG_INFO("Transition started: type=%u, duration=%ums, frames=%u, fps=%u", resolved_type,
+                    meta->transition_duration_ms, num_frames, fps);
+
+    /* Render and commit Frame 1 immediately at t=0 so the transition begins with zero latency
+     * and the timerfd interval starts after Frame 1 is already committed. */
+    transition_engine_step(state);
+
+    if (state->transitions_in_progress && state->transition_timer_fd >= 0) {
+        struct itimerspec its = {
+            .it_interval = {.tv_sec = (time_t)(frame_interval_ns / 1000000000ULL),
+                            .tv_nsec = (long)(frame_interval_ns % 1000000000ULL)},
+            .it_value = {.tv_sec = (time_t)(frame_interval_ns / 1000000000ULL),
+                         .tv_nsec = (long)(frame_interval_ns % 1000000000ULL)}};
         uint64_t dummy;
         while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0)
             ;
         timerfd_settime(state->transition_timer_fd, 0, &its, NULL);
     }
-    state->transitions_in_progress = true;
-    WAYWAL_LOG_INFO("Transition started: type=%u, duration=%ums, frames=%u, fps=%u", resolved_type,
-                    meta->transition_duration_ms, num_frames, fps);
     return true;
 }
 
-void transition_engine_dispatch_tick(daemon_state_t *state)
+static void transition_engine_step(daemon_state_t *state)
 {
-    if (!state || state->transition_timer_fd < 0)
+    if (!state)
         return;
 
-    uint64_t expirations = 0;
-    ssize_t s = read(state->transition_timer_fd, &expirations, sizeof(expirations));
-    if (s <= 0 || expirations == 0)
-        return;
+    struct timespec ts_now;
+    clock_gettime(CLOCK_MONOTONIC, &ts_now);
+    uint64_t now_ns = (uint64_t)ts_now.tv_sec * 1000000000ULL + (uint64_t)ts_now.tv_nsec;
 
     int active_count = 0;
 
@@ -2281,13 +2319,10 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
             continue;
         }
 
-        out->transition_current_frame++;
-        float t = (float)out->transition_current_frame / (float)out->transition_total_frames;
-        if (t > 1.0f)
-            t = 1.0f;
-        out->transition_params.progress = (out->transition_params.type == WAYWAL_TRANSITION_SIMPLE)
-                                              ? t
-                                              : bezier_eval(&out->transition_params.bezier, t);
+        dmabuf_bo_t *target_bo = NULL;
+        int back_idx = 0;
+        size_t frame_sz = (size_t)out->width * (size_t)out->height * sizeof(uint32_t);
+        bool abort_invalid = false;
 
         if (out->use_dmabuf) {
             if ((int32_t)out->dmabuf_ring.width != out->width ||
@@ -2296,72 +2331,146 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                 (int32_t)out->source_old_bo.height != out->height ||
                 (int32_t)out->source_new_bo.width != out->width ||
                 (int32_t)out->source_new_bo.height != out->height) {
-                out->transition_current_frame = out->transition_total_frames;
+                abort_invalid = true;
             } else {
-                bool committed = false;
-                dmabuf_bo_t *target_bo = dmabuf_ring_acquire(&out->dmabuf_ring);
-                if (target_bo && target_bo->wl_buffer) {
-                    if (render_engine_execute_transition(&state->render_engine, target_bo,
-                                                         &out->source_old_bo, &out->source_new_bo,
-                                                         &out->transition_params)) {
-                        wl_surface_attach(out->surface, target_bo->wl_buffer, 0, 0);
-                        wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
-                        presentation_sync_request(&out->pres_sync);
-                        output_commit_frame(out);
-                        out->last_presented_bo = target_bo;
-                        committed = true;
-                    } else {
-                        target_bo->in_use = false;
-                    }
+                target_bo = dmabuf_ring_acquire(&out->dmabuf_ring);
+                if (target_bo && out->surface && !target_bo->wl_buffer) {
+                    target_bo->in_use = false;
+                    target_bo = NULL;
                 }
-                if (!committed && out->transition_current_frame >= out->transition_total_frames) {
-                    out->transition_current_frame = out->transition_total_frames - 1;
+                if (!target_bo) {
                     active_count++;
                     continue;
                 }
             }
         } else {
-            /* SHM ping-pong path: render into back buffer, never touch the front */
-            size_t frame_sz = (size_t)out->width * (size_t)out->height * sizeof(uint32_t);
-            if (out->width <= 0 || out->height <= 0 || !out->shm_buffers[0] ||
-                !out->shm_buffers[1] || !out->shm_data || !out->shm_old_data ||
-                !out->shm_new_data || out->shm_size != frame_sz * 2 ||
-                out->shm_buffer_cap < frame_sz || out->shm_width != out->width ||
-                out->shm_height != out->height || out->staging_width != out->width ||
-                out->staging_height != out->height) {
-                out->transition_current_frame = out->transition_total_frames;
+            if (out->width <= 0 || out->height <= 0 ||
+                (out->surface && (!out->shm_buffers[0] || !out->shm_buffers[1])) ||
+                !out->shm_data || !out->shm_old_data || !out->shm_new_data ||
+                out->shm_size != frame_sz * 2 || out->shm_buffer_cap < frame_sz ||
+                out->shm_width != out->width || out->shm_height != out->height ||
+                out->staging_width != out->width || out->staging_height != out->height) {
+                abort_invalid = true;
             } else {
-                int back_idx = 1 - out->active_buffer_idx;
-
-                /* Safety: if compositor hasn't released the back buffer yet, skip frame */
+                back_idx = 1 - out->active_buffer_idx;
                 if (!out->shm_buffer_released[back_idx]) {
                     active_count++;
                     continue;
                 }
+            }
+        }
 
-                struct timespec ts0, ts1;
-                clock_gettime(CLOCK_MONOTONIC, &ts0);
+        if (abort_invalid) {
+            out->transition_current_frame = out->transition_total_frames;
+            out->transition_progress_linear = 1.0f;
+            out->transition_params.progress = 1.0f;
+            out->transition_active = false;
+            if (out->use_dmabuf) {
+                if (out->has_source_old_bo) {
+                    release_output_bo_refs(state, out, &out->source_old_bo);
+                    dmabuf_bo_free(&out->source_old_bo);
+                    out->has_source_old_bo = false;
+                }
+                if (out->has_source_new_bo) {
+                    release_output_bo_refs(state, out, &out->source_new_bo);
+                    dmabuf_bo_free(&out->source_new_bo);
+                    out->has_source_new_bo = false;
+                }
+            } else {
+                free(out->shm_old_data);
+                free(out->shm_new_data);
+                out->shm_old_data = NULL;
+                out->shm_new_data = NULL;
+                out->shm_buffer_cap = 0;
+                out->staging_width = 0;
+                out->staging_height = 0;
+            }
+            continue;
+        }
 
-                void *back_ptr = (uint8_t *)out->shm_data + (size_t)back_idx * frame_sz;
+        uint32_t prev_frame = out->transition_current_frame;
+        float prev_progress = out->transition_progress_linear;
+        uint64_t prev_start_ns = out->transition_start_ns;
+        uint64_t prev_last_tick_ns = out->transition_last_tick_ns;
 
-                /* OpenMP-parallelized CPU transition (16 threads, ~5–18ms for complex effects) */
-                render_engine_execute_cpu_transition(
+        uint32_t total_frames =
+            out->transition_total_frames > 0 ? out->transition_total_frames : 1U;
+        float min_step = 1.0f / (float)total_frames;
+        float wall_step = min_step;
+        if (out->transition_start_ns == 0) {
+            out->transition_start_ns = now_ns;
+            out->transition_last_tick_ns = now_ns;
+        } else {
+            uint64_t dt_ns =
+                (now_ns > out->transition_last_tick_ns && out->transition_last_tick_ns > 0)
+                    ? (now_ns - out->transition_last_tick_ns)
+                    : 0ULL;
+            out->transition_last_tick_ns = now_ns;
+            if (out->transition_duration_ns > 0) {
+                wall_step = (float)dt_ns / (float)out->transition_duration_ns;
+            }
+        }
+
+        float step = (wall_step > min_step) ? wall_step : min_step;
+        if (total_frames >= 8U && step > 0.08f) {
+            step = 0.08f;
+        }
+
+        out->transition_current_frame++;
+        out->transition_progress_linear += step;
+        if (out->transition_progress_linear >= 0.999f ||
+            (total_frames < 8U && out->transition_current_frame >= total_frames)) {
+            out->transition_progress_linear = 1.0f;
+        }
+
+        float t = out->transition_progress_linear;
+        out->transition_params.progress = (out->transition_params.type == WAYWAL_TRANSITION_SIMPLE)
+                                              ? t
+                                              : bezier_eval(&out->transition_params.bezier, t);
+
+        bool committed = false;
+        if (out->use_dmabuf) {
+            if (render_engine_execute_transition(&state->render_engine, target_bo,
+                                                 &out->source_old_bo, &out->source_new_bo,
+                                                 &out->transition_params)) {
+                if (out->surface && target_bo->wl_buffer) {
+                    wl_surface_attach(out->surface, target_bo->wl_buffer, 0, 0);
+                    wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
+                    presentation_sync_request(&out->pres_sync);
+                    output_commit_frame(out);
+                }
+                out->last_presented_bo = target_bo;
+                out->last_committed_ring_idx = (int)(target_bo - out->dmabuf_ring.buffers);
+                committed = true;
+            } else {
+                target_bo->in_use = false;
+            }
+        } else {
+            struct timespec ts0, ts1;
+            clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+            void *back_ptr = (uint8_t *)out->shm_data + (size_t)back_idx * frame_sz;
+
+            /* OpenMP-parallelized CPU transition (16 threads, ~5–18ms for complex effects) */
+            if (render_engine_execute_cpu_transition(
                     (uint32_t *)back_ptr, (const uint32_t *)out->shm_old_data,
                     (const uint32_t *)out->shm_new_data, (uint32_t)out->width,
                     (uint32_t)out->height, (uint32_t)out->width * sizeof(uint32_t),
-                    &out->transition_params);
-
+                    &out->transition_params)) {
                 clock_gettime(CLOCK_MONOTONIC, &ts1);
                 double render_ms = ((ts1.tv_sec - ts0.tv_sec) * 1000.0) +
                                    ((ts1.tv_nsec - ts0.tv_nsec) / 1000000.0);
 
                 /* Commit back buffer; swap front/back indices */
-                wl_surface_attach(out->surface, out->shm_buffers[back_idx], 0, 0);
-                wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
+                if (out->surface && out->shm_buffers[back_idx]) {
+                    wl_surface_attach(out->surface, out->shm_buffers[back_idx], 0, 0);
+                    wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
+                    presentation_sync_request(&out->pres_sync);
+                    output_commit_frame(out);
+                }
                 out->shm_buffer_released[back_idx] = false;
                 out->active_buffer_idx = back_idx;
-                presentation_sync_request(&out->pres_sync);
-                output_commit_frame(out);
+                committed = true;
 
                 if (out->transition_current_frame <= 2 || out->transition_current_frame % 20 == 0) {
                     WAYWAL_LOG_INFO("Tick frame %u out %s: render=%.2fms (OpenMP CPU)",
@@ -2370,7 +2479,18 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
             }
         }
 
-        if (out->transition_current_frame >= out->transition_total_frames) {
+        if (!committed) {
+            out->transition_current_frame = prev_frame;
+            out->transition_progress_linear = prev_progress;
+            out->transition_start_ns = prev_start_ns;
+            out->transition_last_tick_ns = prev_last_tick_ns;
+            active_count++;
+            continue;
+        }
+
+        out->has_image = true;
+
+        if (out->transition_progress_linear >= 1.0f) {
             out->transition_active = false;
             if (out->use_dmabuf) {
                 if (out->has_source_old_bo) {
@@ -2393,30 +2513,50 @@ void transition_engine_dispatch_tick(daemon_state_t *state)
                 out->staging_height = 0;
                 int inactive_idx = 1 - out->active_buffer_idx;
                 if (out->shm_buffer_released[inactive_idx] && out->shm_data && out->shm_size >= 8) {
-                    size_t frame_sz = out->shm_size / 2;
-                    void *inactive_ptr = (uint8_t *)out->shm_data + (size_t)inactive_idx * frame_sz;
-                    madvise(inactive_ptr, frame_sz, MADV_REMOVE);
+                    size_t half_sz = out->shm_size / 2;
+                    void *inactive_ptr = (uint8_t *)out->shm_data + (size_t)inactive_idx * half_sz;
+                    madvise(inactive_ptr, half_sz, MADV_REMOVE);
                 }
             }
-            out->has_image = true;
         } else {
             active_count++;
         }
     }
 
-    wl_display_flush(state->display);
+    if (state->display) {
+        wl_display_flush(state->display);
+    }
 
     if (active_count == 0) {
-        struct itimerspec its;
-        memset(&its, 0, sizeof(its));
-        timerfd_settime(state->transition_timer_fd, 0, &its, NULL);
-        uint64_t dummy;
-        while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0)
-            ;
+        if (state->transition_timer_fd >= 0) {
+            struct itimerspec its;
+            memset(&its, 0, sizeof(its));
+            timerfd_settime(state->transition_timer_fd, 0, &its, NULL);
+            uint64_t dummy;
+            while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0)
+                ;
+        }
         state->transitions_in_progress = false;
         malloc_trim(0);
         WAYWAL_LOG_INFO("Transition completed successfully across active outputs");
     }
+}
+
+void transition_engine_dispatch_tick(daemon_state_t *state)
+{
+    if (!state)
+        return;
+
+    if (state->transition_timer_fd >= 0) {
+        uint64_t expirations = 0;
+        ssize_t s = read(state->transition_timer_fd, &expirations, sizeof(expirations));
+        if (s <= 0 || expirations == 0)
+            return;
+    } else if (!state->transitions_in_progress) {
+        return;
+    }
+
+    transition_engine_step(state);
 }
 
 void output_node_render_image_with_transition(daemon_state_t *state, output_node_t *node,

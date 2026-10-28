@@ -2077,8 +2077,8 @@ static void ensure_parent_dirs_for_file(const char *filepath)
 static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint32_t width,
                               uint32_t height, bool is_bgra)
 {
-    if (!filepath || filepath[0] == '\0' || !pixels || width == 0 || height == 0 ||
-        width > 16384 || height > 16384) {
+    if (!filepath || filepath[0] == '\0' || !pixels || width == 0 || height == 0 || width > 16384 ||
+        height > 16384) {
         return false;
     }
 
@@ -2174,6 +2174,12 @@ static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint3
                 sy1 = sy0 + 1U;
             if (sy1 > height)
                 sy1 = height;
+            uint32_t ya = sy0;
+            uint32_t yb = sy0 + ((sy1 - sy0) >> 1);
+            if (yb >= height)
+                yb = height - 1U;
+            const uint8_t *srow_a = pixels + (size_t)ya * (size_t)width * 4U;
+            const uint8_t *srow_b = pixels + (size_t)yb * (size_t)width * 4U;
             for (uint32_t x = 0; x < dst_w; ++x) {
                 uint32_t sx0 = (uint32_t)(((uint64_t)x * width) / dst_w);
                 uint32_t sx1 = (uint32_t)(((uint64_t)(x + 1U) * width) / dst_w);
@@ -2181,21 +2187,20 @@ static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint3
                     sx1 = sx0 + 1U;
                 if (sx1 > width)
                     sx1 = width;
-                uint32_t sum0 = 0, sum1 = 0, sum2 = 0;
-                uint32_t count = (sy1 - sy0) * (sx1 - sx0);
-                for (uint32_t sy = sy0; sy < sy1; ++sy) {
-                    const uint8_t *srow = pixels + (size_t)sy * (size_t)width * 4U;
-                    for (uint32_t sx = sx0; sx < sx1; ++sx) {
-                        const uint8_t *p = srow + (size_t)sx * 4U;
-                        sum0 += p[0];
-                        sum1 += p[1];
-                        sum2 += p[2];
-                    }
-                }
-                uint32_t half = count >> 1;
-                row_buf[x * 4U + 0U] = (uint8_t)((sum0 + half) / count);
-                row_buf[x * 4U + 1U] = (uint8_t)((sum1 + half) / count);
-                row_buf[x * 4U + 2U] = (uint8_t)((sum2 + half) / count);
+                uint32_t xa = sx0;
+                uint32_t xb = sx0 + ((sx1 - sx0) >> 1);
+                if (xb >= width)
+                    xb = width - 1U;
+                const uint8_t *p00 = srow_a + (size_t)xa * 4U;
+                const uint8_t *p10 = srow_a + (size_t)xb * 4U;
+                const uint8_t *p01 = srow_b + (size_t)xa * 4U;
+                const uint8_t *p11 = srow_b + (size_t)xb * 4U;
+                uint32_t sum0 = (uint32_t)p00[0] + p10[0] + p01[0] + p11[0];
+                uint32_t sum1 = (uint32_t)p00[1] + p10[1] + p01[1] + p11[1];
+                uint32_t sum2 = (uint32_t)p00[2] + p10[2] + p01[2] + p11[2];
+                row_buf[x * 4U + 0U] = (uint8_t)((sum0 + 2U) >> 2);
+                row_buf[x * 4U + 1U] = (uint8_t)((sum1 + 2U) >> 2);
+                row_buf[x * 4U + 2U] = (uint8_t)((sum2 + 2U) >> 2);
                 row_buf[x * 4U + 3U] = 255;
             }
         }
@@ -2206,7 +2211,7 @@ static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint3
     free((void *)row_buf);
     png_destroy_write_struct(&png, &info);
 
-    bool io_ok = (fflush(fp) == 0 && !ferror(fp) && fdatasync(fileno(fp)) == 0);
+    bool io_ok = (fflush(fp) == 0 && !ferror(fp));
     if (fclose(fp) != 0 || !io_ok) {
         unlink(tmp_path);
         return false;

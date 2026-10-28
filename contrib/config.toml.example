@@ -42,8 +42,8 @@ pywal_compat = true                   # Write ~/.cache/wal/{colors.json,colors,c
 type = "grow"                         # none, simple, fade, wipe, grow, outer, wave, noise, crosszoom,
                                       # slide, glitch, burn, ripple, pixelate, doom, swirl, cube, luma,
                                       # light_leak, page_curl, custom, left, right, top, bottom, center, any, random
-duration = 0.8                        # Transition duration in seconds (float, e.g. 0.5, 0.8, 1.2)
-fps = 144                             # Target transition frame rate
+duration = 1.2                        # Transition duration in seconds (float, e.g. 0.5, 0.8, 1.2)
+fps = 60                              # Target transition frame rate
 pos = "cursor"                        # center, cursor, top, bottom, left, right, tl, tr, bl, br, or "0.5,0.5"
 invert_y = false                      # Invert Y coordinate of transition-pos (swww/awww compatibility)
 crop_gravity = "center"               # Crop anchor for fill/crop scaling

@@ -419,6 +419,9 @@ if get_option('tests')
 
   test_transitions_exe = executable('test_transitions',
     'tests/test_transitions.c',
+    'src/daemon/layer_shell.c',
+    'src/daemon/presentation.c',
+    'src/daemon/uring_loop.c',
     'src/daemon/render_engine.c',
     'src/daemon/gpu_compute.c',
     'src/daemon/shader_engine.c',
@@ -430,7 +433,7 @@ if get_option('tests')
     'src/daemon/simd/blend_avx512.c',
     'src/daemon/simd/blend_neon.c',
     'src/daemon/simd/cpu_transitions.c',
-    include_directories: inc_dir,
+    include_directories: [inc_dir, include_directories('src/daemon')],
     dependencies: [
       common_dep,
       proto_dep,
@@ -440,6 +443,7 @@ if get_option('tests')
       gbm_dep,
       egl_dep,
       glesv2_dep,
+      liburing_dep,
       threads_dep,
       m_dep
     ] + (openmp_dep.found() ? [openmp_dep] : [])

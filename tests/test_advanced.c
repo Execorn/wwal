@@ -656,7 +656,8 @@ static void test_cli_version_and_example_config(void)
         assert(waywal_config_load_file(example_cfg, &cfg, err_buf, sizeof(err_buf)));
         assert(cfg.daemon.idle_timeout_sec == 300U);
         assert(cfg.theme.enabled == true);
-        assert(cfg.transition.fps == 144U);
+        assert(cfg.transition.fps == 60U);
+        assert(fabsf(cfg.transition.duration - 1.2f) < 1e-4f);
     }
 
     printf("  -> CLI --version flags and contrib/config.toml.example: PASSED\n");

@@ -1233,16 +1233,8 @@ static void test_swww_awww_compat(void)
     unsetenv("AWWW_INVERT_Y");
 
     /* 3. Pixel coordinates > 1.0f in --transition-pos + --crop-gravity + --no-cache + -a */
-    char *argv_px[] = {"wwal",
-                       "img",
-                       "/tmp/wall.png",
-                       "-a",
-                       "--no-cache",
-                       "--crop-gravity",
-                       "SE",
-                       "--transition-pos",
-                       "1200, 600",
-                       "--invert-y"};
+    char *argv_px[] = {"wwal",           "img", "/tmp/wall.png",    "-a",        "--no-cache",
+                       "--crop-gravity", "SE",  "--transition-pos", "1200, 600", "--invert-y"};
     assert(cli_parse(10, argv_px, &opts));
     assert(opts.all_namespaces);
     assert(opts.no_cache);
@@ -1301,8 +1293,8 @@ static void test_swww_awww_compat(void)
     unsetenv("SWWW_TRANSITION_INVERT_Y");
     unsetenv("SWWW_TRANSITION_POS");
 
-    char *argv_dur_step[] = {"swww", "img",  "/tmp/wall.png",     "--transition-duration",
-                             "2.0",  "--transition-step", "90"};
+    char *argv_dur_step[] = {
+        "swww", "img", "/tmp/wall.png", "--transition-duration", "2.0", "--transition-step", "90"};
     assert(cli_parse(7, argv_dur_step, &opts));
     assert(opts.has_transition_duration);
     assert(opts.transition_duration_ms == 2000U);
@@ -1311,7 +1303,32 @@ static void test_swww_awww_compat(void)
     assert(cli_parse(5, argv_step_only, &opts));
     assert(!opts.has_transition_duration);
     assert(opts.transition_step == 90U);
-    assert(opts.transition_duration_ms == 90U * 16U);
+    /* frames = ceil(255 / 90) = 3; approx_ms = (3 * 1000) / 60 = 50 -> clamped to 100ms */
+    assert(opts.transition_duration_ms == 100U);
+
+    char *argv_step_small[] = {"swww", "img", "/tmp/wall.png", "--transition-step", "15"};
+    cli_options_t opts_small_step;
+    assert(cli_parse(5, argv_step_small, &opts_small_step));
+    assert(!opts_small_step.has_transition_duration);
+    assert(opts_small_step.transition_step == 15U);
+    /* frames = ceil(255 / 15) = 17; approx_ms = (17 * 1000) / 60 = 283ms (> step 90's 100ms) */
+    assert(opts_small_step.transition_duration_ms == 283U);
+    assert(opts_small_step.transition_duration_ms > opts.transition_duration_ms);
+
+    char *argv_step_clamp[] = {
+        "swww", "img", "/tmp/wall.png", "--transition-step", "1", "--transition-fps", "10"};
+    cli_options_t opts_clamp_step;
+    assert(cli_parse(7, argv_step_clamp, &opts_clamp_step));
+    /* frames = 255; approx_ms = (255 * 1000) / 10 = 25500 -> clamped to 10000ms */
+    assert(opts_clamp_step.transition_duration_ms == 10000U);
+
+    setenv("SWWW_TRANSITION_STEP", "15", 1);
+    char *argv_env_step[] = {"swww", "img", "/tmp/wall.png"};
+    cli_options_t opts_env_step;
+    assert(cli_parse(3, argv_env_step, &opts_env_step));
+    assert(opts_env_step.transition_step == 15U);
+    assert(opts_env_step.transition_duration_ms == 283U);
+    unsetenv("SWWW_TRANSITION_STEP");
 
     /* 7. init / daemon subcommands and -d / --no-daemon flags */
     char *argv_init[] = {"swww", "init"};
@@ -1348,8 +1365,8 @@ static void test_swww_awww_compat(void)
     /* 9. Solid-color transition vs instant clear, mixed --invert-y,
      *    regular-file symlink preservation, TOML invert_y ordering, per-namespace state_store,
      *    and WAYLAND_DISPLAY slash sanitization */
-    char *argv_hex_anim[] = {"wwal", "img",  "0x1e1e2e",              "--transition-type",
-                             "fade", "--transition-duration", "0.5"};
+    char *argv_hex_anim[] = {
+        "wwal", "img", "0x1e1e2e", "--transition-type", "fade", "--transition-duration", "0.5"};
     assert(cli_parse(7, argv_hex_anim, &opts));
     cli_auto_dispatch_img(&opts);
     assert(opts.cmd == CLI_CMD_IMG && opts.is_solid_color);
@@ -1359,7 +1376,7 @@ static void test_swww_awww_compat(void)
     cli_auto_dispatch_img(&opts);
     assert(opts.cmd == CLI_CMD_CLEAR && opts.is_solid_color);
 
-    char *argv_mixed_inv[] = {"wwal", "img", "/tmp/wall.png", "--transition-pos",
+    char *argv_mixed_inv[] = {"wwal",     "img",       "/tmp/wall.png", "--transition-pos",
                               "500, 0.8", "--invert-y"};
     assert(cli_parse(6, argv_mixed_inv, &opts));
     assert(fabsf(opts.transition_pos_x - 500.0f) < 1e-3f);
@@ -1419,8 +1436,7 @@ static void test_swww_awww_compat(void)
 
     st_b.count = 1;
     strncpy(st_b.outputs[0].output_name, "DP-1", sizeof(st_b.outputs[0].output_name) - 1);
-    strncpy(st_b.outputs[0].media_path, "/tmp/ns_beta.png",
-            sizeof(st_b.outputs[0].media_path) - 1);
+    strncpy(st_b.outputs[0].media_path, "/tmp/ns_beta.png", sizeof(st_b.outputs[0].media_path) - 1);
 
     waywal_state_store_set_namespace("default");
     assert(waywal_state_store_save(&st_def));
@@ -1572,8 +1588,7 @@ static void test_ecosystem_and_picker(void)
     fputs("void mainImage(out vec4 c, in vec2 f) { c = vec4(0.1, 0.8, 0.3, 1.0); }\n", ffp);
     fclose(ffp);
     unlink(cur_png);
-    assert(
-        waywal_ecosystem_cache_sync("HDMI-A-1", frag_path, "Bilinear", NULL, 0, 0, true, false));
+    assert(waywal_ecosystem_cache_sync("HDMI-A-1", frag_path, "Bilinear", NULL, 0, 0, true, false));
     memset(&loaded, 0, sizeof(loaded));
     assert(image_load(cur_png, &loaded));
     assert(loaded.width == 320 && loaded.height == 180);
@@ -1588,7 +1603,8 @@ static void test_ecosystem_and_picker(void)
     /* Path traversal output names ("../pwn", "*", "unknown") must not create swww files */
     char swww_pwn[600];
     snprintf(swww_pwn, sizeof(swww_pwn), "%s/pwn", fake_xcache);
-    assert(waywal_ecosystem_cache_sync("../pwn", png_path, "Lanczos3", bgra32, 32, 16, true, false));
+    assert(
+        waywal_ecosystem_cache_sync("../pwn", png_path, "Lanczos3", bgra32, 32, 16, true, false));
     assert(access(swww_pwn, F_OK) != 0);
 
     /* Comma-separated output_name ("DP-3,HDMI-A-2") writes separate per-output swww/awww files */
@@ -1700,20 +1716,40 @@ static void test_ecosystem_and_picker(void)
         fclose(jfp);
         assert(image_save_png_bgra(ws_mock_prev, bgra32, 32, 16));
 
-        assert(waywal_ecosystem_cache_sync("DP-1", ws_mock_dir, "Lanczos3", NULL, 0, 0, true,
-                                           false));
+        assert(
+            waywal_ecosystem_cache_sync("DP-1", ws_mock_dir, "Lanczos3", NULL, 0, 0, true, false));
         struct stat st_sym;
         assert(stat(cur_sym, &st_sym) == 0 && S_ISREG(st_sym.st_mode));
         assert_file_contains(cael_txt, ws_mock_prev);
     }
 
-    /* Reject colon/whitespace/desc: in swww output names */
+    /* Reject colon/whitespace/desc: in swww output names + verify caelestia_sync gating & dedup */
     {
         char bad_swww[600];
         snprintf(bad_swww, sizeof(bad_swww), "%s/swww/desc:Microstep", fake_xcache);
+        unlink(cael_txt);
         assert(waywal_ecosystem_cache_sync("desc:Microstep", png_path, "Lanczos3", bgra32, 32, 16,
                                            false, false));
         assert(access(bad_swww, F_OK) != 0);
+        /* With caelestia_sync == false, path.txt must NOT be created */
+        assert(access(cael_txt, F_OK) != 0);
+
+        /* With caelestia_sync == true, path.txt is created; a second sync with the same path
+         * must skip atomic rewrite and preserve the file's inode. */
+        assert(
+            waywal_ecosystem_cache_sync("DP-1", png_path, "Lanczos3", bgra32, 32, 16, true, false));
+        struct stat st_cael1, st_cael2;
+        assert(stat(cael_txt, &st_cael1) == 0);
+        assert(
+            waywal_ecosystem_cache_sync("DP-1", png_path, "Lanczos3", bgra32, 32, 16, true, false));
+        assert(stat(cael_txt, &st_cael2) == 0);
+        assert(st_cael1.st_ino == st_cael2.st_ino);
+
+        waywal_config_t def_cfg;
+        waywal_config_init_defaults(&def_cfg);
+        assert(def_cfg.general.caelestia_sync == false);
+        assert(def_cfg.daemon.caelestia_sync == false);
+        assert(def_cfg.theme.caelestia_sync == true);
     }
 
     if (old_home[0])
@@ -1733,9 +1769,8 @@ static void test_ecosystem_and_picker(void)
 
     /* 3. CLI parsing for wwal pick and wwal workshop sync-previews */
     cli_options_t opts;
-    char *argv_pick1[] = {"wwal",  "pick",    "--menu", "rofi",    "--dir", "/tmp",
-                          "--theme", "-n",    "pick_ns", "--loop", "4",     "--speed",
-                          "1.75"};
+    char *argv_pick1[] = {"wwal", "pick",    "--menu", "rofi", "--dir",   "/tmp", "--theme",
+                          "-n",   "pick_ns", "--loop", "4",    "--speed", "1.75"};
     assert(cli_parse(13, argv_pick1, &opts));
     assert(opts.cmd == CLI_CMD_PICK);
     assert(opts.pick_menu == WAYWAL_PICK_MENU_ROFI);
@@ -1819,24 +1854,23 @@ static void test_superset_template_engine(void)
     setenv("XDG_CONFIG_HOME", xcfg_dir, 1);
 
     /* 2. TOML [template.<name>] / [[templates]] and [theme] seed/pywal_compat parsing */
-    const char *toml_tpl =
-        "[theme]\n"
-        "enabled = true\n"
-        "mode = \"dark\"\n"
-        "scheme_variant = \"tonal_spot\"\n"
-        "source_color_index = 2\n"
-        "seed_color = \"#ff5500\"\n"
-        "pywal_compat = true\n"
-        "\n"
-        "[template.kitty]\n"
-        "input_path = \"~/templates/kitty.conf\"\n"
-        "output_path = \"$XDG_CONFIG_HOME/kitty/colors.conf\"\n"
-        "post_hook = \"touch $HOME/kitty_hook_ran\"\n"
-        "\n"
-        "[[templates]]\n"
-        "name = \"waybar\"\n"
-        "input = \"~/templates/waybar.css\"\n"
-        "output = \"~/out/waybar.css\"\n";
+    const char *toml_tpl = "[theme]\n"
+                           "enabled = true\n"
+                           "mode = \"dark\"\n"
+                           "scheme_variant = \"tonal_spot\"\n"
+                           "source_color_index = 2\n"
+                           "seed_color = \"#ff5500\"\n"
+                           "pywal_compat = true\n"
+                           "\n"
+                           "[template.kitty]\n"
+                           "input_path = \"~/templates/kitty.conf\"\n"
+                           "output_path = \"$XDG_CONFIG_HOME/kitty/colors.conf\"\n"
+                           "post_hook = \"touch $HOME/kitty_hook_ran\"\n"
+                           "\n"
+                           "[[templates]]\n"
+                           "name = \"waybar\"\n"
+                           "input = \"~/templates/waybar.css\"\n"
+                           "output = \"~/out/waybar.css\"\n";
 
     waywal_config_t cfg;
     waywal_config_init_defaults(&cfg);
@@ -2013,8 +2047,7 @@ static void test_superset_template_engine(void)
     assert(strstr(rendered, expected_line) != NULL);
 
     snprintf(expected_line, sizeof(expected_line), "matugen_strip=%02x%02x%02x",
-             pal_seed.primaryContainer.r, pal_seed.primaryContainer.g,
-             pal_seed.primaryContainer.b);
+             pal_seed.primaryContainer.r, pal_seed.primaryContainer.g, pal_seed.primaryContainer.b);
     assert(strstr(rendered, expected_line) != NULL);
 
     snprintf(expected_line, sizeof(expected_line), "matugen_rgba=rgba(%u, %u, %u, 1.00)",
@@ -2028,8 +2061,8 @@ static void test_superset_template_engine(void)
     assert(strstr(rendered, "wallust_a=1.00\n") != NULL);
     assert(strstr(rendered, "pywal_wp=/tmp/test_wallpaper.png") != NULL);
 
-    snprintf(expected_line, sizeof(expected_line), "pywal_bg=#%02x%02x%02x",
-             pal_seed.background.r, pal_seed.background.g, pal_seed.background.b);
+    snprintf(expected_line, sizeof(expected_line), "pywal_bg=#%02x%02x%02x", pal_seed.background.r,
+             pal_seed.background.g, pal_seed.background.b);
     assert(strstr(rendered, expected_line) != NULL);
 
     snprintf(expected_line, sizeof(expected_line), "pywal_c1_strip=%02x%02x%02x",
@@ -2037,8 +2070,8 @@ static void test_superset_template_engine(void)
     assert(strstr(rendered, expected_line) != NULL);
 
     snprintf(expected_line, sizeof(expected_line),
-             "css_preserve=body { color: #fff; background: #%02x%02x%02x; }",
-             pal_seed.background.r, pal_seed.background.g, pal_seed.background.b);
+             "css_preserve=body { color: #fff; background: #%02x%02x%02x; }", pal_seed.background.r,
+             pal_seed.background.g, pal_seed.background.b);
     assert(strstr(rendered, expected_line) != NULL);
 
     snprintf(expected_line, sizeof(expected_line),
@@ -2065,15 +2098,16 @@ static void test_superset_template_engine(void)
     assert(strstr(rendered, "malformed_blend_nan={{ primary | blend(#ffffff, NaN) }}") != NULL);
     assert(strstr(rendered, "malformed_garbage={{ primary | lighten(0.2abc) }}") != NULL);
     assert(strstr(rendered, "malformed_pal_extra={{ palettes.primary.40.hex.extra }}") != NULL);
-    assert(strstr(rendered, "malformed_unmatched_paren={{ (colors.primary.dark | lighten(0.1) }}") !=
-           NULL);
+    assert(strstr(rendered,
+                  "malformed_unmatched_paren={{ (colors.primary.dark | lighten(0.1) }}") != NULL);
     assert(strstr(rendered, "malformed_unclosed={{ colors.primary.default.hex") != NULL);
 
     /* Verify #000000 source_color renders #000000 in both dark and light contexts */
     ufp = fopen(unit_tpl_in, "wb");
     assert(ufp != NULL);
-    fputs("src_dark={{colors.source_color.dark.hex}}\nsrc_light={{colors.source_color.light.hex}}\n",
-          ufp);
+    fputs(
+        "src_dark={{colors.source_color.dark.hex}}\nsrc_light={{colors.source_color.light.hex}}\n",
+        ufp);
     fclose(ufp);
     assert(waywal_palette_render_template_file(&pal_black_dark, &pal_black_dark, &pal_black_light,
                                                unit_tpl_in, unit_tpl_out));
@@ -2567,7 +2601,8 @@ static void test_slideshow_and_wpaperd(void)
     assert(r_def->sort_mode == WAYWAL_SORT_MTIME && r_def->has_sort_mode);
     assert(r_def->has_recursive && r_def->recursive == false);
 
-    /* Native wpaperd top-level [DP-1] section overrides [default] and inherits interval/sort/recursive */
+    /* Native wpaperd top-level [DP-1] section overrides [default] and inherits
+     * interval/sort/recursive */
     const waywal_output_rule_t *r_dp1 = waywal_config_match_output(&cfg, "DP-1");
     assert(r_dp1 != NULL);
     assert(strcmp(r_dp1->output_name, "DP-1") == 0);
@@ -2590,7 +2625,8 @@ static void test_slideshow_and_wpaperd(void)
     assert(strcmp(r_hdmi->mode, "color") == 0);
     assert(r_hdmi->has_color && r_hdmi->fill_color == 0x1E1E2EFFU);
 
-    /* [DP-3] fill_color = "#112233" inherits path & mode from [default] instead of becoming color */
+    /* [DP-3] fill_color = "#112233" inherits path & mode from [default] instead of becoming color
+     */
     const waywal_output_rule_t *r_dp3 = waywal_config_match_output(&cfg, "DP-3");
     assert(r_dp3 != NULL);
     assert(strcmp(r_dp3->output_name, "DP-3") == 0);
@@ -2620,14 +2656,17 @@ static void test_slideshow_and_wpaperd(void)
     assert(strcmp(cfg.workspaces[3].mode, "color") == 0);
     assert(cfg.workspaces[3].has_color && cfg.workspaces[3].fill_color == 0x336699FFU);
 
-    /* 4b. Validate rejection of negative/NaN/Inf/overflow float durations and 0 slideshow interval */
+    /* 4b. Validate rejection of negative/NaN/Inf/overflow float durations and 0 slideshow interval
+     */
     waywal_config_t bad_dur_cfg;
     waywal_config_init_defaults(&bad_dur_cfg);
-    assert(!waywal_config_parse_string("[workspace.\"1\"]\npath = \"/tmp/a.png\"\ntransition_duration = -5\n",
-                                       &bad_dur_cfg, NULL, 0));
+    assert(!waywal_config_parse_string(
+        "[workspace.\"1\"]\npath = \"/tmp/a.png\"\ntransition_duration = -5\n", &bad_dur_cfg, NULL,
+        0));
     waywal_config_init_defaults(&bad_dur_cfg);
-    assert(!waywal_config_parse_string("[workspace.\"1\"]\npath = \"/tmp/a.png\"\ntransition_duration = nan\n",
-                                       &bad_dur_cfg, NULL, 0));
+    assert(!waywal_config_parse_string(
+        "[workspace.\"1\"]\npath = \"/tmp/a.png\"\ntransition_duration = nan\n", &bad_dur_cfg, NULL,
+        0));
     waywal_config_init_defaults(&bad_dur_cfg);
     assert(!waywal_config_parse_string("[transition]\nduration = -1.0\n", &bad_dur_cfg, NULL, 0));
     waywal_config_init_defaults(&bad_dur_cfg);
@@ -2641,11 +2680,13 @@ static void test_slideshow_and_wpaperd(void)
     waywal_config_init_defaults(&bad_dur_cfg);
     assert(!waywal_config_parse_string("[template]\ninput = \"/tmp/a\"\n", &bad_dur_cfg, NULL, 0));
 
-    /* Verify built-in shader preset names in [output.*] / [workspace.*] auto-infer mode = "shader" */
+    /* Verify built-in shader preset names in [output.*] / [workspace.*] auto-infer mode = "shader"
+     */
     waywal_config_t preset_mode_cfg;
     waywal_config_init_defaults(&preset_mode_cfg);
-    assert(waywal_config_parse_string("[DP-1]\npath = \"aurora\"\n[workspace.\"2\"]\npath = \"preset:cyber_grid\"\n",
-                                      &preset_mode_cfg, NULL, 0));
+    assert(waywal_config_parse_string(
+        "[DP-1]\npath = \"aurora\"\n[workspace.\"2\"]\npath = \"preset:cyber_grid\"\n",
+        &preset_mode_cfg, NULL, 0));
     assert(preset_mode_cfg.output_count == 1U &&
            strcmp(preset_mode_cfg.outputs[0].mode, "shader") == 0);
     assert(preset_mode_cfg.workspace_count == 1U &&
@@ -2670,7 +2711,8 @@ static void test_slideshow_and_wpaperd(void)
     spay.has_sort_mode = 1;
     spay.auto_day_night = 1;
 
-    /* 5a. Non-recursive scan (no_recursive = 1): skips f_subdir, keeps top-level files + Workshop dir */
+    /* 5a. Non-recursive scan (no_recursive = 1): skips f_subdir, keeps top-level files + Workshop
+     * dir */
     spay.no_recursive = 1;
     spay.sort_mode = WAYWAL_SORT_ASCENDING;
     assert(slideshow_start(&ss, &spay));
@@ -2682,7 +2724,8 @@ static void test_slideshow_and_wpaperd(void)
     assert(strcmp(ss.file_list[3], p_d) == 0);
     assert(strcmp(ss.file_list[4], p_ws) == 0);
 
-    /* 5b. Recursive scan (no_recursive = 0): includes f_subdir/sub_wall.png, skips Workshop internals & .git */
+    /* 5b. Recursive scan (no_recursive = 0): includes f_subdir/sub_wall.png, skips Workshop
+     * internals & .git */
     spay.no_recursive = 0;
     spay.sort_mode = WAYWAL_SORT_ASCENDING;
     assert(slideshow_start(&ss, &spay));
@@ -2729,7 +2772,8 @@ static void test_slideshow_and_wpaperd(void)
         for (size_t step = 0; step < 5; ++step) {
             assert(slideshow_control(&ss, WAYWAL_SLIDESHOW_NEXT));
             const char *cur_item = ss.file_list[ss.current_file_idx];
-            /* Non-repeating invariant: consecutive items (including across cycle wrap) never match */
+            /* Non-repeating invariant: consecutive items (including across cycle wrap) never match
+             */
             assert(strcmp(cur_item, prev_item) != 0);
             strncpy(prev_item, cur_item, sizeof(prev_item) - 1);
             prev_item[sizeof(prev_item) - 1] = '\0';
@@ -2758,8 +2802,8 @@ static void test_slideshow_and_wpaperd(void)
     assert(opts.slideshow_interval_s == 5400U);
     assert(opts.has_slideshow_sort && opts.slideshow_sort == WAYWAL_SORT_MTIME);
 
-    char *argv_ss_flags_first[] = {"wwal",   "slideshow",    "--duration", "10m",
-                                   "--sort", "descending",   tmp_dir};
+    char *argv_ss_flags_first[] = {"wwal",   "slideshow",  "--duration", "10m",
+                                   "--sort", "descending", tmp_dir};
     assert(cli_parse(7, argv_ss_flags_first, &opts));
     assert(opts.cmd == CLI_CMD_SLIDESHOW);
     assert(strcmp(opts.filepath, tmp_dir) == 0);
@@ -2781,8 +2825,21 @@ static void test_slideshow_and_wpaperd(void)
     char *argv_env_tdur[] = {"wwal", "img", p_a};
     assert(cli_parse(3, argv_env_tdur, &opts));
     assert(!opts.has_transition_duration);
-    assert(fabsf(opts.transition_duration - 1.0f) < 1e-4f);
+    assert(fabsf(opts.transition_duration - 1.2f) < 1e-4f);
+    assert(opts.transition_duration_ms == 1200U);
+    assert(opts.transition_fps == 60U);
+    assert(fabsf(opts.bezier.p1x - 0.25f) < 1e-4f && fabsf(opts.bezier.p1y - 0.1f) < 1e-4f &&
+           fabsf(opts.bezier.p2x - 0.25f) < 1e-4f && fabsf(opts.bezier.p2y - 1.0f) < 1e-4f);
     unsetenv("AWWW_TRANSITION_DURATION");
+
+    waywal_config_t def_cfg;
+    waywal_config_init_defaults(&def_cfg);
+    assert(fabsf(def_cfg.transition.duration - 1.2f) < 1e-4f);
+    assert(def_cfg.transition.fps == 60U);
+    assert(fabsf(def_cfg.transition.bezier[0] - 0.25f) < 1e-4f &&
+           fabsf(def_cfg.transition.bezier[1] - 0.1f) < 1e-4f &&
+           fabsf(def_cfg.transition.bezier[2] - 0.25f) < 1e-4f &&
+           fabsf(def_cfg.transition.bezier[3] - 1.0f) < 1e-4f);
 
     /* Cleanup temp directory */
     unlink(p_git_img);
@@ -2816,13 +2873,11 @@ static void test_solar_and_dynamic_wallpapers(void)
     tm_summer.tm_sec = 0;
     time_t utc_summer_noon = timegm(&tm_summer);
 
-    waywal_solar_state_t nyc_summer =
-        waywal_solar_calculate(40.7128, -74.0060, utc_summer_noon);
+    waywal_solar_state_t nyc_summer = waywal_solar_calculate(40.7128, -74.0060, utc_summer_noon);
     assert(isfinite(nyc_summer.elevation_deg));
     assert(isfinite(nyc_summer.azimuth_deg));
     assert(nyc_summer.sunrise_utc > 0 && nyc_summer.sunset_utc > nyc_summer.sunrise_utc);
-    double summer_day_hours =
-        (double)(nyc_summer.sunset_utc - nyc_summer.sunrise_utc) / 3600.0;
+    double summer_day_hours = (double)(nyc_summer.sunset_utc - nyc_summer.sunrise_utc) / 3600.0;
     assert(summer_day_hours > 14.0 && summer_day_hours < 16.0);
     assert(nyc_summer.elevation_deg > 65.0);
     assert(nyc_summer.is_daytime);
@@ -2837,12 +2892,10 @@ static void test_solar_and_dynamic_wallpapers(void)
     tm_winter.tm_sec = 0;
     time_t utc_winter_noon = timegm(&tm_winter);
 
-    waywal_solar_state_t nyc_winter =
-        waywal_solar_calculate(40.7128, -74.0060, utc_winter_noon);
+    waywal_solar_state_t nyc_winter = waywal_solar_calculate(40.7128, -74.0060, utc_winter_noon);
     assert(isfinite(nyc_winter.elevation_deg));
     assert(nyc_winter.sunrise_utc > 0 && nyc_winter.sunset_utc > nyc_winter.sunrise_utc);
-    double winter_day_hours =
-        (double)(nyc_winter.sunset_utc - nyc_winter.sunrise_utc) / 3600.0;
+    double winter_day_hours = (double)(nyc_winter.sunset_utc - nyc_winter.sunrise_utc) / 3600.0;
     assert(winter_day_hours > 8.5 && winter_day_hours < 10.5);
     assert(summer_day_hours > winter_day_hours + 4.5);
     assert(nyc_winter.elevation_deg > 20.0 && nyc_winter.elevation_deg < 35.0);
@@ -2878,11 +2931,9 @@ static void test_solar_and_dynamic_wallpapers(void)
     assert(!polar_night.is_daytime);
     assert(polar_night.phase == WAYWAL_SOLAR_NIGHT);
 
-    waywal_solar_state_t svalbard_summer =
-        waywal_solar_calculate(78.22, 15.65, utc_summer_noon);
+    waywal_solar_state_t svalbard_summer = waywal_solar_calculate(78.22, 15.65, utc_summer_noon);
     assert(svalbard_summer.is_daytime && svalbard_summer.phase == WAYWAL_SOLAR_DAY);
-    waywal_solar_state_t svalbard_winter =
-        waywal_solar_calculate(78.22, 15.65, utc_winter_noon);
+    waywal_solar_state_t svalbard_winter = waywal_solar_calculate(78.22, 15.65, utc_winter_noon);
     assert(!svalbard_winter.is_daytime && svalbard_winter.phase == WAYWAL_SOLAR_NIGHT);
 
     /* Vernal equinox at (0.0, 0.0) around 12:00 UTC: sun near zenith (~90 deg) */
@@ -2897,7 +2948,8 @@ static void test_solar_and_dynamic_wallpapers(void)
     double eq_day_hours = (double)(eq_noon.sunset_utc - eq_noon.sunrise_utc) / 3600.0;
     assert(eq_day_hours > 11.8 && eq_day_hours < 12.5);
 
-    /* Western hemisphere across UTC midnight: 2026-06-22 00:15 UTC is 20:15 EDT on 2026-06-21 (before sunset ~00:31 UTC) */
+    /* Western hemisphere across UTC midnight: 2026-06-22 00:15 UTC is 20:15 EDT on 2026-06-21
+     * (before sunset ~00:31 UTC) */
     struct tm tm_nyc_dusk_utc = {0};
     tm_nyc_dusk_utc.tm_year = 2026 - 1900;
     tm_nyc_dusk_utc.tm_mon = 6 - 1;
@@ -2905,36 +2957,33 @@ static void test_solar_and_dynamic_wallpapers(void)
     tm_nyc_dusk_utc.tm_hour = 0;
     tm_nyc_dusk_utc.tm_min = 15;
     time_t utc_nyc_evening = timegm(&tm_nyc_dusk_utc);
-    waywal_solar_state_t nyc_evening =
-        waywal_solar_calculate(40.7128, -74.0060, utc_nyc_evening);
+    waywal_solar_state_t nyc_evening = waywal_solar_calculate(40.7128, -74.0060, utc_nyc_evening);
     assert(nyc_evening.is_daytime);
-    assert(nyc_evening.sunrise_utc <= utc_nyc_evening &&
-           utc_nyc_evening <= nyc_evening.sunset_utc);
+    assert(nyc_evening.sunrise_utc <= utc_nyc_evening && utc_nyc_evening <= nyc_evening.sunset_utc);
 
     /* 2. GNOME .xml dynamic wallpaper manifest parsing & evaluation */
-    const char *gnome_xml =
-        "<?xml version=\"1.0\"?>\n"
-        "<background>\n"
-        "  <!-- Mojave test schedule -->\n"
-        "  <static_meta>ignored_prefix_tag.png</static_meta>\n"
-        "  <starttime>\n"
-        "    <year>2026</year><month>06</month><day>21</day>\n"
-        "    <hour>06</hour><minute>00</minute><second>00</second>\n"
-        "  </starttime>\n"
-        "  <static>\n"
-        "    <duration>21600.0</duration>\n"
-        "    <file type=\"image\">morning.png</file>\n"
-        "  </static>\n"
-        "  <transition type=\"overlay\">\n"
-        "    <duration>7200.0</duration>\n"
-        "    <from>morning.png</from>\n"
-        "    <to>afternoon.png</to>\n"
-        "  </transition>\n"
-        "  <static>\n"
-        "    <duration>57600.0</duration>\n"
-        "    <file>/var/wallpapers/night.png</file>\n"
-        "  </static>\n"
-        "</background>\n";
+    const char *gnome_xml = "<?xml version=\"1.0\"?>\n"
+                            "<background>\n"
+                            "  <!-- Mojave test schedule -->\n"
+                            "  <static_meta>ignored_prefix_tag.png</static_meta>\n"
+                            "  <starttime>\n"
+                            "    <year>2026</year><month>06</month><day>21</day>\n"
+                            "    <hour>06</hour><minute>00</minute><second>00</second>\n"
+                            "  </starttime>\n"
+                            "  <static>\n"
+                            "    <duration>21600.0</duration>\n"
+                            "    <file type=\"image\">morning.png</file>\n"
+                            "  </static>\n"
+                            "  <transition type=\"overlay\">\n"
+                            "    <duration>7200.0</duration>\n"
+                            "    <from>morning.png</from>\n"
+                            "    <to>afternoon.png</to>\n"
+                            "  </transition>\n"
+                            "  <static>\n"
+                            "    <duration>57600.0</duration>\n"
+                            "    <file>/var/wallpapers/night.png</file>\n"
+                            "  </static>\n"
+                            "</background>\n";
 
     waywal_dynwall_manifest_t xml_man;
     assert(waywal_dynwall_parse_xml_string(gnome_xml, strlen(gnome_xml),
@@ -2975,7 +3024,8 @@ static void test_solar_and_dynamic_wallpapers(void)
     /* Next change in first half must wake at the midpoint (13:00 -> 1800s away) */
     assert(eval_res.next_change_sec == 1800);
 
-    /* Evaluate at 13:00 local time (midpoint of 12:00..14:00 transition: blend_factor = 0.50 -> to_path) */
+    /* Evaluate at 13:00 local time (midpoint of 12:00..14:00 transition: blend_factor = 0.50 ->
+     * to_path) */
     lt.tm_hour = 13;
     lt.tm_min = 0;
     lt.tm_sec = 0;
@@ -2998,31 +3048,31 @@ static void test_solar_and_dynamic_wallpapers(void)
     assert(strcmp(eval_res.primary_path, "/var/wallpapers/night.png") == 0);
 
     /* Reject path traversal, entity evasion, and env-var traversal in XML manifest */
-    const char *bad_xml =
-        "<background><static><duration>3600</duration><file>../etc/passwd</file></static></background>";
+    const char *bad_xml = "<background><static><duration>3600</duration><file>../etc/passwd</"
+                          "file></static></background>";
     assert(!waywal_dynwall_parse_xml_string(bad_xml, strlen(bad_xml), "/usr/share/backgrounds",
                                             &xml_man));
-    const char *bad_xml_entity =
-        "<background><static><duration>3600</duration><file>&#46;&#46;/etc/passwd</file></static></background>";
+    const char *bad_xml_entity = "<background><static><duration>3600</duration><file>&#46;&#46;/"
+                                 "etc/passwd</file></static></background>";
     assert(!waywal_dynwall_parse_xml_string(bad_xml_entity, strlen(bad_xml_entity),
                                             "/usr/share/backgrounds", &xml_man));
     setenv("WWAL_TEST_BAD_DIR", "/tmp/../../etc", 1);
     const char *bad_xml_env =
-        "<background><static><duration>3600</duration><file>$WWAL_TEST_BAD_DIR/passwd</file></static></background>";
+        "<background><static><duration>3600</duration><file>$WWAL_TEST_BAD_DIR/passwd</file></"
+        "static></background>";
     assert(!waywal_dynwall_parse_xml_string(bad_xml_env, strlen(bad_xml_env),
                                             "/usr/share/backgrounds", &xml_man));
     unsetenv("WWAL_TEST_BAD_DIR");
 
     /* 3. JSON dynamic wallpaper manifest (both solar-elevation-keyed and time-keyed) */
-    const char *solar_json =
-        "{\n"
-        "  \"type\": \"solar\",\n"
-        "  \"frames\": [\n"
-        "    { \"file\": \"night_deep.png\", \"elevation\": -25.0 },\n"
-        "    { \"file\": \"dawn_glow.png\",  \"elevation\": 0.0 },\n"
-        "    { \"file\": \"noon_bright.png\", \"elevation\": 60.0 }\n"
-        "  ]\n"
-        "}\n";
+    const char *solar_json = "{\n"
+                             "  \"type\": \"solar\",\n"
+                             "  \"frames\": [\n"
+                             "    { \"file\": \"night_deep.png\", \"elevation\": -25.0 },\n"
+                             "    { \"file\": \"dawn_glow.png\",  \"elevation\": 0.0 },\n"
+                             "    { \"file\": \"noon_bright.png\", \"elevation\": 60.0 }\n"
+                             "  ]\n"
+                             "}\n";
     waywal_dynwall_manifest_t json_man;
     assert(waywal_dynwall_parse_json_string(solar_json, strlen(solar_json), "/opt/dynwall",
                                             &json_man));
@@ -3033,15 +3083,14 @@ static void test_solar_and_dynamic_wallpapers(void)
     assert(waywal_dynwall_resolve(&json_man, utc_summer_midnight, NULL, &nyc_midnight, &eval_res));
     assert(strcmp(eval_res.primary_path, "/opt/dynwall/night_deep.png") == 0);
 
-    const char *time_json =
-        "{\n"
-        "  \"frames\": [\n"
-        "    { \"file\": \"t_morning.png\", \"time\": \"06:00\" },\n"
-        "    { \"file\": \"t_evening.png\", \"time\": \"18:00\" }\n"
-        "  ]\n"
-        "}\n";
-    assert(waywal_dynwall_parse_json_string(time_json, strlen(time_json), "/opt/dynwall",
-                                            &json_man));
+    const char *time_json = "{\n"
+                            "  \"frames\": [\n"
+                            "    { \"file\": \"t_morning.png\", \"time\": \"06:00\" },\n"
+                            "    { \"file\": \"t_evening.png\", \"time\": \"18:00\" }\n"
+                            "  ]\n"
+                            "}\n";
+    assert(
+        waywal_dynwall_parse_json_string(time_json, strlen(time_json), "/opt/dynwall", &json_man));
     assert(json_man.step_count == 2);
     lt.tm_hour = 8;
     lt.tm_min = 0;
@@ -3060,10 +3109,9 @@ static void test_solar_and_dynamic_wallpapers(void)
     assert(!waywal_dynwall_parse_xml_string("", 0, "/opt/dynwall", &xml_man));
     assert(!waywal_dynwall_parse_json_string("", 0, "/opt/dynwall", &json_man));
     assert(!waywal_dynwall_parse_json_string("{\"frames\":[]}", 13, "/opt/dynwall", &json_man));
-    const char *bad_json =
-        "{\"frames\":[{\"file\":\"../../etc/shadow\",\"time\":\"06:00\"}]}";
-    assert(!waywal_dynwall_parse_json_string(bad_json, strlen(bad_json), "/opt/dynwall",
-                                             &json_man));
+    const char *bad_json = "{\"frames\":[{\"file\":\"../../etc/shadow\",\"time\":\"06:00\"}]}";
+    assert(
+        !waywal_dynwall_parse_json_string(bad_json, strlen(bad_json), "/opt/dynwall", &json_man));
 
     /* 4. [solar] and [schedule] TOML configuration & CLI overrides */
     char tmp_dir[] = "/tmp/wwal_solar_test_XXXXXX";
@@ -3116,8 +3164,7 @@ static void test_solar_and_dynamic_wallpapers(void)
     assert(strcmp(solar_cfg.schedule[0].phase, "dawn") == 0);
     assert(strcmp(solar_cfg.schedule[0].path, "/tmp/sched_dawn.png") == 0);
     assert(solar_cfg.schedule[0].has_theme_mode && solar_cfg.schedule[0].theme_light_mode);
-    assert(solar_cfg.schedule[1].has_time &&
-           solar_cfg.schedule[1].time_minutes == (21 * 60 + 30));
+    assert(solar_cfg.schedule[1].has_time && solar_cfg.schedule[1].time_minutes == (21 * 60 + 30));
     assert(strcmp(solar_cfg.schedule[1].path, "/tmp/sched_night.png") == 0);
     assert(solar_cfg.schedule[1].has_theme_mode && !solar_cfg.schedule[1].theme_light_mode);
 
@@ -3130,9 +3177,8 @@ static void test_solar_and_dynamic_wallpapers(void)
     assert(!waywal_config_load_file(toml_path, &solar_cfg, NULL, 0));
 
     cli_options_t cli_opts;
-    char *argv_solar[] = {"wwal",           "img",           "/tmp/mojave.xml",
-                          "--auto-day-night", "--latitude",  "35.6762",
-                          "--longitude",    "139.6503"};
+    char *argv_solar[] = {"wwal",       "img",     "/tmp/mojave.xml", "--auto-day-night",
+                          "--latitude", "35.6762", "--longitude",     "139.6503"};
     assert(cli_parse(8, argv_solar, &cli_opts));
     cli_auto_dispatch_img(&cli_opts);
     assert(cli_opts.cmd == CLI_CMD_IMG);
@@ -3159,8 +3205,8 @@ static void test_solar_and_dynamic_wallpapers(void)
 
     /* 5. Manifest security & XML duration/truncation hardening */
     setenv("WWAL_TEST_DOT", ".", 1);
-    const char *bad_xml_comp_env =
-        "<background><static><duration>3600</duration><file>/.$WWAL_TEST_DOT/etc/passwd</file></static></background>";
+    const char *bad_xml_comp_env = "<background><static><duration>3600</duration><file>/"
+                                   ".$WWAL_TEST_DOT/etc/passwd</file></static></background>";
     assert(!waywal_dynwall_parse_xml_string(bad_xml_comp_env, strlen(bad_xml_comp_env),
                                             "/usr/share/backgrounds", &xml_man));
     unsetenv("WWAL_TEST_DOT");
@@ -3246,16 +3292,16 @@ static void test_solar_and_dynamic_wallpapers(void)
         snprintf(saved_home, sizeof(saved_home), "%s", orig_home);
     }
     setenv("HOME", "/tmp/foo/../..", 1);
-    const char *tilde_trav_xml =
-        "<background><static><duration>3600</duration>"
-        "<file>~/etc/passwd</file></static></background>";
+    const char *tilde_trav_xml = "<background><static><duration>3600</duration>"
+                                 "<file>~/etc/passwd</file></static></background>";
     assert(!waywal_dynwall_parse_xml_string(tilde_trav_xml, strlen(tilde_trav_xml), "/opt/dynwall",
                                             &xml_man));
     if (saved_home[0] != '\0') {
         setenv("HOME", saved_home, 1);
     }
 
-    /* Verify waywal_solar_is_daytime_at_ex and waywal_solar_synthesize_local honor custom sunrise/sunset */
+    /* Verify waywal_solar_is_daytime_at_ex and waywal_solar_synthesize_local honor custom
+     * sunrise/sunset */
     waywal_solar_phase_t fb_ph = WAYWAL_SOLAR_NIGHT;
     lt.tm_hour = 7;
     lt.tm_min = 15;
@@ -3271,7 +3317,8 @@ static void test_solar_and_dynamic_wallpapers(void)
     lt.tm_min = 15;
     assert(!waywal_solar_is_daytime_at_ex(0.0, 0.0, false, 480, 1200, t_morning, &lt, &fb_ph));
 
-    /* Verify waywal_solar_synthesize_local drives waywal_dynwall_resolve with custom sunrise=05:00 (300) */
+    /* Verify waywal_solar_synthesize_local drives waywal_dynwall_resolve with custom sunrise=05:00
+     * (300) */
     waywal_solar_state_t custom_fb_solar;
     lt.tm_hour = 5;
     lt.tm_min = 45;
@@ -3320,7 +3367,7 @@ static void test_shader_presets(void)
     assert(count == 10U);
 
     const char *expected_names[10] = {
-        "aurora",    "cyber_grid", "fluid_ink",  "synthwave_sun", "starfield",
+        "aurora",     "cyber_grid", "fluid_ink",  "synthwave_sun", "starfield",
         "rain_glass", "audio_bars", "audio_ring", "crt_retro",     "plasma_orb",
     };
 
@@ -3334,7 +3381,8 @@ static void test_shader_presets(void)
         assert(access(presets[i].path, R_OK) == 0);
         assert(presets[i].is_builtin);
 
-        /* Scan preset GLSL source to verify 0 constant smoothstep(edge0, edge1, ...) with edge0 >= edge1 */
+        /* Scan preset GLSL source to verify 0 constant smoothstep(edge0, edge1, ...) with edge0 >=
+         * edge1 */
         FILE *sf = fopen(presets[i].path, "rb");
         assert(sf != NULL);
         char sbuf[16384];
@@ -3410,9 +3458,11 @@ static void test_shader_presets(void)
     assert(waywal_shader_resolve_path("aurora.frag", resolved_alias, sizeof(resolved_alias)));
     assert(strstr(resolved_alias, "aurora.frag") != NULL);
 
-    assert(!waywal_shader_resolve_path("preset:/etc/hosts", resolved_alias, sizeof(resolved_alias)));
+    assert(
+        !waywal_shader_resolve_path("preset:/etc/hosts", resolved_alias, sizeof(resolved_alias)));
 
-    /* 3. Verify custom $WWAL_SHADER_PRESET_DIR resolution, metadata parsing & override deduplication */
+    /* 3. Verify custom $WWAL_SHADER_PRESET_DIR resolution, metadata parsing & override
+     * deduplication */
     const char *custom_dir = "/tmp/wwal_test_preset_dir";
     const char *custom_shader_dir = "/tmp/wwal_test_shader_dir";
     const char *custom_shader_presets_dir = "/tmp/wwal_test_shader_dir/presets";
@@ -3593,7 +3643,8 @@ static void test_shader_presets(void)
     char *argv_missing_preset[] = {"wwal", "shader", "preset"};
     assert(!cli_parse(3, argv_missing_preset, &opts));
 
-    /* Verify 'wwal shader preset nonexistent_local.frag' fails even if ./nonexistent_local.frag exists in CWD */
+    /* Verify 'wwal shader preset nonexistent_local.frag' fails even if ./nonexistent_local.frag
+     * exists in CWD */
     const char *local_non_preset = "nonexistent_local.frag";
     FILE *lf = fopen(local_non_preset, "wb");
     assert(lf != NULL);
@@ -3613,7 +3664,8 @@ static void test_shader_presets(void)
     assert(opts.shader_preset_explicit);
     assert(strcmp(opts.filepath, "preset:nonexistent") == 0);
 
-    /* Verify 'wwal img preset:nonexistent' dispatches to CLI_CMD_SHADER with shader_preset_explicit */
+    /* Verify 'wwal img preset:nonexistent' dispatches to CLI_CMD_SHADER with shader_preset_explicit
+     */
     char *argv_img_preset_colon_missing[] = {"wwal", "img", "preset:nonexistent"};
     assert(cli_parse(3, argv_img_preset_colon_missing, &opts));
     assert(cli_auto_dispatch_img(&opts));

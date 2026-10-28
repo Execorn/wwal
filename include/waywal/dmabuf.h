@@ -20,7 +20,7 @@ extern "C" {
 #endif
 
 #define WAYWAL_MAX_BUFFER_PLANES 4
-#define WAYWAL_DMABUF_RING_SIZE  3 /* Triple buffering for tear-free async presentation */
+#define WAYWAL_DMABUF_RING_SIZE  4 /* Quad buffering for tear-free async transition presentation */
 
 typedef struct dmabuf_bo {
     int fd[WAYWAL_MAX_BUFFER_PLANES];
@@ -65,7 +65,10 @@ typedef struct dmabuf_context {
 } dmabuf_context_t;
 
 typedef struct dmabuf_ring {
-    dmabuf_bo_t buffers[WAYWAL_DMABUF_RING_SIZE];
+    union {
+        dmabuf_bo_t buffers[WAYWAL_DMABUF_RING_SIZE];
+        dmabuf_bo_t bos[WAYWAL_DMABUF_RING_SIZE];
+    };
     size_t current_idx;
     uint32_t width;
     uint32_t height;

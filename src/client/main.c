@@ -79,6 +79,17 @@ static void apply_config_defaults_to_cli(int argc, char *argv[], const waywal_co
         if (cfg->transition.fps > 0)
             opts->transition_fps = cfg->transition.fps;
     }
+    if (opts->transition_step > 0 && !opts->has_transition_duration) {
+        uint32_t fps = opts->transition_fps > 0 ? opts->transition_fps : 60u;
+        uint32_t frames = (255u + opts->transition_step - 1u) / opts->transition_step;
+        uint32_t approx_ms = (frames * 1000u) / fps;
+        if (approx_ms < 100u)
+            approx_ms = 100u;
+        if (approx_ms > 10000u)
+            approx_ms = 10000u;
+        opts->transition_duration_ms = approx_ms;
+        opts->transition_duration = (float)approx_ms / 1000.0f;
+    }
     if (!opts->has_transition_angle && !opts->has_transition_type &&
         !argv_has_flag(argc, argv, "--transition-angle") &&
         !argv_has_flag(argc, argv, "--transition-type") && !argv_has_flag(argc, argv, "-t")) {
@@ -573,21 +584,9 @@ static bool load_image_or_video_first_frame(const char *path, bool no_cache, uin
             }
         }
         char *const ff_argv[] = {
-            "ffmpeg",
-            "-v",
-            "error",
-            "-nostdin",
-            "-i",
-            (char *)path,
-            "-frames:v",
-            "1",
-            "-vf",
-            "scale=128:128:flags=fast_bilinear",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgra",
-            "pipe:1",
+            "ffmpeg",     "-v",        "error",    "-nostdin", "-i",
+            (char *)path, "-frames:v", "1",        "-vf",      "scale=128:128:flags=fast_bilinear",
+            "-f",         "rawvideo",  "-pix_fmt", "bgra",     "pipe:1",
             NULL,
         };
         execvp("ffmpeg", ff_argv);
@@ -847,12 +846,11 @@ static size_t clear_cache_dir_files(const char *dir_path)
         if (strcmp(ent->d_name, "current_wallpaper.png") == 0)
             continue;
         size_t nlen = strlen(ent->d_name);
-        bool is_cached_ext =
-            (nlen > 4 && (strcasecmp(ent->d_name + nlen - 4, ".mp4") == 0 ||
-                          strcasecmp(ent->d_name + nlen - 4, ".bin") == 0 ||
-                          strcasecmp(ent->d_name + nlen - 4, ".png") == 0 ||
-                          strcasecmp(ent->d_name + nlen - 4, ".jpg") == 0)) ||
-            (nlen > 5 && strcasecmp(ent->d_name + nlen - 5, ".bgra") == 0);
+        bool is_cached_ext = (nlen > 4 && (strcasecmp(ent->d_name + nlen - 4, ".mp4") == 0 ||
+                                           strcasecmp(ent->d_name + nlen - 4, ".bin") == 0 ||
+                                           strcasecmp(ent->d_name + nlen - 4, ".png") == 0 ||
+                                           strcasecmp(ent->d_name + nlen - 4, ".jpg") == 0)) ||
+                             (nlen > 5 && strcasecmp(ent->d_name + nlen - 5, ".bgra") == 0);
         if (!is_cached_ext)
             continue;
 
@@ -962,8 +960,7 @@ static int handle_cmd_theme(const cli_options_t *opts, const waywal_config_t *cf
 {
     char target_path[4096];
     target_path[0] = '\0';
-    bool has_seed_ovr =
-        (opts && opts->has_seed_color) || (cfg && cfg->theme.has_seed_color);
+    bool has_seed_ovr = (opts && opts->has_seed_color) || (cfg && cfg->theme.has_seed_color);
 
     if (opts->filepath[0] != '\0') {
         strncpy(target_path, opts->filepath, sizeof(target_path) - 1);
@@ -988,8 +985,8 @@ static int handle_cmd_theme(const cli_options_t *opts, const waywal_config_t *cf
     uint32_t width = 0, height = 0;
     uint8_t dummy_px[4] = {0, 0, 0, 255};
     if (target_path[0] != '\0') {
-        if (!load_image_or_video_first_frame(target_path, opts->no_cache, &pixels, &width,
-                                             &height, cfg ? &cfg->solar : NULL)) {
+        if (!load_image_or_video_first_frame(target_path, opts->no_cache, &pixels, &width, &height,
+                                             cfg ? &cfg->solar : NULL)) {
             if (!has_seed_ovr) {
                 fprintf(stderr, "Error: Failed to decode media '%s' for theme extraction\n",
                         target_path);
@@ -1620,8 +1617,7 @@ static bool pick_list_add(pick_list_t *list, const char *title, const char *type
         if (strcmp(list->items[i].target_path, canon_target) == 0) {
             return false;
         }
-        if (strcmp(type_str, "shader") == 0 &&
-            strcmp(list->items[i].type_str, "shader") == 0 &&
+        if (strcmp(type_str, "shader") == 0 && strcmp(list->items[i].type_str, "shader") == 0 &&
             strcasecmp(list->items[i].display_title, clean_title) == 0) {
             return false;
         }
@@ -2035,8 +2031,7 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
             close(from_child[1]);
         }
         if (mode == WAYWAL_PICK_MENU_ROFI) {
-            char *const m_argv[] = {"rofi", "-dmenu",     "-i", "-show-icons",
-                                    "-p",   "Wallpaper", NULL};
+            char *const m_argv[] = {"rofi", "-dmenu", "-i", "-show-icons", "-p", "Wallpaper", NULL};
             execvp("rofi", m_argv);
         } else if (mode == WAYWAL_PICK_MENU_FUZZEL) {
             char *const m_argv[] = {"fuzzel", "--dmenu", "-p", "Wallpaper: ", NULL};
@@ -2343,10 +2338,9 @@ int main(int argc, char *argv[])
                 (we_workshop_find_preview_file(resolved_dir, prev_path, sizeof(prev_path)) &&
                  image_load(prev_path, &px, &pw, &ph) && px && pw > 0 && ph > 0);
             if (!loaded_prev) {
-                loaded_prev =
-                    (load_image_or_video_first_frame(resolved_dir, opts.no_cache, &px, &pw, &ph,
-                                                     &cfg.solar) &&
-                     px && pw > 0 && ph > 0);
+                loaded_prev = (load_image_or_video_first_frame(resolved_dir, opts.no_cache, &px,
+                                                               &pw, &ph, &cfg.solar) &&
+                               px && pw > 0 && ph > 0);
             }
             if (loaded_prev) {
                 waywal_theme_mode_t tmode =
@@ -2542,8 +2536,7 @@ int main(int argc, char *argv[])
             snprintf(opts.filepath, sizeof(opts.filepath), "%s", resolved_shader);
             snprintf(opts.custom_shader_path, sizeof(opts.custom_shader_path), "%s",
                      resolved_shader);
-        } else if (opts.shader_preset_explicit ||
-                   strncasecmp(opts.filepath, "preset:", 7) == 0) {
+        } else if (opts.shader_preset_explicit || strncasecmp(opts.filepath, "preset:", 7) == 0) {
             fprintf(stderr,
                     "Error: Shader preset '%s' not found (run 'wwal shader list' to see presets)\n",
                     opts.filepath);
@@ -2574,7 +2567,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (opts.cmd == CLI_CMD_CLEAR && (opts.extract_theme || opts.has_seed_color) && !opts.no_theme) {
+    if (opts.cmd == CLI_CMD_CLEAR && (opts.extract_theme || opts.has_seed_color) &&
+        !opts.no_theme) {
         uint8_t solid_px[4] = {
             opts.clear_color.b,
             opts.clear_color.g,
@@ -2682,7 +2676,8 @@ int main(int argc, char *argv[])
                 !waywal_dynwall_resolve(&manifest, now_utc, &local_tm, &solar, &res) ||
                 !image_load(waywal_dynwall_effective_path(&res), &img_pixels, &img_width,
                             &img_height)) {
-                fprintf(stderr, "Error: Failed to resolve or decode dynamic wallpaper manifest '%s'\n",
+                fprintf(stderr,
+                        "Error: Failed to resolve or decode dynamic wallpaper manifest '%s'\n",
                         opts.filepath);
                 free(img_shader_src);
                 return 1;
@@ -2771,7 +2766,8 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_PONG) {
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) &&
+                resp.opcode == WAYWAL_RESP_PONG) {
                 printf("wwald is alive (pong)\n");
             } else {
                 fprintf(stderr, "Error: Unexpected response from daemon\n");
@@ -2821,862 +2817,870 @@ int main(int argc, char *argv[])
             break;
         }
 
-    case CLI_CMD_CLEAR: {
-        size_t outputs_len = 0;
-        for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-            outputs_len += strlen(opts.outputs[i]) + 1;
-        }
-        size_t clear_payload_size = sizeof(waywal_clear_payload_t) + outputs_len;
-        uint8_t *clear_buf = (uint8_t *)calloc(1, clear_payload_size);
-        if (!clear_buf) {
-            ret_code = 1;
-            break;
-        }
-        waywal_clear_payload_t *cpay = (waywal_clear_payload_t *)clear_buf;
-        cpay->color[0] = opts.clear_color.r;
-        cpay->color[1] = opts.clear_color.g;
-        cpay->color[2] = opts.clear_color.b;
-        cpay->color[3] = opts.clear_color.a;
-        cpay->num_target_outputs = opts.num_outputs;
-
-        char *optr = (char *)clear_buf + sizeof(waywal_clear_payload_t);
-        for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-            size_t slen = strlen(opts.outputs[i]) + 1;
-            memcpy(optr, opts.outputs[i], slen);
-            optr += slen;
-        }
-
-        req_hdr.opcode = WAYWAL_REQ_CLEAR;
-        req_hdr.payload_size = clear_payload_size;
-
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-            !client_write_exact(socket_fd, clear_buf, clear_payload_size)) {
-            fprintf(stderr, "Error: Failed to send clear request\n");
-            free(clear_buf);
-            ret_code = 1;
-            break;
-        }
-        free(clear_buf);
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            printf("Wallpaper cleared to #%02x%02x%02x%02x\n", opts.clear_color.r,
-                   opts.clear_color.g, opts.clear_color.b, opts.clear_color.a);
-        } else {
-            fprintf(stderr, "Error: Daemon failed to clear wallpaper\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_VIDEO: {
-        int video_fd = open(effective_video_path, O_RDONLY | O_CLOEXEC);
-        req_hdr.opcode = WAYWAL_REQ_SET_VIDEO;
-
-        size_t outputs_len = 0;
-        for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-            outputs_len += strlen(opts.outputs[i]) + 1;
-        }
-        size_t video_payload_size = sizeof(waywal_video_payload_t) + outputs_len;
-        uint8_t *video_buf = (uint8_t *)calloc(1, video_payload_size);
-        if (!video_buf) {
-            if (video_fd >= 0)
-                close(video_fd);
-            ret_code = 1;
-            break;
-        }
-
-        waywal_video_payload_t *vpay = (waywal_video_payload_t *)video_buf;
-        vpay->loop_count = opts.video_loop_count;
-        vpay->playback_speed = opts.video_speed;
-        vpay->num_target_outputs = opts.num_outputs;
-        vpay->scaling_mode = opts.scaling_mode;
-        vpay->no_cache = opts.no_cache ? 1u : 0u;
-        char resolved_vid[PATH_MAX];
-        if (realpath(effective_video_path, resolved_vid)) {
-            strncpy(vpay->filepath, resolved_vid, sizeof(vpay->filepath) - 1);
-        } else {
-            strncpy(vpay->filepath, effective_video_path, sizeof(vpay->filepath) - 1);
-        }
-
-        char *optr = (char *)video_buf + sizeof(waywal_video_payload_t);
-        for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-            size_t slen = strlen(opts.outputs[i]) + 1;
-            memcpy(optr, opts.outputs[i], slen);
-            optr += slen;
-        }
-
-        req_hdr.payload_size = video_payload_size;
-
-        if (video_fd >= 0) {
-            if (!waywal_ipc_send(socket_fd, &req_hdr, video_fd)) {
-                fprintf(stderr, "Error: Failed to send video fd to daemon\n");
-                close(video_fd);
-                free(video_buf);
+        case CLI_CMD_CLEAR: {
+            size_t outputs_len = 0;
+            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                outputs_len += strlen(opts.outputs[i]) + 1;
+            }
+            size_t clear_payload_size = sizeof(waywal_clear_payload_t) + outputs_len;
+            uint8_t *clear_buf = (uint8_t *)calloc(1, clear_payload_size);
+            if (!clear_buf) {
                 ret_code = 1;
                 break;
             }
-            close(video_fd);
-            (void)client_write_exact(socket_fd, video_buf, video_payload_size);
-        } else {
+            waywal_clear_payload_t *cpay = (waywal_clear_payload_t *)clear_buf;
+            cpay->color[0] = opts.clear_color.r;
+            cpay->color[1] = opts.clear_color.g;
+            cpay->color[2] = opts.clear_color.b;
+            cpay->color[3] = opts.clear_color.a;
+            cpay->num_target_outputs = opts.num_outputs;
+
+            char *optr = (char *)clear_buf + sizeof(waywal_clear_payload_t);
+            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                size_t slen = strlen(opts.outputs[i]) + 1;
+                memcpy(optr, opts.outputs[i], slen);
+                optr += slen;
+            }
+
+            req_hdr.opcode = WAYWAL_REQ_CLEAR;
+            req_hdr.payload_size = clear_payload_size;
+
             if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-                !client_write_exact(socket_fd, video_buf, video_payload_size)) {
-                fprintf(stderr, "Error: Failed to send video request to daemon\n");
-                free(video_buf);
+                !client_write_exact(socket_fd, clear_buf, clear_payload_size)) {
+                fprintf(stderr, "Error: Failed to send clear request\n");
+                free(clear_buf);
                 ret_code = 1;
                 break;
             }
-        }
-        free(video_buf);
+            free(clear_buf);
 
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            printf("Playing video wallpaper: %s\n", opts.filepath);
-            if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
-                wallpaper_hook_ran = true;
-                (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
-            }
-        } else {
-            fprintf(stderr,
-                    "Error: Daemon rejected video request (check if video format is supported)\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_PAUSE: {
-        req_hdr.opcode = WAYWAL_REQ_PAUSE;
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
-            fprintf(stderr, "Error: Failed to send pause request\n");
-            ret_code = 1;
-            break;
-        }
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            printf("Video playback paused\n");
-        } else {
-            fprintf(stderr, "Error: Unexpected response to pause request\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_UNPAUSE: {
-        req_hdr.opcode = WAYWAL_REQ_UNPAUSE;
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
-            fprintf(stderr, "Error: Failed to send unpause request\n");
-            ret_code = 1;
-            break;
-        }
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            printf("Video playback resumed\n");
-        } else {
-            fprintf(stderr, "Error: Unexpected response to unpause request\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_TOGGLE: {
-        req_hdr.opcode = WAYWAL_REQ_TOGGLE;
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
-            fprintf(stderr, "Error: Failed to send toggle request\n");
-            ret_code = 1;
-            break;
-        }
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            printf("Video playback toggled\n");
-        } else {
-            fprintf(stderr, "Error: Unexpected response to toggle request\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_KILL: {
-        req_hdr.opcode = WAYWAL_REQ_KILL;
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
-            fprintf(stderr, "Error: Failed to send kill request\n");
-            ret_code = 1;
-            break;
-        }
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            printf("wwald daemon terminated cleanly\n");
-        } else {
-            fprintf(stderr, "Error: Unexpected response to kill command\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_IMG: {
-        size_t outputs_len = 0;
-        for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-            outputs_len += strlen(opts.outputs[i]) + 1;
-        }
-        size_t extra_bytes = outputs_len + img_shader_len;
-        size_t pixel_bytes = (size_t)img_width * img_height * 4;
-        size_t total_payload_size = sizeof(waywal_img_metadata_t) + extra_bytes + pixel_bytes;
-
-        int memfd =
-            waywal_create_memfd("wwal-client-img", total_payload_size, F_SEAL_SHRINK | F_SEAL_GROW);
-        if (memfd < 0) {
-            fprintf(stderr, "Error: Failed to create sealed memfd for image\n");
-            ret_code = 1;
-            break;
-        }
-
-        void *mapped = mmap(NULL, total_payload_size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-        if (mapped == MAP_FAILED) {
-            fprintf(stderr, "Error: mmap failed on client memfd\n");
-            close(memfd);
-            ret_code = 1;
-            break;
-        }
-#ifdef MADV_HUGEPAGE
-        (void)madvise(mapped, total_payload_size, MADV_HUGEPAGE);
-#endif
-
-        waywal_img_metadata_t meta;
-        memset(&meta, 0, sizeof(meta));
-        meta.width = img_width;
-        meta.height = img_height;
-        meta.pixel_format = opts.enable_10bit ? WAYWAL_FORMAT_XRGB2101010 : WAYWAL_FORMAT_ARGB8888;
-        meta.transition_type = opts.transition_type;
-        meta.transition_duration_ms = opts.transition_duration_ms;
-        meta.transition_fps = opts.transition_fps;
-        meta.transition_angle_rad = opts.transition_angle_rad;
-        meta.transition_wave_freq = opts.transition_wave_freq;
-        meta.transition_wave_amp = opts.transition_wave_amp;
-        meta.transition_center_x = opts.transition_pos_x;
-        meta.transition_center_y = opts.transition_pos_y;
-        meta.color[0] = opts.clear_color.r;
-        meta.color[1] = opts.clear_color.g;
-        meta.color[2] = opts.clear_color.b;
-        meta.color[3] = opts.clear_color.a;
-        meta.num_target_outputs = opts.num_outputs;
-        meta.sync_mode = opts.sync_mode;
-        meta.stagger_delay_ms = opts.stagger_delay_ms;
-        meta.custom_shader_len = (uint32_t)img_shader_len;
-        meta.extra_data_len = (uint32_t)extra_bytes;
-        meta.scaling_mode = opts.scaling_mode;
-        meta.filter_mode = (uint32_t)opts.filter;
-        meta.bezier = opts.bezier;
-        meta.has_custom_bezier = opts.has_custom_bezier;
-        meta.ten_bit = opts.ten_bit;
-        meta.extract_theme = opts.extract_theme;
-        meta.no_theme = opts.no_theme;
-        meta.theme_light_mode = opts.theme_light_mode;
-        if (opts.depth_map_path[0] != '\0') {
-            char resolved_dm[PATH_MAX];
-            if (realpath(opts.depth_map_path, resolved_dm)) {
-                strncpy(meta.depth_map_path, resolved_dm, sizeof(meta.depth_map_path) - 1);
-            } else {
-                strncpy(meta.depth_map_path, opts.depth_map_path, sizeof(meta.depth_map_path) - 1);
-            }
-        }
-        strncpy(meta.backdrop, opts.backdrop, sizeof(meta.backdrop) - 1);
-        strncpy(meta.layer_name, opts.layer_name, sizeof(meta.layer_name) - 1);
-        strncpy(meta.battery_policy, opts.battery_policy, sizeof(meta.battery_policy) - 1);
-        if (!opts.read_stdin && !opts.is_solid_color && opts.filepath[0] != '\0') {
-            char resolved_img[PATH_MAX];
-            if (realpath(opts.filepath, resolved_img)) {
-                strncpy(meta.filepath, resolved_img, sizeof(meta.filepath) - 1);
-            } else {
-                strncpy(meta.filepath, opts.filepath, sizeof(meta.filepath) - 1);
-            }
-        }
-        meta.depth_strength = opts.depth_strength > 0.0f ? opts.depth_strength : 1.0f;
-        meta.crop_gravity_x = opts.crop_gravity_x;
-        meta.crop_gravity_y = opts.crop_gravity_y;
-        meta.has_crop_gravity = opts.has_crop_gravity ? 1 : 0;
-        meta.invert_y = opts.invert_y ? 1 : 0;
-        meta.no_cache = opts.no_cache ? 1 : 0;
-        meta.is_solid_color = opts.is_solid_color ? 1 : 0;
-        meta.pos_y_inverted = opts.pos_y_inverted ? 1 : 0;
-        meta.source_color_index = opts.source_color_index;
-        meta.has_source_color_index = opts.has_source_color_index ? 1 : 0;
-        meta.has_seed_color = opts.has_seed_color ? 1 : 0;
-        meta.seed_color = opts.seed_color;
-        meta.has_theme_mode = opts.has_theme_mode ? 1 : 0;
-        meta.client_exported_theme = img_theme_exported ? 1 : 0;
-        meta.has_auto_day_night = opts.has_auto_day_night ? 1 : 0;
-        meta.auto_day_night = opts.auto_day_night ? 1 : 0;
-        meta.has_solar_coords = opts.has_solar_coords ? 1 : 0;
-        meta.solar_latitude = opts.solar_latitude;
-        meta.solar_longitude = opts.solar_longitude;
-
-        uint8_t *dst = (uint8_t *)mapped;
-        memcpy(dst, &meta, sizeof(meta));
-        dst += sizeof(meta);
-
-        for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-            size_t slen = strlen(opts.outputs[i]) + 1;
-            memcpy(dst, opts.outputs[i], slen);
-            dst += slen;
-        }
-
-        if (img_shader_src && img_shader_len > 0) {
-            memcpy(dst, img_shader_src, img_shader_len);
-            dst += img_shader_len;
-        }
-
-        memcpy(dst, img_pixels, pixel_bytes);
-        munmap(mapped, total_payload_size);
-        (void)fcntl(memfd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_SEAL);
-
-        req_hdr.opcode = WAYWAL_REQ_SET_IMAGE;
-        req_hdr.payload_size = total_payload_size;
-
-        if (!waywal_ipc_send(socket_fd, &req_hdr, memfd)) {
-            fprintf(stderr, "Error: Failed to send image to daemon via SCM_RIGHTS\n");
-            close(memfd);
-            ret_code = 1;
-            break;
-        }
-        close(memfd);
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            if (opts.is_solid_color) {
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
                 printf("Wallpaper cleared to #%02x%02x%02x%02x\n", opts.clear_color.r,
                        opts.clear_color.g, opts.clear_color.b, opts.clear_color.a);
             } else {
-                printf("Wallpaper set: %s (%ux%u)\n", opts.filepath, img_width, img_height);
+                fprintf(stderr, "Error: Daemon failed to clear wallpaper\n");
+                ret_code = 1;
             }
-            if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
-                wallpaper_hook_ran = true;
-                (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
-            }
-        } else {
-            fprintf(stderr, "Error: Daemon rejected image request\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_SLIDESHOW: {
-        waywal_slideshow_payload_t spay;
-        memset(&spay, 0, sizeof(spay));
-        spay.interval_s = opts.slideshow_interval_s;
-        spay.transition_type = opts.transition_type;
-        spay.transition_duration_ms = opts.transition_duration_ms;
-        spay.transition_fps = opts.transition_fps;
-        spay.transition_angle_rad = opts.transition_angle_rad;
-        spay.transition_wave_freq = opts.transition_wave_freq;
-        spay.transition_wave_amp = opts.transition_wave_amp;
-        spay.transition_center_x = opts.transition_pos_x;
-        spay.transition_center_y = opts.transition_pos_y;
-        spay.random_order = opts.slideshow_random;
-        spay.num_target_outputs = opts.num_outputs;
-        for (uint32_t i = 0; i < opts.num_outputs && i < 16; ++i) {
-            strncpy(spay.target_outputs[i], opts.outputs[i], sizeof(spay.target_outputs[i]) - 1);
-        }
-        spay.scaling_mode = opts.scaling_mode;
-        spay.filter_mode = (uint32_t)opts.filter;
-        spay.bezier = opts.bezier;
-        spay.has_custom_bezier = opts.has_custom_bezier;
-        spay.color[0] = opts.clear_color.r;
-        spay.color[1] = opts.clear_color.g;
-        spay.color[2] = opts.clear_color.b;
-        spay.color[3] = opts.clear_color.a;
-        spay.ten_bit = opts.ten_bit;
-        spay.crop_gravity_x = opts.crop_gravity_x;
-        spay.crop_gravity_y = opts.crop_gravity_y;
-        spay.has_crop_gravity = opts.has_crop_gravity ? 1 : 0;
-        spay.invert_y = opts.invert_y ? 1 : 0;
-        spay.pos_y_inverted = opts.pos_y_inverted ? 1 : 0;
-        spay.no_cache = opts.no_cache ? 1u : 0u;
-        spay.extract_theme = opts.extract_theme ? 1u : 0u;
-        spay.no_theme = opts.no_theme ? 1u : 0u;
-        spay.has_theme_mode = opts.has_theme_mode ? 1u : 0u;
-        spay.theme_light_mode = opts.theme_light_mode ? 1u : 0u;
-        spay.has_source_color_index = opts.has_source_color_index ? 1u : 0u;
-        spay.source_color_index = opts.source_color_index;
-        spay.has_seed_color = opts.has_seed_color ? 1u : 0u;
-        spay.seed_color = opts.seed_color;
-        spay.sort_mode = (uint8_t)opts.slideshow_sort;
-        spay.has_sort_mode = opts.has_slideshow_sort ? 1u : 0u;
-        if (opts.has_slideshow_sort) {
-            spay.random_order = (opts.slideshow_sort == WAYWAL_SORT_RANDOM);
-        }
-        const char *ss_target_out = (opts.num_outputs > 0) ? opts.outputs[0] : "*";
-        const waywal_output_rule_t *ss_rule = waywal_config_match_output(&cfg, ss_target_out);
-        if (ss_rule && ss_rule->has_recursive) {
-            spay.no_recursive = ss_rule->recursive ? 0u : 1u;
-        } else if (cfg.daemon.has_slideshow_recursive) {
-            spay.no_recursive = cfg.daemon.slideshow_recursive ? 0u : 1u;
-        }
-        spay.auto_day_night = opts.has_auto_day_night ? (opts.auto_day_night ? 1u : 2u) : 0u;
-        spay.has_solar_coords = opts.has_solar_coords ? 1u : 0u;
-        spay.solar_latitude = opts.solar_latitude;
-        spay.solar_longitude = opts.solar_longitude;
-        char resolved_ss[PATH_MAX];
-        if (realpath(opts.filepath, resolved_ss)) {
-            strncpy(spay.path, resolved_ss, sizeof(spay.path) - 1);
-        } else {
-            strncpy(spay.path, opts.filepath, sizeof(spay.path) - 1);
-        }
-
-        req_hdr.opcode = WAYWAL_REQ_SLIDESHOW;
-        req_hdr.payload_size = sizeof(spay);
-
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-            !client_write_exact(socket_fd, &spay, sizeof(spay))) {
-            fprintf(stderr, "Error: Failed to send slideshow request to daemon\n");
-            ret_code = 1;
-            break;
-        }
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            printf("Slideshow started on '%s' (interval: %us, shuffle: %s)\n", opts.filepath,
-                   opts.slideshow_interval_s, opts.slideshow_random ? "yes" : "no");
-        } else {
-            fprintf(stderr, "Error: Daemon rejected slideshow request (check directory path)\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_SLIDESHOW_CTRL: {
-        waywal_slideshow_ctrl_t sctrl;
-        memset(&sctrl, 0, sizeof(sctrl));
-        sctrl.action = opts.slideshow_action;
-        if (opts.num_outputs > 0) {
-            size_t pos = 0;
-            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-                int n = snprintf(sctrl.target_output + pos, sizeof(sctrl.target_output) - pos,
-                                 "%s%s", (i > 0) ? "," : "", opts.outputs[i]);
-                if (n < 0 || (size_t)n >= sizeof(sctrl.target_output) - pos)
-                    break;
-                pos += (size_t)n;
-            }
-        } else {
-            strncpy(sctrl.target_output, "*", sizeof(sctrl.target_output) - 1);
-        }
-
-        if (opts.slideshow_action == WAYWAL_SLIDESHOW_NEXT) {
-            req_hdr.opcode = WAYWAL_REQ_SLIDESHOW_NEXT;
-        } else if (opts.slideshow_action == WAYWAL_SLIDESHOW_PREV) {
-            req_hdr.opcode = WAYWAL_REQ_SLIDESHOW_PREV;
-        } else {
-            req_hdr.opcode = WAYWAL_REQ_SLIDESHOW_CTRL;
-        }
-        req_hdr.payload_size = sizeof(sctrl);
-
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-            !client_write_exact(socket_fd, &sctrl, sizeof(sctrl))) {
-            fprintf(stderr, "Error: Failed to send slideshow control request\n");
-            ret_code = 1;
-            break;
-        }
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            if (resp.payload_size > 0 && resp.payload_size <= 16384) {
-                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
-            } else {
-                const char *act_name = "action performed";
-                switch (opts.slideshow_action) {
-                case WAYWAL_SLIDESHOW_STOP:
-                    act_name = "stopped";
-                    break;
-                case WAYWAL_SLIDESHOW_PAUSE:
-                    act_name = "paused";
-                    break;
-                case WAYWAL_SLIDESHOW_RESUME:
-                    act_name = "resumed";
-                    break;
-                case WAYWAL_SLIDESHOW_TOGGLE:
-                    act_name = "toggled";
-                    break;
-                case WAYWAL_SLIDESHOW_NEXT:
-                    act_name = "advanced to next";
-                    break;
-                case WAYWAL_SLIDESHOW_PREV:
-                    act_name = "stepped to previous";
-                    break;
-                }
-                printf("Slideshow %s\n", act_name);
-            }
-        } else {
-            fprintf(stderr, "Error: Daemon rejected slideshow control request\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_SHADER: {
-        waywal_shader_payload_t spay;
-        memset(&spay, 0, sizeof(spay));
-
-        if (opts.num_outputs > 0) {
-            size_t pos = 0;
-            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-                int n = snprintf(spay.output + pos, sizeof(spay.output) - pos, "%s%s",
-                                 (i > 0) ? "," : "", opts.outputs[i]);
-                if (n < 0 || (size_t)n >= sizeof(spay.output) - pos)
-                    break;
-                pos += (size_t)n;
-            }
-        } else {
-            strncpy(spay.output, "*", sizeof(spay.output) - 1);
-        }
-
-        char resolved[PATH_MAX];
-        if (realpath(opts.filepath, resolved)) {
-            strncpy(spay.shader_path, resolved, sizeof(spay.shader_path) - 1);
-        } else {
-            strncpy(spay.shader_path, opts.filepath, sizeof(spay.shader_path) - 1);
-        }
-        spay.fps = opts.transition_fps > 0 ? opts.transition_fps : 60;
-        spay.audio_reactive = opts.audio_reactive;
-        spay.scaling_mode = opts.scaling_mode;
-        spay.transition_type = opts.transition_type;
-        spay.transition_duration_ms = opts.transition_duration_ms;
-        spay.transition_fps = opts.transition_fps;
-        spay.transition_angle_rad = opts.transition_angle_rad;
-        spay.transition_wave_freq = opts.transition_wave_freq;
-        spay.transition_wave_amp = opts.transition_wave_amp;
-        spay.transition_center_x = opts.transition_pos_x;
-        spay.transition_center_y = opts.transition_pos_y;
-        spay.bezier = opts.bezier;
-        spay.has_custom_bezier = opts.has_custom_bezier;
-        spay.invert_y = opts.invert_y ? 1 : 0;
-        spay.pos_y_inverted = opts.pos_y_inverted ? 1 : 0;
-        spay.no_cache = opts.no_cache ? 1u : 0u;
-
-        req_hdr.opcode = WAYWAL_REQ_SHADER;
-        req_hdr.payload_size = sizeof(spay);
-
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-            !client_write_exact(socket_fd, &spay, sizeof(spay))) {
-            fprintf(stderr, "Error: Failed to send shader request to daemon\n");
-            ret_code = 1;
-            break;
-        }
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            if (resp.payload_size > 0 && resp.payload_size <= 16384) {
-                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
-            } else {
-                printf("Shader wallpaper active: %s\n", spay.shader_path);
-            }
-            if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
-                wallpaper_hook_ran = true;
-                (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
-            }
-        } else {
-            fprintf(stderr, "Error: Daemon rejected shader request\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_WORKSHOP: {
-        waywal_workshop_payload_t wpay;
-        memset(&wpay, 0, sizeof(wpay));
-
-        if (opts.num_outputs > 0) {
-            size_t pos = 0;
-            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-                int n = snprintf(wpay.output + pos, sizeof(wpay.output) - pos, "%s%s",
-                                 (i > 0) ? "," : "", opts.outputs[i]);
-                if (n < 0 || (size_t)n >= sizeof(wpay.output) - pos)
-                    break;
-                pos += (size_t)n;
-            }
-        } else {
-            strncpy(wpay.output, "*", sizeof(wpay.output) - 1);
-        }
-
-        strncpy(wpay.workshop_dir, opts.filepath, sizeof(wpay.workshop_dir) - 1);
-        strncpy(wpay.prop_overrides, opts.workshop_props, sizeof(wpay.prop_overrides) - 1);
-        wpay.fps = opts.transition_fps > 0 ? opts.transition_fps : 60;
-        wpay.audio_reactive = opts.audio_reactive;
-        wpay.scaling_mode = opts.scaling_mode;
-        wpay.transition_type = opts.transition_type;
-        wpay.transition_duration_ms = opts.transition_duration_ms;
-        wpay.transition_fps = opts.transition_fps;
-        wpay.transition_angle_rad = opts.transition_angle_rad;
-        wpay.transition_wave_freq = opts.transition_wave_freq;
-        wpay.transition_wave_amp = opts.transition_wave_amp;
-        wpay.transition_center_x = opts.transition_pos_x;
-        wpay.transition_center_y = opts.transition_pos_y;
-        wpay.bezier = opts.bezier;
-        wpay.has_custom_bezier = opts.has_custom_bezier;
-        wpay.invert_y = opts.invert_y ? 1 : 0;
-        wpay.pos_y_inverted = opts.pos_y_inverted ? 1 : 0;
-        wpay.no_cache = opts.no_cache ? 1u : 0u;
-        wpay.extract_theme = opts.extract_theme ? 1u : 0u;
-        wpay.no_theme = opts.no_theme ? 1u : 0u;
-        wpay.has_theme_mode = opts.has_theme_mode ? 1u : 0u;
-        wpay.theme_light_mode = opts.theme_light_mode ? 1u : 0u;
-        wpay.has_source_color_index = opts.has_source_color_index ? 1u : 0u;
-        wpay.source_color_index = opts.source_color_index;
-        wpay.has_seed_color = opts.has_seed_color ? 1u : 0u;
-        wpay.client_exported_theme = workshop_theme_applied ? 1u : 0u;
-        wpay.seed_color = opts.seed_color;
-
-        req_hdr.opcode = WAYWAL_REQ_WORKSHOP;
-        req_hdr.payload_size = sizeof(wpay);
-
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-            !client_write_exact(socket_fd, &wpay, sizeof(wpay))) {
-            fprintf(stderr, "Error: Failed to send workshop request to daemon\n");
-            ret_code = 1;
-            break;
-        }
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            if (resp.payload_size > 0 && resp.payload_size <= 16384) {
-                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
-            } else {
-                printf("Workshop wallpaper active: %s\n", wpay.workshop_dir);
-            }
-            if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
-                wallpaper_hook_ran = true;
-                (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
-            }
-        } else {
-            fprintf(stderr, "Error: Daemon rejected workshop request\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_STATS: {
-        req_hdr.opcode = opts.json_output ? WAYWAL_REQ_QUERY_JSON : WAYWAL_REQ_STATS;
-        req_hdr.payload_size = 0;
-
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
-            fprintf(stderr, "Error: Failed to send stats request to daemon\n");
-            ret_code = 1;
-            break;
-        }
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) &&
-            (resp.opcode == WAYWAL_RESP_OK || resp.opcode == WAYWAL_RESP_INFO)) {
-            if (resp.payload_size > 0 && resp.payload_size <= 65536) {
-                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
-            }
-        } else {
-            fprintf(stderr, "Error: Failed to query telemetry stats from daemon\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_SET_UNIFORM: {
-        waywal_set_uniform_payload_t upay;
-        memset(&upay, 0, sizeof(upay));
-        if (opts.num_outputs > 0) {
-            size_t pos = 0;
-            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-                int n = snprintf(upay.output + pos, sizeof(upay.output) - pos, "%s%s",
-                                 (i > 0) ? "," : "", opts.outputs[i]);
-                if (n < 0 || (size_t)n >= sizeof(upay.output) - pos)
-                    break;
-                pos += (size_t)n;
-            }
-        } else {
-            strncpy(upay.output, "*", sizeof(upay.output) - 1);
-        }
-        strncpy(upay.name, opts.uniform_name, sizeof(upay.name) - 1);
-        for (uint32_t i = 0; i < opts.uniform_components && i < 4; ++i) {
-            upay.values[i] = opts.uniform_values[i];
-        }
-        upay.num_components = opts.uniform_components;
-
-        req_hdr.opcode = WAYWAL_REQ_SET_UNIFORM;
-        req_hdr.payload_size = sizeof(upay);
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-            !client_write_exact(socket_fd, &upay, sizeof(upay))) {
-            fprintf(stderr, "Error: Failed to send set-uniform request\n");
-            ret_code = 1;
-            break;
-        }
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            if (resp.payload_size > 0 && resp.payload_size <= 16384) {
-                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
-            }
-        } else {
-            fprintf(stderr, "Error: Daemon rejected set-uniform request\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_AUDIO: {
-        waywal_audio_ctrl_payload_t apay;
-        memset(&apay, 0, sizeof(apay));
-        apay.volume = opts.volume;
-        apay.mute_on_audio = opts.mute_on_audio;
-        apay.theme_from_media = opts.theme_from_media;
-
-        req_hdr.opcode = WAYWAL_REQ_AUDIO_CTRL;
-        req_hdr.payload_size = sizeof(apay);
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-            !client_write_exact(socket_fd, &apay, sizeof(apay))) {
-            fprintf(stderr, "Error: Failed to send audio control request\n");
-            ret_code = 1;
-            break;
-        }
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            if (resp.payload_size > 0 && resp.payload_size <= 16384) {
-                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
-            }
-        } else {
-            fprintf(stderr, "Error: Daemon rejected audio control request\n");
-            ret_code = 1;
-        }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
-
-    case CLI_CMD_SUBSCRIBE: {
-        req_hdr.opcode = WAYWAL_REQ_SUBSCRIBE;
-        req_hdr.payload_size = 0;
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
-            fprintf(stderr, "Error: Failed to send subscribe request\n");
-            ret_code = 1;
-            break;
-        }
-
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (!waywal_ipc_recv(socket_fd, &resp, &attached_fd) || resp.opcode != WAYWAL_RESP_OK) {
             if (attached_fd >= 0)
                 close(attached_fd);
-            fprintf(stderr, "Error: Daemon rejected event subscription\n");
-            ret_code = 1;
             break;
         }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        if (resp.payload_size > 65536) {
-            fprintf(stderr, "Error: Oversized initial subscribe payload\n");
-            ret_code = 1;
-            break;
-        }
-        if (resp.payload_size > 0) {
-            if (!drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true)) {
+
+        case CLI_CMD_VIDEO: {
+            int video_fd = open(effective_video_path, O_RDONLY | O_CLOEXEC);
+            req_hdr.opcode = WAYWAL_REQ_SET_VIDEO;
+
+            size_t outputs_len = 0;
+            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                outputs_len += strlen(opts.outputs[i]) + 1;
+            }
+            size_t video_payload_size = sizeof(waywal_video_payload_t) + outputs_len;
+            uint8_t *video_buf = (uint8_t *)calloc(1, video_payload_size);
+            if (!video_buf) {
+                if (video_fd >= 0)
+                    close(video_fd);
                 ret_code = 1;
                 break;
             }
-            fflush(stdout);
-        }
 
-        for (;;) {
-            waywal_ipc_hdr_t ev_hdr;
-            int ev_fd = -1;
-            if (!waywal_ipc_recv(socket_fd, &ev_hdr, &ev_fd)) {
-                break;
+            waywal_video_payload_t *vpay = (waywal_video_payload_t *)video_buf;
+            vpay->loop_count = opts.video_loop_count;
+            vpay->playback_speed = opts.video_speed;
+            vpay->num_target_outputs = opts.num_outputs;
+            vpay->scaling_mode = opts.scaling_mode;
+            vpay->no_cache = opts.no_cache ? 1u : 0u;
+            char resolved_vid[PATH_MAX];
+            if (realpath(effective_video_path, resolved_vid)) {
+                strncpy(vpay->filepath, resolved_vid, sizeof(vpay->filepath) - 1);
+            } else {
+                strncpy(vpay->filepath, effective_video_path, sizeof(vpay->filepath) - 1);
             }
-            if (ev_fd >= 0)
-                close(ev_fd);
-            if (ev_hdr.payload_size > 65536) {
-                break;
+
+            char *optr = (char *)video_buf + sizeof(waywal_video_payload_t);
+            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                size_t slen = strlen(opts.outputs[i]) + 1;
+                memcpy(optr, opts.outputs[i], slen);
+                optr += slen;
             }
-            if (ev_hdr.payload_size > 0) {
-                bool print_ev = (ev_hdr.opcode == WAYWAL_RESP_EVENT);
-                if (!drain_and_print_reply(socket_fd, (size_t)ev_hdr.payload_size, print_ev)) {
+
+            req_hdr.payload_size = video_payload_size;
+
+            if (video_fd >= 0) {
+                if (!waywal_ipc_send(socket_fd, &req_hdr, video_fd)) {
+                    fprintf(stderr, "Error: Failed to send video fd to daemon\n");
+                    close(video_fd);
+                    free(video_buf);
+                    ret_code = 1;
                     break;
                 }
-                if (print_ev) {
-                    fflush(stdout);
+                close(video_fd);
+                (void)client_write_exact(socket_fd, video_buf, video_payload_size);
+            } else {
+                if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+                    !client_write_exact(socket_fd, video_buf, video_payload_size)) {
+                    fprintf(stderr, "Error: Failed to send video request to daemon\n");
+                    free(video_buf);
+                    ret_code = 1;
+                    break;
                 }
             }
-        }
-        ns_idx = ns_count;
-        break;
-    }
+            free(video_buf);
 
-    case CLI_CMD_RESTORE: {
-        req_hdr.opcode = WAYWAL_REQ_RESTORE;
-        req_hdr.payload_size = 0;
-
-        if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
-            fprintf(stderr, "Error: Failed to send restore request to daemon\n");
-            ret_code = 1;
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                printf("Playing video wallpaper: %s\n", opts.filepath);
+                if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
+                    wallpaper_hook_ran = true;
+                    (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
+                }
+            } else {
+                fprintf(
+                    stderr,
+                    "Error: Daemon rejected video request (check if video format is supported)\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
             break;
         }
 
-        waywal_ipc_hdr_t resp;
-        int attached_fd = -1;
-        if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-            if (resp.payload_size > 0 && resp.payload_size <= 16384) {
-                (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
-            } else {
-                printf("OK: State restored\n");
+        case CLI_CMD_PAUSE: {
+            req_hdr.opcode = WAYWAL_REQ_PAUSE;
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+                fprintf(stderr, "Error: Failed to send pause request\n");
+                ret_code = 1;
+                break;
             }
-        } else {
-            fprintf(stderr, "Error: Daemon failed to restore state\n");
-            ret_code = 1;
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                printf("Video playback paused\n");
+            } else {
+                fprintf(stderr, "Error: Unexpected response to pause request\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
         }
-        if (attached_fd >= 0)
-            close(attached_fd);
-        break;
-    }
 
-    default:
-        break;
-    }
+        case CLI_CMD_UNPAUSE: {
+            req_hdr.opcode = WAYWAL_REQ_UNPAUSE;
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+                fprintf(stderr, "Error: Failed to send unpause request\n");
+                ret_code = 1;
+                break;
+            }
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                printf("Video playback resumed\n");
+            } else {
+                fprintf(stderr, "Error: Unexpected response to unpause request\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
 
-    close(socket_fd);
+        case CLI_CMD_TOGGLE: {
+            req_hdr.opcode = WAYWAL_REQ_TOGGLE;
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+                fprintf(stderr, "Error: Failed to send toggle request\n");
+                ret_code = 1;
+                break;
+            }
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                printf("Video playback toggled\n");
+            } else {
+                fprintf(stderr, "Error: Unexpected response to toggle request\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        case CLI_CMD_KILL: {
+            req_hdr.opcode = WAYWAL_REQ_KILL;
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+                fprintf(stderr, "Error: Failed to send kill request\n");
+                ret_code = 1;
+                break;
+            }
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                printf("wwald daemon terminated cleanly\n");
+            } else {
+                fprintf(stderr, "Error: Unexpected response to kill command\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        case CLI_CMD_IMG: {
+            size_t outputs_len = 0;
+            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                outputs_len += strlen(opts.outputs[i]) + 1;
+            }
+            size_t extra_bytes = outputs_len + img_shader_len;
+            size_t pixel_bytes = (size_t)img_width * img_height * 4;
+            size_t total_payload_size = sizeof(waywal_img_metadata_t) + extra_bytes + pixel_bytes;
+
+            int memfd = waywal_create_memfd("wwal-client-img", total_payload_size,
+                                            F_SEAL_SHRINK | F_SEAL_GROW);
+            if (memfd < 0) {
+                fprintf(stderr, "Error: Failed to create sealed memfd for image\n");
+                ret_code = 1;
+                break;
+            }
+
+            void *mapped =
+                mmap(NULL, total_payload_size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+            if (mapped == MAP_FAILED) {
+                fprintf(stderr, "Error: mmap failed on client memfd\n");
+                close(memfd);
+                ret_code = 1;
+                break;
+            }
+#ifdef MADV_HUGEPAGE
+            (void)madvise(mapped, total_payload_size, MADV_HUGEPAGE);
+#endif
+
+            waywal_img_metadata_t meta;
+            memset(&meta, 0, sizeof(meta));
+            meta.width = img_width;
+            meta.height = img_height;
+            meta.pixel_format =
+                opts.enable_10bit ? WAYWAL_FORMAT_XRGB2101010 : WAYWAL_FORMAT_ARGB8888;
+            meta.transition_type = opts.transition_type;
+            meta.transition_duration_ms = opts.transition_duration_ms;
+            meta.transition_fps = opts.transition_fps;
+            meta.transition_angle_rad = opts.transition_angle_rad;
+            meta.transition_wave_freq = opts.transition_wave_freq;
+            meta.transition_wave_amp = opts.transition_wave_amp;
+            meta.transition_center_x = opts.transition_pos_x;
+            meta.transition_center_y = opts.transition_pos_y;
+            meta.color[0] = opts.clear_color.r;
+            meta.color[1] = opts.clear_color.g;
+            meta.color[2] = opts.clear_color.b;
+            meta.color[3] = opts.clear_color.a;
+            meta.num_target_outputs = opts.num_outputs;
+            meta.sync_mode = opts.sync_mode;
+            meta.stagger_delay_ms = opts.stagger_delay_ms;
+            meta.custom_shader_len = (uint32_t)img_shader_len;
+            meta.extra_data_len = (uint32_t)extra_bytes;
+            meta.scaling_mode = opts.scaling_mode;
+            meta.filter_mode = (uint32_t)opts.filter;
+            meta.bezier = opts.bezier;
+            meta.has_custom_bezier = opts.has_custom_bezier;
+            meta.ten_bit = opts.ten_bit;
+            meta.extract_theme = opts.extract_theme;
+            meta.no_theme = opts.no_theme;
+            meta.theme_light_mode = opts.theme_light_mode;
+            if (opts.depth_map_path[0] != '\0') {
+                char resolved_dm[PATH_MAX];
+                if (realpath(opts.depth_map_path, resolved_dm)) {
+                    strncpy(meta.depth_map_path, resolved_dm, sizeof(meta.depth_map_path) - 1);
+                } else {
+                    strncpy(meta.depth_map_path, opts.depth_map_path,
+                            sizeof(meta.depth_map_path) - 1);
+                }
+            }
+            strncpy(meta.backdrop, opts.backdrop, sizeof(meta.backdrop) - 1);
+            strncpy(meta.layer_name, opts.layer_name, sizeof(meta.layer_name) - 1);
+            strncpy(meta.battery_policy, opts.battery_policy, sizeof(meta.battery_policy) - 1);
+            if (!opts.read_stdin && !opts.is_solid_color && opts.filepath[0] != '\0') {
+                char resolved_img[PATH_MAX];
+                if (realpath(opts.filepath, resolved_img)) {
+                    strncpy(meta.filepath, resolved_img, sizeof(meta.filepath) - 1);
+                } else {
+                    strncpy(meta.filepath, opts.filepath, sizeof(meta.filepath) - 1);
+                }
+            }
+            meta.depth_strength = opts.depth_strength > 0.0f ? opts.depth_strength : 1.0f;
+            meta.crop_gravity_x = opts.crop_gravity_x;
+            meta.crop_gravity_y = opts.crop_gravity_y;
+            meta.has_crop_gravity = opts.has_crop_gravity ? 1 : 0;
+            meta.invert_y = opts.invert_y ? 1 : 0;
+            meta.no_cache = opts.no_cache ? 1 : 0;
+            meta.is_solid_color = opts.is_solid_color ? 1 : 0;
+            meta.pos_y_inverted = opts.pos_y_inverted ? 1 : 0;
+            meta.source_color_index = opts.source_color_index;
+            meta.has_source_color_index = opts.has_source_color_index ? 1 : 0;
+            meta.has_seed_color = opts.has_seed_color ? 1 : 0;
+            meta.seed_color = opts.seed_color;
+            meta.has_theme_mode = opts.has_theme_mode ? 1 : 0;
+            meta.client_exported_theme = img_theme_exported ? 1 : 0;
+            meta.has_auto_day_night = opts.has_auto_day_night ? 1 : 0;
+            meta.auto_day_night = opts.auto_day_night ? 1 : 0;
+            meta.has_solar_coords = opts.has_solar_coords ? 1 : 0;
+            meta.solar_latitude = opts.solar_latitude;
+            meta.solar_longitude = opts.solar_longitude;
+
+            uint8_t *dst = (uint8_t *)mapped;
+            memcpy(dst, &meta, sizeof(meta));
+            dst += sizeof(meta);
+
+            for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                size_t slen = strlen(opts.outputs[i]) + 1;
+                memcpy(dst, opts.outputs[i], slen);
+                dst += slen;
+            }
+
+            if (img_shader_src && img_shader_len > 0) {
+                memcpy(dst, img_shader_src, img_shader_len);
+                dst += img_shader_len;
+            }
+
+            memcpy(dst, img_pixels, pixel_bytes);
+            munmap(mapped, total_payload_size);
+            (void)fcntl(memfd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_SEAL);
+
+            req_hdr.opcode = WAYWAL_REQ_SET_IMAGE;
+            req_hdr.payload_size = total_payload_size;
+
+            if (!waywal_ipc_send(socket_fd, &req_hdr, memfd)) {
+                fprintf(stderr, "Error: Failed to send image to daemon via SCM_RIGHTS\n");
+                close(memfd);
+                ret_code = 1;
+                break;
+            }
+            close(memfd);
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (opts.is_solid_color) {
+                    printf("Wallpaper cleared to #%02x%02x%02x%02x\n", opts.clear_color.r,
+                           opts.clear_color.g, opts.clear_color.b, opts.clear_color.a);
+                } else {
+                    printf("Wallpaper set: %s (%ux%u)\n", opts.filepath, img_width, img_height);
+                }
+                if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
+                    wallpaper_hook_ran = true;
+                    (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
+                }
+            } else {
+                fprintf(stderr, "Error: Daemon rejected image request\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        case CLI_CMD_SLIDESHOW: {
+            waywal_slideshow_payload_t spay;
+            memset(&spay, 0, sizeof(spay));
+            spay.interval_s = opts.slideshow_interval_s;
+            spay.transition_type = opts.transition_type;
+            spay.transition_duration_ms = opts.transition_duration_ms;
+            spay.transition_fps = opts.transition_fps;
+            spay.transition_angle_rad = opts.transition_angle_rad;
+            spay.transition_wave_freq = opts.transition_wave_freq;
+            spay.transition_wave_amp = opts.transition_wave_amp;
+            spay.transition_center_x = opts.transition_pos_x;
+            spay.transition_center_y = opts.transition_pos_y;
+            spay.random_order = opts.slideshow_random;
+            spay.num_target_outputs = opts.num_outputs;
+            for (uint32_t i = 0; i < opts.num_outputs && i < 16; ++i) {
+                strncpy(spay.target_outputs[i], opts.outputs[i],
+                        sizeof(spay.target_outputs[i]) - 1);
+            }
+            spay.scaling_mode = opts.scaling_mode;
+            spay.filter_mode = (uint32_t)opts.filter;
+            spay.bezier = opts.bezier;
+            spay.has_custom_bezier = opts.has_custom_bezier;
+            spay.color[0] = opts.clear_color.r;
+            spay.color[1] = opts.clear_color.g;
+            spay.color[2] = opts.clear_color.b;
+            spay.color[3] = opts.clear_color.a;
+            spay.ten_bit = opts.ten_bit;
+            spay.crop_gravity_x = opts.crop_gravity_x;
+            spay.crop_gravity_y = opts.crop_gravity_y;
+            spay.has_crop_gravity = opts.has_crop_gravity ? 1 : 0;
+            spay.invert_y = opts.invert_y ? 1 : 0;
+            spay.pos_y_inverted = opts.pos_y_inverted ? 1 : 0;
+            spay.no_cache = opts.no_cache ? 1u : 0u;
+            spay.extract_theme = opts.extract_theme ? 1u : 0u;
+            spay.no_theme = opts.no_theme ? 1u : 0u;
+            spay.has_theme_mode = opts.has_theme_mode ? 1u : 0u;
+            spay.theme_light_mode = opts.theme_light_mode ? 1u : 0u;
+            spay.has_source_color_index = opts.has_source_color_index ? 1u : 0u;
+            spay.source_color_index = opts.source_color_index;
+            spay.has_seed_color = opts.has_seed_color ? 1u : 0u;
+            spay.seed_color = opts.seed_color;
+            spay.sort_mode = (uint8_t)opts.slideshow_sort;
+            spay.has_sort_mode = opts.has_slideshow_sort ? 1u : 0u;
+            if (opts.has_slideshow_sort) {
+                spay.random_order = (opts.slideshow_sort == WAYWAL_SORT_RANDOM);
+            }
+            const char *ss_target_out = (opts.num_outputs > 0) ? opts.outputs[0] : "*";
+            const waywal_output_rule_t *ss_rule = waywal_config_match_output(&cfg, ss_target_out);
+            if (opts.has_slideshow_recursive) {
+                spay.no_recursive = opts.slideshow_recursive ? 0u : 1u;
+            } else if (ss_rule && ss_rule->has_recursive) {
+                spay.no_recursive = ss_rule->recursive ? 0u : 1u;
+            } else if (cfg.daemon.has_slideshow_recursive) {
+                spay.no_recursive = cfg.daemon.slideshow_recursive ? 0u : 1u;
+            }
+            spay.auto_day_night = opts.has_auto_day_night ? (opts.auto_day_night ? 1u : 2u) : 0u;
+            spay.has_solar_coords = opts.has_solar_coords ? 1u : 0u;
+            spay.solar_latitude = opts.solar_latitude;
+            spay.solar_longitude = opts.solar_longitude;
+            char resolved_ss[PATH_MAX];
+            if (realpath(opts.filepath, resolved_ss)) {
+                strncpy(spay.path, resolved_ss, sizeof(spay.path) - 1);
+            } else {
+                strncpy(spay.path, opts.filepath, sizeof(spay.path) - 1);
+            }
+
+            req_hdr.opcode = WAYWAL_REQ_SLIDESHOW;
+            req_hdr.payload_size = sizeof(spay);
+
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+                !client_write_exact(socket_fd, &spay, sizeof(spay))) {
+                fprintf(stderr, "Error: Failed to send slideshow request to daemon\n");
+                ret_code = 1;
+                break;
+            }
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                printf("Slideshow started on '%s' (interval: %us, shuffle: %s)\n", opts.filepath,
+                       opts.slideshow_interval_s, opts.slideshow_random ? "yes" : "no");
+            } else {
+                fprintf(stderr,
+                        "Error: Daemon rejected slideshow request (check directory path)\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        case CLI_CMD_SLIDESHOW_CTRL: {
+            waywal_slideshow_ctrl_t sctrl;
+            memset(&sctrl, 0, sizeof(sctrl));
+            sctrl.action = opts.slideshow_action;
+            if (opts.num_outputs > 0) {
+                size_t pos = 0;
+                for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                    int n = snprintf(sctrl.target_output + pos, sizeof(sctrl.target_output) - pos,
+                                     "%s%s", (i > 0) ? "," : "", opts.outputs[i]);
+                    if (n < 0 || (size_t)n >= sizeof(sctrl.target_output) - pos)
+                        break;
+                    pos += (size_t)n;
+                }
+            } else {
+                strncpy(sctrl.target_output, "*", sizeof(sctrl.target_output) - 1);
+            }
+
+            if (opts.slideshow_action == WAYWAL_SLIDESHOW_NEXT) {
+                req_hdr.opcode = WAYWAL_REQ_SLIDESHOW_NEXT;
+            } else if (opts.slideshow_action == WAYWAL_SLIDESHOW_PREV) {
+                req_hdr.opcode = WAYWAL_REQ_SLIDESHOW_PREV;
+            } else {
+                req_hdr.opcode = WAYWAL_REQ_SLIDESHOW_CTRL;
+            }
+            req_hdr.payload_size = sizeof(sctrl);
+
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+                !client_write_exact(socket_fd, &sctrl, sizeof(sctrl))) {
+                fprintf(stderr, "Error: Failed to send slideshow control request\n");
+                ret_code = 1;
+                break;
+            }
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+                } else {
+                    const char *act_name = "action performed";
+                    switch (opts.slideshow_action) {
+                    case WAYWAL_SLIDESHOW_STOP:
+                        act_name = "stopped";
+                        break;
+                    case WAYWAL_SLIDESHOW_PAUSE:
+                        act_name = "paused";
+                        break;
+                    case WAYWAL_SLIDESHOW_RESUME:
+                        act_name = "resumed";
+                        break;
+                    case WAYWAL_SLIDESHOW_TOGGLE:
+                        act_name = "toggled";
+                        break;
+                    case WAYWAL_SLIDESHOW_NEXT:
+                        act_name = "advanced to next";
+                        break;
+                    case WAYWAL_SLIDESHOW_PREV:
+                        act_name = "stepped to previous";
+                        break;
+                    }
+                    printf("Slideshow %s\n", act_name);
+                }
+            } else {
+                fprintf(stderr, "Error: Daemon rejected slideshow control request\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        case CLI_CMD_SHADER: {
+            waywal_shader_payload_t spay;
+            memset(&spay, 0, sizeof(spay));
+
+            if (opts.num_outputs > 0) {
+                size_t pos = 0;
+                for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                    int n = snprintf(spay.output + pos, sizeof(spay.output) - pos, "%s%s",
+                                     (i > 0) ? "," : "", opts.outputs[i]);
+                    if (n < 0 || (size_t)n >= sizeof(spay.output) - pos)
+                        break;
+                    pos += (size_t)n;
+                }
+            } else {
+                strncpy(spay.output, "*", sizeof(spay.output) - 1);
+            }
+
+            char resolved[PATH_MAX];
+            if (realpath(opts.filepath, resolved)) {
+                strncpy(spay.shader_path, resolved, sizeof(spay.shader_path) - 1);
+            } else {
+                strncpy(spay.shader_path, opts.filepath, sizeof(spay.shader_path) - 1);
+            }
+            spay.fps = opts.transition_fps > 0 ? opts.transition_fps : 60;
+            spay.audio_reactive = opts.audio_reactive;
+            spay.scaling_mode = opts.scaling_mode;
+            spay.transition_type = opts.transition_type;
+            spay.transition_duration_ms = opts.transition_duration_ms;
+            spay.transition_fps = opts.transition_fps;
+            spay.transition_angle_rad = opts.transition_angle_rad;
+            spay.transition_wave_freq = opts.transition_wave_freq;
+            spay.transition_wave_amp = opts.transition_wave_amp;
+            spay.transition_center_x = opts.transition_pos_x;
+            spay.transition_center_y = opts.transition_pos_y;
+            spay.bezier = opts.bezier;
+            spay.has_custom_bezier = opts.has_custom_bezier;
+            spay.invert_y = opts.invert_y ? 1 : 0;
+            spay.pos_y_inverted = opts.pos_y_inverted ? 1 : 0;
+            spay.no_cache = opts.no_cache ? 1u : 0u;
+
+            req_hdr.opcode = WAYWAL_REQ_SHADER;
+            req_hdr.payload_size = sizeof(spay);
+
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+                !client_write_exact(socket_fd, &spay, sizeof(spay))) {
+                fprintf(stderr, "Error: Failed to send shader request to daemon\n");
+                ret_code = 1;
+                break;
+            }
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+                } else {
+                    printf("Shader wallpaper active: %s\n", spay.shader_path);
+                }
+                if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
+                    wallpaper_hook_ran = true;
+                    (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
+                }
+            } else {
+                fprintf(stderr, "Error: Daemon rejected shader request\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        case CLI_CMD_WORKSHOP: {
+            waywal_workshop_payload_t wpay;
+            memset(&wpay, 0, sizeof(wpay));
+
+            if (opts.num_outputs > 0) {
+                size_t pos = 0;
+                for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                    int n = snprintf(wpay.output + pos, sizeof(wpay.output) - pos, "%s%s",
+                                     (i > 0) ? "," : "", opts.outputs[i]);
+                    if (n < 0 || (size_t)n >= sizeof(wpay.output) - pos)
+                        break;
+                    pos += (size_t)n;
+                }
+            } else {
+                strncpy(wpay.output, "*", sizeof(wpay.output) - 1);
+            }
+
+            strncpy(wpay.workshop_dir, opts.filepath, sizeof(wpay.workshop_dir) - 1);
+            strncpy(wpay.prop_overrides, opts.workshop_props, sizeof(wpay.prop_overrides) - 1);
+            wpay.fps = opts.transition_fps > 0 ? opts.transition_fps : 60;
+            wpay.audio_reactive = opts.audio_reactive;
+            wpay.scaling_mode = opts.scaling_mode;
+            wpay.transition_type = opts.transition_type;
+            wpay.transition_duration_ms = opts.transition_duration_ms;
+            wpay.transition_fps = opts.transition_fps;
+            wpay.transition_angle_rad = opts.transition_angle_rad;
+            wpay.transition_wave_freq = opts.transition_wave_freq;
+            wpay.transition_wave_amp = opts.transition_wave_amp;
+            wpay.transition_center_x = opts.transition_pos_x;
+            wpay.transition_center_y = opts.transition_pos_y;
+            wpay.bezier = opts.bezier;
+            wpay.has_custom_bezier = opts.has_custom_bezier;
+            wpay.invert_y = opts.invert_y ? 1 : 0;
+            wpay.pos_y_inverted = opts.pos_y_inverted ? 1 : 0;
+            wpay.no_cache = opts.no_cache ? 1u : 0u;
+            wpay.extract_theme = opts.extract_theme ? 1u : 0u;
+            wpay.no_theme = opts.no_theme ? 1u : 0u;
+            wpay.has_theme_mode = opts.has_theme_mode ? 1u : 0u;
+            wpay.theme_light_mode = opts.theme_light_mode ? 1u : 0u;
+            wpay.has_source_color_index = opts.has_source_color_index ? 1u : 0u;
+            wpay.source_color_index = opts.source_color_index;
+            wpay.has_seed_color = opts.has_seed_color ? 1u : 0u;
+            wpay.client_exported_theme = workshop_theme_applied ? 1u : 0u;
+            wpay.seed_color = opts.seed_color;
+
+            req_hdr.opcode = WAYWAL_REQ_WORKSHOP;
+            req_hdr.payload_size = sizeof(wpay);
+
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+                !client_write_exact(socket_fd, &wpay, sizeof(wpay))) {
+                fprintf(stderr, "Error: Failed to send workshop request to daemon\n");
+                ret_code = 1;
+                break;
+            }
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+                } else {
+                    printf("Workshop wallpaper active: %s\n", wpay.workshop_dir);
+                }
+                if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
+                    wallpaper_hook_ran = true;
+                    (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
+                }
+            } else {
+                fprintf(stderr, "Error: Daemon rejected workshop request\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        case CLI_CMD_STATS: {
+            req_hdr.opcode = opts.json_output ? WAYWAL_REQ_QUERY_JSON : WAYWAL_REQ_STATS;
+            req_hdr.payload_size = 0;
+
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+                fprintf(stderr, "Error: Failed to send stats request to daemon\n");
+                ret_code = 1;
+                break;
+            }
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) &&
+                (resp.opcode == WAYWAL_RESP_OK || resp.opcode == WAYWAL_RESP_INFO)) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+                }
+            } else {
+                fprintf(stderr, "Error: Failed to query telemetry stats from daemon\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        case CLI_CMD_SET_UNIFORM: {
+            waywal_set_uniform_payload_t upay;
+            memset(&upay, 0, sizeof(upay));
+            if (opts.num_outputs > 0) {
+                size_t pos = 0;
+                for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                    int n = snprintf(upay.output + pos, sizeof(upay.output) - pos, "%s%s",
+                                     (i > 0) ? "," : "", opts.outputs[i]);
+                    if (n < 0 || (size_t)n >= sizeof(upay.output) - pos)
+                        break;
+                    pos += (size_t)n;
+                }
+            } else {
+                strncpy(upay.output, "*", sizeof(upay.output) - 1);
+            }
+            strncpy(upay.name, opts.uniform_name, sizeof(upay.name) - 1);
+            for (uint32_t i = 0; i < opts.uniform_components && i < 4; ++i) {
+                upay.values[i] = opts.uniform_values[i];
+            }
+            upay.num_components = opts.uniform_components;
+
+            req_hdr.opcode = WAYWAL_REQ_SET_UNIFORM;
+            req_hdr.payload_size = sizeof(upay);
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+                !client_write_exact(socket_fd, &upay, sizeof(upay))) {
+                fprintf(stderr, "Error: Failed to send set-uniform request\n");
+                ret_code = 1;
+                break;
+            }
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+                }
+            } else {
+                fprintf(stderr, "Error: Daemon rejected set-uniform request\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        case CLI_CMD_AUDIO: {
+            waywal_audio_ctrl_payload_t apay;
+            memset(&apay, 0, sizeof(apay));
+            apay.volume = opts.volume;
+            apay.mute_on_audio = opts.mute_on_audio;
+            apay.theme_from_media = opts.theme_from_media;
+
+            req_hdr.opcode = WAYWAL_REQ_AUDIO_CTRL;
+            req_hdr.payload_size = sizeof(apay);
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
+                !client_write_exact(socket_fd, &apay, sizeof(apay))) {
+                fprintf(stderr, "Error: Failed to send audio control request\n");
+                ret_code = 1;
+                break;
+            }
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+                }
+            } else {
+                fprintf(stderr, "Error: Daemon rejected audio control request\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        case CLI_CMD_SUBSCRIBE: {
+            req_hdr.opcode = WAYWAL_REQ_SUBSCRIBE;
+            req_hdr.payload_size = 0;
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+                fprintf(stderr, "Error: Failed to send subscribe request\n");
+                ret_code = 1;
+                break;
+            }
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (!waywal_ipc_recv(socket_fd, &resp, &attached_fd) || resp.opcode != WAYWAL_RESP_OK) {
+                if (attached_fd >= 0)
+                    close(attached_fd);
+                fprintf(stderr, "Error: Daemon rejected event subscription\n");
+                ret_code = 1;
+                break;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            if (resp.payload_size > 65536) {
+                fprintf(stderr, "Error: Oversized initial subscribe payload\n");
+                ret_code = 1;
+                break;
+            }
+            if (resp.payload_size > 0) {
+                if (!drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true)) {
+                    ret_code = 1;
+                    break;
+                }
+                fflush(stdout);
+            }
+
+            for (;;) {
+                waywal_ipc_hdr_t ev_hdr;
+                int ev_fd = -1;
+                if (!waywal_ipc_recv(socket_fd, &ev_hdr, &ev_fd)) {
+                    break;
+                }
+                if (ev_fd >= 0)
+                    close(ev_fd);
+                if (ev_hdr.payload_size > 65536) {
+                    break;
+                }
+                if (ev_hdr.payload_size > 0) {
+                    bool print_ev = (ev_hdr.opcode == WAYWAL_RESP_EVENT);
+                    if (!drain_and_print_reply(socket_fd, (size_t)ev_hdr.payload_size, print_ev)) {
+                        break;
+                    }
+                    if (print_ev) {
+                        fflush(stdout);
+                    }
+                }
+            }
+            ns_idx = ns_count;
+            break;
+        }
+
+        case CLI_CMD_RESTORE: {
+            req_hdr.opcode = WAYWAL_REQ_RESTORE;
+            req_hdr.payload_size = 0;
+
+            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+                fprintf(stderr, "Error: Failed to send restore request to daemon\n");
+                ret_code = 1;
+                break;
+            }
+
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+                } else {
+                    printf("OK: State restored\n");
+                }
+            } else {
+                fprintf(stderr, "Error: Daemon failed to restore state\n");
+                ret_code = 1;
+            }
+            if (attached_fd >= 0)
+                close(attached_fd);
+            break;
+        }
+
+        default:
+            break;
+        }
+
+        close(socket_fd);
     }
 
     if (img_pixels) {

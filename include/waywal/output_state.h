@@ -3,6 +3,9 @@
 #define WAYWAL_OUTPUT_STATE_H
 
 #include "waywal/dmabuf.h"
+#ifndef WAYWAL_DMABUF_RING_SIZE
+#define WAYWAL_DMABUF_RING_SIZE 4
+#endif
 #include "waywal/ipc_proto.h"
 #include "waywal/presentation.h"
 #include "waywal/render_engine.h"
@@ -93,6 +96,7 @@ struct output_node {
     bool has_source_old_bo;
     bool has_source_new_bo;
     dmabuf_bo_t *last_presented_bo;
+    int last_committed_ring_idx;
 
     struct waywal_shader_engine *shader_eng;
     bool shader_active;
@@ -137,6 +141,10 @@ struct output_node {
     uint32_t transition_current_frame;
     uint32_t transition_total_frames;
     uint32_t transition_delay_frames;
+    uint64_t transition_start_ns;
+    uint64_t transition_last_tick_ns;
+    uint64_t transition_duration_ns;
+    float transition_progress_linear;
     waywal_transition_params_t transition_params;
 
     /* Dynamic Cursor Tracking & Spring Filter */

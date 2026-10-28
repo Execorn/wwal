@@ -200,9 +200,6 @@ bool waywal_state_store_save_at(const waywal_state_store_t *store, const char *f
     }
 
     bool ok = write_all_bytes(fd, &snapshot, sizeof(snapshot));
-    if (ok && fdatasync(fd) != 0) {
-        ok = false;
-    }
     close(fd);
 
     if (!ok) {
@@ -542,9 +539,8 @@ bool waywal_render_shader_preview_bgra(const char *shader_path, uint8_t *out_bgr
     if (shader_path && shader_path[0] != '\0') {
         char resolved_sh[WAYWAL_PATH_MAX];
         const char *effective_sh =
-            waywal_shader_resolve_path(shader_path, resolved_sh, sizeof(resolved_sh))
-                ? resolved_sh
-                : shader_path;
+            waywal_shader_resolve_path(shader_path, resolved_sh, sizeof(resolved_sh)) ? resolved_sh
+                                                                                      : shader_path;
         for (const unsigned char *p = (const unsigned char *)effective_sh; *p; ++p) {
             hash ^= (uint64_t)(*p);
             hash *= 1099511628211ULL;
@@ -595,12 +591,12 @@ bool waywal_render_shader_preview_bgra(const char *shader_path, uint8_t *out_bgr
             float u = (float)x / (float)(width > 1 ? width - 1 : 1);
             float w1 = 0.5f + 0.5f * sinf(u * 4.5f + phase_x + cosf(v * 3.5f + phase_y));
             float w2 = 0.5f + 0.5f * cosf((u - v) * 5.0f - phase_x);
-            float r = stops[0][0] * (1.0f - w1) + stops[1][0] * w1 * (1.0f - w2) +
-                      stops[2][0] * w1 * w2;
-            float g = stops[0][1] * (1.0f - w1) + stops[1][1] * w1 * (1.0f - w2) +
-                      stops[2][1] * w1 * w2;
-            float b = stops[0][2] * (1.0f - w1) + stops[1][2] * w1 * (1.0f - w2) +
-                      stops[2][2] * w1 * w2;
+            float r =
+                stops[0][0] * (1.0f - w1) + stops[1][0] * w1 * (1.0f - w2) + stops[2][0] * w1 * w2;
+            float g =
+                stops[0][1] * (1.0f - w1) + stops[1][1] * w1 * (1.0f - w2) + stops[2][1] * w1 * w2;
+            float b =
+                stops[0][2] * (1.0f - w1) + stops[1][2] * w1 * (1.0f - w2) + stops[2][2] * w1 * w2;
 
             float dx = u - 0.5f;
             float dy = v - 0.5f;
@@ -873,7 +869,25 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
                      home);
         }
         if (cael_file[0] != '\0') {
-            (void)write_text_file_atomic(cael_file, symlink_target, strlen(symlink_target));
+            bool already_matches = false;
+            int rfd = open(cael_file, O_RDONLY | O_CLOEXEC);
+            if (rfd >= 0) {
+                char existing[WAYWAL_PATH_MAX];
+                ssize_t rlen = read(rfd, existing, sizeof(existing) - 1);
+                close(rfd);
+                if (rlen >= 0) {
+                    existing[rlen] = '\0';
+                    while (rlen > 0 && (existing[rlen - 1] == '\n' || existing[rlen - 1] == '\r')) {
+                        existing[--rlen] = '\0';
+                    }
+                    if (strcmp(existing, symlink_target) == 0) {
+                        already_matches = true;
+                    }
+                }
+            }
+            if (!already_matches) {
+                (void)write_text_file_atomic(cael_file, symlink_target, strlen(symlink_target));
+            }
         }
     }
 

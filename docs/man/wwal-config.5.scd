@@ -69,7 +69,7 @@ Controls core *wwald*(1) lifecycle, layer-shell behavior, and Zero-Watt power go
 	Dynamically extract Material Design 3 palettes from active D-Bus *MPRIS2* media player album art (default: *false*).
 
 *recursive* = <bool>
-	Scan slideshow directories recursively by default (default: *false*).
+	Scan slideshow directories recursively by default (default: *true*).
 
 ## [theme]
 
@@ -143,7 +143,7 @@ Sets default parameters for GPU compute and CPU SIMD wallpaper transitions.
 	Default transition effect: *none*, *simple*, *fade*, *wipe*, *grow*, *outer*, *wave*, *noise*, *crosszoom*, *slide*, *glitch*, *burn*, *ripple*, *pixelate*, *doom*, *swirl*, *cube*, *luma*, *light_leak*, *page_curl*, *custom*, *left*, *right*, *top*, *bottom*, *center*, *any*, or *random* (default: *"fade"*).
 
 *duration* = <float>
-	Transition duration in seconds as an unquoted floating-point number such as *0.75* or *1.2* (default: *0.7*).
+	Transition duration in seconds as an unquoted floating-point number such as *0.75* or *1.2* (default: *1.2*).
 
 *fps* = <int>
 	Target transition frame rate (default: *60*).
@@ -183,7 +183,7 @@ Sets global default parameters for mixed-media directory slideshows.
 	Default traversal order for slideshow directories (*name* is an alias for *ascending*).
 
 *recursive* = <bool>
-	Scan slideshow directories recursively (default: *false*).
+	Scan slideshow directories recursively (default: *true*).
 
 ## [solar] & [[schedule]]
 
@@ -258,7 +258,7 @@ Configures initial wallpaper, video, shader, Workshop scene, or slideshow settin
 	Per-output slideshow sort order.
 
 *recursive* = <bool>
-	Scan the output's slideshow directory recursively (default: *false*).
+	Scan the output's slideshow directory recursively (default: *true*).
 
 *audio* = <bool>
 	Enable PipeWire Bark FFT audio capture when *mode = "shader"* or *mode = "workshop"* (default: *false*).

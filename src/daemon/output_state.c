@@ -139,6 +139,7 @@ void output_manager_destroy(output_manager_t *om)
             }
             dmabuf_ring_destroy(om->dmabuf_ctx, &cur->dmabuf_ring);
             cur->use_dmabuf = false;
+            cur->last_committed_ring_idx = -1;
         }
 
         presentation_sync_destroy(&cur->pres_sync);
@@ -172,6 +173,7 @@ output_state_t *output_manager_add(output_manager_t *om, struct wl_registry *reg
     st->wl_name = name;
     st->scale = 1;
     st->shm_fd = -1;
+    st->last_committed_ring_idx = -1;
 
     uint32_t bind_ver = (version > 4) ? 4 : version;
     st->output = (struct wl_output *)wl_registry_bind(reg, name, &wl_output_interface, bind_ver);
@@ -228,6 +230,7 @@ void output_manager_remove(output_manager_t *om, uint32_t name)
                 }
                 dmabuf_ring_destroy(om->dmabuf_ctx, &entry->dmabuf_ring);
                 entry->use_dmabuf = false;
+                entry->last_committed_ring_idx = -1;
             }
 
             presentation_sync_destroy(&entry->pres_sync);

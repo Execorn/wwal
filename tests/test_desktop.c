@@ -97,11 +97,22 @@ static void test_presentation_pll_vrr_tracking(void)
 
 static int g_uring_cb_count = 0;
 static bool g_uring_readd_in_cb = false;
+static int g_uring_write_tfd_in_cb = -1;
+static uring_event_type_t g_uring_order[8];
+static int g_uring_order_len = 0;
 static void test_uring_callback(uring_event_type_t type, int fd, uint32_t res, void *user_data)
 {
     (void)res;
+    if (g_uring_order_len < 8) {
+        g_uring_order[g_uring_order_len++] = type;
+    }
     if (type == URING_EV_WAYLAND_READ) {
         g_uring_cb_count++;
+        if (g_uring_write_tfd_in_cb >= 0) {
+            char b = 0x55;
+            assert(write(g_uring_write_tfd_in_cb, &b, 1) == 1);
+            g_uring_write_tfd_in_cb = -1;
+        }
         if (g_uring_readd_in_cb && user_data) {
             uring_loop_t *lp = (uring_loop_t *)user_data;
             char tmp;
@@ -176,6 +187,43 @@ static void test_io_uring_event_loop(void)
     assert(dispatched >= 1);
     assert(g_uring_cb_count == 4);
     read(fds[0], &rbuf, 1);
+
+    /* Verify URING_EV_WAYLAND_READ is dispatched before URING_EV_TRANSITION_TIMER in the same CQE
+     * batch even when the timer pipe is written to first */
+    int tfds[2];
+    assert(pipe2(tfds, O_NONBLOCK | O_CLOEXEC) == 0);
+    assert(uring_loop_add_poll(&loop, tfds[0], POLLIN, URING_EV_TRANSITION_TIMER, &loop));
+    assert(write(tfds[1], &byte, 1) == 1);
+    assert(write(fds[1], &byte, 1) == 1);
+    g_uring_order_len = 0;
+    dispatched = uring_loop_dispatch(&loop, test_uring_callback);
+    assert(dispatched >= 2);
+    assert(g_uring_order_len >= 2);
+    assert(g_uring_order[0] == URING_EV_WAYLAND_READ);
+    assert(g_uring_order[1] == URING_EV_TRANSITION_TIMER);
+    read(fds[0], &rbuf, 1);
+    read(tfds[0], &rbuf, 1);
+
+    /* Verify a timer CQE arriving mid-pass-0 (inside URING_EV_WAYLAND_READ callback) is bounded by
+     * pass 0's CQE count and never double-dispatched */
+    g_uring_order_len = 0;
+    g_uring_write_tfd_in_cb = tfds[1];
+    assert(write(fds[1], &byte, 1) == 1);
+    dispatched = uring_loop_dispatch(&loop, test_uring_callback);
+    read(fds[0], &rbuf, 1);
+    if (dispatched == 1) {
+        assert(g_uring_order_len == 1);
+        assert(g_uring_order[0] == URING_EV_WAYLAND_READ);
+        dispatched += uring_loop_dispatch(&loop, test_uring_callback);
+    }
+    assert(dispatched == 2);
+    assert(g_uring_order_len == 2);
+    assert(g_uring_order[0] == URING_EV_WAYLAND_READ);
+    assert(g_uring_order[1] == URING_EV_TRANSITION_TIMER);
+    read(tfds[0], &rbuf, 1);
+
+    close(tfds[0]);
+    close(tfds[1]);
 
     close(fds[0]);
     close(fds[1]);

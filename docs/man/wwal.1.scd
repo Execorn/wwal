@@ -297,6 +297,9 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 *--sort, --sorting* <ascending|descending|name|mtime|random>
 	Sort order for slideshow directory traversal (default: *random*; *name* is an alias for *ascending*).
 
+*--recursive, --no-recursive*
+	Enable or disable recursive subdirectory traversal when scanning a slideshow directory (default: *--recursive*).
+
 # ENVIRONMENT
 
 *WAYLAND_DISPLAY*

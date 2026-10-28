@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/daemon/gpu_compute.h"
 #include "../src/daemon/simd/simd_blend.h"
+#include "../src/daemon/wayland_core.h"
+#include "waywal/anim_engine.h"
 #include "waywal/bezier.h"
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
@@ -8,6 +10,7 @@
 #include "waywal/render_engine.h"
 #include "waywal/shader_engine.h"
 #include "waywal/types.h"
+#include "waywal/we_scene.h"
 
 #include <assert.h>
 #include <math.h>
@@ -16,6 +19,31 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+void waywal_we_scene_forget_bo(we_scene_t *scene, const dmabuf_bo_t *bo)
+{
+    (void)scene;
+    (void)bo;
+}
+void we_scene_destroy(we_scene_t *scene) { (void)scene; }
+void waywal_anim_destroy(waywal_anim_decoder_t *dec) { (void)dec; }
+void video_engine_destroy(video_engine_t *ve) { (void)ve; }
+bool video_engine_snapshot_output(video_engine_t *ve, output_node_t *out)
+{
+    (void)ve;
+    (void)out;
+    return false;
+}
+void slideshow_destroy(slideshow_engine_t *ss) { (void)ss; }
+bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *out_x,
+                             double *out_y)
+{
+    (void)state;
+    (void)out;
+    (void)out_x;
+    (void)out_y;
+    return false;
+}
 
 #ifndef __has_feature
 #define __has_feature(x) 0
@@ -565,6 +593,246 @@ static void test_builtin_shader_presets_gles31(void)
            "PASSED.\n");
 }
 
+static void test_buffer_gated_transition_tick(void)
+{
+    printf("[TEST] Running test_buffer_gated_transition_tick...\n");
+
+    assert(WAYWAL_DMABUF_RING_SIZE == 4);
+
+    daemon_state_t state;
+    memset(&state, 0, sizeof(state));
+    state.transition_timer_fd = -1;
+    state.transitions_in_progress = true;
+
+    output_node_t out;
+    memset(&out, 0, sizeof(out));
+    out.state = &state;
+    out.configured = true;
+    out.surface = NULL;
+    out.width = 64;
+    out.height = 64;
+    out.transition_active = true;
+    out.transition_total_frames = 60;
+    out.transition_current_frame = 0;
+    out.transition_duration_ns = 1200000000ULL;
+    out.transition_progress_linear = 0.0f;
+    out.transition_params = (waywal_transition_params_t){
+        .type = WAYWAL_TRANSITION_FADE,
+        .progress = 0.0f,
+        .bezier = BEZIER_DEFAULT,
+    };
+    state.outputs = &out;
+    state.num_outputs = 1;
+
+    /* 1. DMA-BUF ring path: with valid dimensions (so abort_invalid is false) and all 4 ring
+     * buffers busy (in_use = true), transition_engine_dispatch_tick must NOT advance
+     * transition_current_frame or transition_progress_linear, and must keep the transition active.
+     */
+    out.use_dmabuf = true;
+    out.dmabuf_ring.initialized = true;
+    out.dmabuf_ring.width = 64;
+    out.dmabuf_ring.height = 64;
+    out.source_old_bo.width = 64;
+    out.source_old_bo.height = 64;
+    out.source_new_bo.width = 64;
+    out.source_new_bo.height = 64;
+    for (int i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+        out.dmabuf_ring.buffers[i].in_use = true;
+        out.dmabuf_ring.buffers[i].wl_buffer = (struct wl_buffer *)0x1;
+    }
+    assert(dmabuf_ring_acquire(&out.dmabuf_ring) == NULL);
+
+    for (int tick = 0; tick < 10; ++tick) {
+        transition_engine_dispatch_tick(&state);
+        assert(out.transition_active);
+        assert(state.transitions_in_progress);
+        assert(out.transition_current_frame == 0);
+        assert(out.transition_progress_linear == 0.0f);
+        assert(out.transition_start_ns == 0);
+    }
+
+    /* Verify that releasing one slot in the 4-buffer ring allows dmabuf_ring_acquire to succeed */
+    out.dmabuf_ring.buffers[2].in_use = false;
+    dmabuf_bo_t *acq = dmabuf_ring_acquire(&out.dmabuf_ring);
+    assert(acq == &out.dmabuf_ring.buffers[2]);
+    assert(acq->in_use);
+    assert(dmabuf_ring_acquire(&out.dmabuf_ring) == NULL);
+
+    /* 2. SHM fallback path: with valid SHM buffers allocated (so abort_invalid is false),
+     * when the back-buffer has not been released by the compositor,
+     * transition_engine_dispatch_tick must NOT advance transition_current_frame
+     * or transition_progress_linear, and must keep the transition active. */
+    size_t frame_sz = 64U * 64U * sizeof(uint32_t);
+    out.use_dmabuf = false;
+    out.shm_width = 64;
+    out.shm_height = 64;
+    out.staging_width = 64;
+    out.staging_height = 64;
+    out.shm_size = frame_sz * 2U;
+    out.shm_buffer_cap = frame_sz;
+    out.shm_data = calloc(2U, frame_sz);
+    out.shm_old_data = malloc(frame_sz);
+    out.shm_new_data = malloc(frame_sz);
+    assert(out.shm_data && out.shm_old_data && out.shm_new_data);
+    memset(out.shm_old_data, 0x11, frame_sz);
+    memset(out.shm_new_data, 0xEE, frame_sz);
+    out.active_buffer_idx = 0;
+    out.shm_buffer_released[0] = true;
+    out.shm_buffer_released[1] = false; /* back_idx == 1 is busy */
+
+    for (int tick = 0; tick < 10; ++tick) {
+        transition_engine_dispatch_tick(&state);
+        assert(out.transition_active);
+        assert(state.transitions_in_progress);
+        assert(out.transition_current_frame == 0);
+        assert(out.transition_progress_linear == 0.0f);
+        assert(out.transition_start_ns == 0);
+    }
+
+    /* 3. Releasing the SHM back-buffer allows the tick to render, anchor transition_start_ns,
+     * advance transition_current_frame to 1, and flip active_buffer_idx to 1. */
+    out.shm_buffer_released[1] = true;
+    transition_engine_dispatch_tick(&state);
+    assert(out.transition_active);
+    assert(state.transitions_in_progress);
+    assert(out.transition_current_frame == 1);
+    assert(out.transition_start_ns > 0);
+    assert(out.transition_last_tick_ns == out.transition_start_ns);
+    assert(fabsf(out.transition_progress_linear - (1.0f / 60.0f)) < 1e-5f);
+    assert(out.active_buffer_idx == 1);
+    assert(!out.shm_buffer_released[1]);
+
+    /* 4. Anti-teleport clamp: simulate a 500ms wall-clock stall on the next released frame
+     * and verify progress advances by at most 0.08f instead of jumping by 500/1200 (~0.417f). */
+    float prev_prog = out.transition_progress_linear;
+    out.transition_last_tick_ns -= 500000000ULL;
+    out.shm_buffer_released[0] = true;
+    transition_engine_dispatch_tick(&state);
+    assert(out.transition_active);
+    assert(out.transition_current_frame == 2);
+    assert(fabsf((out.transition_progress_linear - prev_prog) - 0.08f) < 1e-5f);
+
+    /* 5. Staggered multi-output mid-transition override (transition_delay_frames > 0) +
+     * completion only after progress == 1.0f frame is committed. */
+    out.transition_current_frame = 0;
+    out.transition_total_frames = 10;
+    out.transition_delay_frames = 2;
+    out.transition_start_ns = 0;
+    out.transition_last_tick_ns = 0;
+    out.transition_duration_ns = 200000000ULL;
+    out.transition_progress_linear = 0.0f;
+    out.shm_buffer_released[0] = true;
+    out.shm_buffer_released[1] = true;
+
+    transition_engine_dispatch_tick(&state);
+    assert(out.transition_delay_frames == 1);
+    assert(out.transition_current_frame == 0);
+    assert(out.transition_start_ns == 0);
+
+    transition_engine_dispatch_tick(&state);
+    assert(out.transition_delay_frames == 0);
+    assert(out.transition_current_frame == 0);
+    assert(out.transition_start_ns == 0);
+
+    int safety = 0;
+    while (out.transition_active && safety++ < 100) {
+        out.shm_buffer_released[1 - out.active_buffer_idx] = true;
+        transition_engine_dispatch_tick(&state);
+    }
+    assert(!out.transition_active);
+    assert(!state.transitions_in_progress);
+    assert(fabsf(out.transition_progress_linear - 1.0f) < 1e-5f);
+    assert(fabsf(out.transition_params.progress - 1.0f) < 1e-5f);
+    assert(out.shm_old_data == NULL && out.shm_new_data == NULL);
+
+    free(out.shm_data);
+
+    /* 6. Mid-transition interruption snapshot via last_committed_ring_idx on DMA-BUF ring */
+    if (dmabuf_context_init(&state.dmabuf_ctx) &&
+        render_engine_init(&state.render_engine, &state.dmabuf_ctx) &&
+        state.render_engine.gpu_compute_active) {
+        state.dmabuf_ctx.preferred_modifier = DRM_FORMAT_MOD_INVALID;
+        state.dmabuf_ctx.map_supported = false;
+        memset(&out, 0, sizeof(out));
+        out.state = &state;
+        out.configured = true;
+        out.surface = NULL;
+        out.width = 64;
+        out.height = 64;
+        out.last_committed_ring_idx = -1;
+        out.use_dmabuf = true;
+        out.dmabuf_ring.initialized = true;
+        out.dmabuf_ring.width = 64;
+        out.dmabuf_ring.height = 64;
+        out.dmabuf_ring.drm_format = DRM_FORMAT_ARGB8888;
+        bool ring_ok = dmabuf_bo_allocate(&state.dmabuf_ctx, &out.source_old_bo, 64, 64,
+                                          DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID) &&
+                       dmabuf_bo_allocate(&state.dmabuf_ctx, &out.source_new_bo, 64, 64,
+                                          DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID);
+        out.has_source_old_bo = ring_ok;
+        out.has_source_new_bo = ring_ok;
+        for (int i = 0; i < WAYWAL_DMABUF_RING_SIZE && ring_ok; ++i) {
+            if (!dmabuf_bo_allocate(&state.dmabuf_ctx, &out.dmabuf_ring.bos[i], 64, 64,
+                                    DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID)) {
+                ring_ok = false;
+                break;
+            }
+            out.dmabuf_ring.bos[i].wl_buffer = (struct wl_buffer *)0x1;
+            out.dmabuf_ring.bos[i].in_use = false;
+        }
+        if (ring_ok) {
+            assert(render_engine_upload_static(&state.render_engine, NULL, 0, 0, &out.source_old_bo,
+                                               WAYWAL_SCALING_FILL, 0xFFFF0000U));
+            assert(render_engine_upload_static(&state.render_engine, NULL, 0, 0, &out.source_new_bo,
+                                               WAYWAL_SCALING_FILL, 0xFF0000FFU));
+            out.transition_params = (waywal_transition_params_t){
+                .type = WAYWAL_TRANSITION_FADE,
+                .progress = 0.0f,
+                .bezier = BEZIER_DEFAULT,
+            };
+            out.transition_current_frame = 0;
+            out.transition_total_frames = 10;
+            out.transition_duration_ns = 500000000ULL;
+            out.transition_progress_linear = 0.0f;
+            out.transition_active = true;
+            state.transitions_in_progress = true;
+
+            transition_engine_dispatch_tick(&state);
+            assert(out.transition_active);
+            assert(out.transition_current_frame == 1);
+            assert(out.last_committed_ring_idx == 0);
+            assert(out.last_presented_bo == &out.dmabuf_ring.bos[0]);
+            assert(out.has_image);
+
+            /* Interrupt mid-transition: snapshot must copy from bos[last_committed_ring_idx]
+             * into source_old_bo and reset last_committed_ring_idx to -1 */
+            layer_shell_snapshot_live_output(&state, &out);
+            assert(out.has_source_old_bo);
+            assert(out.last_presented_bo == &out.source_old_bo);
+            assert(out.last_committed_ring_idx == -1);
+        }
+        for (int i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+            out.dmabuf_ring.bos[i].wl_buffer = NULL;
+            if (out.dmabuf_ring.bos[i].fd[0] >= 0) {
+                render_engine_release_bo(&state.render_engine, &out.dmabuf_ring.bos[i]);
+                dmabuf_bo_free(&out.dmabuf_ring.bos[i]);
+            }
+        }
+        if (out.has_source_old_bo) {
+            render_engine_release_bo(&state.render_engine, &out.source_old_bo);
+            dmabuf_bo_free(&out.source_old_bo);
+        }
+        if (out.has_source_new_bo) {
+            render_engine_release_bo(&state.render_engine, &out.source_new_bo);
+            dmabuf_bo_free(&out.source_new_bo);
+        }
+        render_engine_destroy(&state.render_engine);
+        dmabuf_context_destroy(&state.dmabuf_ctx);
+    }
+
+    printf("[TEST] test_buffer_gated_transition_tick PASSED.\n");
+}
+
 int main(void)
 {
     waywal_log_set_level(WAYWAL_LOG_LEVEL_WARN);
@@ -578,6 +846,7 @@ int main(void)
     test_gpu_compute_transitions();
     test_gpu_compute_nonlinear_and_upload_static();
     test_builtin_shader_presets_gles31();
+    test_buffer_gated_transition_tick();
 
     printf("\n>>> ALL TRANSITIONS UNIT TESTS PASSED SUCCESSFULLY! <<<\n\n");
     return 0;

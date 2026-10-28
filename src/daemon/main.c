@@ -1093,11 +1093,10 @@ void daemon_apply_mpris_album_art_and_theme(daemon_state_t *state,
                 (state->has_active_theme_meta && state->active_theme_meta.has_seed_color)
                     ? state->active_theme_meta.seed_color
                     : state->config.theme.seed_color;
-            if (waywal_palette_extract_seed_ex(state->wallpaper_rgba, state->wallpaper_w,
-                                               state->wallpaper_h, state->wallpaper_w * 4U, true,
-                                               tmode, variant, state->config.theme.contrast,
-                                               src_idx, has_seed, seed_rgb,
-                                               &state->active_palette)) {
+            if (waywal_palette_extract_seed_ex(
+                    state->wallpaper_rgba, state->wallpaper_w, state->wallpaper_h,
+                    state->wallpaper_w * 4U, true, tmode, variant, state->config.theme.contrast,
+                    src_idx, has_seed, seed_rgb, &state->active_palette)) {
                 if (is_nc) {
                     if (state->has_saved_wallpaper_palette) {
                         memcpy(state->active_palette.wallpaper_path,
@@ -1256,8 +1255,7 @@ void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t *bgra_
     uint8_t src_idx = (meta && meta->has_source_color_index)
                           ? meta->source_color_index
                           : state->config.theme.source_color_index;
-    bool has_seed =
-        (meta && meta->has_seed_color) ? true : state->config.theme.has_seed_color;
+    bool has_seed = (meta && meta->has_seed_color) ? true : state->config.theme.has_seed_color;
     uint32_t seed_rgb =
         (meta && meta->has_seed_color) ? meta->seed_color : state->config.theme.seed_color;
     uint8_t solid_opaque_px[4] = {
@@ -1277,8 +1275,7 @@ void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t *bgra_
         bool is_no_cache = (meta && meta->no_cache);
         if (is_no_cache) {
             if (state->has_saved_wallpaper_palette) {
-                memcpy(extracted_pal.wallpaper_path,
-                       state->saved_wallpaper_palette.wallpaper_path,
+                memcpy(extracted_pal.wallpaper_path, state->saved_wallpaper_palette.wallpaper_path,
                        sizeof(extracted_pal.wallpaper_path));
             } else {
                 extracted_pal.wallpaper_path[0] = '\0';
@@ -1299,10 +1296,9 @@ void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t *bgra_
         state->has_active_palette = true;
 
         bool client_already_exported = (meta && meta->client_exported_theme != 0);
-        bool should_export =
-            export_and_hooks && !client_already_exported &&
-            ((meta && (meta->extract_theme || meta->has_seed_color)) ||
-             state->config.theme.enabled);
+        bool should_export = export_and_hooks && !client_already_exported &&
+                             ((meta && (meta->extract_theme || meta->has_seed_color)) ||
+                              state->config.theme.enabled);
         if (should_export) {
             if (!is_no_cache) {
                 (void)waywal_palette_export_filtered(
@@ -1612,11 +1608,13 @@ void daemon_shader_render_once(daemon_state_t *state)
         fparams.mouse_vel[0] = out->mouse_vel_x;
         fparams.mouse_vel[1] = out->mouse_vel_y;
 
-        if (out->transition_active && out->has_source_new_bo) {
-            if (out->workshop_active && wscene) {
-                (void)we_scene_render_frame(wscene, &out->source_new_bo, &fparams);
-            } else if (seng) {
-                (void)waywal_shader_engine_render_frame(seng, &out->source_new_bo, &fparams);
+        if (out->transition_active) {
+            if (out->has_source_new_bo) {
+                if (out->workshop_active && wscene) {
+                    (void)we_scene_render_frame(wscene, &out->source_new_bo, &fparams);
+                } else if (seng && out->shader_path[0] != '\0') {
+                    (void)waywal_shader_engine_render_frame(seng, &out->source_new_bo, &fparams);
+                }
             }
             continue;
         }
@@ -1648,6 +1646,7 @@ void daemon_shader_render_once(daemon_state_t *state)
                     presentation_sync_request(&out->pres_sync);
                     wl_surface_commit(out->surface);
                     out->last_presented_bo = bo;
+                    out->last_committed_ring_idx = (int)(bo - out->dmabuf_ring.buffers);
                     out->has_image = true;
                     wl_display_flush(state->display);
                 } else {
@@ -1758,9 +1757,8 @@ void daemon_reconcile_power_state(daemon_state_t *state)
                         (out->workshop_active && (out->we_scene || state->we_scene))) {
                         any_s_matched = true;
                         uint32_t out_target =
-                            out->shader_fps > 0
-                                ? out->shader_fps
-                                : (state->shader_fps > 0 ? state->shader_fps : 60U);
+                            out->shader_fps > 0 ? out->shader_fps
+                                                : (state->shader_fps > 0 ? state->shader_fps : 60U);
                         uint32_t out_eff = waywal_power_governor_effective_fps(
                             state->power_gov, out->name[0] ? out->name : "*", out_target);
                         if (out_eff > eff_s_fps)
@@ -1823,10 +1821,9 @@ void daemon_reconcile_power_state(daemon_state_t *state)
             (state->config.solar.dawn_path[0] != '\0') ||
             (state->config.solar.day_path[0] != '\0') ||
             (state->config.solar.dusk_path[0] != '\0') ||
-            (state->config.solar.night_path[0] != '\0') ||
-            (state->config.schedule_count > 0) || state->config.solar.auto_day_night ||
-            state->config.theme.auto_day_night || state->config.daemon.auto_day_night ||
-            state->config.auto_day_night ||
+            (state->config.solar.night_path[0] != '\0') || (state->config.schedule_count > 0) ||
+            state->config.solar.auto_day_night || state->config.theme.auto_day_night ||
+            state->config.daemon.auto_day_night || state->config.auto_day_night ||
             (state->has_active_theme_meta && state->active_theme_meta.auto_day_night != 0);
         if (pause_all || !solar_active) {
             disarm_timer_fd(state->solar_timer_fd);
@@ -1886,11 +1883,10 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
         return false;
 
     char resolved_shader_path[4096];
-    const char *shader_file =
-        waywal_shader_resolve_path(spay->shader_path, resolved_shader_path,
-                                   sizeof(resolved_shader_path))
-            ? resolved_shader_path
-            : spay->shader_path;
+    const char *shader_file = waywal_shader_resolve_path(spay->shader_path, resolved_shader_path,
+                                                         sizeof(resolved_shader_path))
+                                  ? resolved_shader_path
+                                  : spay->shader_path;
 
     if (!state->outputs) {
         if (state->we_scene) {
@@ -1932,9 +1928,9 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
         }
         gpu_compute_invalidate_state_cache((gpu_compute_ctx_t *)state->render_engine.gpu_ctx);
         daemon_reconcile_power_state(state);
-        (void)waywal_ecosystem_cache_sync(spay->output[0] ? spay->output : "*", shader_file,
-                                          "Lanczos3", NULL, 0, 0,
-                                          state->config.theme.caelestia_sync, spay->no_cache != 0);
+        (void)waywal_ecosystem_cache_sync(
+            spay->output[0] ? spay->output : "*", shader_file, "Lanczos3", NULL, 0, 0,
+            state->config.general.caelestia_sync, spay->no_cache != 0);
         return true;
     }
 
@@ -2125,6 +2121,10 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
                 out->transition_current_frame = 0;
                 out->transition_total_frames = num_frames;
                 out->transition_delay_frames = 0;
+                out->transition_start_ns = 0;
+                out->transition_last_tick_ns = 0;
+                out->transition_duration_ns = (uint64_t)spay->transition_duration_ms * 1000000ULL;
+                out->transition_progress_linear = 0.0f;
                 out->transition_active = true;
                 any_transition_started = true;
             }
@@ -2147,14 +2147,6 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
     if (state->mpris) {
         daemon_apply_mpris_album_art_and_theme(state, waywal_mpris_get_state(state->mpris), true);
     }
-    gpu_compute_invalidate_state_cache((gpu_compute_ctx_t *)state->render_engine.gpu_ctx);
-    daemon_shader_render_once(state);
-    if (any_transition_started && state->transition_timer_fd >= 0) {
-        arm_periodic_timer_fd(state->transition_timer_fd, trans_fps);
-        state->transitions_in_progress = true;
-    }
-    daemon_reconcile_power_state(state);
-
     if (!spay->no_cache) {
         char matched_outputs[256] = {0};
         size_t mlen = 0;
@@ -2168,10 +2160,17 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
             }
         }
         const char *fallback_target = spay->output[0] ? spay->output : "*";
-        (void)waywal_ecosystem_cache_sync(matched_outputs[0] ? matched_outputs : fallback_target,
-                                          shader_file, "Lanczos3", NULL, 0, 0,
-                                          state->config.theme.caelestia_sync, spay->no_cache != 0);
+        (void)waywal_ecosystem_cache_sync(
+            matched_outputs[0] ? matched_outputs : fallback_target, shader_file, "Lanczos3", NULL,
+            0, 0, state->config.general.caelestia_sync, spay->no_cache != 0);
     }
+    gpu_compute_invalidate_state_cache((gpu_compute_ctx_t *)state->render_engine.gpu_ctx);
+    daemon_shader_render_once(state);
+    if (any_transition_started && state->transition_timer_fd >= 0) {
+        arm_periodic_timer_fd(state->transition_timer_fd, trans_fps);
+        state->transitions_in_progress = true;
+    }
+    daemon_reconcile_power_state(state);
     return true;
 }
 
@@ -2321,6 +2320,35 @@ static bool daemon_render_image_on_target_ex(daemon_state_t *state, const char *
     }
 
     bool has_transition = (transition_type != WAYWAL_TRANSITION_NONE && duration_ms > 0);
+    bool will_transition = !has_transition;
+    if (has_transition && state->outputs) {
+        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            if (out->surface && out->configured && out->width > 0 && out->height > 0 &&
+                output_matches_img_meta(out, meta)) {
+                will_transition = true;
+                break;
+            }
+        }
+    }
+    if (will_transition) {
+        const char *filt_str = waywal_filter_mode_to_swww_str(filter);
+        char matched_outputs[256] = {0};
+        size_t mlen = 0;
+        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            if (output_matches_img_meta(out, meta) && out->name[0] != '\0') {
+                int n = snprintf(matched_outputs + mlen, sizeof(matched_outputs) - mlen, "%s%s",
+                                 mlen > 0 ? "," : "", out->name);
+                if (n > 0 && mlen + (size_t)n < sizeof(matched_outputs)) {
+                    mlen += (size_t)n;
+                }
+            }
+        }
+        const char *fallback_target = target_output ? target_output : "*";
+        (void)waywal_ecosystem_cache_sync(matched_outputs[0] ? matched_outputs : fallback_target,
+                                          filepath, filt_str, px, w, h,
+                                          state->config.general.caelestia_sync, false);
+    }
+
     if (state->outputs) {
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
             if (output_matches_img_meta(out, meta)) {
@@ -2347,7 +2375,8 @@ static bool daemon_render_image_on_target_ex(daemon_state_t *state, const char *
     if (ok) {
         if (is_dynwall_manifest) {
             state->solar_owns_wallpaper = true;
-            snprintf(state->active_dynwall_path, sizeof(state->active_dynwall_path), "%s", filepath);
+            snprintf(state->active_dynwall_path, sizeof(state->active_dynwall_path), "%s",
+                     filepath);
             snprintf(state->active_dynwall_output, sizeof(state->active_dynwall_output), "%s",
                      (target_output && target_output[0] != '\0') ? target_output : "*");
             snprintf(state->last_dynwall_frame_path, sizeof(state->last_dynwall_frame_path), "%s",
@@ -2356,22 +2385,6 @@ static bool daemon_render_image_on_target_ex(daemon_state_t *state, const char *
                 state->sched_theme_override_active = true;
             }
         }
-        const char *filt_str = waywal_filter_mode_to_swww_str(filter);
-        char matched_outputs[256] = {0};
-        size_t mlen = 0;
-        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-            if (output_matches_img_meta(out, meta) && out->name[0] != '\0') {
-                int n = snprintf(matched_outputs + mlen, sizeof(matched_outputs) - mlen, "%s%s",
-                                 mlen > 0 ? "," : "", out->name);
-                if (n > 0 && mlen + (size_t)n < sizeof(matched_outputs)) {
-                    mlen += (size_t)n;
-                }
-            }
-        }
-        const char *fallback_target = target_output ? target_output : "*";
-        (void)waywal_ecosystem_cache_sync(matched_outputs[0] ? matched_outputs : fallback_target,
-                                          filepath, filt_str, px, w, h,
-                                          state->config.theme.caelestia_sync, false);
     }
     image_free(px);
     if (ok) {
@@ -2403,10 +2416,9 @@ bool daemon_start_slideshow_isolated(daemon_state_t *state, const waywal_slidesh
         return false;
 
     if (waywal_dynwall_is_manifest_path(spay->path)) {
-        const char *target =
-            (spay->num_target_outputs > 0 && spay->target_outputs[0][0] != '\0')
-                ? spay->target_outputs[0]
-                : "*";
+        const char *target = (spay->num_target_outputs > 0 && spay->target_outputs[0][0] != '\0')
+                                 ? spay->target_outputs[0]
+                                 : "*";
         return daemon_render_image_on_target(
             state, spay->path, target, (waywal_scaling_mode_t)spay->scaling_mode,
             (waywal_filter_mode_t)spay->filter_mode, spay->ten_bit != 0, spay->transition_type,
@@ -2541,7 +2553,7 @@ static bool daemon_start_video_file_isolated(daemon_state_t *state, const char *
         if (!no_cache && matched_outputs[0] != '\0') {
             (void)waywal_ecosystem_cache_sync(matched_outputs, filepath, "Lanczos3", preview_bgra,
                                               preview_w, preview_h,
-                                              state->config.theme.caelestia_sync, no_cache);
+                                              state->config.general.caelestia_sync, no_cache);
         }
         if (state->video_engine.target_output != target_out) {
             state->video_engine.target_output = NULL;
@@ -2646,11 +2658,9 @@ static bool daemon_start_video_file_isolated(daemon_state_t *state, const char *
         }
         if (!no_cache) {
             const char *fallback_target = target ? target : "*";
-            (void)waywal_ecosystem_cache_sync(matched_outputs[0] ? matched_outputs
-                                                                 : fallback_target,
-                                              filepath, "Lanczos3", preview_bgra, preview_w,
-                                              preview_h, state->config.theme.caelestia_sync,
-                                              no_cache);
+            (void)waywal_ecosystem_cache_sync(
+                matched_outputs[0] ? matched_outputs : fallback_target, filepath, "Lanczos3",
+                preview_bgra, preview_w, preview_h, state->config.general.caelestia_sync, no_cache);
         }
         daemon_reconcile_power_state(state);
     }
@@ -2767,9 +2777,8 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
             memset(&fparams, 0, sizeof(fparams));
             fparams.time_sec = 0.5f;
             fparams.time_delta_sec = 1.0f / 60.0f;
-            if (ws_preview_px &&
-                we_scene_render_rgba8(state->we_scene, ws_preview_w, ws_preview_h, &fparams,
-                                      ws_preview_px)) {
+            if (ws_preview_px && we_scene_render_rgba8(state->we_scene, ws_preview_w, ws_preview_h,
+                                                       &fparams, ws_preview_px)) {
                 size_t total_px = (size_t)ws_preview_w * ws_preview_h;
                 for (size_t i = 0; i < total_px; ++i) {
                     uint8_t *p = &ws_preview_px[i * 4u];
@@ -2840,9 +2849,9 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
         }
         gpu_compute_invalidate_state_cache((gpu_compute_ctx_t *)state->render_engine.gpu_ctx);
         daemon_reconcile_power_state(state);
-        (void)waywal_ecosystem_cache_sync(wpay->output[0] ? wpay->output : "*", ws_dir, "Lanczos3",
-                                          ws_preview_px, ws_preview_w, ws_preview_h,
-                                          state->config.theme.caelestia_sync, wpay->no_cache != 0);
+        (void)waywal_ecosystem_cache_sync(
+            wpay->output[0] ? wpay->output : "*", ws_dir, "Lanczos3", ws_preview_px, ws_preview_w,
+            ws_preview_h, state->config.general.caelestia_sync, wpay->no_cache != 0);
         if (ws_preview_px) {
             if (ws_preview_from_image_load) {
                 image_free(ws_preview_px);
@@ -3005,6 +3014,10 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
                 out->transition_current_frame = 0;
                 out->transition_total_frames = num_frames;
                 out->transition_delay_frames = 0;
+                out->transition_start_ns = 0;
+                out->transition_last_tick_ns = 0;
+                out->transition_duration_ns = (uint64_t)wpay->transition_duration_ms * 1000000ULL;
+                out->transition_progress_linear = 0.0f;
                 out->transition_active = true;
                 any_transition_started = true;
             }
@@ -3042,9 +3055,8 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
         memset(&fparams, 0, sizeof(fparams));
         fparams.time_sec = 0.5f;
         fparams.time_delta_sec = 1.0f / 60.0f;
-        if (ws_preview_px &&
-            we_scene_render_rgba8(preview_scene, ws_preview_w, ws_preview_h, &fparams,
-                                  ws_preview_px)) {
+        if (ws_preview_px && we_scene_render_rgba8(preview_scene, ws_preview_w, ws_preview_h,
+                                                   &fparams, ws_preview_px)) {
             size_t total_px = (size_t)ws_preview_w * ws_preview_h;
             for (size_t i = 0; i < total_px; ++i) {
                 uint8_t *p = &ws_preview_px[i * 4u];
@@ -3076,14 +3088,6 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
     if (state->mpris) {
         daemon_apply_mpris_album_art_and_theme(state, waywal_mpris_get_state(state->mpris), true);
     }
-    gpu_compute_invalidate_state_cache((gpu_compute_ctx_t *)state->render_engine.gpu_ctx);
-    daemon_shader_render_once(state);
-    if (any_transition_started && state->transition_timer_fd >= 0) {
-        arm_periodic_timer_fd(state->transition_timer_fd, trans_fps);
-        state->transitions_in_progress = true;
-    }
-    daemon_reconcile_power_state(state);
-
     if (!wpay->no_cache) {
         char matched_outputs[256] = {0};
         size_t mlen = 0;
@@ -3099,7 +3103,7 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
         const char *fallback_target = wpay->output[0] ? wpay->output : "*";
         (void)waywal_ecosystem_cache_sync(matched_outputs[0] ? matched_outputs : fallback_target,
                                           ws_dir, "Lanczos3", ws_preview_px, ws_preview_w,
-                                          ws_preview_h, state->config.theme.caelestia_sync,
+                                          ws_preview_h, state->config.general.caelestia_sync,
                                           wpay->no_cache != 0);
     }
     if (ws_preview_px) {
@@ -3109,6 +3113,13 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
             free(ws_preview_px);
         }
     }
+    gpu_compute_invalidate_state_cache((gpu_compute_ctx_t *)state->render_engine.gpu_ctx);
+    daemon_shader_render_once(state);
+    if (any_transition_started && state->transition_timer_fd >= 0) {
+        arm_periodic_timer_fd(state->transition_timer_fd, trans_fps);
+        state->transitions_in_progress = true;
+    }
+    daemon_reconcile_power_state(state);
     return true;
 }
 
@@ -3180,7 +3191,7 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
         }
         (void)waywal_ecosystem_cache_sync(matched_outputs[0] ? matched_outputs : target, "",
                                           "Nearest", solid_bgra, 64, 64,
-                                          state->config.theme.caelestia_sync, false);
+                                          state->config.general.caelestia_sync, false);
         return true;
     }
     case WAYWAL_CONTENT_STATIC_IMAGE:
@@ -3318,8 +3329,8 @@ static bool daemon_render_color_on_target(daemon_state_t *state, const char *tar
                 stop_engines_on_output(state, out, false, false, false, false);
                 output_node_render_color(state, out, col);
                 if (out->name[0] != '\0') {
-                    int n = snprintf(matched_outputs + mlen, sizeof(matched_outputs) - mlen,
-                                     "%s%s", mlen > 0 ? "," : "", out->name);
+                    int n = snprintf(matched_outputs + mlen, sizeof(matched_outputs) - mlen, "%s%s",
+                                     mlen > 0 ? "," : "", out->name);
                     if (n > 0 && mlen + (size_t)n < sizeof(matched_outputs)) {
                         mlen += (size_t)n;
                     }
@@ -3339,7 +3350,7 @@ static bool daemon_render_color_on_target(daemon_state_t *state, const char *tar
         solid_bgra[px_i * 4U + 3U] = col.a;
     }
     (void)waywal_ecosystem_cache_sync(matched_outputs[0] ? matched_outputs : target, "", "Nearest",
-                                      solid_bgra, 64, 64, state->config.theme.caelestia_sync,
+                                      solid_bgra, 64, 64, state->config.general.caelestia_sync,
                                       false);
     if (state->config.hooks.on_wallpaper_change[0] != '\0') {
         (void)waywal_palette_run_hook(state->config.hooks.on_wallpaper_change);
@@ -3521,8 +3532,7 @@ static bool daemon_apply_output_config_rule(daemon_state_t *state, const waywal_
         spay.audio_reactive =
             rule->has_audio ? rule->audio : waywal_shader_is_audio_reactive(rule->path);
         spay.scaling_mode = (uint32_t)rule->scaling;
-        bool eff_invert_y =
-            rule->has_invert_y ? rule->invert_y : state->config.transition.invert_y;
+        bool eff_invert_y = rule->has_invert_y ? rule->invert_y : state->config.transition.invert_y;
         spay.invert_y = eff_invert_y ? 1 : 0;
         return daemon_activate_shader(state, &spay);
     }
@@ -3534,8 +3544,7 @@ static bool daemon_apply_output_config_rule(daemon_state_t *state, const waywal_
         wpay.fps = rule->fps > 0 ? rule->fps : 60;
         wpay.audio_reactive = rule->audio;
         wpay.scaling_mode = (uint32_t)rule->scaling;
-        bool eff_invert_y =
-            rule->has_invert_y ? rule->invert_y : state->config.transition.invert_y;
+        bool eff_invert_y = rule->has_invert_y ? rule->invert_y : state->config.transition.invert_y;
         wpay.invert_y = eff_invert_y ? 1 : 0;
         return daemon_activate_workshop(state, &wpay);
     }
@@ -3569,8 +3578,7 @@ static bool daemon_apply_output_config_rule(daemon_state_t *state, const waywal_
         spay.transition_wave_amp = state->config.transition.wave_y;
         spay.transition_center_x = state->config.transition.pos_x;
         spay.transition_center_y = state->config.transition.pos_y;
-        bool eff_invert_y =
-            rule->has_invert_y ? rule->invert_y : state->config.transition.invert_y;
+        bool eff_invert_y = rule->has_invert_y ? rule->invert_y : state->config.transition.invert_y;
         spay.invert_y = eff_invert_y ? 1 : 0;
         spay.pos_y_inverted = state->config.transition.pos_y_inverted ? 1 : 0;
         if (rule->has_invert_y && rule->invert_y != state->config.transition.invert_y &&
@@ -3626,24 +3634,22 @@ static bool config_has_solar_or_schedule_paths(const waywal_config_t *cfg)
     return false;
 }
 
-static bool schedule_phase_matches(const char *rule_phase,
-                                   const waywal_solar_state_t *solar_ptr,
-                                   waywal_solar_phase_t cur_phase, uint32_t sec_of_day,
-                                   bool is_day, bool require_fine_subphase)
+static bool schedule_phase_matches(const char *rule_phase, const waywal_solar_state_t *solar_ptr,
+                                   waywal_solar_phase_t cur_phase, uint32_t sec_of_day, bool is_day,
+                                   bool require_fine_subphase)
 {
     waywal_solar_phase_t rp;
     if (!waywal_solar_phase_from_string(rule_phase, &rp))
         return false;
-    bool is_fine = (rp == WAYWAL_SOLAR_MORNING || rp == WAYWAL_SOLAR_NOON ||
-                    rp == WAYWAL_SOLAR_AFTERNOON || rp == WAYWAL_SOLAR_SUNSET ||
-                    rp == WAYWAL_SOLAR_EVENING);
+    bool is_fine =
+        (rp == WAYWAL_SOLAR_MORNING || rp == WAYWAL_SOLAR_NOON || rp == WAYWAL_SOLAR_AFTERNOON ||
+         rp == WAYWAL_SOLAR_SUNSET || rp == WAYWAL_SOLAR_EVENING);
     if (require_fine_subphase && !is_fine)
         return false;
     if (!require_fine_subphase && is_fine)
         return false;
 
-    double ha =
-        solar_ptr ? solar_ptr->hour_angle_deg : (((double)sec_of_day / 60.0) / 4.0 - 180.0);
+    double ha = solar_ptr ? solar_ptr->hour_angle_deg : (((double)sec_of_day / 60.0) / 4.0 - 180.0);
     if (rp == cur_phase)
         return true;
     if (cur_phase == WAYWAL_SOLAR_DAY) {
@@ -3701,11 +3707,10 @@ void daemon_tick_solar_and_schedule(daemon_state_t *state, bool initial_sync)
                               : (state->config.transition.type_enum != WAYWAL_TRANSITION_NONE
                                      ? state->config.transition.type_enum
                                      : WAYWAL_TRANSITION_FADE);
-    uint32_t trans_dur =
-        initial_sync ? 0U
-                     : (uint32_t)(state->config.transition.duration > 0.0f
-                                      ? state->config.transition.duration * 1000.0f
-                                      : 1000.0f);
+    uint32_t trans_dur = initial_sync ? 0U
+                                      : (uint32_t)(state->config.transition.duration > 0.0f
+                                                       ? state->config.transition.duration * 1000.0f
+                                                       : 1000.0f);
     uint32_t next_wait_ms = 60000U;
     bool wallpaper_rendered_this_tick = false;
     bool has_sched_theme_override = false;
@@ -3731,8 +3736,7 @@ void daemon_tick_solar_and_schedule(daemon_state_t *state, bool initial_sync)
             if (r->has_time && r->time_minutes >= 0) {
                 uint32_t r_sec = (uint32_t)r->time_minutes * 60U;
                 if (r_sec <= sec_of_day) {
-                    if (!best_time_before ||
-                        r->time_minutes >= best_time_before->time_minutes) {
+                    if (!best_time_before || r->time_minutes >= best_time_before->time_minutes) {
                         best_time_before = r;
                     }
                 }
@@ -3753,14 +3757,11 @@ void daemon_tick_solar_and_schedule(daemon_state_t *state, bool initial_sync)
 
         const waywal_schedule_rule_t *best_phase =
             best_fine_phase ? best_fine_phase : best_coarse_phase;
-        bool allow_wrap =
-            !any_phase_rule ||
-            (!is_day && cur_phase == WAYWAL_SOLAR_NIGHT &&
-             sstate.true_solar_time_min < sstate.sunrise_min);
-        chosen_sched = best_phase
-                           ? best_phase
-                           : (best_time_before ? best_time_before
-                                               : (allow_wrap ? best_time_wrap : NULL));
+        bool allow_wrap = !any_phase_rule || (!is_day && cur_phase == WAYWAL_SOLAR_NIGHT &&
+                                              sstate.true_solar_time_min < sstate.sunrise_min);
+        chosen_sched = best_phase ? best_phase
+                                  : (best_time_before ? best_time_before
+                                                      : (allow_wrap ? best_time_wrap : NULL));
         if (chosen_sched && chosen_sched->has_theme_mode) {
             has_sched_theme_override = true;
             sched_light_mode = chosen_sched->theme_light_mode;
@@ -3856,9 +3857,8 @@ void daemon_tick_solar_and_schedule(daemon_state_t *state, bool initial_sync)
             strcmp(state->last_dynwall_frame_path, phase_path) != 0) {
             state->in_solar_tick = true;
             if (daemon_render_image_on_target(state, phase_path, "*", WAYWAL_SCALING_FILL,
-                                              WAYWAL_FILTER_LANCZOS3,
-                                              state->config.daemon.ten_bit, trans_type,
-                                              trans_dur)) {
+                                              WAYWAL_FILTER_LANCZOS3, state->config.daemon.ten_bit,
+                                              trans_type, trans_dur)) {
                 snprintf(state->last_dynwall_frame_path, sizeof(state->last_dynwall_frame_path),
                          "%s", phase_path);
                 wallpaper_rendered_this_tick = true;
@@ -3881,19 +3881,17 @@ void daemon_tick_solar_and_schedule(daemon_state_t *state, bool initial_sync)
         state->in_solar_tick = false;
     }
 
-    bool auto_theme = cfg_auto_theme ||
-                      (state->has_active_theme_meta &&
-                       state->active_theme_meta.auto_day_night != 0);
+    bool auto_theme = cfg_auto_theme || (state->has_active_theme_meta &&
+                                         state->active_theme_meta.auto_day_night != 0);
     bool should_apply_theme =
         state->config.theme.enabled ||
         (state->has_active_theme_meta &&
          (state->active_theme_meta.extract_theme || state->active_theme_meta.has_seed_color));
     if (auto_theme || has_sched_theme_override || prev_sched_override_active) {
-        bool target_light = has_sched_theme_override
-                                ? sched_light_mode
-                                : (auto_theme
-                                       ? is_day
-                                       : (state->config.theme.theme_mode == WAYWAL_THEME_LIGHT));
+        bool target_light =
+            has_sched_theme_override
+                ? sched_light_mode
+                : (auto_theme ? is_day : (state->config.theme.theme_mode == WAYWAL_THEME_LIGHT));
         bool phase_changed =
             state->has_last_solar_state && (state->last_solar_is_daytime != target_light);
         state->last_solar_is_daytime = target_light;
@@ -3923,11 +3921,10 @@ void daemon_tick_solar_and_schedule(daemon_state_t *state, bool initial_sync)
             if (state->media_palette_active && state->has_saved_wallpaper_palette) {
                 char saved_wp[sizeof(state->saved_wallpaper_palette.wallpaper_path)];
                 memcpy(saved_wp, state->saved_wallpaper_palette.wallpaper_path, sizeof(saved_wp));
-                if (waywal_palette_extract_seed_ex(state->wallpaper_rgba, state->wallpaper_w,
-                                                   state->wallpaper_h, state->wallpaper_w * 4U,
-                                                   true, tmode, variant,
-                                                   state->config.theme.contrast, src_idx, has_seed,
-                                                   seed_rgb, &state->saved_wallpaper_palette)) {
+                if (waywal_palette_extract_seed_ex(
+                        state->wallpaper_rgba, state->wallpaper_w, state->wallpaper_h,
+                        state->wallpaper_w * 4U, true, tmode, variant, state->config.theme.contrast,
+                        src_idx, has_seed, seed_rgb, &state->saved_wallpaper_palette)) {
                     memcpy(state->saved_wallpaper_palette.wallpaper_path, saved_wp,
                            sizeof(saved_wp));
                 }
@@ -3936,11 +3933,10 @@ void daemon_tick_solar_and_schedule(daemon_state_t *state, bool initial_sync)
                     (state->has_active_theme_meta && state->active_theme_meta.no_cache);
                 char saved_wp[sizeof(state->active_palette.wallpaper_path)];
                 memcpy(saved_wp, state->active_palette.wallpaper_path, sizeof(saved_wp));
-                if (waywal_palette_extract_seed_ex(state->wallpaper_rgba, state->wallpaper_w,
-                                                   state->wallpaper_h, state->wallpaper_w * 4U,
-                                                   true, tmode, variant,
-                                                   state->config.theme.contrast, src_idx, has_seed,
-                                                   seed_rgb, &state->active_palette)) {
+                if (waywal_palette_extract_seed_ex(
+                        state->wallpaper_rgba, state->wallpaper_w, state->wallpaper_h,
+                        state->wallpaper_w * 4U, true, tmode, variant, state->config.theme.contrast,
+                        src_idx, has_seed, seed_rgb, &state->active_palette)) {
                     memcpy(state->active_palette.wallpaper_path, saved_wp, sizeof(saved_wp));
                     if (!is_no_cache) {
                         state->saved_wallpaper_palette = state->active_palette;
@@ -4035,16 +4031,15 @@ static bool daemon_apply_workspace_rule(daemon_state_t *state, const waywal_work
     if (!is_color && wrule->path[0] == '\0')
         return false;
 
-    const char *target =
-        wrule->output_name[0] ? wrule->output_name
-                              : (monitor_name && monitor_name[0] ? monitor_name : "*");
+    const char *target = wrule->output_name[0]
+                             ? wrule->output_name
+                             : (monitor_name && monitor_name[0] ? monitor_name : "*");
     uint32_t trans_type =
         wrule->has_transition ? (uint32_t)wrule->transition_type_enum : WAYWAL_TRANSITION_SLIDE;
-    float dur_sec = wrule->has_transition_duration
-                        ? wrule->transition_duration
-                        : (state->config.transition.duration > 0.0f
-                               ? state->config.transition.duration
-                               : 0.4f);
+    float dur_sec =
+        wrule->has_transition_duration
+            ? wrule->transition_duration
+            : (state->config.transition.duration > 0.0f ? state->config.transition.duration : 0.4f);
     uint32_t dur_ms = (uint32_t)(dur_sec * 1000.0f);
     float default_angle =
         wrule->directional ? (delta >= 0 ? 0.0f : 180.0f) : state->config.transition.angle;
@@ -4105,16 +4100,15 @@ static bool daemon_apply_workspace_rule(daemon_state_t *state, const waywal_work
                     memcpy(meta_storage + sizeof(waywal_img_metadata_t), target, extra_len);
                 }
             }
+            bool can_transition_color = false;
             for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                if (output_matches_img_meta(out, meta)) {
-                    layer_shell_snapshot_live_output(state, out);
-                    stop_engines_on_output(state, out, false, false, false, false);
+                if (out->surface && out->configured && out->width > 0 && out->height > 0 &&
+                    output_matches_img_meta(out, meta)) {
+                    can_transition_color = true;
+                    break;
                 }
             }
-            reconcile_global_engine_flags(state);
-            uint8_t px_bgra[4] = {col.b, col.g, col.r, col.a};
-            daemon_update_palette_from_bgra(state, px_bgra, 1, 1, meta, true);
-            if (daemon_start_image_transition(state, px_bgra, 1, 1, meta)) {
+            if (can_transition_color) {
                 char matched_outputs[256] = {0};
                 size_t mlen = 0;
                 for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
@@ -4135,7 +4129,18 @@ static bool daemon_apply_workspace_rule(daemon_state_t *state, const waywal_work
                 }
                 (void)waywal_ecosystem_cache_sync(matched_outputs[0] ? matched_outputs : target, "",
                                                   "Nearest", solid_bgra, 64, 64,
-                                                  state->config.theme.caelestia_sync, false);
+                                                  state->config.general.caelestia_sync, false);
+            }
+            for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                if (output_matches_img_meta(out, meta)) {
+                    layer_shell_snapshot_live_output(state, out);
+                    stop_engines_on_output(state, out, false, false, false, false);
+                }
+            }
+            reconcile_global_engine_flags(state);
+            uint8_t px_bgra[4] = {col.b, col.g, col.r, col.a};
+            daemon_update_palette_from_bgra(state, px_bgra, 1, 1, meta, true);
+            if (daemon_start_image_transition(state, px_bgra, 1, 1, meta)) {
                 if (state->config.hooks.on_wallpaper_change[0] != '\0') {
                     (void)waywal_palette_run_hook(state->config.hooks.on_wallpaper_change);
                 }
@@ -4197,17 +4202,16 @@ static bool daemon_apply_workspace_rule(daemon_state_t *state, const waywal_work
         return daemon_activate_workshop(state, &wpay);
     }
     if (strcasecmp(wrule->mode, "video") == 0) {
-        return daemon_start_video_file_isolated(state, wrule->path, target, wrule->scaling, NULL,
-                                                0, 0, false);
+        return daemon_start_video_file_isolated(state, wrule->path, target, wrule->scaling, NULL, 0,
+                                                0, false);
     }
     if (strcasecmp(wrule->mode, "slideshow") == 0) {
         waywal_slideshow_payload_t spay;
         memset(&spay, 0, sizeof(spay));
-        spay.interval_s = wrule->interval > 0
-                              ? wrule->interval
-                              : (state->config.daemon.slideshow_interval > 0
-                                     ? state->config.daemon.slideshow_interval
-                                     : 300);
+        spay.interval_s = wrule->interval > 0 ? wrule->interval
+                                              : (state->config.daemon.slideshow_interval > 0
+                                                     ? state->config.daemon.slideshow_interval
+                                                     : 300);
         spay.sort_mode = (uint8_t)wrule->sort_mode;
         spay.has_sort_mode = 1;
         spay.random_order = (wrule->sort_mode == WAYWAL_SORT_RANDOM);
@@ -4359,10 +4363,11 @@ static bool daemon_pump_wayland_events(daemon_state_t *st)
             g_daemon_wl_ok = false;
             return false;
         }
+        wl_display_dispatch_pending(st->display);
     } else {
         wl_display_cancel_read(st->display);
+        wl_display_dispatch_pending(st->display);
     }
-    wl_display_dispatch_pending(st->display);
     if (wl_display_get_error(st->display) != 0) {
         g_daemon_wl_ok = false;
         return false;
@@ -4532,9 +4537,8 @@ static void daemon_reload_config(daemon_state_t *st)
         if (!rule_updated_theme && should_reload_theme && st->has_active_palette &&
             !(st->has_active_theme_meta && st->active_theme_meta.no_theme &&
               !st->media_palette_active)) {
-            bool is_no_cache =
-                (st->has_active_theme_meta && st->active_theme_meta.no_cache &&
-                 !st->media_palette_active);
+            bool is_no_cache = (st->has_active_theme_meta && st->active_theme_meta.no_cache &&
+                                !st->media_palette_active);
             if (!st->media_palette_active && st->wallpaper_rgba && st->wallpaper_w > 0 &&
                 st->wallpaper_h > 0) {
                 char saved_wp[sizeof(st->active_palette.wallpaper_path)];
@@ -4547,19 +4551,17 @@ static void daemon_reload_config(daemon_state_t *st)
                     (st->has_active_theme_meta && st->active_theme_meta.has_source_color_index)
                         ? st->active_theme_meta.source_color_index
                         : st->config.theme.source_color_index;
-                bool has_seed =
-                    (st->has_active_theme_meta && st->active_theme_meta.has_seed_color)
-                        ? true
-                        : st->config.theme.has_seed_color;
+                bool has_seed = (st->has_active_theme_meta && st->active_theme_meta.has_seed_color)
+                                    ? true
+                                    : st->config.theme.has_seed_color;
                 uint32_t seed_rgb =
                     (st->has_active_theme_meta && st->active_theme_meta.has_seed_color)
                         ? st->active_theme_meta.seed_color
                         : st->config.theme.seed_color;
-                if (waywal_palette_extract_seed_ex(st->wallpaper_rgba, st->wallpaper_w,
-                                                   st->wallpaper_h, st->wallpaper_w * 4U, true,
-                                                   tmode, variant, st->config.theme.contrast,
-                                                   src_idx, has_seed, seed_rgb,
-                                                   &st->active_palette)) {
+                if (waywal_palette_extract_seed_ex(
+                        st->wallpaper_rgba, st->wallpaper_w, st->wallpaper_h, st->wallpaper_w * 4U,
+                        true, tmode, variant, st->config.theme.contrast, src_idx, has_seed,
+                        seed_rgb, &st->active_palette)) {
                     if (is_no_cache) {
                         if (st->has_saved_wallpaper_palette) {
                             memcpy(st->active_palette.wallpaper_path,

@@ -207,3 +207,5 @@ complete -c wwal -n "__fish_seen_subcommand_from slideshow" -s d -l interval -l 
 complete -c wwal -n "__fish_seen_subcommand_from slideshow" -s s -l shuffle -d "Shuffle wallpapers randomly"
 complete -c wwal -n "__fish_seen_subcommand_from slideshow" -l random -d "Shuffle wallpapers randomly"
 complete -c wwal -n "__fish_seen_subcommand_from slideshow" -l sort -l sorting -a "$sort_modes" -d "Slideshow traversal sort order" -r
+complete -c wwal -n "__fish_seen_subcommand_from slideshow" -l recursive -d "Scan slideshow directory recursively"
+complete -c wwal -n "__fish_seen_subcommand_from slideshow" -l no-recursive -d "Do not scan slideshow subdirectories"

@@ -518,7 +518,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
             const char *oname = out->name[0] ? out->name : "unknown";
-            if (num_targets > 0 && !output_matches_extra(out, filter_buf, filter_len, num_targets)) {
+            if (num_targets > 0 &&
+                !output_matches_extra(out, filter_buf, filter_len, num_targets)) {
                 continue;
             }
             int32_t sc = out->scale_factor > 0 ? out->scale_factor : 1;
@@ -558,9 +559,10 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     out->displaying_color
                         ? out->active_color
                         : (out->has_fill_color ? out->fill_color : state->current_color);
-                buf_appendf(query_buf, sizeof(query_buf), &off,
-                            "%s: %s: %dx%d, scale: %d, currently displaying: color: #%02x%02x%02x\n",
-                            ns, oname, out->width, out->height, sc, c.r, c.g, c.b);
+                buf_appendf(
+                    query_buf, sizeof(query_buf), &off,
+                    "%s: %s: %dx%d, scale: %d, currently displaying: color: #%02x%02x%02x\n", ns,
+                    oname, out->width, out->height, sc, c.r, c.g, c.b);
             }
         }
 
@@ -694,9 +696,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 state->solar_owns_wallpaper = false;
                 state->active_dynwall_path[0] = '\0';
                 state->last_dynwall_frame_path[0] = '\0';
-                (void)waywal_ecosystem_cache_sync(mo_len > 0 ? matched_outputs : "*", "", "Lanczos3",
-                                                  solid_px, 64, 64,
-                                                  state->config.theme.caelestia_sync, false);
+                (void)waywal_ecosystem_cache_sync(mo_len > 0 ? matched_outputs : "*", "",
+                                                  "Lanczos3", solid_px, 64, 64,
+                                                  state->config.general.caelestia_sync, false);
                 (void)waywal_state_store_save(&g_saved_state, NULL);
                 WAYWAL_LOG_INFO("Cleared screen with color: #%02x%02x%02x%02x", color.r, color.g,
                                 color.b, color.a);
@@ -786,277 +788,344 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     }
 
                     if (valid_strings) {
-                        const uint8_t *pixels =
-                            (const uint8_t *)mapped + hdr_size + meta->extra_data_len;
-                        WAYWAL_LOG_INFO("Rendering received image: %ux%u", meta->width,
-                                        meta->height);
-                        if (state->outputs) {
+                        bool duplicate_inflight = false;
+                        if (state->outputs && !meta->is_solid_color && meta->filepath[0] != '\0' &&
+                            meta->custom_shader_len == 0 && !meta->extract_theme &&
+                            !meta->has_seed_color && meta->depth_map_path[0] == '\0' &&
+                            meta->transition_type != WAYWAL_TRANSITION_NONE &&
+                            meta->transition_duration_ms > 0) {
+                            uint32_t matched_cnt = 0;
+                            uint32_t inflight_same_cnt = 0;
+                            for (output_node_t *out = state->outputs; out != NULL;
+                                 out = out->next) {
+                                if (!out->surface || !out->configured || out->width <= 0 ||
+                                    out->height <= 0) {
+                                    continue;
+                                }
+                                if (output_matches_img_meta(out, meta)) {
+                                    matched_cnt++;
+                                    if (out->transition_active && !out->displaying_color &&
+                                        strcmp(out->active_media_path, meta->filepath) == 0 &&
+                                        out->scaling_mode == meta->scaling_mode &&
+                                        out->filter_mode == meta->filter_mode &&
+                                        out->ten_bit == (meta->ten_bit != 0)) {
+                                        inflight_same_cnt++;
+                                    }
+                                }
+                            }
+                            if (matched_cnt > 0 && matched_cnt == inflight_same_cnt) {
+                                duplicate_inflight = true;
+                            }
+                        }
+
+                        if (duplicate_inflight) {
+                            WAYWAL_LOG_INFO("Skipping duplicate in-flight transition for %s",
+                                            meta->filepath);
+                            ok = true;
+                        } else {
+                            const uint8_t *pixels =
+                                (const uint8_t *)mapped + hdr_size + meta->extra_data_len;
+                            WAYWAL_LOG_INFO("Rendering received image: %ux%u", meta->width,
+                                            meta->height);
+
+                            const char *first_target = "*";
+                            if (meta->num_target_outputs > 0) {
+                                first_target = (const char *)meta + sizeof(waywal_img_metadata_t);
+                            }
+
                             bool has_transition =
                                 (meta->transition_type != WAYWAL_TRANSITION_NONE &&
                                  meta->transition_duration_ms > 0);
-                            for (output_node_t *out = state->outputs; out != NULL;
-                                 out = out->next) {
-                                if (output_matches_img_meta(out, meta)) {
-                                    if (has_transition) {
-                                        layer_shell_snapshot_live_output(state, out);
-                                    }
-                                    stop_engines_on_output(state, out, false, false, false, false);
-                                }
-                            }
-                            reconcile_global_engine_flags(state);
-                        } else {
-                            if (state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED) {
-                                video_engine_stop(&state->video_engine);
-                            }
-                            slideshow_stop(&state->slideshow);
-                            shader_engine_stop_playback(state);
-                            anim_engine_stop_playback(state);
-                        }
-                        if (state->power_gov) {
-                            waywal_power_governor_set_global_reason(
-                                state->power_gov, WAYWAL_PAUSE_USER_MANUAL, false);
-                        }
-
-                        if (meta->backdrop[0] != '\0') {
-                            state->backdrop_auto_blur =
-                                (strcasecmp(meta->backdrop, "auto-blur") == 0);
-                            if (strcasecmp(meta->backdrop, "none") == 0) {
-                                state->backdrop_path[0] = '\0';
-                            } else if (!state->backdrop_auto_blur) {
-                                strncpy(state->backdrop_path, meta->backdrop,
-                                        sizeof(state->backdrop_path) - 1);
-                                state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
-                            }
-                        }
-                        if (meta->layer_name[0] != '\0') {
-                            state->use_bottom_layer = (strcasecmp(meta->layer_name, "bottom") == 0);
-                            for (output_node_t *out = state->outputs; out != NULL;
-                                 out = out->next) {
-                                if (out->layer_surface && out->surface) {
-                                    zwlr_layer_surface_v1_set_layer(
-                                        out->layer_surface,
-                                        state->use_bottom_layer
-                                            ? ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM
-                                            : ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND);
-                                }
-                            }
-                        }
-                        if (meta->battery_policy[0] != '\0' && state->power_gov) {
-                            waywal_battery_policy_t bpol = WAYWAL_BATTERY_REDUCE_FPS;
-                            if (strcasecmp(meta->battery_policy, "ignore") == 0) {
-                                bpol = WAYWAL_BATTERY_IGNORE;
-                            } else if (strcasecmp(meta->battery_policy, "pause-video") == 0) {
-                                bpol = WAYWAL_BATTERY_PAUSE_VIDEO;
-                            }
-                            waywal_power_governor_set_battery_policy(state->power_gov, bpol);
-                        }
-
-                        if (meta->has_auto_day_night) {
-                            bool adn = (meta->auto_day_night != 0);
-                            state->config.solar.auto_day_night = adn;
-                            state->config.theme.auto_day_night = adn;
-                            state->config.daemon.auto_day_night = adn;
-                            state->config.auto_day_night = adn;
-                        }
-                        if (meta->has_solar_coords && isfinite(meta->solar_latitude) &&
-                            isfinite(meta->solar_longitude)) {
-                            state->config.solar.latitude = meta->solar_latitude;
-                            state->config.solar.longitude = meta->solar_longitude;
-                            state->config.solar.has_coordinates = true;
-                        }
-
-                        state->sched_theme_override_active = false;
-                        if (!meta->is_solid_color || meta->extract_theme || meta->has_seed_color ||
-                            meta->client_exported_theme ||
-                            (state->config.theme.enabled && !meta->no_theme)) {
-                            daemon_update_palette_from_bgra(state, pixels, meta->width,
-                                                            meta->height, meta, false);
-                        }
-
-                        const char *first_target = "*";
-                        if (meta->num_target_outputs > 0) {
-                            first_target = (const char *)meta + sizeof(waywal_img_metadata_t);
-                        }
-                        bool is_anim =
-                            (!meta->is_solid_color) &&
-                            try_start_native_animation(state, meta->filepath, meta, first_target);
-                        bool direct_depth_parallax = false;
-                        if (!meta->is_solid_color && !is_anim && meta->depth_map_path[0] != '\0' &&
-                            (meta->transition_type == WAYWAL_TRANSITION_NONE ||
-                             meta->transition_duration_ms == 0)) {
-                            for (output_node_t *out = state->outputs; out != NULL;
-                                 out = out->next) {
-                                if (!output_matches_img_meta(out, meta))
-                                    continue;
-                                out->scaling_mode = meta->scaling_mode;
-                                out->filter_mode = meta->filter_mode;
-                                out->ten_bit = meta->ten_bit;
-                                out->crop_gravity_x =
-                                    meta->has_crop_gravity ? meta->crop_gravity_x : 0.5f;
-                                out->crop_gravity_y =
-                                    meta->has_crop_gravity ? meta->crop_gravity_y : 0.5f;
-                                out->has_crop_gravity = (meta->has_crop_gravity != 0);
-                            }
-                            direct_depth_parallax = daemon_activate_depth_parallax(
-                                state, pixels, meta->width, meta->height, meta, first_target);
-                        }
-
-                        if (direct_depth_parallax ||
-                            (is_anim && (meta->transition_type == WAYWAL_TRANSITION_NONE ||
-                                         meta->transition_duration_ms == 0))) {
-                            ok = true;
-                        } else {
-                            ok = daemon_start_image_transition(state, pixels, meta->width,
-                                                               meta->height, meta);
-                            if (ok && !meta->is_solid_color && !is_anim &&
-                                meta->depth_map_path[0] != '\0') {
-                                (void)daemon_activate_depth_parallax(
-                                    state, pixels, meta->width, meta->height, meta, first_target);
-                            }
-                        }
-                        if (ok) {
-                            if (!meta->is_solid_color &&
-                                waywal_dynwall_is_manifest_path(meta->filepath)) {
-                                state->solar_owns_wallpaper = true;
-                                snprintf(state->active_dynwall_path,
-                                         sizeof(state->active_dynwall_path), "%s", meta->filepath);
-                                snprintf(state->active_dynwall_output,
-                                         sizeof(state->active_dynwall_output), "%s", first_target);
-                                waywal_dynwall_manifest_t man;
-                                waywal_dynwall_resolved_t res;
-                                time_t now_utc = time(NULL);
-                                struct tm lt;
-                                localtime_r(&now_utc, &lt);
-                                waywal_solar_state_t sstate;
-                                if (state->config.solar.has_coordinates) {
-                                    waywal_solar_compute(state->config.solar.latitude,
-                                                         state->config.solar.longitude, now_utc,
-                                                         &lt, &sstate);
-                                } else {
-                                    waywal_solar_synthesize_local(
-                                        state->config.solar.sunrise_fallback_min,
-                                        state->config.solar.sunset_fallback_min, now_utc, &lt,
-                                        &sstate);
-                                }
-                                if (waywal_dynwall_load_file(meta->filepath, &man) &&
-                                    waywal_dynwall_resolve(&man, now_utc, &lt, &sstate, &res) &&
-                                    waywal_dynwall_effective_path(&res)[0] != '\0') {
-                                    snprintf(state->last_dynwall_frame_path,
-                                             sizeof(state->last_dynwall_frame_path), "%s",
-                                             waywal_dynwall_effective_path(&res));
-                                    if (res.has_theme_mode) {
-                                        state->sched_theme_override_active = true;
-                                    }
-                                }
-                            } else {
-                                state->solar_owns_wallpaper = false;
-                                state->active_dynwall_path[0] = '\0';
-                                state->last_dynwall_frame_path[0] = '\0';
-                            }
-                        }
-                        if (ok && (state->active_dynwall_path[0] != '\0' ||
-                                   state->config.solar.auto_day_night ||
-                                   state->config.theme.auto_day_night ||
-                                   state->config.daemon.auto_day_night ||
-                                   state->config.auto_day_night)) {
-                            daemon_tick_solar_and_schedule(state, true);
-                        }
-
-                        if (ok && !meta->no_cache) {
-                            const char *filt_str = waywal_filter_mode_to_swww_str(
-                                (waywal_filter_mode_t)meta->filter_mode);
+                            bool can_transition = !has_transition;
                             char matched_outputs[512] = {0};
                             size_t mo_len = 0;
                             for (output_node_t *out = state->outputs; out != NULL;
                                  out = out->next) {
-                                if (output_matches_img_meta(out, meta) && out->name[0] != '\0') {
-                                    int n = snprintf(matched_outputs + mo_len,
-                                                     sizeof(matched_outputs) - mo_len, "%s%s",
-                                                     mo_len ? "," : "", out->name);
-                                    if (n > 0 && mo_len + (size_t)n < sizeof(matched_outputs)) {
-                                        mo_len += (size_t)n;
+                                if (output_matches_img_meta(out, meta)) {
+                                    if (out->surface && out->configured && out->width > 0 &&
+                                        out->height > 0) {
+                                        can_transition = true;
                                     }
-                                }
-                            }
-                            (void)waywal_ecosystem_cache_sync(
-                                mo_len > 0 ? matched_outputs : first_target, meta->filepath,
-                                filt_str, pixels, meta->width, meta->height,
-                                state->config.theme.caelestia_sync, false);
-                        }
-
-                        if (ok && !meta->no_cache &&
-                            (meta->filepath[0] != '\0' || meta->is_solid_color)) {
-                            waywal_output_saved_state_t s_entry;
-                            memset(&s_entry, 0, sizeof(s_entry));
-                            if (meta->is_solid_color) {
-                                s_entry.kind = WAYWAL_CONTENT_SOLID_COLOR;
-                                s_entry.media_path[0] = '\0';
-                            } else {
-                                s_entry.kind = is_anim ? WAYWAL_CONTENT_ANIMATION
-                                                       : WAYWAL_CONTENT_STATIC_IMAGE;
-                                snprintf(s_entry.media_path, sizeof(s_entry.media_path), "%.*s",
-                                         (int)(sizeof(meta->filepath) - 1), meta->filepath);
-                            }
-                            s_entry.scaling = (waywal_scaling_mode_t)meta->scaling_mode;
-                            s_entry.filter = (waywal_filter_mode_t)meta->filter_mode;
-                            s_entry.ten_bit = meta->ten_bit;
-                            uint8_t col_a = meta->color[3] ? meta->color[3] : 255;
-                            s_entry.solid_color = ((uint32_t)meta->color[0] << 24) |
-                                                  ((uint32_t)meta->color[1] << 16) |
-                                                  ((uint32_t)meta->color[2] << 8) |
-                                                  (uint32_t)col_a;
-                            s_entry.crop_gravity_x =
-                                meta->has_crop_gravity ? meta->crop_gravity_x : 0.5f;
-                            s_entry.crop_gravity_y =
-                                meta->has_crop_gravity ? meta->crop_gravity_y : 0.5f;
-                            s_entry.has_crop_gravity = meta->has_crop_gravity ? 1 : 0;
-
-                            if (meta->num_target_outputs > 0 &&
-                                !extra_has_wildcard((const char *)meta +
-                                                        sizeof(waywal_img_metadata_t),
-                                                    meta->extra_data_len,
-                                                    meta->num_target_outputs)) {
-                                const char *ptr =
-                                    (const char *)meta + sizeof(waywal_img_metadata_t);
-                                for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
-                                    bool matched_out = false;
-                                    for (output_node_t *out = state->outputs; out != NULL;
-                                         out = out->next) {
-                                        if (output_matches_target_spec(out, ptr) &&
-                                            out->name[0] != '\0') {
-                                            memset(s_entry.output_name, 0,
-                                                   sizeof(s_entry.output_name));
-                                            strncpy(s_entry.output_name, out->name,
-                                                    sizeof(s_entry.output_name) - 1);
-                                            (void)waywal_state_store_update_output(&g_saved_state,
-                                                                                   &s_entry);
-                                            matched_out = true;
+                                    if (out->name[0] != '\0') {
+                                        int n = snprintf(matched_outputs + mo_len,
+                                                         sizeof(matched_outputs) - mo_len, "%s%s",
+                                                         mo_len ? "," : "", out->name);
+                                        if (n > 0 && mo_len + (size_t)n < sizeof(matched_outputs)) {
+                                            mo_len += (size_t)n;
                                         }
                                     }
-                                    if (!matched_out) {
-                                        memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                                        strncpy(s_entry.output_name, ptr,
-                                                sizeof(s_entry.output_name) - 1);
-                                        (void)waywal_state_store_update_output(&g_saved_state,
-                                                                               &s_entry);
-                                    }
-                                    ptr += strlen(ptr) + 1;
                                 }
-                            } else {
-                                strncpy(s_entry.output_name, "*", sizeof(s_entry.output_name) - 1);
-                                (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                            }
+
+                            if (meta->backdrop[0] != '\0') {
+                                state->backdrop_auto_blur =
+                                    (strcasecmp(meta->backdrop, "auto-blur") == 0);
+                                if (strcasecmp(meta->backdrop, "none") == 0) {
+                                    state->backdrop_path[0] = '\0';
+                                } else if (!state->backdrop_auto_blur) {
+                                    strncpy(state->backdrop_path, meta->backdrop,
+                                            sizeof(state->backdrop_path) - 1);
+                                    state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+                                }
+                            }
+                            if (meta->layer_name[0] != '\0') {
+                                state->use_bottom_layer =
+                                    (strcasecmp(meta->layer_name, "bottom") == 0);
                                 for (output_node_t *out = state->outputs; out != NULL;
                                      out = out->next) {
-                                    if (out->name[0] != '\0') {
-                                        memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                                        strncpy(s_entry.output_name, out->name,
-                                                sizeof(s_entry.output_name) - 1);
-                                        (void)waywal_state_store_update_output(&g_saved_state,
-                                                                               &s_entry);
+                                    if (out->layer_surface && out->surface) {
+                                        zwlr_layer_surface_v1_set_layer(
+                                            out->layer_surface,
+                                            state->use_bottom_layer
+                                                ? ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM
+                                                : ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND);
                                     }
                                 }
                             }
-                            (void)waywal_state_store_save(&g_saved_state, NULL);
+                            if (meta->battery_policy[0] != '\0' && state->power_gov) {
+                                waywal_battery_policy_t bpol = WAYWAL_BATTERY_REDUCE_FPS;
+                                if (strcasecmp(meta->battery_policy, "ignore") == 0) {
+                                    bpol = WAYWAL_BATTERY_IGNORE;
+                                } else if (strcasecmp(meta->battery_policy, "pause-video") == 0) {
+                                    bpol = WAYWAL_BATTERY_PAUSE_VIDEO;
+                                }
+                                waywal_power_governor_set_battery_policy(state->power_gov, bpol);
+                            }
+
+                            if (meta->has_auto_day_night) {
+                                bool adn = (meta->auto_day_night != 0);
+                                state->config.solar.auto_day_night = adn;
+                                state->config.theme.auto_day_night = adn;
+                                state->config.daemon.auto_day_night = adn;
+                                state->config.auto_day_night = adn;
+                            }
+                            if (meta->has_solar_coords && isfinite(meta->solar_latitude) &&
+                                isfinite(meta->solar_longitude)) {
+                                state->config.solar.latitude = meta->solar_latitude;
+                                state->config.solar.longitude = meta->solar_longitude;
+                                state->config.solar.has_coordinates = true;
+                            }
+
+                            state->sched_theme_override_active = false;
+                            if (!meta->is_solid_color || meta->extract_theme ||
+                                meta->has_seed_color || meta->client_exported_theme ||
+                                (state->config.theme.enabled && !meta->no_theme)) {
+                                daemon_update_palette_from_bgra(state, pixels, meta->width,
+                                                                meta->height, meta, false);
+                            }
+
+                            bool cache_synced = false;
+                            if (can_transition && !meta->no_cache) {
+                                const char *filt_str = waywal_filter_mode_to_swww_str(
+                                    (waywal_filter_mode_t)meta->filter_mode);
+                                (void)waywal_ecosystem_cache_sync(
+                                    mo_len > 0 ? matched_outputs : first_target, meta->filepath,
+                                    filt_str, pixels, meta->width, meta->height,
+                                    state->config.general.caelestia_sync, false);
+                                cache_synced = true;
+                            }
+
+                            if (state->outputs) {
+                                for (output_node_t *out = state->outputs; out != NULL;
+                                     out = out->next) {
+                                    if (output_matches_img_meta(out, meta)) {
+                                        if (has_transition) {
+                                            layer_shell_snapshot_live_output(state, out);
+                                        }
+                                        stop_engines_on_output(state, out, false, false, false,
+                                                               false);
+                                    }
+                                }
+                                reconcile_global_engine_flags(state);
+                            } else {
+                                if (state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED) {
+                                    video_engine_stop(&state->video_engine);
+                                }
+                                slideshow_stop(&state->slideshow);
+                                shader_engine_stop_playback(state);
+                                anim_engine_stop_playback(state);
+                            }
+                            if (state->power_gov) {
+                                waywal_power_governor_set_global_reason(
+                                    state->power_gov, WAYWAL_PAUSE_USER_MANUAL, false);
+                            }
+
+                            bool is_anim = (!meta->is_solid_color) &&
+                                           try_start_native_animation(state, meta->filepath, meta,
+                                                                      first_target);
+                            bool direct_depth_parallax = false;
+                            if (!meta->is_solid_color && !is_anim &&
+                                meta->depth_map_path[0] != '\0' && !has_transition) {
+                                for (output_node_t *out = state->outputs; out != NULL;
+                                     out = out->next) {
+                                    if (!output_matches_img_meta(out, meta))
+                                        continue;
+                                    out->scaling_mode = meta->scaling_mode;
+                                    out->filter_mode = meta->filter_mode;
+                                    out->ten_bit = meta->ten_bit;
+                                    out->crop_gravity_x =
+                                        meta->has_crop_gravity ? meta->crop_gravity_x : 0.5f;
+                                    out->crop_gravity_y =
+                                        meta->has_crop_gravity ? meta->crop_gravity_y : 0.5f;
+                                    out->has_crop_gravity = (meta->has_crop_gravity != 0);
+                                }
+                                direct_depth_parallax = daemon_activate_depth_parallax(
+                                    state, pixels, meta->width, meta->height, meta, first_target);
+                            }
+
+                            bool will_succeed = direct_depth_parallax ||
+                                                (is_anim && !has_transition) || can_transition;
+                            if (will_succeed) {
+                                if (!meta->is_solid_color &&
+                                    waywal_dynwall_is_manifest_path(meta->filepath)) {
+                                    state->solar_owns_wallpaper = true;
+                                    snprintf(state->active_dynwall_path,
+                                             sizeof(state->active_dynwall_path), "%s",
+                                             meta->filepath);
+                                    snprintf(state->active_dynwall_output,
+                                             sizeof(state->active_dynwall_output), "%s",
+                                             first_target);
+                                    waywal_dynwall_manifest_t man;
+                                    waywal_dynwall_resolved_t res;
+                                    time_t now_utc = time(NULL);
+                                    struct tm lt;
+                                    localtime_r(&now_utc, &lt);
+                                    waywal_solar_state_t sstate;
+                                    if (state->config.solar.has_coordinates) {
+                                        waywal_solar_compute(state->config.solar.latitude,
+                                                             state->config.solar.longitude, now_utc,
+                                                             &lt, &sstate);
+                                    } else {
+                                        waywal_solar_synthesize_local(
+                                            state->config.solar.sunrise_fallback_min,
+                                            state->config.solar.sunset_fallback_min, now_utc, &lt,
+                                            &sstate);
+                                    }
+                                    if (waywal_dynwall_load_file(meta->filepath, &man) &&
+                                        waywal_dynwall_resolve(&man, now_utc, &lt, &sstate, &res) &&
+                                        waywal_dynwall_effective_path(&res)[0] != '\0') {
+                                        snprintf(state->last_dynwall_frame_path,
+                                                 sizeof(state->last_dynwall_frame_path), "%s",
+                                                 waywal_dynwall_effective_path(&res));
+                                        if (res.has_theme_mode) {
+                                            state->sched_theme_override_active = true;
+                                        }
+                                    }
+                                } else {
+                                    state->solar_owns_wallpaper = false;
+                                    state->active_dynwall_path[0] = '\0';
+                                    state->last_dynwall_frame_path[0] = '\0';
+                                }
+
+                                if (state->active_dynwall_path[0] != '\0' ||
+                                    state->config.solar.auto_day_night ||
+                                    state->config.theme.auto_day_night ||
+                                    state->config.daemon.auto_day_night ||
+                                    state->config.auto_day_night) {
+                                    daemon_tick_solar_and_schedule(state, true);
+                                }
+
+                                if (!cache_synced && !meta->no_cache) {
+                                    const char *filt_str = waywal_filter_mode_to_swww_str(
+                                        (waywal_filter_mode_t)meta->filter_mode);
+                                    (void)waywal_ecosystem_cache_sync(
+                                        mo_len > 0 ? matched_outputs : first_target, meta->filepath,
+                                        filt_str, pixels, meta->width, meta->height,
+                                        state->config.general.caelestia_sync, false);
+                                }
+
+                                if (!meta->no_cache &&
+                                    (meta->filepath[0] != '\0' || meta->is_solid_color)) {
+                                    waywal_output_saved_state_t s_entry;
+                                    memset(&s_entry, 0, sizeof(s_entry));
+                                    if (meta->is_solid_color) {
+                                        s_entry.kind = WAYWAL_CONTENT_SOLID_COLOR;
+                                        s_entry.media_path[0] = '\0';
+                                    } else {
+                                        s_entry.kind = is_anim ? WAYWAL_CONTENT_ANIMATION
+                                                               : WAYWAL_CONTENT_STATIC_IMAGE;
+                                        snprintf(s_entry.media_path, sizeof(s_entry.media_path),
+                                                 "%.*s", (int)(sizeof(meta->filepath) - 1),
+                                                 meta->filepath);
+                                    }
+                                    s_entry.scaling = (waywal_scaling_mode_t)meta->scaling_mode;
+                                    s_entry.filter = (waywal_filter_mode_t)meta->filter_mode;
+                                    s_entry.ten_bit = meta->ten_bit;
+                                    uint8_t col_a = meta->color[3] ? meta->color[3] : 255;
+                                    s_entry.solid_color = ((uint32_t)meta->color[0] << 24) |
+                                                          ((uint32_t)meta->color[1] << 16) |
+                                                          ((uint32_t)meta->color[2] << 8) |
+                                                          (uint32_t)col_a;
+                                    s_entry.crop_gravity_x =
+                                        meta->has_crop_gravity ? meta->crop_gravity_x : 0.5f;
+                                    s_entry.crop_gravity_y =
+                                        meta->has_crop_gravity ? meta->crop_gravity_y : 0.5f;
+                                    s_entry.has_crop_gravity = meta->has_crop_gravity ? 1 : 0;
+
+                                    if (meta->num_target_outputs > 0 &&
+                                        !extra_has_wildcard(
+                                            (const char *)meta + sizeof(waywal_img_metadata_t),
+                                            meta->extra_data_len, meta->num_target_outputs)) {
+                                        const char *ptr =
+                                            (const char *)meta + sizeof(waywal_img_metadata_t);
+                                        for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
+                                            bool matched_out = false;
+                                            for (output_node_t *out = state->outputs; out != NULL;
+                                                 out = out->next) {
+                                                if (output_matches_target_spec(out, ptr) &&
+                                                    out->name[0] != '\0') {
+                                                    memset(s_entry.output_name, 0,
+                                                           sizeof(s_entry.output_name));
+                                                    strncpy(s_entry.output_name, out->name,
+                                                            sizeof(s_entry.output_name) - 1);
+                                                    (void)waywal_state_store_update_output(
+                                                        &g_saved_state, &s_entry);
+                                                    matched_out = true;
+                                                }
+                                            }
+                                            if (!matched_out) {
+                                                memset(s_entry.output_name, 0,
+                                                       sizeof(s_entry.output_name));
+                                                strncpy(s_entry.output_name, ptr,
+                                                        sizeof(s_entry.output_name) - 1);
+                                                (void)waywal_state_store_update_output(
+                                                    &g_saved_state, &s_entry);
+                                            }
+                                            ptr += strlen(ptr) + 1;
+                                        }
+                                    } else {
+                                        strncpy(s_entry.output_name, "*",
+                                                sizeof(s_entry.output_name) - 1);
+                                        (void)waywal_state_store_update_output(&g_saved_state,
+                                                                               &s_entry);
+                                        for (output_node_t *out = state->outputs; out != NULL;
+                                             out = out->next) {
+                                            if (out->name[0] != '\0') {
+                                                memset(s_entry.output_name, 0,
+                                                       sizeof(s_entry.output_name));
+                                                strncpy(s_entry.output_name, out->name,
+                                                        sizeof(s_entry.output_name) - 1);
+                                                (void)waywal_state_store_update_output(
+                                                    &g_saved_state, &s_entry);
+                                            }
+                                        }
+                                    }
+                                    (void)waywal_state_store_save(&g_saved_state, NULL);
+                                }
+                            }
+
+                            if (direct_depth_parallax || (is_anim && !has_transition)) {
+                                ok = true;
+                            } else {
+                                ok = daemon_start_image_transition(state, pixels, meta->width,
+                                                                   meta->height, meta);
+                                if (ok && !meta->is_solid_color && !is_anim &&
+                                    meta->depth_map_path[0] != '\0') {
+                                    (void)daemon_activate_depth_parallax(state, pixels, meta->width,
+                                                                         meta->height, meta,
+                                                                         first_target);
+                                }
+                            }
                         }
                     } else {
                         WAYWAL_LOG_ERR("IPC image payload string validation failed");
@@ -1191,7 +1260,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                             const char *end = (const char *)memchr(ptr, '\0', remaining);
                             if (!end)
                                 break;
-                            for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                            for (output_node_t *out = state->outputs; out != NULL;
+                                 out = out->next) {
                                 if (output_matches_target_spec(out, ptr)) {
                                     stop_engines_on_output(state, out, false, false,
                                                            out->video_eng == &state->video_engine,
@@ -1221,8 +1291,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 video_engine_t *ve = &state->video_engine;
                 if (has_extra_targets && state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED &&
                     (!target_out || state->video_engine.target_output != target_out)) {
-                    video_engine_t *custom_ve =
-                        (video_engine_t *)calloc(1, sizeof(video_engine_t));
+                    video_engine_t *custom_ve = (video_engine_t *)calloc(1, sizeof(video_engine_t));
                     if (custom_ve && video_engine_init(custom_ve, state)) {
                         if (custom_ve->timer_fd >= 0) {
                             register_fd_in_loops(state, custom_ve->timer_fd, URING_EV_TIMER);
@@ -1249,7 +1318,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                             const char *end = (const char *)memchr(ptr, '\0', remaining);
                             if (!end)
                                 break;
-                            for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                            for (output_node_t *out = state->outputs; out != NULL;
+                                 out = out->next) {
                                 if (output_matches_target_spec(out, ptr)) {
                                     out->video_targeted = true;
                                 }
@@ -1332,8 +1402,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         if (ok) {
             for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
                 if (out->video_eng != NULL &&
-                    (!has_extra_targets || output_matches_extra(out, extra_buf, extra_len,
-                                                                vpay.num_target_outputs))) {
+                    (!has_extra_targets ||
+                     output_matches_extra(out, extra_buf, extra_len, vpay.num_target_outputs))) {
                     out->displaying_color = false;
                     if (has_vpay && vpay.filepath[0] != '\0') {
                         snprintf(out->active_media_path, sizeof(out->active_media_path), "%s",
@@ -1352,9 +1422,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         (!has_extra_targets || output_matches_extra(out, extra_buf, extra_len,
                                                                     vpay.num_target_outputs)) &&
                         out->name[0] != '\0') {
-                        int n =
-                            snprintf(matched_outputs + mlen, sizeof(matched_outputs) - mlen, "%s%s",
-                                     mlen > 0 ? "," : "", out->name);
+                        int n = snprintf(matched_outputs + mlen, sizeof(matched_outputs) - mlen,
+                                         "%s%s", mlen > 0 ? "," : "", out->name);
                         if (n > 0 && mlen + (size_t)n < sizeof(matched_outputs)) {
                             mlen += (size_t)n;
                         }
@@ -1363,7 +1432,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 const char *fallback_target = has_extra_targets ? extra_buf : "*";
                 (void)waywal_ecosystem_cache_sync(
                     matched_outputs[0] ? matched_outputs : fallback_target, vpay.filepath,
-                    "Lanczos3", NULL, 0, 0, state->config.theme.caelestia_sync,
+                    "Lanczos3", NULL, 0, 0, state->config.general.caelestia_sync,
                     vpay.no_cache != 0);
 
                 waywal_output_saved_state_t s_entry;
@@ -1559,7 +1628,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         memset(&spay, 0, sizeof(spay));
         bool ok = false;
         const size_t min_spay = offsetof(waywal_slideshow_payload_t, extract_theme);
-        size_t read_spay = req_hdr.payload_size < sizeof(spay) ? req_hdr.payload_size : sizeof(spay);
+        size_t read_spay =
+            req_hdr.payload_size < sizeof(spay) ? req_hdr.payload_size : sizeof(spay);
         if (req_hdr.payload_size >= min_spay && req_hdr.payload_size <= sizeof(spay)) {
             if (read_exact(client_fd, &spay, read_spay)) {
                 spay.path[sizeof(spay.path) - 1] = '\0';
@@ -1659,8 +1729,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         }
 
         if (valid_payload) {
-            const char *target_spec =
-                (sctrl.target_output[0] != '\0') ? sctrl.target_output : "*";
+            const char *target_spec = (sctrl.target_output[0] != '\0') ? sctrl.target_output : "*";
             bool is_wildcard = (strcmp(target_spec, "*") == 0);
             bool global_matches = is_wildcard;
             if (!global_matches && !state->outputs) {
@@ -1773,7 +1842,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         }
         resp_hdr.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
-        if (ok && (sctrl.action == WAYWAL_SLIDESHOW_NEXT || sctrl.action == WAYWAL_SLIDESHOW_PREV)) {
+        if (ok &&
+            (sctrl.action == WAYWAL_SLIDESHOW_NEXT || sctrl.action == WAYWAL_SLIDESHOW_PREV)) {
             daemon_broadcast_event(state, "wallpaper_changed");
         }
         break;
@@ -1843,7 +1913,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         memset(&wpay, 0, sizeof(wpay));
         bool ok = false;
         const size_t min_wpay = offsetof(waywal_workshop_payload_t, extract_theme);
-        size_t read_wpay = req_hdr.payload_size < sizeof(wpay) ? req_hdr.payload_size : sizeof(wpay);
+        size_t read_wpay =
+            req_hdr.payload_size < sizeof(wpay) ? req_hdr.payload_size : sizeof(wpay);
         if (req_hdr.payload_size >= min_wpay && req_hdr.payload_size <= sizeof(wpay) &&
             read_exact(client_fd, &wpay, read_wpay)) {
             wpay.output[sizeof(wpay.output) - 1] = '\0';

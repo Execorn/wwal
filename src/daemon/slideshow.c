@@ -403,10 +403,7 @@ static void display_current_image(slideshow_engine_t *ss)
         st->on_wallpaper_loaded(st, pixels, img_w, img_h, meta);
     }
 
-    bool ok = daemon_start_image_transition
-                  ? daemon_start_image_transition(st, pixels, img_w, img_h, meta)
-                  : false;
-    if (ok && !ss->no_cache) {
+    if (daemon_start_image_transition && !ss->no_cache) {
         const char *filt_str =
             waywal_filter_mode_to_swww_str((waywal_filter_mode_t)ss->filter_mode);
         char matched_outputs[256] = {0};
@@ -423,8 +420,12 @@ static void display_current_image(slideshow_engine_t *ss)
         const char *first_target = (meta->num_target_outputs > 0) ? extra_ptr : "*";
         (void)waywal_ecosystem_cache_sync(matched_outputs[0] ? matched_outputs : first_target,
                                           filepath, filt_str, pixels, img_w, img_h,
-                                          st->config.theme.caelestia_sync, ss->no_cache);
+                                          st->config.general.caelestia_sync, ss->no_cache);
     }
+
+    bool ok = daemon_start_image_transition
+                  ? daemon_start_image_transition(st, pixels, img_w, img_h, meta)
+                  : false;
     image_free(pixels);
     if (ok) {
         if (st->config.hooks.on_wallpaper_change[0] != '\0') {
@@ -541,14 +542,13 @@ bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *p
     strncpy(ss->root_path, payload->path, sizeof(ss->root_path) - 1);
     ss->recursive = (payload->no_recursive == 0);
     ss->random_order = payload->random_order;
-    bool explicit_sort = (payload->has_sort_mode != 0) ||
-                         (payload->sort_mode > (uint8_t)WAYWAL_SORT_RANDOM &&
-                          payload->sort_mode <= (uint8_t)WAYWAL_SORT_MTIME);
+    bool explicit_sort =
+        (payload->has_sort_mode != 0) || (payload->sort_mode > (uint8_t)WAYWAL_SORT_RANDOM &&
+                                          payload->sort_mode <= (uint8_t)WAYWAL_SORT_MTIME);
     ss->has_sort_mode = explicit_sort;
-    ss->sort_mode = explicit_sort
-                        ? payload->sort_mode
-                        : (payload->random_order ? (uint8_t)WAYWAL_SORT_RANDOM
-                                                 : (uint8_t)WAYWAL_SORT_ASCENDING);
+    ss->sort_mode = explicit_sort ? payload->sort_mode
+                                  : (payload->random_order ? (uint8_t)WAYWAL_SORT_RANDOM
+                                                           : (uint8_t)WAYWAL_SORT_ASCENDING);
     if (ss->has_sort_mode) {
         ss->random_order = (ss->sort_mode == (uint8_t)WAYWAL_SORT_RANDOM);
     }
@@ -607,8 +607,9 @@ bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *p
     ss->paused = false;
     ss->current_file_idx = 0;
 
-    WAYWAL_LOG_INFO("Slideshow started with %zu media items (interval: %us, sort: %u, transition: %u)",
-                    ss->num_files, ss->interval_s, (unsigned)ss->sort_mode, ss->transition_type);
+    WAYWAL_LOG_INFO(
+        "Slideshow started with %zu media items (interval: %us, sort: %u, transition: %u)",
+        ss->num_files, ss->interval_s, (unsigned)ss->sort_mode, ss->transition_type);
 
     display_current_image(ss);
     arm_timer(ss);

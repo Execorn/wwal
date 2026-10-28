@@ -1602,6 +1602,7 @@ bool video_engine_snapshot_output(video_engine_t *ve, output_node_t *out)
             if (ok) {
                 out->has_image = true;
                 out->last_presented_bo = &out->source_old_bo;
+                out->last_committed_ring_idx = -1;
                 return true;
             }
         }
@@ -1633,6 +1634,7 @@ bool video_engine_snapshot_output(video_engine_t *ve, output_node_t *out)
                 if (ok) {
                     out->has_image = true;
                     out->last_presented_bo = &out->source_old_bo;
+                    out->last_committed_ring_idx = -1;
                     return true;
                 }
             }
@@ -1643,6 +1645,7 @@ bool video_engine_snapshot_output(video_engine_t *ve, output_node_t *out)
                                             clear_col)) {
                 out->has_image = true;
                 out->last_presented_bo = &out->source_old_bo;
+                out->last_committed_ring_idx = -1;
                 return true;
             }
         }

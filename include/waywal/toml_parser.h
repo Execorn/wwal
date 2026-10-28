@@ -108,6 +108,7 @@ typedef struct {
     };
     bool has_slideshow_recursive;
     bool auto_day_night;
+    bool caelestia_sync;
 } waywal_daemon_config_t;
 
 typedef struct {
@@ -338,7 +339,10 @@ typedef struct {
 typedef waywal_schedule_rule_t waywal_schedule_entry_t;
 
 typedef struct waywal_config {
-    waywal_daemon_config_t daemon;
+    union {
+        waywal_daemon_config_t daemon;
+        waywal_daemon_config_t general;
+    };
     waywal_theme_config_t theme;
     waywal_transition_config_t transition;
     waywal_hooks_config_t hooks;

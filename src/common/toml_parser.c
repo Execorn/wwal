@@ -353,8 +353,8 @@ void waywal_config_init_defaults(waywal_config_t *out_cfg)
 
     copy_str_safe(out_cfg->transition.type, sizeof(out_cfg->transition.type), "fade");
     out_cfg->transition.type_enum = 2U;
-    out_cfg->transition.duration = 0.7f;
-    out_cfg->transition.fps = 144U;
+    out_cfg->transition.duration = 1.2f;
+    out_cfg->transition.fps = 60U;
     out_cfg->transition.bezier[0] = 0.25f;
     out_cfg->transition.bezier[1] = 0.10f;
     out_cfg->transition.bezier[2] = 0.25f;
@@ -1685,6 +1685,12 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                 out_cfg->daemon.auto_day_night = adn;
                 out_cfg->theme.auto_day_night = adn;
                 out_cfg->solar.auto_day_night = adn;
+            } else if (strcmp(key, "caelestia_sync") == 0) {
+                bool cs = false;
+                if (!parse_bool_val(&lex, &cs))
+                    return false;
+                out_cfg->daemon.caelestia_sync = cs;
+                out_cfg->theme.caelestia_sync = cs;
             } else {
                 set_error(&lex, "unknown key '%s' in [daemon]", key);
                 return false;
@@ -1721,8 +1727,11 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                 out_cfg->theme.auto_day_night = adn;
                 out_cfg->solar.auto_day_night = adn;
             } else if (strcmp(key, "caelestia_sync") == 0) {
-                if (!parse_bool_val(&lex, &out_cfg->theme.caelestia_sync))
+                bool cs = false;
+                if (!parse_bool_val(&lex, &cs))
                     return false;
+                out_cfg->theme.caelestia_sync = cs;
+                out_cfg->daemon.caelestia_sync = cs;
             } else if (strcmp(key, "tty_sequences") == 0 || strcmp(key, "terminal_osc") == 0) {
                 if (!parse_bool_val(&lex, &out_cfg->theme.tty_sequences))
                     return false;
@@ -1871,8 +1880,7 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                 if (!parse_quoted_string(&lex, raw_out_path, sizeof(raw_out_path))) {
                     return false;
                 }
-                if (!waywal_expand_path(raw_out_path, cur_output->path,
-                                        sizeof(cur_output->path))) {
+                if (!waywal_expand_path(raw_out_path, cur_output->path, sizeof(cur_output->path))) {
                     set_error(&lex, "invalid or unexpandable output.path '%s'", raw_out_path);
                     return false;
                 }
@@ -2152,7 +2160,7 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                     return false;
                 }
                 if (!waywal_expand_path(raw_path, cur_template->input_path,
-                                         sizeof(cur_template->input_path))) {
+                                        sizeof(cur_template->input_path))) {
                     set_error(&lex, "expanded input_path exceeds maximum length");
                     return false;
                 }
@@ -2163,7 +2171,7 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                     return false;
                 }
                 if (!waywal_expand_path(raw_path, cur_template->output_path,
-                                         sizeof(cur_template->output_path))) {
+                                        sizeof(cur_template->output_path))) {
                     set_error(&lex, "expanded output_path exceeds maximum length");
                     return false;
                 }
@@ -2276,16 +2284,14 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
         } else if (section == SECTION_SCHEDULE) {
             waywal_solar_phase_t shorthand_ph;
             int32_t shorthand_mins = -1;
-            bool is_shorthand_ph =
-                (!cur_schedule && strcmp(key, "phase") != 0 && strcmp(key, "time") != 0 &&
-                 strcmp(key, "start") != 0 && strcmp(key, "path") != 0 &&
-                 strcmp(key, "image") != 0 && strcmp(key, "file") != 0 &&
-                 strcmp(key, "mode") != 0 && strcmp(key, "output") != 0 &&
-                 strcmp(key, "theme_mode") != 0 &&
-                 waywal_solar_phase_from_string(key, &shorthand_ph));
-            bool is_shorthand_tm =
-                (!cur_schedule && !is_shorthand_ph &&
-                 waywal_parse_hhmm_minutes(key, &shorthand_mins));
+            bool is_shorthand_ph = (!cur_schedule && strcmp(key, "phase") != 0 &&
+                                    strcmp(key, "time") != 0 && strcmp(key, "start") != 0 &&
+                                    strcmp(key, "path") != 0 && strcmp(key, "image") != 0 &&
+                                    strcmp(key, "file") != 0 && strcmp(key, "mode") != 0 &&
+                                    strcmp(key, "output") != 0 && strcmp(key, "theme_mode") != 0 &&
+                                    waywal_solar_phase_from_string(key, &shorthand_ph));
+            bool is_shorthand_tm = (!cur_schedule && !is_shorthand_ph &&
+                                    waywal_parse_hhmm_minutes(key, &shorthand_mins));
 
             if (is_shorthand_ph || is_shorthand_tm) {
                 char raw_p[WAYWAL_PATH_MAX];
@@ -2423,9 +2429,9 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                               : out_cfg->transition.invert_y;
         }
         if (wild_out && wild_out != r) {
-            bool r_is_standalone_color =
-                r->has_explicit_color_key && !r->has_path && !r->has_scaling &&
-                (!r->has_mode || strcasecmp(r->mode, "color") == 0);
+            bool r_is_standalone_color = r->has_explicit_color_key && !r->has_path &&
+                                         !r->has_scaling &&
+                                         (!r->has_mode || strcasecmp(r->mode, "color") == 0);
             bool r_had_own_target = (r->has_path || r_is_standalone_color);
             if (!r_had_own_target && wild_out->has_path) {
                 copy_str_safe(r->path, sizeof(r->path), wild_out->path);

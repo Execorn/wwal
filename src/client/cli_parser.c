@@ -42,7 +42,8 @@ void cli_print_usage(const char *prog)
     printf("  workshop list              List installed Steam Workshop (431960) wallpapers\n");
     printf(
         "  workshop info <ID|PATH>    Inspect Workshop project.json, scene.pkg, and properties\n");
-    printf("  workshop sync-previews [D] Sync Workshop preview symlinks for external GUI pickers\n");
+    printf(
+        "  workshop sync-previews [D] Sync Workshop preview symlinks for external GUI pickers\n");
     printf("  workshop [apply] <ID|PATH> Render native Wallpaper Engine scene or video\n");
     printf("  theme [PATH] [OPTIONS]     Extract HCT Material You theme palette\n");
     printf("  stats [--json]             Display daemon telemetry and frame timing statistics\n");
@@ -567,8 +568,15 @@ static bool parse_common_flag(int *optind_ptr, int argc, char *argv[], cli_optio
         if (step > 0) {
             opts->transition_step = (uint32_t)step;
             if (!opts->has_transition_duration) {
-                opts->transition_duration_ms = (uint32_t)(step * 16);
-                opts->transition_duration = (float)opts->transition_duration_ms / 1000.0f;
+                uint32_t fps = opts->transition_fps > 0 ? opts->transition_fps : 60u;
+                uint32_t frames = (255u + (uint32_t)step - 1u) / (uint32_t)step;
+                uint32_t approx_ms = (frames * 1000u) / fps;
+                if (approx_ms < 100u)
+                    approx_ms = 100u;
+                if (approx_ms > 10000u)
+                    approx_ms = 10000u;
+                opts->transition_duration_ms = approx_ms;
+                opts->transition_duration = (float)approx_ms / 1000.0f;
             }
         }
         return true;
@@ -579,6 +587,16 @@ static bool parse_common_flag(int *optind_ptr, int argc, char *argv[], cli_optio
         if (fps > 0) {
             opts->transition_fps = (uint32_t)fps;
             opts->has_transition_fps = true;
+            if (opts->transition_step > 0 && !opts->has_transition_duration) {
+                uint32_t frames = (255u + opts->transition_step - 1u) / opts->transition_step;
+                uint32_t approx_ms = (frames * 1000u) / opts->transition_fps;
+                if (approx_ms < 100u)
+                    approx_ms = 100u;
+                if (approx_ms > 10000u)
+                    approx_ms = 10000u;
+                opts->transition_duration_ms = approx_ms;
+                opts->transition_duration = (float)approx_ms / 1000.0f;
+            }
         }
         return true;
     }
@@ -994,6 +1012,16 @@ static bool parse_common_flag(int *optind_ptr, int argc, char *argv[], cli_optio
         opts->has_slideshow_sort = true;
         return true;
     }
+    if (strcmp(arg, "--recursive") == 0) {
+        opts->slideshow_recursive = true;
+        opts->has_slideshow_recursive = true;
+        return true;
+    }
+    if (strcmp(arg, "--no-recursive") == 0) {
+        opts->slideshow_recursive = false;
+        opts->has_slideshow_recursive = true;
+        return true;
+    }
 
     return false;
 }
@@ -1041,8 +1069,15 @@ static void apply_compat_env_vars(cli_options_t *opts)
         int step = atoi(val);
         if (step > 0) {
             opts->transition_step = (uint32_t)step;
-            opts->transition_duration_ms = (uint32_t)(step * 16);
-            opts->transition_duration = (float)opts->transition_duration_ms / 1000.0f;
+            uint32_t fps = opts->transition_fps > 0 ? opts->transition_fps : 60u;
+            uint32_t frames = (255u + (uint32_t)step - 1u) / (uint32_t)step;
+            uint32_t approx_ms = (frames * 1000u) / fps;
+            if (approx_ms < 100u)
+                approx_ms = 100u;
+            if (approx_ms > 10000u)
+                approx_ms = 10000u;
+            opts->transition_duration_ms = approx_ms;
+            opts->transition_duration = (float)approx_ms / 1000.0f;
         }
     }
 
@@ -1146,8 +1181,8 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
     strncpy(opts->namespace_str, "default", sizeof(opts->namespace_str) - 1);
     opts->clear_color = (color_rgba_t){.r = 0, .g = 0, .b = 0, .a = 255};
     opts->transition_type = WAYWAL_TRANSITION_FADE;
-    opts->transition_duration = 1.0f;
-    opts->transition_duration_ms = 1000;
+    opts->transition_duration = 1.2f;
+    opts->transition_duration_ms = 1200;
     opts->transition_fps = 60;
     opts->transition_step = 0;
     opts->transition_angle_rad = 0.0f;
@@ -1171,6 +1206,7 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
     opts->slideshow_interval_s = 300;
     opts->slideshow_random = false;
     opts->slideshow_sort = WAYWAL_SORT_ASCENDING;
+    opts->slideshow_recursive = true;
     opts->volume = -1.0f;
     opts->mute_on_audio = -1;
     opts->theme_from_media = -1;
@@ -1394,7 +1430,8 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
             const char *arg = argv[optind];
             if (strcmp(arg, "--list") == 0) {
                 if (has_path || saw_preset_kw) {
-                    fprintf(stderr, "Error: Cannot combine '--list' with a shader path or preset\n");
+                    fprintf(stderr,
+                            "Error: Cannot combine '--list' with a shader path or preset\n");
                     return false;
                 }
                 opts->shader_list = true;
@@ -1421,8 +1458,7 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
                 if (strncasecmp(arg, "preset:", 7) == 0) {
                     opts->shader_preset_explicit = true;
                 }
-                const char *preset_check =
-                    (strncasecmp(arg, "preset:", 7) == 0) ? (arg + 7) : arg;
+                const char *preset_check = (strncasecmp(arg, "preset:", 7) == 0) ? (arg + 7) : arg;
                 if (opts->shader_preset_explicit &&
                     (preset_check[0] == '\0' || strchr(preset_check, '/') != NULL ||
                      strchr(preset_check, '\\') != NULL || strstr(preset_check, "..") != NULL)) {
@@ -1440,13 +1476,12 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
                 char resolved_preset[4096];
                 bool resolved_ok =
                     waywal_shader_resolve_path(query_buf, resolved_preset, sizeof(resolved_preset));
-                const char *effective =
-                    resolved_ok ? resolved_preset
-                                : (opts->shader_preset_explicit ? query_buf : arg);
+                const char *effective = resolved_ok
+                                            ? resolved_preset
+                                            : (opts->shader_preset_explicit ? query_buf : arg);
                 strncpy(opts->filepath, effective, sizeof(opts->filepath) - 1);
                 opts->filepath[sizeof(opts->filepath) - 1] = '\0';
-                strncpy(opts->custom_shader_path, effective,
-                        sizeof(opts->custom_shader_path) - 1);
+                strncpy(opts->custom_shader_path, effective, sizeof(opts->custom_shader_path) - 1);
                 opts->custom_shader_path[sizeof(opts->custom_shader_path) - 1] = '\0';
                 if (opts->shader_preset_explicit && !resolved_ok) {
                     fprintf(stderr,
@@ -1480,7 +1515,7 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
         opts->cmd = CLI_CMD_WORKSHOP;
         if (optind >= argc) {
             fprintf(stderr,
-                     "Error: 'workshop' requires a subcommand (list, info, apply) or ID/path\n");
+                    "Error: 'workshop' requires a subcommand (list, info, apply) or ID/path\n");
             return false;
         }
         const char *sub = argv[optind];
@@ -1879,8 +1914,8 @@ bool cli_auto_dispatch_img(cli_options_t *opts)
         return false;
     }
 
-    if (opts->is_solid_color ||
-        (access(opts->filepath, F_OK) != 0 && parse_hex_color(opts->filepath, &opts->clear_color))) {
+    if (opts->is_solid_color || (access(opts->filepath, F_OK) != 0 &&
+                                 parse_hex_color(opts->filepath, &opts->clear_color))) {
         opts->is_solid_color = true;
         if (opts->transition_type == WAYWAL_TRANSITION_NONE || opts->transition_duration_ms == 0) {
             opts->cmd = CLI_CMD_COLOR;
@@ -1970,9 +2005,8 @@ bool cli_auto_dispatch_img(cli_options_t *opts)
                 }
                 char resolved_preset[4096];
                 const char *sh_p = (di == 1 && is_symlink) ? resolved : opts->filepath;
-                if (!has_stat &&
-                    waywal_shader_resolve_path(opts->filepath, resolved_preset,
-                                               sizeof(resolved_preset))) {
+                if (!has_stat && waywal_shader_resolve_path(opts->filepath, resolved_preset,
+                                                            sizeof(resolved_preset))) {
                     sh_p = resolved_preset;
                 }
                 if (waywal_shader_is_audio_reactive(opts->filepath) ||
