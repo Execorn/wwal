@@ -5,8 +5,8 @@
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 
 <p align="center">
-  <a href="assets/demo.mp4">
-    <img src="assets/demo.webp" alt="WayWal Demo" width="100%">
+  <a href="https://raw.githubusercontent.com/Execorn/wwal/assets/demo.mp4">
+    <img src="https://raw.githubusercontent.com/Execorn/wwal/assets/demo.webp" alt="WayWal Demo" width="100%">
   </a>
 </p>
 
