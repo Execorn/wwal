@@ -2051,3 +2051,182 @@ bool image_load_raw(const char *filepath, raw_image_t *out_img)
     fill_raw_image(out_img, pixels, w, h);
     return true;
 }
+
+static void ensure_parent_dirs_for_file(const char *filepath)
+{
+    if (!filepath || filepath[0] == '\0')
+        return;
+    char buf[4096];
+    int n = snprintf(buf, sizeof(buf), "%s", filepath);
+    if (n <= 0 || (size_t)n >= sizeof(buf))
+        return;
+    char *last_slash = strrchr(buf, '/');
+    if (!last_slash || last_slash == buf)
+        return;
+    *last_slash = '\0';
+    for (char *p = buf + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            (void)mkdir(buf, 0755);
+            *p = '/';
+        }
+    }
+    (void)mkdir(buf, 0755);
+}
+
+static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint32_t width,
+                              uint32_t height, bool is_bgra)
+{
+    if (!filepath || filepath[0] == '\0' || !pixels || width == 0 || height == 0 ||
+        width > 16384 || height > 16384) {
+        return false;
+    }
+
+    uint32_t dst_w = width;
+    uint32_t dst_h = height;
+    const uint32_t max_w = 1280;
+    const uint32_t max_h = 720;
+    if (dst_w > max_w || dst_h > max_h) {
+        double sx = (double)max_w / (double)dst_w;
+        double sy = (double)max_h / (double)dst_h;
+        double scale = (sx < sy) ? sx : sy;
+        dst_w = (uint32_t)((double)dst_w * scale + 0.5);
+        dst_h = (uint32_t)((double)dst_h * scale + 0.5);
+        if (dst_w == 0)
+            dst_w = 1;
+        if (dst_h == 0)
+            dst_h = 1;
+    }
+
+    char tmp_path[4096];
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", filepath, (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        return false;
+    }
+
+    ensure_parent_dirs_for_file(filepath);
+
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return false;
+    }
+
+    FILE *fp = fdopen(fd, "wb");
+    if (!fp) {
+        close(fd);
+        unlink(tmp_path);
+        return false;
+    }
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) {
+        fclose(fp);
+        unlink(tmp_path);
+        return false;
+    }
+
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_write_struct(&png, NULL);
+        fclose(fp);
+        unlink(tmp_path);
+        return false;
+    }
+
+    uint8_t *volatile row_buf = (uint8_t *)malloc((size_t)dst_w * 4U);
+    if (!row_buf) {
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        unlink(tmp_path);
+        return false;
+    }
+
+    if (setjmp(png_jmpbuf(png))) {
+        free((void *)row_buf);
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        unlink(tmp_path);
+        return false;
+    }
+
+    png_init_io(png, fp);
+    png_set_compression_level(png, 1);
+    png_set_filter(png, 0, PNG_FILTER_SUB | PNG_FILTER_NONE);
+    png_set_IHDR(png, info, dst_w, dst_h, 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    if (is_bgra) {
+        png_set_bgr(png);
+    }
+    png_write_info(png, info);
+
+    bool downscale = (dst_w != width || dst_h != height);
+    for (uint32_t y = 0; y < dst_h; ++y) {
+        if (!downscale) {
+            const uint8_t *src_row = pixels + (size_t)y * (size_t)width * 4U;
+            memcpy((void *)row_buf, src_row, (size_t)dst_w * 4U);
+            for (uint32_t x = 0; x < dst_w; ++x) {
+                row_buf[x * 4U + 3U] = 255;
+            }
+        } else {
+            uint32_t sy0 = (uint32_t)(((uint64_t)y * height) / dst_h);
+            uint32_t sy1 = (uint32_t)(((uint64_t)(y + 1U) * height) / dst_h);
+            if (sy1 <= sy0)
+                sy1 = sy0 + 1U;
+            if (sy1 > height)
+                sy1 = height;
+            for (uint32_t x = 0; x < dst_w; ++x) {
+                uint32_t sx0 = (uint32_t)(((uint64_t)x * width) / dst_w);
+                uint32_t sx1 = (uint32_t)(((uint64_t)(x + 1U) * width) / dst_w);
+                if (sx1 <= sx0)
+                    sx1 = sx0 + 1U;
+                if (sx1 > width)
+                    sx1 = width;
+                uint32_t sum0 = 0, sum1 = 0, sum2 = 0;
+                uint32_t count = (sy1 - sy0) * (sx1 - sx0);
+                for (uint32_t sy = sy0; sy < sy1; ++sy) {
+                    const uint8_t *srow = pixels + (size_t)sy * (size_t)width * 4U;
+                    for (uint32_t sx = sx0; sx < sx1; ++sx) {
+                        const uint8_t *p = srow + (size_t)sx * 4U;
+                        sum0 += p[0];
+                        sum1 += p[1];
+                        sum2 += p[2];
+                    }
+                }
+                uint32_t half = count >> 1;
+                row_buf[x * 4U + 0U] = (uint8_t)((sum0 + half) / count);
+                row_buf[x * 4U + 1U] = (uint8_t)((sum1 + half) / count);
+                row_buf[x * 4U + 2U] = (uint8_t)((sum2 + half) / count);
+                row_buf[x * 4U + 3U] = 255;
+            }
+        }
+        png_write_row(png, (png_const_bytep)row_buf);
+    }
+
+    png_write_end(png, NULL);
+    free((void *)row_buf);
+    png_destroy_write_struct(&png, &info);
+
+    bool io_ok = (fflush(fp) == 0 && !ferror(fp) && fdatasync(fileno(fp)) == 0);
+    if (fclose(fp) != 0 || !io_ok) {
+        unlink(tmp_path);
+        return false;
+    }
+
+    if (rename(tmp_path, filepath) != 0) {
+        unlink(tmp_path);
+        return false;
+    }
+    return true;
+}
+
+bool image_save_png_bgra(const char *filepath, const uint8_t *bgra_pixels, uint32_t width,
+                         uint32_t height)
+{
+    return save_png_internal(filepath, bgra_pixels, width, height, true);
+}
+
+bool image_save_png_rgba(const char *filepath, const uint8_t *rgba_pixels, uint32_t width,
+                         uint32_t height)
+{
+    return save_png_internal(filepath, rgba_pixels, width, height, false);
+}

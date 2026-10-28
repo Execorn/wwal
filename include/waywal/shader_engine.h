@@ -3,6 +3,7 @@
 #define WAYWAL_SHADER_ENGINE_H
 
 #include "waywal/audio_fft.h"
+#include "waywal/path.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -44,6 +45,7 @@ void waywal_shader_engine_destroy(waywal_shader_engine_t *eng);
 bool waywal_shader_engine_load_source(waywal_shader_engine_t *eng, const char *user_src,
                                       const char *debug_name);
 bool waywal_shader_engine_load_file(waywal_shader_engine_t *eng, const char *filepath);
+bool waywal_shader_engine_compile(waywal_shader_engine_t *eng, const char *src_or_path);
 bool waywal_shader_engine_load_depth_parallax(waywal_shader_engine_t *eng, const uint8_t *base_rgba,
                                               uint32_t base_w, uint32_t base_h,
                                               const uint8_t *depth_rgba, uint32_t depth_w,

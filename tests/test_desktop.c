@@ -226,10 +226,49 @@ static void test_security_hardening(void)
 {
     printf("[TEST] Running test_security_hardening...\n");
 
-    /* 1. Fork a child process to verify that seccomp kills forbidden syscalls */
+    int confirm_pfd[2];
+    assert(pipe2(confirm_pfd, O_CLOEXEC) == 0);
+
+    char sbox_tmp[256] = "/tmp/wwal_sbox_test_XXXXXX";
+    assert(mkdtemp(sbox_tmp) != NULL);
+
+    /* 1. Fork a child process to verify Landlock + Seccomp-BPF isolation */
     pid_t pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
+        close(confirm_pfd[0]);
+        char sbox_home[512], sbox_ssh[512], sbox_xcache[512], sbox_xstate[512];
+        char sbox_local[512], sbox_lshare[512], sbox_keyrings[512], sbox_lstate[512],
+            sbox_bash_state[512];
+        snprintf(sbox_home, sizeof(sbox_home), "%s/home", sbox_tmp);
+        snprintf(sbox_ssh, sizeof(sbox_ssh), "%s/home/.ssh", sbox_tmp);
+        snprintf(sbox_local, sizeof(sbox_local), "%s/home/.local", sbox_tmp);
+        snprintf(sbox_lshare, sizeof(sbox_lshare), "%s/home/.local/share", sbox_tmp);
+        snprintf(sbox_keyrings, sizeof(sbox_keyrings), "%s/home/.local/share/keyrings", sbox_tmp);
+        snprintf(sbox_lstate, sizeof(sbox_lstate), "%s/home/.local/state", sbox_tmp);
+        snprintf(sbox_bash_state, sizeof(sbox_bash_state), "%s/home/.local/state/bash", sbox_tmp);
+        snprintf(sbox_xcache, sizeof(sbox_xcache), "%s/cache", sbox_tmp);
+        snprintf(sbox_xstate, sizeof(sbox_xstate), "%s/state", sbox_tmp);
+        mkdir(sbox_home, 0700);
+        mkdir(sbox_ssh, 0700);
+        mkdir(sbox_local, 0700);
+        mkdir(sbox_lshare, 0700);
+        mkdir(sbox_keyrings, 0700);
+        mkdir(sbox_lstate, 0700);
+        mkdir(sbox_bash_state, 0700);
+        mkdir(sbox_xcache, 0700);
+        mkdir(sbox_xstate, 0700);
+        setenv("HOME", sbox_home, 1);
+        setenv("XDG_CACHE_HOME", sbox_xcache, 1);
+        setenv("XDG_STATE_HOME", sbox_xstate, 1);
+        setenv("XDG_DATA_HOME", sbox_lshare, 1);
+
+#ifdef SYS_landlock_create_ruleset
+        int ll_abi = (int)syscall(SYS_landlock_create_ruleset, NULL, 0, 1);
+#else
+        int ll_abi = -1;
+#endif
+
         /* Child: apply security hardening */
         bool sec_ok = security_sandbox_apply(NULL);
         if (!sec_ok)
@@ -244,26 +283,58 @@ static void test_security_hardening(void)
         if (my_pid <= 0)
             _exit(3);
 
-        const char *home = getenv("HOME");
-#ifdef SYS_landlock_create_ruleset
-        int ll_abi = (int)syscall(SYS_landlock_create_ruleset, NULL, 0, 1);
-#else
-        int ll_abi = -1;
-#endif
-        if (ll_abi > 0 && home && home[0]) {
+        if (ll_abi > 0) {
             char cache_test[4096];
-            snprintf(cache_test, sizeof(cache_test), "%s/.cache/wwal", home);
+            snprintf(cache_test, sizeof(cache_test), "%s/.cache/wwal", sbox_home);
             int cfd = open(cache_test, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (cfd < 0)
                 _exit(5);
             close(cfd);
 
-            char ssh_path[4096];
-            snprintf(ssh_path, sizeof(ssh_path), "%s/.ssh", home);
-            int sfd = open(ssh_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            /* Verify Landlock + Seccomp-BPF allow symlink() and RW access in swww, awww, and
+             * caelestia/wallpaper */
+            char sym_path[4096], swww_file[4096], awww_file[4096], cael_file[4096];
+            snprintf(sym_path, sizeof(sym_path), "%s/wwal/current_wallpaper", sbox_xcache);
+            snprintf(swww_file, sizeof(swww_file), "%s/swww/DP-1", sbox_xcache);
+            snprintf(awww_file, sizeof(awww_file), "%s/awww/DP-1", sbox_xcache);
+            snprintf(cael_file, sizeof(cael_file), "%s/caelestia/wallpaper/path.txt", sbox_xstate);
+            if (symlink("/tmp/dummy_wall.png", sym_path) != 0)
+                _exit(11);
+            unlink(sym_path);
+
+            int fd1 = open(swww_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            int fd2 = open(awww_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            int fd3 = open(cael_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            if (fd1 < 0 || fd2 < 0 || fd3 < 0)
+                _exit(12);
+            close(fd1);
+            close(fd2);
+            close(fd3);
+            unlink(swww_file);
+            unlink(awww_file);
+            unlink(cael_file);
+
+            /* Sensitive ~/.ssh must be blocked by Landlock */
+            int sfd = open(sbox_ssh, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (sfd >= 0) {
                 close(sfd);
                 _exit(6);
+            }
+
+            /* Sensitive ~/.local/share/keyrings must be blocked even when XDG_DATA_HOME is set */
+            int kfd = open(sbox_keyrings, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (kfd >= 0) {
+                close(kfd);
+                _exit(13);
+            }
+
+            /* Non-wwal/caelestia subdirectories of ~/.local/state must not be writable */
+            char bash_hist[4096];
+            snprintf(bash_hist, sizeof(bash_hist), "%s/history", sbox_bash_state);
+            int bfd = open(bash_hist, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            if (bfd >= 0) {
+                close(bfd);
+                _exit(14);
             }
         }
 
@@ -279,17 +350,30 @@ static void test_security_hardening(void)
             WEXITSTATUS(hook_st) != 0)
             _exit(8);
 
+        char ok_byte = 'K';
+        (void)write(confirm_pfd[1], &ok_byte, 1);
+        close(confirm_pfd[1]);
+
         /* Verify denied syscall triggers SCMP_ACT_KILL_PROCESS on ptrace */
         syscall(SYS_ptrace, 0, 0, 0, 0);
         /* If not killed by SIGSYS, exit with error code 4 */
         _exit(4);
 #else
+        char ok_byte = 'K';
+        (void)write(confirm_pfd[1], &ok_byte, 1);
+        close(confirm_pfd[1]);
         _exit(0);
 #endif
     }
 
+    close(confirm_pfd[1]);
+    char confirm_byte = 0;
+    ssize_t cr = read(confirm_pfd[0], &confirm_byte, 1);
+    close(confirm_pfd[0]);
+
     int status = 0;
     waitpid(pid, &status, 0);
+    assert(cr == 1 && confirm_byte == 'K');
 #ifdef HAVE_LIBSECCOMP
     assert(WIFSIGNALED(status));
     assert(WTERMSIG(status) == SIGSYS || WTERMSIG(status) == SIGKILL);

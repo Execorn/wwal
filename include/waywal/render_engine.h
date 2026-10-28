@@ -60,6 +60,7 @@ void render_engine_make_current(render_engine_t *re);
 
 void render_engine_set_span_bounds(render_engine_t *re, int32_t off_x, int32_t off_y,
                                    int32_t total_w, int32_t total_h);
+void render_engine_set_crop_gravity(render_engine_t *re, float gx, float gy);
 
 void render_engine_bump_upload_gen(render_engine_t *re);
 void render_engine_release_upload_cache(render_engine_t *re);

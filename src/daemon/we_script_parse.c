@@ -37,6 +37,83 @@ static void lexer_skip_ws_and_comments(js_parser_t *p)
     }
 }
 
+static void scan_template_body(const char *src, size_t len, size_t *pos, int depth);
+
+static void scan_template_expr(const char *src, size_t len, size_t *pos, int depth)
+{
+    if (depth > 32) {
+        *pos = len;
+        return;
+    }
+    int bdepth = 1;
+    while (*pos < len && bdepth > 0) {
+        char ch = src[*pos];
+        if (ch == '\\' && *pos + 1 < len) {
+            *pos += 2;
+            continue;
+        }
+        if (ch == '\'' || ch == '"') {
+            char q = ch;
+            (*pos)++;
+            while (*pos < len && src[*pos] != q) {
+                if (src[*pos] == '\\' && *pos + 1 < len) {
+                    *pos += 2;
+                } else {
+                    (*pos)++;
+                }
+            }
+            if (*pos < len) {
+                (*pos)++;
+            }
+            continue;
+        }
+        if (ch == '`') {
+            (*pos)++;
+            scan_template_body(src, len, pos, depth + 1);
+            if (*pos < len && src[*pos] == '`') {
+                (*pos)++;
+            }
+            continue;
+        }
+        if (ch == '{') {
+            bdepth++;
+        } else if (ch == '}') {
+            bdepth--;
+            if (bdepth == 0) {
+                return;
+            }
+        }
+        (*pos)++;
+    }
+}
+
+static void scan_template_body(const char *src, size_t len, size_t *pos, int depth)
+{
+    if (depth > 32) {
+        *pos = len;
+        return;
+    }
+    while (*pos < len) {
+        char ch = src[*pos];
+        if (ch == '\\' && *pos + 1 < len) {
+            *pos += 2;
+            continue;
+        }
+        if (ch == '`') {
+            return;
+        }
+        if (ch == '$' && *pos + 1 < len && src[*pos + 1] == '{') {
+            *pos += 2;
+            scan_template_expr(src, len, pos, depth + 1);
+            if (*pos < len && src[*pos] == '}') {
+                (*pos)++;
+            }
+            continue;
+        }
+        (*pos)++;
+    }
+}
+
 static void lexer_next(js_parser_t *p)
 {
     lexer_skip_ws_and_comments(p);
@@ -143,8 +220,22 @@ static void lexer_next(js_parser_t *p)
         return;
     }
 
-    /* String literals ('...', "...", `...`) */
-    if (c == '\'' || c == '"' || c == '`') {
+    /* Template literals (`...`) */
+    if (c == '`') {
+        p->pos++;
+        size_t start = p->pos;
+        scan_template_body(p->src, p->len, &p->pos, 0);
+        size_t raw_len = p->pos - start;
+        if (p->pos < p->len && p->src[p->pos] == '`') {
+            p->pos++;
+        }
+        p->cur.type = TOK_TEMPLATE;
+        p->cur.text = script_arena_strdup(p->vm, p->src + start, raw_len);
+        return;
+    }
+
+    /* String literals ('...', "...") */
+    if (c == '\'' || c == '"') {
         char quote = c;
         p->pos++;
         char stack_tmp[1024];
@@ -452,6 +543,92 @@ static ast_node_t *parse_primary(js_parser_t *p)
             n->lit.u.str = p->cur.text ? p->cur.text : "";
         }
         lexer_next(p);
+        return n;
+    }
+    if (t == TOK_TEMPLATE) {
+        const char *raw = p->cur.text ? p->cur.text : "";
+        size_t rlen = strlen(raw);
+        lexer_next(p);
+
+        if (p->depth > 32u) {
+            p->vm->parse_error = true;
+            p->vm->depth_exceeded = true;
+            p->vm->aborted = true;
+            p->cur.type = TOK_EOF;
+            return alloc_node(p, AST_LITERAL);
+        }
+
+        ast_node_t *n = alloc_node(p, AST_TEMPLATE);
+        if (!n) {
+            return NULL;
+        }
+        const char *parts[33];
+        ast_node_t *exprs[32];
+        uint32_t expr_cnt = 0;
+
+        char seg[1024];
+        size_t slen = 0;
+        size_t i = 0;
+        while (i < rlen && !p->vm->aborted) {
+            if (raw[i] == '\\' && i + 1 < rlen) {
+                char esc = raw[i + 1];
+                char out_c = esc;
+                if (esc == 'n') {
+                    out_c = '\n';
+                } else if (esc == 'r') {
+                    out_c = '\r';
+                } else if (esc == 't') {
+                    out_c = '\t';
+                }
+                if (slen + 1 < sizeof(seg)) {
+                    seg[slen++] = out_c;
+                }
+                i += 2;
+                continue;
+            }
+            if (raw[i] == '$' && i + 1 < rlen && raw[i + 1] == '{' && expr_cnt < 32u) {
+                parts[expr_cnt] = script_arena_strdup(p->vm, seg, slen);
+                slen = 0;
+                i += 2;
+                size_t expr_start = i;
+                scan_template_expr(raw, rlen, &i, 0);
+                size_t expr_len = i - expr_start;
+                if (i < rlen && raw[i] == '}') {
+                    i++;
+                }
+                const char *expr_src = script_arena_strdup(p->vm, raw + expr_start, expr_len);
+                js_parser_t sub = {
+                    .vm = p->vm,
+                    .src = expr_src ? expr_src : "",
+                    .len = expr_src ? expr_len : 0,
+                    .pos = 0,
+                    .depth = p->depth + 1,
+                };
+                lexer_next(&sub);
+                exprs[expr_cnt] = parse_expr(&sub);
+                expr_cnt++;
+                continue;
+            }
+            if (slen + 1 < sizeof(seg)) {
+                seg[slen++] = raw[i];
+            }
+            i++;
+        }
+        parts[expr_cnt] = script_arena_strdup(p->vm, seg, slen);
+
+        n->tpl.expr_count = expr_cnt;
+        n->tpl.parts =
+            (const char **)script_arena_alloc(p->vm, (expr_cnt + 1u) * sizeof(const char *));
+        if (n->tpl.parts) {
+            memcpy(n->tpl.parts, parts, (expr_cnt + 1u) * sizeof(const char *));
+        }
+        if (expr_cnt > 0) {
+            n->tpl.exprs =
+                (ast_node_t **)script_arena_alloc(p->vm, expr_cnt * sizeof(ast_node_t *));
+            if (n->tpl.exprs) {
+                memcpy(n->tpl.exprs, exprs, expr_cnt * sizeof(ast_node_t *));
+            }
+        }
         return n;
     }
     if (t == TOK_TRUE || t == TOK_FALSE) {

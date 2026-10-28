@@ -11,7 +11,9 @@ wwald - zero-copy Wayland wallpaper, VA-API video, Shadertoy, and Material You d
 .PP
 .SH DESCRIPTION
 .PP
-\fBwwald\fR is the background rendering daemon for \fBwwal\fR(1). Written in ISO C23 with a binary size under 1.5 MB, \fBwwald\fR replaces separate static wallpaper daemons, video wallpaper players, GLSL shader backgrounds, and color scheme generators within a single sandboxed process.
+\fBwwald\fR is the background rendering daemon for \fBwwal\fR(1). Written in ISO C23 with a stripped binary size under 1.4 MB, \fBwwald\fR replaces separate static wallpaper daemons, video wallpaper players, GLSL shader backgrounds, Steam Wallpaper Engine runners, and color scheme / template generators within a single sandboxed process.
+.PP
+When invoked via a symlink named \fBswww-daemon\fR or \fBawww-daemon\fR, \fBwwald\fR automatically enables full \fBswww\fR / \fBawww\fR v0.12.1 daemon flag and socket namespace compatibility.
 .PP
 .SH ARCHITECTURE
 .PP
@@ -49,11 +51,11 @@ Synchronizes frame presentation to display VBlank using a Phase-Locked Loop (PLL
 .PP
 .SS Native Wallpaper Engine, Multi-Pass Shadertoy & Reactive Audio/MPRIS2
 .PP
-\fBwwald\fR includes a native Wallpaper Engine (\fB431960\fR) Workshop runtime, a multi-pass Shadertoy pipeline, and reactive desktop bridges:
+\fBwwald\fR includes a native Wallpaper Engine (\fB431960\fR) Workshop runtime, a multi-pass Shadertoy pipeline, 10 built-in procedural shader presets, and reactive desktop bridges:
 .IP \(bu 2
-Maps \fBPKGV0001..PKGV0022\fR \fBscene.pkg\fR archives directly via \fBmmap\fR(2) without temporary disk extraction, decoding \fBTEXV0005\fR (\fBBC1\fR, \fBBC2\fR, \fBBC3\fR, \fBBC7\fR, and \fBLZ4\fR) textures, 2D Puppet Warp (\fB.mdl\fR) skeletal meshes, 32-byte-aligned AVX2 Structure-of-Arrays particle systems, and sandboxed \fBSceneScript\fR logic.
+Maps \fBPKGV0001..PKGV0022\fR \fBscene.pkg\fR archives directly via \fBmmap\fR(2) without temporary disk extraction, decoding \fBTEXV0005\fR (\fBBC1\fR, \fBBC2\fR, \fBBC3\fR, \fBBC7\fR, and \fBLZ4\fR) textures, 2D Puppet Warp (\fB.mdl\fR) skeletal meshes, 32-byte-aligned AVX2 Structure-of-Arrays particle systems, `"sound"` ambient audio layers, `"text"` clock/label layers, and sandboxed \fBSceneScript\fR logic.
 .IP \(bu 2
-Executes multi-pass Shadertoy fragment shaders (\fBBuffer A\fR..\fBBuffer D\fR \fBGL_RGBA16F\fR ping-pong passes, \fBiChannel0\fR..\fBiChannel3\fR, \fB#pragma waywal\fR, hardware derivatives) and 2.5D Depth-Map Parallax Occlusion Mapping driven by cursor and workspace-slide spring physics.
+Executes multi-pass Shadertoy fragment shaders (\fBBuffer A\fR..\fBBuffer D\fR \fBGL_RGBA16F\fR ping-pong passes, \fBiChannel0\fR..\fBiChannel3\fR, \fB#pragma waywal\fR, hardware derivatives), 10 built-in procedural shader presets, and 2.5D Depth-Map Parallax Occlusion Mapping driven by cursor and workspace-slide spring physics.
 .IP \(bu 2
 Streams lock-free PipeWire 2048-point AVX2 64-bin Bark-scale FFT spectrum data, automatically ducks wallpaper audio when external media plays, and listens to D-Bus \fBMPRIS2\fR signals with zero idle polling to expose \fBu_album_art\fR, \fBu_media_playing\fR, and live album art Material Design 3 palettes.
 .PP
@@ -83,20 +85,35 @@ At startup, after initializing DRM/GBM and Wayland connections, \fBwwald\fR lock
 .IP \(bu 2
 \fBPR_SET_NO_NEW_PRIVS\fR and \fBPR_SET_DUMPABLE = 0\fR.
 .IP \(bu 2
-Linux \fBLandlock\fR (\fBABI v1..v4\fR): Restricts filesystem visibility to read-only system libraries, device nodes, \fB$XDG_RUNTIME_DIR\fR, and configured wallpaper/cache directories, blocking access to sensitive user data (\fB~/.ssh\fR, \fB~/.gnupg\fR, etc.).
+Linux \fBLandlock\fR (\fBABI v1..v4\fR): Restricts filesystem visibility to read-only system libraries, device nodes, \fB$XDG_RUNTIME_DIR\fR, and configured wallpaper/cache/template directories, blocking access to sensitive user data (\fB~/.ssh\fR, \fB~/.gnupg\fR, etc.).
 .IP \(bu 2
-\fBSeccomp-BPF\fR syscall allowlist: Blocks network socket creation (\fBAF_INET\fR, \fBAF_INET6\fR), process execution (\fBexecve\fR outside pre-sandbox helpers), \fBptrace\fR, and privilege escalation syscalls.
+\fBSeccomp-BPF\fR syscall allowlist: Blocks network socket creation (\fBAF_INET\fR, \fBAF_INET6\fR), \fBptrace\fR, and privilege escalation syscalls.
 .PP
 .SH OPTIONS
 .PP
 \fB-n, --namespace\fR <NAME>
 .RS 4
-Set the IPC socket and Wayland layer-shell namespace (default: \fBdefault\fR).
+Set the IPC socket and Wayland layer-shell namespace (default: \fBdefault\fR, or \fB$SWWW_NAMESPACE\fR / \fB$AWWW_NAMESPACE\fR).
 .RE
 .PP
-\fB-c, --config\fR <PATH>
+\fB-d, --daemon\fR
 .RS 4
-Load declarative configuration from \fIPATH\fR instead of \fB~/.config/wwal/config.toml\fR.
+Fork into the background and signal readiness once the IPC socket and Wayland surfaces are initialized.
+.RE
+.PP
+\fB--no-daemon\fR
+.RS 4
+Stay in the foreground (\fBswww-daemon\fR / \fBawww-daemon\fR compatibility).
+.RE
+.PP
+\fB-f, --format\fR <xrgb|xbgr|rgb|bgr>
+.RS 4
+Pixel channel order hint (\fBswww-daemon\fR / \fBawww-daemon\fR compatibility).
+.RE
+.PP
+\fB-q, --quiet\fR
+.RS 4
+Suppress informational log messages.
 .RE
 .PP
 \fB--layer\fR <background|bottom>
@@ -104,14 +121,29 @@ Load declarative configuration from \fIPATH\fR instead of \fB~/.config/wwal/conf
 Set default Wayland layer-shell placement (default: \fBbackground\fR).
 .RE
 .PP
-\fB--battery-policy\fR <ignore|reduce-fps|pause-video>
+\fB--backdrop\fR <none|auto-blur|PATH>
 .RS 4
-Set laptop battery power governance policy (default: \fBpause-video\fR).
+Configure secondary overview backdrop layer surface mode (default: \fBnone\fR).
 .RE
 .PP
-\fB--no-sandbox\fR
+\fB--battery-policy\fR <ignore|reduce-fps|pause-video>
 .RS 4
-Disable Landlock and Seccomp-BPF sandboxing (for debugging under \fBgdb\fR or \fBvalgrind\fR only).
+Set laptop battery power governance policy (default: \fBreduce-fps\fR).
+.RE
+.PP
+\fB--volume\fR <0.0..1.0>
+.RS 4
+Set default wallpaper audio playback volume (default: \fB0.0\fR).
+.RE
+.PP
+\fB--mute-on-audio\fR, \fB--no-mute-on-audio\fR
+.RS 4
+Enable or disable automatic PipeWire volume ducking when external audio plays.
+.RE
+.PP
+\fB--theme-from-media\fR, \fB--no-theme-from-media\fR
+.RS 4
+Enable or disable dynamic Material Design 3 palette extraction from D-Bus MPRIS2 album art.
 .RE
 .PP
 \fB-v, --verbose\fR
@@ -129,6 +161,43 @@ Print version information and exit.
 Display help message and exit.
 .RE
 .PP
+.SH ENVIRONMENT
+.PP
+\fBWWAL_CONFIG_PATH\fR
+.RS 4
+Explicit path to \fBconfig.toml\fR (defaults to \fB$XDG_CONFIG_HOME/wwal/config.toml\fR).
+.RE
+.PP
+\fBWWAL_WORKSHOP_DIR\fR
+.RS 4
+Override Steam Workshop (\fB431960\fR) directory path.
+.RE
+.PP
+\fBWWAL_WE_ASSETS_DIR\fR
+.RS 4
+Override Wallpaper Engine default assets directory path.
+.RE
+.PP
+\fBWWAL_SHADER_PRESET_DIR\fR, \fBWWAL_SHADER_DIR\fR
+.RS 4
+Override directory searched for shader presets (\fB.glsl\fR, \fB.frag\fR) before falling back to embedded procedural shaders.
+.RE
+.PP
+\fBWWAL_CACHE_DIR\fR
+.RS 4
+Override cache directory path (defaults to \fB$XDG_CACHE_HOME/wwal\fR and \fB$XDG_CACHE_HOME/wal\fR).
+.RE
+.PP
+\fBWWAL_STATE_DIR\fR
+.RS 4
+Override persistent state directory path (defaults to \fB$XDG_STATE_HOME/wwal\fR).
+.RE
+.PP
+\fBSWWW_NAMESPACE\fR, \fBAWWW_NAMESPACE\fR
+.RS 4
+Fallback socket namespace when \fB-n\fR is not specified.
+.RE
+.PP
 .SH SIGNALS
 .PP
 \fBSIGTERM\fR, \fBSIGINT\fR
@@ -138,7 +207,7 @@ Gracefully tear down Wayland surfaces, release GBM/VA-API buffers, and exit.
 .PP
 \fBSIGHUP\fR
 .RS 4
-Reload \fB~/.config/wwal/config.toml\fR.
+Reload \fB~/.config/wwal/config.toml\fR and re-evaluate active solar/schedule rules and templates.
 .RE
 .PP
 .SH SEE ALSO

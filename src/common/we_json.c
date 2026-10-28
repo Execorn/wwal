@@ -120,9 +120,56 @@ static char *json_parse_raw_string(json_lexer_t *lx)
                     char hex[5];
                     memcpy(hex, lx->src + lx->pos, 4);
                     hex[4] = '\0';
-                    unsigned int cp = (unsigned int)strtoul(hex, NULL, 16);
+                    uint32_t cp = (uint32_t)strtoul(hex, NULL, 16);
                     lx->pos += 4;
-                    c = (cp < 0x80 && cp > 0) ? (char)cp : '?';
+                    if (cp >= 0xD800u && cp <= 0xDBFFu && lx->pos + 6 <= lx->len &&
+                        lx->src[lx->pos] == '\\' && lx->src[lx->pos + 1] == 'u' &&
+                        isxdigit((unsigned char)lx->src[lx->pos + 2]) &&
+                        isxdigit((unsigned char)lx->src[lx->pos + 3]) &&
+                        isxdigit((unsigned char)lx->src[lx->pos + 4]) &&
+                        isxdigit((unsigned char)lx->src[lx->pos + 5])) {
+                        char hex2[5];
+                        memcpy(hex2, lx->src + lx->pos + 2, 4);
+                        hex2[4] = '\0';
+                        uint32_t low = (uint32_t)strtoul(hex2, NULL, 16);
+                        if (low >= 0xDC00u && low <= 0xDFFFu) {
+                            cp = 0x10000u + (((cp - 0xD800u) << 10) | (low - 0xDC00u));
+                            lx->pos += 6;
+                        }
+                    }
+                    if (cp >= 0xD800u && cp <= 0xDFFFu) {
+                        cp = 0xFFFDu;
+                    }
+                    if (len + 6 > cap) {
+                        size_t ncap = cap * 2;
+                        char *nb = realloc(out, ncap);
+                        if (!nb) {
+                            free(out);
+                            return NULL;
+                        }
+                        out = nb;
+                        cap = ncap;
+                    }
+                    if (cp == 0) {
+                        out[len++] = ' ';
+                    } else if (cp < 0x80u) {
+                        out[len++] = (char)cp;
+                    } else if (cp < 0x800u) {
+                        out[len++] = (char)(0xC0u | (cp >> 6));
+                        out[len++] = (char)(0x80u | (cp & 0x3Fu));
+                    } else if (cp < 0x10000u) {
+                        out[len++] = (char)(0xE0u | (cp >> 12));
+                        out[len++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+                        out[len++] = (char)(0x80u | (cp & 0x3Fu));
+                    } else if (cp <= 0x10FFFFu) {
+                        out[len++] = (char)(0xF0u | (cp >> 18));
+                        out[len++] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+                        out[len++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+                        out[len++] = (char)(0x80u | (cp & 0x3Fu));
+                    } else {
+                        out[len++] = '?';
+                    }
+                    continue;
                 } else {
                     c = '?';
                 }

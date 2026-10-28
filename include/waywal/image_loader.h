@@ -51,6 +51,11 @@ bool image_load_from_memory_rgba(const uint8_t *buf, size_t size, uint8_t **out_
 void image_free(uint8_t *pixels);
 void raw_image_free(raw_image_t *img);
 
+bool image_save_png_bgra(const char *filepath, const uint8_t *bgra_pixels, uint32_t width,
+                         uint32_t height);
+bool image_save_png_rgba(const char *filepath, const uint8_t *rgba_pixels, uint32_t width,
+                         uint32_t height);
+
 #ifndef __cplusplus
 #define WAYWAL_IMG_LOAD_SEL(_1, _2, _3, _4, NAME, ...) NAME
 #define image_load(...)                                                                            \

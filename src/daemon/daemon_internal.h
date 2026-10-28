@@ -14,6 +14,7 @@
 #include "waywal/power_governor.h"
 #include "waywal/security.h"
 #include "waywal/shader_engine.h"
+#include "waywal/solar_schedule.h"
 #include "waywal/state_store.h"
 #include "waywal/toml_parser.h"
 #include "waywal/uring_loop.h"
@@ -85,6 +86,13 @@ bool daemon_start_slideshow_isolated(daemon_state_t *state, const waywal_slidesh
 bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_payload_t *wpay);
 bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_saved_state_t *saved,
                                  const char *override_output);
+bool daemon_slideshow_present_media(daemon_state_t *state, slideshow_engine_t *ss,
+                                    const char *filepath, uint32_t trans_type);
+void daemon_slideshow_prepare_image_output(daemon_state_t *state, slideshow_engine_t *ss);
+
+waywal_theme_mode_t daemon_resolve_effective_theme_mode(daemon_state_t *state,
+                                                        const waywal_img_metadata_t *meta);
+void daemon_tick_solar_and_schedule(daemon_state_t *state, bool initial_sync);
 
 void daemon_broadcast_event(daemon_state_t *state, const char *event_name);
 void daemon_reap_dead_subscribers(daemon_state_t *state);

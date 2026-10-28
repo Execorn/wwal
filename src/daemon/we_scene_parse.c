@@ -1,14 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "we_scene_internal.h"
 
+#include "waywal/image_loader.h"
 #include "waywal/log.h"
 
 #include <ctype.h>
+#include <dlfcn.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if defined(HAVE_FFMPEG_SWDEC) && __has_include(<libavformat/avformat.h>)
+#define WE_HAVE_LIBAV_AUDIO 1
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
+#include <libavutil/frame.h>
+#include <libavutil/mem.h>
+#include <libavutil/samplefmt.h>
+#endif
 
 static we_blend_mode_t parse_blend_mode(const char *str)
 {
@@ -597,6 +611,15 @@ void sync_layer_from_obj(const we_scene_object_t *obj, we_script_layer_state_t *
     memcpy(ls->color, obj->color, sizeof(ls->color));
     ls->visible = obj->visible;
     snprintf(ls->name, sizeof(ls->name), "%s", obj->name);
+    snprintf(ls->text, sizeof(ls->text), "%s", obj->text_str);
+    ls->pointsize = obj->text_pointsize > 0 ? obj->text_pointsize : 32;
+    snprintf(ls->halign, sizeof(ls->halign), "%s",
+             obj->text_halign[0] != '\0' ? obj->text_halign : "center");
+    snprintf(ls->valign, sizeof(ls->valign), "%s",
+             obj->text_valign[0] != '\0' ? obj->text_valign : "center");
+    ls->volume = obj->sound_volume;
+    ls->audio_playing = obj->sound_playing;
+    ls->audio_cmd = 0;
     ls->id = obj->id;
     ls->dirty_mask = 0;
 }
@@ -616,7 +639,12 @@ void sync_obj_from_layer(we_scene_object_t *obj, const we_script_layer_state_t *
         memcpy(obj->angles, ls->angles, sizeof(obj->angles));
     }
     if (ls->dirty_mask & WE_LAYER_DIRTY_SIZE) {
-        memcpy(obj->size, ls->size, sizeof(obj->size));
+        if (obj->size[0] != ls->size[0] || obj->size[1] != ls->size[1]) {
+            memcpy(obj->size, ls->size, sizeof(obj->size));
+            if (obj->is_text_object) {
+                obj->text_dirty = true;
+            }
+        }
     }
     if (ls->dirty_mask & WE_LAYER_DIRTY_ALPHA) {
         obj->alpha = ls->alpha;
@@ -629,6 +657,55 @@ void sync_obj_from_layer(we_scene_object_t *obj, const we_script_layer_state_t *
     if (ls->dirty_mask & WE_LAYER_DIRTY_VISIBLE) {
         obj->visible = ls->visible;
         obj->visible_user_prop[0] = '\0';
+    }
+    if (ls->dirty_mask & WE_LAYER_DIRTY_TEXT) {
+        if (strcmp(obj->text_str, ls->text) != 0) {
+            snprintf(obj->text_str, sizeof(obj->text_str), "%s", ls->text);
+            obj->text_dirty = true;
+        }
+        obj->user_prop_text[0] = '\0';
+    }
+    if (ls->dirty_mask & WE_LAYER_DIRTY_POINTSIZE) {
+        int32_t new_ps = ls->pointsize >= 4 ? ls->pointsize : 4;
+        if (obj->text_pointsize != new_ps) {
+            obj->text_pointsize = new_ps;
+            obj->text_dirty = true;
+        }
+        obj->user_prop_pointsize[0] = '\0';
+    }
+    if (ls->dirty_mask & WE_LAYER_DIRTY_HALIGN) {
+        if (strcmp(obj->text_halign, ls->halign) != 0) {
+            snprintf(obj->text_halign, sizeof(obj->text_halign), "%s", ls->halign);
+            obj->text_dirty = true;
+        }
+    }
+    if (ls->dirty_mask & WE_LAYER_DIRTY_VALIGN) {
+        if (strcmp(obj->text_valign, ls->valign) != 0) {
+            snprintf(obj->text_valign, sizeof(obj->text_valign), "%s", ls->valign);
+            obj->text_dirty = true;
+        }
+    }
+    if (ls->dirty_mask & WE_LAYER_DIRTY_VOLUME) {
+        obj->sound_volume = fminf(fmaxf(ls->volume, 0.0f), 2.0f);
+        obj->user_prop_volume[0] = '\0';
+    }
+    if (ls->dirty_mask & WE_LAYER_DIRTY_AUDIO_CMD) {
+        if (ls->audio_cmd == 1) { /* play */
+            if (!obj->sound_playing && !obj->sound_paused) {
+                obj->sound_cursor_frame = 0;
+            }
+            obj->sound_playing = true;
+            obj->sound_paused = false;
+            obj->sound_wait_timer = 0.0f;
+        } else if (ls->audio_cmd == 2) { /* stop */
+            obj->sound_playing = false;
+            obj->sound_paused = false;
+            obj->sound_cursor_frame = 0;
+            obj->sound_wait_timer = 0.0f;
+        } else if (ls->audio_cmd == 3) { /* pause */
+            obj->sound_playing = false;
+            obj->sound_paused = true;
+        }
     }
 }
 
@@ -763,6 +840,12 @@ static void attach_object_script(we_scene_t *scene, we_scene_object_t *obj,
         obj->color_user_prop[0] = '\0';
     } else if (target == WE_SCRIPT_PROP_VISIBLE) {
         obj->visible_user_prop[0] = '\0';
+    } else if (target == WE_SCRIPT_PROP_TEXT) {
+        obj->user_prop_text[0] = '\0';
+    } else if (target == WE_SCRIPT_PROP_POINTSIZE) {
+        obj->user_prop_pointsize[0] = '\0';
+    } else if (target == WE_SCRIPT_PROP_VOLUME) {
+        obj->user_prop_volume[0] = '\0';
     }
 
     we_obj_script_t *slot = &obj->scripts[obj->script_count++];
@@ -800,6 +883,626 @@ void apply_scene_script_user_properties(we_scene_t *scene)
             }
         }
     }
+    for (uint32_t i = 0; i < scene->object_count; i++) {
+        we_scene_object_t *obj = &scene->objects[i];
+        if (obj->is_text_object && obj->text_dirty) {
+            we_scene_update_text_texture(scene, obj);
+        }
+    }
+}
+
+static uint16_t read_u16_le(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t read_u32_le(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static bool resample_stereo_f32_to_48k(float *src_stereo, size_t src_frames, uint32_t sample_rate,
+                                       float **out_stereo_f32, size_t *out_frame_count)
+{
+    if (!src_stereo || src_frames == 0 || sample_rate < 4000u || sample_rate > 384000u) {
+        free(src_stereo);
+        return false;
+    }
+    if (sample_rate == 48000u) {
+        if (src_frames > 48000u * 600u) {
+            src_frames = 48000u * 600u;
+        }
+        *out_stereo_f32 = src_stereo;
+        *out_frame_count = src_frames;
+        return true;
+    }
+
+    size_t dst_frames = (size_t)(((uint64_t)src_frames * 48000ULL) / (uint64_t)sample_rate);
+    if (dst_frames == 0) {
+        free(src_stereo);
+        return false;
+    }
+    if (dst_frames > 48000u * 600u) {
+        dst_frames = 48000u * 600u;
+    }
+    float *dst_stereo = malloc(dst_frames * 2u * sizeof(float));
+    if (!dst_stereo) {
+        free(src_stereo);
+        return false;
+    }
+
+    double step = (double)sample_rate / 48000.0;
+    for (size_t i = 0; i < dst_frames; ++i) {
+        double src_pos = (double)i * step;
+        size_t i0 = (size_t)src_pos;
+        if (i0 >= src_frames) {
+            i0 = src_frames - 1;
+        }
+        size_t i1 = (i0 + 1 < src_frames) ? (i0 + 1) : i0;
+        float frac = (float)(src_pos - (double)i0);
+        dst_stereo[i * 2u + 0u] =
+            src_stereo[i0 * 2u + 0u] +
+            frac * (src_stereo[i1 * 2u + 0u] - src_stereo[i0 * 2u + 0u]);
+        dst_stereo[i * 2u + 1u] =
+            src_stereo[i0 * 2u + 1u] +
+            frac * (src_stereo[i1 * 2u + 1u] - src_stereo[i0 * 2u + 1u]);
+    }
+
+    free(src_stereo);
+    *out_stereo_f32 = dst_stereo;
+    *out_frame_count = dst_frames;
+    return true;
+}
+
+bool we_audio_decode_wav_memory(const uint8_t *data, size_t size, float **out_stereo_f32,
+                                size_t *out_frame_count)
+{
+    if (!data || size < 44 || !out_stereo_f32 || !out_frame_count) {
+        return false;
+    }
+    *out_stereo_f32 = NULL;
+    *out_frame_count = 0;
+
+    if (memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
+        return false;
+    }
+
+    uint16_t audio_fmt = 0;
+    uint16_t channels = 0;
+    uint32_t sample_rate = 0;
+    uint16_t block_align = 0;
+    uint16_t bits_per_sample = 0;
+    const uint8_t *pcm_ptr = NULL;
+    size_t pcm_bytes = 0;
+
+    size_t pos = 12;
+    while (pos + 8 <= size) {
+        const uint8_t *hdr = data + pos;
+        uint32_t chunk_sz = read_u32_le(hdr + 4);
+        pos += 8;
+        if (pos + chunk_sz > size) {
+            chunk_sz = (uint32_t)(size - pos);
+        }
+
+        if (memcmp(hdr, "fmt ", 4) == 0 && chunk_sz >= 16) {
+            audio_fmt = read_u16_le(data + pos + 0);
+            channels = read_u16_le(data + pos + 2);
+            sample_rate = read_u32_le(data + pos + 4);
+            block_align = read_u16_le(data + pos + 12);
+            bits_per_sample = read_u16_le(data + pos + 14);
+            if (audio_fmt == 0xFFFEu && chunk_sz >= 40) {
+                audio_fmt = read_u16_le(data + pos + 24);
+            }
+        } else if (memcmp(hdr, "data", 4) == 0) {
+            pcm_ptr = data + pos;
+            pcm_bytes = chunk_sz;
+            break;
+        }
+        pos += chunk_sz + (chunk_sz & 1u);
+    }
+
+    if (!pcm_ptr || pcm_bytes == 0 || channels == 0 || channels > 8 || sample_rate < 4000u ||
+        sample_rate > 384000u) {
+        return false;
+    }
+    if (!((audio_fmt == 1u &&
+           (bits_per_sample == 8 || bits_per_sample == 16 || bits_per_sample == 24 ||
+            bits_per_sample == 32)) ||
+          (audio_fmt == 3u && (bits_per_sample == 32 || bits_per_sample == 64)))) {
+        return false;
+    }
+
+    size_t bytes_per_sample = bits_per_sample / 8u;
+    size_t min_stride = bytes_per_sample * channels;
+    size_t frame_stride = (block_align >= min_stride) ? (size_t)block_align : min_stride;
+    size_t src_frames = pcm_bytes / frame_stride;
+    if (src_frames == 0) {
+        return false;
+    }
+    /* Cap maximum decoded duration at 10 minutes (sample_rate * 600s) to bound RAM */
+    if (src_frames > (size_t)sample_rate * 600u) {
+        src_frames = (size_t)sample_rate * 600u;
+    }
+
+    float *src_stereo = malloc(src_frames * 2u * sizeof(float));
+    if (!src_stereo) {
+        return false;
+    }
+
+    for (size_t f = 0; f < src_frames; ++f) {
+        const uint8_t *fp = pcm_ptr + f * frame_stride;
+        float ch_val[2] = {0.0f, 0.0f};
+        uint16_t read_ch = (channels >= 2) ? 2 : 1;
+        for (uint16_t c = 0; c < read_ch; ++c) {
+            const uint8_t *sp = fp + c * bytes_per_sample;
+            float s = 0.0f;
+            if (audio_fmt == 1u) {
+                if (bits_per_sample == 8) {
+                    s = ((float)sp[0] - 128.0f) / 128.0f;
+                } else if (bits_per_sample == 16) {
+                    int16_t v = (int16_t)read_u16_le(sp);
+                    s = (float)v / 32768.0f;
+                } else if (bits_per_sample == 24) {
+                    int32_t v = (int32_t)sp[0] | ((int32_t)sp[1] << 8) | ((int32_t)sp[2] << 16);
+                    if (v & 0x800000) {
+                        v |= ~0xFFFFFF;
+                    }
+                    s = (float)v / 8388608.0f;
+                } else if (bits_per_sample == 32) {
+                    int32_t v = (int32_t)read_u32_le(sp);
+                    s = (float)((double)v / 2147483648.0);
+                }
+            } else if (audio_fmt == 3u && bits_per_sample == 32) {
+                memcpy(&s, sp, sizeof(float));
+                if (!isfinite(s)) {
+                    s = 0.0f;
+                }
+            } else if (audio_fmt == 3u && bits_per_sample == 64) {
+                double d = 0.0;
+                memcpy(&d, sp, sizeof(double));
+                s = isfinite(d) ? (float)d : 0.0f;
+            }
+            if (s < -1.0f) {
+                s = -1.0f;
+            }
+            if (s > 1.0f) {
+                s = 1.0f;
+            }
+            ch_val[c] = s;
+        }
+        if (channels == 1) {
+            ch_val[1] = ch_val[0];
+        }
+        src_stereo[f * 2u + 0u] = ch_val[0];
+        src_stereo[f * 2u + 1u] = ch_val[1];
+    }
+
+    return resample_stereo_f32_to_48k(src_stereo, src_frames, sample_rate, out_stereo_f32,
+                                      out_frame_count);
+}
+
+#ifdef WE_HAVE_LIBAV_AUDIO
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+} we_avio_mem_t;
+
+static int we_avio_read_packet(void *opaque, uint8_t *buf, int buf_size)
+{
+    we_avio_mem_t *m = (we_avio_mem_t *)opaque;
+    if (!m || m->pos >= m->size || buf_size <= 0) {
+        return AVERROR_EOF;
+    }
+    size_t rem = m->size - m->pos;
+    size_t to_copy = (size_t)buf_size < rem ? (size_t)buf_size : rem;
+    memcpy(buf, m->data + m->pos, to_copy);
+    m->pos += to_copy;
+    return (int)to_copy;
+}
+
+static int64_t we_avio_seek(void *opaque, int64_t offset, int whence)
+{
+    we_avio_mem_t *m = (we_avio_mem_t *)opaque;
+    if (!m) {
+        return -1;
+    }
+    if (whence == AVSEEK_SIZE) {
+        return (int64_t)m->size;
+    }
+    int64_t new_pos = 0;
+    int base = whence & ~AVSEEK_FORCE;
+    if (base == SEEK_SET) {
+        new_pos = offset;
+    } else if (base == SEEK_CUR) {
+        new_pos = (int64_t)m->pos + offset;
+    } else if (base == SEEK_END) {
+        new_pos = (int64_t)m->size + offset;
+    } else {
+        return -1;
+    }
+    if (new_pos < 0 || (size_t)new_pos > m->size) {
+        return -1;
+    }
+    m->pos = (size_t)new_pos;
+    return new_pos;
+}
+
+static void *we_dlopen_any(const char *const *names, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        void *h = dlopen(names[i], RTLD_LAZY | RTLD_LOCAL);
+        if (h) {
+            return h;
+        }
+    }
+    return NULL;
+}
+#endif
+
+static bool we_audio_decode_ffmpeg_memory(const uint8_t *data, size_t size, float **out_stereo_f32,
+                                          size_t *out_frame_count)
+{
+#ifdef WE_HAVE_LIBAV_AUDIO
+    if (!data || size < 4 || !out_stereo_f32 || !out_frame_count) {
+        return false;
+    }
+    static const char *const avformat_names[] = {"libavformat.so.61", "libavformat.so.60",
+                                                 "libavformat.so.59", "libavformat.so"};
+    static const char *const avcodec_names[] = {"libavcodec.so.61", "libavcodec.so.60",
+                                                "libavcodec.so.59", "libavcodec.so"};
+    static const char *const avutil_names[] = {"libavutil.so.59", "libavutil.so.58",
+                                               "libavutil.so.57", "libavutil.so"};
+
+    void *h_avf = we_dlopen_any(avformat_names, sizeof(avformat_names) / sizeof(avformat_names[0]));
+    void *h_avc = we_dlopen_any(avcodec_names, sizeof(avcodec_names) / sizeof(avcodec_names[0]));
+    void *h_avu = we_dlopen_any(avutil_names, sizeof(avutil_names) / sizeof(avutil_names[0]));
+    if (!h_avf || !h_avc || !h_avu) {
+        if (h_avf)
+            dlclose(h_avf);
+        if (h_avc)
+            dlclose(h_avc);
+        if (h_avu)
+            dlclose(h_avu);
+        return false;
+    }
+
+    void *(*p_av_malloc)(size_t) = NULL;
+    void (*p_av_freep)(void *) = NULL;
+    AVFrame *(*p_av_frame_alloc)(void) = NULL;
+    void (*p_av_frame_free)(AVFrame **) = NULL;
+    void (*p_av_frame_unref)(AVFrame *) = NULL;
+
+    const AVCodec *(*p_avcodec_find_decoder)(enum AVCodecID) = NULL;
+    AVCodecContext *(*p_avcodec_alloc_context3)(const AVCodec *) = NULL;
+    void (*p_avcodec_free_context)(AVCodecContext **) = NULL;
+    int (*p_avcodec_parameters_to_context)(AVCodecContext *, const AVCodecParameters *) = NULL;
+    int (*p_avcodec_open2)(AVCodecContext *, const AVCodec *, AVDictionary **) = NULL;
+    int (*p_avcodec_send_packet)(AVCodecContext *, const AVPacket *) = NULL;
+    int (*p_avcodec_receive_frame)(AVCodecContext *, AVFrame *) = NULL;
+    AVPacket *(*p_av_packet_alloc)(void) = NULL;
+    void (*p_av_packet_free)(AVPacket **) = NULL;
+    void (*p_av_packet_unref)(AVPacket *) = NULL;
+
+    AVIOContext *(*p_avio_alloc_context)(unsigned char *, int, int, void *,
+                                         int (*)(void *, uint8_t *, int),
+                                         int (*)(void *, const uint8_t *, int),
+                                         int64_t (*)(void *, int64_t, int)) = NULL;
+    void (*p_avio_context_free)(AVIOContext **) = NULL;
+    AVFormatContext *(*p_avformat_alloc_context)(void) = NULL;
+    int (*p_avformat_open_input)(AVFormatContext **, const char *, const AVInputFormat *,
+                                 AVDictionary **) = NULL;
+    int (*p_avformat_find_stream_info)(AVFormatContext *, AVDictionary **) = NULL;
+    int (*p_av_find_best_stream)(AVFormatContext *, enum AVMediaType, int, int, const AVCodec **,
+                                 int) = NULL;
+    int (*p_av_read_frame)(AVFormatContext *, AVPacket *) = NULL;
+    void (*p_avformat_close_input)(AVFormatContext **) = NULL;
+
+    *(void **)(&p_av_malloc) = dlsym(h_avu, "av_malloc");
+    *(void **)(&p_av_freep) = dlsym(h_avu, "av_freep");
+    *(void **)(&p_av_frame_alloc) = dlsym(h_avu, "av_frame_alloc");
+    *(void **)(&p_av_frame_free) = dlsym(h_avu, "av_frame_free");
+    *(void **)(&p_av_frame_unref) = dlsym(h_avu, "av_frame_unref");
+
+    *(void **)(&p_avcodec_find_decoder) = dlsym(h_avc, "avcodec_find_decoder");
+    *(void **)(&p_avcodec_alloc_context3) = dlsym(h_avc, "avcodec_alloc_context3");
+    *(void **)(&p_avcodec_free_context) = dlsym(h_avc, "avcodec_free_context");
+    *(void **)(&p_avcodec_parameters_to_context) = dlsym(h_avc, "avcodec_parameters_to_context");
+    *(void **)(&p_avcodec_open2) = dlsym(h_avc, "avcodec_open2");
+    *(void **)(&p_avcodec_send_packet) = dlsym(h_avc, "avcodec_send_packet");
+    *(void **)(&p_avcodec_receive_frame) = dlsym(h_avc, "avcodec_receive_frame");
+    *(void **)(&p_av_packet_alloc) = dlsym(h_avc, "av_packet_alloc");
+    *(void **)(&p_av_packet_free) = dlsym(h_avc, "av_packet_free");
+    *(void **)(&p_av_packet_unref) = dlsym(h_avc, "av_packet_unref");
+
+    *(void **)(&p_avio_alloc_context) = dlsym(h_avf, "avio_alloc_context");
+    *(void **)(&p_avio_context_free) = dlsym(h_avf, "avio_context_free");
+    *(void **)(&p_avformat_alloc_context) = dlsym(h_avf, "avformat_alloc_context");
+    *(void **)(&p_avformat_open_input) = dlsym(h_avf, "avformat_open_input");
+    *(void **)(&p_avformat_find_stream_info) = dlsym(h_avf, "avformat_find_stream_info");
+    *(void **)(&p_av_find_best_stream) = dlsym(h_avf, "av_find_best_stream");
+    *(void **)(&p_av_read_frame) = dlsym(h_avf, "av_read_frame");
+    *(void **)(&p_avformat_close_input) = dlsym(h_avf, "avformat_close_input");
+
+    if (!p_av_malloc || !p_av_freep || !p_av_frame_alloc || !p_av_frame_free || !p_av_frame_unref ||
+        !p_avcodec_find_decoder || !p_avcodec_alloc_context3 || !p_avcodec_free_context ||
+        !p_avcodec_parameters_to_context || !p_avcodec_open2 || !p_avcodec_send_packet ||
+        !p_avcodec_receive_frame || !p_av_packet_alloc || !p_av_packet_free ||
+        !p_av_packet_unref || !p_avio_alloc_context || !p_avio_context_free ||
+        !p_avformat_alloc_context || !p_avformat_open_input || !p_avformat_find_stream_info ||
+        !p_av_find_best_stream || !p_av_read_frame || !p_avformat_close_input) {
+        dlclose(h_avf);
+        dlclose(h_avc);
+        dlclose(h_avu);
+        return false;
+    }
+
+    bool ok = false;
+    we_avio_mem_t mem_reader = {.data = data, .size = size, .pos = 0};
+    unsigned char *avio_buf = (unsigned char *)p_av_malloc(32768);
+    AVIOContext *avio_ctx = NULL;
+    AVFormatContext *fmt_ctx = NULL;
+    AVCodecContext *codec_ctx = NULL;
+    AVPacket *pkt = NULL;
+    AVFrame *frame = NULL;
+    float *pcm = NULL;
+    size_t count_frames = 0;
+    uint32_t sample_rate = 0;
+
+    if (!avio_buf) {
+        goto cleanup;
+    }
+    avio_ctx = p_avio_alloc_context(avio_buf, 32768, 0, &mem_reader, we_avio_read_packet, NULL,
+                                    we_avio_seek);
+    if (!avio_ctx) {
+        p_av_freep(&avio_buf);
+        goto cleanup;
+    }
+    fmt_ctx = p_avformat_alloc_context();
+    if (!fmt_ctx) {
+        goto cleanup;
+    }
+    fmt_ctx->pb = avio_ctx;
+    fmt_ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+    if (p_avformat_open_input(&fmt_ctx, NULL, NULL, NULL) < 0) {
+        fmt_ctx = NULL;
+        goto cleanup;
+    }
+    if (p_avformat_find_stream_info(fmt_ctx, NULL) < 0) {
+        goto cleanup;
+    }
+    int stream_idx = p_av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    if (stream_idx < 0 || (unsigned)stream_idx >= fmt_ctx->nb_streams) {
+        goto cleanup;
+    }
+    AVStream *st = fmt_ctx->streams[stream_idx];
+    const AVCodec *codec = p_avcodec_find_decoder(st->codecpar->codec_id);
+    if (!codec) {
+        goto cleanup;
+    }
+    codec_ctx = p_avcodec_alloc_context3(codec);
+    if (!codec_ctx) {
+        goto cleanup;
+    }
+    if (p_avcodec_parameters_to_context(codec_ctx, st->codecpar) < 0) {
+        goto cleanup;
+    }
+    if (p_avcodec_open2(codec_ctx, codec, NULL) < 0) {
+        goto cleanup;
+    }
+
+    if (codec_ctx->sample_rate < 4000 || codec_ctx->sample_rate > 384000) {
+        goto cleanup;
+    }
+    sample_rate = (uint32_t)codec_ctx->sample_rate;
+    size_t max_frames = (size_t)sample_rate * 300u;
+    size_t cap_frames = 4096u;
+    pcm = malloc(cap_frames * 2u * sizeof(float));
+    pkt = p_av_packet_alloc();
+    frame = p_av_frame_alloc();
+    if (!pcm || !pkt || !frame) {
+        goto cleanup;
+    }
+
+    while (count_frames < max_frames && p_av_read_frame(fmt_ctx, pkt) >= 0) {
+        if (pkt->stream_index == stream_idx) {
+            if (p_avcodec_send_packet(codec_ctx, pkt) >= 0) {
+                while (p_avcodec_receive_frame(codec_ctx, frame) >= 0) {
+                    int nb = frame->nb_samples;
+                    int ch = frame->ch_layout.nb_channels;
+                    if (nb > 0 && ch > 0 && count_frames < max_frames) {
+                        size_t take = (size_t)nb;
+                        if (count_frames + take > max_frames) {
+                            take = max_frames - count_frames;
+                        }
+                        if (count_frames + take > cap_frames) {
+                            size_t new_cap = cap_frames * 2u;
+                            while (new_cap < count_frames + take) {
+                                new_cap *= 2u;
+                            }
+                            float *np = realloc(pcm, new_cap * 2u * sizeof(float));
+                            if (!np) {
+                                p_av_frame_unref(frame);
+                                break;
+                            }
+                            pcm = np;
+                            cap_frames = new_cap;
+                        }
+                        enum AVSampleFormat fmt = (enum AVSampleFormat)frame->format;
+                        for (size_t s = 0; s < take; ++s) {
+                            float lr[2] = {0.0f, 0.0f};
+                            int read_ch = (ch >= 2) ? 2 : 1;
+                            for (int c = 0; c < read_ch; ++c) {
+                                float v = 0.0f;
+                                switch (fmt) {
+                                case AV_SAMPLE_FMT_FLTP:
+                                    v = ((const float *)frame->data[c])[s];
+                                    break;
+                                case AV_SAMPLE_FMT_FLT:
+                                    v = ((const float *)frame->data[0])[s * (size_t)ch + (size_t)c];
+                                    break;
+                                case AV_SAMPLE_FMT_DBLP:
+                                    v = (float)((const double *)frame->data[c])[s];
+                                    break;
+                                case AV_SAMPLE_FMT_DBL:
+                                    v = (float)((const double *)frame->data[0])[s * (size_t)ch +
+                                                                                (size_t)c];
+                                    break;
+                                case AV_SAMPLE_FMT_S16P:
+                                    v = (float)((const int16_t *)frame->data[c])[s] / 32768.0f;
+                                    break;
+                                case AV_SAMPLE_FMT_S16:
+                                    v = (float)((const int16_t *)frame->data[0])[s * (size_t)ch +
+                                                                                 (size_t)c] /
+                                        32768.0f;
+                                    break;
+                                case AV_SAMPLE_FMT_S32P:
+                                    v = (float)((double)((const int32_t *)frame->data[c])[s] /
+                                                2147483648.0);
+                                    break;
+                                case AV_SAMPLE_FMT_S32:
+                                    v = (float)((double)((const int32_t *)
+                                                             frame->data[0])[s * (size_t)ch +
+                                                                             (size_t)c] /
+                                                2147483648.0);
+                                    break;
+                                case AV_SAMPLE_FMT_U8P:
+                                    v = ((float)((const uint8_t *)frame->data[c])[s] - 128.0f) /
+                                        128.0f;
+                                    break;
+                                case AV_SAMPLE_FMT_U8:
+                                    v = ((float)((const uint8_t *)frame->data[0])[s * (size_t)ch +
+                                                                                  (size_t)c] -
+                                         128.0f) /
+                                        128.0f;
+                                    break;
+                                default:
+                                    v = 0.0f;
+                                    break;
+                                }
+                                if (!isfinite(v))
+                                    v = 0.0f;
+                                if (v < -1.0f)
+                                    v = -1.0f;
+                                if (v > 1.0f)
+                                    v = 1.0f;
+                                lr[c] = v;
+                            }
+                            if (ch == 1) {
+                                lr[1] = lr[0];
+                            }
+                            pcm[(count_frames + s) * 2u + 0u] = lr[0];
+                            pcm[(count_frames + s) * 2u + 1u] = lr[1];
+                        }
+                        count_frames += take;
+                    }
+                    p_av_frame_unref(frame);
+                }
+            }
+        }
+        p_av_packet_unref(pkt);
+    }
+
+    if (count_frames > 0 && pcm) {
+        ok = resample_stereo_f32_to_48k(pcm, count_frames, sample_rate, out_stereo_f32,
+                                        out_frame_count);
+        pcm = NULL;
+    }
+
+cleanup:
+    free(pcm);
+    if (frame)
+        p_av_frame_free(&frame);
+    if (pkt)
+        p_av_packet_free(&pkt);
+    if (codec_ctx)
+        p_avcodec_free_context(&codec_ctx);
+    if (fmt_ctx)
+        p_avformat_close_input(&fmt_ctx);
+    if (avio_ctx) {
+        if (avio_ctx->buffer) {
+            p_av_freep(&avio_ctx->buffer);
+        }
+        p_avio_context_free(&avio_ctx);
+    }
+    dlclose(h_avf);
+    dlclose(h_avc);
+    dlclose(h_avu);
+    return ok;
+#else
+    (void)data;
+    (void)size;
+    (void)out_stereo_f32;
+    (void)out_frame_count;
+    return false;
+#endif
+}
+
+bool we_audio_decode_memory(const uint8_t *data, size_t size, float **out_stereo_f32,
+                            size_t *out_frame_count)
+{
+    if (we_audio_decode_wav_memory(data, size, out_stereo_f32, out_frame_count)) {
+        return true;
+    }
+    return we_audio_decode_ffmpeg_memory(data, size, out_stereo_f32, out_frame_count);
+}
+
+bool we_audio_decode_pkg_file(we_pkg_t *pkg, const char *vfs_dir, const char *rel_path,
+                              float **out_stereo_f32, size_t *out_frame_count)
+{
+    if (!rel_path || rel_path[0] == '\0' || !out_stereo_f32 || !out_frame_count) {
+        return false;
+    }
+    *out_stereo_f32 = NULL;
+    *out_frame_count = 0;
+
+    size_t sz = 0;
+    bool owned = false;
+    const uint8_t *bytes = NULL;
+    if (pkg) {
+        bytes = we_pkg_resolve(pkg, rel_path, &sz, &owned);
+    }
+    if (!bytes && vfs_dir && vfs_dir[0] != '\0') {
+        char norm[512];
+        if (we_pkg_normalize_path(rel_path, strlen(rel_path), norm, sizeof(norm))) {
+            char full[4096];
+            if (snprintf(full, sizeof(full), "%s/%s", vfs_dir, norm) < (int)sizeof(full)) {
+                FILE *fp = fopen(full, "rb");
+                if (fp) {
+                    if (fseek(fp, 0, SEEK_END) == 0) {
+                        long fsz = ftell(fp);
+                        if (fsz > 0 && fseek(fp, 0, SEEK_SET) == 0) {
+                            uint8_t *buf = malloc((size_t)fsz);
+                            if (buf && fread(buf, 1, (size_t)fsz, fp) == (size_t)fsz) {
+                                bytes = buf;
+                                sz = (size_t)fsz;
+                                owned = true;
+                            } else {
+                                free(buf);
+                            }
+                        }
+                    }
+                    fclose(fp);
+                }
+            }
+        }
+    }
+
+    if (!bytes || sz == 0) {
+        if (owned && bytes) {
+            free((void *)bytes);
+        }
+        return false;
+    }
+
+    bool ok = we_audio_decode_memory(bytes, sz, out_stereo_f32, out_frame_count);
+
+    if (owned) {
+        free((void *)bytes);
+    }
+    return ok;
 }
 
 static void init_scene_scripts(we_scene_t *scene)
@@ -871,12 +1574,28 @@ static void init_scene_scripts(we_scene_t *scene)
                     memcpy(in_val, target_cv->val, ncomp * sizeof(float));
                 }
                 break;
+            case WE_SCRIPT_PROP_TEXT:
+                ncomp = 0;
+                break;
+            case WE_SCRIPT_PROP_POINTSIZE:
+                in_val[0] = (float)obj->text_pointsize;
+                ncomp = 1;
+                break;
+            case WE_SCRIPT_PROP_VOLUME:
+                in_val[0] = obj->sound_volume;
+                ncomp = 1;
+                break;
             }
 
-            memcpy(out_val, in_val, ncomp * sizeof(float));
-            if (we_script_eval_init(sc->vm, &env, &ls, in_val, ncomp, out_val)) {
-                if (sc->target == WE_SCRIPT_PROP_UNIFORM ||
-                    memcmp(out_val, in_val, ncomp * sizeof(float)) != 0) {
+            if (ncomp > 0) {
+                memcpy(out_val, in_val, ncomp * sizeof(float));
+            }
+            if (we_script_eval_init(sc->vm, &env, &ls, ncomp > 0 ? in_val : NULL, ncomp,
+                                    ncomp > 0 ? out_val : NULL)) {
+                sync_obj_from_layer(obj, &ls);
+                sync_scene_layers_from_vm(scene, sc->vm);
+                if (ncomp > 0 && (sc->target == WE_SCRIPT_PROP_UNIFORM ||
+                                  memcmp(out_val, in_val, ncomp * sizeof(float)) != 0)) {
                     switch (sc->target) {
                     case WE_SCRIPT_PROP_ORIGIN:
                         memcpy(obj->origin, out_val, 3 * sizeof(float));
@@ -901,11 +1620,26 @@ static void init_scene_scripts(we_scene_t *scene)
                             memcpy(target_cv->val, out_val, ncomp * sizeof(float));
                         }
                         break;
+                    case WE_SCRIPT_PROP_TEXT:
+                        break;
+                    case WE_SCRIPT_PROP_POINTSIZE:
+                        if ((int32_t)out_val[0] != obj->text_pointsize && out_val[0] >= 4.0f) {
+                            obj->text_pointsize = (int32_t)out_val[0];
+                            obj->text_dirty = true;
+                        }
+                        break;
+                    case WE_SCRIPT_PROP_VOLUME:
+                        obj->sound_volume = fminf(fmaxf(out_val[0], 0.0f), 2.0f);
+                        break;
                     }
                 }
-                sync_obj_from_layer(obj, &ls);
-                sync_scene_layers_from_vm(scene, sc->vm);
             }
+        }
+    }
+    for (uint32_t i = 0; i < scene->object_count; i++) {
+        we_scene_object_t *obj = &scene->objects[i];
+        if (obj->is_text_object && obj->text_dirty) {
+            we_scene_update_text_texture(scene, obj);
         }
     }
 }
@@ -959,6 +1693,167 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
                                       obj->visible_user_prop, sizeof(obj->visible_user_prop));
     obj->copybackground =
         jval_bool_resolved(jobj_get(onode, "copybackground"), &scene->project, false, NULL, 0);
+    obj->sound_volume = 1.0f;
+    obj->text_pointsize = 32;
+    obj->text_padding = 2;
+
+    /* 1. Steam Wallpaper Engine "sound" object */
+    const we_jval_t *snd_node = jobj_get(onode, "sound");
+    if (snd_node && snd_node->type == JVAL_OBJ && jobj_get(snd_node, "value")) {
+        snd_node = jobj_get(snd_node, "value");
+    }
+    if (snd_node &&
+        ((snd_node->type == JVAL_ARR && snd_node->arr.count > 0) ||
+         (snd_node->type == JVAL_STR && snd_node->str && snd_node->str[0] != '\0'))) {
+        obj->is_sound_object = true;
+        obj->sound_volume = jval_float(jobj_get(onode, "volume"), &scene->project, 1.0f,
+                                       obj->user_prop_volume, sizeof(obj->user_prop_volume));
+        obj->sound_startsilent =
+            jval_bool_resolved(jobj_get(onode, "startsilent"), &scene->project, false, NULL, 0);
+        obj->sound_mintime =
+            fmaxf(0.0f, jval_float(jobj_get(onode, "mintime"), &scene->project, 0.0f, NULL, 0));
+        obj->sound_maxtime =
+            fmaxf(0.0f, jval_float(jobj_get(onode, "maxtime"), &scene->project, 0.0f, NULL, 0));
+
+        const char *pm = jval_str(jobj_get(onode, "playbackmode"), "loop");
+        if (pm && (strcasecmp(pm, "single") == 0 || strcasecmp(pm, "once") == 0)) {
+            obj->sound_mode = WE_SOUND_MODE_SINGLE;
+        } else if (pm && strcasecmp(pm, "random") == 0) {
+            obj->sound_mode = WE_SOUND_MODE_RANDOM;
+        } else {
+            obj->sound_mode = WE_SOUND_MODE_LOOP;
+        }
+
+        size_t item_count = (snd_node->type == JVAL_ARR) ? snd_node->arr.count : 1u;
+        for (size_t i = 0; i < item_count && obj->sound_track_count < WE_MAX_SOUND_TRACKS; ++i) {
+            const we_jval_t *item =
+                (snd_node->type == JVAL_ARR) ? snd_node->arr.items[i] : snd_node;
+            const char *spath = jval_str(item, NULL);
+            if (!spath && item && item->type == JVAL_OBJ) {
+                spath = jval_str(jobj_get(item, "file"), NULL);
+            }
+            if (spath && spath[0] != '\0') {
+                float *pcm = NULL;
+                size_t frames = 0;
+                if (we_audio_decode_pkg_file(scene->pkg, scene->project.workshop_dir, spath, &pcm,
+                                             &frames) &&
+                    pcm && frames > 0) {
+                    obj->sound_tracks_pcm[obj->sound_track_count] = pcm;
+                    obj->sound_tracks_frames[obj->sound_track_count] = frames;
+                    obj->sound_track_count++;
+                }
+            }
+        }
+        obj->sound_playing =
+            (obj->sound_track_count > 0 && !obj->sound_startsilent && obj->visible);
+        if (obj->sound_track_count > 0) {
+            scene->uses_audio = true;
+        }
+    }
+
+    /* 2. Steam Wallpaper Engine "text" layer */
+    const we_jval_t *tnode = jobj_get(onode, "text");
+    if (tnode && (tnode->type == JVAL_STR || tnode->type == JVAL_OBJ)) {
+        obj->is_text_object = true;
+        const char *raw_txt = NULL;
+        if (tnode->type == JVAL_STR) {
+            raw_txt = tnode->str;
+        } else if (tnode->type == JVAL_OBJ) {
+            const we_jval_t *u = jobj_get(tnode, "user");
+            if (u && u->type == JVAL_STR && u->str) {
+                snprintf(obj->user_prop_text, sizeof(obj->user_prop_text), "%s", u->str);
+                const we_user_prop_t *up = project_find_prop(&scene->project, u->str);
+                if (up && up->type == WE_PROP_TEXT && up->str_val[0] != '\0') {
+                    raw_txt = up->str_val;
+                }
+            } else if (u && u->type == JVAL_OBJ) {
+                const char *uname = jval_str(jobj_get(u, "name"), NULL);
+                if (uname) {
+                    snprintf(obj->user_prop_text, sizeof(obj->user_prop_text), "%s", uname);
+                    const we_user_prop_t *up = project_find_prop(&scene->project, uname);
+                    if (up && up->type == WE_PROP_TEXT && up->str_val[0] != '\0') {
+                        raw_txt = up->str_val;
+                    }
+                }
+            }
+            if (!raw_txt) {
+                raw_txt = jval_str(jobj_get(tnode, "value"), "");
+            }
+        }
+        snprintf(obj->text_str, sizeof(obj->text_str), "%s", raw_txt ? raw_txt : "");
+
+        const char *font_str = jval_str(jobj_get(onode, "font"), NULL);
+        if (!font_str && tnode->type == JVAL_OBJ) {
+            font_str = jval_str(jobj_get(tnode, "font"), NULL);
+        }
+        snprintf(obj->text_font, sizeof(obj->text_font), "%s",
+                 font_str ? font_str : "monospace");
+
+        const we_jval_t *ps_node = jobj_get(onode, "pointsize");
+        if (!ps_node && tnode->type == JVAL_OBJ) {
+            ps_node = jobj_get(tnode, "pointsize");
+        }
+        float ps = jval_float(ps_node, &scene->project, 32.0f, obj->user_prop_pointsize,
+                              sizeof(obj->user_prop_pointsize));
+        obj->text_pointsize = (ps >= 4.0f) ? (int32_t)ps : 32;
+
+        const char *ha = jval_str(jobj_get(onode, "horizontalalign"), NULL);
+        if (!ha && tnode->type == JVAL_OBJ) {
+            ha = jval_str(jobj_get(tnode, "horizontalalign"), NULL);
+        }
+        snprintf(obj->text_halign, sizeof(obj->text_halign), "%s", ha ? ha : "center");
+
+        const char *va = jval_str(jobj_get(onode, "verticalalign"), NULL);
+        if (!va && tnode->type == JVAL_OBJ) {
+            va = jval_str(jobj_get(tnode, "verticalalign"), NULL);
+        }
+        snprintf(obj->text_valign, sizeof(obj->text_valign), "%s", va ? va : "center");
+
+        const we_jval_t *pad_node = jobj_get(onode, "padding");
+        if (!pad_node && tnode->type == JVAL_OBJ) {
+            pad_node = jobj_get(tnode, "padding");
+        }
+        if (pad_node) {
+            int32_t pad_v = (int32_t)jval_float(pad_node, &scene->project, 2.0f, NULL, 0);
+            obj->text_padding = (pad_v >= 0) ? pad_v : 0;
+        }
+
+        const we_jval_t *obg_node = jobj_get(onode, "opaquebackground");
+        if (!obg_node && tnode->type == JVAL_OBJ) {
+            obg_node = jobj_get(tnode, "opaquebackground");
+        }
+        obj->text_opaque_bg = jval_bool_resolved(obg_node, &scene->project, false, NULL, 0);
+
+        const we_jval_t *bgc_node = jobj_get(onode, "backgroundcolor");
+        if (!bgc_node && tnode->type == JVAL_OBJ) {
+            bgc_node = jobj_get(tnode, "backgroundcolor");
+        }
+        obj->text_bg_color[0] = 0.0f;
+        obj->text_bg_color[1] = 0.0f;
+        obj->text_bg_color[2] = 0.0f;
+        if (bgc_node) {
+            jval_floats(bgc_node, &scene->project, obj->text_bg_color, 3, NULL, 0);
+        }
+
+        if (!has_explicit_size) {
+            obj->size[0] = 512.0f;
+            obj->size[1] = 128.0f;
+            has_explicit_size = true;
+        }
+
+        obj->has_base_pass = true;
+        obj->base_pass.blending = WE_BLEND_NORMAL;
+        snprintf(obj->base_pass.shader_name, sizeof(obj->base_pass.shader_name), "genericimage2");
+        snprintf(obj->base_pass.tex_paths[0], sizeof(obj->base_pass.tex_paths[0]), "_we_text_%d",
+                 obj->id);
+        we_scene_update_text_texture(scene, obj);
+        finalize_material_pass_cpu(&obj->base_pass, scene->pkg);
+
+        attach_object_script(scene, obj, WE_SCRIPT_PROP_TEXT, NULL, tnode, NULL);
+        if (ps_node) {
+            attach_object_script(scene, obj, WE_SCRIPT_PROP_POINTSIZE, NULL, ps_node, NULL);
+        }
+    }
 
     char mat_path[256] = {0};
     char mdl_path[256] = {0};
@@ -1059,7 +1954,7 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
         pass_set_combo(&obj->base_pass, "SKINNING", 1);
     }
 
-    if (mat_path[0] != '\0' && !obj->passthrough) {
+    if (mat_path[0] != '\0' && !obj->passthrough && !obj->is_text_object) {
         if (load_material_pass_from_file(&obj->base_pass, scene->pkg, mat_path, &scene->project)) {
             obj->has_base_pass = true;
             parse_pass_json_overrides(&obj->base_pass, onode, &scene->project);
@@ -1099,10 +1994,12 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
     attach_object_script(scene, obj, WE_SCRIPT_PROP_COLOR, NULL, jobj_get(onode, "color"), NULL);
     attach_object_script(scene, obj, WE_SCRIPT_PROP_VISIBLE, NULL, jobj_get(onode, "visible"),
                          NULL);
+    attach_object_script(scene, obj, WE_SCRIPT_PROP_VOLUME, NULL, jobj_get(onode, "volume"), NULL);
     const we_jval_t *top_script = jobj_get(onode, "script");
     if (top_script) {
-        attach_object_script(scene, obj, WE_SCRIPT_PROP_ORIGIN, NULL, top_script,
-                             jval_str(top_script, NULL));
+        attach_object_script(scene, obj,
+                             obj->is_text_object ? WE_SCRIPT_PROP_TEXT : WE_SCRIPT_PROP_ORIGIN,
+                             NULL, top_script, jval_str(top_script, NULL));
     }
     for (uint32_t c = 0; c < obj->base_pass.const_val_count; c++) {
         we_const_val_t *cv = &obj->base_pass.const_vals[c];
@@ -1321,6 +2218,8 @@ we_scene_t *we_scene_load_cpu(const char *workshop_dir, const char *prop_overrid
     scene->ortho_height = 1080.0f;
     scene->clear_enabled = true;
     scene->camera_up[1] = 1.0f;
+    scene->sound_rng_state = 0x9E3779B97F4A7C15ULL;
+    scene->last_audio_step_time = -1.0;
 
     we_jval_t *sroot = pkg_load_json(scene->pkg, scene->project.file);
     if (!sroot && strcasecmp(scene->project.file, "scene.json") != 0) {
@@ -1395,9 +2294,139 @@ we_scene_t *we_scene_load_cpu(const char *workshop_dir, const char *prop_overrid
                     }
                 }
                 init_scene_scripts(scene);
+                for (uint32_t i = 0; i < scene->object_count; i++) {
+                    if (scene->objects[i].is_text_object && scene->objects[i].text_dirty) {
+                        we_scene_update_text_texture(scene, &scene->objects[i]);
+                    }
+                }
             }
         }
         jval_free(sroot);
+    } else {
+        if (sroot) {
+            jval_free(sroot);
+        }
+        scene->camera_eye[0] = scene->ortho_width * 0.5f;
+        scene->camera_eye[1] = scene->ortho_height * 0.5f;
+        scene->camera_eye[2] = -1000.0f;
+        scene->camera_center[0] = scene->ortho_width * 0.5f;
+        scene->camera_center[1] = scene->ortho_height * 0.5f;
+        scene->camera_center[2] = 0.0f;
+    }
+
+    if (scene->object_count == 0) {
+        uint8_t *bgra_px = NULL;
+        uint32_t iw = 0, ih = 0;
+
+        if (scene->project.file[0] != '\0' && strchr(scene->project.file, '/') == NULL &&
+            strchr(scene->project.file, '\\') == NULL && strcmp(scene->project.file, ".") != 0 &&
+            strcmp(scene->project.file, "..") != 0) {
+            const char *fdot = strrchr(scene->project.file, '.');
+            bool is_meta_ext =
+                fdot && (strcasecmp(fdot, ".json") == 0 || strcasecmp(fdot, ".pkg") == 0 ||
+                         strcasecmp(fdot, ".html") == 0 || strcasecmp(fdot, ".htm") == 0);
+            if (!is_meta_ext) {
+                char fpath[4096];
+                struct stat fst;
+                if (snprintf(fpath, sizeof(fpath), "%s/%s", resolved_dir, scene->project.file) <
+                        (int)sizeof(fpath) &&
+                    stat(fpath, &fst) == 0 && S_ISREG(fst.st_mode) && fst.st_size > 0) {
+                    (void)image_load(fpath, &bgra_px, &iw, &ih);
+                }
+                if (!bgra_px && scene->pkg) {
+                    size_t pkg_sz = 0;
+                    bool pkg_owned = false;
+                    const uint8_t *pkg_data =
+                        we_pkg_resolve(scene->pkg, scene->project.file, &pkg_sz, &pkg_owned);
+                    if (pkg_data && pkg_sz > 0) {
+                        raw_image_t rimg;
+                        if (image_load_from_memory(pkg_data, pkg_sz, &rimg) && rimg.data &&
+                            rimg.width > 0 && rimg.height > 0) {
+                            bgra_px = rimg.data;
+                            iw = rimg.width;
+                            ih = rimg.height;
+                        }
+                    }
+                    if (pkg_owned && pkg_data) {
+                        free((void *)pkg_data);
+                    }
+                }
+            }
+        }
+
+        if (!bgra_px) {
+            char prev_path[4096];
+            if (we_workshop_find_preview_file(resolved_dir, prev_path, sizeof(prev_path))) {
+                (void)image_load(prev_path, &bgra_px, &iw, &ih);
+            }
+        }
+
+        if (bgra_px && iw > 0 && ih > 0) {
+            we_tex_t *tex = (we_tex_t *)calloc(1, sizeof(we_tex_t));
+            we_tex_image_t *timg = (we_tex_image_t *)calloc(1, sizeof(we_tex_image_t));
+            we_tex_mip_t *tmip = (we_tex_mip_t *)calloc(1, sizeof(we_tex_mip_t));
+            we_scene_object_t *objs_arr = (we_scene_object_t *)calloc(1, sizeof(we_scene_object_t));
+            if (tex && timg && tmip && objs_arr) {
+                if (scene->objects) {
+                    free(scene->objects);
+                }
+                scene->objects = objs_arr;
+                scene->object_count = 1;
+
+                tmip->width = iw;
+                tmip->height = ih;
+                tmip->rgba8 = bgra_px;
+                tmip->is_bgra_swiz = true;
+
+                timg->mip_count = 1;
+                timg->mips = tmip;
+
+                tex->format = WE_TEX_FMT_RGBA8888;
+                tex->flags = WE_TEX_FLAG_CLAMP_UVS;
+                tex->texture_width = iw;
+                tex->texture_height = ih;
+                tex->image_width = iw;
+                tex->image_height = ih;
+                tex->image_count = 1;
+                tex->images = timg;
+
+                we_scene_object_t *obj = &scene->objects[0];
+                snprintf(obj->name, sizeof(obj->name), "fallback_preview_quad");
+                obj->id = 0;
+                obj->parent_id = -1;
+                obj->origin[0] = scene->ortho_width * 0.5f;
+                obj->origin[1] = scene->ortho_height * 0.5f;
+                obj->origin[2] = 0.0f;
+                obj->scale[0] = 1.0f;
+                obj->scale[1] = 1.0f;
+                obj->scale[2] = 1.0f;
+                obj->size[0] = scene->ortho_width;
+                obj->size[1] = scene->ortho_height;
+                obj->alpha = 1.0f;
+                obj->brightness = 1.0f;
+                obj->color[0] = 1.0f;
+                obj->color[1] = 1.0f;
+                obj->color[2] = 1.0f;
+                obj->visible = true;
+                obj->fullscreen = true;
+                obj->has_base_pass = true;
+                obj->base_pass.blending = WE_BLEND_NORMAL;
+                snprintf(obj->base_pass.shader_name, sizeof(obj->base_pass.shader_name),
+                         "genericimage2");
+                snprintf(obj->base_pass.tex_paths[0], sizeof(obj->base_pass.tex_paths[0]),
+                         "_fallback_img");
+                obj->base_pass.textures[0] = tex;
+                finalize_material_pass_cpu(&obj->base_pass, scene->pkg);
+            } else {
+                free(tex);
+                free(timg);
+                free(tmip);
+                free(objs_arr);
+                image_free(bgra_px);
+            }
+        } else if (bgra_px) {
+            image_free(bgra_px);
+        }
     }
 
     return scene;

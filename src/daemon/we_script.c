@@ -17,7 +17,9 @@ static inline bool vm_check_watchdog(we_script_t *vm)
     }
     if ((vm->step_count & 63u) == 0u) {
         struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+        }
         int64_t ds = (int64_t)now.tv_sec - (int64_t)vm->start_ts.tv_sec;
         int64_t dn = (int64_t)now.tv_nsec - (int64_t)vm->start_ts.tv_nsec;
         int64_t elapsed_ns = ds * 1000000000LL + dn;
@@ -118,6 +120,7 @@ static double val_to_num(js_val_t v)
 {
     switch (v.type) {
     case VAL_NUM:
+    case VAL_DATE:
         return v.u.num;
     case VAL_BOOL:
         return v.u.bval ? 1.0 : 0.0;
@@ -158,6 +161,7 @@ static bool val_is_nan(js_val_t v)
     case VAL_BOOL:
         return false;
     case VAL_NUM:
+    case VAL_DATE:
         return isnan(v.u.num);
     case VAL_STR: {
         if (!v.u.str) {
@@ -214,6 +218,7 @@ static bool val_to_bool(js_val_t v)
     case VAL_SCENE_LAYER:
     case VAL_AUDIO_BUFFERS:
     case VAL_AUDIO_CHANNEL:
+    case VAL_DATE:
         return true;
     default:
         return false;
@@ -236,6 +241,26 @@ static void val_to_str_buf(js_val_t v, char *buf, size_t cap)
             snprintf(buf, cap, "%g", isfinite(v.u.num) ? v.u.num : 0.0);
         }
         break;
+    case VAL_DATE: {
+        double ms = v.u.num;
+        if (!isfinite(ms)) {
+            ms = 0.0;
+        }
+        if (ms < -8.64e15) {
+            ms = -8.64e15;
+        } else if (ms > 8.64e15) {
+            ms = 8.64e15;
+        }
+        time_t sec = (time_t)floor(ms / 1000.0);
+        struct tm tmv = {0};
+        if (!localtime_r(&sec, &tmv)) {
+            memset(&tmv, 0, sizeof(tmv));
+            tmv.tm_mday = 1;
+        }
+        snprintf(buf, cap, "%04d-%02d-%02d %02d:%02d:%02d", tmv.tm_year + 1900, tmv.tm_mon + 1,
+                 tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        break;
+    }
     case VAL_BOOL:
         snprintf(buf, cap, "%s", v.u.bval ? "true" : "false");
         break;
@@ -283,6 +308,9 @@ static bool js_val_equals(js_val_t lv, js_val_t rv, bool strict)
     }
     if (lv.type == VAL_BOOL && rv.type == VAL_BOOL) {
         return lv.u.bval == rv.u.bval;
+    }
+    if (lv.type == VAL_DATE || rv.type == VAL_DATE) {
+        return lv.type == VAL_DATE && rv.type == VAL_DATE && lv.u.num == rv.u.num;
     }
     if (lv.type == VAL_OBJ || rv.type == VAL_OBJ) {
         return lv.type == VAL_OBJ && rv.type == VAL_OBJ && lv.u.obj == rv.u.obj;
@@ -886,10 +914,73 @@ static js_val_t call_builtin_method(we_script_t *vm, js_builtin_id_t bid, const 
             }
             return val_undef();
         }
+        if (bid == BUILTIN_THIS_LAYER) {
+            if (strcmp(method, "play") == 0) {
+                vm->layer.audio_playing = true;
+                vm->layer.audio_cmd = 1;
+                vm->layer.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
+                return val_undef();
+            }
+            if (strcmp(method, "stop") == 0) {
+                vm->layer.audio_playing = false;
+                vm->layer.audio_cmd = 2;
+                vm->layer.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
+                return val_undef();
+            }
+            if (strcmp(method, "pause") == 0) {
+                vm->layer.audio_playing = false;
+                vm->layer.audio_cmd = 3;
+                vm->layer.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
+                return val_undef();
+            }
+            if (strcmp(method, "isPlaying") == 0) {
+                return val_bool(vm->layer.audio_playing);
+            }
+        }
+    } else if (bid == BUILTIN_DATE) {
+        if (strcmp(method, "now") == 0) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            return val_num((double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6);
+        }
     } else if (bid == BUILTIN_CONSOLE) {
         return val_undef();
     } else if (bid == BUILTIN_SCRIPT_PROPS_BUILDER) {
         return val_builtin(BUILTIN_SCRIPT_PROPS_BUILDER);
+    }
+    return val_undef();
+}
+
+static js_val_t call_scene_layer_method(we_script_t *vm, uint32_t slot, const char *method,
+                                        const js_val_t *args, uint32_t argc)
+{
+    (void)args;
+    (void)argc;
+    if (!vm || !method || slot >= WE_SCRIPT_MAX_SCENE_LAYERS || !vm->scene_layers[slot].valid) {
+        return val_undef();
+    }
+    we_script_scene_layer_slot_t *sl = &vm->scene_layers[slot];
+    sl->accessed = true;
+    if (strcmp(method, "play") == 0) {
+        sl->state.audio_playing = true;
+        sl->state.audio_cmd = 1;
+        sl->state.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
+        return val_undef();
+    }
+    if (strcmp(method, "stop") == 0) {
+        sl->state.audio_playing = false;
+        sl->state.audio_cmd = 2;
+        sl->state.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
+        return val_undef();
+    }
+    if (strcmp(method, "pause") == 0) {
+        sl->state.audio_playing = false;
+        sl->state.audio_cmd = 3;
+        sl->state.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
+        return val_undef();
+    }
+    if (strcmp(method, "isPlaying") == 0) {
+        return val_bool(sl->state.audio_playing);
     }
     return val_undef();
 }
@@ -927,6 +1018,18 @@ static js_val_t get_scene_layer_member(we_script_t *vm, uint32_t slot, const cha
         return val_bool(sl->state.visible);
     if (strcmp(prop, "name") == 0)
         return val_str(sl->state.name);
+    if (strcmp(prop, "text") == 0)
+        return val_str(sl->state.text);
+    if (strcmp(prop, "pointsize") == 0)
+        return val_num((double)sl->state.pointsize);
+    if (strcmp(prop, "horizontalalign") == 0)
+        return val_str(sl->state.halign);
+    if (strcmp(prop, "verticalalign") == 0)
+        return val_str(sl->state.valign);
+    if (strcmp(prop, "volume") == 0)
+        return val_num((double)sl->state.volume);
+    if (strcmp(prop, "isPlaying") == 0)
+        return val_bool(sl->state.audio_playing);
     if (strcmp(prop, "id") == 0)
         return val_num((double)sl->state.id);
     return val_undef();
@@ -1007,6 +1110,18 @@ static js_val_t get_builtin_member(we_script_t *vm, js_builtin_id_t bid, const c
             return val_bool(vm->layer.visible);
         if (strcmp(prop, "name") == 0)
             return val_str(vm->layer.name);
+        if (strcmp(prop, "text") == 0)
+            return val_str(vm->layer.text);
+        if (strcmp(prop, "pointsize") == 0)
+            return val_num((double)vm->layer.pointsize);
+        if (strcmp(prop, "horizontalalign") == 0)
+            return val_str(vm->layer.halign);
+        if (strcmp(prop, "verticalalign") == 0)
+            return val_str(vm->layer.valign);
+        if (strcmp(prop, "volume") == 0)
+            return val_num((double)vm->layer.volume);
+        if (strcmp(prop, "isPlaying") == 0)
+            return val_bool(vm->layer.audio_playing);
         if (strcmp(prop, "id") == 0)
             return val_num((double)vm->layer.id);
         for (uint32_t i = 0; i < vm->this_prop_count; i++) {
@@ -1025,6 +1140,52 @@ static bool apply_layer_state_prop(we_script_layer_state_t *st, js_vec_obj_t *or
                                    js_vec_obj_t *color_vec, js_vec_obj_t *size_vec,
                                    const char *prop, js_val_t rhs)
 {
+    if (strcmp(prop, "text") == 0) {
+        char buf[512];
+        val_to_str_buf(rhs, buf, sizeof(buf));
+        snprintf(st->text, sizeof(st->text), "%s", buf);
+        st->dirty_mask |= WE_LAYER_DIRTY_TEXT;
+        return true;
+    }
+    if (strcmp(prop, "pointsize") == 0) {
+        int32_t ps = num_to_i32(val_to_num(rhs));
+        if (ps < 4) {
+            ps = 4;
+        }
+        if (ps > 256) {
+            ps = 256;
+        }
+        st->pointsize = ps;
+        st->dirty_mask |= WE_LAYER_DIRTY_POINTSIZE;
+        return true;
+    }
+    if (strcmp(prop, "horizontalalign") == 0) {
+        char buf[32];
+        val_to_str_buf(rhs, buf, sizeof(buf));
+        snprintf(st->halign, sizeof(st->halign), "%s", buf);
+        st->dirty_mask |= WE_LAYER_DIRTY_HALIGN;
+        return true;
+    }
+    if (strcmp(prop, "verticalalign") == 0) {
+        char buf[32];
+        val_to_str_buf(rhs, buf, sizeof(buf));
+        snprintf(st->valign, sizeof(st->valign), "%s", buf);
+        st->dirty_mask |= WE_LAYER_DIRTY_VALIGN;
+        return true;
+    }
+    if (strcmp(prop, "volume") == 0) {
+        float vol = sanitize_f((float)val_to_num(rhs), 1.0f);
+        if (vol < 0.0f) {
+            vol = 0.0f;
+        }
+        if (vol > 2.0f) {
+            vol = 2.0f;
+        }
+        st->volume = vol;
+        st->dirty_mask |= WE_LAYER_DIRTY_VOLUME;
+        return true;
+    }
+
     float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     extract_other_vec(rhs, tmp);
     for (int i = 0; i < 4; i++) {
@@ -1624,11 +1785,342 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
     return val_undef();
 }
 
+static js_val_t call_date_method(we_script_t *vm, js_val_t recv, const char *method,
+                                 const js_val_t *args, uint32_t argc)
+{
+    (void)args;
+    (void)argc;
+    double ms = recv.u.num;
+    if (!isfinite(ms)) {
+        ms = 0.0;
+    }
+    if (ms < -8.64e15) {
+        ms = -8.64e15;
+    } else if (ms > 8.64e15) {
+        ms = 8.64e15;
+    }
+    time_t sec = (time_t)floor(ms / 1000.0);
+    int msec = (int)floor(fmod(ms, 1000.0));
+    if (msec < 0) {
+        msec += 1000;
+    }
+    struct tm tmv = {0};
+    if (!localtime_r(&sec, &tmv)) {
+        memset(&tmv, 0, sizeof(tmv));
+        tmv.tm_mday = 1;
+    }
+
+    if (strcmp(method, "getHours") == 0)
+        return val_num((double)tmv.tm_hour);
+    if (strcmp(method, "getMinutes") == 0)
+        return val_num((double)tmv.tm_min);
+    if (strcmp(method, "getSeconds") == 0)
+        return val_num((double)tmv.tm_sec);
+    if (strcmp(method, "getMilliseconds") == 0)
+        return val_num((double)msec);
+    if (strcmp(method, "getFullYear") == 0)
+        return val_num((double)(tmv.tm_year + 1900));
+    if (strcmp(method, "getMonth") == 0)
+        return val_num((double)tmv.tm_mon);
+    if (strcmp(method, "getDate") == 0)
+        return val_num((double)tmv.tm_mday);
+    if (strcmp(method, "getDay") == 0)
+        return val_num((double)tmv.tm_wday);
+    if (strcmp(method, "getTime") == 0 || strcmp(method, "valueOf") == 0)
+        return val_num(ms);
+    if (strcmp(method, "toString") == 0 || strcmp(method, "toLocaleTimeString") == 0 ||
+        strcmp(method, "toTimeString") == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+    }
+    if (strcmp(method, "toLocaleDateString") == 0 || strcmp(method, "toDateString") == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tmv.tm_year + 1900, tmv.tm_mon + 1,
+                 tmv.tm_mday);
+        return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+    }
+    return val_undef();
+}
+
+static js_val_t call_str_method(we_script_t *vm, js_val_t recv, const char *method,
+                                const js_val_t *args, uint32_t argc)
+{
+    const char *s = recv.u.str ? recv.u.str : "";
+    size_t slen = strlen(s);
+
+    if (strcmp(method, "toString") == 0 || strcmp(method, "valueOf") == 0) {
+        return recv;
+    }
+    if (strcmp(method, "padStart") == 0 || strcmp(method, "padEnd") == 0) {
+        bool is_start = (strcmp(method, "padStart") == 0);
+        int32_t target_len = (argc >= 1) ? num_to_i32(val_to_num(args[0])) : 0;
+        if (target_len > 512) {
+            target_len = 512;
+        }
+        if (target_len <= 0 || (size_t)target_len <= slen) {
+            return recv;
+        }
+        char pad_buf[64] = " ";
+        if (argc >= 2 && args[1].type != VAL_UNDEF) {
+            val_to_str_buf(args[1], pad_buf, sizeof(pad_buf));
+        }
+        size_t plen = strlen(pad_buf);
+        if (plen == 0) {
+            return recv;
+        }
+        size_t pad_needed = (size_t)target_len - slen;
+        char out[516];
+        size_t pos = 0;
+        if (is_start) {
+            for (size_t i = 0; i < pad_needed; i++) {
+                out[pos++] = pad_buf[i % plen];
+            }
+            memcpy(out + pos, s, slen);
+            pos += slen;
+        } else {
+            memcpy(out, s, slen);
+            pos = slen;
+            for (size_t i = 0; i < pad_needed; i++) {
+                out[pos++] = pad_buf[i % plen];
+            }
+        }
+        out[pos] = '\0';
+        return val_str(script_arena_strdup(vm, out, pos));
+    }
+    if (strcmp(method, "slice") == 0 || strcmp(method, "substring") == 0) {
+        bool is_sub = (strcmp(method, "substring") == 0);
+        int32_t len = (int32_t)slen;
+        int32_t start = (argc >= 1) ? num_to_i32(val_to_num(args[0])) : 0;
+        int32_t end =
+            (argc >= 2 && args[1].type != VAL_UNDEF) ? num_to_i32(val_to_num(args[1])) : len;
+        if (is_sub) {
+            if (start < 0)
+                start = 0;
+            if (end < 0)
+                end = 0;
+            if (start > len)
+                start = len;
+            if (end > len)
+                end = len;
+            if (start > end) {
+                int32_t t = start;
+                start = end;
+                end = t;
+            }
+        } else {
+            if (start < 0)
+                start = len + start;
+            if (start < 0)
+                start = 0;
+            if (start > len)
+                start = len;
+            if (end < 0)
+                end = len + end;
+            if (end < start)
+                end = start;
+            if (end > len)
+                end = len;
+        }
+        return val_str(script_arena_strdup(vm, s + start, (size_t)(end - start)));
+    }
+    if (strcmp(method, "substr") == 0) {
+        int32_t len = (int32_t)slen;
+        int32_t start = (argc >= 1) ? num_to_i32(val_to_num(args[0])) : 0;
+        if (start < 0)
+            start = len + start;
+        if (start < 0)
+            start = 0;
+        if (start > len)
+            start = len;
+        int32_t count = (argc >= 2 && args[1].type != VAL_UNDEF) ? num_to_i32(val_to_num(args[1]))
+                                                                 : (len - start);
+        if (count < 0)
+            count = 0;
+        if (count > len - start)
+            count = len - start;
+        return val_str(script_arena_strdup(vm, s + start, (size_t)count));
+    }
+    if (strcmp(method, "toUpperCase") == 0 || strcmp(method, "toLowerCase") == 0) {
+        bool upper = (strcmp(method, "toUpperCase") == 0);
+        char *dst = script_arena_strdup(vm, s, slen);
+        if (!dst) {
+            return val_str("");
+        }
+        for (size_t i = 0; i < slen; i++) {
+            unsigned char c = (unsigned char)dst[i];
+            dst[i] = (char)(upper ? toupper(c) : tolower(c));
+        }
+        return val_str(dst);
+    }
+    if (strcmp(method, "trim") == 0) {
+        size_t start = 0;
+        while (start < slen && isspace((unsigned char)s[start])) {
+            start++;
+        }
+        size_t end = slen;
+        while (end > start && isspace((unsigned char)s[end - 1])) {
+            end--;
+        }
+        return val_str(script_arena_strdup(vm, s + start, end - start));
+    }
+    if (strcmp(method, "charAt") == 0) {
+        int32_t idx = (argc >= 1) ? num_to_i32(val_to_num(args[0])) : 0;
+        if (idx < 0 || (size_t)idx >= slen) {
+            return val_str("");
+        }
+        return val_str(script_arena_strdup(vm, s + idx, 1));
+    }
+    if (strcmp(method, "indexOf") == 0) {
+        if (argc < 1) {
+            return val_num(-1.0);
+        }
+        char needle[128];
+        val_to_str_buf(args[0], needle, sizeof(needle));
+        int32_t from = (argc >= 2) ? num_to_i32(val_to_num(args[1])) : 0;
+        if (from < 0)
+            from = 0;
+        if ((size_t)from > slen) {
+            return val_num(-1.0);
+        }
+        const char *found = strstr(s + from, needle);
+        return found ? val_num((double)(found - s)) : val_num(-1.0);
+    }
+    if (strcmp(method, "replace") == 0 && argc >= 2) {
+        char pat[128];
+        char rep[256];
+        val_to_str_buf(args[0], pat, sizeof(pat));
+        val_to_str_buf(args[1], rep, sizeof(rep));
+        size_t plen = strlen(pat);
+        if (plen == 0) {
+            return recv;
+        }
+        const char *hit = strstr(s, pat);
+        if (!hit) {
+            return recv;
+        }
+        char out[1024];
+        size_t pre = (size_t)(hit - s);
+        size_t rlen = strlen(rep);
+        size_t post = slen - pre - plen;
+        size_t pos = 0;
+        if (pre < sizeof(out) - 1) {
+            memcpy(out, s, pre);
+            pos += pre;
+        }
+        if (pos + rlen < sizeof(out) - 1) {
+            memcpy(out + pos, rep, rlen);
+            pos += rlen;
+        }
+        if (pos + post < sizeof(out) - 1) {
+            memcpy(out + pos, hit + plen, post);
+            pos += post;
+        }
+        out[pos] = '\0';
+        return val_str(script_arena_strdup(vm, out, pos));
+    }
+    if (strcmp(method, "split") == 0) {
+        js_arr_t *arr = (js_arr_t *)script_arena_alloc(vm, sizeof(js_arr_t));
+        if (!arr) {
+            return val_undef();
+        }
+        char sep[64] = "";
+        if (argc >= 1 && args[0].type != VAL_UNDEF) {
+            val_to_str_buf(args[0], sep, sizeof(sep));
+        }
+        size_t sep_len = strlen(sep);
+        if (argc == 0 || args[0].type == VAL_UNDEF) {
+            arr_push_item(vm, arr, recv);
+        } else if (sep_len == 0) {
+            for (size_t i = 0; i < slen && i < 256u; i++) {
+                arr_push_item(vm, arr, val_str(script_arena_strdup(vm, s + i, 1)));
+            }
+        } else {
+            const char *cur = s;
+            while (*cur) {
+                const char *hit = strstr(cur, sep);
+                if (!hit) {
+                    arr_push_item(vm, arr, val_str(script_arena_strdup(vm, cur, strlen(cur))));
+                    break;
+                }
+                arr_push_item(vm, arr,
+                              val_str(script_arena_strdup(vm, cur, (size_t)(hit - cur))));
+                cur = hit + sep_len;
+                if (*cur == '\0') {
+                    arr_push_item(vm, arr, val_str(""));
+                    break;
+                }
+            }
+        }
+        js_val_t v = {.type = VAL_ARR, .u.arr = arr};
+        return v;
+    }
+    return val_undef();
+}
+
+static js_val_t call_num_method(we_script_t *vm, js_val_t recv, const char *method,
+                                const js_val_t *args, uint32_t argc)
+{
+    double d = recv.u.num;
+    if (strcmp(method, "toFixed") == 0) {
+        int digits = (argc >= 1) ? num_to_i32(val_to_num(args[0])) : 0;
+        if (digits < 0)
+            digits = 0;
+        if (digits > 20)
+            digits = 20;
+        char buf[64];
+        if (!isfinite(d)) {
+            snprintf(buf, sizeof(buf), "%s", isnan(d) ? "NaN" : (d > 0 ? "Infinity" : "-Infinity"));
+        } else {
+            snprintf(buf, sizeof(buf), "%.*f", digits, d);
+        }
+        return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+    }
+    if (strcmp(method, "toString") == 0) {
+        char buf[64];
+        val_to_str_buf(recv, buf, sizeof(buf));
+        return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+    }
+    return val_undef();
+}
+
 static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_node_t *node)
 {
     switch (node->type) {
     case AST_LITERAL:
         return node->lit;
+
+    case AST_TEMPLATE: {
+        char out_buf[1024];
+        size_t pos = 0;
+        out_buf[0] = '\0';
+        uint32_t ecnt = node->tpl.expr_count;
+        for (uint32_t i = 0; i <= ecnt; i++) {
+            const char *seg = (node->tpl.parts && node->tpl.parts[i]) ? node->tpl.parts[i] : "";
+            size_t slen = strlen(seg);
+            if (slen > 0 && pos + 1 < sizeof(out_buf)) {
+                size_t copy_n =
+                    (pos + slen < sizeof(out_buf) - 1) ? slen : (sizeof(out_buf) - 1 - pos);
+                memcpy(out_buf + pos, seg, copy_n);
+                pos += copy_n;
+                out_buf[pos] = '\0';
+            }
+            if (i < ecnt && node->tpl.exprs && node->tpl.exprs[i]) {
+                js_val_t ev = eval_node(vm, scope, node->tpl.exprs[i]);
+                char ebuf[256];
+                val_to_str_buf(ev, ebuf, sizeof(ebuf));
+                size_t elen = strlen(ebuf);
+                if (elen > 0 && pos + 1 < sizeof(out_buf)) {
+                    size_t copy_n =
+                        (pos + elen < sizeof(out_buf) - 1) ? elen : (sizeof(out_buf) - 1 - pos);
+                    memcpy(out_buf + pos, ebuf, copy_n);
+                    pos += copy_n;
+                    out_buf[pos] = '\0';
+                }
+            }
+        }
+        return val_str(script_arena_strdup(vm, out_buf, pos));
+    }
 
     case AST_FUNC_DECL: {
         js_val_t v;
@@ -1651,6 +2143,8 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
         }
         if (strcmp(node->name, "Math") == 0)
             return val_builtin(BUILTIN_MATH);
+        if (strcmp(node->name, "Date") == 0)
+            return val_builtin(BUILTIN_DATE);
         if (strcmp(node->name, "WEMath") == 0)
             return val_builtin(BUILTIN_WEMATH);
         if (strcmp(node->name, "WEColor") == 0)
@@ -1713,6 +2207,49 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
             args[i] = eval_node(vm, scope, node->children[i]);
         }
         if (node->name) {
+            if (strcmp(node->name, "Date") == 0) {
+                double ms = 0.0;
+                if (argc == 0) {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    ms = (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+                } else if (argc == 1) {
+                    ms = val_to_num(args[0]);
+                } else {
+                    struct tm tmv = {0};
+                    int yr = num_to_i32(val_to_num(args[0]));
+                    if (yr < -271821) {
+                        yr = -271821;
+                    } else if (yr > 275760) {
+                        yr = 275760;
+                    }
+                    tmv.tm_year = (yr >= 0 && yr <= 99) ? yr : (yr - 1900);
+                    tmv.tm_mon = num_to_i32(val_to_num(args[1]));
+                    tmv.tm_mday = (argc >= 3) ? num_to_i32(val_to_num(args[2])) : 1;
+                    tmv.tm_hour = (argc >= 4) ? num_to_i32(val_to_num(args[3])) : 0;
+                    tmv.tm_min = (argc >= 5) ? num_to_i32(val_to_num(args[4])) : 0;
+                    tmv.tm_sec = (argc >= 6) ? num_to_i32(val_to_num(args[5])) : 0;
+                    tmv.tm_isdst = -1;
+                    double extra_ms = (argc >= 7) ? val_to_num(args[6]) : 0.0;
+                    if (!isfinite(extra_ms)) {
+                        extra_ms = 0.0;
+                    }
+                    ms = (double)mktime(&tmv) * 1000.0 + extra_ms;
+                }
+                if (!isfinite(ms)) {
+                    ms = 0.0;
+                }
+                if (ms < -8.64e15) {
+                    ms = -8.64e15;
+                } else if (ms > 8.64e15) {
+                    ms = 8.64e15;
+                }
+                js_val_t v;
+                memset(&v, 0, sizeof(v));
+                v.type = VAL_DATE;
+                v.u.num = ms;
+                return v;
+            }
             if (strcmp(node->name, "Vec2") == 0)
                 return construct_vec(vm, 2, args, argc);
             if (strcmp(node->name, "Vec3") == 0)
@@ -1815,6 +2352,14 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
             }
             return val_undef();
         }
+        if (base.type == VAL_STR && base.u.str) {
+            int32_t i = num_to_i32(val_to_num(idx_v));
+            size_t slen = strlen(base.u.str);
+            if (i >= 0 && (size_t)i < slen) {
+                return val_str(script_arena_strdup(vm, base.u.str + i, 1));
+            }
+            return val_undef();
+        }
         if (base.type == VAL_VEC && base.u.vec) {
             int32_t i = num_to_i32(val_to_num(idx_v));
             if (i >= 0 && i < 4) {
@@ -1854,6 +2399,18 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
             if (recv.type == VAL_BUILTIN_OBJ) {
                 return call_builtin_method(vm, recv.u.builtin_id, method, args, argc);
             }
+            if (recv.type == VAL_SCENE_LAYER) {
+                return call_scene_layer_method(vm, recv.u.layer_slot, method, args, argc);
+            }
+            if (recv.type == VAL_DATE) {
+                return call_date_method(vm, recv, method, args, argc);
+            }
+            if (recv.type == VAL_STR) {
+                return call_str_method(vm, recv, method, args, argc);
+            }
+            if (recv.type == VAL_NUM) {
+                return call_num_method(vm, recv, method, args, argc);
+            }
             if (recv.type == VAL_ARR && recv.u.arr) {
                 return call_arr_method(vm, scope, recv, method, args, argc);
             }
@@ -1877,6 +2434,11 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
                     return invoke_ast_func(vm, mfn.u.func, args, argc, d);
                 }
             }
+            if (strcmp(method, "toString") == 0) {
+                char buf[128];
+                val_to_str_buf(recv, buf, sizeof(buf));
+                return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+            }
             return val_undef();
         }
 
@@ -1888,6 +2450,31 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
                 return construct_vec(vm, 3, args, argc);
             if (strcmp(fname, "Vec4") == 0)
                 return construct_vec(vm, 4, args, argc);
+            if (strcmp(fname, "String") == 0) {
+                if (argc == 0) {
+                    return val_str("");
+                }
+                char buf[512];
+                val_to_str_buf(args[0], buf, sizeof(buf));
+                return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+            }
+            if (strcmp(fname, "Boolean") == 0) {
+                return val_bool(argc >= 1 ? val_to_bool(args[0]) : false);
+            }
+            if (strcmp(fname, "Date") == 0) {
+                struct timespec ts = {0};
+                clock_gettime(CLOCK_REALTIME, &ts);
+                time_t sec = ts.tv_sec;
+                struct tm tmv = {0};
+                if (!localtime_r(&sec, &tmv)) {
+                    memset(&tmv, 0, sizeof(tmv));
+                    tmv.tm_mday = 1;
+                }
+                char buf[64];
+                snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", tmv.tm_year + 1900,
+                         tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+                return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+            }
             if (strcmp(fname, "parseFloat") == 0) {
                 if (argc == 0) {
                     return val_nan();
@@ -2388,6 +2975,8 @@ static void sync_layer_to_vm(we_script_t *vm, const we_script_layer_state_t *lay
         vm->layer.color[0] = vm->layer.color[1] = vm->layer.color[2] = 1.0f;
         vm->layer.alpha = 1.0f;
         vm->layer.visible = true;
+        vm->layer.pointsize = 32;
+        vm->layer.volume = 1.0f;
     }
 
     vm->layer_origin_vec.dim = 3;
@@ -2422,7 +3011,9 @@ static void reset_watchdog(we_script_t *vm)
     vm->aborted = false;
     vm->timed_out = false;
     vm->eval_depth = 0;
-    clock_gettime(CLOCK_MONOTONIC, &vm->start_ts);
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &vm->start_ts) != 0) {
+        clock_gettime(CLOCK_MONOTONIC, &vm->start_ts);
+    }
 }
 
 we_script_t *we_script_create(const char *src, size_t len, we_script_shared_t *shared)
@@ -2467,6 +3058,7 @@ we_script_t *we_script_create(const char *src, size_t len, we_script_shared_t *s
     vm->env.canvas_size[0] = 1920.0f;
     vm->env.canvas_size[1] = 1080.0f;
     sync_layer_to_vm(vm, NULL);
+    tzset();
 
     reset_watchdog(vm);
 
@@ -3025,6 +3617,8 @@ static bool run_value_callback(we_script_t *vm, const ast_node_t *fn, const we_s
                             d >= 4 ? in_val[3] : 1.0f);
     } else if (in_val && num_components == 1) {
         arg_v = val_num((double)in_val[0]);
+    } else if (num_components == 0) {
+        arg_v = val_str(script_arena_strdup(vm, vm->layer.text, strlen(vm->layer.text)));
     } else {
         arg_v = val_num(0.0);
     }
@@ -3041,6 +3635,26 @@ static bool run_value_callback(we_script_t *vm, const ast_node_t *fn, const we_s
         }
         promote_global_values(vm);
         return false;
+    }
+
+    const char *orig_text = (arg_v.type == VAL_STR && arg_v.u.str) ? arg_v.u.str : "";
+    bool text_already_dirty = (vm->layer.dirty_mask & WE_LAYER_DIRTY_TEXT) != 0;
+    if (ret.type == VAL_STR && ret.u.str) {
+        if (!text_already_dirty || strcmp(ret.u.str, orig_text) != 0) {
+            if (strcmp(vm->layer.text, ret.u.str) != 0) {
+                snprintf(vm->layer.text, sizeof(vm->layer.text), "%s", ret.u.str);
+                vm->layer.dirty_mask |= WE_LAYER_DIRTY_TEXT;
+            }
+        }
+    } else if (num_components == 0 && ret.type != VAL_UNDEF && ret.type != VAL_NULL) {
+        char buf[512];
+        val_to_str_buf(ret, buf, sizeof(buf));
+        if (!text_already_dirty || strcmp(buf, orig_text) != 0) {
+            if (strcmp(vm->layer.text, buf) != 0) {
+                snprintf(vm->layer.text, sizeof(vm->layer.text), "%s", buf);
+                vm->layer.dirty_mask |= WE_LAYER_DIRTY_TEXT;
+            }
+        }
     }
 
     if (inout_layer) {

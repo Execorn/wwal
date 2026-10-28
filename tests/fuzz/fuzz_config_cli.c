@@ -115,6 +115,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         char err_buf[256];
         waywal_config_init_defaults(&cfg);
         waywal_config_parse_string(toml_str, &cfg, err_buf, sizeof(err_buf));
+        uint32_t dur_sec = 0;
+        (void)waywal_parse_duration_seconds(toml_str, &dur_sec);
+        waywal_sort_mode_t sort_m = WAYWAL_SORT_RANDOM;
+        (void)waywal_parse_sort_mode(toml_str, &sort_m);
         free(toml_str);
     }
 #endif
@@ -167,11 +171,20 @@ int main(int argc, char **argv)
         "1.0]\n"
         "[output.\"DP-1\"]\npath = \"/tmp/wall.png\"\nscaling = \"fill\"\n"
         "[workspace.\"1\"]\npath = \"/tmp/ws1.png\"\noutput = \"DP-1\"\n",
+        "[default]\npath = \"/tmp\"\nduration = \"15m\"\nmode = \"fit-border-color\"\n"
+        "sorting = \"mtime\"\ncolor = \"#112233\"\n"
+        "[any]\nduration = 1h30m\n"
+        "[DP-1]\npath = \"/tmp/shader.frag\"\nmode = \"center\"\n"
+        "[workspace.\"2\"]\ncolor = \"#336699\"\ntransition = \"slide\"\n"
+        "transition_duration = \"400ms\"\ndirectional = false\n",
         "img /tmp/test.png --transition-type grow --transition-pos cursor --transition-fps 144 "
         "--transition-bezier 0.22,1.0,0.36,1.0 --fill-color #1e1e2e --resize fit --10bit",
         "video /tmp/loop.mp4 --loop 0 --speed 1.5 -o DP-1,HDMI-A-1",
         "slideshow start /tmp --interval 120 --shuffle --transition-type wave --transition-wave "
         "30,0.08",
+        "slideshow --duration 1h30m --sort descending /tmp -o DP-1",
+        "next -o DP-1",
+        "prev --output HDMI-A-1",
         "clear #ff00ff -o eDP-1",
         "unterminated = \"string literal\n[broken.section\nbezier = [1, 2, 3, 4, 5, 6]",
     };

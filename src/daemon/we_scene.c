@@ -584,6 +584,9 @@ bool we_scene_init_gl(we_scene_t *scene, dmabuf_context_t *dmabuf_ctx)
         if (obj->has_base_pass) {
             upload_pass_gl(&obj->base_pass);
         }
+        if (obj->is_text_object) {
+            we_scene_update_text_texture(scene, obj);
+        }
         if (obj->puppet) {
             we_puppet_upload_gl(obj->puppet);
         }
@@ -1049,6 +1052,615 @@ static void apply_gl_blend_mode(we_blend_mode_t mode)
     }
 }
 
+/* =========================================================================
+ * Embedded 8x16 Bitmap Font Table (ASCII 0x20..0x7E) & Text Rasterizer
+ * ========================================================================= */
+
+static const uint8_t we_font8x16[95][16] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x20 */
+    {0x00, 0x00, 0x18, 0x3C, 0x3C, 0x3C, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00}, /* 0x21 */
+    {0x00, 0x66, 0x66, 0x66, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x22 */
+    {0x00, 0x00, 0x00, 0x6C, 0x6C, 0xFE, 0x6C, 0x6C, 0x6C, 0xFE, 0x6C, 0x6C, 0x00, 0x00, 0x00, 0x00}, /* 0x23 */
+    {0x18, 0x18, 0x7C, 0xC6, 0xC2, 0xC0, 0x7C, 0x06, 0x06, 0x86, 0xC6, 0x7C, 0x18, 0x18, 0x00, 0x00}, /* 0x24 */
+    {0x00, 0x00, 0x00, 0x00, 0xC2, 0xC6, 0x0C, 0x18, 0x30, 0x60, 0xC6, 0x86, 0x00, 0x00, 0x00, 0x00}, /* 0x25 */
+    {0x00, 0x00, 0x38, 0x6C, 0x6C, 0x38, 0x76, 0xDC, 0xCC, 0xCC, 0xCC, 0x76, 0x00, 0x00, 0x00, 0x00}, /* 0x26 */
+    {0x00, 0x30, 0x30, 0x30, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x27 */
+    {0x00, 0x00, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00, 0x00, 0x00, 0x00}, /* 0x28 */
+    {0x00, 0x00, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00, 0x00, 0x00, 0x00}, /* 0x29 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x2A */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x2B */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x18, 0x30, 0x00, 0x00, 0x00}, /* 0x2C */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x2D */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00}, /* 0x2E */
+    {0x00, 0x00, 0x00, 0x00, 0x02, 0x06, 0x0C, 0x18, 0x30, 0x60, 0xC0, 0x80, 0x00, 0x00, 0x00, 0x00}, /* 0x2F */
+    {0x00, 0x00, 0x7C, 0xC6, 0xCE, 0xDE, 0xF6, 0xE6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x30 */
+    {0x00, 0x00, 0x18, 0x38, 0x78, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00, 0x00, 0x00, 0x00}, /* 0x31 */
+    {0x00, 0x00, 0x7C, 0xC6, 0x06, 0x0C, 0x18, 0x30, 0x60, 0xC0, 0xC6, 0xFE, 0x00, 0x00, 0x00, 0x00}, /* 0x32 */
+    {0x00, 0x00, 0x7C, 0xC6, 0x06, 0x06, 0x3C, 0x06, 0x06, 0x06, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x33 */
+    {0x00, 0x00, 0x0C, 0x1C, 0x3C, 0x6C, 0xCC, 0xFE, 0x0C, 0x0C, 0x0C, 0x1E, 0x00, 0x00, 0x00, 0x00}, /* 0x34 */
+    {0x00, 0x00, 0xFE, 0xC0, 0xC0, 0xC0, 0xFC, 0x06, 0x06, 0x06, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x35 */
+    {0x00, 0x00, 0x38, 0x60, 0xC0, 0xC0, 0xFC, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x36 */
+    {0x00, 0x00, 0xFE, 0xC6, 0x06, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x30, 0x00, 0x00, 0x00, 0x00}, /* 0x37 */
+    {0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xC6, 0x7C, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x38 */
+    {0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xC6, 0x7E, 0x06, 0x06, 0x06, 0x0C, 0x78, 0x00, 0x00, 0x00, 0x00}, /* 0x39 */
+    {0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x3A */
+    {0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30, 0x00, 0x00, 0x00, 0x00}, /* 0x3B */
+    {0x00, 0x00, 0x00, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x00, 0x00, 0x00, 0x00}, /* 0x3C */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x3D */
+    {0x00, 0x00, 0x00, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x00, 0x00, 0x00, 0x00}, /* 0x3E */
+    {0x00, 0x00, 0x7C, 0xC6, 0xC6, 0x0C, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00}, /* 0x3F */
+    {0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xDE, 0xDE, 0xDE, 0xDC, 0xC0, 0xC0, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x40 */
+    {0x00, 0x00, 0x10, 0x38, 0x6C, 0xC6, 0xC6, 0xFE, 0xC6, 0xC6, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00}, /* 0x41 */
+    {0x00, 0x00, 0xFC, 0x66, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x66, 0x66, 0xFC, 0x00, 0x00, 0x00, 0x00}, /* 0x42 */
+    {0x00, 0x00, 0x3C, 0x66, 0xC2, 0xC0, 0xC0, 0xC0, 0xC0, 0xC2, 0x66, 0x3C, 0x00, 0x00, 0x00, 0x00}, /* 0x43 */
+    {0x00, 0x00, 0xF8, 0x6C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x6C, 0xF8, 0x00, 0x00, 0x00, 0x00}, /* 0x44 */
+    {0x00, 0x00, 0xFE, 0x66, 0x62, 0x68, 0x78, 0x68, 0x60, 0x62, 0x66, 0xFE, 0x00, 0x00, 0x00, 0x00}, /* 0x45 */
+    {0x00, 0x00, 0xFE, 0x66, 0x62, 0x68, 0x78, 0x68, 0x60, 0x60, 0x60, 0xF0, 0x00, 0x00, 0x00, 0x00}, /* 0x46 */
+    {0x00, 0x00, 0x3C, 0x66, 0xC2, 0xC0, 0xC0, 0xDE, 0xC6, 0xC6, 0x66, 0x3A, 0x00, 0x00, 0x00, 0x00}, /* 0x47 */
+    {0x00, 0x00, 0xC6, 0xC6, 0xC6, 0xC6, 0xFE, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00}, /* 0x48 */
+    {0x00, 0x00, 0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0x00}, /* 0x49 */
+    {0x00, 0x00, 0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0xCC, 0xCC, 0xCC, 0x78, 0x00, 0x00, 0x00, 0x00}, /* 0x4A */
+    {0x00, 0x00, 0xE6, 0x66, 0x6C, 0x6C, 0x78, 0x78, 0x6C, 0x66, 0x66, 0xE6, 0x00, 0x00, 0x00, 0x00}, /* 0x4B */
+    {0x00, 0x00, 0xF0, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x62, 0x66, 0xFE, 0x00, 0x00, 0x00, 0x00}, /* 0x4C */
+    {0x00, 0x00, 0xC6, 0xEE, 0xFE, 0xFE, 0xD6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00}, /* 0x4D */
+    {0x00, 0x00, 0xC6, 0xE6, 0xF6, 0xFE, 0xDE, 0xCE, 0xC6, 0xC6, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00}, /* 0x4E */
+    {0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x4F */
+    {0x00, 0x00, 0xFC, 0x66, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x60, 0xF0, 0x00, 0x00, 0x00, 0x00}, /* 0x50 */
+    {0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xD6, 0xDE, 0x7C, 0x0C, 0x0E, 0x00, 0x00}, /* 0x51 */
+    {0x00, 0x00, 0xFC, 0x66, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x66, 0xE6, 0x00, 0x00, 0x00, 0x00}, /* 0x52 */
+    {0x00, 0x00, 0x7C, 0xC6, 0xC6, 0x60, 0x38, 0x0C, 0x06, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x53 */
+    {0x00, 0x00, 0x7E, 0x7E, 0x5A, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0x00}, /* 0x54 */
+    {0x00, 0x00, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x55 */
+    {0x00, 0x00, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x6C, 0x38, 0x10, 0x00, 0x00, 0x00, 0x00}, /* 0x56 */
+    {0x00, 0x00, 0xC6, 0xC6, 0xC6, 0xC6, 0xD6, 0xD6, 0xFE, 0xEE, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00}, /* 0x57 */
+    {0x00, 0x00, 0xC6, 0xC6, 0x6C, 0x7C, 0x38, 0x38, 0x7C, 0x6C, 0xC6, 0xC6, 0x00, 0x00, 0x00, 0x00}, /* 0x58 */
+    {0x00, 0x00, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0x00}, /* 0x59 */
+    {0x00, 0x00, 0xFE, 0xC6, 0x86, 0x0C, 0x18, 0x30, 0x60, 0xC2, 0xC6, 0xFE, 0x00, 0x00, 0x00, 0x00}, /* 0x5A */
+    {0x00, 0x00, 0x3C, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3C, 0x00, 0x00, 0x00, 0x00}, /* 0x5B */
+    {0x00, 0x00, 0x00, 0x80, 0xC0, 0xE0, 0x70, 0x38, 0x1C, 0x0E, 0x06, 0x02, 0x00, 0x00, 0x00, 0x00}, /* 0x5C */
+    {0x00, 0x00, 0x3C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x3C, 0x00, 0x00, 0x00, 0x00}, /* 0x5D */
+    {0x10, 0x38, 0x6C, 0xC6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x5E */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00}, /* 0x5F */
+    {0x30, 0x30, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x60 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x0C, 0x7C, 0xCC, 0xCC, 0xCC, 0x76, 0x00, 0x00, 0x00, 0x00}, /* 0x61 */
+    {0x00, 0x00, 0xE0, 0x60, 0x60, 0x78, 0x6C, 0x66, 0x66, 0x66, 0x66, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x62 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0xC6, 0xC0, 0xC0, 0xC0, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x63 */
+    {0x00, 0x00, 0x1C, 0x0C, 0x0C, 0x3C, 0x6C, 0xCC, 0xCC, 0xCC, 0xCC, 0x76, 0x00, 0x00, 0x00, 0x00}, /* 0x64 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0xC6, 0xFE, 0xC0, 0xC0, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x65 */
+    {0x00, 0x00, 0x38, 0x6C, 0x64, 0x60, 0xF0, 0x60, 0x60, 0x60, 0x60, 0xF0, 0x00, 0x00, 0x00, 0x00}, /* 0x66 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x76, 0xCC, 0xCC, 0xCC, 0xCC, 0x7C, 0x0C, 0xCC, 0x78, 0x00, 0x00}, /* 0x67 */
+    {0x00, 0x00, 0xE0, 0x60, 0x60, 0x6C, 0x76, 0x66, 0x66, 0x66, 0x66, 0xE6, 0x00, 0x00, 0x00, 0x00}, /* 0x68 */
+    {0x00, 0x00, 0x18, 0x18, 0x00, 0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0x00}, /* 0x69 */
+    {0x00, 0x00, 0x06, 0x06, 0x00, 0x0E, 0x06, 0x06, 0x06, 0x06, 0x06, 0x66, 0x66, 0x3C, 0x00, 0x00}, /* 0x6A */
+    {0x00, 0x00, 0xE0, 0x60, 0x60, 0x66, 0x6C, 0x78, 0x78, 0x6C, 0x66, 0xE6, 0x00, 0x00, 0x00, 0x00}, /* 0x6B */
+    {0x00, 0x00, 0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0x00}, /* 0x6C */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0xEC, 0xFE, 0xD6, 0xD6, 0xD6, 0xD6, 0xC6, 0x00, 0x00, 0x00, 0x00}, /* 0x6D */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0xDC, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00}, /* 0x6E */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x6F */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0xDC, 0x66, 0x66, 0x66, 0x66, 0x7C, 0x60, 0x60, 0xF0, 0x00, 0x00}, /* 0x70 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x76, 0xCC, 0xCC, 0xCC, 0xCC, 0x7C, 0x0C, 0x0C, 0x1E, 0x00, 0x00}, /* 0x71 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0xDC, 0x76, 0x66, 0x60, 0x60, 0x60, 0xF0, 0x00, 0x00, 0x00, 0x00}, /* 0x72 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0xC6, 0x60, 0x38, 0x0C, 0xC6, 0x7C, 0x00, 0x00, 0x00, 0x00}, /* 0x73 */
+    {0x00, 0x00, 0x10, 0x30, 0x30, 0xFC, 0x30, 0x30, 0x30, 0x30, 0x36, 0x1C, 0x00, 0x00, 0x00, 0x00}, /* 0x74 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0x76, 0x00, 0x00, 0x00, 0x00}, /* 0x75 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00, 0x00, 0x00, 0x00}, /* 0x76 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0xC6, 0xC6, 0xD6, 0xD6, 0xD6, 0xFE, 0x6C, 0x00, 0x00, 0x00, 0x00}, /* 0x77 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0xC6, 0x6C, 0x38, 0x38, 0x38, 0x6C, 0xC6, 0x00, 0x00, 0x00, 0x00}, /* 0x78 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7E, 0x06, 0x0C, 0xF8, 0x00, 0x00}, /* 0x79 */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0xCC, 0x18, 0x30, 0x60, 0xC6, 0xFE, 0x00, 0x00, 0x00, 0x00}, /* 0x7A */
+    {0x00, 0x00, 0x0E, 0x18, 0x18, 0x18, 0x70, 0x18, 0x18, 0x18, 0x18, 0x0E, 0x00, 0x00, 0x00, 0x00}, /* 0x7B */
+    {0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00}, /* 0x7C */
+    {0x00, 0x00, 0x70, 0x18, 0x18, 0x18, 0x0E, 0x18, 0x18, 0x18, 0x18, 0x70, 0x00, 0x00, 0x00, 0x00}, /* 0x7D */
+    {0x00, 0x00, 0x76, 0xDC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* 0x7E */
+};
+
+static const uint8_t we_font8x16_ext[6][16] = {
+    {0x00, 0x38, 0x6C, 0x6C, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* U+00B0 degree */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x3C, 0x3C, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* U+2022 bullet */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* U+2013 en-dash */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* U+2014 em-dash */
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xDB, 0xDB, 0x00, 0x00, 0x00, 0x00}, /* U+2026 ellipsis */
+    {0x00, 0x10, 0x10, 0x38, 0xFE, 0x7C, 0x38, 0x6C, 0xC6, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* U+2605 star */
+};
+
+static uint32_t utf8_next_codepoint(const char *s, size_t len, size_t *idx)
+{
+    if (*idx >= len) {
+        return 0;
+    }
+    unsigned char b0 = (unsigned char)s[(*idx)++];
+    if (b0 < 0x80u) {
+        return b0;
+    }
+    if ((b0 & 0xE0u) == 0xC0u && *idx < len) {
+        unsigned char b1 = (unsigned char)s[*idx];
+        if ((b1 & 0xC0u) == 0x80u) {
+            uint32_t cp = ((uint32_t)(b0 & 0x1Fu) << 6) | (uint32_t)(b1 & 0x3Fu);
+            if (cp >= 0x80u) {
+                (*idx)++;
+                return cp;
+            }
+        }
+        return '?';
+    }
+    if ((b0 & 0xF0u) == 0xE0u && *idx + 1 < len) {
+        unsigned char b1 = (unsigned char)s[*idx];
+        unsigned char b2 = (unsigned char)s[*idx + 1];
+        if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u) {
+            uint32_t cp = ((uint32_t)(b0 & 0x0Fu) << 12) | ((uint32_t)(b1 & 0x3Fu) << 6) |
+                          (uint32_t)(b2 & 0x3Fu);
+            if (cp >= 0x800u && (cp < 0xD800u || cp > 0xDFFFu)) {
+                *idx += 2;
+                return cp;
+            }
+        }
+        return '?';
+    }
+    if ((b0 & 0xF8u) == 0xF0u && *idx + 2 < len) {
+        unsigned char b1 = (unsigned char)s[*idx];
+        unsigned char b2 = (unsigned char)s[*idx + 1];
+        unsigned char b3 = (unsigned char)s[*idx + 2];
+        if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u && (b3 & 0xC0u) == 0x80u) {
+            uint32_t cp = ((uint32_t)(b0 & 0x07u) << 18) | ((uint32_t)(b1 & 0x3Fu) << 12) |
+                          ((uint32_t)(b2 & 0x3Fu) << 6) | (uint32_t)(b3 & 0x3Fu);
+            if (cp >= 0x10000u && cp <= 0x10FFFFu) {
+                *idx += 3;
+                return cp;
+            }
+        }
+        return '?';
+    }
+    return '?';
+}
+
+static const uint8_t *font_glyph_for_cp(uint32_t cp)
+{
+    if (cp >= 0x20u && cp <= 0x7Eu) {
+        return we_font8x16[cp - 0x20u];
+    }
+    if (cp == 0x00B0u) {
+        return we_font8x16_ext[0];
+    }
+    if (cp == 0x2022u || cp == 0x00B7u) {
+        return we_font8x16_ext[1];
+    }
+    if (cp == 0x2013u) {
+        return we_font8x16_ext[2];
+    }
+    if (cp == 0x2014u) {
+        return we_font8x16_ext[3];
+    }
+    if (cp == 0x2026u) {
+        return we_font8x16_ext[4];
+    }
+    if (cp == 0x2605u || cp == 0x2606u) {
+        return we_font8x16_ext[5];
+    }
+    return we_font8x16['?' - 0x20u];
+}
+
+static float font_bit(const uint8_t glyph[16], int x, int y)
+{
+    if (x < 0 || x >= 8 || y < 0 || y >= 16) {
+        return 0.0f;
+    }
+    return ((glyph[y] >> (7 - x)) & 1u) ? 1.0f : 0.0f;
+}
+
+static float font_sample_bilinear(const uint8_t glyph[16], float fx, float fy)
+{
+    int x0 = (int)floorf(fx);
+    int y0 = (int)floorf(fy);
+    float tx = fx - (float)x0;
+    float ty = fy - (float)y0;
+    float v00 = font_bit(glyph, x0, y0);
+    float v10 = font_bit(glyph, x0 + 1, y0);
+    float v01 = font_bit(glyph, x0, y0 + 1);
+    float v11 = font_bit(glyph, x0 + 1, y0 + 1);
+    float v0 = v00 + (v10 - v00) * tx;
+    float v1 = v01 + (v11 - v01) * tx;
+    return v0 + (v1 - v0) * ty;
+}
+
+static float font_sample_smooth(const uint8_t glyph[16], float fx, float fy)
+{
+    float cov = font_sample_bilinear(glyph, fx, fy);
+    float t = fminf(fmaxf((cov - 0.30f) / 0.40f, 0.0f), 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+void we_scene_update_text_texture(we_scene_t *scene, we_scene_object_t *obj)
+{
+    if (!obj || !obj->is_text_object) {
+        return;
+    }
+
+    uint32_t w = (uint32_t)(obj->size[0] >= 16.0f ? obj->size[0] : 256.0f);
+    uint32_t h = (uint32_t)(obj->size[1] >= 16.0f ? obj->size[1] : 64.0f);
+    if (w < 16u) {
+        w = 16u;
+    }
+    if (w > 2048u) {
+        w = 2048u;
+    }
+    if (h < 16u) {
+        h = 16u;
+    }
+    if (h > 2048u) {
+        h = 2048u;
+    }
+
+    we_tex_t *tex = obj->base_pass.textures[0];
+    if (!tex) {
+        tex = (we_tex_t *)calloc(1, sizeof(we_tex_t));
+        if (!tex) {
+            return;
+        }
+        tex->format = WE_TEX_FMT_RGBA8888;
+        tex->flags = WE_TEX_FLAG_CLAMP_UVS;
+        tex->image_count = 1u;
+        tex->images = (we_tex_image_t *)calloc(1, sizeof(we_tex_image_t));
+        if (!tex->images) {
+            free(tex);
+            return;
+        }
+        tex->images[0].mip_count = 1u;
+        tex->images[0].mips = (we_tex_mip_t *)calloc(1, sizeof(we_tex_mip_t));
+        if (!tex->images[0].mips) {
+            free(tex->images);
+            free(tex);
+            return;
+        }
+        obj->base_pass.textures[0] = tex;
+        obj->base_pass.bound_tex_mask |= 1u;
+    }
+
+    tex->texture_width = w;
+    tex->texture_height = h;
+    tex->image_width = w;
+    tex->image_height = h;
+
+    we_tex_mip_t *mip0 = &tex->images[0].mips[0];
+    size_t npx = (size_t)w * (size_t)h;
+    size_t req_bytes = npx * 4u;
+    if (!mip0->data || mip0->data_size != req_bytes) {
+        free(mip0->data);
+        mip0->data = (uint8_t *)malloc(req_bytes);
+        if (!mip0->data) {
+            mip0->data_size = 0;
+            return;
+        }
+        mip0->data_size = req_bytes;
+    }
+    mip0->width = w;
+    mip0->height = h;
+
+    uint8_t *rgba = mip0->data;
+    uint8_t bg_r =
+        obj->text_opaque_bg
+            ? (uint8_t)(fminf(fmaxf(obj->text_bg_color[0], 0.0f), 1.0f) * 255.0f + 0.5f)
+            : 255u;
+    uint8_t bg_g =
+        obj->text_opaque_bg
+            ? (uint8_t)(fminf(fmaxf(obj->text_bg_color[1], 0.0f), 1.0f) * 255.0f + 0.5f)
+            : 255u;
+    uint8_t bg_b =
+        obj->text_opaque_bg
+            ? (uint8_t)(fminf(fmaxf(obj->text_bg_color[2], 0.0f), 1.0f) * 255.0f + 0.5f)
+            : 255u;
+    uint8_t bg_a = obj->text_opaque_bg ? 255u : 0u;
+    for (size_t i = 0; i < npx; ++i) {
+        rgba[i * 4u + 0u] = bg_r;
+        rgba[i * 4u + 1u] = bg_g;
+        rgba[i * 4u + 2u] = bg_b;
+        rgba[i * 4u + 3u] = bg_a;
+    }
+
+    uint32_t line_cps[32][256];
+    size_t line_lens[32];
+    uint32_t line_count = 0;
+    size_t max_line_len = 0;
+
+    const char *p = obj->text_str;
+    while (*p && line_count < 32u) {
+        const char *start = p;
+        while (*p && *p != '\n' && *p != '\r') {
+            p++;
+        }
+        size_t byte_len = (size_t)(p - start);
+        size_t bidx = 0;
+        size_t cp_count = 0;
+        while (bidx < byte_len && cp_count < 256u) {
+            line_cps[line_count][cp_count++] = utf8_next_codepoint(start, byte_len, &bidx);
+        }
+        line_lens[line_count] = cp_count;
+        if (cp_count > max_line_len) {
+            max_line_len = cp_count;
+        }
+        line_count++;
+        if (*p == '\r') {
+            p++;
+        }
+        if (*p == '\n') {
+            p++;
+        }
+    }
+
+    if (line_count > 0 && max_line_len > 0) {
+        float pad = (float)(obj->text_padding >= 0 ? obj->text_padding : 2);
+        float avail_w = fmaxf(8.0f, (float)w - 2.0f * pad);
+        float pt = (float)(obj->text_pointsize >= 4 ? obj->text_pointsize : 32);
+        float scale = fmaxf(0.5f, pt / 16.0f);
+        float glyph_w = 8.0f * scale;
+        float glyph_h = 16.0f * scale;
+        float line_step = 18.0f * scale;
+
+        if ((float)max_line_len * glyph_w > avail_w) {
+            scale = avail_w / ((float)max_line_len * 8.0f);
+            if (scale < 0.5f) {
+                scale = 0.5f;
+            }
+            glyph_w = 8.0f * scale;
+            glyph_h = 16.0f * scale;
+            line_step = 18.0f * scale;
+        }
+
+        float total_h = (float)(line_count - 1u) * line_step + glyph_h;
+        float start_y = ((float)h - total_h) * 0.5f;
+        if (strcasecmp(obj->text_valign, "top") == 0) {
+            start_y = pad;
+        } else if (strcasecmp(obj->text_valign, "bottom") == 0) {
+            start_y = (float)h - total_h - pad;
+        }
+
+        for (uint32_t l = 0; l < line_count; ++l) {
+            float line_w = (float)line_lens[l] * glyph_w;
+            float start_x = ((float)w - line_w) * 0.5f;
+            if (strcasecmp(obj->text_halign, "left") == 0) {
+                start_x = pad;
+            } else if (strcasecmp(obj->text_halign, "right") == 0) {
+                start_x = (float)w - line_w - pad;
+            }
+
+            float gy0 = start_y + (float)l * line_step;
+            for (size_t c = 0; c < line_lens[l]; ++c) {
+                uint32_t cp = line_cps[l][c];
+                if (cp == ' ') {
+                    continue;
+                }
+                const uint8_t *glyph = font_glyph_for_cp(cp);
+                float gx0 = start_x + (float)c * glyph_w;
+
+                int px0 = (int)floorf(gx0);
+                int px1 = (int)ceilf(gx0 + glyph_w);
+                int py0 = (int)floorf(gy0);
+                int py1 = (int)ceilf(gy0 + glyph_h);
+                if (px0 < 0) {
+                    px0 = 0;
+                }
+                if (py0 < 0) {
+                    py0 = 0;
+                }
+                if (px1 > (int)w) {
+                    px1 = (int)w;
+                }
+                if (py1 > (int)h) {
+                    py1 = (int)h;
+                }
+
+                for (int py = py0; py < py1; ++py) {
+                    float fy0 = (((float)py + 0.25f - gy0) / glyph_h) * 16.0f - 0.5f;
+                    float fy1 = (((float)py + 0.75f - gy0) / glyph_h) * 16.0f - 0.5f;
+                    for (int px = px0; px < px1; ++px) {
+                        float fx0 = (((float)px + 0.25f - gx0) / glyph_w) * 8.0f - 0.5f;
+                        float fx1 = (((float)px + 0.75f - gx0) / glyph_w) * 8.0f - 0.5f;
+                        /* 2x2 supersampled bilinear glyph coverage */
+                        float alpha_f = 0.25f * (font_sample_smooth(glyph, fx0, fy0) +
+                                                 font_sample_smooth(glyph, fx1, fy0) +
+                                                 font_sample_smooth(glyph, fx0, fy1) +
+                                                 font_sample_smooth(glyph, fx1, fy1));
+                        uint8_t a8 = (uint8_t)(alpha_f * 255.0f + 0.5f);
+                        uint8_t *dst_px = &rgba[((size_t)py * (size_t)w + (size_t)px) * 4u];
+                        if (obj->text_opaque_bg) {
+                            dst_px[0] =
+                                (uint8_t)((float)bg_r + (255.0f - (float)bg_r) * alpha_f + 0.5f);
+                            dst_px[1] =
+                                (uint8_t)((float)bg_g + (255.0f - (float)bg_g) * alpha_f + 0.5f);
+                            dst_px[2] =
+                                (uint8_t)((float)bg_b + (255.0f - (float)bg_b) * alpha_f + 0.5f);
+                            dst_px[3] = 255u;
+                        } else if (a8 > dst_px[3]) {
+                            dst_px[3] = a8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if ((scene && scene->gl_initialized) || tex->gl_tex != 0) {
+        if (scene && scene->egl_display && scene->egl_context &&
+            eglGetCurrentContext() != scene->egl_context) {
+            eglMakeCurrent(scene->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, scene->egl_context);
+        }
+        GLint prev_tex = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+        if (tex->gl_tex == 0) {
+            GLuint ntex = 0;
+            glGenTextures(1, &ntex);
+            tex->gl_tex = (uint32_t)ntex;
+            glBindTexture(GL_TEXTURE_2D, ntex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, (GLuint)tex->gl_tex);
+        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, rgba);
+        glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    }
+
+    obj->text_dirty = false;
+}
+
+/* =========================================================================
+ * Scene Audio Output & "sound" Object Mixer
+ * ========================================================================= */
+
+static uint64_t sound_rng_next(uint64_t *state)
+{
+    uint64_t x = *state ? *state : 0x9E3779B97F4A7C15ULL;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+static float sound_random_wait(we_scene_t *scene, const we_scene_object_t *obj)
+{
+    if (obj->sound_maxtime <= 0.0f) {
+        return 0.0f;
+    }
+    if (obj->sound_maxtime <= obj->sound_mintime) {
+        return obj->sound_mintime;
+    }
+    float u = (float)(sound_rng_next(&scene->sound_rng_state) & 0xFFFFu) / 65535.0f;
+    return obj->sound_mintime + u * (obj->sound_maxtime - obj->sound_mintime);
+}
+
+void we_scene_set_audio_output(we_scene_t *scene, waywal_audio_fft_t *audio_fft)
+{
+    if (!scene) {
+        return;
+    }
+    if (scene->audio_out && scene->audio_out != audio_fft) {
+        waywal_audio_clear_playback(scene->audio_out);
+    }
+    scene->audio_out = audio_fft;
+}
+
+size_t we_scene_step_audio(we_scene_t *scene, float dt_sec)
+{
+    if (!scene || dt_sec <= 0.0f || !isfinite(dt_sec)) {
+        return 0;
+    }
+    if (dt_sec > 0.25f) {
+        dt_sec = 0.25f;
+    }
+    size_t remaining = (size_t)lrintf(dt_sec * 48000.0f);
+    if (remaining == 0) {
+        remaining = 1;
+    }
+    if (remaining > 12000u) {
+        remaining = 12000u;
+    }
+
+    size_t total_submitted = 0;
+    float mix_buf[2048 * 2];
+
+    while (remaining > 0) {
+        size_t chunk = (remaining > 2048u) ? 2048u : remaining;
+        memset(mix_buf, 0, chunk * 2u * sizeof(float));
+        bool any_active = false;
+
+        for (uint32_t i = 0; i < scene->object_count; ++i) {
+            we_scene_object_t *obj = &scene->objects[i];
+            if (!obj->is_sound_object || !obj->visible || !obj->sound_playing ||
+                obj->sound_track_count == 0) {
+                continue;
+            }
+            if (obj->user_prop_volume[0] != '\0') {
+                const we_user_prop_t *up =
+                    project_find_prop(&scene->project, obj->user_prop_volume);
+                if (up && up->num_components > 0) {
+                    obj->sound_volume = fminf(fmaxf(up->val[0], 0.0f), 2.0f);
+                }
+            }
+            float vol =
+                fminf(fmaxf(obj->sound_volume, 0.0f), 2.0f) * fminf(fmaxf(obj->alpha, 0.0f), 1.0f);
+
+            size_t written = 0;
+            while (written < chunk && obj->sound_playing) {
+                if (obj->sound_wait_timer > 0.0f) {
+                    float rem_dt = (float)(chunk - written) / 48000.0f;
+                    if (obj->sound_wait_timer > rem_dt) {
+                        obj->sound_wait_timer -= rem_dt;
+                        break;
+                    }
+                    size_t wait_frames = (size_t)(obj->sound_wait_timer * 48000.0f);
+                    if (wait_frames > chunk - written) {
+                        wait_frames = chunk - written;
+                    }
+                    written += wait_frames;
+                    obj->sound_wait_timer = 0.0f;
+                    if (written >= chunk) {
+                        break;
+                    }
+                }
+
+                if (obj->sound_active_track >= obj->sound_track_count) {
+                    obj->sound_active_track = 0;
+                }
+                uint32_t tidx = obj->sound_active_track;
+                const float *trk_pcm = obj->sound_tracks_pcm[tidx];
+                size_t trk_frames = obj->sound_tracks_frames[tidx];
+                if (!trk_pcm || trk_frames == 0) {
+                    obj->sound_playing = false;
+                    break;
+                }
+
+                size_t avail = (obj->sound_cursor_frame < trk_frames)
+                                   ? (trk_frames - obj->sound_cursor_frame)
+                                   : 0;
+                size_t take = (chunk - written < avail) ? (chunk - written) : avail;
+                if (take > 0 && vol > 0.0001f) {
+                    const float *src = trk_pcm + obj->sound_cursor_frame * 2u;
+                    float *dst = mix_buf + written * 2u;
+                    for (size_t s = 0; s < take * 2u; ++s) {
+                        dst[s] += src[s] * vol;
+                    }
+                    any_active = true;
+                }
+                obj->sound_cursor_frame += take;
+                written += take;
+
+                if (obj->sound_cursor_frame >= trk_frames) {
+                    obj->sound_cursor_frame = 0;
+                    if (obj->sound_mode == WE_SOUND_MODE_SINGLE) {
+                        obj->sound_playing = false;
+                        break;
+                    } else if (obj->sound_mode == WE_SOUND_MODE_RANDOM) {
+                        obj->sound_active_track =
+                            (uint32_t)(sound_rng_next(&scene->sound_rng_state) %
+                                       obj->sound_track_count);
+                        obj->sound_wait_timer = sound_random_wait(scene, obj);
+                    } else {
+                        obj->sound_active_track =
+                            (obj->sound_active_track + 1u) % obj->sound_track_count;
+                        if (obj->sound_maxtime > 0.0f) {
+                            obj->sound_wait_timer = sound_random_wait(scene, obj);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (any_active && scene->audio_out) {
+            for (size_t s = 0; s < chunk * 2u; ++s) {
+                mix_buf[s] = fminf(fmaxf(mix_buf[s], -1.0f), 1.0f);
+            }
+            total_submitted += waywal_audio_submit_pcm_f32(scene->audio_out, mix_buf, chunk);
+        }
+        remaining -= chunk;
+    }
+
+    return total_submitted;
+}
+
 static void step_object_scripts(we_scene_t *scene, we_scene_object_t *obj, uint32_t norm_w,
                                 uint32_t norm_h, float dt_sec, float time_sec, bool cursor_moved,
                                 const waywal_shader_frame_params_t *params)
@@ -1121,14 +1733,28 @@ static void step_object_scripts(we_scene_t *scene, we_scene_object_t *obj, uint3
                 memcpy(in_val, target_cv->val, ncomp * sizeof(float));
             }
             break;
+        case WE_SCRIPT_PROP_TEXT:
+            ncomp = 0;
+            break;
+        case WE_SCRIPT_PROP_POINTSIZE:
+            in_val[0] = (float)obj->text_pointsize;
+            ncomp = 1;
+            break;
+        case WE_SCRIPT_PROP_VOLUME:
+            in_val[0] = obj->sound_volume;
+            ncomp = 1;
+            break;
         }
 
-        memcpy(out_val, in_val, ncomp * sizeof(float));
-        if (we_script_eval_update(sc->vm, &env, &ls, in_val, ncomp, out_val)) {
+        if (ncomp > 0) {
+            memcpy(out_val, in_val, ncomp * sizeof(float));
+        }
+        if (we_script_eval_update(sc->vm, &env, &ls, ncomp > 0 ? in_val : NULL, ncomp,
+                                  ncomp > 0 ? out_val : NULL)) {
             sync_obj_from_layer(obj, &ls);
             sync_scene_layers_from_vm(scene, sc->vm);
-            if (sc->target == WE_SCRIPT_PROP_UNIFORM ||
-                memcmp(out_val, in_val, ncomp * sizeof(float)) != 0) {
+            if (ncomp > 0 && (sc->target == WE_SCRIPT_PROP_UNIFORM ||
+                              memcmp(out_val, in_val, ncomp * sizeof(float)) != 0)) {
                 switch (sc->target) {
                 case WE_SCRIPT_PROP_ORIGIN:
                     memcpy(obj->origin, out_val, 3 * sizeof(float));
@@ -1152,6 +1778,17 @@ static void step_object_scripts(we_scene_t *scene, we_scene_object_t *obj, uint3
                     if (target_cv) {
                         memcpy(target_cv->val, out_val, ncomp * sizeof(float));
                     }
+                    break;
+                case WE_SCRIPT_PROP_TEXT:
+                    break;
+                case WE_SCRIPT_PROP_POINTSIZE:
+                    if ((int32_t)out_val[0] != obj->text_pointsize && out_val[0] >= 4.0f) {
+                        obj->text_pointsize = (int32_t)out_val[0];
+                        obj->text_dirty = true;
+                    }
+                    break;
+                case WE_SCRIPT_PROP_VOLUME:
+                    obj->sound_volume = fminf(fmaxf(out_val[0], 0.0f), 2.0f);
                     break;
                 }
             }
@@ -1261,12 +1898,45 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                 obj->color[2] = up->val[2];
             }
         }
+        if (obj->user_prop_volume[0] != '\0') {
+            const we_user_prop_t *up = project_find_prop(&scene->project, obj->user_prop_volume);
+            if (up && up->num_components > 0) {
+                obj->sound_volume = fminf(fmaxf(up->val[0], 0.0f), 2.0f);
+            }
+        }
+        if (obj->user_prop_pointsize[0] != '\0') {
+            const we_user_prop_t *up = project_find_prop(&scene->project, obj->user_prop_pointsize);
+            if (up && up->num_components > 0 && (int32_t)up->val[0] >= 4 &&
+                (int32_t)up->val[0] != obj->text_pointsize) {
+                obj->text_pointsize = (int32_t)up->val[0];
+                obj->text_dirty = true;
+            }
+        }
+        if (obj->user_prop_text[0] != '\0') {
+            const we_user_prop_t *up = project_find_prop(&scene->project, obj->user_prop_text);
+            if (up && up->type == WE_PROP_TEXT && strcmp(obj->text_str, up->str_val) != 0) {
+                snprintf(obj->text_str, sizeof(obj->text_str), "%s", up->str_val);
+                obj->text_dirty = true;
+            }
+        }
     }
 
     /* Evaluate SceneScript update / cursorMove callbacks across all objects before rendering */
     for (uint32_t i = 0; i < scene->object_count; i++) {
         step_object_scripts(scene, &scene->objects[i], norm_w, norm_h, dt_sec, time_sec,
                             cursor_moved, params);
+    }
+    for (uint32_t i = 0; i < scene->object_count; i++) {
+        if (scene->objects[i].is_text_object && scene->objects[i].text_dirty) {
+            we_scene_update_text_texture(scene, &scene->objects[i]);
+        }
+    }
+    double audio_t = (params && (params->time_sec > 0.0f || params->time_delta_sec > 0.0f))
+                         ? (double)params->time_sec
+                         : (double)scene->sim_time;
+    if (fabs(audio_t - scene->last_audio_step_time) > 1e-4) {
+        scene->last_audio_step_time = audio_t;
+        (void)we_scene_step_audio(scene, dt_sec);
     }
 
     for (uint32_t i = 0; i < scene->object_count; i++) {
@@ -1967,6 +2637,18 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glDeleteTextures(1, &tmp_tex);
         }
+        size_t row_bytes = (size_t)width * 4u;
+        uint8_t *swap_row = (uint8_t *)malloc(row_bytes);
+        if (swap_row) {
+            for (uint32_t y = 0; y < height / 2u; ++y) {
+                uint8_t *top = out_rgba + (size_t)y * row_bytes;
+                uint8_t *bot = out_rgba + (size_t)(height - 1u - y) * row_bytes;
+                memcpy(swap_row, top, row_bytes);
+                memcpy(top, bot, row_bytes);
+                memcpy(bot, swap_row, row_bytes);
+            }
+            free(swap_row);
+        }
         return true;
     }
 
@@ -2030,11 +2712,44 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
                 obj->color[2] = up->val[2];
             }
         }
+        if (obj->user_prop_volume[0] != '\0') {
+            const we_user_prop_t *up = project_find_prop(&scene->project, obj->user_prop_volume);
+            if (up && up->num_components > 0) {
+                obj->sound_volume = fminf(fmaxf(up->val[0], 0.0f), 2.0f);
+            }
+        }
+        if (obj->user_prop_pointsize[0] != '\0') {
+            const we_user_prop_t *up = project_find_prop(&scene->project, obj->user_prop_pointsize);
+            if (up && up->num_components > 0 && (int32_t)up->val[0] >= 4 &&
+                (int32_t)up->val[0] != obj->text_pointsize) {
+                obj->text_pointsize = (int32_t)up->val[0];
+                obj->text_dirty = true;
+            }
+        }
+        if (obj->user_prop_text[0] != '\0') {
+            const we_user_prop_t *up = project_find_prop(&scene->project, obj->user_prop_text);
+            if (up && up->type == WE_PROP_TEXT && strcmp(obj->text_str, up->str_val) != 0) {
+                snprintf(obj->text_str, sizeof(obj->text_str), "%s", up->str_val);
+                obj->text_dirty = true;
+            }
+        }
     }
 
     for (uint32_t i = 0; i < scene->object_count; i++) {
         step_object_scripts(scene, &scene->objects[i], width, height, dt_sec, time_sec,
                             cursor_moved, params);
+    }
+    for (uint32_t i = 0; i < scene->object_count; i++) {
+        if (scene->objects[i].is_text_object && scene->objects[i].text_dirty) {
+            we_scene_update_text_texture(scene, &scene->objects[i]);
+        }
+    }
+    double audio_t = (params && (params->time_sec > 0.0f || params->time_delta_sec > 0.0f))
+                         ? (double)params->time_sec
+                         : (double)scene->sim_time;
+    if (fabs(audio_t - scene->last_audio_step_time) > 1e-4) {
+        scene->last_audio_step_time = audio_t;
+        (void)we_scene_step_audio(scene, dt_sec);
     }
 
     for (uint32_t i = 0; i < scene->object_count; i++) {
@@ -2342,6 +3057,16 @@ bool we_scene_set_uniform_override(we_scene_t *scene, const char *name, const fl
             user_prop_matches_key(obj->visible_user_prop, name)) {
             (void)we_project_eval_prop_bool(&scene->project, obj->visible_user_prop, &obj->visible);
         }
+        if (obj->user_prop_volume[0] != '\0' && strcasecmp(obj->user_prop_volume, name) == 0) {
+            obj->sound_volume = fminf(fmaxf(values[0], 0.0f), 2.0f);
+        }
+        if (obj->user_prop_pointsize[0] != '\0' &&
+            strcasecmp(obj->user_prop_pointsize, name) == 0 && (int32_t)values[0] >= 4) {
+            if (obj->text_pointsize != (int32_t)values[0]) {
+                obj->text_pointsize = (int32_t)values[0];
+                obj->text_dirty = true;
+            }
+        }
         if (obj->has_base_pass) {
             update_pass_uniform_override(scene, &obj->base_pass, name, val_str, values,
                                          num_components);
@@ -2432,6 +3157,11 @@ void we_scene_destroy(we_scene_t *scene)
         return;
     }
 
+    if (scene->audio_out) {
+        waywal_audio_clear_playback(scene->audio_out);
+        scene->audio_out = NULL;
+    }
+
     if (scene->gl_initialized && scene->egl_display && scene->egl_context) {
         if (eglGetCurrentContext() != scene->egl_context) {
             eglMakeCurrent(scene->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, scene->egl_context);
@@ -2454,6 +3184,10 @@ void we_scene_destroy(we_scene_t *scene)
                     we_script_destroy(obj->scripts[s].vm);
                     obj->scripts[s].vm = NULL;
                 }
+            }
+            for (uint32_t t = 0; t < obj->sound_track_count && t < WE_MAX_SOUND_TRACKS; t++) {
+                free(obj->sound_tracks_pcm[t]);
+                obj->sound_tracks_pcm[t] = NULL;
             }
             free_material_pass(&obj->base_pass, scene->gl_initialized);
             if (obj->effects) {

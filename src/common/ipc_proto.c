@@ -31,6 +31,11 @@ bool waywal_ipc_resolve_socket_path(path_buf_t *out_path, const char *namespace_
     const char *wl_disp = getenv("WAYLAND_DISPLAY");
     if (!wl_disp || wl_disp[0] == '\0') {
         wl_disp = "wayland-0";
+    } else {
+        const char *slash = strrchr(wl_disp, '/');
+        if (slash) {
+            wl_disp = (slash[1] != '\0') ? (slash + 1) : "wayland-0";
+        }
     }
 
     if (!namespace_str || namespace_str[0] == '\0') {
@@ -198,6 +203,52 @@ static int connect_unix_socket_path(const char *sock_path, int timeout_ms)
     return cfd;
 }
 
+bool waywal_ipc_namespace_is_alive(const char *namespace_str)
+{
+    const char *listen_pid = getenv("LISTEN_PID");
+    const char *listen_fds = getenv("LISTEN_FDS");
+    if (listen_pid && listen_fds && atoi(listen_pid) == (int)getpid() && atoi(listen_fds) >= 1) {
+        return false;
+    }
+
+    path_buf_t sock_path;
+    if (!waywal_ipc_resolve_socket_path(&sock_path, namespace_str)) {
+        return false;
+    }
+
+    int cfd = connect_unix_socket_path(path_buf_cstr(&sock_path), 100);
+    if (cfd < 0) {
+        return false;
+    }
+
+    waywal_ipc_hdr_t ping_hdr = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_PING,
+        .payload_size = 0,
+    };
+    bool alive = false;
+    if (waywal_ipc_send(cfd, &ping_hdr, -1)) {
+        struct pollfd pfd = {.fd = cfd, .events = POLLIN};
+        int pr = poll(&pfd, 1, 1000);
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            waywal_ipc_hdr_t resp;
+            int attached_fd = -1;
+            if (waywal_ipc_recv(cfd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_PONG) {
+                alive = true;
+            }
+            if (attached_fd >= 0) {
+                close(attached_fd);
+            }
+        } else if (pr == 0) {
+            /* Connected to an active kernel listening socket whose main thread is temporarily busy */
+            alive = true;
+        }
+    }
+    close(cfd);
+    return alive;
+}
+
 int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms)
 {
     path_buf_t sock_path;
@@ -210,7 +261,9 @@ int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms)
         return cfd;
     }
 
-    if (errno == ENOENT || errno == ECONNREFUSED) {
+    bool is_default_ns =
+        (!namespace_str || namespace_str[0] == '\0' || strcmp(namespace_str, "default") == 0);
+    if (is_default_ns && (errno == ENOENT || errno == ECONNREFUSED)) {
         const char *xdg = getenv("XDG_RUNTIME_DIR");
         if (!xdg || xdg[0] == '\0') {
             xdg = "/tmp";

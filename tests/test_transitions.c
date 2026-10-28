@@ -4,7 +4,9 @@
 #include "waywal/bezier.h"
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
+#include "waywal/path.h"
 #include "waywal/render_engine.h"
+#include "waywal/shader_engine.h"
 #include "waywal/types.h"
 
 #include <assert.h>
@@ -475,6 +477,94 @@ static void test_cpu_transitions(void)
     printf("[TEST] test_cpu_transitions PASSED.\n");
 }
 
+static void test_builtin_shader_presets_gles31(void)
+{
+    printf("[TEST] Running test_builtin_shader_presets_gles31...\n");
+
+    waywal_shader_preset_info_t presets[16];
+    size_t count = waywal_shader_preset_list(presets, 16);
+    assert(count == 10U);
+
+    dmabuf_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    if (!dmabuf_context_init(&ctx) || !ctx.available) {
+        printf("  DRM/GBM unavailable in this environment. Skipping GLES 3.1 preset compilation "
+               "test.\n");
+        return;
+    }
+
+    waywal_shader_engine_t *eng = waywal_shader_engine_create(&ctx);
+    if (!eng) {
+        printf("  Headless EGL/GLES 3.1 context unavailable. Skipping GLES 3.1 preset compilation "
+               "test.\n");
+        dmabuf_context_destroy(&ctx);
+        return;
+    }
+
+    dmabuf_bo_t bo;
+    memset(&bo, 0, sizeof(bo));
+    bool has_bo =
+        dmabuf_bo_allocate(&ctx, &bo, 128, 128, DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR);
+    if (!has_bo) {
+        has_bo =
+            dmabuf_bo_allocate(&ctx, &bo, 128, 128, DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID);
+    }
+    assert(has_bo);
+
+    waywal_audio_frame_t audio_frame;
+    memset(&audio_frame, 0, sizeof(audio_frame));
+    audio_frame.envelope = 0.45f;
+    audio_frame.beat_pulse = 0.65f;
+    for (size_t i = 0; i < WAYWAL_AUDIO_BARK_BANDS; ++i) {
+        audio_frame.bands[i] = 0.35f;
+    }
+    for (size_t i = 0; i < WAYWAL_AUDIO_TEX_WIDTH; ++i) {
+        audio_frame.shadertoy_tex[i] = 160;
+        audio_frame.shadertoy_tex[WAYWAL_AUDIO_TEX_WIDTH + i] = 128;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        assert(waywal_shader_engine_compile(eng, presets[i].path));
+        assert(waywal_shader_engine_has_active_program(eng));
+
+        waywal_shader_frame_params_t fp;
+        memset(&fp, 0, sizeof(fp));
+        fp.time_sec = 1.25f + (float)i * 0.5f;
+        fp.time_delta_sec = 1.0f / 60.0f;
+        fp.frame_index = (int32_t)i;
+        fp.mouse_smooth[0] = 64.0f;
+        fp.mouse_smooth[1] = 64.0f;
+        fp.audio = &audio_frame;
+        assert(waywal_shader_engine_render_frame(eng, &bo, &fp));
+
+        /* Render a second frame with audio == NULL to verify dirty-state reset */
+        fp.audio = NULL;
+        fp.time_sec += 1.0f / 60.0f;
+        fp.frame_index++;
+        assert(waywal_shader_engine_render_frame(eng, &bo, &fp));
+
+        if (bo.map_data) {
+            const uint8_t *px = (const uint8_t *)bo.map_data;
+            bool any_rgb = false;
+            for (size_t p = 0; p < 128U * 128U; ++p) {
+                assert(px[p * 4 + 3] == 255U);
+                if (px[p * 4 + 0] > 0 || px[p * 4 + 1] > 0 || px[p * 4 + 2] > 0) {
+                    any_rgb = true;
+                }
+            }
+            assert(any_rgb);
+        }
+    }
+
+    waywal_shader_engine_forget_bo(eng, &bo);
+    dmabuf_bo_free(&bo);
+    waywal_shader_engine_destroy(eng);
+    dmabuf_context_destroy(&ctx);
+
+    printf("[TEST] test_builtin_shader_presets_gles31 (10/10 presets compiled & rendered) "
+           "PASSED.\n");
+}
+
 int main(void)
 {
     waywal_log_set_level(WAYWAL_LOG_LEVEL_WARN);
@@ -487,6 +577,7 @@ int main(void)
     test_cpu_transitions();
     test_gpu_compute_transitions();
     test_gpu_compute_nonlinear_and_upload_static();
+    test_builtin_shader_presets_gles31();
 
     printf("\n>>> ALL TRANSITIONS UNIT TESTS PASSED SUCCESSFULLY! <<<\n\n");
     return 0;

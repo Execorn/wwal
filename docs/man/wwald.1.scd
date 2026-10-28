@@ -10,7 +10,9 @@ wwald - zero-copy Wayland wallpaper, VA-API video, Shadertoy, and Material You d
 
 # DESCRIPTION
 
-*wwald* is the background rendering daemon for *wwal*(1). Written in ISO C23 with a binary size under 1.5 MB, *wwald* replaces separate static wallpaper daemons, video wallpaper players, GLSL shader backgrounds, and color scheme generators within a single sandboxed process.
+*wwald* is the background rendering daemon for *wwal*(1). Written in ISO C23 with a stripped binary size under 1.4 MB, *wwald* replaces separate static wallpaper daemons, video wallpaper players, GLSL shader backgrounds, Steam Wallpaper Engine runners, and color scheme / template generators within a single sandboxed process.
+
+When invoked via a symlink named *swww-daemon* or *awww-daemon*, *wwald* automatically enables full *swww* / *awww* v0.12.1 daemon flag and socket namespace compatibility.
 
 # ARCHITECTURE
 
@@ -39,9 +41,9 @@ When started via *systemd*(1) socket activation (*wwald.socket*), *wwald* inheri
 
 ## Native Wallpaper Engine, Multi-Pass Shadertoy & Reactive Audio/MPRIS2
 
-*wwald* includes a native Wallpaper Engine (*431960*) Workshop runtime, a multi-pass Shadertoy pipeline, and reactive desktop bridges:
-- Maps *PKGV0001..PKGV0022* *scene.pkg* archives directly via *mmap*(2) without temporary disk extraction, decoding *TEXV0005* (*BC1*, *BC2*, *BC3*, *BC7*, and *LZ4*) textures, 2D Puppet Warp (*.mdl*) skeletal meshes, 32-byte-aligned AVX2 Structure-of-Arrays particle systems, and sandboxed *SceneScript* logic.
-- Executes multi-pass Shadertoy fragment shaders (*Buffer A*..*Buffer D* *GL_RGBA16F* ping-pong passes, *iChannel0*..*iChannel3*, *#pragma waywal*, hardware derivatives) and 2.5D Depth-Map Parallax Occlusion Mapping driven by cursor and workspace-slide spring physics.
+*wwald* includes a native Wallpaper Engine (*431960*) Workshop runtime, a multi-pass Shadertoy pipeline, 10 built-in procedural shader presets, and reactive desktop bridges:
+- Maps *PKGV0001..PKGV0022* *scene.pkg* archives directly via *mmap*(2) without temporary disk extraction, decoding *TEXV0005* (*BC1*, *BC2*, *BC3*, *BC7*, and *LZ4*) textures, 2D Puppet Warp (*.mdl*) skeletal meshes, 32-byte-aligned AVX2 Structure-of-Arrays particle systems, `"sound"` ambient audio layers, `"text"` clock/label layers, and sandboxed *SceneScript* logic.
+- Executes multi-pass Shadertoy fragment shaders (*Buffer A*..*Buffer D* *GL_RGBA16F* ping-pong passes, *iChannel0*..*iChannel3*, *#pragma waywal*, hardware derivatives), 10 built-in procedural shader presets, and 2.5D Depth-Map Parallax Occlusion Mapping driven by cursor and workspace-slide spring physics.
 - Streams lock-free PipeWire 2048-point AVX2 64-bin Bark-scale FFT spectrum data, automatically ducks wallpaper audio when external media plays, and listens to D-Bus *MPRIS2* signals with zero idle polling to expose *u_album_art*, *u_media_playing*, and live album art Material Design 3 palettes.
 
 ## Zero-Watt Smart Occlusion & Battery Governor
@@ -61,25 +63,43 @@ Whenever all active outputs have a non-zero *pause_mask*, *wwald* disarms its fr
 
 At startup, after initializing DRM/GBM and Wayland connections, *wwald* locks itself down using:
 - *PR_SET_NO_NEW_PRIVS* and *PR_SET_DUMPABLE = 0*.
-- Linux *Landlock* (*ABI v1..v4*): Restricts filesystem visibility to read-only system libraries, device nodes, *$XDG_RUNTIME_DIR*, and configured wallpaper/cache directories, blocking access to sensitive user data (*~/.ssh*, *~/.gnupg*, etc.).
-- *Seccomp-BPF* syscall allowlist: Blocks network socket creation (*AF_INET*, *AF_INET6*), process execution (*execve* outside pre-sandbox helpers), *ptrace*, and privilege escalation syscalls.
+- Linux *Landlock* (*ABI v1..v4*): Restricts filesystem visibility to read-only system libraries, device nodes, *$XDG_RUNTIME_DIR*, and configured wallpaper/cache/template directories, blocking access to sensitive user data (*~/.ssh*, *~/.gnupg*, etc.).
+- *Seccomp-BPF* syscall allowlist: Blocks network socket creation (*AF_INET*, *AF_INET6*), *ptrace*, and privilege escalation syscalls.
 
 # OPTIONS
 
 *-n, --namespace* <NAME>
-	Set the IPC socket and Wayland layer-shell namespace (default: *default*).
+	Set the IPC socket and Wayland layer-shell namespace (default: *default*, or *$SWWW_NAMESPACE* / *$AWWW_NAMESPACE*).
 
-*-c, --config* <PATH>
-	Load declarative configuration from _PATH_ instead of *~/.config/wwal/config.toml*.
+*-d, --daemon*
+	Fork into the background and signal readiness once the IPC socket and Wayland surfaces are initialized.
+
+*--no-daemon*
+	Stay in the foreground (*swww-daemon* / *awww-daemon* compatibility).
+
+*-f, --format* <xrgb|xbgr|rgb|bgr>
+	Pixel channel order hint (*swww-daemon* / *awww-daemon* compatibility).
+
+*-q, --quiet*
+	Suppress informational log messages.
 
 *--layer* <background|bottom>
 	Set default Wayland layer-shell placement (default: *background*).
 
-*--battery-policy* <ignore|reduce-fps|pause-video>
-	Set laptop battery power governance policy (default: *pause-video*).
+*--backdrop* <none|auto-blur|PATH>
+	Configure secondary overview backdrop layer surface mode (default: *none*).
 
-*--no-sandbox*
-	Disable Landlock and Seccomp-BPF sandboxing (for debugging under *gdb* or *valgrind* only).
+*--battery-policy* <ignore|reduce-fps|pause-video>
+	Set laptop battery power governance policy (default: *reduce-fps*).
+
+*--volume* <0.0..1.0>
+	Set default wallpaper audio playback volume (default: *0.0*).
+
+*--mute-on-audio*, *--no-mute-on-audio*
+	Enable or disable automatic PipeWire volume ducking when external audio plays.
+
+*--theme-from-media*, *--no-theme-from-media*
+	Enable or disable dynamic Material Design 3 palette extraction from D-Bus MPRIS2 album art.
 
 *-v, --verbose*
 	Enable verbose logging.
@@ -90,13 +110,36 @@ At startup, after initializing DRM/GBM and Wayland connections, *wwald* locks it
 *-h, --help*
 	Display help message and exit.
 
+# ENVIRONMENT
+
+*WWAL_CONFIG_PATH*
+	Explicit path to *config.toml* (defaults to *$XDG_CONFIG_HOME/wwal/config.toml*).
+
+*WWAL_WORKSHOP_DIR*
+	Override Steam Workshop (*431960*) directory path.
+
+*WWAL_WE_ASSETS_DIR*
+	Override Wallpaper Engine default assets directory path.
+
+*WWAL_SHADER_PRESET_DIR*, *WWAL_SHADER_DIR*
+	Override directory searched for shader presets (*.glsl*, *.frag*) before falling back to embedded procedural shaders.
+
+*WWAL_CACHE_DIR*
+	Override cache directory path (defaults to *$XDG_CACHE_HOME/wwal* and *$XDG_CACHE_HOME/wal*).
+
+*WWAL_STATE_DIR*
+	Override persistent state directory path (defaults to *$XDG_STATE_HOME/wwal*).
+
+*SWWW_NAMESPACE*, *AWWW_NAMESPACE*
+	Fallback socket namespace when *-n* is not specified.
+
 # SIGNALS
 
 *SIGTERM*, *SIGINT*
 	Gracefully tear down Wayland surfaces, release GBM/VA-API buffers, and exit.
 
 *SIGHUP*
-	Reload *~/.config/wwal/config.toml*.
+	Reload *~/.config/wwal/config.toml* and re-evaluate active solar/schedule rules and templates.
 
 # SEE ALSO
 

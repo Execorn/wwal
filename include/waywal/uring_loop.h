@@ -25,6 +25,8 @@ typedef enum {
     URING_EV_SHADER_TIMER = 9,
     URING_EV_SHADER_INOTIFY = 10,
     URING_EV_ANIM_TIMER = 11,
+    URING_EV_SOLAR_TIMER = 12,
+    EVENT_TYPE_SOLAR_TIMER = URING_EV_SOLAR_TIMER,
 } uring_event_type_t;
 
 typedef struct {

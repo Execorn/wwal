@@ -1565,6 +1565,9 @@ bool video_engine_snapshot_output(video_engine_t *ve, output_node_t *out)
     layer_shell_compute_span_bounds(state, out);
     render_engine_set_span_bounds(&state->render_engine, out->span_off_x, out->span_off_y,
                                   out->span_total_w, out->span_total_h);
+    render_engine_set_crop_gravity(&state->render_engine,
+                                   out->has_crop_gravity ? out->crop_gravity_x : 0.5f,
+                                   out->has_crop_gravity ? out->crop_gravity_y : 0.5f);
     uint32_t clear_col = ((uint32_t)out->fill_color.a << 24) | ((uint32_t)out->fill_color.r << 16) |
                          ((uint32_t)out->fill_color.g << 8) | (uint32_t)out->fill_color.b;
 

@@ -52,6 +52,12 @@ float waywal_audio_fft_get_effective_volume(const waywal_audio_fft_t *fft);
 float waywal_audio_fft_update_ducking(waywal_audio_fft_t *fft, float dt_sec);
 void waywal_audio_fft_set_external_audio_for_test(waywal_audio_fft_t *fft, bool active);
 
+/* PipeWire stereo playback ringbuffer & mixer API */
+size_t waywal_audio_submit_pcm_f32(waywal_audio_fft_t *fft, const float *stereo_interleaved,
+                                   size_t frames);
+float waywal_audio_get_effective_volume(const waywal_audio_fft_t *fft);
+void waywal_audio_clear_playback(waywal_audio_fft_t *fft);
+
 #ifdef __cplusplus
 }
 #endif

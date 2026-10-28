@@ -20,6 +20,20 @@ extern bool try_start_native_animation(daemon_state_t *state, const char *filepa
                                        const waywal_img_metadata_t *meta, const char *target_out)
     __attribute__((weak));
 
+extern bool daemon_slideshow_present_media(daemon_state_t *state, slideshow_engine_t *ss,
+                                           const char *filepath, uint32_t trans_type)
+    __attribute__((weak));
+
+extern void daemon_slideshow_prepare_image_output(daemon_state_t *state, slideshow_engine_t *ss)
+    __attribute__((weak));
+
+extern bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
+                                          uint32_t width, uint32_t height,
+                                          const waywal_img_metadata_t *meta) __attribute__((weak));
+
+extern void daemon_broadcast_event(daemon_state_t *state, const char *event_name)
+    __attribute__((weak));
+
 static bool has_image_extension(const char *name)
 {
     if (!name)
@@ -31,7 +45,63 @@ static bool has_image_extension(const char *name)
             strcasecmp(dot, ".jpeg") == 0 || strcasecmp(dot, ".webp") == 0 ||
             strcasecmp(dot, ".bmp") == 0 || strcasecmp(dot, ".gif") == 0 ||
             strcasecmp(dot, ".avif") == 0 || strcasecmp(dot, ".jxl") == 0 ||
-            strcasecmp(dot, ".svg") == 0);
+            strcasecmp(dot, ".svg") == 0 || strcasecmp(dot, ".tga") == 0 ||
+            strcasecmp(dot, ".pnm") == 0 || strcasecmp(dot, ".ppm") == 0 ||
+            strcasecmp(dot, ".pgm") == 0 || strcasecmp(dot, ".qoi") == 0 ||
+            strcasecmp(dot, ".ff") == 0 || strcasecmp(dot, ".hdr") == 0);
+}
+
+static bool has_video_extension(const char *name)
+{
+    if (!name)
+        return false;
+    const char *dot = strrchr(name, '.');
+    if (!dot)
+        return false;
+    return (strcasecmp(dot, ".mp4") == 0 || strcasecmp(dot, ".webm") == 0 ||
+            strcasecmp(dot, ".mkv") == 0 || strcasecmp(dot, ".mov") == 0 ||
+            strcasecmp(dot, ".avi") == 0 || strcasecmp(dot, ".m4v") == 0);
+}
+
+static bool has_shader_extension(const char *name)
+{
+    if (!name)
+        return false;
+    const char *dot = strrchr(name, '.');
+    if (!dot)
+        return false;
+    return (strcasecmp(dot, ".frag") == 0 || strcasecmp(dot, ".glsl") == 0 ||
+            strcasecmp(dot, ".comp") == 0 || strcasecmp(dot, ".shader") == 0);
+}
+
+static bool has_supported_media_extension(const char *name)
+{
+    return has_image_extension(name) || has_video_extension(name) || has_shader_extension(name);
+}
+
+static bool is_workshop_directory(const char *dir_path)
+{
+    if (!dir_path || dir_path[0] == '\0')
+        return false;
+    char probe[4096];
+    struct stat st;
+    if (snprintf(probe, sizeof(probe), "%s/project.json", dir_path) < (int)sizeof(probe) &&
+        stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
+    if (snprintf(probe, sizeof(probe), "%s/scene.pkg", dir_path) < (int)sizeof(probe) &&
+        stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
+    if (snprintf(probe, sizeof(probe), "%s/gifscene.pkg", dir_path) < (int)sizeof(probe) &&
+        stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
+    if (snprintf(probe, sizeof(probe), "%s/scene.json", dir_path) < (int)sizeof(probe) &&
+        stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
+        return true;
+    }
+    return false;
 }
 
 static void add_file_to_list(slideshow_engine_t *ss, const char *filepath)
@@ -62,20 +132,25 @@ static void scan_path_recursive_internal(slideshow_engine_t *ss, const char *pat
         return;
 
     if (S_ISREG(st.st_mode)) {
-        if (has_image_extension(path)) {
+        if (has_supported_media_extension(path)) {
             add_file_to_list(ss, path);
         }
         return;
     }
 
     if (S_ISDIR(st.st_mode)) {
+        if (is_workshop_directory(path)) {
+            add_file_to_list(ss, path);
+            return;
+        }
+
         DIR *dir = opendir(path);
         if (!dir)
             return;
 
         struct dirent *ent;
         while ((ent = readdir(dir)) != NULL) {
-            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            if (ent->d_name[0] == '.')
                 continue;
 
             char full_path[4096];
@@ -84,8 +159,13 @@ static void scan_path_recursive_internal(slideshow_engine_t *ss, const char *pat
             struct stat child_st;
             if (stat(full_path, &child_st) == 0) {
                 if (S_ISDIR(child_st.st_mode)) {
-                    scan_path_recursive_internal(ss, full_path, depth + 1);
-                } else if (S_ISREG(child_st.st_mode) && has_image_extension(ent->d_name)) {
+                    if (is_workshop_directory(full_path)) {
+                        add_file_to_list(ss, full_path);
+                    } else if (ss->recursive) {
+                        scan_path_recursive_internal(ss, full_path, depth + 1);
+                    }
+                } else if (S_ISREG(child_st.st_mode) &&
+                           has_supported_media_extension(ent->d_name)) {
                     add_file_to_list(ss, full_path);
                 }
             }
@@ -99,6 +179,40 @@ static void scan_path_recursive(slideshow_engine_t *ss, const char *path)
     scan_path_recursive_internal(ss, path, 0);
 }
 
+static int cmp_path_asc(const void *a, const void *b)
+{
+    const char *pa = *(const char *const *)a;
+    const char *pb = *(const char *const *)b;
+    return strcmp(pa, pb);
+}
+
+static int cmp_path_desc(const void *a, const void *b)
+{
+    const char *pa = *(const char *const *)a;
+    const char *pb = *(const char *const *)b;
+    return strcmp(pb, pa);
+}
+
+static int cmp_path_mtime(const void *a, const void *b)
+{
+    const char *pa = *(const char *const *)a;
+    const char *pb = *(const char *const *)b;
+    struct stat sa, sb;
+    bool ok_a = (stat(pa, &sa) == 0);
+    bool ok_b = (stat(pb, &sb) == 0);
+    time_t sec_a = ok_a ? sa.st_mtim.tv_sec : 0;
+    time_t sec_b = ok_b ? sb.st_mtim.tv_sec : 0;
+    if (sec_a != sec_b) {
+        return (sec_a > sec_b) ? -1 : 1;
+    }
+    long nsec_a = ok_a ? sa.st_mtim.tv_nsec : 0;
+    long nsec_b = ok_b ? sb.st_mtim.tv_nsec : 0;
+    if (nsec_a != nsec_b) {
+        return (nsec_a > nsec_b) ? -1 : 1;
+    }
+    return strcmp(pa, pb);
+}
+
 static void shuffle_files(slideshow_engine_t *ss)
 {
     if (!ss || ss->num_files < 2)
@@ -108,6 +222,38 @@ static void shuffle_files(slideshow_engine_t *ss)
         char *tmp = ss->file_list[i];
         ss->file_list[i] = ss->file_list[j];
         ss->file_list[j] = tmp;
+    }
+    if (ss->last_played_path[0] != '\0' && ss->file_list[0] &&
+        strcmp(ss->file_list[0], ss->last_played_path) == 0) {
+        size_t swap_idx = 1 + ((size_t)rand() % (ss->num_files - 1));
+        char *tmp = ss->file_list[0];
+        ss->file_list[0] = ss->file_list[swap_idx];
+        ss->file_list[swap_idx] = tmp;
+    }
+}
+
+static void apply_sort_or_shuffle(slideshow_engine_t *ss)
+{
+    if (!ss || ss->num_files < 2)
+        return;
+    waywal_sort_mode_t mode = ss->has_sort_mode
+                                  ? (waywal_sort_mode_t)ss->sort_mode
+                                  : (ss->random_order ? WAYWAL_SORT_RANDOM : WAYWAL_SORT_ASCENDING);
+    switch (mode) {
+    case WAYWAL_SORT_RANDOM:
+        qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_asc);
+        shuffle_files(ss);
+        break;
+    case WAYWAL_SORT_DESCENDING:
+        qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_desc);
+        break;
+    case WAYWAL_SORT_MTIME:
+        qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_mtime);
+        break;
+    case WAYWAL_SORT_ASCENDING:
+    default:
+        qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_asc);
+        break;
     }
 }
 
@@ -141,10 +287,40 @@ static void disarm_timer(slideshow_engine_t *ss)
 
 static void display_current_image(slideshow_engine_t *ss)
 {
-    if (!ss || ss->num_files == 0 || !ss->daemon_state)
+    if (!ss || ss->num_files == 0)
         return;
 
     const char *filepath = ss->file_list[ss->current_file_idx];
+    if (!filepath)
+        return;
+
+    strncpy(ss->last_played_path, filepath, sizeof(ss->last_played_path) - 1);
+    ss->last_played_path[sizeof(ss->last_played_path) - 1] = '\0';
+
+    if (!ss->daemon_state)
+        return;
+
+    uint32_t trans_type = ss->transition_type;
+    if (trans_type == WAYWAL_TRANSITION_RANDOM) {
+        /* Pick random animated transition between SIMPLE (1) and PAGE_CURL (19) */
+        trans_type = 1 + (uint32_t)(rand() % 19);
+    }
+
+    daemon_state_t *st = ss->daemon_state;
+    struct stat item_st;
+    bool is_dir = (stat(filepath, &item_st) == 0 && S_ISDIR(item_st.st_mode));
+    if (is_dir || has_video_extension(filepath) || has_shader_extension(filepath)) {
+        if (daemon_slideshow_present_media) {
+            WAYWAL_LOG_INFO("Slideshow [%zu/%zu]: presenting live media '%s' (transition: %u)",
+                            ss->current_file_idx + 1, ss->num_files, filepath, trans_type);
+            if (daemon_slideshow_present_media(st, ss, filepath, trans_type) &&
+                st->config.hooks.on_wallpaper_change[0] != '\0') {
+                (void)waywal_palette_run_hook(st->config.hooks.on_wallpaper_change);
+            }
+        }
+        return;
+    }
+
     uint8_t *pixels = NULL;
     uint32_t img_w = 0, img_h = 0;
 
@@ -153,10 +329,8 @@ static void display_current_image(slideshow_engine_t *ss)
         return;
     }
 
-    uint32_t trans_type = ss->transition_type;
-    if (trans_type == WAYWAL_TRANSITION_RANDOM) {
-        /* Pick random animated transition between SIMPLE (1) and PAGE_CURL (19) */
-        trans_type = 1 + (uint32_t)(rand() % 19);
+    if (daemon_slideshow_prepare_image_output) {
+        daemon_slideshow_prepare_image_output(st, ss);
     }
 
     uint8_t meta_buf[sizeof(waywal_img_metadata_t) + 16 * 64];
@@ -184,6 +358,24 @@ static void display_current_image(slideshow_engine_t *ss)
     meta->bezier = ss->bezier;
     meta->has_custom_bezier = ss->has_custom_bezier;
     meta->ten_bit = ss->ten_bit;
+    meta->crop_gravity_x = ss->crop_gravity_x;
+    meta->crop_gravity_y = ss->crop_gravity_y;
+    meta->has_crop_gravity = ss->has_crop_gravity;
+    meta->invert_y = ss->invert_y;
+    meta->pos_y_inverted = ss->pos_y_inverted ? 1 : 0;
+    meta->no_cache = ss->no_cache ? 1 : 0;
+    meta->extract_theme = ss->extract_theme;
+    meta->no_theme = ss->no_theme;
+    meta->has_theme_mode = ss->has_theme_mode ? 1 : 0;
+    meta->theme_light_mode = ss->theme_light_mode;
+    meta->has_source_color_index = ss->has_source_color_index ? 1 : 0;
+    meta->source_color_index = ss->source_color_index;
+    meta->has_seed_color = ss->has_seed_color ? 1 : 0;
+    meta->seed_color = ss->seed_color;
+    if (ss->auto_day_night != 0) {
+        meta->has_auto_day_night = 1;
+        meta->auto_day_night = (ss->auto_day_night == 1) ? 1 : 0;
+    }
     strncpy(meta->filepath, filepath, sizeof(meta->filepath) - 1);
 
     uint32_t valid_targets = 0;
@@ -207,80 +399,32 @@ static void display_current_image(slideshow_engine_t *ss)
     WAYWAL_LOG_INFO("Slideshow [%zu/%zu]: displaying '%s' (transition: %u)",
                     ss->current_file_idx + 1, ss->num_files, filepath, trans_type);
 
-    daemon_state_t *st = ss->daemon_state;
     if (st->on_wallpaper_loaded) {
         st->on_wallpaper_loaded(st, pixels, img_w, img_h, meta);
-    } else if (img_w > 0 && img_h > 0) {
-        uint32_t thumb_w = img_w;
-        uint32_t thumb_h = img_h;
-        if (thumb_w > 1920U || thumb_h > 1080U) {
-            double scale_x = 1920.0 / (double)img_w;
-            double scale_y = 1080.0 / (double)img_h;
-            double scale = (scale_x < scale_y) ? scale_x : scale_y;
-            thumb_w = (uint32_t)((double)img_w * scale + 0.5);
-            thumb_h = (uint32_t)((double)img_h * scale + 0.5);
-            if (thumb_w == 0U)
-                thumb_w = 1U;
-            if (thumb_h == 0U)
-                thumb_h = 1U;
-        }
-        size_t byte_len = (size_t)thumb_w * (size_t)thumb_h * 4U;
-        if (!st->wallpaper_rgba || st->wallpaper_w != thumb_w || st->wallpaper_h != thumb_h) {
-            uint8_t *buf = (uint8_t *)malloc(byte_len);
-            if (buf) {
-                free(st->wallpaper_rgba);
-                st->wallpaper_rgba = buf;
-                st->wallpaper_w = thumb_w;
-                st->wallpaper_h = thumb_h;
-            }
-        }
-        if (st->wallpaper_rgba && st->wallpaper_w == thumb_w && st->wallpaper_h == thumb_h) {
-            if (thumb_w == img_w && thumb_h == img_h) {
-                memcpy(st->wallpaper_rgba, pixels, byte_len);
-            } else {
-                const uint32_t *src32 = (const uint32_t *)pixels;
-                uint32_t *dst32 = (uint32_t *)st->wallpaper_rgba;
-                for (uint32_t dy = 0; dy < thumb_h; ++dy) {
-                    uint32_t sy0 = (uint32_t)(((uint64_t)dy * img_h) / thumb_h);
-                    uint32_t sy1 = sy0 + 1U < img_h ? sy0 + 1U : sy0;
-                    const uint32_t *srow0 = src32 + (size_t)sy0 * img_w;
-                    const uint32_t *srow1 = src32 + (size_t)sy1 * img_w;
-                    uint32_t *drow = dst32 + (size_t)dy * thumb_w;
-                    for (uint32_t dx = 0; dx < thumb_w; ++dx) {
-                        uint32_t sx0 = (uint32_t)(((uint64_t)dx * img_w) / thumb_w);
-                        uint32_t sx1 = sx0 + 1U < img_w ? sx0 + 1U : sx0;
-                        uint32_t p0 =
-                            (((srow0[sx0] & 0xFEFEFEFEU) >> 1) + ((srow0[sx1] & 0xFEFEFEFEU) >> 1));
-                        uint32_t p1 =
-                            (((srow1[sx0] & 0xFEFEFEFEU) >> 1) + ((srow1[sx1] & 0xFEFEFEFEU) >> 1));
-                        drow[dx] = ((p0 & 0xFEFEFEFEU) >> 1) + ((p1 & 0xFEFEFEFEU) >> 1);
-                    }
-                }
-            }
-        }
-        waywal_scheme_variant_t variant =
-            waywal_scheme_variant_from_str(st->config.theme.scheme_variant);
-        if (waywal_palette_extract_ex(pixels, img_w, img_h, img_w * 4U, true,
-                                      st->config.theme.theme_mode, variant,
-                                      st->config.theme.contrast, &st->active_palette)) {
-            st->saved_wallpaper_palette = st->active_palette;
-            st->has_saved_wallpaper_palette = true;
-            st->has_active_palette = true;
-            if (st->config.theme.enabled) {
-                (void)waywal_palette_export_filtered(
-                    &st->active_palette, NULL, st->config.theme.caelestia_sync,
-                    st->config.theme.export_css, st->config.theme.export_hyprland);
-                if (st->config.theme.tty_sequences) {
-                    (void)waywal_palette_broadcast_tty(&st->active_palette);
-                }
-                if (st->config.hooks.on_theme_change[0] != '\0') {
-                    (void)waywal_palette_run_hook(st->config.hooks.on_theme_change);
-                }
-            }
-        }
     }
 
-    bool ok = daemon_start_image_transition(st, pixels, img_w, img_h, meta);
+    bool ok = daemon_start_image_transition
+                  ? daemon_start_image_transition(st, pixels, img_w, img_h, meta)
+                  : false;
+    if (ok && !ss->no_cache) {
+        const char *filt_str =
+            waywal_filter_mode_to_swww_str((waywal_filter_mode_t)ss->filter_mode);
+        char matched_outputs[256] = {0};
+        size_t mlen = 0;
+        for (output_node_t *out = st->outputs; out != NULL; out = out->next) {
+            if (out->slideshow_eng == ss && out->name[0] != '\0') {
+                int n = snprintf(matched_outputs + mlen, sizeof(matched_outputs) - mlen, "%s%s",
+                                 mlen > 0 ? "," : "", out->name);
+                if (n > 0 && mlen + (size_t)n < sizeof(matched_outputs)) {
+                    mlen += (size_t)n;
+                }
+            }
+        }
+        const char *first_target = (meta->num_target_outputs > 0) ? extra_ptr : "*";
+        (void)waywal_ecosystem_cache_sync(matched_outputs[0] ? matched_outputs : first_target,
+                                          filepath, filt_str, pixels, img_w, img_h,
+                                          st->config.theme.caelestia_sync, ss->no_cache);
+    }
     image_free(pixels);
     if (ok) {
         if (st->config.hooks.on_wallpaper_change[0] != '\0') {
@@ -308,6 +452,7 @@ bool slideshow_init(slideshow_engine_t *ss, struct daemon_state *state)
 
     memset(ss, 0, sizeof(*ss));
     ss->daemon_state = state;
+    ss->recursive = true;
     ss->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (ss->timer_fd < 0) {
         WAYWAL_LOG_ERR("Failed to create slideshow timerfd: %s", strerror(errno));
@@ -350,6 +495,10 @@ bool slideshow_rescan(slideshow_engine_t *ss)
         ss->file_list[ss->current_file_idx]) {
         strncpy(prev_path, ss->file_list[ss->current_file_idx], sizeof(prev_path) - 1);
         prev_path[sizeof(prev_path) - 1] = '\0';
+        if (ss->last_played_path[0] == '\0') {
+            strncpy(ss->last_played_path, prev_path, sizeof(ss->last_played_path) - 1);
+            ss->last_played_path[sizeof(ss->last_played_path) - 1] = '\0';
+        }
     }
 
     for (size_t i = 0; i < ss->num_files; ++i) {
@@ -366,12 +515,13 @@ bool slideshow_rescan(slideshow_engine_t *ss)
         return false;
     }
 
-    if (ss->random_order) {
-        shuffle_files(ss);
-    }
+    apply_sort_or_shuffle(ss);
 
     ss->current_file_idx = 0;
-    if (prev_path[0] != '\0') {
+    waywal_sort_mode_t mode = ss->has_sort_mode
+                                  ? (waywal_sort_mode_t)ss->sort_mode
+                                  : (ss->random_order ? WAYWAL_SORT_RANDOM : WAYWAL_SORT_ASCENDING);
+    if (mode != WAYWAL_SORT_RANDOM && prev_path[0] != '\0') {
         for (size_t i = 0; i < ss->num_files; ++i) {
             if (ss->file_list[i] && strcmp(ss->file_list[i], prev_path) == 0) {
                 ss->current_file_idx = i;
@@ -389,8 +539,21 @@ bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *p
 
     memset(ss->root_path, 0, sizeof(ss->root_path));
     strncpy(ss->root_path, payload->path, sizeof(ss->root_path) - 1);
+    ss->recursive = (payload->no_recursive == 0);
     ss->random_order = payload->random_order;
+    bool explicit_sort = (payload->has_sort_mode != 0) ||
+                         (payload->sort_mode > (uint8_t)WAYWAL_SORT_RANDOM &&
+                          payload->sort_mode <= (uint8_t)WAYWAL_SORT_MTIME);
+    ss->has_sort_mode = explicit_sort;
+    ss->sort_mode = explicit_sort
+                        ? payload->sort_mode
+                        : (payload->random_order ? (uint8_t)WAYWAL_SORT_RANDOM
+                                                 : (uint8_t)WAYWAL_SORT_ASCENDING);
+    if (ss->has_sort_mode) {
+        ss->random_order = (ss->sort_mode == (uint8_t)WAYWAL_SORT_RANDOM);
+    }
     ss->current_file_idx = 0;
+    ss->last_played_path[0] = '\0';
 
     /* Clean up any existing file list before fresh start */
     for (size_t i = 0; i < ss->num_files; ++i) {
@@ -402,7 +565,7 @@ bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *p
     ss->capacity_files = 0;
 
     if (!slideshow_rescan(ss)) {
-        WAYWAL_LOG_ERR("Slideshow: No supported image files found in '%s'", payload->path);
+        WAYWAL_LOG_ERR("Slideshow: No supported media files found in '%s'", payload->path);
         slideshow_stop(ss);
         return false;
     }
@@ -424,13 +587,28 @@ bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *p
     ss->has_custom_bezier = payload->has_custom_bezier;
     memcpy(ss->color, payload->color, sizeof(ss->color));
     ss->ten_bit = payload->ten_bit;
+    ss->crop_gravity_x = payload->crop_gravity_x;
+    ss->crop_gravity_y = payload->crop_gravity_y;
+    ss->has_crop_gravity = payload->has_crop_gravity;
+    ss->invert_y = payload->invert_y;
+    ss->pos_y_inverted = payload->pos_y_inverted;
+    ss->no_cache = (payload->no_cache != 0);
+    ss->extract_theme = (payload->extract_theme != 0);
+    ss->no_theme = (payload->no_theme != 0);
+    ss->has_theme_mode = (payload->has_theme_mode != 0);
+    ss->theme_light_mode = (payload->theme_light_mode != 0);
+    ss->has_source_color_index = (payload->has_source_color_index != 0);
+    ss->source_color_index = payload->source_color_index;
+    ss->has_seed_color = (payload->has_seed_color != 0);
+    ss->seed_color = payload->seed_color;
+    ss->auto_day_night = payload->auto_day_night;
 
     ss->active = true;
     ss->paused = false;
     ss->current_file_idx = 0;
 
-    WAYWAL_LOG_INFO("Slideshow started with %zu images (interval: %us, transition: %u)",
-                    ss->num_files, ss->interval_s, ss->transition_type);
+    WAYWAL_LOG_INFO("Slideshow started with %zu media items (interval: %us, sort: %u, transition: %u)",
+                    ss->num_files, ss->interval_s, (unsigned)ss->sort_mode, ss->transition_type);
 
     display_current_image(ss);
     arm_timer(ss);
@@ -478,12 +656,29 @@ void slideshow_toggle(slideshow_engine_t *ss)
         slideshow_pause(ss);
 }
 
+static void advance_slideshow_index(slideshow_engine_t *ss)
+{
+    if (!ss || ss->num_files == 0)
+        return;
+    if (ss->current_file_idx + 1 >= ss->num_files) {
+        ss->current_file_idx = 0;
+        waywal_sort_mode_t mode =
+            ss->has_sort_mode ? (waywal_sort_mode_t)ss->sort_mode
+                              : (ss->random_order ? WAYWAL_SORT_RANDOM : WAYWAL_SORT_ASCENDING);
+        if (mode == WAYWAL_SORT_RANDOM && ss->num_files > 1) {
+            shuffle_files(ss);
+        }
+    } else {
+        ss->current_file_idx++;
+    }
+}
+
 void slideshow_next(slideshow_engine_t *ss)
 {
     if (!ss || !ss->active || ss->num_files == 0)
         return;
 
-    ss->current_file_idx = (ss->current_file_idx + 1) % ss->num_files;
+    advance_slideshow_index(ss);
     display_current_image(ss);
     if (!ss->paused)
         arm_timer(ss);
@@ -517,8 +712,11 @@ void slideshow_dispatch_tick(slideshow_engine_t *ss)
     if (!ss->active || ss->paused || ss->num_files == 0)
         return;
 
-    ss->current_file_idx = (ss->current_file_idx + 1) % ss->num_files;
+    advance_slideshow_index(ss);
     display_current_image(ss);
+    if (ss->daemon_state && daemon_broadcast_event) {
+        daemon_broadcast_event(ss->daemon_state, "wallpaper_changed");
+    }
 }
 
 bool slideshow_control(slideshow_engine_t *ss, uint32_t action)
@@ -530,18 +728,28 @@ bool slideshow_control(slideshow_engine_t *ss, uint32_t action)
         slideshow_stop(ss);
         return true;
     case WAYWAL_SLIDESHOW_PAUSE:
+        if (!ss->active)
+            return false;
         slideshow_pause(ss);
         return true;
     case WAYWAL_SLIDESHOW_RESUME:
+        if (!ss->active)
+            return false;
         slideshow_resume(ss);
         return true;
     case WAYWAL_SLIDESHOW_TOGGLE:
+        if (!ss->active)
+            return false;
         slideshow_toggle(ss);
         return true;
     case WAYWAL_SLIDESHOW_NEXT:
+        if (!ss->active || ss->num_files == 0)
+            return false;
         slideshow_next(ss);
         return true;
     case WAYWAL_SLIDESHOW_PREV:
+        if (!ss->active || ss->num_files == 0)
+            return false;
         slideshow_prev(ss);
         return true;
     default:

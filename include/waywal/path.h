@@ -30,6 +30,27 @@ bool path_buf_parent(path_buf_t *pb);
 
 const char *path_buf_cstr(const path_buf_t *pb);
 
+/* Normalizes an absolute path in-place (collapses '//', strips '/./', resolves '/../') */
+void waywal_normalize_path(char *path);
+
+/* Expands leading '~/' and environment variables ($HOME, $XDG_CONFIG_HOME, ${VAR}, etc.) */
+bool waywal_expand_path(const char *raw_path, char *out_buf, size_t out_cap);
+
+typedef struct {
+    char name[64];
+    char path[WAYWAL_PATH_MAX];
+    char filename[72];
+    char title[64];
+    char description[160];
+    char author[64];
+    bool audio_reactive;
+    bool is_builtin;
+} waywal_shader_preset_info_t;
+
+bool waywal_shader_resolve_path(const char *name_or_path, char *out_buf, size_t out_cap);
+bool waywal_shader_is_audio_reactive(const char *name_or_path);
+size_t waywal_shader_preset_list(waywal_shader_preset_info_t *out_list, size_t max_entries);
+
 #ifdef __cplusplus
 }
 #endif

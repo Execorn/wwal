@@ -7,6 +7,7 @@
 #include "waywal/dmabuf.h"
 #include "waywal/image_loader.h"
 #include "waywal/log.h"
+#include "waywal/path.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -108,6 +109,7 @@ typedef struct {
     uint32_t tex_h;
     int read_idx;
     bool uniforms_initialized;
+    bool audio_uniforms_dirty;
     uint32_t cached_res_w;
     uint32_t cached_res_h;
     uint32_t cached_local_w;
@@ -135,6 +137,7 @@ struct waywal_shader_engine {
 
     shader_pass_t passes[SHADER_NUM_PASSES];
     GLuint audio_tex;
+    bool audio_tex_dirty;
     GLuint noise_tex;
     GLuint wallpaper_tex;
     uint32_t wallpaper_w;
@@ -1965,14 +1968,29 @@ bool waywal_shader_engine_load_file(waywal_shader_engine_t *eng, const char *fil
     if (!eng || !filepath) {
         return false;
     }
-    char *src = read_entire_file(filepath);
+    char resolved[4096];
+    const char *target = waywal_shader_resolve_path(filepath, resolved, sizeof(resolved))
+                             ? resolved
+                             : filepath;
+    char *src = read_entire_file(target);
     if (!src) {
         return false;
     }
-    setup_file_watches(eng, filepath);
-    bool ok = waywal_shader_engine_load_source(eng, src, filepath);
+    setup_file_watches(eng, target);
+    bool ok = waywal_shader_engine_load_source(eng, src, target);
     free(src);
     return ok;
+}
+
+bool waywal_shader_engine_compile(waywal_shader_engine_t *eng, const char *src_or_path)
+{
+    if (!eng || !src_or_path || src_or_path[0] == '\0') {
+        return false;
+    }
+    if (strstr(src_or_path, "mainImage") != NULL || strstr(src_or_path, "void main") != NULL) {
+        return waywal_shader_engine_load_source(eng, src_or_path, "inline");
+    }
+    return waywal_shader_engine_load_file(eng, src_or_path);
 }
 
 int waywal_shader_engine_get_inotify_fd(const waywal_shader_engine_t *eng)
@@ -2376,6 +2394,17 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WAYWAL_AUDIO_TEX_WIDTH, WAYWAL_AUDIO_TEX_HEIGHT,
                         GL_RED, GL_UNSIGNED_BYTE, params->audio->shadertoy_tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        eng->audio_tex_dirty = true;
+    } else if (eng->audio_tex_dirty && eng->audio_tex) {
+        uint8_t zero_tex[WAYWAL_AUDIO_TEX_WIDTH * WAYWAL_AUDIO_TEX_HEIGHT];
+        memset(zero_tex, 0, WAYWAL_AUDIO_TEX_WIDTH);
+        memset(zero_tex + WAYWAL_AUDIO_TEX_WIDTH, 128, WAYWAL_AUDIO_TEX_WIDTH);
+        glBindTexture(GL_TEXTURE_2D, eng->audio_tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WAYWAL_AUDIO_TEX_WIDTH, WAYWAL_AUDIO_TEX_HEIGHT,
+                        GL_RED, GL_UNSIGNED_BYTE, zero_tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        eng->audio_tex_dirty = false;
     }
 
     float date_vals[4] = {params->date[0], params->date[1], params->date[2], params->date[3]};
@@ -2613,6 +2642,19 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             if (u->u_audio_beat >= 0) {
                 glUniform1f(u->u_audio_beat, params->audio->beat_pulse);
             }
+            pass->audio_uniforms_dirty = true;
+        } else if (init_u || pass->audio_uniforms_dirty) {
+            static const float zero_bands[WAYWAL_AUDIO_BARK_BANDS] = {0};
+            if (u->u_audio_bands >= 0) {
+                glUniform1fv(u->u_audio_bands, WAYWAL_AUDIO_BARK_BANDS, zero_bands);
+            }
+            if (u->u_audio_envelope >= 0) {
+                glUniform1f(u->u_audio_envelope, 0.0f);
+            }
+            if (u->u_audio_beat >= 0) {
+                glUniform1f(u->u_audio_beat, 0.0f);
+            }
+            pass->audio_uniforms_dirty = false;
         }
 
         for (int cu_idx = 0; cu_idx < SHADER_MAX_CUSTOM_UNIFORMS; ++cu_idx) {

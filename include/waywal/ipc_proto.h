@@ -47,6 +47,10 @@ typedef enum : uint16_t {
     WAYWAL_IPC_OP_SUBSCRIBE = WAYWAL_REQ_SUBSCRIBE,
     WAYWAL_REQ_AUDIO_CTRL = 0x0013,
     WAYWAL_IPC_OP_AUDIO_CTRL = WAYWAL_REQ_AUDIO_CTRL,
+    WAYWAL_REQ_SLIDESHOW_NEXT = 0x0014,
+    WAYWAL_IPC_OP_SLIDESHOW_NEXT = WAYWAL_REQ_SLIDESHOW_NEXT,
+    WAYWAL_REQ_SLIDESHOW_PREV = 0x0015,
+    WAYWAL_IPC_OP_SLIDESHOW_PREV = WAYWAL_REQ_SLIDESHOW_PREV,
 
     WAYWAL_RESP_OK = 0x8001,
     WAYWAL_RESP_PONG = 0x8002,
@@ -97,6 +101,32 @@ typedef struct {
     char battery_policy[32];
     char filepath[4096];
     float depth_strength;
+    float crop_gravity_x;
+    float crop_gravity_y;
+    uint8_t has_crop_gravity;
+    uint8_t invert_y;
+    uint8_t no_cache;
+    union {
+        uint8_t _pad_flags;
+        struct {
+            uint8_t is_solid_color : 1;
+            uint8_t pos_y_inverted : 1;
+            uint8_t _pad_flags_bits : 6;
+        };
+    };
+    uint8_t source_color_index;
+    uint8_t has_source_color_index;
+    uint8_t has_seed_color;
+    uint8_t _pad_seed;
+    uint32_t seed_color;
+    uint8_t has_theme_mode;
+    uint8_t client_exported_theme;
+    uint8_t has_auto_day_night;
+    uint8_t auto_day_night;
+    uint8_t has_solar_coords;
+    uint8_t _pad_solar;
+    double solar_latitude;
+    double solar_longitude;
     /* Followed by num_target_outputs null-terminated strings, then custom shader GLSL string */
 } waywal_img_metadata_t;
 typedef waywal_img_metadata_t waywal_ipc_img_meta_t;
@@ -113,6 +143,7 @@ typedef struct {
     uint32_t num_target_outputs;
     char filepath[4096];
     uint32_t scaling_mode;
+    uint32_t no_cache;
 } waywal_video_payload_t;
 
 typedef enum : uint32_t {
@@ -126,6 +157,7 @@ typedef enum : uint32_t {
 
 typedef struct {
     uint32_t action; /* waywal_slideshow_action_t */
+    char target_output[64];
 } waywal_slideshow_ctrl_t;
 
 typedef struct {
@@ -148,6 +180,30 @@ typedef struct {
     uint8_t color[4];
     bool ten_bit;
     char path[4096];
+    float crop_gravity_x;
+    float crop_gravity_y;
+    uint8_t has_crop_gravity;
+    uint8_t invert_y;
+    uint8_t pos_y_inverted;
+    uint8_t _pad_ss[1];
+    uint32_t no_cache;
+    uint8_t extract_theme;
+    uint8_t no_theme;
+    uint8_t has_theme_mode;
+    uint8_t theme_light_mode;
+    uint8_t has_source_color_index;
+    uint8_t source_color_index;
+    uint8_t has_seed_color;
+    uint8_t auto_day_night;
+    uint32_t seed_color;
+    uint8_t sort_mode;     /* waywal_sort_mode_t */
+    uint8_t has_sort_mode; /* 1 if sort_mode explicitly set */
+    uint8_t no_recursive;  /* 1 to disable subdirectory recursion (0 = recursive by default) */
+    uint8_t _pad_ss3;
+    uint8_t has_solar_coords;
+    uint8_t _pad_ss2[3];
+    double solar_latitude;
+    double solar_longitude;
 } waywal_slideshow_payload_t;
 
 typedef struct {
@@ -166,6 +222,9 @@ typedef struct {
     float transition_center_y;
     bezier_curve_t bezier;
     bool has_custom_bezier;
+    uint8_t invert_y;
+    uint8_t pos_y_inverted;
+    uint32_t no_cache;
 } waywal_shader_payload_t;
 
 typedef struct {
@@ -185,6 +244,18 @@ typedef struct {
     float transition_center_y;
     bezier_curve_t bezier;
     bool has_custom_bezier;
+    uint8_t invert_y;
+    uint8_t pos_y_inverted;
+    uint32_t no_cache;
+    uint8_t extract_theme;
+    uint8_t no_theme;
+    uint8_t has_theme_mode;
+    uint8_t theme_light_mode;
+    uint8_t has_source_color_index;
+    uint8_t source_color_index;
+    uint8_t has_seed_color;
+    uint8_t client_exported_theme;
+    uint32_t seed_color;
 } waywal_workshop_payload_t;
 
 typedef struct {
@@ -212,6 +283,7 @@ bool waywal_ipc_resolve_socket_path(path_buf_t *out_path, const char *namespace_
 /* Server: Create listening non-blocking Unix domain socket */
 int waywal_ipc_server_create(const char *namespace_str);
 bool waywal_ipc_is_socket_activated(void);
+bool waywal_ipc_namespace_is_alive(const char *namespace_str);
 
 /* Client: Connect to running daemon socket */
 int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms);

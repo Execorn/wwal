@@ -143,6 +143,13 @@ void render_engine_set_span_bounds(render_engine_t *re, int32_t off_x, int32_t o
     gpu_compute_set_span_bounds((gpu_compute_ctx_t *)re->gpu_ctx, off_x, off_y, total_w, total_h);
 }
 
+void render_engine_set_crop_gravity(render_engine_t *re, float gx, float gy)
+{
+    if (!re || !re->has_gpu_compute || !re->gpu_ctx)
+        return;
+    gpu_compute_set_crop_gravity((gpu_compute_ctx_t *)re->gpu_ctx, gx, gy);
+}
+
 void render_engine_bump_upload_gen(render_engine_t *re)
 {
     if (!re || !re->has_gpu_compute || !re->gpu_ctx)

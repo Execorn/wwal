@@ -36,6 +36,25 @@ typedef struct slideshow_engine {
     bool has_custom_bezier;
     uint8_t color[4];
     bool ten_bit;
+    float crop_gravity_x;
+    float crop_gravity_y;
+    uint8_t has_crop_gravity;
+    uint8_t invert_y;
+    uint8_t pos_y_inverted;
+    bool no_cache;
+    bool extract_theme;
+    bool no_theme;
+    bool has_theme_mode;
+    bool theme_light_mode;
+    bool has_source_color_index;
+    uint8_t source_color_index;
+    bool has_seed_color;
+    uint32_t seed_color;
+    uint8_t auto_day_night;
+    uint32_t sort_mode; /* waywal_sort_mode_t */
+    bool has_sort_mode;
+    bool recursive;
+    char last_played_path[4096];
 
     char root_path[4096];
     char **file_list;

@@ -109,6 +109,11 @@ static bool compute_file_hash(const char *filepath, uint32_t max_w, uint32_t max
 
 static bool get_cache_dir(char *out_dir, size_t out_size)
 {
+    const char *env_cache = getenv("WWAL_CACHE_DIR");
+    if (env_cache && env_cache[0]) {
+        snprintf(out_dir, out_size, "%s/transcoded", env_cache);
+        return mkdir_p(out_dir);
+    }
     const char *xdg = getenv("XDG_CACHE_HOME");
     if (xdg && xdg[0]) {
         snprintf(out_dir, out_size, "%s/wwal/transcoded", xdg);

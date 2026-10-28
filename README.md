@@ -10,33 +10,36 @@
   </a>
 </p>
 
-**WayWal** is a fast, all-in-one wallpaper and color theme tool for Linux desktops (Hyprland, Sway, Niri, and other Wayland setups).
+**WayWal** is a fast, all-in-one wallpaper, live shader, Steam Wallpaper Engine, and Material Design 3 color theme tool for Linux desktops (Hyprland, Sway, Niri, and other Wayland setups).
 
-Most people install four or five separate tools just to get pictures, video loops, Steam Wallpaper Engine scenes, music bars, and matching desktop colors. WayWal does all of that in one tiny program (`< 2 MB`). It is easy to use and light on your battery.
+Most people install five or six separate tools (`swww`/`awww`, `mpvpaper`, `linux-wallpaperengine`, `wpaperd`, `matugen`/`wallust`/`pywal`, and custom picker scripts) just to get pictures, video loops, Steam Wallpaper Engine scenes, music bars, and matching desktop colors. WayWal does all of that in one tiny C23 program (`1.66 MB` stripped total). It is easy to use and light on your battery.
 
 ---
 
 ## Key Features
 
-- **Every Wallpaper Type**: Use normal pictures (`PNG`, `JPG`, `WebP`, `AVIF`, `JXL`, `SVG`), `GIF`s, 4K videos (`MP4`, `WebM`, `MKV`), live shaders, or **Steam Wallpaper Engine** scenes.
-- **18 Smooth Effects**: Switch wallpapers with smooth effects like `ripple`, `grow`, `wave`, `burn`, `glitch`, `page_curl`, and `fade`.
-- **Instant Color Themes**: Pulls matching colors from your wallpaper (or your playing song cover) and updates your desktop bar, shell, and terminal in under a millisecond. It keeps dark mode on by default so bright pictures never turn your apps white.
-- **Smart Pause & Battery Saver**: Pauses when a screen is covered by a fullscreen or maximized window. It also pauses when your screen is idle or when your laptop runs on battery.
-- **Smart Sound**: Plays sound from video or Workshop wallpapers when you want it. It mutes the wallpaper sound whenever another app (like Firefox, Spotify, or a game) plays audio.
-- **3D Mouse & Workspace Motion**: Move your mouse or switch workspaces to see smooth 3D depth motion on your background.
-- **Works with `swww` & `awww` Pickers**: Drop-in compatible with GUI pickers like `waypaper` and Rofi menus.
+- **Every Wallpaper Type (`wwal img`)**: Universal `wwal img` auto-detects and runs normal pictures (`PNG`, `JPG`, `WebP`, `AVIF`, `JXL`, `SVG`, `QOI`, `PPM`, `HEIC`), `GIF`s, 4K videos (`MP4`, `WebM`, `MKV`, `MOV`), live shaders (`.frag`, `.comp`), **10 built-in shader presets** (`wwal shader preset <name>`), **Steam Wallpaper Engine** scenes (IDs, folders, or preview symlinks), GNOME `.xml` dynamic timed wallpapers, slideshow directories, and solid hex colors.
+- **18 Smooth Effects**: Switch wallpapers with GPU compute effects like `ripple`, `grow`, `wave`, `burn`, `glitch`, `page_curl`, `light_leak`, and `fade`, with directional crop anchors (`--crop-gravity top|center|tl|...`).
+- **Instant Dual-Mode Color Themes & Template Engine**: Extracts both `dark` and `light` Material Design 3 palettes simultaneously in **`0.44 ms`**, supports ranked seed selection (`--source-color-index 0..3`, `--seed-color`), renders declarative `[template."<name>"]` files in **`0.05 ms`** using **Matugen + Wallust + Pywal** syntax and 7 pipe filters (`lighten`, `darken`, `saturate`, `alpha`, `blend`, `invert`, `complementary`), exports `~/.cache/wal/*` for Pywalfox, and saves `~/.cache/wwal/current_wallpaper.png` (`<= 1280x720`) for `hyprlock` / `swaylock` even when your wallpaper is a video, shader, or Workshop scene.
+- **Solar & Time-of-Day Dynamic Wallpapers**: Built-in astronomical NOAA solar elevation calculator (`[solar]`, `[[schedule]]`, `--auto-day-night`) transitions wallpapers and switches dark/light theme polarity automatically across dawn, day, dusk, and night.
+- **Smart Pause & Battery Saver**: Drops to **`0.00%` CPU and GPU** when a screen is covered by a fullscreen or maximized window, when your workspace is fully tiled, when your screen is idle, or when your laptop runs on battery.
+- **Smart Sound & Workshop Layers**: Plays video and Steam Workshop `"sound"` multi-track ambient audio layers, renders Workshop `"text"` clock/label layers, and automatically ducks volume whenever another app (Firefox, Spotify, or a game) plays audio.
+- **Built-In Picker & Drop-In `swww` / `awww` / `wpaperd` Compatibility**: Includes `wwal pick` (`rofi`, `fuzzel`, `walker`, `dmenu`, `json`) with `< 1 ms` warm thumbnail cache, `wwal workshop sync-previews` for GUI pickers like `waypaper`, full `swww`/`awww` v0.12.1 CLI + `SWWW_*`/`AWWW_*` env var + `~/.cache/{swww,awww}/` compatibility, and `wpaperd` config compatibility (`[default]`/`[any]`, `"30m"` intervals, `--sort`).
 
 ---
 
 ## Speed & Resource Use
 
-WayWal is written in C and runs on your graphics card:
+WayWal is written in C23 and runs directly on your graphics card:
 
-- **Still pictures**: `0%` CPU and `0%` GPU once the picture is on screen.
-- **4K video loops**: Uses hardware video decoding (`~0.3%` CPU).
-- **When covered by a window**: Drops to **`0.00%` CPU and GPU**.
-- **Color theme update**: Under **`0.4 ms`** (no lag when changing backgrounds).
-- **Transitions**: Over **2,400 FPS** at 4K on GPU (and **1,500+ FPS** on CPU).
+- **Binary footprint**: **`1.34 MB`** daemon (`wwald`) + **`0.32 MB`** client (`wwal`) stripped (`0` heavy optional `DT_NEEDED` libraries).
+- **Still pictures**: `0.00%` CPU and `0.00%` GPU once the picture is on screen.
+- **4K video loops**: Hardware VA-API video decoding (`~0.3%` CPU).
+- **When covered by a window**: Drops to strictly **`0.00%` CPU and GPU** (`0 wakeups/sec`).
+- **Dual-mode (`dark`+`light`) HCT palette + 7-filter template render**: **`0.49 ms`** end-to-end (`0.44 ms` extraction + `0.05 ms` template render).
+- **Unified picker (`wwal pick --menu json`)**: **`0.93 ms`** warm cache (`61.2 ms` cold thumbnail generation).
+- **Lockscreen PNG frame export (`1280×720`)**: **`13.0 ms`** native (`29.4 ms` with 4K box-filter downscale).
+- **Transitions**: **1,668 – 2,734 FPS** at 4K (`3840×2160`) on GPU (and **1,176 – 24,377 FPS** at 720p on AVX2 CPU).
 
 Want the deep technical details? Read [**Technical Architecture & Full CLI Reference**](docs/ARCHITECTURE.md).
 
@@ -93,57 +96,72 @@ meson install -C build
 
 ## Popular Commands
 
-Start the background service once (or add `wwald &` to your desktop startup file):
+Start the background service once (or add `wwald &` / `swww-daemon &` to your desktop startup file):
 ```bash
 wwald &
 ```
 
-### 1. Set a Picture
+### 1. Set Any Wallpaper & Extract Colors
 ```bash
 # Set a wallpaper with a ripple effect starting at your mouse cursor
 wwal img ~/Pictures/Wallpapers/mountain.jpg --transition-type ripple --transition-pos cursor
 
-# Set a wallpaper and update your desktop colors (stays in dark mode by default)
-wwal img ~/Pictures/Wallpapers/city.png --theme
+# Keep portrait subjects framed at the top and pick the secondary accent seed (0..3)
+wwal img ~/Pictures/Wallpapers/portrait.png --crop-gravity top --theme --source-color-index 1
 
-# Stretch one wide picture across all screens
-wwal img ~/Pictures/Wallpapers/ultrawide.jpg --scaling-mode span
+# Universal auto-dispatch: pass a video, shader, Workshop ID, GNOME .xml, or directory to `wwal img`
+wwal img 2841902341
 ```
 
-### 2. Play a Video or GIF
+### 2. Built-In Icon-Grid Wallpaper Picker
 ```bash
-# Play a looping video wallpaper
+# Open Rofi / Fuzzel / Walker with cached thumbnails for images, videos, shaders & Workshop items
+wwal pick
+
+# Output structured JSON metadata + thumbnail paths for Quickshell / Eww / AGS widgets
+wwal pick --menu json
+```
+
+### 3. Play a Video or GIF
+```bash
+# Play a looping 4K video wallpaper
 wwal video ~/Videos/rain.mp4
 
-# Play a video at 40% volume, and mute it when other apps play sound
+# Play a video at 40% volume, and auto-duck it when other apps play sound
 wwal video ~/Videos/scenic.mp4 --volume 0.4 --mute-on-audio
 ```
 
-### 3. Use Steam Wallpaper Engine
-If you own Wallpaper Engine on Steam, `wwal` finds your Workshop wallpapers on its own:
+### 4. Use Steam Wallpaper Engine
+If you own Wallpaper Engine on Steam, `wwal` discovers and renders your Workshop wallpapers natively:
 ```bash
 # List your installed Steam Workshop wallpapers
 wwal workshop list
 
 # Apply a Workshop wallpaper by its ID or folder path
 wwal workshop apply 2841902341
+
+# Export human-readable preview symlinks (~/.cache/wwal/workshop-previews/) for Waypaper / Azote
+wwal workshop sync-previews
 ```
 
-### 4. Live Shaders & Slideshows
+### 5. Built-In Shader Presets & Mixed-Media Slideshows
 ```bash
-# Run a live shader that reacts to your music
-wwal shader contrib/shaders/audio_spectrum.frag --audio
+# List all 10 built-in procedural shaders and launch one with PipeWire audio reactivity
+wwal shader list
+wwal shader preset audio_bars --audio
 
-# Start a slideshow that picks a new picture every 10 minutes (600 seconds)
-wwal slideshow ~/Pictures/Wallpapers --interval 600
+# Start a mixed-media slideshow with human-readable intervals and jump forward/backward
+wwal slideshow ~/Pictures/Wallpapers --interval 30m --sort mtime
+wwal next
+wwal prev
 ```
 
-### 5. Useful Controls
+### 6. Useful Controls
 ```bash
 wwal restore       # Restore your last wallpaper on login
-wwal pause         # Pause active video or animation
+wwal pause         # Pause active video, shader, or Workshop animation
 wwal toggle        # Toggle pause and play
-wwal clear 1e1e2e  # Set a solid color background
+wwal clear 1e1e2e  # Set a zero-RAM solid color background
 wwal status        # Show current wallpaper, screen info, and active colors
 ```
 
@@ -151,32 +169,50 @@ wwal status        # Show current wallpaper, screen info, and active colors
 
 ## Config File (Optional)
 
-WayWal works right out of the box with no setup. If you want to save default settings, copy [`contrib/config.toml.example`](contrib/config.toml.example) to `~/.config/wwal/config.toml`:
+WayWal works right out of the box with no setup. If you want to save default settings, templates, or solar schedules, copy [`contrib/config.toml.example`](contrib/config.toml.example) to `~/.config/wwal/config.toml`:
 
 ```toml
 [daemon]
 battery_policy = "reduce-fps"     # "ignore", "reduce-fps", or "pause-video"
-auto_pause_fullscreen = true      # Pause when a window is fullscreen
-auto_pause_maximized = false      # Pause when a window is maximized
+auto_pause_fullscreen = true      # Pause when a window is fullscreen (0.00% CPU/GPU)
 idle_timeout_sec = 300            # Pause after 5 minutes of no input
+crop_gravity = "center"           # "center", "top", "bottom", "left", "right", "tl", "tr", "bl", "br"
 mute_on_audio = true              # Mute wallpaper when another app plays sound
 
 [theme]
 enabled = true                    # Update desktop colors when wallpaper changes
-mode = "dark"                     # Keep dark mode ("dark" or "light")
+mode = "dark"                     # Default theme polarity ("dark", "light", or "auto")
+auto_day_night = true             # Auto-switch dark/light based on [solar] / time of day
+source_color_index = 0            # 0..3 ranked K-Means++ seed cluster selection
 caelestia_sync = true             # Sync colors with Caelestia / Quickshell
+pywal_compat = true               # Write ~/.cache/wal/* for Pywalfox & Pywal tools
+
+[template."kitty"]
+input_path = "~/.config/wwal/templates/kitty.conf"
+output_path = "~/.config/kitty/colors-wwal.conf"
+post_hook = "killall -SIGUSR1 kitty || true"
+
+[solar]
+latitude = 37.7749
+longitude = -122.4194
+auto_theme_mode = true
 
 [transition]
 type = "grow"
-duration = 1.0
-fps = 120
+duration = 0.8
+fps = 144
+
+[default]
+path = "~/Pictures/Wallpapers"
+duration = "30m"
+sort = "mtime"
 ```
 
 ---
 
 ## More Docs
 
-- [**Technical Architecture & Full CLI Reference**](docs/ARCHITECTURE.md) — Wayland protocols, GPU shaders, video decoding, Workshop runtime, and all CLI flags.
+- [**Technical Architecture & Full CLI Reference**](docs/ARCHITECTURE.md) — Wayland protocols, GPU shaders, video decoding, Workshop runtime, template syntax, and all CLI flags.
 - [**Example Config**](contrib/config.toml.example) — Every `config.toml` option explained.
 - [**Support & Troubleshooting**](SUPPORT.md) — Fixes for common setup questions.
 - [**Contributing**](CONTRIBUTING.md) — How to build, test, and send changes.

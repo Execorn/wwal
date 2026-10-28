@@ -47,6 +47,8 @@
               libjxl
               librsvg
               pipewire
+              dbus
+              lz4
             ];
 
             mesonFlags = [
@@ -55,6 +57,7 @@
               "-Denable_simd=true"
               "-Denable_seccomp=true"
               "-Denable_systemd=true"
+              "-Dswww_compat=false"
             ];
 
             meta = with pkgs.lib; {
@@ -123,17 +126,36 @@
                     battery_policy = "reduce-fps";
                     restore_on_start = true;
                     idle_timeout_sec = 300;
+                    crop_gravity = "center";
                   };
                   theme = {
                     enabled = true;
+                    mode = "dark";
+                    auto_day_night = true;
+                    source_color_index = 0;
                     caelestia_sync = true;
                     tty_sequences = true;
+                    pywal_compat = true;
                   };
                   transition = {
-                    type = "fade";
+                    type = "grow";
                     duration = 0.8;
                     fps = 144;
+                    pos = "cursor";
+                    crop_gravity = "center";
                     bezier = [ 0.25 0.1 0.25 1.0 ];
+                  };
+                  solar = {
+                    latitude = 37.7749;
+                    longitude = -122.4194;
+                    auto_theme_mode = true;
+                  };
+                  template = {
+                    kitty = {
+                      input_path = "~/.config/wwal/templates/kitty.conf";
+                      output_path = "~/.config/kitty/colors-wwal.conf";
+                      post_hook = "killall -SIGUSR1 kitty || true";
+                    };
                   };
                 }
               '';

@@ -49,6 +49,17 @@ typedef enum {
     WAYWAL_SCALING_SPAN = 5,    /* Panoramic span across all monitors */
 } waywal_scaling_mode_t;
 
+#ifndef WAYWAL_SORT_MODE_DEFINED
+#define WAYWAL_SORT_MODE_DEFINED
+typedef enum {
+    WAYWAL_SORT_RANDOM = 0,
+    WAYWAL_SORT_ASCENDING = 1,
+    WAYWAL_SORT_DESCENDING = 2,
+    WAYWAL_SORT_MTIME = 3,
+} waywal_sort_mode_t;
+typedef waywal_sort_mode_t waywal_slideshow_sort_t;
+#endif
+
 #ifndef WAYWAL_TRANSITION_TYPE_DEFINED
 #define WAYWAL_TRANSITION_TYPE_DEFINED
 typedef enum {

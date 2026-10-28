@@ -801,8 +801,41 @@ static void test_scene_graph_and_cli(void)
     assert(strcmp(copts.workshop_props, "speed=2.0;bloom=true") == 0);
     assert(copts.audio_reactive);
 
+    /* Test universal wwal img auto-dispatch on Workshop dir, project.json, preview.jpg & symlink */
+    char prev_path[4200];
+    snprintf(prev_path, sizeof(prev_path), "%s/preview.jpg", item_dir);
+    fp = fopen(prev_path, "wb");
+    assert(fp != NULL);
+    fwrite("FAKEJPG", 1, 7, fp);
+    fclose(fp);
+
+    char sym_path[4200];
+    snprintf(sym_path, sizeof(sym_path), "%s/symlink_to_preview.jpg", tmp_root);
+    unlink(sym_path);
+    assert(symlink(prev_path, sym_path) == 0);
+
+    char *argv_img_prev[] = {"wwal", "img", prev_path, NULL};
+    assert(cli_parse(3, argv_img_prev, &copts));
+    cli_auto_dispatch_img(&copts);
+    assert(copts.cmd == CLI_CMD_WORKSHOP && copts.workshop_subcmd == WAYWAL_WORKSHOP_APPLY);
+    assert(strcmp(copts.filepath, item_dir) == 0);
+
+    char *argv_img_sym[] = {"wwal", "img", sym_path, NULL};
+    assert(cli_parse(3, argv_img_sym, &copts));
+    cli_auto_dispatch_img(&copts);
+    assert(copts.cmd == CLI_CMD_WORKSHOP && copts.workshop_subcmd == WAYWAL_WORKSHOP_APPLY);
+    assert(strcmp(copts.filepath, item_dir) == 0);
+
+    char *argv_img_dir[] = {"wwal", "img", item_dir, NULL};
+    assert(cli_parse(3, argv_img_dir, &copts));
+    cli_auto_dispatch_img(&copts);
+    assert(copts.cmd == CLI_CMD_WORKSHOP && copts.workshop_subcmd == WAYWAL_WORKSHOP_APPLY);
+    assert(strcmp(copts.filepath, item_dir) == 0);
+
     /* Cleanup temporary files */
     unsetenv("WWAL_CONFIG_PATH");
+    unlink(sym_path);
+    unlink(prev_path);
     unlink(cfg_path);
     unlink(pkg_path);
     unlink(proj_path);
@@ -3031,6 +3064,760 @@ static void test_shared_we_json_dom(void)
     we_jval_free(root);
 }
 
+static void test_workshop_preview_bridge(void)
+{
+    printf("  [TEST] Testing Workshop preview bridge (sanitize_title, sync_previews, custom "
+           "preview auto-dispatch)...\n");
+
+    char san[128];
+    we_workshop_sanitize_title("Cyberpunk: 2077 / Night*City?", san, sizeof(san));
+    assert(strcmp(san, "Cyberpunk 2077 Night City") == 0);
+
+    we_workshop_sanitize_title("初音ミク / Киберпанк", san, sizeof(san));
+    assert(strcmp(san, "初音ミク Киберпанк") == 0);
+
+    we_workshop_sanitize_title("...   ", san, sizeof(san));
+    assert(strcmp(san, "Untitled") == 0);
+
+    char tmp_ws[] = "/tmp/wwal_test_ws_sync_XXXXXX";
+    assert(mkdtemp(tmp_ws) != NULL);
+
+    char item1[4096], item2[4096], sync_dir[4096];
+    snprintf(item1, sizeof(item1), "%s/111222333", tmp_ws);
+    snprintf(item2, sizeof(item2), "%s/444555666", tmp_ws);
+    snprintf(sync_dir, sizeof(sync_dir), "%s/previews_out", tmp_ws);
+    assert(mkdir(item1, 0755) == 0);
+    assert(mkdir(item2, 0755) == 0);
+    assert(mkdir(sync_dir, 0755) == 0);
+
+    char p1_json[4200], p1_prev[4200];
+    snprintf(p1_json, sizeof(p1_json), "%s/project.json", item1);
+    snprintf(p1_prev, sizeof(p1_prev), "%s/preview.jpg", item1);
+    FILE *fp = fopen(p1_json, "wb");
+    assert(fp != NULL);
+    fputs("{\"title\":\"Neon/City: Rain\",\"type\":\"scene\",\"file\":\"scene.json\","
+          "\"preview\":\"preview.jpg\"}\n",
+          fp);
+    fclose(fp);
+    fp = fopen(p1_prev, "wb");
+    assert(fp != NULL);
+    fputs("JPG1", fp);
+    fclose(fp);
+
+    /* Item 2 uses a non-standard preview filename ("my_custom_thumb.png") */
+    char p2_json[4200], p2_prev[4200];
+    snprintf(p2_json, sizeof(p2_json), "%s/project.json", item2);
+    snprintf(p2_prev, sizeof(p2_prev), "%s/my_custom_thumb.png", item2);
+    fp = fopen(p2_json, "wb");
+    assert(fp != NULL);
+    fputs("{\"title\":\"Custom Thumb Scene\",\"type\":\"video\",\"file\":\"video.mp4\","
+          "\"preview\":\"my_custom_thumb.png\"}\n",
+          fp);
+    fclose(fp);
+    fp = fopen(p2_prev, "wb");
+    assert(fp != NULL);
+    fputs("PNG2", fp);
+    fclose(fp);
+
+    /* Create a dangling symlink (must be pruned) and a regular file (must be preserved) */
+    char dangling_sym[4200], regular_file[4200];
+    snprintf(dangling_sym, sizeof(dangling_sym), "%s/Stale [000].jpg", sync_dir);
+    snprintf(regular_file, sizeof(regular_file), "%s/user_wallpaper.png", sync_dir);
+    assert(symlink("/tmp/nonexistent_wwal_workshop_target_xyz.jpg", dangling_sym) == 0);
+    fp = fopen(regular_file, "wb");
+    assert(fp != NULL);
+    fputs("KEEP", fp);
+    fclose(fp);
+
+    setenv("WWAL_WORKSHOP_DIR", tmp_ws, 1);
+    char old_home[512] = {0}, old_xcfg[512] = {0};
+    const char *eh = getenv("HOME");
+    const char *exc = getenv("XDG_CONFIG_HOME");
+    if (eh)
+        snprintf(old_home, sizeof(old_home), "%s", eh);
+    if (exc)
+        snprintf(old_xcfg, sizeof(old_xcfg), "%s", exc);
+    setenv("HOME", tmp_ws, 1);
+    setenv("XDG_CONFIG_HOME", tmp_ws, 1);
+
+    size_t synced = 0, pruned = 0;
+    assert(we_workshop_sync_previews(sync_dir, &synced, &pruned));
+    assert(synced == 2);
+    assert(pruned == 1);
+
+    struct stat st;
+    assert(lstat(dangling_sym, &st) != 0);
+    assert(stat(regular_file, &st) == 0 && S_ISREG(st.st_mode));
+
+    char link1[4200], link2[4200];
+    snprintf(link1, sizeof(link1), "%s/Neon City Rain [111222333].jpg", sync_dir);
+    snprintf(link2, sizeof(link2), "%s/Custom Thumb Scene [444555666].png", sync_dir);
+    assert(lstat(link1, &st) == 0 && S_ISLNK(st.st_mode));
+    assert(lstat(link2, &st) == 0 && S_ISLNK(st.st_mode));
+
+    /* Verify cli_auto_dispatch_img routes both synced symlinks to CLI_CMD_WORKSHOP */
+    cli_options_t copts;
+    char *argv_l1[] = {"wwal", "img", link1, NULL};
+    assert(cli_parse(3, argv_l1, &copts));
+    cli_auto_dispatch_img(&copts);
+    assert(copts.cmd == CLI_CMD_WORKSHOP && copts.workshop_subcmd == WAYWAL_WORKSHOP_APPLY);
+    assert(strcmp(copts.filepath, item1) == 0);
+
+    char *argv_l2[] = {"wwal", "img", link2, NULL};
+    assert(cli_parse(3, argv_l2, &copts));
+    cli_auto_dispatch_img(&copts);
+    assert(copts.cmd == CLI_CMD_WORKSHOP && copts.workshop_subcmd == WAYWAL_WORKSHOP_APPLY);
+    assert(strcmp(copts.filepath, item2) == 0);
+
+    /* Verify RFC 3629 UTF-8 validation in we_workshop_sanitize_title (reject overlong, surrogate,
+     * out-of-range, and filter C1 controls) */
+    we_workshop_sanitize_title("Valid\xC0\xAF"
+                               "Overlong\xED\xA0\x80"
+                               "Surrogate\xF4\x90\x80\x80"
+                               "Out\xC2\x85"
+                               "C1",
+                               san, sizeof(san));
+    assert(strcmp(san, "ValidOverlongSurrogateOut C1") == 0);
+
+    /* Verify we_workshop_find_preview_file rejects non-image metadata ("project.json"), 0-byte
+     * files, and symlinks escaping ws_dir */
+    fp = fopen(p1_json, "wb");
+    assert(fp != NULL);
+    fputs("{\"title\":\"Bad Preview Field\",\"type\":\"scene\",\"file\":\"scene.json\","
+          "\"preview\":\"project.json\"}\n",
+          fp);
+    fclose(fp);
+    char resolved_prev[4200] = {0};
+    assert(we_workshop_find_preview_file(item1, resolved_prev, sizeof(resolved_prev)));
+    assert(strcmp(resolved_prev, p1_prev) == 0);
+
+    /* Symlink escape inside item1 must be rejected */
+    char escape_sym[4200];
+    snprintf(escape_sym, sizeof(escape_sym), "%s/escape_prev.png", item1);
+    assert(symlink(regular_file, escape_sym) == 0);
+    fp = fopen(p1_json, "wb");
+    assert(fp != NULL);
+    fputs("{\"title\":\"Escape Preview\",\"type\":\"scene\",\"file\":\"scene.json\","
+          "\"preview\":\"escape_prev.png\"}\n",
+          fp);
+    fclose(fp);
+    assert(we_workshop_find_preview_file(item1, resolved_prev, sizeof(resolved_prev)));
+    assert(strcmp(resolved_prev, p1_prev) == 0);
+    unlink(escape_sym);
+
+    /* 0-byte preview file must be skipped */
+    char zero_prev[4200];
+    snprintf(zero_prev, sizeof(zero_prev), "%s/zero.png", item1);
+    fp = fopen(zero_prev, "wb");
+    assert(fp != NULL);
+    fclose(fp);
+    fp = fopen(p1_json, "wb");
+    assert(fp != NULL);
+    fputs("{\"title\":\"Zero Preview\",\"type\":\"scene\",\"file\":\"scene.json\","
+          "\"preview\":\"zero.png\"}\n",
+          fp);
+    fclose(fp);
+    assert(we_workshop_find_preview_file(item1, resolved_prev, sizeof(resolved_prev)));
+    assert(strcmp(resolved_prev, p1_prev) == 0);
+    unlink(zero_prev);
+
+    /* Multi-level nested asset path inside a Workshop directory resolves up to root */
+    char sub1[4200], sub2[4200], nested_asset[4200], resolved_ws[4096];
+    snprintf(sub1, sizeof(sub1), "%s/materials", item1);
+    snprintf(sub2, sizeof(sub2), "%s/materials/sub", item1);
+    snprintf(nested_asset, sizeof(nested_asset), "%s/materials/sub/layer.png", item1);
+    mkdir(sub1, 0755);
+    mkdir(sub2, 0755);
+    fp = fopen(nested_asset, "wb");
+    assert(fp != NULL);
+    fputs("PNG", fp);
+    fclose(fp);
+    assert(we_workshop_resolve_dir(nested_asset, resolved_ws, sizeof(resolved_ws)));
+    assert(strcmp(resolved_ws, item1) == 0);
+    unlink(nested_asset);
+    rmdir(sub2);
+    rmdir(sub1);
+
+    /* Default we_workshop_sync_previews(NULL, ...) creates both workshop-previews and workshop
+     * alias */
+    char old_wcache[512] = {0};
+    const char *ewc = getenv("WWAL_CACHE_DIR");
+    if (ewc)
+        snprintf(old_wcache, sizeof(old_wcache), "%s", ewc);
+    setenv("WWAL_CACHE_DIR", tmp_ws, 1);
+    size_t def_synced = 0, def_pruned = 0;
+    assert(we_workshop_sync_previews(NULL, &def_synced, &def_pruned));
+    assert(def_synced == 2);
+    char def_alias[4200], def_prev_dir[4200];
+    snprintf(def_alias, sizeof(def_alias), "%s/workshop", tmp_ws);
+    snprintf(def_prev_dir, sizeof(def_prev_dir), "%s/workshop-previews", tmp_ws);
+    assert(lstat(def_alias, &st) == 0 && S_ISLNK(st.st_mode));
+    assert(stat(def_prev_dir, &st) == 0 && S_ISDIR(st.st_mode));
+    if (old_wcache[0])
+        setenv("WWAL_CACHE_DIR", old_wcache, 1);
+    else
+        unsetenv("WWAL_CACHE_DIR");
+
+    /* 0-object scene with valid preview image synthesizes a 1-object fullscreen quad */
+    {
+        char item3[4096], p3_json[4200], p3_scn[4200], p3_prev[4200];
+        snprintf(item3, sizeof(item3), "%s/999000111", tmp_ws);
+        assert(mkdir(item3, 0755) == 0);
+        snprintf(p3_json, sizeof(p3_json), "%s/project.json", item3);
+        snprintf(p3_scn, sizeof(p3_scn), "%s/scene.json", item3);
+        snprintf(p3_prev, sizeof(p3_prev), "%s/preview.png", item3);
+        fp = fopen(p3_json, "wb");
+        assert(fp != NULL);
+        fputs("{\"title\":\"Empty Objects Scene\",\"type\":\"scene\",\"file\":\"scene.json\","
+              "\"preview\":\"preview.png\"}\n",
+              fp);
+        fclose(fp);
+        fp = fopen(p3_scn, "wb");
+        assert(fp != NULL);
+        fputs("{\"general\":{\"orthogonalprojection\":{\"width\":64,\"height\":64}},"
+              "\"objects\":[]}\n",
+              fp);
+        fclose(fp);
+        uint8_t prev_bgra[8 * 8 * 4];
+        for (size_t i = 0; i < 8 * 8; ++i) {
+            prev_bgra[i * 4 + 0] = 200;
+            prev_bgra[i * 4 + 1] = 100;
+            prev_bgra[i * 4 + 2] = 50;
+            prev_bgra[i * 4 + 3] = 255;
+        }
+        assert(image_save_png_bgra(p3_prev, prev_bgra, 8, 8));
+        we_scene_t *fb_scn = we_scene_load_cpu(item3, NULL);
+        assert(fb_scn != NULL);
+        assert(fb_scn->object_count == 1);
+        uint8_t out_rgba[8 * 8 * 4] = {0};
+        waywal_shader_frame_params_t fp_zero = {0};
+        assert(we_scene_render_rgba8(fb_scn, 8, 8, &fp_zero, out_rgba));
+        assert(out_rgba[0] == 50 && out_rgba[1] == 100 && out_rgba[2] == 200 && out_rgba[3] == 255);
+        we_scene_destroy(fb_scn);
+    }
+
+    if (old_home[0])
+        setenv("HOME", old_home, 1);
+    if (old_xcfg[0])
+        setenv("XDG_CONFIG_HOME", old_xcfg, 1);
+    else
+        unsetenv("XDG_CONFIG_HOME");
+    unsetenv("WWAL_WORKSHOP_DIR");
+
+    unlink(link1);
+    unlink(link2);
+    unlink(regular_file);
+    unlink(p1_prev);
+    unlink(p1_json);
+    unlink(p2_prev);
+    unlink(p2_json);
+    rmdir(sync_dir);
+    rmdir(item1);
+    rmdir(item2);
+    char rm_cmd[4200];
+    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", tmp_ws);
+    (void)system(rm_cmd);
+}
+
+static void build_synthetic_wav_pcm16(byte_buf_t *bb, uint32_t sample_rate, uint16_t channels,
+                                      uint32_t frame_count, float freq_hz, float amp)
+{
+    bb_init(bb);
+    uint32_t data_bytes = frame_count * (uint32_t)channels * 2u;
+    uint32_t riff_size = 36u + data_bytes;
+    uint32_t byte_rate = sample_rate * (uint32_t)channels * 2u;
+    uint16_t block_align = (uint16_t)(channels * 2u);
+
+    bb_append(bb, "RIFF", 4);
+    bb_u32(bb, riff_size);
+    bb_append(bb, "WAVE", 4);
+    bb_append(bb, "fmt ", 4);
+    bb_u32(bb, 16u);
+    bb_append(bb, "\x01\x00", 2); /* PCM = 1 */
+    bb_append(bb, &channels, 2);
+    bb_u32(bb, sample_rate);
+    bb_u32(bb, byte_rate);
+    bb_append(bb, &block_align, 2);
+    bb_append(bb, "\x10\x00", 2); /* 16 bits per sample */
+    bb_append(bb, "data", 4);
+    bb_u32(bb, data_bytes);
+
+    for (uint32_t f = 0; f < frame_count; ++f) {
+        float s = sinf(2.0f * 3.14159265f * freq_hz * ((float)f / (float)sample_rate)) * amp;
+        int16_t pcm = (int16_t)lrintf(fminf(fmaxf(s, -1.0f), 1.0f) * 32767.0f);
+        for (uint16_t c = 0; c < channels; ++c) {
+            bb_append(bb, &pcm, 2);
+        }
+    }
+}
+
+static void test_sound_and_text_layers_and_scenescript_stdlib(void)
+{
+    printf("  [TEST] Testing WAV decoder, 'sound' objects, 'text' layers, Date, template literals "
+           "& String methods...\n");
+
+    /* 1. In-memory WAV decoding (16-bit 48kHz stereo, 8-bit 24kHz mono resampled, 32-bit float,
+     * and malformed edge cases) */
+    {
+        float *pcm = NULL;
+        size_t frames = 0;
+        assert(!we_audio_decode_wav_memory(NULL, 0, &pcm, &frames));
+        assert(!we_audio_decode_wav_memory((const uint8_t *)"RIFF1234WAVE", 12, &pcm, &frames));
+
+        /* Malformed WAV with sample_rate = 1 or sample_rate = 1000000 must be rejected by both
+         * native WAV decoder and FFmpeg fallback */
+        byte_buf_t bad_wav_sr1, bad_wav_sr1m;
+        build_synthetic_wav_pcm16(&bad_wav_sr1, 1u, 2u, 64u, 440.0f, 0.5f);
+        assert(!we_audio_decode_wav_memory(bad_wav_sr1.data, bad_wav_sr1.len, &pcm, &frames));
+        assert(!we_audio_decode_memory(bad_wav_sr1.data, bad_wav_sr1.len, &pcm, &frames));
+        bb_free(&bad_wav_sr1);
+        build_synthetic_wav_pcm16(&bad_wav_sr1m, 1000000u, 2u, 64u, 440.0f, 0.5f);
+        assert(!we_audio_decode_wav_memory(bad_wav_sr1m.data, bad_wav_sr1m.len, &pcm, &frames));
+        assert(!we_audio_decode_memory(bad_wav_sr1m.data, bad_wav_sr1m.len, &pcm, &frames));
+        bb_free(&bad_wav_sr1m);
+
+        byte_buf_t wav16;
+        build_synthetic_wav_pcm16(&wav16, 48000u, 2u, 480u, 440.0f, 0.5f);
+        assert(we_audio_decode_wav_memory(wav16.data, wav16.len, &pcm, &frames));
+        assert(pcm != NULL && frames == 480u);
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < frames * 2u; ++i) {
+            float a = fabsf(pcm[i]);
+            if (a > max_abs) {
+                max_abs = a;
+            }
+        }
+        assert(max_abs > 0.45f && max_abs < 0.55f);
+        free(pcm);
+        bb_free(&wav16);
+
+        /* 8-bit mono @ 24000 Hz -> resampled 2x to 48000 Hz stereo */
+        byte_buf_t wav8;
+        bb_init(&wav8);
+        uint32_t fcnt8 = 240u;
+        bb_append(&wav8, "RIFF", 4);
+        bb_u32(&wav8, 36u + fcnt8);
+        bb_append(&wav8, "WAVEfmt ", 8);
+        bb_u32(&wav8, 16u);
+        bb_append(&wav8, "\x01\x00\x01\x00", 4); /* PCM, 1ch */
+        bb_u32(&wav8, 24000u);
+        bb_u32(&wav8, 24000u);
+        bb_append(&wav8, "\x01\x00\x08\x00", 4); /* align=1, 8-bit */
+        bb_append(&wav8, "data", 4);
+        bb_u32(&wav8, fcnt8);
+        for (uint32_t i = 0; i < fcnt8; ++i) {
+            uint8_t s = (i < 120u) ? 255u : 64u;
+            bb_append(&wav8, &s, 1);
+        }
+        assert(we_audio_decode_wav_memory(wav8.data, wav8.len, &pcm, &frames));
+        assert(pcm != NULL && frames == 480u);
+        assert(fabsf(pcm[0] - pcm[1]) < 1e-6f);
+        assert(pcm[0] > 0.9f && pcm[479 * 2] < -0.4f);
+        free(pcm);
+        bb_free(&wav8);
+
+        /* 64-bit IEEE float stereo @ 48000 Hz with padded block_align (20 bytes instead of 16) via
+         * we_audio_decode_memory() */
+        byte_buf_t wav64;
+        bb_init(&wav64);
+        uint32_t fcnt64 = 64u;
+        uint16_t align64 = 20u; /* 2 * 8 bytes + 4 bytes padding per frame */
+        uint32_t data64 = fcnt64 * align64;
+        bb_append(&wav64, "RIFF", 4);
+        bb_u32(&wav64, 36u + data64);
+        bb_append(&wav64, "WAVEfmt ", 8);
+        bb_u32(&wav64, 16u);
+        bb_append(&wav64, "\x03\x00\x02\x00", 4); /* IEEE float (3), 2ch */
+        bb_u32(&wav64, 48000u);
+        bb_u32(&wav64, 48000u * align64);
+        bb_append(&wav64, &align64, 2);
+        bb_append(&wav64, "\x40\x00", 2); /* 64 bits per sample */
+        bb_append(&wav64, "data", 4);
+        bb_u32(&wav64, data64);
+        for (uint32_t i = 0; i < fcnt64; ++i) {
+            double l = 0.75;
+            double r = -0.25;
+            uint32_t pad = 0xdeadbeefu;
+            bb_append(&wav64, &l, 8);
+            bb_append(&wav64, &r, 8);
+            bb_append(&wav64, &pad, 4);
+        }
+        assert(we_audio_decode_memory(wav64.data, wav64.len, &pcm, &frames));
+        assert(pcm != NULL && frames == 64u);
+        assert(fabsf(pcm[0] - 0.75f) < 1e-6f && fabsf(pcm[1] - (-0.25f)) < 1e-6f);
+        assert(fabsf(pcm[126] - 0.75f) < 1e-6f && fabsf(pcm[127] - (-0.25f)) < 1e-6f);
+        free(pcm);
+        bb_free(&wav64);
+
+        /* Non-RIFF container (.au / ".snd" big-endian PCM16 @ 24000 Hz stereo) decoded in-memory
+         * via dlopen'd libavformat + AVIOContext fallback in we_audio_decode_memory() */
+        byte_buf_t au_buf;
+        bb_init(&au_buf);
+        uint32_t au_frames = 120u;
+        uint32_t au_data_bytes = au_frames * 2u * 2u;
+        uint8_t au_hdr[24] = {
+            '.',  's',  'n',  'd',  0x00, 0x00, 0x00, 0x18, /* magic + 24-byte offset */
+            0x00, 0x00, (uint8_t)((au_data_bytes >> 8) & 0xffu),
+            (uint8_t)(au_data_bytes & 0xffu),               /* data size */
+            0x00, 0x00, 0x00, 0x03,                         /* encoding = 3 (16-bit PCM BE) */
+            0x00, 0x00, 0x5d, 0xc0,                         /* sample_rate = 24000 Hz */
+            0x00, 0x00, 0x00, 0x02                          /* channels = 2 */
+        };
+        bb_append(&au_buf, au_hdr, sizeof(au_hdr));
+        for (uint32_t i = 0; i < au_frames; ++i) {
+            uint8_t sample_be[4] = {0x40, 0x00, 0xc0, 0x00}; /* +0.5 L, -0.5 R */
+            bb_append(&au_buf, sample_be, 4);
+        }
+        assert(we_audio_decode_memory(au_buf.data, au_buf.len, &pcm, &frames));
+        assert(pcm != NULL && frames == 240u); /* resampled 2x from 24kHz to 48kHz */
+        assert(pcm[0] > 0.45f && pcm[0] < 0.55f);
+        assert(pcm[1] < -0.45f && pcm[1] > -0.55f);
+        free(pcm);
+        bb_free(&au_buf);
+    }
+
+    /* 2. SceneScript Date, ES6 template literals (including nested), String/Number methods, and
+     * text/audio layer bindings */
+    {
+        const char *script_src =
+            "export function update(value) {\n"
+            "  let d = new Date(1700000000000);\n"
+            "  let yr = d.getFullYear();\n"
+            "  let h = String(d.getHours()).padStart(2, '0');\n"
+            "  let m = (d.getMinutes()).toString().padStart(2, '0');\n"
+            "  let s = `${h}:${m} (${yr})`.replace('(', '[').replace(')', ']');\n"
+            "  let sub = '  Hello World  '.trim().toUpperCase().slice(0, 5);\n"
+            "  let numStr = (3.14159).toFixed(2);\n"
+            "  let parts = 'a,b,c'.split(',');\n"
+            "  let nested = `outer(${`inner(${1 + 2})`})`;\n"
+            "  thisLayer.pointsize = 40;\n"
+            "  thisLayer.volume = 1.5;\n"
+            "  thisLayer.horizontalalign = 'right';\n"
+            "  thisLayer.verticalalign = 'bottom';\n"
+            "  if (!thisLayer.isPlaying()) { thisLayer.play(); }\n"
+            "  thisLayer.text = `${s} ${sub} ${numStr} ${parts[1]} ${nested}`;\n"
+            "  return value;\n"
+            "}\n";
+        we_script_t *vm = we_script_create(script_src, strlen(script_src), NULL);
+        assert(vm != NULL);
+
+        we_script_env_t env;
+        memset(&env, 0, sizeof(env));
+        env.frametime = 1.0f / 60.0f;
+        env.runtime = 1.0f;
+
+        we_script_layer_state_t ls;
+        memset(&ls, 0, sizeof(ls));
+        snprintf(ls.text, sizeof(ls.text), "init");
+        snprintf(ls.halign, sizeof(ls.halign), "center");
+        snprintf(ls.valign, sizeof(ls.valign), "center");
+        ls.pointsize = 24;
+        ls.volume = 1.0f;
+        ls.audio_playing = false;
+
+        assert(we_script_eval_update(vm, &env, &ls, NULL, 0, NULL));
+        assert((ls.dirty_mask & WE_LAYER_DIRTY_TEXT) != 0);
+        assert((ls.dirty_mask & WE_LAYER_DIRTY_POINTSIZE) != 0 && ls.pointsize == 40);
+        assert((ls.dirty_mask & WE_LAYER_DIRTY_VOLUME) != 0 && fabsf(ls.volume - 1.5f) < 1e-5f);
+        assert((ls.dirty_mask & WE_LAYER_DIRTY_HALIGN) != 0 && strcmp(ls.halign, "right") == 0);
+        assert((ls.dirty_mask & WE_LAYER_DIRTY_VALIGN) != 0 && strcmp(ls.valign, "bottom") == 0);
+        assert((ls.dirty_mask & WE_LAYER_DIRTY_AUDIO_CMD) != 0 && ls.audio_cmd == 1 &&
+               ls.audio_playing);
+        assert(strstr(ls.text, "[2023] HELLO 3.14 b outer(inner(3))") != NULL);
+
+        we_script_destroy(vm);
+    }
+
+    /* 2b. Adversarial edge cases:
+     *  - 600-char string .padStart(700, "0") and .padEnd(700, "0") (no size_t underflow)
+     *  - new Date(NaN), new Date(1e30), new Date(-2147483648, 0, 1) (no UB / overflow)
+     *  - Deeply nested template literals (64 levels, capped cleanly at depth 32)
+     *  - Unpaired JSON UTF-16 surrogates (\uD800, \uDC00, \uD800\u0041) replaced with U+FFFD */
+    {
+        char long_s[601];
+        memset(long_s, 'A', 600);
+        long_s[600] = '\0';
+
+        char adv_src[2048];
+        snprintf(adv_src, sizeof(adv_src),
+                 "export function update(value) {\n"
+                 "  let s600 = '%s';\n"
+                 "  let ps = s600.padStart(700, '0');\n"
+                 "  let pe = s600.padEnd(700, '0');\n"
+                 "  let sb = 'hello'.substr(2, 2147483647);\n"
+                 "  let d_nan = new Date(NaN);\n"
+                 "  let d_huge = new Date(1e30);\n"
+                 "  let d_min = new Date(-2147483648, 0, 1);\n"
+                 "  let d_str = Date();\n"
+                 "  let check = `${d_nan} ${d_huge.toDateString()} ${d_min.getFullYear()} ${d_str}`;\n"
+                 "  thisLayer.text = `${ps.length}:${pe.length}:${sb}:${d_nan.getHours() >= 0}:${check.length > 0}`;\n"
+                 "  return value;\n"
+                 "}\n",
+                 long_s);
+
+        we_script_t *avm = we_script_create(adv_src, strlen(adv_src), NULL);
+        assert(avm != NULL);
+        we_script_env_t env = {.frametime = 1.0f / 60.0f, .runtime = 1.0f};
+        we_script_layer_state_t ls;
+        memset(&ls, 0, sizeof(ls));
+        assert(we_script_eval_update(avm, &env, &ls, NULL, 0, NULL));
+        assert(strcmp(ls.text, "600:600:llo:true:true") == 0);
+        we_script_destroy(avm);
+
+        /* Deeply nested template literals (64 levels of `${`...`}`) must not overflow stack */
+        char deep_tpl[1024];
+        size_t pos = 0;
+        const char *t_pre = "export function update(v) { let x = ";
+        memcpy(deep_tpl + pos, t_pre, strlen(t_pre));
+        pos += strlen(t_pre);
+        for (int i = 0; i < 64; ++i) {
+            memcpy(deep_tpl + pos, "`${", 3);
+            pos += 3;
+        }
+        deep_tpl[pos++] = '1';
+        for (int i = 0; i < 64; ++i) {
+            memcpy(deep_tpl + pos, "}`", 2);
+            pos += 2;
+        }
+        const char *t_suf = "; return v; }\n";
+        memcpy(deep_tpl + pos, t_suf, strlen(t_suf));
+        pos += strlen(t_suf);
+        deep_tpl[pos] = '\0';
+
+        we_script_t *dtvm = we_script_create(deep_tpl, pos, NULL);
+        if (dtvm) {
+            float iv = 1.0f, ov = 0.0f;
+            (void)we_script_eval_update(dtvm, &env, &ls, &iv, 1u, &ov);
+            we_script_destroy(dtvm);
+        }
+
+        /* Unpaired UTF-16 surrogates in JSON replaced with U+FFFD (\xEF\xBF\xBD) */
+        const char *surr_json =
+            "{\"hi\":\"\\uD800\",\"lo\":\"\\uDC00\",\"hi_ascii\":\"\\uD800A\"}";
+        we_jval_t *sroot = we_json_parse_root(surr_json, strlen(surr_json));
+        assert(sroot != NULL);
+        assert(strcmp(we_jval_str(we_jobj_get(sroot, "hi"), ""), "\xef\xbf\xbd") == 0);
+        assert(strcmp(we_jval_str(we_jobj_get(sroot, "lo"), ""), "\xef\xbf\xbd") == 0);
+        assert(strcmp(we_jval_str(we_jobj_get(sroot, "hi_ascii"), ""), "\xef\xbf\xbd" "A") == 0);
+        we_jval_free(sroot);
+    }
+
+    /* 3. End-to-end Workshop Scene with "sound" layers (loop/once/random + pause/resume vs stop +
+     * ducking) and "text" layer (UTF-8 \uXXXX degree symbol, padding, opaque background + dynamic
+     * script update) */
+    {
+        char tmp_dir[] = "/tmp/wwal_test_sound_text_scene_XXXXXX";
+        assert(mkdtemp(tmp_dir) != NULL);
+
+        const char *proj_json =
+            "{\n"
+            "  \"title\": \"Sound and Text Scene\",\n"
+            "  \"type\": \"scene\",\n"
+            "  \"file\": \"scene.json\",\n"
+            "  \"general\": {\n"
+            "    \"properties\": {\n"
+            "      \"sfxvol\": {\"type\": \"slider\", \"value\": 0.9},\n"
+            "      \"clocksize\": {\"type\": \"slider\", \"value\": 36}\n"
+            "    }\n"
+            "  }\n"
+            "}\n";
+        char ppath[4096];
+        snprintf(ppath, sizeof(ppath), "%s/project.json", tmp_dir);
+        FILE *fp = fopen(ppath, "wb");
+        assert(fp != NULL);
+        fwrite(proj_json, 1, strlen(proj_json), fp);
+        fclose(fp);
+
+        byte_buf_t bgm_wav, sfx_wav;
+        build_synthetic_wav_pcm16(&bgm_wav, 48000u, 2u, 2400u, 440.0f, 0.6f);
+        build_synthetic_wav_pcm16(&sfx_wav, 48000u, 2u, 1200u, 880.0f, 0.8f);
+
+        const char *scene_json =
+            "{\n"
+            "  \"general\": {\n"
+            "    \"orthogonalprojection\": {\"width\": 128, \"height\": 64},\n"
+            "    \"clearcolor\": \"0.0 0.0 0.0\"\n"
+            "  },\n"
+            "  \"objects\": [\n"
+            "    {\n"
+            "      \"id\": 1,\n"
+            "      \"name\": \"BGMLayer\",\n"
+            "      \"sound\": {\"value\": [\"sounds/bgm.wav\"]},\n"
+            "      \"playbackmode\": \"loop\",\n"
+            "      \"volume\": {\n"
+            "        \"user\": \"sfxvol\",\n"
+            "        \"value\": 0.75,\n"
+            "        \"script\": \"export function update(v) { return 0.42; }\"\n"
+            "      },\n"
+            "      \"startsilent\": false,\n"
+            "      \"visible\": true\n"
+            "    },\n"
+            "    {\n"
+            "      \"id\": 2,\n"
+            "      \"name\": \"SFXLayer\",\n"
+            "      \"sound\": [\"sounds/sfx.wav\"],\n"
+            "      \"playbackmode\": \"once\",\n"
+            "      \"volume\": {\"user\": \"sfxvol\", \"value\": 0.9},\n"
+            "      \"startsilent\": true,\n"
+            "      \"visible\": true\n"
+            "    },\n"
+            "    {\n"
+            "      \"id\": 3,\n"
+            "      \"name\": \"ClockText\",\n"
+            "      \"origin\": \"64.0 32.0 0.0\",\n"
+            "      \"size\": \"120.0 48.0\",\n"
+            "      \"color\": \"0.2 1.0 0.4\",\n"
+            "      \"alpha\": 1.0,\n"
+            "      \"padding\": 4,\n"
+            "      \"opaquebackground\": true,\n"
+            "      \"backgroundcolor\": \"0.1 0.1 0.2\",\n"
+            "      \"pointsize\": {\"user\": \"clocksize\", \"value\": 32},\n"
+            "      \"horizontalalign\": \"center\",\n"
+            "      \"verticalalign\": \"center\",\n"
+            "      \"text\": {\n"
+            "        \"value\": \"23\\u00b0C\",\n"
+            "        \"script\": \"var tick = 0; export function update(v) { tick++; let sfx = "
+            "thisScene.getLayer('SFXLayer'); let bgm = thisScene.getLayer('BGMLayer'); "
+            "if (tick === 1 && !sfx.isPlaying()) { sfx.play(); } "
+            "if (tick === 2) { bgm.pause(); } "
+            "if (tick === 3) { bgm.play(); } "
+            "if (tick === 4) { bgm.stop(); } "
+            "thisLayer.text = `12:${String(tick).padStart(2, '0')}\\u00b0`; return v; }\"\n"
+            "      }\n"
+            "    }\n"
+            "  ]\n"
+            "}\n";
+
+        pkg_test_item_t items[3] = {
+            {.path = "scene.json", .data = scene_json, .len = strlen(scene_json)},
+            {.path = "sounds/bgm.wav", .data = bgm_wav.data, .len = bgm_wav.len},
+            {.path = "sounds/sfx.wav", .data = sfx_wav.data, .len = sfx_wav.len},
+        };
+        byte_buf_t pkg_bb;
+        build_synthetic_pkg(&pkg_bb, "PKGV0002", items, 3);
+        char kpath[4096];
+        snprintf(kpath, sizeof(kpath), "%s/scene.pkg", tmp_dir);
+        fp = fopen(kpath, "wb");
+        assert(fp != NULL);
+        fwrite(pkg_bb.data, 1, pkg_bb.len, fp);
+        fclose(fp);
+        bb_free(&pkg_bb);
+        bb_free(&bgm_wav);
+        bb_free(&sfx_wav);
+
+        we_scene_t *scn = we_scene_load_cpu(tmp_dir, NULL);
+        assert(scn != NULL);
+        assert(scn->object_count == 3u);
+        assert(scn->uses_audio);
+        assert(scn->objects[0].is_sound_object && scn->objects[0].sound_playing);
+        assert(scn->objects[1].is_sound_object && !scn->objects[1].sound_playing);
+        assert(scn->objects[1].sound_mode == WE_SOUND_MODE_SINGLE);
+        assert(scn->objects[2].is_text_object);
+        assert(scn->objects[2].text_padding == 4);
+        assert(scn->objects[2].text_opaque_bg);
+        assert(strcmp(scn->objects[2].text_str, "23\xc2\xb0" "C") == 0);
+
+        waywal_audio_fft_t *fft = waywal_audio_fft_create(48000, false);
+        assert(fft != NULL);
+        we_scene_set_audio_output(scn, fft);
+
+        /* Render frame 1: ClockText script updates text to "12:01°", triggers SFXLayer.play(),
+         * rasterizes text into RGBA8, and steps scene audio */
+        uint8_t rgba[128 * 64 * 4];
+        memset(rgba, 0, sizeof(rgba));
+        waywal_shader_frame_params_t fparams;
+        memset(&fparams, 0, sizeof(fparams));
+        fparams.time_sec = 0.016f;
+        fparams.time_delta_sec = 0.025f; /* 1200 frames = full duration of sfx.wav */
+
+        assert(we_scene_render_rgba8(scn, 128, 64, &fparams, rgba));
+        assert(strcmp(scn->objects[2].text_str, "12:01\xc2\xb0") == 0);
+        /* Verify volume script on BGMLayer was NOT clobbered by user_prop_volume ("sfxvol") */
+        assert(fabsf(scn->objects[0].sound_volume - 0.42f) < 1e-5f);
+        /* SFXLayer was started by script on frame 1 and ran for 1200 frames (its exact length in
+         * once/single mode), so it completed and stopped at the end of the step! */
+        assert(!scn->objects[1].sound_playing);
+        /* BGMLayer is in loop mode so it remains playing at cursor 1200 */
+        assert(scn->objects[0].sound_playing && scn->objects[0].sound_cursor_frame == 1200u);
+
+        /* Frame 2: bgm.pause() stops playback but preserves sound_cursor_frame == 1200 */
+        fparams.time_sec += fparams.time_delta_sec;
+        assert(we_scene_render_rgba8(scn, 128, 64, &fparams, rgba));
+        assert(!scn->objects[0].sound_playing && scn->objects[0].sound_paused);
+        assert(scn->objects[0].sound_cursor_frame == 1200u);
+
+        /* Frame 3: bgm.play() resumes from cursor 1200 and steps 480 frames (0.010s) -> 1680 */
+        fparams.time_delta_sec = 0.010f;
+        fparams.time_sec += fparams.time_delta_sec;
+        assert(we_scene_render_rgba8(scn, 128, 64, &fparams, rgba));
+        assert(scn->objects[0].sound_playing && !scn->objects[0].sound_paused);
+        assert(scn->objects[0].sound_cursor_frame == 1680u);
+
+        /* Frame 4: bgm.stop() stops playback and resets sound_cursor_frame to 0 */
+        fparams.time_sec += fparams.time_delta_sec;
+        assert(we_scene_render_rgba8(scn, 128, 64, &fparams, rgba));
+        assert(!scn->objects[0].sound_playing && !scn->objects[0].sound_paused);
+        assert(scn->objects[0].sound_cursor_frame == 0u);
+
+        /* Verify text glyph pixels were rasterized with green-tinted color (0.2, 1.0, 0.4) */
+        uint32_t lit_pixels = 0;
+        for (size_t i = 0; i < 128u * 64u; ++i) {
+            if (rgba[i * 4u + 1u] > 80u) {
+                lit_pixels++;
+            }
+        }
+        assert(lit_pixels > 40u);
+
+        /* Verify self-playback audio populated the FFT spectrum without false self-ducking */
+        assert(!waywal_audio_fft_is_ducked(fft));
+        waywal_audio_frame_t aframe;
+        assert(waywal_audio_fft_process(fft, &aframe));
+        assert(!waywal_audio_fft_is_external_audio_active(fft));
+
+        /* Live uniform override on pointsize re-rasterizes text cleanly */
+        float new_ps = 44.0f;
+        assert(we_scene_set_uniform_override(scn, "clocksize", &new_ps, 1));
+        assert(scn->objects[2].text_pointsize == 44);
+
+        /* Multi-output deduplication: rendering a second monitor at the same fparams.time_sec
+         * (including frame 0 where time_sec == 0.0f) must not double-step audio */
+        scn->objects[0].sound_playing = true;
+        scn->objects[0].sound_cursor_frame = 0u;
+        scn->last_audio_step_time = -1.0;
+        fparams.time_delta_sec = 0.010f;
+        fparams.time_sec = 0.0f;
+        assert(we_scene_render_rgba8(scn, 128, 64, &fparams, rgba));
+        assert(scn->objects[0].sound_cursor_frame == 480u);
+        assert(we_scene_render_rgba8(scn, 128, 64, &fparams, rgba));
+        assert(scn->objects[0].sound_cursor_frame == 480u);
+        fparams.time_sec = 0.050f;
+        assert(we_scene_render_rgba8(scn, 128, 64, &fparams, rgba));
+        assert(scn->objects[0].sound_cursor_frame == 960u);
+        assert(we_scene_render_rgba8(scn, 128, 64, &fparams, rgba));
+        assert(scn->objects[0].sound_cursor_frame == 960u);
+
+        /* Malformed UTF-8 lead byte followed by ASCII ('\xc3' + 'A'), overlong ('\xc1\x81'),
+         * and UTF-8 surrogate ('\xed\xa0\x80') must not swallow valid trailing characters */
+        snprintf(scn->objects[2].text_str, sizeof(scn->objects[2].text_str),
+                 "\xc3" "A" "\xc1\x81" "\xed\xa0\x80" "B");
+        scn->objects[2].text_dirty = true;
+        we_scene_update_text_texture(scn, &scn->objects[2]);
+        assert(!scn->objects[2].text_dirty);
+
+        /* Verify we_scene_destroy() clears the playback ringbuffer on fft (all 16384 frames
+         * become available again after destroy, whereas frames were occupied before) */
+        we_scene_destroy(scn);
+        float *probe_ring = calloc(16000u * 2u, sizeof(float));
+        assert(probe_ring != NULL);
+        assert(waywal_audio_submit_pcm_f32(fft, probe_ring, 16000u) == 16000u);
+        free(probe_ring);
+        waywal_audio_fft_destroy(fft);
+        unlink(kpath);
+        unlink(ppath);
+        rmdir(tmp_dir);
+    }
+}
+
 int main(void)
 {
     printf("=== Running Wallpaper Engine Core Test Suite ===\n");
@@ -3047,6 +3834,8 @@ int main(void)
     test_mpris_audio_ducking_and_live_uniforms();
     test_mpris_arbitration_and_scene_uniform_overrides();
     test_shared_we_json_dom();
+    test_workshop_preview_bridge();
+    test_sound_and_text_layers_and_scenescript_stdlib();
     printf("=== All Wallpaper Engine Core Tests Passed! ===\n");
     return 0;
 }

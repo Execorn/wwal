@@ -3,7 +3,7 @@
 project('waywal', 'c',
   version: '1.1.0',
   license: 'GPL-3.0-or-later',
-  meson_version: '>= 0.60.0',
+  meson_version: '>= 0.61.0',
   default_options: [
     'c_std=gnu2x',
     'optimization=3',
@@ -24,6 +24,8 @@ add_project_arguments(
   '-fstrict-aliasing',
   '-D_GNU_SOURCE',
   '-DWAYWAL_VERSION="' + meson.project_version() + '"',
+  '-DWWAL_DATADIR="' + (get_option('prefix') / get_option('datadir')) + '"',
+  '-DWWAL_SOURCE_ROOT="' + meson.current_source_dir() + '"',
   language: 'c'
 )
 
@@ -206,6 +208,7 @@ common_sources = files(
   'src/common/we_pkg.c',
   'src/common/we_json.c',
   'src/common/we_project.c',
+  'src/common/solar_schedule.c',
 )
 
 common_deps = [threads_dep, m_dep, dl_dep]
@@ -324,6 +327,13 @@ wwal = executable('wwal',
   install: true
 )
 
+if get_option('swww_compat')
+  install_symlink('swww', pointing_to: 'wwal', install_dir: get_option('bindir'))
+  install_symlink('awww', pointing_to: 'wwal', install_dir: get_option('bindir'))
+  install_symlink('swww-daemon', pointing_to: 'wwald', install_dir: get_option('bindir'))
+  install_symlink('awww-daemon', pointing_to: 'wwald', install_dir: get_option('bindir'))
+endif
+
 # Systemd integration
 if get_option('enable_systemd')
   systemd_dep = dependency('systemd', required: false)
@@ -370,6 +380,21 @@ install_data('contrib/completions/wwal.bash', install_dir: get_option('datadir')
 install_data('contrib/completions/wwal.zsh', install_dir: get_option('datadir') / 'zsh/site-functions', rename: '_wwal')
 install_data('contrib/completions/wwal.fish', install_dir: get_option('datadir') / 'fish/vendor_completions.d')
 
+# Sample & preset shaders and example configuration
+install_data(
+  'contrib/shaders/plasma.frag',
+  'contrib/shaders/audio_spectrum.frag',
+  install_dir: get_option('datadir') / 'wwal/shaders'
+)
+fs = import('fs')
+if fs.is_dir('shaders/presets')
+  install_subdir('shaders/presets', install_dir: get_option('datadir') / 'wwal/shaders')
+elif fs.is_dir('contrib/shaders/presets')
+  install_subdir('contrib/shaders/presets', install_dir: get_option('datadir') / 'wwal/shaders')
+endif
+install_data('contrib/config.toml.example', install_dir: get_option('datadir') / 'doc/wwal')
+
+
 # Test & Benchmark Suites
 if get_option('tests')
   test_core_exe = executable('test_core',
@@ -396,6 +421,7 @@ if get_option('tests')
     'tests/test_transitions.c',
     'src/daemon/render_engine.c',
     'src/daemon/gpu_compute.c',
+    'src/daemon/shader_engine.c',
     'src/daemon/dmabuf_alloc.c',
     'src/daemon/dmabuf_feedback.c',
     'src/daemon/simd/simd_blend.c',
@@ -588,6 +614,7 @@ if get_option('tests')
     'src/daemon/audio_fft.c',
     'src/daemon/mpris.c',
     'src/daemon/shader_engine.c',
+    'src/daemon/slideshow.c',
     'src/daemon/gpu_compute.c',
     'src/daemon/dmabuf_alloc.c',
     'src/daemon/dmabuf_feedback.c',

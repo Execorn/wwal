@@ -187,7 +187,18 @@ typedef struct {
     color_rgba_t onSuccess;
     color_rgba_t successContainer;
     color_rgba_t onSuccessContainer;
+
+    uint32_t source_color;
+    uint32_t seeds[4];
+    uint8_t seed_count;
+    uint8_t source_color_index;
+    bool is_light_mode;
+    char wallpaper_path[512];
 } waywal_palette_t;
+
+typedef waywal_scheme_variant_t waywal_scheme_type_t;
+
+struct waywal_config;
 
 waywal_scheme_variant_t waywal_scheme_variant_from_str(const char *str);
 color_rgba_t waywal_hct_to_rgba(float h_deg, float c_cam16, float t_lstar);
@@ -204,9 +215,22 @@ bool waywal_palette_extract_ex(const uint8_t *pixels, uint32_t width, uint32_t h
                                waywal_scheme_variant_t variant, float contrast,
                                waywal_palette_t *out_palette);
 
+bool waywal_palette_extract_seed_ex(const uint8_t *pixels, uint32_t width, uint32_t height,
+                                    uint32_t stride_bytes, bool is_bgra, waywal_theme_mode_t mode,
+                                    waywal_scheme_variant_t variant, float contrast,
+                                    uint8_t source_color_index, bool has_seed_override,
+                                    uint32_t seed_override_rgb, waywal_palette_t *out_palette);
+
 bool waywal_palette_extract_dual(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
                                  uint32_t stride_bytes, waywal_palette_t *out_dark,
                                  waywal_palette_t *out_light);
+
+bool waywal_palette_extract_dual_ex(const uint8_t *pixels, uint32_t width, uint32_t height,
+                                    uint32_t stride_bytes, bool is_bgra,
+                                    waywal_scheme_variant_t variant, float contrast,
+                                    uint8_t source_color_index, bool has_seed_override,
+                                    uint32_t seed_override_rgb, waywal_palette_t *out_dark,
+                                    waywal_palette_t *out_light);
 
 bool waywal_palette_extract_bgra(const uint8_t *bgra_pixels, uint32_t width, uint32_t height,
                                  uint32_t stride_bytes, waywal_theme_mode_t mode,
@@ -216,6 +240,8 @@ bool waywal_palette_extract_dual_bgra(const uint8_t *bgra_pixels, uint32_t width
                                       uint32_t stride_bytes, waywal_palette_t *out_dark,
                                       waywal_palette_t *out_light);
 
+void waywal_palette_derive_opposite(const waywal_palette_t *src, waywal_palette_t *out_opp);
+
 size_t waywal_palette_format_sequences(const waywal_palette_t *pal, char *out_buf, size_t buf_cap);
 
 bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override_base_dir);
@@ -223,8 +249,20 @@ bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override
 bool waywal_palette_export_filtered(const waywal_palette_t *pal, const char *override_base_dir,
                                     bool caelestia_sync, bool export_css, bool export_hyprland);
 
+bool waywal_palette_export_pywal(const waywal_palette_t *pal, const char *override_base_dir);
+
 bool waywal_palette_render_templates(const waywal_palette_t *pal, const char *templates_dir,
                                      const char *out_dir);
+
+bool waywal_palette_render_template_file(const waywal_palette_t *default_pal,
+                                         const waywal_palette_t *dark_pal,
+                                         const waywal_palette_t *light_pal, const char *input_path,
+                                         const char *output_path);
+
+size_t waywal_palette_apply_configured_templates(const waywal_palette_t *default_pal,
+                                                 const waywal_palette_t *dark_pal,
+                                                 const waywal_palette_t *light_pal,
+                                                 const struct waywal_config *cfg);
 
 bool waywal_palette_run_hook(const char *cmd);
 

@@ -41,13 +41,25 @@ typedef enum {
     CLI_CMD_SUBSCRIBE,
     CLI_CMD_AUDIO,
     CLI_CMD_VERSION,
+    CLI_CMD_PICK,
 } cli_cmd_type_t;
 
 typedef enum {
     WAYWAL_WORKSHOP_APPLY = 0,
     WAYWAL_WORKSHOP_LIST = 1,
     WAYWAL_WORKSHOP_INFO = 2,
+    WAYWAL_WORKSHOP_SYNC_PREVIEWS = 3,
 } waywal_workshop_subcmd_t;
+
+typedef enum {
+    WAYWAL_PICK_MENU_AUTO = 0,
+    WAYWAL_PICK_MENU_ROFI = 1,
+    WAYWAL_PICK_MENU_FUZZEL = 2,
+    WAYWAL_PICK_MENU_WALKER = 3,
+    WAYWAL_PICK_MENU_DMENU = 4,
+    WAYWAL_PICK_MENU_STDOUT = 5,
+    WAYWAL_PICK_MENU_JSON = 6,
+} waywal_pick_menu_t;
 
 typedef cli_cmd_type_t waywal_cli_cmd_t;
 
@@ -66,6 +78,7 @@ typedef struct {
     bool audio_reactive;
     bool extract_theme;
     bool no_theme;
+    bool has_theme_mode;
     bool theme_light_mode;
     char backdrop[256];
     char layer_name[32];
@@ -111,6 +124,9 @@ typedef struct {
     size_t custom_shader_len;
     char depth_map_path[256];
     float depth_strength;
+    bool shader_list;
+    bool shader_preset_explicit;
+    char shader_preset[128];
 
     /* Multi-monitor targeting and synchronization */
     uint32_t num_outputs;
@@ -145,7 +161,13 @@ typedef struct {
     /* Slideshow parameters */
     uint32_t slideshow_action;     /* waywal_slideshow_action_t */
     uint32_t slideshow_interval_s; /* interval in seconds */
-    bool slideshow_random;         /* random shuffle order */
+    bool has_slideshow_interval;
+    bool slideshow_random; /* random shuffle order */
+    union {
+        waywal_sort_mode_t slideshow_sort;
+        waywal_sort_mode_t sort_mode;
+    };
+    bool has_slideshow_sort;
 
     /* Workshop parameters */
     uint32_t workshop_subcmd; /* waywal_workshop_subcmd_t */
@@ -159,12 +181,65 @@ typedef struct {
     char uniform_name[64];
     float uniform_values[4];
     uint32_t uniform_components;
+
+    /* swww / awww v0.12.1 compatibility & crop gravity */
+    float crop_gravity_x;
+    float crop_gravity_y;
+    bool has_crop_gravity;
+    bool invert_y;
+    bool pos_y_inverted;
+    bool no_cache;
+    bool clear_cache;
+    bool all_namespaces;
+    bool daemonize;
+    bool no_daemon;
+    bool quiet;
+    bool is_solid_color;
+    char pixel_format[16];
+
+    bool has_transition_type;
+    bool has_transition_duration;
+    bool has_transition_fps;
+    bool has_transition_angle;
+    bool has_transition_pos;
+    bool has_transition_wave;
+    bool has_transition_bezier;
+    bool has_scaling_mode;
+    bool has_filter_mode;
+    bool has_fill_color;
+    bool env_outputs_set;
+
+    waywal_pick_menu_t pick_menu;
+    char pick_dir[4096];
+
+    uint8_t source_color_index;
+    bool has_source_color_index;
+    uint32_t seed_color;
+    bool has_seed_color;
+
+    bool auto_day_night;
+    bool has_auto_day_night;
+    union {
+        double solar_latitude;
+        double latitude;
+    };
+    union {
+        double solar_longitude;
+        double longitude;
+    };
+    union {
+        bool has_solar_coords;
+        bool has_coordinates;
+    };
+    bool has_solar_lat;
+    bool has_solar_lon;
 } cli_options_t;
 
 typedef cli_options_t waywal_cli_opts_t;
 
 bool cli_parse(int argc, char *argv[], cli_options_t *opts);
 bool waywal_cli_parse(int argc, char *argv[], waywal_cli_opts_t *opts);
+bool cli_auto_dispatch_img(cli_options_t *opts);
 void cli_print_usage(const char *prog);
 
 #ifdef __cplusplus

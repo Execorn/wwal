@@ -40,6 +40,7 @@ typedef enum {
     VAL_SCENE_LAYER,
     VAL_AUDIO_BUFFERS,
     VAL_AUDIO_CHANNEL,
+    VAL_DATE,
 } js_val_type_t;
 
 typedef enum {
@@ -53,6 +54,7 @@ typedef enum {
     BUILTIN_SHARED,
     BUILTIN_CONSOLE,
     BUILTIN_SCRIPT_PROPS_BUILDER,
+    BUILTIN_DATE,
 } js_builtin_id_t;
 
 typedef struct js_vec_obj {
@@ -113,6 +115,7 @@ typedef enum {
     TOK_IDENT,
     TOK_NUM,
     TOK_STR,
+    TOK_TEMPLATE,
     TOK_TRUE,
     TOK_FALSE,
     TOK_NULL,
@@ -214,6 +217,7 @@ typedef enum {
     AST_CONTINUE,
     AST_EXPR_STMT,
     AST_LITERAL,
+    AST_TEMPLATE,
     AST_IDENT,
     AST_THIS,
     AST_ARRAY_LIT,
@@ -257,6 +261,11 @@ struct ast_node {
     uint32_t child_count;
     ast_var_item_t *decls;
     uint32_t decl_count;
+    struct {
+        const char **parts; /* expr_count + 1 literal segments */
+        ast_node_t **exprs; /* expr_count interpolated expressions */
+        uint32_t expr_count;
+    } tpl;
 };
 
 #define WE_SCRIPT_MAX_GLOBALS  96u

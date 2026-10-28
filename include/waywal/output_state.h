@@ -172,6 +172,12 @@ struct output_node {
     dev_t target_dev;
     bool has_target_dev;
     bool has_image;
+    char active_media_path[4096];
+    bool displaying_color;
+    color_rgba_t active_color;
+    float crop_gravity_x;
+    float crop_gravity_y;
+    bool has_crop_gravity;
 
     bool configured;
     struct daemon_state *state;

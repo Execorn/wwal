@@ -191,6 +191,8 @@ typedef struct {
     bool active;
 } pw_tracked_node_t;
 
+#define PLAYBACK_RING_FRAMES 16384u
+
 struct waywal_audio_fft {
     uint32_t sample_rate;
     bool has_avx2;
@@ -216,6 +218,8 @@ struct waywal_audio_fft {
     float user_volume;
     float current_gain;
     bool mute_on_audio;
+    bool volume_explicitly_set;
+    bool self_playback_pushed;
     _Atomic bool external_audio_active;
     _Atomic bool test_override_enabled;
     _Atomic bool test_external_audio_active;
@@ -228,6 +232,11 @@ struct waywal_audio_fft {
     struct spa_hook pw_registry_listener;
     void *pw_stream;
     struct pw_stream_events pw_events;
+    void *pw_play_stream;
+    struct pw_stream_events pw_play_events;
+    _Alignas(64) float play_ring[PLAYBACK_RING_FRAMES * 2u];
+    _Atomic uint32_t play_write_idx;
+    _Atomic uint32_t play_read_idx;
     pw_tracked_node_t tracked_nodes[32];
     void (*fn_pw_thread_loop_stop)(void *loop);
     void (*fn_pw_thread_loop_destroy)(void *loop);
@@ -768,6 +777,48 @@ static void on_pw_process(void *userdata)
     fft->fn_pw_stream_queue_buffer(fft->pw_stream, b);
 }
 
+static void on_pw_playback_process(void *userdata)
+{
+    waywal_audio_fft_t *fft = (waywal_audio_fft_t *)userdata;
+    if (!fft || !fft->pw_play_stream || !fft->fn_pw_stream_dequeue_buffer ||
+        !fft->fn_pw_stream_queue_buffer) {
+        return;
+    }
+    struct pw_buffer *b = fft->fn_pw_stream_dequeue_buffer(fft->pw_play_stream);
+    if (!b) {
+        return;
+    }
+    struct spa_buffer *buf = b->buffer;
+    if (buf && buf->n_datas > 0 && buf->datas[0].data && buf->datas[0].chunk) {
+        float *dst = (float *)buf->datas[0].data;
+        uint32_t max_bytes = buf->datas[0].maxsize;
+        uint32_t max_frames = max_bytes / (2u * sizeof(float));
+        if (max_frames > 1024u) {
+            max_frames = 1024u;
+        }
+        uint32_t w = atomic_load_explicit(&fft->play_write_idx, memory_order_acquire);
+        uint32_t r = atomic_load_explicit(&fft->play_read_idx, memory_order_relaxed);
+        uint32_t avail = w - r;
+        uint32_t to_read = (avail < max_frames) ? avail : max_frames;
+
+        for (uint32_t i = 0; i < to_read; ++i) {
+            uint32_t slot = (r + i) & (PLAYBACK_RING_FRAMES - 1u);
+            dst[i * 2u + 0u] = fft->play_ring[slot * 2u + 0u];
+            dst[i * 2u + 1u] = fft->play_ring[slot * 2u + 1u];
+        }
+        for (uint32_t i = to_read; i < max_frames; ++i) {
+            dst[i * 2u + 0u] = 0.0f;
+            dst[i * 2u + 1u] = 0.0f;
+        }
+        atomic_store_explicit(&fft->play_read_idx, r + to_read, memory_order_release);
+
+        buf->datas[0].chunk->offset = 0;
+        buf->datas[0].chunk->stride = 2 * (int)sizeof(float);
+        buf->datas[0].chunk->size = max_frames * 2u * sizeof(float);
+    }
+    fft->fn_pw_stream_queue_buffer(fft->pw_play_stream, b);
+}
+
 waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pipewire)
 {
     waywal_audio_fft_t *fft = NULL;
@@ -784,10 +835,14 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
     atomic_init(&fft->external_audio_active, false);
     atomic_init(&fft->test_override_enabled, false);
     atomic_init(&fft->test_external_audio_active, false);
+    atomic_init(&fft->play_write_idx, 0u);
+    atomic_init(&fft->play_read_idx, 0u);
     fft->last_consumed = 0u;
     fft->user_volume = 0.0f;
     fft->current_gain = 0.0f;
     fft->mute_on_audio = true;
+    fft->volume_explicitly_set = false;
+    fft->self_playback_pushed = false;
 
     init_fft_tables(fft);
 
@@ -951,11 +1006,35 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
                         if (fn_pw_stream_connect(fft->pw_stream, 0 /* PW_DIRECTION_INPUT */,
                                                  0xFFFFFFFFu /* PW_ID_ANY */, flags, params,
                                                  1u) >= 0) {
+                            void *play_props = fn_pw_properties_new(
+                                "media.type", "Audio", "media.category", "Playback", "media.role",
+                                "Music", "node.name", "waywal-audio-playback", NULL);
+                            fft->pw_play_events.version = 2u;
+                            fft->pw_play_events.process = on_pw_playback_process;
+                            fft->pw_play_stream =
+                                fn_pw_stream_new_simple(main_loop, "waywal-audio-playback",
+                                                        play_props, &fft->pw_play_events, fft);
+                            if (fft->pw_play_stream) {
+                                struct spa_audio_format_pod play_fmt_pod = fmt_pod;
+                                play_fmt_pod.audio_channels.val = 2u;
+                                const struct spa_pod *play_params[1] = {&play_fmt_pod.pod};
+                                if (fn_pw_stream_connect(fft->pw_play_stream,
+                                                         1 /* PW_DIRECTION_OUTPUT */,
+                                                         0xFFFFFFFFu /* PW_ID_ANY */, flags,
+                                                         play_params, 1u) < 0) {
+                                    fft->fn_pw_stream_destroy(fft->pw_play_stream);
+                                    fft->pw_play_stream = NULL;
+                                }
+                            }
                             if (fn_pw_thread_loop_start(fft->pw_loop) >= 0) {
                                 fft->pw_available = true;
                                 WAYWAL_LOG_INFO("PipeWire audio capture stream started (%u Hz F32)",
                                                 fft->sample_rate);
                             } else {
+                                if (fft->pw_play_stream && fft->fn_pw_stream_destroy) {
+                                    fft->fn_pw_stream_destroy(fft->pw_play_stream);
+                                    fft->pw_play_stream = NULL;
+                                }
                                 fft->fn_pw_stream_destroy(fft->pw_stream);
                                 fft->pw_stream = NULL;
                                 if (fft->pw_registry && fft->fn_pw_proxy_destroy) {
@@ -1027,6 +1106,10 @@ void waywal_audio_fft_destroy(waywal_audio_fft_t *fft)
         if (fft->fn_pw_thread_loop_stop) {
             fft->fn_pw_thread_loop_stop(fft->pw_loop);
         }
+        if (fft->pw_play_stream && fft->fn_pw_stream_destroy) {
+            fft->fn_pw_stream_destroy(fft->pw_play_stream);
+            fft->pw_play_stream = NULL;
+        }
         if (fft->pw_stream && fft->fn_pw_stream_destroy) {
             fft->fn_pw_stream_destroy(fft->pw_stream);
             fft->pw_stream = NULL;
@@ -1077,11 +1160,14 @@ static void copy_from_ring(const float *ring, uint32_t start_pos, float *dst, ui
     }
 }
 
-size_t waywal_audio_fft_push_samples(waywal_audio_fft_t *fft, const float *samples, size_t count)
+static size_t push_mono_samples_internal(waywal_audio_fft_t *fft, const float *samples,
+                                         size_t count, bool from_self_playback)
 {
     if (!fft || !samples || count == 0) {
         return 0;
     }
+
+    fft->self_playback_pushed = from_self_playback;
 
     uint32_t wp = atomic_load_explicit(&fft->write_pos, memory_order_relaxed);
     const float *src = samples;
@@ -1105,6 +1191,11 @@ size_t waywal_audio_fft_push_samples(waywal_audio_fft_t *fft, const float *sampl
     atomic_store_explicit(&fft->write_pos, wp + (uint32_t)count, memory_order_release);
     atomic_fetch_add_explicit(&fft->total_pushed, (uint32_t)count, memory_order_release);
     return count;
+}
+
+size_t waywal_audio_fft_push_samples(waywal_audio_fft_t *fft, const float *samples, size_t count)
+{
+    return push_mono_samples_internal(fft, samples, count, false);
 }
 
 void waywal_audio_fft_synthesize_signal(waywal_audio_fft_t *fft, float freq_hz, float amplitude,
@@ -1154,7 +1245,7 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
         fft->beat_val *= 0.85f;
         fft->current_frame.beat_pulse = clampf(fft->beat_val, 0.0f, 1.0f);
         if (!atomic_load_explicit(&fft->test_override_enabled, memory_order_acquire) &&
-            !fft->pw_registry) {
+            !fft->pw_registry && !fft->self_playback_pushed) {
             atomic_store_explicit(&fft->external_audio_active, fft->current_frame.envelope > 0.008f,
                                   memory_order_release);
         }
@@ -1256,7 +1347,7 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
 
     fft->current_frame.envelope = clampf(env_sum / (float)WAYWAL_AUDIO_BARK_BANDS, 0.0f, 1.0f);
     if (!atomic_load_explicit(&fft->test_override_enabled, memory_order_acquire) &&
-        !fft->pw_registry) {
+        !fft->pw_registry && !fft->self_playback_pushed) {
         atomic_store_explicit(&fft->external_audio_active, fft->current_frame.envelope > 0.008f,
                               memory_order_release);
     }
@@ -1334,6 +1425,7 @@ void waywal_audio_fft_set_volume(waywal_audio_fft_t *fft, float volume)
         return;
     float clamped = clampf(volume, 0.0f, 1.0f);
     fft->user_volume = clamped;
+    fft->volume_explicitly_set = true;
     if (!(fft->mute_on_audio && waywal_audio_fft_is_external_audio_active(fft))) {
         fft->current_gain = clamped;
     }
@@ -1411,4 +1503,72 @@ void waywal_audio_fft_set_external_audio_for_test(waywal_audio_fft_t *fft, bool 
     atomic_store_explicit(&fft->test_external_audio_active, active, memory_order_release);
     atomic_store_explicit(&fft->test_override_enabled, true, memory_order_release);
     atomic_store_explicit(&fft->external_audio_active, active, memory_order_release);
+}
+
+float waywal_audio_get_effective_volume(const waywal_audio_fft_t *fft)
+{
+    if (!fft) {
+        return 1.0f;
+    }
+    if (waywal_audio_fft_is_ducked(fft)) {
+        return 0.0f;
+    }
+    if (!fft->volume_explicitly_set) {
+        return 1.0f;
+    }
+    return clampf(fft->user_volume, 0.0f, 1.0f);
+}
+
+void waywal_audio_clear_playback(waywal_audio_fft_t *fft)
+{
+    if (!fft) {
+        return;
+    }
+    uint32_t w = atomic_load_explicit(&fft->play_write_idx, memory_order_relaxed);
+    atomic_store_explicit(&fft->play_read_idx, w, memory_order_release);
+}
+
+size_t waywal_audio_submit_pcm_f32(waywal_audio_fft_t *fft, const float *stereo_interleaved,
+                                   size_t frames)
+{
+    if (!fft || !stereo_interleaved || frames == 0) {
+        return 0;
+    }
+    float eff_vol = waywal_audio_get_effective_volume(fft);
+
+    uint32_t w = atomic_load_explicit(&fft->play_write_idx, memory_order_relaxed);
+    uint32_t r = atomic_load_explicit(&fft->play_read_idx, memory_order_acquire);
+    uint32_t used = w - r;
+    if (used >= PLAYBACK_RING_FRAMES) {
+        r = w - (PLAYBACK_RING_FRAMES / 2u);
+        atomic_store_explicit(&fft->play_read_idx, r, memory_order_release);
+        used = w - r;
+    }
+    uint32_t space = PLAYBACK_RING_FRAMES - used;
+    size_t to_write = (frames < (size_t)space) ? frames : (size_t)space;
+
+    float mono_staging[1024];
+    size_t mono_cnt = 0;
+
+    for (size_t i = 0; i < to_write; ++i) {
+        uint32_t slot = (w + (uint32_t)i) & (PLAYBACK_RING_FRAMES - 1u);
+        float l = stereo_interleaved[i * 2u + 0u] * eff_vol;
+        float r_ch = stereo_interleaved[i * 2u + 1u] * eff_vol;
+        fft->play_ring[slot * 2u + 0u] = l;
+        fft->play_ring[slot * 2u + 1u] = r_ch;
+
+        if (!fft->pw_available) {
+            mono_staging[mono_cnt++] = 0.5f * (l + r_ch);
+            if (mono_cnt == 1024u) {
+                push_mono_samples_internal(fft, mono_staging, mono_cnt, true);
+                mono_cnt = 0;
+            }
+        }
+    }
+    if (!fft->pw_available && mono_cnt > 0) {
+        push_mono_samples_internal(fft, mono_staging, mono_cnt, true);
+    }
+
+    atomic_store_explicit(&fft->play_write_idx, w + (uint32_t)to_write, memory_order_release);
+    return to_write;
 }

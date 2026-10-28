@@ -57,6 +57,9 @@ typedef struct {
     uint32_t slideshow_interval_sec;
     bool audio_reactive;
     char prop_overrides[2048];
+    float crop_gravity_x;
+    float crop_gravity_y;
+    bool has_crop_gravity;
 } waywal_output_saved_state_t;
 
 typedef struct {
@@ -68,6 +71,7 @@ typedef struct {
 } waywal_state_store_t;
 
 void waywal_state_store_init(waywal_state_store_t *store);
+void waywal_state_store_set_namespace(const char *namespace_str);
 
 bool waywal_state_store_resolve_path(path_buf_t *out_path, const char *override_dir);
 
@@ -96,6 +100,15 @@ bool waywal_state_store_update_output(waywal_state_store_t *store,
 
 const waywal_output_saved_state_t *waywal_state_store_find_output(const waywal_state_store_t *store,
                                                                   const char *output_name);
+
+const char *waywal_filter_mode_to_swww_str(waywal_filter_mode_t filter);
+
+bool waywal_render_shader_preview_bgra(const char *shader_path, uint8_t *out_bgra, uint32_t width,
+                                       uint32_t height);
+
+bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path,
+                                 const char *filter_str, const uint8_t *bgra_pixels, uint32_t width,
+                                 uint32_t height, bool caelestia_sync, bool no_cache);
 
 #ifdef __cplusplus
 }

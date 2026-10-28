@@ -16,13 +16,19 @@ extern "C" {
 #define WE_SCRIPT_MAX_SHARED_ENTRIES 64u
 #define WE_SCRIPT_MAX_SCENE_LAYERS   512u
 
-#define WE_LAYER_DIRTY_ORIGIN  (1u << 0)
-#define WE_LAYER_DIRTY_SCALE   (1u << 1)
-#define WE_LAYER_DIRTY_ANGLES  (1u << 2)
-#define WE_LAYER_DIRTY_ALPHA   (1u << 3)
-#define WE_LAYER_DIRTY_COLOR   (1u << 4)
-#define WE_LAYER_DIRTY_VISIBLE (1u << 5)
-#define WE_LAYER_DIRTY_SIZE    (1u << 6)
+#define WE_LAYER_DIRTY_ORIGIN    (1u << 0)
+#define WE_LAYER_DIRTY_SCALE     (1u << 1)
+#define WE_LAYER_DIRTY_ANGLES    (1u << 2)
+#define WE_LAYER_DIRTY_ALPHA     (1u << 3)
+#define WE_LAYER_DIRTY_COLOR     (1u << 4)
+#define WE_LAYER_DIRTY_VISIBLE   (1u << 5)
+#define WE_LAYER_DIRTY_SIZE      (1u << 6)
+#define WE_LAYER_DIRTY_TEXT      (1u << 7)
+#define WE_LAYER_DIRTY_POINTSIZE (1u << 8)
+#define WE_LAYER_DIRTY_VOLUME    (1u << 9)
+#define WE_LAYER_DIRTY_AUDIO_CMD (1u << 10)
+#define WE_LAYER_DIRTY_HALIGN    (1u << 11)
+#define WE_LAYER_DIRTY_VALIGN    (1u << 12)
 
 typedef enum {
     WE_SCRIPT_PROP_ORIGIN = 0,
@@ -32,6 +38,9 @@ typedef enum {
     WE_SCRIPT_PROP_COLOR = 4,
     WE_SCRIPT_PROP_VISIBLE = 5,
     WE_SCRIPT_PROP_UNIFORM = 6,
+    WE_SCRIPT_PROP_TEXT = 7,
+    WE_SCRIPT_PROP_POINTSIZE = 8,
+    WE_SCRIPT_PROP_VOLUME = 9,
 } we_script_prop_target_t;
 
 typedef struct {
@@ -43,6 +52,13 @@ typedef struct {
     float color[3];
     bool visible;
     char name[128];
+    char text[512];
+    int32_t pointsize;
+    char halign[32];
+    char valign[32];
+    float volume;
+    bool audio_playing;
+    uint8_t audio_cmd; /* 0 = none, 1 = play, 2 = stop, 3 = pause */
     int32_t id;
     uint32_t dirty_mask;
 } we_script_layer_state_t;

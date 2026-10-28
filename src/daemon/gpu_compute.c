@@ -77,7 +77,9 @@ struct gpu_compute_ctx {
     GLint loc_scale_clear;
     GLint loc_scale_has_src;
     GLint loc_scale_span_bounds;
+    GLint loc_scale_gravity;
     int32_t span_bounds[4];
+    float crop_gravity[2];
     GLint loc_kawase_src_res;
     GLint loc_kawase_dst_res;
     GLint loc_kawase_radius;
@@ -214,6 +216,7 @@ static const char *SHADER_SRC_SCALE =
     "uniform highp vec4 u_clear_color;\n"
     "uniform int u_has_src;\n"
     "uniform ivec4 u_span_bounds;\n"
+    "uniform highp vec2 u_crop_gravity;\n"
     "void main() {\n"
     "    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);\n"
     "    if (coord.x >= u_dst_res.x || coord.y >= u_dst_res.y) return;\n"
@@ -240,7 +243,7 @@ static const char *SHADER_SRC_SCALE =
     "            float r_src = src_f.x / src_f.y, r_dst = tot.x / tot.y;\n"
     "            vec2 crop = (r_src > r_dst) ? vec2(src_f.y * r_dst, src_f.y) : vec2(src_f.x, "
     "src_f.x / r_dst);\n"
-    "            vec2 off = (src_f - crop) * 0.5;\n"
+    "            vec2 off = (src_f - crop) * u_crop_gravity;\n"
     "            vec2 s_px = off + (soff + vec2(coord) + 0.5) * crop / tot;\n"
     "            out_col = texture(u_src, clamp(s_px, vec2(0.5), src_f - 0.5) / src_f);\n"
     "        }\n"
@@ -487,6 +490,9 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
     ctx->loc_scale_clear = glGetUniformLocation(ctx->prog_scale, "u_clear_color");
     ctx->loc_scale_has_src = glGetUniformLocation(ctx->prog_scale, "u_has_src");
     ctx->loc_scale_span_bounds = glGetUniformLocation(ctx->prog_scale, "u_span_bounds");
+    ctx->loc_scale_gravity = glGetUniformLocation(ctx->prog_scale, "u_crop_gravity");
+    ctx->crop_gravity[0] = 0.5f;
+    ctx->crop_gravity[1] = 0.5f;
     ctx->loc_kawase_src_res = glGetUniformLocation(ctx->prog_kawase, "u_src_res");
     ctx->loc_kawase_dst_res = glGetUniformLocation(ctx->prog_kawase, "u_dst_res");
     ctx->loc_kawase_radius = glGetUniformLocation(ctx->prog_kawase, "u_radius");
@@ -1381,6 +1387,22 @@ void gpu_compute_set_span_bounds(gpu_compute_ctx_t *ctx, int32_t off_x, int32_t 
     ctx->span_bounds[3] = total_h;
 }
 
+void gpu_compute_set_crop_gravity(gpu_compute_ctx_t *ctx, float gx, float gy)
+{
+    if (!ctx)
+        return;
+    if (gx < 0.0f)
+        gx = 0.0f;
+    if (gx > 1.0f)
+        gx = 1.0f;
+    if (gy < 0.0f)
+        gy = 0.0f;
+    if (gy > 1.0f)
+        gy = 1.0f;
+    ctx->crop_gravity[0] = gx;
+    ctx->crop_gravity[1] = gy;
+}
+
 bool gpu_compute_upload_static(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, uint32_t src_w,
                                uint32_t src_h, dmabuf_bo_t *dst_bo, waywal_scaling_mode_t scaling,
                                uint32_t clear_color)
@@ -1443,6 +1465,8 @@ bool gpu_compute_upload_static(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba, 
     if (ctx->loc_scale_span_bounds >= 0)
         glUniform4i(ctx->loc_scale_span_bounds, ctx->span_bounds[0], ctx->span_bounds[1],
                     ctx->span_bounds[2], ctx->span_bounds[3]);
+    if (ctx->loc_scale_gravity >= 0)
+        glUniform2f(ctx->loc_scale_gravity, ctx->crop_gravity[0], ctx->crop_gravity[1]);
 
     GLuint groups_x = (dst_bo->width + 15) / 16;
     GLuint groups_y = (dst_bo->height + 15) / 16;
@@ -1539,6 +1563,8 @@ bool gpu_compute_scale_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *src_bo, dmabuf_bo
     if (ctx->loc_scale_span_bounds >= 0)
         glUniform4i(ctx->loc_scale_span_bounds, ctx->span_bounds[0], ctx->span_bounds[1],
                     ctx->span_bounds[2], ctx->span_bounds[3]);
+    if (ctx->loc_scale_gravity >= 0)
+        glUniform2f(ctx->loc_scale_gravity, ctx->crop_gravity[0], ctx->crop_gravity[1]);
 
     GLuint groups_x = (dst_bo->width + 15) / 16;
     GLuint groups_y = (dst_bo->height + 15) / 16;

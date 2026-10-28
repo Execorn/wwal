@@ -217,15 +217,15 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
             if (out->has_image && out->state->wallpaper_rgba) {
                 output_node_render_image(out->state, out, out->state->wallpaper_rgba,
                                          out->state->wallpaper_w, out->state->wallpaper_h);
+            } else if (!out->has_image) {
                 if (out->state->on_output_configured) {
                     out->state->on_output_configured(out->state, out);
                 }
-            } else if (out->has_image && out->state->on_output_configured) {
-                out->state->on_output_configured(out->state, out);
-            } else if (!out->has_image) {
-                color_rgba_t col =
-                    out->has_fill_color ? out->fill_color : out->state->current_color;
-                output_node_render_color(out->state, out, col);
+                if (!out->has_image) {
+                    color_rgba_t col =
+                        out->has_fill_color ? out->fill_color : out->state->current_color;
+                    output_node_render_color(out->state, out, col);
+                }
             } else {
                 output_commit_frame(out);
             }
@@ -907,15 +907,21 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
 
 void output_node_render_color(daemon_state_t *state, output_node_t *node, color_rgba_t color)
 {
-    if (!state || !node || !node->surface || !node->configured)
+    if (!state || !node)
+        return;
+    node->transition_active = false;
+    node->displaying_color = true;
+    node->active_color = color;
+    node->active_media_path[0] = '\0';
+    node->fill_color = color;
+    node->has_fill_color = true;
+    if (!node->surface || !node->configured)
         return;
     if (node->width <= 0 || node->height <= 0)
         return;
 
     uint32_t pixel = ((uint32_t)color.a << 24) | ((uint32_t)color.r << 16) |
                      ((uint32_t)color.g << 8) | (uint32_t)color.b;
-    node->fill_color = color;
-    node->has_fill_color = true;
     int32_t dst_w = node->logical_width > 0 ? (int32_t)node->logical_width : node->width;
     int32_t dst_h = node->logical_height > 0 ? (int32_t)node->logical_height : node->height;
 
@@ -1449,11 +1455,12 @@ void layer_shell_snapshot_live_output(daemon_state_t *state, output_node_t *out)
     }
 }
 
-void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
-                                 size_t dst_stride_bytes, const uint32_t *src, uint32_t src_w,
-                                 uint32_t src_h, int32_t span_off_x, int32_t span_off_y,
-                                 int32_t span_total_w, int32_t span_total_h, uint32_t filter_mode,
-                                 color_rgba_t bg_color)
+static void waywal_scale_image_span_cpu_ex(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
+                                           size_t dst_stride_bytes, const uint32_t *src,
+                                           uint32_t src_w, uint32_t src_h, int32_t span_off_x,
+                                           int32_t span_off_y, int32_t span_total_w,
+                                           int32_t span_total_h, uint32_t filter_mode,
+                                           color_rgba_t bg_color, double gx, double gy)
 {
     if (!dst || !src || dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0)
         return;
@@ -1470,13 +1477,13 @@ void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
     if (r_src > r_dst) {
         crop_h = (double)src_h;
         crop_w = crop_h * r_dst;
-        off_x = ((double)src_w - crop_w) * 0.5;
+        off_x = ((double)src_w - crop_w) * gx;
         off_y = 0.0;
     } else {
         crop_w = (double)src_w;
         crop_h = crop_w / r_dst;
         off_x = 0.0;
-        off_y = ((double)src_h - crop_h) * 0.5;
+        off_y = ((double)src_h - crop_h) * gy;
     }
 
     double sub_off_x = off_x + ((double)span_off_x / tot_w) * crop_w;
@@ -1486,6 +1493,17 @@ void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
 
     scale_bilinear_rect(dst, dst_w, dst_h, dst_stride_bytes, src, src_w, src_h, 0, 0, dst_w, dst_h,
                         sub_off_x, sub_off_y, sub_crop_w, sub_crop_h, bg_packed, filter_mode);
+}
+
+void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
+                                 size_t dst_stride_bytes, const uint32_t *src, uint32_t src_w,
+                                 uint32_t src_h, int32_t span_off_x, int32_t span_off_y,
+                                 int32_t span_total_w, int32_t span_total_h, uint32_t filter_mode,
+                                 color_rgba_t bg_color)
+{
+    waywal_scale_image_span_cpu_ex(dst, dst_w, dst_h, dst_stride_bytes, src, src_w, src_h,
+                                   span_off_x, span_off_y, span_total_w, span_total_h, filter_mode,
+                                   bg_color, 0.5, 0.5);
 }
 
 static void copy_or_scale_image_ex(const output_node_t *node, uint32_t *dst, uint32_t dst_w,
@@ -1510,21 +1528,22 @@ static void copy_or_scale_image_ex(const output_node_t *node, uint32_t *dst, uin
 
     switch ((waywal_scaling_mode_t)scaling_mode) {
     case WAYWAL_SCALING_FILL: {
-        /* Crop to fill / cover preserving aspect ratio, centered */
         double r_src = (double)src_w / (double)src_h;
         double r_dst = (double)dst_w / (double)dst_h;
         double crop_w, crop_h, off_x, off_y;
+        double gx = (node && node->has_crop_gravity) ? (double)node->crop_gravity_x : 0.5;
+        double gy = (node && node->has_crop_gravity) ? (double)node->crop_gravity_y : 0.5;
 
         if (r_src > r_dst) {
             crop_h = (double)src_h;
             crop_w = crop_h * r_dst;
-            off_x = ((double)src_w - crop_w) * 0.5;
+            off_x = ((double)src_w - crop_w) * gx;
             off_y = 0.0;
         } else {
             crop_w = (double)src_w;
             crop_h = crop_w / r_dst;
             off_x = 0.0;
-            off_y = ((double)src_h - crop_h) * 0.5;
+            off_y = ((double)src_h - crop_h) * gy;
         }
 
         scale_bilinear_rect(dst, dst_w, dst_h, dst_stride_bytes, src, src_w, src_h, 0, 0, dst_w,
@@ -1603,8 +1622,10 @@ static void copy_or_scale_image_ex(const output_node_t *node, uint32_t *dst, uin
         int32_t off_y = node ? node->span_off_y : 0;
         int32_t tot_w = (node && node->span_total_w > 0) ? node->span_total_w : (int32_t)dst_w;
         int32_t tot_h = (node && node->span_total_h > 0) ? node->span_total_h : (int32_t)dst_h;
-        waywal_scale_image_span_cpu(dst, dst_w, dst_h, dst_stride_bytes, src, src_w, src_h, off_x,
-                                    off_y, tot_w, tot_h, filter_mode, bg_color);
+        double gx = (node && node->has_crop_gravity) ? (double)node->crop_gravity_x : 0.5;
+        double gy = (node && node->has_crop_gravity) ? (double)node->crop_gravity_y : 0.5;
+        waywal_scale_image_span_cpu_ex(dst, dst_w, dst_h, dst_stride_bytes, src, src_w, src_h,
+                                       off_x, off_y, tot_w, tot_h, filter_mode, bg_color, gx, gy);
         break;
     }
     }
@@ -1659,9 +1680,14 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
     if (node->width <= 0 || node->height <= 0 || img_w == 0 || img_h == 0)
         return;
 
+    node->transition_active = false;
+    node->displaying_color = false;
     compute_output_span_bounds(state, node);
     render_engine_set_span_bounds(&state->render_engine, node->span_off_x, node->span_off_y,
                                   node->span_total_w, node->span_total_h);
+    render_engine_set_crop_gravity(&state->render_engine,
+                                   node->has_crop_gravity ? node->crop_gravity_x : 0.5f,
+                                   node->has_crop_gravity ? node->crop_gravity_y : 0.5f);
 
     const uint32_t *src = (const uint32_t *)src_pixels;
     color_rgba_t fill_col = get_output_fill_color(state, node);
@@ -1808,6 +1834,8 @@ void transition_engine_destroy(daemon_state_t *state)
 
 static bool is_target_output(const output_node_t *node, const waywal_img_metadata_t *meta)
 {
+    if (!node)
+        return false;
     if (!meta || meta->num_target_outputs == 0)
         return true;
 
@@ -1820,8 +1848,20 @@ static bool is_target_output(const output_node_t *node, const waywal_img_metadat
         size_t len = strnlen(ptr, remaining);
         if (len == remaining)
             break;
-        if (strcmp(node->name, ptr) == 0)
+        if (strcmp(ptr, "*") == 0 || strcmp(node->name, ptr) == 0)
             return true;
+        if (node->description[0] != '\0') {
+            if (strcmp(node->description, ptr) == 0 || strstr(node->description, ptr) != NULL)
+                return true;
+            if (strncasecmp(ptr, "desc:", 5) == 0) {
+                const char *d = ptr + 5;
+                while (*d == ' ')
+                    d++;
+                if (*d != '\0' &&
+                    (strcmp(node->description, d) == 0 || strstr(node->description, d) != NULL))
+                    return true;
+            }
+        }
         ptr += len + 1;
         remaining -= (uint32_t)(len + 1);
     }
@@ -1871,6 +1911,33 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         if (has_transition) {
             layer_shell_snapshot_live_output(state, pout);
         }
+        if (meta && meta->is_solid_color) {
+            pout->displaying_color = true;
+            pout->active_color = (color_rgba_t){
+                .r = meta->color[0],
+                .g = meta->color[1],
+                .b = meta->color[2],
+                .a = meta->color[3] ? meta->color[3] : 255,
+            };
+            pout->active_media_path[0] = '\0';
+        } else {
+            pout->displaying_color = false;
+            if (meta && meta->filepath[0] != '\0') {
+                snprintf(pout->active_media_path, sizeof(pout->active_media_path), "%s",
+                         meta->filepath);
+            } else {
+                snprintf(pout->active_media_path, sizeof(pout->active_media_path), "<stdin>");
+            }
+        }
+        if (meta && meta->has_crop_gravity) {
+            pout->has_crop_gravity = true;
+            pout->crop_gravity_x = meta->crop_gravity_x;
+            pout->crop_gravity_y = meta->crop_gravity_y;
+        } else if (meta) {
+            pout->has_crop_gravity = false;
+            pout->crop_gravity_x = 0.5f;
+            pout->crop_gravity_y = 0.5f;
+        }
         if (!pout->transition_active)
             continue;
         /* Copy the currently committed (back) buffer into old staging */
@@ -1914,6 +1981,10 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                 out->ten_bit = meta->ten_bit;
             }
             output_node_render_image(state, out, pixels, img_w, img_h);
+            if (meta && meta->is_solid_color) {
+                out->displaying_color = true;
+                state->current_color = out->active_color;
+            }
         }
         render_engine_release_upload_cache(&state->render_engine);
         return true;
@@ -1955,6 +2026,9 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
             };
             out->has_fill_color = true;
         }
+        if (meta && meta->is_solid_color) {
+            state->current_color = out->active_color;
+        }
         out->ten_bit = meta ? meta->ten_bit : false;
         color_rgba_t fill_col = get_output_fill_color(state, out);
         uint32_t clear_color = pack_color_argb(fill_col);
@@ -1962,6 +2036,9 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         compute_output_span_bounds(state, out);
         render_engine_set_span_bounds(&state->render_engine, out->span_off_x, out->span_off_y,
                                       out->span_total_w, out->span_total_h);
+        render_engine_set_crop_gravity(&state->render_engine,
+                                       out->has_crop_gravity ? out->crop_gravity_x : 0.5f,
+                                       out->has_crop_gravity ? out->crop_gravity_y : 0.5f);
 
         if (out->viewport) {
             int32_t dst_w = out->logical_width > 0 ? (int32_t)out->logical_width : out->width;
@@ -2079,6 +2156,9 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
             if (!ensure_shm_buffer(state, out, out->width, out->height) ||
                 !ensure_shm_transition_buffers(out)) {
                 output_node_render_image(state, out, pixels, img_w, img_h);
+                if (meta && meta->is_solid_color) {
+                    out->displaying_color = true;
+                }
                 continue;
             }
             size_t fsz = (size_t)out->width * (size_t)out->height * sizeof(uint32_t);
@@ -2115,6 +2195,20 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         } else {
             cx = meta->transition_center_x;
             cy = meta->transition_center_y;
+            float ref_w = out->width > 0 ? (float)out->width : 1920.0f;
+            float ref_h = out->height > 0 ? (float)out->height : 1080.0f;
+            if (cx > 1.0f) {
+                cx = cx / ref_w;
+                if (cx > 1.0f)
+                    cx = 1.0f;
+            }
+            if (cy > 1.0f) {
+                cy = cy / ref_h;
+                if (cy > 1.0f)
+                    cy = 1.0f;
+            }
+            if (meta->invert_y && !meta->pos_y_inverted)
+                cy = 1.0f - cy;
         }
 
         float wfreq = meta->transition_wave_freq;

@@ -2,6 +2,7 @@
 #ifndef WAYWAL_WE_SCENE_H
 #define WAYWAL_WE_SCENE_H
 
+#include "waywal/audio_fft.h"
 #include "waywal/shader_engine.h"
 #include "waywal/we_particle.h"
 #include "waywal/we_pkg.h"
@@ -26,6 +27,13 @@ extern "C" {
 #define WE_MAX_SCENE_RT_FBOS  16u
 #define WE_MAX_OBJECT_SCRIPTS 8u
 #define WE_SCENE_MAX_OBJECTS  512u
+#define WE_MAX_SOUND_TRACKS   8u
+
+typedef enum {
+    WE_SOUND_MODE_LOOP = 0,
+    WE_SOUND_MODE_SINGLE = 1,
+    WE_SOUND_MODE_RANDOM = 2,
+} we_sound_playback_mode_t;
 
 typedef struct {
     we_script_prop_target_t target;
@@ -218,6 +226,37 @@ typedef struct we_scene_object {
     we_particle_sys_t *particle_sys;
     we_obj_script_t scripts[WE_MAX_OBJECT_SCRIPTS];
     uint32_t script_count;
+
+    /* Sound object ("sound" array in scene.json) */
+    bool is_sound_object;
+    we_sound_playback_mode_t sound_mode;
+    float sound_volume;
+    char user_prop_volume[64];
+    bool sound_startsilent;
+    float sound_mintime;
+    float sound_maxtime;
+    float sound_wait_timer;
+    uint32_t sound_track_count;
+    float *sound_tracks_pcm[WE_MAX_SOUND_TRACKS]; /* Interleaved stereo F32 @ 48000 Hz */
+    size_t sound_tracks_frames[WE_MAX_SOUND_TRACKS];
+    uint32_t sound_active_track;
+    size_t sound_cursor_frame;
+    bool sound_playing;
+    bool sound_paused;
+
+    /* Text layer ("text" object in scene.json) */
+    bool is_text_object;
+    char text_str[512];
+    char user_prop_text[64];
+    char text_font[128];
+    int32_t text_pointsize;
+    char user_prop_pointsize[64];
+    char text_halign[32]; /* "center", "left", "right" */
+    char text_valign[32]; /* "center", "top", "bottom" */
+    int32_t text_padding;
+    bool text_opaque_bg;
+    float text_bg_color[3];
+    bool text_dirty;
 } we_scene_object_t;
 
 typedef struct we_scene {
@@ -312,6 +351,11 @@ typedef struct we_scene {
     bool uses_audio;
     we_script_shared_t script_shared;
 
+    /* Audio output sink & sound RNG state */
+    waywal_audio_fft_t *audio_out;
+    uint64_t sound_rng_state;
+    double last_audio_step_time;
+
     /* Imported DMA-BUF BO cache (for waywal_we_scene_forget_bo) */
     struct {
         const dmabuf_bo_t *bo;
@@ -336,6 +380,17 @@ bool we_workshop_resolve_dir(const char *id_or_path, char *out_dir, size_t out_c
 
 /* Scans Steam Workshop 431960 directories and returns an array of parsed we_project_t items */
 bool we_workshop_scan_all(we_project_t **out_items, size_t *out_count);
+
+/* Locates the preview image file (e.g. preview.jpg/png/gif/webp) for a Workshop directory */
+bool we_workshop_find_preview_file(const char *workshop_dir, char *out_path, size_t out_cap);
+
+/* Sanitizes a Workshop item title for safe UTF-8 filenames without splitting multi-byte codepoints
+ */
+void we_workshop_sanitize_title(const char *title, char *out_buf, size_t out_cap);
+
+/* Populates a directory with human-readable preview symlinks for external pickers and prunes stale
+ * symlinks */
+bool we_workshop_sync_previews(const char *target_dir, size_t *out_synced, size_t *out_pruned);
 
 /* Loads a Workshop scene on the CPU (parses project.json, scene.pkg, scene.json, materials,
  * effects, preprocesses shaders, and parses .tex headers/mipmaps). */
@@ -369,6 +424,19 @@ bool we_scene_set_uniform_override(we_scene_t *scene, const char *name, const fl
 void we_scene_set_album_art(we_scene_t *scene, const uint8_t *rgba, uint32_t w, uint32_t h);
 void we_scene_set_album_art_bgra(we_scene_t *scene, const uint8_t *bgra, uint32_t w, uint32_t h);
 void we_scene_set_media_playing(we_scene_t *scene, float playing);
+
+/* Binds the daemon's audio engine for "sound" layer playback and steps the scene audio mixer */
+void we_scene_set_audio_output(we_scene_t *scene, waywal_audio_fft_t *audio_fft);
+size_t we_scene_step_audio(we_scene_t *scene, float dt_sec);
+
+/* Rasterizes a "text" object's string into its base_pass texture (CPU + GLES) */
+void we_scene_update_text_texture(we_scene_t *scene, we_scene_object_t *obj);
+
+/* Decodes a RIFF/WAV (or compressed audio) buffer in memory to 48000 Hz stereo interleaved float32 */
+bool we_audio_decode_memory(const uint8_t *data, size_t size, float **out_stereo_f32,
+                            size_t *out_frame_count);
+bool we_audio_decode_wav_memory(const uint8_t *data, size_t size, float **out_stereo_f32,
+                                size_t *out_frame_count);
 
 /* Frees all CPU and GPU resources owned by a we_scene_t */
 void we_scene_destroy(we_scene_t *scene);

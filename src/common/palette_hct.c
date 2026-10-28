@@ -4,7 +4,9 @@
 #endif
 #include "waywal/palette_hct.h"
 
+#include "waywal/log.h"
 #include "waywal/path.h"
+#include "waywal/toml_parser.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -14,11 +16,13 @@
 #include <immintrin.h>
 #endif
 #include <math.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -859,7 +863,17 @@ static size_t weighted_kmeans_pp(const weighted_point_t *pts, size_t n_pts,
         }
     }
 
-    return k_target;
+    size_t valid_k = 0;
+    for (size_t c = 0; c < k_target; ++c) {
+        if (centroids[c].weight > 0.0f) {
+            if (valid_k != c) {
+                centroids[valid_k] = centroids[c];
+            }
+            valid_k++;
+        }
+    }
+
+    return valid_k;
 }
 
 /* Algebraic CAM16 correlates under standard sRGB D65 viewing conditions (Li et al. 2017). */
@@ -1524,55 +1538,118 @@ static void synthesize_m3_scheme(waywal_palette_t *pal, waywal_theme_mode_t mode
         pal->successContainer = waywal_palette_generate_tone(90.0f, succ_c, succ_h);
         pal->onSuccessContainer = waywal_palette_generate_tone(10.0f, succ_c, succ_h);
     }
+
+    pal->is_light_mode = (mode == WAYWAL_THEME_LIGHT);
+    pal->source_color = ((uint32_t)pal->primary_paletteKeyColor.r << 16) |
+                        ((uint32_t)pal->primary_paletteKeyColor.g << 8) |
+                        (uint32_t)pal->primary_paletteKeyColor.b;
+}
+
+static uint32_t oklch_to_rgb24(float l, float c_ok, float h_rad)
+{
+    float a = c_ok * cosf(h_rad);
+    float b = c_ok * sinf(h_rad);
+    float r_lin = 0.0f, g_lin = 0.0f, b_lin = 0.0f;
+    oklab_to_linear_rgb(l, a, b, &r_lin, &g_lin, &b_lin);
+    uint8_t r = linear_to_srgb_u8(r_lin);
+    uint8_t g = linear_to_srgb_u8(g_lin);
+    uint8_t bl = linear_to_srgb_u8(b_lin);
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)bl;
+}
+
+static waywal_oklch_t rgba_to_oklch_seed(color_rgba_t col, float fallback_h_rad)
+{
+    ensure_srgb_lut();
+    waywal_oklab_t ok =
+        linear_rgb_to_oklab(g_srgb_to_linear[col.r], g_srgb_to_linear[col.g], g_srgb_to_linear[col.b]);
+    float c = sqrtf(ok.a * ok.a + ok.b * ok.b);
+    float h = (c > 1e-4f) ? wrap_radians(atan2f(ok.b, ok.a)) : fallback_h_rad;
+    return (waywal_oklch_t){.l = clamp_f(ok.l, 0.2f, 0.85f), .c = c, .h_rad = h};
+}
+
+void waywal_palette_derive_opposite(const waywal_palette_t *src, waywal_palette_t *out_opp)
+{
+    if (!src || !out_opp) {
+        return;
+    }
+
+    waywal_palette_t src_copy = *src;
+    waywal_theme_mode_t opp_mode =
+        (src_copy.mode == WAYWAL_THEME_DARK) ? WAYWAL_THEME_LIGHT : WAYWAL_THEME_DARK;
+
+    waywal_oklch_t p_seed = src_copy.primary_seed;
+    waywal_oklch_t s_seed = src_copy.secondary_seed;
+    waywal_oklch_t t_seed = src_copy.tertiary_seed;
+    waywal_oklch_t n_seed = src_copy.neutral_seed;
+    waywal_oklch_t nv_seed = src_copy.neutral_variant_seed;
+    bool is_mono = src_copy.is_monochrome;
+
+    if (p_seed.l == 0.0f && p_seed.c == 0.0f && n_seed.l == 0.0f) {
+        p_seed = rgba_to_oklch_seed(src_copy.primary, 250.0f * DEG_TO_RAD_F);
+        float src_c_ok = p_seed.c;
+        if (p_seed.c < 0.04f)
+            p_seed.c = 0.12f;
+        s_seed = rgba_to_oklch_seed(src_copy.secondary,
+                                    wrap_radians(p_seed.h_rad + 15.0f * DEG_TO_RAD_F));
+        if (s_seed.c < 0.03f)
+            s_seed.c = 0.05f;
+        t_seed =
+            rgba_to_oklch_seed(src_copy.tertiary, wrap_radians(p_seed.h_rad + 60.0f * DEG_TO_RAD_F));
+        if (t_seed.c < 0.04f)
+            t_seed.c = 0.08f;
+        n_seed = (waywal_oklch_t){.l = 0.5f, .c = 0.018f, .h_rad = p_seed.h_rad};
+        nv_seed = (waywal_oklch_t){.l = 0.5f, .c = 0.036f, .h_rad = p_seed.h_rad};
+        apply_scheme_variant_seeds(src_copy.variant, src_c_ok, &p_seed, &s_seed, &t_seed, &n_seed,
+                                   &nv_seed, &is_mono);
+    }
+
+    synthesize_m3_scheme(out_opp, opp_mode, src_copy.variant, src_copy.contrast, is_mono, p_seed,
+                         s_seed, t_seed, n_seed, nv_seed);
+
+    if (src_copy.seed_count > 0U || src_copy.source_color != 0U) {
+        out_opp->source_color = src_copy.source_color;
+    }
+    memcpy(out_opp->seeds, src_copy.seeds, sizeof(out_opp->seeds));
+    out_opp->seed_count = src_copy.seed_count;
+    out_opp->source_color_index = src_copy.source_color_index;
+    out_opp->is_light_mode = (opp_mode == WAYWAL_THEME_LIGHT);
+    memcpy(out_opp->wallpaper_path, src_copy.wallpaper_path, sizeof(out_opp->wallpaper_path));
 }
 
 static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t height,
                               uint32_t stride_bytes, bool is_bgra, waywal_scheme_variant_t variant,
-                              float contrast, waywal_palette_t *out_dark,
+                              float contrast, uint8_t source_color_index, bool has_seed_override,
+                              uint32_t seed_override_rgb, waywal_palette_t *out_dark,
                               waywal_palette_t *out_light)
 {
-    if (!pixels || width == 0U || height == 0U || (!out_dark && !out_light)) {
+    if ((!out_dark && !out_light) || (!has_seed_override && (!pixels || width == 0U || height == 0U))) {
         return false;
     }
-    if (stride_bytes < width * 4U) {
+    if (pixels && width > 0U && stride_bytes < width * 4U) {
         stride_bytes = width * 4U;
     }
 
     ensure_srgb_lut();
 
-    wu_hist_t *hist = (wu_hist_t *)aligned_alloc(32, sizeof(wu_hist_t));
-    if (!hist) {
-        return false;
-    }
-
-    size_t valid_samples =
-        wu_populate_histogram(hist, pixels, width, height, stride_bytes, is_bgra);
-    if (valid_samples == 0) {
-        free(hist);
-        waywal_oklch_t def_p = {.l = 0.6f, .c = 0.02f, .h_rad = 4.5f};
-        waywal_oklch_t def_s = {.l = 0.6f, .c = 0.015f, .h_rad = 4.5f};
-        waywal_oklch_t def_t = {.l = 0.6f, .c = 0.02f, .h_rad = 5.5f};
-        waywal_oklch_t def_n = {.l = 0.6f, .c = 0.01f, .h_rad = 4.5f};
-        waywal_oklch_t def_nv = {.l = 0.6f, .c = 0.02f, .h_rad = 4.5f};
-        if (out_dark) {
-            synthesize_m3_scheme(out_dark, WAYWAL_THEME_DARK, variant, contrast, true, def_p, def_s,
-                                 def_t, def_n, def_nv);
-        }
-        if (out_light) {
-            synthesize_m3_scheme(out_light, WAYWAL_THEME_LIGHT, variant, contrast, true, def_p,
-                                 def_s, def_t, def_n, def_nv);
-        }
-        return true;
-    }
-
-    wu_compute_moments(hist);
-
-    weighted_point_t wu_boxes[WU_MAX_BOXES];
-    size_t n_boxes = wu_partition(hist, wu_boxes, WU_MAX_BOXES);
-    free(hist);
-
+    size_t n_clusters = 0;
     weighted_point_t clusters[KMEANS_K];
-    size_t n_clusters = weighted_kmeans_pp(wu_boxes, n_boxes, clusters, KMEANS_K);
+    if (pixels && width > 0U && height > 0U) {
+        wu_hist_t *hist = (wu_hist_t *)aligned_alloc(32, sizeof(wu_hist_t));
+        if (!hist) {
+            return false;
+        }
+        size_t valid_samples =
+            wu_populate_histogram(hist, pixels, width, height, stride_bytes, is_bgra);
+        if (valid_samples > 0) {
+            wu_compute_moments(hist);
+            weighted_point_t wu_boxes[WU_MAX_BOXES];
+            size_t n_boxes = wu_partition(hist, wu_boxes, WU_MAX_BOXES);
+            free(hist);
+            n_clusters = weighted_kmeans_pp(wu_boxes, n_boxes, clusters, KMEANS_K);
+        } else {
+            free(hist);
+        }
+    }
 
     float total_weight = 0.0f;
     for (size_t i = 0; i < n_clusters; ++i) {
@@ -1623,6 +1700,7 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
         } else if (l > 0.92f) {
             light_penalty = (1.0f - l) / 0.08f * 0.3f;
         }
+        light_penalty = clamp_f(light_penalty, 0.02f, 1.0f);
 
         /* Dampen desaturated skin-tone / muddy brown clusters so vibrant accents win. */
         float skin_penalty = 1.0f;
@@ -1651,10 +1729,77 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
         }
     }
 
+    uint32_t extracted_seeds[4] = {0};
+    uint8_t extracted_seed_count = (uint8_t)(n_clusters < 4U ? n_clusters : 4U);
+    for (uint8_t k = 0; k < extracted_seed_count; ++k) {
+        extracted_seeds[k] = oklch_to_rgb24(cands[k].l, cands[k].c_ok, cands[k].h_rad);
+    }
+
+    uint8_t clamped_idx = (source_color_index <= 3U) ? source_color_index : 0U;
+    uint8_t effective_idx = 0U;
+    uint32_t chosen_seed_rgb = (extracted_seed_count > 0) ? extracted_seeds[0] : 0U;
+
+    if (!has_seed_override) {
+        effective_idx =
+            (n_clusters > 0U)
+                ? (uint8_t)((clamped_idx < n_clusters) ? clamped_idx : (n_clusters - 1U))
+                : 0U;
+        if (effective_idx > 0U && n_clusters > 0U) {
+            size_t sel = (size_t)effective_idx;
+            candidate_t tmp = cands[0];
+            cands[0] = cands[sel];
+            cands[sel] = tmp;
+            if (sel < 4U) {
+                chosen_seed_rgb = extracted_seeds[sel];
+            }
+        }
+    }
+
     bool is_mono = (max_c_ok < 0.018f);
     waywal_oklch_t p_seed, s_seed, t_seed, n_seed, nv_seed;
+    float src_c_ok = (n_clusters > 0) ? cands[0].c_ok : 0.0f;
 
-    if (is_mono || n_clusters == 0) {
+    if (has_seed_override) {
+        uint8_t sr = (uint8_t)((seed_override_rgb >> 16) & 0xFFU);
+        uint8_t sg = (uint8_t)((seed_override_rgb >> 8) & 0xFFU);
+        uint8_t sb = (uint8_t)(seed_override_rgb & 0xFFU);
+        waywal_oklab_t ok =
+            linear_rgb_to_oklab(g_srgb_to_linear[sr], g_srgb_to_linear[sg], g_srgb_to_linear[sb]);
+        float c_ok = sqrtf(ok.a * ok.a + ok.b * ok.b);
+        float h_rad = (c_ok > 1e-4f) ? wrap_radians(atan2f(ok.b, ok.a)) : (250.0f * DEG_TO_RAD_F);
+        src_c_ok = c_ok;
+        is_mono = (c_ok < 0.018f);
+        if (is_mono) {
+            p_seed = (waywal_oklch_t){.l = 0.65f, .c = 0.02f, .h_rad = h_rad};
+            s_seed = (waywal_oklch_t){
+                .l = 0.65f, .c = 0.015f, .h_rad = wrap_radians(h_rad + 60.0f * DEG_TO_RAD_F)};
+            t_seed = (waywal_oklch_t){
+                .l = 0.65f, .c = 0.02f, .h_rad = wrap_radians(h_rad + 120.0f * DEG_TO_RAD_F)};
+            n_seed = (waywal_oklch_t){.l = 0.65f, .c = 0.008f, .h_rad = h_rad};
+            nv_seed = (waywal_oklch_t){.l = 0.65f, .c = 0.014f, .h_rad = h_rad};
+        } else {
+            float p_c = clamp_f(c_ok, 0.09f, 0.20f);
+            p_seed = (waywal_oklch_t){.l = clamp_f(ok.l, 0.35f, 0.75f), .c = p_c, .h_rad = h_rad};
+            s_seed = (waywal_oklch_t){
+                .l = p_seed.l,
+                .c = clamp_f(p_c * 0.38f, 0.035f, 0.065f),
+                .h_rad = wrap_radians(h_rad + 15.0f * DEG_TO_RAD_F),
+            };
+            t_seed = (waywal_oklch_t){
+                .l = p_seed.l,
+                .c = clamp_f(p_c * 0.65f, 0.06f, 0.11f),
+                .h_rad = wrap_radians(h_rad + 60.0f * DEG_TO_RAD_F),
+            };
+            n_seed = (waywal_oklch_t){.l = 0.5f, .c = 0.018f, .h_rad = h_rad};
+            nv_seed = (waywal_oklch_t){.l = 0.5f, .c = 0.036f, .h_rad = h_rad};
+        }
+        chosen_seed_rgb = seed_override_rgb & 0xFFFFFFU;
+        extracted_seeds[0] = chosen_seed_rgb;
+        if (extracted_seed_count == 0U) {
+            extracted_seed_count = 1U;
+        }
+        effective_idx = 0U;
+    } else if (is_mono || n_clusters == 0) {
         float h =
             (n_clusters > 0 && cands[0].c_ok > 1e-4f) ? cands[0].h_rad : (250.0f * DEG_TO_RAD_F);
         p_seed = (waywal_oklch_t){.l = 0.65f, .c = 0.02f, .h_rad = h};
@@ -1726,19 +1871,63 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
         nv_seed = (waywal_oklch_t){.l = 0.5f, .c = 0.036f, .h_rad = p_h};
     }
 
-    float src_c_ok = (n_clusters > 0) ? cands[0].c_ok : 0.0f;
     apply_scheme_variant_seeds(variant, src_c_ok, &p_seed, &s_seed, &t_seed, &n_seed, &nv_seed,
                                &is_mono);
 
     if (out_dark) {
         synthesize_m3_scheme(out_dark, WAYWAL_THEME_DARK, variant, contrast, is_mono, p_seed,
                              s_seed, t_seed, n_seed, nv_seed);
+        if (extracted_seed_count > 0U || has_seed_override) {
+            out_dark->source_color = chosen_seed_rgb;
+        }
+        memcpy(out_dark->seeds, extracted_seeds, sizeof(extracted_seeds));
+        out_dark->seed_count = extracted_seed_count;
+        out_dark->source_color_index = effective_idx;
+        out_dark->is_light_mode = false;
     }
     if (out_light) {
         synthesize_m3_scheme(out_light, WAYWAL_THEME_LIGHT, variant, contrast, is_mono, p_seed,
                              s_seed, t_seed, n_seed, nv_seed);
+        if (extracted_seed_count > 0U || has_seed_override) {
+            out_light->source_color = chosen_seed_rgb;
+        }
+        memcpy(out_light->seeds, extracted_seeds, sizeof(extracted_seeds));
+        out_light->seed_count = extracted_seed_count;
+        out_light->source_color_index = effective_idx;
+        out_light->is_light_mode = true;
     }
     return true;
+}
+
+bool waywal_palette_extract_dual_ex(const uint8_t *pixels, uint32_t width, uint32_t height,
+                                    uint32_t stride_bytes, bool is_bgra,
+                                    waywal_scheme_variant_t variant, float contrast,
+                                    uint8_t source_color_index, bool has_seed_override,
+                                    uint32_t seed_override_rgb, waywal_palette_t *out_dark,
+                                    waywal_palette_t *out_light)
+{
+    return extract_dual_impl(pixels, width, height, stride_bytes, is_bgra, variant, contrast,
+                             source_color_index, has_seed_override, seed_override_rgb, out_dark,
+                             out_light);
+}
+
+bool waywal_palette_extract_seed_ex(const uint8_t *pixels, uint32_t width, uint32_t height,
+                                    uint32_t stride_bytes, bool is_bgra, waywal_theme_mode_t mode,
+                                    waywal_scheme_variant_t variant, float contrast,
+                                    uint8_t source_color_index, bool has_seed_override,
+                                    uint32_t seed_override_rgb, waywal_palette_t *out_palette)
+{
+    if (!out_palette) {
+        return false;
+    }
+    if (mode == WAYWAL_THEME_LIGHT) {
+        return extract_dual_impl(pixels, width, height, stride_bytes, is_bgra, variant, contrast,
+                                 source_color_index, has_seed_override, seed_override_rgb, NULL,
+                                 out_palette);
+    }
+    return extract_dual_impl(pixels, width, height, stride_bytes, is_bgra, variant, contrast,
+                             source_color_index, has_seed_override, seed_override_rgb, out_palette,
+                             NULL);
 }
 
 bool waywal_palette_extract_dual(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
@@ -1746,7 +1935,7 @@ bool waywal_palette_extract_dual(const uint8_t *rgba_pixels, uint32_t width, uin
                                  waywal_palette_t *out_light)
 {
     return extract_dual_impl(rgba_pixels, width, height, stride_bytes, false,
-                             WAYWAL_SCHEME_TONAL_SPOT, 0.0f, out_dark, out_light);
+                             WAYWAL_SCHEME_TONAL_SPOT, 0.0f, 0U, false, 0U, out_dark, out_light);
 }
 
 bool waywal_palette_extract_dual_bgra(const uint8_t *bgra_pixels, uint32_t width, uint32_t height,
@@ -1754,7 +1943,7 @@ bool waywal_palette_extract_dual_bgra(const uint8_t *bgra_pixels, uint32_t width
                                       waywal_palette_t *out_light)
 {
     return extract_dual_impl(bgra_pixels, width, height, stride_bytes, true,
-                             WAYWAL_SCHEME_TONAL_SPOT, 0.0f, out_dark, out_light);
+                             WAYWAL_SCHEME_TONAL_SPOT, 0.0f, 0U, false, 0U, out_dark, out_light);
 }
 
 bool waywal_palette_extract_ex(const uint8_t *pixels, uint32_t width, uint32_t height,
@@ -1762,15 +1951,8 @@ bool waywal_palette_extract_ex(const uint8_t *pixels, uint32_t width, uint32_t h
                                waywal_scheme_variant_t variant, float contrast,
                                waywal_palette_t *out_palette)
 {
-    if (!out_palette) {
-        return false;
-    }
-    if (mode == WAYWAL_THEME_LIGHT) {
-        return extract_dual_impl(pixels, width, height, stride_bytes, is_bgra, variant, contrast,
-                                 NULL, out_palette);
-    }
-    return extract_dual_impl(pixels, width, height, stride_bytes, is_bgra, variant, contrast,
-                             out_palette, NULL);
+    return waywal_palette_extract_seed_ex(pixels, width, height, stride_bytes, is_bgra, mode,
+                                          variant, contrast, 0U, false, 0U, out_palette);
 }
 
 bool waywal_palette_extract(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
@@ -1990,17 +2172,109 @@ static bool mkdir_parents(const char *file_path)
     return true;
 }
 
+static bool resolve_target_or_parent_realpath(const char *path, char *out_resolved, size_t cap)
+{
+    if (!path || path[0] == '\0' || !out_resolved || cap == 0) {
+        return false;
+    }
+
+    char cur[WAYWAL_PATH_MAX];
+    int n = snprintf(cur, sizeof(cur), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(cur)) {
+        return false;
+    }
+    if (cur[0] == '/') {
+        waywal_normalize_path(cur);
+    }
+
+    char rp[WAYWAL_PATH_MAX];
+    for (int depth = 0; depth < 8; ++depth) {
+        if (realpath(cur, rp) != NULL) {
+            int rn = snprintf(out_resolved, cap, "%s", rp);
+            return (rn >= 0 && (size_t)rn < cap);
+        }
+        struct stat st;
+        if (lstat(cur, &st) != 0 || !S_ISLNK(st.st_mode)) {
+            break;
+        }
+        char link_buf[WAYWAL_PATH_MAX];
+        ssize_t llen = readlink(cur, link_buf, sizeof(link_buf) - 1);
+        if (llen <= 0) {
+            break;
+        }
+        link_buf[llen] = '\0';
+        char next_cur[WAYWAL_PATH_MAX];
+        if (link_buf[0] == '/') {
+            n = snprintf(next_cur, sizeof(next_cur), "%s", link_buf);
+        } else {
+            char *slash = strrchr(cur, '/');
+            if (slash && slash != cur) {
+                *slash = '\0';
+                n = snprintf(next_cur, sizeof(next_cur), "%s/%s", cur, link_buf);
+            } else if (slash == cur) {
+                n = snprintf(next_cur, sizeof(next_cur), "/%s", link_buf);
+            } else {
+                n = snprintf(next_cur, sizeof(next_cur), "%s", link_buf);
+            }
+        }
+        if (n < 0 || (size_t)n >= sizeof(next_cur)) {
+            return false;
+        }
+        if (next_cur[0] == '/') {
+            waywal_normalize_path(next_cur);
+        }
+        memcpy(cur, next_cur, (size_t)n + 1);
+    }
+
+    if (cur[0] == '/') {
+        char probe[WAYWAL_PATH_MAX];
+        snprintf(probe, sizeof(probe), "%s", cur);
+        while (probe[0] == '/' && strcmp(probe, "/") != 0) {
+            char *slash = strrchr(probe, '/');
+            if (!slash || slash == probe) {
+                break;
+            }
+            size_t prefix_len = (size_t)(slash - probe);
+            probe[prefix_len] = '\0';
+            if (realpath(probe, rp) != NULL) {
+                char joined[WAYWAL_PATH_MAX];
+                int jn = snprintf(joined, sizeof(joined), "%s%s", rp, cur + prefix_len);
+                if (jn < 0 || (size_t)jn >= sizeof(joined)) {
+                    return false;
+                }
+                waywal_normalize_path(joined);
+                int on = snprintf(out_resolved, cap, "%s", joined);
+                return (on >= 0 && (size_t)on < cap);
+            }
+        }
+    }
+
+    int on = snprintf(out_resolved, cap, "%s", cur);
+    return (on >= 0 && (size_t)on < cap);
+}
+
 static bool atomic_write_file(const char *target_path, const char *data, size_t len)
 {
     if (!target_path || !data) {
         return false;
     }
-    if (!mkdir_parents(target_path)) {
+
+    char resolved_target[WAYWAL_PATH_MAX];
+    const char *write_path = target_path;
+    struct stat st;
+    if (lstat(target_path, &st) == 0 && S_ISLNK(st.st_mode)) {
+        if (resolve_target_or_parent_realpath(target_path, resolved_target,
+                                              sizeof(resolved_target))) {
+            write_path = resolved_target;
+        }
+    }
+
+    if (!mkdir_parents(write_path)) {
         return false;
     }
 
     char tmp_path[WAYWAL_PATH_MAX];
-    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", target_path, (int)getpid());
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", write_path, (int)getpid());
     if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
         return false;
     }
@@ -2030,7 +2304,7 @@ static bool atomic_write_file(const char *target_path, const char *data, size_t 
         unlink(tmp_path);
         return false;
     }
-    if (rename(tmp_path, target_path) != 0) {
+    if (rename(tmp_path, write_path) != 0) {
         unlink(tmp_path);
         return false;
     }
@@ -2128,10 +2402,765 @@ static size_t format_wwal_hyprland(const named_color_slot_t *slots, size_t n_slo
     return pos;
 }
 
-static bool render_single_template(const waywal_palette_t *pal, const named_color_slot_t *slots,
-                                   size_t n_slots, const char *src, size_t src_len,
-                                   const char *out_path)
+static void normalize_role_key(const char *in, char *out, size_t cap)
 {
+    size_t w = 0;
+    for (const char *p = in; *p != '\0' && w + 1 < cap; ++p) {
+        if (*p == '_' || *p == '-') {
+            continue;
+        }
+        out[w++] = (char)tolower((unsigned char)*p);
+    }
+    out[w] = '\0';
+}
+
+static bool parse_hex_literal_color(const char *s, color_rgba_t *out_col)
+{
+    if (!s)
+        return false;
+    while (*s && isspace((unsigned char)*s))
+        s++;
+    if (s[0] == '#')
+        s++;
+    else if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+        s += 2;
+    else
+        return false;
+
+    size_t len = 0;
+    while (isxdigit((unsigned char)s[len]))
+        len++;
+    if (len != 3 && len != 6 && len != 8)
+        return false;
+    const char *after = s + len;
+    while (*after && isspace((unsigned char)*after))
+        after++;
+    if (*after != '\0')
+        return false;
+
+    char hex_buf[12];
+    memcpy(hex_buf, s, len);
+    hex_buf[len] = '\0';
+    unsigned long v = strtoul(hex_buf, NULL, 16);
+    if (len == 3) {
+        uint8_t r = (uint8_t)((v >> 8) & 0xFU);
+        uint8_t g = (uint8_t)((v >> 4) & 0xFU);
+        uint8_t b = (uint8_t)(v & 0xFU);
+        out_col->r = (uint8_t)((r << 4) | r);
+        out_col->g = (uint8_t)((g << 4) | g);
+        out_col->b = (uint8_t)((b << 4) | b);
+        out_col->a = 255U;
+    } else if (len == 6) {
+        out_col->r = (uint8_t)((v >> 16) & 0xFFU);
+        out_col->g = (uint8_t)((v >> 8) & 0xFFU);
+        out_col->b = (uint8_t)(v & 0xFFU);
+        out_col->a = 255U;
+    } else {
+        out_col->r = (uint8_t)((v >> 24) & 0xFFU);
+        out_col->g = (uint8_t)((v >> 16) & 0xFFU);
+        out_col->b = (uint8_t)((v >> 8) & 0xFFU);
+        out_col->a = (uint8_t)(v & 0xFFU);
+    }
+    return true;
+}
+
+static bool resolve_palette_role_color(const waywal_palette_t *pal, const char *role,
+                                       color_rgba_t *out_col)
+{
+    if (!pal || !role || !out_col) {
+        return false;
+    }
+
+    if (parse_hex_literal_color(role, out_col)) {
+        return true;
+    }
+
+    char norm[64];
+    normalize_role_key(role, norm, sizeof(norm));
+
+    if (strcmp(norm, "sourcecolor") == 0) {
+        if (pal->seed_count > 0U || pal->source_color != 0U) {
+            out_col->r = (uint8_t)((pal->source_color >> 16) & 0xFFU);
+            out_col->g = (uint8_t)((pal->source_color >> 8) & 0xFFU);
+            out_col->b = (uint8_t)(pal->source_color & 0xFFU);
+            out_col->a = 255U;
+        } else {
+            *out_col = pal->primary_paletteKeyColor;
+        }
+        return true;
+    }
+    if (strcmp(norm, "foreground") == 0) {
+        *out_col = pal->onSurface;
+        return true;
+    }
+    if (strcmp(norm, "cursor") == 0) {
+        *out_col = pal->secondary;
+        return true;
+    }
+    if (strncmp(norm, "color", 5) == 0 && isdigit((unsigned char)norm[5])) {
+        char *end = NULL;
+        unsigned long idx = strtoul(norm + 5, &end, 10);
+        if (end && *end == '\0' && idx < 16UL) {
+            *out_col = pal->term[idx];
+            return true;
+        }
+    }
+
+    named_color_slot_t slots[128];
+    size_t n_slots = collect_color_slots(pal, slots);
+    for (size_t i = 0; i < n_slots; ++i) {
+        if (strcmp(slots[i].name, role) == 0) {
+            *out_col = slots[i].color;
+            return true;
+        }
+        char slot_norm[64];
+        normalize_role_key(slots[i].name, slot_norm, sizeof(slot_norm));
+        if (strcmp(slot_norm, norm) == 0) {
+            *out_col = slots[i].color;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_color_format_prop(const char *prop)
+{
+    if (!prop || prop[0] == '\0')
+        return false;
+    return (strcmp(prop, "hex") == 0 || strcmp(prop, "strip") == 0 ||
+            strcmp(prop, "hex_stripped") == 0 || strcmp(prop, "rgb") == 0 ||
+            strcmp(prop, "rgb_css") == 0 || strcmp(prop, "rgba") == 0 ||
+            strcmp(prop, "xrgba") == 0 || strcmp(prop, "octal") == 0 ||
+            strcmp(prop, "hsl") == 0 || strcmp(prop, "oklch") == 0 ||
+            strcmp(prop, "red") == 0 || strcmp(prop, "r") == 0 ||
+            strcmp(prop, "green") == 0 || strcmp(prop, "g") == 0 ||
+            strcmp(prop, "blue") == 0 || strcmp(prop, "b") == 0 ||
+            strcmp(prop, "alpha") == 0 || strcmp(prop, "a") == 0 ||
+            strcmp(prop, "hue") == 0 || strcmp(prop, "h") == 0 ||
+            strcmp(prop, "saturation") == 0 || strcmp(prop, "s") == 0 ||
+            strcmp(prop, "lightness") == 0 || strcmp(prop, "l") == 0);
+}
+
+static void rgba_to_hsl_deg(color_rgba_t c, float *out_h, float *out_s, float *out_l)
+{
+    float r = (float)c.r / 255.0f;
+    float g = (float)c.g / 255.0f;
+    float b = (float)c.b / 255.0f;
+    float mx = fmaxf(r, fmaxf(g, b));
+    float mn = fminf(r, fminf(g, b));
+    float l = 0.5f * (mx + mn);
+    float d = mx - mn;
+    float h = 0.0f;
+    float s = 0.0f;
+    if (d > 1e-5f) {
+        s = (l > 0.5f) ? (d / (2.0f - mx - mn)) : (d / (mx + mn));
+        if (mx == r) {
+            h = (g - b) / d + (g < b ? 6.0f : 0.0f);
+        } else if (mx == g) {
+            h = (b - r) / d + 2.0f;
+        } else {
+            h = (r - g) / d + 4.0f;
+        }
+        h *= 60.0f;
+    }
+    *out_h = clamp_f(h, 0.0f, 360.0f);
+    *out_s = clamp_f(s * 100.0f, 0.0f, 100.0f);
+    *out_l = clamp_f(l * 100.0f, 0.0f, 100.0f);
+}
+
+static color_rgba_t hsl_deg_to_rgba(float h_deg, float s_pct, float l_pct, uint8_t alpha)
+{
+    h_deg = fmodf(h_deg, 360.0f);
+    if (h_deg < 0.0f) {
+        h_deg += 360.0f;
+    }
+    float s = clamp_f(s_pct * 0.01f, 0.0f, 1.0f);
+    float l = clamp_f(l_pct * 0.01f, 0.0f, 1.0f);
+    float c = (1.0f - fabsf(2.0f * l - 1.0f)) * s;
+    float hp = h_deg / 60.0f;
+    float x = c * (1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f));
+    float m = l - 0.5f * c;
+    float r1 = 0.0f, g1 = 0.0f, b1 = 0.0f;
+    if (hp < 1.0f) {
+        r1 = c;
+        g1 = x;
+    } else if (hp < 2.0f) {
+        r1 = x;
+        g1 = c;
+    } else if (hp < 3.0f) {
+        g1 = c;
+        b1 = x;
+    } else if (hp < 4.0f) {
+        g1 = x;
+        b1 = c;
+    } else if (hp < 5.0f) {
+        r1 = x;
+        b1 = c;
+    } else {
+        r1 = c;
+        b1 = x;
+    }
+    return (color_rgba_t){
+        .r = (uint8_t)clamp_i((int)((r1 + m) * 255.0f + 0.5f), 0, 255),
+        .g = (uint8_t)clamp_i((int)((g1 + m) * 255.0f + 0.5f), 0, 255),
+        .b = (uint8_t)clamp_i((int)((b1 + m) * 255.0f + 0.5f), 0, 255),
+        .a = alpha,
+    };
+}
+
+static int format_color_property(color_rgba_t c, float alpha_f, const char *fmt, char *out_buf,
+                                 size_t out_cap)
+{
+    if (!fmt || fmt[0] == '\0' || strcmp(fmt, "hex") == 0) {
+        return snprintf(out_buf, out_cap, "#%02x%02x%02x", c.r, c.g, c.b);
+    }
+    if (strcmp(fmt, "strip") == 0 || strcmp(fmt, "hex_stripped") == 0) {
+        return snprintf(out_buf, out_cap, "%02x%02x%02x", c.r, c.g, c.b);
+    }
+    if (strcmp(fmt, "rgb") == 0) {
+        return snprintf(out_buf, out_cap, "%u, %u, %u", c.r, c.g, c.b);
+    }
+    if (strcmp(fmt, "rgb_css") == 0) {
+        return snprintf(out_buf, out_cap, "rgb(%u, %u, %u)", c.r, c.g, c.b);
+    }
+    if (strcmp(fmt, "rgba") == 0) {
+        return snprintf(out_buf, out_cap, "rgba(%u, %u, %u, %.2f)", c.r, c.g, c.b,
+                        clamp_f(alpha_f, 0.0f, 1.0f));
+    }
+    if (strcmp(fmt, "xrgba") == 0) {
+        uint8_t a8 = (uint8_t)clamp_i((int)(clamp_f(alpha_f, 0.0f, 1.0f) * 255.0f + 0.5f), 0, 255);
+        return snprintf(out_buf, out_cap, "%02x/%02x/%02x/%02x", c.r, c.g, c.b, a8);
+    }
+    if (strcmp(fmt, "octal") == 0) {
+        return snprintf(out_buf, out_cap, "%03o, %03o, %03o", c.r, c.g, c.b);
+    }
+    if (strcmp(fmt, "red") == 0 || strcmp(fmt, "r") == 0) {
+        return snprintf(out_buf, out_cap, "%u", c.r);
+    }
+    if (strcmp(fmt, "green") == 0 || strcmp(fmt, "g") == 0) {
+        return snprintf(out_buf, out_cap, "%u", c.g);
+    }
+    if (strcmp(fmt, "blue") == 0 || strcmp(fmt, "b") == 0) {
+        return snprintf(out_buf, out_cap, "%u", c.b);
+    }
+    if (strcmp(fmt, "alpha") == 0 || strcmp(fmt, "a") == 0) {
+        return snprintf(out_buf, out_cap, "%.2f", clamp_f(alpha_f, 0.0f, 1.0f));
+    }
+    if (strcmp(fmt, "hsl") == 0 || strcmp(fmt, "hue") == 0 || strcmp(fmt, "h") == 0 ||
+        strcmp(fmt, "saturation") == 0 || strcmp(fmt, "s") == 0 ||
+        strcmp(fmt, "lightness") == 0 || strcmp(fmt, "l") == 0) {
+        float h = 0.0f, s = 0.0f, l = 0.0f;
+        rgba_to_hsl_deg(c, &h, &s, &l);
+        if (strcmp(fmt, "hsl") == 0) {
+            return snprintf(out_buf, out_cap, "hsl(%.0f, %.0f%%, %.0f%%)", h, s, l);
+        }
+        if (strcmp(fmt, "hue") == 0 || strcmp(fmt, "h") == 0) {
+            return snprintf(out_buf, out_cap, "%.0f", h);
+        }
+        if (strcmp(fmt, "saturation") == 0 || strcmp(fmt, "s") == 0) {
+            return snprintf(out_buf, out_cap, "%.0f", s);
+        }
+        return snprintf(out_buf, out_cap, "%.0f", l);
+    }
+    if (strcmp(fmt, "oklch") == 0) {
+        ensure_srgb_lut();
+        waywal_oklab_t ok =
+            linear_rgb_to_oklab(g_srgb_to_linear[c.r], g_srgb_to_linear[c.g], g_srgb_to_linear[c.b]);
+        float ch = sqrtf(ok.a * ok.a + ok.b * ok.b);
+        float hd = (ch > 1e-4f) ? (wrap_radians(atan2f(ok.b, ok.a)) * RAD_TO_DEG_F) : 0.0f;
+        return snprintf(out_buf, out_cap, "oklch(%.3f %.3f %.1f)", ok.l, ch, hd);
+    }
+    return -1;
+}
+
+static bool resolve_base_color_expr(const waywal_palette_t *default_pal,
+                                    const waywal_palette_t *dark_pal,
+                                    const waywal_palette_t *light_pal, const char *base_expr,
+                                    color_rgba_t *out_col, char *out_fmt, size_t fmt_cap)
+{
+    char buf[128];
+    while (*base_expr && isspace((unsigned char)*base_expr))
+        base_expr++;
+    size_t blen = strlen(base_expr);
+    while (blen > 0 && isspace((unsigned char)base_expr[blen - 1]))
+        blen--;
+    if (blen == 0 || blen >= sizeof(buf))
+        return false;
+    memcpy(buf, base_expr, blen);
+    buf[blen] = '\0';
+
+    snprintf(out_fmt, fmt_cap, "hex");
+
+    if (parse_hex_literal_color(buf, out_col)) {
+        return true;
+    }
+
+    char *segs[6] = {0};
+    size_t n_segs = 0;
+    char *p = buf;
+    while (p && n_segs < 6) {
+        segs[n_segs++] = p;
+        char *dot = strchr(p, '.');
+        if (!dot)
+            break;
+        if (n_segs == 6)
+            return false;
+        *dot = '\0';
+        p = dot + 1;
+    }
+
+    if (n_segs >= 3 && strcmp(segs[0], "palettes") == 0) {
+        if (n_segs > 4) {
+            return false;
+        }
+        const char *fam = segs[1];
+        const char *tone_str = segs[2];
+        if (tone_str[0] == '\0') {
+            return false;
+        }
+        for (const char *tp = tone_str; *tp != '\0'; ++tp) {
+            if (!isdigit((unsigned char)*tp)) {
+                return false;
+            }
+        }
+        char *end = NULL;
+        float tone = strtof(tone_str, &end);
+        if (!end || end == tone_str || *end != '\0' || !isfinite(tone) || tone < 0.0f ||
+            tone > 100.0f) {
+            return false;
+        }
+        if (n_segs == 4) {
+            if (!is_color_format_prop(segs[3]))
+                return false;
+            snprintf(out_fmt, fmt_cap, "%s", segs[3]);
+        }
+        char fam_norm[32];
+        normalize_role_key(fam, fam_norm, sizeof(fam_norm));
+        waywal_oklch_t seed = default_pal->primary_seed;
+        if (seed.l == 0.0f && seed.c == 0.0f) {
+            seed = rgba_to_oklch_seed(default_pal->primary, 250.0f * DEG_TO_RAD_F);
+        }
+        if (strcmp(fam_norm, "primary") == 0) {
+            /* already primary_seed */
+        } else if (strcmp(fam_norm, "secondary") == 0) {
+            seed = default_pal->secondary_seed;
+            if (seed.l == 0.0f && seed.c == 0.0f)
+                seed = rgba_to_oklch_seed(default_pal->secondary, 265.0f * DEG_TO_RAD_F);
+        } else if (strcmp(fam_norm, "tertiary") == 0) {
+            seed = default_pal->tertiary_seed;
+            if (seed.l == 0.0f && seed.c == 0.0f)
+                seed = rgba_to_oklch_seed(default_pal->tertiary, 310.0f * DEG_TO_RAD_F);
+        } else if (strcmp(fam_norm, "neutral") == 0) {
+            seed = default_pal->neutral_seed;
+            if (seed.l == 0.0f && seed.c == 0.0f)
+                seed = (waywal_oklch_t){.l = 0.5f, .c = 0.018f, .h_rad = 4.5f};
+        } else if (strcmp(fam_norm, "neutralvariant") == 0) {
+            seed = default_pal->neutral_variant_seed;
+            if (seed.l == 0.0f && seed.c == 0.0f)
+                seed = (waywal_oklch_t){.l = 0.5f, .c = 0.036f, .h_rad = 4.5f};
+        } else if (strcmp(fam_norm, "error") == 0) {
+            seed = (waywal_oklch_t){.l = 0.5f, .c = 0.18f, .h_rad = 25.0f * DEG_TO_RAD_F};
+        } else {
+            return false;
+        }
+        *out_col = waywal_palette_generate_tone(tone, seed.c, seed.h_rad);
+        return true;
+    }
+
+    size_t idx = 0;
+    if (n_segs >= 2 && strcmp(segs[0], "colors") == 0) {
+        idx = 1;
+    }
+    if (idx >= n_segs) {
+        return false;
+    }
+
+    const char *role = segs[idx++];
+    const waywal_palette_t *target_pal = default_pal;
+
+    if (idx < n_segs) {
+        if (strcmp(segs[idx], "default") == 0) {
+            target_pal = default_pal;
+            idx++;
+        } else if (strcmp(segs[idx], "dark") == 0) {
+            target_pal = dark_pal ? dark_pal : default_pal;
+            idx++;
+        } else if (strcmp(segs[idx], "light") == 0) {
+            target_pal = light_pal ? light_pal : default_pal;
+            idx++;
+        }
+    }
+
+    if (idx < n_segs) {
+        if (!is_color_format_prop(segs[idx])) {
+            return false;
+        }
+        snprintf(out_fmt, fmt_cap, "%s", segs[idx]);
+        idx++;
+    }
+    if (idx != n_segs) {
+        return false;
+    }
+
+    return resolve_palette_role_color(target_pal, role, out_col);
+}
+
+static bool apply_pipe_filter(const waywal_palette_t *default_pal,
+                              const waywal_palette_t *dark_pal, const waywal_palette_t *light_pal,
+                              const char *filter_str, color_rgba_t *col, float *alpha_f,
+                              char *fmt_buf, size_t fmt_cap)
+{
+    char buf[128];
+    while (*filter_str && isspace((unsigned char)*filter_str))
+        filter_str++;
+    size_t flen = strlen(filter_str);
+    while (flen > 0 && isspace((unsigned char)filter_str[flen - 1]))
+        flen--;
+    if (flen == 0 || flen >= sizeof(buf))
+        return false;
+    memcpy(buf, filter_str, flen);
+    buf[flen] = '\0';
+
+    char *lparen = strchr(buf, '(');
+    char *args = NULL;
+    if (lparen) {
+        *lparen = '\0';
+        args = lparen + 1;
+        char *rparen = strrchr(args, ')');
+        if (!rparen || strchr(args, '(') != NULL || strchr(args, ')') != rparen) {
+            return false;
+        }
+        char *after_r = rparen + 1;
+        while (*after_r && isspace((unsigned char)*after_r))
+            after_r++;
+        if (*after_r != '\0') {
+            return false;
+        }
+        *rparen = '\0';
+    } else {
+        /* Support space-separated argument like `lighten 0.2` */
+        char *sp = buf;
+        while (*sp && !isspace((unsigned char)*sp))
+            sp++;
+        if (*sp) {
+            *sp = '\0';
+            args = sp + 1;
+        }
+    }
+
+    char *fname = buf;
+    while (*fname && isspace((unsigned char)*fname))
+        fname++;
+    size_t fnlen = strlen(fname);
+    while (fnlen > 0 && isspace((unsigned char)fname[fnlen - 1]))
+        fname[--fnlen] = '\0';
+
+    if (args) {
+        while (*args && isspace((unsigned char)*args))
+            args++;
+        size_t alen = strlen(args);
+        while (alen > 0 && isspace((unsigned char)args[alen - 1]))
+            args[--alen] = '\0';
+    }
+
+    if (!args || args[0] == '\0') {
+        if (lparen) {
+            return false;
+        }
+        if (strcmp(fname, "invert") == 0) {
+            col->r = (uint8_t)(255U - col->r);
+            col->g = (uint8_t)(255U - col->g);
+            col->b = (uint8_t)(255U - col->b);
+            return true;
+        }
+        if (strcmp(fname, "complementary") == 0) {
+            float h = 0.0f, s = 0.0f, l = 0.0f;
+            rgba_to_hsl_deg(*col, &h, &s, &l);
+            *col = hsl_deg_to_rgba(h + 180.0f, s, l, col->a);
+            return true;
+        }
+        if (is_color_format_prop(fname)) {
+            snprintf(fmt_buf, fmt_cap, "%s", fname);
+            return true;
+        }
+        return false;
+    }
+
+    if (strcmp(fname, "blend") == 0) {
+        char *comma = strchr(args, ',');
+        if (!comma)
+            return false;
+        *comma = '\0';
+        const char *target_str = args;
+        const char *factor_str = comma + 1;
+        color_rgba_t target_col = {0};
+        char dummy_fmt[32];
+        if (!resolve_base_color_expr(default_pal, dark_pal, light_pal, target_str, &target_col,
+                                     dummy_fmt, sizeof(dummy_fmt))) {
+            return false;
+        }
+        char *end = NULL;
+        float factor = strtof(factor_str, &end);
+        if (!end || end == factor_str || !isfinite(factor))
+            return false;
+        while (*end && isspace((unsigned char)*end))
+            end++;
+        if (*end != '\0')
+            return false;
+        if (fabsf(factor) > 1.0f)
+            factor *= 0.01f;
+        factor = clamp_f(factor, 0.0f, 1.0f);
+
+        ensure_srgb_lut();
+        waywal_oklab_t ok1 = linear_rgb_to_oklab(
+            g_srgb_to_linear[col->r], g_srgb_to_linear[col->g], g_srgb_to_linear[col->b]);
+        waywal_oklab_t ok2 = linear_rgb_to_oklab(g_srgb_to_linear[target_col.r],
+                                                 g_srgb_to_linear[target_col.g],
+                                                 g_srgb_to_linear[target_col.b]);
+        float l = ok1.l + (ok2.l - ok1.l) * factor;
+        float a = ok1.a + (ok2.a - ok1.a) * factor;
+        float b = ok1.b + (ok2.b - ok1.b) * factor;
+        float rl = 0.0f, gl = 0.0f, bl = 0.0f;
+        oklab_to_linear_rgb(l, a, b, &rl, &gl, &bl);
+        col->r = linear_to_srgb_u8(rl);
+        col->g = linear_to_srgb_u8(gl);
+        col->b = linear_to_srgb_u8(bl);
+        return true;
+    }
+
+    char *end = NULL;
+    float val = strtof(args, &end);
+    if (!end || end == args || !isfinite(val)) {
+        return false;
+    }
+    while (*end && isspace((unsigned char)*end))
+        end++;
+    if (*end != '\0') {
+        return false;
+    }
+
+    if (strcmp(fname, "lighten") == 0) {
+        float delta = (fabsf(val) <= 1.0f) ? (val * 100.0f) : val;
+        float h = 0.0f, s = 0.0f, l = 0.0f;
+        rgba_to_hsl_deg(*col, &h, &s, &l);
+        l = clamp_f(l + delta, 0.0f, 100.0f);
+        *col = hsl_deg_to_rgba(h, s, l, col->a);
+        return true;
+    }
+    if (strcmp(fname, "darken") == 0) {
+        float delta = (fabsf(val) <= 1.0f) ? (val * 100.0f) : val;
+        float h = 0.0f, s = 0.0f, l = 0.0f;
+        rgba_to_hsl_deg(*col, &h, &s, &l);
+        l = clamp_f(l - delta, 0.0f, 100.0f);
+        *col = hsl_deg_to_rgba(h, s, l, col->a);
+        return true;
+    }
+    if (strcmp(fname, "set_lightness") == 0 || strcmp(fname, "lightness") == 0) {
+        float target_l = (fabsf(val) <= 1.0f) ? (val * 100.0f) : val;
+        float h = 0.0f, s = 0.0f, l = 0.0f;
+        rgba_to_hsl_deg(*col, &h, &s, &l);
+        l = clamp_f(target_l, 0.0f, 100.0f);
+        *col = hsl_deg_to_rgba(h, s, l, col->a);
+        return true;
+    }
+    if (strcmp(fname, "saturate") == 0) {
+        float delta = (fabsf(val) <= 1.0f) ? (val * 100.0f) : val;
+        float h = 0.0f, s = 0.0f, l = 0.0f;
+        rgba_to_hsl_deg(*col, &h, &s, &l);
+        s = clamp_f(s + delta, 0.0f, 100.0f);
+        *col = hsl_deg_to_rgba(h, s, l, col->a);
+        return true;
+    }
+    if (strcmp(fname, "desaturate") == 0) {
+        float delta = (fabsf(val) <= 1.0f) ? (val * 100.0f) : val;
+        float h = 0.0f, s = 0.0f, l = 0.0f;
+        rgba_to_hsl_deg(*col, &h, &s, &l);
+        s = clamp_f(s - delta, 0.0f, 100.0f);
+        *col = hsl_deg_to_rgba(h, s, l, col->a);
+        return true;
+    }
+    if (strcmp(fname, "alpha") == 0 || strcmp(fname, "set_alpha") == 0) {
+        float a = (fabsf(val) <= 1.0f) ? val : (val * 0.01f);
+        a = clamp_f(a, 0.0f, 1.0f);
+        *alpha_f = a;
+        col->a = (uint8_t)clamp_i((int)(a * 255.0f + 0.5f), 0, 255);
+        if (strcmp(fmt_buf, "rgb") == 0 || strcmp(fmt_buf, "rgb_css") == 0) {
+            snprintf(fmt_buf, fmt_cap, "rgba");
+        }
+        return true;
+    }
+    return false;
+}
+
+static int evaluate_template_expr(const waywal_palette_t *default_pal,
+                                  const waywal_palette_t *dark_pal,
+                                  const waywal_palette_t *light_pal, const char *raw_expr,
+                                  char *out_buf, size_t out_cap)
+{
+    char expr[256];
+    while (*raw_expr && isspace((unsigned char)*raw_expr))
+        raw_expr++;
+    size_t elen = strlen(raw_expr);
+    while (elen > 0 && isspace((unsigned char)raw_expr[elen - 1]))
+        elen--;
+    if (elen == 0 || elen >= sizeof(expr))
+        return -1;
+    memcpy(expr, raw_expr, elen);
+    expr[elen] = '\0';
+
+    if (strcmp(expr, "mode") == 0) {
+        return snprintf(out_buf, out_cap, "%s",
+                        (default_pal->mode == WAYWAL_THEME_LIGHT) ? "light" : "dark");
+    }
+    if (strcmp(expr, "image") == 0 || strcmp(expr, "wallpaper") == 0) {
+        return snprintf(out_buf, out_cap, "%s", default_pal->wallpaper_path);
+    }
+
+    char *work = expr;
+    while (work[0] == '(') {
+        int depth = 0;
+        char *match_r = NULL;
+        for (char *p = work; *p != '\0'; ++p) {
+            if (*p == '(') {
+                depth++;
+            } else if (*p == ')') {
+                depth--;
+                if (depth == 0) {
+                    match_r = p;
+                    break;
+                }
+            }
+        }
+        if (!match_r) {
+            return -1;
+        }
+        char *after = match_r + 1;
+        while (*after && isspace((unsigned char)*after))
+            after++;
+        if (*after == '\0' || *after == '|') {
+            *work = ' ';
+            *match_r = ' ';
+        } else if (*after == '.') {
+            char *prop_start = after + 1;
+            char *prop_end = prop_start;
+            while (*prop_end && (isalnum((unsigned char)*prop_end) || *prop_end == '_')) {
+                prop_end++;
+            }
+            size_t plen = (size_t)(prop_end - prop_start);
+            if (plen == 0 || plen >= 32) {
+                return -1;
+            }
+            char prop_name[32];
+            memcpy(prop_name, prop_start, plen);
+            prop_name[plen] = '\0';
+            if (!is_color_format_prop(prop_name)) {
+                return -1;
+            }
+            char *post = prop_end;
+            while (*post && isspace((unsigned char)*post))
+                post++;
+            if (*post != '\0' && *post != '|') {
+                return -1;
+            }
+            *work = ' ';
+            *match_r = '|';
+            *after = ' ';
+        } else {
+            return -1;
+        }
+        while (*work && isspace((unsigned char)*work))
+            work++;
+    }
+
+    char *pipes[16] = {0};
+    size_t n_pipes = 0;
+    char *cur = work;
+    while (cur && n_pipes < 16) {
+        pipes[n_pipes++] = cur;
+        char *bar = strchr(cur, '|');
+        if (!bar)
+            break;
+        if (n_pipes == 16)
+            return -1;
+        *bar = '\0';
+        cur = bar + 1;
+    }
+
+    color_rgba_t col = {0};
+    float alpha_f = 1.0f;
+    char fmt[32] = "hex";
+
+    if (!resolve_base_color_expr(default_pal, dark_pal, light_pal, pipes[0], &col, fmt,
+                                 sizeof(fmt))) {
+        return -1;
+    }
+    alpha_f = (float)col.a / 255.0f;
+
+    for (size_t i = 1; i < n_pipes; ++i) {
+        if (!apply_pipe_filter(default_pal, dark_pal, light_pal, pipes[i], &col, &alpha_f, fmt,
+                               sizeof(fmt))) {
+            return -1;
+        }
+    }
+
+    return format_color_property(col, alpha_f, fmt, out_buf, out_cap);
+}
+
+static bool is_pywal_single_brace_token(const char *tok)
+{
+    if (!tok || tok[0] == '\0')
+        return false;
+    if (strcmp(tok, "wallpaper") == 0)
+        return true;
+
+    char buf[64];
+    size_t len = strlen(tok);
+    if (len >= sizeof(buf))
+        return false;
+    memcpy(buf, tok, len + 1);
+
+    char *dot = strchr(buf, '.');
+    if (dot) {
+        *dot = '\0';
+        const char *prop = dot + 1;
+        if (!is_color_format_prop(prop))
+            return false;
+    }
+
+    if (strcmp(buf, "background") == 0 || strcmp(buf, "foreground") == 0 ||
+        strcmp(buf, "cursor") == 0) {
+        return true;
+    }
+    if (strncmp(buf, "color", 5) == 0 && isdigit((unsigned char)buf[5])) {
+        char *end = NULL;
+        unsigned long idx = strtoul(buf + 5, &end, 10);
+        if (end && *end == '\0' && idx < 16UL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool render_single_template_dual(const waywal_palette_t *default_pal,
+                                        const waywal_palette_t *dark_pal,
+                                        const waywal_palette_t *light_pal, const char *src,
+                                        size_t src_len, const char *out_path)
+{
+    if (!default_pal || !src || !out_path) {
+        return false;
+    }
+
+    waywal_palette_t derived_opp;
+    if (!dark_pal || !light_pal) {
+        waywal_palette_derive_opposite(default_pal, &derived_opp);
+        if (!dark_pal) {
+            dark_pal = (default_pal->mode == WAYWAL_THEME_DARK) ? default_pal : &derived_opp;
+        }
+        if (!light_pal) {
+            light_pal = (default_pal->mode == WAYWAL_THEME_LIGHT) ? default_pal : &derived_opp;
+        }
+    }
+
     size_t cap = src_len * 2 + 4096;
     char *out = (char *)malloc(cap);
     if (!out) {
@@ -2141,62 +3170,58 @@ static bool render_single_template(const waywal_palette_t *pal, const named_colo
     size_t pos = 0;
     size_t i = 0;
     while (i < src_len) {
+        /* 0. Escaped braces: \{{ -> literal {{ and \{ -> literal { */
+        if (i + 2 < src_len && src[i] == '\\' && src[i + 1] == '{' && src[i + 2] == '{') {
+            if (pos + 3 >= cap) {
+                size_t new_cap = cap * 2;
+                char *nb = (char *)realloc(out, new_cap);
+                if (!nb) {
+                    free(out);
+                    return false;
+                }
+                out = nb;
+                cap = new_cap;
+            }
+            out[pos++] = '{';
+            out[pos++] = '{';
+            i += 3;
+            continue;
+        }
+        if (i + 1 < src_len && src[i] == '\\' && src[i + 1] == '{') {
+            if (pos + 2 >= cap) {
+                size_t new_cap = cap * 2;
+                char *nb = (char *)realloc(out, new_cap);
+                if (!nb) {
+                    free(out);
+                    return false;
+                }
+                out = nb;
+                cap = new_cap;
+            }
+            out[pos++] = '{';
+            i += 2;
+            continue;
+        }
+
+        /* 1. Double-brace {{ ... }} expressions */
         if (i + 3 < src_len && src[i] == '{' && src[i + 1] == '{') {
             size_t end = i + 2;
-            while (end + 1 < src_len && end - (i + 2) < 64 &&
+            while (end + 1 < src_len && end - (i + 2) < 240 &&
                    !(src[end] == '}' && src[end + 1] == '}')) {
+                if (src[end] == '\n')
+                    break;
                 end++;
             }
             if (end + 1 < src_len && src[end] == '}' && src[end + 1] == '}') {
-                char expr[68];
+                char expr[256];
                 size_t expr_len = end - (i + 2);
                 memcpy(expr, src + i + 2, expr_len);
                 expr[expr_len] = '\0';
 
-                /* Trim whitespace inside {{ ... }} */
-                char *start_p = expr;
-                while (*start_p && isspace((unsigned char)*start_p))
-                    start_p++;
-                char *end_p = start_p + strlen(start_p);
-                while (end_p > start_p && isspace((unsigned char)end_p[-1])) {
-                    *(--end_p) = '\0';
-                }
-
-                char replacement[64];
-                int rep_len = -1;
-
-                if (strcmp(start_p, "mode") == 0) {
-                    rep_len = snprintf(replacement, sizeof(replacement), "%s",
-                                       (pal->mode == WAYWAL_THEME_LIGHT) ? "light" : "dark");
-                } else {
-                    char *dot = strchr(start_p, '.');
-                    const char *fmt = "hex";
-                    if (dot) {
-                        *dot = '\0';
-                        fmt = dot + 1;
-                    }
-                    for (size_t s = 0; s < n_slots; ++s) {
-                        if (strcmp(slots[s].name, start_p) == 0) {
-                            color_rgba_t c = slots[s].color;
-                            if (strcmp(fmt, "hex") == 0) {
-                                rep_len = snprintf(replacement, sizeof(replacement),
-                                                   "#%02x%02x%02x", c.r, c.g, c.b);
-                            } else if (strcmp(fmt, "strip") == 0) {
-                                rep_len = snprintf(replacement, sizeof(replacement), "%02x%02x%02x",
-                                                   c.r, c.g, c.b);
-                            } else if (strcmp(fmt, "rgb") == 0) {
-                                rep_len = snprintf(replacement, sizeof(replacement), "%u, %u, %u",
-                                                   c.r, c.g, c.b);
-                            } else if (strcmp(fmt, "rgba") == 0) {
-                                rep_len = snprintf(replacement, sizeof(replacement),
-                                                   "rgba(%u, %u, %u, 1.0)", c.r, c.g, c.b);
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                if (rep_len >= 0) {
+                char replacement[600];
+                int rep_len = evaluate_template_expr(default_pal, dark_pal, light_pal, expr,
+                                                     replacement, sizeof(replacement));
+                if (rep_len >= 0 && (size_t)rep_len < sizeof(replacement)) {
                     if (pos + (size_t)rep_len + 1 >= cap) {
                         size_t new_cap = (cap + (size_t)rep_len + 4096) * 2;
                         char *nb = (char *)realloc(out, new_cap);
@@ -2215,6 +3240,45 @@ static bool render_single_template(const waywal_palette_t *pal, const named_colo
             }
         }
 
+        /* 2. Single-brace pywal {color0.strip}, {background}, {wallpaper} placeholders */
+        if (src[i] == '{' &&
+            (i == 0 || (src[i - 1] != '{' && src[i - 1] != '$' && src[i - 1] != '\\')) &&
+            (i + 1 < src_len && src[i + 1] != '{')) {
+            size_t end = i + 1;
+            while (end < src_len && end - (i + 1) < 48 && src[end] != '}' && src[end] != '\n' &&
+                   src[end] != '{') {
+                end++;
+            }
+            if (end < src_len && src[end] == '}') {
+                char tok[64];
+                size_t tlen = end - (i + 1);
+                memcpy(tok, src + i + 1, tlen);
+                tok[tlen] = '\0';
+
+                if (is_pywal_single_brace_token(tok)) {
+                    char replacement[600];
+                    int rep_len = evaluate_template_expr(default_pal, dark_pal, light_pal, tok,
+                                                         replacement, sizeof(replacement));
+                    if (rep_len >= 0 && (size_t)rep_len < sizeof(replacement)) {
+                        if (pos + (size_t)rep_len + 1 >= cap) {
+                            size_t new_cap = (cap + (size_t)rep_len + 4096) * 2;
+                            char *nb = (char *)realloc(out, new_cap);
+                            if (!nb) {
+                                free(out);
+                                return false;
+                            }
+                            out = nb;
+                            cap = new_cap;
+                        }
+                        memcpy(out + pos, replacement, (size_t)rep_len);
+                        pos += (size_t)rep_len;
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
         if (pos + 2 >= cap) {
             size_t new_cap = cap * 2;
             char *nb = (char *)realloc(out, new_cap);
@@ -2229,8 +3293,251 @@ static bool render_single_template(const waywal_palette_t *pal, const named_colo
     }
 
     bool ok = atomic_write_file(out_path, out, pos);
+    if (!ok) {
+        WAYWAL_LOG_WARN("Failed to write rendered template to '%s': %s", out_path, strerror(errno));
+    }
     free(out);
     return ok;
+}
+
+static bool is_single_unsafe_template_target_str(const char *cand)
+{
+    if (!cand || cand[0] == '\0') {
+        return true;
+    }
+    static const char *const sys_prefixes[] = {
+        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot",
+        "/proc", "/sys", "/dev", "/var",  "/run", "/root",
+    };
+    if (strcmp(cand, "/") == 0) {
+        return true;
+    }
+    for (size_t i = 0; i < sizeof(sys_prefixes) / sizeof(sys_prefixes[0]); ++i) {
+        size_t plen = strlen(sys_prefixes[i]);
+        if (strncmp(cand, sys_prefixes[i], plen) == 0 &&
+            (cand[plen] == '\0' || cand[plen] == '/')) {
+            return true;
+        }
+    }
+
+    char home_norm[WAYWAL_PATH_MAX];
+    if (waywal_expand_path("~", home_norm, sizeof(home_norm)) && home_norm[0] != '\0') {
+        char real_home[WAYWAL_PATH_MAX];
+        const char *homes[2] = {
+            home_norm,
+            realpath(home_norm, real_home) ? real_home : NULL,
+        };
+        static const char *const home_sensitive[] = {
+            ".ssh",  ".gnupg",       ".pki",    ".aws",
+            ".kube", ".docker",      ".netrc",  ".password-store",
+            ".local/share/keyrings",
+        };
+        for (size_t h = 0; h < 2; ++h) {
+            if (!homes[h] || homes[h][0] == '\0') {
+                continue;
+            }
+            size_t hlen = strlen(homes[h]);
+            if (strcmp(cand, homes[h]) == 0) {
+                return true;
+            }
+            /* Reject top-level $HOME dotfiles (e.g., ~/.bashrc, ~/.profile, ~/.zshrc) */
+            if (strncmp(cand, homes[h], hlen) == 0 && cand[hlen] == '/' &&
+                cand[hlen + 1] == '.' && strchr(cand + hlen + 1, '/') == NULL) {
+                return true;
+            }
+            for (size_t i = 0; i < sizeof(home_sensitive) / sizeof(home_sensitive[0]); ++i) {
+                char sub[WAYWAL_PATH_MAX];
+                int n = snprintf(sub, sizeof(sub), "%s/%s", homes[h], home_sensitive[i]);
+                if (n > 0 && (size_t)n < sizeof(sub)) {
+                    if (strncmp(cand, sub, (size_t)n) == 0 &&
+                        (cand[n] == '\0' || cand[n] == '/')) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    const char *xdg_data = getenv("XDG_DATA_HOME");
+    if (xdg_data && xdg_data[0] != '\0') {
+        char xdg_keyrings[WAYWAL_PATH_MAX];
+        int n = snprintf(xdg_keyrings, sizeof(xdg_keyrings), "%s/keyrings", xdg_data);
+        if (n > 0 && (size_t)n < sizeof(xdg_keyrings)) {
+            waywal_normalize_path(xdg_keyrings);
+            size_t klen = strlen(xdg_keyrings);
+            if (strncmp(cand, xdg_keyrings, klen) == 0 &&
+                (cand[klen] == '\0' || cand[klen] == '/')) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool is_unsafe_template_target(const char *norm_path)
+{
+    if (!norm_path || norm_path[0] == '\0') {
+        return true;
+    }
+    if (is_single_unsafe_template_target_str(norm_path)) {
+        return true;
+    }
+    char resolved_path[WAYWAL_PATH_MAX];
+    if (resolve_target_or_parent_realpath(norm_path, resolved_path, sizeof(resolved_path))) {
+        if (is_single_unsafe_template_target_str(resolved_path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool resolve_template_path(const char *raw_path, char *out_buf, size_t out_cap)
+{
+    if (!raw_path || raw_path[0] == '\0' || !out_buf || out_cap == 0) {
+        return false;
+    }
+    if (raw_path[0] == '~' || strchr(raw_path, '$') != NULL) {
+        return waywal_expand_path(raw_path, out_buf, out_cap);
+    }
+    size_t len = strlen(raw_path);
+    if (len >= out_cap) {
+        out_buf[0] = '\0';
+        return false;
+    }
+    memcpy(out_buf, raw_path, len + 1);
+    if (out_buf[0] == '/') {
+        waywal_normalize_path(out_buf);
+    }
+    return true;
+}
+
+bool waywal_palette_render_template_file(const waywal_palette_t *default_pal,
+                                         const waywal_palette_t *dark_pal,
+                                         const waywal_palette_t *light_pal, const char *input_path,
+                                         const char *output_path)
+{
+    if (!default_pal || !input_path || !output_path || input_path[0] == '\0' ||
+        output_path[0] == '\0') {
+        return false;
+    }
+
+    char exp_in[WAYWAL_PATH_MAX];
+    char exp_out[WAYWAL_PATH_MAX];
+    if (!resolve_template_path(input_path, exp_in, sizeof(exp_in)) ||
+        !resolve_template_path(output_path, exp_out, sizeof(exp_out))) {
+        WAYWAL_LOG_WARN("Template path resolution failed for '%s' -> '%s'", input_path,
+                        output_path);
+        return false;
+    }
+
+    if (is_unsafe_template_target(exp_out)) {
+        WAYWAL_LOG_WARN("Refusing to write template to sensitive target '%s'", exp_out);
+        return false;
+    }
+
+    char real_in[WAYWAL_PATH_MAX];
+    char real_out[WAYWAL_PATH_MAX];
+    bool has_real_in = resolve_target_or_parent_realpath(exp_in, real_in, sizeof(real_in));
+    bool has_real_out = resolve_target_or_parent_realpath(exp_out, real_out, sizeof(real_out));
+
+    if (strcmp(exp_in, exp_out) == 0 ||
+        (has_real_in && has_real_out && strcmp(real_in, real_out) == 0)) {
+        WAYWAL_LOG_WARN("Refusing to clobber template input '%s' with identical output path",
+                        exp_in);
+        return false;
+    }
+
+    struct stat st;
+    if (stat(exp_in, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        st.st_size > (4 * 1024 * 1024)) {
+        WAYWAL_LOG_WARN("Template input '%s' is missing or invalid", exp_in);
+        return false;
+    }
+
+    struct stat st_out;
+    if (stat(exp_out, &st_out) == 0 && st.st_dev == st_out.st_dev && st.st_ino == st_out.st_ino) {
+        WAYWAL_LOG_WARN("Refusing to clobber template input '%s' via hardlink/symlink '%s'", exp_in,
+                        exp_out);
+        return false;
+    }
+
+    int fd = open(exp_in, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        WAYWAL_LOG_WARN("Failed to open template input '%s': %s", exp_in, strerror(errno));
+        return false;
+    }
+
+    size_t fsize = (size_t)st.st_size;
+    char *buf = (char *)malloc(fsize + 1);
+    if (!buf) {
+        close(fd);
+        return false;
+    }
+
+    size_t nread_total = 0;
+    while (nread_total < fsize) {
+        ssize_t r = read(fd, buf + nread_total, fsize - nread_total);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (r == 0)
+            break;
+        nread_total += (size_t)r;
+    }
+    close(fd);
+    buf[nread_total] = '\0';
+
+    bool ok =
+        render_single_template_dual(default_pal, dark_pal, light_pal, buf, nread_total, exp_out);
+    free(buf);
+    return ok;
+}
+
+size_t waywal_palette_apply_configured_templates(const waywal_palette_t *default_pal,
+                                                 const waywal_palette_t *dark_pal,
+                                                 const waywal_palette_t *light_pal,
+                                                 const struct waywal_config *cfg)
+{
+    if (!default_pal || !cfg) {
+        return 0;
+    }
+
+    if (cfg->theme.pywal_compat) {
+        (void)waywal_palette_export_pywal(default_pal, NULL);
+    }
+
+    if (cfg->template_count == 0) {
+        return 0;
+    }
+
+    waywal_palette_t derived_opp;
+    if (!dark_pal || !light_pal) {
+        waywal_palette_derive_opposite(default_pal, &derived_opp);
+        if (!dark_pal) {
+            dark_pal = (default_pal->mode == WAYWAL_THEME_DARK) ? default_pal : &derived_opp;
+        }
+        if (!light_pal) {
+            light_pal = (default_pal->mode == WAYWAL_THEME_LIGHT) ? default_pal : &derived_opp;
+        }
+    }
+
+    size_t rendered = 0;
+    for (size_t i = 0; i < cfg->template_count; ++i) {
+        const waywal_template_rule_t *rule = &cfg->templates[i];
+        if (!rule->enabled || rule->input_path[0] == '\0' || rule->output_path[0] == '\0') {
+            continue;
+        }
+        if (waywal_palette_render_template_file(default_pal, dark_pal, light_pal, rule->input_path,
+                                                rule->output_path)) {
+            rendered++;
+            if (rule->post_hook[0] != '\0') {
+                waywal_palette_run_hook(rule->post_hook);
+            }
+        }
+    }
+    return rendered;
 }
 
 bool waywal_palette_render_templates(const waywal_palette_t *pal, const char *templates_dir,
@@ -2282,8 +3589,10 @@ bool waywal_palette_render_templates(const waywal_palette_t *pal, const char *te
         return true;
     }
 
-    named_color_slot_t slots[128];
-    size_t n_slots = collect_color_slots(pal, slots);
+    waywal_palette_t opp_pal;
+    waywal_palette_derive_opposite(pal, &opp_pal);
+    const waywal_palette_t *dark_pal = (pal->mode == WAYWAL_THEME_DARK) ? pal : &opp_pal;
+    const waywal_palette_t *light_pal = (pal->mode == WAYWAL_THEME_LIGHT) ? pal : &opp_pal;
 
     struct dirent *ent;
     while ((ent = readdir(dir)) != NULL) {
@@ -2296,44 +3605,11 @@ bool waywal_palette_render_templates(const waywal_palette_t *pal, const char *te
             continue;
         }
 
-        struct stat st;
-        if (stat(src_file.data, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
-            st.st_size > (4 * 1024 * 1024)) {
-            continue;
-        }
-
-        int fd = open(src_file.data, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) {
-            continue;
-        }
-
-        size_t fsize = (size_t)st.st_size;
-        char *buf = (char *)malloc(fsize + 1);
-        if (!buf) {
-            close(fd);
-            continue;
-        }
-
-        size_t nread_total = 0;
-        while (nread_total < fsize) {
-            ssize_t r = read(fd, buf + nread_total, fsize - nread_total);
-            if (r < 0) {
-                if (errno == EINTR)
-                    continue;
-                break;
-            }
-            if (r == 0)
-                break;
-            nread_total += (size_t)r;
-        }
-        close(fd);
-        buf[nread_total] = '\0';
-
         path_buf_t dst_file = target_dir;
         if (path_buf_push(&dst_file, ent->d_name)) {
-            render_single_template(pal, slots, n_slots, buf, nread_total, dst_file.data);
+            waywal_palette_render_template_file(pal, dark_pal, light_pal, src_file.data,
+                                                dst_file.data);
         }
-        free(buf);
     }
 
     closedir(dir);
@@ -2346,16 +3622,313 @@ bool waywal_palette_run_hook(const char *cmd)
         return false;
     }
 
-    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    static pid_t bg_pids[32];
+    for (size_t i = 0; i < 32; ++i) {
+        if (bg_pids[i] > 0) {
+            if (waitpid(bg_pids[i], NULL, WNOHANG) != 0) {
+                bg_pids[i] = 0;
+            }
+        }
     }
+
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) {
+        return false;
+    }
+    sigset_t empty_mask;
+    sigemptyset(&empty_mask);
+    posix_spawnattr_setsigmask(&attr, &empty_mask);
+
+    sigset_t def_mask;
+    sigemptyset(&def_mask);
+    sigaddset(&def_mask, SIGINT);
+    sigaddset(&def_mask, SIGTERM);
+    sigaddset(&def_mask, SIGQUIT);
+    sigaddset(&def_mask, SIGHUP);
+    sigaddset(&def_mask, SIGCHLD);
+    sigaddset(&def_mask, SIGALRM);
+    sigaddset(&def_mask, SIGPIPE);
+    posix_spawnattr_setsigdefault(&attr, &def_mask);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        posix_spawnattr_destroy(&attr);
+        return false;
+    }
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
 
     pid_t pid = 0;
     char *const argv[] = {(char *)"sh", (char *)"-c", (char *)cmd, NULL};
-    int rc = posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ);
+    int rc = posix_spawn(&pid, "/bin/sh", &actions, &attr, argv, environ);
 
-    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attr);
+
+    if (rc != 0) {
+        WAYWAL_LOG_WARN("Failed to spawn hook '%s': %s", cmd, strerror(rc));
+        return false;
     }
-    return (rc == 0);
+
+    bool reaped = false;
+    for (int attempt = 0; attempt < 250; ++attempt) {
+        pid_t w = waitpid(pid, NULL, WNOHANG);
+        if (w == pid || (w < 0 && errno != EINTR)) {
+            reaped = true;
+            break;
+        }
+        usleep(2000);
+    }
+
+    if (!reaped && pid > 0) {
+        for (size_t i = 0; i < 32; ++i) {
+            if (bg_pids[i] <= 0) {
+                bg_pids[i] = pid;
+                break;
+            }
+        }
+    }
+
+    return true;
+}
+
+static void escape_json_str(const char *src, char *dst, size_t dst_cap)
+{
+    if (!dst || dst_cap == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t w = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p != '\0'; ++p) {
+        unsigned char c = *p;
+        if (c == '"' || c == '\\') {
+            if (w + 2 >= dst_cap)
+                break;
+            dst[w++] = '\\';
+            dst[w++] = (char)c;
+        } else if (c == '\n') {
+            if (w + 2 >= dst_cap)
+                break;
+            dst[w++] = '\\';
+            dst[w++] = 'n';
+        } else if (c == '\r') {
+            if (w + 2 >= dst_cap)
+                break;
+            dst[w++] = '\\';
+            dst[w++] = 'r';
+        } else if (c == '\t') {
+            if (w + 2 >= dst_cap)
+                break;
+            dst[w++] = '\\';
+            dst[w++] = 't';
+        } else if (c == '\b') {
+            if (w + 2 >= dst_cap)
+                break;
+            dst[w++] = '\\';
+            dst[w++] = 'b';
+        } else if (c == '\f') {
+            if (w + 2 >= dst_cap)
+                break;
+            dst[w++] = '\\';
+            dst[w++] = 'f';
+        } else if (c < 0x20U) {
+            if (w + 6 >= dst_cap)
+                break;
+            snprintf(dst + w, dst_cap - w, "\\u%04x", (unsigned int)c);
+            w += 6;
+        } else {
+            if (w + 1 >= dst_cap)
+                break;
+            dst[w++] = (char)c;
+        }
+    }
+    dst[w] = '\0';
+}
+
+static void escape_sh_single_quote(const char *src, char *dst, size_t dst_cap)
+{
+    if (!dst || dst_cap == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t w = 0;
+    for (const char *p = src; *p != '\0'; ++p) {
+        if (*p == '\'') {
+            if (w + 4 >= dst_cap)
+                break;
+            dst[w++] = '\'';
+            dst[w++] = '\\';
+            dst[w++] = '\'';
+            dst[w++] = '\'';
+        } else {
+            if (w + 1 >= dst_cap)
+                break;
+            dst[w++] = *p;
+        }
+    }
+    dst[w] = '\0';
+}
+
+bool waywal_palette_export_pywal(const waywal_palette_t *pal, const char *override_base_dir)
+{
+    if (!pal) {
+        return false;
+    }
+
+    path_buf_t wal_dir;
+    if (override_base_dir && override_base_dir[0] != '\0') {
+        path_buf_from_str(&wal_dir, override_base_dir);
+        path_buf_push(&wal_dir, "wal");
+    } else {
+        const char *xdg_cache = getenv("XDG_CACHE_HOME");
+        const char *home = getenv("HOME");
+        if (xdg_cache && xdg_cache[0] != '\0') {
+            path_buf_from_str(&wal_dir, xdg_cache);
+            path_buf_push(&wal_dir, "wal");
+        } else if (home && home[0] != '\0') {
+            path_buf_from_str(&wal_dir, home);
+            path_buf_push(&wal_dir, ".cache/wal");
+        } else {
+            return false;
+        }
+    }
+
+    char wp_json[2048];
+    char wp_sh[2048];
+    escape_json_str(pal->wallpaper_path, wp_json, sizeof(wp_json));
+    escape_sh_single_quote(pal->wallpaper_path, wp_sh, sizeof(wp_sh));
+
+    char pywal_json[8192];
+    int jpos = snprintf(pywal_json, sizeof(pywal_json),
+                        "{\n"
+                        "  \"wallpaper\": \"%s\",\n"
+                        "  \"alpha\": \"100\",\n"
+                        "  \"special\": {\n"
+                        "    \"background\": \"#%02x%02x%02x\",\n"
+                        "    \"foreground\": \"#%02x%02x%02x\",\n"
+                        "    \"cursor\": \"#%02x%02x%02x\"\n"
+                        "  },\n"
+                        "  \"colors\": {\n",
+                        wp_json, pal->background.r, pal->background.g,
+                        pal->background.b, pal->onSurface.r, pal->onSurface.g, pal->onSurface.b,
+                        pal->secondary.r, pal->secondary.g, pal->secondary.b);
+    if (jpos < 0 || (size_t)jpos >= sizeof(pywal_json)) {
+        return false;
+    }
+    for (int i = 0; i < 16; ++i) {
+        const char *comma = (i < 15) ? "," : "";
+        int n = snprintf(pywal_json + jpos, sizeof(pywal_json) - (size_t)jpos,
+                         "    \"color%d\": \"#%02x%02x%02x\"%s\n", i, pal->term[i].r,
+                         pal->term[i].g, pal->term[i].b, comma);
+        if (n < 0 || (size_t)jpos + (size_t)n >= sizeof(pywal_json))
+            return false;
+        jpos += n;
+    }
+    int n_end = snprintf(pywal_json + jpos, sizeof(pywal_json) - (size_t)jpos, "  }\n}\n");
+    if (n_end < 0 || (size_t)jpos + (size_t)n_end >= sizeof(pywal_json))
+        return false;
+    jpos += n_end;
+
+    char pywal_colors[512];
+    int cpos = 0;
+    for (int i = 0; i < 16; ++i) {
+        int n = snprintf(pywal_colors + cpos, sizeof(pywal_colors) - (size_t)cpos, "#%02x%02x%02x\n",
+                         pal->term[i].r, pal->term[i].g, pal->term[i].b);
+        if (n < 0 || (size_t)cpos + (size_t)n >= sizeof(pywal_colors))
+            return false;
+        cpos += n;
+    }
+
+    char pywal_sh[8192];
+    int spos = snprintf(pywal_sh, sizeof(pywal_sh),
+                        "wallpaper='%s'\n"
+                        "background='#%02x%02x%02x'\n"
+                        "foreground='#%02x%02x%02x'\n"
+                        "cursor='#%02x%02x%02x'\n",
+                        wp_sh, pal->background.r, pal->background.g,
+                        pal->background.b, pal->onSurface.r, pal->onSurface.g, pal->onSurface.b,
+                        pal->secondary.r, pal->secondary.g, pal->secondary.b);
+    if (spos < 0 || (size_t)spos >= sizeof(pywal_sh))
+        return false;
+    for (int i = 0; i < 16; ++i) {
+        int n = snprintf(pywal_sh + spos, sizeof(pywal_sh) - (size_t)spos,
+                         "color%d='#%02x%02x%02x'\n", i, pal->term[i].r, pal->term[i].g,
+                         pal->term[i].b);
+        if (n < 0 || (size_t)spos + (size_t)n >= sizeof(pywal_sh))
+            return false;
+        spos += n;
+    }
+
+    char pywal_css[8192];
+    int csspos = snprintf(pywal_css, sizeof(pywal_css),
+                          ":root {\n"
+                          "  --wallpaper: url(\"%s\");\n"
+                          "  --background: #%02x%02x%02x;\n"
+                          "  --foreground: #%02x%02x%02x;\n"
+                          "  --cursor: #%02x%02x%02x;\n",
+                          wp_json, pal->background.r, pal->background.g,
+                          pal->background.b, pal->onSurface.r, pal->onSurface.g, pal->onSurface.b,
+                          pal->secondary.r, pal->secondary.g, pal->secondary.b);
+    if (csspos < 0 || (size_t)csspos >= sizeof(pywal_css))
+        return false;
+    for (int i = 0; i < 16; ++i) {
+        int n = snprintf(pywal_css + csspos, sizeof(pywal_css) - (size_t)csspos,
+                         "  --color%d: #%02x%02x%02x;\n", i, pal->term[i].r, pal->term[i].g,
+                         pal->term[i].b);
+        if (n < 0 || (size_t)csspos + (size_t)n >= sizeof(pywal_css))
+            return false;
+        csspos += n;
+    }
+    int n_css_end = snprintf(pywal_css + csspos, sizeof(pywal_css) - (size_t)csspos, "}\n");
+    if (n_css_end < 0 || (size_t)csspos + (size_t)n_css_end >= sizeof(pywal_css))
+        return false;
+    csspos += n_css_end;
+
+    char seq_buf[2048];
+    size_t seq_len = waywal_palette_format_sequences(pal, seq_buf, sizeof(seq_buf));
+
+    path_buf_t fpath;
+
+    fpath = wal_dir;
+    if (!path_buf_push(&fpath, "colors.json") ||
+        !atomic_write_file(fpath.data, pywal_json, (size_t)jpos)) {
+        return false;
+    }
+
+    fpath = wal_dir;
+    if (!path_buf_push(&fpath, "colors") ||
+        !atomic_write_file(fpath.data, pywal_colors, (size_t)cpos)) {
+        return false;
+    }
+
+    if (seq_len > 0) {
+        fpath = wal_dir;
+        if (!path_buf_push(&fpath, "sequences") ||
+            !atomic_write_file(fpath.data, seq_buf, seq_len)) {
+            return false;
+        }
+    }
+
+    fpath = wal_dir;
+    if (!path_buf_push(&fpath, "colors.sh") ||
+        !atomic_write_file(fpath.data, pywal_sh, (size_t)spos)) {
+        return false;
+    }
+
+    fpath = wal_dir;
+    if (!path_buf_push(&fpath, "colors.css") ||
+        !atomic_write_file(fpath.data, pywal_css, (size_t)csspos)) {
+        return false;
+    }
+
+    return true;
 }
 
 bool waywal_palette_export_filtered(const waywal_palette_t *pal, const char *override_base_dir,
@@ -2511,7 +4084,11 @@ bool waywal_palette_export_filtered(const waywal_palette_t *pal, const char *ove
 
 bool waywal_palette_export_all(const waywal_palette_t *pal, const char *override_base_dir)
 {
-    return waywal_palette_export_filtered(pal, override_base_dir, true, true, true);
+    if (!waywal_palette_export_filtered(pal, override_base_dir, true, true, true)) {
+        return false;
+    }
+    (void)waywal_palette_export_pywal(pal, override_base_dir);
+    return true;
 }
 
 static bool is_numeric_name(const char *s)

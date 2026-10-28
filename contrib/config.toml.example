@@ -14,44 +14,136 @@ pause_on_idle = true                  # Pause when ext-idle-notify-v1 reports se
 idle_timeout_sec = 300                # Seconds before session is considered idle
 ten_bit = false                       # Request 10-bit wide-gamut scanout (XRGB2101010 / ARGB2101010)
 backdrop = "none"                     # "none", "auto-blur" (Dual-Kawase for Niri overview), or image path
+crop_gravity = "center"               # Default crop anchor: center, top, bottom, left, right, tl, tr, bl, br, or "0.5,0.2"
 volume = 0.0                          # Default wallpaper audio playback volume (0.0 .. 1.0)
 mute_on_audio = true                  # Auto-duck wallpaper volume when another app plays audio
+theme_from_media = false              # Dynamically extract palette from D-Bus MPRIS2 album art
+
+# Note: [general] is accepted as an alias for [daemon]
+# [general]
+# restore_on_start = true
+# crop_gravity = "center"
 
 [theme]
 enabled = true                        # Extract Material Design 3 palette on every wallpaper change
-mode = "dark"                         # "dark" or "light"
-scheme_variant = "tonal_spot"         # tonal_spot, vibrant, expressive, neutral, monochrome, fidelity, content
+mode = "dark"                         # "dark", "light", or "auto" (stays dark by default unless auto_day_night = true)
+# auto_day_night = true               # Automatically switch dark/light polarity based on [solar] or time of day
+scheme_variant = "tonal_spot"         # tonal_spot, vibrant, expressive, neutral, monochrome, fidelity, content, rainbow, fruit_salad
 contrast = 0.0                        # Contrast adjustment (-1.0 .. 1.0)
+source_color_index = 0                # Ranked K-Means++ seed cluster index (0 = dominant .. 3 = quaternary accent)
+# seed_color = "#89b4fa"              # Optional static hex override (bypasses image quantization when set)
 caelestia_sync = true                 # Write ~/.local/state/caelestia/scheme.json for Quickshell
 tty_sequences = true                  # Broadcast OSC 4/10/11 palette to active /dev/pts/* terminals
 export_css = true                     # Write ~/.cache/wwal/colors.css and colors.json
 export_hyprland = true                # Write ~/.cache/wwal/colors-hyprland.conf
-theme_from_media = false              # Dynamically extract palette from D-Bus MPRIS2 album art
+pywal_compat = true                   # Write ~/.cache/wal/{colors.json,colors,colors.sh,colors.css,sequences} for Pywalfox
 
 [transition]
 type = "grow"                         # none, simple, fade, wipe, grow, outer, wave, noise, crosszoom,
                                       # slide, glitch, burn, ripple, pixelate, doom, swirl, cube, luma,
                                       # light_leak, page_curl, custom, left, right, top, bottom, center, any, random
-duration = 0.8                        # Transition duration in seconds
+duration = 0.8                        # Transition duration in seconds (float, e.g. 0.5, 0.8, 1.2)
 fps = 144                             # Target transition frame rate
 pos = "cursor"                        # center, cursor, top, bottom, left, right, tl, tr, bl, br, or "0.5,0.5"
+invert_y = false                      # Invert Y coordinate of transition-pos (swww/awww compatibility)
+crop_gravity = "center"               # Crop anchor for fill/crop scaling
 angle = 0.0                           # Angle in degrees for directional transitions (wipe, slide, wave)
 bezier = [0.25, 0.1, 0.25, 1.0]       # Cubic-bezier control points [x1, y1, x2, y2]
 sync_mode = "simultaneous"            # "simultaneous" or "staggered"
 stagger_delay_ms = 120                # Delay between monitors in staggered mode (ms)
 
+# [slideshow]
+# interval = "30m"                    # Slideshow rotation interval (seconds or "30s", "15m", "1h", "1h30m")
+# shuffle = true                      # Fisher-Yates random shuffle across mixed media (images, videos, shaders, Workshop)
+# sort = "mtime"                      # "ascending" ("name"), "descending", "mtime", or "random"
+# recursive = false                   # Scan slideshow directory recursively
+
 [hooks]
 on_wallpaper_change = ""              # Optional command executed after wallpaper transition finishes
 on_theme_change = ""                  # Optional command executed after Material 3 palette export
+
+# Declarative Template Engine ([template."<name>"])
+# Supports Matugen ({{colors.primary.default.hex}}, {{palettes.primary.40.hex}}),
+# Wallust/Jinja2 pipe filters (lighten, darken, saturate, alpha, blend, invert, complementary),
+# and Pywal ({background}, {foreground}, {color0.strip}..{color15.rgb}) syntax in a single pass.
+#
+# [template."kitty"]
+# input_path = "~/.config/wwal/templates/kitty.conf"
+# output_path = "~/.config/kitty/colors-wwal.conf"
+# post_hook = "killall -SIGUSR1 kitty || true"
+# enabled = true
+#
+# [template."waybar"]
+# input_path = "~/.config/wwal/templates/waybar.css"
+# output_path = "~/.config/waybar/colors.css"
+# post_hook = "pkill -SIGUSR2 waybar || true"
+
+# Astronomical Solar Elevation & Time-of-Day Dynamic Wallpapers
+# Computes sunrise, solar noon, dusk, and night via NOAA solar position equations
+# (or uses explicit sunrise/sunset overrides or local clock periods when coordinates are omitted).
+#
+# [solar]
+# enabled = true
+# latitude = 37.7749
+# longitude = -122.4194
+# auto_theme_mode = true              # Switch to light mode during daytime and dark mode at dusk/night (alias: auto_day_night)
+# sunrise = "06:30"                   # Optional HH:MM override when latitude/longitude are omitted
+# sunset = "19:30"                    # Optional HH:MM override when latitude/longitude are omitted
+# dawn_path = "~/Pictures/Wallpapers/Solar/dawn.jxl"
+# day_path = "~/Pictures/Wallpapers/Solar/daylight.jxl"
+# dusk_path = "~/Pictures/Wallpapers/Solar/sunset.jxl"
+# night_path = "~/Shaders/starfield.frag"
+# manifest_path = "~/Pictures/Wallpapers/Solar/solar.xml"
+#
+# [[schedule]]
+# phase = "dawn"                      # "dawn", "morning", "day", "noon", "afternoon", "dusk", "evening", "night"
+# path = "~/Pictures/Wallpapers/Solar/dawn.jxl"
+# theme_mode = "light"
+#
+# [[schedule]]
+# phase = "day"
+# path = "~/Pictures/Wallpapers/Solar/daylight.jxl"
+# theme_mode = "light"
+#
+# [[schedule]]
+# phase = "dusk"
+# path = "~/Pictures/Wallpapers/Solar/sunset.jxl"
+# theme_mode = "dark"
+#
+# [[schedule]]
+# time = "22:00"                      # Explicit 24-hour HH:MM trigger (alias: start)
+# path = "~/Shaders/starfield.frag"
+# theme_mode = "dark"
+
+# Optional wpaperd-compatible wildcard fallback ([default] or [any] or [output."*"]):
+# [default]
+# path = "~/Pictures/Wallpapers"
+# duration = "30m"
+# sort = "random"
+# scaling = "fill"
+# crop_gravity = "center"
 
 # Optional per-output startup rules:
 # [output."DP-1"]
 # path = "~/Pictures/Wallpapers/ultrawide.jxl"
 # mode = "img"
 # scaling = "fill"
+# crop_gravity = "center"
 #
 # [output."eDP-1"]
 # path = "~/Pictures/Wallpapers/Slideshow"
 # mode = "slideshow"
-# interval = 600
+# duration = "15m"
+# sort = "mtime"
 # shuffle = true
+
+# Optional per-workspace wallpaper rules (Hyprland, Sway, Niri):
+# [workspace."1"]
+# path = "~/Pictures/Wallpapers/coding.png"
+# output = "DP-1"
+# transition_type = "fade"
+#
+# [workspace."9"]
+# path = "~/Shaders/audio_spectrum.frag"
+# output = "DP-1"
+# transition_type = "grow"

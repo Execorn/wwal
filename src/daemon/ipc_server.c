@@ -197,19 +197,21 @@ size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, c
         } else if (out->anim_active) {
             eng_kind = "animation";
             mpath = out->anim_meta.filepath;
+        } else if (!out->displaying_color && out->active_media_path[0] != '\0') {
+            mpath = out->active_media_path;
         } else {
             const waywal_output_saved_state_t *sv =
                 waywal_state_store_find_output(&g_saved_state, out->name);
             if (!sv) {
                 sv = waywal_state_store_find_output(&g_saved_state, "*");
             }
-            if (sv) {
+            if (sv && sv->kind != WAYWAL_CONTENT_SOLID_COLOR) {
                 mpath = sv->media_path;
             }
         }
         char esc_oname[128];
         char esc_odesc[256];
-        char esc_mpath[1024];
+        char esc_mpath[4096];
         waywal_json_escape_string(out->name[0] ? out->name : "unknown", esc_oname,
                                   sizeof(esc_oname));
         waywal_json_escape_string(out->description[0] ? out->description : "unknown", esc_odesc,
@@ -217,7 +219,7 @@ size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, c
         waywal_json_escape_string(mpath, esc_mpath, sizeof(esc_mpath));
 
         double scale_val = json_safe_float(fscale > 0 ? ((float)fscale / 120.0f) : 1.0f);
-        char out_entry[1536];
+        char out_entry[6144];
         size_t entry_off = 0;
         buf_appendf(out_entry, sizeof(out_entry), &entry_off,
                     "%s{\"name\":\"%s\",\"description\":\"%s\",\"width\":%d,\"height\":%d,"
@@ -381,6 +383,53 @@ static bool write_exact(int fd, const void *buf, size_t len)
     return true;
 }
 
+static bool output_matches_extra(const output_node_t *out, const char *extra_buf, size_t extra_len,
+                                 uint32_t count)
+{
+    if (!out || !extra_buf || extra_len == 0 || count == 0)
+        return false;
+    const char *ptr = extra_buf;
+    size_t rem = extra_len;
+    uint32_t i = 0;
+    while (i < count && rem > 0) {
+        const char *end = (const char *)memchr(ptr, '\0', rem);
+        if (!end)
+            break;
+        size_t step = (size_t)(end - ptr) + 1;
+        if (end > ptr) {
+            if (strcmp(ptr, "*") == 0 || output_matches_target_spec(out, ptr))
+                return true;
+            i++;
+        }
+        ptr += step;
+        rem -= step;
+    }
+    return false;
+}
+
+static bool extra_has_wildcard(const char *extra_buf, size_t extra_len, uint32_t count)
+{
+    if (!extra_buf || extra_len == 0 || count == 0)
+        return false;
+    const char *ptr = extra_buf;
+    size_t rem = extra_len;
+    uint32_t i = 0;
+    while (i < count && rem > 0) {
+        const char *end = (const char *)memchr(ptr, '\0', rem);
+        if (!end)
+            break;
+        size_t step = (size_t)(end - ptr) + 1;
+        if (end > ptr) {
+            if (strcmp(ptr, "*") == 0)
+                return true;
+            i++;
+        }
+        ptr += step;
+        rem -= step;
+    }
+    return false;
+}
+
 static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 {
     /* Verify peer credentials (SO_PEERCRED) to prevent unauthorized local hijack */
@@ -424,22 +473,103 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     }
 
     case WAYWAL_REQ_QUERY: {
-        char query_buf[4096];
+        char filter_buf[4097];
+        size_t filter_len = 0;
+        uint32_t num_targets = 0;
+        if (req_hdr.payload_size > 0) {
+            if (req_hdr.payload_size <= 4096) {
+                if (!read_exact(client_fd, filter_buf, req_hdr.payload_size)) {
+                    resp_hdr.opcode = WAYWAL_RESP_ERR;
+                    waywal_ipc_send(client_fd, &resp_hdr, -1);
+                    break;
+                }
+                filter_len = req_hdr.payload_size + 1;
+                filter_buf[req_hdr.payload_size] = '\0';
+                const char *p = filter_buf;
+                size_t rem = filter_len;
+                while (rem > 0) {
+                    const char *end = (const char *)memchr(p, '\0', rem);
+                    if (!end)
+                        break;
+                    if (end > p)
+                        num_targets++;
+                    size_t step = (size_t)(end - p) + 1;
+                    p += step;
+                    rem -= step;
+                }
+            } else {
+                uint8_t drain[1024];
+                size_t rem_drain = req_hdr.payload_size;
+                while (rem_drain > 0) {
+                    size_t chunk = rem_drain > sizeof(drain) ? sizeof(drain) : rem_drain;
+                    if (!read_exact(client_fd, drain, chunk))
+                        break;
+                    rem_drain -= chunk;
+                }
+                resp_hdr.opcode = WAYWAL_RESP_ERR;
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                break;
+            }
+        }
+
+        char query_buf[8192];
         size_t off = 0;
-        buf_appendf(query_buf, sizeof(query_buf), &off, "Connected outputs (%zu):\n",
-                    state->num_outputs);
+        const char *ns = state->namespace_str[0] != '\0' ? state->namespace_str : "default";
 
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-            buf_appendf(query_buf, sizeof(query_buf), &off, "  - %s (%s): %dx%d (scale: %d)\n",
-                        out->name[0] ? out->name : "unknown",
-                        out->description[0] ? out->description : "unknown", out->width, out->height,
-                        out->scale_factor);
+            const char *oname = out->name[0] ? out->name : "unknown";
+            if (num_targets > 0 && !output_matches_extra(out, filter_buf, filter_len, num_targets)) {
+                continue;
+            }
+            int32_t sc = out->scale_factor > 0 ? out->scale_factor : 1;
+            const char *media_path = out->active_media_path;
+
+            if (!out->displaying_color && media_path[0] == '\0') {
+                if (out->workshop_active && out->workshop_dir[0] != '\0') {
+                    media_path = out->workshop_dir;
+                } else if (out->shader_active && out->shader_path[0] != '\0') {
+                    media_path = out->shader_path;
+                } else if (out->video_eng && out->video_eng->filepath[0] != '\0') {
+                    media_path = out->video_eng->filepath;
+                } else if (out->anim_active && out->anim_meta.filepath[0] != '\0') {
+                    media_path = out->anim_meta.filepath;
+                } else if (out->slideshow_eng && out->slideshow_eng->num_files > 0 &&
+                           out->slideshow_eng->current_file_idx < out->slideshow_eng->num_files &&
+                           out->slideshow_eng->file_list &&
+                           out->slideshow_eng->file_list[out->slideshow_eng->current_file_idx]) {
+                    media_path =
+                        out->slideshow_eng->file_list[out->slideshow_eng->current_file_idx];
+                } else {
+                    const waywal_output_saved_state_t *s_ent =
+                        waywal_state_store_find_output(&g_saved_state, oname);
+                    if (s_ent && s_ent->kind != WAYWAL_CONTENT_SOLID_COLOR &&
+                        s_ent->media_path[0] != '\0') {
+                        media_path = s_ent->media_path;
+                    }
+                }
+            }
+
+            if (!out->displaying_color && media_path && media_path[0] != '\0') {
+                buf_appendf(query_buf, sizeof(query_buf), &off,
+                            "%s: %s: %dx%d, scale: %d, currently displaying: image: %s\n", ns,
+                            oname, out->width, out->height, sc, media_path);
+            } else {
+                color_rgba_t c =
+                    out->displaying_color
+                        ? out->active_color
+                        : (out->has_fill_color ? out->fill_color : state->current_color);
+                buf_appendf(query_buf, sizeof(query_buf), &off,
+                            "%s: %s: %dx%d, scale: %d, currently displaying: color: #%02x%02x%02x\n",
+                            ns, oname, out->width, out->height, sc, c.r, c.g, c.b);
+            }
         }
 
         resp_hdr.opcode = WAYWAL_RESP_INFO;
         resp_hdr.payload_size = (uint32_t)off;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
-        (void)write_exact(client_fd, query_buf, off);
+        if (off > 0) {
+            (void)write_exact(client_fd, query_buf, off);
+        }
         break;
     }
 
@@ -453,15 +583,20 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     .b = clear_payload.color[2],
                     .a = clear_payload.color[3],
                 };
-                char extra_buf[4096];
-                size_t extra_len = req_hdr.payload_size - sizeof(clear_payload);
+                char extra_buf[4097];
+                size_t raw_extra_len = req_hdr.payload_size - sizeof(clear_payload);
+                size_t extra_len = 0;
                 bool has_targets = false;
                 if (clear_payload.num_target_outputs > 0 &&
-                    clear_payload.num_target_outputs <= 64 && extra_len > 0 &&
-                    extra_len <= sizeof(extra_buf)) {
-                    if (read_exact(client_fd, extra_buf, extra_len)) {
-                        extra_buf[extra_len - 1] = '\0';
-                        has_targets = true;
+                    clear_payload.num_target_outputs <= 64 && raw_extra_len > 0 &&
+                    raw_extra_len <= 4096) {
+                    if (read_exact(client_fd, extra_buf, raw_extra_len)) {
+                        extra_buf[raw_extra_len] = '\0';
+                        extra_len = raw_extra_len + 1;
+                        if (!extra_has_wildcard(extra_buf, extra_len,
+                                                clear_payload.num_target_outputs)) {
+                            has_targets = true;
+                        }
                     }
                 }
 
@@ -471,6 +606,16 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 s_entry.solid_color = ((uint32_t)color.r << 24) | ((uint32_t)color.g << 16) |
                                       ((uint32_t)color.b << 8) | (uint32_t)color.a;
 
+                uint8_t solid_px[64 * 64 * 4];
+                for (size_t i = 0; i < 64 * 64; ++i) {
+                    solid_px[i * 4 + 0] = color.b;
+                    solid_px[i * 4 + 1] = color.g;
+                    solid_px[i * 4 + 2] = color.r;
+                    solid_px[i * 4 + 3] = color.a;
+                }
+                char matched_outputs[512] = {0};
+                size_t mo_len = 0;
+
                 if (has_targets && state->outputs) {
                     const char *ptr = extra_buf;
                     size_t rem = extra_len;
@@ -478,15 +623,38 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         const char *end = (const char *)memchr(ptr, '\0', rem);
                         if (!end)
                             break;
+                        bool any_matched = false;
                         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                            if (strcmp(out->name, ptr) == 0) {
+                            if (output_matches_target_spec(out, ptr)) {
                                 stop_engines_on_output(state, out, false, false, false, false);
                                 output_node_render_color(state, out, color);
+                                if (out->name[0] != '\0') {
+                                    memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
+                                    strncpy(s_entry.output_name, out->name,
+                                            sizeof(s_entry.output_name) - 1);
+                                    (void)waywal_state_store_update_output(&g_saved_state,
+                                                                           &s_entry);
+                                    int n = snprintf(matched_outputs + mo_len,
+                                                     sizeof(matched_outputs) - mo_len, "%s%s",
+                                                     mo_len ? "," : "", out->name);
+                                    if (n > 0 && mo_len + (size_t)n < sizeof(matched_outputs)) {
+                                        mo_len += (size_t)n;
+                                    }
+                                }
+                                any_matched = true;
                             }
                         }
-                        memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                        strncpy(s_entry.output_name, ptr, sizeof(s_entry.output_name) - 1);
-                        (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                        if (!any_matched && ptr[0] != '\0') {
+                            memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
+                            strncpy(s_entry.output_name, ptr, sizeof(s_entry.output_name) - 1);
+                            (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                            int n =
+                                snprintf(matched_outputs + mo_len, sizeof(matched_outputs) - mo_len,
+                                         "%s%s", mo_len ? "," : "", ptr);
+                            if (n > 0 && mo_len + (size_t)n < sizeof(matched_outputs)) {
+                                mo_len += (size_t)n;
+                            }
+                        }
                         size_t step = (size_t)(end - ptr) + 1;
                         ptr += step;
                         rem -= step;
@@ -514,9 +682,21 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                             strncpy(s_entry.output_name, out->name,
                                     sizeof(s_entry.output_name) - 1);
                             (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                            int n =
+                                snprintf(matched_outputs + mo_len, sizeof(matched_outputs) - mo_len,
+                                         "%s%s", mo_len ? "," : "", out->name);
+                            if (n > 0 && mo_len + (size_t)n < sizeof(matched_outputs)) {
+                                mo_len += (size_t)n;
+                            }
                         }
                     }
                 }
+                state->solar_owns_wallpaper = false;
+                state->active_dynwall_path[0] = '\0';
+                state->last_dynwall_frame_path[0] = '\0';
+                (void)waywal_ecosystem_cache_sync(mo_len > 0 ? matched_outputs : "*", "", "Lanczos3",
+                                                  solid_px, 64, 64,
+                                                  state->config.theme.caelestia_sync, false);
                 (void)waywal_state_store_save(&g_saved_state, NULL);
                 WAYWAL_LOG_INFO("Cleared screen with color: #%02x%02x%02x%02x", color.r, color.g,
                                 color.b, color.a);
@@ -671,17 +851,37 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                             waywal_power_governor_set_battery_policy(state->power_gov, bpol);
                         }
 
-                        daemon_update_palette_from_bgra(state, pixels, meta->width, meta->height,
-                                                        meta, false);
+                        if (meta->has_auto_day_night) {
+                            bool adn = (meta->auto_day_night != 0);
+                            state->config.solar.auto_day_night = adn;
+                            state->config.theme.auto_day_night = adn;
+                            state->config.daemon.auto_day_night = adn;
+                            state->config.auto_day_night = adn;
+                        }
+                        if (meta->has_solar_coords && isfinite(meta->solar_latitude) &&
+                            isfinite(meta->solar_longitude)) {
+                            state->config.solar.latitude = meta->solar_latitude;
+                            state->config.solar.longitude = meta->solar_longitude;
+                            state->config.solar.has_coordinates = true;
+                        }
+
+                        state->sched_theme_override_active = false;
+                        if (!meta->is_solid_color || meta->extract_theme || meta->has_seed_color ||
+                            meta->client_exported_theme ||
+                            (state->config.theme.enabled && !meta->no_theme)) {
+                            daemon_update_palette_from_bgra(state, pixels, meta->width,
+                                                            meta->height, meta, false);
+                        }
 
                         const char *first_target = "*";
                         if (meta->num_target_outputs > 0) {
                             first_target = (const char *)meta + sizeof(waywal_img_metadata_t);
                         }
                         bool is_anim =
+                            (!meta->is_solid_color) &&
                             try_start_native_animation(state, meta->filepath, meta, first_target);
                         bool direct_depth_parallax = false;
-                        if (!is_anim && meta->depth_map_path[0] != '\0' &&
+                        if (!meta->is_solid_color && !is_anim && meta->depth_map_path[0] != '\0' &&
                             (meta->transition_type == WAYWAL_TRANSITION_NONE ||
                              meta->transition_duration_ms == 0)) {
                             for (output_node_t *out = state->outputs; out != NULL;
@@ -691,6 +891,11 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                 out->scaling_mode = meta->scaling_mode;
                                 out->filter_mode = meta->filter_mode;
                                 out->ten_bit = meta->ten_bit;
+                                out->crop_gravity_x =
+                                    meta->has_crop_gravity ? meta->crop_gravity_x : 0.5f;
+                                out->crop_gravity_y =
+                                    meta->has_crop_gravity ? meta->crop_gravity_y : 0.5f;
+                                out->has_crop_gravity = (meta->has_crop_gravity != 0);
                             }
                             direct_depth_parallax = daemon_activate_depth_parallax(
                                 state, pixels, meta->width, meta->height, meta, first_target);
@@ -703,36 +908,138 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         } else {
                             ok = daemon_start_image_transition(state, pixels, meta->width,
                                                                meta->height, meta);
-                            if (ok && !is_anim && meta->depth_map_path[0] != '\0') {
+                            if (ok && !meta->is_solid_color && !is_anim &&
+                                meta->depth_map_path[0] != '\0') {
                                 (void)daemon_activate_depth_parallax(
                                     state, pixels, meta->width, meta->height, meta, first_target);
                             }
                         }
-
                         if (ok) {
+                            if (!meta->is_solid_color &&
+                                waywal_dynwall_is_manifest_path(meta->filepath)) {
+                                state->solar_owns_wallpaper = true;
+                                snprintf(state->active_dynwall_path,
+                                         sizeof(state->active_dynwall_path), "%s", meta->filepath);
+                                snprintf(state->active_dynwall_output,
+                                         sizeof(state->active_dynwall_output), "%s", first_target);
+                                waywal_dynwall_manifest_t man;
+                                waywal_dynwall_resolved_t res;
+                                time_t now_utc = time(NULL);
+                                struct tm lt;
+                                localtime_r(&now_utc, &lt);
+                                waywal_solar_state_t sstate;
+                                if (state->config.solar.has_coordinates) {
+                                    waywal_solar_compute(state->config.solar.latitude,
+                                                         state->config.solar.longitude, now_utc,
+                                                         &lt, &sstate);
+                                } else {
+                                    waywal_solar_synthesize_local(
+                                        state->config.solar.sunrise_fallback_min,
+                                        state->config.solar.sunset_fallback_min, now_utc, &lt,
+                                        &sstate);
+                                }
+                                if (waywal_dynwall_load_file(meta->filepath, &man) &&
+                                    waywal_dynwall_resolve(&man, now_utc, &lt, &sstate, &res) &&
+                                    waywal_dynwall_effective_path(&res)[0] != '\0') {
+                                    snprintf(state->last_dynwall_frame_path,
+                                             sizeof(state->last_dynwall_frame_path), "%s",
+                                             waywal_dynwall_effective_path(&res));
+                                    if (res.has_theme_mode) {
+                                        state->sched_theme_override_active = true;
+                                    }
+                                }
+                            } else {
+                                state->solar_owns_wallpaper = false;
+                                state->active_dynwall_path[0] = '\0';
+                                state->last_dynwall_frame_path[0] = '\0';
+                            }
+                        }
+                        if (ok && (state->active_dynwall_path[0] != '\0' ||
+                                   state->config.solar.auto_day_night ||
+                                   state->config.theme.auto_day_night ||
+                                   state->config.daemon.auto_day_night ||
+                                   state->config.auto_day_night)) {
+                            daemon_tick_solar_and_schedule(state, true);
+                        }
+
+                        if (ok && !meta->no_cache) {
+                            const char *filt_str = waywal_filter_mode_to_swww_str(
+                                (waywal_filter_mode_t)meta->filter_mode);
+                            char matched_outputs[512] = {0};
+                            size_t mo_len = 0;
+                            for (output_node_t *out = state->outputs; out != NULL;
+                                 out = out->next) {
+                                if (output_matches_img_meta(out, meta) && out->name[0] != '\0') {
+                                    int n = snprintf(matched_outputs + mo_len,
+                                                     sizeof(matched_outputs) - mo_len, "%s%s",
+                                                     mo_len ? "," : "", out->name);
+                                    if (n > 0 && mo_len + (size_t)n < sizeof(matched_outputs)) {
+                                        mo_len += (size_t)n;
+                                    }
+                                }
+                            }
+                            (void)waywal_ecosystem_cache_sync(
+                                mo_len > 0 ? matched_outputs : first_target, meta->filepath,
+                                filt_str, pixels, meta->width, meta->height,
+                                state->config.theme.caelestia_sync, false);
+                        }
+
+                        if (ok && !meta->no_cache &&
+                            (meta->filepath[0] != '\0' || meta->is_solid_color)) {
                             waywal_output_saved_state_t s_entry;
                             memset(&s_entry, 0, sizeof(s_entry));
-                            s_entry.kind =
-                                is_anim ? WAYWAL_CONTENT_ANIMATION : WAYWAL_CONTENT_STATIC_IMAGE;
-                            snprintf(s_entry.media_path, sizeof(s_entry.media_path), "%.*s",
-                                     (int)(sizeof(meta->filepath) - 1), meta->filepath);
+                            if (meta->is_solid_color) {
+                                s_entry.kind = WAYWAL_CONTENT_SOLID_COLOR;
+                                s_entry.media_path[0] = '\0';
+                            } else {
+                                s_entry.kind = is_anim ? WAYWAL_CONTENT_ANIMATION
+                                                       : WAYWAL_CONTENT_STATIC_IMAGE;
+                                snprintf(s_entry.media_path, sizeof(s_entry.media_path), "%.*s",
+                                         (int)(sizeof(meta->filepath) - 1), meta->filepath);
+                            }
                             s_entry.scaling = (waywal_scaling_mode_t)meta->scaling_mode;
                             s_entry.filter = (waywal_filter_mode_t)meta->filter_mode;
                             s_entry.ten_bit = meta->ten_bit;
+                            uint8_t col_a = meta->color[3] ? meta->color[3] : 255;
                             s_entry.solid_color = ((uint32_t)meta->color[0] << 24) |
                                                   ((uint32_t)meta->color[1] << 16) |
                                                   ((uint32_t)meta->color[2] << 8) |
-                                                  (uint32_t)meta->color[3];
+                                                  (uint32_t)col_a;
+                            s_entry.crop_gravity_x =
+                                meta->has_crop_gravity ? meta->crop_gravity_x : 0.5f;
+                            s_entry.crop_gravity_y =
+                                meta->has_crop_gravity ? meta->crop_gravity_y : 0.5f;
+                            s_entry.has_crop_gravity = meta->has_crop_gravity ? 1 : 0;
 
-                            if (meta->num_target_outputs > 0) {
+                            if (meta->num_target_outputs > 0 &&
+                                !extra_has_wildcard((const char *)meta +
+                                                        sizeof(waywal_img_metadata_t),
+                                                    meta->extra_data_len,
+                                                    meta->num_target_outputs)) {
                                 const char *ptr =
                                     (const char *)meta + sizeof(waywal_img_metadata_t);
                                 for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
-                                    memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                                    strncpy(s_entry.output_name, ptr,
-                                            sizeof(s_entry.output_name) - 1);
-                                    (void)waywal_state_store_update_output(&g_saved_state,
-                                                                           &s_entry);
+                                    bool matched_out = false;
+                                    for (output_node_t *out = state->outputs; out != NULL;
+                                         out = out->next) {
+                                        if (output_matches_target_spec(out, ptr) &&
+                                            out->name[0] != '\0') {
+                                            memset(s_entry.output_name, 0,
+                                                   sizeof(s_entry.output_name));
+                                            strncpy(s_entry.output_name, out->name,
+                                                    sizeof(s_entry.output_name) - 1);
+                                            (void)waywal_state_store_update_output(&g_saved_state,
+                                                                                   &s_entry);
+                                            matched_out = true;
+                                        }
+                                    }
+                                    if (!matched_out) {
+                                        memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
+                                        strncpy(s_entry.output_name, ptr,
+                                                sizeof(s_entry.output_name) - 1);
+                                        (void)waywal_state_store_update_output(&g_saved_state,
+                                                                               &s_entry);
+                                    }
                                     ptr += strlen(ptr) + 1;
                                 }
                             } else {
@@ -788,166 +1095,65 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         memset(&vpay, 0, sizeof(vpay));
         bool has_vpay = false;
         output_node_t *target_out = NULL;
-        char extra_buf[4096];
+        char extra_buf[4097];
         size_t extra_len = 0;
         bool has_extra_targets = false;
+        uint32_t matched_count = 0;
 
         if (req_hdr.payload_size >= sizeof(waywal_video_payload_t)) {
             if (read_exact(client_fd, &vpay, sizeof(vpay))) {
                 vpay.filepath[sizeof(vpay.filepath) - 1] = '\0';
                 has_vpay = true;
 
-                extra_len = req_hdr.payload_size - sizeof(waywal_video_payload_t);
-                if (vpay.num_target_outputs > 0 && vpay.num_target_outputs <= 64 && extra_len > 0 &&
-                    extra_len <= sizeof(extra_buf)) {
-                    if (read_exact(client_fd, extra_buf, extra_len)) {
-                        extra_buf[extra_len - 1] = '\0';
-                        has_extra_targets = true;
-                        const char *ptr = extra_buf;
-                        size_t remaining = extra_len;
-                        uint32_t matched_count = 0;
-                        output_node_t *last_matched = NULL;
-                        for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0; ++i) {
-                            const char *end = (const char *)memchr(ptr, '\0', remaining);
-                            if (!end)
-                                break;
-                            for (output_node_t *out = state->outputs; out != NULL;
-                                 out = out->next) {
-                                if (strcmp(out->name, ptr) == 0) {
-                                    last_matched = out;
-                                    matched_count++;
+                size_t raw_extra_len = req_hdr.payload_size - sizeof(waywal_video_payload_t);
+                if (vpay.num_target_outputs > 0 && vpay.num_target_outputs <= 64 &&
+                    raw_extra_len > 0 && raw_extra_len <= 4096) {
+                    if (read_exact(client_fd, extra_buf, raw_extra_len)) {
+                        extra_buf[raw_extra_len] = '\0';
+                        extra_len = raw_extra_len + 1;
+                        if (!extra_has_wildcard(extra_buf, extra_len, vpay.num_target_outputs)) {
+                            has_extra_targets = true;
+                            const char *ptr = extra_buf;
+                            size_t remaining = extra_len;
+                            output_node_t *last_matched = NULL;
+                            for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0;
+                                 ++i) {
+                                const char *end = (const char *)memchr(ptr, '\0', remaining);
+                                if (!end)
+                                    break;
+                                for (output_node_t *out = state->outputs; out != NULL;
+                                     out = out->next) {
+                                    if (output_matches_target_spec(out, ptr)) {
+                                        last_matched = out;
+                                        matched_count++;
+                                    }
                                 }
+                                size_t step = (size_t)(end - ptr) + 1;
+                                ptr += step;
+                                remaining -= step;
                             }
-                            size_t step = (size_t)(end - ptr) + 1;
-                            ptr += step;
-                            remaining -= step;
-                        }
-                        if (matched_count == 1) {
-                            target_out = last_matched;
+                            if (matched_count == 1) {
+                                target_out = last_matched;
+                            }
                         }
                     }
                 }
             }
         }
 
-        bool shared_existing_ve = (has_extra_targets && has_vpay && attached_fd < 0 &&
-                                   state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED &&
-                                   state->video_engine.filepath[0] != '\0' &&
-                                   strcmp(state->video_engine.filepath, vpay.filepath) == 0);
-
-        if (shared_existing_ve) {
-            const char *ptr = extra_buf;
-            size_t remaining = extra_len;
-            for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0; ++i) {
-                const char *end = (const char *)memchr(ptr, '\0', remaining);
-                if (!end)
-                    break;
-                for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                    if (strcmp(out->name, ptr) == 0) {
-                        stop_engines_on_output(state, out, false, false,
-                                               out->video_eng == &state->video_engine, false);
-                        out->video_eng = &state->video_engine;
-                        out->video_targeted = true;
-                        out->scaling_mode = vpay.scaling_mode;
-                        out->vp_configured = false;
-                    }
-                }
-                size_t step = (size_t)(end - ptr) + 1;
-                ptr += step;
-                remaining -= step;
+        if (state->outputs != NULL && has_extra_targets && matched_count == 0) {
+            if (attached_fd >= 0) {
+                close(attached_fd);
+                attached_fd = -1;
             }
-            state->video_engine.loop_count = vpay.loop_count;
-            state->video_engine.playback_speed =
-                vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
-            if (state->video_engine.target_output != target_out) {
-                state->video_engine.target_output = NULL;
-            }
-            reconcile_global_engine_flags(state);
-            ok = true;
+            ok = false;
         } else {
-            if (state->outputs) {
-                if (has_extra_targets) {
-                    const char *ptr = extra_buf;
-                    size_t remaining = extra_len;
-                    for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0; ++i) {
-                        const char *end = (const char *)memchr(ptr, '\0', remaining);
-                        if (!end)
-                            break;
-                        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                            if (strcmp(out->name, ptr) == 0) {
-                                stop_engines_on_output(state, out, false, false,
-                                                       out->video_eng == &state->video_engine,
-                                                       false);
-                            }
-                        }
-                        size_t step = (size_t)(end - ptr) + 1;
-                        ptr += step;
-                        remaining -= step;
-                    }
-                } else {
-                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                        stop_engines_on_output(state, out, false, false,
-                                               out->video_eng == &state->video_engine, false);
-                    }
-                    slideshow_stop(&state->slideshow);
-                    shader_engine_stop_playback(state);
-                    anim_engine_stop_playback(state);
-                }
-                reconcile_global_engine_flags(state);
-            } else {
-                slideshow_stop(&state->slideshow);
-                shader_engine_stop_playback(state);
-                anim_engine_stop_playback(state);
-            }
+            bool shared_existing_ve = (has_extra_targets && has_vpay && attached_fd < 0 &&
+                                       state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED &&
+                                       state->video_engine.filepath[0] != '\0' &&
+                                       strcmp(state->video_engine.filepath, vpay.filepath) == 0);
 
-            video_engine_t *ve = &state->video_engine;
-            if (has_extra_targets && state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED &&
-                (!target_out || state->video_engine.target_output != target_out)) {
-                video_engine_t *custom_ve = (video_engine_t *)calloc(1, sizeof(video_engine_t));
-                if (custom_ve && video_engine_init(custom_ve, state)) {
-                    if (custom_ve->timer_fd >= 0) {
-                        register_fd_in_loops(state, custom_ve->timer_fd, URING_EV_TIMER);
-                    }
-                    ve = custom_ve;
-                } else {
-                    free(custom_ve);
-                }
-            }
-
-            if (has_vpay) {
-                ve->loop_count = vpay.loop_count;
-                ve->playback_speed = vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
-            }
-            ve->has_target_filter = has_extra_targets;
-            if (ve == &state->video_engine) {
-                for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                    out->video_targeted = !has_extra_targets;
-                }
-                if (has_extra_targets) {
-                    const char *ptr = extra_buf;
-                    size_t remaining = extra_len;
-                    for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0; ++i) {
-                        const char *end = (const char *)memchr(ptr, '\0', remaining);
-                        if (!end)
-                            break;
-                        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                            if (strcmp(out->name, ptr) == 0) {
-                                out->video_targeted = true;
-                            }
-                        }
-                        size_t step = (size_t)(end - ptr) + 1;
-                        ptr += step;
-                        remaining -= step;
-                    }
-                }
-                for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                    if (!out->video_targeted && out->video_eng == &state->video_engine) {
-                        out->video_eng = NULL;
-                    }
-                }
-            }
-
-            if (has_extra_targets) {
+            if (shared_existing_ve) {
                 const char *ptr = extra_buf;
                 size_t remaining = extra_len;
                 for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0; ++i) {
@@ -955,87 +1161,255 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     if (!end)
                         break;
                     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                        if (strcmp(out->name, ptr) == 0) {
-                            out->video_eng = ve;
-                            if (has_vpay) {
-                                out->scaling_mode = vpay.scaling_mode;
-                                out->vp_configured = false;
-                            }
+                        if (output_matches_target_spec(out, ptr)) {
+                            stop_engines_on_output(state, out, false, false,
+                                                   out->video_eng == &state->video_engine, false);
+                            out->video_eng = &state->video_engine;
+                            out->video_targeted = true;
+                            out->scaling_mode = vpay.scaling_mode;
+                            out->vp_configured = false;
                         }
                     }
                     size_t step = (size_t)(end - ptr) + 1;
                     ptr += step;
                     remaining -= step;
                 }
+                state->video_engine.loop_count = vpay.loop_count;
+                state->video_engine.playback_speed =
+                    vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
+                if (state->video_engine.target_output != target_out) {
+                    state->video_engine.target_output = NULL;
+                }
+                reconcile_global_engine_flags(state);
+                ok = true;
             } else {
-                for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                    out->video_eng = ve;
-                    if (has_vpay) {
-                        out->scaling_mode = vpay.scaling_mode;
-                        out->vp_configured = false;
+                if (state->outputs) {
+                    if (has_extra_targets) {
+                        const char *ptr = extra_buf;
+                        size_t remaining = extra_len;
+                        for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0; ++i) {
+                            const char *end = (const char *)memchr(ptr, '\0', remaining);
+                            if (!end)
+                                break;
+                            for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                                if (output_matches_target_spec(out, ptr)) {
+                                    stop_engines_on_output(state, out, false, false,
+                                                           out->video_eng == &state->video_engine,
+                                                           false);
+                                }
+                            }
+                            size_t step = (size_t)(end - ptr) + 1;
+                            ptr += step;
+                            remaining -= step;
+                        }
+                    } else {
+                        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                            stop_engines_on_output(state, out, false, false,
+                                                   out->video_eng == &state->video_engine, false);
+                        }
+                        slideshow_stop(&state->slideshow);
+                        shader_engine_stop_playback(state);
+                        anim_engine_stop_playback(state);
                     }
-                }
-            }
-
-            if (attached_fd >= 0) {
-                struct stat st;
-                if (fstat(attached_fd, &st) == 0 && st.st_size > 0) {
-                    ok = video_engine_load_mem(ve, attached_fd, (size_t)st.st_size, target_out);
-                    attached_fd = -1;
+                    reconcile_global_engine_flags(state);
                 } else {
-                    close(attached_fd);
-                    attached_fd = -1;
+                    slideshow_stop(&state->slideshow);
+                    shader_engine_stop_playback(state);
+                    anim_engine_stop_playback(state);
                 }
-            } else if (has_vpay) {
-                ok = video_engine_load_file(ve, vpay.filepath, target_out);
-            }
 
-            if (!ok) {
-                for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                    if (out->video_eng == ve) {
-                        out->video_eng = NULL;
+                video_engine_t *ve = &state->video_engine;
+                if (has_extra_targets && state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED &&
+                    (!target_out || state->video_engine.target_output != target_out)) {
+                    video_engine_t *custom_ve =
+                        (video_engine_t *)calloc(1, sizeof(video_engine_t));
+                    if (custom_ve && video_engine_init(custom_ve, state)) {
+                        if (custom_ve->timer_fd >= 0) {
+                            register_fd_in_loops(state, custom_ve->timer_fd, URING_EV_TIMER);
+                        }
+                        ve = custom_ve;
+                    } else {
+                        free(custom_ve);
                     }
                 }
-                if (ve != &state->video_engine) {
-                    if (ve->timer_fd >= 0) {
-                        unregister_fd_from_loops(state, ve->timer_fd);
+
+                if (has_vpay) {
+                    ve->loop_count = vpay.loop_count;
+                    ve->playback_speed = vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
+                }
+                ve->has_target_filter = has_extra_targets;
+                if (ve == &state->video_engine) {
+                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                        out->video_targeted = !has_extra_targets;
                     }
-                    video_engine_destroy(ve);
-                    free(ve);
+                    if (has_extra_targets) {
+                        const char *ptr = extra_buf;
+                        size_t remaining = extra_len;
+                        for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0; ++i) {
+                            const char *end = (const char *)memchr(ptr, '\0', remaining);
+                            if (!end)
+                                break;
+                            for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                                if (output_matches_target_spec(out, ptr)) {
+                                    out->video_targeted = true;
+                                }
+                            }
+                            size_t step = (size_t)(end - ptr) + 1;
+                            ptr += step;
+                            remaining -= step;
+                        }
+                    }
+                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                        if (!out->video_targeted && out->video_eng == &state->video_engine) {
+                            out->video_eng = NULL;
+                        }
+                    }
+                }
+
+                if (has_extra_targets) {
+                    const char *ptr = extra_buf;
+                    size_t remaining = extra_len;
+                    for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0; ++i) {
+                        const char *end = (const char *)memchr(ptr, '\0', remaining);
+                        if (!end)
+                            break;
+                        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                            if (output_matches_target_spec(out, ptr)) {
+                                out->video_eng = ve;
+                                out->video_targeted = true;
+                                if (has_vpay) {
+                                    out->scaling_mode = vpay.scaling_mode;
+                                    out->vp_configured = false;
+                                }
+                            }
+                        }
+                        size_t step = (size_t)(end - ptr) + 1;
+                        ptr += step;
+                        remaining -= step;
+                    }
+                } else {
+                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                        out->video_eng = ve;
+                        out->video_targeted = true;
+                        if (has_vpay) {
+                            out->scaling_mode = vpay.scaling_mode;
+                            out->vp_configured = false;
+                        }
+                    }
+                }
+
+                if (attached_fd >= 0) {
+                    struct stat st;
+                    if (fstat(attached_fd, &st) == 0 && st.st_size > 0) {
+                        ok = video_engine_load_mem(ve, attached_fd, (size_t)st.st_size, target_out);
+                        attached_fd = -1;
+                    } else {
+                        close(attached_fd);
+                        attached_fd = -1;
+                    }
+                } else if (has_vpay) {
+                    ok = video_engine_load_file(ve, vpay.filepath, target_out);
+                }
+
+                if (!ok) {
+                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                        if (out->video_eng == ve) {
+                            out->video_eng = NULL;
+                            out->video_targeted = false;
+                        }
+                    }
+                    if (ve != &state->video_engine) {
+                        if (ve->timer_fd >= 0) {
+                            unregister_fd_from_loops(state, ve->timer_fd);
+                        }
+                        video_engine_destroy(ve);
+                        free(ve);
+                    }
                 }
             }
         }
 
-        if (ok && has_vpay) {
-            daemon_reconcile_power_state(state);
-            waywal_output_saved_state_t s_entry;
-            memset(&s_entry, 0, sizeof(s_entry));
-            s_entry.kind = WAYWAL_CONTENT_VIDEO;
-            strncpy(s_entry.media_path, vpay.filepath, sizeof(s_entry.media_path) - 1);
-            s_entry.scaling = (waywal_scaling_mode_t)vpay.scaling_mode;
-            if (has_extra_targets) {
-                const char *ptr = extra_buf;
-                size_t rem = extra_len;
-                for (uint32_t i = 0; i < vpay.num_target_outputs && rem > 0; ++i) {
-                    const char *end = (const char *)memchr(ptr, '\0', rem);
-                    if (!end)
-                        break;
-                    memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                    strncpy(s_entry.output_name, ptr, sizeof(s_entry.output_name) - 1);
-                    (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
-                    size_t step = (size_t)(end - ptr) + 1;
-                    ptr += step;
-                    rem -= step;
+        if (ok) {
+            for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                if (out->video_eng != NULL &&
+                    (!has_extra_targets || output_matches_extra(out, extra_buf, extra_len,
+                                                                vpay.num_target_outputs))) {
+                    out->displaying_color = false;
+                    if (has_vpay && vpay.filepath[0] != '\0') {
+                        snprintf(out->active_media_path, sizeof(out->active_media_path), "%s",
+                                 vpay.filepath);
+                    } else {
+                        snprintf(out->active_media_path, sizeof(out->active_media_path), "<stdin>");
+                    }
                 }
-            } else {
-                strncpy(s_entry.output_name, "*", sizeof(s_entry.output_name) - 1);
-                (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
             }
-            (void)waywal_state_store_save(&g_saved_state, NULL);
+            daemon_reconcile_power_state(state);
+            if (has_vpay && !vpay.no_cache) {
+                char matched_outputs[256] = {0};
+                size_t mlen = 0;
+                for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                    if (out->video_eng != NULL &&
+                        (!has_extra_targets || output_matches_extra(out, extra_buf, extra_len,
+                                                                    vpay.num_target_outputs)) &&
+                        out->name[0] != '\0') {
+                        int n =
+                            snprintf(matched_outputs + mlen, sizeof(matched_outputs) - mlen, "%s%s",
+                                     mlen > 0 ? "," : "", out->name);
+                        if (n > 0 && mlen + (size_t)n < sizeof(matched_outputs)) {
+                            mlen += (size_t)n;
+                        }
+                    }
+                }
+                const char *fallback_target = has_extra_targets ? extra_buf : "*";
+                (void)waywal_ecosystem_cache_sync(
+                    matched_outputs[0] ? matched_outputs : fallback_target, vpay.filepath,
+                    "Lanczos3", NULL, 0, 0, state->config.theme.caelestia_sync,
+                    vpay.no_cache != 0);
+
+                waywal_output_saved_state_t s_entry;
+                memset(&s_entry, 0, sizeof(s_entry));
+                s_entry.kind = WAYWAL_CONTENT_VIDEO;
+                strncpy(s_entry.media_path, vpay.filepath, sizeof(s_entry.media_path) - 1);
+                s_entry.scaling = (waywal_scaling_mode_t)vpay.scaling_mode;
+                if (has_extra_targets) {
+                    const char *ptr = extra_buf;
+                    size_t rem = extra_len;
+                    for (uint32_t i = 0; i < vpay.num_target_outputs && rem > 0; ++i) {
+                        const char *end = (const char *)memchr(ptr, '\0', rem);
+                        if (!end)
+                            break;
+                        bool matched_out = false;
+                        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                            if (output_matches_target_spec(out, ptr) && out->name[0] != '\0') {
+                                memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
+                                strncpy(s_entry.output_name, out->name,
+                                        sizeof(s_entry.output_name) - 1);
+                                (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                                matched_out = true;
+                            }
+                        }
+                        if (!matched_out) {
+                            memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
+                            strncpy(s_entry.output_name, ptr, sizeof(s_entry.output_name) - 1);
+                            (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                        }
+                        size_t step = (size_t)(end - ptr) + 1;
+                        ptr += step;
+                        rem -= step;
+                    }
+                } else {
+                    strncpy(s_entry.output_name, "*", sizeof(s_entry.output_name) - 1);
+                    (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                }
+                (void)waywal_state_store_save(&g_saved_state, NULL);
+            }
         }
         resp_hdr.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
         if (ok) {
+            state->solar_owns_wallpaper = false;
+            state->active_dynwall_path[0] = '\0';
+            state->last_dynwall_frame_path[0] = '\0';
             daemon_broadcast_event(state, "wallpaper_changed");
         }
         break;
@@ -1182,12 +1556,33 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
     case WAYWAL_REQ_SLIDESHOW: {
         waywal_slideshow_payload_t spay;
+        memset(&spay, 0, sizeof(spay));
         bool ok = false;
-        if (req_hdr.payload_size >= sizeof(spay)) {
-            if (read_exact(client_fd, &spay, sizeof(spay))) {
+        const size_t min_spay = offsetof(waywal_slideshow_payload_t, extract_theme);
+        size_t read_spay = req_hdr.payload_size < sizeof(spay) ? req_hdr.payload_size : sizeof(spay);
+        if (req_hdr.payload_size >= min_spay && req_hdr.payload_size <= sizeof(spay)) {
+            if (read_exact(client_fd, &spay, read_spay)) {
                 spay.path[sizeof(spay.path) - 1] = '\0';
+                if (spay.auto_day_night != 0) {
+                    bool adn = (spay.auto_day_night == 1u);
+                    state->config.solar.auto_day_night = adn;
+                    state->config.theme.auto_day_night = adn;
+                    state->config.daemon.auto_day_night = adn;
+                    state->config.auto_day_night = adn;
+                }
+                if (spay.has_solar_coords && isfinite(spay.solar_latitude) &&
+                    isfinite(spay.solar_longitude)) {
+                    state->config.solar.latitude = spay.solar_latitude;
+                    state->config.solar.longitude = spay.solar_longitude;
+                    state->config.solar.has_coordinates = true;
+                }
+                state->solar_owns_wallpaper = false;
+                state->active_dynwall_path[0] = '\0';
                 ok = daemon_start_slideshow_isolated(state, &spay);
                 if (ok) {
+                    daemon_reconcile_power_state(state);
+                }
+                if (ok && !spay.no_cache) {
                     waywal_output_saved_state_t s_entry;
                     memset(&s_entry, 0, sizeof(s_entry));
                     s_entry.kind = WAYWAL_CONTENT_SLIDESHOW;
@@ -1196,6 +1591,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     s_entry.scaling = (waywal_scaling_mode_t)spay.scaling_mode;
                     s_entry.filter = (waywal_filter_mode_t)spay.filter_mode;
                     s_entry.ten_bit = spay.ten_bit;
+                    s_entry.crop_gravity_x = spay.has_crop_gravity ? spay.crop_gravity_x : 0.5f;
+                    s_entry.crop_gravity_y = spay.has_crop_gravity ? spay.crop_gravity_y : 0.5f;
+                    s_entry.has_crop_gravity = spay.has_crop_gravity ? 1 : 0;
                     if (spay.num_target_outputs > 0) {
                         uint32_t max_t =
                             spay.num_target_outputs <= 16 ? spay.num_target_outputs : 16;
@@ -1223,11 +1621,64 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         break;
     }
 
-    case WAYWAL_REQ_SLIDESHOW_CTRL: {
+    case WAYWAL_REQ_SLIDESHOW_CTRL:
+    case WAYWAL_REQ_SLIDESHOW_NEXT:
+    case WAYWAL_REQ_SLIDESHOW_PREV: {
         waywal_slideshow_ctrl_t sctrl;
+        memset(&sctrl, 0, sizeof(sctrl));
         bool ok = false;
-        if (req_hdr.payload_size >= sizeof(sctrl)) {
-            if (read_exact(client_fd, &sctrl, sizeof(sctrl))) {
+        bool valid_payload = false;
+
+        if (req_hdr.opcode == WAYWAL_REQ_SLIDESHOW_NEXT) {
+            sctrl.action = WAYWAL_SLIDESHOW_NEXT;
+            valid_payload = true;
+        } else if (req_hdr.opcode == WAYWAL_REQ_SLIDESHOW_PREV) {
+            sctrl.action = WAYWAL_SLIDESHOW_PREV;
+            valid_payload = true;
+        }
+
+        if (req_hdr.payload_size > 0) {
+            if (req_hdr.opcode == WAYWAL_REQ_SLIDESHOW_CTRL &&
+                req_hdr.payload_size < sizeof(uint32_t)) {
+                valid_payload = false;
+            } else {
+                size_t to_read =
+                    req_hdr.payload_size < sizeof(sctrl) ? req_hdr.payload_size : sizeof(sctrl);
+                if (read_exact(client_fd, &sctrl, to_read)) {
+                    sctrl.target_output[sizeof(sctrl.target_output) - 1] = '\0';
+                    if (req_hdr.opcode == WAYWAL_REQ_SLIDESHOW_NEXT) {
+                        sctrl.action = WAYWAL_SLIDESHOW_NEXT;
+                    } else if (req_hdr.opcode == WAYWAL_REQ_SLIDESHOW_PREV) {
+                        sctrl.action = WAYWAL_SLIDESHOW_PREV;
+                    }
+                    valid_payload = true;
+                } else {
+                    valid_payload = false;
+                }
+            }
+        }
+
+        if (valid_payload) {
+            const char *target_spec =
+                (sctrl.target_output[0] != '\0') ? sctrl.target_output : "*";
+            bool is_wildcard = (strcmp(target_spec, "*") == 0);
+            bool global_matches = is_wildcard;
+            if (!global_matches && !state->outputs) {
+                if (state->slideshow.num_target_outputs == 0) {
+                    global_matches = true;
+                } else {
+                    for (uint32_t i = 0; i < state->slideshow.num_target_outputs && i < 16; ++i) {
+                        if (strcmp(state->slideshow.target_outputs[i], "*") == 0 ||
+                            strcmp(state->slideshow.target_outputs[i], target_spec) == 0) {
+                            global_matches = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (global_matches &&
+                (state->slideshow.active || sctrl.action == WAYWAL_SLIDESHOW_STOP)) {
                 ok = slideshow_control(&state->slideshow, sctrl.action);
                 if (sctrl.action == WAYWAL_SLIDESHOW_STOP) {
                     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
@@ -1236,11 +1687,72 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         }
                     }
                 }
-                slideshow_engine_t *seen[32];
-                size_t num_seen = 0;
+            }
+
+            slideshow_engine_t *seen[32];
+            size_t num_seen = 0;
+            if (sctrl.action == WAYWAL_SLIDESHOW_STOP) {
                 for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                    if (!output_matches_target_spec(out, target_spec)) {
+                        continue;
+                    }
+                    ok = true;
                     slideshow_engine_t *ss = out->slideshow_eng;
-                    if (!ss || ss == &state->slideshow) {
+                    out->slideshow_eng = NULL;
+                    if (!ss) {
+                        continue;
+                    }
+                    bool already = false;
+                    for (size_t k = 0; k < num_seen; ++k) {
+                        if (seen[k] == ss) {
+                            already = true;
+                            break;
+                        }
+                    }
+                    if (!already && num_seen < 32) {
+                        seen[num_seen++] = ss;
+                    }
+                }
+                for (size_t k = 0; k < num_seen; ++k) {
+                    bool still_used = false;
+                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                        if (out->slideshow_eng == seen[k]) {
+                            still_used = true;
+                            break;
+                        }
+                    }
+                    if (still_used) {
+                        uint32_t rem_count = 0;
+                        memset(seen[k]->target_outputs, 0, sizeof(seen[k]->target_outputs));
+                        for (output_node_t *o = state->outputs; o != NULL && rem_count < 16;
+                             o = o->next) {
+                            if (o->slideshow_eng == seen[k] && o->name[0] != '\0') {
+                                strncpy(seen[k]->target_outputs[rem_count], o->name,
+                                        sizeof(seen[k]->target_outputs[rem_count]) - 1);
+                                rem_count++;
+                            }
+                        }
+                        if (rem_count > 0) {
+                            seen[k]->num_target_outputs = rem_count;
+                        }
+                    } else {
+                        slideshow_stop(seen[k]);
+                        if (seen[k] != &state->slideshow) {
+                            if (seen[k]->timer_fd >= 0) {
+                                unregister_fd_from_loops(state, seen[k]->timer_fd);
+                            }
+                            slideshow_destroy(seen[k]);
+                            free(seen[k]);
+                        }
+                    }
+                }
+            } else {
+                for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                    if (!output_matches_target_spec(out, target_spec)) {
+                        continue;
+                    }
+                    slideshow_engine_t *ss = out->slideshow_eng;
+                    if (!ss || (ss == &state->slideshow && is_wildcard)) {
                         continue;
                     }
                     bool already = false;
@@ -1257,22 +1769,13 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         }
                     }
                 }
-                if (sctrl.action == WAYWAL_SLIDESHOW_STOP) {
-                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                        out->slideshow_eng = NULL;
-                    }
-                    for (size_t k = 0; k < num_seen; ++k) {
-                        if (seen[k]->timer_fd >= 0) {
-                            unregister_fd_from_loops(state, seen[k]->timer_fd);
-                        }
-                        slideshow_destroy(seen[k]);
-                        free(seen[k]);
-                    }
-                }
             }
         }
         resp_hdr.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
+        if (ok && (sctrl.action == WAYWAL_SLIDESHOW_NEXT || sctrl.action == WAYWAL_SLIDESHOW_PREV)) {
+            daemon_broadcast_event(state, "wallpaper_changed");
+        }
         break;
     }
 
@@ -1284,11 +1787,13 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             spay.shader_path[sizeof(spay.shader_path) - 1] = '\0';
 
             ok = daemon_activate_shader(state, &spay);
-            if (ok) {
+            if (ok && !spay.no_cache) {
                 waywal_output_saved_state_t s_entry;
                 memset(&s_entry, 0, sizeof(s_entry));
                 s_entry.kind = WAYWAL_CONTENT_SHADER;
-                strncpy(s_entry.media_path, spay.shader_path, sizeof(s_entry.media_path) - 1);
+                const char *saved_sh_path =
+                    state->shader_path[0] != '\0' ? state->shader_path : spay.shader_path;
+                strncpy(s_entry.media_path, saved_sh_path, sizeof(s_entry.media_path) - 1);
                 s_entry.target_fps = spay.fps > 0 ? spay.fps : 60;
                 s_entry.audio_reactive = spay.audio_reactive;
                 s_entry.scaling = (waywal_scaling_mode_t)spay.scaling_mode;
@@ -1317,6 +1822,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         }
 
         if (ok) {
+            state->solar_owns_wallpaper = false;
+            state->active_dynwall_path[0] = '\0';
+            state->last_dynwall_frame_path[0] = '\0';
             const char *msg = "OK: Shader active\n";
             resp_hdr.opcode = WAYWAL_RESP_OK;
             resp_hdr.payload_size = strlen(msg);
@@ -1332,14 +1840,18 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
     case WAYWAL_REQ_WORKSHOP: {
         waywal_workshop_payload_t wpay;
+        memset(&wpay, 0, sizeof(wpay));
         bool ok = false;
-        if (req_hdr.payload_size >= sizeof(wpay) && read_exact(client_fd, &wpay, sizeof(wpay))) {
+        const size_t min_wpay = offsetof(waywal_workshop_payload_t, extract_theme);
+        size_t read_wpay = req_hdr.payload_size < sizeof(wpay) ? req_hdr.payload_size : sizeof(wpay);
+        if (req_hdr.payload_size >= min_wpay && req_hdr.payload_size <= sizeof(wpay) &&
+            read_exact(client_fd, &wpay, read_wpay)) {
             wpay.output[sizeof(wpay.output) - 1] = '\0';
             wpay.workshop_dir[sizeof(wpay.workshop_dir) - 1] = '\0';
             wpay.prop_overrides[sizeof(wpay.prop_overrides) - 1] = '\0';
 
             ok = daemon_activate_workshop(state, &wpay);
-            if (ok) {
+            if (ok && !wpay.no_cache) {
                 waywal_output_saved_state_t s_entry;
                 memset(&s_entry, 0, sizeof(s_entry));
                 s_entry.kind = WAYWAL_CONTENT_WORKSHOP;
@@ -1376,6 +1888,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         }
 
         if (ok) {
+            state->solar_owns_wallpaper = false;
+            state->active_dynwall_path[0] = '\0';
+            state->last_dynwall_frame_path[0] = '\0';
             const char *msg = "OK: Workshop active\n";
             resp_hdr.opcode = WAYWAL_RESP_OK;
             resp_hdr.payload_size = strlen(msg);

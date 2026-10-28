@@ -54,5 +54,9 @@ void build_script_env(const we_scene_t *scene, uint32_t canvas_w, uint32_t canva
                       we_script_env_t *env);
 void bind_project_props_to_script(we_script_t *vm, const we_project_t *proj);
 void apply_scene_script_user_properties(we_scene_t *scene);
+bool we_audio_decode_memory(const uint8_t *data, size_t size, float **out_stereo_f32,
+                            size_t *out_frame_count);
+bool we_audio_decode_pkg_file(we_pkg_t *pkg, const char *vfs_dir, const char *rel_path,
+                              float **out_stereo_f32, size_t *out_frame_count);
 
 #endif /* WAYWAL_WE_SCENE_INTERNAL_H */

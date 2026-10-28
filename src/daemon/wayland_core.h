@@ -132,6 +132,8 @@ typedef struct daemon_state {
     bool has_active_palette;
     waywal_palette_t saved_wallpaper_palette;
     bool has_saved_wallpaper_palette;
+    waywal_img_metadata_t active_theme_meta;
+    bool has_active_theme_meta;
     void (*on_output_configured)(struct daemon_state *state, output_node_t *out);
     void (*on_power_state_changed)(struct daemon_state *state);
     void (*on_wallpaper_loaded)(struct daemon_state *state, const uint8_t *bgra_pixels, uint32_t w,
@@ -168,6 +170,23 @@ typedef struct daemon_state {
     bool media_palette_active;
     float audio_volume;
     bool mute_on_audio;
+    slideshow_engine_t *g_presenting_slideshow;
+    union {
+        int last_workspace_id;
+        int last_workspace_idx;
+    };
+    char last_workspace_name[64];
+
+    int solar_timer_fd;
+    bool last_solar_is_daytime;
+    bool has_last_solar_state;
+    bool in_solar_tick;
+    bool solar_owns_wallpaper;
+    bool sched_theme_override_active;
+    char active_dynwall_path[4096];
+    char active_dynwall_output[64];
+    char last_dynwall_frame_path[4096];
+    char last_schedule_frame_path[4096];
 } daemon_state_t;
 
 bool daemon_wayland_init(daemon_state_t *state);
