@@ -10,38 +10,38 @@
   </a>
 </p>
 
-**WayWal** is a fast, all-in-one wallpaper, live shader, Steam Wallpaper Engine, and Material Design 3 color theme tool for Linux desktops (Hyprland, Sway, Niri, and other Wayland setups).
+Most Wayland setups are held together with duct tape. You end up installing five or six separate tools (`swww` or `awww`, `mpvpaper`, `linux-wallpaperengine`, `glpaper`, `wpaperd`, plus `matugen` or `pywal`) just to get wallpapers, video loops, Steam Workshop scenes, music bars, and matching system colors.
 
-Most people install five or six separate tools (`swww`/`awww`, `mpvpaper`, `linux-wallpaperengine`, `wpaperd`, `matugen`/`wallust`/`pywal`, and custom picker scripts) just to get pictures, video loops, Steam Wallpaper Engine scenes, music bars, and matching desktop colors. WayWal does all of that in one tiny C23 program (`1.66 MB` stripped total). It is easy to use and light on your battery.
+**WayWal** replaces the whole pile with one tiny C23 binary (`1.66 MB` total). Drop in a photo, a 4K video, a live shader, or a Steam Wallpaper Engine scene, and your whole desktop updates its color theme in half a millisecond. And the instant a window covers your screen, WayWal drops to `0.0%` CPU and GPU so your battery stays untouched.
 
 ---
 
-## Key Features
+## Why use WayWal?
 
-- **Every Wallpaper Type (`wwal img`)**: Universal `wwal img` auto-detects and runs normal pictures (`PNG`, `JPG`, `WebP`, `AVIF`, `JXL`, `SVG`, `QOI`, `PPM`, `HEIC`), `GIF`s, 4K videos (`MP4`, `WebM`, `MKV`, `MOV`), live shaders (`.frag`, `.comp`), **10 built-in shader presets** (`wwal shader preset <name>`), **Steam Wallpaper Engine** scenes (IDs, folders, or preview symlinks), GNOME `.xml` dynamic timed wallpapers, slideshow directories, and solid hex colors.
-- **18 Smooth Effects**: Switch wallpapers with GPU compute effects like `ripple`, `grow`, `wave`, `burn`, `glitch`, `page_curl`, `light_leak`, and `fade`, with directional crop anchors (`--crop-gravity top|center|tl|...`).
-- **Instant Dual-Mode Color Themes & Template Engine**: Extracts both `dark` and `light` Material Design 3 palettes simultaneously in **`0.44 ms`**, supports ranked seed selection (`--source-color-index 0..3`, `--seed-color`), renders declarative `[template."<name>"]` files in **`0.05 ms`** using **Matugen + Wallust + Pywal** syntax and 7 pipe filters (`lighten`, `darken`, `saturate`, `alpha`, `blend`, `invert`, `complementary`), exports `~/.cache/wal/*` for Pywalfox, and saves `~/.cache/wwal/current_wallpaper.png` (`<= 1280x720`) for `hyprlock` / `swaylock` even when your wallpaper is a video, shader, or Workshop scene.
-- **Solar & Time-of-Day Dynamic Wallpapers**: Built-in astronomical NOAA solar elevation calculator (`[solar]`, `[[schedule]]`, `--auto-day-night`) transitions wallpapers and switches dark/light theme polarity automatically across dawn, day, dusk, and night.
-- **Smart Pause & Battery Saver**: Drops to **`0.00%` CPU and GPU** when a screen is covered by a fullscreen or maximized window, when your workspace is fully tiled, when your screen is idle, or when your laptop runs on battery.
-- **Smart Sound & Workshop Layers**: Plays video and Steam Workshop `"sound"` multi-track ambient audio layers, renders Workshop `"text"` clock/label layers, and automatically ducks volume whenever another app (Firefox, Spotify, or a game) plays audio.
-- **Built-In Picker & Drop-In `swww` / `awww` / `wpaperd` Compatibility**: Includes `wwal pick` (`rofi`, `fuzzel`, `walker`, `dmenu`, `json`) with `< 1 ms` warm thumbnail cache, `wwal workshop sync-previews` for GUI pickers like `waypaper`, full `swww`/`awww` v0.12.1 CLI + `SWWW_*`/`AWWW_*` env var + `~/.cache/{swww,awww}/` compatibility, and `wpaperd` config compatibility (`[default]`/`[any]`, `"30m"` intervals, `--sort`).
+- **One command for everything (`wwal img`)**: Point `wwal img` at a picture, a GIF, a 4K video, a Shadertoy file, a Steam Workshop ID, or a folder. WayWal detects the format on its own. Then it blends the new wallpaper onto your screen at your monitor's full refresh rate.
+- **Native Steam Wallpaper Engine**: Run your Steam Workshop scenes straight on Wayland. Puppet meshes, particles, scripts, clocks, and sound layers all work natively. No Wine, no Proton, and no heavy wrapper.
+- **Whole-desktop colors in `0.5 ms`**: Change your wallpaper and your whole system shifts colors to match in half a millisecond. WayWal builds dark and light palettes at once and updates your terminal, bar, browser, and lockscreen right away. Existing `matugen`, `wallust`, and `pywal` templates work as-is.
+- **Built-in shaders & audio visualizers**: Ships with 10 ready-to-run GPU shaders, including live PipeWire audio bars and rings that move to your music.
+- **Sun-tracked day and night wallpapers**: Give it your location (or a GNOME timed wallpaper) and your desktop shifts from dawn to noon to night with the real sun, flipping your apps between light and dark mode along the way.
+- **Zero wasted battery (`0.0%` when covered)**: Still images use `0.0%` CPU and `0.0%` GPU once drawn. Videos use hardware VA-API decoding (`~0.3%` CPU). Open a window full screen or launch a game, and WayWal pauses right away. It mutes background sound too, then wakes back up when you can see your desktop again.
+- **Drop-in replacement for `swww`, `awww`, and `wpaperd`**: Keep your old scripts and keybinds. WayWal reads `swww` and `awww` CLI flags directly, loads `wpaperd` configs, and includes `wwal pick` so you can browse thumbnails in `rofi`, `fuzzel`, or `walker` in under `1 ms`.
 
 ---
 
 ## Speed & Resource Use
 
-WayWal is written in C23 and runs directly on your graphics card:
+WayWal is written in C23 and talks directly to Wayland, DRM/KMS, and your GPU:
 
-- **Binary footprint**: **`1.34 MB`** daemon (`wwald`) + **`0.32 MB`** client (`wwal`) stripped (`0` heavy optional `DT_NEEDED` libraries).
-- **Still pictures**: `0.00%` CPU and `0.00%` GPU once the picture is on screen.
-- **4K video loops**: Hardware VA-API video decoding (`~0.3%` CPU).
-- **When covered by a window**: Drops to strictly **`0.00%` CPU and GPU** (`0 wakeups/sec`).
-- **Dual-mode (`dark`+`light`) HCT palette + 7-filter template render**: **`0.49 ms`** end-to-end (`0.44 ms` extraction + `0.05 ms` template render).
-- **Unified picker (`wwal pick --menu json`)**: **`0.93 ms`** warm cache (`61.2 ms` cold thumbnail generation).
-- **Lockscreen PNG frame export (`1280×720`)**: **`13.0 ms`** native (`29.4 ms` with 4K box-filter downscale).
-- **Transitions**: **1,668 – 2,734 FPS** at 4K (`3840×2160`) on GPU (and **1,176 – 24,377 FPS** at 720p on AVX2 CPU).
+- **Binary size**: **`1.34 MB`** daemon (`wwald`) + **`0.32 MB`** client (`wwal`) stripped.
+- **Still pictures**: **`0.00%` CPU and `0.00%` GPU** once the frame is on screen.
+- **Covered by a window**: **`0.00%` CPU, `0.00%` GPU**, and **`0` wakeups/sec**.
+- **4K video loops**: **`~0.3%` CPU** via hardware VA-API decoding.
+- **Theme extraction + template render**: **`0.49 ms`** end-to-end (`0.44 ms` palette + `0.05 ms` templates).
+- **Wallpaper picker (`wwal pick`)**: **`0.93 ms`** warm cache (`61.2 ms` first-run thumbnail build).
+- **Lockscreen frame export (`1280×720`)**: **`13.0 ms`** ready for `hyprlock` or `swaylock`.
+- **4K GPU transitions**: **`1,668 – 2,734 FPS`** at `3840×2160`.
 
-Want the deep technical details? Read [**Technical Architecture & Full CLI Reference**](docs/ARCHITECTURE.md).
+See [**Technical Architecture & Full CLI Reference**](docs/ARCHITECTURE.md) for the full benchmark suite and internals.
 
 ---
 
@@ -96,7 +96,7 @@ meson install -C build
 
 ## Popular Commands
 
-Start the background service once (or add `wwald &` / `swww-daemon &` to your desktop startup file):
+Start the background daemon once (or add `wwald &` / `swww-daemon &` to your compositor startup file):
 ```bash
 wwald &
 ```
@@ -106,19 +106,19 @@ wwald &
 # Set a wallpaper with a ripple effect starting at your mouse cursor
 wwal img ~/Pictures/Wallpapers/mountain.jpg --transition-type ripple --transition-pos cursor
 
-# Keep portrait subjects framed at the top and pick the secondary accent seed (0..3)
+# Frame portrait art from the top and pick the secondary accent color (0..3)
 wwal img ~/Pictures/Wallpapers/portrait.png --crop-gravity top --theme --source-color-index 1
 
-# Universal auto-dispatch: pass a video, shader, Workshop ID, GNOME .xml, or directory to `wwal img`
+# Pass a photo, video, shader, Workshop ID, GNOME .xml, or folder to `wwal img`
 wwal img 2841902341
 ```
 
-### 2. Built-In Icon-Grid Wallpaper Picker
+### 2. Built-In Wallpaper Picker
 ```bash
-# Open Rofi / Fuzzel / Walker with cached thumbnails for images, videos, shaders & Workshop items
+# Open Rofi / Fuzzel / Walker with thumbnails for images, videos, shaders & Workshop items
 wwal pick
 
-# Output structured JSON metadata + thumbnail paths for Quickshell / Eww / AGS widgets
+# Output JSON metadata + thumbnail paths for Quickshell / Eww / AGS widgets
 wwal pick --menu json
 ```
 
@@ -132,7 +132,7 @@ wwal video ~/Videos/scenic.mp4 --volume 0.4 --mute-on-audio
 ```
 
 ### 4. Use Steam Wallpaper Engine
-If you own Wallpaper Engine on Steam, `wwal` discovers and renders your Workshop wallpapers natively:
+If you own Wallpaper Engine on Steam, `wwal` finds and runs your Workshop library natively:
 ```bash
 # List your installed Steam Workshop wallpapers
 wwal workshop list
@@ -140,23 +140,23 @@ wwal workshop list
 # Apply a Workshop wallpaper by its ID or folder path
 wwal workshop apply 2841902341
 
-# Export human-readable preview symlinks (~/.cache/wwal/workshop-previews/) for Waypaper / Azote
+# Create preview symlinks (~/.cache/wwal/workshop-previews/) for GUI pickers like Waypaper
 wwal workshop sync-previews
 ```
 
-### 5. Built-In Shader Presets & Mixed-Media Slideshows
+### 5. Built-In Shaders & Slideshows
 ```bash
-# List all 10 built-in procedural shaders and launch one with PipeWire audio reactivity
+# List all 10 built-in shaders and launch one with live PipeWire audio reactivity
 wwal shader list
 wwal shader preset audio_bars --audio
 
-# Start a mixed-media slideshow with human-readable intervals and jump forward/backward
+# Run a mixed-media slideshow and step forward or backward
 wwal slideshow ~/Pictures/Wallpapers --interval 30m --sort mtime
 wwal next
 wwal prev
 ```
 
-### 6. Useful Controls
+### 6. Everyday Controls
 ```bash
 wwal restore       # Restore your last wallpaper on login
 wwal pause         # Pause active video, shader, or Workshop animation
@@ -167,52 +167,22 @@ wwal status        # Show current wallpaper, screen info, and active colors
 
 ---
 
-## Config File (Optional)
+## Configuration
 
-WayWal works right out of the box with no setup. If you want to save default settings, templates, or solar schedules, copy [`contrib/config.toml.example`](contrib/config.toml.example) to `~/.config/wwal/config.toml`:
+WayWal works out of the box with no setup. If you want to save default transitions, app color templates, battery rules, or sun schedules, copy the example file to `~/.config/wwal/config.toml`:
 
-```toml
-[daemon]
-battery_policy = "reduce-fps"     # "ignore", "reduce-fps", or "pause-video"
-auto_pause_fullscreen = true      # Pause when a window is fullscreen (0.00% CPU/GPU)
-idle_timeout_sec = 300            # Pause after 5 minutes of no input
-crop_gravity = "center"           # "center", "top", "bottom", "left", "right", "tl", "tr", "bl", "br"
-mute_on_audio = true              # Mute wallpaper when another app plays sound
-
-[theme]
-enabled = true                    # Update desktop colors when wallpaper changes
-mode = "dark"                     # Default theme polarity ("dark", "light", or "auto")
-auto_day_night = true             # Auto-switch dark/light based on [solar] / time of day
-source_color_index = 0            # 0..3 ranked K-Means++ seed cluster selection
-caelestia_sync = true             # Sync colors with Caelestia / Quickshell
-pywal_compat = true               # Write ~/.cache/wal/* for Pywalfox & Pywal tools
-
-[template."kitty"]
-input_path = "~/.config/wwal/templates/kitty.conf"
-output_path = "~/.config/kitty/colors-wwal.conf"
-post_hook = "killall -SIGUSR1 kitty || true"
-
-[solar]
-latitude = 37.7749
-longitude = -122.4194
-auto_theme_mode = true
-
-[transition]
-type = "grow"
-duration = 0.8
-fps = 144
-
-[default]
-path = "~/Pictures/Wallpapers"
-duration = "30m"
-sort = "mtime"
+```bash
+mkdir -p ~/.config/wwal
+cp contrib/config.toml.example ~/.config/wwal/config.toml
 ```
+
+- [**Annotated Example Config (`contrib/config.toml.example`)**](contrib/config.toml.example): Ready-to-copy `config.toml` with comments for every setting.
+- [**Configuration Manual (`docs/man/wwal-config.5.scd`)**](docs/man/wwal-config.5.scd): Full guide for all TOML sections, template variables, pipe filters, and sun schedules (also available via `man 5 wwal-config`).
 
 ---
 
 ## More Docs
 
-- [**Technical Architecture & Full CLI Reference**](docs/ARCHITECTURE.md) — Wayland protocols, GPU shaders, video decoding, Workshop runtime, template syntax, and all CLI flags.
-- [**Example Config**](contrib/config.toml.example) — Every `config.toml` option explained.
-- [**Support & Troubleshooting**](SUPPORT.md) — Fixes for common setup questions.
-- [**Contributing**](CONTRIBUTING.md) — How to build, test, and send changes.
+- [**Technical Architecture & Full CLI Reference**](docs/ARCHITECTURE.md): Wayland protocols, GPU shaders, video decoding, Workshop runtime, and all CLI flags.
+- [**Support & Troubleshooting**](SUPPORT.md): Quick fixes for common setup questions.
+- [**Contributing**](CONTRIBUTING.md): How to build, run tests, and send changes.
