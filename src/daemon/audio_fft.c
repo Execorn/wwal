@@ -257,7 +257,7 @@ struct waywal_audio_fft {
 
 static float clampf(float x, float lo, float hi)
 {
-    if (x < lo) {
+    if (!isfinite(x) || x < lo) {
         return lo;
     }
     if (x > hi) {
@@ -987,7 +987,7 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
                             .audio_format = {.key = 0x10001u /* SPA_FORMAT_AUDIO_format */,
                                              .flags = 0u,
                                              .value = {.size = 4u, .type = 3u /* SPA_TYPE_Id */},
-                                             .val = 0x10Bu /* SPA_AUDIO_FORMAT_F32_LE */,
+                                             .val = 0x11Bu /* SPA_AUDIO_FORMAT_F32_LE */,
                                              .pad = 0u},
                             .audio_rate = {.key = 0x10003u /* SPA_FORMAT_AUDIO_rate */,
                                            .flags = 0u,
@@ -1018,10 +1018,9 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
                                 struct spa_audio_format_pod play_fmt_pod = fmt_pod;
                                 play_fmt_pod.audio_channels.val = 2u;
                                 const struct spa_pod *play_params[1] = {&play_fmt_pod.pod};
-                                if (fn_pw_stream_connect(fft->pw_play_stream,
-                                                         1 /* PW_DIRECTION_OUTPUT */,
-                                                         0xFFFFFFFFu /* PW_ID_ANY */, flags,
-                                                         play_params, 1u) < 0) {
+                                if (fn_pw_stream_connect(
+                                        fft->pw_play_stream, 1 /* PW_DIRECTION_OUTPUT */,
+                                        0xFFFFFFFFu /* PW_ID_ANY */, flags, play_params, 1u) < 0) {
                                     fft->fn_pw_stream_destroy(fft->pw_play_stream);
                                     fft->pw_play_stream = NULL;
                                 }
@@ -1179,14 +1178,16 @@ static size_t push_mono_samples_internal(waywal_audio_fft_t *fft, const float *s
         copy_cnt = WAYWAL_AUDIO_RING_SIZE;
         dst_wp += (uint32_t)skip;
     }
-    uint32_t idx = dst_wp & (WAYWAL_AUDIO_RING_SIZE - 1u);
-    size_t first = WAYWAL_AUDIO_RING_SIZE - idx;
-    if (first > copy_cnt) {
-        first = copy_cnt;
-    }
-    memcpy(fft->ring + idx, src, first * sizeof(float));
-    if (copy_cnt > first) {
-        memcpy(fft->ring, src + first, (copy_cnt - first) * sizeof(float));
+    for (size_t i = 0; i < copy_cnt; ++i) {
+        float s = src[i];
+        if (!isfinite(s)) {
+            s = 0.0f;
+        } else if (s < -4.0f) {
+            s = -4.0f;
+        } else if (s > 4.0f) {
+            s = 4.0f;
+        }
+        fft->ring[(dst_wp + (uint32_t)i) & (WAYWAL_AUDIO_RING_SIZE - 1u)] = s;
     }
     atomic_store_explicit(&fft->write_pos, wp + (uint32_t)count, memory_order_release);
     atomic_fetch_add_explicit(&fft->total_pushed, (uint32_t)count, memory_order_release);
@@ -1226,11 +1227,17 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
         /* Early-return without redundant 2048-pt FFT when no new audio samples arrived */
         float env_sum = 0.0f;
         for (uint32_t b = 0; b < WAYWAL_AUDIO_BARK_BANDS; ++b) {
+            if (!isfinite(fft->smoothed_bands[b])) {
+                fft->smoothed_bands[b] = 0.0f;
+            }
             fft->smoothed_bands[b] *= 0.94f;
             fft->current_frame.bands[b] = fft->smoothed_bands[b];
             env_sum += fft->smoothed_bands[b];
         }
         for (uint32_t k = 0; k < WAYWAL_AUDIO_FREQ_BINS; ++k) {
+            if (!isfinite(fft->current_frame.linear_bins[k])) {
+                fft->current_frame.linear_bins[k] = 0.0f;
+            }
             fft->current_frame.linear_bins[k] *= 0.94f;
         }
         uint8_t *row_fft = &fft->current_frame.shadertoy_tex[0];
@@ -1241,7 +1248,10 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
             row_wav[x] = (uint8_t)(128 + (d * 240) / 256);
         }
         fft->current_frame.envelope = clampf(env_sum / (float)WAYWAL_AUDIO_BARK_BANDS, 0.0f, 1.0f);
-        fft->current_frame.bass_energy *= 0.94f;
+        fft->current_frame.bass_energy = clampf(fft->current_frame.bass_energy * 0.94f, 0.0f, 1.0f);
+        if (!isfinite(fft->beat_val)) {
+            fft->beat_val = 0.0f;
+        }
         fft->beat_val *= 0.85f;
         fft->current_frame.beat_pulse = clampf(fft->beat_val, 0.0f, 1.0f);
         if (!atomic_load_explicit(&fft->test_override_enabled, memory_order_acquire) &&
@@ -1335,11 +1345,13 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
             }
             raw_band = (cnt > 0) ? (0.7f * peak + 0.3f * (sum / (float)cnt)) : 0.0f;
         }
-        raw_band = clampf(raw_band * 2.0f, 0.0f, 1.0f);
+        float tilt = 2.5f + 6.0f * ((float)b / (float)(WAYWAL_AUDIO_BARK_BANDS - 1u));
+        float scaled = clampf(raw_band * tilt, 0.0f, 1.0f);
+        raw_band = clampf(powf(scaled, 0.65f), 0.0f, 1.0f);
 
-        float prev = fft->smoothed_bands[b];
+        float prev = isfinite(fft->smoothed_bands[b]) ? fft->smoothed_bands[b] : 0.0f;
         float alpha = (raw_band >= prev) ? alpha_att : alpha_dec;
-        float cur = prev + alpha * (raw_band - prev);
+        float cur = clampf(prev + alpha * (raw_band - prev), 0.0f, 1.0f);
         fft->smoothed_bands[b] = cur;
         fft->current_frame.bands[b] = cur;
         env_sum += cur;
@@ -1358,13 +1370,14 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
     uint32_t bass_bins = 0;
     const float gamma_comp = 100.0f;
     for (uint32_t bin = 1; bin <= 12u && bin < WAYWAL_AUDIO_FREQ_BINS; ++bin) {
-        float mag = fft->current_frame.linear_bins[bin];
+        float mag = clampf(fft->current_frame.linear_bins[bin], 0.0f, 16.0f);
         if (bin <= 8u) {
             bass_sum += mag;
             bass_bins++;
         }
         float log_mag = log1pf(gamma_comp * mag);
-        float diff = log_mag - fft->prev_log_bins[bin];
+        float prev_log = isfinite(fft->prev_log_bins[bin]) ? fft->prev_log_bins[bin] : 0.0f;
+        float diff = log_mag - prev_log;
         if (diff > 0.0f) {
             log_flux += diff;
         }
@@ -1374,6 +1387,15 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
         (bass_bins > 0) ? clampf((bass_sum / (float)bass_bins) * 2.5f, 0.0f, 1.0f) : 0.0f;
     fft->current_frame.bass_energy = bass_inst;
 
+    if (!isfinite(fft->flux_avg)) {
+        fft->flux_avg = 0.0f;
+    }
+    if (!isfinite(fft->bass_avg)) {
+        fft->bass_avg = 0.0f;
+    }
+    if (!isfinite(fft->beat_val)) {
+        fft->beat_val = 0.0f;
+    }
     if ((log_flux > fft->flux_avg * 1.4f && log_flux > 0.15f) ||
         (bass_inst > fft->bass_avg * 1.35f && bass_inst > 0.08f)) {
         float flux_beat = (log_flux - fft->flux_avg) * 0.6f;

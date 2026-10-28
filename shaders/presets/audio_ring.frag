@@ -13,7 +13,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec2 res = max(iResolution.xy, vec2(1.0));
     vec2 p = (fragCoord - 0.5 * res) / res.y;
 
-    vec2 mouse = (u_mouse_smooth.xy / res) - 0.5;
+    vec2 safe_mouse = (isnan(u_mouse_smooth.x) || isnan(u_mouse_smooth.y) ||
+                       isinf(u_mouse_smooth.x) || isinf(u_mouse_smooth.y))
+                          ? (0.5 * res)
+                          : u_mouse_smooth.xy;
+    vec2 mouse = (safe_mouse / res) - 0.5;
     p -= mouse * 0.08;
 
     vec3 bg_dark = PAL_AR_BG;
@@ -30,16 +34,24 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     float norm_ang = abs(ang) / 3.14159265;
 
     int bin = clamp(int(norm_ang * 63.0), 0, 63);
-    float tex_fft = texture(iChannel0, vec2(norm_ang, 0.25)).r;
-    float band = max(u_audio_bands[bin], tex_fft);
+    float raw_tex = texture(iChannel0, vec2(norm_ang, 0.25)).r;
+    float tex_fft = (isnan(raw_tex) || isinf(raw_tex)) ? 0.0 : clamp(raw_tex, 0.0, 1.0);
+    float raw_band = u_audio_bands[bin];
+    float safe_band = (isnan(raw_band) || isinf(raw_band)) ? 0.0 : clamp(raw_band, 0.0, 1.0);
+    float safe_env =
+        (isnan(u_audio_envelope) || isinf(u_audio_envelope)) ? 0.0 : clamp(u_audio_envelope, 0.0, 1.0);
+    float safe_beat =
+        (isnan(u_audio_beat) || isinf(u_audio_beat)) ? 0.0 : clamp(u_audio_beat, 0.0, 1.0);
+    float band = max(safe_band, tex_fft);
 
     float idle_wave = 0.12 + 0.07 * sin(norm_ang * 18.8495 + iTime * 2.4)
                            + 0.04 * cos(norm_ang * 37.6991 - iTime * 3.6);
     float idle_pulse = 0.03 * sin(iTime * 2.0);
 
-    float has_audio = smoothstep(0.005, 0.04, u_audio_envelope + tex_fft);
-    float amp = mix(idle_wave, band * 0.26, has_audio);
-    float base_r = 0.22 + mix(idle_pulse, u_audio_beat * 0.045 + u_audio_envelope * 0.04, has_audio);
+    float has_audio = smoothstep(0.01, 0.08, safe_env + tex_fft * 0.5);
+    float live_amp = max(band * 0.28, idle_wave * 0.35) + safe_beat * 0.03;
+    float amp = max(mix(idle_wave, live_amp, has_audio), 0.02);
+    float base_r = 0.22 + mix(idle_pulse, safe_beat * 0.045 + safe_env * 0.04, has_audio);
 
     float target_r = base_r + amp;
     float dist = abs(r - target_r);
@@ -58,11 +70,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 
     float shock_phase = fract(iTime * 0.45);
     float shock_r = base_r + shock_phase * 0.55;
-    float shockwave = exp(-abs(r - shock_r) * 55.0) * (1.0 - shock_phase) * (0.35 + u_audio_beat * 0.65);
+    float shockwave = exp(-abs(r - shock_r) * 55.0) * (1.0 - shock_phase) * (0.35 + safe_beat * 0.65);
 
     vec3 ring_col = mix(ring_cyan, ring_magenta, norm_ang);
     vec3 col = bg_dark + ring_col * (core_line * 0.45 + radial_bar * 0.85 + inner_fill * 0.25 + shockwave);
-    col += ring_magenta * exp(-r * 6.5) * (0.18 + u_audio_beat * 0.25);
+    col += ring_magenta * exp(-r * 6.5) * (0.18 + safe_beat * 0.25);
 
     fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }

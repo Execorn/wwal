@@ -602,6 +602,37 @@ static void test_audio_fft_and_shader(void)
     memset(&idle_frame, 0, sizeof(idle_frame));
     assert(waywal_audio_fft_process(fft, &idle_frame));
     assert(idle_frame.envelope < frame.envelope && idle_frame.envelope > 0.0f);
+
+    /* Verify NaN, Inf, and out-of-range samples are sanitized without poisoning FFT state */
+    float bad_samples[512];
+    for (size_t i = 0; i < 512; ++i) {
+        if (i % 4 == 0) {
+            bad_samples[i] = NAN;
+        } else if (i % 4 == 1) {
+            bad_samples[i] = INFINITY;
+        } else if (i % 4 == 2) {
+            bad_samples[i] = -INFINITY;
+        } else {
+            bad_samples[i] = 1e20f;
+        }
+    }
+    assert(waywal_audio_fft_push_samples(fft, bad_samples, 512) == 512U);
+    waywal_audio_frame_t sanitized_frame;
+    memset(&sanitized_frame, 0, sizeof(sanitized_frame));
+    assert(waywal_audio_fft_process(fft, &sanitized_frame));
+    assert(isfinite(sanitized_frame.envelope) && sanitized_frame.envelope >= 0.0f &&
+           sanitized_frame.envelope <= 1.0f);
+    assert(isfinite(sanitized_frame.bass_energy) && sanitized_frame.bass_energy >= 0.0f &&
+           sanitized_frame.bass_energy <= 1.0f);
+    assert(isfinite(sanitized_frame.beat_pulse) && sanitized_frame.beat_pulse >= 0.0f &&
+           sanitized_frame.beat_pulse <= 1.0f);
+    for (size_t b = 0; b < WAYWAL_AUDIO_BARK_BANDS; ++b) {
+        assert(isfinite(sanitized_frame.bands[b]) && sanitized_frame.bands[b] >= 0.0f &&
+               sanitized_frame.bands[b] <= 1.0f);
+    }
+    for (size_t k = 0; k < WAYWAL_AUDIO_FREQ_BINS; ++k) {
+        assert(isfinite(sanitized_frame.linear_bins[k]) && sanitized_frame.linear_bins[k] >= 0.0f);
+    }
     waywal_audio_fft_destroy(fft);
 
     const char *shadertoy_frag = "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
@@ -2779,6 +2810,34 @@ static void test_slideshow_and_wpaperd(void)
             prev_item[sizeof(prev_item) - 1] = '\0';
         }
     }
+    /* 5f. Copy-on-write slideshow_clone isolates per-output navigation and file lists */
+    spay.has_sort_mode = 1;
+    spay.sort_mode = WAYWAL_SORT_ASCENDING;
+    spay.random_order = false;
+    assert(slideshow_start(&ss, &spay));
+    assert(ss.num_files == 5U);
+    assert(ss.current_file_idx == 0U);
+
+    slideshow_engine_t cloned_ss;
+    assert(!slideshow_clone(NULL, &ss));
+    assert(!slideshow_clone(&cloned_ss, NULL));
+    assert(slideshow_clone(&cloned_ss, &ss));
+    assert(cloned_ss.active && !cloned_ss.paused);
+    assert(cloned_ss.timer_fd >= 0 && cloned_ss.timer_fd != ss.timer_fd);
+    assert(cloned_ss.num_files == ss.num_files);
+    assert(cloned_ss.current_file_idx == ss.current_file_idx);
+    assert(cloned_ss.file_list != ss.file_list);
+    for (size_t i = 0; i < ss.num_files; ++i) {
+        assert(cloned_ss.file_list[i] != ss.file_list[i]);
+        assert(strcmp(cloned_ss.file_list[i], ss.file_list[i]) == 0);
+    }
+    assert(slideshow_control(&cloned_ss, WAYWAL_SLIDESHOW_NEXT));
+    assert(cloned_ss.current_file_idx == 1U);
+    assert(ss.current_file_idx == 0U);
+    slideshow_destroy(&cloned_ss);
+    assert(slideshow_control(&ss, WAYWAL_SLIDESHOW_NEXT));
+    assert(ss.current_file_idx == 1U);
+
     slideshow_destroy(&ss);
 
     /* 6. CLI parsing for wwal next, wwal prev, --duration, --sort (flags before & after path) */

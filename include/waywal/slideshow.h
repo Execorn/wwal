@@ -66,6 +66,7 @@ typedef struct slideshow_engine {
 } slideshow_engine_t;
 
 bool slideshow_init(slideshow_engine_t *ss, struct daemon_state *state);
+bool slideshow_clone(slideshow_engine_t *dst, const slideshow_engine_t *src);
 void slideshow_destroy(slideshow_engine_t *ss);
 
 bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *payload);

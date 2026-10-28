@@ -464,6 +464,52 @@ bool slideshow_init(slideshow_engine_t *ss, struct daemon_state *state)
     return true;
 }
 
+bool slideshow_clone(slideshow_engine_t *dst, const slideshow_engine_t *src)
+{
+    if (!dst || !src)
+        return false;
+
+    if (!slideshow_init(dst, src->daemon_state))
+        return false;
+
+    int new_timer_fd = dst->timer_fd;
+    *dst = *src;
+    dst->timer_fd = new_timer_fd;
+    dst->file_list = NULL;
+    dst->num_files = 0;
+    dst->capacity_files = 0;
+
+    if (src->num_files > 0 && src->file_list) {
+        dst->file_list = (char **)calloc(src->num_files, sizeof(char *));
+        if (!dst->file_list) {
+            slideshow_destroy(dst);
+            return false;
+        }
+        dst->capacity_files = src->num_files;
+        for (size_t i = 0; i < src->num_files; ++i) {
+            if (!src->file_list[i])
+                continue;
+            char *dup = strdup(src->file_list[i]);
+            if (!dup) {
+                slideshow_destroy(dst);
+                return false;
+            }
+            dst->file_list[dst->num_files++] = dup;
+        }
+    }
+
+    if (dst->num_files == 0) {
+        dst->current_file_idx = 0;
+    } else if (dst->current_file_idx >= dst->num_files) {
+        dst->current_file_idx = dst->num_files - 1;
+    }
+
+    if (dst->active && !dst->paused && dst->interval_s > 0) {
+        arm_timer(dst);
+    }
+    return true;
+}
+
 void slideshow_destroy(slideshow_engine_t *ss)
 {
     if (!ss)

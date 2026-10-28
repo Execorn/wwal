@@ -1832,6 +1832,72 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         }
                     }
                     if (!already && num_seen < 32) {
+                        if (!is_wildcard) {
+                            bool shared_with_unmatched = false;
+                            for (output_node_t *other = state->outputs; other != NULL;
+                                 other = other->next) {
+                                if (other->slideshow_eng == ss &&
+                                    !output_matches_target_spec(other, target_spec)) {
+                                    shared_with_unmatched = true;
+                                    break;
+                                }
+                            }
+                            if (shared_with_unmatched) {
+                                slideshow_engine_t *cloned =
+                                    (slideshow_engine_t *)calloc(1, sizeof(slideshow_engine_t));
+                                if (cloned && slideshow_clone(cloned, ss)) {
+                                    if (cloned->timer_fd >= 0) {
+                                        register_fd_in_loops(state, cloned->timer_fd,
+                                                             URING_EV_TIMER);
+                                    }
+                                    uint32_t matched_cnt = 0;
+                                    memset(cloned->target_outputs, 0,
+                                           sizeof(cloned->target_outputs));
+                                    for (output_node_t *m = state->outputs; m != NULL;
+                                         m = m->next) {
+                                        if (m->slideshow_eng == ss &&
+                                            output_matches_target_spec(m, target_spec)) {
+                                            m->slideshow_eng = cloned;
+                                            if (m->name[0] != '\0' && matched_cnt < 16) {
+                                                strncpy(
+                                                    cloned->target_outputs[matched_cnt], m->name,
+                                                    sizeof(cloned->target_outputs[matched_cnt]) -
+                                                        1);
+                                                matched_cnt++;
+                                            }
+                                        }
+                                    }
+                                    cloned->num_target_outputs = matched_cnt;
+
+                                    uint32_t rem_cnt = 0;
+                                    memset(ss->target_outputs, 0, sizeof(ss->target_outputs));
+                                    for (output_node_t *u = state->outputs;
+                                         u != NULL && rem_cnt < 16; u = u->next) {
+                                        if (u->slideshow_eng == ss && u->name[0] != '\0') {
+                                            strncpy(ss->target_outputs[rem_cnt], u->name,
+                                                    sizeof(ss->target_outputs[rem_cnt]) - 1);
+                                            rem_cnt++;
+                                        }
+                                    }
+                                    ss->num_target_outputs = rem_cnt;
+                                    ss = cloned;
+                                } else {
+                                    free(cloned);
+                                }
+                            } else if (ss->num_target_outputs == 0) {
+                                uint32_t matched_cnt = 0;
+                                memset(ss->target_outputs, 0, sizeof(ss->target_outputs));
+                                for (output_node_t *m = state->outputs;
+                                     m != NULL && matched_cnt < 16; m = m->next) {
+                                    if (m->slideshow_eng == ss && m->name[0] != '\0') {
+                                        strncpy(ss->target_outputs[matched_cnt], m->name,
+                                                sizeof(ss->target_outputs[matched_cnt]) - 1);
+                                        matched_cnt++;
+                                    }
+                                }
+                                ss->num_target_outputs = matched_cnt;
+                            }
+                        }
                         seen[num_seen++] = ss;
                         if (slideshow_control(ss, sctrl.action)) {
                             ok = true;
