@@ -14,7 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if defined(HAVE_FFMPEG_SWDEC) && __has_include(<libavformat/avformat.h>)
+#if __has_include(<libavformat/avformat.h>) && __has_include(<libavcodec/avcodec.h>)
 #define WE_HAVE_LIBAV_AUDIO 1
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -1440,13 +1440,91 @@ cleanup:
 #endif
 }
 
+static uint32_t read_u32_be(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static bool we_audio_decode_au_memory(const uint8_t *data, size_t size, float **out_stereo_f32,
+                                      size_t *out_frame_count)
+{
+    if (!data || size < 24 || !out_stereo_f32 || !out_frame_count) {
+        return false;
+    }
+    if (memcmp(data, ".snd", 4) != 0) {
+        return false;
+    }
+    uint32_t data_offset = read_u32_be(data + 4);
+    uint32_t data_size = read_u32_be(data + 8);
+    uint32_t encoding = read_u32_be(data + 12);
+    uint32_t sample_rate = read_u32_be(data + 16);
+    uint32_t channels = read_u32_be(data + 20);
+    if (data_offset < 24u || data_offset >= size || channels == 0u || channels > 8u ||
+        sample_rate < 4000u || sample_rate > 384000u) {
+        return false;
+    }
+    size_t bps = (encoding == 2u) ? 1u : (encoding == 3u) ? 2u : (encoding == 5u) ? 4u : 0u;
+    if (bps == 0u) {
+        return false;
+    }
+    size_t avail = size - (size_t)data_offset;
+    size_t pcm_bytes = (data_size == 0xFFFFFFFFu || (size_t)data_size > avail) ? avail
+                                                                               : (size_t)data_size;
+    size_t frame_stride = bps * (size_t)channels;
+    size_t src_frames = pcm_bytes / frame_stride;
+    if (src_frames == 0u) {
+        return false;
+    }
+    if (src_frames > (size_t)sample_rate * 600u) {
+        src_frames = (size_t)sample_rate * 600u;
+    }
+    float *src_stereo = malloc(src_frames * 2u * sizeof(float));
+    if (!src_stereo) {
+        return false;
+    }
+    const uint8_t *pcm_ptr = data + data_offset;
+    for (size_t f = 0; f < src_frames; ++f) {
+        const uint8_t *fp = pcm_ptr + f * frame_stride;
+        float ch_val[2] = {0.0f, 0.0f};
+        uint32_t read_ch = (channels >= 2u) ? 2u : 1u;
+        for (uint32_t c = 0; c < read_ch; ++c) {
+            const uint8_t *sp = fp + c * bps;
+            float s = 0.0f;
+            if (encoding == 2u) {
+                s = (float)((int8_t)sp[0]) / 128.0f;
+            } else if (encoding == 3u) {
+                int16_t v = (int16_t)(((uint16_t)sp[0] << 8) | (uint16_t)sp[1]);
+                s = (float)v / 32768.0f;
+            } else if (encoding == 5u) {
+                int32_t v = (int32_t)read_u32_be(sp);
+                s = (float)((double)v / 2147483648.0);
+            }
+            if (s < -1.0f)
+                s = -1.0f;
+            if (s > 1.0f)
+                s = 1.0f;
+            ch_val[c] = s;
+        }
+        if (channels == 1u) {
+            ch_val[1] = ch_val[0];
+        }
+        src_stereo[f * 2u + 0u] = ch_val[0];
+        src_stereo[f * 2u + 1u] = ch_val[1];
+    }
+    return resample_stereo_f32_to_48k(src_stereo, src_frames, sample_rate, out_stereo_f32,
+                                      out_frame_count);
+}
+
 bool we_audio_decode_memory(const uint8_t *data, size_t size, float **out_stereo_f32,
                             size_t *out_frame_count)
 {
     if (we_audio_decode_wav_memory(data, size, out_stereo_f32, out_frame_count)) {
         return true;
     }
-    return we_audio_decode_ffmpeg_memory(data, size, out_stereo_f32, out_frame_count);
+    if (we_audio_decode_ffmpeg_memory(data, size, out_stereo_f32, out_frame_count)) {
+        return true;
+    }
+    return we_audio_decode_au_memory(data, size, out_stereo_f32, out_frame_count);
 }
 
 bool we_audio_decode_pkg_file(we_pkg_t *pkg, const char *vfs_dir, const char *rel_path,

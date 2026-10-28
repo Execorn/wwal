@@ -39,6 +39,10 @@ jobs:
             libseccomp-dev \
             libpng-dev \
             libturbojpeg0-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswscale-dev \
             systemd-dev
 
       - name: Build release binaries
