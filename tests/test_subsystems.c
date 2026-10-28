@@ -2815,6 +2815,24 @@ static void test_slideshow_and_wpaperd(void)
     assert(opts.cmd == CLI_CMD_SLIDESHOW);
     assert(strcmp(opts.filepath, tmp_dir) == 0);
     assert(opts.slideshow_interval_s == 45U);
+    assert(!opts.has_slideshow_recursive && opts.slideshow_recursive);
+
+    char *argv_ss_norec_start[] = {"wwal", "slideshow", "--no-recursive", "start", tmp_dir};
+    assert(cli_parse(5, argv_ss_norec_start, &opts));
+    assert(opts.cmd == CLI_CMD_SLIDESHOW);
+    assert(strcmp(opts.filepath, tmp_dir) == 0);
+    assert(opts.has_slideshow_recursive && !opts.slideshow_recursive);
+
+    char *argv_ss_rec[] = {"wwal", "slideshow", tmp_dir, "--recursive"};
+    assert(cli_parse(4, argv_ss_rec, &opts));
+    assert(opts.cmd == CLI_CMD_SLIDESHOW);
+    assert(opts.has_slideshow_recursive && opts.slideshow_recursive);
+
+    char *argv_ss_opt_before_next[] = {"wwal", "slideshow", "-o", "DP-1", "next"};
+    assert(cli_parse(5, argv_ss_opt_before_next, &opts));
+    assert(opts.cmd == CLI_CMD_SLIDESHOW_CTRL);
+    assert(opts.slideshow_action == WAYWAL_SLIDESHOW_NEXT);
+    assert(opts.num_outputs == 1 && strcmp(opts.outputs[0], "DP-1") == 0);
 
     char *argv_bad_tdur[] = {"wwal", "img", p_a, "--transition-duration", "-2.5"};
     assert(!cli_parse(5, argv_bad_tdur, &opts));

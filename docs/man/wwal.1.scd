@@ -159,7 +159,7 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 	- *random*: Randomly choose one of the 18 built-in shader transitions.
 
 *--transition-duration* <SECONDS>
-	Duration of the transition in seconds as a floating-point number such as *0.5* or *1.5* (default: *1.0*).
+	Duration of the transition in seconds as a floating-point number such as *0.5* or *1.5* (default: *1.2*).
 
 *--transition-fps* <FPS>
 	Target transition frame rate (default: *60*; automatically locks to display VBlank via *wp_presentation*).
@@ -295,7 +295,7 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 	Randomize slideshow traversal order using Fisher-Yates shuffling.
 
 *--sort, --sorting* <ascending|descending|name|mtime|random>
-	Sort order for slideshow directory traversal (default: *random*; *name* is an alias for *ascending*).
+	Sort order for slideshow directory traversal (default: *ascending*; *name* is an alias for *ascending*).
 
 *--recursive, --no-recursive*
 	Enable or disable recursive subdirectory traversal when scanning a slideshow directory (default: *--recursive*).

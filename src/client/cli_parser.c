@@ -66,14 +66,16 @@ void cli_print_usage(const char *prog)
     printf("  help                       Display this help message\n\n");
     printf("Slideshow Options:\n");
     printf("  -d, --interval <SECONDS>   Seconds between wallpaper changes (default: 300)\n");
-    printf("  -s, --shuffle, --random    Shuffle images into random playback order\n\n");
+    printf("  -s, --shuffle, --random    Shuffle images into random playback order\n");
+    printf("  --sort, --sorting <MODE>   Sort order: ascending, descending, mtime, random\n");
+    printf("  --recursive / --no-recursive Enable or disable recursive directory scan\n\n");
     printf("Image & Transition Options:\n");
     printf("  --transition-type <TYPE>   none, simple, fade, wipe, grow, outer, wave, noise,\n");
     printf("                             crosszoom, slide, glitch, burn, ripple, pixelate,\n");
     printf(
         "                             doom, swirl, cube, luma, light_leak, page_curl, custom,\n");
     printf("                             random, left, right, top, bottom, center, any\n");
-    printf("  --transition-duration <S>  Duration in seconds (e.g. 1.0, 0.5) (default: 1.0)\n");
+    printf("  --transition-duration <S>  Duration in seconds (e.g. 1.2, 0.5) (default: 1.2)\n");
     printf("  --transition-step <N>      Transition step speed (swww/awww compatibility)\n");
     printf("  --transition-fps <FPS>     Target frame rate (default: 60)\n");
     printf("  --transition-angle <DEG>   Wipe/wave/slide angle in degrees (default: 0)\n");
@@ -1731,7 +1733,9 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
             }
         } else {
             opts->cmd = CLI_CMD_SLIDESHOW;
+            bool saw_start_kw = false;
             if (strcmp(sub, "start") == 0) {
+                saw_start_kw = true;
                 optind++;
             }
 
@@ -1766,7 +1770,30 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
                         fprintf(stderr, "Error: Unknown option '%s'\n", arg);
                         return false;
                     }
-                } else if (opts->filepath[0] == '\0') {
+                } else if (opts->cmd == CLI_CMD_SLIDESHOW && opts->filepath[0] == '\0' &&
+                           !saw_start_kw && strcmp(arg, "start") == 0) {
+                    saw_start_kw = true;
+                } else if (opts->cmd == CLI_CMD_SLIDESHOW && opts->filepath[0] == '\0' &&
+                           !saw_start_kw &&
+                           (strcmp(arg, "stop") == 0 || strcmp(arg, "pause") == 0 ||
+                            strcmp(arg, "resume") == 0 || strcmp(arg, "unpause") == 0 ||
+                            strcmp(arg, "toggle") == 0 || strcmp(arg, "next") == 0 ||
+                            strcmp(arg, "prev") == 0 || strcmp(arg, "previous") == 0)) {
+                    opts->cmd = CLI_CMD_SLIDESHOW_CTRL;
+                    if (strcmp(arg, "stop") == 0) {
+                        opts->slideshow_action = WAYWAL_SLIDESHOW_STOP;
+                    } else if (strcmp(arg, "pause") == 0) {
+                        opts->slideshow_action = WAYWAL_SLIDESHOW_PAUSE;
+                    } else if (strcmp(arg, "resume") == 0 || strcmp(arg, "unpause") == 0) {
+                        opts->slideshow_action = WAYWAL_SLIDESHOW_RESUME;
+                    } else if (strcmp(arg, "toggle") == 0) {
+                        opts->slideshow_action = WAYWAL_SLIDESHOW_TOGGLE;
+                    } else if (strcmp(arg, "next") == 0) {
+                        opts->slideshow_action = WAYWAL_SLIDESHOW_NEXT;
+                    } else {
+                        opts->slideshow_action = WAYWAL_SLIDESHOW_PREV;
+                    }
+                } else if (opts->cmd == CLI_CMD_SLIDESHOW && opts->filepath[0] == '\0') {
                     strncpy(opts->filepath, arg, sizeof(opts->filepath) - 1);
                     opts->filepath[sizeof(opts->filepath) - 1] = '\0';
                 } else {
@@ -1775,7 +1802,7 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
                 }
                 optind++;
             }
-            if (opts->filepath[0] == '\0') {
+            if (opts->cmd == CLI_CMD_SLIDESHOW && opts->filepath[0] == '\0') {
                 fprintf(stderr, "Error: 'slideshow' requires a directory path\n");
                 return false;
             }
