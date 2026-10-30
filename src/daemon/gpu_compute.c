@@ -1284,6 +1284,12 @@ void gpu_compute_release_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
         }
     }
     if (bo->gl_tex != 0) {
+        if (ctx->blit_10bit_fbo && ctx->bound_fbo_tex == bo->gl_tex) {
+            glBindFramebuffer(GL_FRAMEBUFFER, ctx->blit_10bit_fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            ctx->bound_fbo_tex = 0;
+        }
         glDeleteTextures(1, &bo->gl_tex);
         bo->gl_tex = 0;
     }

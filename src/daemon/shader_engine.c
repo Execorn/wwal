@@ -1500,6 +1500,17 @@ void waywal_shader_engine_forget_bo(waywal_shader_engine_t *eng, const dmabuf_bo
             if (eng->imported_bos[i].owns_egl && eng->display != EGL_NO_DISPLAY &&
                 eng->context != EGL_NO_CONTEXT) {
                 make_context_current(eng);
+                if (eng->draw_fbo) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0,
+                                           0);
+                }
+                if (eng->read_fbo) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, eng->read_fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0,
+                                           0);
+                }
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 if (eng->imported_bos[i].gl_tex) {
                     glDeleteTextures(1, &eng->imported_bos[i].gl_tex);
                 }
@@ -2416,6 +2427,15 @@ static void record_imported_bo(waywal_shader_engine_t *eng, const dmabuf_bo_t *b
             eng->last_complete_bo_tex = 0;
         }
         if (eng->imported_bos[0].owns_egl) {
+            if (eng->draw_fbo) {
+                glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+            }
+            if (eng->read_fbo) {
+                glBindFramebuffer(GL_FRAMEBUFFER, eng->read_fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
             if (eng->imported_bos[0].gl_tex) {
                 glDeleteTextures(1, &eng->imported_bos[0].gl_tex);
             }

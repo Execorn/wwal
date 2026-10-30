@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-30
+
+### Added
+
+- **Hardware TMU Noise Intrinsics (`u_noise_tex`)**: Persistent `256×256` `GL_RGBA8` bilinear wrap-repeat noise LUT bound to `GL_TEXTURE5` with golden-ratio channel offsets (`G = R(x+37, y+17)`, `B = R(x+113, y+53)`) and built-in `waywal_noise2d`, `waywal_noise2d_dual`, and `waywal_noise3d` GLSL helpers in both fragment and compute shader prologues.
+- **Multi-Rate & Sub-Resolution `BUFFER_A..D` Passes**: Added `@wwal_buffer_scale` (`0.1`–`1.0`) and `@wwal_buffer_fps` (`0`–`240`, with `0` baking static buffer passes once on frame `0` or resize) comment annotations and `#pragma waywal` directives for multi-pass Shadertoy shaders.
+- **Multi-Resolution Transition Scratch Pool**: Added a 4-slot resolution-keyed `GL_RGBA8` scratch texture pool in `gpu_compute.c` for zero-thrash mixed-resolution multi-monitor (`1080p` + `1440p` + `4K`) transitions.
+
+### Fixed
+
+- Fixed OpenGL ES 3.1 `smoothstep(edge0, edge1, x)` inverted-edge undefined behavior (`edge0 >= edge1`) across all 10 built-in `.frag` shader presets and 10 `.comp` transition shaders (`burn`, `ripple`, `slide`, `page_curl`, `pixelate`, `luma`, `wipe`, `wave`, `fade`, `doom`).
+- Fixed multi-monitor image transition state cache invalidation when switching scratch resolutions across outputs (`ensure_10bit_scratch_target` and `blit_scratch_to_10bit_bo`).
+- Fixed cross-monitor Wayland pointer coordinate derivation (`daemon_query_cursor_pos`) and applied smoothed AGC gain (`fft->current_gain`) in `waywal_audio_get_effective_volume`.
+
+### Performance
+
+- **Up to 5.68× Faster Built-In Shaders & 46% Lower Multi-Monitor GPU Power**: Replaced multi-octave procedural ALU noise and `sin()` hashes with hardware TMU `waywal_noise2d` / `waywal_noise2d_dual` fetches, hoisted loop-invariant trigonometric rotation matrices out of raymarching and layer loops, added transmittance early-exit in `aurora.frag` (`2.55 ms` → `0.45 ms` at `1080p`, `28.5 W` → `15.5 W` across 3 monitors), analytic bounding-sphere ray pre-culling in `plasma_orb.frag`, and $O(1)$ active-bar indexing in `audio_bars.frag` and `audio_ring.frag`.
+- **Same-Resolution Multi-Monitor Shader Clone Blit**: Outputs sharing identical resolutions and a mouse-independent shader now blit the rendered texture (`waywal_shader_engine_blit_bo`) instead of re-executing the fragment/compute shader per monitor.
+- **Zero-Stall GLES 3.1 Driver Dispatch**: Eliminated per-frame `glGetIntegerv` driver stalls in `shader_engine.c` and `we_tex.c`, gated unused `glGenerateMipmap`, `iDate` `localtime_r`, `audio_tex` uploads, and `_rt_imageLayerComposite` FBO blits in `we_scene.c`, eliminated 60 Hz Hyprland cursor IPC polling for mouse-independent shaders, and batched `wl_display_flush` once per frame tick.
+
 ## [1.1.0] - 2026-10-28
 
 ### Added
@@ -76,6 +96,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - CRC32-verified binary state persistence (`state.bin`), declarative `~/.config/wwal/config.toml` parser with per-output and per-workspace rules, and real-time telemetry (`wwal stats`).
   - Linux `io_uring` event loop (`uring_loop.c`) and Seccomp-BPF + Landlock v3 process sandboxing (`security.c`).
 
-[Unreleased]: https://github.com/Execorn/wwal/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/Execorn/wwal/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/Execorn/wwal/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Execorn/wwal/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Execorn/wwal/releases/tag/v1.0.0
