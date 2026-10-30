@@ -69,6 +69,7 @@ typedef struct dmabuf_ring {
         dmabuf_bo_t buffers[WAYWAL_DMABUF_RING_SIZE];
         dmabuf_bo_t bos[WAYWAL_DMABUF_RING_SIZE];
     };
+    dmabuf_context_t *ctx;
     size_t current_idx;
     uint32_t width;
     uint32_t height;
@@ -76,6 +77,10 @@ typedef struct dmabuf_ring {
     uint64_t modifier;
     bool initialized;
 } dmabuf_ring_t;
+
+typedef dmabuf_bo_t waywal_dmabuf_bo_t;
+typedef dmabuf_context_t waywal_dmabuf_ctx_t;
+typedef dmabuf_ring_t waywal_dmabuf_ring_t;
 
 /* Initialize DRM node and GBM device */
 bool dmabuf_context_init(dmabuf_context_t *ctx);
@@ -92,6 +97,7 @@ void dmabuf_bo_free(dmabuf_bo_t *bo);
 bool dmabuf_ring_init(dmabuf_context_t *ctx, dmabuf_ring_t *ring, uint32_t width, uint32_t height,
                       uint32_t drm_format, uint64_t modifier);
 void dmabuf_ring_destroy(dmabuf_context_t *ctx, dmabuf_ring_t *ring);
+void dmabuf_ring_trim_idle(dmabuf_ring_t *ring);
 
 /* Acquire next available hardware buffer for rendering/display */
 dmabuf_bo_t *dmabuf_ring_acquire(dmabuf_ring_t *ring);

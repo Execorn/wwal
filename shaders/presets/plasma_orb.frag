@@ -3,6 +3,7 @@
 // @description: Raymarched volumetric energy orb with internal plasma filaments and mouse tracking
 // @author: WayWal
 // @audio_reactive: false
+// @wwal_scale: 0.75
 
 const vec3 PAL_BG = vec3(0.02, 0.03, 0.07);
 const vec3 PAL_CORE = vec3(0.20, 0.78, 1.00);

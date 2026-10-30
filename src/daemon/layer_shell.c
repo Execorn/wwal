@@ -402,6 +402,13 @@ static void release_output_bo_refs(daemon_state_t *state, output_node_t *node, d
         if (node->last_presented_bo == bo) {
             node->last_presented_bo = NULL;
         }
+        if (bo >= node->dmabuf_ring.buffers &&
+            bo < node->dmabuf_ring.buffers + WAYWAL_DMABUF_RING_SIZE) {
+            int r_idx = (int)(bo - node->dmabuf_ring.buffers);
+            if (node->last_committed_ring_idx == r_idx) {
+                node->last_committed_ring_idx = -1;
+            }
+        }
         if (node->shader_eng) {
             waywal_shader_engine_forget_bo(node->shader_eng, bo);
         }
@@ -431,6 +438,65 @@ static void release_output_bo_refs(daemon_state_t *state, output_node_t *node, d
         }
         render_engine_release_bo(&state->render_engine, bo);
     }
+}
+
+void layer_shell_release_output_bo_refs(daemon_state_t *state, output_node_t *node, dmabuf_bo_t *bo)
+{
+    release_output_bo_refs(state, node, bo);
+}
+
+static void trim_output_dmabuf_ring(daemon_state_t *state, output_node_t *node)
+{
+    if (!node || !node->use_dmabuf || !node->dmabuf_ring.initialized)
+        return;
+    if (node->shader_active || node->anim_active || node->workshop_active ||
+        (node->video_eng && node->video_eng->state != WAYWAL_VIDEO_STATE_STOPPED))
+        return;
+
+    dmabuf_ring_t *ring = &node->dmabuf_ring;
+    int keep_idx = -1;
+    if (node->last_committed_ring_idx >= 0 &&
+        node->last_committed_ring_idx < WAYWAL_DMABUF_RING_SIZE &&
+        ring->buffers[node->last_committed_ring_idx].gbm_bo != NULL) {
+        keep_idx = node->last_committed_ring_idx;
+    } else if (node->last_presented_bo >= ring->buffers &&
+               node->last_presented_bo < ring->buffers + WAYWAL_DMABUF_RING_SIZE &&
+               node->last_presented_bo->gbm_bo != NULL) {
+        keep_idx = (int)(node->last_presented_bo - ring->buffers);
+    } else {
+        size_t last_idx =
+            (ring->current_idx + WAYWAL_DMABUF_RING_SIZE - 1) % WAYWAL_DMABUF_RING_SIZE;
+        if (ring->buffers[last_idx].gbm_bo != NULL) {
+            keep_idx = (int)last_idx;
+        } else {
+            for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+                if (ring->buffers[i].gbm_bo != NULL && ring->buffers[i].in_use) {
+                    keep_idx = (int)i;
+                    break;
+                }
+            }
+            if (keep_idx < 0) {
+                for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+                    if (ring->buffers[i].gbm_bo != NULL) {
+                        keep_idx = (int)i;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+        if (ring->buffers[i].gbm_bo != NULL && !ring->buffers[i].in_use && (int)i != keep_idx) {
+            release_output_bo_refs(state, node, &ring->buffers[i]);
+            dmabuf_bo_free(&ring->buffers[i]);
+        }
+    }
+}
+
+void layer_shell_trim_output_dmabuf_ring(daemon_state_t *state, output_node_t *node)
+{
+    trim_output_dmabuf_ring(state, node);
 }
 
 void output_node_destroy_surface(output_node_t *node)
@@ -967,6 +1033,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
             wl_surface_damage_buffer(node->surface, 0, 0, INT32_MAX, INT32_MAX);
             output_commit_frame(node);
             wl_buffer_destroy(sp_buf);
+            trim_output_dmabuf_ring(state, node);
             wl_display_flush(state->display);
             return;
         }
@@ -1002,9 +1069,15 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                 }
             }
             if (uploaded) {
-                if (node->has_source_old_bo && state->render_engine.gpu_compute_active) {
-                    render_engine_upload_static(&state->render_engine, NULL, 0, 0,
-                                                &node->source_old_bo, WAYWAL_SCALING_FILL, pixel);
+                if (node->has_source_old_bo) {
+                    release_output_bo_refs(state, node, &node->source_old_bo);
+                    dmabuf_bo_free(&node->source_old_bo);
+                    node->has_source_old_bo = false;
+                }
+                if (node->has_source_new_bo) {
+                    release_output_bo_refs(state, node, &node->source_new_bo);
+                    dmabuf_bo_free(&node->source_new_bo);
+                    node->has_source_new_bo = false;
                 }
                 if (node->viewport) {
                     wp_viewport_set_destination(node->viewport, dst_w, dst_h);
@@ -1019,6 +1092,10 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                 node->has_image = false;
                 node->last_presented_bo = bo;
                 node->last_committed_ring_idx = (int)(bo - node->dmabuf_ring.buffers);
+                trim_output_dmabuf_ring(state, node);
+                if (!state->transitions_in_progress && !state->anim_active) {
+                    render_engine_release_upload_cache(&state->render_engine);
+                }
                 wl_display_flush(state->display);
                 return;
             }
@@ -1756,9 +1833,15 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                 }
             }
             if (uploaded) {
-                if (!state->transitions_in_progress && !state->anim_active &&
-                    state->num_outputs <= 1) {
-                    render_engine_release_upload_cache(&state->render_engine);
+                if (node->has_source_old_bo) {
+                    release_output_bo_refs(state, node, &node->source_old_bo);
+                    dmabuf_bo_free(&node->source_old_bo);
+                    node->has_source_old_bo = false;
+                }
+                if (node->has_source_new_bo) {
+                    release_output_bo_refs(state, node, &node->source_new_bo);
+                    dmabuf_bo_free(&node->source_new_bo);
+                    node->has_source_new_bo = false;
                 }
                 wl_surface_attach(node->surface, bo->wl_buffer, 0, 0);
                 wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
@@ -1766,6 +1849,10 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                 node->has_image = true;
                 node->last_presented_bo = bo;
                 node->last_committed_ring_idx = (int)(bo - node->dmabuf_ring.buffers);
+                trim_output_dmabuf_ring(state, node);
+                if (!state->transitions_in_progress && !state->anim_active) {
+                    render_engine_release_upload_cache(&state->render_engine);
+                }
                 wl_display_flush(state->display);
                 return;
             }
@@ -1938,6 +2025,18 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         }
         if (has_transition) {
             layer_shell_snapshot_live_output(state, pout);
+        } else {
+            if (pout->has_source_old_bo) {
+                release_output_bo_refs(state, pout, &pout->source_old_bo);
+                dmabuf_bo_free(&pout->source_old_bo);
+                pout->has_source_old_bo = false;
+            }
+            if (pout->has_source_new_bo) {
+                release_output_bo_refs(state, pout, &pout->source_new_bo);
+                dmabuf_bo_free(&pout->source_new_bo);
+                pout->has_source_new_bo = false;
+            }
+            trim_output_dmabuf_ring(state, pout);
         }
         if (meta && meta->is_solid_color) {
             pout->displaying_color = true;
@@ -2376,6 +2475,7 @@ static void transition_engine_step(daemon_state_t *state)
                     dmabuf_bo_free(&out->source_new_bo);
                     out->has_source_new_bo = false;
                 }
+                trim_output_dmabuf_ring(state, out);
             } else {
                 free(out->shm_old_data);
                 free(out->shm_new_data);
@@ -2503,6 +2603,7 @@ static void transition_engine_step(daemon_state_t *state)
                     dmabuf_bo_free(&out->source_new_bo);
                     out->has_source_new_bo = false;
                 }
+                trim_output_dmabuf_ring(state, out);
             } else {
                 free(out->shm_old_data);
                 free(out->shm_new_data);
@@ -2537,6 +2638,9 @@ static void transition_engine_step(daemon_state_t *state)
                 ;
         }
         state->transitions_in_progress = false;
+        if (!state->anim_active) {
+            render_engine_release_upload_cache(&state->render_engine);
+        }
         malloc_trim(0);
         WAYWAL_LOG_INFO("Transition completed successfully across active outputs");
     }

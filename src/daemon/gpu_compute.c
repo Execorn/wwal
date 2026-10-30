@@ -1,12 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "gpu_compute.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 // clang-format off
@@ -166,8 +176,123 @@ static void query_program_uniforms(GLuint prog, gpu_program_uniforms_t *u)
     u->last_step = -1.0f;
 }
 
+#define COMPUTE_SHADER_CACHE_MAGIC 0x57575343u /* "WWSC" */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t format;
+    uint32_t size;
+} compute_shader_cache_hdr_t;
+
+static uint64_t fnv1a_64_update(uint64_t hash, const void *data, size_t len)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= (uint64_t)bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static bool get_compute_shader_cache_path(const char *src, char *out_path, size_t out_sz)
+{
+    if (!src || !out_path || out_sz == 0)
+        return false;
+
+    char base_dir[PATH_MAX];
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    if (xdg && xdg[0] != '\0') {
+        snprintf(base_dir, sizeof(base_dir), "%s", xdg);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || home[0] == '\0')
+            return false;
+        snprintf(base_dir, sizeof(base_dir), "%s/.cache", home);
+        (void)mkdir(base_dir, 0700);
+    }
+
+    char wwal_dir[PATH_MAX];
+    snprintf(wwal_dir, sizeof(wwal_dir), "%s/wwal", base_dir);
+    (void)mkdir(wwal_dir, 0700);
+
+    char shaders_dir[PATH_MAX];
+    snprintf(shaders_dir, sizeof(shaders_dir), "%s/shaders", wwal_dir);
+    (void)mkdir(shaders_dir, 0700);
+
+    uint64_t hash = 14695981039346656037ULL;
+    static const char tag[] = "compute_v1";
+    hash = fnv1a_64_update(hash, tag, sizeof(tag));
+    hash = fnv1a_64_update(hash, src, strlen(src));
+
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+    if (renderer) {
+        hash = fnv1a_64_update(hash, renderer, strlen(renderer) + 1);
+    }
+    const char *version = (const char *)glGetString(GL_VERSION);
+    if (version) {
+        hash = fnv1a_64_update(hash, version, strlen(version) + 1);
+    }
+
+    int n =
+        snprintf(out_path, out_sz, "%s/comp_%016llx.bin", shaders_dir, (unsigned long long)hash);
+    return (n > 0 && (size_t)n < out_sz);
+}
+
+static void trim_driver_compiler_pages(void)
+{
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
+
 static GLuint compile_shader_program(const char *src, const char *name)
 {
+    char cache_path[PATH_MAX];
+    bool has_cache_path = get_compute_shader_cache_path(src, cache_path, sizeof(cache_path));
+
+    if (has_cache_path) {
+        int fd = open(cache_path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            struct stat st;
+            compute_shader_cache_hdr_t hdr;
+            if (fstat(fd, &st) == 0 && st.st_size > (off_t)sizeof(compute_shader_cache_hdr_t) &&
+                read(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr) &&
+                hdr.magic == COMPUTE_SHADER_CACHE_MAGIC && hdr.size > 0 &&
+                hdr.size <= (16u * 1024u * 1024u) &&
+                st.st_size == (off_t)(sizeof(hdr) + hdr.size)) {
+                void *bin = malloc(hdr.size);
+                if (bin) {
+                    ssize_t r = read(fd, bin, hdr.size);
+                    close(fd);
+                    fd = -1;
+                    if (r == (ssize_t)hdr.size) {
+                        GLuint cached_prog = glCreateProgram();
+                        if (cached_prog) {
+                            glProgramBinary(cached_prog, (GLenum)hdr.format, bin,
+                                            (GLsizei)hdr.size);
+                            free(bin);
+                            GLint linked = 0;
+                            glGetProgramiv(cached_prog, GL_LINK_STATUS, &linked);
+                            if (linked) {
+                                trim_driver_compiler_pages();
+                                return cached_prog;
+                            }
+                            glDeleteProgram(cached_prog);
+                        } else {
+                            free(bin);
+                        }
+                    } else {
+                        free(bin);
+                    }
+                    unlink(cache_path);
+                }
+            }
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
+    }
+
     GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
     if (!shader) {
         WAYWAL_LOG_ERR("glCreateShader failed for %s", name);
@@ -193,6 +318,7 @@ static GLuint compile_shader_program(const char *src, const char *name)
         return 0;
     }
 
+    glProgramParameteri(prog, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
     glAttachShader(prog, shader);
     glLinkProgram(prog);
 
@@ -208,6 +334,42 @@ static GLuint compile_shader_program(const char *src, const char *name)
     }
 
     glDeleteShader(shader);
+
+    if (has_cache_path) {
+        GLint bin_len = 0;
+        glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &bin_len);
+        if (bin_len > 0 && bin_len <= (16 * 1024 * 1024)) {
+            void *bin = malloc((size_t)bin_len);
+            if (bin) {
+                GLsizei actual_len = 0;
+                GLenum bin_fmt = 0;
+                glGetProgramBinary(prog, bin_len, &actual_len, &bin_fmt, bin);
+                if (actual_len > 0 && actual_len <= bin_len) {
+                    char tmp_path[PATH_MAX + 32];
+                    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", cache_path, (int)getpid());
+                    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                    if (fd >= 0) {
+                        compute_shader_cache_hdr_t hdr = {
+                            .magic = COMPUTE_SHADER_CACHE_MAGIC,
+                            .format = (uint32_t)bin_fmt,
+                            .size = (uint32_t)actual_len,
+                        };
+                        bool ok = (write(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr)) &&
+                                  (write(fd, bin, (size_t)actual_len) == (ssize_t)actual_len);
+                        close(fd);
+                        if (ok) {
+                            (void)rename(tmp_path, cache_path);
+                        } else {
+                            unlink(tmp_path);
+                        }
+                    }
+                }
+                free(bin);
+            }
+        }
+    }
+
+    trim_driver_compiler_pages();
     return prog;
 }
 
@@ -336,6 +498,51 @@ static GLuint compile_blit_10bit_program(void)
                                 "    frag_color = texture(u_tex, v_uv);\n"
                                 "}\n";
 
+    char cache_path[PATH_MAX];
+    bool has_cache_path = get_compute_shader_cache_path("__gpu_compute_blit_10bit_v1__", cache_path,
+                                                        sizeof(cache_path));
+    if (has_cache_path) {
+        int fd = open(cache_path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            struct stat st;
+            compute_shader_cache_hdr_t hdr;
+            if (fstat(fd, &st) == 0 && st.st_size > (off_t)sizeof(compute_shader_cache_hdr_t) &&
+                read(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr) &&
+                hdr.magic == COMPUTE_SHADER_CACHE_MAGIC && hdr.size > 0 &&
+                hdr.size <= (16u * 1024u * 1024u) &&
+                st.st_size == (off_t)(sizeof(hdr) + hdr.size)) {
+                void *bin = malloc(hdr.size);
+                if (bin) {
+                    ssize_t r = read(fd, bin, hdr.size);
+                    close(fd);
+                    fd = -1;
+                    if (r == (ssize_t)hdr.size) {
+                        GLuint cached_prog = glCreateProgram();
+                        if (cached_prog) {
+                            glProgramBinary(cached_prog, (GLenum)hdr.format, bin,
+                                            (GLsizei)hdr.size);
+                            free(bin);
+                            GLint linked = 0;
+                            glGetProgramiv(cached_prog, GL_LINK_STATUS, &linked);
+                            if (linked) {
+                                trim_driver_compiler_pages();
+                                return cached_prog;
+                            }
+                            glDeleteProgram(cached_prog);
+                        } else {
+                            free(bin);
+                        }
+                    } else {
+                        free(bin);
+                    }
+                    unlink(cache_path);
+                }
+            }
+            if (fd >= 0)
+                close(fd);
+        }
+    }
+
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
     GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
     if (!vs || !fs) {
@@ -360,6 +567,7 @@ static GLuint compile_blit_10bit_program(void)
     }
 
     GLuint prog = glCreateProgram();
+    glProgramParameteri(prog, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
     glAttachShader(prog, vs);
     glAttachShader(prog, fs);
     glLinkProgram(prog);
@@ -372,6 +580,42 @@ static GLuint compile_blit_10bit_program(void)
         glDeleteProgram(prog);
         return 0;
     }
+
+    if (has_cache_path) {
+        GLint bin_len = 0;
+        glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &bin_len);
+        if (bin_len > 0 && bin_len <= (16 * 1024 * 1024)) {
+            void *bin = malloc((size_t)bin_len);
+            if (bin) {
+                GLsizei actual_len = 0;
+                GLenum bin_fmt = 0;
+                glGetProgramBinary(prog, bin_len, &actual_len, &bin_fmt, bin);
+                if (actual_len > 0 && actual_len <= bin_len) {
+                    char tmp_path[PATH_MAX + 32];
+                    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", cache_path, (int)getpid());
+                    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                    if (fd >= 0) {
+                        compute_shader_cache_hdr_t hdr = {
+                            .magic = COMPUTE_SHADER_CACHE_MAGIC,
+                            .format = (uint32_t)bin_fmt,
+                            .size = (uint32_t)actual_len,
+                        };
+                        bool ok = (write(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr)) &&
+                                  (write(fd, bin, (size_t)actual_len) == (ssize_t)actual_len);
+                        close(fd);
+                        if (ok) {
+                            (void)rename(tmp_path, cache_path);
+                        } else {
+                            unlink(tmp_path);
+                        }
+                    }
+                }
+                free(bin);
+            }
+        }
+    }
+
+    trim_driver_compiler_pages();
     return prog;
 }
 
@@ -458,34 +702,10 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
         return NULL;
     }
 
-    /* Compile embedded compute shaders */
-    ctx->prog_fade = compile_shader_program(SHADER_SRC_FADE, "fade");
-    ctx->prog_wipe = compile_shader_program(SHADER_SRC_WIPE, "wipe");
-    ctx->prog_grow = compile_shader_program(SHADER_SRC_GROW, "grow");
-    ctx->prog_outer = compile_shader_program(SHADER_SRC_OUTER, "outer");
-    ctx->prog_wave = compile_shader_program(SHADER_SRC_WAVE, "wave");
-    ctx->prog_noise = compile_shader_program(SHADER_SRC_NOISE, "noise");
-    ctx->prog_crosszoom = compile_shader_program(SHADER_SRC_CROSSZOOM, "crosszoom");
-    ctx->prog_slide = compile_shader_program(SHADER_SRC_SLIDE, "slide");
-    ctx->prog_glitch = compile_shader_program(SHADER_SRC_GLITCH, "glitch");
-    ctx->prog_burn = compile_shader_program(SHADER_SRC_BURN, "burn");
-    ctx->prog_ripple = compile_shader_program(SHADER_SRC_RIPPLE, "ripple");
-    ctx->prog_pixelate = compile_shader_program(SHADER_SRC_PIXELATE, "pixelate");
-    ctx->prog_doom = compile_shader_program(SHADER_SRC_DOOM, "doom");
-    ctx->prog_swirl = compile_shader_program(SHADER_SRC_SWIRL, "swirl");
-    ctx->prog_cube = compile_shader_program(SHADER_SRC_CUBE, "cube");
-    ctx->prog_luma = compile_shader_program(SHADER_SRC_LUMA, "luma");
-    ctx->prog_light_leak = compile_shader_program(SHADER_SRC_LIGHT_LEAK, "light_leak");
-    ctx->prog_page_curl = compile_shader_program(SHADER_SRC_PAGE_CURL, "page_curl");
+    /* Only compile scale compute shader at startup; transition & blur shaders compile lazily */
     ctx->prog_scale = compile_shader_program(SHADER_SRC_SCALE, "scale");
-    ctx->prog_kawase = compile_shader_program(SHADER_SRC_KAWASE, "kawase");
-
-    if (!ctx->prog_fade || !ctx->prog_wipe || !ctx->prog_grow || !ctx->prog_outer ||
-        !ctx->prog_wave || !ctx->prog_noise || !ctx->prog_crosszoom || !ctx->prog_slide ||
-        !ctx->prog_glitch || !ctx->prog_burn || !ctx->prog_ripple || !ctx->prog_pixelate ||
-        !ctx->prog_doom || !ctx->prog_swirl || !ctx->prog_cube || !ctx->prog_luma ||
-        !ctx->prog_light_leak || !ctx->prog_page_curl || !ctx->prog_scale || !ctx->prog_kawase) {
-        WAYWAL_LOG_WARN("One or more compute shader programs failed to compile");
+    if (!ctx->prog_scale) {
+        WAYWAL_LOG_WARN("Compute scale shader program failed to compile");
         gpu_compute_destroy(ctx);
         return NULL;
     }
@@ -499,29 +719,6 @@ gpu_compute_ctx_t *gpu_compute_create(dmabuf_context_t *dmabuf_ctx)
     ctx->loc_scale_gravity = glGetUniformLocation(ctx->prog_scale, "u_crop_gravity");
     ctx->crop_gravity[0] = 0.5f;
     ctx->crop_gravity[1] = 0.5f;
-    ctx->loc_kawase_src_res = glGetUniformLocation(ctx->prog_kawase, "u_src_res");
-    ctx->loc_kawase_dst_res = glGetUniformLocation(ctx->prog_kawase, "u_dst_res");
-    ctx->loc_kawase_radius = glGetUniformLocation(ctx->prog_kawase, "u_radius");
-
-    /* Cache uniform locations at compile/link time to avoid per-frame driver lookups */
-    query_program_uniforms(ctx->prog_fade, &ctx->unif_fade);
-    query_program_uniforms(ctx->prog_wipe, &ctx->unif_wipe);
-    query_program_uniforms(ctx->prog_grow, &ctx->unif_grow);
-    query_program_uniforms(ctx->prog_outer, &ctx->unif_outer);
-    query_program_uniforms(ctx->prog_wave, &ctx->unif_wave);
-    query_program_uniforms(ctx->prog_noise, &ctx->unif_noise);
-    query_program_uniforms(ctx->prog_crosszoom, &ctx->unif_crosszoom);
-    query_program_uniforms(ctx->prog_slide, &ctx->unif_slide);
-    query_program_uniforms(ctx->prog_glitch, &ctx->unif_glitch);
-    query_program_uniforms(ctx->prog_burn, &ctx->unif_burn);
-    query_program_uniforms(ctx->prog_ripple, &ctx->unif_ripple);
-    query_program_uniforms(ctx->prog_pixelate, &ctx->unif_pixelate);
-    query_program_uniforms(ctx->prog_doom, &ctx->unif_doom);
-    query_program_uniforms(ctx->prog_swirl, &ctx->unif_swirl);
-    query_program_uniforms(ctx->prog_cube, &ctx->unif_cube);
-    query_program_uniforms(ctx->prog_luma, &ctx->unif_luma);
-    query_program_uniforms(ctx->prog_light_leak, &ctx->unif_light_leak);
-    query_program_uniforms(ctx->prog_page_curl, &ctx->unif_page_curl);
 
     /* Query fence sync extension entry points for GPU-to-Wayland handoff synchronization */
     ctx->eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
@@ -785,10 +982,12 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
     GLuint prog = 0;
     gpu_program_uniforms_t *u = NULL;
     if (params->progress <= 0.0f || params->progress >= 1.0f) {
-        prog = ctx->prog_fade;
-        u = &ctx->unif_fade;
+        select_transition_program(ctx, WAYWAL_TRANSITION_FADE, &prog, &u);
     } else {
         select_transition_program(ctx, params->type, &prog, &u);
+    }
+    if (!prog || !u) {
+        return false;
     }
 
     if (ctx->current_prog != prog) {
@@ -895,81 +1094,103 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
     return true;
 }
 
+static GLuint ensure_transition_prog(GLuint *prog_slot, gpu_program_uniforms_t *unif_slot,
+                                     const char *src, const char *name)
+{
+    if (*prog_slot == 0) {
+        *prog_slot = compile_shader_program(src, name);
+        if (*prog_slot != 0) {
+            query_program_uniforms(*prog_slot, unif_slot);
+        }
+    }
+    return *prog_slot;
+}
+
 static void select_transition_program(gpu_compute_ctx_t *ctx, waywal_transition_type_t type,
                                       GLuint *out_prog, gpu_program_uniforms_t **out_u)
 {
     if (type == WAYWAL_TRANSITION_RANDOM) {
         type = (waywal_transition_type_t)(1 + (rand() % 19));
     }
-    GLuint prog = ctx->prog_fade;
+    GLuint prog = 0;
     gpu_program_uniforms_t *u = &ctx->unif_fade;
     switch (type) {
     case WAYWAL_TRANSITION_WIPE:
-        prog = ctx->prog_wipe;
+        prog = ensure_transition_prog(&ctx->prog_wipe, &ctx->unif_wipe, SHADER_SRC_WIPE, "wipe");
         u = &ctx->unif_wipe;
         break;
     case WAYWAL_TRANSITION_GROW:
-        prog = ctx->prog_grow;
+        prog = ensure_transition_prog(&ctx->prog_grow, &ctx->unif_grow, SHADER_SRC_GROW, "grow");
         u = &ctx->unif_grow;
         break;
     case WAYWAL_TRANSITION_OUTER:
-        prog = ctx->prog_outer;
+        prog =
+            ensure_transition_prog(&ctx->prog_outer, &ctx->unif_outer, SHADER_SRC_OUTER, "outer");
         u = &ctx->unif_outer;
         break;
     case WAYWAL_TRANSITION_WAVE:
-        prog = ctx->prog_wave;
+        prog = ensure_transition_prog(&ctx->prog_wave, &ctx->unif_wave, SHADER_SRC_WAVE, "wave");
         u = &ctx->unif_wave;
         break;
     case WAYWAL_TRANSITION_NOISE:
-        prog = ctx->prog_noise;
+        prog =
+            ensure_transition_prog(&ctx->prog_noise, &ctx->unif_noise, SHADER_SRC_NOISE, "noise");
         u = &ctx->unif_noise;
         break;
     case WAYWAL_TRANSITION_CROSSZOOM:
-        prog = ctx->prog_crosszoom;
+        prog = ensure_transition_prog(&ctx->prog_crosszoom, &ctx->unif_crosszoom,
+                                      SHADER_SRC_CROSSZOOM, "crosszoom");
         u = &ctx->unif_crosszoom;
         break;
     case WAYWAL_TRANSITION_SLIDE:
-        prog = ctx->prog_slide;
+        prog =
+            ensure_transition_prog(&ctx->prog_slide, &ctx->unif_slide, SHADER_SRC_SLIDE, "slide");
         u = &ctx->unif_slide;
         break;
     case WAYWAL_TRANSITION_GLITCH:
-        prog = ctx->prog_glitch;
+        prog = ensure_transition_prog(&ctx->prog_glitch, &ctx->unif_glitch, SHADER_SRC_GLITCH,
+                                      "glitch");
         u = &ctx->unif_glitch;
         break;
     case WAYWAL_TRANSITION_BURN:
-        prog = ctx->prog_burn;
+        prog = ensure_transition_prog(&ctx->prog_burn, &ctx->unif_burn, SHADER_SRC_BURN, "burn");
         u = &ctx->unif_burn;
         break;
     case WAYWAL_TRANSITION_RIPPLE:
-        prog = ctx->prog_ripple;
+        prog = ensure_transition_prog(&ctx->prog_ripple, &ctx->unif_ripple, SHADER_SRC_RIPPLE,
+                                      "ripple");
         u = &ctx->unif_ripple;
         break;
     case WAYWAL_TRANSITION_PIXELATE:
-        prog = ctx->prog_pixelate;
+        prog = ensure_transition_prog(&ctx->prog_pixelate, &ctx->unif_pixelate, SHADER_SRC_PIXELATE,
+                                      "pixelate");
         u = &ctx->unif_pixelate;
         break;
     case WAYWAL_TRANSITION_DOOM:
-        prog = ctx->prog_doom;
+        prog = ensure_transition_prog(&ctx->prog_doom, &ctx->unif_doom, SHADER_SRC_DOOM, "doom");
         u = &ctx->unif_doom;
         break;
     case WAYWAL_TRANSITION_SWIRL:
-        prog = ctx->prog_swirl;
+        prog =
+            ensure_transition_prog(&ctx->prog_swirl, &ctx->unif_swirl, SHADER_SRC_SWIRL, "swirl");
         u = &ctx->unif_swirl;
         break;
     case WAYWAL_TRANSITION_CUBE:
-        prog = ctx->prog_cube;
+        prog = ensure_transition_prog(&ctx->prog_cube, &ctx->unif_cube, SHADER_SRC_CUBE, "cube");
         u = &ctx->unif_cube;
         break;
     case WAYWAL_TRANSITION_LUMA:
-        prog = ctx->prog_luma;
+        prog = ensure_transition_prog(&ctx->prog_luma, &ctx->unif_luma, SHADER_SRC_LUMA, "luma");
         u = &ctx->unif_luma;
         break;
     case WAYWAL_TRANSITION_LIGHT_LEAK:
-        prog = ctx->prog_light_leak;
+        prog = ensure_transition_prog(&ctx->prog_light_leak, &ctx->unif_light_leak,
+                                      SHADER_SRC_LIGHT_LEAK, "light_leak");
         u = &ctx->unif_light_leak;
         break;
     case WAYWAL_TRANSITION_PAGE_CURL:
-        prog = ctx->prog_page_curl;
+        prog = ensure_transition_prog(&ctx->prog_page_curl, &ctx->unif_page_curl,
+                                      SHADER_SRC_PAGE_CURL, "page_curl");
         u = &ctx->unif_page_curl;
         break;
     case WAYWAL_TRANSITION_CUSTOM:
@@ -977,14 +1198,15 @@ static void select_transition_program(gpu_compute_ctx_t *ctx, waywal_transition_
             prog = ctx->prog_custom;
             u = &ctx->unif_custom;
         } else {
-            prog = ctx->prog_fade;
+            prog =
+                ensure_transition_prog(&ctx->prog_fade, &ctx->unif_fade, SHADER_SRC_FADE, "fade");
             u = &ctx->unif_fade;
         }
         break;
     case WAYWAL_TRANSITION_FADE:
     case WAYWAL_TRANSITION_SIMPLE:
     default:
-        prog = ctx->prog_fade;
+        prog = ensure_transition_prog(&ctx->prog_fade, &ctx->unif_fade, SHADER_SRC_FADE, "fade");
         u = &ctx->unif_fade;
         break;
     }
@@ -1083,10 +1305,12 @@ bool gpu_compute_dispatch_transition_shm(gpu_compute_ctx_t *ctx, uint32_t tex_ol
     GLuint prog = 0;
     gpu_program_uniforms_t *u = NULL;
     if (params->progress <= 0.0f || params->progress >= 1.0f) {
-        prog = ctx->prog_fade;
-        u = &ctx->unif_fade;
+        select_transition_program(ctx, WAYWAL_TRANSITION_FADE, &prog, &u);
     } else {
         select_transition_program(ctx, params->type, &prog, &u);
+    }
+    if (!prog || !u) {
+        return false;
     }
 
     if (ctx->current_prog != prog) {
@@ -1333,23 +1557,66 @@ void gpu_compute_bump_upload_gen(gpu_compute_ctx_t *ctx)
         ctx->upload_gen = 1;
 }
 
+static void gpu_compute_release_scratch(gpu_compute_ctx_t *ctx)
+{
+    if (!ctx)
+        return;
+    bool any = (ctx->kawase_half_tex != 0 || ctx->scratch_10bit_tex != 0);
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (ctx->scratch_pool_tex[i] != 0)
+            any = true;
+    }
+    if (!any)
+        return;
+
+    gpu_compute_make_current(ctx);
+
+    if (ctx->kawase_half_tex != 0) {
+        if (ctx->bound_target_tex == ctx->kawase_half_tex)
+            ctx->bound_target_tex = 0;
+        if (ctx->bound_old_tex == ctx->kawase_half_tex)
+            ctx->bound_old_tex = 0;
+        glDeleteTextures(1, &ctx->kawase_half_tex);
+        ctx->kawase_half_tex = 0;
+        ctx->kawase_half_w = 0;
+        ctx->kawase_half_h = 0;
+    }
+
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (ctx->scratch_pool_tex[i] != 0) {
+            if (ctx->bound_target_tex == ctx->scratch_pool_tex[i])
+                ctx->bound_target_tex = 0;
+            glDeleteTextures(1, &ctx->scratch_pool_tex[i]);
+            ctx->scratch_pool_tex[i] = 0;
+            ctx->scratch_pool_w[i] = 0;
+            ctx->scratch_pool_h[i] = 0;
+        }
+    }
+    ctx->scratch_10bit_tex = 0;
+    ctx->scratch_10bit_w = 0;
+    ctx->scratch_10bit_h = 0;
+}
+
 void gpu_compute_release_upload_cache(gpu_compute_ctx_t *ctx)
 {
-    if (!ctx || ctx->upload_src_tex == 0)
+    if (!ctx)
         return;
-    gpu_compute_make_current(ctx);
-    if (ctx->bound_old_tex == ctx->upload_src_tex)
-        ctx->bound_old_tex = 0;
-    if (ctx->bound_new_tex == ctx->upload_src_tex)
-        ctx->bound_new_tex = 0;
-    glDeleteTextures(1, &ctx->upload_src_tex);
-    ctx->upload_src_tex = 0;
-    ctx->upload_src_w = 0;
-    ctx->upload_src_h = 0;
-    ctx->last_upload_ptr = NULL;
-    ctx->last_upload_w = 0;
-    ctx->last_upload_h = 0;
-    ctx->last_upload_gen = 0;
+    if (ctx->upload_src_tex != 0) {
+        gpu_compute_make_current(ctx);
+        if (ctx->bound_old_tex == ctx->upload_src_tex)
+            ctx->bound_old_tex = 0;
+        if (ctx->bound_new_tex == ctx->upload_src_tex)
+            ctx->bound_new_tex = 0;
+        glDeleteTextures(1, &ctx->upload_src_tex);
+        ctx->upload_src_tex = 0;
+        ctx->upload_src_w = 0;
+        ctx->upload_src_h = 0;
+        ctx->last_upload_ptr = NULL;
+        ctx->last_upload_w = 0;
+        ctx->last_upload_h = 0;
+        ctx->last_upload_gen = 0;
+    }
+    gpu_compute_release_scratch(ctx);
 }
 
 static void upload_source_rgba_dedup(gpu_compute_ctx_t *ctx, const uint8_t *src_rgba,
@@ -1648,7 +1915,7 @@ bool gpu_compute_render_kawase_blur(gpu_compute_ctx_t *ctx, const uint8_t *src_r
                                     uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t radius)
 {
     if (!ctx || !src_rgba || src_w == 0 || src_h == 0 || !dst_bo || dst_bo->width == 0 ||
-        dst_bo->height == 0 || !ctx->prog_kawase) {
+        dst_bo->height == 0) {
         return false;
     }
 
@@ -1657,6 +1924,16 @@ bool gpu_compute_render_kawase_blur(gpu_compute_ctx_t *ctx, const uint8_t *src_r
             eglMakeCurrent(ctx->display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->context);
             gpu_compute_invalidate_state_cache(ctx);
         }
+    }
+
+    if (!ctx->prog_kawase) {
+        ctx->prog_kawase = compile_shader_program(SHADER_SRC_KAWASE, "kawase");
+        if (!ctx->prog_kawase) {
+            return false;
+        }
+        ctx->loc_kawase_src_res = glGetUniformLocation(ctx->prog_kawase, "u_src_res");
+        ctx->loc_kawase_dst_res = glGetUniformLocation(ctx->prog_kawase, "u_dst_res");
+        ctx->loc_kawase_radius = glGetUniformLocation(ctx->prog_kawase, "u_radius");
     }
 
     if (!gpu_compute_import_bo(ctx, dst_bo)) {

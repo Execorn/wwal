@@ -3,6 +3,7 @@
 // @description: Polar circular audio spectrum with reactive bass core and expanding shockwave rings
 // @author: WayWal
 // @audio_reactive: true
+// @wwal_scale: 0.75
 
 const vec3 PAL_AR_BG = vec3(0.03, 0.03, 0.07);
 const vec3 PAL_AR_CYAN = vec3(0.14, 0.86, 0.98);
@@ -44,18 +45,21 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         int bin = clamp(int(band_pos), 0, 63);
         float spoke = abs(fract(band_pos) - 0.5);
 
-        float log_u = pow(norm_ang, 1.8) * 0.85 + 0.01;
-        float raw_tex = textureLod(iChannel0, vec2(log_u, 0.25), 0.0).r;
-        float tex_fft = (isnan(raw_tex) || isinf(raw_tex)) ? 0.0 : clamp(raw_tex, 0.0, 1.0);
         float raw_band = u_audio_bands[bin];
         float safe_band = (isnan(raw_band) || isinf(raw_band)) ? 0.0 : clamp(raw_band, 0.0, 1.0);
+        float tex_fft = 0.0;
+        if (safe_env < 0.001 && safe_band < 0.001) {
+            float log_u = pow(max(norm_ang, 1e-4), 1.8) * 0.85 + 0.01;
+            float raw_tex = textureLod(iChannel0, vec2(log_u, 0.25), 0.0).r;
+            tex_fft = (isnan(raw_tex) || isinf(raw_tex)) ? 0.0 : clamp(raw_tex, 0.0, 1.0);
+        }
         float band = max(safe_band, tex_fft);
 
         float idle_wave = 0.12 + 0.07 * sin(norm_ang * 18.8495 + iTime * 2.4)
                                + 0.04 * cos(norm_ang * 37.6991 - iTime * 3.6);
         float idle_pulse = 0.03 * sin(iTime * 2.0);
 
-        float has_audio = smoothstep(0.01, 0.08, safe_env + tex_fft * 0.5);
+        float has_audio = smoothstep(0.01, 0.08, safe_env + band * 0.5);
         float live_amp = max(band * 0.28, idle_wave * 0.35) + safe_beat * 0.03;
         float amp = max(mix(idle_wave, live_amp, has_audio), 0.02);
         float base_r = 0.22 + mix(idle_pulse, safe_beat * 0.045 + safe_env * 0.04, has_audio);

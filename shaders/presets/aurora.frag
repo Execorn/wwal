@@ -3,6 +3,7 @@
 // @description: Northern Lights curtains over an arctic night sky with stars and audio reactivity
 // @author: WayWal
 // @audio_reactive: false
+// @wwal_scale: 0.75
 
 const vec3 PAL_SKY_BOTTOM = vec3(0.03, 0.07, 0.16);
 const vec3 PAL_AURORA_GREEN = vec3(0.10, 0.92, 0.58);

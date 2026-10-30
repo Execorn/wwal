@@ -79,7 +79,8 @@ bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps)
     memset(sps->scaling_list_4x4, 16, sizeof(sps->scaling_list_4x4));
     memset(sps->scaling_list_8x8, 16, sizeof(sps->scaling_list_8x8));
     sps->profile_idc = (uint8_t)read_bits(&br, 8);
-    read_bits(&br, 8); /* constraint flags */
+    uint8_t constraint_flags = (uint8_t)read_bits(&br, 8);
+    sps->constraint_set1_flag = (constraint_flags >> 6) & 1U;
     sps->level_idc = (uint8_t)read_bits(&br, 8);
     read_ue(&br); /* seq_parameter_set_id */
 

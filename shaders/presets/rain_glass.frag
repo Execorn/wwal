@@ -3,10 +3,32 @@
 // @description: Procedural refractive raindrops and condensation trails sliding down bokeh glass
 // @author: WayWal
 // @audio_reactive: false
+// @wwal_scale: 0.75
 
 const vec3 PAL_NIGHT = vec3(0.05, 0.08, 0.14);
 const vec3 PAL_AMBER = vec3(0.96, 0.62, 0.22);
 const vec3 PAL_CYAN = vec3(0.18, 0.72, 0.92);
+
+const vec4 RG_BOKEH_LUT[18] = vec4[18](
+    vec4(-0.800000, -0.425000, 0.080000, 0.000000),
+    vec4(-0.427246, -0.299918, 0.125843, 0.232971),
+    vec4(-0.413281,  0.379761, 0.166987, 0.241699),
+    vec4(-0.556250,  0.082593, 0.081367, 0.152344),
+    vec4(-0.541211,  0.040466, 0.202756, 0.161743),
+    vec4( 0.003906,  0.370630, 0.202979, 0.502441),
+    vec4(-0.109375,  0.314600, 0.173242, 0.431641),
+    vec4( 0.145313, -0.367725, 0.203730, 0.590820),
+    vec4(-0.207813,  0.121606, 0.115410, 0.370117),
+    vec4( 0.167187,  0.395117, 0.182539, 0.604492),
+    vec4( 0.007812,  0.327051, 0.190332, 0.504883),
+    vec4( 0.714600,  0.294548, 0.151683, 0.946625),
+    vec4( 0.269336,  0.369592, 0.139644, 0.668335),
+    vec4(-0.721484,  0.079688, 0.107993, 0.049072),
+    vec4(-0.202344, -0.271851, 0.096680, 0.373535),
+    vec4( 0.205469, -0.379553, 0.092954, 0.628418),
+    vec4( 0.153125,  0.011621, 0.197988, 0.595703),
+    vec4(-0.212500,  0.229932, 0.164629, 0.367188)
+);
 
 vec3 rg_hash32(vec2 p)
 {
@@ -69,20 +91,22 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec2 sc = vec2(sin(t_wrap * 0.2), cos(t_wrap * 0.2));
 
     for (int i = 0; i < 18; ++i) {
-        float fi = float(i);
-        vec3 bh = rg_hash32(vec2(fi, fi * 2.7));
-        vec2 b_pos = vec2((bh.x - 0.5) * 1.6 + sc.x * 0.08, (bh.y - 0.5) * 0.85);
+        vec4 bd = RG_BOKEH_LUT[i];
+        vec2 b_pos = bd.xy + vec2(sc.x * 0.08, 0.0);
         sc = ROT1 * sc;
 
         vec2 diff = ref_uv - b_pos;
-        float d2 = dot(diff, diff);
-        float rad = mix(0.08, 0.22, bh.z);
-        if (d2 < rad * rad) {
-            float b_d = sqrt(d2);
-            float bokeh = (1.0 - smoothstep(rad * 0.2, rad, b_d)) *
-                          (0.6 + 0.4 * smoothstep(rad * 0.5, rad, b_d));
-            vec3 b_col = mix(bokeh_amber, bokeh_cyan, bh.x);
-            bg += b_col * bokeh * (0.28 + audio_glow * 0.25);
+        float rad = bd.z;
+        if (abs(diff.x) < rad && abs(diff.y) < rad) {
+            float d2 = dot(diff, diff);
+            float r2 = rad * rad;
+            if (d2 < r2) {
+                float b_d = sqrt(d2);
+                float bokeh = (1.0 - smoothstep(rad * 0.2, rad, b_d)) *
+                              (0.6 + 0.4 * smoothstep(rad * 0.5, rad, b_d));
+                vec3 b_col = mix(bokeh_amber, bokeh_cyan, bd.w);
+                bg += b_col * bokeh * (0.28 + audio_glow * 0.25);
+            }
         }
     }
 

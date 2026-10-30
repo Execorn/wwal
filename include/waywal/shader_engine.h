@@ -91,6 +91,10 @@ bool waywal_shader_engine_blit_bo(waywal_shader_engine_t *eng, dmabuf_bo_t *src_
                                   dmabuf_bo_t *target_bo);
 bool waywal_shader_engine_has_active_program(const waywal_shader_engine_t *eng);
 bool waywal_shader_engine_uses_mouse(const waywal_shader_engine_t *eng);
+bool waywal_shader_engine_uses_wallpaper(const waywal_shader_engine_t *eng);
+bool waywal_shader_engine_uses_album_art(const waywal_shader_engine_t *eng);
+float waywal_shader_engine_get_render_scale(const waywal_shader_engine_t *eng);
+uint32_t waywal_shader_engine_get_target_fps(const waywal_shader_engine_t *eng);
 bool waywal_shader_engine_last_load_from_cache(const waywal_shader_engine_t *eng);
 uint32_t waywal_shader_engine_active_pass_mask(const waywal_shader_engine_t *eng);
 bool waywal_shader_engine_shares_egl_context(const waywal_shader_engine_t *a,

@@ -991,13 +991,8 @@ __attribute__((target("avx2,fma"))) static void particle_reset_and_ops_avx2(we_p
         vec_n = sys->padded_cap;
     }
 
-    for (uint32_t a = 0; a < WE_PARTICLE_SOA_ARRAYS; a++) {
-        float *arr = sys->soa_block + (size_t)a * sys->padded_cap;
-        for (uint32_t tail = n; tail < vec_n; tail++) {
-            arr[tail] = 0.0f;
-        }
-    }
     for (uint32_t tail = n; tail < vec_n; tail++) {
+        sys->age[tail] = 0.0f;
         sys->max_life[tail] = 1.0f;
     }
 
@@ -1316,13 +1311,6 @@ __attribute__((target("avx2,fma"))) static void particle_reset_and_ops_avx2(we_p
 
     for (uint32_t i = 0; i < vec_n; i += 8u) {
         _mm256_store_ps(sys->age + i, _mm256_add_ps(_mm256_load_ps(sys->age + i), v_dt));
-    }
-
-    for (uint32_t a = 0; a < WE_PARTICLE_SOA_ARRAYS; a++) {
-        float *arr = sys->soa_block + (size_t)a * sys->padded_cap;
-        for (uint32_t tail = n; tail < vec_n; tail++) {
-            arr[tail] = 0.0f;
-        }
     }
 }
 #endif
@@ -1819,15 +1807,16 @@ void we_particle_draw_gl(we_particle_sys_t *sys, uint32_t gl_prog)
         return;
     }
 
-    GLboolean prev_depth_mask = GL_TRUE;
-    glGetBooleanv(GL_DEPTH_WRITEMASK, &prev_depth_mask);
     glDepthMask(GL_FALSE);
     glBindVertexArray(sys->gl_vao);
     glBindBuffer(GL_ARRAY_BUFFER, sys->gl_vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 (GLsizeiptr)(sys->gl_quad_cap * 4u * sizeof(we_particle_vertex_t)), NULL,
+                 GL_DYNAMIC_DRAW);
     glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(draw_verts * sizeof(we_particle_vertex_t)),
                     verts);
     glDrawElements(GL_TRIANGLES, (GLsizei)(draw_quads * 6u), GL_UNSIGNED_INT, (const void *)0);
-    glDepthMask(prev_depth_mask);
+    glDepthMask(GL_TRUE);
 }
 
 void we_particle_destroy(we_particle_sys_t *sys)

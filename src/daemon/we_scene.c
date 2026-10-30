@@ -576,6 +576,8 @@ bool we_scene_init_gl(we_scene_t *scene, dmabuf_context_t *dmabuf_ctx)
                      (GLsizei)scene->album_art_h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                      scene->album_art_rgba);
         scene->tex_album_art = (uint32_t)atex;
+        free(scene->album_art_rgba);
+        scene->album_art_rgba = NULL;
     }
 
     /* Upload all scene object textures, puppet meshes, particle buffers, and compile shaders */
@@ -868,9 +870,9 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
 
         if (s == 0 && prev_tex != 0) {
             tex_id = prev_tex;
-            if (obj && obj->ping_w > 0 && obj->ping_h > 0) {
-                res[0] = (float)obj->ping_w;
-                res[1] = (float)obj->ping_h;
+            if (scene && scene->shared_obj_ping_w > 0 && scene->shared_obj_ping_h > 0) {
+                res[0] = (float)scene->shared_obj_ping_w;
+                res[1] = (float)scene->shared_obj_ping_h;
                 res[2] = res[0];
                 res[3] = res[1];
             }
@@ -2210,21 +2212,54 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                 pw = sw;
                 ph = sh;
             }
-            ensure_fbo_pair(&obj->ping_fbo[0], &obj->ping_tex[0], &obj->ping_w, &obj->ping_h, pw,
-                            ph);
-            uint32_t dummy_w = obj->ping_w, dummy_h = obj->ping_h;
-            if (!obj->ping_fbo[1]) {
-                dummy_w = 0;
+            int pool_slot = -1;
+            for (int ps = 0; ps < 4; ps++) {
+                if (scene->shared_obj_ping_pool[ps].w == pw &&
+                    scene->shared_obj_ping_pool[ps].h == ph &&
+                    scene->shared_obj_ping_pool[ps].fbo[0] != 0 &&
+                    scene->shared_obj_ping_pool[ps].fbo[1] != 0) {
+                    pool_slot = ps;
+                    break;
+                }
+                if (pool_slot < 0 && scene->shared_obj_ping_pool[ps].fbo[0] == 0) {
+                    pool_slot = ps;
+                }
             }
-            ensure_fbo_pair(&obj->ping_fbo[1], &obj->ping_tex[1], &dummy_w, &dummy_h, pw, ph);
+            if (pool_slot < 0) {
+                pool_slot = 0;
+            }
+            uint32_t p0_w = scene->shared_obj_ping_pool[pool_slot].fbo[0]
+                                ? scene->shared_obj_ping_pool[pool_slot].w
+                                : 0;
+            uint32_t p0_h = scene->shared_obj_ping_pool[pool_slot].fbo[0]
+                                ? scene->shared_obj_ping_pool[pool_slot].h
+                                : 0;
+            uint32_t p1_w = scene->shared_obj_ping_pool[pool_slot].fbo[1]
+                                ? scene->shared_obj_ping_pool[pool_slot].w
+                                : 0;
+            uint32_t p1_h = scene->shared_obj_ping_pool[pool_slot].fbo[1]
+                                ? scene->shared_obj_ping_pool[pool_slot].h
+                                : 0;
+            ensure_fbo_pair(&scene->shared_obj_ping_pool[pool_slot].fbo[0],
+                            &scene->shared_obj_ping_pool[pool_slot].tex[0], &p0_w, &p0_h, pw, ph);
+            ensure_fbo_pair(&scene->shared_obj_ping_pool[pool_slot].fbo[1],
+                            &scene->shared_obj_ping_pool[pool_slot].tex[1], &p1_w, &p1_h, pw, ph);
+            scene->shared_obj_ping_pool[pool_slot].w = pw;
+            scene->shared_obj_ping_pool[pool_slot].h = ph;
+            scene->shared_obj_ping_fbo[0] = scene->shared_obj_ping_pool[pool_slot].fbo[0];
+            scene->shared_obj_ping_fbo[1] = scene->shared_obj_ping_pool[pool_slot].fbo[1];
+            scene->shared_obj_ping_tex[0] = scene->shared_obj_ping_pool[pool_slot].tex[0];
+            scene->shared_obj_ping_tex[1] = scene->shared_obj_ping_pool[pool_slot].tex[1];
+            scene->shared_obj_ping_w = pw;
+            scene->shared_obj_ping_h = ph;
 
             uint32_t cur_idx = 0;
             float ident[16];
             mat4_identity(ident);
 
-            /* Seed ping_fbo[0] by drawing obj->base_pass so compressed S3TC/BC7 textures,
-             * swizzles, and spritesheets render cleanly into ping_fbo[0] */
-            glBindFramebuffer(GL_FRAMEBUFFER, obj->ping_fbo[0]);
+            /* Seed shared_obj_ping_fbo[0] by drawing obj->base_pass so compressed S3TC/BC7
+             * textures, swizzles, and spritesheets render cleanly into shared_obj_ping_fbo[0] */
+            glBindFramebuffer(GL_FRAMEBUFFER, scene->shared_obj_ping_fbo[0]);
             glViewport(0, 0, (GLsizei)pw, (GLsizei)ph);
             glDisable(GL_BLEND);
             glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -2244,7 +2279,7 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                                    ph, norm_w, norm_h, params);
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
             }
-            GLuint cur_tex = obj->ping_tex[0];
+            GLuint cur_tex = scene->shared_obj_ping_tex[0];
 
             for (uint32_t e = 0; e < obj->effect_count; e++) {
                 we_effect_t *eff = &obj->effects[e];
@@ -2262,7 +2297,7 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                     we_material_pass_t *ep = &eff->passes[p];
                     if (strcasecmp(ep->command, "swap") == 0) {
                         cur_idx ^= 1u;
-                        cur_tex = obj->ping_tex[cur_idx];
+                        cur_tex = scene->shared_obj_ping_tex[cur_idx];
                         continue;
                     }
                     if (strcasecmp(ep->command, "copy") == 0) {
@@ -2279,7 +2314,8 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                                 dst_rt = get_or_create_scene_rt_fbo(scene, ep->target_fbo, pw, ph);
                             }
                             if (dst_rt && dst_rt->gl_fbo) {
-                                glBindFramebuffer(GL_READ_FRAMEBUFFER, obj->ping_fbo[cur_idx]);
+                                glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                                  scene->shared_obj_ping_fbo[cur_idx]);
                                 glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_rt->gl_fbo);
                                 glBlitFramebuffer(0, 0, (GLint)pw, (GLint)ph, 0, 0,
                                                   (GLint)dst_rt->width, (GLint)dst_rt->height,
@@ -2293,8 +2329,8 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                     }
 
                     uint32_t next_idx = cur_idx ^ 1u;
-                    GLuint dst_fbo = obj->ping_fbo[next_idx];
-                    GLuint dst_tex = obj->ping_tex[next_idx];
+                    GLuint dst_fbo = scene->shared_obj_ping_fbo[next_idx];
+                    GLuint dst_tex = scene->shared_obj_ping_tex[next_idx];
                     uint32_t dst_w = pw, dst_h = ph;
                     bool wrote_ping = true;
 
@@ -2338,7 +2374,7 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                 snprintf(comp_name, sizeof(comp_name), "_rt_imageLayerComposite_%d_a", obj->id);
                 we_rt_fbo_t *comp_rt = get_or_create_scene_rt_fbo(scene, comp_name, pw, ph);
                 if (comp_rt && comp_rt->gl_fbo) {
-                    glBindFramebuffer(GL_READ_FRAMEBUFFER, obj->ping_fbo[cur_idx]);
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, scene->shared_obj_ping_fbo[cur_idx]);
                     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, comp_rt->gl_fbo);
                     glBlitFramebuffer(0, 0, (GLint)pw, (GLint)ph, 0, 0, (GLint)comp_rt->width,
                                       (GLint)comp_rt->height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
@@ -2374,8 +2410,8 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
 
             static const GLenum k_color_attachment = GL_COLOR_ATTACHMENT0;
             for (int k = 0; k < 2; k++) {
-                if (obj->ping_fbo[k] != 0) {
-                    glBindFramebuffer(GL_FRAMEBUFFER, obj->ping_fbo[k]);
+                if (scene->shared_obj_ping_fbo[k] != 0) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, scene->shared_obj_ping_fbo[k]);
                     glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &k_color_attachment);
                 }
             }
@@ -2400,7 +2436,9 @@ static bool import_scene_bo_tex(we_scene_t *scene, dmabuf_bo_t *bo, GLuint *out_
     }
 
     for (size_t i = 0; i < scene->num_imported_bos; i++) {
-        if (scene->imported_bos[i].bo == bo && scene->imported_bos[i].gl_tex != 0 &&
+        if (scene->imported_bos[i].bo == bo && scene->imported_bos[i].fd == bo->fd[0] &&
+            scene->imported_bos[i].width == bo->width &&
+            scene->imported_bos[i].height == bo->height && scene->imported_bos[i].gl_tex != 0 &&
             scene->imported_bos[i].egl_image != NULL) {
             *out_tex = scene->imported_bos[i].gl_tex;
             return true;
@@ -2540,6 +2578,9 @@ static bool import_scene_bo_tex(we_scene_t *scene, dmabuf_bo_t *bo, GLuint *out_
     }
 
     scene->imported_bos[slot].bo = bo;
+    scene->imported_bos[slot].fd = bo->fd[0];
+    scene->imported_bos[slot].width = bo->width;
+    scene->imported_bos[slot].height = bo->height;
     scene->imported_bos[slot].gl_tex = tex;
     scene->imported_bos[slot].egl_image = img;
     scene->imported_bos[slot].owns_egl = true;
@@ -2547,6 +2588,65 @@ static bool import_scene_bo_tex(we_scene_t *scene, dmabuf_bo_t *bo, GLuint *out_
         scene->num_imported_bos++;
     }
     *out_tex = tex;
+    return true;
+}
+
+bool we_scene_blit_last_frame(we_scene_t *scene, dmabuf_bo_t *target_bo)
+{
+    if (!scene || !target_bo || target_bo->width == 0 || target_bo->height == 0) {
+        return false;
+    }
+    if (!scene->gl_initialized || scene->scene_fbo_tex == 0 || scene->scene_fbo_w == 0 ||
+        scene->scene_fbo_h == 0) {
+        return false;
+    }
+
+    if (scene->egl_display && scene->egl_context && eglGetCurrentContext() != scene->egl_context) {
+        eglMakeCurrent(scene->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, scene->egl_context);
+    }
+
+    GLuint bo_gl_tex = 0;
+    if (!import_scene_bo_tex(scene, target_bo, &bo_gl_tex) || bo_gl_tex == 0) {
+        return false;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, scene->target_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, bo_gl_tex, 0);
+    glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
+    glDisable(GL_BLEND);
+
+    glUseProgram(scene->prog_present);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, scene->scene_fbo_tex);
+    if (scene->present_u_tex_loc >= 0) {
+        glUniform1i(scene->present_u_tex_loc, 0);
+    }
+    glBindVertexArray(scene->quad_vao);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glBindVertexArray(0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    ensure_egl_procs(scene);
+    PFNEGLCREATESYNCKHRPROC create_sync =
+        __extension__(PFNEGLCREATESYNCKHRPROC) scene->fn_eglCreateSyncKHR;
+    PFNEGLCLIENTWAITSYNCKHRPROC wait_sync =
+        __extension__(PFNEGLCLIENTWAITSYNCKHRPROC) scene->fn_eglClientWaitSyncKHR;
+    PFNEGLDESTROYSYNCKHRPROC destroy_sync =
+        __extension__(PFNEGLDESTROYSYNCKHRPROC) scene->fn_eglDestroySyncKHR;
+
+    if (create_sync && wait_sync && destroy_sync && scene->egl_display != EGL_NO_DISPLAY) {
+        EGLSyncKHR sync = create_sync(scene->egl_display, EGL_SYNC_FENCE_KHR, NULL);
+        if (sync != EGL_NO_SYNC_KHR) {
+            wait_sync(scene->egl_display, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 100000000ULL);
+            destroy_sync(scene->egl_display, sync);
+        } else {
+            glFinish();
+        }
+    } else {
+        glFinish();
+    }
+
     return true;
 }
 
@@ -2570,48 +2670,7 @@ bool we_scene_render_frame(we_scene_t *scene, dmabuf_bo_t *target_bo,
     }
 
     render_scene_to_fbo(scene, target_bo->width, target_bo->height, params);
-
-    /* Blit scene_fbo_tex into bo_gl_tex with opaque alpha 1.0 so transparent shaders do not render
-     * black on Wayland */
-    glBindFramebuffer(GL_FRAMEBUFFER, scene->target_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, bo_gl_tex, 0);
-    glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
-    glDisable(GL_BLEND);
-
-    glUseProgram(scene->prog_present);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, scene->scene_fbo_tex);
-    if (scene->present_u_tex_loc >= 0) {
-        glUniform1i(scene->present_u_tex_loc, 0);
-    }
-    glBindVertexArray(scene->quad_vao);
-    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-    glBindVertexArray(0);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    /* Synchronize GPU completion before returning the DMA-BUF to Wayland */
-    ensure_egl_procs(scene);
-    PFNEGLCREATESYNCKHRPROC create_sync =
-        __extension__(PFNEGLCREATESYNCKHRPROC) scene->fn_eglCreateSyncKHR;
-    PFNEGLCLIENTWAITSYNCKHRPROC wait_sync =
-        __extension__(PFNEGLCLIENTWAITSYNCKHRPROC) scene->fn_eglClientWaitSyncKHR;
-    PFNEGLDESTROYSYNCKHRPROC destroy_sync =
-        __extension__(PFNEGLDESTROYSYNCKHRPROC) scene->fn_eglDestroySyncKHR;
-
-    if (create_sync && wait_sync && destroy_sync && scene->egl_display != EGL_NO_DISPLAY) {
-        EGLSyncKHR sync = create_sync(scene->egl_display, EGL_SYNC_FENCE_KHR, NULL);
-        if (sync != EGL_NO_SYNC_KHR) {
-            wait_sync(scene->egl_display, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 100000000ULL);
-            destroy_sync(scene->egl_display, sync);
-        } else {
-            glFinish();
-        }
-    } else {
-        glFinish();
-    }
-
-    return true;
+    return we_scene_blit_last_frame(scene, target_bo);
 }
 
 static void cpu_blend_pixel(uint8_t *dp, float sr, float sg, float sb, float sa,
@@ -3356,16 +3415,6 @@ void we_scene_destroy(we_scene_t *scene)
                 }
                 free(obj->effects);
             }
-            if (scene->gl_initialized) {
-                for (int k = 0; k < 2; k++) {
-                    if (obj->ping_fbo[k]) {
-                        glDeleteFramebuffers(1, &obj->ping_fbo[k]);
-                    }
-                    if (obj->ping_tex[k]) {
-                        glDeleteTextures(1, &obj->ping_tex[k]);
-                    }
-                }
-            }
         }
         free(scene->objects);
     }
@@ -3411,6 +3460,22 @@ void we_scene_destroy(we_scene_t *scene)
         if (scene->full_fb_tex) {
             glDeleteTextures(1, &scene->full_fb_tex);
         }
+        for (int ps = 0; ps < 4; ps++) {
+            for (int k = 0; k < 2; k++) {
+                if (scene->shared_obj_ping_pool[ps].fbo[k]) {
+                    glDeleteFramebuffers(1, &scene->shared_obj_ping_pool[ps].fbo[k]);
+                    scene->shared_obj_ping_pool[ps].fbo[k] = 0;
+                }
+                if (scene->shared_obj_ping_pool[ps].tex[k]) {
+                    glDeleteTextures(1, &scene->shared_obj_ping_pool[ps].tex[k]);
+                    scene->shared_obj_ping_pool[ps].tex[k] = 0;
+                }
+            }
+        }
+        scene->shared_obj_ping_fbo[0] = 0;
+        scene->shared_obj_ping_fbo[1] = 0;
+        scene->shared_obj_ping_tex[0] = 0;
+        scene->shared_obj_ping_tex[1] = 0;
         if (scene->target_fbo) {
             glDeleteFramebuffers(1, &scene->target_fbo);
         }
@@ -3467,7 +3532,8 @@ void we_scene_destroy(we_scene_t *scene)
     free(scene);
 }
 
-void we_scene_set_album_art(we_scene_t *scene, const uint8_t *rgba, uint32_t w, uint32_t h)
+static void we_scene_set_album_art_internal(we_scene_t *scene, const uint8_t *pixels, uint32_t w,
+                                            uint32_t h, bool is_bgra)
 {
     if (!scene) {
         return;
@@ -3477,16 +3543,6 @@ void we_scene_set_album_art(we_scene_t *scene, const uint8_t *rgba, uint32_t w, 
     scene->album_art_w = 0;
     scene->album_art_h = 0;
 
-    if (rgba && w > 0 && h > 0) {
-        size_t sz = (size_t)w * (size_t)h * 4u;
-        scene->album_art_rgba = (uint8_t *)malloc(sz);
-        if (scene->album_art_rgba) {
-            memcpy(scene->album_art_rgba, rgba, sz);
-            scene->album_art_w = w;
-            scene->album_art_h = h;
-        }
-    }
-
     if (scene->gl_initialized && scene->egl_display && scene->egl_context) {
         if (eglGetCurrentContext() != scene->egl_context) {
             eglMakeCurrent(scene->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, scene->egl_context);
@@ -3495,7 +3551,7 @@ void we_scene_set_album_art(we_scene_t *scene, const uint8_t *rgba, uint32_t w, 
             glDeleteTextures(1, &scene->tex_album_art);
             scene->tex_album_art = 0;
         }
-        if (scene->album_art_rgba && scene->album_art_w > 0 && scene->album_art_h > 0) {
+        if (pixels && w > 0 && h > 0) {
             GLuint atex = 0;
             glGenTextures(1, &atex);
             glBindTexture(GL_TEXTURE_2D, atex);
@@ -3503,37 +3559,48 @@ void we_scene_set_album_art(we_scene_t *scene, const uint8_t *rgba, uint32_t w, 
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            if (is_bgra) {
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+            }
             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)scene->album_art_w,
-                         (GLsizei)scene->album_art_h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                         scene->album_art_rgba);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, pixels);
             scene->tex_album_art = (uint32_t)atex;
+            scene->album_art_w = w;
+            scene->album_art_h = h;
+        }
+        return;
+    }
+
+    if (pixels && w > 0 && h > 0) {
+        size_t npx = (size_t)w * (size_t)h;
+        scene->album_art_rgba = (uint8_t *)malloc(npx * 4u);
+        if (scene->album_art_rgba) {
+            if (is_bgra) {
+                for (size_t i = 0; i < npx; ++i) {
+                    scene->album_art_rgba[i * 4u + 0u] = pixels[i * 4u + 2u];
+                    scene->album_art_rgba[i * 4u + 1u] = pixels[i * 4u + 1u];
+                    scene->album_art_rgba[i * 4u + 2u] = pixels[i * 4u + 0u];
+                    scene->album_art_rgba[i * 4u + 3u] = pixels[i * 4u + 3u];
+                }
+            } else {
+                memcpy(scene->album_art_rgba, pixels, npx * 4u);
+            }
+            scene->album_art_w = w;
+            scene->album_art_h = h;
         }
     }
 }
 
+void we_scene_set_album_art(we_scene_t *scene, const uint8_t *rgba, uint32_t w, uint32_t h)
+{
+    we_scene_set_album_art_internal(scene, rgba, w, h, false);
+}
+
 void we_scene_set_album_art_bgra(we_scene_t *scene, const uint8_t *bgra, uint32_t w, uint32_t h)
 {
-    if (!scene) {
-        return;
-    }
-    if (!bgra || w == 0 || h == 0) {
-        we_scene_set_album_art(scene, NULL, 0, 0);
-        return;
-    }
-    size_t npx = (size_t)w * (size_t)h;
-    uint8_t *rgba = (uint8_t *)malloc(npx * 4u);
-    if (!rgba) {
-        return;
-    }
-    for (size_t i = 0; i < npx; ++i) {
-        rgba[i * 4u + 0u] = bgra[i * 4u + 2u];
-        rgba[i * 4u + 1u] = bgra[i * 4u + 1u];
-        rgba[i * 4u + 2u] = bgra[i * 4u + 0u];
-        rgba[i * 4u + 3u] = bgra[i * 4u + 3u];
-    }
-    we_scene_set_album_art(scene, rgba, w, h);
-    free(rgba);
+    we_scene_set_album_art_internal(scene, bgra, w, h, true);
 }
 
 void we_scene_set_media_playing(we_scene_t *scene, float playing)

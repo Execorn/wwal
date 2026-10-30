@@ -215,12 +215,6 @@ typedef struct we_scene_object {
     we_effect_t *effects;
     uint32_t effect_count;
 
-    /* Ping-pong FBO pair for object effect chain */
-    uint32_t ping_fbo[2];
-    uint32_t ping_tex[2];
-    uint32_t ping_w;
-    uint32_t ping_h;
-
     /* Puppet Warp .mdl skeletal mesh, SIMD Particle System, and SceneScripts */
     we_puppet_t *puppet;
     we_particle_sys_t *particle_sys;
@@ -327,6 +321,17 @@ typedef struct we_scene {
     uint32_t full_fb_w;
     uint32_t full_fb_h;
 
+    struct {
+        uint32_t fbo[2];
+        uint32_t tex[2];
+        uint32_t w;
+        uint32_t h;
+    } shared_obj_ping_pool[4];
+    uint32_t shared_obj_ping_fbo[2];
+    uint32_t shared_obj_ping_tex[2];
+    uint32_t shared_obj_ping_w;
+    uint32_t shared_obj_ping_h;
+
     /* Built-in utility textures */
     uint32_t tex_util_white;
     uint32_t tex_util_black;
@@ -359,6 +364,9 @@ typedef struct we_scene {
     /* Imported DMA-BUF BO cache (for waywal_we_scene_forget_bo) */
     struct {
         const dmabuf_bo_t *bo;
+        int fd;
+        uint32_t width;
+        uint32_t height;
         uint32_t gl_tex;
         void *egl_image;
         bool owns_egl;
@@ -407,6 +415,7 @@ we_scene_t *we_scene_create(dmabuf_context_t *dmabuf_ctx, const char *workshop_d
  * target_bo */
 bool we_scene_render_frame(we_scene_t *scene, dmabuf_bo_t *target_bo,
                            const waywal_shader_frame_params_t *params);
+bool we_scene_blit_last_frame(we_scene_t *scene, dmabuf_bo_t *target_bo);
 
 /* Renders one frame of the scene graph and reads back RGBA8 pixels (works both with GLES 3.1
  * and with software CPU fallback when GL is unavailable in headless unit tests) */
@@ -432,7 +441,8 @@ size_t we_scene_step_audio(we_scene_t *scene, float dt_sec);
 /* Rasterizes a "text" object's string into its base_pass texture (CPU + GLES) */
 void we_scene_update_text_texture(we_scene_t *scene, we_scene_object_t *obj);
 
-/* Decodes a RIFF/WAV (or compressed audio) buffer in memory to 48000 Hz stereo interleaved float32 */
+/* Decodes a RIFF/WAV (or compressed audio) buffer in memory to 48000 Hz stereo interleaved float32
+ */
 bool we_audio_decode_memory(const uint8_t *data, size_t size, float **out_stereo_f32,
                             size_t *out_frame_count);
 bool we_audio_decode_wav_memory(const uint8_t *data, size_t size, float **out_stereo_f32,

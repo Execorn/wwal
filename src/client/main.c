@@ -224,7 +224,7 @@ static bool extract_palette_from_bgra(const uint8_t *bgra_pixels, uint32_t width
                                       const waywal_config_t *cfg, const char *wallpaper_path,
                                       waywal_palette_t *out_pal)
 {
-    if (!bgra_pixels || width == 0 || height == 0 || !out_pal)
+    if (!out_pal)
         return false;
 
     waywal_scheme_variant_t variant =
@@ -241,6 +241,14 @@ static bool extract_palette_from_bgra(const uint8_t *bgra_pixels, uint32_t width
     } else if (cfg && cfg->theme.has_seed_color) {
         has_seed = true;
         seed_rgb = cfg->theme.seed_color;
+    }
+    static const uint8_t dummy_bgra[4] = {0, 0, 0, 255};
+    if (!bgra_pixels || width == 0 || height == 0) {
+        if (!has_seed)
+            return false;
+        bgra_pixels = dummy_bgra;
+        width = 1;
+        height = 1;
     }
     if (!waywal_palette_extract_seed_ex(bgra_pixels, width, height, width * 4U, true, mode, variant,
                                         contrast, src_idx, has_seed, seed_rgb, out_pal)) {
@@ -984,16 +992,12 @@ static int handle_cmd_theme(const cli_options_t *opts, const waywal_config_t *cf
     uint8_t *pixels = NULL;
     uint32_t width = 0, height = 0;
     uint8_t dummy_px[4] = {0, 0, 0, 255};
-    if (target_path[0] != '\0') {
+    if (target_path[0] != '\0' && !has_seed_ovr) {
         if (!load_image_or_video_first_frame(target_path, opts->no_cache, &pixels, &width, &height,
                                              cfg ? &cfg->solar : NULL)) {
-            if (!has_seed_ovr) {
-                fprintf(stderr, "Error: Failed to decode media '%s' for theme extraction\n",
-                        target_path);
-                return 1;
-            }
-            width = 1;
-            height = 1;
+            fprintf(stderr, "Error: Failed to decode media '%s' for theme extraction\n",
+                    target_path);
+            return 1;
         }
     } else {
         width = 1;
@@ -2331,28 +2335,36 @@ int main(int argc, char *argv[])
         }
 
         if ((opts.extract_theme || opts.has_seed_color || cfg.theme.enabled) && !opts.no_theme) {
-            char prev_path[4600];
-            uint8_t *px = NULL;
-            uint32_t pw = 0, ph = 0;
-            bool loaded_prev =
-                (we_workshop_find_preview_file(resolved_dir, prev_path, sizeof(prev_path)) &&
-                 image_load(prev_path, &px, &pw, &ph) && px && pw > 0 && ph > 0);
-            if (!loaded_prev) {
-                loaded_prev = (load_image_or_video_first_frame(resolved_dir, opts.no_cache, &px,
-                                                               &pw, &ph, &cfg.solar) &&
-                               px && pw > 0 && ph > 0);
-            }
-            if (loaded_prev) {
-                waywal_theme_mode_t tmode =
-                    opts.theme_light_mode ? WAYWAL_THEME_LIGHT : WAYWAL_THEME_DARK;
-                waywal_palette_t pal;
-                if (extract_palette_from_bgra(px, pw, ph, tmode, &opts, &cfg, resolved_dir, &pal)) {
+            waywal_theme_mode_t tmode =
+                opts.theme_light_mode ? WAYWAL_THEME_LIGHT : WAYWAL_THEME_DARK;
+            waywal_palette_t pal;
+            if (opts.has_seed_color || cfg.theme.has_seed_color) {
+                if (extract_palette_from_bgra(NULL, 0, 0, tmode, &opts, &cfg, resolved_dir, &pal)) {
                     apply_extracted_palette_client(&pal, &opts, &cfg);
                     workshop_theme_applied = true;
                 }
-            }
-            if (px) {
-                image_free(px);
+            } else {
+                char prev_path[4600];
+                uint8_t *px = NULL;
+                uint32_t pw = 0, ph = 0;
+                bool loaded_prev =
+                    (we_workshop_find_preview_file(resolved_dir, prev_path, sizeof(prev_path)) &&
+                     image_load(prev_path, &px, &pw, &ph) && px && pw > 0 && ph > 0);
+                if (!loaded_prev) {
+                    loaded_prev = (load_image_or_video_first_frame(resolved_dir, opts.no_cache, &px,
+                                                                   &pw, &ph, &cfg.solar) &&
+                                   px && pw > 0 && ph > 0);
+                }
+                if (loaded_prev) {
+                    if (extract_palette_from_bgra(px, pw, ph, tmode, &opts, &cfg, resolved_dir,
+                                                  &pal)) {
+                        apply_extracted_palette_client(&pal, &opts, &cfg);
+                        workshop_theme_applied = true;
+                    }
+                }
+                if (px) {
+                    image_free(px);
+                }
             }
         }
 
@@ -2432,13 +2444,11 @@ int main(int argc, char *argv[])
     if (opts.cmd == CLI_CMD_VIDEO) {
         uint32_t max_w = 2560, max_h = 1440;
         query_max_target_resolution(&opts, &max_w, &max_h);
-        bool is_gif = is_gif_file(opts.filepath);
-        if (!is_gif) {
-            if (max_w < 3840U)
-                max_w = 3840U;
-            if (max_h < 2160U)
-                max_h = 2160U;
+        if (max_w == 0 || max_h == 0) {
+            max_w = 2560;
+            max_h = 1440;
         }
+        bool is_gif = is_gif_file(opts.filepath);
         bool vid_ok = false;
         if (opts.no_cache) {
             if (!is_gif) {
@@ -2503,21 +2513,28 @@ int main(int argc, char *argv[])
             if (!workshop_theme_applied &&
                 (opts.extract_theme || opts.has_seed_color || cfg.theme.enabled) &&
                 !opts.no_theme) {
-                uint8_t *vpx = NULL;
-                uint32_t vpw = 0, vph = 0;
-                if (load_image_or_video_first_frame(opts.filepath, opts.no_cache, &vpx, &vpw, &vph,
-                                                    &cfg.solar) &&
-                    vpx && vpw > 0 && vph > 0) {
-                    waywal_theme_mode_t tmode =
-                        opts.theme_light_mode ? WAYWAL_THEME_LIGHT : WAYWAL_THEME_DARK;
-                    waywal_palette_t pal;
-                    if (extract_palette_from_bgra(vpx, vpw, vph, tmode, &opts, &cfg, opts.filepath,
+                waywal_theme_mode_t tmode =
+                    opts.theme_light_mode ? WAYWAL_THEME_LIGHT : WAYWAL_THEME_DARK;
+                waywal_palette_t pal;
+                if (opts.has_seed_color || cfg.theme.has_seed_color) {
+                    if (extract_palette_from_bgra(NULL, 0, 0, tmode, &opts, &cfg, opts.filepath,
                                                   &pal)) {
                         apply_extracted_palette_client(&pal, &opts, &cfg);
                     }
-                }
-                if (vpx) {
-                    image_free(vpx);
+                } else {
+                    uint8_t *vpx = NULL;
+                    uint32_t vpw = 0, vph = 0;
+                    if (load_image_or_video_first_frame(opts.filepath, opts.no_cache, &vpx, &vpw,
+                                                        &vph, &cfg.solar) &&
+                        vpx && vpw > 0 && vph > 0) {
+                        if (extract_palette_from_bgra(vpx, vpw, vph, tmode, &opts, &cfg,
+                                                      opts.filepath, &pal)) {
+                            apply_extracted_palette_client(&pal, &opts, &cfg);
+                        }
+                    }
+                    if (vpx) {
+                        image_free(vpx);
+                    }
                 }
             }
         }
@@ -2550,19 +2567,26 @@ int main(int argc, char *argv[])
             (void)ensure_shader_thumbnail_png(opts.filepath, false, sthumb, sizeof(sthumb));
         }
         if ((opts.extract_theme || opts.has_seed_color || cfg.theme.enabled) && !opts.no_theme) {
-            uint8_t *spx = NULL;
-            uint32_t spw = 0, sph = 0;
-            if (load_image_or_video_first_frame(opts.filepath, opts.no_cache, &spx, &spw, &sph,
-                                                &cfg.solar) &&
-                spx && spw > 0 && sph > 0) {
-                waywal_theme_mode_t tmode =
-                    opts.theme_light_mode ? WAYWAL_THEME_LIGHT : WAYWAL_THEME_DARK;
-                waywal_palette_t pal;
-                if (extract_palette_from_bgra(spx, spw, sph, tmode, &opts, &cfg, opts.filepath,
+            waywal_theme_mode_t tmode =
+                opts.theme_light_mode ? WAYWAL_THEME_LIGHT : WAYWAL_THEME_DARK;
+            waywal_palette_t pal;
+            if (opts.has_seed_color || cfg.theme.has_seed_color) {
+                if (extract_palette_from_bgra(NULL, 0, 0, tmode, &opts, &cfg, opts.filepath,
                                               &pal)) {
                     apply_extracted_palette_client(&pal, &opts, &cfg);
                 }
-                image_free(spx);
+            } else {
+                uint8_t *spx = NULL;
+                uint32_t spw = 0, sph = 0;
+                if (load_image_or_video_first_frame(opts.filepath, opts.no_cache, &spx, &spw, &sph,
+                                                    &cfg.solar) &&
+                    spx && spw > 0 && sph > 0) {
+                    if (extract_palette_from_bgra(spx, spw, sph, tmode, &opts, &cfg, opts.filepath,
+                                                  &pal)) {
+                        apply_extracted_palette_client(&pal, &opts, &cfg);
+                    }
+                    image_free(spx);
+                }
             }
         }
     }
@@ -2707,9 +2731,10 @@ int main(int argc, char *argv[])
                 opts.clear_color.r,
                 255U,
             };
-            const uint8_t *theme_px = opts.is_solid_color ? solid_theme_px : img_pixels;
-            uint32_t theme_w = opts.is_solid_color ? 1U : img_width;
-            uint32_t theme_h = opts.is_solid_color ? 1U : img_height;
+            const uint8_t *theme_px =
+                opts.has_seed_color ? NULL : (opts.is_solid_color ? solid_theme_px : img_pixels);
+            uint32_t theme_w = opts.has_seed_color ? 0U : (opts.is_solid_color ? 1U : img_width);
+            uint32_t theme_h = opts.has_seed_color ? 0U : (opts.is_solid_color ? 1U : img_height);
             if (extract_palette_from_bgra(theme_px, theme_w, theme_h, tmode, &opts, &cfg, wp_path,
                                           &pal)) {
                 apply_extracted_palette_client(&pal, &opts, &cfg);

@@ -615,6 +615,15 @@ bool waywal_render_shader_preview_bgra(const char *shader_path, uint8_t *out_bgr
     return true;
 }
 
+static bool save_preview_png_capped(const char *png_path, const uint8_t *bgra_pixels,
+                                    uint32_t width, uint32_t height)
+{
+    if (!png_path || !bgra_pixels || width == 0 || height == 0) {
+        return false;
+    }
+    return image_save_png_bgra(png_path, bgra_pixels, width, height);
+}
+
 static bool is_valid_swww_output_name(const char *name)
 {
     if (!name || name[0] == '\0' || strcmp(name, "*") == 0 || strcmp(name, "unknown") == 0 ||
@@ -690,7 +699,7 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
     }
 
     if (!png_written && bgra_pixels && width > 0 && height > 0) {
-        png_written = image_save_png_bgra(png_path, bgra_pixels, width, height);
+        png_written = save_preview_png_capped(png_path, bgra_pixels, width, height);
     }
 
     if (!png_written && abs_media[0] != '\0') {
@@ -703,7 +712,7 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
                     png_written = copy_file_atomic(ws_preview, png_path);
                 }
                 if (!png_written) {
-                    png_written = image_save_png_bgra(png_path, px, pw, ph);
+                    png_written = save_preview_png_capped(png_path, px, pw, ph);
                 }
             }
             if (px) {
@@ -764,7 +773,7 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
                     png_written = copy_file_atomic(abs_media, png_path);
                 }
                 if (!png_written) {
-                    png_written = image_save_png_bgra(png_path, px, pw, ph);
+                    png_written = save_preview_png_capped(png_path, px, pw, ph);
                 }
             }
             if (px) {

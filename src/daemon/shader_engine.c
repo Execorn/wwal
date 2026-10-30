@@ -20,9 +20,13 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/inotify.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 // clang-format off
 #include <GLES3/gl31.h>
 #include <GLES2/gl2ext.h>
@@ -30,6 +34,7 @@
 
 #define SHADER_CACHE_MAGIC         0x57534842u /* "WSHB" */
 #define SHADER_NUM_PASSES          5           /* 0..3 = BUFFER_A..D, 4 = IMAGE */
+#define SHADER_PASS_IMAGE          4
 #define SHADER_NOISE_DIM           256u
 #define SHADER_MAX_CUSTOM_UNIFORMS 64
 
@@ -143,6 +148,7 @@ struct waywal_shader_engine {
     shader_pass_t passes[SHADER_NUM_PASSES];
     GLuint audio_tex;
     bool audio_tex_dirty;
+    bool audio_tex_all_zero;
     GLuint noise_tex;
     GLuint wallpaper_tex;
     uint32_t wallpaper_w;
@@ -760,6 +766,38 @@ static void apply_parsed_channel_binding(shader_pass_t passes[SHADER_NUM_PASSES]
     }
 }
 
+static void parse_value_pass_prefix(const char **val_str, size_t *val_len, int *target_pass)
+{
+    const char *s = *val_str;
+    size_t len = *val_len;
+    if (len > 6 && strncasecmp(s, "image", 5) == 0 && (s[5] == ':' || s[5] == '=')) {
+        *target_pass = SHADER_PASS_IMAGE;
+        s += 6;
+        len -= 6;
+    } else if (len > 8 && strncasecmp(s, "buffer", 6) == 0) {
+        if ((s[6] == 'a' || s[6] == 'A' || s[6] == 'b' || s[6] == 'B' || s[6] == 'c' ||
+             s[6] == 'C' || s[6] == 'd' || s[6] == 'D') &&
+            (s[7] == ':' || s[7] == '=')) {
+            *target_pass = tolower((unsigned char)s[6]) - 'a';
+            s += 8;
+            len -= 8;
+        } else if (len > 9 && s[6] == '_' &&
+                   (s[7] == 'a' || s[7] == 'A' || s[7] == 'b' || s[7] == 'B' || s[7] == 'c' ||
+                    s[7] == 'C' || s[7] == 'd' || s[7] == 'D') &&
+                   (s[8] == ':' || s[8] == '=')) {
+            *target_pass = tolower((unsigned char)s[7]) - 'a';
+            s += 9;
+            len -= 9;
+        }
+    }
+    while (len > 0 && (s[0] == ' ' || s[0] == '\t')) {
+        s++;
+        len--;
+    }
+    *val_str = s;
+    *val_len = len;
+}
+
 static void apply_parsed_buffer_scale(shader_pass_t passes[SHADER_NUM_PASSES], int target_pass,
                                       const char *val_str, size_t val_len)
 {
@@ -768,6 +806,7 @@ static void apply_parsed_buffer_scale(shader_pass_t passes[SHADER_NUM_PASSES], i
         val_str++;
         val_len--;
     }
+    parse_value_pass_prefix(&val_str, &val_len, &target_pass);
     if (val_len == 0) {
         return;
     }
@@ -780,14 +819,26 @@ static void apply_parsed_buffer_scale(shader_pass_t passes[SHADER_NUM_PASSES], i
     if (endp == buf || !isfinite(sc) || sc <= 0.0f) {
         return;
     }
-    if (sc < 0.125f) {
-        sc = 0.125f;
-    } else if (sc > 1.0f) {
-        sc = 1.0f;
-    }
-    if (target_pass >= 0 && target_pass < 4) {
+    if (target_pass == SHADER_PASS_IMAGE) {
+        if (sc < 0.25f) {
+            sc = 0.25f;
+        } else if (sc > 1.0f) {
+            sc = 1.0f;
+        }
+        passes[SHADER_PASS_IMAGE].res_scale = sc;
+    } else if (target_pass >= 0 && target_pass < 4) {
+        if (sc < 0.125f) {
+            sc = 0.125f;
+        } else if (sc > 1.0f) {
+            sc = 1.0f;
+        }
         passes[target_pass].res_scale = sc;
     } else {
+        if (sc < 0.125f) {
+            sc = 0.125f;
+        } else if (sc > 1.0f) {
+            sc = 1.0f;
+        }
         for (int p = 0; p < 4; ++p) {
             passes[p].res_scale = sc;
         }
@@ -802,6 +853,7 @@ static void apply_parsed_buffer_fps(shader_pass_t passes[SHADER_NUM_PASSES], int
         val_str++;
         val_len--;
     }
+    parse_value_pass_prefix(&val_str, &val_len, &target_pass);
     if (val_len == 0) {
         return;
     }
@@ -817,7 +869,9 @@ static void apply_parsed_buffer_fps(shader_pass_t passes[SHADER_NUM_PASSES], int
     if (fps > 1000) {
         fps = 1000;
     }
-    if (target_pass >= 0 && target_pass < 4) {
+    if (target_pass == SHADER_PASS_IMAGE) {
+        passes[SHADER_PASS_IMAGE].target_fps = (uint32_t)fps;
+    } else if (target_pass >= 0 && target_pass < 4) {
         passes[target_pass].target_fps = (uint32_t)fps;
     } else {
         for (int p = 0; p < 4; ++p) {
@@ -918,8 +972,9 @@ static void parse_shader_channel_directives(const char *user_src,
                     target_pass = 3;
                     s += 9;
                     slen -= 9;
-                } else if (slen > 6 && strncasecmp(s, "image.", 6) == 0) {
-                    target_pass = 4;
+                } else if (slen > 6 &&
+                           (strncasecmp(s, "image.", 6) == 0 || strncasecmp(s, "image_", 6) == 0)) {
+                    target_pass = SHADER_PASS_IMAGE;
                     s += 6;
                     slen -= 6;
                 }
@@ -942,11 +997,15 @@ static void parse_shader_channel_directives(const char *user_src,
                 } else if (slen >= 12 && strncasecmp(s, "buffer_scale", 12) == 0) {
                     apply_parsed_buffer_scale(passes, target_pass, s + 12, slen - 12);
                 } else if (slen >= 5 && strncasecmp(s, "scale", 5) == 0) {
-                    apply_parsed_buffer_scale(passes, target_pass, s + 5, slen - 5);
+                    apply_parsed_buffer_scale(passes,
+                                              (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE,
+                                              s + 5, slen - 5);
                 } else if (slen >= 10 && strncasecmp(s, "buffer_fps", 10) == 0) {
                     apply_parsed_buffer_fps(passes, target_pass, s + 10, slen - 10);
                 } else if (slen >= 3 && strncasecmp(s, "fps", 3) == 0) {
-                    apply_parsed_buffer_fps(passes, target_pass, s + 3, slen - 3);
+                    apply_parsed_buffer_fps(passes,
+                                            (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE,
+                                            s + 3, slen - 3);
                 }
             } else if (was_comment) {
                 int ch = -1;
@@ -984,16 +1043,33 @@ static void parse_shader_channel_directives(const char *user_src,
                         target_pass = tolower((unsigned char)directive[7]) - 'a';
                         directive += 9;
                         dlen -= 9;
+                    } else if (dlen > 6 && (strncasecmp(directive, "image_", 6) == 0 ||
+                                            strncasecmp(directive, "image.", 6) == 0)) {
+                        target_pass = SHADER_PASS_IMAGE;
+                        directive += 6;
+                        dlen -= 6;
                     }
                     if (dlen >= 12 && strncasecmp(directive, "buffer_scale", 12) == 0) {
                         apply_parsed_buffer_scale(passes, target_pass, directive + 12, dlen - 12);
                     } else if (dlen >= 5 && strncasecmp(directive, "scale", 5) == 0) {
-                        apply_parsed_buffer_scale(passes, target_pass, directive + 5, dlen - 5);
+                        apply_parsed_buffer_scale(
+                            passes, (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE,
+                            directive + 5, dlen - 5);
                     } else if (dlen >= 10 && strncasecmp(directive, "buffer_fps", 10) == 0) {
                         apply_parsed_buffer_fps(passes, target_pass, directive + 10, dlen - 10);
                     } else if (dlen >= 3 && strncasecmp(directive, "fps", 3) == 0) {
-                        apply_parsed_buffer_fps(passes, target_pass, directive + 3, dlen - 3);
+                        apply_parsed_buffer_fps(
+                            passes, (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE,
+                            directive + 3, dlen - 3);
                     }
+                } else if (slen > 6 && strncasecmp(s, "@scale", 6) == 0 &&
+                           (s[6] == ':' || s[6] == '=' || s[6] == ' ' || s[6] == '\t')) {
+                    apply_parsed_buffer_scale(passes, (cur_sec >= 0) ? cur_sec : SHADER_PASS_IMAGE,
+                                              s + 6, slen - 6);
+                } else if (slen > 4 && strncasecmp(s, "@fps", 4) == 0 &&
+                           (s[4] == ':' || s[4] == '=' || s[4] == ' ' || s[4] == '\t')) {
+                    apply_parsed_buffer_fps(passes, (cur_sec >= 0) ? cur_sec : SHADER_PASS_IMAGE,
+                                            s + 4, slen - 4);
                 }
             }
         }
@@ -1259,11 +1335,6 @@ static GLuint create_texture_ex(const uint8_t *pixels, uint32_t w, uint32_t h, G
     return tex;
 }
 
-static GLuint create_rgba_texture(const uint8_t *rgba, uint32_t w, uint32_t h, GLint wrap_mode)
-{
-    return create_texture_ex(rgba, w, h, wrap_mode, false, true);
-}
-
 static GLuint create_r8_depth_texture(const uint8_t *depth_px, uint32_t w, uint32_t h)
 {
     if (!depth_px || w == 0 || h == 0) {
@@ -1343,6 +1414,10 @@ waywal_shader_engine_t *waywal_shader_engine_create(dmabuf_context_t *dmabuf_ctx
     eng->watch_dir_wd = -1;
     eng->loc_blit_swap_rb = -1;
     eng->depth_strength = 1.0f;
+    for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
+        eng->passes[p].res_scale = 1.0f;
+        eng->passes[p].target_fps = 0;
+    }
 
     if (s_shared_egl_refcount > 0 && s_shared_dpy != EGL_NO_DISPLAY &&
         s_shared_ctx != EGL_NO_CONTEXT) {
@@ -1442,6 +1517,7 @@ waywal_shader_engine_t *waywal_shader_engine_create(dmabuf_context_t *dmabuf_ctx
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, WAYWAL_AUDIO_TEX_WIDTH, WAYWAL_AUDIO_TEX_HEIGHT, 0,
                  GL_RED, GL_UNSIGNED_BYTE, zero_tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    eng->audio_tex_all_zero = true;
 
     init_builtin_noise_texture(eng);
     glGenFramebuffers(1, &eng->read_fbo);
@@ -1774,7 +1850,8 @@ static void load_custom_channel_images(waywal_shader_engine_t *eng,
         }
         for (int c = 0; c < 4; ++c) {
             shader_channel_binding_t *b = &passes[p].channels[c];
-            if (b->target != SHADER_CHAN_IMAGE || b->image_path[0] == '\0') {
+            if (b->target != SHADER_CHAN_IMAGE || b->image_path[0] == '\0' ||
+                passes[p].uniforms.iChannel[c] < 0) {
                 continue;
             }
             char resolved[4096];
@@ -1786,13 +1863,7 @@ static void load_custom_channel_images(waywal_shader_engine_t *eng,
             uint8_t *px = NULL;
             uint32_t w = 0, h = 0;
             if (image_load(resolved, &px, &w, &h) && px) {
-                size_t npx = (size_t)w * (size_t)h;
-                for (size_t i = 0; i < npx; ++i) {
-                    uint8_t tmp = px[i * 4 + 0];
-                    px[i * 4 + 0] = px[i * 4 + 2];
-                    px[i * 4 + 2] = tmp;
-                }
-                b->custom_tex = create_rgba_texture(px, w, h, GL_REPEAT);
+                b->custom_tex = create_texture_ex(px, w, h, GL_REPEAT, true, true);
                 b->custom_w = w;
                 b->custom_h = h;
                 image_free(px);
@@ -1927,6 +1998,23 @@ bool waywal_shader_engine_load_source(waywal_shader_engine_t *eng, const char *u
         }
     }
     eng->last_from_cache = all_cached;
+
+    if (!waywal_shader_engine_uses_wallpaper(eng) && eng->wallpaper_tex != 0) {
+        glDeleteTextures(1, &eng->wallpaper_tex);
+        eng->wallpaper_tex = 0;
+        eng->wallpaper_w = 0;
+        eng->wallpaper_h = 0;
+    }
+    if (!waywal_shader_engine_uses_album_art(eng) && eng->album_art_tex != 0) {
+        glDeleteTextures(1, &eng->album_art_tex);
+        eng->album_art_tex = 0;
+        eng->album_art_w = 0;
+        eng->album_art_h = 0;
+    }
+
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
     return true;
 }
 
@@ -2194,6 +2282,13 @@ static bool load_depth_parallax_internal(waywal_shader_engine_t *eng, const uint
     eng->watched_dir[0] = '\0';
     eng->watched_base[0] = '\0';
 
+    if (!waywal_shader_engine_load_source(eng, DEPTH_PARALLAX_POM_SHADER, "builtin_depth_pom")) {
+        return false;
+    }
+    eng->passes[4].channels[0].target = SHADER_CHAN_WALLPAPER;
+    eng->passes[4].channels[1].target = SHADER_CHAN_DEPTH;
+    recompute_engine_feature_flags(eng);
+
     if (is_bgra) {
         waywal_shader_engine_set_wallpaper_bgra(eng, base_px, base_w, base_h);
     } else {
@@ -2207,13 +2302,6 @@ static bool load_depth_parallax_internal(waywal_shader_engine_t *eng, const uint
     eng->depth_tex = create_r8_depth_texture(depth_px, depth_w, depth_h);
     eng->depth_w = depth_w;
     eng->depth_h = depth_h;
-
-    if (!waywal_shader_engine_load_source(eng, DEPTH_PARALLAX_POM_SHADER, "builtin_depth_pom")) {
-        return false;
-    }
-    eng->passes[4].channels[0].target = SHADER_CHAN_WALLPAPER;
-    eng->passes[4].channels[1].target = SHADER_CHAN_DEPTH;
-    recompute_engine_feature_flags(eng);
     return true;
 }
 
@@ -2755,32 +2843,41 @@ static void ensure_blit_resources(waywal_shader_engine_t *eng)
                                     "    vec4 c = texture(u_tex, v_uv);\n"
                                     "    frag_color = (u_swap_rb != 0) ? c.bgra : c;\n"
                                     "}\n";
-        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
-        GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
-        if (vs && fs) {
-            glShaderSource(vs, 1, &vs_src, NULL);
-            glCompileShader(vs);
-            glShaderSource(fs, 1, &fs_src, NULL);
-            glCompileShader(fs);
-            GLuint p = glCreateProgram();
-            if (p) {
-                glAttachShader(p, vs);
-                glAttachShader(p, fs);
-                glLinkProgram(p);
-                GLint ok = 0;
-                glGetProgramiv(p, GL_LINK_STATUS, &ok);
-                if (ok) {
-                    eng->prog_blit = p;
-                    eng->loc_blit_swap_rb = glGetUniformLocation(p, "u_swap_rb");
-                } else {
-                    glDeleteProgram(p);
+        uint64_t key = waywal_shader_compute_cache_key(fs_src, eng->gpu_id);
+        GLuint cached = try_load_cached_program(key);
+        if (cached != 0) {
+            eng->prog_blit = cached;
+            eng->loc_blit_swap_rb = glGetUniformLocation(cached, "u_swap_rb");
+        } else {
+            GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+            GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+            if (vs && fs) {
+                glShaderSource(vs, 1, &vs_src, NULL);
+                glCompileShader(vs);
+                glShaderSource(fs, 1, &fs_src, NULL);
+                glCompileShader(fs);
+                GLuint p = glCreateProgram();
+                if (p) {
+                    glProgramParameteri(p, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+                    glAttachShader(p, vs);
+                    glAttachShader(p, fs);
+                    glLinkProgram(p);
+                    GLint ok = 0;
+                    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+                    if (ok) {
+                        save_program_to_cache(p, key);
+                        eng->prog_blit = p;
+                        eng->loc_blit_swap_rb = glGetUniformLocation(p, "u_swap_rb");
+                    } else {
+                        glDeleteProgram(p);
+                    }
                 }
             }
+            if (vs)
+                glDeleteShader(vs);
+            if (fs)
+                glDeleteShader(fs);
         }
-        if (vs)
-            glDeleteShader(vs);
-        if (fs)
-            glDeleteShader(fs);
     }
     if (!eng->blit_vao) {
         glGenVertexArrays(1, &eng->blit_vao);
@@ -2802,14 +2899,30 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
 
     if (eng->uses_audio_channel) {
         if (params->audio) {
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, eng->audio_tex);
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WAYWAL_AUDIO_TEX_WIDTH, WAYWAL_AUDIO_TEX_HEIGHT,
-                            GL_RED, GL_UNSIGNED_BYTE, params->audio->shadertoy_tex);
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-            eng->audio_tex_dirty = true;
-        } else if (eng->audio_tex_dirty && eng->audio_tex) {
+            bool is_silent =
+                (params->audio->envelope <= 1e-5f && params->audio->beat_pulse <= 1e-5f);
+            if (is_silent) {
+                for (size_t i = 0; i < WAYWAL_AUDIO_TEX_WIDTH; ++i) {
+                    if (params->audio->shadertoy_tex[i] != 0 ||
+                        (params->audio->shadertoy_tex[WAYWAL_AUDIO_TEX_WIDTH + i] != 128 &&
+                         params->audio->shadertoy_tex[WAYWAL_AUDIO_TEX_WIDTH + i] != 0)) {
+                        is_silent = false;
+                        break;
+                    }
+                }
+            }
+            if (!is_silent || !eng->audio_tex_all_zero) {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, eng->audio_tex);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WAYWAL_AUDIO_TEX_WIDTH,
+                                WAYWAL_AUDIO_TEX_HEIGHT, GL_RED, GL_UNSIGNED_BYTE,
+                                params->audio->shadertoy_tex);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                eng->audio_tex_all_zero = is_silent;
+                eng->audio_tex_dirty = !is_silent;
+            }
+        } else if ((eng->audio_tex_dirty || !eng->audio_tex_all_zero) && eng->audio_tex) {
             uint8_t zero_tex[WAYWAL_AUDIO_TEX_WIDTH * WAYWAL_AUDIO_TEX_HEIGHT];
             memset(zero_tex, 0, WAYWAL_AUDIO_TEX_WIDTH);
             memset(zero_tex + WAYWAL_AUDIO_TEX_WIDTH, 128, WAYWAL_AUDIO_TEX_WIDTH);
@@ -2820,6 +2933,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                             GL_RED, GL_UNSIGNED_BYTE, zero_tex);
             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
             eng->audio_tex_dirty = false;
+            eng->audio_tex_all_zero = true;
         }
     }
 
@@ -3486,6 +3600,64 @@ bool waywal_shader_engine_uses_mouse(const waywal_shader_engine_t *eng)
         }
     }
     return false;
+}
+
+bool waywal_shader_engine_uses_wallpaper(const waywal_shader_engine_t *eng)
+{
+    if (!eng) {
+        return false;
+    }
+    for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
+        if (!eng->passes[p].active || !eng->passes[p].prog) {
+            continue;
+        }
+        if (eng->passes[p].uniforms.u_album_art >= 0) {
+            return true;
+        }
+        for (int c = 0; c < 4; ++c) {
+            if (eng->passes[p].uniforms.iChannel[c] >= 0 &&
+                (eng->passes[p].channels[c].target == SHADER_CHAN_WALLPAPER ||
+                 eng->passes[p].channels[c].target == SHADER_CHAN_ALBUM_ART)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool waywal_shader_engine_uses_album_art(const waywal_shader_engine_t *eng)
+{
+    if (!eng) {
+        return false;
+    }
+    for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
+        if (!eng->passes[p].active || !eng->passes[p].prog) {
+            continue;
+        }
+        if (eng->passes[p].uniforms.u_album_art >= 0) {
+            return true;
+        }
+        for (int c = 0; c < 4; ++c) {
+            if (eng->passes[p].uniforms.iChannel[c] >= 0 &&
+                eng->passes[p].channels[c].target == SHADER_CHAN_ALBUM_ART) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+float waywal_shader_engine_get_render_scale(const waywal_shader_engine_t *eng)
+{
+    return (eng && eng->passes[SHADER_PASS_IMAGE].res_scale >= 0.25f &&
+            eng->passes[SHADER_PASS_IMAGE].res_scale <= 1.0f)
+               ? eng->passes[SHADER_PASS_IMAGE].res_scale
+               : 1.0f;
+}
+
+uint32_t waywal_shader_engine_get_target_fps(const waywal_shader_engine_t *eng)
+{
+    return eng ? eng->passes[SHADER_PASS_IMAGE].target_fps : 0;
 }
 
 bool waywal_shader_engine_last_load_from_cache(const waywal_shader_engine_t *eng)

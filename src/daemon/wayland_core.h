@@ -214,6 +214,9 @@ void output_node_render_image_with_transition(daemon_state_t *state, output_node
 void layer_shell_update_input_regions(daemon_state_t *state, bool interactive);
 void layer_shell_compute_span_bounds(daemon_state_t *state, output_node_t *target);
 void layer_shell_snapshot_live_output(daemon_state_t *state, output_node_t *out);
+void layer_shell_release_output_bo_refs(daemon_state_t *state, output_node_t *node,
+                                        dmabuf_bo_t *bo);
+void layer_shell_trim_output_dmabuf_ring(daemon_state_t *state, output_node_t *node);
 void waywal_scale_image_span_cpu(uint32_t *dst, uint32_t dst_w, uint32_t dst_h,
                                  size_t dst_stride_bytes, const uint32_t *src, uint32_t src_w,
                                  uint32_t src_h, int32_t span_off_x, int32_t span_off_y,

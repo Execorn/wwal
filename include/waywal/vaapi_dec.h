@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 #define WAYWAL_VA_SURFACE_POOL_SIZE 24
-#define WAYWAL_VA_VPP_POOL_SIZE     3
+#define WAYWAL_VA_VPP_POOL_SIZE     2
 
 typedef struct {
     VASurfaceID surface;
@@ -33,6 +33,7 @@ typedef struct {
 
 typedef struct {
     uint8_t profile_idc;
+    uint8_t constraint_set1_flag;
     uint8_t level_idc;
     uint8_t chroma_format_idc;
     uint8_t bit_depth_luma_minus8;

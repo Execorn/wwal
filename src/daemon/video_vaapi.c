@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "waywal/log.h"
 #include "waywal/vaapi_dec.h"
 #include "waywal/video_decoder.h"
@@ -24,22 +27,9 @@
 
 static void evict_cold_driver_pages(void)
 {
-    FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps)
-        return;
-    char line[512];
-    while (fgets(line, sizeof(line), maps)) {
-        if (!strstr(line, "libnvidia-gpucomp.so") && !strstr(line, "libnvidia-ptxjitcompiler.so"))
-            continue;
-        unsigned long start = 0, end = 0;
-        char perms[8] = {0};
-        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) == 3) {
-            if (strcmp(perms, "r-xp") == 0 && end > start) {
-                madvise((void *)start, (size_t)(end - start), MADV_DONTNEED);
-            }
-        }
-    }
-    fclose(maps);
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
 }
 
 static bool profile_supported(const VAProfile *profiles, int count, VAProfile target)
@@ -158,6 +148,7 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
 
     /* Avoid eagerly faulting libnvidia-ptxjitcompiler.so (~21.5 MiB PSS) into host RAM */
     setenv("CUDA_MODULE_LOADING", "LAZY", 0);
+    setenv("CUDA_DISABLE_PERF_BOOST", "1", 0);
 
     const char *candidate_nodes[] = {NULL, "/dev/dri/renderD128", "/dev/dri/renderD129"};
     bool found = false;
@@ -239,6 +230,16 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
         vaapi_decoder_set_extradata(dec, extradata, extradata_size);
     }
 
+    bool is_10bit_stream =
+        (dec->va_profile == VAProfileHEVCMain10 || dec->va_profile == VAProfileVP9Profile2 ||
+         (dec->va_profile == VAProfileAV1Profile0 && dec->cached_av1_seq.valid &&
+          dec->cached_av1_seq.high_bitdepth) ||
+         (dec->cached_hevc_sps.valid && (dec->cached_hevc_sps.bit_depth_luma_minus8 == 2 ||
+                                         dec->cached_hevc_sps.bit_depth_chroma_minus8 == 2)));
+    if (is_10bit_stream && !dec->allow_direct_p010) {
+        allow_direct_nv12 = false;
+    }
+
     uint32_t max_refs = 4;
     if (dec->cached_sps.valid) {
         max_refs = dec->cached_sps.num_ref_frames;
@@ -255,21 +256,33 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
     } else if (codec == WAYWAL_CODEC_VP9 || codec == WAYWAL_CODEC_AV1) {
         max_refs = 8;
     }
-    dec->num_surfaces = max_refs + 6;
-    if (dec->num_surfaces < 8)
-        dec->num_surfaces = 8;
+
+    if (!allow_direct_nv12) {
+        if (codec == WAYWAL_CODEC_VP9 || codec == WAYWAL_CODEC_AV1) {
+            dec->num_surfaces = 9;
+        } else {
+            bool no_reorder =
+                (codec == WAYWAL_CODEC_H264 && dec->cached_sps.valid &&
+                 (dec->cached_sps.profile_idc == 66 || dec->cached_sps.constraint_set1_flag != 0 ||
+                  dec->cached_sps.num_ref_frames <= 1 ||
+                  dec->cached_sps.pic_order_cnt_type == 2)) ||
+                (codec == WAYWAL_CODEC_HEVC && dec->cached_hevc_sps.valid &&
+                 dec->cached_hevc_sps.sps_max_num_reorder_pics == 0);
+            uint32_t min_surf = no_reorder ? 3U : 5U;
+            dec->num_surfaces = max_refs + (no_reorder ? 2U : 3U);
+            if (dec->num_surfaces < min_surf)
+                dec->num_surfaces = min_surf;
+            if (dec->num_surfaces > 9U)
+                dec->num_surfaces = 9U;
+        }
+    } else {
+        dec->num_surfaces = max_refs + 4;
+        if (dec->num_surfaces < 6)
+            dec->num_surfaces = 6;
+    }
     if (dec->num_surfaces > WAYWAL_VA_SURFACE_POOL_SIZE)
         dec->num_surfaces = WAYWAL_VA_SURFACE_POOL_SIZE;
 
-    bool is_10bit_stream =
-        (dec->va_profile == VAProfileHEVCMain10 || dec->va_profile == VAProfileVP9Profile2 ||
-         (dec->va_profile == VAProfileAV1Profile0 && dec->cached_av1_seq.valid &&
-          dec->cached_av1_seq.high_bitdepth) ||
-         (dec->cached_hevc_sps.valid && (dec->cached_hevc_sps.bit_depth_luma_minus8 == 2 ||
-                                         dec->cached_hevc_sps.bit_depth_chroma_minus8 == 2)));
-    if (is_10bit_stream && !dec->allow_direct_p010) {
-        allow_direct_nv12 = false;
-    }
     bool use_10bit = is_10bit_stream;
     uint32_t rt_format = use_10bit ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
     dec->fourcc = use_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
@@ -1495,6 +1508,10 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         }
         if (max_refs > 16) {
             max_refs = 16;
+        }
+        uint32_t dpb_cap = dec->num_surfaces > 2 ? (dec->num_surfaces - 2) : 1;
+        if (max_refs > dpb_cap) {
+            max_refs = dpb_cap;
         }
         if (max_refs < 1) {
             max_refs = 1;

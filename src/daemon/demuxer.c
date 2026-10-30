@@ -1439,6 +1439,7 @@ demuxer_t *demuxer_open_file(const char *filepath)
         close(fd);
         return NULL;
     }
+    madvise(mapped, file_size, MADV_RANDOM);
 
     demuxer_t *d = demuxer_open_mem((const uint8_t *)mapped, file_size);
     if (!d) {
@@ -1454,5 +1455,6 @@ demuxer_t *demuxer_open_file(const char *filepath)
     demuxer_common_state_t *state = (demuxer_common_state_t *)d->internal_state;
     state->file_fd = fd;
     state->owns_mmap = true;
+    evict_mmap_for_seek(d, 0);
     return d;
 }

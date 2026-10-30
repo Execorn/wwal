@@ -5,10 +5,14 @@
 
 #include <GLES3/gl31.h>
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* =========================================================================
  * Built-in Wallpaper Engine Shader Headers & Fallback Shaders
@@ -1782,12 +1786,173 @@ static GLuint compile_gl_stage(GLenum stage, const char *src, const char *debug_
     return sh;
 }
 
+typedef struct {
+    uint32_t magic;
+    uint32_t format;
+    uint32_t length;
+} we_prog_cache_hdr_t;
+
+#define WE_PROG_CACHE_MAGIC 0x57455042u
+
+static uint64_t fnv1a_step_str(uint64_t h, const char *s)
+{
+    if (!s) {
+        return h;
+    }
+    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; ++p) {
+        h ^= (uint64_t)(*p);
+        h *= 1099511628211ULL;
+    }
+    h ^= 0xFFULL;
+    h *= 1099511628211ULL;
+    return h;
+}
+
+static bool resolve_we_shader_cache_path(uint64_t hash, char *out_path, size_t cap)
+{
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    char base[4096];
+    if (xdg && xdg[0] != '\0') {
+        snprintf(base, sizeof(base), "%s", xdg);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || home[0] == '\0') {
+            return false;
+        }
+        snprintf(base, sizeof(base), "%s/.cache", home);
+        (void)mkdir(base, 0700);
+    }
+    char dir1[4200];
+    char dir2[4300];
+    snprintf(dir1, sizeof(dir1), "%s/wwal", base);
+    (void)mkdir(dir1, 0700);
+    snprintf(dir2, sizeof(dir2), "%s/shaders", dir1);
+    (void)mkdir(dir2, 0700);
+    int n = snprintf(out_path, cap, "%s/we_%016llx.bin", dir2, (unsigned long long)hash);
+    return (n > 0 && (size_t)n < cap);
+}
+
+static GLuint try_load_we_cached_program(const char *cache_path)
+{
+    int fd = open(cache_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return 0;
+    }
+    we_prog_cache_hdr_t hdr;
+    ssize_t r = read(fd, &hdr, sizeof(hdr));
+    if (r != (ssize_t)sizeof(hdr) || hdr.magic != WE_PROG_CACHE_MAGIC || hdr.length == 0 ||
+        hdr.length > 16u * 1024u * 1024u) {
+        close(fd);
+        return 0;
+    }
+    uint8_t *buf = (uint8_t *)malloc(hdr.length);
+    if (!buf) {
+        close(fd);
+        return 0;
+    }
+    size_t got = 0;
+    while (got < hdr.length) {
+        ssize_t n = read(fd, buf + got, hdr.length - got);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        got += (size_t)n;
+    }
+    close(fd);
+    if (got != hdr.length) {
+        free(buf);
+        return 0;
+    }
+    GLuint prog = glCreateProgram();
+    if (!prog) {
+        free(buf);
+        return 0;
+    }
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    glProgramBinary(prog, (GLenum)hdr.format, buf, (GLsizei)hdr.length);
+    free(buf);
+    GLenum err = glGetError();
+    GLint linked = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+    if (err != GL_NO_ERROR || !linked) {
+        glDeleteProgram(prog);
+        return 0;
+    }
+    return prog;
+}
+
+static void save_we_cached_program(GLuint prog, const char *cache_path)
+{
+    GLint bin_len = 0;
+    glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &bin_len);
+    if (bin_len <= 0 || bin_len > 16 * 1024 * 1024) {
+        return;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)bin_len);
+    if (!buf) {
+        return;
+    }
+    GLsizei actual_len = 0;
+    GLenum bin_fmt = 0;
+    glGetProgramBinary(prog, bin_len, &actual_len, &bin_fmt, buf);
+    if (actual_len <= 0 || actual_len > bin_len) {
+        free(buf);
+        return;
+    }
+    char tmp_path[4464];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", cache_path, (int)getpid()) >=
+        (int)sizeof(tmp_path)) {
+        free(buf);
+        return;
+    }
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        we_prog_cache_hdr_t hdr = {
+            .magic = WE_PROG_CACHE_MAGIC,
+            .format = (uint32_t)bin_fmt,
+            .length = (uint32_t)actual_len,
+        };
+        bool ok = (write(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr)) &&
+                  (write(fd, buf, (size_t)actual_len) == (ssize_t)actual_len);
+        close(fd);
+        if (ok) {
+            (void)rename(tmp_path, cache_path);
+        } else {
+            unlink(tmp_path);
+        }
+    }
+    free(buf);
+}
+
 uint32_t we_shader_compile_program(const char *vert_glsl, const char *frag_glsl,
                                    const char *debug_name)
 {
     if (!vert_glsl || !frag_glsl) {
         return 0;
     }
+
+    char cache_path[4400] = {0};
+    uint64_t h = 14695981039346656037ULL;
+    h = fnv1a_step_str(h, vert_glsl);
+    h = fnv1a_step_str(h, frag_glsl);
+    h = fnv1a_step_str(h, (const char *)glGetString(GL_VENDOR));
+    h = fnv1a_step_str(h, (const char *)glGetString(GL_RENDERER));
+    h = fnv1a_step_str(h, (const char *)glGetString(GL_VERSION));
+    bool have_cache_path = resolve_we_shader_cache_path(h, cache_path, sizeof(cache_path));
+    if (have_cache_path) {
+        GLuint cached_prog = try_load_we_cached_program(cache_path);
+        if (cached_prog != 0) {
+            return (uint32_t)cached_prog;
+        }
+    }
+
     GLuint vs = compile_gl_stage(GL_VERTEX_SHADER, vert_glsl, debug_name);
     if (!vs) {
         return 0;
@@ -1805,6 +1970,7 @@ uint32_t we_shader_compile_program(const char *vert_glsl, const char *frag_glsl,
         return 0;
     }
 
+    glProgramParameteri(prog, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
     glAttachShader(prog, vs);
     glAttachShader(prog, fs);
 
@@ -1831,6 +1997,9 @@ uint32_t we_shader_compile_program(const char *vert_glsl, const char *frag_glsl,
                         debug_name ? debug_name : "shader", log_buf);
         glDeleteProgram(prog);
         return 0;
+    }
+    if (have_cache_path) {
+        save_we_cached_program(prog, cache_path);
     }
     return (uint32_t)prog;
 }

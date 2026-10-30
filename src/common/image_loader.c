@@ -362,6 +362,124 @@ static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     return true;
 }
 
+static bool pnm_next_token(FILE *fp, char *tok, size_t cap)
+{
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (c == '#') {
+            while ((c = fgetc(fp)) != EOF && c != '\n' && c != '\r') {
+            }
+            continue;
+        }
+        if (!isspace((unsigned char)c))
+            break;
+    }
+    if (c == EOF)
+        return false;
+
+    size_t i = 0;
+    while (c != EOF && !isspace((unsigned char)c) && c != '#') {
+        if (i + 1 < cap)
+            tok[i++] = (char)c;
+        c = fgetc(fp);
+    }
+    if (c == '#') {
+        while ((c = fgetc(fp)) != EOF && c != '\n' && c != '\r') {
+        }
+    }
+    tok[i] = '\0';
+    return i > 0;
+}
+
+static bool load_pnm(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
+    char tok[64];
+    if (!pnm_next_token(fp, tok, sizeof(tok)) || tok[0] != 'P')
+        return false;
+    char fmt = tok[1];
+    if ((fmt != '3' && fmt != '5' && fmt != '6') || tok[2] != '\0')
+        return false;
+
+    long vals[3] = {0, 0, 0};
+    for (int i = 0; i < 3; ++i) {
+        if (!pnm_next_token(fp, tok, sizeof(tok)))
+            return false;
+        char *endptr = NULL;
+        long v = strtol(tok, &endptr, 10);
+        if (!endptr || *endptr != '\0' || v <= 0)
+            return false;
+        vals[i] = v;
+    }
+
+    if (vals[0] > 16384 || vals[1] > 16384 || vals[2] > 255)
+        return false;
+
+    uint32_t w = (uint32_t)vals[0];
+    uint32_t h = (uint32_t)vals[1];
+    uint32_t maxval = (uint32_t)vals[2];
+    size_t total_px = (size_t)w * (size_t)h;
+    uint8_t *pixels = alloc_aligned_rgba(total_px * 4);
+    if (!pixels)
+        return false;
+
+    if (fmt == '6') {
+        uint8_t *rgb = (uint8_t *)malloc(total_px * 3);
+        if (!rgb || fread(rgb, 1, total_px * 3, fp) != total_px * 3) {
+            free(rgb);
+            free(pixels);
+            return false;
+        }
+        for (size_t i = 0; i < total_px; ++i) {
+            pixels[i * 4 + 0] = (uint8_t)((rgb[i * 3 + 2] * 255U) / maxval);
+            pixels[i * 4 + 1] = (uint8_t)((rgb[i * 3 + 1] * 255U) / maxval);
+            pixels[i * 4 + 2] = (uint8_t)((rgb[i * 3 + 0] * 255U) / maxval);
+            pixels[i * 4 + 3] = 0xFF;
+        }
+        free(rgb);
+    } else if (fmt == '5') {
+        uint8_t *gray = (uint8_t *)malloc(total_px);
+        if (!gray || fread(gray, 1, total_px, fp) != total_px) {
+            free(gray);
+            free(pixels);
+            return false;
+        }
+        for (size_t i = 0; i < total_px; ++i) {
+            uint8_t g = (uint8_t)((gray[i] * 255U) / maxval);
+            pixels[i * 4 + 0] = g;
+            pixels[i * 4 + 1] = g;
+            pixels[i * 4 + 2] = g;
+            pixels[i * 4 + 3] = 0xFF;
+        }
+        free(gray);
+    } else {
+        for (size_t i = 0; i < total_px; ++i) {
+            uint8_t c[3];
+            for (int ch = 0; ch < 3; ++ch) {
+                if (!pnm_next_token(fp, tok, sizeof(tok))) {
+                    free(pixels);
+                    return false;
+                }
+                char *endptr = NULL;
+                long v = strtol(tok, &endptr, 10);
+                if (!endptr || *endptr != '\0' || v < 0 || v > (long)maxval) {
+                    free(pixels);
+                    return false;
+                }
+                c[ch] = (uint8_t)(((uint32_t)v * 255U) / maxval);
+            }
+            pixels[i * 4 + 0] = c[2];
+            pixels[i * 4 + 1] = c[1];
+            pixels[i * 4 + 2] = c[0];
+            pixels[i * 4 + 3] = 0xFF;
+        }
+    }
+
+    *out_pixels = pixels;
+    *out_w = w;
+    *out_h = h;
+    return true;
+}
+
 typedef struct {
     FILE *fp;
     uint32_t bit_buf;
@@ -1276,25 +1394,68 @@ static void init_rsvg_lib(void)
 #endif
 }
 
+static uint8_t *sanitize_svg_xml(const uint8_t *buf, size_t size, size_t *out_len)
+{
+    if (!buf || size == 0 || size > 64U * 1024U * 1024U || !out_len)
+        return NULL;
+
+    uint8_t *clean = (uint8_t *)malloc(size + 1);
+    if (!clean)
+        return NULL;
+
+    const char *src = (const char *)buf;
+    const char *end = src + size;
+    size_t dst_off = 0;
+
+    while (src < end) {
+        size_t rem = (size_t)(end - src);
+        if (*src == '<' && rem >= 14 && strncasecmp(src, "<foreignObject", 14) == 0) {
+            const char *close_tag = strcasestr(src + 14, "</foreignObject>");
+            if (close_tag && close_tag + 16 <= end) {
+                src = close_tag + 16;
+                continue;
+            }
+            const char *tag_end = (const char *)memchr(src, '>', rem);
+            if (tag_end) {
+                src = tag_end + 1;
+                continue;
+            }
+            break;
+        }
+        clean[dst_off++] = (uint8_t)(*src++);
+    }
+
+    clean[dst_off] = '\0';
+    *out_len = dst_off;
+    return clean;
+}
+
 static bool load_svg_librsvg(const uint8_t *buf, size_t size, raw_image_t *out_img)
 {
+    if (!buf || size == 0 || size > 64U * 1024U * 1024U)
+        return false;
+
     pthread_once(&g_rsvg_once, init_rsvg_lib);
     if (!g_rsvg_ready)
         return false;
 
-    void *handle = g_fn_rsvg_handle_new_from_data(buf, size, NULL);
-    if (!handle)
+    size_t clean_len = 0;
+    uint8_t *clean_svg = sanitize_svg_xml(buf, size, &clean_len);
+    if (!clean_svg || clean_len == 0) {
+        free(clean_svg);
         return false;
+    }
 
-    char *svg_str = (char *)malloc(size + 1);
+    void *handle = g_fn_rsvg_handle_new_from_data(clean_svg, clean_len, NULL);
+    if (!handle) {
+        free(clean_svg);
+        return false;
+    }
+
     uint32_t parsed_w = 256, parsed_h = 256;
     float vx = 0.0f, vy = 0.0f, vw = 256.0f, vh = 256.0f;
-    if (svg_str) {
-        memcpy(svg_str, buf, size);
-        svg_str[size] = '\0';
-        svg_parse_dimensions(svg_str, &parsed_w, &parsed_h, &vx, &vy, &vw, &vh);
-        free(svg_str);
-    }
+    svg_parse_dimensions((const char *)clean_svg, &parsed_w, &parsed_h, &vx, &vy, &vw, &vh);
+    free(clean_svg);
 
     double dw = 0.0, dh = 0.0;
     uint32_t w = parsed_w, h = parsed_h;
@@ -1518,6 +1679,9 @@ static const svg_linear_grad_t *svg_find_grad(const svg_linear_grad_t *grads, si
 
 static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image_t *out_img)
 {
+    if (!buf || size == 0 || size > 64U * 1024U * 1024U)
+        return false;
+
     char *svg_text = (char *)malloc(size + 1);
     if (!svg_text)
         return false;
@@ -1878,6 +2042,9 @@ bool image_load_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_im
             ok = load_bmp(fp, &pixels, &w, &h);
         } else if (buf[0] == 'G' && buf[1] == 'I' && buf[2] == 'F' && buf[3] == '8') {
             ok = load_gif(fp, &pixels, &w, &h);
+        } else if (buf[0] == 'P' && (buf[1] == '3' || buf[1] == '5' || buf[1] == '6') &&
+                   isspace((unsigned char)buf[2])) {
+            ok = load_pnm(fp, &pixels, &w, &h);
         }
         fclose(fp);
     }

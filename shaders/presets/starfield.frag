@@ -22,7 +22,7 @@ mat2 sf_rot(float a)
     return mat2(c, -s, s, c);
 }
 
-float sf_star_layer(vec2 uv, float flare, float t_twinkle)
+float sf_star_layer(vec2 uv, float flare, vec2 sc_twinkle)
 {
     vec2 gv = fract(uv) - 0.5;
     vec2 id = floor(uv);
@@ -49,7 +49,8 @@ float sf_star_layer(vec2 uv, float flare, float t_twinkle)
                 star += (1.0 - ray_prod) * flare * smoothstep(0.6, 1.0, size);
             }
             star *= 1.0 - smoothstep(0.15, 0.85, d);
-            float twinkle = 0.6 + 0.4 * sin(t_twinkle + n.y * 62.8);
+            vec2 phase_cs = normalize(n - 0.5 + vec2(1e-4));
+            float twinkle = 0.65 + 0.35 * dot(sc_twinkle, phase_cs);
             acc += star * size * twinkle;
         }
     }
@@ -76,6 +77,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     float warp = 1.0 + u_audio_envelope * 1.5 + u_audio_beat * 0.8;
     float t = mod(iTime * 0.05, 100.0) + (warp - 1.0) * 0.08;
     float t_twinkle = mod(iTime, 3600.0) * 2.5;
+    vec2 sc_twinkle = vec2(sin(t_twinkle), cos(t_twinkle));
     float neb1 = 0.5 + 0.5 * sin(uv.x * 2.5 + cos(uv.y * 2.2 + t * 2.0));
     float neb2 = 0.5 + 0.5 * cos(uv.y * 3.1 - sin(uv.x * 2.8 - t * 1.5));
     vec3 col = space_bg + neb_blue * (neb1 * 0.14) + neb_rose * (neb1 * neb2 * 0.12);
@@ -87,7 +89,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         float fade = depth * (1.0 - smoothstep(0.82, 1.0, depth));
         mat2 rot = sf_rot(float(i) * 0.785398 + t * 0.2);
         vec2 st_uv = (rot * uv) * scale + vec2(fi * 37.2, fi * 19.8) + parallax * (1.5 - depth);
-        float s = sf_star_layer(st_uv, smoothstep(0.4, 0.9, depth), t_twinkle);
+        float s = sf_star_layer(st_uv, smoothstep(0.4, 0.9, depth), sc_twinkle);
         vec3 s_col = mix(vec3(0.65, 0.82, 1.0), vec3(1.0, 0.82, 0.68), fract(fi * 3.7));
         col += s * fade * s_col;
     }

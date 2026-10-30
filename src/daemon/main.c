@@ -24,6 +24,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
@@ -39,6 +42,13 @@
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
+
+float waywal_shader_engine_get_render_scale(const waywal_shader_engine_t *eng);
+uint32_t waywal_shader_engine_get_target_fps(const waywal_shader_engine_t *eng);
+bool waywal_shader_engine_uses_wallpaper(const waywal_shader_engine_t *eng);
+bool waywal_shader_engine_uses_album_art(const waywal_shader_engine_t *eng);
+void waywal_audio_fft_set_capture_active(waywal_audio_fft_t *fft, bool active);
+void dmabuf_ring_trim_idle(dmabuf_ring_t *ring);
 
 waywal_state_store_t g_saved_state;
 
@@ -259,14 +269,9 @@ void reconcile_global_engine_flags(daemon_state_t *state)
     if (!state->outputs) {
         if (!state->shader_active && !state->workshop_active) {
             disarm_timer_fd(state->shader_timer_fd);
-            if (state->audio_fft && waywal_audio_fft_is_pipewire_active(state->audio_fft)) {
+            if (state->audio_fft) {
                 detach_all_scene_audio(state);
-                waywal_audio_fft_destroy(state->audio_fft);
-                state->audio_fft = waywal_audio_fft_create(48000, false);
-                if (state->audio_fft) {
-                    waywal_audio_fft_set_volume(state->audio_fft, state->audio_volume);
-                    waywal_audio_fft_set_mute_on_audio(state->audio_fft, state->mute_on_audio);
-                }
+                waywal_audio_fft_set_capture_active(state->audio_fft, false);
             }
         }
         if (state->workshop_active && state->we_scene && state->we_scene->uses_audio) {
@@ -322,17 +327,13 @@ void reconcile_global_engine_flags(daemon_state_t *state)
             state->audio_fft = waywal_audio_fft_create(48000, true);
         }
         if (state->audio_fft) {
+            waywal_audio_fft_set_capture_active(state->audio_fft, true);
             waywal_audio_fft_set_volume(state->audio_fft, state->audio_volume);
             waywal_audio_fft_set_mute_on_audio(state->audio_fft, state->mute_on_audio);
         }
-    } else if (state->audio_fft && waywal_audio_fft_is_pipewire_active(state->audio_fft)) {
+    } else if (state->audio_fft) {
         detach_all_scene_audio(state);
-        waywal_audio_fft_destroy(state->audio_fft);
-        state->audio_fft = waywal_audio_fft_create(48000, false);
-        if (state->audio_fft) {
-            waywal_audio_fft_set_volume(state->audio_fft, state->audio_volume);
-            waywal_audio_fft_set_mute_on_audio(state->audio_fft, state->mute_on_audio);
-        }
+        waywal_audio_fft_set_capture_active(state->audio_fft, false);
     }
 
     bool bound_scene_audio = false;
@@ -369,6 +370,61 @@ void reconcile_global_engine_flags(daemon_state_t *state)
     }
 }
 
+static void release_output_transition_bos(daemon_state_t *state, output_node_t *out, bool free_old,
+                                          bool free_new)
+{
+    if (!state || !out)
+        return;
+    if (free_old && out->has_source_old_bo) {
+        layer_shell_release_output_bo_refs(state, out, &out->source_old_bo);
+        dmabuf_bo_free(&out->source_old_bo);
+        out->has_source_old_bo = false;
+    }
+    if (free_new && out->has_source_new_bo) {
+        layer_shell_release_output_bo_refs(state, out, &out->source_new_bo);
+        dmabuf_bo_free(&out->source_new_bo);
+        out->has_source_new_bo = false;
+    }
+}
+
+static void destroy_output_shader_eng(daemon_state_t *state, output_node_t *out)
+{
+    if (!out || !out->shader_eng)
+        return;
+    waywal_shader_engine_t *seng = out->shader_eng;
+    out->shader_eng = NULL;
+    bool shared = false;
+    if (state) {
+        for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
+            if (o != out && o->shader_eng == seng) {
+                shared = true;
+                break;
+            }
+        }
+        if (state->shader_eng == seng && !shared) {
+            state->shader_eng = NULL;
+            for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
+                if (o != out && o->shader_eng) {
+                    state->shader_eng = o->shader_eng;
+                    break;
+                }
+            }
+        }
+    }
+    if (!shared) {
+        if (state) {
+            int ino_fd = waywal_shader_engine_get_inotify_fd(seng);
+            if (ino_fd >= 0) {
+                unregister_fd_from_loops(state, ino_fd);
+            }
+            if (state->dmabuf_ctx.available) {
+                render_engine_make_current(&state->render_engine);
+            }
+        }
+        waywal_shader_engine_destroy(seng);
+    }
+}
+
 static void destroy_output_we_scene(daemon_state_t *state, output_node_t *out)
 {
     if (!out || !out->we_scene)
@@ -383,7 +439,7 @@ static void destroy_output_we_scene(daemon_state_t *state, output_node_t *out)
                 break;
             }
         }
-        if (state->we_scene == ws) {
+        if (state->we_scene == ws && !shared) {
             state->we_scene = NULL;
             for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
                 if (o != out && o->we_scene) {
@@ -394,6 +450,9 @@ static void destroy_output_we_scene(daemon_state_t *state, output_node_t *out)
         }
     }
     if (!shared) {
+        if (state && state->dmabuf_ctx.available) {
+            render_engine_make_current(&state->render_engine);
+        }
         we_scene_destroy(ws);
     }
 }
@@ -404,23 +463,40 @@ void stop_engines_on_output(daemon_state_t *state, output_node_t *out, bool keep
     if (!state || !out)
         return;
 
+    release_output_transition_bos(state, out, false, true);
+
     if (!keep_shader) {
         out->shader_active = false;
         out->workshop_active = false;
         out->shader_audio_reactive = false;
-        if (out->shader_eng) {
-            bool shared_eng = false;
+        if (out->has_source_old_bo) {
+            if (out->shader_eng)
+                waywal_shader_engine_forget_bo(out->shader_eng, &out->source_old_bo);
+            if (out->we_scene)
+                waywal_we_scene_forget_bo(out->we_scene, &out->source_old_bo);
+        }
+        destroy_output_shader_eng(state, out);
+        destroy_output_we_scene(state, out);
+        if (state->shader_eng) {
+            bool any_attached = false;
             for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
-                if (o != out && o->shader_active && o->shader_eng == out->shader_eng) {
-                    shared_eng = true;
+                if (o->shader_eng == state->shader_eng) {
+                    any_attached = true;
                     break;
                 }
             }
-            if (!shared_eng) {
-                waywal_shader_engine_release_scratch(out->shader_eng);
+            if (!any_attached) {
+                int ino_fd = waywal_shader_engine_get_inotify_fd(state->shader_eng);
+                if (ino_fd >= 0) {
+                    unregister_fd_from_loops(state, ino_fd);
+                }
+                if (state->dmabuf_ctx.available) {
+                    render_engine_make_current(&state->render_engine);
+                }
+                waywal_shader_engine_destroy(state->shader_eng);
+                state->shader_eng = NULL;
             }
         }
-        destroy_output_we_scene(state, out);
     }
 
     if (!keep_anim) {
@@ -532,6 +608,11 @@ void stop_engines_on_output(daemon_state_t *state, output_node_t *out, bool keep
             }
         }
     }
+
+    layer_shell_trim_output_dmabuf_ring(state, out);
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
 }
 
 void shader_engine_stop_playback(daemon_state_t *state)
@@ -542,15 +623,26 @@ void shader_engine_stop_playback(daemon_state_t *state)
         out->shader_active = false;
         out->workshop_active = false;
         out->shader_audio_reactive = false;
-        if (out->shader_eng && out->shader_eng != state->shader_eng) {
-            waywal_shader_engine_release_scratch(out->shader_eng);
-        }
+        release_output_transition_bos(state, out, true, true);
+        destroy_output_shader_eng(state, out);
         destroy_output_we_scene(state, out);
+        layer_shell_trim_output_dmabuf_ring(state, out);
     }
     if (state->shader_eng) {
-        waywal_shader_engine_release_scratch(state->shader_eng);
+        int ino_fd = waywal_shader_engine_get_inotify_fd(state->shader_eng);
+        if (ino_fd >= 0) {
+            unregister_fd_from_loops(state, ino_fd);
+        }
+        if (state->dmabuf_ctx.available) {
+            render_engine_make_current(&state->render_engine);
+        }
+        waywal_shader_engine_destroy(state->shader_eng);
+        state->shader_eng = NULL;
     }
     if (state->we_scene) {
+        if (state->dmabuf_ctx.available) {
+            render_engine_make_current(&state->render_engine);
+        }
         we_scene_destroy(state->we_scene);
         state->we_scene = NULL;
     }
@@ -558,17 +650,16 @@ void shader_engine_stop_playback(daemon_state_t *state)
     state->shader_active = false;
     state->workshop_active = false;
     disarm_timer_fd(state->shader_timer_fd);
-    if (state->audio_fft && waywal_audio_fft_is_pipewire_active(state->audio_fft)) {
-        waywal_audio_fft_destroy(state->audio_fft);
-        state->audio_fft = waywal_audio_fft_create(48000, false);
-        if (state->audio_fft) {
-            waywal_audio_fft_set_volume(state->audio_fft, state->audio_volume);
-            waywal_audio_fft_set_mute_on_audio(state->audio_fft, state->mute_on_audio);
-        }
+    if (state->audio_fft) {
+        detach_all_scene_audio(state);
+        waywal_audio_fft_set_capture_active(state->audio_fft, false);
     }
     if (was_active) {
         layer_shell_update_input_regions(state, false);
     }
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
 }
 
 void anim_engine_stop_playback(daemon_state_t *state)
@@ -774,10 +865,46 @@ bool try_start_native_animation(daemon_state_t *state, const char *filepath,
         return true;
     }
 
+    waywal_anim_decoder_t *dec = waywal_anim_create(buf, sz);
+    free(buf);
+    if (!dec || waywal_anim_frame_count(dec) <= 1) {
+        if (dec)
+            waywal_anim_destroy(dec);
+        stop_anim_on_matched_outputs(state, meta, target_out);
+        return false;
+    }
+    uint32_t total_frames = waywal_anim_frame_count(dec);
+    const uint8_t *f_rgba = NULL;
+    uint32_t fw = 0, fh = 0, delay_ms = 100;
+    if (!waywal_anim_next_frame(dec, &f_rgba, &fw, &fh, &delay_ms)) {
+        waywal_anim_destroy(dec);
+        stop_anim_on_matched_outputs(state, meta, target_out);
+        return false;
+    }
+
     uint64_t t_now = now_ns();
     uint32_t min_delay_ms = UINT32_MAX;
     bool started_any = false;
-    uint32_t total_frames = 0;
+    bool need_reset_dec = false;
+    uint8_t *shared_bgra = NULL;
+    bool heap_bgra = false;
+
+    if (f_rgba && fw > 0 && fh > 0 &&
+        (!meta || meta->transition_type == WAYWAL_TRANSITION_NONE ||
+         meta->transition_duration_ms == 0)) {
+        size_t px_bytes = (size_t)fw * (size_t)fh * 4U;
+        shared_bgra = (uint8_t *)arena_alloc(&state->frame_arena, px_bytes, 32U);
+        if (!shared_bgra) {
+            shared_bgra = (uint8_t *)malloc(px_bytes);
+            heap_bgra = (shared_bgra != NULL);
+        }
+        if (shared_bgra) {
+            swizzle_rgba_to_bgra(shared_bgra, f_rgba, (size_t)fw * (size_t)fh);
+            render_engine_bump_upload_gen(&state->render_engine);
+        }
+    } else {
+        need_reset_dec = true;
+    }
 
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         bool matches = (meta && meta->num_target_outputs > 0)
@@ -785,20 +912,6 @@ bool try_start_native_animation(daemon_state_t *state, const char *filepath,
                            : output_matches_target_spec(out, target_out);
         if (!matches)
             continue;
-
-        waywal_anim_decoder_t *dec = waywal_anim_create(buf, sz);
-        if (!dec || waywal_anim_frame_count(dec) <= 1) {
-            if (dec)
-                waywal_anim_destroy(dec);
-            continue;
-        }
-        total_frames = waywal_anim_frame_count(dec);
-        const uint8_t *f_rgba = NULL;
-        uint32_t fw = 0, fh = 0, delay_ms = 100;
-        if (!waywal_anim_next_frame(dec, &f_rgba, &fw, &fh, &delay_ms)) {
-            waywal_anim_destroy(dec);
-            continue;
-        }
 
         stop_engines_on_output(state, out, false, false, false, true);
         out->anim_dec = dec;
@@ -816,9 +929,7 @@ bool try_start_native_animation(daemon_state_t *state, const char *filepath,
             state->anim_meta = *meta;
         }
 
-        if (f_rgba && fw > 0 && fh > 0 &&
-            (!meta || meta->transition_type == WAYWAL_TRANSITION_NONE ||
-             meta->transition_duration_ms == 0)) {
+        if (shared_bgra) {
             out->transition_active = false;
             out->scaling_mode = meta ? meta->scaling_mode : WAYWAL_SCALING_FILL;
             out->filter_mode = meta ? meta->filter_mode : 0u;
@@ -837,22 +948,7 @@ bool try_start_native_animation(daemon_state_t *state, const char *filepath,
                 out->crop_gravity_y = meta->has_crop_gravity ? meta->crop_gravity_y : 0.5f;
                 out->has_crop_gravity = (meta->has_crop_gravity != 0);
             }
-            size_t px_bytes = (size_t)fw * (size_t)fh * 4U;
-            uint8_t *bgra = (uint8_t *)arena_alloc(&state->frame_arena, px_bytes, 32U);
-            bool heap_bgra = false;
-            if (!bgra) {
-                bgra = (uint8_t *)malloc(px_bytes);
-                heap_bgra = (bgra != NULL);
-            }
-            if (bgra) {
-                swizzle_rgba_to_bgra(bgra, f_rgba, (size_t)fw * (size_t)fh);
-                render_engine_bump_upload_gen(&state->render_engine);
-                output_node_render_image(state, out, bgra, fw, fh);
-                if (heap_bgra)
-                    free(bgra);
-            }
-        } else {
-            waywal_anim_reset(dec);
+            output_node_render_image(state, out, shared_bgra, fw, fh);
         }
 
         if (out->anim_delay_ms < min_delay_ms)
@@ -861,11 +957,18 @@ bool try_start_native_animation(daemon_state_t *state, const char *filepath,
             state->anim_dec = dec;
         started_any = true;
     }
-    free(buf);
+
+    if (heap_bgra)
+        free(shared_bgra);
 
     if (!started_any) {
+        waywal_anim_destroy(dec);
         stop_anim_on_matched_outputs(state, meta, target_out);
         return false;
+    }
+
+    if (need_reset_dec) {
+        waywal_anim_reset(dec);
     }
 
     state->anim_target_output[0] = '\0';
@@ -900,6 +1003,17 @@ static void daemon_anim_dispatch_frame(daemon_state_t *state)
     uint32_t next_arm_ms = UINT32_MAX;
     bool any_active = false;
 
+    struct {
+        waywal_anim_decoder_t *dec;
+        uint8_t *bgra;
+        uint32_t w;
+        uint32_t h;
+        uint32_t delay_ms;
+        bool heap_bgra;
+        bool ok;
+    } stepped_dec[8];
+    size_t num_stepped = 0;
+
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (!out->anim_active || !out->anim_dec)
             continue;
@@ -918,7 +1032,15 @@ static void daemon_anim_dispatch_frame(daemon_state_t *state)
             continue;
         }
 
-        if (t_now + 2000000ULL < out->anim_next_ns) {
+        size_t slot = num_stepped;
+        for (size_t k = 0; k < num_stepped; ++k) {
+            if (stepped_dec[k].dec == out->anim_dec) {
+                slot = k;
+                break;
+            }
+        }
+
+        if (slot == num_stepped && t_now + 2000000ULL < out->anim_next_ns) {
             uint32_t rem_ms = (uint32_t)((out->anim_next_ns - t_now) / 1000000ULL);
             if (rem_ms == 0)
                 rem_ms = 1U;
@@ -927,32 +1049,49 @@ static void daemon_anim_dispatch_frame(daemon_state_t *state)
             continue;
         }
 
-        const uint8_t *rgba = NULL;
-        uint32_t w = 0, h = 0, delay_ms = 100;
-        if (!waywal_anim_next_frame(out->anim_dec, &rgba, &w, &h, &delay_ms) || !rgba || w == 0 ||
-            h == 0) {
-            continue;
-        }
-
-        size_t px_bytes = (size_t)w * (size_t)h * 4U;
-        uint8_t *bgra = (uint8_t *)arena_alloc(&state->frame_arena, px_bytes, 32U);
-        bool heap_bgra = false;
-        if (!bgra) {
-            bgra = (uint8_t *)malloc(px_bytes);
-            if (!bgra)
+        if (slot == num_stepped) {
+            if (slot >= 8)
                 continue;
-            heap_bgra = true;
+            num_stepped++;
+            stepped_dec[slot].dec = out->anim_dec;
+            stepped_dec[slot].bgra = NULL;
+            stepped_dec[slot].w = 0;
+            stepped_dec[slot].h = 0;
+            stepped_dec[slot].delay_ms = 100U;
+            stepped_dec[slot].heap_bgra = false;
+            stepped_dec[slot].ok = false;
+
+            const uint8_t *rgba = NULL;
+            uint32_t w = 0, h = 0, delay_ms = 100;
+            if (waywal_anim_next_frame(out->anim_dec, &rgba, &w, &h, &delay_ms) && rgba && w > 0 &&
+                h > 0) {
+                size_t px_bytes = (size_t)w * (size_t)h * 4U;
+                uint8_t *bgra = (uint8_t *)arena_alloc(&state->frame_arena, px_bytes, 32U);
+                bool heap_bgra = false;
+                if (!bgra) {
+                    bgra = (uint8_t *)malloc(px_bytes);
+                    heap_bgra = (bgra != NULL);
+                }
+                if (bgra) {
+                    swizzle_rgba_to_bgra(bgra, rgba, (size_t)w * (size_t)h);
+                    render_engine_bump_upload_gen(&state->render_engine);
+                    stepped_dec[slot].bgra = bgra;
+                    stepped_dec[slot].w = w;
+                    stepped_dec[slot].h = h;
+                    stepped_dec[slot].delay_ms = delay_ms;
+                    stepped_dec[slot].heap_bgra = heap_bgra;
+                    stepped_dec[slot].ok = true;
+                }
+            }
         }
 
-        swizzle_rgba_to_bgra(bgra, rgba, (size_t)w * (size_t)h);
+        if (!stepped_dec[slot].ok)
+            continue;
 
-        render_engine_bump_upload_gen(&state->render_engine);
-        output_node_render_image(state, out, bgra, w, h);
+        output_node_render_image(state, out, stepped_dec[slot].bgra, stepped_dec[slot].w,
+                                 stepped_dec[slot].h);
 
-        if (heap_bgra)
-            free(bgra);
-
-        uint32_t next_delay = delay_ms > 0 ? delay_ms : 100U;
+        uint32_t next_delay = stepped_dec[slot].delay_ms > 0 ? stepped_dec[slot].delay_ms : 100U;
         if (state->power_gov && waywal_power_governor_is_on_battery(state->power_gov) &&
             next_delay < 33U) {
             next_delay = 33U;
@@ -961,6 +1100,11 @@ static void daemon_anim_dispatch_frame(daemon_state_t *state)
         out->anim_next_ns = t_now + (uint64_t)next_delay * 1000000ULL;
         if (next_delay < next_arm_ms)
             next_arm_ms = next_delay;
+    }
+
+    for (size_t k = 0; k < num_stepped; ++k) {
+        if (stepped_dec[k].heap_bgra)
+            free(stepped_dec[k].bgra);
     }
 
     if (!any_active) {
@@ -1018,14 +1162,15 @@ void daemon_apply_mpris_album_art_and_theme(daemon_state_t *state,
 
     if (state->shader_eng) {
         waywal_shader_engine_set_media_playing(state->shader_eng, playing);
-        if (upload_art) {
+        if (upload_art && state->shader_active &&
+            waywal_shader_engine_uses_album_art(state->shader_eng)) {
             waywal_shader_engine_set_album_art_bgra(state->shader_eng, art_bgra, aw, ah);
             uploaded_gl = true;
         }
     }
     if (state->we_scene) {
         we_scene_set_media_playing(state->we_scene, playing);
-        if (upload_art) {
+        if (upload_art && state->workshop_active) {
             we_scene_set_album_art_bgra(state->we_scene, art_bgra, aw, ah);
             uploaded_gl = true;
         }
@@ -1033,14 +1178,15 @@ void daemon_apply_mpris_album_art_and_theme(daemon_state_t *state,
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (out->shader_eng && out->shader_eng != state->shader_eng) {
             waywal_shader_engine_set_media_playing(out->shader_eng, playing);
-            if (upload_art) {
+            if (upload_art && out->shader_active &&
+                waywal_shader_engine_uses_album_art(out->shader_eng)) {
                 waywal_shader_engine_set_album_art_bgra(out->shader_eng, art_bgra, aw, ah);
                 uploaded_gl = true;
             }
         }
         if (out->we_scene && out->we_scene != state->we_scene) {
             we_scene_set_media_playing(out->we_scene, playing);
-            if (upload_art) {
+            if (upload_art && out->workshop_active) {
                 we_scene_set_album_art_bgra(out->we_scene, art_bgra, aw, ah);
                 uploaded_gl = true;
             }
@@ -1169,6 +1315,15 @@ void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t *bgra_
     if (!state || !bgra_pixels || w == 0 || h == 0)
         return;
 
+    if (!meta || meta->transition_type == WAYWAL_TRANSITION_NONE ||
+        meta->transition_duration_ms == 0) {
+        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            if (!meta || output_matches_img_meta(out, meta)) {
+                release_output_transition_bos(state, out, true, true);
+            }
+        }
+    }
+
     uint32_t thumb_w = w;
     uint32_t thumb_h = h;
     if (thumb_w > 1920U || thumb_h > 1080U) {
@@ -1221,12 +1376,14 @@ void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t *bgra_
     uint32_t sh_w = state->wallpaper_rgba ? state->wallpaper_w : w;
     uint32_t sh_h = state->wallpaper_rgba ? state->wallpaper_h : h;
     bool uploaded_gl = false;
-    if (state->shader_eng) {
+    if (state->shader_eng && state->shader_active &&
+        waywal_shader_engine_uses_wallpaper(state->shader_eng)) {
         waywal_shader_engine_set_wallpaper_bgra(state->shader_eng, sh_px, sh_w, sh_h);
         uploaded_gl = true;
     }
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-        if (out->shader_eng && out->shader_eng != state->shader_eng) {
+        if (out->shader_eng && out->shader_eng != state->shader_eng && out->shader_active &&
+            waywal_shader_engine_uses_wallpaper(out->shader_eng)) {
             waywal_shader_engine_set_wallpaper_bgra(out->shader_eng, sh_px, sh_w, sh_h);
             uploaded_gl = true;
         }
@@ -1264,10 +1421,10 @@ void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t *bgra_
         bgra_pixels[2],
         255U,
     };
-    const uint8_t *extract_px =
-        (meta && meta->is_solid_color && bgra_pixels[3] == 0U) ? solid_opaque_px : bgra_pixels;
-    uint32_t extract_w = (meta && meta->is_solid_color && bgra_pixels[3] == 0U) ? 1U : w;
-    uint32_t extract_h = (meta && meta->is_solid_color && bgra_pixels[3] == 0U) ? 1U : h;
+    bool is_solid_zero_alpha = (meta && meta->is_solid_color && bgra_pixels[3] == 0U);
+    const uint8_t *extract_px = is_solid_zero_alpha ? solid_opaque_px : sh_px;
+    uint32_t extract_w = is_solid_zero_alpha ? 1U : sh_w;
+    uint32_t extract_h = is_solid_zero_alpha ? 1U : sh_h;
     waywal_palette_t extracted_pal;
     if (waywal_palette_extract_seed_ex(extract_px, extract_w, extract_h, extract_w * 4U, true,
                                        tmode, variant, state->config.theme.contrast, src_idx,
@@ -1490,14 +1647,29 @@ void daemon_shader_render_once(daemon_state_t *state)
         }
     }
 
-    if (state->audio_fft) {
+    bool need_audio_this_frame = false;
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (!out->surface || !out->configured || out->width <= 0 || out->height <= 0)
+            continue;
+        if (!out->shader_active && !out->workshop_active)
+            continue;
+        we_scene_t *wscene = out->we_scene ? out->we_scene : state->we_scene;
+        if (out->shader_audio_reactive || (out->workshop_active && wscene && wscene->uses_audio)) {
+            need_audio_this_frame = true;
+            break;
+        }
+    }
+    if (state->audio_fft && need_audio_this_frame) {
         (void)waywal_audio_fft_update_ducking(state->audio_fft, global_dt);
         (void)waywal_audio_fft_process(state->audio_fft, NULL);
         base_params.audio = waywal_audio_fft_get_frame(state->audio_fft);
     }
 
-    output_node_t *donor_out = NULL;
-    dmabuf_bo_t *donor_bo = NULL;
+    output_node_t *donor_outs[8];
+    dmabuf_bo_t *donor_bos[8];
+    float donor_norm_mx[8];
+    float donor_norm_my[8];
+    size_t num_donors = 0;
     bool any_committed = false;
 
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
@@ -1564,21 +1736,42 @@ void daemon_shader_render_once(daemon_state_t *state)
         bool needs_cursor =
             (out->workshop_active && wscene != NULL) ||
             (!out->workshop_active && seng != NULL && waywal_shader_engine_uses_mouse(seng));
-        if (needs_cursor && daemon_query_cursor_pos(state, out, &mx, &my)) {
-            double scale_x = (out->logical_width > 0 && out->width > 0)
-                                 ? ((double)out->width / (double)out->logical_width)
-                                 : (double)(out->scale_factor > 0 ? out->scale_factor : 1);
-            double scale_y = (out->logical_height > 0 && out->height > 0)
-                                 ? ((double)out->height / (double)out->logical_height)
-                                 : (double)(out->scale_factor > 0 ? out->scale_factor : 1);
+        output_node_t *cursor_src = out;
+        bool have_cursor = false;
+        if (needs_cursor) {
+            if (daemon_query_cursor_pos(state, out, &mx, &my)) {
+                have_cursor = true;
+            } else if (out->workshop_active && wscene != NULL &&
+                       out->scaling_mode != WAYWAL_SCALING_SPAN) {
+                for (output_node_t *o2 = state->outputs; o2 != NULL; o2 = o2->next) {
+                    if (o2 != out && o2->workshop_active &&
+                        (o2->we_scene ? o2->we_scene : state->we_scene) == wscene &&
+                        o2->width == out->width && o2->height == out->height &&
+                        daemon_query_cursor_pos(state, o2, &mx, &my)) {
+                        cursor_src = o2;
+                        have_cursor = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (have_cursor) {
+            double scale_x =
+                (cursor_src->logical_width > 0 && cursor_src->width > 0)
+                    ? ((double)cursor_src->width / (double)cursor_src->logical_width)
+                    : (double)(cursor_src->scale_factor > 0 ? cursor_src->scale_factor : 1);
+            double scale_y =
+                (cursor_src->logical_height > 0 && cursor_src->height > 0)
+                    ? ((double)cursor_src->height / (double)cursor_src->logical_height)
+                    : (double)(cursor_src->scale_factor > 0 ? cursor_src->scale_factor : 1);
             target_mx = (float)(mx * scale_x) + span_dx;
             target_my = ((float)out->height - (float)(my * scale_y)) + span_dy;
             fparams.mouse[0] = target_mx;
             fparams.mouse[1] = target_my;
 
-            float click_x = (float)(out->click_x * scale_x) + span_dx;
-            float click_y = ((float)out->height - (float)(out->click_y * scale_y)) + span_dy;
-            if (out->button_down) {
+            float click_x = (float)(cursor_src->click_x * scale_x) + span_dx;
+            float click_y = ((float)out->height - (float)(cursor_src->click_y * scale_y)) + span_dy;
+            if (cursor_src->button_down) {
                 fparams.mouse[2] = click_x;
                 fparams.mouse[3] = click_y;
             } else {
@@ -1626,37 +1819,107 @@ void daemon_shader_render_once(daemon_state_t *state)
             continue;
         }
 
-        if (layer_shell_ensure_dmabuf_ring(state, out, out->width, out->height) &&
-            out->use_dmabuf) {
+        float rscale = (!out->workshop_active && seng != NULL && out->viewport != NULL)
+                           ? waywal_shader_engine_get_render_scale(seng)
+                           : 1.0f;
+        if (rscale < 0.25f)
+            rscale = 0.25f;
+        else if (rscale > 1.0f)
+            rscale = 1.0f;
+        int32_t rw = (rscale < 0.999f) ? (int32_t)((float)out->width * rscale + 0.5f) : out->width;
+        int32_t rh =
+            (rscale < 0.999f) ? (int32_t)((float)out->height * rscale + 0.5f) : out->height;
+        rw &= ~1;
+        rh &= ~1;
+        if (rw < 64)
+            rw = out->width;
+        if (rh < 64)
+            rh = out->height;
+
+        if (out->dmabuf_ring.initialized &&
+            (out->dmabuf_ring.width != (uint32_t)rw || out->dmabuf_ring.height != (uint32_t)rh)) {
+            for (size_t bi = 0; bi < WAYWAL_DMABUF_RING_SIZE; ++bi) {
+                if (seng)
+                    waywal_shader_engine_forget_bo(seng, &out->dmabuf_ring.buffers[bi]);
+                if (wscene)
+                    waywal_we_scene_forget_bo(wscene, &out->dmabuf_ring.buffers[bi]);
+            }
+        }
+
+        waywal_shader_frame_params_t render_params = fparams;
+        if (rw != out->width || rh != out->height) {
+            float sx = (float)rw / (float)out->width;
+            float sy = (float)rh / (float)out->height;
+            render_params.mouse[0] *= sx;
+            render_params.mouse[1] *= sy;
+            render_params.mouse[2] *= sx;
+            render_params.mouse[3] *= sy;
+            render_params.mouse_smooth[0] *= sx;
+            render_params.mouse_smooth[1] *= sy;
+            render_params.mouse_vel[0] *= sx;
+            render_params.mouse_vel[1] *= sy;
+            render_params.span_rect[0] *= sx;
+            render_params.span_rect[1] *= sy;
+            render_params.span_rect[2] *= sx;
+            render_params.span_rect[3] *= sy;
+        }
+
+        float norm_mx = out->width > 0 ? (out->smooth_mouse_x / (float)out->width) : 0.5f;
+        float norm_my = out->height > 0 ? (out->smooth_mouse_y / (float)out->height) : 0.5f;
+
+        if (layer_shell_ensure_dmabuf_ring(state, out, rw, rh) && out->use_dmabuf) {
             dmabuf_bo_t *bo = dmabuf_ring_acquire(&out->dmabuf_ring);
             if (bo && bo->wl_buffer) {
                 bool rendered = false;
-                bool can_clone =
-                    (!out->workshop_active && seng != NULL && donor_out != NULL &&
-                     donor_bo != NULL &&
-                     (!out->shader_eng || out->shader_eng == donor_out->shader_eng ||
-                      (out->shader_path[0] != '\0' &&
-                       strcmp(out->shader_path, donor_out->shader_path) == 0)) &&
-                     out->shader_audio_reactive == donor_out->shader_audio_reactive &&
-                     !out->transition_active && !donor_out->transition_active &&
-                     out->width == donor_out->width && out->height == donor_out->height &&
-                     out->scaling_mode != WAYWAL_SCALING_SPAN &&
-                     donor_out->scaling_mode != WAYWAL_SCALING_SPAN &&
-                     !waywal_shader_engine_uses_mouse(seng));
-                if (can_clone) {
-                    rendered = waywal_shader_engine_blit_bo(seng, donor_bo, bo);
+                if (!out->transition_active && out->scaling_mode != WAYWAL_SCALING_SPAN) {
+                    for (size_t d = 0; d < num_donors; ++d) {
+                        output_node_t *d_out = donor_outs[d];
+                        dmabuf_bo_t *d_bo = donor_bos[d];
+                        if (!d_out || !d_bo || d_out->transition_active ||
+                            d_out->scaling_mode == WAYWAL_SCALING_SPAN ||
+                            d_bo->width != (uint32_t)rw || d_bo->height != (uint32_t)rh ||
+                            out->shader_audio_reactive != d_out->shader_audio_reactive) {
+                            continue;
+                        }
+                        if (out->workshop_active && d_out->workshop_active && wscene != NULL) {
+                            we_scene_t *d_wscene =
+                                d_out->we_scene ? d_out->we_scene : state->we_scene;
+                            if (wscene == d_wscene) {
+                                rendered = we_scene_blit_last_frame(wscene, bo);
+                                if (rendered)
+                                    break;
+                            }
+                        } else if (!out->workshop_active && !d_out->workshop_active &&
+                                   seng != NULL) {
+                            bool same_shader =
+                                (!out->shader_eng || out->shader_eng == d_out->shader_eng ||
+                                 (out->shader_path[0] != '\0' &&
+                                  strcmp(out->shader_path, d_out->shader_path) == 0));
+                            bool mouse_match = !waywal_shader_engine_uses_mouse(seng) ||
+                                               (fabsf(norm_mx - donor_norm_mx[d]) < 1e-3f &&
+                                                fabsf(norm_my - donor_norm_my[d]) < 1e-3f &&
+                                                !out->button_down && !d_out->button_down);
+                            if (same_shader && mouse_match) {
+                                rendered = waywal_shader_engine_blit_bo(seng, d_bo, bo);
+                                if (rendered)
+                                    break;
+                            }
+                        }
+                    }
                 }
                 if (!rendered) {
                     if (out->workshop_active && wscene) {
-                        rendered = we_scene_render_frame(wscene, bo, &fparams);
+                        rendered = we_scene_render_frame(wscene, bo, &render_params);
                     } else if (seng) {
-                        rendered = waywal_shader_engine_render_frame(seng, bo, &fparams);
-                        if (rendered && donor_out == NULL && !out->transition_active &&
-                            out->scaling_mode != WAYWAL_SCALING_SPAN &&
-                            !waywal_shader_engine_uses_mouse(seng)) {
-                            donor_out = out;
-                            donor_bo = bo;
-                        }
+                        rendered = waywal_shader_engine_render_frame(seng, bo, &render_params);
+                    }
+                    if (rendered && num_donors < 8 && !out->transition_active &&
+                        out->scaling_mode != WAYWAL_SCALING_SPAN) {
+                        donor_outs[num_donors] = out;
+                        donor_bos[num_donors] = bo;
+                        donor_norm_mx[num_donors] = norm_mx;
+                        donor_norm_my[num_donors] = norm_my;
+                        num_donors++;
                     }
                 }
                 if (rendered) {
@@ -1677,7 +1940,7 @@ void daemon_shader_render_once(daemon_state_t *state)
                         }
                     }
                     wl_surface_attach(out->surface, bo->wl_buffer, 0, 0);
-                    wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
+                    wl_surface_damage_buffer(out->surface, 0, 0, rw, rh);
                     presentation_sync_request(&out->pres_sync);
                     wl_surface_commit(out->surface);
                     out->last_presented_bo = bo;
@@ -1955,7 +2218,9 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
         }
         state->shader_active = true;
         state->workshop_active = false;
-        state->shader_fps = spay->fps > 0 ? spay->fps : 60U;
+        uint32_t hint_fps =
+            state->shader_eng ? waywal_shader_engine_get_target_fps(state->shader_eng) : 60U;
+        state->shader_fps = spay->fps > 0 ? spay->fps : (hint_fps > 0 ? hint_fps : 60U);
         memset(state->shader_target_output, 0, sizeof(state->shader_target_output));
         strncpy(state->shader_target_output, spay->output[0] ? spay->output : "*",
                 sizeof(state->shader_target_output) - 1);
@@ -1997,9 +2262,28 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
 
         if (has_transition) {
             layer_shell_snapshot_live_output(state, out);
+        } else {
+            release_output_transition_bos(state, out, true, true);
         }
 
-        if (!out->shader_eng && state->dmabuf_ctx.available) {
+        waywal_shader_engine_t *shared_donor_eng = NULL;
+        if (state->dmabuf_ctx.available) {
+            for (output_node_t *prev = state->outputs; prev != NULL && prev != out;
+                 prev = prev->next) {
+                if (prev->shader_active && prev->shader_eng && prev->width == out->width &&
+                    prev->height == out->height && strcmp(prev->shader_path, shader_file) == 0) {
+                    shared_donor_eng = prev->shader_eng;
+                    break;
+                }
+            }
+        }
+
+        if (shared_donor_eng) {
+            if (out->shader_eng && out->shader_eng != shared_donor_eng) {
+                destroy_output_shader_eng(state, out);
+            }
+            out->shader_eng = shared_donor_eng;
+        } else if (!out->shader_eng && state->dmabuf_ctx.available) {
             render_engine_make_current(&state->render_engine);
             if (state->shader_eng &&
                 !is_shader_eng_attached_to_any_output(state, state->shader_eng)) {
@@ -2015,25 +2299,29 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
         }
 
         bool loaded = false;
-        if (out->shader_eng) {
-            if (state->wallpaper_rgba && state->wallpaper_w > 0 && state->wallpaper_h > 0) {
-                waywal_shader_engine_set_wallpaper_bgra(out->shader_eng, state->wallpaper_rgba,
-                                                        state->wallpaper_w, state->wallpaper_h);
-            }
-            if (state->mpris) {
-                const waywal_mpris_state_t *ms = waywal_mpris_get_state(state->mpris);
-                if (ms) {
-                    waywal_shader_engine_set_media_playing(
-                        out->shader_eng, (ms->status == WAYWAL_MPRIS_PLAYING) ? 1.0f : 0.0f);
-                    if (ms->has_art_pixels && ms->art_bgra) {
-                        waywal_shader_engine_set_album_art_bgra(out->shader_eng, ms->art_bgra,
-                                                                ms->art_width, ms->art_height);
-                    }
-                }
-            }
+        if (shared_donor_eng) {
+            loaded = true;
+        } else if (out->shader_eng) {
             first_compile_attempted = true;
             if (waywal_shader_engine_load_file(out->shader_eng, shader_file)) {
                 loaded = true;
+                if (state->wallpaper_rgba && state->wallpaper_w > 0 && state->wallpaper_h > 0 &&
+                    waywal_shader_engine_uses_wallpaper(out->shader_eng)) {
+                    waywal_shader_engine_set_wallpaper_bgra(out->shader_eng, state->wallpaper_rgba,
+                                                            state->wallpaper_w, state->wallpaper_h);
+                }
+                if (state->mpris) {
+                    const waywal_mpris_state_t *ms = waywal_mpris_get_state(state->mpris);
+                    if (ms) {
+                        waywal_shader_engine_set_media_playing(
+                            out->shader_eng, (ms->status == WAYWAL_MPRIS_PLAYING) ? 1.0f : 0.0f);
+                        if (ms->has_art_pixels && ms->art_bgra &&
+                            waywal_shader_engine_uses_album_art(out->shader_eng)) {
+                            waywal_shader_engine_set_album_art_bgra(out->shader_eng, ms->art_bgra,
+                                                                    ms->art_width, ms->art_height);
+                        }
+                    }
+                }
                 int inotify_fd = waywal_shader_engine_get_inotify_fd(out->shader_eng);
                 if (inotify_fd >= 0) {
                     register_fd_in_loops(state, inotify_fd, URING_EV_SHADER_INOTIFY);
@@ -2057,10 +2345,12 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
         stop_engines_on_output(state, out, true, false, false, false);
         destroy_output_we_scene(state, out);
 
+        uint32_t hint_fps =
+            out->shader_eng ? waywal_shader_engine_get_target_fps(out->shader_eng) : 60U;
         out->shader_active = true;
         out->workshop_active = false;
         out->shader_audio_reactive = spay->audio_reactive;
-        out->shader_fps = spay->fps > 0 ? spay->fps : 60U;
+        out->shader_fps = spay->fps > 0 ? spay->fps : (hint_fps > 0 ? hint_fps : 60U);
         out->shader_frame_idx = 0;
         out->shader_start_ns = t_now;
         out->shader_last_ns = t_now;
@@ -2213,6 +2503,9 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
         state->transitions_in_progress = true;
     }
     daemon_reconcile_power_state(state);
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
     return true;
 }
 
@@ -2396,6 +2689,8 @@ static bool daemon_render_image_on_target_ex(daemon_state_t *state, const char *
             if (output_matches_img_meta(out, meta)) {
                 if (has_transition) {
                     layer_shell_snapshot_live_output(state, out);
+                } else {
+                    release_output_transition_bos(state, out, true, true);
                 }
                 stop_engines_on_output(state, out, false, false, false, false);
             }
@@ -2849,7 +3144,11 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
             if (ino_fd >= 0) {
                 unregister_fd_from_loops(state, ino_fd);
             }
-            waywal_shader_engine_release_scratch(state->shader_eng);
+            if (state->dmabuf_ctx.available) {
+                render_engine_make_current(&state->render_engine);
+            }
+            waywal_shader_engine_destroy(state->shader_eng);
+            state->shader_eng = NULL;
         }
         anim_engine_stop_playback(state);
         if (wpay->audio_reactive || state->we_scene->uses_audio) {
@@ -2861,17 +3160,13 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
                 state->audio_fft = waywal_audio_fft_create(48000, true);
             }
             if (state->audio_fft) {
+                waywal_audio_fft_set_capture_active(state->audio_fft, true);
                 waywal_audio_fft_set_volume(state->audio_fft, state->audio_volume);
                 waywal_audio_fft_set_mute_on_audio(state->audio_fft, state->mute_on_audio);
             }
-        } else if (state->audio_fft && waywal_audio_fft_is_pipewire_active(state->audio_fft)) {
+        } else if (state->audio_fft) {
             detach_all_scene_audio(state);
-            waywal_audio_fft_destroy(state->audio_fft);
-            state->audio_fft = waywal_audio_fft_create(48000, false);
-            if (state->audio_fft) {
-                waywal_audio_fft_set_volume(state->audio_fft, state->audio_volume);
-                waywal_audio_fft_set_mute_on_audio(state->audio_fft, state->mute_on_audio);
-            }
+            waywal_audio_fft_set_capture_active(state->audio_fft, false);
         }
         we_scene_set_audio_output(state->we_scene,
                                   state->we_scene->uses_audio ? state->audio_fft : NULL);
@@ -2924,11 +3219,25 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
 
         if (has_transition) {
             layer_shell_snapshot_live_output(state, out);
+        } else {
+            release_output_transition_bos(state, out, true, true);
         }
 
         destroy_output_we_scene(state, out);
 
-        if (state->dmabuf_ctx.available) {
+        we_scene_t *shared_donor_scene = NULL;
+        for (output_node_t *prev = state->outputs; prev != NULL && prev != out; prev = prev->next) {
+            if (prev->workshop_active && prev->we_scene && prev->width == out->width &&
+                prev->height == out->height && strcmp(prev->workshop_dir, ws_dir) == 0 &&
+                strcmp(prev->workshop_props, wpay->prop_overrides) == 0) {
+                shared_donor_scene = prev->we_scene;
+                break;
+            }
+        }
+
+        if (shared_donor_scene) {
+            out->we_scene = shared_donor_scene;
+        } else if (state->dmabuf_ctx.available) {
             render_engine_make_current(&state->render_engine);
             out->we_scene = we_scene_create(&state->dmabuf_ctx, ws_dir, wpay->prop_overrides);
         } else {
@@ -2943,6 +3252,7 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
             continue;
         }
 
+        destroy_output_shader_eng(state, out);
         stop_engines_on_output(state, out, true, false, false, false);
 
         out->shader_active = false;
@@ -3162,6 +3472,9 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
         state->transitions_in_progress = true;
     }
     daemon_reconcile_power_state(state);
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
     return true;
 }
 
@@ -3352,6 +3665,7 @@ static bool daemon_render_color_on_target(daemon_state_t *state, const char *tar
         daemon_clear_all_outputs(state, col);
     } else if (strcmp(target, "*") == 0) {
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            release_output_transition_bos(state, out, true, true);
             stop_engines_on_output(state, out, false, false, false, false);
             if (out->name[0] != '\0') {
                 int n = snprintf(matched_outputs + mlen, sizeof(matched_outputs) - mlen, "%s%s",
@@ -3368,6 +3682,7 @@ static bool daemon_render_color_on_target(daemon_state_t *state, const char *tar
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
             if (output_matches_target_spec(out, target)) {
                 any_matched = true;
+                release_output_transition_bos(state, out, true, true);
                 stop_engines_on_output(state, out, false, false, false, false);
                 output_node_render_color(state, out, col);
                 if (out->name[0] != '\0') {
@@ -3419,6 +3734,8 @@ void daemon_slideshow_prepare_image_output(daemon_state_t *state, slideshow_engi
             if (matches) {
                 if (ss->transition_type != WAYWAL_TRANSITION_NONE && dur_ms > 0) {
                     layer_shell_snapshot_live_output(state, out);
+                } else {
+                    release_output_transition_bos(state, out, true, true);
                 }
                 stop_engines_on_output(state, out, false, false, false, true);
                 out->slideshow_eng = ss;
@@ -4770,6 +5087,10 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
 
 int main(int argc, char *argv[])
 {
+#if defined(__GLIBC__)
+    (void)mallopt(M_MMAP_THRESHOLD, 64 * 1024);
+    (void)mallopt(M_TRIM_THRESHOLD, 64 * 1024);
+#endif
     daemon_state_t state;
     memset(&state, 0, sizeof(state));
     state.shader_timer_fd = -1;

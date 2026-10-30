@@ -3,6 +3,7 @@
 // @description: Domain-warped FBM liquid marble ink currents with mouse ripple and audio reactivity
 // @author: WayWal
 // @audio_reactive: false
+// @wwal_scale: 0.75
 
 const vec3 PAL_INK_BASE = vec3(0.04, 0.06, 0.12);
 const vec3 PAL_INK_TEAL = vec3(0.12, 0.64, 0.78);

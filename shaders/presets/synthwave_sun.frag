@@ -21,9 +21,10 @@ float sw_palm(vec2 uv, vec2 base, float scale, float lean)
     float trunk = step(0.0, p.y) * step(p.y, 1.0) * (1.0 - smoothstep(trunk_lo, trunk_hi, abs(p.x - trunk_x)));
 
     vec2 crown = p - vec2(lean, 1.0);
-    float r = length(crown);
+    float r2 = dot(crown, crown);
     float fronds = 0.0;
-    if (r < 0.38 && r > 1e-4) {
+    if (r2 < 0.1296 && r2 > 1e-8) {
+        float r = sqrt(r2);
         float ang = atan(crown.y, (r > 1e-5) ? crown.x : 1.0);
         float leaf = cos(ang * 7.0 + sin(r * 10.0 - mod(iTime, 628.31853) * 1.2) * 0.4);
         float arch = (1.0 - smoothstep(0.05, 0.36, r)) * smoothstep(-0.7, 0.2, crown.y + r * 0.6);
@@ -94,9 +95,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         col = sea;
     }
 
-    float palm_l = sw_palm(uv, vec2(-0.52, -0.06), 0.34, 0.24);
-    float palm_r = sw_palm(uv, vec2(0.54, -0.06), 0.30, -0.22);
-    col = mix(col, vec3(0.02, 0.005, 0.05), clamp(palm_l + palm_r, 0.0, 1.0));
+    if (abs(uv.x) > 0.28) {
+        float palm = (uv.x < 0.0) ? sw_palm(uv, vec2(-0.52, -0.06), 0.34, 0.24)
+                                  : sw_palm(uv, vec2(0.54, -0.06), 0.30, -0.22);
+        col = mix(col, vec3(0.02, 0.005, 0.05), palm);
+    }
 
     fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }

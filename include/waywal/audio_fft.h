@@ -43,6 +43,7 @@ float waywal_audio_fft_get_volume(const waywal_audio_fft_t *fft);
 
 void waywal_audio_fft_set_mute_on_audio(waywal_audio_fft_t *fft, bool mute_on_audio);
 bool waywal_audio_fft_get_mute_on_audio(const waywal_audio_fft_t *fft);
+void waywal_audio_fft_set_capture_active(waywal_audio_fft_t *fft, bool active);
 
 bool waywal_audio_fft_is_pipewire_active(const waywal_audio_fft_t *fft);
 bool waywal_audio_fft_is_external_audio_active(const waywal_audio_fft_t *fft);

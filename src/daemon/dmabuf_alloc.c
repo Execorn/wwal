@@ -359,6 +359,13 @@ void dmabuf_bo_free(dmabuf_bo_t *bo)
         return;
     bo->egl_image = NULL;
     bo->gl_tex = 0;
+    if (!bo->gbm_bo && !bo->wl_buffer) {
+        for (int p = 0; p < WAYWAL_MAX_BUFFER_PLANES; ++p) {
+            bo->fd[p] = -1;
+        }
+        bo->in_use = false;
+        return;
+    }
     if (bo->wl_buffer) {
         wl_buffer_destroy(bo->wl_buffer);
         bo->wl_buffer = NULL;
@@ -388,24 +395,25 @@ bool dmabuf_ring_init(dmabuf_context_t *ctx, dmabuf_ring_t *ring, uint32_t width
     if (!ctx || !ctx->available || !ring || width == 0 || height == 0)
         return false;
     memset(ring, 0, sizeof(*ring));
+    for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+        for (int p = 0; p < WAYWAL_MAX_BUFFER_PLANES; ++p) {
+            ring->buffers[i].fd[p] = -1;
+        }
+    }
+    ring->ctx = ctx;
     ring->width = width;
     ring->height = height;
     ring->drm_format = drm_format;
     ring->modifier = modifier;
 
-    for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
-        if (!dmabuf_bo_allocate(ctx, &ring->buffers[i], width, height, drm_format, modifier)) {
-            WAYWAL_LOG_ERR("Failed to allocate ring buffer %zu", i);
-            for (size_t j = 0; j < i; ++j) {
-                dmabuf_bo_free(&ring->buffers[j]);
-            }
-            return false;
-        }
+    if (!dmabuf_bo_allocate(ctx, &ring->buffers[0], width, height, drm_format, modifier)) {
+        WAYWAL_LOG_ERR("Failed to allocate initial ring buffer 0");
+        return false;
     }
 
     ring->initialized = true;
-    WAYWAL_LOG_DEBUG("Initialized DMA-BUF ring for %ux%u (mod: 0x%016lx)", width, height,
-                     (unsigned long)modifier);
+    WAYWAL_LOG_DEBUG("Initialized lazy DMA-BUF ring for %ux%u (mod: 0x%016lx, 1/%d allocated)",
+                     width, height, (unsigned long)modifier, WAYWAL_DMABUF_RING_SIZE);
     return true;
 }
 
@@ -421,6 +429,39 @@ void dmabuf_ring_destroy(dmabuf_context_t *ctx, dmabuf_ring_t *ring)
     ring->initialized = false;
 }
 
+void dmabuf_ring_trim_idle(dmabuf_ring_t *ring)
+{
+    if (!ring || !ring->initialized)
+        return;
+
+    int keep_idx = -1;
+    size_t last_idx = (ring->current_idx + WAYWAL_DMABUF_RING_SIZE - 1) % WAYWAL_DMABUF_RING_SIZE;
+    if (ring->buffers[last_idx].gbm_bo != NULL) {
+        keep_idx = (int)last_idx;
+    } else {
+        for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+            if (ring->buffers[i].gbm_bo != NULL && ring->buffers[i].in_use) {
+                keep_idx = (int)i;
+                break;
+            }
+        }
+        if (keep_idx < 0) {
+            for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+                if (ring->buffers[i].gbm_bo != NULL) {
+                    keep_idx = (int)i;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+        if (ring->buffers[i].gbm_bo != NULL && !ring->buffers[i].in_use && (int)i != keep_idx) {
+            dmabuf_bo_free(&ring->buffers[i]);
+        }
+    }
+}
+
 dmabuf_bo_t *dmabuf_ring_acquire(dmabuf_ring_t *ring)
 {
     if (!ring || !ring->initialized)
@@ -428,10 +469,29 @@ dmabuf_bo_t *dmabuf_ring_acquire(dmabuf_ring_t *ring)
 
     for (size_t attempt = 0; attempt < WAYWAL_DMABUF_RING_SIZE; ++attempt) {
         size_t idx = (ring->current_idx + attempt) % WAYWAL_DMABUF_RING_SIZE;
-        if (!ring->buffers[idx].in_use) {
+        bool slot_allocated =
+            (ring->buffers[idx].gbm_bo != NULL || ring->buffers[idx].wl_buffer != NULL);
+        if (slot_allocated && !ring->buffers[idx].in_use) {
             ring->current_idx = (idx + 1) % WAYWAL_DMABUF_RING_SIZE;
             ring->buffers[idx].in_use = true;
             return &ring->buffers[idx];
+        }
+    }
+
+    if (ring->ctx) {
+        for (size_t attempt = 0; attempt < WAYWAL_DMABUF_RING_SIZE; ++attempt) {
+            size_t idx = (ring->current_idx + attempt) % WAYWAL_DMABUF_RING_SIZE;
+            bool slot_allocated =
+                (ring->buffers[idx].gbm_bo != NULL || ring->buffers[idx].wl_buffer != NULL);
+            if (!slot_allocated) {
+                if (dmabuf_bo_allocate(ring->ctx, &ring->buffers[idx], ring->width, ring->height,
+                                       ring->drm_format, ring->modifier)) {
+                    ring->current_idx = (idx + 1) % WAYWAL_DMABUF_RING_SIZE;
+                    ring->buffers[idx].in_use = true;
+                    return &ring->buffers[idx];
+                }
+                break;
+            }
         }
     }
 

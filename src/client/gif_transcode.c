@@ -749,7 +749,7 @@ bool video_transcode_optimize(const char *filepath, uint32_t max_width, uint32_t
         if (probe_mp4_stream(filepath, &probe)) {
             bool fits_bounds = (probe.width <= max_width && probe.height <= max_height);
             bool is_supported_hw_stream =
-                (probe.is_supported_codec && (!probe.is_h264 || probe.num_ref_frames <= 16));
+                (probe.is_supported_codec && (!probe.is_h264 || probe.num_ref_frames <= 4));
 
             if (fits_bounds && is_supported_hw_stream) {
                 strncpy(out_path, filepath, out_path_size - 1);

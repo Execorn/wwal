@@ -1184,23 +1184,30 @@ bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *
         return true;
     }
 
-    if (out && state->outputs) {
-        for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
-            if (o->has_cursor) {
-                double gx = (double)o->global_x + o->cursor_x;
-                double gy = (double)o->global_y + o->cursor_y;
-                *out_x = gx - (double)out->global_x;
-                *out_y = gy - (double)out->global_y;
-                return true;
-            }
-        }
-    }
-
     double ref_w =
         out ? (out->logical_width > 0 ? (double)out->logical_width : (double)out->width) : 1920.0;
     double ref_h =
         out ? (out->logical_height > 0 ? (double)out->logical_height : (double)out->height)
             : 1080.0;
+
+    if (out && state->outputs) {
+        for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
+            if (o->has_cursor) {
+                double gx = (double)o->global_x + o->cursor_x;
+                double gy = (double)o->global_y + o->cursor_y;
+                double lx = gx - (double)out->global_x;
+                double ly = gy - (double)out->global_y;
+                if (out->scaling_mode != WAYWAL_SCALING_SPAN && ref_w > 0.0 && ref_h > 0.0) {
+                    if (lx < 0.0 || lx > ref_w || ly < 0.0 || ly > ref_h) {
+                        return false;
+                    }
+                }
+                *out_x = lx;
+                *out_y = ly;
+                return true;
+            }
+        }
+    }
 
     /* Fall back to compositor IPC cursor query when windows occlude wl_pointer focus,
      * provided an interactive shader or Workshop scene is active and unpaused */

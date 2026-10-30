@@ -3,6 +3,7 @@
 // @description: 64-band log-frequency Bark FFT spectrum analyzer with peak hold and floor reflection
 // @author: WayWal
 // @audio_reactive: true
+// @wwal_scale: 0.75
 
 const vec3 PAL_AB_BG = vec3(0.03, 0.04, 0.08);
 const vec3 PAL_AB_LOW = vec3(0.12, 0.82, 0.96);
@@ -39,20 +40,23 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
 
     if (mask_x > 0.0 && y_dist >= 0.0) {
         float x_norm = float(bar_idx) * (1.0 / 63.0);
-        float log_u = pow(max(x_norm, 1e-4), 1.65) * 0.85 + 0.01;
-        float raw_tex = textureLod(iChannel0, vec2(log_u, 0.25), 0.0).r;
-        float tex_amp = (isnan(raw_tex) || isinf(raw_tex)) ? 0.0 : clamp(raw_tex, 0.0, 1.0);
         float raw_band = u_audio_bands[bar_idx];
         float safe_band = (isnan(raw_band) || isinf(raw_band)) ? 0.0 : clamp(raw_band, 0.0, 1.0);
         float safe_env =
             (isnan(u_audio_envelope) || isinf(u_audio_envelope)) ? 0.0 : clamp(u_audio_envelope, 0.0, 1.0);
+        float tex_amp = 0.0;
+        if (safe_env < 0.001 && safe_band < 0.001) {
+            float log_u = pow(max(x_norm, 1e-4), 1.65) * 0.85 + 0.01;
+            float raw_tex = textureLod(iChannel0, vec2(log_u, 0.25), 0.0).r;
+            tex_amp = (isnan(raw_tex) || isinf(raw_tex)) ? 0.0 : clamp(raw_tex, 0.0, 1.0);
+        }
         float band_amp = max(safe_band, tex_amp);
 
         float synth_amp = 0.28 + 0.22 * sin(iTime * 2.6 + x_norm * 7.5) * cos(iTime * 1.7 - x_norm * 4.2)
                                + 0.14 * sin(iTime * 4.8 + x_norm * 15.0);
         synth_amp *= smoothstep(0.0, 0.15, x_norm) * (1.0 - smoothstep(0.65, 1.0, x_norm)) + 0.25;
 
-        float active_audio = smoothstep(0.01, 0.08, safe_env + tex_amp * 0.5);
+        float active_audio = smoothstep(0.01, 0.08, safe_env + band_amp * 0.5);
         float live_amp = max(band_amp * 0.92, synth_amp * 0.22) + safe_beat * 0.08;
         float amp = clamp(mix(synth_amp, live_amp, active_audio), 0.02, 0.94);
 

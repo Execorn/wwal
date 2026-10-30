@@ -98,5 +98,8 @@ void daemon_broadcast_event(daemon_state_t *state, const char *event_name);
 void daemon_reap_dead_subscribers(daemon_state_t *state);
 size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, char *buf,
                                 size_t cap);
+void layer_shell_release_output_bo_refs(daemon_state_t *state, output_node_t *node,
+                                        dmabuf_bo_t *bo);
+void layer_shell_trim_output_dmabuf_ring(daemon_state_t *state, output_node_t *node);
 
 #endif /* WAYWAL_DAEMON_INTERNAL_H */

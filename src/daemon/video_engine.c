@@ -603,6 +603,52 @@ static void reclaim_output_shm_for_video(output_node_t *out)
         madvise(out->shm_data, out->shm_size, MADV_REMOVE);
         madvise(out->shm_data, out->shm_size, MADV_DONTNEED);
     }
+
+    daemon_state_t *state = out->state;
+    if (out->has_source_old_bo) {
+        if (out->shader_eng) {
+            waywal_shader_engine_forget_bo(out->shader_eng, &out->source_old_bo);
+        }
+        if (state && state->shader_eng && state->shader_eng != out->shader_eng) {
+            waywal_shader_engine_forget_bo(state->shader_eng, &out->source_old_bo);
+        }
+        if (out->we_scene) {
+            waywal_we_scene_forget_bo(out->we_scene, &out->source_old_bo);
+        }
+        if (state && state->we_scene && state->we_scene != out->we_scene) {
+            waywal_we_scene_forget_bo(state->we_scene, &out->source_old_bo);
+        }
+        if (state) {
+            render_engine_release_bo(&state->render_engine, &out->source_old_bo);
+        }
+        dmabuf_bo_free(&out->source_old_bo);
+        out->has_source_old_bo = false;
+        if (out->last_presented_bo == &out->source_old_bo) {
+            out->last_presented_bo = NULL;
+        }
+    }
+    if (out->has_source_new_bo) {
+        if (out->shader_eng) {
+            waywal_shader_engine_forget_bo(out->shader_eng, &out->source_new_bo);
+        }
+        if (state && state->shader_eng && state->shader_eng != out->shader_eng) {
+            waywal_shader_engine_forget_bo(state->shader_eng, &out->source_new_bo);
+        }
+        if (out->we_scene) {
+            waywal_we_scene_forget_bo(out->we_scene, &out->source_new_bo);
+        }
+        if (state && state->we_scene && state->we_scene != out->we_scene) {
+            waywal_we_scene_forget_bo(state->we_scene, &out->source_new_bo);
+        }
+        if (state) {
+            render_engine_release_bo(&state->render_engine, &out->source_new_bo);
+        }
+        dmabuf_bo_free(&out->source_new_bo);
+        out->has_source_new_bo = false;
+        if (out->last_presented_bo == &out->source_new_bo) {
+            out->last_presented_bo = NULL;
+        }
+    }
 }
 
 static void configure_output_video_viewport(output_node_t *out, uint32_t vid_w, uint32_t vid_h)
@@ -738,6 +784,7 @@ static void video_engine_prepare_reload(video_engine_t *ve)
     ve->has_decoded_any = false;
     ve->playback_epoch_ns = 0;
     ve->last_export_surf = VA_INVALID_SURFACE;
+    video_engine_release_wl_buffers(ve);
 #ifdef HAVE_FFMPEG_SWDEC
     swdec_destroy(ve);
 #endif
@@ -823,9 +870,30 @@ static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux
     } else if (demux->codec == WAYWAL_CODEC_VP9 || demux->codec == WAYWAL_CODEC_AV1) {
         max_refs = 8;
     }
-    uint32_t needed_surfaces = max_refs + 6;
-    if (needed_surfaces < 8)
-        needed_surfaces = 8;
+    uint32_t needed_surfaces;
+    if (!want_direct) {
+        if (demux->codec == WAYWAL_CODEC_VP9 || demux->codec == WAYWAL_CODEC_AV1) {
+            needed_surfaces = 9;
+        } else {
+            bool no_reorder =
+                (demux->codec == WAYWAL_CODEC_H264 && dec->cached_sps.valid &&
+                 (dec->cached_sps.profile_idc == 66 || dec->cached_sps.constraint_set1_flag != 0 ||
+                  dec->cached_sps.num_ref_frames <= 1 ||
+                  dec->cached_sps.pic_order_cnt_type == 2)) ||
+                (demux->codec == WAYWAL_CODEC_HEVC && dec->cached_hevc_sps.valid &&
+                 dec->cached_hevc_sps.sps_max_num_reorder_pics == 0);
+            uint32_t min_surf = no_reorder ? 3U : 5U;
+            needed_surfaces = max_refs + (no_reorder ? 2U : 3U);
+            if (needed_surfaces < min_surf)
+                needed_surfaces = min_surf;
+            if (needed_surfaces > 9U)
+                needed_surfaces = 9U;
+        }
+    } else {
+        needed_surfaces = max_refs + 4;
+        if (needed_surfaces < 6)
+            needed_surfaces = 6;
+    }
     if (needed_surfaces > WAYWAL_VA_SURFACE_POOL_SIZE)
         needed_surfaces = WAYWAL_VA_SURFACE_POOL_SIZE;
 
@@ -994,6 +1062,7 @@ bool video_engine_load_mem(video_engine_t *ve, int memfd, size_t size, output_no
         }
         return false;
     }
+    (void)madvise(mapped, size, MADV_RANDOM);
 
     ve->demuxer = demuxer_open_mem((const uint8_t *)mapped, size);
     if (!ve->demuxer) {
@@ -1015,6 +1084,9 @@ bool video_engine_load_mem(video_engine_t *ve, int memfd, size_t size, output_no
     if (state) {
         state->owns_mmap = true;
         state->file_fd = memfd;
+    }
+    if (ve->demuxer->seek_us) {
+        ve->demuxer->seek_us(ve->demuxer, 0);
     }
 
     return video_engine_start_playback(ve, out);
@@ -1058,6 +1130,7 @@ static bool reorder_has_ready_frame(video_engine_t *ve)
             }
         } else if (ve->demuxer->codec == WAYWAL_CODEC_H264) {
             if (ve->decoder.cached_sps.valid && (ve->decoder.cached_sps.profile_idc == 66 ||
+                                                 ve->decoder.cached_sps.constraint_set1_flag != 0 ||
                                                  ve->decoder.cached_sps.num_ref_frames <= 1 ||
                                                  ve->decoder.cached_sps.pic_order_cnt_type == 2)) {
                 target_depth = 1U;
@@ -1087,11 +1160,10 @@ static bool reorder_has_ready_frame(video_engine_t *ve)
         ve->next_present_poc = 0;
     }
 
-    if (ve->next_present_poc == 0) {
-        for (uint32_t i = 0; i < ve->reorder_count; ++i) {
-            if (ve->reorder_buf[i].gop_id == ve->next_present_gop && ve->reorder_buf[i].poc <= 0) {
-                return true;
-            }
+    for (uint32_t i = 0; i < ve->reorder_count; ++i) {
+        if (ve->reorder_buf[i].gop_id == ve->next_present_gop &&
+            ve->reorder_buf[i].poc <= ve->next_present_poc) {
+            return true;
         }
     }
     return false;
@@ -1167,7 +1239,7 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                     if (sw->has_gbm_ring && sw->last_ready_ring_idx >= 0 &&
                         sw->wl_bufs[sw->last_ready_ring_idx]) {
                         int r_idx = sw->last_ready_ring_idx;
-                        sw->buf_busy[r_idx]++;
+                        sw->buf_busy[r_idx] = 1;
                         configure_output_video_viewport(out, sw->width, sw->height);
                         wl_surface_attach(out->surface, sw->wl_bufs[r_idx], 0, 0);
                         wl_surface_damage_buffer(out->surface, 0, 0, (int32_t)sw->width,
@@ -1336,7 +1408,9 @@ void video_engine_dispatch_frame(video_engine_t *ve)
 
         ve->last_pts_us = pres.pts_us;
         ve->next_present_gop = pres.gop_id;
-        ve->next_present_poc = pres.poc + 1;
+        int32_t poc_step =
+            (ve->demuxer && ve->demuxer->codec == WAYWAL_CODEC_H264 && (pres.poc & 1) == 0) ? 2 : 1;
+        ve->next_present_poc = pres.poc + poc_step;
 
         VASurfaceID export_surf = pres.surface;
         uint32_t buf_idx = pres.surf_idx;
@@ -1380,9 +1454,39 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                 wl_surface_commit(out->surface);
                 out->has_image = true;
                 attached_count++;
+                if (out->dmabuf_ring.initialized) {
+                    for (size_t k = 0; k < WAYWAL_DMABUF_RING_SIZE; ++k) {
+                        dmabuf_bo_t *rbo = &out->dmabuf_ring.buffers[k];
+                        if ((rbo->gbm_bo != NULL || rbo->wl_buffer != NULL) && !rbo->in_use) {
+                            if (out->shader_eng) {
+                                waywal_shader_engine_forget_bo(out->shader_eng, rbo);
+                            }
+                            if (ve->daemon_state->shader_eng &&
+                                ve->daemon_state->shader_eng != out->shader_eng) {
+                                waywal_shader_engine_forget_bo(ve->daemon_state->shader_eng, rbo);
+                            }
+                            if (out->we_scene) {
+                                waywal_we_scene_forget_bo(out->we_scene, rbo);
+                            }
+                            if (ve->daemon_state->we_scene &&
+                                ve->daemon_state->we_scene != out->we_scene) {
+                                waywal_we_scene_forget_bo(ve->daemon_state->we_scene, rbo);
+                            }
+                            if (out->last_presented_bo == rbo) {
+                                out->last_presented_bo = NULL;
+                            }
+                            if (out->last_committed_ring_idx == (int)k) {
+                                out->last_committed_ring_idx = -1;
+                            }
+                            render_engine_release_bo(&ve->daemon_state->render_engine, rbo);
+                            dmabuf_bo_free(rbo);
+                        }
+                    }
+                }
             }
             if (attached_count > 0) {
-                ve->video_buffer_in_use[buf_idx] += attached_count;
+                ve->video_buffer_in_use[buf_idx] = 1;
+                render_engine_release_upload_cache(&ve->daemon_state->render_engine);
                 wl_display_flush(ve->daemon_state->display);
             }
         }
@@ -1457,7 +1561,8 @@ void video_engine_resume(video_engine_t *ve)
 
 void video_engine_stop(video_engine_t *ve)
 {
-    if (!ve || (ve->state == WAYWAL_VIDEO_STATE_STOPPED && !ve->demuxer && !ve->using_swdec))
+    if (!ve || (ve->state == WAYWAL_VIDEO_STATE_STOPPED && !ve->demuxer && !ve->using_swdec &&
+                !ve->decoder.initialized))
         return;
 
     struct itimerspec its = {0};
@@ -1492,26 +1597,7 @@ void video_engine_stop(video_engine_t *ve)
     }
 
     if (ve->decoder.initialized) {
-        if (ve->daemon_state && ve == &ve->daemon_state->video_engine) {
-            if (ve->decoder.va_display) {
-                for (uint32_t i = 0; i < ve->decoder.num_surfaces; ++i) {
-                    if (ve->decoder.surfaces[i] != VA_INVALID_SURFACE) {
-                        vaSyncSurface(ve->decoder.va_display, ve->decoder.surfaces[i]);
-                    }
-                }
-                if (ve->decoder.has_vpp) {
-                    for (uint32_t i = 0; i < ve->decoder.num_vpp_surfaces; ++i) {
-                        if (ve->decoder.vpp_surfaces[i] != VA_INVALID_SURFACE) {
-                            vaSyncSurface(ve->decoder.va_display, ve->decoder.vpp_surfaces[i]);
-                        }
-                    }
-                }
-            }
-            vaapi_decoder_reset(&ve->decoder);
-            ve->decoder.current_surface_idx = 0;
-        } else {
-            vaapi_decoder_destroy(&ve->decoder);
-        }
+        vaapi_decoder_destroy(&ve->decoder);
     }
 
     if (ve->demuxer) {
@@ -1549,6 +1635,9 @@ bool video_engine_snapshot_output(video_engine_t *ve, output_node_t *out)
             }
             if (state->we_scene && state->we_scene != out->we_scene) {
                 waywal_we_scene_forget_bo(state->we_scene, &out->source_old_bo);
+            }
+            if (out->last_presented_bo == &out->source_old_bo) {
+                out->last_presented_bo = NULL;
             }
             render_engine_release_bo(&state->render_engine, &out->source_old_bo);
             dmabuf_bo_free(&out->source_old_bo);
