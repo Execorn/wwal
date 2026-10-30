@@ -8,30 +8,15 @@ const vec3 PAL_INK_BASE = vec3(0.04, 0.06, 0.12);
 const vec3 PAL_INK_TEAL = vec3(0.12, 0.64, 0.78);
 const vec3 PAL_INK_GOLD = vec3(0.92, 0.48, 0.28);
 
-float fi_hash(vec2 p)
-{
-    p = fract(p * vec2(234.34, 435.345));
-    p += dot(p, p + 34.23);
-    return fract(p.x * p.y);
-}
+const mat2 FI_ROT = mat2(0.80, -0.60, 0.60, 0.80) * 2.02;
 
-float fi_noise(vec2 p)
-{
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    vec2 u = f * f * (3.0 - 2.0 * f);
-    return mix(mix(fi_hash(i + vec2(0.0, 0.0)), fi_hash(i + vec2(1.0, 0.0)), u.x),
-               mix(fi_hash(i + vec2(0.0, 1.0)), fi_hash(i + vec2(1.0, 1.0)), u.x), u.y);
-}
-
-float fi_fbm(vec2 p)
+float fi_fbm(vec2 p, int octaves)
 {
     float v = 0.0;
     float a = 0.5;
-    mat2 rot = mat2(0.80, -0.60, 0.60, 0.80);
-    for (int i = 0; i < 5; ++i) {
-        v += a * fi_noise(p);
-        p = rot * p * 2.02 + vec2(1.7, 9.2);
+    for (int i = 0; i < octaves; ++i) {
+        v += a * waywal_noise2d(p);
+        p = FI_ROT * p + vec2(1.7, 9.2);
         a *= 0.5;
     }
     return v;
@@ -43,22 +28,27 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec2 uv = (fragCoord - 0.5 * res) / res.y;
     vec2 mouse = (u_mouse_smooth.xy - 0.5 * res) / res.y;
 
-    float m_dist = length(uv - mouse);
-    vec2 m_dir = (m_dist > 1e-4) ? ((uv - mouse) / m_dist) : vec2(0.0);
-    float m_ripple = sin(m_dist * 24.0 - iTime * 4.5) * exp(-m_dist * 5.5) * 0.08;
+    vec2 m_diff = uv - mouse;
+    float m_dist2 = dot(m_diff, m_diff);
+    vec2 m_offset = vec2(0.0);
+    if (iMouse.z > 0.0 && m_dist2 < 1.2 && m_dist2 > 1e-8) {
+        float m_dist = sqrt(m_dist2);
+        float m_ripple = sin(m_dist * 24.0 - mod(iTime, 3600.0) * 4.5) * exp(-m_dist * 5.5) * 0.08;
+        m_offset = (m_diff / m_dist) * m_ripple;
+    }
 
-    vec2 p = (uv + m_dir * m_ripple + u_workspace_offset * 0.08) * 2.4;
+    vec2 p = (uv + m_offset + u_workspace_offset * 0.08) * 2.4;
 
     float audio_flow = clamp(u_audio_envelope * 0.5 + u_audio_beat * 0.4, 0.0, 1.0);
-    float t = iTime * (0.18 + audio_flow * 0.06);
+    float t = mod(iTime * 0.18, 628.31853) + audio_flow * 0.25;
 
-    vec2 q = vec2(fi_fbm(p + vec2(0.0, 0.0) + t * 0.4),
-                  fi_fbm(p + vec2(5.2, 1.3) - t * 0.3));
+    vec2 q = vec2(fi_fbm(p + vec2(0.0, 0.0) + t * 0.4, 2),
+                  fi_fbm(p + vec2(5.2, 1.3) - t * 0.3, 2));
 
-    vec2 r = vec2(fi_fbm(p + 3.8 * q + vec2(1.7, 9.2) + 0.15 * t),
-                  fi_fbm(p + 3.8 * q + vec2(8.3, 2.8) + 0.126 * t));
+    vec2 r = vec2(fi_fbm(p + 3.8 * q + vec2(1.7, 9.2) + 0.15 * t, 3),
+                  fi_fbm(p + 3.8 * q + vec2(8.3, 2.8) + 0.126 * t, 3));
 
-    float f = fi_fbm(p + (3.5 + audio_flow * 0.6) * r);
+    float f = fi_fbm(p + (3.5 + audio_flow * 0.6) * r, 4);
 
     vec3 ink_base = PAL_INK_BASE;
     vec3 ink_teal = PAL_INK_TEAL;

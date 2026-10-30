@@ -86,7 +86,7 @@ void main() {
         vec4 color_a = texture(u_src_a, uv);
         vec4 color_b = texture(u_src_b, uv);
 
-        float burn_factor = smoothstep(flame_width, -flame_width, d);
+        float burn_factor = 1.0 - smoothstep(-flame_width, flame_width, d);
         vec4 base = mix(color_a, color_b, burn_factor);
 
         /* Ember heat intensity peaking near the center of the combustion band */

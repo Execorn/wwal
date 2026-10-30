@@ -1981,10 +1981,7 @@ bool we_tex_advance_video(we_tex_t *tex, float dt_sec)
                                         dst_strides);
 
                         if (tex->gl_tex != 0) {
-                            GLint prev_unpack_align = 4;
-                            GLint prev_tex2d = 0;
-                            glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_unpack_align);
-                            glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex2d);
+                            glActiveTexture(GL_TEXTURE0);
                             glBindTexture(GL_TEXTURE_2D, (GLuint)tex->gl_tex);
                             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
                             if (sw->gl_alloc_w != sw->width || sw->gl_alloc_h != sw->height) {
@@ -1998,8 +1995,6 @@ bool we_tex_advance_video(we_tex_t *tex, float dt_sec)
                                                 (GLsizei)sw->height, GL_RGBA, GL_UNSIGNED_BYTE,
                                                 mip0->rgba8);
                             }
-                            glPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack_align);
-                            glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex2d);
                         }
                     }
                 }

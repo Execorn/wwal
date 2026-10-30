@@ -63,12 +63,10 @@ void main() {
     /* Organic ink bleed edge highlight */
     bool has_glow = false;
     float glow = 0.0;
-    if (u_progress > 0.05 && u_progress < 0.95) {
-        float edge = 1.0 - abs(n - threshold) / (softness * 2.0);
-        if (edge > 0.0) {
-            has_glow = true;
-            glow = edge * edge * sin(u_progress * 3.1415926535) * 0.25;
-        }
+    float edge = 1.0 - abs(n - threshold) / (softness * 2.0);
+    if (edge > 0.0) {
+        has_glow = true;
+        glow = edge * edge * sin(u_progress * 3.1415926535) * 0.25;
     }
 
     vec4 col;
@@ -82,6 +80,7 @@ void main() {
         col = mix(c_old, c_new, mix_val);
         if (has_glow) {
             col.rgb += vec3(glow * 0.3, glow * 0.6, glow * 1.0);
+            col.rgb = min(col.rgb, vec3(1.0));
         }
     }
 

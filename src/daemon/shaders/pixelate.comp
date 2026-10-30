@@ -27,7 +27,9 @@ void main() {
 
     // Dynamic mosaic tile scale, peaking at midpoint
     float d = sin(u_progress * 3.1415926535) * 64.0 + 1.0;
-    vec2 quant_coord = (floor(vec2(coord) / d) * d + vec2(d * 0.5) + vec2(0.5)) / vec2(u_resolution);
+    vec2 tile_center = clamp(floor(vec2(coord) / d) * d + vec2(d * 0.5),
+                             vec2(0.5), vec2(u_resolution) - vec2(0.5));
+    vec2 quant_coord = tile_center / vec2(u_resolution);
 
     vec4 c1 = texture(u_src_a, quant_coord);
     vec4 c2 = texture(u_src_b, quant_coord);

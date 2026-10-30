@@ -98,7 +98,13 @@ struct gpu_compute_ctx {
     GLuint scratch_10bit_tex;
     uint32_t scratch_10bit_w;
     uint32_t scratch_10bit_h;
+    GLuint scratch_pool_tex[4];
+    uint32_t scratch_pool_w[4];
+    uint32_t scratch_pool_h[4];
+    uint32_t scratch_pool_next;
     GLuint blit_10bit_fbo;
+    GLuint bound_fbo_tex;
+    bool scratch_fbo_validated;
     GLuint prog_blit_10bit;
     GLuint blit_10bit_vao;
 
@@ -535,6 +541,7 @@ void gpu_compute_invalidate_state_cache(gpu_compute_ctx_t *ctx)
     ctx->bound_target_tex = 0;
     ctx->bound_old_tex = 0;
     ctx->bound_new_tex = 0;
+    ctx->bound_fbo_tex = 0;
 }
 
 static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
@@ -609,6 +616,7 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
 
     GLuint tex = 0;
     glGenTextures(1, &tex);
+    glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     if (ctx->glEGLImageTargetTexStorageEXT) {
         ctx->glEGLImageTargetTexStorageEXT(GL_TEXTURE_2D, (GLeglImageOES)img, NULL);
@@ -625,6 +633,7 @@ static bool gpu_compute_import_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *bo)
     ctx->bound_target_tex = 0;
     ctx->bound_old_tex = 0;
     ctx->bound_new_tex = 0;
+    ctx->bound_fbo_tex = 0;
     return true;
 }
 
@@ -658,13 +667,28 @@ static GLuint ensure_10bit_scratch_target(gpu_compute_ctx_t *ctx, uint32_t width
         ctx->scratch_10bit_h == height) {
         return ctx->scratch_10bit_tex;
     }
-    if (ctx->scratch_10bit_tex != 0) {
-        glDeleteTextures(1, &ctx->scratch_10bit_tex);
-        ctx->scratch_10bit_tex = 0;
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (ctx->scratch_pool_tex[i] != 0 && ctx->scratch_pool_w[i] == width &&
+            ctx->scratch_pool_h[i] == height) {
+            ctx->scratch_10bit_tex = ctx->scratch_pool_tex[i];
+            ctx->scratch_10bit_w = width;
+            ctx->scratch_10bit_h = height;
+            return ctx->scratch_10bit_tex;
+        }
     }
-    glGenTextures(1, &ctx->scratch_10bit_tex);
+    uint32_t slot = ctx->scratch_pool_next & 3u;
+    ctx->scratch_pool_next++;
+    if (ctx->scratch_pool_tex[slot] != 0) {
+        if (ctx->bound_target_tex == ctx->scratch_pool_tex[slot]) {
+            ctx->bound_target_tex = 0;
+        }
+        glDeleteTextures(1, &ctx->scratch_pool_tex[slot]);
+        ctx->scratch_pool_tex[slot] = 0;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ctx->scratch_10bit_tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -672,8 +696,13 @@ static GLuint ensure_10bit_scratch_target(gpu_compute_ctx_t *ctx, uint32_t width
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, (GLsizei)width, (GLsizei)height);
+    ctx->scratch_pool_tex[slot] = tex;
+    ctx->scratch_pool_w[slot] = width;
+    ctx->scratch_pool_h[slot] = height;
+    ctx->scratch_10bit_tex = tex;
     ctx->scratch_10bit_w = width;
     ctx->scratch_10bit_h = height;
+    ctx->bound_target_tex = 0;
     return ctx->scratch_10bit_tex;
 }
 
@@ -686,21 +715,31 @@ static bool blit_scratch_to_10bit_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
     }
     if (!ctx->blit_10bit_fbo) {
         glGenFramebuffers(1, &ctx->blit_10bit_fbo);
+        ctx->bound_fbo_tex = 0;
+        ctx->scratch_fbo_validated = false;
     }
     if (!ctx->blit_10bit_vao) {
         glGenVertexArrays(1, &ctx->blit_10bit_vao);
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, ctx->blit_10bit_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target_bo->gl_tex,
-                           0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        return false;
+    if (ctx->bound_fbo_tex != target_bo->gl_tex) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                               target_bo->gl_tex, 0);
+        ctx->bound_fbo_tex = target_bo->gl_tex;
+        if (!ctx->scratch_fbo_validated) {
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                ctx->bound_fbo_tex = 0;
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                return false;
+            }
+            ctx->scratch_fbo_validated = true;
+        }
     }
 
     glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
     glUseProgram(ctx->prog_blit_10bit);
+    ctx->current_prog = ctx->prog_blit_10bit;
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx->scratch_10bit_tex);
     glBindVertexArray(ctx->blit_10bit_vao);
@@ -708,10 +747,7 @@ static bool blit_scratch_to_10bit_bo(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
     glBindVertexArray(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    ctx->current_prog = 0;
     ctx->bound_target_tex = 0;
-    ctx->bound_old_tex = 0;
-    ctx->bound_new_tex = 0;
     return true;
 }
 
@@ -738,8 +774,7 @@ bool gpu_compute_dispatch_transition(gpu_compute_ctx_t *ctx, dmabuf_bo_t *target
         return false;
     }
 
-    bool use_scratch = needs_scratch_fbo_blit(ctx, target_bo) ||
-                       needs_scratch_fbo_blit(ctx, old_bo) || needs_scratch_fbo_blit(ctx, new_bo);
+    bool use_scratch = needs_scratch_fbo_blit(ctx, target_bo);
     GLuint dst_image_tex = target_bo->gl_tex;
     if (use_scratch) {
         dst_image_tex = ensure_10bit_scratch_target(ctx, target_bo->width, target_bo->height);
@@ -1220,8 +1255,10 @@ void gpu_compute_destroy(gpu_compute_ctx_t *ctx)
             glDeleteTextures(1, &ctx->upload_src_tex);
         if (ctx->kawase_half_tex)
             glDeleteTextures(1, &ctx->kawase_half_tex);
-        if (ctx->scratch_10bit_tex)
-            glDeleteTextures(1, &ctx->scratch_10bit_tex);
+        for (uint32_t i = 0; i < 4; ++i) {
+            if (ctx->scratch_pool_tex[i])
+                glDeleteTextures(1, &ctx->scratch_pool_tex[i]);
+        }
         if (ctx->blit_10bit_fbo)
             glDeleteFramebuffers(1, &ctx->blit_10bit_fbo);
         if (ctx->blit_10bit_vao)

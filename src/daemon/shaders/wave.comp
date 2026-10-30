@@ -30,7 +30,7 @@ void main() {
 
     vec2 dir = vec2(cos(u_angle), sin(u_angle));
     vec2 centered = uv - vec2(0.5);
-    float proj = dot(centered, dir) * 0.70710678 + 0.5;
+    float proj = dot(centered, dir) / max(abs(dir.x) + abs(dir.y), 1e-5) + 0.5;
 
     float freq = (u_wave_freq > 0.0) ? u_wave_freq : 20.0;
     float amp = (u_wave_amp > 0.0) ? u_wave_amp : 0.05;

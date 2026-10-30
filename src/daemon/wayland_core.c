@@ -1184,6 +1184,18 @@ bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *
         return true;
     }
 
+    if (out && state->outputs) {
+        for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
+            if (o->has_cursor) {
+                double gx = (double)o->global_x + o->cursor_x;
+                double gy = (double)o->global_y + o->cursor_y;
+                *out_x = gx - (double)out->global_x;
+                *out_y = gy - (double)out->global_y;
+                return true;
+            }
+        }
+    }
+
     double ref_w =
         out ? (out->logical_width > 0 ? (double)out->logical_width : (double)out->width) : 1920.0;
     double ref_h =

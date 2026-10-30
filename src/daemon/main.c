@@ -1496,6 +1496,10 @@ void daemon_shader_render_once(daemon_state_t *state)
         base_params.audio = waywal_audio_fft_get_frame(state->audio_fft);
     }
 
+    output_node_t *donor_out = NULL;
+    dmabuf_bo_t *donor_bo = NULL;
+    bool any_committed = false;
+
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (!out->surface || !out->configured || out->width <= 0 || out->height <= 0)
             continue;
@@ -1511,7 +1515,7 @@ void daemon_shader_render_once(daemon_state_t *state)
                 continue;
         }
         uint32_t out_target_fps = out->shader_fps > 0 ? out->shader_fps : 60U;
-        if (state->power_gov &&
+        if (out->shader_frame_idx > 0 && !out->transition_active && state->power_gov &&
             (waywal_power_governor_should_pause_output(state->power_gov, out->name) ||
              waywal_power_governor_effective_fps(state->power_gov, out->name, out_target_fps) ==
                  0U)) {
@@ -1557,7 +1561,10 @@ void daemon_shader_render_once(daemon_state_t *state)
         float target_mx = (float)out->width * 0.5f + span_dx;
         float target_my = (float)out->height * 0.5f + span_dy;
         double mx = 0.0, my = 0.0;
-        if (daemon_query_cursor_pos(state, out, &mx, &my)) {
+        bool needs_cursor =
+            (out->workshop_active && wscene != NULL) ||
+            (!out->workshop_active && seng != NULL && waywal_shader_engine_uses_mouse(seng));
+        if (needs_cursor && daemon_query_cursor_pos(state, out, &mx, &my)) {
             double scale_x = (out->logical_width > 0 && out->width > 0)
                                  ? ((double)out->width / (double)out->logical_width)
                                  : (double)(out->scale_factor > 0 ? out->scale_factor : 1);
@@ -1624,10 +1631,33 @@ void daemon_shader_render_once(daemon_state_t *state)
             dmabuf_bo_t *bo = dmabuf_ring_acquire(&out->dmabuf_ring);
             if (bo && bo->wl_buffer) {
                 bool rendered = false;
-                if (out->workshop_active && wscene) {
-                    rendered = we_scene_render_frame(wscene, bo, &fparams);
-                } else if (seng) {
-                    rendered = waywal_shader_engine_render_frame(seng, bo, &fparams);
+                bool can_clone =
+                    (!out->workshop_active && seng != NULL && donor_out != NULL &&
+                     donor_bo != NULL &&
+                     (!out->shader_eng || out->shader_eng == donor_out->shader_eng ||
+                      (out->shader_path[0] != '\0' &&
+                       strcmp(out->shader_path, donor_out->shader_path) == 0)) &&
+                     out->shader_audio_reactive == donor_out->shader_audio_reactive &&
+                     !out->transition_active && !donor_out->transition_active &&
+                     out->width == donor_out->width && out->height == donor_out->height &&
+                     out->scaling_mode != WAYWAL_SCALING_SPAN &&
+                     donor_out->scaling_mode != WAYWAL_SCALING_SPAN &&
+                     !waywal_shader_engine_uses_mouse(seng));
+                if (can_clone) {
+                    rendered = waywal_shader_engine_blit_bo(seng, donor_bo, bo);
+                }
+                if (!rendered) {
+                    if (out->workshop_active && wscene) {
+                        rendered = we_scene_render_frame(wscene, bo, &fparams);
+                    } else if (seng) {
+                        rendered = waywal_shader_engine_render_frame(seng, bo, &fparams);
+                        if (rendered && donor_out == NULL && !out->transition_active &&
+                            out->scaling_mode != WAYWAL_SCALING_SPAN &&
+                            !waywal_shader_engine_uses_mouse(seng)) {
+                            donor_out = out;
+                            donor_bo = bo;
+                        }
+                    }
                 }
                 if (rendered) {
                     if (out->viewport) {
@@ -1635,11 +1665,16 @@ void daemon_shader_render_once(daemon_state_t *state)
                             out->logical_width > 0 ? (int32_t)out->logical_width : out->width;
                         int32_t dst_h =
                             out->logical_height > 0 ? (int32_t)out->logical_height : out->height;
-                        wp_viewport_set_destination(out->viewport, dst_w, dst_h);
-                        wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1),
-                                               wl_fixed_from_int(-1), wl_fixed_from_int(-1),
-                                               wl_fixed_from_int(-1));
-                        out->vp_configured = false;
+                        if (!out->vp_configured || out->vp_dst_w != dst_w ||
+                            out->vp_dst_h != dst_h) {
+                            wp_viewport_set_destination(out->viewport, dst_w, dst_h);
+                            wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1),
+                                                   wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                                                   wl_fixed_from_int(-1));
+                            out->vp_configured = true;
+                            out->vp_dst_w = dst_w;
+                            out->vp_dst_h = dst_h;
+                        }
                     }
                     wl_surface_attach(out->surface, bo->wl_buffer, 0, 0);
                     wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
@@ -1648,12 +1683,16 @@ void daemon_shader_render_once(daemon_state_t *state)
                     out->last_presented_bo = bo;
                     out->last_committed_ring_idx = (int)(bo - out->dmabuf_ring.buffers);
                     out->has_image = true;
-                    wl_display_flush(state->display);
+                    any_committed = true;
                 } else {
                     bo->in_use = false;
                 }
             }
         }
+    }
+
+    if (any_committed && state->display) {
+        wl_display_flush(state->display);
     }
 
     if (state->render_engine.gpu_ctx) {
@@ -1934,10 +1973,6 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
         return true;
     }
 
-    if (!validate_shader_file_headless(shader_file)) {
-        return false;
-    }
-
     uint64_t t_now = now_ns();
     bool any_ok = false;
     bool any_transition_started = false;
@@ -1952,6 +1987,10 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
     bool has_transition =
         (resolved_type != WAYWAL_TRANSITION_NONE && spay->transition_duration_ms > 0);
 
+    bool first_compile_attempted = false;
+    bool headless_validated = false;
+    bool headless_valid = false;
+
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (!output_matches_target_spec(out, spay->output))
             continue;
@@ -1962,40 +2001,37 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
 
         if (!out->shader_eng && state->dmabuf_ctx.available) {
             render_engine_make_current(&state->render_engine);
-            out->shader_eng = waywal_shader_engine_create(&state->dmabuf_ctx);
-            if (!state->shader_eng) {
-                state->shader_eng = out->shader_eng;
-            } else if (out->shader_eng) {
-                waywal_shader_engine_copy_custom_uniforms(out->shader_eng, state->shader_eng);
-                if (!is_shader_eng_attached_to_any_output(state, state->shader_eng)) {
-                    int ino_fd = waywal_shader_engine_get_inotify_fd(state->shader_eng);
-                    if (ino_fd >= 0) {
-                        unregister_fd_from_loops(state, ino_fd);
-                    }
-                    waywal_shader_engine_destroy(state->shader_eng);
+            if (state->shader_eng &&
+                !is_shader_eng_attached_to_any_output(state, state->shader_eng)) {
+                out->shader_eng = state->shader_eng;
+            } else {
+                out->shader_eng = waywal_shader_engine_create(&state->dmabuf_ctx);
+                if (!state->shader_eng) {
                     state->shader_eng = out->shader_eng;
-                }
-            }
-        }
-        if (out->shader_eng && state->wallpaper_rgba && state->wallpaper_w > 0 &&
-            state->wallpaper_h > 0) {
-            waywal_shader_engine_set_wallpaper_bgra(out->shader_eng, state->wallpaper_rgba,
-                                                    state->wallpaper_w, state->wallpaper_h);
-        }
-        if (out->shader_eng && state->mpris) {
-            const waywal_mpris_state_t *ms = waywal_mpris_get_state(state->mpris);
-            if (ms) {
-                waywal_shader_engine_set_media_playing(
-                    out->shader_eng, (ms->status == WAYWAL_MPRIS_PLAYING) ? 1.0f : 0.0f);
-                if (ms->has_art_pixels && ms->art_bgra) {
-                    waywal_shader_engine_set_album_art_bgra(out->shader_eng, ms->art_bgra,
-                                                            ms->art_width, ms->art_height);
+                } else if (out->shader_eng) {
+                    waywal_shader_engine_copy_custom_uniforms(out->shader_eng, state->shader_eng);
                 }
             }
         }
 
         bool loaded = false;
         if (out->shader_eng) {
+            if (state->wallpaper_rgba && state->wallpaper_w > 0 && state->wallpaper_h > 0) {
+                waywal_shader_engine_set_wallpaper_bgra(out->shader_eng, state->wallpaper_rgba,
+                                                        state->wallpaper_w, state->wallpaper_h);
+            }
+            if (state->mpris) {
+                const waywal_mpris_state_t *ms = waywal_mpris_get_state(state->mpris);
+                if (ms) {
+                    waywal_shader_engine_set_media_playing(
+                        out->shader_eng, (ms->status == WAYWAL_MPRIS_PLAYING) ? 1.0f : 0.0f);
+                    if (ms->has_art_pixels && ms->art_bgra) {
+                        waywal_shader_engine_set_album_art_bgra(out->shader_eng, ms->art_bgra,
+                                                                ms->art_width, ms->art_height);
+                    }
+                }
+            }
+            first_compile_attempted = true;
             if (waywal_shader_engine_load_file(out->shader_eng, shader_file)) {
                 loaded = true;
                 int inotify_fd = waywal_shader_engine_get_inotify_fd(out->shader_eng);
@@ -2004,11 +2040,17 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
                 }
             }
         } else {
-            loaded = true;
+            if (!headless_validated) {
+                headless_valid = validate_shader_file_headless(shader_file);
+                headless_validated = true;
+            }
+            loaded = headless_valid;
         }
 
         if (!loaded) {
             out->shader_active = false;
+            if (!any_ok && first_compile_attempted)
+                break;
             continue;
         }
 

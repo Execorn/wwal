@@ -38,10 +38,9 @@ void main() {
 
     // Shift increases with progress, staggered by delay
     float shift = clamp((u_progress * 1.35 - delay) / 1.0, 0.0, 1.0);
-    float pixel_shift = shift * float(u_resolution.y);
 
     vec4 col;
-    if (float(coord.y) < pixel_shift) {
+    if (uv.y < shift) {
         col = texture(u_src_b, uv);
     } else {
         vec2 melt_uv = uv;

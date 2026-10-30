@@ -14,6 +14,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,6 +89,7 @@ typedef struct {
     GLint u_flip_y;
     GLint u_album_art;
     GLint u_media_playing;
+    GLint u_noise_tex;
 } shader_uniforms_t;
 
 typedef struct {
@@ -128,6 +130,9 @@ typedef struct {
     float cached_media_playing;
     float cached_chan_res[12];
     bool needs_mipmap;
+    float res_scale;
+    uint32_t target_fps;
+    double last_render_sec;
 } shader_pass_t;
 
 struct waywal_shader_engine {
@@ -154,6 +159,11 @@ struct waywal_shader_engine {
     shader_custom_uniform_t custom_uniforms[SHADER_MAX_CUSTOM_UNIFORMS];
     uint32_t num_custom_uniforms;
 
+    bool uses_lod;
+    bool uses_audio_channel;
+    bool uses_date;
+    uint64_t frame_idx;
+
     GLuint scratch_tex;
     uint32_t scratch_w;
     uint32_t scratch_h;
@@ -163,6 +173,10 @@ struct waywal_shader_engine {
     GLint loc_blit_swap_rb;
     GLuint blit_vao;
     GLuint last_complete_bo_tex;
+    const dmabuf_bo_t *last_rendered_bo;
+    GLuint last_rendered_tex;
+    uint32_t last_rendered_w;
+    uint32_t last_rendered_h;
 
     bool last_from_cache;
 
@@ -195,39 +209,84 @@ struct waywal_shader_engine {
     size_t num_imported_bos;
 };
 
-static const char SHADERTOY_PROLOGUE[] = "precision highp float;\n"
-                                         "precision highp int;\n"
-                                         "out highp vec4 waywal_FragColor;\n"
-                                         "uniform vec3 iResolution;\n"
-                                         "uniform float iTime;\n"
-                                         "uniform float iTimeDelta;\n"
-                                         "uniform int iFrame;\n"
-                                         "uniform vec4 iMouse;\n"
-                                         "uniform vec4 iDate;\n"
-                                         "uniform float iSampleRate;\n"
-                                         "uniform highp sampler2D iChannel0;\n"
-                                         "uniform highp sampler2D iChannel1;\n"
-                                         "uniform highp sampler2D iChannel2;\n"
-                                         "uniform highp sampler2D iChannel3;\n"
-                                         "uniform vec3 iChannelResolution[4];\n"
-                                         "uniform float iChannelTime[4];\n"
-                                         "uniform float u_audio_bands[64];\n"
-                                         "uniform float u_audio_envelope;\n"
-                                         "uniform float u_audio_beat;\n"
-                                         "uniform vec3 u_palette_primary;\n"
-                                         "uniform vec3 u_palette_secondary;\n"
-                                         "uniform vec3 u_palette_tertiary;\n"
-                                         "uniform vec4 u_mouse_smooth;\n"
-                                         "uniform vec2 u_mouse_vel;\n"
-                                         "uniform vec2 u_workspace_offset;\n"
-                                         "uniform float u_depth_strength;\n"
-                                         "uniform vec4 u_span_rect;\n"
-                                         "uniform vec2 u_local_size;\n"
-                                         "uniform int u_swap_rb;\n"
-                                         "uniform int u_flip_y;\n"
-                                         "uniform highp sampler2D u_album_art;\n"
-                                         "uniform float u_media_playing;\n"
-                                         "\n";
+static const char SHADERTOY_PROLOGUE[] =
+    "precision highp float;\n"
+    "precision highp int;\n"
+    "out highp vec4 waywal_FragColor;\n"
+    "uniform vec3 iResolution;\n"
+    "uniform float iTime;\n"
+    "uniform float iTimeDelta;\n"
+    "uniform int iFrame;\n"
+    "uniform vec4 iMouse;\n"
+    "uniform vec4 iDate;\n"
+    "uniform float iSampleRate;\n"
+    "uniform highp sampler2D iChannel0;\n"
+    "uniform highp sampler2D iChannel1;\n"
+    "uniform highp sampler2D iChannel2;\n"
+    "uniform highp sampler2D iChannel3;\n"
+    "uniform vec3 iChannelResolution[4];\n"
+    "uniform float iChannelTime[4];\n"
+    "uniform float u_audio_bands[64];\n"
+    "uniform float u_audio_envelope;\n"
+    "uniform float u_audio_beat;\n"
+    "uniform vec3 u_palette_primary;\n"
+    "uniform vec3 u_palette_secondary;\n"
+    "uniform vec3 u_palette_tertiary;\n"
+    "uniform vec4 u_mouse_smooth;\n"
+    "uniform vec2 u_mouse_vel;\n"
+    "uniform vec2 u_workspace_offset;\n"
+    "uniform float u_depth_strength;\n"
+    "uniform vec4 u_span_rect;\n"
+    "uniform vec2 u_local_size;\n"
+    "uniform int u_swap_rb;\n"
+    "uniform int u_flip_y;\n"
+    "uniform highp sampler2D u_album_art;\n"
+    "uniform float u_media_playing;\n"
+    "uniform highp sampler2D u_noise_tex;\n"
+    "float waywal_noise2d(highp vec2 x) {\n"
+    "    highp vec2 i = floor(x);\n"
+    "    highp vec2 f = fract(x);\n"
+    "    f = f * f * (3.0 - 2.0 * f);\n"
+    "    return textureLod(u_noise_tex, (i + f + 0.5) * (1.0 / 256.0), 0.0).r;\n"
+    "}\n"
+    "vec2 waywal_noise2d_dual(highp vec2 x) {\n"
+    "    highp vec2 i = floor(x);\n"
+    "    highp vec2 f = fract(x);\n"
+    "    f = f * f * (3.0 - 2.0 * f);\n"
+    "    return textureLod(u_noise_tex, (i + f + 0.5) * (1.0 / 256.0), 0.0).rb;\n"
+    "}\n"
+    "float waywal_noise3d(highp vec3 p) {\n"
+    "    highp vec3 i = floor(p);\n"
+    "    highp vec3 f = fract(p);\n"
+    "    f = f * f * (3.0 - 2.0 * f);\n"
+    "    highp vec2 uv = (i.xy + vec2(37.0, 17.0) * i.z) + f.xy;\n"
+    "    highp vec2 rg = textureLod(u_noise_tex, (uv + 0.5) * (1.0 / 256.0), 0.0).rg;\n"
+    "    return mix(rg.x, rg.y, f.z);\n"
+    "}\n"
+    "\n";
+
+static const char COMPUTE_PROLOGUE[] =
+    "uniform highp sampler2D u_noise_tex;\n"
+    "float waywal_noise2d(highp vec2 x) {\n"
+    "    highp vec2 i = floor(x);\n"
+    "    highp vec2 f = fract(x);\n"
+    "    f = f * f * (3.0 - 2.0 * f);\n"
+    "    return textureLod(u_noise_tex, (i + f + 0.5) * (1.0 / 256.0), 0.0).r;\n"
+    "}\n"
+    "vec2 waywal_noise2d_dual(highp vec2 x) {\n"
+    "    highp vec2 i = floor(x);\n"
+    "    highp vec2 f = fract(x);\n"
+    "    f = f * f * (3.0 - 2.0 * f);\n"
+    "    return textureLod(u_noise_tex, (i + f + 0.5) * (1.0 / 256.0), 0.0).rb;\n"
+    "}\n"
+    "float waywal_noise3d(highp vec3 p) {\n"
+    "    highp vec3 i = floor(p);\n"
+    "    highp vec3 f = fract(p);\n"
+    "    f = f * f * (3.0 - 2.0 * f);\n"
+    "    highp vec2 uv = (i.xy + vec2(37.0, 17.0) * i.z) + f.xy;\n"
+    "    highp vec2 rg = textureLod(u_noise_tex, (uv + 0.5) * (1.0 / 256.0), 0.0).rg;\n"
+    "    return mix(rg.x, rg.y, f.z);\n"
+    "}\n";
 
 static const char SHADERTOY_EPILOGUE[] =
     "\n"
@@ -363,7 +422,7 @@ static int match_section_marker(const char *line, size_t len)
     while (i < len && (line[i] == ' ' || line[i] == '\t')) {
         i++;
     }
-    if (i + 2 <= len && line[i] == '/' && line[i + 1] == '/') {
+    if (i + 2 <= len && line[i] == '/' && (line[i + 1] == '/' || line[i + 1] == '*')) {
         i += 2;
         while (i < len && (line[i] == ' ' || line[i] == '\t')) {
             i++;
@@ -413,6 +472,40 @@ static bool has_any_section_markers(const char *src, bool *out_has_pass_sec)
     return any;
 }
 
+static bool line_references_pass_macro(const char *line, size_t len, const char *macro)
+{
+    size_t i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    if (i >= len || line[i] != '#') {
+        return false;
+    }
+    i++;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    size_t code_end = len;
+    for (size_t k = i; k + 1 < len; ++k) {
+        if (line[k] == '/' && (line[k + 1] == '/' || line[k + 1] == '*')) {
+            code_end = k;
+            break;
+        }
+    }
+    size_t mlen = strlen(macro);
+    for (size_t k = i; k + mlen <= code_end; ++k) {
+        if (strncmp(line + k, macro, mlen) == 0) {
+            bool prev_ok = (k == i) || (!isalnum((unsigned char)line[k - 1]) && line[k - 1] != '_');
+            bool next_ok = (k + mlen == code_end) ||
+                           (!isalnum((unsigned char)line[k + mlen]) && line[k + mlen] != '_');
+            if (prev_ok && next_ok) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool detect_active_passes(const char *user_src, bool out_active[SHADER_NUM_PASSES])
 {
     for (int i = 0; i < SHADER_NUM_PASSES; ++i) {
@@ -429,17 +522,36 @@ static bool detect_active_passes(const char *user_src, bool out_active[SHADER_NU
             out_active[i] = sec_present[i];
         }
     }
-    if (strstr(user_src, "BUFFER_A") != NULL) {
-        out_active[0] = true;
-    }
-    if (strstr(user_src, "BUFFER_B") != NULL) {
-        out_active[1] = true;
-    }
-    if (strstr(user_src, "BUFFER_C") != NULL) {
-        out_active[2] = true;
-    }
-    if (strstr(user_src, "BUFFER_D") != NULL) {
-        out_active[3] = true;
+
+    static const char *const macros[4] = {"BUFFER_A", "BUFFER_B", "BUFFER_C", "BUFFER_D"};
+    bool in_block_comment = false;
+    const char *p = user_src;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (!in_block_comment) {
+            for (int i = 0; i < 4; ++i) {
+                if (!out_active[i] && line_references_pass_macro(p, len, macros[i])) {
+                    out_active[i] = true;
+                }
+            }
+        }
+        for (size_t k = 0; k + 1 < len; ++k) {
+            if (!in_block_comment && p[k] == '/' && p[k + 1] == '/') {
+                break;
+            }
+            if (!in_block_comment && p[k] == '/' && p[k + 1] == '*') {
+                in_block_comment = true;
+                k++;
+            } else if (in_block_comment && p[k] == '*' && p[k + 1] == '/') {
+                in_block_comment = false;
+                k++;
+            }
+        }
+        if (!nl) {
+            break;
+        }
+        p = nl + 1;
     }
     return true;
 }
@@ -458,7 +570,25 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
 
     if (pass_idx == 4 && strstr(user_src, "local_size_x") != NULL &&
         strstr(user_src, "#version") != NULL) {
-        return strdup(user_src);
+        if (strstr(user_src, "waywal_noise2d") != NULL) {
+            return strdup(user_src);
+        }
+        const char *ver = strstr(user_src, "#version");
+        const char *ver_nl = ver ? strchr(ver, '\n') : NULL;
+        if (!ver_nl) {
+            return strdup(user_src);
+        }
+        size_t head_len = (size_t)(ver_nl - user_src + 1);
+        size_t cpro_len = sizeof(COMPUTE_PROLOGUE) - 1u;
+        size_t tail_len = strlen(ver_nl + 1);
+        char *out = (char *)malloc(head_len + cpro_len + tail_len + 1u);
+        if (!out) {
+            return strdup(user_src);
+        }
+        memcpy(out, user_src, head_len);
+        memcpy(out + head_len, COMPUTE_PROLOGUE, cpro_len);
+        memcpy(out + head_len + cpro_len, ver_nl + 1, tail_len + 1u);
+        return out;
     }
 
     static const char *const pass_defines[SHADER_NUM_PASSES] = {
@@ -630,10 +760,79 @@ static void apply_parsed_channel_binding(shader_pass_t passes[SHADER_NUM_PASSES]
     }
 }
 
+static void apply_parsed_buffer_scale(shader_pass_t passes[SHADER_NUM_PASSES], int target_pass,
+                                      const char *val_str, size_t val_len)
+{
+    while (val_len > 0 &&
+           (val_str[0] == ' ' || val_str[0] == '\t' || val_str[0] == '=' || val_str[0] == ':')) {
+        val_str++;
+        val_len--;
+    }
+    if (val_len == 0) {
+        return;
+    }
+    char buf[64];
+    size_t n = val_len < sizeof(buf) - 1u ? val_len : sizeof(buf) - 1u;
+    memcpy(buf, val_str, n);
+    buf[n] = '\0';
+    char *endp = NULL;
+    float sc = strtof(buf, &endp);
+    if (endp == buf || !isfinite(sc) || sc <= 0.0f) {
+        return;
+    }
+    if (sc < 0.125f) {
+        sc = 0.125f;
+    } else if (sc > 1.0f) {
+        sc = 1.0f;
+    }
+    if (target_pass >= 0 && target_pass < 4) {
+        passes[target_pass].res_scale = sc;
+    } else {
+        for (int p = 0; p < 4; ++p) {
+            passes[p].res_scale = sc;
+        }
+    }
+}
+
+static void apply_parsed_buffer_fps(shader_pass_t passes[SHADER_NUM_PASSES], int target_pass,
+                                    const char *val_str, size_t val_len)
+{
+    while (val_len > 0 &&
+           (val_str[0] == ' ' || val_str[0] == '\t' || val_str[0] == '=' || val_str[0] == ':')) {
+        val_str++;
+        val_len--;
+    }
+    if (val_len == 0) {
+        return;
+    }
+    char buf[64];
+    size_t n = val_len < sizeof(buf) - 1u ? val_len : sizeof(buf) - 1u;
+    memcpy(buf, val_str, n);
+    buf[n] = '\0';
+    char *endp = NULL;
+    long fps = strtol(buf, &endp, 10);
+    if (endp == buf || fps < 0) {
+        return;
+    }
+    if (fps > 1000) {
+        fps = 1000;
+    }
+    if (target_pass >= 0 && target_pass < 4) {
+        passes[target_pass].target_fps = (uint32_t)fps;
+    } else {
+        for (int p = 0; p < 4; ++p) {
+            passes[p].target_fps = (uint32_t)fps;
+        }
+    }
+}
+
 static void parse_shader_channel_directives(const char *user_src,
                                             shader_pass_t passes[SHADER_NUM_PASSES])
 {
     for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
+        passes[p].res_scale = 1.0f;
+        passes[p].target_fps = 0;
+        passes[p].last_render_sec = -1e9;
         for (int c = 0; c < 4; ++c) {
             passes[p].channels[c].target = SHADER_CHAN_AUDIO;
             passes[p].channels[c].image_path[0] = '\0';
@@ -679,22 +878,46 @@ static void parse_shader_channel_directives(const char *user_src,
                     slen--;
                 }
                 int target_pass = cur_sec;
-                if (slen > 8 && strncasecmp(s, "bufferA.", 8) == 0) {
+                if (slen > 8 &&
+                    (strncasecmp(s, "bufferA.", 8) == 0 || strncasecmp(s, "bufferA_", 8) == 0)) {
                     target_pass = 0;
                     s += 8;
                     slen -= 8;
-                } else if (slen > 8 && strncasecmp(s, "bufferB.", 8) == 0) {
+                } else if (slen > 9 && (strncasecmp(s, "buffer_a.", 9) == 0 ||
+                                        strncasecmp(s, "buffer_a_", 9) == 0)) {
+                    target_pass = 0;
+                    s += 9;
+                    slen -= 9;
+                } else if (slen > 8 && (strncasecmp(s, "bufferB.", 8) == 0 ||
+                                        strncasecmp(s, "bufferB_", 8) == 0)) {
                     target_pass = 1;
                     s += 8;
                     slen -= 8;
-                } else if (slen > 8 && strncasecmp(s, "bufferC.", 8) == 0) {
+                } else if (slen > 9 && (strncasecmp(s, "buffer_b.", 9) == 0 ||
+                                        strncasecmp(s, "buffer_b_", 9) == 0)) {
+                    target_pass = 1;
+                    s += 9;
+                    slen -= 9;
+                } else if (slen > 8 && (strncasecmp(s, "bufferC.", 8) == 0 ||
+                                        strncasecmp(s, "bufferC_", 8) == 0)) {
                     target_pass = 2;
                     s += 8;
                     slen -= 8;
-                } else if (slen > 8 && strncasecmp(s, "bufferD.", 8) == 0) {
+                } else if (slen > 9 && (strncasecmp(s, "buffer_c.", 9) == 0 ||
+                                        strncasecmp(s, "buffer_c_", 9) == 0)) {
+                    target_pass = 2;
+                    s += 9;
+                    slen -= 9;
+                } else if (slen > 8 && (strncasecmp(s, "bufferD.", 8) == 0 ||
+                                        strncasecmp(s, "bufferD_", 8) == 0)) {
                     target_pass = 3;
                     s += 8;
                     slen -= 8;
+                } else if (slen > 9 && (strncasecmp(s, "buffer_d.", 9) == 0 ||
+                                        strncasecmp(s, "buffer_d_", 9) == 0)) {
+                    target_pass = 3;
+                    s += 9;
+                    slen -= 9;
                 } else if (slen > 6 && strncasecmp(s, "image.", 6) == 0) {
                     target_pass = 4;
                     s += 6;
@@ -716,6 +939,14 @@ static void parse_shader_channel_directives(const char *user_src,
                     shader_channel_binding_t parsed = {.target = SHADER_CHAN_AUDIO};
                     parse_channel_target_value(s, slen, &parsed);
                     apply_parsed_channel_binding(passes, target_pass, ch, &parsed);
+                } else if (slen >= 12 && strncasecmp(s, "buffer_scale", 12) == 0) {
+                    apply_parsed_buffer_scale(passes, target_pass, s + 12, slen - 12);
+                } else if (slen >= 5 && strncasecmp(s, "scale", 5) == 0) {
+                    apply_parsed_buffer_scale(passes, target_pass, s + 5, slen - 5);
+                } else if (slen >= 10 && strncasecmp(s, "buffer_fps", 10) == 0) {
+                    apply_parsed_buffer_fps(passes, target_pass, s + 10, slen - 10);
+                } else if (slen >= 3 && strncasecmp(s, "fps", 3) == 0) {
+                    apply_parsed_buffer_fps(passes, target_pass, s + 3, slen - 3);
                 }
             } else if (was_comment) {
                 int ch = -1;
@@ -741,6 +972,28 @@ static void parse_shader_channel_directives(const char *user_src,
                     shader_channel_binding_t parsed = {.target = SHADER_CHAN_AUDIO};
                     parse_channel_target_value(s, slen, &parsed);
                     apply_parsed_channel_binding(passes, cur_sec, ch, &parsed);
+                } else if (slen > 6 && strncasecmp(s, "@wwal_", 6) == 0) {
+                    const char *directive = s + 6;
+                    size_t dlen = slen - 6;
+                    int target_pass = cur_sec;
+                    if (dlen > 7 && strncasecmp(directive, "buffer_", 7) == 0 &&
+                        (directive[7] == 'a' || directive[7] == 'A' || directive[7] == 'b' ||
+                         directive[7] == 'B' || directive[7] == 'c' || directive[7] == 'C' ||
+                         directive[7] == 'd' || directive[7] == 'D') &&
+                        (directive[8] == '_' || directive[8] == '.')) {
+                        target_pass = tolower((unsigned char)directive[7]) - 'a';
+                        directive += 9;
+                        dlen -= 9;
+                    }
+                    if (dlen >= 12 && strncasecmp(directive, "buffer_scale", 12) == 0) {
+                        apply_parsed_buffer_scale(passes, target_pass, directive + 12, dlen - 12);
+                    } else if (dlen >= 5 && strncasecmp(directive, "scale", 5) == 0) {
+                        apply_parsed_buffer_scale(passes, target_pass, directive + 5, dlen - 5);
+                    } else if (dlen >= 10 && strncasecmp(directive, "buffer_fps", 10) == 0) {
+                        apply_parsed_buffer_fps(passes, target_pass, directive + 10, dlen - 10);
+                    } else if (dlen >= 3 && strncasecmp(directive, "fps", 3) == 0) {
+                        apply_parsed_buffer_fps(passes, target_pass, directive + 3, dlen - 3);
+                    }
                 }
             }
         }
@@ -958,6 +1211,7 @@ static void cache_uniform_locations(GLuint prog, shader_uniforms_t *u)
     u->u_flip_y = glGetUniformLocation(prog, "u_flip_y");
     u->u_album_art = glGetUniformLocation(prog, "u_album_art");
     u->u_media_playing = glGetUniformLocation(prog, "u_media_playing");
+    u->u_noise_tex = glGetUniformLocation(prog, "u_noise_tex");
 }
 
 static EGLDisplay s_shared_dpy = EGL_NO_DISPLAY;
@@ -981,6 +1235,7 @@ static GLuint create_texture_ex(const uint8_t *pixels, uint32_t w, uint32_t h, G
         return 0;
     }
     GLuint tex = 0;
+    glActiveTexture(GL_TEXTURE0);
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
@@ -1025,6 +1280,7 @@ static GLuint create_r8_depth_texture(const uint8_t *depth_px, uint32_t w, uint3
         r8[i] = depth_px[i * 4u];
     }
     GLuint tex = 0;
+    glActiveTexture(GL_TEXTURE0);
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
@@ -1069,7 +1325,8 @@ static void init_builtin_noise_texture(waywal_shader_engine_t *eng)
                 noise[(oy * SHADER_NOISE_DIM + ox) * 4u + 2u];
         }
     }
-    eng->noise_tex = create_rgba_texture(noise, SHADER_NOISE_DIM, SHADER_NOISE_DIM, GL_REPEAT);
+    eng->noise_tex =
+        create_texture_ex(noise, SHADER_NOISE_DIM, SHADER_NOISE_DIM, GL_REPEAT, false, false);
     free(noise);
 }
 
@@ -1197,6 +1454,7 @@ waywal_shader_engine_t *waywal_shader_engine_create(dmabuf_context_t *dmabuf_ctx
 static void destroy_pass_resources(shader_pass_t *pass)
 {
     if (pass->prog) {
+        glUseProgram(0);
         glDeleteProgram(pass->prog);
         pass->prog = 0;
     }
@@ -1224,11 +1482,20 @@ void waywal_shader_engine_forget_bo(waywal_shader_engine_t *eng, const dmabuf_bo
     if (!eng || !bo) {
         return;
     }
+    if (eng->last_rendered_bo == bo) {
+        eng->last_rendered_bo = NULL;
+        eng->last_rendered_tex = 0;
+        eng->last_rendered_w = 0;
+        eng->last_rendered_h = 0;
+    }
     size_t dst = 0;
     for (size_t i = 0; i < eng->num_imported_bos; ++i) {
         if (eng->imported_bos[i].bo == bo) {
             if (eng->last_complete_bo_tex == eng->imported_bos[i].gl_tex) {
                 eng->last_complete_bo_tex = 0;
+            }
+            if (!bo->egl_image && bo->gl_tex == eng->imported_bos[i].gl_tex) {
+                ((dmabuf_bo_t *)bo)->gl_tex = 0;
             }
             if (eng->imported_bos[i].owns_egl && eng->display != EGL_NO_DISPLAY &&
                 eng->context != EGL_NO_CONTEXT) {
@@ -1313,8 +1580,20 @@ void waywal_shader_engine_destroy(waywal_shader_engine_t *eng)
     if (eng->scratch_tex) {
         glDeleteTextures(1, &eng->scratch_tex);
     }
+    if (eng->read_fbo) {
+        glDeleteFramebuffers(1, &eng->read_fbo);
+        eng->read_fbo = 0;
+    }
+    if (eng->draw_fbo) {
+        glDeleteFramebuffers(1, &eng->draw_fbo);
+        eng->draw_fbo = 0;
+    }
     if (eng->display != EGL_NO_DISPLAY && eng->context != EGL_NO_CONTEXT) {
         for (size_t i = 0; i < eng->num_imported_bos; ++i) {
+            const dmabuf_bo_t *bo = eng->imported_bos[i].bo;
+            if (bo && !bo->egl_image && bo->gl_tex == eng->imported_bos[i].gl_tex) {
+                ((dmabuf_bo_t *)bo)->gl_tex = 0;
+            }
             if (!eng->imported_bos[i].owns_egl) {
                 continue;
             }
@@ -1327,12 +1606,6 @@ void waywal_shader_engine_destroy(waywal_shader_engine_t *eng)
         }
     }
     eng->num_imported_bos = 0;
-    if (eng->read_fbo) {
-        glDeleteFramebuffers(1, &eng->read_fbo);
-    }
-    if (eng->draw_fbo) {
-        glDeleteFramebuffers(1, &eng->draw_fbo);
-    }
     if (eng->prog_blit) {
         glDeleteProgram(eng->prog_blit);
     }
@@ -1519,6 +1792,28 @@ static void load_custom_channel_images(waywal_shader_engine_t *eng,
     }
 }
 
+static void recompute_engine_feature_flags(waywal_shader_engine_t *eng)
+{
+    bool any_audio_chan = false;
+    bool any_date = false;
+    for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
+        if (!eng->passes[p].active || !eng->passes[p].prog) {
+            continue;
+        }
+        if (eng->passes[p].uniforms.iDate >= 0) {
+            any_date = true;
+        }
+        for (int c = 0; c < 4; ++c) {
+            if (eng->passes[p].uniforms.iChannel[c] >= 0 &&
+                eng->passes[p].channels[c].target == SHADER_CHAN_AUDIO) {
+                any_audio_chan = true;
+            }
+        }
+    }
+    eng->uses_audio_channel = any_audio_chan;
+    eng->uses_date = any_date;
+}
+
 bool waywal_shader_engine_load_source(waywal_shader_engine_t *eng, const char *user_src,
                                       const char *debug_name)
 {
@@ -1583,13 +1878,38 @@ bool waywal_shader_engine_load_source(waywal_shader_engine_t *eng, const char *u
     }
     load_custom_channel_images(eng, new_passes, base_dir);
 
-    bool uses_lod = (strstr(user_src, "textureLod") != NULL);
+    bool has_tex_lod = (strstr(user_src, "textureLod(") != NULL);
+    bool any_buf_lod = false;
     for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
-        new_passes[p].needs_mipmap = uses_lod;
+        bool buf_needs_mip = false;
+        if (has_tex_lod && p < 4 && new_passes[p].active) {
+            shader_channel_target_t self_target =
+                (shader_channel_target_t)((int)SHADER_CHAN_BUFFER_A + p);
+            for (int rp = 0; rp < SHADER_NUM_PASSES; ++rp) {
+                if (!new_passes[rp].active) {
+                    continue;
+                }
+                for (int c = 0; c < 4; ++c) {
+                    if (new_passes[rp].channels[c].target == self_target) {
+                        buf_needs_mip = true;
+                        any_buf_lod = true;
+                        break;
+                    }
+                }
+                if (buf_needs_mip) {
+                    break;
+                }
+            }
+        }
+        new_passes[p].needs_mipmap = buf_needs_mip;
         destroy_pass_resources(&eng->passes[p]);
         eng->passes[p] = new_passes[p];
     }
-    for (int i = 0; i < SHADER_MAX_CUSTOM_UNIFORMS; ++i) {
+    eng->uses_lod = any_buf_lod;
+    eng->frame_idx = 0;
+    recompute_engine_feature_flags(eng);
+
+    for (uint32_t i = 0; i < eng->num_custom_uniforms; ++i) {
         for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
             eng->custom_uniforms[i].locations[p] = -2;
             eng->custom_uniforms[i].types[p] = 0;
@@ -1752,17 +2072,21 @@ bool waywal_shader_engine_set_custom_uniform(waywal_shader_engine_t *eng, const 
     }
 
     int slot = -1;
-    for (int i = 0; i < SHADER_MAX_CUSTOM_UNIFORMS; ++i) {
+    for (uint32_t i = 0; i < eng->num_custom_uniforms; ++i) {
         if (eng->custom_uniforms[i].active && strcmp(eng->custom_uniforms[i].name, name) == 0) {
-            slot = i;
+            slot = (int)i;
             break;
         }
         if (slot < 0 && !eng->custom_uniforms[i].active) {
-            slot = i;
+            slot = (int)i;
         }
     }
     if (slot < 0) {
-        return false;
+        if (eng->num_custom_uniforms < SHADER_MAX_CUSTOM_UNIFORMS) {
+            slot = (int)eng->num_custom_uniforms++;
+        } else {
+            return false;
+        }
     }
     shader_custom_uniform_t *cu = &eng->custom_uniforms[slot];
     if (!cu->active || strcmp(cu->name, name) != 0) {
@@ -1798,7 +2122,7 @@ bool waywal_shader_engine_get_custom_uniform(const waywal_shader_engine_t *eng, 
     if (!eng || !name) {
         return false;
     }
-    for (int i = 0; i < SHADER_MAX_CUSTOM_UNIFORMS; ++i) {
+    for (uint32_t i = 0; i < eng->num_custom_uniforms; ++i) {
         if (eng->custom_uniforms[i].active && strcmp(eng->custom_uniforms[i].name, name) == 0) {
             if (out_values) {
                 memcpy(out_values, eng->custom_uniforms[i].values, 4 * sizeof(float));
@@ -1818,7 +2142,7 @@ void waywal_shader_engine_copy_custom_uniforms(waywal_shader_engine_t *dst,
     if (!dst || !src || dst == src) {
         return;
     }
-    for (int i = 0; i < SHADER_MAX_CUSTOM_UNIFORMS; ++i) {
+    for (uint32_t i = 0; i < src->num_custom_uniforms; ++i) {
         if (src->custom_uniforms[i].active) {
             (void)waywal_shader_engine_set_custom_uniform(dst, src->custom_uniforms[i].name,
                                                           src->custom_uniforms[i].values,
@@ -1878,6 +2202,7 @@ static bool load_depth_parallax_internal(waywal_shader_engine_t *eng, const uint
     }
     eng->passes[4].channels[0].target = SHADER_CHAN_WALLPAPER;
     eng->passes[4].channels[1].target = SHADER_CHAN_DEPTH;
+    recompute_engine_feature_flags(eng);
     return true;
 }
 
@@ -1969,9 +2294,8 @@ bool waywal_shader_engine_load_file(waywal_shader_engine_t *eng, const char *fil
         return false;
     }
     char resolved[4096];
-    const char *target = waywal_shader_resolve_path(filepath, resolved, sizeof(resolved))
-                             ? resolved
-                             : filepath;
+    const char *target =
+        waywal_shader_resolve_path(filepath, resolved, sizeof(resolved)) ? resolved : filepath;
     char *src = read_entire_file(target);
     if (!src) {
         return false;
@@ -2122,6 +2446,9 @@ static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLu
         if (eng->imported_bos[i].bo == bo && eng->imported_bos[i].fd0 == bo->fd[0] &&
             eng->imported_bos[i].width == bo->width && eng->imported_bos[i].height == bo->height &&
             eng->imported_bos[i].drm_format == bo->drm_format && eng->imported_bos[i].gl_tex != 0) {
+            if (bo->gl_tex == 0) {
+                bo->gl_tex = eng->imported_bos[i].gl_tex;
+            }
             *out_tex = eng->imported_bos[i].gl_tex;
             return true;
         }
@@ -2208,6 +2535,7 @@ static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLu
     }
 
     GLuint tex = 0;
+    glActiveTexture(GL_TEXTURE0);
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     if (eng->glEGLImageTargetTexStorageEXT) {
@@ -2219,23 +2547,31 @@ static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLu
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     if (eng->display != EGL_NO_DISPLAY) {
         record_imported_bo(eng, bo, tex, img, true);
+    }
+    if (bo->gl_tex == 0) {
+        bo->gl_tex = tex;
     }
     *out_tex = tex;
     return true;
 }
 
-static void ensure_pass_ping_pong_textures(waywal_shader_engine_t *eng, shader_pass_t *pass,
-                                           uint32_t w, uint32_t h, uint16_t **shared_zero_half)
+static bool ensure_pass_ping_pong_textures(waywal_shader_engine_t *eng, shader_pass_t *pass,
+                                           uint32_t w, uint32_t h, uint16_t **shared_zero_half,
+                                           size_t *shared_zero_cap)
 {
     (void)eng;
     if (pass->ping_pong_tex[0] && pass->ping_pong_tex[1] && pass->tex_w == w && pass->tex_h == h) {
-        return;
+        return false;
     }
-    if (shared_zero_half && !*shared_zero_half) {
-        *shared_zero_half = (uint16_t *)calloc((size_t)w * (size_t)h * 4u, sizeof(uint16_t));
+    size_t needed = (size_t)w * (size_t)h * 4u;
+    if (shared_zero_half && shared_zero_cap && (!*shared_zero_half || *shared_zero_cap < needed)) {
+        free(*shared_zero_half);
+        *shared_zero_half = (uint16_t *)calloc(needed, sizeof(uint16_t));
+        *shared_zero_cap = *shared_zero_half ? needed : 0;
     }
     const uint16_t *zero_half = shared_zero_half ? *shared_zero_half : NULL;
     GLsizei levels = 1;
@@ -2246,6 +2582,7 @@ static void ensure_pass_ping_pong_textures(waywal_shader_engine_t *eng, shader_p
             levels++;
         }
     }
+    glActiveTexture(GL_TEXTURE0);
     for (int i = 0; i < 2; ++i) {
         if (pass->ping_pong_tex[i]) {
             glDeleteTextures(1, &pass->ping_pong_tex[i]);
@@ -2269,6 +2606,7 @@ static void ensure_pass_ping_pong_textures(waywal_shader_engine_t *eng, shader_p
     pass->tex_w = w;
     pass->tex_h = h;
     pass->read_idx = 0;
+    return true;
 }
 
 static void ensure_scratch_texture(waywal_shader_engine_t *eng, uint32_t w, uint32_t h)
@@ -2276,6 +2614,7 @@ static void ensure_scratch_texture(waywal_shader_engine_t *eng, uint32_t w, uint
     if (eng->scratch_tex && eng->scratch_w == w && eng->scratch_h == h) {
         return;
     }
+    glActiveTexture(GL_TEXTURE0);
     if (eng->scratch_tex) {
         glDeleteTextures(1, &eng->scratch_tex);
     }
@@ -2375,6 +2714,59 @@ static void resolve_channel_texture(const waywal_shader_engine_t *eng,
     out_res[2] = 1.0f;
 }
 
+static void ensure_blit_resources(waywal_shader_engine_t *eng)
+{
+    if (!eng->prog_blit) {
+        static const char *vs_src =
+            "#version 310 es\n"
+            "out highp vec2 v_uv;\n"
+            "void main() {\n"
+            "    vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    v_uv = pos;\n"
+            "    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
+        static const char *fs_src = "#version 310 es\n"
+                                    "precision highp float;\n"
+                                    "in highp vec2 v_uv;\n"
+                                    "layout(binding = 0) uniform highp sampler2D u_tex;\n"
+                                    "uniform int u_swap_rb;\n"
+                                    "out highp vec4 frag_color;\n"
+                                    "void main() {\n"
+                                    "    vec4 c = texture(u_tex, v_uv);\n"
+                                    "    frag_color = (u_swap_rb != 0) ? c.bgra : c;\n"
+                                    "}\n";
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+        GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+        if (vs && fs) {
+            glShaderSource(vs, 1, &vs_src, NULL);
+            glCompileShader(vs);
+            glShaderSource(fs, 1, &fs_src, NULL);
+            glCompileShader(fs);
+            GLuint p = glCreateProgram();
+            if (p) {
+                glAttachShader(p, vs);
+                glAttachShader(p, fs);
+                glLinkProgram(p);
+                GLint ok = 0;
+                glGetProgramiv(p, GL_LINK_STATUS, &ok);
+                if (ok) {
+                    eng->prog_blit = p;
+                    eng->loc_blit_swap_rb = glGetUniformLocation(p, "u_swap_rb");
+                } else {
+                    glDeleteProgram(p);
+                }
+            }
+        }
+        if (vs)
+            glDeleteShader(vs);
+        if (fs)
+            glDeleteShader(fs);
+    }
+    if (!eng->blit_vao) {
+        glGenVertexArrays(1, &eng->blit_vao);
+    }
+}
+
 bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t *target_bo,
                                        const waywal_shader_frame_params_t *params)
 {
@@ -2388,23 +2780,27 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         return false;
     }
 
-    if (params->audio) {
-        glBindTexture(GL_TEXTURE_2D, eng->audio_tex);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WAYWAL_AUDIO_TEX_WIDTH, WAYWAL_AUDIO_TEX_HEIGHT,
-                        GL_RED, GL_UNSIGNED_BYTE, params->audio->shadertoy_tex);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-        eng->audio_tex_dirty = true;
-    } else if (eng->audio_tex_dirty && eng->audio_tex) {
-        uint8_t zero_tex[WAYWAL_AUDIO_TEX_WIDTH * WAYWAL_AUDIO_TEX_HEIGHT];
-        memset(zero_tex, 0, WAYWAL_AUDIO_TEX_WIDTH);
-        memset(zero_tex + WAYWAL_AUDIO_TEX_WIDTH, 128, WAYWAL_AUDIO_TEX_WIDTH);
-        glBindTexture(GL_TEXTURE_2D, eng->audio_tex);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WAYWAL_AUDIO_TEX_WIDTH, WAYWAL_AUDIO_TEX_HEIGHT,
-                        GL_RED, GL_UNSIGNED_BYTE, zero_tex);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-        eng->audio_tex_dirty = false;
+    if (eng->uses_audio_channel) {
+        if (params->audio) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, eng->audio_tex);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WAYWAL_AUDIO_TEX_WIDTH, WAYWAL_AUDIO_TEX_HEIGHT,
+                            GL_RED, GL_UNSIGNED_BYTE, params->audio->shadertoy_tex);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            eng->audio_tex_dirty = true;
+        } else if (eng->audio_tex_dirty && eng->audio_tex) {
+            uint8_t zero_tex[WAYWAL_AUDIO_TEX_WIDTH * WAYWAL_AUDIO_TEX_HEIGHT];
+            memset(zero_tex, 0, WAYWAL_AUDIO_TEX_WIDTH);
+            memset(zero_tex + WAYWAL_AUDIO_TEX_WIDTH, 128, WAYWAL_AUDIO_TEX_WIDTH);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, eng->audio_tex);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WAYWAL_AUDIO_TEX_WIDTH, WAYWAL_AUDIO_TEX_HEIGHT,
+                            GL_RED, GL_UNSIGNED_BYTE, zero_tex);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            eng->audio_tex_dirty = false;
+        }
     }
 
     float date_vals[4] = {params->date[0], params->date[1], params->date[2], params->date[3]};
@@ -2455,18 +2851,36 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
     }
 
     bool has_multipass = false;
+    bool tex_recreated[4] = {false, false, false, false};
+    uint32_t buf_w[4] = {target_bo->width, target_bo->width, target_bo->width, target_bo->width};
+    uint32_t buf_h[4] = {target_bo->height, target_bo->height, target_bo->height,
+                         target_bo->height};
     uint16_t *shared_zero_half = NULL;
+    size_t shared_zero_cap = 0;
     for (int p = 0; p < 4; ++p) {
         if (eng->passes[p].active) {
             has_multipass = true;
-            ensure_pass_ping_pong_textures(eng, &eng->passes[p], target_bo->width,
-                                           target_bo->height, &shared_zero_half);
+            float sc = eng->passes[p].res_scale;
+            if (sc <= 0.0f || sc > 1.0f) {
+                sc = 1.0f;
+            } else if (sc < 0.125f) {
+                sc = 0.125f;
+            }
+            uint32_t bw = (uint32_t)lroundf((float)target_bo->width * sc);
+            uint32_t bh = (uint32_t)lroundf((float)target_bo->height * sc);
+            if (bw < 1u) {
+                bw = 1u;
+            }
+            if (bh < 1u) {
+                bh = 1u;
+            }
+            buf_w[p] = bw;
+            buf_h[p] = bh;
+            tex_recreated[p] = ensure_pass_ping_pong_textures(eng, &eng->passes[p], bw, bh,
+                                                              &shared_zero_half, &shared_zero_cap);
         }
     }
     free(shared_zero_half);
-
-    GLint prev_prog = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
 
     GLuint groups_x = (target_bo->width + 15u) / 16u;
     GLuint groups_y = (target_bo->height + 15u) / 16u;
@@ -2487,13 +2901,24 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             continue;
         }
 
+        if (p < 4 && !tex_recreated[p] && pass->target_fps > 0 && eng->frame_idx > 0 &&
+            params->frame_index > 0 && (double)params->time_sec >= pass->last_render_sec &&
+            ((double)params->time_sec - pass->last_render_sec) <
+                (0.95 / (double)pass->target_fps)) {
+            continue;
+        }
+
         glUseProgram(pass->prog);
         const shader_uniforms_t *u = &pass->uniforms;
         bool init_u = !pass->uniforms_initialized;
 
         bool use_span_on_pass = (p == 4 && !has_multipass);
-        uint32_t pass_res_w = use_span_on_pass ? span_res_w : target_bo->width;
-        uint32_t pass_res_h = use_span_on_pass ? span_res_h : target_bo->height;
+        uint32_t pass_res_w =
+            (p < 4) ? buf_w[p] : (use_span_on_pass ? span_res_w : target_bo->width);
+        uint32_t pass_res_h =
+            (p < 4) ? buf_h[p] : (use_span_on_pass ? span_res_h : target_bo->height);
+        uint32_t local_w = (p < 4) ? buf_w[p] : target_bo->width;
+        uint32_t local_h = (p < 4) ? buf_h[p] : target_bo->height;
         const float *pass_span =
             use_span_on_pass ? span_vec : (const float[4]){0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -2503,11 +2928,11 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             pass->cached_res_w = pass_res_w;
             pass->cached_res_h = pass_res_h;
         }
-        if (u->u_local_size >= 0 && (init_u || pass->cached_local_w != target_bo->width ||
-                                     pass->cached_local_h != target_bo->height)) {
-            glUniform2f(u->u_local_size, (float)target_bo->width, (float)target_bo->height);
-            pass->cached_local_w = target_bo->width;
-            pass->cached_local_h = target_bo->height;
+        if (u->u_local_size >= 0 &&
+            (init_u || pass->cached_local_w != local_w || pass->cached_local_h != local_h)) {
+            glUniform2f(u->u_local_size, (float)local_w, (float)local_h);
+            pass->cached_local_w = local_w;
+            pass->cached_local_h = local_h;
         }
         if (u->u_span_rect >= 0 && (init_u || pass->cached_span_rect[0] != pass_span[0] ||
                                     pass->cached_span_rect[1] != pass_span[1] ||
@@ -2558,6 +2983,12 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                 pass_mouse_smooth[3] -= span_vec[1];
             else if (pass_mouse_smooth[3] < 0.0f)
                 pass_mouse_smooth[3] += span_vec[1];
+        }
+        if (p < 4 && pass->res_scale > 0.0f && pass->res_scale < 1.0f) {
+            for (int mi = 0; mi < 4; ++mi) {
+                pass_mouse[mi] *= pass->res_scale;
+                pass_mouse_smooth[mi] *= pass->res_scale;
+            }
         }
         if (u->iMouse >= 0 &&
             (init_u || memcmp(pass->cached_mouse, pass_mouse, sizeof(pass_mouse)) != 0)) {
@@ -2632,6 +3063,13 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                 glUniform1i(u->u_album_art, 4);
             }
         }
+        if (u->u_noise_tex >= 0 && eng->noise_tex != 0) {
+            glActiveTexture(GL_TEXTURE5);
+            glBindTexture(GL_TEXTURE_2D, eng->noise_tex);
+            if (init_u) {
+                glUniform1i(u->u_noise_tex, 5);
+            }
+        }
         if (params->audio) {
             if (u->u_audio_bands >= 0) {
                 glUniform1fv(u->u_audio_bands, WAYWAL_AUDIO_BARK_BANDS, params->audio->bands);
@@ -2657,7 +3095,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             pass->audio_uniforms_dirty = false;
         }
 
-        for (int cu_idx = 0; cu_idx < SHADER_MAX_CUSTOM_UNIFORMS; ++cu_idx) {
+        for (uint32_t cu_idx = 0; cu_idx < eng->num_custom_uniforms; ++cu_idx) {
             shader_custom_uniform_t *cu = &eng->custom_uniforms[cu_idx];
             if (!cu->active) {
                 continue;
@@ -2725,7 +3163,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             }
         }
 
-        float chan_res[12];
+        float chan_res[12] = {0};
         float chan_time[4] = {
             params->time_sec,
             params->time_sec,
@@ -2753,6 +3191,8 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
 
         if (p < 4) {
             int write_idx = 1 - pass->read_idx;
+            GLuint pass_groups_x = (buf_w[p] + 15u) / 16u;
+            GLuint pass_groups_y = (buf_h[p] + 15u) / 16u;
             if (u->u_swap_rb >= 0 && (init_u || pass->cached_swap_rb != 0)) {
                 glUniform1i(u->u_swap_rb, 0);
                 pass->cached_swap_rb = 0;
@@ -2765,9 +3205,10 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             if (pass->is_compute) {
                 glBindImageTexture(0, pass->ping_pong_tex[write_idx], 0, GL_FALSE, 0, GL_WRITE_ONLY,
                                    GL_RGBA16F);
-                glDispatchCompute(groups_x, groups_y, 1u);
+                glDispatchCompute(pass_groups_x, pass_groups_y, 1u);
                 glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
                 if (pass->needs_mipmap) {
+                    glActiveTexture(GL_TEXTURE0);
                     glBindTexture(GL_TEXTURE_2D, pass->ping_pong_tex[write_idx]);
                     glGenerateMipmap(GL_TEXTURE_2D);
                 }
@@ -2775,17 +3216,19 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                 glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                                        pass->ping_pong_tex[write_idx], 0);
-                glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
+                glViewport(0, 0, (GLsizei)buf_w[p], (GLsizei)buf_h[p]);
                 glBindVertexArray(eng->blit_vao);
                 glDrawArrays(GL_TRIANGLES, 0, 3);
                 glBindVertexArray(0);
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 if (pass->needs_mipmap) {
+                    glActiveTexture(GL_TEXTURE0);
                     glBindTexture(GL_TEXTURE_2D, pass->ping_pong_tex[write_idx]);
                     glGenerateMipmap(GL_TEXTURE_2D);
                 }
             }
             pass->read_idx = write_idx;
+            pass->last_render_sec = (double)params->time_sec;
         } else if (pass->is_compute) {
             GLuint dst_tex = use_scratch_blit ? eng->scratch_tex : target_tex;
             int swap_rb = 1;
@@ -2838,55 +3281,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
     }
 
     if (use_scratch_blit) {
-        if (!eng->prog_blit) {
-            static const char *vs_src =
-                "#version 310 es\n"
-                "out highp vec2 v_uv;\n"
-                "void main() {\n"
-                "    vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
-                "    v_uv = pos;\n"
-                "    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);\n"
-                "}\n";
-            static const char *fs_src = "#version 310 es\n"
-                                        "precision highp float;\n"
-                                        "in highp vec2 v_uv;\n"
-                                        "layout(binding = 0) uniform highp sampler2D u_tex;\n"
-                                        "uniform int u_swap_rb;\n"
-                                        "out highp vec4 frag_color;\n"
-                                        "void main() {\n"
-                                        "    vec4 c = texture(u_tex, v_uv);\n"
-                                        "    frag_color = (u_swap_rb != 0) ? c.bgra : c;\n"
-                                        "}\n";
-            GLuint vs = glCreateShader(GL_VERTEX_SHADER);
-            GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
-            if (vs && fs) {
-                glShaderSource(vs, 1, &vs_src, NULL);
-                glCompileShader(vs);
-                glShaderSource(fs, 1, &fs_src, NULL);
-                glCompileShader(fs);
-                GLuint p = glCreateProgram();
-                if (p) {
-                    glAttachShader(p, vs);
-                    glAttachShader(p, fs);
-                    glLinkProgram(p);
-                    GLint ok = 0;
-                    glGetProgramiv(p, GL_LINK_STATUS, &ok);
-                    if (ok) {
-                        eng->prog_blit = p;
-                        eng->loc_blit_swap_rb = glGetUniformLocation(p, "u_swap_rb");
-                    } else {
-                        glDeleteProgram(p);
-                    }
-                }
-            }
-            if (vs)
-                glDeleteShader(vs);
-            if (fs)
-                glDeleteShader(fs);
-        }
-        if (!eng->blit_vao) {
-            glGenVertexArrays(1, &eng->blit_vao);
-        }
+        ensure_blit_resources(eng);
 
         glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target_tex, 0);
@@ -2927,7 +3322,98 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
-    glUseProgram((GLuint)prev_prog);
+    glUseProgram(0);
+    if (eng->eglCreateSyncKHR && eng->eglClientWaitSyncKHR && eng->eglDestroySyncKHR) {
+        EGLSyncKHR sync = eng->eglCreateSyncKHR(eng->display, EGL_SYNC_FENCE_KHR, NULL);
+        if (sync != EGL_NO_SYNC_KHR) {
+            eng->eglClientWaitSyncKHR(eng->display, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR,
+                                      EGL_FOREVER_KHR);
+            eng->eglDestroySyncKHR(eng->display, sync);
+        } else {
+            glFlush();
+            glFinish();
+        }
+    } else {
+        glFlush();
+        glFinish();
+    }
+    eng->last_rendered_bo = target_bo;
+    eng->last_rendered_tex = target_tex;
+    eng->last_rendered_w = target_bo->width;
+    eng->last_rendered_h = target_bo->height;
+    eng->frame_idx++;
+    return true;
+}
+
+bool waywal_shader_engine_blit_from_tex(waywal_shader_engine_t *eng, uint32_t src_tex,
+                                        uint32_t src_w, uint32_t src_h, dmabuf_bo_t *target_bo)
+{
+    if (!eng || !target_bo || src_w == 0 || src_h == 0) {
+        return false;
+    }
+
+    make_context_current(eng);
+    GLuint real_src_tex = (GLuint)src_tex;
+    if (eng->last_rendered_bo && eng->last_rendered_tex != 0 &&
+        (src_tex == 0 || eng->last_rendered_bo->gl_tex == src_tex ||
+         eng->last_rendered_tex == src_tex) &&
+        eng->last_rendered_w == src_w && eng->last_rendered_h == src_h) {
+        real_src_tex = eng->last_rendered_tex;
+    } else if (src_tex != 0) {
+        for (size_t i = 0; i < eng->num_imported_bos; ++i) {
+            const dmabuf_bo_t *b = eng->imported_bos[i].bo;
+            if (b && (b->gl_tex == src_tex || eng->imported_bos[i].gl_tex == src_tex)) {
+                real_src_tex = eng->imported_bos[i].gl_tex;
+                break;
+            }
+        }
+    }
+    if (real_src_tex == 0) {
+        return false;
+    }
+
+    GLuint target_tex = 0;
+    if (!ensure_bo_imported(eng, target_bo, &target_tex)) {
+        return false;
+    }
+    if (target_tex == real_src_tex) {
+        return true;
+    }
+
+    ensure_blit_resources(eng);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target_tex, 0);
+    bool fbo_ok = (eng->last_complete_bo_tex == target_tex);
+    if (!fbo_ok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        eng->last_complete_bo_tex = target_tex;
+        fbo_ok = true;
+    }
+    if (eng->prog_blit && fbo_ok) {
+        glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
+        glUseProgram(eng->prog_blit);
+        if (eng->loc_blit_swap_rb >= 0) {
+            glUniform1i(eng->loc_blit_swap_rb, 0);
+        }
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, real_src_tex);
+        glBindVertexArray(eng->blit_vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    } else {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, eng->read_fbo);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                               real_src_tex, 0);
+        GLenum filter =
+            (src_w == target_bo->width && src_h == target_bo->height) ? GL_NEAREST : GL_LINEAR;
+        glBlitFramebuffer(0, 0, (GLint)src_w, (GLint)src_h, 0, 0, (GLint)target_bo->width,
+                          (GLint)target_bo->height, GL_COLOR_BUFFER_BIT, filter);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    }
+
+    glUseProgram(0);
     if (eng->eglCreateSyncKHR && eng->eglClientWaitSyncKHR && eng->eglDestroySyncKHR) {
         EGLSyncKHR sync = eng->eglCreateSyncKHR(eng->display, EGL_SYNC_FENCE_KHR, NULL);
         if (sync != EGL_NO_SYNC_KHR) {
@@ -2943,6 +3429,21 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
         glFinish();
     }
     return true;
+}
+
+bool waywal_shader_engine_blit_bo(waywal_shader_engine_t *eng, dmabuf_bo_t *src_bo,
+                                  dmabuf_bo_t *target_bo)
+{
+    if (!eng || !src_bo || !target_bo) {
+        return false;
+    }
+    make_context_current(eng);
+    GLuint src_tex = 0;
+    if (!ensure_bo_imported(eng, src_bo, &src_tex)) {
+        return false;
+    }
+    return waywal_shader_engine_blit_from_tex(eng, src_tex, src_bo->width, src_bo->height,
+                                              target_bo);
 }
 
 bool waywal_shader_engine_has_active_program(const waywal_shader_engine_t *eng)

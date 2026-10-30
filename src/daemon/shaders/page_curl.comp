@@ -33,7 +33,8 @@ void main() {
     // Curl axis along u_angle (defaults to 45-degree diagonal when 0)
     float angle = (abs(u_angle) > 1e-5) ? u_angle : 0.78539816;
     vec2 dir = vec2(cos(angle), -sin(angle));
-    float s = dot(uv - vec2(0.5), dir) * 0.70710678 + 0.5;
+    float span = max(abs(dir.x) + abs(dir.y), 1e-5);
+    float s = dot(uv - vec2(0.5), dir) / span + 0.5;
 
     vec4 col;
     if (s < line) {
@@ -42,27 +43,27 @@ void main() {
     } else if (s < line + R) {
         // Active cylindrical curl region
         float dist = s - line;
-        vec2 uv_curl = uv - 1.41421356 * dist * dir;
+        vec2 uv_curl = uv - (2.0 * span * dist) * dir;
 
         if (uv_curl.x >= 0.0 && uv_curl.x <= 1.0 && uv_curl.y >= 0.0 && uv_curl.y <= 1.0) {
             // Curled back of the peeling canvas with specular cylinder highlight
-            float curl_light = 0.85 + 0.35 * sin((dist / R) * 3.1415926535);
+            float angle_norm = dist / R;
+            float curl_light = 1.0 + 0.18 * sin(angle_norm * 3.14159265);
             vec4 old_col = texture(u_src_a, uv_curl);
-            col = old_col * vec4(vec3(curl_light * 0.9), 1.0);
+            col = mix(old_col, old_col * curl_light, smoothstep(0.0, R * 0.25, dist));
+            col.a = 1.0;
         } else {
             // Beneath curl: revealed new image with contact shadow
-            float shadow = 0.5 + 0.5 * smoothstep(0.0, R, dist);
+            float shadow = 0.5 + 0.5 * smoothstep(0.0, R * 1.8, dist);
             col = texture(u_src_b, uv) * vec4(vec3(shadow), 1.0);
         }
-    } else {
+    } else if (s < line + R * 1.8) {
         // Revealed new wallpaper with soft contact drop shadow near curl edge
-        float drop_shadow_width = 0.08;
-        if (s < line + R + drop_shadow_width) {
-            float shadow = 0.65 + 0.35 * smoothstep(0.0, drop_shadow_width, s - (line + R));
-            col = texture(u_src_b, uv) * vec4(vec3(shadow), 1.0);
-        } else {
-            col = texture(u_src_b, uv);
-        }
+        float dist = s - line;
+        float shadow = 0.5 + 0.5 * smoothstep(0.0, R * 1.8, dist);
+        col = texture(u_src_b, uv) * vec4(vec3(shadow), 1.0);
+    } else {
+        col = texture(u_src_b, uv);
     }
 
     // Format alignment for DRM_FORMAT_ARGB8888 little-endian

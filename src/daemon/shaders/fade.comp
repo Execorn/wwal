@@ -15,14 +15,13 @@ void main() {
         return;
     }
 
-    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
     vec4 col;
     if (u_progress <= 0.0) {
-        col = texture(u_src_a, uv);
+        col = texelFetch(u_src_a, coord, 0);
     } else if (u_progress >= 1.0) {
-        col = texture(u_src_b, uv);
+        col = texelFetch(u_src_b, coord, 0);
     } else {
-        col = mix(texture(u_src_a, uv), texture(u_src_b, uv), u_progress);
+        col = mix(texelFetch(u_src_a, coord, 0), texelFetch(u_src_b, coord, 0), u_progress);
     }
 
     imageStore(u_target, coord, col.bgra);

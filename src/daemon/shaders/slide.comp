@@ -47,11 +47,12 @@ void main() {
     bool has_blur = (blur_mag >= 0.001);
     vec2 blur_offset = dir * (blur_mag * 0.25);
 
-    /* A slides away in -dir direction; B slides in from +dir direction */
-    vec2 uv_a = uv + dir * u_progress;
-    vec2 uv_b = uv - dir * (1.0 - u_progress);
+    /* A slides in +dir direction; B slides in from -dir direction */
+    vec2 uv_a = uv - dir * u_progress;
+    vec2 uv_b = uv + dir * (1.0 - u_progress);
 
-    float proj = dot(uv - vec2(0.5), dir) * 0.70710678 + 0.5;
+    float span = max(abs(dir.x) + abs(dir.y), 1e-5);
+    float proj = dot(uv - vec2(0.5), dir) / span + 0.5;
     float edge = 0.02 + blur_mag * 0.5;
     float p = u_progress * (1.0 + 2.0 * edge) - edge;
     float split = smoothstep(proj - edge, proj + edge, p);

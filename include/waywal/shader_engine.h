@@ -80,6 +80,15 @@ bool waywal_shader_engine_poll_hot_reload(waywal_shader_engine_t *eng);
 
 bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t *target_bo,
                                        const waywal_shader_frame_params_t *params);
+static inline bool waywal_shader_engine_render(waywal_shader_engine_t *eng, dmabuf_bo_t *target_bo,
+                                               const waywal_shader_frame_params_t *params)
+{
+    return waywal_shader_engine_render_frame(eng, target_bo, params);
+}
+bool waywal_shader_engine_blit_from_tex(waywal_shader_engine_t *eng, uint32_t src_tex,
+                                        uint32_t src_w, uint32_t src_h, dmabuf_bo_t *target_bo);
+bool waywal_shader_engine_blit_bo(waywal_shader_engine_t *eng, dmabuf_bo_t *src_bo,
+                                  dmabuf_bo_t *target_bo);
 bool waywal_shader_engine_has_active_program(const waywal_shader_engine_t *eng);
 bool waywal_shader_engine_uses_mouse(const waywal_shader_engine_t *eng);
 bool waywal_shader_engine_last_load_from_cache(const waywal_shader_engine_t *eng);

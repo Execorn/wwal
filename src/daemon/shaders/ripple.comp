@@ -35,11 +35,9 @@ void main() {
     vec2 delta = vec2(raw_delta.x * aspect, raw_delta.y);
     float dist2 = dot(delta, delta);
 
-    float max_dist = length(vec2(max(center.x, 1.0 - center.x) * aspect,
-                                 max(center.y, 1.0 - center.y))) + 0.1;
-
-    float current_radius = u_progress * max_dist;
     const float wave_width = 0.18;
+    float max_dist = length(max(center, vec2(1.0) - center) * vec2(aspect, 1.0));
+    float current_radius = mix(-0.03, max_dist + wave_width, u_progress);
     float r_in = current_radius - wave_width;
     float r_out = current_radius + wave_width;
 
@@ -57,11 +55,12 @@ void main() {
     float amp = (u_wave_amp > 0.0) ? u_wave_amp : 0.04;
 
     float diff = dist - current_radius;
-    float decay = (1.0 - u_progress) * (1.0 - u_progress);
+    float env = smoothstep(0.0, 0.08, u_progress) * (1.0 - u_progress) * (1.0 - u_progress);
+    float decay = env;
 
     vec2 norm_dir = (dist > 0.0001) ? (raw_delta / dist) : vec2(0.0);
 
-    float window = smoothstep(wave_width, 0.0, abs(diff));
+    float window = 1.0 - smoothstep(0.0, wave_width, abs(diff));
     float wave = sin(diff * freq) * amp * decay * window;
     float crest = max(0.0, -wave / amp) * decay * 0.22;
 

@@ -28,7 +28,7 @@ void main() {
 
     vec2 dir = vec2(cos(u_angle), sin(u_angle));
     float proj = dot(uv - vec2(0.5), dir);
-    float d = proj / 1.41421356 + 0.5;
+    float d = proj / max(abs(dir.x) + abs(dir.y), 1e-5) + 0.5;
 
     float edge = 0.04;
     float p = u_progress * (1.0 + 2.0 * edge) - edge;

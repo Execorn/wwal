@@ -1532,13 +1532,10 @@ float waywal_audio_get_effective_volume(const waywal_audio_fft_t *fft)
     if (!fft) {
         return 1.0f;
     }
-    if (waywal_audio_fft_is_ducked(fft)) {
-        return 0.0f;
-    }
     if (!fft->volume_explicitly_set) {
-        return 1.0f;
+        return waywal_audio_fft_is_ducked(fft) ? clampf(fft->current_gain, 0.0f, 1.0f) : 1.0f;
     }
-    return clampf(fft->user_volume, 0.0f, 1.0f);
+    return clampf(fft->current_gain, 0.0f, 1.0f);
 }
 
 void waywal_audio_clear_playback(waywal_audio_fft_t *fft)
