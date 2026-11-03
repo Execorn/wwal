@@ -69,9 +69,14 @@ static void test_arena(void)
     assert(arena.offset == 0 && "arena_reset must set offset to 0");
 
     /* Reallocate after reset */
-    void *post_reset_ptr = arena_alloc(&arena, 128, 16);
-    assert(post_reset_ptr != NULL);
-    assert(arena.offset >= 128);
+    void *overflow1 = arena_alloc(&arena, SIZE_MAX, 8);
+    assert(overflow1 == NULL && "arena_alloc must reject SIZE_MAX without wrapping");
+    void *overflow2 = arena_alloc(&arena, SIZE_MAX - 7, 8);
+    assert(overflow2 == NULL && "arena_alloc must reject SIZE_MAX - 7 without wrapping");
+    void *overflow3 = arena_alloc(&arena, SIZE_MAX - arena.capacity, 8);
+    assert(overflow3 == NULL && "arena_alloc must reject near-overflow size");
+    void *overflow4 = arena_alloc(&arena, (size_t)-1, 16);
+    assert(overflow4 == NULL && "arena_alloc must reject (size_t)-1 with alignment");
 
     arena_destroy(&arena);
     assert(arena.buffer == NULL && arena.capacity == 0);

@@ -3456,12 +3456,30 @@ static void test_sound_and_text_layers_and_scenescript_stdlib(void)
         uint32_t au_frames = 120u;
         uint32_t au_data_bytes = au_frames * 2u * 2u;
         uint8_t au_hdr[24] = {
-            '.',  's',  'n',  'd',  0x00, 0x00, 0x00, 0x18, /* magic + 24-byte offset */
-            0x00, 0x00, (uint8_t)((au_data_bytes >> 8) & 0xffu),
-            (uint8_t)(au_data_bytes & 0xffu),               /* data size */
-            0x00, 0x00, 0x00, 0x03,                         /* encoding = 3 (16-bit PCM BE) */
-            0x00, 0x00, 0x5d, 0xc0,                         /* sample_rate = 24000 Hz */
-            0x00, 0x00, 0x00, 0x02                          /* channels = 2 */
+            '.',
+            's',
+            'n',
+            'd',
+            0x00,
+            0x00,
+            0x00,
+            0x18, /* magic + 24-byte offset */
+            0x00,
+            0x00,
+            (uint8_t)((au_data_bytes >> 8) & 0xffu),
+            (uint8_t)(au_data_bytes & 0xffu), /* data size */
+            0x00,
+            0x00,
+            0x00,
+            0x03, /* encoding = 3 (16-bit PCM BE) */
+            0x00,
+            0x00,
+            0x5d,
+            0xc0, /* sample_rate = 24000 Hz */
+            0x00,
+            0x00,
+            0x00,
+            0x02 /* channels = 2 */
         };
         bb_append(&au_buf, au_hdr, sizeof(au_hdr));
         for (uint32_t i = 0; i < au_frames; ++i) {
@@ -3528,6 +3546,37 @@ static void test_sound_and_text_layers_and_scenescript_stdlib(void)
         we_script_destroy(vm);
     }
 
+    {
+        char prefix[1200];
+        memset(prefix, 'X', sizeof(prefix) - 1);
+        prefix[sizeof(prefix) - 1] = '\0';
+
+        char *script_buf = (char *)malloc(4096);
+        assert(script_buf != NULL);
+        snprintf(script_buf, 4096,
+                 "export function update(value) {\n"
+                 "  let longStr = '%sMATCH';\n"
+                 "  let rep = longStr.replace('MATCH', 'DONE');\n"
+                 "  thisLayer.text = rep.slice(1195);\n"
+                 "  return value;\n"
+                 "}\n",
+                 prefix);
+
+        we_script_t *vm = we_script_create(script_buf, strlen(script_buf), NULL);
+        assert(vm != NULL);
+
+        we_script_env_t env;
+        memset(&env, 0, sizeof(env));
+        we_script_layer_state_t ls;
+        memset(&ls, 0, sizeof(ls));
+
+        assert(we_script_eval_update(vm, &env, &ls, NULL, 0, NULL));
+        assert(strcmp(ls.text, "XXXXDONE") == 0);
+
+        we_script_destroy(vm);
+        free(script_buf);
+    }
+
     /* 2b. Adversarial edge cases:
      *  - 600-char string .padStart(700, "0") and .padEnd(700, "0") (no size_t underflow)
      *  - new Date(NaN), new Date(1e30), new Date(-2147483648, 0, 1) (no UB / overflow)
@@ -3539,21 +3588,23 @@ static void test_sound_and_text_layers_and_scenescript_stdlib(void)
         long_s[600] = '\0';
 
         char adv_src[2048];
-        snprintf(adv_src, sizeof(adv_src),
-                 "export function update(value) {\n"
-                 "  let s600 = '%s';\n"
-                 "  let ps = s600.padStart(700, '0');\n"
-                 "  let pe = s600.padEnd(700, '0');\n"
-                 "  let sb = 'hello'.substr(2, 2147483647);\n"
-                 "  let d_nan = new Date(NaN);\n"
-                 "  let d_huge = new Date(1e30);\n"
-                 "  let d_min = new Date(-2147483648, 0, 1);\n"
-                 "  let d_str = Date();\n"
-                 "  let check = `${d_nan} ${d_huge.toDateString()} ${d_min.getFullYear()} ${d_str}`;\n"
-                 "  thisLayer.text = `${ps.length}:${pe.length}:${sb}:${d_nan.getHours() >= 0}:${check.length > 0}`;\n"
-                 "  return value;\n"
-                 "}\n",
-                 long_s);
+        snprintf(
+            adv_src, sizeof(adv_src),
+            "export function update(value) {\n"
+            "  let s600 = '%s';\n"
+            "  let ps = s600.padStart(700, '0');\n"
+            "  let pe = s600.padEnd(700, '0');\n"
+            "  let sb = 'hello'.substr(2, 2147483647);\n"
+            "  let d_nan = new Date(NaN);\n"
+            "  let d_huge = new Date(1e30);\n"
+            "  let d_min = new Date(-2147483648, 0, 1);\n"
+            "  let d_str = Date();\n"
+            "  let check = `${d_nan} ${d_huge.toDateString()} ${d_min.getFullYear()} ${d_str}`;\n"
+            "  thisLayer.text = `${ps.length}:${pe.length}:${sb}:${d_nan.getHours() >= "
+            "0}:${check.length > 0}`;\n"
+            "  return value;\n"
+            "}\n",
+            long_s);
 
         we_script_t *avm = we_script_create(adv_src, strlen(adv_src), NULL);
         assert(avm != NULL);
@@ -3592,13 +3643,13 @@ static void test_sound_and_text_layers_and_scenescript_stdlib(void)
         }
 
         /* Unpaired UTF-16 surrogates in JSON replaced with U+FFFD (\xEF\xBF\xBD) */
-        const char *surr_json =
-            "{\"hi\":\"\\uD800\",\"lo\":\"\\uDC00\",\"hi_ascii\":\"\\uD800A\"}";
+        const char *surr_json = "{\"hi\":\"\\uD800\",\"lo\":\"\\uDC00\",\"hi_ascii\":\"\\uD800A\"}";
         we_jval_t *sroot = we_json_parse_root(surr_json, strlen(surr_json));
         assert(sroot != NULL);
         assert(strcmp(we_jval_str(we_jobj_get(sroot, "hi"), ""), "\xef\xbf\xbd") == 0);
         assert(strcmp(we_jval_str(we_jobj_get(sroot, "lo"), ""), "\xef\xbf\xbd") == 0);
-        assert(strcmp(we_jval_str(we_jobj_get(sroot, "hi_ascii"), ""), "\xef\xbf\xbd" "A") == 0);
+        assert(strcmp(we_jval_str(we_jobj_get(sroot, "hi_ascii"), ""), "\xef\xbf\xbd"
+                                                                       "A") == 0);
         we_jval_free(sroot);
     }
 
@@ -3609,18 +3660,17 @@ static void test_sound_and_text_layers_and_scenescript_stdlib(void)
         char tmp_dir[] = "/tmp/wwal_test_sound_text_scene_XXXXXX";
         assert(mkdtemp(tmp_dir) != NULL);
 
-        const char *proj_json =
-            "{\n"
-            "  \"title\": \"Sound and Text Scene\",\n"
-            "  \"type\": \"scene\",\n"
-            "  \"file\": \"scene.json\",\n"
-            "  \"general\": {\n"
-            "    \"properties\": {\n"
-            "      \"sfxvol\": {\"type\": \"slider\", \"value\": 0.9},\n"
-            "      \"clocksize\": {\"type\": \"slider\", \"value\": 36}\n"
-            "    }\n"
-            "  }\n"
-            "}\n";
+        const char *proj_json = "{\n"
+                                "  \"title\": \"Sound and Text Scene\",\n"
+                                "  \"type\": \"scene\",\n"
+                                "  \"file\": \"scene.json\",\n"
+                                "  \"general\": {\n"
+                                "    \"properties\": {\n"
+                                "      \"sfxvol\": {\"type\": \"slider\", \"value\": 0.9},\n"
+                                "      \"clocksize\": {\"type\": \"slider\", \"value\": 36}\n"
+                                "    }\n"
+                                "  }\n"
+                                "}\n";
         char ppath[4096];
         snprintf(ppath, sizeof(ppath), "%s/project.json", tmp_dir);
         FILE *fp = fopen(ppath, "wb");
@@ -3715,7 +3765,8 @@ static void test_sound_and_text_layers_and_scenescript_stdlib(void)
         assert(scn->objects[2].is_text_object);
         assert(scn->objects[2].text_padding == 4);
         assert(scn->objects[2].text_opaque_bg);
-        assert(strcmp(scn->objects[2].text_str, "23\xc2\xb0" "C") == 0);
+        assert(strcmp(scn->objects[2].text_str, "23\xc2\xb0"
+                                                "C") == 0);
 
         waywal_audio_fft_t *fft = waywal_audio_fft_create(48000, false);
         assert(fft != NULL);
@@ -3799,7 +3850,11 @@ static void test_sound_and_text_layers_and_scenescript_stdlib(void)
         /* Malformed UTF-8 lead byte followed by ASCII ('\xc3' + 'A'), overlong ('\xc1\x81'),
          * and UTF-8 surrogate ('\xed\xa0\x80') must not swallow valid trailing characters */
         snprintf(scn->objects[2].text_str, sizeof(scn->objects[2].text_str),
-                 "\xc3" "A" "\xc1\x81" "\xed\xa0\x80" "B");
+                 "\xc3"
+                 "A"
+                 "\xc1\x81"
+                 "\xed\xa0\x80"
+                 "B");
         scn->objects[2].text_dirty = true;
         we_scene_update_text_texture(scn, &scn->objects[2]);
         assert(!scn->objects[2].text_dirty);

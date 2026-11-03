@@ -26,7 +26,7 @@ int open_drm_node_by_devt(dev_t target_dev);
 typedef struct wlr_toplevel_entry {
     struct zwlr_foreign_toplevel_handle_v1 *handle;
     daemon_state_t *state;
-    struct wl_output *outputs[8];
+    struct wl_output *outputs[16];
     size_t num_outputs;
     bool maximized;
     bool fullscreen;
@@ -325,6 +325,9 @@ static void recompute_wlr_toplevel_power_state(daemon_state_t *state)
     if (!state || !state->power_gov)
         return;
 
+    if (!state->config.daemon.auto_pause_fullscreen && !state->config.daemon.auto_pause_maximized)
+        return;
+
     bool single_output = (state->outputs != NULL && state->outputs->next == NULL);
     bool has_compositor_ipc = (waywal_power_governor_get_ipc_fd(state->power_gov) >= 0);
 
@@ -351,6 +354,8 @@ static void recompute_wlr_toplevel_power_state(daemon_state_t *state)
                 any_fs = true;
             if (e->maximized)
                 any_max = true;
+            if (any_fs && any_max)
+                break;
         }
         bool pause_fs = any_fs && state->config.daemon.auto_pause_fullscreen;
         bool pause_max = any_max && state->config.daemon.auto_pause_maximized;
@@ -401,8 +406,11 @@ static void wlr_toplevel_handle_output_enter(void *data,
         if (e->outputs[i] == output)
             return;
     }
-    if (e->num_outputs < 8) {
+    if (e->num_outputs < sizeof(e->outputs) / sizeof(e->outputs[0])) {
         e->outputs[e->num_outputs++] = output;
+    } else {
+        WAYWAL_LOG_WARN("wlr_toplevel: exceeded max output capacity (%zu) for toplevel %p",
+                        sizeof(e->outputs) / sizeof(e->outputs[0]), (void *)e);
     }
 }
 
@@ -639,6 +647,27 @@ static const struct ext_foreign_toplevel_list_v1_listener foreign_toplevel_list_
     .finished = foreign_toplevel_list_handle_finished,
 };
 
+static void presentation_handle_clock_id(void *data, struct wp_presentation *presentation,
+                                         uint32_t clk_id)
+{
+    (void)presentation;
+    daemon_state_t *state = (daemon_state_t *)data;
+    clockid_t clock = (clockid_t)clk_id;
+    if (state) {
+        state->presentation_clock_id = clock;
+        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            out->pres_sync.pll.clock_id = clock;
+            out->pres_sync.pll.has_clock_id = true;
+        }
+    }
+    presentation_set_clock_id(clock);
+    WAYWAL_LOG_INFO("wp_presentation clock_id received: %u", clk_id);
+}
+
+static const struct wp_presentation_listener presentation_listener = {
+    .clock_id = presentation_handle_clock_id,
+};
+
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
                             const char *interface, uint32_t version)
 {
@@ -701,15 +730,26 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         ensure_idle_notification(state);
         WAYWAL_LOG_INFO("Bound ext_idle_notifier_v1 version %u", ver);
     } else if (strcmp(interface, ext_foreign_toplevel_list_v1_interface.name) == 0) {
-        (void)foreign_toplevel_list_listener;
+        uint32_t ver = (version < 1) ? version : 1;
+        state->foreign_toplevel_list = (struct ext_foreign_toplevel_list_v1 *)wl_registry_bind(
+            registry, name, &ext_foreign_toplevel_list_v1_interface, ver);
+        if (state->foreign_toplevel_list) {
+            ext_foreign_toplevel_list_v1_add_listener(state->foreign_toplevel_list,
+                                                      &foreign_toplevel_list_listener, state);
+            WAYWAL_LOG_INFO("Bound ext_foreign_toplevel_list_v1 version %u", ver);
+        }
     } else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
         uint32_t ver = version >= 4 ? 4 : (version >= 3 ? 3 : version);
         state->dmabuf_ctx.dmabuf_proto = (struct zwp_linux_dmabuf_v1 *)wl_registry_bind(
             registry, name, &zwp_linux_dmabuf_v1_interface, ver);
         WAYWAL_LOG_INFO("Bound zwp_linux_dmabuf_v1 version %u", ver);
     } else if (strcmp(interface, wp_presentation_interface.name) == 0) {
+        uint32_t ver = (version < 1) ? version : 1;
         state->presentation = (struct wp_presentation *)wl_registry_bind(
-            registry, name, &wp_presentation_interface, 1);
+            registry, name, &wp_presentation_interface, ver);
+        if (state->presentation) {
+            wp_presentation_add_listener(state->presentation, &presentation_listener, state);
+        }
         state->output_mgr.wp_pres = state->presentation;
         WAYWAL_LOG_INFO("Bound wp_presentation interface");
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
@@ -781,6 +821,7 @@ bool daemon_wayland_init(daemon_state_t *state)
         return false;
 
     state->cursor_ipc_fd = -1;
+    state->presentation_clock_id = CLOCK_MONOTONIC;
     state->display = wl_display_connect(NULL);
     if (!state->display) {
         WAYWAL_LOG_ERR(
@@ -973,9 +1014,9 @@ void daemon_wayland_destroy(daemon_state_t *state)
         }
     }
 
-    output_manager_destroy(&state->output_mgr);
     state->outputs = NULL;
     state->num_outputs = 0;
+    output_manager_destroy(&state->output_mgr);
 
     /* Destroy hardware render engine */
     render_engine_destroy(&state->render_engine);
@@ -1093,66 +1134,64 @@ static bool query_hyprland_cursor_global(daemon_state_t *state, double *gx, doub
     static bool s_has_cached_addr = false;
 
     for (int attempt = 0; attempt < 2; ++attempt) {
-        if (state->cursor_ipc_fd < 0) {
-            int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-            if (fd < 0)
-                return false;
-            struct timeval tv = {.tv_sec = 0, .tv_usec = 10000};
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+            return false;
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 10000};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-            bool connected = false;
-            if (s_has_cached_addr && strcmp(s_cached_his, his) == 0) {
-                if (connect(fd, (struct sockaddr *)&s_cached_addr, sizeof(s_cached_addr)) == 0) {
-                    connected = true;
-                } else {
-                    s_has_cached_addr = false;
-                }
+        bool connected = false;
+        if (s_has_cached_addr && strcmp(s_cached_his, his) == 0) {
+            if (connect(fd, (struct sockaddr *)&s_cached_addr, sizeof(s_cached_addr)) == 0) {
+                connected = true;
+            } else {
+                s_has_cached_addr = false;
             }
-
-            if (!connected) {
-                struct sockaddr_un addr = {0};
-                addr.sun_family = AF_UNIX;
-                if (xrd && xrd[0]) {
-                    int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
-                                            "%s/hypr/%s/.socket.sock", xrd, his);
-                    if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
-                        connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-                        connected = true;
-                    }
-                }
-                if (!connected) {
-                    memset(&addr, 0, sizeof(addr));
-                    addr.sun_family = AF_UNIX;
-                    int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
-                                            "/tmp/hypr/%s/.socket.sock", his);
-                    if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
-                        connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-                        connected = true;
-                    }
-                }
-                if (connected) {
-                    s_cached_addr = addr;
-                    snprintf(s_cached_his, sizeof(s_cached_his), "%s", his);
-                    s_has_cached_addr = true;
-                }
-            }
-            if (!connected) {
-                close(fd);
-                return false;
-            }
-            state->cursor_ipc_fd = fd;
         }
 
-        ssize_t w = send(state->cursor_ipc_fd, "cursorpos", 9, MSG_NOSIGNAL);
+        if (!connected) {
+            struct sockaddr_un addr = {0};
+            addr.sun_family = AF_UNIX;
+            if (xrd && xrd[0]) {
+                int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
+                                        "%s/hypr/%s/.socket.sock", xrd, his);
+                if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
+                    connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                    connected = true;
+                }
+            }
+            if (!connected) {
+                memset(&addr, 0, sizeof(addr));
+                addr.sun_family = AF_UNIX;
+                int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
+                                        "/tmp/hypr/%s/.socket.sock", his);
+                if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
+                    connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                    connected = true;
+                }
+            }
+            if (connected) {
+                s_cached_addr = addr;
+                snprintf(s_cached_his, sizeof(s_cached_his), "%s", his);
+                s_has_cached_addr = true;
+            }
+        }
+
+        if (!connected) {
+            close(fd);
+            continue;
+        }
+
+        ssize_t w = send(fd, "cursorpos", 9, MSG_NOSIGNAL);
         if (w == 9) {
             char buf[128] = {0};
-            ssize_t n = recv(state->cursor_ipc_fd, buf, sizeof(buf) - 1, 0);
+            ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
             if (n > 0) {
                 buf[n] = '\0';
                 int x = 0, y = 0;
                 if (sscanf(buf, "%d, %d", &x, &y) == 2) {
-                    close(state->cursor_ipc_fd);
+                    close(fd);
                     state->cursor_ipc_fd = -1;
                     state->cached_ipc_cursor_x = (double)x;
                     state->cached_ipc_cursor_y = (double)y;
@@ -1164,7 +1203,7 @@ static bool query_hyprland_cursor_global(daemon_state_t *state, double *gx, doub
                 }
             }
         }
-        close(state->cursor_ipc_fd);
+        close(fd);
         state->cursor_ipc_fd = -1;
     }
 

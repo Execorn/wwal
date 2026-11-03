@@ -72,6 +72,25 @@ static char *json_parse_raw_string(json_lexer_t *lx)
     }
     lx->pos++;
 
+    /* Fast path: scan for closing quote when no escape backslash exists */
+    const char *start = lx->src + lx->pos;
+    size_t rem = lx->len - lx->pos;
+    const char *quote = memchr(start, '"', rem);
+    if (quote) {
+        size_t slen = (size_t)(quote - start);
+        const char *esc = memchr(start, '\\', slen);
+        if (!esc) {
+            char *out = malloc(slen + 1);
+            if (!out) {
+                return NULL;
+            }
+            memcpy(out, start, slen);
+            out[slen] = '\0';
+            lx->pos += slen + 1;
+            return out;
+        }
+    }
+
     size_t cap = 64;
     size_t len = 0;
     char *out = malloc(cap);
@@ -401,13 +420,16 @@ const we_jval_t *we_jobj_get(const we_jval_t *obj, const char *key)
     if (!obj || obj->type != JVAL_OBJ || !key) {
         return NULL;
     }
+    char k0 = key[0];
     for (size_t i = 0; i < obj->obj.count; i++) {
-        if (strcmp(obj->obj.entries[i].key, key) == 0) {
+        if (obj->obj.entries[i].key[0] == k0 && strcmp(obj->obj.entries[i].key, key) == 0) {
             return obj->obj.entries[i].val;
         }
     }
+    char k0_lower = (char)tolower((unsigned char)k0);
     for (size_t i = 0; i < obj->obj.count; i++) {
-        if (strcasecmp(obj->obj.entries[i].key, key) == 0) {
+        if ((char)tolower((unsigned char)obj->obj.entries[i].key[0]) == k0_lower &&
+            strcasecmp(obj->obj.entries[i].key, key) == 0) {
             return obj->obj.entries[i].val;
         }
     }
@@ -436,8 +458,10 @@ const we_user_prop_t *we_project_find_prop(const we_project_t *proj, const char 
     if (!proj || !key || key[0] == '\0') {
         return NULL;
     }
+    char k0_lower = (char)tolower((unsigned char)key[0]);
     for (uint32_t i = 0; i < proj->prop_count; i++) {
-        if (strcasecmp(proj->props[i].key, key) == 0) {
+        if ((char)tolower((unsigned char)proj->props[i].key[0]) == k0_lower &&
+            strcasecmp(proj->props[i].key, key) == 0) {
             return &proj->props[i];
         }
     }

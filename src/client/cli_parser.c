@@ -1373,7 +1373,7 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
                 return false;
             optind++;
         }
-    } else if (strcmp(cmd_str, "clear") == 0) {
+    } else if (strcmp(cmd_str, "color") == 0 || strcmp(cmd_str, "clear") == 0) {
         opts->cmd = CLI_CMD_COLOR;
         while (optind < argc) {
             const char *arg = argv[optind];
@@ -1835,10 +1835,11 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
             return false;
         }
     } else if (strcmp(cmd_str, "pause") == 0 || strcmp(cmd_str, "unpause") == 0 ||
-               strcmp(cmd_str, "toggle") == 0 || strcmp(cmd_str, "kill") == 0) {
+               strcmp(cmd_str, "resume") == 0 || strcmp(cmd_str, "toggle") == 0 ||
+               strcmp(cmd_str, "kill") == 0) {
         if (strcmp(cmd_str, "pause") == 0) {
             opts->cmd = CLI_CMD_PAUSE;
-        } else if (strcmp(cmd_str, "unpause") == 0) {
+        } else if (strcmp(cmd_str, "unpause") == 0 || strcmp(cmd_str, "resume") == 0) {
             opts->cmd = CLI_CMD_UNPAUSE;
         } else if (strcmp(cmd_str, "toggle") == 0) {
             opts->cmd = CLI_CMD_TOGGLE;

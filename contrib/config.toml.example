@@ -50,7 +50,7 @@ crop_gravity = "center"               # Crop anchor for fill/crop scaling
 angle = 0.0                           # Angle in degrees for directional transitions (wipe, slide, wave)
 bezier = [0.25, 0.1, 0.25, 1.0]       # Cubic-bezier control points [x1, y1, x2, y2]
 sync_mode = "simultaneous"            # "simultaneous" or "staggered"
-stagger_delay_ms = 120                # Delay between monitors in staggered mode (ms)
+stagger_delay_ms = 120                # Delay between monitors in staggered mode in ms (also accepts stagger_delay)
 
 # [slideshow]
 # interval = "30m"                    # Slideshow rotation interval (seconds or "30s", "15m", "1h", "1h30m")

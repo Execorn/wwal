@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1798,6 +1799,13 @@ static void print_json_escaped(FILE *out, const char *s)
     fputc('"', out);
 }
 
+static volatile sig_atomic_t g_pick_child_interrupted = 0;
+static void pick_child_sig_handler(int sig)
+{
+    (void)sig;
+    g_pick_child_interrupted = 1;
+}
+
 static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
 {
     if (out_should_execute) {
@@ -1998,16 +2006,26 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
     }
 
     signal(SIGPIPE, SIG_IGN);
+    g_pick_child_interrupted = 0;
+    struct sigaction sa, old_sa_int, old_sa_term;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = pick_child_sig_handler;
+    sigaction(SIGINT, &sa, &old_sa_int);
+    sigaction(SIGTERM, &sa, &old_sa_term);
 
     int to_child[2];
     int from_child[2];
     if (pipe(to_child) != 0) {
+        sigaction(SIGINT, &old_sa_int, NULL);
+        sigaction(SIGTERM, &old_sa_term, NULL);
         free(list.items);
         return 1;
     }
     if (pipe(from_child) != 0) {
         close(to_child[0]);
         close(to_child[1]);
+        sigaction(SIGINT, &old_sa_int, NULL);
+        sigaction(SIGTERM, &old_sa_term, NULL);
         free(list.items);
         return 1;
     }
@@ -2018,11 +2036,16 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
         close(to_child[1]);
         close(from_child[0]);
         close(from_child[1]);
+        sigaction(SIGINT, &old_sa_int, NULL);
+        sigaction(SIGTERM, &old_sa_term, NULL);
         free(list.items);
         return 1;
     }
 
     if (pid == 0) {
+        sigaction(SIGINT, &old_sa_int, NULL);
+        sigaction(SIGTERM, &old_sa_term, NULL);
+        (void)prctl(PR_SET_PDEATHSIG, SIGTERM);
         signal(SIGPIPE, SIG_DFL);
         close(to_child[1]);
         close(from_child[0]);
@@ -2107,10 +2130,15 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
     char sel_buf[8192];
     size_t sel_len = 0;
     while (sel_len + 1 < sizeof(sel_buf)) {
+        if (g_pick_child_interrupted)
+            break;
         ssize_t r = read(from_child[0], sel_buf + sel_len, sizeof(sel_buf) - 1 - sel_len);
         if (r < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR) {
+                if (g_pick_child_interrupted)
+                    break;
                 continue;
+            }
             break;
         }
         if (r == 0)
@@ -2123,8 +2151,21 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
     int status = 0;
     pid_t wres;
     do {
+        if (g_pick_child_interrupted) {
+            kill(pid, SIGTERM);
+        }
         wres = waitpid(pid, &status, 0);
-    } while (wres < 0 && errno == EINTR);
+    } while (wres < 0 && errno == EINTR && !g_pick_child_interrupted);
+
+    sigaction(SIGINT, &old_sa_int, NULL);
+    sigaction(SIGTERM, &old_sa_term, NULL);
+
+    if (g_pick_child_interrupted || wres < 0) {
+        kill(pid, SIGTERM);
+        waitpid(pid, &status, 0);
+        free(list.items);
+        return 130;
+    }
 
     if (wres != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || sel_len == 0) {
         free(list.items);
@@ -2916,6 +2957,8 @@ int main(int argc, char *argv[])
             vpay->num_target_outputs = opts.num_outputs;
             vpay->scaling_mode = opts.scaling_mode;
             vpay->no_cache = opts.no_cache ? 1u : 0u;
+            vpay->volume = opts.volume;
+            vpay->mute_on_audio = (opts.mute_on_audio == 1);
             char resolved_vid[PATH_MAX];
             if (realpath(effective_video_path, resolved_vid)) {
                 strncpy(vpay->filepath, resolved_vid, sizeof(vpay->filepath) - 1);
@@ -3406,6 +3449,11 @@ int main(int argc, char *argv[])
             spay.invert_y = opts.invert_y ? 1 : 0;
             spay.pos_y_inverted = opts.pos_y_inverted ? 1 : 0;
             spay.no_cache = opts.no_cache ? 1u : 0u;
+            spay.volume = opts.volume;
+            spay.mute_on_audio = (opts.mute_on_audio == 1);
+            spay.speed = opts.video_speed;
+            strncpy(spay.backdrop, opts.backdrop, sizeof(spay.backdrop) - 1);
+            spay.backdrop[sizeof(spay.backdrop) - 1] = '\0';
 
             req_hdr.opcode = WAYWAL_REQ_SHADER;
             req_hdr.payload_size = sizeof(spay);
@@ -3482,6 +3530,12 @@ int main(int argc, char *argv[])
             wpay.has_seed_color = opts.has_seed_color ? 1u : 0u;
             wpay.client_exported_theme = workshop_theme_applied ? 1u : 0u;
             wpay.seed_color = opts.seed_color;
+            wpay.volume = opts.volume;
+            wpay.mute_on_audio = (opts.mute_on_audio == 1);
+            strncpy(wpay.backdrop, opts.backdrop, sizeof(wpay.backdrop) - 1);
+            wpay.backdrop[sizeof(wpay.backdrop) - 1] = '\0';
+            strncpy(wpay.layer_name, opts.layer_name, sizeof(wpay.layer_name) - 1);
+            wpay.layer_name[sizeof(wpay.layer_name) - 1] = '\0';
 
             req_hdr.opcode = WAYWAL_REQ_WORKSHOP;
             req_hdr.payload_size = sizeof(wpay);

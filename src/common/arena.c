@@ -67,15 +67,22 @@ void *arena_alloc(arena_t *arena, size_t size, size_t alignment)
         alignment = sizeof(void *);
     }
 
-    uintptr_t curr = (uintptr_t)(arena->buffer + arena->offset);
-    uintptr_t aligned = (curr + (alignment - 1)) & ~(uintptr_t)(alignment - 1);
-    size_t aligned_offset = (size_t)(aligned - (uintptr_t)arena->buffer);
-    size_t new_offset = aligned_offset + size;
-
-    if (new_offset > arena->capacity) {
+    if (arena->offset > SIZE_MAX - (alignment - 1)) {
         return NULL;
     }
 
+    uintptr_t curr = (uintptr_t)(arena->buffer + arena->offset);
+    uintptr_t aligned = (curr + (alignment - 1)) & ~(uintptr_t)(alignment - 1);
+    if (aligned < (uintptr_t)arena->buffer) {
+        return NULL;
+    }
+    size_t aligned_offset = (size_t)(aligned - (uintptr_t)arena->buffer);
+
+    if (aligned_offset > arena->capacity || size > arena->capacity - aligned_offset) {
+        return NULL;
+    }
+
+    size_t new_offset = aligned_offset + size;
     arena->offset = new_offset;
     return (void *)aligned;
 }

@@ -133,12 +133,19 @@ const char *path_buf_cstr(const path_buf_t *pb)
 
 void waywal_normalize_path(char *path)
 {
-    if (!path || path[0] != '/')
+    if (!path)
         return;
 
+    if (path[0] == '\0') {
+        path[0] = '.';
+        path[1] = '\0';
+        return;
+    }
+
+    bool is_abs = (path[0] == '/');
     char *dst = path;
-    size_t out_len = 1;
-    const char *p = path + 1;
+    size_t out_len = is_abs ? 1 : 0;
+    const char *p = is_abs ? path + 1 : path;
 
     while (*p != '\0') {
         while (*p == '/')
@@ -155,19 +162,47 @@ void waywal_normalize_path(char *path)
             continue;
 
         if (seg_len == 2 && seg_start[0] == '.' && seg_start[1] == '.') {
-            if (out_len > 1) {
-                while (out_len > 1 && dst[out_len - 1] != '/')
+            if (out_len > (is_abs ? 1 : 0)) {
+                /* Pop previous segment */
+                size_t prev_seg = out_len;
+                while (prev_seg > (is_abs ? 1 : 0) && dst[prev_seg - 1] != '/')
+                    prev_seg--;
+                size_t prev_len = out_len - prev_seg;
+                if (!is_abs && prev_len == 2 && dst[prev_seg] == '.' && dst[prev_seg + 1] == '.') {
+                    /* Previous segment is "..", cannot pop, append ".." */
+                    if (out_len > 0)
+                        dst[out_len++] = '/';
+                    dst[out_len++] = '.';
+                    dst[out_len++] = '.';
+                    continue;
+                }
+                out_len = prev_seg;
+                if (out_len > (is_abs ? 1 : 0) && dst[out_len - 1] == '/')
                     out_len--;
-                if (out_len > 1 && dst[out_len - 1] == '/')
-                    out_len--;
+                continue;
+            } else if (!is_abs) {
+                /* Cannot pop past root of relative path; append ".." */
+                if (out_len > 0)
+                    dst[out_len++] = '/';
+                dst[out_len++] = '.';
+                dst[out_len++] = '.';
+                continue;
             }
             continue;
         }
 
-        if (out_len > 1)
+        if (out_len > 0 && !(out_len == 1 && dst[0] == '/'))
             dst[out_len++] = '/';
         memmove(&dst[out_len], seg_start, seg_len);
         out_len += seg_len;
+    }
+
+    if (out_len == 0) {
+        if (is_abs) {
+            dst[out_len++] = '/';
+        } else {
+            dst[out_len++] = '.';
+        }
     }
 
     dst[out_len] = '\0';
@@ -792,8 +827,7 @@ static void parse_preset_file_metadata(waywal_shader_preset_info_t *dst)
                     pslen--;
                 }
                 if (pslen >= 5 && strncasecmp(ps, "audio", 5) == 0 &&
-                    (pslen == 5 || ps[5] == ' ' || ps[5] == '\t' || ps[5] == ':' ||
-                     ps[5] == '=')) {
+                    (pslen == 5 || ps[5] == ' ' || ps[5] == '\t' || ps[5] == ':' || ps[5] == '=')) {
                     if (pslen == 5) {
                         dst->audio_reactive = true;
                     } else {
@@ -873,16 +907,16 @@ bool waywal_shader_is_audio_reactive(const char *name_or_path)
     if (!name_or_path || name_or_path[0] == '\0')
         return false;
 
-    const char *p = (strncasecmp(name_or_path, "preset:", 7) == 0) ? (name_or_path + 7)
-                                                                   : name_or_path;
+    const char *p =
+        (strncasecmp(name_or_path, "preset:", 7) == 0) ? (name_or_path + 7) : name_or_path;
     const char *slash = strrchr(p, '/');
     const char *bslash = strrchr(p, '\\');
     const char *base = slash ? (slash + 1) : p;
     if (bslash && bslash + 1 > base)
         base = bslash + 1;
 
-    bool default_audio = (strncasecmp(base, "audio_", 6) == 0 ||
-                          strncasecmp(base, "audio-", 6) == 0);
+    bool default_audio =
+        (strncasecmp(base, "audio_", 6) == 0 || strncasecmp(base, "audio-", 6) == 0);
 
     char stem[128];
     size_t blen = strlen(base);
@@ -1024,8 +1058,7 @@ static void scan_custom_preset_dir(const char *dir_path, waywal_shader_preset_in
             snprintf(dst->path, sizeof(dst->path), "%s", resolved_path);
             snprintf(dst->filename, sizeof(dst->filename), "%s.frag", norm_name);
             snprintf(dst->title, sizeof(dst->title), "%s", norm_name);
-            snprintf(dst->description, sizeof(dst->description),
-                     "Custom procedural shader preset");
+            snprintf(dst->description, sizeof(dst->description), "Custom procedural shader preset");
             snprintf(dst->author, sizeof(dst->author), "Custom");
             dst->audio_reactive = (strncmp(norm_name, "audio_", 6) == 0);
             dst->is_builtin = false;
@@ -1041,8 +1074,8 @@ static void scan_custom_preset_dir(const char *dir_path, waywal_shader_preset_in
                 }
             }
             if (overflow->count < overflow->cap) {
-                snprintf(overflow->names[overflow->count],
-                         sizeof(overflow->names[overflow->count]), "%s", norm_name);
+                snprintf(overflow->names[overflow->count], sizeof(overflow->names[overflow->count]),
+                         "%s", norm_name);
                 overflow->count++;
             }
         }

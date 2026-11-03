@@ -22,15 +22,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-static inline double deg_to_rad(double deg)
-{
-    return deg * (M_PI / 180.0);
-}
+static inline double deg_to_rad(double deg) { return deg * (M_PI / 180.0); }
 
-static inline double rad_to_deg(double rad)
-{
-    return rad * (180.0 / M_PI);
-}
+static inline double rad_to_deg(double rad) { return rad * (180.0 / M_PI); }
 
 static inline double clamp_d(double v, double lo, double hi)
 {
@@ -80,30 +74,37 @@ void waywal_solar_compute(double latitude_deg, double longitude_deg, time_t utc_
     double ecc = 0.016708634 - t * (0.000042037 + 0.0000001267 * t);
 
     double m_rad = deg_to_rad(m_deg);
-    double c_deg = sin(m_rad) * (1.914602 - t * (0.004817 + 0.000014 * t)) +
-                   sin(2.0 * m_rad) * (0.019993 - 0.000101 * t) + sin(3.0 * m_rad) * 0.000289;
+    double sin_m = sin(m_rad);
+    double sin_2m = sin(2.0 * m_rad);
+    double c_deg = sin_m * (1.914602 - t * (0.004817 + 0.000014 * t)) +
+                   sin_2m * (0.019993 - 0.000101 * t) + sin(3.0 * m_rad) * 0.000289;
 
     double sun_true_lon_deg = l0_deg + c_deg;
     double omega_deg = 125.04 - 1934.136 * t;
-    double lambda_deg = sun_true_lon_deg - 0.00569 - 0.00478 * sin(deg_to_rad(omega_deg));
+    double omega_rad = deg_to_rad(omega_deg);
+    double sin_omega = sin(omega_rad);
+    double cos_omega = cos(omega_rad);
+    double lambda_deg = sun_true_lon_deg - 0.00569 - 0.00478 * sin_omega;
 
     double eps0_deg =
         23.0 + (26.0 + ((21.448 - t * (46.8150 + t * (0.00059 - 0.001813 * t))) / 60.0)) / 60.0;
-    double eps_deg = eps0_deg + 0.00256 * cos(deg_to_rad(omega_deg));
+    double eps_deg = eps0_deg + 0.00256 * cos_omega;
 
     double eps_rad = deg_to_rad(eps_deg);
     double lambda_rad = deg_to_rad(lambda_deg);
     double sin_delta = clamp_d(sin(eps_rad) * sin(lambda_rad), -1.0, 1.0);
     double delta_rad = asin(sin_delta);
     double delta_deg = rad_to_deg(delta_rad);
+    double cos_delta = cos(delta_rad);
 
     double y = tan(eps_rad / 2.0);
     y *= y;
     double l0_rad = deg_to_rad(l0_deg);
+    double sin_2l0 = sin(2.0 * l0_rad);
+    double cos_2l0 = cos(2.0 * l0_rad);
     double eq_time_min =
-        4.0 * rad_to_deg(y * sin(2.0 * l0_rad) - 2.0 * ecc * sin(m_rad) +
-                         4.0 * ecc * y * sin(m_rad) * cos(2.0 * l0_rad) -
-                         0.5 * y * y * sin(4.0 * l0_rad) - 1.25 * ecc * ecc * sin(2.0 * m_rad));
+        4.0 * rad_to_deg(y * sin_2l0 - 2.0 * ecc * sin_m + 4.0 * ecc * y * sin_m * cos_2l0 -
+                         0.5 * y * y * sin(4.0 * l0_rad) - 1.25 * ecc * ecc * sin_2m);
 
     int64_t day_sec = (int64_t)utc_now % 86400;
     if (day_sec < 0)
@@ -127,18 +128,18 @@ void waywal_solar_compute(double latitude_deg, double longitude_deg, time_t utc_
     double hour_angle_deg = (tst / 4.0) - 180.0;
 
     double phi_rad = deg_to_rad(lat_clamped);
+    double sin_phi = sin(phi_rad);
+    double cos_phi = cos(phi_rad);
     double h_rad = deg_to_rad(hour_angle_deg);
-    double cos_zenith =
-        clamp_d(sin(phi_rad) * sin(delta_rad) + cos(phi_rad) * cos(delta_rad) * cos(h_rad), -1.0,
-                1.0);
+    double cos_zenith = clamp_d(sin_phi * sin_delta + cos_phi * cos_delta * cos(h_rad), -1.0, 1.0);
     double zenith_rad = acos(cos_zenith);
     double zenith_deg = rad_to_deg(zenith_rad);
     double elevation_deg = 90.0 - zenith_deg;
 
     double azimuth_deg = 180.0;
-    double denom_az = cos(phi_rad) * sin(zenith_rad);
+    double denom_az = cos_phi * sin(zenith_rad);
     if (fabs(denom_az) > 1e-9) {
-        double cos_az = clamp_d((sin(phi_rad) * cos_zenith - sin(delta_rad)) / denom_az, -1.0, 1.0);
+        double cos_az = clamp_d((sin_phi * cos_zenith - sin_delta) / denom_az, -1.0, 1.0);
         double az_base = rad_to_deg(acos(cos_az));
         if (hour_angle_deg > 0.0) {
             azimuth_deg = wrap_360(az_base + 180.0);
@@ -147,12 +148,14 @@ void waywal_solar_compute(double latitude_deg, double longitude_deg, time_t utc_
         }
     }
 
-    double denom_ha = cos(phi_rad) * cos(delta_rad);
+    double denom_ha = cos_phi * cos_delta;
     if (fabs(denom_ha) < 1e-9)
         denom_ha = (denom_ha >= 0.0) ? 1e-9 : -1e-9;
 
-    double cos_omega_sr = (sin(deg_to_rad(-0.833)) - sin(phi_rad) * sin(delta_rad)) / denom_ha;
-    double cos_omega_civ = (sin(deg_to_rad(-6.0)) - sin(phi_rad) * sin(delta_rad)) / denom_ha;
+    static const double k_sin_solar_horizon = -0.014538080641473123; /* sin(deg_to_rad(-0.833)) */
+    static const double k_sin_civil_horizon = -0.10452846326765347;  /* sin(deg_to_rad(-6.0)) */
+    double cos_omega_sr = (k_sin_solar_horizon - sin_phi * sin_delta) / denom_ha;
+    double cos_omega_civ = (k_sin_civil_horizon - sin_phi * sin_delta) / denom_ha;
 
     out_state->julian_day = jd;
     out_state->julian_century = t;
@@ -337,8 +340,8 @@ void waywal_solar_synthesize_local(int32_t sunrise_fallback_min, int32_t sunset_
     out_state->elevation_deg = -90.0 * cos(deg_to_rad(out_state->hour_angle_deg));
     out_state->azimuth_deg = (out_state->hour_angle_deg < 0.0) ? 90.0 : 270.0;
     waywal_solar_phase_t fb_phase = WAYWAL_SOLAR_NIGHT;
-    out_state->is_daylight = waywal_solar_is_daytime_at_ex(
-        0.0, 0.0, false, sr_min, ss_min, utc_now, local_tm, &fb_phase);
+    out_state->is_daylight = waywal_solar_is_daytime_at_ex(0.0, 0.0, false, sr_min, ss_min, utc_now,
+                                                           local_tm, &fb_phase);
     out_state->phase = fb_phase;
 }
 
@@ -737,7 +740,8 @@ bool waywal_dynwall_parse_xml_string(const char *xml_text, size_t xml_len, const
     memcpy(buf, xml_text, xml_len);
     buf[xml_len] = '\0';
 
-    /* Strip XML comments <!-- ... --> in-place with spaces so strstr never matches commented tags */
+    /* Strip XML comments <!-- ... --> in-place with spaces so strstr never matches commented tags
+     */
     char *c_pos = buf;
     while ((c_pos = strstr(c_pos, "<!--")) != NULL) {
         char *c_end = strstr(c_pos + 4, "-->");
@@ -982,7 +986,7 @@ bool waywal_dynwall_parse_json_string(const char *json_text, size_t json_len, co
     if (root->type == JVAL_ARR) {
         arr = root;
     } else if (root->type == JVAL_OBJ) {
-        const char *arr_keys[] = {"steps",    "images", "frames", "solar",
+        const char *arr_keys[] = {"steps",    "images",  "frames", "solar",
                                   "schedule", "entries", "times"};
         for (size_t i = 0; i < sizeof(arr_keys) / sizeof(arr_keys[0]); ++i) {
             const we_jval_t *cand = we_jobj_get(root, arr_keys[i]);
@@ -1230,7 +1234,10 @@ bool waywal_dynwall_resolve(const waywal_dynwall_manifest_t *manifest, time_t ut
                         (double)manifest->start_tm.tm_sec;
         }
 
-        double cycle_pos = fmod(now_tod - start_tod, total);
+        double elapsed = now_tod - start_tod;
+        if (elapsed < 0.0)
+            elapsed += 86400.0;
+        double cycle_pos = fmod(elapsed, total);
         if (cycle_pos < 0.0)
             cycle_pos += total;
         if (!isfinite(cycle_pos) || cycle_pos < 0.0 || cycle_pos >= total)
@@ -1269,8 +1276,7 @@ bool waywal_dynwall_resolve(const waywal_dynwall_manifest_t *manifest, time_t ut
             snprintf(out_resolved->secondary_path, sizeof(out_resolved->secondary_path), "%s",
                      active->to_path);
             out_resolved->is_transition = true;
-            out_resolved->blend_factor =
-                (float)clamp_d(into_seg / active->duration_sec, 0.0, 1.0);
+            out_resolved->blend_factor = (float)clamp_d(into_seg / active->duration_sec, 0.0, 1.0);
         }
         return true;
     }
@@ -1344,7 +1350,8 @@ bool waywal_dynwall_resolve(const waywal_dynwall_manifest_t *manifest, time_t ut
 
     if (any_phase) {
         size_t chosen = SIZE_MAX;
-        /* Pass 1a: exact fine-grained subphase match (morning / noon / afternoon / sunset / evening) */
+        /* Pass 1a: exact fine-grained subphase match (morning / noon / afternoon / sunset /
+         * evening) */
         for (size_t i = 0; i < manifest->entry_count; ++i) {
             const waywal_dynwall_entry_t *ent = &manifest->entries[i];
             if (ent->has_phase && fine_subphase_matches(ent->phase, solar)) {
@@ -1352,7 +1359,8 @@ bool waywal_dynwall_resolve(const waywal_dynwall_manifest_t *manifest, time_t ut
                 break;
             }
         }
-        /* Pass 1b: if in dusk and only one of sunset/evening is defined, match it before coarse dusk */
+        /* Pass 1b: if in dusk and only one of sunset/evening is defined, match it before coarse
+         * dusk */
         if (chosen == SIZE_MAX && solar->phase == WAYWAL_SOLAR_DUSK) {
             for (size_t i = 0; i < manifest->entry_count; ++i) {
                 const waywal_dynwall_entry_t *ent = &manifest->entries[i];

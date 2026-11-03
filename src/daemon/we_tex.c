@@ -1174,7 +1174,7 @@ we_tex_t *we_tex_parse_cpu(const uint8_t *data, size_t size)
                 mip->rgba8 = dec_px;
                 mip->width = dw;
                 mip->height = dh;
-                mip->is_bgra_swiz = false;
+                mip->is_bgra_swiz = true;
                 if (img_idx == 0 && m == 0) {
                     tex->image_width = dw;
                     tex->image_height = dh;
@@ -1701,6 +1701,9 @@ void we_tex_advance_spritesheet(we_tex_t *tex, float dt_sec, float out_translati
             }
             tex->frame_time_accum -= cur_dur;
             tex->current_frame_idx = (tex->current_frame_idx + 1u) % tex->frame_count;
+        }
+        if (safety >= 256u) {
+            tex->frame_time_accum = 0.0f;
         }
     }
 

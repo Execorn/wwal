@@ -140,6 +140,7 @@ complete -c wwal -n "__fish_seen_subcommand_from video" -l mute-on-audio -d "Aut
 complete -c wwal -n "__fish_seen_subcommand_from video" -l no-mute-on-audio -d "Disable automatic audio ducking"
 complete -c wwal -n "__fish_seen_subcommand_from video" -l crop-gravity -a "$crop_gravities" -d "Crop anchor for fill/crop mode" -r
 complete -c wwal -n "__fish_seen_subcommand_from video" -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r
+complete -c wwal -n "__fish_seen_subcommand_from video" -l layer -a "$layers" -d "Wayland layer-shell layer" -r
 complete -c wwal -n "__fish_seen_subcommand_from video" -l theme -d "Extract Material You palette and sync caelestia/OSC"
 complete -c wwal -n "__fish_seen_subcommand_from video" -l no-theme -d "Disable automatic Material You palette extraction"
 complete -c wwal -n "__fish_seen_subcommand_from video" -l theme-mode -a "dark light auto" -d "Target Material Design 3 polarity" -r
@@ -168,6 +169,7 @@ complete -c wwal -n "__fish_seen_subcommand_from shader" -l fps -d "Target shade
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l speed -d "Shader time speed multiplier" -r
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l 10bit -d "Request 10-bit wide-gamut scanout"
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r
+complete -c wwal -n "__fish_seen_subcommand_from shader" -l layer -a "$layers" -d "Wayland layer-shell layer" -r
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l theme-from-media -d "Extract Material You palette dynamically from MPRIS2 album art"
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l no-theme-from-media -d "Disable MPRIS2 album art theme extraction"
 
@@ -182,6 +184,7 @@ complete -c wwal -n "__fish_seen_subcommand_from workshop" -l mute-on-audio -d "
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l no-mute-on-audio -d "Disable automatic audio ducking"
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l fps -d "Target frame rate" -r
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l layer -a "$layers" -d "Wayland layer-shell layer" -r
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l theme -d "Extract Material You palette and sync caelestia/OSC"
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l no-theme -d "Disable automatic Material You palette extraction"
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l theme-mode -a "dark light auto" -d "Target Material Design 3 polarity" -r

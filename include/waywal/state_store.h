@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 #define WAYWAL_STATE_MAGIC       0x57575354U
-#define WAYWAL_STATE_VERSION     4U
+#define WAYWAL_STATE_VERSION     5U
 #define WAYWAL_STATE_MAX_OUTPUTS 16U
 
 typedef enum : uint32_t {
@@ -60,6 +60,13 @@ typedef struct {
     float crop_gravity_x;
     float crop_gravity_y;
     bool has_crop_gravity;
+    char depth_map_path[4096];
+    float depth_strength;
+    char backdrop[256];
+    float video_speed;
+    uint64_t loop_count;
+    float volume;
+    bool mute_on_audio;
 } waywal_output_saved_state_t;
 
 typedef struct {

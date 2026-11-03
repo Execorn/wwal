@@ -15,11 +15,9 @@ static inline bool vm_check_watchdog(we_script_t *vm)
         vm->timed_out = true;
         return false;
     }
-    if ((vm->step_count & 63u) == 0u) {
+    if ((vm->step_count & 255u) == 0u) {
         struct timespec now;
-        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) {
-            clock_gettime(CLOCK_MONOTONIC, &now);
-        }
+        clock_gettime(vm->clock_id ? vm->clock_id : CLOCK_MONOTONIC, &now);
         int64_t ds = (int64_t)now.tv_sec - (int64_t)vm->start_ts.tv_sec;
         int64_t dn = (int64_t)now.tv_nsec - (int64_t)vm->start_ts.tv_nsec;
         int64_t elapsed_ns = ds * 1000000000LL + dn;
@@ -408,8 +406,10 @@ static void obj_set_prop(we_script_t *vm, js_obj_t *obj, const char *key, js_val
     if (!vm || !obj || !key) {
         return;
     }
+    char k0 = key[0];
     for (uint32_t i = 0; i < obj->count; i++) {
-        if (obj->props[i].key && strcmp(obj->props[i].key, key) == 0) {
+        const char *pk = obj->props[i].key;
+        if (pk && (pk == key || (pk[0] == k0 && strcmp(pk, key) == 0))) {
             obj->props[i].val = val;
             return;
         }
@@ -436,8 +436,10 @@ static js_val_t obj_get_prop(const js_obj_t *obj, const char *key)
     if (!obj || !key) {
         return val_undef();
     }
+    char k0 = key[0];
     for (uint32_t i = 0; i < obj->count; i++) {
-        if (obj->props[i].key && strcmp(obj->props[i].key, key) == 0) {
+        const char *pk = obj->props[i].key;
+        if (pk && (pk == key || (pk[0] == k0 && strcmp(pk, key) == 0))) {
             return obj->props[i].val;
         }
     }
@@ -450,8 +452,9 @@ static void shared_set_val(we_script_shared_t *sh, const char *key, js_val_t val
         return;
     }
     we_script_shared_entry_t *ent = NULL;
+    char k0 = key[0];
     for (uint32_t i = 0; i < sh->count; i++) {
-        if (strcmp(sh->entries[i].key, key) == 0) {
+        if (sh->entries[i].key[0] == k0 && strcmp(sh->entries[i].key, key) == 0) {
             ent = &sh->entries[i];
             break;
         }
@@ -488,9 +491,10 @@ static js_val_t shared_get_val(we_script_t *vm, const we_script_shared_t *sh, co
     if (!sh || !key) {
         return val_undef();
     }
+    char k0 = key[0];
     for (uint32_t i = 0; i < sh->count; i++) {
         const we_script_shared_entry_t *ent = &sh->entries[i];
-        if (strcmp(ent->key, key) == 0) {
+        if (ent->key[0] == k0 && strcmp(ent->key, key) == 0) {
             if (ent->is_str) {
                 return val_str(script_arena_strdup(vm, ent->str_val, strlen(ent->str_val)));
             }
@@ -585,106 +589,131 @@ static js_val_t call_vec_method(we_script_t *vm, js_vec_obj_t *vo, const char *m
         extract_other_vec(args[0], b);
     }
 
-    if (strcmp(method, "add") == 0) {
-        return val_new_vec(vm, d, vo->v[0] + b[0], vo->v[1] + b[1], d >= 3 ? vo->v[2] + b[2] : 0.0f,
-                           d >= 4 ? vo->v[3] + b[3] : 0.0f);
-    }
-    if (strcmp(method, "subtract") == 0 || strcmp(method, "sub") == 0) {
-        return val_new_vec(vm, d, vo->v[0] - b[0], vo->v[1] - b[1], d >= 3 ? vo->v[2] - b[2] : 0.0f,
-                           d >= 4 ? vo->v[3] - b[3] : 0.0f);
-    }
-    if (strcmp(method, "multiply") == 0 || strcmp(method, "mul") == 0) {
-        return val_new_vec(vm, d, vo->v[0] * b[0], vo->v[1] * b[1], d >= 3 ? vo->v[2] * b[2] : 0.0f,
-                           d >= 4 ? vo->v[3] * b[3] : 0.0f);
-    }
-    if (strcmp(method, "divide") == 0 || strcmp(method, "div") == 0) {
-        return val_new_vec(vm, d, fabsf(b[0]) > 1e-12f ? vo->v[0] / b[0] : 0.0f,
-                           fabsf(b[1]) > 1e-12f ? vo->v[1] / b[1] : 0.0f,
-                           (d >= 3 && fabsf(b[2]) > 1e-12f) ? vo->v[2] / b[2] : 0.0f,
-                           (d >= 4 && fabsf(b[3]) > 1e-12f) ? vo->v[3] / b[3] : 0.0f);
-    }
-    if (strcmp(method, "lengthSqr") == 0) {
-        double sum = 0.0;
-        for (uint8_t i = 0; i < d; i++) {
-            sum += (double)vo->v[i] * (double)vo->v[i];
+    switch (method[0]) {
+    case 'a':
+        if (strcmp(method, "add") == 0) {
+            return val_new_vec(vm, d, vo->v[0] + b[0], vo->v[1] + b[1],
+                               d >= 3 ? vo->v[2] + b[2] : 0.0f, d >= 4 ? vo->v[3] + b[3] : 0.0f);
         }
-        return val_num(sum);
-    }
-    if (strcmp(method, "length") == 0) {
-        double sum = 0.0;
-        for (uint8_t i = 0; i < d; i++) {
-            sum += (double)vo->v[i] * (double)vo->v[i];
+        break;
+    case 's':
+        if (strcmp(method, "subtract") == 0 || strcmp(method, "sub") == 0) {
+            return val_new_vec(vm, d, vo->v[0] - b[0], vo->v[1] - b[1],
+                               d >= 3 ? vo->v[2] - b[2] : 0.0f, d >= 4 ? vo->v[3] - b[3] : 0.0f);
         }
-        return val_num(sqrt(sum));
-    }
-    if (strcmp(method, "distance") == 0) {
-        double sum = 0.0;
-        for (uint8_t i = 0; i < d; i++) {
-            double diff = (double)vo->v[i] - (double)b[i];
-            sum += diff * diff;
+        break;
+    case 'm':
+        if (strcmp(method, "multiply") == 0 || strcmp(method, "mul") == 0) {
+            return val_new_vec(vm, d, vo->v[0] * b[0], vo->v[1] * b[1],
+                               d >= 3 ? vo->v[2] * b[2] : 0.0f, d >= 4 ? vo->v[3] * b[3] : 0.0f);
         }
-        return val_num(sqrt(sum));
-    }
-    if (strcmp(method, "dot") == 0) {
-        double sum = 0.0;
-        for (uint8_t i = 0; i < d; i++) {
-            sum += (double)vo->v[i] * (double)b[i];
+        if (strcmp(method, "min") == 0) {
+            return val_new_vec(vm, d, fminf(vo->v[0], b[0]), fminf(vo->v[1], b[1]),
+                               d >= 3 ? fminf(vo->v[2], b[2]) : 0.0f,
+                               d >= 4 ? fminf(vo->v[3], b[3]) : 0.0f);
         }
-        return val_num(sum);
-    }
-    if (strcmp(method, "cross") == 0) {
-        return val_new_vec(vm, 3, vo->v[1] * b[2] - vo->v[2] * b[1],
-                           vo->v[2] * b[0] - vo->v[0] * b[2], vo->v[0] * b[1] - vo->v[1] * b[0],
-                           0.0f);
-    }
-    if (strcmp(method, "normalize") == 0) {
-        double sum = 0.0;
-        for (uint8_t i = 0; i < d; i++) {
-            sum += (double)vo->v[i] * (double)vo->v[i];
+        if (strcmp(method, "max") == 0) {
+            return val_new_vec(vm, d, fmaxf(vo->v[0], b[0]), fmaxf(vo->v[1], b[1]),
+                               d >= 3 ? fmaxf(vo->v[2], b[2]) : 0.0f,
+                               d >= 4 ? fmaxf(vo->v[3], b[3]) : 0.0f);
         }
-        float len = (float)sqrt(sum);
-        if (len <= 1e-12f) {
-            return val_new_vec(vm, d, 0.0f, 0.0f, 0.0f, 0.0f);
+        if (strcmp(method, "mix") == 0) {
+            float t = (argc >= 2) ? (float)val_to_num(args[1]) : 0.5f;
+            return val_new_vec(vm, d, vo->v[0] + t * (b[0] - vo->v[0]),
+                               vo->v[1] + t * (b[1] - vo->v[1]),
+                               d >= 3 ? vo->v[2] + t * (b[2] - vo->v[2]) : 0.0f,
+                               d >= 4 ? vo->v[3] + t * (b[3] - vo->v[3]) : 0.0f);
         }
-        float inv = 1.0f / len;
-        return val_new_vec(vm, d, vo->v[0] * inv, vo->v[1] * inv, d >= 3 ? vo->v[2] * inv : 0.0f,
-                           d >= 4 ? vo->v[3] * inv : 0.0f);
-    }
-    if (strcmp(method, "copy") == 0 || strcmp(method, "clone") == 0) {
-        return val_new_vec(vm, d, vo->v[0], vo->v[1], d >= 3 ? vo->v[2] : 0.0f,
-                           d >= 4 ? vo->v[3] : 0.0f);
-    }
-    if (strcmp(method, "negate") == 0) {
-        return val_new_vec(vm, d, -vo->v[0], -vo->v[1], d >= 3 ? -vo->v[2] : 0.0f,
-                           d >= 4 ? -vo->v[3] : 0.0f);
-    }
-    if (strcmp(method, "min") == 0) {
-        return val_new_vec(vm, d, fminf(vo->v[0], b[0]), fminf(vo->v[1], b[1]),
-                           d >= 3 ? fminf(vo->v[2], b[2]) : 0.0f,
-                           d >= 4 ? fminf(vo->v[3], b[3]) : 0.0f);
-    }
-    if (strcmp(method, "max") == 0) {
-        return val_new_vec(vm, d, fmaxf(vo->v[0], b[0]), fmaxf(vo->v[1], b[1]),
-                           d >= 3 ? fmaxf(vo->v[2], b[2]) : 0.0f,
-                           d >= 4 ? fmaxf(vo->v[3], b[3]) : 0.0f);
-    }
-    if (strcmp(method, "mix") == 0 || strcmp(method, "lerp") == 0) {
-        float t = (argc >= 2) ? (float)val_to_num(args[1]) : 0.5f;
-        return val_new_vec(vm, d, vo->v[0] + t * (b[0] - vo->v[0]),
-                           vo->v[1] + t * (b[1] - vo->v[1]),
-                           d >= 3 ? vo->v[2] + t * (b[2] - vo->v[2]) : 0.0f,
-                           d >= 4 ? vo->v[3] + t * (b[3] - vo->v[3]) : 0.0f);
-    }
-    if (strcmp(method, "toString") == 0) {
-        char buf[128];
-        if (d == 2) {
-            snprintf(buf, sizeof(buf), "%g %g", vo->v[0], vo->v[1]);
-        } else if (d == 3) {
-            snprintf(buf, sizeof(buf), "%g %g %g", vo->v[0], vo->v[1], vo->v[2]);
-        } else {
-            snprintf(buf, sizeof(buf), "%g %g %g %g", vo->v[0], vo->v[1], vo->v[2], vo->v[3]);
+        break;
+    case 'd':
+        if (strcmp(method, "divide") == 0 || strcmp(method, "div") == 0) {
+            return val_new_vec(vm, d, fabsf(b[0]) > 1e-12f ? vo->v[0] / b[0] : 0.0f,
+                               fabsf(b[1]) > 1e-12f ? vo->v[1] / b[1] : 0.0f,
+                               (d >= 3 && fabsf(b[2]) > 1e-12f) ? vo->v[2] / b[2] : 0.0f,
+                               (d >= 4 && fabsf(b[3]) > 1e-12f) ? vo->v[3] / b[3] : 0.0f);
         }
-        return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+        if (strcmp(method, "distance") == 0) {
+            double sum = 0.0;
+            for (uint8_t i = 0; i < d; i++) {
+                double diff = (double)vo->v[i] - (double)b[i];
+                sum += diff * diff;
+            }
+            return val_num(sqrt(sum));
+        }
+        if (strcmp(method, "dot") == 0) {
+            double sum = 0.0;
+            for (uint8_t i = 0; i < d; i++) {
+                sum += (double)vo->v[i] * (double)b[i];
+            }
+            return val_num(sum);
+        }
+        break;
+    case 'l':
+        if (strcmp(method, "lengthSqr") == 0) {
+            double sum = 0.0;
+            for (uint8_t i = 0; i < d; i++) {
+                sum += (double)vo->v[i] * (double)vo->v[i];
+            }
+            return val_num(sum);
+        }
+        if (strcmp(method, "length") == 0) {
+            double sum = 0.0;
+            for (uint8_t i = 0; i < d; i++) {
+                sum += (double)vo->v[i] * (double)vo->v[i];
+            }
+            return val_num(sqrt(sum));
+        }
+        if (strcmp(method, "lerp") == 0) {
+            float t = (argc >= 2) ? (float)val_to_num(args[1]) : 0.5f;
+            return val_new_vec(vm, d, vo->v[0] + t * (b[0] - vo->v[0]),
+                               vo->v[1] + t * (b[1] - vo->v[1]),
+                               d >= 3 ? vo->v[2] + t * (b[2] - vo->v[2]) : 0.0f,
+                               d >= 4 ? vo->v[3] + t * (b[3] - vo->v[3]) : 0.0f);
+        }
+        break;
+    case 'c':
+        if (strcmp(method, "cross") == 0) {
+            return val_new_vec(vm, 3, vo->v[1] * b[2] - vo->v[2] * b[1],
+                               vo->v[2] * b[0] - vo->v[0] * b[2], vo->v[0] * b[1] - vo->v[1] * b[0],
+                               0.0f);
+        }
+        if (strcmp(method, "copy") == 0 || strcmp(method, "clone") == 0) {
+            return val_new_vec(vm, d, vo->v[0], vo->v[1], d >= 3 ? vo->v[2] : 0.0f,
+                               d >= 4 ? vo->v[3] : 0.0f);
+        }
+        break;
+    case 'n':
+        if (strcmp(method, "normalize") == 0) {
+            double sum = 0.0;
+            for (uint8_t i = 0; i < d; i++) {
+                sum += (double)vo->v[i] * (double)vo->v[i];
+            }
+            float len = (float)sqrt(sum);
+            if (len <= 1e-12f) {
+                return val_new_vec(vm, d, 0.0f, 0.0f, 0.0f, 0.0f);
+            }
+            float inv = 1.0f / len;
+            return val_new_vec(vm, d, vo->v[0] * inv, vo->v[1] * inv,
+                               d >= 3 ? vo->v[2] * inv : 0.0f, d >= 4 ? vo->v[3] * inv : 0.0f);
+        }
+        if (strcmp(method, "negate") == 0) {
+            return val_new_vec(vm, d, -vo->v[0], -vo->v[1], d >= 3 ? -vo->v[2] : 0.0f,
+                               d >= 4 ? -vo->v[3] : 0.0f);
+        }
+        break;
+    case 't':
+        if (strcmp(method, "toString") == 0) {
+            char buf[128];
+            if (d == 2) {
+                snprintf(buf, sizeof(buf), "%g %g", vo->v[0], vo->v[1]);
+            } else if (d == 3) {
+                snprintf(buf, sizeof(buf), "%g %g %g", vo->v[0], vo->v[1], vo->v[2]);
+            } else {
+                snprintf(buf, sizeof(buf), "%g %g %g %g", vo->v[0], vo->v[1], vo->v[2], vo->v[3]);
+            }
+            return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+        }
+        break;
     }
     return val_undef();
 }
@@ -697,77 +726,101 @@ static js_val_t call_builtin_method(we_script_t *vm, js_builtin_id_t bid, const 
     double a2 = (argc >= 3) ? val_to_num(args[2]) : 0.0;
 
     if (bid == BUILTIN_MATH) {
-        if (strcmp(method, "sin") == 0)
-            return val_num(sin(a0));
-        if (strcmp(method, "cos") == 0)
-            return val_num(cos(a0));
-        if (strcmp(method, "tan") == 0)
-            return val_num(tan(a0));
-        if (strcmp(method, "asin") == 0)
-            return val_num(asin(fmin(fmax(a0, -1.0), 1.0)));
-        if (strcmp(method, "acos") == 0)
-            return val_num(acos(fmin(fmax(a0, -1.0), 1.0)));
-        if (strcmp(method, "atan") == 0)
-            return val_num(atan(a0));
-        if (strcmp(method, "atan2") == 0)
-            return val_num(atan2(a0, a1));
-        if (strcmp(method, "abs") == 0)
-            return val_num(fabs(a0));
-        if (strcmp(method, "min") == 0) {
-            if (argc == 0)
-                return val_num(0.0);
-            double m = a0;
-            for (uint32_t i = 1; i < argc; i++) {
-                double v = val_to_num(args[i]);
-                if (v < m)
-                    m = v;
+        switch (method[0]) {
+        case 's':
+            if (strcmp(method, "sin") == 0)
+                return val_num(sin(a0));
+            if (strcmp(method, "sign") == 0)
+                return val_num(a0 > 0.0 ? 1.0 : (a0 < 0.0 ? -1.0 : 0.0));
+            if (strcmp(method, "sqrt") == 0)
+                return val_num(a0 >= 0.0 ? sqrt(a0) : 0.0);
+            break;
+        case 'c':
+            if (strcmp(method, "cos") == 0)
+                return val_num(cos(a0));
+            if (strcmp(method, "ceil") == 0)
+                return val_num(ceil(a0));
+            if (strcmp(method, "cbrt") == 0)
+                return val_num(cbrt(a0));
+            break;
+        case 't':
+            if (strcmp(method, "tan") == 0)
+                return val_num(tan(a0));
+            if (strcmp(method, "trunc") == 0)
+                return val_num(trunc(a0));
+            break;
+        case 'a':
+            if (strcmp(method, "abs") == 0)
+                return val_num(fabs(a0));
+            if (strcmp(method, "asin") == 0)
+                return val_num(asin(fmin(fmax(a0, -1.0), 1.0)));
+            if (strcmp(method, "acos") == 0)
+                return val_num(acos(fmin(fmax(a0, -1.0), 1.0)));
+            if (strcmp(method, "atan") == 0)
+                return val_num(atan(a0));
+            if (strcmp(method, "atan2") == 0)
+                return val_num(atan2(a0, a1));
+            break;
+        case 'm':
+            if (strcmp(method, "min") == 0) {
+                if (argc == 0)
+                    return val_num(0.0);
+                double m = a0;
+                for (uint32_t i = 1; i < argc; i++) {
+                    double v = val_to_num(args[i]);
+                    if (v < m)
+                        m = v;
+                }
+                return val_num(m);
             }
-            return val_num(m);
-        }
-        if (strcmp(method, "max") == 0) {
-            if (argc == 0)
-                return val_num(0.0);
-            double m = a0;
-            for (uint32_t i = 1; i < argc; i++) {
-                double v = val_to_num(args[i]);
-                if (v > m)
-                    m = v;
+            if (strcmp(method, "max") == 0) {
+                if (argc == 0)
+                    return val_num(0.0);
+                double m = a0;
+                for (uint32_t i = 1; i < argc; i++) {
+                    double v = val_to_num(args[i]);
+                    if (v > m)
+                        m = v;
+                }
+                return val_num(m);
             }
-            return val_num(m);
-        }
-        if (strcmp(method, "floor") == 0)
-            return val_num(floor(a0));
-        if (strcmp(method, "ceil") == 0)
-            return val_num(ceil(a0));
-        if (strcmp(method, "round") == 0)
-            return val_num(round(a0));
-        if (strcmp(method, "trunc") == 0)
-            return val_num(trunc(a0));
-        if (strcmp(method, "sign") == 0)
-            return val_num(a0 > 0.0 ? 1.0 : (a0 < 0.0 ? -1.0 : 0.0));
-        if (strcmp(method, "sqrt") == 0)
-            return val_num(a0 >= 0.0 ? sqrt(a0) : 0.0);
-        if (strcmp(method, "cbrt") == 0)
-            return val_num(cbrt(a0));
-        if (strcmp(method, "hypot") == 0)
-            return val_num(hypot(a0, a1));
-        if (strcmp(method, "pow") == 0)
-            return val_num(pow(a0, a1));
-        if (strcmp(method, "exp") == 0)
-            return val_num(exp(a0));
-        if (strcmp(method, "log") == 0)
-            return val_num(a0 > 0.0 ? log(a0) : 0.0);
-        if (strcmp(method, "log2") == 0)
-            return val_num(a0 > 0.0 ? log2(a0) : 0.0);
-        if (strcmp(method, "log10") == 0)
-            return val_num(a0 > 0.0 ? log10(a0) : 0.0);
-        if (strcmp(method, "random") == 0) {
-            uint64_t x = vm->rng_state;
-            x ^= x >> 12;
-            x ^= x << 25;
-            x ^= x >> 27;
-            vm->rng_state = x;
-            return val_num((double)((x * 0x2545F4914F6CDD1DULL) >> 40) / 16777216.0);
+            break;
+        case 'f':
+            if (strcmp(method, "floor") == 0)
+                return val_num(floor(a0));
+            break;
+        case 'r':
+            if (strcmp(method, "round") == 0)
+                return val_num(round(a0));
+            if (strcmp(method, "random") == 0) {
+                uint64_t x = vm->rng_state;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                vm->rng_state = x;
+                return val_num((double)((x * 0x2545F4914F6CDD1DULL) >> 40) / 16777216.0);
+            }
+            break;
+        case 'h':
+            if (strcmp(method, "hypot") == 0)
+                return val_num(hypot(a0, a1));
+            break;
+        case 'p':
+            if (strcmp(method, "pow") == 0)
+                return val_num(pow(a0, a1));
+            break;
+        case 'e':
+            if (strcmp(method, "exp") == 0)
+                return val_num(exp(a0));
+            break;
+        case 'l':
+            if (strcmp(method, "log") == 0)
+                return val_num(a0 > 0.0 ? log(a0) : 0.0);
+            if (strcmp(method, "log2") == 0)
+                return val_num(a0 > 0.0 ? log2(a0) : 0.0);
+            if (strcmp(method, "log10") == 0)
+                return val_num(a0 > 0.0 ? log10(a0) : 0.0);
+            break;
         }
     } else if (bid == BUILTIN_WEMATH) {
         if (strcmp(method, "deg2rad") == 0)
@@ -992,46 +1045,68 @@ static js_val_t get_scene_layer_member(we_script_t *vm, uint32_t slot, const cha
     }
     we_script_scene_layer_slot_t *sl = &vm->scene_layers[slot];
     sl->accessed = true;
-    if (strcmp(prop, "origin") == 0) {
-        js_val_t v = {.type = VAL_VEC, .u.vec = &sl->origin_vec};
-        return v;
+    switch (prop[0]) {
+    case 'o':
+        if (strcmp(prop, "origin") == 0) {
+            js_val_t v = {.type = VAL_VEC, .u.vec = &sl->origin_vec};
+            return v;
+        }
+        break;
+    case 's':
+        if (strcmp(prop, "scale") == 0) {
+            js_val_t v = {.type = VAL_VEC, .u.vec = &sl->scale_vec};
+            return v;
+        }
+        if (strcmp(prop, "size") == 0) {
+            js_val_t v = {.type = VAL_VEC, .u.vec = &sl->size_vec};
+            return v;
+        }
+        break;
+    case 'a':
+        if (strcmp(prop, "angles") == 0) {
+            js_val_t v = {.type = VAL_VEC, .u.vec = &sl->angles_vec};
+            return v;
+        }
+        if (strcmp(prop, "alpha") == 0)
+            return val_num((double)sl->state.alpha);
+        break;
+    case 'c':
+        if (strcmp(prop, "color") == 0) {
+            js_val_t v = {.type = VAL_VEC, .u.vec = &sl->color_vec};
+            return v;
+        }
+        break;
+    case 'v':
+        if (strcmp(prop, "visible") == 0)
+            return val_bool(sl->state.visible);
+        if (strcmp(prop, "verticalalign") == 0)
+            return val_str(sl->state.valign);
+        if (strcmp(prop, "volume") == 0)
+            return val_num((double)sl->state.volume);
+        break;
+    case 'n':
+        if (strcmp(prop, "name") == 0)
+            return val_str(sl->state.name);
+        break;
+    case 't':
+        if (strcmp(prop, "text") == 0)
+            return val_str(sl->state.text);
+        break;
+    case 'p':
+        if (strcmp(prop, "pointsize") == 0)
+            return val_num((double)sl->state.pointsize);
+        break;
+    case 'h':
+        if (strcmp(prop, "horizontalalign") == 0)
+            return val_str(sl->state.halign);
+        break;
+    case 'i':
+        if (strcmp(prop, "isPlaying") == 0)
+            return val_bool(sl->state.audio_playing);
+        if (strcmp(prop, "id") == 0)
+            return val_num((double)sl->state.id);
+        break;
     }
-    if (strcmp(prop, "scale") == 0) {
-        js_val_t v = {.type = VAL_VEC, .u.vec = &sl->scale_vec};
-        return v;
-    }
-    if (strcmp(prop, "angles") == 0) {
-        js_val_t v = {.type = VAL_VEC, .u.vec = &sl->angles_vec};
-        return v;
-    }
-    if (strcmp(prop, "color") == 0) {
-        js_val_t v = {.type = VAL_VEC, .u.vec = &sl->color_vec};
-        return v;
-    }
-    if (strcmp(prop, "size") == 0) {
-        js_val_t v = {.type = VAL_VEC, .u.vec = &sl->size_vec};
-        return v;
-    }
-    if (strcmp(prop, "alpha") == 0)
-        return val_num((double)sl->state.alpha);
-    if (strcmp(prop, "visible") == 0)
-        return val_bool(sl->state.visible);
-    if (strcmp(prop, "name") == 0)
-        return val_str(sl->state.name);
-    if (strcmp(prop, "text") == 0)
-        return val_str(sl->state.text);
-    if (strcmp(prop, "pointsize") == 0)
-        return val_num((double)sl->state.pointsize);
-    if (strcmp(prop, "horizontalalign") == 0)
-        return val_str(sl->state.halign);
-    if (strcmp(prop, "verticalalign") == 0)
-        return val_str(sl->state.valign);
-    if (strcmp(prop, "volume") == 0)
-        return val_num((double)sl->state.volume);
-    if (strcmp(prop, "isPlaying") == 0)
-        return val_bool(sl->state.audio_playing);
-    if (strcmp(prop, "id") == 0)
-        return val_num((double)sl->state.id);
     return val_undef();
 }
 
@@ -1059,21 +1134,36 @@ static js_val_t get_builtin_member(we_script_t *vm, js_builtin_id_t bid, const c
         if (strcmp(prop, "rad2deg") == 0)
             return val_num(180.0 / M_PI);
     } else if (bid == BUILTIN_ENGINE) {
-        if (strcmp(prop, "frametime") == 0)
-            return val_num((double)vm->env.frametime);
-        if (strcmp(prop, "runtime") == 0)
-            return val_num((double)vm->env.runtime);
-        if (strcmp(prop, "timeOfDay") == 0)
-            return val_num((double)vm->env.time_of_day);
-        if (strcmp(prop, "screenResolution") == 0)
-            return val_new_vec(vm, 2, vm->env.screen_resolution[0], vm->env.screen_resolution[1],
-                               0.0f, 0.0f);
-        if (strcmp(prop, "canvasSize") == 0)
-            return val_new_vec(vm, 2, vm->env.canvas_size[0], vm->env.canvas_size[1], 0.0f, 0.0f);
-        if (strcmp(prop, "isRunningInEditor") == 0 || strcmp(prop, "isMobileDevice") == 0)
-            return val_bool(false);
-        if (strcmp(prop, "isDesktopDevice") == 0 || strcmp(prop, "isWallpaper") == 0)
-            return val_bool(true);
+        switch (prop[0]) {
+        case 'f':
+            if (strcmp(prop, "frametime") == 0)
+                return val_num((double)vm->env.frametime);
+            break;
+        case 'r':
+            if (strcmp(prop, "runtime") == 0)
+                return val_num((double)vm->env.runtime);
+            break;
+        case 't':
+            if (strcmp(prop, "timeOfDay") == 0)
+                return val_num((double)vm->env.time_of_day);
+            break;
+        case 's':
+            if (strcmp(prop, "screenResolution") == 0)
+                return val_new_vec(vm, 2, vm->env.screen_resolution[0],
+                                   vm->env.screen_resolution[1], 0.0f, 0.0f);
+            break;
+        case 'c':
+            if (strcmp(prop, "canvasSize") == 0)
+                return val_new_vec(vm, 2, vm->env.canvas_size[0], vm->env.canvas_size[1], 0.0f,
+                                   0.0f);
+            break;
+        case 'i':
+            if (strcmp(prop, "isRunningInEditor") == 0 || strcmp(prop, "isMobileDevice") == 0)
+                return val_bool(false);
+            if (strcmp(prop, "isDesktopDevice") == 0 || strcmp(prop, "isWallpaper") == 0)
+                return val_bool(true);
+            break;
+        }
     } else if (bid == BUILTIN_INPUT) {
         if (strcmp(prop, "cursorWorldPosition") == 0)
             return val_new_vec(vm, 3, vm->env.cursor_world[0], vm->env.cursor_world[1],
@@ -1084,48 +1174,72 @@ static js_val_t get_builtin_member(we_script_t *vm, js_builtin_id_t bid, const c
         if (strcmp(prop, "cursorLeftDown") == 0)
             return val_bool(vm->env.cursor_left_down);
     } else if (bid == BUILTIN_THIS_LAYER) {
-        if (strcmp(prop, "origin") == 0) {
-            js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_origin_vec};
-            return v;
+        switch (prop[0]) {
+        case 'o':
+            if (strcmp(prop, "origin") == 0) {
+                js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_origin_vec};
+                return v;
+            }
+            break;
+        case 's':
+            if (strcmp(prop, "scale") == 0) {
+                js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_scale_vec};
+                return v;
+            }
+            if (strcmp(prop, "size") == 0) {
+                js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_size_vec};
+                return v;
+            }
+            break;
+        case 'a':
+            if (strcmp(prop, "angles") == 0) {
+                js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_angles_vec};
+                return v;
+            }
+            if (strcmp(prop, "alpha") == 0)
+                return val_num((double)vm->layer.alpha);
+            break;
+        case 'c':
+            if (strcmp(prop, "color") == 0) {
+                js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_color_vec};
+                return v;
+            }
+            break;
+        case 'v':
+            if (strcmp(prop, "visible") == 0)
+                return val_bool(vm->layer.visible);
+            if (strcmp(prop, "verticalalign") == 0)
+                return val_str(vm->layer.valign);
+            if (strcmp(prop, "volume") == 0)
+                return val_num((double)vm->layer.volume);
+            break;
+        case 'n':
+            if (strcmp(prop, "name") == 0)
+                return val_str(vm->layer.name);
+            break;
+        case 't':
+            if (strcmp(prop, "text") == 0)
+                return val_str(vm->layer.text);
+            break;
+        case 'p':
+            if (strcmp(prop, "pointsize") == 0)
+                return val_num((double)vm->layer.pointsize);
+            break;
+        case 'h':
+            if (strcmp(prop, "horizontalalign") == 0)
+                return val_str(vm->layer.halign);
+            break;
+        case 'i':
+            if (strcmp(prop, "isPlaying") == 0)
+                return val_bool(vm->layer.audio_playing);
+            if (strcmp(prop, "id") == 0)
+                return val_num((double)vm->layer.id);
+            break;
         }
-        if (strcmp(prop, "scale") == 0) {
-            js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_scale_vec};
-            return v;
-        }
-        if (strcmp(prop, "angles") == 0) {
-            js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_angles_vec};
-            return v;
-        }
-        if (strcmp(prop, "color") == 0) {
-            js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_color_vec};
-            return v;
-        }
-        if (strcmp(prop, "size") == 0) {
-            js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_size_vec};
-            return v;
-        }
-        if (strcmp(prop, "alpha") == 0)
-            return val_num((double)vm->layer.alpha);
-        if (strcmp(prop, "visible") == 0)
-            return val_bool(vm->layer.visible);
-        if (strcmp(prop, "name") == 0)
-            return val_str(vm->layer.name);
-        if (strcmp(prop, "text") == 0)
-            return val_str(vm->layer.text);
-        if (strcmp(prop, "pointsize") == 0)
-            return val_num((double)vm->layer.pointsize);
-        if (strcmp(prop, "horizontalalign") == 0)
-            return val_str(vm->layer.halign);
-        if (strcmp(prop, "verticalalign") == 0)
-            return val_str(vm->layer.valign);
-        if (strcmp(prop, "volume") == 0)
-            return val_num((double)vm->layer.volume);
-        if (strcmp(prop, "isPlaying") == 0)
-            return val_bool(vm->layer.audio_playing);
-        if (strcmp(prop, "id") == 0)
-            return val_num((double)vm->layer.id);
+        char p0 = prop[0];
         for (uint32_t i = 0; i < vm->this_prop_count; i++) {
-            if (vm->this_props[i].name && strcmp(vm->this_props[i].name, prop) == 0) {
+            const char *tpn = vm->this_props[i].name;
+            if (tpn && (tpn == prop || (tpn[0] == p0 && strcmp(tpn, prop) == 0))) {
                 return vm->this_props[i].val;
             }
         }
@@ -1140,96 +1254,122 @@ static bool apply_layer_state_prop(we_script_layer_state_t *st, js_vec_obj_t *or
                                    js_vec_obj_t *color_vec, js_vec_obj_t *size_vec,
                                    const char *prop, js_val_t rhs)
 {
-    if (strcmp(prop, "text") == 0) {
-        char buf[512];
-        val_to_str_buf(rhs, buf, sizeof(buf));
-        snprintf(st->text, sizeof(st->text), "%s", buf);
-        st->dirty_mask |= WE_LAYER_DIRTY_TEXT;
-        return true;
+    if (!prop) {
+        return false;
     }
-    if (strcmp(prop, "pointsize") == 0) {
-        int32_t ps = num_to_i32(val_to_num(rhs));
-        if (ps < 4) {
-            ps = 4;
+    switch (prop[0]) {
+    case 'a':
+        if (strcmp(prop, "alpha") == 0) {
+            st->alpha = sanitize_f((float)val_to_num(rhs), 1.0f);
+            st->dirty_mask |= WE_LAYER_DIRTY_ALPHA;
+            return true;
         }
-        if (ps > 256) {
-            ps = 256;
+        break;
+    case 'v':
+        if (strcmp(prop, "visible") == 0) {
+            st->visible = val_to_bool(rhs);
+            st->dirty_mask |= WE_LAYER_DIRTY_VISIBLE;
+            return true;
         }
-        st->pointsize = ps;
-        st->dirty_mask |= WE_LAYER_DIRTY_POINTSIZE;
-        return true;
-    }
-    if (strcmp(prop, "horizontalalign") == 0) {
-        char buf[32];
-        val_to_str_buf(rhs, buf, sizeof(buf));
-        snprintf(st->halign, sizeof(st->halign), "%s", buf);
-        st->dirty_mask |= WE_LAYER_DIRTY_HALIGN;
-        return true;
-    }
-    if (strcmp(prop, "verticalalign") == 0) {
-        char buf[32];
-        val_to_str_buf(rhs, buf, sizeof(buf));
-        snprintf(st->valign, sizeof(st->valign), "%s", buf);
-        st->dirty_mask |= WE_LAYER_DIRTY_VALIGN;
-        return true;
-    }
-    if (strcmp(prop, "volume") == 0) {
-        float vol = sanitize_f((float)val_to_num(rhs), 1.0f);
-        if (vol < 0.0f) {
-            vol = 0.0f;
+        if (strcmp(prop, "verticalalign") == 0) {
+            char buf[32];
+            val_to_str_buf(rhs, buf, sizeof(buf));
+            snprintf(st->valign, sizeof(st->valign), "%s", buf);
+            st->dirty_mask |= WE_LAYER_DIRTY_VALIGN;
+            return true;
         }
-        if (vol > 2.0f) {
-            vol = 2.0f;
+        if (strcmp(prop, "volume") == 0) {
+            float vol = sanitize_f((float)val_to_num(rhs), 1.0f);
+            if (vol < 0.0f) {
+                vol = 0.0f;
+            }
+            if (vol > 2.0f) {
+                vol = 2.0f;
+            }
+            st->volume = vol;
+            st->dirty_mask |= WE_LAYER_DIRTY_VOLUME;
+            return true;
         }
-        st->volume = vol;
-        st->dirty_mask |= WE_LAYER_DIRTY_VOLUME;
-        return true;
+        break;
+    case 't':
+        if (strcmp(prop, "text") == 0) {
+            char buf[512];
+            val_to_str_buf(rhs, buf, sizeof(buf));
+            snprintf(st->text, sizeof(st->text), "%s", buf);
+            st->dirty_mask |= WE_LAYER_DIRTY_TEXT;
+            return true;
+        }
+        break;
+    case 'p':
+        if (strcmp(prop, "pointsize") == 0) {
+            int32_t ps = num_to_i32(val_to_num(rhs));
+            if (ps < 4) {
+                ps = 4;
+            }
+            if (ps > 256) {
+                ps = 256;
+            }
+            st->pointsize = ps;
+            st->dirty_mask |= WE_LAYER_DIRTY_POINTSIZE;
+            return true;
+        }
+        break;
+    case 'h':
+        if (strcmp(prop, "horizontalalign") == 0) {
+            char buf[32];
+            val_to_str_buf(rhs, buf, sizeof(buf));
+            snprintf(st->halign, sizeof(st->halign), "%s", buf);
+            st->dirty_mask |= WE_LAYER_DIRTY_HALIGN;
+            return true;
+        }
+        break;
     }
 
+    /* Vector properties: origin, scale, angles, color, size */
     float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     extract_other_vec(rhs, tmp);
     for (int i = 0; i < 4; i++) {
         tmp[i] = sanitize_f(tmp[i], 0.0f);
     }
-    if (strcmp(prop, "origin") == 0) {
-        memcpy(st->origin, tmp, 3 * sizeof(float));
-        memcpy(origin_vec->v, tmp, 3 * sizeof(float));
-        st->dirty_mask |= WE_LAYER_DIRTY_ORIGIN;
-        return true;
-    }
-    if (strcmp(prop, "scale") == 0) {
-        memcpy(st->scale, tmp, 3 * sizeof(float));
-        memcpy(scale_vec->v, tmp, 3 * sizeof(float));
-        st->dirty_mask |= WE_LAYER_DIRTY_SCALE;
-        return true;
-    }
-    if (strcmp(prop, "angles") == 0) {
-        memcpy(st->angles, tmp, 3 * sizeof(float));
-        memcpy(angles_vec->v, tmp, 3 * sizeof(float));
-        st->dirty_mask |= WE_LAYER_DIRTY_ANGLES;
-        return true;
-    }
-    if (strcmp(prop, "color") == 0) {
-        memcpy(st->color, tmp, 3 * sizeof(float));
-        memcpy(color_vec->v, tmp, 3 * sizeof(float));
-        st->dirty_mask |= WE_LAYER_DIRTY_COLOR;
-        return true;
-    }
-    if (strcmp(prop, "size") == 0) {
-        memcpy(st->size, tmp, 2 * sizeof(float));
-        memcpy(size_vec->v, tmp, 2 * sizeof(float));
-        st->dirty_mask |= WE_LAYER_DIRTY_SIZE;
-        return true;
-    }
-    if (strcmp(prop, "alpha") == 0) {
-        st->alpha = sanitize_f((float)val_to_num(rhs), 1.0f);
-        st->dirty_mask |= WE_LAYER_DIRTY_ALPHA;
-        return true;
-    }
-    if (strcmp(prop, "visible") == 0) {
-        st->visible = val_to_bool(rhs);
-        st->dirty_mask |= WE_LAYER_DIRTY_VISIBLE;
-        return true;
+    switch (prop[0]) {
+    case 'o':
+        if (strcmp(prop, "origin") == 0) {
+            memcpy(st->origin, tmp, 3 * sizeof(float));
+            memcpy(origin_vec->v, tmp, 3 * sizeof(float));
+            st->dirty_mask |= WE_LAYER_DIRTY_ORIGIN;
+            return true;
+        }
+        break;
+    case 's':
+        if (strcmp(prop, "scale") == 0) {
+            memcpy(st->scale, tmp, 3 * sizeof(float));
+            memcpy(scale_vec->v, tmp, 3 * sizeof(float));
+            st->dirty_mask |= WE_LAYER_DIRTY_SCALE;
+            return true;
+        }
+        if (strcmp(prop, "size") == 0) {
+            memcpy(st->size, tmp, 2 * sizeof(float));
+            memcpy(size_vec->v, tmp, 2 * sizeof(float));
+            st->dirty_mask |= WE_LAYER_DIRTY_SIZE;
+            return true;
+        }
+        break;
+    case 'a':
+        if (strcmp(prop, "angles") == 0) {
+            memcpy(st->angles, tmp, 3 * sizeof(float));
+            memcpy(angles_vec->v, tmp, 3 * sizeof(float));
+            st->dirty_mask |= WE_LAYER_DIRTY_ANGLES;
+            return true;
+        }
+        break;
+    case 'c':
+        if (strcmp(prop, "color") == 0) {
+            memcpy(st->color, tmp, 3 * sizeof(float));
+            memcpy(color_vec->v, tmp, 3 * sizeof(float));
+            st->dirty_mask |= WE_LAYER_DIRTY_COLOR;
+            return true;
+        }
+        break;
     }
     return false;
 }
@@ -1255,8 +1395,10 @@ static void set_layer_member(we_script_t *vm, const char *prop, js_val_t rhs)
                                prop, rhs)) {
         return;
     }
+    char p0 = prop[0];
     for (uint32_t i = 0; i < vm->this_prop_count; i++) {
-        if (vm->this_props[i].name && strcmp(vm->this_props[i].name, prop) == 0) {
+        const char *tpn = vm->this_props[i].name;
+        if (tpn && (tpn == prop || (tpn[0] == p0 && strcmp(tpn, prop) == 0))) {
             vm->this_props[i].val = rhs;
             return;
         }
@@ -1294,15 +1436,18 @@ static js_var_slot_t *find_var_slot(we_script_t *vm, exec_scope_t *scope, const 
     if (!name) {
         return NULL;
     }
+    char n0 = name[0];
     for (exec_scope_t *s = scope; s != NULL; s = s->parent) {
         for (uint32_t i = 0; i < s->count; i++) {
-            if (s->vars[i].name && strcmp(s->vars[i].name, name) == 0) {
+            const char *vn = s->vars[i].name;
+            if (vn && (vn == name || (vn[0] == n0 && strcmp(vn, name) == 0))) {
                 return &s->vars[i];
             }
         }
     }
     for (uint32_t i = 0; i < vm->global_count; i++) {
-        if (vm->globals[i].name && strcmp(vm->globals[i].name, name) == 0) {
+        const char *gn = vm->globals[i].name;
+        if (gn && (gn == name || (gn[0] == n0 && strcmp(gn, name) == 0))) {
             return &vm->globals[i];
         }
     }
@@ -1314,9 +1459,11 @@ static js_var_slot_t *declare_var_slot(we_script_t *vm, exec_scope_t *scope, con
     if (!name) {
         return NULL;
     }
+    char n0 = name[0];
     if (scope) {
         for (uint32_t i = 0; i < scope->count; i++) {
-            if (scope->vars[i].name && strcmp(scope->vars[i].name, name) == 0) {
+            const char *vn = scope->vars[i].name;
+            if (vn && (vn == name || (vn[0] == n0 && strcmp(vn, name) == 0))) {
                 return &scope->vars[i];
             }
         }
@@ -1328,14 +1475,16 @@ static js_var_slot_t *declare_var_slot(we_script_t *vm, exec_scope_t *scope, con
         }
     }
     for (uint32_t i = 0; i < vm->global_count; i++) {
-        if (vm->globals[i].name && strcmp(vm->globals[i].name, name) == 0) {
+        const char *gn = vm->globals[i].name;
+        if (gn && (gn == name || (gn[0] == n0 && strcmp(gn, name) == 0))) {
             return &vm->globals[i];
         }
     }
     if (vm->global_count < WE_SCRIPT_MAX_GLOBALS) {
         js_var_slot_t *sl = &vm->globals[vm->global_count++];
         sl->name = name;
-        sl->val = (strcmp(name, "shared") == 0) ? val_builtin(BUILTIN_SHARED) : val_undef();
+        sl->val =
+            (n0 == 's' && strcmp(name, "shared") == 0) ? val_builtin(BUILTIN_SHARED) : val_undef();
         return sl;
     }
     return NULL;
@@ -1986,11 +2135,23 @@ static js_val_t call_str_method(we_script_t *vm, js_val_t recv, const char *meth
         const char *found = strstr(s + from, needle);
         return found ? val_num((double)(found - s)) : val_num(-1.0);
     }
-    if (strcmp(method, "replace") == 0 && argc >= 2) {
-        char pat[128];
-        char rep[256];
-        val_to_str_buf(args[0], pat, sizeof(pat));
-        val_to_str_buf(args[1], rep, sizeof(rep));
+    if ((strcmp(method, "replace") == 0 || strcmp(method, "replaceAll") == 0) && argc >= 2) {
+        char pat_buf[256];
+        char rep_buf[256];
+        const char *pat = NULL;
+        const char *rep = NULL;
+        if (args[0].type == VAL_STR && args[0].u.str) {
+            pat = args[0].u.str;
+        } else {
+            val_to_str_buf(args[0], pat_buf, sizeof(pat_buf));
+            pat = pat_buf;
+        }
+        if (args[1].type == VAL_STR && args[1].u.str) {
+            rep = args[1].u.str;
+        } else {
+            val_to_str_buf(args[1], rep_buf, sizeof(rep_buf));
+            rep = rep_buf;
+        }
         size_t plen = strlen(pat);
         if (plen == 0) {
             return recv;
@@ -1999,25 +2160,68 @@ static js_val_t call_str_method(we_script_t *vm, js_val_t recv, const char *meth
         if (!hit) {
             return recv;
         }
-        char out[1024];
-        size_t pre = (size_t)(hit - s);
         size_t rlen = strlen(rep);
-        size_t post = slen - pre - plen;
-        size_t pos = 0;
-        if (pre < sizeof(out) - 1) {
-            memcpy(out, s, pre);
-            pos += pre;
+        bool is_all = (strcmp(method, "replaceAll") == 0);
+        if (!is_all) {
+            size_t pre = (size_t)(hit - s);
+            size_t post = slen - pre - plen;
+            size_t total_len = pre + rlen + post;
+            char *out = (char *)script_arena_alloc(vm, total_len + 1u);
+            if (!out) {
+                return recv;
+            }
+            if (pre > 0) {
+                memcpy(out, s, pre);
+            }
+            if (rlen > 0) {
+                memcpy(out + pre, rep, rlen);
+            }
+            if (post > 0) {
+                memcpy(out + pre + rlen, hit + plen, post);
+            }
+            out[total_len] = '\0';
+            return val_str(out);
+        } else {
+            size_t count = 0;
+            const char *p = s;
+            while ((p = strstr(p, pat)) != NULL) {
+                count++;
+                p += plen;
+            }
+            if (count == 0) {
+                return recv;
+            }
+            size_t total_len = slen - (count * plen) + (count * rlen);
+            char *out = (char *)script_arena_alloc(vm, total_len + 1u);
+            if (!out) {
+                return recv;
+            }
+            p = s;
+            char *dst = out;
+            while (true) {
+                const char *next_hit = strstr(p, pat);
+                if (!next_hit) {
+                    size_t rem = strlen(p);
+                    if (rem > 0) {
+                        memcpy(dst, p, rem);
+                        dst += rem;
+                    }
+                    break;
+                }
+                size_t prefix_len = (size_t)(next_hit - p);
+                if (prefix_len > 0) {
+                    memcpy(dst, p, prefix_len);
+                    dst += prefix_len;
+                }
+                if (rlen > 0) {
+                    memcpy(dst, rep, rlen);
+                    dst += rlen;
+                }
+                p = next_hit + plen;
+            }
+            *dst = '\0';
+            return val_str(out);
         }
-        if (pos + rlen < sizeof(out) - 1) {
-            memcpy(out + pos, rep, rlen);
-            pos += rlen;
-        }
-        if (pos + post < sizeof(out) - 1) {
-            memcpy(out + pos, hit + plen, post);
-            pos += post;
-        }
-        out[pos] = '\0';
-        return val_str(script_arena_strdup(vm, out, pos));
     }
     if (strcmp(method, "split") == 0) {
         js_arr_t *arr = (js_arr_t *)script_arena_alloc(vm, sizeof(js_arr_t));
@@ -2043,8 +2247,7 @@ static js_val_t call_str_method(we_script_t *vm, js_val_t recv, const char *meth
                     arr_push_item(vm, arr, val_str(script_arena_strdup(vm, cur, strlen(cur))));
                     break;
                 }
-                arr_push_item(vm, arr,
-                              val_str(script_arena_strdup(vm, cur, (size_t)(hit - cur))));
+                arr_push_item(vm, arr, val_str(script_arena_strdup(vm, cur, (size_t)(hit - cur))));
                 cur = hit + sep_len;
                 if (*cur == '\0') {
                     arr_push_item(vm, arr, val_str(""));
@@ -2141,30 +2344,52 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
         if (sl) {
             return sl->val;
         }
-        if (strcmp(node->name, "Math") == 0)
-            return val_builtin(BUILTIN_MATH);
-        if (strcmp(node->name, "Date") == 0)
-            return val_builtin(BUILTIN_DATE);
-        if (strcmp(node->name, "WEMath") == 0)
-            return val_builtin(BUILTIN_WEMATH);
-        if (strcmp(node->name, "WEColor") == 0)
-            return val_builtin(BUILTIN_WECOLOR);
-        if (strcmp(node->name, "engine") == 0)
-            return val_builtin(BUILTIN_ENGINE);
-        if (strcmp(node->name, "input") == 0)
-            return val_builtin(BUILTIN_INPUT);
-        if (strcmp(node->name, "thisLayer") == 0 || strcmp(node->name, "thisObject") == 0)
-            return val_builtin(BUILTIN_THIS_LAYER);
-        if (strcmp(node->name, "thisScene") == 0)
-            return val_builtin(BUILTIN_SCENE);
-        if (strcmp(node->name, "shared") == 0)
-            return val_builtin(BUILTIN_SHARED);
-        if (strcmp(node->name, "console") == 0)
-            return val_builtin(BUILTIN_CONSOLE);
-        if (strcmp(node->name, "NaN") == 0)
-            return val_nan();
-        if (strcmp(node->name, "Infinity") == 0)
-            return val_num(1e30);
+        switch (node->name[0]) {
+        case 'M':
+            if (strcmp(node->name, "Math") == 0)
+                return val_builtin(BUILTIN_MATH);
+            break;
+        case 'D':
+            if (strcmp(node->name, "Date") == 0)
+                return val_builtin(BUILTIN_DATE);
+            break;
+        case 'W':
+            if (strcmp(node->name, "WEMath") == 0)
+                return val_builtin(BUILTIN_WEMATH);
+            if (strcmp(node->name, "WEColor") == 0)
+                return val_builtin(BUILTIN_WECOLOR);
+            break;
+        case 'e':
+            if (strcmp(node->name, "engine") == 0)
+                return val_builtin(BUILTIN_ENGINE);
+            break;
+        case 'i':
+            if (strcmp(node->name, "input") == 0)
+                return val_builtin(BUILTIN_INPUT);
+            break;
+        case 't':
+            if (strcmp(node->name, "thisLayer") == 0 || strcmp(node->name, "thisObject") == 0)
+                return val_builtin(BUILTIN_THIS_LAYER);
+            if (strcmp(node->name, "thisScene") == 0)
+                return val_builtin(BUILTIN_SCENE);
+            break;
+        case 's':
+            if (strcmp(node->name, "shared") == 0)
+                return val_builtin(BUILTIN_SHARED);
+            break;
+        case 'c':
+            if (strcmp(node->name, "console") == 0)
+                return val_builtin(BUILTIN_CONSOLE);
+            break;
+        case 'N':
+            if (strcmp(node->name, "NaN") == 0)
+                return val_nan();
+            break;
+        case 'I':
+            if (strcmp(node->name, "Infinity") == 0)
+                return val_num(1e30);
+            break;
+        }
         return val_undef();
     }
 
@@ -3011,8 +3236,14 @@ static void reset_watchdog(we_script_t *vm)
     vm->aborted = false;
     vm->timed_out = false;
     vm->eval_depth = 0;
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &vm->start_ts) != 0) {
-        clock_gettime(CLOCK_MONOTONIC, &vm->start_ts);
+    if (vm->clock_id == 0) {
+        vm->clock_id = CLOCK_THREAD_CPUTIME_ID;
+        if (clock_gettime(vm->clock_id, &vm->start_ts) != 0) {
+            vm->clock_id = CLOCK_MONOTONIC;
+            clock_gettime(vm->clock_id, &vm->start_ts);
+        }
+    } else {
+        clock_gettime(vm->clock_id, &vm->start_ts);
     }
 }
 

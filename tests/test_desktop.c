@@ -8,6 +8,7 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,21 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+static int rm_rf_cb(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
+{
+    (void)sb;
+    (void)typeflag;
+    (void)ftwbuf;
+    return remove(fpath);
+}
+
+static void rm_rf_dir(const char *path)
+{
+    if (path && path[0]) {
+        nftw(path, rm_rf_cb, 64, FTW_DEPTH | FTW_PHYS);
+    }
+}
 
 void output_node_destroy_surface(output_node_t *node);
 void output_node_destroy_surface(output_node_t *node) { (void)node; }
@@ -421,6 +437,7 @@ static void test_security_hardening(void)
 
     int status = 0;
     waitpid(pid, &status, 0);
+    rm_rf_dir(sbox_tmp);
     assert(cr == 1 && confirm_byte == 'K');
 #ifdef HAVE_LIBSECCOMP
     assert(WIFSIGNALED(status));

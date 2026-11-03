@@ -2,8 +2,13 @@
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
 
+#include <dlfcn.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <GLES3/gl31.h>
+#include <GLES2/gl2ext.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -11,12 +16,109 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+extern EGLContext eglGetCurrentContext(void) __attribute__((weak));
+extern EGLDisplay eglGetCurrentDisplay(void) __attribute__((weak));
+extern __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *procname)
+    __attribute__((weak));
+extern void glDeleteTextures(GLsizei n, const GLuint *textures) __attribute__((weak));
+extern void glBindTexture(GLenum target, GLuint texture) __attribute__((weak));
+extern void glActiveTexture(GLenum texture) __attribute__((weak));
+extern void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered,
+                               GLint layer, GLenum access, GLenum format) __attribute__((weak));
+
+static inline EGLContext safe_eglGetCurrentContext(void)
+{
+    if (eglGetCurrentContext)
+        return eglGetCurrentContext();
+    typedef EGLContext (*pfn_eglGetCurrentContext)(void);
+    pfn_eglGetCurrentContext fn = NULL;
+    *(void **)(&fn) = dlsym(RTLD_DEFAULT, "eglGetCurrentContext");
+    return fn ? fn() : EGL_NO_CONTEXT;
+}
+
+static inline EGLDisplay safe_eglGetCurrentDisplay(void)
+{
+    if (eglGetCurrentDisplay)
+        return eglGetCurrentDisplay();
+    typedef EGLDisplay (*pfn_eglGetCurrentDisplay)(void);
+    pfn_eglGetCurrentDisplay fn = NULL;
+    *(void **)(&fn) = dlsym(RTLD_DEFAULT, "eglGetCurrentDisplay");
+    return fn ? fn() : EGL_NO_DISPLAY;
+}
+
+static inline __eglMustCastToProperFunctionPointerType safe_eglGetProcAddress(const char *procname)
+{
+    if (eglGetProcAddress)
+        return eglGetProcAddress(procname);
+    typedef __eglMustCastToProperFunctionPointerType (*pfn_eglGetProcAddress)(const char *);
+    pfn_eglGetProcAddress fn = NULL;
+    *(void **)(&fn) = dlsym(RTLD_DEFAULT, "eglGetProcAddress");
+    return fn ? fn(procname) : NULL;
+}
+
+static inline void safe_glDeleteTextures(GLsizei n, const GLuint *textures)
+{
+    if (glDeleteTextures) {
+        glDeleteTextures(n, textures);
+        return;
+    }
+    typedef void (*pfn_glDeleteTextures)(GLsizei, const GLuint *);
+    pfn_glDeleteTextures fn = NULL;
+    *(void **)(&fn) = dlsym(RTLD_DEFAULT, "glDeleteTextures");
+    if (fn)
+        fn(n, textures);
+}
+
+static inline void safe_glBindTexture(GLenum target, GLuint texture)
+{
+    if (glBindTexture) {
+        glBindTexture(target, texture);
+        return;
+    }
+    typedef void (*pfn_glBindTexture)(GLenum, GLuint);
+    pfn_glBindTexture fn = NULL;
+    *(void **)(&fn) = dlsym(RTLD_DEFAULT, "glBindTexture");
+    if (fn)
+        fn(target, texture);
+}
+
+static inline void safe_glActiveTexture(GLenum texture)
+{
+    if (glActiveTexture) {
+        glActiveTexture(texture);
+        return;
+    }
+    typedef void (*pfn_glActiveTexture)(GLenum);
+    pfn_glActiveTexture fn = NULL;
+    *(void **)(&fn) = dlsym(RTLD_DEFAULT, "glActiveTexture");
+    if (fn)
+        fn(texture);
+}
+
+static inline void safe_glBindImageTexture(GLuint unit, GLuint texture, GLint level,
+                                           GLboolean layered, GLint layer, GLenum access,
+                                           GLenum format)
+{
+    if (glBindImageTexture) {
+        glBindImageTexture(unit, texture, level, layered, layer, access, format);
+        return;
+    }
+    typedef void (*pfn_glBindImageTexture)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum);
+    pfn_glBindImageTexture fn = NULL;
+    *(void **)(&fn) = dlsym(RTLD_DEFAULT, "glBindImageTexture");
+    if (fn)
+        fn(unit, texture, level, layered, layer, access, format);
+}
+
 static void dmabuf_release_handler(void *data, struct wl_buffer *wl_buffer)
 {
     (void)wl_buffer;
     dmabuf_bo_t *bo = (dmabuf_bo_t *)data;
     if (bo) {
         bo->in_use = false;
+        if (bo->on_release) {
+            bo->on_release(bo->release_user_data, bo);
+        }
     }
 }
 
@@ -95,6 +197,23 @@ static bool find_active_drm_render_node(char *out_path, size_t max_len)
 /* Try to find the DRM render node matching a specific dev_t reported by the compositor */
 int open_drm_node_by_devt(dev_t target_dev)
 {
+    /* 1. Query libdrm directly: converts primary KMS or render dev_t to render node */
+    drmDevicePtr dev_ptr = NULL;
+    if (drmGetDeviceFromDevId(target_dev, 0, &dev_ptr) == 0 && dev_ptr) {
+        if ((dev_ptr->available_nodes & (1 << DRM_NODE_RENDER)) &&
+            dev_ptr->nodes[DRM_NODE_RENDER]) {
+            int fd = open(dev_ptr->nodes[DRM_NODE_RENDER], O_RDWR | O_CLOEXEC);
+            if (fd >= 0) {
+                WAYWAL_LOG_INFO("Matched compositor DRM device %u:%u via libdrm → %s",
+                                (unsigned)major(target_dev), (unsigned)minor(target_dev),
+                                dev_ptr->nodes[DRM_NODE_RENDER]);
+                drmFreeDevice(&dev_ptr);
+                return fd;
+            }
+        }
+        drmFreeDevice(&dev_ptr);
+    }
+
     DIR *dir = opendir("/dev/dri");
     if (!dir)
         return -1;
@@ -103,7 +222,9 @@ int open_drm_node_by_devt(dev_t target_dev)
     int found_fd = -1;
 
     while ((de = readdir(dir)) != NULL) {
-        if (strncmp(de->d_name, "renderD", 7) != 0)
+        bool is_render = (strncmp(de->d_name, "renderD", 7) == 0);
+        bool is_card = (strncmp(de->d_name, "card", 4) == 0);
+        if (!is_render && !is_card)
             continue;
 
         char path[300];
@@ -111,12 +232,61 @@ int open_drm_node_by_devt(dev_t target_dev)
 
         struct stat st;
         if (stat(path, &st) == 0 && st.st_rdev == target_dev) {
-            found_fd = open(path, O_RDWR | O_CLOEXEC);
-            if (found_fd >= 0) {
-                WAYWAL_LOG_INFO("Matched compositor DRM device %u:%u → %s",
-                                (unsigned)major(target_dev), (unsigned)minor(target_dev), path);
+            if (is_render) {
+                found_fd = open(path, O_RDWR | O_CLOEXEC);
+                if (found_fd >= 0) {
+                    WAYWAL_LOG_INFO("Matched compositor DRM render device %u:%u → %s",
+                                    (unsigned)major(target_dev), (unsigned)minor(target_dev), path);
+                    break;
+                }
+            } else if (is_card) {
+                /* When st.st_rdev == target_dev matches a primary KMS node (card*), derive
+                 * corresponding render node via /sys/class/drm/<cardN>/device/drm/renderD* */
+                char sys_path[512];
+                snprintf(sys_path, sizeof(sys_path), "/sys/class/drm/%s/device/drm", de->d_name);
+                DIR *sys_dir = opendir(sys_path);
+                if (sys_dir) {
+                    struct dirent *sde;
+                    while ((sde = readdir(sys_dir)) != NULL) {
+                        if (strncmp(sde->d_name, "renderD", 7) == 0) {
+                            char render_path[300];
+                            snprintf(render_path, sizeof(render_path), "/dev/dri/%s", sde->d_name);
+                            found_fd = open(render_path, O_RDWR | O_CLOEXEC);
+                            if (found_fd >= 0) {
+                                WAYWAL_LOG_INFO(
+                                    "Derived render node for compositor KMS card %s (%u:%u) → %s",
+                                    de->d_name, (unsigned)major(target_dev),
+                                    (unsigned)minor(target_dev), render_path);
+                                break;
+                            }
+                        }
+                    }
+                    closedir(sys_dir);
+                }
+
+                /* Fallback 1: renderD minor = card minor + 128 */
+                if (found_fd < 0) {
+                    char render_path[300];
+                    snprintf(render_path, sizeof(render_path), "/dev/dri/renderD%d",
+                             (int)minor(target_dev) + 128);
+                    found_fd = open(render_path, O_RDWR | O_CLOEXEC);
+                    if (found_fd >= 0) {
+                        WAYWAL_LOG_INFO("Derived render node via minor offset for %s → %s",
+                                        de->d_name, render_path);
+                    }
+                }
+
+                /* Fallback 2: open matched KMS node directly */
+                if (found_fd < 0) {
+                    found_fd = open(path, O_RDWR | O_CLOEXEC);
+                    if (found_fd >= 0) {
+                        WAYWAL_LOG_INFO("Fallback opened matched KMS card device %u:%u → %s",
+                                        (unsigned)major(target_dev), (unsigned)minor(target_dev),
+                                        path);
+                    }
+                }
+                break;
             }
-            break;
         }
     }
     closedir(dir);
@@ -320,8 +490,14 @@ bool dmabuf_bo_allocate(dmabuf_context_t *ctx, dmabuf_bo_t *bo, uint32_t width, 
                 zwp_linux_buffer_params_v1_destroy(params);
             }
             for (int j = 0; j < p; ++j) {
-                if (bo->fd[j] >= 0) {
-                    close(bo->fd[j]);
+                int fd_to_close = bo->fd[j];
+                if (fd_to_close >= 0) {
+                    close(fd_to_close);
+                    for (int k = j + 1; k < p; ++k) {
+                        if (bo->fd[k] == fd_to_close) {
+                            bo->fd[k] = -1;
+                        }
+                    }
                     bo->fd[j] = -1;
                 }
             }
@@ -357,6 +533,36 @@ void dmabuf_bo_free(dmabuf_bo_t *bo)
 {
     if (!bo)
         return;
+
+    /* Release GL texture and EGLImage before destroying buffer if EGL context is active */
+    if (bo->gl_tex != 0 || bo->egl_image != NULL) {
+        EGLContext cur_ctx = safe_eglGetCurrentContext();
+        if (cur_ctx != EGL_NO_CONTEXT) {
+            EGLDisplay cur_dpy = safe_eglGetCurrentDisplay();
+            if (bo->gl_tex != 0) {
+                /* Invariant: Ensure gl_tex is unbound from texture and image units before deleting
+                 */
+                safe_glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+                safe_glActiveTexture(GL_TEXTURE2);
+                safe_glBindTexture(GL_TEXTURE_2D, 0);
+                safe_glActiveTexture(GL_TEXTURE1);
+                safe_glBindTexture(GL_TEXTURE_2D, 0);
+                safe_glActiveTexture(GL_TEXTURE0);
+                safe_glBindTexture(GL_TEXTURE_2D, 0);
+
+                safe_glDeleteTextures(1, &bo->gl_tex);
+                bo->gl_tex = 0;
+            }
+            if (bo->egl_image != NULL) {
+                PFNEGLDESTROYIMAGEKHRPROC p_eglDestroyImageKHR =
+                    (PFNEGLDESTROYIMAGEKHRPROC)safe_eglGetProcAddress("eglDestroyImageKHR");
+                if (p_eglDestroyImageKHR && cur_dpy != EGL_NO_DISPLAY) {
+                    p_eglDestroyImageKHR(cur_dpy, bo->egl_image);
+                }
+                bo->egl_image = NULL;
+            }
+        }
+    }
     bo->egl_image = NULL;
     bo->gl_tex = 0;
     if (!bo->gbm_bo && !bo->wl_buffer) {
@@ -424,6 +630,8 @@ void dmabuf_ring_destroy(dmabuf_context_t *ctx, dmabuf_ring_t *ring)
         return;
 
     for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+        ring->buffers[i].on_release = NULL;
+        ring->buffers[i].release_user_data = NULL;
         dmabuf_bo_free(&ring->buffers[i]);
     }
     ring->initialized = false;
@@ -484,12 +692,19 @@ dmabuf_bo_t *dmabuf_ring_acquire(dmabuf_ring_t *ring)
             bool slot_allocated =
                 (ring->buffers[idx].gbm_bo != NULL || ring->buffers[idx].wl_buffer != NULL);
             if (!slot_allocated) {
+                void (*saved_on_release)(void *user_data, struct dmabuf_bo *bo) =
+                    ring->buffers[idx].on_release;
+                void *saved_release_user_data = ring->buffers[idx].release_user_data;
                 if (dmabuf_bo_allocate(ring->ctx, &ring->buffers[idx], ring->width, ring->height,
                                        ring->drm_format, ring->modifier)) {
+                    ring->buffers[idx].on_release = saved_on_release;
+                    ring->buffers[idx].release_user_data = saved_release_user_data;
                     ring->current_idx = (idx + 1) % WAYWAL_DMABUF_RING_SIZE;
                     ring->buffers[idx].in_use = true;
                     return &ring->buffers[idx];
                 }
+                ring->buffers[idx].on_release = saved_on_release;
+                ring->buffers[idx].release_user_data = saved_release_user_data;
                 break;
             }
         }

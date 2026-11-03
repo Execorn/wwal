@@ -186,6 +186,11 @@ int main(int argc, char **argv)
         "next -o DP-1",
         "prev --output HDMI-A-1",
         "clear #ff00ff -o eDP-1",
+        "color #1e1e2e -o DP-1",
+        "resume -o HDMI-A-1",
+        "unpause",
+        "[transition]\nstagger_delay = 120\n",
+        "[transition]\nstagger_delay_ms = 250\n",
         "unterminated = \"string literal\n[broken.section\nbezier = [1, 2, 3, 4, 5, 6]",
     };
 
@@ -207,6 +212,36 @@ int main(int argc, char **argv)
                 size_t sub_len = (xorshift32(&rng) % len) + 1U;
                 LLVMFuzzerTestOneInput(mutated, sub_len);
             }
+        }
+    }
+
+#ifdef HAVE_WAYWAL_TOML_PARSER
+    {
+        const char *t1 = "[transition]\nstagger_delay = 120\n";
+        waywal_config_t cfg1;
+        if (!waywal_config_parse_string(t1, &cfg1, NULL, 0) ||
+            cfg1.transition.stagger_delay_ms != 120U) {
+            return 1;
+        }
+        const char *t2 = "[transition]\nstagger_delay_ms = 250\n";
+        waywal_config_t cfg2;
+        if (!waywal_config_parse_string(t2, &cfg2, NULL, 0) ||
+            cfg2.transition.stagger_delay_ms != 250U) {
+            return 1;
+        }
+    }
+#endif
+    {
+        cli_options_t o;
+        char *argv_c[] = {"wwal", "color", "#112233"};
+        memset(&o, 0, sizeof(o));
+        if (!cli_parse(3, argv_c, &o) || o.cmd != CLI_CMD_COLOR) {
+            return 1;
+        }
+        char *argv_r[] = {"wwal", "resume", "-o", "DP-1"};
+        memset(&o, 0, sizeof(o));
+        if (!cli_parse(4, argv_r, &o) || o.cmd != CLI_CMD_UNPAUSE) {
+            return 1;
         }
     }
 

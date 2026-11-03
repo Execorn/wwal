@@ -9,6 +9,7 @@
 
 #include <ctype.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
 #include <immintrin.h>
@@ -16,6 +17,7 @@
 #include <math.h>
 #include <png.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,15 +40,81 @@ __attribute__((target("avx2"))) static void swizzle_rgba_to_bgra_avx2(uint8_t *p
     const __m256i mask = _mm256_setr_epi8(2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15, 2,
                                           1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
     size_t i = 0;
+    for (; i + 128 <= num_bytes; i += 128) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(pixels + i));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(pixels + i + 32));
+        __m256i v2 = _mm256_loadu_si256((const __m256i *)(pixels + i + 64));
+        __m256i v3 = _mm256_loadu_si256((const __m256i *)(pixels + i + 96));
+        v0 = _mm256_shuffle_epi8(v0, mask);
+        v1 = _mm256_shuffle_epi8(v1, mask);
+        v2 = _mm256_shuffle_epi8(v2, mask);
+        v3 = _mm256_shuffle_epi8(v3, mask);
+        _mm256_storeu_si256((__m256i *)(pixels + i), v0);
+        _mm256_storeu_si256((__m256i *)(pixels + i + 32), v1);
+        _mm256_storeu_si256((__m256i *)(pixels + i + 64), v2);
+        _mm256_storeu_si256((__m256i *)(pixels + i + 96), v3);
+    }
     for (; i + 32 <= num_bytes; i += 32) {
         __m256i v = _mm256_loadu_si256((const __m256i *)(pixels + i));
         v = _mm256_shuffle_epi8(v, mask);
         _mm256_storeu_si256((__m256i *)(pixels + i), v);
     }
     for (; i + 4 <= num_bytes; i += 4) {
-        uint8_t tmp = pixels[i + 0];
-        pixels[i + 0] = pixels[i + 2];
-        pixels[i + 2] = tmp;
+        uint32_t px;
+        memcpy(&px, pixels + i, 4);
+        px = (px & 0xFF00FF00U) | ((px & 0x00FF0000U) >> 16) | ((px & 0x000000FFU) << 16);
+        memcpy(pixels + i, &px, 4);
+    }
+}
+
+__attribute__((target("ssse3"))) static void swizzle_rgba_to_bgra_ssse3(uint8_t *pixels,
+                                                                        size_t num_bytes)
+{
+    const __m128i mask = _mm_setr_epi8(2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+    size_t i = 0;
+    for (; i + 64 <= num_bytes; i += 64) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(pixels + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(pixels + i + 16));
+        __m128i v2 = _mm_loadu_si128((const __m128i *)(pixels + i + 32));
+        __m128i v3 = _mm_loadu_si128((const __m128i *)(pixels + i + 48));
+        v0 = _mm_shuffle_epi8(v0, mask);
+        v1 = _mm_shuffle_epi8(v1, mask);
+        v2 = _mm_shuffle_epi8(v2, mask);
+        v3 = _mm_shuffle_epi8(v3, mask);
+        _mm_storeu_si128((__m128i *)(pixels + i), v0);
+        _mm_storeu_si128((__m128i *)(pixels + i + 16), v1);
+        _mm_storeu_si128((__m128i *)(pixels + i + 32), v2);
+        _mm_storeu_si128((__m128i *)(pixels + i + 48), v3);
+    }
+    for (; i + 16 <= num_bytes; i += 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(pixels + i));
+        v = _mm_shuffle_epi8(v, mask);
+        _mm_storeu_si128((__m128i *)(pixels + i), v);
+    }
+    for (; i + 4 <= num_bytes; i += 4) {
+        uint32_t px;
+        memcpy(&px, pixels + i, 4);
+        px = (px & 0xFF00FF00U) | ((px & 0x00FF0000U) >> 16) | ((px & 0x000000FFU) << 16);
+        memcpy(pixels + i, &px, 4);
+    }
+}
+#elif defined(__aarch64__) && !defined(WWAL_DISABLE_SIMD)
+#include <arm_neon.h>
+static void swizzle_rgba_to_bgra_neon(uint8_t *pixels, size_t num_bytes)
+{
+    size_t i = 0;
+    for (; i + 64 <= num_bytes; i += 64) {
+        uint8x16x4_t v = vld4q_u8(pixels + i);
+        uint8x16_t tmp = v.val[0];
+        v.val[0] = v.val[2];
+        v.val[2] = tmp;
+        vst4q_u8(pixels + i, v);
+    }
+    for (; i + 4 <= num_bytes; i += 4) {
+        uint32_t px;
+        memcpy(&px, pixels + i, 4);
+        px = (px & 0xFF00FF00U) | ((px & 0x00FF0000U) >> 16) | ((px & 0x000000FFU) << 16);
+        memcpy(pixels + i, &px, 4);
     }
 }
 #endif
@@ -58,11 +126,19 @@ static void swizzle_rgba_to_bgra_inplace(uint8_t *pixels, size_t num_bytes)
         swizzle_rgba_to_bgra_avx2(pixels, num_bytes);
         return;
     }
+    if (__builtin_cpu_supports("ssse3")) {
+        swizzle_rgba_to_bgra_ssse3(pixels, num_bytes);
+        return;
+    }
+#elif defined(__aarch64__) && !defined(WWAL_DISABLE_SIMD)
+    swizzle_rgba_to_bgra_neon(pixels, num_bytes);
+    return;
 #endif
     for (size_t i = 0; i + 4 <= num_bytes; i += 4) {
-        uint8_t tmp = pixels[i + 0];
-        pixels[i + 0] = pixels[i + 2];
-        pixels[i + 2] = tmp;
+        uint32_t px;
+        memcpy(&px, pixels + i, 4);
+        px = (px & 0xFF00FF00U) | ((px & 0x00FF0000U) >> 16) | ((px & 0x000000FFU) << 16);
+        memcpy(pixels + i, &px, 4);
     }
 }
 
@@ -329,7 +405,11 @@ static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
         return false;
     }
 
-    fseek(fp, (long)data_offset, SEEK_SET);
+    if (data_offset < 54 || fseek(fp, (long)data_offset, SEEK_SET) != 0) {
+        free(row_buf);
+        free(pixels);
+        return false;
+    }
 
     for (uint32_t i = 0; i < abs_h; ++i) {
         uint32_t y = flip_y ? (abs_h - 1 - i) : i;
@@ -947,7 +1027,14 @@ static bool g_avif_ready = false;
 static void init_avif_lib(void)
 {
 #ifndef WWAL_DISABLE_AVIF
-    g_avif_handle = dlopen("libavif.so.16", RTLD_LAZY | RTLD_NODELETE);
+    static const char *const avif_sonames[] = {
+        "libavif.so.16", "libavif.so.15", "libavif.so.14", "libavif.so.17", "libavif.so",
+    };
+    for (size_t i = 0; i < sizeof(avif_sonames) / sizeof(avif_sonames[0]); ++i) {
+        g_avif_handle = dlopen(avif_sonames[i], RTLD_LAZY | RTLD_NODELETE);
+        if (g_avif_handle)
+            break;
+    }
     if (!g_avif_handle)
         return;
 
@@ -1276,19 +1363,31 @@ static void svg_parse_dimensions(const char *svg_text, uint32_t *out_w, uint32_t
                     if (*c == ',')
                         *c = ' ';
                 }
-                sscanf(val, "%f %f %f %f", &vx, &vy, &vw, &vh);
+                if (sscanf(val, "%f %f %f %f", &vx, &vy, &vw, &vh) == 4) {
+                    if (!isfinite(vx) || !isfinite(vy) || !isfinite(vw) || !isfinite(vh)) {
+                        vx = 0.0f;
+                        vy = 0.0f;
+                        vw = 0.0f;
+                        vh = 0.0f;
+                    }
+                } else {
+                    vx = 0.0f;
+                    vy = 0.0f;
+                    vw = 0.0f;
+                    vh = 0.0f;
+                }
             }
             if (svg_extract_attr(svg_tag, tag_end, "width", val, sizeof(val))) {
                 if (strchr(val, '%') == NULL) {
                     float wf = strtof(val, NULL);
-                    if (wf > 0.0f && wf <= 16384.0f)
+                    if (isfinite(wf) && wf > 0.0f && wf <= 16384.0f)
                         w = (uint32_t)lroundf(wf);
                 }
             }
             if (svg_extract_attr(svg_tag, tag_end, "height", val, sizeof(val))) {
                 if (strchr(val, '%') == NULL) {
                     float hf = strtof(val, NULL);
-                    if (hf > 0.0f && hf <= 16384.0f)
+                    if (isfinite(hf) && hf > 0.0f && hf <= 16384.0f)
                         h = (uint32_t)lroundf(hf);
                 }
             }
@@ -1773,8 +1872,8 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
         cursor = close_tag + 17;
     }
 
-    float scale_x = (vw > 0.0f) ? ((float)w / vw) : 1.0f;
-    float scale_y = (vh > 0.0f) ? ((float)h / vh) : 1.0f;
+    float scale_x = (vw > 0.0f && isfinite(vw)) ? ((float)w / vw) : 1.0f;
+    float scale_y = (vh > 0.0f && isfinite(vh)) ? ((float)h / vh) : 1.0f;
 
     const char *svg_tag = strcasestr(svg_text, "<svg");
     if (svg_tag) {
@@ -1835,13 +1934,14 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
             if (svg_extract_attr(p, tag_end, "opacity", val, sizeof(val)) ||
                 svg_extract_attr(p, tag_end, "fill-opacity", val, sizeof(val))) {
                 opacity = strtof(val, NULL);
-                if (opacity < 0.0f)
+                if (!isfinite(opacity) || opacity < 0.0f)
                     opacity = 0.0f;
                 if (opacity > 1.0f)
                     opacity = 1.0f;
             }
 
-            if (has_fill && rw > 0.0f && rh > 0.0f) {
+            if (has_fill && isfinite(rx) && isfinite(ry) && isfinite(rw) && isfinite(rh) &&
+                rw > 0.0f && rh > 0.0f) {
                 int x0 = (int)floorf((rx - vx) * scale_x);
                 int y0 = (int)floorf((ry - vy) * scale_y);
                 int x1 = (int)ceilf((rx + rw - vx) * scale_x);
@@ -1900,13 +2000,13 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
             if (svg_extract_attr(p, tag_end, "opacity", val, sizeof(val)) ||
                 svg_extract_attr(p, tag_end, "fill-opacity", val, sizeof(val))) {
                 opacity = strtof(val, NULL);
-                if (opacity < 0.0f)
+                if (!isfinite(opacity) || opacity < 0.0f)
                     opacity = 0.0f;
                 if (opacity > 1.0f)
                     opacity = 1.0f;
             }
 
-            if (has_fill && r > 0.0f) {
+            if (has_fill && isfinite(cx) && isfinite(cy) && isfinite(r) && r > 0.0f) {
                 float pcx = (cx - vx) * scale_x;
                 float pcy = (cy - vy) * scale_y;
                 float prx = r * scale_x;
@@ -2112,6 +2212,8 @@ bool image_load_fd(int fd, raw_image_t *out_img)
         }
         ssize_t n = read(fd, buf + len, cap - len);
         if (n < 0) {
+            if (errno == EINTR)
+                continue;
             free(buf);
             return false;
         }
@@ -2265,8 +2367,10 @@ static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint3
             dst_h = 1;
     }
 
+    static _Atomic uint32_t s_png_seq = 0;
+    uint32_t seq = atomic_fetch_add_explicit(&s_png_seq, 1, memory_order_relaxed);
     char tmp_path[4096];
-    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", filepath, (int)getpid());
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d.%u", filepath, (int)getpid(), seq);
     if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
         return false;
     }
@@ -2378,7 +2482,7 @@ static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint3
     free((void *)row_buf);
     png_destroy_write_struct(&png, &info);
 
-    bool io_ok = (fflush(fp) == 0 && !ferror(fp));
+    bool io_ok = (fflush(fp) == 0 && !ferror(fp) && fsync(fileno(fp)) == 0);
     if (fclose(fp) != 0 || !io_ok) {
         unlink(tmp_path);
         return false;

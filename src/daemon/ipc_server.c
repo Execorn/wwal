@@ -459,10 +459,13 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         return;
     }
 
-    /* Set socket timeouts to prevent stalled client from hanging daemon event loop */
+    /* Set socket timeouts and buffer sizes to optimize IPC throughput */
     struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int buf_size = 262144;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
 
     waywal_ipc_hdr_t req_hdr;
     int attached_fd = -1;
@@ -738,7 +741,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         if (attached_fd >= 0 && fstat(attached_fd, &st) == 0 &&
             (size_t)st.st_size >= min_hdr_size && req_hdr.payload_size >= min_hdr_size &&
             (size_t)st.st_size >= req_hdr.payload_size) {
-            void *mapped = mmap(NULL, req_hdr.payload_size, PROT_READ, MAP_PRIVATE, attached_fd, 0);
+            void *mapped = mmap(NULL, req_hdr.payload_size, PROT_READ | PROT_WRITE, MAP_PRIVATE,
+                                attached_fd, 0);
             if (mapped != MAP_FAILED) {
                 const waywal_img_metadata_t *raw_meta = (const waywal_img_metadata_t *)mapped;
                 uint64_t pixel_bytes =
@@ -780,6 +784,13 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         }
                         meta = (waywal_img_metadata_t *)compat_buf;
                     }
+
+                    /* Enforce null termination on all untrusted struct-embedded string buffers */
+                    meta->filepath[sizeof(meta->filepath) - 1] = '\0';
+                    meta->depth_map_path[sizeof(meta->depth_map_path) - 1] = '\0';
+                    meta->backdrop[sizeof(meta->backdrop) - 1] = '\0';
+                    meta->layer_name[sizeof(meta->layer_name) - 1] = '\0';
+                    meta->battery_policy[sizeof(meta->battery_policy) - 1] = '\0';
 
                     if (valid_strings && meta->num_target_outputs > 64) {
                         valid_strings = false;
@@ -1083,6 +1094,12 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                     s_entry.crop_gravity_y =
                                         meta->has_crop_gravity ? meta->crop_gravity_y : 0.5f;
                                     s_entry.has_crop_gravity = meta->has_crop_gravity ? 1 : 0;
+                                    strncpy(s_entry.depth_map_path, meta->depth_map_path,
+                                            sizeof(s_entry.depth_map_path) - 1);
+                                    s_entry.depth_strength =
+                                        meta->depth_strength > 0.0f ? meta->depth_strength : 1.0f;
+                                    strncpy(s_entry.backdrop, meta->backdrop,
+                                            sizeof(s_entry.backdrop) - 1);
 
                                     if (meta->num_target_outputs > 0 &&
                                         !extra_has_wildcard(
@@ -1191,12 +1208,34 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         bool has_extra_targets = false;
         uint32_t matched_count = 0;
 
-        if (req_hdr.payload_size >= sizeof(waywal_video_payload_t)) {
-            if (read_exact(client_fd, &vpay, sizeof(vpay))) {
+        const size_t min_vpay = offsetof(waywal_video_payload_t, volume);
+        if (req_hdr.payload_size >= min_vpay) {
+            size_t vpay_size_to_read = req_hdr.payload_size >= sizeof(waywal_video_payload_t)
+                                           ? sizeof(waywal_video_payload_t)
+                                           : min_vpay;
+            if (vpay_size_to_read < sizeof(waywal_video_payload_t)) {
+                vpay.volume = -1.0f;
+                vpay.mute_on_audio = false;
+            }
+            if (read_exact(client_fd, &vpay, vpay_size_to_read)) {
                 vpay.filepath[sizeof(vpay.filepath) - 1] = '\0';
                 has_vpay = true;
 
-                size_t raw_extra_len = req_hdr.payload_size - sizeof(waywal_video_payload_t);
+                if (isfinite(vpay.volume) && vpay.volume >= 0.0f) {
+                    float clamped = vpay.volume > 1.0f ? 1.0f : vpay.volume;
+                    state->audio_volume = clamped;
+                    if (state->audio_fft) {
+                        waywal_audio_fft_set_volume(state->audio_fft, clamped);
+                    }
+                }
+                if (vpay.mute_on_audio) {
+                    state->mute_on_audio = true;
+                    if (state->audio_fft) {
+                        waywal_audio_fft_set_mute_on_audio(state->audio_fft, true);
+                    }
+                }
+
+                size_t raw_extra_len = req_hdr.payload_size - vpay_size_to_read;
                 if (vpay.num_target_outputs > 0 && vpay.num_target_outputs <= 64 &&
                     raw_extra_len > 0 && raw_extra_len <= 4096) {
                     if (read_exact(client_fd, extra_buf, raw_extra_len)) {
@@ -1243,12 +1282,17 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             }
             ok = false;
         } else {
-            bool shared_existing_ve = (has_extra_targets && has_vpay && attached_fd < 0 &&
-                                       state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED &&
-                                       state->video_engine.filepath[0] != '\0' &&
-                                       strcmp(state->video_engine.filepath, vpay.filepath) == 0);
+            bool shared_existing_ve =
+                (has_extra_targets && has_vpay &&
+                 state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED &&
+                 state->video_engine.filepath[0] != '\0' && vpay.filepath[0] != '\0' &&
+                 strcmp(state->video_engine.filepath, vpay.filepath) == 0);
 
             if (shared_existing_ve) {
+                if (attached_fd >= 0) {
+                    close(attached_fd);
+                    attached_fd = -1;
+                }
                 const char *ptr = extra_buf;
                 size_t remaining = extra_len;
                 for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0; ++i) {
@@ -1399,6 +1443,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     if (fstat(attached_fd, &st) == 0 && st.st_size > 0) {
                         ok = video_engine_load_mem(ve, attached_fd, (size_t)st.st_size, target_out);
                         attached_fd = -1;
+                        if (ok && has_vpay && vpay.filepath[0] != '\0') {
+                            snprintf(ve->filepath, sizeof(ve->filepath), "%s", vpay.filepath);
+                        }
                     } else {
                         close(attached_fd);
                         attached_fd = -1;
@@ -1466,6 +1513,10 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 s_entry.kind = WAYWAL_CONTENT_VIDEO;
                 strncpy(s_entry.media_path, vpay.filepath, sizeof(s_entry.media_path) - 1);
                 s_entry.scaling = (waywal_scaling_mode_t)vpay.scaling_mode;
+                s_entry.video_speed = vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
+                s_entry.loop_count = vpay.loop_count;
+                s_entry.volume = vpay.volume;
+                s_entry.mute_on_audio = vpay.mute_on_audio;
                 if (has_extra_targets) {
                     const char *ptr = extra_buf;
                     size_t rem = extra_len;
@@ -1669,7 +1720,16 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             req_hdr.payload_size < sizeof(spay) ? req_hdr.payload_size : sizeof(spay);
         if (req_hdr.payload_size >= min_spay && req_hdr.payload_size <= sizeof(spay)) {
             if (read_exact(client_fd, &spay, read_spay)) {
+                if (read_spay < sizeof(spay)) {
+                    memset((uint8_t *)&spay + read_spay, 0, sizeof(spay) - read_spay);
+                }
                 spay.path[sizeof(spay.path) - 1] = '\0';
+                if (spay.num_target_outputs > 16) {
+                    spay.num_target_outputs = 16;
+                }
+                for (uint32_t i = 0; i < 16; ++i) {
+                    spay.target_outputs[i][sizeof(spay.target_outputs[i]) - 1] = '\0';
+                }
                 if (spay.auto_day_night != 0) {
                     bool adn = (spay.auto_day_night == 1u);
                     state->config.solar.auto_day_night = adn;
@@ -1961,13 +2021,46 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     case WAYWAL_REQ_SHADER: {
         waywal_shader_payload_t spay;
         bool ok = false;
-        if (req_hdr.payload_size >= sizeof(spay)) {
-            if (read_exact(client_fd, &spay, sizeof(spay))) {
-                if (req_hdr.payload_size > sizeof(spay)) {
-                    ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(spay));
+        const size_t min_spay = offsetof(waywal_shader_payload_t, volume);
+        if (req_hdr.payload_size >= min_spay) {
+            size_t to_read = req_hdr.payload_size >= sizeof(spay) ? sizeof(spay) : min_spay;
+            if (to_read < sizeof(spay)) {
+                spay.volume = -1.0f;
+                spay.mute_on_audio = false;
+                spay.speed = 1.0f;
+                spay.backdrop[0] = '\0';
+            }
+            if (read_exact(client_fd, &spay, to_read)) {
+                if (req_hdr.payload_size > to_read) {
+                    ipc_drain_bytes(client_fd, req_hdr.payload_size - to_read);
                 }
                 spay.output[sizeof(spay.output) - 1] = '\0';
                 spay.shader_path[sizeof(spay.shader_path) - 1] = '\0';
+                spay.backdrop[sizeof(spay.backdrop) - 1] = '\0';
+
+                if (isfinite(spay.volume) && spay.volume >= 0.0f) {
+                    float clamped = spay.volume > 1.0f ? 1.0f : spay.volume;
+                    state->audio_volume = clamped;
+                    if (state->audio_fft) {
+                        waywal_audio_fft_set_volume(state->audio_fft, clamped);
+                    }
+                }
+                if (spay.mute_on_audio) {
+                    state->mute_on_audio = true;
+                    if (state->audio_fft) {
+                        waywal_audio_fft_set_mute_on_audio(state->audio_fft, true);
+                    }
+                }
+                if (spay.backdrop[0] != '\0') {
+                    state->backdrop_auto_blur = (strcasecmp(spay.backdrop, "auto-blur") == 0);
+                    if (strcasecmp(spay.backdrop, "none") == 0) {
+                        state->backdrop_path[0] = '\0';
+                    } else if (!state->backdrop_auto_blur) {
+                        strncpy(state->backdrop_path, spay.backdrop,
+                                sizeof(state->backdrop_path) - 1);
+                        state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+                    }
+                }
 
                 if (state->power_gov) {
                     waywal_power_governor_set_global_reason(state->power_gov,
@@ -1984,6 +2077,10 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     s_entry.target_fps = spay.fps > 0 ? spay.fps : 60;
                     s_entry.audio_reactive = spay.audio_reactive;
                     s_entry.scaling = (waywal_scaling_mode_t)spay.scaling_mode;
+                    s_entry.video_speed = spay.speed > 0.01f ? spay.speed : 1.0f;
+                    s_entry.volume = spay.volume;
+                    s_entry.mute_on_audio = spay.mute_on_audio;
+                    strncpy(s_entry.backdrop, spay.backdrop, sizeof(s_entry.backdrop) - 1);
                     if (spay.output[0] != '\0' && strchr(spay.output, ',') != NULL) {
                         char out_copy[sizeof(spay.output)];
                         strncpy(out_copy, spay.output, sizeof(out_copy) - 1);
@@ -2035,11 +2132,55 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         const size_t min_wpay = offsetof(waywal_workshop_payload_t, extract_theme);
         size_t read_wpay =
             req_hdr.payload_size < sizeof(wpay) ? req_hdr.payload_size : sizeof(wpay);
-        if (req_hdr.payload_size >= min_wpay && req_hdr.payload_size <= sizeof(wpay)) {
+        if (req_hdr.payload_size >= min_wpay) {
             if (read_exact(client_fd, &wpay, read_wpay)) {
+                if (read_wpay < sizeof(wpay)) {
+                    memset((uint8_t *)&wpay + read_wpay, 0, sizeof(wpay) - read_wpay);
+                    wpay.volume = -1.0f;
+                }
+                if (req_hdr.payload_size > read_wpay) {
+                    ipc_drain_bytes(client_fd, req_hdr.payload_size - read_wpay);
+                }
                 wpay.output[sizeof(wpay.output) - 1] = '\0';
                 wpay.workshop_dir[sizeof(wpay.workshop_dir) - 1] = '\0';
                 wpay.prop_overrides[sizeof(wpay.prop_overrides) - 1] = '\0';
+                wpay.backdrop[sizeof(wpay.backdrop) - 1] = '\0';
+                wpay.layer_name[sizeof(wpay.layer_name) - 1] = '\0';
+
+                if (isfinite(wpay.volume) && wpay.volume >= 0.0f) {
+                    float clamped = wpay.volume > 1.0f ? 1.0f : wpay.volume;
+                    state->audio_volume = clamped;
+                    if (state->audio_fft) {
+                        waywal_audio_fft_set_volume(state->audio_fft, clamped);
+                    }
+                }
+                if (wpay.mute_on_audio) {
+                    state->mute_on_audio = true;
+                    if (state->audio_fft) {
+                        waywal_audio_fft_set_mute_on_audio(state->audio_fft, true);
+                    }
+                }
+                if (wpay.backdrop[0] != '\0') {
+                    state->backdrop_auto_blur = (strcasecmp(wpay.backdrop, "auto-blur") == 0);
+                    if (strcasecmp(wpay.backdrop, "none") == 0) {
+                        state->backdrop_path[0] = '\0';
+                    } else if (!state->backdrop_auto_blur) {
+                        strncpy(state->backdrop_path, wpay.backdrop,
+                                sizeof(state->backdrop_path) - 1);
+                        state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+                    }
+                }
+                if (wpay.layer_name[0] != '\0') {
+                    state->use_bottom_layer = (strcasecmp(wpay.layer_name, "bottom") == 0);
+                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                        if (out->layer_surface && out->surface) {
+                            zwlr_layer_surface_v1_set_layer(
+                                out->layer_surface, state->use_bottom_layer
+                                                        ? ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM
+                                                        : ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND);
+                        }
+                    }
+                }
 
                 ok = daemon_activate_workshop(state, &wpay);
                 if (ok && !wpay.no_cache) {
@@ -2054,6 +2195,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     s_entry.target_fps = wpay.fps > 0 ? wpay.fps : 60;
                     s_entry.audio_reactive = wpay.audio_reactive;
                     s_entry.scaling = (waywal_scaling_mode_t)wpay.scaling_mode;
+                    s_entry.volume = wpay.volume;
+                    s_entry.mute_on_audio = wpay.mute_on_audio;
+                    strncpy(s_entry.backdrop, wpay.backdrop, sizeof(s_entry.backdrop) - 1);
                     if (wpay.output[0] != '\0' && strchr(wpay.output, ',') != NULL) {
                         char out_copy[sizeof(wpay.output)];
                         strncpy(out_copy, wpay.output, sizeof(out_copy) - 1);

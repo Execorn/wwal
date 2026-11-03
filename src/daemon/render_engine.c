@@ -112,9 +112,16 @@ bool render_engine_copy_bo(render_engine_t *re, dmabuf_bo_t *dst_bo, dmabuf_bo_t
         size_t row_bytes = (size_t)dst_bo->width * 4u;
         if (src_ptr && src_ptr != MAP_FAILED && dst_ptr && dst_ptr != MAP_FAILED &&
             (size_t)src_stride >= row_bytes && (size_t)dst_stride >= row_bytes) {
-            for (uint32_t y = 0; y < dst_bo->height; ++y) {
-                memcpy((uint8_t *)dst_ptr + (size_t)y * dst_stride,
-                       (const uint8_t *)src_ptr + (size_t)y * src_stride, row_bytes);
+            if (src_stride == row_bytes && dst_stride == row_bytes) {
+                memcpy(dst_ptr, src_ptr, row_bytes * (size_t)dst_bo->height);
+            } else {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (uint32_t y = 0; y < dst_bo->height; ++y) {
+                    memcpy((uint8_t *)dst_ptr + (size_t)y * dst_stride,
+                           (const uint8_t *)src_ptr + (size_t)y * src_stride, row_bytes);
+                }
             }
             gbm_bo_unmap(dst_bo->gbm_bo, map_dst);
             gbm_bo_unmap(src_bo->gbm_bo, map_src);
@@ -211,6 +218,9 @@ bool render_engine_execute_transition(render_engine_t *re, dmabuf_bo_t *target_b
         if (stride_old != row_bytes) {
             packed_old = (uint32_t *)malloc(row_bytes * (size_t)target_bo->height);
             if (packed_old) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
                 for (uint32_t y = 0; y < target_bo->height; ++y) {
                     memcpy((uint8_t *)packed_old + (size_t)y * row_bytes,
                            (const uint8_t *)map_old + (size_t)y * stride_old, row_bytes);
@@ -223,6 +233,9 @@ bool render_engine_execute_transition(render_engine_t *re, dmabuf_bo_t *target_b
         if (inputs_ready && stride_new != row_bytes) {
             packed_new = (uint32_t *)malloc(row_bytes * (size_t)target_bo->height);
             if (packed_new) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
                 for (uint32_t y = 0; y < target_bo->height; ++y) {
                     memcpy((uint8_t *)packed_new + (size_t)y * row_bytes,
                            (const uint8_t *)map_new + (size_t)y * stride_new, row_bytes);

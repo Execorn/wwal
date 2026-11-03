@@ -372,6 +372,14 @@ typedef struct we_scene {
         bool owns_egl;
     } imported_bos[32];
     size_t num_imported_bos;
+
+    /* GL state caching to eliminate redundant per-frame driver state changes */
+    int32_t current_gl_blend_mode;
+    uint32_t current_gl_prog;
+    uint32_t current_vao;
+    uint32_t current_fbo;
+    uint32_t current_vp_w;
+    uint32_t current_vp_h;
 } we_scene_t;
 
 /* Parses project.json from memory or directory */

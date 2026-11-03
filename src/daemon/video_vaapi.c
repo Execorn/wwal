@@ -149,6 +149,9 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
     /* Avoid eagerly faulting libnvidia-ptxjitcompiler.so (~21.5 MiB PSS) into host RAM */
     setenv("CUDA_MODULE_LOADING", "LAZY", 0);
     setenv("CUDA_DISABLE_PERF_BOOST", "1", 0);
+    /* Prevent nvidia_drv_video.so from hoarding up to 128 MiB of detached backing images */
+    setenv("NVD_MAX_DETACHED_BACKING_IMAGES", "0", 0);
+    setenv("NVD_MAX_DETACHED_BACKING_IMAGE_BYTES", "0", 0);
 
     const char *candidate_nodes[] = {NULL, "/dev/dri/renderD128", "/dev/dri/renderD129"};
     bool found = false;
@@ -257,31 +260,16 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
         max_refs = 8;
     }
 
-    if (!allow_direct_nv12) {
-        if (codec == WAYWAL_CODEC_VP9 || codec == WAYWAL_CODEC_AV1) {
-            dec->num_surfaces = 9;
-        } else {
-            bool no_reorder =
-                (codec == WAYWAL_CODEC_H264 && dec->cached_sps.valid &&
-                 (dec->cached_sps.profile_idc == 66 || dec->cached_sps.constraint_set1_flag != 0 ||
-                  dec->cached_sps.num_ref_frames <= 1 ||
-                  dec->cached_sps.pic_order_cnt_type == 2)) ||
-                (codec == WAYWAL_CODEC_HEVC && dec->cached_hevc_sps.valid &&
-                 dec->cached_hevc_sps.sps_max_num_reorder_pics == 0);
-            uint32_t min_surf = no_reorder ? 3U : 5U;
-            dec->num_surfaces = max_refs + (no_reorder ? 2U : 3U);
-            if (dec->num_surfaces < min_surf)
-                dec->num_surfaces = min_surf;
-            if (dec->num_surfaces > 9U)
-                dec->num_surfaces = 9U;
-        }
-    } else {
-        dec->num_surfaces = max_refs + 4;
-        if (dec->num_surfaces < 6)
-            dec->num_surfaces = 6;
+    /* Allocate sufficient surfaces: 16 DPB references + 6 reorder capacity + 4 presentation
+     * headroom = 26 */
+    uint32_t needed_surfaces = max_refs + 6U + 4U;
+    if (needed_surfaces < 26U) {
+        needed_surfaces = 26U;
     }
-    if (dec->num_surfaces > WAYWAL_VA_SURFACE_POOL_SIZE)
-        dec->num_surfaces = WAYWAL_VA_SURFACE_POOL_SIZE;
+    if (needed_surfaces > WAYWAL_VA_SURFACE_POOL_SIZE) {
+        needed_surfaces = WAYWAL_VA_SURFACE_POOL_SIZE;
+    }
+    dec->num_surfaces = needed_surfaces;
 
     bool use_10bit = is_10bit_stream;
     uint32_t rt_format = use_10bit ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
@@ -618,6 +606,7 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
     /* Pick the lowest-index free surface not in DPB or held by reorder/compositor
      * so nvidia_drv_video's lazy direct_realiseSurface allocates VRAM only for the
      * active working set rather than touching all pool_size handles. */
+    bool surface_found = false;
     for (uint32_t idx = 0; idx < pool_size; ++idx) {
         VASurfaceID s = dec->surfaces[idx];
         bool in_dpb = false;
@@ -640,8 +629,53 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         bool compositor_busy = dec->surface_busy_mask && dec->surface_busy_mask[idx];
         if (!in_dpb && !compositor_busy) {
             dec->current_surface_idx = idx;
+            surface_found = true;
             break;
         }
+    }
+
+    if (!surface_found) {
+        /* Prefer any non-compositor-busy slot and invalidate/evict stale DPB reference */
+        for (uint32_t i = 0; i < pool_size; ++i) {
+            uint32_t cand = (dec->current_surface_idx + 1 + i) % pool_size;
+            bool compositor_busy = dec->surface_busy_mask && dec->surface_busy_mask[cand];
+            if (!compositor_busy) {
+                VASurfaceID s = dec->surfaces[cand];
+                if (!is_vp9 && !is_av1) {
+                    for (size_t d = 0; d < dec->dpb.count; ++d) {
+                        if (dec->dpb.entries[d].surface == s) {
+                            if (d + 1 < dec->dpb.count) {
+                                memmove(&dec->dpb.entries[d], &dec->dpb.entries[d + 1],
+                                        (dec->dpb.count - d - 1) * sizeof(h264_dpb_entry_t));
+                            }
+                            dec->dpb.count--;
+                            break;
+                        }
+                    }
+                } else if (is_vp9) {
+                    for (int r = 0; r < 8; ++r) {
+                        if (dec->vp9_ref_frames[r] == s) {
+                            dec->vp9_ref_frames[r] = VA_INVALID_SURFACE;
+                        }
+                    }
+                } else if (is_av1) {
+                    for (int r = 0; r < 8; ++r) {
+                        if (dec->av1_ref_frames[r] == s) {
+                            dec->av1_ref_frames[r] = VA_INVALID_SURFACE;
+                        }
+                    }
+                }
+                dec->current_surface_idx = cand;
+                surface_found = true;
+                break;
+            }
+        }
+    }
+
+    if (!surface_found) {
+        WAYWAL_LOG_WARN("All %u VA surfaces are busy (presentation), failing frame decode cleanly",
+                        pool_size);
+        return false;
     }
 
     VASurfaceID target = dec->surfaces[dec->current_surface_idx];
@@ -1277,10 +1311,14 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                 if (ref_surf != VA_INVALID_SURFACE) {
                     target = ref_surf;
                     display_target = ref_surf;
+                    continue;
                 }
-                continue;
+                WAYWAL_LOG_WARN("VP9 show_existing references unpopulated slot %u",
+                                show_existing_idx);
+                return false;
             }
 
+            bool vp9_surf_found = false;
             for (uint32_t idx = 0; idx < pool_size; ++idx) {
                 VASurfaceID s = dec->surfaces[idx];
                 bool in_dpb = false;
@@ -1294,17 +1332,36 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                 if (!in_dpb && !compositor_busy) {
                     dec->current_surface_idx = idx;
                     target = s;
+                    vp9_surf_found = true;
                     break;
                 }
+            }
+            if (!vp9_surf_found) {
+                for (uint32_t i = 0; i < pool_size; ++i) {
+                    uint32_t cand = (dec->current_surface_idx + 1 + i) % pool_size;
+                    bool compositor_busy = dec->surface_busy_mask && dec->surface_busy_mask[cand];
+                    if (!compositor_busy) {
+                        dec->current_surface_idx = cand;
+                        target = dec->surfaces[cand];
+                        for (int r = 0; r < 8; ++r) {
+                            if (dec->vp9_ref_frames[r] == target) {
+                                dec->vp9_ref_frames[r] = VA_INVALID_SURFACE;
+                            }
+                        }
+                        vp9_surf_found = true;
+                        break;
+                    }
+                }
+            }
+            if (!vp9_surf_found) {
+                WAYWAL_LOG_WARN(
+                    "All %u VA surfaces are busy (presentation), failing VP9 decode cleanly",
+                    pool_size);
+                return false;
             }
 
             if (sub_is_idr) {
                 is_idr_pic = true;
-            }
-            for (int i = 0; i < 8; ++i) {
-                if (refresh_flags & (1U << i)) {
-                    dec->vp9_ref_frames[i] = target;
-                }
             }
             if (pic_param.pic_fields.bits.show_frame != 0) {
                 display_target = target;
@@ -1341,7 +1398,16 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                     vaDestroyBuffer(dec->va_display, sf_bufs[b]);
                 }
             }
-            vaEndPicture(dec->va_display, dec->va_context);
+            VAStatus end_st = vaEndPicture(dec->va_display, dec->va_context);
+            if (end_st != VA_STATUS_SUCCESS) {
+                WAYWAL_LOG_ERR("vaEndPicture failed: %s", vaErrorStr(end_st));
+                return false;
+            }
+            for (int i = 0; i < 8; ++i) {
+                if (refresh_flags & (1U << i)) {
+                    dec->vp9_ref_frames[i] = target;
+                }
+            }
         }
 
         target = display_target;
@@ -1562,6 +1628,11 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
     dec->last_decoded_is_idr = is_idr_pic;
     dec->frame_num++;
 
+    if (target == VA_INVALID_SURFACE) {
+        WAYWAL_LOG_WARN("Decoded surface target is invalid");
+        return false;
+    }
+
     *out_surface = target;
     dec->current_surface_idx = (dec->current_surface_idx + 1) % pool_size;
     return true;
@@ -1732,26 +1803,28 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
     memset(&prime_desc, 0, sizeof(prime_desc));
 
     VAStatus st;
-    if (!dec->has_vpp && !dec->is_nvidia_vaapi) {
-        /* Intel iHD/i965 and AMD radeonsi export a single multi-planar NV12/P010 descriptor
-         * via COMPOSED_LAYERS that Wayland compositors scan out directly on KMS YUV planes. */
+    uint32_t export_mode = dec->export_layer_mode;
+    if (export_mode != 0) {
         st = vaExportSurfaceHandle(dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                                   VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
-                                   &prime_desc);
-        if (st != VA_STATUS_SUCCESS) {
-            st = vaExportSurfaceHandle(
-                dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &prime_desc);
-        }
+                                   VA_EXPORT_SURFACE_READ_ONLY | export_mode, &prime_desc);
     } else {
-        /* nvidia_drv_video.so only supports VA_EXPORT_SURFACE_SEPARATE_LAYERS for NV12/P010 */
+        uint32_t preferred = (!dec->has_vpp && !dec->is_nvidia_vaapi)
+                                 ? VA_EXPORT_SURFACE_COMPOSED_LAYERS
+                                 : VA_EXPORT_SURFACE_SEPARATE_LAYERS;
+        uint32_t fallback = (preferred == VA_EXPORT_SURFACE_COMPOSED_LAYERS)
+                                ? VA_EXPORT_SURFACE_SEPARATE_LAYERS
+                                : VA_EXPORT_SURFACE_COMPOSED_LAYERS;
         st = vaExportSurfaceHandle(dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                                   VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
-                                   &prime_desc);
-        if (st != VA_STATUS_SUCCESS) {
-            st = vaExportSurfaceHandle(
-                dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS, &prime_desc);
+                                   VA_EXPORT_SURFACE_READ_ONLY | preferred, &prime_desc);
+        if (st == VA_STATUS_SUCCESS) {
+            dec->export_layer_mode = preferred;
+        } else {
+            st = vaExportSurfaceHandle(dec->va_display, surface,
+                                       VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                       VA_EXPORT_SURFACE_READ_ONLY | fallback, &prime_desc);
+            if (st == VA_STATUS_SUCCESS) {
+                dec->export_layer_mode = fallback;
+            }
         }
     }
 
@@ -1780,7 +1853,7 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
     }
 
     uint32_t plane_idx = 0;
-    bool obj_used[256] = {false};
+    uint32_t obj_used_mask = 0;
     for (uint32_t l = 0; l < prime_desc.num_layers && plane_idx < 4; ++l) {
         for (uint32_t p = 0; p < prime_desc.layers[l].num_planes && plane_idx < 4; ++p) {
             uint32_t obj_idx = prime_desc.layers[l].object_index[p];
@@ -1789,15 +1862,15 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
                 out_frame->modifiers[plane_idx] = prime_desc.objects[obj_idx].drm_format_modifier;
                 out_frame->offsets[plane_idx] = prime_desc.layers[l].offset[p];
                 out_frame->strides[plane_idx] = prime_desc.layers[l].pitch[p];
-                if (obj_idx < 256)
-                    obj_used[obj_idx] = true;
+                if (obj_idx < 32)
+                    obj_used_mask |= (1U << obj_idx);
                 plane_idx++;
             }
         }
     }
 
     for (uint32_t i = 0; i < prime_desc.num_objects; ++i) {
-        if ((i >= 256 || !obj_used[i]) && prime_desc.objects[i].fd >= 0) {
+        if ((i >= 32 || !(obj_used_mask & (1U << i))) && prime_desc.objects[i].fd >= 0) {
             close(prime_desc.objects[i].fd);
         }
     }

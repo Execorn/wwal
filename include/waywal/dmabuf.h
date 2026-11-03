@@ -36,6 +36,8 @@ typedef struct dmabuf_bo {
     struct wl_buffer *wl_buffer;
     void *egl_image;
     void *map_data;
+    void (*on_release)(void *user_data, struct dmabuf_bo *bo);
+    void *release_user_data;
     uint32_t gl_tex;
     bool is_10bit;
     bool in_use;

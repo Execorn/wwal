@@ -156,6 +156,22 @@ static void scan_path_recursive_internal(slideshow_engine_t *ss, const char *pat
             char full_path[4096];
             snprintf(full_path, sizeof(full_path), "%s/%s", path, ent->d_name);
 
+#ifdef _DIRENT_HAVE_D_TYPE
+            if (ent->d_type == DT_REG) {
+                if (has_supported_media_extension(ent->d_name)) {
+                    add_file_to_list(ss, full_path);
+                }
+                continue;
+            } else if (ent->d_type == DT_DIR) {
+                if (is_workshop_directory(full_path)) {
+                    add_file_to_list(ss, full_path);
+                } else if (ss->recursive) {
+                    scan_path_recursive_internal(ss, full_path, depth + 1);
+                }
+                continue;
+            }
+#endif
+
             struct stat child_st;
             if (stat(full_path, &child_st) == 0) {
                 if (S_ISDIR(child_st.st_mode)) {
@@ -191,6 +207,25 @@ static int cmp_path_desc(const void *a, const void *b)
     const char *pa = *(const char *const *)a;
     const char *pb = *(const char *const *)b;
     return strcmp(pb, pa);
+}
+
+typedef struct {
+    char *path;
+    time_t sec;
+    long nsec;
+} path_mtime_entry_t;
+
+static int cmp_mtime_entry(const void *a, const void *b)
+{
+    const path_mtime_entry_t *ea = (const path_mtime_entry_t *)a;
+    const path_mtime_entry_t *eb = (const path_mtime_entry_t *)b;
+    if (ea->sec != eb->sec) {
+        return (ea->sec > eb->sec) ? -1 : 1;
+    }
+    if (ea->nsec != eb->nsec) {
+        return (ea->nsec > eb->nsec) ? -1 : 1;
+    }
+    return strcmp(ea->path, eb->path);
 }
 
 static int cmp_path_mtime(const void *a, const void *b)
@@ -247,9 +282,31 @@ static void apply_sort_or_shuffle(slideshow_engine_t *ss)
     case WAYWAL_SORT_DESCENDING:
         qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_desc);
         break;
-    case WAYWAL_SORT_MTIME:
-        qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_mtime);
+    case WAYWAL_SORT_MTIME: {
+        path_mtime_entry_t *entries =
+            (path_mtime_entry_t *)malloc(ss->num_files * sizeof(path_mtime_entry_t));
+        if (entries) {
+            for (size_t i = 0; i < ss->num_files; ++i) {
+                entries[i].path = ss->file_list[i];
+                struct stat st;
+                if (stat(ss->file_list[i], &st) == 0) {
+                    entries[i].sec = st.st_mtim.tv_sec;
+                    entries[i].nsec = st.st_mtim.tv_nsec;
+                } else {
+                    entries[i].sec = 0;
+                    entries[i].nsec = 0;
+                }
+            }
+            qsort(entries, ss->num_files, sizeof(path_mtime_entry_t), cmp_mtime_entry);
+            for (size_t i = 0; i < ss->num_files; ++i) {
+                ss->file_list[i] = entries[i].path;
+            }
+            free(entries);
+        } else {
+            qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_mtime);
+        }
         break;
+    }
     case WAYWAL_SORT_ASCENDING:
     default:
         qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_asc);

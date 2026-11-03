@@ -13,11 +13,35 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+static uint32_t get_next_atomic_seq(void)
+{
+    static _Atomic uint32_t s_seq = 0;
+    return atomic_fetch_add_explicit(&s_seq, 1, memory_order_relaxed);
+}
+
+typedef struct {
+    char output_name[64];
+    waywal_content_kind_t kind;
+    char media_path[4096];
+    uint32_t solid_color;
+    waywal_scaling_mode_t scaling;
+    waywal_filter_mode_t filter;
+    bool ten_bit;
+    uint32_t target_fps;
+    uint32_t slideshow_interval_sec;
+    bool audio_reactive;
+    char prop_overrides[2048];
+    float crop_gravity_x;
+    float crop_gravity_y;
+    bool has_crop_gravity;
+} waywal_output_saved_state_v4_t;
 
 static bool ensure_parent_dirs(const char *file_path)
 {
@@ -183,24 +207,34 @@ bool waywal_state_store_save_at(const waywal_state_store_t *store, const char *f
         return false;
     }
 
+    uint32_t seq = get_next_atomic_seq();
     char tmp_path[WAYWAL_PATH_MAX];
-    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", file_path, (int)getpid());
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d.%u", file_path, (int)getpid(), seq);
     if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
         return false;
     }
 
-    waywal_state_store_t snapshot = *store;
-    snapshot.magic = WAYWAL_STATE_MAGIC;
-    snapshot.version = WAYWAL_STATE_VERSION;
-    snapshot.reserved = 0;
+    waywal_state_store_t *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot) {
+        return false;
+    }
+    *snapshot = *store;
+    snapshot->magic = WAYWAL_STATE_MAGIC;
+    snapshot->version = WAYWAL_STATE_VERSION;
+    snapshot->reserved = 0;
 
     int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
+        free(snapshot);
         return false;
     }
 
-    bool ok = write_all_bytes(fd, &snapshot, sizeof(snapshot));
+    bool ok = write_all_bytes(fd, snapshot, sizeof(*snapshot));
+    if (ok && fsync(fd) != 0) {
+        ok = false;
+    }
     close(fd);
+    free(snapshot);
 
     if (!ok) {
         unlink(tmp_path);
@@ -225,25 +259,87 @@ bool waywal_state_store_load_at(waywal_state_store_t *store, const char *file_pa
         return false;
     }
 
-    waywal_state_store_t loaded;
-    bool ok = read_all_bytes(fd, &loaded, sizeof(loaded));
+    uint32_t hdr[4] = {0};
+    if (!read_all_bytes(fd, hdr, sizeof(hdr))) {
+        close(fd);
+        return false;
+    }
+
+    if (hdr[0] != WAYWAL_STATE_MAGIC || hdr[2] > WAYWAL_STATE_MAX_OUTPUTS) {
+        close(fd);
+        return false;
+    }
+
+    waywal_state_store_t *loaded = calloc(1, sizeof(*loaded));
+    if (!loaded) {
+        close(fd);
+        return false;
+    }
+
+    loaded->magic = hdr[0];
+    loaded->version = WAYWAL_STATE_VERSION;
+    loaded->count = hdr[2];
+    loaded->reserved = hdr[3];
+
+    if (hdr[1] == WAYWAL_STATE_VERSION) {
+        if (!read_all_bytes(fd, loaded->outputs, sizeof(loaded->outputs))) {
+            free(loaded);
+            close(fd);
+            return false;
+        }
+    } else if (hdr[1] == 4U) {
+        waywal_output_saved_state_v4_t v4_outs[WAYWAL_STATE_MAX_OUTPUTS];
+        memset(v4_outs, 0, sizeof(v4_outs));
+        if (!read_all_bytes(fd, v4_outs, sizeof(v4_outs))) {
+            free(loaded);
+            close(fd);
+            return false;
+        }
+
+        for (uint32_t i = 0; i < loaded->count; ++i) {
+            memcpy(loaded->outputs[i].output_name, v4_outs[i].output_name,
+                   sizeof(loaded->outputs[i].output_name));
+            loaded->outputs[i].kind = v4_outs[i].kind;
+            memcpy(loaded->outputs[i].media_path, v4_outs[i].media_path,
+                   sizeof(loaded->outputs[i].media_path));
+            loaded->outputs[i].solid_color = v4_outs[i].solid_color;
+            loaded->outputs[i].scaling = v4_outs[i].scaling;
+            loaded->outputs[i].filter = v4_outs[i].filter;
+            loaded->outputs[i].ten_bit = v4_outs[i].ten_bit;
+            loaded->outputs[i].target_fps = v4_outs[i].target_fps;
+            loaded->outputs[i].slideshow_interval_sec = v4_outs[i].slideshow_interval_sec;
+            loaded->outputs[i].audio_reactive = v4_outs[i].audio_reactive;
+            memcpy(loaded->outputs[i].prop_overrides, v4_outs[i].prop_overrides,
+                   sizeof(loaded->outputs[i].prop_overrides));
+            loaded->outputs[i].crop_gravity_x = v4_outs[i].crop_gravity_x;
+            loaded->outputs[i].crop_gravity_y = v4_outs[i].crop_gravity_y;
+            loaded->outputs[i].has_crop_gravity = v4_outs[i].has_crop_gravity;
+            loaded->outputs[i].depth_map_path[0] = '\0';
+            loaded->outputs[i].depth_strength = 1.0f;
+            loaded->outputs[i].backdrop[0] = '\0';
+            loaded->outputs[i].video_speed = 1.0f;
+            loaded->outputs[i].loop_count = 0;
+            loaded->outputs[i].volume = 1.0f;
+            loaded->outputs[i].mute_on_audio = false;
+        }
+    } else {
+        free(loaded);
+        close(fd);
+        return false;
+    }
+
     close(fd);
 
-    if (!ok) {
-        return false;
-    }
-    if (loaded.magic != WAYWAL_STATE_MAGIC || loaded.version != WAYWAL_STATE_VERSION ||
-        loaded.count > WAYWAL_STATE_MAX_OUTPUTS) {
-        return false;
-    }
-
-    for (uint32_t i = 0; i < loaded.count; ++i) {
-        loaded.outputs[i].output_name[sizeof(loaded.outputs[i].output_name) - 1] = '\0';
-        loaded.outputs[i].media_path[sizeof(loaded.outputs[i].media_path) - 1] = '\0';
-        loaded.outputs[i].prop_overrides[sizeof(loaded.outputs[i].prop_overrides) - 1] = '\0';
+    for (uint32_t i = 0; i < loaded->count; ++i) {
+        loaded->outputs[i].output_name[sizeof(loaded->outputs[i].output_name) - 1] = '\0';
+        loaded->outputs[i].media_path[sizeof(loaded->outputs[i].media_path) - 1] = '\0';
+        loaded->outputs[i].prop_overrides[sizeof(loaded->outputs[i].prop_overrides) - 1] = '\0';
+        loaded->outputs[i].depth_map_path[sizeof(loaded->outputs[i].depth_map_path) - 1] = '\0';
+        loaded->outputs[i].backdrop[sizeof(loaded->outputs[i].backdrop) - 1] = '\0';
     }
 
-    *store = loaded;
+    *store = *loaded;
+    free(loaded);
     return true;
 }
 
@@ -301,6 +397,8 @@ bool waywal_state_store_update_output(waywal_state_store_t *store,
             store->outputs[i].output_name[sizeof(store->outputs[i].output_name) - 1] = '\0';
             store->outputs[i].media_path[sizeof(store->outputs[i].media_path) - 1] = '\0';
             store->outputs[i].prop_overrides[sizeof(store->outputs[i].prop_overrides) - 1] = '\0';
+            store->outputs[i].depth_map_path[sizeof(store->outputs[i].depth_map_path) - 1] = '\0';
+            store->outputs[i].backdrop[sizeof(store->outputs[i].backdrop) - 1] = '\0';
             return true;
         }
     }
@@ -314,6 +412,9 @@ bool waywal_state_store_update_output(waywal_state_store_t *store,
     store->outputs[store->count].media_path[sizeof(store->outputs[0].media_path) - 1] = '\0';
     store->outputs[store->count].prop_overrides[sizeof(store->outputs[0].prop_overrides) - 1] =
         '\0';
+    store->outputs[store->count].depth_map_path[sizeof(store->outputs[0].depth_map_path) - 1] =
+        '\0';
+    store->outputs[store->count].backdrop[sizeof(store->outputs[0].backdrop) - 1] = '\0';
     store->count++;
     return true;
 }
@@ -366,8 +467,9 @@ static bool write_text_file_atomic(const char *file_path, const char *content, s
         return false;
     }
 
+    uint32_t seq = get_next_atomic_seq();
     char tmp_path[WAYWAL_PATH_MAX];
-    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", file_path, (int)getpid());
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d.%u", file_path, (int)getpid(), seq);
     if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
         return false;
     }
@@ -377,6 +479,9 @@ static bool write_text_file_atomic(const char *file_path, const char *content, s
         return false;
     }
     bool ok = write_all_bytes(fd, content, len);
+    if (ok && fsync(fd) != 0) {
+        ok = false;
+    }
     close(fd);
     if (!ok) {
         unlink(tmp_path);
@@ -457,8 +562,9 @@ static bool copy_file_atomic(const char *src_path, const char *dst_path)
         return false;
     }
 
+    uint32_t seq = get_next_atomic_seq();
     char tmp_path[WAYWAL_PATH_MAX];
-    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", dst_path, (int)getpid());
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d.%u", dst_path, (int)getpid(), seq);
     if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
         close(sfd);
         return false;
@@ -490,6 +596,9 @@ static bool copy_file_atomic(const char *src_path, const char *dst_path)
         }
     }
 
+    if (ok && fsync(dfd) != 0) {
+        ok = false;
+    }
     close(sfd);
     close(dfd);
 

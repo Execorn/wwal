@@ -171,6 +171,11 @@ static void swdec_destroy(video_engine_t *ve)
     if (sw->pkt && sw->p_av_packet_free) {
         sw->p_av_packet_free(&sw->pkt);
     }
+    if (sw->codec_ctx && sw->codec_ctx->extradata) {
+        free(sw->codec_ctx->extradata);
+        sw->codec_ctx->extradata = NULL;
+        sw->codec_ctx->extradata_size = 0;
+    }
     if (sw->codec_ctx && sw->p_avcodec_free_context) {
         sw->p_avcodec_free_context(&sw->codec_ctx);
     }
@@ -309,7 +314,7 @@ static bool swdec_init(video_engine_t *ve, const demuxer_t *demux)
                     gbm_bo_destroy(sw->gbm_bos[i]);
                     sw->gbm_bos[i] = NULL;
                 }
-                sw->buf_busy[i] = false;
+                sw->buf_busy[i] = 0;
             }
         }
         sw->has_gbm_ring = ring_ok;
@@ -522,7 +527,7 @@ static struct wl_buffer *ensure_shared_video_buffer(video_engine_t *ve, VASurfac
             prime_frame.drm_format);
         wl_buffer_add_listener(wl_buf, &g_video_buffer_listener, &ve->video_buffer_in_use[buf_idx]);
         ve->video_wl_buffers[buf_idx] = wl_buf;
-        ve->video_buffer_in_use[buf_idx] = false;
+        ve->video_buffer_in_use[buf_idx] = 0;
     } else {
         WAYWAL_LOG_ERR("create_immed returned NULL for shared video surface %u", export_surf);
     }
@@ -649,6 +654,24 @@ static void reclaim_output_shm_for_video(output_node_t *out)
             out->last_presented_bo = NULL;
         }
     }
+    if (out->use_dmabuf && out->dmabuf_ring.initialized) {
+        for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+            dmabuf_bo_t *bo = &out->dmabuf_ring.buffers[i];
+            if ((bo->gbm_bo != NULL || bo->wl_buffer != NULL) && !bo->in_use) {
+                if (out->last_presented_bo == bo) {
+                    out->last_presented_bo = NULL;
+                }
+                if (out->last_committed_ring_idx == (int)i) {
+                    out->last_committed_ring_idx = -1;
+                }
+                layer_shell_release_output_bo_refs(state, out, bo);
+                dmabuf_bo_free(bo);
+            }
+        }
+    }
+    if (state) {
+        render_engine_release_upload_cache(&state->render_engine);
+    }
 }
 
 static void configure_output_video_viewport(output_node_t *out, uint32_t vid_w, uint32_t vid_h)
@@ -760,7 +783,7 @@ static void video_engine_release_wl_buffers(video_engine_t *ve)
             ve->video_wl_buffers[i] = NULL;
             destroyed_any = true;
         }
-        ve->video_buffer_in_use[i] = false;
+        ve->video_buffer_in_use[i] = 0;
     }
     if (destroyed_any && ve->daemon_state && ve->daemon_state->display) {
         wl_display_flush(ve->daemon_state->display);
@@ -882,8 +905,8 @@ static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux
                   dec->cached_sps.pic_order_cnt_type == 2)) ||
                 (demux->codec == WAYWAL_CODEC_HEVC && dec->cached_hevc_sps.valid &&
                  dec->cached_hevc_sps.sps_max_num_reorder_pics == 0);
-            uint32_t min_surf = no_reorder ? 3U : 5U;
-            needed_surfaces = max_refs + (no_reorder ? 2U : 3U);
+            uint32_t min_surf = no_reorder ? 2U : 5U;
+            needed_surfaces = max_refs + (no_reorder ? 1U : 3U);
             if (needed_surfaces < min_surf)
                 needed_surfaces = min_surf;
             if (needed_surfaces > 9U)
@@ -1228,6 +1251,7 @@ void video_engine_dispatch_frame(video_engine_t *ve)
             ffmpeg_swdec_t *sw = (ffmpeg_swdec_t *)ve->swdec_ctx;
             if (ve->daemon_state) {
                 render_engine_bump_upload_gen(&ve->daemon_state->render_engine);
+                int sw_attached_count = 0;
                 for (output_node_t *out = ve->daemon_state->outputs; out != NULL; out = out->next) {
                     if (!is_output_active_for_video(ve, out) || !out->surface)
                         continue;
@@ -1239,17 +1263,20 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                     if (sw->has_gbm_ring && sw->last_ready_ring_idx >= 0 &&
                         sw->wl_bufs[sw->last_ready_ring_idx]) {
                         int r_idx = sw->last_ready_ring_idx;
-                        sw->buf_busy[r_idx] = 1;
                         configure_output_video_viewport(out, sw->width, sw->height);
                         wl_surface_attach(out->surface, sw->wl_bufs[r_idx], 0, 0);
                         wl_surface_damage_buffer(out->surface, 0, 0, (int32_t)sw->width,
                                                  (int32_t)sw->height);
                         wl_surface_commit(out->surface);
                         out->has_image = true;
+                        sw_attached_count++;
                     } else if (sw->rgba_buf) {
                         output_node_render_image(ve->daemon_state, out, sw->rgba_buf, sw->width,
                                                  sw->height);
                     }
+                }
+                if (sw_attached_count > 0 && sw->has_gbm_ring && sw->last_ready_ring_idx >= 0) {
+                    sw->buf_busy[sw->last_ready_ring_idx] += sw_attached_count;
                 }
                 wl_display_flush(ve->daemon_state->display);
             }
@@ -1388,11 +1415,10 @@ void video_engine_dispatch_frame(video_engine_t *ve)
         }
 
         video_reorder_entry_t pres = ve->reorder_buf[best_idx];
-        if (best_idx + 1 < ve->reorder_count) {
-            memmove(&ve->reorder_buf[best_idx], &ve->reorder_buf[best_idx + 1],
-                    (ve->reorder_count - best_idx - 1) * sizeof(video_reorder_entry_t));
-        }
         ve->reorder_count--;
+        if (best_idx < ve->reorder_count) {
+            ve->reorder_buf[best_idx] = ve->reorder_buf[ve->reorder_count];
+        }
 
         int64_t scaled_pts_ns = (int64_t)((double)(pres.pts_us * 1000LL) / speed);
         if (ve->playback_epoch_ns == 0 || pres.loop_id != ve->presented_loop_id ||
@@ -1417,14 +1443,27 @@ void video_engine_dispatch_frame(video_engine_t *ve)
         if (ve->decoder.has_vpp) {
             uint32_t vpp_pool = ve->decoder.num_vpp_surfaces > 0 ? ve->decoder.num_vpp_surfaces
                                                                  : WAYWAL_VA_VPP_POOL_SIZE;
-            /* Always select the lowest-index free VPP surface so nvidia_drv_video's lazy
-             * direct_realiseSurface allocates VRAM only for the 2 ping-pong buffers actually
-             * needed by the compositor. */
+            /* Select a free VPP surface not held by any attached output. */
             uint32_t vpp_idx = (ve->last_vpp_idx + 1) % vpp_pool;
+            bool found_free = false;
             for (uint32_t k = 0; k < vpp_pool; ++k) {
                 if (ve->video_buffer_in_use[k] <= 0) {
                     vpp_idx = k;
+                    found_free = true;
                     break;
+                }
+            }
+            if (!found_free) {
+                /* If all slots are currently held, pick the slot with lowest in-use count
+                 * while skipping the slot just committed in the previous frame. */
+                int min_in_use = INT_MAX;
+                for (uint32_t k = 0; k < vpp_pool; ++k) {
+                    if (k == ve->last_vpp_idx && vpp_pool > 1)
+                        continue;
+                    if (ve->video_buffer_in_use[k] < min_in_use) {
+                        min_in_use = ve->video_buffer_in_use[k];
+                        vpp_idx = k;
+                    }
                 }
             }
             ve->last_vpp_idx = vpp_idx;
@@ -1485,7 +1524,7 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                 }
             }
             if (attached_count > 0) {
-                ve->video_buffer_in_use[buf_idx] = 1;
+                ve->video_buffer_in_use[buf_idx] += attached_count;
                 render_engine_release_upload_cache(&ve->daemon_state->render_engine);
                 wl_display_flush(ve->daemon_state->display);
             }

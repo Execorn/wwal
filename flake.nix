@@ -49,6 +49,7 @@
               pipewire
               dbus
               lz4
+              ffmpeg
             ];
 
             mesonFlags = [
@@ -59,6 +60,11 @@
               "-Denable_systemd=true"
               "-Dswww_compat=false"
             ];
+
+            postInstall = ''
+              wrapProgram $out/bin/wwald \
+                --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath buildInputs}
+            '';
 
             meta = with pkgs.lib; {
               description = "Zero-copy C23 Wayland wallpaper, hardware video, GLSL shader, and Material You engine";
@@ -85,6 +91,7 @@
               valgrind
               ffmpeg
               weston
+              python3Packages.psutil
             ];
           };
         });

@@ -1,5 +1,7 @@
 #version 310 es
 // SPDX-License-Identifier: GPL-3.0-or-later
+precision highp float;
+precision highp int;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
@@ -18,19 +20,21 @@ void main() {
         return;
     }
 
-    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    vec2 inv_res = 1.0 / vec2(u_resolution);
+    vec2 uv = (vec2(coord) + 0.5) * inv_res;
     if (u_progress <= 0.0) {
-        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        imageStore(u_target, coord, vec4(texture(u_src_a, uv).rgb, 1.0).bgra);
         return;
     }
     if (u_progress >= 1.0) {
-        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        imageStore(u_target, coord, vec4(texture(u_src_b, uv).rgb, 1.0).bgra);
         return;
     }
 
     vec2 dir = vec2(cos(u_angle), sin(u_angle));
     vec2 centered = uv - vec2(0.5);
-    float proj = dot(centered, dir) / max(abs(dir.x) + abs(dir.y), 1e-5) + 0.5;
+    float inv_span = 1.0 / max(abs(dir.x) + abs(dir.y), 1e-5);
+    float proj = dot(centered, dir) * inv_span + 0.5;
 
     float freq = (u_wave_freq > 0.0) ? u_wave_freq : 20.0;
     float amp = (u_wave_amp > 0.0) ? u_wave_amp : 0.05;
@@ -39,11 +43,11 @@ void main() {
     float p = u_progress * (1.0 + 2.0 * margin) - margin;
 
     if (proj - p >= margin) {
-        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        imageStore(u_target, coord, vec4(texture(u_src_a, uv).rgb, 1.0).bgra);
         return;
     }
     if (p - proj >= margin) {
-        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        imageStore(u_target, coord, vec4(texture(u_src_b, uv).rgb, 1.0).bgra);
         return;
     }
 
@@ -61,5 +65,5 @@ void main() {
     } else {
         col = mix(texture(u_src_a, uv), texture(u_src_b, uv), alpha);
     }
-    imageStore(u_target, coord, col.bgra);
+    imageStore(u_target, coord, vec4(col.rgb, 1.0).bgra);
 }

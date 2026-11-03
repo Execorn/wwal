@@ -753,7 +753,10 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
         cache_pass_uniform_locs(pass);
     }
     const we_pass_uniform_locs_t *ul = &pass->ulocs;
-    glUseProgram(prog);
+    if (scene && scene->current_gl_prog != prog) {
+        glUseProgram(prog);
+        scene->current_gl_prog = prog;
+    }
 
     float time_sec = params ? params->time_sec : 0.0f;
     float dt_sec =
@@ -1028,8 +1031,14 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
     }
 }
 
-static void apply_gl_blend_mode(we_blend_mode_t mode)
+static void apply_gl_blend_mode(we_scene_t *scene, we_blend_mode_t mode)
 {
+    if (scene && scene->current_gl_blend_mode == (int32_t)mode) {
+        return;
+    }
+    if (scene) {
+        scene->current_gl_blend_mode = (int32_t)mode;
+    }
     switch (mode) {
     case WE_BLEND_DISABLED:
         glDisable(GL_BLEND);
@@ -1983,7 +1992,12 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                     &scene->scene_fbo_h, sw, sh);
 
     glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
+    scene->current_fbo = scene->scene_fbo;
     glViewport(0, 0, (GLsizei)sw, (GLsizei)sh);
+    scene->current_vp_w = sw;
+    scene->current_vp_h = sh;
+    scene->current_gl_blend_mode = -1;
+    scene->current_gl_prog = 0;
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_SCISSOR_TEST);
@@ -2022,6 +2036,7 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
     mat4_ortho_topdown((float)sw, (float)sh, shake_x, shake_y, vp);
 
     glBindVertexArray(scene->quad_vao);
+    scene->current_vao = scene->quad_vao;
 
     for (uint32_t i = 0; i < scene->object_count; i++) {
         we_scene_object_t *obj = &scene->objects[i];
@@ -2113,10 +2128,20 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
             we_particle_update(obj->particle_sys, dt_sec);
 
             if (scene->particle_program != 0) {
-                glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
-                glViewport(0, 0, (GLsizei)sw, (GLsizei)sh);
-                apply_gl_blend_mode(obj->base_pass.blending);
-                glUseProgram(scene->particle_program);
+                if (scene->current_fbo != scene->scene_fbo) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
+                    scene->current_fbo = scene->scene_fbo;
+                }
+                if (scene->current_vp_w != sw || scene->current_vp_h != sh) {
+                    glViewport(0, 0, (GLsizei)sw, (GLsizei)sh);
+                    scene->current_vp_w = sw;
+                    scene->current_vp_h = sh;
+                }
+                apply_gl_blend_mode(scene, obj->base_pass.blending);
+                if (scene->current_gl_prog != scene->particle_program) {
+                    glUseProgram(scene->particle_program);
+                    scene->current_gl_prog = scene->particle_program;
+                }
 
                 if (scene->part_mvp_loc >= 0) {
                     glUniformMatrix4fv(scene->part_mvp_loc, 1, GL_FALSE, mvp);
@@ -2153,7 +2178,10 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                     glUniform1i(scene->part_tex0_loc, 0);
                 }
                 we_particle_draw_gl(obj->particle_sys, scene->particle_program);
-                glBindVertexArray(scene->quad_vao);
+                if (scene->current_vao != scene->quad_vao) {
+                    glBindVertexArray(scene->quad_vao);
+                    scene->current_vao = scene->quad_vao;
+                }
             }
             continue;
         }
@@ -2193,15 +2221,27 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
             }
             mat4_mul(vp, model, mvp);
 
-            glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
-            glViewport(0, 0, (GLsizei)sw, (GLsizei)sh);
-            apply_gl_blend_mode(obj->base_pass.blending);
+            if (scene->current_fbo != scene->scene_fbo) {
+                glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
+                scene->current_fbo = scene->scene_fbo;
+            }
+            if (scene->current_vp_w != sw || scene->current_vp_h != sh) {
+                glViewport(0, 0, (GLsizei)sw, (GLsizei)sh);
+                scene->current_vp_w = sw;
+                scene->current_vp_h = sh;
+            }
+            apply_gl_blend_mode(scene, obj->base_pass.blending);
             bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, model, vp, mvp, 0, sw, sh, norm_w,
                                norm_h, params);
             if (obj->puppet) {
                 we_puppet_draw_gl(obj->puppet, obj->base_pass.gl_prog, (double)time_sec);
                 glBindVertexArray(scene->quad_vao);
+                scene->current_vao = scene->quad_vao;
             } else {
+                if (scene->current_vao != scene->quad_vao) {
+                    glBindVertexArray(scene->quad_vao);
+                    scene->current_vao = scene->quad_vao;
+                }
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
             }
         } else {
@@ -2260,8 +2300,11 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
             /* Seed shared_obj_ping_fbo[0] by drawing obj->base_pass so compressed S3TC/BC7
              * textures, swizzles, and spritesheets render cleanly into shared_obj_ping_fbo[0] */
             glBindFramebuffer(GL_FRAMEBUFFER, scene->shared_obj_ping_fbo[0]);
+            scene->current_fbo = scene->shared_obj_ping_fbo[0];
             glViewport(0, 0, (GLsizei)pw, (GLsizei)ph);
-            glDisable(GL_BLEND);
+            scene->current_vp_w = pw;
+            scene->current_vp_h = ph;
+            apply_gl_blend_mode(scene, WE_BLEND_DISABLED);
             glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
             glClear(GL_COLOR_BUFFER_BIT);
             if (obj->puppet) {
@@ -2274,7 +2317,12 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                                    ph, norm_w, norm_h, params);
                 we_puppet_draw_gl(obj->puppet, obj->base_pass.gl_prog, (double)time_sec);
                 glBindVertexArray(scene->quad_vao);
+                scene->current_vao = scene->quad_vao;
             } else {
+                if (scene->current_vao != scene->quad_vao) {
+                    glBindVertexArray(scene->quad_vao);
+                    scene->current_vao = scene->quad_vao;
+                }
                 bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, ident, ident, ident, 0, pw,
                                    ph, norm_w, norm_h, params);
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
@@ -2355,11 +2403,22 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                         }
                     }
 
-                    glBindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
-                    glViewport(0, 0, (GLsizei)dst_w, (GLsizei)dst_h);
-                    apply_gl_blend_mode(ep->blending);
+                    if (scene->current_fbo != dst_fbo) {
+                        glBindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
+                        scene->current_fbo = dst_fbo;
+                    }
+                    if (scene->current_vp_w != dst_w || scene->current_vp_h != dst_h) {
+                        glViewport(0, 0, (GLsizei)dst_w, (GLsizei)dst_h);
+                        scene->current_vp_w = dst_w;
+                        scene->current_vp_h = dst_h;
+                    }
+                    apply_gl_blend_mode(scene, ep->blending);
                     bind_pass_uniforms(scene, obj, eff, ep, ident, ident, ident, cur_tex, dst_w,
                                        dst_h, norm_w, norm_h, params);
+                    if (scene->current_vao != scene->quad_vao) {
+                        glBindVertexArray(scene->quad_vao);
+                        scene->current_vao = scene->quad_vao;
+                    }
                     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
                     if (wrote_ping) {
@@ -2386,11 +2445,21 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
             compute_object_model_matrix(scene, obj, pdx, pdy, model);
             mat4_mul(vp, model, mvp);
 
-            glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
-            glViewport(0, 0, (GLsizei)sw, (GLsizei)sh);
-            apply_gl_blend_mode(obj->base_pass.blending);
+            if (scene->current_fbo != scene->scene_fbo) {
+                glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
+                scene->current_fbo = scene->scene_fbo;
+            }
+            if (scene->current_vp_w != sw || scene->current_vp_h != sh) {
+                glViewport(0, 0, (GLsizei)sw, (GLsizei)sh);
+                scene->current_vp_w = sw;
+                scene->current_vp_h = sh;
+            }
+            apply_gl_blend_mode(scene, obj->base_pass.blending);
             if (scene->default_program != 0) {
-                glUseProgram(scene->default_program);
+                if (scene->current_gl_prog != scene->default_program) {
+                    glUseProgram(scene->default_program);
+                    scene->current_gl_prog = scene->default_program;
+                }
                 if (scene->default_prog_ulocs.mvp >= 0) {
                     glUniformMatrix4fv(scene->default_prog_ulocs.mvp, 1, GL_FALSE, mvp);
                 }
@@ -2399,12 +2468,20 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                 }
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, cur_tex);
+                if (scene->current_vao != scene->quad_vao) {
+                    glBindVertexArray(scene->quad_vao);
+                    scene->current_vao = scene->quad_vao;
+                }
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
             } else {
                 bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, model, vp, mvp, cur_tex, sw,
                                    sh, norm_w, norm_h, params);
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, cur_tex);
+                if (scene->current_vao != scene->quad_vao) {
+                    glBindVertexArray(scene->quad_vao);
+                    scene->current_vao = scene->quad_vao;
+                }
                 glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
             }
 
@@ -2412,10 +2489,14 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
             for (int k = 0; k < 2; k++) {
                 if (scene->shared_obj_ping_fbo[k] != 0) {
                     glBindFramebuffer(GL_FRAMEBUFFER, scene->shared_obj_ping_fbo[k]);
+                    scene->current_fbo = scene->shared_obj_ping_fbo[k];
                     glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &k_color_attachment);
                 }
             }
-            glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
+            if (scene->current_fbo != scene->scene_fbo) {
+                glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
+                scene->current_fbo = scene->scene_fbo;
+            }
         }
     }
 
@@ -2532,11 +2613,8 @@ static bool import_scene_bo_tex(we_scene_t *scene, dmabuf_bo_t *bo, GLuint *out_
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    if (target_storage) {
-        target_storage(GL_TEXTURE_2D, (GLeglImageOES)img, NULL);
-    } else {
-        target_tex2d(GL_TEXTURE_2D, img);
-    }
+    (void)target_storage;
+    target_tex2d(GL_TEXTURE_2D, img);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -2611,21 +2689,32 @@ bool we_scene_blit_last_frame(we_scene_t *scene, dmabuf_bo_t *target_bo)
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, scene->target_fbo);
+    scene->current_fbo = scene->target_fbo;
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, bo_gl_tex, 0);
     glViewport(0, 0, (GLsizei)target_bo->width, (GLsizei)target_bo->height);
-    glDisable(GL_BLEND);
+    scene->current_vp_w = target_bo->width;
+    scene->current_vp_h = target_bo->height;
+    apply_gl_blend_mode(scene, WE_BLEND_DISABLED);
 
-    glUseProgram(scene->prog_present);
+    if (scene->current_gl_prog != scene->prog_present) {
+        glUseProgram(scene->prog_present);
+        scene->current_gl_prog = scene->prog_present;
+    }
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, scene->scene_fbo_tex);
     if (scene->present_u_tex_loc >= 0) {
         glUniform1i(scene->present_u_tex_loc, 0);
     }
     glBindVertexArray(scene->quad_vao);
+    scene->current_vao = scene->quad_vao;
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
     glBindVertexArray(0);
+    scene->current_vao = 0;
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    scene->current_fbo = 0;
+    scene->current_vp_w = 0;
+    scene->current_vp_h = 0;
 
     ensure_egl_procs(scene);
     PFNEGLCREATESYNCKHRPROC create_sync =

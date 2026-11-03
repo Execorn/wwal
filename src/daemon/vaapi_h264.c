@@ -528,6 +528,9 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
 
 static inline size_t find_annexb_start_code(const uint8_t *data, size_t start, size_t size)
 {
+    if (start + 3 > size)
+        return size;
+
     size_t pos = start;
 #if defined(__AVX2__) && !defined(WWAL_DISABLE_SIMD)
     const __m256i v_zero = _mm256_setzero_si256();
@@ -544,12 +547,16 @@ static inline size_t find_annexb_start_code(const uint8_t *data, size_t start, s
         pos += 30;
     }
 #endif
-    while (pos + 3 <= size) {
-        if (data[pos] == 0 && data[pos + 1] == 0 &&
-            (data[pos + 2] == 1 || (pos + 3 < size && data[pos + 2] == 0 && data[pos + 3] == 1))) {
-            return pos;
+    while (pos + 2 < size) {
+        const uint8_t *p = memchr(data + pos + 2, 1, size - (pos + 2));
+        if (!p)
+            break;
+        size_t idx = (size_t)(p - data);
+        if (data[idx - 1] == 0 && data[idx - 2] == 0) {
+            size_t sc = idx - 2;
+            return (sc > start && data[sc - 1] == 0) ? (sc - 1) : sc;
         }
-        pos++;
+        pos = idx - 1;
     }
     return size;
 }

@@ -19,6 +19,7 @@ typedef struct {
 typedef struct {
     dmabuf_format_table_entry_t *table;
     size_t num_entries;
+    size_t table_size;
     int table_fd;
     dev_t tranche_dev;
     bool has_tranche_dev;
@@ -27,7 +28,7 @@ typedef struct {
     bool locked_scanout_10bit;
 } feedback_state_t;
 
-static feedback_state_t g_fb_state = {.table_fd = -1};
+static feedback_state_t g_fb_state = {.table_fd = -1, .table_size = 0};
 
 static void feedback_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback)
 {
@@ -48,22 +49,40 @@ static void feedback_format_table(void *data, struct zwp_linux_dmabuf_feedback_v
     (void)data;
     (void)feedback;
     if (g_fb_state.table && g_fb_state.table != MAP_FAILED) {
-        munmap(g_fb_state.table, g_fb_state.num_entries * sizeof(dmabuf_format_table_entry_t));
+        munmap(g_fb_state.table, g_fb_state.table_size);
+        g_fb_state.table = NULL;
     }
     if (g_fb_state.table_fd >= 0) {
         close(g_fb_state.table_fd);
+        g_fb_state.table_fd = -1;
     }
 
-    g_fb_state.table_fd = fd;
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < (off_t)size ||
+        size < sizeof(dmabuf_format_table_entry_t)) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        g_fb_state.table = NULL;
+        g_fb_state.num_entries = 0;
+        g_fb_state.table_size = 0;
+        return;
+    }
+
+    g_fb_state.table_size = size;
     g_fb_state.num_entries = size / sizeof(dmabuf_format_table_entry_t);
     g_fb_state.table =
         (dmabuf_format_table_entry_t *)mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
 
+    /* The client owns fd and must close it once mapped (mmap retains its own reference) */
+    close(fd);
+    g_fb_state.table_fd = -1;
+
     if (g_fb_state.table == MAP_FAILED) {
         WAYWAL_LOG_ERR("Failed to mmap dmabuf feedback format table");
         g_fb_state.table = NULL;
-        close(fd);
-        g_fb_state.table_fd = -1;
+        g_fb_state.num_entries = 0;
+        g_fb_state.table_size = 0;
     }
 }
 
@@ -214,7 +233,7 @@ void dmabuf_feedback_destroy(dmabuf_context_t *ctx)
     ctx->default_feedback = NULL;
 
     if (g_fb_state.table && g_fb_state.table != MAP_FAILED) {
-        munmap(g_fb_state.table, g_fb_state.num_entries * sizeof(dmabuf_format_table_entry_t));
+        munmap(g_fb_state.table, g_fb_state.table_size);
         g_fb_state.table = NULL;
     }
     if (g_fb_state.table_fd >= 0) {
@@ -222,4 +241,5 @@ void dmabuf_feedback_destroy(dmabuf_context_t *ctx)
         g_fb_state.table_fd = -1;
     }
     g_fb_state.num_entries = 0;
+    g_fb_state.table_size = 0;
 }

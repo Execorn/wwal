@@ -211,6 +211,7 @@ struct waywal_shader_engine {
         GLuint gl_tex;
         EGLImageKHR egl_image;
         bool owns_egl;
+        bool is_fbo_mode;
     } imported_bos[32];
     size_t num_imported_bos;
 };
@@ -562,6 +563,52 @@ static bool detect_active_passes(const char *user_src, bool out_active[SHADER_NU
     return true;
 }
 
+static bool source_defines_void_main(const char *src)
+{
+    if (!src) {
+        return false;
+    }
+    const char *p = src;
+    while (*p) {
+        if (p[0] == '/' && p[1] == '/') {
+            p += 2;
+            while (*p && *p != '\n') {
+                p++;
+            }
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) {
+                p++;
+            }
+            if (*p) {
+                p += 2;
+            }
+            continue;
+        }
+        if (strncmp(p, "void", 4) == 0) {
+            if (p == src || (!isalnum((unsigned char)p[-1]) && p[-1] != '_')) {
+                const char *q = p + 4;
+                while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') {
+                    q++;
+                }
+                if (strncmp(q, "main", 4) == 0) {
+                    q += 4;
+                    while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') {
+                        q++;
+                    }
+                    if (*q == '(') {
+                        return true;
+                    }
+                }
+            }
+        }
+        p++;
+    }
+    return false;
+}
+
 char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
 {
     if (!user_src || pass_idx < 0 || pass_idx >= SHADER_NUM_PASSES) {
@@ -584,16 +631,34 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
         if (!ver_nl) {
             return strdup(user_src);
         }
-        size_t head_len = (size_t)(ver_nl - user_src + 1);
+        const char *tail = ver_nl + 1;
+        while (*tail) {
+            const char *tnl = strchr(tail, '\n');
+            size_t tlen = tnl ? (size_t)(tnl - tail + 1) : strlen(tail);
+            const char *ttrim = tail;
+            while (ttrim < tail + tlen && (*ttrim == ' ' || *ttrim == '\t'))
+                ttrim++;
+            if (ttrim < tail + tlen && *ttrim == '#') {
+                const char *tcmd = ttrim + 1;
+                while (tcmd < tail + tlen && (*tcmd == ' ' || *tcmd == '\t'))
+                    tcmd++;
+                if ((size_t)(tail + tlen - tcmd) >= 9 && strncmp(tcmd, "extension", 9) == 0) {
+                    tail = tnl ? (tnl + 1) : (tail + tlen);
+                    continue;
+                }
+            }
+            break;
+        }
+        size_t head_len = (size_t)(tail - user_src);
         size_t cpro_len = sizeof(COMPUTE_PROLOGUE) - 1u;
-        size_t tail_len = strlen(ver_nl + 1);
+        size_t tail_len = strlen(tail);
         char *out = (char *)malloc(head_len + cpro_len + tail_len + 1u);
         if (!out) {
             return strdup(user_src);
         }
         memcpy(out, user_src, head_len);
         memcpy(out + head_len, COMPUTE_PROLOGUE, cpro_len);
-        memcpy(out + head_len + cpro_len, ver_nl + 1, tail_len + 1u);
+        memcpy(out + head_len + cpro_len, tail, tail_len + 1u);
         return out;
     }
 
@@ -619,14 +684,62 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
         }
     }
 
-    char *wrapped =
-        (char *)malloc(ver_len + pro_len + def_len + src_len + num_lines * 2u + epi_len + 32u);
+    size_t ext_bytes = 0;
+    const char *ep = user_src;
+    while (*ep) {
+        const char *enl = strchr(ep, '\n');
+        size_t elen = enl ? (size_t)(enl - ep + 1) : strlen(ep);
+        const char *etrim = ep;
+        while (etrim < ep + elen && (*etrim == ' ' || *etrim == '\t'))
+            etrim++;
+        if (etrim < ep + elen && *etrim == '#') {
+            const char *ecmd = etrim + 1;
+            while (ecmd < ep + elen && (*ecmd == ' ' || *ecmd == '\t'))
+                ecmd++;
+            if ((size_t)(ep + elen - ecmd) >= 9 && strncmp(ecmd, "extension", 9) == 0) {
+                ext_bytes += elen + 2u;
+            }
+        }
+        if (!enl)
+            break;
+        ep = enl + 1;
+    }
+
+    char *wrapped = (char *)malloc(ver_len + ext_bytes + pro_len + def_len + src_len +
+                                   num_lines * 2u + epi_len + 64u);
     if (!wrapped) {
         return NULL;
     }
     size_t out_off = 0;
     memcpy(wrapped + out_off, ver_hdr, ver_len);
     out_off += ver_len;
+
+    /* Hoist all #extension directives immediately after #version before any non-preprocessor tokens
+     */
+    ep = user_src;
+    while (*ep) {
+        const char *enl = strchr(ep, '\n');
+        size_t elen = enl ? (size_t)(enl - ep + 1) : strlen(ep);
+        const char *etrim = ep;
+        while (etrim < ep + elen && (*etrim == ' ' || *etrim == '\t'))
+            etrim++;
+        if (etrim < ep + elen && *etrim == '#') {
+            const char *ecmd = etrim + 1;
+            while (ecmd < ep + elen && (*ecmd == ' ' || *ecmd == '\t'))
+                ecmd++;
+            if ((size_t)(ep + elen - ecmd) >= 9 && strncmp(ecmd, "extension", 9) == 0) {
+                memcpy(wrapped + out_off, ep, elen);
+                out_off += elen;
+                if (elen == 0 || wrapped[out_off - 1] != '\n') {
+                    wrapped[out_off++] = '\n';
+                }
+            }
+        }
+        if (!enl)
+            break;
+        ep = enl + 1;
+    }
+
     memcpy(wrapped + out_off, pass_defines[pass_idx], def_len);
     out_off += def_len;
     memcpy(wrapped + out_off, SHADERTOY_PROLOGUE, pro_len);
@@ -660,7 +773,17 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
                     trimmed++;
                 }
                 size_t rem = (size_t)(p + content_len - trimmed);
-                if ((rem >= 8 && strncmp(trimmed, "#version", 8) == 0) ||
+                bool is_ext = false;
+                if (rem >= 1 && *trimmed == '#') {
+                    const char *ecmd = trimmed + 1;
+                    while (ecmd < p + content_len && (*ecmd == ' ' || *ecmd == '\t'))
+                        ecmd++;
+                    if ((size_t)(p + content_len - ecmd) >= 9 &&
+                        strncmp(ecmd, "extension", 9) == 0) {
+                        is_ext = true;
+                    }
+                }
+                if (is_ext || (rem >= 8 && strncmp(trimmed, "#version", 8) == 0) ||
                     (rem >= 14 && strncmp(trimmed, "#pragma waywal", 14) == 0)) {
                     wrapped[out_off++] = '/';
                     wrapped[out_off++] = '/';
@@ -679,8 +802,12 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
         p = nl + 1;
     }
 
-    memcpy(wrapped + out_off, SHADERTOY_EPILOGUE, epi_len);
-    out_off += epi_len;
+    bool has_main_image = (strstr(user_src, "mainImage") != NULL);
+    bool has_void_main = source_defines_void_main(user_src);
+    if (has_main_image || !has_void_main) {
+        memcpy(wrapped + out_off, SHADERTOY_EPILOGUE, epi_len);
+        out_off += epi_len;
+    }
     wrapped[out_off] = '\0';
     return wrapped;
 }
@@ -1576,6 +1703,7 @@ void waywal_shader_engine_forget_bo(waywal_shader_engine_t *eng, const dmabuf_bo
             if (eng->imported_bos[i].owns_egl && eng->display != EGL_NO_DISPLAY &&
                 eng->context != EGL_NO_CONTEXT) {
                 make_context_current(eng);
+                glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
                 if (eng->draw_fbo) {
                     glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
                     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0,
@@ -1676,6 +1804,7 @@ void waywal_shader_engine_destroy(waywal_shader_engine_t *eng)
         eng->draw_fbo = 0;
     }
     if (eng->display != EGL_NO_DISPLAY && eng->context != EGL_NO_CONTEXT) {
+        glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
         for (size_t i = 0; i < eng->num_imported_bos; ++i) {
             const dmabuf_bo_t *bo = eng->imported_bos[i].bo;
             if (bo && !bo->egl_image && bo->gl_tex == eng->imported_bos[i].gl_tex) {
@@ -2470,7 +2599,7 @@ bool waywal_shader_engine_poll_hot_reload(waywal_shader_engine_t *eng)
 }
 
 static void record_imported_bo(waywal_shader_engine_t *eng, const dmabuf_bo_t *bo, GLuint tex,
-                               EGLImageKHR img, bool owns_egl)
+                               EGLImageKHR img, bool owns_egl, bool is_fbo_mode)
 {
     if (!eng || !bo) {
         return;
@@ -2485,6 +2614,7 @@ static void record_imported_bo(waywal_shader_engine_t *eng, const dmabuf_bo_t *b
                 eng->imported_bos[i].width = bo->width;
                 eng->imported_bos[i].height = bo->height;
                 eng->imported_bos[i].drm_format = bo->drm_format;
+                eng->imported_bos[i].is_fbo_mode = is_fbo_mode;
                 return;
             }
             if (eng->last_complete_bo_tex == eng->imported_bos[i].gl_tex &&
@@ -2507,6 +2637,7 @@ static void record_imported_bo(waywal_shader_engine_t *eng, const dmabuf_bo_t *b
             eng->imported_bos[i].gl_tex = tex;
             eng->imported_bos[i].egl_image = img;
             eng->imported_bos[i].owns_egl = owns_egl;
+            eng->imported_bos[i].is_fbo_mode = is_fbo_mode;
             return;
         }
     }
@@ -2515,6 +2646,7 @@ static void record_imported_bo(waywal_shader_engine_t *eng, const dmabuf_bo_t *b
             eng->last_complete_bo_tex = 0;
         }
         if (eng->imported_bos[0].owns_egl) {
+            glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
             if (eng->draw_fbo) {
                 glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
@@ -2524,6 +2656,11 @@ static void record_imported_bo(waywal_shader_engine_t *eng, const dmabuf_bo_t *b
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
             }
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            const dmabuf_bo_t *evicted_bo = eng->imported_bos[0].bo;
+            if (evicted_bo && !evicted_bo->egl_image &&
+                evicted_bo->gl_tex == eng->imported_bos[0].gl_tex) {
+                ((dmabuf_bo_t *)evicted_bo)->gl_tex = 0;
+            }
             if (eng->imported_bos[0].gl_tex) {
                 glDeleteTextures(1, &eng->imported_bos[0].gl_tex);
             }
@@ -2543,22 +2680,30 @@ static void record_imported_bo(waywal_shader_engine_t *eng, const dmabuf_bo_t *b
     eng->imported_bos[slot].gl_tex = tex;
     eng->imported_bos[slot].egl_image = img;
     eng->imported_bos[slot].owns_egl = owns_egl;
+    eng->imported_bos[slot].is_fbo_mode = is_fbo_mode;
 }
 
-static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLuint *out_tex)
+static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, bool want_fbo_mode,
+                               GLuint *out_tex)
 {
     if (!eng || !bo || !out_tex) {
         return false;
     }
     for (size_t i = 0; i < eng->num_imported_bos; ++i) {
-        if (eng->imported_bos[i].bo == bo && eng->imported_bos[i].fd0 == bo->fd[0] &&
-            eng->imported_bos[i].width == bo->width && eng->imported_bos[i].height == bo->height &&
-            eng->imported_bos[i].drm_format == bo->drm_format && eng->imported_bos[i].gl_tex != 0) {
-            if (bo->gl_tex == 0) {
-                bo->gl_tex = eng->imported_bos[i].gl_tex;
+        if (eng->imported_bos[i].bo == bo) {
+            if (eng->imported_bos[i].fd0 == bo->fd[0] && eng->imported_bos[i].width == bo->width &&
+                eng->imported_bos[i].height == bo->height &&
+                eng->imported_bos[i].drm_format == bo->drm_format &&
+                eng->imported_bos[i].gl_tex != 0 &&
+                eng->imported_bos[i].is_fbo_mode == want_fbo_mode) {
+                if (bo->gl_tex == 0) {
+                    bo->gl_tex = eng->imported_bos[i].gl_tex;
+                }
+                *out_tex = eng->imported_bos[i].gl_tex;
+                return true;
             }
-            *out_tex = eng->imported_bos[i].gl_tex;
-            return true;
+            waywal_shader_engine_forget_bo(eng, bo);
+            break;
         }
     }
     if (bo->fd[0] < 0) {
@@ -2646,7 +2791,7 @@ static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLu
     glActiveTexture(GL_TEXTURE0);
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    if (eng->glEGLImageTargetTexStorageEXT) {
+    if (!want_fbo_mode && eng->glEGLImageTargetTexStorageEXT) {
         eng->glEGLImageTargetTexStorageEXT(GL_TEXTURE_2D, (GLeglImageOES)img, NULL);
     } else {
         eng->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
@@ -2658,7 +2803,7 @@ static bool ensure_bo_imported(waywal_shader_engine_t *eng, dmabuf_bo_t *bo, GLu
     glBindTexture(GL_TEXTURE_2D, 0);
 
     if (eng->display != EGL_NO_DISPLAY) {
-        record_imported_bo(eng, bo, tex, img, true);
+        record_imported_bo(eng, bo, tex, img, true, want_fbo_mode);
     }
     if (bo->gl_tex == 0) {
         bo->gl_tex = tex;
@@ -2671,7 +2816,6 @@ static bool ensure_pass_ping_pong_textures(waywal_shader_engine_t *eng, shader_p
                                            uint32_t w, uint32_t h, uint16_t **shared_zero_half,
                                            size_t *shared_zero_cap)
 {
-    (void)eng;
     if (pass->ping_pong_tex[0] && pass->ping_pong_tex[1] && pass->tex_w == w && pass->tex_h == h) {
         return false;
     }
@@ -2691,6 +2835,16 @@ static bool ensure_pass_ping_pong_textures(waywal_shader_engine_t *eng, shader_p
         }
     }
     glActiveTexture(GL_TEXTURE0);
+    if (eng && eng->draw_fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+    if (eng && eng->read_fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, eng->read_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
     for (int i = 0; i < 2; ++i) {
         if (pass->ping_pong_tex[i]) {
             glDeleteTextures(1, &pass->ping_pong_tex[i]);
@@ -2706,6 +2860,19 @@ static bool ensure_pass_ping_pong_textures(waywal_shader_engine_t *eng, shader_p
         if (zero_half) {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_HALF_FLOAT,
                             zero_half);
+            if (levels > 1) {
+                glGenerateMipmap(GL_TEXTURE_2D);
+            }
+        } else {
+            /* Zero-initialize GL_RGBA16F row-by-row using a stack buffer under memory pressure */
+            uint16_t zero_chunk[512 * 4] = {0};
+            for (uint32_t y = 0; y < h; ++y) {
+                for (uint32_t x = 0; x < w; x += 512u) {
+                    uint32_t chunk_w = (w - x < 512u) ? (w - x) : 512u;
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, (GLint)x, (GLint)y, (GLsizei)chunk_w, 1,
+                                    GL_RGBA, GL_HALF_FLOAT, zero_chunk);
+                }
+            }
             if (levels > 1) {
                 glGenerateMipmap(GL_TEXTURE_2D);
             }
@@ -2833,16 +3000,17 @@ static void ensure_blit_resources(waywal_shader_engine_t *eng)
             "    v_uv = pos;\n"
             "    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);\n"
             "}\n";
-        static const char *fs_src = "#version 310 es\n"
-                                    "precision highp float;\n"
-                                    "in highp vec2 v_uv;\n"
-                                    "layout(binding = 0) uniform highp sampler2D u_tex;\n"
-                                    "uniform int u_swap_rb;\n"
-                                    "out highp vec4 frag_color;\n"
-                                    "void main() {\n"
-                                    "    vec4 c = texture(u_tex, v_uv);\n"
-                                    "    frag_color = (u_swap_rb != 0) ? c.bgra : c;\n"
-                                    "}\n";
+        static const char *fs_src =
+            "#version 310 es\n"
+            "precision highp float;\n"
+            "in highp vec2 v_uv;\n"
+            "layout(binding = 0) uniform highp sampler2D u_tex;\n"
+            "uniform int u_swap_rb;\n"
+            "out highp vec4 frag_color;\n"
+            "void main() {\n"
+            "    vec4 c = texture(u_tex, v_uv);\n"
+            "    frag_color = vec4((u_swap_rb != 0) ? c.bgr : c.rgb, 1.0);\n"
+            "}\n";
         uint64_t key = waywal_shader_compute_cache_key(fs_src, eng->gpu_id);
         GLuint cached = try_load_cached_program(key);
         if (cached != 0) {
@@ -2892,8 +3060,22 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
     }
 
     make_context_current(eng);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    bool is_10bit_fmt = target_bo->is_10bit || target_bo->drm_format == DRM_FORMAT_XRGB2101010 ||
+                        target_bo->drm_format == DRM_FORMAT_ARGB2101010 ||
+                        target_bo->drm_format == DRM_FORMAT_XBGR2101010 ||
+                        target_bo->drm_format == DRM_FORMAT_ABGR2101010;
+    bool is_non_linear = (target_bo->modifier != DRM_FORMAT_MOD_LINEAR &&
+                          target_bo->modifier != DRM_FORMAT_MOD_INVALID);
+    bool use_scratch_blit = is_10bit_fmt || is_non_linear;
+    bool want_fbo_mode = use_scratch_blit || !eng->passes[4].is_compute;
+
     GLuint target_tex = 0;
-    if (!ensure_bo_imported(eng, target_bo, &target_tex)) {
+    if (!ensure_bo_imported(eng, target_bo, want_fbo_mode, &target_tex)) {
         return false;
     }
 
@@ -2967,14 +3149,6 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             mouse_smooth_vals[1] = (float)target_bo->height * 0.5f;
         }
     }
-
-    bool is_10bit_fmt = target_bo->is_10bit || target_bo->drm_format == DRM_FORMAT_XRGB2101010 ||
-                        target_bo->drm_format == DRM_FORMAT_ARGB2101010 ||
-                        target_bo->drm_format == DRM_FORMAT_XBGR2101010 ||
-                        target_bo->drm_format == DRM_FORMAT_ABGR2101010;
-    bool is_non_linear = (target_bo->modifier != DRM_FORMAT_MOD_LINEAR &&
-                          target_bo->modifier != DRM_FORMAT_MOD_INVALID);
-    bool use_scratch_blit = is_10bit_fmt || is_non_linear;
 
     if (use_scratch_blit) {
         ensure_scratch_texture(eng, target_bo->width, target_bo->height);
@@ -3341,6 +3515,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                                    GL_RGBA16F);
                 glDispatchCompute(pass_groups_x, pass_groups_y, 1u);
                 glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+                glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
                 if (pass->needs_mipmap) {
                     glActiveTexture(GL_TEXTURE0);
                     glBindTexture(GL_TEXTURE_2D, pass->ping_pong_tex[write_idx]);
@@ -3354,6 +3529,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                 glBindVertexArray(eng->blit_vao);
                 glDrawArrays(GL_TRIANGLES, 0, 3);
                 glBindVertexArray(0);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 if (pass->needs_mipmap) {
                     glActiveTexture(GL_TEXTURE0);
@@ -3379,6 +3555,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             glDispatchCompute(groups_x, groups_y, 1u);
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT |
                             GL_TEXTURE_FETCH_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
+            glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
         } else {
             glBindFramebuffer(GL_FRAMEBUFFER, eng->draw_fbo);
             if (!use_scratch_blit) {
@@ -3410,6 +3587,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             glBindVertexArray(eng->blit_vao);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glBindVertexArray(0);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
     }
@@ -3435,6 +3613,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             glBindVertexArray(eng->blit_vao);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glBindVertexArray(0);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
         } else {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, eng->read_fbo);
@@ -3443,6 +3622,8 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             glBlitFramebuffer(0, 0, (GLint)target_bo->width, (GLint)target_bo->height, 0, 0,
                               (GLint)target_bo->width, (GLint)target_bo->height,
                               GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
             glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         }
@@ -3453,6 +3634,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                                eng->scratch_tex, 0);
         const GLenum discard_att = GL_COLOR_ATTACHMENT0;
         glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &discard_att);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
@@ -3487,6 +3669,11 @@ bool waywal_shader_engine_blit_from_tex(waywal_shader_engine_t *eng, uint32_t sr
     }
 
     make_context_current(eng);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     GLuint real_src_tex = (GLuint)src_tex;
     if (eng->last_rendered_bo && eng->last_rendered_tex != 0 &&
         (src_tex == 0 || eng->last_rendered_bo->gl_tex == src_tex ||
@@ -3507,7 +3694,7 @@ bool waywal_shader_engine_blit_from_tex(waywal_shader_engine_t *eng, uint32_t sr
     }
 
     GLuint target_tex = 0;
-    if (!ensure_bo_imported(eng, target_bo, &target_tex)) {
+    if (!ensure_bo_imported(eng, target_bo, true, &target_tex)) {
         return false;
     }
     if (target_tex == real_src_tex) {
@@ -3534,6 +3721,7 @@ bool waywal_shader_engine_blit_from_tex(waywal_shader_engine_t *eng, uint32_t sr
         glBindVertexArray(eng->blit_vao);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glBindVertexArray(0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     } else {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, eng->read_fbo);
@@ -3543,6 +3731,8 @@ bool waywal_shader_engine_blit_from_tex(waywal_shader_engine_t *eng, uint32_t sr
             (src_w == target_bo->width && src_h == target_bo->height) ? GL_NEAREST : GL_LINEAR;
         glBlitFramebuffer(0, 0, (GLint)src_w, (GLint)src_h, 0, 0, (GLint)target_bo->width,
                           (GLint)target_bo->height, GL_COLOR_BUFFER_BIT, filter);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     }
@@ -3573,7 +3763,17 @@ bool waywal_shader_engine_blit_bo(waywal_shader_engine_t *eng, dmabuf_bo_t *src_
     }
     make_context_current(eng);
     GLuint src_tex = 0;
-    if (!ensure_bo_imported(eng, src_bo, &src_tex)) {
+    for (size_t i = 0; i < eng->num_imported_bos; ++i) {
+        if (eng->imported_bos[i].bo == src_bo && eng->imported_bos[i].fd0 == src_bo->fd[0] &&
+            eng->imported_bos[i].width == src_bo->width &&
+            eng->imported_bos[i].height == src_bo->height &&
+            eng->imported_bos[i].drm_format == src_bo->drm_format &&
+            eng->imported_bos[i].gl_tex != 0) {
+            src_tex = eng->imported_bos[i].gl_tex;
+            break;
+        }
+    }
+    if (src_tex == 0 && !ensure_bo_imported(eng, src_bo, true, &src_tex)) {
         return false;
     }
     return waywal_shader_engine_blit_from_tex(eng, src_tex, src_bo->width, src_bo->height,

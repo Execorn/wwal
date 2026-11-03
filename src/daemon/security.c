@@ -28,10 +28,7 @@
 
 static const waywal_config_t *g_sandbox_cfg = NULL;
 
-void security_sandbox_register_config(const struct waywal_config *cfg)
-{
-    g_sandbox_cfg = cfg;
-}
+void security_sandbox_register_config(const struct waywal_config *cfg) { g_sandbox_cfg = cfg; }
 
 #ifndef landlock_create_ruleset
 static inline int landlock_create_ruleset(const struct landlock_ruleset_attr *const attr,
@@ -72,10 +69,7 @@ static void mkdir_p_mode(const char *path, mode_t mode)
     (void)mkdir(tmp, mode);
 }
 
-static void mkdir_p_user_dir(const char *path)
-{
-    mkdir_p_mode(path, 0700);
-}
+static void mkdir_p_user_dir(const char *path) { mkdir_p_mode(path, 0700); }
 
 static bool resolve_sandbox_home(char *buf, size_t cap)
 {
@@ -143,8 +137,9 @@ static bool is_sensitive_target_path(const char *path)
         char real_home[4096];
         const char *homes[2] = {home, realpath(home, real_home) ? real_home : NULL};
         static const char *const sensitive_rel[] = {
-            ".ssh",  ".gnupg",  ".aws",   ".pki", ".password-store",
-            ".kube", ".docker", ".netrc", ".local/share/keyrings",
+            ".ssh",    ".gnupg",          ".aws",
+            ".pki",    ".password-store", ".kube",
+            ".docker", ".netrc",          ".local/share/keyrings",
         };
         for (size_t h = 0; h < 2; ++h) {
             if (!homes[h] || homes[h][0] == '\0')
@@ -165,8 +160,8 @@ static bool is_sensitive_target_path(const char *path)
     const char *xdg_data = getenv("XDG_DATA_HOME");
     if (xdg_data && xdg_data[0] != '\0') {
         char real_xdg_data[4096];
-        const char *data_roots[2] = {
-            xdg_data, realpath(xdg_data, real_xdg_data) ? real_xdg_data : NULL};
+        const char *data_roots[2] = {xdg_data,
+                                     realpath(xdg_data, real_xdg_data) ? real_xdg_data : NULL};
         for (size_t d = 0; d < 2; ++d) {
             if (!data_roots[d] || data_roots[d][0] == '\0')
                 continue;
@@ -189,8 +184,8 @@ static bool is_single_sensitive_ancestor_str(const char *cand)
         return true;
 
     static const char *const sys_ancestors[] = {
-        "/",      "/etc",  "/usr",  "/bin",  "/sbin", "/lib", "/lib64",
-        "/boot",  "/proc", "/sys",  "/dev",  "/var",  "/run", "/root",
+        "/",     "/etc",  "/usr", "/bin", "/sbin", "/lib", "/lib64",
+        "/boot", "/proc", "/sys", "/dev", "/var",  "/run", "/root",
     };
     for (size_t i = 0; i < sizeof(sys_ancestors) / sizeof(sys_ancestors[0]); ++i) {
         if (strcmp(cand, sys_ancestors[i]) == 0)
@@ -388,6 +383,26 @@ static void apply_landlock_sandbox(const char *runtime_dir)
         add_landlock_dir_rule(ruleset_fd, ro_paths[i], ro_access);
     }
 
+    /* Permit read-only access to external media mounts if present at sandbox init */
+    const char *ext_mounts[] = {"/media", "/run/media", "/mnt"};
+    for (size_t i = 0; i < sizeof(ext_mounts) / sizeof(ext_mounts[0]); ++i) {
+        struct stat st_m;
+        if (stat(ext_mounts[i], &st_m) == 0 && S_ISDIR(st_m.st_mode)) {
+            add_landlock_dir_rule(ruleset_fd, ext_mounts[i], ro_access);
+        }
+    }
+    const char *cur_user = getenv("USER");
+    if (cur_user && cur_user[0] != '\0') {
+        char user_media[4096];
+        if (snprintf(user_media, sizeof(user_media), "/run/media/%s", cur_user) <
+            (int)sizeof(user_media)) {
+            struct stat st_u;
+            if (stat(user_media, &st_u) == 0 && S_ISDIR(st_u.st_mode)) {
+                add_landlock_dir_rule(ruleset_fd, user_media, ro_access);
+            }
+        }
+    }
+
     /* Allow read-write strictly for DRI/GPU device nodes (/dev, /dev/dri) and /tmp */
     const char *rw_paths[] = {"/dev", "/dev/dri", "/tmp", NULL};
     for (int i = 0; rw_paths[i] != NULL; ++i) {
@@ -536,10 +551,10 @@ static void apply_landlock_sandbox(const char *runtime_dir)
                     continue;
                 int n = snprintf(path_buf, sizeof(path_buf), "%s/%s", home, ent->d_name);
                 if (n > 0 && (size_t)n < sizeof(path_buf)) {
-                    __u64 ent_access = (strcmp(ent->d_name, "bin") == 0 ||
-                                        strcmp(ent->d_name, ".cargo") == 0)
-                                           ? rx_access
-                                           : ro_access;
+                    __u64 ent_access =
+                        (strcmp(ent->d_name, "bin") == 0 || strcmp(ent->d_name, ".cargo") == 0)
+                            ? rx_access
+                            : ro_access;
                     add_landlock_dir_rule(ruleset_fd, path_buf, ent_access);
                 }
             }
@@ -564,12 +579,8 @@ static void apply_landlock_sandbox(const char *runtime_dir)
         }
 
         const char *home_ro_subdirs[] = {
-            "Pictures",
-            "Videos",
-            "Wallpapers",
-            "Downloads",
-            ".config",
-            ".local/share/wallpapers",
+            "Pictures",           "Videos",  "Wallpapers",
+            "Downloads",          ".config", ".local/share/wallpapers",
             ".local/share/Steam",
         };
         for (size_t i = 0; i < sizeof(home_ro_subdirs) / sizeof(home_ro_subdirs[0]); ++i) {
@@ -657,8 +668,8 @@ static void apply_landlock_sandbox(const char *runtime_dir)
                 ro_cfg_paths[ro_cfg_count++] = g_sandbox_cfg->outputs[i].path;
             }
         }
-        for (size_t i = 0;
-             i < g_sandbox_cfg->workspace_count && i < WAYWAL_CONFIG_MAX_WORKSPACES; ++i) {
+        for (size_t i = 0; i < g_sandbox_cfg->workspace_count && i < WAYWAL_CONFIG_MAX_WORKSPACES;
+             ++i) {
             if (g_sandbox_cfg->workspaces[i].path[0] != '\0') {
                 ro_cfg_paths[ro_cfg_count++] = g_sandbox_cfg->workspaces[i].path;
             }
@@ -717,8 +728,8 @@ bool security_sandbox_apply(const char *runtime_dir)
     if (ctx) {
         /* Immediately terminate process on high-risk kernel/namespace syscalls */
         const int denied_syscalls[] = {
-            SCMP_SYS(ptrace),        SCMP_SYS(mount),      SCMP_SYS(umount2),     SCMP_SYS(chroot),
-            SCMP_SYS(pivot_root),    SCMP_SYS(reboot),     SCMP_SYS(kexec_load),  SCMP_SYS(init_module),
+            SCMP_SYS(ptrace),        SCMP_SYS(mount),  SCMP_SYS(umount2),    SCMP_SYS(chroot),
+            SCMP_SYS(pivot_root),    SCMP_SYS(reboot), SCMP_SYS(kexec_load), SCMP_SYS(init_module),
             SCMP_SYS(delete_module), SCMP_SYS(bpf),
         };
 

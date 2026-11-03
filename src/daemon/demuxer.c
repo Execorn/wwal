@@ -6,6 +6,7 @@
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,8 @@ typedef struct {
     size_t num_samples;
     size_t current_sample_idx;
     size_t last_evicted_offset;
+    size_t *keyframe_indices;
+    size_t num_keyframes;
 } mp4_state_t;
 
 static inline uint16_t read_u16_be(const uint8_t *p)
@@ -158,19 +161,46 @@ static bool mp4_seek_us(demuxer_t *d, int64_t target_pts_us)
 
     size_t best_idx = 0;
     if (target_pts_us > 0) {
-        /* Find nearest keyframe at or before target_pts_us */
-        for (size_t i = 0; i < st->num_samples; ++i) {
-            if (st->samples[i].is_keyframe) {
-                if (st->samples[i].pts_us > target_pts_us) {
-                    break;
+        if (st->num_keyframes > 0 && st->keyframe_indices) {
+            size_t left = 0;
+            size_t right = st->num_keyframes;
+            while (left < right) {
+                size_t mid = left + (right - left) / 2;
+                size_t s_idx = st->keyframe_indices[mid];
+                if (st->samples[s_idx].pts_us <= target_pts_us) {
+                    best_idx = s_idx;
+                    left = mid + 1;
+                } else {
+                    right = mid;
                 }
-                best_idx = i;
+            }
+        } else {
+            /* Fallback linear search */
+            for (size_t i = 0; i < st->num_samples; ++i) {
+                if (st->samples[i].is_keyframe) {
+                    if (st->samples[i].pts_us > target_pts_us) {
+                        break;
+                    }
+                    best_idx = i;
+                }
             }
         }
     }
 
     if (st->owns_mmap) {
         evict_mmap_for_seek(d, st->samples[best_idx].offset);
+        if (d->mapped_buf && d->mapped_size > 0) {
+            size_t off = st->samples[best_idx].offset;
+            uintptr_t base = (uintptr_t)d->mapped_buf;
+            uintptr_t page_start = (base + off) & ~(uintptr_t)4095U;
+            size_t prefetch_len = (2U << 20);
+            if (off + prefetch_len > d->mapped_size) {
+                prefetch_len = (d->mapped_size > off) ? (d->mapped_size - off) : 0;
+            }
+            if (prefetch_len > 0) {
+                madvise((void *)page_start, prefetch_len, MADV_WILLNEED);
+            }
+        }
     }
 
     st->current_sample_idx = best_idx;
@@ -187,6 +217,9 @@ static void mp4_destroy(demuxer_t *d)
         mp4_state_t *st = (mp4_state_t *)d->internal_state;
         if (st->samples) {
             free(st->samples);
+        }
+        if (st->keyframe_indices) {
+            free(st->keyframe_indices);
         }
         if (st->owns_mmap && d->mapped_buf && d->mapped_size > 0) {
             munmap((void *)d->mapped_buf, d->mapped_size);
@@ -527,6 +560,8 @@ typedef struct {
     size_t num_samples;
     size_t current_sample_idx;
     size_t last_evicted_offset;
+    size_t *keyframe_indices;
+    size_t num_keyframes;
 } webm_state_t;
 
 static bool ebml_read_vint(const uint8_t *data, size_t size, size_t *offset, uint64_t *out_val,
@@ -612,18 +647,46 @@ static bool webm_seek_us(demuxer_t *d, int64_t target_pts_us)
 
     size_t best_idx = 0;
     if (target_pts_us > 0) {
-        for (size_t i = 0; i < st->num_samples; ++i) {
-            if (st->samples[i].is_keyframe) {
-                if (st->samples[i].pts_us > target_pts_us) {
-                    break;
+        if (st->num_keyframes > 0 && st->keyframe_indices) {
+            size_t left = 0;
+            size_t right = st->num_keyframes;
+            while (left < right) {
+                size_t mid = left + (right - left) / 2;
+                size_t s_idx = st->keyframe_indices[mid];
+                if (st->samples[s_idx].pts_us <= target_pts_us) {
+                    best_idx = s_idx;
+                    left = mid + 1;
+                } else {
+                    right = mid;
                 }
-                best_idx = i;
+            }
+        } else {
+            /* Fallback linear search */
+            for (size_t i = 0; i < st->num_samples; ++i) {
+                if (st->samples[i].is_keyframe) {
+                    if (st->samples[i].pts_us > target_pts_us) {
+                        break;
+                    }
+                    best_idx = i;
+                }
             }
         }
     }
 
     if (st->owns_mmap) {
         evict_mmap_for_seek(d, st->samples[best_idx].offset);
+        if (d->mapped_buf && d->mapped_size > 0) {
+            size_t off = st->samples[best_idx].offset;
+            uintptr_t base = (uintptr_t)d->mapped_buf;
+            uintptr_t page_start = (base + off) & ~(uintptr_t)4095U;
+            size_t prefetch_len = (2U << 20);
+            if (off + prefetch_len > d->mapped_size) {
+                prefetch_len = (d->mapped_size > off) ? (d->mapped_size - off) : 0;
+            }
+            if (prefetch_len > 0) {
+                madvise((void *)page_start, prefetch_len, MADV_WILLNEED);
+            }
+        }
     }
 
     st->current_sample_idx = best_idx;
@@ -640,6 +703,9 @@ static void webm_destroy(demuxer_t *d)
         webm_state_t *st = (webm_state_t *)d->internal_state;
         if (st->samples) {
             free(st->samples);
+        }
+        if (st->keyframe_indices) {
+            free(st->keyframe_indices);
         }
         if (st->owns_mmap && d->mapped_buf && d->mapped_size > 0) {
             munmap((void *)d->mapped_buf, d->mapped_size);
@@ -723,6 +789,9 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                             break;
                         if (inf_id == EBML_ID_TIMECODE_SCALE) {
                             timecode_scale = ebml_read_uint(data + info_off, inf_size);
+                            if (timecode_scale == 0 || timecode_scale > 1000000000ULL) {
+                                timecode_scale = 1000000ULL; /* Clamp to default 1ms */
+                            }
                         } else if (inf_id == EBML_ID_DURATION) {
                             if (inf_size == 4) {
                                 uint32_t bits = read_u32_be(data + info_off);
@@ -908,7 +977,9 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                             block_time = 0;
                                         }
                                         int64_t pts_us =
-                                            (block_time * (int64_t)timecode_scale) / 1000LL;
+                                            (int64_t)((__extension__(unsigned __int128) block_time *
+                                                       timecode_scale) /
+                                                      1000ULL);
                                         bool is_kf = is_block_group ? !has_reference_block
                                                                     : ((flags & 0x80) != 0);
                                         int64_t lace_step_us =
@@ -991,46 +1062,57 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
                                                 }
                                             } else if (lacing == 3) {
                                                 /* EBML lacing */
-                                                uint64_t first_sz = 0;
-                                                if (!ebml_read_vint(data, blk_end, &blk_off,
-                                                                    &first_sz, NULL, true) ||
-                                                    first_sz > blk_end - blk_off) {
-                                                    lace_valid = false;
-                                                } else {
-                                                    lace_sizes[0] = (size_t)first_sz;
-                                                    sum_sizes = lace_sizes[0];
-                                                    for (uint32_t li = 1; li + 1 < lace_count;
-                                                         ++li) {
-                                                        uint64_t raw_vint = 0;
-                                                        uint32_t vlen = 0;
-                                                        if (!ebml_read_vint(data, blk_end, &blk_off,
-                                                                            &raw_vint, &vlen,
-                                                                            true) ||
-                                                            vlen == 0 || vlen > 8) {
-                                                            lace_valid = false;
-                                                            break;
-                                                        }
-                                                        int64_t bias =
-                                                            (1LL << (7 * vlen - 1)) - 1LL;
-                                                        int64_t delta = (int64_t)raw_vint - bias;
-                                                        int64_t next_sz =
-                                                            (int64_t)lace_sizes[li - 1] + delta;
-                                                        if (next_sz <= 0 ||
-                                                            sum_sizes > blk_end - blk_off ||
-                                                            (size_t)next_sz >
-                                                                (blk_end - blk_off) - sum_sizes) {
-                                                            lace_valid = false;
-                                                            break;
-                                                        }
-                                                        lace_sizes[li] = (size_t)next_sz;
-                                                        sum_sizes += lace_sizes[li];
-                                                    }
-                                                    if (lace_valid &&
-                                                        sum_sizes <= blk_end - blk_off) {
-                                                        lace_sizes[lace_count - 1] =
-                                                            (blk_end - blk_off) - sum_sizes;
-                                                    } else {
+                                                if (lace_count == 1) {
+                                                    if (blk_off >= blk_end) {
                                                         lace_valid = false;
+                                                    } else {
+                                                        lace_sizes[0] = blk_end - blk_off;
+                                                        sum_sizes = lace_sizes[0];
+                                                    }
+                                                } else {
+                                                    uint64_t first_sz = 0;
+                                                    if (!ebml_read_vint(data, blk_end, &blk_off,
+                                                                        &first_sz, NULL, true) ||
+                                                        first_sz > blk_end - blk_off) {
+                                                        lace_valid = false;
+                                                    } else {
+                                                        lace_sizes[0] = (size_t)first_sz;
+                                                        sum_sizes = lace_sizes[0];
+                                                        for (uint32_t li = 1; li + 1 < lace_count;
+                                                             ++li) {
+                                                            uint64_t raw_vint = 0;
+                                                            uint32_t vlen = 0;
+                                                            if (!ebml_read_vint(data, blk_end,
+                                                                                &blk_off, &raw_vint,
+                                                                                &vlen, true) ||
+                                                                vlen == 0 || vlen > 8) {
+                                                                lace_valid = false;
+                                                                break;
+                                                            }
+                                                            int64_t bias =
+                                                                (1LL << (7 * vlen - 1)) - 1LL;
+                                                            int64_t delta =
+                                                                (int64_t)raw_vint - bias;
+                                                            int64_t next_sz =
+                                                                (int64_t)lace_sizes[li - 1] + delta;
+                                                            if (next_sz <= 0 ||
+                                                                sum_sizes > blk_end - blk_off ||
+                                                                (size_t)next_sz >
+                                                                    (blk_end - blk_off) -
+                                                                        sum_sizes) {
+                                                                lace_valid = false;
+                                                                break;
+                                                            }
+                                                            lace_sizes[li] = (size_t)next_sz;
+                                                            sum_sizes += lace_sizes[li];
+                                                        }
+                                                        if (lace_valid &&
+                                                            sum_sizes <= blk_end - blk_off) {
+                                                            lace_sizes[lace_count - 1] =
+                                                                (blk_end - blk_off) - sum_sizes;
+                                                        } else {
+                                                            lace_valid = false;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1108,9 +1190,29 @@ static demuxer_t *webm_demuxer_open(const uint8_t *data, size_t size)
     st->num_samples = samples_count;
     st->current_sample_idx = 0;
 
+    size_t kf_count = 0;
+    for (size_t i = 0; i < samples_count; ++i) {
+        if (samples[i].is_keyframe)
+            kf_count++;
+    }
+    size_t *kf_indices = NULL;
+    if (kf_count > 0) {
+        kf_indices = (size_t *)malloc(kf_count * sizeof(size_t));
+        if (kf_indices) {
+            size_t ki = 0;
+            for (size_t i = 0; i < samples_count; ++i) {
+                if (samples[i].is_keyframe)
+                    kf_indices[ki++] = i;
+            }
+        }
+    }
+    st->keyframe_indices = kf_indices;
+    st->num_keyframes = (kf_indices != NULL) ? kf_count : 0;
+
     int64_t last_pts = samples[samples_count - 1].pts_us;
-    int64_t info_duration_us =
-        (raw_duration > 0.0) ? (int64_t)(raw_duration * (double)timecode_scale / 1000.0 + 0.5) : 0;
+    int64_t info_duration_us = (raw_duration > 0.0 && isfinite(raw_duration))
+                                   ? (int64_t)(raw_duration * (double)timecode_scale / 1000.0 + 0.5)
+                                   : 0;
     int64_t total_duration_us = (info_duration_us > last_pts) ? info_duration_us : last_pts;
 
     d->mapped_buf = data;
@@ -1384,6 +1486,25 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size)
     st->num_samples = sample_count;
     st->current_sample_idx = 0;
 
+    size_t kf_count = 0;
+    for (size_t i = 0; i < sample_count; ++i) {
+        if (samples[i].is_keyframe)
+            kf_count++;
+    }
+    size_t *kf_indices = NULL;
+    if (kf_count > 0) {
+        kf_indices = (size_t *)malloc(kf_count * sizeof(size_t));
+        if (kf_indices) {
+            size_t ki = 0;
+            for (size_t i = 0; i < sample_count; ++i) {
+                if (samples[i].is_keyframe)
+                    kf_indices[ki++] = i;
+            }
+        }
+    }
+    st->keyframe_indices = kf_indices;
+    st->num_keyframes = (kf_indices != NULL) ? kf_count : 0;
+
     d->mapped_buf = data;
     d->mapped_size = size;
     d->codec = pt.codec;
@@ -1456,5 +1577,8 @@ demuxer_t *demuxer_open_file(const char *filepath)
     state->file_fd = fd;
     state->owns_mmap = true;
     evict_mmap_for_seek(d, 0);
+    madvise(mapped, file_size, MADV_SEQUENTIAL);
+    size_t prefetch_len = file_size < (2U << 20) ? file_size : (2U << 20);
+    madvise(mapped, prefetch_len, MADV_WILLNEED);
     return d;
 }

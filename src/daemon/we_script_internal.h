@@ -333,6 +333,7 @@ struct we_script {
 
     /* Watchdog telemetry */
     struct timespec start_ts;
+    clockid_t clock_id;
     uint32_t step_count;
     uint32_t last_steps;
     uint32_t eval_depth;

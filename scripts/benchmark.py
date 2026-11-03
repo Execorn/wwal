@@ -40,6 +40,9 @@ IMG2 = os.environ.get("WWAL_BENCH_IMG2", DEFAULT_IMG)
 _GPU_BUSY_PATHS = sorted(glob.glob("/sys/class/drm/card*/device/gpu_busy_percent"))
 _VRAM_USED_PATHS = sorted(glob.glob("/sys/class/drm/card*/device/mem_info_vram_used"))
 _HAS_NVIDIA_SMI = shutil.which("nvidia-smi") is not None
+_LAST_NVIDIA_QUERY_TIME = 0.0
+_CACHED_GPU_BUSY = 0
+_CACHED_VRAM_MB = 0.0
 
 FORBIDDEN_DT_NEEDED = (
     "libavcodec",
@@ -54,6 +57,31 @@ FORBIDDEN_DT_NEEDED = (
 )
 
 
+def _query_nvidia_smi() -> tuple[int, float]:
+    global _HAS_NVIDIA_SMI, _LAST_NVIDIA_QUERY_TIME, _CACHED_GPU_BUSY, _CACHED_VRAM_MB
+    now = time.monotonic()
+    if not _HAS_NVIDIA_SMI:
+        return 0, 0.0
+    if now - _LAST_NVIDIA_QUERY_TIME < 0.25:
+        return _CACHED_GPU_BUSY, _CACHED_VRAM_MB
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.2,
+        )
+        line = out.strip().splitlines()[0]
+        parts = [p.strip() for p in line.split(",")]
+        _CACHED_GPU_BUSY = int(parts[0])
+        _CACHED_VRAM_MB = float(parts[1])
+        _LAST_NVIDIA_QUERY_TIME = now
+    except Exception:
+        # Cache failure: if nvidia-smi times out (timeout=0.2) or fails, skip further queries to avoid sampling lag
+        _HAS_NVIDIA_SMI = False
+    return _CACHED_GPU_BUSY, _CACHED_VRAM_MB
+
+
 def get_gpu_busy() -> int:
     for path in _GPU_BUSY_PATHS:
         try:
@@ -62,16 +90,8 @@ def get_gpu_busy() -> int:
         except Exception:
             continue
     if _HAS_NVIDIA_SMI:
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=0.5,
-            )
-            return int(out.strip().splitlines()[0])
-        except Exception:
-            pass
+        busy, _ = _query_nvidia_smi()
+        return busy
     return 0
 
 
@@ -83,16 +103,8 @@ def get_vram_mb() -> float:
         except Exception:
             continue
     if _HAS_NVIDIA_SMI:
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=0.5,
-            )
-            return float(out.strip().splitlines()[0])
-        except Exception:
-            pass
+        _, vram = _query_nvidia_smi()
+        return vram
     return 0.0
 
 

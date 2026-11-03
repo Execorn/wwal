@@ -144,6 +144,8 @@ typedef struct {
     char filepath[4096];
     uint32_t scaling_mode;
     uint32_t no_cache;
+    float volume;
+    bool mute_on_audio;
 } waywal_video_payload_t;
 
 typedef enum : uint32_t {
@@ -225,6 +227,10 @@ typedef struct {
     uint8_t invert_y;
     uint8_t pos_y_inverted;
     uint32_t no_cache;
+    float volume;
+    bool mute_on_audio;
+    float speed;
+    char backdrop[256];
 } waywal_shader_payload_t;
 
 typedef struct {
@@ -256,6 +262,10 @@ typedef struct {
     uint8_t has_seed_color;
     uint8_t client_exported_theme;
     uint32_t seed_color;
+    float volume;
+    bool mute_on_audio;
+    char backdrop[256];
+    char layer_name[32];
 } waywal_workshop_payload_t;
 
 typedef struct {

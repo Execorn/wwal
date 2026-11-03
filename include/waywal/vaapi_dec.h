@@ -15,8 +15,10 @@
 extern "C" {
 #endif
 
-#define WAYWAL_VA_SURFACE_POOL_SIZE 24
-#define WAYWAL_VA_VPP_POOL_SIZE     2
+#define VAAPI_MAX_SURFACES          32
+#define WAYWAL_VA_SURFACE_POOL_SIZE 32
+#define WAYWAL_VA_VPP_POOL_SIZE     8
+#define VAAPI_VPP_RING_SIZE         WAYWAL_VA_VPP_POOL_SIZE
 
 typedef struct {
     VASurfaceID surface;
@@ -271,6 +273,7 @@ typedef struct {
     bool has_vpp;
     bool vpp_warmed_up;
     bool initialized;
+    uint32_t export_layer_mode; /* Cached working VA_EXPORT_SURFACE_*_LAYERS mode */
     const bool
         *surface_busy_mask; /* External compositor in-use flags (WAYWAL_VA_SURFACE_POOL_SIZE) */
 } vaapi_decoder_t;

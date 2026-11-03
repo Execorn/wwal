@@ -89,16 +89,27 @@ static void arm_periodic_timer_fd(int timer_fd, uint32_t fps)
     uint64_t interval_ns = 1000000000ULL / (uint64_t)fps;
     if (interval_ns == 0)
         interval_ns = 1000000ULL;
+    time_t exp_sec = (time_t)(interval_ns / 1000000000ULL);
+    long exp_nsec = (long)(interval_ns % 1000000000ULL);
+
+    struct itimerspec cur_its;
+    if (timerfd_gettime(timer_fd, &cur_its) == 0) {
+        if (cur_its.it_interval.tv_sec == exp_sec && cur_its.it_interval.tv_nsec == exp_nsec &&
+            (cur_its.it_value.tv_sec != 0 || cur_its.it_value.tv_nsec != 0)) {
+            return;
+        }
+    }
+
     struct itimerspec its = {
         .it_interval =
             {
-                .tv_sec = (time_t)(interval_ns / 1000000000ULL),
-                .tv_nsec = (long)(interval_ns % 1000000000ULL),
+                .tv_sec = exp_sec,
+                .tv_nsec = exp_nsec,
             },
         .it_value =
             {
-                .tv_sec = (time_t)(interval_ns / 1000000000ULL),
-                .tv_nsec = (long)(interval_ns % 1000000000ULL),
+                .tv_sec = exp_sec,
+                .tv_nsec = exp_nsec,
             },
     };
     drain_timer_fd(timer_fd);
@@ -236,11 +247,15 @@ static bool output_matches_slideshow_payload(const output_node_t *out,
         return false;
     if (!spay || spay->num_target_outputs == 0)
         return true;
-    uint32_t max_t = spay->num_target_outputs <= 16 ? spay->num_target_outputs : 16;
-    for (uint32_t i = 0; i < max_t; ++i) {
-        if (strcmp(spay->target_outputs[i], "*") == 0 ||
-            strcmp(out->name, spay->target_outputs[i]) == 0 ||
-            output_matches_target_spec(out, spay->target_outputs[i])) {
+    for (uint32_t i = 0; i < spay->num_target_outputs && i < 16; ++i) {
+        if (strncmp(spay->target_outputs[i], "*", sizeof(spay->target_outputs[i])) == 0 ||
+            strncmp(spay->target_outputs[i], out->name, sizeof(spay->target_outputs[i])) == 0) {
+            return true;
+        }
+        char target_buf[sizeof(spay->target_outputs[i]) + 1];
+        memcpy(target_buf, spay->target_outputs[i], sizeof(spay->target_outputs[i]));
+        target_buf[sizeof(spay->target_outputs[i])] = '\0';
+        if (output_matches_target_spec(out, target_buf)) {
             return true;
         }
     }
@@ -3140,6 +3155,11 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
             slideshow_stop(&state->slideshow);
         }
         if (state->shader_eng) {
+            for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
+                if (o->shader_eng == state->shader_eng) {
+                    o->shader_eng = NULL;
+                }
+            }
             int ino_fd = waywal_shader_engine_get_inotify_fd(state->shader_eng);
             if (ino_fd >= 0) {
                 unregister_fd_from_loops(state, ino_fd);
@@ -3551,6 +3571,54 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
     }
     case WAYWAL_CONTENT_STATIC_IMAGE:
     case WAYWAL_CONTENT_ANIMATION: {
+        if (saved->backdrop[0] != '\0') {
+            state->backdrop_auto_blur = (strcasecmp(saved->backdrop, "auto-blur") == 0);
+            if (strcasecmp(saved->backdrop, "none") == 0) {
+                state->backdrop_path[0] = '\0';
+            } else if (!state->backdrop_auto_blur) {
+                strncpy(state->backdrop_path, saved->backdrop, sizeof(state->backdrop_path) - 1);
+                state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+            }
+        }
+        if (saved->kind == WAYWAL_CONTENT_STATIC_IMAGE && saved->depth_map_path[0] != '\0' &&
+            state->dmabuf_ctx.available) {
+            uint8_t *px = NULL;
+            uint32_t w = 0, h = 0;
+            if (image_load(saved->media_path, &px, &w, &h) && px && w > 0 && h > 0) {
+                waywal_img_metadata_t meta;
+                memset(&meta, 0, sizeof(meta));
+                meta.width = w;
+                meta.height = h;
+                meta.scaling_mode = (uint32_t)saved->scaling;
+                meta.filter_mode = (uint32_t)saved->filter;
+                meta.ten_bit = saved->ten_bit;
+                meta.crop_gravity_x = saved->has_crop_gravity ? saved->crop_gravity_x : 0.5f;
+                meta.crop_gravity_y = saved->has_crop_gravity ? saved->crop_gravity_y : 0.5f;
+                meta.has_crop_gravity = saved->has_crop_gravity ? 1 : 0;
+                strncpy(meta.filepath, saved->media_path, sizeof(meta.filepath) - 1);
+                strncpy(meta.depth_map_path, saved->depth_map_path,
+                        sizeof(meta.depth_map_path) - 1);
+                meta.depth_strength = saved->depth_strength > 0.0f ? saved->depth_strength : 1.0f;
+                strncpy(meta.backdrop, saved->backdrop, sizeof(meta.backdrop) - 1);
+
+                for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                    if (output_matches_target_spec(out, target)) {
+                        stop_engines_on_output(state, out, false, false, false, false);
+                        out->scaling_mode = meta.scaling_mode;
+                        out->filter_mode = meta.filter_mode;
+                        out->ten_bit = meta.ten_bit;
+                        out->crop_gravity_x = meta.crop_gravity_x;
+                        out->crop_gravity_y = meta.crop_gravity_y;
+                        out->has_crop_gravity = (meta.has_crop_gravity != 0);
+                    }
+                }
+                bool ok = daemon_activate_depth_parallax(state, px, w, h, &meta, target);
+                image_free(px);
+                if (ok) {
+                    return true;
+                }
+            }
+        }
         return daemon_render_image_on_target(state, saved->media_path, target, saved->scaling,
                                              saved->filter, saved->ten_bit, WAYWAL_TRANSITION_NONE,
                                              0);
@@ -3610,12 +3678,59 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
     case WAYWAL_CONTENT_VIDEO: {
         if (saved->media_path[0] == '\0')
             return false;
-        return daemon_start_video_file_isolated(state, saved->media_path, target, saved->scaling,
-                                                NULL, 0, 0, false);
+        if (isfinite(saved->volume) && saved->volume >= 0.0f) {
+            float clamped = saved->volume > 1.0f ? 1.0f : saved->volume;
+            state->audio_volume = clamped;
+            if (state->audio_fft) {
+                waywal_audio_fft_set_volume(state->audio_fft, clamped);
+            }
+        }
+        if (saved->mute_on_audio) {
+            state->mute_on_audio = true;
+            if (state->audio_fft) {
+                waywal_audio_fft_set_mute_on_audio(state->audio_fft, true);
+            }
+        }
+        bool ok = daemon_start_video_file_isolated(state, saved->media_path, target, saved->scaling,
+                                                   NULL, 0, 0, false);
+        if (ok) {
+            float eff_speed = saved->video_speed > 0.01f ? saved->video_speed : 1.0f;
+            state->video_engine.playback_speed = eff_speed;
+            state->video_engine.loop_count = saved->loop_count;
+            for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                if (output_matches_target_spec(out, target) && out->video_eng) {
+                    out->video_eng->playback_speed = eff_speed;
+                    out->video_eng->loop_count = saved->loop_count;
+                }
+            }
+        }
+        return ok;
     }
     case WAYWAL_CONTENT_SHADER: {
         if (saved->media_path[0] == '\0')
             return false;
+        if (isfinite(saved->volume) && saved->volume >= 0.0f) {
+            float clamped = saved->volume > 1.0f ? 1.0f : saved->volume;
+            state->audio_volume = clamped;
+            if (state->audio_fft) {
+                waywal_audio_fft_set_volume(state->audio_fft, clamped);
+            }
+        }
+        if (saved->mute_on_audio) {
+            state->mute_on_audio = true;
+            if (state->audio_fft) {
+                waywal_audio_fft_set_mute_on_audio(state->audio_fft, true);
+            }
+        }
+        if (saved->backdrop[0] != '\0') {
+            state->backdrop_auto_blur = (strcasecmp(saved->backdrop, "auto-blur") == 0);
+            if (strcasecmp(saved->backdrop, "none") == 0) {
+                state->backdrop_path[0] = '\0';
+            } else if (!state->backdrop_auto_blur) {
+                strncpy(state->backdrop_path, saved->backdrop, sizeof(state->backdrop_path) - 1);
+                state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+            }
+        }
         waywal_shader_payload_t spay;
         memset(&spay, 0, sizeof(spay));
         strncpy(spay.output, target, sizeof(spay.output) - 1);
@@ -3624,11 +3739,37 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
         spay.audio_reactive = saved->audio_reactive;
         spay.scaling_mode = (uint32_t)saved->scaling;
         spay.invert_y = state->config.transition.invert_y ? 1 : 0;
+        spay.volume = saved->volume;
+        spay.mute_on_audio = saved->mute_on_audio;
+        spay.speed = saved->video_speed > 0.01f ? saved->video_speed : 1.0f;
+        strncpy(spay.backdrop, saved->backdrop, sizeof(spay.backdrop) - 1);
         return daemon_activate_shader(state, &spay);
     }
     case WAYWAL_CONTENT_WORKSHOP: {
         if (saved->media_path[0] == '\0')
             return false;
+        if (isfinite(saved->volume) && saved->volume >= 0.0f) {
+            float clamped = saved->volume > 1.0f ? 1.0f : saved->volume;
+            state->audio_volume = clamped;
+            if (state->audio_fft) {
+                waywal_audio_fft_set_volume(state->audio_fft, clamped);
+            }
+        }
+        if (saved->mute_on_audio) {
+            state->mute_on_audio = true;
+            if (state->audio_fft) {
+                waywal_audio_fft_set_mute_on_audio(state->audio_fft, true);
+            }
+        }
+        if (saved->backdrop[0] != '\0') {
+            state->backdrop_auto_blur = (strcasecmp(saved->backdrop, "auto-blur") == 0);
+            if (strcasecmp(saved->backdrop, "none") == 0) {
+                state->backdrop_path[0] = '\0';
+            } else if (!state->backdrop_auto_blur) {
+                strncpy(state->backdrop_path, saved->backdrop, sizeof(state->backdrop_path) - 1);
+                state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+            }
+        }
         waywal_workshop_payload_t wpay;
         memset(&wpay, 0, sizeof(wpay));
         strncpy(wpay.output, target, sizeof(wpay.output) - 1);
@@ -3638,6 +3779,9 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
         wpay.audio_reactive = saved->audio_reactive;
         wpay.scaling_mode = (uint32_t)saved->scaling;
         wpay.invert_y = state->config.transition.invert_y ? 1 : 0;
+        wpay.volume = saved->volume;
+        wpay.mute_on_audio = saved->mute_on_audio;
+        strncpy(wpay.backdrop, saved->backdrop, sizeof(wpay.backdrop) - 1);
         return daemon_activate_workshop(state, &wpay);
     }
     default:
@@ -4639,15 +4783,10 @@ static void daemon_handle_power_gov_events(daemon_state_t *state, int fd)
         bool reconnected = waywal_power_governor_consume_ipc_reconnected(state->power_gov);
         if (new_ipc_fd != ipc_fd || reconnected) {
             if (ipc_fd >= 0) {
-                if (state->epoll_fd >= 0 && new_ipc_fd != ipc_fd) {
-                    epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL, ipc_fd, NULL);
-                }
-                if (state->use_uring && state->uring_loop) {
-                    (void)uring_loop_remove_poll(state->uring_loop, ipc_fd);
-                }
+                unregister_fd_from_loops(state, ipc_fd);
             }
             if (new_ipc_fd >= 0) {
-                register_fd_in_loops(state, new_ipc_fd, URING_EV_TIMER);
+                register_fd_in_loops(state, new_ipc_fd, URING_EV_POWER_IPC);
             }
         }
         char ws[64];
@@ -5027,6 +5166,13 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
             break;
         daemon_handle_power_gov_events(st, fd);
         break;
+    case URING_EV_MPRIS:
+        if (st->mpris && fd == waywal_mpris_get_fd(st->mpris)) {
+            if ((res & (POLLERR | POLLHUP)) != 0 || !waywal_mpris_dispatch(st->mpris)) {
+                unregister_fd_from_loops(st, fd);
+            }
+        }
+        break;
     case URING_EV_SOLAR_TIMER:
         if ((res & POLLIN) == 0)
             break;
@@ -5057,11 +5203,6 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
             if (waywal_shader_engine_poll_hot_reload(st->shader_eng) && st->shader_active) {
                 daemon_shader_render_once(st);
             }
-        } else if (st->power_gov && (fd == waywal_power_governor_get_ipc_fd(st->power_gov) ||
-                                     fd == waywal_power_governor_get_inotify_fd(st->power_gov))) {
-            daemon_handle_power_gov_events(st, fd);
-        } else if (st->mpris && fd == waywal_mpris_get_fd(st->mpris)) {
-            waywal_mpris_dispatch(st->mpris);
         }
         break;
     case URING_EV_SIGNAL: {
@@ -5087,6 +5228,8 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
 
 int main(int argc, char *argv[])
 {
+    (void)setenv("NVD_MAX_DETACHED_BACKING_IMAGES", "0", 0);
+    (void)setenv("NVD_MAX_DETACHED_BACKING_IMAGE_BYTES", "0", 0);
 #if defined(__GLIBC__)
     (void)mallopt(M_MMAP_THRESHOLD, 64 * 1024);
     (void)mallopt(M_TRIM_THRESHOLD, 64 * 1024);
@@ -5477,13 +5620,14 @@ int main(int argc, char *argv[])
                                 &state);
         }
         if (gov_ipc_fd >= 0) {
-            uring_loop_add_poll(&uring_loop, gov_ipc_fd, POLLIN, URING_EV_TIMER, &state);
+            uring_loop_add_poll(&uring_loop, gov_ipc_fd, POLLIN, URING_EV_POWER_IPC, &state);
         }
         if (gov_inotify_fd >= 0) {
-            uring_loop_add_poll(&uring_loop, gov_inotify_fd, POLLIN, URING_EV_TIMER, &state);
+            uring_loop_add_poll(&uring_loop, gov_inotify_fd, POLLIN, URING_EV_POWER_INOTIFY,
+                                &state);
         }
         if (mpris_fd >= 0) {
-            uring_loop_add_poll(&uring_loop, mpris_fd, POLLIN, URING_EV_TIMER, &state);
+            uring_loop_add_poll(&uring_loop, mpris_fd, POLLIN, URING_EV_MPRIS, &state);
         }
         WAYWAL_LOG_INFO("Event loop running via Linux io_uring (zero-syscall polling)");
     } else {
@@ -5580,7 +5724,9 @@ int main(int argc, char *argv[])
                             ev_fd == waywal_power_governor_get_inotify_fd(state.power_gov))) {
                     daemon_handle_power_gov_events(&state, ev_fd);
                 } else if (state.mpris && ev_fd == waywal_mpris_get_fd(state.mpris)) {
-                    waywal_mpris_dispatch(state.mpris);
+                    if (!waywal_mpris_dispatch(state.mpris)) {
+                        unregister_fd_from_loops(&state, ev_fd);
+                    }
                 } else if (ev_fd == state.signal_fd) {
                     struct signalfd_siginfo fdsi;
                     ssize_t s = read(state.signal_fd, &fdsi, sizeof(fdsi));

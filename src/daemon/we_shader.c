@@ -1407,8 +1407,7 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
                 if (ok && swiz[0] != '\0') {
                     ok = sb_append(&sb, "#define ") && sb_append(&sb, vname) &&
                          sb_append(&sb, " ") && sb_append(&sb, vname) && sb_append(&sb, ".") &&
-                         sb_append(&sb, swiz) && sb_append(&sb, "\n#undef ") &&
-                         sb_append(&sb, vname) && sb_append(&sb, "\n");
+                         sb_append(&sb, swiz) && sb_append(&sb, "\n");
                 }
             } else {
                 ok = sb_append_len(&sb, line, (size_t)(p - line)) &&

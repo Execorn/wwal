@@ -8,6 +8,12 @@
 #include <string.h>
 #include <time.h>
 
+static clockid_t g_presentation_clock_id = CLOCK_MONOTONIC;
+
+void presentation_set_clock_id(clockid_t clk_id) { g_presentation_clock_id = clk_id; }
+
+clockid_t presentation_get_clock_id(void) { return g_presentation_clock_id; }
+
 void presentation_pll_init(waywal_pll_t *pll, uint32_t default_refresh_hz)
 {
     if (!pll)
@@ -18,10 +24,14 @@ void presentation_pll_init(waywal_pll_t *pll, uint32_t default_refresh_hz)
 
     uint32_t hz = (default_refresh_hz > 0) ? default_refresh_hz : 60;
     pll->period_est_ns = 1000000000LL / (int64_t)hz;
+    if (pll->period_est_ns <= 0)
+        pll->period_est_ns = 16666667LL;
     pll->phase_est_ns = 0;
     pll->last_hardware_time = 0;
     pll->frame_seq = 0;
     pll->jitter_ns = 0;
+    pll->clock_id = g_presentation_clock_id;
+    pll->has_clock_id = true;
 }
 
 void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t refresh_ns,
@@ -30,10 +40,17 @@ void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t ref
     if (!pll || hw_time_ns <= 0)
         return;
 
+    if (pll->period_est_ns <= 0) {
+        pll->period_est_ns = 16666667LL;
+    }
+
     if (pll->phase_est_ns == 0) {
         /* First hardware sample: seed state */
         if (refresh_ns > 0) {
             pll->period_est_ns = (int64_t)refresh_ns;
+        }
+        if (pll->period_est_ns <= 0) {
+            pll->period_est_ns = 16666667LL;
         }
         pll->phase_est_ns = hw_time_ns + pll->period_est_ns;
         pll->last_hardware_time = hw_time_ns;
@@ -103,14 +120,19 @@ int64_t presentation_pll_predict_next_vblank(const waywal_pll_t *pll)
     if (!pll)
         return 0;
 
+    clockid_t clk = (pll->has_clock_id) ? pll->clock_id : presentation_get_clock_id();
     struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    clock_gettime(clk, &now);
     int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
 
+    int64_t period = (pll->period_est_ns > 0) ? pll->period_est_ns : 16666667LL;
     int64_t next_vblank_ns = pll->phase_est_ns;
-    if (next_vblank_ns <= now_ns && pll->period_est_ns > 0) {
-        int64_t cycles = (now_ns - next_vblank_ns) / pll->period_est_ns + 1;
-        next_vblank_ns += cycles * pll->period_est_ns;
+    if (next_vblank_ns == 0) {
+        return now_ns + period;
+    }
+    if (next_vblank_ns <= now_ns) {
+        int64_t cycles = (now_ns - next_vblank_ns) / period + 1;
+        next_vblank_ns += cycles * period;
     }
     return next_vblank_ns;
 }

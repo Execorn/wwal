@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import os
+import re
 import sys
 
 
@@ -28,6 +29,7 @@ def main() -> int:
         stem = os.path.splitext(os.path.basename(path))[0].upper()
         if stem == "DISSOLVE_NOISE":
             stem = "NOISE"
+        stem = re.sub(r'[^A-Za-z0-9_]', '_', stem).upper()
         var_name = f"SHADER_SRC_{stem}"
 
         with open(path, "r", encoding="utf-8") as f:

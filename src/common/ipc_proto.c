@@ -121,6 +121,10 @@ int waywal_ipc_server_create(const char *namespace_str)
         return -1;
     }
 
+    int sbuf = 262144;
+    setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &sbuf, sizeof(sbuf));
+    setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &sbuf, sizeof(sbuf));
+
     if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         WAYWAL_LOG_ERR("bind(%s) failed: %s", addr.sun_path, strerror(errno));
         close(sfd);
@@ -156,6 +160,10 @@ static int connect_unix_socket_path(const char *sock_path, int timeout_ms)
     if (cfd < 0) {
         return -1;
     }
+
+    int cbuf = 262144;
+    setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &cbuf, sizeof(cbuf));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &cbuf, sizeof(cbuf));
 
     if (timeout_ms <= 0) {
         if (connect(cfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -241,7 +249,8 @@ bool waywal_ipc_namespace_is_alive(const char *namespace_str)
                 close(attached_fd);
             }
         } else if (pr == 0) {
-            /* Connected to an active kernel listening socket whose main thread is temporarily busy */
+            /* Connected to an active kernel listening socket whose main thread is temporarily busy
+             */
             alive = true;
         }
     }
@@ -286,8 +295,7 @@ bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd
     if (socket_fd < 0 || !hdr)
         return false;
 
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
+    struct msghdr msg = {0};
 
     struct iovec iov = {.iov_base = (void *)hdr, .iov_len = sizeof(waywal_ipc_hdr_t)};
     msg.msg_iov = &iov;
@@ -325,8 +333,7 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
     if (out_attached_fd)
         *out_attached_fd = -1;
 
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
+    struct msghdr msg = {0};
 
     struct iovec iov = {.iov_base = (void *)out_hdr, .iov_len = sizeof(waywal_ipc_hdr_t)};
     msg.msg_iov = &iov;

@@ -783,11 +783,13 @@ static void particle_reset_and_ops_scalar(we_particle_sys_t *sys, float dt)
         switch (op->type) {
         case WE_OP_MOVEMENT: {
             float damp = expf(-op->drag * dt);
-            float gx = op->gravity[0], gy = op->gravity[1], gz = op->gravity[2];
+            float gx_dt = op->gravity[0] * dt;
+            float gy_dt = op->gravity[1] * dt;
+            float gz_dt = op->gravity[2] * dt;
             for (uint32_t i = 0; i < n; i++) {
-                float vx = (sys->vel_x[i] + (gx + sys->acc_x[i]) * dt) * damp;
-                float vy = (sys->vel_y[i] + (gy + sys->acc_y[i]) * dt) * damp;
-                float vz = (sys->vel_z[i] + (gz + sys->acc_z[i]) * dt) * damp;
+                float vx = (sys->vel_x[i] + gx_dt + sys->acc_x[i] * dt) * damp;
+                float vy = (sys->vel_y[i] + gy_dt + sys->acc_y[i] * dt) * damp;
+                float vz = (sys->vel_z[i] + gz_dt + sys->acc_z[i] * dt) * damp;
                 sys->vel_x[i] = vx;
                 sys->vel_y[i] = vy;
                 sys->vel_z[i] = vz;
@@ -855,30 +857,35 @@ static void particle_reset_and_ops_scalar(we_particle_sys_t *sys, float dt)
         }
         case WE_OP_OSCILLATE_ALPHA: {
             float freq = 0.5f * (op->freq_min + op->freq_max);
+            float half_range = 0.5f * (op->scale_max - op->scale_min);
+            float base = op->scale_min + half_range;
             for (uint32_t i = 0; i < n; i++) {
-                float w = 0.5f + 0.5f * sinf(sys->age[i] * freq + sys->rng_phase[i]);
-                sys->a[i] *= (op->scale_min + w * (op->scale_max - op->scale_min));
+                sys->a[i] *= (base + sinf(sys->age[i] * freq + sys->rng_phase[i]) * half_range);
             }
             break;
         }
         case WE_OP_OSCILLATE_SIZE: {
             float freq = 0.5f * (op->freq_min + op->freq_max);
+            float half_range = 0.5f * (op->scale_max - op->scale_min);
+            float base = op->scale_min + half_range;
             for (uint32_t i = 0; i < n; i++) {
-                float w = 0.5f + 0.5f * sinf(sys->age[i] * freq + sys->rng_phase[i]);
-                sys->size[i] *= (op->scale_min + w * (op->scale_max - op->scale_min));
+                sys->size[i] *= (base + sinf(sys->age[i] * freq + sys->rng_phase[i]) * half_range);
             }
             break;
         }
         case WE_OP_OSCILLATE_POSITION: {
             float freq = 0.5f * (op->freq_min + op->freq_max);
             float amp = 0.5f * (op->scale_min + op->scale_max);
+            float delta_half = 0.5f * dt * freq;
+            float scalar = 2.0f * sinf(delta_half) * amp;
+            float mx = scalar * op->mask[0];
+            float my = scalar * op->mask[1];
+            float mz = scalar * op->mask[2];
             for (uint32_t i = 0; i < n; i++) {
-                float p0 = sys->age[i] * freq + sys->rng_phase[i];
-                float p1 = (sys->age[i] + dt) * freq + sys->rng_phase[i];
-                float s = (sinf(p1) - sinf(p0)) * amp;
-                sys->pos_x[i] += s * op->mask[0];
-                sys->pos_y[i] += s * op->mask[1];
-                sys->pos_z[i] += s * op->mask[2];
+                float c = cosf(sys->age[i] * freq + sys->rng_phase[i] + delta_half);
+                sys->pos_x[i] += c * mx;
+                sys->pos_y[i] += c * my;
+                sys->pos_z[i] += c * mz;
             }
             break;
         }
@@ -1320,9 +1327,11 @@ static void copy_particle_slot(we_particle_sys_t *sys, uint32_t dst, uint32_t sr
     if (dst == src) {
         return;
     }
-    uint32_t stride = sys->padded_cap;
+    const uint32_t stride = sys->padded_cap;
+    float *base = sys->soa_block;
     for (uint32_t a = 0; a < WE_PARTICLE_SOA_ARRAYS; a++) {
-        sys->soa_block[a * stride + dst] = sys->soa_block[a * stride + src];
+        base[dst] = base[src];
+        base += stride;
     }
 }
 

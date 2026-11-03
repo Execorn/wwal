@@ -194,7 +194,14 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
     int dispatched_events = 0;
     while (dispatched_events == 0 && loop->running) {
         struct io_uring_cqe *cqe = NULL;
-        int ret = io_uring_wait_cqe(&loop->ring, &cqe);
+        int ret;
+        if (io_uring_sq_ready(&loop->ring) > 0) {
+            ret = io_uring_submit_and_wait(&loop->ring, 1);
+            if (ret < 0 && ret != -EINTR && ret != -EAGAIN && ret != -EBUSY) {
+                return ret;
+            }
+        }
+        ret = io_uring_wait_cqe(&loop->ring, &cqe);
         if (ret < 0) {
             if (ret == -EINTR)
                 return 0;
@@ -296,7 +303,9 @@ int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler)
         }
 
         io_uring_cq_advance(&loop->ring, count);
-        io_uring_submit(&loop->ring);
+        if (io_uring_sq_ready(&loop->ring) > 0) {
+            io_uring_submit(&loop->ring);
+        }
     }
     return dispatched_events;
 }
@@ -306,4 +315,13 @@ void uring_loop_stop(uring_loop_t *loop)
     if (loop) {
         loop->running = false;
     }
+}
+
+int uring_loop_submit(waywal_uring_loop_t *loop)
+{
+    if (!loop || !loop->initialized)
+        return -EINVAL;
+    if (io_uring_sq_ready(&loop->ring) == 0)
+        return 0;
+    return io_uring_submit(&loop->ring);
 }

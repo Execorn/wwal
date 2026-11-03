@@ -145,9 +145,23 @@ bool we_project_load_dir(const char *workshop_dir, we_project_t *out_proj)
         return false;
     }
 
-    ssize_t rd = read(fd, buf, (size_t)st.st_size);
+    size_t total = 0;
+    size_t sz = (size_t)st.st_size;
+    while (total < sz) {
+        ssize_t rd = read(fd, buf + total, sz - total);
+        if (rd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (rd == 0) {
+            break;
+        }
+        total += (size_t)rd;
+    }
     close(fd);
-    if (rd != st.st_size) {
+    if (total != sz) {
         free(buf);
         return false;
     }
@@ -165,8 +179,10 @@ bool we_project_apply_override(we_project_t *proj, const char *key, const char *
     }
 
     we_user_prop_t *target = NULL;
+    char k0 = (char)tolower((unsigned char)key[0]);
     for (uint32_t i = 0; i < proj->prop_count; i++) {
-        if (strcasecmp(proj->props[i].key, key) == 0) {
+        if ((char)tolower((unsigned char)proj->props[i].key[0]) == k0 &&
+            strcasecmp(proj->props[i].key, key) == 0) {
             target = &proj->props[i];
             break;
         }
@@ -521,7 +537,7 @@ static bool has_supported_preview_image_ext(const char *filename)
         return false;
     }
     static const char *const exts[] = {
-        ".jpg", ".jpeg", ".png", ".gif",  ".webp", ".bmp", ".avif", ".jxl",
+        ".jpg", ".jpeg", ".png",  ".gif",  ".webp", ".bmp", ".avif", ".jxl",
         ".svg", ".qoi",  ".heic", ".heif", ".ppm",  ".pgm", ".pnm",
     };
     for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); ++i) {
@@ -564,8 +580,7 @@ bool we_workshop_find_preview_file(const char *workshop_dir, char *out_path, siz
         strchr(proj.preview, '/') == NULL && strchr(proj.preview, '\\') == NULL &&
         strcmp(proj.preview, ".") != 0 && strcmp(proj.preview, "..") != 0 &&
         strcasecmp(proj.preview, "project.json") != 0 &&
-        strcasecmp(proj.preview, "scene.json") != 0 &&
-        strcasecmp(proj.preview, "scene.pkg") != 0 &&
+        strcasecmp(proj.preview, "scene.json") != 0 && strcasecmp(proj.preview, "scene.pkg") != 0 &&
         strcasecmp(proj.preview, "gifscene.pkg") != 0 &&
         has_supported_preview_image_ext(proj.preview)) {
         char candidate[4096];

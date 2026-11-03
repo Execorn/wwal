@@ -28,7 +28,7 @@ bezier_curve_t bezier_create(float p1x, float p1y, float p2x, float p2y)
     };
 }
 
-float bezier_eval(const bezier_curve_t *curve, float progress)
+float waywal_cubic_bezier_solve_t(const bezier_curve_t *curve, float progress)
 {
     if (!curve)
         return progress;
@@ -46,21 +46,19 @@ float bezier_eval(const bezier_curve_t *curve, float progress)
     const float bx = 3.0f * (curve->p2x - curve->p1x) - cx;
     const float ax = 1.0f - cx - bx;
 
-    const float cy = 3.0f * curve->p1y;
-    const float by = 3.0f * (curve->p2y - curve->p1y) - cy;
-    const float ay = 1.0f - cy - by;
-
     /* Newton-Raphson iteration: solve x(t) = progress for t */
     float t = progress;
-    for (int i = 0; i < 6; ++i) {
+    bool converged = false;
+    for (int i = 0; i < 8; ++i) {
         float x = ((ax * t + bx) * t + cx) * t;
         float d = (3.0f * ax * t + 2.0f * bx) * t + cx;
         if (fabsf(d) < 1e-6f) {
             break;
         }
         float err = x - progress;
-        if (fabsf(err) < 1e-6f) {
-            break;
+        if (fabsf(err) < 1e-5f) {
+            converged = true;
+            return t;
         }
         t -= err / d;
         if (t < 0.0f || t > 1.0f) {
@@ -70,7 +68,7 @@ float bezier_eval(const bezier_curve_t *curve, float progress)
     }
 
     /* Fallback bisection if not converged or out of bounds */
-    if (t < 0.0f || t > 1.0f) {
+    if (!converged || t < 0.0f || t > 1.0f) {
         float t0 = 0.0f, t1 = 1.0f;
         t = progress;
         for (int i = 0; i < 16; ++i) {
@@ -86,6 +84,29 @@ float bezier_eval(const bezier_curve_t *curve, float progress)
             t = (t0 + t1) * 0.5f;
         }
     }
+
+    return t;
+}
+
+float bezier_eval(const bezier_curve_t *curve, float progress)
+{
+    if (!curve)
+        return progress;
+    if (progress <= 0.0f)
+        return 0.0f;
+    if (progress >= 1.0f)
+        return 1.0f;
+
+    /* Check for linear identity curve */
+    if (curve->p1x == curve->p1y && curve->p2x == curve->p2y) {
+        return progress;
+    }
+
+    float t = waywal_cubic_bezier_solve_t(curve, progress);
+
+    const float cy = 3.0f * curve->p1y;
+    const float by = 3.0f * (curve->p2y - curve->p1y) - cy;
+    const float ay = 1.0f - cy - by;
 
     /* Evaluate y(t) */
     return ((ay * t + by) * t + cy) * t;

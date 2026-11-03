@@ -2,6 +2,7 @@
 #include "waywal/output_state.h"
 
 #include "fractional-scale-v1-client-protocol.h"
+#include "wayland_core.h"
 #include "waywal/log.h"
 #include "waywal/shader_engine.h"
 
@@ -117,6 +118,9 @@ void output_manager_destroy(output_manager_t *om)
     while (cur) {
         output_state_t *next = cur->next;
         om->head = next;
+        if (cur->state) {
+            cur->state->outputs = next;
+        }
 
         output_node_destroy_surface(cur);
 
@@ -172,6 +176,9 @@ output_state_t *output_manager_add(output_manager_t *om, struct wl_registry *reg
 
     st->wl_name = name;
     st->scale = 1;
+    st->last_buffer_scale = 1;
+    st->pres_sync.pll.clock_id = presentation_get_clock_id();
+    st->pres_sync.pll.has_clock_id = true;
     st->shm_fd = -1;
     st->last_committed_ring_idx = -1;
 
@@ -205,6 +212,9 @@ void output_manager_remove(output_manager_t *om, uint32_t name)
         if (entry->wl_name == name) {
             *curr = entry->next;
             om->count--;
+            if (entry->state) {
+                entry->state->outputs = om->head;
+            }
 
             WAYWAL_LOG_INFO("Hotplug: display unplugged id %u (%s) (remaining: %u)", name,
                             entry->name[0] ? entry->name : "unnamed", om->count);

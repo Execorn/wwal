@@ -1,5 +1,7 @@
 #version 310 es
 // SPDX-License-Identifier: GPL-3.0-or-later
+precision highp float;
+precision highp int;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
@@ -38,24 +40,26 @@ void main() {
         return;
     }
 
-    vec2 uv = (vec2(coord) + 0.5) / vec2(u_resolution);
+    vec2 inv_res = 1.0 / vec2(u_resolution);
+    vec2 uv = (vec2(coord) + 0.5) * inv_res;
     if (u_progress <= 0.0) {
-        imageStore(u_target, coord, texture(u_src_a, uv).bgra);
+        imageStore(u_target, coord, vec4(texture(u_src_a, uv).rgb, 1.0).bgra);
         return;
     }
     if (u_progress >= 1.0) {
-        imageStore(u_target, coord, texture(u_src_b, uv).bgra);
+        imageStore(u_target, coord, vec4(texture(u_src_b, uv).rgb, 1.0).bgra);
         return;
     }
 
-    float aspect = float(u_resolution.x) / float(u_resolution.y);
+    float aspect = float(u_resolution.x) * inv_res.y;
 
     /* Multi-octave organic luma pattern (3 octaves) */
     float n = fbm(vec2(uv.x * aspect, uv.y) * 4.0);
 
     /* Threshold spans from -0.1 to 1.1 across progress */
     float threshold = u_progress * 1.2 - 0.1;
-    float softness = 0.08;
+    const float softness = 0.08;
+    const float inv_softness2 = 1.0 / (0.08 * 2.0);
 
     float alpha = smoothstep(threshold - softness, threshold + softness, n);
     float mix_val = 1.0 - alpha;
@@ -63,7 +67,7 @@ void main() {
     /* Organic ink bleed edge highlight */
     bool has_glow = false;
     float glow = 0.0;
-    float edge = 1.0 - abs(n - threshold) / (softness * 2.0);
+    float edge = 1.0 - abs(n - threshold) * inv_softness2;
     if (edge > 0.0) {
         has_glow = true;
         glow = edge * edge * sin(u_progress * 3.1415926535) * 0.25;
@@ -84,5 +88,5 @@ void main() {
         }
     }
 
-    imageStore(u_target, coord, col.bgra);
+    imageStore(u_target, coord, vec4(col.rgb, 1.0).bgra);
 }

@@ -56,6 +56,7 @@ typedef struct daemon_state {
     struct wp_viewporter *viewporter;
     struct wp_fractional_scale_manager_v1 *fract_manager;
     struct wp_presentation *presentation;
+    clockid_t presentation_clock_id;
     struct wp_single_pixel_buffer_manager_v1 *single_pixel_mgr;
     struct wp_linux_drm_syncobj_manager_v1 *syncobj_mgr;
     struct ext_idle_notifier_v1 *idle_notifier;

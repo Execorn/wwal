@@ -196,7 +196,7 @@ static inline size_t rbsp_bit_offset_to_ebsp_bits(const uint8_t *ebsp, size_t eb
     size_t si = 0, di = 0, epb_count = 0;
     while (si < ebsp_len && di < target_rbsp_bytes) {
         if (si + 2 < ebsp_len && ebsp[si] == 0 && ebsp[si + 1] == 0 && ebsp[si + 2] == 3) {
-            if (di + 2 >= target_rbsp_bytes) {
+            if (di + 2 > target_rbsp_bytes) {
                 di = target_rbsp_bytes;
                 break;
             }

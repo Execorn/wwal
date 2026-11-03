@@ -1048,12 +1048,39 @@ bool waywal_mpris_dispatch(waywal_mpris_t *mpris)
 {
     if (!mpris)
         return false;
-    if (mpris->bus && mpris->api.process && mpris->api.flush) {
-        while (mpris->api.process(mpris->bus, NULL) > 0) {
+    if (mpris->test_mode && !mpris->bus)
+        return true;
+    if (!mpris->bus)
+        return false;
+    if (mpris->api.process && mpris->api.flush) {
+        int r = 0;
+        while ((r = mpris->api.process(mpris->bus, NULL)) > 0) {
+        }
+        if (r < 0) {
+            WAYWAL_LOG_WARN("MPRIS: D-Bus connection error (%d), closing bus", r);
+            if (mpris->list_names_slot && mpris->api.slot_unref) {
+                mpris->api.slot_unref(mpris->list_names_slot);
+                mpris->list_names_slot = NULL;
+            }
+            if (mpris->props_match_slot && mpris->api.slot_unref) {
+                mpris->api.slot_unref(mpris->props_match_slot);
+                mpris->props_match_slot = NULL;
+            }
+            if (mpris->owner_match_slot && mpris->api.slot_unref) {
+                mpris->api.slot_unref(mpris->owner_match_slot);
+                mpris->owner_match_slot = NULL;
+            }
+            if (mpris->api.flush_close_unref) {
+                mpris->api.flush_close_unref(mpris->bus);
+            } else if (mpris->api.unref) {
+                mpris->api.unref(mpris->bus);
+            }
+            mpris->bus = NULL;
+            return false;
         }
         mpris->api.flush(mpris->bus);
     }
-    return mpris->art_changed || mpris->metadata_changed;
+    return true;
 }
 
 const waywal_mpris_metadata_t *waywal_mpris_get_metadata(const waywal_mpris_t *mpris)

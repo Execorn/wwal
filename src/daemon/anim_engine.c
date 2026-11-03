@@ -311,21 +311,20 @@ bool waywal_anim_probe(const uint8_t *data, size_t size)
 static void apply_previous_disposal(waywal_anim_decoder_t *dec)
 {
     if (dec->prev_disposal == 1 || dec->prev_disposal == 2) {
-        for (uint32_t y = 0; y < dec->prev_rect_h; ++y) {
-            uint32_t cy = dec->prev_rect_y + y;
-            if (cy >= dec->canvas_h) {
-                continue;
+        uint32_t x_start = dec->prev_rect_x;
+        uint32_t w = dec->prev_rect_w;
+        if (x_start < dec->canvas_w && w > 0) {
+            if (x_start + w > dec->canvas_w) {
+                w = dec->canvas_w - x_start;
             }
-            for (uint32_t x = 0; x < dec->prev_rect_w; ++x) {
-                uint32_t cx = dec->prev_rect_x + x;
-                if (cx >= dec->canvas_w) {
+            size_t span_bytes = (size_t)w * 4u;
+            for (uint32_t y = 0; y < dec->prev_rect_h; ++y) {
+                uint32_t cy = dec->prev_rect_y + y;
+                if (cy >= dec->canvas_h) {
                     continue;
                 }
-                size_t idx = ((size_t)cy * dec->canvas_w + cx) * 4u;
-                dec->canvas[idx + 0] = 0;
-                dec->canvas[idx + 1] = 0;
-                dec->canvas[idx + 2] = 0;
-                dec->canvas[idx + 3] = 0;
+                size_t offset = ((size_t)cy * dec->canvas_w + x_start) * 4u;
+                memset(dec->canvas + offset, 0, span_bytes);
             }
         }
     } else if (dec->prev_disposal == 3 && dec->prev_canvas) {
@@ -661,6 +660,15 @@ static bool step_gif_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba,
 
     const uint8_t *palette = f->has_lct ? f->lct : dec->gif_gct;
     uint16_t palette_count = f->has_lct ? f->lct_count : dec->gif_gct_count;
+    uint32_t rgba_lut[256];
+    for (uint32_t c = 0; c < 256; ++c) {
+        if (c < palette_count) {
+            rgba_lut[c] = (uint32_t)palette[c * 3u + 0] | ((uint32_t)palette[c * 3u + 1] << 8) |
+                          ((uint32_t)palette[c * 3u + 2] << 16) | (255u << 24);
+        } else {
+            rgba_lut[c] = 0;
+        }
+    }
 
     static const uint8_t interlace_start[4] = {0, 4, 2, 1};
     static const uint8_t interlace_step[4] = {8, 8, 4, 2};
@@ -688,12 +696,10 @@ static bool step_gif_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba,
                 if (f->has_transparency && color_idx == f->trans_index) {
                     continue;
                 }
-                size_t dst_off = ((size_t)dst_y * dec->canvas_w + dst_x) * 4u;
                 if (color_idx < palette_count) {
-                    dec->canvas[dst_off + 0] = palette[color_idx * 3u + 0];
-                    dec->canvas[dst_off + 1] = palette[color_idx * 3u + 1];
-                    dec->canvas[dst_off + 2] = palette[color_idx * 3u + 2];
-                    dec->canvas[dst_off + 3] = 255;
+                    size_t dst_off = ((size_t)dst_y * dec->canvas_w + dst_x) * 4u;
+                    uint32_t px = rgba_lut[color_idx];
+                    memcpy(dec->canvas + dst_off, &px, sizeof(px));
                 }
             }
         }
@@ -785,8 +791,9 @@ static int huff_decode(deflate_bits_t *b, const huff_table_t *h)
     for (int len = 1; len <= 15; ++len) {
         code |= (int)bits_pull(b, 1);
         int count = h->counts[len];
-        if (code - count < first) {
-            return h->symbols[index + (code - first)];
+        int diff = code - first;
+        if (diff >= 0 && diff < count) {
+            return h->symbols[index + diff];
         }
         index += count;
         first += count;
@@ -840,6 +847,11 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
         uint32_t btype = bits_pull(&b, 2);
 
         if (btype == 0) {
+            /* RFC 1951: Discard remaining bits in current byte, rewind any full prefetched bytes */
+            while (b.bitcnt >= 8 && b.pos > 0) {
+                b.pos--;
+                b.bitcnt -= 8;
+            }
             b.bitbuf = 0;
             b.bitcnt = 0;
             if (b.pos + 4 > b.size) {
@@ -968,7 +980,7 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
     return out_pos == dst_cap;
 }
 
-static uint8_t paeth_predictor(int a, int b, int c)
+static inline uint8_t paeth_predictor(int a, int b, int c)
 {
     int p = a + b - c;
     int pa = abs(p - a);
@@ -1198,29 +1210,38 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
         uint8_t *cur = line + 1;
         const uint8_t *prev = (y > 0) ? (line - stride) : NULL;
 
-        for (size_t i = 0; i < stride; ++i) {
-            int a = (i >= bpp) ? cur[i - bpp] : 0;
-            int b = prev ? prev[i] : 0;
-            int c = (prev && i >= bpp) ? prev[i - bpp] : 0;
-
-            switch (filter) {
-            case 0:
-                break;
-            case 1:
-                cur[i] = (uint8_t)(cur[i] + a);
-                break;
-            case 2:
-                cur[i] = (uint8_t)(cur[i] + b);
-                break;
-            case 3:
-                cur[i] = (uint8_t)(cur[i] + ((a + b) >> 1));
-                break;
-            case 4:
-                cur[i] = (uint8_t)(cur[i] + paeth_predictor(a, b, c));
-                break;
-            default:
-                return false;
+        switch (filter) {
+        case 0:
+            break;
+        case 1:
+            for (size_t i = bpp; i < stride; ++i) {
+                cur[i] = (uint8_t)(cur[i] + cur[i - bpp]);
             }
+            break;
+        case 2:
+            if (prev) {
+                for (size_t i = 0; i < stride; ++i) {
+                    cur[i] = (uint8_t)(cur[i] + prev[i]);
+                }
+            }
+            break;
+        case 3:
+            for (size_t i = 0; i < stride; ++i) {
+                int a = (i >= bpp) ? cur[i - bpp] : 0;
+                int b = prev ? prev[i] : 0;
+                cur[i] = (uint8_t)(cur[i] + ((a + b) >> 1));
+            }
+            break;
+        case 4:
+            for (size_t i = 0; i < stride; ++i) {
+                int a = (i >= bpp) ? cur[i - bpp] : 0;
+                int b = prev ? prev[i] : 0;
+                int c = (prev && i >= bpp) ? prev[i - bpp] : 0;
+                cur[i] = (uint8_t)(cur[i] + paeth_predictor(a, b, c));
+            }
+            break;
+        default:
+            return false;
         }
 
         uint64_t dst_y64 = (uint64_t)f->y_offset + y;
@@ -1228,6 +1249,13 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
             continue;
         }
         uint32_t dst_y = (uint32_t)dst_y64;
+
+        if (dec->png_color_type == 6 && f->blend_op == 0 &&
+            (uint64_t)f->x_offset + f->width <= dec->canvas_w) {
+            size_t dst_off = ((size_t)dst_y * dec->canvas_w + f->x_offset) * 4u;
+            memcpy(dec->canvas + dst_off, cur, (size_t)f->width * 4u);
+            continue;
+        }
 
         for (uint32_t x = 0; x < f->width; ++x) {
             uint64_t dst_x64 = (uint64_t)f->x_offset + x;
@@ -1270,10 +1298,9 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
 
             size_t dst_off = ((size_t)dst_y * dec->canvas_w + dst_x) * 4u;
             if (f->blend_op == 0 || sa == 255) {
-                dec->canvas[dst_off + 0] = sr;
-                dec->canvas[dst_off + 1] = sg;
-                dec->canvas[dst_off + 2] = sb;
-                dec->canvas[dst_off + 3] = sa;
+                uint32_t px = (uint32_t)sr | ((uint32_t)sg << 8) | ((uint32_t)sb << 16) |
+                              ((uint32_t)sa << 24);
+                memcpy(dec->canvas + dst_off, &px, sizeof(px));
             } else if (sa > 0) {
                 uint32_t dr = dec->canvas[dst_off + 0];
                 uint32_t dg = dec->canvas[dst_off + 1];

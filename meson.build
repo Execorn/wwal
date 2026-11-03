@@ -18,16 +18,20 @@ cc = meson.get_compiler('c')
 python3 = find_program('python3')
 
 # Optimization & compiler hardening arguments
-add_project_arguments(
+base_c_args = [
   '-fno-plt',
   '-fvisibility=hidden',
   '-fstrict-aliasing',
   '-D_GNU_SOURCE',
   '-DWAYWAL_VERSION="' + meson.project_version() + '"',
   '-DWWAL_DATADIR="' + (get_option('prefix') / get_option('datadir')) + '"',
-  '-DWWAL_SOURCE_ROOT="' + meson.current_source_dir() + '"',
-  language: 'c'
-)
+]
+
+if get_option('buildtype') != 'release'
+  base_c_args += ['-DWWAL_SOURCE_ROOT="' + meson.current_source_dir() + '"']
+endif
+
+add_project_arguments(base_c_args, language: 'c')
 
 extra_c_args = cc.get_supported_arguments([
   '-Wundef',
@@ -39,8 +43,16 @@ extra_c_args = cc.get_supported_arguments([
   '-Wimplicit-fallthrough',
   '-Wno-unused-parameter',
   '-fstack-protector-strong',
+  '-ffunction-sections',
+  '-fdata-sections',
 ])
 add_project_arguments(extra_c_args, language: 'c')
+
+extra_link_args = cc.get_supported_link_arguments([
+  '-Wl,--as-needed',
+  '-Wl,--gc-sections',
+])
+add_project_link_arguments(extra_link_args, language: 'c')
 
 if not get_option('enable_simd')
   add_project_arguments('-DWWAL_DISABLE_SIMD', language: 'c')
@@ -718,4 +730,5 @@ summary({
   'JPEG-XL (dlopen)': not get_option('jxl').disabled(),
   'SVG / librsvg (dlopen)': not get_option('svg').disabled(),
   'PipeWire FFT (dlopen)': not get_option('pipewire').disabled(),
+  'FFmpeg SW Dec': have_ffmpeg_swdec,
 }, section: 'Features & Codecs', bool_yn: true)

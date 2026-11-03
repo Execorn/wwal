@@ -1095,6 +1095,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                        (size_t)((int)width - x_seam_R) * sizeof(uint32_t));
             }
         }
+        simd_stream_fence();
         return true;
     }
 
@@ -1222,6 +1223,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                        (size_t)((int)width - x_out_R) * sizeof(uint32_t));
             }
         }
+        simd_stream_fence();
         return true;
     }
 
@@ -1324,6 +1326,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                        (size_t)((int)width - x_band_R) * sizeof(uint32_t));
             }
         }
+        simd_stream_fence();
         return true;
     }
 
@@ -1425,6 +1428,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             free(lut_ix);
         if (lut_cx != lut_cx_stack)
             free(lut_cx);
+        simd_stream_fence();
         return true;
     }
 
@@ -1508,6 +1512,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             free(lut_ax);
         if (lut_bx != lut_bx_stack)
             free(lut_bx);
+        simd_stream_fence();
         return true;
     }
 
@@ -1615,6 +1620,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                     copy_shifted_span(dst_row, row_b, x_seam_R, (int)width, ishift_bx, (int)width);
             }
         }
+        simd_stream_fence();
         return true;
     }
 
@@ -1908,6 +1914,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             free(lut_cx1);
         if (lut_cx2 != lut_cx2_stack)
             free(lut_cx2);
+        simd_stream_fence();
         return true;
     }
 
@@ -2054,6 +2061,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                        (size_t)((int)width - x_out_R) * sizeof(uint32_t));
             }
         }
+        simd_stream_fence();
         return true;
     }
 
@@ -2483,6 +2491,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             free(col_sx);
         if (col_ky != col_ky_stack)
             free(col_ky);
+        simd_stream_fence();
         return true;
     }
 
@@ -2812,6 +2821,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
                 }
             }
         }
+        simd_stream_fence();
         return true;
     }
 

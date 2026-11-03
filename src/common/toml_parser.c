@@ -422,7 +422,12 @@ static void skip_ws_and_comments(toml_lexer_t *lex)
     }
 }
 
-static bool is_bare_key_char(char c) { return isalnum((unsigned char)c) || c == '_' || c == '-'; }
+static inline bool is_bare_key_char(char c)
+{
+    unsigned char uc = (unsigned char)c;
+    return (uc >= 'a' && uc <= 'z') || (uc >= 'A' && uc <= 'Z') || (uc >= '0' && uc <= '9') ||
+           uc == '_' || uc == '-';
+}
 
 static bool parse_quoted_string(toml_lexer_t *lex, char *out_buf, size_t out_cap)
 {
@@ -508,19 +513,17 @@ static bool parse_key_segment(toml_lexer_t *lex, char *out_buf, size_t out_cap)
         return false;
     }
 
-    size_t w = 0;
+    size_t start = lex->pos;
     while (lex->pos < lex->len && is_bare_key_char(lex->src[lex->pos])) {
-        if (w + 1 >= out_cap) {
-            set_error(lex, "key segment exceeds maximum length (%zu)",
-                      out_cap > 0 ? out_cap - 1 : 0);
-            return false;
-        }
-        out_buf[w++] = lex->src[lex->pos];
         lex->pos++;
     }
-    if (out_cap > 0) {
-        out_buf[w] = '\0';
+    size_t seg_len = lex->pos - start;
+    if (seg_len + 1 > out_cap) {
+        set_error(lex, "key segment exceeds maximum length (%zu)", out_cap > 0 ? out_cap - 1 : 0);
+        return false;
     }
+    memcpy(out_buf, &lex->src[start], seg_len);
+    out_buf[seg_len] = '\0';
     return true;
 }
 
@@ -1835,7 +1838,8 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                                          sizeof(out_cfg->transition.sync_mode))) {
                     return false;
                 }
-            } else if (strcmp(key, "stagger_delay_ms") == 0) {
+            } else if (strcmp(key, "stagger_delay_ms") == 0 || strcmp(key, "stagger_delay") == 0 ||
+                       strcmp(key, "stagger-delay") == 0) {
                 if (!parse_uint32_val(&lex, &out_cfg->transition.stagger_delay_ms))
                     return false;
             } else if (strcmp(key, "crop_gravity") == 0 || strcmp(key, "crop-gravity") == 0) {
@@ -2632,10 +2636,11 @@ bool waywal_config_load_file(const char *file_path, waywal_config_t *out_cfg, ch
     }
 
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < 0 || st.st_size > (1024 * 1024)) {
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        st.st_size > (1024 * 1024)) {
         close(fd);
         if (err_buf && err_cap > 0) {
-            snprintf(err_buf, err_cap, "invalid file size for '%s'", file_path);
+            snprintf(err_buf, err_cap, "invalid file or size for '%s'", file_path);
         }
         return false;
     }

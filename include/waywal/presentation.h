@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
 #include <wayland-client.h>
 
 #ifdef __cplusplus
@@ -14,7 +15,7 @@ extern "C" {
 
 typedef struct {
     /* PLL state variables */
-    int64_t phase_est_ns;       /* Estimated time of next VBlank in CLOCK_MONOTONIC ns */
+    int64_t phase_est_ns;       /* Estimated time of next VBlank in presentation clock ns */
     int64_t period_est_ns;      /* Estimated monitor refresh cycle in ns */
     int64_t last_hardware_time; /* Actual timestamp returned by display hardware */
     uint64_t frame_seq;
@@ -27,6 +28,8 @@ typedef struct {
     bool has_hw_clock;
     bool is_zero_copy;
     int64_t jitter_ns;
+    clockid_t clock_id;
+    bool has_clock_id;
 } waywal_pll_t;
 
 typedef struct {
@@ -41,6 +44,8 @@ void presentation_pll_init(waywal_pll_t *pll, uint32_t default_refresh_hz);
 void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t refresh_ns,
                              uint32_t flags);
 int64_t presentation_pll_predict_next_vblank(const waywal_pll_t *pll);
+void presentation_set_clock_id(clockid_t clk_id);
+clockid_t presentation_get_clock_id(void);
 
 bool presentation_sync_init(presentation_sync_t *ps, struct wp_presentation *pres,
                             struct wl_surface *surface);

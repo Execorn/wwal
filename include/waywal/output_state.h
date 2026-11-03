@@ -171,6 +171,9 @@ struct output_node {
     uint32_t vp_scaling_mode;
     bool vp_configured;
     bool video_targeted;
+    int32_t backdrop_vp_dst_w;
+    int32_t backdrop_vp_dst_h;
+    int32_t last_buffer_scale;
 
     uint32_t scaling_mode; /* waywal_scaling_mode_t */
     uint32_t filter_mode;  /* waywal_filter_mode_t */

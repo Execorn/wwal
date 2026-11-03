@@ -34,20 +34,20 @@ void waywal_log(waywal_log_level_t level, const char *file, int line, const char
         switch (level) {
         case WAYWAL_LOG_LEVEL_DEBUG:
             prefix = "\033[90m[DEBUG]\033[0m ";
-            prefix_len = 16;
+            prefix_len = 17;
             break;
         case WAYWAL_LOG_LEVEL_INFO:
             prefix = "\033[32m[INFO]\033[0m ";
-            prefix_len = 15;
+            prefix_len = 16;
             break;
         case WAYWAL_LOG_LEVEL_WARN:
             prefix = "\033[33m[WARN]\033[0m ";
-            prefix_len = 15;
+            prefix_len = 16;
             break;
         case WAYWAL_LOG_LEVEL_ERR:
         default:
             prefix = "\033[31m[ERROR]\033[0m ";
-            prefix_len = 16;
+            prefix_len = 17;
             break;
         }
     } else {

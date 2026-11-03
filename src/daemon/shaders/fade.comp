@@ -1,5 +1,7 @@
 #version 310 es
 // SPDX-License-Identifier: GPL-3.0-or-later
+precision highp float;
+precision highp int;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(rgba8, binding = 0) writeonly uniform highp image2D u_target;
@@ -15,14 +17,17 @@ void main() {
         return;
     }
 
+    vec2 inv_res = 1.0 / vec2(u_resolution);
+    vec2 uv = (vec2(coord) + 0.5) * inv_res;
+
     vec4 col;
     if (u_progress <= 0.0) {
-        col = texelFetch(u_src_a, coord, 0);
+        col = texture(u_src_a, uv);
     } else if (u_progress >= 1.0) {
-        col = texelFetch(u_src_b, coord, 0);
+        col = texture(u_src_b, uv);
     } else {
-        col = mix(texelFetch(u_src_a, coord, 0), texelFetch(u_src_b, coord, 0), u_progress);
+        col = mix(texture(u_src_a, uv), texture(u_src_b, uv), u_progress);
     }
 
-    imageStore(u_target, coord, col.bgra);
+    imageStore(u_target, coord, vec4(col.rgb, 1.0).bgra);
 }

@@ -1229,6 +1229,59 @@ static ast_node_t *parse_func_decl(js_parser_t *p, bool is_exported)
     return fn;
 }
 
+static ast_node_t *parse_block(js_parser_t *p)
+{
+    lexer_next(p);
+    ast_node_t *blk = alloc_node(p, AST_BLOCK);
+    uint32_t cap = 256u;
+    ast_node_t *stack_stmts[256];
+    ast_node_t **stmts = stack_stmts;
+    uint32_t cnt = 0;
+    while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->vm->aborted) {
+        if (cnt >= cap) {
+            uint32_t new_cap = cap * 2u;
+            if (new_cap > 65536u) {
+                WAYWAL_LOG_WARN(
+                    "we_script_parse: block statement limit (%u) reached; truncating statements",
+                    cap);
+                break;
+            }
+            ast_node_t **new_stmts = NULL;
+            if (stmts == stack_stmts) {
+                new_stmts = (ast_node_t **)malloc(new_cap * sizeof(ast_node_t *));
+                if (new_stmts) {
+                    memcpy(new_stmts, stack_stmts, cnt * sizeof(ast_node_t *));
+                }
+            } else {
+                new_stmts = (ast_node_t **)realloc(stmts, new_cap * sizeof(ast_node_t *));
+            }
+            if (!new_stmts) {
+                WAYWAL_LOG_WARN(
+                    "we_script_parse: out of memory growing block statement list at %u statements",
+                    cnt);
+                break;
+            }
+            stmts = new_stmts;
+            cap = new_cap;
+        }
+        stmts[cnt++] = parse_stmt(p);
+    }
+    if (p->cur.type == TOK_RBRACE) {
+        lexer_next(p);
+    }
+    if (blk && cnt > 0) {
+        blk->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
+        if (blk->children) {
+            memcpy(blk->children, stmts, cnt * sizeof(ast_node_t *));
+            blk->child_count = cnt;
+        }
+    }
+    if (stmts != stack_stmts) {
+        free(stmts);
+    }
+    return blk;
+}
+
 static ast_node_t *parse_stmt_inner(js_parser_t *p)
 {
     if (p->cur.type == TOK_SEMI) {
@@ -1236,27 +1289,7 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
         return alloc_node(p, AST_BLOCK);
     }
     if (p->cur.type == TOK_LBRACE) {
-        lexer_next(p);
-        ast_node_t *blk = alloc_node(p, AST_BLOCK);
-        ast_node_t *stmts[256];
-        uint32_t cnt = 0;
-        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->vm->aborted) {
-            ast_node_t *st = parse_stmt(p);
-            if (cnt < 256u) {
-                stmts[cnt++] = st;
-            }
-        }
-        if (p->cur.type == TOK_RBRACE) {
-            lexer_next(p);
-        }
-        if (blk && cnt > 0) {
-            blk->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
-            if (blk->children) {
-                memcpy(blk->children, stmts, cnt * sizeof(ast_node_t *));
-                blk->child_count = cnt;
-            }
-        }
-        return blk;
+        return parse_block(p);
     }
     if (p->cur.type == TOK_EXPORT) {
         lexer_next(p);
@@ -1337,13 +1370,17 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
                 continue;
             }
             ast_node_t *cblk = alloc_node(p, AST_BLOCK);
-            ast_node_t *cstmts[64];
+            ast_node_t *cstmts[128];
             uint32_t scnt = 0;
             while (p->cur.type != TOK_CASE && p->cur.type != TOK_DEFAULT &&
                    p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->vm->aborted) {
                 ast_node_t *st = parse_stmt(p);
-                if (scnt < 64u) {
+                if (scnt < 128u) {
                     cstmts[scnt++] = st;
+                } else {
+                    WAYWAL_LOG_WARN(
+                        "we_script_parse: case statement limit (%u) reached; truncating statements",
+                        128u);
                 }
             }
             if (cblk && scnt > 0) {
@@ -1556,9 +1593,37 @@ static ast_node_t *parse_stmt(js_parser_t *p)
 static ast_node_t *parse_program(js_parser_t *p)
 {
     ast_node_t *prog = alloc_node(p, AST_PROGRAM);
-    ast_node_t *stmts[256];
+    uint32_t cap = 256u;
+    ast_node_t *stack_stmts[256];
+    ast_node_t **stmts = stack_stmts;
     uint32_t cnt = 0;
-    while (p->cur.type != TOK_EOF && cnt < 256 && !p->vm->aborted) {
+    while (p->cur.type != TOK_EOF && !p->vm->aborted) {
+        if (cnt >= cap) {
+            uint32_t new_cap = cap * 2u;
+            if (new_cap > 65536u) {
+                WAYWAL_LOG_WARN(
+                    "we_script_parse: program statement limit (%u) reached; truncating statements",
+                    cap);
+                break;
+            }
+            ast_node_t **new_stmts = NULL;
+            if (stmts == stack_stmts) {
+                new_stmts = (ast_node_t **)malloc(new_cap * sizeof(ast_node_t *));
+                if (new_stmts) {
+                    memcpy(new_stmts, stack_stmts, cnt * sizeof(ast_node_t *));
+                }
+            } else {
+                new_stmts = (ast_node_t **)realloc(stmts, new_cap * sizeof(ast_node_t *));
+            }
+            if (!new_stmts) {
+                WAYWAL_LOG_WARN("we_script_parse: out of memory growing program statement list at "
+                                "%u statements",
+                                cnt);
+                break;
+            }
+            stmts = new_stmts;
+            cap = new_cap;
+        }
         stmts[cnt++] = parse_stmt(p);
     }
     if (prog && cnt > 0) {
@@ -1567,6 +1632,9 @@ static ast_node_t *parse_program(js_parser_t *p)
             memcpy(prog->children, stmts, cnt * sizeof(ast_node_t *));
             prog->child_count = cnt;
         }
+    }
+    if (stmts != stack_stmts) {
+        free(stmts);
     }
     return prog;
 }

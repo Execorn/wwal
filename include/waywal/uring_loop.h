@@ -29,6 +29,7 @@ typedef enum {
     URING_EV_ANIM_TIMER = 11,
     URING_EV_SOLAR_TIMER = 12,
     EVENT_TYPE_SOLAR_TIMER = URING_EV_SOLAR_TIMER,
+    URING_EV_MPRIS = 13,
 } uring_event_type_t;
 
 typedef struct {
@@ -73,6 +74,9 @@ bool uring_loop_remove_poll(waywal_uring_loop_t *loop, int fd);
 int uring_loop_dispatch(uring_loop_t *loop, uring_event_handler_t handler);
 
 void uring_loop_stop(uring_loop_t *loop);
+
+/* Explicitly flushes/submits any queued SQEs */
+int uring_loop_submit(waywal_uring_loop_t *loop);
 
 #ifdef __cplusplus
 }

@@ -514,6 +514,17 @@ static bool run_ffmpeg_transcode(const char *filepath, const char *tmp_mp4, cons
     }
 
     if (pid == 0) {
+        if (close_range(3, ~0U, 0) != 0) {
+            int max_fd = (int)sysconf(_SC_OPEN_MAX);
+            if (max_fd < 256)
+                max_fd = 256;
+            if (max_fd > 4096)
+                max_fd = 4096;
+            for (int fd = 3; fd < max_fd; ++fd) {
+                close(fd);
+            }
+        }
+
         int devnull = open("/dev/null", O_RDWR);
         if (devnull >= 0) {
             dup2(devnull, STDIN_FILENO);
@@ -571,6 +582,7 @@ static bool run_ffmpeg_transcode(const char *filepath, const char *tmp_mp4, cons
                                   (char *)tmp_mp4,
                                   NULL};
             execvp("ffmpeg", args);
+            _exit(127);
         } else if (enc == TRANSCODE_ENC_VAAPI) {
             char vaapi_vf[600];
             snprintf(vaapi_vf, sizeof(vaapi_vf), "%s,format=nv12,hwupload", vf_arg);
@@ -610,6 +622,7 @@ static bool run_ffmpeg_transcode(const char *filepath, const char *tmp_mp4, cons
                                   (char *)tmp_mp4,
                                   NULL};
             execvp("ffmpeg", args);
+            _exit(127);
         } else if (enc == TRANSCODE_ENC_QSV) {
             char *const args[] = {"ffmpeg",
                                   "-y",
@@ -651,6 +664,7 @@ static bool run_ffmpeg_transcode(const char *filepath, const char *tmp_mp4, cons
                                   (char *)tmp_mp4,
                                   NULL};
             execvp("ffmpeg", args);
+            _exit(127);
         } else {
             char *const args[] = {
                 "ffmpeg",
@@ -697,6 +711,7 @@ static bool run_ffmpeg_transcode(const char *filepath, const char *tmp_mp4, cons
                 (char *)tmp_mp4,
                 NULL};
             execvp("ffmpeg", args);
+            _exit(127);
         }
         _exit(127);
     }

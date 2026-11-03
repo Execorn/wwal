@@ -44,6 +44,41 @@ static inline void output_commit_frame(output_node_t *node)
     wl_surface_commit(node->surface);
 }
 
+static inline void output_viewport_update_destination(output_node_t *node, int32_t dst_w,
+                                                      int32_t dst_h)
+{
+    if (!node || !node->viewport || dst_w <= 0 || dst_h <= 0)
+        return;
+    if (!node->vp_configured || node->vp_dst_w != dst_w || node->vp_dst_h != dst_h) {
+        wp_viewport_set_destination(node->viewport, dst_w, dst_h);
+        node->vp_dst_w = dst_w;
+        node->vp_dst_h = dst_h;
+        node->vp_configured = true;
+    }
+}
+
+static inline void output_backdrop_viewport_update_destination(output_node_t *node, int32_t dst_w,
+                                                               int32_t dst_h)
+{
+    if (!node || !node->backdrop_viewport || dst_w <= 0 || dst_h <= 0)
+        return;
+    if (node->backdrop_vp_dst_w != dst_w || node->backdrop_vp_dst_h != dst_h) {
+        wp_viewport_set_destination(node->backdrop_viewport, dst_w, dst_h);
+        node->backdrop_vp_dst_w = dst_w;
+        node->backdrop_vp_dst_h = dst_h;
+    }
+}
+
+static inline void output_surface_update_buffer_scale(output_node_t *node, int32_t scale)
+{
+    if (!node || !node->surface || scale <= 0)
+        return;
+    if (node->last_buffer_scale != scale) {
+        wl_surface_set_buffer_scale(node->surface, scale);
+        node->last_buffer_scale = scale;
+    }
+}
+
 /* SHM ping-pong buffer release listener: tracks when compositor releases a buffer */
 static void shm_buffer_release(void *data, struct wl_buffer *wl_buffer)
 {
@@ -110,7 +145,7 @@ static void fractional_scale_preferred_scale(void *data,
 {
     (void)wp_fractional_scale_v1;
     output_node_t *out = (output_node_t *)data;
-    if (!out || scale == 0)
+    if (!out || scale == 0 || out->fractional_scale == (int32_t)scale)
         return;
 
     out->fractional_scale = (int32_t)scale;
@@ -139,7 +174,7 @@ static void backdrop_layer_surface_configure(void *data,
                     node->logical_width > 0 ? (int32_t)node->logical_width : node->width;
                 int32_t dst_h =
                     node->logical_height > 0 ? (int32_t)node->logical_height : node->height;
-                wp_viewport_set_destination(node->backdrop_viewport, dst_w, dst_h);
+                output_backdrop_viewport_update_destination(node, dst_w, dst_h);
             }
             wl_surface_attach(node->backdrop_surface, node->backdrop_bo.wl_buffer, 0, 0);
             wl_surface_damage_buffer(node->backdrop_surface, 0, 0, node->width, node->height);
@@ -189,8 +224,10 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
         (void)recompute_output_dimensions(out);
     }
     if (out->viewport && out->logical_width > 0 && out->logical_height > 0) {
-        wp_viewport_set_destination(out->viewport, (int32_t)out->logical_width,
-                                    (int32_t)out->logical_height);
+        output_viewport_update_destination(out, (int32_t)out->logical_width,
+                                           (int32_t)out->logical_height);
+    } else if (out->surface && out->scale > 1) {
+        output_surface_update_buffer_scale(out, out->scale);
     }
     out->configured = true;
     out->vp_configured = false;
@@ -351,6 +388,12 @@ void output_node_create_surface(daemon_state_t *state, output_node_t *node)
 
     if (state->presentation) {
         presentation_sync_init(&node->pres_sync, state->presentation, node->surface);
+        node->pres_sync.pll.clock_id = state->presentation_clock_id;
+        node->pres_sync.pll.has_clock_id = true;
+    }
+
+    if (!state->viewporter && node->scale > 1) {
+        output_surface_update_buffer_scale(node, node->scale);
     }
 
     wl_surface_commit(node->surface);
@@ -497,6 +540,27 @@ static void trim_output_dmabuf_ring(daemon_state_t *state, output_node_t *node)
 void layer_shell_trim_output_dmabuf_ring(daemon_state_t *state, output_node_t *node)
 {
     trim_output_dmabuf_ring(state, node);
+}
+
+static void on_output_dmabuf_bo_released(void *user_data, dmabuf_bo_t *bo)
+{
+    output_node_t *node = (output_node_t *)user_data;
+    if (!node || !node->state || !bo || node->transition_active)
+        return;
+    if (node->video_eng && node->video_eng->state != WAYWAL_VIDEO_STATE_STOPPED &&
+        !node->video_eng->using_swdec) {
+        if (node->last_presented_bo == bo)
+            node->last_presented_bo = NULL;
+        if (bo >= node->dmabuf_ring.buffers &&
+            bo < node->dmabuf_ring.buffers + WAYWAL_DMABUF_RING_SIZE &&
+            node->last_committed_ring_idx == (int)(bo - node->dmabuf_ring.buffers)) {
+            node->last_committed_ring_idx = -1;
+        }
+        release_output_bo_refs(node->state, node, bo);
+        dmabuf_bo_free(bo);
+        return;
+    }
+    trim_output_dmabuf_ring(node->state, node);
 }
 
 void output_node_destroy_surface(output_node_t *node)
@@ -835,6 +899,10 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
 
     if (dmabuf_ring_init(&state->dmabuf_ctx, &node->dmabuf_ring, (uint32_t)width, (uint32_t)height,
                          drm_format, modifier)) {
+        for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+            node->dmabuf_ring.buffers[i].on_release = on_output_dmabuf_bo_released;
+            node->dmabuf_ring.buffers[i].release_user_data = node;
+        }
         node->use_dmabuf = true;
         node->last_committed_ring_idx = -1;
         WAYWAL_LOG_INFO("Direct Scanout active for output %s (%ux%u, fmt=0x%08x, mod=0x%016lx)",
@@ -846,6 +914,10 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
         modifier = gpu_ok ? state->dmabuf_ctx.preferred_modifier : DRM_FORMAT_MOD_LINEAR;
         if (dmabuf_ring_init(&state->dmabuf_ctx, &node->dmabuf_ring, (uint32_t)width,
                              (uint32_t)height, DRM_FORMAT_ARGB8888, modifier)) {
+            for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+                node->dmabuf_ring.buffers[i].on_release = on_output_dmabuf_bo_released;
+                node->dmabuf_ring.buffers[i].release_user_data = node;
+            }
             node->ten_bit = false;
             node->use_dmabuf = true;
             node->last_committed_ring_idx = -1;
@@ -1027,8 +1099,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
             node->has_image = false;
             wp_viewport_set_source(node->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                    wl_fixed_from_int(-1), wl_fixed_from_int(-1));
-            wp_viewport_set_destination(node->viewport, dst_w, dst_h);
-            node->vp_configured = false;
+            output_viewport_update_destination(node, dst_w, dst_h);
             wl_surface_attach(node->surface, sp_buf, 0, 0);
             wl_surface_damage_buffer(node->surface, 0, 0, INT32_MAX, INT32_MAX);
             output_commit_frame(node);
@@ -1080,11 +1151,10 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                     node->has_source_new_bo = false;
                 }
                 if (node->viewport) {
-                    wp_viewport_set_destination(node->viewport, dst_w, dst_h);
+                    output_viewport_update_destination(node, dst_w, dst_h);
                     wp_viewport_set_source(node->viewport, wl_fixed_from_int(-1),
                                            wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                            wl_fixed_from_int(-1));
-                    node->vp_configured = false;
                 }
                 wl_surface_attach(node->surface, bo->wl_buffer, 0, 0);
                 wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
@@ -1119,10 +1189,9 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
     }
 
     if (node->viewport) {
-        wp_viewport_set_destination(node->viewport, dst_w, dst_h);
+        output_viewport_update_destination(node, dst_w, dst_h);
         wp_viewport_set_source(node->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                wl_fixed_from_int(-1), wl_fixed_from_int(-1));
-        node->vp_configured = false;
     }
 
     wl_surface_attach(node->surface, node->shm_buffers[back_idx], 0, 0);
@@ -1759,7 +1828,7 @@ static void render_backdrop_surface(daemon_state_t *state, output_node_t *node,
                     node->logical_width > 0 ? (int32_t)node->logical_width : node->width;
                 int32_t dst_h =
                     node->logical_height > 0 ? (int32_t)node->logical_height : node->height;
-                wp_viewport_set_destination(node->backdrop_viewport, dst_w, dst_h);
+                output_backdrop_viewport_update_destination(node, dst_w, dst_h);
             }
             if (node->backdrop_configured) {
                 wl_surface_attach(node->backdrop_surface, node->backdrop_bo.wl_buffer, 0, 0);
@@ -1798,10 +1867,9 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
     int32_t dst_h = node->logical_height > 0 ? (int32_t)node->logical_height : node->height;
 
     if (node->viewport) {
-        wp_viewport_set_destination(node->viewport, dst_w, dst_h);
+        output_viewport_update_destination(node, dst_w, dst_h);
         wp_viewport_set_source(node->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                wl_fixed_from_int(-1), wl_fixed_from_int(-1));
-        node->vp_configured = false;
     }
 
     render_backdrop_surface(state, node, src_pixels, img_w, img_h);
@@ -2171,10 +2239,9 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         if (out->viewport) {
             int32_t dst_w = out->logical_width > 0 ? (int32_t)out->logical_width : out->width;
             int32_t dst_h = out->logical_height > 0 ? (int32_t)out->logical_height : out->height;
-            wp_viewport_set_destination(out->viewport, dst_w, dst_h);
+            output_viewport_update_destination(out, dst_w, dst_h);
             wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                    wl_fixed_from_int(-1), wl_fixed_from_int(-1));
-            out->vp_configured = false;
         }
 
         render_backdrop_surface(state, out, pixels, img_w, img_h);
@@ -2536,7 +2603,6 @@ static void transition_engine_step(daemon_state_t *state)
                 if (out->surface && target_bo->wl_buffer) {
                     wl_surface_attach(out->surface, target_bo->wl_buffer, 0, 0);
                     wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
-                    presentation_sync_request(&out->pres_sync);
                     output_commit_frame(out);
                 }
                 out->last_presented_bo = target_bo;
@@ -2565,7 +2631,6 @@ static void transition_engine_step(daemon_state_t *state)
                 if (out->surface && out->shm_buffers[back_idx]) {
                     wl_surface_attach(out->surface, out->shm_buffers[back_idx], 0, 0);
                     wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
-                    presentation_sync_request(&out->pres_sync);
                     output_commit_frame(out);
                 }
                 out->shm_buffer_released[back_idx] = false;

@@ -1165,22 +1165,6 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
         }
     }
 
-    for (int i = 0; i < 8; ++i) {
-        if (refresh_frame_flags & (1U << i)) {
-            dec->av1_ref_order_hints[i] = order_hint;
-            memcpy(dec->wm[i], pic_param->wm, sizeof(pic_param->wm));
-            memcpy(dec->loop_filter_ref_deltas[i], pic_param->ref_deltas,
-                   sizeof(pic_param->ref_deltas));
-            memcpy(dec->loop_filter_mode_deltas[i], pic_param->mode_deltas,
-                   sizeof(pic_param->mode_deltas));
-            memcpy(dec->seg_feature_data[i], pic_param->seg_info.feature_data,
-                   sizeof(pic_param->seg_info.feature_data));
-            memcpy(dec->seg_feature_mask[i], pic_param->seg_info.feature_mask,
-                   sizeof(pic_param->seg_info.feature_mask));
-            dec->film_grain[i] = pic_param->film_grain_info;
-        }
-    }
-
     *out_refresh_flags = refresh_frame_flags;
     *out_is_keyframe = (frame_type == 0 && show_frame != 0);
     return true;
@@ -1197,11 +1181,14 @@ bool submit_av1_frame_to_va(vaapi_decoder_t *dec, uint32_t pool_size,
         VASurfaceID ref_surf = dec->av1_ref_frames[av1_show_existing_idx & 7];
         if (ref_surf != VA_INVALID_SURFACE) {
             *io_target = ref_surf;
+            return true;
         }
-        return true;
+        WAYWAL_LOG_WARN("AV1 show_existing references unpopulated slot %u", av1_show_existing_idx);
+        return false;
     }
 
     VASurfaceID target = *io_target;
+    bool surface_found = false;
     for (uint32_t idx = 0; idx < pool_size; ++idx) {
         VASurfaceID s = dec->surfaces[idx];
         bool in_dpb = false;
@@ -1215,30 +1202,39 @@ bool submit_av1_frame_to_va(vaapi_decoder_t *dec, uint32_t pool_size,
         if (!in_dpb && !compositor_busy) {
             dec->current_surface_idx = idx;
             target = s;
+            surface_found = true;
             break;
         }
+    }
+    if (!surface_found) {
+        /* Prefer any non-compositor-busy slot and invalidate references to it */
+        for (uint32_t i = 0; i < pool_size; ++i) {
+            uint32_t cand = (dec->current_surface_idx + 1 + i) % pool_size;
+            bool compositor_busy = dec->surface_busy_mask && dec->surface_busy_mask[cand];
+            if (!compositor_busy) {
+                dec->current_surface_idx = cand;
+                target = dec->surfaces[cand];
+                for (int r = 0; r < 8; ++r) {
+                    if (dec->av1_ref_frames[r] == target) {
+                        dec->av1_ref_frames[r] = VA_INVALID_SURFACE;
+                    }
+                }
+                surface_found = true;
+                break;
+            }
+        }
+    }
+    if (!surface_found) {
+        WAYWAL_LOG_WARN(
+            "All %u VA surfaces are busy (presentation), failing AV1 frame decode cleanly",
+            pool_size);
+        return false;
     }
     *io_target = target;
     pic_param->current_frame = target;
     pic_param->current_display_picture = target;
     for (int i = 0; i < 8; ++i) {
         pic_param->ref_frame_map[i] = dec->av1_ref_frames[i];
-    }
-    for (int i = 0; i < 8; ++i) {
-        if (refresh_flags & (1U << i)) {
-            dec->av1_ref_frames[i] = target;
-            dec->av1_ref_order_hints[i] = pic_param->order_hint;
-            memcpy(dec->wm[i], pic_param->wm, sizeof(pic_param->wm));
-            memcpy(dec->loop_filter_ref_deltas[i], pic_param->ref_deltas,
-                   sizeof(pic_param->ref_deltas));
-            memcpy(dec->loop_filter_mode_deltas[i], pic_param->mode_deltas,
-                   sizeof(pic_param->mode_deltas));
-            memcpy(dec->seg_feature_data[i], pic_param->seg_info.feature_data,
-                   sizeof(pic_param->seg_info.feature_data));
-            memcpy(dec->seg_feature_mask[i], pic_param->seg_info.feature_mask,
-                   sizeof(pic_param->seg_info.feature_mask));
-            dec->film_grain[i] = pic_param->film_grain_info;
-        }
     }
     if (av1_slice_count == 0) {
         av1_slices[0].slice_data_size = (uint32_t)pkt->size;
@@ -1276,6 +1272,28 @@ bool submit_av1_frame_to_va(vaapi_decoder_t *dec, uint32_t pool_size,
             vaDestroyBuffer(dec->va_display, av1_bufs[b]);
         }
     }
-    vaEndPicture(dec->va_display, dec->va_context);
+    VAStatus end_st = vaEndPicture(dec->va_display, dec->va_context);
+    if (end_st != VA_STATUS_SUCCESS) {
+        WAYWAL_LOG_ERR("vaEndPicture failed: %s", vaErrorStr(end_st));
+        return false;
+    }
+
+    /* Defer reference state mutation until after hardware execution succeeds */
+    for (int i = 0; i < 8; ++i) {
+        if (refresh_flags & (1U << i)) {
+            dec->av1_ref_frames[i] = target;
+            dec->av1_ref_order_hints[i] = pic_param->order_hint;
+            memcpy(dec->wm[i], pic_param->wm, sizeof(pic_param->wm));
+            memcpy(dec->loop_filter_ref_deltas[i], pic_param->ref_deltas,
+                   sizeof(pic_param->ref_deltas));
+            memcpy(dec->loop_filter_mode_deltas[i], pic_param->mode_deltas,
+                   sizeof(pic_param->mode_deltas));
+            memcpy(dec->seg_feature_data[i], pic_param->seg_info.feature_data,
+                   sizeof(pic_param->seg_info.feature_data));
+            memcpy(dec->seg_feature_mask[i], pic_param->seg_info.feature_mask,
+                   sizeof(pic_param->seg_info.feature_mask));
+            dec->film_grain[i] = pic_param->film_grain_info;
+        }
+    }
     return true;
 }

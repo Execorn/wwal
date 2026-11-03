@@ -8,6 +8,7 @@
 #include "wayland_core.h"
 #include "waywal/anim_engine.h"
 #include "waywal/audio_fft.h"
+#include "waywal/bezier.h"
 #include "waywal/image_loader.h"
 #include "waywal/ipc_proto.h"
 #include "waywal/log.h"
@@ -330,6 +331,41 @@ static void test_toml_cli_formats(void)
         assert(cli_parse(2, argv_restore, &opts));
         assert(opts.is_swww_compat);
         assert(opts.cmd == CLI_CMD_RESTORE);
+    }
+
+    {
+        char *argv_color[] = {"wwal", "color", "#1e1e2e", "-o", "DP-1"};
+        cli_options_t opts;
+        assert(cli_parse(5, argv_color, &opts));
+        assert(opts.cmd == CLI_CMD_COLOR);
+        assert(opts.clear_color.r == 0x1e && opts.clear_color.g == 0x1e &&
+               opts.clear_color.b == 0x2e);
+        assert(opts.num_outputs == 1 && strcmp(opts.outputs[0], "DP-1") == 0);
+
+        char *argv_clear[] = {"wwal", "clear", "#1e1e2e"};
+        assert(cli_parse(3, argv_clear, &opts));
+        assert(opts.cmd == CLI_CMD_COLOR);
+
+        char *argv_resume[] = {"wwal", "resume", "-o", "HDMI-A-1"};
+        assert(cli_parse(4, argv_resume, &opts));
+        assert(opts.cmd == CLI_CMD_UNPAUSE);
+        assert(opts.num_outputs == 1 && strcmp(opts.outputs[0], "HDMI-A-1") == 0);
+
+        char *argv_unpause[] = {"wwal", "unpause"};
+        assert(cli_parse(2, argv_unpause, &opts));
+        assert(opts.cmd == CLI_CMD_UNPAUSE);
+    }
+
+    {
+        const char *t_stag1 = "[transition]\nstagger_delay = 120\n";
+        waywal_config_t cfg_s1;
+        assert(waywal_config_parse_string(t_stag1, &cfg_s1, NULL, 0));
+        assert(cfg_s1.transition.stagger_delay_ms == 120U);
+
+        const char *t_stag2 = "[transition]\nstagger_delay_ms = 250\n";
+        waywal_config_t cfg_s2;
+        assert(waywal_config_parse_string(t_stag2, &cfg_s2, NULL, 0));
+        assert(cfg_s2.transition.stagger_delay_ms == 250U);
     }
 
     const char *svg_xml = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\" "
@@ -2400,6 +2436,20 @@ static void test_template_security_and_edge_cases(void)
     assert(symlink(tpl_in, sym_to_input) == 0);
     assert(!waywal_palette_render_template_file(&pal, &pal, &pal_sep, tpl_in, sym_to_input));
 
+    char orig_cwd[WAYWAL_PATH_MAX];
+    if (getcwd(orig_cwd, sizeof(orig_cwd)) != NULL) {
+        char nested_dir[700];
+        snprintf(nested_dir, sizeof(nested_dir), "%s/sub/nest1/nest2", tmp_dir);
+        mkdir(nested_dir, 0755);
+        if (chdir(nested_dir) == 0) {
+            assert(!waywal_palette_render_template_file(&pal, &pal, &pal_sep, tpl_in,
+                                                        "../../../.ssh/authorized_keys"));
+            assert(!waywal_palette_render_template_file(&pal, &pal, &pal_sep, tpl_in,
+                                                        "../../.ssh/authorized_keys"));
+            (void)chdir(orig_cwd);
+        }
+    }
+
     /* 7. Symlink preservation in atomic_write_file (both existing and non-existent target leaf) */
     char real_target_dir[640], real_target[680], sym_target[680];
     snprintf(real_target_dir, sizeof(real_target_dir), "%s/real_dir", tmp_dir);
@@ -3124,6 +3174,20 @@ static void test_solar_and_dynamic_wallpapers(void)
     assert(waywal_dynwall_resolve(&xml_man, t_night, &lt, NULL, &eval_res));
     assert(strcmp(eval_res.primary_path, "/var/wallpapers/night.png") == 0);
 
+    lt.tm_hour = 23;
+    lt.tm_min = 59;
+    lt.tm_sec = 59;
+    time_t t_pre_midnight = mktime(&lt);
+    assert(waywal_dynwall_resolve(&xml_man, t_pre_midnight, &lt, NULL, &eval_res));
+    assert(strcmp(eval_res.primary_path, "/var/wallpapers/night.png") == 0);
+
+    lt.tm_hour = 0;
+    lt.tm_min = 0;
+    lt.tm_sec = 1;
+    time_t t_post_midnight = mktime(&lt);
+    assert(waywal_dynwall_resolve(&xml_man, t_post_midnight, &lt, NULL, &eval_res));
+    assert(strcmp(eval_res.primary_path, "/var/wallpapers/night.png") == 0);
+
     /* Reject path traversal, entity evasion, and env-var traversal in XML manifest */
     const char *bad_xml = "<background><static><duration>3600</duration><file>../etc/passwd</"
                           "file></static></background>";
@@ -3753,6 +3817,70 @@ static void test_shader_presets(void)
     printf("  -> Curated Built-In Shader Preset Library & CLI: PASSED\n");
 }
 
+static void test_cubic_bezier_bisection_fallback(void)
+{
+    printf("[TEST] Testing Cubic Bezier Solver & Bisection Fallback...\n");
+
+    /* Boundary cases */
+    assert(waywal_cubic_bezier_solve_t(NULL, 0.5f) == 0.5f);
+    assert(bezier_eval(NULL, 0.5f) == 0.5f);
+    assert(waywal_cubic_bezier_solve_t(&BEZIER_DEFAULT, -0.5f) == 0.0f);
+    assert(bezier_eval(&BEZIER_DEFAULT, -0.5f) == 0.0f);
+    assert(waywal_cubic_bezier_solve_t(&BEZIER_DEFAULT, 1.5f) == 1.0f);
+    assert(bezier_eval(&BEZIER_DEFAULT, 1.5f) == 1.0f);
+
+    /* Linear identity curve */
+    for (float p = 0.0f; p <= 1.0f; p += 0.1f) {
+        assert(fabsf(waywal_cubic_bezier_solve_t(&BEZIER_LINEAR, p) - p) < 1e-5f);
+        assert(fabsf(bezier_eval(&BEZIER_LINEAR, p) - p) < 1e-5f);
+    }
+
+    /* Standard presets */
+    const bezier_curve_t *presets[] = {&BEZIER_DEFAULT, &BEZIER_EASE_IN, &BEZIER_EASE_OUT,
+                                       &BEZIER_EASE_IN_OUT};
+    for (size_t i = 0; i < sizeof(presets) / sizeof(presets[0]); ++i) {
+        float prev_y = 0.0f;
+        for (float p = 0.0f; p <= 1.0f; p += 0.05f) {
+            float y = bezier_eval(presets[i], p);
+            assert(y >= -0.05f && y <= 1.05f);
+            assert(y >= prev_y - 1e-4f);
+            prev_y = y;
+        }
+    }
+
+    /* Steep S-curve where Newton-Raphson tends to overshoot/diverge without bisection fallback */
+    bezier_curve_t c_steep = bezier_create(0.95f, 0.0f, 0.05f, 1.0f);
+    const float steep_cx = 3.0f * c_steep.p1x;
+    const float steep_bx = 3.0f * (c_steep.p2x - c_steep.p1x) - steep_cx;
+    const float steep_ax = 1.0f - steep_cx - steep_bx;
+
+    for (float p = 0.02f; p <= 0.98f; p += 0.05f) {
+        float t = waywal_cubic_bezier_solve_t(&c_steep, p);
+        assert(t >= 0.0f && t <= 1.0f);
+        float x_t = ((steep_ax * t + steep_bx) * t + steep_cx) * t;
+        assert(fabsf(x_t - p) < 1e-3f);
+        float y = bezier_eval(&c_steep, p);
+        assert(y >= 0.0f && y <= 1.0f);
+    }
+
+    /* Flat initial tangent curve (p1x = 0) where derivative dx/dt at origin vanishes */
+    bezier_curve_t c_flat = bezier_create(0.0f, 0.5f, 0.0f, 0.5f);
+    const float flat_cx = 3.0f * c_flat.p1x;
+    const float flat_bx = 3.0f * (c_flat.p2x - c_flat.p1x) - flat_cx;
+    const float flat_ax = 1.0f - flat_cx - flat_bx;
+
+    for (float p = 0.001f; p <= 0.999f; p += 0.1f) {
+        float t = waywal_cubic_bezier_solve_t(&c_flat, p);
+        assert(t >= 0.0f && t <= 1.0f);
+        float x_t = ((flat_ax * t + flat_bx) * t + flat_cx) * t;
+        assert(fabsf(x_t - p) < 1e-3f);
+        float y = bezier_eval(&c_flat, p);
+        assert(y >= 0.0f && y <= 1.0f);
+    }
+
+    printf("  -> Cubic Bezier Solver & Bisection Fallback: PASSED\n");
+}
+
 int main(void)
 {
     waywal_log_set_level(WAYWAL_LOG_LEVEL_WARN);
@@ -3775,6 +3903,7 @@ int main(void)
     test_slideshow_and_wpaperd();
     test_solar_and_dynamic_wallpapers();
     test_shader_presets();
+    test_cubic_bezier_bisection_fallback();
 
     printf("\n>>> ALL CORE SUBSYSTEMS UNIT TESTS PASSED! <<<\n\n");
     return 0;
