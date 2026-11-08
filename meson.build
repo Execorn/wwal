@@ -898,7 +898,7 @@ if get_option('tests')
       include_directories: studio_inc_dirs,
       dependencies: studio_deps,
     )
-    test('benchmark_grid_virtualization', benchmark_grid_virtualization_exe, timeout: 60)
+    test('benchmark_grid_virtualization', benchmark_grid_virtualization_exe, timeout: 60, is_parallel: false)
   endif
 endif
 

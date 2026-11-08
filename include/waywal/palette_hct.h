@@ -122,9 +122,17 @@ typedef struct {
     color_rgba_t onTertiaryFixed;
     color_rgba_t onTertiaryFixedVariant;
 
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#ifdef __clang__
+#pragma clang diagnostic ignored "-Wnested-anon-types"
+#pragma clang diagnostic ignored "-Wgnu-anonymous-struct"
+#endif
+#endif
     union {
         color_rgba_t term[16];
-        __extension__ struct {
+        struct {
             color_rgba_t term0;
             color_rgba_t term1;
             color_rgba_t term2;
@@ -143,6 +151,9 @@ typedef struct {
             color_rgba_t term15;
         };
     };
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
     color_rgba_t rosewater;
     color_rgba_t flamingo;

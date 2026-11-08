@@ -31,7 +31,7 @@ struct WallpaperPreset {
     QString transitionType{QStringLiteral("fade")};
     uint32_t transitionDurationMs{1000};
     uint32_t transitionFps{60};
-    bezier_curve_t bezier{0.25f, 0.1f, 0.25f, 1.0f};
+    bezier_curve_t bezier{{0.25f}, {0.1f}, {0.25f}, {1.0f}};
     bool hasCustomBezier{false};
 
     // Power & Audio parameters
@@ -58,7 +58,7 @@ struct WallpaperPreset {
 class PresetStore : public QObject {
     Q_OBJECT
 
-public:
+  public:
     explicit PresetStore(QString baseDir = QString(), QObject *parent = nullptr);
     ~PresetStore() override = default;
 
@@ -74,12 +74,12 @@ public:
 
     static QString sanitizeId(const QString &id);
 
-signals:
+  signals:
     void presetSaved(const QString &id);
     void presetDeleted(const QString &id);
     void errorOccurred(const QString &error);
 
-private:
+  private:
     void ensureDirectoryExists() const;
     QString m_baseDir;
 };

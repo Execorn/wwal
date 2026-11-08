@@ -31,7 +31,8 @@ namespace waywal::studio {
 /**
  * @brief Helper alias calling waywal_cubic_bezier_solve_t directly from libwaywal_core.a.
  */
-inline float bezier_solve_t(const bezier_curve_t *curve, float progress) {
+inline float bezier_solve_t(const bezier_curve_t *curve, float progress)
+{
     return waywal_cubic_bezier_solve_t(curve, progress);
 }
 
@@ -47,8 +48,8 @@ struct TransitionConfig {
     float waveAmp{0.1f};                   ///< Wave amplitude (0.0..1.0)
     float centerX{0.5f};                   ///< Radial center X in [0.0, 1.0]
     float centerY{0.5f};                   ///< Radial center Y in [0.0, 1.0]
-    bezier_curve_t bezier{0.25f, 0.1f, 0.25f, 1.0f}; ///< Cubic bezier curve
-    bool hasCustomBezier{true};            ///< Custom curve enabled flag
+    bezier_curve_t bezier{{0.25f}, {0.1f}, {0.25f}, {1.0f}}; ///< Cubic bezier curve
+    bool hasCustomBezier{true};                              ///< Custom curve enabled flag
 };
 
 class BezierCurveCanvas;
@@ -69,7 +70,7 @@ class EasingRunnerTrack;
 class CubicBezierEditorWidget : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit CubicBezierEditorWidget(QWidget *parent = nullptr);
     ~CubicBezierEditorWidget() override;
 
@@ -82,19 +83,19 @@ public:
     void applyPreset(const QString &name);
 
     // Transition configuration access
-    const TransitionConfig& transitionConfig() const { return m_config; }
+    const TransitionConfig &transitionConfig() const { return m_config; }
     void setTransitionConfig(const TransitionConfig &config);
 
     // CommandBus integration
     void setCommandBus(CommandBus *bus) { m_commandBus = bus; }
-    CommandBus* commandBus() const { return m_commandBus; }
+    CommandBus *commandBus() const { return m_commandBus; }
 
-signals:
+  signals:
     void curveChanged(float p1x, float p1y, float p2x, float p2y);
     void transitionConfigChanged(const TransitionConfig &config);
     void presetApplied(const QString &presetName);
 
-private slots:
+  private slots:
     void onCanvasCurveChanged(float p1x, float p1y, float p2x, float p2y, bool isInteractive);
     void onTransitionTypeChanged(int index);
     void onDurationChanged(int val);
@@ -105,7 +106,7 @@ private slots:
     void onCenterChanged();
     void onSpinBoxesCurveChanged();
 
-private:
+  private:
     void setupUi();
     void updateUiFromConfig();
 
@@ -152,7 +153,7 @@ private:
 class BezierCurveCanvas : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit BezierCurveCanvas(QWidget *parent = nullptr);
     ~BezierCurveCanvas() override;
 
@@ -162,22 +163,22 @@ public:
     void setDurationMs(uint32_t ms);
     void setAnimationFps(uint32_t fps);
 
-signals:
+  signals:
     void curveModified(float p1x, float p1y, float p2x, float p2y, bool isInteractive);
     void animationTick(float normalizedTime, float easedProgress);
 
-protected:
+  protected:
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
 
-private:
+  private:
     QPointF mapToCanvas(float x, float y) const;
     QPointF mapFromCanvas(const QPointF &pt) const;
     QRectF getHandleRect(const QPointF &canvasPt) const;
 
-    bezier_curve_t m_curve{0.25f, 0.1f, 0.25f, 1.0f};
+    bezier_curve_t m_curve{{0.25f}, {0.1f}, {0.25f}, {1.0f}};
 
     // Canvas view bounds (allowing overshoot Y in [-0.5, 1.5])
     const float m_minX{0.0f};
@@ -204,17 +205,17 @@ private:
 class EasingRunnerTrack : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit EasingRunnerTrack(QWidget *parent = nullptr);
     ~EasingRunnerTrack() override;
 
-public slots:
+  public slots:
     void updateProgress(float normalizedTime, float easedProgress);
 
-protected:
+  protected:
     void paintEvent(QPaintEvent *event) override;
 
-private:
+  private:
     float m_normalizedTime{0.0f};
     float m_easedProgress{0.0f};
 };

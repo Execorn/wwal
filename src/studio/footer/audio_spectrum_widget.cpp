@@ -18,40 +18,44 @@ namespace wwal::studio {
 
 namespace {
 
-constexpr float MaxBark = 28.0f; // Schroeder Bark scale limit up to ~20 kHz
-constexpr float MinDecayRate = 9.0f; // 1/s exponential decay constant
+[[maybe_unused]] constexpr float MaxBark = 28.0f; // Schroeder Bark scale limit up to ~20 kHz
+constexpr float MinDecayRate = 9.0f;              // 1/s exponential decay constant
 constexpr float PeakHoldDurationSec = 0.35f;
 constexpr float PeakGravity = 3.5f; // Normalized units / s^2
 
-inline float clampf(float val, float minVal, float maxVal) noexcept {
+inline float clampf(float val, float minVal, float maxVal) noexcept
+{
     return std::max(minVal, std::min(val, maxVal));
 }
 
 } // namespace
 
-float AudioSpectrumWidget::hzToBark(float hz) noexcept {
+float AudioSpectrumWidget::hzToBark(float hz) noexcept
+{
     float term1 = 13.0f * std::atan(0.00076f * hz);
     float ratio = hz / 7500.0f;
     float term2 = 3.5f * std::atan(ratio * ratio);
     return term1 + term2;
 }
 
-float AudioSpectrumWidget::barkToHz(float bark) noexcept {
+float AudioSpectrumWidget::barkToHz(float bark) noexcept
+{
     float z = clampf(bark, 0.0f, 30.0f);
     return 600.0f * std::sinh(z / 6.0f);
 }
 
-float AudioSpectrumWidget::bandCenterHz(size_t band) noexcept {
+float AudioSpectrumWidget::bandCenterHz(size_t band) noexcept
+{
     if (band >= NumBands) {
         band = NumBands - 1;
     }
     const float maxBark = hzToBark(20000.0f);
-    const float zCenter = ((static_cast<float>(band) + 0.5f) / static_cast<float>(NumBands)) * maxBark;
+    const float zCenter =
+        ((static_cast<float>(band) + 0.5f) / static_cast<float>(NumBands)) * maxBark;
     return barkToHz(zCenter);
 }
 
-AudioSpectrumWidget::AudioSpectrumWidget(QWidget *parent)
-    : QWidget(parent)
+AudioSpectrumWidget::AudioSpectrumWidget(QWidget *parent) : QWidget(parent)
 {
     setMinimumHeight(40);
     setMinimumWidth(140);
@@ -62,8 +66,8 @@ AudioSpectrumWidget::AudioSpectrumWidget(QWidget *parent)
     for (size_t b = 0; b < NumBands; ++b) {
         m_centerFreqs[b] = bandCenterHz(b);
         const float normIdx = static_cast<float>(b) / static_cast<float>(NumBands - 1);
-        const float env = 0.14f + 0.22f * std::exp(-std::pow((normIdx - 0.22f) / 0.18f, 2.0f))
-                        + 0.12f * std::exp(-std::pow((normIdx - 0.58f) / 0.20f, 2.0f));
+        const float env = 0.14f + 0.22f * std::exp(-std::pow((normIdx - 0.22f) / 0.18f, 2.0f)) +
+                          0.12f * std::exp(-std::pow((normIdx - 0.58f) / 0.20f, 2.0f));
         m_targetBands[b] = env;
         m_currentBands[b] = env;
         m_peakCaps[b] = std::min(1.0f, env + 0.08f);
@@ -82,7 +86,8 @@ AudioSpectrumWidget::AudioSpectrumWidget(QWidget *parent)
     m_physicsTimer.start(16); // ~60 Hz
 }
 
-void AudioSpectrumWidget::setupUi() {
+void AudioSpectrumWidget::setupUi()
+{
     auto *rootLayout = new QHBoxLayout(this);
     rootLayout->setContentsMargins(2, 2, 2, 2);
     rootLayout->setSpacing(4);
@@ -96,18 +101,16 @@ void AudioSpectrumWidget::setupUi() {
     m_beatBadge = new QLabel("BEAT", this);
     m_beatBadge->setFixedSize(34, 22);
     m_beatBadge->setAlignment(Qt::AlignCenter);
-    m_beatBadge->setStyleSheet(
-        "QLabel {"
-        "  background-color: #1a1e29;"
-        "  color: #64748b;"
-        "  border: 1px solid #334155;"
-        "  border-radius: 4px;"
-        "  font-family: monospace;"
-        "  font-size: 9px;"
-        "  font-weight: bold;"
-        "  padding: 1px 2px;"
-        "}"
-    );
+    m_beatBadge->setStyleSheet("QLabel {"
+                               "  background-color: #1a1e29;"
+                               "  color: #64748b;"
+                               "  border: 1px solid #334155;"
+                               "  border-radius: 4px;"
+                               "  font-family: monospace;"
+                               "  font-size: 9px;"
+                               "  font-weight: bold;"
+                               "  padding: 1px 2px;"
+                               "}");
     controlsLayout->addWidget(m_beatBadge);
 
     // Audio status badge (PipeWire / Muted)
@@ -115,18 +118,16 @@ void AudioSpectrumWidget::setupUi() {
     m_statusBadge->setToolTip("PipeWire Audio Stream Status");
     m_statusBadge->setFixedSize(26, 22);
     m_statusBadge->setAlignment(Qt::AlignCenter);
-    m_statusBadge->setStyleSheet(
-        "QLabel {"
-        "  background-color: #1a1e29;"
-        "  color: #10b981;"
-        "  border: 1px solid #065f46;"
-        "  border-radius: 4px;"
-        "  font-family: monospace;"
-        "  font-size: 9px;"
-        "  font-weight: bold;"
-        "  padding: 1px 2px;"
-        "}"
-    );
+    m_statusBadge->setStyleSheet("QLabel {"
+                                 "  background-color: #1a1e29;"
+                                 "  color: #10b981;"
+                                 "  border: 1px solid #065f46;"
+                                 "  border-radius: 4px;"
+                                 "  font-family: monospace;"
+                                 "  font-size: 9px;"
+                                 "  font-weight: bold;"
+                                 "  padding: 1px 2px;"
+                                 "}");
     controlsLayout->addWidget(m_statusBadge);
 
     // Sensitivity Gain Slider (0.0x to 5.0x -> slider range 0 to 500)
@@ -139,28 +140,26 @@ void AudioSpectrumWidget::setupUi() {
     m_gainSlider->setValue(100); // 1.00x default
     m_gainSlider->setFixedWidth(52);
     m_gainSlider->setToolTip("Master Audio Sensitivity Gain (0.0x - 5.0x)");
-    m_gainSlider->setStyleSheet(
-        "QSlider::groove:horizontal {"
-        "  height: 4px;"
-        "  background: #334155;"
-        "  border-radius: 2px;"
-        "}"
-        "QSlider::sub-page:horizontal {"
-        "  background: #06b6d4;"
-        "  border-radius: 2px;"
-        "}"
-        "QSlider::handle:horizontal {"
-        "  background: #f8fafc;"
-        "  border: 1px solid #06b6d4;"
-        "  width: 10px;"
-        "  margin-top: -3px;"
-        "  margin-bottom: -3px;"
-        "  border-radius: 5px;"
-        "}"
-        "QSlider::handle:horizontal:hover {"
-        "  background: #38bdf8;"
-        "}"
-    );
+    m_gainSlider->setStyleSheet("QSlider::groove:horizontal {"
+                                "  height: 4px;"
+                                "  background: #334155;"
+                                "  border-radius: 2px;"
+                                "}"
+                                "QSlider::sub-page:horizontal {"
+                                "  background: #06b6d4;"
+                                "  border-radius: 2px;"
+                                "}"
+                                "QSlider::handle:horizontal {"
+                                "  background: #f8fafc;"
+                                "  border: 1px solid #06b6d4;"
+                                "  width: 10px;"
+                                "  margin-top: -3px;"
+                                "  margin-bottom: -3px;"
+                                "  border-radius: 5px;"
+                                "}"
+                                "QSlider::handle:horizontal:hover {"
+                                "  background: #38bdf8;"
+                                "}");
     connect(m_gainSlider, &QSlider::valueChanged, this, &AudioSpectrumWidget::onGainSliderChanged);
     controlsLayout->addWidget(m_gainSlider);
 
@@ -172,24 +171,22 @@ void AudioSpectrumWidget::setupUi() {
     // Mute on External Audio Checkbox
     m_muteToggle = new QCheckBox("Mute", this);
     m_muteToggle->setToolTip("Mute wallpaper audio when external application is playing");
-    m_muteToggle->setStyleSheet(
-        "QCheckBox {"
-        "  color: #94a3b8;"
-        "  font-size: 9.5px;"
-        "  spacing: 3px;"
-        "}"
-        "QCheckBox::indicator {"
-        "  width: 11px;"
-        "  height: 11px;"
-        "  border-radius: 2px;"
-        "  border: 1px solid #475569;"
-        "  background: #1e293b;"
-        "}"
-        "QCheckBox::indicator:checked {"
-        "  background: #06b6d4;"
-        "  border-color: #38bdf8;"
-        "}"
-    );
+    m_muteToggle->setStyleSheet("QCheckBox {"
+                                "  color: #94a3b8;"
+                                "  font-size: 9.5px;"
+                                "  spacing: 3px;"
+                                "}"
+                                "QCheckBox::indicator {"
+                                "  width: 11px;"
+                                "  height: 11px;"
+                                "  border-radius: 2px;"
+                                "  border: 1px solid #475569;"
+                                "  background: #1e293b;"
+                                "}"
+                                "QCheckBox::indicator:checked {"
+                                "  background: #06b6d4;"
+                                "  border-color: #38bdf8;"
+                                "}");
     connect(m_muteToggle, &QCheckBox::toggled, this, &AudioSpectrumWidget::onMuteCheckToggled);
     controlsLayout->addWidget(m_muteToggle);
 
@@ -197,27 +194,17 @@ void AudioSpectrumWidget::setupUi() {
     rootLayout->addLayout(controlsLayout);
 }
 
-void AudioSpectrumWidget::updateFromTelemetry(const waywal_telemetry_snapshot_t &snapshot) {
-    updateAudioData(
-        snapshot.bark_bands,
-        snapshot.rms_level,
-        snapshot.beat_pulse,
-        snapshot.beat_onset != 0,
-        snapshot.audio_active != 0,
-        snapshot.pipewire_active != 0,
-        snapshot.mute_on_audio != 0,
-        snapshot.audio_volume
-    );
+void AudioSpectrumWidget::updateFromTelemetry(const waywal_telemetry_snapshot_t &snapshot)
+{
+    updateAudioData(snapshot.bark_bands, snapshot.rms_level, snapshot.beat_pulse,
+                    snapshot.beat_onset != 0, snapshot.audio_active != 0,
+                    snapshot.pipewire_active != 0, snapshot.mute_on_audio != 0,
+                    snapshot.audio_volume);
 }
 
-void AudioSpectrumWidget::updateAudioData(const float bands[NumBands],
-                                         float rmsLevel,
-                                         float beatPulse,
-                                         bool beatOnset,
-                                         bool audioActive,
-                                         bool pipewireActive,
-                                         bool muteOnAudio,
-                                         float audioVolume)
+void AudioSpectrumWidget::updateAudioData(const float bands[NumBands], float rmsLevel,
+                                          float beatPulse, bool beatOnset, bool audioActive,
+                                          bool pipewireActive, bool muteOnAudio, float audioVolume)
 {
     if (bands) {
         for (size_t i = 0; i < NumBands; ++i) {
@@ -247,18 +234,25 @@ void AudioSpectrumWidget::updateAudioData(const float bands[NumBands],
     if (m_statusBadge) {
         if (!pipewireActive) {
             m_statusBadge->setText("OFF");
-            m_statusBadge->setStyleSheet("QLabel { background-color: #1e293b; color: #64748b; border: 1px solid #334155; border-radius: 4px; font-family: monospace; font-size: 9px; padding: 2px; }");
+            m_statusBadge->setStyleSheet(
+                "QLabel { background-color: #1e293b; color: #64748b; border: 1px solid #334155; "
+                "border-radius: 4px; font-family: monospace; font-size: 9px; padding: 2px; }");
         } else if (muteOnAudio && audioVolume < 0.05f) {
             m_statusBadge->setText("DUCK");
-            m_statusBadge->setStyleSheet("QLabel { background-color: #3b2010; color: #fbbf24; border: 1px solid #b45309; border-radius: 4px; font-family: monospace; font-size: 9px; padding: 2px; }");
+            m_statusBadge->setStyleSheet(
+                "QLabel { background-color: #3b2010; color: #fbbf24; border: 1px solid #b45309; "
+                "border-radius: 4px; font-family: monospace; font-size: 9px; padding: 2px; }");
         } else {
             m_statusBadge->setText("PW");
-            m_statusBadge->setStyleSheet("QLabel { background-color: #064e3b; color: #34d399; border: 1px solid #059669; border-radius: 4px; font-family: monospace; font-size: 9px; padding: 2px; }");
+            m_statusBadge->setStyleSheet(
+                "QLabel { background-color: #064e3b; color: #34d399; border: 1px solid #059669; "
+                "border-radius: 4px; font-family: monospace; font-size: 9px; padding: 2px; }");
         }
     }
 }
 
-void AudioSpectrumWidget::setSensitivityGain(float gain) {
+void AudioSpectrumWidget::setSensitivityGain(float gain)
+{
     gain = clampf(gain, 0.0f, 5.0f);
     if (std::abs(m_sensitivityGain - gain) > 0.001f) {
         m_sensitivityGain = gain;
@@ -276,7 +270,8 @@ void AudioSpectrumWidget::setSensitivityGain(float gain) {
     }
 }
 
-void AudioSpectrumWidget::setMuteOnAudio(bool enabled) {
+void AudioSpectrumWidget::setMuteOnAudio(bool enabled)
+{
     if (m_muteOnAudio != enabled) {
         m_muteOnAudio = enabled;
         if (m_muteToggle) {
@@ -287,7 +282,8 @@ void AudioSpectrumWidget::setMuteOnAudio(bool enabled) {
     }
 }
 
-void AudioSpectrumWidget::onGainSliderChanged(int value) {
+void AudioSpectrumWidget::onGainSliderChanged(int value)
+{
     float newGain = static_cast<float>(value) / 100.0f;
     if (std::abs(m_sensitivityGain - newGain) > 0.001f) {
         m_sensitivityGain = newGain;
@@ -300,14 +296,16 @@ void AudioSpectrumWidget::onGainSliderChanged(int value) {
     }
 }
 
-void AudioSpectrumWidget::onMuteCheckToggled(bool checked) {
+void AudioSpectrumWidget::onMuteCheckToggled(bool checked)
+{
     if (m_muteOnAudio != checked) {
         m_muteOnAudio = checked;
         Q_EMIT muteOnAudioToggled(m_muteOnAudio);
     }
 }
 
-void AudioSpectrumWidget::onPhysicsTick() {
+void AudioSpectrumWidget::onPhysicsTick()
+{
     qint64 elapsedNs = m_elapsedTimer.nsecsElapsed();
     m_elapsedTimer.restart();
     float dt = static_cast<float>(elapsedNs) * 1e-9f;
@@ -317,7 +315,8 @@ void AudioSpectrumWidget::onPhysicsTick() {
     update();
 }
 
-void AudioSpectrumWidget::stepPhysics(float dt) {
+void AudioSpectrumWidget::stepPhysics(float dt)
+{
     const float decayFactor = std::exp(-MinDecayRate * dt);
 
     for (size_t i = 0; i < NumBands; ++i) {
@@ -392,38 +391,39 @@ void AudioSpectrumWidget::stepPhysics(float dt) {
     // Update beat badge style
     if (m_beatBadge) {
         if (m_beatGlowIntensity > 0.15f || m_currentBeatPulse > 0.4f) {
-            int alpha = static_cast<int>(clampf(std::max(m_beatGlowIntensity, m_currentBeatPulse), 0.0f, 1.0f) * 255.0f);
+            int alpha = static_cast<int>(
+                clampf(std::max(m_beatGlowIntensity, m_currentBeatPulse), 0.0f, 1.0f) * 255.0f);
             char styleBuf[256];
             std::snprintf(styleBuf, sizeof(styleBuf),
-                "QLabel {"
-                "  background-color: rgba(236, 72, 153, %d);"
-                "  color: #ffffff;"
-                "  border: 1px solid #f472b6;"
-                "  border-radius: 4px;"
-                "  font-family: monospace;"
-                "  font-size: 9px;"
-                "  font-weight: bold;"
-                "  padding: 2px;"
-                "}", std::min(alpha, 220));
+                          "QLabel {"
+                          "  background-color: rgba(236, 72, 153, %d);"
+                          "  color: #ffffff;"
+                          "  border: 1px solid #f472b6;"
+                          "  border-radius: 4px;"
+                          "  font-family: monospace;"
+                          "  font-size: 9px;"
+                          "  font-weight: bold;"
+                          "  padding: 2px;"
+                          "}",
+                          std::min(alpha, 220));
             m_beatBadge->setStyleSheet(styleBuf);
         } else {
-            m_beatBadge->setStyleSheet(
-                "QLabel {"
-                "  background-color: #1a1e29;"
-                "  color: #64748b;"
-                "  border: 1px solid #334155;"
-                "  border-radius: 4px;"
-                "  font-family: monospace;"
-                "  font-size: 9px;"
-                "  font-weight: bold;"
-                "  padding: 2px;"
-                "}"
-            );
+            m_beatBadge->setStyleSheet("QLabel {"
+                                       "  background-color: #1a1e29;"
+                                       "  color: #64748b;"
+                                       "  border: 1px solid #334155;"
+                                       "  border-radius: 4px;"
+                                       "  font-family: monospace;"
+                                       "  font-size: 9px;"
+                                       "  font-weight: bold;"
+                                       "  padding: 2px;"
+                                       "}");
         }
     }
 }
 
-void AudioSpectrumWidget::paintEvent(QPaintEvent * /*event*/) {
+void AudioSpectrumWidget::paintEvent(QPaintEvent * /*event*/)
+{
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
 
@@ -431,7 +431,8 @@ void AudioSpectrumWidget::paintEvent(QPaintEvent * /*event*/) {
     const float widgetWidth = static_cast<float>(width());
     const float widgetHeight = static_cast<float>(height());
 
-    // Allocate space: Spectrum bars occupy available space to the left of the leftmost visible control
+    // Allocate space: Spectrum bars occupy available space to the left of the leftmost visible
+    // control
     float controlsLeft = widgetWidth - 140.0f;
     if (m_beatBadge && m_beatBadge->isVisible()) {
         controlsLeft = static_cast<float>(m_beatBadge->geometry().left());
@@ -465,7 +466,8 @@ void AudioSpectrumWidget::paintEvent(QPaintEvent * /*event*/) {
     renderRmsMeter(painter, rmsRect);
 }
 
-void AudioSpectrumWidget::renderBeatPulse(QPainter &painter, const QRectF &rect) {
+void AudioSpectrumWidget::renderBeatPulse(QPainter &painter, const QRectF &rect)
+{
     if (m_beatGlowIntensity <= 0.01f && m_currentBeatPulse <= 0.05f) {
         return;
     }
@@ -488,7 +490,8 @@ void AudioSpectrumWidget::renderBeatPulse(QPainter &painter, const QRectF &rect)
 
     // Expanding beat ripple ring
     if (m_beatRingRadius > 0.0f && m_beatRingRadius < maxRadius) {
-        int ringAlpha = static_cast<int>(clampf(m_beatGlowIntensity * 120.0f * (1.0f - (m_beatRingRadius / maxRadius)), 0.0f, 255.0f));
+        int ringAlpha = static_cast<int>(clampf(
+            m_beatGlowIntensity * 120.0f * (1.0f - (m_beatRingRadius / maxRadius)), 0.0f, 255.0f));
         if (ringAlpha > 0) {
             painter.setPen(QPen(QColor(244, 114, 182, ringAlpha), 1.5));
             painter.setBrush(Qt::NoBrush);
@@ -498,17 +501,19 @@ void AudioSpectrumWidget::renderBeatPulse(QPainter &painter, const QRectF &rect)
     painter.restore();
 }
 
-void AudioSpectrumWidget::renderSpectrumBars(QPainter &painter, const QRectF &rect) {
+void AudioSpectrumWidget::renderSpectrumBars(QPainter &painter, const QRectF &rect)
+{
     const float totalWidth = rect.width();
     const float totalHeight = rect.height();
     const float barSpacing = (totalWidth >= 140.0f) ? 1.0f : 0.5f;
-    const float barWidth = std::max(0.5f, (totalWidth - (NumBands - 1) * barSpacing) / static_cast<float>(NumBands));
+    const float barWidth =
+        std::max(0.5f, (totalWidth - (NumBands - 1) * barSpacing) / static_cast<float>(NumBands));
 
     // Dynamic gradient from cyan/teal to violet/magenta
     QLinearGradient barGradient(rect.left(), rect.bottom(), rect.left(), rect.top());
-    barGradient.setColorAt(0.0, QColor(6, 182, 212, 220));   // Cyan-500
-    barGradient.setColorAt(0.6, QColor(139, 92, 246, 230));  // Violet-500
-    barGradient.setColorAt(1.0, QColor(236, 72, 153, 240));  // Pink-500
+    barGradient.setColorAt(0.0, QColor(6, 182, 212, 220));  // Cyan-500
+    barGradient.setColorAt(0.6, QColor(139, 92, 246, 230)); // Violet-500
+    barGradient.setColorAt(1.0, QColor(236, 72, 153, 240)); // Pink-500
 
     painter.setPen(Qt::NoPen);
 
@@ -540,7 +545,8 @@ void AudioSpectrumWidget::renderSpectrumBars(QPainter &painter, const QRectF &re
     }
 }
 
-void AudioSpectrumWidget::renderRmsMeter(QPainter &painter, const QRectF &rect) {
+void AudioSpectrumWidget::renderRmsMeter(QPainter &painter, const QRectF &rect)
+{
     const float totalHeight = rect.height();
 
     // Background track
@@ -554,9 +560,9 @@ void AudioSpectrumWidget::renderRmsMeter(QPainter &painter, const QRectF &rect) 
     QRectF fillRect(rect.left(), y, rect.width(), rmsH);
 
     QLinearGradient rmsGrad(rect.left(), rect.bottom(), rect.left(), rect.top());
-    rmsGrad.setColorAt(0.0, QColor(16, 185, 129, 230));  // Green
-    rmsGrad.setColorAt(0.7, QColor(234, 179, 8, 230));   // Yellow
-    rmsGrad.setColorAt(1.0, QColor(239, 68, 68, 240));   // Red
+    rmsGrad.setColorAt(0.0, QColor(16, 185, 129, 230)); // Green
+    rmsGrad.setColorAt(0.7, QColor(234, 179, 8, 230));  // Yellow
+    rmsGrad.setColorAt(1.0, QColor(239, 68, 68, 240));  // Red
 
     painter.setBrush(rmsGrad);
     painter.drawRoundedRect(fillRect, 1.5, 1.5);
@@ -570,7 +576,8 @@ void AudioSpectrumWidget::renderRmsMeter(QPainter &painter, const QRectF &rect) 
     }
 }
 
-void AudioSpectrumWidget::mouseMoveEvent(QMouseEvent *event) {
+void AudioSpectrumWidget::mouseMoveEvent(QMouseEvent *event)
+{
     const float widgetWidth = static_cast<float>(width());
     float controlsLeft = widgetWidth - 140.0f;
     if (m_beatBadge && m_beatBadge->isVisible()) {
@@ -582,7 +589,8 @@ void AudioSpectrumWidget::mouseMoveEvent(QMouseEvent *event) {
     const float rmsWidth = 6.0f;
     const float spectrumWidth = std::max(16.0f, availWidth - rmsWidth - 10.0f);
     const float barSpacing = (spectrumWidth >= 140.0f) ? 1.0f : 0.5f;
-    const float barWidth = std::max(0.5f, (spectrumWidth - (NumBands - 1) * barSpacing) / static_cast<float>(NumBands));
+    const float barWidth = std::max(0.5f, (spectrumWidth - (NumBands - 1) * barSpacing) /
+                                              static_cast<float>(NumBands));
 
     float mouseX = static_cast<float>(event->pos().x());
     float relativeX = mouseX - 6.0f;
@@ -616,7 +624,8 @@ void AudioSpectrumWidget::mouseMoveEvent(QMouseEvent *event) {
     QWidget::mouseMoveEvent(event);
 }
 
-void AudioSpectrumWidget::leaveEvent(QEvent *event) {
+void AudioSpectrumWidget::leaveEvent(QEvent *event)
+{
     if (m_hoveredBand != -1) {
         m_hoveredBand = -1;
         update();
@@ -624,12 +633,16 @@ void AudioSpectrumWidget::leaveEvent(QEvent *event) {
     QWidget::leaveEvent(event);
 }
 
-void AudioSpectrumWidget::resizeEvent(QResizeEvent *event) {
+void AudioSpectrumWidget::resizeEvent(QResizeEvent *event)
+{
     QWidget::resizeEvent(event);
     const bool wide = (width() >= 290);
-    if (m_beatBadge) m_beatBadge->setVisible(wide);
-    if (m_gainLabel) m_gainLabel->setVisible(wide);
-    if (m_gainValueLabel) m_gainValueLabel->setVisible(wide);
+    if (m_beatBadge)
+        m_beatBadge->setVisible(wide);
+    if (m_gainLabel)
+        m_gainLabel->setVisible(wide);
+    if (m_gainValueLabel)
+        m_gainValueLabel->setVisible(wide);
 }
 
 } // namespace wwal::studio

@@ -23,7 +23,8 @@ namespace waywal::studio {
 /* Helper Functions                                                          */
 /* ========================================================================= */
 
-static bool readExactNonBlocking(int fd, void *buf, size_t count, int timeoutMs) {
+static bool readExactNonBlocking(int fd, void *buf, size_t count, int timeoutMs)
+{
     uint8_t *ptr = static_cast<uint8_t *>(buf);
     size_t total = 0;
 
@@ -54,7 +55,8 @@ static bool readExactNonBlocking(int fd, void *buf, size_t count, int timeoutMs)
     return true;
 }
 
-static bool writeExactNonBlocking(int fd, const void *buf, size_t count, int timeoutMs) {
+static bool writeExactNonBlocking(int fd, const void *buf, size_t count, int timeoutMs)
+{
     const uint8_t *ptr = static_cast<const uint8_t *>(buf);
     size_t total = 0;
 
@@ -90,10 +92,10 @@ static bool writeExactNonBlocking(int fd, const void *buf, size_t count, int tim
 /* ========================================================================= */
 
 IpcClient::IpcClient(QString namespaceStr, QString socketPath, QObject *parent)
-    : QObject(parent),
-      m_namespaceStr(std::move(namespaceStr)),
+    : QObject(parent), m_namespaceStr(std::move(namespaceStr)),
       m_customSocketPath(std::move(socketPath)),
-      m_lastUniformFlush(std::chrono::steady_clock::now()) {
+      m_lastUniformFlush(std::chrono::steady_clock::now())
+{
     if (m_namespaceStr.isEmpty()) {
         m_namespaceStr = QStringLiteral("default");
     }
@@ -106,7 +108,8 @@ IpcClient::IpcClient(QString namespaceStr, QString socketPath, QObject *parent)
     start();
 }
 
-IpcClient::~IpcClient() {
+IpcClient::~IpcClient()
+{
     stop();
     if (m_wakeupFd >= 0) {
         close(m_wakeupFd);
@@ -114,7 +117,8 @@ IpcClient::~IpcClient() {
     }
 }
 
-void IpcClient::start() {
+void IpcClient::start()
+{
     if (m_running.exchange(true)) {
         return; // Already running
     }
@@ -122,7 +126,8 @@ void IpcClient::start() {
     m_workerThread = std::thread(&IpcClient::workerLoop, this);
 }
 
-void IpcClient::stop() {
+void IpcClient::stop()
+{
     if (!m_running.exchange(false)) {
         return;
     }
@@ -135,37 +140,38 @@ void IpcClient::stop() {
     closeSocket();
 }
 
-bool IpcClient::isConnected() const {
-    return m_connected.load();
-}
+bool IpcClient::isConnected() const { return m_connected.load(); }
 
-QString IpcClient::socketPath() const {
+QString IpcClient::socketPath() const
+{
     if (!m_customSocketPath.isEmpty()) {
         return m_customSocketPath;
     }
     return m_resolvedSocketPath;
 }
 
-void IpcClient::wakeupWorker() {
+void IpcClient::wakeupWorker()
+{
     if (m_wakeupFd >= 0) {
         uint64_t val = 1;
-        (void)write(m_wakeupFd, &val, sizeof(val));
+        [[maybe_unused]] ssize_t nw = write(m_wakeupFd, &val, sizeof(val));
     }
 }
 
-void IpcClient::closeSocket() {
+void IpcClient::closeSocket()
+{
     if (m_socketFd >= 0) {
         close(m_socketFd);
         m_socketFd = -1;
     }
     if (m_connected.exchange(false)) {
-        QMetaObject::invokeMethod(this, [this]() {
-            emit connectionStateChanged(false);
-        }, Qt::QueuedConnection);
+        QMetaObject::invokeMethod(
+            this, [this]() { emit connectionStateChanged(false); }, Qt::QueuedConnection);
     }
 }
 
-bool IpcClient::connectSocket() {
+bool IpcClient::connectSocket()
+{
     QString targetPath = m_customSocketPath;
     if (targetPath.isEmpty()) {
         path_buf_t pb;
@@ -224,14 +230,14 @@ bool IpcClient::connectSocket() {
     m_socketFd = fd;
     m_connected.store(true);
 
-    QMetaObject::invokeMethod(this, [this]() {
-        emit connectionStateChanged(true);
-    }, Qt::QueuedConnection);
+    QMetaObject::invokeMethod(
+        this, [this]() { emit connectionStateChanged(true); }, Qt::QueuedConnection);
 
     return true;
 }
 
-void IpcClient::workerLoop() {
+void IpcClient::workerLoop()
+{
     int backoffMs = 50;
 
     while (m_running.load()) {
@@ -268,14 +274,15 @@ void IpcClient::workerLoop() {
         int pr = poll(pfds, 2, pollTimeoutMs);
 
         if (pr < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             closeSocket();
             continue;
         }
 
         if (pfds[0].revents & POLLIN) {
             uint64_t val = 0;
-            (void)read(m_wakeupFd, &val, sizeof(val));
+            [[maybe_unused]] ssize_t nr = read(m_wakeupFd, &val, sizeof(val));
         }
 
         if (pfds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) {
@@ -292,7 +299,8 @@ void IpcClient::workerLoop() {
     }
 }
 
-void IpcClient::flushOutboundQueue() {
+void IpcClient::flushOutboundQueue()
+{
     if (m_socketFd < 0 || !m_connected.load()) {
         return;
     }
@@ -371,7 +379,8 @@ void IpcClient::flushOutboundQueue() {
     }
 }
 
-void IpcClient::handleIncomingPacket() {
+void IpcClient::handleIncomingPacket()
+{
     waywal_ipc_hdr_t hdr{};
     int fds[4] = {-1, -1, -1, -1};
     size_t numFds = 0;
@@ -399,17 +408,17 @@ void IpcClient::handleIncomingPacket() {
 
     // Process responses based on opcode
     if (hdr.opcode == WAYWAL_RESP_EVENT) {
-        QString jsonStr = QString::fromUtf8(
-            reinterpret_cast<const char *>(payload.data()),
-            static_cast<qsizetype>(payload.size()));
+        QString jsonStr = QString::fromUtf8(reinterpret_cast<const char *>(payload.data()),
+                                            static_cast<qsizetype>(payload.size()));
 
         QJsonDocument doc = QJsonDocument::fromJson(jsonStr.toUtf8());
         if (doc.isObject()) {
             QJsonObject obj = doc.object();
-            QString eventType = obj.value(QStringLiteral("event")).toString(QStringLiteral("unknown"));
-            QMetaObject::invokeMethod(this, [this, eventType, obj]() {
-                emit eventReceived(eventType, obj);
-            }, Qt::QueuedConnection);
+            QString eventType =
+                obj.value(QStringLiteral("event")).toString(QStringLiteral("unknown"));
+            QMetaObject::invokeMethod(
+                this, [this, eventType, obj]() { emit eventReceived(eventType, obj); },
+                Qt::QueuedConnection);
         }
         return;
     }
@@ -427,7 +436,8 @@ void IpcClient::handleIncomingPacket() {
     }
 
     if (hdr.opcode == WAYWAL_RESP_DMABUF ||
-        (hasReq && req.expectedOpcode == WAYWAL_REQ_EXPORT_OUTPUT_DMABUF && hdr.opcode == WAYWAL_RESP_OK)) {
+        (hasReq && req.expectedOpcode == WAYWAL_REQ_EXPORT_OUTPUT_DMABUF &&
+         hdr.opcode == WAYWAL_RESP_OK)) {
         if (payload.size() >= sizeof(waywal_export_dmabuf_resp_t)) {
             waywal_export_dmabuf_resp_t desc{};
             std::memcpy(&desc, payload.data(), sizeof(desc));
@@ -443,9 +453,9 @@ void IpcClient::handleIncomingPacket() {
                 req.dmabufCallback(desc, qfds);
             }
 
-            QMetaObject::invokeMethod(this, [this, desc, qfds]() {
-                emit dmabufReceived(desc, qfds);
-            }, Qt::QueuedConnection);
+            QMetaObject::invokeMethod(
+                this, [this, desc, qfds]() { emit dmabufReceived(desc, qfds); },
+                Qt::QueuedConnection);
         }
         return;
     }
@@ -458,7 +468,8 @@ void IpcClient::handleIncomingPacket() {
     }
 
     if (hdr.opcode == WAYWAL_RESP_TELEMETRY ||
-        (hasReq && req.expectedOpcode == WAYWAL_REQ_GET_TELEMETRY && hdr.opcode == WAYWAL_RESP_OK)) {
+        (hasReq && req.expectedOpcode == WAYWAL_REQ_GET_TELEMETRY &&
+         hdr.opcode == WAYWAL_RESP_OK)) {
         if (payload.size() >= sizeof(waywal_telemetry_snapshot_t)) {
             waywal_telemetry_snapshot_t raw{};
             std::memcpy(&raw, payload.data(), sizeof(raw));
@@ -481,7 +492,8 @@ void IpcClient::handleIncomingPacket() {
             snap.muteOnAudio = (raw.mute_on_audio != 0);
             snap.audioVolume = raw.audio_volume;
 
-            uint32_t outCount = std::min(raw.num_outputs, static_cast<uint32_t>(WAYWAL_MAX_TELEMETRY_OUTPUTS));
+            uint32_t outCount =
+                std::min(raw.num_outputs, static_cast<uint32_t>(WAYWAL_MAX_TELEMETRY_OUTPUTS));
             for (uint32_t i = 0; i < outCount; ++i) {
                 const auto &ro = raw.outputs[i];
                 OutputTelemetry ot{};
@@ -505,25 +517,22 @@ void IpcClient::handleIncomingPacket() {
                 req.telemetryCallback(snap);
             }
 
-            QMetaObject::invokeMethod(this, [this, snap]() {
-                emit telemetryReceived(snap);
-            }, Qt::QueuedConnection);
+            QMetaObject::invokeMethod(
+                this, [this, snap]() { emit telemetryReceived(snap); }, Qt::QueuedConnection);
         }
         return;
     }
 
     if (hasReq && req.expectedOpcode == WAYWAL_REQ_QUERY_JSON) {
-        QString jsonStr = QString::fromUtf8(
-            reinterpret_cast<const char *>(payload.data()),
-            static_cast<qsizetype>(payload.size()));
+        QString jsonStr = QString::fromUtf8(reinterpret_cast<const char *>(payload.data()),
+                                            static_cast<qsizetype>(payload.size()));
 
         if (req.jsonCallback) {
             req.jsonCallback(jsonStr);
         }
 
-        QMetaObject::invokeMethod(this, [this, jsonStr]() {
-            emit outputsJsonReceived(jsonStr);
-        }, Qt::QueuedConnection);
+        QMetaObject::invokeMethod(
+            this, [this, jsonStr]() { emit outputsJsonReceived(jsonStr); }, Qt::QueuedConnection);
         return;
     }
 
@@ -533,9 +542,8 @@ void IpcClient::handleIncomingPacket() {
             err = QString::fromUtf8(reinterpret_cast<const char *>(payload.data()),
                                     static_cast<qsizetype>(payload.size()));
         }
-        QMetaObject::invokeMethod(this, [this, err]() {
-            emit errorOccurred(err);
-        }, Qt::QueuedConnection);
+        QMetaObject::invokeMethod(
+            this, [this, err]() { emit errorOccurred(err); }, Qt::QueuedConnection);
     }
 }
 
@@ -543,9 +551,11 @@ void IpcClient::handleIncomingPacket() {
 /* Public API Methods                                                        */
 /* ========================================================================= */
 
-void IpcClient::sendSetUniform(const QString &output, const QString &name,
-                              const float *vals, uint32_t count, bool persist) {
-    if (!vals || count == 0) return;
+void IpcClient::sendSetUniform(const QString &output, const QString &name, const float *vals,
+                               uint32_t count, bool persist)
+{
+    if (!vals || count == 0)
+        return;
 
     waywal_set_uniform_payload_t payload{};
     std::memset(&payload, 0, sizeof(payload));
@@ -583,7 +593,8 @@ void IpcClient::sendSetUniform(const QString &output, const QString &name,
     wakeupWorker();
 }
 
-void IpcClient::sendSetImage(const waywal_img_metadata_t &meta, int memfd) {
+void IpcClient::sendSetImage(const waywal_img_metadata_t &meta, int memfd)
+{
     OutboundPacket pkt{};
     pkt.type = OutboundPacket::Type::Raw;
     pkt.hdr.magic = WAYWAL_IPC_MAGIC;
@@ -609,8 +620,9 @@ void IpcClient::sendSetImage(const waywal_img_metadata_t &meta, int memfd) {
     wakeupWorker();
 }
 
-void IpcClient::sendAudioPowerConfig(float volume, int8_t muteOnAudio,
-                                    int8_t themeFromMedia, uint8_t batteryPolicy) {
+void IpcClient::sendAudioPowerConfig(float volume, int8_t muteOnAudio, int8_t themeFromMedia,
+                                     uint8_t batteryPolicy)
+{
     (void)batteryPolicy; // Reserved for power governor packet extension
     waywal_audio_ctrl_payload_t apay{};
     apay.volume = volume;
@@ -635,7 +647,8 @@ void IpcClient::sendAudioPowerConfig(float volume, int8_t muteOnAudio,
     wakeupWorker();
 }
 
-void IpcClient::requestOutputsJson(std::function<void(const QString &json)> callback) {
+void IpcClient::requestOutputsJson(std::function<void(const QString &json)> callback)
+{
     OutboundPacket pkt{};
     pkt.type = OutboundPacket::Type::QueryJson;
     pkt.hdr.magic = WAYWAL_IPC_MAGIC;
@@ -652,7 +665,8 @@ void IpcClient::requestOutputsJson(std::function<void(const QString &json)> call
     wakeupWorker();
 }
 
-void IpcClient::requestTelemetry(std::function<void(const TelemetrySnapshot &snapshot)> callback) {
+void IpcClient::requestTelemetry(std::function<void(const TelemetrySnapshot &snapshot)> callback)
+{
     OutboundPacket pkt{};
     pkt.type = OutboundPacket::Type::Telemetry;
     pkt.hdr.magic = WAYWAL_IPC_MAGIC;
@@ -669,9 +683,10 @@ void IpcClient::requestTelemetry(std::function<void(const TelemetrySnapshot &sna
     wakeupWorker();
 }
 
-void IpcClient::requestOutputDmabuf(const QString &output,
-                                   std::function<void(const waywal_export_dmabuf_resp_t &desc,
-                                                      const QVector<int> &fds)> callback) {
+void IpcClient::requestOutputDmabuf(
+    const QString &output,
+    std::function<void(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds)> callback)
+{
     waywal_export_dmabuf_req_t req{};
     QByteArray outBa = output.toUtf8();
     std::strncpy(req.output, outBa.constData(), sizeof(req.output) - 1);
@@ -694,7 +709,8 @@ void IpcClient::requestOutputDmabuf(const QString &output,
     wakeupWorker();
 }
 
-void IpcClient::subscribeEvents() {
+void IpcClient::subscribeEvents()
+{
     OutboundPacket pkt{};
     pkt.type = OutboundPacket::Type::Subscribe;
     pkt.hdr.magic = WAYWAL_IPC_MAGIC;

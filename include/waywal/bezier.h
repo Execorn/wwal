@@ -48,6 +48,11 @@ float bezier_eval(const bezier_curve_t *curve, float progress);
 
 #ifdef __cplusplus
 }
+
+inline bool operator==(const bezier_curve_t &a, const bezier_curve_t &b) noexcept
+{
+    return a.p1x == b.p1x && a.p1y == b.p1y && a.p2x == b.p2x && a.p2y == b.p2y;
+}
 #endif
 
 #endif /* WAYWAL_BEZIER_H */

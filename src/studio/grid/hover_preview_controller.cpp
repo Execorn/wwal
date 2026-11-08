@@ -18,21 +18,25 @@ namespace wwal::studio {
 
 namespace {
 
-QImage loadPreviewFileRobust(const std::string &path) {
-    if (path.empty()) return {};
+QImage loadPreviewFileRobust(const std::string &path)
+{
+    if (path.empty())
+        return {};
     QImage img(QString::fromStdString(path));
-    if (!img.isNull()) return img;
+    if (!img.isNull())
+        return img;
 
     uint8_t *rgba = nullptr;
     uint32_t w = 0, h = 0;
     if (image_load_rgba(path.c_str(), &rgba, &w, &h) && rgba && w > 0 && h > 0) {
-        QImage raw(rgba, static_cast<int>(w), static_cast<int>(h),
-                   static_cast<int>(w * 4), QImage::Format_RGBA8888);
+        QImage raw(rgba, static_cast<int>(w), static_cast<int>(h), static_cast<int>(w * 4),
+                   QImage::Format_RGBA8888);
         QImage copy = raw.copy();
         image_free(rgba);
         return copy;
     }
-    if (rgba) image_free(rgba);
+    if (rgba)
+        image_free(rgba);
 
     // Fallback to disk thumbnail cache (~/.cache/wwal/thumbnails/<sha256>.webp) for video/XML items
     const char *xdg_cache = std::getenv("XDG_CACHE_HOME");
@@ -50,7 +54,8 @@ QImage loadPreviewFileRobust(const std::string &path) {
     std::error_code ec;
     if (std::filesystem::exists(cached_file, ec)) {
         QImage cached_img(QString::fromStdString(cached_file.string()));
-        if (!cached_img.isNull()) return cached_img;
+        if (!cached_img.isNull())
+            return cached_img;
     }
     return {};
 }
@@ -88,9 +93,8 @@ void main() {
 } // namespace
 
 HoverPreviewController::HoverPreviewController(QObject *parent)
-    : QObject(parent),
-      m_dwellTimer(new QTimer(this)),
-      m_playbackTimer(new QTimer(this)) {
+    : QObject(parent), m_dwellTimer(new QTimer(this)), m_playbackTimer(new QTimer(this))
+{
 
     m_dwellTimer->setSingleShot(true);
     connect(m_dwellTimer, &QTimer::timeout, this, &HoverPreviewController::onDwellTimeout);
@@ -99,12 +103,12 @@ HoverPreviewController::HoverPreviewController(QObject *parent)
     connect(m_playbackTimer, &QTimer::timeout, this, &HoverPreviewController::onPlaybackTick);
 }
 
-HoverPreviewController::~HoverPreviewController() {
-    stop();
-}
+HoverPreviewController::~HoverPreviewController() { stop(); }
 
-void HoverPreviewController::initGl(QOpenGLExtraFunctions *gl) {
-    if (!gl) return;
+void HoverPreviewController::initGl(QOpenGLExtraFunctions *gl)
+{
+    if (!gl)
+        return;
     m_gl = gl;
 
     if (m_previewTexId == 0) {
@@ -115,22 +119,22 @@ void HoverPreviewController::initGl(QOpenGLExtraFunctions *gl) {
         m_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         m_gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-        m_gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
-                           PREVIEW_WIDTH, PREVIEW_HEIGHT, 0,
-                           GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        m_gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, PREVIEW_WIDTH, PREVIEW_HEIGHT, 0, GL_RGBA,
+                           GL_UNSIGNED_BYTE, nullptr);
         m_gl->glBindTexture(GL_TEXTURE_2D, 0);
     }
 
     if (m_shaderFbo == 0) {
         m_gl->glGenFramebuffers(1, &m_shaderFbo);
         m_gl->glBindFramebuffer(GL_FRAMEBUFFER, m_shaderFbo);
-        m_gl->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                     GL_TEXTURE_2D, m_previewTexId, 0);
+        m_gl->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                     m_previewTexId, 0);
         m_gl->glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 }
 
-void HoverPreviewController::destroyGl(QOpenGLExtraFunctions *gl) {
+void HoverPreviewController::destroyGl(QOpenGLExtraFunctions *gl)
+{
     stop();
 
     if (gl) {
@@ -152,7 +156,8 @@ void HoverPreviewController::destroyGl(QOpenGLExtraFunctions *gl) {
 
 void HoverPreviewController::onCellHoverEntered(uint32_t item_id, const std::string &path,
                                                 WallpaperBadge badge,
-                                                const std::string &preview_path) {
+                                                const std::string &preview_path)
+{
     if (m_previewActive && m_activeItemId == item_id) {
         return; // Already playing this preview
     }
@@ -172,7 +177,8 @@ void HoverPreviewController::onCellHoverEntered(uint32_t item_id, const std::str
     m_dwellTimer->start(DWELL_TIMEOUT_MS);
 }
 
-void HoverPreviewController::onCellHoverExited(uint32_t item_id) {
+void HoverPreviewController::onCellHoverExited(uint32_t item_id)
+{
     if (m_hasPendingItem && m_pendingItemId == item_id) {
         if (m_dwellTimer && m_dwellTimer->isActive()) {
             m_dwellTimer->stop();
@@ -185,7 +191,8 @@ void HoverPreviewController::onCellHoverExited(uint32_t item_id) {
     }
 }
 
-void HoverPreviewController::stop() {
+void HoverPreviewController::stop()
+{
     if (m_dwellTimer && m_dwellTimer->isActive()) {
         m_dwellTimer->stop();
     }
@@ -193,12 +200,15 @@ void HoverPreviewController::stop() {
     cleanupActivePreview();
 }
 
-void HoverPreviewController::onDwellTimeout() {
-    if (!m_hasPendingItem) return;
+void HoverPreviewController::onDwellTimeout()
+{
+    if (!m_hasPendingItem)
+        return;
     startActivePreview();
 }
 
-void HoverPreviewController::startActivePreview() {
+void HoverPreviewController::startActivePreview()
+{
     cleanupActivePreview();
 
     m_activeItemId = m_pendingItemId;
@@ -233,9 +243,10 @@ void HoverPreviewController::startActivePreview() {
                 int crop_h = std::max(1, static_cast<int>(initial_img.height() / zoom));
                 int crop_x = (initial_img.width() - crop_w) / 2;
                 int crop_y = (initial_img.height() - crop_h) / 2;
-                QImage frame = initial_img.copy(crop_x, crop_y, crop_w, crop_h)
-                                         .scaled(PREVIEW_WIDTH, PREVIEW_HEIGHT,
-                                                 Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+                QImage frame =
+                    initial_img.copy(crop_x, crop_y, crop_w, crop_h)
+                        .scaled(PREVIEW_WIDTH, PREVIEW_HEIGHT, Qt::KeepAspectRatioByExpanding,
+                                Qt::SmoothTransformation);
                 if (frame.width() > static_cast<int>(PREVIEW_WIDTH) ||
                     frame.height() > static_cast<int>(PREVIEW_HEIGHT)) {
                     frame = frame.copy((frame.width() - static_cast<int>(PREVIEW_WIDTH)) / 2,
@@ -286,11 +297,13 @@ void HoverPreviewController::startActivePreview() {
     }
 }
 
-void HoverPreviewController::updateTextureWithImage(const QImage &img) {
-    if (img.isNull()) return;
+void HoverPreviewController::updateTextureWithImage(const QImage &img)
+{
+    if (img.isNull())
+        return;
 
-    QImage scaled = img.scaled(PREVIEW_WIDTH, PREVIEW_HEIGHT,
-                               Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+    QImage scaled = img.scaled(PREVIEW_WIDTH, PREVIEW_HEIGHT, Qt::KeepAspectRatioByExpanding,
+                               Qt::SmoothTransformation);
     if (scaled.width() > static_cast<int>(PREVIEW_WIDTH) ||
         scaled.height() > static_cast<int>(PREVIEW_HEIGHT)) {
         scaled = scaled.copy((scaled.width() - static_cast<int>(PREVIEW_WIDTH)) / 2,
@@ -300,17 +313,19 @@ void HoverPreviewController::updateTextureWithImage(const QImage &img) {
     QImage rgba = scaled.convertToFormat(QImage::Format_RGBA8888);
     m_currentPreviewImage = rgba;
 
-    if (!m_gl || m_previewTexId == 0 || QOpenGLContext::currentContext() == nullptr) return;
+    if (!m_gl || m_previewTexId == 0 || QOpenGLContext::currentContext() == nullptr)
+        return;
 
     m_gl->glBindTexture(GL_TEXTURE_2D, m_previewTexId);
-    m_gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                          PREVIEW_WIDTH, PREVIEW_HEIGHT,
-                          GL_RGBA, GL_UNSIGNED_BYTE, rgba.constBits());
+    m_gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT, GL_RGBA,
+                          GL_UNSIGNED_BYTE, rgba.constBits());
     m_gl->glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-void HoverPreviewController::setupOffscreenShader(const std::string &shader_path) {
-    if (!m_gl) return;
+void HoverPreviewController::setupOffscreenShader(const std::string &shader_path)
+{
+    if (!m_gl)
+        return;
 
     std::string fragment_code;
     std::ifstream file(shader_path);
@@ -383,7 +398,8 @@ void main() {
     m_shaderInitialized = true;
 }
 
-void HoverPreviewController::renderShaderFrame() {
+void HoverPreviewController::renderShaderFrame()
+{
     if (m_gl && m_shaderInitialized && m_shaderProgram != 0 && m_shaderFbo != 0 &&
         QOpenGLContext::currentContext() != nullptr) {
         m_gl->glBindFramebuffer(GL_FRAMEBUFFER, m_shaderFbo);
@@ -392,21 +408,19 @@ void HoverPreviewController::renderShaderFrame() {
         m_gl->glUseProgram(m_shaderProgram);
 
         GLint u_time = m_gl->glGetUniformLocation(m_shaderProgram, "iTime");
-        if (u_time >= 0) m_gl->glUniform1f(u_time, m_shaderTime);
+        if (u_time >= 0)
+            m_gl->glUniform1f(u_time, m_shaderTime);
 
         GLint u_res = m_gl->glGetUniformLocation(m_shaderProgram, "iResolution");
-        if (u_res >= 0) m_gl->glUniform3f(u_res, static_cast<float>(PREVIEW_WIDTH),
-                                          static_cast<float>(PREVIEW_HEIGHT), 1.0f);
+        if (u_res >= 0)
+            m_gl->glUniform3f(u_res, static_cast<float>(PREVIEW_WIDTH),
+                              static_cast<float>(PREVIEW_HEIGHT), 1.0f);
 
         GLint u_frame = m_gl->glGetUniformLocation(m_shaderProgram, "iFrame");
-        if (u_frame >= 0) m_gl->glUniform1i(u_frame, m_shaderFrame);
+        if (u_frame >= 0)
+            m_gl->glUniform1i(u_frame, m_shaderFrame);
 
-        static const float quad_verts[] = {
-            -1.0f, -1.0f,
-             1.0f, -1.0f,
-            -1.0f,  1.0f,
-             1.0f,  1.0f
-        };
+        static const float quad_verts[] = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
 
         GLuint vbo = 0;
         m_gl->glGenBuffers(1, &vbo);
@@ -423,8 +437,13 @@ void HoverPreviewController::renderShaderFrame() {
         m_gl->glDeleteBuffers(1, &vbo);
 
         QImage readback(PREVIEW_WIDTH, PREVIEW_HEIGHT, QImage::Format_RGBA8888);
-        m_gl->glReadPixels(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, readback.bits());
+        m_gl->glReadPixels(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE,
+                           readback.bits());
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
         m_currentPreviewImage = readback.flipped(Qt::Vertical);
+#else
+        m_currentPreviewImage = readback.mirrored(false, true);
+#endif
 
         m_gl->glUseProgram(0);
         m_gl->glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -464,8 +483,10 @@ void HoverPreviewController::renderShaderFrame() {
     m_shaderFrame++;
 }
 
-void HoverPreviewController::onPlaybackTick() {
-    if (!m_previewActive) return;
+void HoverPreviewController::onPlaybackTick()
+{
+    if (!m_previewActive)
+        return;
 
     if (m_activeBadge == WallpaperBadge::Shader) {
         renderShaderFrame();
@@ -478,7 +499,8 @@ void HoverPreviewController::onPlaybackTick() {
     }
 }
 
-void HoverPreviewController::cleanupActivePreview() {
+void HoverPreviewController::cleanupActivePreview()
+{
     if (m_playbackTimer && m_playbackTimer->isActive()) {
         m_playbackTimer->stop();
     }
