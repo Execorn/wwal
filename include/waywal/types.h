@@ -23,7 +23,7 @@ typedef struct {
 } rect_t;
 
 typedef union {
-    struct {
+    __extension__ struct {
         uint8_t r;
         uint8_t g;
         uint8_t b;

@@ -8,7 +8,7 @@ For a quick overview, installation instructions, and everyday examples, see the 
 
 ## 1. Subsystem Architecture
 
-WayWal is written in C23 (`gnu2x`) and compiled into two binaries (`wwald` daemon `1.34 MB` stripped and `wwal` CLI client `0.32 MB` stripped) sharing `libwaywal_common.a`:
+WayWal is written in C23 (`gnu2x`) and compiled into two core binaries (`wwald` daemon `1.34 MB` stripped and `wwal` CLI client `0.32 MB` stripped) plus an optional C++23/Qt6 Wayland GUI (`wwal-studio`), all sharing `libwaywal_core.a`:
 
 - **Zero-Copy Wayland Direct Scanout (`wayland_core.c`, `layer_shell.c`, `dmabuf_alloc.c`, `dmabuf_feedback.c`)**:
   - Uses `zwp_linux_dmabuf_v1` (v4 surface feedback) to negotiate hardware scanout modifiers directly with the Wayland compositor, including linear, NVIDIA Block-Linear, AMD DCC, Intel CCS, and ARM AFBC formats, plus 10-bit wide-gamut (`XRGB2101010` / `ARGB2101010`).
@@ -59,17 +59,22 @@ WayWal is written in C23 (`gnu2x`) and compiled into two binaries (`wwald` daemo
   - Disarms all render timers down to **`0.00%` CPU and GPU** when an output is occluded by a fullscreen or maximized window (`zwlr_foreign_toplevel_manager_v1` + Hyprland/Sway/Niri IPC), when the session is idle (`ext-idle-notify-v1`), or on laptop battery power (`/sys/class/power_supply`).
   - Runs on a Linux `io_uring` multishot poll event loop (`uring_loop.c`) with `epoll` fallback, hardened after initialization by Landlock v3 filesystem restrictions and a Seccomp-BPF syscall filter (`security.c`).
 
+- **WayWal Studio GUI (`src/studio/`, `wwal-studio`)**:
+  - C++23 / Qt6 Wayland desktop IDE linking directly to `libwaywal_core.a` (`-Dstudio=auto`).
+  - Includes an $O(1)$ virtualized OpenGL wallpaper library with Myers/Bitap bit-parallel fuzzy search and 512 MB LRU texture caching, zero-copy `EGL_EXT_image_dma_buf_import` live preview, dynamic GLSL `@uniform` and Workshop `project.json` property inspector with 1,000-step undo/redo (`CommandBus`), interactive Material You HCT/OkLab theme studio, multi-monitor topology and span canvas, cubic-Bezier transition curve editor, and 60 Hz Bark-scale audio/telemetry HUD.
+
 ---
 
 ## 2. Build Dependencies
 
-To build from source, you need a C23 compiler (`GCC >= 13` or `Clang >= 17`), `meson >= 0.61`, `ninja`, `pkg-config`, and `python3`.
+To build from source, you need a C23/C++23 compiler (`GCC >= 13` or `Clang >= 17`), `meson >= 0.61`, `ninja`, `pkg-config`, and `python3`.
 
 | Group | `pkg-config` / Package Names | Role |
 | :--- | :--- | :--- |
 | **Core Wayland & DRM** | `wayland-client >= 1.20`, `wayland-protocols >= 1.34`, `wayland-scanner`, `libdrm >= 2.4.110`, `gbm`, `egl`, `glesv2` | Layer surfaces, DMA-BUF buffers, and GLES 3.1 pipelines |
 | **Video & Kernel** | `libva`, `libva-drm`, `liburing`, `libseccomp` | VA-API video decode, `io_uring` loop, and Seccomp sandbox |
 | **Base Image Formats** | `libpng`, `libturbojpeg` | Native PNG, APNG, and JPEG decode/encode |
+| **Optional Studio GUI** | `Qt6Core`, `Qt6Gui`, `Qt6Widgets`, `Qt6OpenGLWidgets` (`-Dstudio=auto`) | Builds the `wwal-studio` desktop GUI |
 | **Optional Plugins (`dlopen`)** | `libwebp`, `libavif`, `libjxl`, `librsvg-2.0`, `libpipewire-0.3`, `libdbus-1`, `libsystemd` / `libelogind`, `liblz4`, `libquickjs` | Loaded lazily at runtime (`dlopen`) with zero startup RSS overhead when unused |
 | **Optional Build Tools** | `scdoc`, `systemd` | Builds `docs/man/*.scd` man pages and sets systemd user unit paths |
 
@@ -81,6 +86,7 @@ meson setup build \
   --buildtype=release \
   -Doptimization=3 \
   -Db_lto=true \
+  -Dstudio=auto \
   -Dwebp=enabled \
   -Davif=enabled \
   -Djxl=enabled \

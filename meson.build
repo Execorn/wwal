@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-project('waywal', 'c',
+project('waywal', ['c', 'cpp'],
   version: '1.2.0',
   license: 'GPL-3.0-or-later',
   meson_version: '>= 0.61.0',
   default_options: [
     'c_std=gnu2x',
+    'cpp_std=c++23',
     'optimization=3',
     'b_lto=true',
     'b_pie=true',
@@ -15,6 +16,7 @@ project('waywal', 'c',
 )
 
 cc = meson.get_compiler('c')
+cpp = meson.get_compiler('cpp')
 python3 = find_program('python3')
 
 # Optimization & compiler hardening arguments
@@ -53,6 +55,41 @@ extra_link_args = cc.get_supported_link_arguments([
   '-Wl,--gc-sections',
 ])
 add_project_link_arguments(extra_link_args, language: 'c')
+
+base_cpp_args = [
+  '-fno-plt',
+  '-fstrict-aliasing',
+  '-D_GNU_SOURCE',
+  '-DWAYWAL_VERSION="' + meson.project_version() + '"',
+  '-DWWAL_DATADIR="' + (get_option('prefix') / get_option('datadir')) + '"',
+]
+
+if get_option('buildtype') != 'release'
+  base_cpp_args += ['-DWWAL_SOURCE_ROOT="' + meson.current_source_dir() + '"']
+endif
+
+add_project_arguments(base_cpp_args, language: 'cpp')
+
+extra_cpp_args = cpp.get_supported_arguments([
+  '-Wundef',
+  '-Wpointer-arith',
+  '-Winit-self',
+  '-Wimplicit-fallthrough',
+  '-Wno-unused-parameter',
+  '-fstack-protector-strong',
+  '-ffunction-sections',
+  '-fdata-sections',
+])
+if host_machine.cpu_family() == 'x86_64'
+  extra_cpp_args += cpp.get_supported_arguments(['-mavx2', '-mfma'])
+endif
+add_project_arguments(extra_cpp_args, language: 'cpp')
+
+extra_cpp_link_args = cpp.get_supported_link_arguments([
+  '-Wl,--as-needed',
+  '-Wl,--gc-sections',
+])
+add_project_link_arguments(extra_cpp_link_args, language: 'cpp')
 
 if not get_option('enable_simd')
   add_project_arguments('-DWWAL_DISABLE_SIMD', language: 'c')
@@ -205,8 +242,12 @@ proto_dep = declare_dependency(
 png_dep = dependency('libpng', required: false)
 turbojpeg_dep = dependency('libturbojpeg', required: false)
 
-# Common foundation library
-common_sources = files(
+# ==============================================================================
+# WayWal Core Static Library (libwaywal_core.a)
+# Shared cleanly between wwald (daemon), wwal (CLI), and wwal-studio (GUI)
+# ==============================================================================
+
+core_sources = files(
   'src/common/arena.c',
   'src/common/path.c',
   'src/common/log.c',
@@ -221,30 +262,38 @@ common_sources = files(
   'src/common/we_json.c',
   'src/common/we_project.c',
   'src/common/solar_schedule.c',
+  'src/common/shader_parser.c',
 )
 
-common_deps = [threads_dep, m_dep, dl_dep]
+core_deps = [threads_dep, m_dep, dl_dep]
 if png_dep.found()
-  common_deps += png_dep
+  core_deps += png_dep
 endif
 if turbojpeg_dep.found()
-  common_deps += turbojpeg_dep
+  core_deps += turbojpeg_dep
 endif
 if openmp_dep.found()
-  common_deps += openmp_dep
+  core_deps += openmp_dep
 endif
 
-common_lib = static_library('waywal_common',
-  common_sources,
+waywal_core_lib = static_library('waywal_core',
+  core_sources,
   include_directories: inc_dir,
-  dependencies: common_deps
+  dependencies: core_deps,
+  pic: true,
+  install: false,
 )
 
-common_dep = declare_dependency(
-  link_with: common_lib,
+waywal_core_dep = declare_dependency(
+  link_with: waywal_core_lib,
   include_directories: inc_dir,
-  dependencies: common_deps
+  dependencies: core_deps,
 )
+
+common_sources = core_sources
+common_lib = waywal_core_lib
+common_dep = waywal_core_dep
+
 
 # Daemon executable (wwald)
 daemon_sources = files(
@@ -290,7 +339,7 @@ daemon_sources = files(
 )
 
 daemon_deps = [
-  common_dep,
+  waywal_core_dep,
   proto_dep,
   shaders_dep,
   wayland_client_dep,
@@ -330,7 +379,7 @@ client_sources = files(
   'src/client/gif_transcode.c',
 )
 
-client_deps = [common_dep, threads_dep, m_dep]
+client_deps = [waywal_core_dep, threads_dep, m_dep]
 
 wwal = executable('wwal',
   client_sources,
@@ -344,6 +393,91 @@ if get_option('swww_compat')
   install_symlink('awww', pointing_to: 'wwal', install_dir: get_option('bindir'))
   install_symlink('swww-daemon', pointing_to: 'wwald', install_dir: get_option('bindir'))
   install_symlink('awww-daemon', pointing_to: 'wwald', install_dir: get_option('bindir'))
+endif
+
+# ==============================================================================
+# WayWal Studio GUI Application (wwal-studio)
+# ==============================================================================
+
+qt6_opt = get_option('studio')
+have_qt6 = false
+qt6_dep = dependency('qt6', modules: ['Core', 'Gui', 'Widgets', 'OpenGLWidgets'], required: qt6_opt)
+if qt6_dep.found()
+  qt6 = import('qt6')
+  have_qt6 = true
+
+  studio_moc_headers = files(
+    'src/studio/app/dock_layout_manager.hpp',
+    'src/studio/app/main_window.hpp',
+    'src/studio/core/command_bus.hpp',
+    'src/studio/core/ipc_client.hpp',
+    'src/studio/core/preset_store.hpp',
+    'src/studio/footer/audio_spectrum_widget.hpp',
+    'src/studio/footer/power_governor_widget.hpp',
+    'src/studio/footer/studio_footer_bar.hpp',
+    'src/studio/footer/telemetry_hud_widget.hpp',
+    'src/studio/grid/hover_preview_controller.hpp',
+    'src/studio/grid/virtualized_grid_widget.hpp',
+    'src/studio/inspector/oklch_color_dialog.hpp',
+    'src/studio/inspector/property_inspector_widget.hpp',
+    'src/studio/theme/desktop_preview_mockup.hpp',
+    'src/studio/theme/template_exporter.hpp',
+    'src/studio/theme/theme_studio_widget.hpp',
+    'src/studio/topology/cubic_bezier_editor.hpp',
+    'src/studio/topology/monitor_topology_canvas.hpp',
+    'src/studio/viewport/gpu_preview_viewport.hpp',
+  )
+
+  studio_inc_dirs = [inc_dir, include_directories('src', 'src/studio')]
+
+  studio_mocs = qt6.compile_moc(
+    headers: studio_moc_headers,
+    include_directories: studio_inc_dirs,
+    dependencies: qt6_dep,
+  )
+
+  studio_sources = files(
+    'src/studio/main.cpp',
+    'src/studio/app/dock_layout_manager.cpp',
+    'src/studio/app/main_window.cpp',
+    'src/studio/core/command_bus.cpp',
+    'src/studio/core/ipc_client.cpp',
+    'src/studio/core/preset_store.cpp',
+    'src/studio/footer/audio_spectrum_widget.cpp',
+    'src/studio/footer/power_governor_widget.cpp',
+    'src/studio/footer/studio_footer_bar.cpp',
+    'src/studio/footer/telemetry_hud_widget.cpp',
+    'src/studio/grid/fuzzy_catalog_index.cpp',
+    'src/studio/grid/gpu_texture_pool.cpp',
+    'src/studio/grid/hover_preview_controller.cpp',
+    'src/studio/grid/virtualized_grid_widget.cpp',
+    'src/studio/inspector/oklch_color_dialog.cpp',
+    'src/studio/inspector/property_inspector_widget.cpp',
+    'src/studio/theme/desktop_preview_mockup.cpp',
+    'src/studio/theme/template_exporter.cpp',
+    'src/studio/theme/theme_studio_widget.cpp',
+    'src/studio/topology/cubic_bezier_editor.cpp',
+    'src/studio/topology/monitor_topology_canvas.cpp',
+    'src/studio/viewport/gpu_preview_viewport.cpp',
+  ) + studio_mocs
+
+  studio_deps = [
+    qt6_dep,
+    waywal_core_dep,
+    threads_dep,
+    m_dep,
+    dl_dep,
+    egl_dep,
+    glesv2_dep,
+    libdrm_dep,
+  ]
+
+  wwal_studio = executable('wwal-studio',
+    studio_sources,
+    include_directories: studio_inc_dirs,
+    dependencies: studio_deps,
+    install: true,
+  )
 endif
 
 # Systemd integration
@@ -707,10 +841,70 @@ if get_option('tests')
   test('fuzz_demuxer', fuzz_demuxer_exe)
   test('fuzz_bitstream', fuzz_bitstream_exe)
   test('fuzz_config_cli', fuzz_config_cli_exe)
+
+  # Core C++23 Compatibility, IPC Invariant & Studio Test Suites
+  test_core_cxx23_compat_exe = executable('test_core_cxx23_compat',
+    'tests/test_core_cxx23_compat.cpp',
+    include_directories: [inc_dir, include_directories('src')],
+    dependencies: [waywal_core_dep, proto_dep, libdrm_dep]
+  )
+  test('core_cxx23_compat', test_core_cxx23_compat_exe)
+
+  test_ipc_legacy_72byte_exe = executable('test_ipc_legacy_72byte',
+    'tests/test_ipc_legacy_72byte.c',
+    include_directories: inc_dir,
+    dependencies: [waywal_core_dep]
+  )
+  test('ipc_legacy_72byte', test_ipc_legacy_72byte_exe)
+
+  if have_qt6
+    dock_test_mocs = qt6.compile_moc(
+      headers: [
+        'src/studio/core/command_bus.hpp',
+        'src/studio/app/dock_layout_manager.hpp',
+        'src/studio/topology/monitor_topology_canvas.hpp',
+      ],
+      include_directories: studio_inc_dirs,
+      dependencies: qt6_dep,
+    )
+
+    test_studio_command_and_dock_exe = executable('test_studio_command_and_dock',
+      'tests/test_studio_command_and_dock.cpp',
+      'src/studio/core/command_bus.cpp',
+      'src/studio/app/dock_layout_manager.cpp',
+      'src/studio/topology/monitor_topology_canvas.cpp',
+      dock_test_mocs,
+      include_directories: studio_inc_dirs,
+      dependencies: studio_deps,
+    )
+    test('studio_command_and_dock', test_studio_command_and_dock_exe)
+
+    grid_bench_mocs = qt6.compile_moc(
+      headers: [
+        'src/studio/grid/virtualized_grid_widget.hpp',
+        'src/studio/grid/hover_preview_controller.hpp',
+      ],
+      include_directories: studio_inc_dirs,
+      dependencies: qt6_dep,
+    )
+
+    benchmark_grid_virtualization_exe = executable('benchmark_grid_virtualization',
+      'tests/benchmark_grid_virtualization.cpp',
+      'src/studio/grid/fuzzy_catalog_index.cpp',
+      'src/studio/grid/gpu_texture_pool.cpp',
+      'src/studio/grid/hover_preview_controller.cpp',
+      'src/studio/grid/virtualized_grid_widget.cpp',
+      grid_bench_mocs,
+      include_directories: studio_inc_dirs,
+      dependencies: studio_deps,
+    )
+    test('benchmark_grid_virtualization', benchmark_grid_virtualization_exe, timeout: 60)
+  endif
 endif
 
 summary({
   'C compiler': cc.get_id() + ' ' + cc.version(),
+  'C++ compiler': cpp.get_id() + ' ' + cpp.version(),
   'Install prefix': get_option('prefix'),
   'Systemd units': get_option('enable_systemd'),
   'Manual pages': not man_pages_opt.disabled(),
@@ -718,6 +912,7 @@ summary({
 }, section: 'Build environment', bool_yn: true)
 
 summary({
+  'wwal-studio (Qt6 GUI)': have_qt6,
   'VA-API hardware video': vaapi_dep.found() and vaapi_drm_dep.found(),
   'io_uring event loop': liburing_dep.found(),
   'Seccomp-BPF sandbox': seccomp_dep.found(),
@@ -732,3 +927,4 @@ summary({
   'PipeWire FFT (dlopen)': not get_option('pipewire').disabled(),
   'FFmpeg SW Dec': have_ffmpeg_swdec,
 }, section: 'Features & Codecs', bool_yn: true)
+

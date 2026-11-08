@@ -124,7 +124,7 @@ typedef struct {
 
     union {
         color_rgba_t term[16];
-        struct {
+        __extension__ struct {
             color_rgba_t term0;
             color_rgba_t term1;
             color_rgba_t term2;
@@ -209,6 +209,10 @@ color_rgba_t waywal_palette_generate_tone(float l_target, float chroma, float hu
 bool waywal_palette_extract(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
                             uint32_t stride_bytes, waywal_theme_mode_t mode,
                             waywal_palette_t *out_palette);
+
+bool waywal_palette_hct_extract(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
+                                uint32_t stride_bytes, waywal_theme_mode_t mode,
+                                waywal_palette_t *out_palette);
 
 bool waywal_palette_extract_ex(const uint8_t *pixels, uint32_t width, uint32_t height,
                                uint32_t stride_bytes, bool is_bgra, waywal_theme_mode_t mode,

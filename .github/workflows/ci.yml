@@ -71,12 +71,17 @@ jobs:
             libavutil-dev \
             libswscale-dev \
             systemd-dev \
+            qt6-base-dev \
+            qt6-base-dev-tools \
+            libgl-dev \
+            libopengl-dev \
             weston \
             ffmpeg
 
       - name: Configure Meson (${{ matrix.compiler }} / ${{ matrix.profile }})
         env:
           CC: ${{ matrix.compiler }}
+          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
         run: |
           if [ "${{ matrix.profile }}" = "release" ]; then
             meson setup build \
@@ -85,6 +90,7 @@ jobs:
               -Doptimization=3 \
               -Db_lto=true \
               -Db_pie=true \
+              -Dstudio=enabled \
               -Denable_vaapi=true \
               -Denable_io_uring=true \
               -Denable_simd=true \
@@ -98,6 +104,7 @@ jobs:
               -Db_lto=false \
               -Db_lundef=false \
               -Db_sanitize=address,undefined \
+              -Dstudio=enabled \
               -Denable_vaapi=true \
               -Denable_io_uring=true \
               -Denable_simd=true \

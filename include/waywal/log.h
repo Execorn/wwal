@@ -22,14 +22,10 @@ waywal_log_level_t waywal_log_get_level(void);
 void waywal_log(waywal_log_level_t level, const char *file, int line, const char *fmt, ...)
     __attribute__((format(printf, 4, 5)));
 
-#define WAYWAL_LOG_DEBUG(fmt, ...)                                                                 \
-    waywal_log(WAYWAL_LOG_LEVEL_DEBUG, __FILE__, __LINE__, fmt __VA_OPT__(, ) __VA_ARGS__)
-#define WAYWAL_LOG_INFO(fmt, ...)                                                                  \
-    waywal_log(WAYWAL_LOG_LEVEL_INFO, __FILE__, __LINE__, fmt __VA_OPT__(, ) __VA_ARGS__)
-#define WAYWAL_LOG_WARN(fmt, ...)                                                                  \
-    waywal_log(WAYWAL_LOG_LEVEL_WARN, __FILE__, __LINE__, fmt __VA_OPT__(, ) __VA_ARGS__)
-#define WAYWAL_LOG_ERR(fmt, ...)                                                                   \
-    waywal_log(WAYWAL_LOG_LEVEL_ERR, __FILE__, __LINE__, fmt __VA_OPT__(, ) __VA_ARGS__)
+#define WAYWAL_LOG_DEBUG(...) waywal_log(WAYWAL_LOG_LEVEL_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
+#define WAYWAL_LOG_INFO(...)  waywal_log(WAYWAL_LOG_LEVEL_INFO, __FILE__, __LINE__, __VA_ARGS__)
+#define WAYWAL_LOG_WARN(...)  waywal_log(WAYWAL_LOG_LEVEL_WARN, __FILE__, __LINE__, __VA_ARGS__)
+#define WAYWAL_LOG_ERR(...)   waywal_log(WAYWAL_LOG_LEVEL_ERR, __FILE__, __LINE__, __VA_ARGS__)
 
 #ifdef __cplusplus
 }

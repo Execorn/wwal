@@ -88,6 +88,11 @@ float waywal_cubic_bezier_solve_t(const bezier_curve_t *curve, float progress)
     return t;
 }
 
+float bezier_solve_t(const bezier_curve_t *curve, float progress)
+{
+    return waywal_cubic_bezier_solve_t(curve, progress);
+}
+
 float bezier_eval(const bezier_curve_t *curve, float progress)
 {
     if (!curve)

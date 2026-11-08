@@ -716,3 +716,5 @@ bool we_jval_bool_resolved(const we_jval_t *v, const we_project_t *proj, bool de
     }
     return def;
 }
+
+we_jval_t *we_json_parse(const char *src, size_t len) { return we_json_parse_root(src, len); }

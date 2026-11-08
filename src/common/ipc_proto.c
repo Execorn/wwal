@@ -290,7 +290,7 @@ int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms)
     return -1;
 }
 
-bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd)
+bool waywal_ipc_send_fds(int socket_fd, const waywal_ipc_hdr_t *hdr, const int *fds, size_t num_fds)
 {
     if (socket_fd < 0 || !hdr)
         return false;
@@ -302,20 +302,23 @@ bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd
     msg.msg_iovlen = 1;
 
     union {
-        char buf[CMSG_SPACE(sizeof(int))];
+        char buf[CMSG_SPACE(sizeof(int) * 4)];
         struct cmsghdr align;
     } u;
 
-    if (attached_fd >= 0) {
+    if (fds && num_fds > 0) {
+        if (num_fds > 4) {
+            num_fds = 4;
+        }
         memset(u.buf, 0, sizeof(u.buf));
         msg.msg_control = u.buf;
-        msg.msg_controllen = sizeof(u.buf);
+        msg.msg_controllen = CMSG_SPACE(sizeof(int) * num_fds);
 
         struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
         cmsg->cmsg_level = SOL_SOCKET;
         cmsg->cmsg_type = SCM_RIGHTS;
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(cmsg), &attached_fd, sizeof(int));
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int) * num_fds);
+        memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * num_fds);
     }
 
     ssize_t sent;
@@ -326,12 +329,26 @@ bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd
     return (sent == (ssize_t)sizeof(waywal_ipc_hdr_t));
 }
 
-bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached_fd)
+bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd)
+{
+    if (attached_fd >= 0) {
+        return waywal_ipc_send_fds(socket_fd, hdr, &attached_fd, 1);
+    }
+    return waywal_ipc_send_fds(socket_fd, hdr, NULL, 0);
+}
+
+bool waywal_ipc_recv_fds(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_fds, size_t max_fds,
+                         size_t *out_num_fds)
 {
     if (socket_fd < 0 || !out_hdr)
         return false;
-    if (out_attached_fd)
-        *out_attached_fd = -1;
+    if (out_num_fds)
+        *out_num_fds = 0;
+    if (out_fds) {
+        for (size_t i = 0; i < max_fds; ++i) {
+            out_fds[i] = -1;
+        }
+    }
 
     struct msghdr msg = {0};
 
@@ -340,7 +357,7 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
     msg.msg_iovlen = 1;
 
     union {
-        char buf[CMSG_SPACE(sizeof(int)) * 2];
+        char buf[CMSG_SPACE(sizeof(int) * 4) * 2];
         struct cmsghdr align;
     } u;
     memset(u.buf, 0, sizeof(u.buf));
@@ -356,8 +373,7 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
         return false;
     }
 
-    /* Extract any SCM_RIGHTS FD delivered on the first byte immediately, closing any extra FDs */
-    int received_fd = -1;
+    size_t extracted = 0;
     for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
         if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
             cmsg->cmsg_len >= CMSG_LEN(0)) {
@@ -367,14 +383,17 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
                 int fd = -1;
                 memcpy(&fd, data + i * sizeof(int), sizeof(int));
                 if (fd >= 0) {
-                    if (received_fd < 0 && out_attached_fd != NULL) {
-                        received_fd = fd;
+                    if (out_fds && extracted < max_fds) {
+                        out_fds[extracted++] = fd;
                     } else {
                         close(fd);
                     }
                 }
             }
         }
+    }
+    if (out_num_fds) {
+        *out_num_fds = extracted;
     }
 
     /* Complete reading the full header if initial recvmsg was partial */
@@ -391,13 +410,29 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
                 if (poll(&pfd, 1, 100) > 0)
                     continue;
             }
-            if (received_fd >= 0)
-                close(received_fd);
+            if (out_fds) {
+                for (size_t i = 0; i < extracted; ++i) {
+                    if (out_fds[i] >= 0) {
+                        close(out_fds[i]);
+                        out_fds[i] = -1;
+                    }
+                }
+            }
+            if (out_num_fds)
+                *out_num_fds = 0;
             return false;
         }
         if (rem == 0) {
-            if (received_fd >= 0)
-                close(received_fd);
+            if (out_fds) {
+                for (size_t i = 0; i < extracted; ++i) {
+                    if (out_fds[i] >= 0) {
+                        close(out_fds[i]);
+                        out_fds[i] = -1;
+                    }
+                }
+            }
+            if (out_num_fds)
+                *out_num_fds = 0;
             return false;
         }
         total_read += (size_t)rem;
@@ -406,16 +441,31 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
     if (out_hdr->magic != WAYWAL_IPC_MAGIC || out_hdr->version != WAYWAL_IPC_VERSION) {
         WAYWAL_LOG_ERR("IPC header magic/version mismatch: magic=0x%08x ver=%u", out_hdr->magic,
                        out_hdr->version);
-        if (received_fd >= 0)
-            close(received_fd);
+        if (out_fds) {
+            for (size_t i = 0; i < extracted; ++i) {
+                if (out_fds[i] >= 0) {
+                    close(out_fds[i]);
+                    out_fds[i] = -1;
+                }
+            }
+        }
+        if (out_num_fds)
+            *out_num_fds = 0;
         return false;
     }
 
-    if (out_attached_fd) {
-        *out_attached_fd = received_fd;
-    } else if (received_fd >= 0) {
-        close(received_fd);
-    }
-
     return true;
+}
+
+bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached_fd)
+{
+    int fd = -1;
+    size_t count = 0;
+    bool ok = waywal_ipc_recv_fds(socket_fd, out_hdr, &fd, 1, &count);
+    if (out_attached_fd) {
+        *out_attached_fd = (ok && count > 0) ? fd : -1;
+    } else if (count > 0 && fd >= 0) {
+        close(fd);
+    }
+    return ok;
 }

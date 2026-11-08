@@ -6,6 +6,7 @@
 #include "waywal/shader_engine.h"
 #include "waywal/we_particle.h"
 #include "waywal/we_pkg.h"
+#include "waywal/we_project.h"
 #include "waywal/we_puppet.h"
 #include "waywal/we_script.h"
 #include "waywal/we_shader.h"
@@ -19,7 +20,6 @@
 extern "C" {
 #endif
 
-#define WE_MAX_USER_PROPS     64u
 #define WE_MAX_PASS_TEXTURES  8u
 #define WE_MAX_CONST_VALS     32u
 #define WE_MAX_EFFECT_PASSES  16u
@@ -40,34 +40,6 @@ typedef struct {
     char uniform_name[64];
     we_script_t *vm;
 } we_obj_script_t;
-
-typedef enum {
-    WE_PROP_FLOAT = 0,
-    WE_PROP_BOOL = 1,
-    WE_PROP_INT = 2,
-    WE_PROP_COLOR = 3,
-    WE_PROP_TEXT = 4,
-} we_prop_type_t;
-
-typedef struct {
-    char key[64];
-    char text[128];
-    we_prop_type_t type;
-    float val[4];
-    uint32_t num_components;
-    char str_val[256];
-} we_user_prop_t;
-
-typedef struct {
-    char workshop_id[64];
-    char workshop_dir[4096];
-    char title[256];
-    char type[64];  /* "scene", "video", "web", "application" */
-    char file[256]; /* Default "scene.json" or video filename */
-    char preview[256];
-    we_user_prop_t props[WE_MAX_USER_PROPS];
-    uint32_t prop_count;
-} we_project_t;
 
 typedef enum {
     WE_BLEND_NORMAL = 0,

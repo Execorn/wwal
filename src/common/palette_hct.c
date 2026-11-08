@@ -1976,6 +1976,13 @@ bool waywal_palette_extract(const uint8_t *rgba_pixels, uint32_t width, uint32_t
                                      WAYWAL_SCHEME_TONAL_SPOT, 0.0f, out_palette);
 }
 
+bool waywal_palette_hct_extract(const uint8_t *rgba_pixels, uint32_t width, uint32_t height,
+                                uint32_t stride_bytes, waywal_theme_mode_t mode,
+                                waywal_palette_t *out_palette)
+{
+    return waywal_palette_extract(rgba_pixels, width, height, stride_bytes, mode, out_palette);
+}
+
 bool waywal_palette_extract_bgra(const uint8_t *bgra_pixels, uint32_t width, uint32_t height,
                                  uint32_t stride_bytes, waywal_theme_mode_t mode,
                                  waywal_palette_t *out_palette)

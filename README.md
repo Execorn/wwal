@@ -25,6 +25,7 @@ Most Wayland setups are held together with duct tape. You end up installing five
 - **Sun-tracked day and night wallpapers**: Give it your location (or a GNOME timed wallpaper) and your desktop shifts from dawn to noon to night with the real sun, flipping your apps between light and dark mode along the way.
 - **Zero wasted battery (`0.0%` when covered)**: Still images use `0.0%` CPU and `0.0%` GPU once drawn. Videos use hardware VA-API decoding (`~0.3%` CPU). Open a window full screen or launch a game, and WayWal pauses right away. It mutes background sound too, then wakes back up when you can see your desktop again.
 - **Drop-in replacement for `swww`, `awww`, and `wpaperd`**: Keep your old scripts and keybinds. WayWal reads `swww` and `awww` CLI flags directly, loads `wpaperd` configs, and includes `wwal pick` so you can browse thumbnails in `rofi`, `fuzzel`, or `walker` in under `1 ms`.
+- **WayWal Studio GUI (`wwal-studio`)**: Includes an optional Wayland GUI app to browse wallpapers, edit live shader and Workshop sliders, preview Material You color themes, tune transition curves, and arrange multi-monitor spans.
 
 ---
 
@@ -82,12 +83,12 @@ nix profile install github:Execorn/wwal
 
 ### Build from Source (Ubuntu, Fedora, Debian, Arch, Void, Alpine)
 
-1. Install your system build tools (`meson`, `ninja`, `gcc` or `clang`, `pkg-config`) and base libraries (`wayland`, `wayland-protocols`, `libdrm`, `mesa`, `libva`, `liburing`, `libseccomp`, `libpng`, `libjpeg-turbo`).
-2. Build and install:
+1. Install your system build tools (`meson`, `ninja`, `gcc` or `clang`, `pkg-config`) and base libraries (`wayland`, `wayland-protocols`, `libdrm`, `mesa`, `libva`, `liburing`, `libseccomp`, `libpng`, `libjpeg-turbo`, plus optional `qt6-base` for `wwal-studio`).
+2. Build and install (pass `-Dstudio=disabled` for a headless/CLI-only build):
 ```bash
 git clone https://github.com/Execorn/wwal.git
 cd wwal
-meson setup build --prefix="$HOME/.local" --buildtype=release -Doptimization=3 -Db_lto=true
+meson setup build --prefix="$HOME/.local" --buildtype=release -Doptimization=3 -Db_lto=true -Dstudio=auto
 meson compile -C build
 meson install -C build
 ```
@@ -113,13 +114,19 @@ wwal img ~/Pictures/Wallpapers/portrait.png --crop-gravity top --theme --source-
 wwal img 2841902341
 ```
 
-### 2. Built-In Wallpaper Picker
+### 2. Built-In Wallpaper Picker & Studio GUI
 ```bash
 # Open Rofi / Fuzzel / Walker with thumbnails for images, videos, shaders & Workshop items
 wwal pick
 
 # Output JSON metadata + thumbnail paths for Quickshell / Eww / AGS widgets
 wwal pick --menu json
+
+# Launch the WayWal Studio GUI (library browser, shader/scene sliders, theme studio & monitor canvas)
+wwal-studio
+
+# Launch Studio scanning specific wallpaper folders while excluding subfolders
+wwal-studio -d ~/Pictures/Wallpapers -x Screenshots
 ```
 
 ### 3. Play a Video or GIF

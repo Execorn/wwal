@@ -2,10 +2,17 @@
 #ifndef WAYWAL_TOML_PARSER_H
 #define WAYWAL_TOML_PARSER_H
 
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
 #include "waywal/palette_hct.h"
+#include "waywal/types.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #include "waywal/path.h"
 #include "waywal/state_store.h"
-#include "waywal/types.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -22,14 +29,22 @@ extern "C" {
 #define WAYWAL_CONFIG_MAX_SCHEDULE   32U
 #define WAYWAL_MAX_SCHEDULES         WAYWAL_CONFIG_MAX_SCHEDULE
 
+#ifdef __cplusplus
 typedef enum : uint32_t {
+#else
+typedef enum {
+#endif
     WAYWAL_LAYER_BACKGROUND = 0,
     WAYWAL_LAYER_BOTTOM = 1,
 } waywal_layer_pos_t;
 
 #ifndef WAYWAL_BATTERY_POLICY_DEFINED
 #define WAYWAL_BATTERY_POLICY_DEFINED
+#ifdef __cplusplus
 typedef enum : uint32_t {
+#else
+typedef enum {
+#endif
     WAYWAL_BATTERY_IGNORE = 0,
     WAYWAL_BATTERY_REDUCE_FPS = 1,
     WAYWAL_BATTERY_PAUSE_VIDEO = 2,

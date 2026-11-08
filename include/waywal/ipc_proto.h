@@ -5,12 +5,18 @@
 #include "waywal/bezier.h"
 #include "waywal/path.h"
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 #endif
 
 #define WAYWAL_IPC_MAGIC                                                                           \
@@ -51,12 +57,20 @@ typedef enum : uint16_t {
     WAYWAL_IPC_OP_SLIDESHOW_NEXT = WAYWAL_REQ_SLIDESHOW_NEXT,
     WAYWAL_REQ_SLIDESHOW_PREV = 0x0015,
     WAYWAL_IPC_OP_SLIDESHOW_PREV = WAYWAL_REQ_SLIDESHOW_PREV,
+    WAYWAL_REQ_SET_SHADER_PARAM = 0x0016,
+    WAYWAL_IPC_OP_SET_SHADER_PARAM = WAYWAL_REQ_SET_SHADER_PARAM,
+    WAYWAL_REQ_GET_TELEMETRY = 0x0017,
+    WAYWAL_IPC_OP_GET_TELEMETRY = WAYWAL_REQ_GET_TELEMETRY,
+    WAYWAL_REQ_EXPORT_OUTPUT_DMABUF = 0x0018,
+    WAYWAL_IPC_OP_EXPORT_OUTPUT_DMABUF = WAYWAL_REQ_EXPORT_OUTPUT_DMABUF,
 
     WAYWAL_RESP_OK = 0x8001,
     WAYWAL_RESP_PONG = 0x8002,
     WAYWAL_RESP_INFO = 0x8003,
     WAYWAL_RESP_ERR = 0x8004,
     WAYWAL_RESP_EVENT = 0x8005,
+    WAYWAL_RESP_TELEMETRY = 0x8006,
+    WAYWAL_RESP_DMABUF = 0x8007,
 } waywal_opcode_t;
 typedef waywal_opcode_t waywal_ipc_op_t;
 
@@ -130,6 +144,8 @@ typedef struct {
     /* Followed by num_target_outputs null-terminated strings, then custom shader GLSL string */
 } waywal_img_metadata_t;
 typedef waywal_img_metadata_t waywal_ipc_img_meta_t;
+static_assert(offsetof(waywal_img_metadata_t, filter_mode) == 72,
+              "Legacy 72-byte prefix of waywal_img_metadata_t must remain frozen at offset 72");
 
 typedef struct {
     uint8_t color[4];
@@ -268,14 +284,32 @@ typedef struct {
     char layer_name[32];
 } waywal_workshop_payload_t;
 
+#define WAYWAL_UNIFORM_FLAG_PERSIST 0x0001U
+
 typedef struct {
-    char output[64];         /* Empty string "" = apply to all outputs */
-    char name[64];           /* GLSL uniform name or WE property key */
-    uint32_t num_components; /* 1..4 */
-    float values[4];
+    union {
+        /* Standard 64/64 layout (CLI, daemon, legacy) */
+        struct {
+            char output[64];         /* Empty string "" = apply to all outputs */
+            char name[64];           /* GLSL uniform name or WE property key */
+            uint32_t num_components; /* 1..4 */
+            float values[4];
+        };
+        /* Structured 32/64 layout with explicit persistence flags */
+        struct {
+            char target_output[32];
+            char uniform_name[64];
+            uint32_t uniform_components;
+            float uniform_values[4];
+            uint32_t flags; /* Bit 0: WAYWAL_UNIFORM_FLAG_PERSIST */
+            uint8_t _reserved[28];
+        };
+        uint8_t raw[148];
+    };
 } waywal_set_uniform_payload_t;
 static_assert(sizeof(waywal_set_uniform_payload_t) == 148,
               "waywal_set_uniform_payload_t must be 148 bytes");
+typedef waywal_set_uniform_payload_t waywal_shader_param_payload_t;
 
 typedef struct {
     float volume;            /* < 0.0f = unchanged, 0.0..1.0 = set master volume */
@@ -285,6 +319,94 @@ typedef struct {
 } waywal_audio_ctrl_payload_t;
 static_assert(sizeof(waywal_audio_ctrl_payload_t) == 8,
               "waywal_audio_ctrl_payload_t must be 8 bytes");
+
+#define WAYWAL_MAX_TELEMETRY_OUTPUTS 8
+
+typedef enum : uint8_t {
+    WAYWAL_BO_STATE_FREE = 0,
+    WAYWAL_BO_STATE_RENDERING = 1,
+    WAYWAL_BO_STATE_COMMITTED = 2,
+    WAYWAL_BO_STATE_SCANOUT_LOCKED = 3,
+} waywal_bo_slot_state_t;
+
+typedef struct {
+    char name[64];
+    float scanout_fps;
+    uint32_t last_render_us;
+    uint32_t vram_kib;
+    uint8_t bo_states[4]; /* waywal_bo_slot_state_t */
+    uint8_t engine_kind;  /* 0=static, 1=shader, 2=workshop, 3=video, 4=slideshow, 5=animation */
+    uint8_t is_paused;
+    uint16_t pause_mask;
+    uint32_t width;
+    uint32_t height;
+    uint32_t logical_width;
+    uint32_t logical_height;
+    int32_t scale_120;
+    uint8_t _pad[8];
+} waywal_output_telemetry_t;
+static_assert(sizeof(waywal_output_telemetry_t) == 112,
+              "waywal_output_telemetry_t must be 112 bytes");
+
+#define WAYWAL_TELEMETRY_FORMAT_BINARY 0x0000U
+#define WAYWAL_TELEMETRY_FORMAT_JSON   0x0001U
+
+typedef struct {
+    uint32_t version;      /* 1 */
+    uint32_t flags;        /* Bit 0: format (0=binary, 1=json) */
+    uint64_t timestamp_ns; /* CLOCK_MONOTONIC timestamp */
+
+    /* Process resources */
+    uint32_t rss_kib;
+    uint32_t pss_kib;
+    uint32_t total_vram_kib;
+    uint32_t gpu_active; /* 1 = GPU compute active, 0 = CPU fallback */
+
+    /* Power governor */
+    uint8_t on_battery;
+    uint8_t battery_policy; /* 0=ignore, 1=reduce-fps, 2=pause-video */
+    uint16_t global_pause_mask;
+
+    /* Audio FFT */
+    float bark_bands[64];    /* 64 Bark-scale frequency bands */
+    float rms_level;         /* RMS envelope */
+    float beat_pulse;        /* Normalized beat onset */
+    uint8_t beat_onset;      /* 1 if beat onset active */
+    uint8_t audio_active;    /* 1 if audio engine active */
+    uint8_t pipewire_active; /* 1 if PipeWire stream active */
+    uint8_t mute_on_audio;
+    float audio_volume;
+
+    /* Outputs */
+    uint32_t num_outputs;
+    waywal_output_telemetry_t outputs[WAYWAL_MAX_TELEMETRY_OUTPUTS];
+} waywal_telemetry_snapshot_t;
+static_assert(sizeof(waywal_telemetry_snapshot_t) == 1208,
+              "waywal_telemetry_snapshot_t must be 1208 bytes");
+
+typedef struct {
+    char output[64]; /* Target output name, or empty string "" for primary active output */
+} waywal_export_dmabuf_req_t;
+static_assert(sizeof(waywal_export_dmabuf_req_t) == 64,
+              "waywal_export_dmabuf_req_t must be 64 bytes");
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t drm_format;
+    uint32_t num_planes;
+    uint64_t modifier;
+    uint32_t strides[4];
+    uint32_t offsets[4];
+    char output[64];
+    uint32_t flags; /* Bit 0: 10-bit color, Bit 1: linear */
+    uint8_t _pad[4];
+} waywal_export_dmabuf_resp_t;
+static_assert(sizeof(waywal_export_dmabuf_resp_t) == 128,
+              "waywal_export_dmabuf_resp_t must be 128 bytes");
+typedef waywal_export_dmabuf_resp_t waywal_dmabuf_export_resp_t;
+typedef waywal_export_dmabuf_resp_t waywal_dmabuf_frame_desc_t;
+
 #pragma pack(pop)
 
 /* Resolves runtime socket path: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-wwald.<namespace>.sock */
@@ -301,6 +423,14 @@ int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms);
 /* SCM_RIGHTS file descriptor sending and receiving */
 bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd);
 bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached_fd);
+bool waywal_ipc_send_fds(int socket_fd, const waywal_ipc_hdr_t *hdr, const int *fds,
+                         size_t num_fds);
+bool waywal_ipc_recv_fds(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_fds, size_t max_fds,
+                         size_t *out_num_fds);
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 #ifdef __cplusplus
 }

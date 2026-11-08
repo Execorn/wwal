@@ -44,6 +44,7 @@ struct we_jval {
 };
 
 we_jval_t *we_json_parse_root(const char *src, size_t len);
+we_jval_t *we_json_parse(const char *src, size_t len);
 void we_jval_free(we_jval_t *v);
 const we_jval_t *we_jobj_get(const we_jval_t *obj, const char *key);
 const char *we_jval_str(const we_jval_t *v, const char *def);

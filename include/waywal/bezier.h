@@ -40,6 +40,7 @@ bezier_curve_t bezier_create(float p1x, float p1y, float p2x, float p2y);
 
 /* Solves x(t) = progress for t via Newton-Raphson iteration (with bisection fallback) */
 float waywal_cubic_bezier_solve_t(const bezier_curve_t *curve, float progress);
+float bezier_solve_t(const bezier_curve_t *curve, float progress);
 
 /* Solves x(t) = progress for t via Newton-Raphson iteration (with bisection fallback)
    and returns y(t). Evaluates in < 5ns with 4-iteration convergence. */
