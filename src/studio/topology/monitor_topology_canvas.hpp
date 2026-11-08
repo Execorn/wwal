@@ -26,13 +26,13 @@ namespace waywal::studio {
  * @brief Representation of a connected physical or logical Wayland monitor.
  */
 struct MonitorInfo {
-    QString name;                 ///< e.g. "DP-1", "HDMI-A-1"
-    QString model;                ///< Display model name
-    QString manufacturer;         ///< Display manufacturer
-    QRect geometry;               ///< Compositor coordinates (X, Y, W, H)
-    QSize physicalResolution;     ///< Native hardware resolution
-    qreal devicePixelRatio{1.0};  ///< Fractional scale factor (e.g. 1.0, 1.25, 1.5)
-    qreal refreshRateHz{60.0};    ///< Refresh rate in Hz (e.g. 144.0)
+    QString name;                ///< e.g. "DP-1", "HDMI-A-1"
+    QString model;               ///< Display model name
+    QString manufacturer;        ///< Display manufacturer
+    QRect geometry;              ///< Compositor coordinates (X, Y, W, H)
+    QSize physicalResolution;    ///< Native hardware resolution
+    qreal devicePixelRatio{1.0}; ///< Fractional scale factor (e.g. 1.0, 1.25, 1.5)
+    qreal refreshRateHz{60.0};   ///< Refresh rate in Hz (e.g. 144.0)
     bool isConnected{true};
     bool isPrimary{false};
 
@@ -47,8 +47,9 @@ struct MonitorInfo {
  * @brief Result of desktop span bounding calculation across all monitors.
  */
 struct DesktopSpanCalculation {
-    QRect boundingBox;                     ///< Global virtual bounding box in compositor space
-    QMap<QString, QRectF> normalizedRects; ///< u_span_rect_i = (Xi-Xmin/Wspan, Yi-Ymin/Hspan, Wi/Wspan, Hi/Hspan)
+    QRect boundingBox; ///< Global virtual bounding box in compositor space
+    QMap<QString, QRectF>
+        normalizedRects; ///< u_span_rect_i = (Xi-Xmin/Wspan, Yi-Ymin/Hspan, Wi/Wspan, Hi/Hspan)
 };
 
 /**
@@ -66,7 +67,7 @@ struct DesktopSpanCalculation {
 class MonitorTopologyCanvas : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit MonitorTopologyCanvas(QWidget *parent = nullptr);
     ~MonitorTopologyCanvas() override;
 
@@ -76,9 +77,9 @@ public:
     void updateOutputsFromJson(const QJsonObject &rootObj);
 
     // Monitor queries
-    const QList<MonitorInfo>& monitors() const { return m_monitors; }
-    MonitorInfo* findMonitor(const QString &name);
-    const MonitorInfo* findMonitor(const QString &name) const;
+    const QList<MonitorInfo> &monitors() const { return m_monitors; }
+    MonitorInfo *findMonitor(const QString &name);
+    const MonitorInfo *findMonitor(const QString &name) const;
 
     // Selection management
     QStringList selectedMonitorNames() const;
@@ -100,13 +101,14 @@ public:
     void setCropGravityForSelection(const QPointF &gravity);
 
     // Wallpaper assignment
-    void assignWallpaper(const QString &monitorName, const QString &filePath, const QPixmap &pixmap = QPixmap());
+    void assignWallpaper(const QString &monitorName, const QString &filePath,
+                         const QPixmap &pixmap = QPixmap());
     void assignWallpaperToSelection(const QString &filePath, const QPixmap &pixmap = QPixmap());
 
     // Normalized span sub-rectangle calculation
     DesktopSpanCalculation calculateSpanRectangles() const;
 
-signals:
+  signals:
     void monitorSelectionChanged(const QStringList &selectedOutputs);
     void wallpaperDropped(const QStringList &targetOutputs, const QString &wallpaperPath);
     void scalingModeChanged(const QStringList &targetOutputs, int mode);
@@ -115,7 +117,7 @@ signals:
     void spanRectsCalculated(const QMap<QString, QRectF> &normalizedSpanRects);
     void outputsRefreshed(int count);
 
-protected:
+  protected:
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
@@ -129,7 +131,7 @@ protected:
     void dragLeaveEvent(QDragLeaveEvent *event) override;
     void dropEvent(QDropEvent *event) override;
 
-private:
+  private:
     void recalculateLayoutTransform();
     QRectF mapToCanvas(const QRect &compositorRect) const;
     QRectF getMonitorCanvasRect(int monitorIndex) const;
@@ -161,13 +163,7 @@ private:
     qreal m_padding{40.0};
 
     // Interactive interaction state
-    enum class DragMode {
-        None,
-        CropGravityHandle,
-        SpanCropGravityHandle,
-        SelectionBox,
-        Pan
-    };
+    enum class DragMode { None, CropGravityHandle, SpanCropGravityHandle, SelectionBox, Pan };
     DragMode m_dragMode{DragMode::None};
     int m_activeDragMonitorIndex{-1};
     QPointF m_dragStartPos;

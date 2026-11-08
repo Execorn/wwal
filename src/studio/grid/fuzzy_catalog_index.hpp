@@ -19,10 +19,10 @@
 namespace wwal::studio {
 
 enum class WallpaperBadge : uint32_t {
-    Image    = 0,
-    Video    = WAYWAL_THUMB_FLAG_VIDEO,
-    Shader   = WAYWAL_THUMB_FLAG_SHADER,
-    Scene    = WAYWAL_THUMB_FLAG_SCENE,
+    Image = 0,
+    Video = WAYWAL_THUMB_FLAG_VIDEO,
+    Shader = WAYWAL_THUMB_FLAG_SHADER,
+    Scene = WAYWAL_THUMB_FLAG_SCENE,
     GnomeXml = (1u << 4),
     Favorite = WAYWAL_THUMB_FLAG_FAVORITE,
 };
@@ -39,37 +39,37 @@ enum class SortCriteria {
 };
 
 namespace WallpaperTags {
-    inline constexpr uint64_t None         = 0;
-    inline constexpr uint64_t Anime        = 1ULL << 0;
-    inline constexpr uint64_t Nature       = 1ULL << 1;
-    inline constexpr uint64_t Abstract     = 1ULL << 2;
-    inline constexpr uint64_t Cyberpunk    = 1ULL << 3;
-    inline constexpr uint64_t Minimal      = 1ULL << 4;
-    inline constexpr uint64_t SciFi        = 1ULL << 5;
-    inline constexpr uint64_t Landscape    = 1ULL << 6;
-    inline constexpr uint64_t Architecture = 1ULL << 7;
-    inline constexpr uint64_t Dark         = 1ULL << 8;
-    inline constexpr uint64_t Light        = 1ULL << 9;
-    inline constexpr uint64_t Retro        = 1ULL << 10;
-    inline constexpr uint64_t Fantasy      = 1ULL << 11;
-    inline constexpr uint64_t Vehicles     = 1ULL << 12;
-    inline constexpr uint64_t Animals      = 1ULL << 13;
-    inline constexpr uint64_t PixelArt     = 1ULL << 14;
-    inline constexpr uint64_t Space        = 1ULL << 15;
-    inline constexpr uint64_t Urban        = 1ULL << 16;
-    inline constexpr uint64_t DigitalArt   = 1ULL << 17;
-    inline constexpr uint64_t Photography  = 1ULL << 18;
-    inline constexpr uint64_t All          = ~0ULL;
+inline constexpr uint64_t None = 0;
+inline constexpr uint64_t Anime = 1ULL << 0;
+inline constexpr uint64_t Nature = 1ULL << 1;
+inline constexpr uint64_t Abstract = 1ULL << 2;
+inline constexpr uint64_t Cyberpunk = 1ULL << 3;
+inline constexpr uint64_t Minimal = 1ULL << 4;
+inline constexpr uint64_t SciFi = 1ULL << 5;
+inline constexpr uint64_t Landscape = 1ULL << 6;
+inline constexpr uint64_t Architecture = 1ULL << 7;
+inline constexpr uint64_t Dark = 1ULL << 8;
+inline constexpr uint64_t Light = 1ULL << 9;
+inline constexpr uint64_t Retro = 1ULL << 10;
+inline constexpr uint64_t Fantasy = 1ULL << 11;
+inline constexpr uint64_t Vehicles = 1ULL << 12;
+inline constexpr uint64_t Animals = 1ULL << 13;
+inline constexpr uint64_t PixelArt = 1ULL << 14;
+inline constexpr uint64_t Space = 1ULL << 15;
+inline constexpr uint64_t Urban = 1ULL << 16;
+inline constexpr uint64_t DigitalArt = 1ULL << 17;
+inline constexpr uint64_t Photography = 1ULL << 18;
+inline constexpr uint64_t All = ~0ULL;
 
-    struct TagDefinition {
-        uint64_t mask;
-        const char *name;
-        const char *display_name;
-    };
+struct TagDefinition {
+    uint64_t mask;
+    const char *name;
+    const char *display_name;
+};
 
-    const std::vector<TagDefinition> &allKnownTags();
-    uint64_t parseTagsFromString(std::string_view text);
-}
+const std::vector<TagDefinition> &allKnownTags();
+uint64_t parseTagsFromString(std::string_view text);
+} // namespace WallpaperTags
 
 struct CatalogItem {
     uint32_t id{0};
@@ -90,7 +90,7 @@ struct CatalogItem {
 };
 
 class FuzzyCatalogIndex {
-public:
+  public:
     FuzzyCatalogIndex();
     ~FuzzyCatalogIndex() = default;
 
@@ -104,14 +104,21 @@ public:
     // honoring excluded folders.
     size_t scanAll(const std::vector<std::string> &extra_search_paths = {});
 
-    // Folder Inclusion / Exclusion Configuration & Persistence ($XDG_CONFIG_HOME/wwal/studio_catalog.json)
+    // Folder Inclusion / Exclusion Configuration & Persistence
+    // ($XDG_CONFIG_HOME/wwal/studio_catalog.json)
     void setIncludedDirectories(const std::vector<std::string> &dirs);
     void setExcludedDirectories(const std::vector<std::string> &dirs);
     void addExcludedDirectory(const std::string &dir);
     void setScanSystemAndWorkshopPaths(bool enabled);
 
-    [[nodiscard]] const std::vector<std::string> &includedDirectories() const noexcept { return m_includedDirs; }
-    [[nodiscard]] const std::vector<std::string> &excludedDirectories() const noexcept { return m_excludedDirs; }
+    [[nodiscard]] const std::vector<std::string> &includedDirectories() const noexcept
+    {
+        return m_includedDirs;
+    }
+    [[nodiscard]] const std::vector<std::string> &excludedDirectories() const noexcept
+    {
+        return m_excludedDirs;
+    }
     [[nodiscard]] bool scanSystemAndWorkshopPaths() const noexcept { return m_scanSystemPaths; }
     [[nodiscard]] bool isPathExcluded(const std::filesystem::path &p) const;
 
@@ -138,18 +145,19 @@ public:
     [[nodiscard]] size_t totalCount() const noexcept { return m_items.size(); }
     [[nodiscard]] size_t filteredCount() const noexcept { return m_filteredIndices.size(); }
     [[nodiscard]] const CatalogItem &itemAt(size_t index) const { return m_items[index]; }
-    [[nodiscard]] const CatalogItem &filteredItemAt(size_t filtered_index) const {
+    [[nodiscard]] const CatalogItem &filteredItemAt(size_t filtered_index) const
+    {
         return m_items[m_filteredIndices[filtered_index]];
     }
-    [[nodiscard]] uint32_t filteredIdAt(size_t filtered_index) const {
+    [[nodiscard]] uint32_t filteredIdAt(size_t filtered_index) const
+    {
         return m_filteredIndices[filtered_index];
     }
-    [[nodiscard]] const std::vector<uint32_t> &filteredIndices() const noexcept {
+    [[nodiscard]] const std::vector<uint32_t> &filteredIndices() const noexcept
+    {
         return m_filteredIndices;
     }
-    [[nodiscard]] const std::vector<CatalogItem> &allItems() const noexcept {
-        return m_items;
-    }
+    [[nodiscard]] const std::vector<CatalogItem> &allItems() const noexcept { return m_items; }
 
     // Performance verification: benchmarks Myers/Bitap scoring across items in microseconds
     [[nodiscard]] double benchmarkSearch(std::string_view query, size_t iterations = 100) const;
@@ -162,7 +170,7 @@ public:
     [[nodiscard]] std::string_view activeSearchQuery() const noexcept { return m_activeQuery; }
     [[nodiscard]] SortCriteria activeSorting() const noexcept { return m_activeSorting; }
 
-private:
+  private:
     std::vector<CatalogItem> m_items;
     std::vector<uint32_t> m_filteredIndices;
     std::unordered_set<std::string> m_seenPaths;

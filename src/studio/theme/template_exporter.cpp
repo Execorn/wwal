@@ -21,87 +21,37 @@ namespace waywal::studio {
 const QVector<TemplateTargetDescriptor> &TemplateExporter::targetDescriptors()
 {
     static const QVector<TemplateTargetDescriptor> descriptors = {
-        {
-            TemplateTargetId::Hyprland,
-            QStringLiteral("hyprland"),
-            QStringLiteral("Hyprland"),
-            QStringLiteral("hypr/colors.conf"),
-            QString(),
-            QStringLiteral("Active border 45° gradient, inactive borders, and color variables"),
-            true
-        },
-        {
-            TemplateTargetId::Waybar,
-            QStringLiteral("waybar"),
-            QStringLiteral("Waybar"),
-            QStringLiteral("waybar/colors.css"),
-            QString(),
-            QStringLiteral("CSS @define-color tokens for bar modules and pills"),
-            true
-        },
-        {
-            TemplateTargetId::Caelestia,
-            QStringLiteral("caelestia"),
-            QStringLiteral("Quickshell / Caelestia"),
-            QStringLiteral("quickshell/caelestia/colors.json"),
-            QString(),
-            QStringLiteral("Full JSON schema for Caelestia Quickshell desktop shell"),
-            true
-        },
-        {
-            TemplateTargetId::Kitty,
-            QStringLiteral("kitty"),
-            QStringLiteral("Kitty Terminal"),
-            QStringLiteral("kitty/kitty-colors.conf"),
-            QString(),
-            QStringLiteral("Foreground, background, cursor, tabs, and 16 ANSI colors"),
-            true
-        },
-        {
-            TemplateTargetId::Alacritty,
-            QStringLiteral("alacritty"),
-            QStringLiteral("Alacritty Terminal"),
-            QStringLiteral("alacritty/colors.toml"),
-            QString(),
-            QStringLiteral("TOML palette with primary, cursor, normal, and bright ANSI colors"),
-            true
-        },
-        {
-            TemplateTargetId::RofiFuzzel,
-            QStringLiteral("rofi_fuzzel"),
-            QStringLiteral("Rofi & Fuzzel"),
-            QStringLiteral("rofi/colors.rasi"),
-            QStringLiteral("fuzzel/colors.ini"),
-            QStringLiteral("Application launcher theme definitions (RASI and INI formats)"),
-            true
-        },
-        {
-            TemplateTargetId::Mako,
-            QStringLiteral("mako"),
-            QStringLiteral("Mako Notification Daemon"),
-            QStringLiteral("mako/config-colors"),
-            QString(),
-            QStringLiteral("Notification backgrounds, borders, progress bars, and urgency overrides"),
-            true
-        },
-        {
-            TemplateTargetId::Gtk3Gtk4,
-            QStringLiteral("gtk"),
-            QStringLiteral("GTK 3.0 & GTK 4.0"),
-            QStringLiteral("gtk-3.0/waywal-colors.css"),
-            QStringLiteral("gtk-4.0/waywal-colors.css"),
-            QStringLiteral("Universal GTK theme CSS color overrides for Libadwaita & GTK 3"),
-            true
-        }
-    };
+        {TemplateTargetId::Hyprland, QStringLiteral("hyprland"), QStringLiteral("Hyprland"),
+         QStringLiteral("hypr/colors.conf"), QString(),
+         QStringLiteral("Active border 45° gradient, inactive borders, and color variables"), true},
+        {TemplateTargetId::Waybar, QStringLiteral("waybar"), QStringLiteral("Waybar"),
+         QStringLiteral("waybar/colors.css"), QString(),
+         QStringLiteral("CSS @define-color tokens for bar modules and pills"), true},
+        {TemplateTargetId::Caelestia, QStringLiteral("caelestia"),
+         QStringLiteral("Quickshell / Caelestia"),
+         QStringLiteral("quickshell/caelestia/colors.json"), QString(),
+         QStringLiteral("Full JSON schema for Caelestia Quickshell desktop shell"), true},
+        {TemplateTargetId::Kitty, QStringLiteral("kitty"), QStringLiteral("Kitty Terminal"),
+         QStringLiteral("kitty/kitty-colors.conf"), QString(),
+         QStringLiteral("Foreground, background, cursor, tabs, and 16 ANSI colors"), true},
+        {TemplateTargetId::Alacritty, QStringLiteral("alacritty"),
+         QStringLiteral("Alacritty Terminal"), QStringLiteral("alacritty/colors.toml"), QString(),
+         QStringLiteral("TOML palette with primary, cursor, normal, and bright ANSI colors"), true},
+        {TemplateTargetId::RofiFuzzel, QStringLiteral("rofi_fuzzel"),
+         QStringLiteral("Rofi & Fuzzel"), QStringLiteral("rofi/colors.rasi"),
+         QStringLiteral("fuzzel/colors.ini"),
+         QStringLiteral("Application launcher theme definitions (RASI and INI formats)"), true},
+        {TemplateTargetId::Mako, QStringLiteral("mako"), QStringLiteral("Mako Notification Daemon"),
+         QStringLiteral("mako/config-colors"), QString(),
+         QStringLiteral("Notification backgrounds, borders, progress bars, and urgency overrides"),
+         true},
+        {TemplateTargetId::Gtk3Gtk4, QStringLiteral("gtk"), QStringLiteral("GTK 3.0 & GTK 4.0"),
+         QStringLiteral("gtk-3.0/waywal-colors.css"), QStringLiteral("gtk-4.0/waywal-colors.css"),
+         QStringLiteral("Universal GTK theme CSS color overrides for Libadwaita & GTK 3"), true}};
     return descriptors;
 }
 
-TemplateExporter::TemplateExporter(QWidget *parent)
-    : QWidget(parent)
-{
-    setupUi();
-}
+TemplateExporter::TemplateExporter(QWidget *parent) : QWidget(parent) { setupUi(); }
 
 void TemplateExporter::setupUi()
 {
@@ -113,9 +63,9 @@ void TemplateExporter::setupUi()
     headerLabel->setStyleSheet(QStringLiteral("font-size: 10pt;"));
     mainLayout->addWidget(headerLabel);
 
-    auto *descLabel = new QLabel(
-        QStringLiteral("Export Material You HCT color tokens atomically to standard $XDG_CONFIG_HOME target templates."),
-        this);
+    auto *descLabel = new QLabel(QStringLiteral("Export Material You HCT color tokens atomically "
+                                                "to standard $XDG_CONFIG_HOME target templates."),
+                                 this);
     descLabel->setStyleSheet(QStringLiteral("color: #888888; font-size: 8pt;"));
     descLabel->setWordWrap(true);
     mainLayout->addWidget(descLabel);
@@ -131,7 +81,8 @@ void TemplateExporter::setupUi()
         auto *rowLayout = new QHBoxLayout();
         rowLayout->setContentsMargins(0, 0, 0, 0);
 
-        auto *cb = new QCheckBox(QString(desc.displayName).replace(QLatin1String("&"), QLatin1String("&&")), this);
+        auto *cb = new QCheckBox(
+            QString(desc.displayName).replace(QLatin1String("&"), QLatin1String("&&")), this);
         cb->setChecked(desc.defaultEnabled);
         cb->setToolTip(desc.description);
 
@@ -141,7 +92,8 @@ void TemplateExporter::setupUi()
         }
 
         auto *pl = new QLabel(pathText, this);
-        pl->setStyleSheet(QStringLiteral("color: #777777; font-family: monospace; font-size: 8pt;"));
+        pl->setStyleSheet(
+            QStringLiteral("color: #777777; font-family: monospace; font-size: 8pt;"));
         pl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         pl->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
         pl->setMinimumWidth(50);
@@ -223,7 +175,8 @@ QString TemplateExporter::resolveDestination(const QString &relPath, const QStri
     return QDir(configHome).filePath(relPath);
 }
 
-bool TemplateExporter::atomicWrite(const QString &targetPath, const QString &content, QString *errorOut)
+bool TemplateExporter::atomicWrite(const QString &targetPath, const QString &content,
+                                   QString *errorOut)
 {
     QFileInfo targetInfo(targetPath);
     QDir parentDir = targetInfo.dir();
@@ -231,16 +184,17 @@ bool TemplateExporter::atomicWrite(const QString &targetPath, const QString &con
     if (!parentDir.exists()) {
         if (!parentDir.mkpath(QStringLiteral("."))) {
             if (errorOut) {
-                *errorOut = QStringLiteral("Failed to create parent directory: ") + parentDir.absolutePath();
+                *errorOut = QStringLiteral("Failed to create parent directory: ") +
+                            parentDir.absolutePath();
             }
             return false;
         }
     }
 
     const quint32 randSuffix = QRandomGenerator::global()->generate();
-    const QString tempPath = targetPath + QStringLiteral(".tmp.%1.%2")
-                                 .arg(QCoreApplication::applicationPid())
-                                 .arg(randSuffix);
+    const QString tempPath =
+        targetPath +
+        QStringLiteral(".tmp.%1.%2").arg(QCoreApplication::applicationPid()).arg(randSuffix);
 
     QFile tempFile(tempPath);
     if (!tempFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
@@ -278,7 +232,8 @@ bool TemplateExporter::atomicWrite(const QString &targetPath, const QString &con
         QFile::remove(targetPath);
         if (!QFile::rename(tempPath, targetPath)) {
             if (errorOut) {
-                *errorOut = QStringLiteral("Atomic rename failed from ") + tempPath + QStringLiteral(" to ") + targetPath;
+                *errorOut = QStringLiteral("Atomic rename failed from ") + tempPath +
+                            QStringLiteral(" to ") + targetPath;
             }
             QFile::remove(tempPath);
             return false;
@@ -292,28 +247,38 @@ QString TemplateExporter::formatHyprland(const waywal_palette_t &pal)
 {
     QString out;
     out += QStringLiteral("# Generated by wwal-studio Material You HCT Live Theme Studio\n");
-    out += QStringLiteral("# Auto-generated on ") + QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
+    out += QStringLiteral("# Auto-generated on ") +
+           QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
 
     out += QStringLiteral("$primary = ") + hyprRgb(pal.primary) + QStringLiteral("\n");
     out += QStringLiteral("$on_primary = ") + hyprRgb(pal.onPrimary) + QStringLiteral("\n");
-    out += QStringLiteral("$primary_container = ") + hyprRgb(pal.primaryContainer) + QStringLiteral("\n");
-    out += QStringLiteral("$on_primary_container = ") + hyprRgb(pal.onPrimaryContainer) + QStringLiteral("\n");
-    out += QStringLiteral("$inverse_primary = ") + hyprRgb(pal.inversePrimary) + QStringLiteral("\n\n");
+    out += QStringLiteral("$primary_container = ") + hyprRgb(pal.primaryContainer) +
+           QStringLiteral("\n");
+    out += QStringLiteral("$on_primary_container = ") + hyprRgb(pal.onPrimaryContainer) +
+           QStringLiteral("\n");
+    out += QStringLiteral("$inverse_primary = ") + hyprRgb(pal.inversePrimary) +
+           QStringLiteral("\n\n");
 
     out += QStringLiteral("$secondary = ") + hyprRgb(pal.secondary) + QStringLiteral("\n");
     out += QStringLiteral("$on_secondary = ") + hyprRgb(pal.onSecondary) + QStringLiteral("\n");
-    out += QStringLiteral("$secondary_container = ") + hyprRgb(pal.secondaryContainer) + QStringLiteral("\n");
-    out += QStringLiteral("$on_secondary_container = ") + hyprRgb(pal.onSecondaryContainer) + QStringLiteral("\n\n");
+    out += QStringLiteral("$secondary_container = ") + hyprRgb(pal.secondaryContainer) +
+           QStringLiteral("\n");
+    out += QStringLiteral("$on_secondary_container = ") + hyprRgb(pal.onSecondaryContainer) +
+           QStringLiteral("\n\n");
 
     out += QStringLiteral("$tertiary = ") + hyprRgb(pal.tertiary) + QStringLiteral("\n");
     out += QStringLiteral("$on_tertiary = ") + hyprRgb(pal.onTertiary) + QStringLiteral("\n");
-    out += QStringLiteral("$tertiary_container = ") + hyprRgb(pal.tertiaryContainer) + QStringLiteral("\n");
-    out += QStringLiteral("$on_tertiary_container = ") + hyprRgb(pal.onTertiaryContainer) + QStringLiteral("\n\n");
+    out += QStringLiteral("$tertiary_container = ") + hyprRgb(pal.tertiaryContainer) +
+           QStringLiteral("\n");
+    out += QStringLiteral("$on_tertiary_container = ") + hyprRgb(pal.onTertiaryContainer) +
+           QStringLiteral("\n\n");
 
     out += QStringLiteral("$error = ") + hyprRgb(pal.error) + QStringLiteral("\n");
     out += QStringLiteral("$on_error = ") + hyprRgb(pal.onError) + QStringLiteral("\n");
-    out += QStringLiteral("$error_container = ") + hyprRgb(pal.errorContainer) + QStringLiteral("\n");
-    out += QStringLiteral("$on_error_container = ") + hyprRgb(pal.onErrorContainer) + QStringLiteral("\n\n");
+    out +=
+        QStringLiteral("$error_container = ") + hyprRgb(pal.errorContainer) + QStringLiteral("\n");
+    out += QStringLiteral("$on_error_container = ") + hyprRgb(pal.onErrorContainer) +
+           QStringLiteral("\n\n");
 
     out += QStringLiteral("$background = ") + hyprRgb(pal.background) + QStringLiteral("\n");
     out += QStringLiteral("$on_background = ") + hyprRgb(pal.onBackground) + QStringLiteral("\n");
@@ -321,22 +286,31 @@ QString TemplateExporter::formatHyprland(const waywal_palette_t &pal)
     out += QStringLiteral("$on_surface = ") + hyprRgb(pal.onSurface) + QStringLiteral("\n");
     out += QStringLiteral("$surface_dim = ") + hyprRgb(pal.surfaceDim) + QStringLiteral("\n");
     out += QStringLiteral("$surface_bright = ") + hyprRgb(pal.surfaceBright) + QStringLiteral("\n");
-    out += QStringLiteral("$surface_variant = ") + hyprRgb(pal.surfaceVariant) + QStringLiteral("\n");
-    out += QStringLiteral("$on_surface_variant = ") + hyprRgb(pal.onSurfaceVariant) + QStringLiteral("\n");
-    out += QStringLiteral("$surface_container_lowest = ") + hyprRgb(pal.surfaceContainerLowest) + QStringLiteral("\n");
-    out += QStringLiteral("$surface_container_low = ") + hyprRgb(pal.surfaceContainerLow) + QStringLiteral("\n");
-    out += QStringLiteral("$surface_container = ") + hyprRgb(pal.surfaceContainer) + QStringLiteral("\n");
-    out += QStringLiteral("$surface_container_high = ") + hyprRgb(pal.surfaceContainerHigh) + QStringLiteral("\n");
-    out += QStringLiteral("$surface_container_highest = ") + hyprRgb(pal.surfaceContainerHighest) + QStringLiteral("\n\n");
+    out +=
+        QStringLiteral("$surface_variant = ") + hyprRgb(pal.surfaceVariant) + QStringLiteral("\n");
+    out += QStringLiteral("$on_surface_variant = ") + hyprRgb(pal.onSurfaceVariant) +
+           QStringLiteral("\n");
+    out += QStringLiteral("$surface_container_lowest = ") + hyprRgb(pal.surfaceContainerLowest) +
+           QStringLiteral("\n");
+    out += QStringLiteral("$surface_container_low = ") + hyprRgb(pal.surfaceContainerLow) +
+           QStringLiteral("\n");
+    out += QStringLiteral("$surface_container = ") + hyprRgb(pal.surfaceContainer) +
+           QStringLiteral("\n");
+    out += QStringLiteral("$surface_container_high = ") + hyprRgb(pal.surfaceContainerHigh) +
+           QStringLiteral("\n");
+    out += QStringLiteral("$surface_container_highest = ") + hyprRgb(pal.surfaceContainerHighest) +
+           QStringLiteral("\n\n");
 
     out += QStringLiteral("$outline = ") + hyprRgb(pal.outline) + QStringLiteral("\n");
-    out += QStringLiteral("$outline_variant = ") + hyprRgb(pal.outlineVariant) + QStringLiteral("\n");
+    out +=
+        QStringLiteral("$outline_variant = ") + hyprRgb(pal.outlineVariant) + QStringLiteral("\n");
     out += QStringLiteral("$shadow = ") + hyprRgb(pal.shadow) + QStringLiteral("\n\n");
 
     // Standard Hyprland Active and Inactive Border Gradients
     out += QStringLiteral("$active_border = ") + hyprRgb(pal.primary) + QStringLiteral(" ") +
            hyprRgb(pal.tertiary) + QStringLiteral(" 45deg\n");
-    out += QStringLiteral("$inactive_border = ") + hyprRgb(pal.outlineVariant) + QStringLiteral("\n");
+    out +=
+        QStringLiteral("$inactive_border = ") + hyprRgb(pal.outlineVariant) + QStringLiteral("\n");
 
     return out;
 }
@@ -345,7 +319,8 @@ QString TemplateExporter::formatWaybar(const waywal_palette_t &pal)
 {
     QString out;
     out += QStringLiteral("/* Generated by wwal-studio Material You HCT Live Theme Studio */\n");
-    out += QStringLiteral("/* Auto-generated on ") + QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral(" */\n\n");
+    out += QStringLiteral("/* Auto-generated on ") +
+           QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral(" */\n\n");
 
     const auto addCss = [&](const char *name, const color_rgba_t &c) {
         out += QString::asprintf("@define-color %s #%02x%02x%02x;\n", name, c.r, c.g, c.b);
@@ -399,7 +374,8 @@ QString TemplateExporter::formatCaelestia(const waywal_palette_t &pal)
     QJsonObject root;
     root[QStringLiteral("generator")] = QStringLiteral("wwal-studio");
     root[QStringLiteral("timestamp")] = QDateTime::currentDateTime().toString(Qt::ISODate);
-    root[QStringLiteral("mode")] = (pal.mode == WAYWAL_THEME_LIGHT) ? QStringLiteral("light") : QStringLiteral("dark");
+    root[QStringLiteral("mode")] =
+        (pal.mode == WAYWAL_THEME_LIGHT) ? QStringLiteral("light") : QStringLiteral("dark");
     root[QStringLiteral("contrast")] = static_cast<double>(pal.contrast);
 
     QJsonObject colors;
@@ -477,27 +453,36 @@ QString TemplateExporter::formatKitty(const waywal_palette_t &pal)
 {
     QString out;
     out += QStringLiteral("# Generated by wwal-studio Material You HCT Live Theme Studio\n");
-    out += QStringLiteral("# Auto-generated on ") + QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
+    out += QStringLiteral("# Auto-generated on ") +
+           QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
 
     out += QStringLiteral("foreground ") + hexRgb(pal.onSurface) + QStringLiteral("\n");
-    out += QStringLiteral("background ") + hexRgb(pal.surfaceContainerLowest) + QStringLiteral("\n");
-    out += QStringLiteral("selection_foreground ") + hexRgb(pal.onPrimaryContainer) + QStringLiteral("\n");
-    out += QStringLiteral("selection_background ") + hexRgb(pal.primaryContainer) + QStringLiteral("\n\n");
+    out +=
+        QStringLiteral("background ") + hexRgb(pal.surfaceContainerLowest) + QStringLiteral("\n");
+    out += QStringLiteral("selection_foreground ") + hexRgb(pal.onPrimaryContainer) +
+           QStringLiteral("\n");
+    out += QStringLiteral("selection_background ") + hexRgb(pal.primaryContainer) +
+           QStringLiteral("\n\n");
 
     out += QStringLiteral("cursor ") + hexRgb(pal.primary) + QStringLiteral("\n");
     out += QStringLiteral("cursor_text_color ") + hexRgb(pal.onPrimary) + QStringLiteral("\n\n");
 
     out += QStringLiteral("url_color ") + hexRgb(pal.tertiary) + QStringLiteral("\n");
     out += QStringLiteral("active_border_color ") + hexRgb(pal.primary) + QStringLiteral("\n");
-    out += QStringLiteral("inactive_border_color ") + hexRgb(pal.outlineVariant) + QStringLiteral("\n\n");
+    out += QStringLiteral("inactive_border_color ") + hexRgb(pal.outlineVariant) +
+           QStringLiteral("\n\n");
 
     out += QStringLiteral("active_tab_foreground ") + hexRgb(pal.onSurface) + QStringLiteral("\n");
-    out += QStringLiteral("active_tab_background ") + hexRgb(pal.surfaceContainerHigh) + QStringLiteral("\n");
-    out += QStringLiteral("inactive_tab_foreground ") + hexRgb(pal.onSurfaceVariant) + QStringLiteral("\n");
-    out += QStringLiteral("inactive_tab_background ") + hexRgb(pal.surfaceContainerLow) + QStringLiteral("\n\n");
+    out += QStringLiteral("active_tab_background ") + hexRgb(pal.surfaceContainerHigh) +
+           QStringLiteral("\n");
+    out += QStringLiteral("inactive_tab_foreground ") + hexRgb(pal.onSurfaceVariant) +
+           QStringLiteral("\n");
+    out += QStringLiteral("inactive_tab_background ") + hexRgb(pal.surfaceContainerLow) +
+           QStringLiteral("\n\n");
 
     for (int i = 0; i < 16; ++i) {
-        out += QString::asprintf("color%d #%02x%02x%02x\n", i, pal.term[i].r, pal.term[i].g, pal.term[i].b);
+        out += QString::asprintf("color%d #%02x%02x%02x\n", i, pal.term[i].r, pal.term[i].g,
+                                 pal.term[i].b);
     }
 
     return out;
@@ -507,10 +492,12 @@ QString TemplateExporter::formatAlacritty(const waywal_palette_t &pal)
 {
     QString out;
     out += QStringLiteral("# Generated by wwal-studio Material You HCT Live Theme Studio\n");
-    out += QStringLiteral("# Auto-generated on ") + QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
+    out += QStringLiteral("# Auto-generated on ") +
+           QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
 
     out += QStringLiteral("[colors.primary]\n");
-    out += QStringLiteral("background = \"") + hexRgb(pal.surfaceContainerLowest) + QStringLiteral("\"\n");
+    out += QStringLiteral("background = \"") + hexRgb(pal.surfaceContainerLowest) +
+           QStringLiteral("\"\n");
     out += QStringLiteral("foreground = \"") + hexRgb(pal.onSurface) + QStringLiteral("\"\n\n");
 
     out += QStringLiteral("[colors.cursor]\n");
@@ -519,7 +506,8 @@ QString TemplateExporter::formatAlacritty(const waywal_palette_t &pal)
 
     out += QStringLiteral("[colors.selection]\n");
     out += QStringLiteral("text = \"") + hexRgb(pal.onPrimaryContainer) + QStringLiteral("\"\n");
-    out += QStringLiteral("background = \"") + hexRgb(pal.primaryContainer) + QStringLiteral("\"\n\n");
+    out +=
+        QStringLiteral("background = \"") + hexRgb(pal.primaryContainer) + QStringLiteral("\"\n\n");
 
     out += QStringLiteral("[colors.normal]\n");
     out += QStringLiteral("black = \"") + hexRgb(pal.term0) + QStringLiteral("\"\n");
@@ -548,23 +536,37 @@ QString TemplateExporter::formatRofi(const waywal_palette_t &pal)
 {
     QString out;
     out += QStringLiteral("/* Generated by wwal-studio Material You HCT Live Theme Studio */\n");
-    out += QStringLiteral("/* Auto-generated on ") + QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral(" */\n\n");
+    out += QStringLiteral("/* Auto-generated on ") +
+           QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral(" */\n\n");
 
     out += QStringLiteral("* {\n");
-    out += QStringLiteral("    primary:              ") + hexRgb(pal.primary) + QStringLiteral(";\n");
-    out += QStringLiteral("    on-primary:           ") + hexRgb(pal.onPrimary) + QStringLiteral(";\n");
-    out += QStringLiteral("    primary-container:    ") + hexRgb(pal.primaryContainer) + QStringLiteral(";\n");
-    out += QStringLiteral("    on-primary-container: ") + hexRgb(pal.onPrimaryContainer) + QStringLiteral(";\n");
-    out += QStringLiteral("    secondary:            ") + hexRgb(pal.secondary) + QStringLiteral(";\n");
-    out += QStringLiteral("    on-secondary:         ") + hexRgb(pal.onSecondary) + QStringLiteral(";\n");
-    out += QStringLiteral("    tertiary:             ") + hexRgb(pal.tertiary) + QStringLiteral(";\n");
-    out += QStringLiteral("    background:           ") + hexRgb(pal.surfaceContainerLowest) + QStringLiteral(";\n");
-    out += QStringLiteral("    background-alt:       ") + hexRgb(pal.surfaceContainerHigh) + QStringLiteral(";\n");
-    out += QStringLiteral("    foreground:           ") + hexRgb(pal.onSurface) + QStringLiteral(";\n");
-    out += QStringLiteral("    selected:             ") + hexRgb(pal.primaryContainer) + QStringLiteral(";\n");
-    out += QStringLiteral("    active:               ") + hexRgb(pal.primary) + QStringLiteral(";\n");
+    out +=
+        QStringLiteral("    primary:              ") + hexRgb(pal.primary) + QStringLiteral(";\n");
+    out += QStringLiteral("    on-primary:           ") + hexRgb(pal.onPrimary) +
+           QStringLiteral(";\n");
+    out += QStringLiteral("    primary-container:    ") + hexRgb(pal.primaryContainer) +
+           QStringLiteral(";\n");
+    out += QStringLiteral("    on-primary-container: ") + hexRgb(pal.onPrimaryContainer) +
+           QStringLiteral(";\n");
+    out += QStringLiteral("    secondary:            ") + hexRgb(pal.secondary) +
+           QStringLiteral(";\n");
+    out += QStringLiteral("    on-secondary:         ") + hexRgb(pal.onSecondary) +
+           QStringLiteral(";\n");
+    out +=
+        QStringLiteral("    tertiary:             ") + hexRgb(pal.tertiary) + QStringLiteral(";\n");
+    out += QStringLiteral("    background:           ") + hexRgb(pal.surfaceContainerLowest) +
+           QStringLiteral(";\n");
+    out += QStringLiteral("    background-alt:       ") + hexRgb(pal.surfaceContainerHigh) +
+           QStringLiteral(";\n");
+    out += QStringLiteral("    foreground:           ") + hexRgb(pal.onSurface) +
+           QStringLiteral(";\n");
+    out += QStringLiteral("    selected:             ") + hexRgb(pal.primaryContainer) +
+           QStringLiteral(";\n");
+    out +=
+        QStringLiteral("    active:               ") + hexRgb(pal.primary) + QStringLiteral(";\n");
     out += QStringLiteral("    urgent:               ") + hexRgb(pal.error) + QStringLiteral(";\n");
-    out += QStringLiteral("    border-color:         ") + hexRgb(pal.primary) + QStringLiteral(";\n");
+    out +=
+        QStringLiteral("    border-color:         ") + hexRgb(pal.primary) + QStringLiteral(";\n");
     out += QStringLiteral("}\n");
 
     return out;
@@ -574,16 +576,23 @@ QString TemplateExporter::formatFuzzel(const waywal_palette_t &pal)
 {
     QString out;
     out += QStringLiteral("# Generated by wwal-studio Material You HCT Live Theme Studio\n");
-    out += QStringLiteral("# Auto-generated on ") + QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
+    out += QStringLiteral("# Auto-generated on ") +
+           QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
 
     out += QStringLiteral("[colors]\n");
-    out += QString::asprintf("background=%02x%02x%02xfa\n", pal.surfaceContainerLowest.r, pal.surfaceContainerLowest.g, pal.surfaceContainerLowest.b);
-    out += QString::asprintf("text=%02x%02x%02xff\n", pal.onSurface.r, pal.onSurface.g, pal.onSurface.b);
+    out += QString::asprintf("background=%02x%02x%02xfa\n", pal.surfaceContainerLowest.r,
+                             pal.surfaceContainerLowest.g, pal.surfaceContainerLowest.b);
+    out += QString::asprintf("text=%02x%02x%02xff\n", pal.onSurface.r, pal.onSurface.g,
+                             pal.onSurface.b);
     out += QString::asprintf("match=%02x%02x%02xff\n", pal.primary.r, pal.primary.g, pal.primary.b);
-    out += QString::asprintf("selection=%02x%02x%02xff\n", pal.primaryContainer.r, pal.primaryContainer.g, pal.primaryContainer.b);
-    out += QString::asprintf("selection-text=%02x%02x%02xff\n", pal.onPrimaryContainer.r, pal.onPrimaryContainer.g, pal.onPrimaryContainer.b);
-    out += QString::asprintf("selection-match=%02x%02x%02xff\n", pal.tertiary.r, pal.tertiary.g, pal.tertiary.b);
-    out += QString::asprintf("border=%02x%02x%02xff\n", pal.primary.r, pal.primary.g, pal.primary.b);
+    out += QString::asprintf("selection=%02x%02x%02xff\n", pal.primaryContainer.r,
+                             pal.primaryContainer.g, pal.primaryContainer.b);
+    out += QString::asprintf("selection-text=%02x%02x%02xff\n", pal.onPrimaryContainer.r,
+                             pal.onPrimaryContainer.g, pal.onPrimaryContainer.b);
+    out += QString::asprintf("selection-match=%02x%02x%02xff\n", pal.tertiary.r, pal.tertiary.g,
+                             pal.tertiary.b);
+    out +=
+        QString::asprintf("border=%02x%02x%02xff\n", pal.primary.r, pal.primary.g, pal.primary.b);
 
     return out;
 }
@@ -592,20 +601,25 @@ QString TemplateExporter::formatMako(const waywal_palette_t &pal)
 {
     QString out;
     out += QStringLiteral("# Generated by wwal-studio Material You HCT Live Theme Studio\n");
-    out += QStringLiteral("# Auto-generated on ") + QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
+    out += QStringLiteral("# Auto-generated on ") +
+           QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
 
-    out += QStringLiteral("background-color=") + hexRgb(pal.surfaceContainer) + QStringLiteral("\n");
+    out +=
+        QStringLiteral("background-color=") + hexRgb(pal.surfaceContainer) + QStringLiteral("\n");
     out += QStringLiteral("text-color=") + hexRgb(pal.onSurface) + QStringLiteral("\n");
     out += QStringLiteral("border-color=") + hexRgb(pal.primary) + QStringLiteral("\n");
-    out += QStringLiteral("progress-color=over ") + hexRgb(pal.primaryContainer) + QStringLiteral("\n\n");
+    out += QStringLiteral("progress-color=over ") + hexRgb(pal.primaryContainer) +
+           QStringLiteral("\n\n");
 
     out += QStringLiteral("[urgency=low]\n");
-    out += QStringLiteral("background-color=") + hexRgb(pal.surfaceContainerLow) + QStringLiteral("\n");
+    out += QStringLiteral("background-color=") + hexRgb(pal.surfaceContainerLow) +
+           QStringLiteral("\n");
     out += QStringLiteral("text-color=") + hexRgb(pal.onSurfaceVariant) + QStringLiteral("\n");
     out += QStringLiteral("border-color=") + hexRgb(pal.outlineVariant) + QStringLiteral("\n\n");
 
     out += QStringLiteral("[urgency=normal]\n");
-    out += QStringLiteral("background-color=") + hexRgb(pal.surfaceContainer) + QStringLiteral("\n");
+    out +=
+        QStringLiteral("background-color=") + hexRgb(pal.surfaceContainer) + QStringLiteral("\n");
     out += QStringLiteral("text-color=") + hexRgb(pal.onSurface) + QStringLiteral("\n");
     out += QStringLiteral("border-color=") + hexRgb(pal.primary) + QStringLiteral("\n\n");
 
@@ -621,7 +635,8 @@ QString TemplateExporter::formatGtkCss(const waywal_palette_t &pal)
 {
     QString out;
     out += QStringLiteral("/* Generated by wwal-studio Material You HCT Live Theme Studio */\n");
-    out += QStringLiteral("/* Auto-generated on ") + QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral(" */\n\n");
+    out += QStringLiteral("/* Auto-generated on ") +
+           QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral(" */\n\n");
 
     const auto addCss = [&](const char *name, const color_rgba_t &c) {
         out += QString::asprintf("@define-color %s #%02x%02x%02x;\n", name, c.r, c.g, c.b);
@@ -661,7 +676,8 @@ QString TemplateExporter::formatGtkCss(const waywal_palette_t &pal)
     return out;
 }
 
-bool TemplateExporter::exportTarget(TemplateTargetId id, const QString &overrideBaseDir, QString *errorOut)
+bool TemplateExporter::exportTarget(TemplateTargetId id, const QString &overrideBaseDir,
+                                    QString *errorOut)
 {
     if (!m_hasPalette) {
         if (errorOut) {
@@ -672,28 +688,35 @@ bool TemplateExporter::exportTarget(TemplateTargetId id, const QString &override
 
     switch (id) {
     case TemplateTargetId::Hyprland: {
-        const QString path = resolveDestination(QStringLiteral("hypr/colors.conf"), overrideBaseDir);
+        const QString path =
+            resolveDestination(QStringLiteral("hypr/colors.conf"), overrideBaseDir);
         return atomicWrite(path, formatHyprland(m_palette), errorOut);
     }
     case TemplateTargetId::Waybar: {
-        const QString path = resolveDestination(QStringLiteral("waybar/colors.css"), overrideBaseDir);
+        const QString path =
+            resolveDestination(QStringLiteral("waybar/colors.css"), overrideBaseDir);
         return atomicWrite(path, formatWaybar(m_palette), errorOut);
     }
     case TemplateTargetId::Caelestia: {
-        const QString path = resolveDestination(QStringLiteral("quickshell/caelestia/colors.json"), overrideBaseDir);
+        const QString path =
+            resolveDestination(QStringLiteral("quickshell/caelestia/colors.json"), overrideBaseDir);
         return atomicWrite(path, formatCaelestia(m_palette), errorOut);
     }
     case TemplateTargetId::Kitty: {
-        const QString path = resolveDestination(QStringLiteral("kitty/kitty-colors.conf"), overrideBaseDir);
+        const QString path =
+            resolveDestination(QStringLiteral("kitty/kitty-colors.conf"), overrideBaseDir);
         return atomicWrite(path, formatKitty(m_palette), errorOut);
     }
     case TemplateTargetId::Alacritty: {
-        const QString path = resolveDestination(QStringLiteral("alacritty/colors.toml"), overrideBaseDir);
+        const QString path =
+            resolveDestination(QStringLiteral("alacritty/colors.toml"), overrideBaseDir);
         return atomicWrite(path, formatAlacritty(m_palette), errorOut);
     }
     case TemplateTargetId::RofiFuzzel: {
-        const QString rofiPath = resolveDestination(QStringLiteral("rofi/colors.rasi"), overrideBaseDir);
-        const QString fuzzelPath = resolveDestination(QStringLiteral("fuzzel/colors.ini"), overrideBaseDir);
+        const QString rofiPath =
+            resolveDestination(QStringLiteral("rofi/colors.rasi"), overrideBaseDir);
+        const QString fuzzelPath =
+            resolveDestination(QStringLiteral("fuzzel/colors.ini"), overrideBaseDir);
         bool ok = atomicWrite(rofiPath, formatRofi(m_palette), errorOut);
         if (ok) {
             ok = atomicWrite(fuzzelPath, formatFuzzel(m_palette), errorOut);
@@ -701,12 +724,15 @@ bool TemplateExporter::exportTarget(TemplateTargetId id, const QString &override
         return ok;
     }
     case TemplateTargetId::Mako: {
-        const QString path = resolveDestination(QStringLiteral("mako/config-colors"), overrideBaseDir);
+        const QString path =
+            resolveDestination(QStringLiteral("mako/config-colors"), overrideBaseDir);
         return atomicWrite(path, formatMako(m_palette), errorOut);
     }
     case TemplateTargetId::Gtk3Gtk4: {
-        const QString gtk3Path = resolveDestination(QStringLiteral("gtk-3.0/waywal-colors.css"), overrideBaseDir);
-        const QString gtk4Path = resolveDestination(QStringLiteral("gtk-4.0/waywal-colors.css"), overrideBaseDir);
+        const QString gtk3Path =
+            resolveDestination(QStringLiteral("gtk-3.0/waywal-colors.css"), overrideBaseDir);
+        const QString gtk4Path =
+            resolveDestination(QStringLiteral("gtk-4.0/waywal-colors.css"), overrideBaseDir);
         const QString content = formatGtkCss(m_palette);
         bool ok = atomicWrite(gtk3Path, content, errorOut);
         if (ok) {
@@ -801,7 +827,8 @@ void TemplateExporter::exportSelectedNow()
 {
     if (!m_hasPalette) {
         if (m_statusLabel) {
-            m_statusLabel->setText(QStringLiteral("<font color='#f44336'>Cannot export: No palette loaded!</font>"));
+            m_statusLabel->setText(
+                QStringLiteral("<font color='#f44336'>Cannot export: No palette loaded!</font>"));
         }
         return;
     }
@@ -824,7 +851,8 @@ void TemplateExporter::exportSelectedNow()
     const int successCount = exportSelected(QString(), &errors);
     QString msg;
     if (successCount == total) {
-        msg = QStringLiteral("<font color='#4caf50'>Successfully exported %1 targets to $XDG_CONFIG_HOME at %2</font>")
+        msg = QStringLiteral("<font color='#4caf50'>Successfully exported %1 targets to "
+                             "$XDG_CONFIG_HOME at %2</font>")
                   .arg(successCount)
                   .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")));
     } else {

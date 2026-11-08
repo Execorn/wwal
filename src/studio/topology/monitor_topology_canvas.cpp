@@ -27,8 +27,7 @@
 
 namespace waywal::studio {
 
-MonitorTopologyCanvas::MonitorTopologyCanvas(QWidget *parent)
-    : QWidget(parent)
+MonitorTopologyCanvas::MonitorTopologyCanvas(QWidget *parent) : QWidget(parent)
 {
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
@@ -43,7 +42,7 @@ MonitorTopologyCanvas::~MonitorTopologyCanvas() = default;
 
 void MonitorTopologyCanvas::refreshFromWayland()
 {
-    const QList<QScreen*> screens = QGuiApplication::screens();
+    const QList<QScreen *> screens = QGuiApplication::screens();
     if (screens.isEmpty()) {
         return;
     }
@@ -58,12 +57,12 @@ void MonitorTopologyCanvas::refreshFromWayland()
 
     int screenIdx = 1;
     for (QScreen *screen : screens) {
-        if (!screen) continue;
+        if (!screen)
+            continue;
 
         MonitorInfo info;
-        info.name = screen->name().trimmed().isEmpty()
-                        ? QStringLiteral("Display-%1").arg(screenIdx)
-                        : screen->name();
+        info.name = screen->name().trimmed().isEmpty() ? QStringLiteral("Display-%1").arg(screenIdx)
+                                                       : screen->name();
         ++screenIdx;
         info.model = screen->model();
         info.manufacturer = screen->manufacturer();
@@ -128,7 +127,8 @@ void MonitorTopologyCanvas::updateOutputsFromJson(const QJsonObject &rootObj)
     m_monitors.clear();
 
     for (const auto &val : outputsArray) {
-        if (!val.isObject()) continue;
+        if (!val.isObject())
+            continue;
         QJsonObject obj = val.toObject();
 
         MonitorInfo info;
@@ -175,7 +175,7 @@ void MonitorTopologyCanvas::updateOutputsFromJson(const QJsonObject &rootObj)
     update();
 }
 
-MonitorInfo* MonitorTopologyCanvas::findMonitor(const QString &name)
+MonitorInfo *MonitorTopologyCanvas::findMonitor(const QString &name)
 {
     for (auto &m : m_monitors) {
         if (m.name == name) {
@@ -185,7 +185,7 @@ MonitorInfo* MonitorTopologyCanvas::findMonitor(const QString &name)
     return nullptr;
 }
 
-const MonitorInfo* MonitorTopologyCanvas::findMonitor(const QString &name) const
+const MonitorInfo *MonitorTopologyCanvas::findMonitor(const QString &name) const
 {
     for (const auto &m : m_monitors) {
         if (m.name == name) {
@@ -285,7 +285,8 @@ void MonitorTopologyCanvas::setCropGravity(const QString &monitorName, const QPo
     QPointF clamped(std::clamp(gravity.x(), 0.0, 1.0), std::clamp(gravity.y(), 0.0, 1.0));
     if (auto *m = findMonitor(monitorName)) {
         m->cropGravity = clamped;
-        emit cropGravityChanged({monitorName}, static_cast<float>(clamped.x()), static_cast<float>(clamped.y()));
+        emit cropGravityChanged({monitorName}, static_cast<float>(clamped.x()),
+                                static_cast<float>(clamped.y()));
         update();
     }
 }
@@ -295,7 +296,8 @@ void MonitorTopologyCanvas::setCropGravityForSelection(const QPointF &gravity)
     QPointF clamped(std::clamp(gravity.x(), 0.0, 1.0), std::clamp(gravity.y(), 0.0, 1.0));
     if (m_spanMode) {
         m_spanCropGravity = clamped;
-        emit cropGravityChanged(m_selectedMonitors.values(), static_cast<float>(clamped.x()), static_cast<float>(clamped.y()));
+        emit cropGravityChanged(m_selectedMonitors.values(), static_cast<float>(clamped.x()),
+                                static_cast<float>(clamped.y()));
     } else {
         QStringList targets = selectedMonitorNames();
         for (const QString &name : targets) {
@@ -303,12 +305,14 @@ void MonitorTopologyCanvas::setCropGravityForSelection(const QPointF &gravity)
                 m->cropGravity = clamped;
             }
         }
-        emit cropGravityChanged(targets, static_cast<float>(clamped.x()), static_cast<float>(clamped.y()));
+        emit cropGravityChanged(targets, static_cast<float>(clamped.x()),
+                                static_cast<float>(clamped.y()));
     }
     update();
 }
 
-void MonitorTopologyCanvas::assignWallpaper(const QString &monitorName, const QString &filePath, const QPixmap &pixmap)
+void MonitorTopologyCanvas::assignWallpaper(const QString &monitorName, const QString &filePath,
+                                            const QPixmap &pixmap)
 {
     if (auto *m = findMonitor(monitorName)) {
         m->assignedWallpaperPath = filePath;
@@ -324,7 +328,8 @@ void MonitorTopologyCanvas::assignWallpaper(const QString &monitorName, const QS
     }
 }
 
-void MonitorTopologyCanvas::assignWallpaperToSelection(const QString &filePath, const QPixmap &pixmap)
+void MonitorTopologyCanvas::assignWallpaperToSelection(const QString &filePath,
+                                                       const QPixmap &pixmap)
 {
     if (m_spanMode) {
         m_spanWallpaperPath = filePath;
@@ -402,17 +407,15 @@ void MonitorTopologyCanvas::recalculateLayoutTransform()
     qreal renderH = m_virtualBoundingBox.height() * m_canvasScale;
 
     m_canvasOffsetX = padX + (availW - renderW) * 0.5 - m_virtualBoundingBox.left() * m_canvasScale;
-    m_canvasOffsetY = padY + topReserve + (availH - renderH) * 0.5 - m_virtualBoundingBox.top() * m_canvasScale;
+    m_canvasOffsetY =
+        padY + topReserve + (availH - renderH) * 0.5 - m_virtualBoundingBox.top() * m_canvasScale;
 }
 
 QRectF MonitorTopologyCanvas::mapToCanvas(const QRect &compositorRect) const
 {
-    return QRectF(
-        m_canvasOffsetX + compositorRect.left() * m_canvasScale,
-        m_canvasOffsetY + compositorRect.top() * m_canvasScale,
-        compositorRect.width() * m_canvasScale,
-        compositorRect.height() * m_canvasScale
-    );
+    return QRectF(m_canvasOffsetX + compositorRect.left() * m_canvasScale,
+                  m_canvasOffsetY + compositorRect.top() * m_canvasScale,
+                  compositorRect.width() * m_canvasScale, compositorRect.height() * m_canvasScale);
 }
 
 QRectF MonitorTopologyCanvas::getMonitorCanvasRect(int monitorIndex) const
@@ -522,19 +525,17 @@ void MonitorTopologyCanvas::drawMonitors(QPainter &painter)
         if (pix && !pix->isNull()) {
             if (m_spanMode) {
                 QRectF normRect = spanCalc.normalizedRects.value(m.name, QRectF(0, 0, 1, 1));
-                QRectF srcRect(
-                    normRect.x() * pix->width(),
-                    normRect.y() * pix->height(),
-                    normRect.width() * pix->width(),
-                    normRect.height() * pix->height()
-                );
+                QRectF srcRect(normRect.x() * pix->width(), normRect.y() * pix->height(),
+                               normRect.width() * pix->width(), normRect.height() * pix->height());
                 painter.drawPixmap(mRect, *pix, srcRect);
             } else {
                 if (m.scalingMode == WAYWAL_SCALING_FIT) {
-                    qreal scale = std::min(mRect.width() / pix->width(), mRect.height() / pix->height());
+                    qreal scale =
+                        std::min(mRect.width() / pix->width(), mRect.height() / pix->height());
                     qreal w = pix->width() * scale;
                     qreal h = pix->height() * scale;
-                    QRectF destRect(mRect.x() + (mRect.width() - w) * 0.5, mRect.y() + (mRect.height() - h) * 0.5, w, h);
+                    QRectF destRect(mRect.x() + (mRect.width() - w) * 0.5,
+                                    mRect.y() + (mRect.height() - h) * 0.5, w, h);
                     painter.fillRect(mRect, Qt::black);
                     painter.drawPixmap(destRect, *pix, pix->rect());
                 } else if (m.scalingMode == WAYWAL_SCALING_STRETCH) {
@@ -542,11 +543,13 @@ void MonitorTopologyCanvas::drawMonitors(QPainter &painter)
                 } else if (m.scalingMode == WAYWAL_SCALING_CENTER) {
                     qreal w = pix->width();
                     qreal h = pix->height();
-                    QRectF destRect(mRect.x() + (mRect.width() - w) * 0.5, mRect.y() + (mRect.height() - h) * 0.5, w, h);
+                    QRectF destRect(mRect.x() + (mRect.width() - w) * 0.5,
+                                    mRect.y() + (mRect.height() - h) * 0.5, w, h);
                     painter.fillRect(mRect, Qt::black);
                     painter.drawPixmap(destRect, *pix, pix->rect());
                 } else {
-                    qreal scale = std::max(mRect.width() / pix->width(), mRect.height() / pix->height());
+                    qreal scale =
+                        std::max(mRect.width() / pix->width(), mRect.height() / pix->height());
                     qreal visibleSrcW = mRect.width() / scale;
                     qreal visibleSrcH = mRect.height() / scale;
                     qreal maxOffX = pix->width() - visibleSrcW;
@@ -574,13 +577,15 @@ void MonitorTopologyCanvas::drawMonitors(QPainter &painter)
             QFontMetrics fm(font);
 
             const QString displayName = m.name.isEmpty() ? QStringLiteral("Display-1") : m.name;
-            const QString resStr = QStringLiteral("%1x%2").arg(m.geometry.width()).arg(m.geometry.height());
+            const QString resStr =
+                QStringLiteral("%1x%2").arg(m.geometry.width()).arg(m.geometry.height());
             const QString combined = (mRect.width() >= 96.0)
                                          ? QStringLiteral("%1 · %2").arg(displayName, resStr)
                                          : resStr;
 
             const qreal maxBadgeW = std::max(20.0, mRect.width() - 6.0);
-            const qreal badgeW = std::min(maxBadgeW, static_cast<qreal>(fm.horizontalAdvance(combined) + 8));
+            const qreal badgeW =
+                std::min(maxBadgeW, static_cast<qreal>(fm.horizontalAdvance(combined) + 8));
             const qreal badgeH = 13.0;
             const QRectF badgeRect(mRect.left() + 3.0, mRect.top() + 2.0, badgeW, badgeH);
 
@@ -589,8 +594,10 @@ void MonitorTopologyCanvas::drawMonitors(QPainter &painter)
             painter.drawRoundedRect(badgeRect, 3.0, 3.0);
 
             painter.setPen(isSelected ? QColor(137, 180, 250) : QColor(205, 214, 244));
-            const QString elided = fm.elidedText(combined, Qt::ElideRight, static_cast<int>(badgeW - 6));
-            painter.drawText(badgeRect.adjusted(3, 0, -3, 0), Qt::AlignLeft | Qt::AlignVCenter, elided);
+            const QString elided =
+                fm.elidedText(combined, Qt::ElideRight, static_cast<int>(badgeW - 6));
+            painter.drawText(badgeRect.adjusted(3, 0, -3, 0), Qt::AlignLeft | Qt::AlignVCenter,
+                             elided);
         } else {
             QFont font = painter.font();
             font.setPixelSize(11);
@@ -598,12 +605,20 @@ void MonitorTopologyCanvas::drawMonitors(QPainter &painter)
             painter.setFont(font);
 
             const QString displayName = m.name.isEmpty() ? QStringLiteral("Display-1") : m.name;
-            QString title = QString("%1 (%2x%3)").arg(displayName).arg(m.geometry.width()).arg(m.geometry.height());
-            QString subtitle = QString("%1 Hz · %2x").arg(QString::number(m.refreshRateHz, 'f', 0)).arg(QString::number(m.devicePixelRatio, 'f', 1));
+            QString title = QString("%1 (%2x%3)")
+                                .arg(displayName)
+                                .arg(m.geometry.width())
+                                .arg(m.geometry.height());
+            QString subtitle = QString("%1 Hz · %2x")
+                                   .arg(QString::number(m.refreshRateHz, 'f', 0))
+                                   .arg(QString::number(m.devicePixelRatio, 'f', 1));
 
             QFontMetrics fm(font);
             qreal maxBadgeW = std::max(24.0, mRect.width() - 8.0);
-            qreal badgeW = std::min(maxBadgeW, static_cast<qreal>(std::max(fm.horizontalAdvance(title), fm.horizontalAdvance(subtitle)) + 12));
+            qreal badgeW =
+                std::min(maxBadgeW, static_cast<qreal>(std::max(fm.horizontalAdvance(title),
+                                                                fm.horizontalAdvance(subtitle)) +
+                                                       12));
             qreal badgeH = 34.0;
             QRectF badgeRect(mRect.left() + 4.0, mRect.top() + 4.0, badgeW, badgeH);
 
@@ -612,16 +627,20 @@ void MonitorTopologyCanvas::drawMonitors(QPainter &painter)
             painter.drawRoundedRect(badgeRect, 4.0, 4.0);
 
             painter.setPen(isSelected ? QColor(137, 180, 250) : QColor(205, 214, 244));
-            QString elidedTitle = fm.elidedText(title, Qt::ElideRight, static_cast<int>(badgeW - 8));
-            painter.drawText(badgeRect.adjusted(4, 2, -4, -badgeH * 0.45), Qt::AlignLeft | Qt::AlignVCenter, elidedTitle);
+            QString elidedTitle =
+                fm.elidedText(title, Qt::ElideRight, static_cast<int>(badgeW - 8));
+            painter.drawText(badgeRect.adjusted(4, 2, -4, -badgeH * 0.45),
+                             Qt::AlignLeft | Qt::AlignVCenter, elidedTitle);
 
             font.setPixelSize(9);
             font.setBold(false);
             painter.setFont(font);
             QFontMetrics fmSub(font);
             painter.setPen(QColor(166, 173, 200));
-            QString elidedSub = fmSub.elidedText(subtitle, Qt::ElideRight, static_cast<int>(badgeW - 8));
-            painter.drawText(badgeRect.adjusted(4, badgeH * 0.48, -4, -2), Qt::AlignLeft | Qt::AlignVCenter, elidedSub);
+            QString elidedSub =
+                fmSub.elidedText(subtitle, Qt::ElideRight, static_cast<int>(badgeW - 8));
+            painter.drawText(badgeRect.adjusted(4, badgeH * 0.48, -4, -2),
+                             Qt::AlignLeft | Qt::AlignVCenter, elidedSub);
         }
 
         painter.restore(); // End clip
@@ -664,7 +683,9 @@ void MonitorTopologyCanvas::drawSpanOverlay(QPainter &painter)
         font.setBold(true);
         painter.setFont(font);
 
-        QString text = QString("SPAN: %1 x %2").arg(m_virtualBoundingBox.width()).arg(m_virtualBoundingBox.height());
+        QString text = QString("SPAN: %1 x %2")
+                           .arg(m_virtualBoundingBox.width())
+                           .arg(m_virtualBoundingBox.height());
         QFontMetrics fm(font);
         int w = fm.horizontalAdvance(text) + 16;
         QRectF badgeRect(spanRect.left() + 6, spanRect.bottom() - 22, w, 18);
@@ -694,14 +715,18 @@ void MonitorTopologyCanvas::drawGravityHandles(QPainter &painter)
         painter.setBrush(QColor(249, 226, 175, 60));
         painter.drawEllipse(center, r, r);
 
-        painter.drawLine(QPointF(center.x() - r - 3, center.y()), QPointF(center.x() + r + 3, center.y()));
-        painter.drawLine(QPointF(center.x(), center.y() - r - 3), QPointF(center.x(), center.y() + r + 3));
+        painter.drawLine(QPointF(center.x() - r - 3, center.y()),
+                         QPointF(center.x() + r + 3, center.y()));
+        painter.drawLine(QPointF(center.x(), center.y() - r - 3),
+                         QPointF(center.x(), center.y() + r + 3));
 
         painter.setBrush(QColor(249, 226, 175));
         painter.drawEllipse(center, 2.5, 2.5);
 
         if (!compact) {
-            QString readout = QString("Span Gravity: (%1, %2)").arg(QString::number(m_spanCropGravity.x(), 'f', 2)).arg(QString::number(m_spanCropGravity.y(), 'f', 2));
+            QString readout = QString("Span Gravity: (%1, %2)")
+                                  .arg(QString::number(m_spanCropGravity.x(), 'f', 2))
+                                  .arg(QString::number(m_spanCropGravity.y(), 'f', 2));
             QFont font = painter.font();
             font.setPixelSize(10);
             painter.setFont(font);
@@ -720,7 +745,8 @@ void MonitorTopologyCanvas::drawGravityHandles(QPainter &painter)
     } else {
         for (int i = 0; i < m_monitors.size(); ++i) {
             const auto &m = m_monitors[i];
-            if (!m_selectedMonitors.contains(m.name)) continue;
+            if (!m_selectedMonitors.contains(m.name))
+                continue;
 
             QRectF hRect = getCropGravityHandleRect(i);
             QPointF center = hRect.center();
@@ -733,14 +759,18 @@ void MonitorTopologyCanvas::drawGravityHandles(QPainter &painter)
             painter.setBrush(QColor(137, 180, 250, 70));
             painter.drawEllipse(center, r, r);
 
-            painter.drawLine(QPointF(center.x() - r - 3, center.y()), QPointF(center.x() + r + 3, center.y()));
-            painter.drawLine(QPointF(center.x(), center.y() - r - 3), QPointF(center.x(), center.y() + r + 3));
+            painter.drawLine(QPointF(center.x() - r - 3, center.y()),
+                             QPointF(center.x() + r + 3, center.y()));
+            painter.drawLine(QPointF(center.x(), center.y() - r - 3),
+                             QPointF(center.x(), center.y() + r + 3));
 
             painter.setBrush(QColor(255, 255, 255));
             painter.drawEllipse(center, 2.5, 2.5);
 
             if (!compact) {
-                QString readout = QString("(%1, %2)").arg(QString::number(m.cropGravity.x(), 'f', 2)).arg(QString::number(m.cropGravity.y(), 'f', 2));
+                QString readout = QString("(%1, %2)")
+                                      .arg(QString::number(m.cropGravity.x(), 'f', 2))
+                                      .arg(QString::number(m.cropGravity.y(), 'f', 2));
                 QFont font = painter.font();
                 font.setPixelSize(10);
                 painter.setFont(font);
@@ -769,13 +799,15 @@ void MonitorTopologyCanvas::drawToolbarOverlay(QPainter &painter)
         font.setBold(true);
         painter.setFont(font);
 
-        QString badgeText = QString("%1 Display(s) · %2x%3 · %4")
-                                .arg(m_monitors.size())
-                                .arg(m_virtualBoundingBox.width())
-                                .arg(m_virtualBoundingBox.height())
-                                .arg(m_spanMode ? QStringLiteral("SPAN") : QStringLiteral("PER-MONITOR"));
+        QString badgeText =
+            QString("%1 Display(s) · %2x%3 · %4")
+                .arg(m_monitors.size())
+                .arg(m_virtualBoundingBox.width())
+                .arg(m_virtualBoundingBox.height())
+                .arg(m_spanMode ? QStringLiteral("SPAN") : QStringLiteral("PER-MONITOR"));
         QFontMetrics fm(font);
-        qreal bw = std::min(static_cast<qreal>(width() - 16), static_cast<qreal>(fm.horizontalAdvance(badgeText) + 16));
+        qreal bw = std::min(static_cast<qreal>(width() - 16),
+                            static_cast<qreal>(fm.horizontalAdvance(badgeText) + 16));
         QRectF pillRect(8.0, 6.0, bw, 20.0);
 
         painter.setPen(QPen(QColor(49, 50, 68, 180), 1.0));
@@ -804,7 +836,8 @@ void MonitorTopologyCanvas::drawToolbarOverlay(QPainter &painter)
                              .arg(m_virtualBoundingBox.width())
                              .arg(m_virtualBoundingBox.height());
     painter.setPen(QColor(205, 214, 244));
-    painter.drawText(barRect.adjusted(12, 0, -180, 0), Qt::AlignLeft | Qt::AlignVCenter, statusText);
+    painter.drawText(barRect.adjusted(12, 0, -180, 0), Qt::AlignLeft | Qt::AlignVCenter,
+                     statusText);
 
     QRectF pillRect(barRect.right() - 164, barRect.top() + 4, 156, 22);
     if (m_spanMode) {
@@ -859,7 +892,8 @@ void MonitorTopologyCanvas::mousePressEvent(QMouseEvent *event)
         int clickedIdx = findMonitorAtCanvasPos(m_dragStartPos);
         if (clickedIdx >= 0) {
             const QString &name = m_monitors[clickedIdx].name;
-            bool additive = (event->modifiers() & Qt::ControlModifier) || (event->modifiers() & Qt::ShiftModifier);
+            bool additive = (event->modifiers() & Qt::ControlModifier) ||
+                            (event->modifiers() & Qt::ShiftModifier);
             selectMonitor(name, additive);
             m_activeDragMonitorIndex = clickedIdx;
         } else {
@@ -878,10 +912,13 @@ void MonitorTopologyCanvas::mouseMoveEvent(QMouseEvent *event)
     if (m_dragMode == DragMode::SpanCropGravityHandle) {
         QRectF spanRect = mapToCanvas(m_virtualBoundingBox);
         if (spanRect.width() > 1.0 && spanRect.height() > 1.0) {
-            qreal gx = std::clamp((m_currentMousePos.x() - spanRect.left()) / spanRect.width(), 0.0, 1.0);
-            qreal gy = std::clamp((m_currentMousePos.y() - spanRect.top()) / spanRect.height(), 0.0, 1.0);
+            qreal gx =
+                std::clamp((m_currentMousePos.x() - spanRect.left()) / spanRect.width(), 0.0, 1.0);
+            qreal gy =
+                std::clamp((m_currentMousePos.y() - spanRect.top()) / spanRect.height(), 0.0, 1.0);
             m_spanCropGravity = QPointF(gx, gy);
-            emit cropGravityChanged(m_selectedMonitors.values(), static_cast<float>(gx), static_cast<float>(gy));
+            emit cropGravityChanged(m_selectedMonitors.values(), static_cast<float>(gx),
+                                    static_cast<float>(gy));
             update();
         }
         return;
@@ -893,7 +930,8 @@ void MonitorTopologyCanvas::mouseMoveEvent(QMouseEvent *event)
             qreal gx = std::clamp((m_currentMousePos.x() - mRect.left()) / mRect.width(), 0.0, 1.0);
             qreal gy = std::clamp((m_currentMousePos.y() - mRect.top()) / mRect.height(), 0.0, 1.0);
             m_monitors[m_activeDragMonitorIndex].cropGravity = QPointF(gx, gy);
-            emit cropGravityChanged({m_monitors[m_activeDragMonitorIndex].name}, static_cast<float>(gx), static_cast<float>(gy));
+            emit cropGravityChanged({m_monitors[m_activeDragMonitorIndex].name},
+                                    static_cast<float>(gx), static_cast<float>(gy));
             update();
         }
         return;
@@ -905,7 +943,8 @@ void MonitorTopologyCanvas::mouseMoveEvent(QMouseEvent *event)
         hoveringHandle = getSpanGravityHandleRect().contains(m_currentMousePos);
     } else {
         for (int i = 0; i < m_monitors.size(); ++i) {
-            if (m_selectedMonitors.contains(m_monitors[i].name) && getCropGravityHandleRect(i).contains(m_currentMousePos)) {
+            if (m_selectedMonitors.contains(m_monitors[i].name) &&
+                getCropGravityHandleRect(i).contains(m_currentMousePos)) {
                 hoveringHandle = true;
                 break;
             }

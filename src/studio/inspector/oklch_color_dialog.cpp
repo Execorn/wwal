@@ -23,14 +23,15 @@ namespace waywal::studio {
 // OklchColorWheel Implementation
 // =============================================================================
 
-OklchColorWheel::OklchColorWheel(QWidget *parent)
-    : QWidget(parent) {
+OklchColorWheel::OklchColorWheel(QWidget *parent) : QWidget(parent)
+{
     setAttribute(Qt::WA_OpaquePaintEvent, false);
     setMouseTracking(true);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 }
 
-void OklchColorWheel::setMode(Mode m) {
+void OklchColorWheel::setMode(Mode m)
+{
     if (m_mode != m) {
         m_mode = m;
         m_cacheDirty = true;
@@ -38,7 +39,8 @@ void OklchColorWheel::setMode(Mode m) {
     }
 }
 
-void OklchColorWheel::setLightness(float l) {
+void OklchColorWheel::setLightness(float l)
+{
     float clamped = std::clamp(l, 0.0f, 1.0f);
     if (std::abs(m_lightness - clamped) > 1e-4f) {
         m_lightness = clamped;
@@ -49,7 +51,8 @@ void OklchColorWheel::setLightness(float l) {
     }
 }
 
-void OklchColorWheel::setChroma(float c) {
+void OklchColorWheel::setChroma(float c)
+{
     float clamped = std::clamp(c, 0.0f, ColorScience::MAX_CHROMA);
     if (std::abs(m_chroma - clamped) > 1e-4f) {
         m_chroma = clamped;
@@ -57,16 +60,19 @@ void OklchColorWheel::setChroma(float c) {
     }
 }
 
-void OklchColorWheel::setHue(float h) {
+void OklchColorWheel::setHue(float h)
+{
     float norm_h = std::fmod(h, 360.0f);
-    if (norm_h < 0.0f) norm_h += 360.0f;
+    if (norm_h < 0.0f)
+        norm_h += 360.0f;
     if (std::abs(m_hue - norm_h) > 1e-3f) {
         m_hue = norm_h;
         update();
     }
 }
 
-void OklchColorWheel::setSaturation(float s) {
+void OklchColorWheel::setSaturation(float s)
+{
     float clamped = std::clamp(s, 0.0f, 1.0f);
     if (std::abs(m_saturation - clamped) > 1e-4f) {
         m_saturation = clamped;
@@ -74,7 +80,8 @@ void OklchColorWheel::setSaturation(float s) {
     }
 }
 
-void OklchColorWheel::setValue(float v) {
+void OklchColorWheel::setValue(float v)
+{
     float clamped = std::clamp(v, 0.0f, 1.0f);
     if (std::abs(m_value - clamped) > 1e-4f) {
         m_value = clamped;
@@ -85,26 +92,28 @@ void OklchColorWheel::setValue(float v) {
     }
 }
 
-void OklchColorWheel::setOklch(float l, float c, float h) {
+void OklchColorWheel::setOklch(float l, float c, float h)
+{
     setLightness(l);
     setChroma(c);
     setHue(h);
 }
 
-void OklchColorWheel::setHsv(float h, float s, float v) {
+void OklchColorWheel::setHsv(float h, float s, float v)
+{
     setHue(h);
     setSaturation(s);
     setValue(v);
 }
 
-void OklchColorWheel::resizeEvent(QResizeEvent *) {
-    m_cacheDirty = true;
-}
+void OklchColorWheel::resizeEvent(QResizeEvent *) { m_cacheDirty = true; }
 
-void OklchColorWheel::updateWheelCache() {
+void OklchColorWheel::updateWheelCache()
+{
     int w = width();
     int h = height();
-    if (w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0)
+        return;
 
     qreal dpr = devicePixelRatioF();
     int pixW = static_cast<int>(std::round(w * dpr));
@@ -145,7 +154,8 @@ void OklchColorWheel::updateWheelCache() {
 
             float angle_rad = std::atan2(dy, dx);
             float angle_deg = angle_rad * ColorScience::RAD_TO_DEG;
-            if (angle_deg < 0.0f) angle_deg += 360.0f;
+            if (angle_deg < 0.0f)
+                angle_deg += 360.0f;
 
             float norm_r = std::clamp(dist / radius, 0.0f, 1.0f);
 
@@ -185,7 +195,8 @@ void OklchColorWheel::updateWheelCache() {
     m_cacheDirty = false;
 }
 
-void OklchColorWheel::paintEvent(QPaintEvent *) {
+void OklchColorWheel::paintEvent(QPaintEvent *)
+{
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
 
@@ -199,7 +210,8 @@ void OklchColorWheel::paintEvent(QPaintEvent *) {
     float cx = width() * 0.5f;
     float cy = height() * 0.5f;
     float radius = std::min(cx, cy) - 6.0f;
-    if (radius <= 1.0f) return;
+    if (radius <= 1.0f)
+        return;
 
     // Outer wheel border ring
     p.setPen(QPen(QColor(60, 65, 85, 200), 2.0));
@@ -240,7 +252,8 @@ void OklchColorWheel::paintEvent(QPaintEvent *) {
     // Compute color for selector dot
     QColor indicatorColor;
     if (m_mode == Mode::OkLCH) {
-        indicatorColor = ColorScience::oklchToQColor(OklchColor{m_lightness, m_chroma, m_hue, 1.0f});
+        indicatorColor =
+            ColorScience::oklchToQColor(OklchColor{m_lightness, m_chroma, m_hue, 1.0f});
     } else {
         float r = 0.0f, g = 0.0f, b = 0.0f;
         ColorScience::hsvToSrgb(m_hue, m_saturation, m_value, r, g, b);
@@ -257,11 +270,13 @@ void OklchColorWheel::paintEvent(QPaintEvent *) {
     p.drawEllipse(QPointF(sel_x, sel_y), 5.5, 5.5);
 }
 
-void OklchColorWheel::handleMousePosition(const QPointF &pos) {
+void OklchColorWheel::handleMousePosition(const QPointF &pos)
+{
     float cx = width() * 0.5f;
     float cy = height() * 0.5f;
     float radius = std::min(cx, cy) - 6.0f;
-    if (radius <= 1.0f) return;
+    if (radius <= 1.0f)
+        return;
 
     float dx = pos.x() - cx;
     float dy = -(pos.y() - cy);
@@ -271,7 +286,8 @@ void OklchColorWheel::handleMousePosition(const QPointF &pos) {
 
     float angle_rad = std::atan2(dy, dx);
     float angle_deg = angle_rad * ColorScience::RAD_TO_DEG;
-    if (angle_deg < 0.0f) angle_deg += 360.0f;
+    if (angle_deg < 0.0f)
+        angle_deg += 360.0f;
 
     m_hue = angle_deg;
 
@@ -287,20 +303,23 @@ void OklchColorWheel::handleMousePosition(const QPointF &pos) {
     update();
 }
 
-void OklchColorWheel::mousePressEvent(QMouseEvent *event) {
+void OklchColorWheel::mousePressEvent(QMouseEvent *event)
+{
     if (event->button() == Qt::LeftButton) {
         m_dragging = true;
         handleMousePosition(event->position());
     }
 }
 
-void OklchColorWheel::mouseMoveEvent(QMouseEvent *event) {
+void OklchColorWheel::mouseMoveEvent(QMouseEvent *event)
+{
     if (m_dragging) {
         handleMousePosition(event->position());
     }
 }
 
-void OklchColorWheel::mouseReleaseEvent(QMouseEvent *event) {
+void OklchColorWheel::mouseReleaseEvent(QMouseEvent *event)
+{
     if (event->button() == Qt::LeftButton) {
         m_dragging = false;
     }
@@ -310,8 +329,8 @@ void OklchColorWheel::mouseReleaseEvent(QMouseEvent *event) {
 // OklchColorDialog Implementation
 // =============================================================================
 
-OklchColorDialog::OklchColorDialog(QWidget *parent)
-    : QDialog(parent) {
+OklchColorDialog::OklchColorDialog(QWidget *parent) : QDialog(parent)
+{
     setWindowTitle(tr("OkLCH Perceptual Color Picker"));
     setMinimumSize(680, 520);
     setupUi();
@@ -319,13 +338,15 @@ OklchColorDialog::OklchColorDialog(QWidget *parent)
 }
 
 OklchColorDialog::OklchColorDialog(const QColor &initial, QWidget *parent)
-    : OklchColorDialog(parent) {
+    : OklchColorDialog(parent)
+{
     setCurrentColor(initial);
     m_initialOklch = m_currentOklch;
     updatePreviewSwatches();
 }
 
-void OklchColorDialog::setupUi() {
+void OklchColorDialog::setupUi()
+{
     auto *mainLayout = new QVBoxLayout(this);
     mainLayout->setContentsMargins(16, 16, 16, 16);
     mainLayout->setSpacing(12);
@@ -354,7 +375,8 @@ void OklchColorDialog::setupUi() {
     auto *warnLabel = new QLabel(tr("⚠️ <i>Out of sRGB Gamut</i>"), m_gamutWarningWidget);
     warnLabel->setStyleSheet("color: #e5c890; font-weight: bold;");
     auto *btnGamutMap = new QPushButton(tr("Map to Gamut"), m_gamutWarningWidget);
-    btnGamutMap->setStyleSheet("background: #414559; color: #c6d0f5; padding: 3px 8px; border-radius: 4px;");
+    btnGamutMap->setStyleSheet(
+        "background: #414559; color: #c6d0f5; padding: 3px 8px; border-radius: 4px;");
     connect(btnGamutMap, &QPushButton::clicked, this, &OklchColorDialog::onGamutMapClicked);
     gwLayout->addWidget(warnLabel);
     gwLayout->addWidget(btnGamutMap);
@@ -372,7 +394,8 @@ void OklchColorDialog::setupUi() {
     leftCol->setSpacing(10);
 
     m_colorWheel = new OklchColorWheel(this);
-    connect(m_colorWheel, &OklchColorWheel::oklchChanged, this, &OklchColorDialog::onWheelOklchChanged);
+    connect(m_colorWheel, &OklchColorWheel::oklchChanged, this,
+            &OklchColorDialog::onWheelOklchChanged);
     connect(m_colorWheel, &OklchColorWheel::hsvChanged, this, &OklchColorDialog::onWheelHsvChanged);
     leftCol->addWidget(m_colorWheel, 1);
 
@@ -390,7 +413,8 @@ void OklchColorDialog::setupUi() {
     m_spinL->setValue(0.70);
     m_spinL->setFixedWidth(75);
     connect(m_sliderL, &QSlider::valueChanged, this, &OklchColorDialog::onSliderLightnessChanged);
-    connect(m_spinL, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &OklchColorDialog::onSpinOklchChanged);
+    connect(m_spinL, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            &OklchColorDialog::onSpinOklchChanged);
     layoutL->addWidget(lblL);
     layoutL->addWidget(m_sliderL);
     layoutL->addWidget(m_spinL);
@@ -410,7 +434,8 @@ void OklchColorDialog::setupUi() {
     m_spinC->setValue(0.160);
     m_spinC->setFixedWidth(75);
     connect(m_sliderC, &QSlider::valueChanged, this, &OklchColorDialog::onSliderChromaChanged);
-    connect(m_spinC, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &OklchColorDialog::onSpinOklchChanged);
+    connect(m_spinC, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            &OklchColorDialog::onSpinOklchChanged);
     layoutC->addWidget(lblC);
     layoutC->addWidget(m_sliderC);
     layoutC->addWidget(m_spinC);
@@ -430,7 +455,8 @@ void OklchColorDialog::setupUi() {
     m_spinH->setValue(220.0);
     m_spinH->setFixedWidth(75);
     connect(m_sliderH, &QSlider::valueChanged, this, &OklchColorDialog::onSliderHueChanged);
-    connect(m_spinH, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &OklchColorDialog::onSpinOklchChanged);
+    connect(m_spinH, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            &OklchColorDialog::onSpinOklchChanged);
     layoutH->addWidget(lblH);
     layoutH->addWidget(m_sliderH);
     layoutH->addWidget(m_spinH);
@@ -450,7 +476,8 @@ void OklchColorDialog::setupUi() {
     m_spinA->setValue(1.0);
     m_spinA->setFixedWidth(75);
     connect(m_sliderA, &QSlider::valueChanged, this, &OklchColorDialog::onSliderAlphaChanged);
-    connect(m_spinA, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &OklchColorDialog::onSpinOklchChanged);
+    connect(m_spinA, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            &OklchColorDialog::onSpinOklchChanged);
     layoutA->addWidget(lblA);
     layoutA->addWidget(m_sliderA);
     layoutA->addWidget(m_spinA);
@@ -495,9 +522,8 @@ void OklchColorDialog::setupUi() {
     auto *btnCopyHex = new QPushButton(tr("Copy"), this);
     btnCopyHex->setFixedWidth(55);
     connect(m_hexEdit, &QLineEdit::textEdited, this, &OklchColorDialog::onHexEdited);
-    connect(btnCopyHex, &QPushButton::clicked, this, [this]() {
-        QApplication::clipboard()->setText(m_hexEdit->text());
-    });
+    connect(btnCopyHex, &QPushButton::clicked, this,
+            [this]() { QApplication::clipboard()->setText(m_hexEdit->text()); });
     hexLayout->addWidget(hexLabel);
     hexLayout->addWidget(m_hexEdit);
     hexLayout->addWidget(btnCopyHex);
@@ -527,9 +553,12 @@ void OklchColorDialog::setupUi() {
     m_spinBf->setRange(0.0, 1.0);
     m_spinBf->setDecimals(3);
 
-    connect(m_spinR, qOverload<int>(&QSpinBox::valueChanged), this, &OklchColorDialog::onSpinRgbChanged);
-    connect(m_spinG, qOverload<int>(&QSpinBox::valueChanged), this, &OklchColorDialog::onSpinRgbChanged);
-    connect(m_spinB, qOverload<int>(&QSpinBox::valueChanged), this, &OklchColorDialog::onSpinRgbChanged);
+    connect(m_spinR, qOverload<int>(&QSpinBox::valueChanged), this,
+            &OklchColorDialog::onSpinRgbChanged);
+    connect(m_spinG, qOverload<int>(&QSpinBox::valueChanged), this,
+            &OklchColorDialog::onSpinRgbChanged);
+    connect(m_spinB, qOverload<int>(&QSpinBox::valueChanged), this,
+            &OklchColorDialog::onSpinRgbChanged);
 
     connect(m_spinRf, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
         if (!m_updating) {
@@ -577,9 +606,12 @@ void OklchColorDialog::setupUi() {
     m_spinHsvV->setDecimals(1);
     m_spinHsvV->setSuffix("%");
 
-    connect(m_spinHsvH, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &OklchColorDialog::onSpinHsvChanged);
-    connect(m_spinHsvS, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &OklchColorDialog::onSpinHsvChanged);
-    connect(m_spinHsvV, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &OklchColorDialog::onSpinHsvChanged);
+    connect(m_spinHsvH, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            &OklchColorDialog::onSpinHsvChanged);
+    connect(m_spinHsvS, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            &OklchColorDialog::onSpinHsvChanged);
+    connect(m_spinHsvV, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            &OklchColorDialog::onSpinHsvChanged);
 
     hsvLayout->addWidget(new QLabel("H:", hsvGroup), 0, 0);
     hsvLayout->addWidget(m_spinHsvH, 0, 1);
@@ -599,14 +631,14 @@ void OklchColorDialog::setupUi() {
         QColor("#e78284"), QColor("#ea999c"), QColor("#ef9f76"), QColor("#e5c890"),
         QColor("#a6d189"), QColor("#81c8be"), QColor("#99d1db"), QColor("#85c1dc"),
         QColor("#8caaee"), QColor("#babbf1"), QColor("#ca9ee6"), QColor("#f4b8e4"),
-        QColor("#ffffff"), QColor("#a5adce"), QColor("#414559"), QColor("#000000")
-    };
+        QColor("#ffffff"), QColor("#a5adce"), QColor("#414559"), QColor("#000000")};
 
     for (int i = 0; i < 16; ++i) {
         auto *btn = new QPushButton(palGroup);
         btn->setFixedSize(26, 26);
-        btn->setStyleSheet(QString("background-color: %1; border: 1px solid #51576d; border-radius: 4px;")
-                               .arg(quickColors[i].name()));
+        btn->setStyleSheet(
+            QString("background-color: %1; border: 1px solid #51576d; border-radius: 4px;")
+                .arg(quickColors[i].name()));
         btn->setCursor(Qt::PointingHandCursor);
         QColor c = quickColors[i];
         connect(btn, &QPushButton::clicked, this, [this, c]() { onQuickColorClicked(c); });
@@ -629,7 +661,8 @@ void OklchColorDialog::setupUi() {
 
     auto *btnOk = new QPushButton(tr("OK"), this);
     btnOk->setDefault(true);
-    btnOk->setStyleSheet("background: #8caaee; color: #1e1e2e; font-weight: bold; padding: 6px 18px; border-radius: 5px;");
+    btnOk->setStyleSheet("background: #8caaee; color: #1e1e2e; font-weight: bold; padding: 6px "
+                         "18px; border-radius: 5px;");
     connect(btnOk, &QPushButton::clicked, this, &QDialog::accept);
 
     btnBox->addWidget(btnReset);
@@ -639,25 +672,31 @@ void OklchColorDialog::setupUi() {
     mainLayout->addLayout(btnBox);
 }
 
-QColor OklchColorDialog::currentColor() const noexcept {
+QColor OklchColorDialog::currentColor() const noexcept
+{
     return ColorScience::oklchToQColor(m_currentOklch);
 }
 
-void OklchColorDialog::setCurrentColor(const QColor &color) {
+void OklchColorDialog::setCurrentColor(const QColor &color)
+{
     m_currentOklch = ColorScience::qcolorToOklch(color);
     updateAllControlsFromOklch();
 }
 
-void OklchColorDialog::setOklch(float l, float c, float h, float a) {
+void OklchColorDialog::setOklch(float l, float c, float h, float a)
+{
     m_currentOklch.l = std::clamp(l, 0.0f, 1.0f);
     m_currentOklch.c = std::clamp(c, 0.0f, ColorScience::MAX_CHROMA);
     m_currentOklch.h = std::fmod(h, 360.0f);
-    if (m_currentOklch.h < 0.0f) m_currentOklch.h += 360.0f;
+    if (m_currentOklch.h < 0.0f)
+        m_currentOklch.h += 360.0f;
     m_currentOklch.a = std::clamp(a, 0.0f, 1.0f);
     updateAllControlsFromOklch();
 }
 
-void OklchColorDialog::getOklch(float &out_l, float &out_c, float &out_h, float *out_a) const noexcept {
+void OklchColorDialog::getOklch(float &out_l, float &out_c, float &out_h,
+                                float *out_a) const noexcept
+{
     out_l = m_currentOklch.l;
     out_c = m_currentOklch.c;
     out_h = m_currentOklch.h;
@@ -666,11 +705,14 @@ void OklchColorDialog::getOklch(float &out_l, float &out_c, float &out_h, float 
     }
 }
 
-void OklchColorDialog::getLinearRgb(float &out_r, float &out_g, float &out_b) const noexcept {
-    ColorScience::oklchToLinearRgb(m_currentOklch.l, m_currentOklch.c, m_currentOklch.h, out_r, out_g, out_b);
+void OklchColorDialog::getLinearRgb(float &out_r, float &out_g, float &out_b) const noexcept
+{
+    ColorScience::oklchToLinearRgb(m_currentOklch.l, m_currentOklch.c, m_currentOklch.h, out_r,
+                                   out_g, out_b);
 }
 
-QColor OklchColorDialog::getColor(const QColor &initial, QWidget *parent, const QString &title) {
+QColor OklchColorDialog::getColor(const QColor &initial, QWidget *parent, const QString &title)
+{
     OklchColorDialog dlg(initial, parent);
     if (!title.isEmpty()) {
         dlg.setWindowTitle(title);
@@ -681,23 +723,29 @@ QColor OklchColorDialog::getColor(const QColor &initial, QWidget *parent, const 
     return initial;
 }
 
-void OklchColorDialog::updatePreviewSwatches() {
+void OklchColorDialog::updatePreviewSwatches()
+{
     QColor cur = currentColor();
     m_swatchCurrent->setStyleSheet(
-        QString("background-color: %1; border: 1px solid #51576d; border-radius: 6px;").arg(cur.name(QColor::HexArgb)));
+        QString("background-color: %1; border: 1px solid #51576d; border-radius: 6px;")
+            .arg(cur.name(QColor::HexArgb)));
 
     QColor initCol = ColorScience::oklchToQColor(m_initialOklch);
     m_swatchInitial->setStyleSheet(
-        QString("background-color: %1; border: 1px solid #51576d; border-radius: 6px;").arg(initCol.name(QColor::HexArgb)));
+        QString("background-color: %1; border: 1px solid #51576d; border-radius: 6px;")
+            .arg(initCol.name(QColor::HexArgb)));
 }
 
 void OklchColorDialog::updateAllControlsFromOklch(bool updateWheel, bool updateSliders,
-                                                 bool updateSpins, bool updateHex) {
-    if (m_updating) return;
+                                                  bool updateSpins, bool updateHex)
+{
+    if (m_updating)
+        return;
     m_updating = true;
 
     // Check gamut status
-    bool inGamut = ColorScience::isOklchInGamut(m_currentOklch.l, m_currentOklch.c, m_currentOklch.h);
+    bool inGamut =
+        ColorScience::isOklchInGamut(m_currentOklch.l, m_currentOklch.c, m_currentOklch.h);
     m_gamutWarningWidget->setVisible(!inGamut);
 
     // Update Wheel
@@ -707,7 +755,8 @@ void OklchColorDialog::updateAllControlsFromOklch(bool updateWheel, bool updateS
         m_colorWheel->setHue(m_currentOklch.h);
 
         float r = 0.0f, g = 0.0f, b = 0.0f;
-        ColorScience::oklchToSrgbClamped(m_currentOklch.l, m_currentOklch.c, m_currentOklch.h, r, g, b);
+        ColorScience::oklchToSrgbClamped(m_currentOklch.l, m_currentOklch.c, m_currentOklch.h, r, g,
+                                         b);
         float h_hsv = 0.0f, s_hsv = 0.0f, v_hsv = 0.0f;
         ColorScience::srgbToHsv(r, g, b, h_hsv, s_hsv, v_hsv);
         m_colorWheel->setSaturation(s_hsv);
@@ -731,7 +780,8 @@ void OklchColorDialog::updateAllControlsFromOklch(bool updateWheel, bool updateS
 
         // Update sRGB
         float r = 0.0f, g = 0.0f, b = 0.0f;
-        ColorScience::oklchToSrgbClamped(m_currentOklch.l, m_currentOklch.c, m_currentOklch.h, r, g, b);
+        ColorScience::oklchToSrgbClamped(m_currentOklch.l, m_currentOklch.c, m_currentOklch.h, r, g,
+                                         b);
 
         int ir = std::clamp(static_cast<int>(std::round(r * 255.0f)), 0, 255);
         int ig = std::clamp(static_cast<int>(std::round(g * 255.0f)), 0, 255);
@@ -770,48 +820,62 @@ void OklchColorDialog::updateAllControlsFromOklch(bool updateWheel, bool updateS
     emit oklchChanged(m_currentOklch.l, m_currentOklch.c, m_currentOklch.h);
 }
 
-void OklchColorDialog::onWheelOklchChanged(float l, float c, float h) {
-    if (m_updating) return;
+void OklchColorDialog::onWheelOklchChanged(float l, float c, float h)
+{
+    if (m_updating)
+        return;
     m_currentOklch.l = l;
     m_currentOklch.c = c;
     m_currentOklch.h = h;
     updateAllControlsFromOklch(false, true, true, true);
 }
 
-void OklchColorDialog::onWheelHsvChanged(float h, float s, float v) {
-    if (m_updating) return;
+void OklchColorDialog::onWheelHsvChanged(float h, float s, float v)
+{
+    if (m_updating)
+        return;
     float r = 0.0f, g = 0.0f, b = 0.0f;
     ColorScience::hsvToSrgb(h, s, v, r, g, b);
     m_currentOklch = ColorScience::srgbToOklch(r, g, b, m_currentOklch.a);
     updateAllControlsFromOklch(false, true, true, true);
 }
 
-void OklchColorDialog::onSliderLightnessChanged(int val) {
-    if (m_updating) return;
+void OklchColorDialog::onSliderLightnessChanged(int val)
+{
+    if (m_updating)
+        return;
     m_currentOklch.l = static_cast<float>(val) / 1000.0f;
     updateAllControlsFromOklch(true, false, true, true);
 }
 
-void OklchColorDialog::onSliderChromaChanged(int val) {
-    if (m_updating) return;
+void OklchColorDialog::onSliderChromaChanged(int val)
+{
+    if (m_updating)
+        return;
     m_currentOklch.c = static_cast<float>(val) / 1000.0f;
     updateAllControlsFromOklch(true, false, true, true);
 }
 
-void OklchColorDialog::onSliderHueChanged(int val) {
-    if (m_updating) return;
+void OklchColorDialog::onSliderHueChanged(int val)
+{
+    if (m_updating)
+        return;
     m_currentOklch.h = static_cast<float>(val) / 10.0f;
     updateAllControlsFromOklch(true, false, true, true);
 }
 
-void OklchColorDialog::onSliderAlphaChanged(int val) {
-    if (m_updating) return;
+void OklchColorDialog::onSliderAlphaChanged(int val)
+{
+    if (m_updating)
+        return;
     m_currentOklch.a = static_cast<float>(val) / 1000.0f;
     updateAllControlsFromOklch(false, false, true, true);
 }
 
-void OklchColorDialog::onSpinOklchChanged() {
-    if (m_updating) return;
+void OklchColorDialog::onSpinOklchChanged()
+{
+    if (m_updating)
+        return;
     m_currentOklch.l = static_cast<float>(m_spinL->value());
     m_currentOklch.c = static_cast<float>(m_spinC->value());
     m_currentOklch.h = static_cast<float>(m_spinH->value());
@@ -819,8 +883,10 @@ void OklchColorDialog::onSpinOklchChanged() {
     updateAllControlsFromOklch(true, true, false, true);
 }
 
-void OklchColorDialog::onSpinRgbChanged() {
-    if (m_updating) return;
+void OklchColorDialog::onSpinRgbChanged()
+{
+    if (m_updating)
+        return;
     float r = static_cast<float>(m_spinR->value()) / 255.0f;
     float g = static_cast<float>(m_spinG->value()) / 255.0f;
     float b = static_cast<float>(m_spinB->value()) / 255.0f;
@@ -828,8 +894,10 @@ void OklchColorDialog::onSpinRgbChanged() {
     updateAllControlsFromOklch(true, true, false, true);
 }
 
-void OklchColorDialog::onSpinHsvChanged() {
-    if (m_updating) return;
+void OklchColorDialog::onSpinHsvChanged()
+{
+    if (m_updating)
+        return;
     float h = static_cast<float>(m_spinHsvH->value());
     float s = static_cast<float>(m_spinHsvS->value()) / 100.0f;
     float v = static_cast<float>(m_spinHsvV->value()) / 100.0f;
@@ -839,8 +907,10 @@ void OklchColorDialog::onSpinHsvChanged() {
     updateAllControlsFromOklch(true, true, true, true);
 }
 
-void OklchColorDialog::onHexEdited(const QString &text) {
-    if (m_updating) return;
+void OklchColorDialog::onHexEdited(const QString &text)
+{
+    if (m_updating)
+        return;
     QString cleaned = text.trimmed();
     if (!cleaned.startsWith('#')) {
         cleaned.prepend('#');
@@ -852,24 +922,29 @@ void OklchColorDialog::onHexEdited(const QString &text) {
     }
 }
 
-void OklchColorDialog::onModeToggled(bool oklchMode) {
+void OklchColorDialog::onModeToggled(bool oklchMode)
+{
     if (m_colorWheel) {
-        m_colorWheel->setMode(oklchMode ? OklchColorWheel::Mode::OkLCH : OklchColorWheel::Mode::HSV);
+        m_colorWheel->setMode(oklchMode ? OklchColorWheel::Mode::OkLCH
+                                        : OklchColorWheel::Mode::HSV);
     }
 }
 
-void OklchColorDialog::onGamutMapClicked() {
+void OklchColorDialog::onGamutMapClicked()
+{
     float maxC = ColorScience::maxInGamutChroma(m_currentOklch.l, m_currentOklch.h);
     m_currentOklch.c = std::min(m_currentOklch.c, maxC);
     updateAllControlsFromOklch();
 }
 
-void OklchColorDialog::onResetToInitialClicked() {
+void OklchColorDialog::onResetToInitialClicked()
+{
     m_currentOklch = m_initialOklch;
     updateAllControlsFromOklch();
 }
 
-void OklchColorDialog::onQuickColorClicked(const QColor &col) {
+void OklchColorDialog::onQuickColorClicked(const QColor &col)
+{
     m_currentOklch = ColorScience::qcolorToOklch(col);
     updateAllControlsFromOklch();
 }

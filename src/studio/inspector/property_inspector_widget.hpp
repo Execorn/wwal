@@ -39,17 +39,7 @@ class PresetStore; // Forward declaration for preset store service
  * user properties and Shadertoy GLSL uniform pragmas.
  */
 struct InspectorProperty {
-    enum class Kind {
-        Float,
-        Vec2,
-        Vec3,
-        Vec4,
-        Bool,
-        Int,
-        Color,
-        Text,
-        Combo
-    };
+    enum class Kind { Float, Vec2, Vec3, Vec4, Bool, Int, Color, Text, Combo };
 
     QString id;
     QString name;
@@ -77,7 +67,7 @@ struct InspectorProperty {
 class PropertyRowWidget : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit PropertyRowWidget(const InspectorProperty &prop, QWidget *parent = nullptr);
     ~PropertyRowWidget() override = default;
 
@@ -86,10 +76,10 @@ public:
     void resetToDefault();
     void setFilterVisible(bool visible);
 
-signals:
+  signals:
     void valueChanged(const QString &name, const std::vector<float> &values, uint32_t count);
 
-private slots:
+  private slots:
     void onSliderValueChanged(int index, int sliderVal);
     void onSpinValueChanged(int index, double spinVal);
     void onBoolToggled(bool checked);
@@ -99,7 +89,7 @@ private slots:
     void onHexEdited(const QString &text);
     void onTextEdited(const QString &text);
 
-private:
+  private:
     void setupUi();
     void syncSliderSpin(int index, float val);
     void emitChange();
@@ -129,7 +119,7 @@ private:
 class PropertyInspectorWidget : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit PropertyInspectorWidget(QWidget *parent = nullptr);
     ~PropertyInspectorWidget() override = default;
 
@@ -161,20 +151,21 @@ public:
     void resetAllToDefaults();
     [[nodiscard]] QStringList listAvailablePresets() const;
 
-signals:
-    void uniformChanged(const QString &output, const QString &name, const QVector<float> &values, uint32_t count);
+  signals:
+    void uniformChanged(const QString &output, const QString &name, const QVector<float> &values,
+                        uint32_t count);
     void presetSaved(const QString &presetId, const QString &filePath);
     void presetLoaded(const QString &presetId, const QString &filePath);
     void resetToDefaultsTriggered();
     void statusMessage(const QString &msg);
 
-private slots:
+  private slots:
     void onRowValueChanged(const QString &name, const std::vector<float> &values, uint32_t count);
     void onFilterTextChanged(const QString &text);
     void onSavePresetClicked();
     void onLoadPresetClicked();
 
-private:
+  private:
     void setupUi();
     void populateDefaultSceneParameters();
     void rebuildPropertyUi();

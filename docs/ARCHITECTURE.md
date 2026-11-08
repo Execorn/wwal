@@ -206,8 +206,9 @@ wwal/
 ├── src/
 │   ├── common/                        # Arena, IPC, Bezier, OKLab/HCT palette & templates, TOML, JSON, image loader, Workshop PKG
 │   ├── daemon/                        # Wayland core, IPC server, GBM/DMA-BUF, VA-API codecs, Shaders, Workshop runtime, MPRIS, Audio
-│   └── client/                        # CLI parser (wwal + swww/awww), unified picker, and client dispatch
-└── tests/                             # Unit, subsystem, Workshop scene/script/particle, LibFuzzer, and E2E suites
+│   ├── client/                        # CLI parser (wwal + swww/awww), unified picker, and client dispatch
+│   └── studio/                        # C++23 / Qt6 Wayland desktop IDE (grid, viewport, inspector, theme studio, topology, HUD)
+└── tests/                             # Unit, subsystem, Workshop scene/script/particle, Studio, LibFuzzer, and E2E suites
 ```
 
 ---

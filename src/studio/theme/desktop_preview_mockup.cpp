@@ -15,8 +15,7 @@
 
 namespace waywal::studio {
 
-DesktopPreviewMockup::DesktopPreviewMockup(QWidget *parent)
-    : QWidget(parent)
+DesktopPreviewMockup::DesktopPreviewMockup(QWidget *parent) : QWidget(parent)
 {
     setAttribute(Qt::WA_OpaquePaintEvent, false);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -45,20 +44,11 @@ void DesktopPreviewMockup::setLockscreenPreview(bool enabled)
     }
 }
 
-void DesktopPreviewMockup::toggleLockscreenPreview()
-{
-    setLockscreenPreview(!m_lockscreenPreview);
-}
+void DesktopPreviewMockup::toggleLockscreenPreview() { setLockscreenPreview(!m_lockscreenPreview); }
 
-QSize DesktopPreviewMockup::sizeHint() const
-{
-    return {640, 360};
-}
+QSize DesktopPreviewMockup::sizeHint() const { return {640, 360}; }
 
-QSize DesktopPreviewMockup::minimumSizeHint() const
-{
-    return {170, 120};
-}
+QSize DesktopPreviewMockup::minimumSizeHint() const { return {170, 120}; }
 
 void DesktopPreviewMockup::resizeEvent(QResizeEvent *event)
 {
@@ -66,10 +56,7 @@ void DesktopPreviewMockup::resizeEvent(QResizeEvent *event)
     m_blurDirty = true;
 }
 
-QColor DesktopPreviewMockup::toQColor(const color_rgba_t &c)
-{
-    return QColor(c.r, c.g, c.b, c.a);
-}
+QColor DesktopPreviewMockup::toQColor(const color_rgba_t &c) { return QColor(c.r, c.g, c.b, c.a); }
 
 QString DesktopPreviewMockup::toHex(const color_rgba_t &c)
 {
@@ -130,24 +117,24 @@ void DesktopPreviewMockup::updateBlurredWallpaper()
 
     // Multi-pass Kawase / Dual-Filter downsampling and upsampling simulation
     // Pass 1: Downsample to 1/2 size
-    QImage pass1 = m_wallpaperImage.scaled(
-        targetW / 2, targetH / 2, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    QImage pass1 = m_wallpaperImage.scaled(targetW / 2, targetH / 2, Qt::IgnoreAspectRatio,
+                                           Qt::SmoothTransformation);
 
     // Pass 2: Downsample to 1/4 size
-    QImage pass2 = pass1.scaled(
-        targetW / 4, targetH / 4, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    QImage pass2 =
+        pass1.scaled(targetW / 4, targetH / 4, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 
     // Pass 3: Downsample to 1/8 size
-    QImage pass3 = pass2.scaled(
-        targetW / 8, targetH / 8, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    QImage pass3 =
+        pass2.scaled(targetW / 8, targetH / 8, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 
     // Pass 4: Upsample back to 1/4 size with bilinear interpolation
-    QImage pass4 = pass3.scaled(
-        targetW / 4, targetH / 4, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    QImage pass4 =
+        pass3.scaled(targetW / 4, targetH / 4, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 
     // Pass 5: Upsample back to target size with bilinear interpolation
-    QImage blurred = pass4.scaled(
-        targetW, targetH, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    QImage blurred =
+        pass4.scaled(targetW, targetH, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 
     // Apply frosted surface color tint overlay
     QPainter bp(&blurred);
@@ -244,8 +231,10 @@ void DesktopPreviewMockup::drawWaybar(QPainter &p, const QRect &desktopRect)
             p.drawRoundedRect(wsPill, 5.0, 5.0);
             p.setPen(actFg);
         } else {
-            QColor inactBg = m_hasPalette ? toQColor(m_palette.surfaceContainerHigh) : QColor(40, 40, 50);
-            QColor inactFg = m_hasPalette ? toQColor(m_palette.onSurfaceVariant) : QColor(180, 180, 190);
+            QColor inactBg =
+                m_hasPalette ? toQColor(m_palette.surfaceContainerHigh) : QColor(40, 40, 50);
+            QColor inactFg =
+                m_hasPalette ? toQColor(m_palette.onSurfaceVariant) : QColor(180, 180, 190);
             p.setPen(Qt::NoPen);
             p.setBrush(inactBg);
             p.drawRoundedRect(wsPill, 5.0, 5.0);
@@ -259,7 +248,8 @@ void DesktopPreviewMockup::drawWaybar(QPainter &p, const QRect &desktopRect)
 
     // Right modules: System tray pills (drawn first so we know exact remaining center space)
     int trayX = barRect.right() - 6;
-    const auto drawTrayPill = [&](const QString &label, const color_rgba_t &accent, bool isPrimary) {
+    const auto drawTrayPill = [&](const QString &label, const color_rgba_t &accent,
+                                  bool isPrimary) {
         const int w = fm.horizontalAdvance(label) + (compact ? 10 : 14);
         if (trayX - w <= wsX + 8) {
             return;
@@ -292,7 +282,8 @@ void DesktopPreviewMockup::drawWaybar(QPainter &p, const QRect &desktopRect)
         const int titleX = wsX + 6 + (availCenterW - titleW) / 2;
         const QRect titleRect(titleX, wsY, titleW, wsH);
 
-        QColor titleBg = m_hasPalette ? toQColor(m_palette.surfaceContainerHigh) : QColor(40, 40, 50);
+        QColor titleBg =
+            m_hasPalette ? toQColor(m_palette.surfaceContainerHigh) : QColor(40, 40, 50);
         titleBg.setAlpha(220);
         p.setPen(Qt::NoPen);
         p.setBrush(titleBg);
@@ -315,7 +306,8 @@ void DesktopPreviewMockup::drawHyprlandWindows(QPainter &p, const QRect &desktop
     // Inactive Window (Behind, Top-Left)
     const int inactW = std::clamp(static_cast<int>(usableW * 0.42), 85, 380);
     const int inactH = std::clamp(static_cast<int>(usableH * (tallDesktop ? 0.50 : 0.68)), 56, 260);
-    const QRect inactRect(desktopRect.x() + (compact ? 8 : 16), usableTop + (compact ? 3 : 6), inactW, inactH);
+    const QRect inactRect(desktopRect.x() + (compact ? 8 : 16), usableTop + (compact ? 3 : 6),
+                          inactW, inactH);
 
     // Inactive drop shadow
     p.setPen(Qt::NoPen);
@@ -365,16 +357,18 @@ void DesktopPreviewMockup::drawHyprlandWindows(QPainter &p, const QRect &desktop
     p.setClipping(false);
 
     // Active Kitty Window:
-    // - In tall desktops (usableH >= 200), place Kitty below the top-right Mako toast so they never overlap vertically,
-    //   and make it wide enough (82% of usableW) that full prompt & HCT description strings never clip.
-    // - In compact desktops (usableH < 200), place Kitty on the left/center so the right-side Mako toast never overlaps horizontally.
+    // - In tall desktops (usableH >= 200), place Kitty below the top-right Mako toast so they never
+    // overlap vertically,
+    //   and make it wide enough (82% of usableW) that full prompt & HCT description strings never
+    //   clip.
+    // - In compact desktops (usableH < 200), place Kitty on the left/center so the right-side Mako
+    // toast never overlaps horizontally.
     QRect actRect;
     if (tallDesktop) {
         const int toastReserveH = 74;
         const int actW = std::clamp(static_cast<int>(usableW * 0.84), 210, 480);
         const int actH = std::clamp(usableH - toastReserveH - 6, 100, 360);
-        const int actX = std::clamp(desktopRect.right() - actW - 10,
-                                    desktopRect.x() + 12,
+        const int actX = std::clamp(desktopRect.right() - actW - 10, desktopRect.x() + 12,
                                     desktopRect.right() - actW - 6);
         const int actY = usableTop + toastReserveH;
         actRect = QRect(actX, actY, actW, actH);
@@ -451,8 +445,8 @@ void DesktopPreviewMockup::drawKittyTerminal(QPainter &p, const QRect &windowRec
                tabFm.elidedText(QStringLiteral("kitty: ~/wwal"), Qt::ElideRight, pillW - 6));
 
     // Terminal body
-    const QRect bodyRect(windowRect.x() + 5, windowRect.y() + tabH + 2,
-                         windowRect.width() - 10, windowRect.height() - tabH - 4);
+    const QRect bodyRect(windowRect.x() + 5, windowRect.y() + tabH + 2, windowRect.width() - 10,
+                         windowRect.height() - tabH - 4);
 
     QFont termFont(QStringLiteral("Monospace"));
     termFont.setStyleHint(QFont::Monospace);
@@ -468,7 +462,8 @@ void DesktopPreviewMockup::drawKittyTerminal(QPainter &p, const QRect &windowRec
     const int maxRight = bodyRect.right() - 2;
 
     const auto drawSegment = [&](const QString &seg, const QColor &col) {
-        if (cursorX >= maxRight) return;
+        if (cursorX >= maxRight)
+            return;
         p.setPen(col);
         const int avail = maxRight - cursorX;
         const int adv = termFm.horizontalAdvance(seg);
@@ -481,12 +476,18 @@ void DesktopPreviewMockup::drawKittyTerminal(QPainter &p, const QRect &windowRec
         }
     };
 
-    drawSegment(QStringLiteral("execorn"), m_hasPalette ? toQColor(m_palette.term2) : QColor(80, 250, 123));
-    drawSegment(QStringLiteral("@"), m_hasPalette ? toQColor(m_palette.onSurfaceVariant) : QColor(200, 200, 210));
-    drawSegment(QStringLiteral("arch"), m_hasPalette ? toQColor(m_palette.term6) : QColor(139, 233, 253));
-    drawSegment(QStringLiteral(":"), m_hasPalette ? toQColor(m_palette.onSurfaceVariant) : QColor(200, 200, 210));
-    drawSegment(QStringLiteral("~/wwal"), m_hasPalette ? toQColor(m_palette.term4) : QColor(98, 114, 164));
-    drawSegment(QStringLiteral(" $ "), m_hasPalette ? toQColor(m_palette.primary) : QColor(189, 147, 249));
+    drawSegment(QStringLiteral("execorn"),
+                m_hasPalette ? toQColor(m_palette.term2) : QColor(80, 250, 123));
+    drawSegment(QStringLiteral("@"),
+                m_hasPalette ? toQColor(m_palette.onSurfaceVariant) : QColor(200, 200, 210));
+    drawSegment(QStringLiteral("arch"),
+                m_hasPalette ? toQColor(m_palette.term6) : QColor(139, 233, 253));
+    drawSegment(QStringLiteral(":"),
+                m_hasPalette ? toQColor(m_palette.onSurfaceVariant) : QColor(200, 200, 210));
+    drawSegment(QStringLiteral("~/wwal"),
+                m_hasPalette ? toQColor(m_palette.term4) : QColor(98, 114, 164));
+    drawSegment(QStringLiteral(" $ "),
+                m_hasPalette ? toQColor(m_palette.primary) : QColor(189, 147, 249));
     drawSegment(compactTerm ? QStringLiteral("colorscript") : QStringLiteral("colorscript -e m3"),
                 m_hasPalette ? toQColor(m_palette.onSurface) : Qt::white);
 
@@ -500,7 +501,8 @@ void DesktopPreviewMockup::drawKittyTerminal(QPainter &p, const QRect &windowRec
     p.drawText(bodyRect.x() + 2, textY,
                termFm.elidedText(infoStr, Qt::ElideRight, std::max(20, bodyRect.width() - 4)));
 
-    // 16 ANSI Color Squares Grid (2 rows of 8), scaled to fit both width and remaining vertical height
+    // 16 ANSI Color Squares Grid (2 rows of 8), scaled to fit both width and remaining vertical
+    // height
     const int sqGap = compactTerm ? 2 : 3;
     const int ansiStartY = textY + (compactTerm ? 3 : 4);
     const int availAnsiH = std::max(12, bodyRect.bottom() - ansiStartY - 1);
@@ -516,8 +518,10 @@ void DesktopPreviewMockup::drawKittyTerminal(QPainter &p, const QRect &windowRec
         p.drawRoundedRect(sq1, 2.0, 2.0);
 
         // Row 2: term8 .. term15 (Bright ANSI)
-        QRect sq2(bodyRect.x() + 2 + (col * (sqSize + sqGap)), ansiStartY + sqSize + sqGap, sqSize, sqSize);
-        p.setBrush(m_hasPalette ? toQColor(m_palette.term[col + 8]) : QColor(80 + (col * 20), 80, 80));
+        QRect sq2(bodyRect.x() + 2 + (col * (sqSize + sqGap)), ansiStartY + sqSize + sqGap, sqSize,
+                  sqSize);
+        p.setBrush(m_hasPalette ? toQColor(m_palette.term[col + 8])
+                                : QColor(80 + (col * 20), 80, 80));
         p.drawRoundedRect(sq2, 2.0, 2.0);
     }
 
@@ -578,7 +582,8 @@ void DesktopPreviewMockup::drawMakoToast(QPainter &p, const QRect &desktopRect)
     p.setPen(m_hasPalette ? toQColor(m_palette.outline) : QColor(130, 130, 140));
     p.drawText(toastRect.right() - nowW - 4, toastRect.y() + 15, QStringLiteral("now"));
 
-    // Action button pill ("Dismiss") & Toast Body — strictly non-overlapping in both tall and compact layouts
+    // Action button pill ("Dismiss") & Toast Body — strictly non-overlapping in both tall and
+    // compact layouts
     QFont bodyFont = p.font();
     bodyFont.setPixelSize(8);
     bodyFont.setBold(false);
@@ -589,11 +594,9 @@ void DesktopPreviewMockup::drawMakoToast(QPainter &p, const QRect &desktopRect)
     const int btnH = 13;
     const QRect btnRect(toastRect.right() - btnW - 5, toastRect.bottom() - btnH - 4, btnW, btnH);
 
-    const int bodyAvailW = tallDesktop
-                               ? std::max(24, toastRect.width() - 12)
-                               : std::max(20, btnRect.left() - (toastRect.x() + 6) - 4);
-    const QRect bodyTextRect(toastRect.x() + 6,
-                             tallDesktop ? (toastRect.y() + 25) : btnRect.y(),
+    const int bodyAvailW = tallDesktop ? std::max(24, toastRect.width() - 12)
+                                       : std::max(20, btnRect.left() - (toastRect.x() + 6) - 4);
+    const QRect bodyTextRect(toastRect.x() + 6, tallDesktop ? (toastRect.y() + 25) : btnRect.y(),
                              bodyAvailW, 14);
 
     p.setPen(m_hasPalette ? toQColor(m_palette.onSurfaceVariant) : QColor(180, 180, 190));

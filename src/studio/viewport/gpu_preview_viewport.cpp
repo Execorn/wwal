@@ -37,101 +37,76 @@ struct Vertex {
 };
 
 // Fullscreen quad vertices with position [-1, 1] and UV [0, 1]
-static constexpr Vertex kQuadVertices[6] = {
-    {-1.0f, -1.0f,  0.0f, 0.0f},
-    { 1.0f, -1.0f,  1.0f, 0.0f},
-    { 1.0f,  1.0f,  1.0f, 1.0f},
-    {-1.0f, -1.0f,  0.0f, 0.0f},
-    { 1.0f,  1.0f,  1.0f, 1.0f},
-    {-1.0f,  1.0f,  0.0f, 1.0f}
-};
+static constexpr Vertex kQuadVertices[6] = {{-1.0f, -1.0f, 0.0f, 0.0f}, {1.0f, -1.0f, 1.0f, 0.0f},
+                                            {1.0f, 1.0f, 1.0f, 1.0f},   {-1.0f, -1.0f, 0.0f, 0.0f},
+                                            {1.0f, 1.0f, 1.0f, 1.0f},   {-1.0f, 1.0f, 0.0f, 1.0f}};
 
-static constexpr EGLint kPlaneFdKeys[4] = {
-    EGL_DMA_BUF_PLANE0_FD_EXT,
-    EGL_DMA_BUF_PLANE1_FD_EXT,
-    EGL_DMA_BUF_PLANE2_FD_EXT,
-    EGL_DMA_BUF_PLANE3_FD_EXT
-};
+static constexpr EGLint kPlaneFdKeys[4] = {EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE1_FD_EXT,
+                                           EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE3_FD_EXT};
 
 static constexpr EGLint kPlaneOffsetKeys[4] = {
-    EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-    EGL_DMA_BUF_PLANE1_OFFSET_EXT,
-    EGL_DMA_BUF_PLANE2_OFFSET_EXT,
-    EGL_DMA_BUF_PLANE3_OFFSET_EXT
-};
+    EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT,
+    EGL_DMA_BUF_PLANE3_OFFSET_EXT};
 
 static constexpr EGLint kPlanePitchKeys[4] = {
-    EGL_DMA_BUF_PLANE0_PITCH_EXT,
-    EGL_DMA_BUF_PLANE1_PITCH_EXT,
-    EGL_DMA_BUF_PLANE2_PITCH_EXT,
-    EGL_DMA_BUF_PLANE3_PITCH_EXT
-};
+    EGL_DMA_BUF_PLANE0_PITCH_EXT, EGL_DMA_BUF_PLANE1_PITCH_EXT, EGL_DMA_BUF_PLANE2_PITCH_EXT,
+    EGL_DMA_BUF_PLANE3_PITCH_EXT};
 
 static constexpr EGLint kPlaneModLoKeys[4] = {
-    EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
-    EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
-    EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
-    EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT
-};
+    EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+    EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT};
 
 static constexpr EGLint kPlaneModHiKeys[4] = {
-    EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-    EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
-    EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT,
-    EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT
-};
+    EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
+    EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT};
 
-const char *kBlitVertexShader =
-    "#version 300 es\n"
-    "precision highp float;\n"
-    "layout (location = 0) in vec2 a_pos;\n"
-    "layout (location = 1) in vec2 a_uv;\n"
-    "uniform mat4 u_mvp;\n"
-    "out vec2 v_uv;\n"
-    "void main() {\n"
-    "    v_uv = a_uv;\n"
-    "    gl_Position = u_mvp * vec4(a_pos, 0.0, 1.0);\n"
-    "}\n";
+const char *kBlitVertexShader = "#version 300 es\n"
+                                "precision highp float;\n"
+                                "layout (location = 0) in vec2 a_pos;\n"
+                                "layout (location = 1) in vec2 a_uv;\n"
+                                "uniform mat4 u_mvp;\n"
+                                "out vec2 v_uv;\n"
+                                "void main() {\n"
+                                "    v_uv = a_uv;\n"
+                                "    gl_Position = u_mvp * vec4(a_pos, 0.0, 1.0);\n"
+                                "}\n";
 
-const char *kBlitFragmentShader =
-    "#version 300 es\n"
-    "precision highp float;\n"
-    "in vec2 v_uv;\n"
-    "uniform sampler2D u_texture;\n"
-    "uniform int u_flip_y;\n"
-    "uniform int u_is_bgr;\n"
-    "out vec4 fragColor;\n"
-    "void main() {\n"
-    "    vec2 uv = v_uv;\n"
-    "    if (u_flip_y != 0) {\n"
-    "        uv.y = 1.0 - uv.y;\n"
-    "    }\n"
-    "    vec4 col = texture(u_texture, uv);\n"
-    "    if (u_is_bgr != 0) {\n"
-    "        col.rgb = col.bgr;\n"
-    "    }\n"
-    "    // Invariant: IMAGE_PASS must always force opaque alpha\n"
-    "    fragColor = vec4(col.rgb, 1.0);\n"
-    "}\n";
+const char *kBlitFragmentShader = "#version 300 es\n"
+                                  "precision highp float;\n"
+                                  "in vec2 v_uv;\n"
+                                  "uniform sampler2D u_texture;\n"
+                                  "uniform int u_flip_y;\n"
+                                  "uniform int u_is_bgr;\n"
+                                  "out vec4 fragColor;\n"
+                                  "void main() {\n"
+                                  "    vec2 uv = v_uv;\n"
+                                  "    if (u_flip_y != 0) {\n"
+                                  "        uv.y = 1.0 - uv.y;\n"
+                                  "    }\n"
+                                  "    vec4 col = texture(u_texture, uv);\n"
+                                  "    if (u_is_bgr != 0) {\n"
+                                  "        col.rgb = col.bgr;\n"
+                                  "    }\n"
+                                  "    // Invariant: IMAGE_PASS must always force opaque alpha\n"
+                                  "    fragColor = vec4(col.rgb, 1.0);\n"
+                                  "}\n";
 
-const char *kShadertoyPreamble =
-    "#version 300 es\n"
-    "precision highp float;\n"
-    "out vec4 outFragColor;\n"
-    "uniform vec3 iResolution;\n"
-    "uniform float iTime;\n"
-    "uniform float iTimeDelta;\n"
-    "uniform int iFrame;\n"
-    "uniform vec4 iMouse;\n"
-    "uniform vec4 iDate;\n\n";
+const char *kShadertoyPreamble = "#version 300 es\n"
+                                 "precision highp float;\n"
+                                 "out vec4 outFragColor;\n"
+                                 "uniform vec3 iResolution;\n"
+                                 "uniform float iTime;\n"
+                                 "uniform float iTimeDelta;\n"
+                                 "uniform int iFrame;\n"
+                                 "uniform vec4 iMouse;\n"
+                                 "uniform vec4 iDate;\n\n";
 
-const char *kShadertoyEpilogue =
-    "\nvoid main() {\n"
-    "    vec4 color = vec4(0.0);\n"
-    "    mainImage(color, gl_FragCoord.xy);\n"
-    "    // Invariant: IMAGE_PASS must always force opaque alpha\n"
-    "    outFragColor = vec4(color.rgb, 1.0);\n"
-    "}\n";
+const char *kShadertoyEpilogue = "\nvoid main() {\n"
+                                 "    vec4 color = vec4(0.0);\n"
+                                 "    mainImage(color, gl_FragCoord.xy);\n"
+                                 "    // Invariant: IMAGE_PASS must always force opaque alpha\n"
+                                 "    outFragColor = vec4(color.rgb, 1.0);\n"
+                                 "}\n";
 
 } // namespace
 
@@ -145,8 +120,7 @@ void DmaBufFrame::closeFds() noexcept
     }
 }
 
-void DmaBufFrame::releaseGl(EGLDisplay dpy,
-                            PFNEGLDESTROYIMAGEKHRPROC destroyImage,
+void DmaBufFrame::releaseGl(EGLDisplay dpy, PFNEGLDESTROYIMAGEKHRPROC destroyImage,
                             PFNEGLDESTROYSYNCKHRPROC destroySync) noexcept
 {
     if (glTexture != 0) {
@@ -164,8 +138,7 @@ void DmaBufFrame::releaseGl(EGLDisplay dpy,
     closeFds();
 }
 
-GpuPreviewViewport::GpuPreviewViewport(QWidget *parent)
-    : QOpenGLWidget(parent)
+GpuPreviewViewport::GpuPreviewViewport(QWidget *parent) : QOpenGLWidget(parent)
 {
     setAutoFillBackground(false);
     setMouseTracking(true);
@@ -204,7 +177,8 @@ GpuPreviewViewport::~GpuPreviewViewport()
         makeCurrent();
 
         if (m_currentDmaBufFrame.has_value()) {
-            m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR, m_eglDestroySyncKHR);
+            m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR,
+                                            m_eglDestroySyncKHR);
             m_currentDmaBufFrame.reset();
         }
 
@@ -232,10 +206,7 @@ void GpuPreviewViewport::setTargetAnimationFps(int fps)
     }
 }
 
-void GpuPreviewViewport::pauseAnimation(bool pause)
-{
-    m_animationPaused = pause;
-}
+void GpuPreviewViewport::pauseAnimation(bool pause) { m_animationPaused = pause; }
 
 uint32_t GpuPreviewViewport::contentWidth() const noexcept
 {
@@ -299,21 +270,24 @@ void GpuPreviewViewport::resolveEglExtensions()
         return;
     }
 
-    auto getProc = [](const char *name) -> void* {
-        void *p = reinterpret_cast<void*>(eglGetProcAddress(name));
+    auto getProc = [](const char *name) -> void * {
+        void *p = reinterpret_cast<void *>(eglGetProcAddress(name));
         return p;
     };
 
     m_eglCreateImageKHR = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(getProc("eglCreateImageKHR"));
-    m_eglDestroyImageKHR = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(getProc("eglDestroyImageKHR"));
+    m_eglDestroyImageKHR =
+        reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(getProc("eglDestroyImageKHR"));
     m_eglCreateSyncKHR = reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(getProc("eglCreateSyncKHR"));
     m_eglDestroySyncKHR = reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(getProc("eglDestroySyncKHR"));
     m_eglWaitSyncKHR = reinterpret_cast<PFNEGLWAITSYNCKHRPROC>(getProc("eglWaitSyncKHR"));
-    m_eglClientWaitSyncKHR = reinterpret_cast<PFNEGLCLIENTWAITSYNCKHRPROC>(getProc("eglClientWaitSyncKHR"));
-    m_glEGLImageTargetTexture2DOES =
-        reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(getProc("glEGLImageTargetTexture2DOES"));
+    m_eglClientWaitSyncKHR =
+        reinterpret_cast<PFNEGLCLIENTWAITSYNCKHRPROC>(getProc("eglClientWaitSyncKHR"));
+    m_glEGLImageTargetTexture2DOES = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+        getProc("glEGLImageTargetTexture2DOES"));
 
-    m_eglInitialized = (m_eglCreateImageKHR != nullptr && m_glEGLImageTargetTexture2DOES != nullptr);
+    m_eglInitialized =
+        (m_eglCreateImageKHR != nullptr && m_glEGLImageTargetTexture2DOES != nullptr);
 }
 
 void GpuPreviewViewport::setupQuadGeometry()
@@ -331,11 +305,11 @@ void GpuPreviewViewport::setupQuadGeometry()
 
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                          reinterpret_cast<void*>(offsetof(Vertex, x)));
+                          reinterpret_cast<void *>(offsetof(Vertex, x)));
 
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                          reinterpret_cast<void*>(offsetof(Vertex, u)));
+                          reinterpret_cast<void *>(offsetof(Vertex, u)));
 
     m_quadVao.release();
     m_quadVbo.release();
@@ -369,8 +343,8 @@ void GpuPreviewViewport::initializeGL()
         QImage formatted = m_fallbackImage.convertToFormat(QImage::Format_RGBA8888);
         glGenTextures(1, &m_inProcessImageTex);
         glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, formatted.constBits());
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, formatted.constBits());
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -406,11 +380,11 @@ void GpuPreviewViewport::ensureOffscreenFbo(int w, int h)
 }
 
 bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &desc,
-                                          const int *plane_fds,
-                                          size_t num_fds)
+                                           const int *plane_fds, size_t num_fds)
 {
     auto cleanupIncomingFds = [plane_fds, num_fds]() {
-        if (!plane_fds) return;
+        if (!plane_fds)
+            return;
         for (size_t i = 0; i < num_fds; ++i) {
             if (plane_fds[i] >= 0) {
                 ::close(plane_fds[i]);
@@ -420,7 +394,8 @@ bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &des
 
     if (desc.width == 0 || desc.height == 0 || num_fds == 0 || !plane_fds) {
         cleanupIncomingFds();
-        emit dmaBufImportFailed(QStringLiteral("Invalid DMA-BUF parameters: dimensions 0 or no FDs"));
+        emit dmaBufImportFailed(
+            QStringLiteral("Invalid DMA-BUF parameters: dimensions 0 or no FDs"));
         return false;
     }
 
@@ -429,7 +404,8 @@ bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &des
 
     if (!m_eglCreateImageKHR || !m_glEGLImageTargetTexture2DOES) {
         cleanupIncomingFds();
-        emit dmaBufImportFailed(QStringLiteral("Missing EGL DMA-BUF extensions (eglCreateImageKHR / glEGLImageTargetTexture2DOES)"));
+        emit dmaBufImportFailed(QStringLiteral(
+            "Missing EGL DMA-BUF extensions (eglCreateImageKHR / glEGLImageTargetTexture2DOES)"));
         return false;
     }
 
@@ -442,9 +418,8 @@ bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &des
     attribs[n++] = EGL_LINUX_DRM_FOURCC_EXT;
     attribs[n++] = static_cast<EGLint>(desc.drm_format);
 
-    uint32_t planesToImport = std::min({static_cast<uint32_t>(num_fds),
-                                        desc.num_planes > 0 ? desc.num_planes : 1u,
-                                        4u});
+    uint32_t planesToImport =
+        std::min({static_cast<uint32_t>(num_fds), desc.num_planes > 0 ? desc.num_planes : 1u, 4u});
 
     for (uint32_t p = 0; p < planesToImport; ++p) {
         if (plane_fds[p] < 0) {
@@ -466,13 +441,13 @@ bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &des
     }
     attribs[n] = EGL_NONE;
 
-    EGLImageKHR img = m_eglCreateImageKHR(m_eglDisplay, EGL_NO_CONTEXT,
-                                         EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
+    EGLImageKHR img =
+        m_eglCreateImageKHR(m_eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
     if (img == EGL_NO_IMAGE_KHR) {
         EGLint err = eglGetError();
         cleanupIncomingFds();
-        emit dmaBufImportFailed(QStringLiteral("eglCreateImageKHR failed with error 0x%1")
-                                    .arg(err, 0, 16));
+        emit dmaBufImportFailed(
+            QStringLiteral("eglCreateImageKHR failed with error 0x%1").arg(err, 0, 16));
         return false;
     }
 
@@ -523,7 +498,8 @@ bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &des
     {
         std::lock_guard<std::mutex> lock(m_frameMutex);
         if (m_currentDmaBufFrame.has_value()) {
-            m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR, m_eglDestroySyncKHR);
+            m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR,
+                                            m_eglDestroySyncKHR);
         }
         m_currentDmaBufFrame = newFrame;
         m_previewMode = PreviewMode::DmaBufLive;
@@ -571,7 +547,8 @@ bool GpuPreviewViewport::requestLiveDmaBuf(int socketFd, const QString &outputNa
     if (resp_hdr.opcode != WAYWAL_RESP_OK ||
         resp_hdr.payload_size < sizeof(waywal_export_dmabuf_resp_t)) {
         for (size_t i = 0; i < num_fds; ++i) {
-            if (fds[i] >= 0) ::close(fds[i]);
+            if (fds[i] >= 0)
+                ::close(fds[i]);
         }
         return false;
     }
@@ -579,7 +556,8 @@ bool GpuPreviewViewport::requestLiveDmaBuf(int socketFd, const QString &outputNa
     waywal_export_dmabuf_resp_t resp_pay;
     if (::read(socketFd, &resp_pay, sizeof(resp_pay)) != static_cast<ssize_t>(sizeof(resp_pay))) {
         for (size_t i = 0; i < num_fds; ++i) {
-            if (fds[i] >= 0) ::close(fds[i]);
+            if (fds[i] >= 0)
+                ::close(fds[i]);
         }
         return false;
     }
@@ -623,8 +601,8 @@ void GpuPreviewViewport::setPreviewImage(const QImage &image)
             glGenTextures(1, &m_inProcessImageTex);
         }
         glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, formatted.constBits());
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, formatted.constBits());
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -686,8 +664,8 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
         uint8_t *rgba = nullptr;
         uint32_t w = 0, h = 0;
         if (image_load_rgba(stdPath.c_str(), &rgba, &w, &h) && rgba && w > 0 && h > 0) {
-            QImage raw(rgba, static_cast<int>(w), static_cast<int>(h),
-                       static_cast<int>(w * 4), QImage::Format_RGBA8888);
+            QImage raw(rgba, static_cast<int>(w), static_cast<int>(h), static_cast<int>(w * 4),
+                       QImage::Format_RGBA8888);
             img = raw.copy();
             image_free(rgba);
         } else if (rgba) {
@@ -700,13 +678,11 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
         (ext == ".mp4" || ext == ".mkv" || ext == ".webm" || ext == ".avi" || ext == ".mov")) {
         QProcess proc;
         proc.start(QStringLiteral("ffmpeg"),
-                   {QStringLiteral("-loglevel"), QStringLiteral("error"),
-                    QStringLiteral("-ss"), QStringLiteral("00:00:00.50"),
-                    QStringLiteral("-i"), targetPath,
-                    QStringLiteral("-frames:v"), QStringLiteral("1"),
-                    QStringLiteral("-vf"), QStringLiteral("scale=1280:-1"),
-                    QStringLiteral("-f"), QStringLiteral("image2pipe"),
-                    QStringLiteral("-vcodec"), QStringLiteral("bmp"),
+                   {QStringLiteral("-loglevel"), QStringLiteral("error"), QStringLiteral("-ss"),
+                    QStringLiteral("00:00:00.50"), QStringLiteral("-i"), targetPath,
+                    QStringLiteral("-frames:v"), QStringLiteral("1"), QStringLiteral("-vf"),
+                    QStringLiteral("scale=1280:-1"), QStringLiteral("-f"),
+                    QStringLiteral("image2pipe"), QStringLiteral("-vcodec"), QStringLiteral("bmp"),
                     QStringLiteral("-")});
         if (proc.waitForFinished(2500) && proc.exitCode() == 0) {
             QByteArray data = proc.readAllStandardOutput();
@@ -725,8 +701,7 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
             seed *= 16777619u;
         }
         QColor c1(static_cast<int>((seed >> 16) & 0x7F) + 40,
-                  static_cast<int>((seed >> 8) & 0x7F) + 50,
-                  static_cast<int>(seed & 0x7F) + 80);
+                  static_cast<int>((seed >> 8) & 0x7F) + 50, static_cast<int>(seed & 0x7F) + 80);
         QColor c2(static_cast<int>((seed >> 12) & 0x7F) + 20,
                   static_cast<int>((seed >> 4) & 0x7F) + 30,
                   static_cast<int>((seed >> 20) & 0x7F) + 60);
@@ -871,7 +846,8 @@ void GpuPreviewViewport::setShaderUniform(const QString &name, float v0, float v
     m_customUniforms[name.toStdString()] = std::move(val);
 }
 
-void GpuPreviewViewport::setShaderUniform(const QString &name, float v0, float v1, float v2, float v3)
+void GpuPreviewViewport::setShaderUniform(const QString &name, float v0, float v1, float v2,
+                                          float v3)
 {
     ShaderUniformValue val;
     val.type = ShaderUniformValue::Type::Vec4;
@@ -902,10 +878,7 @@ void GpuPreviewViewport::setShaderUniform(const QString &name, int value)
     m_customUniforms[name.toStdString()] = std::move(val);
 }
 
-void GpuPreviewViewport::clearShaderUniforms()
-{
-    m_customUniforms.clear();
-}
+void GpuPreviewViewport::clearShaderUniforms() { m_customUniforms.clear(); }
 
 void GpuPreviewViewport::setZoom(float zoom)
 {
@@ -1023,28 +996,26 @@ void GpuPreviewViewport::renderInProcessShaderPass()
     m_shaderProgram->setUniformValue("iTimeDelta", timeDeltaSec);
     m_shaderProgram->setUniformValue("iFrame", m_shaderFrameIndex++);
 
-    m_shaderProgram->setUniformValue("iMouse", QVector4D(
-        static_cast<float>(m_mouseGlCoord.x()),
-        static_cast<float>(m_mouseGlCoord.y()),
-        static_cast<float>(m_mouseClickCoord.x()),
-        static_cast<float>(m_mouseClickCoord.y())
-    ));
+    m_shaderProgram->setUniformValue("iMouse",
+                                     QVector4D(static_cast<float>(m_mouseGlCoord.x()),
+                                               static_cast<float>(m_mouseGlCoord.y()),
+                                               static_cast<float>(m_mouseClickCoord.x()),
+                                               static_cast<float>(m_mouseClickCoord.y())));
 
     QDateTime dt = QDateTime::currentDateTime();
     float secOfDay = dt.time().msecsSinceStartOfDay() / 1000.0f;
-    m_shaderProgram->setUniformValue("iDate", QVector4D(
-        static_cast<float>(dt.date().year()),
-        static_cast<float>(dt.date().month()),
-        static_cast<float>(dt.date().day()),
-        secOfDay
-    ));
+    m_shaderProgram->setUniformValue("iDate",
+                                     QVector4D(static_cast<float>(dt.date().year()),
+                                               static_cast<float>(dt.date().month()),
+                                               static_cast<float>(dt.date().day()), secOfDay));
 
     // Custom inspector uniforms
     for (const auto &[name, val] : m_customUniforms) {
         const char *cName = name.c_str();
         switch (val.type) {
         case ShaderUniformValue::Type::Float:
-            if (!val.fVals.empty()) m_shaderProgram->setUniformValue(cName, val.fVals[0]);
+            if (!val.fVals.empty())
+                m_shaderProgram->setUniformValue(cName, val.fVals[0]);
             break;
         case ShaderUniformValue::Type::Vec2:
             if (val.fVals.size() >= 2)
@@ -1052,14 +1023,17 @@ void GpuPreviewViewport::renderInProcessShaderPass()
             break;
         case ShaderUniformValue::Type::Vec3:
             if (val.fVals.size() >= 3)
-                m_shaderProgram->setUniformValue(cName, QVector3D(val.fVals[0], val.fVals[1], val.fVals[2]));
+                m_shaderProgram->setUniformValue(
+                    cName, QVector3D(val.fVals[0], val.fVals[1], val.fVals[2]));
             break;
         case ShaderUniformValue::Type::Vec4:
             if (val.fVals.size() >= 4)
-                m_shaderProgram->setUniformValue(cName, QVector4D(val.fVals[0], val.fVals[1], val.fVals[2], val.fVals[3]));
+                m_shaderProgram->setUniformValue(
+                    cName, QVector4D(val.fVals[0], val.fVals[1], val.fVals[2], val.fVals[3]));
             break;
         case ShaderUniformValue::Type::Int:
-            if (!val.iVals.empty()) m_shaderProgram->setUniformValue(cName, val.iVals[0]);
+            if (!val.iVals.empty())
+                m_shaderProgram->setUniformValue(cName, val.iVals[0]);
             break;
         case ShaderUniformValue::Type::Mat4:
             break;
@@ -1074,10 +1048,10 @@ void GpuPreviewViewport::renderInProcessShaderPass()
     m_quadVbo.bind();
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                          reinterpret_cast<void*>(offsetof(Vertex, x)));
+                          reinterpret_cast<void *>(offsetof(Vertex, x)));
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                          reinterpret_cast<void*>(offsetof(Vertex, u)));
+                          reinterpret_cast<void *>(offsetof(Vertex, u)));
     glDrawArrays(GL_TRIANGLES, 0, 6);
     glDisableVertexAttribArray(1);
     glDisableVertexAttribArray(0);
@@ -1141,9 +1115,11 @@ void GpuPreviewViewport::updateFpsTelemetry()
 {
     m_fpsFrameCounter++;
     auto now = std::chrono::steady_clock::now();
-    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastFpsCalcTime).count();
+    auto elapsedMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastFpsCalcTime).count();
     if (elapsedMs >= 250) {
-        m_currentFps = (static_cast<float>(m_fpsFrameCounter) * 1000.0f) / static_cast<float>(elapsedMs);
+        m_currentFps =
+            (static_cast<float>(m_fpsFrameCounter) * 1000.0f) / static_cast<float>(elapsedMs);
         m_fpsFrameCounter = 0;
         m_lastFpsCalcTime = now;
         emit fpsUpdated(m_currentFps);
@@ -1159,13 +1135,13 @@ void GpuPreviewViewport::paintGL()
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
 
-    if (m_previewMode == PreviewMode::InProcessImage &&
-        m_inProcessImageTex == 0 && !m_fallbackImage.isNull()) {
+    if (m_previewMode == PreviewMode::InProcessImage && m_inProcessImageTex == 0 &&
+        !m_fallbackImage.isNull()) {
         QImage formatted = m_fallbackImage.convertToFormat(QImage::Format_RGBA8888);
         glGenTextures(1, &m_inProcessImageTex);
         glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, formatted.constBits());
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, formatted.constBits());
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1238,8 +1214,8 @@ void GpuPreviewViewport::paintGL()
             }
         } else {
             mvp.ortho(-vAspect, vAspect, -1.0f, 1.0f, -1.0f, 1.0f);
-            mvp.translate(m_panOffset.x() / (vW * 0.5f) * vAspect,
-                          -m_panOffset.y() / (vH * 0.5f), 0.0f);
+            mvp.translate(m_panOffset.x() / (vW * 0.5f) * vAspect, -m_panOffset.y() / (vH * 0.5f),
+                          0.0f);
             mvp.scale(m_zoom, m_zoom, 1.0f);
 
             if (cAspect > vAspect) {
@@ -1261,10 +1237,10 @@ void GpuPreviewViewport::paintGL()
         m_quadVbo.bind();
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                              reinterpret_cast<void*>(offsetof(Vertex, x)));
+                              reinterpret_cast<void *>(offsetof(Vertex, x)));
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                              reinterpret_cast<void*>(offsetof(Vertex, u)));
+                              reinterpret_cast<void *>(offsetof(Vertex, u)));
         glDrawArrays(GL_TRIANGLES, 0, 6);
         glDisableVertexAttribArray(1);
         glDisableVertexAttribArray(0);
@@ -1285,8 +1261,8 @@ void GpuPreviewViewport::paintGL()
 
     if (activeTex == 0) {
         drawFallbackBackdrop(painter, displayRect);
-    } else if (m_previewMode == PreviewMode::InProcessImage &&
-               !m_fallbackImage.isNull() && !m_parallaxEnabled) {
+    } else if (m_previewMode == PreviewMode::InProcessImage && !m_fallbackImage.isNull() &&
+               !m_parallaxEnabled) {
         painter.drawImage(displayRect, m_fallbackImage);
     }
 
@@ -1460,12 +1436,24 @@ void GpuPreviewViewport::drawSafeFrameGuides(QPainter &painter, const QRectF &di
     // Safe Frame Label Tag
     QString guideLabel;
     switch (m_aspectRatioGuide) {
-    case AspectRatioGuide::Ratio16_9: guideLabel = QStringLiteral("SAFE FRAME: 16:9 UHD"); break;
-    case AspectRatioGuide::Ratio16_10: guideLabel = QStringLiteral("SAFE FRAME: 16:10"); break;
-    case AspectRatioGuide::Ratio21_9: guideLabel = QStringLiteral("SAFE FRAME: 21:9 ULTRAWIDE"); break;
-    case AspectRatioGuide::Ratio32_9: guideLabel = QStringLiteral("SAFE FRAME: 32:9 DUAL SPAN"); break;
-    case AspectRatioGuide::Ratio4_3: guideLabel = QStringLiteral("SAFE FRAME: 4:3"); break;
-    default: guideLabel = QStringLiteral("SAFE FRAME: DISPLAY MATCH"); break;
+    case AspectRatioGuide::Ratio16_9:
+        guideLabel = QStringLiteral("SAFE FRAME: 16:9 UHD");
+        break;
+    case AspectRatioGuide::Ratio16_10:
+        guideLabel = QStringLiteral("SAFE FRAME: 16:10");
+        break;
+    case AspectRatioGuide::Ratio21_9:
+        guideLabel = QStringLiteral("SAFE FRAME: 21:9 ULTRAWIDE");
+        break;
+    case AspectRatioGuide::Ratio32_9:
+        guideLabel = QStringLiteral("SAFE FRAME: 32:9 DUAL SPAN");
+        break;
+    case AspectRatioGuide::Ratio4_3:
+        guideLabel = QStringLiteral("SAFE FRAME: 4:3");
+        break;
+    default:
+        guideLabel = QStringLiteral("SAFE FRAME: DISPLAY MATCH");
+        break;
     }
 
     QFont tagFont = painter.font();
@@ -1483,8 +1471,9 @@ void GpuPreviewViewport::drawSafeFrameGuides(QPainter &painter, const QRectF &di
         painter.drawRoundedRect(tagRect, 4.0, 4.0);
 
         painter.setPen(QColor(0, 229, 255, 230));
-        painter.drawText(tagRect, Qt::AlignCenter,
-                         tagFm.elidedText(guideLabel, Qt::ElideRight, static_cast<int>(tagW - 8.0f)));
+        painter.drawText(
+            tagRect, Qt::AlignCenter,
+            tagFm.elidedText(guideLabel, Qt::ElideRight, static_cast<int>(tagW - 8.0f)));
     }
 
     painter.restore();
@@ -1518,23 +1507,23 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
     float btnH = barH - 12.0f;
 
     float wStatus = ultraCompact ? 68.0f : (compact ? 92.0f : 124.0f);
-    float wMon    = ultraCompact ? 62.0f : (compact ? 82.0f : 102.0f);
-    float wApply  = ultraCompact ? 68.0f : (compact ? 96.0f : 126.0f);
-    float wReset  = ultraCompact ? 34.0f : 42.0f;
-    float wGuide  = ultraCompact ? 42.0f : (compact ? 52.0f : 62.0f);
-    float wPara   = ultraCompact ? 38.0f : 46.0f;
+    float wMon = ultraCompact ? 62.0f : (compact ? 82.0f : 102.0f);
+    float wApply = ultraCompact ? 68.0f : (compact ? 96.0f : 126.0f);
+    float wReset = ultraCompact ? 34.0f : 42.0f;
+    float wGuide = ultraCompact ? 42.0f : (compact ? 52.0f : 62.0f);
+    float wPara = ultraCompact ? 38.0f : 46.0f;
 
     float rawSum = wStatus + wMon + wApply + wReset + wGuide + wPara + 5.0f * gap + 8.0f;
     float innerW = std::max(160.0f, barW - 2.0f * padX);
     float scale = std::min(1.0f, innerW / rawSum);
 
     wStatus *= scale;
-    wMon    *= scale;
-    wApply  *= scale;
-    wReset  *= scale;
-    wGuide  *= scale;
-    wPara   *= scale;
-    gap     *= scale;
+    wMon *= scale;
+    wApply *= scale;
+    wReset *= scale;
+    wGuide *= scale;
+    wPara *= scale;
+    gap *= scale;
 
     float curX = barX + padX;
 
@@ -1565,9 +1554,11 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
     QFontMetrics fm(statusFont);
     painter.setPen(QColor(230, 230, 235));
     QRectF statusTextRect(statusRect.left() + 14.0f, statusRect.top(),
-                          std::max(10.0f, static_cast<float>(statusRect.width()) - 16.0f), statusRect.height());
-    painter.drawText(statusTextRect, Qt::AlignVCenter | Qt::AlignLeft,
-                     fm.elidedText(statusText, Qt::ElideRight, static_cast<int>(statusTextRect.width())));
+                          std::max(10.0f, static_cast<float>(statusRect.width()) - 16.0f),
+                          statusRect.height());
+    painter.drawText(
+        statusTextRect, Qt::AlignVCenter | Qt::AlignLeft,
+        fm.elidedText(statusText, Qt::ElideRight, static_cast<int>(statusTextRect.width())));
 
     curX += wStatus + 4.0f * scale;
 
@@ -1579,14 +1570,14 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
     // 2. Monitor Selection Button
     m_monitorBtnRect = QRectF(curX, btnY, wMon, btnH);
     bool monitorHovered = (m_hoveredButton == ActionBarButton::MonitorSelector);
-    painter.setPen(QPen(monitorHovered ? QColor(0, 229, 255, 120) : QColor(255, 255, 255, 25), 1.0));
+    painter.setPen(
+        QPen(monitorHovered ? QColor(0, 229, 255, 120) : QColor(255, 255, 255, 25), 1.0));
     painter.setBrush(monitorHovered ? QColor(40, 44, 56, 230) : QColor(32, 34, 42, 200));
     painter.drawRoundedRect(m_monitorBtnRect, 5.0, 5.0);
 
     painter.setPen(QColor(220, 225, 235));
-    QString monitorText = ultraCompact
-                              ? QStringLiteral("%1 ▾").arg(m_selectedMonitor)
-                              : QStringLiteral("🖥 %1 ▾").arg(m_selectedMonitor);
+    QString monitorText = ultraCompact ? QStringLiteral("%1 ▾").arg(m_selectedMonitor)
+                                       : QStringLiteral("🖥 %1 ▾").arg(m_selectedMonitor);
     painter.drawText(m_monitorBtnRect, Qt::AlignCenter,
                      fm.elidedText(monitorText, Qt::ElideRight, static_cast<int>(wMon - 6.0f)));
     curX += wMon + gap;
@@ -1599,9 +1590,8 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
     painter.drawRoundedRect(m_applyBtnRect, 5.0, 5.0);
 
     painter.setPen(Qt::white);
-    QString applyText = compact
-                            ? QStringLiteral("⚡ Apply")
-                            : QStringLiteral("⚡ Apply to %1").arg(m_selectedMonitor);
+    QString applyText = compact ? QStringLiteral("⚡ Apply")
+                                : QStringLiteral("⚡ Apply to %1").arg(m_selectedMonitor);
     painter.drawText(m_applyBtnRect, Qt::AlignCenter,
                      fm.elidedText(applyText, Qt::ElideRight, static_cast<int>(wApply - 6.0f)));
     curX += wApply + gap;
@@ -1609,7 +1599,8 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
     // 4. Quick Action Buttons: Reset, Guide, 2.5D Parallax
     m_resetBtnRect = QRectF(curX, btnY, wReset, btnH);
     bool resetHovered = (m_hoveredButton == ActionBarButton::ResetButton);
-    painter.setPen(QPen(resetHovered ? QColor(255, 255, 255, 100) : QColor(255, 255, 255, 25), 1.0));
+    painter.setPen(
+        QPen(resetHovered ? QColor(255, 255, 255, 100) : QColor(255, 255, 255, 25), 1.0));
     painter.setBrush(resetHovered ? QColor(50, 52, 64, 230) : QColor(32, 34, 42, 200));
     painter.drawRoundedRect(m_resetBtnRect, 5.0, 5.0);
     painter.setPen(QColor(210, 215, 225));
@@ -1620,8 +1611,9 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
     bool guideHovered = (m_hoveredButton == ActionBarButton::GuideButton);
     bool guideActive = (m_showSafeGuides && m_aspectRatioGuide != AspectRatioGuide::None);
     painter.setPen(QPen(guideActive ? QColor(0, 229, 255, 180) : QColor(255, 255, 255, 25), 1.0));
-    painter.setBrush(guideActive ? QColor(0, 100, 120, 180) :
-                     (guideHovered ? QColor(50, 52, 64, 230) : QColor(32, 34, 42, 200)));
+    painter.setBrush(guideActive
+                         ? QColor(0, 100, 120, 180)
+                         : (guideHovered ? QColor(50, 52, 64, 230) : QColor(32, 34, 42, 200)));
     painter.drawRoundedRect(m_guideBtnRect, 5.0, 5.0);
     painter.setPen(guideActive ? QColor(0, 229, 255) : QColor(210, 215, 225));
     painter.drawText(m_guideBtnRect, Qt::AlignCenter,
@@ -1630,9 +1622,11 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
 
     m_parallaxBtnRect = QRectF(curX, btnY, wPara, btnH);
     bool parallaxHovered = (m_hoveredButton == ActionBarButton::ParallaxButton);
-    painter.setPen(QPen(m_parallaxEnabled ? QColor(168, 85, 247, 200) : QColor(255, 255, 255, 25), 1.0));
-    painter.setBrush(m_parallaxEnabled ? QColor(107, 33, 168, 200) :
-                     (parallaxHovered ? QColor(50, 52, 64, 230) : QColor(32, 34, 42, 200)));
+    painter.setPen(
+        QPen(m_parallaxEnabled ? QColor(168, 85, 247, 200) : QColor(255, 255, 255, 25), 1.0));
+    painter.setBrush(m_parallaxEnabled
+                         ? QColor(107, 33, 168, 200)
+                         : (parallaxHovered ? QColor(50, 52, 64, 230) : QColor(32, 34, 42, 200)));
     painter.drawRoundedRect(m_parallaxBtnRect, 5.0, 5.0);
     painter.setPen(m_parallaxEnabled ? QColor(233, 213, 255) : QColor(210, 215, 225));
     painter.drawText(m_parallaxBtnRect, Qt::AlignCenter, QStringLiteral("2.5D"));
@@ -1650,8 +1644,8 @@ void GpuPreviewViewport::drawStatusOverlay(QPainter &painter)
 
     QString modeStr = (m_previewMode == PreviewMode::DmaBufLive) ? QStringLiteral("LIVE DMA-BUF")
                       : (m_previewMode == PreviewMode::InProcessShader) ? QStringLiteral("SHADER")
-                      : (m_previewMode == PreviewMode::InProcessImage) ? QStringLiteral("IMAGE")
-                      : QStringLiteral("IDLE");
+                      : (m_previewMode == PreviewMode::InProcessImage)  ? QStringLiteral("IMAGE")
+                                                                        : QStringLiteral("IDLE");
 
     QString telemetryStr = QStringLiteral("%1 · %2x%3 · %4% · %5 FPS")
                                .arg(modeStr)
@@ -1676,16 +1670,22 @@ void GpuPreviewViewport::drawStatusOverlay(QPainter &painter)
     painter.restore();
 }
 
-GpuPreviewViewport::ActionBarButton GpuPreviewViewport::hitTestActionBar(const QPointF &pos) const noexcept
+GpuPreviewViewport::ActionBarButton
+GpuPreviewViewport::hitTestActionBar(const QPointF &pos) const noexcept
 {
     if (!m_showActionBar || !m_actionBarRect.contains(pos)) {
         return ActionBarButton::None;
     }
-    if (m_monitorBtnRect.contains(pos)) return ActionBarButton::MonitorSelector;
-    if (m_applyBtnRect.contains(pos)) return ActionBarButton::ApplyButton;
-    if (m_resetBtnRect.contains(pos)) return ActionBarButton::ResetButton;
-    if (m_guideBtnRect.contains(pos)) return ActionBarButton::GuideButton;
-    if (m_parallaxBtnRect.contains(pos)) return ActionBarButton::ParallaxButton;
+    if (m_monitorBtnRect.contains(pos))
+        return ActionBarButton::MonitorSelector;
+    if (m_applyBtnRect.contains(pos))
+        return ActionBarButton::ApplyButton;
+    if (m_resetBtnRect.contains(pos))
+        return ActionBarButton::ResetButton;
+    if (m_guideBtnRect.contains(pos))
+        return ActionBarButton::GuideButton;
+    if (m_parallaxBtnRect.contains(pos))
+        return ActionBarButton::ParallaxButton;
     return ActionBarButton::None;
 }
 
@@ -1732,8 +1732,8 @@ void GpuPreviewViewport::mousePressEvent(QMouseEvent *event)
 
 void GpuPreviewViewport::mouseMoveEvent(QMouseEvent *event)
 {
-    m_mouseGlCoord = QPointF(event->position().x(),
-                             static_cast<float>(height()) - event->position().y());
+    m_mouseGlCoord =
+        QPointF(event->position().x(), static_cast<float>(height()) - event->position().y());
 
     if (m_showActionBar) {
         ActionBarButton hit = hitTestActionBar(event->position());
@@ -1802,7 +1802,8 @@ void GpuPreviewViewport::wheelEvent(QWheelEvent *event)
 
     // Zoom anchored to cursor position
     QPointF mousePos = event->position();
-    QPointF center = QPointF(static_cast<float>(width()) * 0.5f, static_cast<float>(height()) * 0.5f);
+    QPointF center =
+        QPointF(static_cast<float>(width()) * 0.5f, static_cast<float>(height()) * 0.5f);
     QPointF mouseFromCenter = mousePos - center;
     m_panOffset = mouseFromCenter - (mouseFromCenter - m_panOffset) * (m_zoom / oldZoom);
 
@@ -1826,20 +1827,11 @@ void GpuPreviewViewport::leaveEvent(QEvent *event)
     QOpenGLWidget::leaveEvent(event);
 }
 
-void GpuPreviewViewport::onApplyClicked()
-{
-    emit applyRequested(m_selectedMonitor);
-}
+void GpuPreviewViewport::onApplyClicked() { emit applyRequested(m_selectedMonitor); }
 
-void GpuPreviewViewport::onResetViewClicked()
-{
-    resetView();
-}
+void GpuPreviewViewport::onResetViewClicked() { resetView(); }
 
-void GpuPreviewViewport::onToggleParallax()
-{
-    setParallaxEnabled(!m_parallaxEnabled);
-}
+void GpuPreviewViewport::onToggleParallax() { setParallaxEnabled(!m_parallaxEnabled); }
 
 void GpuPreviewViewport::onCycleGuides()
 {

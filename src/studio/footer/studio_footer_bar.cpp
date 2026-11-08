@@ -9,7 +9,8 @@ namespace wwal::studio {
 
 namespace {
 
-QFrame *createDivider(QWidget *parent) {
+QFrame *createDivider(QWidget *parent)
+{
     auto *divider = new QFrame(parent);
     divider->setFrameShape(QFrame::VLine);
     divider->setFrameShadow(QFrame::Plain);
@@ -19,8 +20,7 @@ QFrame *createDivider(QWidget *parent) {
 
 } // namespace
 
-StudioFooterBar::StudioFooterBar(QWidget *parent)
-    : QWidget(parent)
+StudioFooterBar::StudioFooterBar(QWidget *parent) : QWidget(parent)
 {
     setFixedHeight(48);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
@@ -28,17 +28,17 @@ StudioFooterBar::StudioFooterBar(QWidget *parent)
     setupUi();
 
     m_statusMessageTimer.setSingleShot(true);
-    connect(&m_statusMessageTimer, &QTimer::timeout, this, &StudioFooterBar::onStatusMessageTimeout);
+    connect(&m_statusMessageTimer, &QTimer::timeout, this,
+            &StudioFooterBar::onStatusMessageTimeout);
 }
 
-void StudioFooterBar::setupUi() {
+void StudioFooterBar::setupUi()
+{
     // Top-level footer styling
-    setStyleSheet(
-        "StudioFooterBar {"
-        "  background-color: #0b0f19;"
-        "  border-top: 1px solid #1e293b;"
-        "}"
-    );
+    setStyleSheet("StudioFooterBar {"
+                  "  background-color: #0b0f19;"
+                  "  border-top: 1px solid #1e293b;"
+                  "}");
 
     auto *rootLayout = new QHBoxLayout(this);
     rootLayout->setContentsMargins(4, 2, 4, 2);
@@ -46,49 +46,48 @@ void StudioFooterBar::setupUi() {
 
     // 1. Left section: Power Governor
     m_powerGovernor = new PowerGovernorWidget(this);
-    connect(m_powerGovernor, &PowerGovernorWidget::fpsCapChanged,
-            this, &StudioFooterBar::fpsCapChanged);
-    connect(m_powerGovernor, &PowerGovernorWidget::batteryPolicyChanged,
-            this, &StudioFooterBar::batteryPolicyChanged);
-    connect(m_powerGovernor, &PowerGovernorWidget::autoPauseFlagsChanged,
-            this, &StudioFooterBar::autoPauseFlagsChanged);
+    connect(m_powerGovernor, &PowerGovernorWidget::fpsCapChanged, this,
+            &StudioFooterBar::fpsCapChanged);
+    connect(m_powerGovernor, &PowerGovernorWidget::batteryPolicyChanged, this,
+            &StudioFooterBar::batteryPolicyChanged);
+    connect(m_powerGovernor, &PowerGovernorWidget::autoPauseFlagsChanged, this,
+            &StudioFooterBar::autoPauseFlagsChanged);
     rootLayout->addWidget(m_powerGovernor, 0);
 
     rootLayout->addWidget(createDivider(this));
 
     // 2. Center section: 64-Band Bark-Scale Audio Visualizer & Controls
     m_audioSpectrum = new AudioSpectrumWidget(this);
-    connect(m_audioSpectrum, &AudioSpectrumWidget::sensitivityGainChanged,
-            this, &StudioFooterBar::audioSensitivityGainChanged);
-    connect(m_audioSpectrum, &AudioSpectrumWidget::muteOnAudioToggled,
-            this, &StudioFooterBar::muteOnAudioToggled);
+    connect(m_audioSpectrum, &AudioSpectrumWidget::sensitivityGainChanged, this,
+            &StudioFooterBar::audioSensitivityGainChanged);
+    connect(m_audioSpectrum, &AudioSpectrumWidget::muteOnAudioToggled, this,
+            &StudioFooterBar::muteOnAudioToggled);
     rootLayout->addWidget(m_audioSpectrum, 1); // Expand to fill available center space
 
     rootLayout->addWidget(createDivider(this));
 
     // 3. Right section: Streaming Telemetry HUD & DMA-BUF Ring Visualizer
     m_telemetryHud = new TelemetryHudWidget(this);
-    connect(m_telemetryHud, &TelemetryHudWidget::outputSelected,
-            this, &StudioFooterBar::outputSelected);
+    connect(m_telemetryHud, &TelemetryHudWidget::outputSelected, this,
+            &StudioFooterBar::outputSelected);
     rootLayout->addWidget(m_telemetryHud, 0);
 
     // Status Message label (initially hidden/empty, floats or displays when active)
     m_statusMessageLabel = new QLabel(this);
     m_statusMessageLabel->setVisible(false);
-    m_statusMessageLabel->setStyleSheet(
-        "QLabel {"
-        "  background-color: #0284c7;"
-        "  color: #ffffff;"
-        "  border-radius: 3px;"
-        "  font-size: 10px;"
-        "  font-weight: 500;"
-        "  padding: 2px 6px;"
-        "}"
-    );
+    m_statusMessageLabel->setStyleSheet("QLabel {"
+                                        "  background-color: #0284c7;"
+                                        "  color: #ffffff;"
+                                        "  border-radius: 3px;"
+                                        "  font-size: 10px;"
+                                        "  font-weight: 500;"
+                                        "  padding: 2px 6px;"
+                                        "}");
     rootLayout->addWidget(m_statusMessageLabel);
 }
 
-void StudioFooterBar::updateTelemetry(const waywal_telemetry_snapshot_t &snapshot) {
+void StudioFooterBar::updateTelemetry(const waywal_telemetry_snapshot_t &snapshot)
+{
     if (m_powerGovernor) {
         m_powerGovernor->updateFromTelemetry(snapshot);
     }
@@ -100,7 +99,8 @@ void StudioFooterBar::updateTelemetry(const waywal_telemetry_snapshot_t &snapsho
     }
 }
 
-void StudioFooterBar::setStatusMessage(const QString &msg, int timeoutMs) {
+void StudioFooterBar::setStatusMessage(const QString &msg, int timeoutMs)
+{
     if (!m_statusMessageLabel) {
         return;
     }
@@ -119,7 +119,8 @@ void StudioFooterBar::setStatusMessage(const QString &msg, int timeoutMs) {
     }
 }
 
-void StudioFooterBar::onStatusMessageTimeout() {
+void StudioFooterBar::onStatusMessageTimeout()
+{
     if (m_statusMessageLabel) {
         m_statusMessageLabel->setVisible(false);
     }

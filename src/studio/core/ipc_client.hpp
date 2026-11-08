@@ -31,24 +31,25 @@ namespace waywal::studio {
 class IpcClient : public QObject, public IIpcClientService {
     Q_OBJECT
 
-public:
-    explicit IpcClient(QString namespaceStr = QString(),
-                       QString socketPath = QString(),
+  public:
+    explicit IpcClient(QString namespaceStr = QString(), QString socketPath = QString(),
                        QObject *parent = nullptr);
     ~IpcClient() override;
 
     // Service Interface Implementation
     [[nodiscard]] bool isConnected() const override;
-    void sendSetUniform(const QString &output, const QString &name,
-                        const float *vals, uint32_t count, bool persist = false) override;
+    void sendSetUniform(const QString &output, const QString &name, const float *vals,
+                        uint32_t count, bool persist = false) override;
     void sendSetImage(const waywal_img_metadata_t &meta, int memfd = -1) override;
-    void sendAudioPowerConfig(float volume, int8_t muteOnAudio,
-                              int8_t themeFromMedia, uint8_t batteryPolicy = 0) override;
+    void sendAudioPowerConfig(float volume, int8_t muteOnAudio, int8_t themeFromMedia,
+                              uint8_t batteryPolicy = 0) override;
     void requestOutputsJson(std::function<void(const QString &json)> callback = nullptr) override;
-    void requestTelemetry(std::function<void(const TelemetrySnapshot &snapshot)> callback = nullptr) override;
-    void requestOutputDmabuf(const QString &output,
-                             std::function<void(const waywal_export_dmabuf_resp_t &desc,
-                                                const QVector<int> &fds)> callback = nullptr) override;
+    void requestTelemetry(
+        std::function<void(const TelemetrySnapshot &snapshot)> callback = nullptr) override;
+    void requestOutputDmabuf(
+        const QString &output,
+        std::function<void(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds)>
+            callback = nullptr) override;
     void subscribeEvents() override;
 
     // Lifecycle
@@ -58,7 +59,7 @@ public:
     [[nodiscard]] QString socketPath() const;
     [[nodiscard]] QString namespaceStr() const { return m_namespaceStr; }
 
-signals:
+  signals:
     void connectionStateChanged(bool connected);
     void outputsJsonReceived(const QString &json);
     void telemetryReceived(const TelemetrySnapshot &snapshot);
@@ -66,7 +67,7 @@ signals:
     void eventReceived(const QString &eventType, const QJsonObject &data);
     void errorOccurred(const QString &error);
 
-private:
+  private:
     struct OutboundPacket {
         enum class Type {
             Raw,
@@ -86,14 +87,16 @@ private:
         // Callbacks for request-response tracking
         std::function<void(const QString &json)> jsonCallback;
         std::function<void(const TelemetrySnapshot &snapshot)> telemetryCallback;
-        std::function<void(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds)> dmabufCallback;
+        std::function<void(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds)>
+            dmabufCallback;
     };
 
     struct PendingRequest {
         uint16_t expectedOpcode{0};
         std::function<void(const QString &json)> jsonCallback;
         std::function<void(const TelemetrySnapshot &snapshot)> telemetryCallback;
-        std::function<void(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds)> dmabufCallback;
+        std::function<void(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds)>
+            dmabufCallback;
         std::chrono::steady_clock::time_point sentAt;
     };
 

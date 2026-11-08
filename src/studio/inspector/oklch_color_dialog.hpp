@@ -52,14 +52,15 @@ struct LinearRgb {
  * and HSV bidirectional transformations.
  */
 class ColorScience {
-public:
+  public:
     static constexpr float PI_F = 3.14159265358979323846f;
     static constexpr float RAD_TO_DEG = 180.0f / PI_F;
     static constexpr float DEG_TO_RAD = PI_F / 180.0f;
     static constexpr float MAX_CHROMA = 0.4f;
 
     // --- Gamma Transfer Functions ---
-    static inline float srgbToLinear(float val) noexcept {
+    static inline float srgbToLinear(float val) noexcept
+    {
         val = std::clamp(val, 0.0f, 1.0f);
         if (val <= 0.04045f) {
             return val / 12.92f;
@@ -67,7 +68,8 @@ public:
         return std::pow((val + 0.055f) / 1.055f, 2.4f);
     }
 
-    static inline float linearToSrgb(float val) noexcept {
+    static inline float linearToSrgb(float val) noexcept
+    {
         if (val <= 0.0031308f) {
             return std::max(0.0f, val * 12.92f);
         }
@@ -76,7 +78,8 @@ public:
 
     // --- OkLab / Linear RGB Transformations ---
     static inline void linearRgbToOklab(float r, float g, float b, float &out_l, float &out_a,
-                                        float &out_b) noexcept {
+                                        float &out_b) noexcept
+    {
         // Linear RGB to LMS cone responses
         float l_lin = 0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b;
         float m_lin = 0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b;
@@ -93,7 +96,8 @@ public:
     }
 
     static inline void oklabToLinearRgb(float l, float a, float b_val, float &out_r, float &out_g,
-                                        float &out_b) noexcept {
+                                        float &out_b) noexcept
+    {
         float l_ = l + 0.3963377774f * a + 0.2158037573f * b_val;
         float m_ = l - 0.1055613458f * a - 0.0638541728f * b_val;
         float s_ = l - 0.0894841775f * a - 1.2914855480f * b_val;
@@ -109,7 +113,8 @@ public:
 
     // --- OkLab <-> OkLCH Transformations ---
     static inline void oklabToOklch(float l, float a, float b_val, float &out_l, float &out_c,
-                                    float &out_h_deg) noexcept {
+                                    float &out_h_deg) noexcept
+    {
         out_l = l;
         out_c = std::sqrt(a * a + b_val * b_val);
         float h_rad = std::atan2(b_val, a);
@@ -120,7 +125,8 @@ public:
     }
 
     static inline void oklchToOklab(float l, float c, float h_deg, float &out_l, float &out_a,
-                                    float &out_b) noexcept {
+                                    float &out_b) noexcept
+    {
         out_l = l;
         float h_rad = h_deg * DEG_TO_RAD;
         out_a = c * std::cos(h_rad);
@@ -128,7 +134,8 @@ public:
     }
 
     // --- End-to-End OkLCH <-> sRGB Transformations ---
-    static inline OklchColor srgbToOklch(float r, float g, float b, float a = 1.0f) noexcept {
+    static inline OklchColor srgbToOklch(float r, float g, float b, float a = 1.0f) noexcept
+    {
         float r_lin = srgbToLinear(r);
         float g_lin = srgbToLinear(g);
         float b_lin = srgbToLinear(b);
@@ -143,18 +150,21 @@ public:
     }
 
     static inline void oklchToLinearRgb(float l, float c, float h_deg, float &out_r, float &out_g,
-                                        float &out_b) noexcept {
+                                        float &out_b) noexcept
+    {
         float ok_l{0.0f}, ok_a{0.0f}, ok_b{0.0f};
         oklchToOklab(l, c, h_deg, ok_l, ok_a, ok_b);
         oklabToLinearRgb(ok_l, ok_a, ok_b, out_r, out_g, out_b);
     }
 
-    static inline bool isLinearRgbInGamut(float r, float g, float b, float eps = 1e-4f) noexcept {
+    static inline bool isLinearRgbInGamut(float r, float g, float b, float eps = 1e-4f) noexcept
+    {
         return (r >= -eps && r <= 1.0f + eps && g >= -eps && g <= 1.0f + eps && b >= -eps &&
                 b <= 1.0f + eps);
     }
 
-    static inline bool isOklchInGamut(float l, float c, float h_deg) noexcept {
+    static inline bool isOklchInGamut(float l, float c, float h_deg) noexcept
+    {
         float r_lin{0.0f}, g_lin{0.0f}, b_lin{0.0f};
         oklchToLinearRgb(l, c, h_deg, r_lin, g_lin, b_lin);
         return isLinearRgbInGamut(r_lin, g_lin, b_lin);
@@ -164,7 +174,8 @@ public:
      * @brief Evaluates the maximum in-gamut chroma for a given Lightness and Hue
      * using a high-precision 16-step binary search (convergence < 0.0001).
      */
-    static inline float maxInGamutChroma(float l, float h_deg) noexcept {
+    static inline float maxInGamutChroma(float l, float h_deg) noexcept
+    {
         if (l <= 0.0f || l >= 1.0f) {
             return 0.0f;
         }
@@ -182,7 +193,8 @@ public:
     }
 
     static inline void oklchToSrgbClamped(float l, float c, float h_deg, float &out_r, float &out_g,
-                                          float &out_b) noexcept {
+                                          float &out_b) noexcept
+    {
         float r_lin{0.0f}, g_lin{0.0f}, b_lin{0.0f};
         oklchToLinearRgb(l, c, h_deg, r_lin, g_lin, b_lin);
 
@@ -191,7 +203,8 @@ public:
         out_b = std::clamp(linearToSrgb(b_lin), 0.0f, 1.0f);
     }
 
-    static inline QColor oklchToQColor(const OklchColor &col) noexcept {
+    static inline QColor oklchToQColor(const OklchColor &col) noexcept
+    {
         float r{0.0f}, g{0.0f}, b{0.0f};
         oklchToSrgbClamped(col.l, col.c, col.h, r, g, b);
         int ir = std::clamp(static_cast<int>(std::round(r * 255.0f)), 0, 255);
@@ -201,13 +214,15 @@ public:
         return QColor(ir, ig, ib, ia);
     }
 
-    static inline OklchColor qcolorToOklch(const QColor &qcol) noexcept {
+    static inline OklchColor qcolorToOklch(const QColor &qcol) noexcept
+    {
         return srgbToOklch(qcol.redF(), qcol.greenF(), qcol.blueF(), qcol.alphaF());
     }
 
     // --- HSV Transformations ---
     static inline void srgbToHsv(float r, float g, float b, float &out_h, float &out_s,
-                                 float &out_v) noexcept {
+                                 float &out_v) noexcept
+    {
         float max_c = std::max({r, g, b});
         float min_c = std::min({r, g, b});
         float delta = max_c - min_c;
@@ -234,26 +249,40 @@ public:
     }
 
     static inline void hsvToSrgb(float h, float s, float v, float &out_r, float &out_g,
-                                 float &out_b) noexcept {
+                                 float &out_b) noexcept
+    {
         float c = v * s;
         float h_prime = std::fmod(h, 360.0f) / 60.0f;
-        if (h_prime < 0.0f) h_prime += 6.0f;
+        if (h_prime < 0.0f)
+            h_prime += 6.0f;
         float x = c * (1.0f - std::abs(std::fmod(h_prime, 2.0f) - 1.0f));
         float m = v - c;
 
         float r1 = 0.0f, g1 = 0.0f, b1 = 0.0f;
         if (h_prime < 1.0f) {
-            r1 = c; g1 = x; b1 = 0.0f;
+            r1 = c;
+            g1 = x;
+            b1 = 0.0f;
         } else if (h_prime < 2.0f) {
-            r1 = x; g1 = c; b1 = 0.0f;
+            r1 = x;
+            g1 = c;
+            b1 = 0.0f;
         } else if (h_prime < 3.0f) {
-            r1 = 0.0f; g1 = c; b1 = x;
+            r1 = 0.0f;
+            g1 = c;
+            b1 = x;
         } else if (h_prime < 4.0f) {
-            r1 = 0.0f; g1 = x; b1 = c;
+            r1 = 0.0f;
+            g1 = x;
+            b1 = c;
         } else if (h_prime < 5.0f) {
-            r1 = x; g1 = 0.0f; b1 = c;
+            r1 = x;
+            g1 = 0.0f;
+            b1 = c;
         } else {
-            r1 = c; g1 = 0.0f; b1 = x;
+            r1 = c;
+            g1 = 0.0f;
+            b1 = x;
         }
 
         out_r = std::clamp(r1 + m, 0.0f, 1.0f);
@@ -270,11 +299,8 @@ public:
 class OklchColorWheel : public QWidget {
     Q_OBJECT
 
-public:
-    enum class Mode {
-        OkLCH,
-        HSV
-    };
+  public:
+    enum class Mode { OkLCH, HSV };
 
     explicit OklchColorWheel(QWidget *parent = nullptr);
     ~OklchColorWheel() override = default;
@@ -303,19 +329,19 @@ public:
     [[nodiscard]] QSize sizeHint() const override { return {260, 260}; }
     [[nodiscard]] QSize minimumSizeHint() const override { return {180, 180}; }
 
-signals:
+  signals:
     void oklchChanged(float l, float c, float h);
     void hsvChanged(float h, float s, float v);
     void colorInteracted();
 
-protected:
+  protected:
     void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
 
-private:
+  private:
     void updateWheelCache();
     void handleMousePosition(const QPointF &pos);
 
@@ -338,7 +364,7 @@ private:
 class OklchColorDialog : public QDialog {
     Q_OBJECT
 
-public:
+  public:
     explicit OklchColorDialog(QWidget *parent = nullptr);
     explicit OklchColorDialog(const QColor &initial, QWidget *parent = nullptr);
     ~OklchColorDialog() override = default;
@@ -356,11 +382,11 @@ public:
     static QColor getColor(const QColor &initial = Qt::white, QWidget *parent = nullptr,
                            const QString &title = QString());
 
-signals:
+  signals:
     void colorChanged(const QColor &color);
     void oklchChanged(float l, float c, float h);
 
-private slots:
+  private slots:
     void onWheelOklchChanged(float l, float c, float h);
     void onWheelHsvChanged(float h, float s, float v);
     void onSliderLightnessChanged(int val);
@@ -376,10 +402,10 @@ private slots:
     void onResetToInitialClicked();
     void onQuickColorClicked(const QColor &col);
 
-private:
+  private:
     void setupUi();
     void updateAllControlsFromOklch(bool updateWheel = true, bool updateSliders = true,
-                                   bool updateSpins = true, bool updateHex = true);
+                                    bool updateSpins = true, bool updateHex = true);
     void updatePreviewSwatches();
 
     OklchColor m_currentOklch{0.70f, 0.16f, 220.0f, 1.0f};

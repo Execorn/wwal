@@ -286,12 +286,14 @@ static void test_folder_inclusion_exclusion_and_dedup()
     std::filesystem::remove_all(tmpRoot);
 
     std::filesystem::path wallDir = tmpRoot / "Pictures" / "Wallpapers";
+    std::filesystem::path mainSubDir = wallDir / "Nature";
     std::filesystem::path subDir = wallDir / "Anime";
     std::filesystem::path exclByNameDir = wallDir / "Screenshots";
     std::filesystem::path exclByPathDir = wallDir / "PrivateDump";
     std::filesystem::path phoneDir = tmpRoot / "Pictures" / "Phone";
     std::filesystem::path mirrorDir = tmpRoot / "Mirror";
 
+    std::filesystem::create_directories(mainSubDir);
     std::filesystem::create_directories(subDir);
     std::filesystem::create_directories(exclByNameDir);
     std::filesystem::create_directories(exclByPathDir);
@@ -306,14 +308,14 @@ static void test_folder_inclusion_exclusion_and_dedup()
         assert(saved);
     };
 
-    writeTestPng(wallDir / "keep_main.png", QColor(20, 120, 220), 640, 360);
+    writeTestPng(mainSubDir / "keep_main.png", QColor(20, 120, 220), 640, 360);
     writeTestPng(subDir / "keep_sub.png", QColor(220, 80, 40), 800, 450);
     writeTestPng(exclByNameDir / "skip_screenshot.png", QColor(100, 100, 100));
     writeTestPng(exclByPathDir / "skip_private.png", QColor(50, 50, 50));
     writeTestPng(phoneDir / "skip_phone.png", QColor(10, 200, 80));
 
     // Exact duplicate copy of keep_main.png in mirrorDir
-    std::filesystem::copy_file(wallDir / "keep_main.png", mirrorDir / "keep_main.png",
+    std::filesystem::copy_file(mainSubDir / "keep_main.png", mirrorDir / "keep_main.png",
                                std::filesystem::copy_options::overwrite_existing);
 
     FuzzyCatalogIndex idx;
@@ -375,15 +377,12 @@ static void test_folder_inclusion_exclusion_and_dedup()
            "HoverPreviewController must activate for item_id == 0 after 250ms dwell");
     assert(!hoverCtrl.currentPreviewImage().isNull());
 
-    // Verify runtime folder exclusion + rescan removes items from newly excluded directory
-    // Exclude whichever folder firstItem came from so item_id 0 is reassigned to the other image
-    std::string firstItemFolder = std::filesystem::path(firstItem.path).parent_path().string();
-    if (firstItemFolder == subDir.string()) {
-        reloadedIdx.addExcludedDirectory("Anime");
-    } else {
-        // Put keep_main.png in its own subfolder or exclude Anime so count drops to 1
-        reloadedIdx.addExcludedDirectory(subDir.string());
-    }
+    // Exclude whichever subfolder firstItem came from (plus mirrorDir if keep_main.png was first)
+    // so rescanning reassigns item_id 0 to the remaining image from the other subfolder.
+    std::string firstFolderName =
+        std::filesystem::path(firstItem.path).parent_path().filename().string();
+    reloadedIdx.addExcludedDirectory(firstFolderName);
+    reloadedIdx.addExcludedDirectory(mirrorDir.string());
     size_t rescanCount = reloadedIdx.scanAll();
     std::cout << "  -> Rescanned count after runtime exclusion: " << rescanCount << " (expected: 1)"
               << std::endl;
@@ -391,11 +390,12 @@ static void test_folder_inclusion_exclusion_and_dedup()
         rescanCount == 1 &&
         "Runtime exclusion + scanAll() must clear previously scanned items from excluded folder");
 
-    // Verify GpuTexturePool invalidates stale thumbnail when item_id 0 changes media_path
-    std::string otherPath = (firstItem.path == (wallDir / "keep_main.png").string())
-                                ? (subDir / "keep_sub.png").string()
-                                : (wallDir / "keep_main.png").string();
-    (void)pool.requestTexture(0, otherPath, "");
+    CatalogItem reassignedFirst = reloadedIdx.itemAt(0);
+    assert(reassignedFirst.id == 0);
+    assert(reassignedFirst.path != firstItem.path &&
+           "After excluding firstItem's folder, itemAt(0) must be reassigned to the other image");
+    (void)pool.requestTexture(reassignedFirst.id, reassignedFirst.path,
+                              reassignedFirst.preview_path);
     for (int attempt = 0; attempt < 50; ++attempt) {
         pool.processPendingUploads(nullptr, 8);
         QImage updated = pool.getThumbnailImage(0);

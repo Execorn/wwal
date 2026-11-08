@@ -18,13 +18,15 @@ namespace wwal::studio {
  * Features:
  * - Integrates AudioSpectrumWidget (64-band Bark-scale FFT, beat pulse, RMS meter).
  * - Integrates PowerGovernorWidget (FPS cap, battery policy, auto-pause flags, power status).
- * - Integrates TelemetryHudWidget (wp_presentation scanout FPS, compute duration, VRAM/PSS/RSS, 4-slot DMA-BUF ring).
- * - Exposes unified updateTelemetry() entry point and signal forwarding for MainWindow and CommandBus.
+ * - Integrates TelemetryHudWidget (wp_presentation scanout FPS, compute duration, VRAM/PSS/RSS,
+ * 4-slot DMA-BUF ring).
+ * - Exposes unified updateTelemetry() entry point and signal forwarding for MainWindow and
+ * CommandBus.
  */
 class StudioFooterBar : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit StudioFooterBar(QWidget *parent = nullptr);
     ~StudioFooterBar() override = default;
 
@@ -42,7 +44,7 @@ public:
     [[nodiscard]] PowerGovernorWidget *powerGovernor() const noexcept { return m_powerGovernor; }
     [[nodiscard]] TelemetryHudWidget *telemetryHud() const noexcept { return m_telemetryHud; }
 
-Q_SIGNALS:
+  Q_SIGNALS:
     // Forwarded audio signals
     void audioSensitivityGainChanged(float gain);
     void muteOnAudioToggled(bool enabled);
@@ -55,10 +57,10 @@ Q_SIGNALS:
     // Forwarded telemetry selection
     void outputSelected(const QString &outputName);
 
-private Q_SLOTS:
+  private Q_SLOTS:
     void onStatusMessageTimeout();
 
-private:
+  private:
     void setupUi();
 
     // Sub-components

@@ -30,7 +30,7 @@ namespace wwal::studio {
 class TelemetryHudWidget : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     static constexpr size_t DmabufRingSlots = 4;
 
     explicit TelemetryHudWidget(QWidget *parent = nullptr);
@@ -53,14 +53,14 @@ public:
     [[nodiscard]] float studioRssMb() const noexcept { return m_studioRssMb; }
     [[nodiscard]] waywal_bo_slot_state_t boSlotState(size_t slot) const noexcept;
 
-Q_SIGNALS:
+  Q_SIGNALS:
     void outputSelected(const QString &outputName);
 
-private Q_SLOTS:
+  private Q_SLOTS:
     void onRefreshTimerTick();
     void onOutputComboChanged(int index);
 
-private:
+  private:
     void setupUi();
     void updateLabels();
     void updateSlotIndicators();
@@ -75,11 +75,7 @@ private:
 
     // 4-Slot DMA-BUF ring buffer states
     std::array<waywal_bo_slot_state_t, DmabufRingSlots> m_boStates{
-        WAYWAL_BO_STATE_FREE,
-        WAYWAL_BO_STATE_FREE,
-        WAYWAL_BO_STATE_FREE,
-        WAYWAL_BO_STATE_FREE
-    };
+        WAYWAL_BO_STATE_FREE, WAYWAL_BO_STATE_FREE, WAYWAL_BO_STATE_FREE, WAYWAL_BO_STATE_FREE};
 
     // Output tracking
     uint32_t m_numOutputs{0};
@@ -98,7 +94,7 @@ private:
     QLabel *m_studioRssBadge{nullptr};
 
     // 4 DMA-BUF slot widgets
-    std::array<QLabel*, DmabufRingSlots> m_slotLabels{nullptr, nullptr, nullptr, nullptr};
+    std::array<QLabel *, DmabufRingSlots> m_slotLabels{nullptr, nullptr, nullptr, nullptr};
 };
 
 } // namespace wwal::studio

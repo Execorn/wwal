@@ -40,13 +40,13 @@ struct GridVisibleSlice {
 class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
     Q_OBJECT
 
-public:
+  public:
     static constexpr int ITEM_WIDTH = 280;
     static constexpr int ITEM_HEIGHT = 158; // 16:9 aspect ratio
     static constexpr int SPACING_X = 16;
     static constexpr int SPACING_Y = 16;
     static constexpr int ROW_HEIGHT = ITEM_HEIGHT + SPACING_Y; // 174 px
-    static constexpr int OVERSCAN_ROWS = 2; // 2-row overscan margin
+    static constexpr int OVERSCAN_ROWS = 2;                    // 2-row overscan margin
 
     explicit GridGlCanvas(FuzzyCatalogIndex &index, GpuTexturePool &pool,
                           HoverPreviewController &hover, QWidget *parent = nullptr);
@@ -69,11 +69,12 @@ public:
     void selectRange(uint32_t from_id, uint32_t to_id);
     void clearSelection();
     void resetHoverState();
-    [[nodiscard]] const std::unordered_set<uint32_t> &selectedIds() const noexcept {
+    [[nodiscard]] const std::unordered_set<uint32_t> &selectedIds() const noexcept
+    {
         return m_selectedIds;
     }
 
-signals:
+  signals:
     void virtualHeightChanged(int virtual_height);
     void itemSelected(const CatalogItem &item);
     void itemDoubleClicked(const CatalogItem &item);
@@ -82,7 +83,7 @@ signals:
     void excludeFolderRequested(const QString &folder_path);
     void configureFoldersRequested();
 
-protected:
+  protected:
     void initializeGL() override;
     void resizeGL(int w, int h) override;
     void paintGL() override;
@@ -95,7 +96,7 @@ protected:
     void leaveEvent(QEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
 
-private:
+  private:
     FuzzyCatalogIndex &m_index;
     GpuTexturePool &m_pool;
     HoverPreviewController &m_hover;
@@ -122,7 +123,7 @@ private:
 class VirtualizedGridWidget : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit VirtualizedGridWidget(QWidget *parent = nullptr);
     ~VirtualizedGridWidget() override;
 
@@ -131,10 +132,10 @@ public:
     void populateSampleCatalogIfEmpty(bool force_showcase_cards = false);
     void selectFirstItemIfAvailable();
 
-public slots:
+  public slots:
     void openFolderSettingsDialog();
 
-public:
+  public:
     // Accessors
     [[nodiscard]] const FuzzyCatalogIndex &catalogIndex() const noexcept { return m_index; }
     [[nodiscard]] FuzzyCatalogIndex &catalogIndex() noexcept { return m_index; }
@@ -144,13 +145,13 @@ public:
     [[nodiscard]] std::vector<uint32_t> selectedIds() const;
     void clearSelection();
 
-signals:
+  signals:
     void wallpaperSelected(const CatalogItem &item);
     void wallpaperDoubleClicked(const CatalogItem &item);
     void playlistSelectionChanged(const std::vector<uint32_t> &selected_ids);
     void catalogScanned(size_t total_count);
 
-private slots:
+  private slots:
     void onSearchTextChanged(const QString &text);
     void onTagChipClicked(uint64_t tag_mask);
     void onSortChanged(int combo_index);
@@ -158,7 +159,7 @@ private slots:
     void onVirtualHeightChanged(int virtual_height);
     void onPlaylistAddClicked();
 
-private:
+  private:
     FuzzyCatalogIndex m_index;
     GpuTexturePool m_pool;
     HoverPreviewController m_hover;

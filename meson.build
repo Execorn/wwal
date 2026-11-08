@@ -436,8 +436,7 @@ if qt6_dep.found()
     dependencies: qt6_dep,
   )
 
-  studio_sources = files(
-    'src/studio/main.cpp',
+  studio_lib_sources = files(
     'src/studio/app/dock_layout_manager.cpp',
     'src/studio/app/main_window.cpp',
     'src/studio/core/command_bus.cpp',
@@ -472,10 +471,24 @@ if qt6_dep.found()
     libdrm_dep,
   ]
 
-  wwal_studio = executable('wwal-studio',
-    studio_sources,
+  waywal_studio_lib = static_library('waywal_studio',
+    studio_lib_sources,
     include_directories: studio_inc_dirs,
     dependencies: studio_deps,
+    pic: true,
+    install: false,
+  )
+
+  waywal_studio_dep = declare_dependency(
+    link_with: waywal_studio_lib,
+    include_directories: studio_inc_dirs,
+    dependencies: studio_deps,
+  )
+
+  wwal_studio = executable('wwal-studio',
+    'src/studio/main.cpp',
+    include_directories: studio_inc_dirs,
+    dependencies: [waywal_studio_dep],
     install: true,
   )
 endif
@@ -858,45 +871,17 @@ if get_option('tests')
   test('ipc_legacy_72byte', test_ipc_legacy_72byte_exe)
 
   if have_qt6
-    dock_test_mocs = qt6.compile_moc(
-      headers: [
-        'src/studio/core/command_bus.hpp',
-        'src/studio/app/dock_layout_manager.hpp',
-        'src/studio/topology/monitor_topology_canvas.hpp',
-      ],
-      include_directories: studio_inc_dirs,
-      dependencies: qt6_dep,
-    )
-
     test_studio_command_and_dock_exe = executable('test_studio_command_and_dock',
       'tests/test_studio_command_and_dock.cpp',
-      'src/studio/core/command_bus.cpp',
-      'src/studio/app/dock_layout_manager.cpp',
-      'src/studio/topology/monitor_topology_canvas.cpp',
-      dock_test_mocs,
       include_directories: studio_inc_dirs,
-      dependencies: studio_deps,
+      dependencies: [waywal_studio_dep],
     )
     test('studio_command_and_dock', test_studio_command_and_dock_exe)
 
-    grid_bench_mocs = qt6.compile_moc(
-      headers: [
-        'src/studio/grid/virtualized_grid_widget.hpp',
-        'src/studio/grid/hover_preview_controller.hpp',
-      ],
-      include_directories: studio_inc_dirs,
-      dependencies: qt6_dep,
-    )
-
     benchmark_grid_virtualization_exe = executable('benchmark_grid_virtualization',
       'tests/benchmark_grid_virtualization.cpp',
-      'src/studio/grid/fuzzy_catalog_index.cpp',
-      'src/studio/grid/gpu_texture_pool.cpp',
-      'src/studio/grid/hover_preview_controller.cpp',
-      'src/studio/grid/virtualized_grid_widget.cpp',
-      grid_bench_mocs,
       include_directories: studio_inc_dirs,
-      dependencies: studio_deps,
+      dependencies: [waywal_studio_dep],
     )
     test('benchmark_grid_virtualization', benchmark_grid_virtualization_exe, timeout: 60, is_parallel: false)
   endif

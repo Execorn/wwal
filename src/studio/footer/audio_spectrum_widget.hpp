@@ -34,7 +34,7 @@ namespace wwal::studio {
 class AudioSpectrumWidget : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     static constexpr size_t NumBands = 64;
 
     explicit AudioSpectrumWidget(QWidget *parent = nullptr);
@@ -48,13 +48,8 @@ public:
     /**
      * @brief Direct update of raw audio data.
      */
-    void updateAudioData(const float bands[NumBands],
-                         float rmsLevel,
-                         float beatPulse,
-                         bool beatOnset,
-                         bool audioActive,
-                         bool pipewireActive,
-                         bool muteOnAudio,
+    void updateAudioData(const float bands[NumBands], float rmsLevel, float beatPulse,
+                         bool beatOnset, bool audioActive, bool pipewireActive, bool muteOnAudio,
                          float audioVolume);
 
     [[nodiscard]] float sensitivityGain() const noexcept { return m_sensitivityGain; }
@@ -77,26 +72,26 @@ public:
      */
     static float barkToHz(float bark) noexcept;
 
-public Q_SLOTS:
+  public Q_SLOTS:
     void setSensitivityGain(float gain);
     void setMuteOnAudio(bool enabled);
 
-Q_SIGNALS:
+  Q_SIGNALS:
     void sensitivityGainChanged(float gain);
     void muteOnAudioToggled(bool enabled);
 
-protected:
+  protected:
     void paintEvent(QPaintEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void leaveEvent(QEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
 
-private Q_SLOTS:
+  private Q_SLOTS:
     void onPhysicsTick();
     void onGainSliderChanged(int value);
     void onMuteCheckToggled(bool checked);
 
-private:
+  private:
     void setupUi();
     void stepPhysics(float dt);
     void renderSpectrumBars(class QPainter &painter, const QRectF &rect);

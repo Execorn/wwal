@@ -28,8 +28,7 @@ namespace waywal::studio {
 /* BezierCurveCanvas Implementation                                         */
 /* ========================================================================= */
 
-BezierCurveCanvas::BezierCurveCanvas(QWidget *parent)
-    : QWidget(parent)
+BezierCurveCanvas::BezierCurveCanvas(QWidget *parent) : QWidget(parent)
 {
     setMinimumSize(100, 60);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -68,10 +67,7 @@ void BezierCurveCanvas::setCurve(const bezier_curve_t &curve)
     update();
 }
 
-void BezierCurveCanvas::setDurationMs(uint32_t ms)
-{
-    m_durationMs = std::max(100u, ms);
-}
+void BezierCurveCanvas::setDurationMs(uint32_t ms) { m_durationMs = std::max(100u, ms); }
 
 void BezierCurveCanvas::setAnimationFps(uint32_t fps)
 {
@@ -214,15 +210,18 @@ void BezierCurveCanvas::paintEvent(QPaintEvent *event)
     painter.setFont(font);
 
     painter.setPen(QColor(137, 180, 250));
-    const qreal p1Lx = std::clamp((m_curve.p1y <= m_curve.p1x + 0.1f) ? (ptP1.x() + 8.0) : (ptP1.x() - 20.0),
-                                  4.0, static_cast<qreal>(width() - 22));
-    const qreal p1Ly = std::clamp((m_curve.p1y <= m_curve.p1x + 0.1f) ? (ptP1.y() + 1.0) : (ptP1.y() - 13.0),
-                                  2.0, static_cast<qreal>(height() - 13));
+    const qreal p1Lx =
+        std::clamp((m_curve.p1y <= m_curve.p1x + 0.1f) ? (ptP1.x() + 8.0) : (ptP1.x() - 20.0), 4.0,
+                   static_cast<qreal>(width() - 22));
+    const qreal p1Ly =
+        std::clamp((m_curve.p1y <= m_curve.p1x + 0.1f) ? (ptP1.y() + 1.0) : (ptP1.y() - 13.0), 2.0,
+                   static_cast<qreal>(height() - 13));
     painter.drawText(QRectF(p1Lx, p1Ly, 22, 12), Qt::AlignLeft | Qt::AlignVCenter, "P1");
 
     painter.setPen(QColor(243, 139, 168));
-    const qreal p2Lx = std::clamp((ptP2.x() >= 28.0 && m_curve.p2y >= m_curve.p2x) ? (ptP2.x() - 19.0) : (ptP2.x() + 8.0),
-                                  4.0, static_cast<qreal>(width() - 22));
+    const qreal p2Lx = std::clamp(
+        (ptP2.x() >= 28.0 && m_curve.p2y >= m_curve.p2x) ? (ptP2.x() - 19.0) : (ptP2.x() + 8.0),
+        4.0, static_cast<qreal>(width() - 22));
     const qreal p2Ly = std::clamp((m_curve.p2y >= 0.85f) ? (ptP2.y() - 14.0) : (ptP2.y() - 6.0),
                                   1.0, static_cast<qreal>(height() - 13));
     painter.drawText(QRectF(p2Lx, p2Ly, 22, 12), Qt::AlignLeft | Qt::AlignVCenter, "P2");
@@ -292,8 +291,7 @@ void BezierCurveCanvas::mouseReleaseEvent(QMouseEvent *event)
 /* EasingRunnerTrack Implementation                                          */
 /* ========================================================================= */
 
-EasingRunnerTrack::EasingRunnerTrack(QWidget *parent)
-    : QWidget(parent)
+EasingRunnerTrack::EasingRunnerTrack(QWidget *parent) : QWidget(parent)
 {
     setFixedHeight(14);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
@@ -324,7 +322,8 @@ void EasingRunnerTrack::paintEvent(QPaintEvent *event)
     // Runner block position
     const qreal runnerW = 16.0;
     qreal availW = std::max(1.0, trackRect.width() - runnerW);
-    qreal rx = trackRect.left() + std::clamp(static_cast<qreal>(m_easedProgress), 0.0, 1.0) * availW;
+    qreal rx =
+        trackRect.left() + std::clamp(static_cast<qreal>(m_easedProgress), 0.0, 1.0) * availW;
     QRectF runnerRect(rx, trackRect.top() + 2, runnerW, trackRect.height() - 4);
 
     // Glow effect
@@ -341,8 +340,7 @@ void EasingRunnerTrack::paintEvent(QPaintEvent *event)
 /* CubicBezierEditorWidget Implementation                                    */
 /* ========================================================================= */
 
-CubicBezierEditorWidget::CubicBezierEditorWidget(QWidget *parent)
-    : QWidget(parent)
+CubicBezierEditorWidget::CubicBezierEditorWidget(QWidget *parent) : QWidget(parent)
 {
     setMinimumSize(200, 115);
     setupUi();
@@ -368,8 +366,10 @@ void CubicBezierEditorWidget::setupUi()
     m_runnerTrack = new EasingRunnerTrack(this);
     leftCol->addWidget(m_runnerTrack);
 
-    connect(m_canvas, &BezierCurveCanvas::curveModified, this, &CubicBezierEditorWidget::onCanvasCurveChanged);
-    connect(m_canvas, &BezierCurveCanvas::animationTick, m_runnerTrack, &EasingRunnerTrack::updateProgress);
+    connect(m_canvas, &BezierCurveCanvas::curveModified, this,
+            &CubicBezierEditorWidget::onCanvasCurveChanged);
+    connect(m_canvas, &BezierCurveCanvas::animationTick, m_runnerTrack,
+            &EasingRunnerTrack::updateProgress);
 
     // Preset buttons in a compact 2x3 grid so they never force wide horizontal size
     auto *presetsGrid = new QGridLayout();
@@ -379,11 +379,10 @@ void CubicBezierEditorWidget::setupUi()
     auto makePresetBtn = [this](const QString &text) {
         auto *btn = new QPushButton(text, this);
         btn->setFixedHeight(17);
-        btn->setStyleSheet(
-            "QPushButton { background: #313244; color: #cdd6f4; border-radius: 3px; padding: 0px 4px; font-weight: 600; font-size: 9px; }"
-            "QPushButton:hover { background: #45475a; color: #89b4fa; }"
-            "QPushButton:pressed { background: #585b70; }"
-        );
+        btn->setStyleSheet("QPushButton { background: #313244; color: #cdd6f4; border-radius: 3px; "
+                           "padding: 0px 4px; font-weight: 600; font-size: 9px; }"
+                           "QPushButton:hover { background: #45475a; color: #89b4fa; }"
+                           "QPushButton:pressed { background: #585b70; }");
         return btn;
     };
 
@@ -426,8 +425,8 @@ void CubicBezierEditorWidget::setupUi()
     const QString groupStyle = QStringLiteral(
         "QGroupBox { font-weight: bold; font-size: 9px; color: #cdd6f4; border: 1px solid #313244; "
         "border-radius: 4px; margin-top: 4px; padding-top: 3px; } "
-        "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 6px; padding: 0 3px; }"
-    );
+        "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 6px; "
+        "padding: 0 3px; }");
     const QString labelStyle = QStringLiteral("font-size: 9px; color: #bac2de; padding: 0px;");
 
     auto makeParamLabel = [&labelStyle](const QString &text, QWidget *parentWidget) {
@@ -450,7 +449,9 @@ void CubicBezierEditorWidget::setupUi()
         spin->setDecimals(2);
         spin->setFixedHeight(16);
         spin->setMinimumWidth(44);
-        spin->setStyleSheet("QDoubleSpinBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; border-radius: 3px; padding: 0px 2px; font-size: 8.5px; }");
+        spin->setStyleSheet(
+            "QDoubleSpinBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; "
+            "border-radius: 3px; padding: 0px 2px; font-size: 8.5px; }");
         return spin;
     };
 
@@ -473,15 +474,20 @@ void CubicBezierEditorWidget::setupUi()
     m_cssReadoutLabel->setMinimumWidth(80);
     m_cssReadoutLabel->setFixedHeight(13);
     m_cssReadoutLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-    m_cssReadoutLabel->setStyleSheet("color: #89b4fa; font-family: monospace; font-size: 8.5px; padding: 0px;");
+    m_cssReadoutLabel->setStyleSheet(
+        "color: #89b4fa; font-family: monospace; font-size: 8.5px; padding: 0px;");
     coordsLayout->addWidget(m_cssReadoutLabel, 2, 0, 1, 4);
 
     rightLayout->addWidget(coordsGroup);
 
-    connect(m_spinP1x, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CubicBezierEditorWidget::onSpinBoxesCurveChanged);
-    connect(m_spinP1y, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CubicBezierEditorWidget::onSpinBoxesCurveChanged);
-    connect(m_spinP2x, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CubicBezierEditorWidget::onSpinBoxesCurveChanged);
-    connect(m_spinP2y, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CubicBezierEditorWidget::onSpinBoxesCurveChanged);
+    connect(m_spinP1x, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onSpinBoxesCurveChanged);
+    connect(m_spinP1y, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onSpinBoxesCurveChanged);
+    connect(m_spinP2x, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onSpinBoxesCurveChanged);
+    connect(m_spinP2y, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onSpinBoxesCurveChanged);
 
     // GPU Transition Settings panel
     auto *transGroup = new QGroupBox("GPU Transition && Dynamics", rightContainer);
@@ -493,32 +499,36 @@ void CubicBezierEditorWidget::setupUi()
     m_comboTransitionType = new QComboBox(transGroup);
     m_comboTransitionType->setFixedHeight(16);
     m_comboTransitionType->setMinimumWidth(80);
-    m_comboTransitionType->setStyleSheet("QComboBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; border-radius: 3px; padding: 0px 4px; font-size: 8.5px; } QComboBox::drop-down { border: none; }");
+    m_comboTransitionType->setStyleSheet(
+        "QComboBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; "
+        "border-radius: 3px; padding: 0px 4px; font-size: 8.5px; } QComboBox::drop-down { border: "
+        "none; }");
 
-    const struct { int type; const char *name; } transitions[] = {
-        { WAYWAL_TRANSITION_NONE,       "0: None (Instant Cut)" },
-        { WAYWAL_TRANSITION_SIMPLE,     "1: Simple Cut" },
-        { WAYWAL_TRANSITION_FADE,       "2: Fade (Crossfade)" },
-        { WAYWAL_TRANSITION_WIPE,       "3: Directional Wipe" },
-        { WAYWAL_TRANSITION_GROW,       "4: Grow / Expand" },
-        { WAYWAL_TRANSITION_OUTER,      "5: Outer Reveal" },
-        { WAYWAL_TRANSITION_WAVE,       "6: Wave Dissolve" },
-        { WAYWAL_TRANSITION_NOISE,      "7: Perlin Noise" },
-        { WAYWAL_TRANSITION_CROSSZOOM,  "8: Cross Zoom" },
-        { WAYWAL_TRANSITION_SLIDE,      "9: Smooth Slide" },
-        { WAYWAL_TRANSITION_GLITCH,     "10: Digital Glitch" },
-        { WAYWAL_TRANSITION_BURN,       "11: Color Burn" },
-        { WAYWAL_TRANSITION_RIPPLE,     "12: Water Ripple" },
-        { WAYWAL_TRANSITION_PIXELATE,   "13: Pixelate" },
-        { WAYWAL_TRANSITION_DOOM,       "14: Doom Melt" },
-        { WAYWAL_TRANSITION_SWIRL,      "15: Vortex Swirl" },
-        { WAYWAL_TRANSITION_CUBE,       "16: 3D Cube Flip" },
-        { WAYWAL_TRANSITION_LUMA,       "17: Luma Mask" },
-        { WAYWAL_TRANSITION_LIGHT_LEAK, "18: Light Leak" },
-        { WAYWAL_TRANSITION_PAGE_CURL,  "19: Page Curl" },
-        { WAYWAL_TRANSITION_CUSTOM,     "20: Custom Shader" },
-        { WAYWAL_TRANSITION_RANDOM,     "21: Random Transition" }
-    };
+    const struct {
+        int type;
+        const char *name;
+    } transitions[] = {{WAYWAL_TRANSITION_NONE, "0: None (Instant Cut)"},
+                       {WAYWAL_TRANSITION_SIMPLE, "1: Simple Cut"},
+                       {WAYWAL_TRANSITION_FADE, "2: Fade (Crossfade)"},
+                       {WAYWAL_TRANSITION_WIPE, "3: Directional Wipe"},
+                       {WAYWAL_TRANSITION_GROW, "4: Grow / Expand"},
+                       {WAYWAL_TRANSITION_OUTER, "5: Outer Reveal"},
+                       {WAYWAL_TRANSITION_WAVE, "6: Wave Dissolve"},
+                       {WAYWAL_TRANSITION_NOISE, "7: Perlin Noise"},
+                       {WAYWAL_TRANSITION_CROSSZOOM, "8: Cross Zoom"},
+                       {WAYWAL_TRANSITION_SLIDE, "9: Smooth Slide"},
+                       {WAYWAL_TRANSITION_GLITCH, "10: Digital Glitch"},
+                       {WAYWAL_TRANSITION_BURN, "11: Color Burn"},
+                       {WAYWAL_TRANSITION_RIPPLE, "12: Water Ripple"},
+                       {WAYWAL_TRANSITION_PIXELATE, "13: Pixelate"},
+                       {WAYWAL_TRANSITION_DOOM, "14: Doom Melt"},
+                       {WAYWAL_TRANSITION_SWIRL, "15: Vortex Swirl"},
+                       {WAYWAL_TRANSITION_CUBE, "16: 3D Cube Flip"},
+                       {WAYWAL_TRANSITION_LUMA, "17: Luma Mask"},
+                       {WAYWAL_TRANSITION_LIGHT_LEAK, "18: Light Leak"},
+                       {WAYWAL_TRANSITION_PAGE_CURL, "19: Page Curl"},
+                       {WAYWAL_TRANSITION_CUSTOM, "20: Custom Shader"},
+                       {WAYWAL_TRANSITION_RANDOM, "21: Random Transition"}};
 
     for (const auto &t : transitions) {
         m_comboTransitionType->addItem(t.name, t.type);
@@ -533,7 +543,9 @@ void CubicBezierEditorWidget::setupUi()
     m_spinDuration->setSuffix(" ms");
     m_spinDuration->setFixedHeight(16);
     m_spinDuration->setMinimumWidth(50);
-    m_spinDuration->setStyleSheet("QSpinBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; border-radius: 3px; padding: 0px 2px; font-size: 8.5px; }");
+    m_spinDuration->setStyleSheet(
+        "QSpinBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; border-radius: "
+        "3px; padding: 0px 2px; font-size: 8.5px; }");
 
     m_sliderDuration = new QSlider(Qt::Horizontal, transGroup);
     m_sliderDuration->setFixedHeight(14);
@@ -563,7 +575,8 @@ void CubicBezierEditorWidget::setupUi()
     m_spinFps->setSuffix(" Hz");
     m_spinFps->setFixedHeight(16);
     m_spinFps->setMinimumWidth(50);
-    m_spinFps->setStyleSheet("QSpinBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; border-radius: 3px; padding: 0px 2px; font-size: 8.5px; }");
+    m_spinFps->setStyleSheet("QSpinBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid "
+                             "#313244; border-radius: 3px; padding: 0px 2px; font-size: 8.5px; }");
 
     m_spinWaveFreq = makeDoubleSpin(transGroup, 0.1, 50.0, 0.5);
     m_spinWaveAmp = makeDoubleSpin(transGroup, 0.0, 1.0, 0.02);
@@ -592,16 +605,24 @@ void CubicBezierEditorWidget::setupUi()
     rootLayout->addWidget(rightScroll, 7);
 
     // Connect transition controls
-    connect(m_comboTransitionType, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &CubicBezierEditorWidget::onTransitionTypeChanged);
-    connect(m_spinDuration, QOverload<int>::of(&QSpinBox::valueChanged), this, &CubicBezierEditorWidget::onDurationChanged);
+    connect(m_comboTransitionType, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            &CubicBezierEditorWidget::onTransitionTypeChanged);
+    connect(m_spinDuration, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onDurationChanged);
     connect(m_sliderDuration, &QSlider::valueChanged, m_spinDuration, &QSpinBox::setValue);
-    connect(m_spinFps, QOverload<int>::of(&QSpinBox::valueChanged), this, &CubicBezierEditorWidget::onFpsChanged);
-    connect(m_spinAngle, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CubicBezierEditorWidget::onAngleChanged);
+    connect(m_spinFps, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onFpsChanged);
+    connect(m_spinAngle, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onAngleChanged);
     connect(m_sliderAngle, &QSlider::valueChanged, [this](int val) { m_spinAngle->setValue(val); });
-    connect(m_spinWaveFreq, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CubicBezierEditorWidget::onWaveFreqChanged);
-    connect(m_spinWaveAmp, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CubicBezierEditorWidget::onWaveAmpChanged);
-    connect(m_spinCenterX, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CubicBezierEditorWidget::onCenterChanged);
-    connect(m_spinCenterY, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CubicBezierEditorWidget::onCenterChanged);
+    connect(m_spinWaveFreq, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onWaveFreqChanged);
+    connect(m_spinWaveAmp, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onWaveAmpChanged);
+    connect(m_spinCenterX, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onCenterChanged);
+    connect(m_spinCenterY, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            &CubicBezierEditorWidget::onCenterChanged);
 }
 
 void CubicBezierEditorWidget::updateUiFromConfig()
@@ -651,22 +672,21 @@ void CubicBezierEditorWidget::setCurve(const bezier_curve_t &curve, bool dispatc
 
     if (dispatchCommand && m_commandBus) {
         auto cmd = std::make_unique<SetBezierCurveCommand>(
-            "all",
-            oldCurve,
-            m_config.bezier,
+            "all", oldCurve, m_config.bezier,
             [this](const QString &output, const bezier_curve_t &c) {
                 (void)output;
                 setCurve(c, false);
-            }
-        );
+            });
         m_commandBus->execute(std::move(cmd));
     }
 
-    emit curveChanged(m_config.bezier.p1x, m_config.bezier.p1y, m_config.bezier.p2x, m_config.bezier.p2y);
+    emit curveChanged(m_config.bezier.p1x, m_config.bezier.p1y, m_config.bezier.p2x,
+                      m_config.bezier.p2y);
     emit transitionConfigChanged(m_config);
 }
 
-void CubicBezierEditorWidget::setCurve(float p1x, float p1y, float p2x, float p2y, bool dispatchCommand)
+void CubicBezierEditorWidget::setCurve(float p1x, float p1y, float p2x, float p2y,
+                                       bool dispatchCommand)
 {
     setCurve(bezier_create(p1x, p1y, p2x, p2y), dispatchCommand);
 }
@@ -700,7 +720,8 @@ void CubicBezierEditorWidget::setTransitionConfig(const TransitionConfig &config
     emit transitionConfigChanged(m_config);
 }
 
-void CubicBezierEditorWidget::onCanvasCurveChanged(float p1x, float p1y, float p2x, float p2y, bool isInteractive)
+void CubicBezierEditorWidget::onCanvasCurveChanged(float p1x, float p1y, float p2x, float p2y,
+                                                   bool isInteractive)
 {
     bezier_curve_t oldCurve = m_config.bezier;
     m_config.bezier = bezier_create(p1x, p1y, p2x, p2y);
@@ -721,14 +742,11 @@ void CubicBezierEditorWidget::onCanvasCurveChanged(float p1x, float p1y, float p
     // Drag coalescing with CommandBus
     if (m_commandBus) {
         auto cmd = std::make_unique<SetBezierCurveCommand>(
-            "all",
-            oldCurve,
-            m_config.bezier,
+            "all", oldCurve, m_config.bezier,
             [this](const QString &output, const bezier_curve_t &c) {
                 (void)output;
                 setCurve(c, false);
-            }
-        );
+            });
         m_commandBus->execute(std::move(cmd));
     }
 
@@ -740,7 +758,8 @@ void CubicBezierEditorWidget::onCanvasCurveChanged(float p1x, float p1y, float p
 
 void CubicBezierEditorWidget::onSpinBoxesCurveChanged()
 {
-    if (m_updatingUi) return;
+    if (m_updatingUi)
+        return;
 
     float p1x = static_cast<float>(m_spinP1x->value());
     float p1y = static_cast<float>(m_spinP1y->value());
@@ -752,14 +771,16 @@ void CubicBezierEditorWidget::onSpinBoxesCurveChanged()
 
 void CubicBezierEditorWidget::onTransitionTypeChanged(int index)
 {
-    if (m_updatingUi) return;
+    if (m_updatingUi)
+        return;
     m_config.type = static_cast<uint32_t>(m_comboTransitionType->itemData(index).toInt());
     emit transitionConfigChanged(m_config);
 }
 
 void CubicBezierEditorWidget::onDurationChanged(int val)
 {
-    if (m_updatingUi) return;
+    if (m_updatingUi)
+        return;
     m_config.durationMs = static_cast<uint32_t>(val);
     m_sliderDuration->setValue(val);
     m_canvas->setDurationMs(m_config.durationMs);
@@ -768,7 +789,8 @@ void CubicBezierEditorWidget::onDurationChanged(int val)
 
 void CubicBezierEditorWidget::onFpsChanged(int val)
 {
-    if (m_updatingUi) return;
+    if (m_updatingUi)
+        return;
     m_config.fps = static_cast<uint32_t>(val);
     m_canvas->setAnimationFps(m_config.fps);
     emit transitionConfigChanged(m_config);
@@ -776,7 +798,8 @@ void CubicBezierEditorWidget::onFpsChanged(int val)
 
 void CubicBezierEditorWidget::onAngleChanged(double val)
 {
-    if (m_updatingUi) return;
+    if (m_updatingUi)
+        return;
     m_config.angleDeg = static_cast<float>(val);
     m_sliderAngle->setValue(static_cast<int>(val));
     emit transitionConfigChanged(m_config);
@@ -784,21 +807,24 @@ void CubicBezierEditorWidget::onAngleChanged(double val)
 
 void CubicBezierEditorWidget::onWaveFreqChanged(double val)
 {
-    if (m_updatingUi) return;
+    if (m_updatingUi)
+        return;
     m_config.waveFreq = static_cast<float>(val);
     emit transitionConfigChanged(m_config);
 }
 
 void CubicBezierEditorWidget::onWaveAmpChanged(double val)
 {
-    if (m_updatingUi) return;
+    if (m_updatingUi)
+        return;
     m_config.waveAmp = static_cast<float>(val);
     emit transitionConfigChanged(m_config);
 }
 
 void CubicBezierEditorWidget::onCenterChanged()
 {
-    if (m_updatingUi) return;
+    if (m_updatingUi)
+        return;
     m_config.centerX = static_cast<float>(m_spinCenterX->value());
     m_config.centerY = static_cast<float>(m_spinCenterY->value());
     emit transitionConfigChanged(m_config);

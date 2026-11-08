@@ -32,7 +32,7 @@ namespace waywal::studio {
 class ColorSwatchChip : public QFrame {
     Q_OBJECT
 
-public:
+  public:
     ColorSwatchChip(const QString &tokenName, const color_rgba_t &color, QWidget *parent = nullptr);
     ~ColorSwatchChip() override = default;
 
@@ -41,13 +41,13 @@ public:
     [[nodiscard]] QString hexString() const { return m_hexString; }
     [[nodiscard]] color_rgba_t colorRgba() const { return m_color; }
 
-Q_SIGNALS:
+  Q_SIGNALS:
     void copiedToClipboard(const QString &name, const QString &hex);
 
-protected:
+  protected:
     void mousePressEvent(QMouseEvent *event) override;
 
-private:
+  private:
     void refreshUi();
 
     QString m_tokenName;
@@ -65,13 +65,13 @@ private:
 class WcagBadgeWidget : public QFrame {
     Q_OBJECT
 
-public:
+  public:
     explicit WcagBadgeWidget(const QString &pairName, QWidget *parent = nullptr);
     ~WcagBadgeWidget() override = default;
 
     void updateRatio(const color_rgba_t &fg, const color_rgba_t &bg);
 
-private:
+  private:
     static double relativeLuminance(const color_rgba_t &c);
     static double computeContrastRatio(const color_rgba_t &fg, const color_rgba_t &bg);
 
@@ -97,7 +97,7 @@ private:
 class ThemeStudioWidget : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit ThemeStudioWidget(QWidget *parent = nullptr);
     ~ThemeStudioWidget() override = default;
 
@@ -110,7 +110,7 @@ public:
     [[nodiscard]] float contrast() const { return m_contrast; }
     [[nodiscard]] uint8_t seedIndex() const { return m_seedIndex; }
 
-public Q_SLOTS:
+  public Q_SLOTS:
     void reextract();
     void setThemeMode(waywal_theme_mode_t mode);
     void setAutoSolarSchedule(bool enabled);
@@ -121,7 +121,7 @@ public Q_SLOTS:
     void clearCustomSeed();
     void openWallpaperDialog();
 
-Q_SIGNALS:
+  Q_SIGNALS:
     void paletteChanged(const waywal_palette_t &palette);
     void modeChanged(waywal_theme_mode_t mode);
     void variantChanged(waywal_scheme_variant_t variant);
@@ -129,14 +129,14 @@ Q_SIGNALS:
     void seedIndexChanged(uint8_t index);
     void statusMessageRequested(const QString &msg);
 
-protected:
+  protected:
     void resizeEvent(QResizeEvent *event) override;
 
-private Q_SLOTS:
+  private Q_SLOTS:
     void onSolarTimerTick();
     void onSwatchCopied(const QString &name, const QString &hex);
 
-private:
+  private:
     void setupUi();
     void setupControlsCard(QVBoxLayout *parentLayout);
     void setupWcagBadgesCard(QVBoxLayout *parentLayout);

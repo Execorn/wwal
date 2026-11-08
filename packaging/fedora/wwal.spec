@@ -1,5 +1,5 @@
 Name:           wwal
-Version:        1.1.0
+Version:        1.2.0
 Release:        1%{?dist}
 Summary:        Zero-copy Wayland wallpaper, VA-API video, Shadertoy, and Material You engine
 
@@ -54,6 +54,7 @@ procedural shader presets.
 %build
 %meson \
     -Dtests=false \
+    -Dstudio=disabled \
     -Denable_vaapi=true \
     -Denable_io_uring=true \
     -Denable_simd=true \

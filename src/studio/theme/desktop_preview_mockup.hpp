@@ -27,7 +27,7 @@ namespace waywal::studio {
 class DesktopPreviewMockup : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit DesktopPreviewMockup(QWidget *parent = nullptr);
     ~DesktopPreviewMockup() override = default;
 
@@ -44,14 +44,14 @@ public:
     [[nodiscard]] QSize sizeHint() const override;
     [[nodiscard]] QSize minimumSizeHint() const override;
 
-public Q_SLOTS:
+  public Q_SLOTS:
     void toggleLockscreenPreview();
 
-protected:
+  protected:
     void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
 
-private:
+  private:
     void ensureWallpaperValid();
     void updateBlurredWallpaper();
 

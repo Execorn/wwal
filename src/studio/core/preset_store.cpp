@@ -19,11 +19,13 @@ namespace waywal::studio {
 /* ========================================================================= */
 
 PresetStore::PresetStore(QString baseDir, QObject *parent)
-    : QObject(parent), m_baseDir(std::move(baseDir)) {
+    : QObject(parent), m_baseDir(std::move(baseDir))
+{
     ensureDirectoryExists();
 }
 
-QString PresetStore::sanitizeId(const QString &id) {
+QString PresetStore::sanitizeId(const QString &id)
+{
     if (id.isEmpty()) {
         return QStringLiteral("default");
     }
@@ -34,7 +36,8 @@ QString PresetStore::sanitizeId(const QString &id) {
     return sanitized;
 }
 
-QString PresetStore::presetDirectory() const {
+QString PresetStore::presetDirectory() const
+{
     if (!m_baseDir.isEmpty()) {
         return m_baseDir;
     }
@@ -52,12 +55,14 @@ QString PresetStore::presetDirectory() const {
     return QStringLiteral("/tmp/waywal/presets");
 }
 
-QString PresetStore::resolvePresetFilePath(const QString &id) const {
+QString PresetStore::resolvePresetFilePath(const QString &id) const
+{
     QString safeId = sanitizeId(id);
     return QDir(presetDirectory()).filePath(safeId + QStringLiteral(".toml"));
 }
 
-void PresetStore::ensureDirectoryExists() const {
+void PresetStore::ensureDirectoryExists() const
+{
     QString dirPath = presetDirectory();
     QDir dir(dirPath);
     if (!dir.exists()) {
@@ -65,11 +70,13 @@ void PresetStore::ensureDirectoryExists() const {
     }
 }
 
-bool PresetStore::hasPreset(const QString &id) const {
+bool PresetStore::hasPreset(const QString &id) const
+{
     return QFile::exists(resolvePresetFilePath(id));
 }
 
-QStringList PresetStore::listPresetIds() const {
+QStringList PresetStore::listPresetIds() const
+{
     QDir dir(presetDirectory());
     if (!dir.exists()) {
         return {};
@@ -87,7 +94,8 @@ QStringList PresetStore::listPresetIds() const {
     return ids;
 }
 
-QList<WallpaperPreset> PresetStore::listAllPresets() const {
+QList<WallpaperPreset> PresetStore::listAllPresets() const
+{
     QStringList ids = listPresetIds();
     QList<WallpaperPreset> presets;
     presets.reserve(ids.size());
@@ -101,7 +109,8 @@ QList<WallpaperPreset> PresetStore::listAllPresets() const {
     return presets;
 }
 
-bool PresetStore::deletePreset(const QString &id) {
+bool PresetStore::deletePreset(const QString &id)
+{
     QString path = resolvePresetFilePath(id);
     if (!QFile::exists(path)) {
         return false;
@@ -116,7 +125,8 @@ bool PresetStore::deletePreset(const QString &id) {
     return false;
 }
 
-bool PresetStore::savePreset(const WallpaperPreset &preset) {
+bool PresetStore::savePreset(const WallpaperPreset &preset)
+{
     ensureDirectoryExists();
     QString targetPath = resolvePresetFilePath(preset.id);
 
@@ -141,8 +151,7 @@ bool PresetStore::savePreset(const WallpaperPreset &preset) {
     out << "duration_ms = " << preset.transitionDurationMs << "\n";
     out << "fps = " << preset.transitionFps << "\n";
     out << "has_custom_bezier = " << (preset.hasCustomBezier ? "true" : "false") << "\n";
-    out << "bezier = ["
-        << QString::number(preset.bezier.p1x, 'f', 4) << ", "
+    out << "bezier = [" << QString::number(preset.bezier.p1x, 'f', 4) << ", "
         << QString::number(preset.bezier.p1y, 'f', 4) << ", "
         << QString::number(preset.bezier.p2x, 'f', 4) << ", "
         << QString::number(preset.bezier.p2y, 'f', 4) << "]\n\n";
@@ -171,20 +180,17 @@ bool PresetStore::savePreset(const WallpaperPreset &preset) {
                 out << name << " = " << (uval.boolVal ? "true" : "false") << "\n";
                 break;
             case UniformValue::Type::Vec2:
-                out << name << " = ["
-                    << QString::number(uval.floats[0], 'f', 6) << ", "
+                out << name << " = [" << QString::number(uval.floats[0], 'f', 6) << ", "
                     << QString::number(uval.floats[1], 'f', 6) << "]\n";
                 break;
             case UniformValue::Type::Vec3:
-                out << name << " = ["
-                    << QString::number(uval.floats[0], 'f', 6) << ", "
+                out << name << " = [" << QString::number(uval.floats[0], 'f', 6) << ", "
                     << QString::number(uval.floats[1], 'f', 6) << ", "
                     << QString::number(uval.floats[2], 'f', 6) << "]\n";
                 break;
             case UniformValue::Type::Vec4:
             case UniformValue::Type::Color:
-                out << name << " = ["
-                    << QString::number(uval.floats[0], 'f', 6) << ", "
+                out << name << " = [" << QString::number(uval.floats[0], 'f', 6) << ", "
                     << QString::number(uval.floats[1], 'f', 6) << ", "
                     << QString::number(uval.floats[2], 'f', 6) << ", "
                     << QString::number(uval.floats[3], 'f', 6) << "]\n";
@@ -214,7 +220,8 @@ bool PresetStore::savePreset(const WallpaperPreset &preset) {
     return true;
 }
 
-static std::vector<float> parseNumberArray(const QString &valStr) {
+static std::vector<float> parseNumberArray(const QString &valStr)
+{
     std::vector<float> nums;
     QString trimmed = valStr.trimmed();
     if (trimmed.startsWith(QLatin1Char('[')) && trimmed.endsWith(QLatin1Char(']'))) {
@@ -232,7 +239,8 @@ static std::vector<float> parseNumberArray(const QString &valStr) {
     return nums;
 }
 
-bool PresetStore::loadPreset(const QString &id, WallpaperPreset &outPreset) {
+bool PresetStore::loadPreset(const QString &id, WallpaperPreset &outPreset)
+{
     QString path = resolvePresetFilePath(id);
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -288,7 +296,8 @@ bool PresetStore::loadPreset(const QString &id, WallpaperPreset &outPreset) {
             } else if (key == QStringLiteral("fps")) {
                 preset.transitionFps = val.toUInt();
             } else if (key == QStringLiteral("has_custom_bezier")) {
-                preset.hasCustomBezier = (val.toLower() == QStringLiteral("true") || val == QStringLiteral("1"));
+                preset.hasCustomBezier =
+                    (val.toLower() == QStringLiteral("true") || val == QStringLiteral("1"));
             } else if (key == QStringLiteral("bezier")) {
                 std::vector<float> b = parseNumberArray(val);
                 if (b.size() >= 4) {
@@ -300,7 +309,8 @@ bool PresetStore::loadPreset(const QString &id, WallpaperPreset &outPreset) {
             if (key == QStringLiteral("battery_policy")) {
                 preset.batteryPolicy = unquoted;
             } else if (key == QStringLiteral("mute_on_audio")) {
-                preset.muteOnAudio = (val.toLower() == QStringLiteral("true") || val == QStringLiteral("1"));
+                preset.muteOnAudio =
+                    (val.toLower() == QStringLiteral("true") || val == QStringLiteral("1"));
             } else if (key == QStringLiteral("volume")) {
                 preset.volume = val.toFloat();
             }
@@ -310,7 +320,8 @@ bool PresetStore::loadPreset(const QString &id, WallpaperPreset &outPreset) {
             } else if (key == QStringLiteral("crop_gravity_y")) {
                 preset.cropGravityY = val.toFloat();
             } else if (key == QStringLiteral("has_crop_gravity")) {
-                preset.hasCropGravity = (val.toLower() == QStringLiteral("true") || val == QStringLiteral("1"));
+                preset.hasCropGravity =
+                    (val.toLower() == QStringLiteral("true") || val == QStringLiteral("1"));
             }
         } else if (currentSection == QStringLiteral("uniforms")) {
             if (val.startsWith(QLatin1Char('['))) {
@@ -322,13 +333,17 @@ bool PresetStore::loadPreset(const QString &id, WallpaperPreset &outPreset) {
                 } else if (nums.size() == 3) {
                     preset.uniforms[key] = UniformValue::fromVec3(nums[0], nums[1], nums[2]);
                 } else if (nums.size() >= 4) {
-                    preset.uniforms[key] = UniformValue::fromVec4(nums[0], nums[1], nums[2], nums[3]);
+                    preset.uniforms[key] =
+                        UniformValue::fromVec4(nums[0], nums[1], nums[2], nums[3]);
                 }
-            } else if (val.toLower() == QStringLiteral("true") || val.toLower() == QStringLiteral("false")) {
-                preset.uniforms[key] = UniformValue::fromBool(val.toLower() == QStringLiteral("true"));
+            } else if (val.toLower() == QStringLiteral("true") ||
+                       val.toLower() == QStringLiteral("false")) {
+                preset.uniforms[key] =
+                    UniformValue::fromBool(val.toLower() == QStringLiteral("true"));
             } else if (val.startsWith(QLatin1Char('"')) || val.startsWith(QLatin1Char('\''))) {
                 preset.uniforms[key] = UniformValue::fromString(unquoted);
-            } else if (val.contains(QLatin1Char('.')) || val.contains(QLatin1Char('e')) || val.contains(QLatin1Char('E'))) {
+            } else if (val.contains(QLatin1Char('.')) || val.contains(QLatin1Char('e')) ||
+                       val.contains(QLatin1Char('E'))) {
                 preset.uniforms[key] = UniformValue::fromFloat(val.toFloat());
             } else {
                 bool isInt = false;

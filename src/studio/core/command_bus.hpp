@@ -22,14 +22,15 @@ namespace waywal::studio {
 /* ========================================================================= */
 
 class ICommand {
-public:
+  public:
     virtual ~ICommand() = default;
 
     virtual void execute() = 0;
     virtual void undo() = 0;
     virtual void redo() { execute(); }
     virtual QString describe() const = 0;
-    virtual bool mergeWith(const ICommand *other) {
+    virtual bool mergeWith(const ICommand *other)
+    {
         (void)other;
         return false;
     }
@@ -42,7 +43,7 @@ public:
 class CommandBus : public QObject {
     Q_OBJECT
 
-public:
+  public:
     explicit CommandBus(size_t maxHistory = 1000, QObject *parent = nullptr);
     ~CommandBus() override = default;
 
@@ -59,11 +60,12 @@ public:
     [[nodiscard]] size_t redoCount() const;
     [[nodiscard]] size_t maxHistory() const { return m_maxHistory; }
 
-signals:
-    void historyChanged(bool canUndo, bool canRedo, const QString &undoText, const QString &redoText);
+  signals:
+    void historyChanged(bool canUndo, bool canRedo, const QString &undoText,
+                        const QString &redoText);
     void stateChanged();
 
-private:
+  private:
     void notifyHistoryChanged();
 
     std::deque<std::unique_ptr<ICommand>> m_undoStack;
@@ -76,18 +78,12 @@ private:
 /* ========================================================================= */
 
 class SetUniformCommand : public ICommand {
-public:
-    using ApplyFunction = std::function<void(const QString &output,
-                                             const QString &name,
-                                             const float *vals,
-                                             uint32_t count,
-                                             uint32_t flags)>;
+  public:
+    using ApplyFunction = std::function<void(const QString &output, const QString &name,
+                                             const float *vals, uint32_t count, uint32_t flags)>;
 
-    SetUniformCommand(QString output,
-                      QString uniformName,
-                      std::vector<float> oldValues,
-                      std::vector<float> newValues,
-                      uint32_t flags = 0,
+    SetUniformCommand(QString output, QString uniformName, std::vector<float> oldValues,
+                      std::vector<float> newValues, uint32_t flags = 0,
                       ApplyFunction applyFunc = nullptr);
 
     void execute() override;
@@ -100,7 +96,7 @@ public:
     [[nodiscard]] const std::vector<float> &oldValues() const { return m_oldValues; }
     [[nodiscard]] const std::vector<float> &newValues() const { return m_newValues; }
 
-private:
+  private:
     QString m_output;
     QString m_uniformName;
     std::vector<float> m_oldValues;
@@ -111,12 +107,10 @@ private:
 };
 
 class SetBezierCurveCommand : public ICommand {
-public:
+  public:
     using ApplyFunction = std::function<void(const QString &output, const bezier_curve_t &curve)>;
 
-    SetBezierCurveCommand(QString output,
-                          bezier_curve_t oldCurve,
-                          bezier_curve_t newCurve,
+    SetBezierCurveCommand(QString output, bezier_curve_t oldCurve, bezier_curve_t newCurve,
                           ApplyFunction applyFunc = nullptr);
 
     void execute() override;
@@ -128,7 +122,7 @@ public:
     [[nodiscard]] const bezier_curve_t &oldCurve() const { return m_oldCurve; }
     [[nodiscard]] const bezier_curve_t &newCurve() const { return m_newCurve; }
 
-private:
+  private:
     QString m_output;
     bezier_curve_t m_oldCurve{};
     bezier_curve_t m_newCurve{};
@@ -137,16 +131,12 @@ private:
 };
 
 class ApplyWallpaperCommand : public ICommand {
-public:
-    using ApplyFunction = std::function<void(const QString &output,
-                                             const waywal_img_metadata_t &meta,
-                                             const QString &path)>;
+  public:
+    using ApplyFunction = std::function<void(
+        const QString &output, const waywal_img_metadata_t &meta, const QString &path)>;
 
-    ApplyWallpaperCommand(QString output,
-                          waywal_img_metadata_t oldMeta,
-                          waywal_img_metadata_t newMeta,
-                          QString oldPath,
-                          QString newPath,
+    ApplyWallpaperCommand(QString output, waywal_img_metadata_t oldMeta,
+                          waywal_img_metadata_t newMeta, QString oldPath, QString newPath,
                           ApplyFunction applyFunc = nullptr);
 
     void execute() override;
@@ -157,7 +147,7 @@ public:
     [[nodiscard]] const QString &newPath() const { return m_newPath; }
     [[nodiscard]] const QString &oldPath() const { return m_oldPath; }
 
-private:
+  private:
     QString m_output;
     waywal_img_metadata_t m_oldMeta{};
     waywal_img_metadata_t m_newMeta{};
@@ -167,11 +157,10 @@ private:
 };
 
 class SetPowerPolicyCommand : public ICommand {
-public:
+  public:
     using ApplyFunction = std::function<void(uint32_t policy)>;
 
-    SetPowerPolicyCommand(uint32_t oldPolicy,
-                          uint32_t newPolicy,
+    SetPowerPolicyCommand(uint32_t oldPolicy, uint32_t newPolicy,
                           ApplyFunction applyFunc = nullptr);
 
     void execute() override;
@@ -181,7 +170,7 @@ public:
     [[nodiscard]] uint32_t oldPolicy() const { return m_oldPolicy; }
     [[nodiscard]] uint32_t newPolicy() const { return m_newPolicy; }
 
-private:
+  private:
     uint32_t m_oldPolicy{0};
     uint32_t m_newPolicy{0};
     ApplyFunction m_applyFunc;

@@ -42,7 +42,7 @@ struct TemplateTargetDescriptor {
 class TemplateExporter : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit TemplateExporter(QWidget *parent = nullptr);
     ~TemplateExporter() override = default;
 
@@ -65,25 +65,29 @@ public:
     static const QVector<TemplateTargetDescriptor> &targetDescriptors();
 
     // Export operations
-    static QString resolveDestination(const QString &relPath, const QString &overrideBaseDir = QString());
-    static bool atomicWrite(const QString &targetPath, const QString &content, QString *errorOut = nullptr);
+    static QString resolveDestination(const QString &relPath,
+                                      const QString &overrideBaseDir = QString());
+    static bool atomicWrite(const QString &targetPath, const QString &content,
+                            QString *errorOut = nullptr);
 
-    bool exportTarget(TemplateTargetId id, const QString &overrideBaseDir = QString(), QString *errorOut = nullptr);
-    int exportSelected(const QString &overrideBaseDir = QString(), QStringList *errorsOut = nullptr);
+    bool exportTarget(TemplateTargetId id, const QString &overrideBaseDir = QString(),
+                      QString *errorOut = nullptr);
+    int exportSelected(const QString &overrideBaseDir = QString(),
+                       QStringList *errorsOut = nullptr);
     int exportAll(const QString &overrideBaseDir = QString(), QStringList *errorsOut = nullptr);
 
     [[nodiscard]] bool isTargetEnabled(TemplateTargetId id) const;
     void setTargetEnabled(TemplateTargetId id, bool enabled);
 
-Q_SIGNALS:
+  Q_SIGNALS:
     void exportCompleted(int successCount, int totalCount, const QString &statusMessage);
 
-public Q_SLOTS:
+  public Q_SLOTS:
     void exportSelectedNow();
     void selectAll();
     void deselectAll();
 
-private:
+  private:
     void setupUi();
 
     static QString hexRgb(const color_rgba_t &c);

@@ -22,11 +22,11 @@ namespace wwal::studio {
 class HoverPreviewController : public QObject {
     Q_OBJECT
 
-public:
+  public:
     static constexpr uint32_t PREVIEW_WIDTH = 384;
     static constexpr uint32_t PREVIEW_HEIGHT = 216;
-    static constexpr int DWELL_TIMEOUT_MS = 250; // 250 ms dwell trigger
-    static constexpr int FRAME_INTERVAL_MS = 33; // 30 FPS (~33.3 ms)
+    static constexpr int DWELL_TIMEOUT_MS = 250;        // 250 ms dwell trigger
+    static constexpr int FRAME_INTERVAL_MS = 33;        // 30 FPS (~33.3 ms)
     static constexpr int MAX_VIDEO_PREVIEW_SECONDS = 4; // First 4 seconds
 
     explicit HoverPreviewController(QObject *parent = nullptr);
@@ -40,26 +40,29 @@ public:
     void destroyGl(QOpenGLExtraFunctions *gl);
 
     // Grid Hover Interaction Handlers
-    void onCellHoverEntered(uint32_t item_id, const std::string &path,
-                            WallpaperBadge badge, const std::string &preview_path = "");
+    void onCellHoverEntered(uint32_t item_id, const std::string &path, WallpaperBadge badge,
+                            const std::string &preview_path = "");
     void onCellHoverExited(uint32_t item_id);
     void stop();
 
     [[nodiscard]] bool isPreviewActive() const noexcept { return m_previewActive; }
     [[nodiscard]] uint32_t activeItemId() const noexcept { return m_activeItemId; }
     [[nodiscard]] GLuint previewTextureId() const noexcept { return m_previewTexId; }
-    [[nodiscard]] const QImage &currentPreviewImage() const noexcept { return m_currentPreviewImage; }
+    [[nodiscard]] const QImage &currentPreviewImage() const noexcept
+    {
+        return m_currentPreviewImage;
+    }
 
-signals:
+  signals:
     void previewStarted(uint32_t item_id);
     void previewFrameReady(uint32_t item_id, GLuint texture_id);
     void previewStopped(uint32_t item_id);
 
-private slots:
+  private slots:
     void onDwellTimeout();
     void onPlaybackTick();
 
-private:
+  private:
     QOpenGLExtraFunctions *m_gl{nullptr};
     GLuint m_previewTexId{0};
     GLuint m_shaderFbo{0};

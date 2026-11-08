@@ -10,10 +10,14 @@ namespace waywal::studio {
 /* ========================================================================= */
 
 CommandBus::CommandBus(size_t maxHistory, QObject *parent)
-    : QObject(parent), m_maxHistory(maxHistory > 0 ? maxHistory : 1000) {}
+    : QObject(parent), m_maxHistory(maxHistory > 0 ? maxHistory : 1000)
+{
+}
 
-void CommandBus::execute(std::unique_ptr<ICommand> cmd) {
-    if (!cmd) return;
+void CommandBus::execute(std::unique_ptr<ICommand> cmd)
+{
+    if (!cmd)
+        return;
 
     if (!m_undoStack.empty() && m_undoStack.back()->mergeWith(cmd.get())) {
         // Coalesced micro-drag action (e.g. continuous slider or bezier drag)
@@ -35,8 +39,10 @@ void CommandBus::execute(std::unique_ptr<ICommand> cmd) {
     emit stateChanged();
 }
 
-void CommandBus::undo() {
-    if (m_undoStack.empty()) return;
+void CommandBus::undo()
+{
+    if (m_undoStack.empty())
+        return;
 
     auto cmd = std::move(m_undoStack.back());
     m_undoStack.pop_back();
@@ -48,8 +54,10 @@ void CommandBus::undo() {
     emit stateChanged();
 }
 
-void CommandBus::redo() {
-    if (m_redoStack.empty()) return;
+void CommandBus::redo()
+{
+    if (m_redoStack.empty())
+        return;
 
     auto cmd = std::move(m_redoStack.back());
     m_redoStack.pop_back();
@@ -61,40 +69,38 @@ void CommandBus::redo() {
     emit stateChanged();
 }
 
-void CommandBus::clear() {
+void CommandBus::clear()
+{
     m_undoStack.clear();
     m_redoStack.clear();
     notifyHistoryChanged();
     emit stateChanged();
 }
 
-bool CommandBus::canUndo() const {
-    return !m_undoStack.empty();
-}
+bool CommandBus::canUndo() const { return !m_undoStack.empty(); }
 
-bool CommandBus::canRedo() const {
-    return !m_redoStack.empty();
-}
+bool CommandBus::canRedo() const { return !m_redoStack.empty(); }
 
-QString CommandBus::undoText() const {
-    if (m_undoStack.empty()) return {};
+QString CommandBus::undoText() const
+{
+    if (m_undoStack.empty())
+        return {};
     return m_undoStack.back()->describe();
 }
 
-QString CommandBus::redoText() const {
-    if (m_redoStack.empty()) return {};
+QString CommandBus::redoText() const
+{
+    if (m_redoStack.empty())
+        return {};
     return m_redoStack.back()->describe();
 }
 
-size_t CommandBus::undoCount() const {
-    return m_undoStack.size();
-}
+size_t CommandBus::undoCount() const { return m_undoStack.size(); }
 
-size_t CommandBus::redoCount() const {
-    return m_redoStack.size();
-}
+size_t CommandBus::redoCount() const { return m_redoStack.size(); }
 
-void CommandBus::notifyHistoryChanged() {
+void CommandBus::notifyHistoryChanged()
+{
     emit historyChanged(canUndo(), canRedo(), undoText(), redoText());
 }
 
@@ -102,21 +108,17 @@ void CommandBus::notifyHistoryChanged() {
 /* SetUniformCommand Implementation                                          */
 /* ========================================================================= */
 
-SetUniformCommand::SetUniformCommand(QString output,
-                                     QString uniformName,
-                                     std::vector<float> oldValues,
-                                     std::vector<float> newValues,
-                                     uint32_t flags,
-                                     ApplyFunction applyFunc)
-    : m_output(std::move(output)),
-      m_uniformName(std::move(uniformName)),
-      m_oldValues(std::move(oldValues)),
-      m_newValues(std::move(newValues)),
-      m_flags(flags),
-      m_applyFunc(std::move(applyFunc)),
-      m_timestamp(std::chrono::steady_clock::now()) {}
+SetUniformCommand::SetUniformCommand(QString output, QString uniformName,
+                                     std::vector<float> oldValues, std::vector<float> newValues,
+                                     uint32_t flags, ApplyFunction applyFunc)
+    : m_output(std::move(output)), m_uniformName(std::move(uniformName)),
+      m_oldValues(std::move(oldValues)), m_newValues(std::move(newValues)), m_flags(flags),
+      m_applyFunc(std::move(applyFunc)), m_timestamp(std::chrono::steady_clock::now())
+{
+}
 
-void SetUniformCommand::execute() {
+void SetUniformCommand::execute()
+{
     if (m_applyFunc) {
         m_applyFunc(m_output, m_uniformName, m_newValues.data(),
                     static_cast<uint32_t>(m_newValues.size()), m_flags);
@@ -127,7 +129,8 @@ void SetUniformCommand::execute() {
     }
 }
 
-void SetUniformCommand::undo() {
+void SetUniformCommand::undo()
+{
     if (m_applyFunc) {
         m_applyFunc(m_output, m_uniformName, m_oldValues.data(),
                     static_cast<uint32_t>(m_oldValues.size()), m_flags);
@@ -138,23 +141,27 @@ void SetUniformCommand::undo() {
     }
 }
 
-QString SetUniformCommand::describe() const {
+QString SetUniformCommand::describe() const
+{
     if (m_output.isEmpty()) {
         return QString("Set uniform '%1'").arg(m_uniformName);
     }
     return QString("Set uniform '%1' on %2").arg(m_uniformName, m_output);
 }
 
-bool SetUniformCommand::mergeWith(const ICommand *other) {
+bool SetUniformCommand::mergeWith(const ICommand *other)
+{
     const auto *otherCmd = dynamic_cast<const SetUniformCommand *>(other);
-    if (!otherCmd) return false;
+    if (!otherCmd)
+        return false;
 
     if (m_output != otherCmd->m_output || m_uniformName != otherCmd->m_uniformName) {
         return false;
     }
 
-    auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(
-        otherCmd->m_timestamp - m_timestamp).count();
+    auto diff =
+        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
+            .count();
 
     // Coalesce continuous slider/color micro-drags within 500 ms into a single undo step
     if (diff < 0 || diff > 500) {
@@ -171,45 +178,48 @@ bool SetUniformCommand::mergeWith(const ICommand *other) {
 /* SetBezierCurveCommand Implementation                                      */
 /* ========================================================================= */
 
-SetBezierCurveCommand::SetBezierCurveCommand(QString output,
-                                             bezier_curve_t oldCurve,
-                                             bezier_curve_t newCurve,
-                                             ApplyFunction applyFunc)
-    : m_output(std::move(output)),
-      m_oldCurve(oldCurve),
-      m_newCurve(newCurve),
-      m_applyFunc(std::move(applyFunc)),
-      m_timestamp(std::chrono::steady_clock::now()) {}
+SetBezierCurveCommand::SetBezierCurveCommand(QString output, bezier_curve_t oldCurve,
+                                             bezier_curve_t newCurve, ApplyFunction applyFunc)
+    : m_output(std::move(output)), m_oldCurve(oldCurve), m_newCurve(newCurve),
+      m_applyFunc(std::move(applyFunc)), m_timestamp(std::chrono::steady_clock::now())
+{
+}
 
-void SetBezierCurveCommand::execute() {
+void SetBezierCurveCommand::execute()
+{
     if (m_applyFunc) {
         m_applyFunc(m_output, m_newCurve);
     }
 }
 
-void SetBezierCurveCommand::undo() {
+void SetBezierCurveCommand::undo()
+{
     if (m_applyFunc) {
         m_applyFunc(m_output, m_oldCurve);
     }
 }
 
-QString SetBezierCurveCommand::describe() const {
+QString SetBezierCurveCommand::describe() const
+{
     if (m_output.isEmpty()) {
         return QString("Adjust Cubic-Bézier easing curve");
     }
     return QString("Adjust Cubic-Bézier easing curve on %1").arg(m_output);
 }
 
-bool SetBezierCurveCommand::mergeWith(const ICommand *other) {
+bool SetBezierCurveCommand::mergeWith(const ICommand *other)
+{
     const auto *otherCmd = dynamic_cast<const SetBezierCurveCommand *>(other);
-    if (!otherCmd) return false;
+    if (!otherCmd)
+        return false;
 
     if (m_output != otherCmd->m_output) {
         return false;
     }
 
-    auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(
-        otherCmd->m_timestamp - m_timestamp).count();
+    auto diff =
+        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
+            .count();
 
     if (diff < 0 || diff > 500) {
         return false;
@@ -224,20 +234,17 @@ bool SetBezierCurveCommand::mergeWith(const ICommand *other) {
 /* ApplyWallpaperCommand Implementation                                      */
 /* ========================================================================= */
 
-ApplyWallpaperCommand::ApplyWallpaperCommand(QString output,
-                                             waywal_img_metadata_t oldMeta,
-                                             waywal_img_metadata_t newMeta,
-                                             QString oldPath,
-                                             QString newPath,
-                                             ApplyFunction applyFunc)
-    : m_output(std::move(output)),
-      m_oldMeta(oldMeta),
-      m_newMeta(newMeta),
-      m_oldPath(std::move(oldPath)),
-      m_newPath(std::move(newPath)),
-      m_applyFunc(std::move(applyFunc)) {}
+ApplyWallpaperCommand::ApplyWallpaperCommand(QString output, waywal_img_metadata_t oldMeta,
+                                             waywal_img_metadata_t newMeta, QString oldPath,
+                                             QString newPath, ApplyFunction applyFunc)
+    : m_output(std::move(output)), m_oldMeta(oldMeta), m_newMeta(newMeta),
+      m_oldPath(std::move(oldPath)), m_newPath(std::move(newPath)),
+      m_applyFunc(std::move(applyFunc))
+{
+}
 
-void ApplyWallpaperCommand::execute() {
+void ApplyWallpaperCommand::execute()
+{
     if (m_applyFunc) {
         m_applyFunc(m_output, m_newMeta, m_newPath);
     } else if (auto *ipc = Services::instance().ipcClient()) {
@@ -245,7 +252,8 @@ void ApplyWallpaperCommand::execute() {
     }
 }
 
-void ApplyWallpaperCommand::undo() {
+void ApplyWallpaperCommand::undo()
+{
     if (m_applyFunc) {
         m_applyFunc(m_output, m_oldMeta, m_oldPath);
     } else if (auto *ipc = Services::instance().ipcClient()) {
@@ -253,7 +261,8 @@ void ApplyWallpaperCommand::undo() {
     }
 }
 
-QString ApplyWallpaperCommand::describe() const {
+QString ApplyWallpaperCommand::describe() const
+{
     QString fileName = QFileInfo(m_newPath).fileName();
     if (fileName.isEmpty()) {
         fileName = m_newPath;
@@ -268,14 +277,14 @@ QString ApplyWallpaperCommand::describe() const {
 /* SetPowerPolicyCommand Implementation                                      */
 /* ========================================================================= */
 
-SetPowerPolicyCommand::SetPowerPolicyCommand(uint32_t oldPolicy,
-                                             uint32_t newPolicy,
+SetPowerPolicyCommand::SetPowerPolicyCommand(uint32_t oldPolicy, uint32_t newPolicy,
                                              ApplyFunction applyFunc)
-    : m_oldPolicy(oldPolicy),
-      m_newPolicy(newPolicy),
-      m_applyFunc(std::move(applyFunc)) {}
+    : m_oldPolicy(oldPolicy), m_newPolicy(newPolicy), m_applyFunc(std::move(applyFunc))
+{
+}
 
-void SetPowerPolicyCommand::execute() {
+void SetPowerPolicyCommand::execute()
+{
     if (m_applyFunc) {
         m_applyFunc(m_newPolicy);
     } else if (auto *ipc = Services::instance().ipcClient()) {
@@ -283,7 +292,8 @@ void SetPowerPolicyCommand::execute() {
     }
 }
 
-void SetPowerPolicyCommand::undo() {
+void SetPowerPolicyCommand::undo()
+{
     if (m_applyFunc) {
         m_applyFunc(m_oldPolicy);
     } else if (auto *ipc = Services::instance().ipcClient()) {
@@ -291,12 +301,19 @@ void SetPowerPolicyCommand::undo() {
     }
 }
 
-QString SetPowerPolicyCommand::describe() const {
+QString SetPowerPolicyCommand::describe() const
+{
     const char *policyStr = "unknown";
     switch (m_newPolicy) {
-    case 0: policyStr = "ignore"; break;
-    case 1: policyStr = "reduce-fps"; break;
-    case 2: policyStr = "pause-video"; break;
+    case 0:
+        policyStr = "ignore";
+        break;
+    case 1:
+        policyStr = "reduce-fps";
+        break;
+    case 2:
+        policyStr = "pause-video";
+        break;
     }
     return QString("Set battery policy: %1").arg(policyStr);
 }

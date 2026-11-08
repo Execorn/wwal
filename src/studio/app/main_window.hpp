@@ -16,12 +16,12 @@ class AudioSpectrumWidget;
 class PowerGovernorWidget;
 class TelemetryHudWidget;
 class StudioFooterBar;
-}
+} // namespace wwal::studio
 
 namespace waywal::studio {
 
-using ::wwal::studio::VirtualizedGridWidget;
 using ::wwal::studio::StudioFooterBar;
+using ::wwal::studio::VirtualizedGridWidget;
 
 class DockLayoutManager;
 class CommandBus;
@@ -55,51 +55,53 @@ struct StudioOptions {
  *   - Right Dock: PropertyInspectorWidget + ThemeStudioWidget
  *   - Bottom Footer: StudioFooterBar (AudioSpectrumWidget, PowerGovernorWidget, TelemetryHudWidget)
  * - Configures dark pro-studio fusion stylesheet (Blender / DaVinci Resolve aesthetic)
- * - High-DPI fractional scaling (Qt::HighDpiScaleFactorRoundingPolicy::PassThrough for wp_fractional_scale_v1)
- * - Global shortcuts: Ctrl+Z Undo, Ctrl+Y / Ctrl+Shift+Z Redo, Ctrl+F Search Focus, Space Pause/Resume, F11 Fullscreen Preview
+ * - High-DPI fractional scaling (Qt::HighDpiScaleFactorRoundingPolicy::PassThrough for
+ * wp_fractional_scale_v1)
+ * - Global shortcuts: Ctrl+Z Undo, Ctrl+Y / Ctrl+Shift+Z Redo, Ctrl+F Search Focus, Space
+ * Pause/Resume, F11 Fullscreen Preview
  * - Headless verification check execution mode
  */
 class MainWindow : public QMainWindow {
     Q_OBJECT
 
-public:
-    explicit MainWindow(const StudioOptions& options = StudioOptions(), QWidget* parent = nullptr);
+  public:
+    explicit MainWindow(const StudioOptions &options = StudioOptions(), QWidget *parent = nullptr);
     ~MainWindow() override;
 
-    DockLayoutManager* dockLayoutManager() const { return m_layoutManager; }
-    CommandBus* commandBus() const { return m_commandBus.get(); }
-    const StudioOptions& options() const { return m_options; }
+    DockLayoutManager *dockLayoutManager() const { return m_layoutManager; }
+    CommandBus *commandBus() const { return m_commandBus.get(); }
+    const StudioOptions &options() const { return m_options; }
 
     // Direct access to core panels
-    MonitorTopologyBar* topologyBar() const { return m_topologyBar; }
-    VirtualizedGridWidget* gridWidget() const { return m_gridWidget; }
-    GpuPreviewViewport* previewViewport() const { return m_previewViewport; }
-    CubicBezierEditorWidget* bezierEditor() const { return m_bezierEditor; }
-    PropertyInspectorWidget* propertyInspector() const { return m_propertyInspector; }
-    ThemeStudioWidget* themeStudio() const { return m_themeStudio; }
-    StudioFooterBar* footerBar() const { return m_footerBar; }
+    MonitorTopologyBar *topologyBar() const { return m_topologyBar; }
+    VirtualizedGridWidget *gridWidget() const { return m_gridWidget; }
+    GpuPreviewViewport *previewViewport() const { return m_previewViewport; }
+    CubicBezierEditorWidget *bezierEditor() const { return m_bezierEditor; }
+    PropertyInspectorWidget *propertyInspector() const { return m_propertyInspector; }
+    ThemeStudioWidget *themeStudio() const { return m_themeStudio; }
+    StudioFooterBar *footerBar() const { return m_footerBar; }
 
     // Global Actions
-    QAction* undoAction() const { return m_undoAction; }
-    QAction* redoAction() const { return m_redoAction; }
-    QAction* searchFocusAction() const { return m_searchFocusAction; }
-    QAction* playPauseAction() const { return m_playPauseAction; }
-    QAction* fullscreenAction() const { return m_fullscreenAction; }
+    QAction *undoAction() const { return m_undoAction; }
+    QAction *redoAction() const { return m_redoAction; }
+    QAction *searchFocusAction() const { return m_searchFocusAction; }
+    QAction *playPauseAction() const { return m_playPauseAction; }
+    QAction *fullscreenAction() const { return m_fullscreenAction; }
 
-public slots:
+  public slots:
     void handleUndo();
     void handleRedo();
     void handleSearchFocus();
     void handlePlayPauseToggle();
     void handleFullscreenToggle();
-    void handlePerspectiveSelected(const QString& perspectiveName);
+    void handlePerspectiveSelected(const QString &perspectiveName);
     void handleResetLayout();
 
-protected:
-    void closeEvent(QCloseEvent* event) override;
-    void keyPressEvent(QKeyEvent* event) override;
+  protected:
+    void closeEvent(QCloseEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
 
-private:
+  private:
     void setupPanels();
     void setupMenuBar();
     void setupToolBar();
@@ -107,31 +109,31 @@ private:
     void applyProStudioDarkTheme();
     void wireInterPanelSignals();
     void updateCommandBusHistoryUI();
-    void applyWallpaperPath(const QString& path);
+    void applyWallpaperPath(const QString &path);
 
     StudioOptions m_options;
-    DockLayoutManager* m_layoutManager{nullptr};
+    DockLayoutManager *m_layoutManager{nullptr};
     std::unique_ptr<CommandBus> m_commandBus;
 
     // 6 Studio Dock Panels & Bars
-    MonitorTopologyBar* m_topologyBar{nullptr};
-    VirtualizedGridWidget* m_gridWidget{nullptr};
-    GpuPreviewViewport* m_previewViewport{nullptr};
-    CubicBezierEditorWidget* m_bezierEditor{nullptr};
-    PropertyInspectorWidget* m_propertyInspector{nullptr};
-    ThemeStudioWidget* m_themeStudio{nullptr};
-    StudioFooterBar* m_footerBar{nullptr};
+    MonitorTopologyBar *m_topologyBar{nullptr};
+    VirtualizedGridWidget *m_gridWidget{nullptr};
+    GpuPreviewViewport *m_previewViewport{nullptr};
+    CubicBezierEditorWidget *m_bezierEditor{nullptr};
+    PropertyInspectorWidget *m_propertyInspector{nullptr};
+    ThemeStudioWidget *m_themeStudio{nullptr};
+    StudioFooterBar *m_footerBar{nullptr};
 
     // Global Actions
-    QAction* m_undoAction{nullptr};
-    QAction* m_redoAction{nullptr};
-    QAction* m_searchFocusAction{nullptr};
-    QAction* m_playPauseAction{nullptr};
-    QAction* m_fullscreenAction{nullptr};
+    QAction *m_undoAction{nullptr};
+    QAction *m_redoAction{nullptr};
+    QAction *m_searchFocusAction{nullptr};
+    QAction *m_playPauseAction{nullptr};
+    QAction *m_fullscreenAction{nullptr};
 
     // Perspective & Status Controls
-    QComboBox* m_perspectiveCombo{nullptr};
-    QLabel* m_statusLabel{nullptr};
+    QComboBox *m_perspectiveCombo{nullptr};
+    QLabel *m_statusLabel{nullptr};
     QString m_activeWallpaperPath;
 
     bool m_isFullscreenPreview{false};

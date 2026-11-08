@@ -53,12 +53,7 @@
 
 namespace waywal::studio {
 
-enum class PreviewMode {
-    OfflineEmpty,
-    DmaBufLive,
-    InProcessImage,
-    InProcessShader
-};
+enum class PreviewMode { OfflineEmpty, DmaBufLive, InProcessImage, InProcessShader };
 
 enum class AspectRatioGuide {
     None,
@@ -91,20 +86,12 @@ struct DmaBufFrame {
     EGLSyncKHR syncFence{EGL_NO_SYNC_KHR};
 
     void closeFds() noexcept;
-    void releaseGl(EGLDisplay dpy,
-                   PFNEGLDESTROYIMAGEKHRPROC destroyImage,
+    void releaseGl(EGLDisplay dpy, PFNEGLDESTROYIMAGEKHRPROC destroyImage,
                    PFNEGLDESTROYSYNCKHRPROC destroySync) noexcept;
 };
 
 struct ShaderUniformValue {
-    enum class Type {
-        Float,
-        Vec2,
-        Vec3,
-        Vec4,
-        Int,
-        Mat4
-    };
+    enum class Type { Float, Vec2, Vec3, Vec4, Int, Mat4 };
     Type type{Type::Float};
     std::vector<float> fVals{};
     std::vector<int> iVals{};
@@ -113,7 +100,7 @@ struct ShaderUniformValue {
 class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
 
-public:
+  public:
     explicit GpuPreviewViewport(QWidget *parent = nullptr);
     ~GpuPreviewViewport() override;
 
@@ -122,8 +109,7 @@ public:
      * @brief Import DMA-BUF plane file descriptors received from wwald.
      * Takes ownership of plane_fds; closes them upon buffer rotation, destruction, or error.
      */
-    bool importDmaBufFrame(const waywal_dmabuf_frame_desc_t &desc,
-                           const int *plane_fds,
+    bool importDmaBufFrame(const waywal_dmabuf_frame_desc_t &desc, const int *plane_fds,
                            size_t num_fds);
 
     bool requestLiveDmaBuf(int socketFd, const QString &outputName = QString());
@@ -197,7 +183,7 @@ public:
     void pauseAnimation(bool pause);
     bool isAnimationPaused() const noexcept { return m_animationPaused; }
 
-signals:
+  signals:
     void applyRequested(const QString &monitorSpec);
     void monitorSelectionChanged(const QString &monitorName);
     void zoomChanged(float newZoom);
@@ -208,14 +194,14 @@ signals:
     void dmaBufFrameRendered(uint32_t width, uint32_t height, uint64_t frameCount);
     void fpsUpdated(float fps);
 
-public slots:
+  public slots:
     void onApplyClicked();
     void onResetViewClicked();
     void onToggleParallax();
     void onCycleGuides();
     void onCycleMonitors();
 
-protected:
+  protected:
     void initializeGL() override;
     void resizeGL(int w, int h) override;
     void paintGL() override;
@@ -228,7 +214,7 @@ protected:
     void wheelEvent(QWheelEvent *event) override;
     void leaveEvent(QEvent *event) override;
 
-private:
+  private:
     void resolveEglExtensions();
     void setupQuadGeometry();
     void initBlitShader();

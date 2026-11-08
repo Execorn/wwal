@@ -18,6 +18,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -26,7 +28,7 @@
 
 using namespace waywal::studio;
 
-static int runHeadlessCheck(const StudioOptions& options)
+static int runHeadlessCheck(const StudioOptions &options)
 {
     std::cout << "========================================================" << std::endl;
     std::cout << "[wwal-studio] Starting Headless Verification Suite" << std::endl;
@@ -34,7 +36,7 @@ static int runHeadlessCheck(const StudioOptions& options)
 
     // 1. Instantiate core MainWindow in offscreen mode
     MainWindow window(options);
-    DockLayoutManager* layoutMgr = window.dockLayoutManager();
+    DockLayoutManager *layoutMgr = window.dockLayoutManager();
     if (!layoutMgr) {
         std::cerr << "[-] FAILED: DockLayoutManager is null!" << std::endl;
         return 1;
@@ -43,26 +45,24 @@ static int runHeadlessCheck(const StudioOptions& options)
 
     // 2. Validate Panel Registration for all 6 panels & bars
     QStringList panelIds = layoutMgr->registeredPanelIds();
-    std::cout << "[+] Registered panels (" << panelIds.size() << "): "
-              << panelIds.join(", ").toStdString() << std::endl;
+    std::cout << "[+] Registered panels (" << panelIds.size()
+              << "): " << panelIds.join(", ").toStdString() << std::endl;
 
     const QStringList expectedPanels = {
-        QStringLiteral("Wallpapers"),
-        QStringLiteral("GpuPreviewViewport"),
-        QStringLiteral("CubicBezier"),
-        QStringLiteral("PropertyInspectorWidget"),
-        QStringLiteral("ThemeStudioWidget"),
-        QStringLiteral("MonitorTopologyBar"),
-        QStringLiteral("StudioFooterBar")
-    };
+        QStringLiteral("Wallpapers"),        QStringLiteral("GpuPreviewViewport"),
+        QStringLiteral("CubicBezier"),       QStringLiteral("PropertyInspectorWidget"),
+        QStringLiteral("ThemeStudioWidget"), QStringLiteral("MonitorTopologyBar"),
+        QStringLiteral("StudioFooterBar")};
 
-    for (const auto& expected : expectedPanels) {
+    for (const auto &expected : expectedPanels) {
         if (!panelIds.contains(expected)) {
-            std::cerr << "[-] FAILED: Panel '" << expected.toStdString() << "' is not registered!" << std::endl;
+            std::cerr << "[-] FAILED: Panel '" << expected.toStdString() << "' is not registered!"
+                      << std::endl;
             return 1;
         }
         if (!layoutMgr->dockWidget(expected)) {
-            std::cerr << "[-] FAILED: DockWidget for '" << expected.toStdString() << "' is null!" << std::endl;
+            std::cerr << "[-] FAILED: DockWidget for '" << expected.toStdString() << "' is null!"
+                      << std::endl;
             return 1;
         }
     }
@@ -70,18 +70,17 @@ static int runHeadlessCheck(const StudioOptions& options)
 
     // 3. Validate Available Perspectives
     QStringList perspectives = layoutMgr->availablePerspectives();
-    std::cout << "[+] Available perspectives: " << perspectives.join(", ").toStdString() << std::endl;
+    std::cout << "[+] Available perspectives: " << perspectives.join(", ").toStdString()
+              << std::endl;
 
     const QStringList requiredPerspectives = {
-        QStringLiteral("Default"),
-        QStringLiteral("Shader Coding"),
-        QStringLiteral("Theme Studio"),
-        QStringLiteral("Multi-Monitor")
-    };
+        QStringLiteral("Default"), QStringLiteral("Shader Coding"), QStringLiteral("Theme Studio"),
+        QStringLiteral("Multi-Monitor")};
 
-    for (const auto& req : requiredPerspectives) {
+    for (const auto &req : requiredPerspectives) {
         if (!perspectives.contains(req)) {
-            std::cerr << "[-] FAILED: Missing required perspective: " << req.toStdString() << std::endl;
+            std::cerr << "[-] FAILED: Missing required perspective: " << req.toStdString()
+                      << std::endl;
             return 1;
         }
     }
@@ -99,9 +98,10 @@ static int runHeadlessCheck(const StudioOptions& options)
     }
 
     QJsonObject perspsObj = layoutJson.value(QStringLiteral("perspectives")).toObject();
-    for (const auto& req : requiredPerspectives) {
+    for (const auto &req : requiredPerspectives) {
         if (!perspsObj.contains(req)) {
-            std::cerr << "[-] FAILED: Serialized JSON missing perspective: " << req.toStdString() << std::endl;
+            std::cerr << "[-] FAILED: Serialized JSON missing perspective: " << req.toStdString()
+                      << std::endl;
             return 1;
         }
     }
@@ -110,21 +110,23 @@ static int runHeadlessCheck(const StudioOptions& options)
     QJsonObject defTree = perspsObj.value(QStringLiteral("Default")).toObject();
     if (!defTree.contains(QStringLiteral("split_direction")) ||
         !defTree.contains(QStringLiteral("split_ratio")) ||
-        !defTree.contains(QStringLiteral("left")) ||
-        !defTree.contains(QStringLiteral("right"))) {
-        std::cerr << "[-] FAILED: 'Default' perspective root does not match expected split schema!" << std::endl;
+        !defTree.contains(QStringLiteral("left")) || !defTree.contains(QStringLiteral("right"))) {
+        std::cerr << "[-] FAILED: 'Default' perspective root does not match expected split schema!"
+                  << std::endl;
         return 1;
     }
-    std::cout << "[+] JSON layout serialization matches split tree schema with 100% fidelity." << std::endl;
+    std::cout << "[+] JSON layout serialization matches split tree schema with 100% fidelity."
+              << std::endl;
 
     // 5. Test Live Perspective Switching
-    for (const auto& name : requiredPerspectives) {
+    for (const auto &name : requiredPerspectives) {
         bool ok = layoutMgr->switchPerspective(name);
         if (!ok || layoutMgr->activePerspective() != name) {
             std::cerr << "[-] FAILED to switch to perspective: " << name.toStdString() << std::endl;
             return 1;
         }
-        std::cout << "  -> Switched to perspective: '" << name.toStdString() << "' [OK]" << std::endl;
+        std::cout << "  -> Switched to perspective: '" << name.toStdString() << "' [OK]"
+                  << std::endl;
     }
     // Switch back to Default
     layoutMgr->switchPerspective(QStringLiteral("Default"));
@@ -135,7 +137,8 @@ static int runHeadlessCheck(const StudioOptions& options)
                                .arg(QCoreApplication::applicationPid());
     bool saved = layoutMgr->saveLayoutToFile(testFilePath);
     if (!saved || !QFile::exists(testFilePath)) {
-        std::cerr << "[-] FAILED to save layout file to: " << testFilePath.toStdString() << std::endl;
+        std::cerr << "[-] FAILED to save layout file to: " << testFilePath.toStdString()
+                  << std::endl;
         return 1;
     }
 
@@ -152,19 +155,22 @@ static int runHeadlessCheck(const StudioOptions& options)
         std::cerr << "[-] FAILED: Unable to reload saved layout JSON file!" << std::endl;
         return 1;
     }
-    std::cout << "[+] File persistence round-trip ($XDG_CONFIG_HOME JSON format) passed." << std::endl;
+    std::cout << "[+] File persistence round-trip ($XDG_CONFIG_HOME JSON format) passed."
+              << std::endl;
 
     // 7. Verify Global Actions and Shortcuts
-    if (!window.undoAction() || !window.redoAction() ||
-        !window.searchFocusAction() || !window.playPauseAction() ||
-        !window.fullscreenAction()) {
+    if (!window.undoAction() || !window.redoAction() || !window.searchFocusAction() ||
+        !window.playPauseAction() || !window.fullscreenAction()) {
         std::cerr << "[-] FAILED: One or more global studio actions are null!" << std::endl;
         return 1;
     }
     std::cout << "[+] Global shortcuts and actions verified:" << std::endl;
-    std::cout << "  - Undo: " << window.undoAction()->shortcut().toString().toStdString() << std::endl;
-    std::cout << "  - Redo: " << window.redoAction()->shortcut().toString().toStdString() << std::endl;
-    std::cout << "  - Search Focus: " << window.searchFocusAction()->shortcut().toString().toStdString() << std::endl;
+    std::cout << "  - Undo: " << window.undoAction()->shortcut().toString().toStdString()
+              << std::endl;
+    std::cout << "  - Redo: " << window.redoAction()->shortcut().toString().toStdString()
+              << std::endl;
+    std::cout << "  - Search Focus: "
+              << window.searchFocusAction()->shortcut().toString().toStdString() << std::endl;
     // 8. Verify Idle RSS < 80 MB (Private Anonymous / Heap Memory)
     double rss_anon_mb = 0.0;
     double rss_total_mb = 0.0;
@@ -186,8 +192,8 @@ static int runHeadlessCheck(const StudioOptions& options)
     std::cout << "[+] Idle Memory Footprint:" << std::endl;
     std::cout << "  -> Private Anonymous / Heap RSS: " << std::fixed << std::setprecision(2)
               << rss_anon_mb << " MB (Budget: < 80.00 MB)" << std::endl;
-    std::cout << "  -> Total VmRSS (including shared OS libraries): "
-              << rss_total_mb << " MB" << std::endl;
+    std::cout << "  -> Total VmRSS (including shared OS libraries): " << rss_total_mb << " MB"
+              << std::endl;
 
     if (rss_anon_mb >= 80.0) {
         std::cerr << "[-] FAILED: Idle Private RSS exceeded 80 MB budget!" << std::endl;
@@ -197,18 +203,18 @@ static int runHeadlessCheck(const StudioOptions& options)
     // 9. Verify Realized Window Geometry, Dock Non-Overlap, & Proportional Resize Scaling
     // Populate sample/scanned catalog entries so GridGlCanvas card rendering is verified
     if (window.gridWidget()) {
-        auto& idx = window.gridWidget()->catalogIndex();
+        auto &idx = window.gridWidget()->catalogIndex();
         (void)idx.loadConfigFromFile();
         if (!options.wallpaperDirs.isEmpty()) {
             std::vector<std::string> dirs;
-            for (const auto& d : options.wallpaperDirs) {
+            for (const auto &d : options.wallpaperDirs) {
                 dirs.push_back(d.toStdString());
             }
             idx.setIncludedDirectories(dirs);
             idx.setScanSystemAndWorkshopPaths(false);
         }
         if (!options.excludeDirs.isEmpty()) {
-            for (const auto& ex : options.excludeDirs) {
+            for (const auto &ex : options.excludeDirs) {
                 idx.addExcludedDirectory(ex.toStdString());
             }
         }
@@ -227,25 +233,30 @@ static int runHeadlessCheck(const StudioOptions& options)
         QThread::msleep(15);
     }
 
-    auto* dWallpapers = layoutMgr->dockWidget(QStringLiteral("Wallpapers"));
-    auto* dPreview    = layoutMgr->dockWidget(QStringLiteral("GpuPreviewViewport"));
-    auto* dBezier     = layoutMgr->dockWidget(QStringLiteral("CubicBezier"));
-    auto* dInspector  = layoutMgr->dockWidget(QStringLiteral("PropertyInspectorWidget"));
-    auto* dTheme      = layoutMgr->dockWidget(QStringLiteral("ThemeStudioWidget"));
-    auto* dTopo       = layoutMgr->dockWidget(QStringLiteral("MonitorTopologyBar"));
-    auto* dFooter     = layoutMgr->dockWidget(QStringLiteral("StudioFooterBar"));
+    auto *dWallpapers = layoutMgr->dockWidget(QStringLiteral("Wallpapers"));
+    auto *dPreview = layoutMgr->dockWidget(QStringLiteral("GpuPreviewViewport"));
+    auto *dBezier = layoutMgr->dockWidget(QStringLiteral("CubicBezier"));
+    auto *dInspector = layoutMgr->dockWidget(QStringLiteral("PropertyInspectorWidget"));
+    auto *dTheme = layoutMgr->dockWidget(QStringLiteral("ThemeStudioWidget"));
+    auto *dTopo = layoutMgr->dockWidget(QStringLiteral("MonitorTopologyBar"));
+    auto *dFooter = layoutMgr->dockWidget(QStringLiteral("StudioFooterBar"));
 
-    std::cout << "[+] Default Perspective Geometries @ 1600x960 (initial show without post-show switchPerspective):" << std::endl;
-    for (const auto& id : expectedPanels) {
-        if (auto* d = layoutMgr->dockWidget(id)) {
+    std::cout << "[+] Default Perspective Geometries @ 1600x960 (initial show without post-show "
+                 "switchPerspective):"
+              << std::endl;
+    for (const auto &id : expectedPanels) {
+        if (auto *d = layoutMgr->dockWidget(id)) {
             QRect g = d->geometry();
-            std::cout << "  - " << id.toStdString() << ": (" << g.x() << ", " << g.y()
-                      << ", " << g.width() << "x" << g.height() << ") visible=" << d->isVisible() << std::endl;
+            std::cout << "  - " << id.toStdString() << ": (" << g.x() << ", " << g.y() << ", "
+                      << g.width() << "x" << g.height() << ") visible=" << d->isVisible()
+                      << std::endl;
         }
     }
 
     if (dWallpapers->width() < 220 || dPreview->width() < 500 || dInspector->width() < 300) {
-        std::cerr << "[-] FAILED: Default perspective columns did not scale proportionally at 1600x960!" << std::endl;
+        std::cerr
+            << "[-] FAILED: Default perspective columns did not scale proportionally at 1600x960!"
+            << std::endl;
         return 1;
     }
     if (dBezier->geometry().top() < dPreview->geometry().bottom()) {
@@ -254,7 +265,8 @@ static int runHeadlessCheck(const StudioOptions& options)
     }
     if (dWallpapers->geometry().right() > dPreview->geometry().left() ||
         dPreview->geometry().right() > dInspector->geometry().left()) {
-        std::cerr << "[-] FAILED: Horizontal dock columns overlap in Default perspective!" << std::endl;
+        std::cerr << "[-] FAILED: Horizontal dock columns overlap in Default perspective!"
+                  << std::endl;
         return 1;
     }
     if (dTopo->width() < 1500 || dFooter->width() < 1500) {
@@ -262,11 +274,13 @@ static int runHeadlessCheck(const StudioOptions& options)
         return 1;
     }
 
-    auto checkMultiTabBarsVisible = [&window](const char* contextLabel, int expectedMinTabs = 2) -> bool {
+    auto checkMultiTabBarsVisible = [&window](const char *contextLabel,
+                                              int expectedMinTabs = 2) -> bool {
         int activeTabGroups = 0;
-        const auto tabBars = window.findChildren<QTabBar*>(QString(), Qt::FindDirectChildrenOnly);
-        for (QTabBar* tb : tabBars) {
-            if (!tb) continue;
+        const auto tabBars = window.findChildren<QTabBar *>(QString(), Qt::FindDirectChildrenOnly);
+        for (QTabBar *tb : tabBars) {
+            if (!tb)
+                continue;
             if (tb->y() < 45) {
                 if (tb->isVisible()) {
                     std::cerr << "[-] FAILED (" << contextLabel << "): Parked QTabBar at ("
@@ -278,16 +292,18 @@ static int runHeadlessCheck(const StudioOptions& options)
             if (tb->count() >= expectedMinTabs) {
                 ++activeTabGroups;
                 if (!tb->isVisible() || tb->width() < 100 || tb->height() < 16) {
-                    std::cerr << "[-] FAILED (" << contextLabel << "): Multi-tab QTabBar (count="
-                              << tb->count() << ") is hidden or collapsed ("
-                              << tb->width() << "x" << tb->height() << ")!" << std::endl;
+                    std::cerr << "[-] FAILED (" << contextLabel
+                              << "): Multi-tab QTabBar (count=" << tb->count()
+                              << ") is hidden or collapsed (" << tb->width() << "x" << tb->height()
+                              << ")!" << std::endl;
                     return false;
                 }
             }
         }
         if (activeTabGroups == 0) {
-            std::cerr << "[-] FAILED (" << contextLabel << "): Expected at least 1 multi-tab QTabBar (count >= "
-                      << expectedMinTabs << ")!" << std::endl;
+            std::cerr << "[-] FAILED (" << contextLabel
+                      << "): Expected at least 1 multi-tab QTabBar (count >= " << expectedMinTabs
+                      << ")!" << std::endl;
             return false;
         }
         return true;
@@ -303,13 +319,14 @@ static int runHeadlessCheck(const StudioOptions& options)
     }
 
     // Switch active tab in right dock to Material You Theme Studio, simulate mouse release
-    // (which triggers syncLiveRatiosFromGeometry while PropertyInspectorWidget is parked offscreen),
-    // and verify QTabBar and split ratios are not corrupted!
+    // (which triggers syncLiveRatiosFromGeometry while PropertyInspectorWidget is parked
+    // offscreen), and verify QTabBar and split ratios are not corrupted!
     layoutMgr->setPanelVisible(QStringLiteral("ThemeStudioWidget"), true);
-    for (int i = 0; i < 6; ++i) QCoreApplication::processEvents();
+    for (int i = 0; i < 6; ++i)
+        QCoreApplication::processEvents();
     if (dTheme->x() <= 0 || dTheme->y() <= 0) {
-        std::cerr << "[-] FAILED: ThemeStudioWidget tab did not raise onto screen: ("
-                  << dTheme->x() << ", " << dTheme->y() << ")!" << std::endl;
+        std::cerr << "[-] FAILED: ThemeStudioWidget tab did not raise onto screen: (" << dTheme->x()
+                  << ", " << dTheme->y() << ")!" << std::endl;
         return 1;
     }
     {
@@ -317,7 +334,8 @@ static int runHeadlessCheck(const StudioOptions& options)
                               Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
         QCoreApplication::sendEvent(&window, &releaseEv);
     }
-    for (int i = 0; i < 4; ++i) QCoreApplication::processEvents();
+    for (int i = 0; i < 4; ++i)
+        QCoreApplication::processEvents();
 
     if (!checkMultiTabBarsVisible("Default 1600x960 after raising ThemeStudioWidget tab")) {
         return 1;
@@ -329,10 +347,13 @@ static int runHeadlessCheck(const StudioOptions& options)
     // Test dynamic window resize down to 1024x720 while ThemeStudioWidget is the active tab
     // (verifying that offscreen PropertyInspectorWidget did not corrupt split_ratio!)
     window.resize(1024, 720);
-    for (int i = 0; i < 8; ++i) QCoreApplication::processEvents();
+    for (int i = 0; i < 8; ++i)
+        QCoreApplication::processEvents();
 
-    if (dWallpapers->width() < 160 || dPreview->width() < 350 || dTheme->width() < 220 || dTheme->x() <= 0) {
-        std::cerr << "[-] FAILED: Dock columns collapsed at 1024x720 when ThemeStudioWidget tab is active! "
+    if (dWallpapers->width() < 160 || dPreview->width() < 350 || dTheme->width() < 220 ||
+        dTheme->x() <= 0) {
+        std::cerr << "[-] FAILED: Dock columns collapsed at 1024x720 when ThemeStudioWidget tab is "
+                     "active! "
                   << "wall=" << dWallpapers->width() << " prev=" << dPreview->width()
                   << " theme=" << dTheme->width() << " x=" << dTheme->x() << std::endl;
         return 1;
@@ -346,19 +367,22 @@ static int runHeadlessCheck(const StudioOptions& options)
 
     // Switch back to PropertyInspectorWidget tab at 1024x720 and verify QTabBar & geometry
     layoutMgr->setPanelVisible(QStringLiteral("PropertyInspectorWidget"), true);
-    for (int i = 0; i < 6; ++i) QCoreApplication::processEvents();
+    for (int i = 0; i < 6; ++i)
+        QCoreApplication::processEvents();
 
     std::cout << "[+] Default Perspective Geometries @ 1024x720:" << std::endl;
-    for (const auto& id : expectedPanels) {
-        if (auto* d = layoutMgr->dockWidget(id)) {
+    for (const auto &id : expectedPanels) {
+        if (auto *d = layoutMgr->dockWidget(id)) {
             QRect g = d->geometry();
-            std::cout << "  - " << id.toStdString() << ": (" << g.x() << ", " << g.y()
-                      << ", " << g.width() << "x" << g.height() << ") visible=" << d->isVisible() << std::endl;
+            std::cout << "  - " << id.toStdString() << ": (" << g.x() << ", " << g.y() << ", "
+                      << g.width() << "x" << g.height() << ") visible=" << d->isVisible()
+                      << std::endl;
         }
     }
 
     if (dWallpapers->width() < 160 || dPreview->width() < 350 || dInspector->width() < 220) {
-        std::cerr << "[-] FAILED: Dock columns collapsed or failed to scale at 1024x720!" << std::endl;
+        std::cerr << "[-] FAILED: Dock columns collapsed or failed to scale at 1024x720!"
+                  << std::endl;
         return 1;
     }
     if (!checkMultiTabBarsVisible("Default 1024x720 after resize")) {
@@ -369,29 +393,31 @@ static int runHeadlessCheck(const StudioOptions& options)
         window.grab().save(screenshotDir + QStringLiteral("/default_1024x720.png"));
 
         window.resize(1600, 960);
-        for (int i = 0; i < 8; ++i) QCoreApplication::processEvents();
+        for (int i = 0; i < 8; ++i)
+            QCoreApplication::processEvents();
 
         layoutMgr->switchPerspective(QStringLiteral("Shader Coding"));
-        for (int i = 0; i < 8; ++i) QCoreApplication::processEvents();
+        for (int i = 0; i < 8; ++i)
+            QCoreApplication::processEvents();
         if (!checkMultiTabBarsVisible("Shader Coding 1600x960", 3)) {
             return 1;
         }
         window.grab().save(screenshotDir + QStringLiteral("/shader_coding_1600x960.png"));
 
         layoutMgr->switchPerspective(QStringLiteral("Theme Studio"));
-        for (int i = 0; i < 8; ++i) QCoreApplication::processEvents();
+        for (int i = 0; i < 8; ++i)
+            QCoreApplication::processEvents();
         window.grab().save(screenshotDir + QStringLiteral("/theme_studio_1600x960.png"));
 
         layoutMgr->switchPerspective(QStringLiteral("Multi-Monitor"));
-        for (int i = 0; i < 8; ++i) QCoreApplication::processEvents();
+        for (int i = 0; i < 8; ++i)
+            QCoreApplication::processEvents();
         window.grab().save(screenshotDir + QStringLiteral("/multi_monitor_1600x960.png"));
 
         layoutMgr->switchPerspective(QStringLiteral("Default"));
-        for (int i = 0; i < 8; ++i) QCoreApplication::processEvents();
+        for (int i = 0; i < 8; ++i)
+            QCoreApplication::processEvents();
     }
-
-    // Persist clean default perspective state to user config
-    layoutMgr->saveLayoutToFile();
 
     window.hide();
     QCoreApplication::processEvents();
@@ -402,15 +428,87 @@ static int runHeadlessCheck(const StudioOptions& options)
     return 0;
 }
 
+static int runBenchmarkGrid(const StudioOptions & /*options*/)
+{
+    std::cout << "========================================================" << std::endl;
+    std::cout << "[wwal-studio] 144 FPS Virtualization & Search Benchmark" << std::endl;
+    std::cout << "========================================================" << std::endl;
+
+    wwal::studio::FuzzyCatalogIndex index;
+    constexpr size_t totalItems = 10000;
+    for (size_t i = 0; i < totalItems; ++i) {
+        wwal::studio::CatalogItem item;
+        item.id = static_cast<uint32_t>(i);
+        item.title = "Wallpaper Asset " + std::to_string(i + 1);
+        item.path = "/usr/share/backgrounds/wwal/wallpaper_" + std::to_string(i + 1) + ".png";
+        item.badge = static_cast<wwal::studio::WallpaperBadge>(i % 5);
+        item.file_size = 1024 * 1024 * (1 + (i % 16));
+        item.date_modified = 1700000000 + static_cast<int64_t>(i);
+        item.aspect_ratio = 16.0f / 9.0f;
+        index.addItem(std::move(item));
+    }
+
+    wwal::studio::GpuTexturePool pool(256);
+    wwal::studio::HoverPreviewController hover;
+    wwal::studio::GridGlCanvas canvas(index, pool, hover);
+
+    const int cols = canvas.computeColumns(1920);
+    const int virtualH = canvas.computeVirtualHeight(totalItems, cols);
+    constexpr int viewportH = 1080;
+    constexpr int frames = 2000;
+
+    std::vector<double> frameUs;
+    frameUs.reserve(frames);
+    for (int f = 0; f < frames; ++f) {
+        const int scrollY =
+            static_cast<int>((static_cast<double>(f) / frames) * std::max(1, virtualH - viewportH));
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto slice = canvas.computeVisibleSlice(totalItems, cols, scrollY, viewportH);
+        const auto t1 = std::chrono::steady_clock::now();
+        if (slice.is_empty || slice.index_last < slice.index_first ||
+            slice.index_last >= totalItems) {
+            std::cerr << "[-] FAILED: Invalid visible slice in scroll sweep!" << std::endl;
+            return 1;
+        }
+        frameUs.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+    }
+
+    std::sort(frameUs.begin(), frameUs.end());
+    const double p50Us = frameUs[frameUs.size() * 50 / 100];
+    const double p99Us = frameUs[frameUs.size() * 99 / 100];
+    const double searchUs = index.benchmarkSearch("wallpaper", 50);
+
+    std::cout << "[+] 10,000-item O(1) slice: p50=" << std::fixed << std::setprecision(3) << p50Us
+              << " us, p99=" << p99Us << " us (144 FPS budget: < 6940.0 us)" << std::endl;
+    std::cout << "[+] 10,000-item Myers/Bitap search: " << std::fixed << std::setprecision(1)
+              << searchUs << " us" << std::endl;
+
+    if (p99Us >= 6940.0) {
+        std::cerr << "[-] FAILED: Grid virtualization p99 exceeded 144 FPS budget!" << std::endl;
+        return 1;
+    }
+    std::cout << "========================================================" << std::endl;
+    std::cout << "[wwal-studio] Grid benchmark PASSED cleanly (code 0)." << std::endl;
+    std::cout << "========================================================" << std::endl;
+    return 0;
+}
+
 static QtMessageHandler g_prevQtMessageHandler = nullptr;
 
-static void waywalQtMessageFilter(QtMsgType type, const QMessageLogContext& context, const QString& msg)
+static void waywalQtMessageFilter(QtMsgType type, const QMessageLogContext &context,
+                                  const QString &msg)
 {
     if (context.category && std::string_view(context.category) == "qt.qpa.wayland.textinput") {
         return;
     }
     if (msg.contains(QLatin1String("QWaylandTextInputv3::disableSurface")) ||
-        (msg.contains(QLatin1String("Trying to disable")) && msg.contains(QLatin1String("is focused")))) {
+        (msg.contains(QLatin1String("Trying to disable")) &&
+         msg.contains(QLatin1String("is focused")))) {
+        return;
+    }
+    if (qEnvironmentVariable("QT_QPA_PLATFORM") == QLatin1String("offscreen") &&
+        (msg.contains(QLatin1String("QOpenGLWidget is not supported on this platform")) ||
+         msg.contains(QLatin1String("QOpenGLWidget: Failed to create context")))) {
         return;
     }
     if (g_prevQtMessageHandler) {
@@ -418,20 +516,21 @@ static void waywalQtMessageFilter(QtMsgType type, const QMessageLogContext& cont
     }
 }
 
-int main(int argc, char* argv[])
+#ifndef WAYWAL_VERSION
+#define WAYWAL_VERSION "1.2.0"
+#endif
+
+int main(int argc, char *argv[])
 {
     g_prevQtMessageHandler = qInstallMessageHandler(waywalQtMessageFilter);
     if (qEnvironmentVariableIsEmpty("QT_LOGGING_RULES")) {
-        QLoggingCategory::setFilterRules(
-            QStringLiteral("qt.qpa.wayland.textinput.warning=false\n"
-                           "qt.qpa.wayland.textinput=false")
-        );
+        QLoggingCategory::setFilterRules(QStringLiteral("qt.qpa.wayland.textinput.warning=false\n"
+                                                        "qt.qpa.wayland.textinput=false"));
     }
 
     // High-DPI fractional scaling (wp_fractional_scale_v1) MUST be configured before Q*Application
     QGuiApplication::setHighDpiScaleFactorRoundingPolicy(
-        Qt::HighDpiScaleFactorRoundingPolicy::PassThrough
-    );
+        Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
 
     // Unified OpenGL ES 3.1 surface format across all QOpenGLWidget viewports
     QSurfaceFormat fmt;
@@ -447,17 +546,19 @@ int main(int argc, char* argv[])
     fmt.setSwapInterval(0);
     QSurfaceFormat::setDefaultFormat(fmt);
 
-    // Early scan for --headless-check so we can switch to offscreen platform plugin
+    // Early scan for headless flags so we can switch to offscreen platform plugin
     bool isHeadless = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string_view(argv[i]) == "--headless-check") {
+        const std::string_view arg(argv[i]);
+        if (arg == "--headless-check" || arg == "--benchmark-grid") {
             isHeadless = true;
             break;
         }
     }
 
     // In headless environments without display servers, auto-enable offscreen platform
-    if (isHeadless || (qEnvironmentVariableIsEmpty("DISPLAY") && qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY"))) {
+    if (isHeadless || (qEnvironmentVariableIsEmpty("DISPLAY") &&
+                       qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY"))) {
         qputenv("QT_QPA_PLATFORM", "offscreen");
         qunsetenv("DISPLAY");
         qunsetenv("WAYLAND_DISPLAY");
@@ -465,60 +566,55 @@ int main(int argc, char* argv[])
 
     QApplication app(argc, argv);
     if (qEnvironmentVariableIsEmpty("QT_LOGGING_RULES")) {
-        QLoggingCategory::setFilterRules(
-            QStringLiteral("qt.qpa.wayland.textinput.warning=false\n"
-                           "qt.qpa.wayland.textinput=false")
-        );
+        QLoggingCategory::setFilterRules(QStringLiteral("qt.qpa.wayland.textinput.warning=false\n"
+                                                        "qt.qpa.wayland.textinput=false"));
     }
     app.setApplicationName(QStringLiteral("wwal-studio"));
-    app.setApplicationVersion(QStringLiteral("1.0.0"));
+    app.setApplicationVersion(QStringLiteral(WAYWAL_VERSION));
     app.setOrganizationName(QStringLiteral("waywal"));
     app.setOrganizationDomain(QStringLiteral("waywal.org"));
 
     QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("WayWal Studio — Linux Wayland Creative Wallpaper IDE"));
+    parser.setApplicationDescription(
+        QStringLiteral("WayWal Studio — Linux Wayland Creative Wallpaper IDE"));
     parser.addHelpOption();
     parser.addVersionOption();
 
     QCommandLineOption namespaceOption(
         QStringList() << QStringLiteral("n") << QStringLiteral("namespace"),
         QStringLiteral("IPC socket namespace for daemon connection (default: 'default')."),
-        QStringLiteral("name"),
-        QStringLiteral("default")
-    );
+        QStringLiteral("name"), QStringLiteral("default"));
     parser.addOption(namespaceOption);
 
     QCommandLineOption socketOption(
         QStringList() << QStringLiteral("s") << QStringLiteral("socket"),
         QStringLiteral("Direct path to wwald Unix domain socket override."),
-        QStringLiteral("path")
-    );
+        QStringLiteral("path"));
     parser.addOption(socketOption);
 
     QCommandLineOption wallpaperDirOption(
         QStringList() << QStringLiteral("d") << QStringLiteral("wallpaper-dir"),
-        QStringLiteral("Wallpaper directory to scan (can be passed multiple times; overrides default folders)."),
-        QStringLiteral("dir")
-    );
+        QStringLiteral("Wallpaper directory to scan (can be passed multiple times; overrides "
+                       "default folders)."),
+        QStringLiteral("dir"));
     parser.addOption(wallpaperDirOption);
 
     QCommandLineOption excludeDirOption(
         QStringList() << QStringLiteral("x") << QStringLiteral("exclude-dir"),
-        QStringLiteral("Folder path or folder name to exclude from wallpaper scanning (can be passed multiple times)."),
-        QStringLiteral("dir_or_name")
-    );
+        QStringLiteral("Folder path or folder name to exclude from wallpaper scanning (can be "
+                       "passed multiple times)."),
+        QStringLiteral("dir_or_name"));
     parser.addOption(excludeDirOption);
 
     QCommandLineOption benchmarkGridOption(
         QStringList() << QStringLiteral("benchmark-grid"),
-        QStringLiteral("Run automated 144 FPS virtualization scroll stress benchmark.")
-    );
+        QStringLiteral("Run automated 144 FPS virtualization scroll stress benchmark."));
     parser.addOption(benchmarkGridOption);
 
     QCommandLineOption headlessCheckOption(
         QStringList() << QStringLiteral("headless-check"),
-        QStringLiteral("Instantiate core structures, test layout serialization, and exit 0 without window.")
-    );
+        QStringLiteral(
+            "Instantiate core structures, test layout serialization, and exit 0 without window."));
     parser.addOption(headlessCheckOption);
 
     parser.process(app);
@@ -531,9 +627,11 @@ int main(int argc, char* argv[])
     options.benchmarkGrid = parser.isSet(benchmarkGridOption);
     options.headlessCheck = parser.isSet(headlessCheckOption);
 
-    // If headless-check requested, execute verification suite and return
     if (options.headlessCheck) {
         return runHeadlessCheck(options);
+    }
+    if (options.benchmarkGrid) {
+        return runBenchmarkGrid(options);
     }
 
     // Normal Interactive GUI Mode

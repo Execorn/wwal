@@ -42,13 +42,15 @@ struct TexturePoolStats {
 };
 
 class GpuTexturePool {
-public:
+  public:
     static constexpr uint32_t THUMB_WIDTH = 384;
     static constexpr uint32_t THUMB_HEIGHT = 216;
     static constexpr size_t BYTES_PER_PIXEL = 4;
-    static constexpr size_t FRAME_SIZE_BYTES = THUMB_WIDTH * THUMB_HEIGHT * BYTES_PER_PIXEL; // 331,776 bytes
-    static constexpr size_t STAGING_BUFFER_SIZE = 128 * 1024 * 1024; // 128 MB Tier 2 CPU ringbuffer
-    static constexpr size_t STAGING_SLOT_COUNT = STAGING_BUFFER_SIZE / FRAME_SIZE_BYTES; // ~404 slots
+    static constexpr size_t FRAME_SIZE_BYTES =
+        THUMB_WIDTH * THUMB_HEIGHT * BYTES_PER_PIXEL;                // 331,776 bytes
+    static constexpr size_t STAGING_BUFFER_SIZE = 128 * 1024 * 1024; // 128 MB L2 CPU ringbuffer
+    static constexpr size_t STAGING_SLOT_COUNT =
+        STAGING_BUFFER_SIZE / FRAME_SIZE_BYTES;         // ~404 slots
     static constexpr int DEFAULT_MAX_VRAM_SLOTS = 1500; // <= 1,540 slots (512 MB VRAM cap)
 
     explicit GpuTexturePool(int max_vram_slots = DEFAULT_MAX_VRAM_SLOTS);
@@ -74,8 +76,8 @@ public:
                        const std::string &preview_path = "");
 
     // Called on the UI render thread every frame (e.g., in paintGL / paintEvent).
-    // Uploads decoded frames from Tier 2 staging ringbuffer into Tier 3 VRAM via dual-PBO ping-pong.
-    // Returns number of frames uploaded this frame.
+    // Uploads decoded frames from L2 staging ringbuffer into L3 VRAM via dual-PBO
+    // ping-pong. Returns number of frames uploaded this frame.
     int processPendingUploads(QOpenGLExtraFunctions *gl, int max_uploads_per_frame = 6);
 
     [[nodiscard]] bool isTextureReady(uint32_t item_id) const;
@@ -88,7 +90,7 @@ public:
 
     [[nodiscard]] TexturePoolStats stats() const;
 
-private:
+  private:
     struct LruNode {
         uint32_t item_id{0};
         int layer_index{-1};
@@ -122,7 +124,7 @@ private:
     bool m_initialized{false};
     PboUploadQueue m_pboQueue;
 
-    // Tier 2: 128 MB Page-Aligned CPU Staging Ringbuffer
+    // L2: 128 MB Page-Aligned CPU Staging Ringbuffer
     uint8_t *m_stagingBuffer{nullptr};
     std::vector<StagingSlot> m_stagingSlots;
     std::queue<size_t> m_freeStagingSlots;
@@ -132,7 +134,7 @@ private:
     std::queue<size_t> m_uploadQueue;
     std::mutex m_uploadMutex;
 
-    // Tier 3: O(1) LRU Doubly Linked List & Hash Map
+    // L3: O(1) LRU Doubly Linked List & Hash Map
     std::unordered_map<uint32_t, LruNode *> m_itemToNode;
     std::unordered_map<int, LruNode *> m_layerToNode;
     std::vector<int> m_freeLayers;
@@ -140,7 +142,7 @@ private:
     LruNode *m_lruTail{nullptr}; // LRU
     mutable std::mutex m_lruMutex;
 
-    // Background Thread Pool (Worker threads for Tier 1 disk -> Tier 2 staging decode)
+    // Background Thread Pool (Worker threads for L1 disk -> L2 staging decode)
     std::vector<std::thread> m_workerThreads;
     std::queue<WorkerTask> m_taskQueue;
     std::mutex m_taskMutex;

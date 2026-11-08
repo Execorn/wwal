@@ -27,7 +27,7 @@ namespace wwal::studio {
 class PowerGovernorWidget : public QWidget {
     Q_OBJECT
 
-public:
+  public:
     explicit PowerGovernorWidget(QWidget *parent = nullptr);
     ~PowerGovernorWidget() override = default;
 
@@ -44,22 +44,22 @@ public:
     [[nodiscard]] bool isOnBattery() const noexcept { return m_onBattery; }
     [[nodiscard]] uint16_t globalPauseMask() const noexcept { return m_globalPauseMask; }
 
-public Q_SLOTS:
+  public Q_SLOTS:
     void setFpsCap(uint32_t fps);
     void setBatteryPolicy(waywal_battery_policy_t policy);
     void setAutoPausePolicies(bool pauseFullscreen, bool pauseMaximized, bool pauseOccluded);
 
-Q_SIGNALS:
+  Q_SIGNALS:
     void fpsCapChanged(uint32_t fps);
     void batteryPolicyChanged(waywal_battery_policy_t policy);
     void autoPauseFlagsChanged(bool pauseFullscreen, bool pauseMaximized, bool pauseOccluded);
 
-private Q_SLOTS:
+  private Q_SLOTS:
     void onFpsComboChanged(int index);
     void onBatteryPolicyComboChanged(int index);
     void onAutoPauseCheckChanged();
 
-private:
+  private:
     void setupUi();
     void updateStatusBadges();
 

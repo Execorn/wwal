@@ -26,16 +26,7 @@ namespace waywal::studio {
 /* ========================================================================= */
 
 struct UniformValue {
-    enum class Type : uint8_t {
-        Float,
-        Int,
-        Bool,
-        Vec2,
-        Vec3,
-        Vec4,
-        Color,
-        String
-    };
+    enum class Type : uint8_t { Float, Int, Bool, Vec2, Vec3, Vec4, Color, String };
 
     Type type{Type::Float};
     float floats[4]{0.0f, 0.0f, 0.0f, 0.0f};
@@ -45,14 +36,16 @@ struct UniformValue {
 
     UniformValue() = default;
 
-    static UniformValue fromFloat(float val) {
+    static UniformValue fromFloat(float val)
+    {
         UniformValue v;
         v.type = Type::Float;
         v.floats[0] = val;
         return v;
     }
 
-    static UniformValue fromInt(int32_t val) {
+    static UniformValue fromInt(int32_t val)
+    {
         UniformValue v;
         v.type = Type::Int;
         v.intVal = val;
@@ -60,7 +53,8 @@ struct UniformValue {
         return v;
     }
 
-    static UniformValue fromBool(bool val) {
+    static UniformValue fromBool(bool val)
+    {
         UniformValue v;
         v.type = Type::Bool;
         v.boolVal = val;
@@ -68,7 +62,8 @@ struct UniformValue {
         return v;
     }
 
-    static UniformValue fromVec2(float x, float y) {
+    static UniformValue fromVec2(float x, float y)
+    {
         UniformValue v;
         v.type = Type::Vec2;
         v.floats[0] = x;
@@ -76,7 +71,8 @@ struct UniformValue {
         return v;
     }
 
-    static UniformValue fromVec3(float x, float y, float z) {
+    static UniformValue fromVec3(float x, float y, float z)
+    {
         UniformValue v;
         v.type = Type::Vec3;
         v.floats[0] = x;
@@ -85,7 +81,8 @@ struct UniformValue {
         return v;
     }
 
-    static UniformValue fromVec4(float x, float y, float z, float w) {
+    static UniformValue fromVec4(float x, float y, float z, float w)
+    {
         UniformValue v;
         v.type = Type::Vec4;
         v.floats[0] = x;
@@ -95,7 +92,8 @@ struct UniformValue {
         return v;
     }
 
-    static UniformValue fromColor(const QColor &col) {
+    static UniformValue fromColor(const QColor &col)
+    {
         UniformValue v;
         v.type = Type::Color;
         v.floats[0] = static_cast<float>(col.redF());
@@ -106,14 +104,16 @@ struct UniformValue {
         return v;
     }
 
-    static UniformValue fromString(const QString &str) {
+    static UniformValue fromString(const QString &str)
+    {
         UniformValue v;
         v.type = Type::String;
         v.stringVal = str;
         return v;
     }
 
-    uint32_t getFloatCount() const {
+    uint32_t getFloatCount() const
+    {
         switch (type) {
         case Type::Float:
         case Type::Int:
@@ -132,8 +132,10 @@ struct UniformValue {
         return 1;
     }
 
-    bool toFloats(float *out, uint32_t &outCount) const {
-        if (!out) return false;
+    bool toFloats(float *out, uint32_t &outCount) const
+    {
+        if (!out)
+            return false;
         outCount = getFloatCount();
         for (uint32_t i = 0; i < outCount; ++i) {
             out[i] = floats[i];
@@ -141,8 +143,10 @@ struct UniformValue {
         return true;
     }
 
-    bool operator==(const UniformValue &other) const {
-        if (type != other.type) return false;
+    bool operator==(const UniformValue &other) const
+    {
+        if (type != other.type)
+            return false;
         switch (type) {
         case Type::Float:
         case Type::Vec2:
@@ -150,7 +154,8 @@ struct UniformValue {
         case Type::Vec4:
         case Type::Color:
             for (uint32_t i = 0; i < getFloatCount(); ++i) {
-                if (floats[i] != other.floats[i]) return false;
+                if (floats[i] != other.floats[i])
+                    return false;
             }
             return true;
         case Type::Int:
@@ -165,11 +170,11 @@ struct UniformValue {
 };
 
 struct OutputTopologyInfo {
-    QString name;             // e.g. "DP-1"
-    QString description;      // Monitor make/model
-    int32_t x{0};             // Compositor global X
-    int32_t y{0};             // Compositor global Y
-    uint32_t width{0};        // Pixel resolution
+    QString name;        // e.g. "DP-1"
+    QString description; // Monitor make/model
+    int32_t x{0};        // Compositor global X
+    int32_t y{0};        // Compositor global Y
+    uint32_t width{0};   // Pixel resolution
     uint32_t height{0};
     uint32_t logicalWidth{0}; // Scaled resolution
     uint32_t logicalHeight{0};
@@ -187,7 +192,7 @@ struct OutputTelemetry {
     uint32_t lastRenderUs{0};
     uint32_t vramKiB{0};
     uint8_t boStates[4]{0, 0, 0, 0}; // 0=Free, 1=Rendering, 2=Committed, 3=Locked
-    uint8_t engineKind{0};           // 0=static, 1=shader, 2=workshop, 3=video, 4=slideshow, 5=animation
+    uint8_t engineKind{0}; // 0=static, 1=shader, 2=workshop, 3=video, 4=slideshow, 5=animation
     bool isPaused{false};
     uint16_t pauseMask{0};
     uint32_t width{0};
@@ -230,12 +235,12 @@ enum class WallpaperSourceKind : uint8_t {
 };
 
 struct WallpaperCatalogEntry {
-    QString id;                    // Unique identifier (hash or path-derived)
-    QString title;                 // Human-readable title
+    QString id;    // Unique identifier (hash or path-derived)
+    QString title; // Human-readable title
     QString description;
     QString author;
-    QString filePath;              // Full absolute path
-    QString previewThumbnailPath;  // Cached WebP thumbnail path
+    QString filePath;             // Full absolute path
+    QString previewThumbnailPath; // Cached WebP thumbnail path
     WallpaperSourceKind sourceKind{WallpaperSourceKind::Image};
     uint64_t tagBitmask{0};
     uint64_t fileSizeBytes{0};
@@ -252,25 +257,28 @@ struct WallpaperCatalogEntry {
 /* ========================================================================= */
 
 class IIpcClientService {
-public:
+  public:
     virtual ~IIpcClientService() = default;
 
     virtual bool isConnected() const = 0;
-    virtual void sendSetUniform(const QString &output, const QString &name,
-                                const float *vals, uint32_t count, bool persist = false) = 0;
+    virtual void sendSetUniform(const QString &output, const QString &name, const float *vals,
+                                uint32_t count, bool persist = false) = 0;
     virtual void sendSetImage(const waywal_img_metadata_t &meta, int memfd = -1) = 0;
-    virtual void sendAudioPowerConfig(float volume, int8_t muteOnAudio,
-                                      int8_t themeFromMedia, uint8_t batteryPolicy = 0) = 0;
-    virtual void requestOutputsJson(std::function<void(const QString &json)> callback = nullptr) = 0;
-    virtual void requestTelemetry(std::function<void(const TelemetrySnapshot &snapshot)> callback = nullptr) = 0;
-    virtual void requestOutputDmabuf(const QString &output,
-                                     std::function<void(const waywal_export_dmabuf_resp_t &desc,
-                                                        const QVector<int> &fds)> callback = nullptr) = 0;
+    virtual void sendAudioPowerConfig(float volume, int8_t muteOnAudio, int8_t themeFromMedia,
+                                      uint8_t batteryPolicy = 0) = 0;
+    virtual void
+    requestOutputsJson(std::function<void(const QString &json)> callback = nullptr) = 0;
+    virtual void
+    requestTelemetry(std::function<void(const TelemetrySnapshot &snapshot)> callback = nullptr) = 0;
+    virtual void requestOutputDmabuf(
+        const QString &output,
+        std::function<void(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds)>
+            callback = nullptr) = 0;
     virtual void subscribeEvents() = 0;
 };
 
 class IVirtualizedGridService {
-public:
+  public:
     virtual ~IVirtualizedGridService() = default;
 
     virtual size_t entryCount() const = 0;
@@ -280,7 +288,7 @@ public:
 };
 
 class IThemeEngineService {
-public:
+  public:
     virtual ~IThemeEngineService() = default;
 
     virtual bool extractThemeFromImage(const QString &imagePath, bool lightMode = false) = 0;
@@ -290,7 +298,7 @@ public:
 };
 
 class IAudioTelemetryService {
-public:
+  public:
     virtual ~IAudioTelemetryService() = default;
 
     virtual TelemetrySnapshot currentTelemetry() const = 0;
@@ -305,53 +313,62 @@ public:
 /* ========================================================================= */
 
 class Services {
-public:
-    static Services &instance() {
+  public:
+    static Services &instance()
+    {
         static Services s_instance;
         return s_instance;
     }
 
-    void setIpcClient(IIpcClientService *svc) {
+    void setIpcClient(IIpcClientService *svc)
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_ipcClient = svc;
     }
 
-    IIpcClientService *ipcClient() const {
+    IIpcClientService *ipcClient() const
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_ipcClient;
     }
 
-    void setGridService(IVirtualizedGridService *svc) {
+    void setGridService(IVirtualizedGridService *svc)
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_gridService = svc;
     }
 
-    IVirtualizedGridService *gridService() const {
+    IVirtualizedGridService *gridService() const
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_gridService;
     }
 
-    void setThemeEngine(IThemeEngineService *svc) {
+    void setThemeEngine(IThemeEngineService *svc)
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_themeEngine = svc;
     }
 
-    IThemeEngineService *themeEngine() const {
+    IThemeEngineService *themeEngine() const
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_themeEngine;
     }
 
-    void setAudioTelemetry(IAudioTelemetryService *svc) {
+    void setAudioTelemetry(IAudioTelemetryService *svc)
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_audioTelemetry = svc;
     }
 
-    IAudioTelemetryService *audioTelemetry() const {
+    IAudioTelemetryService *audioTelemetry() const
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_audioTelemetry;
     }
 
-private:
+  private:
     Services() = default;
     ~Services() = default;
     Services(const Services &) = delete;
