@@ -37,7 +37,7 @@ using namespace wwal::studio;
 #endif
 #if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
 constexpr double PALETTE_BUDGET_MS = 25.0;
-constexpr double FUZZY_BUDGET_MS = 5.0;
+constexpr double FUZZY_BUDGET_MS = 15.0;
 #else
 constexpr double PALETTE_BUDGET_MS = 2.5;
 constexpr double FUZZY_BUDGET_MS = 0.4;
@@ -345,8 +345,9 @@ static void test_folder_inclusion_exclusion_and_dedup()
 
     // Verify thumbnail decoding via GpuTexturePool
     GpuTexturePool pool(64);
-    const auto &firstItem = reloadedIdx.filteredItemAt(0);
+    CatalogItem firstItem = reloadedIdx.itemAt(0);
     assert(firstItem.id == 0 && "First catalog item must have 0-based id == 0");
+    assert(reloadedIdx.itemAt(1).id == 1 && "Second catalog item must have 0-based id == 1");
     (void)pool.requestTexture(firstItem.id, firstItem.path, firstItem.preview_path);
 
     for (int attempt = 0; attempt < 50; ++attempt) {

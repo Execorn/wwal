@@ -280,8 +280,8 @@ int main(int argc, char *argv[])
     printf("[TEST] Connected to daemon socket: %s\n", sock_path);
 
     // 3. Create legacy 72-byte payload memfd
-    constexpr uint32_t test_w = 16;
-    constexpr uint32_t test_h = 16;
+    const uint32_t test_w = 16;
+    const uint32_t test_h = 16;
     int memfd = create_test_legacy_memfd(test_w, test_h);
     assert(memfd >= 0 && "create_test_legacy_memfd failed");
 
