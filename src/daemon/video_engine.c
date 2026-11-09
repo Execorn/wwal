@@ -658,17 +658,13 @@ static void reclaim_output_shm_for_video(output_node_t *out)
         for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
             dmabuf_bo_t *bo = &out->dmabuf_ring.buffers[i];
             if ((bo->gbm_bo != NULL || bo->wl_buffer != NULL) && !bo->in_use) {
-                if (out->last_presented_bo == bo) {
-                    out->last_presented_bo = NULL;
-                }
-                if (out->last_committed_ring_idx == (int)i) {
-                    out->last_committed_ring_idx = -1;
-                }
                 layer_shell_release_output_bo_refs(state, out, bo);
                 dmabuf_bo_free(bo);
             }
         }
     }
+    out->last_presented_bo = NULL;
+    out->last_committed_ring_idx = -1;
     if (state) {
         render_engine_release_upload_cache(&state->render_engine);
     }
@@ -893,34 +889,13 @@ static bool can_reuse_vaapi_decoder(vaapi_decoder_t *dec, const demuxer_t *demux
     } else if (demux->codec == WAYWAL_CODEC_VP9 || demux->codec == WAYWAL_CODEC_AV1) {
         max_refs = 8;
     }
-    uint32_t needed_surfaces;
-    if (!want_direct) {
-        if (demux->codec == WAYWAL_CODEC_VP9 || demux->codec == WAYWAL_CODEC_AV1) {
-            needed_surfaces = 9;
-        } else {
-            bool no_reorder =
-                (demux->codec == WAYWAL_CODEC_H264 && dec->cached_sps.valid &&
-                 (dec->cached_sps.profile_idc == 66 || dec->cached_sps.constraint_set1_flag != 0 ||
-                  dec->cached_sps.num_ref_frames <= 1 ||
-                  dec->cached_sps.pic_order_cnt_type == 2)) ||
-                (demux->codec == WAYWAL_CODEC_HEVC && dec->cached_hevc_sps.valid &&
-                 dec->cached_hevc_sps.sps_max_num_reorder_pics == 0);
-            uint32_t min_surf = no_reorder ? 2U : 5U;
-            needed_surfaces = max_refs + (no_reorder ? 1U : 3U);
-            if (needed_surfaces < min_surf)
-                needed_surfaces = min_surf;
-            if (needed_surfaces > 9U)
-                needed_surfaces = 9U;
-        }
-    } else {
-        needed_surfaces = max_refs + 4;
-        if (needed_surfaces < 6)
-            needed_surfaces = 6;
-    }
+    uint32_t needed_surfaces = max_refs + 6U + 4U;
+    if (needed_surfaces < 26U)
+        needed_surfaces = 26U;
     if (needed_surfaces > WAYWAL_VA_SURFACE_POOL_SIZE)
         needed_surfaces = WAYWAL_VA_SURFACE_POOL_SIZE;
 
-    return (dec->num_surfaces == needed_surfaces);
+    return (dec->num_surfaces >= needed_surfaces);
 }
 
 static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
@@ -1122,7 +1097,9 @@ static void update_combined_busy_mask(video_engine_t *ve)
     memset(ve->combined_busy_mask, 0, sizeof(ve->combined_busy_mask));
     if (!ve->decoder.has_vpp) {
         for (uint32_t i = 0; i < pool_size; ++i) {
-            if (ve->video_buffer_in_use[i] > 0) {
+            if (ve->video_buffer_in_use[i] > 0 ||
+                (ve->last_export_surf != VA_INVALID_SURFACE &&
+                 ve->decoder.surfaces[i] == ve->last_export_surf)) {
                 ve->combined_busy_mask[i] = true;
             }
         }
@@ -1153,10 +1130,13 @@ static bool reorder_has_ready_frame(video_engine_t *ve)
             }
         } else if (ve->demuxer->codec == WAYWAL_CODEC_H264) {
             if (ve->decoder.cached_sps.valid && (ve->decoder.cached_sps.profile_idc == 66 ||
-                                                 ve->decoder.cached_sps.constraint_set1_flag != 0 ||
+                                                 ve->decoder.cached_sps.constraint_set0_flag != 0 ||
                                                  ve->decoder.cached_sps.num_ref_frames <= 1 ||
                                                  ve->decoder.cached_sps.pic_order_cnt_type == 2)) {
                 target_depth = 1U;
+            } else if (ve->decoder.cached_sps.valid &&
+                       ve->decoder.cached_sps.bitstream_restriction_flag) {
+                target_depth = (uint32_t)ve->decoder.cached_sps.max_num_reorder_frames + 1U;
             } else {
                 target_depth = 4U;
             }
@@ -1165,31 +1145,7 @@ static bool reorder_has_ready_frame(video_engine_t *ve)
     if (target_depth > WAYWAL_VIDEO_REORDER_CAP - 1U) {
         target_depth = WAYWAL_VIDEO_REORDER_CAP - 1U;
     }
-    if (ve->reorder_count >= target_depth)
-        return true;
-
-    if (ve->current_gop_id > ve->next_present_gop) {
-        bool has_old_gop = false;
-        for (uint32_t i = 0; i < ve->reorder_count; ++i) {
-            if (ve->reorder_buf[i].gop_id == ve->next_present_gop) {
-                has_old_gop = true;
-                break;
-            }
-        }
-        if (has_old_gop) {
-            return true;
-        }
-        ve->next_present_gop = ve->current_gop_id;
-        ve->next_present_poc = 0;
-    }
-
-    for (uint32_t i = 0; i < ve->reorder_count; ++i) {
-        if (ve->reorder_buf[i].gop_id == ve->next_present_gop &&
-            ve->reorder_buf[i].poc <= ve->next_present_poc) {
-            return true;
-        }
-    }
-    return false;
+    return (ve->reorder_count >= target_depth);
 }
 
 void video_engine_dispatch_frame(video_engine_t *ve)
@@ -1317,6 +1273,7 @@ void video_engine_dispatch_frame(video_engine_t *ve)
         ve->current_gop_id++;
     }
 
+    bool looped_this_tick = false;
     while (!ve->eof_draining && ve->reorder_count < WAYWAL_VIDEO_REORDER_CAP) {
         if (reorder_has_ready_frame(ve)) {
             break;
@@ -1324,24 +1281,30 @@ void video_engine_dispatch_frame(video_engine_t *ve)
 
         demux_packet_t pkt;
         if (!ve->demuxer->read_packet(ve->demuxer, &pkt)) {
-            if (ve->reorder_count > 0) {
-                /* Drain remaining B-frame / reorder_buf frames in POC order before looping */
-                ve->eof_draining = true;
-                break;
-            }
-            if (ve->loop_count > 0 && ve->current_loop + 1 >= ve->loop_count) {
+            bool is_final_loop = (ve->loop_count > 0 && ve->current_loop + 1 >= ve->loop_count);
+            if (is_final_loop || looped_this_tick) {
+                if (ve->reorder_count > 0) {
+                    /* Drain remaining B-frame / reorder_buf frames in POC order before stopping */
+                    ve->eof_draining = true;
+                    break;
+                }
                 ve->current_loop++;
                 WAYWAL_LOG_INFO("Video loop count (%lu) reached, stopping playback",
                                 ve->loop_count);
                 video_engine_stop(ve);
                 return;
             }
+            looped_this_tick = true;
             ve->current_loop++;
 
             ve->demuxer->seek_us(ve->demuxer, 0);
             vaapi_decoder_reset(&ve->decoder);
             ve->current_gop_id++;
             if (!ve->demuxer->read_packet(ve->demuxer, &pkt)) {
+                if (ve->reorder_count > 0) {
+                    ve->eof_draining = true;
+                    break;
+                }
                 WAYWAL_LOG_WARN("Failed to seek to start of stream on video loop");
                 video_engine_stop(ve);
                 return;
@@ -1399,9 +1362,8 @@ void video_engine_dispatch_frame(video_engine_t *ve)
     int64_t frame_interval_ns = frame_interval_us * 1000LL;
 
     struct timespec now_ts;
-    clock_gettime(CLOCK_MONOTONIC, &now_ts);
-    int64_t now_ns = (int64_t)now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
-    int64_t target_pres_ns = now_ns + frame_interval_ns;
+    int64_t now_ns = 0;
+    int64_t target_pres_ns = 0;
 
     if (ve->reorder_count > 0) {
         uint32_t best_idx = 0;
@@ -1420,35 +1382,21 @@ void video_engine_dispatch_frame(video_engine_t *ve)
             ve->reorder_buf[best_idx] = ve->reorder_buf[ve->reorder_count];
         }
 
-        int64_t scaled_pts_ns = (int64_t)((double)(pres.pts_us * 1000LL) / speed);
-        if (ve->playback_epoch_ns == 0 || pres.loop_id != ve->presented_loop_id ||
-            pres.pts_us < ve->last_pts_us) {
-            ve->playback_epoch_ns = now_ns - scaled_pts_ns;
-            ve->presented_loop_id = pres.loop_id;
-        }
-        target_pres_ns = ve->playback_epoch_ns + scaled_pts_ns + frame_interval_ns;
-        if (target_pres_ns <= now_ns - 2 * frame_interval_ns) {
-            ve->playback_epoch_ns = now_ns - scaled_pts_ns;
-            target_pres_ns = now_ns + frame_interval_ns;
-        }
-
-        ve->last_pts_us = pres.pts_us;
-        ve->next_present_gop = pres.gop_id;
-        int32_t poc_step =
-            (ve->demuxer && ve->demuxer->codec == WAYWAL_CODEC_H264 && (pres.poc & 1) == 0) ? 2 : 1;
-        ve->next_present_poc = pres.poc + poc_step;
-
         VASurfaceID export_surf = pres.surface;
         uint32_t buf_idx = pres.surf_idx;
+        bool was_vpp_warmed_up = ve->decoder.vpp_warmed_up;
         if (ve->decoder.has_vpp) {
             uint32_t vpp_pool = ve->decoder.num_vpp_surfaces > 0 ? ve->decoder.num_vpp_surfaces
                                                                  : WAYWAL_VA_VPP_POOL_SIZE;
-            /* Select a free VPP surface not held by any attached output. */
+            /* Select a free VPP surface in round-robin order, skipping the last committed slot. */
             uint32_t vpp_idx = (ve->last_vpp_idx + 1) % vpp_pool;
             bool found_free = false;
             for (uint32_t k = 0; k < vpp_pool; ++k) {
-                if (ve->video_buffer_in_use[k] <= 0) {
-                    vpp_idx = k;
+                uint32_t cand = (ve->last_vpp_idx + 1 + k) % vpp_pool;
+                if (cand == ve->last_vpp_idx && vpp_pool > 1)
+                    continue;
+                if (ve->video_buffer_in_use[cand] <= 0) {
+                    vpp_idx = cand;
                     found_free = true;
                     break;
                 }
@@ -1458,11 +1406,12 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                  * while skipping the slot just committed in the previous frame. */
                 int min_in_use = INT_MAX;
                 for (uint32_t k = 0; k < vpp_pool; ++k) {
-                    if (k == ve->last_vpp_idx && vpp_pool > 1)
+                    uint32_t cand = (ve->last_vpp_idx + 1 + k) % vpp_pool;
+                    if (cand == ve->last_vpp_idx && vpp_pool > 1)
                         continue;
-                    if (ve->video_buffer_in_use[k] < min_in_use) {
-                        min_in_use = ve->video_buffer_in_use[k];
-                        vpp_idx = k;
+                    if (ve->video_buffer_in_use[cand] < min_in_use) {
+                        min_in_use = ve->video_buffer_in_use[cand];
+                        vpp_idx = cand;
                     }
                 }
             }
@@ -1470,6 +1419,11 @@ void video_engine_dispatch_frame(video_engine_t *ve)
             export_surf = ve->decoder.vpp_surfaces[vpp_idx];
             buf_idx = vpp_idx;
             vaapi_decoder_vpp_blit(&ve->decoder, pres.surface, export_surf);
+            if (!was_vpp_warmed_up && ve->decoder.vpp_warmed_up) {
+                ve->playback_epoch_ns = 0;
+            }
+        } else if (ve->decoder.va_display && ve->video_wl_buffers[buf_idx]) {
+            vaSyncSurface(ve->decoder.va_display, export_surf);
         }
         ve->last_export_surf = export_surf;
 
@@ -1529,31 +1483,70 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                 wl_display_flush(ve->daemon_state->display);
             }
         }
+
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        now_ns = (int64_t)now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
+
+        int64_t scaled_pts_ns = (int64_t)((double)(pres.pts_us * 1000LL) / speed);
+        if (ve->playback_epoch_ns == 0 || pres.loop_id != ve->presented_loop_id ||
+            pres.pts_us < ve->last_pts_us) {
+            ve->playback_epoch_ns = now_ns - scaled_pts_ns;
+            ve->presented_loop_id = pres.loop_id;
+        }
+        target_pres_ns = ve->playback_epoch_ns + scaled_pts_ns + frame_interval_ns;
+        if (target_pres_ns <= now_ns - 2 * frame_interval_ns) {
+            ve->playback_epoch_ns = now_ns - scaled_pts_ns;
+            target_pres_ns = now_ns + frame_interval_ns;
+        }
+
+        ve->last_pts_us = pres.pts_us;
+        ve->next_present_gop = pres.gop_id;
+        ve->next_present_poc = pres.poc + 1;
+    } else {
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        now_ns = (int64_t)now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
+        target_pres_ns = now_ns + frame_interval_ns;
     }
 
-    int64_t next_interval_ns = target_pres_ns - now_ns;
-
     if (pll_ref_out && pll_ref_out->pres_sync.pll.phase_est_ns > 0 &&
-        pll_ref_out->pres_sync.pll.period_est_ns > 0) {
+        pll_ref_out->pres_sync.pll.period_est_ns > 0 &&
+        (!pll_ref_out->pres_sync.pll.has_clock_id ||
+         pll_ref_out->pres_sync.pll.clock_id == CLOCK_MONOTONIC)) {
         int64_t next_vblank_ns = presentation_pll_predict_next_vblank(&pll_ref_out->pres_sync.pll);
         int64_t period_ns = pll_ref_out->pres_sync.pll.period_est_ns;
 
-        if (target_pres_ns >= next_vblank_ns && period_ns > 0) {
-            int64_t cycles = (target_pres_ns - next_vblank_ns + (period_ns / 2)) / period_ns;
-            if (cycles < 0)
-                cycles = 0;
-            int64_t aligned_vblank_ns = next_vblank_ns + cycles * period_ns;
+        if (period_ns > 0 && frame_interval_ns >= period_ns - (period_ns / 12)) {
+            int64_t rem = frame_interval_ns % period_ns;
+            bool harmonic = (rem <= period_ns / 12 || (period_ns - rem) <= period_ns / 12);
+            if (harmonic) {
+                int64_t lead_time_ns = period_ns / 4;
+                if (lead_time_ns < 1500000LL)
+                    lead_time_ns = 1500000LL;
+                if (lead_time_ns > 4000000LL)
+                    lead_time_ns = 4000000LL;
+                if (lead_time_ns > period_ns / 2)
+                    lead_time_ns = period_ns / 2;
 
-            int64_t lead_time_ns = period_ns / 4;
-            if (lead_time_ns > 1000000LL)
-                lead_time_ns = 1000000LL;
-            int64_t target_fire_ns = aligned_vblank_ns - lead_time_ns;
-
-            if (target_fire_ns > now_ns) {
-                next_interval_ns = target_fire_ns - now_ns;
+                int64_t desired_vblank_ns = target_pres_ns + lead_time_ns;
+                if (desired_vblank_ns >= next_vblank_ns) {
+                    int64_t cycles =
+                        (desired_vblank_ns - next_vblank_ns + (period_ns / 2)) / period_ns;
+                    if (cycles < 0)
+                        cycles = 0;
+                    int64_t aligned_vblank_ns = next_vblank_ns + cycles * period_ns;
+                    int64_t target_fire_ns = aligned_vblank_ns - lead_time_ns;
+                    int64_t phase_err = target_fire_ns - target_pres_ns;
+                    int64_t adj = phase_err / 4;
+                    if (ve->playback_epoch_ns > 0) {
+                        ve->playback_epoch_ns += adj;
+                    }
+                    target_pres_ns += adj;
+                }
             }
         }
     }
+
+    int64_t next_interval_ns = target_pres_ns - now_ns;
     if (next_interval_ns < 1000000LL)
         next_interval_ns = 1000000LL;
 

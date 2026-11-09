@@ -354,8 +354,8 @@ void OklchColorDialog::setupUi()
     // --- Mode Toolbar ---
     auto *modeBar = new QHBoxLayout();
     auto *modeLabel = new QLabel(tr("<b>Color Model:</b>"), this);
-    m_radioOklch = new QRadioButton(tr("OkLCH (Perceptual Uniform)"), this);
-    m_radioHsv = new QRadioButton(tr("HSV (Standard)"), this);
+    m_radioOklch = new QRadioButton(tr("OkLCH"), this);
+    m_radioHsv = new QRadioButton(tr("HSV"), this);
     m_radioOklch->setChecked(true);
 
     auto *modeGroup = new QButtonGroup(this);
@@ -372,11 +372,11 @@ void OklchColorDialog::setupUi()
     m_gamutWarningWidget = new QWidget(this);
     auto *gwLayout = new QHBoxLayout(m_gamutWarningWidget);
     gwLayout->setContentsMargins(0, 0, 0, 0);
-    auto *warnLabel = new QLabel(tr("⚠️ <i>Out of sRGB Gamut</i>"), m_gamutWarningWidget);
-    warnLabel->setStyleSheet("color: #e5c890; font-weight: bold;");
-    auto *btnGamutMap = new QPushButton(tr("Map to Gamut"), m_gamutWarningWidget);
-    btnGamutMap->setStyleSheet(
-        "background: #414559; color: #c6d0f5; padding: 3px 8px; border-radius: 4px;");
+    auto *warnLabel = new QLabel(tr("<i>Out of sRGB gamut</i>"), m_gamutWarningWidget);
+    warnLabel->setStyleSheet("color: #f59e0b; font-weight: bold;");
+    auto *btnGamutMap = new QPushButton(tr("Fit to Gamut"), m_gamutWarningWidget);
+    btnGamutMap->setStyleSheet("background: #20242e; color: #f1f5f9; border: 1px solid #2c3240; "
+                               "padding: 3px 8px; border-radius: 4px;");
     connect(btnGamutMap, &QPushButton::clicked, this, &OklchColorDialog::onGamutMapClicked);
     gwLayout->addWidget(warnLabel);
     gwLayout->addWidget(btnGamutMap);
@@ -443,7 +443,7 @@ void OklchColorDialog::setupUi()
 
     // Hue Slider
     auto *layoutH = new QHBoxLayout();
-    auto *lblH = new QLabel(tr("Hue (h°):"), this);
+    auto *lblH = new QLabel(tr("Hue (deg):"), this);
     lblH->setFixedWidth(95);
     m_sliderH = new QSlider(Qt::Horizontal, this);
     m_sliderH->setRange(0, 3600);
@@ -502,7 +502,7 @@ void OklchColorDialog::setupUi()
     m_swatchInitial->setCursor(Qt::PointingHandCursor);
 
     auto *btnRestore = new QToolButton(swatchGroup);
-    btnRestore->setText(tr("⟲"));
+    btnRestore->setText(tr("Reset"));
     btnRestore->setToolTip(tr("Reset to initial color"));
     connect(btnRestore, &QToolButton::clicked, this, &OklchColorDialog::onResetToInitialClicked);
 

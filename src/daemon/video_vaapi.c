@@ -148,7 +148,6 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
 
     /* Avoid eagerly faulting libnvidia-ptxjitcompiler.so (~21.5 MiB PSS) into host RAM */
     setenv("CUDA_MODULE_LOADING", "LAZY", 0);
-    setenv("CUDA_DISABLE_PERF_BOOST", "1", 0);
     /* Prevent nvidia_drv_video.so from hoarding up to 128 MiB of detached backing images */
     setenv("NVD_MAX_DETACHED_BACKING_IMAGES", "0", 0);
     setenv("NVD_MAX_DETACHED_BACKING_IMAGE_BYTES", "0", 0);
@@ -1770,7 +1769,6 @@ bool vaapi_decoder_vpp_blit(vaapi_decoder_t *dec, VASurfaceID src_surface,
          * faulting in libnvidia-ptxjitcompiler.so / libnvidia-gpucomp.so. Evict those one-shot
          * compiler pages immediately after warmup. */
         evict_cold_driver_pages();
-        malloc_trim(0);
     }
     return ok;
 }
@@ -1807,6 +1805,17 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
     if (export_mode != 0) {
         st = vaExportSurfaceHandle(dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
                                    VA_EXPORT_SURFACE_READ_ONLY | export_mode, &prime_desc);
+        if (st != VA_STATUS_SUCCESS) {
+            uint32_t alt_mode = (export_mode == VA_EXPORT_SURFACE_COMPOSED_LAYERS)
+                                    ? VA_EXPORT_SURFACE_SEPARATE_LAYERS
+                                    : VA_EXPORT_SURFACE_COMPOSED_LAYERS;
+            st = vaExportSurfaceHandle(dec->va_display, surface,
+                                       VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                       VA_EXPORT_SURFACE_READ_ONLY | alt_mode, &prime_desc);
+            if (st == VA_STATUS_SUCCESS) {
+                dec->export_layer_mode = alt_mode;
+            }
+        }
     } else {
         uint32_t preferred = (!dec->has_vpp && !dec->is_nvidia_vaapi)
                                  ? VA_EXPORT_SURFACE_COMPOSED_LAYERS

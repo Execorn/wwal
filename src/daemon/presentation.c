@@ -193,8 +193,14 @@ bool presentation_sync_init(presentation_sync_t *ps, struct wp_presentation *pre
 
 void presentation_sync_request(presentation_sync_t *ps)
 {
-    if (!ps || !ps->wp_pres || !ps->surface || ps->pending_feedback)
+    if (!ps || !ps->wp_pres || !ps->surface)
         return;
+
+    if (ps->feedback && ps->pending_feedback) {
+        wp_presentation_feedback_destroy(ps->feedback);
+        ps->feedback = NULL;
+        ps->pending_feedback = false;
+    }
 
     ps->feedback = wp_presentation_feedback(ps->wp_pres, ps->surface);
     if (ps->feedback) {

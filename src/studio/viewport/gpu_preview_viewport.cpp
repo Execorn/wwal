@@ -1501,19 +1501,19 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
     painter.drawPath(barPath);
     painter.setClipPath(barPath);
 
-    float padX = 10.0f;
-    float gap = ultraCompact ? 4.0f : 6.0f;
+    float padX = 12.0f;
+    float gap = ultraCompact ? 6.0f : 8.0f;
     float btnY = barY + 6.0f;
     float btnH = barH - 12.0f;
 
-    float wStatus = ultraCompact ? 68.0f : (compact ? 92.0f : 124.0f);
-    float wMon = ultraCompact ? 62.0f : (compact ? 82.0f : 102.0f);
-    float wApply = ultraCompact ? 68.0f : (compact ? 96.0f : 126.0f);
-    float wReset = ultraCompact ? 34.0f : 42.0f;
-    float wGuide = ultraCompact ? 42.0f : (compact ? 52.0f : 62.0f);
-    float wPara = ultraCompact ? 38.0f : 46.0f;
+    float wStatus = ultraCompact ? 68.0f : (compact ? 90.0f : 116.0f);
+    float wMon = ultraCompact ? 64.0f : (compact ? 84.0f : 104.0f);
+    float wApply = ultraCompact ? 68.0f : (compact ? 94.0f : 122.0f);
+    float wReset = ultraCompact ? 38.0f : 44.0f;
+    float wGuide = ultraCompact ? 46.0f : (compact ? 56.0f : 64.0f);
+    float wPara = ultraCompact ? 42.0f : 50.0f;
 
-    float rawSum = wStatus + wMon + wApply + wReset + wGuide + wPara + 5.0f * gap + 8.0f;
+    float rawSum = wStatus + wMon + wApply + wReset + wGuide + wPara + 5.0f * gap + 12.0f;
     float innerW = std::max(160.0f, barW - 2.0f * padX);
     float scale = std::min(1.0f, innerW / rawSum);
 
@@ -1537,10 +1537,10 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
         statusText = ultraCompact ? QStringLiteral("LIVE") : QStringLiteral("LIVE DMA-BUF");
     } else if (m_previewMode == PreviewMode::InProcessShader) {
         dotColor = QColor(6, 182, 212);
-        statusText = ultraCompact ? QStringLiteral("SHADER") : QStringLiteral("SHADER");
+        statusText = QStringLiteral("SHADER");
     } else if (m_previewMode == PreviewMode::InProcessImage) {
         dotColor = QColor(245, 158, 11);
-        statusText = ultraCompact ? QStringLiteral("IMAGE") : QStringLiteral("IMAGE");
+        statusText = QStringLiteral("IMAGE");
     }
 
     painter.setPen(Qt::NoPen);
@@ -1560,40 +1560,39 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
         statusTextRect, Qt::AlignVCenter | Qt::AlignLeft,
         fm.elidedText(statusText, Qt::ElideRight, static_cast<int>(statusTextRect.width())));
 
-    curX += wStatus + 4.0f * scale;
+    curX += wStatus + 6.0f * scale;
 
     // Vertical Divider
     painter.setPen(QPen(QColor(255, 255, 255, 25), 1.0));
     painter.drawLine(QPointF(curX, barY + 9.0f), QPointF(curX, barY + barH - 9.0f));
-    curX += 4.0f * scale;
+    curX += 6.0f * scale;
 
     // 2. Monitor Selection Button
     m_monitorBtnRect = QRectF(curX, btnY, wMon, btnH);
     bool monitorHovered = (m_hoveredButton == ActionBarButton::MonitorSelector);
     painter.setPen(
-        QPen(monitorHovered ? QColor(0, 229, 255, 120) : QColor(255, 255, 255, 25), 1.0));
-    painter.setBrush(monitorHovered ? QColor(40, 44, 56, 230) : QColor(32, 34, 42, 200));
+        QPen(monitorHovered ? QColor(56, 189, 248, 140) : QColor(255, 255, 255, 25), 1.0));
+    painter.setBrush(monitorHovered ? QColor(42, 48, 61, 230) : QColor(32, 36, 46, 210));
     painter.drawRoundedRect(m_monitorBtnRect, 5.0, 5.0);
 
     painter.setPen(QColor(220, 225, 235));
-    QString monitorText = ultraCompact ? QStringLiteral("%1 ▾").arg(m_selectedMonitor)
-                                       : QStringLiteral("🖥 %1 ▾").arg(m_selectedMonitor);
+    QString monitorText = m_selectedMonitor;
     painter.drawText(m_monitorBtnRect, Qt::AlignCenter,
-                     fm.elidedText(monitorText, Qt::ElideRight, static_cast<int>(wMon - 6.0f)));
+                     fm.elidedText(monitorText, Qt::ElideRight, static_cast<int>(wMon - 8.0f)));
     curX += wMon + gap;
 
     // 3. "Apply to Selected Monitor(s)" Action Button
     m_applyBtnRect = QRectF(curX, btnY, wApply, btnH);
     bool applyHovered = (m_hoveredButton == ActionBarButton::ApplyButton);
     painter.setPen(Qt::NoPen);
-    painter.setBrush(applyHovered ? QColor(59, 130, 246) : QColor(37, 99, 235));
+    painter.setBrush(applyHovered ? QColor(3, 105, 161) : QColor(2, 132, 199));
     painter.drawRoundedRect(m_applyBtnRect, 5.0, 5.0);
 
     painter.setPen(Qt::white);
-    QString applyText = compact ? QStringLiteral("⚡ Apply")
-                                : QStringLiteral("⚡ Apply to %1").arg(m_selectedMonitor);
+    QString applyText =
+        compact ? QStringLiteral("Apply") : QStringLiteral("Apply to %1").arg(m_selectedMonitor);
     painter.drawText(m_applyBtnRect, Qt::AlignCenter,
-                     fm.elidedText(applyText, Qt::ElideRight, static_cast<int>(wApply - 6.0f)));
+                     fm.elidedText(applyText, Qt::ElideRight, static_cast<int>(wApply - 8.0f)));
     curX += wApply + gap;
 
     // 4. Quick Action Buttons: Reset, Guide, 2.5D Parallax
@@ -1601,7 +1600,7 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
     bool resetHovered = (m_hoveredButton == ActionBarButton::ResetButton);
     painter.setPen(
         QPen(resetHovered ? QColor(255, 255, 255, 100) : QColor(255, 255, 255, 25), 1.0));
-    painter.setBrush(resetHovered ? QColor(50, 52, 64, 230) : QColor(32, 34, 42, 200));
+    painter.setBrush(resetHovered ? QColor(42, 48, 61, 230) : QColor(32, 36, 46, 210));
     painter.drawRoundedRect(m_resetBtnRect, 5.0, 5.0);
     painter.setPen(QColor(210, 215, 225));
     painter.drawText(m_resetBtnRect, Qt::AlignCenter, QStringLiteral("1:1"));
@@ -1610,12 +1609,12 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
     m_guideBtnRect = QRectF(curX, btnY, wGuide, btnH);
     bool guideHovered = (m_hoveredButton == ActionBarButton::GuideButton);
     bool guideActive = (m_showSafeGuides && m_aspectRatioGuide != AspectRatioGuide::None);
-    painter.setPen(QPen(guideActive ? QColor(0, 229, 255, 180) : QColor(255, 255, 255, 25), 1.0));
+    painter.setPen(QPen(guideActive ? QColor(56, 189, 248, 180) : QColor(255, 255, 255, 25), 1.0));
     painter.setBrush(guideActive
-                         ? QColor(0, 100, 120, 180)
-                         : (guideHovered ? QColor(50, 52, 64, 230) : QColor(32, 34, 42, 200)));
+                         ? QColor(7, 89, 133, 200)
+                         : (guideHovered ? QColor(42, 48, 61, 230) : QColor(32, 36, 46, 210)));
     painter.drawRoundedRect(m_guideBtnRect, 5.0, 5.0);
-    painter.setPen(guideActive ? QColor(0, 229, 255) : QColor(210, 215, 225));
+    painter.setPen(guideActive ? QColor(56, 189, 248) : QColor(210, 215, 225));
     painter.drawText(m_guideBtnRect, Qt::AlignCenter,
                      ultraCompact ? QStringLiteral("Grid") : QStringLiteral("Guides"));
     curX += wGuide + gap;
@@ -1626,7 +1625,7 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
         QPen(m_parallaxEnabled ? QColor(168, 85, 247, 200) : QColor(255, 255, 255, 25), 1.0));
     painter.setBrush(m_parallaxEnabled
                          ? QColor(107, 33, 168, 200)
-                         : (parallaxHovered ? QColor(50, 52, 64, 230) : QColor(32, 34, 42, 200)));
+                         : (parallaxHovered ? QColor(42, 48, 61, 230) : QColor(32, 36, 46, 210)));
     painter.drawRoundedRect(m_parallaxBtnRect, 5.0, 5.0);
     painter.setPen(m_parallaxEnabled ? QColor(233, 213, 255) : QColor(210, 215, 225));
     painter.drawText(m_parallaxBtnRect, Qt::AlignCenter, QStringLiteral("2.5D"));
@@ -1636,7 +1635,7 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
 
 void GpuPreviewViewport::drawStatusOverlay(QPainter &painter)
 {
-    // Sleek top-left telemetry readout
+    // Top-left telemetry readout
     painter.save();
     QFont hudFont = painter.font();
     hudFont.setPixelSize(10);
@@ -1647,7 +1646,7 @@ void GpuPreviewViewport::drawStatusOverlay(QPainter &painter)
                       : (m_previewMode == PreviewMode::InProcessImage)  ? QStringLiteral("IMAGE")
                                                                         : QStringLiteral("IDLE");
 
-    QString telemetryStr = QStringLiteral("%1 · %2x%3 · %4% · %5 FPS")
+    QString telemetryStr = QStringLiteral("%1 | %2x%3 | %4% | %5 FPS")
                                .arg(modeStr)
                                .arg(contentWidth())
                                .arg(contentHeight())

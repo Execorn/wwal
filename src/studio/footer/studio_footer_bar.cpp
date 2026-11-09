@@ -36,13 +36,13 @@ void StudioFooterBar::setupUi()
 {
     // Top-level footer styling
     setStyleSheet("StudioFooterBar {"
-                  "  background-color: #0b0f19;"
-                  "  border-top: 1px solid #1e293b;"
+                  "  background-color: #12141a;"
+                  "  border-top: 1px solid #262b36;"
                   "}");
 
     auto *rootLayout = new QHBoxLayout(this);
     rootLayout->setContentsMargins(4, 2, 4, 2);
-    rootLayout->setSpacing(4);
+    rootLayout->setSpacing(6);
 
     // 1. Left section: Power Governor
     m_powerGovernor = new PowerGovernorWidget(this);

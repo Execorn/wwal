@@ -352,13 +352,13 @@ CubicBezierEditorWidget::~CubicBezierEditorWidget() = default;
 void CubicBezierEditorWidget::setupUi()
 {
     auto *rootLayout = new QHBoxLayout(this);
-    rootLayout->setContentsMargins(5, 2, 5, 2);
-    rootLayout->setSpacing(5);
+    rootLayout->setContentsMargins(6, 4, 6, 4);
+    rootLayout->setSpacing(8);
 
     // Left Column: Curve Canvas + Live Runner + Quick Presets
     auto *leftCol = new QVBoxLayout();
     leftCol->setContentsMargins(0, 0, 0, 0);
-    leftCol->setSpacing(2);
+    leftCol->setSpacing(4);
 
     m_canvas = new BezierCurveCanvas(this);
     leftCol->addWidget(m_canvas, 1);
@@ -371,18 +371,19 @@ void CubicBezierEditorWidget::setupUi()
     connect(m_canvas, &BezierCurveCanvas::animationTick, m_runnerTrack,
             &EasingRunnerTrack::updateProgress);
 
-    // Preset buttons in a compact 2x3 grid so they never force wide horizontal size
+    // Preset buttons in a 2x3 grid
     auto *presetsGrid = new QGridLayout();
     presetsGrid->setContentsMargins(0, 0, 0, 0);
-    presetsGrid->setSpacing(2);
+    presetsGrid->setSpacing(4);
 
     auto makePresetBtn = [this](const QString &text) {
         auto *btn = new QPushButton(text, this);
-        btn->setFixedHeight(17);
-        btn->setStyleSheet("QPushButton { background: #313244; color: #cdd6f4; border-radius: 3px; "
-                           "padding: 0px 4px; font-weight: 600; font-size: 9px; }"
-                           "QPushButton:hover { background: #45475a; color: #89b4fa; }"
-                           "QPushButton:pressed { background: #585b70; }");
+        btn->setFixedHeight(22);
+        btn->setStyleSheet(
+            "QPushButton { background: #20242e; color: #cbd5e1; border: 1px solid #2c3240; "
+            "border-radius: 4px; padding: 1px 6px; font-weight: 600; font-size: 9.5px; }"
+            "QPushButton:hover { background: #2a303c; color: #38bdf8; border-color: #3b4252; }"
+            "QPushButton:pressed { background: #181b22; }");
         return btn;
     };
 
@@ -419,15 +420,16 @@ void CubicBezierEditorWidget::setupUi()
 
     auto *rightContainer = new QWidget(rightScroll);
     auto *rightLayout = new QVBoxLayout(rightContainer);
-    rightLayout->setContentsMargins(0, 0, 3, 0);
-    rightLayout->setSpacing(2);
+    rightLayout->setContentsMargins(0, 0, 4, 0);
+    rightLayout->setSpacing(6);
 
     const QString groupStyle = QStringLiteral(
-        "QGroupBox { font-weight: bold; font-size: 9px; color: #cdd6f4; border: 1px solid #313244; "
-        "border-radius: 4px; margin-top: 4px; padding-top: 3px; } "
+        "QGroupBox { font-weight: 600; font-size: 9.5px; color: #cbd5e1; border: 1px solid "
+        "#262b36; "
+        "border-radius: 5px; margin-top: 6px; padding-top: 4px; } "
         "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 6px; "
-        "padding: 0 3px; }");
-    const QString labelStyle = QStringLiteral("font-size: 9px; color: #bac2de; padding: 0px;");
+        "padding: 0 4px; }");
+    const QString labelStyle = QStringLiteral("font-size: 9.5px; color: #94a3b8; padding: 0px;");
 
     auto makeParamLabel = [&labelStyle](const QString &text, QWidget *parentWidget) {
         auto *lbl = new QLabel(text, parentWidget);
@@ -436,22 +438,22 @@ void CubicBezierEditorWidget::setupUi()
     };
 
     // Numeric control point spinboxes & CSS formula
-    auto *coordsGroup = new QGroupBox("Curve Parameters", rightContainer);
+    auto *coordsGroup = new QGroupBox("Curve Points", rightContainer);
     coordsGroup->setStyleSheet(groupStyle);
     auto *coordsLayout = new QGridLayout(coordsGroup);
-    coordsLayout->setContentsMargins(4, 2, 4, 2);
-    coordsLayout->setSpacing(1);
+    coordsLayout->setContentsMargins(6, 4, 6, 4);
+    coordsLayout->setSpacing(4);
 
     auto makeDoubleSpin = [](QWidget *parentWidget, double min, double max, double step) {
         auto *spin = new QDoubleSpinBox(parentWidget);
         spin->setRange(min, max);
         spin->setSingleStep(step);
         spin->setDecimals(2);
-        spin->setFixedHeight(16);
-        spin->setMinimumWidth(44);
+        spin->setFixedHeight(20);
+        spin->setMinimumWidth(48);
         spin->setStyleSheet(
-            "QDoubleSpinBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; "
-            "border-radius: 3px; padding: 0px 2px; font-size: 8.5px; }");
+            "QDoubleSpinBox { background: #181b22; color: #e2e8f0; border: 1px solid #2c3240; "
+            "border-radius: 3px; padding: 0px 3px; font-size: 9px; }");
         return spin;
     };
 
@@ -472,10 +474,10 @@ void CubicBezierEditorWidget::setupUi()
 
     m_cssReadoutLabel = new QLabel(coordsGroup);
     m_cssReadoutLabel->setMinimumWidth(80);
-    m_cssReadoutLabel->setFixedHeight(13);
+    m_cssReadoutLabel->setFixedHeight(15);
     m_cssReadoutLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     m_cssReadoutLabel->setStyleSheet(
-        "color: #89b4fa; font-family: monospace; font-size: 8.5px; padding: 0px;");
+        "color: #38bdf8; font-family: monospace; font-size: 9px; padding: 0px;");
     coordsLayout->addWidget(m_cssReadoutLabel, 2, 0, 1, 4);
 
     rightLayout->addWidget(coordsGroup);
@@ -489,46 +491,46 @@ void CubicBezierEditorWidget::setupUi()
     connect(m_spinP2y, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             &CubicBezierEditorWidget::onSpinBoxesCurveChanged);
 
-    // GPU Transition Settings panel
-    auto *transGroup = new QGroupBox("GPU Transition && Dynamics", rightContainer);
+    // Transition Settings panel
+    auto *transGroup = new QGroupBox("Transition Settings", rightContainer);
     transGroup->setStyleSheet(groupStyle);
     auto *transLayout = new QGridLayout(transGroup);
-    transLayout->setContentsMargins(4, 2, 4, 2);
-    transLayout->setSpacing(1);
+    transLayout->setContentsMargins(6, 4, 6, 4);
+    transLayout->setSpacing(4);
 
     m_comboTransitionType = new QComboBox(transGroup);
-    m_comboTransitionType->setFixedHeight(16);
+    m_comboTransitionType->setFixedHeight(20);
     m_comboTransitionType->setMinimumWidth(80);
     m_comboTransitionType->setStyleSheet(
-        "QComboBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; "
-        "border-radius: 3px; padding: 0px 4px; font-size: 8.5px; } QComboBox::drop-down { border: "
+        "QComboBox { background: #181b22; color: #e2e8f0; border: 1px solid #2c3240; "
+        "border-radius: 3px; padding: 0px 4px; font-size: 9px; } QComboBox::drop-down { border: "
         "none; }");
 
     const struct {
         int type;
         const char *name;
-    } transitions[] = {{WAYWAL_TRANSITION_NONE, "0: None (Instant Cut)"},
-                       {WAYWAL_TRANSITION_SIMPLE, "1: Simple Cut"},
-                       {WAYWAL_TRANSITION_FADE, "2: Fade (Crossfade)"},
-                       {WAYWAL_TRANSITION_WIPE, "3: Directional Wipe"},
-                       {WAYWAL_TRANSITION_GROW, "4: Grow / Expand"},
-                       {WAYWAL_TRANSITION_OUTER, "5: Outer Reveal"},
-                       {WAYWAL_TRANSITION_WAVE, "6: Wave Dissolve"},
-                       {WAYWAL_TRANSITION_NOISE, "7: Perlin Noise"},
-                       {WAYWAL_TRANSITION_CROSSZOOM, "8: Cross Zoom"},
-                       {WAYWAL_TRANSITION_SLIDE, "9: Smooth Slide"},
-                       {WAYWAL_TRANSITION_GLITCH, "10: Digital Glitch"},
-                       {WAYWAL_TRANSITION_BURN, "11: Color Burn"},
-                       {WAYWAL_TRANSITION_RIPPLE, "12: Water Ripple"},
-                       {WAYWAL_TRANSITION_PIXELATE, "13: Pixelate"},
-                       {WAYWAL_TRANSITION_DOOM, "14: Doom Melt"},
-                       {WAYWAL_TRANSITION_SWIRL, "15: Vortex Swirl"},
-                       {WAYWAL_TRANSITION_CUBE, "16: 3D Cube Flip"},
-                       {WAYWAL_TRANSITION_LUMA, "17: Luma Mask"},
-                       {WAYWAL_TRANSITION_LIGHT_LEAK, "18: Light Leak"},
-                       {WAYWAL_TRANSITION_PAGE_CURL, "19: Page Curl"},
-                       {WAYWAL_TRANSITION_CUSTOM, "20: Custom Shader"},
-                       {WAYWAL_TRANSITION_RANDOM, "21: Random Transition"}};
+    } transitions[] = {{WAYWAL_TRANSITION_NONE, "None (Instant Cut)"},
+                       {WAYWAL_TRANSITION_SIMPLE, "Simple Cut"},
+                       {WAYWAL_TRANSITION_FADE, "Fade (Crossfade)"},
+                       {WAYWAL_TRANSITION_WIPE, "Directional Wipe"},
+                       {WAYWAL_TRANSITION_GROW, "Grow / Expand"},
+                       {WAYWAL_TRANSITION_OUTER, "Outer Reveal"},
+                       {WAYWAL_TRANSITION_WAVE, "Wave Dissolve"},
+                       {WAYWAL_TRANSITION_NOISE, "Perlin Noise"},
+                       {WAYWAL_TRANSITION_CROSSZOOM, "Cross Zoom"},
+                       {WAYWAL_TRANSITION_SLIDE, "Smooth Slide"},
+                       {WAYWAL_TRANSITION_GLITCH, "Digital Glitch"},
+                       {WAYWAL_TRANSITION_BURN, "Color Burn"},
+                       {WAYWAL_TRANSITION_RIPPLE, "Water Ripple"},
+                       {WAYWAL_TRANSITION_PIXELATE, "Pixelate"},
+                       {WAYWAL_TRANSITION_DOOM, "Doom Melt"},
+                       {WAYWAL_TRANSITION_SWIRL, "Vortex Swirl"},
+                       {WAYWAL_TRANSITION_CUBE, "3D Cube Flip"},
+                       {WAYWAL_TRANSITION_LUMA, "Luma Mask"},
+                       {WAYWAL_TRANSITION_LIGHT_LEAK, "Light Leak"},
+                       {WAYWAL_TRANSITION_PAGE_CURL, "Page Curl"},
+                       {WAYWAL_TRANSITION_CUSTOM, "Custom Shader"},
+                       {WAYWAL_TRANSITION_RANDOM, "Random"}};
 
     for (const auto &t : transitions) {
         m_comboTransitionType->addItem(t.name, t.type);
@@ -541,14 +543,14 @@ void CubicBezierEditorWidget::setupUi()
     m_spinDuration->setRange(100, 10000);
     m_spinDuration->setSingleStep(50);
     m_spinDuration->setSuffix(" ms");
-    m_spinDuration->setFixedHeight(16);
-    m_spinDuration->setMinimumWidth(50);
+    m_spinDuration->setFixedHeight(20);
+    m_spinDuration->setMinimumWidth(52);
     m_spinDuration->setStyleSheet(
-        "QSpinBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; border-radius: "
-        "3px; padding: 0px 2px; font-size: 8.5px; }");
+        "QSpinBox { background: #181b22; color: #e2e8f0; border: 1px solid #2c3240; border-radius: "
+        "3px; padding: 0px 3px; font-size: 9px; }");
 
     m_sliderDuration = new QSlider(Qt::Horizontal, transGroup);
-    m_sliderDuration->setFixedHeight(14);
+    m_sliderDuration->setFixedHeight(16);
     m_sliderDuration->setRange(100, 5000);
     m_sliderDuration->setMinimumWidth(40);
 
@@ -556,11 +558,11 @@ void CubicBezierEditorWidget::setupUi()
     transLayout->addWidget(m_spinDuration, 1, 1);
     transLayout->addWidget(m_sliderDuration, 1, 2, 1, 2);
 
-    // Row 2: Angle Spin + Slider (paired cleanly just like Duration!)
+    // Row 2: Angle Spin + Slider
     m_spinAngle = makeDoubleSpin(transGroup, 0.0, 360.0, 5.0);
-    m_spinAngle->setSuffix("°");
+    m_spinAngle->setSuffix(" deg");
     m_sliderAngle = new QSlider(Qt::Horizontal, transGroup);
-    m_sliderAngle->setFixedHeight(14);
+    m_sliderAngle->setFixedHeight(16);
     m_sliderAngle->setRange(0, 360);
     m_sliderAngle->setMinimumWidth(40);
 
@@ -573,10 +575,10 @@ void CubicBezierEditorWidget::setupUi()
     m_spinFps->setRange(15, 360);
     m_spinFps->setValue(144);
     m_spinFps->setSuffix(" Hz");
-    m_spinFps->setFixedHeight(16);
-    m_spinFps->setMinimumWidth(50);
-    m_spinFps->setStyleSheet("QSpinBox { background: #1e1e2e; color: #cdd6f4; border: 1px solid "
-                             "#313244; border-radius: 3px; padding: 0px 2px; font-size: 8.5px; }");
+    m_spinFps->setFixedHeight(20);
+    m_spinFps->setMinimumWidth(52);
+    m_spinFps->setStyleSheet("QSpinBox { background: #181b22; color: #e2e8f0; border: 1px solid "
+                             "#2c3240; border-radius: 3px; padding: 0px 3px; font-size: 9px; }");
 
     m_spinWaveFreq = makeDoubleSpin(transGroup, 0.1, 50.0, 0.5);
     m_spinWaveAmp = makeDoubleSpin(transGroup, 0.0, 1.0, 0.02);

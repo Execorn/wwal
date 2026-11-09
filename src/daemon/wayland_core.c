@@ -357,12 +357,16 @@ static void recompute_wlr_toplevel_power_state(daemon_state_t *state)
             if (any_fs && any_max)
                 break;
         }
+        bool was_fs = out->wlr_has_fullscreen;
+        out->wlr_has_fullscreen = any_fs;
         bool pause_fs = any_fs && state->config.daemon.auto_pause_fullscreen;
         bool pause_max = any_max && state->config.daemon.auto_pause_maximized;
         uint32_t prev_mask = waywal_power_governor_get_output_mask(state->power_gov, out->name);
         /* When compositor IPC (Hyprland/Sway/Niri) is active, it tracks workspace-visible
-         * per-output fullscreen state accurately; do not let wlr_toplevel overwrite it. */
-        if (!has_compositor_ipc) {
+         * per-output fullscreen state accurately; do not let wlr_toplevel set fullscreen pause
+         * from inactive workspaces, but always clear it when no window on the output is fullscreen.
+         */
+        if (!has_compositor_ipc || !pause_fs) {
             waywal_power_governor_set_output_reason(state->power_gov, out->name,
                                                     WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, pause_fs);
         }
@@ -371,6 +375,10 @@ static void recompute_wlr_toplevel_power_state(daemon_state_t *state)
         uint32_t new_mask = waywal_power_governor_get_output_mask(state->power_gov, out->name);
         if (prev_mask != new_mask)
             changed = true;
+        if (was_fs && !any_fs && out->configured && out->pres_sync.wp_pres &&
+            out->pres_sync.pll.frame_seq == 0) {
+            output_node_recreate_layer_surface(state, out);
+        }
     }
 
     if (changed && state->on_power_state_changed) {

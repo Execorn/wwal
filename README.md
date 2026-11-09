@@ -72,8 +72,8 @@ sudo zypper install wwal
 
 ### Ubuntu / Debian (`.deb`)
 ```bash
-curl -LO https://github.com/Execorn/wwal/releases/latest/download/wwal_1.2.0_amd64.deb
-sudo apt install ./wwal_1.2.0_amd64.deb
+curl -LO https://github.com/Execorn/wwal/releases/latest/download/wwal_3.0.0_amd64.deb
+sudo apt install ./wwal_3.0.0_amd64.deb
 ```
 
 ### NixOS / Nix (`flake.nix`)

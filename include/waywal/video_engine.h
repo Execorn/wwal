@@ -21,7 +21,7 @@ typedef enum {
 struct daemon_state;
 struct output_node;
 
-#define WAYWAL_VIDEO_REORDER_CAP 6
+#define WAYWAL_VIDEO_REORDER_CAP 17
 
 typedef struct {
     VASurfaceID surface;

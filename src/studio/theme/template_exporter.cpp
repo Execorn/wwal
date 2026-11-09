@@ -23,7 +23,8 @@ const QVector<TemplateTargetDescriptor> &TemplateExporter::targetDescriptors()
     static const QVector<TemplateTargetDescriptor> descriptors = {
         {TemplateTargetId::Hyprland, QStringLiteral("hyprland"), QStringLiteral("Hyprland"),
          QStringLiteral("hypr/colors.conf"), QString(),
-         QStringLiteral("Active border 45° gradient, inactive borders, and color variables"), true},
+         QStringLiteral("Active border 45 deg gradient, inactive borders, and color variables"),
+         true},
         {TemplateTargetId::Waybar, QStringLiteral("waybar"), QStringLiteral("Waybar"),
          QStringLiteral("waybar/colors.css"), QString(),
          QStringLiteral("CSS @define-color tokens for bar modules and pills"), true},
@@ -56,23 +57,21 @@ TemplateExporter::TemplateExporter(QWidget *parent) : QWidget(parent) { setupUi(
 void TemplateExporter::setupUi()
 {
     auto *mainLayout = new QVBoxLayout(this);
-    mainLayout->setContentsMargins(6, 6, 6, 6);
-    mainLayout->setSpacing(6);
+    mainLayout->setContentsMargins(8, 8, 8, 8);
+    mainLayout->setSpacing(8);
 
-    auto *headerLabel = new QLabel(QStringLiteral("<b>Desktop Template Exporter</b>"), this);
-    headerLabel->setStyleSheet(QStringLiteral("font-size: 10pt;"));
+    auto *headerLabel = new QLabel(QStringLiteral("<b>Config Exporter</b>"), this);
+    headerLabel->setStyleSheet(QStringLiteral("font-size: 9.5pt; color: #f8fafc;"));
     mainLayout->addWidget(headerLabel);
 
-    auto *descLabel = new QLabel(QStringLiteral("Export Material You HCT color tokens atomically "
-                                                "to standard $XDG_CONFIG_HOME target templates."),
-                                 this);
-    descLabel->setStyleSheet(QStringLiteral("color: #888888; font-size: 8pt;"));
+    auto *descLabel = new QLabel(QStringLiteral("Write generated color files to ~/.config."), this);
+    descLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 8.5pt;"));
     descLabel->setWordWrap(true);
     mainLayout->addWidget(descLabel);
 
     // Target Checkbox List
     auto *targetsLayout = new QVBoxLayout();
-    targetsLayout->setSpacing(4);
+    targetsLayout->setSpacing(6);
 
     const auto &descriptors = targetDescriptors();
     m_targets.reserve(descriptors.size());
@@ -93,7 +92,7 @@ void TemplateExporter::setupUi()
 
         auto *pl = new QLabel(pathText, this);
         pl->setStyleSheet(
-            QStringLiteral("color: #777777; font-family: monospace; font-size: 8pt;"));
+            QStringLiteral("color: #64748b; font-family: monospace; font-size: 8pt;"));
         pl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         pl->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
         pl->setMinimumWidth(50);
@@ -111,13 +110,15 @@ void TemplateExporter::setupUi()
 
     // Buttons Row
     auto *btnLayout = new QHBoxLayout();
-    btnLayout->setSpacing(6);
+    btnLayout->setSpacing(8);
 
     m_selectAllBtn = new QPushButton(QStringLiteral("Select All"), this);
+    m_selectAllBtn->setFixedHeight(26);
     connect(m_selectAllBtn, &QPushButton::clicked, this, &TemplateExporter::selectAll);
     btnLayout->addWidget(m_selectAllBtn);
 
     m_deselectAllBtn = new QPushButton(QStringLiteral("Deselect All"), this);
+    m_deselectAllBtn->setFixedHeight(26);
     connect(m_deselectAllBtn, &QPushButton::clicked, this, &TemplateExporter::deselectAll);
     btnLayout->addWidget(m_deselectAllBtn);
 
@@ -125,17 +126,18 @@ void TemplateExporter::setupUi()
     mainLayout->addLayout(btnLayout);
 
     m_exportBtn = new QPushButton(QStringLiteral("Export Selected to ~/.config"), this);
+    m_exportBtn->setFixedHeight(28);
     m_exportBtn->setStyleSheet(
-        QStringLiteral("QPushButton { background-color: #6750A4; color: white; font-weight: bold; "
-                       "padding: 6px 12px; border-radius: 6px; } "
-                       "QPushButton:hover { background-color: #7D64B8; } "
-                       "QPushButton:pressed { background-color: #533C8F; }"));
+        QStringLiteral("QPushButton { background-color: #0284c7; color: #f8fafc; font-weight: 600; "
+                       "padding: 4px 12px; border-radius: 5px; border: 1px solid #0369a1; } "
+                       "QPushButton:hover { background-color: #0369a1; } "
+                       "QPushButton:pressed { background-color: #075985; }"));
     connect(m_exportBtn, &QPushButton::clicked, this, &TemplateExporter::exportSelectedNow);
     mainLayout->addWidget(m_exportBtn);
 
     // Status Label
     m_statusLabel = new QLabel(QStringLiteral("Ready to export."), this);
-    m_statusLabel->setStyleSheet(QStringLiteral("color: #888888; font-size: 8.5pt;"));
+    m_statusLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 8.5pt;"));
     m_statusLabel->setWordWrap(true);
     mainLayout->addWidget(m_statusLabel);
     mainLayout->addStretch(1);

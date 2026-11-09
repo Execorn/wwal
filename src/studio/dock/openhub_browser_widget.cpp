@@ -219,7 +219,7 @@ struct OpenHubBrowserWidget::Impl {
 
     // Capability Pills Layout
     QWidget *capabilitiesContainer{nullptr};
-    QHBoxLayout *capabilitiesLayout{nullptr};
+    QGridLayout *capabilitiesLayout{nullptr};
 
     // Resource Budgets
     QLabel *vramBudgetLabel{nullptr};
@@ -554,14 +554,11 @@ void OpenHubBrowserWidget::Impl::syncWithGridView()
     }
 
     if (statusTelemetryLabel) {
-        statusTelemetryLabel->setText(
-            QString(
-                "WayWal Open Hub Feed: %1 packages | Airgap Sandbox: Active (Network/FS Locked)")
-                .arg(filteredRecords.size()));
+        statusTelemetryLabel->setText(QString("%1 packages").arg(filteredRecords.size()));
     }
 
     catIndex.refilter();
-    owner->m_gridView->update();
+    owner->m_gridView->refreshCatalogView();
 }
 
 void OpenHubBrowserWidget::Impl::updateInspector(const OpenHubRecord &rec)
@@ -570,7 +567,7 @@ void OpenHubBrowserWidget::Impl::updateInspector(const OpenHubRecord &rec)
         return;
 
     inspectorTitleLabel->setText(rec.name);
-    inspectorVersionSlugLabel->setText(QString("<b>%1</b> (v%2) · SPDX: %3 · Size: %4")
+    inspectorVersionSlugLabel->setText(QString("<b>%1</b> (v%2) | %3 | %4")
                                            .arg(rec.slug)
                                            .arg(rec.version)
                                            .arg(rec.license)
@@ -578,78 +575,83 @@ void OpenHubBrowserWidget::Impl::updateInspector(const OpenHubRecord &rec)
 
     inspectorAuthorLabel->setText(
         QString("Author: %1 &lt;%2&gt;").arg(rec.author_name).arg(rec.author_email));
-    inspectorCidLabel->setText(QString("<b>CID:</b> <code>%1</code>").arg(rec.cid));
+    QString shortCid =
+        rec.cid.length() > 24 ? (rec.cid.left(15) + "..." + rec.cid.right(8)) : rec.cid;
+    inspectorCidLabel->setText(QString("<b>CID:</b> <code>%1</code>").arg(shortCid));
+    inspectorCidLabel->setToolTip(rec.cid);
 
     // Cryptographic verification badge
     if (rec.is_verified) {
-        cryptoBadgeLabel->setText("✓ ED25519 VERIFIED · MERKLE ROOT INTEGRITY INTACT");
+        cryptoBadgeLabel->setText("Verified Signature");
         cryptoBadgeLabel->setStyleSheet(
             "background-color: #065f46; color: #34d399; border: 1px solid #059669; "
-            "border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;");
+            "border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 11px;");
     } else {
-        cryptoBadgeLabel->setText("⚠ UNVERIFIED / SELF-SIGNED CONTAINER");
+        cryptoBadgeLabel->setText("Unverified Package");
         cryptoBadgeLabel->setStyleSheet(
             "background-color: #78350f; color: #fbbf24; border: 1px solid #d97706; "
-            "border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;");
+            "border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 11px;");
     }
 
     QString shortPubkey =
         rec.author_pubkey_hex.length() > 16
             ? (rec.author_pubkey_hex.left(8) + "..." + rec.author_pubkey_hex.right(8))
             : rec.author_pubkey_hex;
-    authorPubkeyLabel->setText(QString("Author PubKey: <code>%1</code>").arg(shortPubkey));
+    authorPubkeyLabel->setText(QString("Public Key: <code>%1</code>").arg(shortPubkey));
 
     QString shortMerkle = rec.merkle_root_hex.length() > 16
                               ? (rec.merkle_root_hex.left(8) + "..." + rec.merkle_root_hex.right(8))
                               : rec.merkle_root_hex;
     merkleRootLabel->setText(QString("Merkle Root: <code>%1</code>").arg(shortMerkle));
 
-    // Capability pills
+    // Capability pills (2-column grid so 1-4 badges fit cleanly in narrow docks)
     QLayoutItem *child;
     while ((child = capabilitiesLayout->takeAt(0)) != nullptr) {
         delete child->widget();
         delete child;
     }
 
-    auto addPill = [this](const QString &text, const char *style) {
+    int pillIdx = 0;
+    auto addPill = [this, &pillIdx](const QString &text, const char *style) {
         auto *lbl = new QLabel(text, capabilitiesContainer);
+        lbl->setAlignment(Qt::AlignCenter);
         lbl->setStyleSheet(style);
-        capabilitiesLayout->addWidget(lbl);
+        capabilitiesLayout->addWidget(lbl, pillIdx / 2, pillIdx % 2);
+        ++pillIdx;
     };
 
     if (rec.cap_compute)
-        addPill("⚡ Compute Shader", STYLE_PILL_COMPUTE);
+        addPill("Compute Shader", STYLE_PILL_COMPUTE);
     if (rec.cap_audio_spectrum)
-        addPill("♬ Audio FFT Spectrum", STYLE_PILL_AUDIO);
+        addPill("Audio Reactive", STYLE_PILL_AUDIO);
     if (rec.cap_scripting)
-        addPill("✎ SceneScript AST", STYLE_PILL_SCRIPT);
-    addPill("🛡 Zero-Network Airgap", STYLE_PILL_AIRGAP);
-    capabilitiesLayout->addStretch();
+        addPill("SceneScript", STYLE_PILL_SCRIPT);
+    addPill("Offline Safe", STYLE_PILL_AIRGAP);
 
     // Resource budgets
-    vramBudgetLabel->setText(QString("VRAM Budget: %1 MB max").arg(rec.max_vram_mb));
+    vramBudgetLabel->setText(QString("VRAM Limit: %1 MB").arg(rec.max_vram_mb));
     vramBudgetBar->setValue(static_cast<int>(std::min(rec.max_vram_mb, 512u)));
 
-    ramBudgetLabel->setText(QString("RAM Budget: %1 MB max").arg(rec.max_ram_mb));
+    ramBudgetLabel->setText(QString("RAM Limit: %1 MB").arg(rec.max_ram_mb));
     ramBudgetBar->setValue(static_cast<int>(std::min(rec.max_ram_mb, 1024u)));
 
     targetFpsBadge->setText(QString("Target: <b>%1 FPS</b>").arg(rec.target_fps));
 
     // Install / Download status
     if (rec.is_downloading) {
-        installStateBadge->setText("<font color='#38bdf8'><b>⟳ Downloading package...</b></font>");
+        installStateBadge->setText("<font color='#38bdf8'><b>Downloading...</b></font>");
         downloadProgressBox->setVisible(true);
         installDownloadBtn->setText("Cancel Download");
         applyToMonitorBtn->setEnabled(false);
     } else if (rec.is_installed) {
-        installStateBadge->setText("<font color='#34d399'><b>✓ Installed in Local Hub</b></font>");
+        installStateBadge->setText("<font color='#34d399'><b>Installed</b></font>");
         downloadProgressBox->setVisible(false);
-        installDownloadBtn->setText("Re-install / Verify");
+        installDownloadBtn->setText("Reinstall");
         applyToMonitorBtn->setEnabled(true);
     } else {
-        installStateBadge->setText("<font color='#94a3b8'>Available in Feed</font>");
+        installStateBadge->setText("<font color='#94a3b8'>Available</font>");
         downloadProgressBox->setVisible(false);
-        installDownloadBtn->setText("1-Click Install (.wwpkg)");
+        installDownloadBtn->setText("Install");
         applyToMonitorBtn->setEnabled(false);
     }
 }
@@ -694,141 +696,160 @@ void OpenHubBrowserWidget::setupUi()
     rootLayout->setContentsMargins(0, 0, 0, 0);
     rootLayout->setSpacing(0);
 
-    // 1. Top Toolbar
+    // 1. Top Toolbar (2 clean rows to avoid crowding in narrow docks)
     auto *toolbarFrame = new QFrame(this);
-    toolbarFrame->setStyleSheet(
-        "background-color: #1a1e26; border-bottom: 1px solid #2b303c; padding: 4px;");
-    auto *toolbarLayout = new QHBoxLayout(toolbarFrame);
-    toolbarLayout->setContentsMargins(8, 6, 8, 6);
-    toolbarLayout->setSpacing(8);
+    toolbarFrame->setStyleSheet("background-color: #181b22; border-bottom: 1px solid #262b36;");
+    auto *toolbarOuter = new QVBoxLayout(toolbarFrame);
+    toolbarOuter->setContentsMargins(10, 8, 10, 8);
+    toolbarOuter->setSpacing(8);
+
+    auto *topRow = new QHBoxLayout();
+    topRow->setSpacing(8);
 
     // Search Bar
     m_searchEdit = new QLineEdit(toolbarFrame);
-    m_searchEdit->setPlaceholderText("Search Open Hub packages (.wwpkg, tags, author, CID)...");
+    m_searchEdit->setPlaceholderText("Search Open Hub...");
     m_searchEdit->setClearButtonEnabled(true);
+    m_searchEdit->setFixedHeight(28);
     m_searchEdit->setStyleSheet(STYLE_SEARCH_BAR);
-    toolbarLayout->addWidget(m_searchEdit, 2);
+    topRow->addWidget(m_searchEdit, 1);
+
+    // Refresh Feed Button
+    m_refreshBtn = new QToolButton(toolbarFrame);
+    m_refreshBtn->setText("Refresh");
+    m_refreshBtn->setToolTip("Refresh Open Hub feed and local packages");
+    m_refreshBtn->setFixedHeight(28);
+    m_refreshBtn->setStyleSheet(
+        "QToolButton { background-color: #20242e; color: #f1f5f9; border: 1px solid #2c3240; "
+        "border-radius: 5px; padding: 4px 12px; font-size: 12px; }"
+        "QToolButton:hover { background-color: #2a303d; color: #ffffff; }");
+    topRow->addWidget(m_refreshBtn);
+
+    // Keep wizardLaunchBtn instantiated for signal compatibility, hidden to avoid duplicating main
+    // toolbar
+    m_impl->wizardLaunchBtn = new QToolButton(toolbarFrame);
+    m_impl->wizardLaunchBtn->setText("Package...");
+    m_impl->wizardLaunchBtn->setVisible(false);
+
+    toolbarOuter->addLayout(topRow);
+
+    auto *filterRow = new QHBoxLayout();
+    filterRow->setSpacing(8);
 
     // Category Combo
     m_categoryCombo = new QComboBox(toolbarFrame);
     m_categoryCombo->addItems({"All Categories", "Fragment Shaders", "Compute Shaders", "2D Scenes",
                                "Puppet Scenes", "Particle Systems", "Video Streams"});
+    m_categoryCombo->setFixedHeight(26);
     m_categoryCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
-    toolbarLayout->addWidget(m_categoryCombo, 1);
+    filterRow->addWidget(m_categoryCombo, 1);
 
     // Sort Combo
     m_sortCombo = new QComboBox(toolbarFrame);
-    m_sortCombo->addItems(
-        {"Trending (Downloads & Rating)", "Most Downloaded", "Recently Updated", "Package Name"});
+    m_sortCombo->addItems({"Trending", "Most Downloaded", "Recently Updated", "Name"});
+    m_sortCombo->setFixedHeight(26);
     m_sortCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
-    toolbarLayout->addWidget(m_sortCombo, 1);
+    filterRow->addWidget(m_sortCombo, 1);
 
-    // Refresh Feed Button
-    m_refreshBtn = new QToolButton(toolbarFrame);
-    m_refreshBtn->setText("⟳ Refresh");
-    m_refreshBtn->setToolTip("Refresh decentralized Open Hub package feeds and local storage");
-    m_refreshBtn->setStyleSheet(
-        "QToolButton { background-color: #2b303c; color: #f1f5f9; border: 1px solid #334155; "
-        "border-radius: 6px; padding: 5px 12px; font-weight: bold; font-size: 12px; }"
-        "QToolButton:hover { background-color: #38bdf8; color: #0f172a; }");
-    toolbarLayout->addWidget(m_refreshBtn);
-
-    // Creator Packaging Wizard Launch Button
-    m_impl->wizardLaunchBtn = new QToolButton(toolbarFrame);
-    m_impl->wizardLaunchBtn->setText("📦 Package Wallpaper (.wwpkg)...");
-    m_impl->wizardLaunchBtn->setToolTip("Launch 6-step Creator Packaging & Signing Wizard");
-    m_impl->wizardLaunchBtn->setStyleSheet(
-        "QToolButton { background-color: #0284c7; color: #ffffff; border: none; "
-        "border-radius: 6px; padding: 5px 12px; font-weight: bold; font-size: 12px; }"
-        "QToolButton:hover { background-color: #0369a1; }");
-    toolbarLayout->addWidget(m_impl->wizardLaunchBtn);
-
+    toolbarOuter->addLayout(filterRow);
     rootLayout->addWidget(toolbarFrame);
 
     // 2. Main Splitter View (Grid View & Package Details Inspector)
-    m_impl->mainSplitter = new QSplitter(Qt::Horizontal, this);
+    m_impl->mainSplitter = new QSplitter(Qt::Vertical, this);
     m_impl->mainSplitter->setStyleSheet(
-        "QSplitter::handle { background-color: #2b303c; width: 2px; }");
+        "QSplitter::handle { background-color: #262b36; height: 2px; }");
 
     // Grid View
     m_gridView = new VirtualizedGridWidget(m_impl->mainSplitter);
+    m_gridView->setEmbeddedMode(true);
     m_impl->mainSplitter->addWidget(m_gridView);
 
     // Package Details Inspector Drawer
     m_impl->inspectorScrollArea = new QScrollArea(m_impl->mainSplitter);
     m_impl->inspectorScrollArea->setWidgetResizable(true);
+    m_impl->inspectorScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_impl->inspectorScrollArea->setStyleSheet(STYLE_DRAWER_BG);
 
     m_impl->inspectorDrawer = new QWidget(m_impl->inspectorScrollArea);
+    m_impl->inspectorDrawer->setMinimumWidth(0);
     auto *drawerLayout = new QVBoxLayout(m_impl->inspectorDrawer);
     drawerLayout->setContentsMargins(14, 14, 14, 14);
     drawerLayout->setSpacing(10);
 
     // Package Titles
     m_impl->inspectorTitleLabel =
-        new QLabel("Select a package to inspect", m_impl->inspectorDrawer);
+        new QLabel("Select a package to view details", m_impl->inspectorDrawer);
     m_impl->inspectorTitleLabel->setStyleSheet(
-        "font-size: 15px; font-weight: bold; color: #f1f5f9;");
+        "font-size: 14px; font-weight: bold; color: #f1f5f9;");
     m_impl->inspectorTitleLabel->setWordWrap(true);
+    m_impl->inspectorTitleLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->inspectorTitleLabel);
 
-    m_impl->inspectorVersionSlugLabel = new QLabel("Package Slug: —", m_impl->inspectorDrawer);
+    m_impl->inspectorVersionSlugLabel = new QLabel("Package Slug: None", m_impl->inspectorDrawer);
     m_impl->inspectorVersionSlugLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
+    m_impl->inspectorVersionSlugLabel->setWordWrap(true);
+    m_impl->inspectorVersionSlugLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->inspectorVersionSlugLabel);
 
-    m_impl->inspectorAuthorLabel = new QLabel("Author: —", m_impl->inspectorDrawer);
+    m_impl->inspectorAuthorLabel = new QLabel("Author: Unknown", m_impl->inspectorDrawer);
     m_impl->inspectorAuthorLabel->setStyleSheet("font-size: 11px; color: #cbd5e1;");
+    m_impl->inspectorAuthorLabel->setWordWrap(true);
+    m_impl->inspectorAuthorLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->inspectorAuthorLabel);
 
     // Content-Addressed Identifier Row
     auto *cidRow = new QHBoxLayout();
-    m_impl->inspectorCidLabel = new QLabel("CID: —", m_impl->inspectorDrawer);
-    m_impl->inspectorCidLabel->setStyleSheet("font-size: 10px; color: #38bdf8;");
+    cidRow->setSpacing(8);
+    m_impl->inspectorCidLabel = new QLabel("CID: None", m_impl->inspectorDrawer);
+    m_impl->inspectorCidLabel->setStyleSheet("font-size: 11px; color: #38bdf8;");
     m_impl->inspectorCidLabel->setWordWrap(true);
+    m_impl->inspectorCidLabel->setMinimumWidth(0);
     cidRow->addWidget(m_impl->inspectorCidLabel, 1);
 
     m_impl->copyCidBtn = new QPushButton("Copy", m_impl->inspectorDrawer);
-    m_impl->copyCidBtn->setFixedSize(48, 20);
+    m_impl->copyCidBtn->setFixedSize(60, 26);
     m_impl->copyCidBtn->setStyleSheet(STYLE_BUTTON_SECONDARY);
     cidRow->addWidget(m_impl->copyCidBtn);
     drawerLayout->addLayout(cidRow);
 
     // Cryptographic Verification Status Badge
-    m_impl->cryptoBadgeLabel = new QLabel("ED25519 CRYPTOGRAPHIC PROOF", m_impl->inspectorDrawer);
+    m_impl->cryptoBadgeLabel = new QLabel("Signature Status", m_impl->inspectorDrawer);
     m_impl->cryptoBadgeLabel->setAlignment(Qt::AlignCenter);
     drawerLayout->addWidget(m_impl->cryptoBadgeLabel);
 
-    m_impl->authorPubkeyLabel = new QLabel("Author PubKey: —", m_impl->inspectorDrawer);
-    m_impl->authorPubkeyLabel->setStyleSheet("font-size: 10px; color: #94a3b8;");
+    m_impl->authorPubkeyLabel = new QLabel("Public Key: None", m_impl->inspectorDrawer);
+    m_impl->authorPubkeyLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
+    m_impl->authorPubkeyLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->authorPubkeyLabel);
 
-    m_impl->merkleRootLabel = new QLabel("Merkle Root: —", m_impl->inspectorDrawer);
-    m_impl->merkleRootLabel->setStyleSheet("font-size: 10px; color: #94a3b8;");
+    m_impl->merkleRootLabel = new QLabel("Merkle Root: None", m_impl->inspectorDrawer);
+    m_impl->merkleRootLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
+    m_impl->merkleRootLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->merkleRootLabel);
 
     // Capability Pills Strip
-    auto *capTitle =
-        new QLabel("<b>Authorized Capabilities & Sandbox Ceilings:</b>", m_impl->inspectorDrawer);
+    auto *capTitle = new QLabel("<b>Capabilities</b>", m_impl->inspectorDrawer);
     capTitle->setStyleSheet("font-size: 11px; color: #cbd5e1;");
     drawerLayout->addWidget(capTitle);
 
     m_impl->capabilitiesContainer = new QWidget(m_impl->inspectorDrawer);
-    m_impl->capabilitiesLayout = new QHBoxLayout(m_impl->capabilitiesContainer);
+    m_impl->capabilitiesLayout = new QGridLayout(m_impl->capabilitiesContainer);
     m_impl->capabilitiesLayout->setContentsMargins(0, 2, 0, 2);
-    m_impl->capabilitiesLayout->setSpacing(6);
+    m_impl->capabilitiesLayout->setHorizontalSpacing(6);
+    m_impl->capabilitiesLayout->setVerticalSpacing(6);
     drawerLayout->addWidget(m_impl->capabilitiesContainer);
 
     // Resource Budget Bars
     auto *budgetsFrame = new QFrame(m_impl->inspectorDrawer);
     budgetsFrame->setStyleSheet(
-        "background: #14171c; border: 1px solid #334155; border-radius: 6px; padding: 6px;");
+        "background: #14171c; border: 1px solid #2c3240; border-radius: 6px; padding: 6px;");
     auto *budgetsLayout = new QVBoxLayout(budgetsFrame);
     budgetsLayout->setContentsMargins(8, 6, 8, 6);
     budgetsLayout->setSpacing(6);
 
     auto *vramRow = new QHBoxLayout();
-    m_impl->vramBudgetLabel = new QLabel("VRAM Budget: 128 MB max", budgetsFrame);
-    m_impl->vramBudgetLabel->setStyleSheet("font-size: 10px; color: #94a3b8;");
+    m_impl->vramBudgetLabel = new QLabel("VRAM Limit: 128 MB", budgetsFrame);
+    m_impl->vramBudgetLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     vramRow->addWidget(m_impl->vramBudgetLabel);
     m_impl->vramBudgetBar = new QProgressBar(budgetsFrame);
     m_impl->vramBudgetBar->setRange(0, 512);
@@ -842,8 +863,8 @@ void OpenHubBrowserWidget::setupUi()
     budgetsLayout->addLayout(vramRow);
 
     auto *ramRow = new QHBoxLayout();
-    m_impl->ramBudgetLabel = new QLabel("RAM Budget: 256 MB max", budgetsFrame);
-    m_impl->ramBudgetLabel->setStyleSheet("font-size: 10px; color: #94a3b8;");
+    m_impl->ramBudgetLabel = new QLabel("RAM Limit: 256 MB", budgetsFrame);
+    m_impl->ramBudgetLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     ramRow->addWidget(m_impl->ramBudgetLabel);
     m_impl->ramBudgetBar = new QProgressBar(budgetsFrame);
     m_impl->ramBudgetBar->setRange(0, 1024);
@@ -857,17 +878,17 @@ void OpenHubBrowserWidget::setupUi()
     budgetsLayout->addLayout(ramRow);
 
     m_impl->targetFpsBadge = new QLabel("Target: <b>60 FPS</b>", budgetsFrame);
-    m_impl->targetFpsBadge->setStyleSheet("font-size: 10px; color: #34d399;");
+    m_impl->targetFpsBadge->setStyleSheet("font-size: 11px; color: #34d399;");
     budgetsLayout->addWidget(m_impl->targetFpsBadge);
 
     drawerLayout->addWidget(budgetsFrame);
 
     // Install Status
     auto *statusRow = new QHBoxLayout();
-    auto *stLbl = new QLabel("Package State:", m_impl->inspectorDrawer);
+    auto *stLbl = new QLabel("Status:", m_impl->inspectorDrawer);
     stLbl->setStyleSheet("font-size: 11px; color: #94a3b8;");
     statusRow->addWidget(stLbl);
-    m_impl->installStateBadge = new QLabel("Available in Feed", m_impl->inspectorDrawer);
+    m_impl->installStateBadge = new QLabel("Available", m_impl->inspectorDrawer);
     m_impl->installStateBadge->setStyleSheet("font-size: 11px;");
     statusRow->addWidget(m_impl->installStateBadge, 1);
     drawerLayout->addLayout(statusRow);
@@ -889,27 +910,30 @@ void OpenHubBrowserWidget::setupUi()
     dlLayout->addWidget(m_impl->downloadProgressBar);
 
     m_impl->downloadTelemetryLabel =
-        new QLabel("Downloading: 0% (0.0 MB/s, ETA: —)", m_impl->downloadProgressBox);
+        new QLabel("Downloading: 0% (0.0 MB/s)", m_impl->downloadProgressBox);
     m_impl->downloadTelemetryLabel->setStyleSheet("font-size: 10px; color: #38bdf8;");
     dlLayout->addWidget(m_impl->downloadTelemetryLabel);
 
     m_impl->downloadProgressBox->setVisible(false);
     drawerLayout->addWidget(m_impl->downloadProgressBox);
 
-    // 1-Click Install Button
-    m_impl->installDownloadBtn =
-        new QPushButton("1-Click Install (.wwpkg)", m_impl->inspectorDrawer);
+    // Install Button
+    m_impl->installDownloadBtn = new QPushButton("Install", m_impl->inspectorDrawer);
+    m_impl->installDownloadBtn->setFixedHeight(30);
     m_impl->installDownloadBtn->setStyleSheet(STYLE_BUTTON_PRIMARY);
     drawerLayout->addWidget(m_impl->installDownloadBtn);
 
     // Apply to Monitor Row
     auto *applyRow = new QHBoxLayout();
+    applyRow->setSpacing(8);
     m_impl->monitorTargetCombo = new QComboBox(m_impl->inspectorDrawer);
     m_impl->monitorTargetCombo->addItems({"All Displays", "DP-1", "HDMI-A-1"});
+    m_impl->monitorTargetCombo->setFixedHeight(28);
     m_impl->monitorTargetCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
     applyRow->addWidget(m_impl->monitorTargetCombo, 1);
 
-    m_impl->applyToMonitorBtn = new QPushButton("▶ Apply to Wallpaper", m_impl->inspectorDrawer);
+    m_impl->applyToMonitorBtn = new QPushButton("Apply", m_impl->inspectorDrawer);
+    m_impl->applyToMonitorBtn->setFixedHeight(28);
     m_impl->applyToMonitorBtn->setStyleSheet(STYLE_BUTTON_SECONDARY);
     applyRow->addWidget(m_impl->applyToMonitorBtn, 1);
     drawerLayout->addLayout(applyRow);
@@ -919,18 +943,18 @@ void OpenHubBrowserWidget::setupUi()
     m_impl->inspectorScrollArea->setWidget(m_impl->inspectorDrawer);
     m_impl->mainSplitter->addWidget(m_impl->inspectorScrollArea);
 
-    m_impl->mainSplitter->setStretchFactor(0, 72);
-    m_impl->mainSplitter->setStretchFactor(1, 28);
+    m_impl->mainSplitter->setStretchFactor(0, 60);
+    m_impl->mainSplitter->setStretchFactor(1, 40);
     rootLayout->addWidget(m_impl->mainSplitter, 1);
 
     // 3. Bottom Status Strip
     auto *bottomStrip = new QFrame(this);
     bottomStrip->setStyleSheet(
-        "background-color: #14171c; border-top: 1px solid #2b303c; padding: 2px;");
+        "background-color: #14171c; border-top: 1px solid #262b36; padding: 2px;");
     auto *bottomLayout = new QHBoxLayout(bottomStrip);
     bottomLayout->setContentsMargins(10, 4, 10, 4);
 
-    m_impl->statusTelemetryLabel = new QLabel("WayWal Open Hub Feed Ready", bottomStrip);
+    m_impl->statusTelemetryLabel = new QLabel("Open Hub Ready", bottomStrip);
     m_impl->statusTelemetryLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     bottomLayout->addWidget(m_impl->statusTelemetryLabel);
     bottomLayout->addStretch();
@@ -1168,10 +1192,10 @@ void OpenHubBrowserWidget::onDownloadProgressUpdated(const QString &packageId, f
                                   : 0;
 
             m_impl->downloadTelemetryLabel->setText(
-                QString("Downloading .wwpkg: %1 / %2 (%.1f MB/s, ETA: %3s)")
+                QString("Downloading .wwpkg: %1 / %2 (%3 MB/s, ETA: %4s)")
                     .arg(formatBytes(downloadedBytes))
                     .arg(formatBytes(rec.file_size_bytes))
-                    .arg(speedMiB)
+                    .arg(speedMiB, 0, 'f', 1)
                     .arg(etaSec));
         }
     }

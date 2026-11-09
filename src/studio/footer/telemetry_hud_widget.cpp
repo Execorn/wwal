@@ -51,32 +51,32 @@ void TelemetryHudWidget::setupUi()
 {
     auto *rootLayout = new QHBoxLayout(this);
     rootLayout->setContentsMargins(2, 2, 2, 2);
-    rootLayout->setSpacing(3);
+    rootLayout->setSpacing(4);
 
     const QString badgeBaseStyle = "QLabel {"
-                                   "  background-color: #0f172a;"
-                                   "  border: 1px solid #1e293b;"
+                                   "  background-color: #181b22;"
+                                   "  border: 1px solid #262b36;"
                                    "  border-radius: 4px;"
                                    "  font-family: monospace;"
                                    "  font-size: 9px;"
                                    "  font-weight: 600;"
-                                   "  padding: 2px 3px;"
+                                   "  padding: 2px 4px;"
                                    "}";
 
     // Output selector combo box
     m_outputCombo = new QComboBox(this);
-    m_outputCombo->setFixedSize(46, 22);
+    m_outputCombo->setFixedSize(48, 22);
     m_outputCombo->setStyleSheet("QComboBox {"
-                                 "  background-color: #1e293b;"
+                                 "  background-color: #181b22;"
                                  "  color: #f1f5f9;"
-                                 "  border: 1px solid #334155;"
+                                 "  border: 1px solid #2c3240;"
                                  "  border-radius: 4px;"
-                                 "  padding: 1px 3px;"
+                                 "  padding: 1px 4px;"
                                  "  font-size: 9px;"
                                  "  font-weight: bold;"
                                  "}"
                                  "QComboBox:hover {"
-                                 "  border-color: #06b6d4;"
+                                 "  border-color: #38bdf8;"
                                  "}"
                                  "QComboBox::drop-down {"
                                  "  subcontrol-origin: padding;"
@@ -85,14 +85,14 @@ void TelemetryHudWidget::setupUi()
                                  "  border-left: none;"
                                  "}"
                                  "QComboBox QAbstractItemView {"
-                                 "  background-color: #0f172a;"
+                                 "  background-color: #12141a;"
                                  "  color: #f1f5f9;"
-                                 "  border: 1px solid #334155;"
+                                 "  border: 1px solid #2c3240;"
                                  "  selection-background-color: #0284c7;"
                                  "  selection-color: #ffffff;"
                                  "}");
     m_outputCombo->addItem("ALL");
-    m_outputCombo->setToolTip("Active Wayland Output Display");
+    m_outputCombo->setToolTip("Selected Wayland output");
     connect(m_outputCombo, &QComboBox::currentIndexChanged, this,
             &TelemetryHudWidget::onOutputComboChanged);
     rootLayout->addWidget(m_outputCombo);
@@ -102,16 +102,16 @@ void TelemetryHudWidget::setupUi()
     m_fpsBadge->setFixedHeight(22);
     m_fpsBadge->setAlignment(Qt::AlignCenter);
     m_fpsBadge->setStyleSheet(badgeBaseStyle + "QLabel { color: #34d399; border-color: #065f46; }");
-    m_fpsBadge->setToolTip("wp_presentation Hardware Scanout Refresh Rate");
+    m_fpsBadge->setToolTip("Display scanout frame rate");
     rootLayout->addWidget(m_fpsBadge);
 
     // GPU Compute Time Badge
-    m_computeBadge = new QLabel("-- µs", this);
+    m_computeBadge = new QLabel("-- us", this);
     m_computeBadge->setFixedHeight(22);
     m_computeBadge->setAlignment(Qt::AlignCenter);
     m_computeBadge->setStyleSheet(badgeBaseStyle +
                                   "QLabel { color: #38bdf8; border-color: #0369a1; }");
-    m_computeBadge->setToolTip("GPU Compute Shader Pass Duration");
+    m_computeBadge->setToolTip("GPU compute pass duration");
     rootLayout->addWidget(m_computeBadge);
 
     // Daemon VRAM Footprint Badge
@@ -120,7 +120,7 @@ void TelemetryHudWidget::setupUi()
     m_vramBadge->setAlignment(Qt::AlignCenter);
     m_vramBadge->setStyleSheet(badgeBaseStyle +
                                "QLabel { color: #c084fc; border-color: #7e22ce; }");
-    m_vramBadge->setToolTip("Daemon GPU VRAM Footprint");
+    m_vramBadge->setToolTip("Daemon GPU VRAM usage");
     rootLayout->addWidget(m_vramBadge);
 
     // Daemon PSS Badge
@@ -128,7 +128,7 @@ void TelemetryHudWidget::setupUi()
     m_pssBadge->setFixedHeight(22);
     m_pssBadge->setAlignment(Qt::AlignCenter);
     m_pssBadge->setStyleSheet(badgeBaseStyle + "QLabel { color: #94a3b8; border-color: #334155; }");
-    m_pssBadge->setToolTip("Daemon Proportional Set Size (PSS)");
+    m_pssBadge->setToolTip("Daemon proportional memory usage (PSS)");
     rootLayout->addWidget(m_pssBadge);
 
     // Studio RSS Badge
@@ -137,13 +137,13 @@ void TelemetryHudWidget::setupUi()
     m_studioRssBadge->setAlignment(Qt::AlignCenter);
     m_studioRssBadge->setStyleSheet(badgeBaseStyle +
                                     "QLabel { color: #fbbf24; border-color: #b45309; }");
-    m_studioRssBadge->setToolTip("wwal-studio Resident Set Size (VmRSS from /proc/self/status)");
+    m_studioRssBadge->setToolTip("WayWal Studio memory usage (VmRSS)");
     rootLayout->addWidget(m_studioRssBadge);
 
     // 4-Slot DMA-BUF Ring Buffer Visualizer layout
     auto *ringLayout = new QHBoxLayout();
-    ringLayout->setSpacing(2);
-    ringLayout->setContentsMargins(1, 0, 0, 0);
+    ringLayout->setSpacing(3);
+    ringLayout->setContentsMargins(2, 0, 0, 0);
 
     for (size_t i = 0; i < DmabufRingSlots; ++i) {
         char nameBuf[16];
@@ -152,9 +152,9 @@ void TelemetryHudWidget::setupUi()
         slotLabel->setAlignment(Qt::AlignCenter);
         slotLabel->setFixedSize(22, 18);
         slotLabel->setStyleSheet("QLabel {"
-                                 "  background-color: #1e293b;"
+                                 "  background-color: #181b22;"
                                  "  color: #64748b;"
-                                 "  border: 1px solid #334155;"
+                                 "  border: 1px solid #2c3240;"
                                  "  border-radius: 3px;"
                                  "  font-family: monospace;"
                                  "  font-size: 8px;"
@@ -280,7 +280,7 @@ void TelemetryHudWidget::updateLabels()
         } else {
             m_fpsBadge->setText("0 FPS");
             m_fpsBadge->setStyleSheet(
-                "QLabel { background-color: #1e293b; color: #64748b; border: 1px solid #334155; "
+                "QLabel { background-color: #181b22; color: #64748b; border: 1px solid #2c3240; "
                 "border-radius: 4px; font-family: monospace; font-size: 9.5px; font-weight: 600; "
                 "padding: 2px 4px; }");
         }
@@ -291,7 +291,7 @@ void TelemetryHudWidget::updateLabels()
         if (m_lastRenderUs >= 1000) {
             std::snprintf(buf, sizeof(buf), "%.1fms", static_cast<float>(m_lastRenderUs) / 1000.0f);
         } else {
-            std::snprintf(buf, sizeof(buf), "%uµs", m_lastRenderUs);
+            std::snprintf(buf, sizeof(buf), "%uus", m_lastRenderUs);
         }
         m_computeBadge->setText(buf);
     }

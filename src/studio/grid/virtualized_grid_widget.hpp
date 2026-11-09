@@ -69,6 +69,8 @@ class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
     void selectRange(uint32_t from_id, uint32_t to_id);
     void clearSelection();
     void resetHoverState();
+    void setEmbeddedMode(bool embedded) noexcept { m_embeddedMode = embedded; }
+    [[nodiscard]] bool isEmbeddedMode() const noexcept { return m_embeddedMode; }
     [[nodiscard]] const std::unordered_set<uint32_t> &selectedIds() const noexcept
     {
         return m_selectedIds;
@@ -102,6 +104,7 @@ class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
     HoverPreviewController &m_hover;
 
     int m_scrollY{0};
+    bool m_embeddedMode{false};
     std::optional<size_t> m_hoveredFilteredIdx;
     std::unordered_set<uint32_t> m_selectedIds;
     std::optional<uint32_t> m_lastSelectedId;
@@ -131,6 +134,9 @@ class VirtualizedGridWidget : public QWidget {
     void scanWallpapers(const std::vector<std::string> &extra_paths = {});
     void populateSampleCatalogIfEmpty(bool force_showcase_cards = false);
     void selectFirstItemIfAvailable();
+    void setEmbeddedMode(bool embedded);
+    [[nodiscard]] bool isEmbeddedMode() const noexcept { return m_embeddedMode; }
+    void refreshCatalogView();
 
   public slots:
     void openFolderSettingsDialog();
@@ -163,8 +169,10 @@ class VirtualizedGridWidget : public QWidget {
     FuzzyCatalogIndex m_index;
     GpuTexturePool m_pool;
     HoverPreviewController m_hover;
+    bool m_embeddedMode{false};
 
     // UI Widgets
+    QWidget *m_headerContainer{nullptr};
     QLineEdit *m_searchEdit{nullptr};
     QComboBox *m_sortCombo{nullptr};
     QPushButton *m_foldersButton{nullptr};

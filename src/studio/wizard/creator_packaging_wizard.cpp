@@ -148,9 +148,8 @@ void addPubkeyToTrustedKeys(const QString &pubkeyHex)
 SourceIntakePage::SourceIntakePage(CreatorPackagingContext *ctx, QWidget *parent)
     : QWizardPage(parent), m_ctx(ctx)
 {
-    setTitle(QStringLiteral("Step 1: Source Intake & Project Detection"));
-    setSubTitle(QStringLiteral(
-        "Select your wallpaper project directory or individual GLSL shader/scene file."));
+    setTitle(QStringLiteral("Step 1: Source Files"));
+    setSubTitle(QStringLiteral("Select a wallpaper project folder or shader file to package."));
     setupUi();
 }
 
@@ -160,11 +159,12 @@ void SourceIntakePage::setupUi()
     layout->setSpacing(12);
 
     // Source path group
-    auto *pathGroup = new QGroupBox(QStringLiteral("Wallpaper Source Intake"), this);
+    auto *pathGroup = new QGroupBox(QStringLiteral("Project Source"), this);
     auto *pathLayout = new QVBoxLayout(pathGroup);
-    pathLayout->setSpacing(8);
+    pathLayout->setSpacing(10);
 
     auto *rowLayout = new QHBoxLayout();
+    rowLayout->setSpacing(8);
     m_sourcePathEdit = new QLineEdit(pathGroup);
     m_sourcePathEdit->setPlaceholderText(
         QStringLiteral("Select project folder, shader (.frag/.comp), or scene.json..."));
@@ -180,22 +180,23 @@ void SourceIntakePage::setupUi()
 
     // Project Type dropdown
     auto *typeLayout = new QHBoxLayout();
+    typeLayout->setSpacing(8);
     auto *typeLabel = new QLabel(QStringLiteral("Package Type:"), pathGroup);
     typeLabel->setFixedWidth(110);
     typeLayout->addWidget(typeLabel);
 
     m_typeCombo = new QComboBox(pathGroup);
-    m_typeCombo->addItem(QStringLiteral("GLSL Fragment Shader (shader_fragment)"),
+    m_typeCombo->addItem(QStringLiteral("Fragment Shader"),
                          QVariant(static_cast<int>(WWPKG_TYPE_SHADER_FRAGMENT)));
-    m_typeCombo->addItem(QStringLiteral("GLSL Compute Shader (shader_compute)"),
+    m_typeCombo->addItem(QStringLiteral("Compute Shader"),
                          QVariant(static_cast<int>(WWPKG_TYPE_SHADER_COMPUTE)));
-    m_typeCombo->addItem(QStringLiteral("2D Scene Wallpaper (scene_2d)"),
+    m_typeCombo->addItem(QStringLiteral("2D Scene"),
                          QVariant(static_cast<int>(WWPKG_TYPE_SCENE_2D)));
-    m_typeCombo->addItem(QStringLiteral("Skeletal Puppet Scene (scene_puppet)"),
+    m_typeCombo->addItem(QStringLiteral("Puppet Scene"),
                          QVariant(static_cast<int>(WWPKG_TYPE_SCENE_PUPPET)));
-    m_typeCombo->addItem(QStringLiteral("Particle System Scene (scene_particles)"),
+    m_typeCombo->addItem(QStringLiteral("Particle Scene"),
                          QVariant(static_cast<int>(WWPKG_TYPE_SCENE_PARTICLES)));
-    m_typeCombo->addItem(QStringLiteral("Video Stream Wallpaper (video_stream)"),
+    m_typeCombo->addItem(QStringLiteral("Video Wallpaper"),
                          QVariant(static_cast<int>(WWPKG_TYPE_VIDEO_STREAM)));
     typeLayout->addWidget(m_typeCombo, 1);
 
@@ -203,17 +204,17 @@ void SourceIntakePage::setupUi()
     layout->addWidget(pathGroup);
 
     // Analysis results card
-    auto *analysisGroup = new QGroupBox(QStringLiteral("Automated Intake Analysis"), this);
+    auto *analysisGroup = new QGroupBox(QStringLiteral("Project Summary"), this);
     auto *analysisLayout = new QGridLayout(analysisGroup);
     analysisLayout->setHorizontalSpacing(16);
-    analysisLayout->setVerticalSpacing(6);
+    analysisLayout->setVerticalSpacing(8);
 
-    analysisLayout->addWidget(new QLabel(QStringLiteral("Detected Title:"), analysisGroup), 0, 0);
+    analysisLayout->addWidget(new QLabel(QStringLiteral("Title:"), analysisGroup), 0, 0);
     m_detectedTitleLabel = new QLabel(QStringLiteral("None"), analysisGroup);
-    m_detectedTitleLabel->setStyleSheet(QStringLiteral("font-weight: bold; color: #60a5fa;"));
+    m_detectedTitleLabel->setStyleSheet(QStringLiteral("font-weight: bold; color: #38bdf8;"));
     analysisLayout->addWidget(m_detectedTitleLabel, 0, 1);
 
-    analysisLayout->addWidget(new QLabel(QStringLiteral("Detected Author:"), analysisGroup), 1, 0);
+    analysisLayout->addWidget(new QLabel(QStringLiteral("Author:"), analysisGroup), 1, 0);
     m_detectedAuthorLabel = new QLabel(QStringLiteral("None"), analysisGroup);
     analysisLayout->addWidget(m_detectedAuthorLabel, 1, 1);
 
@@ -222,16 +223,16 @@ void SourceIntakePage::setupUi()
     m_entrypointLabel->setStyleSheet(QStringLiteral("font-family: monospace; color: #34d399;"));
     analysisLayout->addWidget(m_entrypointLabel, 2, 1);
 
-    analysisLayout->addWidget(new QLabel(QStringLiteral("Assets Detected:"), analysisGroup), 3, 0);
+    analysisLayout->addWidget(new QLabel(QStringLiteral("Files:"), analysisGroup), 3, 0);
     m_fileCountLabel = new QLabel(QStringLiteral("0 files (0 B)"), analysisGroup);
     analysisLayout->addWidget(m_fileCountLabel, 3, 1);
 
     layout->addWidget(analysisGroup);
 
     // Status message
-    m_statusLabel = new QLabel(
-        QStringLiteral("Please select a project directory or shader file to begin."), this);
-    m_statusLabel->setStyleSheet(QStringLiteral("color: #9a9a9e; font-style: italic;"));
+    m_statusLabel =
+        new QLabel(QStringLiteral("Select a project directory or shader file to continue."), this);
+    m_statusLabel->setStyleSheet(QStringLiteral("color: #94a3b8;"));
     layout->addWidget(m_statusLabel);
 
     layout->addStretch();
@@ -320,8 +321,8 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
         m_fileCountLabel->setText(QStringLiteral("0 files (0 B)"));
         m_statusLabel->setText(
             path.isEmpty()
-                ? QStringLiteral("Please select a project directory or shader file to begin.")
-                : QStringLiteral("Path does not exist on disk."));
+                ? QStringLiteral("Select a project directory or shader file to continue.")
+                : QStringLiteral("Selected path does not exist."));
         m_statusLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
         emit completeChanged();
         return;
@@ -450,8 +451,7 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
     m_fileCountLabel->setText(
         QStringLiteral("%1 files (%2)").arg(fileCount).arg(formatBytes(totalBytes)));
 
-    m_statusLabel->setText(
-        QStringLiteral("Source validated: %1 asset(s) ready for bundling.").arg(fileCount));
+    m_statusLabel->setText(QStringLiteral("Source ready: %1 file(s) found.").arg(fileCount));
     m_statusLabel->setStyleSheet(QStringLiteral("color: #10b981; font-weight: bold;"));
 
     emit completeChanged();
@@ -478,9 +478,8 @@ bool SourceIntakePage::validatePage()
 AssetBundlingPage::AssetBundlingPage(CreatorPackagingContext *ctx, QWidget *parent)
     : QWizardPage(parent), m_ctx(ctx)
 {
-    setTitle(QStringLiteral("Step 2: Asset Bundling & Optimization"));
-    setSubTitle(QStringLiteral("Inspect referenced assets, prune unreferenced dead files, and "
-                               "transcode uncompressed textures."));
+    setTitle(QStringLiteral("Step 2: Assets"));
+    setSubTitle(QStringLiteral("Review included files and compression settings."));
     setupUi();
 }
 
@@ -490,13 +489,13 @@ void AssetBundlingPage::setupUi()
     layout->setSpacing(10);
 
     m_summaryLabel = new QLabel(QStringLiteral("Scanning assets..."), this);
-    m_summaryLabel->setStyleSheet(QStringLiteral("color: #9a9a9e; font-size: 11px;"));
+    m_summaryLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
     layout->addWidget(m_summaryLabel);
 
     m_assetTree = new QTreeWidget(this);
     m_assetTree->setColumnCount(4);
-    m_assetTree->setHeaderLabels({QStringLiteral("Relative Path"), QStringLiteral("Category"),
-                                  QStringLiteral("Size"), QStringLiteral("Packaging Action")});
+    m_assetTree->setHeaderLabels({QStringLiteral("File"), QStringLiteral("Type"),
+                                  QStringLiteral("Size"), QStringLiteral("Action")});
     m_assetTree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_assetTree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_assetTree->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
@@ -504,27 +503,24 @@ void AssetBundlingPage::setupUi()
     m_assetTree->setAlternatingRowColors(true);
     layout->addWidget(m_assetTree, 1);
 
-    auto *optGroup = new QGroupBox(QStringLiteral("Optimization & Pruning Directives"), this);
+    auto *optGroup = new QGroupBox(QStringLiteral("Asset Options"), this);
     auto *optLayout = new QVBoxLayout(optGroup);
-    optLayout->setSpacing(6);
+    optLayout->setSpacing(8);
 
     m_pruneCheck = new QCheckBox(
-        QStringLiteral(
-            "Prune unreferenced & temporary files (.git, .DS_Store, *.bak, dead assets)"),
-        optGroup);
+        QStringLiteral("Exclude temporary and unused files (.git, .DS_Store, *.bak)"), optGroup);
     m_pruneCheck->setChecked(true);
     optLayout->addWidget(m_pruneCheck);
 
-    m_transcodeCheck = new QCheckBox(
-        QStringLiteral("Transcode textures and preview cards to WebP for maximum compression"),
-        optGroup);
+    m_transcodeCheck =
+        new QCheckBox(QStringLiteral("Convert PNG and BMP textures to WebP"), optGroup);
     m_transcodeCheck->setChecked(true);
     optLayout->addWidget(m_transcodeCheck);
 
     layout->addWidget(optGroup);
 
     auto *btnLayout = new QHBoxLayout();
-    m_rescanBtn = new QPushButton(QStringLiteral("↻ Re-scan Assets"), this);
+    m_rescanBtn = new QPushButton(QStringLiteral("Rescan Assets"), this);
     btnLayout->addWidget(m_rescanBtn);
     btnLayout->addStretch();
     layout->addLayout(btnLayout);
@@ -566,7 +562,7 @@ void AssetBundlingPage::scanAssets()
                 lower.startsWith(QStringLiteral(".ds_store")) ||
                 lower.endsWith(QStringLiteral(".bak")) || lower.endsWith(QStringLiteral(".tmp")) ||
                 lower.endsWith(QStringLiteral("~"))) {
-                entry.category = QStringLiteral("dead/temporary");
+                entry.category = QStringLiteral("temporary");
                 entry.isReferenced = false;
                 deadCount++;
             } else if (lower.endsWith(QStringLiteral(".frag")) ||
@@ -606,15 +602,15 @@ void AssetBundlingPage::scanAssets()
             item->setText(2, formatBytes(entry.sizeBytes));
 
             if (!entry.isReferenced) {
-                item->setText(3, QStringLiteral("Prune (Discard)"));
+                item->setText(3, QStringLiteral("Exclude"));
                 item->setForeground(3, QBrush(QColor(QStringLiteral("#ef4444"))));
             } else if (entry.category == QStringLiteral("texture") &&
                        (lower.endsWith(QStringLiteral(".png")) ||
                         lower.endsWith(QStringLiteral(".bmp")))) {
-                item->setText(3, QStringLiteral("Bundle & Transcode to WebP"));
+                item->setText(3, QStringLiteral("Convert to WebP"));
                 item->setForeground(3, QBrush(QColor(QStringLiteral("#38bdf8"))));
             } else {
-                item->setText(3, QStringLiteral("Bundle"));
+                item->setText(3, QStringLiteral("Include"));
                 item->setForeground(3, QBrush(QColor(QStringLiteral("#34d399"))));
             }
         }
@@ -633,15 +629,14 @@ void AssetBundlingPage::scanAssets()
         item->setText(0, entry.relativePath);
         item->setText(1, entry.category);
         item->setText(2, formatBytes(entry.sizeBytes));
-        item->setText(3, QStringLiteral("Bundle into shaders/"));
+        item->setText(3, QStringLiteral("Include in shaders/"));
         item->setForeground(3, QBrush(QColor(QStringLiteral("#34d399"))));
     }
 
-    m_summaryLabel->setText(
-        QStringLiteral("Scanned %1 asset(s) totaling %2. %3 marked as dead/temporary.")
-            .arg(m_ctx->scannedAssets.size())
-            .arg(formatBytes(totalSize))
-            .arg(deadCount));
+    m_summaryLabel->setText(QStringLiteral("Found %1 file(s) (%2). %3 marked for exclusion.")
+                                .arg(m_ctx->scannedAssets.size())
+                                .arg(formatBytes(totalSize))
+                                .arg(deadCount));
 }
 
 bool AssetBundlingPage::validatePage()
@@ -717,9 +712,8 @@ bool AssetBundlingPage::validatePage()
 MetadataPreviewPage::MetadataPreviewPage(CreatorPackagingContext *ctx, QWidget *parent)
     : QWizardPage(parent), m_ctx(ctx)
 {
-    setTitle(QStringLiteral("Step 3: Metadata, SPDX License & Automated Preview Capture"));
-    setSubTitle(QStringLiteral("Validate package slug, SemVer, author credentials, and capture an "
-                               "offscreen 512x288 preview."));
+    setTitle(QStringLiteral("Step 3: Details & Preview"));
+    setSubTitle(QStringLiteral("Set the package name, version, license, and preview image."));
     setupUi();
 }
 
@@ -729,56 +723,56 @@ void MetadataPreviewPage::setupUi()
     mainLayout->setSpacing(16);
 
     // Left column: Metadata fields
-    auto *metaGroup = new QGroupBox(QStringLiteral("Package Identity & Manifest"), this);
+    auto *metaGroup = new QGroupBox(QStringLiteral("Package Details"), this);
     auto *form = new QGridLayout(metaGroup);
     form->setHorizontalSpacing(10);
-    form->setVerticalSpacing(6);
+    form->setVerticalSpacing(8);
 
     int row = 0;
 
     // Package ID
-    form->addWidget(new QLabel(QStringLiteral("Package UUID:"), metaGroup), row, 0);
+    form->addWidget(new QLabel(QStringLiteral("Package ID:"), metaGroup), row, 0);
     m_idEdit = new QLineEdit(metaGroup);
     m_idEdit->setReadOnly(true);
-    m_idEdit->setStyleSheet(QStringLiteral("font-family: monospace; color: #9a9a9e;"));
+    m_idEdit->setStyleSheet(QStringLiteral("font-family: monospace; color: #94a3b8;"));
     form->addWidget(m_idEdit, row++, 1, 1, 2);
 
     // Slug
-    form->addWidget(new QLabel(QStringLiteral("Package Slug:"), metaGroup), row, 0);
+    form->addWidget(new QLabel(QStringLiteral("Slug:"), metaGroup), row, 0);
     m_slugEdit = new QLineEdit(metaGroup);
-    m_slugEdit->setPlaceholderText(QStringLiteral("lowercase-hyphenated-identifier"));
+    m_slugEdit->setPlaceholderText(QStringLiteral("lowercase-hyphenated-name"));
     form->addWidget(m_slugEdit, row, 1);
-    m_slugValidationLabel = new QLabel(QStringLiteral("✓"), metaGroup);
+    m_slugValidationLabel = new QLabel(QStringLiteral("Valid"), metaGroup);
     m_slugValidationLabel->setStyleSheet(QStringLiteral("color: #10b981; font-weight: bold;"));
     form->addWidget(m_slugValidationLabel, row++, 2);
 
     // Name
-    form->addWidget(new QLabel(QStringLiteral("Display Name:"), metaGroup), row, 0);
+    form->addWidget(new QLabel(QStringLiteral("Title:"), metaGroup), row, 0);
     m_nameEdit = new QLineEdit(metaGroup);
-    m_nameEdit->setPlaceholderText(QStringLiteral("Human-readable wallpaper title"));
+    m_nameEdit->setPlaceholderText(QStringLiteral("Wallpaper title"));
     form->addWidget(m_nameEdit, row++, 1, 1, 2);
 
     // Version
-    form->addWidget(new QLabel(QStringLiteral("SemVer Version:"), metaGroup), row, 0);
+    form->addWidget(new QLabel(QStringLiteral("Version:"), metaGroup), row, 0);
     m_versionEdit = new QLineEdit(metaGroup);
     m_versionEdit->setPlaceholderText(QStringLiteral("1.0.0"));
     form->addWidget(m_versionEdit, row, 1);
-    m_versionValidationLabel = new QLabel(QStringLiteral("✓"), metaGroup);
+    m_versionValidationLabel = new QLabel(QStringLiteral("Valid"), metaGroup);
     m_versionValidationLabel->setStyleSheet(QStringLiteral("color: #10b981; font-weight: bold;"));
     form->addWidget(m_versionValidationLabel, row++, 2);
 
     // Author Name & Email
-    form->addWidget(new QLabel(QStringLiteral("Author Name:"), metaGroup), row, 0);
+    form->addWidget(new QLabel(QStringLiteral("Author:"), metaGroup), row, 0);
     m_authorNameEdit = new QLineEdit(metaGroup);
     form->addWidget(m_authorNameEdit, row++, 1, 1, 2);
 
-    form->addWidget(new QLabel(QStringLiteral("Author Email:"), metaGroup), row, 0);
+    form->addWidget(new QLabel(QStringLiteral("Email:"), metaGroup), row, 0);
     m_authorEmailEdit = new QLineEdit(metaGroup);
-    m_authorEmailEdit->setPlaceholderText(QStringLiteral("author@domain.org"));
+    m_authorEmailEdit->setPlaceholderText(QStringLiteral("author@example.com"));
     form->addWidget(m_authorEmailEdit, row++, 1, 1, 2);
 
     // SPDX License
-    form->addWidget(new QLabel(QStringLiteral("SPDX License:"), metaGroup), row, 0);
+    form->addWidget(new QLabel(QStringLiteral("License:"), metaGroup), row, 0);
     m_licenseCombo = new QComboBox(metaGroup);
     m_licenseCombo->setEditable(true);
     m_licenseCombo->addItems(
@@ -788,21 +782,22 @@ void MetadataPreviewPage::setupUi()
     form->addWidget(m_licenseCombo, row++, 1, 1, 2);
 
     // Tags
-    form->addWidget(new QLabel(QStringLiteral("Tags (CSV):"), metaGroup), row, 0);
+    form->addWidget(new QLabel(QStringLiteral("Tags:"), metaGroup), row, 0);
     m_tagsEdit = new QLineEdit(metaGroup);
-    m_tagsEdit->setPlaceholderText(QStringLiteral("cyberpunk, anime, audio-reactive, 60fps"));
+    m_tagsEdit->setPlaceholderText(QStringLiteral("abstract, audio-reactive, 60fps"));
     form->addWidget(m_tagsEdit, row++, 1, 1, 2);
 
     // Target FPS & VRAM
     auto *budgetRow = new QHBoxLayout();
-    budgetRow->addWidget(new QLabel(QStringLiteral("FPS:"), metaGroup));
+    budgetRow->setSpacing(8);
+    budgetRow->addWidget(new QLabel(QStringLiteral("Target FPS:"), metaGroup));
     m_fpsCombo = new QComboBox(metaGroup);
     m_fpsCombo->addItems(
         {QStringLiteral("30"), QStringLiteral("60"), QStringLiteral("120"), QStringLiteral("144")});
     m_fpsCombo->setCurrentText(QStringLiteral("60"));
     budgetRow->addWidget(m_fpsCombo);
 
-    budgetRow->addWidget(new QLabel(QStringLiteral("Max VRAM:"), metaGroup));
+    budgetRow->addWidget(new QLabel(QStringLiteral("VRAM Limit:"), metaGroup));
     m_vramSpin = new QSpinBox(metaGroup);
     m_vramSpin->setRange(32, 2048);
     m_vramSpin->setValue(256);
@@ -814,32 +809,30 @@ void MetadataPreviewPage::setupUi()
     // Description
     form->addWidget(new QLabel(QStringLiteral("Description:"), metaGroup), row, 0);
     m_descriptionEdit = new QTextEdit(metaGroup);
-    m_descriptionEdit->setPlaceholderText(
-        QStringLiteral("Wallpaper summary, interactive controls, audio dynamics..."));
+    m_descriptionEdit->setPlaceholderText(QStringLiteral("Short description of the wallpaper..."));
     m_descriptionEdit->setMaximumHeight(80);
     form->addWidget(m_descriptionEdit, row++, 1, 1, 2);
 
     mainLayout->addWidget(metaGroup, 3);
 
     // Right column: Preview Capture Box
-    auto *previewGroup = new QGroupBox(QStringLiteral("512x288 Automated Preview Capture"), this);
+    auto *previewGroup = new QGroupBox(QStringLiteral("Preview Image"), this);
     auto *previewLayout = new QVBoxLayout(previewGroup);
-    previewLayout->setSpacing(8);
+    previewLayout->setSpacing(10);
 
     m_previewDisplay = new QLabel(previewGroup);
     m_previewDisplay->setFixedSize(256, 144);
     m_previewDisplay->setStyleSheet(QStringLiteral(
-        "border: 2px solid #334155; background-color: #0f172a; border-radius: 4px;"));
+        "border: 1px solid #2c3240; background-color: #12141a; border-radius: 4px;"));
     m_previewDisplay->setAlignment(Qt::AlignCenter);
     previewLayout->addWidget(m_previewDisplay, 0, Qt::AlignCenter);
 
-    m_previewInfoLabel =
-        new QLabel(QStringLiteral("Offscreen 512x288 WebP & 1280x720 JPEG"), previewGroup);
-    m_previewInfoLabel->setStyleSheet(QStringLiteral("color: #9a9a9e; font-size: 10px;"));
+    m_previewInfoLabel = new QLabel(QStringLiteral("512x288 WebP & 1280x720 JPEG"), previewGroup);
+    m_previewInfoLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
     m_previewInfoLabel->setAlignment(Qt::AlignCenter);
     previewLayout->addWidget(m_previewInfoLabel);
 
-    m_captureBtn = new QPushButton(QStringLiteral("⚡ Capture Offscreen Preview"), previewGroup);
+    m_captureBtn = new QPushButton(QStringLiteral("Generate Preview"), previewGroup);
     previewLayout->addWidget(m_captureBtn);
 
     m_browsePreviewBtn = new QPushButton(QStringLiteral("Load Custom Image..."), previewGroup);
@@ -871,9 +864,8 @@ void MetadataPreviewPage::initializePage()
     m_idEdit->setText(m_ctx->packageId);
 
     if (m_nameEdit->text().isEmpty()) {
-        m_nameEdit->setText(m_ctx->detectedTitle.isEmpty()
-                                ? QStringLiteral("WayWal Dynamic Wallpaper")
-                                : m_ctx->detectedTitle);
+        m_nameEdit->setText(m_ctx->detectedTitle.isEmpty() ? QStringLiteral("WayWal Wallpaper")
+                                                           : m_ctx->detectedTitle);
     }
 
     if (m_slugEdit->text().isEmpty()) {
@@ -889,7 +881,7 @@ void MetadataPreviewPage::initializePage()
         if (author.isEmpty()) {
             author = qEnvironmentVariable("USER");
             if (author.isEmpty())
-                author = QStringLiteral("WayWal Creator");
+                author = QStringLiteral("Creator");
         }
         m_authorNameEdit->setText(author);
     }
@@ -940,21 +932,21 @@ void MetadataPreviewPage::validateFields()
     const QString slug = m_slugEdit->text().trimmed();
     const bool slugValid = slugRegex.match(slug).hasMatch();
     if (slugValid) {
-        m_slugValidationLabel->setText(QStringLiteral("✓"));
+        m_slugValidationLabel->setText(QStringLiteral("Valid"));
         m_slugValidationLabel->setStyleSheet(QStringLiteral("color: #10b981; font-weight: bold;"));
     } else {
-        m_slugValidationLabel->setText(QStringLiteral("✗ lowercase & hyphens only"));
+        m_slugValidationLabel->setText(QStringLiteral("Use lowercase and hyphens"));
         m_slugValidationLabel->setStyleSheet(QStringLiteral("color: #ef4444; font-size: 10px;"));
     }
 
     const QString version = m_versionEdit->text().trimmed();
     const bool versionValid = semverRegex.match(version).hasMatch();
     if (versionValid) {
-        m_versionValidationLabel->setText(QStringLiteral("✓"));
+        m_versionValidationLabel->setText(QStringLiteral("Valid"));
         m_versionValidationLabel->setStyleSheet(
             QStringLiteral("color: #10b981; font-weight: bold;"));
     } else {
-        m_versionValidationLabel->setText(QStringLiteral("✗ X.Y.Z"));
+        m_versionValidationLabel->setText(QStringLiteral("Use X.Y.Z"));
         m_versionValidationLabel->setStyleSheet(QStringLiteral("color: #ef4444; font-size: 10px;"));
     }
 
@@ -975,7 +967,7 @@ bool MetadataPreviewPage::isComplete() const
 
 void MetadataPreviewPage::captureOffscreenPreview()
 {
-    // Generate an offscreen 512x288 high-fidelity preview thumbnail canvas
+    // Generate an offscreen 512x288 preview thumbnail canvas
     QImage canvas(512, 288, QImage::Format_ARGB32_Premultiplied);
     canvas.fill(Qt::transparent);
 
@@ -989,7 +981,7 @@ void MetadataPreviewPage::captureOffscreenPreview()
     bgGrad.setColorAt(1.0, QColor(0x02, 0x06, 0x17));
     painter.fillRect(canvas.rect(), bgGrad);
 
-    // Subtle aesthetic geometry pattern
+    // Subtle geometry pattern
     painter.setPen(QPen(QColor(0x38, 0xbd, 0xf8, 0x18), 1));
     for (int x = 0; x < 512; x += 32) {
         painter.drawLine(x, 0, x, 288);
@@ -1006,17 +998,19 @@ void MetadataPreviewPage::captureOffscreenPreview()
     painter.setPen(QPen(QColor(0x38, 0xbd, 0xf8, 0x80), 2));
     painter.drawEllipse(QPoint(256, 110), 48, 48);
 
-    // Modern wallpaper icon glyph
-    painter.setPen(QPen(Qt::white, 3, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-    painter.drawText(QRect(208, 62, 96, 96), Qt::AlignCenter, QStringLiteral("❖"));
+    // Monogram label
+    QFont monoFont(QStringLiteral("Sans Serif"), 18, QFont::Bold);
+    painter.setFont(monoFont);
+    painter.setPen(QPen(Qt::white, 2));
+    painter.drawText(QRect(208, 62, 96, 96), Qt::AlignCenter, QStringLiteral("WW"));
 
     // Title typography
     QFont titleFont(QStringLiteral("Sans Serif"), 16, QFont::Bold);
     painter.setFont(titleFont);
     painter.setPen(Qt::white);
-    QString title = m_nameEdit ? m_nameEdit->text() : QStringLiteral("WayWal Dynamic Wallpaper");
+    QString title = m_nameEdit ? m_nameEdit->text() : QStringLiteral("WayWal Wallpaper");
     if (title.isEmpty())
-        title = QStringLiteral("WayWal Dynamic Wallpaper");
+        title = QStringLiteral("WayWal Wallpaper");
     painter.drawText(QRect(20, 175, 472, 30), Qt::AlignCenter, title);
 
     // Author & subtitle
@@ -1025,7 +1019,7 @@ void MetadataPreviewPage::captureOffscreenPreview()
     painter.setPen(QColor(0x94, 0xa3, 0xb8));
     QString author = m_authorNameEdit ? m_authorNameEdit->text() : QStringLiteral("Creator");
     painter.drawText(QRect(20, 205, 472, 20), Qt::AlignCenter,
-                     QStringLiteral("By %1 • WayWal Open Hub").arg(author));
+                     QStringLiteral("By %1 | WayWal Open Hub").arg(author));
 
     // Badge pill
     painter.setBrush(QColor(0x0f, 0x76, 0x6e, 0xa0));
@@ -1035,7 +1029,7 @@ void MetadataPreviewPage::captureOffscreenPreview()
     painter.setFont(badgeFont);
     painter.setPen(QColor(0x5e, 0xeb, 0xd3));
     painter.drawText(QRect(186, 240, 140, 22), Qt::AlignCenter,
-                     QStringLiteral("GLES 3.1 • 60 FPS"));
+                     QStringLiteral("GLES 3.1 | 60 FPS"));
 
     painter.end();
 
@@ -1124,9 +1118,8 @@ bool MetadataPreviewPage::validatePage()
 CapabilityAuditPage::CapabilityAuditPage(CreatorPackagingContext *ctx, QWidget *parent)
     : QWizardPage(parent), m_ctx(ctx)
 {
-    setTitle(QStringLiteral("Step 4: Deterministic Capability & Sandbox Audit"));
-    setSubTitle(QStringLiteral(
-        "Audit package AST, capability flags, and ensure strict air-gap compliance."));
+    setTitle(QStringLiteral("Step 4: Compatibility Check"));
+    setSubTitle(QStringLiteral("Review shader compatibility and required permissions."));
     setupUi();
 }
 
@@ -1136,13 +1129,12 @@ void CapabilityAuditPage::setupUi()
     layout->setSpacing(12);
 
     // Top: Classification & Score Bar
-    auto *badgeBox =
-        new QGroupBox(QStringLiteral("Compatibility Classification & Hardware Grading"), this);
+    auto *badgeBox = new QGroupBox(QStringLiteral("Compatibility"), this);
     auto *badgeLayout = new QGridLayout(badgeBox);
     badgeLayout->setHorizontalSpacing(16);
     badgeLayout->setVerticalSpacing(8);
 
-    m_tierBadge = new QLabel(QStringLiteral("TIER 1: NATIVE"), badgeBox);
+    m_tierBadge = new QLabel(QStringLiteral("Native"), badgeBox);
     m_tierBadge->setStyleSheet(
         QStringLiteral("background-color: #10b981; color: white; font-weight: bold; "
                        "padding: 6px 12px; border-radius: 4px; font-size: 13px;"));
@@ -1161,65 +1153,57 @@ void CapabilityAuditPage::setupUi()
     badgeLayout->addWidget(m_scoreBar, 1, 0, 1, 2);
 
     m_metricsLabel = new QLabel(
-        QStringLiteral("Estimated VRAM: 64.0 MB • Estimated FPS: 60 • Pass Count: 6"), badgeBox);
-    m_metricsLabel->setStyleSheet(QStringLiteral("color: #9a9a9e; font-size: 11px;"));
+        QStringLiteral("Estimated VRAM: 64.0 MB | Target FPS: 60 | Passes: 6"), badgeBox);
+    m_metricsLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
     badgeLayout->addWidget(m_metricsLabel, 2, 0, 1, 2);
 
     layout->addWidget(badgeBox);
 
     // Capabilities Checklist
-    auto *capGroup =
-        new QGroupBox(QStringLiteral("Permission Sandboxing & Capability Grants"), this);
+    auto *capGroup = new QGroupBox(QStringLiteral("Permissions"), this);
     auto *capLayout = new QGridLayout(capGroup);
     capLayout->setHorizontalSpacing(20);
-    capLayout->setVerticalSpacing(6);
+    capLayout->setVerticalSpacing(8);
 
-    m_capComputeCheck = new QCheckBox(QStringLiteral("Compute Shaders (GLES 3.10)"), capGroup);
+    m_capComputeCheck = new QCheckBox(QStringLiteral("Compute Shaders (GLES 3.1)"), capGroup);
     capLayout->addWidget(m_capComputeCheck, 0, 0);
 
-    m_capAudioSpectrumCheck =
-        new QCheckBox(QStringLiteral("Audio Spectrum Uniforms (64 Bark bands)"), capGroup);
+    m_capAudioSpectrumCheck = new QCheckBox(QStringLiteral("Audio Spectrum Uniforms"), capGroup);
     capLayout->addWidget(m_capAudioSpectrumCheck, 0, 1);
 
-    m_capAudioPlaybackCheck =
-        new QCheckBox(QStringLiteral("Audio Playback (PipeWire Ducking)"), capGroup);
+    m_capAudioPlaybackCheck = new QCheckBox(QStringLiteral("Audio Playback"), capGroup);
     capLayout->addWidget(m_capAudioPlaybackCheck, 1, 0);
 
-    m_capScriptingCheck =
-        new QCheckBox(QStringLiteral("Sandboxed Scripting (QuickJS ES2020)"), capGroup);
+    m_capScriptingCheck = new QCheckBox(QStringLiteral("SceneScript (QuickJS)"), capGroup);
     capLayout->addWidget(m_capScriptingCheck, 1, 1);
 
-    m_capForeignToplevelCheck =
-        new QCheckBox(QStringLiteral("Foreign Toplevel Integration"), capGroup);
+    m_capForeignToplevelCheck = new QCheckBox(QStringLiteral("Window State Tracking"), capGroup);
     capLayout->addWidget(m_capForeignToplevelCheck, 2, 0);
 
     // Locked air-gap flags
-    m_capNetworkCheck =
-        new QCheckBox(QStringLiteral("🔒 Network Access (Permanently Locked: FALSE)"), capGroup);
+    m_capNetworkCheck = new QCheckBox(QStringLiteral("Network Access (Disabled)"), capGroup);
     m_capNetworkCheck->setChecked(false);
     m_capNetworkCheck->setEnabled(false);
-    m_capNetworkCheck->setToolTip(QStringLiteral(
-        "Air-gap invariant: .wwpkg containers are permanently forbidden from accessing network."));
-    m_capNetworkCheck->setStyleSheet(QStringLiteral("color: #9a9a9e;"));
+    m_capNetworkCheck->setToolTip(
+        QStringLiteral("Wallpaper packages run offline without network access."));
+    m_capNetworkCheck->setStyleSheet(QStringLiteral("color: #94a3b8;"));
     capLayout->addWidget(m_capNetworkCheck, 3, 0);
 
     m_capFilesystemCheck =
-        new QCheckBox(QStringLiteral("🔒 Host Filesystem (Permanently Locked: FALSE)"), capGroup);
+        new QCheckBox(QStringLiteral("Host Filesystem Access (Disabled)"), capGroup);
     m_capFilesystemCheck->setChecked(false);
     m_capFilesystemCheck->setEnabled(false);
     m_capFilesystemCheck->setToolTip(
-        QStringLiteral("Air-gap invariant: .wwpkg containers are permanently forbidden from "
-                       "accessing host filesystem."));
-    m_capFilesystemCheck->setStyleSheet(QStringLiteral("color: #9a9a9e;"));
+        QStringLiteral("Wallpaper packages cannot read or write outside their sandbox."));
+    m_capFilesystemCheck->setStyleSheet(QStringLiteral("color: #94a3b8;"));
     capLayout->addWidget(m_capFilesystemCheck, 3, 1);
 
     layout->addWidget(capGroup);
 
     // Issues & Repairs Tree
-    auto *issuesGroup =
-        new QGroupBox(QStringLiteral("Static AST Audit Issues & Auto-Repairs"), this);
+    auto *issuesGroup = new QGroupBox(QStringLiteral("Compatibility Notes"), this);
     auto *issuesLayout = new QVBoxLayout(issuesGroup);
-    issuesLayout->setSpacing(6);
+    issuesLayout->setSpacing(8);
 
     m_issuesTree = new QTreeWidget(issuesGroup);
     m_issuesTree->setColumnCount(4);
@@ -1232,11 +1216,12 @@ void CapabilityAuditPage::setupUi()
     issuesLayout->addWidget(m_issuesTree, 1);
 
     auto *repairRow = new QHBoxLayout();
-    m_repairsSummaryLabel = new QLabel(QStringLiteral("0 auto-repairs available."), issuesGroup);
-    m_repairsSummaryLabel->setStyleSheet(QStringLiteral("color: #9a9a9e; font-size: 11px;"));
+    repairRow->setSpacing(8);
+    m_repairsSummaryLabel = new QLabel(QStringLiteral("No issues detected."), issuesGroup);
+    m_repairsSummaryLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
     repairRow->addWidget(m_repairsSummaryLabel, 1);
 
-    m_applyRepairsBtn = new QPushButton(QStringLiteral("⚡ Apply Auto-Repairs"), issuesGroup);
+    m_applyRepairsBtn = new QPushButton(QStringLiteral("Apply Suggested Fixes"), issuesGroup);
     m_applyRepairsBtn->setEnabled(false);
     repairRow->addWidget(m_applyRepairsBtn);
 
@@ -1310,26 +1295,26 @@ void CapabilityAuditPage::runCompatibilityAudit()
     // Update UI Badges
     switch (m_ctx->compatTier) {
     case WE_TIER_1_NATIVE:
-        m_tierBadge->setText(QStringLiteral("TIER 1: NATIVE"));
+        m_tierBadge->setText(QStringLiteral("Native"));
         m_tierBadge->setStyleSheet(
             QStringLiteral("background-color: #10b981; color: white; font-weight: bold; "
                            "padding: 6px 12px; border-radius: 4px; font-size: 13px;"));
         break;
     case WE_TIER_2_TRANSPILED:
-        m_tierBadge->setText(QStringLiteral("TIER 2: TRANSPILED"));
+        m_tierBadge->setText(QStringLiteral("Transpiled"));
         m_tierBadge->setStyleSheet(
             QStringLiteral("background-color: #06b6d4; color: white; font-weight: bold; "
                            "padding: 6px 12px; border-radius: 4px; font-size: 13px;"));
         break;
     case WE_TIER_3_DEGRADED:
-        m_tierBadge->setText(QStringLiteral("TIER 3: DEGRADED"));
+        m_tierBadge->setText(QStringLiteral("Limited"));
         m_tierBadge->setStyleSheet(
             QStringLiteral("background-color: #f59e0b; color: white; font-weight: bold; "
                            "padding: 6px 12px; border-radius: 4px; font-size: 13px;"));
         break;
     case WE_TIER_4_BLOCKED:
     default:
-        m_tierBadge->setText(QStringLiteral("TIER 4: BLOCKED"));
+        m_tierBadge->setText(QStringLiteral("Incompatible"));
         m_tierBadge->setStyleSheet(
             QStringLiteral("background-color: #ef4444; color: white; font-weight: bold; "
                            "padding: 6px 12px; border-radius: 4px; font-size: 13px;"));
@@ -1338,11 +1323,10 @@ void CapabilityAuditPage::runCompatibilityAudit()
 
     m_scoreLabel->setText(QStringLiteral("Compatibility Score: %1/100").arg(m_ctx->compatScore));
     m_scoreBar->setValue(m_ctx->compatScore);
-    m_metricsLabel->setText(
-        QStringLiteral("Estimated VRAM: %1 MB • Estimated FPS: %2 • Issues Found: %3")
-            .arg(QString::number(m_ctx->estimatedVramMb, 'f', 1))
-            .arg(m_ctx->estimatedFps)
-            .arg(m_ctx->issues.size()));
+    m_metricsLabel->setText(QStringLiteral("Estimated VRAM: %1 MB | Target FPS: %2 | Notes: %3")
+                                .arg(QString::number(m_ctx->estimatedVramMb, 'f', 1))
+                                .arg(m_ctx->estimatedFps)
+                                .arg(m_ctx->issues.size()));
 
     // Populate issues tree
     for (const auto &iss : m_ctx->issues) {
@@ -1368,7 +1352,7 @@ void CapabilityAuditPage::runCompatibilityAudit()
             break;
         default:
             sevStr = QStringLiteral("UNKNOWN");
-            sevColor = QColor(QStringLiteral("#9a9a9e"));
+            sevColor = QColor(QStringLiteral("#94a3b8"));
             break;
         }
         item->setText(0, sevStr);
@@ -1390,12 +1374,10 @@ void CapabilityAuditPage::runCompatibilityAudit()
     // Repairs
     if (!m_ctx->repairs.isEmpty()) {
         m_repairsSummaryLabel->setText(
-            QStringLiteral("%1 auto-repair(s) available for automated application.")
-                .arg(m_ctx->repairs.size()));
+            QStringLiteral("%1 automatic fix(es) available.").arg(m_ctx->repairs.size()));
         m_applyRepairsBtn->setEnabled(true);
     } else {
-        m_repairsSummaryLabel->setText(
-            QStringLiteral("Zero outstanding auto-repairs. Shader and scene AST verified clean."));
+        m_repairsSummaryLabel->setText(QStringLiteral("No issues detected."));
         m_applyRepairsBtn->setEnabled(false);
     }
 
@@ -1433,10 +1415,9 @@ bool CapabilityAuditPage::validatePage()
 {
     if (!isComplete()) {
         QMessageBox::critical(
-            this, QStringLiteral("Packaging Blocked"),
-            QStringLiteral("This wallpaper is classified into Tier 4 (Blocked) due to security "
-                           "policies or fatal syntax errors. "
-                           "Packages in Tier 4 cannot be compiled into .wwpkg containers."));
+            this, QStringLiteral("Cannot Package Wallpaper"),
+            QStringLiteral("This wallpaper has fatal compatibility or security errors "
+                           "and cannot be packaged."));
         return false;
     }
 
@@ -1456,38 +1437,38 @@ bool CapabilityAuditPage::validatePage()
 CompilationSigningPage::CompilationSigningPage(CreatorPackagingContext *ctx, QWidget *parent)
     : QWizardPage(parent), m_ctx(ctx)
 {
-    setTitle(QStringLiteral("Step 5: Ed25519 Key Management & Merkle Compilation"));
-    setSubTitle(QStringLiteral("Manage your author cryptographic identity, build RFC 6962 Merkle "
-                               "tree, and sign the .wwpkg container."));
+    setTitle(QStringLiteral("Step 5: Sign & Build"));
+    setSubTitle(
+        QStringLiteral("Sign the package with your author key and build the .wwpkg archive."));
     setupUi();
 }
 
 void CompilationSigningPage::setupUi()
 {
     auto *layout = new QVBoxLayout(this);
-    layout->setSpacing(10);
+    layout->setSpacing(12);
 
     // Cryptographic Identity Group
-    auto *keyGroup = new QGroupBox(QStringLiteral("Author Cryptographic Identity (Ed25519)"), this);
+    auto *keyGroup = new QGroupBox(QStringLiteral("Signing Key (Ed25519)"), this);
     auto *keyLayout = new QVBoxLayout(keyGroup);
     keyLayout->setSpacing(8);
 
     auto *keyRow = new QHBoxLayout();
+    keyRow->setSpacing(8);
     m_keyPathEdit = new QLineEdit(keyGroup);
     keyRow->addWidget(m_keyPathEdit, 1);
 
     m_browseKeyBtn = new QPushButton(QStringLiteral("Browse Key..."), keyGroup);
     keyRow->addWidget(m_browseKeyBtn);
 
-    m_generateKeyBtn = new QPushButton(QStringLiteral("🔑 Generate Keypair"), keyGroup);
+    m_generateKeyBtn = new QPushButton(QStringLiteral("Generate Keypair"), keyGroup);
     m_generateKeyBtn->setStyleSheet(
-        QStringLiteral("background-color: #2563eb; color: white; font-weight: bold;"));
+        QStringLiteral("background-color: #0284c7; color: white; font-weight: bold;"));
     keyRow->addWidget(m_generateKeyBtn);
 
     keyLayout->addLayout(keyRow);
 
-    m_keyFingerprintLabel =
-        new QLabel(QStringLiteral("Public Key Fingerprint: None loaded"), keyGroup);
+    m_keyFingerprintLabel = new QLabel(QStringLiteral("Public Key: None loaded"), keyGroup);
     m_keyFingerprintLabel->setStyleSheet(
         QStringLiteral("font-family: monospace; color: #38bdf8; font-size: 11px;"));
     keyLayout->addWidget(m_keyFingerprintLabel);
@@ -1495,12 +1476,13 @@ void CompilationSigningPage::setupUi()
     layout->addWidget(keyGroup);
 
     // Output & Build Action Group
-    auto *buildGroup = new QGroupBox(QStringLiteral("Container Compilation & Signing"), this);
+    auto *buildGroup = new QGroupBox(QStringLiteral("Build Package"), this);
     auto *buildLayout = new QVBoxLayout(buildGroup);
-    buildLayout->setSpacing(8);
+    buildLayout->setSpacing(10);
 
     auto *outRow = new QHBoxLayout();
-    auto *outLbl = new QLabel(QStringLiteral("Output Package:"), buildGroup);
+    outRow->setSpacing(8);
+    auto *outLbl = new QLabel(QStringLiteral("Output File:"), buildGroup);
     outRow->addWidget(outLbl);
 
     m_outPkgPathEdit = new QLineEdit(buildGroup);
@@ -1511,15 +1493,16 @@ void CompilationSigningPage::setupUi()
     buildLayout->addLayout(outRow);
 
     auto *actRow = new QHBoxLayout();
-    m_compileBtn = new QPushButton(
-        QStringLiteral("📦 Compile & Cryptographically Sign .wwpkg Package"), buildGroup);
+    actRow->setSpacing(12);
+    m_compileBtn = new QPushButton(QStringLiteral("Build & Sign Package"), buildGroup);
     m_compileBtn->setFixedHeight(32);
-    m_compileBtn->setStyleSheet(QStringLiteral(
-        "background-color: #16a34a; color: white; font-weight: bold; font-size: 13px;"));
+    m_compileBtn->setStyleSheet(
+        QStringLiteral("background-color: #059669; color: white; font-weight: bold; font-size: "
+                       "12px; padding: 6px 16px;"));
     actRow->addWidget(m_compileBtn);
 
-    m_verificationBadge = new QLabel(QStringLiteral("Status: Not Compiled"), buildGroup);
-    m_verificationBadge->setStyleSheet(QStringLiteral("color: #9a9a9e; font-weight: bold;"));
+    m_verificationBadge = new QLabel(QStringLiteral("Status: Not Built"), buildGroup);
+    m_verificationBadge->setStyleSheet(QStringLiteral("color: #94a3b8; font-weight: bold;"));
     actRow->addWidget(m_verificationBadge);
     actRow->addStretch();
     buildLayout->addLayout(actRow);
@@ -1533,12 +1516,12 @@ void CompilationSigningPage::setupUi()
     layout->addWidget(buildGroup);
 
     // Compilation Log
-    auto *logGroup = new QGroupBox(QStringLiteral("RFC 6962 Merkle Tree & Attestation Log"), this);
+    auto *logGroup = new QGroupBox(QStringLiteral("Build Log"), this);
     auto *logLayout = new QVBoxLayout(logGroup);
     m_logEdit = new QTextEdit(logGroup);
     m_logEdit->setReadOnly(true);
     m_logEdit->setStyleSheet(QStringLiteral(
-        "background-color: #090d16; font-family: monospace; font-size: 10px; color: #e2e8f0;"));
+        "background-color: #12141a; font-family: monospace; font-size: 11px; color: #e2e8f0;"));
     logLayout->addWidget(m_logEdit);
     layout->addWidget(logGroup, 1);
 
@@ -1547,7 +1530,7 @@ void CompilationSigningPage::setupUi()
             &CompilationSigningPage::generateKeypair);
     connect(m_browseKeyBtn, &QPushButton::clicked, this, &CompilationSigningPage::browseKeyFile);
     connect(m_browseOutBtn, &QPushButton::clicked, this, [this]() {
-        QString f = QFileDialog::getSaveFileName(this, QStringLiteral("Save .wwpkg Container"),
+        QString f = QFileDialog::getSaveFileName(this, QStringLiteral("Save Package"),
                                                  m_outPkgPathEdit->text(),
                                                  QStringLiteral("WayWal Package (*.wwpkg)"));
         if (!f.isEmpty()) {
@@ -1585,7 +1568,7 @@ void CompilationSigningPage::checkOrLoadKey()
 
     if (!keyFile.exists() || !keyFile.open(QIODevice::ReadOnly)) {
         m_keyFingerprintLabel->setText(QStringLiteral(
-            "Key file not found. Click 'Generate Keypair' to create your signing identity."));
+            "Key file not found. Click 'Generate Keypair' to create a signing key."));
         m_keyFingerprintLabel->setStyleSheet(QStringLiteral("color: #f59e0b;"));
         m_ctx->authorPrivKey.clear();
         m_ctx->authorPubKey.clear();
@@ -1622,13 +1605,13 @@ void CompilationSigningPage::checkOrLoadKey()
         m_ctx->authorPrivKey = privBytes;
         m_ctx->authorPubKey = privBytes.mid(32, 32);
         QString pubHex = m_ctx->authorPubKey.toHex();
-        m_keyFingerprintLabel->setText(QStringLiteral("Author Public Key: %1").arg(pubHex));
+        m_keyFingerprintLabel->setText(QStringLiteral("Public Key: %1").arg(pubHex));
         m_keyFingerprintLabel->setStyleSheet(
             QStringLiteral("font-family: monospace; color: #38bdf8; font-weight: bold;"));
         addPubkeyToTrustedKeys(pubHex);
     } else {
         m_keyFingerprintLabel->setText(
-            QStringLiteral("Invalid key format. Expected 64-byte Ed25519 private key."));
+            QStringLiteral("Invalid key format. Expected a 64-byte Ed25519 private key."));
         m_keyFingerprintLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
     }
 }
@@ -1660,7 +1643,7 @@ void CompilationSigningPage::generateKeypair()
     m_ctx->authorPubKey = QByteArray(reinterpret_cast<const char *>(pub), 32);
 
     QString pubHex = m_ctx->authorPubKey.toHex();
-    m_keyFingerprintLabel->setText(QStringLiteral("Generated New Author Identity: %1").arg(pubHex));
+    m_keyFingerprintLabel->setText(QStringLiteral("Generated Public Key: %1").arg(pubHex));
     m_keyFingerprintLabel->setStyleSheet(
         QStringLiteral("font-family: monospace; color: #10b981; font-weight: bold;"));
 
@@ -1700,9 +1683,9 @@ void CompilationSigningPage::compileAndSignPackage()
 
     m_logEdit->clear();
     m_progressBar->setValue(10);
-    m_logEdit->append(QStringLiteral("[%1] Initiating .wwpkg container compilation...")
+    m_logEdit->append(QStringLiteral("[%1] Starting package build...")
                           .arg(QDateTime::currentDateTime().toString(Qt::ISODate)));
-    m_logEdit->append(QStringLiteral("Staging Root: %1").arg(m_ctx->stagingDir));
+    m_logEdit->append(QStringLiteral("Staging Directory: %1").arg(m_ctx->stagingDir));
     m_logEdit->append(QStringLiteral("Output File: %1").arg(outPkg));
 
     // Construct wwpkg_manifest_t
@@ -1753,7 +1736,7 @@ void CompilationSigningPage::compileAndSignPackage()
     manifest.budgets.target_fps = m_ctx->targetFps;
 
     m_progressBar->setValue(35);
-    m_logEdit->append(QStringLiteral("Generating canonical manifest.json via RFC 8785 JCS..."));
+    m_logEdit->append(QStringLiteral("Writing manifest.json..."));
 
     // Invoke wwpkg_build_package()
     bool buildOk =
@@ -1765,21 +1748,20 @@ void CompilationSigningPage::compileAndSignPackage()
 
     if (!buildOk) {
         m_logEdit->append(
-            QStringLiteral("❌ ERROR: Failed to compile package via wwpkg_build_package()!"));
-        m_verificationBadge->setText(QStringLiteral("Status: Compilation Failed"));
+            QStringLiteral("[ERROR] Failed to build package via wwpkg_build_package()."));
+        m_verificationBadge->setText(QStringLiteral("Status: Build Failed"));
         m_verificationBadge->setStyleSheet(QStringLiteral("color: #ef4444; font-weight: bold;"));
         m_progressBar->setValue(0);
         return;
     }
 
-    m_logEdit->append(QStringLiteral("✓ POSIX tar container compressed with Zstandard level 12."));
-    m_logEdit->append(
-        QStringLiteral("Performing immediate post-build cryptographic self-verification..."));
+    m_logEdit->append(QStringLiteral("[OK] Archive compressed with Zstandard (level 12)."));
+    m_logEdit->append(QStringLiteral("Verifying package signature..."));
 
     // Verify self-check
     wwpkg_package_t *pkg = wwpkg_open(outPkg.toUtf8().constData());
     if (!pkg) {
-        m_logEdit->append(QStringLiteral("❌ ERROR: Could not open newly built package!"));
+        m_logEdit->append(QStringLiteral("[ERROR] Could not open newly built package."));
         return;
     }
 
@@ -1803,23 +1785,23 @@ void CompilationSigningPage::compileAndSignPackage()
         m_ctx->outPkgPath = outPkg;
         m_ctx->compiledSizeBytes = QFileInfo(outPkg).size();
 
-        m_logEdit->append(QStringLiteral("✓ RFC 6962 Domain-Separated Merkle Root: %1")
+        m_logEdit->append(QStringLiteral("[OK] Merkle Root: %1")
                               .arg(QString::fromLatin1(m_ctx->merkleRoot.toHex())));
-        m_logEdit->append(QStringLiteral("✓ RFC 8032 Ed25519 Cryptographic Signature: %1...")
+        m_logEdit->append(QStringLiteral("[OK] Ed25519 Signature: %1...")
                               .arg(QString::fromLatin1(m_ctx->signature.toHex().left(32))));
         m_logEdit->append(
-            QStringLiteral("✓ Author Key Trust Attestation: %1")
-                .arg(isTrusted ? QStringLiteral("TRUSTED") : QStringLiteral("UNTRUSTED")));
-        m_logEdit->append(QStringLiteral("✓ Package compiled and verified: %1 (%2)")
+            QStringLiteral("[OK] Key Trust Status: %1")
+                .arg(isTrusted ? QStringLiteral("Trusted") : QStringLiteral("Untrusted")));
+        m_logEdit->append(QStringLiteral("[OK] Package built and verified: %1 (%2)")
                               .arg(outPkg)
                               .arg(formatBytes(m_ctx->compiledSizeBytes)));
 
-        m_verificationBadge->setText(QStringLiteral("✓ VERIFIED & SIGNED"));
+        m_verificationBadge->setText(QStringLiteral("Signed & Verified"));
         m_verificationBadge->setStyleSheet(QStringLiteral("color: #10b981; font-weight: bold;"));
 
         emit completeChanged();
     } else {
-        m_logEdit->append(QStringLiteral("❌ ERROR: Cryptographic self-verification failed!"));
+        m_logEdit->append(QStringLiteral("[ERROR] Signature verification failed."));
         m_verificationBadge->setText(QStringLiteral("Status: Verification Failed"));
         m_verificationBadge->setStyleSheet(QStringLiteral("color: #ef4444; font-weight: bold;"));
     }
@@ -1839,20 +1821,20 @@ bool CompilationSigningPage::validatePage() { return isComplete(); }
 HubPublishingExportPage::HubPublishingExportPage(CreatorPackagingContext *ctx, QWidget *parent)
     : QWizardPage(parent), m_ctx(ctx)
 {
-    setTitle(QStringLiteral("Step 6: Open Hub Registry Publishing & Local Export"));
-    setSubTitle(QStringLiteral("Publish your content-addressed package to the WayWal Open Hub or "
-                               "install locally with 1-click."));
+    setTitle(QStringLiteral("Step 6: Export & Install"));
+    setSubTitle(QStringLiteral("Install the package locally or export it for sharing."));
     setupUi();
 }
 
 void HubPublishingExportPage::setupUi()
 {
     auto *layout = new QVBoxLayout(this);
-    layout->setSpacing(10);
+    layout->setSpacing(12);
 
     // CID Banner
-    auto *cidBox = new QGroupBox(QStringLiteral("Content-Addressed Identifier (CID)"), this);
+    auto *cidBox = new QGroupBox(QStringLiteral("Content Identifier (CID)"), this);
     auto *cidLayout = new QHBoxLayout(cidBox);
+    cidLayout->setSpacing(8);
 
     m_cidLabel = new QLabel(QStringLiteral("sha256:..."), cidBox);
     m_cidLabel->setStyleSheet(QStringLiteral(
@@ -1860,27 +1842,27 @@ void HubPublishingExportPage::setupUi()
     m_cidLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     cidLayout->addWidget(m_cidLabel, 1);
 
-    m_copyCidBtn = new QPushButton(QStringLiteral("📋 Copy CID"), cidBox);
+    m_copyCidBtn = new QPushButton(QStringLiteral("Copy CID"), cidBox);
     cidLayout->addWidget(m_copyCidBtn);
     layout->addWidget(cidBox);
 
     // Registry Index Entry JSON
-    auto *jsonBox = new QGroupBox(
-        QStringLiteral("Open Hub Federated Registry Index Entry (RFC 8785 Format)"), this);
+    auto *jsonBox = new QGroupBox(QStringLiteral("Registry Metadata"), this);
     auto *jsonLayout = new QVBoxLayout(jsonBox);
-    jsonLayout->setSpacing(6);
+    jsonLayout->setSpacing(8);
 
     m_registryJsonEdit = new QTextEdit(jsonBox);
     m_registryJsonEdit->setReadOnly(true);
     m_registryJsonEdit->setStyleSheet(QStringLiteral(
-        "background-color: #090d16; font-family: monospace; font-size: 10px; color: #e2e8f0;"));
+        "background-color: #12141a; font-family: monospace; font-size: 11px; color: #e2e8f0;"));
     jsonLayout->addWidget(m_registryJsonEdit, 1);
 
     auto *btnRow = new QHBoxLayout();
+    btnRow->setSpacing(8);
     m_copyJsonBtn = new QPushButton(QStringLiteral("Copy JSON"), jsonBox);
     btnRow->addWidget(m_copyJsonBtn);
 
-    m_saveJsonBtn = new QPushButton(QStringLiteral("Export index.json..."), jsonBox);
+    m_saveJsonBtn = new QPushButton(QStringLiteral("Save index.json..."), jsonBox);
     btnRow->addWidget(m_saveJsonBtn);
     btnRow->addStretch();
     jsonLayout->addLayout(btnRow);
@@ -1888,29 +1870,32 @@ void HubPublishingExportPage::setupUi()
     layout->addWidget(jsonBox, 1);
 
     // Actions Group
-    auto *actGroup = new QGroupBox(QStringLiteral("Local Deployment & Distribution"), this);
+    auto *actGroup = new QGroupBox(QStringLiteral("Install & Export"), this);
     auto *actLayout = new QVBoxLayout(actGroup);
     actLayout->setSpacing(8);
 
     auto *installRow = new QHBoxLayout();
-    m_installLocalBtn = new QPushButton(
-        QStringLiteral("⚡ 1-Click Install to Local Hub (~/.local/share/waywal/hub/)"), actGroup);
+    installRow->setSpacing(8);
+    m_installLocalBtn = new QPushButton(QStringLiteral("Install to Local Hub"), actGroup);
     m_installLocalBtn->setFixedHeight(32);
-    m_installLocalBtn->setStyleSheet(QStringLiteral(
-        "background-color: #2563eb; color: white; font-weight: bold; font-size: 12px;"));
+    m_installLocalBtn->setStyleSheet(
+        QStringLiteral("background-color: #0284c7; color: white; font-weight: bold; font-size: "
+                       "12px; padding: 6px 14px;"));
     installRow->addWidget(m_installLocalBtn);
 
     m_openFolderBtn = new QPushButton(QStringLiteral("Open Output Folder"), actGroup);
+    m_openFolderBtn->setFixedHeight(32);
     installRow->addWidget(m_openFolderBtn);
 
-    m_exportPkgBtn = new QPushButton(QStringLiteral("Export .wwpkg As..."), actGroup);
+    m_exportPkgBtn = new QPushButton(QStringLiteral("Save Package As..."), actGroup);
+    m_exportPkgBtn->setFixedHeight(32);
     installRow->addWidget(m_exportPkgBtn);
 
     actLayout->addLayout(installRow);
 
-    m_installStatusLabel = new QLabel(
-        QStringLiteral("Ready to deploy into local WayWal Open Hub directory."), actGroup);
-    m_installStatusLabel->setStyleSheet(QStringLiteral("color: #9a9a9e; font-size: 11px;"));
+    m_installStatusLabel =
+        new QLabel(QStringLiteral("Ready to install to ~/.local/share/waywal/hub/."), actGroup);
+    m_installStatusLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
     actLayout->addWidget(m_installStatusLabel);
 
     layout->addWidget(actGroup);
@@ -2000,7 +1985,7 @@ void HubPublishingExportPage::copyCidToClipboard()
 {
     if (m_ctx && !m_ctx->cid.isEmpty()) {
         QGuiApplication::clipboard()->setText(m_ctx->cid);
-        m_copyCidBtn->setText(QStringLiteral("✓ Copied!"));
+        m_copyCidBtn->setText(QStringLiteral("Copied"));
     }
 }
 
@@ -2008,13 +1993,13 @@ void HubPublishingExportPage::copyJsonToClipboard()
 {
     if (m_ctx && !m_ctx->registryIndexJson.isEmpty()) {
         QGuiApplication::clipboard()->setText(m_ctx->registryIndexJson);
-        m_copyJsonBtn->setText(QStringLiteral("✓ Copied!"));
+        m_copyJsonBtn->setText(QStringLiteral("Copied"));
     }
 }
 
 void HubPublishingExportPage::exportJsonToFile()
 {
-    QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export Open Hub Index JSON"),
+    QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Save Index JSON"),
                                                 QDir::homePath() + QStringLiteral("/index.json"),
                                                 QStringLiteral("JSON Files (*.json)"));
     if (!path.isEmpty() && m_ctx) {
@@ -2022,9 +2007,8 @@ void HubPublishingExportPage::exportJsonToFile()
         if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             f.write(m_ctx->registryIndexJson.toUtf8());
             f.close();
-            QMessageBox::information(
-                this, QStringLiteral("Export Successful"),
-                QStringLiteral("Registry index entry exported to:\n%1").arg(path));
+            QMessageBox::information(this, QStringLiteral("Saved"),
+                                     QStringLiteral("Metadata saved to:\n%1").arg(path));
         }
     }
 }
@@ -2086,8 +2070,7 @@ void HubPublishingExportPage::installToLocalHub()
     }
 
     m_ctx->installedToLocalHub = true;
-    m_installStatusLabel->setText(
-        QStringLiteral("✓ Installed to %1 successfully! Available in OpenHubBrowser.").arg(dstPkg));
+    m_installStatusLabel->setText(QStringLiteral("Installed to %1.").arg(dstPkg));
     m_installStatusLabel->setStyleSheet(QStringLiteral("color: #10b981; font-weight: bold;"));
 }
 
@@ -2104,15 +2087,14 @@ void HubPublishingExportPage::exportPackageTo()
     if (!m_ctx || m_ctx->outPkgPath.isEmpty())
         return;
 
-    QString dst = QFileDialog::getSaveFileName(this, QStringLiteral("Export .wwpkg Package"),
+    QString dst = QFileDialog::getSaveFileName(this, QStringLiteral("Save Package As"),
                                                QFileInfo(m_ctx->outPkgPath).fileName(),
                                                QStringLiteral("WayWal Package (*.wwpkg)"));
     if (!dst.isEmpty()) {
         QFile::remove(dst);
         if (QFile::copy(m_ctx->outPkgPath, dst)) {
-            QMessageBox::information(
-                this, QStringLiteral("Export Complete"),
-                QStringLiteral("Package exported successfully to:\n%1").arg(dst));
+            QMessageBox::information(this, QStringLiteral("Export Complete"),
+                                     QStringLiteral("Package saved to:\n%1").arg(dst));
         }
     }
 }
@@ -2124,9 +2106,9 @@ void HubPublishingExportPage::exportPackageTo()
 CreatorPackagingWizard::CreatorPackagingWizard(QWidget *parent) : QWizard(parent)
 {
     setObjectName(QStringLiteral("CreatorPackagingWizard"));
-    setWindowTitle(QStringLiteral("WayWal Creator Packaging & Publishing Wizard (.wwpkg)"));
+    setWindowTitle(QStringLiteral("Package Wallpaper"));
     setWizardStyle(QWizard::ModernStyle);
-    resize(940, 700);
+    resize(920, 680);
 
     // Instantiate all 6 guided pages
     m_intakePage = new SourceIntakePage(&m_context, this);
@@ -2157,18 +2139,18 @@ CreatorPackagingWizard::~CreatorPackagingWizard()
 
 void CreatorPackagingWizard::applyStudioTheme()
 {
-    // Pro-studio dark aesthetic matching wwal-studio
+    // Clean dark aesthetic matching wwal-studio
     setStyleSheet(
         QStringLiteral("QWizard {"
-                       "  background-color: #181820;"
+                       "  background-color: #181b22;"
                        "  color: #f1f5f9;"
                        "}"
                        "QWizardPage {"
-                       "  background-color: #181820;"
+                       "  background-color: #181b22;"
                        "  color: #f1f5f9;"
                        "}"
                        "QGroupBox {"
-                       "  border: 1px solid #334155;"
+                       "  border: 1px solid #2c3240;"
                        "  border-radius: 6px;"
                        "  margin-top: 10px;"
                        "  padding-top: 10px;"
@@ -2182,49 +2164,49 @@ void CreatorPackagingWizard::applyStudioTheme()
                        "  padding: 0 4px;"
                        "}"
                        "QLineEdit, QComboBox, QSpinBox, QTextEdit {"
-                       "  background-color: #0f172a;"
-                       "  border: 1px solid #334155;"
-                       "  border-radius: 4px;"
-                       "  padding: 4px 8px;"
-                       "  color: #f8fafc;"
+                       "  background-color: #12141a;"
+                       "  border: 1px solid #2c3240;"
+                       "  border-radius: 5px;"
+                       "  padding: 5px 8px;"
+                       "  color: #f1f5f9;"
                        "}"
                        "QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus {"
-                       "  border: 1px solid #3b82f6;"
+                       "  border: 1px solid #38bdf8;"
                        "}"
                        "QPushButton {"
-                       "  background-color: #1e293b;"
-                       "  border: 1px solid #475569;"
-                       "  border-radius: 4px;"
-                       "  padding: 5px 12px;"
-                       "  color: #f8fafc;"
+                       "  background-color: #20242e;"
+                       "  border: 1px solid #2c3240;"
+                       "  border-radius: 5px;"
+                       "  padding: 6px 14px;"
+                       "  color: #f1f5f9;"
                        "}"
                        "QPushButton:hover {"
-                       "  background-color: #334155;"
+                       "  background-color: #2a303d;"
                        "}"
                        "QPushButton:pressed {"
-                       "  background-color: #0f172a;"
+                       "  background-color: #12141a;"
                        "}"
                        "QTreeWidget {"
-                       "  background-color: #0f172a;"
-                       "  border: 1px solid #334155;"
-                       "  border-radius: 4px;"
-                       "  color: #f8fafc;"
+                       "  background-color: #12141a;"
+                       "  border: 1px solid #2c3240;"
+                       "  border-radius: 5px;"
+                       "  color: #f1f5f9;"
                        "}"
                        "QHeaderView::section {"
-                       "  background-color: #1e293b;"
+                       "  background-color: #20242e;"
                        "  color: #94a3b8;"
-                       "  padding: 4px;"
-                       "  border: 1px solid #334155;"
+                       "  padding: 5px;"
+                       "  border: 1px solid #2c3240;"
                        "}"
                        "QProgressBar {"
-                       "  background-color: #0f172a;"
-                       "  border: 1px solid #334155;"
-                       "  border-radius: 3px;"
+                       "  background-color: #12141a;"
+                       "  border: 1px solid #2c3240;"
+                       "  border-radius: 4px;"
                        "  text-align: center;"
                        "  color: white;"
                        "}"
                        "QProgressBar::chunk {"
-                       "  background-color: #3b82f6;"
+                       "  background-color: #0284c7;"
                        "}"));
 }
 

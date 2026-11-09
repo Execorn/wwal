@@ -55,47 +55,51 @@ class MonitorTopologyBar : public QWidget {
         setMinimumHeight(74);
 
         auto *layout = new QHBoxLayout(this);
-        layout->setContentsMargins(6, 4, 6, 4);
-        layout->setSpacing(8);
+        layout->setContentsMargins(10, 6, 10, 6);
+        layout->setSpacing(12);
 
         m_canvas = new MonitorTopologyCanvas(this);
         layout->addWidget(m_canvas, 1);
 
         auto *controlsBox = new QWidget(this);
-        controlsBox->setFixedWidth(136);
+        controlsBox->setFixedWidth(210);
         auto *ctrlLayout = new QVBoxLayout(controlsBox);
         ctrlLayout->setContentsMargins(0, 0, 0, 0);
-        ctrlLayout->setSpacing(4);
+        ctrlLayout->setSpacing(8);
 
-        auto *btnRefresh = new QPushButton(QStringLiteral("↻ Refresh Outputs"), controlsBox);
+        auto *topBtnRow = new QHBoxLayout();
+        topBtnRow->setContentsMargins(0, 0, 0, 0);
+        topBtnRow->setSpacing(8);
+
+        auto *btnRefresh = new QPushButton(QStringLiteral("Refresh"), controlsBox);
         btnRefresh->setToolTip(QStringLiteral("Refresh connected Wayland outputs"));
-        btnRefresh->setFixedHeight(22);
+        btnRefresh->setFixedHeight(26);
         connect(btnRefresh, &QPushButton::clicked, this, [this]() {
             if (m_canvas)
                 m_canvas->refreshFromWayland();
         });
-        ctrlLayout->addWidget(btnRefresh);
+        topBtnRow->addWidget(btnRefresh, 1);
 
-        auto *btnSpan = new QPushButton(QStringLiteral("Span Displays"), controlsBox);
+        auto *btnSpan = new QPushButton(QStringLiteral("Span"), controlsBox);
         btnSpan->setCheckable(true);
-        btnSpan->setFixedHeight(22);
-        btnSpan->setToolTip(
-            QStringLiteral("Calculate and apply seamless multi-display panoramic span"));
+        btnSpan->setFixedHeight(26);
+        btnSpan->setToolTip(QStringLiteral("Span wallpaper across all displays"));
         connect(btnSpan, &QPushButton::toggled, this, [this](bool checked) {
             if (m_canvas)
                 m_canvas->setDesktopSpanMode(checked);
         });
-        ctrlLayout->addWidget(btnSpan);
+        topBtnRow->addWidget(btnSpan, 1);
+        ctrlLayout->addLayout(topBtnRow);
 
         auto *scaleRow = new QHBoxLayout();
         scaleRow->setContentsMargins(0, 0, 0, 0);
-        scaleRow->setSpacing(4);
-        auto *scaleLbl = new QLabel(QStringLiteral("Scale:"), controlsBox);
-        scaleLbl->setStyleSheet(QStringLiteral("color: #9a9a9e; font-size: 10px;"));
+        scaleRow->setSpacing(8);
+        auto *scaleLbl = new QLabel(QStringLiteral("Scale"), controlsBox);
+        scaleLbl->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
         scaleRow->addWidget(scaleLbl);
 
         auto *comboScaling = new QComboBox(controlsBox);
-        comboScaling->setFixedHeight(22);
+        comboScaling->setFixedHeight(26);
         comboScaling->addItems({QStringLiteral("Fill"), QStringLiteral("Fit"),
                                 QStringLiteral("Center"), QStringLiteral("Stretch"),
                                 QStringLiteral("Tile")});
@@ -169,7 +173,7 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
 {
     // 1. Configure Window Properties
     setObjectName(QStringLiteral("WayWalStudioMainWindow"));
-    setWindowTitle(QStringLiteral("WayWal Studio — Linux Wayland Wallpaper IDE"));
+    setWindowTitle(QStringLiteral("WayWal Studio"));
     setMinimumSize(860, 600);
     resize(1600, 960);
 
@@ -187,7 +191,7 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
     setupToolBar();
     setupShortcuts();
 
-    // 6. Apply Blender / DaVinci Resolve Dark Pro-Studio Styling
+    // 6. Apply Unified Studio Dark Styling
     applyProStudioDarkTheme();
 
     // 7. Wire Inter-Panel Signals & Slots
@@ -296,8 +300,7 @@ void MainWindow::setupPanels()
     // Panel 1 (Top Bar): Monitor Topology & Span Mode
     m_topologyBar = new MonitorTopologyBar(this);
     m_layoutManager->registerPanel(QStringLiteral("MonitorTopologyBar"), m_topologyBar,
-                                   QStringLiteral("Monitor Topology & Span"),
-                                   Qt::TopDockWidgetArea);
+                                   QStringLiteral("Displays"), Qt::TopDockWidgetArea);
 
     // Catalog & Download Managers
     m_catalogIndexMgr = std::make_shared<CatalogIndexManager>();
@@ -306,12 +309,12 @@ void MainWindow::setupPanels()
     // Panel 2 (Left Dock Tab 1): Virtualized Wallpaper Grid
     m_gridWidget = new VirtualizedGridWidget(this);
     m_layoutManager->registerPanel(QStringLiteral("Wallpapers"), m_gridWidget,
-                                   QStringLiteral("Wallpaper Library"), Qt::LeftDockWidgetArea);
+                                   QStringLiteral("Library"), Qt::LeftDockWidgetArea);
 
     // Panel 2 (Left Dock Tab 2): Steam Workshop Browser
     m_workshopBrowser = new WorkshopBrowserWidget(m_catalogIndexMgr, m_downloadMgr, this);
     m_layoutManager->registerPanel(QStringLiteral("WorkshopBrowser"), m_workshopBrowser,
-                                   QStringLiteral("Steam Workshop"), Qt::LeftDockWidgetArea);
+                                   QStringLiteral("Workshop"), Qt::LeftDockWidgetArea);
 
     // Panel 2 (Left Dock Tab 3): Open Hub Browser
     m_openHubBrowser = new OpenHubBrowserWidget(m_downloadMgr, this);
@@ -321,33 +324,29 @@ void MainWindow::setupPanels()
     // Panel 3 (Center Dock Top): GPU Preview Viewport
     m_previewViewport = new GpuPreviewViewport(this);
     m_layoutManager->registerPanel(QStringLiteral("GpuPreviewViewport"), m_previewViewport,
-                                   QStringLiteral("GPU Viewport Preview"), Qt::RightDockWidgetArea);
+                                   QStringLiteral("Preview"), Qt::RightDockWidgetArea);
 
-    // Panel 4 (Center Dock Bottom): Transition Cubic Bézier Editor
+    // Panel 4 (Center Dock Bottom): Transition Cubic Bezier Editor
     m_bezierEditor = new CubicBezierEditorWidget(this);
     m_bezierEditor->setCommandBus(m_commandBus.get());
     m_layoutManager->registerPanel(QStringLiteral("CubicBezier"), m_bezierEditor,
-                                   QStringLiteral("Transition Bézier Curves"),
-                                   Qt::RightDockWidgetArea);
+                                   QStringLiteral("Transitions"), Qt::RightDockWidgetArea);
 
     // Panel 5 (Right Dock Tab 1): Live Scene & Shader Inspector
     m_propertyInspector = new PropertyInspectorWidget(this);
     m_propertyInspector->setCommandBus(m_commandBus.get());
     m_layoutManager->registerPanel(QStringLiteral("PropertyInspectorWidget"), m_propertyInspector,
-                                   QStringLiteral("Shader & Scene Inspector"),
-                                   Qt::RightDockWidgetArea);
+                                   QStringLiteral("Inspector"), Qt::RightDockWidgetArea);
 
     // Panel 5 (Right Dock Tab 2): Material You Theme Studio
     m_themeStudio = new ThemeStudioWidget(this);
     m_layoutManager->registerPanel(QStringLiteral("ThemeStudioWidget"), m_themeStudio,
-                                   QStringLiteral("Material You Theme Studio"),
-                                   Qt::RightDockWidgetArea);
+                                   QStringLiteral("Theme"), Qt::RightDockWidgetArea);
 
     // Panel 6 (Bottom Footer): Audio FFT Spectrum, Power Governor & Telemetry HUD
     m_footerBar = new StudioFooterBar(this);
     m_layoutManager->registerPanel(QStringLiteral("StudioFooterBar"), m_footerBar,
-                                   QStringLiteral("Studio Footer & Telemetry"),
-                                   Qt::BottomDockWidgetArea);
+                                   QStringLiteral("Telemetry"), Qt::BottomDockWidgetArea);
 
     // Remove standard status bar to let custom FooterBar shine
     setStatusBar(nullptr);
@@ -398,8 +397,7 @@ void MainWindow::setupMenuBar()
         }
     });
 
-    auto *folderSettingsAction =
-        fileMenu->addAction(QStringLiteral("Wallpaper &Folders && Exclusions..."));
+    auto *folderSettingsAction = fileMenu->addAction(QStringLiteral("Wallpaper &Folders..."));
     folderSettingsAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+,")));
     connect(folderSettingsAction, &QAction::triggered, this, [this]() {
         if (m_gridWidget) {
@@ -411,8 +409,8 @@ void MainWindow::setupMenuBar()
     openShaderAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+O")));
     connect(openShaderAction, &QAction::triggered, this, [this]() {
         QString file = QFileDialog::getOpenFileName(
-            this, QStringLiteral("Open Shadertoy GLSL Shader"), QString(),
-            QStringLiteral("GLSL Compute / Fragment (*.glsl *.frag *.comp);;All Files (*)"));
+            this, QStringLiteral("Open GLSL Shader"), QString(),
+            QStringLiteral("GLSL Shader (*.glsl *.frag *.comp);;All Files (*)"));
         if (!file.isEmpty()) {
             m_activeWallpaperPath = file;
             if (m_previewViewport) {
@@ -425,7 +423,7 @@ void MainWindow::setupMenuBar()
                 m_propertyInspector->loadShaderFile(file);
             }
             if (m_statusLabel) {
-                m_statusLabel->setText(QStringLiteral("Loaded Shader: %1").arg(file));
+                m_statusLabel->setText(QStringLiteral("Loaded shader: %1").arg(file));
             }
         }
     });
@@ -442,8 +440,7 @@ void MainWindow::setupMenuBar()
 
     fileMenu->addSeparator();
 
-    m_packageWizardAction =
-        fileMenu->addAction(QStringLiteral("📦 &Package Wallpaper (.wwpkg)..."));
+    m_packageWizardAction = fileMenu->addAction(QStringLiteral("&Package Wallpaper..."));
     m_packageWizardAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+P")));
     connect(m_packageWizardAction, &QAction::triggered, this,
             &MainWindow::handleOpenPackagingWizard);
@@ -469,14 +466,14 @@ void MainWindow::setupMenuBar()
 
     editMenu->addSeparator();
 
-    m_searchFocusAction = editMenu->addAction(QStringLiteral("&Search Focus"));
+    m_searchFocusAction = editMenu->addAction(QStringLiteral("&Find Wallpaper"));
     m_searchFocusAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+F")));
     connect(m_searchFocusAction, &QAction::triggered, this, &MainWindow::handleSearchFocus);
 
     // --- View Menu ---
     auto *viewMenu = mb->addMenu(QStringLiteral("&View"));
 
-    auto *perspsMenu = viewMenu->addMenu(QStringLiteral("&Perspectives"));
+    auto *perspsMenu = viewMenu->addMenu(QStringLiteral("&Workspaces"));
 
     auto *defaultPerspAction = perspsMenu->addAction(QStringLiteral("&1 Default"));
     defaultPerspAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+1")));
@@ -500,7 +497,7 @@ void MainWindow::setupMenuBar()
 
     perspsMenu->addSeparator();
 
-    auto *resetLayoutAction = perspsMenu->addAction(QStringLiteral("&Reset Layout to Default"));
+    auto *resetLayoutAction = perspsMenu->addAction(QStringLiteral("&Reset Layout"));
     connect(resetLayoutAction, &QAction::triggered, this, &MainWindow::handleResetLayout);
 
     viewMenu->addSeparator();
@@ -527,7 +524,7 @@ void MainWindow::setupMenuBar()
 
     viewMenu->addSeparator();
 
-    m_fullscreenAction = viewMenu->addAction(QStringLiteral("&Fullscreen Preview"));
+    m_fullscreenAction = viewMenu->addAction(QStringLiteral("&Fullscreen"));
     m_fullscreenAction->setShortcut(QKeySequence(Qt::Key_F11));
     connect(m_fullscreenAction, &QAction::triggered, this, &MainWindow::handleFullscreenToggle);
 
@@ -542,37 +539,28 @@ void MainWindow::setupMenuBar()
     auto *helpMenu = mb->addMenu(QStringLiteral("&Help"));
     auto *aboutAction = helpMenu->addAction(QStringLiteral("&About WayWal Studio"));
     connect(aboutAction, &QAction::triggered, this, [this]() {
-        QMessageBox::about(
-            this, QStringLiteral("About WayWal Studio"),
-            QStringLiteral("<b>WayWal Studio</b> v1.0.0<br>"
-                           "Linux Wayland Creative Wallpaper IDE & Live Pipeline.<br><br>"
-                           "Built with C++23, Qt 6, GLES 3.1 compute shaders, and zero-copy "
-                           "DMA-BUF scanout."));
+        QMessageBox::about(this, QStringLiteral("About WayWal Studio"),
+                           QStringLiteral("<b>WayWal Studio</b><br>"
+                                          "Wallpaper manager and shader editor for Wayland."));
     });
 }
 
 void MainWindow::setupToolBar()
 {
-    auto *toolbar = addToolBar(QStringLiteral("Main Studio Controls"));
+    auto *toolbar = addToolBar(QStringLiteral("Main Controls"));
     toolbar->setObjectName(QStringLiteral("MainStudioToolBar"));
     toolbar->setMovable(false);
-    toolbar->setIconSize(QSize(18, 18));
 
-    // Logo / Branding
-    auto *brandLabel = new QLabel(QStringLiteral(" ✦ WayWal Studio "), this);
-    brandLabel->setStyleSheet(QStringLiteral("font-weight: 700; color: #e58824; font-size: 13px;"));
-    toolbar->addWidget(brandLabel);
-
-    toolbar->addSeparator();
-
-    // Perspective Selector
-    auto *perspLabel = new QLabel(QStringLiteral(" Perspective: "), this);
-    perspLabel->setStyleSheet(QStringLiteral("color: #aaaaaa; font-size: 11px;"));
+    // Workspace Selector
+    auto *perspLabel = new QLabel(QStringLiteral("Workspace"), this);
+    perspLabel->setStyleSheet(
+        QStringLiteral("color: #94a3b8; font-size: 11px; font-weight: 500; padding-left: 4px;"));
     toolbar->addWidget(perspLabel);
 
     m_perspectiveCombo = new QComboBox(this);
     m_perspectiveCombo->setObjectName(QStringLiteral("PerspectiveComboBox"));
-    m_perspectiveCombo->setFixedWidth(150);
+    m_perspectiveCombo->setFixedWidth(148);
+    m_perspectiveCombo->setFixedHeight(28);
     m_perspectiveCombo->addItems({QStringLiteral("Default"), QStringLiteral("Shader Coding"),
                                   QStringLiteral("Theme Studio"), QStringLiteral("Multi-Monitor")});
     connect(m_perspectiveCombo, &QComboBox::currentTextChanged, this, [this](const QString &text) {
@@ -585,39 +573,27 @@ void MainWindow::setupToolBar()
     toolbar->addSeparator();
 
     // Play/Pause button
-    auto *btnPlayPause = new QPushButton(QStringLiteral("⏸ Pause"), this);
-    btnPlayPause->setToolTip(QStringLiteral("Pause / Resume animation & live preview [Space]"));
-    btnPlayPause->setFixedHeight(24);
+    auto *btnPlayPause = new QPushButton(QStringLiteral("Pause"), this);
+    btnPlayPause->setToolTip(QStringLiteral("Pause or resume preview playback (Space)"));
+    btnPlayPause->setFixedHeight(28);
     connect(btnPlayPause, &QPushButton::clicked, this, [this, btnPlayPause]() {
         handlePlayPauseToggle();
-        btnPlayPause->setText(m_isPlaying ? QStringLiteral("⏸ Pause") : QStringLiteral("▶ Resume"));
+        btnPlayPause->setText(m_isPlaying ? QStringLiteral("Pause") : QStringLiteral("Resume"));
     });
     toolbar->addWidget(btnPlayPause);
 
-    toolbar->addSeparator();
-
     // Fullscreen Preview button
-    auto *btnFullscreen = new QPushButton(QStringLiteral("⛶ Fullscreen"), this);
-    btnFullscreen->setToolTip(QStringLiteral("Toggle Fullscreen Preview [F11]"));
-    btnFullscreen->setFixedHeight(24);
+    auto *btnFullscreen = new QPushButton(QStringLiteral("Fullscreen"), this);
+    btnFullscreen->setToolTip(QStringLiteral("Toggle fullscreen window (F11)"));
+    btnFullscreen->setFixedHeight(28);
     connect(btnFullscreen, &QPushButton::clicked, this, &MainWindow::handleFullscreenToggle);
     toolbar->addWidget(btnFullscreen);
 
-    toolbar->addSeparator();
-
-    // Search focus button
-    auto *btnSearch = new QPushButton(QStringLiteral("🔍 Find"), this);
-    btnSearch->setToolTip(QStringLiteral("Focus wallpaper search box [Ctrl+F]"));
-    btnSearch->setFixedHeight(24);
-    connect(btnSearch, &QPushButton::clicked, this, &MainWindow::handleSearchFocus);
-    toolbar->addWidget(btnSearch);
-
-    toolbar->addSeparator();
-
     // Creator Packaging Wizard button
-    auto *btnWizard = new QPushButton(QStringLiteral("📦 Package"), this);
-    btnWizard->setToolTip(QStringLiteral("Open Creator Packaging Wizard (.wwpkg) [Ctrl+Shift+P]"));
-    btnWizard->setFixedHeight(24);
+    auto *btnWizard = new QPushButton(QStringLiteral("Package..."), this);
+    btnWizard->setToolTip(
+        QStringLiteral("Create a signed .wwpkg wallpaper package (Ctrl+Shift+P)"));
+    btnWizard->setFixedHeight(28);
     connect(btnWizard, &QPushButton::clicked, this, &MainWindow::handleOpenPackagingWizard);
     toolbar->addWidget(btnWizard);
 
@@ -627,9 +603,9 @@ void MainWindow::setupToolBar()
     toolbar->addWidget(spacer);
 
     // Status label
-    m_statusLabel = new QLabel(QStringLiteral("Wayland Client Ready • 144 Hz"), this);
+    m_statusLabel = new QLabel(QStringLiteral("Ready"), this);
     m_statusLabel->setStyleSheet(
-        QStringLiteral("color: #888888; font-size: 11px; padding-right: 8px;"));
+        QStringLiteral("color: #64748b; font-size: 11px; padding-right: 8px;"));
     toolbar->addWidget(m_statusLabel);
 }
 
@@ -642,133 +618,132 @@ void MainWindow::setupShortcuts()
 
 void MainWindow::applyProStudioDarkTheme()
 {
-    // 1. Fusion Pro Dark Palette
+    // 1. Unified Dark Studio Palette
     QPalette palette;
-    palette.setColor(QPalette::Window, QColor(0x1e, 0x1e, 0x1e));
-    palette.setColor(QPalette::WindowText, QColor(0xe0, 0xe0, 0xe0));
-    palette.setColor(QPalette::Base, QColor(0x16, 0x16, 0x16));
-    palette.setColor(QPalette::AlternateBase, QColor(0x24, 0x24, 0x24));
-    palette.setColor(QPalette::ToolTipBase, QColor(0x28, 0x28, 0x28));
-    palette.setColor(QPalette::ToolTipText, QColor(0xe0, 0xe0, 0xe0));
-    palette.setColor(QPalette::Text, QColor(0xe0, 0xe0, 0xe0));
-    palette.setColor(QPalette::Button, QColor(0x2b, 0x2b, 0x2b));
-    palette.setColor(QPalette::ButtonText, QColor(0xe0, 0xe0, 0xe0));
+    palette.setColor(QPalette::Window, QColor(0x12, 0x14, 0x1a));
+    palette.setColor(QPalette::WindowText, QColor(0xf1, 0xf5, 0xf9));
+    palette.setColor(QPalette::Base, QColor(0x18, 0x1b, 0x22));
+    palette.setColor(QPalette::AlternateBase, QColor(0x20, 0x24, 0x2e));
+    palette.setColor(QPalette::ToolTipBase, QColor(0x18, 0x1b, 0x22));
+    palette.setColor(QPalette::ToolTipText, QColor(0xf1, 0xf5, 0xf9));
+    palette.setColor(QPalette::Text, QColor(0xf1, 0xf5, 0xf9));
+    palette.setColor(QPalette::Button, QColor(0x20, 0x24, 0x2e));
+    palette.setColor(QPalette::ButtonText, QColor(0xf1, 0xf5, 0xf9));
     palette.setColor(QPalette::BrightText, QColor(0xff, 0xff, 0xff));
-    palette.setColor(QPalette::Highlight, QColor(0xe5, 0x88, 0x24)); // Warm DaVinci / Blender Amber
-    palette.setColor(QPalette::HighlightedText, QColor(0x18, 0x18, 0x18));
-    palette.setColor(QPalette::Disabled, QPalette::Text, QColor(0x55, 0x55, 0x55));
-    palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(0x55, 0x55, 0x55));
+    palette.setColor(QPalette::Highlight, QColor(0x02, 0x84, 0xc7));
+    palette.setColor(QPalette::HighlightedText, QColor(0xff, 0xff, 0xff));
+    palette.setColor(QPalette::Disabled, QPalette::Text, QColor(0x64, 0x74, 0x8b));
+    palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(0x64, 0x74, 0x8b));
     QApplication::setPalette(palette);
 
-    // 2. Comprehensive Blender / DaVinci Resolve Stylesheet
+    // 2. Unified Studio Stylesheet
     setStyleSheet(
         QStringLiteral("QMainWindow {"
-                       "  background: #1e1e1e;"
+                       "  background: #12141a;"
                        "}"
                        "QWidget {"
-                       "  color: #e0e0e0;"
+                       "  color: #f1f5f9;"
                        "  font-family: 'Inter', 'Cantarell', 'Segoe UI', sans-serif;"
                        "  font-size: 11px;"
                        "}"
                        "QMenuBar {"
-                       "  background: #1a1a1a;"
-                       "  border-bottom: 1px solid #2a2a2a;"
-                       "  padding: 2px 4px;"
+                       "  background: #14171f;"
+                       "  border-bottom: 1px solid #262b36;"
+                       "  padding: 2px 6px;"
                        "}"
                        "QMenuBar::item {"
-                       "  padding: 4px 10px;"
+                       "  padding: 5px 10px;"
                        "  background: transparent;"
-                       "  border-radius: 2px;"
+                       "  border-radius: 4px;"
                        "}"
                        "QMenuBar::item:selected {"
-                       "  background: #333333;"
+                       "  background: #20242e;"
                        "  color: #ffffff;"
                        "}"
                        "QMenu {"
-                       "  background: #242424;"
-                       "  border: 1px solid #383838;"
+                       "  background: #181b22;"
+                       "  border: 1px solid #2c3240;"
                        "  padding: 4px 0px;"
                        "}"
                        "QMenu::item {"
-                       "  padding: 5px 24px 5px 20px;"
+                       "  padding: 6px 24px 6px 20px;"
                        "}"
                        "QMenu::item:selected {"
-                       "  background: #e58824;"
-                       "  color: #181818;"
-                       "  font-weight: bold;"
+                       "  background: #0284c7;"
+                       "  color: #ffffff;"
                        "}"
                        "QMenu::separator {"
                        "  height: 1px;"
-                       "  background: #333333;"
+                       "  background: #262b36;"
                        "  margin: 4px 0px;"
                        "}"
                        "QToolBar {"
-                       "  background: #202020;"
-                       "  border-bottom: 1px solid #2a2a2a;"
-                       "  spacing: 6px;"
-                       "  padding: 3px 8px;"
+                       "  background: #14171f;"
+                       "  border-bottom: 1px solid #262b36;"
+                       "  spacing: 10px;"
+                       "  padding: 5px 12px;"
                        "}"
                        "QTabBar::tab {"
-                       "  background: #1a1a1a;"
-                       "  color: #999999;"
-                       "  padding: 5px 14px;"
+                       "  background: #14171f;"
+                       "  color: #94a3b8;"
+                       "  padding: 6px 14px;"
                        "  border: none;"
-                       "  border-top-left-radius: 3px;"
-                       "  border-top-right-radius: 3px;"
-                       "  margin-right: 2px;"
+                       "  border-top-left-radius: 4px;"
+                       "  border-top-right-radius: 4px;"
+                       "  margin-right: 4px;"
                        "}"
                        "QTabBar::tab:selected {"
-                       "  background: #262626;"
-                       "  color: #ffffff;"
-                       "  border-bottom: 2px solid #e58824;"
+                       "  background: #20242e;"
+                       "  color: #f8fafc;"
+                       "  border-bottom: 2px solid #38bdf8;"
                        "  font-weight: 600;"
                        "}"
                        "QTabBar::tab:hover:!selected {"
-                       "  background: #222222;"
-                       "  color: #cccccc;"
+                       "  background: #1b1f29;"
+                       "  color: #e2e8f0;"
                        "}"
                        "QDockWidget {"
                        "  titlebar-close-icon: none;"
                        "  titlebar-normal-icon: none;"
-                       "  border: 1px solid #2a2a2a;"
+                       "  border: 1px solid #262b36;"
                        "}"
                        "QSplitter::handle {"
-                       "  background: #202020;"
+                       "  background: #12141a;"
                        "}"
                        "QSplitter::handle:hover {"
-                       "  background: #e58824;"
+                       "  background: #0284c7;"
                        "}"
                        "QPushButton, QToolButton {"
-                       "  background: #2d2d2d;"
-                       "  border: 1px solid #3d3d3d;"
-                       "  border-radius: 3px;"
-                       "  padding: 4px 10px;"
-                       "  color: #e0e0e0;"
+                       "  background: #20242e;"
+                       "  border: 1px solid #2e3545;"
+                       "  border-radius: 5px;"
+                       "  padding: 5px 12px;"
+                       "  color: #e2e8f0;"
                        "  font-weight: 500;"
                        "}"
                        "QPushButton:hover, QToolButton:hover {"
-                       "  background: #383838;"
-                       "  border-color: #e58824;"
+                       "  background: #2a303d;"
+                       "  border-color: #38bdf8;"
                        "  color: #ffffff;"
                        "}"
                        "QPushButton:pressed, QToolButton:pressed {"
-                       "  background: #1f1f1f;"
+                       "  background: #161920;"
                        "}"
                        "QPushButton:checked {"
-                       "  background: #e58824;"
-                       "  color: #181818;"
+                       "  background: #0284c7;"
+                       "  color: #ffffff;"
                        "  font-weight: 600;"
-                       "  border-color: #f08d49;"
+                       "  border-color: #38bdf8;"
                        "}"
                        "QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {"
-                       "  background: #181818;"
-                       "  border: 1px solid #383838;"
-                       "  border-radius: 3px;"
-                       "  padding: 3px 6px;"
-                       "  color: #e0e0e0;"
+                       "  background: #14171f;"
+                       "  border: 1px solid #2e3545;"
+                       "  border-radius: 5px;"
+                       "  padding: 4px 8px;"
+                       "  color: #f1f5f9;"
                        "}"
                        "QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {"
-                       "  border: 1px solid #e58824;"
+                       "  border: 1px solid #38bdf8;"
                        "}"
                        "QScrollBar:vertical {"
                        "  background: transparent;"
@@ -776,33 +751,34 @@ void MainWindow::applyProStudioDarkTheme()
                        "  margin: 0px;"
                        "}"
                        "QScrollBar::handle:vertical {"
-                       "  background: #383838;"
+                       "  background: #2e3545;"
                        "  min-height: 24px;"
                        "  border-radius: 4px;"
                        "}"
                        "QScrollBar::handle:vertical:hover {"
-                       "  background: #555555;"
+                       "  background: #475569;"
                        "}"
                        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
                        "  height: 0px;"
                        "}"
                        "QSlider::groove:horizontal {"
                        "  height: 4px;"
-                       "  background: #2a2a2a;"
+                       "  background: #262b36;"
                        "  border-radius: 2px;"
                        "}"
                        "QSlider::sub-page:horizontal {"
-                       "  background: #e58824;"
+                       "  background: #0284c7;"
                        "  border-radius: 2px;"
                        "}"
                        "QSlider::handle:horizontal {"
                        "  width: 12px;"
                        "  margin: -4px 0;"
-                       "  background: #f08d49;"
+                       "  background: #f8fafc;"
+                       "  border: 1px solid #0284c7;"
                        "  border-radius: 6px;"
                        "}"
                        "QSlider::handle:horizontal:hover {"
-                       "  background: #ffa666;"
+                       "  background: #38bdf8;"
                        "}"));
 }
 

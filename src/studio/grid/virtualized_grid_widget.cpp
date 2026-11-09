@@ -600,15 +600,17 @@ void GridGlCanvas::mousePressEvent(QMouseEvent *event)
         QAction *applyAct = menu.addAction("Apply Wallpaper Now");
         connect(applyAct, &QAction::triggered, this,
                 [this, item]() { emit itemDoubleClicked(item); });
-        menu.addSeparator();
-        if (!parent_qstr.isEmpty()) {
-            QAction *exclAct = menu.addAction(
-                QStringLiteral("Exclude Folder '%1' (%2)").arg(parent_name, parent_qstr));
-            connect(exclAct, &QAction::triggered, this,
-                    [this, parent_qstr]() { emit excludeFolderRequested(parent_qstr); });
+        if (!m_embeddedMode) {
+            menu.addSeparator();
+            if (!parent_qstr.isEmpty()) {
+                QAction *exclAct = menu.addAction(
+                    QStringLiteral("Exclude Folder '%1' (%2)").arg(parent_name, parent_qstr));
+                connect(exclAct, &QAction::triggered, this,
+                        [this, parent_qstr]() { emit excludeFolderRequested(parent_qstr); });
+            }
+            QAction *cfgAct = menu.addAction("Configure Wallpaper Folders && Exclusions...");
+            connect(cfgAct, &QAction::triggered, this, &GridGlCanvas::configureFoldersRequested);
         }
-        QAction *cfgAct = menu.addAction("Configure Wallpaper Folders && Exclusions...");
-        connect(cfgAct, &QAction::triggered, this, &GridGlCanvas::configureFoldersRequested);
         menu.exec(event->globalPosition().toPoint());
         return;
     }
@@ -680,129 +682,103 @@ VirtualizedGridWidget::~VirtualizedGridWidget()
 void VirtualizedGridWidget::setupUi()
 {
     auto *root_layout = new QVBoxLayout(this);
-    root_layout->setContentsMargins(6, 6, 6, 6);
-    root_layout->setSpacing(5);
+    root_layout->setContentsMargins(10, 10, 10, 10);
+    root_layout->setSpacing(8);
 
-    // 1. Top Search Bar (full width so it never crushes in narrow docks)
-    m_searchEdit = new QLineEdit(this);
-    m_searchEdit->setPlaceholderText("Search wallpapers (Fuzzy Myers)...");
+    m_headerContainer = new QWidget(this);
+    auto *header_layout = new QVBoxLayout(m_headerContainer);
+    header_layout->setContentsMargins(0, 0, 0, 0);
+    header_layout->setSpacing(8);
+
+    // 1. Top Search Bar
+    m_searchEdit = new QLineEdit(m_headerContainer);
+    m_searchEdit->setPlaceholderText("Search wallpapers...");
     m_searchEdit->setClearButtonEnabled(true);
+    m_searchEdit->setFixedHeight(28);
     m_searchEdit->setStyleSheet(
-        "QLineEdit { background: #1e222b; color: #f1f5f9; border: 1px solid #334155; "
-        "border-radius: 5px; padding: 4px 8px; font-size: 11px; }"
+        "QLineEdit { background: #14171f; color: #f1f5f9; border: 1px solid #2e3545; "
+        "border-radius: 5px; padding: 4px 10px; font-size: 11px; }"
         "QLineEdit:focus { border: 1px solid #38bdf8; }");
     connect(m_searchEdit, &QLineEdit::textChanged, this,
             &VirtualizedGridWidget::onSearchTextChanged);
-    root_layout->addWidget(m_searchEdit);
+    header_layout->addWidget(m_searchEdit);
 
-    // 1b. Sort, Folders & Status Row
+    // 2. Filter, Sort & Folders Row
     auto *top_bar = new QHBoxLayout();
     top_bar->setContentsMargins(0, 0, 0, 0);
-    top_bar->setSpacing(4);
+    top_bar->setSpacing(8);
 
-    m_sortCombo = new QComboBox(this);
-    m_sortCombo->setMaximumWidth(92);
+    auto *tagCombo = new QComboBox(m_headerContainer);
+    tagCombo->setFixedHeight(26);
+    tagCombo->addItem("All Tags", QVariant::fromValue<qulonglong>(WallpaperTags::None));
+    for (const auto &tag : WallpaperTags::allKnownTags()) {
+        tagCombo->addItem(QString::fromUtf8(tag.display_name),
+                          QVariant::fromValue<qulonglong>(tag.mask));
+    }
+    tagCombo->setStyleSheet(
+        "QComboBox { background: #14171f; color: #f1f5f9; border: 1px solid #2e3545; "
+        "border-radius: 5px; padding: 2px 8px; font-size: 11px; }");
+    connect(tagCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this, tagCombo](int idx) {
+                uint64_t mask = tagCombo->itemData(idx).toULongLong();
+                if (m_canvas) {
+                    m_canvas->resetHoverState();
+                }
+                m_index.setTagMask(mask, false);
+                int cols = m_canvas->computeColumns(m_canvas->width());
+                int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
+                onVirtualHeightChanged(vh);
+                updateStatusText();
+                m_canvas->update();
+            });
+    top_bar->addWidget(tagCombo, 1);
+
+    m_sortCombo = new QComboBox(m_headerContainer);
+    m_sortCombo->setFixedHeight(26);
     m_sortCombo->addItem("Name (A-Z)", static_cast<int>(SortCriteria::NameAsc));
     m_sortCombo->addItem("Name (Z-A)", static_cast<int>(SortCriteria::NameDesc));
-    m_sortCombo->addItem("Date (Newest)", static_cast<int>(SortCriteria::DateNewest));
-    m_sortCombo->addItem("Date (Oldest)", static_cast<int>(SortCriteria::DateOldest));
-    m_sortCombo->addItem("Size (Largest)", static_cast<int>(SortCriteria::SizeLargest));
-    m_sortCombo->addItem("Size (Smallest)", static_cast<int>(SortCriteria::SizeSmallest));
-    m_sortCombo->addItem("Type (Badge)", static_cast<int>(SortCriteria::Type));
-    m_sortCombo->addItem("Dominant Hue", static_cast<int>(SortCriteria::DominantHue));
+    m_sortCombo->addItem("Newest", static_cast<int>(SortCriteria::DateNewest));
+    m_sortCombo->addItem("Oldest", static_cast<int>(SortCriteria::DateOldest));
+    m_sortCombo->addItem("Largest", static_cast<int>(SortCriteria::SizeLargest));
+    m_sortCombo->addItem("Smallest", static_cast<int>(SortCriteria::SizeSmallest));
+    m_sortCombo->addItem("Type", static_cast<int>(SortCriteria::Type));
+    m_sortCombo->addItem("Color", static_cast<int>(SortCriteria::DominantHue));
     m_sortCombo->setStyleSheet(
-        "QComboBox { background: #1e222b; color: #f1f5f9; border: 1px solid #334155; "
-        "border-radius: 5px; padding: 2px 5px; font-size: 10px; }");
+        "QComboBox { background: #14171f; color: #f1f5f9; border: 1px solid #2e3545; "
+        "border-radius: 5px; padding: 2px 8px; font-size: 11px; }");
     connect(m_sortCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             &VirtualizedGridWidget::onSortChanged);
-    top_bar->addWidget(m_sortCombo);
+    top_bar->addWidget(m_sortCombo, 1);
 
-    m_foldersButton = new QPushButton("Folders", this);
-    m_foldersButton->setToolTip(
-        "Configure included & excluded wallpaper folders (~/.config/wwal/studio_catalog.json)");
+    m_foldersButton = new QPushButton("Folders...", m_headerContainer);
+    m_foldersButton->setFixedHeight(26);
+    m_foldersButton->setToolTip("Choose which wallpaper folders to include or exclude");
     m_foldersButton->setStyleSheet(
-        "QPushButton { background: #1e222b; color: #38bdf8; border: 1px solid #334155; "
-        "border-radius: 5px; padding: 2px 7px; font-size: 10px; font-weight: 600; }"
-        "QPushButton:hover { background: #283040; border-color: #38bdf8; color: #f1f5f9; }");
+        "QPushButton { background: #20242e; color: #e2e8f0; border: 1px solid #2e3545; "
+        "border-radius: 5px; padding: 2px 10px; font-size: 11px; font-weight: 500; }"
+        "QPushButton:hover { background: #2a303d; border-color: #38bdf8; color: #ffffff; }");
     connect(m_foldersButton, &QPushButton::clicked, this,
             &VirtualizedGridWidget::openFolderSettingsDialog);
     top_bar->addWidget(m_foldersButton);
 
+    header_layout->addLayout(top_bar);
+    root_layout->addWidget(m_headerContainer);
+
     m_statusLabel = new QLabel("0 wallpapers", this);
-    m_statusLabel->setStyleSheet("color: #94a3b8; font-size: 9.5px;");
-    m_statusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    m_statusLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    top_bar->addWidget(m_statusLabel, 1);
-
-    root_layout->addLayout(top_bar);
-
-    // 2. Tag Filter Chips Grid (4 columns so all tags are visible without clipping)
-    m_tagChipContainer = new QWidget(this);
-    auto *chip_grid = new QGridLayout(m_tagChipContainer);
-    chip_grid->setContentsMargins(0, 0, 0, 0);
-    chip_grid->setHorizontalSpacing(3);
-    chip_grid->setVerticalSpacing(3);
-    for (int col = 0; col < 4; ++col) {
-        chip_grid->setColumnStretch(col, 1);
-    }
-
-    auto configureChipBtn = [](QPushButton *btn, const QString &tooltip) {
-        btn->setCheckable(true);
-        btn->setFixedHeight(20);
-        btn->setMinimumWidth(34);
-        btn->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-        btn->setToolTip(tooltip);
-    };
-
-    // "All" chip
-    auto *all_btn = new QPushButton("All", m_tagChipContainer);
-    configureChipBtn(all_btn, QStringLiteral("Show all wallpapers"));
-    all_btn->setChecked(true);
-    connect(all_btn, &QPushButton::clicked, this,
-            [this]() { onTagChipClicked(WallpaperTags::None); });
-    m_tagChips.push_back(all_btn);
-    chip_grid->addWidget(all_btn, 0, 0);
-
-    // Individual tag chips
-    int chipIdx = 1;
-    for (const auto &tag : WallpaperTags::allKnownTags()) {
-        QString label = QString::fromUtf8(tag.display_name);
-        if (label == QStringLiteral("Audio-Reactive")) {
-            label = QStringLiteral("Audio");
-        } else if (label == QStringLiteral("Cyberpunk")) {
-            label = QStringLiteral("Cyber");
-        } else if (label == QStringLiteral("Architecture")) {
-            label = QStringLiteral("Arch");
-        } else if (label == QStringLiteral("Photography")) {
-            label = QStringLiteral("Photo");
-        } else if (label == QStringLiteral("Digital Art")) {
-            label = QStringLiteral("Digital");
-        } else if (label == QStringLiteral("Landscape")) {
-            label = QStringLiteral("Scenic");
-        }
-        auto *btn = new QPushButton(label, m_tagChipContainer);
-        configureChipBtn(
-            btn, QStringLiteral("Filter by tag: %1").arg(QString::fromUtf8(tag.display_name)));
-        uint64_t mask = tag.mask;
-        connect(btn, &QPushButton::clicked, this, [this, mask]() { onTagChipClicked(mask); });
-        m_tagChips.push_back(btn);
-        chip_grid->addWidget(btn, chipIdx / 4, chipIdx % 4);
-        ++chipIdx;
-    }
-    updateTagChipStyles();
-    root_layout->addWidget(m_tagChipContainer);
+    m_statusLabel->setStyleSheet("color: #64748b; font-size: 11px;");
+    root_layout->addWidget(m_statusLabel);
 
     // 3. Central Grid Canvas + Vertical Scroll Bar
     auto *grid_layout = new QHBoxLayout();
     grid_layout->setContentsMargins(0, 0, 0, 0);
-    grid_layout->setSpacing(2);
+    grid_layout->setSpacing(4);
 
     m_canvas = new GridGlCanvas(m_index, m_pool, m_hover, this);
     m_scrollBar = new QScrollBar(Qt::Vertical, this);
     m_scrollBar->setVisible(false);
     m_scrollBar->setStyleSheet(
-        "QScrollBar:vertical { background: #14171d; width: 10px; margin: 0; }"
-        "QScrollBar::handle:vertical { background: #334155; min-height: 24px; border-radius: 4px; }"
+        "QScrollBar:vertical { background: #14171f; width: 8px; margin: 0; }"
+        "QScrollBar::handle:vertical { background: #2e3545; min-height: 24px; border-radius: 4px; }"
         "QScrollBar::handle:vertical:hover { background: #475569; }"
         "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }");
 
@@ -840,37 +816,76 @@ void VirtualizedGridWidget::setupUi()
     // 4. Multi-Select Playlist Bar (shown when items are selected)
     m_playlistBar = new QWidget(this);
     m_playlistBar->setVisible(false);
-    m_playlistBar->setStyleSheet("QWidget { background: #1e222b; border: 1px solid #334155; "
-                                 "border-radius: 5px; padding: 2px; }");
+    m_playlistBar->setStyleSheet("QWidget { background: #181b22; border: 1px solid #2c3240; "
+                                 "border-radius: 5px; }");
     auto *pl_layout = new QHBoxLayout(m_playlistBar);
-    pl_layout->setContentsMargins(6, 4, 6, 4);
-    pl_layout->setSpacing(4);
+    pl_layout->setContentsMargins(10, 6, 10, 6);
+    pl_layout->setSpacing(8);
 
     m_playlistSelectionLabel = new QLabel("0 selected", m_playlistBar);
     m_playlistSelectionLabel->setStyleSheet(
-        "color: #f1f5f9; font-weight: bold; font-size: 9.5px; border: none;");
+        "color: #f1f5f9; font-weight: 600; font-size: 11px; border: none;");
     pl_layout->addWidget(m_playlistSelectionLabel);
 
     pl_layout->addStretch();
 
-    m_playlistAddButton = new QPushButton("+ Playlist", m_playlistBar);
+    m_playlistAddButton = new QPushButton("Add to Playlist", m_playlistBar);
+    m_playlistAddButton->setFixedHeight(26);
     m_playlistAddButton->setStyleSheet(
         "QPushButton { background: #0284c7; color: white; border: none; border-radius: 4px; "
-        "padding: 3px 8px; font-weight: bold; font-size: 9.5px; }"
+        "padding: 4px 12px; font-weight: 600; font-size: 11px; }"
         "QPushButton:hover { background: #0369a1; }");
     connect(m_playlistAddButton, &QPushButton::clicked, this,
             &VirtualizedGridWidget::onPlaylistAddClicked);
     pl_layout->addWidget(m_playlistAddButton);
 
     m_playlistClearButton = new QPushButton("Clear", m_playlistBar);
-    m_playlistClearButton->setStyleSheet("QPushButton { background: transparent; color: #94a3b8; "
-                                         "border: none; padding: 3px 5px; font-size: 9.5px; }"
-                                         "QPushButton:hover { color: #f1f5f9; }");
+    m_playlistClearButton->setFixedHeight(26);
+    m_playlistClearButton->setStyleSheet(
+        "QPushButton { background: #20242e; color: #94a3b8; "
+        "border: 1px solid #2e3545; border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
+        "QPushButton:hover { color: #f1f5f9; border-color: #38bdf8; }");
     connect(m_playlistClearButton, &QPushButton::clicked, this,
             &VirtualizedGridWidget::clearSelection);
     pl_layout->addWidget(m_playlistClearButton);
 
     root_layout->addWidget(m_playlistBar);
+}
+
+void VirtualizedGridWidget::setEmbeddedMode(bool embedded)
+{
+    m_embeddedMode = embedded;
+    if (m_headerContainer) {
+        m_headerContainer->setVisible(!embedded);
+    }
+    if (m_statusLabel) {
+        m_statusLabel->setVisible(!embedded);
+    }
+    if (m_canvas) {
+        m_canvas->setEmbeddedMode(embedded);
+    }
+    if (auto *root = qobject_cast<QVBoxLayout *>(layout())) {
+        if (embedded) {
+            root->setContentsMargins(8, 6, 8, 6);
+            root->setSpacing(4);
+        } else {
+            root->setContentsMargins(10, 10, 10, 10);
+            root->setSpacing(8);
+        }
+    }
+}
+
+void VirtualizedGridWidget::refreshCatalogView()
+{
+    if (!m_canvas) {
+        return;
+    }
+    m_canvas->resetHoverState();
+    int cols = m_canvas->computeColumns(m_canvas->width());
+    int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
+    onVirtualHeightChanged(vh);
+    updateStatusText();
+    m_canvas->update();
 }
 
 void VirtualizedGridWidget::scanWallpapers(const std::vector<std::string> &extra_paths)
@@ -880,11 +895,7 @@ void VirtualizedGridWidget::scanWallpapers(const std::vector<std::string> &extra
         m_canvas->clearSelection();
     }
     size_t count = m_index.scanAll(extra_paths);
-    int cols = m_canvas->computeColumns(m_canvas->width());
-    int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
-    onVirtualHeightChanged(vh);
-    updateStatusText();
-    m_canvas->update();
+    refreshCatalogView();
     emit catalogScanned(count);
 }
 
@@ -943,11 +954,7 @@ void VirtualizedGridWidget::populateSampleCatalogIfEmpty(bool force_showcase_car
     }
 
     m_index.refilter();
-    int cols = m_canvas->computeColumns(m_canvas->width());
-    int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
-    onVirtualHeightChanged(vh);
-    updateStatusText();
-    m_canvas->update();
+    refreshCatalogView();
     emit catalogScanned(m_index.totalCount());
 }
 
@@ -1234,12 +1241,13 @@ void VirtualizedGridWidget::updateStatusText()
 {
     size_t filtered = m_index.filteredCount();
     size_t total = m_index.totalCount();
-    double dur_us = m_index.lastFilterDurationUs();
-    double dur_ms = dur_us / 1000.0;
 
-    QString text =
-        QString("%1 / %2 (%3 ms)").arg(filtered).arg(total).arg(QString::number(dur_ms, 'f', 2));
-    m_statusLabel->setText(text);
+    if (filtered == total) {
+        m_statusLabel->setText(total == 1 ? QStringLiteral("1 wallpaper")
+                                          : QStringLiteral("%1 wallpapers").arg(total));
+    } else {
+        m_statusLabel->setText(QStringLiteral("%1 of %2 wallpapers").arg(filtered).arg(total));
+    }
 }
 
 } // namespace wwal::studio

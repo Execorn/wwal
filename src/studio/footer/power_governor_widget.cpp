@@ -25,16 +25,16 @@ void PowerGovernorWidget::setupUi()
 
     // Common stylesheet for compact dark controls
     const QString comboStyle = "QComboBox {"
-                               "  background-color: #1e293b;"
+                               "  background-color: #181b22;"
                                "  color: #f1f5f9;"
-                               "  border: 1px solid #334155;"
+                               "  border: 1px solid #2c3240;"
                                "  border-radius: 4px;"
-                               "  padding: 1px 3px;"
+                               "  padding: 1px 4px;"
                                "  font-size: 9.5px;"
                                "  font-weight: 500;"
                                "}"
                                "QComboBox:hover {"
-                               "  border-color: #06b6d4;"
+                               "  border-color: #38bdf8;"
                                "}"
                                "QComboBox::drop-down {"
                                "  subcontrol-origin: padding;"
@@ -43,9 +43,9 @@ void PowerGovernorWidget::setupUi()
                                "  border-left: none;"
                                "}"
                                "QComboBox QAbstractItemView {"
-                               "  background-color: #0f172a;"
+                               "  background-color: #12141a;"
                                "  color: #f1f5f9;"
-                               "  border: 1px solid #334155;"
+                               "  border: 1px solid #2c3240;"
                                "  selection-background-color: #0284c7;"
                                "  selection-color: #ffffff;"
                                "  font-size: 10px;"
@@ -54,7 +54,7 @@ void PowerGovernorWidget::setupUi()
     const QString checkStyle = "QCheckBox {"
                                "  color: #94a3b8;"
                                "  font-size: 9.5px;"
-                               "  spacing: 2px;"
+                               "  spacing: 3px;"
                                "}"
                                "QCheckBox:hover {"
                                "  color: #f1f5f9;"
@@ -64,7 +64,7 @@ void PowerGovernorWidget::setupUi()
                                "  height: 11px;"
                                "  border-radius: 2px;"
                                "  border: 1px solid #475569;"
-                               "  background: #1e293b;"
+                               "  background: #181b22;"
                                "}"
                                "QCheckBox::indicator:checked {"
                                "  background: #0284c7;"
@@ -72,10 +72,10 @@ void PowerGovernorWidget::setupUi()
                                "}";
 
     // Power source badge (AC vs Battery)
-    m_powerBadge = new QLabel("⚡ AC", this);
-    m_powerBadge->setToolTip("Live Power Source");
+    m_powerBadge = new QLabel("AC", this);
+    m_powerBadge->setToolTip("Power source");
     m_powerBadge->setAlignment(Qt::AlignCenter);
-    m_powerBadge->setFixedSize(40, 22);
+    m_powerBadge->setFixedSize(34, 22);
     m_powerBadge->setStyleSheet("QLabel {"
                                 "  background-color: #064e3b;"
                                 "  color: #34d399;"
@@ -90,7 +90,7 @@ void PowerGovernorWidget::setupUi()
 
     // Pause status badge
     m_pauseStatusBadge = new QLabel("ACTIVE", this);
-    m_pauseStatusBadge->setToolTip("Live Wallpaper Daemon Render State");
+    m_pauseStatusBadge->setToolTip("Daemon render state");
     m_pauseStatusBadge->setAlignment(Qt::AlignCenter);
     m_pauseStatusBadge->setFixedSize(48, 22);
     m_pauseStatusBadge->setStyleSheet("QLabel {"
@@ -107,7 +107,7 @@ void PowerGovernorWidget::setupUi()
 
     // FPS Cap section
     auto *fpsLayout = new QHBoxLayout();
-    fpsLayout->setSpacing(2);
+    fpsLayout->setSpacing(3);
     auto *fpsLabel = new QLabel("FPS:", this);
     fpsLabel->setStyleSheet("color: #64748b; font-size: 9.5px; font-weight: 600;");
     fpsLayout->addWidget(fpsLabel);
@@ -115,7 +115,7 @@ void PowerGovernorWidget::setupUi()
     m_fpsCombo = new QComboBox(this);
     m_fpsCombo->setFixedSize(54, 22);
     m_fpsCombo->setStyleSheet(comboStyle);
-    m_fpsCombo->setToolTip("Target Render FPS Cap (or VSync for monitor refresh)");
+    m_fpsCombo->setToolTip("Frame rate cap (or VSync for monitor refresh)");
     m_fpsCombo->addItem("VSync", QVariant(0u));
     m_fpsCombo->addItem("24", QVariant(24u));
     m_fpsCombo->addItem("30", QVariant(30u));
@@ -130,7 +130,7 @@ void PowerGovernorWidget::setupUi()
 
     // Battery Policy section
     auto *batLayout = new QHBoxLayout();
-    batLayout->setSpacing(2);
+    batLayout->setSpacing(3);
     auto *batLabel = new QLabel("Bat:", this);
     batLabel->setStyleSheet("color: #64748b; font-size: 9.5px; font-weight: 600;");
     batLayout->addWidget(batLabel);
@@ -138,7 +138,7 @@ void PowerGovernorWidget::setupUi()
     m_batteryPolicyCombo = new QComboBox(this);
     m_batteryPolicyCombo->setFixedSize(56, 22);
     m_batteryPolicyCombo->setStyleSheet(comboStyle);
-    m_batteryPolicyCombo->setToolTip("Autonomous Battery Power Governor Policy");
+    m_batteryPolicyCombo->setToolTip("Behavior when running on battery power");
     m_batteryPolicyCombo->addItem("Ignore", QVariant(static_cast<uint32_t>(WAYWAL_BATTERY_IGNORE)));
     m_batteryPolicyCombo->addItem("30 FPS",
                                   QVariant(static_cast<uint32_t>(WAYWAL_BATTERY_REDUCE_FPS)));
@@ -152,12 +152,11 @@ void PowerGovernorWidget::setupUi()
 
     // Auto-Pause check boxes
     auto *pauseLayout = new QHBoxLayout();
-    pauseLayout->setSpacing(4);
+    pauseLayout->setSpacing(6);
 
     m_pauseFullscreenCheck = new QCheckBox("FS", this);
     m_pauseFullscreenCheck->setStyleSheet(checkStyle);
-    m_pauseFullscreenCheck->setToolTip(
-        "Auto-pause wallpaper rendering when a window is fullscreened");
+    m_pauseFullscreenCheck->setToolTip("Pause rendering when a window is fullscreen");
     m_pauseFullscreenCheck->setChecked(m_pauseFullscreen);
     connect(m_pauseFullscreenCheck, &QCheckBox::toggled, this,
             &PowerGovernorWidget::onAutoPauseCheckChanged);
@@ -165,7 +164,7 @@ void PowerGovernorWidget::setupUi()
 
     m_pauseMaximizedCheck = new QCheckBox("Max", this);
     m_pauseMaximizedCheck->setStyleSheet(checkStyle);
-    m_pauseMaximizedCheck->setToolTip("Auto-pause wallpaper rendering when windows are maximized");
+    m_pauseMaximizedCheck->setToolTip("Pause rendering when windows are maximized");
     m_pauseMaximizedCheck->setChecked(m_pauseMaximized);
     connect(m_pauseMaximizedCheck, &QCheckBox::toggled, this,
             &PowerGovernorWidget::onAutoPauseCheckChanged);
@@ -173,7 +172,7 @@ void PowerGovernorWidget::setupUi()
 
     m_pauseOccludedCheck = new QCheckBox("Occl", this);
     m_pauseOccludedCheck->setStyleSheet(checkStyle);
-    m_pauseOccludedCheck->setToolTip("Auto-pause rendering on workspaces without visible monitors");
+    m_pauseOccludedCheck->setToolTip("Pause rendering on inactive workspaces");
     m_pauseOccludedCheck->setChecked(m_pauseOccluded);
     connect(m_pauseOccludedCheck, &QCheckBox::toggled, this,
             &PowerGovernorWidget::onAutoPauseCheckChanged);
@@ -210,7 +209,7 @@ void PowerGovernorWidget::updateStatusBadges()
 {
     if (m_powerBadge) {
         if (m_onBattery) {
-            m_powerBadge->setText("🔋 BAT");
+            m_powerBadge->setText("BAT");
             m_powerBadge->setStyleSheet("QLabel {"
                                         "  background-color: #713f12;"
                                         "  color: #fde047;"
@@ -222,7 +221,7 @@ void PowerGovernorWidget::updateStatusBadges()
                                         "  padding: 2px 4px;"
                                         "}");
         } else {
-            m_powerBadge->setText("⚡ AC");
+            m_powerBadge->setText("AC");
             m_powerBadge->setStyleSheet("QLabel {"
                                         "  background-color: #064e3b;"
                                         "  color: #34d399;"

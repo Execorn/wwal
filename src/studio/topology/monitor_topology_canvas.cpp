@@ -580,7 +580,7 @@ void MonitorTopologyCanvas::drawMonitors(QPainter &painter)
             const QString resStr =
                 QStringLiteral("%1x%2").arg(m.geometry.width()).arg(m.geometry.height());
             const QString combined = (mRect.width() >= 96.0)
-                                         ? QStringLiteral("%1 · %2").arg(displayName, resStr)
+                                         ? QStringLiteral("%1 | %2").arg(displayName, resStr)
                                          : resStr;
 
             const qreal maxBadgeW = std::max(20.0, mRect.width() - 6.0);
@@ -609,7 +609,7 @@ void MonitorTopologyCanvas::drawMonitors(QPainter &painter)
                                 .arg(displayName)
                                 .arg(m.geometry.width())
                                 .arg(m.geometry.height());
-            QString subtitle = QString("%1 Hz · %2x")
+            QString subtitle = QString("%1 Hz | %2x")
                                    .arg(QString::number(m.refreshRateHz, 'f', 0))
                                    .arg(QString::number(m.devicePixelRatio, 'f', 1));
 
@@ -800,7 +800,7 @@ void MonitorTopologyCanvas::drawToolbarOverlay(QPainter &painter)
         painter.setFont(font);
 
         QString badgeText =
-            QString("%1 Display(s) · %2x%3 · %4")
+            QString("%1 Display(s) | %2x%3 | %4")
                 .arg(m_monitors.size())
                 .arg(m_virtualBoundingBox.width())
                 .arg(m_virtualBoundingBox.height())
@@ -831,7 +831,7 @@ void MonitorTopologyCanvas::drawToolbarOverlay(QPainter &painter)
     font.setBold(true);
     painter.setFont(font);
 
-    QString statusText = QString("Wayland Topology: %1 Display(s) · Bounding Canvas: %2 x %3")
+    QString statusText = QString("Displays: %1 | Canvas: %2 x %3")
                              .arg(m_monitors.size())
                              .arg(m_virtualBoundingBox.width())
                              .arg(m_virtualBoundingBox.height());

@@ -191,6 +191,7 @@ struct output_node {
     bool has_crop_gravity;
 
     bool configured;
+    bool wlr_has_fullscreen;
     struct daemon_state *state;
     struct output_node *next;
 };

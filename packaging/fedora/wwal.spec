@@ -1,5 +1,5 @@
 Name:           wwal
-Version:        1.2.0
+Version:        3.0.0
 Release:        1%{?dist}
 Summary:        Zero-copy Wayland wallpaper, VA-API video, Shadertoy, and Material You engine
 
@@ -87,6 +87,11 @@ procedural shader presets.
 %{_datadir}/doc/wwal/config.toml.example
 
 %changelog
+* Mon Nov 09 2026 Biryukov Nikita <n.biryukov.04@gmail.com> - 3.0.0-1
+- Release 3.0.0: WayWal Studio desktop GUI, Steam Workshop & Open Hub browsers,
+  Ed25519-signed .wwpkg packages, 4-tier compatibility scanner, and VA-API
+  H.264 B-frame reorder & VBlank PLL pacing fixes.
+
 * Wed Oct 28 2026 Biryukov Nikita <n.biryukov.04@gmail.com> - 1.1.0-1
 - Release 1.1.0: swww/awww v0.12.1 drop-in compatibility, unified wwal pick,
   dual-mode Material 3 + Matugen/Wallust/Pywal template engine, solar/schedule

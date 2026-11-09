@@ -35,31 +35,23 @@ static double json_safe_float(float v) { return isfinite(v) ? (double)v : 0.0; }
 static void get_process_memory_kib(unsigned long *out_rss_kib, unsigned long *out_pss_kib)
 {
     unsigned long rss = 0, pss = 0;
-    FILE *f = fopen("/proc/self/smaps_rollup", "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, "Rss:", 4) == 0) {
-                (void)sscanf(line + 4, "%lu", &rss);
-            } else if (strncmp(line, "Pss:", 4) == 0) {
-                (void)sscanf(line + 4, "%lu", &pss);
-            }
+    FILE *statm = fopen("/proc/self/statm", "r");
+    if (statm) {
+        unsigned long total = 0, rss_pages = 0, shared_pages = 0;
+        int n = fscanf(statm, "%lu %lu %lu", &total, &rss_pages, &shared_pages);
+        if (n >= 2) {
+            long page_sz = sysconf(_SC_PAGESIZE);
+            if (page_sz <= 0)
+                page_sz = 4096;
+            unsigned long page_kib = (unsigned long)page_sz / 1024UL;
+            if (page_kib == 0)
+                page_kib = 4;
+            rss = rss_pages * page_kib;
+            unsigned long priv_pages =
+                (n >= 3 && rss_pages > shared_pages) ? (rss_pages - shared_pages) : rss_pages;
+            pss = priv_pages * page_kib;
         }
-        fclose(f);
-    }
-    if (rss == 0) {
-        FILE *statm = fopen("/proc/self/statm", "r");
-        if (statm) {
-            unsigned long total = 0, rss_pages = 0;
-            if (fscanf(statm, "%lu %lu", &total, &rss_pages) == 2) {
-                long page_sz = sysconf(_SC_PAGESIZE);
-                if (page_sz <= 0)
-                    page_sz = 4096;
-                rss = (rss_pages * (unsigned long)page_sz) / 1024UL;
-                pss = rss;
-            }
-            fclose(statm);
-        }
+        fclose(statm);
     }
     if (out_rss_kib)
         *out_rss_kib = rss;
@@ -2822,6 +2814,65 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         }
         if (!target_out) {
             target_out = state->outputs;
+        }
+
+        if (target_out && !target_out->shader_active && !target_out->anim_active &&
+            !target_out->workshop_active) {
+            video_engine_t *ve = NULL;
+            if (target_out->video_eng &&
+                target_out->video_eng->state != WAYWAL_VIDEO_STATE_STOPPED) {
+                ve = target_out->video_eng;
+            } else if (state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED &&
+                       ((state->video_engine.target_output &&
+                         state->video_engine.target_output == target_out) ||
+                        (!state->video_engine.target_output &&
+                         (!state->video_engine.has_target_filter || target_out->video_targeted)))) {
+                ve = &state->video_engine;
+            }
+            if (ve) {
+                if (ve->decoder.initialized && ve->last_export_surf != VA_INVALID_SURFACE &&
+                    (ve->decoder.has_vpp || !video_engine_snapshot_output(ve, target_out))) {
+                    vaapi_prime_frame_t prime_frame;
+                    if (vaapi_decoder_export_prime(&ve->decoder, ve->last_export_surf,
+                                                   &prime_frame)) {
+                        waywal_export_dmabuf_resp_t resp_pay;
+                        memset(&resp_pay, 0, sizeof(resp_pay));
+                        resp_pay.width =
+                            prime_frame.width > 0 ? prime_frame.width : (uint32_t)target_out->width;
+                        resp_pay.height = prime_frame.height > 0 ? prime_frame.height
+                                                                 : (uint32_t)target_out->height;
+                        resp_pay.drm_format = prime_frame.drm_format;
+                        resp_pay.modifier = prime_frame.modifiers[0];
+                        resp_pay.num_planes =
+                            prime_frame.num_planes > 0 ? prime_frame.num_planes : 1;
+                        if (resp_pay.num_planes > 4) {
+                            resp_pay.num_planes = 4;
+                        }
+                        for (uint32_t p = 0; p < resp_pay.num_planes; ++p) {
+                            resp_pay.strides[p] = prime_frame.strides[p];
+                            resp_pay.offsets[p] = prime_frame.offsets[p];
+                        }
+                        snprintf(resp_pay.output, sizeof(resp_pay.output), "%s", target_out->name);
+                        resp_pay.flags = (prime_frame.drm_format == DRM_FORMAT_P010 ||
+                                          prime_frame.drm_format == DRM_FORMAT_ARGB2101010 ||
+                                          prime_frame.drm_format == DRM_FORMAT_XRGB2101010)
+                                             ? 1
+                                             : 0;
+
+                        resp_hdr.opcode = WAYWAL_RESP_OK;
+                        resp_hdr.payload_size = sizeof(resp_pay);
+                        bool sent = waywal_ipc_send_fds(client_fd, &resp_hdr, prime_frame.fds,
+                                                        resp_pay.num_planes);
+                        vaapi_prime_frame_close(&prime_frame);
+                        if (sent) {
+                            (void)write_exact(client_fd, &resp_pay, sizeof(resp_pay));
+                        }
+                        break;
+                    }
+                } else if (ve->using_swdec) {
+                    (void)video_engine_snapshot_output(ve, target_out);
+                }
+            }
         }
 
         const dmabuf_bo_t *src_bo = NULL;

@@ -4793,6 +4793,16 @@ static void daemon_handle_power_gov_events(daemon_state_t *state, int fd)
         char mon[64];
         while (waywal_power_governor_pop_workspace_change(state->power_gov, ws, sizeof(ws), mon,
                                                           sizeof(mon))) {
+            if (mon[0] != '\0') {
+                for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                    if (strcmp(out->name, mon) == 0 && out->configured && out->pres_sync.wp_pres &&
+                        out->pres_sync.pll.frame_seq == 0 && !out->pres_sync.pending_feedback &&
+                        (waywal_power_governor_get_output_mask(state->power_gov, out->name) &
+                         WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN) == 0) {
+                        output_node_recreate_layer_surface(state, out);
+                    }
+                }
+            }
             if (ws[0] != '\0' && strcmp(state->last_workspace_name, ws) == 0) {
                 continue;
             }

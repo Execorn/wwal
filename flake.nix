@@ -19,7 +19,7 @@
         rec {
           wwal = pkgs.stdenv.mkDerivation {
             pname = "wwal";
-            version = "1.2.0";
+            version = "3.0.0";
             src = self;
 
             nativeBuildInputs = with pkgs; [

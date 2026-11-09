@@ -226,18 +226,18 @@ void PropertyRowWidget::setupUi()
                                          std::clamp(b, 0.0f, 1.0f));
 
         m_colorSwatchBtn = new QPushButton(this);
-        m_colorSwatchBtn->setFixedSize(36, 20);
+        m_colorSwatchBtn->setFixedSize(36, 24);
         m_colorSwatchBtn->setCursor(Qt::PointingHandCursor);
-        m_colorSwatchBtn->setToolTip(tr("Click to open OkLCH Perceptual Color Dialog"));
+        m_colorSwatchBtn->setToolTip(tr("Click to choose color"));
         m_colorSwatchBtn->setStyleSheet(
-            QString("background-color: %1; border: 1px solid #51576d; border-radius: 4px;")
+            QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
                 .arg(curCol.name(QColor::HexRgb)));
 
         m_hexEdit = new QLineEdit(curCol.name(QColor::HexRgb).toUpper(), this);
         m_hexEdit->setMaxLength(7);
-        m_hexEdit->setFixedWidth(64);
-        m_hexEdit->setFixedHeight(20);
-        m_hexEdit->setStyleSheet("font-size: 10px; padding: 1px 3px;");
+        m_hexEdit->setFixedWidth(68);
+        m_hexEdit->setFixedHeight(24);
+        m_hexEdit->setStyleSheet("font-size: 11px; padding: 2px 4px;");
 
         connect(m_colorSwatchBtn, &QPushButton::clicked, this,
                 &PropertyRowWidget::onColorButtonClicked);
@@ -262,12 +262,13 @@ void PropertyRowWidget::setupUi()
 
     // Reset-to-default button
     m_resetButton = new QToolButton(this);
-    m_resetButton->setText(tr("⟲"));
-    m_resetButton->setFixedSize(20, 20);
+    m_resetButton->setText(tr("Reset"));
+    m_resetButton->setFixedSize(44, 22);
     m_resetButton->setToolTip(tr("Reset this parameter to default value"));
     m_resetButton->setStyleSheet(
-        "QToolButton { color: #a5adce; font-weight: bold; border: none; padding: 1px; } "
-        "QToolButton:hover { color: #8caaee; background: #303446; border-radius: 3px; }");
+        "QToolButton { color: #94a3b8; font-size: 10px; background: #20242e; border: 1px solid "
+        "#2c3240; border-radius: 4px; padding: 1px 4px; } "
+        "QToolButton:hover { color: #f1f5f9; background: #2a303d; }");
     connect(m_resetButton, &QToolButton::clicked, this, &PropertyRowWidget::resetToDefault);
     rowLayout->addWidget(m_resetButton);
 }
@@ -358,9 +359,9 @@ void PropertyRowWidget::onColorButtonClicked()
 
     OklchColorDialog dlg(initCol, this);
     dlg.setWindowTitle(
-        tr("Pick Color — %1").arg(m_prop.label.isEmpty() ? m_prop.name : m_prop.label));
+        tr("Pick Color - %1").arg(m_prop.label.isEmpty() ? m_prop.name : m_prop.label));
 
-    // Connect live changes to stream parameters at 60/144 Hz while dragging in color picker!
+    // Connect live changes to stream parameters while dragging in color picker
     connect(&dlg, &OklchColorDialog::colorChanged, this, [this](const QColor &newCol) {
         if (m_prop.currentValues.size() < 3)
             m_prop.currentValues.resize(3);
@@ -370,7 +371,7 @@ void PropertyRowWidget::onColorButtonClicked()
 
         if (m_colorSwatchBtn) {
             m_colorSwatchBtn->setStyleSheet(
-                QString("background-color: %1; border: 1px solid #51576d; border-radius: 4px;")
+                QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
                     .arg(newCol.name(QColor::HexRgb)));
         }
         if (m_hexEdit) {
@@ -386,7 +387,7 @@ void PropertyRowWidget::onColorButtonClicked()
         m_prop.currentValues[2] = initCol.blueF();
         if (m_colorSwatchBtn) {
             m_colorSwatchBtn->setStyleSheet(
-                QString("background-color: %1; border: 1px solid #51576d; border-radius: 4px;")
+                QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
                     .arg(initCol.name(QColor::HexRgb)));
         }
         if (m_hexEdit) {
@@ -413,7 +414,7 @@ void PropertyRowWidget::onHexEdited(const QString &text)
 
         if (m_colorSwatchBtn) {
             m_colorSwatchBtn->setStyleSheet(
-                QString("background-color: %1; border: 1px solid #51576d; border-radius: 4px;")
+                QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
                     .arg(col.name(QColor::HexRgb)));
         }
         emitChange();
@@ -457,7 +458,7 @@ void PropertyRowWidget::updateValues(const std::vector<float> &vals)
                              std::clamp(vals[2], 0.0f, 1.0f));
         if (m_colorSwatchBtn) {
             m_colorSwatchBtn->setStyleSheet(
-                QString("background-color: %1; border: 1px solid #51576d; border-radius: 4px;")
+                QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
                     .arg(col.name(QColor::HexRgb)));
         }
         if (m_hexEdit) {
@@ -490,27 +491,27 @@ PropertyInspectorWidget::PropertyInspectorWidget(QWidget *parent) : QWidget(pare
 void PropertyInspectorWidget::setupUi()
 {
     auto *rootLayout = new QVBoxLayout(this);
-    rootLayout->setContentsMargins(6, 4, 6, 4);
-    rootLayout->setSpacing(4);
+    rootLayout->setContentsMargins(10, 8, 10, 8);
+    rootLayout->setSpacing(8);
 
     // --- Header Card ---
     auto *headerWidget = new QWidget(this);
     headerWidget->setStyleSheet(
-        "background: #292c3c; border: 1px solid #414559; border-radius: 6px;");
+        "background: #181b22; border: 1px solid #2c3240; border-radius: 6px;");
     auto *headerLayout = new QVBoxLayout(headerWidget);
-    headerLayout->setContentsMargins(8, 4, 8, 4);
-    headerLayout->setSpacing(2);
+    headerLayout->setContentsMargins(10, 8, 10, 8);
+    headerLayout->setSpacing(4);
 
     auto *topRow = new QHBoxLayout();
-    topRow->setSpacing(4);
+    topRow->setSpacing(8);
     m_titleLabel = new QLabel(m_currentTitle, headerWidget);
     m_titleLabel->setMinimumWidth(60);
     m_titleLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    m_titleLabel->setStyleSheet("font-size: 12px; font-weight: bold; color: #c6d0f5;");
+    m_titleLabel->setStyleSheet("font-size: 13px; font-weight: bold; color: #f1f5f9;");
 
     m_typeBadge = new QLabel(m_currentType, headerWidget);
-    m_typeBadge->setStyleSheet("background: #85c1dc; color: #1e1e2e; font-weight: bold; "
-                               "border-radius: 3px; padding: 1px 5px; font-size: 10px;");
+    m_typeBadge->setStyleSheet("background: #0284c7; color: #ffffff; font-weight: bold; "
+                               "border-radius: 4px; padding: 2px 8px; font-size: 10px;");
 
     topRow->addWidget(m_titleLabel, 1);
     topRow->addWidget(m_typeBadge, 0);
@@ -519,7 +520,7 @@ void PropertyInspectorWidget::setupUi()
     m_authorLabel = new QLabel(headerWidget);
     m_authorLabel->setMinimumWidth(50);
     m_authorLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    m_authorLabel->setStyleSheet("color: #a5adce; font-size: 10px;");
+    m_authorLabel->setStyleSheet("color: #94a3b8; font-size: 11px;");
     m_authorLabel->setVisible(false);
     headerLayout->addWidget(m_authorLabel);
 
@@ -527,36 +528,43 @@ void PropertyInspectorWidget::setupUi()
 
     // --- Toolbar: Search Filter & Presets ---
     m_filterEdit = new QLineEdit(this);
-    m_filterEdit->setPlaceholderText(tr("🔍 Filter parameters..."));
+    m_filterEdit->setPlaceholderText(tr("Filter parameters..."));
     m_filterEdit->setClearButtonEnabled(true);
+    m_filterEdit->setFixedHeight(26);
     connect(m_filterEdit, &QLineEdit::textChanged, this,
             &PropertyInspectorWidget::onFilterTextChanged);
     rootLayout->addWidget(m_filterEdit);
 
     auto *toolBar = new QHBoxLayout();
     toolBar->setContentsMargins(0, 0, 0, 0);
-    toolBar->setSpacing(4);
+    toolBar->setSpacing(8);
 
-    m_btnSavePreset = new QPushButton(tr("💾 Save"), this);
+    m_btnSavePreset = new QPushButton(tr("Save"), this);
+    m_btnSavePreset->setFixedHeight(26);
     m_btnSavePreset->setToolTip(tr("Save current parameters as a named preset"));
-    m_btnSavePreset->setStyleSheet("background: #303446; color: #c6d0f5; padding: 2px 6px; "
-                                   "border-radius: 4px; font-size: 10.5px;");
+    m_btnSavePreset->setStyleSheet(
+        "background: #20242e; color: #f1f5f9; border: 1px solid #2c3240; padding: 4px 10px; "
+        "border-radius: 5px; font-size: 11px;");
     connect(m_btnSavePreset, &QPushButton::clicked, this,
             &PropertyInspectorWidget::onSavePresetClicked);
     toolBar->addWidget(m_btnSavePreset, 1);
 
-    m_btnLoadPreset = new QPushButton(tr("📂 Load"), this);
+    m_btnLoadPreset = new QPushButton(tr("Load"), this);
+    m_btnLoadPreset->setFixedHeight(26);
     m_btnLoadPreset->setToolTip(tr("Load parameters from a saved preset"));
-    m_btnLoadPreset->setStyleSheet("background: #303446; color: #c6d0f5; padding: 2px 6px; "
-                                   "border-radius: 4px; font-size: 10.5px;");
+    m_btnLoadPreset->setStyleSheet(
+        "background: #20242e; color: #f1f5f9; border: 1px solid #2c3240; padding: 4px 10px; "
+        "border-radius: 5px; font-size: 11px;");
     connect(m_btnLoadPreset, &QPushButton::clicked, this,
             &PropertyInspectorWidget::onLoadPresetClicked);
     toolBar->addWidget(m_btnLoadPreset, 1);
 
-    m_btnResetAll = new QPushButton(tr("⟲ Reset"), this);
+    m_btnResetAll = new QPushButton(tr("Reset"), this);
+    m_btnResetAll->setFixedHeight(26);
     m_btnResetAll->setToolTip(tr("Reset all parameters to their default values"));
-    m_btnResetAll->setStyleSheet("background: #414559; color: #e78284; padding: 2px 6px; "
-                                 "border-radius: 4px; font-size: 10.5px;");
+    m_btnResetAll->setStyleSheet(
+        "background: #20242e; color: #f87171; border: 1px solid #2c3240; padding: 4px 10px; "
+        "border-radius: 5px; font-size: 11px;");
     connect(m_btnResetAll, &QPushButton::clicked, this,
             &PropertyInspectorWidget::resetAllToDefaults);
     toolBar->addWidget(m_btnResetAll, 1);
@@ -573,7 +581,7 @@ void PropertyInspectorWidget::setupUi()
     m_containerWidget = new QWidget(m_scrollArea);
     m_containerLayout = new QVBoxLayout(m_containerWidget);
     m_containerLayout->setContentsMargins(0, 0, 4, 0);
-    m_containerLayout->setSpacing(4);
+    m_containerLayout->setSpacing(8);
 
     m_scrollArea->setWidget(m_containerWidget);
     rootLayout->addWidget(m_scrollArea, 1);
@@ -583,11 +591,11 @@ void PropertyInspectorWidget::setupUi()
 void PropertyInspectorWidget::populateDefaultSceneParameters()
 {
     m_currentId = QStringLiteral("studio_default_scene");
-    m_currentTitle = tr("Studio Shader & Scene Uniforms");
+    m_currentTitle = tr("Shader Parameters");
     m_currentType = QStringLiteral("GLES 3.1");
     m_titleLabel->setText(m_currentTitle);
     m_typeBadge->setText(m_currentType);
-    m_authorLabel->setText(tr("Live 144 Hz Uniform Stream"));
+    m_authorLabel->setText(tr("Live Uniforms"));
     m_authorLabel->setVisible(true);
 
     m_properties.clear();
@@ -938,15 +946,15 @@ void PropertyInspectorWidget::rebuildPropertyUi()
 
         auto *group = new QGroupBox(cleanTitle, m_containerWidget);
         group->setStyleSheet(
-            "QGroupBox { font-weight: bold; font-size: 10.5px; border: 1px solid #414559; "
+            "QGroupBox { font-weight: bold; font-size: 11px; border: 1px solid #2c3240; "
             "border-radius: 6px; "
-            "margin-top: 7px; padding-top: 8px; background: #232634; } "
+            "margin-top: 8px; padding-top: 10px; background: #181b22; } "
             "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; "
-            "left: 10px; top: 0px; padding: 0px 6px 2px 6px; color: #8caaee; }");
+            "left: 10px; top: 0px; padding: 0px 6px 2px 6px; color: #38bdf8; }");
 
         auto *groupLayout = new QVBoxLayout(group);
-        groupLayout->setContentsMargins(6, 4, 6, 4);
-        groupLayout->setSpacing(2);
+        groupLayout->setContentsMargins(8, 6, 8, 6);
+        groupLayout->setSpacing(6);
 
         for (const auto &p : propList) {
             auto *row = new PropertyRowWidget(p, group);

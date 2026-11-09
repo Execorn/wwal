@@ -47,22 +47,21 @@ ColorSwatchChip::ColorSwatchChip(const QString &tokenName, const color_rgba_t &c
 {
     setFrameShape(QFrame::StyledPanel);
     setCursor(Qt::PointingHandCursor);
-    setMinimumWidth(84);
-    setFixedHeight(28);
+    setMinimumWidth(88);
+    setFixedHeight(32);
     setStyleSheet(QStringLiteral(
-        "ColorSwatchChip { background-color: #20222a; border: 1px solid #333644; "
-        "border-radius: 5px; padding: 1px; } "
-        "ColorSwatchChip:hover { background-color: #2c2f3c; border-color: #6750A4; }"));
+        "ColorSwatchChip { background-color: #181b22; border: 1px solid #262b36; "
+        "border-radius: 5px; padding: 2px; } "
+        "ColorSwatchChip:hover { background-color: #20242e; border-color: #0284c7; }"));
 
     auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(4, 1, 4, 1);
-    layout->setSpacing(0);
+    layout->setContentsMargins(6, 2, 6, 2);
+    layout->setSpacing(1);
 
     m_nameLabel = new QLabel(m_tokenName, this);
     m_nameLabel->setMinimumWidth(28);
     m_nameLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    m_nameLabel->setStyleSheet(
-        QStringLiteral("font-weight: 600; font-size: 8.5px; color: #E0E2EC;"));
+    m_nameLabel->setStyleSheet(QStringLiteral("font-weight: 600; font-size: 9px; color: #e2e8f0;"));
     layout->addWidget(m_nameLabel);
 
     auto *bottomRow = new QHBoxLayout();
@@ -75,7 +74,7 @@ ColorSwatchChip::ColorSwatchChip(const QString &tokenName, const color_rgba_t &c
 
     m_hexLabel = new QLabel(this);
     m_hexLabel->setStyleSheet(
-        QStringLiteral("font-family: monospace; font-size: 8.5px; color: #9094A6;"));
+        QStringLiteral("font-family: monospace; font-size: 9px; color: #94a3b8;"));
     bottomRow->addWidget(m_hexLabel, 1);
 
     layout->addLayout(bottomRow);
@@ -124,14 +123,14 @@ WcagBadgeWidget::WcagBadgeWidget(const QString &pairName, QWidget *parent)
 {
     setFrameShape(QFrame::StyledPanel);
     setToolTip(pairName);
-    setFixedHeight(15);
+    setFixedHeight(22);
     setStyleSheet(
-        QStringLiteral("WcagBadgeWidget { background-color: #1a1c23; border: 1px solid #2b2e3b; "
-                       "border-radius: 3px; padding: 0px; }"));
+        QStringLiteral("WcagBadgeWidget { background-color: #181b22; border: 1px solid #262b36; "
+                       "border-radius: 4px; padding: 0px; }"));
 
     auto *layout = new QHBoxLayout(this);
-    layout->setContentsMargins(2, 0, 2, 0);
-    layout->setSpacing(2);
+    layout->setContentsMargins(6, 2, 6, 2);
+    layout->setSpacing(4);
 
     QString shortLabel = pairName;
     const int slashIdx = pairName.indexOf(QLatin1Char('/'));
@@ -147,25 +146,25 @@ WcagBadgeWidget::WcagBadgeWidget(const QString &pairName, QWidget *parent)
     }
 
     m_nameLabel = new QLabel(shortLabel, this);
-    m_nameLabel->setMinimumWidth(16);
+    m_nameLabel->setMinimumWidth(20);
     m_nameLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     m_nameLabel->setStyleSheet(
-        QStringLiteral("font-size: 8px; font-weight: bold; color: #D0D2DE; border: none;"));
+        QStringLiteral("font-size: 9px; font-weight: 600; color: #cbd5e1; border: none;"));
     layout->addWidget(m_nameLabel, 1);
 
     m_ratioLabel = new QLabel(QStringLiteral("0.0:1"), this);
-    m_ratioLabel->setStyleSheet(QStringLiteral("font-family: monospace; font-size: 8px; "
-                                               "font-weight: bold; color: #FFFFFF; border: none;"));
+    m_ratioLabel->setStyleSheet(QStringLiteral("font-family: monospace; font-size: 9px; "
+                                               "font-weight: bold; color: #f8fafc; border: none;"));
     layout->addWidget(m_ratioLabel, 0);
 
     m_aaBadge = new QLabel(QStringLiteral("AA"), this);
     m_aaBadge->setAlignment(Qt::AlignCenter);
-    m_aaBadge->setFixedSize(14, 11);
+    m_aaBadge->setFixedSize(18, 14);
     layout->addWidget(m_aaBadge, 0);
 
     m_aaaBadge = new QLabel(QStringLiteral("AAA"), this);
     m_aaaBadge->setAlignment(Qt::AlignCenter);
-    m_aaaBadge->setFixedSize(18, 11);
+    m_aaaBadge->setFixedSize(24, 14);
     layout->addWidget(m_aaaBadge, 0);
 }
 
@@ -203,26 +202,26 @@ void WcagBadgeWidget::updateRatio(const color_rgba_t &fg, const color_rgba_t &bg
 
     if (passAa) {
         m_aaBadge->setStyleSheet(
-            QStringLiteral("background-color: #2e7d32; color: white; border-radius: 2px; "
-                           "font-size: 7px; font-weight: bold; border: none;"));
-        m_aaBadge->setToolTip(QStringLiteral("%1 — WCAG 2.1 AA (4.5:1) Pass").arg(m_pairName));
+            QStringLiteral("background-color: #15803d; color: white; border-radius: 3px; "
+                           "font-size: 8px; font-weight: bold; border: none;"));
+        m_aaBadge->setToolTip(QStringLiteral("%1 - WCAG 2.1 AA (4.5:1) Pass").arg(m_pairName));
     } else {
         m_aaBadge->setStyleSheet(
-            QStringLiteral("background-color: #c62828; color: white; border-radius: 2px; "
-                           "font-size: 7px; font-weight: bold; border: none;"));
-        m_aaBadge->setToolTip(QStringLiteral("%1 — WCAG 2.1 AA (4.5:1) Fail").arg(m_pairName));
+            QStringLiteral("background-color: #b91c1c; color: white; border-radius: 3px; "
+                           "font-size: 8px; font-weight: bold; border: none;"));
+        m_aaBadge->setToolTip(QStringLiteral("%1 - WCAG 2.1 AA (4.5:1) Fail").arg(m_pairName));
     }
 
     if (passAaa) {
         m_aaaBadge->setStyleSheet(
-            QStringLiteral("background-color: #2e7d32; color: white; border-radius: 2px; "
-                           "font-size: 7px; font-weight: bold; border: none;"));
-        m_aaaBadge->setToolTip(QStringLiteral("%1 — WCAG 2.1 AAA (7.0:1) Pass").arg(m_pairName));
+            QStringLiteral("background-color: #15803d; color: white; border-radius: 3px; "
+                           "font-size: 8px; font-weight: bold; border: none;"));
+        m_aaaBadge->setToolTip(QStringLiteral("%1 - WCAG 2.1 AAA (7.0:1) Pass").arg(m_pairName));
     } else {
         m_aaaBadge->setStyleSheet(
-            QStringLiteral("background-color: #555555; color: #bbbbbb; border-radius: 2px; "
-                           "font-size: 7px; font-weight: bold; border: none;"));
-        m_aaaBadge->setToolTip(QStringLiteral("%1 — WCAG 2.1 AAA (7.0:1) Not met").arg(m_pairName));
+            QStringLiteral("background-color: #334155; color: #cbd5e1; border-radius: 3px; "
+                           "font-size: 8px; font-weight: bold; border: none;"));
+        m_aaaBadge->setToolTip(QStringLiteral("%1 - WCAG 2.1 AAA (7.0:1) Not met").arg(m_pairName));
     }
 }
 
@@ -234,11 +233,11 @@ ThemeStudioWidget::ThemeStudioWidget(QWidget *parent) : QWidget(parent)
 {
     setMinimumWidth(210);
     setStyleSheet(
-        QStringLiteral("QGroupBox { border: 1px solid #2b2e3b; border-radius: 5px; margin-top: "
-                       "8px; padding-top: 2px; "
-                       "font-size: 8pt; font-weight: bold; color: #c7d2fe; } "
+        QStringLiteral("QGroupBox { border: 1px solid #262b36; border-radius: 6px; margin-top: "
+                       "10px; padding-top: 6px; "
+                       "font-size: 8.5pt; font-weight: 600; color: #cbd5e1; } "
                        "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top "
-                       "left; left: 6px; top: 0px; padding: 0 3px; }"));
+                       "left; left: 8px; top: 0px; padding: 0 4px; }"));
     setupUi();
 
     // Solar timer every 60 seconds
@@ -258,9 +257,9 @@ void ThemeStudioWidget::resizeEvent(QResizeEvent *event)
             m_mainSplitter->setOrientation(target);
         }
         if (target == Qt::Vertical && height() > 240) {
-            const int availH = std::max(240, height() - 28);
-            const int bottomH = (availH >= 560) ? 330 : 120;
-            const int topH = std::max(316, availH - bottomH - 4);
+            const int availH = std::max(240, height() - 32);
+            const int bottomH = (availH >= 560) ? 300 : 140;
+            const int topH = std::max(260, availH - bottomH - 4);
             m_mainSplitter->setSizes({topH, std::max(96, availH - topH)});
         } else if (target == Qt::Horizontal && width() > 300) {
             int leftW = static_cast<int>(width() * 0.54);
@@ -274,43 +273,42 @@ QColor ThemeStudioWidget::toQColor(const color_rgba_t &c) { return QColor(c.r, c
 void ThemeStudioWidget::setupUi()
 {
     auto *topLayout = new QVBoxLayout(this);
-    topLayout->setContentsMargins(5, 3, 5, 3);
-    topLayout->setSpacing(3);
+    topLayout->setContentsMargins(8, 6, 8, 6);
+    topLayout->setSpacing(6);
 
     // Header toolbar
     auto *headerLayout = new QHBoxLayout();
     headerLayout->setContentsMargins(0, 0, 0, 0);
-    headerLayout->setSpacing(3);
+    headerLayout->setSpacing(6);
 
-    auto *titleLabel = new QLabel(QStringLiteral("<b>Material You HCT</b>"), this);
-    titleLabel->setStyleSheet(QStringLiteral("font-size: 8.5pt; color: #E0E2EC;"));
+    auto *titleLabel = new QLabel(QStringLiteral("<b>Color Palette</b>"), this);
+    titleLabel->setStyleSheet(QStringLiteral("font-size: 9pt; color: #f8fafc;"));
     titleLabel->setMinimumWidth(60);
     titleLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     headerLayout->addWidget(titleLabel, 1);
 
     m_clipboardToastLabel = new QLabel(this);
     m_clipboardToastLabel->setStyleSheet(
-        QStringLiteral("color: #80cbc4; font-size: 7.5pt; font-weight: bold;"));
+        QStringLiteral("color: #38bdf8; font-size: 8pt; font-weight: 600;"));
     headerLayout->addWidget(m_clipboardToastLabel, 0);
 
     m_perfLabel = new QLabel(QStringLiteral("Ready"), this);
-    m_perfLabel->setToolTip(
-        QStringLiteral("Material You HCT Extraction Latency (Target: < 2.5 ms)"));
+    m_perfLabel->setToolTip(QStringLiteral("Palette extraction time"));
     m_perfLabel->setStyleSheet(
-        QStringLiteral("color: #888888; font-size: 7pt; font-family: monospace;"));
+        QStringLiteral("color: #94a3b8; font-size: 8pt; font-family: monospace;"));
     headerLayout->addWidget(m_perfLabel, 0);
 
-    auto *toggleLockBtn = new QPushButton(QStringLiteral("Blur"), this);
-    toggleLockBtn->setToolTip(QStringLiteral("Toggle Lockscreen Kawase Blur Preview Mode"));
-    toggleLockBtn->setFixedHeight(19);
-    toggleLockBtn->setStyleSheet(QStringLiteral("padding: 1px 5px; font-size: 7.5pt;"));
+    auto *toggleLockBtn = new QPushButton(QStringLiteral("Lockscreen"), this);
+    toggleLockBtn->setToolTip(QStringLiteral("Toggle lockscreen blur preview"));
+    toggleLockBtn->setFixedHeight(24);
+    toggleLockBtn->setStyleSheet(QStringLiteral("padding: 2px 8px; font-size: 8pt;"));
     headerLayout->addWidget(toggleLockBtn, 0);
 
-    auto *loadWallBtn = new QPushButton(QStringLiteral("Open..."), this);
-    loadWallBtn->setToolTip(QStringLiteral("Open image to extract Material You HCT palette"));
-    loadWallBtn->setFixedHeight(19);
+    auto *loadWallBtn = new QPushButton(QStringLiteral("Open Image..."), this);
+    loadWallBtn->setToolTip(QStringLiteral("Load an image to extract its color palette"));
+    loadWallBtn->setFixedHeight(24);
     loadWallBtn->setStyleSheet(
-        QStringLiteral("padding: 1px 5px; font-size: 7.5pt; font-weight: bold;"));
+        QStringLiteral("padding: 2px 8px; font-size: 8pt; font-weight: 600;"));
     connect(loadWallBtn, &QPushButton::clicked, this, &ThemeStudioWidget::openWallpaperDialog);
     headerLayout->addWidget(loadWallBtn, 0);
 
@@ -331,23 +329,20 @@ void ThemeStudioWidget::setupUi()
 
     auto *leftColWidget = new QWidget(leftScroll);
     auto *leftColLayout = new QVBoxLayout(leftColWidget);
-    leftColLayout->setContentsMargins(0, 0, 2, 0);
-    leftColLayout->setSpacing(2);
+    leftColLayout->setContentsMargins(0, 0, 4, 0);
+    leftColLayout->setSpacing(6);
 
     // Controls Card
     setupControlsCard(leftColLayout);
 
-    // WCAG Badges Card
-    setupWcagBadgesCard(leftColLayout);
-
     // Desktop Preview Mockup
-    auto *previewCard = new QGroupBox(QStringLiteral("Live Desktop Vector Mockup"), leftColWidget);
+    auto *previewCard = new QGroupBox(QStringLiteral("Desktop Preview"), leftColWidget);
     auto *previewLayout = new QVBoxLayout(previewCard);
-    previewLayout->setContentsMargins(3, 2, 3, 2);
-    previewLayout->setSpacing(1);
+    previewLayout->setContentsMargins(6, 6, 6, 6);
+    previewLayout->setSpacing(4);
 
     m_mockup = new DesktopPreviewMockup(previewCard);
-    m_mockup->setMinimumSize(170, 114);
+    m_mockup->setMinimumSize(170, 120);
     previewLayout->addWidget(m_mockup, 1);
     connect(toggleLockBtn, &QPushButton::clicked, m_mockup,
             &DesktopPreviewMockup::toggleLockscreenPreview);
@@ -360,11 +355,10 @@ void ThemeStudioWidget::setupUi()
     auto *rightColWidget = new QWidget(m_mainSplitter);
     auto *rightColLayout = new QVBoxLayout(rightColWidget);
     rightColLayout->setContentsMargins(0, 0, 0, 0);
-    rightColLayout->setSpacing(2);
+    rightColLayout->setSpacing(4);
 
     auto *tabWidget = new QTabWidget(rightColWidget);
-    tabWidget->setStyleSheet(
-        QStringLiteral("QTabBar::tab { padding: 2px 5px; font-size: 7.5pt; }"));
+    tabWidget->setStyleSheet(QStringLiteral("QTabBar::tab { padding: 4px 8px; font-size: 8pt; }"));
     setupSwatchesCard(tabWidget);
 
     rightColLayout->addWidget(tabWidget, 1);
@@ -378,32 +372,32 @@ void ThemeStudioWidget::setupUi()
 
 void ThemeStudioWidget::setupControlsCard(QVBoxLayout *parentLayout)
 {
-    auto *card = new QGroupBox(QStringLiteral("Theme Generation Controls"), this);
+    auto *card = new QGroupBox(QStringLiteral("Theme Options"), this);
     auto *layout = new QVBoxLayout(card);
-    layout->setContentsMargins(3, 2, 3, 2);
-    layout->setSpacing(1);
+    layout->setContentsMargins(8, 6, 8, 6);
+    layout->setSpacing(6);
 
     // Row 1: Mode & Solar Schedule
     auto *row1 = new QHBoxLayout();
     row1->setContentsMargins(0, 0, 0, 0);
-    row1->setSpacing(4);
+    row1->setSpacing(6);
 
     auto *modeLabel = new QLabel(QStringLiteral("Mode:"), card);
-    modeLabel->setStyleSheet(QStringLiteral("font-weight: bold; font-size: 8pt;"));
+    modeLabel->setStyleSheet(QStringLiteral("font-weight: 600; font-size: 8.5pt;"));
     row1->addWidget(modeLabel);
 
     m_modeDarkBtn = new QPushButton(QStringLiteral("Dark"), card);
     m_modeDarkBtn->setCheckable(true);
     m_modeDarkBtn->setChecked(true);
-    m_modeDarkBtn->setFixedHeight(18);
-    m_modeDarkBtn->setStyleSheet(QStringLiteral("padding: 1px 6px; font-size: 7.5pt;"));
+    m_modeDarkBtn->setFixedHeight(24);
+    m_modeDarkBtn->setStyleSheet(QStringLiteral("padding: 2px 8px; font-size: 8pt;"));
     row1->addWidget(m_modeDarkBtn);
 
     m_modeLightBtn = new QPushButton(QStringLiteral("Light"), card);
     m_modeLightBtn->setCheckable(true);
     m_modeLightBtn->setChecked(false);
-    m_modeLightBtn->setFixedHeight(18);
-    m_modeLightBtn->setStyleSheet(QStringLiteral("padding: 1px 6px; font-size: 7.5pt;"));
+    m_modeLightBtn->setFixedHeight(24);
+    m_modeLightBtn->setStyleSheet(QStringLiteral("padding: 2px 8px; font-size: 8pt;"));
     row1->addWidget(m_modeLightBtn);
 
     connect(m_modeDarkBtn, &QPushButton::clicked, this,
@@ -411,22 +405,22 @@ void ThemeStudioWidget::setupControlsCard(QVBoxLayout *parentLayout)
     connect(m_modeLightBtn, &QPushButton::clicked, this,
             [this]() { setThemeMode(WAYWAL_THEME_LIGHT); });
 
-    row1->addSpacing(4);
+    row1->addSpacing(6);
 
     m_autoSolarCheck = new QCheckBox(QStringLiteral("Solar"), card);
     m_autoSolarCheck->setToolTip(
-        QStringLiteral("Automatically switch Dark/Light mode via astronomical solar schedule"));
+        QStringLiteral("Switch between Dark and Light mode based on time of day"));
     m_autoSolarCheck->setStyleSheet(QStringLiteral(
-        "QCheckBox { font-size: 7.5pt; spacing: 3px; } "
-        "QCheckBox::indicator { width: 11px; height: 11px; border: 1px solid #55596a; "
-        "border-radius: 2px; background: #181a20; } "
-        "QCheckBox::indicator:checked { background: #e58824; border-color: #f08d49; }"));
+        "QCheckBox { font-size: 8pt; spacing: 4px; } "
+        "QCheckBox::indicator { width: 13px; height: 13px; border: 1px solid #475569; "
+        "border-radius: 3px; background: #181b22; } "
+        "QCheckBox::indicator:checked { background: #0284c7; border-color: #38bdf8; }"));
     connect(m_autoSolarCheck, &QCheckBox::toggled, this, &ThemeStudioWidget::setAutoSolarSchedule);
     row1->addWidget(m_autoSolarCheck);
 
-    m_solarPhaseBadge = new QLabel(QStringLiteral("Standby"), card);
+    m_solarPhaseBadge = new QLabel(QStringLiteral("Manual"), card);
     m_solarPhaseBadge->setStyleSheet(
-        QStringLiteral("color: #7986cb; font-size: 7pt; font-family: monospace;"));
+        QStringLiteral("color: #94a3b8; font-size: 8pt; font-family: monospace;"));
     m_solarPhaseBadge->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     row1->addWidget(m_solarPhaseBadge, 1);
 
@@ -435,19 +429,19 @@ void ThemeStudioWidget::setupControlsCard(QVBoxLayout *parentLayout)
     // Row 2: M3 Variant Combo
     auto *row2 = new QHBoxLayout();
     row2->setContentsMargins(0, 0, 0, 0);
-    row2->setSpacing(4);
+    row2->setSpacing(6);
 
     auto *varLabel = new QLabel(QStringLiteral("Scheme:"), card);
-    varLabel->setStyleSheet(QStringLiteral("font-weight: bold; font-size: 8pt;"));
+    varLabel->setStyleSheet(QStringLiteral("font-weight: 600; font-size: 8.5pt;"));
     row2->addWidget(varLabel);
 
     m_variantCombo = new QComboBox(card);
-    m_variantCombo->setFixedHeight(19);
+    m_variantCombo->setFixedHeight(24);
     m_variantCombo->setMinimumWidth(80);
     m_variantCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     m_variantCombo->addItem(QStringLiteral("Tonal Spot (Balanced)"),
                             static_cast<int>(WAYWAL_SCHEME_TONAL_SPOT));
-    m_variantCombo->addItem(QStringLiteral("Vibrant (Max chroma)"),
+    m_variantCombo->addItem(QStringLiteral("Vibrant (High chroma)"),
                             static_cast<int>(WAYWAL_SCHEME_VIBRANT));
     m_variantCombo->addItem(QStringLiteral("Expressive (Shifted)"),
                             static_cast<int>(WAYWAL_SCHEME_EXPRESSIVE));
@@ -472,18 +466,18 @@ void ThemeStudioWidget::setupControlsCard(QVBoxLayout *parentLayout)
 
     layout->addLayout(row2);
 
-    // Row 2b: Contrast Slider (own row so it never clips horizontally in narrow docks)
+    // Row 2b: Contrast Slider
     auto *row2b = new QHBoxLayout();
     row2b->setContentsMargins(0, 0, 0, 0);
-    row2b->setSpacing(4);
+    row2b->setSpacing(6);
 
     m_contrastValLabel = new QLabel(QStringLiteral("Contrast: 0.00"), card);
     m_contrastValLabel->setStyleSheet(
-        QStringLiteral("font-weight: bold; font-size: 7.5pt; font-family: monospace;"));
+        QStringLiteral("font-weight: 600; font-size: 8pt; font-family: monospace;"));
     row2b->addWidget(m_contrastValLabel);
 
     m_contrastSlider = new QSlider(Qt::Horizontal, card);
-    m_contrastSlider->setFixedHeight(16);
+    m_contrastSlider->setFixedHeight(20);
     m_contrastSlider->setRange(-100, 100);
     m_contrastSlider->setValue(0);
     m_contrastSlider->setSingleStep(5);
@@ -493,43 +487,41 @@ void ThemeStudioWidget::setupControlsCard(QVBoxLayout *parentLayout)
             [this](int val) { setContrast(static_cast<float>(val) / 100.0f); });
     row2b->addWidget(m_contrastSlider, 1);
 
-    m_resetContrastBtn = new QPushButton(QStringLiteral("0.0"), card);
-    m_resetContrastBtn->setToolTip(QStringLiteral("Reset contrast to standard 0.0"));
-    m_resetContrastBtn->setFixedSize(28, 17);
-    m_resetContrastBtn->setStyleSheet(
-        QStringLiteral("padding: 0px 2px; font-size: 7pt; font-family: monospace;"));
+    m_resetContrastBtn = new QPushButton(QStringLiteral("Reset"), card);
+    m_resetContrastBtn->setToolTip(QStringLiteral("Reset contrast to 0.0"));
+    m_resetContrastBtn->setFixedSize(44, 22);
+    m_resetContrastBtn->setStyleSheet(QStringLiteral("padding: 1px 4px; font-size: 8pt;"));
     connect(m_resetContrastBtn, &QPushButton::clicked, this,
             [this]() { m_contrastSlider->setValue(0); });
     row2b->addWidget(m_resetContrastBtn);
 
     layout->addLayout(row2b);
 
-    // Row 3: Ranked Seeds 0..3 & Custom Override (compact so it fits in <220px width)
-    auto *row3 = new QHBoxLayout();
-    row3->setContentsMargins(0, 0, 0, 0);
-    row3->setSpacing(2);
+    // Row 3a: Ranked Seeds 1..4
+    auto *seedRow = new QHBoxLayout();
+    seedRow->setContentsMargins(0, 0, 0, 0);
+    seedRow->setSpacing(6);
 
     auto *seedLabel = new QLabel(QStringLiteral("Seed:"), card);
-    seedLabel->setStyleSheet(QStringLiteral("font-weight: bold; font-size: 9px;"));
-    row3->addWidget(seedLabel);
+    seedLabel->setStyleSheet(QStringLiteral("font-weight: 600; font-size: 8.5pt;"));
+    seedRow->addWidget(seedLabel);
 
     m_seedGroup = new QButtonGroup(this);
     m_seedRadios.resize(4);
     m_seedSwatches.resize(4);
 
-    const QString seedShortNames[4] = {QStringLiteral("0"), QStringLiteral("1"),
-                                       QStringLiteral("2"), QStringLiteral("3")};
-    const QString seedTooltips[4] = {QStringLiteral("Seed 0 (Primary ranked wallpaper accent)"),
-                                     QStringLiteral("Seed 1 (Secondary ranked wallpaper accent)"),
-                                     QStringLiteral("Seed 2 (Tertiary ranked wallpaper accent)"),
-                                     QStringLiteral("Seed 3 (Neutral ranked wallpaper accent)")};
+    const QString seedShortNames[4] = {QStringLiteral("1"), QStringLiteral("2"),
+                                       QStringLiteral("3"), QStringLiteral("4")};
+    const QString seedTooltips[4] = {
+        QStringLiteral("Primary wallpaper accent"), QStringLiteral("Secondary wallpaper accent"),
+        QStringLiteral("Tertiary wallpaper accent"), QStringLiteral("Neutral wallpaper accent")};
 
     for (int i = 0; i < 4; ++i) {
         auto *radio = new QRadioButton(seedShortNames[i], card);
         radio->setToolTip(seedTooltips[i]);
         radio->setStyleSheet(
-            QStringLiteral("QRadioButton { font-size: 9px; spacing: 1px; }"
-                           "QRadioButton::indicator { width: 10px; height: 10px; }"));
+            QStringLiteral("QRadioButton { font-size: 8pt; spacing: 3px; }"
+                           "QRadioButton::indicator { width: 12px; height: 12px; }"));
         if (i == 0) {
             radio->setChecked(true);
         }
@@ -537,59 +529,67 @@ void ThemeStudioWidget::setupControlsCard(QVBoxLayout *parentLayout)
         m_seedRadios[i] = radio;
 
         auto *swatch = new QWidget(card);
-        swatch->setFixedSize(9, 9);
+        swatch->setFixedSize(13, 13);
         swatch->setToolTip(seedTooltips[i]);
         swatch->setStyleSheet(
-            QStringLiteral("border-radius: 2px; border: 1px solid rgba(255,255,255,0.2);"));
+            QStringLiteral("border-radius: 3px; border: 1px solid rgba(255,255,255,0.25);"));
         m_seedSwatches[i] = swatch;
 
-        row3->addWidget(radio);
-        row3->addWidget(swatch);
-        row3->addSpacing(1);
+        seedRow->addWidget(radio);
+        seedRow->addWidget(swatch);
+        seedRow->addSpacing(4);
     }
 
     connect(m_seedGroup, &QButtonGroup::idClicked, this,
             [this](int id) { setSeedIndex(static_cast<uint8_t>(id)); });
 
-    row3->addSpacing(2);
+    seedRow->addStretch(1);
+    layout->addLayout(seedRow);
 
-    m_customSeedBtn = new QPushButton(QStringLiteral("Pick"), card);
-    m_customSeedBtn->setToolTip(
-        QStringLiteral("Override seed color with custom OkLCH / RGB color"));
-    m_customSeedBtn->setFixedHeight(16);
-    m_customSeedBtn->setStyleSheet(QStringLiteral("padding: 0px 4px; font-size: 9px;"));
+    // Row 3b: Custom Seed Override
+    auto *customRow = new QHBoxLayout();
+    customRow->setContentsMargins(0, 0, 0, 0);
+    customRow->setSpacing(6);
+
+    auto *customLabel = new QLabel(QStringLiteral("Custom:"), card);
+    customLabel->setStyleSheet(QStringLiteral("font-weight: 600; font-size: 8.5pt;"));
+    customRow->addWidget(customLabel);
+
+    m_customSeedBtn = new QPushButton(QStringLiteral("Pick Color..."), card);
+    m_customSeedBtn->setToolTip(QStringLiteral("Choose a custom seed color"));
+    m_customSeedBtn->setFixedHeight(22);
+    m_customSeedBtn->setStyleSheet(QStringLiteral("padding: 1px 8px; font-size: 8pt;"));
     connect(m_customSeedBtn, &QPushButton::clicked, this, &ThemeStudioWidget::openCustomSeedDialog);
-    row3->addWidget(m_customSeedBtn);
+    customRow->addWidget(m_customSeedBtn);
 
     m_customSeedSwatch = new QWidget(card);
-    m_customSeedSwatch->setFixedSize(9, 9);
+    m_customSeedSwatch->setFixedSize(14, 14);
     m_customSeedSwatch->setStyleSheet(QStringLiteral(
-        "border-radius: 2px; border: 1px solid #777; background-color: transparent;"));
-    row3->addWidget(m_customSeedSwatch);
+        "border-radius: 3px; border: 1px solid #64748b; background-color: transparent;"));
+    customRow->addWidget(m_customSeedSwatch);
 
-    m_clearSeedOverrideBtn = new QPushButton(QStringLiteral("✕"), card);
+    m_clearSeedOverrideBtn = new QPushButton(QStringLiteral("Clear"), card);
     m_clearSeedOverrideBtn->setToolTip(
-        QStringLiteral("Clear custom override; revert to wallpaper seeds"));
-    m_clearSeedOverrideBtn->setFixedSize(16, 16);
-    m_clearSeedOverrideBtn->setStyleSheet(QStringLiteral("padding: 0px; font-size: 8.5px;"));
+        QStringLiteral("Clear custom seed and use wallpaper colors"));
+    m_clearSeedOverrideBtn->setFixedHeight(22);
+    m_clearSeedOverrideBtn->setStyleSheet(QStringLiteral("padding: 1px 8px; font-size: 8pt;"));
     m_clearSeedOverrideBtn->setEnabled(false);
     connect(m_clearSeedOverrideBtn, &QPushButton::clicked, this,
             &ThemeStudioWidget::clearCustomSeed);
-    row3->addWidget(m_clearSeedOverrideBtn);
+    customRow->addWidget(m_clearSeedOverrideBtn);
 
-    row3->addStretch(1);
-    layout->addLayout(row3);
+    customRow->addStretch(1);
+    layout->addLayout(customRow);
 
     parentLayout->addWidget(card);
 }
 
 void ThemeStudioWidget::setupWcagBadgesCard(QVBoxLayout *parentLayout)
 {
-    auto *card =
-        new QGroupBox(QStringLiteral("WCAG 2.1 Contrast Governor (AA 4.5 / AAA 7.0)"), this);
+    auto *card = new QGroupBox(QStringLiteral("WCAG 2.1 Contrast (AA 4.5 / AAA 7.0)"), this);
     auto *grid = new QGridLayout(card);
-    grid->setContentsMargins(3, 2, 3, 2);
-    grid->setSpacing(1);
+    grid->setContentsMargins(6, 6, 6, 6);
+    grid->setSpacing(4);
     grid->setColumnStretch(0, 1);
     grid->setColumnStretch(1, 1);
 
@@ -622,8 +622,8 @@ void ThemeStudioWidget::setupSwatchesCard(QTabWidget *tabWidget)
     m3Scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     auto *m3Container = new QWidget();
     auto *m3Grid = new QGridLayout(m3Container);
-    m3Grid->setContentsMargins(3, 3, 3, 3);
-    m3Grid->setSpacing(2);
+    m3Grid->setContentsMargins(6, 6, 6, 6);
+    m3Grid->setSpacing(4);
     m3Grid->setColumnStretch(0, 1);
     m3Grid->setColumnStretch(1, 1);
 
@@ -678,8 +678,8 @@ void ThemeStudioWidget::setupSwatchesCard(QTabWidget *tabWidget)
     ansiScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     auto *ansiContainer = new QWidget();
     auto *ansiGrid = new QGridLayout(ansiContainer);
-    ansiGrid->setContentsMargins(4, 4, 4, 4);
-    ansiGrid->setSpacing(3);
+    ansiGrid->setContentsMargins(6, 6, 6, 6);
+    ansiGrid->setSpacing(4);
     ansiGrid->setColumnStretch(0, 1);
     ansiGrid->setColumnStretch(1, 1);
 
@@ -710,8 +710,8 @@ void ThemeStudioWidget::setupSwatchesCard(QTabWidget *tabWidget)
     catScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     auto *catContainer = new QWidget();
     auto *catGrid = new QGridLayout(catContainer);
-    catGrid->setContentsMargins(4, 4, 4, 4);
-    catGrid->setSpacing(3);
+    catGrid->setContentsMargins(6, 6, 6, 6);
+    catGrid->setSpacing(4);
     catGrid->setColumnStretch(0, 1);
     catGrid->setColumnStretch(1, 1);
 
@@ -733,7 +733,21 @@ void ThemeStudioWidget::setupSwatchesCard(QTabWidget *tabWidget)
     catScroll->setWidget(catContainer);
     tabWidget->addTab(catScroll, QStringLiteral("Catppuccin (14)"));
 
-    // Tab 4: Template Exporter Widget (wrapped in QScrollArea so it never forces minimum size)
+    // Tab 4: Contrast (WCAG 2.1)
+    auto *wcagScroll = new QScrollArea(tabWidget);
+    wcagScroll->setWidgetResizable(true);
+    wcagScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    wcagScroll->setFrameShape(QFrame::NoFrame);
+    auto *wcagContainer = new QWidget();
+    auto *wcagLayout = new QVBoxLayout(wcagContainer);
+    wcagLayout->setContentsMargins(6, 6, 6, 6);
+    wcagLayout->setSpacing(6);
+    setupWcagBadgesCard(wcagLayout);
+    wcagLayout->addStretch(1);
+    wcagScroll->setWidget(wcagContainer);
+    tabWidget->addTab(wcagScroll, QStringLiteral("Contrast"));
+
+    // Tab 5: Template Exporter Widget
     auto *exporterScroll = new QScrollArea(tabWidget);
     exporterScroll->setWidgetResizable(true);
     exporterScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -815,9 +829,8 @@ void ThemeStudioWidget::reextract()
     const double elapsedMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     if (m_perfLabel) {
-        m_perfLabel->setText(QStringLiteral("%1 ms %2")
-                                 .arg(QString::number(elapsedMs, 'f', 2))
-                                 .arg(ok ? QStringLiteral("✓") : QStringLiteral("✗")));
+        m_perfLabel->setText(ok ? QStringLiteral("%1 ms").arg(QString::number(elapsedMs, 'f', 2))
+                                : QStringLiteral("Failed"));
     }
 
     // Propagate updated palette to Mockup and Exporter

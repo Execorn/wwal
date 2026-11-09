@@ -27,34 +27,29 @@ StudioDockTitleBar::StudioDockTitleBar(const QString &title, QDockWidget *parent
     : QWidget(parent), m_parentDock(parentDock)
 {
     setObjectName(QStringLiteral("StudioDockTitleBar"));
-    setFixedHeight(26);
+    setFixedHeight(28);
 
     auto *layout = new QHBoxLayout(this);
-    layout->setContentsMargins(8, 2, 4, 2);
-    layout->setSpacing(4);
-
-    // Grip / Accent indicator
-    auto *grip = new QLabel(QStringLiteral("⋮"), this);
-    grip->setObjectName(QStringLiteral("DockTitleGrip"));
-    grip->setStyleSheet(QStringLiteral("color: #666666; font-size: 13px; font-weight: bold;"));
-    layout->addWidget(grip);
+    layout->setContentsMargins(10, 2, 8, 2);
+    layout->setSpacing(8);
 
     // Title label
     m_titleLabel = new QLabel(title, this);
     m_titleLabel->setObjectName(QStringLiteral("DockTitleText"));
     m_titleLabel->setStyleSheet(
-        QStringLiteral("color: #dcdcdc; font-size: 11px; font-weight: 600;"));
+        QStringLiteral("color: #e2e8f0; font-size: 11px; font-weight: 600;"));
     layout->addWidget(m_titleLabel, 1);
 
     // Float / Detach button
     m_floatButton = new QToolButton(this);
     m_floatButton->setObjectName(QStringLiteral("DockFloatButton"));
     m_floatButton->setToolTip(QStringLiteral("Detach into floating window"));
-    m_floatButton->setText(QStringLiteral("⧉"));
-    m_floatButton->setFixedSize(20, 20);
+    m_floatButton->setText(QStringLiteral("Float"));
+    m_floatButton->setFixedHeight(20);
     m_floatButton->setStyleSheet(QStringLiteral(
-        "QToolButton { background: transparent; border: none; color: #aaaaaa; font-size: 12px; }"
-        "QToolButton:hover { background: #383838; color: #ffffff; border-radius: 2px; }"));
+        "QToolButton { background: transparent; border: none; color: #94a3b8; font-size: 10px; "
+        "padding: 2px 6px; border-radius: 3px; }"
+        "QToolButton:hover { background: #262c3a; color: #f8fafc; }"));
     connect(m_floatButton, &QToolButton::clicked, this, [this]() {
         if (m_parentDock) {
             m_parentDock->setFloating(!m_parentDock->isFloating());
@@ -67,11 +62,12 @@ StudioDockTitleBar::StudioDockTitleBar(const QString &title, QDockWidget *parent
     m_closeButton = new QToolButton(this);
     m_closeButton->setObjectName(QStringLiteral("DockCloseButton"));
     m_closeButton->setToolTip(QStringLiteral("Hide panel"));
-    m_closeButton->setText(QStringLiteral("✕"));
-    m_closeButton->setFixedSize(20, 20);
+    m_closeButton->setText(QStringLiteral("Hide"));
+    m_closeButton->setFixedHeight(20);
     m_closeButton->setStyleSheet(QStringLiteral(
-        "QToolButton { background: transparent; border: none; color: #888888; font-size: 10px; }"
-        "QToolButton:hover { background: #c42b1c; color: #ffffff; border-radius: 2px; }"));
+        "QToolButton { background: transparent; border: none; color: #94a3b8; font-size: 10px; "
+        "padding: 2px 6px; border-radius: 3px; }"
+        "QToolButton:hover { background: #7f1d1d; color: #ffffff; }"));
     connect(m_closeButton, &QToolButton::clicked, this, [this]() {
         if (m_parentDock) {
             m_parentDock->close();
@@ -81,8 +77,8 @@ StudioDockTitleBar::StudioDockTitleBar(const QString &title, QDockWidget *parent
     layout->addWidget(m_closeButton);
 
     setStyleSheet(QStringLiteral("#StudioDockTitleBar {"
-                                 "  background: #242424;"
-                                 "  border-bottom: 1px solid #1a1a1a;"
+                                 "  background: #181b22;"
+                                 "  border-bottom: 1px solid #262b36;"
                                  "}"));
 }
 
@@ -102,10 +98,10 @@ void StudioDockTitleBar::updateFloatingState(bool floating)
 {
     if (m_floatButton) {
         if (floating) {
-            m_floatButton->setText(QStringLiteral("↙"));
-            m_floatButton->setToolTip(QStringLiteral("Re-dock panel"));
+            m_floatButton->setText(QStringLiteral("Dock"));
+            m_floatButton->setToolTip(QStringLiteral("Return panel to main window"));
         } else {
-            m_floatButton->setText(QStringLiteral("⧉"));
+            m_floatButton->setText(QStringLiteral("Float"));
             m_floatButton->setToolTip(QStringLiteral("Detach into floating window"));
         }
     }

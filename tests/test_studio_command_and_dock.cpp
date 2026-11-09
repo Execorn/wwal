@@ -12,11 +12,24 @@
 
 #include "studio/core/command_bus.hpp"
 #include "studio/app/dock_layout_manager.hpp"
+#include "studio/app/main_window.hpp"
+#include "studio/dock/openhub_browser_widget.hpp"
+#include "studio/dock/workshop_browser_widget.hpp"
+#include "studio/wizard/creator_packaging_wizard.hpp"
+#include "studio/inspector/oklch_color_dialog.hpp"
+#include "studio/theme/theme_studio_widget.hpp"
 #include "studio/topology/monitor_topology_canvas.hpp"
 
+#include <QAbstractButton>
+#include <QAction>
 #include <QApplication>
+#include <QComboBox>
+#include <QGroupBox>
+#include <QLabel>
+#include <QLineEdit>
 #include <QMainWindow>
 #include <QMouseEvent>
+#include <QPushButton>
 #include <QTabBar>
 #include <QWidget>
 #include <QFile>
@@ -171,8 +184,7 @@ static void test_dock_layout_manager_roundtrip()
     layoutMgr.registerPanel(QStringLiteral("Wallpapers"), &p1, QStringLiteral("Wallpaper Catalog"));
     layoutMgr.registerPanel(QStringLiteral("GpuPreviewViewport"), &p2,
                             QStringLiteral("GPU Preview"));
-    layoutMgr.registerPanel(QStringLiteral("CubicBezier"), &p3,
-                            QStringLiteral("Bézier Curve Editor"));
+    layoutMgr.registerPanel(QStringLiteral("CubicBezier"), &p3, QStringLiteral("Transitions"));
     layoutMgr.registerPanel(QStringLiteral("PropertyInspectorWidget"), &p4,
                             QStringLiteral("Inspector"));
     layoutMgr.registerPanel(QStringLiteral("ThemeStudioWidget"), &p5,
@@ -429,9 +441,190 @@ static void test_monitor_topology_span_math()
     std::cout << "  -> Asymmetric 3-monitor span math passed with 100% precision." << std::endl;
 }
 
+static void assert_ascii_only(const QString &str, const char *context)
+{
+    for (QChar ch : str) {
+        if (ch.unicode() > 0x7F) {
+            std::cerr << "[FAIL] Non-ASCII character U+" << std::hex
+                      << static_cast<uint16_t>(ch.unicode()) << std::dec << " in " << context
+                      << ": \"" << str.toStdString() << "\"" << std::endl;
+            assert(false && "UI text must not contain emojis, em-dashes, or decorative Unicode");
+        }
+    }
+}
+
+static void audit_widget_tree(QWidget *root, const char *rootName)
+{
+    assert_ascii_only(root->windowTitle(), rootName);
+    assert_ascii_only(root->toolTip(), rootName);
+
+    for (QWidget *w : root->findChildren<QWidget *>()) {
+        if (!w)
+            continue;
+        assert_ascii_only(w->windowTitle(), rootName);
+        assert_ascii_only(w->toolTip(), rootName);
+
+        if (auto *btn = qobject_cast<QAbstractButton *>(w)) {
+            assert_ascii_only(btn->text(), rootName);
+        }
+        if (auto *pushBtn = qobject_cast<QPushButton *>(w)) {
+            if (pushBtn->isVisible() && pushBtn->height() > 0) {
+                if (pushBtn->height() < 20) {
+                    std::cerr << "[FAIL] Cramped QPushButton \"" << pushBtn->text().toStdString()
+                              << "\" height=" << pushBtn->height() << " in " << rootName
+                              << std::endl;
+                    assert(pushBtn->height() >= 20 &&
+                           "Visible QPushButtons must have height >= 20px");
+                }
+            }
+        }
+        if (auto *lbl = qobject_cast<QLabel *>(w)) {
+            assert_ascii_only(lbl->text(), rootName);
+        }
+        if (auto *grp = qobject_cast<QGroupBox *>(w)) {
+            assert_ascii_only(grp->title(), rootName);
+        }
+        if (auto *edit = qobject_cast<QLineEdit *>(w)) {
+            assert_ascii_only(edit->placeholderText(), rootName);
+            assert_ascii_only(edit->text(), rootName);
+        }
+        if (auto *combo = qobject_cast<QComboBox *>(w)) {
+            for (int i = 0; i < combo->count(); ++i) {
+                assert_ascii_only(combo->itemText(i), rootName);
+            }
+        }
+    }
+
+    for (QAction *act : root->findChildren<QAction *>()) {
+        if (!act)
+            continue;
+        assert_ascii_only(act->text(), rootName);
+        assert_ascii_only(act->toolTip(), rootName);
+    }
+}
+
+static void test_studio_ui_ergonomics_and_zero_emoji()
+{
+    std::cout << "[UI/UX] Auditing MainWindow, CreatorPackagingWizard & OklchColorDialog for zero "
+                 "emojis/Unicode and button ergonomics..."
+              << std::endl;
+
+    MainWindow mainWin;
+    mainWin.resize(1600, 960);
+    mainWin.show();
+    for (int i = 0; i < 6; ++i)
+        QCoreApplication::processEvents();
+    audit_widget_tree(&mainWin, "MainWindow");
+
+    // Raise WorkshopBrowser and OpenHubBrowser tabs and verify embedded VirtualizedGridWidget
+    // does NOT show a duplicate search bar or local "Folders..." button
+    auto *layoutMgr = mainWin.dockLayoutManager();
+    assert(layoutMgr != nullptr);
+
+    for (const QString &panelId :
+         {QStringLiteral("WorkshopBrowser"), QStringLiteral("OpenHubBrowser")}) {
+        layoutMgr->setPanelVisible(panelId, true);
+        for (int i = 0; i < 6; ++i)
+            QCoreApplication::processEvents();
+
+        auto *dock = layoutMgr->dockWidget(panelId);
+        assert(dock != nullptr && dock->isVisible());
+        audit_widget_tree(dock, panelId.toUtf8().constData());
+
+        int visibleSearchBars = 0;
+        for (auto *edit : dock->findChildren<QLineEdit *>()) {
+            if (edit && edit->isVisible()) {
+                ++visibleSearchBars;
+            }
+        }
+        assert(visibleSearchBars == 1 &&
+               "Browser panel must have exactly 1 visible search bar (no duplicate embedded grid "
+               "search bar)");
+
+        for (auto *btn : dock->findChildren<QPushButton *>()) {
+            if (btn && btn->isVisible()) {
+                assert(btn->text() != QStringLiteral("Folders...") &&
+                       "Embedded grid inside Workshop/OpenHub must not show local 'Folders...' "
+                       "button");
+            }
+        }
+    }
+
+    // Verify narrow-dock (220px width) ergonomics and download progress formatting
+    if (auto *ws = mainWin.workshopBrowser()) {
+        ws->resize(220, 600);
+        for (int i = 0; i < 4; ++i)
+            QCoreApplication::processEvents();
+        audit_widget_tree(ws, "WorkshopBrowserWidget@220px");
+
+        for (auto *btn : ws->findChildren<QPushButton *>()) {
+            if (btn && btn->text() == QStringLiteral("Subscribe & Download")) {
+                btn->click();
+                break;
+            }
+        }
+        QMetaObject::invokeMethod(ws, "onDownloadProgressUpdated", Qt::DirectConnection,
+                                  Q_ARG(uint64_t, 2841902314ULL), Q_ARG(float, 50.0f),
+                                  Q_ARG(float, 12.5f * 1024.0f * 1024.0f));
+        for (auto *lbl : ws->findChildren<QLabel *>()) {
+            if (lbl) {
+                assert(!lbl->text().contains(QStringLiteral("%.1f")) &&
+                       "Download telemetry must not contain literal %.1f format specifier");
+                assert(!lbl->text().contains(QStringLiteral("%3")) &&
+                       "Download telemetry must not contain unexpanded %3 placeholder");
+            }
+        }
+    }
+
+    if (auto *hub = mainWin.openHubBrowser()) {
+        hub->resize(220, 600);
+        for (int i = 0; i < 4; ++i)
+            QCoreApplication::processEvents();
+        audit_widget_tree(hub, "OpenHubBrowserWidget@220px");
+
+        QMetaObject::invokeMethod(hub, "onDownloadProgressUpdated", Qt::DirectConnection,
+                                  Q_ARG(QString, QStringLiteral("pkg-001")), Q_ARG(float, 50.0f),
+                                  Q_ARG(float, 15.2f * 1024.0f * 1024.0f));
+        for (auto *lbl : hub->findChildren<QLabel *>()) {
+            if (lbl) {
+                assert(!lbl->text().contains(QStringLiteral("%.1f")) &&
+                       "OpenHub download telemetry must not contain literal %.1f format specifier");
+                assert(!lbl->text().contains(QStringLiteral("%3")) &&
+                       "OpenHub download telemetry must not contain unexpanded %3 placeholder");
+            }
+        }
+    }
+
+    if (auto *ts = mainWin.themeStudio()) {
+        ts->resize(220, 600);
+        for (int i = 0; i < 4; ++i)
+            QCoreApplication::processEvents();
+        audit_widget_tree(ts, "ThemeStudioWidget@220px");
+    }
+
+    CreatorPackagingWizard wizard;
+    wizard.resize(840, 620);
+    wizard.show();
+    for (int i = 0; i < 4; ++i)
+        QCoreApplication::processEvents();
+    audit_widget_tree(&wizard, "CreatorPackagingWizard");
+
+    OklchColorDialog colorDlg(QColor(56, 189, 248));
+    colorDlg.show();
+    for (int i = 0; i < 4; ++i)
+        QCoreApplication::processEvents();
+    audit_widget_tree(&colorDlg, "OklchColorDialog");
+
+    std::cout << "  -> UI/UX zero-emoji, embedded grid chrome, download telemetry & 220px "
+                 "narrow-dock ergonomics audit passed across all widgets."
+              << std::endl;
+}
+
 int main(int argc, char *argv[])
 {
     qputenv("QT_QPA_PLATFORM", "offscreen");
+    qunsetenv("DISPLAY");
+    qunsetenv("WAYLAND_DISPLAY");
     QApplication app(argc, argv);
 
     std::cout << "==========================================================" << std::endl;
@@ -442,6 +635,7 @@ int main(int argc, char *argv[])
     test_micro_drag_coalescing();
     test_dock_layout_manager_roundtrip();
     test_monitor_topology_span_math();
+    test_studio_ui_ergonomics_and_zero_emoji();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  >>> STUDIO COMMAND & DOCK SUITE PASSED CLEANLY (100%) <<<" << std::endl;

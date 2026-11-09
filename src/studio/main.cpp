@@ -517,7 +517,7 @@ static void waywalQtMessageFilter(QtMsgType type, const QMessageLogContext &cont
 }
 
 #ifndef WAYWAL_VERSION
-#define WAYWAL_VERSION "1.2.0"
+#define WAYWAL_VERSION "3.0.0"
 #endif
 
 int main(int argc, char *argv[])
@@ -576,7 +576,7 @@ int main(int argc, char *argv[])
 
     QCommandLineParser parser;
     parser.setApplicationDescription(
-        QStringLiteral("WayWal Studio — Linux Wayland Creative Wallpaper IDE"));
+        QStringLiteral("WayWal Studio wallpaper manager and shader editor"));
     parser.addHelpOption();
     parser.addVersionOption();
 

@@ -58,6 +58,24 @@ void refresh_cached_h264_iq(vaapi_decoder_t *dec)
     dec->iq_valid = true;
 }
 
+static void skip_h264_hrd_parameters(bit_reader_t *br)
+{
+    uint32_t cpb_cnt_minus1 = read_ue(br);
+    if (cpb_cnt_minus1 > 31)
+        cpb_cnt_minus1 = 31;
+    read_bits(br, 4); /* bit_rate_scale */
+    read_bits(br, 4); /* cpb_size_scale */
+    for (uint32_t i = 0; i <= cpb_cnt_minus1 && br->bit_pos < br->size * 8; ++i) {
+        read_ue(br);  /* bit_rate_value_minus1 */
+        read_ue(br);  /* cpb_size_value_minus1 */
+        read_bit(br); /* cbr_flag */
+    }
+    read_bits(br, 5); /* initial_cpb_removal_delay_length_minus1 */
+    read_bits(br, 5); /* cpb_removal_delay_length_minus1 */
+    read_bits(br, 5); /* dpb_output_delay_length_minus1 */
+    read_bits(br, 5); /* time_offset_length */
+}
+
 bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps)
 {
     if (nal_len < 4)
@@ -80,6 +98,7 @@ bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps)
     memset(sps->scaling_list_8x8, 16, sizeof(sps->scaling_list_8x8));
     sps->profile_idc = (uint8_t)read_bits(&br, 8);
     uint8_t constraint_flags = (uint8_t)read_bits(&br, 8);
+    sps->constraint_set0_flag = (constraint_flags >> 7) & 1U;
     sps->constraint_set1_flag = (constraint_flags >> 6) & 1U;
     sps->level_idc = (uint8_t)read_bits(&br, 8);
     read_ue(&br); /* seq_parameter_set_id */
@@ -180,6 +199,42 @@ bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps)
                 sps->colour_primaries = (uint8_t)read_bits(&br, 8);
                 sps->transfer_characteristics = (uint8_t)read_bits(&br, 8);
                 sps->matrix_coefficients = (uint8_t)read_bits(&br, 8);
+            }
+        }
+        if (read_bit(&br)) { /* chroma_loc_info_present_flag */
+            read_ue(&br);    /* chroma_sample_loc_type_top_field */
+            read_ue(&br);    /* chroma_sample_loc_type_bottom_field */
+        }
+        if (read_bit(&br)) { /* timing_info_present_flag */
+            read_bits(&br, 16);
+            read_bits(&br, 16); /* num_units_in_tick */
+            read_bits(&br, 16);
+            read_bits(&br, 16); /* time_scale */
+            read_bit(&br);      /* fixed_frame_rate_flag */
+        }
+        uint32_t nal_hrd = read_bit(&br);
+        if (nal_hrd) {
+            skip_h264_hrd_parameters(&br);
+        }
+        uint32_t vcl_hrd = read_bit(&br);
+        if (vcl_hrd) {
+            skip_h264_hrd_parameters(&br);
+        }
+        if (nal_hrd || vcl_hrd) {
+            read_bit(&br); /* low_delay_hrd_flag */
+        }
+        read_bit(&br);                              /* pic_struct_present_flag */
+        if (more_rbsp_data(&br) && read_bit(&br)) { /* bitstream_restriction_flag */
+            read_bit(&br);                          /* motion_vectors_over_pic_boundaries_flag */
+            read_ue(&br);                           /* max_bytes_per_pic_denom */
+            read_ue(&br);                           /* max_bits_per_mb_denom */
+            read_ue(&br);                           /* log2_max_mv_length_horizontal */
+            read_ue(&br);                           /* log2_max_mv_length_vertical */
+            uint32_t max_reorder = read_ue(&br);    /* max_num_reorder_frames */
+            read_ue(&br);                           /* max_dec_frame_buffering */
+            if (br.bit_pos <= br.size * 8 && max_reorder <= 16) {
+                sps->bitstream_restriction_flag = true;
+                sps->max_num_reorder_frames = (uint8_t)max_reorder;
             }
         }
     }

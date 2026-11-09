@@ -202,9 +202,9 @@ void SetBezierCurveCommand::undo()
 QString SetBezierCurveCommand::describe() const
 {
     if (m_output.isEmpty()) {
-        return QString("Adjust Cubic-Bézier easing curve");
+        return QString("Adjust Cubic-Bezier easing curve");
     }
-    return QString("Adjust Cubic-Bézier easing curve on %1").arg(m_output);
+    return QString("Adjust Cubic-Bezier easing curve on %1").arg(m_output);
 }
 
 bool SetBezierCurveCommand::mergeWith(const ICommand *other)

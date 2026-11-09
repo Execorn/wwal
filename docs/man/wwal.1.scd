@@ -1,4 +1,4 @@
-wwal(1) "wwal 1.2.0" "WayWal Manual"
+wwal(1) "wwal 3.0.0" "WayWal Manual"
 
 # NAME
 

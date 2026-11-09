@@ -35,6 +35,7 @@ typedef struct {
 
 typedef struct {
     uint8_t profile_idc;
+    uint8_t constraint_set0_flag;
     uint8_t constraint_set1_flag;
     uint8_t level_idc;
     uint8_t chroma_format_idc;
@@ -59,6 +60,8 @@ typedef struct {
     uint8_t transfer_characteristics;
     uint8_t matrix_coefficients;
     bool video_full_range_flag;
+    bool bitstream_restriction_flag;
+    uint8_t max_num_reorder_frames;
     bool valid;
 } parsed_sps_t;
 

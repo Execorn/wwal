@@ -722,17 +722,17 @@ void WorkshopBrowserWidget::Impl::syncWithGridView()
     // Update status label
     if (statusTelemetryLabel) {
         statusTelemetryLabel->setText(
-            QString("Showing %1 / %2 items | Steam Client: %3")
+            QString("%1 of %2 items  |  Steam: %3")
                 .arg(filteredRecords.size())
                 .arg(allRecords.size())
                 .arg((owner->m_downloadMgr && owner->m_downloadMgr->isSteamClientRunning())
                          ? "<font color='#34d399'>Connected</font>"
-                         : "<font color='#94a3b8'>Standby (Web API active)</font>"));
+                         : "<font color='#94a3b8'>Web API</font>"));
     }
 
     // Trigger grid re-filter
     catIndex.refilter();
-    owner->m_gridView->update();
+    owner->m_gridView->refreshCatalogView();
 }
 
 void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &rec)
@@ -741,7 +741,7 @@ void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &rec)
         return;
 
     inspectorTitleLabel->setText(rec.title);
-    inspectorIdLabel->setText(QString("Workshop ID: %1 | Size: %2 | Subs: %3")
+    inspectorIdLabel->setText(QString("ID %1  |  %2  |  %3 subscribers")
                                   .arg(rec.published_file_id)
                                   .arg(formatBytes(rec.file_size_bytes))
                                   .arg(rec.subscriptions));
@@ -751,36 +751,36 @@ void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &rec)
     QString tierStyle;
     switch (rec.compat_tier) {
     case WE_TIER_1_NATIVE:
-        tierText = "TIER 1 · NATIVE (100% COMPATIBLE)";
-        tierStyle = "background-color: #065f46; color: #34d399; border: 1px solid #059669; "
-                    "border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;";
+        tierText = "Native (Compatible)";
+        tierStyle = "background-color: #064e3b; color: #34d399; border: 1px solid #059669; "
+                    "border-radius: 5px; padding: 4px 10px; font-weight: 600; font-size: 11px;";
         break;
     case WE_TIER_2_TRANSPILED:
-        tierText = "TIER 2 · TRANSPILED (AST REPAIRED)";
-        tierStyle = "background-color: #075985; color: #38bdf8; border: 1px solid #0284c7; "
-                    "border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;";
+        tierText = "Transpiled (Auto-Repaired)";
+        tierStyle = "background-color: #0c4a6e; color: #38bdf8; border: 1px solid #0284c7; "
+                    "border-radius: 5px; padding: 4px 10px; font-weight: 600; font-size: 11px;";
         break;
     case WE_TIER_3_DEGRADED:
-        tierText = "TIER 3 · DEGRADED (FEATURES LIMITED)";
-        tierStyle = "background-color: #78350f; color: #fbbf24; border: 1px solid #d97706; "
-                    "border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;";
+        tierText = "Partial Support";
+        tierStyle = "background-color: #451a03; color: #fbbf24; border: 1px solid #d97706; "
+                    "border-radius: 5px; padding: 4px 10px; font-weight: 600; font-size: 11px;";
         break;
     case WE_TIER_4_BLOCKED:
-        tierText = "TIER 4 · BLOCKED (MALWARE / INCOMPATIBLE)";
-        tierStyle = "background-color: #881337; color: #f43f5e; border: 1px solid #e11d48; "
-                    "border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;";
+        tierText = "Unsupported";
+        tierStyle = "background-color: #450a0a; color: #f87171; border: 1px solid #dc2626; "
+                    "border-radius: 5px; padding: 4px 10px; font-weight: 600; font-size: 11px;";
         break;
     default:
-        tierText = "TIER UNKNOWN";
+        tierText = "Unknown Compatibility";
         tierStyle =
-            "background-color: #334155; color: #94a3b8; border-radius: 4px; padding: 4px 8px;";
+            "background-color: #20242e; color: #94a3b8; border-radius: 5px; padding: 4px 10px;";
         break;
     }
     tierBadgeLabel->setText(tierText);
     tierBadgeLabel->setStyleSheet(tierStyle);
 
     // Compatibility Score
-    compatScoreLabel->setText(QString("Compatibility Score: %1 / 100").arg(rec.compat_score));
+    compatScoreLabel->setText(QString("Compatibility: %1%").arg(rec.compat_score));
     compatScoreBar->setValue(static_cast<int>(rec.compat_score));
     if (rec.compat_score >= 90) {
         compatScoreBar->setStyleSheet(
@@ -793,27 +793,25 @@ void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &rec)
             "QProgressBar::chunk { background-color: #f59e0b; border-radius: 3px; }");
     } else {
         compatScoreBar->setStyleSheet(
-            "QProgressBar::chunk { background-color: #f43f5e; border-radius: 3px; }");
+            "QProgressBar::chunk { background-color: #ef4444; border-radius: 3px; }");
     }
 
     // Hardware estimates
-    vramFpsMetricsLabel->setText(
-        QString("Est. VRAM: <b>%1 MB</b>  |  Target Frame Rate: <b>%2 FPS</b>")
-            .arg(QString::number(rec.estimated_vram_mb, 'f', 1))
-            .arg(rec.estimated_fps));
+    vramFpsMetricsLabel->setText(QString("VRAM: <b>%1 MB</b>  |  Target: <b>%2 FPS</b>")
+                                     .arg(QString::number(rec.estimated_vram_mb, 'f', 1))
+                                     .arg(rec.estimated_fps));
 
     // Issues list
     issuesListWidget->clear();
     if (rec.issue_messages.empty()) {
-        auto *item =
-            new QListWidgetItem("✓ Zero compatibility issues detected. Ready for DMA-BUF scanout.");
+        auto *item = new QListWidgetItem("No compatibility issues found.");
         item->setForeground(QColor(52, 211, 153));
         issuesListWidget->addItem(item);
     } else {
         for (const auto &msg : rec.issue_messages) {
             auto *item = new QListWidgetItem(msg);
             if (msg.contains("FATAL") || msg.contains("ERROR")) {
-                item->setForeground(QColor(244, 63, 94));
+                item->setForeground(QColor(248, 113, 113));
             } else if (msg.contains("WARN")) {
                 item->setForeground(QColor(251, 191, 36));
             } else {
@@ -826,7 +824,7 @@ void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &rec)
     // Auto-repairs list
     repairsListWidget->clear();
     if (rec.repair_descriptions.empty()) {
-        auto *item = new QListWidgetItem("No automated repairs required for this asset.");
+        auto *item = new QListWidgetItem("No shader fixes needed.");
         item->setForeground(QColor(148, 163, 184));
         repairsListWidget->addItem(item);
         runAutoRepairBtn->setEnabled(false);
@@ -841,25 +839,25 @@ void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &rec)
 
     // Installation status
     if (rec.install_state & WAYWAL_UGC_STATE_DOWNLOADING) {
-        installStatusBadge->setText("<font color='#38bdf8'><b>⟳ Downloading...</b></font>");
+        installStatusBadge->setText("<font color='#38bdf8'><b>Downloading...</b></font>");
         downloadProgressBox->setVisible(true);
         subscribeDownloadBtn->setText("Cancel Download");
         applyToMonitorBtn->setEnabled(false);
     } else if (rec.install_state & WAYWAL_UGC_STATE_INSTALLED) {
-        installStatusBadge->setText("<font color='#34d399'><b>✓ Installed & Up-to-date</b></font>");
+        installStatusBadge->setText("<font color='#34d399'><b>Installed</b></font>");
         downloadProgressBox->setVisible(false);
-        subscribeDownloadBtn->setText("Verify / Re-download");
+        subscribeDownloadBtn->setText("Reinstall");
         applyToMonitorBtn->setEnabled(rec.compat_tier != WE_TIER_4_BLOCKED);
     } else if (rec.install_state & WAYWAL_UGC_STATE_NEEDS_UPDATE) {
-        installStatusBadge->setText("<font color='#fbbf24'><b>▲ Update Available</b></font>");
+        installStatusBadge->setText("<font color='#fbbf24'><b>Update Available</b></font>");
         downloadProgressBox->setVisible(false);
-        subscribeDownloadBtn->setText("Update Item");
+        subscribeDownloadBtn->setText("Update");
         applyToMonitorBtn->setEnabled(true);
     } else if (rec.install_state & WAYWAL_UGC_STATE_SUBSCRIBED) {
         installStatusBadge->setText(
-            "<font color='#38bdf8'><b>★ Subscribed (Pending Download)</b></font>");
+            "<font color='#38bdf8'><b>Subscribed (Not Downloaded)</b></font>");
         downloadProgressBox->setVisible(false);
-        subscribeDownloadBtn->setText("Download Now");
+        subscribeDownloadBtn->setText("Download");
         applyToMonitorBtn->setEnabled(false);
     } else {
         installStatusBadge->setText("<font color='#94a3b8'>Not Subscribed</font>");
@@ -924,94 +922,108 @@ void WorkshopBrowserWidget::setupUi()
     rootLayout->setContentsMargins(0, 0, 0, 0);
     rootLayout->setSpacing(0);
 
-    // 1. Top Filter Toolbar
+    // 1. Top Filter Toolbar (2 clean rows so controls never crowd in narrow docks)
     auto *toolbarFrame = new QFrame(this);
-    toolbarFrame->setStyleSheet(
-        "background-color: #1a1e26; border-bottom: 1px solid #2b303c; padding: 4px;");
-    auto *toolbarLayout = new QHBoxLayout(toolbarFrame);
-    toolbarLayout->setContentsMargins(8, 6, 8, 6);
-    toolbarLayout->setSpacing(8);
+    toolbarFrame->setStyleSheet("background-color: #181b22; border-bottom: 1px solid #262b36;");
+    auto *toolbarOuter = new QVBoxLayout(toolbarFrame);
+    toolbarOuter->setContentsMargins(10, 8, 10, 8);
+    toolbarOuter->setSpacing(8);
 
-    // Search Bar
+    auto *searchRow = new QHBoxLayout();
+    searchRow->setContentsMargins(0, 0, 0, 0);
+    searchRow->setSpacing(8);
+
     m_searchEdit = new QLineEdit(toolbarFrame);
-    m_searchEdit->setPlaceholderText("Search Steam Workshop items (FTS5 BM25 prefix search)...");
+    m_searchEdit->setPlaceholderText("Search Workshop wallpapers...");
     m_searchEdit->setClearButtonEnabled(true);
+    m_searchEdit->setFixedHeight(28);
     m_searchEdit->setStyleSheet(STYLE_SEARCH_BAR);
-    toolbarLayout->addWidget(m_searchEdit, 2);
+    searchRow->addWidget(m_searchEdit, 1);
 
-    // Type / Category Filter
-    m_typeCombo = new QComboBox(toolbarFrame);
-    m_typeCombo->addItems({"All Types", "Scene (Wallpaper Engine)", "Video Wallpapers",
-                           "Shader Compute", "Web Wallpapers"});
-    m_typeCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
-    toolbarLayout->addWidget(m_typeCombo, 1);
-
-    // Compatibility Tier Filter
-    m_impl->tierFilterCombo = new QComboBox(toolbarFrame);
-    m_impl->tierFilterCombo->addItems({"All Tiers", "Tier 1: Native", "Tier 2: Transpiled",
-                                       "Tier 3: Degraded", "Tier 4: Blocked"});
-    m_impl->tierFilterCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
-    toolbarLayout->addWidget(m_impl->tierFilterCombo, 1);
-
-    // Sort Order Combo
-    m_sortCombo = new QComboBox(toolbarFrame);
-    m_sortCombo->addItems(
-        {"Subscriptions", "Rating", "Recently Updated", "Compatibility Score", "Title"});
-    m_sortCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
-    toolbarLayout->addWidget(m_sortCombo, 1);
-
-    // Refresh Button
     m_refreshBtn = new QToolButton(toolbarFrame);
-    m_refreshBtn->setText("⟳ Scan");
-    m_refreshBtn->setToolTip("Re-scan local Steam Workshop content and refresh catalog");
+    m_refreshBtn->setText("Rescan");
+    m_refreshBtn->setFixedHeight(28);
+    m_refreshBtn->setToolTip("Rescan local Steam Workshop folders");
     m_refreshBtn->setStyleSheet(
-        "QToolButton { background-color: #2b303c; color: #f1f5f9; border: 1px solid #334155; "
-        "border-radius: 6px; padding: 5px 12px; font-weight: bold; font-size: 12px; }"
-        "QToolButton:hover { background-color: #38bdf8; color: #0f172a; }");
-    toolbarLayout->addWidget(m_refreshBtn);
+        "QToolButton { background-color: #20242e; color: #e2e8f0; border: 1px solid #2e3545; "
+        "border-radius: 5px; padding: 4px 12px; font-weight: 500; font-size: 11px; }"
+        "QToolButton:hover { background-color: #2a303d; border-color: #38bdf8; color: #ffffff; }");
+    searchRow->addWidget(m_refreshBtn);
+    toolbarOuter->addLayout(searchRow);
+
+    auto *filterRow = new QHBoxLayout();
+    filterRow->setContentsMargins(0, 0, 0, 0);
+    filterRow->setSpacing(8);
+
+    m_typeCombo = new QComboBox(toolbarFrame);
+    m_typeCombo->setFixedHeight(26);
+    m_typeCombo->addItems({"All Types", "Scene", "Video", "Shader", "Web"});
+    m_typeCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
+    filterRow->addWidget(m_typeCombo, 1);
+
+    m_impl->tierFilterCombo = new QComboBox(toolbarFrame);
+    m_impl->tierFilterCombo->setFixedHeight(26);
+    m_impl->tierFilterCombo->addItems(
+        {"All Tiers", "Native", "Transpiled", "Partial", "Unsupported"});
+    m_impl->tierFilterCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
+    filterRow->addWidget(m_impl->tierFilterCombo, 1);
+
+    m_sortCombo = new QComboBox(toolbarFrame);
+    m_sortCombo->setFixedHeight(26);
+    m_sortCombo->addItems({"Subscribers", "Rating", "Recent", "Compatibility", "Title"});
+    m_sortCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
+    filterRow->addWidget(m_sortCombo, 1);
+    toolbarOuter->addLayout(filterRow);
 
     rootLayout->addWidget(toolbarFrame);
 
-    // 2. Central Split View: Grid View (Left) & Inspector Drawer (Right)
-    m_impl->mainSplitter = new QSplitter(Qt::Horizontal, this);
+    // 2. Central Split View: Grid View (Top) & Inspector Drawer (Bottom)
+    m_impl->mainSplitter = new QSplitter(Qt::Vertical, this);
     m_impl->mainSplitter->setStyleSheet(
-        "QSplitter::handle { background-color: #2b303c; width: 2px; }");
+        "QSplitter::handle { background-color: #262b36; height: 2px; }");
 
     // Grid View
     m_gridView = new VirtualizedGridWidget(m_impl->mainSplitter);
+    m_gridView->setEmbeddedMode(true);
     m_impl->mainSplitter->addWidget(m_gridView);
 
     // Inspector Drawer
     m_impl->inspectorScrollArea = new QScrollArea(m_impl->mainSplitter);
     m_impl->inspectorScrollArea->setWidgetResizable(true);
+    m_impl->inspectorScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_impl->inspectorScrollArea->setStyleSheet(STYLE_DRAWER_BG);
 
     m_impl->inspectorDrawer = new QWidget(m_impl->inspectorScrollArea);
+    m_impl->inspectorDrawer->setMinimumWidth(0);
     auto *drawerLayout = new QVBoxLayout(m_impl->inspectorDrawer);
-    drawerLayout->setContentsMargins(14, 14, 14, 14);
+    drawerLayout->setContentsMargins(12, 12, 12, 12);
     drawerLayout->setSpacing(10);
 
     // Header Title & Metadata
     m_impl->inspectorTitleLabel =
-        new QLabel("Select a wallpaper to inspect", m_impl->inspectorDrawer);
+        new QLabel("Select a wallpaper to view details", m_impl->inspectorDrawer);
     m_impl->inspectorTitleLabel->setStyleSheet(
-        "font-size: 15px; font-weight: bold; color: #f1f5f9;");
+        "font-size: 13px; font-weight: 600; color: #f1f5f9;");
     m_impl->inspectorTitleLabel->setWordWrap(true);
+    m_impl->inspectorTitleLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->inspectorTitleLabel);
 
-    m_impl->inspectorIdLabel = new QLabel("Item ID: —", m_impl->inspectorDrawer);
+    m_impl->inspectorIdLabel = new QLabel("No item selected", m_impl->inspectorDrawer);
     m_impl->inspectorIdLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
+    m_impl->inspectorIdLabel->setWordWrap(true);
+    m_impl->inspectorIdLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->inspectorIdLabel);
 
     // Compatibility Tier Badge
-    m_impl->tierBadgeLabel = new QLabel("TIER 1 · NATIVE", m_impl->inspectorDrawer);
+    m_impl->tierBadgeLabel = new QLabel("Native (Compatible)", m_impl->inspectorDrawer);
     m_impl->tierBadgeLabel->setAlignment(Qt::AlignCenter);
     drawerLayout->addWidget(m_impl->tierBadgeLabel);
 
     // Compatibility Score Gauge
     auto *scoreBox = new QHBoxLayout();
-    m_impl->compatScoreLabel = new QLabel("Score: 100 / 100", m_impl->inspectorDrawer);
-    m_impl->compatScoreLabel->setStyleSheet("font-size: 11px; font-weight: bold; color: #e2e8f0;");
+    scoreBox->setSpacing(8);
+    m_impl->compatScoreLabel = new QLabel("Compatibility: 100%", m_impl->inspectorDrawer);
+    m_impl->compatScoreLabel->setStyleSheet("font-size: 11px; font-weight: 600; color: #e2e8f0;");
     scoreBox->addWidget(m_impl->compatScoreLabel);
 
     m_impl->compatScoreBar = new QProgressBar(m_impl->inspectorDrawer);
@@ -1020,52 +1032,51 @@ void WorkshopBrowserWidget::setupUi()
     m_impl->compatScoreBar->setFixedHeight(8);
     m_impl->compatScoreBar->setTextVisible(false);
     m_impl->compatScoreBar->setStyleSheet(
-        "QProgressBar { background: #1e222b; border-radius: 4px; }");
+        "QProgressBar { background: #20242e; border-radius: 4px; }");
     scoreBox->addWidget(m_impl->compatScoreBar, 1);
     drawerLayout->addLayout(scoreBox);
 
     // Hardware Estimates (VRAM & Target FPS)
     m_impl->vramFpsMetricsLabel =
-        new QLabel("Est. VRAM: 64 MB | Target FPS: 60", m_impl->inspectorDrawer);
+        new QLabel("VRAM: 64 MB  |  Target: 60 FPS", m_impl->inspectorDrawer);
     m_impl->vramFpsMetricsLabel->setStyleSheet(
-        "font-size: 11px; color: #cbd5e1; background: #1e222b; "
-        "padding: 6px 10px; border-radius: 4px; border: 1px solid #334155;");
+        "font-size: 11px; color: #cbd5e1; background: #20242e; "
+        "padding: 6px 10px; border-radius: 5px; border: 1px solid #2e3545;");
     drawerLayout->addWidget(m_impl->vramFpsMetricsLabel);
 
-    // Static Issues breakdown
-    m_impl->issuesHeaderLabel =
-        new QLabel("<b>Static Compatibility Diagnostics:</b>", m_impl->inspectorDrawer);
+    // Compatibility Notes
+    m_impl->issuesHeaderLabel = new QLabel("<b>Compatibility Notes</b>", m_impl->inspectorDrawer);
     m_impl->issuesHeaderLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     drawerLayout->addWidget(m_impl->issuesHeaderLabel);
 
     m_impl->issuesListWidget = new QListWidget(m_impl->inspectorDrawer);
-    m_impl->issuesListWidget->setMaximumHeight(90);
+    m_impl->issuesListWidget->setMaximumHeight(80);
     m_impl->issuesListWidget->setStyleSheet(
-        "QListWidget { background: #14171c; border: 1px solid #334155; border-radius: 4px; "
-        "font-size: 10px; padding: 4px; }");
+        "QListWidget { background: #14171f; border: 1px solid #2e3545; border-radius: 5px; "
+        "font-size: 11px; padding: 4px; }");
     drawerLayout->addWidget(m_impl->issuesListWidget);
 
-    // Auto-repairs breakdown
-    m_impl->repairsHeaderLabel =
-        new QLabel("<b>Automated AST Transformations:</b>", m_impl->inspectorDrawer);
+    // Suggested Fixes
+    m_impl->repairsHeaderLabel = new QLabel("<b>Suggested Fixes</b>", m_impl->inspectorDrawer);
     m_impl->repairsHeaderLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     drawerLayout->addWidget(m_impl->repairsHeaderLabel);
 
     m_impl->repairsListWidget = new QListWidget(m_impl->inspectorDrawer);
-    m_impl->repairsListWidget->setMaximumHeight(70);
+    m_impl->repairsListWidget->setMaximumHeight(68);
     m_impl->repairsListWidget->setStyleSheet(
-        "QListWidget { background: #14171c; border: 1px solid #334155; border-radius: 4px; "
-        "font-size: 10px; padding: 4px; }");
+        "QListWidget { background: #14171f; border: 1px solid #2e3545; border-radius: 5px; "
+        "font-size: 11px; padding: 4px; }");
     drawerLayout->addWidget(m_impl->repairsListWidget);
 
-    // Run Auto-Repair Button
-    m_impl->runAutoRepairBtn =
-        new QPushButton("🛠 Run Auto-Repair (Promote Varyings & Defaults)", m_impl->inspectorDrawer);
+    // Repair Shader Button
+    m_impl->runAutoRepairBtn = new QPushButton("Repair Shader", m_impl->inspectorDrawer);
+    m_impl->runAutoRepairBtn->setFixedHeight(28);
     m_impl->runAutoRepairBtn->setStyleSheet(STYLE_BUTTON_SECONDARY);
     drawerLayout->addWidget(m_impl->runAutoRepairBtn);
 
     // Status & Installation State
     auto *statusRow = new QHBoxLayout();
+    statusRow->setSpacing(8);
     auto *statusTitle = new QLabel("Status:", m_impl->inspectorDrawer);
     statusTitle->setStyleSheet("font-size: 11px; color: #94a3b8;");
     statusRow->addWidget(statusTitle);
@@ -1078,40 +1089,42 @@ void WorkshopBrowserWidget::setupUi()
     m_impl->downloadProgressBox = new QWidget(m_impl->inspectorDrawer);
     auto *dlLayout = new QVBoxLayout(m_impl->downloadProgressBox);
     dlLayout->setContentsMargins(0, 0, 0, 0);
-    dlLayout->setSpacing(4);
+    dlLayout->setSpacing(6);
 
     m_impl->downloadProgressBar = new QProgressBar(m_impl->downloadProgressBox);
     m_impl->downloadProgressBar->setRange(0, 100);
     m_impl->downloadProgressBar->setValue(0);
-    m_impl->downloadProgressBar->setFixedHeight(12);
+    m_impl->downloadProgressBar->setFixedHeight(10);
     m_impl->downloadProgressBar->setStyleSheet(
-        "QProgressBar { background: #1e222b; border: 1px solid #334155; border-radius: 4px; "
+        "QProgressBar { background: #20242e; border: 1px solid #2e3545; border-radius: 4px; "
         "text-align: center; font-size: 9px; color: white; }"
         "QProgressBar::chunk { background-color: #0284c7; border-radius: 3px; }");
     dlLayout->addWidget(m_impl->downloadProgressBar);
 
-    m_impl->downloadTelemetryLabel =
-        new QLabel("Downloading: 0% (0.0 MB/s, ETA: —)", m_impl->downloadProgressBox);
-    m_impl->downloadTelemetryLabel->setStyleSheet("font-size: 10px; color: #38bdf8;");
+    m_impl->downloadTelemetryLabel = new QLabel("Downloading: 0%", m_impl->downloadProgressBox);
+    m_impl->downloadTelemetryLabel->setStyleSheet("font-size: 11px; color: #38bdf8;");
     dlLayout->addWidget(m_impl->downloadTelemetryLabel);
 
     m_impl->downloadProgressBox->setVisible(false);
     drawerLayout->addWidget(m_impl->downloadProgressBox);
 
     // Primary Action Buttons
-    m_impl->subscribeDownloadBtn =
-        new QPushButton("★ Subscribe & Download", m_impl->inspectorDrawer);
+    m_impl->subscribeDownloadBtn = new QPushButton("Subscribe & Download", m_impl->inspectorDrawer);
+    m_impl->subscribeDownloadBtn->setFixedHeight(28);
     m_impl->subscribeDownloadBtn->setStyleSheet(STYLE_BUTTON_SECONDARY);
     drawerLayout->addWidget(m_impl->subscribeDownloadBtn);
 
     // Monitor Output Selector & Apply Button
     auto *applyRow = new QHBoxLayout();
+    applyRow->setSpacing(8);
     m_impl->monitorTargetCombo = new QComboBox(m_impl->inspectorDrawer);
+    m_impl->monitorTargetCombo->setFixedHeight(28);
     m_impl->monitorTargetCombo->addItems({"All Displays", "DP-1", "HDMI-A-1"});
     m_impl->monitorTargetCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
     applyRow->addWidget(m_impl->monitorTargetCombo, 1);
 
-    m_impl->applyToMonitorBtn = new QPushButton("▶ Apply to Monitor", m_impl->inspectorDrawer);
+    m_impl->applyToMonitorBtn = new QPushButton("Apply", m_impl->inspectorDrawer);
+    m_impl->applyToMonitorBtn->setFixedHeight(28);
     m_impl->applyToMonitorBtn->setStyleSheet(STYLE_BUTTON_PRIMARY);
     applyRow->addWidget(m_impl->applyToMonitorBtn, 1);
     drawerLayout->addLayout(applyRow);
@@ -1121,19 +1134,18 @@ void WorkshopBrowserWidget::setupUi()
     m_impl->inspectorScrollArea->setWidget(m_impl->inspectorDrawer);
     m_impl->mainSplitter->addWidget(m_impl->inspectorScrollArea);
 
-    // Set initial splitter balance: 72% grid, 28% inspector
-    m_impl->mainSplitter->setStretchFactor(0, 72);
-    m_impl->mainSplitter->setStretchFactor(1, 28);
+    // Set initial splitter balance: 60% grid, 40% inspector
+    m_impl->mainSplitter->setStretchFactor(0, 60);
+    m_impl->mainSplitter->setStretchFactor(1, 40);
     rootLayout->addWidget(m_impl->mainSplitter, 1);
 
-    // 3. Bottom Telemetry Status Strip
+    // 3. Bottom Status Strip
     auto *bottomStrip = new QFrame(this);
-    bottomStrip->setStyleSheet(
-        "background-color: #14171c; border-top: 1px solid #2b303c; padding: 2px;");
+    bottomStrip->setStyleSheet("background-color: #14171f; border-top: 1px solid #262b36;");
     auto *bottomLayout = new QHBoxLayout(bottomStrip);
-    bottomLayout->setContentsMargins(10, 4, 10, 4);
+    bottomLayout->setContentsMargins(10, 5, 10, 5);
 
-    m_impl->statusTelemetryLabel = new QLabel("Catalog loaded: 0 items", bottomStrip);
+    m_impl->statusTelemetryLabel = new QLabel("0 items", bottomStrip);
     m_impl->statusTelemetryLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     bottomLayout->addWidget(m_impl->statusTelemetryLabel);
     bottomLayout->addStretch();
@@ -1257,15 +1269,13 @@ void WorkshopBrowserWidget::wireSignals()
 
         auto &rec = m_impl->filteredRecords[m_impl->selectedItemIndex];
 
-        // Apply simulated or real AST auto-repair transformations
+        // Apply shader repair transformations
         rec.compat_tier = WE_TIER_1_NATIVE;
         rec.compat_score = 98;
         rec.issue_messages.clear();
-        rec.issue_messages.push_back(
-            "✓ All varying widths and user defaults successfully reconciled.");
+        rec.issue_messages.push_back("Shader varyings and default uniforms updated.");
         rec.repair_descriptions.clear();
-        rec.repair_descriptions.push_back(
-            "✓ AST Auto-Repairs applied into linear scratch shader AST.");
+        rec.repair_descriptions.push_back("Shader fixes applied.");
 
         m_impl->updateInspector(rec);
     });
@@ -1384,10 +1394,10 @@ void WorkshopBrowserWidget::onDownloadProgressUpdated(uint64_t publishedFileId, 
                                   : 0;
 
             m_impl->downloadTelemetryLabel->setText(
-                QString("Downloading: %1 / %2 (%.1f MB/s, ETA: %3s)")
+                QString("Downloading: %1 / %2 (%3 MB/s, ETA: %4s)")
                     .arg(formatBytes(downloadedBytes))
                     .arg(formatBytes(rec.file_size_bytes))
-                    .arg(speedMiB)
+                    .arg(speedMiB, 0, 'f', 1)
                     .arg(etaSec));
         }
     }

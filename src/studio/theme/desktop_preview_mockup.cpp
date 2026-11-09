@@ -277,7 +277,7 @@ void DesktopPreviewMockup::drawWaybar(QPainter &p, const QRect &desktopRect)
     // Center module: Window Title Pill bounded strictly between [wsX + 6, trayX - 6]
     const int availCenterW = trayX - wsX - 12;
     if (availCenterW >= 48) {
-        const QString titleText = QStringLiteral("wwal-studio — Material You Live Theme");
+        const QString titleText = QStringLiteral("WayWal Studio - Live Theme");
         const int titleW = std::min(fm.horizontalAdvance(titleText) + 18, availCenterW);
         const int titleX = wsX + 6 + (availCenterW - titleW) / 2;
         const QRect titleRect(titleX, wsY, titleW, wsH);
@@ -343,7 +343,7 @@ void DesktopPreviewMockup::drawHyprlandWindows(QPainter &p, const QRect &desktop
     p.setPen(m_hasPalette ? toQColor(m_palette.onSurfaceVariant) : QColor(160, 160, 170));
     const QRect inactTitleTextRect = inactTitleBar.adjusted(42, 0, -6, 0);
     p.drawText(inactTitleTextRect, Qt::AlignVCenter | Qt::AlignLeft,
-               inactFm.elidedText(QStringLiteral("Files — ~/wwal/themes"), Qt::ElideRight,
+               inactFm.elidedText(QStringLiteral("Files - ~/wwal/themes"), Qt::ElideRight,
                                   std::max(20, inactTitleTextRect.width())));
 
     // Inactive window content lines (simulated file manager rows)
@@ -387,7 +387,7 @@ void DesktopPreviewMockup::drawHyprlandWindows(QPainter &p, const QRect &desktop
     p.setBrush(QColor(0, 0, 0, 85));
     p.drawRoundedRect(actRect.translated(5, 6), 9.0, 9.0);
 
-    // Hyprland 45° Gradient Active Border: rgb($primary) rgb($tertiary) 45deg
+    // Hyprland 45 deg Gradient Active Border: rgb($primary) rgb($tertiary) 45deg
     QLinearGradient gradBorder(actRect.topLeft(), actRect.bottomRight());
     gradBorder.setColorAt(0.0, m_hasPalette ? toQColor(m_palette.primary) : QColor(103, 80, 164));
     gradBorder.setColorAt(1.0, m_hasPalette ? toQColor(m_palette.tertiary) : QColor(125, 82, 96));
@@ -496,8 +496,8 @@ void DesktopPreviewMockup::drawKittyTerminal(QPainter &p, const QRect &windowRec
     // System info snippet (elided cleanly within bodyRect)
     p.setPen(m_hasPalette ? toQColor(m_palette.onSurfaceVariant) : QColor(170, 170, 180));
     const QString infoStr = compactTerm
-                                ? QStringLiteral("M3 HCT • OkLab • 32+16")
-                                : QStringLiteral("Material You HCT • OkLab • 32 M3 + 16 ANSI");
+                                ? QStringLiteral("M3 HCT | OkLab | 32+16")
+                                : QStringLiteral("Material You HCT | OkLab | 32 M3 + 16 ANSI");
     p.drawText(bodyRect.x() + 2, textY,
                termFm.elidedText(infoStr, Qt::ElideRight, std::max(20, bodyRect.width() - 4)));
 
@@ -582,7 +582,7 @@ void DesktopPreviewMockup::drawMakoToast(QPainter &p, const QRect &desktopRect)
     p.setPen(m_hasPalette ? toQColor(m_palette.outline) : QColor(130, 130, 140));
     p.drawText(toastRect.right() - nowW - 4, toastRect.y() + 15, QStringLiteral("now"));
 
-    // Action button pill ("Dismiss") & Toast Body — strictly non-overlapping in both tall and
+    // Action button pill ("Dismiss") & Toast Body - strictly non-overlapping in both tall and
     // compact layouts
     QFont bodyFont = p.font();
     bodyFont.setPixelSize(8);
@@ -621,7 +621,7 @@ void DesktopPreviewMockup::drawLockscreenView(QPainter &p, const QRect &r)
     }
 
     // 2. Lockscreen mode banner at top
-    const QRect bannerRect(r.center().x() - 110, r.y() + 14, 220, 22);
+    const QRect bannerRect(r.center().x() - 90, r.y() + 14, 180, 22);
     p.setPen(Qt::NoPen);
     QColor bannerBg = m_hasPalette ? toQColor(m_palette.secondaryContainer) : QColor(74, 68, 88);
     bannerBg.setAlpha(210);
@@ -633,7 +633,7 @@ void DesktopPreviewMockup::drawLockscreenView(QPainter &p, const QRect &r)
     bannerFont.setBold(true);
     p.setFont(bannerFont);
     p.setPen(m_hasPalette ? toQColor(m_palette.onSecondaryContainer) : Qt::white);
-    p.drawText(bannerRect, Qt::AlignCenter, QStringLiteral("🔒 Kawase Blur Lockscreen Preview"));
+    p.drawText(bannerRect, Qt::AlignCenter, QStringLiteral("Lockscreen Preview"));
 
     // 3. Digital Clock
     const int clockY = r.center().y() - 50;
@@ -696,7 +696,7 @@ void DesktopPreviewMockup::drawLockscreenView(QPainter &p, const QRect &r)
     p.setFont(dotFont);
     p.setPen(m_hasPalette ? toQColor(m_palette.primary) : QColor(103, 80, 164));
     p.drawText(passRect.adjusted(14, 0, -32, 0), Qt::AlignVCenter | Qt::AlignLeft,
-               QStringLiteral("••••••••"));
+               QStringLiteral("********"));
 
     // Enter arrow pill button
     const QRect enterPill(passRect.right() - 24, passRect.y() + 4, 20, 20);
@@ -707,8 +707,9 @@ void DesktopPreviewMockup::drawLockscreenView(QPainter &p, const QRect &r)
     p.setPen(m_hasPalette ? toQColor(m_palette.onPrimaryContainer) : Qt::white);
     QFont arrowFont = p.font();
     arrowFont.setPointSize(8);
+    arrowFont.setBold(true);
     p.setFont(arrowFont);
-    p.drawText(enterPill, Qt::AlignCenter, QStringLiteral("➔"));
+    p.drawText(enterPill, Qt::AlignCenter, QStringLiteral(">"));
 }
 
 } // namespace waywal::studio

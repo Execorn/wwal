@@ -1145,6 +1145,233 @@ static void test_mp4_ctts_v0_and_v1(void)
     printf("  -> MP4 ctts v0 positive offsets & v1 signed negative offsets: PASSED\n");
 }
 
+static void test_h264_main_profile_bframe_reordering(void)
+{
+    printf("[TEST] Running test_h264_main_profile_bframe_reordering...\n");
+
+    /* avcC extradata with profile_idc=77 (Main), constraint_flags=0x40 (constraint_set1_flag=1,
+     * constraint_set0_flag=0), level_idc=40, num_ref_frames=4, 640x480 progressive */
+    const uint8_t main_avcc[] = {
+        0x01, 0x4D, 0x40, 0x28, 0xFF, 0xE1, 0x00, 0x09, 0x67,
+        0x4D, 0x40, 0x28, 0xF2, 0x81, 0x40, 0x7B, 0x20, 0x00,
+    };
+    vaapi_decoder_t dec;
+    memset(&dec, 0, sizeof(dec));
+    dec.va_profile = VAProfileH264Main;
+    assert(vaapi_decoder_set_extradata(&dec, main_avcc, sizeof(main_avcc)));
+    assert(dec.cached_sps.valid);
+    assert(dec.cached_sps.profile_idc == 77);
+    assert(dec.cached_sps.constraint_set0_flag == 0);
+    assert(dec.cached_sps.constraint_set1_flag == 1);
+    assert(dec.cached_sps.num_ref_frames == 4);
+    assert(dec.cached_sps.pic_order_cnt_type == 0);
+    assert(!dec.cached_sps.bitstream_restriction_flag);
+
+    /* Verify Constrained Baseline (profile_idc=66, constraint_flags=0xC0) sets constraint_set0_flag
+     */
+    const uint8_t baseline_avcc[] = {
+        0x01, 0x42, 0xC0, 0x28, 0xFF, 0xE1, 0x00, 0x09, 0x67,
+        0x42, 0xC0, 0x28, 0xF2, 0x81, 0x40, 0x7B, 0x20, 0x00,
+    };
+    vaapi_decoder_t base_dec;
+    memset(&base_dec, 0, sizeof(base_dec));
+    base_dec.va_profile = VAProfileH264ConstrainedBaseline;
+    assert(vaapi_decoder_set_extradata(&base_dec, baseline_avcc, sizeof(baseline_avcc)));
+    assert(base_dec.cached_sps.valid);
+    assert(base_dec.cached_sps.profile_idc == 66);
+    assert(base_dec.cached_sps.constraint_set0_flag == 1);
+    assert(base_dec.cached_sps.constraint_set1_flag == 1);
+
+    /* Verify VUI bitstream_restriction_flag with max_num_reorder_frames=4 and =0 */
+    const uint8_t vui_reorder4_avcc[] = {
+        0x01, 0x4D, 0x40, 0x28, 0xFF, 0xE1, 0x00, 0x0B, 0x67, 0x4D,
+        0x40, 0x28, 0xF2, 0x81, 0x40, 0x7B, 0x40, 0x3F, 0x2E, 0x00,
+    };
+    vaapi_decoder_t vui4_dec;
+    memset(&vui4_dec, 0, sizeof(vui4_dec));
+    vui4_dec.va_profile = VAProfileH264Main;
+    assert(vaapi_decoder_set_extradata(&vui4_dec, vui_reorder4_avcc, sizeof(vui_reorder4_avcc)));
+    assert(vui4_dec.cached_sps.valid);
+    assert(vui4_dec.cached_sps.bitstream_restriction_flag);
+    assert(vui4_dec.cached_sps.max_num_reorder_frames == 4);
+
+    const uint8_t vui_reorder0_avcc[] = {
+        0x01, 0x4D, 0x40, 0x28, 0xFF, 0xE1, 0x00, 0x0B, 0x67, 0x4D,
+        0x40, 0x28, 0xF2, 0x81, 0x40, 0x7B, 0x40, 0x3F, 0xE0, 0x00,
+    };
+    vaapi_decoder_t vui0_dec;
+    memset(&vui0_dec, 0, sizeof(vui0_dec));
+    vui0_dec.va_profile = VAProfileH264Main;
+    assert(vaapi_decoder_set_extradata(&vui0_dec, vui_reorder0_avcc, sizeof(vui_reorder0_avcc)));
+    assert(vui0_dec.cached_sps.valid);
+    assert(vui0_dec.cached_sps.bitstream_restriction_flag);
+    assert(vui0_dec.cached_sps.max_num_reorder_frames == 0);
+
+    /* Main Profile (profile_idc=77, constraint_set1_flag=1, constraint_set0_flag=0) must select
+     * target_depth=4 (NOT 1) so B-frames are reordered into monotonic PTS/POC order. */
+    uint32_t target_depth =
+        (dec.cached_sps.valid &&
+         (dec.cached_sps.profile_idc == 66 || dec.cached_sps.constraint_set0_flag != 0 ||
+          dec.cached_sps.num_ref_frames <= 1 || dec.cached_sps.pic_order_cnt_type == 2))
+            ? 1U
+            : (dec.cached_sps.valid && dec.cached_sps.bitstream_restriction_flag
+                   ? (uint32_t)dec.cached_sps.max_num_reorder_frames + 1U
+                   : 4U);
+    assert(target_depth == 4U);
+
+    /* Simulate 2 loops of 2 GOPs of hierarchical B-frame decode order (including POC step 2 in
+     * GOP 0 and POC step 1 in GOP 1) and verify:
+     * 1. Zero backwards PTS or POC rewinds within each GOP and loop.
+     * 2. Steady-state ticks (including across loop boundaries!) decode 1 packet per tick without
+     *    draining reorder_count to 0 or stalling for a 4-frame burst decode. */
+    typedef struct {
+        uint64_t loop_id;
+        uint64_t gop_id;
+        int32_t poc;
+        int64_t pts_us;
+    } sim_pkt_t;
+
+    const sim_pkt_t stream[] = {
+        /* GOP 0 (even POCs: 0, 6, 2, 4, 12, 8, 10) */
+        {0, 0, 0, 0},
+        {0, 0, 6, 99999},
+        {0, 0, 2, 33333},
+        {0, 0, 4, 66666},
+        {0, 0, 12, 199998},
+        {0, 0, 8, 133332},
+        {0, 0, 10, 166665},
+        /* GOP 1 (consecutive POCs: 0, 3, 1, 2, 6, 4, 5) */
+        {0, 1, 0, 233331},
+        {0, 1, 3, 333330},
+        {0, 1, 1, 266664},
+        {0, 1, 2, 299997},
+        {0, 1, 6, 433329},
+        {0, 1, 4, 366663},
+        {0, 1, 5, 399996},
+    };
+    const size_t stream_len = sizeof(stream) / sizeof(stream[0]);
+    const uint64_t max_loops = 2;
+    const size_t total_pkts = stream_len * max_loops;
+
+    sim_pkt_t reorder_buf[6];
+    uint32_t reorder_count = 0;
+    bool eof_draining = false;
+    size_t read_idx = 0;
+    uint64_t current_loop = 0;
+    uint64_t gop_offset = 0;
+    int64_t prev_pts_us = -1;
+    uint64_t prev_loop_id = 0;
+    uint64_t prev_gop_id = 0;
+    int32_t prev_poc = -1;
+    size_t presented_count = 0;
+    uint32_t tick = 0;
+
+    while (presented_count < total_pkts) {
+        uint32_t decoded_this_tick = 0;
+        bool looped_this_tick = false;
+        while (!eof_draining && reorder_count < 6) {
+            bool ready = (reorder_count > 0) && (eof_draining || reorder_count >= target_depth);
+            if (ready)
+                break;
+            if (read_idx >= stream_len) {
+                bool is_final_loop = (current_loop + 1 >= max_loops);
+                if (is_final_loop || looped_this_tick) {
+                    eof_draining = true;
+                    break;
+                }
+                looped_this_tick = true;
+                current_loop++;
+                gop_offset += 2;
+                read_idx = 0;
+            }
+            sim_pkt_t pkt = stream[read_idx++];
+            pkt.loop_id = current_loop;
+            pkt.gop_id += gop_offset;
+            reorder_buf[reorder_count++] = pkt;
+            decoded_this_tick++;
+        }
+
+        if (tick > 0 && !eof_draining) {
+            assert(decoded_this_tick == 1U);
+        }
+
+        assert(reorder_count > 0);
+        uint32_t best_idx = 0;
+        for (uint32_t i = 1; i < reorder_count; ++i) {
+            const sim_pkt_t *a = &reorder_buf[i];
+            const sim_pkt_t *b = &reorder_buf[best_idx];
+            if (a->gop_id < b->gop_id || (a->gop_id == b->gop_id && a->poc < b->poc) ||
+                (a->gop_id == b->gop_id && a->poc == b->poc && a->pts_us < b->pts_us)) {
+                best_idx = i;
+            }
+        }
+        sim_pkt_t pres = reorder_buf[best_idx];
+        reorder_count--;
+        if (best_idx < reorder_count) {
+            reorder_buf[best_idx] = reorder_buf[reorder_count];
+        }
+
+        if (presented_count > 0 && pres.loop_id == prev_loop_id) {
+            assert(pres.pts_us > prev_pts_us);
+            if (pres.gop_id == prev_gop_id) {
+                assert(pres.poc > prev_poc);
+            }
+        }
+        prev_loop_id = pres.loop_id;
+        prev_pts_us = pres.pts_us;
+        prev_gop_id = pres.gop_id;
+        prev_poc = pres.poc;
+        presented_count++;
+        tick++;
+    }
+
+    /* Verify PLL vblank phase-locking when playback_epoch_ns starts in the second half of a
+     * 60Hz vblank interval (9.0ms past vblank) with 2.0ms decode+VPP+commit overhead:
+     * must converge smoothly to 1 frame per vblank without 22ms/8ms oscillation. */
+    const int64_t period_ns = 16666667LL;
+    const int64_t frame_interval_ns = 16666667LL;
+    const int64_t work_ns = 2000000LL;
+    const int64_t lead_time_ns = 4000000LL;
+    int64_t now_ns = 9000000LL;
+    int64_t playback_epoch_ns = now_ns;
+    int64_t prev_vblank_idx = -1;
+
+    for (int f = 0; f < 30; ++f) {
+        int64_t scaled_pts_ns = (int64_t)f * frame_interval_ns;
+        int64_t target_pres_ns = playback_epoch_ns + scaled_pts_ns + frame_interval_ns;
+        int64_t next_vblank_ns = ((now_ns / period_ns) + 1) * period_ns;
+        int64_t desired_vblank_ns = target_pres_ns + lead_time_ns;
+        if (desired_vblank_ns >= next_vblank_ns) {
+            int64_t cycles = (desired_vblank_ns - next_vblank_ns + (period_ns / 2)) / period_ns;
+            if (cycles < 0)
+                cycles = 0;
+            int64_t aligned_vblank_ns = next_vblank_ns + cycles * period_ns;
+            int64_t target_fire_ns = aligned_vblank_ns - lead_time_ns;
+            int64_t phase_err = target_fire_ns - target_pres_ns;
+            int64_t adj = phase_err / 4;
+            playback_epoch_ns += adj;
+            target_pres_ns += adj;
+        }
+        int64_t next_interval_ns = target_pres_ns - now_ns;
+        if (next_interval_ns < 1000000LL)
+            next_interval_ns = 1000000LL;
+        /* Ensure no 8ms double-commit or 23ms frame-repeat oscillation occurs in steady state */
+        if (f >= 4) {
+            assert(next_interval_ns >= 13000000LL && next_interval_ns <= 16000000LL);
+        }
+        int64_t wake_ns = now_ns + next_interval_ns;
+        now_ns = wake_ns + work_ns;
+        int64_t committed_vblank_idx = now_ns / period_ns;
+        if (f >= 4) {
+            assert(committed_vblank_idx == prev_vblank_idx + 1);
+        }
+        prev_vblank_idx = committed_vblank_idx;
+    }
+
+    printf(
+        "  -> H.264 Main Profile constraint_set1_flag SPS & B-frame monotonic reorder: PASSED\n");
+}
+
 int main(void)
 {
     printf("=========================================\n");
@@ -1155,6 +1382,7 @@ int main(void)
     test_webm_demuxer_zero_allocation();
     test_webm_duration_and_lacing();
     test_mp4_ctts_v0_and_v1();
+    test_h264_main_profile_bframe_reordering();
     test_real_mp4_demuxing();
     test_vaapi_decoder_and_prime_export();
     test_high_precision_monotonic_timer();

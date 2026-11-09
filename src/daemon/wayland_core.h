@@ -205,6 +205,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
 
 void output_node_create_surface(daemon_state_t *state, output_node_t *node);
 void output_node_destroy_surface(output_node_t *node);
+void output_node_recreate_layer_surface(daemon_state_t *state, output_node_t *node);
 void output_node_render_color(daemon_state_t *state, output_node_t *node, color_rgba_t color);
 void output_node_render_image(daemon_state_t *state, output_node_t *node, const uint8_t *pixels,
                               uint32_t img_w, uint32_t img_h);

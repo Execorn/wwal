@@ -237,9 +237,25 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
                      out->height);
 
     if (!was_configured) {
-        output_node_render_color(out->state, out, out->state->current_color);
-        if (out->state && out->state->on_output_configured) {
-            out->state->on_output_configured(out->state, out);
+        if (out->last_presented_bo && out->last_presented_bo->wl_buffer && out->surface) {
+            int32_t dst_w = out->logical_width > 0 ? (int32_t)out->logical_width : out->width;
+            int32_t dst_h = out->logical_height > 0 ? (int32_t)out->logical_height : out->height;
+            if (out->viewport) {
+                wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                                       wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+                output_viewport_update_destination(out, dst_w, dst_h);
+            }
+            wl_surface_attach(out->surface, out->last_presented_bo->wl_buffer, 0, 0);
+            wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
+            output_commit_frame(out);
+            if (out->state && out->state->display) {
+                wl_display_flush(out->state->display);
+            }
+        } else {
+            output_node_render_color(out->state, out, out->state->current_color);
+            if (out->state && out->state->on_output_configured) {
+                out->state->on_output_configured(out->state, out);
+            }
         }
     } else {
         bool dims_changed = (out->width != old_w || out->height != old_h);
@@ -806,6 +822,51 @@ void output_node_destroy_surface(output_node_t *node)
     node->transition_duration_ns = 0;
     node->transition_progress_linear = 0.0f;
     node->last_committed_ring_idx = -1;
+}
+
+void output_node_recreate_layer_surface(daemon_state_t *state, output_node_t *node)
+{
+    if (!state || !node || !node->wl_output)
+        return;
+
+    node->backdrop_configured = false;
+    if (node->backdrop_viewport) {
+        wp_viewport_destroy(node->backdrop_viewport);
+        node->backdrop_viewport = NULL;
+    }
+    if (node->backdrop_layer_surface) {
+        zwlr_layer_surface_v1_destroy(node->backdrop_layer_surface);
+        node->backdrop_layer_surface = NULL;
+    }
+    if (node->backdrop_surface) {
+        wl_surface_destroy(node->backdrop_surface);
+        node->backdrop_surface = NULL;
+    }
+
+    if (node->viewport) {
+        wp_viewport_destroy(node->viewport);
+        node->viewport = NULL;
+    }
+    if (node->fract_scale) {
+        wp_fractional_scale_v1_destroy(node->fract_scale);
+        node->fract_scale = NULL;
+    }
+    if (node->layer_surface) {
+        zwlr_layer_surface_v1_destroy(node->layer_surface);
+        node->layer_surface = NULL;
+    }
+    presentation_sync_destroy(&node->pres_sync);
+    if (node->surface) {
+        wl_surface_destroy(node->surface);
+        node->surface = NULL;
+    }
+    node->configured = false;
+    node->vp_configured = false;
+    node->backdrop_vp_dst_w = 0;
+    node->backdrop_vp_dst_h = 0;
+    node->last_buffer_scale = 0;
+
+    output_node_create_surface(state, node);
 }
 
 static color_rgba_t get_output_fill_color(const daemon_state_t *state, const output_node_t *node)

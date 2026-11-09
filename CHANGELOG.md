@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-11-09
+
+### Added
+
+- **WayWal Studio (`wwal-studio`) Desktop IDE**: Native C++23 / Qt 6 workstation featuring dockable Workspace Presets (`Browse`, `Inspect & Tune`, `Theme Lab`), a 144 FPS Virtualized Media Grid with zero-copy DMA-BUF hover previews, a live GPU Preview Viewport, a Multi-Monitor Topology Canvas (`Fill`, `Fit`, `Center`, `Stretch`, `Tile`, `Span`), an interactive Cubic-Bezier Transition Curve Editor, a real-time Shader & Workshop Property Inspector, and a live Material Design 3 (`OKLab` / `CAM16` / `HCT`) Theme Studio with WCAG 2.1 contrast auditing and dotfile template export.
+- **Multi-Drive Steam Workshop (`431960`) Discovery & Hybrid Filesystem Watcher**: Automatic parsing of Valve KeyValues VDF (`libraryfolders.vdf`, `appworkshop_431960.acf`) across all mounted Steam libraries, coupled with a hybrid `fanotify` (`FAN_MARK_FILESYSTEM`) and recursive `inotify` watcher with `epoll` + `timerfd` 300 ms debounce and 1,000 ms flush ceiling.
+- **Embedded SQLite3 WAL + FTS5 Catalog Index**: Sub-millisecond (`< 0.1 ms` at 50,000 items) full-text prefix search and multi-faceted filtering backed by 6 covering indices and zero-churn FTS5 synchronization triggers.
+- **Multi-Backend Download & Subscription Queue Manager**: 3-tier download arbitration (`libsteam_api.so` ISteamUGC runtime `dlopen`, Steam Web API + HTTP/2 byte-range resume worker with full-jitter HTTP 429 backoff, and asynchronous `steamcmd` pipe runner) governed by a Token Bucket bandwidth limiter and EWMA speed/ETA estimator.
+- **WayWal Open Hub & Cryptographic `.wwpkg` Ecosystem**: Open `.wwpkg` (`tar.zst`) wallpaper package container with RFC 8785 JSON Canonicalization Scheme (JCS), RFC 6962 domain-separated SHA-256 Merkle tree proofs (`0x00` leaf / `0x01` internal node), RFC 8032 Ed25519 digital signatures (`216`-byte `wwpkg_signature_t`), and a 6-step `CreatorPackagingWizard` in `wwal-studio`.
+- **Deterministic 4-Tier Wallpaper Engine Compatibility Scanner (`we_compat_scanner`)**: Pre-apply static & AST analyzer for `PKGV0001`..`PKGV0024` archives with rolling XOR de-masking, PE/ELF/Zip-Slip quarantine, 6-pass `scene.json` / GLSL ES 3.10 AST auditing, automatic shader repair (`highp float`, HLSL-to-GLSL intrinsics, `fragColor.a = 1.0`), and a QuickJS instruction/memory watchdog (`<= 2.0 ms`, `16 MiB` heap, `100,000` opcodes).
+- **Extended Daemon IPC Protocol (`0x0019`..`0x001C`, `0x8008`..`0x800B`)**: Added `WAYWAL_REQ_SCAN_COMPAT`, `WAYWAL_REQ_INSTALL_WWPKG`, `WAYWAL_REQ_QUERY_WORKSHOP_STATUS`, and `WAYWAL_REQ_RELOAD_WORKSHOP_SCENE` with zero-copy DMA-BUF output export (`WAYWAL_REQ_EXPORT_OUTPUT_DMABUF`) prioritizing active video engines.
+
+### Fixed
+
+- **VA-API H.264 B-Frame Reorder Buffer & VUI Parsing (`vaapi_h264.c`, `video_engine.c`)**: Fixed `constraint_set0_flag` vs `constraint_set1_flag` bit extraction, parsed H.264 SPS VUI `bitstream_restriction_flag` / `max_num_reorder_frames`, expanded `WAYWAL_VIDEO_REORDER_CAP` to `17` frames, prevented premature B-frame reorder buffer draining acrossPOC gaps (`poc <= ve->next_present_poc`), eliminated loop-boundary decode stalls (`looped_this_tick`), and fixed VPP round-robin surface selection on NVIDIA.
+- **VBlank PLL Phase-Locking & Frame Pacing (`video_engine.c`, `presentation.c`)**: Sampled `CLOCK_MONOTONIC` after synchronous GPU/VPP blits, aligned PLL vblank predictions past the current frame boundary to prevent `8 ms` / `23 ms` frame-repeat oscillations, replaced superseded `wp_presentation_feedback` requests on back-to-back commits, and cached `/proc/self/smaps_rollup` reads in `ipc_server.c` (`500 ms` TTL) so `wwal-studio` telemetry polling never stalls the render loop.
+- **Hyprland Fullscreen Layer-Surface Recovery (`layer_shell.c`, `wayland_core.c`, `main.c`)**: Automatically recreates and remaps `zwlr_layer_surface_v1` background surfaces that were initially mapped behind a fullscreen window (`out->pres_sync.pll.frame_seq == 0`) as soon as fullscreen exits or the active workspace changes, working around Hyprland's `CLayerSurface::onMap` `m_alpha = 0` skip.
+
 ## [1.2.0] - 2026-10-30
 
 ### Added
@@ -96,7 +114,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - CRC32-verified binary state persistence (`state.bin`), declarative `~/.config/wwal/config.toml` parser with per-output and per-workspace rules, and real-time telemetry (`wwal stats`).
   - Linux `io_uring` event loop (`uring_loop.c`) and Seccomp-BPF + Landlock v3 process sandboxing (`security.c`).
 
-[Unreleased]: https://github.com/Execorn/wwal/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/Execorn/wwal/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/Execorn/wwal/compare/v1.2.0...v3.0.0
 [1.2.0]: https://github.com/Execorn/wwal/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Execorn/wwal/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Execorn/wwal/releases/tag/v1.0.0
