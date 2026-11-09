@@ -16,12 +16,24 @@ class AudioSpectrumWidget;
 class PowerGovernorWidget;
 class TelemetryHudWidget;
 class StudioFooterBar;
+class CatalogIndexManager;
+class DownloadManager;
+class RecursiveFsWatcher;
+class WorkshopBrowserWidget;
+class OpenHubBrowserWidget;
+class CreatorPackagingWizard;
 } // namespace wwal::studio
 
 namespace waywal::studio {
 
+using ::wwal::studio::CatalogIndexManager;
+using ::wwal::studio::CreatorPackagingWizard;
+using ::wwal::studio::DownloadManager;
+using ::wwal::studio::OpenHubBrowserWidget;
+using ::wwal::studio::RecursiveFsWatcher;
 using ::wwal::studio::StudioFooterBar;
 using ::wwal::studio::VirtualizedGridWidget;
+using ::wwal::studio::WorkshopBrowserWidget;
 
 class DockLayoutManager;
 class CommandBus;
@@ -80,6 +92,11 @@ class MainWindow : public QMainWindow {
     PropertyInspectorWidget *propertyInspector() const { return m_propertyInspector; }
     ThemeStudioWidget *themeStudio() const { return m_themeStudio; }
     StudioFooterBar *footerBar() const { return m_footerBar; }
+    WorkshopBrowserWidget *workshopBrowser() const { return m_workshopBrowser; }
+    OpenHubBrowserWidget *openHubBrowser() const { return m_openHubBrowser; }
+    CatalogIndexManager *catalogIndexManager() const { return m_catalogIndexMgr.get(); }
+    DownloadManager *downloadManager() const { return m_downloadMgr.get(); }
+    RecursiveFsWatcher *fsWatcher() const { return m_fsWatcher.get(); }
 
     // Global Actions
     QAction *undoAction() const { return m_undoAction; }
@@ -87,6 +104,7 @@ class MainWindow : public QMainWindow {
     QAction *searchFocusAction() const { return m_searchFocusAction; }
     QAction *playPauseAction() const { return m_playPauseAction; }
     QAction *fullscreenAction() const { return m_fullscreenAction; }
+    QAction *packageWizardAction() const { return m_packageWizardAction; }
 
   public slots:
     void handleUndo();
@@ -96,6 +114,7 @@ class MainWindow : public QMainWindow {
     void handleFullscreenToggle();
     void handlePerspectiveSelected(const QString &perspectiveName);
     void handleResetLayout();
+    void handleOpenPackagingWizard();
 
   protected:
     void closeEvent(QCloseEvent *event) override;
@@ -115,9 +134,16 @@ class MainWindow : public QMainWindow {
     DockLayoutManager *m_layoutManager{nullptr};
     std::unique_ptr<CommandBus> m_commandBus;
 
-    // 6 Studio Dock Panels & Bars
+    // Steam Workshop, Open Hub & Catalog Engine
+    std::shared_ptr<CatalogIndexManager> m_catalogIndexMgr;
+    std::shared_ptr<DownloadManager> m_downloadMgr;
+    std::unique_ptr<RecursiveFsWatcher> m_fsWatcher;
+
+    // 6+ Studio Dock Panels & Bars
     MonitorTopologyBar *m_topologyBar{nullptr};
     VirtualizedGridWidget *m_gridWidget{nullptr};
+    WorkshopBrowserWidget *m_workshopBrowser{nullptr};
+    OpenHubBrowserWidget *m_openHubBrowser{nullptr};
     GpuPreviewViewport *m_previewViewport{nullptr};
     CubicBezierEditorWidget *m_bezierEditor{nullptr};
     PropertyInspectorWidget *m_propertyInspector{nullptr};
@@ -130,6 +156,7 @@ class MainWindow : public QMainWindow {
     QAction *m_searchFocusAction{nullptr};
     QAction *m_playPauseAction{nullptr};
     QAction *m_fullscreenAction{nullptr};
+    QAction *m_packageWizardAction{nullptr};
 
     // Perspective & Status Controls
     QComboBox *m_perspectiveCombo{nullptr};

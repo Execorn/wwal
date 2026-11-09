@@ -365,12 +365,18 @@ void IpcClient::flushOutboundQueue()
         }
 
         // Register pending request if callbacks are attached
-        if (pkt.jsonCallback || pkt.telemetryCallback || pkt.dmabufCallback) {
+        if (pkt.jsonCallback || pkt.telemetryCallback || pkt.dmabufCallback ||
+            pkt.workshopSyncCallback || pkt.workshopDownloadCallback || pkt.wwpkgInstallCallback ||
+            pkt.scanCompatCallback) {
             PendingRequest req{};
             req.expectedOpcode = pkt.hdr.opcode;
             req.jsonCallback = std::move(pkt.jsonCallback);
             req.telemetryCallback = std::move(pkt.telemetryCallback);
             req.dmabufCallback = std::move(pkt.dmabufCallback);
+            req.workshopSyncCallback = std::move(pkt.workshopSyncCallback);
+            req.workshopDownloadCallback = std::move(pkt.workshopDownloadCallback);
+            req.wwpkgInstallCallback = std::move(pkt.wwpkgInstallCallback);
+            req.scanCompatCallback = std::move(pkt.scanCompatCallback);
             req.sentAt = std::chrono::steady_clock::now();
 
             std::lock_guard<std::mutex> lock(m_requestsMutex);
@@ -533,6 +539,70 @@ void IpcClient::handleIncomingPacket()
 
         QMetaObject::invokeMethod(
             this, [this, jsonStr]() { emit outputsJsonReceived(jsonStr); }, Qt::QueuedConnection);
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_WORKSHOP_SYNC ||
+        (hasReq && req.expectedOpcode == WAYWAL_REQ_WORKSHOP_SYNC)) {
+        if (payload.size() >= sizeof(waywal_ipc_resp_workshop_sync_t)) {
+            waywal_ipc_resp_workshop_sync_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            if (req.workshopSyncCallback) {
+                req.workshopSyncCallback(resp);
+            }
+            QMetaObject::invokeMethod(
+                this, [this, resp]() { emit workshopSyncReceived(resp); }, Qt::QueuedConnection);
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_WORKSHOP_DOWNLOAD ||
+        (hasReq && req.expectedOpcode == WAYWAL_REQ_WORKSHOP_DOWNLOAD)) {
+        if (payload.size() >= sizeof(waywal_ipc_resp_workshop_download_t)) {
+            waywal_ipc_resp_workshop_download_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            if (req.workshopDownloadCallback) {
+                req.workshopDownloadCallback(resp);
+            }
+            QMetaObject::invokeMethod(
+                this, [this, resp]() { emit workshopDownloadReceived(resp); },
+                Qt::QueuedConnection);
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_WWPKG_INSTALL ||
+        (hasReq && req.expectedOpcode == WAYWAL_REQ_WWPKG_INSTALL)) {
+        if (payload.size() >= sizeof(waywal_ipc_resp_wwpkg_install_t)) {
+            waywal_ipc_resp_wwpkg_install_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            QString errMsg;
+            if (resp.error_msg_len > 0 && payload.size() >= sizeof(resp) + resp.error_msg_len) {
+                errMsg =
+                    QString::fromUtf8(reinterpret_cast<const char *>(payload.data() + sizeof(resp)),
+                                      static_cast<qsizetype>(resp.error_msg_len));
+            }
+            if (req.wwpkgInstallCallback) {
+                req.wwpkgInstallCallback(resp, errMsg);
+            }
+            QMetaObject::invokeMethod(
+                this, [this, resp, errMsg]() { emit wwpkgInstallReceived(resp, errMsg); },
+                Qt::QueuedConnection);
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_SCAN_COMPAT ||
+        (hasReq && req.expectedOpcode == WAYWAL_REQ_SCAN_COMPAT)) {
+        if (payload.size() >= sizeof(waywal_ipc_resp_scan_compat_t)) {
+            waywal_ipc_resp_scan_compat_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            if (req.scanCompatCallback) {
+                req.scanCompatCallback(resp);
+            }
+            QMetaObject::invokeMethod(
+                this, [this, resp]() { emit scanCompatReceived(resp); }, Qt::QueuedConnection);
+        }
         return;
     }
 
@@ -717,6 +787,121 @@ void IpcClient::subscribeEvents()
     pkt.hdr.version = WAYWAL_IPC_VERSION;
     pkt.hdr.opcode = WAYWAL_REQ_SUBSCRIBE;
     pkt.hdr.payload_size = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+
+    wakeupWorker();
+}
+
+void IpcClient::requestWorkshopSync(
+    uint32_t flags, const QString &customRoot,
+    std::function<void(const waywal_ipc_resp_workshop_sync_t &resp)> callback)
+{
+    waywal_ipc_req_workshop_sync_t req{};
+    req.flags = flags;
+    QByteArray rootBa = customRoot.toUtf8();
+    std::strncpy(req.custom_root, rootBa.constData(), sizeof(req.custom_root) - 1);
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::WorkshopSync;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_WORKSHOP_SYNC;
+    pkt.hdr.payload_size = sizeof(req);
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+    pkt.workshopSyncCallback = std::move(callback);
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+
+    wakeupWorker();
+}
+
+void IpcClient::requestWorkshopDownload(
+    uint64_t publishedFileId, uint32_t priority, uint32_t preferredBackend,
+    std::function<void(const waywal_ipc_resp_workshop_download_t &resp)> callback)
+{
+    waywal_ipc_req_workshop_download_t req{};
+    req.published_file_id = publishedFileId;
+    req.priority = priority;
+    req.preferred_backend = preferredBackend;
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::WorkshopDownload;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_WORKSHOP_DOWNLOAD;
+    pkt.hdr.payload_size = sizeof(req);
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+    pkt.workshopDownloadCallback = std::move(callback);
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+
+    wakeupWorker();
+}
+
+void IpcClient::requestWwpkgInstall(
+    const uint8_t packageUuid[16], uint32_t flags, const QString &targetOutput,
+    std::function<void(const waywal_ipc_resp_wwpkg_install_t &resp, const QString &errorMsg)>
+        callback)
+{
+    waywal_ipc_req_wwpkg_install_t req{};
+    if (packageUuid) {
+        std::memcpy(req.package_uuid, packageUuid, 16);
+    }
+    req.flags = flags;
+    QByteArray outBa = targetOutput.toUtf8();
+    req.target_output_len = static_cast<uint32_t>(outBa.size());
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::WwpkgInstall;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_WWPKG_INSTALL;
+    pkt.hdr.payload_size = sizeof(req) + req.target_output_len;
+    pkt.payload.resize(pkt.hdr.payload_size);
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+    if (req.target_output_len > 0) {
+        std::memcpy(pkt.payload.data() + sizeof(req), outBa.constData(), req.target_output_len);
+    }
+    pkt.wwpkgInstallCallback = std::move(callback);
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+
+    wakeupWorker();
+}
+
+void IpcClient::requestScanCompat(
+    const QString &targetPath, uint32_t autoRepairFlags,
+    std::function<void(const waywal_ipc_resp_scan_compat_t &resp)> callback)
+{
+    waywal_ipc_req_scan_compat_t req{};
+    QByteArray pathBa = targetPath.toUtf8();
+    std::strncpy(req.target_path, pathBa.constData(), sizeof(req.target_path) - 1);
+    req.auto_repair_flags = autoRepairFlags;
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::ScanCompat;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_SCAN_COMPAT;
+    pkt.hdr.payload_size = sizeof(req);
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+    pkt.scanCompatCallback = std::move(callback);
 
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);

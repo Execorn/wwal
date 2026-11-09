@@ -263,6 +263,10 @@ core_sources = files(
   'src/common/we_project.c',
   'src/common/solar_schedule.c',
   'src/common/shader_parser.c',
+  'src/common/we_vdf.c',
+  'src/common/we_appworkshop.c',
+  'src/common/wwpkg.c',
+  'src/common/we_compat_scanner.c',
 )
 
 core_deps = [threads_dep, m_dep, dl_dep]
@@ -402,7 +406,8 @@ endif
 qt6_opt = get_option('studio')
 have_qt6 = false
 qt6_dep = dependency('qt6', modules: ['Core', 'Gui', 'Widgets', 'OpenGLWidgets'], required: qt6_opt)
-if qt6_dep.found()
+sqlite3_dep = dependency('sqlite3', required: qt6_opt)
+if qt6_dep.found() and sqlite3_dep.found()
   qt6 = import('qt6')
   have_qt6 = true
 
@@ -412,6 +417,8 @@ if qt6_dep.found()
     'src/studio/core/command_bus.hpp',
     'src/studio/core/ipc_client.hpp',
     'src/studio/core/preset_store.hpp',
+    'src/studio/dock/openhub_browser_widget.hpp',
+    'src/studio/dock/workshop_browser_widget.hpp',
     'src/studio/footer/audio_spectrum_widget.hpp',
     'src/studio/footer/power_governor_widget.hpp',
     'src/studio/footer/studio_footer_bar.hpp',
@@ -426,6 +433,7 @@ if qt6_dep.found()
     'src/studio/topology/cubic_bezier_editor.hpp',
     'src/studio/topology/monitor_topology_canvas.hpp',
     'src/studio/viewport/gpu_preview_viewport.hpp',
+    'src/studio/wizard/creator_packaging_wizard.hpp',
   )
 
   studio_inc_dirs = [inc_dir, include_directories('src', 'src/studio')]
@@ -439,9 +447,13 @@ if qt6_dep.found()
   studio_lib_sources = files(
     'src/studio/app/dock_layout_manager.cpp',
     'src/studio/app/main_window.cpp',
+    'src/studio/core/catalog_index_manager.cpp',
     'src/studio/core/command_bus.cpp',
     'src/studio/core/ipc_client.cpp',
     'src/studio/core/preset_store.cpp',
+    'src/studio/core/recursive_fs_watcher.cpp',
+    'src/studio/dock/openhub_browser_widget.cpp',
+    'src/studio/dock/workshop_browser_widget.cpp',
     'src/studio/footer/audio_spectrum_widget.cpp',
     'src/studio/footer/power_governor_widget.cpp',
     'src/studio/footer/studio_footer_bar.cpp',
@@ -452,17 +464,20 @@ if qt6_dep.found()
     'src/studio/grid/virtualized_grid_widget.cpp',
     'src/studio/inspector/oklch_color_dialog.cpp',
     'src/studio/inspector/property_inspector_widget.cpp',
+    'src/studio/queue/download_manager.cpp',
     'src/studio/theme/desktop_preview_mockup.cpp',
     'src/studio/theme/template_exporter.cpp',
     'src/studio/theme/theme_studio_widget.cpp',
     'src/studio/topology/cubic_bezier_editor.cpp',
     'src/studio/topology/monitor_topology_canvas.cpp',
     'src/studio/viewport/gpu_preview_viewport.cpp',
+    'src/studio/wizard/creator_packaging_wizard.cpp',
   ) + studio_mocs
 
   studio_deps = [
     qt6_dep,
     waywal_core_dep,
+    sqlite3_dep,
     threads_dep,
     m_dep,
     dl_dep,
@@ -870,6 +885,43 @@ if get_option('tests')
   )
   test('ipc_legacy_72byte', test_ipc_legacy_72byte_exe)
 
+  # Workshop, Open Hub & Compatibility Test Targets
+  test_we_vdf_exe = executable('test_we_vdf',
+    'tests/test_we_vdf.c',
+    include_directories: inc_dir,
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('we_vdf', test_we_vdf_exe)
+
+  test_wwpkg_crypto_exe = executable('test_wwpkg_crypto',
+    'tests/test_wwpkg_crypto.c',
+    include_directories: inc_dir,
+    dependencies: [waywal_core_dep, m_dep, dl_dep]
+  )
+  test('wwpkg_crypto', test_wwpkg_crypto_exe, timeout: 60)
+
+  test_we_compat_scanner_exe = executable('test_we_compat_scanner',
+    'tests/test_we_compat_scanner.c',
+    include_directories: inc_dir,
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('we_compat_scanner', test_we_compat_scanner_exe, timeout: 60)
+
+  fuzz_workshop_parsers_exe = executable('fuzz_workshop_parsers',
+    'tests/fuzz/fuzz_workshop_parsers.c',
+    c_args: ['-DWWAL_FUZZ_STANDALONE'],
+    include_directories: inc_dir,
+    dependencies: [waywal_core_dep, m_dep, dl_dep]
+  )
+  test('fuzz_workshop_parsers', fuzz_workshop_parsers_exe, timeout: 60)
+
+  test_workshop_security_exe = executable('test_workshop_security',
+    'tests/test_workshop_security.c',
+    include_directories: inc_dir,
+    dependencies: [waywal_core_dep, m_dep, dl_dep]
+  )
+  test('workshop_security', test_workshop_security_exe, timeout: 60)
+
   if have_qt6
     test_studio_command_and_dock_exe = executable('test_studio_command_and_dock',
       'tests/test_studio_command_and_dock.cpp',
@@ -884,6 +936,27 @@ if get_option('tests')
       dependencies: [waywal_studio_dep],
     )
     test('benchmark_grid_virtualization', benchmark_grid_virtualization_exe, timeout: 60, is_parallel: false)
+
+    test_catalog_index_exe = executable('test_catalog_index',
+      'tests/test_catalog_index.cpp',
+      include_directories: studio_inc_dirs,
+      dependencies: [waywal_studio_dep],
+    )
+    test('catalog_index', test_catalog_index_exe, timeout: 60, is_parallel: false, priority: 50)
+
+    test_recursive_fs_watcher_exe = executable('test_recursive_fs_watcher',
+      'tests/test_recursive_fs_watcher.cpp',
+      include_directories: studio_inc_dirs,
+      dependencies: [waywal_studio_dep],
+    )
+    test('recursive_fs_watcher', test_recursive_fs_watcher_exe, timeout: 30)
+
+    test_download_manager_exe = executable('test_download_manager',
+      'tests/test_download_manager.cpp',
+      include_directories: studio_inc_dirs,
+      dependencies: [waywal_studio_dep],
+    )
+    test('download_manager', test_download_manager_exe, timeout: 30)
   endif
 endif
 

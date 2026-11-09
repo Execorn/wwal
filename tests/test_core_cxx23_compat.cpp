@@ -59,6 +59,10 @@
 #include "waywal/we_script.h"
 #include "waywal/we_shader.h"
 #include "waywal/we_tex.h"
+#include "waywal/we_vdf.h"
+#include "waywal/we_appworkshop.h"
+#include "waywal/wwpkg.h"
+#include "waywal/we_compat_scanner.h"
 
 // ----------------------------------------------------------------------------
 // Compile-time Struct Packing & Offset Assertions
@@ -68,6 +72,23 @@ static_assert(sizeof(waywal_img_metadata_t) == 4815,
               "waywal_img_metadata_t must be exactly 4815 bytes packed");
 static_assert(offsetof(waywal_img_metadata_t, filter_mode) == 72,
               "Legacy 72-byte prefix of waywal_img_metadata_t must remain frozen at offset 72");
+
+// Workshop, Open Hub & Compatibility IPC Wire Struct Sizes and Alignment Invariants
+static_assert(sizeof(waywal_ipc_req_workshop_sync_t) == 1028, "Must be 1028 bytes");
+static_assert(sizeof(waywal_ipc_resp_workshop_sync_t) == 24, "Must be 24 bytes");
+static_assert(offsetof(waywal_ipc_resp_workshop_sync_t, total_size_bytes) == 16,
+              "total_size_bytes must be at offset 16");
+
+static_assert(sizeof(waywal_ipc_req_workshop_download_t) == 16, "Must be 16 bytes");
+static_assert(sizeof(waywal_ipc_resp_workshop_download_t) == 280, "Must be 280 bytes");
+
+static_assert(sizeof(waywal_ipc_req_wwpkg_install_t) == 24, "Must be 24 bytes header");
+static_assert(sizeof(waywal_ipc_resp_wwpkg_install_t) == 24, "Must be 24 bytes header");
+
+static_assert(sizeof(waywal_ipc_req_scan_compat_t) == 1028, "Must be 1028 bytes");
+static_assert(sizeof(waywal_ipc_resp_scan_compat_t) == 1052, "Must be 1052 bytes");
+
+static_assert(sizeof(wwpkg_signature_t) == 216, "Must be 216 bytes with zero hidden padding");
 
 static void test_bezier_solver()
 {
@@ -247,6 +268,70 @@ static void test_shader_parser()
     std::cout << "  -> GLSL shader parser passed." << std::endl;
 }
 
+static void test_workshop_and_wwpkg_cxx23_interop()
+{
+    std::cout << "[Core C++23] Testing Workshop & WWPKG C23 Modules (VDF, AppWorkshop, WWPKG, "
+                 "Compat Scanner)..."
+              << std::endl;
+
+    // 1. VDF Parser interop
+    const char sample_vdf[] = "\"libraryfolders\"\n"
+                              "{\n"
+                              "    \"0\"\n"
+                              "    {\n"
+                              "        \"path\" \"/home/user/.local/share/Steam\"\n"
+                              "        \"label\" \"\"\n"
+                              "        \"contentid\" \"12345\"\n"
+                              "        \"total_size\" \"500000000000\"\n"
+                              "        \"apps\"\n"
+                              "        {\n"
+                              "            \"431960\" \"104857600\"\n"
+                              "        }\n"
+                              "    }\n"
+                              "}\n";
+
+    waywal_vdf_doc_t *vdf = waywal_vdf_parse(sample_vdf, sizeof(sample_vdf) - 1);
+    assert(vdf != nullptr && "waywal_vdf_parse must succeed on valid VDF");
+    assert(vdf->root != nullptr);
+    const waywal_vdf_node_t *node0 = waywal_vdf_find_child(vdf->root, "0");
+    assert(node0 != nullptr);
+    const char *path = waywal_vdf_get_string(node0, "path", "");
+    assert(std::string_view(path) == "/home/user/.local/share/Steam");
+    waywal_vdf_free(vdf);
+
+    // 2. WWPKG Crypto interop (Ed25519 keypair and SHA-256)
+    uint8_t pub[32]{};
+    uint8_t priv[64]{};
+    wwpkg_generate_keypair(pub, priv);
+    bool has_nonzero_pub = false;
+    for (uint8_t b : pub) {
+        if (b != 0)
+            has_nonzero_pub = true;
+    }
+    assert(has_nonzero_pub && "Generated pubkey must be non-zero");
+
+    const uint8_t test_msg[] = "WayWal Open Hub RFC 6962 Merkle Test";
+    uint8_t test_hash[32]{};
+    wwpkg_sha256(test_msg, sizeof(test_msg) - 1, test_hash);
+    uint8_t sig[64]{};
+    int sign_rc = wwpkg_ed25519_sign(sig, test_hash, 32, priv);
+    assert(sign_rc == 0 && "wwpkg_ed25519_sign must succeed");
+    int verify_rc = wwpkg_ed25519_verify(sig, test_hash, 32, pub);
+    assert(verify_rc == 0 && "wwpkg_ed25519_verify must verify signature");
+
+    // 3. Compat Scanner heap report allocation interop
+    we_compat_report_t *report = we_compat_report_alloc();
+    assert(report != nullptr && "we_compat_report_alloc must allocate 246 KB report on heap");
+    assert(report->tier == WE_TIER_UNKNOWN);
+    we_compat_report_free(report);
+
+    we_compat_scanner_t *scanner = we_compat_scanner_create(true, true);
+    assert(scanner != nullptr && "we_compat_scanner_create must succeed");
+    we_compat_scanner_destroy(scanner);
+
+    std::cout << "  -> Workshop & WWPKG C23 Modules interop passed." << std::endl;
+}
+
 int main()
 {
     std::cout << "==========================================================" << std::endl;
@@ -257,6 +342,7 @@ int main()
     test_palette_hct_extraction();
     test_we_json_parser();
     test_shader_parser();
+    test_workshop_and_wwpkg_cxx23_interop();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  >>> CORE C++23 COMPATIBILITY PASSED CLEANLY (100%) <<<  " << std::endl;

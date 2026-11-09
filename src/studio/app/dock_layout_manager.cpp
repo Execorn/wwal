@@ -1150,6 +1150,7 @@ QJsonObject DockLayoutManager::createDefaultPerspectiveTree()
     QJsonArray leftTabs;
     leftTabs.append(QStringLiteral("Wallpapers"));
     leftTabs.append(QStringLiteral("WorkshopBrowser"));
+    leftTabs.append(QStringLiteral("OpenHubBrowser"));
     leftTab.insert(QStringLiteral("tabs"), leftTabs);
     tree.insert(QStringLiteral("left"), leftTab);
 

@@ -73,6 +73,8 @@ jobs:
             systemd-dev \
             qt6-base-dev \
             qt6-base-dev-tools \
+            libsqlite3-dev \
+            libzstd-dev \
             libgl-dev \
             libopengl-dev \
             weston \
@@ -133,3 +135,4 @@ jobs:
           ./build/fuzz_demuxer
           ./build/fuzz_bitstream
           ./build/fuzz_config_cli
+          ./build/fuzz_workshop_parsers

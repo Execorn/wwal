@@ -149,6 +149,15 @@ class MonitorTopologyBar : public QWidget {
 #include "footer/studio_footer_bar.hpp"
 #endif
 
+// Include Workshop, Open Hub & Catalog Subsystems
+#include "studio/core/catalog_index_manager.hpp"
+#include "studio/core/recursive_fs_watcher.hpp"
+#include "studio/queue/download_manager.hpp"
+#include "studio/dock/workshop_browser_widget.hpp"
+#include "studio/dock/openhub_browser_widget.hpp"
+#include "studio/wizard/creator_packaging_wizard.hpp"
+#include "waywal/we_vdf.h"
+
 namespace waywal::studio {
 
 /* ========================================================================= */
@@ -245,6 +254,39 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
             }
         });
     }
+
+    // 12. Setup Recursive Filesystem Watcher for Steam Workshop & Open Hub
+    if (!m_options.headlessCheck && !m_options.benchmarkGrid) {
+        m_fsWatcher =
+            std::make_unique<RecursiveFsWatcher>([this](const std::vector<FsWatchEvent> &events) {
+                if (events.empty())
+                    return;
+                QMetaObject::invokeMethod(
+                    this,
+                    [this]() {
+                        if (m_workshopBrowser) {
+                            m_workshopBrowser->refreshLibrary();
+                        }
+                        if (m_openHubBrowser) {
+                            m_openHubBrowser->refreshFeed();
+                        }
+                    },
+                    Qt::QueuedConnection);
+            });
+
+        waywal_steam_library_t libs[16];
+        size_t libCount = waywal_steam_discover_libraries(libs, 16);
+        for (size_t i = 0; i < libCount; ++i) {
+            std::string wsDir = std::string(libs[i].path) + "/steamapps/workshop/content/431960";
+            if (std::filesystem::exists(wsDir)) {
+                m_fsWatcher->addWatchRoot(wsDir);
+            }
+        }
+        QString localHub = QDir::homePath() + QStringLiteral("/.local/share/waywal/hub");
+        QDir().mkpath(localHub);
+        m_fsWatcher->addWatchRoot(localHub.toStdString());
+        m_fsWatcher->start();
+    }
 }
 
 MainWindow::~MainWindow() = default;
@@ -257,10 +299,24 @@ void MainWindow::setupPanels()
                                    QStringLiteral("Monitor Topology & Span"),
                                    Qt::TopDockWidgetArea);
 
-    // Panel 2 (Left Dock): Virtualized Wallpaper Grid
+    // Catalog & Download Managers
+    m_catalogIndexMgr = std::make_shared<CatalogIndexManager>();
+    m_downloadMgr = std::make_shared<DownloadManager>();
+
+    // Panel 2 (Left Dock Tab 1): Virtualized Wallpaper Grid
     m_gridWidget = new VirtualizedGridWidget(this);
     m_layoutManager->registerPanel(QStringLiteral("Wallpapers"), m_gridWidget,
                                    QStringLiteral("Wallpaper Library"), Qt::LeftDockWidgetArea);
+
+    // Panel 2 (Left Dock Tab 2): Steam Workshop Browser
+    m_workshopBrowser = new WorkshopBrowserWidget(m_catalogIndexMgr, m_downloadMgr, this);
+    m_layoutManager->registerPanel(QStringLiteral("WorkshopBrowser"), m_workshopBrowser,
+                                   QStringLiteral("Steam Workshop"), Qt::LeftDockWidgetArea);
+
+    // Panel 2 (Left Dock Tab 3): Open Hub Browser
+    m_openHubBrowser = new OpenHubBrowserWidget(m_downloadMgr, this);
+    m_layoutManager->registerPanel(QStringLiteral("OpenHubBrowser"), m_openHubBrowser,
+                                   QStringLiteral("Open Hub"), Qt::LeftDockWidgetArea);
 
     // Panel 3 (Center Dock Top): GPU Preview Viewport
     m_previewViewport = new GpuPreviewViewport(this);
@@ -383,6 +439,14 @@ void MainWindow::setupMenuBar()
             m_propertyInspector->savePreset();
         }
     });
+
+    fileMenu->addSeparator();
+
+    m_packageWizardAction =
+        fileMenu->addAction(QStringLiteral("📦 &Package Wallpaper (.wwpkg)..."));
+    m_packageWizardAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+P")));
+    connect(m_packageWizardAction, &QAction::triggered, this,
+            &MainWindow::handleOpenPackagingWizard);
 
     fileMenu->addSeparator();
 
@@ -547,6 +611,15 @@ void MainWindow::setupToolBar()
     btnSearch->setFixedHeight(24);
     connect(btnSearch, &QPushButton::clicked, this, &MainWindow::handleSearchFocus);
     toolbar->addWidget(btnSearch);
+
+    toolbar->addSeparator();
+
+    // Creator Packaging Wizard button
+    auto *btnWizard = new QPushButton(QStringLiteral("📦 Package"), this);
+    btnWizard->setToolTip(QStringLiteral("Open Creator Packaging Wizard (.wwpkg) [Ctrl+Shift+P]"));
+    btnWizard->setFixedHeight(24);
+    connect(btnWizard, &QPushButton::clicked, this, &MainWindow::handleOpenPackagingWizard);
+    toolbar->addWidget(btnWizard);
 
     // Spacer
     auto *spacer = new QWidget(this);
@@ -822,6 +895,20 @@ void MainWindow::wireInterPanelSignals()
                     }
                 });
     }
+
+    // 4. Connect Steam Workshop & Open Hub browser selections
+    if (m_workshopBrowser) {
+        connect(m_workshopBrowser, &WorkshopBrowserWidget::wallpaperSelected, this,
+                [this](uint64_t /*id*/, const QString &filePath) { applyWallpaperPath(filePath); });
+    }
+    if (m_openHubBrowser) {
+        connect(m_openHubBrowser, &OpenHubBrowserWidget::packageSelected, this,
+                [this](const QString & /*pkgId*/, const QString &cid) {
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(QStringLiteral("Selected Hub Package: %1").arg(cid));
+                    }
+                });
+    }
 }
 
 void MainWindow::applyWallpaperPath(const QString &path)
@@ -917,6 +1004,16 @@ void MainWindow::handleResetLayout()
     if (m_layoutManager) {
         m_layoutManager->resetToDefaultPerspective();
     }
+}
+
+void MainWindow::handleOpenPackagingWizard()
+{
+    auto *wizard = new CreatorPackagingWizard(this);
+    wizard->setAttribute(Qt::WA_DeleteOnClose);
+    if (!m_activeWallpaperPath.isEmpty()) {
+        wizard->setSourcePath(m_activeWallpaperPath);
+    }
+    wizard->show();
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)

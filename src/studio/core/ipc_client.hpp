@@ -52,6 +52,21 @@ class IpcClient : public QObject, public IIpcClientService {
             callback = nullptr) override;
     void subscribeEvents() override;
 
+    // Steam Workshop & Open Hub Operations
+    void requestWorkshopSync(
+        uint32_t flags, const QString &customRoot,
+        std::function<void(const waywal_ipc_resp_workshop_sync_t &resp)> callback = nullptr);
+    void requestWorkshopDownload(
+        uint64_t publishedFileId, uint32_t priority = 50, uint32_t preferredBackend = 0,
+        std::function<void(const waywal_ipc_resp_workshop_download_t &resp)> callback = nullptr);
+    void requestWwpkgInstall(
+        const uint8_t packageUuid[16], uint32_t flags, const QString &targetOutput,
+        std::function<void(const waywal_ipc_resp_wwpkg_install_t &resp, const QString &errorMsg)>
+            callback = nullptr);
+    void requestScanCompat(
+        const QString &targetPath, uint32_t autoRepairFlags = 0,
+        std::function<void(const waywal_ipc_resp_scan_compat_t &resp)> callback = nullptr);
+
     // Lifecycle
     void start();
     void stop();
@@ -66,6 +81,10 @@ class IpcClient : public QObject, public IIpcClientService {
     void dmabufReceived(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds);
     void eventReceived(const QString &eventType, const QJsonObject &data);
     void errorOccurred(const QString &error);
+    void workshopSyncReceived(const waywal_ipc_resp_workshop_sync_t &resp);
+    void workshopDownloadReceived(const waywal_ipc_resp_workshop_download_t &resp);
+    void wwpkgInstallReceived(const waywal_ipc_resp_wwpkg_install_t &resp, const QString &errorMsg);
+    void scanCompatReceived(const waywal_ipc_resp_scan_compat_t &resp);
 
   private:
     struct OutboundPacket {
@@ -76,7 +95,11 @@ class IpcClient : public QObject, public IIpcClientService {
             Telemetry,
             ExportDmabuf,
             Subscribe,
-            AudioPower
+            AudioPower,
+            WorkshopSync,
+            WorkshopDownload,
+            WwpkgInstall,
+            ScanCompat
         };
 
         Type type{Type::Raw};
@@ -89,6 +112,12 @@ class IpcClient : public QObject, public IIpcClientService {
         std::function<void(const TelemetrySnapshot &snapshot)> telemetryCallback;
         std::function<void(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds)>
             dmabufCallback;
+        std::function<void(const waywal_ipc_resp_workshop_sync_t &resp)> workshopSyncCallback;
+        std::function<void(const waywal_ipc_resp_workshop_download_t &resp)>
+            workshopDownloadCallback;
+        std::function<void(const waywal_ipc_resp_wwpkg_install_t &resp, const QString &errorMsg)>
+            wwpkgInstallCallback;
+        std::function<void(const waywal_ipc_resp_scan_compat_t &resp)> scanCompatCallback;
     };
 
     struct PendingRequest {
@@ -97,6 +126,12 @@ class IpcClient : public QObject, public IIpcClientService {
         std::function<void(const TelemetrySnapshot &snapshot)> telemetryCallback;
         std::function<void(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds)>
             dmabufCallback;
+        std::function<void(const waywal_ipc_resp_workshop_sync_t &resp)> workshopSyncCallback;
+        std::function<void(const waywal_ipc_resp_workshop_download_t &resp)>
+            workshopDownloadCallback;
+        std::function<void(const waywal_ipc_resp_wwpkg_install_t &resp, const QString &errorMsg)>
+            wwpkgInstallCallback;
+        std::function<void(const waywal_ipc_resp_scan_compat_t &resp)> scanCompatCallback;
         std::chrono::steady_clock::time_point sentAt;
     };
 

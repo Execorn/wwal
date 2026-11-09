@@ -469,3 +469,331 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
     }
     return ok;
 }
+
+/* ========================================================================= */
+/* Workshop, Open Hub & Compatibility IPC Serialization Helpers             */
+/* ========================================================================= */
+
+bool waywal_ipc_validate_req_workshop_sync(const waywal_ipc_req_workshop_sync_t *req,
+                                           size_t payload_size)
+{
+    if (!req || payload_size != sizeof(waywal_ipc_req_workshop_sync_t)) {
+        return false;
+    }
+    if (!memchr(req->custom_root, '\0', sizeof(req->custom_root))) {
+        return false;
+    }
+    return true;
+}
+
+bool waywal_ipc_serialize_req_workshop_sync(uint32_t flags, const char *custom_root,
+                                            waywal_ipc_hdr_t *out_hdr,
+                                            waywal_ipc_req_workshop_sync_t *out_req)
+{
+    if (!out_hdr || !out_req) {
+        return false;
+    }
+    memset(out_req, 0, sizeof(*out_req));
+    out_req->flags = flags;
+    if (custom_root) {
+        strncpy(out_req->custom_root, custom_root, sizeof(out_req->custom_root) - 1);
+    }
+    out_hdr->magic = WAYWAL_IPC_MAGIC;
+    out_hdr->version = WAYWAL_IPC_VERSION;
+    out_hdr->opcode = WAYWAL_REQ_WORKSHOP_SYNC;
+    out_hdr->payload_size = sizeof(waywal_ipc_req_workshop_sync_t);
+    return true;
+}
+
+bool waywal_ipc_validate_resp_workshop_sync(const waywal_ipc_resp_workshop_sync_t *resp,
+                                            size_t payload_size)
+{
+    if (!resp || payload_size != sizeof(waywal_ipc_resp_workshop_sync_t)) {
+        return false;
+    }
+    return true;
+}
+
+bool waywal_ipc_serialize_resp_workshop_sync(uint32_t status_code, uint32_t total_libraries_found,
+                                             uint32_t total_items_indexed,
+                                             uint64_t total_size_bytes, waywal_ipc_hdr_t *out_hdr,
+                                             waywal_ipc_resp_workshop_sync_t *out_resp)
+{
+    if (!out_hdr || !out_resp) {
+        return false;
+    }
+    memset(out_resp, 0, sizeof(*out_resp));
+    out_resp->status_code = status_code;
+    out_resp->total_libraries_found = total_libraries_found;
+    out_resp->total_items_indexed = total_items_indexed;
+    out_resp->_reserved = 0;
+    out_resp->total_size_bytes = total_size_bytes;
+    out_hdr->magic = WAYWAL_IPC_MAGIC;
+    out_hdr->version = WAYWAL_IPC_VERSION;
+    out_hdr->opcode = WAYWAL_RESP_WORKSHOP_SYNC;
+    out_hdr->payload_size = sizeof(waywal_ipc_resp_workshop_sync_t);
+    return true;
+}
+
+bool waywal_ipc_validate_req_workshop_download(const waywal_ipc_req_workshop_download_t *req,
+                                               size_t payload_size)
+{
+    if (!req || payload_size != sizeof(waywal_ipc_req_workshop_download_t)) {
+        return false;
+    }
+    if (req->published_file_id == 0) {
+        return false;
+    }
+    return true;
+}
+
+bool waywal_ipc_serialize_req_workshop_download(uint64_t published_file_id, uint32_t priority,
+                                                uint32_t preferred_backend,
+                                                waywal_ipc_hdr_t *out_hdr,
+                                                waywal_ipc_req_workshop_download_t *out_req)
+{
+    if (!out_hdr || !out_req) {
+        return false;
+    }
+    memset(out_req, 0, sizeof(*out_req));
+    out_req->published_file_id = published_file_id;
+    out_req->priority = priority;
+    out_req->preferred_backend = preferred_backend;
+    out_hdr->magic = WAYWAL_IPC_MAGIC;
+    out_hdr->version = WAYWAL_IPC_VERSION;
+    out_hdr->opcode = WAYWAL_REQ_WORKSHOP_DOWNLOAD;
+    out_hdr->payload_size = sizeof(waywal_ipc_req_workshop_download_t);
+    return true;
+}
+
+bool waywal_ipc_validate_resp_workshop_download(const waywal_ipc_resp_workshop_download_t *resp,
+                                                size_t payload_size)
+{
+    if (!resp || payload_size != sizeof(waywal_ipc_resp_workshop_download_t)) {
+        return false;
+    }
+    if (!memchr(resp->error_msg, '\0', sizeof(resp->error_msg))) {
+        return false;
+    }
+    return true;
+}
+
+bool waywal_ipc_serialize_resp_workshop_download(uint64_t published_file_id, uint32_t task_state,
+                                                 float progress_pct, float speed_bytes_per_sec,
+                                                 uint32_t eta_seconds, const char *error_msg,
+                                                 waywal_ipc_hdr_t *out_hdr,
+                                                 waywal_ipc_resp_workshop_download_t *out_resp)
+{
+    if (!out_hdr || !out_resp) {
+        return false;
+    }
+    memset(out_resp, 0, sizeof(*out_resp));
+    out_resp->published_file_id = published_file_id;
+    out_resp->task_state = task_state;
+    out_resp->progress_pct = progress_pct;
+    out_resp->speed_bytes_per_sec = speed_bytes_per_sec;
+    out_resp->eta_seconds = eta_seconds;
+    if (error_msg) {
+        strncpy(out_resp->error_msg, error_msg, sizeof(out_resp->error_msg) - 1);
+    }
+    out_hdr->magic = WAYWAL_IPC_MAGIC;
+    out_hdr->version = WAYWAL_IPC_VERSION;
+    out_hdr->opcode = WAYWAL_RESP_WORKSHOP_DOWNLOAD;
+    out_hdr->payload_size = sizeof(waywal_ipc_resp_workshop_download_t);
+    return true;
+}
+
+bool waywal_ipc_validate_req_wwpkg_install(const waywal_ipc_req_wwpkg_install_t *req,
+                                           size_t payload_size, const char **out_target_output)
+{
+    if (!req || payload_size < sizeof(waywal_ipc_req_wwpkg_install_t)) {
+        return false;
+    }
+    if (payload_size != sizeof(waywal_ipc_req_wwpkg_install_t) + (size_t)req->target_output_len) {
+        return false;
+    }
+    if (out_target_output) {
+        *out_target_output = (req->target_output_len > 0)
+                                 ? ((const char *)req + sizeof(waywal_ipc_req_wwpkg_install_t))
+                                 : NULL;
+    }
+    return true;
+}
+
+bool waywal_ipc_serialize_req_wwpkg_install(const uint8_t package_uuid[16], uint32_t flags,
+                                            const char *target_output, waywal_ipc_hdr_t *out_hdr,
+                                            waywal_ipc_req_wwpkg_install_t *out_req, void *out_buf,
+                                            size_t out_buf_cap, size_t *out_total_len)
+{
+    if (!out_hdr) {
+        return false;
+    }
+    size_t target_len = target_output ? strlen(target_output) : 0;
+    size_t total_len = sizeof(waywal_ipc_req_wwpkg_install_t) + target_len;
+    if (out_total_len) {
+        *out_total_len = total_len;
+    }
+    out_hdr->magic = WAYWAL_IPC_MAGIC;
+    out_hdr->version = WAYWAL_IPC_VERSION;
+    out_hdr->opcode = WAYWAL_REQ_WWPKG_INSTALL;
+    out_hdr->payload_size = total_len;
+
+    if (out_req) {
+        memset(out_req, 0, sizeof(*out_req));
+        if (package_uuid) {
+            memcpy(out_req->package_uuid, package_uuid, 16);
+        }
+        out_req->flags = flags;
+        out_req->target_output_len = (uint32_t)target_len;
+    }
+    if (out_buf) {
+        if (out_buf_cap < total_len) {
+            return false;
+        }
+        waywal_ipc_req_wwpkg_install_t *hdr_part = (waywal_ipc_req_wwpkg_install_t *)out_buf;
+        memset(hdr_part, 0, sizeof(*hdr_part));
+        if (package_uuid) {
+            memcpy(hdr_part->package_uuid, package_uuid, 16);
+        }
+        hdr_part->flags = flags;
+        hdr_part->target_output_len = (uint32_t)target_len;
+        if (target_len > 0) {
+            memcpy((char *)out_buf + sizeof(*hdr_part), target_output, target_len);
+        }
+    }
+    return true;
+}
+
+bool waywal_ipc_validate_resp_wwpkg_install(const waywal_ipc_resp_wwpkg_install_t *resp,
+                                            size_t payload_size, const char **out_error_msg)
+{
+    if (!resp || payload_size < sizeof(waywal_ipc_resp_wwpkg_install_t)) {
+        return false;
+    }
+    if (payload_size != sizeof(waywal_ipc_resp_wwpkg_install_t) + (size_t)resp->error_msg_len) {
+        return false;
+    }
+    if (out_error_msg) {
+        *out_error_msg = (resp->error_msg_len > 0)
+                             ? ((const char *)resp + sizeof(waywal_ipc_resp_wwpkg_install_t))
+                             : NULL;
+    }
+    return true;
+}
+
+bool waywal_ipc_serialize_resp_wwpkg_install(const uint8_t package_uuid[16], uint32_t status_code,
+                                             const char *error_msg, waywal_ipc_hdr_t *out_hdr,
+                                             waywal_ipc_resp_wwpkg_install_t *out_resp,
+                                             void *out_buf, size_t out_buf_cap,
+                                             size_t *out_total_len)
+{
+    if (!out_hdr) {
+        return false;
+    }
+    size_t err_len = (status_code != 0 && error_msg) ? strlen(error_msg) : 0;
+    size_t total_len = sizeof(waywal_ipc_resp_wwpkg_install_t) + err_len;
+    if (out_total_len) {
+        *out_total_len = total_len;
+    }
+    out_hdr->magic = WAYWAL_IPC_MAGIC;
+    out_hdr->version = WAYWAL_IPC_VERSION;
+    out_hdr->opcode = WAYWAL_RESP_WWPKG_INSTALL;
+    out_hdr->payload_size = total_len;
+
+    if (out_resp) {
+        memset(out_resp, 0, sizeof(*out_resp));
+        if (package_uuid) {
+            memcpy(out_resp->package_uuid, package_uuid, 16);
+        }
+        out_resp->status_code = status_code;
+        out_resp->error_msg_len = (uint32_t)err_len;
+    }
+    if (out_buf) {
+        if (out_buf_cap < total_len) {
+            return false;
+        }
+        waywal_ipc_resp_wwpkg_install_t *hdr_part = (waywal_ipc_resp_wwpkg_install_t *)out_buf;
+        memset(hdr_part, 0, sizeof(*hdr_part));
+        if (package_uuid) {
+            memcpy(hdr_part->package_uuid, package_uuid, 16);
+        }
+        hdr_part->status_code = status_code;
+        hdr_part->error_msg_len = (uint32_t)err_len;
+        if (err_len > 0) {
+            memcpy((char *)out_buf + sizeof(*hdr_part), error_msg, err_len);
+        }
+    }
+    return true;
+}
+
+bool waywal_ipc_validate_req_scan_compat(const waywal_ipc_req_scan_compat_t *req,
+                                         size_t payload_size)
+{
+    if (!req || payload_size != sizeof(waywal_ipc_req_scan_compat_t)) {
+        return false;
+    }
+    if (!memchr(req->target_path, '\0', sizeof(req->target_path))) {
+        return false;
+    }
+    return true;
+}
+
+bool waywal_ipc_serialize_req_scan_compat(const char *target_path, uint32_t auto_repair_flags,
+                                          waywal_ipc_hdr_t *out_hdr,
+                                          waywal_ipc_req_scan_compat_t *out_req)
+{
+    if (!out_hdr || !out_req) {
+        return false;
+    }
+    memset(out_req, 0, sizeof(*out_req));
+    if (target_path) {
+        strncpy(out_req->target_path, target_path, sizeof(out_req->target_path) - 1);
+    }
+    out_req->auto_repair_flags = auto_repair_flags;
+    out_hdr->magic = WAYWAL_IPC_MAGIC;
+    out_hdr->version = WAYWAL_IPC_VERSION;
+    out_hdr->opcode = WAYWAL_REQ_SCAN_COMPAT;
+    out_hdr->payload_size = sizeof(waywal_ipc_req_scan_compat_t);
+    return true;
+}
+
+bool waywal_ipc_validate_resp_scan_compat(const waywal_ipc_resp_scan_compat_t *resp,
+                                          size_t payload_size)
+{
+    if (!resp || payload_size != sizeof(waywal_ipc_resp_scan_compat_t)) {
+        return false;
+    }
+    if (!memchr(resp->report_json_path, '\0', sizeof(resp->report_json_path))) {
+        return false;
+    }
+    return true;
+}
+
+bool waywal_ipc_serialize_resp_scan_compat(uint32_t status_code, uint32_t compat_tier,
+                                           uint32_t compat_score, uint32_t total_issues,
+                                           uint32_t repairs_applied, float estimated_vram_mb,
+                                           uint32_t estimated_fps, const char *report_json_path,
+                                           waywal_ipc_hdr_t *out_hdr,
+                                           waywal_ipc_resp_scan_compat_t *out_resp)
+{
+    if (!out_hdr || !out_resp) {
+        return false;
+    }
+    memset(out_resp, 0, sizeof(*out_resp));
+    out_resp->status_code = status_code;
+    out_resp->compat_tier = compat_tier;
+    out_resp->compat_score = compat_score;
+    out_resp->total_issues = total_issues;
+    out_resp->repairs_applied = repairs_applied;
+    out_resp->estimated_vram_mb = estimated_vram_mb;
+    out_resp->estimated_fps = estimated_fps;
+    if (report_json_path) {
+        strncpy(out_resp->report_json_path, report_json_path,
+                sizeof(out_resp->report_json_path) - 1);
+    }
+    out_hdr->magic = WAYWAL_IPC_MAGIC;
+    out_hdr->version = WAYWAL_IPC_VERSION;
+    out_hdr->opcode = WAYWAL_RESP_SCAN_COMPAT;
+    out_hdr->payload_size = sizeof(waywal_ipc_resp_scan_compat_t);
+    return true;
+}

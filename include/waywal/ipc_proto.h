@@ -63,6 +63,14 @@ typedef enum : uint16_t {
     WAYWAL_IPC_OP_GET_TELEMETRY = WAYWAL_REQ_GET_TELEMETRY,
     WAYWAL_REQ_EXPORT_OUTPUT_DMABUF = 0x0018,
     WAYWAL_IPC_OP_EXPORT_OUTPUT_DMABUF = WAYWAL_REQ_EXPORT_OUTPUT_DMABUF,
+    WAYWAL_REQ_WORKSHOP_SYNC = 0x0019u,
+    WAYWAL_IPC_OP_WORKSHOP_SYNC = WAYWAL_REQ_WORKSHOP_SYNC,
+    WAYWAL_REQ_WORKSHOP_DOWNLOAD = 0x001Au,
+    WAYWAL_IPC_OP_WORKSHOP_DOWNLOAD = WAYWAL_REQ_WORKSHOP_DOWNLOAD,
+    WAYWAL_REQ_WWPKG_INSTALL = 0x001Bu,
+    WAYWAL_IPC_OP_WWPKG_INSTALL = WAYWAL_REQ_WWPKG_INSTALL,
+    WAYWAL_REQ_SCAN_COMPAT = 0x001Cu,
+    WAYWAL_IPC_OP_SCAN_COMPAT = WAYWAL_REQ_SCAN_COMPAT,
 
     WAYWAL_RESP_OK = 0x8001,
     WAYWAL_RESP_PONG = 0x8002,
@@ -71,8 +79,21 @@ typedef enum : uint16_t {
     WAYWAL_RESP_EVENT = 0x8005,
     WAYWAL_RESP_TELEMETRY = 0x8006,
     WAYWAL_RESP_DMABUF = 0x8007,
+    WAYWAL_RESP_WORKSHOP_SYNC = 0x8008u,
+    WAYWAL_RESP_WORKSHOP_DOWNLOAD = 0x8009u,
+    WAYWAL_RESP_WWPKG_INSTALL = 0x800Au,
+    WAYWAL_RESP_SCAN_COMPAT = 0x800Bu,
 } waywal_opcode_t;
 typedef waywal_opcode_t waywal_ipc_op_t;
+
+#define WAYWAL_REQ_WORKSHOP_SYNC      WAYWAL_REQ_WORKSHOP_SYNC
+#define WAYWAL_RESP_WORKSHOP_SYNC     WAYWAL_RESP_WORKSHOP_SYNC
+#define WAYWAL_REQ_WORKSHOP_DOWNLOAD  WAYWAL_REQ_WORKSHOP_DOWNLOAD
+#define WAYWAL_RESP_WORKSHOP_DOWNLOAD WAYWAL_RESP_WORKSHOP_DOWNLOAD
+#define WAYWAL_REQ_WWPKG_INSTALL      WAYWAL_REQ_WWPKG_INSTALL
+#define WAYWAL_RESP_WWPKG_INSTALL     WAYWAL_RESP_WWPKG_INSTALL
+#define WAYWAL_REQ_SCAN_COMPAT        WAYWAL_REQ_SCAN_COMPAT
+#define WAYWAL_RESP_SCAN_COMPAT       WAYWAL_RESP_SCAN_COMPAT
 
 #pragma pack(push, 1)
 typedef struct {
@@ -407,7 +428,161 @@ static_assert(sizeof(waywal_export_dmabuf_resp_t) == 128,
 typedef waywal_export_dmabuf_resp_t waywal_dmabuf_export_resp_t;
 typedef waywal_export_dmabuf_resp_t waywal_dmabuf_frame_desc_t;
 
+/* WAYWAL_REQ_WORKSHOP_SYNC (0x0019) */
+#define WAYWAL_WORKSHOP_SYNC_FLAG_FORCE_RESCAN 0x0001u
+#define WAYWAL_WORKSHOP_SYNC_FLAG_PURGE_STALE  0x0002u
+
+typedef struct {
+    uint32_t flags; /* 0x1 = Force re-scan, 0x2 = Purge stale cache */
+    char custom_root[1024];
+} waywal_ipc_req_workshop_sync_t;
+static_assert(sizeof(waywal_ipc_req_workshop_sync_t) == 1028, "Must be 1028 bytes");
+
+/* WAYWAL_RESP_WORKSHOP_SYNC (0x8008) */
+typedef struct {
+    uint32_t status_code; /* 0 = OK */
+    uint32_t total_libraries_found;
+    uint32_t total_items_indexed;
+    uint32_t
+        _reserved; /* Explicit padding to naturally 8-byte align total_size_bytes at offset 16 */
+    uint64_t total_size_bytes;
+} waywal_ipc_resp_workshop_sync_t;
+static_assert(sizeof(waywal_ipc_resp_workshop_sync_t) == 24,
+              "Must be 24 bytes with 8-byte aligned total_size_bytes");
+static_assert(offsetof(waywal_ipc_resp_workshop_sync_t, total_size_bytes) == 16,
+              "total_size_bytes must be at offset 16");
+
+/* WAYWAL_REQ_WORKSHOP_DOWNLOAD (0x001A) */
+#define WAYWAL_DOWNLOAD_BACKEND_AUTO     0u
+#define WAYWAL_DOWNLOAD_BACKEND_STEAMAPI 1u
+#define WAYWAL_DOWNLOAD_BACKEND_WEBAPI   2u
+#define WAYWAL_DOWNLOAD_BACKEND_STEAMCMD 3u
+
+typedef struct {
+    uint64_t published_file_id;
+    uint32_t priority;          /* TaskPriority */
+    uint32_t preferred_backend; /* 0=Auto, 1=SteamAPI, 2=WebAPI, 3=steamcmd */
+} waywal_ipc_req_workshop_download_t;
+static_assert(sizeof(waywal_ipc_req_workshop_download_t) == 16, "Must be 16 bytes");
+
+/* WAYWAL_RESP_WORKSHOP_DOWNLOAD (0x8009) */
+typedef struct {
+    uint64_t published_file_id;
+    uint32_t task_state; /* TaskState */
+    float progress_pct;
+    float speed_bytes_per_sec;
+    uint32_t eta_seconds;
+    char error_msg[256];
+} waywal_ipc_resp_workshop_download_t;
+static_assert(sizeof(waywal_ipc_resp_workshop_download_t) == 280, "Must be 280 bytes");
+
+/* WAYWAL_REQ_WWPKG_INSTALL (0x001B) */
+#define WAYWAL_WWPKG_INSTALL_FLAG_VERIFY_ONLY     0x0001u
+#define WAYWAL_WWPKG_INSTALL_FLAG_FORCE_OVERWRITE 0x0002u
+#define WAYWAL_WWPKG_INSTALL_FLAG_AUTO_APPLY      0x0004u
+
+typedef struct {
+    uint8_t package_uuid[16];
+    uint32_t flags; /* 0x1 = Verify only, 0x2 = Force overwrite, 0x4 = Auto-apply */
+    uint32_t target_output_len;
+    /* target_output_len bytes of UTF-8 output name follow immediately */
+} waywal_ipc_req_wwpkg_install_t;
+static_assert(sizeof(waywal_ipc_req_wwpkg_install_t) == 24, "Must be 24 bytes header");
+
+/* WAYWAL_RESP_WWPKG_INSTALL (0x800A) */
+typedef struct {
+    uint8_t package_uuid[16];
+    uint32_t status_code; /* 0 = OK, non-zero = error */
+    uint32_t error_msg_len;
+    /* error_msg_len bytes of UTF-8 error message follow if status_code != 0 */
+} waywal_ipc_resp_wwpkg_install_t;
+static_assert(sizeof(waywal_ipc_resp_wwpkg_install_t) == 24, "Must be 24 bytes header");
+
+/* WAYWAL_REQ_SCAN_COMPAT (0x001C) */
+#define WAYWAL_SCAN_COMPAT_FLAG_APPLY_REPAIRS 0x0001u
+
+typedef struct {
+    char target_path[1024];
+    uint32_t auto_repair_flags; /* 0x1 = Apply repairs to cache */
+} waywal_ipc_req_scan_compat_t;
+static_assert(sizeof(waywal_ipc_req_scan_compat_t) == 1028, "Must be 1028 bytes");
+
+/* WAYWAL_RESP_SCAN_COMPAT (0x800B) */
+typedef struct {
+    uint32_t status_code;
+    uint32_t compat_tier;  /* we_compat_tier_t */
+    uint32_t compat_score; /* 0 .. 100 */
+    uint32_t total_issues;
+    uint32_t repairs_applied;
+    float estimated_vram_mb;
+    uint32_t estimated_fps;
+    char report_json_path[1024];
+} waywal_ipc_resp_scan_compat_t;
+static_assert(sizeof(waywal_ipc_resp_scan_compat_t) == 1052, "Must be 1052 bytes");
+
 #pragma pack(pop)
+
+/* ========================================================================= */
+/* Workshop, Open Hub & Compatibility IPC Serialization Helpers             */
+/* ========================================================================= */
+
+bool waywal_ipc_validate_req_workshop_sync(const waywal_ipc_req_workshop_sync_t *req,
+                                           size_t payload_size);
+bool waywal_ipc_serialize_req_workshop_sync(uint32_t flags, const char *custom_root,
+                                            waywal_ipc_hdr_t *out_hdr,
+                                            waywal_ipc_req_workshop_sync_t *out_req);
+
+bool waywal_ipc_validate_resp_workshop_sync(const waywal_ipc_resp_workshop_sync_t *resp,
+                                            size_t payload_size);
+bool waywal_ipc_serialize_resp_workshop_sync(uint32_t status_code, uint32_t total_libraries_found,
+                                             uint32_t total_items_indexed,
+                                             uint64_t total_size_bytes, waywal_ipc_hdr_t *out_hdr,
+                                             waywal_ipc_resp_workshop_sync_t *out_resp);
+
+bool waywal_ipc_validate_req_workshop_download(const waywal_ipc_req_workshop_download_t *req,
+                                               size_t payload_size);
+bool waywal_ipc_serialize_req_workshop_download(uint64_t published_file_id, uint32_t priority,
+                                                uint32_t preferred_backend,
+                                                waywal_ipc_hdr_t *out_hdr,
+                                                waywal_ipc_req_workshop_download_t *out_req);
+
+bool waywal_ipc_validate_resp_workshop_download(const waywal_ipc_resp_workshop_download_t *resp,
+                                                size_t payload_size);
+bool waywal_ipc_serialize_resp_workshop_download(uint64_t published_file_id, uint32_t task_state,
+                                                 float progress_pct, float speed_bytes_per_sec,
+                                                 uint32_t eta_seconds, const char *error_msg,
+                                                 waywal_ipc_hdr_t *out_hdr,
+                                                 waywal_ipc_resp_workshop_download_t *out_resp);
+
+bool waywal_ipc_validate_req_wwpkg_install(const waywal_ipc_req_wwpkg_install_t *req,
+                                           size_t payload_size, const char **out_target_output);
+bool waywal_ipc_serialize_req_wwpkg_install(const uint8_t package_uuid[16], uint32_t flags,
+                                            const char *target_output, waywal_ipc_hdr_t *out_hdr,
+                                            waywal_ipc_req_wwpkg_install_t *out_req, void *out_buf,
+                                            size_t out_buf_cap, size_t *out_total_len);
+
+bool waywal_ipc_validate_resp_wwpkg_install(const waywal_ipc_resp_wwpkg_install_t *resp,
+                                            size_t payload_size, const char **out_error_msg);
+bool waywal_ipc_serialize_resp_wwpkg_install(const uint8_t package_uuid[16], uint32_t status_code,
+                                             const char *error_msg, waywal_ipc_hdr_t *out_hdr,
+                                             waywal_ipc_resp_wwpkg_install_t *out_resp,
+                                             void *out_buf, size_t out_buf_cap,
+                                             size_t *out_total_len);
+
+bool waywal_ipc_validate_req_scan_compat(const waywal_ipc_req_scan_compat_t *req,
+                                         size_t payload_size);
+bool waywal_ipc_serialize_req_scan_compat(const char *target_path, uint32_t auto_repair_flags,
+                                          waywal_ipc_hdr_t *out_hdr,
+                                          waywal_ipc_req_scan_compat_t *out_req);
+
+bool waywal_ipc_validate_resp_scan_compat(const waywal_ipc_resp_scan_compat_t *resp,
+                                          size_t payload_size);
+bool waywal_ipc_serialize_resp_scan_compat(uint32_t status_code, uint32_t compat_tier,
+                                           uint32_t compat_score, uint32_t total_issues,
+                                           uint32_t repairs_applied, float estimated_vram_mb,
+                                           uint32_t estimated_fps, const char *report_json_path,
+                                           waywal_ipc_hdr_t *out_hdr,
+                                           waywal_ipc_resp_scan_compat_t *out_resp);
 
 /* Resolves runtime socket path: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY-wwald.<namespace>.sock */
 bool waywal_ipc_resolve_socket_path(path_buf_t *out_path, const char *namespace_str);

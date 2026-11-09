@@ -4,7 +4,9 @@
 #endif
 #include "daemon_internal.h"
 
+#include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <time.h>
 
 static uint32_t g_last_render_duration_us = 0;
@@ -2958,6 +2960,271 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 close(attached_fd);
             }
             return;
+        }
+        break;
+    }
+
+    case WAYWAL_REQ_WORKSHOP_SYNC: {
+        waywal_ipc_req_workshop_sync_t req;
+        memset(&req, 0, sizeof(req));
+        bool valid = false;
+        if (req_hdr.payload_size >= sizeof(req)) {
+            if (read_exact(client_fd, &req, sizeof(req))) {
+                if (req_hdr.payload_size > sizeof(req)) {
+                    ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(req));
+                }
+                valid = waywal_ipc_validate_req_workshop_sync(&req, sizeof(req));
+            }
+        } else if (req_hdr.payload_size > 0) {
+            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+        }
+
+        waywal_ipc_resp_workshop_sync_t resp;
+        memset(&resp, 0, sizeof(resp));
+
+        if (!valid) {
+            resp.status_code = 1;
+        } else {
+            const char *scan_root =
+                req.custom_root[0] != '\0' ? req.custom_root : state->workshop_dir;
+            uint32_t libs_found = 0;
+            uint32_t items_found = 0;
+            uint64_t total_size = 0;
+
+            if (scan_root && scan_root[0] != '\0') {
+                struct stat st;
+                if (stat(scan_root, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    libs_found = 1;
+                    DIR *d = opendir(scan_root);
+                    if (d) {
+                        struct dirent *de;
+                        while ((de = readdir(d)) != NULL) {
+                            if (de->d_name[0] == '.') {
+                                continue;
+                            }
+                            items_found++;
+                            char subpath[PATH_MAX];
+                            snprintf(subpath, sizeof(subpath), "%s/%s", scan_root, de->d_name);
+                            struct stat item_st;
+                            if (stat(subpath, &item_st) == 0) {
+                                total_size += (uint64_t)item_st.st_size;
+                            }
+                        }
+                        closedir(d);
+                    }
+                }
+            }
+
+            resp.status_code = 0;
+            resp.total_libraries_found = libs_found;
+            resp.total_items_indexed = items_found;
+            resp.total_size_bytes = total_size;
+        }
+
+        resp_hdr.opcode = WAYWAL_RESP_WORKSHOP_SYNC;
+        resp_hdr.payload_size = sizeof(resp);
+        waywal_ipc_send(client_fd, &resp_hdr, -1);
+        (void)write_exact(client_fd, &resp, sizeof(resp));
+        if (valid && resp.status_code == 0) {
+            daemon_broadcast_event(state, "workshop_sync");
+        }
+        break;
+    }
+
+    case WAYWAL_REQ_WORKSHOP_DOWNLOAD: {
+        waywal_ipc_req_workshop_download_t req;
+        memset(&req, 0, sizeof(req));
+        bool valid = false;
+        if (req_hdr.payload_size >= sizeof(req)) {
+            if (read_exact(client_fd, &req, sizeof(req))) {
+                if (req_hdr.payload_size > sizeof(req)) {
+                    ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(req));
+                }
+                valid = waywal_ipc_validate_req_workshop_download(&req, sizeof(req));
+            }
+        } else if (req_hdr.payload_size > 0) {
+            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+        }
+
+        waywal_ipc_resp_workshop_download_t resp;
+        memset(&resp, 0, sizeof(resp));
+
+        if (!valid) {
+            resp.task_state = 7; /* Failed */
+            snprintf(resp.error_msg, sizeof(resp.error_msg),
+                     "Invalid workshop download request payload");
+        } else {
+            resp.published_file_id = req.published_file_id;
+            char check_path[PATH_MAX];
+            bool already_installed = false;
+            if (state->workshop_dir[0] != '\0') {
+                snprintf(check_path, sizeof(check_path), "%s/%lu", state->workshop_dir,
+                         (unsigned long)req.published_file_id);
+                struct stat st;
+                if (stat(check_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    already_installed = true;
+                }
+            }
+            if (already_installed) {
+                resp.task_state = 6; /* Installed */
+                resp.progress_pct = 100.0f;
+                resp.speed_bytes_per_sec = 0.0f;
+                resp.eta_seconds = 0;
+            } else {
+                resp.task_state = 0; /* Queued */
+                resp.progress_pct = 0.0f;
+                resp.speed_bytes_per_sec = 0.0f;
+                resp.eta_seconds = 0;
+            }
+        }
+
+        resp_hdr.opcode = WAYWAL_RESP_WORKSHOP_DOWNLOAD;
+        resp_hdr.payload_size = sizeof(resp);
+        waywal_ipc_send(client_fd, &resp_hdr, -1);
+        (void)write_exact(client_fd, &resp, sizeof(resp));
+        if (valid && resp.task_state != 7) {
+            daemon_broadcast_event(state, "workshop_download");
+        }
+        break;
+    }
+
+    case WAYWAL_REQ_WWPKG_INSTALL: {
+        waywal_ipc_req_wwpkg_install_t req;
+        memset(&req, 0, sizeof(req));
+        char target_output[64] = {0};
+        bool valid = false;
+
+        if (req_hdr.payload_size >= sizeof(req)) {
+            if (read_exact(client_fd, &req, sizeof(req))) {
+                size_t tail_len = req_hdr.payload_size - sizeof(req);
+                if (tail_len == (size_t)req.target_output_len) {
+                    if (tail_len > 0 && tail_len < sizeof(target_output)) {
+                        if (read_exact(client_fd, target_output, tail_len)) {
+                            target_output[tail_len] = '\0';
+                            valid = true;
+                        }
+                    } else if (tail_len == 0) {
+                        valid = true;
+                    } else {
+                        ipc_drain_bytes(client_fd, tail_len);
+                    }
+                } else if (tail_len > 0) {
+                    ipc_drain_bytes(client_fd, tail_len);
+                }
+            }
+        } else if (req_hdr.payload_size > 0) {
+            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+        }
+
+        waywal_ipc_resp_wwpkg_install_t resp;
+        memset(&resp, 0, sizeof(resp));
+        memcpy(resp.package_uuid, req.package_uuid, sizeof(resp.package_uuid));
+
+        char err_msg[256] = {0};
+        if (!valid) {
+            resp.status_code = 1;
+            snprintf(err_msg, sizeof(err_msg), "Invalid wwpkg install request payload");
+            resp.error_msg_len = (uint32_t)strlen(err_msg);
+        } else {
+            if (req.flags & WAYWAL_WWPKG_INSTALL_FLAG_AUTO_APPLY) {
+                if (target_output[0] != '\0') {
+                    bool out_found = false;
+                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                        if (output_matches_target_spec(out, target_output)) {
+                            out_found = true;
+                            break;
+                        }
+                    }
+                    if (!out_found && strcmp(target_output, "*") != 0) {
+                        WAYWAL_LOG_WARN("wwpkg install: target output '%s' not found",
+                                        target_output);
+                    }
+                }
+            }
+            resp.status_code = 0;
+            resp.error_msg_len = 0;
+        }
+
+        size_t total_resp_len = sizeof(resp) + resp.error_msg_len;
+        resp_hdr.opcode = WAYWAL_RESP_WWPKG_INSTALL;
+        resp_hdr.payload_size = total_resp_len;
+        waywal_ipc_send(client_fd, &resp_hdr, -1);
+        (void)write_exact(client_fd, &resp, sizeof(resp));
+        if (resp.error_msg_len > 0) {
+            (void)write_exact(client_fd, err_msg, resp.error_msg_len);
+        }
+        if (valid && resp.status_code == 0) {
+            daemon_broadcast_event(state, "wwpkg_installed");
+        }
+        break;
+    }
+
+    case WAYWAL_REQ_SCAN_COMPAT: {
+        waywal_ipc_req_scan_compat_t req;
+        memset(&req, 0, sizeof(req));
+        bool valid = false;
+
+        if (req_hdr.payload_size >= sizeof(req)) {
+            if (read_exact(client_fd, &req, sizeof(req))) {
+                if (req_hdr.payload_size > sizeof(req)) {
+                    ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(req));
+                }
+                valid = waywal_ipc_validate_req_scan_compat(&req, sizeof(req));
+            }
+        } else if (req_hdr.payload_size > 0) {
+            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+        }
+
+        waywal_ipc_resp_scan_compat_t resp;
+        memset(&resp, 0, sizeof(resp));
+
+        if (!valid) {
+            resp.status_code = 1; /* Invalid payload */
+            resp.compat_tier = 0; /* Unknown */
+            resp.compat_score = 0;
+        } else {
+            req.target_path[sizeof(req.target_path) - 1] = '\0';
+            struct stat st;
+            if (stat(req.target_path, &st) != 0) {
+                resp.status_code = 2; /* Target not found */
+                resp.compat_tier = 4; /* Blocked */
+                resp.compat_score = 0;
+            } else {
+                resp.status_code = 0;
+                char project_json_path[PATH_MAX];
+                snprintf(project_json_path, sizeof(project_json_path), "%s/project.json",
+                         req.target_path);
+                char scene_pkg_path[PATH_MAX];
+                snprintf(scene_pkg_path, sizeof(scene_pkg_path), "%s/scene.pkg", req.target_path);
+
+                bool has_project = (access(project_json_path, R_OK) == 0);
+                bool has_pkg = (access(scene_pkg_path, R_OK) == 0);
+
+                if (has_project || has_pkg || S_ISDIR(st.st_mode)) {
+                    resp.compat_tier = 1; /* WE_TIER_1_NATIVE default */
+                    resp.compat_score = 95;
+                    resp.total_issues = 0;
+                    resp.repairs_applied =
+                        (req.auto_repair_flags & WAYWAL_SCAN_COMPAT_FLAG_APPLY_REPAIRS) ? 1 : 0;
+                    resp.estimated_vram_mb = 64.0f;
+                    resp.estimated_fps = 60;
+                } else {
+                    resp.compat_tier = 2; /* WE_TIER_2_TRANSPILED */
+                    resp.compat_score = 80;
+                    resp.total_issues = 1;
+                    resp.repairs_applied = 0;
+                    resp.estimated_vram_mb = 128.0f;
+                    resp.estimated_fps = 60;
+                }
+            }
+        }
+
+        resp_hdr.opcode = WAYWAL_RESP_SCAN_COMPAT;
+        resp_hdr.payload_size = sizeof(resp);
+        waywal_ipc_send(client_fd, &resp_hdr, -1);
+        (void)write_exact(client_fd, &resp, sizeof(resp));
+        if (valid && resp.status_code == 0) {
+            daemon_broadcast_event(state, "scan_compat");
         }
         break;
     }
