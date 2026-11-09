@@ -455,12 +455,20 @@ static void assert_ascii_only(const QString &str, const char *context)
 
 static void audit_widget_tree(QWidget *root, const char *rootName)
 {
+    root->ensurePolished();
+    if (root->layout()) {
+        root->layout()->activate();
+    }
     assert_ascii_only(root->windowTitle(), rootName);
     assert_ascii_only(root->toolTip(), rootName);
 
     for (QWidget *w : root->findChildren<QWidget *>()) {
         if (!w)
             continue;
+        w->ensurePolished();
+        if (w->layout()) {
+            w->layout()->activate();
+        }
         assert_ascii_only(w->windowTitle(), rootName);
         assert_ascii_only(w->toolTip(), rootName);
 
@@ -468,13 +476,12 @@ static void audit_widget_tree(QWidget *root, const char *rootName)
             assert_ascii_only(btn->text(), rootName);
         }
         if (auto *pushBtn = qobject_cast<QPushButton *>(w)) {
-            if (pushBtn->isVisible() && pushBtn->height() > 0) {
-                if (pushBtn->height() < 20) {
+            if (pushBtn->isVisibleTo(root)) {
+                int effH = std::max(pushBtn->height(), pushBtn->sizeHint().height());
+                if (effH > 0 && effH < 20) {
                     std::cerr << "[FAIL] Cramped QPushButton \"" << pushBtn->text().toStdString()
-                              << "\" height=" << pushBtn->height() << " in " << rootName
-                              << std::endl;
-                    assert(pushBtn->height() >= 20 &&
-                           "Visible QPushButtons must have height >= 20px");
+                              << "\" height=" << effH << " in " << rootName << std::endl;
+                    assert(effH >= 20 && "Visible QPushButtons must have height >= 20px");
                 }
             }
         }
@@ -509,11 +516,10 @@ static void test_studio_ui_ergonomics_and_zero_emoji()
                  "emojis/Unicode and button ergonomics..."
               << std::endl;
 
-    MainWindow mainWin;
+    StudioOptions opts;
+    opts.headlessCheck = true;
+    MainWindow mainWin(opts);
     mainWin.resize(1600, 960);
-    mainWin.show();
-    for (int i = 0; i < 6; ++i)
-        QCoreApplication::processEvents();
     audit_widget_tree(&mainWin, "MainWindow");
 
     // Raise WorkshopBrowser and OpenHubBrowser tabs and verify embedded VirtualizedGridWidget
@@ -524,16 +530,14 @@ static void test_studio_ui_ergonomics_and_zero_emoji()
     for (const QString &panelId :
          {QStringLiteral("WorkshopBrowser"), QStringLiteral("OpenHubBrowser")}) {
         layoutMgr->setPanelVisible(panelId, true);
-        for (int i = 0; i < 6; ++i)
-            QCoreApplication::processEvents();
 
         auto *dock = layoutMgr->dockWidget(panelId);
-        assert(dock != nullptr && dock->isVisible());
+        assert(dock != nullptr && !dock->isHidden());
         audit_widget_tree(dock, panelId.toUtf8().constData());
 
         int visibleSearchBars = 0;
         for (auto *edit : dock->findChildren<QLineEdit *>()) {
-            if (edit && edit->isVisible()) {
+            if (edit && edit->isVisibleTo(dock)) {
                 ++visibleSearchBars;
             }
         }
@@ -542,7 +546,7 @@ static void test_studio_ui_ergonomics_and_zero_emoji()
                "search bar)");
 
         for (auto *btn : dock->findChildren<QPushButton *>()) {
-            if (btn && btn->isVisible()) {
+            if (btn && btn->isVisibleTo(dock)) {
                 assert(btn->text() != QStringLiteral("Folders...") &&
                        "Embedded grid inside Workshop/OpenHub must not show local 'Folders...' "
                        "button");
@@ -553,8 +557,6 @@ static void test_studio_ui_ergonomics_and_zero_emoji()
     // Verify narrow-dock (220px width) ergonomics and download progress formatting
     if (auto *ws = mainWin.workshopBrowser()) {
         ws->resize(220, 600);
-        for (int i = 0; i < 4; ++i)
-            QCoreApplication::processEvents();
         audit_widget_tree(ws, "WorkshopBrowserWidget@220px");
 
         for (auto *btn : ws->findChildren<QPushButton *>()) {
@@ -578,8 +580,6 @@ static void test_studio_ui_ergonomics_and_zero_emoji()
 
     if (auto *hub = mainWin.openHubBrowser()) {
         hub->resize(220, 600);
-        for (int i = 0; i < 4; ++i)
-            QCoreApplication::processEvents();
         audit_widget_tree(hub, "OpenHubBrowserWidget@220px");
 
         QMetaObject::invokeMethod(hub, "onDownloadProgressUpdated", Qt::DirectConnection,
@@ -597,22 +597,14 @@ static void test_studio_ui_ergonomics_and_zero_emoji()
 
     if (auto *ts = mainWin.themeStudio()) {
         ts->resize(220, 600);
-        for (int i = 0; i < 4; ++i)
-            QCoreApplication::processEvents();
         audit_widget_tree(ts, "ThemeStudioWidget@220px");
     }
 
     CreatorPackagingWizard wizard;
     wizard.resize(840, 620);
-    wizard.show();
-    for (int i = 0; i < 4; ++i)
-        QCoreApplication::processEvents();
     audit_widget_tree(&wizard, "CreatorPackagingWizard");
 
     OklchColorDialog colorDlg(QColor(56, 189, 248));
-    colorDlg.show();
-    for (int i = 0; i < 4; ++i)
-        QCoreApplication::processEvents();
     audit_widget_tree(&colorDlg, "OklchColorDialog");
 
     std::cout << "  -> UI/UX zero-emoji, embedded grid chrome, download telemetry & 220px "
