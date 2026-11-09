@@ -552,7 +552,7 @@ static void test_vaapi_decoder_and_prime_export(void)
 {
     printf("[TEST] Running test_vaapi_decoder_and_prime_export...\n");
 
-    vaapi_decoder_t dec;
+    vaapi_decoder_t dec = {0};
     bool init_ok = vaapi_decoder_init(&dec, -1, WAYWAL_CODEC_H264, 1920, 1080);
     if (!init_ok) {
         printf("  [SKIPPED] Hardware VA-API not available or DRM node inaccessible\n");
@@ -632,7 +632,7 @@ static void test_vaapi_decoder_and_prime_export(void)
     if (!real_demux)
         real_demux = demuxer_open_file("tests/test_video.mp4");
     if (real_demux) {
-        vaapi_decoder_t vpp_dec;
+        vaapi_decoder_t vpp_dec = {0};
         bool vpp_init_ok = vaapi_decoder_init_with_params(
             &vpp_dec, -1, real_demux->codec, real_demux->width, real_demux->height,
             real_demux->extradata, real_demux->extradata_size, false);
@@ -744,7 +744,7 @@ static void test_vaapi_decoder_and_prime_export(void)
         vaapi_decoder_destroy(&vpp_dec);
         real_demux->seek_us(real_demux, 0);
 
-        vaapi_decoder_t opt_dec;
+        vaapi_decoder_t opt_dec = {0};
         bool opt_ok = vaapi_decoder_init_with_params(
             &opt_dec, -1, real_demux->codec, real_demux->width, real_demux->height,
             real_demux->extradata, real_demux->extradata_size, true);
@@ -771,7 +771,7 @@ static void test_vaapi_decoder_and_prime_export(void)
         /* Stress rapid back-to-back VA-API context init + decode + destroy cycles */
         for (int cycle = 0; cycle < 4; ++cycle) {
             real_demux->seek_us(real_demux, 0);
-            vaapi_decoder_t cyc_dec;
+            vaapi_decoder_t cyc_dec = {0};
             assert(vaapi_decoder_init_with_params(
                 &cyc_dec, -1, real_demux->codec, real_demux->width, real_demux->height,
                 real_demux->extradata, real_demux->extradata_size, true));

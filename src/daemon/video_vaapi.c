@@ -122,7 +122,9 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
 {
     if (!dec || width == 0 || height == 0)
         return false;
-    bool saved_allow_direct_p010 = dec->allow_direct_p010;
+    uint8_t raw_p010 = 0;
+    memcpy(&raw_p010, &dec->allow_direct_p010, sizeof(raw_p010));
+    bool saved_allow_direct_p010 = allow_direct_nv12 && (raw_p010 == 1);
     memset(dec, 0, sizeof(*dec));
     dec->allow_direct_p010 = saved_allow_direct_p010;
     dec->width = width;
