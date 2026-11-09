@@ -130,7 +130,7 @@ static void test_100_package_synthetic_matrix(we_compat_scanner_t *scanner)
     int count_tier3 = 0;
     int count_tier4 = 0;
 
-    constexpr int TOTAL_PACKAGES = 100;
+    const int TOTAL_PACKAGES = 100;
     we_compat_report_t *rep = we_compat_report_alloc();
 
     for (int i = 0; i < TOTAL_PACKAGES; ++i) {

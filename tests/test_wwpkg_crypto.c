@@ -211,7 +211,7 @@ static void test_decompression_benchmark(const char *pkg_path)
 {
     printf("[WWPKG 5/6] Benchmarking cold-start package opening & decompression speed...\n");
 
-    constexpr int ITERATIONS = 100;
+    const int ITERATIONS = 100;
     struct timespec ts_start, ts_end;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 

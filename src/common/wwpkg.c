@@ -446,14 +446,14 @@ static const gf gf0 = {0};
 static const gf gf1 = {1};
 static const gf D = {0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070,
                      0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203};
-static const gf D2 = {0xf146, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0,
-                      0xd130, 0xef73, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406};
+static const gf D2 = {0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0,
+                      0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406};
 static const gf X = {0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c,
                      0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169};
 static const gf Y = {0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
                      0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666};
-static const gf I = {0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xa45d, 0x344d, 0xd00f,
-                     0x7c69, 0x8820, 0x9cc5, 0x6504, 0x77e0, 0x41e5, 0x16be, 0x2b83};
+static const gf I = {0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43,
+                     0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83};
 
 static const uint8_t L25519[32] = {0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7,
                                    0xa2, 0xde, 0xf9, 0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -472,17 +472,17 @@ static void car25519(gf o)
         o[i] += (1LL << 16);
         int64_t c = o[i] >> 16;
         o[(i + 1) * (i < 15)] += c - 1 + 37 * (c - 1) * (i == 15);
-        o[i] -= c << 16;
+        o[i] -= (int64_t)((uint64_t)c << 16);
     }
 }
 
 static void sel25519(gf p, gf q, int b)
 {
-    int64_t c = ~(b - 1);
+    uint64_t c = ~(uint64_t)(b - 1);
     for (int i = 0; i < 16; i++) {
-        int64_t t = c & (p[i] ^ q[i]);
-        p[i] ^= t;
-        q[i] ^= t;
+        uint64_t t = c & ((uint64_t)p[i] ^ (uint64_t)q[i]);
+        p[i] ^= (int64_t)t;
+        q[i] ^= (int64_t)t;
     }
 }
 
@@ -676,12 +676,13 @@ static void modL(uint8_t *r, int64_t x[64])
 {
     for (int i = 63; i >= 32; i--) {
         int64_t carry = 0;
-        for (int j = i - 32; j < i - 12; j++) {
+        int j;
+        for (j = i - 32; j < i - 12; j++) {
             x[j] += carry - 16 * x[i] * L25519[j - (i - 32)];
             carry = (x[j] + 128) >> 8;
-            x[j] -= carry << 8;
+            x[j] -= (int64_t)((uint64_t)carry << 8);
         }
-        x[i - 12] += carry;
+        x[j] += carry;
         x[i] = 0;
     }
     int64_t carry = 0;
@@ -692,8 +693,6 @@ static void modL(uint8_t *r, int64_t x[64])
     }
     for (int j = 0; j < 32; j++) {
         x[j] -= carry * L25519[j];
-        carry = x[j] >> 8;
-        x[j] &= 0xff;
     }
     for (int i = 0; i < 32; i++) {
         x[i + 1] += x[i] >> 8;
@@ -730,9 +729,9 @@ static int unpackneg(gf r[4], const uint8_t p[32])
     M(t, t, den);
 
     pow2523(t, t);
-    M(t, t, den);
     M(t, t, num);
-    M(r[0], t, den);
+    M(t, t, den);
+    M(r[0], t, den2);
 
     S(chk, r[0]);
     M(chk, chk, den);
@@ -842,10 +841,7 @@ static int tweetnacl_ed25519_verify(const uint8_t sig[64], const uint8_t *m, siz
 
 int wwpkg_ed25519_keypair(uint8_t pk[32], uint8_t sk[64])
 {
-    sodium_probe();
-    if (g_sodium_available && g_sodium.crypto_sign_ed25519_keypair) {
-        return g_sodium.crypto_sign_ed25519_keypair(pk, sk);
-    }
+    (void)sodium_probe;
     if (secure_random_bytes(sk, 32) != 0) {
         return -1;
     }
@@ -854,20 +850,11 @@ int wwpkg_ed25519_keypair(uint8_t pk[32], uint8_t sk[64])
 
 int wwpkg_ed25519_sign(uint8_t sig[64], const uint8_t *m, size_t mlen, const uint8_t sk[64])
 {
-    sodium_probe();
-    if (g_sodium_available && g_sodium.crypto_sign_ed25519_detached) {
-        unsigned long long slen = 64;
-        return g_sodium.crypto_sign_ed25519_detached(sig, &slen, m, (unsigned long long)mlen, sk);
-    }
     return tweetnacl_ed25519_sign(sig, m, mlen, sk);
 }
 
 int wwpkg_ed25519_verify(const uint8_t sig[64], const uint8_t *m, size_t mlen, const uint8_t pk[32])
 {
-    sodium_probe();
-    if (g_sodium_available && g_sodium.crypto_sign_ed25519_verify_detached) {
-        return g_sodium.crypto_sign_ed25519_verify_detached(sig, m, (unsigned long long)mlen, pk);
-    }
     return tweetnacl_ed25519_verify(sig, m, mlen, pk);
 }
 

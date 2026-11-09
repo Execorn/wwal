@@ -108,8 +108,8 @@ int main(void)
 
     // Initial seed corpus
     const char *corpus[] = {
-        "\"AppWorkshop\" { \"appid\" \"431960\" \"WorkshopItemsInstalled\" { \"101\" { \"size\" "
-        "\"100\" } } }",
+        ("\"AppWorkshop\" { \"appid\" \"431960\" \"WorkshopItemsInstalled\" { \"101\" { \"size\" "
+         "\"100\" } } }"),
         "\"libraryfolders\" { \"0\" { \"path\" \"/steam\" \"apps\" { \"431960\" \"1000\" } } }",
         "{\"title\":\"Test Scene\",\"type\":\"scene\",\"general\":{\"properties\":{}}}",
         "PKGV0001\x00\x00\x00\x00\x01\x00\x00\x00scene.json\x00\x00",
