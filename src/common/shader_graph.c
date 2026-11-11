@@ -13,12 +13,27 @@
 #include "waywal/shader_graph.h"
 
 #include <ctype.h>
+#include <float.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static inline float finite_or_zero(float v) { return isfinite(v) ? v : 0.0f; }
+
+static inline int32_t safe_f32_to_i32(float v)
+{
+    double d = (double)v;
+    if (!isfinite(d))
+        return 0;
+    if (d >= (double)INT32_MAX)
+        return INT32_MAX;
+    if (d <= (double)INT32_MIN)
+        return INT32_MIN;
+    return (int32_t)d;
+}
 
 /* ========================================================================= */
 /* Dynamic String Buffer Helper for Codegen & Serialization                  */
@@ -28,37 +43,53 @@ typedef struct {
     char *data;
     size_t len;
     size_t cap;
+    bool oom;
 } str_buf_t;
 
-static void str_buf_init(str_buf_t *sb, size_t initial_cap)
+static bool str_buf_init(str_buf_t *sb, size_t initial_cap)
 {
-    sb->cap = (initial_cap > 256) ? initial_cap : 256;
-    sb->len = 0;
-    sb->data = (char *)malloc(sb->cap);
-    if (sb->data) {
-        sb->data[0] = '\0';
+    if (!sb)
+        return false;
+    memset(sb, 0, sizeof(*sb));
+    size_t cap = (initial_cap > 256u) ? initial_cap : 256u;
+    sb->data = (char *)malloc(cap);
+    if (!sb->data) {
+        sb->oom = true;
+        return false;
     }
+    sb->cap = cap;
+    sb->data[0] = '\0';
+    return true;
 }
 
 static inline void str_buf_free(str_buf_t *sb)
 {
-    if (sb->data) {
-        free(sb->data);
-        sb->data = NULL;
-    }
+    if (!sb)
+        return;
+    free(sb->data);
+    sb->data = NULL;
     sb->len = 0;
     sb->cap = 0;
+    sb->oom = false;
 }
 
 static bool str_buf_ensure(str_buf_t *sb, size_t extra)
 {
-    if (sb->len + extra + 1 > sb->cap) {
-        size_t new_cap = sb->cap * 2;
-        if (new_cap < sb->len + extra + 1) {
-            new_cap = sb->len + extra + 1024;
+    if (!sb || sb->oom || !sb->data)
+        return false;
+    if (extra > SIZE_MAX - sb->len - 1u) {
+        sb->oom = true;
+        return false;
+    }
+    size_t needed = sb->len + extra + 1u;
+    if (needed > sb->cap) {
+        size_t new_cap = (sb->cap <= SIZE_MAX / 2u) ? (sb->cap * 2u) : SIZE_MAX;
+        if (new_cap < needed) {
+            new_cap = (needed <= SIZE_MAX - 1024u) ? (needed + 1024u) : needed;
         }
         char *new_data = (char *)realloc(sb->data, new_cap);
         if (!new_data) {
+            sb->oom = true;
             return false;
         }
         sb->data = new_data;
@@ -69,7 +100,7 @@ static bool str_buf_ensure(str_buf_t *sb, size_t extra)
 
 static void str_buf_append(str_buf_t *sb, const char *str)
 {
-    if (!str)
+    if (!str || !sb || sb->oom || !sb->data)
         return;
     size_t slen = strlen(str);
     if (str_buf_ensure(sb, slen)) {
@@ -81,7 +112,7 @@ static void str_buf_append(str_buf_t *sb, const char *str)
 
 static void str_buf_append_fmt(str_buf_t *sb, const char *fmt, ...)
 {
-    if (!sb || !sb->data)
+    if (!sb || sb->oom || !sb->data)
         return;
     size_t avail = (sb->cap > sb->len) ? (sb->cap - sb->len) : 0;
 
@@ -92,27 +123,76 @@ static void str_buf_append_fmt(str_buf_t *sb, const char *fmt, ...)
     int needed = vsnprintf(sb->data + sb->len, avail, fmt, args_copy);
     va_end(args_copy);
 
-    if (needed >= 0 && (size_t)needed < avail) {
+    if (needed < 0) {
+        sb->oom = true;
+        if (sb->data && sb->len < sb->cap)
+            sb->data[sb->len] = '\0';
+    } else if ((size_t)needed < avail) {
         sb->len += (size_t)needed;
-    } else if (needed > 0 && str_buf_ensure(sb, (size_t)needed)) {
-        vsnprintf(sb->data + sb->len, (size_t)needed + 1, fmt, args);
-        sb->len += (size_t)needed;
+    } else {
+        if (sb->len < sb->cap)
+            sb->data[sb->len] = '\0';
+        if (str_buf_ensure(sb, (size_t)needed)) {
+            vsnprintf(sb->data + sb->len, (size_t)needed + 1u, fmt, args);
+            sb->len += (size_t)needed;
+        }
     }
     va_end(args);
 }
 
+/* Branchless 8-byte detector for bytes < 0x20, '"' (0x22), or '\\' (0x5c). */
+static inline bool swar_has_json_special(uint64_t x)
+{
+    const uint64_t ones = 0x0101010101010101ULL;
+    const uint64_t highs = 0x8080808080808080ULL;
+    uint64_t lt_20 = (x - 0x2020202020202020ULL) & ~x & highs;
+    uint64_t xq = x ^ 0x2222222222222222ULL;
+    uint64_t eq_q = (xq - ones) & ~xq & highs;
+    uint64_t xb = x ^ 0x5c5c5c5c5c5c5c5cULL;
+    uint64_t eq_b = (xb - ones) & ~xb & highs;
+    return (lt_20 | eq_q | eq_b) != 0ULL;
+}
+
 static void str_buf_append_json_escaped(str_buf_t *sb, const char *str)
 {
-    if (!sb)
+    if (!sb || sb->oom || !sb->data)
         return;
     const char *s = str ? str : "";
-    size_t worst = strlen(s) * 6 + 3;
+    size_t slen = strlen(s);
+    if (slen > (SIZE_MAX - 4u) / 6u) {
+        sb->oom = true;
+        return;
+    }
+    size_t worst = slen * 6u + 3u;
     if (!str_buf_ensure(sb, worst))
         return;
 
     char *dst = sb->data + sb->len;
     *dst++ = '"';
-    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; ++p) {
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *s_end = p + slen;
+
+    while ((size_t)(s_end - p) >= 8u) {
+        uint64_t word;
+        memcpy(&word, p, sizeof(word));
+        if (swar_has_json_special(word))
+            break;
+        memcpy(dst, p, 8u);
+        dst += 8u;
+        p += 8u;
+    }
+
+    for (; p < s_end; ++p) {
+        if ((size_t)(s_end - p) >= 8u) {
+            uint64_t word;
+            memcpy(&word, p, sizeof(word));
+            if (!swar_has_json_special(word)) {
+                memcpy(dst, p, 8u);
+                dst += 8u;
+                p += 7u;
+                continue;
+            }
+        }
         unsigned char c = *p;
         switch (c) {
         case '"':
@@ -656,10 +736,43 @@ const waywal_graph_node_t *waywal_shader_graph_find_node_const(const waywal_shad
     return NULL;
 }
 
+static void sync_connected_pin_flags(waywal_shader_graph_t *graph)
+{
+    if (!graph)
+        return;
+    uint32_t ncnt =
+        (graph->node_count <= WAYWAL_GRAPH_MAX_NODES) ? graph->node_count : WAYWAL_GRAPH_MAX_NODES;
+    uint32_t ecnt =
+        (graph->edge_count <= WAYWAL_GRAPH_MAX_EDGES) ? graph->edge_count : WAYWAL_GRAPH_MAX_EDGES;
+
+    for (uint32_t i = 0; i < ncnt; ++i) {
+        waywal_graph_node_t *n = &graph->nodes[i];
+        for (uint32_t p = 0; p < n->input_pin_count && p < WAYWAL_GRAPH_MAX_PINS_PER_NODE; ++p)
+            n->inputs[p].flags &= ~WAYWAL_PIN_FLAG_CONNECTED;
+        for (uint32_t p = 0; p < n->output_pin_count && p < WAYWAL_GRAPH_MAX_PINS_PER_NODE; ++p)
+            n->outputs[p].flags &= ~WAYWAL_PIN_FLAG_CONNECTED;
+    }
+
+    for (uint32_t i = 0; i < ecnt; ++i) {
+        const waywal_graph_edge_t *e = &graph->edges[i];
+        waywal_graph_node_t *sn = waywal_shader_graph_find_node(graph, e->src_node_id);
+        waywal_graph_node_t *dn = waywal_shader_graph_find_node(graph, e->dst_node_id);
+        if (sn && e->src_pin_index < sn->output_pin_count &&
+            e->src_pin_index < WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
+            sn->outputs[e->src_pin_index].flags |= WAYWAL_PIN_FLAG_CONNECTED;
+        }
+        if (dn && e->dst_pin_index < dn->input_pin_count &&
+            e->dst_pin_index < WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
+            dn->inputs[e->dst_pin_index].flags |= WAYWAL_PIN_FLAG_CONNECTED;
+        }
+    }
+}
+
 int32_t waywal_shader_graph_add_node(waywal_shader_graph_t *graph, uint32_t opcode,
                                      const char *title, float x, float y)
 {
-    if (!graph || graph->node_count >= WAYWAL_GRAPH_MAX_NODES) {
+    if (!graph || graph->node_count >= WAYWAL_GRAPH_MAX_NODES ||
+        opcode > WAYWAL_NODE_OUT_IMAGE_PASS) {
         return -1;
     }
 
@@ -669,6 +782,8 @@ int32_t waywal_shader_graph_add_node(waywal_shader_graph_t *graph, uint32_t opco
             max_id = graph->nodes[i].node_id;
         }
     }
+    if (max_id >= (uint32_t)INT32_MAX)
+        return -1;
     uint32_t new_id = max_id + 1;
 
     waywal_graph_node_t *n = &graph->nodes[graph->node_count];
@@ -733,6 +848,7 @@ bool waywal_shader_graph_remove_node(waywal_shader_graph_t *graph, uint32_t node
         graph->nodes[i] = graph->nodes[i + 1];
     }
     graph->node_count--;
+    sync_connected_pin_flags(graph);
     return true;
 }
 
@@ -820,6 +936,9 @@ int32_t waywal_shader_graph_connect(waywal_shader_graph_t *graph, uint32_t src_n
             max_eid = graph->edges[i].edge_id;
         }
     }
+    if (max_eid >= (uint32_t)INT32_MAX) {
+        return -1;
+    }
     uint32_t new_eid = max_eid + 1;
 
     /* Tentatively add edge */
@@ -864,19 +983,11 @@ bool waywal_shader_graph_disconnect(waywal_shader_graph_t *graph, uint32_t edge_
     if (target_idx < 0)
         return false;
 
-    uint32_t dst_nid = graph->edges[target_idx].dst_node_id;
-    uint32_t dst_pid = graph->edges[target_idx].dst_pin_index;
-
     for (uint32_t i = (uint32_t)target_idx; i + 1 < graph->edge_count; ++i) {
         graph->edges[i] = graph->edges[i + 1];
     }
     graph->edge_count--;
-
-    /* Update connected flag on dst pin */
-    waywal_graph_node_t *dst_node = waywal_shader_graph_find_node(graph, dst_nid);
-    if (dst_node && dst_pid < dst_node->input_pin_count) {
-        dst_node->inputs[dst_pid].flags &= ~WAYWAL_PIN_FLAG_CONNECTED;
-    }
+    sync_connected_pin_flags(graph);
     return true;
 }
 
@@ -885,15 +996,22 @@ bool waywal_shader_graph_disconnect_pins(waywal_shader_graph_t *graph, uint32_t 
 {
     if (!graph)
         return false;
+    uint32_t edge_w = 0;
     bool found = false;
-    for (uint32_t i = 0; i < graph->edge_count;) {
+    for (uint32_t i = 0; i < graph->edge_count; ++i) {
         if (graph->edges[i].dst_node_id == dst_node_id &&
             graph->edges[i].dst_pin_index == dst_pin_idx) {
-            waywal_shader_graph_disconnect(graph, graph->edges[i].edge_id);
             found = true;
-        } else {
-            i++;
+            continue;
         }
+        if (edge_w != i) {
+            graph->edges[edge_w] = graph->edges[i];
+        }
+        edge_w++;
+    }
+    if (found) {
+        graph->edge_count = edge_w;
+        sync_connected_pin_flags(graph);
     }
     return found;
 }
@@ -1133,6 +1251,9 @@ static inline bool edge_requires_barrier_split(const waywal_shader_graph_t *grap
 {
     const waywal_graph_node_t *src = &graph->nodes[src_idx];
     const waywal_graph_node_t *dst = &graph->nodes[dst_idx];
+    if (dst->flags & WAYWAL_NODE_FLAG_MUTED_BYPASS) {
+        return false;
+    }
     if (is_texture_backed_source_op(src->opcode)) {
         return false;
     }
@@ -1220,36 +1341,19 @@ static uint32_t compute_sethi_ullman_adj(const waywal_shader_graph_t *graph, con
     return max_weight;
 }
 
-bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
-                                 waywal_graph_schedule_t *out_schedule)
+static void compute_node_passes_readonly(const waywal_shader_graph_t *graph_in,
+                                         const graph_adj_t *adj,
+                                         bool reachable[WAYWAL_GRAPH_MAX_NODES],
+                                         uint32_t out_target_pass[WAYWAL_GRAPH_MAX_NODES],
+                                         uint32_t *out_active_pass_mask)
 {
-    if (!graph_in || !out_schedule)
-        return false;
-    memset(out_schedule, 0, sizeof(*out_schedule));
-
     uint32_t ncnt = (graph_in->node_count <= WAYWAL_GRAPH_MAX_NODES) ? graph_in->node_count
                                                                      : WAYWAL_GRAPH_MAX_NODES;
     uint32_t ecnt = (graph_in->edge_count <= WAYWAL_GRAPH_MAX_EDGES) ? graph_in->edge_count
                                                                      : WAYWAL_GRAPH_MAX_EDGES;
+    memset(reachable, 0, sizeof(bool) * WAYWAL_GRAPH_MAX_NODES);
+    memset(out_target_pass, 0, sizeof(uint32_t) * WAYWAL_GRAPH_MAX_NODES);
 
-    if (ncnt == 0) {
-        return true;
-    }
-
-    graph_adj_t adj;
-    graph_adj_build(graph_in, &adj);
-
-    uint32_t cycle_node = 0;
-    if (has_cycle_with_adj(graph_in, &adj, &cycle_node)) {
-        out_schedule->has_cycle_error = 1;
-        out_schedule->cycle_node_id = cycle_node;
-        snprintf(out_schedule->error_msg, sizeof(out_schedule->error_msg),
-                 "Directed cycle detected involving node ID %u", cycle_node);
-        return false;
-    }
-
-    /* 1. Iterative O(|V| + |E|) backward reachability from terminal sinks */
-    bool reachable[WAYWAL_GRAPH_MAX_NODES] = {false};
     bool reaches_image_sink[WAYWAL_GRAPH_MAX_NODES] = {false};
     int8_t explicit_buf_pass[WAYWAL_GRAPH_MAX_NODES];
     memset(explicit_buf_pass, -1, sizeof(explicit_buf_pass));
@@ -1280,8 +1384,8 @@ bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
                 explicit_buf_pass[cur] = bpass;
             }
 
-            for (int16_t e = adj.head_in[cur]; e >= 0; e = adj.next_in[e]) {
-                int16_t s = adj.edge_src_idx[e];
+            for (int16_t e = adj->head_in[cur]; e >= 0; e = adj->next_in[e]) {
+                int16_t s = adj->edge_src_idx[e];
                 if (s >= 0 && !visited_local[s]) {
                     visited_local[s] = true;
                     bfs_stack[top++] = (uint16_t)s;
@@ -1297,13 +1401,12 @@ bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
         }
     }
 
-    /* 2. Spatial Convolution Barrier Stage Assignment */
     uint32_t barrier_stage[WAYWAL_GRAPH_MAX_NODES] = {0};
     for (uint32_t iter = 0; iter < ncnt; ++iter) {
         bool changed = false;
         for (uint32_t e = 0; e < ecnt; ++e) {
-            int16_t s = adj.edge_src_idx[e];
-            int16_t d = adj.edge_dst_idx[e];
+            int16_t s = adj->edge_src_idx[e];
+            int16_t d = adj->edge_dst_idx[e];
             if (s < 0 || d < 0 || !reachable[s] || !reachable[d])
                 continue;
 
@@ -1326,8 +1429,8 @@ bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
             break;
     }
 
-    /* Pull non-barrier leaf inputs (e.g. constants/UVs feeding filter parameters) up to consumer
-     * stage. */
+    /* Pull non-barrier leaf inputs up to their consumer stage so constants/UVs do not force
+     * spurious intermediate pass splits. */
     for (uint32_t iter = 0; iter < ncnt; ++iter) {
         bool changed = false;
         for (uint32_t u = 0; u < ncnt; ++u) {
@@ -1342,10 +1445,10 @@ bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
             uint32_t min_dst_stage = UINT32_MAX;
             bool has_consumer = false;
             bool has_split_out = false;
-            for (int16_t e = adj.head_out[u]; e >= 0; e = adj.next_out[e]) {
+            for (int16_t e = adj->head_out[u]; e >= 0; e = adj->next_out[e]) {
                 if (graph_in->edges[e].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH)
                     continue;
-                int16_t d = adj.edge_dst_idx[e];
+                int16_t d = adj->edge_dst_idx[e];
                 if (d < 0 || !reachable[d])
                     continue;
                 has_consumer = true;
@@ -1374,32 +1477,70 @@ bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
         }
     }
 
-    uint32_t target_pass[WAYWAL_GRAPH_MAX_NODES] = {0};
+    uint32_t mask = 0;
     for (uint32_t i = 0; i < ncnt; ++i) {
-        if (!reachable[i])
+        if (!reachable[i]) {
+            out_target_pass[i] = (graph_in->nodes[i].target_pass < WAYWAL_GRAPH_MAX_PASSES)
+                                     ? graph_in->nodes[i].target_pass
+                                     : 4u;
             continue;
+        }
         uint32_t op = graph_in->nodes[i].opcode;
         if (op == WAYWAL_NODE_OUT_IMAGE_PASS) {
-            target_pass[i] = 4;
+            out_target_pass[i] = 4;
         } else if (op == WAYWAL_NODE_OUT_BUFFER_PASS) {
-            target_pass[i] = resolve_buffer_pass_index(&graph_in->nodes[i]);
+            out_target_pass[i] = resolve_buffer_pass_index(&graph_in->nodes[i]);
         } else if (!reaches_image_sink[i] && explicit_buf_pass[i] >= 0) {
-            target_pass[i] = (uint32_t)explicit_buf_pass[i];
+            out_target_pass[i] = (uint32_t)explicit_buf_pass[i];
         } else if (max_image_stage == 0) {
-            target_pass[i] = 4;
+            out_target_pass[i] = 4;
         } else {
-            target_pass[i] = (barrier_stage[i] >= max_image_stage)
-                                 ? 4u
-                                 : ((barrier_stage[i] <= 3u) ? barrier_stage[i] : 3u);
+            out_target_pass[i] = (barrier_stage[i] >= max_image_stage)
+                                     ? 4u
+                                     : ((barrier_stage[i] <= 3u) ? barrier_stage[i] : 3u);
         }
-        out_schedule->active_pass_mask |= (1u << target_pass[i]);
+        mask |= (1u << out_target_pass[i]);
     }
 
-    if (out_schedule->active_pass_mask == 0) {
-        out_schedule->active_pass_mask = (1u << 4);
+    if (mask == 0) {
+        mask = (1u << 4);
+    }
+    if (out_active_pass_mask) {
+        *out_active_pass_mask = mask;
+    }
+}
+
+bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
+                                 waywal_graph_schedule_t *out_schedule)
+{
+    if (!graph_in || !out_schedule)
+        return false;
+    memset(out_schedule, 0, sizeof(*out_schedule));
+
+    uint32_t ncnt = (graph_in->node_count <= WAYWAL_GRAPH_MAX_NODES) ? graph_in->node_count
+                                                                     : WAYWAL_GRAPH_MAX_NODES;
+
+    if (ncnt == 0) {
+        return true;
     }
 
-    /* 3. Compute Sethi-Ullman register weights in O(|V| + |E|) */
+    graph_adj_t adj;
+    graph_adj_build(graph_in, &adj);
+
+    uint32_t cycle_node = 0;
+    if (has_cycle_with_adj(graph_in, &adj, &cycle_node)) {
+        out_schedule->has_cycle_error = 1;
+        out_schedule->cycle_node_id = cycle_node;
+        snprintf(out_schedule->error_msg, sizeof(out_schedule->error_msg),
+                 "Directed cycle detected involving node ID %u", cycle_node);
+        return false;
+    }
+
+    bool reachable[WAYWAL_GRAPH_MAX_NODES];
+    uint32_t target_pass[WAYWAL_GRAPH_MAX_NODES];
+    compute_node_passes_readonly(graph_in, &adj, reachable, target_pass,
+                                 &out_schedule->active_pass_mask);
+
     uint32_t sethi_ullman[WAYWAL_GRAPH_MAX_NODES] = {0};
     bool visiting[WAYWAL_GRAPH_MAX_NODES] = {false};
     for (uint32_t i = 0; i < ncnt; ++i) {
@@ -1408,7 +1549,6 @@ bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
         }
     }
 
-    /* 4. Kahn's Topological Sort with Sethi-Ullman Ready Queue per pass */
     uint32_t scheduled_count = 0;
     for (uint32_t pass = 0; pass < WAYWAL_GRAPH_MAX_PASSES; ++pass) {
         if (!(out_schedule->active_pass_mask & (1u << pass))) {
@@ -1474,7 +1614,6 @@ bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
 
     out_schedule->sorted_count = scheduled_count;
 
-    /* 5. Static ALU ops & Texture fetch estimation */
     uint32_t alu_ops = 0;
     uint32_t tex_fetches = 0;
 
@@ -1513,15 +1652,6 @@ bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
 
     out_schedule->estimated_alu_ops = alu_ops;
     out_schedule->estimated_tex_fetches = tex_fetches;
-
-    waywal_shader_graph_t *graph_mut = (waywal_shader_graph_t *)graph_in;
-    for (uint32_t i = 0; i < ncnt; ++i) {
-        if (reachable[i]) {
-            graph_mut->nodes[i].target_pass = target_pass[i];
-            graph_mut->nodes[i].sethi_ullman_num = sethi_ullman[i];
-        }
-    }
-
     return true;
 }
 
@@ -1556,20 +1686,20 @@ static inline const char *resolve_pass_buffer_sampler(const char *key, uint32_t 
 }
 
 static const char *resolve_spatial_sampler(const waywal_shader_graph_t *graph,
-                                           const graph_adj_t *adj, uint32_t node_idx,
-                                           uint32_t pin_idx, bool *out_has_sampler)
+                                           const graph_adj_t *adj, const uint32_t *node_pass,
+                                           uint32_t node_idx, uint32_t pin_idx,
+                                           bool *out_has_sampler)
 {
-    const waywal_graph_node_t *dst = &graph->nodes[node_idx];
     if (pin_idx < WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
         int16_t e_idx = adj->pin_in_edge[node_idx][pin_idx];
         if (e_idx >= 0) {
             int16_t s_idx = adj->edge_src_idx[e_idx];
             if (s_idx >= 0) {
                 const waywal_graph_node_t *src = &graph->nodes[s_idx];
-                if (src->target_pass != dst->target_pass) {
+                if (node_pass[s_idx] != node_pass[node_idx]) {
                     if (out_has_sampler)
                         *out_has_sampler = true;
-                    return resolve_pass_buffer_sampler(NULL, src->target_pass);
+                    return resolve_pass_buffer_sampler(NULL, node_pass[s_idx]);
                 }
                 if (src->opcode == WAYWAL_NODE_IN_PASS_BUFFER ||
                     src->opcode == WAYWAL_NODE_IN_TEXTURE2D) {
@@ -1589,7 +1719,7 @@ static const char *resolve_spatial_sampler(const waywal_shader_graph_t *graph,
         }
     }
     if (out_has_sampler)
-        *out_has_sampler = true;
+        *out_has_sampler = false;
     return "u_BufferA";
 }
 
@@ -1610,110 +1740,276 @@ static bool key_contains_ci(const char *haystack, const char *needle)
     return false;
 }
 
-static void emit_glsl_helpers(str_buf_t *sb)
+enum {
+    WWAL_HLP_OKLCH_TO_SRGB = (1u << 0),
+    WWAL_HLP_SRGB_TO_OKLCH = (1u << 1),
+    WWAL_HLP_HASH21 = (1u << 2),
+    WWAL_HLP_SIMPLEX2D = (1u << 3),
+    WWAL_HLP_CURL2D = (1u << 4),
+    WWAL_HLP_VORONOI2D = (1u << 5),
+    WWAL_HLP_FBM2D = (1u << 6),
+    WWAL_HLP_SDF_BOX = (1u << 7),
+    WWAL_HLP_UV_POLAR = (1u << 8),
+    WWAL_HLP_UV_TWIRL = (1u << 9),
+    WWAL_HLP_HUE_SHIFT = (1u << 10),
+    WWAL_HLP_CONTRAST_SAT = (1u << 11),
+    WWAL_HLP_DUAL_KAWASE = (1u << 12),
+    WWAL_HLP_CHROMATIC_ABERR = (1u << 13),
+    WWAL_HLP_NORMAL_HEIGHT_TEX = (1u << 14),
+    WWAL_HLP_NORMAL_HEIGHT = (1u << 15),
+    WWAL_HLP_BLINN_PHONG = (1u << 16),
+    WWAL_HLP_FX_WATERRIPPLE = (1u << 17),
+    WWAL_HLP_FX_WATERWAVES = (1u << 18),
+    WWAL_HLP_FX_CAS_SHARPEN = (1u << 19),
+    WWAL_HLP_FX_VIGNETTE = (1u << 20),
+    WWAL_HLP_FX_CRT_PIXELATE = (1u << 21),
+    WWAL_HLP_FX_GODRAYS = (1u << 22),
+};
+
+static uint32_t helper_mask_for_builtin_key(const char *key)
 {
-    str_buf_append(sb,
-                   "// --- Math, Spatial Filter & Built-In Effect Helper Functions ---\n"
-                   "vec3 wwal_oklch_to_srgb(vec4 oklch) {\n"
-                   "    float L = oklch.x, C = oklch.y, h = oklch.z;\n"
-                   "    float a = C * cos(h), b = C * sin(h);\n"
-                   "    float l_ = L + 0.3963377774 * a + 0.2158037573 * b;\n"
-                   "    float m_ = L - 0.1055613458 * a - 0.0638541728 * b;\n"
-                   "    float s_ = L - 0.0894841775 * a - 1.2914855480 * b;\n"
-                   "    float l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;\n"
-                   "    float r = +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;\n"
-                   "    float g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;\n"
-                   "    float bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;\n"
-                   "    return clamp(vec3(r, g, bl), 0.0, 1.0);\n"
-                   "}\n\n"
-                   "vec3 wwal_srgb_to_oklch(vec4 srgb) {\n"
-                   "    vec3 c = srgb.rgb;\n"
-                   "    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;\n"
-                   "    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;\n"
-                   "    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;\n"
-                   "    float l_ = pow(max(l, 0.0), 0.3333333333);\n"
-                   "    float m_ = pow(max(m, 0.0), 0.3333333333);\n"
-                   "    float s_ = pow(max(s, 0.0), 0.3333333333);\n"
-                   "    float L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;\n"
-                   "    float a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;\n"
-                   "    float b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;\n"
-                   "    float C = sqrt(max(a * a + b * b, 0.0));\n"
-                   "    float h = atan(b, a);\n"
-                   "    return vec3(L, C, h);\n"
-                   "}\n\n"
-                   "float wwal_hash21(vec2 p) {\n"
-                   "    vec3 p3 = fract(vec3(p.xyx) * 0.1031);\n"
-                   "    p3 += dot(p3, p3.yzx + 33.33);\n"
-                   "    return fract((p3.x + p3.y) * p3.z);\n"
-                   "}\n\n"
-                   "float wwal_simplex2d(vec2 p) {\n"
-                   "    const float K1 = 0.366025404;\n"
-                   "    const float K2 = 0.211324865;\n"
-                   "    vec2 i = floor(p + (p.x + p.y) * K1);\n"
-                   "    vec2 a = p - i + (i.x + i.y) * K2;\n"
-                   "    float m = step(a.y, a.x);\n"
-                   "    vec2 o = vec2(m, 1.0 - m);\n"
-                   "    vec2 b = a - o + K2;\n"
-                   "    vec2 c = a - 1.0 + 2.0 * K2;\n"
-                   "    vec3 h = max(0.5 - vec3(dot(a, a), dot(b, b), dot(c, c)), 0.0);\n"
-                   "    vec3 n = h * h * h * h * vec3(dot(a, vec2(wwal_hash21(i) - 0.5, "
-                   "wwal_hash21(i + 13.0) - 0.5)),\n"
-                   "                                  dot(b, vec2(wwal_hash21(i + o) - 0.5, "
-                   "wwal_hash21(i + o + 13.0) - 0.5)),\n"
-                   "                                  dot(c, vec2(wwal_hash21(i + 1.0) - 0.5, "
-                   "wwal_hash21(i + 14.0) - 0.5)));\n"
-                   "    return dot(n, vec3(70.0));\n"
-                   "}\n\n"
-                   "vec2 wwal_curl2d(vec2 p, float t) {\n"
-                   "    const float eps = 0.005;\n"
-                   "    float n1 = wwal_simplex2d(p + vec2(0.0, eps) + vec2(t * 0.1));\n"
-                   "    float n2 = wwal_simplex2d(p - vec2(0.0, eps) + vec2(t * 0.1));\n"
-                   "    float n3 = wwal_simplex2d(p + vec2(eps, 0.0) + vec2(t * 0.1));\n"
-                   "    float n4 = wwal_simplex2d(p - vec2(eps, 0.0) + vec2(t * 0.1));\n"
-                   "    float dy = (n1 - n2) / (2.0 * eps);\n"
-                   "    float dx = (n3 - n4) / (2.0 * eps);\n"
-                   "    return vec2(-dy, dx);\n"
-                   "}\n\n"
-                   "vec2 wwal_voronoi2d(vec2 p) {\n"
-                   "    vec2 n = floor(p);\n"
-                   "    vec2 f = fract(p);\n"
-                   "    float m_dist = 8.0;\n"
-                   "    vec2 m_point = vec2(0.0);\n"
-                   "    for (int j = -1; j <= 1; ++j) {\n"
-                   "        for (int i = -1; i <= 1; ++i) {\n"
-                   "            vec2 g = vec2(float(i), float(j));\n"
-                   "            vec2 o = vec2(wwal_hash21(n + g), wwal_hash21(n + g + 17.0));\n"
-                   "            vec2 diff = g + o - f;\n"
-                   "            float d = dot(diff, diff);\n"
-                   "            if (d < m_dist) {\n"
-                   "                m_dist = d;\n"
-                   "                m_point = n + g;\n"
-                   "            }\n"
-                   "        }\n"
-                   "    }\n"
-                   "    return vec2(sqrt(m_dist), length(m_point));\n"
-                   "}\n\n");
-    str_buf_append(sb, "float wwal_fbm2d(vec2 p, int octaves, float lacunarity) {\n"
-                       "    float val = 0.0;\n"
-                       "    float amp = 0.5;\n"
-                       "    float freq = 1.0;\n"
-                       "    for (int i = 0; i < octaves && i < 8; ++i) {\n"
-                       "        val += amp * wwal_simplex2d(p * freq);\n"
-                       "        freq *= lacunarity;\n"
-                       "        amp *= 0.5;\n"
+    if (!key || key[0] == '\0' || key_contains_ci(key, "waterripple") ||
+        key_contains_ci(key, "ripple")) {
+        return WWAL_HLP_FX_WATERRIPPLE;
+    }
+    if (key_contains_ci(key, "water") || key_contains_ci(key, "refract") ||
+        key_contains_ci(key, "rain")) {
+        return WWAL_HLP_FX_WATERWAVES;
+    }
+    if (key_contains_ci(key, "bloom") || key_contains_ci(key, "halo") ||
+        key_contains_ci(key, "flare") || key_contains_ci(key, "shine") ||
+        key_contains_ci(key, "blur") || key_contains_ci(key, "depth_of_field")) {
+        return WWAL_HLP_DUAL_KAWASE;
+    }
+    if (key_contains_ci(key, "chromatic") || key_contains_ci(key, "vhs")) {
+        return WWAL_HLP_CHROMATIC_ABERR;
+    }
+    if (key_contains_ci(key, "sharpen") || key_contains_ci(key, "edge") ||
+        key_contains_ci(key, "outline")) {
+        return WWAL_HLP_FX_CAS_SHARPEN;
+    }
+    if (key_contains_ci(key, "vignette") || key_contains_ci(key, "iris")) {
+        return WWAL_HLP_FX_VIGNETTE;
+    }
+    if (key_contains_ci(key, "crt") || key_contains_ci(key, "pixelate") ||
+        key_contains_ci(key, "halftone")) {
+        return WWAL_HLP_FX_CRT_PIXELATE;
+    }
+    if (key_contains_ci(key, "twirl") || key_contains_ci(key, "fisheye") ||
+        key_contains_ci(key, "pendulum") || key_contains_ci(key, "perspective")) {
+        return WWAL_HLP_UV_TWIRL;
+    }
+    if (key_contains_ci(key, "foliage") || key_contains_ci(key, "scroll") ||
+        key_contains_ci(key, "shake") || key_contains_ci(key, "skew") ||
+        key_contains_ci(key, "pulse")) {
+        return 0u;
+    }
+    if (key_contains_ci(key, "hsv") || key_contains_ci(key, "tint") ||
+        key_contains_ci(key, "colorgrading")) {
+        return WWAL_HLP_HUE_SHIFT;
+    }
+    if (key_contains_ci(key, "contrast")) {
+        return WWAL_HLP_CONTRAST_SAT;
+    }
+    if (key_contains_ci(key, "godrays") || key_contains_ci(key, "lightshafts") ||
+        key_contains_ci(key, "aurora") || key_contains_ci(key, "fire") ||
+        key_contains_ci(key, "nitro") || key_contains_ci(key, "cloud")) {
+        return WWAL_HLP_FX_GODRAYS;
+    }
+    return WWAL_HLP_FX_WATERWAVES;
+}
+
+static uint32_t helper_mask_for_node(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
+                                     const uint32_t *node_pass, uint32_t idx)
+{
+    const waywal_graph_node_t *node = &graph->nodes[idx];
+    if ((node->flags & WAYWAL_NODE_FLAG_MUTED_BYPASS) && node->output_pin_count > 0) {
+        return 0u;
+    }
+    switch (node->opcode) {
+    case WAYWAL_NODE_NOISE_SIMPLEX2D:
+        return WWAL_HLP_SIMPLEX2D;
+    case WAYWAL_NODE_NOISE_CURL2D:
+        return WWAL_HLP_CURL2D;
+    case WAYWAL_NODE_NOISE_VORONOI2D:
+        return WWAL_HLP_VORONOI2D;
+    case WAYWAL_NODE_NOISE_FBM2D:
+        return WWAL_HLP_FBM2D;
+    case WAYWAL_NODE_SDF_BOX:
+        return WWAL_HLP_SDF_BOX;
+    case WAYWAL_NODE_UV_POLAR:
+        return WWAL_HLP_UV_POLAR;
+    case WAYWAL_NODE_UV_TWIRL:
+        return WWAL_HLP_UV_TWIRL;
+    case WAYWAL_NODE_COLOR_OKLCH_TO_SRGB:
+        return WWAL_HLP_OKLCH_TO_SRGB;
+    case WAYWAL_NODE_COLOR_SRGB_TO_OKLCH:
+        return WWAL_HLP_SRGB_TO_OKLCH;
+    case WAYWAL_NODE_COLOR_HUE_SHIFT:
+        return WWAL_HLP_HUE_SHIFT;
+    case WAYWAL_NODE_COLOR_CONTRAST_SAT:
+        return WWAL_HLP_CONTRAST_SAT;
+    case WAYWAL_NODE_FILTER_DUAL_KAWASE: {
+        bool has_smp = false;
+        (void)resolve_spatial_sampler(graph, adj, node_pass, idx, 0, &has_smp);
+        return has_smp ? WWAL_HLP_DUAL_KAWASE : 0u;
+    }
+    case WAYWAL_NODE_FILTER_CHROMATIC_ABERR: {
+        bool has_smp = false;
+        (void)resolve_spatial_sampler(graph, adj, node_pass, idx, 0, &has_smp);
+        return has_smp ? WWAL_HLP_CHROMATIC_ABERR : 0u;
+    }
+    case WAYWAL_NODE_LIGHT_NORMAL_FROM_HEIGHT: {
+        bool has_smp = false;
+        (void)resolve_spatial_sampler(graph, adj, node_pass, idx, 0, &has_smp);
+        return (adj->pin_in_edge[idx][0] >= 0 && has_smp) ? WWAL_HLP_NORMAL_HEIGHT_TEX
+                                                          : WWAL_HLP_NORMAL_HEIGHT;
+    }
+    case WAYWAL_NODE_LIGHT_BLINN_PHONG:
+        return WWAL_HLP_BLINN_PHONG;
+    case WAYWAL_NODE_BUILTIN_EFFECT:
+        return helper_mask_for_builtin_key(node->prop_or_asset_key);
+    default:
+        return 0u;
+    }
+}
+
+static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
+{
+    if (helper_mask & (WWAL_HLP_CURL2D | WWAL_HLP_FBM2D))
+        helper_mask |= WWAL_HLP_SIMPLEX2D;
+    if (helper_mask & (WWAL_HLP_SIMPLEX2D | WWAL_HLP_VORONOI2D))
+        helper_mask |= WWAL_HLP_HASH21;
+    if (helper_mask & WWAL_HLP_HUE_SHIFT)
+        helper_mask |= (WWAL_HLP_SRGB_TO_OKLCH | WWAL_HLP_OKLCH_TO_SRGB);
+
+    if (helper_mask == 0u)
+        return;
+
+    if (helper_mask & WWAL_HLP_OKLCH_TO_SRGB) {
+        str_buf_append(sb,
+                       "vec3 wwal_oklch_to_srgb(vec4 oklch) {\n"
+                       "    float L = oklch.x, C = oklch.y, h = oklch.z;\n"
+                       "    float a = C * cos(h), b = C * sin(h);\n"
+                       "    float l_ = L + 0.3963377774 * a + 0.2158037573 * b;\n"
+                       "    float m_ = L - 0.1055613458 * a - 0.0638541728 * b;\n"
+                       "    float s_ = L - 0.0894841775 * a - 1.2914855480 * b;\n"
+                       "    float l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;\n"
+                       "    float r = +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;\n"
+                       "    float g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;\n"
+                       "    float bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;\n"
+                       "    return clamp(vec3(r, g, bl), 0.0, 1.0);\n"
+                       "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_SRGB_TO_OKLCH) {
+        str_buf_append(
+            sb, "vec3 wwal_srgb_to_oklch(vec4 srgb) {\n"
+                "    vec3 c = srgb.rgb;\n"
+                "    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;\n"
+                "    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;\n"
+                "    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;\n"
+                "    float l_ = pow(max(l, 0.0), 0.3333333333);\n"
+                "    float m_ = pow(max(m, 0.0), 0.3333333333);\n"
+                "    float s_ = pow(max(s, 0.0), 0.3333333333);\n"
+                "    float L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;\n"
+                "    float a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;\n"
+                "    float b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;\n"
+                "    float C = sqrt(max(a * a + b * b, 0.0));\n"
+                "    float h = atan(b, a);\n"
+                "    return vec3(L, C, h);\n"
+                "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_HASH21) {
+        str_buf_append(sb, "float wwal_hash21(vec2 p) {\n"
+                           "    vec3 p3 = fract(vec3(p.xyx) * 0.1031);\n"
+                           "    p3 += dot(p3, p3.yzx + 33.33);\n"
+                           "    return fract((p3.x + p3.y) * p3.z);\n"
+                           "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_SIMPLEX2D) {
+        str_buf_append(sb,
+                       "float wwal_simplex2d(vec2 p) {\n"
+                       "    const float K1 = 0.366025404;\n"
+                       "    const float K2 = 0.211324865;\n"
+                       "    vec2 i = floor(p + (p.x + p.y) * K1);\n"
+                       "    vec2 a = p - i + (i.x + i.y) * K2;\n"
+                       "    float m = step(a.y, a.x);\n"
+                       "    vec2 o = vec2(m, 1.0 - m);\n"
+                       "    vec2 b = a - o + K2;\n"
+                       "    vec2 c = a - 1.0 + 2.0 * K2;\n"
+                       "    vec3 h = max(0.5 - vec3(dot(a, a), dot(b, b), dot(c, c)), 0.0);\n"
+                       "    vec3 n = h * h * h * h * vec3(dot(a, vec2(wwal_hash21(i) - 0.5, "
+                       "wwal_hash21(i + 13.0) - 0.5)),\n"
+                       "                                  dot(b, vec2(wwal_hash21(i + o) - 0.5, "
+                       "wwal_hash21(i + o + 13.0) - 0.5)),\n"
+                       "                                  dot(c, vec2(wwal_hash21(i + 1.0) - 0.5, "
+                       "wwal_hash21(i + 14.0) - 0.5)));\n"
+                       "    return dot(n, vec3(70.0));\n"
+                       "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_CURL2D) {
+        str_buf_append(sb, "vec2 wwal_curl2d(vec2 p, float t) {\n"
+                           "    const float eps = 0.005;\n"
+                           "    float n1 = wwal_simplex2d(p + vec2(0.0, eps) + vec2(t * 0.1));\n"
+                           "    float n2 = wwal_simplex2d(p - vec2(0.0, eps) + vec2(t * 0.1));\n"
+                           "    float n3 = wwal_simplex2d(p + vec2(eps, 0.0) + vec2(t * 0.1));\n"
+                           "    float n4 = wwal_simplex2d(p - vec2(eps, 0.0) + vec2(t * 0.1));\n"
+                           "    float dy = (n1 - n2) / (2.0 * eps);\n"
+                           "    float dx = (n3 - n4) / (2.0 * eps);\n"
+                           "    return vec2(-dy, dx);\n"
+                           "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_VORONOI2D) {
+        str_buf_append(sb,
+                       "vec2 wwal_voronoi2d(vec2 p) {\n"
+                       "    vec2 n = floor(p);\n"
+                       "    vec2 f = fract(p);\n"
+                       "    float m_dist = 8.0;\n"
+                       "    vec2 m_point = vec2(0.0);\n"
+                       "    for (int j = -1; j <= 1; ++j) {\n"
+                       "        for (int i = -1; i <= 1; ++i) {\n"
+                       "            vec2 g = vec2(float(i), float(j));\n"
+                       "            vec2 o = vec2(wwal_hash21(n + g), wwal_hash21(n + g + 17.0));\n"
+                       "            vec2 diff = g + o - f;\n"
+                       "            float d = dot(diff, diff);\n"
+                       "            if (d < m_dist) {\n"
+                       "                m_dist = d;\n"
+                       "                m_point = n + g;\n"
+                       "            }\n"
+                       "        }\n"
                        "    }\n"
-                       "    return val;\n"
-                       "}\n\n"
-                       "float wwal_sdf_box(vec2 p, vec2 b) {\n"
-                       "    vec2 d = abs(p) - b;\n"
-                       "    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);\n"
-                       "}\n\n"
-                       "vec2 wwal_uv_polar(vec2 uv, vec2 center) {\n"
-                       "    vec2 d = uv - center;\n"
-                       "    float r = length(d);\n"
-                       "    float a = atan(d.y, d.x) / 6.28318530718 + 0.5;\n"
-                       "    return vec2(a, r);\n"
-                       "}\n\n"
+                       "    return vec2(sqrt(m_dist), length(m_point));\n"
+                       "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_FBM2D) {
+        str_buf_append(sb, "float wwal_fbm2d(vec2 p, int octaves, float lacunarity) {\n"
+                           "    float val = 0.0;\n"
+                           "    float amp = 0.5;\n"
+                           "    float freq = 1.0;\n"
+                           "    for (int i = 0; i < octaves && i < 8; ++i) {\n"
+                           "        val += amp * wwal_simplex2d(p * freq);\n"
+                           "        freq *= lacunarity;\n"
+                           "        amp *= 0.5;\n"
+                           "    }\n"
+                           "    return val;\n"
+                           "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_SDF_BOX) {
+        str_buf_append(sb, "float wwal_sdf_box(vec2 p, vec2 b) {\n"
+                           "    vec2 d = abs(p) - b;\n"
+                           "    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);\n"
+                           "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_UV_POLAR) {
+        str_buf_append(sb, "vec2 wwal_uv_polar(vec2 uv, vec2 center) {\n"
+                           "    vec2 d = uv - center;\n"
+                           "    float r = length(d);\n"
+                           "    float a = atan(d.y, d.x) / 6.28318530718 + 0.5;\n"
+                           "    return vec2(a, r);\n"
+                           "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_UV_TWIRL) {
+        str_buf_append(sb,
                        "vec2 wwal_uv_twirl(vec2 uv, vec2 center, float strength, float radius) {\n"
                        "    vec2 d = uv - center;\n"
                        "    float dist = length(d);\n"
@@ -1725,62 +2021,82 @@ static void emit_glsl_helpers(str_buf_t *sb)
                        "        d = vec2(dot(d, vec2(c, -s)), dot(d, vec2(s, c)));\n"
                        "    }\n"
                        "    return center + d;\n"
-                       "}\n\n"
-                       "vec4 wwal_hue_shift(vec4 col, float shift) {\n"
-                       "    vec3 oklch = wwal_srgb_to_oklch(col);\n"
-                       "    oklch.z += shift;\n"
-                       "    return vec4(wwal_oklch_to_srgb(vec4(oklch, 1.0)), col.a);\n"
-                       "}\n\n"
-                       "vec4 wwal_contrast_saturation(vec4 col, float c, float s) {\n"
-                       "    vec3 rgb = (col.rgb - 0.5) * c + 0.5;\n"
-                       "    float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));\n"
-                       "    rgb = mix(vec3(luma), rgb, s);\n"
-                       "    return vec4(clamp(rgb, 0.0, 1.0), col.a);\n"
                        "}\n\n");
-    str_buf_append(sb,
-                   "vec4 wwal_dual_kawase(sampler2D tex, vec2 uv, float offset) {\n"
-                   "    vec2 halfpixel = max(offset, 0.0) / max(u_Resolution, vec2(1.0));\n"
-                   "    vec4 sum = texture(tex, uv) * 4.0;\n"
-                   "    sum += texture(tex, clamp(uv - halfpixel.xy, vec2(0.0), vec2(1.0)));\n"
-                   "    sum += texture(tex, clamp(uv + halfpixel.xy, vec2(0.0), vec2(1.0)));\n"
-                   "    sum += texture(tex, clamp(uv + vec2(halfpixel.x, -halfpixel.y), vec2(0.0), "
-                   "vec2(1.0)));\n"
-                   "    sum += texture(tex, clamp(uv - vec2(halfpixel.x, -halfpixel.y), vec2(0.0), "
-                   "vec2(1.0)));\n"
-                   "    return sum * 0.125;\n"
-                   "}\n\n"
-                   "vec4 wwal_chromatic_aberration(sampler2D tex, vec2 uv, float intensity) {\n"
-                   "    vec2 dir = (uv - vec2(0.5)) * intensity;\n"
-                   "    float r = texture(tex, clamp(uv + dir, vec2(0.0), vec2(1.0))).r;\n"
-                   "    vec4 center = texture(tex, uv);\n"
-                   "    float b = texture(tex, clamp(uv - dir, vec2(0.0), vec2(1.0))).b;\n"
-                   "    return vec4(r, center.g, b, center.a);\n"
-                   "}\n\n"
-                   "vec3 wwal_normal_from_height_tex(sampler2D tex, vec2 uv, float strength) {\n"
-                   "    vec2 texel = 1.0 / max(u_Resolution, vec2(1.0));\n"
-                   "    float hL = texture(tex, uv - vec2(texel.x, 0.0)).x;\n"
-                   "    float hR = texture(tex, uv + vec2(texel.x, 0.0)).x;\n"
-                   "    float hD = texture(tex, uv - vec2(0.0, texel.y)).x;\n"
-                   "    float hU = texture(tex, uv + vec2(0.0, texel.y)).x;\n"
-                   "    return normalize(vec3((hL - hR) * strength, (hD - hU) * strength, 1.0));\n"
-                   "}\n\n"
-                   "vec3 wwal_normal_from_height(float h, vec2 uv, float strength) {\n"
-                   "    float dx = dFdx(h + uv.x * 0.0) * strength;\n"
-                   "    float dy = dFdy(h + uv.y * 0.0) * strength;\n"
-                   "    return normalize(vec3(-dx, -dy, 1.0));\n"
-                   "}\n\n"
-                   "vec4 wwal_blinn_phong(vec3 n, vec3 l, vec3 v, vec4 albedo, float shininess) {\n"
-                   "    vec3 nn = normalize(n);\n"
-                   "    vec3 nl = normalize(l);\n"
-                   "    vec3 nv = normalize(v);\n"
-                   "    vec3 h = normalize(nl + nv);\n"
-                   "    float diff = max(dot(nn, nl), 0.0);\n"
-                   "    float spec = pow(max(dot(nn, h), 0.0), max(shininess, 1.0));\n"
-                   "    vec3 col = albedo.rgb * (0.15 + 0.85 * diff) + vec3(spec * 0.5);\n"
-                   "    return vec4(col, albedo.a);\n"
-                   "}\n\n");
-    str_buf_append(
-        sb, "vec4 wwal_effect_waterripple(sampler2D tex, vec2 uv_base, vec2 uv_in, float speed, "
+    }
+    if (helper_mask & WWAL_HLP_HUE_SHIFT) {
+        str_buf_append(sb, "vec4 wwal_hue_shift(vec4 col, float shift) {\n"
+                           "    vec3 oklch = wwal_srgb_to_oklch(col);\n"
+                           "    oklch.z += shift;\n"
+                           "    return vec4(wwal_oklch_to_srgb(vec4(oklch, 1.0)), col.a);\n"
+                           "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_CONTRAST_SAT) {
+        str_buf_append(sb, "vec4 wwal_contrast_saturation(vec4 col, float c, float s) {\n"
+                           "    vec3 rgb = (col.rgb - 0.5) * c + 0.5;\n"
+                           "    float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));\n"
+                           "    rgb = mix(vec3(luma), rgb, s);\n"
+                           "    return vec4(clamp(rgb, 0.0, 1.0), col.a);\n"
+                           "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_DUAL_KAWASE) {
+        str_buf_append(
+            sb, "vec4 wwal_dual_kawase(sampler2D tex, vec2 uv, float offset) {\n"
+                "    vec2 halfpixel = max(offset, 0.0) / max(u_Resolution, vec2(1.0));\n"
+                "    vec4 sum = texture(tex, uv) * 4.0;\n"
+                "    sum += texture(tex, clamp(uv - halfpixel.xy, vec2(0.0), vec2(1.0)));\n"
+                "    sum += texture(tex, clamp(uv + halfpixel.xy, vec2(0.0), vec2(1.0)));\n"
+                "    sum += texture(tex, clamp(uv + vec2(halfpixel.x, -halfpixel.y), vec2(0.0), "
+                "vec2(1.0)));\n"
+                "    sum += texture(tex, clamp(uv - vec2(halfpixel.x, -halfpixel.y), vec2(0.0), "
+                "vec2(1.0)));\n"
+                "    return sum * 0.125;\n"
+                "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_CHROMATIC_ABERR) {
+        str_buf_append(sb,
+                       "vec4 wwal_chromatic_aberration(sampler2D tex, vec2 uv, float intensity) {\n"
+                       "    vec2 dir = (uv - vec2(0.5)) * intensity;\n"
+                       "    float r = texture(tex, clamp(uv + dir, vec2(0.0), vec2(1.0))).r;\n"
+                       "    vec4 center = texture(tex, uv);\n"
+                       "    float b = texture(tex, clamp(uv - dir, vec2(0.0), vec2(1.0))).b;\n"
+                       "    return vec4(r, center.g, b, center.a);\n"
+                       "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_NORMAL_HEIGHT_TEX) {
+        str_buf_append(
+            sb, "vec3 wwal_normal_from_height_tex(sampler2D tex, vec2 uv, float strength) {\n"
+                "    vec2 texel = 1.0 / max(u_Resolution, vec2(1.0));\n"
+                "    float hL = texture(tex, uv - vec2(texel.x, 0.0)).x;\n"
+                "    float hR = texture(tex, uv + vec2(texel.x, 0.0)).x;\n"
+                "    float hD = texture(tex, uv - vec2(0.0, texel.y)).x;\n"
+                "    float hU = texture(tex, uv + vec2(0.0, texel.y)).x;\n"
+                "    return normalize(vec3((hL - hR) * strength, (hD - hU) * strength, 1.0));\n"
+                "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_NORMAL_HEIGHT) {
+        str_buf_append(sb, "vec3 wwal_normal_from_height(float h, vec2 uv, float strength) {\n"
+                           "    float dx = dFdx(h + uv.x * 0.0) * strength;\n"
+                           "    float dy = dFdy(h + uv.y * 0.0) * strength;\n"
+                           "    return normalize(vec3(-dx, -dy, 1.0));\n"
+                           "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_BLINN_PHONG) {
+        str_buf_append(
+            sb, "vec4 wwal_blinn_phong(vec3 n, vec3 l, vec3 v, vec4 albedo, float shininess) {\n"
+                "    vec3 nn = normalize(n);\n"
+                "    vec3 nl = normalize(l);\n"
+                "    vec3 nv = normalize(v);\n"
+                "    vec3 h = normalize(nl + nv);\n"
+                "    float diff = max(dot(nn, nl), 0.0);\n"
+                "    float spec = pow(max(dot(nn, h), 0.0), max(shininess, 1.0));\n"
+                "    vec3 col = albedo.rgb * (0.15 + 0.85 * diff) + vec3(spec * 0.5);\n"
+                "    return vec4(col, albedo.a);\n"
+                "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_FX_WATERRIPPLE) {
+        str_buf_append(
+            sb,
+            "vec4 wwal_effect_waterripple(sampler2D tex, vec2 uv_base, vec2 uv_in, float speed, "
             "float amp, float freq) {\n"
             "    vec2 p = (uv_base - vec2(0.5)) + uv_in * 0.05;\n"
             "    float dist = length(p);\n"
@@ -1791,7 +2107,11 @@ static void emit_glsl_helpers(str_buf_t *sb)
             "    vec3 caustic = vec3(0.08, 0.52, 0.92) * (0.5 + 0.5 * wave) * clamp(abs(amp) * "
             "10.0, 0.12, 0.85);\n"
             "    return vec4(clamp(base.rgb + caustic, 0.0, 1.0), 1.0);\n"
-            "}\n\n"
+            "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_FX_WATERWAVES) {
+        str_buf_append(
+            sb,
             "vec4 wwal_effect_waterwaves(sampler2D tex, vec2 uv, float speed, float amp, float "
             "freq) {\n"
             "    float f = max(freq, 1.0);\n"
@@ -1800,7 +2120,11 @@ static void emit_glsl_helpers(str_buf_t *sb)
             "    vec4 base = texture(tex, clamp(uv + disp, vec2(0.0), vec2(1.0)));\n"
             "    float crest = 0.5 + 0.5 * sin((uv.x + uv.y) * f - u_Time * speed);\n"
             "    return vec4(clamp(base.rgb + vec3(0.04, 0.10, 0.16) * crest, 0.0, 1.0), 1.0);\n"
-            "}\n\n"
+            "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_FX_CAS_SHARPEN) {
+        str_buf_append(
+            sb,
             "vec4 wwal_effect_cas_sharpen(sampler2D tex, vec2 uv, float sharpness) {\n"
             "    vec2 texel = 1.0 / max(u_Resolution, vec2(1.0));\n"
             "    vec3 c = texture(tex, uv).rgb;\n"
@@ -1815,43 +2139,154 @@ static void emit_glsl_helpers(str_buf_t *sb)
             "    vec3 out_rgb = clamp((c + (n + s + w + e) * weight) / (1.0 + 4.0 * weight), 0.0, "
             "1.0);\n"
             "    return vec4(out_rgb, 1.0);\n"
-            "}\n\n"
+            "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_FX_VIGNETTE) {
+        str_buf_append(
+            sb,
             "vec4 wwal_effect_vignette(sampler2D tex, vec2 uv, float radius, float softness) {\n"
             "    vec4 c = texture(tex, uv);\n"
             "    float d = length(uv - vec2(0.5));\n"
             "    float r = (radius > 0.0) ? radius : 0.75;\n"
             "    float s = max(softness, 0.15);\n"
-            "    float vig = smoothstep(r, max(r - s, 0.0), d);\n"
+            "    float lo = max(r - s, 0.0);\n"
+            "    float hi = max(r, lo + 1e-4);\n"
+            "    float vig = 1.0 - smoothstep(lo, hi, d);\n"
             "    return vec4(c.rgb * vig, 1.0);\n"
-            "}\n\n"
-            "vec4 wwal_effect_crt_pixelate(sampler2D tex, vec2 uv, float density, float "
-            "scan_strength) {\n"
-            "    float cells = max(density, 64.0);\n"
-            "    vec2 q_uv = (floor(uv * cells) + 0.5) / cells;\n"
-            "    vec4 c = texture(tex, clamp(q_uv, vec2(0.0), vec2(1.0)));\n"
-            "    float scan = 1.0 - clamp(scan_strength, 0.0, 0.75) * (0.5 + 0.5 * sin(uv.y * "
-            "max(u_Resolution.y, 240.0) * 3.14159265));\n"
-            "    return vec4(c.rgb * scan, 1.0);\n"
-            "}\n\n"
-            "vec4 wwal_effect_godrays(sampler2D tex, vec2 uv, float intensity, float decay) {\n"
-            "    vec2 delta = (uv - vec2(0.5)) * 0.12;\n"
-            "    vec2 cur = uv;\n"
-            "    vec3 acc = vec3(0.0);\n"
-            "    float w = 1.0;\n"
-            "    float dec = clamp((decay > 0.0) ? decay : 0.85, 0.5, 0.98);\n"
-            "    for (int i = 0; i < 4; ++i) {\n"
-            "        cur = clamp(cur - delta, vec2(0.0), vec2(1.0));\n"
-            "        acc += texture(tex, cur).rgb * w;\n"
-            "        w *= dec;\n"
-            "    }\n"
-            "    vec3 base = texture(tex, uv).rgb;\n"
-            "    return vec4(clamp(base + acc * 0.25 * max(intensity, 0.4), 0.0, 1.0), 1.0);\n"
             "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_FX_CRT_PIXELATE) {
+        str_buf_append(
+            sb, "vec4 wwal_effect_crt_pixelate(sampler2D tex, vec2 uv, float density, float "
+                "scan_strength) {\n"
+                "    float cells = max(density, 64.0);\n"
+                "    vec2 q_uv = (floor(uv * cells) + 0.5) / cells;\n"
+                "    vec4 c = texture(tex, clamp(q_uv, vec2(0.0), vec2(1.0)));\n"
+                "    float scan = 1.0 - clamp(scan_strength, 0.0, 0.75) * (0.5 + 0.5 * sin(uv.y * "
+                "max(u_Resolution.y, 240.0) * 3.14159265));\n"
+                "    return vec4(c.rgb * scan, 1.0);\n"
+                "}\n\n");
+    }
+    if (helper_mask & WWAL_HLP_FX_GODRAYS) {
+        str_buf_append(
+            sb, "vec4 wwal_effect_godrays(sampler2D tex, vec2 uv, float intensity, float decay) {\n"
+                "    vec2 delta = (uv - vec2(0.5)) * 0.12;\n"
+                "    vec2 cur = uv;\n"
+                "    vec3 acc = vec3(0.0);\n"
+                "    float w = 1.0;\n"
+                "    float dec = clamp((decay > 0.0) ? decay : 0.85, 0.5, 0.98);\n"
+                "    for (int i = 0; i < 4; ++i) {\n"
+                "        cur = clamp(cur - delta, vec2(0.0), vec2(1.0));\n"
+                "        acc += texture(tex, cur).rgb * w;\n"
+                "        w *= dec;\n"
+                "    }\n"
+                "    vec3 base = texture(tex, uv).rgb;\n"
+                "    return vec4(clamp(base + acc * 0.25 * max(intensity, 0.4), 0.0, 1.0), 1.0);\n"
+                "}\n\n");
+    }
 }
 
-static void format_operand_adj(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
-                               const bool *emitted_in_pass, uint32_t dst_idx, uint32_t pin_idx,
-                               char *out_expr, size_t out_cap)
+static uint32_t pin_lane_count(uint32_t pin_type)
+{
+    switch (pin_type) {
+    case WAYWAL_PIN_VEC2:
+        return 2u;
+    case WAYWAL_PIN_VEC3:
+        return 3u;
+    case WAYWAL_PIN_VEC4:
+    case WAYWAL_PIN_AUDIO_SPECTRUM:
+        return 4u;
+    default:
+        return 1u;
+    }
+}
+
+static void coerce_glsl_expr(uint32_t src_type, uint32_t dst_type, const char *raw_var,
+                             char *out_expr, size_t out_cap)
+{
+    uint32_t s_norm = (src_type == WAYWAL_PIN_AUDIO_SPECTRUM) ? WAYWAL_PIN_VEC4 : src_type;
+    uint32_t d_norm = (dst_type == WAYWAL_PIN_AUDIO_SPECTRUM) ? WAYWAL_PIN_VEC4 : dst_type;
+
+    if (s_norm == d_norm) {
+        snprintf(out_expr, out_cap, "%s", raw_var);
+        return;
+    }
+
+    switch (d_norm) {
+    case WAYWAL_PIN_FLOAT:
+        if (s_norm == WAYWAL_PIN_INT)
+            snprintf(out_expr, out_cap, "float(%s)", raw_var);
+        else if (s_norm == WAYWAL_PIN_BOOL)
+            snprintf(out_expr, out_cap, "(%s ? 1.0 : 0.0)", raw_var);
+        else
+            snprintf(out_expr, out_cap, "(%s).x", raw_var);
+        return;
+
+    case WAYWAL_PIN_INT:
+        if (s_norm == WAYWAL_PIN_FLOAT)
+            snprintf(out_expr, out_cap, "int(%s)", raw_var);
+        else if (s_norm == WAYWAL_PIN_BOOL)
+            snprintf(out_expr, out_cap, "(%s ? 1 : 0)", raw_var);
+        else
+            snprintf(out_expr, out_cap, "int((%s).x)", raw_var);
+        return;
+
+    case WAYWAL_PIN_BOOL:
+        if (s_norm == WAYWAL_PIN_INT)
+            snprintf(out_expr, out_cap, "((%s) != 0)", raw_var);
+        else if (s_norm == WAYWAL_PIN_FLOAT)
+            snprintf(out_expr, out_cap, "((%s) != 0.0)", raw_var);
+        else
+            snprintf(out_expr, out_cap, "((%s).x != 0.0)", raw_var);
+        return;
+
+    case WAYWAL_PIN_VEC2:
+        if (s_norm == WAYWAL_PIN_FLOAT)
+            snprintf(out_expr, out_cap, "vec2(%s)", raw_var);
+        else if (s_norm == WAYWAL_PIN_INT)
+            snprintf(out_expr, out_cap, "vec2(float(%s))", raw_var);
+        else if (s_norm == WAYWAL_PIN_BOOL)
+            snprintf(out_expr, out_cap, "vec2(%s ? 1.0 : 0.0)", raw_var);
+        else
+            snprintf(out_expr, out_cap, "(%s).xy", raw_var);
+        return;
+
+    case WAYWAL_PIN_VEC3:
+        if (s_norm == WAYWAL_PIN_FLOAT)
+            snprintf(out_expr, out_cap, "vec3(%s)", raw_var);
+        else if (s_norm == WAYWAL_PIN_INT)
+            snprintf(out_expr, out_cap, "vec3(float(%s))", raw_var);
+        else if (s_norm == WAYWAL_PIN_BOOL)
+            snprintf(out_expr, out_cap, "vec3(%s ? 1.0 : 0.0)", raw_var);
+        else if (s_norm == WAYWAL_PIN_VEC2)
+            snprintf(out_expr, out_cap, "vec3(%s, 0.0)", raw_var);
+        else
+            snprintf(out_expr, out_cap, "(%s).xyz", raw_var);
+        return;
+
+    case WAYWAL_PIN_VEC4:
+        if (s_norm == WAYWAL_PIN_FLOAT)
+            snprintf(out_expr, out_cap, "vec4(vec3(%s), 1.0)", raw_var);
+        else if (s_norm == WAYWAL_PIN_INT)
+            snprintf(out_expr, out_cap, "vec4(vec3(float(%s)), 1.0)", raw_var);
+        else if (s_norm == WAYWAL_PIN_BOOL)
+            snprintf(out_expr, out_cap, "vec4(vec3(%s ? 1.0 : 0.0), 1.0)", raw_var);
+        else if (s_norm == WAYWAL_PIN_VEC2)
+            snprintf(out_expr, out_cap, "vec4(%s, 0.0, 1.0)", raw_var);
+        else
+            snprintf(out_expr, out_cap, "vec4(%s, 1.0)", raw_var);
+        return;
+
+    default:
+        snprintf(out_expr, out_cap, "%s", raw_var);
+        return;
+    }
+}
+
+static void format_operand_typed_adj(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
+                                     const uint32_t *node_pass, const bool *emitted_in_pass,
+                                     uint32_t dst_idx, uint32_t pin_idx, uint32_t dst_type,
+                                     char *out_expr, size_t out_cap)
 {
     const waywal_graph_node_t *dst_node = &graph->nodes[dst_idx];
     if (pin_idx >= dst_node->input_pin_count || pin_idx >= WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
@@ -1869,15 +2304,14 @@ static void format_operand_adj(const waywal_shader_graph_t *graph, const graph_a
             const waywal_graph_node_t *src_node = &graph->nodes[s_idx];
             if (incoming_edge->src_pin_index < src_node->output_pin_count) {
                 uint32_t src_type = src_node->outputs[incoming_edge->src_pin_index].pin_type;
-                uint32_t dst_type = dst_pin->pin_type;
-                char raw_var[64];
+                char raw_var[80];
 
-                if (src_node->target_pass != dst_node->target_pass || !emitted_in_pass[s_idx]) {
+                if (node_pass[s_idx] != node_pass[dst_idx] || !emitted_in_pass[s_idx]) {
                     const char *buf_name =
                         resolve_pass_buffer_sampler((src_node->opcode == WAYWAL_NODE_IN_PASS_BUFFER)
                                                         ? src_node->prop_or_asset_key
                                                         : NULL,
-                                                    src_node->target_pass);
+                                                    node_pass[s_idx]);
                     snprintf(raw_var, sizeof(raw_var), "texture(%s, v_TexCoord)", buf_name);
                     src_type = WAYWAL_PIN_VEC4;
                 } else {
@@ -1885,81 +2319,136 @@ static void format_operand_adj(const waywal_shader_graph_t *graph, const graph_a
                              incoming_edge->src_pin_index);
                 }
 
-                if (src_type == dst_type) {
-                    snprintf(out_expr, out_cap, "%s", raw_var);
-                } else if (src_type == WAYWAL_PIN_FLOAT && dst_type == WAYWAL_PIN_VEC2) {
-                    snprintf(out_expr, out_cap, "vec2(%s)", raw_var);
-                } else if (src_type == WAYWAL_PIN_FLOAT && dst_type == WAYWAL_PIN_VEC3) {
-                    snprintf(out_expr, out_cap, "vec3(%s)", raw_var);
-                } else if (src_type == WAYWAL_PIN_FLOAT && dst_type == WAYWAL_PIN_VEC4) {
-                    snprintf(out_expr, out_cap, "vec4(vec3(%s), 1.0)", raw_var);
-                } else if (src_type == WAYWAL_PIN_VEC2 && dst_type == WAYWAL_PIN_VEC3) {
-                    snprintf(out_expr, out_cap, "vec3(%s, 0.0)", raw_var);
-                } else if (src_type == WAYWAL_PIN_VEC2 && dst_type == WAYWAL_PIN_VEC4) {
-                    snprintf(out_expr, out_cap, "vec4(%s, 0.0, 1.0)", raw_var);
-                } else if (src_type == WAYWAL_PIN_VEC3 && dst_type == WAYWAL_PIN_VEC4) {
-                    snprintf(out_expr, out_cap, "vec4(%s, 1.0)", raw_var);
-                } else if (src_type == WAYWAL_PIN_VEC4 && dst_type == WAYWAL_PIN_VEC3) {
-                    snprintf(out_expr, out_cap, "(%s).xyz", raw_var);
-                } else if (src_type == WAYWAL_PIN_VEC4 && dst_type == WAYWAL_PIN_VEC2) {
-                    snprintf(out_expr, out_cap, "(%s).xy", raw_var);
-                } else if (src_type == WAYWAL_PIN_VEC4 && dst_type == WAYWAL_PIN_FLOAT) {
-                    snprintf(out_expr, out_cap, "(%s).x", raw_var);
-                } else if (src_type == WAYWAL_PIN_VEC3 && dst_type == WAYWAL_PIN_VEC2) {
-                    snprintf(out_expr, out_cap, "(%s).xy", raw_var);
-                } else if (src_type == WAYWAL_PIN_VEC3 && dst_type == WAYWAL_PIN_FLOAT) {
-                    snprintf(out_expr, out_cap, "(%s).x", raw_var);
-                } else if (src_type == WAYWAL_PIN_VEC2 && dst_type == WAYWAL_PIN_FLOAT) {
-                    snprintf(out_expr, out_cap, "(%s).x", raw_var);
-                } else if (src_type == WAYWAL_PIN_AUDIO_SPECTRUM && dst_type == WAYWAL_PIN_FLOAT) {
-                    snprintf(out_expr, out_cap, "(%s).x", raw_var);
-                } else if (src_type == WAYWAL_PIN_INT && dst_type == WAYWAL_PIN_FLOAT) {
-                    snprintf(out_expr, out_cap, "float(%s)", raw_var);
-                } else if (src_type == WAYWAL_PIN_BOOL && dst_type == WAYWAL_PIN_FLOAT) {
-                    snprintf(out_expr, out_cap, "(%s ? 1.0 : 0.0)", raw_var);
+                uint32_t src_lanes = pin_lane_count(src_type);
+                if (incoming_edge->swizzle_mask != 0u && src_lanes >= 2u) {
+                    static const char k_swz_chars[4] = {'x', 'y', 'z', 'w'};
+                    uint32_t swz_lanes = pin_lane_count(dst_type);
+                    char swz[5];
+                    for (uint32_t i = 0; i < swz_lanes; ++i) {
+                        uint32_t lane = (incoming_edge->swizzle_mask >> (i * 2u)) & 3u;
+                        if (lane >= src_lanes)
+                            lane = src_lanes - 1u;
+                        swz[i] = k_swz_chars[lane];
+                    }
+                    swz[swz_lanes] = '\0';
+                    char swizzled_var[96];
+                    snprintf(swizzled_var, sizeof(swizzled_var), "(%s).%s", raw_var, swz);
+                    uint32_t swz_type = (swz_lanes == 1u)   ? WAYWAL_PIN_FLOAT
+                                        : (swz_lanes == 2u) ? WAYWAL_PIN_VEC2
+                                        : (swz_lanes == 3u) ? WAYWAL_PIN_VEC3
+                                                            : WAYWAL_PIN_VEC4;
+                    coerce_glsl_expr(swz_type, dst_type, swizzled_var, out_expr, out_cap);
                 } else {
-                    snprintf(out_expr, out_cap, "%s", raw_var);
+                    coerce_glsl_expr(src_type, dst_type, raw_var, out_expr, out_cap);
                 }
                 return;
             }
         }
     }
 
+    char def_expr[80];
     switch (dst_pin->pin_type) {
     case WAYWAL_PIN_FLOAT:
-        snprintf(out_expr, out_cap, "%.6f", dst_pin->default_val[0]);
+        snprintf(def_expr, sizeof(def_expr), "%.6f", finite_or_zero(dst_pin->default_val[0]));
         break;
     case WAYWAL_PIN_VEC2:
         if (dst_node->opcode == WAYWAL_NODE_IN_TEXTURE2D ||
             dst_node->opcode == WAYWAL_NODE_IN_PASS_BUFFER ||
             dst_node->opcode == WAYWAL_NODE_IN_DEPTH_MAP || strcasecmp(dst_pin->name, "uv") == 0) {
-            snprintf(out_expr, out_cap, "v_TexCoord");
+            snprintf(def_expr, sizeof(def_expr), "v_TexCoord");
         } else {
-            snprintf(out_expr, out_cap, "vec2(%.6f, %.6f)", dst_pin->default_val[0],
-                     dst_pin->default_val[1]);
+            snprintf(def_expr, sizeof(def_expr), "vec2(%.6f, %.6f)",
+                     finite_or_zero(dst_pin->default_val[0]),
+                     finite_or_zero(dst_pin->default_val[1]));
         }
         break;
     case WAYWAL_PIN_VEC3:
-        snprintf(out_expr, out_cap, "vec3(%.6f, %.6f, %.6f)", dst_pin->default_val[0],
-                 dst_pin->default_val[1], dst_pin->default_val[2]);
+        snprintf(def_expr, sizeof(def_expr), "vec3(%.6f, %.6f, %.6f)",
+                 finite_or_zero(dst_pin->default_val[0]), finite_or_zero(dst_pin->default_val[1]),
+                 finite_or_zero(dst_pin->default_val[2]));
         break;
     case WAYWAL_PIN_VEC4:
     case WAYWAL_PIN_AUDIO_SPECTRUM:
-        snprintf(out_expr, out_cap, "vec4(%.6f, %.6f, %.6f, %.6f)", dst_pin->default_val[0],
-                 dst_pin->default_val[1], dst_pin->default_val[2], dst_pin->default_val[3]);
+        snprintf(def_expr, sizeof(def_expr), "vec4(%.6f, %.6f, %.6f, %.6f)",
+                 finite_or_zero(dst_pin->default_val[0]), finite_or_zero(dst_pin->default_val[1]),
+                 finite_or_zero(dst_pin->default_val[2]), finite_or_zero(dst_pin->default_val[3]));
         break;
     case WAYWAL_PIN_INT:
-        snprintf(out_expr, out_cap, "%d", (int)dst_pin->default_val[0]);
+        snprintf(def_expr, sizeof(def_expr), "%d", (int)safe_f32_to_i32(dst_pin->default_val[0]));
         break;
     case WAYWAL_PIN_BOOL:
-        snprintf(out_expr, out_cap, "%s", (dst_pin->default_val[0] != 0.0f) ? "true" : "false");
+        snprintf(def_expr, sizeof(def_expr), "%s",
+                 (finite_or_zero(dst_pin->default_val[0]) != 0.0f) ? "true" : "false");
         break;
     case WAYWAL_PIN_SAMPLER2D:
         snprintf(out_expr, out_cap, "u_BufferA");
-        break;
+        return;
     default:
         snprintf(out_expr, out_cap, "0.0");
-        break;
+        return;
+    }
+    coerce_glsl_expr(dst_pin->pin_type, dst_type, def_expr, out_expr, out_cap);
+}
+
+static void format_operand_adj(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
+                               const uint32_t *node_pass, const bool *emitted_in_pass,
+                               uint32_t dst_idx, uint32_t pin_idx, char *out_expr, size_t out_cap)
+{
+    const waywal_graph_node_t *dst_node = &graph->nodes[dst_idx];
+    if (pin_idx >= dst_node->input_pin_count || pin_idx >= WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
+        snprintf(out_expr, out_cap, "0.0");
+        return;
+    }
+    format_operand_typed_adj(graph, adj, node_pass, emitted_in_pass, dst_idx, pin_idx,
+                             dst_node->inputs[pin_idx].pin_type, out_expr, out_cap);
+}
+
+static void emit_muted_bypass_node(str_buf_t *sb, const waywal_shader_graph_t *graph,
+                                   const graph_adj_t *adj, const uint32_t *node_pass,
+                                   const bool *emitted_in_pass, uint32_t idx)
+{
+    const waywal_graph_node_t *node = &graph->nodes[idx];
+    uint32_t nid = node->node_id;
+    uint32_t out_cnt = (node->output_pin_count <= WAYWAL_GRAPH_MAX_PINS_PER_NODE)
+                           ? node->output_pin_count
+                           : WAYWAL_GRAPH_MAX_PINS_PER_NODE;
+
+    for (uint32_t out_p = 0; out_p < out_cnt; ++out_p) {
+        uint32_t out_type = node->outputs[out_p].pin_type;
+        const char *glsl_type = "vec4";
+        const char *zero_lit = "vec4(0.0, 0.0, 0.0, 1.0)";
+        switch (out_type) {
+        case WAYWAL_PIN_FLOAT:
+            glsl_type = "float";
+            zero_lit = "0.0";
+            break;
+        case WAYWAL_PIN_VEC2:
+            glsl_type = "vec2";
+            zero_lit = "vec2(0.0)";
+            break;
+        case WAYWAL_PIN_VEC3:
+            glsl_type = "vec3";
+            zero_lit = "vec3(0.0)";
+            break;
+        case WAYWAL_PIN_INT:
+            glsl_type = "int";
+            zero_lit = "0";
+            break;
+        case WAYWAL_PIN_BOOL:
+            glsl_type = "bool";
+            zero_lit = "false";
+            break;
+        default:
+            break;
+        }
+        if (node->input_pin_count > 0) {
+            char expr[128];
+            format_operand_typed_adj(graph, adj, node_pass, emitted_in_pass, idx, 0, out_type, expr,
+                                     sizeof(expr));
+            str_buf_append_fmt(sb, "    %s n%u_out%u = %s;\n", glsl_type, nid, out_p, expr);
+        } else {
+            str_buf_append_fmt(sb, "    %s n%u_out%u = %s;\n", glsl_type, nid, out_p, zero_lit);
+        }
     }
 }
 
@@ -1970,7 +2459,19 @@ static void emit_builtin_effect_node(str_buf_t *sb, const waywal_graph_node_t *n
     uint32_t nid = node->node_id;
     const char *key = node->prop_or_asset_key;
 
-    str_buf_append_fmt(sb, "    // Builtin Effect: %s\n", (key[0] != '\0') ? key : "waterripple");
+    /* Strip control characters, non-ASCII bytes, and trailing-comment-continuation backslashes so
+     * untrusted keys cannot escape the single-line GLSL comment into executable code. */
+    char safe_key[128];
+    size_t sk_len = 0;
+    for (size_t i = 0; key[i] != '\0' && sk_len + 1u < sizeof(safe_key); ++i) {
+        unsigned char c = (unsigned char)key[i];
+        if (c >= 0x20u && c < 0x7fu && c != '\\') {
+            safe_key[sk_len++] = (char)c;
+        }
+    }
+    safe_key[sk_len] = '\0';
+
+    str_buf_append_fmt(sb, "    // Builtin Effect: %s\n", (sk_len > 0) ? safe_key : "waterripple");
 
     if (key[0] == '\0' || key_contains_ci(key, "waterripple") || key_contains_ci(key, "ripple")) {
         str_buf_append_fmt(
@@ -2058,11 +2559,25 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
         return NULL;
     }
 
+    uint32_t ncnt =
+        (graph->node_count <= WAYWAL_GRAPH_MAX_NODES) ? graph->node_count : WAYWAL_GRAPH_MAX_NODES;
+    uint32_t sorted_cnt = (schedule->sorted_count <= WAYWAL_GRAPH_MAX_NODES)
+                              ? schedule->sorted_count
+                              : WAYWAL_GRAPH_MAX_NODES;
+
     graph_adj_t adj;
     graph_adj_build(graph, &adj);
 
+    bool reachable[WAYWAL_GRAPH_MAX_NODES];
+    uint32_t node_pass[WAYWAL_GRAPH_MAX_NODES];
+    compute_node_passes_readonly(graph, &adj, reachable, node_pass, NULL);
+
     str_buf_t sb;
-    str_buf_init(&sb, 24576);
+    if (!str_buf_init(&sb, 16384)) {
+        if (out_glsl_len)
+            *out_glsl_len = 0;
+        return NULL;
+    }
 
     uint32_t active_mask = schedule->active_pass_mask;
     if (active_mask == 0) {
@@ -2103,21 +2618,22 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
             "// Promoted GraphConstants uniforms (144 Hz zero-recompile scrubbing)\n",
             pass_name);
 
-        for (uint32_t k = 0; k < schedule->sorted_count; ++k) {
+        uint32_t helper_mask = 0u;
+        for (uint32_t k = 0; k < sorted_cnt; ++k) {
             uint32_t idx = schedule->sorted_node_indices[k];
+            if (idx >= ncnt || node_pass[idx] != pass)
+                continue;
             const waywal_graph_node_t *node = &graph->nodes[idx];
-            if (node->target_pass == pass) {
-                if (node->opcode == WAYWAL_NODE_IN_CONSTANT ||
-                    node->opcode == WAYWAL_NODE_IN_USER_PROP) {
-                    str_buf_append_fmt(&sb, "uniform vec4 u_Node%u_Const;\n", node->node_id);
-                } else if (node->opcode == WAYWAL_NODE_NOISE_CURL2D) {
-                    str_buf_append_fmt(&sb, "uniform float u_Node%u_Scale;\n", node->node_id);
-                }
+            helper_mask |= helper_mask_for_node(graph, &adj, node_pass, idx);
+            if (!(node->flags & WAYWAL_NODE_FLAG_MUTED_BYPASS) &&
+                (node->opcode == WAYWAL_NODE_IN_CONSTANT ||
+                 node->opcode == WAYWAL_NODE_IN_USER_PROP)) {
+                str_buf_append_fmt(&sb, "uniform vec4 u_Node%u_Const;\n", node->node_id);
             }
         }
         str_buf_append(&sb, "\n");
 
-        emit_glsl_helpers(&sb);
+        emit_glsl_helpers(&sb, helper_mask);
 
         str_buf_append(&sb, "void main() {\n");
 
@@ -2125,17 +2641,25 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
         int32_t final_node_idx = -1;
         bool has_pass_sink = false;
 
-        for (uint32_t k = 0; k < schedule->sorted_count; ++k) {
+        for (uint32_t k = 0; k < sorted_cnt; ++k) {
             uint32_t idx = schedule->sorted_node_indices[k];
+            if (idx >= ncnt || node_pass[idx] != pass) {
+                continue;
+            }
             const waywal_graph_node_t *node = &graph->nodes[idx];
-            if (node->target_pass != pass) {
+
+            if ((node->flags & WAYWAL_NODE_FLAG_MUTED_BYPASS) && node->output_pin_count > 0) {
+                emit_muted_bypass_node(&sb, graph, &adj, node_pass, emitted_in_pass, idx);
+                emitted_in_pass[idx] = true;
+                final_node_idx = (int32_t)idx;
                 continue;
             }
 
             char ops[5][128];
             uint32_t max_ops = (node->input_pin_count < 5) ? node->input_pin_count : 5;
             for (uint32_t p = 0; p < max_ops; ++p) {
-                format_operand_adj(graph, &adj, emitted_in_pass, idx, p, ops[p], sizeof(ops[p]));
+                format_operand_adj(graph, &adj, node_pass, emitted_in_pass, idx, p, ops[p],
+                                   sizeof(ops[p]));
             }
             for (uint32_t p = max_ops; p < 5; ++p) {
                 ops[p][0] = '0';
@@ -2211,8 +2735,18 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
                                    in2);
                 break;
             case WAYWAL_NODE_MATH_SMOOTHSTEP:
-                str_buf_append_fmt(&sb, "    float n%u_out0 = smoothstep(%s, %s, %s);\n", nid, in0,
-                                   in1, in2);
+                /* GLSL ES 3.10 §8.3 leaves smoothstep(edge0, edge1, x) undefined when
+                 * edge0 >= edge1; order the bounds and invert when reversed. */
+                str_buf_append_fmt(
+                    &sb,
+                    "    float n%u_e0 = %s;\n"
+                    "    float n%u_e1 = %s;\n"
+                    "    float n%u_lo = min(n%u_e0, n%u_e1);\n"
+                    "    float n%u_hi = max(max(n%u_e0, n%u_e1), n%u_lo + 1e-5);\n"
+                    "    float n%u_s = smoothstep(n%u_lo, n%u_hi, %s);\n"
+                    "    float n%u_out0 = (n%u_e0 <= n%u_e1) ? n%u_s : (1.0 - n%u_s);\n",
+                    nid, in0, nid, in1, nid, nid, nid, nid, nid, nid, nid, nid, nid, nid, in2, nid,
+                    nid, nid, nid, nid);
                 break;
             case WAYWAL_NODE_MATH_CLAMP:
                 str_buf_append_fmt(&sb, "    vec4 n%u_out0 = clamp(%s, %s, %s);\n", nid, in0, in1,
@@ -2326,9 +2860,10 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
                 break;
             case WAYWAL_NODE_FILTER_DUAL_KAWASE: {
                 bool has_smp = false;
-                const char *smp = resolve_spatial_sampler(graph, &adj, idx, 0, &has_smp);
+                const char *smp = resolve_spatial_sampler(graph, &adj, node_pass, idx, 0, &has_smp);
                 if (has_smp && key_contains_ci(node->prop_or_asset_key, "bloom")) {
-                    float glow = (node->const_val[1] > 0.0f) ? node->const_val[1] : 0.65f;
+                    float c1 = finite_or_zero(node->const_val[1]);
+                    float glow = (c1 > 0.0f) ? c1 : 0.65f;
                     str_buf_append_fmt(&sb,
                                        "    vec4 n%u_out0 = texture(%s, (%s).xy) + "
                                        "wwal_dual_kawase(%s, (%s).xy, %s) * %.4f;\n",
@@ -2338,31 +2873,25 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
                                        "    vec4 n%u_out0 = wwal_dual_kawase(%s, (%s).xy, %s);\n",
                                        nid, smp, in1, in2);
                 } else {
-                    str_buf_append_fmt(
-                        &sb,
-                        "    vec4 n%u_out0 = mix(%s, wwal_dual_kawase(%s, (%s).xy, %s), 0.5);\n",
-                        nid, in0, smp, in1, in2);
+                    str_buf_append_fmt(&sb, "    vec4 n%u_out0 = %s;\n", nid, in0);
                 }
                 break;
             }
             case WAYWAL_NODE_FILTER_CHROMATIC_ABERR: {
                 bool has_smp = false;
-                const char *smp = resolve_spatial_sampler(graph, &adj, idx, 0, &has_smp);
+                const char *smp = resolve_spatial_sampler(graph, &adj, node_pass, idx, 0, &has_smp);
                 if (has_smp) {
                     str_buf_append_fmt(
                         &sb, "    vec4 n%u_out0 = wwal_chromatic_aberration(%s, (%s).xy, %s);\n",
                         nid, smp, in1, in2);
                 } else {
-                    str_buf_append_fmt(&sb,
-                                       "    vec4 n%u_out0 = mix(%s, wwal_chromatic_aberration(%s, "
-                                       "(%s).xy, %s), 0.5);\n",
-                                       nid, in0, smp, in1, in2);
+                    str_buf_append_fmt(&sb, "    vec4 n%u_out0 = %s;\n", nid, in0);
                 }
                 break;
             }
             case WAYWAL_NODE_LIGHT_NORMAL_FROM_HEIGHT: {
                 bool has_smp = false;
-                const char *smp = resolve_spatial_sampler(graph, &adj, idx, 0, &has_smp);
+                const char *smp = resolve_spatial_sampler(graph, &adj, node_pass, idx, 0, &has_smp);
                 if (adj.pin_in_edge[idx][0] >= 0 && has_smp) {
                     str_buf_append_fmt(
                         &sb, "    vec3 n%u_out0 = wwal_normal_from_height_tex(%s, (%s).xy, %s);\n",
@@ -2382,7 +2911,7 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
                 break;
             case WAYWAL_NODE_BUILTIN_EFFECT: {
                 bool has_smp = false;
-                const char *smp = resolve_spatial_sampler(graph, &adj, idx, 0, &has_smp);
+                const char *smp = resolve_spatial_sampler(graph, &adj, node_pass, idx, 0, &has_smp);
                 (void)has_smp;
                 emit_builtin_effect_node(&sb, node, smp, in0, in1, in2, in3);
                 break;
@@ -2435,6 +2964,13 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
         str_buf_append(&sb, "}\n\n");
     }
 
+    if (sb.oom) {
+        str_buf_free(&sb);
+        if (out_glsl_len)
+            *out_glsl_len = 0;
+        return NULL;
+    }
+
     if (out_glsl_len) {
         *out_glsl_len = sb.len;
     }
@@ -2451,7 +2987,13 @@ char *waywal_shader_graph_save_json(const waywal_shader_graph_t *graph)
         return NULL;
 
     str_buf_t sb;
-    str_buf_init(&sb, 8192);
+    if (!str_buf_init(&sb, 8192))
+        return NULL;
+
+    uint32_t ncnt =
+        (graph->node_count <= WAYWAL_GRAPH_MAX_NODES) ? graph->node_count : WAYWAL_GRAPH_MAX_NODES;
+    uint32_t ecnt =
+        (graph->edge_count <= WAYWAL_GRAPH_MAX_EDGES) ? graph->edge_count : WAYWAL_GRAPH_MAX_EDGES;
 
     str_buf_append(&sb, "{\n");
     str_buf_append_fmt(&sb, "  \"schema_version\": %u,\n", graph->schema_version);
@@ -2462,7 +3004,7 @@ char *waywal_shader_graph_save_json(const waywal_shader_graph_t *graph)
     str_buf_append_fmt(&sb, ",\n  \"flags\": %u,\n", graph->flags);
 
     str_buf_append(&sb, "  \"nodes\": [\n");
-    for (uint32_t i = 0; i < graph->node_count; ++i) {
+    for (uint32_t i = 0; i < ncnt; ++i) {
         const waywal_graph_node_t *n = &graph->nodes[i];
         str_buf_append(&sb, "    {\n");
         str_buf_append_fmt(&sb, "      \"node_id\": %u,\n", n->node_id);
@@ -2471,18 +3013,25 @@ char *waywal_shader_graph_save_json(const waywal_shader_graph_t *graph)
         str_buf_append_json_escaped(&sb, n->title);
         str_buf_append(&sb, ",\n      \"prop_or_asset_key\": ");
         str_buf_append_json_escaped(&sb, n->prop_or_asset_key);
-        str_buf_append_fmt(&sb, ",\n      \"canvas_pos\": [%.2f, %.2f],\n", n->canvas_pos[0],
-                           n->canvas_pos[1]);
+        if (n->custom_label[0] != '\0') {
+            str_buf_append(&sb, ",\n      \"custom_label\": ");
+            str_buf_append_json_escaped(&sb, n->custom_label);
+        }
+        str_buf_append_fmt(&sb, ",\n      \"canvas_pos\": [%.9g, %.9g],\n",
+                           (double)finite_or_zero(n->canvas_pos[0]),
+                           (double)finite_or_zero(n->canvas_pos[1]));
         str_buf_append_fmt(&sb, "      \"target_pass\": %u,\n", n->target_pass);
         str_buf_append_fmt(&sb, "      \"flags\": %u,\n", n->flags);
-        str_buf_append_fmt(&sb, "      \"const_val\": [%.4f, %.4f, %.4f, %.4f]\n", n->const_val[0],
-                           n->const_val[1], n->const_val[2], n->const_val[3]);
-        str_buf_append_fmt(&sb, "    }%s\n", (i + 1 < graph->node_count) ? "," : "");
+        str_buf_append_fmt(
+            &sb, "      \"const_val\": [%.9g, %.9g, %.9g, %.9g]\n",
+            (double)finite_or_zero(n->const_val[0]), (double)finite_or_zero(n->const_val[1]),
+            (double)finite_or_zero(n->const_val[2]), (double)finite_or_zero(n->const_val[3]));
+        str_buf_append_fmt(&sb, "    }%s\n", (i + 1 < ncnt) ? "," : "");
     }
     str_buf_append(&sb, "  ],\n");
 
     str_buf_append(&sb, "  \"edges\": [\n");
-    for (uint32_t i = 0; i < graph->edge_count; ++i) {
+    for (uint32_t i = 0; i < ecnt; ++i) {
         const waywal_graph_edge_t *e = &graph->edges[i];
         str_buf_append(&sb, "    { ");
         str_buf_append_fmt(&sb, "\"edge_id\": %u, ", e->edge_id);
@@ -2491,11 +3040,18 @@ char *waywal_shader_graph_save_json(const waywal_shader_graph_t *graph)
         str_buf_append_fmt(&sb, "\"dst_node_id\": %u, ", e->dst_node_id);
         str_buf_append_fmt(&sb, "\"dst_pin_index\": %u, ", e->dst_pin_index);
         str_buf_append_fmt(&sb, "\"swizzle_mask\": %u", e->swizzle_mask);
-        str_buf_append_fmt(&sb, " }%s\n", (i + 1 < graph->edge_count) ? "," : "");
+        if (e->flags != 0) {
+            str_buf_append_fmt(&sb, ", \"flags\": %u", e->flags);
+        }
+        str_buf_append_fmt(&sb, " }%s\n", (i + 1 < ecnt) ? "," : "");
     }
     str_buf_append(&sb, "  ]\n");
     str_buf_append(&sb, "}\n");
 
+    if (sb.oom) {
+        str_buf_free(&sb);
+        return NULL;
+    }
     return sb.data;
 }
 
@@ -2534,67 +3090,156 @@ static int hex_digit_val(char c)
     return -1;
 }
 
+static void utf8_append_codepoint(uint32_t cp, char *out, size_t cap, size_t *io_len)
+{
+    if (!out || cap <= 1u)
+        return;
+    char enc[4];
+    size_t enc_len = 0;
+    if (cp <= 0x7Fu) {
+        enc[0] = (char)cp;
+        enc_len = 1u;
+    } else if (cp <= 0x7FFu) {
+        enc[0] = (char)(0xC0u | (cp >> 6));
+        enc[1] = (char)(0x80u | (cp & 0x3Fu));
+        enc_len = 2u;
+    } else if (cp <= 0xFFFFu) {
+        enc[0] = (char)(0xE0u | (cp >> 12));
+        enc[1] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        enc[2] = (char)(0x80u | (cp & 0x3Fu));
+        enc_len = 3u;
+    } else if (cp <= 0x10FFFFu) {
+        enc[0] = (char)(0xF0u | (cp >> 18));
+        enc[1] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+        enc[2] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        enc[3] = (char)(0x80u | (cp & 0x3Fu));
+        enc_len = 4u;
+    } else {
+        return;
+    }
+    if (*io_len + enc_len < cap) {
+        memcpy(out + *io_len, enc, enc_len);
+        *io_len += enc_len;
+    }
+}
+
 static bool json_parse_string(const char **p, const char *end, char *out, size_t cap)
 {
     json_skip_ws(p, end);
     if (*p >= end || **p != '"')
         return false;
-    (*p)++;
+    const char *cur = *p + 1;
 
     size_t out_len = 0;
-    while (*p < end && **p != '"') {
-        if (**p == '\\') {
-            if (*p + 1 >= end)
-                return false;
-            (*p)++;
-            char esc = **p;
-            char decoded = esc;
-            if (esc == '"' || esc == '\\' || esc == '/') {
-                decoded = esc;
-            } else if (esc == 'b') {
-                decoded = '\b';
-            } else if (esc == 'f') {
-                decoded = '\f';
-            } else if (esc == 'n') {
-                decoded = '\n';
-            } else if (esc == 'r') {
-                decoded = '\r';
-            } else if (esc == 't') {
-                decoded = '\t';
-            } else if (esc == 'u' && *p + 4 < end) {
-                int h0 = hex_digit_val((*p)[1]);
-                int h1 = hex_digit_val((*p)[2]);
-                int h2 = hex_digit_val((*p)[3]);
-                int h3 = hex_digit_val((*p)[4]);
-                if (h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0) {
-                    unsigned int cp = (unsigned int)((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
-                    if (cp < 0x80u) {
-                        decoded = (char)cp;
-                    } else {
-                        decoded = '?';
-                    }
-                    *p += 4;
-                }
+    while (cur < end) {
+        while ((size_t)(end - cur) >= 8u) {
+            uint64_t chunk;
+            memcpy(&chunk, cur, 8u);
+            if (swar_has_json_special(chunk))
+                break;
+            if (out && cap > 1u && out_len + 1u < cap) {
+                size_t avail = cap - 1u - out_len;
+                size_t to_copy = (avail < 8u) ? avail : 8u;
+                memcpy(out + out_len, cur, to_copy);
+                out_len += to_copy;
             }
-            if (out_len + 1 < cap) {
+            cur += 8u;
+        }
+        if (cur >= end)
+            return false;
+
+        unsigned char c = (unsigned char)*cur;
+        if (c == '"') {
+            *p = cur + 1;
+            if (out && cap > 0u) {
+                out[(out_len < cap) ? out_len : (cap - 1u)] = '\0';
+            }
+            return true;
+        }
+        if (c < 0x20u) {
+            return false;
+        }
+        if (c == '\\') {
+            cur++;
+            if (cur >= end)
+                return false;
+            char esc = *cur;
+            char decoded = 0;
+            bool single_byte = true;
+            switch (esc) {
+            case '"':
+            case '\\':
+            case '/':
+                decoded = esc;
+                break;
+            case 'b':
+                decoded = '\b';
+                break;
+            case 'f':
+                decoded = '\f';
+                break;
+            case 'n':
+                decoded = '\n';
+                break;
+            case 'r':
+                decoded = '\r';
+                break;
+            case 't':
+                decoded = '\t';
+                break;
+            case 'u': {
+                single_byte = false;
+                if ((size_t)(end - cur) < 5u)
+                    return false;
+                int h0 = hex_digit_val(cur[1]);
+                int h1 = hex_digit_val(cur[2]);
+                int h2 = hex_digit_val(cur[3]);
+                int h3 = hex_digit_val(cur[4]);
+                if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0)
+                    return false;
+                uint32_t cp = (uint32_t)((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
+                cur += 5;
+                if (cp >= 0xD800u && cp <= 0xDBFFu) {
+                    if ((size_t)(end - cur) >= 6u && cur[0] == '\\' && cur[1] == 'u') {
+                        int l0 = hex_digit_val(cur[2]);
+                        int l1 = hex_digit_val(cur[3]);
+                        int l2 = hex_digit_val(cur[4]);
+                        int l3 = hex_digit_val(cur[5]);
+                        if (l0 >= 0 && l1 >= 0 && l2 >= 0 && l3 >= 0) {
+                            uint32_t lo = (uint32_t)((l0 << 12) | (l1 << 8) | (l2 << 4) | l3);
+                            if (lo >= 0xDC00u && lo <= 0xDFFFu) {
+                                cp = 0x10000u + (((cp - 0xD800u) << 10) | (lo - 0xDC00u));
+                                cur += 6;
+                            } else {
+                                cp = 0xFFFDu;
+                            }
+                        } else {
+                            return false;
+                        }
+                    } else {
+                        cp = 0xFFFDu;
+                    }
+                } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+                    cp = 0xFFFDu;
+                }
+                utf8_append_codepoint(cp, out, cap, &out_len);
+                continue;
+            }
+            default:
+                return false;
+            }
+            if (single_byte && out && cap > 1u && out_len + 1u < cap) {
                 out[out_len++] = decoded;
             }
+            cur++;
         } else {
-            if (out_len + 1 < cap) {
-                out[out_len++] = **p;
+            if (out && cap > 1u && out_len + 1u < cap) {
+                out[out_len++] = (char)c;
             }
+            cur++;
         }
-        (*p)++;
     }
-    if (*p >= end || **p != '"')
-        return false;
-    (*p)++;
-    if (out_len < cap) {
-        out[out_len] = '\0';
-    } else if (cap > 0) {
-        out[cap - 1] = '\0';
-    }
-    return true;
+    return false;
 }
 
 static bool json_parse_number(const char **p, const char *end, double *out_val)
@@ -2622,68 +3267,83 @@ static bool json_parse_number(const char **p, const char *end, double *out_val)
     num_buf[n] = '\0';
 
     char *endptr = NULL;
-    *out_val = strtod(num_buf, &endptr);
-    if (endptr == num_buf)
+    double val = strtod(num_buf, &endptr);
+    if (endptr == num_buf || !isfinite(val))
         return false;
+    *out_val = val;
     *p += (size_t)(endptr - num_buf);
+    return true;
+}
+
+static bool json_parse_f32(const char **p, const char *end, float *out_val)
+{
+    double d = 0.0;
+    if (!json_parse_number(p, end, &d))
+        return false;
+    if (d < -(double)FLT_MAX || d > (double)FLT_MAX)
+        return false;
+    *out_val = (float)d;
     return true;
 }
 
 static bool json_parse_uint(const char **p, const char *end, uint32_t *out_val)
 {
-    double d = 0;
+    double d = 0.0;
     if (!json_parse_number(p, end, &d))
         return false;
-    if (d < 0)
+    if (!isfinite(d) || d < 0.0 || d > (double)UINT32_MAX || floor(d) != d)
         return false;
     *out_val = (uint32_t)d;
     return true;
 }
 
-static void json_skip_value(const char **p, const char *end)
+static bool json_skip_value(const char **p, const char *end)
 {
     json_skip_ws(p, end);
     if (*p >= end)
-        return;
+        return false;
 
     if (**p == '"') {
-        char dummy[16];
-        json_parse_string(p, end, dummy, sizeof(dummy));
-    } else if (**p == '{') {
-        (*p)++;
-        int depth = 1;
-        while (*p < end && depth > 0) {
-            if (**p == '{')
-                depth++;
-            else if (**p == '}')
-                depth--;
-            else if (**p == '"') {
-                char dummy[16];
-                json_parse_string(p, end, dummy, sizeof(dummy));
-                continue;
-            }
-            (*p)++;
-        }
-    } else if (**p == '[') {
-        (*p)++;
-        int depth = 1;
-        while (*p < end && depth > 0) {
-            if (**p == '[')
-                depth++;
-            else if (**p == ']')
-                depth--;
-            else if (**p == '"') {
-                char dummy[16];
-                json_parse_string(p, end, dummy, sizeof(dummy));
-                continue;
-            }
-            (*p)++;
-        }
-    } else {
-        while (*p < end && **p != ',' && **p != '}' && **p != ']' && !isspace((unsigned char)**p)) {
-            (*p)++;
-        }
+        return json_parse_string(p, end, NULL, 0);
     }
+    if (**p == '{' || **p == '[') {
+        char open_c = **p;
+        char close_c = (open_c == '{') ? '}' : ']';
+        (*p)++;
+        int depth = 1;
+        while (*p < end && depth > 0) {
+            if (**p == open_c) {
+                depth++;
+                (*p)++;
+            } else if (**p == close_c) {
+                depth--;
+                (*p)++;
+            } else if (**p == '"') {
+                if (!json_parse_string(p, end, NULL, 0))
+                    return false;
+            } else if (**p == '{' || **p == '[') {
+                if (!json_skip_value(p, end))
+                    return false;
+            } else {
+                (*p)++;
+            }
+        }
+        return (depth == 0);
+    }
+    if ((size_t)(end - *p) >= 4u && memcmp(*p, "true", 4u) == 0) {
+        *p += 4;
+        return true;
+    }
+    if ((size_t)(end - *p) >= 5u && memcmp(*p, "false", 5u) == 0) {
+        *p += 5;
+        return true;
+    }
+    if ((size_t)(end - *p) >= 4u && memcmp(*p, "null", 4u) == 0) {
+        *p += 4;
+        return true;
+    }
+    double dummy_num = 0.0;
+    return json_parse_number(p, end, &dummy_num);
 }
 
 bool waywal_shader_graph_load_json(const char *json_str, size_t json_len,
@@ -2708,12 +3368,16 @@ bool waywal_shader_graph_load_json(const char *json_str, size_t json_len,
         return false;
     }
 
+    bool edge_had_explicit_id[WAYWAL_GRAPH_MAX_EDGES] = {false};
+    bool root_closed = false;
+
     while (p < end) {
         json_skip_ws(&p, end);
         if (p >= end)
             break;
         if (*p == '}') {
             p++;
+            root_closed = true;
             break;
         }
 
@@ -2738,11 +3402,23 @@ bool waywal_shader_graph_load_json(const char *json_str, size_t json_len,
             }
             out_graph->schema_version = sv;
         } else if (strcmp(key, "graph_name") == 0) {
-            json_parse_string(&p, end, out_graph->graph_name, sizeof(out_graph->graph_name));
+            if (!json_parse_string(&p, end, out_graph->graph_name, sizeof(out_graph->graph_name))) {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Invalid graph_name string");
+                return false;
+            }
         } else if (strcmp(key, "author") == 0) {
-            json_parse_string(&p, end, out_graph->author, sizeof(out_graph->author));
+            if (!json_parse_string(&p, end, out_graph->author, sizeof(out_graph->author))) {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Invalid author string");
+                return false;
+            }
         } else if (strcmp(key, "flags") == 0) {
-            json_parse_uint(&p, end, &out_graph->flags);
+            if (!json_parse_uint(&p, end, &out_graph->flags)) {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Invalid graph flags");
+                return false;
+            }
         } else if (strcmp(key, "nodes") == 0) {
             if (!json_expect_char(&p, end, '[')) {
                 if (err_buf)
@@ -2750,12 +3426,14 @@ bool waywal_shader_graph_load_json(const char *json_str, size_t json_len,
                 return false;
             }
 
+            bool nodes_closed = false;
             while (p < end) {
                 json_skip_ws(&p, end);
                 if (p >= end)
                     break;
                 if (*p == ']') {
                     p++;
+                    nodes_closed = true;
                     break;
                 }
                 if (out_graph->node_count >= WAYWAL_GRAPH_MAX_NODES) {
@@ -2775,6 +3453,8 @@ bool waywal_shader_graph_load_json(const char *json_str, size_t json_len,
                 n->canvas_size[0] = 180.0f;
                 n->canvas_size[1] = 120.0f;
                 n->const_val[3] = 1.0f;
+                bool has_target_pass = false;
+                bool node_closed = false;
 
                 while (p < end) {
                     json_skip_ws(&p, end);
@@ -2782,60 +3462,143 @@ bool waywal_shader_graph_load_json(const char *json_str, size_t json_len,
                         break;
                     if (*p == '}') {
                         p++;
+                        node_closed = true;
                         break;
                     }
 
                     char nkey[64];
-                    if (!json_parse_string(&p, end, nkey, sizeof(nkey)))
-                        break;
-                    if (!json_expect_char(&p, end, ':'))
-                        break;
-
-                    if (strcmp(nkey, "node_id") == 0 || strcmp(nkey, "id") == 0) {
-                        json_parse_uint(&p, end, &n->node_id);
-                    } else if (strcmp(nkey, "opcode") == 0) {
-                        json_parse_uint(&p, end, &n->opcode);
-                    } else if (strcmp(nkey, "title") == 0) {
-                        json_parse_string(&p, end, n->title, sizeof(n->title));
-                    } else if (strcmp(nkey, "prop_or_asset_key") == 0) {
-                        json_parse_string(&p, end, n->prop_or_asset_key,
-                                          sizeof(n->prop_or_asset_key));
-                    } else if (strcmp(nkey, "canvas_pos") == 0) {
-                        if (json_expect_char(&p, end, '[')) {
-                            double x = 0, y = 0;
-                            json_parse_number(&p, end, &x);
-                            json_expect_char(&p, end, ',');
-                            json_parse_number(&p, end, &y);
-                            json_expect_char(&p, end, ']');
-                            n->canvas_pos[0] = (float)x;
-                            n->canvas_pos[1] = (float)y;
-                        }
-                    } else if (strcmp(nkey, "target_pass") == 0) {
-                        json_parse_uint(&p, end, &n->target_pass);
-                    } else if (strcmp(nkey, "flags") == 0) {
-                        json_parse_uint(&p, end, &n->flags);
-                    } else if (strcmp(nkey, "const_val") == 0) {
-                        if (json_expect_char(&p, end, '[')) {
-                            double c[4] = {0, 0, 0, 1};
-                            for (int ci = 0; ci < 4; ++ci) {
-                                json_parse_number(&p, end, &c[ci]);
-                                if (ci < 3)
-                                    json_expect_char(&p, end, ',');
-                            }
-                            json_expect_char(&p, end, ']');
-                            for (int ci = 0; ci < 4; ++ci)
-                                n->const_val[ci] = (float)c[ci];
-                        }
-                    } else {
-                        json_skip_value(&p, end);
+                    if (!json_parse_string(&p, end, nkey, sizeof(nkey)) ||
+                        !json_expect_char(&p, end, ':')) {
+                        if (err_buf)
+                            snprintf(err_buf, 256, "Malformed node key/value pair");
+                        return false;
                     }
 
-                    json_expect_char(&p, end, ',');
+                    if (strcmp(nkey, "node_id") == 0 || strcmp(nkey, "id") == 0) {
+                        if (!json_parse_uint(&p, end, &n->node_id)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid node_id");
+                            return false;
+                        }
+                    } else if (strcmp(nkey, "opcode") == 0) {
+                        if (!json_parse_uint(&p, end, &n->opcode)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid node opcode");
+                            return false;
+                        }
+                    } else if (strcmp(nkey, "title") == 0) {
+                        if (!json_parse_string(&p, end, n->title, sizeof(n->title))) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid node title");
+                            return false;
+                        }
+                    } else if (strcmp(nkey, "prop_or_asset_key") == 0) {
+                        if (!json_parse_string(&p, end, n->prop_or_asset_key,
+                                               sizeof(n->prop_or_asset_key))) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid prop_or_asset_key");
+                            return false;
+                        }
+                    } else if (strcmp(nkey, "custom_label") == 0) {
+                        if (!json_parse_string(&p, end, n->custom_label, sizeof(n->custom_label))) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid custom_label");
+                            return false;
+                        }
+                    } else if (strcmp(nkey, "canvas_pos") == 0) {
+                        float x = 0.0f, y = 0.0f;
+                        if (!json_expect_char(&p, end, '[') || !json_parse_f32(&p, end, &x) ||
+                            !json_expect_char(&p, end, ',') || !json_parse_f32(&p, end, &y) ||
+                            !json_expect_char(&p, end, ']')) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid canvas_pos array");
+                            return false;
+                        }
+                        n->canvas_pos[0] = x;
+                        n->canvas_pos[1] = y;
+                    } else if (strcmp(nkey, "target_pass") == 0) {
+                        if (!json_parse_uint(&p, end, &n->target_pass)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid target_pass");
+                            return false;
+                        }
+                        has_target_pass = true;
+                    } else if (strcmp(nkey, "flags") == 0) {
+                        if (!json_parse_uint(&p, end, &n->flags)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid node flags");
+                            return false;
+                        }
+                    } else if (strcmp(nkey, "const_val") == 0) {
+                        if (!json_expect_char(&p, end, '[')) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Expected '[' for const_val");
+                            return false;
+                        }
+                        float c[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                        for (int ci = 0; ci < 4; ++ci) {
+                            if (!json_parse_f32(&p, end, &c[ci])) {
+                                if (err_buf)
+                                    snprintf(err_buf, 256, "Invalid const_val element");
+                                return false;
+                            }
+                            if (ci < 3 && !json_expect_char(&p, end, ',')) {
+                                if (err_buf)
+                                    snprintf(err_buf, 256, "Expected ',' in const_val");
+                                return false;
+                            }
+                        }
+                        if (!json_expect_char(&p, end, ']')) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Expected ']' after const_val");
+                            return false;
+                        }
+                        for (int ci = 0; ci < 4; ++ci)
+                            n->const_val[ci] = c[ci];
+                    } else {
+                        if (!json_skip_value(&p, end)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Malformed value in node object");
+                            return false;
+                        }
+                    }
+
+                    if (!json_expect_char(&p, end, ',')) {
+                        json_skip_ws(&p, end);
+                        if (p >= end || *p != '}') {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Expected ',' or '}' in node object");
+                            return false;
+                        }
+                    }
                 }
 
+                if (!node_closed) {
+                    if (err_buf)
+                        snprintf(err_buf, 256, "Unclosed node object");
+                    return false;
+                }
+
+                if (!has_target_pass && n->opcode == WAYWAL_NODE_OUT_IMAGE_PASS) {
+                    n->target_pass = 4u;
+                }
                 node_init_default_pins(n);
                 out_graph->node_count++;
-                json_expect_char(&p, end, ',');
+
+                if (!json_expect_char(&p, end, ',')) {
+                    json_skip_ws(&p, end);
+                    if (p >= end || *p != ']') {
+                        if (err_buf)
+                            snprintf(err_buf, 256, "Expected ',' or ']' in nodes array");
+                        return false;
+                    }
+                }
+            }
+
+            if (!nodes_closed) {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Unclosed nodes array");
+                return false;
             }
         } else if (strcmp(key, "edges") == 0) {
             if (!json_expect_char(&p, end, '[')) {
@@ -2844,12 +3607,14 @@ bool waywal_shader_graph_load_json(const char *json_str, size_t json_len,
                 return false;
             }
 
+            bool edges_closed = false;
             while (p < end) {
                 json_skip_ws(&p, end);
                 if (p >= end)
                     break;
                 if (*p == ']') {
                     p++;
+                    edges_closed = true;
                     break;
                 }
                 if (out_graph->edge_count >= WAYWAL_GRAPH_MAX_EDGES) {
@@ -2864,8 +3629,10 @@ bool waywal_shader_graph_load_json(const char *json_str, size_t json_len,
                     return false;
                 }
 
-                waywal_graph_edge_t *e = &out_graph->edges[out_graph->edge_count];
+                uint32_t e_idx = out_graph->edge_count;
+                waywal_graph_edge_t *e = &out_graph->edges[e_idx];
                 memset(e, 0, sizeof(*e));
+                bool edge_closed = false;
 
                 while (p < end) {
                     json_skip_ws(&p, end);
@@ -2873,56 +3640,228 @@ bool waywal_shader_graph_load_json(const char *json_str, size_t json_len,
                         break;
                     if (*p == '}') {
                         p++;
+                        edge_closed = true;
                         break;
                     }
 
                     char ekey[64];
-                    if (!json_parse_string(&p, end, ekey, sizeof(ekey)))
-                        break;
-                    if (!json_expect_char(&p, end, ':'))
-                        break;
-
-                    if (strcmp(ekey, "edge_id") == 0 || strcmp(ekey, "id") == 0) {
-                        json_parse_uint(&p, end, &e->edge_id);
-                    } else if (strcmp(ekey, "src_node_id") == 0) {
-                        json_parse_uint(&p, end, &e->src_node_id);
-                    } else if (strcmp(ekey, "src_pin_index") == 0) {
-                        json_parse_uint(&p, end, &e->src_pin_index);
-                    } else if (strcmp(ekey, "dst_node_id") == 0) {
-                        json_parse_uint(&p, end, &e->dst_node_id);
-                    } else if (strcmp(ekey, "dst_pin_index") == 0) {
-                        json_parse_uint(&p, end, &e->dst_pin_index);
-                    } else if (strcmp(ekey, "swizzle_mask") == 0) {
-                        json_parse_uint(&p, end, &e->swizzle_mask);
-                    } else {
-                        json_skip_value(&p, end);
+                    if (!json_parse_string(&p, end, ekey, sizeof(ekey)) ||
+                        !json_expect_char(&p, end, ':')) {
+                        if (err_buf)
+                            snprintf(err_buf, 256, "Malformed edge key/value pair");
+                        return false;
                     }
 
-                    json_expect_char(&p, end, ',');
+                    if (strcmp(ekey, "edge_id") == 0 || strcmp(ekey, "id") == 0) {
+                        if (!json_parse_uint(&p, end, &e->edge_id)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid edge_id");
+                            return false;
+                        }
+                        edge_had_explicit_id[e_idx] = true;
+                    } else if (strcmp(ekey, "src_node_id") == 0) {
+                        if (!json_parse_uint(&p, end, &e->src_node_id)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid src_node_id");
+                            return false;
+                        }
+                    } else if (strcmp(ekey, "src_pin_index") == 0) {
+                        if (!json_parse_uint(&p, end, &e->src_pin_index)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid src_pin_index");
+                            return false;
+                        }
+                    } else if (strcmp(ekey, "dst_node_id") == 0) {
+                        if (!json_parse_uint(&p, end, &e->dst_node_id)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid dst_node_id");
+                            return false;
+                        }
+                    } else if (strcmp(ekey, "dst_pin_index") == 0) {
+                        if (!json_parse_uint(&p, end, &e->dst_pin_index)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid dst_pin_index");
+                            return false;
+                        }
+                    } else if (strcmp(ekey, "swizzle_mask") == 0) {
+                        if (!json_parse_uint(&p, end, &e->swizzle_mask)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid swizzle_mask");
+                            return false;
+                        }
+                    } else if (strcmp(ekey, "flags") == 0) {
+                        if (!json_parse_uint(&p, end, &e->flags)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Invalid edge flags");
+                            return false;
+                        }
+                    } else {
+                        if (!json_skip_value(&p, end)) {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Malformed value in edge object");
+                            return false;
+                        }
+                    }
+
+                    if (!json_expect_char(&p, end, ',')) {
+                        json_skip_ws(&p, end);
+                        if (p >= end || *p != '}') {
+                            if (err_buf)
+                                snprintf(err_buf, 256, "Expected ',' or '}' in edge object");
+                            return false;
+                        }
+                    }
                 }
 
-                /* Mark connected flag on pins */
-                waywal_graph_node_t *dst_node =
-                    waywal_shader_graph_find_node(out_graph, e->dst_node_id);
-                if (dst_node && e->dst_pin_index < dst_node->input_pin_count) {
-                    dst_node->inputs[e->dst_pin_index].flags |= WAYWAL_PIN_FLAG_CONNECTED;
-                }
-                waywal_graph_node_t *src_node =
-                    waywal_shader_graph_find_node(out_graph, e->src_node_id);
-                if (src_node && e->src_pin_index < src_node->output_pin_count) {
-                    src_node->outputs[e->src_pin_index].flags |= WAYWAL_PIN_FLAG_CONNECTED;
+                if (!edge_closed) {
+                    if (err_buf)
+                        snprintf(err_buf, 256, "Unclosed edge object");
+                    return false;
                 }
 
                 out_graph->edge_count++;
-                json_expect_char(&p, end, ',');
+
+                if (!json_expect_char(&p, end, ',')) {
+                    json_skip_ws(&p, end);
+                    if (p >= end || *p != ']') {
+                        if (err_buf)
+                            snprintf(err_buf, 256, "Expected ',' or ']' in edges array");
+                        return false;
+                    }
+                }
+            }
+
+            if (!edges_closed) {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Unclosed edges array");
+                return false;
             }
         } else {
-            json_skip_value(&p, end);
+            if (!json_skip_value(&p, end)) {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Malformed value for key '%s'", key);
+                return false;
+            }
         }
 
-        json_expect_char(&p, end, ',');
+        if (!json_expect_char(&p, end, ',')) {
+            json_skip_ws(&p, end);
+            if (p >= end || *p != '}') {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Expected ',' or '}' in root object");
+                return false;
+            }
+        }
     }
 
+    if (!root_closed) {
+        if (err_buf)
+            snprintf(err_buf, 256, "Unclosed root JSON object");
+        return false;
+    }
+
+    json_skip_ws(&p, end);
+    if (p != end) {
+        if (err_buf)
+            snprintf(err_buf, 256, "Unexpected trailing content after root JSON object");
+        return false;
+    }
+
+    /* Validate node invariants after parsing so unordered JSON keys ("edges" before "nodes") work
+     * identically to canonical order. */
+    for (uint32_t i = 0; i < out_graph->node_count; ++i) {
+        const waywal_graph_node_t *n = &out_graph->nodes[i];
+        if (n->node_id == 0 || n->node_id > (uint32_t)INT32_MAX) {
+            if (err_buf)
+                snprintf(err_buf, 256, "Invalid node_id %u", n->node_id);
+            return false;
+        }
+        if (n->opcode > WAYWAL_NODE_OUT_IMAGE_PASS) {
+            if (err_buf)
+                snprintf(err_buf, 256, "Out-of-range opcode %u on node %u", n->opcode, n->node_id);
+            return false;
+        }
+        if (n->target_pass >= WAYWAL_GRAPH_MAX_PASSES) {
+            if (err_buf)
+                snprintf(err_buf, 256, "Out-of-range target_pass %u on node %u", n->target_pass,
+                         n->node_id);
+            return false;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            if (out_graph->nodes[j].node_id == n->node_id) {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Duplicate node_id %u", n->node_id);
+                return false;
+            }
+        }
+    }
+
+    uint32_t max_eid = 0;
+    for (uint32_t i = 0; i < out_graph->edge_count; ++i) {
+        if (edge_had_explicit_id[i] && out_graph->edges[i].edge_id > max_eid)
+            max_eid = out_graph->edges[i].edge_id;
+    }
+
+    for (uint32_t i = 0; i < out_graph->edge_count; ++i) {
+        waywal_graph_edge_t *e = &out_graph->edges[i];
+        if (!edge_had_explicit_id[i]) {
+            if (max_eid >= (uint32_t)INT32_MAX) {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Edge ID overflow");
+                return false;
+            }
+            e->edge_id = ++max_eid;
+        } else if (e->edge_id == 0 || e->edge_id > (uint32_t)INT32_MAX) {
+            if (err_buf)
+                snprintf(err_buf, 256, "Invalid edge_id %u", e->edge_id);
+            return false;
+        }
+
+        const waywal_graph_node_t *sn =
+            waywal_shader_graph_find_node_const(out_graph, e->src_node_id);
+        const waywal_graph_node_t *dn =
+            waywal_shader_graph_find_node_const(out_graph, e->dst_node_id);
+        if (!sn || !dn) {
+            if (err_buf)
+                snprintf(err_buf, 256, "Edge %u references non-existent node (%u -> %u)",
+                         e->edge_id, e->src_node_id, e->dst_node_id);
+            return false;
+        }
+        if (e->src_pin_index >= sn->output_pin_count || e->dst_pin_index >= dn->input_pin_count) {
+            if (err_buf)
+                snprintf(err_buf, 256, "Edge %u pin index out of bounds", e->edge_id);
+            return false;
+        }
+        if (!waywal_pin_types_compatible(sn->outputs[e->src_pin_index].pin_type,
+                                         dn->inputs[e->dst_pin_index].pin_type)) {
+            if (err_buf)
+                snprintf(err_buf, 256, "Edge %u connects incompatible pin types", e->edge_id);
+            return false;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            if (out_graph->edges[j].edge_id == e->edge_id) {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Duplicate edge_id %u", e->edge_id);
+                return false;
+            }
+            if (out_graph->edges[j].dst_node_id == e->dst_node_id &&
+                out_graph->edges[j].dst_pin_index == e->dst_pin_index) {
+                if (err_buf)
+                    snprintf(err_buf, 256, "Multiple incoming edges on node %u pin %u",
+                             e->dst_node_id, e->dst_pin_index);
+                return false;
+            }
+        }
+    }
+
+    uint32_t cycle_node = 0;
+    if (waywal_shader_graph_has_cycle(out_graph, &cycle_node)) {
+        if (err_buf)
+            snprintf(err_buf, 256, "Directed cycle detected involving node ID %u", cycle_node);
+        return false;
+    }
+
+    sync_connected_pin_flags(out_graph);
     return true;
 }
 

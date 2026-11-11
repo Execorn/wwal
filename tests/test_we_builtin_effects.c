@@ -75,8 +75,12 @@ static void test_descriptor_table_and_size(void)
         assert(strlen(desc->display_name) > 0);
         assert(desc->uncompressed_glsl_size > 0);
         assert(desc->lz4_compressed_size > 0);
-        assert(desc->pass_count >= 1 && desc->pass_count <= 4);
+        assert(desc->pass_count == 1);
     }
+    assert(we_builtin_effect_get_by_id(WE_EFFECT_BLOOM)->pass_count == 1);
+    assert(we_builtin_effect_get_by_id(WE_EFFECT_BLOOM)->flags == 0);
+    assert(we_builtin_effect_get_by_id(WE_EFFECT_BLUR_KAWASE)->pass_count == 1);
+    assert(we_builtin_effect_get_by_id(WE_EFFECT_GODRAYS)->pass_count == 1);
     printf("    -> All 50 effect descriptors verified in static table.\n");
 }
 
@@ -111,8 +115,29 @@ static void test_decompression_performance_and_syntax(void)
                                                          sizeof(frag_buf));
         size_t v_sz = we_builtin_effect_decompress_stage((we_builtin_effect_id_t)id, false,
                                                          vert_buf, sizeof(vert_buf));
-        assert(f_sz > 0);
-        assert(v_sz > 0);
+        assert(f_sz > 0 && f_sz < 1280);
+        assert(v_sz > 0 && v_sz < 1280);
+
+        // Undersized stage buffer must return 0 rather than silently truncating GLSL
+        char tiny_stage[64];
+        assert(we_builtin_effect_decompress_stage((we_builtin_effect_id_t)id, true, tiny_stage,
+                                                  sizeof(tiny_stage)) == 0);
+        assert(we_builtin_effect_decompress_stage((we_builtin_effect_id_t)id, true, frag_buf,
+                                                  f_sz) == 0);
+
+        // Verify zero inverted smoothstep(edge0, edge1, x) patterns in stock fragment shaders
+        assert(strstr(frag_buf, "smoothstep(0.5, 0.0") == NULL);
+        assert(strstr(frag_buf, "smoothstep(0.35, 0.0") == NULL);
+        assert(strstr(frag_buf, "smoothstep(1.0, 0.0") == NULL);
+        assert(strstr(frag_buf, "smoothstep(rad, 0.0") == NULL);
+        assert(strstr(frag_buf, "smoothstep(r, max(r -") == NULL);
+        assert(strstr(frag_buf, "smoothstep(outer, inner") == NULL);
+        if (id == WE_EFFECT_PULSE) {
+            assert(strstr(frag_buf, "s_safe") != NULL);
+        }
+        if (id == WE_EFFECT_BLOOM) {
+            assert(strstr(frag_buf, "bloomBright(") != NULL);
+        }
 
         // Test cached stage pointer
         const char *cached_frag =
@@ -230,6 +255,17 @@ static void test_robin_hood_slug_lookup(void)
         assert(from_frag != NULL);
         assert(from_frag->id == desc->id);
     }
+
+    // Real Wallpaper Engine multi-segment path forms with generic leaf stems
+    const we_builtin_effect_desc_t *wr =
+        we_builtin_effect_find_by_slug("Effects/waterripple/effect.json");
+    assert(wr != NULL && wr->id == WE_EFFECT_WATERRIPPLE);
+    assert(we_builtin_effect_find_by_slug("materials/effects/bloom/material.json") ==
+           we_builtin_effect_get_by_id(WE_EFFECT_BLOOM));
+    assert(we_builtin_effect_find_by_slug("./effects/waterripple.frag") == wr);
+    assert(we_builtin_effect_find_by_slug("effects/blur_kawase/shaders/pass_0.frag") ==
+           we_builtin_effect_get_by_id(WE_EFFECT_BLUR_KAWASE));
+    assert(we_builtin_effect_find_by_slug("Water Ripple") == wr);
 
     // Verify negative lookups
     assert(we_builtin_effect_find_by_slug("non_existent_effect_slug_xyz") == NULL);
@@ -453,6 +489,7 @@ static void test_headless_gles31_compile_all_50(void)
     size_t glsl_len = 0;
     char *glsl = waywal_shader_graph_compile_glsl(graph, &sched, &glsl_len);
     assert(glsl != NULL && glsl_len > 0);
+    assert(strstr(glsl, "_Scale") == NULL);
 
     const char *cursor = strstr(glsl, "#pragma Pass ");
     assert(cursor != NULL);
