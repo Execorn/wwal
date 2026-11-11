@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <assert.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <locale.h>
@@ -1174,6 +1175,272 @@ static void test_cold_open_and_1bit_tamper(const char *base_tmp, const uint8_t p
     printf("  -> Cold open benchmark & 1-bit tamper rejection passed.\n");
 }
 
+static void test_promotion_retention_toctou_and_confinement(const char *base_tmp,
+                                                            const uint8_t priv_key[64])
+{
+    printf("[WWPKG 10/10] Testing Frame 0 retention, path-swap TOCTOU, skippable frames & confined "
+           "extraction...\n");
+
+    char src1[256], src2[256], pkg1_path[256], pkg2_path[256], swap_path[256];
+    snprintf(src1, sizeof(src1), "%s/ret_src1", base_tmp);
+    snprintf(src2, sizeof(src2), "%s/ret_src2", base_tmp);
+    snprintf(pkg1_path, sizeof(pkg1_path), "%s/ret_pkg1.wwpkg", base_tmp);
+    snprintf(pkg2_path, sizeof(pkg2_path), "%s/ret_pkg2.wwpkg", base_tmp);
+    snprintf(swap_path, sizeof(swap_path), "%s/ret_swap.wwpkg", base_tmp);
+    mkdir(src1, 0700);
+    mkdir(src2, 0700);
+
+    /* 8 KiB preview exceeds inline Frame 0 buffer (5 KiB) while fitting inside Frame 0 (<64 KiB) */
+    const size_t prev_len = 8192u;
+    uint8_t *big_prev = (uint8_t *)malloc(prev_len);
+    assert(big_prev != NULL);
+    for (size_t i = 0; i < prev_len; ++i) {
+        big_prev[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
+    }
+
+    char p1_frag[256], p1_prev[256], p2_frag[256], p2_prev[256];
+    snprintf(p1_frag, sizeof(p1_frag), "%s/shader.frag", src1);
+    snprintf(p1_prev, sizeof(p1_prev), "%s/preview.webp", src1);
+    snprintf(p2_frag, sizeof(p2_frag), "%s/shader.frag", src2);
+    snprintf(p2_prev, sizeof(p2_prev), "%s/preview.webp", src2);
+
+    const char *frag1 = "void mainImage(out vec4 c, in vec2 f) { c = vec4(0.25, 0.5, 0.75, 1.0); }";
+    const char *frag2 = "void mainImage(out vec4 c, in vec2 f) { c = vec4(1.0, 0.0, 0.0, 1.0); }";
+    write_file_bytes(p1_frag, frag1, strlen(frag1));
+    write_file_bytes(p1_prev, big_prev, prev_len);
+    write_file_bytes(p2_frag, frag2, strlen(frag2));
+    write_file_bytes(p2_prev, "RIFF....WEBP", 12u);
+
+    wwpkg_manifest_t mf1;
+    init_sample_manifest(&mf1, "retention-pkg-one", "shader.frag");
+    mf1.budgets.max_compute_workgroups[0] = 64u;
+    mf1.budgets.max_compute_workgroups[1] = 32u;
+    mf1.budgets.max_compute_workgroups[2] = 2u;
+    assert(wwpkg_build_package(src1, &mf1, priv_key, pkg1_path));
+
+    uint8_t pub2[32] = {0}, priv2[64] = {0};
+    wwpkg_generate_keypair(pub2, priv2);
+    wwpkg_manifest_t mf2;
+    init_sample_manifest(&mf2, "retention-pkg-two", "shader.frag");
+    assert(wwpkg_build_package(src2, &mf2, priv2, pkg2_path));
+
+    /* 1. Frame 0 pointer stability across lazy promotion + max_compute_workgroups round-trip */
+    wwpkg_package_t *meta_pkg = wwpkg_open_metadata_only(pkg1_path);
+    assert(meta_pkg != NULL);
+    const wwpkg_manifest_t *loaded_mf = wwpkg_get_manifest(meta_pkg);
+    assert(loaded_mf != NULL);
+    assert(loaded_mf->budgets.max_compute_workgroups[0] == 64u);
+    assert(loaded_mf->budgets.max_compute_workgroups[1] == 32u);
+    assert(loaded_mf->budgets.max_compute_workgroups[2] == 2u);
+
+    size_t got_prev_sz = 0;
+    const uint8_t *prev_before = wwpkg_read_asset(meta_pkg, "preview.webp", &got_prev_sz);
+    assert(prev_before != NULL && got_prev_sz == prev_len);
+    assert(wwpkg_verify_signature(meta_pkg, NULL));
+
+    size_t got_frag_sz = 0;
+    const uint8_t *frag_after = wwpkg_read_asset(meta_pkg, "shader.frag", &got_frag_sz);
+    assert(frag_after != NULL && got_frag_sz == strlen(frag1));
+    /* Reading prev_before after lazy Frame 1 promotion must not trigger Heap-UAF */
+    assert(memcmp(prev_before, big_prev, prev_len) == 0);
+    wwpkg_close(meta_pkg);
+
+    /* 2. Path-swap TOCTOU rejection on metadata-only handle */
+    size_t raw1_sz = 0, raw2_sz = 0;
+    uint8_t *raw1 = read_file_bytes(pkg1_path, &raw1_sz);
+    uint8_t *raw2 = read_file_bytes(pkg2_path, &raw2_sz);
+    write_file_bytes(swap_path, raw1, raw1_sz);
+
+    wwpkg_package_t *swap_pkg = wwpkg_open_metadata_only(swap_path);
+    assert(swap_pkg != NULL);
+    char swap_tmp[256];
+    snprintf(swap_tmp, sizeof(swap_tmp), "%s/ret_swap.tmp", base_tmp);
+    write_file_bytes(swap_tmp, raw2, raw2_sz);
+    assert(rename(swap_tmp, swap_path) == 0);
+
+    assert(!wwpkg_verify_signature(swap_pkg, NULL));
+    size_t swapped_sz = 0;
+    assert(wwpkg_read_asset(swap_pkg, "shader.frag", &swapped_sz) == NULL);
+    char swap_ext_dir[256];
+    snprintf(swap_ext_dir, sizeof(swap_ext_dir), "%s/ret_swap_ext", base_tmp);
+    assert(mkdir(swap_ext_dir, 0700) == 0);
+    assert(!wwpkg_extract_all(swap_pkg, swap_ext_dir));
+    assert(rmdir(swap_ext_dir) == 0 && "dest_dir must stay empty on path-swap extract failure");
+    wwpkg_close(swap_pkg);
+    unlink(swap_path);
+
+    /* 2b. Large (>64 KiB) preview.webp in Frame 1 tampered after metadata-only open:
+     * wwpkg_extract_all must reject and leave dest_dir completely empty. */
+    char f1p_src[256], f1p_frag[256], f1p_prev[256], f1p_pkg_path[256];
+    snprintf(f1p_src, sizeof(f1p_src), "%s/f1prev_src", base_tmp);
+    snprintf(f1p_frag, sizeof(f1p_frag), "%s/shader.frag", f1p_src);
+    snprintf(f1p_prev, sizeof(f1p_prev), "%s/preview.webp", f1p_src);
+    snprintf(f1p_pkg_path, sizeof(f1p_pkg_path), "%s/f1prev_base.wwpkg", base_tmp);
+    assert(mkdir(f1p_src, 0700) == 0);
+    write_file_bytes(f1p_frag, frag1, strlen(frag1));
+
+    const size_t large_prev_len = 70u * 1024u;
+    uint8_t *large_prev = (uint8_t *)malloc(large_prev_len);
+    assert(large_prev != NULL);
+    memcpy(large_prev, "RIFF0000WEBPVP8 ", 16u);
+    for (size_t i = 16u; i < large_prev_len; i++) {
+        large_prev[i] = (uint8_t)((i * 73u + 19u) & 0xFFu);
+    }
+    write_file_bytes(f1p_prev, large_prev, large_prev_len);
+    assert(wwpkg_build_package(f1p_src, &mf1, priv_key, f1p_pkg_path));
+
+    size_t f1p_raw_sz = 0;
+    uint8_t *f1p_raw = read_file_bytes(f1p_pkg_path, &f1p_raw_sz);
+    size_t f0_off = sizeof(wwpkg_outer_envelope_t);
+    size_t f0_ulen = 0, f0_clen = 0;
+    uint8_t *f0_tmp = zstd_decompress_frame_exact(f1p_raw + f0_off, f1p_raw_sz - f0_off,
+                                                  WWPKG_FRAME0_MAX_BYTES, &f0_ulen, &f0_clen);
+    free(f0_tmp);
+
+    size_t f1_off = f0_off + f0_clen;
+    size_t f1_ulen = 0, f1_clen_orig = 0;
+    uint8_t *f1_plain = zstd_decompress_frame_exact(f1p_raw + f1_off, f1p_raw_sz - f1_off,
+                                                    4u * 1024u * 1024u, &f1_ulen, &f1_clen_orig);
+    bool flipped_f1_prev = false;
+    for (size_t off = 0; off + 512u <= f1_ulen;) {
+        uint8_t *th = f1_plain + off;
+        if (th[0] == '\0') {
+            break;
+        }
+        unsigned long long esz = strtoull((const char *)(th + 124), NULL, 8);
+        if (strcmp((const char *)th, "preview.webp") == 0) {
+            f1_plain[off + 512u + 16u] ^= 0x5Au;
+            recompute_tar_chksum(th);
+            flipped_f1_prev = true;
+            break;
+        }
+        size_t padded_esz = ((size_t)esz + 511u) & ~511u;
+        off += 512u + padded_esz;
+    }
+    assert(flipped_f1_prev);
+
+    size_t forged_f1_clen = 0;
+    uint8_t *forged_f1_comp = zstd_compress_buf(f1_plain, f1_ulen, &forged_f1_clen);
+    size_t forged_f1_total = f1_off + forged_f1_clen;
+    uint8_t *forged_f1_pkg = (uint8_t *)malloc(forged_f1_total);
+    assert(forged_f1_pkg != NULL);
+    memcpy(forged_f1_pkg, f1p_raw, f1_off);
+    memcpy(forged_f1_pkg + f1_off, forged_f1_comp, forged_f1_clen);
+
+    char tamper_f1_path[256], tamper_ext_dir[256];
+    snprintf(tamper_f1_path, sizeof(tamper_f1_path), "%s/tamper_f1_prev.wwpkg", base_tmp);
+    snprintf(tamper_ext_dir, sizeof(tamper_ext_dir), "%s/tamper_f1_ext", base_tmp);
+    write_file_bytes(tamper_f1_path, forged_f1_pkg, forged_f1_total);
+
+    wwpkg_package_t *tamper_meta = wwpkg_open_metadata_only(tamper_f1_path);
+    assert(tamper_meta != NULL);
+    assert(mkdir(tamper_ext_dir, 0700) == 0);
+    assert(!wwpkg_extract_all(tamper_meta, tamper_ext_dir));
+    assert(wwpkg_get_last_error(NULL) == WWPKG_ERR_BAD_SIGNATURE);
+
+    DIR *td = opendir(tamper_ext_dir);
+    assert(td != NULL);
+    struct dirent *tent;
+    while ((tent = readdir(td)) != NULL) {
+        assert(strcmp(tent->d_name, ".") == 0 || strcmp(tent->d_name, "..") == 0);
+    }
+    closedir(td);
+    assert(rmdir(tamper_ext_dir) == 0 &&
+           "dest_dir must be empty after tampered preview.webp rejection on metadata-only pkg");
+    wwpkg_close(tamper_meta);
+    unlink(tamper_f1_path);
+    unlink(f1p_pkg_path);
+    unlink(f1p_frag);
+    unlink(f1p_prev);
+    rmdir(f1p_src);
+    free(large_prev);
+    free(f1p_raw);
+    free(forged_f1_pkg);
+    free(forged_f1_comp);
+    free(f1_plain);
+
+    /* 3. Benign RFC 8878 skippable frame (0x184D2A55) prepended before Frame 0 */
+    uint8_t skip_hdr[12] = {0x55, 0x2A, 0x4D, 0x18, 0x04, 0x00, 0x00, 0x00, 'W', 'W', 'A', 'L'};
+    uint8_t *with_skip = (uint8_t *)malloc(sizeof(skip_hdr) + raw1_sz);
+    assert(with_skip != NULL);
+    memcpy(with_skip, skip_hdr, sizeof(skip_hdr));
+    memcpy(with_skip + sizeof(skip_hdr), raw1, raw1_sz);
+    wwpkg_package_t *skip_pkg = wwpkg_open_memory(with_skip, sizeof(skip_hdr) + raw1_sz);
+    assert(skip_pkg != NULL);
+    assert(wwpkg_verify_signature(skip_pkg, NULL));
+    wwpkg_close(skip_pkg);
+    free(with_skip);
+
+    /* 4. Zero-byte regular file returns WWPKG_ERR_CORRUPT (distinct from WWPKG_ERR_IO) */
+    char empty_path[256];
+    snprintf(empty_path, sizeof(empty_path), "%s/empty.wwpkg", base_tmp);
+    write_file_bytes(empty_path, "", 0u);
+    assert(wwpkg_open(empty_path) == NULL);
+    assert(wwpkg_get_last_error(NULL) == WWPKG_ERR_CORRUPT);
+    assert(wwpkg_open_metadata_only(empty_path) == NULL);
+    assert(wwpkg_get_last_error(NULL) == WWPKG_ERR_CORRUPT);
+    unlink(empty_path);
+
+    /* 5. Streaming confined wwpkg_extract_all: nested mkdir -p + hardlink & FIFO immunity */
+    char nested_dest[256], victim_path[256], hardlink_dest[256], fifo_dest[256];
+    snprintf(nested_dest, sizeof(nested_dest), "%s/nested/a/b", base_tmp);
+    snprintf(victim_path, sizeof(victim_path), "%s/external_victim.txt", base_tmp);
+    const char *orig_victim = "IMMUTABLE_HOST_SECRET";
+    write_file_bytes(victim_path, orig_victim, strlen(orig_victim));
+
+    char parent_nested[256], parent_a[256];
+    snprintf(parent_nested, sizeof(parent_nested), "%s/nested", base_tmp);
+    snprintf(parent_a, sizeof(parent_a), "%s/nested/a", base_tmp);
+    mkdir(parent_nested, 0700);
+    mkdir(parent_a, 0700);
+    mkdir(nested_dest, 0700);
+
+    snprintf(hardlink_dest, sizeof(hardlink_dest), "%s/shader.frag", nested_dest);
+    snprintf(fifo_dest, sizeof(fifo_dest), "%s/preview.webp", nested_dest);
+    assert(link(victim_path, hardlink_dest) == 0);
+    assert(mkfifo(fifo_dest, 0600) == 0);
+
+    wwpkg_package_t *stream_pkg = wwpkg_open_metadata_only(pkg1_path);
+    assert(stream_pkg != NULL);
+    assert(wwpkg_extract_all(stream_pkg, nested_dest));
+    wwpkg_close(stream_pkg);
+
+    /* External hardlink target must remain untouched; extracted preview must be a regular file */
+    size_t vlen = 0;
+    uint8_t *vbytes = read_file_bytes(victim_path, &vlen);
+    assert(vlen == strlen(orig_victim) && memcmp(vbytes, orig_victim, vlen) == 0);
+    free(vbytes);
+
+    struct stat pst;
+    assert(lstat(fifo_dest, &pst) == 0 && S_ISREG(pst.st_mode));
+
+    char mf_dest[256], sig_dest[256];
+    snprintf(mf_dest, sizeof(mf_dest), "%s/manifest.json", nested_dest);
+    snprintf(sig_dest, sizeof(sig_dest), "%s/signature.sig", nested_dest);
+    assert(unlink(hardlink_dest) == 0);
+    assert(unlink(fifo_dest) == 0);
+    assert(unlink(mf_dest) == 0);
+    assert(unlink(sig_dest) == 0);
+    assert(rmdir(nested_dest) == 0);
+    assert(rmdir(parent_a) == 0);
+    assert(rmdir(parent_nested) == 0);
+    assert(unlink(victim_path) == 0);
+
+    free(raw1);
+    free(raw2);
+    free(big_prev);
+    unlink(p1_frag);
+    unlink(p1_prev);
+    unlink(p2_frag);
+    unlink(p2_prev);
+    rmdir(src1);
+    rmdir(src2);
+    unlink(pkg1_path);
+    unlink(pkg2_path);
+
+    printf("  -> Frame 0 retention, TOCTOU defense, skippable frame & confined extract passed.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -1197,11 +1464,12 @@ int main(void)
     test_trust_store_and_notary(base_tmp);
     test_dual_frame_metadata_fastpath_and_extract(base_tmp, priv_key);
     test_cold_open_and_1bit_tamper(base_tmp, priv_key);
+    test_promotion_retention_toctou_and_confinement(base_tmp, priv_key);
 
     rmdir(base_tmp);
 
     printf("==========================================================\n");
-    printf("  >>> ALL 9/9 .WWPKG CRYPTOGRAPHIC SUITES PASSED (100%%) <<<\n");
+    printf("  >>> ALL 10/10 .WWPKG CRYPTOGRAPHIC SUITES PASSED (100%%) <<<\n");
     printf("==========================================================\n");
     return 0;
 }
