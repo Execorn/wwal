@@ -171,6 +171,87 @@ static void challenge_ipc_wire_framing(void)
            "inline_json_len.\n");
 }
 
+/* Challenge 6: GLSL comment breakout sanitization & adversarial JSON fuzzing */
+static void challenge_glsl_comment_injection_and_json_adversarial(void)
+{
+    printf("[CHALLENGE 6] Testing GLSL comment breakout & adversarial JSON rejection...\n");
+
+    waywal_shader_graph_t *g = waywal_shader_graph_create();
+    int32_t n_uv = waywal_shader_graph_add_node(g, WAYWAL_NODE_IN_UV, "UV", 0, 0);
+    int32_t n_fx = waywal_shader_graph_add_node(g, WAYWAL_NODE_BUILTIN_EFFECT, "FX", 100, 0);
+    int32_t n_out = waywal_shader_graph_add_node(g, WAYWAL_NODE_OUT_IMAGE_PASS, "Sink", 200, 0);
+    waywal_graph_node_t *fx = waywal_shader_graph_find_node(g, (uint32_t)n_fx);
+    strncpy(fx->prop_or_asset_key, "waterripple\\\n#error INJECTED_CODE\r\n\\",
+            sizeof(fx->prop_or_asset_key) - 1);
+    waywal_shader_graph_connect(g, (uint32_t)n_uv, 0, (uint32_t)n_fx, 0);
+    waywal_shader_graph_connect(g, (uint32_t)n_fx, 0, (uint32_t)n_out, 0);
+
+    waywal_graph_schedule_t sched;
+    assert(waywal_shader_graph_analyze(g, &sched));
+    size_t glsl_len = 0;
+    char *glsl = waywal_shader_graph_compile_glsl(g, &sched, &glsl_len);
+    assert(glsl != NULL && glsl_len > 0);
+    assert(strstr(glsl, "\n#error INJECTED_CODE") == NULL);
+    assert(strstr(glsl, "    vec4 n2_out0 = ") != NULL);
+    free(glsl);
+    waywal_shader_graph_destroy(g);
+
+    waywal_shader_graph_t *dst = waywal_shader_graph_create();
+    char err_buf[256] = {0};
+
+    const char *bad_docs[] = {
+        "{\"schema_version\":1,\"flags\":1e30}",
+        "{\"schema_version\":1,\"flags\":-1}",
+        "{\"schema_version\":1,\"flags\":1.5}",
+        "{\"schema_version\":1,\"flags\":4294967296}",
+        "{\"schema_version\":1,\"nodes\":[{\"node_id\":1,\"opcode\":8,\"const_val\":[1e300,0,0,1]}]"
+        "}",
+        "{\"schema_version\":1,\"nodes\":[{\"node_id\":1,\"opcode\":8,\"const_val\":[1e999,0,0,1]}]"
+        "}",
+        "{\"schema_version\":1,\"graph_name\":\"bad\\u12\"}",
+        "{\"schema_version\":1,\"graph_name\":\"bad\nraw_newline\"}",
+        "{\"schema_version\":1} trailing_garbage",
+        "{\"schema_version\":1,\"nodes\":[{\"node_id\":0,\"opcode\":0}]}",
+        "{\"schema_version\":1,\"nodes\":[{\"node_id\":1,\"opcode\":999}]}",
+        "{\"schema_version\":1,\"nodes\":[{\"node_id\":1,\"opcode\":0},{\"node_id\":1,\"opcode\":1}"
+        "]}",
+        "{\"schema_version\":1,\"nodes\":[{\"node_id\":1,\"opcode\":0}],\"edges\":[{\"edge_id\":1,"
+        "\"src_node_id\":1,\"src_pin_index\":0,\"dst_node_id\":99,\"dst_pin_index\":0}]}",
+        "{\"schema_version\":1,\"nodes\":[{\"node_id\":1,\"opcode\":10},{\"node_id\":2,\"opcode\":"
+        "10}],\"edges\":[{\"edge_id\":1,\"src_node_id\":1,\"src_pin_index\":0,\"dst_node_id\":2,"
+        "\"dst_pin_index\":0},{\"edge_id\":2,\"src_node_id\":2,\"src_pin_index\":0,\"dst_node_id\":"
+        "1,\"dst_pin_index\":0}]}",
+    };
+
+    for (size_t i = 0; i < sizeof(bad_docs) / sizeof(bad_docs[0]); ++i) {
+        assert(!waywal_shader_graph_load_json(bad_docs[i], strlen(bad_docs[i]), dst, err_buf));
+    }
+
+    // Truncated \u escape right at exact slice end (ASAN out-of-bounds read guard)
+    const char *trunc_u = "{\"schema_version\":1,\"graph_name\":\"\\u12";
+    size_t trunc_len = strlen(trunc_u);
+    char *trunc_buf = (char *)malloc(trunc_len);
+    assert(trunc_buf != NULL);
+    memcpy(trunc_buf, trunc_u, trunc_len);
+    assert(!waywal_shader_graph_load_json(trunc_buf, trunc_len, dst, err_buf));
+    free(trunc_buf);
+
+    // Unordered JSON keys ("edges" before "nodes") must still sync WAYWAL_PIN_FLAG_CONNECTED
+    const char *edges_first =
+        "{\"schema_version\":1,"
+        "\"edges\":[{\"edge_id\":1,\"src_node_id\":1,\"src_pin_index\":0,\"dst_node_id\":2,\"dst_"
+        "pin_index\":0}],"
+        "\"nodes\":[{\"node_id\":1,\"opcode\":0},{\"node_id\":2,\"opcode\":50}]}";
+    assert(waywal_shader_graph_load_json(edges_first, strlen(edges_first), dst, err_buf));
+    assert((waywal_shader_graph_find_node(dst, 1)->outputs[0].flags & WAYWAL_PIN_FLAG_CONNECTED) !=
+           0u);
+    assert((waywal_shader_graph_find_node(dst, 2)->inputs[0].flags & WAYWAL_PIN_FLAG_CONNECTED) !=
+           0u);
+
+    waywal_shader_graph_destroy(dst);
+    printf("  [*] Comment injection neutralized and all adversarial JSON inputs rejected.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -182,6 +263,7 @@ int main(void)
     challenge_glsl_const_qualifier();
     challenge_cross_pass_undeclared_variables();
     challenge_ipc_wire_framing();
+    challenge_glsl_comment_injection_and_json_adversarial();
 
     printf("==========================================================\n");
     printf("  >>> ALL CHALLENGER SHADER GRAPH TESTS PASSED (100%%) <<<\n");

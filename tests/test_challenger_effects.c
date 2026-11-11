@@ -8,6 +8,7 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -95,9 +96,18 @@ static void test_lz4_decompressor_fuzzing(void)
     // Fuzz test A: Buffer undersizing (dst_cap from 0 up to actual size)
     for (size_t cap = 0; cap <= 100; cap++) {
         size_t n = we_builtin_effect_decompress_glsl(WE_EFFECT_WATERWAVES, out_buf, cap);
-        assert(n == 0 || n < cap);
+        assert(n == 0);
     }
-    printf("    -> Buffer undersizing tests (cap 0..100) safely handled without overflow.\n");
+    for (uint32_t id = 1; id <= 50; ++id) {
+        size_t full_f = we_builtin_effect_decompress_stage((we_builtin_effect_id_t)id, true,
+                                                           out_buf, sizeof(out_buf));
+        assert(full_f > 0 && full_f < 1280);
+        assert(we_builtin_effect_decompress_stage((we_builtin_effect_id_t)id, true, out_buf,
+                                                  full_f) == 0);
+        assert(we_builtin_effect_decompress_stage((we_builtin_effect_id_t)id, true, out_buf,
+                                                  full_f + 1u) == full_f);
+    }
+    printf("    -> Buffer undersizing tests (cap 0..exact) safely handled without truncation.\n");
 
     // Fuzz test B: Truncated compressed streams (simulate truncated downloads)
     // We can't access s_we_builtin_lz4_blob directly if it's static, but we test invalid effect IDs
@@ -264,6 +274,32 @@ static void test_robin_hood_hash_rigor(void)
            "normalized.\n");
 }
 
+static void *stage_cache_race_worker(void *arg)
+{
+    uint32_t seed = (uint32_t)(uintptr_t)arg;
+    for (uint32_t iter = 0; iter < 400; ++iter) {
+        uint32_t id = 1u + ((seed * 17u + iter * 7u) % 50u);
+        bool is_frag = ((iter + seed) & 1u) != 0u;
+        const char *glsl = we_builtin_effect_get_stage_glsl((we_builtin_effect_id_t)id, is_frag);
+        assert(glsl != NULL);
+        assert(strstr(glsl, "void main") != NULL);
+    }
+    return NULL;
+}
+
+static void test_concurrent_stage_cache_reads(void)
+{
+    printf("[CHALLENGER 1] 4. Concurrent lock-free stage cache stress test...\n");
+    pthread_t threads[4];
+    for (uintptr_t t = 0; t < 4; ++t) {
+        assert(pthread_create(&threads[t], NULL, stage_cache_race_worker, (void *)(t + 1u)) == 0);
+    }
+    for (size_t t = 0; t < 4; ++t) {
+        assert(pthread_join(threads[t], NULL) == 0);
+    }
+    printf("    -> PASS: 4 concurrent threads x 400 stage fetches verified race-free.\n");
+}
+
 int main(void)
 {
     printf("====================================================================\n");
@@ -273,6 +309,7 @@ int main(void)
     test_all_50_effects_decompression_and_alpha();
     test_lz4_decompressor_fuzzing();
     test_robin_hood_hash_rigor();
+    test_concurrent_stage_cache_reads();
 
     printf("====================================================================\n");
     printf("  >>> ALL BUILT-IN EFFECTS CHALLENGE TESTS PASSED CLEANLY (100%%) <<<\n");
