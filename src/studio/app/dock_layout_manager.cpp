@@ -243,6 +243,30 @@ DockLayoutManager::DockLayoutManager(QMainWindow *mainWindow, QObject *parent)
     m_aliases.insert(QStringLiteral("StudioFooterBar"), QStringLiteral("StudioFooterBar"));
     m_aliases.insert(QStringLiteral("Footer"), QStringLiteral("StudioFooterBar"));
 
+    m_aliases.insert(QStringLiteral("NodeGraphEditorWidget"),
+                     QStringLiteral("NodeGraphEditorWidget"));
+    m_aliases.insert(QStringLiteral("NodeGraphEditor"), QStringLiteral("NodeGraphEditorWidget"));
+    m_aliases.insert(QStringLiteral("ShaderGraph"), QStringLiteral("NodeGraphEditorWidget"));
+
+    m_aliases.insert(QStringLiteral("EffectLibraryBrowserWidget"),
+                     QStringLiteral("EffectLibraryBrowserWidget"));
+    m_aliases.insert(QStringLiteral("EffectLibraryBrowser"),
+                     QStringLiteral("EffectLibraryBrowserWidget"));
+    m_aliases.insert(QStringLiteral("EffectLibrary"), QStringLiteral("EffectLibraryBrowserWidget"));
+
+    m_aliases.insert(QStringLiteral("CameraLightingInspectorWidget"),
+                     QStringLiteral("CameraLightingInspectorWidget"));
+    m_aliases.insert(QStringLiteral("CameraLightingInspector"),
+                     QStringLiteral("CameraLightingInspectorWidget"));
+    m_aliases.insert(QStringLiteral("Camera3D"), QStringLiteral("CameraLightingInspectorWidget"));
+
+    m_aliases.insert(QStringLiteral("PhysicsSpringInspectorWidget"),
+                     QStringLiteral("PhysicsSpringInspectorWidget"));
+    m_aliases.insert(QStringLiteral("PhysicsSpringInspector"),
+                     QStringLiteral("PhysicsSpringInspectorWidget"));
+    m_aliases.insert(QStringLiteral("PuppetPhysics"),
+                     QStringLiteral("PhysicsSpringInspectorWidget"));
+
     // Populate built-in perspectives
     setupDefaultPerspectives();
 }
@@ -1013,7 +1037,7 @@ QJsonObject DockLayoutManager::serializeLayout() const
 {
     QJsonObject root;
     root.insert(QStringLiteral("version"), 1);
-    root.insert(QStringLiteral("layout_revision"), 4);
+    root.insert(QStringLiteral("layout_revision"), 5);
     root.insert(QStringLiteral("active_perspective"), m_activePerspective);
 
     QJsonObject perspsObj;
@@ -1034,7 +1058,7 @@ bool DockLayoutManager::deserializeLayout(const QJsonObject &root)
     const int revision = root.value(QStringLiteral("layout_revision")).toInt(0);
     QJsonObject perspsObj = root.value(QStringLiteral("perspectives")).toObject();
 
-    if (revision < 4) {
+    if (revision < 5) {
         // Refresh all 4 built-in perspectives to current canonical layout trees
         setupDefaultPerspectives();
         for (auto it = perspsObj.constBegin(); it != perspsObj.constEnd(); ++it) {
@@ -1118,7 +1142,7 @@ bool DockLayoutManager::loadLayoutFromFile(const QString &filePath)
     }
 
     QJsonObject rootObj = doc.object();
-    const bool needsMigrationSave = (rootObj.value(QStringLiteral("layout_revision")).toInt(0) < 4);
+    const bool needsMigrationSave = (rootObj.value(QStringLiteral("layout_revision")).toInt(0) < 5);
     if (!deserializeLayout(rootObj)) {
         switchPerspective(m_activePerspective);
         return false;
@@ -1139,7 +1163,7 @@ QJsonObject DockLayoutManager::createDefaultPerspectiveTree()
     tree.insert(QStringLiteral("split_direction"), QStringLiteral("Horizontal"));
     tree.insert(QStringLiteral("split_ratio"), 0.23);
 
-    // Left: Wallpapers & Workshop browser
+    // Left: Wallpapers, Workshop, Open Hub, and Effect Library
     QJsonObject leftTab;
     leftTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
     leftTab.insert(QStringLiteral("active_tab"), QStringLiteral("Wallpapers"));
@@ -1147,10 +1171,12 @@ QJsonObject DockLayoutManager::createDefaultPerspectiveTree()
     leftTabs.append(QStringLiteral("Wallpapers"));
     leftTabs.append(QStringLiteral("WorkshopBrowser"));
     leftTabs.append(QStringLiteral("OpenHubBrowser"));
+    leftTabs.append(QStringLiteral("EffectLibraryBrowser"));
     leftTab.insert(QStringLiteral("tabs"), leftTabs);
     tree.insert(QStringLiteral("left"), leftTab);
 
-    // Right: Center (Viewport + Bezier/Audio) + Right (Inspector/Theme)
+    // Right: Center (Viewport + NodeGraph/Bezier/Audio/Telemetry) + Right
+    // (Inspector/Camera/Physics/Theme)
     QJsonObject centerVertical;
     centerVertical.insert(QStringLiteral("split_direction"), QStringLiteral("Vertical"));
     centerVertical.insert(QStringLiteral("split_ratio"), 0.59);
@@ -1165,6 +1191,7 @@ QJsonObject DockLayoutManager::createDefaultPerspectiveTree()
     centerBottom.insert(QStringLiteral("active_tab"), QStringLiteral("CubicBezier"));
     QJsonArray bottomTabs;
     bottomTabs.append(QStringLiteral("CubicBezier"));
+    bottomTabs.append(QStringLiteral("NodeGraphEditor"));
     bottomTabs.append(QStringLiteral("AudioFFT"));
     bottomTabs.append(QStringLiteral("Telemetry"));
     centerBottom.insert(QStringLiteral("tabs"), bottomTabs);
@@ -1180,6 +1207,8 @@ QJsonObject DockLayoutManager::createDefaultPerspectiveTree()
     inspectorTab.insert(QStringLiteral("active_tab"), QStringLiteral("PropertyInspectorWidget"));
     QJsonArray inspectorTabs;
     inspectorTabs.append(QStringLiteral("PropertyInspectorWidget"));
+    inspectorTabs.append(QStringLiteral("CameraLightingInspector"));
+    inspectorTabs.append(QStringLiteral("PhysicsSpringInspector"));
     inspectorTabs.append(QStringLiteral("ThemeStudioWidget"));
     inspectorTab.insert(QStringLiteral("tabs"), inspectorTabs);
     rightSplit.insert(QStringLiteral("right"), inspectorTab);
@@ -1193,38 +1222,50 @@ QJsonObject DockLayoutManager::createShaderCodingPerspectiveTree()
 {
     QJsonObject tree;
     tree.insert(QStringLiteral("split_direction"), QStringLiteral("Horizontal"));
-    tree.insert(QStringLiteral("split_ratio"), 0.56);
+    tree.insert(QStringLiteral("split_ratio"), 0.54);
 
-    // Left: Expanded GPU Preview Viewport
-    QJsonObject leftNode;
-    leftNode.insert(QStringLiteral("type"), QStringLiteral("DockNode"));
-    leftNode.insert(QStringLiteral("content"), QStringLiteral("GpuPreviewViewport"));
-    tree.insert(QStringLiteral("left"), leftNode);
+    // Left: Viewport on top, NodeGraphEditor on bottom
+    QJsonObject leftVertical;
+    leftVertical.insert(QStringLiteral("split_direction"), QStringLiteral("Vertical"));
+    leftVertical.insert(QStringLiteral("split_ratio"), 0.52);
 
-    // Right: Inspector on top, Transition & Easing on bottom
+    QJsonObject leftTop;
+    leftTop.insert(QStringLiteral("type"), QStringLiteral("DockNode"));
+    leftTop.insert(QStringLiteral("content"), QStringLiteral("GpuPreviewViewport"));
+    leftVertical.insert(QStringLiteral("top"), leftTop);
+
+    QJsonObject leftBottom;
+    leftBottom.insert(QStringLiteral("type"), QStringLiteral("DockNode"));
+    leftBottom.insert(QStringLiteral("content"), QStringLiteral("NodeGraphEditor"));
+    leftVertical.insert(QStringLiteral("bottom"), leftBottom);
+
+    tree.insert(QStringLiteral("left"), leftVertical);
+
+    // Right: Inspector tab on top, Telemetry tab on bottom
     QJsonObject rightSplit;
     rightSplit.insert(QStringLiteral("split_direction"), QStringLiteral("Vertical"));
-    rightSplit.insert(QStringLiteral("split_ratio"), 0.62);
+    rightSplit.insert(QStringLiteral("split_ratio"), 0.64);
 
-    QJsonObject inspectorTab;
-    inspectorTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
-    inspectorTab.insert(QStringLiteral("active_tab"), QStringLiteral("PropertyInspectorWidget"));
-    QJsonArray inspectorTabs;
-    inspectorTabs.append(QStringLiteral("PropertyInspectorWidget"));
-    inspectorTabs.append(QStringLiteral("ThemeStudioWidget"));
-    inspectorTabs.append(QStringLiteral("Wallpapers"));
-    inspectorTab.insert(QStringLiteral("tabs"), inspectorTabs);
-    rightSplit.insert(QStringLiteral("top"), inspectorTab);
+    QJsonObject rightTopTab;
+    rightTopTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
+    rightTopTab.insert(QStringLiteral("active_tab"), QStringLiteral("EffectLibraryBrowser"));
+    QJsonArray rightTopTabs;
+    rightTopTabs.append(QStringLiteral("EffectLibraryBrowser"));
+    rightTopTabs.append(QStringLiteral("PropertyInspectorWidget"));
+    rightTopTabs.append(QStringLiteral("CameraLightingInspector"));
+    rightTopTabs.append(QStringLiteral("PhysicsSpringInspector"));
+    rightTopTab.insert(QStringLiteral("tabs"), rightTopTabs);
+    rightSplit.insert(QStringLiteral("top"), rightTopTab);
 
-    QJsonObject telemetryTab;
-    telemetryTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
-    telemetryTab.insert(QStringLiteral("active_tab"), QStringLiteral("CubicBezier"));
-    QJsonArray telemetryTabs;
-    telemetryTabs.append(QStringLiteral("CubicBezier"));
-    telemetryTabs.append(QStringLiteral("Telemetry"));
-    telemetryTabs.append(QStringLiteral("AudioFFT"));
-    telemetryTab.insert(QStringLiteral("tabs"), telemetryTabs);
-    rightSplit.insert(QStringLiteral("bottom"), telemetryTab);
+    QJsonObject rightBottomTab;
+    rightBottomTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
+    rightBottomTab.insert(QStringLiteral("active_tab"), QStringLiteral("Telemetry"));
+    QJsonArray rightBottomTabs;
+    rightBottomTabs.append(QStringLiteral("Telemetry"));
+    rightBottomTabs.append(QStringLiteral("AudioFFT"));
+    rightBottomTabs.append(QStringLiteral("CubicBezier"));
+    rightBottomTab.insert(QStringLiteral("tabs"), rightBottomTabs);
+    rightSplit.insert(QStringLiteral("bottom"), rightBottomTab);
 
     tree.insert(QStringLiteral("right"), rightSplit);
 

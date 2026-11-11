@@ -112,6 +112,13 @@ static void parse_pass_json_overrides(we_material_pass_t *pass, const we_jval_t 
     if (dt) {
         pass->depthtest_enabled = (strcasecmp(dt, "enabled") == 0);
     }
+    const char *dw = jval_str(jobj_get(pnode, "depthwrite"), NULL);
+    if (dw) {
+        pass->depthwrite_enabled =
+            (strcasecmp(dw, "disabled") != 0 && strcasecmp(dw, "false") != 0);
+    } else {
+        pass->depthwrite_enabled = true;
+    }
     const char *cm = jval_str(jobj_get(pnode, "cullmode"), NULL);
     if (cm) {
         pass->cull_enabled = (strcasecmp(cm, "nocull") != 0 && strcasecmp(cm, "disabled") != 0);
@@ -891,15 +898,11 @@ void apply_scene_script_user_properties(we_scene_t *scene)
     }
 }
 
-static uint16_t read_u16_le(const uint8_t *p)
-{
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
+static uint16_t read_u16_le(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
 static uint32_t read_u32_le(const uint8_t *p)
 {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 static bool resample_stereo_f32_to_48k(float *src_stereo, size_t src_frames, uint32_t sample_rate,
@@ -942,11 +945,9 @@ static bool resample_stereo_f32_to_48k(float *src_stereo, size_t src_frames, uin
         size_t i1 = (i0 + 1 < src_frames) ? (i0 + 1) : i0;
         float frac = (float)(src_pos - (double)i0);
         dst_stereo[i * 2u + 0u] =
-            src_stereo[i0 * 2u + 0u] +
-            frac * (src_stereo[i1 * 2u + 0u] - src_stereo[i0 * 2u + 0u]);
+            src_stereo[i0 * 2u + 0u] + frac * (src_stereo[i1 * 2u + 0u] - src_stereo[i0 * 2u + 0u]);
         dst_stereo[i * 2u + 1u] =
-            src_stereo[i0 * 2u + 1u] +
-            frac * (src_stereo[i1 * 2u + 1u] - src_stereo[i0 * 2u + 1u]);
+            src_stereo[i0 * 2u + 1u] + frac * (src_stereo[i1 * 2u + 1u] - src_stereo[i0 * 2u + 1u]);
     }
 
     free(src_stereo);
@@ -1006,9 +1007,8 @@ bool we_audio_decode_wav_memory(const uint8_t *data, size_t size, float **out_st
         sample_rate > 384000u) {
         return false;
     }
-    if (!((audio_fmt == 1u &&
-           (bits_per_sample == 8 || bits_per_sample == 16 || bits_per_sample == 24 ||
-            bits_per_sample == 32)) ||
+    if (!((audio_fmt == 1u && (bits_per_sample == 8 || bits_per_sample == 16 ||
+                               bits_per_sample == 24 || bits_per_sample == 32)) ||
           (audio_fmt == 3u && (bits_per_sample == 32 || bits_per_sample == 64)))) {
         return false;
     }
@@ -1185,10 +1185,9 @@ static bool we_audio_decode_ffmpeg_memory(const uint8_t *data, size_t size, floa
     void (*p_av_packet_free)(AVPacket **) = NULL;
     void (*p_av_packet_unref)(AVPacket *) = NULL;
 
-    AVIOContext *(*p_avio_alloc_context)(unsigned char *, int, int, void *,
-                                         int (*)(void *, uint8_t *, int),
-                                         int (*)(void *, const uint8_t *, int),
-                                         int64_t (*)(void *, int64_t, int)) = NULL;
+    AVIOContext *(*p_avio_alloc_context)(
+        unsigned char *, int, int, void *, int (*)(void *, uint8_t *, int),
+        int (*)(void *, const uint8_t *, int), int64_t (*)(void *, int64_t, int)) = NULL;
     void (*p_avio_context_free)(AVIOContext **) = NULL;
     AVFormatContext *(*p_avformat_alloc_context)(void) = NULL;
     int (*p_avformat_open_input)(AVFormatContext **, const char *, const AVInputFormat *,
@@ -1228,10 +1227,10 @@ static bool we_audio_decode_ffmpeg_memory(const uint8_t *data, size_t size, floa
     if (!p_av_malloc || !p_av_freep || !p_av_frame_alloc || !p_av_frame_free || !p_av_frame_unref ||
         !p_avcodec_find_decoder || !p_avcodec_alloc_context3 || !p_avcodec_free_context ||
         !p_avcodec_parameters_to_context || !p_avcodec_open2 || !p_avcodec_send_packet ||
-        !p_avcodec_receive_frame || !p_av_packet_alloc || !p_av_packet_free ||
-        !p_av_packet_unref || !p_avio_alloc_context || !p_avio_context_free ||
-        !p_avformat_alloc_context || !p_avformat_open_input || !p_avformat_find_stream_info ||
-        !p_av_find_best_stream || !p_av_read_frame || !p_avformat_close_input) {
+        !p_avcodec_receive_frame || !p_av_packet_alloc || !p_av_packet_free || !p_av_packet_unref ||
+        !p_avio_alloc_context || !p_avio_context_free || !p_avformat_alloc_context ||
+        !p_avformat_open_input || !p_avformat_find_stream_info || !p_av_find_best_stream ||
+        !p_av_read_frame || !p_avformat_close_input) {
         dlclose(h_avf);
         dlclose(h_avc);
         dlclose(h_avu);
@@ -1347,15 +1346,15 @@ static bool we_audio_decode_ffmpeg_memory(const uint8_t *data, size_t size, floa
                                     v = (float)((const double *)frame->data[c])[s];
                                     break;
                                 case AV_SAMPLE_FMT_DBL:
-                                    v = (float)((const double *)frame->data[0])[s * (size_t)ch +
-                                                                                (size_t)c];
+                                    v = (float)((const double *)
+                                                    frame->data[0])[s * (size_t)ch + (size_t)c];
                                     break;
                                 case AV_SAMPLE_FMT_S16P:
                                     v = (float)((const int16_t *)frame->data[c])[s] / 32768.0f;
                                     break;
                                 case AV_SAMPLE_FMT_S16:
-                                    v = (float)((const int16_t *)frame->data[0])[s * (size_t)ch +
-                                                                                 (size_t)c] /
+                                    v = (float)((const int16_t *)
+                                                    frame->data[0])[s * (size_t)ch + (size_t)c] /
                                         32768.0f;
                                     break;
                                 case AV_SAMPLE_FMT_S32P:
@@ -1373,8 +1372,8 @@ static bool we_audio_decode_ffmpeg_memory(const uint8_t *data, size_t size, floa
                                         128.0f;
                                     break;
                                 case AV_SAMPLE_FMT_U8:
-                                    v = ((float)((const uint8_t *)frame->data[0])[s * (size_t)ch +
-                                                                                  (size_t)c] -
+                                    v = ((float)((const uint8_t *)
+                                                     frame->data[0])[s * (size_t)ch + (size_t)c] -
                                          128.0f) /
                                         128.0f;
                                     break;
@@ -1468,8 +1467,8 @@ static bool we_audio_decode_au_memory(const uint8_t *data, size_t size, float **
         return false;
     }
     size_t avail = size - (size_t)data_offset;
-    size_t pcm_bytes = (data_size == 0xFFFFFFFFu || (size_t)data_size > avail) ? avail
-                                                                               : (size_t)data_size;
+    size_t pcm_bytes =
+        (data_size == 0xFFFFFFFFu || (size_t)data_size > avail) ? avail : (size_t)data_size;
     size_t frame_stride = bps * (size_t)channels;
     size_t src_frames = pcm_bytes / frame_stride;
     if (src_frames == 0u) {
@@ -1780,9 +1779,8 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
     if (snd_node && snd_node->type == JVAL_OBJ && jobj_get(snd_node, "value")) {
         snd_node = jobj_get(snd_node, "value");
     }
-    if (snd_node &&
-        ((snd_node->type == JVAL_ARR && snd_node->arr.count > 0) ||
-         (snd_node->type == JVAL_STR && snd_node->str && snd_node->str[0] != '\0'))) {
+    if (snd_node && ((snd_node->type == JVAL_ARR && snd_node->arr.count > 0) ||
+                     (snd_node->type == JVAL_STR && snd_node->str && snd_node->str[0] != '\0'))) {
         obj->is_sound_object = true;
         obj->sound_volume = jval_float(jobj_get(onode, "volume"), &scene->project, 1.0f,
                                        obj->user_prop_volume, sizeof(obj->user_prop_volume));
@@ -1864,8 +1862,7 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
         if (!font_str && tnode->type == JVAL_OBJ) {
             font_str = jval_str(jobj_get(tnode, "font"), NULL);
         }
-        snprintf(obj->text_font, sizeof(obj->text_font), "%s",
-                 font_str ? font_str : "monospace");
+        snprintf(obj->text_font, sizeof(obj->text_font), "%s", font_str ? font_str : "monospace");
 
         const we_jval_t *ps_node = jobj_get(onode, "pointsize");
         if (!ps_node && tnode->type == JVAL_OBJ) {
@@ -1930,6 +1927,89 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
         attach_object_script(scene, obj, WE_SCRIPT_PROP_TEXT, NULL, tnode, NULL);
         if (ps_node) {
             attach_object_script(scene, obj, WE_SCRIPT_PROP_POINTSIZE, NULL, ps_node, NULL);
+        }
+    }
+
+    /* 3. Steam Wallpaper Engine "light" object */
+    const we_jval_t *lnode = jobj_get(onode, "light");
+    const char *otype = jval_str(jobj_get(onode, "type"), "");
+    if (lnode || (otype && strcasecmp(otype, "light") == 0)) {
+        obj->is_light_object = true;
+        obj->light_intensity = 1.0f;
+        obj->light_radius = 1000.0f;
+        obj->light_cone_angle = 45.0f;
+        obj->light_inner_cone_angle = 30.0f;
+        obj->light_specular_power = 32.0f;
+        obj->light_type = WE_LIGHT_POINT;
+
+        const we_jval_t *l_src = (lnode && lnode->type == JVAL_OBJ) ? lnode : onode;
+
+        const char *lt = jval_str(jobj_get(l_src, "lighttype"), NULL);
+        if (!lt) {
+            lt = jval_str(jobj_get(l_src, "type"), NULL);
+        }
+        if (lt) {
+            if (strcasecmp(lt, "directional") == 0 || strcasecmp(lt, "dir") == 0) {
+                obj->light_type = WE_LIGHT_DIRECTIONAL;
+            } else if (strcasecmp(lt, "spot") == 0) {
+                obj->light_type = WE_LIGHT_SPOT;
+            } else if (strcasecmp(lt, "tube") == 0 || strcasecmp(lt, "line") == 0) {
+                obj->light_type = WE_LIGHT_TUBE;
+            } else {
+                obj->light_type = WE_LIGHT_POINT;
+            }
+        }
+
+        const we_jval_t *col_node = jobj_get(l_src, "color");
+        if (col_node) {
+            jval_floats(col_node, &scene->project, obj->color, 3, obj->color_user_prop,
+                        sizeof(obj->color_user_prop));
+        }
+
+        const we_jval_t *int_node = jobj_get(l_src, "intensity");
+        if (int_node) {
+            obj->light_intensity = jval_float(int_node, &scene->project, 1.0f, NULL, 0);
+        }
+
+        const we_jval_t *rad_node = jobj_get(l_src, "radius");
+        if (rad_node) {
+            obj->light_radius = jval_float(rad_node, &scene->project, 1000.0f, NULL, 0);
+        }
+
+        const we_jval_t *cone_node = jobj_get(l_src, "coneangle");
+        if (!cone_node) {
+            cone_node = jobj_get(l_src, "outerconeangle");
+        }
+        if (cone_node) {
+            obj->light_cone_angle = jval_float(cone_node, &scene->project, 45.0f, NULL, 0);
+        }
+
+        const we_jval_t *inner_node = jobj_get(l_src, "innerconeangle");
+        if (inner_node) {
+            obj->light_inner_cone_angle = jval_float(inner_node, &scene->project, 30.0f, NULL, 0);
+        }
+
+        const we_jval_t *spec_node = jobj_get(l_src, "specularpower");
+        if (spec_node) {
+            obj->light_specular_power = jval_float(spec_node, &scene->project, 32.0f, NULL, 0);
+        }
+
+        const we_jval_t *dir_node = jobj_get(l_src, "direction");
+        if (dir_node) {
+            jval_floats(dir_node, &scene->project, obj->light_direction, 3, NULL, 0);
+        } else {
+            float pitch = obj->angles[0], yaw = obj->angles[1];
+            obj->light_direction[0] = -sinf(yaw) * cosf(pitch);
+            obj->light_direction[1] = sinf(pitch);
+            obj->light_direction[2] = -cosf(yaw) * cosf(pitch);
+        }
+
+        const we_jval_t *tube_node = jobj_get(l_src, "tubelength");
+        if (!tube_node) {
+            tube_node = jobj_get(l_src, "length");
+        }
+        if (tube_node) {
+            obj->light_tube_length = jval_float(tube_node, &scene->project, 100.0f, NULL, 0);
         }
     }
 
@@ -2260,6 +2340,104 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
     }
 }
 
+static void parse_camera_keyframe_paths(we_scene_t *scene, const we_jval_t *paths_node)
+{
+    if (!scene || !paths_node) {
+        return;
+    }
+    const we_jval_t *kfs_arr = NULL;
+    if (paths_node->type == JVAL_ARR) {
+        kfs_arr = paths_node;
+    } else if (paths_node->type == JVAL_OBJ) {
+        const char *loop_str = jval_str(jobj_get(paths_node, "mode"), NULL);
+        if (!loop_str) {
+            loop_str = jval_str(jobj_get(paths_node, "loop"), NULL);
+        }
+        if (loop_str) {
+            if (strcasecmp(loop_str, "pingpong") == 0) {
+                scene->camera.path_loop_mode = WE_CAM_PATH_PINGPONG;
+            } else if (strcasecmp(loop_str, "once") == 0) {
+                scene->camera.path_loop_mode = WE_CAM_PATH_ONCE;
+            } else {
+                scene->camera.path_loop_mode = WE_CAM_PATH_LOOP;
+            }
+        }
+        kfs_arr = jobj_get(paths_node, "keyframes");
+        if (!kfs_arr) {
+            kfs_arr = jobj_get(paths_node, "points");
+        }
+    }
+
+    if (!kfs_arr || kfs_arr->type != JVAL_ARR || kfs_arr->arr.count == 0) {
+        return;
+    }
+
+    uint32_t count = 0;
+    for (size_t k = 0; k < kfs_arr->arr.count && count < WE_CAMERA_MAX_KEYFRAMES; k++) {
+        const we_jval_t *kn = kfs_arr->arr.items[k];
+        if (!kn || kn->type != JVAL_OBJ) {
+            continue;
+        }
+        we_camera_kf_t *kf = &scene->camera.keyframes[count++];
+        memset(kf, 0, sizeof(*kf));
+        kf->time_sec = jval_float(jobj_get(kn, "time"), &scene->project, (float)k, NULL, 0);
+        if (!jobj_get(kn, "time")) {
+            kf->time_sec = jval_float(jobj_get(kn, "time_sec"), &scene->project, (float)k, NULL, 0);
+        }
+
+        /* Position */
+        const we_jval_t *pos_n = jobj_get(kn, "position");
+        if (!pos_n) {
+            pos_n = jobj_get(kn, "eye");
+        }
+        if (!pos_n) {
+            pos_n = jobj_get(kn, "origin");
+        }
+        if (pos_n) {
+            jval_floats(pos_n, &scene->project, kf->position, 3, NULL, 0);
+        }
+
+        /* Orientation: quaternion or Euler angles */
+        const we_jval_t *q_n = jobj_get(kn, "orientation");
+        if (!q_n) {
+            q_n = jobj_get(kn, "quat");
+        }
+        if (!q_n) {
+            q_n = jobj_get(kn, "rotation");
+        }
+        if (q_n && q_n->type == JVAL_ARR && q_n->arr.count >= 4) {
+            jval_floats(q_n, &scene->project, kf->orientation_quat, 4, NULL, 0);
+            quat_normalize(kf->orientation_quat);
+        } else if (q_n && q_n->type == JVAL_ARR && q_n->arr.count == 3) {
+            float angles[3] = {0};
+            jval_floats(q_n, &scene->project, angles, 3, NULL, 0);
+            /* Euler intrinsic ZYX to unit quaternion */
+            float p = angles[0] * 0.5f, y = angles[1] * 0.5f, r = angles[2] * 0.5f;
+            float cp = cosf(p), sp = sinf(p);
+            float cy = cosf(y), sy = sinf(y);
+            float cr = cosf(r), sr = sinf(r);
+            kf->orientation_quat[0] = sp * cy * cr - cp * sy * sr;
+            kf->orientation_quat[1] = cp * sy * cr + sp * cy * sr;
+            kf->orientation_quat[2] = cp * cy * sr - sp * sy * cr;
+            kf->orientation_quat[3] = cp * cy * cr + sp * sy * sr;
+            quat_normalize(kf->orientation_quat);
+        } else {
+            quat_identity(kf->orientation_quat);
+        }
+
+        kf->fov_deg =
+            jval_float(jobj_get(kn, "fov"), &scene->project, scene->camera.fov_y_deg, NULL, 0);
+        kf->focal_distance =
+            jval_float(jobj_get(kn, "focaldistance"), &scene->project, 1000.0f, NULL, 0);
+        kf->aperture_fstop = jval_float(jobj_get(kn, "aperture"), &scene->project, 2.8f, NULL, 0);
+        kf->tension = jval_float(jobj_get(kn, "tension"), &scene->project, 0.5f, NULL, 0);
+    }
+    if (count > 0) {
+        scene->camera.keyframe_count = count;
+        scene->camera.path_enabled = 1;
+    }
+}
+
 we_scene_t *we_scene_load_cpu(const char *workshop_dir, const char *prop_overrides)
 {
     if (!workshop_dir || workshop_dir[0] == '\0') {
@@ -2345,18 +2523,90 @@ we_scene_t *we_scene_load_cpu(const char *workshop_dir, const char *prop_overrid
                 jval_float(jobj_get(gen, "camerashakespeed"), &scene->project, 1.0f, NULL, 0);
         }
 
-        scene->camera_eye[0] = scene->ortho_width * 0.5f;
-        scene->camera_eye[1] = scene->ortho_height * 0.5f;
-        scene->camera_eye[2] = -1000.0f;
-        scene->camera_center[0] = scene->ortho_width * 0.5f;
-        scene->camera_center[1] = scene->ortho_height * 0.5f;
-        scene->camera_center[2] = 0.0f;
+        we_camera3d_init_default(&scene->camera, scene->ortho_width, scene->ortho_height);
 
         const we_jval_t *cam = jobj_get(sroot, "camera");
+
+        const we_jval_t *proj_node = jobj_get(cam ? cam : sroot, "projection");
+        if (!proj_node && cam) {
+            proj_node = jobj_get(sroot, "projection");
+        }
+        if (proj_node) {
+            if (proj_node->type == JVAL_STR) {
+                const char *pstr = proj_node->str;
+                if (pstr && (strcasecmp(pstr, "perspective") == 0 || strcasecmp(pstr, "3d") == 0)) {
+                    scene->camera.projection_mode = WE_PROJ_PERSPECTIVE_3D;
+                    scene->is_3d = true;
+                } else if (pstr && (strcasecmp(pstr, "depthparallax") == 0 ||
+                                    strcasecmp(pstr, "2.5d") == 0)) {
+                    scene->camera.projection_mode = WE_PROJ_DEPTH_PARALLAX_25D;
+                    scene->is_3d = true;
+                } else {
+                    scene->camera.projection_mode = WE_PROJ_ORTHOGRAPHIC_2D;
+                }
+            } else {
+                scene->camera.projection_mode =
+                    (uint32_t)jval_float(proj_node, &scene->project, 0.0f, NULL, 0);
+                if (scene->camera.projection_mode != WE_PROJ_ORTHOGRAPHIC_2D) {
+                    scene->is_3d = true;
+                }
+            }
+        }
+        if (jval_bool_resolved(jobj_get(sroot, "is3d"), &scene->project, false, NULL, 0)) {
+            scene->is_3d = true;
+            scene->camera.projection_mode = WE_PROJ_PERSPECTIVE_3D;
+        }
+
+        const we_jval_t *fov_node = jobj_get(cam ? cam : sroot, "fov");
+        if (!fov_node && cam) {
+            fov_node = jobj_get(sroot, "fov");
+        }
+        if (!fov_node) {
+            fov_node = jobj_get(cam ? cam : sroot, "fovy");
+        }
+        if (fov_node) {
+            scene->camera.fov_y_deg = jval_float(fov_node, &scene->project, 60.0f, NULL, 0);
+        }
+
+        const we_jval_t *nz_node = jobj_get(cam ? cam : sroot, "nearz");
+        if (!nz_node && cam) {
+            nz_node = jobj_get(sroot, "nearz");
+        }
+        if (nz_node) {
+            scene->camera.near_z = jval_float(nz_node, &scene->project, 1.0f, NULL, 0);
+        }
+
+        const we_jval_t *fz_node = jobj_get(cam ? cam : sroot, "farz");
+        if (!fz_node && cam) {
+            fz_node = jobj_get(sroot, "farz");
+        }
+        if (fz_node) {
+            scene->camera.far_z = jval_float(fz_node, &scene->project, 10000.0f, NULL, 0);
+        }
+
         if (cam && cam->type == JVAL_OBJ) {
-            jval_floats(jobj_get(cam, "eye"), &scene->project, scene->camera_eye, 3, NULL, 0);
-            jval_floats(jobj_get(cam, "center"), &scene->project, scene->camera_center, 3, NULL, 0);
-            jval_floats(jobj_get(cam, "up"), &scene->project, scene->camera_up, 3, NULL, 0);
+            jval_floats(jobj_get(cam, "eye"), &scene->project, scene->camera.eye_pos, 3, NULL, 0);
+            jval_floats(jobj_get(cam, "center"), &scene->project, scene->camera.target_pos, 3, NULL,
+                        0);
+            jval_floats(jobj_get(cam, "up"), &scene->project, scene->camera.up_vec, 3, NULL, 0);
+        }
+        memcpy(scene->camera_eye, scene->camera.eye_pos, 3 * sizeof(float));
+        memcpy(scene->camera_center, scene->camera.target_pos, 3 * sizeof(float));
+        memcpy(scene->camera_up, scene->camera.up_vec, 3 * sizeof(float));
+
+        scene->camera.parallax_amount[0] = scene->camera_parallax_amount * 25.0f;
+        scene->camera.parallax_amount[1] = scene->camera_parallax_amount * 25.0f;
+        scene->camera.parallax_smoothing = scene->camera_parallax_delay > 0.001f ? 0.15f : 1.0f;
+
+        const we_jval_t *cpaths = jobj_get(sroot, "camerapaths");
+        if (!cpaths) {
+            cpaths = jobj_get(sroot, "camerapath");
+        }
+        if (!cpaths && cam) {
+            cpaths = jobj_get(cam, "paths");
+        }
+        if (cpaths) {
+            parse_camera_keyframe_paths(scene, cpaths);
         }
 
         const we_jval_t *objs = jobj_get(sroot, "objects");
@@ -2384,6 +2634,7 @@ we_scene_t *we_scene_load_cpu(const char *workshop_dir, const char *prop_overrid
         if (sroot) {
             jval_free(sroot);
         }
+        we_camera3d_init_default(&scene->camera, scene->ortho_width, scene->ortho_height);
         scene->camera_eye[0] = scene->ortho_width * 0.5f;
         scene->camera_eye[1] = scene->ortho_height * 0.5f;
         scene->camera_eye[2] = -1000.0f;

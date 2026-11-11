@@ -606,6 +606,46 @@ void IpcClient::handleIncomingPacket()
         return;
     }
 
+    if (hdr.opcode == WAYWAL_RESP_COMPILE_SHADER_GRAPH) {
+        if (payload.size() >= sizeof(waywal_ipc_resp_compile_shader_graph_t)) {
+            waywal_ipc_resp_compile_shader_graph_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            QMetaObject::invokeMethod(
+                this, [this, resp]() { emit shaderGraphCompiled(resp); }, Qt::QueuedConnection);
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_SET_CAMERA_3D) {
+        if (payload.size() >= sizeof(waywal_ipc_resp_set_camera_3d_t)) {
+            waywal_ipc_resp_set_camera_3d_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            QMetaObject::invokeMethod(
+                this, [this, resp]() { emit camera3DUpdated(resp); }, Qt::QueuedConnection);
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_SET_PHYSICS_PARAMS) {
+        if (payload.size() >= sizeof(waywal_ipc_resp_set_physics_params_t)) {
+            waywal_ipc_resp_set_physics_params_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            QMetaObject::invokeMethod(
+                this, [this, resp]() { emit physicsParamsUpdated(resp); }, Qt::QueuedConnection);
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_SET_SCENE_LIGHTS) {
+        if (payload.size() >= sizeof(waywal_ipc_resp_set_scene_lights_t)) {
+            waywal_ipc_resp_set_scene_lights_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            QMetaObject::invokeMethod(
+                this, [this, resp]() { emit sceneLightsUpdated(resp); }, Qt::QueuedConnection);
+        }
+        return;
+    }
+
     if (hdr.opcode == WAYWAL_RESP_ERR) {
         QString err = QStringLiteral("Daemon returned error");
         if (!payload.empty()) {
@@ -909,6 +949,190 @@ void IpcClient::requestScanCompat(
     }
 
     wakeupWorker();
+}
+
+bool IpcClient::requestCompileShaderGraph(const QString &output, const QString &path,
+                                          const QString &inlineJson, uint32_t flags,
+                                          waywal_ipc_resp_compile_shader_graph_t *outResp)
+{
+    QByteArray outBa = output.toUtf8();
+    QByteArray pathBa = path.toUtf8();
+    QByteArray jsonBa = inlineJson.toUtf8();
+
+    waywal_ipc_hdr_t hdr{};
+    waywal_ipc_req_compile_shader_graph_t req{};
+
+    std::vector<uint8_t> sendBuf(sizeof(hdr) + sizeof(req) + jsonBa.size());
+    size_t totalLen = 0;
+
+    if (!waywal_ipc_serialize_req_compile_shader_graph(
+            outBa.isEmpty() ? "*" : outBa.constData(), pathBa.constData(),
+            jsonBa.isEmpty() ? nullptr : jsonBa.constData(), flags, &hdr, &req, sendBuf.data(),
+            sendBuf.size(), &totalLen)) {
+        return false;
+    }
+
+    if (outResp) {
+        QString targetPath = m_customSocketPath;
+        if (targetPath.isEmpty()) {
+            path_buf_t pb;
+            if (waywal_ipc_resolve_socket_path(&pb, m_namespaceStr.toUtf8().constData())) {
+                targetPath = QString::fromUtf8(path_buf_cstr(&pb));
+            } else {
+                return false;
+            }
+        }
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            return false;
+        }
+
+        struct sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        QByteArray targetBa = targetPath.toUtf8();
+        if (static_cast<size_t>(targetBa.size()) >= sizeof(addr.sun_path)) {
+            close(fd);
+            return false;
+        }
+        std::memcpy(addr.sun_path, targetBa.constData(), targetBa.size());
+
+        if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
+            close(fd);
+            return false;
+        }
+
+        if (!writeExactNonBlocking(fd, sendBuf.data(), totalLen, 2000)) {
+            close(fd);
+            return false;
+        }
+
+        waywal_ipc_hdr_t respHdr{};
+        if (!readExactNonBlocking(fd, &respHdr, sizeof(respHdr), 2000)) {
+            close(fd);
+            return false;
+        }
+
+        if (respHdr.opcode != WAYWAL_RESP_COMPILE_SHADER_GRAPH ||
+            respHdr.payload_size < sizeof(waywal_ipc_resp_compile_shader_graph_t)) {
+            close(fd);
+            return false;
+        }
+
+        waywal_ipc_resp_compile_shader_graph_t resp{};
+        if (!readExactNonBlocking(fd, &resp, sizeof(resp), 2000)) {
+            close(fd);
+            return false;
+        }
+        close(fd);
+
+        *outResp = resp;
+        return (resp.status_code == 0);
+    }
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr = hdr;
+    pkt.payload.resize(totalLen - sizeof(hdr));
+    std::memcpy(pkt.payload.data(), sendBuf.data() + sizeof(hdr), pkt.payload.size());
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendSetCamera3D(const QString &output, const we_camera3d_t &cam)
+{
+    waywal_ipc_hdr_t hdr{};
+    waywal_ipc_req_set_camera_3d_t req{};
+    QByteArray outBa = output.toUtf8();
+    uint32_t flags = 0;
+    if (cam.dof_enabled > 0.5f) {
+        flags |= WAYWAL_CAMERA_FLAG_ENABLE_DOF;
+    }
+    if (cam.path_enabled != 0) {
+        flags |= WAYWAL_CAMERA_FLAG_ENABLE_KEYFRAMES;
+    }
+
+    if (!waywal_ipc_serialize_req_set_camera_3d(
+            outBa.isEmpty() ? "*" : outBa.constData(), cam.projection_mode, flags, cam.eye_pos,
+            cam.target_pos, cam.up_vec, cam.fov_y_deg, cam.near_z, cam.far_z, cam.parallax_amount,
+            cam.parallax_smoothing, cam.dof_focal_dist, cam.dof_focal_region,
+            cam.dof_bokeh_radius_px, &hdr, &req)) {
+        return false;
+    }
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr = hdr;
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendSetPhysicsParams(const QString &output, int32_t objectId, int32_t boneIndex,
+                                     const we_bone_sim_config_t &cfg, const we_wind_field_t &wind,
+                                     const we_cursor_force_t &cursor)
+{
+    waywal_ipc_hdr_t hdr{};
+    waywal_ipc_req_set_physics_params_t req{};
+    QByteArray outBa = output.toUtf8();
+
+    if (!waywal_ipc_serialize_req_set_physics_params(outBa.isEmpty() ? "*" : outBa.constData(),
+                                                     objectId, boneIndex, &cfg, &wind, &cursor,
+                                                     &hdr, &req)) {
+        return false;
+    }
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr = hdr;
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendSetSceneLights(const QString &output, const we_lighting_uniforms_t &lights)
+{
+    waywal_ipc_hdr_t hdr{};
+    waywal_ipc_req_set_scene_lights_t req{};
+    QByteArray outBa = output.toUtf8();
+
+    if (!waywal_ipc_serialize_req_set_scene_lights(outBa.isEmpty() ? "*" : outBa.constData(),
+                                                   &lights, &hdr, &req)) {
+        return false;
+    }
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr = hdr;
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+
+    wakeupWorker();
+    return true;
 }
 
 } // namespace waywal::studio

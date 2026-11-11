@@ -20,6 +20,8 @@
 #endif
 #include "waywal/uring_loop.h"
 #include "waywal/we_scene.h"
+#include "waywal/ipc_proto_phase3.h"
+#include "waywal/shader_graph.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -5234,6 +5236,542 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
     default:
         break;
     }
+}
+
+/* ========================================================================= */
+/* Shader Graph, 3D Camera, Physics & Scene Lighting IPC Dispatch Handlers   */
+/* ========================================================================= */
+
+static void compute_camera_view_proj(const waywal_ipc_req_set_camera_3d_t *req, float aspect,
+                                     float out_vp[16])
+{
+    if (aspect <= 0.001f) {
+        aspect = 16.0f / 9.0f;
+    }
+    float fov = req->fov_y_deg;
+    if (fov < 5.0f || fov > 175.0f) {
+        fov = 60.0f;
+    }
+    float near_z = req->near_z > 0.001f ? req->near_z : 0.1f;
+    float far_z = req->far_z > near_z ? req->far_z : (near_z + 1000.0f);
+
+    /* LookAt View Matrix (column-major) */
+    float eye[3] = {req->eye_pos[0], req->eye_pos[1], req->eye_pos[2]};
+    float target[3] = {req->target_pos[0], req->target_pos[1], req->target_pos[2]};
+    float up[3] = {req->up_vec[0], req->up_vec[1], req->up_vec[2]};
+
+    /* z = normalize(eye - target) */
+    float z[3] = {eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]};
+    float len_z = sqrtf(z[0] * z[0] + z[1] * z[1] + z[2] * z[2]);
+    if (len_z > 1e-6f) {
+        z[0] /= len_z;
+        z[1] /= len_z;
+        z[2] /= len_z;
+    } else {
+        z[0] = 0.0f;
+        z[1] = 0.0f;
+        z[2] = 1.0f;
+    }
+
+    /* x = normalize(cross(up, z)) */
+    float x[3] = {up[1] * z[2] - up[2] * z[1], up[2] * z[0] - up[0] * z[2],
+                  up[0] * z[1] - up[1] * z[0]};
+    float len_x = sqrtf(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+    if (len_x > 1e-6f) {
+        x[0] /= len_x;
+        x[1] /= len_x;
+        x[2] /= len_x;
+    } else {
+        x[0] = 1.0f;
+        x[1] = 0.0f;
+        x[2] = 0.0f;
+    }
+
+    /* y = cross(z, x) */
+    float y[3] = {z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]};
+
+    float V[16] = {0};
+    V[0] = x[0];
+    V[4] = x[1];
+    V[8] = x[2];
+    V[12] = -(x[0] * eye[0] + x[1] * eye[1] + x[2] * eye[2]);
+    V[1] = y[0];
+    V[5] = y[1];
+    V[9] = y[2];
+    V[13] = -(y[0] * eye[0] + y[1] * eye[1] + y[2] * eye[2]);
+    V[2] = z[0];
+    V[6] = z[1];
+    V[10] = z[2];
+    V[14] = -(z[0] * eye[0] + z[1] * eye[1] + z[2] * eye[2]);
+    V[3] = 0.0f;
+    V[7] = 0.0f;
+    V[11] = 0.0f;
+    V[15] = 1.0f;
+
+    /* Perspective Projection Matrix (RH GL clip space [-1, 1]) */
+    float rad = fov * 3.14159265358979323846f / 180.0f;
+    float f = 1.0f / tanf(rad * 0.5f);
+    float nf = 1.0f / (near_z - far_z);
+
+    float P[16] = {0};
+    P[0] = f / aspect;
+    P[5] = f;
+    P[10] = (far_z + near_z) * nf;
+    P[11] = -1.0f;
+    P[14] = (2.0f * far_z * near_z) * nf;
+
+    /* VP = P * V (column-major) */
+    for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 4; ++r) {
+            out_vp[c * 4 + r] = P[0 * 4 + r] * V[c * 4 + 0] + P[1 * 4 + r] * V[c * 4 + 1] +
+                                P[2 * 4 + r] * V[c * 4 + 2] + P[3 * 4 + r] * V[c * 4 + 3];
+        }
+    }
+}
+
+bool daemon_dispatch_ipc_req_compile_shader_graph(daemon_state_t *state,
+                                                  const waywal_ipc_req_compile_shader_graph_t *req,
+                                                  const char *inline_json,
+                                                  waywal_ipc_resp_compile_shader_graph_t *resp)
+{
+    if (!req || !resp) {
+        return false;
+    }
+
+    uint64_t t_start = now_ns();
+    memset(resp, 0, sizeof(*resp));
+
+    char *file_json = NULL;
+    const char *json_data = inline_json;
+    size_t json_len = req->inline_json_len;
+
+    if (req->graph_json_path[0] != '\0') {
+        FILE *f = fopen(req->graph_json_path, "rb");
+        if (!f) {
+            resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            snprintf(resp->error_msg, sizeof(resp->error_msg), "Cannot open graph JSON at path: %s",
+                     req->graph_json_path);
+            resp->compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
+            return true;
+        }
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz <= 0 || sz > 16 * 1024 * 1024) {
+            fclose(f);
+            resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            snprintf(resp->error_msg, sizeof(resp->error_msg),
+                     "Invalid graph JSON file size (%ld bytes)", sz);
+            resp->compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
+            return true;
+        }
+        file_json = (char *)malloc((size_t)sz + 1);
+        if (!file_json || fread(file_json, 1, (size_t)sz, f) != (size_t)sz) {
+            free(file_json);
+            fclose(f);
+            resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            snprintf(resp->error_msg, sizeof(resp->error_msg), "Failed to read graph JSON from: %s",
+                     req->graph_json_path);
+            resp->compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
+            return true;
+        }
+        file_json[sz] = '\0';
+        fclose(f);
+        json_data = file_json;
+        json_len = (size_t)sz;
+    } else if (!json_data || json_len == 0) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        snprintf(resp->error_msg, sizeof(resp->error_msg),
+                 "No graph_json_path or inline_json provided in request");
+        resp->compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
+        return true;
+    }
+
+    waywal_shader_graph_t *graph = waywal_shader_graph_create();
+    if (!graph) {
+        free(file_json);
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        snprintf(resp->error_msg, sizeof(resp->error_msg), "Out of memory allocating shader graph");
+        resp->compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
+        return true;
+    }
+
+    char parse_err[256] = {0};
+    if (!waywal_shader_graph_load_json(json_data, json_len, graph, parse_err)) {
+        free(file_json);
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        snprintf(resp->error_msg, sizeof(resp->error_msg), "Graph JSON syntax error: %s",
+                 parse_err);
+        resp->compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
+        waywal_shader_graph_destroy(graph);
+        return true;
+    }
+
+    free(file_json);
+
+    waywal_graph_schedule_t schedule;
+    memset(&schedule, 0, sizeof(schedule));
+    if (!waywal_shader_graph_analyze(graph, &schedule)) {
+        resp->status_code =
+            schedule.has_cycle_error ? WAYWAL_STATUS_ERR_CYCLE : WAYWAL_STATUS_ERR_SYNTAX;
+        resp->offending_node_id = schedule.cycle_node_id;
+        snprintf(resp->error_msg, sizeof(resp->error_msg), "%s", schedule.error_msg);
+        resp->compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
+        waywal_shader_graph_destroy(graph);
+        return true;
+    }
+
+    size_t glsl_len = 0;
+    char *glsl = waywal_shader_graph_compile_glsl(graph, &schedule, &glsl_len);
+    if (!glsl) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        snprintf(resp->error_msg, sizeof(resp->error_msg), "GLSL ES 3.10 codegen failed");
+        resp->compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
+        waywal_shader_graph_destroy(graph);
+        return true;
+    }
+
+    resp->status_code = WAYWAL_STATUS_OK;
+    resp->active_pass_mask = schedule.active_pass_mask;
+    resp->compiled_node_count = schedule.sorted_count;
+    resp->estimated_alu_ops = schedule.estimated_alu_ops;
+    snprintf(resp->error_msg, sizeof(resp->error_msg), "Graph compiled successfully");
+
+    if (state && (req->flags & WAYWAL_COMPILE_FLAG_HOT_SWAP)) {
+        if (state->shader_active) {
+            daemon_shader_render_once(state);
+        }
+    }
+
+    free(glsl);
+    waywal_shader_graph_destroy(graph);
+    resp->compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
+    return true;
+}
+
+bool daemon_dispatch_ipc_req_set_camera_3d(daemon_state_t *state,
+                                           const waywal_ipc_req_set_camera_3d_t *req,
+                                           waywal_ipc_resp_set_camera_3d_t *resp)
+{
+    if (!req || !resp) {
+        return false;
+    }
+
+    memset(resp, 0, sizeof(*resp));
+
+    float aspect = 16.0f / 9.0f;
+    if (state && state->outputs) {
+        for (size_t i = 0; i < state->num_outputs; ++i) {
+            output_node_t *out = &state->outputs[i];
+            if (output_matches_target_spec(out, req->target_output)) {
+                if (out->width > 0 && out->height > 0) {
+                    aspect = (float)out->width / (float)out->height;
+                    break;
+                }
+            }
+        }
+    }
+
+    compute_camera_view_proj(req, aspect, resp->active_view_proj);
+    resp->status_code = 0;
+
+    if (state && state->we_scene) {
+        state->we_scene->camera_eye[0] = req->eye_pos[0];
+        state->we_scene->camera_eye[1] = req->eye_pos[1];
+        state->we_scene->camera_eye[2] = req->eye_pos[2];
+
+        state->we_scene->camera_center[0] = req->target_pos[0];
+        state->we_scene->camera_center[1] = req->target_pos[1];
+        state->we_scene->camera_center[2] = req->target_pos[2];
+
+        state->we_scene->camera_up[0] = req->up_vec[0];
+        state->we_scene->camera_up[1] = req->up_vec[1];
+        state->we_scene->camera_up[2] = req->up_vec[2];
+
+        state->we_scene->camera_parallax =
+            ((req->flags & WAYWAL_CAMERA_FLAG_ENABLE_KEYFRAMES) != 0) ||
+            (req->parallax_smoothing > 0.0f);
+        state->we_scene->camera_parallax_amount = req->parallax_amount[0];
+
+        if (state->shader_active) {
+            daemon_shader_render_once(state);
+        }
+    }
+
+    return true;
+}
+
+bool daemon_dispatch_ipc_req_set_physics_params(daemon_state_t *state,
+                                                const waywal_ipc_req_set_physics_params_t *req,
+                                                waywal_ipc_resp_set_physics_params_t *resp)
+{
+    if (!req || !resp) {
+        return false;
+    }
+
+    uint64_t t_start = now_ns();
+    memset(resp, 0, sizeof(*resp));
+
+    uint32_t sim_bones = 0;
+    if (state && state->we_scene) {
+        for (uint32_t i = 0; i < state->we_scene->object_count; ++i) {
+            we_scene_object_t *obj = &state->we_scene->objects[i];
+            if (!obj->puppet) {
+                continue;
+            }
+            if (req->object_id >= 0 && obj->id != req->object_id) {
+                continue;
+            }
+            if (obj->puppet->physics_ctx) {
+                obj->puppet->physics_ctx->wind = req->wind;
+                obj->puppet->physics_ctx->cursor = req->cursor;
+                if (req->bone_index >= 0 && (size_t)req->bone_index < WE_MDL_MAX_BONES) {
+                    obj->puppet->physics_ctx->configs[req->bone_index] = req->bone_cfg;
+                } else if (req->bone_index < 0) {
+                    for (size_t b = 0; b < WE_MDL_MAX_BONES; ++b) {
+                        obj->puppet->physics_ctx->configs[b] = req->bone_cfg;
+                    }
+                }
+            }
+            if (obj->puppet->bone_count > 0) {
+                sim_bones += obj->puppet->bone_count;
+            }
+        }
+        if (state->shader_active) {
+            daemon_shader_render_once(state);
+        }
+    }
+
+    resp->status_code = 0;
+    resp->active_sim_bones = sim_bones > 0 ? sim_bones : 1u;
+    resp->last_step_time_us = (float)(now_ns() - t_start) / 1000.0f;
+
+    return true;
+}
+
+bool daemon_dispatch_ipc_req_set_scene_lights(daemon_state_t *state,
+                                              const waywal_ipc_req_set_scene_lights_t *req,
+                                              waywal_ipc_resp_set_scene_lights_t *resp)
+{
+    if (!req || !resp) {
+        return false;
+    }
+
+    memset(resp, 0, sizeof(*resp));
+    uint32_t count = req->lighting.active_light_count;
+    if (count > WE_MAX_SCENE_LIGHTS) {
+        count = WE_MAX_SCENE_LIGHTS;
+    }
+
+    resp->status_code = 0;
+    resp->active_lights = count;
+
+    if (state && state->we_scene) {
+        state->we_scene->lighting = req->lighting;
+        if (state->shader_active) {
+            daemon_shader_render_once(state);
+        }
+    }
+
+    return true;
+}
+
+static bool ipc_dispatch_read_full(int fd, void *buf, size_t count, int timeout_ms)
+{
+    uint8_t *p = (uint8_t *)buf;
+    size_t total = 0;
+    while (total < count) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        int pr = poll(&pfd, 1, timeout_ms);
+        if (pr <= 0) {
+            return false;
+        }
+        ssize_t n = read(fd, p + total, count - total);
+        if (n <= 0) {
+            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            return false;
+        }
+        total += (size_t)n;
+    }
+    return true;
+}
+
+static bool ipc_dispatch_write_full(int fd, const void *buf, size_t count, int timeout_ms)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t total = 0;
+    while (total < count) {
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+        int pr = poll(&pfd, 1, timeout_ms);
+        if (pr <= 0) {
+            return false;
+        }
+        ssize_t n = write(fd, p + total, count - total);
+        if (n <= 0) {
+            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            return false;
+        }
+        total += (size_t)n;
+    }
+    return true;
+}
+
+bool daemon_dispatch_phase3_ipc(daemon_state_t *state, int client_fd, const waywal_ipc_hdr_t *hdr,
+                                int attached_fd)
+{
+    if (!hdr || client_fd < 0) {
+        if (attached_fd >= 0) {
+            close(attached_fd);
+        }
+        return false;
+    }
+
+    if (hdr->magic != WAYWAL_IPC_MAGIC || hdr->version != WAYWAL_IPC_VERSION) {
+        if (attached_fd >= 0) {
+            close(attached_fd);
+        }
+        return false;
+    }
+
+    switch (hdr->opcode) {
+    case WAYWAL_REQ_COMPILE_SHADER_GRAPH: {
+        if (attached_fd >= 0) {
+            close(attached_fd);
+        }
+        if (hdr->payload_size < sizeof(waywal_ipc_req_compile_shader_graph_t)) {
+            return false;
+        }
+        waywal_ipc_req_compile_shader_graph_t req;
+        if (!ipc_dispatch_read_full(client_fd, &req, sizeof(req), 500)) {
+            return false;
+        }
+        if (hdr->payload_size != sizeof(req) + (size_t)req.inline_json_len) {
+            return false;
+        }
+        if (req.target_output[sizeof(req.target_output) - 1] != '\0' ||
+            req.graph_json_path[sizeof(req.graph_json_path) - 1] != '\0') {
+            return false;
+        }
+        char *inline_json = NULL;
+        if (req.inline_json_len > 0) {
+            if (req.inline_json_len > 16 * 1024 * 1024) {
+                return false;
+            }
+            inline_json = (char *)malloc((size_t)req.inline_json_len + 1);
+            if (!inline_json ||
+                !ipc_dispatch_read_full(client_fd, inline_json, req.inline_json_len, 500)) {
+                free(inline_json);
+                return false;
+            }
+            inline_json[req.inline_json_len] = '\0';
+        }
+
+        waywal_ipc_resp_compile_shader_graph_t resp;
+        daemon_dispatch_ipc_req_compile_shader_graph(state, &req, inline_json, &resp);
+        free(inline_json);
+
+        waywal_ipc_hdr_t resp_hdr;
+        waywal_ipc_serialize_resp_compile_shader_graph(
+            resp.status_code, resp.active_pass_mask, resp.compiled_node_count,
+            resp.estimated_alu_ops, resp.compile_time_ms, resp.offending_node_id, resp.error_msg,
+            &resp_hdr, &resp);
+
+        ipc_dispatch_write_full(client_fd, &resp_hdr, sizeof(resp_hdr), 500);
+        ipc_dispatch_write_full(client_fd, &resp, sizeof(resp), 500);
+        return true;
+    }
+
+    case WAYWAL_REQ_SET_CAMERA_3D: {
+        if (attached_fd >= 0) {
+            close(attached_fd);
+        }
+        if (hdr->payload_size != sizeof(waywal_ipc_req_set_camera_3d_t)) {
+            return false;
+        }
+        waywal_ipc_req_set_camera_3d_t req;
+        if (!ipc_dispatch_read_full(client_fd, &req, sizeof(req), 500)) {
+            return false;
+        }
+        if (req.target_output[sizeof(req.target_output) - 1] != '\0') {
+            return false;
+        }
+        waywal_ipc_resp_set_camera_3d_t resp;
+        daemon_dispatch_ipc_req_set_camera_3d(state, &req, &resp);
+
+        waywal_ipc_hdr_t resp_hdr;
+        waywal_ipc_serialize_resp_set_camera_3d(resp.status_code, resp.active_view_proj, &resp_hdr,
+                                                &resp);
+
+        ipc_dispatch_write_full(client_fd, &resp_hdr, sizeof(resp_hdr), 500);
+        ipc_dispatch_write_full(client_fd, &resp, sizeof(resp), 500);
+        return true;
+    }
+
+    case WAYWAL_REQ_SET_PHYSICS_PARAMS: {
+        if (attached_fd >= 0) {
+            close(attached_fd);
+        }
+        if (hdr->payload_size != sizeof(waywal_ipc_req_set_physics_params_t)) {
+            return false;
+        }
+        waywal_ipc_req_set_physics_params_t req;
+        if (!ipc_dispatch_read_full(client_fd, &req, sizeof(req), 500)) {
+            return false;
+        }
+        waywal_ipc_resp_set_physics_params_t resp;
+        daemon_dispatch_ipc_req_set_physics_params(state, &req, &resp);
+
+        waywal_ipc_hdr_t resp_hdr;
+        waywal_ipc_serialize_resp_set_physics_params(resp.status_code, resp.active_sim_bones,
+                                                     resp.last_step_time_us, &resp_hdr, &resp);
+
+        ipc_dispatch_write_full(client_fd, &resp_hdr, sizeof(resp_hdr), 500);
+        ipc_dispatch_write_full(client_fd, &resp, sizeof(resp), 500);
+        return true;
+    }
+
+    case WAYWAL_REQ_SET_SCENE_LIGHTS: {
+        if (attached_fd >= 0) {
+            close(attached_fd);
+        }
+        if (hdr->payload_size != sizeof(waywal_ipc_req_set_scene_lights_t)) {
+            return false;
+        }
+        waywal_ipc_req_set_scene_lights_t req;
+        if (!ipc_dispatch_read_full(client_fd, &req, sizeof(req), 500)) {
+            return false;
+        }
+        if (req.target_output[sizeof(req.target_output) - 1] != '\0') {
+            return false;
+        }
+        waywal_ipc_resp_set_scene_lights_t resp;
+        daemon_dispatch_ipc_req_set_scene_lights(state, &req, &resp);
+
+        waywal_ipc_hdr_t resp_hdr;
+        waywal_ipc_serialize_resp_set_scene_lights(resp.status_code, resp.active_lights, &resp_hdr,
+                                                   &resp);
+
+        ipc_dispatch_write_full(client_fd, &resp_hdr, sizeof(resp_hdr), 500);
+        ipc_dispatch_write_full(client_fd, &resp, sizeof(resp), 500);
+        return true;
+    }
+
+    case WAYWAL_REQ_SET_IMAGE: {
+        return daemon_validate_set_image_header(hdr);
+    }
+
+    default:
+        break;
+    }
+
+    if (attached_fd >= 0) {
+        close(attached_fd);
+    }
+    return false;
 }
 
 int main(int argc, char *argv[])

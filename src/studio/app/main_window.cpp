@@ -160,6 +160,12 @@ class MonitorTopologyBar : public QWidget {
 #include "studio/dock/workshop_browser_widget.hpp"
 #include "studio/dock/openhub_browser_widget.hpp"
 #include "studio/wizard/creator_packaging_wizard.hpp"
+#include "studio/core/ipc_client.hpp"
+#include "studio/core/services.hpp"
+#include "studio/graph/node_graph_editor_widget.hpp"
+#include "studio/graph/effect_library_browser_widget.hpp"
+#include "studio/inspector/camera_lighting_inspector_widget.hpp"
+#include "studio/inspector/physics_spring_inspector_widget.hpp"
 #include "waywal/we_vdf.h"
 
 namespace waywal::studio {
@@ -183,7 +189,14 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
     // 3. Initialize CommandBus with 1,000-Step History & Drag Coalescing
     m_commandBus = std::make_unique<CommandBus>(1000, this);
 
-    // 4. Create and Wire all 6 Panels & Bars
+    // 3b. Initialize IpcClient
+    m_ipcClient = std::make_unique<IpcClient>(m_options.namespaceStr, m_options.socketPath, this);
+    Services::instance().setIpcClient(m_ipcClient.get());
+    if (!m_options.headlessCheck && !m_options.benchmarkGrid) {
+        m_ipcClient->start();
+    }
+
+    // 4. Create and Wire all Panels & Bars
     setupPanels();
 
     // 5. Construct Menus, Toolbars, and Shortcuts
@@ -335,6 +348,7 @@ void MainWindow::setupPanels()
     // Panel 5 (Right Dock Tab 1): Live Scene & Shader Inspector
     m_propertyInspector = new PropertyInspectorWidget(this);
     m_propertyInspector->setCommandBus(m_commandBus.get());
+    m_propertyInspector->setIpcClient(m_ipcClient.get());
     m_layoutManager->registerPanel(QStringLiteral("PropertyInspectorWidget"), m_propertyInspector,
                                    QStringLiteral("Inspector"), Qt::RightDockWidgetArea);
 
@@ -342,6 +356,31 @@ void MainWindow::setupPanels()
     m_themeStudio = new ThemeStudioWidget(this);
     m_layoutManager->registerPanel(QStringLiteral("ThemeStudioWidget"), m_themeStudio,
                                    QStringLiteral("Theme"), Qt::RightDockWidgetArea);
+
+    m_nodeGraphEditor = new NodeGraphEditorWidget(this);
+    m_nodeGraphEditor->setCommandBus(m_commandBus.get());
+    m_nodeGraphEditor->setIpcClient(m_ipcClient.get());
+    m_layoutManager->registerPanel(QStringLiteral("NodeGraphEditorWidget"), m_nodeGraphEditor,
+                                   QStringLiteral("Shader Graph"), Qt::RightDockWidgetArea);
+
+    m_effectLibraryBrowser = new EffectLibraryBrowserWidget(this);
+    m_layoutManager->registerPanel(QStringLiteral("EffectLibraryBrowserWidget"),
+                                   m_effectLibraryBrowser, QStringLiteral("Effect Library"),
+                                   Qt::LeftDockWidgetArea);
+
+    m_cameraLightingInspector = new CameraLightingInspectorWidget(this);
+    m_cameraLightingInspector->setCommandBus(m_commandBus.get());
+    m_cameraLightingInspector->setIpcClient(m_ipcClient.get());
+    m_layoutManager->registerPanel(QStringLiteral("CameraLightingInspectorWidget"),
+                                   m_cameraLightingInspector, QStringLiteral("Camera & Lights"),
+                                   Qt::RightDockWidgetArea);
+
+    m_physicsSpringInspector = new PhysicsSpringInspectorWidget(this);
+    m_physicsSpringInspector->setCommandBus(m_commandBus.get());
+    m_physicsSpringInspector->setIpcClient(m_ipcClient.get());
+    m_layoutManager->registerPanel(QStringLiteral("PhysicsSpringInspectorWidget"),
+                                   m_physicsSpringInspector, QStringLiteral("Puppet Physics"),
+                                   Qt::RightDockWidgetArea);
 
     // Panel 6 (Bottom Footer): Audio FFT Spectrum, Power Governor & Telemetry HUD
     m_footerBar = new StudioFooterBar(this);
@@ -882,6 +921,68 @@ void MainWindow::wireInterPanelSignals()
                 [this](const QString & /*pkgId*/, const QString &cid) {
                     if (m_statusLabel) {
                         m_statusLabel->setText(QStringLiteral("Selected Hub Package: %1").arg(cid));
+                    }
+                });
+    }
+
+    if (m_effectLibraryBrowser && m_nodeGraphEditor) {
+        connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectInsertRequested, this,
+                [this](uint32_t effectId) {
+                    if (m_nodeGraphEditor) {
+                        m_nodeGraphEditor->addBuiltinEffectNode(
+                            static_cast<we_builtin_effect_id_t>(effectId), QPointF(100.0, 100.0));
+                    }
+                });
+        connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectActivated, this,
+                [this](we_builtin_effect_id_t effectId, const QString & /*slug*/) {
+                    if (m_nodeGraphEditor) {
+                        m_nodeGraphEditor->addBuiltinEffectNode(effectId, QPointF(100.0, 100.0));
+                    }
+                });
+    }
+
+    if (m_nodeGraphEditor) {
+        connect(m_nodeGraphEditor,
+                qOverload<const QString &, uint32_t>(&NodeGraphEditorWidget::graphCompiled), this,
+                [this](const QString &glslCode, uint32_t /*activePassMask*/) {
+                    if (m_previewViewport && !glslCode.isEmpty()) {
+                        m_previewViewport->setPreviewShader(glslCode);
+                    }
+                    if (m_ipcClient && !glslCode.isEmpty()) {
+                        m_ipcClient->requestCompileShaderGraph(
+                            QStringLiteral("*"), QString(), glslCode, WAYWAL_COMPILE_FLAG_HOT_SWAP);
+                    }
+                });
+    }
+
+    if (m_cameraLightingInspector) {
+        connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::camera3DChanged, this,
+                [this](const QString &output, const we_camera3d_t &cam) {
+                    if (m_previewViewport) {
+                        QMatrix4x4 vpMat(cam.view_proj_matrix);
+                        m_previewViewport->setShaderUniform(
+                            QStringLiteral("g_ViewProjectionMatrix"), vpMat);
+                    }
+                    if (m_ipcClient) {
+                        m_ipcClient->sendSetCamera3D(output, cam);
+                    }
+                });
+        connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::lightingChanged, this,
+                [this](const QString &output, const we_lighting_uniforms_t &lights) {
+                    if (m_ipcClient) {
+                        m_ipcClient->sendSetSceneLights(output, lights);
+                    }
+                });
+    }
+
+    if (m_physicsSpringInspector) {
+        connect(m_physicsSpringInspector, &PhysicsSpringInspectorWidget::physicsParamsChanged, this,
+                [this](const QString &output, int32_t objectId, int32_t boneIndex,
+                       const we_bone_sim_config_t &cfg, const we_wind_field_t &wind,
+                       const we_cursor_force_t &cursor) {
+                    if (m_ipcClient) {
+                        m_ipcClient->sendSetPhysicsParams(output, objectId, boneIndex, cfg, wind,
+                                                          cursor);
                     }
                 });
     }

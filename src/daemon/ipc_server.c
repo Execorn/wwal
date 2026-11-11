@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 #include "daemon_internal.h"
+#include "waywal/ipc_proto_phase3.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -3293,6 +3294,14 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         }
         break;
     }
+
+    case WAYWAL_REQ_COMPILE_SHADER_GRAPH:
+    case WAYWAL_REQ_SET_CAMERA_3D:
+    case WAYWAL_REQ_SET_PHYSICS_PARAMS:
+    case WAYWAL_REQ_SET_SCENE_LIGHTS:
+        daemon_dispatch_phase3_ipc(state, client_fd, &req_hdr, attached_fd);
+        attached_fd = -1;
+        break;
 
     default:
         if (req_hdr.payload_size > 0) {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/we_puppet.h"
+#include "waywal/we_physics.h"
 
 #include "waywal/log.h"
 
@@ -918,6 +919,11 @@ we_puppet_t *we_puppet_parse_cpu(const uint8_t *data, size_t size)
                 we_mat4_inverse(b->world_bind, b->offset_trans);
                 mat4_identity(puppet->skin_mats[i]);
             }
+
+            puppet->physics_ctx = calloc(1, sizeof(we_puppet_physics_ctx_t));
+            if (puppet->physics_ctx) {
+                we_physics_init_from_puppet(puppet->physics_ctx, puppet);
+            }
         }
     }
 
@@ -1360,7 +1366,26 @@ void we_puppet_eval_skin_matrices(const we_puppet_t *puppet, const we_puppet_lay
         }
     }
 
-    /* Pass 1: Compute animated world matrices down the bone hierarchy */
+    /* Accumulate physics time if simulation context is active */
+    uint32_t substeps = 0;
+    we_puppet_physics_ctx_t *pctx = puppet->physics_ctx;
+    if (pctx && pctx->initialized && pctx->active_bone_count > 0) {
+        float frame_dt = (pctx->total_sim_time_sec > 0.0)
+                             ? (float)(time_sec - pctx->total_sim_time_sec)
+                             : (1.0f / 60.0f);
+        if (frame_dt <= 0.0f || frame_dt > 0.10f) {
+            frame_dt = 1.0f / 60.0f;
+        }
+        pctx->time_accumulator_sec += frame_dt;
+        substeps = (uint32_t)(pctx->time_accumulator_sec / WE_PHYSICS_SUBSTEP_DT);
+        if (substeps > WE_PHYSICS_MAX_SUBSTEPS) {
+            substeps = WE_PHYSICS_MAX_SUBSTEPS;
+            pctx->time_accumulator_sec = (float)WE_PHYSICS_MAX_SUBSTEPS * WE_PHYSICS_SUBSTEP_DT;
+        }
+    }
+
+    /* Pass 1: Compute animated world matrices down the bone hierarchy with XPBD spring deflection
+     */
     for (uint32_t k = 0; k < puppet->bone_count; k++) {
         uint32_t parent = puppet->bones[k].parent;
         if (parent == 0xFFFFFFFFu || parent >= k) {
@@ -1368,6 +1393,30 @@ void we_puppet_eval_skin_matrices(const we_puppet_t *puppet, const we_puppet_lay
         } else {
             we_mat4_mul(world_mats[parent], anim_local[k], world_mats[k]);
         }
+
+        if (pctx && (pctx->configs[k].flags & WE_BONE_PHYS_ENABLED)) {
+            float pivot[3] = {world_mats[k][12], world_mats[k][13], world_mats[k][14]};
+            if (substeps > 0) {
+                double sim_t = pctx->total_sim_time_sec;
+                for (uint32_t s = 0; s < substeps; s++) {
+                    we_physics_substep_bone(pctx, k, pivot, world_mats[k], WE_PHYSICS_SUBSTEP_DT,
+                                            sim_t + (double)s * (double)WE_PHYSICS_SUBSTEP_DT);
+                }
+            } else {
+                we_physics_apply_bone_rotation(pctx, k, pivot, world_mats[k]);
+            }
+        }
+    }
+
+    if (pctx && substeps > 0) {
+        pctx->time_accumulator_sec -= (float)substeps * WE_PHYSICS_SUBSTEP_DT;
+        pctx->total_sim_time_sec += (double)substeps * (double)WE_PHYSICS_SUBSTEP_DT;
+
+        float bass = 0.0f;
+        for (int b = 0; b < 8; b++) {
+            bass += pctx->audio_bands[b];
+        }
+        pctx->prev_audio_bass = bass * 0.125f;
     }
 
     /* Pass 2: Post-multiply each bone's world matrix by its inverse bind matrix (offset_trans)
@@ -1776,6 +1825,10 @@ void we_puppet_destroy(we_puppet_t *puppet)
             }
         }
         free(puppet->anims);
+    }
+    if (puppet->physics_ctx) {
+        free(puppet->physics_ctx);
+        puppet->physics_ctx = NULL;
     }
     free(puppet->bones);
     free(puppet->skin_mats);

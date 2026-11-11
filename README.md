@@ -19,13 +19,13 @@ Most Wayland setups are held together with duct tape. You end up installing five
 ## Why use WayWal?
 
 - **One command for everything (`wwal img`)**: Point `wwal img` at a picture, a GIF, a 4K video, a Shadertoy file, a Steam Workshop ID, or a folder. WayWal detects the format on its own. Then it blends the new wallpaper onto your screen at your monitor's full refresh rate.
-- **Native Steam Wallpaper Engine**: Run your Steam Workshop scenes straight on Wayland. Puppet meshes, particles, scripts, clocks, and sound layers all work natively. No Wine, no Proton, and no heavy wrapper.
+- **Native Steam Wallpaper Engine**: Run your Steam Workshop scenes straight on Wayland. Puppet meshes with 240 Hz spring-bone physics and 3D curl-noise wind, 3D perspective cameras and dynamic multi-light rigs, 50 built-in stock effects with automatic HLSL-to-GLSL translation, particles, scripts, clocks, and sound layers all work natively. No Wine, no Proton, and no heavy wrapper.
 - **Whole-desktop colors in `0.5 ms`**: Change your wallpaper and your whole system shifts colors to match in half a millisecond. WayWal builds dark and light palettes at once and updates your terminal, bar, browser, and lockscreen right away. Existing `matugen`, `wallust`, and `pywal` templates work as-is.
-- **Built-in shaders & audio visualizers**: Ships with 10 ready-to-run GPU shaders, including live PipeWire audio bars and rings that move to your music.
+- **Built-in shaders, visual node graph & audio visualizers**: Ships with 10 procedural GPU shader presets, 50 stock post-processing and distortion effects, live PipeWire audio bars and rings that move to your music, and a visual `.wwgraph` node-graph shader compiler.
 - **Sun-tracked day and night wallpapers**: Give it your location (or a GNOME timed wallpaper) and your desktop shifts from dawn to noon to night with the real sun, flipping your apps between light and dark mode along the way.
 - **Zero wasted battery (`0.0%` when covered)**: Still images use `0.0%` CPU and `0.0%` GPU once drawn. Videos use hardware VA-API decoding (`~0.3%` CPU). Open a window full screen or launch a game, and WayWal pauses right away. It mutes background sound too, then wakes back up when you can see your desktop again.
 - **Drop-in replacement for `swww`, `awww`, and `wpaperd`**: Keep your old scripts and keybinds. WayWal reads `swww` and `awww` CLI flags directly, loads `wpaperd` configs, and includes `wwal pick` so you can browse thumbnails in `rofi`, `fuzzel`, or `walker` in under `1 ms`.
-- **WayWal Studio GUI (`wwal-studio`)**: Includes an optional Wayland GUI app to browse local wallpapers, Steam Workshop (`431960`), and WayWal Open Hub packages, edit live shader and Workshop sliders, preview Material You color themes, tune transition curves, arrange multi-monitor spans, and build Ed25519-signed `.wwpkg` wallpaper packages.
+- **WayWal Studio GUI (`wwal-studio`)**: Includes an optional Wayland GUI app to browse local wallpapers, Steam Workshop (`431960`), and WayWal Open Hub packages, compose multi-pass shaders in a visual node graph editor with 50 drag-and-drop effects, tune 3D cameras, lights, and spring-bone physics, preview Material You color themes, shape transition curves, arrange multi-monitor spans, and build Ed25519-signed `.wwpkg` wallpaper packages.
 
 ---
 

@@ -178,4 +178,6 @@ class SetPowerPolicyCommand : public ICommand {
 
 } // namespace waywal::studio
 
+#include "studio/core/command_bus_phase3.hpp"
+
 #endif // WAYWAL_STUDIO_COMMAND_BUS_HPP

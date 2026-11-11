@@ -4,6 +4,7 @@
 
 #include "waywal/audio_fft.h"
 #include "waywal/shader_engine.h"
+#include "waywal/we_camera3d.h"
 #include "waywal/we_particle.h"
 #include "waywal/we_pkg.h"
 #include "waywal/we_project.h"
@@ -102,6 +103,12 @@ typedef struct {
     int32_t tex_resolution[WE_MAX_PASS_TEXTURES];
     int32_t tex_translation[WE_MAX_PASS_TEXTURES];
     int32_t tex_rotation[WE_MAX_PASS_TEXTURES];
+    int32_t normal_matrix;
+    int32_t lights_color_premultiplied;
+    int32_t lights_position;
+    int32_t lights_color_radius;
+    int32_t light_ambient_color;
+    int32_t light_skylight_color;
     int32_t custom_uniforms[WE_SHADER_MAX_UNIFORMS];
 } we_pass_uniform_locs_t;
 
@@ -109,6 +116,7 @@ typedef struct {
     char shader_name[128];
     we_blend_mode_t blending;
     bool depthtest_enabled;
+    bool depthwrite_enabled;
     bool cull_enabled;
 
     char tex_paths[WE_MAX_PASS_TEXTURES][256];
@@ -223,6 +231,17 @@ typedef struct we_scene_object {
     bool text_opaque_bg;
     float text_bg_color[3];
     bool text_dirty;
+
+    /* Dynamic 3D Light layer ("light" object in scene.json) */
+    bool is_light_object;
+    uint32_t light_type; /* we_light_type_t */
+    float light_intensity;
+    float light_radius;
+    float light_cone_angle;
+    float light_inner_cone_angle;
+    float light_specular_power;
+    float light_direction[3];
+    float light_tube_length;
 } we_scene_object_t;
 
 typedef struct we_scene {
@@ -287,6 +306,14 @@ typedef struct we_scene {
     uint32_t scene_fbo_tex;
     uint32_t scene_fbo_w;
     uint32_t scene_fbo_h;
+
+    /* 3D camera, depth buffer & multi-light engine */
+    bool is_3d;
+    we_camera3d_t camera;
+    we_lighting_uniforms_t lighting;
+    uint32_t scene_depth_rbo;
+    uint32_t scene_depth_rbo_w;
+    uint32_t scene_depth_rbo_h;
 
     uint32_t full_fb_fbo;
     uint32_t full_fb_tex;

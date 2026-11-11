@@ -4,6 +4,7 @@
 
 #include "services.hpp"
 #include "waywal/ipc_proto.h"
+#include "waywal/ipc_proto_phase3.h"
 
 #include <QJsonObject>
 #include <QObject>
@@ -67,6 +68,15 @@ class IpcClient : public QObject, public IIpcClientService {
         const QString &targetPath, uint32_t autoRepairFlags = 0,
         std::function<void(const waywal_ipc_resp_scan_compat_t &resp)> callback = nullptr);
 
+    bool requestCompileShaderGraph(const QString &output, const QString &path,
+                                   const QString &inlineJson, uint32_t flags,
+                                   waywal_ipc_resp_compile_shader_graph_t *outResp = nullptr);
+    bool sendSetCamera3D(const QString &output, const we_camera3d_t &cam);
+    bool sendSetPhysicsParams(const QString &output, int32_t objectId, int32_t boneIndex,
+                              const we_bone_sim_config_t &cfg, const we_wind_field_t &wind,
+                              const we_cursor_force_t &cursor);
+    bool sendSetSceneLights(const QString &output, const we_lighting_uniforms_t &lights);
+
     // Lifecycle
     void start();
     void stop();
@@ -85,6 +95,10 @@ class IpcClient : public QObject, public IIpcClientService {
     void workshopDownloadReceived(const waywal_ipc_resp_workshop_download_t &resp);
     void wwpkgInstallReceived(const waywal_ipc_resp_wwpkg_install_t &resp, const QString &errorMsg);
     void scanCompatReceived(const waywal_ipc_resp_scan_compat_t &resp);
+    void shaderGraphCompiled(const waywal_ipc_resp_compile_shader_graph_t &resp);
+    void camera3DUpdated(const waywal_ipc_resp_set_camera_3d_t &resp);
+    void physicsParamsUpdated(const waywal_ipc_resp_set_physics_params_t &resp);
+    void sceneLightsUpdated(const waywal_ipc_resp_set_scene_lights_t &resp);
 
   private:
     struct OutboundPacket {

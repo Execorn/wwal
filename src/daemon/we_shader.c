@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/we_shader.h"
+#include "waywal/we_builtin_effects.h"
 
 #include "waywal/log.h"
 
@@ -255,6 +256,31 @@ const char *we_shader_get_builtin(const char *path)
         strcasecmp(base, "default.frag") == 0) {
         return WE_BUILTIN_GENERICIMAGE2_FRAG;
     }
+
+    /* Resolve built-in clean-room effects before falling back to genericimage2 */
+    const we_builtin_effect_desc_t *eff = we_builtin_effect_find_by_slug(path);
+    if (eff) {
+        bool is_frag = true;
+        const char *dot = strrchr(base, '.');
+        if (dot && (strcasecmp(dot, ".vert") == 0 || strcasecmp(dot, ".vs") == 0)) {
+            is_frag = false;
+        }
+        const char *src =
+            we_builtin_effect_get_stage_glsl((we_builtin_effect_id_t)eff->id, is_frag);
+        if (src) {
+            return src;
+        }
+    }
+
+    /* Workshop or Studio effect referencing effects/... resolves to fallback */
+    if (strstr(path, "effects/") != NULL || strstr(path, "effects\\") != NULL) {
+        const char *dot = strrchr(base, '.');
+        if (dot && (strcasecmp(dot, ".vert") == 0 || strcasecmp(dot, ".vs") == 0)) {
+            return WE_BUILTIN_GENERICIMAGE2_VERT;
+        }
+        return WE_BUILTIN_GENERICIMAGE2_FRAG;
+    }
+
     return NULL;
 }
 
@@ -516,7 +542,8 @@ void we_shader_extract_metadata(const char *src, we_shader_meta_t *inout_meta)
             if (json) {
                 char cname[64] = {0};
                 int32_t cdef = 0;
-                if (json_extract_string(json, "combo", cname, sizeof(cname))) {
+                if (json_extract_string(json, "combo", cname, sizeof(cname)) ||
+                    json_extract_string(json, "name", cname, sizeof(cname))) {
                     json_extract_int(json, "default", &cdef);
                     meta_set_combo(inout_meta, cname, cdef, false);
                 }
@@ -782,7 +809,8 @@ static bool expand_includes_recursive(const char *src, const we_pkg_t *pkg,
 
 typedef struct {
     char name[64];
-    int width; /* 1=float, 2=vec2, 3=vec3, 4=vec4 */
+    int width;       /* 1=float, 2=vec2, 3=vec3, 4=vec4 */
+    char interp[16]; /* "flat", "centroid", or "" */
 } we_varying_info_t;
 
 static int type_to_width(const char *type)
@@ -797,6 +825,18 @@ static int type_to_width(const char *type)
         return 3;
     }
     if (strcmp(type, "vec4") == 0 || strcmp(type, "float4") == 0) {
+        return 4;
+    }
+    if (strcmp(type, "int") == 0 || strcmp(type, "uint") == 0) {
+        return 1;
+    }
+    if (strcmp(type, "ivec2") == 0 || strcmp(type, "uvec2") == 0) {
+        return 2;
+    }
+    if (strcmp(type, "ivec3") == 0 || strcmp(type, "uvec3") == 0) {
+        return 3;
+    }
+    if (strcmp(type, "ivec4") == 0 || strcmp(type, "uvec4") == 0) {
         return 4;
     }
     return 0;
@@ -836,24 +876,40 @@ static bool pp_lookup_macro(const char *name, size_t len, const we_shader_meta_t
 
 static void pp_skip_ws(const char **pp, const char *end)
 {
-    while (*pp < end && (**pp == ' ' || **pp == '\t' || **pp == '\r')) {
-        (*pp)++;
+    while (*pp < end) {
+        if (**pp == ' ' || **pp == '\t' || **pp == '\r') {
+            (*pp)++;
+        } else if (**pp == '\\' && *pp + 1 < end && (*pp)[1] == '\n') {
+            *pp += 2;
+        } else if (**pp == '\\' && *pp + 2 < end && (*pp)[1] == '\r' && (*pp)[2] == '\n') {
+            *pp += 3;
+        } else if (*pp + 1 < end && (*pp)[0] == '/' && (*pp)[1] == '*') {
+            *pp += 2;
+            while (*pp + 1 < end && !((*pp)[0] == '*' && (*pp)[1] == '/')) {
+                (*pp)++;
+            }
+            if (*pp + 1 < end) {
+                *pp += 2;
+            }
+        } else {
+            break;
+        }
     }
 }
 
-static int eval_pp_or(const char **pp, const char *end, const we_shader_meta_t *meta,
-                      const we_shader_combo_t *local_defs, uint32_t local_count);
+static int64_t eval_pp_expr(const char **pp, const char *end, const we_shader_meta_t *meta,
+                            const we_shader_combo_t *local_defs, uint32_t local_count);
 
-static int eval_pp_primary(const char **pp, const char *end, const we_shader_meta_t *meta,
-                           const we_shader_combo_t *local_defs, uint32_t local_count)
+static int64_t eval_pp_primary(const char **pp, const char *end, const we_shader_meta_t *meta,
+                               const we_shader_combo_t *local_defs, uint32_t local_count)
 {
     pp_skip_ws(pp, end);
     if (*pp >= end) {
-        return 0;
+        return 0LL;
     }
     if (**pp == '(') {
         (*pp)++;
-        int v = eval_pp_or(pp, end, meta, local_defs, local_count);
+        int64_t v = eval_pp_expr(pp, end, meta, local_defs, local_count);
         pp_skip_ws(pp, end);
         if (*pp < end && **pp == ')') {
             (*pp)++;
@@ -862,44 +918,16 @@ static int eval_pp_primary(const char **pp, const char *end, const we_shader_met
     }
     if (isdigit((unsigned char)**pp)) {
         char *next = NULL;
-        long v = strtol(*pp, &next, 0);
+        long long v = strtoll(*pp, &next, 0);
         if (next && next > *pp) {
             *pp = (next <= end) ? next : end;
+            while (*pp < end && (**pp == 'u' || **pp == 'U' || **pp == 'l' || **pp == 'L')) {
+                (*pp)++;
+            }
         } else {
             (*pp)++;
         }
-        return (int)v;
-    }
-    if (isalpha((unsigned char)**pp) || **pp == '_') {
-        const char *id_start = *pp;
-        while (*pp < end && (isalnum((unsigned char)**pp) || **pp == '_')) {
-            (*pp)++;
-        }
-        int val = 0;
-        pp_lookup_macro(id_start, (size_t)(*pp - id_start), meta, local_defs, local_count, &val);
-        return val;
-    }
-    return 0;
-}
-
-static int eval_pp_unary(const char **pp, const char *end, const we_shader_meta_t *meta,
-                         const we_shader_combo_t *local_defs, uint32_t local_count)
-{
-    pp_skip_ws(pp, end);
-    if (*pp >= end) {
-        return 0;
-    }
-    if (**pp == '!' && (*pp + 1 >= end || (*pp)[1] != '=')) {
-        (*pp)++;
-        return !eval_pp_unary(pp, end, meta, local_defs, local_count);
-    }
-    if (**pp == '+') {
-        (*pp)++;
-        return eval_pp_unary(pp, end, meta, local_defs, local_count);
-    }
-    if (**pp == '-') {
-        (*pp)++;
-        return -eval_pp_unary(pp, end, meta, local_defs, local_count);
+        return (int64_t)v;
     }
     if (end - *pp >= 7 && strncmp(*pp, "defined", 7) == 0 &&
         (*pp + 7 == end || !(isalnum((unsigned char)(*pp)[7]) || (*pp)[7] == '_'))) {
@@ -922,23 +950,83 @@ static int eval_pp_unary(const char **pp, const char *end, const we_shader_meta_
                 (*pp)++;
             }
         }
-        return pp_lookup_macro(id_start, id_len, meta, local_defs, local_count, NULL) ? 1 : 0;
+        return pp_lookup_macro(id_start, id_len, meta, local_defs, local_count, NULL) ? 1LL : 0LL;
+    }
+    if (isalpha((unsigned char)**pp) || **pp == '_') {
+        const char *id_start = *pp;
+        while (*pp < end && (isalnum((unsigned char)**pp) || **pp == '_')) {
+            (*pp)++;
+        }
+        int val = 0;
+        pp_lookup_macro(id_start, (size_t)(*pp - id_start), meta, local_defs, local_count, &val);
+        return (int64_t)val;
+    }
+    return 0LL;
+}
+
+static int64_t eval_pp_unary(const char **pp, const char *end, const we_shader_meta_t *meta,
+                             const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    pp_skip_ws(pp, end);
+    if (*pp >= end) {
+        return 0LL;
+    }
+    if (**pp == '!' && (*pp + 1 >= end || (*pp)[1] != '=')) {
+        (*pp)++;
+        return !eval_pp_unary(pp, end, meta, local_defs, local_count);
+    }
+    if (**pp == '~') {
+        (*pp)++;
+        return ~eval_pp_unary(pp, end, meta, local_defs, local_count);
+    }
+    if (**pp == '+') {
+        (*pp)++;
+        return +eval_pp_unary(pp, end, meta, local_defs, local_count);
+    }
+    if (**pp == '-') {
+        (*pp)++;
+        return -eval_pp_unary(pp, end, meta, local_defs, local_count);
     }
     return eval_pp_primary(pp, end, meta, local_defs, local_count);
 }
 
-static int eval_pp_add(const char **pp, const char *end, const we_shader_meta_t *meta,
-                       const we_shader_combo_t *local_defs, uint32_t local_count)
+static int64_t eval_pp_mul(const char **pp, const char *end, const we_shader_meta_t *meta,
+                           const we_shader_combo_t *local_defs, uint32_t local_count)
 {
-    int lhs = eval_pp_unary(pp, end, meta, local_defs, local_count);
+    int64_t lhs = eval_pp_unary(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (*pp < end && **pp == '*') {
+            (*pp)++;
+            lhs *= eval_pp_unary(pp, end, meta, local_defs, local_count);
+        } else if (*pp < end && **pp == '/' &&
+                   (*pp + 1 >= end || ((*pp)[1] != '/' && (*pp)[1] != '*'))) {
+            (*pp)++;
+            int64_t rhs = eval_pp_unary(pp, end, meta, local_defs, local_count);
+            lhs = (rhs != 0) ? (lhs / rhs) : 0LL;
+        } else if (*pp < end && **pp == '%') {
+            (*pp)++;
+            int64_t rhs = eval_pp_unary(pp, end, meta, local_defs, local_count);
+            lhs = (rhs != 0) ? (lhs % rhs) : 0LL;
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int64_t eval_pp_add(const char **pp, const char *end, const we_shader_meta_t *meta,
+                           const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int64_t lhs = eval_pp_mul(pp, end, meta, local_defs, local_count);
     for (;;) {
         pp_skip_ws(pp, end);
         if (*pp < end && **pp == '+') {
             (*pp)++;
-            lhs += eval_pp_unary(pp, end, meta, local_defs, local_count);
+            lhs += eval_pp_mul(pp, end, meta, local_defs, local_count);
         } else if (*pp < end && **pp == '-') {
             (*pp)++;
-            lhs -= eval_pp_unary(pp, end, meta, local_defs, local_count);
+            lhs -= eval_pp_mul(pp, end, meta, local_defs, local_count);
         } else {
             break;
         }
@@ -946,24 +1034,45 @@ static int eval_pp_add(const char **pp, const char *end, const we_shader_meta_t 
     return lhs;
 }
 
-static int eval_pp_rel(const char **pp, const char *end, const we_shader_meta_t *meta,
-                       const we_shader_combo_t *local_defs, uint32_t local_count)
+static int64_t eval_pp_shift(const char **pp, const char *end, const we_shader_meta_t *meta,
+                             const we_shader_combo_t *local_defs, uint32_t local_count)
 {
-    int lhs = eval_pp_add(pp, end, meta, local_defs, local_count);
+    int64_t lhs = eval_pp_add(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (end - *pp >= 2 && (*pp)[0] == '<' && (*pp)[1] == '<') {
+            *pp += 2;
+            int64_t shift = eval_pp_add(pp, end, meta, local_defs, local_count) & 63;
+            lhs = lhs << shift;
+        } else if (end - *pp >= 2 && (*pp)[0] == '>' && (*pp)[1] == '>') {
+            *pp += 2;
+            int64_t shift = eval_pp_add(pp, end, meta, local_defs, local_count) & 63;
+            lhs = lhs >> shift;
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int64_t eval_pp_rel(const char **pp, const char *end, const we_shader_meta_t *meta,
+                           const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int64_t lhs = eval_pp_shift(pp, end, meta, local_defs, local_count);
     for (;;) {
         pp_skip_ws(pp, end);
         if (end - *pp >= 2 && (*pp)[0] == '<' && (*pp)[1] == '=') {
             *pp += 2;
-            lhs = (lhs <= eval_pp_add(pp, end, meta, local_defs, local_count)) ? 1 : 0;
+            lhs = (lhs <= eval_pp_shift(pp, end, meta, local_defs, local_count)) ? 1LL : 0LL;
         } else if (end - *pp >= 2 && (*pp)[0] == '>' && (*pp)[1] == '=') {
             *pp += 2;
-            lhs = (lhs >= eval_pp_add(pp, end, meta, local_defs, local_count)) ? 1 : 0;
-        } else if (*pp < end && **pp == '<') {
+            lhs = (lhs >= eval_pp_shift(pp, end, meta, local_defs, local_count)) ? 1LL : 0LL;
+        } else if (*pp < end && **pp == '<' && (*pp + 1 >= end || (*pp)[1] != '<')) {
             (*pp)++;
-            lhs = (lhs < eval_pp_add(pp, end, meta, local_defs, local_count)) ? 1 : 0;
-        } else if (*pp < end && **pp == '>') {
+            lhs = (lhs < eval_pp_shift(pp, end, meta, local_defs, local_count)) ? 1LL : 0LL;
+        } else if (*pp < end && **pp == '>' && (*pp + 1 >= end || (*pp)[1] != '>')) {
             (*pp)++;
-            lhs = (lhs > eval_pp_add(pp, end, meta, local_defs, local_count)) ? 1 : 0;
+            lhs = (lhs > eval_pp_shift(pp, end, meta, local_defs, local_count)) ? 1LL : 0LL;
         } else {
             break;
         }
@@ -971,18 +1080,18 @@ static int eval_pp_rel(const char **pp, const char *end, const we_shader_meta_t 
     return lhs;
 }
 
-static int eval_pp_eq(const char **pp, const char *end, const we_shader_meta_t *meta,
-                      const we_shader_combo_t *local_defs, uint32_t local_count)
+static int64_t eval_pp_eq(const char **pp, const char *end, const we_shader_meta_t *meta,
+                          const we_shader_combo_t *local_defs, uint32_t local_count)
 {
-    int lhs = eval_pp_rel(pp, end, meta, local_defs, local_count);
+    int64_t lhs = eval_pp_rel(pp, end, meta, local_defs, local_count);
     for (;;) {
         pp_skip_ws(pp, end);
         if (end - *pp >= 2 && (*pp)[0] == '=' && (*pp)[1] == '=') {
             *pp += 2;
-            lhs = (lhs == eval_pp_rel(pp, end, meta, local_defs, local_count)) ? 1 : 0;
+            lhs = (lhs == eval_pp_rel(pp, end, meta, local_defs, local_count)) ? 1LL : 0LL;
         } else if (end - *pp >= 2 && (*pp)[0] == '!' && (*pp)[1] == '=') {
             *pp += 2;
-            lhs = (lhs != eval_pp_rel(pp, end, meta, local_defs, local_count)) ? 1 : 0;
+            lhs = (lhs != eval_pp_rel(pp, end, meta, local_defs, local_count)) ? 1LL : 0LL;
         } else {
             break;
         }
@@ -990,38 +1099,117 @@ static int eval_pp_eq(const char **pp, const char *end, const we_shader_meta_t *
     return lhs;
 }
 
-static int eval_pp_and(const char **pp, const char *end, const we_shader_meta_t *meta,
-                       const we_shader_combo_t *local_defs, uint32_t local_count)
+static int64_t eval_pp_bit_and(const char **pp, const char *end, const we_shader_meta_t *meta,
+                               const we_shader_combo_t *local_defs, uint32_t local_count)
 {
-    int lhs = eval_pp_eq(pp, end, meta, local_defs, local_count);
+    int64_t lhs = eval_pp_eq(pp, end, meta, local_defs, local_count);
     for (;;) {
         pp_skip_ws(pp, end);
-        if (end - *pp >= 2 && (*pp)[0] == '&' && (*pp)[1] == '&') {
-            *pp += 2;
-            int rhs = eval_pp_eq(pp, end, meta, local_defs, local_count);
-            lhs = (lhs && rhs) ? 1 : 0;
+        if (*pp < end && **pp == '&' && (*pp + 1 >= end || (*pp)[1] != '&')) {
+            (*pp)++;
+            lhs &= eval_pp_eq(pp, end, meta, local_defs, local_count);
         } else {
             break;
         }
     }
     return lhs;
+}
+
+static int64_t eval_pp_bit_xor(const char **pp, const char *end, const we_shader_meta_t *meta,
+                               const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int64_t lhs = eval_pp_bit_and(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (*pp < end && **pp == '^') {
+            (*pp)++;
+            lhs ^= eval_pp_bit_and(pp, end, meta, local_defs, local_count);
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int64_t eval_pp_bit_or(const char **pp, const char *end, const we_shader_meta_t *meta,
+                              const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int64_t lhs = eval_pp_bit_xor(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (*pp < end && **pp == '|' && (*pp + 1 >= end || (*pp)[1] != '|')) {
+            (*pp)++;
+            lhs |= eval_pp_bit_xor(pp, end, meta, local_defs, local_count);
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int64_t eval_pp_and(const char **pp, const char *end, const we_shader_meta_t *meta,
+                           const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int64_t lhs = eval_pp_bit_or(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (end - *pp >= 2 && (*pp)[0] == '&' && (*pp)[1] == '&') {
+            *pp += 2;
+            int64_t rhs = eval_pp_bit_or(pp, end, meta, local_defs, local_count);
+            lhs = (lhs && rhs) ? 1LL : 0LL;
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int64_t eval_pp_or_internal(const char **pp, const char *end, const we_shader_meta_t *meta,
+                                   const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int64_t lhs = eval_pp_and(pp, end, meta, local_defs, local_count);
+    for (;;) {
+        pp_skip_ws(pp, end);
+        if (end - *pp >= 2 && (*pp)[0] == '|' && (*pp)[1] == '|') {
+            *pp += 2;
+            int64_t rhs = eval_pp_and(pp, end, meta, local_defs, local_count);
+            lhs = (lhs || rhs) ? 1LL : 0LL;
+        } else {
+            break;
+        }
+    }
+    return lhs;
+}
+
+static int64_t eval_pp_ternary(const char **pp, const char *end, const we_shader_meta_t *meta,
+                               const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    int64_t cond = eval_pp_or_internal(pp, end, meta, local_defs, local_count);
+    pp_skip_ws(pp, end);
+    if (*pp < end && **pp == '?') {
+        (*pp)++;
+        int64_t true_val = eval_pp_expr(pp, end, meta, local_defs, local_count);
+        pp_skip_ws(pp, end);
+        if (*pp < end && **pp == ':') {
+            (*pp)++;
+            int64_t false_val = eval_pp_ternary(pp, end, meta, local_defs, local_count);
+            return cond ? true_val : false_val;
+        }
+        return cond ? true_val : 0LL;
+    }
+    return cond;
+}
+
+static int64_t eval_pp_expr(const char **pp, const char *end, const we_shader_meta_t *meta,
+                            const we_shader_combo_t *local_defs, uint32_t local_count)
+{
+    return eval_pp_ternary(pp, end, meta, local_defs, local_count);
 }
 
 static int eval_pp_or(const char **pp, const char *end, const we_shader_meta_t *meta,
                       const we_shader_combo_t *local_defs, uint32_t local_count)
 {
-    int lhs = eval_pp_and(pp, end, meta, local_defs, local_count);
-    for (;;) {
-        pp_skip_ws(pp, end);
-        if (end - *pp >= 2 && (*pp)[0] == '|' && (*pp)[1] == '|') {
-            *pp += 2;
-            int rhs = eval_pp_and(pp, end, meta, local_defs, local_count);
-            lhs = (lhs || rhs) ? 1 : 0;
-        } else {
-            break;
-        }
-    }
-    return lhs;
+    return (int)eval_pp_expr(pp, end, meta, local_defs, local_count);
 }
 
 static void collect_varyings(const char *src, const we_shader_meta_t *meta, we_varying_info_t *list,
@@ -1045,6 +1233,17 @@ static void collect_varyings(const char *src, const we_shader_meta_t *meta, we_v
     const char *line = src;
     while (*line) {
         const char *eol = strchr(line, '\n');
+        while (eol) {
+            const char *check = eol - 1;
+            while (check >= line && (*check == ' ' || *check == '\t' || *check == '\r')) {
+                check--;
+            }
+            if (check >= line && *check == '\\') {
+                eol = strchr(eol + 1, '\n');
+            } else {
+                break;
+            }
+        }
         size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
 
         const char *p = line;
@@ -1146,47 +1345,75 @@ static void collect_varyings(const char *src, const we_shader_meta_t *meta, we_v
                     }
                 }
             }
-        } else if (cur_active && end - p > 8 && strncmp(p, "varying", 7) == 0 &&
-                   isspace((unsigned char)p[7])) {
+        } else if (cur_active) {
             char decl[256];
-            size_t dlen = (size_t)(end - (p + 7));
+            size_t dlen = (size_t)(end - p);
             if (dlen >= sizeof(decl)) {
                 dlen = sizeof(decl) - 1;
             }
-            memcpy(decl, p + 7, dlen);
+            memcpy(decl, p, dlen);
             decl[dlen] = '\0';
             char *semi = strchr(decl, ';');
             if (semi) {
                 *semi = '\0';
             }
-
-            char tok1[64] = {0}, tok2[64] = {0}, tok3[64] = {0};
-            int ntok = sscanf(decl, "%63s %63s %63s", tok1, tok2, tok3);
-            const char *vtype = NULL;
-            const char *vname = NULL;
-            if (ntok == 3 && (strcmp(tok1, "highp") == 0 || strcmp(tok1, "mediump") == 0 ||
-                              strcmp(tok1, "lowp") == 0)) {
-                vtype = tok2;
-                vname = tok3;
-            } else if (ntok >= 2) {
-                vtype = tok1;
-                vname = tok2;
-            }
-            if (vtype && vname && strchr(vname, '[') == NULL) {
-                int w = type_to_width(vtype);
-                if (w > 0) {
-                    bool updated = false;
-                    for (uint32_t i = 0; i < *inout_count; i++) {
-                        if (strcmp(list[i].name, vname) == 0) {
-                            list[i].width = w;
-                            updated = true;
-                            break;
-                        }
+            char t[5][64];
+            memset(t, 0, sizeof(t));
+            int ntok = sscanf(decl, "%63s %63s %63s %63s %63s", t[0], t[1], t[2], t[3], t[4]);
+            if (ntok >= 2 && semi != NULL) {
+                int idx = 0;
+                char interp[16] = {0};
+                if (strcmp(t[idx], "flat") == 0 || strcmp(t[idx], "centroid") == 0 ||
+                    strcmp(t[idx], "smooth") == 0) {
+                    snprintf(interp, sizeof(interp), "%.15s", t[idx]);
+                    idx++;
+                }
+                bool is_varying_decl = false;
+                if (idx < ntok && (strcmp(t[idx], "varying") == 0 || strcmp(t[idx], "in") == 0 ||
+                                   strcmp(t[idx], "out") == 0)) {
+                    is_varying_decl = true;
+                    idx++;
+                }
+                if (is_varying_decl && idx < ntok) {
+                    if (strcmp(t[idx], "highp") == 0 || strcmp(t[idx], "mediump") == 0 ||
+                        strcmp(t[idx], "lowp") == 0) {
+                        idx++;
                     }
-                    if (!updated && *inout_count < WE_SHADER_MAX_VARYINGS) {
-                        snprintf(list[*inout_count].name, sizeof(list[0].name), "%s", vname);
-                        list[*inout_count].width = w;
-                        (*inout_count)++;
+                    if (idx < ntok) {
+                        const char *vtype = t[idx++];
+                        const char *vname = (idx < ntok) ? t[idx] : NULL;
+                        if (vtype && vname && strchr(vname, '[') == NULL &&
+                            strchr(vname, '(') == NULL) {
+                            int w = type_to_width(vtype);
+                            if (w > 0) {
+                                if (interp[0] == '\0' && (strncmp(vtype, "int", 3) == 0 ||
+                                                          strncmp(vtype, "uint", 4) == 0 ||
+                                                          strncmp(vtype, "ivec", 4) == 0 ||
+                                                          strncmp(vtype, "uvec", 4) == 0)) {
+                                    snprintf(interp, sizeof(interp), "flat");
+                                }
+                                bool updated = false;
+                                for (uint32_t i = 0; i < *inout_count; i++) {
+                                    if (strcmp(list[i].name, vname) == 0) {
+                                        list[i].width = w;
+                                        if (interp[0] != '\0') {
+                                            snprintf(list[i].interp, sizeof(list[i].interp),
+                                                     "%.15s", interp);
+                                        }
+                                        updated = true;
+                                        break;
+                                    }
+                                }
+                                if (!updated && *inout_count < WE_SHADER_MAX_VARYINGS) {
+                                    snprintf(list[*inout_count].name, sizeof(list[0].name), "%s",
+                                             vname);
+                                    list[*inout_count].width = w;
+                                    snprintf(list[*inout_count].interp, sizeof(list[0].interp),
+                                             "%.15s", interp);
+                                    (*inout_count)++;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1298,6 +1525,147 @@ static bool append_line_with_varying_swizzles(we_strbuf_t *sb, const char *line,
     return sb_append_len(sb, seg_start, (size_t)(end - seg_start)) && sb_append(sb, "\n");
 }
 
+static void strip_hlsl_bracket_attributes(char *line)
+{
+    char *p = line;
+    while ((p = strchr(p, '[')) != NULL) {
+        char *close = strchr(p, ']');
+        if (!close) {
+            break;
+        }
+        size_t attr_len = (size_t)(close - p + 1);
+        const char *attr = p + 1;
+        while (*attr == ' ' || *attr == '\t') {
+            attr++;
+        }
+        if (strncmp(attr, "unroll", 6) == 0 || strncmp(attr, "loop", 4) == 0 ||
+            strncmp(attr, "branch", 6) == 0 || strncmp(attr, "flatten", 7) == 0 ||
+            strncmp(attr, "fastopt", 7) == 0) {
+            memset(p, ' ', attr_len);
+            p = close + 1;
+        } else {
+            p++;
+        }
+    }
+}
+
+static void strip_hlsl_storage(char *line)
+{
+    char *p = line;
+    while ((p = strstr(p, "static")) != NULL) {
+        bool word_start = (p == line || !(isalnum((unsigned char)p[-1]) || p[-1] == '_'));
+        bool word_end = !(isalnum((unsigned char)p[6]) || p[6] == '_');
+        if (word_start && word_end) {
+            const char *after = p + 6;
+            while (*after == ' ' || *after == '\t') {
+                after++;
+            }
+            if (strncmp(after, "const", 5) == 0 &&
+                !(isalnum((unsigned char)after[5]) || after[5] == '_')) {
+                memset(p, ' ', 6);
+            } else if (p == line || p[-1] == ';' || p[-1] == '{' || p[-1] == '}') {
+                memset(p, ' ', 6);
+            }
+        }
+        p += 6;
+    }
+}
+
+static bool hoist_mul_side_effects(we_strbuf_t *sb, char *line, uint32_t *tmp_counter)
+{
+    char *p = line;
+    while ((p = strstr(p, "mul")) != NULL) {
+        if (p > line && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) {
+            p += 3;
+            continue;
+        }
+        char *open_p = p + 3;
+        while (*open_p == ' ' || *open_p == '\t') {
+            open_p++;
+        }
+        if (*open_p != '(') {
+            p += 3;
+            continue;
+        }
+        char *cur = open_p + 1;
+        int depth = 1;
+        while (*cur && depth > 0) {
+            if (*cur == '(') {
+                depth++;
+            } else if (*cur == ')') {
+                depth--;
+            }
+            cur++;
+        }
+        if (depth != 0) {
+            p += 3;
+            continue;
+        }
+        char *mul_end = cur;
+
+        char *inc = open_p + 1;
+        while (inc < mul_end - 1) {
+            if ((inc[0] == '+' && inc[1] == '+') || (inc[0] == '-' && inc[1] == '-')) {
+                bool is_inc = (inc[0] == '+');
+                if (inc > open_p + 1 && (isalnum((unsigned char)inc[-1]) || inc[-1] == '_')) {
+                    char *v_end = inc;
+                    char *v_start = inc - 1;
+                    while (v_start > open_p + 1 &&
+                           (isalnum((unsigned char)v_start[-1]) || v_start[-1] == '_')) {
+                        v_start--;
+                    }
+                    size_t v_len = (size_t)(v_end - v_start);
+                    if (v_len > 0 && v_len < 64) {
+                        char vname[64];
+                        memcpy(vname, v_start, v_len);
+                        vname[v_len] = '\0';
+                        char tmp_name[32];
+                        snprintf(tmp_name, sizeof(tmp_name), "_we_tmp_%u", (*tmp_counter)++);
+                        if (!sb_append(sb, "int ") || !sb_append(sb, tmp_name) ||
+                            !sb_append(sb, " = ") || !sb_append(sb, vname) ||
+                            !sb_append(sb, ";\n") || !sb_append(sb, vname) ||
+                            !sb_append(sb, is_inc ? "++;\n" : "--;\n")) {
+                            return false;
+                        }
+                        size_t orig_span = (size_t)(inc + 2 - v_start);
+                        size_t t_len = strlen(tmp_name);
+                        if (t_len <= orig_span) {
+                            memcpy(v_start, tmp_name, t_len);
+                            memset(v_start + t_len, ' ', orig_span - t_len);
+                        }
+                    }
+                    inc += 2;
+                } else {
+                    char *v_start = inc + 2;
+                    while (v_start < mul_end && (*v_start == ' ' || *v_start == '\t')) {
+                        v_start++;
+                    }
+                    char *v_end = v_start;
+                    while (v_end < mul_end && (isalnum((unsigned char)*v_end) || *v_end == '_')) {
+                        v_end++;
+                    }
+                    size_t v_len = (size_t)(v_end - v_start);
+                    if (v_len > 0 && v_len < 64) {
+                        char vname[64];
+                        memcpy(vname, v_start, v_len);
+                        vname[v_len] = '\0';
+                        if (!sb_append(sb, is_inc ? "++" : "--") || !sb_append(sb, vname) ||
+                            !sb_append(sb, ";\n")) {
+                            return false;
+                        }
+                        memset(inc, ' ', (size_t)(v_start - inc));
+                    }
+                    inc = v_end;
+                }
+            } else {
+                inc++;
+            }
+        }
+        p = mul_end;
+    }
+    return true;
+}
+
 /* Rewrites legacy attribute/varying lines and optionally promotes specific varyings to vec4 */
 static char *transform_stage_declarations(const char *expanded_src, bool is_frag,
                                           const we_varying_info_t *promoted_varyings,
@@ -1328,13 +1696,33 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
         }
     }
 
+    uint32_t tmp_counter = 0;
     const char *line = expanded_src;
     while (*line) {
         const char *eol = strchr(line, '\n');
         size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
 
-        const char *p = line;
-        const char *end = line + line_len;
+        char stack_buf[1024];
+        char *lbuf = (line_len < sizeof(stack_buf)) ? stack_buf : (char *)malloc(line_len + 1);
+        if (!lbuf) {
+            free(sb.buf);
+            return NULL;
+        }
+        memcpy(lbuf, line, line_len);
+        lbuf[line_len] = '\0';
+
+        strip_hlsl_bracket_attributes(lbuf);
+        strip_hlsl_storage(lbuf);
+        if (!hoist_mul_side_effects(&sb, lbuf, &tmp_counter)) {
+            if (lbuf != stack_buf) {
+                free(lbuf);
+            }
+            free(sb.buf);
+            return NULL;
+        }
+
+        const char *p = lbuf;
+        const char *end = lbuf + strlen(lbuf);
         while (p < end && (*p == ' ' || *p == '\t')) {
             p++;
         }
@@ -1342,98 +1730,144 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
         bool ok = true;
         if (!is_frag && end - p > 10 && strncmp(p, "attribute", 9) == 0 &&
             isspace((unsigned char)p[9])) {
-            ok = sb_append_len(&sb, line, (size_t)(p - line)) && sb_append(&sb, "in") &&
+            ok = sb_append_len(&sb, lbuf, (size_t)(p - lbuf)) && sb_append(&sb, "in") &&
                  sb_append_len(&sb, p + 9, (size_t)(end - (p + 9))) && sb_append(&sb, "\n");
-        } else if (end - p > 8 && strncmp(p, "varying", 7) == 0 && isspace((unsigned char)p[7])) {
-            char decl[256];
-            size_t dlen = (size_t)(end - (p + 7));
-            if (dlen >= sizeof(decl)) {
-                dlen = sizeof(decl) - 1;
+        } else if (end - p > 0) {
+            const char *qual = NULL;
+            const char *cur = p;
+            if (end - cur > 5 && strncmp(cur, "flat", 4) == 0 && isspace((unsigned char)cur[4])) {
+                qual = "flat";
+                cur += 4;
+                while (cur < end && (*cur == ' ' || *cur == '\t')) {
+                    cur++;
+                }
+            } else if (end - cur > 9 && strncmp(cur, "centroid", 8) == 0 &&
+                       isspace((unsigned char)cur[8])) {
+                qual = "centroid";
+                cur += 8;
+                while (cur < end && (*cur == ' ' || *cur == '\t')) {
+                    cur++;
+                }
+            } else if (end - cur > 7 && strncmp(cur, "smooth", 6) == 0 &&
+                       isspace((unsigned char)cur[6])) {
+                qual = "smooth";
+                cur += 6;
+                while (cur < end && (*cur == ' ' || *cur == '\t')) {
+                    cur++;
+                }
             }
-            memcpy(decl, p + 7, dlen);
-            decl[dlen] = '\0';
 
-            char tok1[64] = {0}, tok2[64] = {0}, tok3[64] = {0};
-            char *semi = strchr(decl, ';');
-            if (semi) {
-                *semi = '\0';
-            }
-            int ntok = sscanf(decl, "%63s %63s %63s", tok1, tok2, tok3);
-            const char *vprec = NULL;
-            const char *vtype = NULL;
-            const char *vname = NULL;
-            if (ntok == 3 && (strcmp(tok1, "highp") == 0 || strcmp(tok1, "mediump") == 0 ||
-                              strcmp(tok1, "lowp") == 0)) {
-                vprec = tok1;
-                vtype = tok2;
-                vname = tok3;
-            } else if (ntok >= 2) {
-                vtype = tok1;
-                vname = tok2;
-            }
-            int orig_width = vtype ? type_to_width(vtype) : 0;
+            if (end - cur > 8 && strncmp(cur, "varying", 7) == 0 &&
+                isspace((unsigned char)cur[7])) {
+                char decl[256];
+                size_t dlen = (size_t)(end - (cur + 7));
+                if (dlen >= sizeof(decl)) {
+                    dlen = sizeof(decl) - 1;
+                }
+                memcpy(decl, cur + 7, dlen);
+                decl[dlen] = '\0';
 
-            bool promote_to_vec4 = false;
-            if (vname) {
-                for (uint32_t i = 0; i < promoted_count; i++) {
-                    if (strcmp(promoted_varyings[i].name, vname) == 0) {
-                        promote_to_vec4 = true;
-                        if (promoted_varyings[i].width > 0) {
-                            orig_width = promoted_varyings[i].width;
+                char tok1[64] = {0}, tok2[64] = {0}, tok3[64] = {0};
+                char *semi = strchr(decl, ';');
+                if (semi) {
+                    *semi = '\0';
+                }
+                int ntok = sscanf(decl, "%63s %63s %63s", tok1, tok2, tok3);
+                const char *vprec = NULL;
+                const char *vtype = NULL;
+                const char *vname = NULL;
+                if (ntok == 3 && (strcmp(tok1, "highp") == 0 || strcmp(tok1, "mediump") == 0 ||
+                                  strcmp(tok1, "lowp") == 0)) {
+                    vprec = tok1;
+                    vtype = tok2;
+                    vname = tok3;
+                } else if (ntok >= 2) {
+                    vtype = tok1;
+                    vname = tok2;
+                }
+                int orig_width = vtype ? type_to_width(vtype) : 0;
+                const char *interp = qual ? qual : "";
+                if (interp[0] == '\0' && vtype &&
+                    (strncmp(vtype, "int", 3) == 0 || strncmp(vtype, "uint", 4) == 0 ||
+                     strncmp(vtype, "ivec", 4) == 0 || strncmp(vtype, "uvec", 4) == 0)) {
+                    interp = "flat";
+                }
+
+                bool promote_to_vec4 = false;
+                if (vname) {
+                    for (uint32_t i = 0; i < promoted_count; i++) {
+                        if (strcmp(promoted_varyings[i].name, vname) == 0) {
+                            promote_to_vec4 = true;
+                            if (promoted_varyings[i].width > 0) {
+                                orig_width = promoted_varyings[i].width;
+                            }
+                            if (promoted_varyings[i].interp[0] != '\0') {
+                                interp = promoted_varyings[i].interp;
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
-            }
 
-            if (promote_to_vec4 && vname) {
-                const char *swiz = "";
-                if (orig_width == 1) {
-                    swiz = "x";
-                } else if (orig_width == 2) {
-                    swiz = "xy";
-                } else if (orig_width == 3) {
-                    swiz = "xyz";
+                if (promote_to_vec4 && vname) {
+                    const char *swiz = (orig_width == 1)   ? "x"
+                                       : (orig_width == 2) ? "xy"
+                                       : (orig_width == 3) ? "xyz"
+                                                           : "";
+                    ok = sb_append(&sb, "#undef ") && sb_append(&sb, vname) && sb_append(&sb, "\n");
+                    if (interp[0] != '\0') {
+                        ok = ok && sb_append(&sb, interp) && sb_append(&sb, " ");
+                    }
+                    ok = ok && sb_append(&sb, is_frag ? "in " : "out ");
+                    if (ok && vprec) {
+                        ok = sb_append(&sb, vprec) && sb_append(&sb, " ");
+                    }
+                    ok = ok && sb_append(&sb, "vec4 ") && sb_append(&sb, vname) &&
+                         sb_append(&sb, ";\n");
+                    if (ok && swiz[0] != '\0') {
+                        ok = sb_append(&sb, "#define ") && sb_append(&sb, vname) &&
+                             sb_append(&sb, " ") && sb_append(&sb, vname) && sb_append(&sb, ".") &&
+                             sb_append(&sb, swiz) && sb_append(&sb, "\n");
+                    }
+                } else {
+                    if (interp[0] != '\0') {
+                        ok = sb_append(&sb, interp) && sb_append(&sb, " ");
+                    }
+                    ok = ok && sb_append(&sb, is_frag ? "in " : "out ");
+                    if (ok && vprec) {
+                        ok = sb_append(&sb, vprec) && sb_append(&sb, " ");
+                    }
+                    if (ok && vtype && vname) {
+                        ok = sb_append(&sb, vtype) && sb_append(&sb, " ") &&
+                             sb_append(&sb, vname) && sb_append(&sb, ";\n");
+                    }
                 }
-
-                ok = sb_append(&sb, "#undef ") && sb_append(&sb, vname) && sb_append(&sb, "\n") &&
-                     sb_append_len(&sb, line, (size_t)(p - line)) &&
-                     sb_append(&sb, is_frag ? "in " : "out ");
-                if (ok && vprec) {
-                    ok = sb_append(&sb, vprec) && sb_append(&sb, " ");
-                }
-                ok =
-                    ok && sb_append(&sb, "vec4 ") && sb_append(&sb, vname) && sb_append(&sb, ";\n");
-                if (ok && swiz[0] != '\0') {
-                    ok = sb_append(&sb, "#define ") && sb_append(&sb, vname) &&
-                         sb_append(&sb, " ") && sb_append(&sb, vname) && sb_append(&sb, ".") &&
-                         sb_append(&sb, swiz) && sb_append(&sb, "\n");
-                }
-            } else {
-                ok = sb_append_len(&sb, line, (size_t)(p - line)) &&
-                     sb_append(&sb, is_frag ? "in" : "out") &&
-                     sb_append_len(&sb, p + 7, (size_t)(end - (p + 7))) && sb_append(&sb, "\n");
-            }
-        } else if (p < end && *p == '#') {
-            /* If user shader defines #define saturate, undefine preamble saturate first */
-            const char *q = p + 1;
-            while (q < end && (*q == ' ' || *q == '\t')) {
-                q++;
-            }
-            if (end - q > 7 && strncmp(q, "define", 6) == 0 && isspace((unsigned char)q[6])) {
-                q += 6;
+            } else if (p < end && *p == '#') {
+                const char *q = p + 1;
                 while (q < end && (*q == ' ' || *q == '\t')) {
                     q++;
                 }
-                if (end - q >= 8 && strncmp(q, "saturate", 8) == 0 &&
-                    (end - q == 8 || !(isalnum((unsigned char)q[8]) || q[8] == '_'))) {
-                    ok = sb_append(&sb, "#undef saturate\n");
+                if (end - q > 7 && strncmp(q, "define", 6) == 0 && isspace((unsigned char)q[6])) {
+                    q += 6;
+                    while (q < end && (*q == ' ' || *q == '\t')) {
+                        q++;
+                    }
+                    if (end - q >= 8 && strncmp(q, "saturate", 8) == 0 &&
+                        (end - q == 8 || !(isalnum((unsigned char)q[8]) || q[8] == '_'))) {
+                        ok = sb_append(&sb, "#undef saturate\n");
+                    }
                 }
+                ok = ok && sb_append_len(&sb, lbuf, (size_t)(end - lbuf)) && sb_append(&sb, "\n");
+            } else {
+                ok = append_line_with_varying_swizzles(&sb, lbuf, (size_t)(end - lbuf),
+                                                       active_swizzles, active_swizzle_count);
             }
-            ok = ok && sb_append_len(&sb, line, line_len) && sb_append(&sb, "\n");
         } else {
-            ok = append_line_with_varying_swizzles(&sb, line, line_len, active_swizzles,
-                                                   active_swizzle_count);
+            ok = sb_append(&sb, "\n");
+        }
+
+        if (lbuf != stack_buf) {
+            free(lbuf);
         }
         if (!ok) {
             free(sb.buf);
@@ -1491,10 +1925,15 @@ static const char WE_GLSL_PREAMBLE_COMMON[] =
     "#define fmod(x, y) mod(x, y)\n"
     "#define rsqrt(x) inversesqrt(x)\n"
     "#define lerp(x, y, s) mix(x, y, s)\n"
+    "#define mad(a, b, c) (((a) * (b)) + (c))\n"
     "#ifndef saturate\n"
     "#define saturate(x) clamp(x, 0.0, 1.0)\n"
     "#endif\n"
     "#define log10(x) (log(x) * 0.4342944819032518)\n"
+    "float rcp(float x) { return 1.0 / x; }\n"
+    "vec2 rcp(vec2 x) { return vec2(1.0) / x; }\n"
+    "vec3 rcp(vec3 x) { return vec3(1.0) / x; }\n"
+    "vec4 rcp(vec4 x) { return vec4(1.0) / x; }\n"
     "void sincos(float x, out float s, out float c) { s = sin(x); c = cos(x); }\n"
     "void sincos(vec2 x, out vec2 s, out vec2 c) { s = sin(x); c = cos(x); }\n"
     "void sincos(vec3 x, out vec3 s, out vec3 c) { s = sin(x); c = cos(x); }\n"
@@ -1502,16 +1941,23 @@ static const char WE_GLSL_PREAMBLE_COMMON[] =
     "float we_atan2(float y, float x) {\n"
     "    return (abs(x) < 1e-8 && abs(y) < 1e-8) ? 0.0 : atan(y, x);\n"
     "}\n"
-    "vec2 we_atan2(vec2 y, vec2 x) {\n"
-    "    return vec2(we_atan2(y.x, x.x), we_atan2(y.y, x.y));\n"
-    "}\n"
-    "vec3 we_atan2(vec3 y, vec3 x) {\n"
-    "    return vec3(we_atan2(y.x, x.x), we_atan2(y.y, x.y), we_atan2(y.z, x.z));\n"
-    "}\n"
+    "vec2 we_atan2(vec2 y, vec2 x) { return vec2(we_atan2(y.x, x.x), we_atan2(y.y, x.y)); }\n"
+    "vec2 we_atan2(vec2 y, float x) { return vec2(we_atan2(y.x, x), we_atan2(y.y, x)); }\n"
+    "vec2 we_atan2(float y, vec2 x) { return vec2(we_atan2(y, x.x), we_atan2(y, x.y)); }\n"
+    "vec3 we_atan2(vec3 y, vec3 x) { return vec3(we_atan2(y.x, x.x), we_atan2(y.y, x.y), "
+    "we_atan2(y.z, x.z)); }\n"
+    "vec3 we_atan2(vec3 y, float x) { return vec3(we_atan2(y.x, x), we_atan2(y.y, x), "
+    "we_atan2(y.z, x)); }\n"
+    "vec3 we_atan2(float y, vec3 x) { return vec3(we_atan2(y, x.x), we_atan2(y, x.y), we_atan2(y, "
+    "x.z)); }\n"
     "vec4 we_atan2(vec4 y, vec4 x) {\n"
     "    return vec4(we_atan2(y.x, x.x), we_atan2(y.y, x.y), we_atan2(y.z, x.z), we_atan2(y.w, "
     "x.w));\n"
     "}\n"
+    "vec4 we_atan2(vec4 y, float x) { return vec4(we_atan2(y.x, x), we_atan2(y.y, x), "
+    "we_atan2(y.z, x), we_atan2(y.w, x)); }\n"
+    "vec4 we_atan2(float y, vec4 x) { return vec4(we_atan2(y, x.x), we_atan2(y, x.y), we_atan2(y, "
+    "x.z), we_atan2(y, x.w)); }\n"
     "#define atan2(y, x) we_atan2(y, x)\n"
     "float we_mul(float a, float b) { return a * b; }\n"
     "vec2 we_mul(vec2 a, float b) { return a * b; }\n"
@@ -1534,27 +1980,55 @@ static const char WE_GLSL_PREAMBLE_COMMON[] =
     "mat4 we_mul(mat4 a, mat4 b) { return a * b; }\n"
     "vec3 we_mul(vec4 a, mat3x4 b) { return a * b; }\n"
     "vec4 we_mul(mat3x4 a, vec3 b) { return a * b; }\n"
-    "vec4 we_mul(vec3 a, mat3x4 b) { return vec4(a, 1.0) * b; }\n"
+    "vec3 we_mul(vec3 a, mat3x4 b) { return vec4(a, 1.0) * b; }\n"
     "vec3 we_mul(mat3x4 a, vec4 b) { return b * a; }\n"
     "vec4 we_mul(vec3 a, mat4x3 b) { return a * b; }\n"
     "vec3 we_mul(vec4 a, mat4x3 b) { return b * a; }\n"
     "vec3 we_mul(mat4x3 a, vec4 b) { return a * b; }\n"
     "vec3 we_mul(mat4x3 a, vec3 b) { return a * vec4(b, 1.0); }\n"
-    "#define mul(a, b) we_mul(a, b)\n"
+    "#define mul(a, b) we_mul(a, b)\n";
+
+static const char WE_GLSL_PREAMBLE_SAMPLERS[] =
     "vec4 texSample2D(sampler2D s, vec2 uv) { return texture(s, uv); }\n"
     "vec4 texSample2D(sampler2D s, vec4 uv) { return texture(s, uv.xy); }\n"
+    "vec4 tex2D(sampler2D s, vec2 uv) { return texture(s, uv); }\n"
+    "vec4 tex2D(sampler2D s, vec4 uv) { return texture(s, uv.xy); }\n"
+    "vec4 we_texture2D(sampler2D s, vec2 uv) { return texture(s, uv); }\n"
+    "vec4 we_texture2D(sampler2D s, vec4 uv) { return texture(s, uv.xy); }\n"
     "vec4 texSample2DLod(sampler2D s, vec2 uv, float lod) { return textureLod(s, uv, lod); }\n"
     "vec4 texSample2DLod(sampler2D s, vec4 uv, float lod) { return textureLod(s, uv.xy, lod); }\n"
-    "vec4 texture2D(sampler2D s, vec2 uv) { return texture(s, uv); }\n"
-    "vec4 texture2D(sampler2D s, vec4 uv) { return texture(s, uv.xy); }\n"
-    "vec4 texture2DLod(sampler2D s, vec2 uv, float lod) { return textureLod(s, uv, lod); }\n"
-    "vec4 texture2DLod(sampler2D s, vec4 uv, float lod) { return textureLod(s, uv.xy, lod); }\n";
+    "vec4 texSample2DLod(sampler2D s, vec4 uv_lod) { return textureLod(s, uv_lod.xy, uv_lod.w); }\n"
+    "vec4 we_texture2DLod(sampler2D s, vec2 uv, float lod) { return textureLod(s, uv, lod); }\n"
+    "vec4 we_texture2DLod(sampler2D s, vec4 uv, float lod) { return textureLod(s, uv.xy, lod); }\n"
+    "vec4 we_texture2DLod(sampler2D s, vec4 uv_lod) { return textureLod(s, uv_lod.xy, uv_lod.w); "
+    "}\n"
+    "vec4 tex2Dlod(sampler2D s, vec4 uv_lod) { return textureLod(s, uv_lod.xy, uv_lod.w); }\n"
+    "vec4 tex2Dlod(sampler2D s, vec2 uv, float lod) { return textureLod(s, uv, lod); }\n"
+    "vec4 tex2Dproj(sampler2D s, vec3 uv) { return textureProj(s, uv); }\n"
+    "vec4 tex2Dproj(sampler2D s, vec4 uv) { return textureProj(s, uv); }\n"
+    "vec4 tex2Dgrad(sampler2D s, vec2 uv, vec2 dx, vec2 dy) { return textureGrad(s, uv, dx, dy); "
+    "}\n"
+    "vec4 tex2Dgrad(sampler2D s, vec4 uv, vec2 dx, vec2 dy) { return textureGrad(s, uv.xy, dx, "
+    "dy); }\n"
+    "vec4 texSample2DGrad(sampler2D s, vec2 uv, vec2 dx, vec2 dy) { return textureGrad(s, uv, dx, "
+    "dy); }\n"
+    "vec4 texSample2DGrad(sampler2D s, vec4 uv, vec2 dx, vec2 dy) { return textureGrad(s, uv.xy, "
+    "dx, dy); }\n"
+    "vec4 we_texture2DGrad(sampler2D s, vec2 uv, vec2 dx, vec2 dy) { return textureGrad(s, uv, dx, "
+    "dy); }\n"
+    "vec4 we_texture2DGrad(sampler2D s, vec4 uv, vec2 dx, vec2 dy) { return textureGrad(s, uv.xy, "
+    "dx, dy); }\n";
 
 static const char WE_GLSL_PREAMBLE_VERT[] =
     "vec4 texSample2D(sampler2D s, vec2 uv, float bias) { return textureLod(s, uv, bias); }\n"
     "vec4 texSample2D(sampler2D s, vec4 uv, float bias) { return textureLod(s, uv.xy, bias); }\n"
-    "vec4 texture2D(sampler2D s, vec2 uv, float bias) { return textureLod(s, uv, bias); }\n"
-    "vec4 texture2D(sampler2D s, vec4 uv, float bias) { return textureLod(s, uv.xy, bias); }\n";
+    "vec4 we_texture2D(sampler2D s, vec2 uv, float bias) { return textureLod(s, uv, bias); }\n"
+    "vec4 we_texture2D(sampler2D s, vec4 uv, float bias) { return textureLod(s, uv.xy, bias); }\n"
+    "vec4 tex2Dbias(sampler2D s, vec4 uv_bias) { return textureLod(s, uv_bias.xy, uv_bias.w); }\n"
+    "vec4 tex2Dbias(sampler2D s, vec2 uv, float bias) { return textureLod(s, uv, bias); }\n"
+    "#define texture2D we_texture2D\n"
+    "#define texture2DLod we_texture2DLod\n"
+    "#define texture2DGrad we_texture2DGrad\n";
 
 static const char WE_GLSL_PREAMBLE_FRAG[] =
     "#define ddx(x) dFdx(x)\n"
@@ -1562,8 +2036,13 @@ static const char WE_GLSL_PREAMBLE_FRAG[] =
     "#define ddxy(x) fwidth(x)\n"
     "vec4 texSample2D(sampler2D s, vec2 uv, float bias) { return texture(s, uv, bias); }\n"
     "vec4 texSample2D(sampler2D s, vec4 uv, float bias) { return texture(s, uv.xy, bias); }\n"
-    "vec4 texture2D(sampler2D s, vec2 uv, float bias) { return texture(s, uv, bias); }\n"
-    "vec4 texture2D(sampler2D s, vec4 uv, float bias) { return texture(s, uv.xy, bias); }\n"
+    "vec4 we_texture2D(sampler2D s, vec2 uv, float bias) { return texture(s, uv, bias); }\n"
+    "vec4 we_texture2D(sampler2D s, vec4 uv, float bias) { return texture(s, uv.xy, bias); }\n"
+    "vec4 tex2Dbias(sampler2D s, vec4 uv_bias) { return texture(s, uv_bias.xy, uv_bias.w); }\n"
+    "vec4 tex2Dbias(sampler2D s, vec2 uv, float bias) { return texture(s, uv, bias); }\n"
+    "#define texture2D we_texture2D\n"
+    "#define texture2DLod we_texture2DLod\n"
+    "#define texture2DGrad we_texture2DGrad\n"
     "void clip(float x) { if (x < 0.0) discard; }\n"
     "void clip(vec2 x) { if (any(lessThan(x, vec2(0.0)))) discard; }\n"
     "void clip(vec3 x) { if (any(lessThan(x, vec3(0.0)))) discard; }\n"
@@ -1609,7 +2088,7 @@ static char *assemble_final_stage(const char *transformed_body, bool is_frag,
         return NULL;
     }
 
-    if (!sb_append(&sb, WE_GLSL_PREAMBLE_COMMON) ||
+    if (!sb_append(&sb, WE_GLSL_PREAMBLE_COMMON) || !sb_append(&sb, WE_GLSL_PREAMBLE_SAMPLERS) ||
         !sb_append(&sb, is_frag ? WE_GLSL_PREAMBLE_FRAG : WE_GLSL_PREAMBLE_VERT)) {
         free(sb.buf);
         return NULL;

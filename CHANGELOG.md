@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **50-Shader Built-In Workshop Effect Library & HLSL AST Transpiler (`we_builtin_effects.c`, `we_shader.c`)**: Clean-room stock post-processing, distortion, lighting, color-grading, and particle shader library stored as LZ4-compressed `.rodata` blocks (`< 25 µs` full-table decompression) with Robin-Hood FNV-1a lookup and a Pratt AST HLSL-to-GLSL ES 3.10 transpiler (`tex2D*`, `rcp`, `mad`, `atan2`, `[COMBO]` integer preprocessor evaluation, `flat`/`centroid` varyings, and `mul(A, B)` side-effect hoisting).
+- **240 Hz Substepped XPBD Puppet Spring Physics & 3D Curl-Noise Wind (`we_physics.c`, `we_puppet.c`)**: Frame-rate-invariant (`30`–`240 Hz`) Extended Position-Based Dynamics skeletal spring-bone solver with 6 material presets (`Silk`, `LongHair`, `HeavyCape`, `FoliageBranch`, `SoftRibbon`, `MetallicChain`), analytic divergence-free 3D Simplex curl-noise wind fields, Wayland cursor SDF repulsion/vortex coupling, and PipeWire Bark-band audio impulses.
+- **3D Perspective Camera, Catmull-Rom + SQUAD Spline & 8-Light Engine (`we_camera3d.c`, `we_scene.c`)**: Right-handed GLES 3.1 perspective frustum camera with 5-point Gauss-Legendre arc-length centripetal Catmull-Rom position splines, Shoemake SQUAD quaternion orientation slerp, Circle-of-Confusion depth of field, `GL_DEPTH_COMPONENT24` two-subpass depth rendering, and `std140` 8-light (`Point`, `Spot`, `Directional`, `Tube`) uniform packing.
+- **Visual Shader Graph DAG & SSA GLSL ES 3.10 Compiler (`shader_graph.c`)**: Multi-pass node-graph compiler featuring Tarjan $O(V + E)$ SCC cycle rejection with temporal `BUFFER_A..D` feedback latch exemption, spatial convolution barrier pass scheduling, Kahn topological sort with Sethi-Ullman register pressure minimization, forced opaque `IMAGE_PASS` alpha, and bounded `.wwgraph` JSON serialization.
+- **Shader Graph, 3D Camera, Physics & Lighting IPC (`0x001D`..`0x0020`, `0x800C`..`0x800F`) & Studio Docks**: Added `WAYWAL_REQ_COMPILE_SHADER_GRAPH`, `WAYWAL_REQ_SET_CAMERA_3D`, `WAYWAL_REQ_SET_PHYSICS_PARAMS`, and `WAYWAL_REQ_SET_SCENE_LIGHTS` wire messages, 500 ms micro-drag `CommandBus` coalescing, and 4 dockable `wwal-studio` panels (`NodeGraphEditorWidget`, `EffectLibraryBrowserWidget`, `CameraLightingInspectorWidget`, `PhysicsSpringInspectorWidget`) under `DockLayoutManager` layout revision `5`.
+
 ## [3.0.0] - 2026-11-09
 
 ### Added
@@ -16,7 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Multi-Backend Download & Subscription Queue Manager**: 3-tier download arbitration (`libsteam_api.so` ISteamUGC runtime `dlopen`, Steam Web API + HTTP/2 byte-range resume worker with full-jitter HTTP 429 backoff, and asynchronous `steamcmd` pipe runner) governed by a Token Bucket bandwidth limiter and EWMA speed/ETA estimator.
 - **WayWal Open Hub & Cryptographic `.wwpkg` Ecosystem**: Open `.wwpkg` (`tar.zst`) wallpaper package container with RFC 8785 JSON Canonicalization Scheme (JCS), RFC 6962 domain-separated SHA-256 Merkle tree proofs (`0x00` leaf / `0x01` internal node), RFC 8032 Ed25519 digital signatures (`216`-byte `wwpkg_signature_t`), and a 6-step `CreatorPackagingWizard` in `wwal-studio`.
 - **Deterministic 4-Tier Wallpaper Engine Compatibility Scanner (`we_compat_scanner`)**: Pre-apply static & AST analyzer for `PKGV0001`..`PKGV0024` archives with rolling XOR de-masking, PE/ELF/Zip-Slip quarantine, 6-pass `scene.json` / GLSL ES 3.10 AST auditing, automatic shader repair (`highp float`, HLSL-to-GLSL intrinsics, `fragColor.a = 1.0`), and a QuickJS instruction/memory watchdog (`<= 2.0 ms`, `16 MiB` heap, `100,000` opcodes).
-- **Extended Daemon IPC Protocol (`0x0019`..`0x001C`, `0x8008`..`0x800B`)**: Added `WAYWAL_REQ_SCAN_COMPAT`, `WAYWAL_REQ_INSTALL_WWPKG`, `WAYWAL_REQ_QUERY_WORKSHOP_STATUS`, and `WAYWAL_REQ_RELOAD_WORKSHOP_SCENE` with zero-copy DMA-BUF output export (`WAYWAL_REQ_EXPORT_OUTPUT_DMABUF`) prioritizing active video engines.
+- **Extended Daemon IPC Protocol (`0x0019`..`0x001C`, `0x8008`..`0x800B`)**: Added `WAYWAL_REQ_WORKSHOP_SYNC`, `WAYWAL_REQ_WORKSHOP_DOWNLOAD`, `WAYWAL_REQ_WWPKG_INSTALL`, and `WAYWAL_REQ_SCAN_COMPAT` with zero-copy DMA-BUF output export (`WAYWAL_REQ_EXPORT_OUTPUT_DMABUF`) prioritizing active video engines.
 
 ### Fixed
 

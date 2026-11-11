@@ -878,6 +878,15 @@ void GpuPreviewViewport::setShaderUniform(const QString &name, int value)
     m_customUniforms[name.toStdString()] = std::move(val);
 }
 
+void GpuPreviewViewport::setShaderUniform(const QString &name, const QMatrix4x4 &mat)
+{
+    ShaderUniformValue val;
+    val.type = ShaderUniformValue::Type::Mat4;
+    val.matVal = mat;
+    val.fVals.assign(mat.constData(), mat.constData() + 16);
+    m_customUniforms[name.toStdString()] = std::move(val);
+}
+
 void GpuPreviewViewport::clearShaderUniforms() { m_customUniforms.clear(); }
 
 void GpuPreviewViewport::setZoom(float zoom)
@@ -1036,6 +1045,7 @@ void GpuPreviewViewport::renderInProcessShaderPass()
                 m_shaderProgram->setUniformValue(cName, val.iVals[0]);
             break;
         case ShaderUniformValue::Type::Mat4:
+            m_shaderProgram->setUniformValue(cName, val.matVal);
             break;
         }
     }

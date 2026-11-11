@@ -16,6 +16,8 @@ extern "C" {
 #define WE_MDL_MAX_ANIMS     64u
 #define WE_MDL_MAX_LAYERS    16u
 
+typedef struct we_puppet_physics_ctx we_puppet_physics_ctx_t;
+
 typedef struct {
     float pos[3];
     uint32_t blend_indices[4];
@@ -114,6 +116,9 @@ typedef struct we_puppet {
     /* Scratch buffers for runtime two-pass skinning */
     float (*skin_mats)[16];
     we_skinned_vertex_t *skinned_verts;
+
+    /* XPBD spring-bone physics context */
+    we_puppet_physics_ctx_t *physics_ctx;
 
     /* Bind-pose bounding box */
     float min_pos[3];

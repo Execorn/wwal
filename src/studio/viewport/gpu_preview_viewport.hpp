@@ -95,6 +95,7 @@ struct ShaderUniformValue {
     Type type{Type::Float};
     std::vector<float> fVals{};
     std::vector<int> iVals{};
+    QMatrix4x4 matVal{};
 };
 
 class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
@@ -136,6 +137,7 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     void setShaderUniform(const QString &name, const QVector3D &vec);
     void setShaderUniform(const QString &name, const QVector4D &vec);
     void setShaderUniform(const QString &name, int value);
+    void setShaderUniform(const QString &name, const QMatrix4x4 &mat);
     void clearShaderUniforms();
 
     // --- Viewport State & Properties ---

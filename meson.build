@@ -252,6 +252,7 @@ core_sources = files(
   'src/common/path.c',
   'src/common/log.c',
   'src/common/os_compat.c',
+  'src/common/ipc.c',
   'src/common/ipc_proto.c',
   'src/common/bezier.c',
   'src/common/palette_hct.c',
@@ -267,6 +268,7 @@ core_sources = files(
   'src/common/we_appworkshop.c',
   'src/common/wwpkg.c',
   'src/common/we_compat_scanner.c',
+  'src/common/shader_graph.c',
 )
 
 core_deps = [threads_dep, m_dep, dl_dep]
@@ -340,6 +342,9 @@ daemon_sources = files(
   'src/daemon/we_script.c',
   'src/daemon/we_scene_parse.c',
   'src/daemon/we_scene.c',
+  'src/daemon/we_builtin_effects.c',
+  'src/daemon/we_physics.c',
+  'src/daemon/we_camera3d.c',
 )
 
 daemon_deps = [
@@ -434,6 +439,10 @@ if qt6_dep.found() and sqlite3_dep.found()
     'src/studio/topology/monitor_topology_canvas.hpp',
     'src/studio/viewport/gpu_preview_viewport.hpp',
     'src/studio/wizard/creator_packaging_wizard.hpp',
+    'src/studio/graph/node_graph_editor_widget.hpp',
+    'src/studio/graph/effect_library_browser_widget.hpp',
+    'src/studio/inspector/camera_lighting_inspector_widget.hpp',
+    'src/studio/inspector/physics_spring_inspector_widget.hpp',
   )
 
   studio_inc_dirs = [inc_dir, include_directories('src', 'src/studio')]
@@ -472,6 +481,13 @@ if qt6_dep.found() and sqlite3_dep.found()
     'src/studio/topology/monitor_topology_canvas.cpp',
     'src/studio/viewport/gpu_preview_viewport.cpp',
     'src/studio/wizard/creator_packaging_wizard.cpp',
+    'src/studio/graph/node_graph_editor_widget.cpp',
+    'src/studio/graph/effect_library_browser_widget.cpp',
+    'src/studio/inspector/camera_lighting_inspector_widget.cpp',
+    'src/studio/inspector/physics_spring_inspector_widget.cpp',
+    'src/daemon/we_builtin_effects.c',
+    'src/daemon/we_physics.c',
+    'src/daemon/we_camera3d.c',
   ) + studio_mocs
 
   studio_deps = [
@@ -818,6 +834,9 @@ if get_option('tests')
     'src/daemon/we_script.c',
     'src/daemon/we_scene_parse.c',
     'src/daemon/we_scene.c',
+    'src/daemon/we_builtin_effects.c',
+    'src/daemon/we_physics.c',
+    'src/daemon/we_camera3d.c',
     'src/daemon/dmabuf_alloc.c',
     'src/daemon/dmabuf_feedback.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
@@ -922,6 +941,77 @@ if get_option('tests')
   )
   test('workshop_security', test_workshop_security_exe, timeout: 60)
 
+  # Built-in Effects, Physics, 3D Camera & Shader Graph Test Suites
+  test_we_builtin_effects_exe = executable('test_we_builtin_effects',
+    'tests/test_we_builtin_effects.c',
+    'src/daemon/we_builtin_effects.c',
+    'src/daemon/we_shader.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_core_dep, egl_dep, glesv2_dep, gbm_dep, libdrm_dep, m_dep]
+  )
+  test('we_builtin_effects', test_we_builtin_effects_exe)
+
+  test_we_physics_exe = executable('test_we_physics',
+    'tests/test_we_physics.c',
+    'src/daemon/we_physics.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('we_physics', test_we_physics_exe)
+
+  test_we_camera3d_exe = executable('test_we_camera3d',
+    'tests/test_we_camera3d.c',
+    'src/daemon/we_camera3d.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('we_camera3d', test_we_camera3d_exe)
+
+  test_shader_graph_compiler_exe = executable('test_shader_graph_compiler',
+    'tests/test_shader_graph_compiler.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('shader_graph_compiler', test_shader_graph_compiler_exe)
+
+  test_ipc_phase3_wire_exe = executable('test_ipc_phase3_wire',
+    'tests/test_ipc_phase3_wire.c',
+    include_directories: inc_dir,
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('ipc_phase3_wire', test_ipc_phase3_wire_exe)
+
+  test_challenger_effects_exe = executable('test_challenger_effects',
+    'tests/test_challenger_effects.c',
+    'src/daemon/we_builtin_effects.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('challenger_effects', test_challenger_effects_exe)
+
+  test_challenger_physics_exe = executable('test_challenger_physics',
+    'tests/test_challenger_physics.c',
+    'src/daemon/we_physics.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('challenger_physics', test_challenger_physics_exe)
+
+  test_challenger_camera3d_exe = executable('test_challenger_camera3d',
+    'tests/test_challenger_camera3d.c',
+    'src/daemon/we_camera3d.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('challenger_camera3d', test_challenger_camera3d_exe)
+
+  test_challenger_shader_graph_exe = executable('test_challenger_shader_graph',
+    'tests/test_challenger_shader_graph.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('challenger_shader_graph', test_challenger_shader_graph_exe)
+
   if have_qt6
     test_studio_command_and_dock_exe = executable('test_studio_command_and_dock',
       'tests/test_studio_command_and_dock.cpp',
@@ -929,6 +1019,13 @@ if get_option('tests')
       dependencies: [waywal_studio_dep],
     )
     test('studio_command_and_dock', test_studio_command_and_dock_exe)
+
+    test_studio_phase3_integration_exe = executable('test_studio_phase3_integration',
+      'tests/test_studio_phase3_integration.cpp',
+      include_directories: studio_inc_dirs,
+      dependencies: [waywal_studio_dep],
+    )
+    test('studio_phase3_integration', test_studio_phase3_integration_exe, timeout: 60, is_parallel: false)
 
     benchmark_grid_virtualization_exe = executable('benchmark_grid_virtualization',
       'tests/benchmark_grid_virtualization.cpp',

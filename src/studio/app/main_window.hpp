@@ -37,12 +37,17 @@ using ::wwal::studio::WorkshopBrowserWidget;
 
 class DockLayoutManager;
 class CommandBus;
+class IpcClient;
 class GpuPreviewViewport;
 class CubicBezierEditorWidget;
 class PropertyInspectorWidget;
 class ThemeStudioWidget;
 class MonitorTopologyCanvas;
 class MonitorTopologyBar;
+class NodeGraphEditorWidget;
+class EffectLibraryBrowserWidget;
+class CameraLightingInspectorWidget;
+class PhysicsSpringInspectorWidget;
 
 /**
  * @brief Startup options parsed from CLI arguments.
@@ -97,6 +102,17 @@ class MainWindow : public QMainWindow {
     CatalogIndexManager *catalogIndexManager() const { return m_catalogIndexMgr.get(); }
     DownloadManager *downloadManager() const { return m_downloadMgr.get(); }
     RecursiveFsWatcher *fsWatcher() const { return m_fsWatcher.get(); }
+    IpcClient *ipcClient() const { return m_ipcClient.get(); }
+    NodeGraphEditorWidget *nodeGraphEditor() const { return m_nodeGraphEditor; }
+    EffectLibraryBrowserWidget *effectLibraryBrowser() const { return m_effectLibraryBrowser; }
+    CameraLightingInspectorWidget *cameraLightingInspector() const
+    {
+        return m_cameraLightingInspector;
+    }
+    PhysicsSpringInspectorWidget *physicsSpringInspector() const
+    {
+        return m_physicsSpringInspector;
+    }
 
     // Global Actions
     QAction *undoAction() const { return m_undoAction; }
@@ -149,6 +165,12 @@ class MainWindow : public QMainWindow {
     PropertyInspectorWidget *m_propertyInspector{nullptr};
     ThemeStudioWidget *m_themeStudio{nullptr};
     StudioFooterBar *m_footerBar{nullptr};
+
+    std::unique_ptr<IpcClient> m_ipcClient;
+    NodeGraphEditorWidget *m_nodeGraphEditor{nullptr};
+    EffectLibraryBrowserWidget *m_effectLibraryBrowser{nullptr};
+    CameraLightingInspectorWidget *m_cameraLightingInspector{nullptr};
+    PhysicsSpringInspectorWidget *m_physicsSpringInspector{nullptr};
 
     // Global Actions
     QAction *m_undoAction{nullptr};

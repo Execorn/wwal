@@ -318,4 +318,325 @@ QString SetPowerPolicyCommand::describe() const
     return QString("Set battery policy: %1").arg(policyStr);
 }
 
+/* ========================================================================= */
+/* Shader Graph, 3D Camera & Puppet Physics Commands                         */
+/* ========================================================================= */
+
+AddNodeCommand::AddNodeCommand(waywal_graph_node_t node, MutateFn mutateFn)
+    : m_node(node), m_mutateFn(std::move(mutateFn))
+{
+}
+
+void AddNodeCommand::execute()
+{
+    if (m_mutateFn) {
+        m_mutateFn(m_node, true);
+    }
+}
+
+void AddNodeCommand::undo()
+{
+    if (m_mutateFn) {
+        m_mutateFn(m_node, false);
+    }
+}
+
+QString AddNodeCommand::describe() const
+{
+    return QStringLiteral("Add node '%1' (#%2)")
+        .arg(QString::fromUtf8(m_node.title), QString::number(m_node.node_id));
+}
+
+RemoveNodeCommand::RemoveNodeCommand(waywal_graph_node_t removedNode,
+                                     std::vector<waywal_graph_edge_t> detachedEdges,
+                                     RestoreFn restoreFn)
+    : m_removedNode(removedNode), m_detachedEdges(std::move(detachedEdges)),
+      m_restoreFn(std::move(restoreFn))
+{
+}
+
+void RemoveNodeCommand::execute()
+{
+    if (m_restoreFn) {
+        m_restoreFn(m_removedNode, m_detachedEdges, false);
+    }
+}
+
+void RemoveNodeCommand::undo()
+{
+    if (m_restoreFn) {
+        m_restoreFn(m_removedNode, m_detachedEdges, true);
+    }
+}
+
+QString RemoveNodeCommand::describe() const
+{
+    return QStringLiteral("Remove node '%1' (#%2)")
+        .arg(QString::fromUtf8(m_removedNode.title), QString::number(m_removedNode.node_id));
+}
+
+MoveNodesCommand::MoveNodesCommand(std::vector<NodeMoveDelta> deltas, ApplyMoveFn applyFn)
+    : m_deltas(std::move(deltas)), m_applyFn(std::move(applyFn)),
+      m_timestamp(std::chrono::steady_clock::now())
+{
+}
+
+void MoveNodesCommand::execute()
+{
+    if (m_applyFn) {
+        m_applyFn(m_deltas, true);
+    }
+}
+
+void MoveNodesCommand::undo()
+{
+    if (m_applyFn) {
+        m_applyFn(m_deltas, false);
+    }
+}
+
+QString MoveNodesCommand::describe() const
+{
+    return QStringLiteral("Move %1 node(s)").arg(m_deltas.size());
+}
+
+bool MoveNodesCommand::mergeWith(const ICommand *other)
+{
+    const auto *otherCmd = dynamic_cast<const MoveNodesCommand *>(other);
+    if (!otherCmd) {
+        return false;
+    }
+
+    auto diff =
+        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
+            .count();
+    if (diff < 0 || diff > 500) {
+        return false;
+    }
+
+    if (m_deltas.size() != otherCmd->m_deltas.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < m_deltas.size(); ++i) {
+        if (m_deltas[i].nodeId != otherCmd->m_deltas[i].nodeId) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < m_deltas.size(); ++i) {
+        m_deltas[i].newPos = otherCmd->m_deltas[i].newPos;
+    }
+    m_timestamp = otherCmd->m_timestamp;
+    return true;
+}
+
+ConnectWireCommand::ConnectWireCommand(waywal_graph_edge_t edge, WireFn wireFn)
+    : m_edge(edge), m_wireFn(std::move(wireFn))
+{
+}
+
+void ConnectWireCommand::execute()
+{
+    if (m_wireFn) {
+        m_wireFn(m_edge, true);
+    }
+}
+
+void ConnectWireCommand::undo()
+{
+    if (m_wireFn) {
+        m_wireFn(m_edge, false);
+    }
+}
+
+QString ConnectWireCommand::describe() const
+{
+    return QStringLiteral("Connect wire (#%1: %2:%3 -> %4:%5)")
+        .arg(QString::number(m_edge.edge_id), QString::number(m_edge.src_node_id),
+             QString::number(m_edge.src_pin_index), QString::number(m_edge.dst_node_id),
+             QString::number(m_edge.dst_pin_index));
+}
+
+DisconnectWireCommand::DisconnectWireCommand(waywal_graph_edge_t edge, WireFn wireFn)
+    : m_edge(edge), m_wireFn(std::move(wireFn))
+{
+}
+
+void DisconnectWireCommand::execute()
+{
+    if (m_wireFn) {
+        m_wireFn(m_edge, false);
+    }
+}
+
+void DisconnectWireCommand::undo()
+{
+    if (m_wireFn) {
+        m_wireFn(m_edge, true);
+    }
+}
+
+QString DisconnectWireCommand::describe() const
+{
+    return QStringLiteral("Disconnect wire (#%1: %2:%3 -> %4:%5)")
+        .arg(QString::number(m_edge.edge_id), QString::number(m_edge.src_node_id),
+             QString::number(m_edge.src_pin_index), QString::number(m_edge.dst_node_id),
+             QString::number(m_edge.dst_pin_index));
+}
+
+SetNodeConstantCommand::SetNodeConstantCommand(uint32_t nodeId, QString nodeTitle,
+                                               std::array<float, 4> oldVal,
+                                               std::array<float, 4> newVal, ApplyConstFn applyFn)
+    : m_nodeId(nodeId), m_nodeTitle(std::move(nodeTitle)), m_oldVal(oldVal), m_newVal(newVal),
+      m_applyFn(std::move(applyFn)), m_timestamp(std::chrono::steady_clock::now())
+{
+}
+
+void SetNodeConstantCommand::execute()
+{
+    if (m_applyFn) {
+        m_applyFn(m_nodeId, m_newVal);
+    }
+}
+
+void SetNodeConstantCommand::undo()
+{
+    if (m_applyFn) {
+        m_applyFn(m_nodeId, m_oldVal);
+    }
+}
+
+QString SetNodeConstantCommand::describe() const
+{
+    return QStringLiteral("Set constant on '%1' (#%2)").arg(m_nodeTitle, QString::number(m_nodeId));
+}
+
+bool SetNodeConstantCommand::mergeWith(const ICommand *other)
+{
+    const auto *otherCmd = dynamic_cast<const SetNodeConstantCommand *>(other);
+    if (!otherCmd || m_nodeId != otherCmd->m_nodeId) {
+        return false;
+    }
+
+    auto diff =
+        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
+            .count();
+    if (diff < 0 || diff > 500) {
+        return false;
+    }
+
+    m_newVal = otherCmd->m_newVal;
+    m_timestamp = otherCmd->m_timestamp;
+    return true;
+}
+
+SetCamera3DCommand::SetCamera3DCommand(QString output, we_camera3d_t oldCam, we_camera3d_t newCam,
+                                       we_lighting_uniforms_t oldLights,
+                                       we_lighting_uniforms_t newLights, ApplyCamFn applyFn)
+    : m_output(std::move(output)), m_oldCam(oldCam), m_newCam(newCam), m_oldLights(oldLights),
+      m_newLights(newLights), m_applyFn(std::move(applyFn)),
+      m_timestamp(std::chrono::steady_clock::now())
+{
+}
+
+void SetCamera3DCommand::execute()
+{
+    if (m_applyFn) {
+        m_applyFn(m_output, m_newCam, m_newLights);
+    }
+}
+
+void SetCamera3DCommand::undo()
+{
+    if (m_applyFn) {
+        m_applyFn(m_output, m_oldCam, m_oldLights);
+    }
+}
+
+QString SetCamera3DCommand::describe() const
+{
+    if (m_output.isEmpty()) {
+        return QStringLiteral("Adjust 3D Camera & Lighting");
+    }
+    return QStringLiteral("Adjust 3D Camera & Lighting on %1").arg(m_output);
+}
+
+bool SetCamera3DCommand::mergeWith(const ICommand *other)
+{
+    const auto *otherCmd = dynamic_cast<const SetCamera3DCommand *>(other);
+    if (!otherCmd || m_output != otherCmd->m_output) {
+        return false;
+    }
+
+    auto diff =
+        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
+            .count();
+    if (diff < 0 || diff > 500) {
+        return false;
+    }
+
+    m_newCam = otherCmd->m_newCam;
+    m_newLights = otherCmd->m_newLights;
+    m_timestamp = otherCmd->m_timestamp;
+    return true;
+}
+
+SetPhysicsSpringCommand::SetPhysicsSpringCommand(QString output, int32_t objectId,
+                                                 int32_t boneIndex, we_bone_sim_config_t oldCfg,
+                                                 we_bone_sim_config_t newCfg,
+                                                 we_wind_field_t oldWind, we_wind_field_t newWind,
+                                                 we_cursor_force_t oldCursor,
+                                                 we_cursor_force_t newCursor, ApplyPhysFn applyFn)
+    : m_output(std::move(output)), m_objectId(objectId), m_boneIndex(boneIndex), m_oldCfg(oldCfg),
+      m_newCfg(newCfg), m_oldWind(oldWind), m_newWind(newWind), m_oldCursor(oldCursor),
+      m_newCursor(newCursor), m_applyFn(std::move(applyFn)),
+      m_timestamp(std::chrono::steady_clock::now())
+{
+}
+
+void SetPhysicsSpringCommand::execute()
+{
+    if (m_applyFn) {
+        m_applyFn(m_output, m_objectId, m_boneIndex, m_newCfg, m_newWind, m_newCursor);
+    }
+}
+
+void SetPhysicsSpringCommand::undo()
+{
+    if (m_applyFn) {
+        m_applyFn(m_output, m_objectId, m_boneIndex, m_oldCfg, m_oldWind, m_oldCursor);
+    }
+}
+
+QString SetPhysicsSpringCommand::describe() const
+{
+    if (m_output.isEmpty()) {
+        return QStringLiteral("Adjust physics spring bone %1").arg(m_boneIndex);
+    }
+    return QStringLiteral("Adjust physics spring bone %1 on %2").arg(m_boneIndex).arg(m_output);
+}
+
+bool SetPhysicsSpringCommand::mergeWith(const ICommand *other)
+{
+    const auto *otherCmd = dynamic_cast<const SetPhysicsSpringCommand *>(other);
+    if (!otherCmd || m_output != otherCmd->m_output || m_objectId != otherCmd->m_objectId ||
+        m_boneIndex != otherCmd->m_boneIndex) {
+        return false;
+    }
+
+    auto diff =
+        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
+            .count();
+    if (diff < 0 || diff > 500) {
+        return false;
+    }
+
+    m_newCfg = otherCmd->m_newCfg;
+    m_newWind = otherCmd->m_newWind;
+    m_newCursor = otherCmd->m_newCursor;
+    m_timestamp = otherCmd->m_timestamp;
+    return true;
+}
+
 } // namespace waywal::studio
