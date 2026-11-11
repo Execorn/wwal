@@ -29,6 +29,25 @@ namespace waywal::studio {
 
 namespace {
 
+bool expectsGenericOkReply(uint16_t reqOpcode) noexcept
+{
+    switch (reqOpcode) {
+    case WAYWAL_REQ_EXPORT_OUTPUT_DMABUF:
+    case WAYWAL_REQ_GET_TELEMETRY:
+    case WAYWAL_REQ_WORKSHOP_SYNC:
+    case WAYWAL_REQ_WORKSHOP_DOWNLOAD:
+    case WAYWAL_REQ_WWPKG_INSTALL:
+    case WAYWAL_REQ_SCAN_COMPAT:
+    case WAYWAL_REQ_COMPILE_SHADER_GRAPH:
+    case WAYWAL_REQ_SET_CAMERA_3D:
+    case WAYWAL_REQ_SET_PHYSICS_PARAMS:
+    case WAYWAL_REQ_SET_SCENE_LIGHTS:
+        return false;
+    default:
+        return true;
+    }
+}
+
 bool readExactNonBlocking(int fd, void *buf, size_t count, int timeoutMs)
 {
     uint8_t *ptr = static_cast<uint8_t *>(buf);
@@ -514,7 +533,12 @@ void IpcClient::workerLoop()
         }
 
         if (pfds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-            if (pfds[1].revents & POLLIN) {
+            while (m_socketFd >= 0 && (pfds[1].revents & POLLIN)) {
+                char peekByte = 0;
+                ssize_t peekRes = ::recv(m_socketFd, &peekByte, 1, MSG_PEEK | MSG_DONTWAIT);
+                if (peekRes <= 0) {
+                    break;
+                }
                 handleIncomingPacket();
             }
             closeSocket();
@@ -535,9 +559,11 @@ void IpcClient::flushOutboundQueue()
         return;
     }
 
+    std::deque<OutboundPacket> packets;
     std::vector<waywal_set_uniform_payload_t> uniformBatch;
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
+        packets.swap(m_outQueue);
         if (!m_pendingUniforms.empty()) {
             uniformBatch.reserve(m_pendingUniforms.size());
             for (auto &[key, payload] : m_pendingUniforms) {
@@ -545,35 +571,6 @@ void IpcClient::flushOutboundQueue()
             }
             m_pendingUniforms.clear();
         }
-    }
-
-    for (const auto &payload : uniformBatch) {
-        waywal_ipc_hdr_t hdr{};
-        hdr.magic = WAYWAL_IPC_MAGIC;
-        hdr.version = WAYWAL_IPC_VERSION;
-        hdr.opcode = WAYWAL_REQ_SET_UNIFORM;
-        hdr.payload_size = sizeof(waywal_set_uniform_payload_t);
-
-        if (!writeExactNonBlocking(m_socketFd, &hdr, sizeof(hdr), 100)) {
-            closeSocket();
-            return;
-        }
-        if (!writeExactNonBlocking(m_socketFd, &payload, sizeof(payload), 100)) {
-            closeSocket();
-            return;
-        }
-
-        PendingRequest req{};
-        req.expectedOpcode = WAYWAL_REQ_SET_UNIFORM;
-        req.sentAt = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lock(m_requestsMutex);
-        m_pendingRequests.push_back(std::move(req));
-    }
-
-    std::deque<OutboundPacket> packets;
-    {
-        std::lock_guard<std::mutex> lock(m_queueMutex);
-        packets.swap(m_outQueue);
     }
 
     auto closeRemainingFds = [](std::deque<OutboundPacket> &q) {
@@ -628,6 +625,29 @@ void IpcClient::flushOutboundQueue()
         std::lock_guard<std::mutex> lock(m_requestsMutex);
         m_pendingRequests.push_back(std::move(req));
     }
+
+    for (const auto &payload : uniformBatch) {
+        waywal_ipc_hdr_t hdr{};
+        hdr.magic = WAYWAL_IPC_MAGIC;
+        hdr.version = WAYWAL_IPC_VERSION;
+        hdr.opcode = WAYWAL_REQ_SET_UNIFORM;
+        hdr.payload_size = sizeof(waywal_set_uniform_payload_t);
+
+        if (!writeExactNonBlocking(m_socketFd, &hdr, sizeof(hdr), 100)) {
+            closeSocket();
+            return;
+        }
+        if (!writeExactNonBlocking(m_socketFd, &payload, sizeof(payload), 100)) {
+            closeSocket();
+            return;
+        }
+
+        PendingRequest req{};
+        req.expectedOpcode = WAYWAL_REQ_SET_UNIFORM;
+        req.sentAt = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(m_requestsMutex);
+        m_pendingRequests.push_back(std::move(req));
+    }
 }
 
 bool IpcClient::popPendingForOpcode(uint16_t reqOpcode, PendingRequest &outReq)
@@ -649,7 +669,7 @@ bool IpcClient::popPendingForOpcode(uint16_t reqOpcode, PendingRequest &outReq)
                                    static_cast<bool>(entry.workshopDownloadCallback) ||
                                    static_cast<bool>(entry.wwpkgInstallCallback) ||
                                    static_cast<bool>(entry.scanCompatCallback);
-                if (!hasCb) {
+                if (expectsGenericOkReply(entry.expectedOpcode) && !hasCb) {
                     m_pendingRequests.erase(m_pendingRequests.begin() +
                                             static_cast<std::ptrdiff_t>(scan));
                     --idx;
@@ -1052,15 +1072,36 @@ void IpcClient::handleIncomingPacket()
         return;
     }
 
+    if (hdr.opcode == WAYWAL_RESP_INFO) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_QUERY_JSON, req);
+        QString jsonStr = QString::fromUtf8(reinterpret_cast<const char *>(payload.data()),
+                                            static_cast<qsizetype>(payload.size()));
+        QMetaObject::invokeMethod(
+            this,
+            [this, jsonStr, cb = std::move(req.jsonCallback)]() {
+                if (cb) {
+                    cb(jsonStr);
+                }
+                emit outputsJsonReceived(jsonStr);
+            },
+            Qt::QueuedConnection);
+        return;
+    }
+
     if (hdr.opcode == WAYWAL_RESP_OK) {
         PendingRequest req{};
         bool hasReq = false;
         {
             std::lock_guard<std::mutex> lock(m_requestsMutex);
-            if (!m_pendingRequests.empty()) {
-                req = std::move(m_pendingRequests.front());
-                m_pendingRequests.pop_front();
-                hasReq = true;
+            for (size_t idx = 0; idx < m_pendingRequests.size(); ++idx) {
+                if (expectsGenericOkReply(m_pendingRequests[idx].expectedOpcode)) {
+                    req = std::move(m_pendingRequests[idx]);
+                    m_pendingRequests.erase(m_pendingRequests.begin() +
+                                            static_cast<std::ptrdiff_t>(idx));
+                    hasReq = true;
+                    break;
+                }
             }
         }
         if (hasReq && req.expectedOpcode == WAYWAL_REQ_QUERY_JSON) {

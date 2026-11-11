@@ -401,6 +401,14 @@ size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, c
     return off;
 }
 
+typedef struct {
+    int fd;
+    uint64_t token;
+} ipc_paused_subscriber_t;
+
+static ipc_paused_subscriber_t g_paused_subscribers[16];
+static uint64_t g_next_sub_pause_token = 1;
+
 static bool daemon_is_subscriber_fd(const daemon_state_t *state, int fd)
 {
     if (!state || fd < 0) {
@@ -414,6 +422,105 @@ static bool daemon_is_subscriber_fd(const daemon_state_t *state, int fd)
     return false;
 }
 
+static bool ipc_subscriber_is_paused(int fd)
+{
+    if (fd < 0) {
+        return false;
+    }
+    for (size_t i = 0; i < 16; ++i) {
+        if (g_paused_subscribers[i].token != 0 && g_paused_subscribers[i].fd == fd) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint64_t ipc_pause_subscriber_fd(daemon_state_t *state, int fd)
+{
+    if (!state || fd < 0) {
+        return 0;
+    }
+    uint64_t tok = g_next_sub_pause_token++;
+    if (tok == 0) {
+        tok = g_next_sub_pause_token++;
+    }
+    size_t slot = 16;
+    for (size_t i = 0; i < 16; ++i) {
+        if (g_paused_subscribers[i].token != 0 && g_paused_subscribers[i].fd == fd) {
+            slot = i;
+            break;
+        }
+        if (g_paused_subscribers[i].token == 0 && slot == 16) {
+            slot = i;
+        }
+    }
+    if (slot >= 16) {
+        slot = 0;
+    }
+    g_paused_subscribers[slot].fd = fd;
+    g_paused_subscribers[slot].token = tok;
+    unregister_fd_from_loops(state, fd);
+    return tok;
+}
+
+static bool ipc_subscriber_token_is_active(const daemon_state_t *state, int fd, uint64_t tok)
+{
+    if (!state || fd < 0 || tok == 0 || !daemon_is_subscriber_fd(state, fd)) {
+        return false;
+    }
+    for (size_t i = 0; i < 16; ++i) {
+        if (g_paused_subscribers[i].token == tok && g_paused_subscribers[i].fd == fd) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ipc_unpause_subscriber_token(int fd, uint64_t tok)
+{
+    if (fd < 0 || tok == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < 16; ++i) {
+        if (g_paused_subscribers[i].token == tok && g_paused_subscribers[i].fd == fd) {
+            g_paused_subscribers[i].fd = -1;
+            g_paused_subscribers[i].token = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ipc_invalidate_paused_subscriber_fd(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+    for (size_t i = 0; i < 16; ++i) {
+        if (g_paused_subscribers[i].token != 0 && g_paused_subscribers[i].fd == fd) {
+            g_paused_subscribers[i].fd = -1;
+            g_paused_subscribers[i].token = 0;
+        }
+    }
+}
+
+static void daemon_close_subscriber_at(daemon_state_t *state, size_t idx)
+{
+    if (!state || idx >= state->num_subscribers) {
+        return;
+    }
+    int sfd = state->subscriber_fds[idx];
+    if (sfd >= 0) {
+        ipc_invalidate_paused_subscriber_fd(sfd);
+        unregister_fd_from_loops(state, sfd);
+        close(sfd);
+    }
+    for (size_t j = idx + 1; j < state->num_subscribers; ++j) {
+        state->subscriber_fds[j - 1] = state->subscriber_fds[j];
+    }
+    state->num_subscribers--;
+}
+
 static void daemon_remove_subscriber_fd(daemon_state_t *state, int fd)
 {
     if (!state || fd < 0) {
@@ -421,12 +528,7 @@ static void daemon_remove_subscriber_fd(daemon_state_t *state, int fd)
     }
     for (size_t i = 0; i < state->num_subscribers; ++i) {
         if (state->subscriber_fds[i] == fd) {
-            unregister_fd_from_loops(state, fd);
-            close(fd);
-            for (size_t j = i + 1; j < state->num_subscribers; ++j) {
-                state->subscriber_fds[j - 1] = state->subscriber_fds[j];
-            }
-            state->num_subscribers--;
+            daemon_close_subscriber_at(state, i);
             return;
         }
     }
@@ -457,14 +559,7 @@ void daemon_reap_dead_subscribers(daemon_state_t *state)
             }
         }
         if (dead) {
-            if (sfd >= 0) {
-                unregister_fd_from_loops(state, sfd);
-                close(sfd);
-            }
-            for (size_t j = i + 1; j < state->num_subscribers; ++j) {
-                state->subscriber_fds[j - 1] = state->subscriber_fds[j];
-            }
-            state->num_subscribers--;
+            daemon_close_subscriber_at(state, i);
         } else {
             ++i;
         }
@@ -513,14 +608,7 @@ void daemon_broadcast_event(daemon_state_t *state, const char *event_name)
             }
         }
         if (!ok) {
-            if (sfd >= 0) {
-                unregister_fd_from_loops(state, sfd);
-                close(sfd);
-            }
-            for (size_t j = i + 1; j < state->num_subscribers; ++j) {
-                state->subscriber_fds[j - 1] = state->subscriber_fds[j];
-            }
-            state->num_subscribers--;
+            daemon_close_subscriber_at(state, i);
         } else {
             ++i;
         }
@@ -1243,6 +1331,8 @@ typedef enum {
 typedef struct {
     ipc_async_job_kind_t kind;
     int client_fd;
+    int sub_fd;
+    uint64_t sub_pause_token;
     int attached_fd;
     bool gpu_compute_active;
     char default_workshop_dir[PATH_MAX];
@@ -1453,6 +1543,7 @@ static int ipc_run_steamcmd_isolated(const char *steamcmd_bin, uint64_t file_id,
 
     int exit_code = -1;
     int elapsed_ms = 0;
+    bool got_status = false;
     while (elapsed_ms < 900000) {
         struct pollfd pfds[2] = {
             {.fd = status_pipe[0], .events = POLLIN | POLLHUP},
@@ -1470,9 +1561,22 @@ static int ipc_run_steamcmd_isolated(const char *steamcmd_bin, uint64_t file_id,
             /* Closing cancel_pipe[1] wakes the helper immediately to terminate steamcmd */
             close(cancel_pipe[1]);
             cancel_pipe[1] = -1;
-            struct pollfd wpfd = {.fd = status_pipe[0], .events = POLLIN | POLLHUP};
-            (void)poll(&wpfd, 1, 500);
-            (void)read(status_pipe[0], &exit_code, sizeof(exit_code));
+            int wait_rem_ms = 500;
+            while (wait_rem_ms > 0) {
+                struct pollfd wpfd = {.fd = status_pipe[0], .events = POLLIN | POLLHUP};
+                int wpr = poll(&wpfd, 1, 50);
+                if (wpr > 0) {
+                    break;
+                }
+                if (wpr < 0 && errno != EINTR) {
+                    break;
+                }
+                wait_rem_ms -= 50;
+            }
+            if (read(status_pipe[0], &exit_code, sizeof(exit_code)) != (ssize_t)sizeof(exit_code)) {
+                exit_code = 130;
+            }
+            got_status = true;
             break;
         }
         if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
@@ -1480,15 +1584,40 @@ static int ipc_run_steamcmd_isolated(const char *steamcmd_bin, uint64_t file_id,
             if (r != (ssize_t)sizeof(exit_code)) {
                 exit_code = 1;
             }
+            got_status = true;
             break;
         }
         elapsed_ms += 250;
+    }
+
+    if (!got_status && cancel_pipe[1] >= 0) {
+        close(cancel_pipe[1]);
+        cancel_pipe[1] = -1;
+        int wait_rem_ms = 500;
+        while (wait_rem_ms > 0) {
+            struct pollfd wpfd = {.fd = status_pipe[0], .events = POLLIN | POLLHUP};
+            int wpr = poll(&wpfd, 1, 50);
+            if (wpr > 0) {
+                break;
+            }
+            if (wpr < 0 && errno != EINTR) {
+                break;
+            }
+            wait_rem_ms -= 50;
+        }
+        int helper_rc = 0;
+        (void)read(status_pipe[0], &helper_rc, sizeof(helper_rc));
+        if (elapsed_ms >= 900000) {
+            exit_code = 124;
+        }
     }
 
     if (cancel_pipe[1] >= 0) {
         close(cancel_pipe[1]);
     }
     close(status_pipe[0]);
+    while (waitpid(helper_pid, NULL, 0) < 0 && errno == EINTR) {
+    }
     return exit_code;
 }
 
@@ -1535,6 +1664,9 @@ static void *ipc_download_worker_main(void *arg)
                 ok = true;
             } else if (rc == 130) {
                 snprintf(err_buf, sizeof(err_buf), "Workshop download cancelled during shutdown");
+            } else if (rc == 124) {
+                snprintf(err_buf, sizeof(err_buf), "Workshop download timed out for item %llu",
+                         (unsigned long long)next_id);
             } else {
                 snprintf(err_buf, sizeof(err_buf), "steamcmd exited with status %d for item %llu",
                          rc, (unsigned long long)next_id);
@@ -2144,6 +2276,42 @@ static void ipc_async_run_job(ipc_async_job_t *job)
     }
 }
 
+static bool ipc_async_can_reply_to_job_client(const daemon_state_t *state,
+                                              const ipc_async_job_t *job)
+{
+    if (!job || job->client_fd < 0) {
+        return false;
+    }
+    if (job->sub_pause_token != 0) {
+        return ipc_subscriber_token_is_active(state, job->sub_fd, job->sub_pause_token);
+    }
+    return true;
+}
+
+static void ipc_async_resume_subscriber_if_needed(daemon_state_t *state, ipc_async_job_t *job,
+                                                  bool send_succeeded)
+{
+    if (!job || job->sub_pause_token == 0) {
+        return;
+    }
+    int sfd = job->sub_fd;
+    uint64_t tok = job->sub_pause_token;
+    job->sub_fd = -1;
+    job->sub_pause_token = 0;
+
+    if (!ipc_unpause_subscriber_token(sfd, tok) || !state || !daemon_is_subscriber_fd(state, sfd)) {
+        return;
+    }
+    if (!send_succeeded) {
+        daemon_remove_subscriber_fd(state, sfd);
+        return;
+    }
+    if (state->running) {
+        register_fd_in_loops(state, sfd, URING_EV_IPC_READ);
+        (void)daemon_ipc_dispatch_subscriber_fd(state, sfd);
+    }
+}
+
 static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_t *job)
 {
     if (!job) {
@@ -2158,48 +2326,50 @@ static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_
     case IPC_JOB_WORKSHOP_SYNC: {
         waywal_ipc_hdr_t rhdr;
         waywal_ipc_resp_workshop_sync_t resp;
-        if (job->client_fd >= 0 &&
+        bool send_ok = false;
+        if (ipc_async_can_reply_to_job_client(state, job) &&
             waywal_ipc_serialize_resp_workshop_sync(
                 job->sync_resp.status_code, job->sync_resp.total_libraries_found,
                 job->sync_resp.total_items_indexed, job->sync_resp.total_size_bytes, &rhdr,
                 &resp)) {
-            if (waywal_ipc_send(job->client_fd, &rhdr, -1)) {
-                (void)write_exact(job->client_fd, &resp, sizeof(resp));
+            if (waywal_ipc_send(job->client_fd, &rhdr, -1) &&
+                write_exact(job->client_fd, &resp, sizeof(resp))) {
+                send_ok = true;
             }
         }
         if (job->client_fd >= 0) {
-            if (!daemon_is_subscriber_fd(state, job->client_fd)) {
-                close(job->client_fd);
-            }
+            close(job->client_fd);
             job->client_fd = -1;
         }
         if (state && job->sync_resp.status_code == 0) {
             daemon_broadcast_event(state, "workshop_sync");
         }
+        ipc_async_resume_subscriber_if_needed(state, job, send_ok);
         break;
     }
     case IPC_JOB_SCAN_COMPAT: {
         waywal_ipc_hdr_t rhdr;
         waywal_ipc_resp_scan_compat_t resp;
-        if (job->client_fd >= 0 &&
+        bool send_ok = false;
+        if (ipc_async_can_reply_to_job_client(state, job) &&
             waywal_ipc_serialize_resp_scan_compat(
                 job->scan_resp.status_code, job->scan_resp.compat_tier, job->scan_resp.compat_score,
                 job->scan_resp.total_issues, job->scan_resp.repairs_applied,
                 job->scan_resp.estimated_vram_mb, job->scan_resp.estimated_fps,
                 job->scan_resp.report_json_path, &rhdr, &resp)) {
-            if (waywal_ipc_send(job->client_fd, &rhdr, -1)) {
-                (void)write_exact(job->client_fd, &resp, sizeof(resp));
+            if (waywal_ipc_send(job->client_fd, &rhdr, -1) &&
+                write_exact(job->client_fd, &resp, sizeof(resp))) {
+                send_ok = true;
             }
         }
         if (job->client_fd >= 0) {
-            if (!daemon_is_subscriber_fd(state, job->client_fd)) {
-                close(job->client_fd);
-            }
+            close(job->client_fd);
             job->client_fd = -1;
         }
         if (state && job->scan_resp.status_code == 0) {
             daemon_broadcast_event(state, "scan_compat");
         }
+        ipc_async_resume_subscriber_if_needed(state, job, send_ok);
         break;
     }
     case IPC_JOB_WWPKG_INSTALL: {
@@ -2226,7 +2396,16 @@ static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_
                 snprintf(wpay.workshop_dir, sizeof(wpay.workshop_dir), "%s",
                          job->wwpkg_install_dir);
                 wpay.fps = job->wwpkg_target_fps > 0 ? job->wwpkg_target_fps : 60u;
-                (void)daemon_activate_workshop(state, &wpay);
+                if (!daemon_activate_workshop(state, &wpay) &&
+                    job->wwpkg_entrypoint_abs[0] != '\0') {
+                    waywal_output_saved_state_t sv;
+                    memset(&sv, 0, sizeof(sv));
+                    snprintf(sv.output_name, sizeof(sv.output_name), "%s", tgt);
+                    snprintf(sv.media_path, sizeof(sv.media_path), "%s", job->wwpkg_entrypoint_abs);
+                    sv.kind = WAYWAL_CONTENT_STATIC_IMAGE;
+                    sv.scaling = WAYWAL_SCALING_FILL;
+                    (void)daemon_restore_output_entry(state, &sv, tgt);
+                }
             } else if (job->wwpkg_type == WWPKG_TYPE_VIDEO_STREAM &&
                        job->wwpkg_entrypoint_abs[0] != '\0') {
                 waywal_output_saved_state_t sv;
@@ -2236,52 +2415,62 @@ static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_
                 sv.kind = WAYWAL_CONTENT_VIDEO;
                 sv.scaling = WAYWAL_SCALING_FILL;
                 (void)daemon_restore_output_entry(state, &sv, tgt);
+            } else if (job->wwpkg_entrypoint_abs[0] != '\0') {
+                waywal_output_saved_state_t sv;
+                memset(&sv, 0, sizeof(sv));
+                snprintf(sv.output_name, sizeof(sv.output_name), "%s", tgt);
+                snprintf(sv.media_path, sizeof(sv.media_path), "%s", job->wwpkg_entrypoint_abs);
+                sv.kind = WAYWAL_CONTENT_STATIC_IMAGE;
+                sv.scaling = WAYWAL_SCALING_FILL;
+                (void)daemon_restore_output_entry(state, &sv, tgt);
             }
         }
 
         uint8_t resp_buf[sizeof(waywal_ipc_resp_wwpkg_install_t) + WAYWAL_IPC_MAX_TAIL_STR];
         size_t resp_len = 0;
         waywal_ipc_hdr_t rhdr;
-        if (job->client_fd >= 0 &&
+        bool send_ok = false;
+        if (ipc_async_can_reply_to_job_client(state, job) &&
             waywal_ipc_serialize_resp_wwpkg_install(job->wwpkg_resp_uuid, job->wwpkg_status_code,
                                                     job->wwpkg_error_msg, &rhdr, NULL, resp_buf,
                                                     sizeof(resp_buf), &resp_len)) {
-            if (waywal_ipc_send(job->client_fd, &rhdr, -1)) {
-                (void)write_exact(job->client_fd, resp_buf, resp_len);
+            if (waywal_ipc_send(job->client_fd, &rhdr, -1) &&
+                write_exact(job->client_fd, resp_buf, resp_len)) {
+                send_ok = true;
             }
         }
         if (job->client_fd >= 0) {
-            if (!daemon_is_subscriber_fd(state, job->client_fd)) {
-                close(job->client_fd);
-            }
+            close(job->client_fd);
             job->client_fd = -1;
         }
         if (state && job->wwpkg_status_code == 0) {
             daemon_broadcast_event(state, "wwpkg_installed");
         }
+        ipc_async_resume_subscriber_if_needed(state, job, send_ok);
         break;
     }
     case IPC_JOB_WORKSHOP_DOWNLOAD: {
         waywal_ipc_hdr_t rhdr;
         waywal_ipc_resp_workshop_download_t resp;
-        if (job->client_fd >= 0 &&
+        bool send_ok = false;
+        if (ipc_async_can_reply_to_job_client(state, job) &&
             waywal_ipc_serialize_resp_workshop_download(
                 job->dl_resp.published_file_id, job->dl_resp.task_state, job->dl_resp.progress_pct,
                 job->dl_resp.speed_bytes_per_sec, job->dl_resp.eta_seconds, job->dl_resp.error_msg,
                 &rhdr, &resp)) {
-            if (waywal_ipc_send(job->client_fd, &rhdr, -1)) {
-                (void)write_exact(job->client_fd, &resp, sizeof(resp));
+            if (waywal_ipc_send(job->client_fd, &rhdr, -1) &&
+                write_exact(job->client_fd, &resp, sizeof(resp))) {
+                send_ok = true;
             }
         }
         if (job->client_fd >= 0) {
-            if (!daemon_is_subscriber_fd(state, job->client_fd)) {
-                close(job->client_fd);
-            }
+            close(job->client_fd);
             job->client_fd = -1;
         }
         if (state && job->dl_resp.task_state != 7u) {
             daemon_broadcast_event(state, "workshop_download");
         }
+        ipc_async_resume_subscriber_if_needed(state, job, send_ok);
         break;
     }
     case IPC_JOB_BG_DOWNLOAD_EVENT:
@@ -2331,7 +2520,20 @@ static bool ipc_async_submit(daemon_state_t *state, ipc_async_job_t *job)
     if (!job) {
         return false;
     }
+    /* Duplicate subscriber sockets into an owned reply FD and suspend subscriber reads until the
+     * async job finishes so closed subscribers cannot alias reused FD numbers or reorder replies.
+     */
+    const bool from_sub = daemon_is_subscriber_fd(state, job->client_fd);
     if (!g_ipc_async.initialized) {
+        if (from_sub) {
+            int dup_fd = fcntl(job->client_fd, F_DUPFD_CLOEXEC, 0);
+            if (dup_fd < 0) {
+                return false;
+            }
+            job->client_fd = dup_fd;
+        }
+        job->sub_fd = -1;
+        job->sub_pause_token = 0;
         ipc_async_run_job(job);
         ipc_async_complete_job_on_main(state, job);
         free(job);
@@ -2341,6 +2543,20 @@ static bool ipc_async_submit(daemon_state_t *state, ipc_async_job_t *job)
     if (g_ipc_async.stopping || g_ipc_async.q_count >= IPC_ASYNC_QUEUE_CAP) {
         pthread_mutex_unlock(&g_ipc_async.mtx);
         return false;
+    }
+    if (from_sub) {
+        int orig_sfd = job->client_fd;
+        int dup_fd = fcntl(orig_sfd, F_DUPFD_CLOEXEC, 0);
+        if (dup_fd < 0) {
+            pthread_mutex_unlock(&g_ipc_async.mtx);
+            return false;
+        }
+        job->client_fd = dup_fd;
+        job->sub_fd = orig_sfd;
+        job->sub_pause_token = ipc_pause_subscriber_fd(state, orig_sfd);
+    } else {
+        job->sub_fd = -1;
+        job->sub_pause_token = 0;
     }
     g_ipc_async.queue[g_ipc_async.q_tail] = job;
     g_ipc_async.q_tail = (g_ipc_async.q_tail + 1) % IPC_ASYNC_QUEUE_CAP;
@@ -2470,7 +2686,7 @@ void daemon_ipc_async_shutdown(struct daemon_state *state)
             if (j->attached_fd >= 0) {
                 close(j->attached_fd);
             }
-            if (j->client_fd >= 0 && !daemon_is_subscriber_fd(state, j->client_fd)) {
+            if (j->client_fd >= 0) {
                 close(j->client_fd);
             }
             free(j);
@@ -2483,13 +2699,14 @@ void daemon_ipc_async_shutdown(struct daemon_state *state)
             if (j->attached_fd >= 0) {
                 close(j->attached_fd);
             }
-            if (j->client_fd >= 0 && !daemon_is_subscriber_fd(state, j->client_fd)) {
+            if (j->client_fd >= 0) {
                 close(j->client_fd);
             }
             free(j);
             g_ipc_async.comp[i] = NULL;
         }
     }
+    memset(g_paused_subscribers, 0, sizeof(g_paused_subscribers));
 
     if (g_ipc_async.efd >= 0) {
         close(g_ipc_async.efd);
@@ -4926,12 +5143,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             daemon_reap_dead_subscribers(state);
             if (!daemon_is_subscriber_fd(state, client_fd)) {
                 if (state->num_subscribers >= 16) {
-                    unregister_fd_from_loops(state, state->subscriber_fds[0]);
-                    close(state->subscriber_fds[0]);
-                    for (size_t j = 1; j < 16; ++j) {
-                        state->subscriber_fds[j - 1] = state->subscriber_fds[j];
-                    }
-                    state->num_subscribers = 15;
+                    daemon_close_subscriber_at(state, 0);
                 }
                 state->subscriber_fds[state->num_subscribers++] = client_fd;
                 register_fd_in_loops(state, client_fd, URING_EV_IPC_READ);
@@ -5225,7 +5437,7 @@ bool daemon_ipc_dispatch_subscriber_fd(struct daemon_state *state, int fd)
     if (!daemon_is_subscriber_fd(state, fd)) {
         return false;
     }
-    while (daemon_is_subscriber_fd(state, fd)) {
+    while (daemon_is_subscriber_fd(state, fd) && !ipc_subscriber_is_paused(fd)) {
         char b = 0;
         ssize_t r = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
         if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
@@ -5236,7 +5448,7 @@ bool daemon_ipc_dispatch_subscriber_fd(struct daemon_state *state, int fd)
             break;
         }
         daemon_process_ipc_client(state, fd);
-        if (!state->running) {
+        if (!state->running || ipc_subscriber_is_paused(fd)) {
             break;
         }
     }

@@ -280,25 +280,65 @@ QString resolveExtractedEntrypointPath(const uint8_t installedUuid[16],
     }
     const QString hexDir = QString::fromLatin1(uuidHex, 32);
 
+    auto appendUniquePkgBase = [&](QStringList &out, const QString &root) {
+        if (root.isEmpty()) {
+            return;
+        }
+        const QString candidate =
+            QDir::cleanPath(root + QStringLiteral("/wwal/packages/") + hexDir);
+        if (!out.contains(candidate)) {
+            out << candidate;
+        }
+    };
+
     QStringList baseDirs;
-    const QString xdgData = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
-    if (!xdgData.isEmpty()) {
-        baseDirs << (xdgData + QStringLiteral("/wwal/packages/") + hexDir);
+    const QString envXdgData = qEnvironmentVariable("XDG_DATA_HOME");
+    if (envXdgData.startsWith(QLatin1Char('/'))) {
+        appendUniquePkgBase(baseDirs, envXdgData);
     }
-    const QString homeData =
-        QDir::homePath() + QStringLiteral("/.local/share/wwal/packages/") + hexDir;
-    if (!baseDirs.contains(homeData)) {
-        baseDirs << homeData;
+    appendUniquePkgBase(baseDirs,
+                        QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation));
+    appendUniquePkgBase(baseDirs, QDir::homePath() + QStringLiteral("/.local/share"));
+
+    /* Live daemon sessions fall back to XDG_STATE_HOME / ~/.local/state when Landlock restricts
+     * ~/.local/share to read-only access. */
+    const QString envXdgState = qEnvironmentVariable("XDG_STATE_HOME");
+    if (envXdgState.startsWith(QLatin1Char('/'))) {
+        appendUniquePkgBase(baseDirs, envXdgState);
     }
+    appendUniquePkgBase(baseDirs,
+                        QStandardPaths::writableLocation(QStandardPaths::GenericStateLocation));
+    appendUniquePkgBase(baseDirs, QDir::homePath() + QStringLiteral("/.local/state"));
+    const QString envWwalState = qEnvironmentVariable("WWAL_STATE_DIR");
+    if (envWwalState.startsWith(QLatin1Char('/'))) {
+        const QString stateCandidate =
+            QDir::cleanPath(envWwalState + QStringLiteral("/packages/") + hexDir);
+        if (!baseDirs.contains(stateCandidate)) {
+            baseDirs << stateCandidate;
+        }
+    }
+
+    QString bestPath;
+    std::filesystem::file_time_type bestMtime{};
+    bool hasBest = false;
 
     for (const QString &base : baseDirs) {
         const QString full = QDir(base).filePath(relativeEntrypoint);
         QFileInfo fi(full);
         if (fi.exists() && fi.isFile()) {
-            return fi.absoluteFilePath();
+            const QString absPath = fi.absoluteFilePath();
+            std::error_code ec;
+            const auto mtime = std::filesystem::last_write_time(absPath.toStdString(), ec);
+            if (!hasBest || (!ec && mtime > bestMtime)) {
+                bestPath = absPath;
+                if (!ec) {
+                    bestMtime = mtime;
+                }
+                hasBest = true;
+            }
         }
     }
-    return {};
+    return bestPath;
 }
 
 template <typename WizardT, typename HandlerT>
@@ -1287,7 +1327,7 @@ void MainWindow::installPackageToDaemon(const QString &packageIdOrPath, const QS
                 const QString extractedEntry =
                     resolveExtractedEntrypointPath(resp.package_uuid, relativeEntrypoint);
                 if (!extractedEntry.isEmpty()) {
-                    self->applyWallpaperPath(extractedEntry);
+                    self->m_activeWallpaperPath = extractedEntry;
                 }
                 if (self->m_statusLabel) {
                     self->m_statusLabel->setText(
