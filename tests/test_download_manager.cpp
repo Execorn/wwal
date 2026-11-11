@@ -990,6 +990,7 @@ void test_nonblocking_pause_cancel_and_throttle_isolation()
     std::snprintf(man.license, sizeof(man.license), "MIT");
     std::memcpy(man.author_pubkey, pub, WWPKG_PUBKEY_BYTES);
     man.type = WWPKG_TYPE_SHADER_FRAGMENT;
+    std::snprintf(man.entrypoint_pipeline, sizeof(man.entrypoint_pipeline), "scene.frag");
     fs::path large_pkg_path = test_dir / "source_large.wwpkg";
     assert(wwpkg_build_package(large_src.string().c_str(), &man, priv,
                                large_pkg_path.string().c_str()));

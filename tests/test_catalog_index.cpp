@@ -490,10 +490,6 @@ void test_wwpkg_signature_gate_in_reconcile()
     uint8_t privkey[64]{};
     wwpkg_generate_keypair(pubkey, privkey);
 
-    uint8_t wrongPub[WWPKG_PUBKEY_BYTES]{};
-    uint8_t wrongPriv[64]{};
-    wwpkg_generate_keypair(wrongPub, wrongPriv);
-
     wwpkg_manifest_t manGood{};
     std::snprintf(manGood.id, sizeof(manGood.id), "pkg-good-001");
     std::snprintf(manGood.slug, sizeof(manGood.slug), "good-shader");
@@ -503,6 +499,7 @@ void test_wwpkg_signature_gate_in_reconcile()
     std::snprintf(manGood.license, sizeof(manGood.license), "MIT");
     std::memcpy(manGood.author_pubkey, pubkey, WWPKG_PUBKEY_BYTES);
     manGood.type = WWPKG_TYPE_SHADER_FRAGMENT;
+    std::snprintf(manGood.entrypoint_pipeline, sizeof(manGood.entrypoint_pipeline), "scene.frag");
 
     std::filesystem::path goodPkg = hubDir / "good.wwpkg";
     std::filesystem::path forgedSigPkg = hubDir / "forged_sig.wwpkg";
@@ -510,16 +507,23 @@ void test_wwpkg_signature_gate_in_reconcile()
     assert(
         wwpkg_build_package(srcDir.string().c_str(), &manGood, privkey, goodPkg.string().c_str()));
 
-    // Validly compressed container whose embedded author_pubkey disagrees with the signing seed.
-    uint8_t mismatchedPriv[64]{};
-    std::memcpy(mismatchedPriv, privkey, 32);
-    std::memcpy(mismatchedPriv + 32, wrongPub, 32);
+    // Validly compressed container whose Ed25519 signature bytes in the outer envelope are forged.
     wwpkg_manifest_t manForged = manGood;
     std::snprintf(manForged.id, sizeof(manForged.id), "pkg-forged-002");
     std::snprintf(manForged.slug, sizeof(manForged.slug), "forged-shader");
     std::snprintf(manForged.name, sizeof(manForged.name), "Forged Signature Shader");
-    assert(wwpkg_build_package(srcDir.string().c_str(), &manForged, mismatchedPriv,
+    assert(wwpkg_build_package(srcDir.string().c_str(), &manForged, privkey,
                                forgedSigPkg.string().c_str()));
+    {
+        std::fstream f(forgedSigPkg, std::ios::in | std::ios::out | std::ios::binary);
+        assert(f.is_open());
+        f.seekg(112, std::ios::beg);
+        char sigByte = 0;
+        f.read(&sigByte, 1);
+        sigByte ^= static_cast<char>(0x01);
+        f.seekp(112, std::ios::beg);
+        f.write(&sigByte, 1);
+    }
 
     wwpkg_manifest_t manBad = manGood;
     std::snprintf(manBad.id, sizeof(manBad.id), "pkg-bad-003");

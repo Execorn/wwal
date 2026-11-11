@@ -5599,6 +5599,40 @@ bool wwpkg_build_package(const char *source_dir, const wwpkg_manifest_t *manifes
     }
     memcpy(active_manifest.entrypoint_preview, norm_prev, strlen(norm_prev) + 1);
 
+    char norm_pipe[WWPKG_MAX_PATH_LEN] = {0};
+    const char *raw_pipe = active_manifest.entrypoint_pipeline;
+    if (raw_pipe[0] == '\0') {
+        for (size_t i = 0; i < payload_list.count; i++) {
+            if (strcmp(payload_list.entries[i].name, active_manifest.entrypoint_preview) != 0) {
+                raw_pipe = payload_list.entries[i].name;
+                break;
+            }
+        }
+        if (raw_pipe[0] == '\0') {
+            switch (active_manifest.type) {
+            case WWPKG_TYPE_SHADER_FRAGMENT:
+                raw_pipe = "scene.frag";
+                break;
+            case WWPKG_TYPE_SHADER_COMPUTE:
+                raw_pipe = "scene.comp";
+                break;
+            case WWPKG_TYPE_VIDEO_STREAM:
+                raw_pipe = "assets/video.mp4";
+                break;
+            default:
+                raw_pipe = "scene.json";
+                break;
+            }
+        }
+    }
+    if (!sanitize_archive_path(raw_pipe, norm_pipe, sizeof(norm_pipe))) {
+        explicit_bzero(effective_sk, sizeof(effective_sk));
+        build_list_free(&payload_list);
+        set_tls_error(WWPKG_ERR_BAD_MANIFEST);
+        return false;
+    }
+    memcpy(active_manifest.entrypoint_pipeline, norm_pipe, strlen(norm_pipe) + 1);
+
     ssize_t preview_idx = -1;
     for (size_t i = 0; i < payload_list.count; i++) {
         if (strcmp(payload_list.entries[i].name, active_manifest.entrypoint_preview) == 0) {
