@@ -12,6 +12,7 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -259,6 +260,48 @@ static bool get_compute_shader_cache_path(const char *src, char *out_path, size_
     return (n > 0 && (size_t)n < out_sz);
 }
 
+static _Atomic uint32_t s_comp_cache_tmp_seq = 0u;
+
+static bool comp_read_all_no_eintr(int fd, void *buf, size_t len)
+{
+    uint8_t *dst = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = read(fd, dst + got, len - got);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        got += (size_t)n;
+    }
+    return true;
+}
+
+static bool comp_write_all_no_eintr(int fd, const void *buf, size_t len)
+{
+    const uint8_t *src = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, src + sent, len - sent);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        sent += (size_t)n;
+    }
+    return true;
+}
+
 static void trim_driver_compiler_pages(void)
 {
 #if defined(__GLIBC__)
@@ -277,24 +320,27 @@ static GLuint compile_shader_program(const char *src, const char *name)
             struct stat st;
             compute_shader_cache_hdr_t hdr;
             if (fstat(fd, &st) == 0 && st.st_size > (off_t)sizeof(compute_shader_cache_hdr_t) &&
-                read(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr) &&
+                comp_read_all_no_eintr(fd, &hdr, sizeof(hdr)) &&
                 hdr.magic == COMPUTE_SHADER_CACHE_MAGIC && hdr.size > 0 &&
                 hdr.size <= (16u * 1024u * 1024u) &&
                 st.st_size == (off_t)(sizeof(hdr) + hdr.size)) {
                 void *bin = malloc(hdr.size);
                 if (bin) {
-                    ssize_t r = read(fd, bin, hdr.size);
+                    bool ok_rd = comp_read_all_no_eintr(fd, bin, hdr.size);
                     close(fd);
                     fd = -1;
-                    if (r == (ssize_t)hdr.size) {
+                    if (ok_rd) {
                         GLuint cached_prog = glCreateProgram();
                         if (cached_prog) {
+                            while (glGetError() != GL_NO_ERROR) {
+                            }
                             glProgramBinary(cached_prog, (GLenum)hdr.format, bin,
                                             (GLsizei)hdr.size);
                             free(bin);
+                            GLenum bin_err = glGetError();
                             GLint linked = 0;
                             glGetProgramiv(cached_prog, GL_LINK_STATUS, &linked);
-                            if (linked) {
+                            if (bin_err == GL_NO_ERROR && linked) {
                                 trim_driver_compiler_pages();
                                 return cached_prog;
                             }
@@ -366,22 +412,26 @@ static GLuint compile_shader_program(const char *src, const char *name)
                 GLenum bin_fmt = 0;
                 glGetProgramBinary(prog, bin_len, &actual_len, &bin_fmt, bin);
                 if (actual_len > 0 && actual_len <= bin_len) {
-                    char tmp_path[PATH_MAX + 32];
-                    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", cache_path, (int)getpid());
-                    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-                    if (fd >= 0) {
-                        compute_shader_cache_hdr_t hdr = {
-                            .magic = COMPUTE_SHADER_CACHE_MAGIC,
-                            .format = (uint32_t)bin_fmt,
-                            .size = (uint32_t)actual_len,
-                        };
-                        bool ok = (write(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr)) &&
-                                  (write(fd, bin, (size_t)actual_len) == (ssize_t)actual_len);
-                        close(fd);
-                        if (ok) {
-                            (void)rename(tmp_path, cache_path);
-                        } else {
-                            unlink(tmp_path);
+                    char tmp_path[PATH_MAX + 48];
+                    uint32_t seq =
+                        atomic_fetch_add_explicit(&s_comp_cache_tmp_seq, 1u, memory_order_relaxed);
+                    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d.%u", cache_path,
+                                 (int)getpid(), seq) < (int)sizeof(tmp_path)) {
+                        int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                        if (fd >= 0) {
+                            compute_shader_cache_hdr_t hdr = {
+                                .magic = COMPUTE_SHADER_CACHE_MAGIC,
+                                .format = (uint32_t)bin_fmt,
+                                .size = (uint32_t)actual_len,
+                            };
+                            bool ok = comp_write_all_no_eintr(fd, &hdr, sizeof(hdr)) &&
+                                      comp_write_all_no_eintr(fd, bin, (size_t)actual_len);
+                            if (close(fd) != 0) {
+                                ok = false;
+                            }
+                            if (!ok || rename(tmp_path, cache_path) != 0) {
+                                unlink(tmp_path);
+                            }
                         }
                     }
                 }
@@ -530,24 +580,27 @@ static GLuint compile_blit_10bit_program(void)
             struct stat st;
             compute_shader_cache_hdr_t hdr;
             if (fstat(fd, &st) == 0 && st.st_size > (off_t)sizeof(compute_shader_cache_hdr_t) &&
-                read(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr) &&
+                comp_read_all_no_eintr(fd, &hdr, sizeof(hdr)) &&
                 hdr.magic == COMPUTE_SHADER_CACHE_MAGIC && hdr.size > 0 &&
                 hdr.size <= (16u * 1024u * 1024u) &&
                 st.st_size == (off_t)(sizeof(hdr) + hdr.size)) {
                 void *bin = malloc(hdr.size);
                 if (bin) {
-                    ssize_t r = read(fd, bin, hdr.size);
+                    bool ok_rd = comp_read_all_no_eintr(fd, bin, hdr.size);
                     close(fd);
                     fd = -1;
-                    if (r == (ssize_t)hdr.size) {
+                    if (ok_rd) {
                         GLuint cached_prog = glCreateProgram();
                         if (cached_prog) {
+                            while (glGetError() != GL_NO_ERROR) {
+                            }
                             glProgramBinary(cached_prog, (GLenum)hdr.format, bin,
                                             (GLsizei)hdr.size);
                             free(bin);
+                            GLenum bin_err = glGetError();
                             GLint linked = 0;
                             glGetProgramiv(cached_prog, GL_LINK_STATUS, &linked);
-                            if (linked) {
+                            if (bin_err == GL_NO_ERROR && linked) {
                                 trim_driver_compiler_pages();
                                 return cached_prog;
                             }
@@ -584,12 +637,26 @@ static GLuint compile_blit_10bit_program(void)
     glGetShaderiv(vs, GL_COMPILE_STATUS, &ok_vs);
     glGetShaderiv(fs, GL_COMPILE_STATUS, &ok_fs);
     if (!ok_vs || !ok_fs) {
+        char log_buf[512];
+        if (!ok_vs) {
+            glGetShaderInfoLog(vs, sizeof(log_buf), NULL, log_buf);
+            WAYWAL_LOG_ERR("Blit vertex shader compilation failed: %s", log_buf);
+        }
+        if (!ok_fs) {
+            glGetShaderInfoLog(fs, sizeof(log_buf), NULL, log_buf);
+            WAYWAL_LOG_ERR("Blit fragment shader compilation failed: %s", log_buf);
+        }
         glDeleteShader(vs);
         glDeleteShader(fs);
         return 0;
     }
 
     GLuint prog = glCreateProgram();
+    if (!prog) {
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        return 0;
+    }
     glProgramParameteri(prog, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
     glAttachShader(prog, vs);
     glAttachShader(prog, fs);
@@ -614,22 +681,26 @@ static GLuint compile_blit_10bit_program(void)
                 GLenum bin_fmt = 0;
                 glGetProgramBinary(prog, bin_len, &actual_len, &bin_fmt, bin);
                 if (actual_len > 0 && actual_len <= bin_len) {
-                    char tmp_path[PATH_MAX + 32];
-                    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", cache_path, (int)getpid());
-                    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-                    if (fd >= 0) {
-                        compute_shader_cache_hdr_t hdr = {
-                            .magic = COMPUTE_SHADER_CACHE_MAGIC,
-                            .format = (uint32_t)bin_fmt,
-                            .size = (uint32_t)actual_len,
-                        };
-                        bool ok = (write(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr)) &&
-                                  (write(fd, bin, (size_t)actual_len) == (ssize_t)actual_len);
-                        close(fd);
-                        if (ok) {
-                            (void)rename(tmp_path, cache_path);
-                        } else {
-                            unlink(tmp_path);
+                    char tmp_path[PATH_MAX + 48];
+                    uint32_t seq =
+                        atomic_fetch_add_explicit(&s_comp_cache_tmp_seq, 1u, memory_order_relaxed);
+                    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d.%u", cache_path,
+                                 (int)getpid(), seq) < (int)sizeof(tmp_path)) {
+                        int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                        if (fd >= 0) {
+                            compute_shader_cache_hdr_t hdr = {
+                                .magic = COMPUTE_SHADER_CACHE_MAGIC,
+                                .format = (uint32_t)bin_fmt,
+                                .size = (uint32_t)actual_len,
+                            };
+                            bool ok = comp_write_all_no_eintr(fd, &hdr, sizeof(hdr)) &&
+                                      comp_write_all_no_eintr(fd, bin, (size_t)actual_len);
+                            if (close(fd) != 0) {
+                                ok = false;
+                            }
+                            if (!ok || rename(tmp_path, cache_path) != 0) {
+                                unlink(tmp_path);
+                            }
                         }
                     }
                 }

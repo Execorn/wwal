@@ -33,6 +33,18 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void)
+{
+    return "leak:<unknown module>\nleak:gbm_create_device\nleak:libgbm\nleak:libEGL\n"
+           "leak:libGLESv2\nleak:dri\nleak:libnvidia\n";
+}
+#endif
+
 static void assert_file_contains(const char *path, const char *needle)
 {
     FILE *fp = fopen(path, "rb");
@@ -1157,6 +1169,76 @@ static void test_cam16_shaders_and_governor(void)
                         /* Format is BGRA in little-endian XRGB8888: B=uv.y, G=uv.x, R=dx*dy */
                         assert(px[2] > 200); /* dx * dy ~= 1.0 -> R > 200 */
                         assert(px[1] > 120); /* span_rect.x=64 / 128 -> uv.x >= 0.5 -> G > 120 */
+                    }
+                    memset(fp.span_rect, 0, sizeof(fp.span_rect));
+
+                    /* Verify #pragma Pass multi-pass .wwgraph dialect bridging, opaque IMAGE_PASS
+                     * alpha enforcement, and dirty_pass_mask custom uniform coalescing */
+                    const char *wwgraph_mp_src =
+                        "// =====================================================================\n"
+                        "#pragma Pass BUFFER_A\n"
+                        "// =====================================================================\n"
+                        "#version 310 es\n"
+                        "precision highp float;\n"
+                        "precision highp int;\n"
+                        "in vec2 v_TexCoord;\n"
+                        "layout(location = 0) out vec4 outColor;\n"
+                        "uniform float u_Time;\n"
+                        "uniform vec2  u_Resolution;\n"
+                        "uniform vec2  u_Pointer;\n"
+                        "uniform vec4  u_AudioBands[4];\n"
+                        "uniform sampler2D u_BufferA;\n"
+                        "uniform vec4 u_Node1_Const;\n"
+                        "void main() {\n"
+                        "    vec4 ab = u_AudioBands[clamp(int(u_Time), 0, 3)];\n"
+                        "    vec2 uv_chk = clamp(v_TexCoord + u_Pointer * 0.0 + u_Resolution * 0.0,"
+                        " 0.0, 1.0);\n"
+                        "    outColor = vec4(u_Node1_Const.rgb + ab.rgb * 0.0 + uv_chk.xyy * 0.0,"
+                        " 0.25);\n"
+                        "}\n"
+                        "// =====================================================================\n"
+                        "#pragma Pass IMAGE_PASS\n"
+                        "// =====================================================================\n"
+                        "#version 310 es\n"
+                        "precision highp float;\n"
+                        "precision highp int;\n"
+                        "in vec2 v_TexCoord;\n"
+                        "layout(location = 0) out vec4 outColor;\n"
+                        "uniform sampler2D u_BufferA;\n"
+                        "uniform sampler2D u_BufferB;\n"
+                        "uniform sampler2D u_BufferC;\n"
+                        "uniform sampler2D u_BufferD;\n"
+                        "uniform sampler2D u_DepthMap;\n"
+                        "void main() {\n"
+                        "    vec4 buf = texture(u_BufferA, v_TexCoord);\n"
+                        "    outColor = vec4(buf.rgb, 0.0);\n"
+                        "}\n";
+                    assert(waywal_shader_engine_compile(seng, wwgraph_mp_src));
+                    for (int ch = 0; ch < 4; ++ch) {
+                        assert(waywal_shader_engine_get_channel_target(seng, 0, ch) == ch + 1);
+                        assert(waywal_shader_engine_get_channel_target(seng, 4, ch) == ch + 1);
+                    }
+                    const float c_orange[4] = {1.0f, 0.5f, 0.0f, 1.0f};
+                    assert(waywal_shader_engine_set_custom_uniform(seng, "u_Node1_Const", c_orange,
+                                                                   4));
+                    assert(waywal_shader_engine_render_frame(seng, &bo8, &fp));
+                    assert(waywal_shader_engine_set_custom_uniform(seng, "u_Node1_Const", c_orange,
+                                                                   4));
+                    assert(waywal_shader_engine_render_frame(seng, &bo8, &fp));
+                    if (bo8.map_data) {
+                        const uint8_t *px = (const uint8_t *)bo8.map_data;
+                        /* XRGB8888 little-endian: B=px[0], G=px[1], R=px[2], A=px[3] */
+                        assert(px[2] > 230 && px[1] > 100 && px[1] < 160 && px[0] < 20);
+                        assert(px[3] == 255);
+                    }
+                    const float c_cyan[4] = {0.0f, 0.75f, 1.0f, 1.0f};
+                    assert(
+                        waywal_shader_engine_set_custom_uniform(seng, "u_Node1_Const", c_cyan, 4));
+                    assert(waywal_shader_engine_render_frame(seng, &bo8, &fp));
+                    if (bo8.map_data) {
+                        const uint8_t *px = (const uint8_t *)bo8.map_data;
+                        assert(px[2] < 20 && px[1] > 170 && px[0] > 230);
+                        assert(px[3] == 255);
                     }
 
                     /* Test per-output multi-engine concurrency sharing dmabuf_context_t */

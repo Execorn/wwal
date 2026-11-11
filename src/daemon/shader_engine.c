@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +41,7 @@
 
 typedef struct {
     bool active;
+    uint8_t dirty_pass_mask;
     char name[64];
     uint32_t num_components;
     float values[4];
@@ -378,6 +380,12 @@ static const char DEPTH_PARALLAX_POM_SHADER[] =
 
 static int match_pass_tag(const char *tag, size_t tag_len)
 {
+    for (size_t k = 0; k + 1 < tag_len; ++k) {
+        if (tag[k] == '/' && (tag[k + 1] == '/' || tag[k + 1] == '*')) {
+            tag_len = k;
+            break;
+        }
+    }
     while (tag_len > 0 && (*tag == ' ' || *tag == '\t')) {
         tag++;
         tag_len--;
@@ -417,14 +425,63 @@ static int match_pass_tag(const char *tag, size_t tag_len)
     if (tag_len == 7 && strncasecmp(tag, "BUFFERD", 7) == 0) {
         return 3;
     }
-    if (tag_len == 5 && strncasecmp(tag, "IMAGE", 5) == 0) {
+    if ((tag_len == 5 && strncasecmp(tag, "IMAGE", 5) == 0) ||
+        (tag_len == 9 && strncasecmp(tag, "IMAGEPASS", 9) == 0) ||
+        (tag_len == 10 &&
+         (strncasecmp(tag, "IMAGE_PASS", 10) == 0 || strncasecmp(tag, "IMAGE PASS", 10) == 0))) {
         return 4;
     }
     return -2;
 }
 
+static bool match_pragma_pass_marker(const char *line, size_t len, int *out_pass)
+{
+    size_t i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    if (i + 2 <= len && line[i] == '/' && (line[i + 1] == '/' || line[i + 1] == '*')) {
+        i += 2;
+        while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+            i++;
+        }
+    }
+    if (i >= len || line[i] != '#') {
+        return false;
+    }
+    i++;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    if (i + 6 > len || strncasecmp(line + i, "pragma", 6) != 0 ||
+        (line[i + 6] != ' ' && line[i + 6] != '\t')) {
+        return false;
+    }
+    i += 6;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) {
+        i++;
+    }
+    if (i + 4 > len || strncasecmp(line + i, "pass", 4) != 0 ||
+        (line[i + 4] != ' ' && line[i + 4] != '\t')) {
+        return false;
+    }
+    i += 4;
+    int sec = match_pass_tag(line + i, len - i);
+    if (sec >= -1) {
+        if (out_pass) {
+            *out_pass = sec;
+        }
+        return true;
+    }
+    return false;
+}
+
 static int match_section_marker(const char *line, size_t len)
 {
+    int pragma_pass = -2;
+    if (match_pragma_pass_marker(line, len, &pragma_pass)) {
+        return pragma_pass;
+    }
     size_t i = 0;
     while (i < len && (line[i] == ' ' || line[i] == '\t')) {
         i++;
@@ -609,6 +666,124 @@ static bool source_defines_void_main(const char *src)
     return false;
 }
 
+static bool is_wwgraph_stripped_decl(const char *trimmed, size_t rem)
+{
+    size_t code_len = rem;
+    for (size_t k = 0; k + 1 < rem; ++k) {
+        if (trimmed[k] == '/' && (trimmed[k + 1] == '/' || trimmed[k + 1] == '*')) {
+            code_len = k;
+            break;
+        }
+    }
+    while (code_len > 0 && (trimmed[code_len - 1] == ' ' || trimmed[code_len - 1] == '\t' ||
+                            trimmed[code_len - 1] == '\r')) {
+        code_len--;
+    }
+    if (code_len < 2 || trimmed[code_len - 1] != ';') {
+        return false;
+    }
+
+    size_t pos = 0;
+    const size_t end_idx = code_len - 1;
+    if (end_idx - pos >= 7 && strncmp(trimmed + pos, "layout", 6) == 0 &&
+        (trimmed[pos + 6] == '(' || trimmed[pos + 6] == ' ' || trimmed[pos + 6] == '\t')) {
+        size_t rp = pos + 6;
+        while (rp < end_idx && trimmed[rp] != ')') {
+            rp++;
+        }
+        if (rp >= end_idx) {
+            return false;
+        }
+        pos = rp + 1;
+        while (pos < end_idx && (trimmed[pos] == ' ' || trimmed[pos] == '\t')) {
+            pos++;
+        }
+    }
+    if (pos < end_idx) {
+        size_t left = end_idx - pos;
+        if ((left > 6 && strncmp(trimmed + pos, "smooth", 6) == 0 &&
+             (trimmed[pos + 6] == ' ' || trimmed[pos + 6] == '\t')) ||
+            (left > 4 && strncmp(trimmed + pos, "flat", 4) == 0 &&
+             (trimmed[pos + 4] == ' ' || trimmed[pos + 4] == '\t')) ||
+            (left > 8 && strncmp(trimmed + pos, "centroid", 8) == 0 &&
+             (trimmed[pos + 8] == ' ' || trimmed[pos + 8] == '\t'))) {
+            while (pos < end_idx && trimmed[pos] != ' ' && trimmed[pos] != '\t') {
+                pos++;
+            }
+            while (pos < end_idx && (trimmed[pos] == ' ' || trimmed[pos] == '\t')) {
+                pos++;
+            }
+        }
+    }
+    if (pos >= end_idx) {
+        return false;
+    }
+
+    size_t left = end_idx - pos;
+    bool is_in = (left > 3 && strncmp(trimmed + pos, "in", 2) == 0 &&
+                  (trimmed[pos + 2] == ' ' || trimmed[pos + 2] == '\t'));
+    bool is_out = (left > 4 && strncmp(trimmed + pos, "out", 3) == 0 &&
+                   (trimmed[pos + 3] == ' ' || trimmed[pos + 3] == '\t'));
+    bool is_uni = (left > 8 && strncmp(trimmed + pos, "uniform", 7) == 0 &&
+                   (trimmed[pos + 7] == ' ' || trimmed[pos + 7] == '\t'));
+    if (!is_in && !is_out && !is_uni) {
+        return false;
+    }
+
+    size_t id_end = end_idx;
+    while (id_end > pos && (trimmed[id_end - 1] == ' ' || trimmed[id_end - 1] == '\t')) {
+        id_end--;
+    }
+    for (size_t k = pos; k < id_end; ++k) {
+        if (trimmed[k] == '=') {
+            id_end = k;
+            while (id_end > pos && (trimmed[id_end - 1] == ' ' || trimmed[id_end - 1] == '\t')) {
+                id_end--;
+            }
+            break;
+        }
+    }
+    if (id_end > pos && trimmed[id_end - 1] == ']') {
+        size_t lb = id_end - 1;
+        while (lb > pos && trimmed[lb] != '[') {
+            lb--;
+        }
+        if (trimmed[lb] == '[') {
+            id_end = lb;
+            while (id_end > pos && (trimmed[id_end - 1] == ' ' || trimmed[id_end - 1] == '\t')) {
+                id_end--;
+            }
+        }
+    }
+    size_t id_start = id_end;
+    while (id_start > pos &&
+           (isalnum((unsigned char)trimmed[id_start - 1]) || trimmed[id_start - 1] == '_')) {
+        id_start--;
+    }
+    size_t id_len = id_end - id_start;
+    if (id_len == 0) {
+        return false;
+    }
+    const char *id_ptr = trimmed + id_start;
+    if (is_in) {
+        return id_len == 10 && strncmp(id_ptr, "v_TexCoord", 10) == 0;
+    }
+    if (is_out) {
+        return id_len == 8 && strncmp(id_ptr, "outColor", 8) == 0;
+    }
+    static const char *const bridged_uniforms[] = {
+        "u_Time",    "u_Resolution", "u_Pointer", "u_AudioBands", "u_BufferA",
+        "u_BufferB", "u_BufferC",    "u_BufferD", "u_DepthMap",
+    };
+    for (size_t u = 0; u < sizeof(bridged_uniforms) / sizeof(bridged_uniforms[0]); ++u) {
+        if (strlen(bridged_uniforms[u]) == id_len &&
+            strncmp(id_ptr, bridged_uniforms[u], id_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
 {
     if (!user_src || pass_idx < 0 || pass_idx >= SHADER_NUM_PASSES) {
@@ -670,22 +845,103 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
     bool sec_present[SHADER_NUM_PASSES];
     bool use_sections = has_any_section_markers(user_src, sec_present);
 
+    size_t src_len = strlen(user_src);
+    char *pass_body = (char *)malloc(src_len + 2u);
+    if (!pass_body) {
+        return NULL;
+    }
+    size_t body_len = 0;
+    int cur_sec = -1;
+    const char *sp = user_src;
+    while (*sp) {
+        const char *nl = strchr(sp, '\n');
+        size_t line_len = nl ? (size_t)(nl - sp + 1) : strlen(sp);
+        size_t content_len = nl ? (size_t)(nl - sp) : line_len;
+
+        int marker = match_section_marker(sp, content_len);
+        if (marker >= -1) {
+            cur_sec = marker;
+        } else {
+            bool include_line = true;
+            if (use_sections) {
+                if (cur_sec == -1 || cur_sec == pass_idx) {
+                    include_line = true;
+                } else {
+                    include_line = false;
+                }
+            }
+            if (include_line) {
+                memcpy(pass_body + body_len, sp, line_len);
+                body_len += line_len;
+            }
+        }
+        if (!nl) {
+            break;
+        }
+        sp = nl + 1;
+    }
+    pass_body[body_len] = '\0';
+
+    bool is_wwgraph = (strstr(pass_body, "out vec4 outColor;") != NULL &&
+                       strstr(pass_body, "in vec2 v_TexCoord;") != NULL);
+    bool has_main_image = (strstr(pass_body, "mainImage") != NULL);
+    bool has_void_main = source_defines_void_main(pass_body);
+    bool wrap_graph_image_main = (is_wwgraph && pass_idx == 4 && has_void_main && !has_main_image);
+
     static const char ver_hdr[] = "#version 310 es\n";
+    static const char wwgraph_bridge_common[] =
+        "#define v_TexCoord ((u_flip_y != 0) "
+        "? vec2((gl_FragCoord.x + u_span_rect.x) / max(iResolution.x, 1.0), "
+        "(((u_local_size.y > 0.0 ? u_local_size.y : max(iResolution.y, 1.0)) - gl_FragCoord.y + "
+        "u_span_rect.y) / max(iResolution.y, 1.0))) "
+        ": ((gl_FragCoord.xy + u_span_rect.xy) / max(iResolution.xy, vec2(1.0))))\n"
+        "#define u_Time iTime\n"
+        "#define u_Resolution iResolution.xy\n"
+        "#define u_Pointer (iMouse.xy / max(iResolution.xy, vec2(1.0)))\n"
+        "#define u_BufferA iChannel0\n"
+        "#define u_BufferB iChannel1\n"
+        "#define u_BufferC iChannel2\n"
+        "#define u_BufferD iChannel3\n"
+        "#define u_DepthMap iChannel3\n"
+        "#define u_AudioBands vec4[4]("
+        "vec4(u_audio_bands[0], u_audio_bands[1], u_audio_bands[2], u_audio_bands[3]),"
+        "vec4(u_audio_bands[4], u_audio_bands[5], u_audio_bands[6], u_audio_bands[7]),"
+        "vec4(u_audio_bands[8], u_audio_bands[9], u_audio_bands[10], u_audio_bands[11]),"
+        "vec4(u_audio_bands[12], u_audio_bands[13], u_audio_bands[14], u_audio_bands[15]))\n";
+    static const char wwgraph_out_direct[] = "#define outColor waywal_FragColor\n";
+    static const char wwgraph_out_image_pre[] = "vec4 _wwal_outColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
+                                                "#define outColor _wwal_outColor\n"
+                                                "#define main _wwal_graph_main\n";
+    static const char wwgraph_out_image_epi[] =
+        "\n#undef main\n"
+        "void main() {\n"
+        "    _wwal_graph_main();\n"
+        "    vec4 _wwal_c = clamp(_wwal_outColor, 0.0, 1.0);\n"
+        "    if (u_swap_rb != 0) {\n"
+        "        waywal_FragColor = vec4(_wwal_c.bgr, 1.0);\n"
+        "    } else {\n"
+        "        waywal_FragColor = vec4(_wwal_c.rgb, 1.0);\n"
+        "    }\n"
+        "}\n";
+
     size_t ver_len = sizeof(ver_hdr) - 1u;
     size_t pro_len = sizeof(SHADERTOY_PROLOGUE) - 1u;
     size_t def_len = strlen(pass_defines[pass_idx]);
-    size_t src_len = strlen(user_src);
     size_t epi_len = sizeof(SHADERTOY_EPILOGUE) - 1u;
+    size_t bridge_extra = is_wwgraph
+                              ? (sizeof(wwgraph_bridge_common) + sizeof(wwgraph_out_image_pre) +
+                                 sizeof(wwgraph_out_image_epi))
+                              : 0u;
 
     size_t num_lines = 1u;
-    for (size_t i = 0; i < src_len; ++i) {
-        if (user_src[i] == '\n') {
+    for (size_t i = 0; i < body_len; ++i) {
+        if (pass_body[i] == '\n') {
             num_lines++;
         }
     }
 
     size_t ext_bytes = 0;
-    const char *ep = user_src;
+    const char *ep = pass_body;
     while (*ep) {
         const char *enl = strchr(ep, '\n');
         size_t elen = enl ? (size_t)(enl - ep + 1) : strlen(ep);
@@ -705,9 +961,10 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
         ep = enl + 1;
     }
 
-    char *wrapped = (char *)malloc(ver_len + ext_bytes + pro_len + def_len + src_len +
-                                   num_lines * 2u + epi_len + 64u);
+    char *wrapped = (char *)malloc(ver_len + ext_bytes + pro_len + def_len + bridge_extra +
+                                   body_len + num_lines * 4u + epi_len + 64u);
     if (!wrapped) {
+        free(pass_body);
         return NULL;
     }
     size_t out_off = 0;
@@ -716,7 +973,7 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
 
     /* Hoist all #extension directives immediately after #version before any non-preprocessor tokens
      */
-    ep = user_src;
+    ep = pass_body;
     while (*ep) {
         const char *enl = strchr(ep, '\n');
         size_t elen = enl ? (size_t)(enl - ep + 1) : strlen(ep);
@@ -745,55 +1002,56 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
     memcpy(wrapped + out_off, SHADERTOY_PROLOGUE, pro_len);
     out_off += pro_len;
 
-    int cur_sec = -1; /* -1 = COMMON */
-    const char *p = user_src;
+    if (is_wwgraph) {
+        size_t bc_len = sizeof(wwgraph_bridge_common) - 1u;
+        memcpy(wrapped + out_off, wwgraph_bridge_common, bc_len);
+        out_off += bc_len;
+        if (wrap_graph_image_main) {
+            size_t pre_len = sizeof(wwgraph_out_image_pre) - 1u;
+            memcpy(wrapped + out_off, wwgraph_out_image_pre, pre_len);
+            out_off += pre_len;
+        } else {
+            size_t dir_len = sizeof(wwgraph_out_direct) - 1u;
+            memcpy(wrapped + out_off, wwgraph_out_direct, dir_len);
+            out_off += dir_len;
+        }
+    }
+
+    const char *p = pass_body;
     while (*p) {
         const char *nl = strchr(p, '\n');
         size_t line_len = nl ? (size_t)(nl - p + 1) : strlen(p);
         size_t content_len = nl ? (size_t)(nl - p) : line_len;
 
-        int marker = match_section_marker(p, content_len);
-        if (marker >= -1) {
-            cur_sec = marker;
+        const char *trimmed = p;
+        while (trimmed < p + content_len && (*trimmed == ' ' || *trimmed == '\t')) {
+            trimmed++;
+        }
+        size_t rem = (size_t)(p + content_len - trimmed);
+        bool is_ext = false;
+        if (rem >= 1 && *trimmed == '#') {
+            const char *ecmd = trimmed + 1;
+            while (ecmd < p + content_len && (*ecmd == ' ' || *ecmd == '\t'))
+                ecmd++;
+            if ((size_t)(p + content_len - ecmd) >= 9 && strncmp(ecmd, "extension", 9) == 0) {
+                is_ext = true;
+            }
+        }
+        if (is_ext || (rem >= 8 && strncmp(trimmed, "#version", 8) == 0) ||
+            (rem >= 14 && strncmp(trimmed, "#pragma waywal", 14) == 0)) {
+            wrapped[out_off++] = '/';
+            wrapped[out_off++] = '/';
+            memcpy(wrapped + out_off, trimmed + 1, line_len - (size_t)(trimmed + 1 - p));
+            out_off += line_len - (size_t)(trimmed + 1 - p);
+        } else if (is_wwgraph && is_wwgraph_stripped_decl(trimmed, rem)) {
+            wrapped[out_off++] = '/';
+            wrapped[out_off++] = '/';
+            wrapped[out_off++] = ' ';
+            memcpy(wrapped + out_off, trimmed, line_len - (size_t)(trimmed - p));
+            out_off += line_len - (size_t)(trimmed - p);
         } else {
-            bool include_line = true;
-            if (use_sections) {
-                if (cur_sec == -1 || cur_sec == pass_idx) {
-                    include_line = true;
-                } else if (pass_idx == 4 && !sec_present[4] && cur_sec == -1) {
-                    include_line = true;
-                } else {
-                    include_line = false;
-                }
-            }
-
-            if (include_line) {
-                const char *trimmed = p;
-                while (trimmed < p + content_len && (*trimmed == ' ' || *trimmed == '\t')) {
-                    trimmed++;
-                }
-                size_t rem = (size_t)(p + content_len - trimmed);
-                bool is_ext = false;
-                if (rem >= 1 && *trimmed == '#') {
-                    const char *ecmd = trimmed + 1;
-                    while (ecmd < p + content_len && (*ecmd == ' ' || *ecmd == '\t'))
-                        ecmd++;
-                    if ((size_t)(p + content_len - ecmd) >= 9 &&
-                        strncmp(ecmd, "extension", 9) == 0) {
-                        is_ext = true;
-                    }
-                }
-                if (is_ext || (rem >= 8 && strncmp(trimmed, "#version", 8) == 0) ||
-                    (rem >= 14 && strncmp(trimmed, "#pragma waywal", 14) == 0)) {
-                    wrapped[out_off++] = '/';
-                    wrapped[out_off++] = '/';
-                    memcpy(wrapped + out_off, trimmed + 1, line_len - (size_t)(trimmed + 1 - p));
-                    out_off += line_len - (size_t)(trimmed + 1 - p);
-                } else {
-                    memcpy(wrapped + out_off, p, line_len);
-                    out_off += line_len;
-                }
-            }
+            memcpy(wrapped + out_off, p, line_len);
+            out_off += line_len;
         }
 
         if (!nl) {
@@ -802,9 +1060,13 @@ char *waywal_shader_wrap_pass_source(const char *user_src, int pass_idx)
         p = nl + 1;
     }
 
-    bool has_main_image = (strstr(user_src, "mainImage") != NULL);
-    bool has_void_main = source_defines_void_main(user_src);
-    if (has_main_image || !has_void_main) {
+    free(pass_body);
+
+    if (wrap_graph_image_main) {
+        size_t gepi_len = sizeof(wwgraph_out_image_epi) - 1u;
+        memcpy(wrapped + out_off, wwgraph_out_image_epi, gepi_len);
+        out_off += gepi_len;
+    } else if (has_main_image || !has_void_main) {
         memcpy(wrapped + out_off, SHADERTOY_EPILOGUE, epi_len);
         out_off += epi_len;
     }
@@ -1029,174 +1291,187 @@ static void parse_shader_channel_directives(const char *user_src,
         const char *nl = strchr(line, '\n');
         size_t len = nl ? (size_t)(nl - line) : strlen(line);
 
-        int sec = match_section_marker(line, len);
-        if (sec >= -1) {
-            cur_sec = sec;
+        int pragma_pass = -2;
+        if (match_pragma_pass_marker(line, len, &pragma_pass)) {
+            cur_sec = pragma_pass;
+            if (cur_sec >= 0 && cur_sec < SHADER_NUM_PASSES) {
+                for (int c = 0; c < 4; ++c) {
+                    passes[cur_sec].channels[c].target =
+                        (shader_channel_target_t)((int)SHADER_CHAN_BUFFER_A + c);
+                }
+            }
         } else {
-            const char *s = line;
-            size_t slen = len;
-            while (slen > 0 && (*s == ' ' || *s == '\t')) {
-                s++;
-                slen--;
-            }
-
-            bool was_comment = false;
-            if (slen >= 2 && s[0] == '/' && s[1] == '/') {
-                was_comment = true;
-                s += 2;
-                slen -= 2;
+            int sec = match_section_marker(line, len);
+            if (sec >= -1) {
+                cur_sec = sec;
+            } else {
+                const char *s = line;
+                size_t slen = len;
                 while (slen > 0 && (*s == ' ' || *s == '\t')) {
                     s++;
                     slen--;
                 }
-            }
 
-            if (slen > 14 && strncmp(s, "#pragma waywal", 14) == 0) {
-                s += 14;
-                slen -= 14;
-                while (slen > 0 && (*s == ' ' || *s == '\t')) {
-                    s++;
-                    slen--;
-                }
-                int target_pass = cur_sec;
-                if (slen > 8 &&
-                    (strncasecmp(s, "bufferA.", 8) == 0 || strncasecmp(s, "bufferA_", 8) == 0)) {
-                    target_pass = 0;
-                    s += 8;
-                    slen -= 8;
-                } else if (slen > 9 && (strncasecmp(s, "buffer_a.", 9) == 0 ||
-                                        strncasecmp(s, "buffer_a_", 9) == 0)) {
-                    target_pass = 0;
-                    s += 9;
-                    slen -= 9;
-                } else if (slen > 8 && (strncasecmp(s, "bufferB.", 8) == 0 ||
-                                        strncasecmp(s, "bufferB_", 8) == 0)) {
-                    target_pass = 1;
-                    s += 8;
-                    slen -= 8;
-                } else if (slen > 9 && (strncasecmp(s, "buffer_b.", 9) == 0 ||
-                                        strncasecmp(s, "buffer_b_", 9) == 0)) {
-                    target_pass = 1;
-                    s += 9;
-                    slen -= 9;
-                } else if (slen > 8 && (strncasecmp(s, "bufferC.", 8) == 0 ||
-                                        strncasecmp(s, "bufferC_", 8) == 0)) {
-                    target_pass = 2;
-                    s += 8;
-                    slen -= 8;
-                } else if (slen > 9 && (strncasecmp(s, "buffer_c.", 9) == 0 ||
-                                        strncasecmp(s, "buffer_c_", 9) == 0)) {
-                    target_pass = 2;
-                    s += 9;
-                    slen -= 9;
-                } else if (slen > 8 && (strncasecmp(s, "bufferD.", 8) == 0 ||
-                                        strncasecmp(s, "bufferD_", 8) == 0)) {
-                    target_pass = 3;
-                    s += 8;
-                    slen -= 8;
-                } else if (slen > 9 && (strncasecmp(s, "buffer_d.", 9) == 0 ||
-                                        strncasecmp(s, "buffer_d_", 9) == 0)) {
-                    target_pass = 3;
-                    s += 9;
-                    slen -= 9;
-                } else if (slen > 6 &&
-                           (strncasecmp(s, "image.", 6) == 0 || strncasecmp(s, "image_", 6) == 0)) {
-                    target_pass = SHADER_PASS_IMAGE;
-                    s += 6;
-                    slen -= 6;
+                bool was_comment = false;
+                if (slen >= 2 && s[0] == '/' && s[1] == '/') {
+                    was_comment = true;
+                    s += 2;
+                    slen -= 2;
+                    while (slen > 0 && (*s == ' ' || *s == '\t')) {
+                        s++;
+                        slen--;
+                    }
                 }
 
-                int ch = -1;
-                if (slen >= 9 && strncasecmp(s, "iChannel", 8) == 0 && s[8] >= '0' && s[8] <= '3') {
-                    ch = s[8] - '0';
-                    s += 9;
-                    slen -= 9;
-                } else if (slen >= 8 && strncasecmp(s, "channel", 7) == 0 && s[7] >= '0' &&
-                           s[7] <= '3') {
-                    ch = s[7] - '0';
-                    s += 8;
-                    slen -= 8;
-                }
-                if (ch >= 0) {
-                    shader_channel_binding_t parsed = {.target = SHADER_CHAN_AUDIO};
-                    parse_channel_target_value(s, slen, &parsed);
-                    apply_parsed_channel_binding(passes, target_pass, ch, &parsed);
-                } else if (slen >= 12 && strncasecmp(s, "buffer_scale", 12) == 0) {
-                    apply_parsed_buffer_scale(passes, target_pass, s + 12, slen - 12);
-                } else if (slen >= 5 && strncasecmp(s, "scale", 5) == 0) {
-                    apply_parsed_buffer_scale(passes,
-                                              (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE,
-                                              s + 5, slen - 5);
-                } else if (slen >= 10 && strncasecmp(s, "buffer_fps", 10) == 0) {
-                    apply_parsed_buffer_fps(passes, target_pass, s + 10, slen - 10);
-                } else if (slen >= 3 && strncasecmp(s, "fps", 3) == 0) {
-                    apply_parsed_buffer_fps(passes,
-                                            (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE,
-                                            s + 3, slen - 3);
-                }
-            } else if (was_comment) {
-                int ch = -1;
-                if (slen > 10 && strncasecmp(s, "[CHANNEL", 8) == 0 && s[8] >= '0' && s[8] <= '3' &&
-                    s[9] == ']') {
-                    ch = s[8] - '0';
-                    s += 10;
-                    slen -= 10;
-                } else if (slen > 9 && strncasecmp(s, "iChannel", 8) == 0 && s[8] >= '0' &&
-                           s[8] <= '3' &&
-                           (s[9] == ':' || s[9] == '=' || s[9] == ' ' || s[9] == '\t')) {
-                    ch = s[8] - '0';
-                    s += 9;
-                    slen -= 9;
-                } else if (slen > 8 && strncasecmp(s, "channel", 7) == 0 && s[7] >= '0' &&
-                           s[7] <= '3' &&
-                           (s[8] == ':' || s[8] == '=' || s[8] == ' ' || s[8] == '\t')) {
-                    ch = s[7] - '0';
-                    s += 8;
-                    slen -= 8;
-                }
-                if (ch >= 0) {
-                    shader_channel_binding_t parsed = {.target = SHADER_CHAN_AUDIO};
-                    parse_channel_target_value(s, slen, &parsed);
-                    apply_parsed_channel_binding(passes, cur_sec, ch, &parsed);
-                } else if (slen > 6 && strncasecmp(s, "@wwal_", 6) == 0) {
-                    const char *directive = s + 6;
-                    size_t dlen = slen - 6;
+                if (slen > 14 && strncmp(s, "#pragma waywal", 14) == 0) {
+                    s += 14;
+                    slen -= 14;
+                    while (slen > 0 && (*s == ' ' || *s == '\t')) {
+                        s++;
+                        slen--;
+                    }
                     int target_pass = cur_sec;
-                    if (dlen > 7 && strncasecmp(directive, "buffer_", 7) == 0 &&
-                        (directive[7] == 'a' || directive[7] == 'A' || directive[7] == 'b' ||
-                         directive[7] == 'B' || directive[7] == 'c' || directive[7] == 'C' ||
-                         directive[7] == 'd' || directive[7] == 'D') &&
-                        (directive[8] == '_' || directive[8] == '.')) {
-                        target_pass = tolower((unsigned char)directive[7]) - 'a';
-                        directive += 9;
-                        dlen -= 9;
-                    } else if (dlen > 6 && (strncasecmp(directive, "image_", 6) == 0 ||
-                                            strncasecmp(directive, "image.", 6) == 0)) {
+                    if (slen > 8 && (strncasecmp(s, "bufferA.", 8) == 0 ||
+                                     strncasecmp(s, "bufferA_", 8) == 0)) {
+                        target_pass = 0;
+                        s += 8;
+                        slen -= 8;
+                    } else if (slen > 9 && (strncasecmp(s, "buffer_a.", 9) == 0 ||
+                                            strncasecmp(s, "buffer_a_", 9) == 0)) {
+                        target_pass = 0;
+                        s += 9;
+                        slen -= 9;
+                    } else if (slen > 8 && (strncasecmp(s, "bufferB.", 8) == 0 ||
+                                            strncasecmp(s, "bufferB_", 8) == 0)) {
+                        target_pass = 1;
+                        s += 8;
+                        slen -= 8;
+                    } else if (slen > 9 && (strncasecmp(s, "buffer_b.", 9) == 0 ||
+                                            strncasecmp(s, "buffer_b_", 9) == 0)) {
+                        target_pass = 1;
+                        s += 9;
+                        slen -= 9;
+                    } else if (slen > 8 && (strncasecmp(s, "bufferC.", 8) == 0 ||
+                                            strncasecmp(s, "bufferC_", 8) == 0)) {
+                        target_pass = 2;
+                        s += 8;
+                        slen -= 8;
+                    } else if (slen > 9 && (strncasecmp(s, "buffer_c.", 9) == 0 ||
+                                            strncasecmp(s, "buffer_c_", 9) == 0)) {
+                        target_pass = 2;
+                        s += 9;
+                        slen -= 9;
+                    } else if (slen > 8 && (strncasecmp(s, "bufferD.", 8) == 0 ||
+                                            strncasecmp(s, "bufferD_", 8) == 0)) {
+                        target_pass = 3;
+                        s += 8;
+                        slen -= 8;
+                    } else if (slen > 9 && (strncasecmp(s, "buffer_d.", 9) == 0 ||
+                                            strncasecmp(s, "buffer_d_", 9) == 0)) {
+                        target_pass = 3;
+                        s += 9;
+                        slen -= 9;
+                    } else if (slen > 6 && (strncasecmp(s, "image.", 6) == 0 ||
+                                            strncasecmp(s, "image_", 6) == 0)) {
                         target_pass = SHADER_PASS_IMAGE;
-                        directive += 6;
-                        dlen -= 6;
+                        s += 6;
+                        slen -= 6;
                     }
-                    if (dlen >= 12 && strncasecmp(directive, "buffer_scale", 12) == 0) {
-                        apply_parsed_buffer_scale(passes, target_pass, directive + 12, dlen - 12);
-                    } else if (dlen >= 5 && strncasecmp(directive, "scale", 5) == 0) {
+
+                    int ch = -1;
+                    if (slen >= 9 && strncasecmp(s, "iChannel", 8) == 0 && s[8] >= '0' &&
+                        s[8] <= '3') {
+                        ch = s[8] - '0';
+                        s += 9;
+                        slen -= 9;
+                    } else if (slen >= 8 && strncasecmp(s, "channel", 7) == 0 && s[7] >= '0' &&
+                               s[7] <= '3') {
+                        ch = s[7] - '0';
+                        s += 8;
+                        slen -= 8;
+                    }
+                    if (ch >= 0) {
+                        shader_channel_binding_t parsed = {.target = SHADER_CHAN_AUDIO};
+                        parse_channel_target_value(s, slen, &parsed);
+                        apply_parsed_channel_binding(passes, target_pass, ch, &parsed);
+                    } else if (slen >= 12 && strncasecmp(s, "buffer_scale", 12) == 0) {
+                        apply_parsed_buffer_scale(passes, target_pass, s + 12, slen - 12);
+                    } else if (slen >= 5 && strncasecmp(s, "scale", 5) == 0) {
                         apply_parsed_buffer_scale(
-                            passes, (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE,
-                            directive + 5, dlen - 5);
-                    } else if (dlen >= 10 && strncasecmp(directive, "buffer_fps", 10) == 0) {
-                        apply_parsed_buffer_fps(passes, target_pass, directive + 10, dlen - 10);
-                    } else if (dlen >= 3 && strncasecmp(directive, "fps", 3) == 0) {
+                            passes, (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE, s + 5,
+                            slen - 5);
+                    } else if (slen >= 10 && strncasecmp(s, "buffer_fps", 10) == 0) {
+                        apply_parsed_buffer_fps(passes, target_pass, s + 10, slen - 10);
+                    } else if (slen >= 3 && strncasecmp(s, "fps", 3) == 0) {
                         apply_parsed_buffer_fps(
-                            passes, (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE,
-                            directive + 3, dlen - 3);
+                            passes, (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE, s + 3,
+                            slen - 3);
                     }
-                } else if (slen > 6 && strncasecmp(s, "@scale", 6) == 0 &&
-                           (s[6] == ':' || s[6] == '=' || s[6] == ' ' || s[6] == '\t')) {
-                    apply_parsed_buffer_scale(passes, (cur_sec >= 0) ? cur_sec : SHADER_PASS_IMAGE,
-                                              s + 6, slen - 6);
-                } else if (slen > 4 && strncasecmp(s, "@fps", 4) == 0 &&
-                           (s[4] == ':' || s[4] == '=' || s[4] == ' ' || s[4] == '\t')) {
-                    apply_parsed_buffer_fps(passes, (cur_sec >= 0) ? cur_sec : SHADER_PASS_IMAGE,
-                                            s + 4, slen - 4);
+                } else if (was_comment) {
+                    int ch = -1;
+                    if (slen > 10 && strncasecmp(s, "[CHANNEL", 8) == 0 && s[8] >= '0' &&
+                        s[8] <= '3' && s[9] == ']') {
+                        ch = s[8] - '0';
+                        s += 10;
+                        slen -= 10;
+                    } else if (slen > 9 && strncasecmp(s, "iChannel", 8) == 0 && s[8] >= '0' &&
+                               s[8] <= '3' &&
+                               (s[9] == ':' || s[9] == '=' || s[9] == ' ' || s[9] == '\t')) {
+                        ch = s[8] - '0';
+                        s += 9;
+                        slen -= 9;
+                    } else if (slen > 8 && strncasecmp(s, "channel", 7) == 0 && s[7] >= '0' &&
+                               s[7] <= '3' &&
+                               (s[8] == ':' || s[8] == '=' || s[8] == ' ' || s[8] == '\t')) {
+                        ch = s[7] - '0';
+                        s += 8;
+                        slen -= 8;
+                    }
+                    if (ch >= 0) {
+                        shader_channel_binding_t parsed = {.target = SHADER_CHAN_AUDIO};
+                        parse_channel_target_value(s, slen, &parsed);
+                        apply_parsed_channel_binding(passes, cur_sec, ch, &parsed);
+                    } else if (slen > 6 && strncasecmp(s, "@wwal_", 6) == 0) {
+                        const char *directive = s + 6;
+                        size_t dlen = slen - 6;
+                        int target_pass = cur_sec;
+                        if (dlen > 7 && strncasecmp(directive, "buffer_", 7) == 0 &&
+                            (directive[7] == 'a' || directive[7] == 'A' || directive[7] == 'b' ||
+                             directive[7] == 'B' || directive[7] == 'c' || directive[7] == 'C' ||
+                             directive[7] == 'd' || directive[7] == 'D') &&
+                            (directive[8] == '_' || directive[8] == '.')) {
+                            target_pass = tolower((unsigned char)directive[7]) - 'a';
+                            directive += 9;
+                            dlen -= 9;
+                        } else if (dlen > 6 && (strncasecmp(directive, "image_", 6) == 0 ||
+                                                strncasecmp(directive, "image.", 6) == 0)) {
+                            target_pass = SHADER_PASS_IMAGE;
+                            directive += 6;
+                            dlen -= 6;
+                        }
+                        if (dlen >= 12 && strncasecmp(directive, "buffer_scale", 12) == 0) {
+                            apply_parsed_buffer_scale(passes, target_pass, directive + 12,
+                                                      dlen - 12);
+                        } else if (dlen >= 5 && strncasecmp(directive, "scale", 5) == 0) {
+                            apply_parsed_buffer_scale(
+                                passes, (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE,
+                                directive + 5, dlen - 5);
+                        } else if (dlen >= 10 && strncasecmp(directive, "buffer_fps", 10) == 0) {
+                            apply_parsed_buffer_fps(passes, target_pass, directive + 10, dlen - 10);
+                        } else if (dlen >= 3 && strncasecmp(directive, "fps", 3) == 0) {
+                            apply_parsed_buffer_fps(
+                                passes, (target_pass >= 0) ? target_pass : SHADER_PASS_IMAGE,
+                                directive + 3, dlen - 3);
+                        }
+                    } else if (slen > 6 && strncasecmp(s, "@scale", 6) == 0 &&
+                               (s[6] == ':' || s[6] == '=' || s[6] == ' ' || s[6] == '\t')) {
+                        apply_parsed_buffer_scale(
+                            passes, (cur_sec >= 0) ? cur_sec : SHADER_PASS_IMAGE, s + 6, slen - 6);
+                    } else if (slen > 4 && strncasecmp(s, "@fps", 4) == 0 &&
+                               (s[4] == ':' || s[4] == '=' || s[4] == ' ' || s[4] == '\t')) {
+                        apply_parsed_buffer_fps(
+                            passes, (cur_sec >= 0) ? cur_sec : SHADER_PASS_IMAGE, s + 4, slen - 4);
+                    }
                 }
             }
         }
@@ -1263,6 +1538,48 @@ static bool build_cache_filepath(uint64_t key, char *out_path, size_t out_sz)
     return n > 0 && (size_t)n < out_sz;
 }
 
+static _Atomic uint32_t s_shader_cache_tmp_seq = 0u;
+
+static bool read_all_no_eintr(int fd, void *buf, size_t len)
+{
+    uint8_t *dst = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = read(fd, dst + got, len - got);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        got += (size_t)n;
+    }
+    return true;
+}
+
+static bool write_all_no_eintr(int fd, const void *buf, size_t len)
+{
+    const uint8_t *src = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, src + sent, len - sent);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        sent += (size_t)n;
+    }
+    return true;
+}
+
 static GLuint try_load_cached_program(uint64_t key)
 {
     char path[4096];
@@ -1275,9 +1592,12 @@ static GLuint try_load_cached_program(uint64_t key)
         return 0;
     }
 
+    struct stat st;
     shader_cache_header_t hdr;
-    if (read(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) || hdr.magic != SHADER_CACHE_MAGIC ||
-        hdr.source_hash != key || hdr.binary_len == 0 || hdr.binary_len > (16u * 1024u * 1024u)) {
+    if (fstat(fd, &st) != 0 || st.st_size <= (off_t)sizeof(hdr) ||
+        !read_all_no_eintr(fd, &hdr, sizeof(hdr)) || hdr.magic != SHADER_CACHE_MAGIC ||
+        hdr.source_hash != key || hdr.binary_len == 0 || hdr.binary_len > (16u * 1024u * 1024u) ||
+        st.st_size != (off_t)(sizeof(hdr) + hdr.binary_len)) {
         close(fd);
         return 0;
     }
@@ -1288,9 +1608,9 @@ static GLuint try_load_cached_program(uint64_t key)
         return 0;
     }
 
-    ssize_t rd = read(fd, bin, hdr.binary_len);
+    bool ok_rd = read_all_no_eintr(fd, bin, hdr.binary_len);
     close(fd);
-    if (rd != (ssize_t)hdr.binary_len) {
+    if (!ok_rd) {
         free(bin);
         return 0;
     }
@@ -1320,7 +1640,7 @@ static void save_program_to_cache(GLuint prog, uint64_t key)
 {
     GLint bin_len = 0;
     glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &bin_len);
-    if (bin_len <= 0) {
+    if (bin_len <= 0 || bin_len > (16 * 1024 * 1024)) {
         return;
     }
 
@@ -1332,7 +1652,7 @@ static void save_program_to_cache(GLuint prog, uint64_t key)
     GLsizei actual_len = 0;
     GLenum bin_format = 0;
     glGetProgramBinary(prog, bin_len, &actual_len, &bin_format, bin);
-    if (actual_len <= 0) {
+    if (actual_len <= 0 || actual_len > bin_len) {
         free(bin);
         return;
     }
@@ -1343,13 +1663,14 @@ static void save_program_to_cache(GLuint prog, uint64_t key)
         free(bin);
         return;
     }
-    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", final_path, (int)getpid()) >=
+    uint32_t seq = atomic_fetch_add_explicit(&s_shader_cache_tmp_seq, 1u, memory_order_relaxed);
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d.%u", final_path, (int)getpid(), seq) >=
         (int)sizeof(tmp_path)) {
         free(bin);
         return;
     }
 
-    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) {
         free(bin);
         return;
@@ -1362,14 +1683,14 @@ static void save_program_to_cache(GLuint prog, uint64_t key)
         .binary_len = (uint32_t)actual_len,
     };
 
-    bool ok = (write(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr)) &&
-              (write(fd, bin, (size_t)actual_len) == (ssize_t)actual_len);
-    close(fd);
+    bool ok = write_all_no_eintr(fd, &hdr, sizeof(hdr)) &&
+              write_all_no_eintr(fd, bin, (size_t)actual_len);
+    if (close(fd) != 0) {
+        ok = false;
+    }
     free(bin);
 
-    if (ok) {
-        rename(tmp_path, final_path);
-    } else {
+    if (!ok || rename(tmp_path, final_path) != 0) {
         unlink(tmp_path);
     }
 }
@@ -1923,6 +2244,18 @@ static GLuint compile_or_load_pass(waywal_shader_engine_t *eng, const char *wrap
         glShaderSource(vs, 1, &vs_src, NULL);
         glCompileShader(vs);
 
+        GLint vs_compiled = 0;
+        glGetShaderiv(vs, GL_COMPILE_STATUS, &vs_compiled);
+        if (!vs_compiled) {
+            char log_buf[1024];
+            glGetShaderInfoLog(vs, sizeof(log_buf), NULL, log_buf);
+            WAYWAL_LOG_ERR("Vertex shader compilation failed (%s): %s",
+                           debug_name ? debug_name : "live", log_buf);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            return 0;
+        }
+
         const char *fs_ptr = wrapped;
         glShaderSource(fs, 1, &fs_ptr, NULL);
         glCompileShader(fs);
@@ -2125,6 +2458,9 @@ bool waywal_shader_engine_load_source(waywal_shader_engine_t *eng, const char *u
             eng->custom_uniforms[i].locations[p] = -2;
             eng->custom_uniforms[i].types[p] = 0;
         }
+        if (eng->custom_uniforms[i].active) {
+            eng->custom_uniforms[i].dirty_pass_mask = 0x1Fu;
+        }
     }
     eng->last_from_cache = all_cached;
 
@@ -2316,8 +2652,17 @@ bool waywal_shader_engine_set_custom_uniform(waywal_shader_engine_t *eng, const 
             return false;
         }
     }
+    float new_vals[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    memcpy(new_vals, values, num_components * sizeof(float));
+
     shader_custom_uniform_t *cu = &eng->custom_uniforms[slot];
-    if (!cu->active || strcmp(cu->name, name) != 0) {
+    bool name_changed = (!cu->active || strcmp(cu->name, name) != 0);
+    bool val_changed = name_changed || cu->num_components != num_components ||
+                       memcmp(cu->values, new_vals, sizeof(new_vals)) != 0;
+    if (!val_changed) {
+        return true;
+    }
+    if (name_changed) {
         snprintf(cu->name, sizeof(cu->name), "%s", name);
         for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
             cu->locations[p] = -2;
@@ -2325,11 +2670,11 @@ bool waywal_shader_engine_set_custom_uniform(waywal_shader_engine_t *eng, const 
         }
     }
     cu->num_components = num_components;
-    memset(cu->values, 0, sizeof(cu->values));
-    memcpy(cu->values, values, num_components * sizeof(float));
+    memcpy(cu->values, new_vals, sizeof(cu->values));
+    cu->dirty_pass_mask = 0x1Fu;
     cu->active = true;
 
-    if (eng->display != EGL_NO_DISPLAY && eng->context != EGL_NO_CONTEXT) {
+    if (name_changed && eng->display != EGL_NO_DISPLAY && eng->context != EGL_NO_CONTEXT) {
         make_context_current(eng);
         for (int p = 0; p < SHADER_NUM_PASSES; ++p) {
             if (eng->passes[p].active && eng->passes[p].prog) {
@@ -2468,13 +2813,13 @@ static char *read_entire_file(const char *filepath)
         close(fd);
         return NULL;
     }
-    ssize_t n = read(fd, buf, (size_t)st.st_size);
+    bool ok_rd = read_all_no_eintr(fd, buf, (size_t)st.st_size);
     close(fd);
-    if (n != st.st_size) {
+    if (!ok_rd) {
         free(buf);
         return NULL;
     }
-    buf[n] = '\0';
+    buf[st.st_size] = '\0';
     return buf;
 }
 
@@ -2539,7 +2884,9 @@ bool waywal_shader_engine_compile(waywal_shader_engine_t *eng, const char *src_o
     if (!eng || !src_or_path || src_or_path[0] == '\0') {
         return false;
     }
-    if (strstr(src_or_path, "mainImage") != NULL || strstr(src_or_path, "void main") != NULL) {
+    if (strstr(src_or_path, "mainImage") != NULL || strstr(src_or_path, "void main") != NULL ||
+        strstr(src_or_path, "#pragma Pass") != NULL ||
+        strstr(src_or_path, "#pragma pass") != NULL) {
         return waywal_shader_engine_load_source(eng, src_or_path, "inline");
     }
     return waywal_shader_engine_load_file(eng, src_or_path);
@@ -2922,6 +3269,13 @@ static void resolve_channel_texture(const waywal_shader_engine_t *eng,
             out_res[2] = 1.0f;
             return;
         }
+        if (b->target == SHADER_CHAN_BUFFER_D && eng->depth_tex) {
+            *out_tex = eng->depth_tex;
+            out_res[0] = (float)eng->depth_w;
+            out_res[1] = (float)eng->depth_h;
+            out_res[2] = 1.0f;
+            return;
+        }
         break;
     }
     case SHADER_CHAN_NOISE:
@@ -3024,20 +3378,36 @@ static void ensure_blit_resources(waywal_shader_engine_t *eng)
                 glCompileShader(vs);
                 glShaderSource(fs, 1, &fs_src, NULL);
                 glCompileShader(fs);
-                GLuint p = glCreateProgram();
-                if (p) {
-                    glProgramParameteri(p, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
-                    glAttachShader(p, vs);
-                    glAttachShader(p, fs);
-                    glLinkProgram(p);
-                    GLint ok = 0;
-                    glGetProgramiv(p, GL_LINK_STATUS, &ok);
-                    if (ok) {
-                        save_program_to_cache(p, key);
-                        eng->prog_blit = p;
-                        eng->loc_blit_swap_rb = glGetUniformLocation(p, "u_swap_rb");
-                    } else {
-                        glDeleteProgram(p);
+                GLint ok_vs = 0;
+                GLint ok_fs = 0;
+                glGetShaderiv(vs, GL_COMPILE_STATUS, &ok_vs);
+                glGetShaderiv(fs, GL_COMPILE_STATUS, &ok_fs);
+                if (!ok_vs) {
+                    char log_buf[512];
+                    glGetShaderInfoLog(vs, sizeof(log_buf), NULL, log_buf);
+                    WAYWAL_LOG_ERR("Blit vertex shader compilation failed: %s", log_buf);
+                }
+                if (!ok_fs) {
+                    char log_buf[512];
+                    glGetShaderInfoLog(fs, sizeof(log_buf), NULL, log_buf);
+                    WAYWAL_LOG_ERR("Blit fragment shader compilation failed: %s", log_buf);
+                }
+                if (ok_vs && ok_fs) {
+                    GLuint p = glCreateProgram();
+                    if (p) {
+                        glProgramParameteri(p, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+                        glAttachShader(p, vs);
+                        glAttachShader(p, fs);
+                        glLinkProgram(p);
+                        GLint ok = 0;
+                        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+                        if (ok) {
+                            save_program_to_cache(p, key);
+                            eng->prog_blit = p;
+                            eng->loc_blit_swap_rb = glGetUniformLocation(p, "u_swap_rb");
+                        } else {
+                            glDeleteProgram(p);
+                        }
                     }
                 }
             }
@@ -3071,7 +3441,8 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                         target_bo->drm_format == DRM_FORMAT_ABGR2101010;
     bool is_non_linear = (target_bo->modifier != DRM_FORMAT_MOD_LINEAR &&
                           target_bo->modifier != DRM_FORMAT_MOD_INVALID);
-    bool use_scratch_blit = is_10bit_fmt || is_non_linear;
+    bool need_immutable_image = eng->passes[4].is_compute && !eng->glEGLImageTargetTexStorageEXT;
+    bool use_scratch_blit = is_10bit_fmt || is_non_linear || need_immutable_image;
     bool want_fbo_mode = use_scratch_blit || !eng->passes[4].is_compute;
 
     GLuint target_tex = 0;
@@ -3403,9 +3774,10 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
             pass->audio_uniforms_dirty = false;
         }
 
+        const uint8_t pass_bit = (uint8_t)(1u << p);
         for (uint32_t cu_idx = 0; cu_idx < eng->num_custom_uniforms; ++cu_idx) {
             shader_custom_uniform_t *cu = &eng->custom_uniforms[cu_idx];
-            if (!cu->active) {
+            if (!cu->active || (!init_u && !(cu->dirty_pass_mask & pass_bit))) {
                 continue;
             }
             if (cu->locations[p] == -2) {
@@ -3421,12 +3793,16 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                     (cu->num_components >= 3) ? cu->values[2] : cu->values[0],
                     (cu->num_components >= 4) ? cu->values[3] : cu->values[0],
                 };
-                GLint ivals[4] = {
-                    (GLint)lroundf(fvals[0]),
-                    (GLint)lroundf(fvals[1]),
-                    (GLint)lroundf(fvals[2]),
-                    (GLint)lroundf(fvals[3]),
-                };
+                GLint ivals[4];
+                for (int k = 0; k < 4; ++k) {
+                    float clamped = fvals[k];
+                    if (clamped > 2147483520.0f) {
+                        clamped = 2147483520.0f;
+                    } else if (clamped < -2147483648.0f) {
+                        clamped = -2147483648.0f;
+                    }
+                    ivals[k] = (GLint)lroundf(clamped);
+                }
                 switch (ut) {
                 case GL_INT:
                 case GL_BOOL:
@@ -3469,6 +3845,7 @@ bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t 
                     break;
                 }
             }
+            cu->dirty_pass_mask &= (uint8_t)~pass_bit;
         }
 
         float chan_res[12] = {0};
