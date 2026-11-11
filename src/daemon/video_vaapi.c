@@ -148,12 +148,6 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
     memset(&dec->cached_iq, 16, sizeof(dec->cached_iq));
     dec->iq_valid = true;
 
-    /* Avoid eagerly faulting libnvidia-ptxjitcompiler.so (~21.5 MiB PSS) into host RAM */
-    setenv("CUDA_MODULE_LOADING", "LAZY", 0);
-    /* Prevent nvidia_drv_video.so from hoarding up to 128 MiB of detached backing images */
-    setenv("NVD_MAX_DETACHED_BACKING_IMAGES", "0", 0);
-    setenv("NVD_MAX_DETACHED_BACKING_IMAGE_BYTES", "0", 0);
-
     const char *candidate_nodes[] = {NULL, "/dev/dri/renderD128", "/dev/dri/renderD129"};
     bool found = false;
 
@@ -183,14 +177,6 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
 
         int major = 0, minor = 0;
         VAStatus st = vaInitialize(dpy, &major, &minor);
-        if (st != VA_STATUS_SUCCESS && getenv("LIBVA_DRIVER_NAME") != NULL) {
-            vaTerminate(dpy);
-            unsetenv("LIBVA_DRIVER_NAME");
-            dpy = vaGetDisplayDRM(fd);
-            if (dpy) {
-                st = vaInitialize(dpy, &major, &minor);
-            }
-        }
         if (!dpy || st != VA_STATUS_SUCCESS) {
             if (dpy)
                 vaTerminate(dpy);

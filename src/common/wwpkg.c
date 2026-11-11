@@ -2840,6 +2840,47 @@ static bool parse_manifest_ast(const jcs_val_t *root, wwpkg_manifest_t *m, int *
                 *out_err = WWPKG_ERR_BAD_MANIFEST;
             return false;
         }
+        const jcs_val_t *v_wg = jcs_find_member(v_bud, "max_compute_workgroups");
+        if (v_wg) {
+            if (v_wg->type != JCS_TYPE_ARR || v_wg->arr.count != 3u) {
+                if (out_err)
+                    *out_err = WWPKG_ERR_BAD_MANIFEST;
+                return false;
+            }
+            for (size_t i = 0; i < 3u; i++) {
+                const jcs_val_t *ev = v_wg->arr.items[i];
+                if (!ev || ev->type != JCS_TYPE_NUM) {
+                    if (out_err)
+                        *out_err = WWPKG_ERR_BAD_MANIFEST;
+                    return false;
+                }
+                uint64_t uv = 0;
+                if (ev->is_uint) {
+                    uv = ev->uval;
+                } else if (ev->is_int) {
+                    if (ev->ival < 0) {
+                        if (out_err)
+                            *out_err = WWPKG_ERR_BAD_MANIFEST;
+                        return false;
+                    }
+                    uv = (uint64_t)ev->ival;
+                } else {
+                    if (ev->dval < 0.0 || ev->dval > (double)UINT32_MAX ||
+                        floor(ev->dval) != ev->dval) {
+                        if (out_err)
+                            *out_err = WWPKG_ERR_BAD_MANIFEST;
+                        return false;
+                    }
+                    uv = (uint64_t)ev->dval;
+                }
+                if (uv > UINT32_MAX) {
+                    if (out_err)
+                        *out_err = WWPKG_ERR_BAD_MANIFEST;
+                    return false;
+                }
+                m->budgets.max_compute_workgroups[i] = (uint32_t)uv;
+            }
+        }
     } else {
         m->budgets.max_vram_mb = 256;
         m->budgets.max_ram_mb = 64;
@@ -3082,11 +3123,23 @@ static char *manifest_to_canonical_json(const wwpkg_manifest_t *m, size_t *out_l
              m->capabilities.foreign_toplevel ? "true" : "false");
     ok = ok && jcs_out_append_lit(&raw, num_tmp);
 
-    snprintf(num_tmp, sizeof(num_tmp),
-             ",\"resource_budgets\":{\"max_vram_mb\":%u,\"max_ram_mb\":%u,\"target_fps\":%u}",
-             m->budgets.max_vram_mb ? m->budgets.max_vram_mb : 256u,
-             m->budgets.max_ram_mb ? m->budgets.max_ram_mb : 64u,
-             m->budgets.target_fps ? m->budgets.target_fps : 60u);
+    if (m->budgets.max_compute_workgroups[0] != 0u || m->budgets.max_compute_workgroups[1] != 0u ||
+        m->budgets.max_compute_workgroups[2] != 0u) {
+        snprintf(num_tmp, sizeof(num_tmp),
+                 ",\"resource_budgets\":{\"max_vram_mb\":%u,\"max_ram_mb\":%u,"
+                 "\"target_fps\":%u,\"max_compute_workgroups\":[%u,%u,%u]}",
+                 m->budgets.max_vram_mb ? m->budgets.max_vram_mb : 256u,
+                 m->budgets.max_ram_mb ? m->budgets.max_ram_mb : 64u,
+                 m->budgets.target_fps ? m->budgets.target_fps : 60u,
+                 m->budgets.max_compute_workgroups[0], m->budgets.max_compute_workgroups[1],
+                 m->budgets.max_compute_workgroups[2]);
+    } else {
+        snprintf(num_tmp, sizeof(num_tmp),
+                 ",\"resource_budgets\":{\"max_vram_mb\":%u,\"max_ram_mb\":%u,\"target_fps\":%u}",
+                 m->budgets.max_vram_mb ? m->budgets.max_vram_mb : 256u,
+                 m->budgets.max_ram_mb ? m->budgets.max_ram_mb : 64u,
+                 m->budgets.target_fps ? m->budgets.target_fps : 60u);
+    }
     ok = ok && jcs_out_append_lit(&raw, num_tmp);
 
     if (m->has_preview_sha256) {
@@ -3124,13 +3177,6 @@ typedef struct {
     size_t size;
 } merkle_file_t;
 
-static int merkle_file_cmp(const void *a, const void *b)
-{
-    const merkle_file_t *fa = (const merkle_file_t *)a;
-    const merkle_file_t *fb = (const merkle_file_t *)b;
-    return strcmp(fa->name, fb->name);
-}
-
 /* v2 leaf = SHA256(0x00 || u32le(path_len) || norm_path || u64le(file_len) || file_data);
  * v1 leaf = SHA256(0x00 || file_data) for backward compatibility */
 static void compute_merkle_leaf(const char *norm_path, const uint8_t *data, size_t size,
@@ -3156,28 +3202,40 @@ static void compute_merkle_leaf(const char *norm_path, const uint8_t *data, size
     sha256_final(&ctx, out_hash);
 }
 
-static bool compute_merkle_root(merkle_file_t *files, size_t file_count, bool v2_leaves,
-                                uint8_t out_root[32])
+typedef struct {
+    char name[WWPKG_MAX_PATH_LEN];
+    uint8_t hash[32];
+} merkle_leaf_node_t;
+
+static int merkle_leaf_node_cmp(const void *a, const void *b)
 {
-    if (file_count == 0) {
+    const merkle_leaf_node_t *la = (const merkle_leaf_node_t *)a;
+    const merkle_leaf_node_t *lb = (const merkle_leaf_node_t *)b;
+    return strcmp(la->name, lb->name);
+}
+
+static bool compute_merkle_root_from_leaves(merkle_leaf_node_t *leaves, size_t leaf_count,
+                                            uint8_t out_root[32])
+{
+    if (leaf_count == 0) {
         wwpkg_sha256((const uint8_t *)"", 0, out_root);
         return true;
     }
 
-    if (file_count > 1) {
-        qsort(files, file_count, sizeof(merkle_file_t), merkle_file_cmp);
+    if (leaf_count > 1) {
+        qsort(leaves, leaf_count, sizeof(merkle_leaf_node_t), merkle_leaf_node_cmp);
     }
 
-    uint8_t (*nodes)[32] = (uint8_t (*)[32])malloc(file_count * 32);
+    uint8_t (*nodes)[32] = (uint8_t (*)[32])malloc(leaf_count * 32u);
     if (!nodes) {
         return false;
     }
 
-    for (size_t i = 0; i < file_count; i++) {
-        compute_merkle_leaf(files[i].name, files[i].data, files[i].size, v2_leaves, nodes[i]);
+    for (size_t i = 0; i < leaf_count; i++) {
+        memcpy(nodes[i], leaves[i].hash, 32u);
     }
 
-    size_t current_count = file_count;
+    size_t current_count = leaf_count;
     while (current_count > 1) {
         size_t next_count = (current_count + 1) / 2;
         for (size_t i = 0; i < current_count; i += 2) {
@@ -3198,6 +3256,31 @@ static bool compute_merkle_root(merkle_file_t *files, size_t file_count, bool v2
     memcpy(out_root, nodes[0], 32);
     free(nodes);
     return true;
+}
+
+static bool compute_merkle_root(merkle_file_t *files, size_t file_count, bool v2_leaves,
+                                uint8_t out_root[32])
+{
+    if (file_count == 0) {
+        wwpkg_sha256((const uint8_t *)"", 0, out_root);
+        return true;
+    }
+
+    merkle_leaf_node_t *leaves =
+        (merkle_leaf_node_t *)malloc(file_count * sizeof(merkle_leaf_node_t));
+    if (!leaves) {
+        return false;
+    }
+
+    for (size_t i = 0; i < file_count; i++) {
+        size_t nlen = strlen(files[i].name);
+        memcpy(leaves[i].name, files[i].name, nlen + 1u);
+        compute_merkle_leaf(files[i].name, files[i].data, files[i].size, v2_leaves, leaves[i].hash);
+    }
+
+    bool ok = compute_merkle_root_from_leaves(leaves, file_count, out_root);
+    free(leaves);
+    return ok;
 }
 
 /* ========================================================================= */
@@ -3541,6 +3624,7 @@ struct wwpkg_package {
     char *source_path;
     uint8_t *decompressed_buf;
     size_t decompressed_size;
+    uint8_t *retained_f0_buf;
 
     pkg_asset_entry_t *assets;
     size_t asset_count;
@@ -3633,6 +3717,7 @@ void wwpkg_close(wwpkg_package_t *pkg)
     if (pkg->decompressed_buf != pkg->inline_f0_buf) {
         free(pkg->decompressed_buf);
     }
+    free(pkg->retained_f0_buf);
     if (pkg->assets != pkg->inline_assets) {
         free(pkg->assets);
     }
@@ -3948,15 +4033,30 @@ wwpkg_package_t *wwpkg_open_memory(const uint8_t *data, size_t size)
     const uint8_t *stream_ptr = data;
     size_t stream_len = size;
 
-    if (size >= 4 && read_u32_le(data) == WWPKG_MAGIC_SKIPPABLE_ENV) {
-        int env_err = WWPKG_ERR_BAD_SIGNATURE;
-        if (!verify_outer_envelope_bytes(data, size, &outer_env, &env_err)) {
-            set_tls_error(env_err);
+    /* Advance past any RFC 8878 skippable frames (0x184D2A50..0x184D2A5F), authenticating
+     * our outer Ed25519 envelope (0x184D2A50) if present. */
+    while (stream_len >= 8u && (read_u32_le(stream_ptr) & 0xFFFFFFF0u) == 0x184D2A50u) {
+        uint32_t magic = read_u32_le(stream_ptr);
+        uint32_t skip_payload = read_u32_le(stream_ptr + 4u);
+        if ((size_t)skip_payload > stream_len - 8u) {
+            set_tls_error(WWPKG_ERR_CORRUPT);
             return nullptr;
         }
-        has_outer = true;
-        stream_ptr = data + sizeof(wwpkg_outer_envelope_t);
-        stream_len = size - sizeof(wwpkg_outer_envelope_t);
+        size_t total_skip = 8u + (size_t)skip_payload;
+        if (magic == WWPKG_MAGIC_SKIPPABLE_ENV) {
+            if (has_outer) {
+                set_tls_error(WWPKG_ERR_CORRUPT);
+                return nullptr;
+            }
+            int env_err = WWPKG_ERR_BAD_SIGNATURE;
+            if (!verify_outer_envelope_bytes(stream_ptr, total_skip, &outer_env, &env_err)) {
+                set_tls_error(env_err);
+                return nullptr;
+            }
+            has_outer = true;
+        }
+        stream_ptr += total_skip;
+        stream_len -= total_skip;
     }
 
     uint8_t *tar_buf = nullptr;
@@ -4015,8 +4115,12 @@ wwpkg_package_t *wwpkg_open_fd(int fd)
     }
 
     struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
         set_tls_error(WWPKG_ERR_IO);
+        return nullptr;
+    }
+    if (st.st_size == 0) {
+        set_tls_error(WWPKG_ERR_CORRUPT);
         return nullptr;
     }
     if ((uint64_t)st.st_size > WWPKG_MAX_ARCHIVE_BYTES) {
@@ -4092,9 +4196,14 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
     }
 
     struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
         close(fd);
         set_tls_error(WWPKG_ERR_IO);
+        return nullptr;
+    }
+    if (st.st_size == 0) {
+        close(fd);
+        set_tls_error(WWPKG_ERR_CORRUPT);
         return nullptr;
     }
     if ((uint64_t)st.st_size > WWPKG_MAX_ARCHIVE_BYTES) {
@@ -4344,6 +4453,8 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
     return pkg;
 }
 
+static bool verify_package_crypto_core(const wwpkg_package_t *pkg, uint8_t out_h_manifest[32]);
+
 static bool wwpkg_promote_metadata_pkg(wwpkg_package_t *pkg)
 {
     if (!pkg) {
@@ -4354,6 +4465,7 @@ static bool wwpkg_promote_metadata_pkg(wwpkg_package_t *pkg)
     }
     if (!pkg->source_path) {
         pkg->last_error = WWPKG_ERR_IO;
+        set_tls_error(WWPKG_ERR_IO);
         return false;
     }
 
@@ -4363,8 +4475,31 @@ static bool wwpkg_promote_metadata_pkg(wwpkg_package_t *pkg)
         return false;
     }
 
+    /* Reject path-swap TOCTOU or bulk payload tampering before replacing metadata state. */
+    if (!full->has_manifest || !full->has_signature || full->is_metadata_only ||
+        full->signature.version != pkg->signature.version ||
+        full->signature.timestamp != pkg->signature.timestamp ||
+        memcmp(full->signature.signature, pkg->signature.signature, WWPKG_SIGNATURE_BYTES) != 0 ||
+        memcmp(full->signature.author_pubkey, pkg->signature.author_pubkey, WWPKG_PUBKEY_BYTES) !=
+            0 ||
+        memcmp(full->manifest.author_pubkey, pkg->manifest.author_pubkey, WWPKG_PUBKEY_BYTES) !=
+            0 ||
+        memcmp(full->signature.merkle_root, pkg->signature.merkle_root, WWPKG_MERKLE_ROOT_BYTES) !=
+            0 ||
+        full->raw_manifest_len != pkg->raw_manifest_len ||
+        memcmp(full->raw_manifest_str, pkg->raw_manifest_str, pkg->raw_manifest_len) != 0 ||
+        !verify_package_crypto_core(full, nullptr)) {
+        wwpkg_close(full);
+        pkg->last_error = WWPKG_ERR_BAD_SIGNATURE;
+        set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
+        return false;
+    }
+
+    /* Retain heap Frame 0 storage until wwpkg_close so prior wwpkg_read_asset pointers stay live.
+     */
     if (pkg->decompressed_buf != pkg->inline_f0_buf) {
-        free(pkg->decompressed_buf);
+        free(pkg->retained_f0_buf);
+        pkg->retained_f0_buf = pkg->decompressed_buf;
     }
     if (pkg->assets != pkg->inline_assets) {
         free(pkg->assets);
@@ -4408,6 +4543,8 @@ static bool wwpkg_promote_metadata_pkg(wwpkg_package_t *pkg)
         full->raw_manifest_str = full->inline_manifest_str;
     }
     pkg->raw_manifest_len = full->raw_manifest_len;
+    memcpy(pkg->raw_manifest_sha256, full->raw_manifest_sha256, 32);
+    pkg->has_raw_manifest_sha256 = full->has_raw_manifest_sha256;
 
     wwpkg_close(full);
     return true;
@@ -4745,6 +4882,9 @@ static bool load_trust_store_file(const char *path, parsed_trust_store_t *store)
     return true;
 }
 
+static bool wwpkg_stream_metadata_pkg(const wwpkg_package_t *meta_pkg, int extract_dfd,
+                                      uint8_t out_h_manifest[32], int *out_err);
+
 static bool verify_package_crypto_core(const wwpkg_package_t *pkg, uint8_t out_h_manifest[32])
 {
     if (!pkg || !pkg->has_manifest || !pkg->has_signature) {
@@ -4752,9 +4892,8 @@ static bool verify_package_crypto_core(const wwpkg_package_t *pkg, uint8_t out_h
     }
 
     if (pkg->is_metadata_only) {
-        if (!wwpkg_promote_metadata_pkg((wwpkg_package_t *)pkg)) {
-            return false;
-        }
+        int stream_err = WWPKG_ERR_BAD_SIGNATURE;
+        return wwpkg_stream_metadata_pkg(pkg, -1, out_h_manifest, &stream_err);
     }
 
     bool is_v2 = (strcmp(pkg->manifest.schema_version, "wwpkg/v2") == 0);
@@ -4998,9 +5137,77 @@ struct wwpkg_open_how {
 #define WWPKG_RESOLVE_BENEATH       RESOLVE_BENEATH
 #endif
 
-static int open_confined_write(int root_dfd, const char *rel_path)
+static bool write_all_fd(int fd, const uint8_t *buf, size_t len);
+
+static int wwpkg_mkdir_p_and_open_dfd(const char *dest_dir, int *out_err)
 {
-    /* Walk and create intermediate directories with O_NOFOLLOW to prevent symlink escapes */
+    size_t dlen = strlen(dest_dir);
+    if (dlen == 0 || dlen >= PATH_MAX) {
+        if (out_err)
+            *out_err = WWPKG_ERR_INVALID_PARAM;
+        return -1;
+    }
+
+    if (mkdir(dest_dir, 0755) != 0 && errno != EEXIST) {
+        if (errno != ENOENT) {
+            if (out_err)
+                *out_err = WWPKG_ERR_IO;
+            return -1;
+        }
+        char tmp[PATH_MAX];
+        memcpy(tmp, dest_dir, dlen + 1u);
+        while (dlen > 1u && tmp[dlen - 1u] == '/') {
+            tmp[--dlen] = '\0';
+        }
+        for (char *p = tmp + 1; *p; ++p) {
+            if (*p == '/') {
+                *p = '\0';
+                if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+                    if (out_err)
+                        *out_err = WWPKG_ERR_IO;
+                    return -1;
+                }
+                *p = '/';
+            }
+        }
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+            if (out_err)
+                *out_err = WWPKG_ERR_IO;
+            return -1;
+        }
+    }
+
+    int dfd = open(dest_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dfd < 0) {
+        if (out_err)
+            *out_err =
+                (errno == ELOOP || errno == ENOTDIR) ? WWPKG_ERR_PATH_TRAVERSAL : WWPKG_ERR_IO;
+        return -1;
+    }
+    return dfd;
+}
+
+static int wwpkg_open_dest_fast(int root_dfd, const char *rel_path)
+{
+#ifdef SYS_openat2
+    /* Optimistic 1-syscall path for fresh extractions; O_EXCL prevents clobbering hardlinks or
+     * blocking on pre-existing FIFOs while kernel flags block symlink escapes. */
+    struct wwpkg_open_how how_excl;
+    memset(&how_excl, 0, sizeof(how_excl));
+    how_excl.flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW;
+    how_excl.mode = 0644;
+    how_excl.resolve =
+        WWPKG_RESOLVE_BENEATH | WWPKG_RESOLVE_NO_SYMLINKS | WWPKG_RESOLVE_NO_MAGICLINKS;
+    long fd_fast = syscall(SYS_openat2, root_dfd, rel_path, &how_excl, sizeof(how_excl));
+    if (fd_fast >= 0) {
+        return (int)fd_fast;
+    }
+    if (errno != ENOENT && errno != EEXIST && errno != ENOSYS && errno != EPERM) {
+        return -1;
+    }
+#endif
+
+    /* Walk and create intermediate directories with O_NOFOLLOW to prevent symlink escapes. */
     int cur_dfd = fcntl(root_dfd, F_DUPFD_CLOEXEC, 0);
     if (cur_dfd < 0) {
         return -1;
@@ -5034,13 +5241,21 @@ static int open_confined_write(int root_dfd, const char *rel_path)
         p = slash + 1;
     }
 
+    size_t blen = strlen(p);
+    if (blen == 0 || blen >= NAME_MAX) {
+        close(cur_dfd);
+        return -1;
+    }
+
+    /* Single-component unlinkat on a confined directory FD severs any pre-existing hardlink,
+     * symlink, or FIFO without traversing symlinks or truncating external link targets. */
+    if (unlinkat(cur_dfd, p, 0) != 0 && errno != ENOENT) {
+        close(cur_dfd);
+        return -1;
+    }
+
 #ifdef SYS_openat2
-    struct wwpkg_open_how how;
-    memset(&how, 0, sizeof(how));
-    how.flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW;
-    how.mode = 0644;
-    how.resolve = WWPKG_RESOLVE_BENEATH | WWPKG_RESOLVE_NO_SYMLINKS | WWPKG_RESOLVE_NO_MAGICLINKS;
-    long fd2 = syscall(SYS_openat2, root_dfd, rel_path, &how, sizeof(how));
+    long fd2 = syscall(SYS_openat2, cur_dfd, p, &how_excl, sizeof(how_excl));
     if (fd2 >= 0) {
         close(cur_dfd);
         return (int)fd2;
@@ -5051,9 +5266,885 @@ static int open_confined_write(int root_dfd, const char *rel_path)
     }
 #endif
 
-    int leaf_fd = openat(cur_dfd, p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    int leaf_fd = openat(cur_dfd, p, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
     close(cur_dfd);
     return leaf_fd;
+}
+
+static void wwpkg_unlink_confined_rel(int root_dfd, const char *rel_path)
+{
+    int cur_dfd = fcntl(root_dfd, F_DUPFD_CLOEXEC, 0);
+    if (cur_dfd < 0) {
+        return;
+    }
+    int parent_dfds[32];
+    char parent_names[32][NAME_MAX + 1];
+    size_t depth = 0;
+
+    const char *p = rel_path;
+    while (true) {
+        const char *slash = strchr(p, '/');
+        if (!slash) {
+            break;
+        }
+        size_t clen = (size_t)(slash - p);
+        if (clen == 0 || clen >= NAME_MAX || depth >= 32u) {
+            close(cur_dfd);
+            for (size_t i = 0; i < depth; i++) {
+                close(parent_dfds[i]);
+            }
+            return;
+        }
+        char comp[NAME_MAX + 1];
+        memcpy(comp, p, clen);
+        comp[clen] = '\0';
+        int next_dfd = openat(cur_dfd, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next_dfd < 0) {
+            close(cur_dfd);
+            for (size_t i = 0; i < depth; i++) {
+                close(parent_dfds[i]);
+            }
+            return;
+        }
+        parent_dfds[depth] = cur_dfd;
+        memcpy(parent_names[depth], comp, clen + 1u);
+        depth++;
+        cur_dfd = next_dfd;
+        p = slash + 1;
+    }
+    if (p[0] != '\0') {
+        (void)unlinkat(cur_dfd, p, 0);
+    }
+    close(cur_dfd);
+    while (depth > 0) {
+        depth--;
+        (void)unlinkat(parent_dfds[depth], parent_names[depth], AT_REMOVEDIR);
+        close(parent_dfds[depth]);
+    }
+}
+
+typedef enum {
+    TAR_STREAM_HDR = 0,
+    TAR_STREAM_DATA,
+    TAR_STREAM_PAD,
+    TAR_STREAM_EOF,
+} tar_stream_phase_t;
+
+typedef struct {
+    tar_stream_phase_t phase;
+    uint8_t hdr_buf[512];
+    size_t hdr_used;
+    size_t entry_rem;
+    size_t pad_rem;
+    int extract_dfd;
+    int cur_out_fd;
+    int err_code;
+
+    bool v2_leaves;
+    bool cur_is_sig;
+    bool cur_is_mf;
+    bool cur_is_prev;
+    bool saw_sig;
+    bool saw_mf;
+    bool found_prev;
+
+    char cur_name[WWPKG_MAX_PATH_LEN];
+    char expected_prev_name[WWPKG_MAX_PATH_LEN];
+    uint8_t expected_prev_sha[32];
+    bool check_prev_sha;
+
+    wwpkg_signature_t sig;
+    size_t sig_pos;
+
+    char *mf_buf;
+    size_t mf_size;
+    size_t mf_pos;
+
+    sha256_ctx_t leaf_ctx;
+    sha256_ctx_t prev_ctx;
+
+    merkle_leaf_node_t *leaves;
+    size_t leaf_count;
+    size_t leaf_cap;
+
+    uint32_t payload_files;
+    uint64_t payload_bytes;
+} tar_stream_ctx_t;
+
+static void tar_stream_ctx_cleanup(tar_stream_ctx_t *ts, bool rollback_files)
+{
+    if (ts->cur_out_fd >= 0) {
+        close(ts->cur_out_fd);
+        ts->cur_out_fd = -1;
+    }
+    if (rollback_files && ts->extract_dfd >= 0) {
+        if (ts->cur_name[0] != '\0') {
+            wwpkg_unlink_confined_rel(ts->extract_dfd, ts->cur_name);
+            ts->cur_name[0] = '\0';
+        }
+        if (ts->saw_sig) {
+            wwpkg_unlink_confined_rel(ts->extract_dfd, "signature.sig");
+        }
+        for (size_t i = 0; i < ts->leaf_count; i++) {
+            wwpkg_unlink_confined_rel(ts->extract_dfd, ts->leaves[i].name);
+        }
+    }
+    free(ts->mf_buf);
+    ts->mf_buf = nullptr;
+    free(ts->leaves);
+    ts->leaves = nullptr;
+}
+
+static bool tar_stream_finish_entry(tar_stream_ctx_t *ts)
+{
+    if (ts->cur_out_fd >= 0) {
+        close(ts->cur_out_fd);
+        ts->cur_out_fd = -1;
+    }
+
+    if (ts->cur_is_sig) {
+        if (ts->sig.has_notary_countersign > 1u) {
+            ts->err_code = WWPKG_ERR_BAD_SIGNATURE;
+            return false;
+        }
+        ts->saw_sig = true;
+    } else {
+        if (ts->cur_is_mf) {
+            ts->mf_buf[ts->mf_size] = '\0';
+            ts->saw_mf = true;
+        }
+        if (ts->cur_is_prev) {
+            uint8_t prev_sha[32];
+            sha256_final(&ts->prev_ctx, prev_sha);
+            if (memcmp(prev_sha, ts->expected_prev_sha, 32) != 0) {
+                ts->err_code = WWPKG_ERR_BAD_SIGNATURE;
+                return false;
+            }
+            ts->found_prev = true;
+        }
+
+        if (ts->leaf_count >= ts->leaf_cap) {
+            size_t ncap = ts->leaf_cap ? ts->leaf_cap * 2u : 16u;
+            if (ncap > WWPKG_MAX_FILE_COUNT + 2u) {
+                ncap = WWPKG_MAX_FILE_COUNT + 2u;
+            }
+            if (ts->leaf_count >= ncap) {
+                ts->err_code = WWPKG_ERR_DECOMPRESS;
+                return false;
+            }
+            merkle_leaf_node_t *nl =
+                (merkle_leaf_node_t *)realloc(ts->leaves, ncap * sizeof(merkle_leaf_node_t));
+            if (!nl) {
+                ts->err_code = WWPKG_ERR_IO;
+                return false;
+            }
+            ts->leaves = nl;
+            ts->leaf_cap = ncap;
+        }
+
+        size_t nlen = strlen(ts->cur_name);
+        memcpy(ts->leaves[ts->leaf_count].name, ts->cur_name, nlen + 1u);
+        sha256_final(&ts->leaf_ctx, ts->leaves[ts->leaf_count].hash);
+        ts->leaf_count++;
+    }
+
+    ts->cur_name[0] = '\0';
+    ts->phase = ts->pad_rem ? TAR_STREAM_PAD : TAR_STREAM_HDR;
+    ts->hdr_used = 0;
+    return true;
+}
+
+static bool tar_stream_consume(tar_stream_ctx_t *ts, const uint8_t *buf, size_t len)
+{
+    size_t pos = 0;
+    while (pos < len) {
+        if (ts->phase == TAR_STREAM_EOF) {
+            return true;
+        }
+
+        if (ts->phase == TAR_STREAM_HDR) {
+            size_t need = 512u - ts->hdr_used;
+            size_t take = (len - pos) < need ? (len - pos) : need;
+            memcpy(ts->hdr_buf + ts->hdr_used, buf + pos, take);
+            ts->hdr_used += take;
+            pos += take;
+            if (ts->hdr_used < 512u) {
+                continue;
+            }
+
+            bool is_zero = true;
+            for (size_t i = 0; i < 512u; i++) {
+                if (ts->hdr_buf[i] != 0) {
+                    is_zero = false;
+                    break;
+                }
+            }
+            if (is_zero) {
+                ts->phase = TAR_STREAM_EOF;
+                return true;
+            }
+
+            const ustar_hdr_t *hdr = (const ustar_hdr_t *)ts->hdr_buf;
+            if (memcmp(hdr->magic, "ustar", 5) != 0) {
+                ts->err_code = WWPKG_ERR_CORRUPT;
+                return false;
+            }
+            uint64_t stored_sum = 0;
+            if (!ustar_parse_octal(hdr->chksum, sizeof(hdr->chksum), &stored_sum) ||
+                (uint64_t)ustar_calc_chksum(hdr) != stored_sum) {
+                ts->err_code = WWPKG_ERR_CORRUPT;
+                return false;
+            }
+            uint64_t fsize_u64 = 0;
+            if (!ustar_parse_octal(hdr->size, sizeof(hdr->size), &fsize_u64) ||
+                fsize_u64 > WWPKG_MAX_ARCHIVE_BYTES) {
+                ts->err_code = WWPKG_ERR_CORRUPT;
+                return false;
+            }
+            size_t fsize = (size_t)fsize_u64;
+
+            if (hdr->typeflag == '5') {
+                if (fsize != 0 || hdr->linkname[0] != '\0') {
+                    ts->err_code =
+                        (hdr->linkname[0] != '\0') ? WWPKG_ERR_PATH_TRAVERSAL : WWPKG_ERR_CORRUPT;
+                    return false;
+                }
+                char full_dir[260];
+                if (hdr->prefix[0] != '\0') {
+                    size_t plen = strnlen(hdr->prefix, 155u);
+                    size_t nlen = strnlen(hdr->name, 100u);
+                    memcpy(full_dir, hdr->prefix, plen);
+                    full_dir[plen] = '/';
+                    memcpy(full_dir + plen + 1u, hdr->name, nlen);
+                    full_dir[plen + 1u + nlen] = '\0';
+                } else {
+                    size_t nlen = strnlen(hdr->name, 100u);
+                    memcpy(full_dir, hdr->name, nlen);
+                    full_dir[nlen] = '\0';
+                }
+                char clean_dir[WWPKG_MAX_PATH_LEN];
+                if (!sanitize_archive_path(full_dir, clean_dir, sizeof(clean_dir))) {
+                    ts->err_code = WWPKG_ERR_PATH_TRAVERSAL;
+                    return false;
+                }
+                ts->hdr_used = 0;
+                continue;
+            }
+
+            if ((hdr->typeflag != '0' && hdr->typeflag != '\0') || hdr->linkname[0] != '\0') {
+                ts->err_code = WWPKG_ERR_PATH_TRAVERSAL;
+                return false;
+            }
+
+            char full_path[260];
+            if (hdr->prefix[0] != '\0') {
+                size_t plen = strnlen(hdr->prefix, 155u);
+                size_t nlen = strnlen(hdr->name, 100u);
+                memcpy(full_path, hdr->prefix, plen);
+                full_path[plen] = '/';
+                memcpy(full_path + plen + 1u, hdr->name, nlen);
+                full_path[plen + 1u + nlen] = '\0';
+            } else {
+                size_t nlen = strnlen(hdr->name, 100u);
+                memcpy(full_path, hdr->name, nlen);
+                full_path[nlen] = '\0';
+            }
+
+            char clean_name[WWPKG_MAX_PATH_LEN];
+            if (!sanitize_archive_path(full_path, clean_name, sizeof(clean_name))) {
+                ts->err_code = WWPKG_ERR_PATH_TRAVERSAL;
+                return false;
+            }
+
+            if (strcmp(clean_name, "signature.sig") == 0) {
+                if (ts->saw_sig || fsize != sizeof(wwpkg_signature_t)) {
+                    ts->err_code = WWPKG_ERR_CORRUPT;
+                    return false;
+                }
+                ts->cur_is_sig = true;
+                ts->cur_is_mf = false;
+                ts->cur_is_prev = false;
+                ts->sig_pos = 0;
+            } else {
+                for (size_t i = 0; i < ts->leaf_count; i++) {
+                    if (strcmp(ts->leaves[i].name, clean_name) == 0) {
+                        ts->err_code = WWPKG_ERR_CORRUPT;
+                        return false;
+                    }
+                }
+                if (ts->leaf_count + (ts->saw_sig ? 1u : 0u) >= WWPKG_MAX_FILE_COUNT) {
+                    ts->err_code = WWPKG_ERR_DECOMPRESS;
+                    return false;
+                }
+
+                ts->cur_is_sig = false;
+                ts->cur_is_mf = (strcmp(clean_name, "manifest.json") == 0);
+                ts->cur_is_prev = (!ts->cur_is_mf && ts->check_prev_sha &&
+                                   strcmp(clean_name, ts->expected_prev_name) == 0);
+
+                if (ts->cur_is_mf) {
+                    if (ts->saw_mf || fsize == 0 || fsize > WWPKG_FRAME0_MAX_BYTES) {
+                        ts->err_code = WWPKG_ERR_BAD_MANIFEST;
+                        return false;
+                    }
+                    ts->mf_buf = (char *)malloc(fsize + 1u);
+                    if (!ts->mf_buf) {
+                        ts->err_code = WWPKG_ERR_IO;
+                        return false;
+                    }
+                    ts->mf_size = fsize;
+                    ts->mf_pos = 0;
+                } else {
+                    ts->payload_files++;
+                    if (ts->payload_files > WWPKG_MAX_FILE_COUNT ||
+                        fsize_u64 > WWPKG_MAX_ARCHIVE_BYTES - ts->payload_bytes) {
+                        ts->err_code = WWPKG_ERR_DECOMPRESS;
+                        return false;
+                    }
+                    ts->payload_bytes += fsize_u64;
+                }
+
+                if (ts->cur_is_prev) {
+                    sha256_init(&ts->prev_ctx);
+                }
+
+                uint8_t domain = 0x00;
+                sha256_init(&ts->leaf_ctx);
+                sha256_update(&ts->leaf_ctx, &domain, 1u);
+                if (ts->v2_leaves) {
+                    uint32_t plen = (uint32_t)strlen(clean_name);
+                    uint8_t plen_le[4];
+                    uint8_t flen_le[8];
+                    write_u32_le(plen_le, plen);
+                    write_u64_le(flen_le, (uint64_t)fsize);
+                    sha256_update(&ts->leaf_ctx, plen_le, sizeof(plen_le));
+                    sha256_update(&ts->leaf_ctx, (const uint8_t *)clean_name, plen);
+                    sha256_update(&ts->leaf_ctx, flen_le, sizeof(flen_le));
+                }
+            }
+
+            if (ts->extract_dfd >= 0) {
+                ts->cur_out_fd = wwpkg_open_dest_fast(ts->extract_dfd, clean_name);
+                if (ts->cur_out_fd < 0) {
+                    ts->err_code = WWPKG_ERR_PATH_TRAVERSAL;
+                    return false;
+                }
+            }
+            memcpy(ts->cur_name, clean_name, strlen(clean_name) + 1u);
+
+            size_t rem = fsize & 511u;
+            ts->entry_rem = fsize;
+            ts->pad_rem = rem ? (512u - rem) : 0u;
+            if (fsize == 0) {
+                if (!tar_stream_finish_entry(ts)) {
+                    return false;
+                }
+            } else {
+                ts->phase = TAR_STREAM_DATA;
+            }
+            continue;
+        }
+
+        if (ts->phase == TAR_STREAM_DATA) {
+            size_t take = (len - pos) < ts->entry_rem ? (len - pos) : ts->entry_rem;
+            const uint8_t *chunk = buf + pos;
+
+            if (ts->cur_is_sig) {
+                memcpy(((uint8_t *)&ts->sig) + ts->sig_pos, chunk, take);
+                ts->sig_pos += take;
+            } else {
+                sha256_update(&ts->leaf_ctx, chunk, take);
+                if (ts->cur_is_mf) {
+                    memcpy(ts->mf_buf + ts->mf_pos, chunk, take);
+                    ts->mf_pos += take;
+                }
+                if (ts->cur_is_prev) {
+                    sha256_update(&ts->prev_ctx, chunk, take);
+                }
+            }
+
+            if (ts->cur_out_fd >= 0 && !write_all_fd(ts->cur_out_fd, chunk, take)) {
+                ts->err_code = WWPKG_ERR_IO;
+                return false;
+            }
+
+            pos += take;
+            ts->entry_rem -= take;
+            if (ts->entry_rem == 0 && !tar_stream_finish_entry(ts)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (ts->phase == TAR_STREAM_PAD) {
+            size_t take = (len - pos) < ts->pad_rem ? (len - pos) : ts->pad_rem;
+            pos += take;
+            ts->pad_rem -= take;
+            if (ts->pad_rem == 0) {
+                ts->phase = TAR_STREAM_HDR;
+                ts->hdr_used = 0;
+            }
+        }
+    }
+    return true;
+}
+
+static bool stat_identity_unchanged(int fd, const struct stat *before)
+{
+    struct stat after;
+    if (fstat(fd, &after) != 0) {
+        return false;
+    }
+    return after.st_dev == before->st_dev && after.st_ino == before->st_ino &&
+           after.st_size == before->st_size && after.st_mtim.tv_sec == before->st_mtim.tv_sec &&
+           after.st_mtim.tv_nsec == before->st_mtim.tv_nsec;
+}
+
+static bool wwpkg_stream_metadata_pkg_bytes(const wwpkg_package_t *meta_pkg,
+                                            const uint8_t *raw_data, size_t raw_size,
+                                            int extract_dfd, int src_fd,
+                                            const struct stat *expected_st,
+                                            uint8_t out_h_manifest[32], int *out_err)
+{
+    bool is_v2 = (strcmp(meta_pkg->manifest.schema_version, "wwpkg/v2") == 0);
+    bool is_v1 = (strcmp(meta_pkg->manifest.schema_version, "wwpkg/v1") == 0);
+    if ((!is_v2 && !is_v1) || (is_v2 && meta_pkg->signature.version < 2) ||
+        (is_v1 && meta_pkg->signature.version != 1) || meta_pkg->manifest.capabilities.network ||
+        meta_pkg->manifest.capabilities.filesystem ||
+        meta_pkg->signature.has_notary_countersign > 1u ||
+        memcmp(meta_pkg->manifest.author_pubkey, meta_pkg->signature.author_pubkey,
+               WWPKG_PUBKEY_BYTES) != 0) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        return false;
+    }
+
+    wwpkg_outer_envelope_t outer_env;
+    memset(&outer_env, 0, sizeof(outer_env));
+    bool has_outer = false;
+    const uint8_t *stream_ptr = raw_data;
+    size_t stream_len = raw_size;
+
+    while (stream_len >= 8u && (read_u32_le(stream_ptr) & 0xFFFFFFF0u) == 0x184D2A50u) {
+        uint32_t magic = read_u32_le(stream_ptr);
+        uint32_t skip_payload = read_u32_le(stream_ptr + 4u);
+        if ((size_t)skip_payload > stream_len - 8u) {
+            if (out_err)
+                *out_err = WWPKG_ERR_CORRUPT;
+            return false;
+        }
+        size_t total_skip = 8u + (size_t)skip_payload;
+        if (magic == WWPKG_MAGIC_SKIPPABLE_ENV) {
+            if (has_outer) {
+                if (out_err)
+                    *out_err = WWPKG_ERR_CORRUPT;
+                return false;
+            }
+            int env_err = WWPKG_ERR_BAD_SIGNATURE;
+            if (!verify_outer_envelope_bytes(stream_ptr, total_skip, &outer_env, &env_err)) {
+                if (out_err)
+                    *out_err = env_err;
+                return false;
+            }
+            has_outer = true;
+        }
+        stream_ptr += total_skip;
+        stream_len -= total_skip;
+    }
+
+    if (has_outer != meta_pkg->has_outer_env ||
+        (has_outer && memcmp(&outer_env, &meta_pkg->outer_env, sizeof(outer_env)) != 0)) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        return false;
+    }
+
+    tar_stream_ctx_t ts;
+    memset(&ts, 0, sizeof(ts));
+    ts.extract_dfd = extract_dfd;
+    ts.cur_out_fd = -1;
+    ts.err_code = WWPKG_ERR_CORRUPT;
+    ts.v2_leaves = is_v2;
+    if (meta_pkg->manifest.has_preview_sha256) {
+        ts.check_prev_sha = true;
+        memcpy(ts.expected_prev_name, meta_pkg->manifest.entrypoint_preview,
+               sizeof(ts.expected_prev_name));
+        memcpy(ts.expected_prev_sha, meta_pkg->manifest.preview_sha256, 32);
+    }
+
+    const size_t max_tar_stream = WWPKG_MAX_ARCHIVE_BYTES + (8ULL * 1024ULL * 1024ULL);
+
+    if (stream_len >= 4u && read_u32_le(stream_ptr) == WWPKG_MAGIC_ZSTD) {
+        zstd_probe();
+        if (!g_zstd_available) {
+            tar_stream_ctx_cleanup(&ts, true);
+            if (out_err)
+                *out_err = WWPKG_ERR_DECOMPRESS;
+            return false;
+        }
+        zstd_dstream_t *dstream = g_zstd.createDStream();
+        if (!dstream) {
+            tar_stream_ctx_cleanup(&ts, true);
+            if (out_err)
+                *out_err = WWPKG_ERR_DECOMPRESS;
+            return false;
+        }
+        size_t init_rc = g_zstd.initDStream(dstream);
+        if (g_zstd.isError(init_rc)) {
+            g_zstd.freeDStream(dstream);
+            tar_stream_ctx_cleanup(&ts, true);
+            if (out_err)
+                *out_err = WWPKG_ERR_DECOMPRESS;
+            return false;
+        }
+
+        uint8_t scratch[65536];
+        size_t total_out = 0;
+        zstd_in_buffer_t in_buf = {.src = stream_ptr, .size = stream_len, .pos = 0};
+        size_t last_ret = 0;
+
+        while (in_buf.pos < in_buf.size || last_ret != 0) {
+            size_t prev_in = in_buf.pos;
+            zstd_out_buffer_t out_chunk = {.dst = scratch, .size = sizeof(scratch), .pos = 0};
+            last_ret = g_zstd.decompressStream(dstream, &out_chunk, &in_buf);
+            if (g_zstd.isError(last_ret)) {
+                g_zstd.freeDStream(dstream);
+                tar_stream_ctx_cleanup(&ts, true);
+                if (out_err)
+                    *out_err = WWPKG_ERR_DECOMPRESS;
+                return false;
+            }
+            if (out_chunk.pos > 0) {
+                if (out_chunk.pos > max_tar_stream - total_out) {
+                    g_zstd.freeDStream(dstream);
+                    tar_stream_ctx_cleanup(&ts, true);
+                    if (out_err)
+                        *out_err = WWPKG_ERR_DECOMPRESS;
+                    return false;
+                }
+                total_out += out_chunk.pos;
+                if (!tar_stream_consume(&ts, scratch, out_chunk.pos)) {
+                    g_zstd.freeDStream(dstream);
+                    if (out_err)
+                        *out_err = ts.err_code;
+                    tar_stream_ctx_cleanup(&ts, true);
+                    return false;
+                }
+            }
+            if (in_buf.pos == prev_in && out_chunk.pos == 0) {
+                if (last_ret != 0 || in_buf.pos < in_buf.size) {
+                    g_zstd.freeDStream(dstream);
+                    tar_stream_ctx_cleanup(&ts, true);
+                    if (out_err)
+                        *out_err = WWPKG_ERR_DECOMPRESS;
+                    return false;
+                }
+                break;
+            }
+        }
+        g_zstd.freeDStream(dstream);
+    } else if (stream_len >= 512u && stream_len <= max_tar_stream &&
+               memcmp(stream_ptr + 257u, "ustar", 5) == 0) {
+        if (!tar_stream_consume(&ts, stream_ptr, stream_len)) {
+            if (out_err)
+                *out_err = ts.err_code;
+            tar_stream_ctx_cleanup(&ts, true);
+            return false;
+        }
+    } else {
+        tar_stream_ctx_cleanup(&ts, true);
+        if (out_err)
+            *out_err = WWPKG_ERR_CORRUPT;
+        return false;
+    }
+
+    if ((ts.phase != TAR_STREAM_EOF && !(ts.phase == TAR_STREAM_HDR && ts.hdr_used == 0)) ||
+        !ts.saw_sig || !ts.saw_mf) {
+        if (out_err)
+            *out_err = WWPKG_ERR_CORRUPT;
+        tar_stream_ctx_cleanup(&ts, true);
+        return false;
+    }
+
+    if (ts.sig.version != meta_pkg->signature.version ||
+        ts.sig.timestamp != meta_pkg->signature.timestamp ||
+        ts.sig.has_notary_countersign != meta_pkg->signature.has_notary_countersign ||
+        memcmp(ts.sig.signature, meta_pkg->signature.signature, WWPKG_SIGNATURE_BYTES) != 0 ||
+        memcmp(ts.sig.author_pubkey, meta_pkg->signature.author_pubkey, WWPKG_PUBKEY_BYTES) != 0 ||
+        memcmp(ts.sig.merkle_root, meta_pkg->signature.merkle_root, WWPKG_MERKLE_ROOT_BYTES) != 0 ||
+        memcmp(ts.sig.notary_signature, meta_pkg->signature.notary_signature,
+               WWPKG_SIGNATURE_BYTES) != 0 ||
+        ts.mf_size != meta_pkg->raw_manifest_len ||
+        memcmp(ts.mf_buf, meta_pkg->raw_manifest_str, ts.mf_size) != 0) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        tar_stream_ctx_cleanup(&ts, true);
+        return false;
+    }
+
+    if (is_v2 && (ts.payload_files != meta_pkg->manifest.file_count ||
+                  ts.payload_bytes != meta_pkg->manifest.total_bytes)) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        tar_stream_ctx_cleanup(&ts, true);
+        return false;
+    }
+
+    if (ts.check_prev_sha && !ts.found_prev) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        tar_stream_ctx_cleanup(&ts, true);
+        return false;
+    }
+
+    uint8_t computed_root[32];
+    if (!compute_merkle_root_from_leaves(ts.leaves, ts.leaf_count, computed_root) ||
+        memcmp(computed_root, meta_pkg->signature.merkle_root, 32) != 0) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        tar_stream_ctx_cleanup(&ts, true);
+        return false;
+    }
+
+    size_t canonical_manifest_len = 0;
+    char *canonical_manifest =
+        wwpkg_canonicalize_json(ts.mf_buf, ts.mf_size, &canonical_manifest_len);
+    if (!canonical_manifest) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_MANIFEST;
+        tar_stream_ctx_cleanup(&ts, true);
+        return false;
+    }
+    uint8_t h_manifest[32];
+    wwpkg_sha256((const uint8_t *)canonical_manifest, canonical_manifest_len, h_manifest);
+    free(canonical_manifest);
+
+    if (has_outer && (outer_env.timestamp_le != meta_pkg->signature.timestamp ||
+                      memcmp(outer_env.author_pubkey, meta_pkg->signature.author_pubkey, 32) != 0 ||
+                      memcmp(outer_env.merkle_root, meta_pkg->signature.merkle_root, 32) != 0 ||
+                      memcmp(outer_env.manifest_sha256, h_manifest, 32) != 0 ||
+                      memcmp(outer_env.signature, meta_pkg->signature.signature, 64) != 0)) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        tar_stream_ctx_cleanup(&ts, true);
+        return false;
+    }
+
+    uint8_t sign_payload[85];
+    build_sign_payload(meta_pkg->signature.version, h_manifest, meta_pkg->signature.merkle_root,
+                       meta_pkg->signature.timestamp, sign_payload);
+    if (wwpkg_ed25519_verify(meta_pkg->signature.signature, sign_payload, sizeof(sign_payload),
+                             meta_pkg->signature.author_pubkey) != 0) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        tar_stream_ctx_cleanup(&ts, true);
+        return false;
+    }
+
+    if (meta_pkg->signature.has_notary_countersign == 1u) {
+        if (!ed25519_scalar_is_canonical(meta_pkg->signature.notary_signature + 32)) {
+            if (out_err)
+                *out_err = WWPKG_ERR_BAD_SIGNATURE;
+            tar_stream_ctx_cleanup(&ts, true);
+            return false;
+        }
+        bool all_zero = true;
+        for (int i = 0; i < 64; i++) {
+            if (meta_pkg->signature.notary_signature[i] != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            if (out_err)
+                *out_err = WWPKG_ERR_BAD_SIGNATURE;
+            tar_stream_ctx_cleanup(&ts, true);
+            return false;
+        }
+    }
+
+    if (src_fd >= 0 && expected_st != nullptr && !stat_identity_unchanged(src_fd, expected_st)) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        tar_stream_ctx_cleanup(&ts, true);
+        return false;
+    }
+
+    if (out_h_manifest) {
+        memcpy(out_h_manifest, h_manifest, 32);
+    }
+    tar_stream_ctx_cleanup(&ts, false);
+    return true;
+}
+
+static bool wwpkg_map_or_read_open_fd(int fd, size_t file_size, const uint8_t **out_bytes,
+                                      void **out_mapped, uint8_t **out_heap, int *out_err)
+{
+    *out_bytes = nullptr;
+    *out_mapped = MAP_FAILED;
+    *out_heap = nullptr;
+
+    void *mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapped != MAP_FAILED) {
+        *out_mapped = mapped;
+        *out_bytes = (const uint8_t *)mapped;
+        return true;
+    }
+
+    uint8_t *raw_data = (uint8_t *)malloc(file_size);
+    if (!raw_data) {
+        if (out_err)
+            *out_err = WWPKG_ERR_IO;
+        return false;
+    }
+    size_t rd = 0;
+    while (rd < file_size) {
+        ssize_t r = pread(fd, raw_data + rd, file_size - rd, (off_t)rd);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) {
+                continue;
+            }
+            free(raw_data);
+            if (out_err)
+                *out_err = WWPKG_ERR_IO;
+            return false;
+        }
+        rd += (size_t)r;
+    }
+    *out_heap = raw_data;
+    *out_bytes = raw_data;
+    return true;
+}
+
+static bool wwpkg_stream_metadata_pkg(const wwpkg_package_t *meta_pkg, int extract_dfd,
+                                      uint8_t out_h_manifest[32], int *out_err)
+{
+    if (!meta_pkg || !meta_pkg->source_path) {
+        if (out_err)
+            *out_err = WWPKG_ERR_IO;
+        return false;
+    }
+
+    int fd = open(meta_pkg->source_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (out_err)
+            *out_err = WWPKG_ERR_IO;
+        return false;
+    }
+
+    struct stat st;
+    int fstat_rc = fstat(fd, &st);
+    if (fstat_rc != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        close(fd);
+        if (out_err)
+            *out_err = (fstat_rc == 0 && S_ISREG(st.st_mode) && st.st_size == 0) ? WWPKG_ERR_CORRUPT
+                                                                                 : WWPKG_ERR_IO;
+        return false;
+    }
+    if ((uint64_t)st.st_size > WWPKG_MAX_ARCHIVE_BYTES) {
+        close(fd);
+        if (out_err)
+            *out_err = WWPKG_ERR_DECOMPRESS;
+        return false;
+    }
+
+    size_t file_size = (size_t)st.st_size;
+    const uint8_t *bytes = nullptr;
+    void *mapped = MAP_FAILED;
+    uint8_t *raw_data = nullptr;
+    if (!wwpkg_map_or_read_open_fd(fd, file_size, &bytes, &mapped, &raw_data, out_err)) {
+        close(fd);
+        return false;
+    }
+
+    bool ok = wwpkg_stream_metadata_pkg_bytes(meta_pkg, bytes, file_size, extract_dfd, fd, &st,
+                                              out_h_manifest, out_err);
+    if (mapped != MAP_FAILED) {
+        munmap(mapped, file_size);
+    }
+    free(raw_data);
+    close(fd);
+    return ok;
+}
+
+static bool wwpkg_verify_and_extract_metadata_pkg(const wwpkg_package_t *meta_pkg,
+                                                  const char *dest_dir, int *out_err)
+{
+    if (!meta_pkg || !meta_pkg->source_path) {
+        if (out_err)
+            *out_err = WWPKG_ERR_IO;
+        return false;
+    }
+
+    int fd = open(meta_pkg->source_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (out_err)
+            *out_err = WWPKG_ERR_IO;
+        return false;
+    }
+
+    struct stat st;
+    int fstat_rc = fstat(fd, &st);
+    if (fstat_rc != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        close(fd);
+        if (out_err)
+            *out_err = (fstat_rc == 0 && S_ISREG(st.st_mode) && st.st_size == 0) ? WWPKG_ERR_CORRUPT
+                                                                                 : WWPKG_ERR_IO;
+        return false;
+    }
+    if ((uint64_t)st.st_size > WWPKG_MAX_ARCHIVE_BYTES) {
+        close(fd);
+        if (out_err)
+            *out_err = WWPKG_ERR_DECOMPRESS;
+        return false;
+    }
+
+    size_t file_size = (size_t)st.st_size;
+    const uint8_t *bytes = nullptr;
+    void *mapped = MAP_FAILED;
+    uint8_t *raw_data = nullptr;
+    if (!wwpkg_map_or_read_open_fd(fd, file_size, &bytes, &mapped, &raw_data, out_err)) {
+        close(fd);
+        return false;
+    }
+
+    int verr = WWPKG_ERR_BAD_SIGNATURE;
+    if (!wwpkg_stream_metadata_pkg_bytes(meta_pkg, bytes, file_size, -1, fd, &st, nullptr, &verr)) {
+        if (mapped != MAP_FAILED) {
+            munmap(mapped, file_size);
+        }
+        free(raw_data);
+        close(fd);
+        if (out_err)
+            *out_err = verr;
+        return false;
+    }
+
+    int derr = WWPKG_ERR_IO;
+    int root_dfd = wwpkg_mkdir_p_and_open_dfd(dest_dir, &derr);
+    if (root_dfd < 0) {
+        if (mapped != MAP_FAILED) {
+            munmap(mapped, file_size);
+        }
+        free(raw_data);
+        close(fd);
+        if (out_err)
+            *out_err = derr;
+        return false;
+    }
+
+    int xerr = WWPKG_ERR_BAD_SIGNATURE;
+    bool ok = wwpkg_stream_metadata_pkg_bytes(meta_pkg, bytes, file_size, root_dfd, fd, &st,
+                                              nullptr, &xerr);
+    close(root_dfd);
+    if (mapped != MAP_FAILED) {
+        munmap(mapped, file_size);
+    }
+    free(raw_data);
+    close(fd);
+    if (out_err)
+        *out_err = ok ? WWPKG_OK : xerr;
+    return ok;
 }
 
 bool wwpkg_extract_all(wwpkg_package_t *pkg, const char *dest_dir)
@@ -5063,19 +6154,22 @@ bool wwpkg_extract_all(wwpkg_package_t *pkg, const char *dest_dir)
         return false;
     }
 
+    if (pkg->is_metadata_only) {
+        int xerr = WWPKG_ERR_BAD_SIGNATURE;
+        bool ok = wwpkg_verify_and_extract_metadata_pkg(pkg, dest_dir, &xerr);
+        set_tls_error(ok ? WWPKG_OK : xerr);
+        return ok;
+    }
+
     if (!wwpkg_verify_signature(pkg, nullptr)) {
         set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
         return false;
     }
 
-    if (mkdir(dest_dir, 0755) != 0 && errno != EEXIST) {
-        set_tls_error(WWPKG_ERR_IO);
-        return false;
-    }
-
-    int root_dfd = open(dest_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int derr = WWPKG_ERR_IO;
+    int root_dfd = wwpkg_mkdir_p_and_open_dfd(dest_dir, &derr);
     if (root_dfd < 0) {
-        set_tls_error(WWPKG_ERR_PATH_TRAVERSAL);
+        set_tls_error(derr);
         return false;
     }
 
@@ -5087,28 +6181,18 @@ bool wwpkg_extract_all(wwpkg_package_t *pkg, const char *dest_dir)
             return false;
         }
 
-        int out_fd = open_confined_write(root_dfd, clean);
+        int out_fd = wwpkg_open_dest_fast(root_dfd, clean);
         if (out_fd < 0) {
             close(root_dfd);
             set_tls_error(WWPKG_ERR_PATH_TRAVERSAL);
             return false;
         }
 
-        size_t wr = 0;
-        const uint8_t *src = pkg->assets[i].data;
-        size_t sz = pkg->assets[i].size;
-        while (wr < sz) {
-            ssize_t w = write(out_fd, src + wr, sz - wr);
-            if (w <= 0) {
-                if (w < 0 && errno == EINTR) {
-                    continue;
-                }
-                close(out_fd);
-                close(root_dfd);
-                set_tls_error(WWPKG_ERR_IO);
-                return false;
-            }
-            wr += (size_t)w;
+        if (!write_all_fd(out_fd, pkg->assets[i].data, pkg->assets[i].size)) {
+            close(out_fd);
+            close(root_dfd);
+            set_tls_error(WWPKG_ERR_IO);
+            return false;
         }
         close(out_fd);
     }
@@ -5854,6 +6938,11 @@ bool wwpkg_notarize_package(const char *pkg_path, const uint8_t notary_sk[64])
         set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
         return false;
     }
+    if (strcmp(pkg->manifest.schema_version, "wwpkg/v2") != 0 || pkg->signature.version < 2) {
+        wwpkg_close(pkg);
+        set_tls_error(WWPKG_ERR_BAD_MANIFEST);
+        return false;
+    }
 
     uint8_t notary_payload[184];
     build_notary_payload(pkg->signature.author_pubkey, h_manifest, pkg->signature.merkle_root,
@@ -5889,7 +6978,7 @@ bool wwpkg_notarize_package(const char *pkg_path, const uint8_t notary_sk[64])
     bool preview_in_f0 = false;
     size_t bulk_count = payload_count;
 
-    if (preview_idx >= 0) {
+    if (preview_idx >= 0 && pkg->manifest.has_preview_sha256) {
         size_t psz = pkg->assets[preview_idx].size;
         size_t p_tar = 512u + (((psz + 511u) / 512u) * 512u);
         size_t eof_pad = (payload_count == 1u) ? 1024u : 0u;

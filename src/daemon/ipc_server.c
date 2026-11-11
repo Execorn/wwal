@@ -10,15 +10,13 @@
 #include "waywal/wwpkg.h"
 
 #include <dirent.h>
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <linux/openat2.h>
 #include <pthread.h>
 #include <pwd.h>
 #include <signal.h>
 #include <sys/eventfd.h>
-#include <sys/syscall.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <time.h>
 
@@ -435,6 +433,8 @@ static bool ipc_subscriber_is_paused(int fd)
     return false;
 }
 
+static void daemon_remove_subscriber_fd(daemon_state_t *state, int fd);
+
 static uint64_t ipc_pause_subscriber_fd(daemon_state_t *state, int fd)
 {
     if (!state || fd < 0) {
@@ -455,6 +455,12 @@ static uint64_t ipc_pause_subscriber_fd(daemon_state_t *state, int fd)
         }
     }
     if (slot >= 16) {
+        /* Evicting an active pause slot would strand its FD outside the event loop forever;
+         * close and remove the oldest paused subscriber cleanly before reusing slot 0. */
+        if (g_paused_subscribers[0].token != 0 && g_paused_subscribers[0].fd >= 0 &&
+            g_paused_subscribers[0].fd != fd) {
+            daemon_remove_subscriber_fd(state, g_paused_subscribers[0].fd);
+        }
         slot = 0;
     }
     g_paused_subscribers[slot].fd = fd;
@@ -589,28 +595,42 @@ void daemon_broadcast_event(daemon_state_t *state, const char *event_name)
         .payload_size = (uint32_t)len,
     };
 
+    const size_t frame_bytes = sizeof(hdr) + len;
     size_t i = 0;
     while (i < state->num_subscribers) {
         int sfd = state->subscriber_fds[i];
-        bool ok = false;
-        if (sfd >= 0) {
-            struct iovec iov[2] = {
-                {.iov_base = &hdr, .iov_len = sizeof(hdr)},
-                {.iov_base = json_buf, .iov_len = len},
-            };
-            struct msghdr msg;
-            memset(&msg, 0, sizeof(msg));
-            msg.msg_iov = iov;
-            msg.msg_iovlen = 2;
-            ssize_t w = sendmsg(sfd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
-            if (w == (ssize_t)(sizeof(hdr) + len)) {
-                ok = true;
-            }
-        }
-        if (!ok) {
+        if (sfd < 0) {
             daemon_close_subscriber_at(state, i);
-        } else {
+            continue;
+        }
+
+        /* Skip congested subscribers before sendmsg can partially enqueue an skb and
+         * desynchronize stream framing while a client is paused on an async request. */
+        int sndbuf = 0;
+        socklen_t optlen = sizeof(sndbuf);
+        int outq = 0;
+        if (getsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) == 0 && sndbuf > 0 &&
+            ioctl(sfd, TIOCOUTQ, &outq) == 0 && outq > 0 &&
+            (size_t)outq + frame_bytes + 4096u >= (size_t)sndbuf) {
             ++i;
+            continue;
+        }
+
+        struct iovec iov[2] = {
+            {.iov_base = &hdr, .iov_len = sizeof(hdr)},
+            {.iov_base = json_buf, .iov_len = len},
+        };
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = iov;
+        msg.msg_iovlen = 2;
+        ssize_t w = sendmsg(sfd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (w == (ssize_t)frame_bytes) {
+            ++i;
+        } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            ++i;
+        } else {
+            daemon_close_subscriber_at(state, i);
         }
     }
 }
@@ -662,6 +682,51 @@ static bool write_exact(int fd, const void *buf, size_t len)
         total += (size_t)w;
     }
     return true;
+}
+
+static bool ipc_send_response_iov(int fd, const waywal_ipc_hdr_t *hdr, const void *payload,
+                                  size_t payload_len)
+{
+    if (fd < 0 || !hdr) {
+        return false;
+    }
+    if (payload_len == 0 || !payload) {
+        return waywal_ipc_send(fd, hdr, -1);
+    }
+
+    struct iovec iov[2] = {
+        {.iov_base = (void *)hdr, .iov_len = sizeof(*hdr)},
+        {.iov_base = (void *)payload, .iov_len = payload_len},
+    };
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 2;
+
+    const size_t total = sizeof(*hdr) + payload_len;
+    ssize_t w = sendmsg(fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (w == (ssize_t)total) {
+        return true;
+    }
+
+    size_t written = 0;
+    if (w < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR && errno != ENOTSOCK &&
+            errno != EOPNOTSUPP) {
+            return false;
+        }
+    } else {
+        written = (size_t)w;
+    }
+
+    if (written < sizeof(*hdr)) {
+        if (!write_exact(fd, (const uint8_t *)hdr + written, sizeof(*hdr) - written)) {
+            return false;
+        }
+        written = sizeof(*hdr);
+    }
+    const size_t pay_off = written - sizeof(*hdr);
+    return write_exact(fd, (const uint8_t *)payload + pay_off, payload_len - pay_off);
 }
 
 static void ipc_drain_bytes(int fd, size_t n)
@@ -729,87 +794,10 @@ static bool extra_has_wildcard(const char *extra_buf, size_t extra_len, uint32_t
 /* ========================================================================= */
 
 #define IPC_ASYNC_QUEUE_CAP      32u
-#define IPC_ASYNC_COMP_CAP       64u
+#define IPC_ASYNC_COMP_CAP       256u
 #define IPC_ASYNC_WORKERS        2u
 #define IPC_DL_TRACKER_CAP       64u
 #define IPC_WWPKG_MAX_ARCHIVE_SZ (512ULL * 1024ULL * 1024ULL)
-#define IPC_WWPKG_MAX_FILES      4096u
-
-typedef struct {
-    const void *src;
-    size_t size;
-    size_t pos;
-} ipc_zstd_in_buf_t;
-
-typedef struct {
-    void *dst;
-    size_t size;
-    size_t pos;
-} ipc_zstd_out_buf_t;
-
-typedef struct {
-    void *(*createDStream)(void);
-    size_t (*freeDStream)(void *zds);
-    size_t (*initDStream)(void *zds);
-    size_t (*decompressStream)(void *zds, ipc_zstd_out_buf_t *output, ipc_zstd_in_buf_t *input);
-    unsigned (*isError)(size_t code);
-    bool available;
-} ipc_zstd_stream_api_t;
-
-static pthread_once_t g_ipc_zstd_once = PTHREAD_ONCE_INIT;
-static ipc_zstd_stream_api_t g_ipc_zstd_api;
-
-static void ipc_zstd_probe_once(void)
-{
-    memset(&g_ipc_zstd_api, 0, sizeof(g_ipc_zstd_api));
-    void *h = dlopen("libzstd.so.1", RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
-    if (!h) {
-        h = dlopen("libzstd.so", RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
-    }
-    if (!h) {
-        return;
-    }
-    *(void **)(&g_ipc_zstd_api.createDStream) = dlsym(h, "ZSTD_createDStream");
-    *(void **)(&g_ipc_zstd_api.freeDStream) = dlsym(h, "ZSTD_freeDStream");
-    *(void **)(&g_ipc_zstd_api.initDStream) = dlsym(h, "ZSTD_initDStream");
-    *(void **)(&g_ipc_zstd_api.decompressStream) = dlsym(h, "ZSTD_decompressStream");
-    *(void **)(&g_ipc_zstd_api.isError) = dlsym(h, "ZSTD_isError");
-    if (g_ipc_zstd_api.createDStream && g_ipc_zstd_api.freeDStream && g_ipc_zstd_api.initDStream &&
-        g_ipc_zstd_api.decompressStream && g_ipc_zstd_api.isError) {
-        g_ipc_zstd_api.available = true;
-    }
-}
-
-typedef struct {
-    char name[100];
-    char mode[8];
-    char uid[8];
-    char gid[8];
-    char size[12];
-    char mtime[12];
-    char chksum[8];
-    char typeflag;
-    char linkname[100];
-    char magic[6];
-    char version[2];
-    char uname[32];
-    char gname[32];
-    char devmajor[8];
-    char devminor[8];
-    char prefix[155];
-    char pad[12];
-} ipc_ustar_hdr_t;
-static_assert(sizeof(ipc_ustar_hdr_t) == 512, "POSIX ustar header must be 512 bytes");
-
-static uint32_t ipc_ustar_checksum(const ipc_ustar_hdr_t *hdr)
-{
-    const uint8_t *raw = (const uint8_t *)hdr;
-    uint32_t sum = 0;
-    for (size_t i = 0; i < 512; ++i) {
-        sum += (i >= 148 && i < 156) ? (uint32_t)' ' : (uint32_t)raw[i];
-    }
-    return sum;
-}
 
 static bool ipc_resolve_user_home(char *buf, size_t cap)
 {
@@ -913,61 +901,6 @@ static bool ipc_sanitize_rel_path(const char *in_path, char *out_path, size_t ca
     return true;
 }
 
-static int ipc_openat_beneath_write(int root_dfd, const char *clean_rel)
-{
-    if (root_dfd < 0 || !clean_rel || clean_rel[0] == '\0') {
-        return -1;
-    }
-
-    /* Ensure intermediate subdirectories exist strictly without following symlinks */
-    char rel_copy[WWPKG_MAX_PATH_LEN];
-    int n = snprintf(rel_copy, sizeof(rel_copy), "%s", clean_rel);
-    if (n <= 0 || (size_t)n >= sizeof(rel_copy)) {
-        return -1;
-    }
-
-    int cur_dfd = dup(root_dfd);
-    if (cur_dfd < 0) {
-        return -1;
-    }
-    (void)fcntl(cur_dfd, F_SETFD, FD_CLOEXEC);
-
-    char *cursor = rel_copy;
-    char *slash = NULL;
-    while ((slash = strchr(cursor, '/')) != NULL) {
-        *slash = '\0';
-        if (mkdirat(cur_dfd, cursor, 0700) != 0 && errno != EEXIST) {
-            close(cur_dfd);
-            return -1;
-        }
-        int next_dfd = openat(cur_dfd, cursor, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        close(cur_dfd);
-        if (next_dfd < 0) {
-            return -1;
-        }
-        cur_dfd = next_dfd;
-        cursor = slash + 1;
-    }
-
-    int file_fd = -1;
-#if defined(__NR_openat2) && defined(RESOLVE_BENEATH)
-    struct open_how how;
-    memset(&how, 0, sizeof(how));
-    how.flags = O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC;
-    how.mode = 0600;
-    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
-    file_fd = (int)syscall(__NR_openat2, root_dfd, clean_rel, &how, sizeof(how));
-    if (file_fd < 0 && (errno == ENOSYS || errno == EPERM)) {
-        file_fd =
-            openat(cur_dfd, cursor, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
-    }
-#else
-    file_fd = openat(cur_dfd, cursor, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
-#endif
-    close(cur_dfd);
-    return file_fd;
-}
-
 static bool ipc_write_all_fd(int fd, const uint8_t *data, size_t len)
 {
     size_t total = 0;
@@ -985,238 +918,6 @@ static bool ipc_write_all_fd(int fd, const uint8_t *data, size_t len)
         total += (size_t)w;
     }
     return true;
-}
-
-static bool ipc_decompress_wwpkg_stream(const uint8_t *raw_data, size_t raw_len,
-                                        uint8_t **out_tar_buf, size_t *out_tar_len)
-{
-    if (!raw_data || raw_len < 4 || !out_tar_buf || !out_tar_len) {
-        return false;
-    }
-    *out_tar_buf = NULL;
-    *out_tar_len = 0;
-
-    uint32_t magic = (uint32_t)raw_data[0] | ((uint32_t)raw_data[1] << 8) |
-                     ((uint32_t)raw_data[2] << 16) | ((uint32_t)raw_data[3] << 24);
-    bool is_zstd = (magic == 0xFD2FB528u) || ((magic & 0xFFFFFFF0u) == 0x184D2A50u);
-
-    if (!is_zstd) {
-        if (raw_len >= 512 && memcmp(raw_data + 257, "ustar", 5) == 0) {
-            uint8_t *copy = (uint8_t *)malloc(raw_len);
-            if (!copy) {
-                return false;
-            }
-            memcpy(copy, raw_data, raw_len);
-            *out_tar_buf = copy;
-            *out_tar_len = raw_len;
-            return true;
-        }
-        return false;
-    }
-
-    pthread_once(&g_ipc_zstd_once, ipc_zstd_probe_once);
-    if (!g_ipc_zstd_api.available) {
-        return false;
-    }
-
-    void *dstream = g_ipc_zstd_api.createDStream();
-    if (!dstream) {
-        return false;
-    }
-    if (g_ipc_zstd_api.isError(g_ipc_zstd_api.initDStream(dstream))) {
-        g_ipc_zstd_api.freeDStream(dstream);
-        return false;
-    }
-
-    size_t cap = 262144u;
-    uint8_t *buf = (uint8_t *)malloc(cap);
-    if (!buf) {
-        g_ipc_zstd_api.freeDStream(dstream);
-        return false;
-    }
-
-    size_t out_total = 0;
-    ipc_zstd_in_buf_t in_b = {.src = raw_data, .size = raw_len, .pos = 0};
-    uint8_t chunk[65536];
-
-    while (in_b.pos < in_b.size) {
-        ipc_zstd_out_buf_t out_b = {.dst = chunk, .size = sizeof(chunk), .pos = 0};
-        size_t rc = g_ipc_zstd_api.decompressStream(dstream, &out_b, &in_b);
-        if (g_ipc_zstd_api.isError(rc)) {
-            free(buf);
-            g_ipc_zstd_api.freeDStream(dstream);
-            return false;
-        }
-        if (out_b.pos > 0) {
-            if (out_total > IPC_WWPKG_MAX_ARCHIVE_SZ - out_b.pos) {
-                free(buf);
-                g_ipc_zstd_api.freeDStream(dstream);
-                return false;
-            }
-            if (out_total + out_b.pos > cap) {
-                size_t new_cap = cap;
-                while (new_cap < out_total + out_b.pos) {
-                    if (new_cap > IPC_WWPKG_MAX_ARCHIVE_SZ / 2) {
-                        new_cap = IPC_WWPKG_MAX_ARCHIVE_SZ;
-                        break;
-                    }
-                    new_cap *= 2;
-                }
-                uint8_t *nb = (uint8_t *)realloc(buf, new_cap);
-                if (!nb) {
-                    free(buf);
-                    g_ipc_zstd_api.freeDStream(dstream);
-                    return false;
-                }
-                buf = nb;
-                cap = new_cap;
-            }
-            memcpy(buf + out_total, chunk, out_b.pos);
-            out_total += out_b.pos;
-        }
-        /* Re-prime stream state between concatenated Zstd frames */
-        if (rc == 0 && in_b.pos < in_b.size) {
-            if (g_ipc_zstd_api.isError(g_ipc_zstd_api.initDStream(dstream))) {
-                free(buf);
-                g_ipc_zstd_api.freeDStream(dstream);
-                return false;
-            }
-        }
-    }
-
-    g_ipc_zstd_api.freeDStream(dstream);
-    *out_tar_buf = buf;
-    *out_tar_len = out_total;
-    return out_total >= 512;
-}
-
-static bool ipc_extract_verified_wwpkg_fd(int pkg_fd, int dest_dfd)
-{
-    struct stat st;
-    if (pkg_fd < 0 || dest_dfd < 0 || fstat(pkg_fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-        st.st_size <= 0 || (uint64_t)st.st_size > IPC_WWPKG_MAX_ARCHIVE_SZ) {
-        return false;
-    }
-
-    size_t raw_len = (size_t)st.st_size;
-    uint8_t *raw_buf = (uint8_t *)malloc(raw_len);
-    if (!raw_buf) {
-        return false;
-    }
-
-    size_t rd = 0;
-    while (rd < raw_len) {
-        ssize_t r = pread(pkg_fd, raw_buf + rd, raw_len - rd, (off_t)rd);
-        if (r < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            free(raw_buf);
-            return false;
-        }
-        if (r == 0) {
-            break;
-        }
-        rd += (size_t)r;
-    }
-    if (rd != raw_len) {
-        free(raw_buf);
-        return false;
-    }
-
-    uint8_t *tar_buf = NULL;
-    size_t tar_len = 0;
-    bool decomp_ok = ipc_decompress_wwpkg_stream(raw_buf, raw_len, &tar_buf, &tar_len);
-    free(raw_buf);
-    if (!decomp_ok || !tar_buf) {
-        return false;
-    }
-
-    size_t off = 0;
-    size_t files_written = 0;
-    uint64_t total_written = 0;
-    bool ok = true;
-
-    while (tar_len - off >= 512) {
-        const ipc_ustar_hdr_t *hdr = (const ipc_ustar_hdr_t *)(tar_buf + off);
-        bool all_zero = true;
-        for (size_t i = 0; i < 512; ++i) {
-            if (((const uint8_t *)hdr)[i] != 0) {
-                all_zero = false;
-                break;
-            }
-        }
-        if (all_zero) {
-            off += 512;
-            continue;
-        }
-
-        if (memcmp(hdr->magic, "ustar", 5) != 0) {
-            ok = false;
-            break;
-        }
-        char *endp = NULL;
-        unsigned long stored_sum = strtoul(hdr->chksum, &endp, 8);
-        if (ipc_ustar_checksum(hdr) != (uint32_t)stored_sum) {
-            ok = false;
-            break;
-        }
-
-        unsigned long long fsize_ull = strtoull(hdr->size, NULL, 8);
-        if (fsize_ull > (unsigned long long)(tar_len - off - 512)) {
-            ok = false;
-            break;
-        }
-        size_t fsize = (size_t)fsize_ull;
-
-        if (hdr->typeflag != '0' && hdr->typeflag != '\0' && hdr->typeflag != '5') {
-            ok = false;
-            break;
-        }
-        if (hdr->typeflag == '5' && fsize != 0) {
-            ok = false;
-            break;
-        }
-
-        char raw_rel[WWPKG_MAX_PATH_LEN];
-        if (hdr->prefix[0] != '\0') {
-            snprintf(raw_rel, sizeof(raw_rel), "%.155s/%.100s", hdr->prefix, hdr->name);
-        } else {
-            snprintf(raw_rel, sizeof(raw_rel), "%.100s", hdr->name);
-        }
-
-        char clean_rel[WWPKG_MAX_PATH_LEN];
-        if (!ipc_sanitize_rel_path(raw_rel, clean_rel, sizeof(clean_rel))) {
-            ok = false;
-            break;
-        }
-
-        if (hdr->typeflag != '5') {
-            if (++files_written > IPC_WWPKG_MAX_FILES ||
-                total_written + (uint64_t)fsize > IPC_WWPKG_MAX_ARCHIVE_SZ) {
-                ok = false;
-                break;
-            }
-            int out_fd = ipc_openat_beneath_write(dest_dfd, clean_rel);
-            if (out_fd < 0) {
-                ok = false;
-                break;
-            }
-            bool w_ok = ipc_write_all_fd(out_fd, tar_buf + off + 512, fsize);
-            close(out_fd);
-            if (!w_ok) {
-                ok = false;
-                break;
-            }
-            total_written += (uint64_t)fsize;
-        }
-
-        size_t padded = ((fsize + 511u) / 512u) * 512u;
-        off += 512u + padded;
-    }
-
-    free(tar_buf);
-    return ok && files_written > 0;
 }
 
 static uint64_t ipc_sum_regular_files_bytes(const char *dir_path, int depth)
@@ -1328,7 +1029,8 @@ typedef enum {
     IPC_JOB_BG_DOWNLOAD_EVENT = 5,
 } ipc_async_job_kind_t;
 
-typedef struct {
+typedef struct ipc_async_job {
+    struct ipc_async_job *next;
     ipc_async_job_kind_t kind;
     int client_fd;
     int sub_fd;
@@ -1381,10 +1083,9 @@ static struct {
     size_t q_tail;
     size_t q_count;
 
-    ipc_async_job_t *comp[IPC_ASYNC_COMP_CAP];
-    size_t c_head;
-    size_t c_tail;
-    size_t c_count;
+    ipc_async_job_t *done_head;
+    ipc_async_job_t *done_tail;
+    size_t done_count;
 
     pthread_mutex_t dl_mtx;
     pthread_cond_t dl_cv;
@@ -1410,16 +1111,32 @@ static void ipc_async_notify_main_loop(void)
 static bool ipc_async_push_completion(ipc_async_job_t *job)
 {
     pthread_mutex_lock(&g_ipc_async.mtx);
-    if (g_ipc_async.stopping || g_ipc_async.c_count >= IPC_ASYNC_COMP_CAP) {
+    if (g_ipc_async.stopping || g_ipc_async.done_count >= IPC_ASYNC_COMP_CAP) {
         pthread_mutex_unlock(&g_ipc_async.mtx);
         return false;
     }
-    g_ipc_async.comp[g_ipc_async.c_tail] = job;
-    g_ipc_async.c_tail = (g_ipc_async.c_tail + 1) % IPC_ASYNC_COMP_CAP;
-    g_ipc_async.c_count++;
+    job->next = NULL;
+    if (g_ipc_async.done_tail) {
+        g_ipc_async.done_tail->next = job;
+    } else {
+        g_ipc_async.done_head = job;
+    }
+    g_ipc_async.done_tail = job;
+    g_ipc_async.done_count++;
     pthread_mutex_unlock(&g_ipc_async.mtx);
     ipc_async_notify_main_loop();
     return true;
+}
+
+static ipc_async_job_t *ipc_async_steal_all_done(void)
+{
+    pthread_mutex_lock(&g_ipc_async.mtx);
+    ipc_async_job_t *head = g_ipc_async.done_head;
+    g_ipc_async.done_head = NULL;
+    g_ipc_async.done_tail = NULL;
+    g_ipc_async.done_count = 0;
+    pthread_mutex_unlock(&g_ipc_async.mtx);
+    return head;
 }
 
 static int ipc_run_steamcmd_isolated(const char *steamcmd_bin, uint64_t file_id, int cancel_efd)
@@ -2006,12 +1723,50 @@ static void ipc_execute_wwpkg_install(ipc_async_job_t *job)
         return;
     }
 
-    char proc_fd_path[64];
-    snprintf(proc_fd_path, sizeof(proc_fd_path), "/proc/self/fd/%d", job->attached_fd);
-    wwpkg_package_t *pkg = wwpkg_open(proc_fd_path);
-    if (!pkg) {
+    /* Snapshot the SCM_RIGHTS descriptor once into private heap memory and close it immediately
+     * so an unsealed writable memfd cannot mutate payload bytes between verification and writeout.
+     */
+    const size_t raw_sz = (size_t)st.st_size;
+    uint8_t *pkg_bytes = (uint8_t *)malloc(raw_sz);
+    if (!pkg_bytes) {
         close(job->attached_fd);
         job->attached_fd = -1;
+        job->wwpkg_status_code = 3;
+        snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
+                 "Out of memory snapshotting .wwpkg archive");
+        return;
+    }
+
+    size_t rd = 0;
+    bool read_err = false;
+    while (rd < raw_sz) {
+        ssize_t r = pread(job->attached_fd, pkg_bytes + rd, raw_sz - rd, (off_t)rd);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            read_err = true;
+            break;
+        }
+        if (r == 0) {
+            break;
+        }
+        rd += (size_t)r;
+    }
+    close(job->attached_fd);
+    job->attached_fd = -1;
+
+    if (read_err || rd != raw_sz) {
+        free(pkg_bytes);
+        job->wwpkg_status_code = 2;
+        snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
+                 "Short or failed read from .wwpkg file descriptor");
+        return;
+    }
+
+    wwpkg_package_t *pkg = wwpkg_open_memory(pkg_bytes, raw_sz);
+    free(pkg_bytes);
+    if (!pkg) {
         job->wwpkg_status_code = 3;
         snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
                  "Failed to parse .wwpkg container");
@@ -2021,8 +1776,6 @@ static void ipc_execute_wwpkg_install(ipc_async_job_t *job)
     bool is_trusted = false;
     if (!wwpkg_verify_signature(pkg, &is_trusted)) {
         wwpkg_close(pkg);
-        close(job->attached_fd);
-        job->attached_fd = -1;
         job->wwpkg_status_code = 4;
         snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
                  "Cryptographic signature or Merkle verification failed");
@@ -2032,8 +1785,6 @@ static void ipc_execute_wwpkg_install(ipc_async_job_t *job)
     const wwpkg_manifest_t *man = wwpkg_get_manifest(pkg);
     if (!man || man->capabilities.network || man->capabilities.filesystem) {
         wwpkg_close(pkg);
-        close(job->attached_fd);
-        job->attached_fd = -1;
         job->wwpkg_status_code = 4;
         snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
                  "Package manifest rejected by air-gap policy");
@@ -2108,8 +1859,6 @@ static void ipc_execute_wwpkg_install(ipc_async_job_t *job)
 
         if (dest_dfd < 0) {
             wwpkg_close(pkg);
-            close(job->attached_fd);
-            job->attached_fd = -1;
             job->wwpkg_status_code = 5;
             snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
                      "Failed to open destination package directory");
@@ -2120,20 +1869,15 @@ static void ipc_execute_wwpkg_install(ipc_async_job_t *job)
             faccessat(dest_dfd, "manifest.json", F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
             close(dest_dfd);
             wwpkg_close(pkg);
-            close(job->attached_fd);
-            job->attached_fd = -1;
             job->wwpkg_status_code = 6;
             snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
                      "Package already installed without FORCE_OVERWRITE");
             return;
         }
-
-        bool extracted = ipc_extract_verified_wwpkg_fd(job->attached_fd, dest_dfd);
         close(dest_dfd);
-        if (!extracted) {
+
+        if (!wwpkg_extract_all(pkg, pkg_dir)) {
             wwpkg_close(pkg);
-            close(job->attached_fd);
-            job->attached_fd = -1;
             job->wwpkg_status_code = 7;
             snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
                      "Failed to extract verified .wwpkg assets");
@@ -2150,8 +1894,6 @@ static void ipc_execute_wwpkg_install(ipc_async_job_t *job)
     }
 
     wwpkg_close(pkg);
-    close(job->attached_fd);
-    job->attached_fd = -1;
 }
 
 static void ipc_execute_workshop_download(ipc_async_job_t *job)
@@ -2332,8 +2074,7 @@ static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_
                 job->sync_resp.status_code, job->sync_resp.total_libraries_found,
                 job->sync_resp.total_items_indexed, job->sync_resp.total_size_bytes, &rhdr,
                 &resp)) {
-            if (waywal_ipc_send(job->client_fd, &rhdr, -1) &&
-                write_exact(job->client_fd, &resp, sizeof(resp))) {
+            if (ipc_send_response_iov(job->client_fd, &rhdr, &resp, sizeof(resp))) {
                 send_ok = true;
             }
         }
@@ -2357,8 +2098,7 @@ static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_
                 job->scan_resp.total_issues, job->scan_resp.repairs_applied,
                 job->scan_resp.estimated_vram_mb, job->scan_resp.estimated_fps,
                 job->scan_resp.report_json_path, &rhdr, &resp)) {
-            if (waywal_ipc_send(job->client_fd, &rhdr, -1) &&
-                write_exact(job->client_fd, &resp, sizeof(resp))) {
+            if (ipc_send_response_iov(job->client_fd, &rhdr, &resp, sizeof(resp))) {
                 send_ok = true;
             }
         }
@@ -2434,8 +2174,7 @@ static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_
             waywal_ipc_serialize_resp_wwpkg_install(job->wwpkg_resp_uuid, job->wwpkg_status_code,
                                                     job->wwpkg_error_msg, &rhdr, NULL, resp_buf,
                                                     sizeof(resp_buf), &resp_len)) {
-            if (waywal_ipc_send(job->client_fd, &rhdr, -1) &&
-                write_exact(job->client_fd, resp_buf, resp_len)) {
+            if (ipc_send_response_iov(job->client_fd, &rhdr, resp_buf, resp_len)) {
                 send_ok = true;
             }
         }
@@ -2458,8 +2197,7 @@ static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_
                 job->dl_resp.published_file_id, job->dl_resp.task_state, job->dl_resp.progress_pct,
                 job->dl_resp.speed_bytes_per_sec, job->dl_resp.eta_seconds, job->dl_resp.error_msg,
                 &rhdr, &resp)) {
-            if (waywal_ipc_send(job->client_fd, &rhdr, -1) &&
-                write_exact(job->client_fd, &resp, sizeof(resp))) {
+            if (ipc_send_response_iov(job->client_fd, &rhdr, &resp, sizeof(resp))) {
                 send_ok = true;
             }
         }
@@ -2627,22 +2365,13 @@ void daemon_ipc_async_dispatch(struct daemon_state *state)
     while (read(g_ipc_async.efd, &val, sizeof(val)) > 0) {
     }
 
-    while (true) {
-        pthread_mutex_lock(&g_ipc_async.mtx);
-        if (g_ipc_async.c_count == 0) {
-            pthread_mutex_unlock(&g_ipc_async.mtx);
-            break;
-        }
-        ipc_async_job_t *job = g_ipc_async.comp[g_ipc_async.c_head];
-        g_ipc_async.comp[g_ipc_async.c_head] = NULL;
-        g_ipc_async.c_head = (g_ipc_async.c_head + 1) % IPC_ASYNC_COMP_CAP;
-        g_ipc_async.c_count--;
-        pthread_mutex_unlock(&g_ipc_async.mtx);
-
-        if (job) {
-            ipc_async_complete_job_on_main(state, job);
-            free(job);
-        }
+    ipc_async_job_t *job = ipc_async_steal_all_done();
+    while (job) {
+        ipc_async_job_t *next = job->next;
+        job->next = NULL;
+        ipc_async_complete_job_on_main(state, job);
+        free(job);
+        job = next;
     }
 }
 
@@ -2693,18 +2422,20 @@ void daemon_ipc_async_shutdown(struct daemon_state *state)
             g_ipc_async.queue[i] = NULL;
         }
     }
-    for (size_t i = 0; i < IPC_ASYNC_COMP_CAP; ++i) {
-        ipc_async_job_t *j = g_ipc_async.comp[i];
-        if (j) {
-            if (j->attached_fd >= 0) {
-                close(j->attached_fd);
-            }
-            if (j->client_fd >= 0) {
-                close(j->client_fd);
-            }
-            free(j);
-            g_ipc_async.comp[i] = NULL;
+    ipc_async_job_t *done = g_ipc_async.done_head;
+    g_ipc_async.done_head = NULL;
+    g_ipc_async.done_tail = NULL;
+    g_ipc_async.done_count = 0;
+    while (done) {
+        ipc_async_job_t *next = done->next;
+        if (done->attached_fd >= 0) {
+            close(done->attached_fd);
         }
+        if (done->client_fd >= 0) {
+            close(done->client_fd);
+        }
+        free(done);
+        done = next;
     }
     memset(g_paused_subscribers, 0, sizeof(g_paused_subscribers));
 
@@ -2875,10 +2606,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
         resp_hdr.opcode = WAYWAL_RESP_INFO;
         resp_hdr.payload_size = (uint32_t)off;
-        waywal_ipc_send(client_fd, &resp_hdr, -1);
-        if (off > 0) {
-            (void)write_exact(client_fd, query_buf, off);
-        }
+        (void)ipc_send_response_iov(client_fd, &resp_hdr, query_buf, off);
         break;
     }
 
@@ -4401,8 +4129,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             const char *msg = "OK: Shader active\n";
             resp_hdr.opcode = WAYWAL_RESP_OK;
             resp_hdr.payload_size = strlen(msg);
-            waywal_ipc_send(client_fd, &resp_hdr, -1);
-            (void)write_exact(client_fd, msg, strlen(msg));
+            (void)ipc_send_response_iov(client_fd, &resp_hdr, msg, strlen(msg));
             daemon_broadcast_event(state, "wallpaper_changed");
         } else {
             resp_hdr.opcode = WAYWAL_RESP_ERR;
@@ -4518,8 +4245,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             const char *msg = "OK: Workshop active\n";
             resp_hdr.opcode = WAYWAL_RESP_OK;
             resp_hdr.payload_size = strlen(msg);
-            waywal_ipc_send(client_fd, &resp_hdr, -1);
-            (void)write_exact(client_fd, msg, strlen(msg));
+            (void)ipc_send_response_iov(client_fd, &resp_hdr, msg, strlen(msg));
             daemon_broadcast_event(state, "wallpaper_changed");
         } else {
             resp_hdr.opcode = WAYWAL_RESP_ERR;
@@ -4595,8 +4321,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
         resp_hdr.opcode = WAYWAL_RESP_OK;
         resp_hdr.payload_size = (uint32_t)off;
-        waywal_ipc_send(client_fd, &resp_hdr, -1);
-        (void)write_exact(client_fd, stats_buf, off);
+        (void)ipc_send_response_iov(client_fd, &resp_hdr, stats_buf, off);
         break;
     }
 
@@ -4633,8 +4358,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         const char *msg = "OK: State restored\n";
         resp_hdr.opcode = WAYWAL_RESP_OK;
         resp_hdr.payload_size = strlen(msg);
-        waywal_ipc_send(client_fd, &resp_hdr, -1);
-        (void)write_exact(client_fd, msg, strlen(msg));
+        (void)ipc_send_response_iov(client_fd, &resp_hdr, msg, strlen(msg));
         daemon_broadcast_event(state, "state_restored");
         break;
     }
@@ -4647,10 +4371,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         size_t len = daemon_build_status_json(state, NULL, json_buf, sizeof(json_buf));
         resp_hdr.opcode = WAYWAL_RESP_INFO;
         resp_hdr.payload_size = len;
-        waywal_ipc_send(client_fd, &resp_hdr, -1);
-        if (len > 0) {
-            (void)write_exact(client_fd, json_buf, len);
-        }
+        (void)ipc_send_response_iov(client_fd, &resp_hdr, json_buf, len);
         break;
     }
 
@@ -4825,10 +4546,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             size_t len = daemon_build_status_json(state, NULL, json_buf, sizeof(json_buf));
             resp_hdr.opcode = WAYWAL_RESP_INFO;
             resp_hdr.payload_size = len;
-            waywal_ipc_send(client_fd, &resp_hdr, -1);
-            if (len > 0) {
-                (void)write_exact(client_fd, json_buf, len);
-            }
+            (void)ipc_send_response_iov(client_fd, &resp_hdr, json_buf, len);
         } else {
             waywal_telemetry_snapshot_t snap;
             memset(&snap, 0, sizeof(snap));
@@ -4927,8 +4645,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
             resp_hdr.opcode = WAYWAL_RESP_OK;
             resp_hdr.payload_size = sizeof(snap);
-            waywal_ipc_send(client_fd, &resp_hdr, -1);
-            (void)write_exact(client_fd, &snap, sizeof(snap));
+            (void)ipc_send_response_iov(client_fd, &resp_hdr, &snap, sizeof(snap));
         }
         break;
     }
@@ -5134,8 +4851,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         size_t len = daemon_build_status_json(state, "initial", json_buf, sizeof(json_buf));
         resp_hdr.opcode = WAYWAL_RESP_OK;
         resp_hdr.payload_size = (uint32_t)len;
-        if (waywal_ipc_send(client_fd, &resp_hdr, -1) &&
-            (len == 0 || write_exact(client_fd, json_buf, len))) {
+        if (ipc_send_response_iov(client_fd, &resp_hdr, json_buf, len)) {
             int flags = fcntl(client_fd, F_GETFL, 0);
             if (flags >= 0) {
                 (void)fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
@@ -5171,8 +4887,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         if (!valid) {
             waywal_ipc_resp_workshop_sync_t resp;
             if (waywal_ipc_serialize_resp_workshop_sync(1u, 0u, 0u, 0ULL, &resp_hdr, &resp)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, &resp, sizeof(resp));
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, &resp, sizeof(resp));
             }
             break;
         }
@@ -5181,8 +4896,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         if (!job) {
             waywal_ipc_resp_workshop_sync_t resp;
             if (waywal_ipc_serialize_resp_workshop_sync(3u, 0u, 0u, 0ULL, &resp_hdr, &resp)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, &resp, sizeof(resp));
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, &resp, sizeof(resp));
             }
             break;
         }
@@ -5197,8 +4911,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             free(job);
             waywal_ipc_resp_workshop_sync_t resp;
             if (waywal_ipc_serialize_resp_workshop_sync(4u, 0u, 0u, 0ULL, &resp_hdr, &resp)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, &resp, sizeof(resp));
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, &resp, sizeof(resp));
             }
             break;
         }
@@ -5222,8 +4935,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             if (waywal_ipc_serialize_resp_workshop_download(
                     req.published_file_id, 7u, 0.0f, 0.0f, 0u,
                     "Invalid workshop download request payload", &resp_hdr, &resp)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, &resp, sizeof(resp));
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, &resp, sizeof(resp));
             }
             break;
         }
@@ -5233,8 +4945,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             waywal_ipc_resp_workshop_download_t resp;
             if (waywal_ipc_serialize_resp_workshop_download(
                     req.published_file_id, 7u, 0.0f, 0.0f, 0u, "Out of memory", &resp_hdr, &resp)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, &resp, sizeof(resp));
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, &resp, sizeof(resp));
             }
             break;
         }
@@ -5251,8 +4962,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             if (waywal_ipc_serialize_resp_workshop_download(req.published_file_id, 7u, 0.0f, 0.0f,
                                                             0u, "Daemon async worker queue is full",
                                                             &resp_hdr, &resp)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, &resp, sizeof(resp));
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, &resp, sizeof(resp));
             }
             break;
         }
@@ -5289,8 +4999,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             if (waywal_ipc_serialize_resp_wwpkg_install(
                     parsed_req.package_uuid, 1u, "Invalid wwpkg install request payload", &resp_hdr,
                     NULL, err_buf, sizeof(err_buf), &err_len)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, err_buf, err_len);
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, err_buf, err_len);
             }
             break;
         }
@@ -5306,8 +5015,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             if (waywal_ipc_serialize_resp_wwpkg_install(parsed_req.package_uuid, 3u,
                                                         "Out of memory", &resp_hdr, NULL, err_buf,
                                                         sizeof(err_buf), &err_len)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, err_buf, err_len);
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, err_buf, err_len);
             }
             break;
         }
@@ -5332,8 +5040,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             if (waywal_ipc_serialize_resp_wwpkg_install(
                     parsed_req.package_uuid, 4u, "Daemon async worker queue is full", &resp_hdr,
                     NULL, err_buf, sizeof(err_buf), &err_len)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, err_buf, err_len);
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, err_buf, err_len);
             }
             break;
         }
@@ -5357,8 +5064,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             waywal_ipc_resp_scan_compat_t resp;
             if (waywal_ipc_serialize_resp_scan_compat(1u, 0u, 0u, 0u, 0u, 0.0f, 0u, "", &resp_hdr,
                                                       &resp)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, &resp, sizeof(resp));
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, &resp, sizeof(resp));
             }
             break;
         }
@@ -5368,8 +5074,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             waywal_ipc_resp_scan_compat_t resp;
             if (waywal_ipc_serialize_resp_scan_compat(3u, (uint32_t)WE_TIER_4_BLOCKED, 0u, 0u, 0u,
                                                       0.0f, 0u, "", &resp_hdr, &resp)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, &resp, sizeof(resp));
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, &resp, sizeof(resp));
             }
             break;
         }
@@ -5384,8 +5089,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             waywal_ipc_resp_scan_compat_t resp;
             if (waywal_ipc_serialize_resp_scan_compat(4u, (uint32_t)WE_TIER_4_BLOCKED, 0u, 0u, 0u,
                                                       0.0f, 0u, "", &resp_hdr, &resp)) {
-                waywal_ipc_send(client_fd, &resp_hdr, -1);
-                (void)write_exact(client_fd, &resp, sizeof(resp));
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, &resp, sizeof(resp));
             }
             break;
         }

@@ -16,7 +16,9 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/openat2.h>
+#include <locale.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1493,9 +1495,24 @@ static const uint8_t *compat_vfs_read_file(we_compat_vfs_t *vfs, const char *rel
             size_t sz = (size_t)st.st_size;
             uint8_t *buf = (uint8_t *)malloc(sz + 1u);
             if (buf) {
-                ssize_t rd = read(fd, buf, sz);
+                size_t total = 0u;
+                bool io_err = false;
+                while (total < sz) {
+                    ssize_t rd = read(fd, buf + total, sz - total);
+                    if (rd < 0) {
+                        if (errno == EINTR) {
+                            continue;
+                        }
+                        io_err = true;
+                        break;
+                    }
+                    if (rd == 0) {
+                        break;
+                    }
+                    total += (size_t)rd;
+                }
                 close(fd);
-                if (rd == (ssize_t)sz) {
+                if (!io_err && total == sz) {
                     buf[sz] = '\0';
                     if (out_size) {
                         *out_size = sz;
@@ -1566,9 +1583,22 @@ static bool scan_loose_directory_malware(const char *dir_path, we_compat_report_
             int fd = open(subpath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
             if (fd >= 0) {
                 uint8_t hdr[16];
-                ssize_t n = read(fd, hdr, sizeof(hdr));
+                size_t total = 0u;
+                while (total < sizeof(hdr)) {
+                    ssize_t r = read(fd, hdr + total, sizeof(hdr) - total);
+                    if (r < 0) {
+                        if (errno == EINTR) {
+                            continue;
+                        }
+                        break;
+                    }
+                    if (r == 0) {
+                        break;
+                    }
+                    total += (size_t)r;
+                }
                 close(fd);
-                if (n >= 2 && is_executable_binary_payload(hdr, (size_t)n, ent->d_name)) {
+                if (total >= 2u && is_executable_binary_payload(hdr, total, ent->d_name)) {
                     report_add_issue(report, "SECURITY_ALERT_MALICIOUS", WE_ISSUE_SEV_FATAL,
                                      "Malicious executable binary detected (PE/ELF header)",
                                      subpath, 1, "Quarantine package and remove executable");
@@ -1838,8 +1868,23 @@ static void scan_loose_assets_recursive(we_compat_vfs_t *vfs, const char *dir_pa
                     if (sz > 0u && sz <= (64ULL * 1024ULL * 1024ULL)) {
                         uint8_t *buf = (uint8_t *)malloc(sz + 1u);
                         if (buf) {
-                            ssize_t rd = read(fd, buf, sz);
-                            if (rd == (ssize_t)sz) {
+                            size_t total = 0u;
+                            bool io_err = false;
+                            while (total < sz) {
+                                ssize_t rd = read(fd, buf + total, sz - total);
+                                if (rd < 0) {
+                                    if (errno == EINTR) {
+                                        continue;
+                                    }
+                                    io_err = true;
+                                    break;
+                                }
+                                if (rd == 0) {
+                                    break;
+                                }
+                                total += (size_t)rd;
+                            }
+                            if (!io_err && total == sz) {
                                 buf[sz] = '\0';
                                 audit_single_asset(vfs, rel_path, buf, sz, scanner, out_report,
                                                    flags);
@@ -2373,7 +2418,7 @@ static int open_beneath_confined(int root_dfd, const char *rel_path, int flags, 
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
 
     int fd = (int)syscall(SYS_openat2, root_dfd, rel_path, &how, sizeof(how));
-    if (fd < 0 && errno == ENOSYS) {
+    if (fd < 0 && (errno == ENOSYS || errno == EPERM)) {
         int cur_dfd = root_dfd;
         const char *p = rel_path;
         while (*p) {
@@ -2719,6 +2764,9 @@ static char *rewrite_shader_promote_varyings(const char *src, size_t len,
     }
 
     size_t pos = 0;
+    bool prev_was_dot = false;
+    bool pending_struct = false;
+    uint32_t struct_brace_depth = 0u;
     while (pos < len) {
         if (src[pos] == '/' && pos + 1u < len && src[pos + 1u] == '/') {
             size_t start = pos;
@@ -2761,21 +2809,14 @@ static char *rewrite_shader_promote_varyings(const char *src, size_t len,
                 continue;
             }
             if (pos == vars[v].type_off) {
-                const char *swiz = varying_swizzle_suffix(vars[v].width);
+                /* Emit only the promoted vec4 declaration; body tokens are rewritten below so
+                 * struct members sharing the identifier name are never corrupted by a #define. */
                 (void)sb_append(&sb, "vec4 _wwal_v4_");
                 (void)sb_append_n(&sb, vars[v].name, strlen(vars[v].name));
-                (void)sb_append(&sb, ";\n#define ");
-                (void)sb_append(&sb, vars[v].name);
-                if (swiz[0] != '\0') {
-                    (void)sb_append(&sb, " (_wwal_v4_");
-                    (void)sb_append(&sb, vars[v].name);
-                    (void)sb_append(&sb, swiz);
-                    (void)sb_append(&sb, ")");
-                } else {
-                    (void)sb_append(&sb, " _wwal_v4_");
-                    (void)sb_append(&sb, vars[v].name);
-                }
+                (void)sb_append(&sb, ";");
                 pos = vars[v].semi_off + 1u;
+                prev_was_dot = false;
+                pending_struct = false;
                 handled_decl = true;
                 break;
             }
@@ -2795,29 +2836,27 @@ static char *rewrite_shader_promote_varyings(const char *src, size_t len,
                 (void)sb_append(&sb, " = vec4(0.0);");
             }
             pos++;
+            prev_was_dot = false;
+            pending_struct = false;
             continue;
         }
 
         if (isalpha((unsigned char)src[pos]) || src[pos] == '_') {
-            bool prev_member = false;
-            if (pos > 0u) {
-                size_t back = pos;
-                while (back > 0u && isspace((unsigned char)src[back - 1u])) {
-                    back--;
-                }
-                if (back > 0u && src[back - 1u] == '.') {
-                    prev_member = true;
-                }
-            }
-
             size_t tok_start = pos++;
             while (pos < len && (isalnum((unsigned char)src[pos]) || src[pos] == '_')) {
                 pos++;
             }
             size_t tok_len = pos - tok_start;
 
+            if (tok_len == 6u && memcmp(src + tok_start, "struct", 6) == 0) {
+                (void)sb_append_n(&sb, src + tok_start, tok_len);
+                pending_struct = true;
+                prev_was_dot = false;
+                continue;
+            }
+
             int matched = -1;
-            if (!prev_member) {
+            if (!prev_was_dot && !pending_struct && struct_brace_depth == 0u) {
                 for (uint32_t v = 0; v < var_count; v++) {
                     if (promote_mask[v] && strlen(vars[v].name) == tok_len &&
                         memcmp(src + tok_start, vars[v].name, tok_len) == 0) {
@@ -2826,6 +2865,7 @@ static char *rewrite_shader_promote_varyings(const char *src, size_t len,
                     }
                 }
             }
+            prev_was_dot = false;
 
             if (matched >= 0) {
                 size_t peek = pos;
@@ -2843,6 +2883,30 @@ static char *rewrite_shader_promote_varyings(const char *src, size_t len,
                 (void)sb_append_n(&sb, src + tok_start, tok_len);
             }
             continue;
+        }
+
+        if (!isspace((unsigned char)src[pos])) {
+            char ch = src[pos];
+            if (ch == '{') {
+                if (pending_struct || struct_brace_depth > 0u) {
+                    pending_struct = false;
+                    struct_brace_depth++;
+                }
+                prev_was_dot = false;
+            } else if (ch == '}') {
+                if (struct_brace_depth > 0u) {
+                    struct_brace_depth--;
+                }
+                pending_struct = false;
+                prev_was_dot = false;
+            } else if (ch == ';' || ch == '(' || ch == ')') {
+                pending_struct = false;
+                prev_was_dot = false;
+            } else if (ch == '.') {
+                prev_was_dot = true;
+            } else {
+                prev_was_dot = false;
+            }
         }
 
         (void)sb_append_n(&sb, &src[pos], 1u);
@@ -2941,6 +3005,38 @@ static bool repair_promote_varying_confined(int root_dfd, const char *target_rel
     return ok;
 }
 
+static pthread_once_t g_compat_locale_once = PTHREAD_ONCE_INIT;
+static locale_t g_compat_c_locale = (locale_t)0;
+
+static void compat_init_c_locale(void)
+{
+    g_compat_c_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+}
+
+__attribute__((destructor)) static void compat_free_c_locale(void)
+{
+    if (g_compat_c_locale != (locale_t)0) {
+        freelocale(g_compat_c_locale);
+        g_compat_c_locale = (locale_t)0;
+    }
+}
+
+static locale_t compat_push_c_locale(void)
+{
+    pthread_once(&g_compat_locale_once, compat_init_c_locale);
+    if (g_compat_c_locale == (locale_t)0) {
+        return (locale_t)0;
+    }
+    return uselocale(g_compat_c_locale);
+}
+
+static void compat_pop_c_locale(locale_t prev)
+{
+    if (prev != (locale_t)0) {
+        uselocale(prev);
+    }
+}
+
 static void sb_append_indent(compat_sb_t *sb, int depth)
 {
     for (int i = 0; i < depth; i++) {
@@ -2964,7 +3060,9 @@ static void sb_serialize_jval(compat_sb_t *sb, const we_jval_t *v, int depth)
     case JVAL_NUM: {
         char nbuf[64];
         if (isfinite(v->num)) {
+            locale_t prev_loc = compat_push_c_locale();
             snprintf(nbuf, sizeof(nbuf), "%.17g", v->num);
+            compat_pop_c_locale(prev_loc);
         } else {
             snprintf(nbuf, sizeof(nbuf), "0");
         }
@@ -3036,6 +3134,17 @@ static we_jval_t *jval_new_num(double num)
     }
     v->type = JVAL_NUM;
     v->num = num;
+    return v;
+}
+
+static we_jval_t *jval_new_bool(bool bval)
+{
+    we_jval_t *v = (we_jval_t *)calloc(1, sizeof(we_jval_t));
+    if (!v) {
+        return NULL;
+    }
+    v->type = JVAL_BOOL;
+    v->bval = bval;
     return v;
 }
 
@@ -3250,7 +3359,7 @@ static void synthesize_shader_props_in_dir(int root_dfd, const char *rel_prefix,
         how.flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
         how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
         dfd = (int)syscall(SYS_openat2, root_dfd, rel_prefix, &how, sizeof(how));
-        if (dfd < 0 && errno == ENOSYS) {
+        if (dfd < 0 && (errno == ENOSYS || errno == EPERM)) {
             int cur_dfd = root_dfd;
             const char *p = rel_prefix;
             while (*p) {
@@ -3430,7 +3539,23 @@ static bool repair_clamp_particles_confined(int root_dfd, const char *target_rel
         close(fd);
         return false;
     }
-    if (read(fd, code, sz) != (ssize_t)sz) {
+    size_t total = 0u;
+    bool io_err = false;
+    while (total < sz) {
+        ssize_t r = read(fd, code + total, sz - total);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            io_err = true;
+            break;
+        }
+        if (r == 0) {
+            break;
+        }
+        total += (size_t)r;
+    }
+    if (io_err || total != sz) {
         free(code);
         close(fd);
         return false;
@@ -3477,6 +3602,50 @@ static bool repair_clamp_particles_confined(int root_dfd, const char *target_rel
     return ok;
 }
 
+static bool merge_compat_config_confined(int root_dfd, bool want_bc7_fallback,
+                                         bool want_clamp_bones)
+{
+    size_t existing_len = 0u;
+    char *existing_buf = read_confined_file(root_dfd, ".waywal_compat.json", 65536u, &existing_len);
+    we_jval_t *cfg = NULL;
+    if (existing_buf) {
+        cfg = we_json_parse_root(existing_buf, existing_len);
+        free(existing_buf);
+        if (cfg && cfg->type != JVAL_OBJ) {
+            we_jval_free(cfg);
+            cfg = NULL;
+        }
+    }
+    if (!cfg) {
+        cfg = jval_new_obj();
+        if (!cfg) {
+            return false;
+        }
+    }
+
+    if (want_bc7_fallback && !jobj_put_owned(cfg, "bc7_software_fallback", jval_new_bool(true))) {
+        we_jval_free(cfg);
+        return false;
+    }
+    if (want_clamp_bones && !jobj_put_owned(cfg, "clamp_puppet_bones", jval_new_num(128.0))) {
+        we_jval_free(cfg);
+        return false;
+    }
+
+    compat_sb_t sb;
+    sb_init(&sb);
+    sb_serialize_jval(&sb, cfg, 0);
+    (void)sb_append_n(&sb, "\n", 1u);
+    we_jval_free(cfg);
+    if (sb.oom) {
+        free(sb.buf);
+        return false;
+    }
+    bool ok = write_confined_file(root_dfd, ".waywal_compat.json", sb.buf, sb.len, true);
+    free(sb.buf);
+    return ok;
+}
+
 static bool apply_repairs_confined_core(const we_compat_report_t *report, const char *target_dir,
                                         uint32_t *out_applied)
 {
@@ -3494,6 +3663,8 @@ static bool apply_repairs_confined_core(const we_compat_report_t *report, const 
 
     uint32_t applied = 0;
     bool all_ok = true;
+    bool want_bc7_fallback = false;
+    bool want_clamp_bones = false;
 
     for (uint32_t i = 0; i < report->repair_count; i++) {
         const we_auto_repair_t *rep = &report->repairs[i];
@@ -3531,13 +3702,7 @@ static bool apply_repairs_confined_core(const we_compat_report_t *report, const 
                 break;
             }
             close(check_fd);
-
-            static const char fallback_cfg[] = "{\n  \"bc7_software_fallback\": true\n}\n";
-            if (!write_confined_file(root_dfd, ".waywal_compat.json", fallback_cfg,
-                                     sizeof(fallback_cfg) - 1u, true)) {
-                all_ok = false;
-                break;
-            }
+            want_bc7_fallback = true;
             applied++;
         } else if (strcmp(rep->transformation_id, "REPAIR_CLAMP_PARTICLES") == 0) {
             if (!repair_clamp_particles_confined(root_dfd, rep->target_file)) {
@@ -3552,16 +3717,17 @@ static bool apply_repairs_confined_core(const we_compat_report_t *report, const 
                 break;
             }
             close(check_fd);
-            static const char clamp_cfg[] = "{\n  \"clamp_puppet_bones\": 128\n}\n";
-            if (!write_confined_file(root_dfd, ".waywal_compat.json", clamp_cfg,
-                                     sizeof(clamp_cfg) - 1u, true)) {
-                all_ok = false;
-                break;
-            }
+            want_clamp_bones = true;
             applied++;
         } else {
             all_ok = false;
             break;
+        }
+    }
+
+    if (all_ok && (want_bc7_fallback || want_clamp_bones)) {
+        if (!merge_compat_config_confined(root_dfd, want_bc7_fallback, want_clamp_bones)) {
+            all_ok = false;
         }
     }
 
@@ -3637,6 +3803,7 @@ char *we_compat_report_to_json(const we_compat_report_t *report)
 
     (void)sb_append(&sb, ",\n  \"summary\": {\n");
     char sum_buf[1024];
+    locale_t prev_loc = compat_push_c_locale();
     snprintf(sum_buf, sizeof(sum_buf),
              "    \"total_objects\": %u,\n"
              "    \"sprite_layers\": %u,\n"
@@ -3650,6 +3817,7 @@ char *we_compat_report_to_json(const we_compat_report_t *report)
              report->summary.puppet_meshes, report->summary.particle_systems,
              report->summary.sound_layers, report->summary.active_scripts,
              report->summary.estimated_vram_mb, report->summary.estimated_fps);
+    compat_pop_c_locale(prev_loc);
     (void)sb_append(&sb, sum_buf);
 
     (void)sb_append(&sb, ",\n  \"issues\": [\n");

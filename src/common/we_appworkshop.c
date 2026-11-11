@@ -4,6 +4,7 @@
 #endif
 #include "waywal/we_appworkshop.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdatomic.h>
@@ -144,7 +145,7 @@ static waywal_workshop_item_manifest_t *ws_alloc_items(size_t cap, bool zero_ini
             atomic_flag_clear_explicit(&g_ws_item_cache_lock, memory_order_release);
             WS_ASAN_UNPOISON(ptr, actual_cap * sizeof(waywal_workshop_item_manifest_t));
             if (zero_init) {
-                memset(ptr, 0, cap * sizeof(waywal_workshop_item_manifest_t));
+                memset(ptr, 0, actual_cap * sizeof(waywal_workshop_item_manifest_t));
             }
             if (out_actual_cap) {
                 *out_actual_cap = actual_cap;
@@ -218,7 +219,7 @@ static bool ws_table_init(ws_item_table_t *tbl, size_t estimated_items)
         return false;
     }
 
-    tbl->cap = item_cap;
+    tbl->cap = actual_cap;
     tbl->ht_cap = ht_cap;
     tbl->ht_shift = 64u - log2_ht;
     return true;
@@ -804,11 +805,14 @@ ws_parse_installed_slice(const char *src, size_t slice_lo, size_t slice_hi, size
         it->is_installed = true;
 
         uint32_t encoded = tid_tag | (uint32_t)(local_idx + 1u);
+        size_t ht_cap = ht_mask + 1u;
         size_t sl = (size_t)((id * WS_FIB_HASH_MULT) >> ht_shift);
-        for (;;) {
+        size_t steps = 0u;
+        for (; steps < ht_cap; ++steps) {
             uint32_t exp = 0u;
-            if (__atomic_compare_exchange_n(&slots[sl], &exp, encoded, false, __ATOMIC_RELAXED,
-                                            __ATOMIC_RELAXED)) {
+            /* Publish published_file_id before making the slot visible to peer slices. */
+            if (__atomic_compare_exchange_n(&slots[sl], &exp, encoded, false, __ATOMIC_RELEASE,
+                                            __ATOMIC_ACQUIRE)) {
                 break;
             }
             size_t otid = (size_t)(exp >> 24u);
@@ -817,6 +821,9 @@ ws_parse_installed_slice(const char *src, size_t slice_lo, size_t slice_hi, size
                 return out;
             }
             sl = (sl + 1u) & ht_mask;
+        }
+        if (__builtin_expect(steps == ht_cap, 0)) {
+            return out;
         }
 
         uint64_t man_primary = 0u;
@@ -969,9 +976,11 @@ ws_parse_details_slice(const char *src, size_t slice_lo, size_t slice_hi, size_t
                 hint_k = 0u;
             }
         } else {
+            size_t ht_cap = ht_mask + 1u;
             size_t slot = (size_t)((id * WS_FIB_HASH_MULT) >> ht_shift);
-            for (;;) {
-                uint32_t e = slots[slot];
+            size_t steps = 0u;
+            for (; steps < ht_cap; ++steps) {
+                uint32_t e = __atomic_load_n(&slots[slot], __ATOMIC_ACQUIRE);
                 if (__builtin_expect(e == 0u, 0)) {
                     return out;
                 }
@@ -990,11 +999,14 @@ ws_parse_details_slice(const char *src, size_t slice_lo, size_t slice_hi, size_t
                 }
                 slot = (slot + 1u) & ht_mask;
             }
+            if (__builtin_expect(steps == ht_cap, 0)) {
+                return out;
+            }
         }
 
         /* Prevent cross-thread writes if a manifest repeats a published_file_id in details. */
         if (__builtin_expect(
-                __atomic_exchange_n(&claim_base[owner_pos], 1u, __ATOMIC_RELAXED) != 0u, 0)) {
+                __atomic_exchange_n(&claim_base[owner_pos], 1u, __ATOMIC_ACQ_REL) != 0u, 0)) {
             return out;
         }
 
@@ -1267,11 +1279,26 @@ static bool ws_try_parse_parallel(const char *src, size_t sz,
         return false;
     }
     size_t total_sub_cap = per_cap * (size_t)nchunks;
+    if (total_sub_cap > SIZE_MAX / 2u) {
+        return false;
+    }
+
+    size_t est_items = sz / 120u + 64u;
+    size_t min_ht = 64u;
+    if (est_items <= SIZE_MAX / 4u && est_items * 4u > min_ht) {
+        min_ht = est_items * 4u;
+    }
+    /* Keep open-addressing load factor <= 0.5 across the worst-case parallel item capacity. */
+    if (total_sub_cap * 2u > min_ht) {
+        min_ht = total_sub_cap * 2u;
+    }
 
     unsigned log2_ht = 12u;
-    size_t est_items = sz / 120u + 64u;
-    while (((size_t)1u << log2_ht) * 2u < est_items * 5u && log2_ht < 23u) {
+    while (((size_t)1u << log2_ht) < min_ht && log2_ht < 27u) {
         log2_ht++;
+    }
+    if (((size_t)1u << log2_ht) < min_ht) {
+        return false;
     }
     size_t ht_cap = (size_t)1u << log2_ht;
     unsigned ht_shift = 64u - log2_ht;
@@ -1877,15 +1904,28 @@ bool waywal_appworkshop_parse_file(const char *manifest_path,
         if (own_io) {
             WS_ASAN_UNPOISON(g_ws_io_buf, sz + 1u);
             size_t total_rd = 0u;
+            bool io_err = false;
             while (total_rd < sz) {
                 ssize_t n = read(fd, g_ws_io_buf + total_rd, sz - total_rd);
-                if (n <= 0) {
+                if (n < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    io_err = true;
+                    break;
+                }
+                if (n == 0) {
                     break;
                 }
                 total_rd += (size_t)n;
             }
+            if (io_err || total_rd != sz) {
+                WS_ASAN_POISON(g_ws_io_buf, g_ws_io_cap);
+                atomic_flag_clear_explicit(&g_ws_io_lock, memory_order_release);
+                close(fd);
+                return false;
+            }
             g_ws_io_buf[total_rd] = '\0';
-            sz = total_rd;
             data = g_ws_io_buf;
         }
     }
@@ -1902,16 +1942,28 @@ bool waywal_appworkshop_parse_file(const char *manifest_path,
             close(fd);
             return false;
         }
-        size_t total_rd = 0;
+        size_t total_rd = 0u;
+        bool io_err = false;
         while (total_rd < sz) {
             ssize_t n = read(fd, heap_buf + total_rd, sz - total_rd);
-            if (n <= 0) {
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                io_err = true;
+                break;
+            }
+            if (n == 0) {
                 break;
             }
             total_rd += (size_t)n;
         }
+        if (io_err || total_rd != sz) {
+            free(heap_buf);
+            close(fd);
+            return false;
+        }
         heap_buf[total_rd] = '\0';
-        sz = total_rd;
         data = heap_buf;
     }
     close(fd);

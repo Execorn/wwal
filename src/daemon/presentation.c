@@ -3,6 +3,8 @@
 
 #include "waywal/log.h"
 
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -206,9 +208,11 @@ static void feedback_presented(void *data, struct wp_presentation_feedback *feed
     (void)seq_lo;
     presentation_sync_t *ps = (presentation_sync_t *)data;
     if (ps) {
-        int64_t hw_time_ns =
-            (((int64_t)tv_sec_hi << 32) | (int64_t)tv_sec_lo) * 1000000000LL + (int64_t)tv_nsec;
-        presentation_pll_update(&ps->pll, hw_time_ns, refresh_ns, flags);
+        uint64_t sec = ((uint64_t)tv_sec_hi << 32) | (uint64_t)tv_sec_lo;
+        if (tv_nsec < 1000000000U && sec <= (uint64_t)(INT64_MAX / 1000000000LL) - 1ULL) {
+            int64_t hw_time_ns = (int64_t)(sec * 1000000000ULL + (uint64_t)tv_nsec);
+            presentation_pll_update(&ps->pll, hw_time_ns, refresh_ns, flags);
+        }
         ps->pending_feedback = false;
         ps->feedback = NULL;
     }

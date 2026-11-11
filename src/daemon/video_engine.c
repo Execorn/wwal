@@ -40,6 +40,7 @@ static const struct wl_buffer_listener g_video_buffer_listener = {
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
+#include <pthread.h>
 
 #define SWDEC_GBM_RING_SIZE 4
 
@@ -89,10 +90,16 @@ typedef struct {
     int last_src_fmt;
 } ffmpeg_swdec_t;
 
+static pthread_once_t g_swdec_once = PTHREAD_ONCE_INIT;
+static ffmpeg_swdec_t g_swdec_proto;
+static bool g_swdec_proto_ok = false;
+
 static void *dlopen_any(const char *const *names, size_t count)
 {
     for (size_t i = 0; i < count; ++i) {
-        void *h = dlopen(names[i], RTLD_LAZY | RTLD_LOCAL);
+        /* Pin FFmpeg DSOs with RTLD_NODELETE so transitive codec worker threads or TLS
+         * destructors never execute unmapped pages after decoder teardown. */
+        void *h = dlopen(names[i], RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
         if (h) {
             return h;
         }
@@ -100,7 +107,7 @@ static void *dlopen_any(const char *const *names, size_t count)
     return NULL;
 }
 
-static bool swdec_load_symbols(ffmpeg_swdec_t *sw)
+static void swdec_probe_once(void)
 {
     static const char *const avcodec_names[] = {"libavcodec.so.61", "libavcodec.so.60",
                                                 "libavcodec.so.59", "libavcodec.so"};
@@ -109,18 +116,20 @@ static bool swdec_load_symbols(ffmpeg_swdec_t *sw)
     static const char *const swscale_names[] = {"libswscale.so.8", "libswscale.so.7",
                                                 "libswscale.so.6", "libswscale.so"};
 
+    memset(&g_swdec_proto, 0, sizeof(g_swdec_proto));
+    ffmpeg_swdec_t *sw = &g_swdec_proto;
     sw->lib_avutil = dlopen_any(avutil_names, sizeof(avutil_names) / sizeof(avutil_names[0]));
     sw->lib_avcodec = dlopen_any(avcodec_names, sizeof(avcodec_names) / sizeof(avcodec_names[0]));
     sw->lib_swscale = dlopen_any(swscale_names, sizeof(swscale_names) / sizeof(swscale_names[0]));
     if (!sw->lib_avutil || !sw->lib_avcodec || !sw->lib_swscale) {
-        return false;
+        return;
     }
 
 #define RESOLVE_SYM(handle, field, sym)                                                            \
     do {                                                                                           \
         *(void **)(&sw->field) = dlsym(handle, sym);                                               \
         if (!sw->field)                                                                            \
-            return false;                                                                          \
+            return;                                                                                \
     } while (0)
 
     RESOLVE_SYM(sw->lib_avcodec, p_avcodec_find_decoder, "avcodec_find_decoder");
@@ -144,6 +153,16 @@ static bool swdec_load_symbols(ffmpeg_swdec_t *sw)
     RESOLVE_SYM(sw->lib_swscale, p_sws_freeContext, "sws_freeContext");
 
 #undef RESOLVE_SYM
+    g_swdec_proto_ok = true;
+}
+
+static bool swdec_load_symbols(ffmpeg_swdec_t *sw)
+{
+    pthread_once(&g_swdec_once, swdec_probe_once);
+    if (!g_swdec_proto_ok) {
+        return false;
+    }
+    *sw = g_swdec_proto;
     return true;
 }
 
@@ -171,22 +190,9 @@ static void swdec_destroy(video_engine_t *ve)
     if (sw->pkt && sw->p_av_packet_free) {
         sw->p_av_packet_free(&sw->pkt);
     }
-    if (sw->codec_ctx && sw->codec_ctx->extradata) {
-        free(sw->codec_ctx->extradata);
-        sw->codec_ctx->extradata = NULL;
-        sw->codec_ctx->extradata_size = 0;
-    }
+    /* avcodec_free_context frees codec_ctx->extradata via av_freep internally. */
     if (sw->codec_ctx && sw->p_avcodec_free_context) {
         sw->p_avcodec_free_context(&sw->codec_ctx);
-    }
-    if (sw->lib_swscale) {
-        dlclose(sw->lib_swscale);
-    }
-    if (sw->lib_avcodec) {
-        dlclose(sw->lib_avcodec);
-    }
-    if (sw->lib_avutil) {
-        dlclose(sw->lib_avutil);
     }
     free(sw->rgba_buf);
     free(sw);
@@ -590,15 +596,18 @@ static bool video_engine_redraw_output(video_engine_t *ve, output_node_t *out)
             sw->wl_bufs[sw->last_ready_ring_idx]) {
             int r_idx = sw->last_ready_ring_idx;
             configure_output_video_viewport(out, sw->width, sw->height);
+            bool prev_still_pending = out->pres_sync.pending_feedback;
             if (out->pres_sync.wp_pres) {
                 presentation_sync_request(&out->pres_sync);
             }
-            if (out->fifo) {
-                if (out->fifo_barrier_pending) {
+            if (out->fifo && out->pres_sync.wp_pres) {
+                if (out->fifo_barrier_pending && !prev_still_pending) {
                     waywal_fifo_wait_barrier(out->fifo);
                 }
                 waywal_fifo_set_barrier(out->fifo);
                 out->fifo_barrier_pending = true;
+            } else {
+                out->fifo_barrier_pending = false;
             }
             wl_surface_attach(out->surface, sw->wl_bufs[r_idx], 0, 0);
             wl_surface_damage_buffer(out->surface, 0, 0, (int32_t)sw->width, (int32_t)sw->height);
@@ -628,15 +637,18 @@ static bool video_engine_redraw_output(video_engine_t *ve, output_node_t *out)
     }
     if (wl_buf && ve->decoder.width > 0 && ve->decoder.height > 0) {
         configure_output_video_viewport(out, ve->decoder.width, ve->decoder.height);
+        bool prev_still_pending = out->pres_sync.pending_feedback;
         if (out->pres_sync.wp_pres) {
             presentation_sync_request(&out->pres_sync);
         }
-        if (out->fifo) {
-            if (out->fifo_barrier_pending) {
+        if (out->fifo && out->pres_sync.wp_pres) {
+            if (out->fifo_barrier_pending && !prev_still_pending) {
                 waywal_fifo_wait_barrier(out->fifo);
             }
             waywal_fifo_set_barrier(out->fifo);
             out->fifo_barrier_pending = true;
+        } else {
+            out->fifo_barrier_pending = false;
         }
         wl_surface_attach(out->surface, wl_buf, 0, 0);
         wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);

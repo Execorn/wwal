@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <locale.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -763,6 +764,119 @@ static void test_report_json_serialization(we_compat_scanner_t *scanner)
     printf("  -> Report JSON serialization passed.\n");
 }
 
+static void test_struct_field_varying_locale_and_merged_config(we_compat_scanner_t *scanner)
+{
+    printf("[Compat Scanner 10/10] Testing struct-member varying safety, C-locale JSON & merged "
+           "compat config...\n");
+
+    const char *src_dir = "/tmp/test_we_struct_merge_src";
+    const char *dst_dir = "/tmp/test_we_struct_merge_dst";
+    cleanup_dir(src_dir);
+    cleanup_dir(dst_dir);
+    mkdir(src_dir, 0755);
+    mkdir(dst_dir, 0755);
+
+    const char *proj =
+        "{\"title\":\"Struct & Merge\",\"type\":\"scene\",\"file\":\"scene.json\"}\n";
+    const char *scene = "{\"objects\":[{\"name\":\"puppet\",\"puppet\":\"model.mdl\"}]}\n";
+    const char *vert = "#version 310 es\n"
+                       "precision highp float;\n"
+                       "struct Surface { vec2 v_TexCoord; };\n"
+                       "in vec4 a_Pos;\n"
+                       "layout(location = 0) out vec2 v_TexCoord;\n"
+                       "void main() {\n"
+                       "    Surface s;\n"
+                       "    s.v_TexCoord = a_Pos.xy;\n"
+                       "    v_TexCoord = s.v_TexCoord;\n"
+                       "    gl_Position = a_Pos;\n"
+                       "}\n";
+    const char *frag = "#version 310 es\n"
+                       "precision mediump float;\n"
+                       "struct Surface { vec2 v_TexCoord; };\n"
+                       "layout(location = 0) in vec4 v_TexCoord;\n"
+                       "out vec4 fragColor;\n"
+                       "void main() {\n"
+                       "    Surface s;\n"
+                       "    s.v_TexCoord = v_TexCoord.xy;\n"
+                       "    fragColor = vec4(s.v_TexCoord, v_TexCoord.z, 1.0);\n"
+                       "}\n";
+
+    write_bytes_to_path("/tmp/test_we_struct_merge_src/project.json", proj, strlen(proj));
+    write_bytes_to_path("/tmp/test_we_struct_merge_src/scene.json", scene, strlen(scene));
+    write_bytes_to_path("/tmp/test_we_struct_merge_src/item.vert", vert, strlen(vert));
+    write_bytes_to_path("/tmp/test_we_struct_merge_src/item.frag", frag, strlen(frag));
+
+    /* Synthesize a TEX header with BC7 format + >128 bone puppet header so both config flags fire
+     */
+    uint8_t bc7_tex[64] = {'T', 'E', 'X', 'V', '0', '0', '0', '5', 0, 'T', 'E', 'X',
+                           'I', '0', '0', '0', '1', 0,   15,  0,   0, 0,   0,   0,
+                           0,   0,   16,  0,   0,   0,   16,  0,   0, 0};
+    uint8_t dummy_mdl[32] = {'M', 'D', 'L', 'V', '0', '0', '0', '5', 0};
+    write_bytes_to_path("/tmp/test_we_struct_merge_src/albedo.tex", bc7_tex, sizeof(bc7_tex));
+    write_bytes_to_path("/tmp/test_we_struct_merge_src/model.mdl", dummy_mdl, sizeof(dummy_mdl));
+
+    we_compat_report_t *rep = we_compat_report_alloc();
+    we_compat_scanner_t *sw_scanner = we_compat_scanner_create(false, false);
+    assert(we_compat_scan_directory(sw_scanner, src_dir, rep));
+    we_compat_scanner_destroy(sw_scanner);
+
+    /* Inject both config-writing repairs to verify non-clobber merge */
+    if (rep->repair_count + 2u <= WE_SCAN_MAX_REPAIRS) {
+        we_auto_repair_t *r0 = &rep->repairs[rep->repair_count++];
+        snprintf(r0->transformation_id, sizeof(r0->transformation_id),
+                 "REPAIR_BC7_SOFTWARE_FALLBACK");
+        snprintf(r0->target_file, sizeof(r0->target_file), "albedo.tex");
+        snprintf(r0->description, sizeof(r0->description), "Enable BC7 software fallback");
+
+        we_auto_repair_t *r1 = &rep->repairs[rep->repair_count++];
+        snprintf(r1->transformation_id, sizeof(r1->transformation_id), "REPAIR_CLAMP_BONES");
+        snprintf(r1->target_file, sizeof(r1->target_file), "model.mdl");
+        snprintf(r1->description, sizeof(r1->description), "Clamp puppet bones to 128");
+    }
+
+    /* Verify locale-independent '.' decimal serialization even under comma LC_NUMERIC */
+    const char *locales[] = {"de_DE.UTF-8", "fr_FR.UTF-8", "es_ES.UTF-8"};
+    for (size_t i = 0; i < sizeof(locales) / sizeof(locales[0]); ++i) {
+        if (setlocale(LC_NUMERIC, locales[i]) != NULL) {
+            break;
+        }
+    }
+    rep->summary.estimated_vram_mb = 12.75f;
+    char *json_str = we_compat_report_to_json(rep);
+    setlocale(LC_NUMERIC, "C");
+    assert(json_str != NULL);
+    assert(strstr(json_str, "12.75") != NULL);
+    assert(strstr(json_str, "12,75") == NULL);
+    free(json_str);
+
+    assert(we_compat_apply_auto_repairs(rep, src_dir, dst_dir));
+
+    char *rep_vert = read_text_from_path("/tmp/test_we_struct_merge_dst/item.vert");
+    char *rep_frag = read_text_from_path("/tmp/test_we_struct_merge_dst/item.frag");
+    char *compat_cfg = read_text_from_path("/tmp/test_we_struct_merge_dst/.waywal_compat.json");
+
+    /* No #define macro emitted; struct member s.v_TexCoord remains intact and compiles under GLES
+     */
+    assert(strstr(rep_vert, "#define v_TexCoord") == NULL);
+    assert(strstr(rep_vert, "struct Surface { vec2 v_TexCoord; };") != NULL);
+    assert(strstr(rep_vert, "s.v_TexCoord = a_Pos.xy;") != NULL);
+    maybe_verify_gles_shader_link(rep_vert, rep_frag);
+
+    /* Both compat flags must survive in .waywal_compat.json without overwriting one another */
+    assert(strstr(compat_cfg, "\"bc7_software_fallback\": true") != NULL);
+    assert(strstr(compat_cfg, "\"clamp_puppet_bones\": 128") != NULL);
+
+    free(rep_vert);
+    free(rep_frag);
+    free(compat_cfg);
+    we_compat_report_free(rep);
+    cleanup_dir(src_dir);
+    cleanup_dir(dst_dir);
+    (void)scanner;
+
+    printf("  -> Struct-member varying safety, C-locale JSON & merged compat config passed.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -782,11 +896,12 @@ int main(void)
     test_auto_repairs_transformation(scanner);
     test_non_nul_pkg_slices(scanner);
     test_report_json_serialization(scanner);
+    test_struct_field_varying_locale_and_merged_config(scanner);
 
     we_compat_scanner_destroy(scanner);
 
     printf("==========================================================\n");
-    printf("  >>> ALL 9 CAPABILITY SCANNER TESTS PASSED (100%%) <<<    \n");
+    printf("  >>> ALL 10 CAPABILITY SCANNER TESTS PASSED (100%%) <<<   \n");
     printf("==========================================================\n");
 
     return 0;

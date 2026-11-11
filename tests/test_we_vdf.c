@@ -592,6 +592,12 @@ static void test_appworkshop_50k_benchmark(void)
     assert(warm.item_count == item_count);
     waywal_appworkshop_free(&warm);
 
+#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+    const double budget_ms = 100.0;
+#else
+    const double budget_ms = 5.0;
+#endif
+
     double best_ms = 1e9;
     waywal_appworkshop_manifest_t manifest;
     memset(&manifest, 0, sizeof(manifest));
@@ -605,12 +611,12 @@ static void test_appworkshop_50k_benchmark(void)
         if (elapsed_ms < best_ms) {
             best_ms = elapsed_ms;
         }
-        if (run >= 2 && best_ms < 5.0) {
+        if (run >= 2 && best_ms < budget_ms) {
             break;
         }
         if (run < 59) {
             waywal_appworkshop_free(&manifest);
-            if (elapsed_ms >= 5.0) {
+            if (elapsed_ms >= budget_ms) {
                 struct timespec pause_ts = {.tv_sec = 0, .tv_nsec = 4000000L};
                 nanosleep(&pause_ts, NULL);
             }
@@ -625,9 +631,10 @@ static void test_appworkshop_50k_benchmark(void)
            2800000000ULL + (uint64_t)(item_count - 1u) * 7919ULL);
     assert(manifest.items[item_count - 1u].manifest_id == 900000000ULL + (item_count - 1u));
 
-    printf("  -> 50,000-item Fibonacci merge completed in %.3f ms (budget < 5.000 ms).\n", best_ms);
+    printf("  -> 50,000-item Fibonacci merge completed in %.3f ms (budget < %.3f ms).\n", best_ms,
+           budget_ms);
     fflush(stdout);
-    assert(best_ms < 5.0 && "50k appworkshop parse/merge must finish in < 5 ms");
+    assert(best_ms < budget_ms && "50k appworkshop parse/merge exceeded budget");
 
     waywal_appworkshop_free(&manifest);
     unlink(acf_path);
@@ -710,6 +717,100 @@ static void test_appworkshop_large_fallback_edges(void)
     printf("  -> Passed.\n");
 }
 
+static void test_appworkshop_compact_parallel_18k_no_hang(void)
+{
+    printf("[VDF 18/19] Testing 18,000 compact Workshop IDs (>256 KiB parallel probe stress)...\n");
+
+    char dir_tmpl[] = "/dev/shm/wwal_compact18k_XXXXXX";
+    char *dir = mkdtemp(dir_tmpl);
+    if (!dir) {
+        strcpy(dir_tmpl, "/tmp/wwal_compact18k_XXXXXX");
+        dir = mkdtemp(dir_tmpl);
+    }
+    assert(dir != NULL);
+
+    char acf_path[256];
+    snprintf(acf_path, sizeof(acf_path), "%s/appworkshop_431960.acf", dir);
+
+    /* Compact 12-byte entries pack ~18,000 unique IDs into ~432 KiB (>256 KiB parallel threshold)
+     * where byte-density heuristics would underestimate unique IDs by >4x. */
+    const size_t n_items = 18000u;
+    const size_t cap = n_items * 32u + 4096u;
+    char *buf = (char *)malloc(cap);
+    assert(buf != NULL);
+
+    size_t off = (size_t)snprintf(
+        buf, cap, "\"AppWorkshop\"\n{\n\"appid\" \"431960\"\n\"WorkshopItemsInstalled\"\n{\n");
+    for (size_t i = 0; i < n_items; ++i) {
+        off += (size_t)snprintf(buf + off, cap - off, "\"%llu\"{}\n",
+                                (unsigned long long)(1000000ULL + i));
+    }
+    off += (size_t)snprintf(buf + off, cap - off, "}\n\"WorkshopItemDetails\"\n{\n");
+    for (size_t i = 0; i < n_items; ++i) {
+        off += (size_t)snprintf(buf + off, cap - off, "\"%llu\"{}\n",
+                                (unsigned long long)(1000000ULL + i));
+    }
+    off += (size_t)snprintf(buf + off, cap - off, "}\n}\n");
+    assert(off >= 262144u);
+
+    int fd = open(acf_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    assert(fd >= 0);
+    size_t wr = 0;
+    while (wr < off) {
+        ssize_t n = write(fd, buf + wr, off - wr);
+        assert(n > 0);
+        wr += (size_t)n;
+    }
+    close(fd);
+    free(buf);
+
+    waywal_appworkshop_manifest_t man;
+    memset(&man, 0, sizeof(man));
+    assert(waywal_appworkshop_parse_file(acf_path, &man));
+    assert(man.item_count == n_items);
+    assert(man.items[0].published_file_id == 1000000ULL);
+    assert(man.items[n_items - 1u].published_file_id == 1000000ULL + (n_items - 1u));
+    waywal_appworkshop_free(&man);
+
+    unlink(acf_path);
+    rmdir(dir);
+    printf("  -> Passed (%zu compact unique IDs merged without probe hang).\n", n_items);
+}
+
+static void test_vdf_avx2_boundary_spans(void)
+{
+    printf("[VDF 19/19] Testing >64-byte whitespace, comments, and quoted escapes across SIMD "
+           "lanes...\n");
+
+    char vdf[2048];
+    size_t pos = 0;
+    /* >96 bytes of mixed VDF whitespace (\t, \r, \n, \v, \f, space) plus comment */
+    for (int i = 0; i < 18; ++i) {
+        memcpy(vdf + pos, "  \t\v\f\r\n", 7u);
+        pos += 7u;
+    }
+    pos += (size_t)snprintf(
+        vdf + pos, sizeof(vdf) - pos,
+        "// Long comment crossing multiple 32-byte SIMD vector lanes 0123456789abcdef0123456789\n"
+        "\"RootSpanNode\"\n{\n"
+        "    "
+        "\"long_key_0123456789abcdef_0123456789abcdef_0123456789abcdef_0123456789\"    "
+        "\"0123456789012345678901234567890\\\"234567890123456789012345678901\\\\"
+        "456789012345678901234567890123456789\"\n}\n");
+
+    waywal_vdf_doc_t *doc = waywal_vdf_parse(vdf, pos);
+    assert(doc != NULL && doc->root != NULL);
+    assert(strcmp(doc->root->key, "RootSpanNode") == 0);
+    const char *val = waywal_vdf_get_string(
+        doc->root, "long_key_0123456789abcdef_0123456789abcdef_0123456789abcdef_0123456789", NULL);
+    assert(val != NULL);
+    assert(val[31] == '"');
+    assert(val[62] == '\\');
+    assert(strlen(val) == 99u);
+    waywal_vdf_free(doc);
+    printf("  -> Passed.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -733,9 +834,11 @@ int main(void)
     test_vdf_utf16_surrogate_pairs();
     test_appworkshop_50k_benchmark();
     test_appworkshop_large_fallback_edges();
+    test_appworkshop_compact_parallel_18k_no_hang();
+    test_vdf_avx2_boundary_spans();
 
     printf("==========================================================\n");
-    printf("  >>> ALL 17 VDF & MANIFEST TESTS PASSED CLEANLY (100%%) <<<\n");
+    printf("  >>> ALL 19 VDF & MANIFEST TESTS PASSED CLEANLY (100%%) <<<\n");
     printf("==========================================================\n");
 
     return 0;

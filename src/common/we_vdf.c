@@ -7,7 +7,9 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pwd.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,15 +18,22 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define VDF_HAVE_X86_SIMD 1
+#else
+#define VDF_HAVE_X86_SIMD 0
+#endif
+
 #define VDF_SLAB_DEFAULT_BYTES (256u * 1024u)
 #define VDF_ARENA_MAX_BYTES    (512ULL * 1024ULL * 1024ULL)
+#define VDF_MAX_FILE_BYTES     (128ULL * 1024ULL * 1024ULL)
 
 typedef struct vdf_slab {
     struct vdf_slab *next;
     size_t cap;
     size_t used;
-    size_t _pad;
-    uint8_t data[];
+    _Alignas(max_align_t) uint8_t data[];
 } vdf_slab_t;
 
 typedef struct {
@@ -59,7 +68,6 @@ static vdf_slab_t *vdf_slab_create(vdf_arena_ctx_t *ctx, size_t min_cap)
     slab->next = NULL;
     slab->cap = cap;
     slab->used = 0;
-    slab->_pad = 0;
     ctx->total_bytes += cap;
     return slab;
 }
@@ -125,13 +133,77 @@ static void vdf_arena_destroy(vdf_arena_ctx_t *ctx)
     ctx->total_bytes = 0;
 }
 
+#if VDF_HAVE_X86_SIMD
+static int g_vdf_has_avx2 = -1;
+
+static inline bool vdf_cpu_has_avx2(void)
+{
+    int v = __atomic_load_n(&g_vdf_has_avx2, __ATOMIC_RELAXED);
+    if (__builtin_expect(v < 0, 0)) {
+        v = __builtin_cpu_supports("avx2") ? 1 : 0;
+        __atomic_store_n(&g_vdf_has_avx2, v, __ATOMIC_RELAXED);
+    }
+    return v != 0;
+}
+
+__attribute__((target("avx2"))) static size_t vdf_skip_ws_avx2(const char *src, size_t pos,
+                                                               size_t len)
+{
+    const __m256i v_sp = _mm256_set1_epi8(' ');
+    const __m256i v_lo = _mm256_set1_epi8(8);
+    const __m256i v_hi = _mm256_set1_epi8(14);
+    while (pos + 32u <= len) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i *)(const void *)(src + pos));
+        __m256i ctrl_ws =
+            _mm256_and_si256(_mm256_cmpgt_epi8(chunk, v_lo), _mm256_cmpgt_epi8(v_hi, chunk));
+        __m256i ws = _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v_sp), ctrl_ws);
+        uint32_t non_ws = ~(uint32_t)_mm256_movemask_epi8(ws);
+        if (non_ws != 0u) {
+            return pos + (size_t)__builtin_ctz(non_ws);
+        }
+        pos += 32u;
+    }
+    return pos;
+}
+
+__attribute__((target("avx2"))) static size_t vdf_scan_quote_or_esc_avx2(const char *start,
+                                                                         size_t rem)
+{
+    size_t i = 0u;
+    const __m256i v_q = _mm256_set1_epi8('"');
+    const __m256i v_bs = _mm256_set1_epi8('\\');
+    while (i + 32u <= rem) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i *)(const void *)(start + i));
+        __m256i hit =
+            _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v_q), _mm256_cmpeq_epi8(chunk, v_bs));
+        uint32_t m = (uint32_t)_mm256_movemask_epi8(hit);
+        if (m != 0u) {
+            return i + (size_t)__builtin_ctz(m);
+        }
+        i += 32u;
+    }
+    return i;
+}
+#endif
+
 static void skip_whitespace_and_comments(vdf_parser_t *p)
 {
     const char *src = p->src;
     size_t len = p->len;
     size_t pos = p->pos;
+#if VDF_HAVE_X86_SIMD
+    bool use_avx2 = (len - pos >= 32u) && vdf_cpu_has_avx2();
+#endif
 
     while (pos < len) {
+#if VDF_HAVE_X86_SIMD
+        if (use_avx2 && pos + 32u <= len) {
+            pos = vdf_skip_ws_avx2(src, pos, len);
+            if (pos >= len) {
+                break;
+            }
+        }
+#endif
         unsigned char c = (unsigned char)src[pos];
         if (c <= ' ' &&
             (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f')) {
@@ -159,7 +231,18 @@ static void skip_quoted_string(vdf_parser_t *p)
         return;
     }
     p->pos++;
+#if VDF_HAVE_X86_SIMD
+    bool use_avx2 = (p->len - p->pos >= 32u) && vdf_cpu_has_avx2();
+#endif
     while (p->pos < p->len) {
+#if VDF_HAVE_X86_SIMD
+        if (use_avx2 && p->pos + 32u <= p->len) {
+            p->pos += vdf_scan_quote_or_esc_avx2(p->src + p->pos, p->len - p->pos);
+            if (p->pos >= p->len) {
+                break;
+            }
+        }
+#endif
         char c = p->src[p->pos++];
         if (c == '"') {
             break;
@@ -231,8 +314,14 @@ static char *parse_quoted_string(vdf_parser_t *p)
     const char *start = p->src + p->pos;
     size_t rem = p->len - p->pos;
 
-    /* Fast path for common unescaped VDF keys and numeric values */
-    for (size_t i = 0; i < rem; i++) {
+    /* Fast path for common unescaped VDF keys and values */
+    size_t i = 0u;
+#if VDF_HAVE_X86_SIMD
+    if (rem >= 32u && vdf_cpu_has_avx2()) {
+        i = vdf_scan_quote_or_esc_avx2(start, rem);
+    }
+#endif
+    for (; i < rem; i++) {
         char c = start[i];
         if (c == '"') {
             char *dest = (char *)vdf_arena_alloc(p->arena, i + 1u, 1u);
@@ -628,32 +717,50 @@ static char *read_entire_file_local(const char *path, size_t *out_len)
     }
     *out_len = 0;
 
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
         return NULL;
     }
 
-    if (fseek(fp, 0, SEEK_END) != 0) {
-        fclose(fp);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uint64_t)st.st_size > VDF_MAX_FILE_BYTES) {
+        close(fd);
         return NULL;
     }
-    long sz = ftell(fp);
-    if (sz < 0) {
-        fclose(fp);
-        return NULL;
-    }
-    rewind(fp);
 
-    char *buf = (char *)malloc((size_t)sz + 1u);
+    size_t sz = (size_t)st.st_size;
+    char *buf = (char *)malloc(sz + 1u);
     if (!buf) {
-        fclose(fp);
+        close(fd);
         return NULL;
     }
 
-    size_t read_bytes = fread(buf, 1, (size_t)sz, fp);
-    fclose(fp);
-    buf[read_bytes] = '\0';
-    *out_len = read_bytes;
+    size_t total_rd = 0u;
+    bool io_err = false;
+    while (total_rd < sz) {
+        ssize_t n = read(fd, buf + total_rd, sz - total_rd);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            io_err = true;
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        total_rd += (size_t)n;
+    }
+    close(fd);
+
+    if (io_err || total_rd != sz) {
+        free(buf);
+        return NULL;
+    }
+
+    buf[total_rd] = '\0';
+    *out_len = total_rd;
     return buf;
 }
 
@@ -888,13 +995,26 @@ static void parse_workshop_dir_from_toml(const char *toml_path, char *out_dir, s
     }
     out_dir[0] = '\0';
 
-    FILE *fp = fopen(toml_path, "r");
-    if (!fp) {
+    int fd = open(toml_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uint64_t)st.st_size > VDF_MAX_FILE_BYTES) {
+        close(fd);
         return;
     }
 
-    char line[1024];
-    while (fgets(line, sizeof(line), fp)) {
+    FILE *fp = fdopen(fd, "r");
+    if (!fp) {
+        close(fd);
+        return;
+    }
+
+    char *line = NULL;
+    size_t line_cap = 0;
+    while (getline(&line, &line_cap, fp) >= 0) {
         char *p = line;
         while (*p && isspace((unsigned char)*p)) {
             p++;
@@ -928,6 +1048,7 @@ static void parse_workshop_dir_from_toml(const char *toml_path, char *out_dir, s
             }
         }
     }
+    free(line);
     fclose(fp);
 }
 

@@ -638,6 +638,33 @@ static void test_ast_sandbox_infinite_loops(void)
     printf("  -> Infinite loop detection and auto-repair passed.\n");
 }
 
+static void test_vdf_control_byte_non_whitespace_lanes(void)
+{
+    printf(COLOR_CYAN "[VDF Stress 7/7] Control bytes (0x01..0x08, 0x0E..0x1F) across 32-byte SIMD "
+                      "lanes..." COLOR_RESET "\n");
+
+    /* Control bytes outside {' ', \t, \n, \v, \f, \r} must never be silently skipped as spaces */
+    char raw[160];
+    memset(raw, ' ', sizeof(raw));
+    raw[31] = '\x07';
+    raw[32] = '\x1F';
+    memcpy(raw + 40, "\"Root\" { \"k\" \"v\" }", 18u);
+
+    waywal_vdf_doc_t *doc = waywal_vdf_parse(raw, 58u);
+    if (doc && doc->root) {
+        /* Because \x07\x1F precedes "Root", it is tokenized as the unquoted root key rather than
+         * skipped as whitespace. */
+        TEST_ASSERT(strcmp(doc->root->key, "Root") != 0,
+                    "Control bytes 0x07/0x1F must not be skipped as VDF whitespace");
+    } else {
+        TEST_ASSERT(true, "Control bytes rejected cleanly without skipping as whitespace");
+    }
+    if (doc) {
+        waywal_vdf_free(doc);
+    }
+    printf("  -> SIMD control-byte boundary classification passed.\n");
+}
+
 /* =========================================================================
  * Main Entry Point
  * ========================================================================= */
@@ -655,6 +682,7 @@ int main(void)
     test_vdf_bare_tokens_and_whitespace();
     test_vdf_corrupted_libraryfolders();
     test_vdf_memory_bounds();
+    test_vdf_control_byte_non_whitespace_lanes();
 
     /* Part 2: Malware Quarantine Probing */
     test_malware_quarantine_pe_disguised();
