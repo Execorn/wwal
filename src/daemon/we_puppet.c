@@ -4,6 +4,7 @@
 
 #include "waywal/log.h"
 
+#include <EGL/egl.h>
 #include <GLES3/gl31.h>
 #include <ctype.h>
 #include <math.h>
@@ -530,7 +531,14 @@ static void mat4_decompose_trs(const float m[16], float out_pos[3], float out_an
     float sy = sqrtf(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
     float sz = sqrtf(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
 
-    out_scale[0] = sx > 1e-6f ? sx : 1.0f;
+    /* Preserve odd-axis reflection sign so mirrored 2D puppet limbs do not invert orientation. */
+    float det3 = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) +
+                 m[8] * (m[1] * m[6] - m[2] * m[5]);
+    if (det3 < 0.0f) {
+        sx = -sx;
+    }
+
+    out_scale[0] = fabsf(sx) > 1e-6f ? sx : 1.0f;
     out_scale[1] = sy > 1e-6f ? sy : 1.0f;
     out_scale[2] = sz > 1e-6f ? sz : 1.0f;
 
@@ -891,8 +899,15 @@ we_puppet_t *we_puppet_parse_cpu(const uint8_t *data, size_t size)
                     return NULL;
                 }
 
+                bool trans_finite = true;
                 for (int m = 0; m < 16; m++) {
                     b->local_trans[m] = read_f32_le(data + cur + (size_t)m * 4u);
+                    if (!isfinite(b->local_trans[m])) {
+                        trans_finite = false;
+                    }
+                }
+                if (!trans_finite || fabsf(b->local_trans[15]) < 1e-6f) {
+                    mat4_identity(b->local_trans);
                 }
                 cur += 64u;
 
@@ -1122,15 +1137,14 @@ we_puppet_t *we_puppet_parse_cpu(const uint8_t *data, size_t size)
                         }
                         for (uint32_t k = 0; k < kf_count; k++) {
                             we_mdl_keyframe_t *kf = &tr->keyframes[k];
-                            kf->pos[0] = read_f32_le(data + cur + 0u);
-                            kf->pos[1] = read_f32_le(data + cur + 4u);
-                            kf->pos[2] = read_f32_le(data + cur + 8u);
-                            kf->angle[0] = read_f32_le(data + cur + 12u);
-                            kf->angle[1] = read_f32_le(data + cur + 16u);
-                            kf->angle[2] = read_f32_le(data + cur + 20u);
-                            kf->scale[0] = read_f32_le(data + cur + 24u);
-                            kf->scale[1] = read_f32_le(data + cur + 28u);
-                            kf->scale[2] = read_f32_le(data + cur + 32u);
+                            for (int c = 0; c < 3; c++) {
+                                float pv = read_f32_le(data + cur + (size_t)c * 4u);
+                                float av = read_f32_le(data + cur + 12u + (size_t)c * 4u);
+                                float sv = read_f32_le(data + cur + 24u + (size_t)c * 4u);
+                                kf->pos[c] = isfinite(pv) ? pv : 0.0f;
+                                kf->angle[c] = isfinite(av) ? av : 0.0f;
+                                kf->scale[c] = isfinite(sv) ? sv : 1.0f;
+                            }
                             cur += 36u;
                         }
                     }
@@ -1308,9 +1322,9 @@ void we_puppet_eval_skin_matrices(const we_puppet_t *puppet, const we_puppet_lay
     }
 
     float anim_local[WE_MDL_MAX_BONES][16];
-    float world_mats[WE_MDL_MAX_BONES][16];
+    uint32_t bcnt = puppet->bone_count < WE_MDL_MAX_BONES ? puppet->bone_count : WE_MDL_MAX_BONES;
 
-    for (uint32_t k = 0; k < puppet->bone_count; k++) {
+    for (uint32_t k = 0; k < bcnt; k++) {
         const we_mdl_bone_t *bone = &puppet->bones[k];
         float pos[3] = {bone->bind_pos[0], bone->bind_pos[1], bone->bind_pos[2]};
         float angle[3] = {bone->bind_angle[0], bone->bind_angle[1], bone->bind_angle[2]};
@@ -1366,64 +1380,9 @@ void we_puppet_eval_skin_matrices(const we_puppet_t *puppet, const we_puppet_lay
         }
     }
 
-    /* Accumulate physics time if simulation context is active */
-    uint32_t substeps = 0;
-    we_puppet_physics_ctx_t *pctx = puppet->physics_ctx;
-    if (pctx && pctx->initialized && pctx->active_bone_count > 0) {
-        float frame_dt = (pctx->total_sim_time_sec > 0.0)
-                             ? (float)(time_sec - pctx->total_sim_time_sec)
-                             : (1.0f / 60.0f);
-        if (frame_dt <= 0.0f || frame_dt > 0.10f) {
-            frame_dt = 1.0f / 60.0f;
-        }
-        pctx->time_accumulator_sec += frame_dt;
-        substeps = (uint32_t)(pctx->time_accumulator_sec / WE_PHYSICS_SUBSTEP_DT);
-        if (substeps > WE_PHYSICS_MAX_SUBSTEPS) {
-            substeps = WE_PHYSICS_MAX_SUBSTEPS;
-            pctx->time_accumulator_sec = (float)WE_PHYSICS_MAX_SUBSTEPS * WE_PHYSICS_SUBSTEP_DT;
-        }
-    }
-
-    /* Pass 1: Compute animated world matrices down the bone hierarchy with XPBD spring deflection
-     */
-    for (uint32_t k = 0; k < puppet->bone_count; k++) {
-        uint32_t parent = puppet->bones[k].parent;
-        if (parent == 0xFFFFFFFFu || parent >= k) {
-            memcpy(world_mats[k], anim_local[k], sizeof(world_mats[k]));
-        } else {
-            we_mat4_mul(world_mats[parent], anim_local[k], world_mats[k]);
-        }
-
-        if (pctx && (pctx->configs[k].flags & WE_BONE_PHYS_ENABLED)) {
-            float pivot[3] = {world_mats[k][12], world_mats[k][13], world_mats[k][14]};
-            if (substeps > 0) {
-                double sim_t = pctx->total_sim_time_sec;
-                for (uint32_t s = 0; s < substeps; s++) {
-                    we_physics_substep_bone(pctx, k, pivot, world_mats[k], WE_PHYSICS_SUBSTEP_DT,
-                                            sim_t + (double)s * (double)WE_PHYSICS_SUBSTEP_DT);
-                }
-            } else {
-                we_physics_apply_bone_rotation(pctx, k, pivot, world_mats[k]);
-            }
-        }
-    }
-
-    if (pctx && substeps > 0) {
-        pctx->time_accumulator_sec -= (float)substeps * WE_PHYSICS_SUBSTEP_DT;
-        pctx->total_sim_time_sec += (double)substeps * (double)WE_PHYSICS_SUBSTEP_DT;
-
-        float bass = 0.0f;
-        for (int b = 0; b < 8; b++) {
-            bass += pctx->audio_bands[b];
-        }
-        pctx->prev_audio_bass = bass * 0.125f;
-    }
-
-    /* Pass 2: Post-multiply each bone's world matrix by its inverse bind matrix (offset_trans)
-     * in a separate loop so child bones NEVER inherit parent inverse bind matrices. */
-    for (uint32_t k = 0; k < puppet->bone_count; k++) {
-        we_mat4_mul(world_mats[k], puppet->bones[k].offset_trans, out_skin_mats[k]);
-    }
+    uint32_t substeps = we_physics_advance_wall_clock(puppet->physics_ctx, time_sec);
+    we_physics_solve_hierarchy_skin_matrices(
+        puppet->physics_ctx, puppet, (const float (*)[16])anim_local, substeps, out_skin_mats);
 }
 
 void we_puppet_skin_vertices_cpu(const we_puppet_t *puppet, const float (*skin_mats)[16],
@@ -1563,6 +1522,9 @@ bool we_puppet_upload_gl(we_puppet_t *puppet)
     }
     if (puppet->gl_uploaded) {
         return true;
+    }
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        return false;
     }
 
     GLuint vao = 0, vbo_dyn = 0, vbo_skin = 0, ebo = 0;
@@ -1797,7 +1759,7 @@ void we_puppet_destroy(we_puppet_t *puppet)
     if (!puppet) {
         return;
     }
-    if (puppet->gl_uploaded) {
+    if (puppet->gl_uploaded && eglGetCurrentContext() != EGL_NO_CONTEXT) {
         if (puppet->gl_ebo) {
             GLuint b = puppet->gl_ebo;
             glDeleteBuffers(1, &b);

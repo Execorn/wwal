@@ -3,6 +3,7 @@
 
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
+#include "waywal/we_physics.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -13,10 +14,57 @@
 // clang-format on
 #include <ctype.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
+static uint32_t clamp_scene_f32_to_u32(float v, uint32_t min_v, uint32_t max_v)
+{
+    if (!isfinite(v) || v <= (float)min_v) {
+        return min_v;
+    }
+    double dv = (double)v;
+    if (dv >= (double)max_v) {
+        return max_v;
+    }
+    return (uint32_t)dv;
+}
+
+static int32_t safe_scene_f32_to_i32(float v, int32_t def_val)
+{
+    if (!isfinite(v)) {
+        return def_val;
+    }
+    double dv = (double)v;
+    if (dv <= -2147483648.0) {
+        return INT32_MIN;
+    }
+    if (dv >= 2147483647.0) {
+        return INT32_MAX;
+    }
+    return (int32_t)dv;
+}
+
+static GLint safe_scene_round_glint(float v)
+{
+    if (!isfinite(v)) {
+        return 0;
+    }
+    double dv = round((double)v);
+    if (dv <= -2147483648.0) {
+        return INT32_MIN;
+    }
+    if (dv >= 2147483647.0) {
+        return INT32_MAX;
+    }
+    return (GLint)dv;
+}
 
 /* =========================================================================
  * OpenGL ES 3.1 Initialization, Matrix Math & Scene Graph Rendering
@@ -340,6 +388,13 @@ static void cache_pass_uniform_locs(we_material_pass_t *pass)
             glUniform1i(ul->tex_sampler[s], (GLint)s);
         }
     }
+    GLuint ubo_blk = glGetUniformBlockIndex(prog, "SceneLighting");
+    if (ubo_blk == GL_INVALID_INDEX) {
+        ubo_blk = glGetUniformBlockIndex(prog, "LightingBlock");
+    }
+    if (ubo_blk != GL_INVALID_INDEX) {
+        glUniformBlockBinding(prog, ubo_blk, 2u);
+    }
 }
 
 static void ensure_egl_procs(we_scene_t *scene)
@@ -590,6 +645,19 @@ bool we_scene_init_gl(we_scene_t *scene, dmabuf_context_t *dmabuf_ctx)
     glGenFramebuffers(1, &tfbo);
     scene->target_fbo = tfbo;
 
+    GLuint lubo = 0;
+    glGenBuffers(1, &lubo);
+    if (lubo != 0) {
+        glBindBuffer(GL_UNIFORM_BUFFER, lubo);
+        glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)sizeof(we_lighting_uniforms_t),
+                     &scene->lighting, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_UNIFORM_BUFFER, 0);
+    }
+    scene->lighting_ubo = (uint32_t)lubo;
+    memset(scene->current_tex2d, 0xFF, sizeof(scene->current_tex2d));
+    scene->current_active_unit = 0xFFFFFFFFu;
+    scene->current_depth_cull_bits = 0xFFu;
+
     /* Built-in utility textures */
     scene->tex_util_white = create_solid_tex(255, 255, 255, 255);
     scene->tex_util_black = create_solid_tex(0, 0, 0, 255);
@@ -654,8 +722,52 @@ we_scene_t *we_scene_create(dmabuf_context_t *dmabuf_ctx, const char *workshop_d
     return scene;
 }
 
-static void ensure_fbo_pair_depth(uint32_t *inout_fbo, uint32_t *inout_tex, uint32_t *inout_rbo,
-                                  uint32_t *inout_w, uint32_t *inout_h, uint32_t w, uint32_t h)
+static void invalidate_scene_tex_cache(we_scene_t *scene)
+{
+    if (!scene) {
+        return;
+    }
+    memset(scene->current_tex2d, 0xFF, sizeof(scene->current_tex2d));
+    scene->current_active_unit = 0xFFFFFFFFu;
+}
+
+static void bind_tex2d_cached(we_scene_t *scene, uint32_t unit, GLuint tex)
+{
+    if (!scene || unit > WE_MAX_PASS_TEXTURES) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        if (scene) {
+            scene->current_active_unit = unit;
+        }
+        return;
+    }
+    if (scene->current_tex2d[unit] != (uint32_t)tex) {
+        if (scene->current_active_unit != unit) {
+            glActiveTexture(GL_TEXTURE0 + unit);
+            scene->current_active_unit = unit;
+        }
+        glBindTexture(GL_TEXTURE_2D, tex);
+        scene->current_tex2d[unit] = (uint32_t)tex;
+    }
+}
+
+static void blit_fbo_color(we_scene_t *scene, uint32_t src_fbo, uint32_t sw, uint32_t sh,
+                           uint32_t dst_fbo, uint32_t dw, uint32_t dh, GLenum filter)
+{
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_fbo);
+    glBlitFramebuffer(0, 0, (GLint)sw, (GLint)sh, 0, 0, (GLint)dw, (GLint)dh, GL_COLOR_BUFFER_BIT,
+                      filter);
+    /* Reset both READ and DRAW targets so later passes cannot trigger an FBO feedback loop. */
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (scene) {
+        scene->current_fbo = 0;
+    }
+}
+
+static void ensure_fbo_pair_depth(we_scene_t *scene, uint32_t *inout_fbo, uint32_t *inout_tex,
+                                  uint32_t *inout_rbo, uint32_t *inout_w, uint32_t *inout_h,
+                                  uint32_t w, uint32_t h)
 {
     if (*inout_fbo && *inout_tex && (!inout_rbo || *inout_rbo) && *inout_w == w && *inout_h == h) {
         return;
@@ -675,6 +787,8 @@ static void ensure_fbo_pair_depth(uint32_t *inout_fbo, uint32_t *inout_tex, uint
         glDeleteRenderbuffers(1, &r);
         *inout_rbo = 0;
     }
+    invalidate_scene_tex_cache(scene);
+
     GLuint tex = 0, fbo = 0, rbo = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -694,7 +808,13 @@ static void ensure_fbo_pair_depth(uint32_t *inout_fbo, uint32_t *inout_tex, uint
         glBindRenderbuffer(GL_RENDERBUFFER, rbo);
         glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, (GLsizei)w, (GLsizei)h);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbo);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
         *inout_rbo = rbo;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (scene) {
+        scene->current_fbo = 0;
     }
 
     *inout_fbo = fbo;
@@ -703,10 +823,55 @@ static void ensure_fbo_pair_depth(uint32_t *inout_fbo, uint32_t *inout_tex, uint
     *inout_h = h;
 }
 
-static void ensure_fbo_pair(uint32_t *inout_fbo, uint32_t *inout_tex, uint32_t *inout_w,
-                            uint32_t *inout_h, uint32_t w, uint32_t h)
+static void ensure_fbo_pair(we_scene_t *scene, uint32_t *inout_fbo, uint32_t *inout_tex,
+                            uint32_t *inout_w, uint32_t *inout_h, uint32_t w, uint32_t h)
 {
-    ensure_fbo_pair_depth(inout_fbo, inout_tex, NULL, inout_w, inout_h, w, h);
+    ensure_fbo_pair_depth(scene, inout_fbo, inout_tex, NULL, inout_w, inout_h, w, h);
+}
+
+static void sync_scene_depth_rbo(we_scene_t *scene, uint32_t sw, uint32_t sh, bool need_depth)
+{
+    if (!scene || scene->scene_fbo == 0) {
+        return;
+    }
+    if (!need_depth) {
+        if (scene->scene_depth_rbo != 0) {
+            glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+            GLuint r = scene->scene_depth_rbo;
+            glDeleteRenderbuffers(1, &r);
+            scene->scene_depth_rbo = 0;
+            scene->scene_depth_rbo_w = 0;
+            scene->scene_depth_rbo_h = 0;
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            scene->current_fbo = 0;
+        }
+        return;
+    }
+
+    if (scene->scene_depth_rbo != 0 && scene->scene_depth_rbo_w == sw &&
+        scene->scene_depth_rbo_h == sh) {
+        return;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
+    if (scene->scene_depth_rbo != 0) {
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+        GLuint old_rbo = scene->scene_depth_rbo;
+        glDeleteRenderbuffers(1, &old_rbo);
+        scene->scene_depth_rbo = 0;
+    }
+    GLuint rbo = 0;
+    glGenRenderbuffers(1, &rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, (GLsizei)sw, (GLsizei)sh);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    scene->scene_depth_rbo = (uint32_t)rbo;
+    scene->scene_depth_rbo_w = sw;
+    scene->scene_depth_rbo_h = sh;
+    scene->current_fbo = 0;
 }
 
 static we_rt_fbo_t *get_or_create_scene_rt_fbo(we_scene_t *scene, const char *name, uint32_t w,
@@ -717,7 +882,7 @@ static we_rt_fbo_t *get_or_create_scene_rt_fbo(we_scene_t *scene, const char *na
     }
     for (uint32_t i = 0; i < scene->rt_fbo_count; i++) {
         if (strcasecmp(scene->rt_fbos[i].name, name) == 0) {
-            ensure_fbo_pair(&scene->rt_fbos[i].gl_fbo, &scene->rt_fbos[i].gl_tex,
+            ensure_fbo_pair(scene, &scene->rt_fbos[i].gl_fbo, &scene->rt_fbos[i].gl_tex,
                             &scene->rt_fbos[i].width, &scene->rt_fbos[i].height, w, h);
             return &scene->rt_fbos[i];
         }
@@ -729,7 +894,7 @@ static we_rt_fbo_t *get_or_create_scene_rt_fbo(we_scene_t *scene, const char *na
     memset(rt, 0, sizeof(*rt));
     snprintf(rt->name, sizeof(rt->name), "%s", name);
     rt->scale = 1;
-    ensure_fbo_pair(&rt->gl_fbo, &rt->gl_tex, &rt->width, &rt->height, w, h);
+    ensure_fbo_pair(scene, &rt->gl_fbo, &rt->gl_tex, &rt->width, &rt->height, w, h);
     return rt;
 }
 
@@ -795,35 +960,74 @@ static uint32_t resolve_named_rt_tex(we_scene_t *scene, we_effect_t *eff, const 
     return prev_tex;
 }
 
-static void apply_pass_depth_cull_state(const we_material_pass_t *pass, bool is_opaque, bool is_3d)
+static void apply_raw_depth_cull_bits(we_scene_t *scene, uint8_t bits)
 {
-    bool depth_test = pass ? (pass->depthtest_enabled || is_3d) : is_3d;
-    bool depth_write = pass ? (pass->depthwrite_enabled && is_opaque) : is_opaque;
-    bool cull = pass ? pass->cull_enabled : false;
-
-    if (depth_test) {
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LEQUAL);
-    } else {
-        glDisable(GL_DEPTH_TEST);
+    if (scene && scene->current_depth_cull_bits == bits) {
+        return;
     }
+    uint8_t prev = scene ? scene->current_depth_cull_bits : 0xFFu;
+    bool force = (prev == 0xFFu);
 
-    glDepthMask(depth_write ? GL_TRUE : GL_FALSE);
+    bool depth_test = (bits & 0x01u) != 0;
+    bool depth_write = (bits & 0x02u) != 0;
+    bool cull = (bits & 0x04u) != 0;
 
-    if (cull) {
-        glEnable(GL_CULL_FACE);
-        glCullFace(GL_BACK);
-    } else {
-        glDisable(GL_CULL_FACE);
+    if (force || ((prev & 0x01u) != (bits & 0x01u))) {
+        if (depth_test) {
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+        } else {
+            glDisable(GL_DEPTH_TEST);
+        }
+    }
+    if (force || ((prev & 0x02u) != (bits & 0x02u))) {
+        glDepthMask(depth_write ? GL_TRUE : GL_FALSE);
+    }
+    if (force || ((prev & 0x04u) != (bits & 0x04u))) {
+        if (cull) {
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_BACK);
+        } else {
+            glDisable(GL_CULL_FACE);
+        }
+    }
+    if (scene) {
+        scene->current_depth_cull_bits = bits;
     }
 }
 
-static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_effect_t *eff,
-                               we_material_pass_t *pass, const float model[16], const float vp[16],
-                               const float mvp[16], uint32_t prev_tex, uint32_t rt_w, uint32_t rt_h,
-                               uint32_t target_w, uint32_t target_h,
-                               const waywal_shader_frame_params_t *params)
+static void apply_pass_depth_cull_state(we_scene_t *scene, const we_material_pass_t *pass,
+                                        bool is_opaque, bool is_3d)
 {
+    bool has_depth_buf = (!scene || scene->scene_depth_rbo != 0);
+    bool depth_test = has_depth_buf && (pass ? (pass->depthtest_enabled || is_3d) : is_3d);
+    bool depth_write = depth_test && (pass ? (pass->depthwrite_enabled && is_opaque) : is_opaque);
+    bool cull = pass ? pass->cull_enabled : false;
+    uint8_t bits = (depth_test ? 0x01u : 0u) | (depth_write ? 0x02u : 0u) | (cull ? 0x04u : 0u);
+    apply_raw_depth_cull_bits(scene, bits);
+}
+
+static float wrap_glsl_time_sec(double time_sec_d)
+{
+    if (!isfinite(time_sec_d)) {
+        return 0.0f;
+    }
+    double w = fmod(time_sec_d, 86400.0);
+    if (w < 0.0) {
+        w += 86400.0;
+    }
+    return (float)w;
+}
+
+static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_effect_t *eff,
+                               we_material_pass_t *pass, const float model[16],
+                               const float normal_src[16], const float vp[16], const float mvp[16],
+                               uint32_t prev_tex, uint32_t rt_w, uint32_t rt_h, uint32_t target_w,
+                               uint32_t target_h, const waywal_shader_frame_params_t *params)
+{
+    if (!scene || !pass) {
+        return;
+    }
     GLuint prog = pass->gl_prog;
     if (!pass->ulocs.initialized && prog != 0) {
         cache_pass_uniform_locs(pass);
@@ -834,7 +1038,9 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
         scene->current_gl_prog = prog;
     }
 
-    float time_sec = params ? params->time_sec : 0.0f;
+    double raw_time_d = (params && params->time_sec > 0.0f) ? (double)params->time_sec
+                                                            : (scene ? scene->sim_time : 0.0);
+    float time_sec = wrap_glsl_time_sec(raw_time_d);
     float dt_sec =
         (params && params->time_delta_sec > 0.0f) ? params->time_delta_sec : (1.0f / 60.0f);
 
@@ -897,7 +1103,8 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
     }
     if (ul->normal_matrix >= 0) {
         float normal_mat[9];
-        we_camera3d_compute_normal_matrix(model ? model : ident, normal_mat);
+        const float *nsrc = normal_src ? normal_src : (model ? model : ident);
+        we_camera3d_compute_normal_matrix(nsrc, normal_mat);
         glUniformMatrix3fv(ul->normal_matrix, 1, GL_FALSE, normal_mat);
     }
 
@@ -1033,8 +1240,7 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
             glUniform4fv(ul->tex_rotation[s], 1, rot);
         }
 
-        glActiveTexture(GL_TEXTURE0 + s);
-        glBindTexture(GL_TEXTURE_2D, tex_id);
+        bind_tex2d_cached(scene, s, tex_id);
 
         if (ul->tex_sampler[s] >= 0) {
             glUniform1i(ul->tex_sampler[s], (GLint)s);
@@ -1045,11 +1251,15 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
     }
     if (ul->album_art >= 0) {
         GLuint art_tex = scene->tex_album_art ? scene->tex_album_art : scene->tex_util_black;
-        glActiveTexture(GL_TEXTURE0 + WE_MAX_PASS_TEXTURES);
-        glBindTexture(GL_TEXTURE_2D, art_tex);
+        bind_tex2d_cached(scene, WE_MAX_PASS_TEXTURES, art_tex);
         glUniform1i(ul->album_art, (GLint)WE_MAX_PASS_TEXTURES);
     }
-    glActiveTexture(GL_TEXTURE0);
+    if (!scene || scene->current_active_unit != 0u) {
+        glActiveTexture(GL_TEXTURE0);
+        if (scene) {
+            scene->current_active_unit = 0u;
+        }
+    }
 
     /* Apply inline uniform defaults and material constantshadervalues */
     for (uint32_t u = 0; u < pass->prep.meta.uniform_count && u < WE_SHADER_MAX_UNIFORMS; u++) {
@@ -1069,7 +1279,7 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
 
         /* Check if overridden in pass->const_vals by material_key or uniform name */
         float cond_val[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (uint32_t c = 0; c < pass->const_val_count; c++) {
+        for (uint32_t c = 0; c < pass->const_val_count && c < WE_MAX_CONST_VALS; c++) {
             const we_const_val_t *cv = &pass->const_vals[c];
             if ((um->material_key[0] != '\0' && strcasecmp(cv->name, um->material_key) == 0) ||
                 strcasecmp(cv->name, um->name) == 0) {
@@ -1120,22 +1330,22 @@ static void bind_pass_uniforms(we_scene_t *scene, we_scene_object_t *obj, we_eff
             if (strcmp(um->type, "float") == 0 || strcmp(um->type, "half") == 0) {
                 glUniform1f(loc, val[0]);
             } else if (strcmp(um->type, "int") == 0 || strcmp(um->type, "bool") == 0) {
-                glUniform1i(loc, (GLint)lroundf(val[0]));
+                glUniform1i(loc, safe_scene_round_glint(val[0]));
             } else if (strcmp(um->type, "int2") == 0 || strcmp(um->type, "ivec2") == 0 ||
                        strcmp(um->type, "bvec2") == 0) {
-                glUniform2i(loc, (GLint)lroundf(val[0]),
-                            (GLint)lroundf(ncomp >= 2 ? val[1] : val[0]));
+                glUniform2i(loc, safe_scene_round_glint(val[0]),
+                            safe_scene_round_glint(ncomp >= 2 ? val[1] : val[0]));
             } else if (strcmp(um->type, "int3") == 0 || strcmp(um->type, "ivec3") == 0 ||
                        strcmp(um->type, "bvec3") == 0) {
-                glUniform3i(loc, (GLint)lroundf(val[0]),
-                            (GLint)lroundf(ncomp >= 2 ? val[1] : val[0]),
-                            (GLint)lroundf(ncomp >= 3 ? val[2] : val[0]));
+                glUniform3i(loc, safe_scene_round_glint(val[0]),
+                            safe_scene_round_glint(ncomp >= 2 ? val[1] : val[0]),
+                            safe_scene_round_glint(ncomp >= 3 ? val[2] : val[0]));
             } else if (strcmp(um->type, "int4") == 0 || strcmp(um->type, "ivec4") == 0 ||
                        strcmp(um->type, "bvec4") == 0) {
-                glUniform4i(loc, (GLint)lroundf(val[0]),
-                            (GLint)lroundf(ncomp >= 2 ? val[1] : val[0]),
-                            (GLint)lroundf(ncomp >= 3 ? val[2] : val[0]),
-                            (GLint)lroundf(ncomp >= 4 ? val[3] : 1.0f));
+                glUniform4i(loc, safe_scene_round_glint(val[0]),
+                            safe_scene_round_glint(ncomp >= 2 ? val[1] : val[0]),
+                            safe_scene_round_glint(ncomp >= 3 ? val[2] : val[0]),
+                            safe_scene_round_glint(ncomp >= 4 ? val[3] : 1.0f));
             } else if (strcmp(um->type, "vec2") == 0 || strcmp(um->type, "float2") == 0 ||
                        strcmp(um->type, "half2") == 0) {
                 glUniform2f(loc, val[0], ncomp >= 2 ? val[1] : val[0]);
@@ -1508,20 +1718,12 @@ void we_scene_update_text_texture(we_scene_t *scene, we_scene_object_t *obj)
         return;
     }
 
-    uint32_t w = (uint32_t)(obj->size[0] >= 16.0f ? obj->size[0] : 256.0f);
-    uint32_t h = (uint32_t)(obj->size[1] >= 16.0f ? obj->size[1] : 64.0f);
-    if (w < 16u) {
-        w = 16u;
-    }
-    if (w > 2048u) {
-        w = 2048u;
-    }
-    if (h < 16u) {
-        h = 16u;
-    }
-    if (h > 2048u) {
-        h = 2048u;
-    }
+    uint32_t w = (isfinite(obj->size[0]) && obj->size[0] >= 16.0f)
+                     ? clamp_scene_f32_to_u32(obj->size[0], 16u, 2048u)
+                     : 256u;
+    uint32_t h = (isfinite(obj->size[1]) && obj->size[1] >= 16.0f)
+                     ? clamp_scene_f32_to_u32(obj->size[1], 16u, 2048u)
+                     : 64u;
 
     we_tex_t *tex = obj->base_pass.textures[0];
     if (!tex) {
@@ -2011,12 +2213,14 @@ static void step_object_scripts(we_scene_t *scene, we_scene_object_t *obj, uint3
                     break;
                 case WE_SCRIPT_PROP_TEXT:
                     break;
-                case WE_SCRIPT_PROP_POINTSIZE:
-                    if ((int32_t)out_val[0] != obj->text_pointsize && out_val[0] >= 4.0f) {
-                        obj->text_pointsize = (int32_t)out_val[0];
+                case WE_SCRIPT_PROP_POINTSIZE: {
+                    int32_t new_ps = safe_scene_f32_to_i32(out_val[0], 0);
+                    if (new_ps >= 4 && new_ps <= 512 && new_ps != obj->text_pointsize) {
+                        obj->text_pointsize = new_ps;
                         obj->text_dirty = true;
                     }
                     break;
+                }
                 case WE_SCRIPT_PROP_VOLUME:
                     obj->sound_volume = fminf(fmaxf(out_val[0], 0.0f), 2.0f);
                     break;
@@ -2072,6 +2276,178 @@ static bool scene_references_layer_composite(const we_scene_t *scene, int32_t ob
     return false;
 }
 
+static bool extract_frustum_planes(const float vp[16], float planes[6][4])
+{
+    /* Gribb-Hartmann clip-plane extraction from column-major ViewProjection matrix. */
+    const float r0[4] = {vp[0], vp[4], vp[8], vp[12]};
+    const float r1[4] = {vp[1], vp[5], vp[9], vp[13]};
+    const float r2[4] = {vp[2], vp[6], vp[10], vp[14]};
+    const float r3[4] = {vp[3], vp[7], vp[11], vp[15]};
+
+    for (int j = 0; j < 4; j++) {
+        planes[0][j] = r3[j] + r0[j];
+        planes[1][j] = r3[j] - r0[j];
+        planes[2][j] = r3[j] + r1[j];
+        planes[3][j] = r3[j] - r1[j];
+        planes[4][j] = r3[j] + r2[j];
+        planes[5][j] = r3[j] - r2[j];
+    }
+
+    for (int p = 0; p < 6; p++) {
+        float nx = planes[p][0], ny = planes[p][1], nz = planes[p][2], d = planes[p][3];
+        if (!isfinite(nx) || !isfinite(ny) || !isfinite(nz) || !isfinite(d)) {
+            return false;
+        }
+        float len = sqrtf(nx * nx + ny * ny + nz * nz);
+        if (!isfinite(len) || len <= 1e-8f) {
+            return false;
+        }
+        float inv = 1.0f / len;
+        planes[p][0] *= inv;
+        planes[p][1] *= inv;
+        planes[p][2] *= inv;
+        planes[p][3] *= inv;
+    }
+    return true;
+}
+
+static bool object_outside_frustum(const we_scene_object_t *obj, const float world_node[16],
+                                   const float planes[6][4])
+{
+    float lc[3] = {0.0f, 0.0f, 0.0f};
+    float le[3] = {0.0f, 0.0f, 1.0f};
+
+    if (obj->puppet) {
+        const we_puppet_t *pup = obj->puppet;
+        float bmin[3] = {pup->min_pos[0], pup->min_pos[1], pup->min_pos[2]};
+        float bmax[3] = {pup->max_pos[0], pup->max_pos[1], pup->max_pos[2]};
+        if (!isfinite(bmin[0]) || !isfinite(bmax[0]) || bmax[0] < bmin[0]) {
+            bmin[0] = -fabsf(obj->size[0]) * 0.5f;
+            bmax[0] = fabsf(obj->size[0]) * 0.5f;
+            bmin[1] = -fabsf(obj->size[1]) * 0.5f;
+            bmax[1] = fabsf(obj->size[1]) * 0.5f;
+            bmin[2] = -16.0f;
+            bmax[2] = 16.0f;
+        }
+        float hx = fabsf(obj->size[0]) * 0.5f;
+        float hy = fabsf(obj->size[1]) * 0.5f;
+        if (-hx < bmin[0]) {
+            bmin[0] = -hx;
+        }
+        if (hx > bmax[0]) {
+            bmax[0] = hx;
+        }
+        if (-hy < bmin[1]) {
+            bmin[1] = -hy;
+        }
+        if (hy > bmax[1]) {
+            bmax[1] = hy;
+        }
+        float phys_reach = 64.0f;
+        if (pup->physics_ctx && pup->physics_ctx->active_bone_count > 0) {
+            uint32_t nb = pup->bone_count <= WE_MDL_MAX_BONES ? pup->bone_count : WE_MDL_MAX_BONES;
+            for (uint32_t k = 0; k < nb; k++) {
+                if ((pup->physics_ctx->configs[k].flags & WE_BONE_PHYS_ENABLED) != 0u &&
+                    isfinite(pup->physics_ctx->configs[k].rest_length_px) &&
+                    pup->physics_ctx->configs[k].rest_length_px > 0.0f) {
+                    phys_reach += pup->physics_ctx->configs[k].rest_length_px;
+                }
+            }
+        }
+        float anim_margin = fmaxf(fmaxf(hx, hy) * 0.5f, phys_reach);
+        for (int c = 0; c < 3; c++) {
+            lc[c] = 0.5f * (bmin[c] + bmax[c]);
+            le[c] = 0.5f * (bmax[c] - bmin[c]) + anim_margin;
+        }
+    } else {
+        if (obj->size[0] <= 0.0f && obj->size[1] <= 0.0f) {
+            return false;
+        }
+        le[0] = fabsf(obj->size[0]) * 0.5f + 2.0f;
+        le[1] = fabsf(obj->size[1]) * 0.5f + 2.0f;
+        le[2] = 2.0f;
+    }
+
+    float wc[3] = {
+        world_node[0] * lc[0] + world_node[4] * lc[1] + world_node[8] * lc[2] + world_node[12],
+        world_node[1] * lc[0] + world_node[5] * lc[1] + world_node[9] * lc[2] + world_node[13],
+        world_node[2] * lc[0] + world_node[6] * lc[1] + world_node[10] * lc[2] + world_node[14],
+    };
+    if (!isfinite(wc[0]) || !isfinite(wc[1]) || !isfinite(wc[2])) {
+        return false;
+    }
+
+    float a0[3] = {world_node[0] * le[0], world_node[1] * le[0], world_node[2] * le[0]};
+    float a1[3] = {world_node[4] * le[1], world_node[5] * le[1], world_node[6] * le[1]};
+    float a2[3] = {world_node[8] * le[2], world_node[9] * le[2], world_node[10] * le[2]};
+
+    for (int p = 0; p < 6; p++) {
+        float nx = planes[p][0], ny = planes[p][1], nz = planes[p][2], d = planes[p][3];
+        float r = fabsf(nx * a0[0] + ny * a0[1] + nz * a0[2]) +
+                  fabsf(nx * a1[0] + ny * a1[1] + nz * a1[2]) +
+                  fabsf(nx * a2[0] + ny * a2[1] + nz * a2[2]);
+        float s = nx * wc[0] + ny * wc[1] + nz * wc[2] + d;
+        if (s + r < 0.0f) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void map_pointer_to_puppet_local(const float ptr_norm[2], uint32_t sw, uint32_t sh,
+                                        const float inv_world[16], bool has_inv,
+                                        const float world_node[16], float *out_lx, float *out_ly)
+{
+    float wx = ptr_norm[0] * (float)sw;
+    float wy = (1.0f - ptr_norm[1]) * (float)sh;
+    float wz = world_node[14];
+    if (has_inv) {
+        *out_lx = inv_world[0] * wx + inv_world[4] * wy + inv_world[8] * wz + inv_world[12];
+        *out_ly = inv_world[1] * wx + inv_world[5] * wy + inv_world[9] * wz + inv_world[13];
+    } else {
+        *out_lx = wx - world_node[12];
+        *out_ly = wy - world_node[13];
+    }
+}
+
+static void sync_puppet_physics_inputs(const we_scene_t *scene, we_scene_object_t *obj,
+                                       const float world_node[16], uint32_t sw, uint32_t sh,
+                                       const float cur_ptr[2], bool had_prev_pointer, float dt_sec,
+                                       const waywal_shader_frame_params_t *params)
+{
+    if (!obj || !obj->puppet || !obj->puppet->physics_ctx) {
+        return;
+    }
+    we_puppet_physics_ctx_t *pctx = obj->puppet->physics_ctx;
+
+    float inv_world[16];
+    bool has_inv = we_mat4_inverse(world_node, inv_world);
+    float cur_lx = 0.0f, cur_ly = 0.0f;
+    map_pointer_to_puppet_local(cur_ptr, sw, sh, inv_world, has_inv, world_node, &cur_lx, &cur_ly);
+
+    float vx = 0.0f, vy = 0.0f;
+    if (had_prev_pointer && dt_sec > 1e-5f) {
+        float prev_lx = 0.0f, prev_ly = 0.0f;
+        map_pointer_to_puppet_local(scene->last_pointer, sw, sh, inv_world, has_inv, world_node,
+                                    &prev_lx, &prev_ly);
+        vx = (cur_lx - prev_lx) / dt_sec;
+        vy = (cur_ly - prev_ly) / dt_sec;
+    }
+    we_physics_set_cursor(pctx, cur_lx, cur_ly, vx, vy);
+
+    if (params && params->audio) {
+        float bands64[64];
+        for (int i = 0; i < 64; i++) {
+            int src = (i * (int)WAYWAL_AUDIO_BARK_BANDS) / 64;
+            bands64[i] = params->audio->bands[src];
+        }
+        we_physics_set_audio_bands(pctx, bands64);
+    } else {
+        static const float k_zero_bands[64] = {0};
+        we_physics_set_audio_bands(pctx, k_zero_bands);
+    }
+}
+
 static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t target_h,
                                 const waywal_shader_frame_params_t *params)
 {
@@ -2080,8 +2456,12 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
         scene->frame_counter = 1;
     }
 
-    uint32_t sw = (uint32_t)(scene->ortho_width > 1.0f ? scene->ortho_width : (float)target_w);
-    uint32_t sh = (uint32_t)(scene->ortho_height > 1.0f ? scene->ortho_height : (float)target_h);
+    uint32_t sw = (isfinite(scene->ortho_width) && scene->ortho_width > 1.0f)
+                      ? clamp_scene_f32_to_u32(scene->ortho_width, 1u, 16384u)
+                      : target_w;
+    uint32_t sh = (isfinite(scene->ortho_height) && scene->ortho_height > 1.0f)
+                      ? clamp_scene_f32_to_u32(scene->ortho_height, 1u, 16384u)
+                      : target_h;
     if (sw == 0) {
         sw = target_w > 0 ? target_w : 1920;
     }
@@ -2093,10 +2473,13 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
 
     float dt_sec =
         (params && params->time_delta_sec > 0.0f) ? params->time_delta_sec : (1.0f / 60.0f);
+    bool had_prev_pointer = scene->first_frame_done;
     if (scene->first_frame_done) {
-        scene->sim_time += dt_sec;
+        scene->sim_time += (double)dt_sec;
     }
-    float time_sec = (params && params->time_sec > 0.0f) ? params->time_sec : scene->sim_time;
+    double time_sec_d =
+        (params && params->time_sec > 0.0f) ? (double)params->time_sec : scene->sim_time;
+    float time_sec = wrap_glsl_time_sec(time_sec_d);
 
     float cur_ptr[2] = {0.5f, 0.5f};
     if (params && norm_w > 0 && norm_h > 0 &&
@@ -2104,14 +2487,20 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
         cur_ptr[0] = params->mouse[0] / (float)norm_w;
         cur_ptr[1] = params->mouse[1] / (float)norm_h;
     }
-    bool cursor_moved =
-        scene->first_frame_done && (fabsf(cur_ptr[0] - scene->last_pointer[0]) > 1e-5f ||
-                                    fabsf(cur_ptr[1] - scene->last_pointer[1]) > 1e-5f);
+    bool cursor_moved = had_prev_pointer && (fabsf(cur_ptr[0] - scene->last_pointer[0]) > 1e-5f ||
+                                             fabsf(cur_ptr[1] - scene->last_pointer[1]) > 1e-5f);
     scene->first_frame_done = true;
 
-    ensure_fbo_pair_depth(&scene->scene_fbo, &scene->scene_fbo_tex, &scene->scene_depth_rbo,
-                          &scene->scene_fbo_w, &scene->scene_fbo_h, sw, sh);
+    bool is_3d = scene->is_3d || scene->camera.projection_mode == WE_PROJ_PERSPECTIVE_3D ||
+                 scene->camera.projection_mode == WE_PROJ_DEPTH_PARALLAX_25D;
+    bool need_depth = is_3d || scene->has_depth_pass;
 
+    ensure_fbo_pair(scene, &scene->scene_fbo, &scene->scene_fbo_tex, &scene->scene_fbo_w,
+                    &scene->scene_fbo_h, sw, sh);
+    sync_scene_depth_rbo(scene, sw, sh, need_depth);
+
+    invalidate_scene_tex_cache(scene);
+    scene->current_depth_cull_bits = 0xFFu;
     glBindFramebuffer(GL_FRAMEBUFFER, scene->scene_fbo);
     scene->current_fbo = scene->scene_fbo;
     glViewport(0, 0, (GLsizei)sw, (GLsizei)sh);
@@ -2119,13 +2508,16 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
     scene->current_vp_h = sh;
     scene->current_gl_blend_mode = -1;
     scene->current_gl_prog = 0;
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_STENCIL_TEST);
-    glDepthMask(GL_TRUE);
-    glClearDepthf(1.0f);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    if (scene->scene_depth_rbo != 0) {
+        apply_raw_depth_cull_bits(scene, 0x02u);
+        glClearDepthf(1.0f);
+    } else {
+        apply_raw_depth_cull_bits(scene, 0x00u);
+    }
 
     GLbitfield clear_mask = 0;
     if (scene->clear_enabled) {
@@ -2139,7 +2531,6 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
         glClear(clear_mask);
     }
 
-    /* Compute camera parallax & shake offsets normalized by target_w/target_h */
     float pdx = 0.0f, pdy = 0.0f;
     if (scene->camera_parallax && params && norm_w > 0 && norm_h > 0) {
         float mx = (params->mouse[0] / (float)norm_w) * 2.0f - 1.0f;
@@ -2157,16 +2548,15 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
 
     float shake_x = 0.0f, shake_y = 0.0f;
     if (scene->camera_shake && params) {
-        float t = time_sec * scene->camera_shake_speed;
+        float t = wrap_glsl_time_sec(time_sec_d * (double)scene->camera_shake_speed);
         shake_x = sinf(t * 1.7f) * scene->camera_shake_amp * 4.0f;
         shake_y = cosf(t * 2.3f) * scene->camera_shake_amp * 4.0f;
     }
 
     float vp[16];
-    bool is_3d = scene->is_3d || scene->camera.projection_mode == WE_PROJ_PERSPECTIVE_3D;
     if (is_3d) {
         float aspect = (sh > 0) ? ((float)sw / (float)sh) : (16.0f / 9.0f);
-        we_camera3d_update(&scene->camera, (double)time_sec, cur_ptr[0], cur_ptr[1], aspect);
+        we_camera3d_update(&scene->camera, time_sec_d, cur_ptr[0], cur_ptr[1], aspect);
         memcpy(vp, scene->camera.view_proj_matrix, sizeof(vp));
         scene->camera_eye[0] = scene->camera.eye_pos[0];
         scene->camera_eye[1] = scene->camera.eye_pos[1];
@@ -2175,68 +2565,90 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
         mat4_ortho_topdown((float)sw, (float)sh, shake_x, shake_y, vp);
     }
 
-    /* Pack active dynamic lights (up to WE_MAX_SCENE_LIGHTS = 8) into std140 UBO */
-    we_scene_light_t active_lights[WE_MAX_SCENE_LIGHTS];
-    uint32_t active_light_count = 0;
-    for (uint32_t i = 0; i < scene->object_count && active_light_count < WE_MAX_SCENE_LIGHTS; i++) {
-        const we_scene_object_t *obj = &scene->objects[i];
-        if (!obj->visible || !obj->is_light_object) {
-            continue;
-        }
-        we_scene_light_t *l = &active_lights[active_light_count++];
-        memset(l, 0, sizeof(*l));
-        l->light_type = obj->light_type > 0 ? obj->light_type : WE_LIGHT_POINT;
-        l->color_rgb[0] = obj->color[0];
-        l->color_rgb[1] = obj->color[1];
-        l->color_rgb[2] = obj->color[2];
-        l->intensity = obj->light_intensity > 0.0f ? obj->light_intensity : 1.0f;
-        l->attenuation_radius = obj->light_radius > 0.0f ? obj->light_radius : 1000.0f;
-        l->spot_inner_cos =
-            cosf(obj->light_inner_cone_angle > 0.0f ? obj->light_inner_cone_angle
-                                                    : (obj->light_cone_angle * 0.5f));
-        l->spot_outer_cos = cosf(obj->light_cone_angle);
-        l->tube_length = obj->light_tube_length;
-        l->specular_power = obj->light_specular_power > 0.0f ? obj->light_specular_power : 32.0f;
+    float frustum_planes[6][4];
+    bool frustum_valid = is_3d && extract_frustum_planes(vp, frustum_planes);
 
-        float world_node[16];
-        compute_object_node_world_matrix(scene, obj, pdx, pdy, world_node);
-        if (l->light_type == WE_LIGHT_DIRECTIONAL) {
-            float dx = obj->light_direction[0];
-            float dy = obj->light_direction[1];
-            float dz = obj->light_direction[2];
-            float len = sqrtf(dx * dx + dy * dy + dz * dz);
-            if (len > 1e-4f) {
-                l->position_or_dir[0] = dx / len;
-                l->position_or_dir[1] = dy / len;
-                l->position_or_dir[2] = dz / len;
-            } else {
-                l->position_or_dir[0] = 0.0f;
-                l->position_or_dir[1] = 0.0f;
-                l->position_or_dir[2] = -1.0f;
+    if (!scene->lighting_ipc_override) {
+        we_scene_light_t active_lights[WE_MAX_SCENE_LIGHTS];
+        uint32_t active_light_count = 0;
+        const float deg_to_rad = 3.14159265358979323846f / 180.0f;
+        for (uint32_t i = 0; i < scene->object_count && active_light_count < WE_MAX_SCENE_LIGHTS;
+             i++) {
+            const we_scene_object_t *obj = &scene->objects[i];
+            if (!obj->visible || !obj->is_light_object) {
+                continue;
             }
-        } else {
-            l->position_or_dir[0] = world_node[12];
-            l->position_or_dir[1] = world_node[13];
-            l->position_or_dir[2] = world_node[14];
+            we_scene_light_t *l = &active_lights[active_light_count++];
+            memset(l, 0, sizeof(*l));
+            l->light_type = obj->light_type > 0 ? obj->light_type : WE_LIGHT_POINT;
+            l->color_rgb[0] = obj->color[0];
+            l->color_rgb[1] = obj->color[1];
+            l->color_rgb[2] = obj->color[2];
+            l->intensity = obj->light_intensity > 0.0f ? obj->light_intensity : 1.0f;
+            l->attenuation_radius = obj->light_radius > 0.0f ? obj->light_radius : 1000.0f;
 
-            float dx = obj->light_direction[0];
-            float dy = obj->light_direction[1];
-            float dz = obj->light_direction[2];
-            float len = sqrtf(dx * dx + dy * dy + dz * dz);
-            if (len > 1e-4f) {
-                l->spot_dir[0] = dx / len;
-                l->spot_dir[1] = dy / len;
-                l->spot_dir[2] = dz / len;
+            float outer_deg = (isfinite(obj->light_cone_angle) && obj->light_cone_angle > 0.0f)
+                                  ? fminf(obj->light_cone_angle, 89.9f)
+                                  : 45.0f;
+            float inner_deg =
+                (isfinite(obj->light_inner_cone_angle) && obj->light_inner_cone_angle > 0.0f)
+                    ? fminf(obj->light_inner_cone_angle, outer_deg)
+                    : (outer_deg * 0.5f);
+            l->spot_inner_cos = cosf(inner_deg * deg_to_rad);
+            l->spot_outer_cos = cosf(outer_deg * deg_to_rad);
+            l->tube_length = obj->light_tube_length;
+            l->specular_power =
+                obj->light_specular_power > 0.0f ? obj->light_specular_power : 32.0f;
+
+            float world_node[16];
+            compute_object_node_world_matrix(scene, obj, pdx, pdy, world_node);
+            if (l->light_type == WE_LIGHT_DIRECTIONAL) {
+                float dx = obj->light_direction[0];
+                float dy = obj->light_direction[1];
+                float dz = obj->light_direction[2];
+                float len = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (len > 1e-4f) {
+                    l->position_or_dir[0] = dx / len;
+                    l->position_or_dir[1] = dy / len;
+                    l->position_or_dir[2] = dz / len;
+                } else {
+                    l->position_or_dir[0] = 0.0f;
+                    l->position_or_dir[1] = 0.0f;
+                    l->position_or_dir[2] = -1.0f;
+                }
             } else {
-                l->spot_dir[0] = 0.0f;
-                l->spot_dir[1] = 0.0f;
-                l->spot_dir[2] = -1.0f;
+                l->position_or_dir[0] = world_node[12];
+                l->position_or_dir[1] = world_node[13];
+                l->position_or_dir[2] = world_node[14];
+
+                float dx = obj->light_direction[0];
+                float dy = obj->light_direction[1];
+                float dz = obj->light_direction[2];
+                float len = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (len > 1e-4f) {
+                    l->spot_dir[0] = dx / len;
+                    l->spot_dir[1] = dy / len;
+                    l->spot_dir[2] = dz / len;
+                } else {
+                    l->spot_dir[0] = 0.0f;
+                    l->spot_dir[1] = 0.0f;
+                    l->spot_dir[2] = -1.0f;
+                }
             }
         }
+        we_lighting_pack_ubo(active_lights, active_light_count, scene->lighting.ambient_color_rgb,
+                             scene->lighting.sky_color_rgb, scene->lighting.normal_map_strength,
+                             &scene->lighting);
+        scene->light_count = scene->lighting.active_light_count;
     }
-    we_lighting_pack_ubo(active_lights, active_light_count, scene->lighting.ambient_color_rgb,
-                         scene->lighting.sky_color_rgb, scene->lighting.normal_map_strength,
-                         &scene->lighting);
+
+    if (scene->lighting_ubo != 0) {
+        glBindBuffer(GL_UNIFORM_BUFFER, scene->lighting_ubo);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)sizeof(we_lighting_uniforms_t),
+                        &scene->lighting);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 2u, scene->lighting_ubo);
+        glBindBuffer(GL_UNIFORM_BUFFER, 0);
+    }
 
     glBindVertexArray(scene->quad_vao);
     scene->current_vao = scene->quad_vao;
@@ -2270,10 +2682,12 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
         }
         if (obj->user_prop_pointsize[0] != '\0') {
             const we_user_prop_t *up = project_find_prop(&scene->project, obj->user_prop_pointsize);
-            if (up && up->num_components > 0 && (int32_t)up->val[0] >= 4 &&
-                (int32_t)up->val[0] != obj->text_pointsize) {
-                obj->text_pointsize = (int32_t)up->val[0];
-                obj->text_dirty = true;
+            if (up && up->num_components > 0) {
+                int32_t new_ps = safe_scene_f32_to_i32(up->val[0], 0);
+                if (new_ps >= 4 && new_ps <= 512 && new_ps != obj->text_pointsize) {
+                    obj->text_pointsize = new_ps;
+                    obj->text_dirty = true;
+                }
             }
         }
         if (obj->user_prop_text[0] != '\0') {
@@ -2293,11 +2707,12 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
     for (uint32_t i = 0; i < scene->object_count; i++) {
         if (scene->objects[i].is_text_object && scene->objects[i].text_dirty) {
             we_scene_update_text_texture(scene, &scene->objects[i]);
+            invalidate_scene_tex_cache(scene);
         }
     }
     double audio_t = (params && (params->time_sec > 0.0f || params->time_delta_sec > 0.0f))
                          ? (double)params->time_sec
-                         : (double)scene->sim_time;
+                         : scene->sim_time;
     if (fabs(audio_t - scene->last_audio_step_time) > 1e-4) {
         scene->last_audio_step_time = audio_t;
         (void)we_scene_step_audio(scene, dt_sec);
@@ -2358,7 +2773,7 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                         scene->current_vp_h = sh;
                     }
                     apply_gl_blend_mode(scene, obj->base_pass.blending);
-                    apply_pass_depth_cull_state(&obj->base_pass, false, is_3d);
+                    apply_pass_depth_cull_state(scene, &obj->base_pass, false, is_3d);
                     if (scene->current_gl_prog != scene->particle_program) {
                         glUseProgram(scene->particle_program);
                         scene->current_gl_prog = scene->particle_program;
@@ -2394,21 +2809,28 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                     if (scene->part_rot_loc >= 0) {
                         glUniform4fv(scene->part_rot_loc, 1, rot);
                     }
-                    glActiveTexture(GL_TEXTURE0);
-                    glBindTexture(GL_TEXTURE_2D, ptex);
+                    bind_tex2d_cached(scene, 0u, ptex);
                     if (scene->part_tex0_loc >= 0) {
                         glUniform1i(scene->part_tex0_loc, 0);
                     }
                     we_particle_draw_gl(obj->particle_sys, scene->particle_program);
-                    if (scene->current_vao != scene->quad_vao) {
-                        glBindVertexArray(scene->quad_vao);
-                        scene->current_vao = scene->quad_vao;
-                    }
+                    /* we_particle_draw_gl binds its own VAO internally, so restore quad_vao. */
+                    glBindVertexArray(scene->quad_vao);
+                    scene->current_vao = scene->quad_vao;
                 }
                 continue;
             }
 
             if (!obj->has_base_pass || obj->base_pass.gl_prog == 0) {
+                continue;
+            }
+
+            float world_node[16];
+            compute_object_node_world_matrix(scene, obj, pdx, pdy, world_node);
+            bool has_composite_dep =
+                (obj->id >= 0 && scene_references_layer_composite(scene, obj->id));
+            if (frustum_valid && !obj->fullscreen && !obj->needs_full_fb_copy &&
+                !has_composite_dep && object_outside_frustum(obj, world_node, frustum_planes)) {
                 continue;
             }
 
@@ -2426,19 +2848,17 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
             }
 
             if (obj->needs_full_fb_copy) {
-                ensure_fbo_pair(&scene->full_fb_fbo, &scene->full_fb_tex, &scene->full_fb_w,
+                ensure_fbo_pair(scene, &scene->full_fb_fbo, &scene->full_fb_tex, &scene->full_fb_w,
                                 &scene->full_fb_h, sw, sh);
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, scene->scene_fbo);
-                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scene->full_fb_fbo);
-                glBlitFramebuffer(0, 0, (GLint)sw, (GLint)sh, 0, 0, (GLint)sw, (GLint)sh,
-                                  GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                blit_fbo_color(scene, scene->scene_fbo, sw, sh, scene->full_fb_fbo, sw, sh,
+                               GL_NEAREST);
             }
 
             if (active_effs == 0) {
                 /* Fast path: render object directly into scene_fbo */
                 float model[16], mvp[16];
                 if (obj->puppet) {
-                    compute_object_node_world_matrix(scene, obj, pdx, pdy, model);
+                    memcpy(model, world_node, sizeof(model));
                 } else {
                     compute_object_model_matrix(scene, obj, pdx, pdy, model);
                 }
@@ -2454,11 +2874,13 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                     scene->current_vp_h = sh;
                 }
                 apply_gl_blend_mode(scene, obj->base_pass.blending);
-                apply_pass_depth_cull_state(&obj->base_pass, is_opaque, is_3d);
-                bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, model, vp, mvp, 0, sw, sh,
-                                   norm_w, norm_h, params);
+                apply_pass_depth_cull_state(scene, &obj->base_pass, is_opaque, is_3d);
+                bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, model, world_node, vp, mvp, 0,
+                                   sw, sh, norm_w, norm_h, params);
                 if (obj->puppet) {
-                    we_puppet_draw_gl(obj->puppet, obj->base_pass.gl_prog, (double)time_sec);
+                    sync_puppet_physics_inputs(scene, obj, world_node, sw, sh, cur_ptr,
+                                               had_prev_pointer, dt_sec, params);
+                    we_puppet_draw_gl(obj->puppet, obj->base_pass.gl_prog, time_sec_d);
                     glBindVertexArray(scene->quad_vao);
                     scene->current_vao = scene->quad_vao;
                 } else {
@@ -2470,11 +2892,17 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                 }
             } else {
                 /* Ping-pong effect chain path */
-                uint32_t pw = (uint32_t)(obj->size[0] > 1.0f ? obj->size[0] : (float)sw);
-                uint32_t ph = (uint32_t)(obj->size[1] > 1.0f ? obj->size[1] : (float)sh);
+                uint32_t fallback_pw = sw > 8192u ? 8192u : (sw > 0u ? sw : 1u);
+                uint32_t fallback_ph = sh > 8192u ? 8192u : (sh > 0u ? sh : 1u);
+                uint32_t pw = (isfinite(obj->size[0]) && obj->size[0] > 1.0f)
+                                  ? clamp_scene_f32_to_u32(obj->size[0], 1u, 8192u)
+                                  : fallback_pw;
+                uint32_t ph = (isfinite(obj->size[1]) && obj->size[1] > 1.0f)
+                                  ? clamp_scene_f32_to_u32(obj->size[1], 1u, 8192u)
+                                  : fallback_ph;
                 if (obj->fullscreen) {
-                    pw = sw;
-                    ph = sh;
+                    pw = fallback_pw;
+                    ph = fallback_ph;
                 }
                 int pool_slot = -1;
                 for (int ps = 0; ps < 4; ps++) {
@@ -2504,10 +2932,10 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                 uint32_t p1_h = scene->shared_obj_ping_pool[pool_slot].fbo[1]
                                     ? scene->shared_obj_ping_pool[pool_slot].h
                                     : 0;
-                ensure_fbo_pair(&scene->shared_obj_ping_pool[pool_slot].fbo[0],
+                ensure_fbo_pair(scene, &scene->shared_obj_ping_pool[pool_slot].fbo[0],
                                 &scene->shared_obj_ping_pool[pool_slot].tex[0], &p0_w, &p0_h, pw,
                                 ph);
-                ensure_fbo_pair(&scene->shared_obj_ping_pool[pool_slot].fbo[1],
+                ensure_fbo_pair(scene, &scene->shared_obj_ping_pool[pool_slot].fbo[1],
                                 &scene->shared_obj_ping_pool[pool_slot].tex[1], &p1_w, &p1_h, pw,
                                 ph);
                 scene->shared_obj_ping_pool[pool_slot].w = pw;
@@ -2523,18 +2951,13 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                 float ident[16];
                 mat4_identity(ident);
 
-                /* Seed shared_obj_ping_fbo[0] by drawing obj->base_pass so compressed S3TC/BC7
-                 * textures, swizzles, and spritesheets render cleanly into shared_obj_ping_fbo[0]
-                 */
                 glBindFramebuffer(GL_FRAMEBUFFER, scene->shared_obj_ping_fbo[0]);
                 scene->current_fbo = scene->shared_obj_ping_fbo[0];
                 glViewport(0, 0, (GLsizei)pw, (GLsizei)ph);
                 scene->current_vp_w = pw;
                 scene->current_vp_h = ph;
                 apply_gl_blend_mode(scene, WE_BLEND_DISABLED);
-                glDisable(GL_DEPTH_TEST);
-                glDepthMask(GL_FALSE);
-                glDisable(GL_CULL_FACE);
+                apply_raw_depth_cull_bits(scene, 0x00u);
                 glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
                 glClear(GL_COLOR_BUFFER_BIT);
                 if (obj->puppet) {
@@ -2543,9 +2966,11 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                     p_mvp[0] = 2.0f / (float)pw;
                     p_mvp[5] = -2.0f / (float)ph;
                     p_mvp[10] = -1.0f / 2000.0f;
-                    bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, ident, p_mvp, p_mvp, 0,
-                                       pw, ph, norm_w, norm_h, params);
-                    we_puppet_draw_gl(obj->puppet, obj->base_pass.gl_prog, (double)time_sec);
+                    bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, ident, ident, p_mvp,
+                                       p_mvp, 0, pw, ph, norm_w, norm_h, params);
+                    sync_puppet_physics_inputs(scene, obj, world_node, sw, sh, cur_ptr,
+                                               had_prev_pointer, dt_sec, params);
+                    we_puppet_draw_gl(obj->puppet, obj->base_pass.gl_prog, time_sec_d);
                     glBindVertexArray(scene->quad_vao);
                     scene->current_vao = scene->quad_vao;
                 } else {
@@ -2553,8 +2978,8 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                         glBindVertexArray(scene->quad_vao);
                         scene->current_vao = scene->quad_vao;
                     }
-                    bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, ident, ident, ident, 0,
-                                       pw, ph, norm_w, norm_h, params);
+                    bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, ident, ident, ident,
+                                       ident, 0, pw, ph, norm_w, norm_h, params);
                     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
                 }
                 GLuint cur_tex = scene->shared_obj_ping_tex[0];
@@ -2568,7 +2993,7 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                         uint32_t sc = eff->fbos[f].scale > 0 ? eff->fbos[f].scale : 1;
                         uint32_t fw = pw / sc > 0 ? pw / sc : 1;
                         uint32_t fh = ph / sc > 0 ? ph / sc : 1;
-                        ensure_fbo_pair(&eff->fbos[f].gl_fbo, &eff->fbos[f].gl_tex,
+                        ensure_fbo_pair(scene, &eff->fbos[f].gl_fbo, &eff->fbos[f].gl_tex,
                                         &eff->fbos[f].width, &eff->fbos[f].height, fw, fh);
                     }
                     for (uint32_t p = 0; p < eff->pass_count; p++) {
@@ -2593,12 +3018,9 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                                         get_or_create_scene_rt_fbo(scene, ep->target_fbo, pw, ph);
                                 }
                                 if (dst_rt && dst_rt->gl_fbo) {
-                                    glBindFramebuffer(GL_READ_FRAMEBUFFER,
-                                                      scene->shared_obj_ping_fbo[cur_idx]);
-                                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_rt->gl_fbo);
-                                    glBlitFramebuffer(0, 0, (GLint)pw, (GLint)ph, 0, 0,
-                                                      (GLint)dst_rt->width, (GLint)dst_rt->height,
-                                                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                                    blit_fbo_color(scene, scene->shared_obj_ping_fbo[cur_idx], pw,
+                                                   ph, dst_rt->gl_fbo, dst_rt->width,
+                                                   dst_rt->height, GL_LINEAR);
                                 }
                             }
                             continue;
@@ -2644,11 +3066,9 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                             scene->current_vp_h = dst_h;
                         }
                         apply_gl_blend_mode(scene, ep->blending);
-                        glDisable(GL_DEPTH_TEST);
-                        glDepthMask(GL_FALSE);
-                        glDisable(GL_CULL_FACE);
-                        bind_pass_uniforms(scene, obj, eff, ep, ident, ident, ident, cur_tex, dst_w,
-                                           dst_h, norm_w, norm_h, params);
+                        apply_raw_depth_cull_bits(scene, 0x00u);
+                        bind_pass_uniforms(scene, obj, eff, ep, ident, ident, ident, ident, cur_tex,
+                                           dst_w, dst_h, norm_w, norm_h, params);
                         if (scene->current_vao != scene->quad_vao) {
                             glBindVertexArray(scene->quad_vao);
                             scene->current_vao = scene->quad_vao;
@@ -2662,15 +3082,13 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                     }
                 }
 
-                if (obj->id >= 0 && scene_references_layer_composite(scene, obj->id)) {
+                if (has_composite_dep) {
                     char comp_name[64];
                     snprintf(comp_name, sizeof(comp_name), "_rt_imageLayerComposite_%d_a", obj->id);
                     we_rt_fbo_t *comp_rt = get_or_create_scene_rt_fbo(scene, comp_name, pw, ph);
                     if (comp_rt && comp_rt->gl_fbo) {
-                        glBindFramebuffer(GL_READ_FRAMEBUFFER, scene->shared_obj_ping_fbo[cur_idx]);
-                        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, comp_rt->gl_fbo);
-                        glBlitFramebuffer(0, 0, (GLint)pw, (GLint)ph, 0, 0, (GLint)comp_rt->width,
-                                          (GLint)comp_rt->height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                        blit_fbo_color(scene, scene->shared_obj_ping_fbo[cur_idx], pw, ph,
+                                       comp_rt->gl_fbo, comp_rt->width, comp_rt->height, GL_LINEAR);
                     }
                 }
 
@@ -2689,7 +3107,7 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                     scene->current_vp_h = sh;
                 }
                 apply_gl_blend_mode(scene, obj->base_pass.blending);
-                apply_pass_depth_cull_state(&obj->base_pass, is_opaque, is_3d);
+                apply_pass_depth_cull_state(scene, &obj->base_pass, is_opaque, is_3d);
                 if (scene->default_program != 0) {
                     if (scene->current_gl_prog != scene->default_program) {
                         glUseProgram(scene->default_program);
@@ -2701,18 +3119,16 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
                     if (scene->default_prog_ulocs.tex_sampler[0] >= 0) {
                         glUniform1i(scene->default_prog_ulocs.tex_sampler[0], 0);
                     }
-                    glActiveTexture(GL_TEXTURE0);
-                    glBindTexture(GL_TEXTURE_2D, cur_tex);
+                    bind_tex2d_cached(scene, 0u, cur_tex);
                     if (scene->current_vao != scene->quad_vao) {
                         glBindVertexArray(scene->quad_vao);
                         scene->current_vao = scene->quad_vao;
                     }
                     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
                 } else {
-                    bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, model, vp, mvp, cur_tex,
-                                       sw, sh, norm_w, norm_h, params);
-                    glActiveTexture(GL_TEXTURE0);
-                    glBindTexture(GL_TEXTURE_2D, cur_tex);
+                    bind_pass_uniforms(scene, obj, NULL, &obj->base_pass, model, world_node, vp,
+                                       mvp, cur_tex, sw, sh, norm_w, norm_h, params);
+                    bind_tex2d_cached(scene, 0u, cur_tex);
                     if (scene->current_vao != scene->quad_vao) {
                         glBindVertexArray(scene->quad_vao);
                         scene->current_vao = scene->quad_vao;
@@ -2738,6 +3154,9 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
 
     scene->last_pointer[0] = cur_ptr[0];
     scene->last_pointer[1] = cur_ptr[1];
+    if (scene->lighting_ubo != 0) {
+        glBindBufferBase(GL_UNIFORM_BUFFER, 2u, 0);
+    }
     glActiveTexture(GL_TEXTURE0);
     glDisable(GL_BLEND);
     glDisable(GL_DEPTH_TEST);
@@ -2747,6 +3166,13 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
     glDisable(GL_STENCIL_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glBindVertexArray(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    scene->current_gl_blend_mode = -1;
+    scene->current_vao = 0;
+    scene->current_fbo = 0;
+    scene->current_depth_cull_bits = 0xFFu;
+    invalidate_scene_tex_cache(scene);
 }
 
 static bool import_scene_bo_tex(we_scene_t *scene, dmabuf_bo_t *bo, GLuint *out_tex)
@@ -2901,6 +3327,7 @@ static bool import_scene_bo_tex(we_scene_t *scene, dmabuf_bo_t *bo, GLuint *out_
     scene->imported_bos[slot].gl_tex = tex;
     scene->imported_bos[slot].egl_image = img;
     scene->imported_bos[slot].owns_egl = true;
+    invalidate_scene_tex_cache(scene);
     if (slot == scene->num_imported_bos) {
         scene->num_imported_bos++;
     }
@@ -3066,11 +3493,15 @@ static void cpu_rasterize_triangle(uint8_t *out_rgba, uint32_t width, uint32_t h
     float max_x = fmaxf(sx0, fmaxf(sx1, sx2));
     float min_y = fminf(sy0, fminf(sy1, sy2));
     float max_y = fmaxf(sy0, fmaxf(sy1, sy2));
+    if (!isfinite(min_x) || !isfinite(max_x) || !isfinite(min_y) || !isfinite(max_y) ||
+        max_x <= 0.0f || max_y <= 0.0f || min_x >= (float)width || min_y >= (float)height) {
+        return;
+    }
 
-    int32_t x0 = (int32_t)floorf(min_x);
-    int32_t x1 = (int32_t)ceilf(max_x);
-    int32_t y0 = (int32_t)floorf(min_y);
-    int32_t y1 = (int32_t)ceilf(max_y);
+    int32_t x0 = (int32_t)floorf(fmaxf(min_x, 0.0f));
+    int32_t x1 = (int32_t)ceilf(fminf(max_x, (float)width));
+    int32_t y0 = (int32_t)floorf(fmaxf(min_y, 0.0f));
+    int32_t y1 = (int32_t)ceilf(fminf(max_y, (float)height));
     if (x0 < 0) {
         x0 = 0;
     }
@@ -3167,6 +3598,8 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glDeleteTextures(1, &tmp_tex);
+            scene->current_fbo = 0;
+            invalidate_scene_tex_cache(scene);
         }
         size_t row_bytes = (size_t)width * 4u;
         uint8_t *swap_row = (uint8_t *)malloc(row_bytes);
@@ -3207,9 +3640,11 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
     float dt_sec =
         (params && params->time_delta_sec > 0.0f) ? params->time_delta_sec : (1.0f / 60.0f);
     if (scene->first_frame_done) {
-        scene->sim_time += dt_sec;
+        scene->sim_time += (double)dt_sec;
     }
-    float time_sec = (params && params->time_sec > 0.0f) ? params->time_sec : scene->sim_time;
+    double time_sec_d =
+        (params && params->time_sec > 0.0f) ? (double)params->time_sec : scene->sim_time;
+    float time_sec = wrap_glsl_time_sec(time_sec_d);
 
     float cur_ptr[2] = {0.5f, 0.5f};
     if (params && width > 0 && height > 0 && (params->mouse[0] > 0.0f || params->mouse[1] > 0.0f)) {
@@ -3251,10 +3686,12 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
         }
         if (obj->user_prop_pointsize[0] != '\0') {
             const we_user_prop_t *up = project_find_prop(&scene->project, obj->user_prop_pointsize);
-            if (up && up->num_components > 0 && (int32_t)up->val[0] >= 4 &&
-                (int32_t)up->val[0] != obj->text_pointsize) {
-                obj->text_pointsize = (int32_t)up->val[0];
-                obj->text_dirty = true;
+            if (up && up->num_components > 0) {
+                int32_t new_ps = safe_scene_f32_to_i32(up->val[0], 0);
+                if (new_ps >= 4 && new_ps <= 512 && new_ps != obj->text_pointsize) {
+                    obj->text_pointsize = new_ps;
+                    obj->text_dirty = true;
+                }
             }
         }
         if (obj->user_prop_text[0] != '\0') {
@@ -3592,9 +4029,10 @@ bool we_scene_set_uniform_override(we_scene_t *scene, const char *name, const fl
             obj->sound_volume = fminf(fmaxf(values[0], 0.0f), 2.0f);
         }
         if (obj->user_prop_pointsize[0] != '\0' &&
-            strcasecmp(obj->user_prop_pointsize, name) == 0 && (int32_t)values[0] >= 4) {
-            if (obj->text_pointsize != (int32_t)values[0]) {
-                obj->text_pointsize = (int32_t)values[0];
+            strcasecmp(obj->user_prop_pointsize, name) == 0) {
+            int32_t new_ps = safe_scene_f32_to_i32(values[0], 0);
+            if (new_ps >= 4 && new_ps <= 512 && obj->text_pointsize != new_ps) {
+                obj->text_pointsize = new_ps;
                 obj->text_dirty = true;
             }
         }
@@ -3630,14 +4068,14 @@ void waywal_we_scene_forget_bo(we_scene_t *scene, const dmabuf_bo_t *bo)
     if (!scene || !bo) {
         return;
     }
-    ensure_egl_procs(scene);
-    PFNEGLDESTROYIMAGEKHRPROC destroy_img =
-        __extension__(PFNEGLDESTROYIMAGEKHRPROC) scene->fn_eglDestroyImageKHR;
 
     for (size_t i = 0; i < scene->num_imported_bos; i++) {
         if (scene->imported_bos[i].bo == bo) {
             if (scene->gl_initialized && scene->egl_display && scene->egl_context &&
                 scene->imported_bos[i].owns_egl) {
+                ensure_egl_procs(scene);
+                PFNEGLDESTROYIMAGEKHRPROC destroy_img =
+                    __extension__(PFNEGLDESTROYIMAGEKHRPROC) scene->fn_eglDestroyImageKHR;
                 if (eglGetCurrentContext() != scene->egl_context) {
                     eglMakeCurrent(scene->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                                    scene->egl_context);
@@ -3645,6 +4083,7 @@ void waywal_we_scene_forget_bo(we_scene_t *scene, const dmabuf_bo_t *bo)
                 if (scene->imported_bos[i].gl_tex) {
                     GLuint del_tex = scene->imported_bos[i].gl_tex;
                     glDeleteTextures(1, &del_tex);
+                    invalidate_scene_tex_cache(scene);
                 }
                 if (scene->imported_bos[i].egl_image && destroy_img) {
                     void *del_img = scene->imported_bos[i].egl_image;
@@ -3748,13 +4187,13 @@ void we_scene_destroy(we_scene_t *scene)
     }
 
     if (scene->gl_initialized) {
-        ensure_egl_procs(scene);
-        PFNEGLDESTROYIMAGEKHRPROC destroy_img =
-            __extension__(PFNEGLDESTROYIMAGEKHRPROC) scene->fn_eglDestroyImageKHR;
         for (size_t i = 0; i < scene->num_imported_bos; i++) {
             if (!scene->imported_bos[i].owns_egl) {
                 continue;
             }
+            ensure_egl_procs(scene);
+            PFNEGLDESTROYIMAGEKHRPROC destroy_img =
+                __extension__(PFNEGLDESTROYIMAGEKHRPROC) scene->fn_eglDestroyImageKHR;
             if (scene->imported_bos[i].gl_tex) {
                 GLuint del_tex = scene->imported_bos[i].gl_tex;
                 glDeleteTextures(1, &del_tex);
@@ -3809,6 +4248,11 @@ void we_scene_destroy(we_scene_t *scene)
         scene->shared_obj_ping_fbo[1] = 0;
         scene->shared_obj_ping_tex[0] = 0;
         scene->shared_obj_ping_tex[1] = 0;
+        if (scene->lighting_ubo) {
+            GLuint lubo = scene->lighting_ubo;
+            glDeleteBuffers(1, &lubo);
+            scene->lighting_ubo = 0;
+        }
         if (scene->target_fbo) {
             glDeleteFramebuffers(1, &scene->target_fbo);
         }
@@ -3851,6 +4295,12 @@ void we_scene_destroy(we_scene_t *scene)
             if (s_we_shared_refcount == 0) {
                 eglMakeCurrent(scene->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
                 eglDestroyContext(scene->egl_display, scene->egl_context);
+#if !(defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer))
+                /* Skip eglTerminate under LeakSanitizer because libEGL_nvidia dlcloses its
+                 * vendor sub-library on display teardown while leaving one-time pthread_once
+                 * allocations unmapped in <unknown module>. */
+                eglTerminate(scene->egl_display);
+#endif
                 s_we_shared_dpy = EGL_NO_DISPLAY;
                 s_we_shared_ctx = EGL_NO_CONTEXT;
             }
@@ -3884,6 +4334,7 @@ static void we_scene_set_album_art_internal(we_scene_t *scene, const uint8_t *pi
             glDeleteTextures(1, &scene->tex_album_art);
             scene->tex_album_art = 0;
         }
+        invalidate_scene_tex_cache(scene);
         if (pixels && w > 0 && h > 0) {
             GLuint atex = 0;
             glGenTextures(1, &atex);

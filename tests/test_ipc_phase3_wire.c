@@ -27,6 +27,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -387,6 +388,116 @@ static void test_scene_lights_wire(void)
     printf("  -> PASS: Scene Lights IPC wire round-trip & fuzzing verified.\n");
 }
 
+static void test_adversarial_nan_enum_and_bounds_fuzz(void)
+{
+    printf("[TEST] Adversarial NaN/Inf, Enum & Bounds Wire Validation...\n");
+
+    // 1. Camera 3D NaN/Inf & enum bounds
+    {
+        const float eye[3] = {0.0f, 1.0f, 5.0f};
+        const float target[3] = {0.0f, 0.0f, 0.0f};
+        const float up[3] = {0.0f, 1.0f, 0.0f};
+        const float parallax[2] = {0.1f, 0.1f};
+        waywal_ipc_hdr_t hdr;
+        waywal_ipc_req_set_camera_3d_t req;
+        assert(waywal_ipc_serialize_req_set_camera_3d("*", 1, 0, eye, target, up, 60.0f, 0.1f,
+                                                      100.0f, parallax, 0.5f, 4.0f, 1.0f, 6.0f,
+                                                      &hdr, &req));
+        assert(waywal_ipc_validate_req_set_camera_3d(&req, sizeof(req)));
+
+        waywal_ipc_req_set_camera_3d_t bad = req;
+        bad.projection_mode = 99u;
+        assert(!waywal_ipc_validate_req_set_camera_3d(&bad, sizeof(bad)));
+
+        bad = req;
+        bad.parallax_amount[1] = NAN;
+        assert(!waywal_ipc_validate_req_set_camera_3d(&bad, sizeof(bad)));
+
+        bad = req;
+        bad.dof_bokeh_radius_px = INFINITY;
+        assert(!waywal_ipc_validate_req_set_camera_3d(&bad, sizeof(bad)));
+    }
+
+    // 2. Physics params NaN/Inf & bone_index bounds
+    {
+        we_bone_sim_config_t bone_cfg;
+        memset(&bone_cfg, 0, sizeof(bone_cfg));
+        bone_cfg.mass_kg = 1.0f;
+        we_wind_field_t wind;
+        memset(&wind, 0, sizeof(wind));
+        we_cursor_force_t cursor;
+        memset(&cursor, 0, sizeof(cursor));
+
+        waywal_ipc_hdr_t hdr;
+        waywal_ipc_req_set_physics_params_t req;
+        assert(waywal_ipc_serialize_req_set_physics_params("*", -1, 0, &bone_cfg, &wind, &cursor,
+                                                           &hdr, &req));
+        assert(waywal_ipc_validate_req_set_physics_params(&req, sizeof(req)));
+
+        waywal_ipc_req_set_physics_params_t bad = req;
+        bad.bone_index = -2;
+        assert(!waywal_ipc_validate_req_set_physics_params(&bad, sizeof(bad)));
+
+        bad = req;
+        bad.bone_index = (int32_t)WE_MDL_MAX_BONES;
+        assert(!waywal_ipc_validate_req_set_physics_params(&bad, sizeof(bad)));
+
+        bad = req;
+        bad.bone_cfg.mass_kg = NAN;
+        assert(!waywal_ipc_validate_req_set_physics_params(&bad, sizeof(bad)));
+
+        bad = req;
+        bad.wind.gust_amplitude = INFINITY;
+        assert(!waywal_ipc_validate_req_set_physics_params(&bad, sizeof(bad)));
+
+        bad = req;
+        bad.cursor.impulse_strength = -INFINITY;
+        assert(!waywal_ipc_validate_req_set_physics_params(&bad, sizeof(bad)));
+    }
+
+    // 3. Scene lights NaN/Inf & light_type bounds
+    {
+        we_lighting_uniforms_t lights;
+        memset(&lights, 0, sizeof(lights));
+        lights.active_light_count = 1;
+        lights.lights[0].light_type = WE_LIGHT_SPOT;
+        lights.lights[0].intensity = 2.0f;
+
+        waywal_ipc_hdr_t hdr;
+        waywal_ipc_req_set_scene_lights_t req;
+        assert(waywal_ipc_serialize_req_set_scene_lights("*", &lights, &hdr, &req));
+        assert(waywal_ipc_validate_req_set_scene_lights(&req, sizeof(req)));
+
+        waywal_ipc_req_set_scene_lights_t bad = req;
+        bad.lighting.ambient_color_rgb[0] = NAN;
+        assert(!waywal_ipc_validate_req_set_scene_lights(&bad, sizeof(bad)));
+
+        bad = req;
+        bad.lighting.lights[0].light_type = 77u;
+        assert(!waywal_ipc_validate_req_set_scene_lights(&bad, sizeof(bad)));
+
+        bad = req;
+        bad.lighting.lights[0].spot_dir[2] = INFINITY;
+        assert(!waywal_ipc_validate_req_set_scene_lights(&bad, sizeof(bad)));
+    }
+
+    // 4. Embedded NUL in inline_json rejection
+    {
+        uint8_t buf[sizeof(waywal_ipc_req_compile_shader_graph_t) + 8];
+        memset(buf, 0, sizeof(buf));
+        waywal_ipc_req_compile_shader_graph_t req_hdr_body;
+        memset(&req_hdr_body, 0, sizeof(req_hdr_body));
+        req_hdr_body.target_output[0] = '*';
+        req_hdr_body.inline_json_len = 8u;
+        memcpy(buf, &req_hdr_body, sizeof(req_hdr_body));
+        memcpy(buf + sizeof(req_hdr_body), "{}\0bad{}", 8u);
+        assert(!waywal_ipc_validate_req_compile_shader_graph(
+            (const waywal_ipc_req_compile_shader_graph_t *)buf, sizeof(buf), NULL));
+    }
+
+    printf("  -> PASS: Adversarial NaN/Inf, enum & bounds wire fuzzing verified.\n");
+}
+
 /* ========================================================================= */
 /* 7. LIVE SOCKET WIRE TEST                                                  */
 /* ========================================================================= */
@@ -716,6 +827,7 @@ int main(void)
     test_camera3d_wire();
     test_physics_wire();
     test_scene_lights_wire();
+    test_adversarial_nan_enum_and_bounds_fuzz();
     test_live_socket_round_trip();
 
     printf("=================================================================\n");

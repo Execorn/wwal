@@ -428,6 +428,142 @@ static void test_128_bone_step_puppet_benchmark(void)
     free(bones);
 }
 
+static float det3x3_col_major(const float m[16])
+{
+    return m[0] * (m[5] * m[10] - m[9] * m[6]) - m[4] * (m[1] * m[10] - m[9] * m[2]) +
+           m[8] * (m[1] * m[6] - m[5] * m[2]);
+}
+
+static void test_avx2_curl_wind_batch_equivalence(void)
+{
+    printf("[+] Testing batched SIMD 3D curl-noise equivalence against scalar oracle...\n");
+
+    we_wind_field_t wind = {
+        .enabled = 1,
+        .base_direction_rad = 0.65f,
+        .base_speed_px_s = 175.0f,
+        .gust_frequency_hz = 1.25f,
+        .gust_amplitude = 2.1f,
+        .curl_spatial_scale = 0.006f,
+        .gravity_vec = {0.0f, -980.0f},
+    };
+
+    enum { N = 67 };
+    float xs[N], ys[N], zs[N];
+    float batch_vel[N][3];
+    for (int i = 0; i < N; ++i) {
+        xs[i] = -1400.0f + (float)i * 43.7f;
+        ys[i] = 950.0f - (float)i * 29.3f;
+        zs[i] = -320.0f + (float)(i % 11) * 61.5f;
+    }
+
+    const double high_t = 500000.125;
+    we_physics_eval_curl_wind_3d_batch(&wind, xs, ys, zs, N, high_t, batch_vel);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        float ref[3];
+        we_physics_eval_curl_wind_3d(&wind, xs[i], ys[i], zs[i], high_t, ref);
+        for (int c = 0; c < 3; ++c) {
+            assert(isfinite(batch_vel[i][c]) && isfinite(ref[c]));
+            float d = fabsf(batch_vel[i][c] - ref[c]);
+            if (d > max_diff) {
+                max_diff = d;
+            }
+        }
+    }
+    printf("    -> Max batch vs scalar velocity delta across %d points: %.2e px/s\n", N, max_diff);
+    assert(max_diff <= 1e-3f && "Batched curl wind diverged from scalar reference");
+}
+
+static void test_wall_clock_and_non_compounding_hierarchy_solver(void)
+{
+    printf("[+] Testing wall-clock substep scheduling & non-compounding hierarchy skinning...\n");
+
+    we_mdl_bone_t bones[2];
+    memset(bones, 0, sizeof(bones));
+
+    bones[0].parent = 0xFFFFFFFFu;
+    bones[0].local_trans[0] = 1.0f;
+    bones[0].local_trans[5] = 1.0f;
+    bones[0].local_trans[10] = 1.0f;
+    bones[0].local_trans[15] = 1.0f;
+    bones[0].offset_trans[0] = 1.0f;
+    bones[0].offset_trans[5] = 1.0f;
+    bones[0].offset_trans[10] = 1.0f;
+    bones[0].offset_trans[15] = 1.0f;
+    snprintf(bones[0].simulation_json, sizeof(bones[0].simulation_json),
+             "{\"stiffness\":0.3,\"damping\":0.2,\"length\":40.0,\"wind\":1.0}");
+
+    bones[1].parent = 0u;
+    bones[1].local_trans[0] = 1.0f;
+    bones[1].local_trans[5] = 1.0f;
+    bones[1].local_trans[10] = 1.0f;
+    bones[1].local_trans[13] = -40.0f;
+    bones[1].local_trans[15] = 1.0f;
+    bones[1].offset_trans[0] = 1.0f;
+    bones[1].offset_trans[5] = 1.0f;
+    bones[1].offset_trans[10] = 1.0f;
+    bones[1].offset_trans[13] = 40.0f;
+    bones[1].offset_trans[15] = 1.0f;
+    snprintf(bones[1].simulation_json, sizeof(bones[1].simulation_json),
+             "{\"stiffness\":0.3,\"damping\":0.2,\"length\":40.0,\"wind\":1.0}");
+
+    we_puppet_t puppet;
+    memset(&puppet, 0, sizeof(puppet));
+    puppet.bone_count = 2;
+    puppet.bones = bones;
+
+    we_puppet_physics_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    we_physics_init_from_puppet(&ctx, &puppet);
+    ctx.wind.enabled = 1;
+    ctx.wind.base_speed_px_s = 220.0f;
+
+    float anim_local[2][16];
+    memcpy(anim_local[0], bones[0].local_trans, sizeof(anim_local[0]));
+    memcpy(anim_local[1], bones[1].local_trans, sizeof(anim_local[1]));
+    float skin_mats[2][16];
+
+    // First wall-clock call seeds last_wall_time_sec with nominal 60 Hz dt (4 substeps)
+    assert(we_physics_advance_wall_clock(&ctx, 10.0) == 4u);
+    ctx.time_accumulator_sec = 0.0f;
+
+    // 30 Hz step triggers 8 substeps in one frame; rotations must NOT compound S times
+    uint32_t subs_30hz = we_physics_advance_wall_clock(&ctx, 10.0 + (1.0 / 30.0));
+    assert(subs_30hz == 8u);
+    we_physics_solve_hierarchy_skin_matrices(&ctx, &puppet, (const float (*)[16])anim_local,
+                                             subs_30hz, skin_mats);
+
+    float det0 = det3x3_col_major(skin_mats[0]);
+    float det1 = det3x3_col_major(skin_mats[1]);
+    assert(fabsf(det0 - 1.0f) < 1e-3f && fabsf(det1 - 1.0f) < 1e-3f);
+
+    // Compare 30 Hz single-frame deflection vs 8 discrete 240 Hz frames
+    we_puppet_physics_ctx_t ctx_ref;
+    memset(&ctx_ref, 0, sizeof(ctx_ref));
+    we_physics_init_from_puppet(&ctx_ref, &puppet);
+    ctx_ref.wind = ctx.wind;
+    assert(we_physics_advance_wall_clock(&ctx_ref, 10.0) == 4u);
+    ctx_ref.time_accumulator_sec = 0.0f;
+    float skin_ref[2][16];
+    for (int f = 1; f <= 8; ++f) {
+        uint32_t s = we_physics_advance_wall_clock(&ctx_ref, 10.0 + (double)f * (1.0 / 240.0));
+        assert(s == 1u);
+        we_physics_solve_hierarchy_skin_matrices(&ctx_ref, &puppet, (const float (*)[16])anim_local,
+                                                 s, skin_ref);
+    }
+    for (int m = 0; m < 16; ++m) {
+        assert(fabsf(skin_mats[1][m] - skin_ref[1][m]) < 1e-3f &&
+               "Multi-substep frame skin matrix must match discrete 240 Hz frames");
+    }
+
+    // Resume jump (+3600s) clamps cleanly
+    uint32_t subs_jump = we_physics_advance_wall_clock(&ctx, 3610.0);
+    assert(subs_jump <= WE_PHYSICS_MAX_SUBSTEPS);
+    printf("    -> Non-compounding hierarchy skinning & wall-clock clamping verified.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -440,6 +576,8 @@ int main(void)
     test_chain_inextensibility_under_gusts();
     test_cursor_sdf_and_audio_impulses();
     test_128_bone_step_puppet_benchmark();
+    test_avx2_curl_wind_batch_equivalence();
+    test_wall_clock_and_non_compounding_hierarchy_solver();
 
     printf("==========================================================\n");
     printf("  >>> ALL WE_PHYSICS TESTS PASSED CLEANLY (100%%) <<<\n");
