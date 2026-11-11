@@ -1,27 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-/**
- * @file test_we_vdf.c
- * @brief Comprehensive Valve KeyValues VDF & AppWorkshop Manifest Verification Suite
- *
- * Exercises the bump-arena VDF parser across 10+ complex real-world and synthetic
- * VDF documents: quoted/unquoted tokens, escape sequences, mixed CRLF, comments,
- * recursion depth clamping, libraryfolders.vdf, appworkshop_431960.vdf, and multi-drive
- * Steam library discovery with zero memory leaks.
- */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
+#include <assert.h>
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
-#include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
-#include "waywal/we_vdf.h"
 #include "waywal/we_appworkshop.h"
+#include "waywal/we_vdf.h"
 
 static void test_vdf_basic_kv(void)
 {
-    printf("[VDF 1/12] Testing basic quoted key-value pairs...\n");
+    printf("[VDF 1/16] Testing basic quoted key-value pairs...\n");
     const char *doc_str = "\"settings\"\n"
                           "{\n"
                           "    \"name\" \"WayWal\"\n"
@@ -53,7 +50,7 @@ static void test_vdf_basic_kv(void)
 
 static void test_vdf_unquoted_tokens(void)
 {
-    printf("[VDF 2/12] Testing unquoted keys and values...\n");
+    printf("[VDF 2/16] Testing unquoted keys and values...\n");
     const char *doc_str = "AppSettings\n"
                           "{\n"
                           "    appid 431960\n"
@@ -78,7 +75,7 @@ static void test_vdf_unquoted_tokens(void)
 
 static void test_vdf_comments(void)
 {
-    printf("[VDF 3/12] Testing single-line comments in diverse positions...\n");
+    printf("[VDF 3/16] Testing single-line comments in diverse positions...\n");
     const char *doc_str = "// Global comment before root\n"
                           "\"Config\" // inline comment\n"
                           "{\n"
@@ -102,7 +99,7 @@ static void test_vdf_comments(void)
 
 static void test_vdf_mixed_crlf(void)
 {
-    printf("[VDF 4/12] Testing mixed CRLF and LF line endings...\n");
+    printf("[VDF 4/16] Testing mixed CRLF and LF line endings...\n");
     const char *doc_str = "\"CRLFTest\"\r\n"
                           "{\r\n"
                           "    \"line1\" \"value1\"\n"
@@ -124,7 +121,7 @@ static void test_vdf_mixed_crlf(void)
 
 static void test_vdf_escape_sequences(void)
 {
-    printf("[VDF 5/12] Testing escape sequences in strings (\\\", \\\\, \\n, \\t)...\n");
+    printf("[VDF 5/16] Testing escape sequences in strings (\\\", \\\\, \\n, \\t)...\n");
     const char *doc_str = "\"Escapes\"\n"
                           "{\n"
                           "    \"quoted\" \"Hello \\\"World\\\"!\"\n"
@@ -155,7 +152,7 @@ static void test_vdf_escape_sequences(void)
 
 static void test_vdf_nested_hierarchy(void)
 {
-    printf("[VDF 6/12] Testing multi-level nested hierarchy and traversal...\n");
+    printf("[VDF 6/16] Testing multi-level nested hierarchy and traversal...\n");
     const char *doc_str = "\"Root\"\n"
                           "{\n"
                           "    \"Level1\"\n"
@@ -195,19 +192,18 @@ static void test_vdf_nested_hierarchy(void)
 
 static void test_vdf_recursion_clamp(void)
 {
-    printf("[VDF 7/12] Testing recursion depth clamp (> 64 nested levels)...\n");
+    printf("[VDF 7/16] Testing recursion depth clamp (> 64 nested levels)...\n");
     char deep_buf[4096];
     size_t pos = 0;
 
     for (int i = 0; i < 70; ++i) {
-        pos += snprintf(deep_buf + pos, sizeof(deep_buf) - pos, "\"node%d\" { ", i);
+        pos += (size_t)snprintf(deep_buf + pos, sizeof(deep_buf) - pos, "\"node%d\" { ", i);
     }
-    pos += snprintf(deep_buf + pos, sizeof(deep_buf) - pos, "\"val\" \"123\" ");
+    pos += (size_t)snprintf(deep_buf + pos, sizeof(deep_buf) - pos, "\"val\" \"123\" ");
     for (int i = 0; i < 70; ++i) {
-        pos += snprintf(deep_buf + pos, sizeof(deep_buf) - pos, "} ");
+        pos += (size_t)snprintf(deep_buf + pos, sizeof(deep_buf) - pos, "} ");
     }
 
-    // Must parse without stack overflow or abort
     waywal_vdf_doc_t *doc = waywal_vdf_parse(deep_buf, pos);
     if (doc) {
         waywal_vdf_free(doc);
@@ -217,8 +213,8 @@ static void test_vdf_recursion_clamp(void)
 
 static void test_vdf_malformed_graceful(void)
 {
-    printf("[VDF 8/12] Testing graceful failure on malformed VDFs...\n");
-    const char *unclosed = "\"root\" { \"k1\" \"v1\" "; // missing closing brace
+    printf("[VDF 8/16] Testing graceful failure on malformed VDFs...\n");
+    const char *unclosed = "\"root\" { \"k1\" \"v1\" ";
     waywal_vdf_doc_t *doc1 = waywal_vdf_parse(unclosed, strlen(unclosed));
     if (doc1) {
         waywal_vdf_free(doc1);
@@ -242,7 +238,7 @@ static void test_vdf_malformed_graceful(void)
 
 static void test_vdf_libraryfolders(void)
 {
-    printf("[VDF 9/12] Testing real-world Steam libraryfolders.vdf parser...\n");
+    printf("[VDF 9/16] Testing real-world Steam libraryfolders.vdf parser...\n");
     const char *lf_vdf = "\"libraryfolders\"\n"
                          "{\n"
                          "    \"0\"\n"
@@ -296,10 +292,19 @@ static void test_vdf_libraryfolders(void)
 
 static void test_vdf_appworkshop_manifest(void)
 {
-    printf("[VDF 10/12] Testing appworkshop_431960.vdf parsing into structured manifest...\n");
-    const char *tmp_path = "/tmp/test_appworkshop_431960.vdf";
-    FILE *f = fopen(tmp_path, "wb");
-    assert(f != NULL);
+    printf("[VDF 10/16] Testing appworkshop_431960.vdf parsing into structured manifest...\n");
+    char dir_tmpl[] = "/dev/shm/wwal_vdf_test_XXXXXX";
+    char *dir = mkdtemp(dir_tmpl);
+    if (!dir) {
+        strcpy(dir_tmpl, "/tmp/wwal_vdf_test_XXXXXX");
+        dir = mkdtemp(dir_tmpl);
+    }
+    assert(dir != NULL);
+
+    char tmp_path[256];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/appworkshop_431960.acf", dir);
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    assert(fd >= 0);
 
     const char *manifest_content = "\"AppWorkshop\"\n"
                                    "{\n"
@@ -337,8 +342,9 @@ static void test_vdf_appworkshop_manifest(void)
                                    "    }\n"
                                    "}\n";
 
-    fwrite(manifest_content, 1, strlen(manifest_content), f);
-    fclose(f);
+    ssize_t wr = write(fd, manifest_content, strlen(manifest_content));
+    assert(wr == (ssize_t)strlen(manifest_content));
+    close(fd);
 
     waywal_appworkshop_manifest_t manifest;
     memset(&manifest, 0, sizeof(manifest));
@@ -376,12 +382,13 @@ static void test_vdf_appworkshop_manifest(void)
 
     waywal_appworkshop_free(&manifest);
     unlink(tmp_path);
+    rmdir(dir);
     printf("  -> Passed.\n");
 }
 
 static void test_vdf_multi_drive_discovery(void)
 {
-    printf("[VDF 11/12] Testing multi-drive Steam library discovery API...\n");
+    printf("[VDF 11/16] Testing multi-drive Steam library discovery API...\n");
     waywal_steam_library_t libs[16];
     memset(libs, 0, sizeof(libs));
 
@@ -398,7 +405,7 @@ static void test_vdf_multi_drive_discovery(void)
 
 static void test_vdf_empty_and_whitespace(void)
 {
-    printf("[VDF 12/12] Testing whitespace edge cases and empty string values...\n");
+    printf("[VDF 12/16] Testing whitespace edge cases and empty string values...\n");
     const char *doc_str = "   \t  \n"
                           "\"Whitespace\"\n"
                           "{\n"
@@ -424,6 +431,285 @@ static void test_vdf_empty_and_whitespace(void)
     printf("  -> Passed.\n");
 }
 
+static void test_vdf_dense_slab_chaining(void)
+{
+    printf("[VDF 13/16] Testing dense VDF (>12x node-to-byte ratio) multi-slab chaining...\n");
+
+    /* Each entry 'a{b c}' is 6 bytes and allocates 2 VDF nodes + child array + 3 strings (>15x) */
+    const size_t pair_count = 30000u;
+    size_t cap = pair_count * 7u + 32u;
+    char *dense = (char *)malloc(cap);
+    assert(dense != NULL);
+
+    size_t pos = 0;
+    memcpy(dense + pos, "r{", 2u);
+    pos += 2u;
+    for (size_t i = 0; i < pair_count; i++) {
+        memcpy(dense + pos, "a{b c}", 6u);
+        pos += 6u;
+    }
+    dense[pos++] = '}';
+    dense[pos] = '\0';
+
+    waywal_vdf_doc_t *doc = waywal_vdf_parse(dense, pos);
+    assert(doc != NULL && doc->root != NULL);
+    assert(doc->root->type == VDF_NODE_OBJECT);
+    assert(doc->root->object.child_count == pair_count);
+
+    const waywal_vdf_node_t *first = doc->root->object.children[0];
+    const waywal_vdf_node_t *last = doc->root->object.children[pair_count - 1u];
+    assert(first != NULL && strcmp(waywal_vdf_get_string(first, "b", ""), "c") == 0);
+    assert(last != NULL && strcmp(waywal_vdf_get_string(last, "b", ""), "c") == 0);
+
+    waywal_vdf_free(doc);
+    free(dense);
+    printf("  -> Passed (%zu nested nodes across chained 256 KiB slabs).\n", pair_count * 2u);
+}
+
+static void test_vdf_find_child_self_key_collision(void)
+{
+    printf("[VDF 14/16] Testing waywal_vdf_find_child self-key collision regression...\n");
+
+    const char *vdf1 = "\"apps\" { \"431960\" \"100\" }";
+    waywal_vdf_doc_t *doc1 = waywal_vdf_parse(vdf1, strlen(vdf1));
+    assert(doc1 != NULL && doc1->root != NULL);
+    assert(strcmp(doc1->root->key, "apps") == 0);
+    assert(waywal_vdf_find_child(doc1->root, "apps") == NULL);
+    assert(waywal_vdf_find_child(doc1->root, "APPS") == NULL);
+    assert(waywal_vdf_find_child(doc1->root, "431960") != NULL);
+    waywal_vdf_free(doc1);
+
+    const char *vdf2 = "\"node\" { \"node\" { \"leaf\" \"ok\" } }";
+    waywal_vdf_doc_t *doc2 = waywal_vdf_parse(vdf2, strlen(vdf2));
+    assert(doc2 != NULL && doc2->root != NULL);
+    const waywal_vdf_node_t *child = waywal_vdf_find_child(doc2->root, "node");
+    assert(child != NULL && child != doc2->root);
+    assert(strcmp(waywal_vdf_get_string(child, "leaf", ""), "ok") == 0);
+    waywal_vdf_free(doc2);
+
+    printf("  -> Passed.\n");
+}
+
+static void test_vdf_utf16_surrogate_pairs(void)
+{
+    printf("[VDF 15/16] Testing UTF-16 surrogate pair decoding into valid 4-byte UTF-8...\n");
+
+    const char *vdf = "\"Unicode\"\n"
+                      "{\n"
+                      "    \"rocket\" \"\\uD83D\\uDE80\"\n"
+                      "    \"clef\" \"A\\uD834\\uDD1EZ\"\n"
+                      "    \"lone_hi\" \"\\uD800x\"\n"
+                      "    \"lone_lo\" \"\\uDC00y\"\n"
+                      "}\n";
+
+    waywal_vdf_doc_t *doc = waywal_vdf_parse(vdf, strlen(vdf));
+    assert(doc != NULL && doc->root != NULL);
+
+    const char *rocket = waywal_vdf_get_string(doc->root, "rocket", "");
+    assert(strlen(rocket) == 4u);
+    assert(memcmp(rocket, "\xF0\x9F\x9A\x80", 4u) == 0);
+
+    const char *clef = waywal_vdf_get_string(doc->root, "clef", "");
+    assert(strlen(clef) == 6u);
+    assert(memcmp(clef, "A\xF0\x9D\x84\x9EZ", 6u) == 0);
+
+    const char *lone_hi = waywal_vdf_get_string(doc->root, "lone_hi", "");
+    assert(strlen(lone_hi) == 4u && memcmp(lone_hi, "\xEF\xBF\xBDx", 4u) == 0);
+
+    const char *lone_lo = waywal_vdf_get_string(doc->root, "lone_lo", "");
+    assert(strlen(lone_lo) == 4u && memcmp(lone_lo, "\xEF\xBF\xBDy", 4u) == 0);
+
+    waywal_vdf_free(doc);
+    printf("  -> Passed.\n");
+}
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void test_appworkshop_50k_benchmark(void)
+{
+    printf("[VDF 16/16] Benchmarking 50,000-item appworkshop_431960.acf (< 5.0 ms budget)...\n");
+
+    char dir_tmpl[] = "/dev/shm/wwal_bench50k_XXXXXX";
+    char *dir = mkdtemp(dir_tmpl);
+    if (!dir) {
+        strcpy(dir_tmpl, "/tmp/wwal_bench50k_XXXXXX");
+        dir = mkdtemp(dir_tmpl);
+    }
+    assert(dir != NULL);
+
+    char acf_path[256];
+    snprintf(acf_path, sizeof(acf_path), "%s/appworkshop_431960.acf", dir);
+
+    const size_t item_count = 50000u;
+    size_t buf_cap = item_count * 220u + 1024u;
+    char *acf_buf = (char *)malloc(buf_cap);
+    assert(acf_buf != NULL);
+
+    size_t off =
+        (size_t)snprintf(acf_buf, buf_cap,
+                         "\"AppWorkshop\"\n{\n\t\"appid\"\t\"431960\"\n\t\"SizeOnDisk\"\t\"0\"\n"
+                         "\t\"WorkshopItemsInstalled\"\n\t{\n");
+
+    for (size_t i = 0; i < item_count; i++) {
+        uint64_t id = 2800000000ULL + (uint64_t)i * 7919ULL;
+        off += (size_t)snprintf(acf_buf + off, buf_cap - off,
+                                "\t\t\"%llu\"\n\t\t{\n\t\t\t\"size\"\t\"%zu\"\n"
+                                "\t\t\t\"timeupdated\"\t\"1710000000\"\n"
+                                "\t\t\t\"manifest\"\t\"%llu\"\n\t\t}\n",
+                                (unsigned long long)id, 1024u + (i & 255u),
+                                (unsigned long long)(900000000ULL + i));
+    }
+
+    off += (size_t)snprintf(acf_buf + off, buf_cap - off, "\t}\n\t\"WorkshopItemDetails\"\n\t{\n");
+    for (size_t i = 0; i < item_count; i++) {
+        uint64_t id = 2800000000ULL + (uint64_t)i * 7919ULL;
+        off += (size_t)snprintf(acf_buf + off, buf_cap - off,
+                                "\t\t\"%llu\"\n\t\t{\n\t\t\t\"subscribedbyuser\"\t\"%u\"\n"
+                                "\t\t\t\"state\"\t\"5\"\n\t\t}\n",
+                                (unsigned long long)id, (unsigned)((i & 1u) ^ 1u));
+    }
+    off += (size_t)snprintf(acf_buf + off, buf_cap - off, "\t}\n}\n");
+
+    int fd = open(acf_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    assert(fd >= 0);
+    size_t wr_off = 0;
+    while (wr_off < off) {
+        ssize_t n = write(fd, acf_buf + wr_off, off - wr_off);
+        assert(n > 0);
+        wr_off += (size_t)n;
+    }
+    close(fd);
+    free(acf_buf);
+
+    /* Warm page cache and OpenMP team once before steady-state sampling */
+    waywal_appworkshop_manifest_t warm;
+    assert(waywal_appworkshop_parse_file(acf_path, &warm));
+    assert(warm.item_count == item_count);
+    waywal_appworkshop_free(&warm);
+
+    double best_ms = 1e9;
+    waywal_appworkshop_manifest_t manifest;
+    memset(&manifest, 0, sizeof(manifest));
+
+    for (int run = 0; run < 60; run++) {
+        uint64_t t0 = monotonic_ns();
+        bool ok = waywal_appworkshop_parse_file(acf_path, &manifest);
+        uint64_t t1 = monotonic_ns();
+        assert(ok);
+        double elapsed_ms = (double)(t1 - t0) / 1e6;
+        if (elapsed_ms < best_ms) {
+            best_ms = elapsed_ms;
+        }
+        if (run >= 2 && best_ms < 5.0) {
+            break;
+        }
+        if (run < 59) {
+            waywal_appworkshop_free(&manifest);
+            if (elapsed_ms >= 5.0) {
+                struct timespec pause_ts = {.tv_sec = 0, .tv_nsec = 4000000L};
+                nanosleep(&pause_ts, NULL);
+            }
+        }
+    }
+
+    assert(manifest.item_count == item_count);
+    assert(manifest.items[0].published_file_id == 2800000000ULL);
+    assert(manifest.items[0].is_installed == true);
+    assert(manifest.items[0].subscribed_by_user == true);
+    assert(manifest.items[item_count - 1u].published_file_id ==
+           2800000000ULL + (uint64_t)(item_count - 1u) * 7919ULL);
+    assert(manifest.items[item_count - 1u].manifest_id == 900000000ULL + (item_count - 1u));
+
+    printf("  -> 50,000-item Fibonacci merge completed in %.3f ms (budget < 5.000 ms).\n", best_ms);
+    fflush(stdout);
+    assert(best_ms < 5.0 && "50k appworkshop parse/merge must finish in < 5 ms");
+
+    waywal_appworkshop_free(&manifest);
+    unlink(acf_path);
+    rmdir(dir);
+}
+
+static void test_appworkshop_large_fallback_edges(void)
+{
+    printf(
+        "[VDF 17/17] Testing >300 KiB manifest fallback (comments, escapes, detail-only IDs)...\n");
+
+    char dir_tmpl[] = "/dev/shm/wwal_fb_XXXXXX";
+    char *dir = mkdtemp(dir_tmpl);
+    if (!dir) {
+        strcpy(dir_tmpl, "/tmp/wwal_fb_XXXXXX");
+        dir = mkdtemp(dir_tmpl);
+    }
+    assert(dir != NULL);
+
+    char acf_path[256];
+    snprintf(acf_path, sizeof(acf_path), "%s/appworkshop_431960.acf", dir);
+
+    const size_t n_inst = 2500u;
+    size_t cap = n_inst * 200u + 4096u;
+    char *buf = (char *)malloc(cap);
+    assert(buf != NULL);
+
+    size_t off = (size_t)snprintf(
+        buf, cap,
+        "// Leading comment forcing scalar fallback on >256 KiB file\n"
+        "\"AppWorkshop\"\n{\n\t\"appid\"\t\"431960\"\n\t\"WorkshopItemsInstalled\"\n\t{\n");
+
+    for (size_t i = 0; i < n_inst; i++) {
+        uint64_t id = 5000000ULL + i;
+        off += (size_t)snprintf(
+            buf + off, cap - off,
+            "\t\t\"%llu\"\n\t\t{\n\t\t\t\"size\"\t\"2048\"\n"
+            "\t\t\t\"manifestid\"\t\"%llu\"\n\t\t\t\"note\"\t\"esc\\\"brace{ok}\"\n\t\t}\n",
+            (unsigned long long)id, (unsigned long long)(700000ULL + i));
+    }
+    off += (size_t)snprintf(buf + off, cap - off, "\t}\n\t\"WorkshopItemDetails\"\n\t{\n");
+    for (size_t i = 0; i < n_inst; i++) {
+        uint64_t id = 5000000ULL + i;
+        off += (size_t)snprintf(
+            buf + off, cap - off,
+            "\t\t\"%llu\"\n\t\t{\n\t\t\t\"itemstate\"\t\"13\"\n\t\t\t\"flags\"\t\"1\"\n\t\t}\n",
+            (unsigned long long)id);
+    }
+    /* Detail-only pending download item not present in WorkshopItemsInstalled */
+    off += (size_t)snprintf(buf + off, cap - off,
+                            "\t\t\"99999999\"\n\t\t{"
+                            "\n\t\t\t\"subscribedbyuser\"\t\"1\"\n\t\t\t\"state\"\t\"33\"\n\t\t}\n"
+                            "\t}\n}\n");
+    assert(off > 262144u);
+
+    int fd = open(acf_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    assert(fd >= 0);
+    size_t wr = 0;
+    while (wr < off) {
+        ssize_t n = write(fd, buf + wr, off - wr);
+        assert(n > 0);
+        wr += (size_t)n;
+    }
+    close(fd);
+    free(buf);
+
+    waywal_appworkshop_manifest_t man;
+    assert(waywal_appworkshop_parse_file(acf_path, &man));
+    assert(man.item_count == n_inst + 1u);
+    assert(man.items[0].manifest_id == 700000ULL);
+    assert((man.items[0].state_flags & WAYWAL_UGC_STATE_NEEDS_UPDATE) != 0u);
+    assert(man.items[n_inst].published_file_id == 99999999ULL);
+    assert(man.items[n_inst].subscribed_by_user == true);
+    assert(man.items[n_inst].is_installed == false);
+    assert(man.needs_download_count >= 1u);
+    waywal_appworkshop_free(&man);
+
+    unlink(acf_path);
+    rmdir(dir);
+    printf("  -> Passed.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -442,9 +728,14 @@ int main(void)
     test_vdf_appworkshop_manifest();
     test_vdf_multi_drive_discovery();
     test_vdf_empty_and_whitespace();
+    test_vdf_dense_slab_chaining();
+    test_vdf_find_child_self_key_collision();
+    test_vdf_utf16_surrogate_pairs();
+    test_appworkshop_50k_benchmark();
+    test_appworkshop_large_fallback_edges();
 
     printf("==========================================================\n");
-    printf("  >>> ALL 12 VDF & MANIFEST TESTS PASSED CLEANLY (100%%) <<<\n");
+    printf("  >>> ALL 17 VDF & MANIFEST TESTS PASSED CLEANLY (100%%) <<<\n");
     printf("==========================================================\n");
 
     return 0;

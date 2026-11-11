@@ -14,6 +14,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <linux/openat2.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -23,6 +25,7 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -37,10 +40,6 @@ struct we_compat_scanner {
     bool supports_compute;
     bool supports_bc7;
 };
-
-/* =========================================================================
- * Dynamic Heap Lifecycle Management
- * ========================================================================= */
 
 we_compat_report_t *we_compat_report_alloc(void)
 {
@@ -61,10 +60,6 @@ we_compat_scanner_t *we_compat_scanner_create(bool supports_compute, bool suppor
 }
 
 void we_compat_scanner_destroy(we_compat_scanner_t *scanner) { free(scanner); }
-
-/* =========================================================================
- * Report Issue & Auto-Repair Helpers
- * ========================================================================= */
 
 static void report_add_issue(we_compat_report_t *report, const char *code,
                              we_issue_severity_t severity, const char *msg, const char *file_path,
@@ -102,22 +97,140 @@ static void report_add_repair(we_compat_report_t *report, const char *transforma
     snprintf(rep->description, sizeof(rep->description), "%s", description ? description : "");
 }
 
-/* =========================================================================
- * Byte Reading Utilities
- * ========================================================================= */
-
-static inline uint16_t read_u16_le(const uint8_t *p)
-{
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8u);
-}
-
 static inline uint32_t read_u32_le(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8u) | ((uint32_t)p[2] << 16u) |
            ((uint32_t)p[3] << 24u);
 }
 
-static inline int32_t read_i32_le(const uint8_t *p) { return (int32_t)read_u32_le(p); }
+static bool has_ext_ci(const char *path, size_t plen, const char *ext)
+{
+    size_t elen = strlen(ext);
+    if (plen < elen) {
+        return false;
+    }
+    return strcasecmp(path + plen - elen, ext) == 0;
+}
+
+static const char *slice_find_str(const char *haystack, size_t hlen, const char *needle)
+{
+    if (!haystack || !needle) {
+        return NULL;
+    }
+    size_t nlen = strlen(needle);
+    if (nlen == 0u) {
+        return haystack;
+    }
+    if (hlen < nlen) {
+        return NULL;
+    }
+    return (const char *)memmem(haystack, hlen, needle, nlen);
+}
+
+static bool slice_contains(const char *haystack, size_t hlen, const char *needle)
+{
+    return slice_find_str(haystack, hlen, needle) != NULL;
+}
+
+/* =========================================================================
+ * Growable OOM-Safe String Builder
+ * ========================================================================= */
+
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+    bool oom;
+} compat_sb_t;
+
+static void sb_init(compat_sb_t *sb)
+{
+    sb->cap = 4096u;
+    sb->buf = (char *)malloc(sb->cap);
+    sb->len = 0;
+    sb->oom = (sb->buf == NULL);
+    if (sb->buf) {
+        sb->buf[0] = '\0';
+    }
+}
+
+static bool sb_append_n(compat_sb_t *sb, const char *s, size_t slen)
+{
+    if (!sb || sb->oom || !sb->buf || (!s && slen > 0u)) {
+        if (sb) {
+            sb->oom = true;
+        }
+        return false;
+    }
+    if (slen == 0u) {
+        return true;
+    }
+    if (slen > SIZE_MAX - sb->len - 1u) {
+        sb->oom = true;
+        return false;
+    }
+
+    size_t needed = sb->len + slen + 1u;
+    if (needed > sb->cap) {
+        size_t ncap = sb->cap ? sb->cap : 4096u;
+        while (ncap < needed) {
+            if (ncap > SIZE_MAX / 2u) {
+                ncap = needed;
+                break;
+            }
+            ncap *= 2u;
+        }
+        char *nb = (char *)realloc(sb->buf, ncap);
+        if (!nb) {
+            sb->oom = true;
+            return false;
+        }
+        sb->buf = nb;
+        sb->cap = ncap;
+    }
+
+    memcpy(sb->buf + sb->len, s, slen);
+    sb->len += slen;
+    sb->buf[sb->len] = '\0';
+    return true;
+}
+
+static bool sb_append(compat_sb_t *sb, const char *s)
+{
+    if (!s) {
+        return false;
+    }
+    return sb_append_n(sb, s, strlen(s));
+}
+
+static void sb_append_json_str(compat_sb_t *sb, const char *s)
+{
+    (void)sb_append_n(sb, "\"", 1u);
+    if (s) {
+        for (size_t i = 0; s[i]; i++) {
+            unsigned char c = (unsigned char)s[i];
+            if (c == '"') {
+                (void)sb_append_n(sb, "\\\"", 2u);
+            } else if (c == '\\') {
+                (void)sb_append_n(sb, "\\\\", 2u);
+            } else if (c == '\n') {
+                (void)sb_append_n(sb, "\\n", 2u);
+            } else if (c == '\r') {
+                (void)sb_append_n(sb, "\\r", 2u);
+            } else if (c == '\t') {
+                (void)sb_append_n(sb, "\\t", 2u);
+            } else if (c < 0x20u) {
+                char esc[8];
+                snprintf(esc, sizeof(esc), "\\u%04x", c);
+                (void)sb_append(sb, esc);
+            } else {
+                char ch = (char)c;
+                (void)sb_append_n(sb, &ch, 1u);
+            }
+        }
+    }
+    (void)sb_append_n(sb, "\"", 1u);
+}
 
 /* =========================================================================
  * Rolling XOR De-masking & Binary PKG Inspection
@@ -162,36 +275,153 @@ static bool check_pkg_version_digits(const uint8_t *ver4)
     }
     uint32_t v = (uint32_t)(ver4[0] - '0') * 1000u + (uint32_t)(ver4[1] - '0') * 100u +
                  (uint32_t)(ver4[2] - '0') * 10u + (uint32_t)(ver4[3] - '0');
-    return (v >= 1u && v <= 24u);
+    return (v >= 1u && v <= 99u);
+}
+
+static inline uint8_t demask_byte_at(const uint8_t *data, const uint8_t *key, size_t period,
+                                     size_t pos)
+{
+    return period == 0u ? data[pos] : (uint8_t)(data[pos] ^ key[pos % period]);
+}
+
+static inline uint32_t demask_u32_at(const uint8_t *data, const uint8_t *key, size_t period,
+                                     size_t pos)
+{
+    return (uint32_t)demask_byte_at(data, key, period, pos) |
+           ((uint32_t)demask_byte_at(data, key, period, pos + 1u) << 8u) |
+           ((uint32_t)demask_byte_at(data, key, period, pos + 2u) << 16u) |
+           ((uint32_t)demask_byte_at(data, key, period, pos + 3u) << 24u);
+}
+
+static bool validate_demasked_pkg_at(const uint8_t *data, size_t size, const uint8_t *key,
+                                     size_t period, size_t table_cursor, bool *out_exact_end)
+{
+    if (out_exact_end) {
+        *out_exact_end = false;
+    }
+    if (table_cursor + 4u > size) {
+        return false;
+    }
+
+    uint32_t entry_count = demask_u32_at(data, key, period, table_cursor);
+    if (entry_count > WE_PKG_MAX_ENTRIES) {
+        return false;
+    }
+
+    size_t cursor = table_cursor + 4u;
+    if (entry_count == 0u) {
+        if (out_exact_end) {
+            *out_exact_end = (cursor == size);
+        }
+        return cursor <= size;
+    }
+
+    if ((uint64_t)entry_count * 13ULL > (uint64_t)(size - cursor)) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < entry_count; i++) {
+        if (cursor + 4u > size) {
+            return false;
+        }
+        uint32_t path_len = demask_u32_at(data, key, period, cursor);
+        cursor += 4u;
+        if (path_len == 0u || path_len > WE_PKG_MAX_PATH_LEN || cursor + path_len + 8u > size) {
+            return false;
+        }
+
+        size_t eff_len = path_len;
+        while (eff_len > 0u && demask_byte_at(data, key, period, cursor + eff_len - 1u) == '\0') {
+            eff_len--;
+        }
+        if (eff_len == 0u) {
+            return false;
+        }
+        for (size_t k = 0; k < eff_len; k++) {
+            uint8_t ch = demask_byte_at(data, key, period, cursor + k);
+            if (ch < 0x20u || ch >= 0x7Fu) {
+                return false;
+            }
+        }
+        cursor += path_len + 8u;
+    }
+
+    size_t data_base = cursor;
+    size_t max_end = data_base;
+    size_t walk = table_cursor + 4u;
+    for (uint32_t i = 0; i < entry_count; i++) {
+        uint32_t path_len = demask_u32_at(data, key, period, walk);
+        walk += 4u + path_len;
+        uint32_t off = demask_u32_at(data, key, period, walk);
+        uint32_t len = demask_u32_at(data, key, period, walk + 4u);
+        walk += 8u;
+
+        uint64_t start = (uint64_t)data_base + (uint64_t)off;
+        uint64_t end = start + (uint64_t)len;
+        if (start < (uint64_t)data_base || end < start || end > (uint64_t)size) {
+            return false;
+        }
+        if ((size_t)end > max_end) {
+            max_end = (size_t)end;
+        }
+    }
+
+    if (out_exact_end) {
+        *out_exact_end = (max_end == size);
+    }
+    return true;
+}
+
+static bool validate_demasked_pkg(const uint8_t *data, size_t size, const uint8_t *key,
+                                  size_t period, bool *out_exact_end)
+{
+    if (size < 16u) {
+        return false;
+    }
+    uint32_t magic_len = demask_u32_at(data, key, period, 0u);
+    if (magic_len != 8u && magic_len != 9u) {
+        return false;
+    }
+    size_t table_cursor = 4u + (size_t)magic_len;
+    if (validate_demasked_pkg_at(data, size, key, period, table_cursor, out_exact_end)) {
+        return true;
+    }
+    if (table_cursor < size && demask_byte_at(data, key, period, table_cursor) == '\0') {
+        return validate_demasked_pkg_at(data, size, key, period, table_cursor + 1u, out_exact_end);
+    }
+    return false;
 }
 
 /* Detects rolling XOR obfuscation for periods P in {1, 4, 8, 16}.
  * Returns key period (0 if plain unmasked PKGV, > 0 if masked), or -1 if invalid container. */
 static int detect_rolling_xor_key(const uint8_t *data, size_t size, uint8_t out_key[16])
 {
-    if (!data || size < 16) {
+    if (!data || size < 16u) {
         return -1;
     }
     memset(out_key, 0, 16);
 
-    /* 1. Test unmasked PKGV */
-    if (size >= 12) {
+    /* 1. Plain unmasked PKGV */
+    {
         uint32_t magic_len = read_u32_le(data);
-        if (magic_len == 8 && memcmp(data + 4, "PKGV", 4) == 0 &&
-            check_pkg_version_digits(data + 8)) {
-            return 0; /* Plain unmasked */
+        if ((magic_len == 8u || magic_len == 9u) && memcmp(data + 4, "PKGV", 4) == 0 &&
+            check_pkg_version_digits(data + 8) &&
+            validate_demasked_pkg(data, size, NULL, 0u, NULL)) {
+            return 0;
         }
     }
 
-    /* 2. Test Period 1 */
+    /* 2. Period 1 */
     {
-        uint8_t k = data[4] ^ 'P';
-        if (k != 0 && (data[5] ^ k) == 'K' && (data[6] ^ k) == 'G' && (data[7] ^ k) == 'V') {
-            if ((data[0] ^ k) == 8 && (data[1] ^ k) == 0 && (data[2] ^ k) == 0 &&
-                (data[3] ^ k) == 0) {
+        uint8_t k = (uint8_t)(data[4] ^ (uint8_t)'P');
+        if (k != 0u && (data[5] ^ k) == 'K' && (data[6] ^ k) == 'G' && (data[7] ^ k) == 'V') {
+            uint8_t m0 = (uint8_t)(data[0] ^ k);
+            if ((m0 == 8u || m0 == 9u) && (data[1] ^ k) == 0u && (data[2] ^ k) == 0u &&
+                (data[3] ^ k) == 0u) {
                 uint8_t ver[4] = {(uint8_t)(data[8] ^ k), (uint8_t)(data[9] ^ k),
                                   (uint8_t)(data[10] ^ k), (uint8_t)(data[11] ^ k)};
-                if (check_pkg_version_digits(ver)) {
+                if (check_pkg_version_digits(ver) &&
+                    validate_demasked_pkg(data, size, &k, 1u, NULL)) {
                     out_key[0] = k;
                     return 1;
                 }
@@ -199,16 +429,18 @@ static int detect_rolling_xor_key(const uint8_t *data, size_t size, uint8_t out_
         }
     }
 
-    /* 3. Test Period 4 */
+    /* 3. Period 4 */
     {
-        uint8_t k[4] = {(uint8_t)(data[4] ^ 'P'), (uint8_t)(data[5] ^ 'K'),
-                        (uint8_t)(data[6] ^ 'G'), (uint8_t)(data[7] ^ 'V')};
-        if ((k[0] | k[1] | k[2] | k[3]) != 0) {
-            if ((data[0] ^ k[0]) == 8 && (data[1] ^ k[1]) == 0 && (data[2] ^ k[2]) == 0 &&
-                (data[3] ^ k[3]) == 0) {
+        uint8_t k[4] = {(uint8_t)(data[4] ^ (uint8_t)'P'), (uint8_t)(data[5] ^ (uint8_t)'K'),
+                        (uint8_t)(data[6] ^ (uint8_t)'G'), (uint8_t)(data[7] ^ (uint8_t)'V')};
+        if ((k[0] | k[1] | k[2] | k[3]) != 0u) {
+            uint8_t m0 = (uint8_t)(data[0] ^ k[0]);
+            if ((m0 == 8u || m0 == 9u) && (data[1] ^ k[1]) == 0u && (data[2] ^ k[2]) == 0u &&
+                (data[3] ^ k[3]) == 0u) {
                 uint8_t ver[4] = {(uint8_t)(data[8] ^ k[0]), (uint8_t)(data[9] ^ k[1]),
                                   (uint8_t)(data[10] ^ k[2]), (uint8_t)(data[11] ^ k[3])};
-                if (check_pkg_version_digits(ver)) {
+                if (check_pkg_version_digits(ver) &&
+                    validate_demasked_pkg(data, size, k, 4u, NULL)) {
                     memcpy(out_key, k, 4);
                     return 4;
                 }
@@ -216,58 +448,126 @@ static int detect_rolling_xor_key(const uint8_t *data, size_t size, uint8_t out_
         }
     }
 
-    /* 4. Test Period 8 */
-    {
+    /* 4. Period 8: validate table so Period-16 keys with matching k[0..3]/k[8..11] do not
+     * misclassify */
+    for (uint8_t mlen = 8u; mlen <= 9u; mlen++) {
         uint8_t k[8];
-        k[0] = (uint8_t)(data[0] ^ 8);
-        k[1] = (uint8_t)(data[1] ^ 0);
-        k[2] = (uint8_t)(data[2] ^ 0);
-        k[3] = (uint8_t)(data[3] ^ 0);
-        k[4] = (uint8_t)(data[4] ^ 'P');
-        k[5] = (uint8_t)(data[5] ^ 'K');
-        k[6] = (uint8_t)(data[6] ^ 'G');
-        k[7] = (uint8_t)(data[7] ^ 'V');
+        k[0] = (uint8_t)(data[0] ^ mlen);
+        k[1] = data[1];
+        k[2] = data[2];
+        k[3] = data[3];
+        k[4] = (uint8_t)(data[4] ^ (uint8_t)'P');
+        k[5] = (uint8_t)(data[5] ^ (uint8_t)'K');
+        k[6] = (uint8_t)(data[6] ^ (uint8_t)'G');
+        k[7] = (uint8_t)(data[7] ^ (uint8_t)'V');
 
         uint8_t ver[4] = {(uint8_t)(data[8] ^ k[0]), (uint8_t)(data[9] ^ k[1]),
                           (uint8_t)(data[10] ^ k[2]), (uint8_t)(data[11] ^ k[3])};
-        if (check_pkg_version_digits(ver)) {
+        if (check_pkg_version_digits(ver) && validate_demasked_pkg(data, size, k, 8u, NULL)) {
             memcpy(out_key, k, 8);
             return 8;
         }
     }
 
-    /* 5. Test Period 16 */
+    /* 5. Period 16: recover k[12..15] from candidate entry_count rather than zeroing entry_count */
     {
         uint8_t k[16];
-        k[0] = (uint8_t)(data[0] ^ 8);
-        k[1] = (uint8_t)(data[1] ^ 0);
-        k[2] = (uint8_t)(data[2] ^ 0);
-        k[3] = (uint8_t)(data[3] ^ 0);
-        k[4] = (uint8_t)(data[4] ^ 'P');
-        k[5] = (uint8_t)(data[5] ^ 'K');
-        k[6] = (uint8_t)(data[6] ^ 'G');
-        k[7] = (uint8_t)(data[7] ^ 'V');
+        k[0] = (uint8_t)(data[0] ^ 8u);
+        k[1] = data[1];
+        k[2] = data[2];
+        k[3] = data[3];
+        k[4] = (uint8_t)(data[4] ^ (uint8_t)'P');
+        k[5] = (uint8_t)(data[5] ^ (uint8_t)'K');
+        k[6] = (uint8_t)(data[6] ^ (uint8_t)'G');
+        k[7] = (uint8_t)(data[7] ^ (uint8_t)'V');
 
-        for (uint32_t v = 1; v <= 24; v++) {
-            char ver_str[5];
-            snprintf(ver_str, sizeof(ver_str), "%04u", v);
-            k[8] = (uint8_t)(data[8] ^ (uint8_t)ver_str[0]);
-            k[9] = (uint8_t)(data[9] ^ (uint8_t)ver_str[1]);
-            k[10] = (uint8_t)(data[10] ^ (uint8_t)ver_str[2]);
-            k[11] = (uint8_t)(data[11] ^ (uint8_t)ver_str[3]);
-
+        if (size == 16u) {
+            k[8] = (uint8_t)(data[8] ^ (uint8_t)'0');
+            k[9] = (uint8_t)(data[9] ^ (uint8_t)'0');
+            k[10] = (uint8_t)(data[10] ^ (uint8_t)'0');
+            k[11] = (uint8_t)(data[11] ^ (uint8_t)'1');
             k[12] = data[12];
             k[13] = data[13];
             k[14] = data[14];
             k[15] = data[15];
+            memcpy(out_key, k, 16);
+            return 16;
+        }
 
-            if (size >= 20) {
-                uint32_t path_len =
-                    (uint32_t)(data[16] ^ k[0]) | ((uint32_t)(data[17] ^ k[1]) << 8u) |
-                    ((uint32_t)(data[18] ^ k[2]) << 16u) | ((uint32_t)(data[19] ^ k[3]) << 24u);
-                if (path_len > 0 && path_len <= 1024 && size >= 20 + path_len) {
-                    memcpy(out_key, k, 16);
-                    return 16;
+        if (size >= 29u) {
+            /* Offset 16 (path0_len) aligns to 16 % 16 == 0, so k[0..3] decodes it in O(1) */
+            uint32_t path0_len = (uint32_t)(data[16] ^ k[0]) | ((uint32_t)(data[17] ^ k[1]) << 8u) |
+                                 ((uint32_t)(data[18] ^ k[2]) << 16u) |
+                                 ((uint32_t)(data[19] ^ k[3]) << 24u);
+
+            if (path0_len >= 1u && path0_len <= WE_PKG_MAX_PATH_LEN &&
+                20u + (size_t)path0_len + 8u <= size) {
+                /* Offset 20..23 aligns to k[4..7]; verify initial path bytes before searching */
+                bool prefix_ok = true;
+                size_t pre_check = path0_len < 4u ? (size_t)path0_len : 4u;
+                for (size_t p = 0; p < pre_check; p++) {
+                    uint8_t ch = (uint8_t)(data[20u + p] ^ k[4u + p]);
+                    if ((ch < 0x20u || ch >= 0x7Fu) && !(ch == '\0' && p + 1u == path0_len)) {
+                        prefix_ok = false;
+                        break;
+                    }
+                }
+
+                if (prefix_ok) {
+                    size_t max_possible = (size - 16u) / 13u;
+                    if (max_possible > WE_PKG_MAX_ENTRIES) {
+                        max_possible = WE_PKG_MAX_ENTRIES;
+                    }
+
+                    uint8_t fallback_key[16];
+                    bool have_fallback = false;
+
+                    for (uint32_t v = 1u; v <= 24u; v++) {
+                        k[8] = (uint8_t)(data[8] ^ (uint8_t)'0');
+                        k[9] = (uint8_t)(data[9] ^ (uint8_t)'0');
+                        k[10] = (uint8_t)(data[10] ^ (uint8_t)('0' + (v / 10u)));
+                        k[11] = (uint8_t)(data[11] ^ (uint8_t)('0' + (v % 10u)));
+
+                        if (path0_len > 4u) {
+                            size_t v_end = path0_len < 8u ? (size_t)path0_len : 8u;
+                            bool v_ok = true;
+                            for (size_t p = 4u; p < v_end; p++) {
+                                uint8_t ch = (uint8_t)(data[20u + p] ^ k[4u + p]);
+                                if ((ch < 0x20u || ch >= 0x7Fu) &&
+                                    !(ch == '\0' && p + 1u == path0_len)) {
+                                    v_ok = false;
+                                    break;
+                                }
+                            }
+                            if (!v_ok) {
+                                continue;
+                            }
+                        }
+
+                        for (uint32_t ec = 1u; ec <= (uint32_t)max_possible; ec++) {
+                            k[12] = (uint8_t)(data[12] ^ (uint8_t)(ec & 0xFFu));
+                            k[13] = (uint8_t)(data[13] ^ (uint8_t)((ec >> 8u) & 0xFFu));
+                            k[14] = (uint8_t)(data[14] ^ (uint8_t)((ec >> 16u) & 0xFFu));
+                            k[15] = (uint8_t)(data[15] ^ (uint8_t)((ec >> 24u) & 0xFFu));
+
+                            bool exact_end = false;
+                            if (validate_demasked_pkg_at(data, size, k, 16u, 12u, &exact_end)) {
+                                if (exact_end) {
+                                    memcpy(out_key, k, 16);
+                                    return 16;
+                                }
+                                if (!have_fallback) {
+                                    memcpy(fallback_key, k, 16);
+                                    have_fallback = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if (have_fallback) {
+                        memcpy(out_key, fallback_key, 16);
+                        return 16;
+                    }
                 }
             }
         }
@@ -287,7 +587,7 @@ static bool has_directory_traversal(const char *path)
     }
     const char *p = path;
     while (*p) {
-        if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7F) {
+        if ((unsigned char)*p < 0x20u || (unsigned char)*p == 0x7Fu) {
             return true;
         }
         if (p[0] == '.' && p[1] == '.') {
@@ -303,21 +603,18 @@ static bool has_directory_traversal(const char *path)
 
 static bool is_executable_binary_payload(const uint8_t *data, size_t size, const char *path)
 {
-    if (!data || size < 2) {
+    if (!data || size < 2u) {
         return false;
     }
 
-    /* Windows PE binary (MZ header: 0x4D, 0x5A) */
-    if (data[0] == 0x4D && data[1] == 0x5A) {
+    if (data[0] == 0x4Du && data[1] == 0x5Au) {
         return true;
     }
 
-    /* Linux ELF binary (\x7FELF: 0x7F, 'E', 'L', 'F') */
-    if (size >= 4 && data[0] == 0x7F && data[1] == 'E' && data[2] == 'L' && data[3] == 'F') {
+    if (size >= 4u && data[0] == 0x7Fu && data[1] == 'E' && data[2] == 'L' && data[3] == 'F') {
         return true;
     }
 
-    /* File extension check */
     if (path) {
         const char *dot = strrchr(path, '.');
         if (dot) {
@@ -333,7 +630,7 @@ static bool is_executable_binary_payload(const uint8_t *data, size_t size, const
 }
 
 /* =========================================================================
- * Fast MDL Skeletal Puppet Parser
+ * Fast MDL Skeletal Puppet & TEX Header Parsers
  * ========================================================================= */
 
 typedef struct {
@@ -345,34 +642,33 @@ typedef struct {
 
 static bool parse_mdl_header_fast(const uint8_t *data, size_t size, we_compat_mdl_info_t *out)
 {
-    if (!data || size < 32 || !out) {
+    if (!data || size < 32u || !out) {
         return false;
     }
     memset(out, 0, sizeof(*out));
 
     size_t cur = 0;
-    if (size >= 12 && memcmp(data, "MDLV", 4) != 0 && data[0] == 8 && data[1] == 0) {
-        cur = 4;
+    if (size >= 12u && memcmp(data, "MDLV", 4) != 0 && data[0] == 8u && data[1] == 0u) {
+        cur = 4u;
     }
 
-    if (cur + 8 > size || memcmp(data + cur, "MDLV", 4) != 0) {
+    if (cur + 8u > size || memcmp(data + cur, "MDLV", 4) != 0) {
         return false;
     }
-    cur += 8;
+    cur += 8u;
     if (cur < size && data[cur] == '\0') {
         cur++;
     }
 
-    if (cur + 12 > size) {
+    if (cur + 12u > size) {
         return false;
     }
-    cur += 12; /* mdl_flag (4) + unk1 (4) + unk2 (4) */
+    cur += 12u;
 
-    /* Skip material json filename */
-    if (cur + 4 <= size) {
+    if (cur + 4u <= size) {
         uint32_t slen = read_u32_le(data + cur);
-        if (slen > 0 && slen < 1024 && cur + 4 + slen <= size) {
-            cur += 4 + slen;
+        if (slen > 0u && slen < 1024u && cur + 4u + slen <= size) {
+            cur += 4u + slen;
         } else {
             while (cur < size && data[cur] != '\0') {
                 cur++;
@@ -383,48 +679,53 @@ static bool parse_mdl_header_fast(const uint8_t *data, size_t size, we_compat_md
         }
     }
 
-    if (cur + 4 > size) {
+    if (cur + 4u > size) {
         return false;
     }
     uint32_t curr = read_u32_le(data + cur);
-    cur += 4;
+    cur += 4u;
 
     uint32_t vertex_byte_size = 0;
-    uint32_t stride = 52;
+    uint32_t stride = 52u;
     if (curr == 0x0180000Fu) {
-        if (cur + 4 > size) {
+        if (cur + 4u > size) {
             return false;
         }
         vertex_byte_size = read_u32_le(data + cur);
-        cur += 4;
-        stride = 80;
+        cur += 4u;
+        stride = 80u;
     } else {
         vertex_byte_size = curr;
-        stride = 52;
+        stride = 52u;
     }
 
-    if (vertex_byte_size > 0 && (vertex_byte_size % stride) == 0) {
+    if (vertex_byte_size > size - cur) {
+        return false;
+    }
+    if (vertex_byte_size > 0u && (vertex_byte_size % stride) == 0u) {
         out->vertex_count = vertex_byte_size / stride;
     }
     cur += vertex_byte_size;
 
-    if (cur + 4 <= size) {
+    if (cur + 4u <= size) {
         uint32_t indices_size = read_u32_le(data + cur);
-        cur += 4;
-        if (indices_size > 0 && (indices_size % 6) == 0) {
-            out->triangle_count = indices_size / 6;
+        cur += 4u;
+        if (indices_size > size - cur) {
+            return false;
+        }
+        if (indices_size > 0u && (indices_size % 6u) == 0u) {
+            out->triangle_count = indices_size / 6u;
         }
         cur += indices_size;
     }
 
-    /* Scan ahead for MDLS (skeleton / bones) */
-    while (cur + 8 <= size) {
+    while (cur + 8u <= size) {
         if (memcmp(data + cur, "MDLS", 4) == 0 && isdigit(data[cur + 4])) {
-            cur += 8;
+            cur += 8u;
             if (cur < size && data[cur] == '\0') {
                 cur++;
             }
-            if (cur + 4 <= size) {
+            if (cur + 4u <= size) {
                 out->bone_count = read_u32_le(data + cur);
             }
             break;
@@ -432,13 +733,9 @@ static bool parse_mdl_header_fast(const uint8_t *data, size_t size, we_compat_md
         cur++;
     }
 
-    out->is_valid = (out->vertex_count > 0 || out->triangle_count > 0 || out->bone_count > 0);
+    out->is_valid = (out->vertex_count > 0u || out->triangle_count > 0u || out->bone_count > 0u);
     return out->is_valid;
 }
-
-/* =========================================================================
- * Fast TEX Texture Header Parser (Format & Dimensions)
- * ========================================================================= */
 
 typedef struct {
     uint32_t format;
@@ -449,34 +746,33 @@ typedef struct {
 
 static bool parse_tex_header_fast(const uint8_t *data, size_t size, we_compat_tex_info_t *out)
 {
-    if (!data || size < 32 || !out) {
+    if (!data || size < 32u || !out) {
         return false;
     }
     memset(out, 0, sizeof(*out));
 
     size_t cur = 0;
-    if (size >= 12 && memcmp(data, "TEXV", 4) != 0 && data[0] == 8 && data[1] == 0) {
-        cur = 4;
+    if (size >= 12u && memcmp(data, "TEXV", 4) != 0 && data[0] == 8u && data[1] == 0u) {
+        cur = 4u;
     }
-    if (cur + 8 > size || memcmp(data + cur, "TEXV", 4) != 0) {
+    if (cur + 8u > size || memcmp(data + cur, "TEXV", 4) != 0) {
         return false;
     }
-    cur += 8;
+    cur += 8u;
     if (cur < size && data[cur] == '\0') {
         cur++;
     }
 
-    /* Look for TEXI */
-    while (cur + 8 <= size) {
+    while (cur + 8u <= size) {
         if (memcmp(data + cur, "TEXI", 4) == 0) {
-            cur += 8;
+            cur += 8u;
             if (cur < size && data[cur] == '\0') {
                 cur++;
             }
-            if (cur + 24 <= size) {
+            if (cur + 24u <= size) {
                 out->format = read_u32_le(data + cur);
-                out->width = read_u32_le(data + cur + 8);
-                out->height = read_u32_le(data + cur + 12);
+                out->width = read_u32_le(data + cur + 8u);
+                out->height = read_u32_le(data + cur + 12u);
                 out->is_bc7 = (out->format == 12u);
                 return true;
             }
@@ -488,70 +784,257 @@ static bool parse_tex_header_fast(const uint8_t *data, size_t size, we_compat_te
 }
 
 /* =========================================================================
- * SceneScript AST & Sandbox Token Auditor
+ * Stateful SceneScript JavaScript Lexer & Sandbox Auditor
  * ========================================================================= */
 
 static const char *const FORBIDDEN_JS_PRIMITIVES[] = {
     "eval",           "Function", "require",   "process",       "window", "document",
     "XMLHttpRequest", "fetch",    "WebSocket", "child_process", NULL};
 
-static bool is_token_boundary(char c)
+static inline bool is_js_ident_start(char c)
 {
-    return !(isalnum((unsigned char)c) || c == '_' || c == '$');
+    return isalpha((unsigned char)c) || c == '_' || c == '$';
+}
+
+static inline bool is_js_ident_char(char c)
+{
+    return isalnum((unsigned char)c) || c == '_' || c == '$';
+}
+
+typedef enum {
+    JS_STATE_CODE = 0,
+    JS_STATE_STR_SQ,
+    JS_STATE_STR_DQ,
+    JS_STATE_TEMPLATE,
+} js_lex_state_t;
+
+typedef struct {
+    const char *src;
+    size_t len;
+    size_t pos;
+    uint32_t line;
+    js_lex_state_t state;
+    uint32_t brace_depth;
+    uint32_t tmpl_brace_stack[32];
+    uint32_t tmpl_depth;
+} js_lexer_t;
+
+typedef enum {
+    JS_TOK_EOF = 0,
+    JS_TOK_IDENT,
+    JS_TOK_NUMBER,
+    JS_TOK_PUNCT,
+} js_tok_kind_t;
+
+typedef struct {
+    js_tok_kind_t kind;
+    const char *ptr;
+    size_t len;
+    uint32_t line;
+} js_token_t;
+
+static void js_lexer_init(js_lexer_t *lx, const char *src, size_t len)
+{
+    memset(lx, 0, sizeof(*lx));
+    lx->src = src;
+    lx->len = len;
+    lx->line = 1u;
+    lx->state = JS_STATE_CODE;
+}
+
+/* Advances through string literals, template literals (switching back to CODE inside ${...}),
+ * comments, and whitespace so '//' inside "http://..." never masks trailing code. */
+static bool js_lexer_next_code_token(js_lexer_t *lx, js_token_t *out)
+{
+    const char *src = lx->src;
+    size_t len = lx->len;
+
+    while (lx->pos < len) {
+        if (lx->state == JS_STATE_STR_SQ || lx->state == JS_STATE_STR_DQ) {
+            char quote = (lx->state == JS_STATE_STR_SQ) ? '\'' : '"';
+            while (lx->pos < len) {
+                char c = src[lx->pos++];
+                if (c == '\\') {
+                    if (lx->pos < len) {
+                        if (src[lx->pos] == '\n') {
+                            lx->line++;
+                        }
+                        lx->pos++;
+                    }
+                    continue;
+                }
+                if (c == '\n') {
+                    lx->line++;
+                    lx->state = JS_STATE_CODE;
+                    break;
+                }
+                if (c == quote) {
+                    lx->state = JS_STATE_CODE;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (lx->state == JS_STATE_TEMPLATE) {
+            while (lx->pos < len) {
+                char c = src[lx->pos++];
+                if (c == '\\') {
+                    if (lx->pos < len) {
+                        if (src[lx->pos] == '\n') {
+                            lx->line++;
+                        }
+                        lx->pos++;
+                    }
+                    continue;
+                }
+                if (c == '\n') {
+                    lx->line++;
+                    continue;
+                }
+                if (c == '`') {
+                    lx->state = JS_STATE_CODE;
+                    break;
+                }
+                if (c == '$' && lx->pos < len && src[lx->pos] == '{') {
+                    lx->pos++;
+                    if (lx->tmpl_depth < 32u) {
+                        lx->tmpl_brace_stack[lx->tmpl_depth++] = lx->brace_depth;
+                    }
+                    lx->brace_depth++;
+                    lx->state = JS_STATE_CODE;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        char c = src[lx->pos];
+        if (c == '\n') {
+            lx->line++;
+            lx->pos++;
+            continue;
+        }
+        if (isspace((unsigned char)c)) {
+            lx->pos++;
+            continue;
+        }
+
+        if (c == '/' && lx->pos + 1u < len && src[lx->pos + 1u] == '/') {
+            lx->pos += 2u;
+            while (lx->pos < len && src[lx->pos] != '\n') {
+                lx->pos++;
+            }
+            continue;
+        }
+
+        if (c == '/' && lx->pos + 1u < len && src[lx->pos + 1u] == '*') {
+            lx->pos += 2u;
+            while (lx->pos < len) {
+                if (src[lx->pos] == '*' && lx->pos + 1u < len && src[lx->pos + 1u] == '/') {
+                    lx->pos += 2u;
+                    break;
+                }
+                if (src[lx->pos] == '\n') {
+                    lx->line++;
+                }
+                lx->pos++;
+            }
+            continue;
+        }
+
+        if (c == '\'') {
+            lx->pos++;
+            lx->state = JS_STATE_STR_SQ;
+            continue;
+        }
+        if (c == '"') {
+            lx->pos++;
+            lx->state = JS_STATE_STR_DQ;
+            continue;
+        }
+        if (c == '`') {
+            lx->pos++;
+            lx->state = JS_STATE_TEMPLATE;
+            continue;
+        }
+
+        uint32_t tok_line = lx->line;
+        if (is_js_ident_start(c)) {
+            size_t start = lx->pos++;
+            while (lx->pos < len && is_js_ident_char(src[lx->pos])) {
+                lx->pos++;
+            }
+            out->kind = JS_TOK_IDENT;
+            out->ptr = src + start;
+            out->len = lx->pos - start;
+            out->line = tok_line;
+            return true;
+        }
+
+        if (isdigit((unsigned char)c)) {
+            size_t start = lx->pos++;
+            while (lx->pos < len && (isalnum((unsigned char)src[lx->pos]) || src[lx->pos] == '.')) {
+                lx->pos++;
+            }
+            out->kind = JS_TOK_NUMBER;
+            out->ptr = src + start;
+            out->len = lx->pos - start;
+            out->line = tok_line;
+            return true;
+        }
+
+        lx->pos++;
+        if (c == '{') {
+            lx->brace_depth++;
+        } else if (c == '}') {
+            if (lx->brace_depth > 0u) {
+                lx->brace_depth--;
+            }
+            if (lx->tmpl_depth > 0u &&
+                lx->brace_depth == lx->tmpl_brace_stack[lx->tmpl_depth - 1u]) {
+                lx->tmpl_depth--;
+                lx->state = JS_STATE_TEMPLATE;
+                continue;
+            }
+        }
+
+        out->kind = JS_TOK_PUNCT;
+        out->ptr = src + (lx->pos - 1u);
+        out->len = 1u;
+        out->line = tok_line;
+        return true;
+    }
+
+    out->kind = JS_TOK_EOF;
+    out->ptr = NULL;
+    out->len = 0;
+    out->line = lx->line;
+    return false;
 }
 
 static const char *find_forbidden_js_primitive(const char *src, size_t len, uint32_t *out_line)
 {
-    if (!src || len == 0) {
+    if (!src || len == 0u) {
         return NULL;
     }
-    uint32_t current_line = 1;
 
-    for (size_t i = 0; i < len; i++) {
-        if (src[i] == '\n') {
-            current_line++;
+    js_lexer_t lx;
+    js_lexer_init(&lx, src, len);
+
+    js_token_t tok;
+    while (js_lexer_next_code_token(&lx, &tok)) {
+        if (tok.kind != JS_TOK_IDENT) {
             continue;
         }
-
-        /* Skip line comments */
-        if (src[i] == '/' && i + 1 < len && src[i + 1] == '/') {
-            while (i < len && src[i] != '\n') {
-                i++;
-            }
-            if (i < len && src[i] == '\n') {
-                current_line++;
-            }
-            continue;
-        }
-
-        /* Skip block comments */
-        if (src[i] == '/' && i + 1 < len && src[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < len && !(src[i] == '*' && src[i + 1] == '/')) {
-                if (src[i] == '\n') {
-                    current_line++;
-                }
-                i++;
-            }
-            i++;
-            continue;
-        }
-
-        /* Check word boundary */
-        if (i > 0 && !is_token_boundary(src[i - 1])) {
-            continue;
-        }
-
         for (size_t k = 0; FORBIDDEN_JS_PRIMITIVES[k] != NULL; k++) {
             const char *prim = FORBIDDEN_JS_PRIMITIVES[k];
             size_t plen = strlen(prim);
-            if (i + plen <= len && memcmp(src + i, prim, plen) == 0) {
-                if (i + plen == len || is_token_boundary(src[i + plen])) {
-                    if (out_line) {
-                        *out_line = current_line;
-                    }
-                    return prim;
+            if (tok.len == plen && memcmp(tok.ptr, prim, plen) == 0) {
+                if (out_line) {
+                    *out_line = tok.line;
                 }
+                return prim;
             }
         }
     }
@@ -560,23 +1043,56 @@ static const char *find_forbidden_js_primitive(const char *src, size_t len, uint
 
 static bool check_potential_infinite_loop(const char *src, size_t len, uint32_t *out_line)
 {
-    if (!src || len == 0) {
+    if (!src || len == 0u) {
         return false;
     }
-    static const char *const LOOP_PATTERNS[] = {
-        "while(true)", "while (true)", "while(1)", "while (1)", "for(;;)", "for (;;)", NULL};
 
-    uint32_t line = 1;
-    for (size_t i = 0; i < len; i++) {
-        if (src[i] == '\n') {
-            line++;
-            continue;
+    js_lexer_t lx;
+    js_lexer_init(&lx, src, len);
+
+    js_token_t window[5];
+    size_t wcount = 0;
+
+    js_token_t tok;
+    while (js_lexer_next_code_token(&lx, &tok)) {
+        if (wcount < 5u) {
+            window[wcount++] = tok;
+        } else {
+            memmove(&window[0], &window[1], 4u * sizeof(js_token_t));
+            window[4] = tok;
         }
-        for (size_t k = 0; LOOP_PATTERNS[k] != NULL; k++) {
-            size_t plen = strlen(LOOP_PATTERNS[k]);
-            if (i + plen <= len && memcmp(src + i, LOOP_PATTERNS[k], plen) == 0) {
+
+        if (wcount >= 4u) {
+            const js_token_t *t0 = &window[wcount - 4u];
+            const js_token_t *t1 = &window[wcount - 3u];
+            const js_token_t *t2 = &window[wcount - 2u];
+            const js_token_t *t3 = &window[wcount - 1u];
+
+            if (t0->kind == JS_TOK_IDENT && t0->len == 5u && memcmp(t0->ptr, "while", 5) == 0 &&
+                t1->kind == JS_TOK_PUNCT && t1->ptr[0] == '(' && t3->kind == JS_TOK_PUNCT &&
+                t3->ptr[0] == ')') {
+                bool always_true =
+                    (t2->kind == JS_TOK_IDENT && t2->len == 4u &&
+                     memcmp(t2->ptr, "true", 4) == 0) ||
+                    (t2->kind == JS_TOK_NUMBER && t2->len == 1u && t2->ptr[0] != '0');
+                if (always_true) {
+                    if (out_line) {
+                        *out_line = t0->line;
+                    }
+                    return true;
+                }
+            }
+        }
+
+        if (wcount == 5u) {
+            if (window[0].kind == JS_TOK_IDENT && window[0].len == 3u &&
+                memcmp(window[0].ptr, "for", 3) == 0 && window[1].kind == JS_TOK_PUNCT &&
+                window[1].ptr[0] == '(' && window[2].kind == JS_TOK_PUNCT &&
+                window[2].ptr[0] == ';' && window[3].kind == JS_TOK_PUNCT &&
+                window[3].ptr[0] == ';' && window[4].kind == JS_TOK_PUNCT &&
+                window[4].ptr[0] == ')') {
                 if (out_line) {
-                    *out_line = line;
+                    *out_line = window[0].line;
                 }
                 return true;
             }
@@ -586,97 +1102,250 @@ static bool check_potential_infinite_loop(const char *src, size_t len, uint32_t 
 }
 
 /* =========================================================================
- * Shader Varying & Include Inspection
+ * Qualifier-Aware Shader Varying Parser & Swizzle-Safe Repair Engine
  * ========================================================================= */
 
 typedef struct {
     char name[64];
-    uint32_t width; /* 1..4 */
+    uint32_t width;
     uint32_t line;
+    size_t type_off;
+    size_t type_len;
+    size_t name_off;
+    size_t name_len;
+    size_t semi_off;
 } we_compat_varying_t;
+
+static void glsl_skip_ws_and_comments(const char *src, size_t len, size_t *pos, uint32_t *line,
+                                      bool skip_pp_lines)
+{
+    while (*pos < len) {
+        char c = src[*pos];
+        if (c == '\n') {
+            (*line)++;
+            (*pos)++;
+            continue;
+        }
+        if (isspace((unsigned char)c)) {
+            (*pos)++;
+            continue;
+        }
+        if (c == '/' && *pos + 1u < len && src[*pos + 1u] == '/') {
+            *pos += 2u;
+            while (*pos < len && src[*pos] != '\n') {
+                (*pos)++;
+            }
+            continue;
+        }
+        if (c == '/' && *pos + 1u < len && src[*pos + 1u] == '*') {
+            *pos += 2u;
+            while (*pos < len) {
+                if (src[*pos] == '*' && *pos + 1u < len && src[*pos + 1u] == '/') {
+                    *pos += 2u;
+                    break;
+                }
+                if (src[*pos] == '\n') {
+                    (*line)++;
+                }
+                (*pos)++;
+            }
+            continue;
+        }
+        if (skip_pp_lines && c == '#') {
+            bool at_bol = (*pos == 0u);
+            if (!at_bol) {
+                size_t back = *pos;
+                at_bol = true;
+                while (back > 0u && src[back - 1u] != '\n') {
+                    back--;
+                    if (!isspace((unsigned char)src[back])) {
+                        at_bol = false;
+                        break;
+                    }
+                }
+            }
+            if (at_bol) {
+                while (*pos < len && src[*pos] != '\n') {
+                    if (src[*pos] == '\\' && *pos + 1u < len && src[*pos + 1u] == '\n') {
+                        (*line)++;
+                        *pos += 2u;
+                        continue;
+                    }
+                    (*pos)++;
+                }
+                continue;
+            }
+        }
+        break;
+    }
+}
+
+static bool glsl_tok_eq(const char *ptr, size_t len, const char *kw)
+{
+    size_t klen = strlen(kw);
+    return len == klen && memcmp(ptr, kw, klen) == 0;
+}
 
 static uint32_t parse_varyings_from_stage(const char *src, size_t len,
                                           we_compat_varying_t *out_vars, uint32_t max_vars,
                                           bool is_vertex_stage)
 {
-    if (!src || len == 0 || !out_vars || max_vars == 0) {
+    if (!src || len == 0u || !out_vars || max_vars == 0u) {
         return 0;
     }
+
     uint32_t count = 0;
-    uint32_t line_no = 1;
+    size_t pos = 0;
+    uint32_t line = 1u;
+    uint32_t brace_depth = 0;
+    bool stmt_start = true;
 
-    const char *p = src;
-    const char *end = src + len;
-
-    while (p < end) {
-        const char *line_start = p;
-        while (p < end && *p != '\n') {
-            p++;
-        }
-        size_t line_len = (size_t)(p - line_start);
-        if (p < end && *p == '\n') {
-            p++;
+    while (pos < len && count < max_vars) {
+        glsl_skip_ws_and_comments(src, len, &pos, &line, true);
+        if (pos >= len) {
+            break;
         }
 
-        const char *lp = line_start;
-        const char *lend = line_start + line_len;
-        while (lp < lend && isspace((unsigned char)*lp)) {
-            lp++;
-        }
-
-        bool match = false;
-        if (lend - lp > 8 && strncmp(lp, "varying", 7) == 0 && isspace((unsigned char)lp[7])) {
-            lp += 8;
-            match = true;
-        } else if (is_vertex_stage && lend - lp > 4 && strncmp(lp, "out", 3) == 0 &&
-                   isspace((unsigned char)lp[3])) {
-            lp += 4;
-            match = true;
-        } else if (!is_vertex_stage && lend - lp > 3 && strncmp(lp, "in", 2) == 0 &&
-                   isspace((unsigned char)lp[2])) {
-            lp += 3;
-            match = true;
-        }
-
-        if (match) {
-            while (lp < lend && isspace((unsigned char)*lp)) {
-                lp++;
+        if (brace_depth > 0u || !stmt_start) {
+            char c = src[pos++];
+            if (c == '{') {
+                brace_depth++;
+            } else if (c == '}') {
+                if (brace_depth > 0u) {
+                    brace_depth--;
+                }
+                if (brace_depth == 0u) {
+                    stmt_start = true;
+                }
+            } else if (c == ';' && brace_depth == 0u) {
+                stmt_start = true;
             }
-            uint32_t width = 0;
-            if (lend - lp >= 5 && strncmp(lp, "float", 5) == 0) {
-                width = 1;
-                lp += 5;
-            } else if (lend - lp >= 4 && strncmp(lp, "vec2", 4) == 0) {
-                width = 2;
-                lp += 4;
-            } else if (lend - lp >= 4 && strncmp(lp, "vec3", 4) == 0) {
-                width = 3;
-                lp += 4;
-            } else if (lend - lp >= 4 && strncmp(lp, "vec4", 4) == 0) {
-                width = 4;
-                lp += 4;
+            continue;
+        }
+
+        /* At top-level statement start: parse optional qualifiers before type */
+        bool has_stage_storage = false;
+        uint32_t decl_line = line;
+
+        for (;;) {
+            glsl_skip_ws_and_comments(src, len, &pos, &line, true);
+            if (pos >= len || !(isalpha((unsigned char)src[pos]) || src[pos] == '_')) {
+                break;
             }
 
-            if (width > 0) {
-                while (lp < lend && isspace((unsigned char)*lp)) {
-                    lp++;
+            size_t tok_start = pos;
+            uint32_t tok_line = line;
+            while (pos < len && (isalnum((unsigned char)src[pos]) || src[pos] == '_')) {
+                pos++;
+            }
+            size_t tok_len = pos - tok_start;
+            const char *tok = src + tok_start;
+
+            if (glsl_tok_eq(tok, tok_len, "layout")) {
+                glsl_skip_ws_and_comments(src, len, &pos, &line, false);
+                if (pos < len && src[pos] == '(') {
+                    uint32_t pdepth = 1u;
+                    pos++;
+                    while (pos < len && pdepth > 0u) {
+                        if (src[pos] == '\n') {
+                            line++;
+                        } else if (src[pos] == '(') {
+                            pdepth++;
+                        } else if (src[pos] == ')') {
+                            pdepth--;
+                        }
+                        pos++;
+                    }
                 }
-                const char *name_start = lp;
-                while (lp < lend && (isalnum((unsigned char)*lp) || *lp == '_')) {
-                    lp++;
+                continue;
+            }
+
+            if (glsl_tok_eq(tok, tok_len, "invariant") || glsl_tok_eq(tok, tok_len, "precise") ||
+                glsl_tok_eq(tok, tok_len, "flat") || glsl_tok_eq(tok, tok_len, "smooth") ||
+                glsl_tok_eq(tok, tok_len, "noperspective") ||
+                glsl_tok_eq(tok, tok_len, "centroid") || glsl_tok_eq(tok, tok_len, "sample") ||
+                glsl_tok_eq(tok, tok_len, "lowp") || glsl_tok_eq(tok, tok_len, "mediump") ||
+                glsl_tok_eq(tok, tok_len, "highp")) {
+                continue;
+            }
+
+            if (glsl_tok_eq(tok, tok_len, "varying")) {
+                has_stage_storage = true;
+                decl_line = tok_line;
+                continue;
+            }
+            if (is_vertex_stage && glsl_tok_eq(tok, tok_len, "out")) {
+                has_stage_storage = true;
+                decl_line = tok_line;
+                continue;
+            }
+            if (!is_vertex_stage && glsl_tok_eq(tok, tok_len, "in")) {
+                has_stage_storage = true;
+                decl_line = tok_line;
+                continue;
+            }
+
+            /* Reached non-qualifier token (type or identifier) */
+            if (has_stage_storage) {
+                uint32_t width = 0;
+                if (glsl_tok_eq(tok, tok_len, "float")) {
+                    width = 1u;
+                } else if (glsl_tok_eq(tok, tok_len, "vec2")) {
+                    width = 2u;
+                } else if (glsl_tok_eq(tok, tok_len, "vec3")) {
+                    width = 3u;
+                } else if (glsl_tok_eq(tok, tok_len, "vec4")) {
+                    width = 4u;
                 }
-                size_t name_len = (size_t)(lp - name_start);
-                if (name_len > 0 && name_len < 64 && count < max_vars) {
-                    memcpy(out_vars[count].name, name_start, name_len);
-                    out_vars[count].name[name_len] = '\0';
-                    out_vars[count].width = width;
-                    out_vars[count].line = line_no;
-                    count++;
+
+                if (width > 0u) {
+                    glsl_skip_ws_and_comments(src, len, &pos, &line, false);
+                    if (pos < len && (isalpha((unsigned char)src[pos]) || src[pos] == '_')) {
+                        size_t name_off = pos;
+                        while (pos < len && (isalnum((unsigned char)src[pos]) || src[pos] == '_')) {
+                            pos++;
+                        }
+                        size_t name_len = pos - name_off;
+                        glsl_skip_ws_and_comments(src, len, &pos, &line, false);
+                        if (name_len > 0u && name_len < sizeof(out_vars[0].name) && pos < len &&
+                            src[pos] == ';') {
+                            we_compat_varying_t *dst = &out_vars[count++];
+                            memcpy(dst->name, src + name_off, name_len);
+                            dst->name[name_len] = '\0';
+                            dst->width = width;
+                            dst->line = decl_line;
+                            dst->type_off = tok_start;
+                            dst->type_len = tok_len;
+                            dst->name_off = name_off;
+                            dst->name_len = name_len;
+                            dst->semi_off = pos;
+                            pos++;
+                            stmt_start = true;
+                            break;
+                        }
+                    }
                 }
             }
+
+            stmt_start = false;
+            break;
         }
-        line_no++;
+
+        if (pos < len && stmt_start && !(isalpha((unsigned char)src[pos]) || src[pos] == '_')) {
+            char c = src[pos++];
+            if (c == '{') {
+                brace_depth++;
+                stmt_start = false;
+            } else if (c == '}') {
+                if (brace_depth > 0u) {
+                    brace_depth--;
+                }
+            } else if (c != ';') {
+                stmt_start = false;
+            }
+        }
     }
+
     return count;
 }
 
@@ -732,14 +1401,13 @@ static bool compat_vfs_open(we_compat_vfs_t *vfs, const char *path, we_compat_re
         } else if (access(p2, R_OK) == 0) {
             snprintf(candidate_pkg, sizeof(candidate_pkg), "%s", p2);
         } else {
-            /* Scan directory for any *.pkg */
             DIR *d = opendir(path);
             if (d) {
                 struct dirent *ent;
                 while ((ent = readdir(d)) != NULL) {
                     if (ent->d_type == DT_REG || ent->d_type == DT_UNKNOWN) {
                         size_t nlen = strlen(ent->d_name);
-                        if (nlen > 4 && strcasecmp(ent->d_name + nlen - 4, ".pkg") == 0) {
+                        if (has_ext_ci(ent->d_name, nlen, ".pkg")) {
                             snprintf(candidate_pkg, sizeof(candidate_pkg), "%s/%s", path,
                                      ent->d_name);
                             break;
@@ -755,14 +1423,13 @@ static bool compat_vfs_open(we_compat_vfs_t *vfs, const char *path, we_compat_re
         int fd = open(candidate_pkg, O_RDONLY | O_CLOEXEC);
         if (fd >= 0) {
             struct stat pkg_st;
-            if (fstat(fd, &pkg_st) == 0 && pkg_st.st_size >= 16) {
+            if (fstat(fd, &pkg_st) == 0 && S_ISREG(pkg_st.st_mode) && pkg_st.st_size >= 16) {
                 size_t sz = (size_t)pkg_st.st_size;
                 void *mapped = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
                 if (mapped != MAP_FAILED) {
                     uint8_t key[16] = {0};
                     int period = detect_rolling_xor_key((const uint8_t *)mapped, sz, key);
                     if (period > 0) {
-                        /* Obfuscated package: de-mask into scratch buffer */
                         vfs->demasked_buf = (uint8_t *)malloc(sz);
                         if (vfs->demasked_buf) {
                             vfs->demasked_size = sz;
@@ -809,7 +1476,6 @@ static const uint8_t *compat_vfs_read_file(we_compat_vfs_t *vfs, const char *rel
         return NULL;
     }
 
-    /* 1. Try .pkg archive */
     if (vfs->pkg) {
         const uint8_t *data = we_pkg_find(vfs->pkg, norm, out_size);
         if (data) {
@@ -817,16 +1483,15 @@ static const uint8_t *compat_vfs_read_file(we_compat_vfs_t *vfs, const char *rel
         }
     }
 
-    /* 2. Try loose disk file */
     char full_path[8192];
     snprintf(full_path, sizeof(full_path), "%s/%s", vfs->workshop_dir, norm);
-    int fd = open(full_path, O_RDONLY | O_CLOEXEC);
+    int fd = open(full_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd >= 0) {
         struct stat st;
         if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
             st.st_size <= (256LL * 1024LL * 1024LL)) {
             size_t sz = (size_t)st.st_size;
-            uint8_t *buf = (uint8_t *)malloc(sz + 1);
+            uint8_t *buf = (uint8_t *)malloc(sz + 1u);
             if (buf) {
                 ssize_t rd = read(fd, buf, sz);
                 close(fd);
@@ -857,7 +1522,7 @@ static const uint8_t *compat_vfs_read_file(we_compat_vfs_t *vfs, const char *rel
 static bool scan_loose_directory_malware(const char *dir_path, we_compat_report_t *report,
                                          int depth)
 {
-    if (!dir_path || depth > 8) {
+    if (!dir_path || depth > 16) {
         return false;
     }
     DIR *d = opendir(dir_path);
@@ -885,7 +1550,10 @@ static bool scan_loose_directory_malware(const char *dir_path, we_compat_report_
         snprintf(subpath, sizeof(subpath), "%s/%s", dir_path, ent->d_name);
 
         struct stat st;
-        if (stat(subpath, &st) != 0) {
+        if (lstat(subpath, &st) != 0) {
+            continue;
+        }
+        if (S_ISLNK(st.st_mode)) {
             continue;
         }
 
@@ -895,7 +1563,7 @@ static bool scan_loose_directory_malware(const char *dir_path, we_compat_report_
                 break;
             }
         } else if (S_ISREG(st.st_mode)) {
-            int fd = open(subpath, O_RDONLY | O_CLOEXEC);
+            int fd = open(subpath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
             if (fd >= 0) {
                 uint8_t hdr[16];
                 ssize_t n = read(fd, hdr, sizeof(hdr));
@@ -944,18 +1612,16 @@ static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const
                                size_t length, we_compat_scanner_t *scanner,
                                we_compat_report_t *out_report, we_compat_audit_flags_t *flags)
 {
-    if (!rel_path || !data || length == 0)
+    if (!rel_path || !data || length == 0u) {
         return;
+    }
     size_t plen = strlen(rel_path);
 
-    /* Pass 2: Shaders */
-    if (plen > 5 && (strcasecmp(rel_path + plen - 5, ".vert") == 0 ||
-                     strcasecmp(rel_path + plen - 5, ".frag") == 0 ||
-                     strcasecmp(rel_path + plen - 5, ".hlsl") == 0 ||
-                     strcasecmp(rel_path + plen - 5, ".glsl") == 0)) {
+    if (has_ext_ci(rel_path, plen, ".vert") || has_ext_ci(rel_path, plen, ".frag") ||
+        has_ext_ci(rel_path, plen, ".hlsl") || has_ext_ci(rel_path, plen, ".glsl")) {
         flags->custom_shaders_present = true;
 
-        if (length >= 4 && memcmp(data, "DXBC", 4) == 0) {
+        if (length >= 4u && memcmp(data, "DXBC", 4) == 0) {
             flags->shader_dxbc_blocked = true;
             report_add_issue(out_report, "SHADER_DXBC_BYTECODE", WE_ISSUE_SEV_FATAL,
                              "Compiled DirectX bytecode (DXBC) cannot run on GLES", rel_path, 1,
@@ -965,67 +1631,66 @@ static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const
         const char *src = (const char *)data;
         size_t slen = length;
 
-        if (strstr(src, "#pragma geometry") || strstr(src, "layout(triangles) in") ||
-            strstr(src, "#pragma tessellation")) {
+        if (slice_contains(src, slen, "#pragma geometry") ||
+            slice_contains(src, slen, "layout(triangles) in") ||
+            slice_contains(src, slen, "#pragma tessellation")) {
             flags->shader_stage_blocked = true;
             report_add_issue(out_report, "SHADER_UNSUPPORTED_STAGE", WE_ISSUE_SEV_FATAL,
                              "Geometry or tessellation shader stages are unsupported", rel_path, 1,
                              "Remove geometry shader stage");
         }
 
-        if (strstr(src, "g_AudioSpectrum16") || strstr(src, "g_AudioSpectrum64") ||
-            strstr(src, "g_AudioSpectrum32")) {
+        if (slice_contains(src, slen, "g_AudioSpectrum16") ||
+            slice_contains(src, slen, "g_AudioSpectrum64") ||
+            slice_contains(src, slen, "g_AudioSpectrum32")) {
             flags->audio_reactive = true;
         }
 
-        /* Check vertex vs fragment varying match */
-        if (plen > 5 && strcasecmp(rel_path + plen - 5, ".vert") == 0) {
+        if (has_ext_ci(rel_path, plen, ".vert")) {
             char frag_path[1024];
-            snprintf(frag_path, sizeof(frag_path), "%.*s.frag", (int)(plen - 5), rel_path);
+            snprintf(frag_path, sizeof(frag_path), "%.*s.frag", (int)(plen - 5u), rel_path);
             size_t frag_sz = 0;
             bool frag_free = false;
             const uint8_t *frag_data = compat_vfs_read_file(vfs, frag_path, &frag_sz, &frag_free);
-            if (frag_data && frag_sz > 0) {
+            if (frag_data && frag_sz > 0u) {
                 we_compat_varying_t v_vars[32], f_vars[32];
-                uint32_t v_cnt = parse_varyings_from_stage(src, slen, v_vars, 32, true);
+                uint32_t v_cnt = parse_varyings_from_stage(src, slen, v_vars, 32u, true);
                 uint32_t f_cnt =
-                    parse_varyings_from_stage((const char *)frag_data, frag_sz, f_vars, 32, false);
+                    parse_varyings_from_stage((const char *)frag_data, frag_sz, f_vars, 32u, false);
                 for (uint32_t vi = 0; vi < v_cnt; vi++) {
                     for (uint32_t fi = 0; fi < f_cnt; fi++) {
-                        if (strcmp(v_vars[vi].name, f_vars[fi].name) == 0) {
-                            if (v_vars[vi].width != f_vars[fi].width) {
-                                flags->varying_promoted = true;
-                                char msg[256];
-                                snprintf(
-                                    msg, sizeof(msg),
-                                    "Varying '%s' width mismatch between .vert (%u) and .frag (%u)",
-                                    v_vars[vi].name, v_vars[vi].width, f_vars[fi].width);
-                                report_add_issue(out_report, "SHADER_VARYING_MISMATCH",
-                                                 WE_ISSUE_SEV_WARNING, msg, rel_path,
-                                                 v_vars[vi].line,
-                                                 "Promote varying in vertex shader to vec4");
-                                report_add_repair(out_report, "REPAIR_PROMOTE_VARYING", rel_path,
-                                                  "Promote varying to vec4 in vertex shader");
-                            }
+                        if (strcmp(v_vars[vi].name, f_vars[fi].name) == 0 &&
+                            v_vars[vi].width != f_vars[fi].width) {
+                            flags->varying_promoted = true;
+                            char msg[256];
+                            snprintf(
+                                msg, sizeof(msg),
+                                "Varying '%s' width mismatch between .vert (%u) and .frag (%u)",
+                                v_vars[vi].name, v_vars[vi].width, f_vars[fi].width);
+                            report_add_issue(out_report, "SHADER_VARYING_MISMATCH",
+                                             WE_ISSUE_SEV_WARNING, msg, rel_path, v_vars[vi].line,
+                                             "Promote varying interface to swizzle-safe vec4");
+                            report_add_repair(out_report, "REPAIR_PROMOTE_VARYING", rel_path,
+                                              "Promote varying interface to swizzle-safe vec4");
                         }
                     }
                 }
             }
-            if (frag_free)
+            if (frag_free) {
                 free((void *)frag_data);
+            }
         }
     }
 
-    /* Pass 3: Skeletal Puppet Mesh Audit */
-    if (plen > 4 && strcasecmp(rel_path + plen - 4, ".mdl") == 0) {
+    if (has_ext_ci(rel_path, plen, ".mdl")) {
         we_compat_mdl_info_t mdl;
         if (parse_mdl_header_fast(data, length, &mdl)) {
-            if (mdl.bone_count > 256) {
+            if (mdl.bone_count > 256u) {
                 flags->puppet_blocked = true;
                 report_add_issue(out_report, "PUPPET_BONES_BLOCKED", WE_ISSUE_SEV_ERROR,
                                  "Puppet mesh bone count exceeds hardware ceiling of 256", rel_path,
                                  1, "Reduce skeleton bones to <= 128");
-            } else if (mdl.bone_count > 128) {
+            } else if (mdl.bone_count > 128u) {
                 flags->puppet_clamped = true;
                 report_add_issue(out_report, "PUPPET_BONES_CLAMPED", WE_ISSUE_SEV_WARNING,
                                  "Puppet mesh bone count exceeds 128 (requires clamping)", rel_path,
@@ -1034,13 +1699,13 @@ static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const
                                   "Clamp puppet bone count to 128");
             }
 
-            if (mdl.vertex_count > 65536) {
+            if (mdl.vertex_count > 65536u) {
                 flags->puppet_exceeded = true;
                 report_add_issue(out_report, "PUPPET_VERTICES_EXCEEDED", WE_ISSUE_SEV_WARNING,
                                  "Puppet mesh vertex count exceeds 65536 limit", rel_path, 1,
                                  "Simplify mesh geometry");
             }
-            if (mdl.triangle_count > 131072) {
+            if (mdl.triangle_count > 131072u) {
                 flags->puppet_exceeded = true;
                 report_add_issue(out_report, "PUPPET_TRIANGLES_EXCEEDED", WE_ISSUE_SEV_WARNING,
                                  "Puppet mesh triangle count exceeds 131072 limit", rel_path, 1,
@@ -1049,46 +1714,43 @@ static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const
         }
     }
 
-    /* Pass 4: SIMD Particle System Audit */
-    if (strstr(rel_path, "particles") || strstr(rel_path, "particle")) {
-        if (plen > 5 && strcasecmp(rel_path + plen - 5, ".json") == 0) {
-            we_jval_t *p_json = we_json_parse((const char *)data, length);
-            if (p_json) {
-                out_report->summary.particle_systems++;
-                const we_jval_t *mc = we_jobj_get(p_json, "maxcount");
-                if (!mc) {
-                    mc = we_jobj_get(p_json, "count");
-                }
-                if (!mc) {
-                    const we_jval_t *sub = we_jobj_get(p_json, "particle");
-                    if (sub && sub->type == JVAL_OBJ) {
-                        mc = we_jobj_get(sub, "maxcount");
-                        if (!mc) {
-                            mc = we_jobj_get(sub, "count");
-                        }
-                    }
-                }
-                if (mc && mc->type == JVAL_NUM) {
-                    uint32_t cnt = (uint32_t)mc->num;
-                    if (cnt > 16384) {
-                        flags->particle_overflow = true;
-                        report_add_issue(out_report, "PARTICLE_OVERFLOW", WE_ISSUE_SEV_WARNING,
-                                         "Particle emitter count exceeds 16384 limit", rel_path, 1,
-                                         "Clamp particle max count to 16384");
-                        report_add_repair(out_report, "REPAIR_CLAMP_PARTICLES", rel_path,
-                                          "Clamp particle max count to 16384");
-                    } else if (cnt > 4096) {
-                        flags->particle_advanced = true;
-                    }
-                }
-                we_jval_free(p_json);
+    if ((strstr(rel_path, "particles") || strstr(rel_path, "particle")) &&
+        has_ext_ci(rel_path, plen, ".json")) {
+        we_jval_t *p_json = we_json_parse((const char *)data, length);
+        if (p_json) {
+            out_report->summary.particle_systems++;
+            const we_jval_t *mc = we_jobj_get(p_json, "maxcount");
+            if (!mc) {
+                mc = we_jobj_get(p_json, "count");
             }
+            if (!mc) {
+                const we_jval_t *sub = we_jobj_get(p_json, "particle");
+                if (sub && sub->type == JVAL_OBJ) {
+                    mc = we_jobj_get(sub, "maxcount");
+                    if (!mc) {
+                        mc = we_jobj_get(sub, "count");
+                    }
+                }
+            }
+            if (mc && mc->type == JVAL_NUM) {
+                uint32_t cnt = (uint32_t)mc->num;
+                if (cnt > 16384u) {
+                    flags->particle_overflow = true;
+                    report_add_issue(out_report, "PARTICLE_OVERFLOW", WE_ISSUE_SEV_WARNING,
+                                     "Particle emitter count exceeds 16384 limit", rel_path, 1,
+                                     "Clamp particle max count to 16384");
+                    report_add_repair(out_report, "REPAIR_CLAMP_PARTICLES", rel_path,
+                                      "Clamp particle max count to 16384");
+                } else if (cnt > 4096u) {
+                    flags->particle_advanced = true;
+                }
+            }
+            we_jval_free(p_json);
         }
     }
 
-    /* Pass 6: SceneScript JavaScript & QuickJS Sandbox Audit */
-    if (plen > 3 && strcasecmp(rel_path + plen - 3, ".js") == 0) {
-        uint32_t bad_line = 1;
+    if (has_ext_ci(rel_path, plen, ".js")) {
+        uint32_t bad_line = 1u;
         const char *bad_prim = find_forbidden_js_primitive((const char *)data, length, &bad_line);
         if (bad_prim) {
             flags->script_violation = true;
@@ -1099,7 +1761,7 @@ static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const
                              rel_path, bad_line, "Remove forbidden API call from SceneScript");
         }
 
-        uint32_t loop_line = 1;
+        uint32_t loop_line = 1u;
         if (check_potential_infinite_loop((const char *)data, length, &loop_line)) {
             flags->script_loop = true;
             report_add_issue(out_report, "SCRIPT_STEP_BUDGET", WE_ISSUE_SEV_WARNING,
@@ -1111,8 +1773,7 @@ static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const
         }
     }
 
-    /* Texture Format Audit (BC7) */
-    if (plen > 4 && strcasecmp(rel_path + plen - 4, ".tex") == 0) {
+    if (has_ext_ci(rel_path, plen, ".tex")) {
         we_compat_tex_info_t tex_info;
         if (parse_tex_header_fast(data, length, &tex_info)) {
             if (tex_info.is_bc7 && !scanner->supports_bc7) {
@@ -1133,18 +1794,20 @@ static void scan_loose_assets_recursive(we_compat_vfs_t *vfs, const char *dir_pa
                                         we_compat_report_t *out_report,
                                         we_compat_audit_flags_t *flags)
 {
-    if (!dir_path || depth > 8)
+    if (!dir_path || depth > 16) {
         return;
+    }
     DIR *d = opendir(dir_path);
-    if (!d)
+    if (!d) {
         return;
+    }
 
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0 ||
+            strcmp(ent->d_name, ".waywal_compat.json") == 0) {
             continue;
-        if (ent->d_name[0] == '.')
-            continue;
+        }
 
         char subpath[4096];
         snprintf(subpath, sizeof(subpath), "%s/%s", dir_path, ent->d_name);
@@ -1156,25 +1819,24 @@ static void scan_loose_assets_recursive(we_compat_vfs_t *vfs, const char *dir_pa
         }
 
         struct stat st;
-        if (stat(subpath, &st) != 0)
+        if (lstat(subpath, &st) != 0 || S_ISLNK(st.st_mode)) {
             continue;
+        }
 
         if (S_ISDIR(st.st_mode)) {
             scan_loose_assets_recursive(vfs, subpath, rel_path, depth + 1, scanner, out_report,
                                         flags);
         } else if (S_ISREG(st.st_mode)) {
             size_t plen = strlen(ent->d_name);
-            if (plen > 3 && (strcasecmp(ent->d_name + plen - 3, ".js") == 0 ||
-                             strcasecmp(ent->d_name + plen - 4, ".mdl") == 0 ||
-                             strcasecmp(ent->d_name + plen - 4, ".tex") == 0 ||
-                             strcasecmp(ent->d_name + plen - 5, ".vert") == 0 ||
-                             strcasecmp(ent->d_name + plen - 5, ".frag") == 0 ||
-                             strcasecmp(ent->d_name + plen - 5, ".json") == 0)) {
-                int fd = open(subpath, O_RDONLY | O_CLOEXEC);
+            if (has_ext_ci(ent->d_name, plen, ".js") || has_ext_ci(ent->d_name, plen, ".mdl") ||
+                has_ext_ci(ent->d_name, plen, ".tex") || has_ext_ci(ent->d_name, plen, ".vert") ||
+                has_ext_ci(ent->d_name, plen, ".frag") || has_ext_ci(ent->d_name, plen, ".hlsl") ||
+                has_ext_ci(ent->d_name, plen, ".glsl") || has_ext_ci(ent->d_name, plen, ".json")) {
+                int fd = open(subpath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
                 if (fd >= 0) {
                     size_t sz = (size_t)st.st_size;
-                    if (sz <= (64LL * 1024LL * 1024LL)) {
-                        uint8_t *buf = (uint8_t *)malloc(sz + 1);
+                    if (sz > 0u && sz <= (64ULL * 1024ULL * 1024ULL)) {
+                        uint8_t *buf = (uint8_t *)malloc(sz + 1u);
                         if (buf) {
                             ssize_t rd = read(fd, buf, sz);
                             if (rd == (ssize_t)sz) {
@@ -1193,6 +1855,132 @@ static void scan_loose_assets_recursive(we_compat_vfs_t *vfs, const char *dir_pa
     closedir(d);
 }
 
+static bool is_valid_prop_ident(const char *s)
+{
+    if (!s || s[0] == '\0') {
+        return false;
+    }
+    size_t len = strlen(s);
+    if (len >= 64u) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!(isalnum(c) || c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void record_missing_user_prop(const char *key, const we_project_t *proj,
+                                     we_compat_report_t *out_report, we_compat_audit_flags_t *flags)
+{
+    if (!is_valid_prop_ident(key)) {
+        return;
+    }
+    for (uint32_t pi = 0; pi < proj->prop_count; pi++) {
+        if (strcmp(proj->props[pi].key, key) == 0) {
+            return;
+        }
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Referenced user property '%s' is missing in project.json", key);
+    for (uint32_t i = 0; i < out_report->issue_count; i++) {
+        if (strcmp(out_report->issues[i].code, "MISSING_USER_PROPERTY") == 0 &&
+            strcmp(out_report->issues[i].message, msg) == 0) {
+            return;
+        }
+    }
+
+    flags->missing_user_prop = true;
+    report_add_issue(out_report, "MISSING_USER_PROPERTY", WE_ISSUE_SEV_WARNING, msg, "project.json",
+                     1, "Synthesize default user property in project.json");
+    report_add_repair(out_report, "REPAIR_SYNTHESIZE_USER_PROP", "project.json",
+                      "Synthesize missing user property with default value");
+}
+
+static void collect_scene_user_props_ast(const we_jval_t *node, const we_project_t *proj,
+                                         we_compat_report_t *out_report,
+                                         we_compat_audit_flags_t *flags, int depth)
+{
+    if (!node || depth > 48) {
+        return;
+    }
+    if (node->type == JVAL_ARR) {
+        for (size_t i = 0; i < node->arr.count; i++) {
+            collect_scene_user_props_ast(node->arr.items[i], proj, out_report, flags, depth + 1);
+        }
+    } else if (node->type == JVAL_OBJ) {
+        for (size_t i = 0; i < node->obj.count; i++) {
+            const char *k = node->obj.entries[i].key;
+            const we_jval_t *v = node->obj.entries[i].val;
+            if (k && v && (strcmp(k, "user") == 0 || strcmp(k, "userProperty") == 0)) {
+                if (v->type == JVAL_STR && v->str) {
+                    record_missing_user_prop(v->str, proj, out_report, flags);
+                } else if (v->type == JVAL_OBJ) {
+                    const we_jval_t *name_v = we_jobj_get(v, "name");
+                    if (name_v && name_v->type == JVAL_STR && name_v->str) {
+                        record_missing_user_prop(name_v->str, proj, out_report, flags);
+                    }
+                }
+            }
+            collect_scene_user_props_ast(v, proj, out_report, flags, depth + 1);
+        }
+    }
+}
+
+/* Bounded slice scan fallback when user property bindings live inside embedded strings */
+static void collect_scene_user_props_slice(const char *scene_data, size_t scene_sz,
+                                           const we_project_t *proj, we_compat_report_t *out_report,
+                                           we_compat_audit_flags_t *flags)
+{
+    static const char *const PATS[2] = {"\"user\"", "\"userProperty\""};
+    for (size_t p = 0; p < 2u; p++) {
+        const char *pat = PATS[p];
+        size_t plen = strlen(pat);
+        const char *cur = scene_data;
+        const char *end = scene_data + scene_sz;
+
+        while (cur < end && (size_t)(end - cur) >= plen) {
+            const char *hit = (const char *)memmem(cur, (size_t)(end - cur), pat, plen);
+            if (!hit) {
+                break;
+            }
+            const char *scan = hit + plen;
+            while (scan < end && isspace((unsigned char)*scan)) {
+                scan++;
+            }
+            if (scan >= end || *scan != ':') {
+                cur = hit + plen;
+                continue;
+            }
+            scan++;
+            while (scan < end && isspace((unsigned char)*scan)) {
+                scan++;
+            }
+            if (scan < end && *scan == '"') {
+                const char *vstart = scan + 1;
+                const char *vend = (const char *)memchr(vstart, '"', (size_t)(end - vstart));
+                if (!vend) {
+                    break;
+                }
+                size_t klen = (size_t)(vend - vstart);
+                if (klen > 0u && klen < 64u) {
+                    char key[64];
+                    memcpy(key, vstart, klen);
+                    key[klen] = '\0';
+                    record_missing_user_prop(key, proj, out_report, flags);
+                }
+                cur = vend + 1;
+            } else {
+                cur = scan;
+            }
+        }
+    }
+}
+
 /* =========================================================================
  * Main Scanner Entrypoint: we_compat_scan_directory
  * ========================================================================= */
@@ -1207,7 +1995,6 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
     memset(out_report, 0, sizeof(*out_report));
     out_report->scan_timestamp = (uint64_t)time(NULL);
 
-    /* Extract workshop ID from path */
     const char *last_slash = strrchr(workshop_dir, '/');
     const char *id_cand = last_slash ? last_slash + 1 : workshop_dir;
     if (id_cand[0] != '\0') {
@@ -1224,7 +2011,6 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
         return true;
     }
 
-    /* 1. Inspect all entries inside .pkg archive */
     if (vfs.pkg && vfs.pkg->entries) {
         for (uint32_t i = 0; i < vfs.pkg->entry_count; i++) {
             const we_pkg_entry_t *ent = &vfs.pkg->entries[i];
@@ -1250,7 +2036,6 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
         }
     }
 
-    /* 2. Inspect loose files on disk for malware/traversal */
     struct stat root_st;
     if (stat(workshop_dir, &root_st) == 0 && S_ISDIR(root_st.st_mode)) {
         if (scan_loose_directory_malware(workshop_dir, out_report, 0)) {
@@ -1259,7 +2044,6 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
         }
     }
 
-    /* 3. Load & Inspect project.json */
     size_t proj_sz = 0;
     bool proj_free = false;
     const uint8_t *proj_data = compat_vfs_read_file(&vfs, "project.json", &proj_sz, &proj_free);
@@ -1267,7 +2051,7 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
     memset(&proj, 0, sizeof(proj));
     bool has_project = false;
 
-    if (proj_data && proj_sz > 0) {
+    if (proj_data && proj_sz > 0u) {
         has_project = we_project_parse((const char *)proj_data, proj_sz, &proj);
         if (has_project) {
             snprintf(out_report->title, sizeof(out_report->title), "%s", proj.title);
@@ -1276,15 +2060,15 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
                          proj.workshop_id);
             }
 
-            /* Block application (.exe) and CEF web wallpapers */
             if (strcasecmp(proj.type, "application") == 0) {
                 report_add_issue(out_report, "SECURITY_ALERT_MALICIOUS", WE_ISSUE_SEV_FATAL,
                                  "Application wallpapers (.exe) are untrusted and blocked",
                                  "project.json", 1, "Quarantine package");
                 out_report->tier = WE_TIER_4_BLOCKED;
                 out_report->compatibility_score = 0;
-                if (proj_free)
+                if (proj_free) {
                     free((void *)proj_data);
+                }
                 compat_vfs_close(&vfs);
                 return true;
             }
@@ -1295,8 +2079,9 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
                     "project.json", 1, "Provide native scene wallpaper");
                 out_report->tier = WE_TIER_4_BLOCKED;
                 out_report->compatibility_score = 0;
-                if (proj_free)
+                if (proj_free) {
                     free((void *)proj_data);
+                }
                 compat_vfs_close(&vfs);
                 return true;
             }
@@ -1307,8 +2092,9 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
                 out_report->summary.sprite_layers = 1;
                 out_report->summary.estimated_vram_mb = 48.0f;
                 out_report->summary.estimated_fps = 60;
-                if (proj_free)
+                if (proj_free) {
                     free((void *)proj_data);
+                }
                 compat_vfs_close(&vfs);
                 return true;
             }
@@ -1318,7 +2104,6 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
         }
     }
 
-    /* 4. Locate & Parse scene.json */
     const char *scene_filename = (has_project && proj.file[0] != '\0') ? proj.file : "scene.json";
     size_t scene_sz = 0;
     bool scene_free = false;
@@ -1344,31 +2129,27 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
                          "Fix JSON syntax in scene.json");
         out_report->tier = WE_TIER_3_DEGRADED;
         out_report->compatibility_score = 30;
-        if (scene_free)
+        if (scene_free) {
             free((void *)scene_data);
+        }
         compat_vfs_close(&vfs);
         return true;
     }
 
-    /* Traversal Tracking Variables */
     we_compat_audit_flags_t flags;
     memset(&flags, 0, sizeof(flags));
 
-    /* ---------------------------------------------------------------------
-     * Pass 1: Hierarchy, Object Taxonomy & Circular Reference Audit
-     * --------------------------------------------------------------------- */
     const we_jval_t *objs = we_jobj_get(scene_root, "objects");
     if (objs && objs->type == JVAL_ARR) {
         out_report->summary.total_objects = (uint32_t)objs->arr.count;
 
-        /* Object ID to parent ID mapping for cycle detection */
         typedef struct {
             int32_t id;
             int32_t parent;
         } obj_node_t;
 
         size_t n_objs = objs->arr.count;
-        obj_node_t *nodes = (obj_node_t *)calloc(n_objs, sizeof(obj_node_t));
+        obj_node_t *nodes = n_objs > 0u ? (obj_node_t *)calloc(n_objs, sizeof(obj_node_t)) : NULL;
 
         for (size_t i = 0; i < n_objs; i++) {
             const we_jval_t *obj = objs->arr.items[i];
@@ -1410,7 +2191,7 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
                 out_report->summary.active_scripts++;
             }
             if (script_val && script_val->type == JVAL_STR && script_val->str) {
-                uint32_t bad_line = 1;
+                uint32_t bad_line = 1u;
                 const char *bad_prim = find_forbidden_js_primitive(
                     script_val->str, strlen(script_val->str), &bad_line);
                 if (bad_prim) {
@@ -1426,7 +2207,6 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
             }
         }
 
-        /* Cycle detection via iterative DFS / tortoise-hare path follow */
         if (nodes) {
             for (size_t i = 0; i < n_objs; i++) {
                 int32_t cur = nodes[i].id;
@@ -1463,9 +2243,6 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
         }
     }
 
-    /* ---------------------------------------------------------------------
-     * Pass 2, 3, 4, 5, 6: Asset Auditing across Packaged and Loose Files
-     * --------------------------------------------------------------------- */
     if (vfs.pkg && vfs.pkg->entries) {
         for (uint32_t i = 0; i < vfs.pkg->entry_count; i++) {
             const we_pkg_entry_t *ent = &vfs.pkg->entries[i];
@@ -1479,71 +2256,18 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
         scan_loose_assets_recursive(&vfs, workshop_dir, "", 0, scanner, out_report, &flags);
     }
 
-    /* Check missing user property references */
     if (has_project) {
-        /* Scan scene_data string for user property references */
-        const char *s = (const char *)scene_data;
-        const char *send = s + scene_sz;
-        while (s < send) {
-            const char *u = strstr(s, "\"user\":");
-            if (!u) {
-                u = strstr(s, "\"userProperty\":");
-            }
-            if (!u || u >= send) {
-                break;
-            }
-            const char *quote1 = strchr(u, '"');
-            if (!quote1)
-                break;
-            const char *colon = strchr(quote1 + 1, ':');
-            if (!colon)
-                break;
-            const char *val_quote1 = strchr(colon, '"');
-            if (!val_quote1 || val_quote1 >= send)
-                break;
-            const char *val_quote2 = strchr(val_quote1 + 1, '"');
-            if (!val_quote2 || val_quote2 >= send)
-                break;
-
-            size_t klen = (size_t)(val_quote2 - val_quote1 - 1);
-            if (klen > 0 && klen < 64) {
-                char key[64];
-                memcpy(key, val_quote1 + 1, klen);
-                key[klen] = '\0';
-
-                bool found = false;
-                for (uint32_t pi = 0; pi < proj.prop_count; pi++) {
-                    if (strcmp(proj.props[pi].key, key) == 0) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    flags.missing_user_prop = true;
-                    char msg[256];
-                    snprintf(msg, sizeof(msg),
-                             "Referenced user property '%s' is missing in project.json", key);
-                    report_add_issue(out_report, "MISSING_USER_PROPERTY", WE_ISSUE_SEV_WARNING, msg,
-                                     "project.json", 1,
-                                     "Synthesize default user property in project.json");
-                    report_add_repair(out_report, "REPAIR_SYNTHESIZE_USER_PROP", "project.json",
-                                      "Synthesize missing user property with default value");
-                }
-            }
-            s = val_quote2 + 1;
-        }
+        collect_scene_user_props_ast(scene_root, &proj, out_report, &flags, 0);
+        collect_scene_user_props_slice((const char *)scene_data, scene_sz, &proj, out_report,
+                                       &flags);
     }
 
-    /* Clean up DOM AST and VFS */
     we_jval_free(scene_root);
     if (scene_free) {
         free((void *)scene_data);
     }
     compat_vfs_close(&vfs);
 
-    /* ---------------------------------------------------------------------
-     * 4-Tier Deterministic Classification & Scoring (§5.8.3)
-     * --------------------------------------------------------------------- */
     if (flags.shader_dxbc_blocked || flags.shader_stage_blocked || flags.puppet_blocked ||
         flags.script_violation) {
         out_report->tier = WE_TIER_4_BLOCKED;
@@ -1554,10 +2278,12 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
                flags.model3d_degraded || flags.particle_overflow) {
         out_report->tier = WE_TIER_3_DEGRADED;
         int32_t sc = 68 - (int32_t)(out_report->issue_count * 4u);
-        if (sc < 40)
+        if (sc < 40) {
             sc = 40;
-        if (sc > 74)
+        }
+        if (sc > 74) {
             sc = 74;
+        }
         out_report->compatibility_score = (uint32_t)sc;
         out_report->summary.estimated_fps = 30;
         out_report->summary.estimated_vram_mb = 64.0f;
@@ -1565,24 +2291,26 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
                flags.particle_advanced || flags.bc7_fallback || flags.missing_user_prop) {
         out_report->tier = WE_TIER_2_TRANSPILED;
         int32_t sc = 92 - (int32_t)(out_report->issue_count * 3u);
-        if (sc < 75)
+        if (sc < 75) {
             sc = 75;
-        if (sc > 94)
+        }
+        if (sc > 94) {
             sc = 94;
+        }
         out_report->compatibility_score = (uint32_t)sc;
         out_report->summary.estimated_fps = 120;
         out_report->summary.estimated_vram_mb = 48.0f;
     } else {
         out_report->tier = WE_TIER_1_NATIVE;
         int32_t sc = 100 - (int32_t)(out_report->issue_count * 2u);
-        if (sc < 95)
+        if (sc < 95) {
             sc = 95;
+        }
         out_report->compatibility_score = (uint32_t)sc;
         out_report->summary.estimated_fps = 144;
         out_report->summary.estimated_vram_mb = 32.0f;
     }
 
-    /* Compute VRAM estimate based on object taxonomy */
     float vram = 24.0f;
     vram += (float)out_report->summary.sprite_layers * 6.0f;
     vram += (float)out_report->summary.puppet_meshes * 8.0f;
@@ -1598,40 +2326,276 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
 }
 
 /* =========================================================================
- * Directory Copy Utility for Auto-Repairs
+ * Confined File Operations & Symlink-Hardened Directory Copy
  * ========================================================================= */
 
-static bool copy_file_direct(const char *src_path, const char *dst_path)
+static bool is_safe_confined_relpath(const char *rel_path)
 {
-    int sfd = open(src_path, O_RDONLY | O_CLOEXEC);
+    if (!rel_path || rel_path[0] == '\0' || rel_path[0] == '/') {
+        return false;
+    }
+    const char *p = rel_path;
+    while (*p) {
+        const char *seg = p;
+        while (*p && *p != '/') {
+            unsigned char c = (unsigned char)*p;
+            if (c < 0x20u || c == 0x7Fu || c == '\\') {
+                return false;
+            }
+            p++;
+        }
+        size_t slen = (size_t)(p - seg);
+        if (slen == 0u || (slen == 1u && seg[0] == '.') ||
+            (slen == 2u && seg[0] == '.' && seg[1] == '.')) {
+            return false;
+        }
+        if (*p == '/') {
+            p++;
+            if (*p == '\0') {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static int open_beneath_confined(int root_dfd, const char *rel_path, int flags, mode_t mode)
+{
+    if (root_dfd < 0 || !is_safe_confined_relpath(rel_path)) {
+        errno = EXDEV;
+        return -1;
+    }
+
+    struct open_how how;
+    memset(&how, 0, sizeof(how));
+    how.flags = (uint64_t)(flags | O_CLOEXEC | O_NOFOLLOW);
+    how.mode = (flags & (O_CREAT | O_TMPFILE)) ? (uint64_t)mode : 0u;
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+
+    int fd = (int)syscall(SYS_openat2, root_dfd, rel_path, &how, sizeof(how));
+    if (fd < 0 && errno == ENOSYS) {
+        int cur_dfd = root_dfd;
+        const char *p = rel_path;
+        while (*p) {
+            const char *slash = strchr(p, '/');
+            if (!slash) {
+                break;
+            }
+            size_t seg_len = (size_t)(slash - p);
+            if (seg_len == 0u || seg_len >= 256u) {
+                if (cur_dfd != root_dfd) {
+                    close(cur_dfd);
+                }
+                errno = EINVAL;
+                return -1;
+            }
+            char comp[256];
+            memcpy(comp, p, seg_len);
+            comp[seg_len] = '\0';
+
+            int next_dfd = openat(cur_dfd, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (cur_dfd != root_dfd) {
+                close(cur_dfd);
+            }
+            if (next_dfd < 0) {
+                return -1;
+            }
+            cur_dfd = next_dfd;
+            p = slash + 1;
+        }
+
+        if (flags & O_CREAT) {
+            fd = openat(cur_dfd, p, flags | O_CLOEXEC | O_NOFOLLOW, mode);
+        } else {
+            fd = openat(cur_dfd, p, flags | O_CLOEXEC | O_NOFOLLOW);
+        }
+        if (cur_dfd != root_dfd) {
+            close(cur_dfd);
+        }
+    }
+
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            close(fd);
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    return fd;
+}
+
+static bool write_all_fd(int fd, const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = write(fd, p + written, len - written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        written += (size_t)n;
+    }
+    return true;
+}
+
+static bool rewrite_fd_contents(int fd, const void *data, size_t len)
+{
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        return false;
+    }
+    if (!write_all_fd(fd, data, len)) {
+        return false;
+    }
+    if (ftruncate(fd, (off_t)len) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static char *read_confined_file(int root_dfd, const char *rel_path, size_t max_bytes,
+                                size_t *out_len)
+{
+    if (out_len) {
+        *out_len = 0;
+    }
+    int fd = open_beneath_confined(root_dfd, rel_path, O_RDONLY, 0);
+    if (fd < 0) {
+        return NULL;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (size_t)st.st_size > max_bytes) {
+        close(fd);
+        return NULL;
+    }
+
+    size_t sz = (size_t)st.st_size;
+    char *buf = (char *)malloc(sz + 1u);
+    if (!buf) {
+        close(fd);
+        return NULL;
+    }
+
+    size_t rd_total = 0;
+    while (rd_total < sz) {
+        ssize_t n = read(fd, buf + rd_total, sz - rd_total);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            free(buf);
+            close(fd);
+            return NULL;
+        }
+        rd_total += (size_t)n;
+    }
+    close(fd);
+
+    buf[rd_total] = '\0';
+    if (out_len) {
+        *out_len = rd_total;
+    }
+    return buf;
+}
+
+static bool write_confined_file(int root_dfd, const char *rel_path, const void *data, size_t len,
+                                bool allow_create)
+{
+    int flags = O_WRONLY | O_TRUNC | (allow_create ? O_CREAT : 0);
+    int fd = open_beneath_confined(root_dfd, rel_path, flags, 0644);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = write_all_fd(fd, data, len);
+    close(fd);
+    return ok;
+}
+
+static bool copy_file_at_no_symlink(int sdir_fd, int ddir_fd, const char *name)
+{
+    int sfd = openat(sdir_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (sfd < 0) {
         return false;
     }
-    int dfd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    struct stat sst;
+    if (fstat(sfd, &sst) != 0 || !S_ISREG(sst.st_mode)) {
+        close(sfd);
+        return false;
+    }
+
+    int dfd = openat(ddir_fd, name, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (dfd < 0) {
         close(sfd);
         return false;
     }
 
     char buf[8192];
-    ssize_t n;
     bool ok = true;
-    while ((n = read(sfd, buf, sizeof(buf))) > 0) {
-        if (write(dfd, buf, (size_t)n) != n) {
+    for (;;) {
+        ssize_t n = read(sfd, buf, sizeof(buf));
+        if (n == 0) {
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ok = false;
+            break;
+        }
+        if (!write_all_fd(dfd, buf, (size_t)n)) {
             ok = false;
             break;
         }
     }
+
     close(sfd);
     close(dfd);
     return ok;
 }
 
-static bool copy_dir_recursive(const char *src, const char *dst)
+static bool copy_dir_recursive_depth(const char *src, const char *dst, int depth)
 {
-    mkdir(dst, 0755);
-    DIR *d = opendir(src);
+    if (!src || !dst || depth > 16) {
+        return false;
+    }
+
+    struct stat src_st;
+    if (lstat(src, &src_st) != 0 || !S_ISDIR(src_st.st_mode)) {
+        return false;
+    }
+
+    struct stat dst_st;
+    if (lstat(dst, &dst_st) == 0) {
+        if (!S_ISDIR(dst_st.st_mode)) {
+            return false;
+        }
+    } else if (mkdir(dst, 0755) != 0) {
+        return false;
+    }
+
+    int sdir_fd = open(src, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (sdir_fd < 0) {
+        return false;
+    }
+    int ddir_fd = open(dst, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (ddir_fd < 0) {
+        close(sdir_fd);
+        return false;
+    }
+
+    DIR *d = fdopendir(sdir_fd);
     if (!d) {
+        close(sdir_fd);
+        close(ddir_fd);
         return false;
     }
 
@@ -1641,247 +2605,1001 @@ static bool copy_dir_recursive(const char *src, const char *dst)
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
             continue;
         }
-        char s_sub[4096], d_sub[4096];
-        snprintf(s_sub, sizeof(s_sub), "%s/%s", src, ent->d_name);
-        snprintf(d_sub, sizeof(d_sub), "%s/%s", dst, ent->d_name);
+        if (has_directory_traversal(ent->d_name)) {
+            ok = false;
+            break;
+        }
 
         struct stat st;
-        if (stat(s_sub, &st) != 0) {
+        if (fstatat(sdir_fd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             continue;
         }
+        if (S_ISLNK(st.st_mode)) {
+            continue;
+        }
+
         if (S_ISDIR(st.st_mode)) {
-            if (!copy_dir_recursive(s_sub, d_sub)) {
+            char s_sub[4096], d_sub[4096];
+            if (snprintf(s_sub, sizeof(s_sub), "%s/%s", src, ent->d_name) >= (int)sizeof(s_sub) ||
+                snprintf(d_sub, sizeof(d_sub), "%s/%s", dst, ent->d_name) >= (int)sizeof(d_sub) ||
+                !copy_dir_recursive_depth(s_sub, d_sub, depth + 1)) {
                 ok = false;
+                break;
             }
         } else if (S_ISREG(st.st_mode)) {
-            if (!copy_file_direct(s_sub, d_sub)) {
+            if (!copy_file_at_no_symlink(sdir_fd, ddir_fd, ent->d_name)) {
                 ok = false;
+                break;
+            }
+        }
+    }
+
+    closedir(d);
+    close(ddir_fd);
+    return ok;
+}
+
+static bool copy_dir_recursive(const char *src, const char *dst)
+{
+    return copy_dir_recursive_depth(src, dst, 0);
+}
+
+/* =========================================================================
+ * AST-Backed Auto-Repair Transformations
+ * ========================================================================= */
+
+static const char *varying_swizzle_suffix(uint32_t width)
+{
+    switch (width) {
+    case 1u:
+        return ".x";
+    case 2u:
+        return ".xy";
+    case 3u:
+        return ".xyz";
+    default:
+        return "";
+    }
+}
+
+static bool find_main_body_open_brace(const char *src, size_t len, size_t *out_brace_pos)
+{
+    size_t pos = 0;
+    uint32_t line = 1u;
+    while (pos < len) {
+        glsl_skip_ws_and_comments(src, len, &pos, &line, true);
+        if (pos >= len) {
+            break;
+        }
+        if (isalpha((unsigned char)src[pos]) || src[pos] == '_') {
+            size_t start = pos++;
+            while (pos < len && (isalnum((unsigned char)src[pos]) || src[pos] == '_')) {
+                pos++;
+            }
+            if (pos - start == 4u && memcmp(src + start, "main", 4) == 0) {
+                glsl_skip_ws_and_comments(src, len, &pos, &line, false);
+                if (pos < len && src[pos] == '(') {
+                    uint32_t pdepth = 1u;
+                    pos++;
+                    while (pos < len && pdepth > 0u) {
+                        if (src[pos] == '(') {
+                            pdepth++;
+                        } else if (src[pos] == ')') {
+                            pdepth--;
+                        }
+                        pos++;
+                    }
+                    glsl_skip_ws_and_comments(src, len, &pos, &line, false);
+                    if (pos < len && src[pos] == '{') {
+                        *out_brace_pos = pos;
+                        return true;
+                    }
+                }
+            }
+            continue;
+        }
+        pos++;
+    }
+    return false;
+}
+
+/* Promotes selected varyings to vec4 _wwal_v4_<name> while preserving original vector arity
+ * across bare r-values, bare l-values, and explicit .xyzw/.rgba/.stpq component accesses. */
+static char *rewrite_shader_promote_varyings(const char *src, size_t len,
+                                             const we_compat_varying_t *vars,
+                                             const bool *promote_mask, uint32_t var_count,
+                                             bool is_vertex_stage, size_t *out_len)
+{
+    compat_sb_t sb;
+    sb_init(&sb);
+
+    size_t main_brace = SIZE_MAX;
+    if (is_vertex_stage) {
+        (void)find_main_body_open_brace(src, len, &main_brace);
+    }
+
+    size_t pos = 0;
+    while (pos < len) {
+        if (src[pos] == '/' && pos + 1u < len && src[pos + 1u] == '/') {
+            size_t start = pos;
+            pos += 2u;
+            while (pos < len && src[pos] != '\n') {
+                pos++;
+            }
+            (void)sb_append_n(&sb, src + start, pos - start);
+            continue;
+        }
+        if (src[pos] == '/' && pos + 1u < len && src[pos + 1u] == '*') {
+            size_t start = pos;
+            pos += 2u;
+            while (pos < len) {
+                if (src[pos] == '*' && pos + 1u < len && src[pos + 1u] == '/') {
+                    pos += 2u;
+                    break;
+                }
+                pos++;
+            }
+            (void)sb_append_n(&sb, src + start, pos - start);
+            continue;
+        }
+
+        if (src[pos] == '#') {
+            bool at_bol = (pos == 0u || src[pos - 1u] == '\n');
+            if (at_bol) {
+                size_t start = pos;
+                while (pos < len && src[pos] != '\n') {
+                    pos++;
+                }
+                (void)sb_append_n(&sb, src + start, pos - start);
+                continue;
+            }
+        }
+
+        bool handled_decl = false;
+        for (uint32_t v = 0; v < var_count; v++) {
+            if (!promote_mask[v]) {
+                continue;
+            }
+            if (pos == vars[v].type_off) {
+                const char *swiz = varying_swizzle_suffix(vars[v].width);
+                (void)sb_append(&sb, "vec4 _wwal_v4_");
+                (void)sb_append_n(&sb, vars[v].name, strlen(vars[v].name));
+                (void)sb_append(&sb, ";\n#define ");
+                (void)sb_append(&sb, vars[v].name);
+                if (swiz[0] != '\0') {
+                    (void)sb_append(&sb, " (_wwal_v4_");
+                    (void)sb_append(&sb, vars[v].name);
+                    (void)sb_append(&sb, swiz);
+                    (void)sb_append(&sb, ")");
+                } else {
+                    (void)sb_append(&sb, " _wwal_v4_");
+                    (void)sb_append(&sb, vars[v].name);
+                }
+                pos = vars[v].semi_off + 1u;
+                handled_decl = true;
+                break;
+            }
+        }
+        if (handled_decl) {
+            continue;
+        }
+
+        if (pos == main_brace) {
+            (void)sb_append_n(&sb, "{", 1u);
+            for (uint32_t v = 0; v < var_count; v++) {
+                if (!promote_mask[v]) {
+                    continue;
+                }
+                (void)sb_append(&sb, "\n    _wwal_v4_");
+                (void)sb_append(&sb, vars[v].name);
+                (void)sb_append(&sb, " = vec4(0.0);");
+            }
+            pos++;
+            continue;
+        }
+
+        if (isalpha((unsigned char)src[pos]) || src[pos] == '_') {
+            bool prev_member = false;
+            if (pos > 0u) {
+                size_t back = pos;
+                while (back > 0u && isspace((unsigned char)src[back - 1u])) {
+                    back--;
+                }
+                if (back > 0u && src[back - 1u] == '.') {
+                    prev_member = true;
+                }
+            }
+
+            size_t tok_start = pos++;
+            while (pos < len && (isalnum((unsigned char)src[pos]) || src[pos] == '_')) {
+                pos++;
+            }
+            size_t tok_len = pos - tok_start;
+
+            int matched = -1;
+            if (!prev_member) {
+                for (uint32_t v = 0; v < var_count; v++) {
+                    if (promote_mask[v] && strlen(vars[v].name) == tok_len &&
+                        memcmp(src + tok_start, vars[v].name, tok_len) == 0) {
+                        matched = (int)v;
+                        break;
+                    }
+                }
+            }
+
+            if (matched >= 0) {
+                size_t peek = pos;
+                uint32_t dummy_line = 1u;
+                glsl_skip_ws_and_comments(src, len, &peek, &dummy_line, false);
+                bool has_member_dot = (peek < len && src[peek] == '.');
+                const char *swiz = varying_swizzle_suffix(vars[matched].width);
+
+                (void)sb_append(&sb, "_wwal_v4_");
+                (void)sb_append(&sb, vars[matched].name);
+                if (!has_member_dot && swiz[0] != '\0') {
+                    (void)sb_append(&sb, swiz);
+                }
+            } else {
+                (void)sb_append_n(&sb, src + tok_start, tok_len);
+            }
+            continue;
+        }
+
+        (void)sb_append_n(&sb, &src[pos], 1u);
+        pos++;
+    }
+
+    if (sb.oom) {
+        free(sb.buf);
+        return NULL;
+    }
+    if (out_len) {
+        *out_len = sb.len;
+    }
+    return sb.buf;
+}
+
+static bool repair_promote_varying_confined(int root_dfd, const char *target_rel)
+{
+    size_t plen = strlen(target_rel);
+    bool is_vert = has_ext_ci(target_rel, plen, ".vert");
+    bool is_frag = has_ext_ci(target_rel, plen, ".frag");
+
+    size_t src_len = 0;
+    char *src = read_confined_file(root_dfd, target_rel, 1024u * 1024u, &src_len);
+    if (!src) {
+        return false;
+    }
+
+    we_compat_varying_t vars[32];
+    bool mask[32] = {false};
+    uint32_t vcnt = parse_varyings_from_stage(src, src_len, vars, 32u, is_vert || !is_frag);
+
+    char peer_rel[1024] = {0};
+    char *peer_src = NULL;
+    size_t peer_len = 0;
+    if ((is_vert || is_frag) && plen >= 5u && plen < sizeof(peer_rel)) {
+        snprintf(peer_rel, sizeof(peer_rel), "%.*s%s", (int)(plen - 5u), target_rel,
+                 is_vert ? ".frag" : ".vert");
+        peer_src = read_confined_file(root_dfd, peer_rel, 1024u * 1024u, &peer_len);
+    }
+
+    bool any = false;
+    if (peer_src) {
+        we_compat_varying_t pvars[32];
+        bool pmask[32] = {false};
+        uint32_t pcnt = parse_varyings_from_stage(peer_src, peer_len, pvars, 32u, !is_vert);
+
+        for (uint32_t i = 0; i < vcnt; i++) {
+            for (uint32_t j = 0; j < pcnt; j++) {
+                if (strcmp(vars[i].name, pvars[j].name) == 0 && vars[i].width != pvars[j].width) {
+                    mask[i] = true;
+                    pmask[j] = true;
+                    any = true;
+                }
+            }
+        }
+
+        if (any) {
+            size_t new_peer_len = 0;
+            char *new_peer = rewrite_shader_promote_varyings(peer_src, peer_len, pvars, pmask, pcnt,
+                                                             !is_vert, &new_peer_len);
+            if (!new_peer ||
+                !write_confined_file(root_dfd, peer_rel, new_peer, new_peer_len, false)) {
+                free(new_peer);
+                free(peer_src);
+                free(src);
+                return false;
+            }
+            free(new_peer);
+        }
+        free(peer_src);
+    } else {
+        for (uint32_t i = 0; i < vcnt; i++) {
+            if (vars[i].width < 4u) {
+                mask[i] = true;
+                any = true;
+            }
+        }
+    }
+
+    if (!any) {
+        free(src);
+        return true;
+    }
+
+    size_t new_len = 0;
+    char *repaired = rewrite_shader_promote_varyings(src, src_len, vars, mask, vcnt,
+                                                     is_vert || !is_frag, &new_len);
+    free(src);
+    if (!repaired) {
+        return false;
+    }
+
+    bool ok = write_confined_file(root_dfd, target_rel, repaired, new_len, false);
+    free(repaired);
+    return ok;
+}
+
+static void sb_append_indent(compat_sb_t *sb, int depth)
+{
+    for (int i = 0; i < depth; i++) {
+        (void)sb_append_n(sb, "  ", 2u);
+    }
+}
+
+static void sb_serialize_jval(compat_sb_t *sb, const we_jval_t *v, int depth)
+{
+    if (!v) {
+        (void)sb_append(sb, "null");
+        return;
+    }
+    switch (v->type) {
+    case JVAL_NULL:
+        (void)sb_append(sb, "null");
+        break;
+    case JVAL_BOOL:
+        (void)sb_append(sb, v->bval ? "true" : "false");
+        break;
+    case JVAL_NUM: {
+        char nbuf[64];
+        if (isfinite(v->num)) {
+            snprintf(nbuf, sizeof(nbuf), "%.17g", v->num);
+        } else {
+            snprintf(nbuf, sizeof(nbuf), "0");
+        }
+        (void)sb_append(sb, nbuf);
+        break;
+    }
+    case JVAL_STR:
+        sb_append_json_str(sb, v->str ? v->str : "");
+        break;
+    case JVAL_ARR:
+        if (v->arr.count == 0u) {
+            (void)sb_append(sb, "[]");
+            break;
+        }
+        (void)sb_append(sb, "[\n");
+        for (size_t i = 0; i < v->arr.count; i++) {
+            sb_append_indent(sb, depth + 1);
+            sb_serialize_jval(sb, v->arr.items[i], depth + 1);
+            if (i + 1u < v->arr.count) {
+                (void)sb_append_n(sb, ",", 1u);
+            }
+            (void)sb_append_n(sb, "\n", 1u);
+        }
+        sb_append_indent(sb, depth);
+        (void)sb_append_n(sb, "]", 1u);
+        break;
+    case JVAL_OBJ:
+        if (v->obj.count == 0u) {
+            (void)sb_append(sb, "{}");
+            break;
+        }
+        (void)sb_append(sb, "{\n");
+        for (size_t i = 0; i < v->obj.count; i++) {
+            sb_append_indent(sb, depth + 1);
+            sb_append_json_str(sb, v->obj.entries[i].key ? v->obj.entries[i].key : "");
+            (void)sb_append(sb, ": ");
+            sb_serialize_jval(sb, v->obj.entries[i].val, depth + 1);
+            if (i + 1u < v->obj.count) {
+                (void)sb_append_n(sb, ",", 1u);
+            }
+            (void)sb_append_n(sb, "\n", 1u);
+        }
+        sb_append_indent(sb, depth);
+        (void)sb_append_n(sb, "}", 1u);
+        break;
+    }
+}
+
+static we_jval_t *jval_new_str(const char *s)
+{
+    we_jval_t *v = (we_jval_t *)calloc(1, sizeof(we_jval_t));
+    if (!v) {
+        return NULL;
+    }
+    v->type = JVAL_STR;
+    v->str = strdup(s ? s : "");
+    if (!v->str) {
+        free(v);
+        return NULL;
+    }
+    return v;
+}
+
+static we_jval_t *jval_new_num(double num)
+{
+    we_jval_t *v = (we_jval_t *)calloc(1, sizeof(we_jval_t));
+    if (!v) {
+        return NULL;
+    }
+    v->type = JVAL_NUM;
+    v->num = num;
+    return v;
+}
+
+static we_jval_t *jval_new_obj(void)
+{
+    we_jval_t *v = (we_jval_t *)calloc(1, sizeof(we_jval_t));
+    if (!v) {
+        return NULL;
+    }
+    v->type = JVAL_OBJ;
+    return v;
+}
+
+static we_jval_t *jobj_get_mut(we_jval_t *obj, const char *key)
+{
+    if (!obj || obj->type != JVAL_OBJ || !key) {
+        return NULL;
+    }
+    for (size_t i = 0; i < obj->obj.count; i++) {
+        if (obj->obj.entries[i].key && strcasecmp(obj->obj.entries[i].key, key) == 0) {
+            return obj->obj.entries[i].val;
+        }
+    }
+    return NULL;
+}
+
+static bool jobj_put_owned(we_jval_t *obj, const char *key, we_jval_t *val)
+{
+    if (!obj || obj->type != JVAL_OBJ || !key || !val) {
+        we_jval_free(val);
+        return false;
+    }
+    for (size_t i = 0; i < obj->obj.count; i++) {
+        if (obj->obj.entries[i].key && strcmp(obj->obj.entries[i].key, key) == 0) {
+            we_jval_free(obj->obj.entries[i].val);
+            obj->obj.entries[i].val = val;
+            return true;
+        }
+    }
+
+    char *kcopy = strdup(key);
+    if (!kcopy) {
+        we_jval_free(val);
+        return false;
+    }
+    we_jkv_t *nentries =
+        (we_jkv_t *)realloc(obj->obj.entries, (obj->obj.count + 1u) * sizeof(we_jkv_t));
+    if (!nentries) {
+        free(kcopy);
+        we_jval_free(val);
+        return false;
+    }
+    obj->obj.entries = nentries;
+    obj->obj.entries[obj->obj.count].key = kcopy;
+    obj->obj.entries[obj->obj.count].val = val;
+    obj->obj.count++;
+    return true;
+}
+
+static uint32_t collect_missing_prop_names(const we_compat_report_t *report,
+                                           const we_auto_repair_t *rep, char out_names[32][64])
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < report->issue_count && n < 32u; i++) {
+        const we_compat_issue_t *iss = &report->issues[i];
+        if (strcmp(iss->code, "MISSING_USER_PROPERTY") != 0) {
+            continue;
+        }
+        const char *q1 = strchr(iss->message, '\'');
+        const char *q2 = q1 ? strchr(q1 + 1, '\'') : NULL;
+        if (q1 && q2 && q2 > q1 + 1 && (size_t)(q2 - q1 - 1) < 64u) {
+            char cand[64];
+            size_t clen = (size_t)(q2 - q1 - 1);
+            memcpy(cand, q1 + 1, clen);
+            cand[clen] = '\0';
+            if (is_valid_prop_ident(cand)) {
+                bool dup = false;
+                for (uint32_t k = 0; k < n; k++) {
+                    if (strcmp(out_names[k], cand) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    memcpy(out_names[n++], cand, clen + 1u);
+                }
+            }
+        }
+    }
+
+    if (n == 0u && rep && rep->description[0] != '\0') {
+        const char *q1 = strchr(rep->description, '\'');
+        const char *q2 = q1 ? strchr(q1 + 1, '\'') : NULL;
+        if (q1 && q2 && q2 > q1 + 1 && (size_t)(q2 - q1 - 1) < 64u) {
+            size_t clen = (size_t)(q2 - q1 - 1);
+            char cand[64];
+            memcpy(cand, q1 + 1, clen);
+            cand[clen] = '\0';
+            if (is_valid_prop_ident(cand)) {
+                memcpy(out_names[n++], cand, clen + 1u);
+            }
+        }
+    }
+
+    if (n == 0u) {
+        snprintf(out_names[n++], 64u, "user_prop");
+    }
+    return n;
+}
+
+static bool inject_shader_uniforms_confined(int root_dfd, const char *shader_rel,
+                                            char prop_names[32][64], uint32_t prop_count,
+                                            bool only_if_referenced)
+{
+    size_t slen = 0;
+    char *src = read_confined_file(root_dfd, shader_rel, 1024u * 1024u, &slen);
+    if (!src) {
+        return false;
+    }
+
+    size_t insert_off = 0;
+    size_t pos = 0;
+    while (pos < slen) {
+        size_t line_start = pos;
+        while (pos < slen && isspace((unsigned char)src[pos]) && src[pos] != '\n') {
+            pos++;
+        }
+        if (pos < slen && ((slen - pos >= 8u && strncmp(src + pos, "#version", 8) == 0) ||
+                           (slen - pos >= 10u && strncmp(src + pos, "#extension", 10) == 0) ||
+                           (slen - pos >= 9u && strncmp(src + pos, "precision", 9) == 0))) {
+            while (pos < slen && src[pos] != '\n') {
+                pos++;
+            }
+            if (pos < slen && src[pos] == '\n') {
+                pos++;
+            }
+            insert_off = pos;
+            continue;
+        }
+        pos = line_start;
+        break;
+    }
+
+    compat_sb_t decls;
+    sb_init(&decls);
+    bool injected_any = false;
+
+    for (uint32_t i = 0; i < prop_count; i++) {
+        const char *p = prop_names[i];
+        char u_name[80];
+        if (strncmp(p, "u_", 2) == 0) {
+            snprintf(u_name, sizeof(u_name), "%s", p);
+        } else {
+            snprintf(u_name, sizeof(u_name), "u_%s", p);
+        }
+
+        char decl_probe1[96], decl_probe2[96];
+        snprintf(decl_probe1, sizeof(decl_probe1), "uniform float %s", u_name);
+        snprintf(decl_probe2, sizeof(decl_probe2), "uniform float %s", p);
+        if (strstr(src, decl_probe1) || strstr(src, decl_probe2)) {
+            continue;
+        }
+
+        if (only_if_referenced && !strstr(src, u_name) && !strstr(src, p)) {
+            continue;
+        }
+
+        const char *chosen =
+            (only_if_referenced && strstr(src, p) && !strstr(src, u_name)) ? p : u_name;
+        char line_buf[256];
+        snprintf(line_buf, sizeof(line_buf),
+                 "uniform float %s; // {\"material\":\"%s\",\"default\":1.0}\n", chosen, p);
+        (void)sb_append(&decls, line_buf);
+        injected_any = true;
+    }
+
+    if (!injected_any) {
+        free(decls.buf);
+        free(src);
+        return true;
+    }
+
+    compat_sb_t out;
+    sb_init(&out);
+    (void)sb_append_n(&out, src, insert_off);
+    (void)sb_append_n(&out, decls.buf, decls.len);
+    (void)sb_append_n(&out, src + insert_off, slen - insert_off);
+    free(decls.buf);
+    free(src);
+
+    if (out.oom) {
+        free(out.buf);
+        return false;
+    }
+    bool ok = write_confined_file(root_dfd, shader_rel, out.buf, out.len, false);
+    free(out.buf);
+    return ok;
+}
+
+static void synthesize_shader_props_in_dir(int root_dfd, const char *rel_prefix, int depth,
+                                           char prop_names[32][64], uint32_t prop_count)
+{
+    if (depth > 8) {
+        return;
+    }
+    int dfd = -1;
+    if (rel_prefix[0] == '\0') {
+        dfd = fcntl(root_dfd, F_DUPFD_CLOEXEC, 0);
+    } else if (is_safe_confined_relpath(rel_prefix)) {
+        struct open_how how;
+        memset(&how, 0, sizeof(how));
+        how.flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+        how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+        dfd = (int)syscall(SYS_openat2, root_dfd, rel_prefix, &how, sizeof(how));
+        if (dfd < 0 && errno == ENOSYS) {
+            int cur_dfd = root_dfd;
+            const char *p = rel_prefix;
+            while (*p) {
+                const char *slash = strchr(p, '/');
+                size_t seg_len = slash ? (size_t)(slash - p) : strlen(p);
+                if (seg_len == 0u || seg_len >= 256u) {
+                    if (cur_dfd != root_dfd) {
+                        close(cur_dfd);
+                    }
+                    cur_dfd = -1;
+                    break;
+                }
+                char comp[256];
+                memcpy(comp, p, seg_len);
+                comp[seg_len] = '\0';
+                int next_dfd =
+                    openat(cur_dfd, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                if (cur_dfd != root_dfd) {
+                    close(cur_dfd);
+                }
+                if (next_dfd < 0) {
+                    cur_dfd = -1;
+                    break;
+                }
+                cur_dfd = next_dfd;
+                if (!slash) {
+                    break;
+                }
+                p = slash + 1;
+            }
+            dfd = (cur_dfd != root_dfd) ? cur_dfd : -1;
+        }
+    }
+    if (dfd < 0) {
+        return;
+    }
+
+    DIR *d = fdopendir(dfd);
+    if (!d) {
+        close(dfd);
+        return;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        struct stat st;
+        if (fstatat(dfd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || S_ISLNK(st.st_mode)) {
+            continue;
+        }
+        char child_rel[1024];
+        if (rel_prefix[0] == '\0') {
+            snprintf(child_rel, sizeof(child_rel), "%s", ent->d_name);
+        } else {
+            snprintf(child_rel, sizeof(child_rel), "%s/%s", rel_prefix, ent->d_name);
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            synthesize_shader_props_in_dir(root_dfd, child_rel, depth + 1, prop_names, prop_count);
+        } else if (S_ISREG(st.st_mode)) {
+            size_t nlen = strlen(ent->d_name);
+            if (has_ext_ci(ent->d_name, nlen, ".vert") || has_ext_ci(ent->d_name, nlen, ".frag") ||
+                has_ext_ci(ent->d_name, nlen, ".glsl") || has_ext_ci(ent->d_name, nlen, ".hlsl")) {
+                (void)inject_shader_uniforms_confined(root_dfd, child_rel, prop_names, prop_count,
+                                                      true);
             }
         }
     }
     closedir(d);
+}
+
+static bool repair_synthesize_user_prop_confined(int root_dfd, const we_compat_report_t *report,
+                                                 const we_auto_repair_t *rep)
+{
+    char prop_names[32][64];
+    uint32_t prop_count = collect_missing_prop_names(report, rep, prop_names);
+
+    size_t plen = strlen(rep->target_file);
+    if (has_ext_ci(rep->target_file, plen, ".vert") ||
+        has_ext_ci(rep->target_file, plen, ".frag") ||
+        has_ext_ci(rep->target_file, plen, ".glsl") ||
+        has_ext_ci(rep->target_file, plen, ".hlsl")) {
+        return inject_shader_uniforms_confined(root_dfd, rep->target_file, prop_names, prop_count,
+                                               false);
+    }
+
+    size_t json_len = 0;
+    char *json_buf = read_confined_file(root_dfd, rep->target_file, 4u * 1024u * 1024u, &json_len);
+    if (!json_buf) {
+        return false;
+    }
+
+    we_jval_t *root = we_json_parse_root(json_buf, json_len);
+    free(json_buf);
+    if (!root || root->type != JVAL_OBJ) {
+        we_jval_free(root);
+        return false;
+    }
+
+    we_jval_t *general = jobj_get_mut(root, "general");
+    if (!general || general->type != JVAL_OBJ) {
+        we_jval_t *new_gen = jval_new_obj();
+        if (!new_gen || !jobj_put_owned(root, "general", new_gen)) {
+            we_jval_free(root);
+            return false;
+        }
+        general = new_gen;
+    }
+
+    we_jval_t *props = jobj_get_mut(general, "properties");
+    if (!props || props->type != JVAL_OBJ) {
+        we_jval_t *new_props = jval_new_obj();
+        if (!new_props || !jobj_put_owned(general, "properties", new_props)) {
+            we_jval_free(root);
+            return false;
+        }
+        props = new_props;
+    }
+
+    for (uint32_t i = 0; i < prop_count; i++) {
+        if (jobj_get_mut(props, prop_names[i])) {
+            continue;
+        }
+        we_jval_t *pobj = jval_new_obj();
+        if (!pobj) {
+            we_jval_free(root);
+            return false;
+        }
+        if (!jobj_put_owned(pobj, "text", jval_new_str(prop_names[i])) ||
+            !jobj_put_owned(pobj, "type", jval_new_str("slider")) ||
+            !jobj_put_owned(pobj, "value", jval_new_num(1.0)) ||
+            !jobj_put_owned(props, prop_names[i], pobj)) {
+            we_jval_free(root);
+            return false;
+        }
+    }
+
+    compat_sb_t sb;
+    sb_init(&sb);
+    sb_serialize_jval(&sb, root, 0);
+    (void)sb_append_n(&sb, "\n", 1u);
+    we_jval_free(root);
+
+    if (sb.oom) {
+        free(sb.buf);
+        return false;
+    }
+
+    bool ok = write_confined_file(root_dfd, rep->target_file, sb.buf, sb.len, false);
+    free(sb.buf);
+    if (!ok) {
+        return false;
+    }
+
+    synthesize_shader_props_in_dir(root_dfd, "", 0, prop_names, prop_count);
+    return true;
+}
+
+static bool repair_clamp_particles_confined(int root_dfd, const char *target_rel)
+{
+    int fd = open_beneath_confined(root_dfd, target_rel, O_RDWR, 0);
+    if (fd < 0) {
+        return false;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > 1024 * 1024) {
+        close(fd);
+        return false;
+    }
+
+    size_t sz = (size_t)st.st_size;
+    char *code = (char *)malloc(sz + 1u);
+    if (!code) {
+        close(fd);
+        return false;
+    }
+    if (read(fd, code, sz) != (ssize_t)sz) {
+        free(code);
+        close(fd);
+        return false;
+    }
+    code[sz] = '\0';
+
+    we_jval_t *root = we_json_parse_root(code, sz);
+    free(code);
+    if (!root || root->type != JVAL_OBJ) {
+        we_jval_free(root);
+        close(fd);
+        return false;
+    }
+
+    we_jval_t *mc = jobj_get_mut(root, "maxcount");
+    if (!mc) {
+        mc = jobj_get_mut(root, "count");
+    }
+    if (!mc) {
+        we_jval_t *sub = jobj_get_mut(root, "particle");
+        if (sub && sub->type == JVAL_OBJ) {
+            mc = jobj_get_mut(sub, "maxcount");
+            if (!mc) {
+                mc = jobj_get_mut(sub, "count");
+            }
+        }
+    }
+    if (mc && mc->type == JVAL_NUM && mc->num > 16384.0) {
+        mc->num = 16384.0;
+    }
+
+    compat_sb_t sb;
+    sb_init(&sb);
+    sb_serialize_jval(&sb, root, 0);
+    (void)sb_append_n(&sb, "\n", 1u);
+    we_jval_free(root);
+
+    bool ok = false;
+    if (!sb.oom) {
+        ok = rewrite_fd_contents(fd, sb.buf, sb.len);
+    }
+    free(sb.buf);
+    close(fd);
     return ok;
 }
 
-/* =========================================================================
- * Auto-Repair Transformations Engine
- * ========================================================================= */
+static bool apply_repairs_confined_core(const we_compat_report_t *report, const char *target_dir,
+                                        uint32_t *out_applied)
+{
+    if (out_applied) {
+        *out_applied = 0;
+    }
+    if (!report || !target_dir || target_dir[0] == '\0') {
+        return false;
+    }
+
+    int root_dfd = open(target_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root_dfd < 0) {
+        return false;
+    }
+
+    uint32_t applied = 0;
+    bool all_ok = true;
+
+    for (uint32_t i = 0; i < report->repair_count; i++) {
+        const we_auto_repair_t *rep = &report->repairs[i];
+        if (!is_safe_confined_relpath(rep->target_file)) {
+            all_ok = false;
+            break;
+        }
+
+        if (strcmp(rep->transformation_id, "REPAIR_PROMOTE_VARYING") == 0) {
+            if (!repair_promote_varying_confined(root_dfd, rep->target_file)) {
+                all_ok = false;
+                break;
+            }
+            applied++;
+        } else if (strcmp(rep->transformation_id, "REPAIR_SYNTHESIZE_USER_PROP") == 0) {
+            if (!repair_synthesize_user_prop_confined(root_dfd, report, rep)) {
+                all_ok = false;
+                break;
+            }
+            applied++;
+        } else if (strcmp(rep->transformation_id, "REPAIR_STUB_SCRIPT") == 0) {
+            static const char stub[] = "// Safe identity watchdog stub synthesized by WayWal\n"
+                                       "'use strict';\n"
+                                       "export function init(value) { return value; }\n"
+                                       "export function update(value) { return value; }\n";
+            if (!write_confined_file(root_dfd, rep->target_file, stub, sizeof(stub) - 1u, false)) {
+                all_ok = false;
+                break;
+            }
+            applied++;
+        } else if (strcmp(rep->transformation_id, "REPAIR_BC7_SOFTWARE_FALLBACK") == 0) {
+            int check_fd = open_beneath_confined(root_dfd, rep->target_file, O_RDONLY, 0);
+            if (check_fd < 0) {
+                all_ok = false;
+                break;
+            }
+            close(check_fd);
+
+            static const char fallback_cfg[] = "{\n  \"bc7_software_fallback\": true\n}\n";
+            if (!write_confined_file(root_dfd, ".waywal_compat.json", fallback_cfg,
+                                     sizeof(fallback_cfg) - 1u, true)) {
+                all_ok = false;
+                break;
+            }
+            applied++;
+        } else if (strcmp(rep->transformation_id, "REPAIR_CLAMP_PARTICLES") == 0) {
+            if (!repair_clamp_particles_confined(root_dfd, rep->target_file)) {
+                all_ok = false;
+                break;
+            }
+            applied++;
+        } else if (strcmp(rep->transformation_id, "REPAIR_CLAMP_BONES") == 0) {
+            int check_fd = open_beneath_confined(root_dfd, rep->target_file, O_RDONLY, 0);
+            if (check_fd < 0) {
+                all_ok = false;
+                break;
+            }
+            close(check_fd);
+            static const char clamp_cfg[] = "{\n  \"clamp_puppet_bones\": 128\n}\n";
+            if (!write_confined_file(root_dfd, ".waywal_compat.json", clamp_cfg,
+                                     sizeof(clamp_cfg) - 1u, true)) {
+                all_ok = false;
+                break;
+            }
+            applied++;
+        } else {
+            all_ok = false;
+            break;
+        }
+    }
+
+    close(root_dfd);
+    if (out_applied) {
+        *out_applied = all_ok ? applied : 0u;
+    }
+    return all_ok;
+}
+
+uint32_t we_compat_apply_repairs(const we_compat_report_t *report, const char *target_dir)
+{
+    uint32_t applied = 0;
+    if (!apply_repairs_confined_core(report, target_dir, &applied)) {
+        return 0;
+    }
+    return applied;
+}
 
 bool we_compat_apply_auto_repairs(const we_compat_report_t *report, const char *source_dir,
                                   const char *target_dir)
 {
-    if (!report || !source_dir || !target_dir) {
+    if (!report || !source_dir || !target_dir || source_dir[0] == '\0' || target_dir[0] == '\0') {
         return false;
     }
 
     if (strcmp(source_dir, target_dir) != 0) {
-        struct stat src_st;
-        if (stat(source_dir, &src_st) == 0 && S_ISDIR(src_st.st_mode)) {
-            copy_dir_recursive(source_dir, target_dir);
+        if (!copy_dir_recursive(source_dir, target_dir)) {
+            return false;
         }
     }
 
-    for (uint32_t i = 0; i < report->repair_count; i++) {
-        const we_auto_repair_t *rep = &report->repairs[i];
-
-        if (strcmp(rep->transformation_id, "REPAIR_PROMOTE_VARYING") == 0) {
-            char target_file[4096];
-            snprintf(target_file, sizeof(target_file), "%s/%s", target_dir, rep->target_file);
-
-            int fd = open(target_file, O_RDONLY | O_CLOEXEC);
-            if (fd >= 0) {
-                struct stat st;
-                if (fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size < 1024 * 1024) {
-                    size_t sz = (size_t)st.st_size;
-                    char *code = (char *)malloc(sz + 1024);
-                    if (code) {
-                        ssize_t rd = read(fd, code, sz);
-                        close(fd);
-                        fd = -1;
-                        if (rd == (ssize_t)sz) {
-                            code[sz] = '\0';
-                            char *v2 = strstr(code, "varying vec2 v_TexCoord;");
-                            if (v2) {
-                                memcpy(v2, "varying vec4 v_TexCoord;", 24);
-                            } else {
-                                char *o2 = strstr(code, "out vec2 v_TexCoord;");
-                                if (o2) {
-                                    memcpy(o2, "out vec4 v_TexCoord;", 20);
-                                }
-                            }
-                            int wfd = open(target_file, O_WRONLY | O_TRUNC | O_CLOEXEC);
-                            if (wfd >= 0) {
-                                write(wfd, code, strlen(code));
-                                close(wfd);
-                            }
-                        }
-                        free(code);
-                    }
-                }
-                if (fd >= 0)
-                    close(fd);
-            }
-        } else if (strcmp(rep->transformation_id, "REPAIR_SYNTHESIZE_USER_PROP") == 0) {
-            char target_file[4096];
-            snprintf(target_file, sizeof(target_file), "%s/%s", target_dir, rep->target_file);
-
-            /* Append default property if missing in project.json */
-            int fd = open(target_file, O_RDWR | O_CLOEXEC);
-            if (fd >= 0) {
-                struct stat st;
-                if (fstat(fd, &st) == 0 && st.st_size > 2) {
-                    size_t sz = (size_t)st.st_size;
-                    char *buf = (char *)malloc(sz + 256);
-                    if (buf) {
-                        if (read(fd, buf, sz) == (ssize_t)sz) {
-                            buf[sz] = '\0';
-                            char *props = strstr(buf, "\"properties\"");
-                            if (!props) {
-                                props = strstr(buf, "\"general\"");
-                            }
-                            if (props) {
-                                /* Insert synthesized default */
-                                lseek(fd, 0, SEEK_SET);
-                                write(fd, buf, sz);
-                            }
-                        }
-                        free(buf);
-                    }
-                }
-                close(fd);
-            }
-        } else if (strcmp(rep->transformation_id, "REPAIR_STUB_SCRIPT") == 0) {
-            char target_file[4096];
-            snprintf(target_file, sizeof(target_file), "%s/%s", target_dir, rep->target_file);
-            int wfd = open(target_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-            if (wfd >= 0) {
-                const char stub[] = "// Safe identity watchdog stub synthesized by WayWal\n"
-                                    "'use strict';\n"
-                                    "export function init(value) { return value; }\n"
-                                    "export function update(value) { return value; }\n";
-                write(wfd, stub, sizeof(stub) - 1);
-                close(wfd);
-            }
-        } else if (strcmp(rep->transformation_id, "REPAIR_BC7_SOFTWARE_FALLBACK") == 0) {
-            char meta_file[4096];
-            snprintf(meta_file, sizeof(meta_file), "%s/.waywal_compat.json", target_dir);
-            int wfd = open(meta_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-            if (wfd >= 0) {
-                const char fallback_cfg[] = "{\n  \"bc7_software_fallback\": true\n}\n";
-                write(wfd, fallback_cfg, sizeof(fallback_cfg) - 1);
-                close(wfd);
-            }
-        } else if (strcmp(rep->transformation_id, "REPAIR_CLAMP_PARTICLES") == 0) {
-            char target_file[4096];
-            snprintf(target_file, sizeof(target_file), "%s/%s", target_dir, rep->target_file);
-            int fd = open(target_file, O_RDWR | O_CLOEXEC);
-            if (fd >= 0) {
-                struct stat st;
-                if (fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size < 1024 * 1024) {
-                    size_t sz = (size_t)st.st_size;
-                    char *code = (char *)malloc(sz + 1);
-                    if (code && read(fd, code, sz) == (ssize_t)sz) {
-                        code[sz] = '\0';
-                        char *mc = strstr(code, "\"maxcount\"");
-                        if (!mc) {
-                            mc = strstr(code, "\"count\"");
-                        }
-                        if (mc) {
-                            char *colon = strchr(mc, ':');
-                            if (colon) {
-                                while (*colon && !isdigit((unsigned char)*colon))
-                                    colon++;
-                                char *end_num = colon;
-                                while (*end_num && isdigit((unsigned char)*end_num))
-                                    end_num++;
-                                if (colon < end_num) {
-                                    /* Rewrite in place */
-                                    lseek(fd, 0, SEEK_SET);
-                                    write(fd, code, (size_t)(colon - code));
-                                    write(fd, "16384", 5);
-                                    write(fd, end_num, strlen(end_num));
-                                    off_t new_len = lseek(fd, 0, SEEK_CUR);
-                                    if (new_len > 0) {
-                                        ftruncate(fd, new_len);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    free(code);
-                }
-                close(fd);
-            }
-        }
-    }
-    return true;
+    return apply_repairs_confined_core(report, target_dir, NULL);
 }
 
 /* =========================================================================
  * Report to JSON Serializer
  * ========================================================================= */
-
-typedef struct {
-    char *buf;
-    size_t len;
-    size_t cap;
-} compat_sb_t;
-
-static void sb_init(compat_sb_t *sb)
-{
-    sb->cap = 4096;
-    sb->buf = (char *)malloc(sb->cap);
-    sb->len = 0;
-    if (sb->buf) {
-        sb->buf[0] = '\0';
-    }
-}
-
-static void sb_append(compat_sb_t *sb, const char *s)
-{
-    if (!sb->buf || !s)
-        return;
-    size_t slen = strlen(s);
-    while (sb->len + slen + 1 > sb->cap) {
-        sb->cap *= 2;
-        char *nb = (char *)realloc(sb->buf, sb->cap);
-        if (!nb)
-            return;
-        sb->buf = nb;
-    }
-    memcpy(sb->buf + sb->len, s, slen);
-    sb->len += slen;
-    sb->buf[sb->len] = '\0';
-}
-
-static void sb_append_json_str(compat_sb_t *sb, const char *s)
-{
-    sb_append(sb, "\"");
-    if (s) {
-        for (size_t i = 0; s[i]; i++) {
-            unsigned char c = (unsigned char)s[i];
-            if (c == '"') {
-                sb_append(sb, "\\\"");
-            } else if (c == '\\') {
-                sb_append(sb, "\\\\");
-            } else if (c == '\n') {
-                sb_append(sb, "\\n");
-            } else if (c == '\r') {
-                sb_append(sb, "\\r");
-            } else if (c == '\t') {
-                sb_append(sb, "\\t");
-            } else if (c < 0x20) {
-                char esc[8];
-                snprintf(esc, sizeof(esc), "\\u%04x", c);
-                sb_append(sb, esc);
-            } else {
-                char ch[2] = {(char)c, '\0'};
-                sb_append(sb, ch);
-            }
-        }
-    }
-    sb_append(sb, "\"");
-}
 
 char *we_compat_report_to_json(const we_compat_report_t *report)
 {
@@ -1895,29 +3613,29 @@ char *we_compat_report_to_json(const we_compat_report_t *report)
     const char *tier_names[] = {"Unknown", "Tier 1: Native", "Tier 2: Transpiled",
                                 "Tier 3: Degraded", "Tier 4: Blocked"};
     uint32_t t_idx = (uint32_t)report->tier;
-    if (t_idx > 4)
-        t_idx = 0;
+    if (t_idx > 4u) {
+        t_idx = 0u;
+    }
 
-    sb_append(&sb, "{\n");
-    sb_append(&sb, "  \"workshop_id\": ");
+    (void)sb_append(&sb, "{\n");
+    (void)sb_append(&sb, "  \"workshop_id\": ");
     sb_append_json_str(&sb, report->workshop_id);
-    sb_append(&sb, ",\n  \"title\": ");
+    (void)sb_append(&sb, ",\n  \"title\": ");
     sb_append_json_str(&sb, report->title);
-    sb_append(&sb, ",\n  \"tier\": ");
+    (void)sb_append(&sb, ",\n  \"tier\": ");
     char num[64];
     snprintf(num, sizeof(num), "%u", (uint32_t)report->tier);
-    sb_append(&sb, num);
-    sb_append(&sb, ",\n  \"tier_name\": ");
+    (void)sb_append(&sb, num);
+    (void)sb_append(&sb, ",\n  \"tier_name\": ");
     sb_append_json_str(&sb, tier_names[t_idx]);
-    sb_append(&sb, ",\n  \"compatibility_score\": ");
+    (void)sb_append(&sb, ",\n  \"compatibility_score\": ");
     snprintf(num, sizeof(num), "%u", report->compatibility_score);
-    sb_append(&sb, num);
-    sb_append(&sb, ",\n  \"scan_timestamp\": ");
+    (void)sb_append(&sb, num);
+    (void)sb_append(&sb, ",\n  \"scan_timestamp\": ");
     snprintf(num, sizeof(num), "%llu", (unsigned long long)report->scan_timestamp);
-    sb_append(&sb, num);
+    (void)sb_append(&sb, num);
 
-    /* Summary */
-    sb_append(&sb, ",\n  \"summary\": {\n");
+    (void)sb_append(&sb, ",\n  \"summary\": {\n");
     char sum_buf[1024];
     snprintf(sum_buf, sizeof(sum_buf),
              "    \"total_objects\": %u,\n"
@@ -1932,56 +3650,58 @@ char *we_compat_report_to_json(const we_compat_report_t *report)
              report->summary.puppet_meshes, report->summary.particle_systems,
              report->summary.sound_layers, report->summary.active_scripts,
              report->summary.estimated_vram_mb, report->summary.estimated_fps);
-    sb_append(&sb, sum_buf);
+    (void)sb_append(&sb, sum_buf);
 
-    /* Issues */
-    sb_append(&sb, ",\n  \"issues\": [\n");
+    (void)sb_append(&sb, ",\n  \"issues\": [\n");
     for (uint32_t i = 0; i < report->issue_count; i++) {
         const we_compat_issue_t *iss = &report->issues[i];
-        sb_append(&sb, "    {\n      \"code\": ");
+        (void)sb_append(&sb, "    {\n      \"code\": ");
         sb_append_json_str(&sb, iss->code);
-        sb_append(&sb, ",\n      \"severity\": ");
+        (void)sb_append(&sb, ",\n      \"severity\": ");
         snprintf(num, sizeof(num), "%u", (uint32_t)iss->severity);
-        sb_append(&sb, num);
-        sb_append(&sb, ",\n      \"message\": ");
+        (void)sb_append(&sb, num);
+        (void)sb_append(&sb, ",\n      \"message\": ");
         sb_append_json_str(&sb, iss->message);
-        sb_append(&sb, ",\n      \"file_path\": ");
+        (void)sb_append(&sb, ",\n      \"file_path\": ");
         sb_append_json_str(&sb, iss->file_path);
-        sb_append(&sb, ",\n      \"line_number\": ");
+        (void)sb_append(&sb, ",\n      \"line_number\": ");
         snprintf(num, sizeof(num), "%u", iss->line_number);
-        sb_append(&sb, num);
-        sb_append(&sb, ",\n      \"suggested_fix\": ");
+        (void)sb_append(&sb, num);
+        (void)sb_append(&sb, ",\n      \"suggested_fix\": ");
         sb_append_json_str(&sb, iss->suggested_fix);
-        sb_append(&sb, "\n    }");
-        if (i + 1 < report->issue_count) {
-            sb_append(&sb, ",");
+        (void)sb_append(&sb, "\n    }");
+        if (i + 1u < report->issue_count) {
+            (void)sb_append_n(&sb, ",", 1u);
         }
-        sb_append(&sb, "\n");
+        (void)sb_append_n(&sb, "\n", 1u);
     }
-    sb_append(&sb, "  ],\n  \"issue_count\": ");
+    (void)sb_append(&sb, "  ],\n  \"issue_count\": ");
     snprintf(num, sizeof(num), "%u", report->issue_count);
-    sb_append(&sb, num);
+    (void)sb_append(&sb, num);
 
-    /* Repairs */
-    sb_append(&sb, ",\n  \"repairs\": [\n");
+    (void)sb_append(&sb, ",\n  \"repairs\": [\n");
     for (uint32_t i = 0; i < report->repair_count; i++) {
         const we_auto_repair_t *rep = &report->repairs[i];
-        sb_append(&sb, "    {\n      \"transformation_id\": ");
+        (void)sb_append(&sb, "    {\n      \"transformation_id\": ");
         sb_append_json_str(&sb, rep->transformation_id);
-        sb_append(&sb, ",\n      \"target_file\": ");
+        (void)sb_append(&sb, ",\n      \"target_file\": ");
         sb_append_json_str(&sb, rep->target_file);
-        sb_append(&sb, ",\n      \"description\": ");
+        (void)sb_append(&sb, ",\n      \"description\": ");
         sb_append_json_str(&sb, rep->description);
-        sb_append(&sb, "\n    }");
-        if (i + 1 < report->repair_count) {
-            sb_append(&sb, ",");
+        (void)sb_append(&sb, "\n    }");
+        if (i + 1u < report->repair_count) {
+            (void)sb_append_n(&sb, ",", 1u);
         }
-        sb_append(&sb, "\n");
+        (void)sb_append_n(&sb, "\n", 1u);
     }
-    sb_append(&sb, "  ],\n  \"repair_count\": ");
+    (void)sb_append(&sb, "  ],\n  \"repair_count\": ");
     snprintf(num, sizeof(num), "%u", report->repair_count);
-    sb_append(&sb, num);
-    sb_append(&sb, "\n}\n");
+    (void)sb_append(&sb, num);
+    (void)sb_append(&sb, "\n}\n");
 
+    if (sb.oom) {
+        free(sb.buf);
+        return NULL;
+    }
     return sb.buf;
 }

@@ -3,11 +3,12 @@
 #define _GNU_SOURCE
 #endif
 #include "waywal/we_vdf.h"
-#include "waywal/arena.h"
 #include "waywal/toml_parser.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <pwd.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,35 +16,141 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#define VDF_SLAB_DEFAULT_BYTES (256u * 1024u)
+#define VDF_ARENA_MAX_BYTES    (512ULL * 1024ULL * 1024ULL)
+
+typedef struct vdf_slab {
+    struct vdf_slab *next;
+    size_t cap;
+    size_t used;
+    size_t _pad;
+    uint8_t data[];
+} vdf_slab_t;
+
 typedef struct {
-    arena_t arena;
+    vdf_slab_t *head;
+    vdf_slab_t *curr;
+    size_t total_bytes;
 } vdf_arena_ctx_t;
 
 typedef struct {
     const char *src;
     size_t len;
     size_t pos;
-    arena_t *arena;
+    vdf_arena_ctx_t *arena;
     int depth;
 } vdf_parser_t;
 
+static vdf_slab_t *vdf_slab_create(vdf_arena_ctx_t *ctx, size_t min_cap)
+{
+    size_t cap = VDF_SLAB_DEFAULT_BYTES;
+    if (min_cap > cap) {
+        cap = min_cap;
+    }
+    if (cap > VDF_ARENA_MAX_BYTES || ctx->total_bytes > VDF_ARENA_MAX_BYTES - cap ||
+        cap > SIZE_MAX - sizeof(vdf_slab_t)) {
+        return NULL;
+    }
+
+    vdf_slab_t *slab = (vdf_slab_t *)malloc(sizeof(vdf_slab_t) + cap);
+    if (!slab) {
+        return NULL;
+    }
+    slab->next = NULL;
+    slab->cap = cap;
+    slab->used = 0;
+    slab->_pad = 0;
+    ctx->total_bytes += cap;
+    return slab;
+}
+
+static void *vdf_arena_alloc(vdf_arena_ctx_t *ctx, size_t size, size_t alignment)
+{
+    if (!ctx || size == 0) {
+        return NULL;
+    }
+    if (alignment == 0 || (alignment & (alignment - 1u)) != 0) {
+        alignment = _Alignof(void *);
+    }
+    if (size > SIZE_MAX - alignment) {
+        return NULL;
+    }
+
+    vdf_slab_t *curr = ctx->curr;
+    if (curr) {
+        uintptr_t base = (uintptr_t)curr->data;
+        uintptr_t aligned = (base + curr->used + (alignment - 1u)) & ~(uintptr_t)(alignment - 1u);
+        size_t aligned_off = (size_t)(aligned - base);
+        if (aligned_off <= curr->cap && size <= curr->cap - aligned_off) {
+            curr->used = aligned_off + size;
+            return (void *)aligned;
+        }
+    }
+
+    size_t min_needed = size + (alignment - 1u);
+    vdf_slab_t *slab = vdf_slab_create(ctx, min_needed);
+    if (!slab) {
+        return NULL;
+    }
+
+    /* Keep partially filled 256 KiB active slab when servicing a large child-pointer array */
+    if (curr && min_needed > VDF_SLAB_DEFAULT_BYTES && curr->cap - curr->used >= 4096u) {
+        slab->next = ctx->head;
+        ctx->head = slab;
+    } else {
+        slab->next = ctx->head;
+        ctx->head = slab;
+        ctx->curr = slab;
+    }
+
+    uintptr_t base = (uintptr_t)slab->data;
+    uintptr_t aligned = (base + (alignment - 1u)) & ~(uintptr_t)(alignment - 1u);
+    slab->used = (size_t)(aligned - base) + size;
+    return (void *)aligned;
+}
+
+static void vdf_arena_destroy(vdf_arena_ctx_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    vdf_slab_t *slab = ctx->head;
+    while (slab) {
+        vdf_slab_t *next = slab->next;
+        free(slab);
+        slab = next;
+    }
+    ctx->head = NULL;
+    ctx->curr = NULL;
+    ctx->total_bytes = 0;
+}
+
 static void skip_whitespace_and_comments(vdf_parser_t *p)
 {
-    while (p->pos < p->len) {
-        char c = p->src[p->pos];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f') {
-            p->pos++;
+    const char *src = p->src;
+    size_t len = p->len;
+    size_t pos = p->pos;
+
+    while (pos < len) {
+        unsigned char c = (unsigned char)src[pos];
+        if (c <= ' ' &&
+            (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f')) {
+            pos++;
             continue;
         }
-        if (c == '/' && p->pos + 1 < p->len && p->src[p->pos + 1] == '/') {
-            p->pos += 2;
-            while (p->pos < p->len && p->src[p->pos] != '\n' && p->src[p->pos] != '\r') {
-                p->pos++;
+        if (c == '/' && pos + 1u < len && src[pos + 1u] == '/') {
+            pos += 2u;
+            const char *nl = (const char *)memchr(src + pos, '\n', len - pos);
+            if (nl) {
+                pos = (size_t)(nl - src) + 1u;
+            } else {
+                pos = len;
             }
             continue;
         }
         break;
     }
+    p->pos = pos;
 }
 
 static void skip_quoted_string(vdf_parser_t *p)
@@ -51,16 +158,67 @@ static void skip_quoted_string(vdf_parser_t *p)
     if (p->pos >= p->len || p->src[p->pos] != '"') {
         return;
     }
-    p->pos++; /* skip initial quote */
+    p->pos++;
     while (p->pos < p->len) {
         char c = p->src[p->pos++];
         if (c == '"') {
             break;
         }
         if (c == '\\' && p->pos < p->len) {
-            p->pos++; /* skip escaped character */
+            p->pos++;
         }
     }
+}
+
+static bool parse_hex4(const char *s, uint32_t *out)
+{
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned char c = (unsigned char)s[i];
+        uint32_t d;
+        if (c >= '0' && c <= '9') {
+            d = (uint32_t)(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            d = (uint32_t)(c - 'a' + 10);
+        } else if (c >= 'A' && c <= 'F') {
+            d = (uint32_t)(c - 'A' + 10);
+        } else {
+            return false;
+        }
+        v = (v << 4u) | d;
+    }
+    *out = v;
+    return true;
+}
+
+static size_t encode_utf8_codepoint(uint32_t cp, char *dst)
+{
+    if (cp <= 0x7Fu) {
+        dst[0] = (char)cp;
+        return 1u;
+    }
+    if (cp <= 0x7FFu) {
+        dst[0] = (char)(0xC0u | (cp >> 6u));
+        dst[1] = (char)(0x80u | (cp & 0x3Fu));
+        return 2u;
+    }
+    if (cp >= 0xD800u && cp <= 0xDFFFu) {
+        cp = 0xFFFDu;
+    }
+    if (cp <= 0xFFFFu) {
+        dst[0] = (char)(0xE0u | (cp >> 12u));
+        dst[1] = (char)(0x80u | ((cp >> 6u) & 0x3Fu));
+        dst[2] = (char)(0x80u | (cp & 0x3Fu));
+        return 3u;
+    }
+    if (cp <= 0x10FFFFu) {
+        dst[0] = (char)(0xF0u | (cp >> 18u));
+        dst[1] = (char)(0x80u | ((cp >> 12u) & 0x3Fu));
+        dst[2] = (char)(0x80u | ((cp >> 6u) & 0x3Fu));
+        dst[3] = (char)(0x80u | (cp & 0x3Fu));
+        return 4u;
+    }
+    return encode_utf8_codepoint(0xFFFDu, dst);
 }
 
 static char *parse_quoted_string(vdf_parser_t *p)
@@ -68,9 +226,31 @@ static char *parse_quoted_string(vdf_parser_t *p)
     if (p->pos >= p->len || p->src[p->pos] != '"') {
         return NULL;
     }
-    p->pos++; /* skip initial quote */
+    p->pos++;
 
-    /* Pre-scan to find matching unescaped closing quote */
+    const char *start = p->src + p->pos;
+    size_t rem = p->len - p->pos;
+
+    /* Fast path for common unescaped VDF keys and numeric values */
+    for (size_t i = 0; i < rem; i++) {
+        char c = start[i];
+        if (c == '"') {
+            char *dest = (char *)vdf_arena_alloc(p->arena, i + 1u, 1u);
+            if (!dest) {
+                return NULL;
+            }
+            if (i > 0) {
+                memcpy(dest, start, i);
+            }
+            dest[i] = '\0';
+            p->pos += i + 1u;
+            return dest;
+        }
+        if (c == '\\') {
+            break;
+        }
+    }
+
     size_t scan_pos = p->pos;
     while (scan_pos < p->len) {
         char c = p->src[scan_pos++];
@@ -78,12 +258,12 @@ static char *parse_quoted_string(vdf_parser_t *p)
             break;
         }
         if (c == '\\' && scan_pos < p->len) {
-            scan_pos++; /* skip escaped character */
+            scan_pos++;
         }
     }
 
     size_t token_len = scan_pos - p->pos;
-    char *dest = arena_alloc(p->arena, token_len + 4, 1);
+    char *dest = (char *)vdf_arena_alloc(p->arena, token_len + 4u, 1u);
     if (!dest) {
         return NULL;
     }
@@ -126,27 +306,27 @@ static char *parse_quoted_string(vdf_parser_t *p)
                 dest[out_len++] = '\f';
                 break;
             case 'u': {
-                if (p->pos + 4 <= p->len) {
-                    char hex_buf[5] = {p->src[p->pos], p->src[p->pos + 1], p->src[p->pos + 2],
-                                       p->src[p->pos + 3], '\0'};
-                    char *endptr = NULL;
-                    long val = strtol(hex_buf, &endptr, 16);
-                    if (endptr == hex_buf + 4 && val >= 0) {
-                        p->pos += 4;
-                        if (val <= 0x7F) {
-                            dest[out_len++] = (char)val;
-                        } else if (val <= 0x7FF) {
-                            dest[out_len++] = (char)(0xC0 | ((val >> 6) & 0x1F));
-                            dest[out_len++] = (char)(0x80 | (val & 0x3F));
+                uint32_t hi = 0;
+                if (p->pos + 4u <= p->len && parse_hex4(p->src + p->pos, &hi)) {
+                    p->pos += 4u;
+                    uint32_t cp = hi;
+                    if (hi >= 0xD800u && hi <= 0xDBFFu) {
+                        uint32_t lo = 0;
+                        if (p->pos + 6u <= p->len && p->src[p->pos] == '\\' &&
+                            p->src[p->pos + 1u] == 'u' && parse_hex4(p->src + p->pos + 2u, &lo) &&
+                            lo >= 0xDC00u && lo <= 0xDFFFu) {
+                            cp = 0x10000u + (((hi - 0xD800u) << 10u) | (lo - 0xDC00u));
+                            p->pos += 6u;
                         } else {
-                            dest[out_len++] = (char)(0xE0 | ((val >> 12) & 0x0F));
-                            dest[out_len++] = (char)(0x80 | ((val >> 6) & 0x3F));
-                            dest[out_len++] = (char)(0x80 | (val & 0x3F));
+                            cp = 0xFFFDu;
                         }
-                        break;
+                    } else if (hi >= 0xDC00u && hi <= 0xDFFFu) {
+                        cp = 0xFFFDu;
                     }
+                    out_len += encode_utf8_codepoint(cp, dest + out_len);
+                } else {
+                    dest[out_len++] = 'u';
                 }
-                dest[out_len++] = 'u';
                 break;
             }
             default:
@@ -170,7 +350,7 @@ static char *parse_bare_string(vdf_parser_t *p)
             c == '}' || c == '"') {
             break;
         }
-        if (c == '/' && p->pos + 1 < p->len && p->src[p->pos + 1] == '/') {
+        if (c == '/' && p->pos + 1u < p->len && p->src[p->pos + 1u] == '/') {
             break;
         }
         p->pos++;
@@ -181,7 +361,7 @@ static char *parse_bare_string(vdf_parser_t *p)
         return NULL;
     }
 
-    char *dest = arena_alloc(p->arena, count + 1, 1);
+    char *dest = (char *)vdf_arena_alloc(p->arena, count + 1u, 1u);
     if (!dest) {
         return NULL;
     }
@@ -205,12 +385,16 @@ static char *parse_token_string(vdf_parser_t *p)
     return parse_bare_string(p);
 }
 
-static bool vdf_object_add_child(arena_t *arena, waywal_vdf_object_t *obj, waywal_vdf_node_t *child)
+static bool vdf_object_add_child(vdf_arena_ctx_t *arena, waywal_vdf_object_t *obj,
+                                 waywal_vdf_node_t *child)
 {
     if (obj->child_count >= obj->child_capacity) {
-        size_t new_cap = obj->child_capacity == 0 ? 8 : obj->child_capacity * 2;
-        waywal_vdf_node_t **new_children =
-            arena_alloc(arena, new_cap * sizeof(waywal_vdf_node_t *), _Alignof(void *));
+        size_t new_cap = obj->child_capacity == 0 ? 4u : obj->child_capacity * 2u;
+        if (new_cap > SIZE_MAX / sizeof(waywal_vdf_node_t *)) {
+            return false;
+        }
+        waywal_vdf_node_t **new_children = (waywal_vdf_node_t **)vdf_arena_alloc(
+            arena, new_cap * sizeof(waywal_vdf_node_t *), _Alignof(void *));
         if (!new_children) {
             return false;
         }
@@ -224,15 +408,30 @@ static bool vdf_object_add_child(arena_t *arena, waywal_vdf_object_t *obj, waywa
     return true;
 }
 
+static waywal_vdf_node_t *alloc_vdf_node(vdf_arena_ctx_t *arena, char *key, waywal_vdf_type_t type)
+{
+    waywal_vdf_node_t *node = (waywal_vdf_node_t *)vdf_arena_alloc(arena, sizeof(waywal_vdf_node_t),
+                                                                   _Alignof(waywal_vdf_node_t));
+    if (!node) {
+        return NULL;
+    }
+    node->key = key;
+    node->type = type;
+    if (type == VDF_NODE_OBJECT) {
+        node->object.children = NULL;
+        node->object.child_count = 0;
+        node->object.child_capacity = 0;
+    } else {
+        node->string_value = "";
+    }
+    return node;
+}
+
 static bool parse_object_children(vdf_parser_t *p, waywal_vdf_node_t *parent_node)
 {
     while (p->pos < p->len) {
         skip_whitespace_and_comments(p);
-        if (p->pos >= p->len) {
-            break;
-        }
-
-        if (p->src[p->pos] == '}') {
+        if (p->pos >= p->len || p->src[p->pos] == '}') {
             break;
         }
 
@@ -247,34 +446,30 @@ static bool parse_object_children(vdf_parser_t *p, waywal_vdf_node_t *parent_nod
 
         skip_whitespace_and_comments(p);
         if (p->pos >= p->len) {
-            waywal_vdf_node_t *node =
-                arena_alloc_zero(p->arena, sizeof(waywal_vdf_node_t), _Alignof(waywal_vdf_node_t));
-            if (node) {
-                node->key = key;
-                node->type = VDF_NODE_STRING;
-                node->string_value = "";
-                vdf_object_add_child(p->arena, &parent_node->object, node);
+            waywal_vdf_node_t *node = alloc_vdf_node(p->arena, key, VDF_NODE_STRING);
+            if (!node || !vdf_object_add_child(p->arena, &parent_node->object, node)) {
+                return false;
             }
             break;
         }
 
         if (p->src[p->pos] == '{') {
-            p->pos++; /* consume '{' */
-            waywal_vdf_node_t *obj_node =
-                arena_alloc_zero(p->arena, sizeof(waywal_vdf_node_t), _Alignof(waywal_vdf_node_t));
+            p->pos++;
+            waywal_vdf_node_t *obj_node = alloc_vdf_node(p->arena, key, VDF_NODE_OBJECT);
             if (!obj_node) {
                 return false;
             }
-            obj_node->key = key;
-            obj_node->type = VDF_NODE_OBJECT;
 
             if (p->depth < 64) {
                 p->depth++;
-                parse_object_children(p, obj_node);
+                if (!parse_object_children(p, obj_node)) {
+                    p->depth--;
+                    return false;
+                }
                 p->depth--;
                 skip_whitespace_and_comments(p);
                 if (p->pos < p->len && p->src[p->pos] == '}') {
-                    p->pos++; /* consume '}' */
+                    p->pos++;
                 }
             } else {
                 int brace_count = 1;
@@ -297,15 +492,13 @@ static bool parse_object_children(vdf_parser_t *p, waywal_vdf_node_t *parent_nod
                 }
             }
 
-            vdf_object_add_child(p->arena, &parent_node->object, obj_node);
+            if (!vdf_object_add_child(p->arena, &parent_node->object, obj_node)) {
+                return false;
+            }
         } else if (p->src[p->pos] == '}') {
-            waywal_vdf_node_t *node =
-                arena_alloc_zero(p->arena, sizeof(waywal_vdf_node_t), _Alignof(waywal_vdf_node_t));
-            if (node) {
-                node->key = key;
-                node->type = VDF_NODE_STRING;
-                node->string_value = "";
-                vdf_object_add_child(p->arena, &parent_node->object, node);
+            waywal_vdf_node_t *node = alloc_vdf_node(p->arena, key, VDF_NODE_STRING);
+            if (!node || !vdf_object_add_child(p->arena, &parent_node->object, node)) {
+                return false;
             }
             break;
         } else {
@@ -313,15 +506,14 @@ static bool parse_object_children(vdf_parser_t *p, waywal_vdf_node_t *parent_nod
             if (!value) {
                 value = "";
             }
-            waywal_vdf_node_t *str_node =
-                arena_alloc_zero(p->arena, sizeof(waywal_vdf_node_t), _Alignof(waywal_vdf_node_t));
+            waywal_vdf_node_t *str_node = alloc_vdf_node(p->arena, key, VDF_NODE_STRING);
             if (!str_node) {
                 return false;
             }
-            str_node->key = key;
-            str_node->type = VDF_NODE_STRING;
             str_node->string_value = value;
-            vdf_object_add_child(p->arena, &parent_node->object, str_node);
+            if (!vdf_object_add_child(p->arena, &parent_node->object, str_node)) {
+                return false;
+            }
         }
     }
     return true;
@@ -333,48 +525,45 @@ waywal_vdf_doc_t *waywal_vdf_parse(const char *text, size_t length)
         return NULL;
     }
 
-    waywal_vdf_doc_t *doc = calloc(1, sizeof(waywal_vdf_doc_t));
+    waywal_vdf_doc_t *doc = (waywal_vdf_doc_t *)calloc(1, sizeof(waywal_vdf_doc_t));
     if (!doc) {
         return NULL;
     }
 
-    vdf_arena_ctx_t *ctx = calloc(1, sizeof(vdf_arena_ctx_t));
+    vdf_arena_ctx_t *ctx = (vdf_arena_ctx_t *)calloc(1, sizeof(vdf_arena_ctx_t));
     if (!ctx) {
         free(doc);
         return NULL;
     }
 
-    size_t reserve = 2 * 1024 * 1024;
-    if (length * 6 + 512 * 1024 > reserve) {
-        reserve = length * 6 + 512 * 1024;
-    }
-
-    if (!arena_init(&ctx->arena, reserve)) {
+    vdf_slab_t *first_slab = vdf_slab_create(ctx, VDF_SLAB_DEFAULT_BYTES);
+    if (!first_slab) {
         free(ctx);
         free(doc);
         return NULL;
     }
-
+    ctx->head = first_slab;
+    ctx->curr = first_slab;
     doc->arena_ctx = ctx;
 
-    waywal_vdf_node_t *container =
-        arena_alloc_zero(&ctx->arena, sizeof(waywal_vdf_node_t), _Alignof(waywal_vdf_node_t));
+    waywal_vdf_node_t *container = alloc_vdf_node(ctx, "", VDF_NODE_OBJECT);
     if (!container) {
         waywal_vdf_free(doc);
         return NULL;
     }
-    container->key = "";
-    container->type = VDF_NODE_OBJECT;
 
     vdf_parser_t parser = {
         .src = text,
         .len = length,
         .pos = 0,
-        .arena = &ctx->arena,
+        .arena = ctx,
         .depth = 0,
     };
 
-    parse_object_children(&parser, container);
+    if (!parse_object_children(&parser, container)) {
+        waywal_vdf_free(doc);
+        return NULL;
+    }
 
     if (container->object.child_count == 0) {
         doc->root = NULL;
@@ -394,7 +583,7 @@ void waywal_vdf_free(waywal_vdf_doc_t *doc)
     }
     if (doc->arena_ctx) {
         vdf_arena_ctx_t *ctx = (vdf_arena_ctx_t *)doc->arena_ctx;
-        arena_destroy(&ctx->arena);
+        vdf_arena_destroy(ctx);
         free(ctx);
     }
     free(doc);
@@ -415,10 +604,6 @@ const waywal_vdf_node_t *waywal_vdf_find_child(const waywal_vdf_node_t *parent, 
         }
     }
 
-    if (parent->key && strcasecmp(parent->key, key) == 0) {
-        return parent;
-    }
-
     return NULL;
 }
 
@@ -430,10 +615,8 @@ const char *waywal_vdf_get_string(const waywal_vdf_node_t *parent, const char *k
     }
 
     const waywal_vdf_node_t *child = waywal_vdf_find_child(parent, key);
-    if (child) {
-        if (child->type == VDF_NODE_STRING && child->string_value) {
-            return child->string_value;
-        }
+    if (child && child->type == VDF_NODE_STRING && child->string_value) {
+        return child->string_value;
     }
     return fallback;
 }
@@ -461,7 +644,7 @@ static char *read_entire_file_local(const char *path, size_t *out_len)
     }
     rewind(fp);
 
-    char *buf = malloc((size_t)sz + 1);
+    char *buf = (char *)malloc((size_t)sz + 1u);
     if (!buf) {
         fclose(fp);
         return NULL;
@@ -590,7 +773,10 @@ static void parse_libraryfolders_vdf(const char *vdf_path, waywal_steam_library_
                     path = item->key;
                 }
                 const char *label = waywal_vdf_get_string(item, "label", "");
-                const char *totalsize_str = waywal_vdf_get_string(item, "totalsize", "0");
+                const char *totalsize_str = waywal_vdf_get_string(item, "totalsize", NULL);
+                if (!totalsize_str) {
+                    totalsize_str = waywal_vdf_get_string(item, "total_size", "0");
+                }
                 uint64_t total_size = strtoull(totalsize_str, NULL, 10);
 
                 bool has_we = false;
@@ -669,7 +855,6 @@ static void probe_colon_separated_roots(const char *path_list, waywal_steam_libr
             memcpy(candidate, p, len);
             candidate[len] = '\0';
 
-            /* Trim spaces */
             char *start = candidate;
             while (*start && isspace((unsigned char)*start)) {
                 start++;
@@ -682,7 +867,6 @@ static void probe_colon_separated_roots(const char *path_list, waywal_steam_libr
 
             if (start[0] != '\0') {
                 probe_candidate_steam_root(start, out_libs, inout_count, max_libs);
-                /* If it's a direct workshop path without libraryfolders.vdf */
                 struct stat st;
                 if (stat(start, &st) == 0 && S_ISDIR(st.st_mode)) {
                     add_or_merge_library(out_libs, inout_count, max_libs, start, "custom", 0, 0,
@@ -767,11 +951,24 @@ size_t waywal_steam_discover_libraries(waywal_steam_library_t *out_libs, size_t 
         probe_colon_separated_roots(cfg.daemon.workshop_dir, out_libs, &count, max_libs);
     }
 
+    char pw_stack_buf[4096];
+    char *pw_heap_buf = NULL;
+    struct passwd pw_entry;
     const char *home = getenv("HOME");
     if (!home || home[0] == '\0') {
-        struct passwd *pw = getpwuid(getuid());
-        if (pw) {
-            home = pw->pw_dir;
+        struct passwd *pw_res = NULL;
+        int rc = getpwuid_r(getuid(), &pw_entry, pw_stack_buf, sizeof(pw_stack_buf), &pw_res);
+        if (rc == ERANGE) {
+            long sys_max = sysconf(_SC_GETPW_R_SIZE_MAX);
+            size_t dyn_sz =
+                (sys_max > 0 && (size_t)sys_max > sizeof(pw_stack_buf)) ? (size_t)sys_max : 16384u;
+            pw_heap_buf = (char *)malloc(dyn_sz);
+            if (pw_heap_buf) {
+                rc = getpwuid_r(getuid(), &pw_entry, pw_heap_buf, dyn_sz, &pw_res);
+            }
+        }
+        if (rc == 0 && pw_res && pw_res->pw_dir && pw_res->pw_dir[0] != '\0') {
+            home = pw_res->pw_dir;
         }
     }
 
@@ -779,7 +976,6 @@ size_t waywal_steam_discover_libraries(waywal_steam_library_t *out_libs, size_t 
         char custom_cfg[4096];
         char parsed_dir[4096];
 
-        /* Probe ~/.config/waywal/config.toml */
         if (snprintf(custom_cfg, sizeof(custom_cfg), "%s/.config/waywal/config.toml", home) <
             (int)sizeof(custom_cfg)) {
             parse_workshop_dir_from_toml(custom_cfg, parsed_dir, sizeof(parsed_dir));
@@ -788,7 +984,6 @@ size_t waywal_steam_discover_libraries(waywal_steam_library_t *out_libs, size_t 
             }
         }
 
-        /* Probe ~/.config/wwal/config.toml */
         if (snprintf(custom_cfg, sizeof(custom_cfg), "%s/.config/wwal/config.toml", home) <
             (int)sizeof(custom_cfg)) {
             parse_workshop_dir_from_toml(custom_cfg, parsed_dir, sizeof(parsed_dir));
@@ -837,5 +1032,6 @@ size_t waywal_steam_discover_libraries(waywal_steam_library_t *out_libs, size_t 
         }
     }
 
+    free(pw_heap_buf);
     return count;
 }

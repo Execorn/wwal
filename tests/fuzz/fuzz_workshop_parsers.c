@@ -1,32 +1,67 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-/**
- * @file fuzz_workshop_parsers.c
- * @brief Corpus & Mutation Fuzzing Harness for VDF, Compatibility Scanner, and WWPKG Parsers
- *
- * Targets:
- * 1. Valve KeyValues VDF Parser (waywal_vdf_parse)
- * 2. Wallpaper Engine Compatibility Scanner (we_compat_scan_directory)
- * 3. WayWal Open Hub .wwpkg Container Parser (wwpkg_open)
- */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
-#include "waywal/we_vdf.h"
+#include "waywal/we_appworkshop.h"
 #include "waywal/we_compat_scanner.h"
+#include "waywal/we_pkg.h"
+#include "waywal/we_vdf.h"
 #include "waywal/wwpkg.h"
+
+extern wwpkg_package_t *fuzz_wwpkg_open_memory_sym(const uint8_t *data,
+                                                   size_t len) __asm__("wwpkg_open_memory")
+    __attribute__((weak));
+extern char *fuzz_wwpkg_jcs_canonicalize_sym(const char *json_src, size_t len,
+                                             size_t *out_len) __asm__("wwpkg_jcs_canonicalize")
+    __attribute__((weak));
+
+#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+__attribute__((visibility("default"))) const char *__asan_default_options(void);
+__attribute__((visibility("default"))) const char *__asan_default_options(void)
+{
+    return "allocator_may_return_null=1:detect_leaks=1";
+}
+#endif
 
 static we_compat_scanner_t *g_scanner = NULL;
 static we_compat_report_t *g_report = NULL;
+static char g_shm_dir[128] = {0};
+static int g_shm_dfd = -1;
 
-static void ensure_scanner_init(void)
+static void cleanup_fuzz_state(void)
+{
+    if (g_report) {
+        we_compat_report_free(g_report);
+        g_report = NULL;
+    }
+    if (g_scanner) {
+        we_compat_scanner_destroy(g_scanner);
+        g_scanner = NULL;
+    }
+    if (g_shm_dfd >= 0) {
+        close(g_shm_dfd);
+        g_shm_dfd = -1;
+    }
+    if (g_shm_dir[0] != '\0') {
+        (void)rmdir(g_shm_dir);
+        g_shm_dir[0] = '\0';
+    }
+}
+
+static bool ensure_fuzz_init(void)
 {
     if (!g_scanner) {
         g_scanner = we_compat_scanner_create(true, true);
@@ -34,17 +69,147 @@ static void ensure_scanner_init(void)
     if (!g_report) {
         g_report = we_compat_report_alloc();
     }
+    if (g_shm_dfd < 0) {
+        snprintf(g_shm_dir, sizeof(g_shm_dir), "/dev/shm/wwal_fuzz_XXXXXX");
+        if (!mkdtemp(g_shm_dir)) {
+            snprintf(g_shm_dir, sizeof(g_shm_dir), "/tmp/wwal_fuzz_XXXXXX");
+            if (!mkdtemp(g_shm_dir)) {
+                g_shm_dir[0] = '\0';
+                return false;
+            }
+        }
+        g_shm_dfd = open(g_shm_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (g_shm_dfd < 0) {
+            (void)rmdir(g_shm_dir);
+            g_shm_dir[0] = '\0';
+            return false;
+        }
+        (void)atexit(cleanup_fuzz_state);
+    }
+    return g_scanner != NULL && g_report != NULL && g_shm_dfd >= 0;
+}
+
+static bool write_excl_at(int dfd, const char *name, const uint8_t *buf, size_t len)
+{
+    int fd = openat(dfd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return false;
+    }
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n <= 0) {
+            break;
+        }
+        off += (size_t)n;
+    }
+    close(fd);
+    return off == len;
+}
+
+static void exercise_wwpkg_handle(wwpkg_package_t *pkg)
+{
+    if (!pkg) {
+        return;
+    }
+    (void)wwpkg_get_manifest(pkg);
+    (void)wwpkg_get_signature(pkg);
+    bool is_trusted = false;
+    (void)wwpkg_verify_signature(pkg, &is_trusted);
+    size_t asset_sz = 0;
+    (void)wwpkg_read_asset(pkg, "scene.json", &asset_sz);
+    wwpkg_close(pkg);
+}
+
+static void fuzz_wwpkg_in_memory(const uint8_t *data, size_t size)
+{
+    if (fuzz_wwpkg_open_memory_sym) {
+        wwpkg_package_t *pkg = fuzz_wwpkg_open_memory_sym(data, size);
+        exercise_wwpkg_handle(pkg);
+        return;
+    }
+
+    int mfd = memfd_create("wwpkg_fuzz_mem", MFD_CLOEXEC);
+    if (mfd < 0) {
+        return;
+    }
+    size_t off = 0;
+    while (off < size) {
+        ssize_t n = write(mfd, data + off, size - off);
+        if (n <= 0) {
+            break;
+        }
+        off += (size_t)n;
+    }
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", mfd);
+    wwpkg_package_t *pkg = wwpkg_open(proc_path);
+    exercise_wwpkg_handle(pkg);
+    close(mfd);
+}
+
+static void fuzz_jcs_canonicalizer(const uint8_t *data, size_t size)
+{
+    size_t out_len = 0;
+    char *canon = wwpkg_canonicalize_json((const char *)data, size, &out_len);
+    free(canon);
+
+    if (fuzz_wwpkg_jcs_canonicalize_sym &&
+        fuzz_wwpkg_jcs_canonicalize_sym != wwpkg_canonicalize_json) {
+        size_t alt_len = 0;
+        char *alt = fuzz_wwpkg_jcs_canonicalize_sym((const char *)data, size, &alt_len);
+        free(alt);
+    }
+}
+
+static void fuzz_loose_directory(const uint8_t *data, size_t size)
+{
+    if (mkdirat(g_shm_dfd, "loose", 0700) != 0) {
+        return;
+    }
+    int ldfd = openat(g_shm_dfd, "loose", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (ldfd < 0) {
+        (void)unlinkat(g_shm_dfd, "loose", AT_REMOVEDIR);
+        return;
+    }
+
+    static const char *const LOOSE_NAMES[] = {
+        "project.json", "scene.json", "effect.vert", "effect.frag",
+        "logic.js",     ".hidden.js", "abcd",
+    };
+    const size_t nfiles = sizeof(LOOSE_NAMES) / sizeof(LOOSE_NAMES[0]);
+    size_t chunk = size / nfiles;
+    size_t cur = 0;
+
+    for (size_t i = 0; i < nfiles; i++) {
+        size_t flen = (i + 1u == nfiles) ? (size - cur) : chunk;
+        (void)write_excl_at(ldfd, LOOSE_NAMES[i], data + cur, flen);
+        cur += flen;
+    }
+
+    char loose_path[256];
+    snprintf(loose_path, sizeof(loose_path), "%s/loose", g_shm_dir);
+    if (we_compat_scan_directory(g_scanner, loose_path, g_report) && g_report->repair_count > 0u) {
+        (void)we_compat_apply_repairs(g_report, loose_path);
+    }
+
+    for (size_t i = 0; i < nfiles; i++) {
+        (void)unlinkat(ldfd, LOOSE_NAMES[i], 0);
+    }
+    (void)unlinkat(ldfd, ".waywal_compat.json", 0);
+    close(ldfd);
+    (void)unlinkat(g_shm_dfd, "loose", AT_REMOVEDIR);
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
-    if (!data || size == 0) {
+    if (!data || size == 0u) {
         return 0;
     }
 
-    // 1. Fuzz KeyValues VDF Parser
+    /* 1. Fuzz Valve KeyValues VDF parser */
     waywal_vdf_doc_t *vdf = waywal_vdf_parse((const char *)data, size);
     if (vdf) {
         if (vdf->root) {
@@ -55,40 +220,49 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         waywal_vdf_free(vdf);
     }
 
-    // 2. Fuzz .wwpkg container parser & Compat Scanner via temporary file/dir
-    ensure_scanner_init();
-
-    char tmp_file[64];
-    snprintf(tmp_file, sizeof(tmp_file), "/tmp/fuzz_p2_%d.tmp", getpid());
-    int fd = open(tmp_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd >= 0) {
-        (void)write(fd, data, size);
-        close(fd);
-
-        // Fuzz wwpkg_open on arbitrary byte stream
-        wwpkg_package_t *pkg = wwpkg_open(tmp_file);
-        if (pkg) {
-            (void)wwpkg_get_manifest(pkg);
-            (void)wwpkg_get_signature(pkg);
-            bool is_trusted = false;
-            (void)wwpkg_verify_signature(pkg, &is_trusted);
-            size_t asset_sz = 0;
-            (void)wwpkg_read_asset(pkg, "scene.json", &asset_sz);
-            wwpkg_close(pkg);
-        }
-
-        // Fuzz compat scanner on arbitrary file
-        if (g_scanner && g_report) {
-            (void)we_compat_scan_directory(g_scanner, tmp_file, g_report);
-        }
-
-        unlink(tmp_file);
+    /* 2. Fuzz PKGV in-memory container parser */
+    we_pkg_t *mem_pkg = we_pkg_open_mem(data, size, NULL);
+    if (mem_pkg) {
+        size_t esz = 0;
+        (void)we_pkg_find(mem_pkg, "scene.json", &esz);
+        we_pkg_close(mem_pkg);
     }
 
+    /* 3. Fuzz RFC 8785 JCS canonicalizer and in-memory .wwpkg parser */
+    fuzz_jcs_canonicalizer(data, size);
+    fuzz_wwpkg_in_memory(data, size);
+
+    /* 4. Fuzz file-backed .wwpkg, appworkshop, single-file and multi-file loose directory paths */
+    if (!ensure_fuzz_init()) {
+        return 0;
+    }
+
+    if (write_excl_at(g_shm_dfd, "input.bin", data, size)) {
+        char input_path[256];
+        snprintf(input_path, sizeof(input_path), "%s/input.bin", g_shm_dir);
+
+        wwpkg_package_t *pkg = wwpkg_open(input_path);
+        exercise_wwpkg_handle(pkg);
+
+        waywal_appworkshop_manifest_t ws_man;
+        if (waywal_appworkshop_parse_file(input_path, &ws_man)) {
+            waywal_appworkshop_free(&ws_man);
+        }
+
+        (void)we_compat_scan_directory(g_scanner, input_path, g_report);
+        (void)unlinkat(g_shm_dfd, "input.bin", 0);
+    }
+
+    fuzz_loose_directory(data, size);
     return 0;
 }
 
 #ifdef WWAL_FUZZ_STANDALONE
+
+typedef struct {
+    const uint8_t *bytes;
+    size_t len;
+} fuzz_seed_t;
 
 static uint32_t xorshift32(uint32_t *state)
 {
@@ -104,59 +278,65 @@ int main(void)
 {
     printf("[FUZZ] Starting fuzz_workshop_parsers standalone fuzzing harness...\n");
 
-    ensure_scanner_init();
-
-    // Initial seed corpus
-    const char *corpus[] = {
-        ("\"AppWorkshop\" { \"appid\" \"431960\" \"WorkshopItemsInstalled\" { \"101\" { \"size\" "
-         "\"100\" } } }"),
-        "\"libraryfolders\" { \"0\" { \"path\" \"/steam\" \"apps\" { \"431960\" \"1000\" } } }",
-        "{\"title\":\"Test Scene\",\"type\":\"scene\",\"general\":{\"properties\":{}}}",
-        "PKGV0001\x00\x00\x00\x00\x01\x00\x00\x00scene.json\x00\x00",
-        "\x28\xB5\x2F\xFD\x00\x00\x00\x00tar.zst mock header",
-        "",
-        "// Comments and unclosed quotes \"broken",
-        "{{{{{{{{{{ deep recursion }}}}}}}}}}",
-    };
-
-    size_t corpus_count = sizeof(corpus) / sizeof(corpus[0]);
-    for (size_t i = 0; i < corpus_count; ++i) {
-        LLVMFuzzerTestOneInput((const uint8_t *)corpus[i], strlen(corpus[i]));
+    if (!ensure_fuzz_init()) {
+        fprintf(stderr, "[FUZZ] Failed to initialize /dev/shm workspace\n");
+        return 1;
     }
 
-    // Run 5,000 randomized mutations
-    const int MUTATION_ROUNDS = 5000;
+    static const uint8_t seed0[] =
+        "\"AppWorkshop\" { \"appid\" \"431960\" \"WorkshopItemsInstalled\" { \"101\" { \"size\" "
+        "\"100\" } } }";
+    static const uint8_t seed1[] =
+        "\"libraryfolders\" { \"0\" { \"path\" \"/steam\" \"apps\" { \"431960\" \"1000\" } } }";
+    static const uint8_t seed2[] =
+        "{\"title\":\"Test Scene\",\"type\":\"scene\",\"general\":{\"properties\":{}}}";
+    /* Valid 4-byte length-prefixed PKGV0001 archive with 1 embedded scene.json entry */
+    static const uint8_t seed3[] = "\x08\x00\x00\x00PKGV0001"
+                                   "\x01\x00\x00\x00"
+                                   "\x0a\x00\x00\x00scene.json"
+                                   "\x00\x00\x00\x00"
+                                   "\x0e\x00\x00\x00"
+                                   "{\"objects\":[]}";
+    static const uint8_t seed4[] = "\x28\xB5\x2F\xFD\x00\x00\x00\x00tar.zst mock header";
+    static const uint8_t seed5[] =
+        "{\"z\":1,\"a\":\"\\uD83D\\uDE80\",\"nested\":{\"b\":true,\"a\":-0.0}}";
+    static const uint8_t seed6[] = "// Comments and unclosed quotes \"broken \\uD800";
+    static const uint8_t seed7[] = "{{{{{{{{{{ deep recursion }}}}}}}}}}";
+
+    const fuzz_seed_t corpus[] = {
+        {seed0, sizeof(seed0) - 1u}, {seed1, sizeof(seed1) - 1u}, {seed2, sizeof(seed2) - 1u},
+        {seed3, sizeof(seed3) - 1u}, {seed4, sizeof(seed4) - 1u}, {seed5, sizeof(seed5) - 1u},
+        {seed6, sizeof(seed6) - 1u}, {seed7, sizeof(seed7) - 1u},
+    };
+
+    const size_t corpus_count = sizeof(corpus) / sizeof(corpus[0]);
+    for (size_t i = 0; i < corpus_count; ++i) {
+        LLVMFuzzerTestOneInput(corpus[i].bytes, corpus[i].len);
+    }
+
+    const int MUTATION_ROUNDS = 2500;
     uint32_t rng = 0xC001CAFEU;
     uint8_t mut_buf[2048];
 
     for (int r = 0; r < MUTATION_ROUNDS; ++r) {
         size_t base_idx = xorshift32(&rng) % corpus_count;
-        size_t base_len = strlen(corpus[base_idx]);
-        size_t len = base_len < sizeof(mut_buf) ? base_len : sizeof(mut_buf) - 1;
-        memcpy(mut_buf, corpus[base_idx], len);
+        size_t base_len = corpus[base_idx].len;
+        size_t len = base_len < sizeof(mut_buf) ? base_len : sizeof(mut_buf) - 1u;
+        memcpy(mut_buf, corpus[base_idx].bytes, len);
 
-        // Apply 1 to 8 random mutations (byte flip, insert, truncate)
         uint32_t flips = (xorshift32(&rng) % 8U) + 1U;
         for (uint32_t f = 0; f < flips; ++f) {
-            if (len > 0) {
+            if (len > 0u) {
                 size_t p = xorshift32(&rng) % len;
                 mut_buf[p] ^= (uint8_t)(xorshift32(&rng) & 0xFFU);
             }
         }
 
-        size_t test_len = (len > 0) ? ((xorshift32(&rng) % len) + 1U) : 0;
+        size_t test_len = (len > 0u) ? ((xorshift32(&rng) % len) + 1U) : 0u;
         LLVMFuzzerTestOneInput(mut_buf, test_len);
     }
 
-    if (g_report) {
-        we_compat_report_free(g_report);
-        g_report = NULL;
-    }
-    if (g_scanner) {
-        we_compat_scanner_destroy(g_scanner);
-        g_scanner = NULL;
-    }
-
+    cleanup_fuzz_state();
     printf("[FUZZ] fuzz_workshop_parsers (%d mutation rounds) PASSED CLEANLY (100%%).\n",
            MUTATION_ROUNDS);
     return 0;

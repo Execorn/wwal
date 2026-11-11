@@ -487,6 +487,8 @@ static void test_ast_sandbox_forbidden_globals(void)
         "document.cookie = 'stolen';",
         "new XMLHttpRequest();",
         "require('child_process').execSync('id');",
+        "const u = \"http://attacker.com/x\"; eval('1');",
+        "const t = `http://attacker.com/${fetch('https://x')}`;",
     };
 
     we_compat_scanner_t *scanner = we_compat_scanner_create(true, true);
