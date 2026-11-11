@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -1180,12 +1181,14 @@ struct Task {
 
     void notifyProgress()
     {
-        if (!callback) {
-            return;
-        }
+        ProgressCallback cb;
         DownloadProgress prog;
         {
             std::lock_guard<std::mutex> lk(progress_mutex);
+            if (!callback) {
+                return;
+            }
+            cb = callback;
             prog.published_file_id = request.steam_published_file_id;
             prog.openhub_package_id = request.openhub_package_id;
             prog.state = state.load(std::memory_order_relaxed);
@@ -1198,7 +1201,7 @@ struct Task {
             prog.installed_path = installed_path;
             prog.extracted_dir = extracted_dir;
         }
-        callback(prog);
+        cb(prog);
     }
 };
 
@@ -1264,6 +1267,7 @@ struct DownloadManager::Impl {
 
     DownloadManager *q_ptr{nullptr};
     std::atomic<bool> m_running{false};
+    std::atomic<bool> m_reactorAlive{false};
 
     TokenBucket m_tokenBucket;
     SteamworksBackend m_steamworks;
@@ -1316,6 +1320,7 @@ struct DownloadManager::Impl {
         uint64_t initial_offset{0};
         uint64_t current_offset{0};
         uint64_t expected_total{0};
+        bool has_authoritative_length{false};
         long last_http_code{0};
         int retry_after_sec{-1};
         size_t discarded_error_bytes{0};
@@ -1415,9 +1420,21 @@ struct DownloadManager::Impl {
             task->state.store(finalState, std::memory_order_relaxed);
         }
         task->notifyProgress();
+        {
+            ProgressCallback droppedCb;
+            std::lock_guard<std::mutex> lk(task->progress_mutex);
+            droppedCb = std::move(task->callback);
+        }
 
         m_inFlightTasks.fetch_sub(1, std::memory_order_acq_rel);
         std::lock_guard<std::mutex> qlk(m_queueMutex);
+        if (m_allTasks.size() > 64) {
+            std::erase_if(m_allTasks, [](const std::shared_ptr<Task> &t) {
+                const TaskState st = t->state.load(std::memory_order_relaxed);
+                return st == TaskState::Installed || st == TaskState::Failed ||
+                       st == TaskState::Cancelled;
+            });
+        }
         m_idleCv.notify_all();
     }
 
@@ -1464,6 +1481,7 @@ struct DownloadManager::Impl {
         ::epoll_ctl(m_epollFd, EPOLL_CTL_ADD, m_wakeEventFd, &evWake);
 
         m_running.store(true, std::memory_order_release);
+        m_reactorAlive.store(true, std::memory_order_release);
         m_reactorThread = std::thread(&Impl::httpReactorLoop, this);
         m_arbThread = std::thread(&Impl::arbWorkerLoop, this);
         m_verifyThreads.reserve(kVerifyPoolThreads);
@@ -1507,12 +1525,16 @@ struct DownloadManager::Impl {
         m_verifyCv.notify_all();
         wakeReactor();
 
-        if (m_reactorThread.joinable()) {
-            m_reactorThread.join();
-        }
+        // Join the arbitration producer before the HTTP reactor consumer so any
+        // late Backend B fallback submission wakes deterministically.
         if (m_arbThread.joinable()) {
             m_arbThread.join();
         }
+        wakeReactor();
+        if (m_reactorThread.joinable()) {
+            m_reactorThread.join();
+        }
+        m_verifyCv.notify_all();
         for (auto &vt : m_verifyThreads) {
             if (vt.joinable()) {
                 vt.join();
@@ -1524,6 +1546,7 @@ struct DownloadManager::Impl {
         m_steamworks.shutdown();
 
         std::lock_guard<std::mutex> qlk(m_queueMutex);
+        m_allTasks.clear();
         m_idleCv.notify_all();
     }
 
@@ -1559,13 +1582,25 @@ struct DownloadManager::Impl {
             job->is_wwpkg = true;
             job->fast_lane = (request.priority == TaskPriority::Immediate);
 
+            bool enqueued = false;
             {
                 std::lock_guard<std::mutex> hlk(m_httpMutex);
-                if (job->fast_lane) {
-                    m_httpFastQueue.push(std::move(job));
-                } else {
-                    m_httpBulkQueue.push(std::move(job));
+                if (m_running.load(std::memory_order_acquire) &&
+                    !task->cancelled.load(std::memory_order_relaxed) &&
+                    m_reactorAlive.load(std::memory_order_acquire)) {
+                    if (job->fast_lane) {
+                        m_httpFastQueue.push(job);
+                    } else {
+                        m_httpBulkQueue.push(job);
+                    }
+                    enqueued = true;
                 }
+            }
+            if (!enqueued) {
+                finishHttpJobOutcome(job, false, "Download engine not running",
+                                     task->cancelled.load(std::memory_order_relaxed) ||
+                                         !m_running.load(std::memory_order_acquire));
+                return;
             }
             wakeReactor();
             return;
@@ -1859,6 +1894,7 @@ struct DownloadManager::Impl {
                 if (ok) {
                     uint64_t base = (slot->last_http_code == 206) ? slot->initial_offset : 0;
                     slot->expected_total = base + contentLen;
+                    slot->has_authoritative_length = true;
                     std::lock_guard<std::mutex> lk(slot->job->task->progress_mutex);
                     slot->job->task->bytes_total = slot->expected_total;
                 }
@@ -2345,7 +2381,10 @@ struct DownloadManager::Impl {
 
             bool validSuccessCode =
                 (httpCode == 200) || (httpCode == 206 && slot->initial_offset > 0);
-            if (curlResult == 0 && !slot->drop_triggered && validSuccessCode) {
+            bool completeBody =
+                (!slot->has_authoritative_length || slot->current_offset == slot->expected_total) &&
+                (slot->expected_total == 0 || slot->current_offset >= slot->expected_total);
+            if (curlResult == 0 && !slot->drop_triggered && validSuccessCode && completeBody) {
                 finishHttpJobOutcome(job, true, {});
                 continue;
             }
@@ -2479,6 +2518,9 @@ struct DownloadManager::Impl {
                 }
 
                 if (m_multi) {
+                    if (!m_socketEvents.contains(fd)) {
+                        continue;
+                    }
                     int action = 0;
                     if (revents & EPOLLIN) {
                         action |= CurlBinding::CSELECT_IN;
@@ -2524,6 +2566,7 @@ struct DownloadManager::Impl {
         std::vector<std::shared_ptr<HttpTransferJob>> drained;
         {
             std::lock_guard<std::mutex> hlk(m_httpMutex);
+            m_reactorAlive.store(false, std::memory_order_release);
             while (!m_httpFastQueue.empty()) {
                 drained.push_back(m_httpFastQueue.top());
                 m_httpFastQueue.pop();
@@ -3021,18 +3064,29 @@ struct DownloadManager::Impl {
             job->sync_ok = std::make_shared<bool>(false);
             job->sync_err = std::make_shared<std::string>();
 
+            bool enqueued = false;
             {
                 std::lock_guard<std::mutex> hlk(m_httpMutex);
-                if (job->fast_lane) {
-                    m_httpFastQueue.push(job);
-                } else {
-                    m_httpBulkQueue.push(job);
+                if (m_running.load(std::memory_order_acquire) &&
+                    !task->cancelled.load(std::memory_order_relaxed) &&
+                    m_reactorAlive.load(std::memory_order_acquire)) {
+                    if (job->fast_lane) {
+                        m_httpFastQueue.push(job);
+                    } else {
+                        m_httpBulkQueue.push(job);
+                    }
+                    enqueued = true;
                 }
+            }
+            if (!enqueued) {
+                return false;
             }
             wakeReactor();
 
             std::unique_lock<std::mutex> slk(*job->sync_mtx);
-            job->sync_cv->wait(slk, [&] { return *job->sync_done; });
+            job->sync_cv->wait(slk, [&] {
+                return *job->sync_done || !m_reactorAlive.load(std::memory_order_acquire);
+            });
             if (*job->sync_ok && !task->cancelled.load(std::memory_order_relaxed)) {
                 std::error_code ec;
                 fs::rename(partPath, finalPath, ec);
@@ -3260,6 +3314,7 @@ struct DownloadManager::Impl {
         }
 
         if (pid == 0) {
+            (void)::setpgid(0, 0);
             ::close(pipefd[0]);
             ::dup2(pipefd[1], STDOUT_FILENO);
             ::dup2(pipefd[1], STDERR_FILENO);
@@ -3271,6 +3326,7 @@ struct DownloadManager::Impl {
             ::_exit(127);
         }
 
+        (void)::setpgid(pid, pid);
         ::close(pipefd[1]);
 
         {
@@ -3287,15 +3343,38 @@ struct DownloadManager::Impl {
         std::regex reProgressPct(R"(progress:\s*([0-9.]+)%)");
         std::regex reSuccess(R"rx(Success\.\s*Downloaded item\s*([0-9]+)\s*to\s*"([^"]+)")rx");
 
+        auto parseFloatSafe = [](const std::string &s, float &out) noexcept -> bool {
+            if (s.empty()) {
+                return false;
+            }
+            const char *first = s.data();
+            const char *last = first + s.size();
+            auto [ptr, ec] = std::from_chars(first, last, out);
+            return ec == std::errc{} && ptr == last && std::isfinite(out);
+        };
+        auto parseU64Safe = [](const std::string &s, uint64_t &out) noexcept -> bool {
+            if (s.empty()) {
+                return false;
+            }
+            const char *first = s.data();
+            const char *last = first + s.size();
+            auto [ptr, ec] = std::from_chars(first, last, out, 10);
+            return ec == std::errc{} && ptr == last;
+        };
+
         auto handleLine = [&](const std::string &line) {
             if (line.empty()) {
                 return;
             }
             std::smatch match;
             if (std::regex_search(line, match, reProgressBytes)) {
-                float pct = std::stof(match[1].str());
-                uint64_t cur = std::stoull(match[2].str());
-                uint64_t tot = std::stoull(match[3].str());
+                float pct = 0.0f;
+                uint64_t cur = 0;
+                uint64_t tot = 0;
+                if (!parseFloatSafe(match[1].str(), pct) || !parseU64Safe(match[2].str(), cur) ||
+                    !parseU64Safe(match[3].str(), tot)) {
+                    return;
+                }
                 {
                     std::lock_guard<std::mutex> lk(task->progress_mutex);
                     task->bytes_downloaded = cur;
@@ -3306,7 +3385,10 @@ struct DownloadManager::Impl {
                 }
                 task->notifyProgress();
             } else if (std::regex_search(line, match, reProgressPct)) {
-                float pct = std::stof(match[1].str());
+                float pct = 0.0f;
+                if (!parseFloatSafe(match[1].str(), pct)) {
+                    return;
+                }
                 {
                     std::lock_guard<std::mutex> lk(task->progress_mutex);
                     task->progress_pct = pct;
@@ -3383,7 +3465,9 @@ struct DownloadManager::Impl {
             if (reaped) {
                 return;
             }
-            ::kill(pid, SIGTERM);
+            if (::kill(-pid, SIGTERM) != 0) {
+                (void)::kill(pid, SIGTERM);
+            }
             for (int i = 0; i < 12; ++i) {
                 int status = 0;
                 pid_t w = ::waitpid(pid, &status, WNOHANG);
@@ -3397,7 +3481,9 @@ struct DownloadManager::Impl {
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(25));
             }
-            ::kill(pid, SIGKILL);
+            if (::kill(-pid, SIGKILL) != 0) {
+                (void)::kill(pid, SIGKILL);
+            }
             int status = 0;
             while (true) {
                 pid_t w = ::waitpid(pid, &status, 0);

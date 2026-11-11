@@ -22,10 +22,14 @@
 #include <QComboBox>
 #include <QDateTime>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -208,8 +212,209 @@ bool parseVerifiedPackageFile(const std::filesystem::path &pkgPath, OpenHubRecor
     rec.download_count = 0;
     rec.rating = 0.0f;
 
+    // Extract preview asset into local cache for verified packages so grid cards display thumbnails
+    // before activation.
+    if (rec.is_verified) {
+        const char *previewCands[4] = {
+            man->entrypoint_preview[0] != '\0' ? man->entrypoint_preview : nullptr, "preview.webp",
+            "preview.png", "preview.jpg"};
+        for (const char *cand : previewCands) {
+            if (!cand || cand[0] == '\0') {
+                continue;
+            }
+            size_t assetLen = 0;
+            const uint8_t *assetBytes = wwpkg_read_asset(pkg.get(), cand, &assetLen);
+            if (!assetBytes || assetLen == 0) {
+                continue;
+            }
+
+            QString cacheRoot =
+                QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation);
+            if (cacheRoot.isEmpty()) {
+                cacheRoot = QStringLiteral("/tmp");
+            }
+            std::filesystem::path cacheDir = std::filesystem::path(
+                (cacheRoot + QStringLiteral("/wwal/openhub_previews")).toStdString());
+            std::filesystem::create_directories(cacheDir, ec);
+
+            std::string ext = std::filesystem::path(cand).extension().string();
+            if (ext.empty()) {
+                ext = ".webp";
+            }
+            QString safeStem = rec.id;
+            for (qsizetype i = 0; i < safeStem.size(); ++i) {
+                const QChar c = safeStem[i];
+                if (!c.isLetterOrNumber() && c != QLatin1Char('_') && c != QLatin1Char('-')) {
+                    safeStem[i] = QLatin1Char('_');
+                }
+            }
+            std::filesystem::path outPreview = cacheDir / (safeStem.toStdString() + ext);
+            const uint64_t existingSz = std::filesystem::exists(outPreview, ec)
+                                            ? std::filesystem::file_size(outPreview, ec)
+                                            : 0;
+            if (ec || existingSz != assetLen) {
+                QFile pf(QString::fromStdString(outPreview.string()));
+                if (pf.open(QIODevice::WriteOnly)) {
+                    pf.write(reinterpret_cast<const char *>(assetBytes),
+                             static_cast<qint64>(assetLen));
+                    pf.close();
+                }
+            }
+            if (std::filesystem::is_regular_file(outPreview, ec)) {
+                rec.preview_path = QString::fromStdString(outPreview.string());
+            }
+            break;
+        }
+    }
+
     outRec = std::move(rec);
     return true;
+}
+
+static QString resolveConfinedHubAsset(const std::filesystem::path &rootDir, const QString &rel)
+{
+    if (rel.isEmpty()) {
+        return {};
+    }
+    std::filesystem::path relPath(rel.toStdString());
+    if (relPath.is_absolute()) {
+        return {};
+    }
+    std::error_code ec;
+    const auto canonRoot = std::filesystem::weakly_canonical(rootDir, ec);
+    if (ec) {
+        return {};
+    }
+    const auto canonTarget = std::filesystem::weakly_canonical(rootDir / relPath, ec);
+    if (ec || !std::filesystem::is_regular_file(canonTarget, ec)) {
+        return {};
+    }
+    auto [rootEnd, _] =
+        std::mismatch(canonRoot.begin(), canonRoot.end(), canonTarget.begin(), canonTarget.end());
+    if (rootEnd != canonRoot.end()) {
+        return {};
+    }
+    return QString::fromStdString(canonTarget.string());
+}
+
+static void parseHubManifestJsonFile(const std::filesystem::path &jsonPath,
+                                     const std::filesystem::path &rootDir,
+                                     std::unordered_set<std::string> &seenIds,
+                                     std::vector<OpenHubRecord> &outRecords)
+{
+    QFile jf(QString::fromStdString(jsonPath.string()));
+    if (!jf.open(QIODevice::ReadOnly)) {
+        return;
+    }
+    const QByteArray raw = jf.read(8 * 1024 * 1024);
+    QJsonParseError jerr{};
+    const QJsonDocument doc = QJsonDocument::fromJson(raw, &jerr);
+    if (jerr.error != QJsonParseError::NoError) {
+        return;
+    }
+
+    QJsonArray arr;
+    if (doc.isArray()) {
+        arr = doc.array();
+    } else if (doc.isObject()) {
+        const QJsonObject rootObj = doc.object();
+        arr = rootObj.contains(QStringLiteral("wallpapers"))
+                  ? rootObj.value(QStringLiteral("wallpapers")).toArray()
+                  : rootObj.value(QStringLiteral("items")).toArray();
+    }
+
+    for (const QJsonValue &val : arr) {
+        if (!val.isObject()) {
+            continue;
+        }
+        const QJsonObject obj = val.toObject();
+        OpenHubRecord rec{};
+        rec.id = obj.value(QStringLiteral("id")).toString().trimmed();
+        rec.slug = obj.value(QStringLiteral("slug")).toString().trimmed();
+        if (rec.id.isEmpty()) {
+            rec.id = rec.slug;
+        }
+        if (rec.id.isEmpty()) {
+            continue;
+        }
+        std::string key = rec.id.toStdString();
+        if (seenIds.contains(key)) {
+            continue;
+        }
+
+        rec.name = obj.value(QStringLiteral("name")).toString().trimmed();
+        if (rec.name.isEmpty()) {
+            rec.name = obj.value(QStringLiteral("title")).toString().trimmed();
+        }
+        if (rec.name.isEmpty()) {
+            rec.name = rec.id;
+        }
+        rec.version = obj.value(QStringLiteral("version")).toString(QStringLiteral("1.0.0"));
+        rec.author_name = obj.value(QStringLiteral("author_name")).toString();
+        if (rec.author_name.isEmpty()) {
+            rec.author_name = obj.value(QStringLiteral("author")).toString();
+        }
+        rec.author_email = obj.value(QStringLiteral("author_email")).toString();
+        rec.license = obj.value(QStringLiteral("license")).toString(QStringLiteral("CC-BY-4.0"));
+        rec.description = obj.value(QStringLiteral("description")).toString();
+        rec.download_url = obj.value(QStringLiteral("download_url")).toString();
+        if (rec.download_url.isEmpty()) {
+            rec.download_url = obj.value(QStringLiteral("url")).toString();
+        }
+        rec.cid = obj.value(QStringLiteral("cid")).toString();
+        if (rec.cid.isEmpty()) {
+            rec.cid = QStringLiteral("sha256:") + rec.id;
+        }
+        rec.file_size_bytes = static_cast<uint64_t>(
+            obj.value(QStringLiteral("file_size_bytes"))
+                .toVariant()
+                .toULongLong());
+        if (rec.file_size_bytes == 0) {
+            rec.file_size_bytes =
+                static_cast<uint64_t>(obj.value(QStringLiteral("size")).toVariant().toULongLong());
+        }
+        rec.timestamp =
+            static_cast<uint64_t>(obj.value(QStringLiteral("timestamp")).toVariant().toULongLong());
+        rec.download_count = static_cast<uint32_t>(
+            obj.value(QStringLiteral("download_count")).toInt(
+                obj.value(QStringLiteral("downloads")).toInt(0)));
+        rec.rating = static_cast<float>(obj.value(QStringLiteral("rating")).toDouble(0.0));
+
+        const QString typeStr = obj.value(QStringLiteral("type")).toString().trimmed().toLower();
+        if (typeStr == QStringLiteral("video")) {
+            rec.type = WWPKG_TYPE_VIDEO_STREAM;
+        } else if (typeStr == QStringLiteral("compute")) {
+            rec.type = WWPKG_TYPE_SHADER_COMPUTE;
+        } else if (typeStr == QStringLiteral("scene")) {
+            rec.type = WWPKG_TYPE_SCENE_2D;
+        } else {
+            rec.type = WWPKG_TYPE_SHADER_FRAGMENT;
+        }
+
+        const QJsonArray tagArr = obj.value(QStringLiteral("tags")).toArray();
+        for (const QJsonValue &tv : tagArr) {
+            if (tv.isString()) {
+                rec.tags.push_back(tv.toString());
+            }
+        }
+
+        QString prevRaw = obj.value(QStringLiteral("preview_path")).toString().trimmed();
+        if (prevRaw.isEmpty()) {
+            prevRaw = obj.value(QStringLiteral("preview")).toString().trimmed();
+        }
+        if (!prevRaw.isEmpty()) {
+            rec.preview_path = resolveConfinedHubAsset(rootDir, prevRaw);
+        }
+
+        QString pkgRel = obj.value(QStringLiteral("package_path")).toString().trimmed();
+        if (!pkgRel.isEmpty()) {
+            rec.local_pkg_path = resolveConfinedHubAsset(rootDir, pkgRel);
+            rec.is_installed = !rec.local_pkg_path.isEmpty();
+        }
+
+        seenIds.insert(std::move(key));
+        outRecords.push_back(std::move(rec));
+    }
 }
 
 std::vector<OpenHubRecord> scanLocalHubRootsWorker(const std::atomic<bool> &cancelFlag,
@@ -277,6 +482,16 @@ std::vector<OpenHubRecord> scanLocalHubRootsWorker(const std::atomic<bool> &canc
                     seenIds.insert(std::move(key));
                     records.push_back(std::move(rec));
                 }
+            }
+        }
+
+        for (const char *feedName : {"catalog.json", "manifest.json", "index.json"}) {
+            if (cancelFlag.load(std::memory_order_relaxed)) {
+                break;
+            }
+            std::filesystem::path feedPath = root / feedName;
+            if (std::filesystem::is_regular_file(feedPath, ec)) {
+                parseHubManifestJsonFile(feedPath, root, seenIds, records);
             }
         }
     }

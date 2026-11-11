@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "virtualized_grid_widget.hpp"
+#include "etc2_simd_compressor.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -19,6 +20,7 @@
 #include <QMetaObject>
 #include <QOpenGLContext>
 #include <QPainterPath>
+#include <QPointer>
 #include <QResizeEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
@@ -33,185 +35,6 @@ namespace {
 #ifndef GL_COMPRESSED_SRGB8_ETC2
 #define GL_COMPRESSED_SRGB8_ETC2 0x9275
 #endif
-
-constexpr int kEtc2ModifierTables[8][2] = {
-    {2, 8}, {5, 17}, {9, 29}, {13, 42}, {18, 60}, {24, 80}, {33, 106}, {47, 183},
-};
-
-[[nodiscard]] inline int clampU8(int v) noexcept { return std::clamp(v, 0, 255); }
-
-[[nodiscard]] inline int expand4To8(int v4) noexcept { return (v4 << 4) | v4; }
-
-[[nodiscard]] inline int expand5To8(int v5) noexcept { return (v5 << 3) | (v5 >> 2); }
-
-struct SubblockEval {
-    int table{0};
-    uint16_t msb_bits{0};
-    uint16_t lsb_bits{0};
-    uint64_t error{0};
-};
-
-// Evaluates best ETC1/ETC2 luminance modifier table and 2-bit pixel selectors for an 8-pixel
-// subblock given expanded 8-bit base RGB.
-SubblockEval evaluateEtc2Subblock(const uint8_t blockRgba[16][4], const int pixelIndices[8],
-                                  int baseR, int baseG, int baseB) noexcept
-{
-    SubblockEval best{};
-    best.error = std::numeric_limits<uint64_t>::max();
-
-    for (int t = 0; t < 8; ++t) {
-        const int smallMod = kEtc2ModifierTables[t][0];
-        const int largeMod = kEtc2ModifierTables[t][1];
-        const int deltas[4] = {smallMod, largeMod, -smallMod, -largeMod};
-
-        uint64_t tableErr = 0;
-        uint16_t msbMask = 0;
-        uint16_t lsbMask = 0;
-
-        for (int i = 0; i < 8; ++i) {
-            const int pixIdx = pixelIndices[i];
-            const int pr = blockRgba[pixIdx][0];
-            const int pg = blockRgba[pixIdx][1];
-            const int pb = blockRgba[pixIdx][2];
-
-            uint32_t bestPixErr = std::numeric_limits<uint32_t>::max();
-            int bestSel = 0;
-            for (int s = 0; s < 4; ++s) {
-                const int d = deltas[s];
-                const int dr = pr - clampU8(baseR + d);
-                const int dg = pg - clampU8(baseG + d);
-                const int db = pb - clampU8(baseB + d);
-                const uint32_t err = static_cast<uint32_t>(dr * dr + dg * dg + db * db);
-                if (err < bestPixErr) {
-                    bestPixErr = err;
-                    bestSel = s;
-                }
-            }
-
-            tableErr += bestPixErr;
-            if (tableErr >= best.error) {
-                break;
-            }
-            if (bestSel & 2) {
-                msbMask |= static_cast<uint16_t>(1u << pixIdx);
-            }
-            if (bestSel & 1) {
-                lsbMask |= static_cast<uint16_t>(1u << pixIdx);
-            }
-        }
-
-        if (tableErr < best.error) {
-            best.error = tableErr;
-            best.table = t;
-            best.msb_bits = msbMask;
-            best.lsb_bits = lsbMask;
-        }
-    }
-
-    return best;
-}
-
-void encodeSingleEtc2Block(const uint8_t blockRgba[16][4], uint8_t out[8]) noexcept
-{
-    // Khronos GLES 3.0 Table C.3 column-major pixel index: idx = x * 4 + y
-    static constexpr int kFlip0Sub0[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-    static constexpr int kFlip0Sub1[8] = {8, 9, 10, 11, 12, 13, 14, 15};
-    static constexpr int kFlip1Sub0[8] = {0, 1, 4, 5, 8, 9, 12, 13};
-    static constexpr int kFlip1Sub1[8] = {2, 3, 6, 7, 10, 11, 14, 15};
-
-    uint64_t bestTotalErr = std::numeric_limits<uint64_t>::max();
-    uint8_t bestBlock[8]{};
-
-    for (int flip = 0; flip <= 1; ++flip) {
-        const int *sub0 = (flip == 0) ? kFlip0Sub0 : kFlip1Sub0;
-        const int *sub1 = (flip == 0) ? kFlip0Sub1 : kFlip1Sub1;
-
-        int sumR0 = 0, sumG0 = 0, sumB0 = 0;
-        int sumR1 = 0, sumG1 = 0, sumB1 = 0;
-        for (int i = 0; i < 8; ++i) {
-            sumR0 += blockRgba[sub0[i]][0];
-            sumG0 += blockRgba[sub0[i]][1];
-            sumB0 += blockRgba[sub0[i]][2];
-            sumR1 += blockRgba[sub1[i]][0];
-            sumG1 += blockRgba[sub1[i]][1];
-            sumB1 += blockRgba[sub1[i]][2];
-        }
-
-        const int avgR0 = (sumR0 + 4) >> 3;
-        const int avgG0 = (sumG0 + 4) >> 3;
-        const int avgB0 = (sumB0 + 4) >> 3;
-        const int avgR1 = (sumR1 + 4) >> 3;
-        const int avgG1 = (sumG1 + 4) >> 3;
-        const int avgB1 = (sumB1 + 4) >> 3;
-
-        const int r5_0 = (avgR0 * 31 + 127) / 255;
-        const int g5_0 = (avgG0 * 31 + 127) / 255;
-        const int b5_0 = (avgB0 * 31 + 127) / 255;
-        const int r5_1 = (avgR1 * 31 + 127) / 255;
-        const int g5_1 = (avgG1 * 31 + 127) / 255;
-        const int b5_1 = (avgB1 * 31 + 127) / 255;
-
-        const int dR = r5_1 - r5_0;
-        const int dG = g5_1 - g5_0;
-        const int dB = b5_1 - b5_0;
-
-        uint8_t b0 = 0, b1 = 0, b2 = 0;
-        int diffBit = 0;
-        int baseR0 = 0, baseG0 = 0, baseB0 = 0;
-        int baseR1 = 0, baseG1 = 0, baseB1 = 0;
-
-        if (dR >= -4 && dR <= 3 && dG >= -4 && dG <= 3 && dB >= -4 && dB <= 3) {
-            diffBit = 1;
-            b0 = static_cast<uint8_t>((r5_0 << 3) | (dR & 0x7));
-            b1 = static_cast<uint8_t>((g5_0 << 3) | (dG & 0x7));
-            b2 = static_cast<uint8_t>((b5_0 << 3) | (dB & 0x7));
-            baseR0 = expand5To8(r5_0);
-            baseG0 = expand5To8(g5_0);
-            baseB0 = expand5To8(b5_0);
-            baseR1 = expand5To8(r5_0 + dR);
-            baseG1 = expand5To8(g5_0 + dG);
-            baseB1 = expand5To8(b5_0 + dB);
-        } else {
-            diffBit = 0;
-            const int r4_0 = (avgR0 * 15 + 127) / 255;
-            const int g4_0 = (avgG0 * 15 + 127) / 255;
-            const int b4_0 = (avgB0 * 15 + 127) / 255;
-            const int r4_1 = (avgR1 * 15 + 127) / 255;
-            const int g4_1 = (avgG1 * 15 + 127) / 255;
-            const int b4_1 = (avgB1 * 15 + 127) / 255;
-            b0 = static_cast<uint8_t>((r4_0 << 4) | r4_1);
-            b1 = static_cast<uint8_t>((g4_0 << 4) | g4_1);
-            b2 = static_cast<uint8_t>((b4_0 << 4) | b4_1);
-            baseR0 = expand4To8(r4_0);
-            baseG0 = expand4To8(g4_0);
-            baseB0 = expand4To8(b4_0);
-            baseR1 = expand4To8(r4_1);
-            baseG1 = expand4To8(g4_1);
-            baseB1 = expand4To8(b4_1);
-        }
-
-        SubblockEval ev0 = evaluateEtc2Subblock(blockRgba, sub0, baseR0, baseG0, baseB0);
-        SubblockEval ev1 = evaluateEtc2Subblock(blockRgba, sub1, baseR1, baseG1, baseB1);
-        uint64_t totalErr = ev0.error + ev1.error;
-
-        if (totalErr < bestTotalErr) {
-            bestTotalErr = totalErr;
-            const uint16_t msb = static_cast<uint16_t>(ev0.msb_bits | ev1.msb_bits);
-            const uint16_t lsb = static_cast<uint16_t>(ev0.lsb_bits | ev1.lsb_bits);
-            bestBlock[0] = b0;
-            bestBlock[1] = b1;
-            bestBlock[2] = b2;
-            bestBlock[3] =
-                static_cast<uint8_t>((ev0.table << 5) | (ev1.table << 2) | (diffBit << 1) | flip);
-            bestBlock[4] = static_cast<uint8_t>((msb >> 8) & 0xFFu);
-            bestBlock[5] = static_cast<uint8_t>(msb & 0xFFu);
-            bestBlock[6] = static_cast<uint8_t>((lsb >> 8) & 0xFFu);
-            bestBlock[7] = static_cast<uint8_t>(lsb & 0xFFu);
-        }
-    }
-
-    std::memcpy(out, bestBlock, 8);
-}
 
 QColor badgeColor(WallpaperBadge badge)
 {
@@ -264,34 +87,7 @@ void GridGlCanvas::encodeRgbaToEtc2(const uint8_t *rgba, int width, int height,
         outBlocks.clear();
         return;
     }
-
-    const int blocksX = (width + 3) / 4;
-    const int blocksY = (height + 3) / 4;
-    outBlocks.resize(static_cast<size_t>(blocksX) * static_cast<size_t>(blocksY) * 8u);
-
-    size_t dstOffset = 0;
-    for (int by = 0; by < blocksY; ++by) {
-        for (int bx = 0; bx < blocksX; ++bx) {
-            uint8_t blockPixels[16][4];
-            for (int x = 0; x < 4; ++x) {
-                const int sx = std::min(width - 1, bx * 4 + x);
-                for (int y = 0; y < 4; ++y) {
-                    const int sy = std::min(height - 1, by * 4 + y);
-                    const uint8_t *src =
-                        rgba + (static_cast<size_t>(sy) * static_cast<size_t>(width) +
-                                static_cast<size_t>(sx)) *
-                                   4u;
-                    const int colMajorIdx = x * 4 + y;
-                    blockPixels[colMajorIdx][0] = src[0];
-                    blockPixels[colMajorIdx][1] = src[1];
-                    blockPixels[colMajorIdx][2] = src[2];
-                    blockPixels[colMajorIdx][3] = src[3];
-                }
-            }
-            encodeSingleEtc2Block(blockPixels, outBlocks.data() + dstOffset);
-            dstOffset += 8u;
-        }
-    }
+    etc2::encodeRgbaToEtc2Simd(rgba, width, height, width * 4, outBlocks);
 }
 
 GridGlCanvas::GridGlCanvas(FuzzyCatalogIndex &index, GpuTexturePool &pool,
@@ -306,8 +102,21 @@ GridGlCanvas::GridGlCanvas(FuzzyCatalogIndex &index, GpuTexturePool &pool,
     m_fallbackCanvas->setAttribute(Qt::WA_TransparentForMouseEvents, true);
     m_fallbackCanvas->setVisible(false);
 
-    m_pool.setThumbnailReadyCallback([this]() {
-        QMetaObject::invokeMethod(this, [this]() { update(); }, Qt::QueuedConnection);
+    m_hover.setGlOwner(this);
+
+    QPointer<GridGlCanvas> safeSelf(this);
+    m_pool.setThumbnailReadyCallback([safeSelf]() {
+        if (!safeSelf || !qApp) {
+            return;
+        }
+        QMetaObject::invokeMethod(
+            qApp,
+            [safeSelf]() {
+                if (safeSelf) {
+                    safeSelf->update();
+                }
+            },
+            Qt::QueuedConnection);
     });
 
     connect(&m_hover, &HoverPreviewController::previewFrameReady, this,
@@ -318,6 +127,8 @@ GridGlCanvas::GridGlCanvas(FuzzyCatalogIndex &index, GpuTexturePool &pool,
 
 GridGlCanvas::~GridGlCanvas()
 {
+    m_pool.setThumbnailReadyCallback(nullptr);
+    m_hover.setGlOwner(nullptr);
     QObject::disconnect(m_contextDestroyConn);
     if (isValid()) {
         makeCurrent();
@@ -344,7 +155,7 @@ void GridGlCanvas::releaseGlResources()
         glDeleteBuffers(2, m_pboRing.data());
         m_pboRing = {0, 0};
     }
-    m_pboCapacityBytes = 0;
+    m_pboCapacities = {0, 0};
     m_pboIndex = 0;
     m_supportsEtc2 = false;
     m_etc2InternalFormat = 0;
@@ -360,9 +171,18 @@ void GridGlCanvas::releaseGlResources()
         glDeleteProgram(m_cardProgram);
         m_cardProgram = 0;
     }
+    if (m_cardArrayProgram != 0) {
+        glDeleteProgram(m_cardArrayProgram);
+        m_cardArrayProgram = 0;
+    }
     m_uViewportLoc = -1;
     m_uCardRectLoc = -1;
     m_uTexLoc = -1;
+    m_uArrayViewportLoc = -1;
+    m_uArrayCardRectLoc = -1;
+    m_uArrayTexLoc = -1;
+    m_uArrayLayerLoc = -1;
+    m_uArraySrgbLoc = -1;
     m_glRenderedThisFrame.clear();
     m_pool.destroyGl(this);
     m_hover.destroyGl(this);
@@ -564,13 +384,13 @@ void GridGlCanvas::initPboAndEtc2Support()
         glDeleteTextures(1, &probeTex);
     }
 
-    m_pboCapacityBytes = static_cast<size_t>(GpuTexturePool::THUMB_WIDTH) *
-                         static_cast<size_t>(GpuTexturePool::THUMB_HEIGHT) * 4u;
+    const size_t initialCap = GpuTexturePool::ETC2_FRAME_SIZE_BYTES;
     glGenBuffers(2, m_pboRing.data());
-    for (GLuint pbo : m_pboRing) {
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-        glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(m_pboCapacityBytes), nullptr,
+    for (size_t i = 0; i < 2; ++i) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pboRing[i]);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(initialCap), nullptr,
                      GL_STREAM_DRAW);
+        m_pboCapacities[i] = initialCap;
     }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 }
@@ -688,6 +508,77 @@ void GridGlCanvas::initCardShaders()
     m_uCardRectLoc = glGetUniformLocation(m_cardProgram, "u_cardRect");
     m_uTexLoc = glGetUniformLocation(m_cardProgram, "u_tex");
 
+    const char *fsArraySrc =
+        isGles ? "#version 300 es\n"
+                 "precision mediump float;\n"
+                 "precision mediump sampler2DArray;\n"
+                 "in vec2 v_uv;\n"
+                 "uniform vec4 u_cardRect;\n"
+                 "uniform sampler2DArray u_texArray;\n"
+                 "uniform float u_texLayer;\n"
+                 "uniform int u_srgbEncode;\n"
+                 "out vec4 fragColor;\n"
+                 "void main() {\n"
+                 "    vec2 halfSize = u_cardRect.zw * 0.5;\n"
+                 "    vec2 p = (v_uv - 0.5) * u_cardRect.zw;\n"
+                 "    vec2 q = abs(p) - (halfSize - vec2(8.0));\n"
+                 "    float dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 8.0;\n"
+                 "    float alpha = clamp(0.5 - dist, 0.0, 1.0);\n"
+                 "    if (alpha <= 0.001) discard;\n"
+                 "    vec3 col = texture(u_texArray, vec3(v_uv, u_texLayer)).rgb;\n"
+                 "    if (u_srgbEncode != 0) {\n"
+                 "        col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));\n"
+                 "    }\n"
+                 "    fragColor = vec4(col, alpha);\n"
+                 "}\n"
+               : "#version 330 core\n"
+                 "in vec2 v_uv;\n"
+                 "uniform vec4 u_cardRect;\n"
+                 "uniform sampler2DArray u_texArray;\n"
+                 "uniform float u_texLayer;\n"
+                 "uniform int u_srgbEncode;\n"
+                 "out vec4 fragColor;\n"
+                 "void main() {\n"
+                 "    vec2 halfSize = u_cardRect.zw * 0.5;\n"
+                 "    vec2 p = (v_uv - 0.5) * u_cardRect.zw;\n"
+                 "    vec2 q = abs(p) - (halfSize - vec2(8.0));\n"
+                 "    float dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 8.0;\n"
+                 "    float alpha = clamp(0.5 - dist, 0.0, 1.0);\n"
+                 "    if (alpha <= 0.001) discard;\n"
+                 "    vec3 col = texture(u_texArray, vec3(v_uv, u_texLayer)).rgb;\n"
+                 "    if (u_srgbEncode != 0) {\n"
+                 "        col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));\n"
+                 "    }\n"
+                 "    fragColor = vec4(col, alpha);\n"
+                 "}\n";
+
+    GLuint vsArr = compileShader(GL_VERTEX_SHADER, vsSrc);
+    GLuint fsArr = compileShader(GL_FRAGMENT_SHADER, fsArraySrc);
+    if (vsArr != 0 && fsArr != 0) {
+        GLuint arrProg = glCreateProgram();
+        glAttachShader(arrProg, vsArr);
+        glAttachShader(arrProg, fsArr);
+        glLinkProgram(arrProg);
+        GLint arrLinked = GL_FALSE;
+        glGetProgramiv(arrProg, GL_LINK_STATUS, &arrLinked);
+        if (arrLinked == GL_TRUE) {
+            m_cardArrayProgram = arrProg;
+            m_uArrayViewportLoc = glGetUniformLocation(m_cardArrayProgram, "u_viewport");
+            m_uArrayCardRectLoc = glGetUniformLocation(m_cardArrayProgram, "u_cardRect");
+            m_uArrayTexLoc = glGetUniformLocation(m_cardArrayProgram, "u_texArray");
+            m_uArrayLayerLoc = glGetUniformLocation(m_cardArrayProgram, "u_texLayer");
+            m_uArraySrgbLoc = glGetUniformLocation(m_cardArrayProgram, "u_srgbEncode");
+        } else {
+            glDeleteProgram(arrProg);
+        }
+    }
+    if (vsArr != 0) {
+        glDeleteShader(vsArr);
+    }
+    if (fsArr != 0) {
+        glDeleteShader(fsArr);
+    }
+
     static constexpr float kQuadUvs[12] = {
         0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f,
     };
@@ -787,32 +678,44 @@ GLuint GridGlCanvas::uploadOrGetCardTexture(uint32_t item_id, const QImage &thum
     glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
 #endif
 
-    const GLuint pbo = m_pboRing[static_cast<size_t>(m_pboIndex & 1)];
+    const size_t ringSlot = static_cast<size_t>(m_pboIndex & 1);
+    const GLuint pbo = m_pboRing[ringSlot];
     m_pboIndex ^= 1;
 
     if (m_supportsEtc2) {
+        const uint8_t *compressedData = nullptr;
+        size_t payloadBytes = 0;
+        auto precompressed = m_pool.getCompressedEtc2Blocks(item_id);
         thread_local std::vector<uint8_t> etc2Blocks;
-        encodeRgbaToEtc2(rgbaPixels, w, h, etc2Blocks);
-        const size_t payloadBytes = etc2Blocks.size();
+        if (precompressed && w == static_cast<int>(GpuTexturePool::THUMB_WIDTH) &&
+            h == static_cast<int>(GpuTexturePool::THUMB_HEIGHT) &&
+            precompressed->size() == GpuTexturePool::ETC2_FRAME_SIZE_BYTES) {
+            compressedData = precompressed->data();
+            payloadBytes = precompressed->size();
+        } else {
+            encodeRgbaToEtc2(rgbaPixels, w, h, etc2Blocks);
+            compressedData = etc2Blocks.data();
+            payloadBytes = etc2Blocks.size();
+        }
 
         glCompressedTexImage2D(GL_TEXTURE_2D, 0, m_etc2InternalFormat, w, h, 0,
                                static_cast<GLsizei>(payloadBytes), nullptr);
 
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-        if (payloadBytes > m_pboCapacityBytes) {
-            m_pboCapacityBytes = payloadBytes;
-            glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(m_pboCapacityBytes),
-                         nullptr, GL_STREAM_DRAW);
+        if (payloadBytes > m_pboCapacities[ringSlot]) {
+            m_pboCapacities[ringSlot] = payloadBytes;
+            glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(payloadBytes), nullptr,
+                         GL_STREAM_DRAW);
         }
         void *mapped =
             glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, static_cast<GLsizeiptr>(payloadBytes),
                              GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
         if (mapped) {
-            std::memcpy(mapped, etc2Blocks.data(), payloadBytes);
+            std::memcpy(mapped, compressedData, payloadBytes);
             glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
         } else {
             glBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, static_cast<GLsizeiptr>(payloadBytes),
-                            etc2Blocks.data());
+                            compressedData);
         }
 
         glCompressedTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, m_etc2InternalFormat,
@@ -823,10 +726,10 @@ GLuint GridGlCanvas::uploadOrGetCardTexture(uint32_t item_id, const QImage &thum
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-        if (payloadBytes > m_pboCapacityBytes) {
-            m_pboCapacityBytes = payloadBytes;
-            glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(m_pboCapacityBytes),
-                         nullptr, GL_STREAM_DRAW);
+        if (payloadBytes > m_pboCapacities[ringSlot]) {
+            m_pboCapacities[ringSlot] = payloadBytes;
+            glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(payloadBytes), nullptr,
+                         GL_STREAM_DRAW);
         }
         void *mapped =
             glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, static_cast<GLsizeiptr>(payloadBytes),
@@ -873,52 +776,103 @@ void GridGlCanvas::renderGlThumbnails()
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glUseProgram(m_cardProgram);
-    glUniform2f(m_uViewportLoc, static_cast<float>(width()), static_cast<float>(height()));
-    glUniform1i(m_uTexLoc, 0);
-    if (srgbLoc >= 0) {
-        glUniform1i(srgbLoc,
-                    (m_supportsEtc2 && m_etc2InternalFormat == GL_COMPRESSED_SRGB8_ETC2) ? 1 : 0);
-    }
     glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(m_cardVao);
 
-    for (size_t i = slice.index_first; i <= slice.index_last; ++i) {
-        const auto &item = m_index.filteredItemAt(i);
-        QRect card = itemRect(i, cols, m_scrollY);
-        if (card.bottom() < 0 || card.top() > height()) {
-            continue;
+    const bool canUsePoolArray = (m_cardArrayProgram != 0 && m_pool.isInitialized() &&
+                                  m_pool.textureArrayId() != 0);
+    if (canUsePoolArray) {
+        glUseProgram(m_cardArrayProgram);
+        glUniform2f(m_uArrayViewportLoc, static_cast<float>(width()), static_cast<float>(height()));
+        glUniform1i(m_uArrayTexLoc, 0);
+        if (m_uArraySrgbLoc >= 0) {
+            glUniform1i(
+                m_uArraySrgbLoc,
+                (m_pool.isArrayEtc2() && m_pool.arrayInternalFormat() == GL_COMPRESSED_SRGB8_ETC2)
+                    ? 1
+                    : 0);
+        }
+        glBindTexture(GL_TEXTURE_2D_ARRAY, m_pool.textureArrayId());
+
+        for (size_t i = slice.index_first; i <= slice.index_last; ++i) {
+            const auto &item = m_index.filteredItemAt(i);
+            QRect card = itemRect(i, cols, m_scrollY);
+            if (card.bottom() < 0 || card.top() > height()) {
+                continue;
+            }
+
+            const int layer = m_pool.requestTexture(item.id, item.path, item.preview_path);
+            if (layer < 0) {
+                continue;
+            }
+
+            bool is_hovered = (m_hoveredFilteredIdx.has_value() && *m_hoveredFilteredIdx == i);
+            QRect render_rect = card;
+            if (is_hovered) {
+                int dw = static_cast<int>(card.width() * 0.03f);
+                int dh = static_cast<int>(card.height() * 0.03f);
+                render_rect.adjust(-dw / 2, -dh / 2, dw / 2, dh / 2);
+            }
+
+            glUniform1f(m_uArrayLayerLoc, static_cast<float>(layer));
+            glUniform4f(m_uArrayCardRectLoc, static_cast<float>(render_rect.x()),
+                        static_cast<float>(render_rect.y()),
+                        static_cast<float>(render_rect.width()),
+                        static_cast<float>(render_rect.height()));
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            m_glRenderedThisFrame.insert(item.id);
         }
 
-        (void)m_pool.requestTexture(item.id, item.path, item.preview_path);
-        QImage thumb = m_pool.getThumbnailImage(item.id);
-        if (thumb.isNull()) {
-            continue;
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+    } else {
+        glUseProgram(m_cardProgram);
+        glUniform2f(m_uViewportLoc, static_cast<float>(width()), static_cast<float>(height()));
+        glUniform1i(m_uTexLoc, 0);
+        if (srgbLoc >= 0) {
+            glUniform1i(srgbLoc,
+                        (m_supportsEtc2 && m_etc2InternalFormat == GL_COMPRESSED_SRGB8_ETC2) ? 1
+                                                                                             : 0);
         }
 
-        GLuint tex = uploadOrGetCardTexture(item.id, thumb, uploadBudget);
-        if (tex == 0) {
-            continue;
+        for (size_t i = slice.index_first; i <= slice.index_last; ++i) {
+            const auto &item = m_index.filteredItemAt(i);
+            QRect card = itemRect(i, cols, m_scrollY);
+            if (card.bottom() < 0 || card.top() > height()) {
+                continue;
+            }
+
+            (void)m_pool.requestTexture(item.id, item.path, item.preview_path);
+            QImage thumb = m_pool.getThumbnailImage(item.id);
+            if (thumb.isNull()) {
+                continue;
+            }
+
+            GLuint tex = uploadOrGetCardTexture(item.id, thumb, uploadBudget);
+            if (tex == 0) {
+                continue;
+            }
+
+            bool is_hovered = (m_hoveredFilteredIdx.has_value() && *m_hoveredFilteredIdx == i);
+            QRect render_rect = card;
+            if (is_hovered) {
+                int dw = static_cast<int>(card.width() * 0.03f);
+                int dh = static_cast<int>(card.height() * 0.03f);
+                render_rect.adjust(-dw / 2, -dh / 2, dw / 2, dh / 2);
+            }
+
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glUniform4f(m_uCardRectLoc, static_cast<float>(render_rect.x()),
+                        static_cast<float>(render_rect.y()),
+                        static_cast<float>(render_rect.width()),
+                        static_cast<float>(render_rect.height()));
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            m_glRenderedThisFrame.insert(item.id);
         }
 
-        bool is_hovered = (m_hoveredFilteredIdx.has_value() && *m_hoveredFilteredIdx == i);
-        QRect render_rect = card;
-        if (is_hovered) {
-            int dw = static_cast<int>(card.width() * 0.03f);
-            int dh = static_cast<int>(card.height() * 0.03f);
-            render_rect.adjust(-dw / 2, -dh / 2, dw / 2, dh / 2);
-        }
-
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glUniform4f(m_uCardRectLoc, static_cast<float>(render_rect.x()),
-                    static_cast<float>(render_rect.y()), static_cast<float>(render_rect.width()),
-                    static_cast<float>(render_rect.height()));
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-        m_glRenderedThisFrame.insert(item.id);
+        glBindTexture(GL_TEXTURE_2D, 0);
     }
 
     glBindVertexArray(0);
-    glBindTexture(GL_TEXTURE_2D, 0);
     glUseProgram(0);
     glDisable(GL_BLEND);
 }
@@ -930,16 +884,22 @@ void GridGlCanvas::initializeGL()
     m_etc2Cache.clear();
     m_etc2Lru.clear();
     m_pboRing = {0, 0};
-    m_pboCapacityBytes = 0;
+    m_pboCapacities = {0, 0};
     m_pboIndex = 0;
     m_supportsEtc2 = false;
     m_etc2InternalFormat = 0;
     m_cardProgram = 0;
+    m_cardArrayProgram = 0;
     m_cardVao = 0;
     m_cardVbo = 0;
     m_uViewportLoc = -1;
     m_uCardRectLoc = -1;
     m_uTexLoc = -1;
+    m_uArrayViewportLoc = -1;
+    m_uArrayCardRectLoc = -1;
+    m_uArrayTexLoc = -1;
+    m_uArrayLayerLoc = -1;
+    m_uArraySrgbLoc = -1;
     m_glRenderedThisFrame.clear();
 
     QObject::disconnect(m_contextDestroyConn);
@@ -967,7 +927,7 @@ void GridGlCanvas::initializeGL()
 void GridGlCanvas::resizeGL(int w, int h)
 {
     glViewport(0, 0, w, h);
-    int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(w));
+    int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
     emit virtualHeightChanged(vh);
 }
 
@@ -1351,6 +1311,9 @@ VirtualizedGridWidget::VirtualizedGridWidget(QWidget *parent) : QWidget(parent)
 
 VirtualizedGridWidget::~VirtualizedGridWidget()
 {
+    m_pool.setThumbnailReadyCallback(nullptr);
+    m_pool.shutdownWorkers();
+    m_hover.stop();
     delete m_canvas;
     m_canvas = nullptr;
 }

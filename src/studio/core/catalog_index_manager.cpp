@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "studio/core/catalog_index_manager.hpp"
+#include "studio/core/catalog_soa_rcu_pool.hpp"
 
 #include <sqlite3.h>
 
@@ -24,6 +25,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 
 #if __has_include(<linux/io_uring.h>)
 #include <linux/io_uring.h>
@@ -583,10 +585,13 @@ std::filesystem::path defaultDatabasePath()
 
 struct CatalogIndexManager::Impl {
     mutable std::mutex dbMutex;
+    mutable ReadOnlySqlitePool readPool;
+    std::atomic<std::shared_ptr<const CatalogSoaSnapshot>> rcuSnapshot{
+        std::make_shared<const CatalogSoaSnapshot>()};
     bool hasTrigramFts{false};
     std::atomic<size_t> lastReconcileStatCalls{0};
 
-    // Contiguous cache-friendly SoA arrays and inverted 64-bit tag bitplanes.
+    // Writer-side mutable SoA state cloned into immutable RCU snapshots upon commit.
     std::vector<uint64_t> soaPubIds;
     std::vector<uint64_t> soaTagMasks;
     std::array<std::vector<uint64_t>, 64> tagBitsets;
@@ -601,6 +606,28 @@ struct CatalogIndexManager::Impl {
     uint64_t totalTagsBytes{0};
     uint64_t totalDescBytes{0};
     std::unordered_map<uint64_t, size_t> idToSlot;
+
+    void publishRcuSnapshotLocked()
+    {
+        auto snap = std::make_shared<CatalogSoaSnapshot>();
+        snap->count = soaPubIds.size();
+        snap->published_ids = soaPubIds;
+        snap->tag_masks = soaTagMasks;
+        snap->tag_bitsets = tagBitsets;
+        snap->title_offsets = soaTitleOffsets;
+        snap->title_lengths = soaTitleLengths;
+        snap->lower_title_arena = soaLowerTitles;
+        snap->tags_offsets = soaTagsOffsets;
+        snap->tags_lengths = soaTagsLengths;
+        snap->lower_tags_arena = soaLowerTags;
+        snap->desc_lengths = soaDescLengths;
+        rcuSnapshot.store(std::move(snap), std::memory_order_release);
+    }
+
+    [[nodiscard]] std::shared_ptr<const CatalogSoaSnapshot> loadSnapshot() const noexcept
+    {
+        return rcuSnapshot.load(std::memory_order_acquire);
+    }
 
     void clearSoaLocked()
     {
@@ -778,6 +805,7 @@ struct CatalogIndexManager::Impl {
             upsertSoaLocked(id, mask, t ? t : "", g ? g : "", d ? d : "");
         }
         sqlite3_finalize(stmt);
+        publishRcuSnapshotLocked();
     }
 };
 
@@ -800,13 +828,16 @@ CatalogIndexManager::CatalogIndexManager(const std::filesystem::path &dbPath)
         return;
     }
 
+    sqlite3_busy_timeout(m_db, 200);
     initSchema();
     prepareStatements();
     m_impl->loadInitialSoaFromDbLocked(m_db);
+    (void)m_impl->readPool.open(m_dbPath, m_impl->hasTrigramFts);
 }
 
 CatalogIndexManager::~CatalogIndexManager()
 {
+    m_impl->readPool.close();
     std::lock_guard<std::mutex> lock(m_impl->dbMutex);
     finalizeStatements();
     if (m_db) {
@@ -891,6 +922,25 @@ void CatalogIndexManager::initSchema()
     )";
     sqlite3_exec(m_db, sqlIndices, nullptr, nullptr, nullptr);
 
+    bool rebuildLegacyFts = false;
+    {
+        sqlite3_stmt *chk = nullptr;
+        if (sqlite3_prepare_v2(
+                m_db, "SELECT sql FROM sqlite_master WHERE type='table' AND name='workshop_fts';",
+                -1, &chk, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(chk) == SQLITE_ROW) {
+                const auto *ddl = reinterpret_cast<const char *>(sqlite3_column_text(chk, 0));
+                if (ddl && std::strstr(ddl, "columnsize=0") != nullptr) {
+                    rebuildLegacyFts = true;
+                }
+            }
+            sqlite3_finalize(chk);
+        }
+    }
+    if (rebuildLegacyFts) {
+        sqlite3_exec(m_db, "DROP TABLE IF EXISTS workshop_fts;", nullptr, nullptr, nullptr);
+    }
+
     const char *sqlFts = R"(
         CREATE VIRTUAL TABLE IF NOT EXISTS workshop_fts USING fts5 (
             title,
@@ -898,12 +948,14 @@ void CatalogIndexManager::initSchema()
             description,
             content='workshop_items',
             content_rowid='published_file_id',
-            tokenize='unicode61 remove_diacritics 2',
-            columnsize=0,
-            detail=column
+            tokenize='unicode61 remove_diacritics 2'
         );
     )";
     sqlite3_exec(m_db, sqlFts, nullptr, nullptr, nullptr);
+    if (rebuildLegacyFts) {
+        sqlite3_exec(m_db, "INSERT INTO workshop_fts(workshop_fts) VALUES('rebuild');", nullptr,
+                     nullptr, nullptr);
+    }
 
     const char *sqlTriggers = R"(
         CREATE TRIGGER IF NOT EXISTS trg_workshop_items_ai AFTER INSERT ON workshop_items BEGIN
@@ -1019,6 +1071,7 @@ void CatalogIndexManager::prepareStatements()
            OR workshop_items.storage_backend != excluded.storage_backend
            OR workshop_items.compat_tier != excluded.compat_tier
            OR workshop_items.compat_score != excluded.compat_score
+           OR ABS(workshop_items.aspect_ratio - excluded.aspect_ratio) > 1e-4
            OR workshop_items.dominant_color != excluded.dominant_color
            OR workshop_items.tag_mask != excluded.tag_mask
            OR workshop_items.tags_string != excluded.tags_string
@@ -1054,7 +1107,23 @@ void CatalogIndexManager::prepareStatements()
     const char *sqlCount = "SELECT COUNT(*) FROM workshop_items;";
     sqlite3_prepare_v2(m_db, sqlCount, -1, &m_stmtCount, nullptr);
 
-    const char *sqlFts5 = "SELECT rowid FROM workshop_fts WHERE workshop_fts MATCH ? LIMIT 4096;";
+    const char *sqlFts5 = R"(
+        SELECT i.published_file_id, i.owner_steam_id, i.title, i.type, i.file_path, i.preview_path,
+               i.file_size_bytes, i.time_created, i.time_updated, i.subscriptions, i.favorited,
+               i.views, i.rating, i.install_state, i.storage_backend, i.compat_tier, i.compat_score,
+               i.aspect_ratio, i.dominant_color, i.tag_mask, i.tags_string, i.description,
+               i.manifest_id, i.file_clock, i.signature_verified,
+               f.rank_score
+        FROM (
+            SELECT rowid, bm25(workshop_fts, 10.0, 5.0, 1.0) AS rank_score
+            FROM workshop_fts
+            WHERE workshop_fts MATCH ?1
+            ORDER BY rank_score ASC, rowid ASC
+            LIMIT ?2 OFFSET ?3
+        ) f
+        JOIN workshop_items i ON i.published_file_id = f.rowid
+        ORDER BY f.rank_score ASC, i.published_file_id ASC;
+    )";
     sqlite3_prepare_v2(m_db, sqlFts5, -1, &m_stmtFts5, nullptr);
 
     if (m_impl->hasTrigramFts) {
@@ -1186,6 +1255,7 @@ bool CatalogIndexManager::upsertItem(const WorkshopItemRecord &item)
     if (rc == SQLITE_DONE) {
         m_impl->upsertSoaLocked(item.published_file_id, item.tag_mask, item.title, item.tags_string,
                                 item.description);
+        m_impl->publishRcuSnapshotLocked();
         return true;
     }
     return false;
@@ -1234,6 +1304,7 @@ bool CatalogIndexManager::upsertItems(const std::vector<WorkshopItemRecord> &ite
             m_impl->upsertSoaLocked(item.published_file_id, item.tag_mask, item.title,
                                     item.tags_string, item.description);
         }
+        m_impl->publishRcuSnapshotLocked();
     } else {
         sqlite3_exec(m_db, "ROLLBACK;", nullptr, nullptr, nullptr);
     }
@@ -1257,6 +1328,7 @@ bool CatalogIndexManager::removeItem(uint64_t publishedFileId)
     sqlite3_reset(m_stmtDelete);
     if (rc == SQLITE_DONE) {
         m_impl->removeSoaLocked(publishedFileId);
+        m_impl->publishRcuSnapshotLocked();
         return true;
     }
     return false;
@@ -1264,6 +1336,20 @@ bool CatalogIndexManager::removeItem(uint64_t publishedFileId)
 
 std::optional<WorkshopItemRecord> CatalogIndexManager::getItem(uint64_t publishedFileId) const
 {
+    if (m_impl->readPool.isOpen()) {
+        auto lease = m_impl->readPool.acquire();
+        sqlite3_stmt *stmt = lease.slot().stmtGetById;
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(publishedFileId));
+
+        std::optional<WorkshopItemRecord> result;
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            result = readRecordFromStmt(stmt);
+        }
+        return result;
+    }
+
     std::lock_guard<std::mutex> lock(m_impl->dbMutex);
     if (!m_db || !m_stmtGetById) {
         return std::nullopt;
@@ -1284,6 +1370,20 @@ std::optional<WorkshopItemRecord> CatalogIndexManager::getItem(uint64_t publishe
 std::optional<WorkshopItemRecord>
 CatalogIndexManager::getItemByPath(const std::string &filePath) const
 {
+    if (m_impl->readPool.isOpen()) {
+        auto lease = m_impl->readPool.acquire();
+        sqlite3_stmt *stmt = lease.slot().stmtGetByPath;
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, filePath.c_str(), -1, SQLITE_TRANSIENT);
+
+        std::optional<WorkshopItemRecord> result;
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            result = readRecordFromStmt(stmt);
+        }
+        return result;
+    }
+
     std::lock_guard<std::mutex> lock(m_impl->dbMutex);
     if (!m_db || !m_stmtGetByPath) {
         return std::nullopt;
@@ -1303,6 +1403,17 @@ CatalogIndexManager::getItemByPath(const std::string &filePath) const
 
 size_t CatalogIndexManager::totalItemCount() const
 {
+    if (m_impl->readPool.isOpen()) {
+        auto lease = m_impl->readPool.acquire();
+        sqlite3_stmt *stmt = lease.slot().stmtCount;
+        sqlite3_reset(stmt);
+        size_t count = 0;
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = static_cast<size_t>(sqlite3_column_int64(stmt, 0));
+        }
+        return count;
+    }
+
     std::lock_guard<std::mutex> lock(m_impl->dbMutex);
     if (!m_db || !m_stmtCount) {
         return 0;
@@ -1320,16 +1431,17 @@ size_t CatalogIndexManager::totalItemCount() const
 size_t CatalogIndexManager::filterByTagMaskBitmap(uint64_t requiredMask,
                                                   std::vector<uint64_t> *outIds) const
 {
-    std::lock_guard<std::mutex> lock(m_impl->dbMutex);
-    const size_t n = m_impl->soaPubIds.size();
-    const uint64_t *ids = m_impl->soaPubIds.data();
-
     if (outIds) {
         outIds->clear();
     }
-    if (n == 0) {
+
+    const auto snap = m_impl->loadSnapshot();
+    if (!snap || snap->count == 0) {
         return 0;
     }
+
+    const size_t n = snap->count;
+    const uint64_t *ids = snap->published_ids.data();
     if (requiredMask == 0) {
         if (outIds) {
             outIds->assign(ids, ids + n);
@@ -1341,7 +1453,7 @@ size_t CatalogIndexManager::filterByTagMaskBitmap(uint64_t requiredMask,
     size_t planeCount = 0;
     for (uint64_t m = requiredMask; m != 0; m &= (m - 1ULL)) {
         unsigned b = static_cast<unsigned>(std::countr_zero(m));
-        activePlanes[planeCount++] = m_impl->tagBitsets[b].data();
+        activePlanes[planeCount++] = snap->tag_bitsets[b].data();
     }
 
     const size_t wordCount = (n + 63u) >> 6;
@@ -1386,7 +1498,6 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFuzzy(const std::stri
 {
     const int cappedLimit = limit > 0 ? limit : 50;
 
-    // Trim whitespace for pattern extraction.
     std::string trimmed;
     for (char ch : query) {
         if (static_cast<unsigned char>(ch) > ' ' || !trimmed.empty()) {
@@ -1396,35 +1507,50 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFuzzy(const std::stri
     while (!trimmed.empty() && static_cast<unsigned char>(trimmed.back()) <= ' ') {
         trimmed.pop_back();
     }
-    if (trimmed.empty()) {
+    if (trimmed.empty() || !m_db) {
         return {};
     }
 
-    std::lock_guard<std::mutex> lock(m_impl->dbMutex);
-    if (!m_db) {
-        return {};
-    }
-
-    // 1. Try trigram substring index when pattern has >= 3 characters and no tag filter.
     std::vector<WorkshopItemRecord> results;
-    if (m_stmtFtsTrigram && requiredTagMask == 0 && trimmed.size() >= 3 &&
+    if (m_impl->hasTrigramFts && requiredTagMask == 0 && trimmed.size() >= 3 &&
         trimmed.find('"') == std::string::npos) {
-        std::string triPhrase = "\"" + trimmed + "\"";
-        sqlite3_reset(m_stmtFtsTrigram);
-        sqlite3_clear_bindings(m_stmtFtsTrigram);
-        sqlite3_bind_text(m_stmtFtsTrigram, 1, triPhrase.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(m_stmtFtsTrigram, 2, cappedLimit);
-        sqlite3_bind_int(m_stmtFtsTrigram, 3, 0);
-        while (sqlite3_step(m_stmtFtsTrigram) == SQLITE_ROW) {
-            results.push_back(readRecordFromStmt(m_stmtFtsTrigram));
+        const std::string triPhrase = "\"" + trimmed + "\"";
+        if (m_impl->readPool.isOpen()) {
+            auto lease = m_impl->readPool.acquire();
+            if (sqlite3_stmt *stmt = lease.slot().stmtTrigram) {
+                sqlite3_reset(stmt);
+                sqlite3_clear_bindings(stmt);
+                sqlite3_bind_text(stmt, 1, triPhrase.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int(stmt, 2, cappedLimit);
+                sqlite3_bind_int(stmt, 3, 0);
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    results.push_back(readRecordFromStmt(stmt));
+                }
+            }
+        } else {
+            std::lock_guard<std::mutex> lock(m_impl->dbMutex);
+            if (m_stmtFtsTrigram) {
+                sqlite3_reset(m_stmtFtsTrigram);
+                sqlite3_clear_bindings(m_stmtFtsTrigram);
+                sqlite3_bind_text(m_stmtFtsTrigram, 1, triPhrase.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int(m_stmtFtsTrigram, 2, cappedLimit);
+                sqlite3_bind_int(m_stmtFtsTrigram, 3, 0);
+                while (sqlite3_step(m_stmtFtsTrigram) == SQLITE_ROW) {
+                    results.push_back(readRecordFromStmt(m_stmtFtsTrigram));
+                }
+                sqlite3_reset(m_stmtFtsTrigram);
+            }
         }
-        sqlite3_reset(m_stmtFtsTrigram);
         if (!results.empty()) {
             return results;
         }
     }
 
-    // 2. 64-bit Myers bit-parallel approximate substring scan combined with tag-mask bitmap.
+    const auto snap = m_impl->loadSnapshot();
+    if (!snap || snap->count == 0) {
+        return {};
+    }
+
     std::string pattern = toLowerAscii(trimmed);
     if (pattern.size() > 64) {
         pattern.resize(64);
@@ -1445,12 +1571,12 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFuzzy(const std::stri
     std::vector<CandidateHit> hits;
     hits.reserve(static_cast<size_t>(cappedLimit) * 2);
 
-    const size_t n = m_impl->soaPubIds.size();
-    const uint64_t *masks = m_impl->soaTagMasks.data();
-    const uint64_t *ids = m_impl->soaPubIds.data();
-    const uint32_t *offs = m_impl->soaTitleOffsets.data();
-    const uint32_t *lens = m_impl->soaTitleLengths.data();
-    const char *arena = m_impl->soaLowerTitles.data();
+    const size_t n = snap->count;
+    const uint64_t *masks = snap->tag_masks.data();
+    const uint64_t *ids = snap->published_ids.data();
+    const uint32_t *offs = snap->title_offsets.data();
+    const uint32_t *lens = snap->title_lengths.data();
+    const char *arena = snap->lower_title_arena.data();
 
     for (size_t i = 0; i < n; ++i) {
         if (requiredTagMask != 0 && (masks[i] & requiredTagMask) != requiredTagMask) {
@@ -1480,17 +1606,33 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFuzzy(const std::stri
                       });
 
     results.reserve(keep);
-    if (m_stmtGetById) {
+    if (m_impl->readPool.isOpen()) {
+        auto lease = m_impl->readPool.acquire();
+        sqlite3_stmt *stmt = lease.slot().stmtGetById;
         for (size_t i = 0; i < keep; ++i) {
-            sqlite3_reset(m_stmtGetById);
-            sqlite3_clear_bindings(m_stmtGetById);
-            sqlite3_bind_int64(m_stmtGetById, 1, static_cast<sqlite3_int64>(hits[i].pubId));
-            if (sqlite3_step(m_stmtGetById) == SQLITE_ROW) {
-                WorkshopItemRecord rec = readRecordFromStmt(m_stmtGetById);
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(hits[i].pubId));
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                WorkshopItemRecord rec = readRecordFromStmt(stmt);
                 rec.search_rank = -static_cast<double>(100u - hits[i].dist * 25u);
                 results.push_back(std::move(rec));
             }
-            sqlite3_reset(m_stmtGetById);
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(m_impl->dbMutex);
+        if (m_stmtGetById) {
+            for (size_t i = 0; i < keep; ++i) {
+                sqlite3_reset(m_stmtGetById);
+                sqlite3_clear_bindings(m_stmtGetById);
+                sqlite3_bind_int64(m_stmtGetById, 1, static_cast<sqlite3_int64>(hits[i].pubId));
+                if (sqlite3_step(m_stmtGetById) == SQLITE_ROW) {
+                    WorkshopItemRecord rec = readRecordFromStmt(m_stmtGetById);
+                    rec.search_rank = -static_cast<double>(100u - hits[i].dist * 25u);
+                    results.push_back(std::move(rec));
+                }
+                sqlite3_reset(m_stmtGetById);
+            }
         }
     }
     return results;
@@ -1500,144 +1642,44 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFts5Bm25(const std::s
                                                                     int limit, int offset) const
 {
     std::string sanitized = sanitizeFts5Query(query);
-    if (sanitized.empty()) {
+    if (sanitized.empty() || !m_db) {
         return {};
     }
 
     const int cappedLimit = limit > 0 ? limit : 50;
-    const size_t startOffset = static_cast<size_t>(std::max(0, offset));
-
-    std::vector<std::string> lowerTokens;
-    {
-        std::string cur;
-        for (char ch : sanitized) {
-            if (ch == '"' || ch == '*') {
-                continue;
-            }
-            if (static_cast<unsigned char>(ch) <= ' ') {
-                if (!cur.empty()) {
-                    lowerTokens.push_back(toLowerAscii(cur));
-                    cur.clear();
-                }
-            } else {
-                cur.push_back(ch);
-            }
-        }
-        if (!cur.empty()) {
-            lowerTokens.push_back(toLowerAscii(cur));
-        }
-    }
+    const int safeOffset = std::max(0, offset);
 
     std::vector<WorkshopItemRecord> results;
     results.reserve(static_cast<size_t>(cappedLimit));
-    {
+
+    if (m_impl->readPool.isOpen()) {
+        auto lease = m_impl->readPool.acquire();
+        sqlite3_stmt *stmt = lease.slot().stmtFtsBm25;
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, sanitized.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 2, cappedLimit);
+        sqlite3_bind_int(stmt, 3, safeOffset);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            results.push_back(readRecordFromStmt(stmt));
+        }
+    } else {
         std::lock_guard<std::mutex> lock(m_impl->dbMutex);
-        if (!m_db || !m_stmtFts5 || !m_stmtGetById) {
+        if (!m_db || !m_stmtFts5) {
             return {};
         }
-
-        // Stream matching rowids directly from the FTS5 inverted posting list without
-        // invoking SQLite per-row bm25() virtual-table callbacks.
-        std::vector<uint64_t> candIds;
-        candIds.reserve(256);
         sqlite3_reset(m_stmtFts5);
         sqlite3_clear_bindings(m_stmtFts5);
         sqlite3_bind_text(m_stmtFts5, 1, sanitized.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(m_stmtFts5, 2, cappedLimit);
+        sqlite3_bind_int(m_stmtFts5, 3, safeOffset);
         while (sqlite3_step(m_stmtFts5) == SQLITE_ROW) {
-            candIds.push_back(static_cast<uint64_t>(sqlite3_column_int64(m_stmtFts5, 0)));
+            results.push_back(readRecordFromStmt(m_stmtFts5));
         }
         sqlite3_reset(m_stmtFts5);
-
-        if (!candIds.empty()) {
-            const double totalDocs =
-                static_cast<double>(std::max<size_t>(1, m_impl->soaPubIds.size()));
-            const double df = static_cast<double>(candIds.size());
-            const double idf = std::log((totalDocs - df + 0.5) / (df + 0.5) + 1.0);
-
-            const double avgTitleLen =
-                std::max(1.0, static_cast<double>(m_impl->totalTitleBytes) / totalDocs);
-            const double avgTagsLen =
-                std::max(1.0, static_cast<double>(m_impl->totalTagsBytes) / totalDocs);
-            const double avgDescLen =
-                std::max(1.0, static_cast<double>(m_impl->totalDescBytes) / totalDocs);
-
-            constexpr double k1 = 1.2;
-            constexpr double b = 0.75;
-
-            struct ScoredRow {
-                double score;
-                uint64_t pubId;
-            };
-            std::vector<ScoredRow> scored;
-            scored.reserve(candIds.size());
-
-            const char *titleArena = m_impl->soaLowerTitles.data();
-            const char *tagsArena = m_impl->soaLowerTags.data();
-
-            for (uint64_t pubId : candIds) {
-                double docScore = 0.0;
-                auto slotIt = m_impl->idToSlot.find(pubId);
-                if (slotIt != m_impl->idToSlot.end()) {
-                    size_t slot = slotIt->second;
-                    std::string_view tv(titleArena + m_impl->soaTitleOffsets[slot],
-                                        m_impl->soaTitleLengths[slot]);
-                    std::string_view gv(tagsArena + m_impl->soaTagsOffsets[slot],
-                                        m_impl->soaTagsLengths[slot]);
-                    double descLen = static_cast<double>(m_impl->soaDescLengths[slot]);
-
-                    double titleNorm = 1.0 + k1 * ((1.0 - b) + b * (tv.size() / avgTitleLen));
-                    double tagsNorm = 1.0 + k1 * ((1.0 - b) + b * (gv.size() / avgTagsLen));
-                    double descNorm = 1.0 + k1 * ((1.0 - b) + b * (descLen / avgDescLen));
-
-                    for (const auto &tok : lowerTokens) {
-                        bool matchedTitleOrTag = false;
-                        if (tv.find(tok) != std::string_view::npos) {
-                            docScore += 5.0 * idf * ((k1 + 1.0) / titleNorm);
-                            matchedTitleOrTag = true;
-                        }
-                        if (gv.find(tok) != std::string_view::npos) {
-                            docScore += 2.0 * idf * ((k1 + 1.0) / tagsNorm);
-                            matchedTitleOrTag = true;
-                        }
-                        if (!matchedTitleOrTag) {
-                            docScore += 1.0 * idf * ((k1 + 1.0) / descNorm);
-                        }
-                    }
-                } else {
-                    docScore = idf;
-                }
-                scored.push_back(ScoredRow{docScore, pubId});
-            }
-
-            if (startOffset < scored.size()) {
-                const size_t endIdx =
-                    std::min(scored.size(), startOffset + static_cast<size_t>(cappedLimit));
-                std::partial_sort(scored.begin(),
-                                  scored.begin() + static_cast<std::ptrdiff_t>(endIdx),
-                                  scored.end(), [](const ScoredRow &lhs, const ScoredRow &rhs) {
-                                      if (lhs.score != rhs.score) {
-                                          return lhs.score > rhs.score;
-                                      }
-                                      return lhs.pubId < rhs.pubId;
-                                  });
-
-                for (size_t i = startOffset; i < endIdx; ++i) {
-                    sqlite3_reset(m_stmtGetById);
-                    sqlite3_clear_bindings(m_stmtGetById);
-                    sqlite3_bind_int64(m_stmtGetById, 1,
-                                       static_cast<sqlite3_int64>(scored[i].pubId));
-                    if (sqlite3_step(m_stmtGetById) == SQLITE_ROW) {
-                        WorkshopItemRecord rec = readRecordFromStmt(m_stmtGetById);
-                        rec.search_rank = -scored[i].score;
-                        results.push_back(std::move(rec));
-                    }
-                    sqlite3_reset(m_stmtGetById);
-                }
-            }
-        }
     }
 
-    if (results.empty() && offset == 0) {
+    if (results.empty() && safeOffset == 0) {
         return searchFuzzy(query, 0, limit);
     }
     return results;
@@ -1646,7 +1688,6 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFts5Bm25(const std::s
 std::vector<WorkshopItemRecord>
 CatalogIndexManager::queryByFilters(const CatalogFilter &filter) const
 {
-    std::lock_guard<std::mutex> lock(m_impl->dbMutex);
     if (!m_db) {
         return {};
     }
@@ -1705,40 +1746,52 @@ CatalogIndexManager::queryByFilters(const CatalogFilter &filter) const
     }
 
     sql << " LIMIT ? OFFSET ?;";
+    const std::string sqlStr = sql.str();
 
-    std::string sqlStr = sql.str();
-    sqlite3_stmt *stmt = nullptr;
-    if (sqlite3_prepare_v2(m_db, sqlStr.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-        return {};
+    auto executeWithDb = [&](sqlite3 *dbHandle) -> std::vector<WorkshopItemRecord> {
+        sqlite3_stmt *stmt = nullptr;
+        if (sqlite3_prepare_v2(dbHandle, sqlStr.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            return {};
+        }
+
+        int bindIdx = 1;
+        if (!filter.type.empty() && filter.type != "all" && filter.type != "All") {
+            sqlite3_bind_text(stmt, bindIdx++, filter.type.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        if (filter.compat_tier > 0) {
+            sqlite3_bind_int(stmt, bindIdx++, static_cast<int>(filter.compat_tier));
+        }
+        if (filter.required_tag_mask != 0) {
+            sqlite3_bind_int64(stmt, bindIdx++,
+                               static_cast<sqlite3_int64>(filter.required_tag_mask));
+            sqlite3_bind_int64(stmt, bindIdx++,
+                               static_cast<sqlite3_int64>(filter.required_tag_mask));
+        }
+        if (filter.install_state_mask != 0) {
+            sqlite3_bind_int64(stmt, bindIdx++,
+                               static_cast<sqlite3_int64>(filter.install_state_mask));
+        }
+
+        int lim = filter.limit > 0 ? filter.limit : 50;
+        int off = filter.offset >= 0 ? filter.offset : 0;
+        sqlite3_bind_int(stmt, bindIdx++, lim);
+        sqlite3_bind_int(stmt, bindIdx++, off);
+
+        std::vector<WorkshopItemRecord> rows;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            rows.push_back(readRecordFromStmt(stmt));
+        }
+        sqlite3_finalize(stmt);
+        return rows;
+    };
+
+    if (m_impl->readPool.isOpen()) {
+        auto lease = m_impl->readPool.acquire();
+        return executeWithDb(lease.slot().db);
     }
 
-    int bindIdx = 1;
-    if (!filter.type.empty() && filter.type != "all" && filter.type != "All") {
-        sqlite3_bind_text(stmt, bindIdx++, filter.type.c_str(), -1, SQLITE_TRANSIENT);
-    }
-    if (filter.compat_tier > 0) {
-        sqlite3_bind_int(stmt, bindIdx++, static_cast<int>(filter.compat_tier));
-    }
-    if (filter.required_tag_mask != 0) {
-        sqlite3_bind_int64(stmt, bindIdx++, static_cast<sqlite3_int64>(filter.required_tag_mask));
-        sqlite3_bind_int64(stmt, bindIdx++, static_cast<sqlite3_int64>(filter.required_tag_mask));
-    }
-    if (filter.install_state_mask != 0) {
-        sqlite3_bind_int64(stmt, bindIdx++, static_cast<sqlite3_int64>(filter.install_state_mask));
-    }
-
-    int lim = filter.limit > 0 ? filter.limit : 50;
-    int off = filter.offset >= 0 ? filter.offset : 0;
-    sqlite3_bind_int(stmt, bindIdx++, lim);
-    sqlite3_bind_int(stmt, bindIdx++, off);
-
-    std::vector<WorkshopItemRecord> results;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        results.push_back(readRecordFromStmt(stmt));
-    }
-
-    sqlite3_finalize(stmt);
-    return results;
+    std::lock_guard<std::mutex> lock(m_impl->dbMutex);
+    return m_db ? executeWithDb(m_db) : std::vector<WorkshopItemRecord>{};
 }
 
 std::vector<WorkshopItemRecord> CatalogIndexManager::queryByFilters(const std::string &type,
@@ -1928,22 +1981,49 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
         }
     }
 
-    // 2. Snapshot existing (published_file_id -> time_updated) pairs from SQLite in one pass.
+    // 2. Snapshot existing rows scoped to storageBackend and workshopDir in one pass.
+    std::string dirPrefix = workshopDir.lexically_normal().string();
+    while (dirPrefix.size() > 1 && dirPrefix.back() == '/') {
+        dirPrefix.pop_back();
+    }
+    if (dirPrefix != "/") {
+        dirPrefix.push_back('/');
+    }
+
     std::unordered_map<uint64_t, uint64_t> existingTimestamps;
+    std::vector<uint64_t> existingScopedIds;
     {
-        std::lock_guard<std::mutex> lock(m_impl->dbMutex);
-        if (m_db) {
+        auto loadExisting = [&](sqlite3 *dbHandle) {
             sqlite3_stmt *stmt = nullptr;
-            const char *sql = "SELECT published_file_id, time_updated FROM workshop_items WHERE "
-                              "storage_backend = ?;";
-            if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            const char *sql =
+                "SELECT published_file_id, time_updated, file_path FROM workshop_items WHERE "
+                "storage_backend = ?;";
+            if (sqlite3_prepare_v2(dbHandle, sql, -1, &stmt, nullptr) == SQLITE_OK) {
                 sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(storageBackend));
                 while (sqlite3_step(stmt) == SQLITE_ROW) {
                     uint64_t id = static_cast<uint64_t>(sqlite3_column_int64(stmt, 0));
                     uint64_t ts = static_cast<uint64_t>(sqlite3_column_int64(stmt, 1));
+                    const auto *fp =
+                        reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
                     existingTimestamps.emplace(id, ts);
+                    if (fp) {
+                        std::string normFp = std::filesystem::path(fp).lexically_normal().string();
+                        if (normFp.starts_with(dirPrefix)) {
+                            existingScopedIds.push_back(id);
+                        }
+                    }
                 }
                 sqlite3_finalize(stmt);
+            }
+        };
+
+        if (m_impl->readPool.isOpen()) {
+            auto lease = m_impl->readPool.acquire();
+            loadExisting(lease.slot().db);
+        } else {
+            std::lock_guard<std::mutex> lock(m_impl->dbMutex);
+            if (m_db) {
+                loadExisting(m_db);
             }
         }
     }
@@ -1952,6 +2032,8 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
     size_t statCalls = 0;
     IoUringStatxBatcher statxBatcher;
     std::vector<WorkshopItemRecord> dirtyRecords;
+    std::unordered_set<uint64_t> seenIds;
+    seenIds.reserve(existingScopedIds.size() + 32);
 
     while (struct dirent *ent = ::readdir(topDir)) {
         if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0) {
@@ -1977,6 +2059,7 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
             } catch (...) {
                 id = std::hash<std::string>{}(ent->d_name);
             }
+            seenIds.insert(id);
 
             const waywal_workshop_item_manifest_t *acfPtr = nullptr;
             auto mfIt = manifestMap.find(id);
@@ -2024,6 +2107,7 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
                     if (id == 0) {
                         id = std::hash<std::string>{}(man->slug);
                     }
+                    seenIds.insert(id);
 
                     WorkshopItemRecord rec;
                     rec.published_file_id = id;
@@ -2068,6 +2152,7 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
                     id ^= ch;
                     id *= 1099511628211ULL;
                 }
+                seenIds.insert(id);
                 WorkshopItemRecord rec;
                 rec.published_file_id = id;
                 rec.title = entryPath.stem().string();
@@ -2087,6 +2172,29 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
 
     ::closedir(topDir);
     m_impl->lastReconcileStatCalls.store(statCalls, std::memory_order_relaxed);
+
+    std::vector<uint64_t> staleIds;
+    for (uint64_t exId : existingScopedIds) {
+        if (!seenIds.contains(exId)) {
+            staleIds.push_back(exId);
+        }
+    }
+    if (!staleIds.empty()) {
+        std::lock_guard<std::mutex> lock(m_impl->dbMutex);
+        if (m_db && m_stmtDelete) {
+            sqlite3_exec(m_db, "BEGIN IMMEDIATE TRANSACTION;", nullptr, nullptr, nullptr);
+            for (uint64_t deadId : staleIds) {
+                sqlite3_reset(m_stmtDelete);
+                sqlite3_clear_bindings(m_stmtDelete);
+                sqlite3_bind_int64(m_stmtDelete, 1, static_cast<sqlite3_int64>(deadId));
+                (void)sqlite3_step(m_stmtDelete);
+                m_impl->removeSoaLocked(deadId);
+            }
+            sqlite3_reset(m_stmtDelete);
+            sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
+            m_impl->publishRcuSnapshotLocked();
+        }
+    }
 
     if (!dirtyRecords.empty()) {
         if (upsertItems(dirtyRecords)) {

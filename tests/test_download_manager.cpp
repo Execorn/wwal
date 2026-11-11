@@ -1121,6 +1121,161 @@ void test_nonblocking_pause_cancel_and_throttle_isolation()
               << std::endl;
 }
 
+void test_concurrent_cancel_shutdown_and_malformed_progress()
+{
+    std::cout << "[Download Mgr 11/11] Testing malformed Backend C progress resilience, truncated "
+                 "HTTP 200 rejection & concurrent cancel/shutdown..."
+              << std::endl;
+
+    fs::path test_dir = "/tmp/test_wwal_dl_shutdown_race";
+    cleanup_dir(test_dir);
+    fs::create_directories(test_dir);
+
+    // Part A: Malformed Backend C progress lines must never throw or abort.
+    fs::path malformedScript = write_executable_script(
+        test_dir / "steamcmd_malformed.sh",
+        "echo 'Update state (0x61) downloading, progress: NaN_bad% (bad_num / "
+        "999999999999999999999999999999999999999)'\n"
+        "echo 'Update state (0x61) downloading, progress: % ( / )'\n"
+        "echo 'Update state (0x61) downloading, progress: "
+        "999999999999999999999999999999999999999999.0% (-5 / 0)'\n"
+        "echo 'Update state (0x61) downloading, progress: 75.50% (755 / 1000)'\n"
+        "echo 'Success. Downloaded item 9099'\n"
+        "exit 0");
+
+    {
+        DownloadManager dm;
+        dm.setDownloadDirectory((test_dir / "malformed_dl").string());
+        DownloadManager::SimulationHooks hooks{};
+        hooks.force_backend_failure_a = true;
+        hooks.force_backend_failure_b = true;
+        hooks.steamcmd_override_path = malformedScript.string();
+        dm.setSimulationHooks(hooks);
+        assert(dm.initialize());
+
+        std::atomic<TaskState> endState{TaskState::Queued};
+        std::atomic<bool> sawValidPct{false};
+        dm.enqueue(9099ULL, TaskPriority::Immediate, [&](const DownloadProgress &p) {
+            if (p.state == TaskState::Downloading && std::fabs(p.progress_pct - 75.5f) < 0.2f &&
+                p.bytes_downloaded == 755ULL && p.bytes_total == 1000ULL) {
+                sawValidPct.store(true);
+            }
+            if (p.state == TaskState::Installed || p.state == TaskState::Failed ||
+                p.state == TaskState::Cancelled) {
+                endState.store(p.state);
+            }
+        });
+        dm.waitUntilIdle();
+        dm.shutdown();
+
+        assert(endState.load() == TaskState::Installed &&
+               "Malformed progress tokens must be ignored without throwing");
+        assert(sawValidPct.load() && "Subsequent valid progress line must parse cleanly");
+    }
+
+    // Part B + C: Truncated HTTP 200 rejection and concurrent enqueue/cancel/shutdown stress.
+    std::vector<uint8_t> signedPkg = build_signed_test_wwpkg(test_dir);
+    std::atomic<bool> releaseStalled{false};
+
+    LoopbackHttpServer server([&](int cfd, const LoopbackHttpRequest &req) {
+        if (req.path == "/truncated_always.wwpkg") {
+            std::ostringstream hdr;
+            hdr << "HTTP/1.1 200 OK\r\nContent-Length: " << signedPkg.size()
+                << "\r\nConnection: close\r\n\r\n";
+            auto h = hdr.str();
+            LoopbackHttpServer::writeAll(cfd, h.data(), h.size());
+            LoopbackHttpServer::writeAll(cfd, signedPkg.data(), signedPkg.size() / 3);
+            return;
+        }
+        if (req.path == "/stall_race.wwpkg") {
+            std::ostringstream hdr;
+            hdr << "HTTP/1.1 200 OK\r\nContent-Length: " << signedPkg.size()
+                << "\r\nConnection: close\r\n\r\n";
+            auto h = hdr.str();
+            LoopbackHttpServer::writeAll(cfd, h.data(), h.size());
+            LoopbackHttpServer::writeAll(cfd, signedPkg.data(), signedPkg.size() / 4);
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
+            while (!releaseStalled.load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            return;
+        }
+        std::ostringstream hdr;
+        hdr << "HTTP/1.1 200 OK\r\nContent-Length: " << signedPkg.size()
+            << "\r\nConnection: close\r\n\r\n";
+        auto h = hdr.str();
+        LoopbackHttpServer::writeAll(cfd, h.data(), h.size());
+        LoopbackHttpServer::writeAll(cfd, signedPkg.data(), signedPkg.size());
+    });
+
+    {
+        DownloadManager dm;
+        fs::path truncDir = test_dir / "trunc_dl";
+        dm.setDownloadDirectory(truncDir.string());
+        DownloadManager::SimulationHooks hooks{};
+        hooks.allow_loopback_http = true;
+        dm.setSimulationHooks(hooks);
+        assert(dm.initialize());
+
+        std::atomic<TaskState> truncState{TaskState::Queued};
+        dm.enqueue("pkg-trunc-always", server.baseUrl() + "/truncated_always.wwpkg",
+                   TaskPriority::Immediate, [&](const DownloadProgress &p) {
+                       if (p.state == TaskState::Installed || p.state == TaskState::Failed) {
+                           truncState.store(p.state);
+                       }
+                   });
+        dm.waitUntilIdle();
+        dm.shutdown();
+        assert(truncState.load() == TaskState::Failed &&
+               "Truncated HTTP body must never be marked Installed");
+        assert(!fs::exists(truncDir / "pkg-trunc-always.wwpkg"));
+    }
+
+    for (int round = 0; round < 12; ++round) {
+        releaseStalled.store(false);
+        DownloadManager dm;
+        fs::path roundDir = test_dir / ("race_" + std::to_string(round));
+        dm.setDownloadDirectory(roundDir.string());
+        DownloadManager::SimulationHooks hooks{};
+        hooks.allow_loopback_http = true;
+        dm.setSimulationHooks(hooks);
+        assert(dm.initialize());
+
+        std::atomic<bool> stopClient{false};
+        std::thread producer([&]() {
+            for (int i = 0; i < 16 && !stopClient.load(std::memory_order_relaxed); ++i) {
+                const std::string id = "race-" + std::to_string(round) + "-" + std::to_string(i);
+                const std::string path = (i % 2 == 0) ? "/stall_race.wwpkg" : "/fast_race.wwpkg";
+                dm.enqueue(id, server.baseUrl() + path,
+                           (i % 3 == 0) ? TaskPriority::Immediate : TaskPriority::Interactive,
+                           [](const DownloadProgress &) {});
+                if (i % 2 == 1) {
+                    dm.cancelOpenHub("race-" + std::to_string(round) + "-" + std::to_string(i - 1));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        auto t0 = std::chrono::steady_clock::now();
+        dm.shutdown();
+        auto shutdownMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+        stopClient.store(true, std::memory_order_relaxed);
+        releaseStalled.store(true);
+        producer.join();
+        assert(shutdownMs < 2500 &&
+               "Concurrent enqueue/cancel/shutdown must never deadlock arbiter and reactor");
+    }
+
+    releaseStalled.store(true);
+    server.stop();
+    cleanup_dir(test_dir);
+    std::cout << "  -> Malformed progress resilience & concurrent cancel/shutdown verified."
+              << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -1142,6 +1297,7 @@ int main(int argc, char **argv)
     test_four_plus_one_fast_lane_isolation();
     test_backend_c_subprocess_reaping_and_shutdown();
     test_nonblocking_pause_cancel_and_throttle_isolation();
+    test_concurrent_cancel_shutdown_and_malformed_progress();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  >>> DOWNLOAD MANAGER SUITE PASSED CLEANLY (100%) <<<    " << std::endl;

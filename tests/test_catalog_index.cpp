@@ -5,8 +5,10 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "studio/core/catalog_index_manager.hpp"
@@ -574,6 +577,158 @@ void test_wwpkg_signature_gate_in_reconcile()
     std::cout << "  -> .wwpkg cryptographic signature verification gate passed." << std::endl;
 }
 
+void test_concurrent_wal_pool_rcu_and_pruning()
+{
+    std::cout << "[Catalog 8/8] Testing concurrent WAL reader pool, lock-free RCU snapshot & "
+                 "deleted-directory pruning..."
+              << std::endl;
+
+    std::filesystem::path root = "/tmp/test_wwal_cat_rcu";
+    std::filesystem::path dbPath = "/tmp/test_wwal_cat_rcu.db";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    cleanup_db_files(dbPath);
+
+    std::filesystem::path wsContent = root / "content" / "431960";
+    std::filesystem::create_directories(wsContent / "4001", ec);
+    std::filesystem::create_directories(wsContent / "4002", ec);
+
+    {
+        std::ofstream f1(wsContent / "4001" / "project.json");
+        f1 << "{ \"title\": \"Persistent Nebula\", \"type\": \"scene\", \"tags\": [\"Space\"] }\n";
+    }
+    {
+        std::ofstream f2(wsContent / "4002" / "project.json");
+        f2 << "{ \"title\": \"Ephemeral Mirage\", \"type\": \"video\", \"tags\": [\"Retro\"] }\n";
+    }
+    {
+        std::ofstream acf(root / "appworkshop_431960.acf");
+        acf << "\"AppWorkshop\"\n{\n"
+            << "  \"appid\" \"431960\"\n"
+            << "  \"WorkshopItemsInstalled\"\n  {\n"
+            << "    \"4001\"\n    {\n      \"size\" \"1024\"\n      \"timeupdated\" \"1710001000\"\n"
+            << "      \"manifest\" \"111\"\n    }\n"
+            << "    \"4002\"\n    {\n      \"size\" \"2048\"\n      \"timeupdated\" \"1710002000\"\n"
+            << "      \"manifest\" \"222\"\n    }\n"
+            << "  }\n}\n";
+    }
+
+    {
+        CatalogIndexManager mgr(dbPath);
+        assert(mgr.reconcileDirectory(wsContent, 0) == 2);
+        assert(mgr.getItem(4001).has_value());
+        assert(mgr.getItem(4002).has_value());
+
+        // Verify aspect_ratio-only mutation triggers dirty-row update.
+        WorkshopItemRecord arItem = *mgr.getItem(4001);
+        arItem.aspect_ratio = 1.7777778f;
+        assert(mgr.upsertItem(arItem));
+        uint64_t clockBefore = mgr.getItem(4001)->file_clock;
+        arItem.aspect_ratio = 2.3888889f;
+        assert(mgr.upsertItem(arItem));
+        auto arAfter = mgr.getItem(4001);
+        assert(arAfter.has_value());
+        assert(std::fabs(arAfter->aspect_ratio - 2.3888889f) < 1e-4f);
+        assert(arAfter->file_clock == clockBefore + 1 &&
+               "Aspect-ratio change must update row and advance file_clock");
+
+        // Remove 4002 from filesystem and manifest, then verify lexical-prefix reconcile prunes it.
+        std::filesystem::remove_all(wsContent / "4002", ec);
+        {
+            std::ofstream acf(root / "appworkshop_431960.acf", std::ios::trunc);
+            acf << "\"AppWorkshop\"\n{\n"
+                << "  \"appid\" \"431960\"\n"
+                << "  \"WorkshopItemsInstalled\"\n  {\n"
+                << "    \"4001\"\n    {\n      \"size\" \"1024\"\n"
+                << "      \"timeupdated\" \"1710001000\"\n      \"manifest\" \"111\"\n    }\n"
+                << "  }\n}\n";
+        }
+        assert(mgr.reconcileDirectory(wsContent, 0) == 1);
+        assert(mgr.getItem(4001).has_value());
+        assert(!mgr.getItem(4002).has_value() &&
+               "Deleted Workshop subdirectory must be pruned from catalog");
+
+        // Concurrent 4-reader WAL pool + RCU snapshot stress against active writer thread.
+        std::vector<WorkshopItemRecord> seedBatch;
+        seedBatch.reserve(256);
+        for (uint64_t i = 0; i < 256; ++i) {
+            WorkshopItemRecord rec{};
+            rec.published_file_id = 800000ULL + i;
+            rec.title = "Concurrent Aurora Shader " + std::to_string(i);
+            rec.type = (i % 2 == 0) ? "scene" : "video";
+            rec.file_path = "/concurrent/" + std::to_string(rec.published_file_id) + "/scene.pkg";
+            rec.subscriptions = static_cast<uint32_t>(1000 + i * 7);
+            rec.compat_tier = 1;
+            rec.compat_score = 95;
+            rec.tag_mask = 1ULL << (i % 8);
+            rec.tags_string = "Aurora, Concurrent";
+            rec.description = "Lock-free RCU reader and WAL pool verification payload";
+            seedBatch.push_back(std::move(rec));
+        }
+        assert(mgr.upsertItems(seedBatch));
+
+        std::atomic<bool> stopReaders{false};
+        std::atomic<size_t> totalReadOps{0};
+        std::vector<std::thread> readers;
+        for (int r = 0; r < 4; ++r) {
+            readers.emplace_back([&, r]() {
+                const std::string wantType =
+                    (r % 2 == 0) ? std::string("scene", 5) : std::string("video", 5);
+                uint64_t iter = 0;
+                while (!stopReaders.load(std::memory_order_acquire)) {
+                    auto fts = mgr.searchFts5Bm25("Aurora", 20, 0);
+                    assert(!fts.empty());
+
+                    CatalogFilter cf{};
+                    cf.type.assign(wantType.data(), wantType.size());
+                    cf.limit = 16;
+                    auto filtered = mgr.queryByFilters(cf);
+                    assert(!filtered.empty());
+
+                    auto fuzzy = mgr.searchFuzzy("Auror Shadr", 0, 10);
+                    assert(!fuzzy.empty());
+
+                    size_t bits = mgr.filterByTagMaskBitmap(1ULL << (iter % 8), nullptr);
+                    assert(bits > 0);
+
+                    (void)mgr.getItem(800000ULL + (iter % 256));
+                    totalReadOps.fetch_add(1, std::memory_order_relaxed);
+                    ++iter;
+                }
+            });
+        }
+
+        for (uint64_t w = 0; w < 80; ++w) {
+            WorkshopItemRecord mut{};
+            mut.published_file_id = 900000ULL + (w % 32);
+            mut.title = "Dynamic Streamed Shader " + std::to_string(w);
+            mut.type = "scene";
+            mut.file_path = "/dynamic/" + std::to_string(mut.published_file_id) + "/scene.pkg";
+            mut.subscriptions = static_cast<uint32_t>(5000 + w);
+            mut.compat_tier = 1;
+            mut.compat_score = 99;
+            mut.tag_mask = 1ULL << (w % 8);
+            mut.tags_string = "Dynamic, Stream";
+            assert(mgr.upsertItem(mut));
+            if (w % 5 == 4) {
+                (void)mgr.removeItem(900000ULL + ((w - 2) % 32));
+            }
+        }
+
+        stopReaders.store(true, std::memory_order_release);
+        for (auto &t : readers) {
+            t.join();
+        }
+        assert(totalReadOps.load() >= 4);
+    }
+
+    std::filesystem::remove_all(root, ec);
+    cleanup_db_files(dbPath);
+    std::cout << "  -> Concurrent 4-slot WAL pool, lock-free RCU snapshot & directory pruning "
+                 "passed."
+              << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -607,9 +762,10 @@ int main(int argc, char **argv)
 
     test_zero_stat_delta_reconciliation();
     test_wwpkg_signature_gate_in_reconcile();
+    test_concurrent_wal_pool_rcu_and_pruning();
 
     std::cout << "==========================================================" << std::endl;
-    std::cout << "  >>> CATALOG INDEX SUITE PASSED (7/7 SUITES, 100%) <<<   " << std::endl;
+    std::cout << "  >>> CATALOG INDEX SUITE PASSED (8/8 SUITES, 100%) <<<   " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
     return 0;

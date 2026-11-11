@@ -48,7 +48,7 @@ struct WorkshopItemRecord {
     [[nodiscard]] CatalogItem toCatalogItem() const
     {
         CatalogItem item;
-        item.id = static_cast<uint32_t>(published_file_id);
+        item.id = static_cast<uint32_t>(published_file_id ^ (published_file_id >> 32));
         item.workshop_id = std::to_string(published_file_id);
         item.title = title;
         item.path = file_path;

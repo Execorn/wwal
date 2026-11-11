@@ -2,14 +2,22 @@
 
 #include "gpu_preview_viewport.hpp"
 
+#include <QApplication>
+#include <QCryptographicHash>
 #include <QPainter>
 #include <QPainterPath>
 #include <QMouseEvent>
 #include <QWheelEvent>
+#include <QShowEvent>
+#include <QHideEvent>
 #include <QDateTime>
 #include <QFileInfo>
 #include <QDir>
+#include <QMetaObject>
+#include <QOpenGLContext>
+#include <QPointer>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QDebug>
 #include <cmath>
@@ -91,6 +99,66 @@ const char *kBlitFragmentShader = "#version 300 es\n"
                                   "    fragColor = vec4(col.rgb, 1.0);\n"
                                   "}\n";
 
+const char *kBlitVertexShaderCore = "#version 330 core\n"
+                                    "layout (location = 0) in vec2 a_pos;\n"
+                                    "layout (location = 1) in vec2 a_uv;\n"
+                                    "uniform mat4 u_mvp;\n"
+                                    "out vec2 v_uv;\n"
+                                    "void main() {\n"
+                                    "    v_uv = a_uv;\n"
+                                    "    gl_Position = u_mvp * vec4(a_pos, 0.0, 1.0);\n"
+                                    "}\n";
+
+const char *kBlitFragmentShaderCore = "#version 330 core\n"
+                                      "in vec2 v_uv;\n"
+                                      "uniform sampler2D u_texture;\n"
+                                      "uniform int u_flip_y;\n"
+                                      "uniform int u_is_bgr;\n"
+                                      "out vec4 fragColor;\n"
+                                      "void main() {\n"
+                                      "    vec2 uv = v_uv;\n"
+                                      "    if (u_flip_y != 0) {\n"
+                                      "        uv.y = 1.0 - uv.y;\n"
+                                      "    }\n"
+                                      "    vec4 col = texture(u_texture, uv);\n"
+                                      "    if (u_is_bgr != 0) {\n"
+                                      "        col.rgb = col.bgr;\n"
+                                      "    }\n"
+                                      "    fragColor = vec4(col.rgb, 1.0);\n"
+                                      "}\n";
+
+const char *kGraphVertexShaderEs310 = "#version 310 es\n"
+                                      "precision highp float;\n"
+                                      "layout (location = 0) in vec2 a_pos;\n"
+                                      "layout (location = 1) in vec2 a_uv;\n"
+                                      "uniform mat4 u_mvp;\n"
+                                      "out vec2 v_TexCoord;\n"
+                                      "void main() {\n"
+                                      "    v_TexCoord = a_uv;\n"
+                                      "    gl_Position = u_mvp * vec4(a_pos, 0.0, 1.0);\n"
+                                      "}\n";
+
+const char *kGraphVertexShaderEs300 = "#version 300 es\n"
+                                      "precision highp float;\n"
+                                      "layout (location = 0) in vec2 a_pos;\n"
+                                      "layout (location = 1) in vec2 a_uv;\n"
+                                      "uniform mat4 u_mvp;\n"
+                                      "out vec2 v_TexCoord;\n"
+                                      "void main() {\n"
+                                      "    v_TexCoord = a_uv;\n"
+                                      "    gl_Position = u_mvp * vec4(a_pos, 0.0, 1.0);\n"
+                                      "}\n";
+
+const char *kGraphVertexShaderCore330 = "#version 330 core\n"
+                                        "layout (location = 0) in vec2 a_pos;\n"
+                                        "layout (location = 1) in vec2 a_uv;\n"
+                                        "uniform mat4 u_mvp;\n"
+                                        "out vec2 v_TexCoord;\n"
+                                        "void main() {\n"
+                                        "    v_TexCoord = a_uv;\n"
+                                        "    gl_Position = u_mvp * vec4(a_pos, 0.0, 1.0);\n"
+                                        "}\n";
+
 const char *kShadertoyPreamble = "#version 300 es\n"
                                  "precision highp float;\n"
                                  "out vec4 outFragColor;\n"
@@ -101,12 +169,137 @@ const char *kShadertoyPreamble = "#version 300 es\n"
                                  "uniform vec4 iMouse;\n"
                                  "uniform vec4 iDate;\n\n";
 
+const char *kShadertoyPreambleCore = "#version 330 core\n"
+                                     "out vec4 outFragColor;\n"
+                                     "uniform vec3 iResolution;\n"
+                                     "uniform float iTime;\n"
+                                     "uniform float iTimeDelta;\n"
+                                     "uniform int iFrame;\n"
+                                     "uniform vec4 iMouse;\n"
+                                     "uniform vec4 iDate;\n\n";
+
 const char *kShadertoyEpilogue = "\nvoid main() {\n"
                                  "    vec4 color = vec4(0.0);\n"
                                  "    mainImage(color, gl_FragCoord.xy);\n"
                                  "    // Invariant: IMAGE_PASS must always force opaque alpha\n"
                                  "    outFragColor = vec4(color.rgb, 1.0);\n"
                                  "}\n";
+
+class GlContextScope {
+  public:
+    explicit GlContextScope(GpuPreviewViewport *vp) noexcept
+    {
+        if (!vp || !vp->isValid() || !vp->context()) {
+            return;
+        }
+        if (QOpenGLContext::currentContext() == vp->context()) {
+            m_ready = true;
+            return;
+        }
+        vp->makeCurrent();
+        m_vp = vp;
+        m_ready = (QOpenGLContext::currentContext() == vp->context());
+    }
+
+    ~GlContextScope()
+    {
+        if (m_vp) {
+            m_vp->doneCurrent();
+        }
+    }
+
+    GlContextScope(const GlContextScope &) = delete;
+    GlContextScope &operator=(const GlContextScope &) = delete;
+
+    [[nodiscard]] bool isReady() const noexcept { return m_ready; }
+
+  private:
+    GpuPreviewViewport *m_vp{nullptr};
+    bool m_ready{false};
+};
+
+QString convertEsFragmentToCore330(QString src)
+{
+    static const QRegularExpression kVersionRe(
+        QStringLiteral("^\\s*#version\\s+\\d+\\s+es\\b[^\\n]*"),
+        QRegularExpression::MultilineOption);
+    static const QRegularExpression kPrecisionRe(
+        QStringLiteral("^\\s*precision\\s+(?:lowp|mediump|highp)\\s+\\w+\\s*;\\s*$"),
+        QRegularExpression::MultilineOption);
+    src.replace(kVersionRe, QStringLiteral("#version 330 core"));
+    src.replace(kPrecisionRe, QString());
+    return src;
+}
+
+QString convertEs310ToEs300(QString src)
+{
+    static const QRegularExpression kVersion310Re(
+        QStringLiteral("^\\s*#version\\s+310\\s+es\\b[^\\n]*"),
+        QRegularExpression::MultilineOption);
+    src.replace(kVersion310Re, QStringLiteral("#version 300 es"));
+    return src;
+}
+
+struct GraphPassSource {
+    int passIndex{4};
+    QString glsl;
+};
+
+std::vector<GraphPassSource> parseGraphPasses(const QString &source)
+{
+    std::vector<GraphPassSource> out;
+    static const QRegularExpression kPragmaPassRe(
+        QStringLiteral("^\\s*#pragma\\s+Pass\\s+([A-Za-z0-9_]+)\\s*$"),
+        QRegularExpression::MultilineOption);
+
+    auto mapPassName = [](const QString &name) -> int {
+        if (name == QLatin1String("BUFFER_A"))
+            return 0;
+        if (name == QLatin1String("BUFFER_B"))
+            return 1;
+        if (name == QLatin1String("BUFFER_C"))
+            return 2;
+        if (name == QLatin1String("BUFFER_D"))
+            return 3;
+        return 4;
+    };
+
+    QRegularExpressionMatchIterator it = kPragmaPassRe.globalMatch(source);
+    struct MatchSpan {
+        int passIndex;
+        qsizetype bodyStart;
+        qsizetype pragmaStart;
+    };
+    std::vector<MatchSpan> spans;
+    while (it.hasNext()) {
+        QRegularExpressionMatch m = it.next();
+        spans.push_back(MatchSpan{
+            .passIndex = mapPassName(m.captured(1)),
+            .bodyStart = m.capturedEnd(0),
+            .pragmaStart = m.capturedStart(0),
+        });
+    }
+
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const qsizetype start = spans[i].bodyStart;
+        const qsizetype end =
+            (i + 1 < spans.size()) ? spans[i + 1].pragmaStart : source.size();
+        QString body = source.mid(start, end - start).trimmed();
+        if (!body.isEmpty()) {
+            out.push_back(GraphPassSource{.passIndex = spans[i].passIndex, .glsl = std::move(body)});
+        }
+    }
+    return out;
+}
+
+using GlTexStorage2DProc = void (*)(GLenum target, GLsizei levels, GLenum internalformat,
+                                    GLsizei width, GLsizei height);
+using GlBindImageTextureProc = void (*)(GLuint unit, GLuint texture, GLint level,
+                                        GLboolean layered, GLint layer, GLenum access,
+                                        GLenum format);
+using GlDispatchComputeProc = void (*)(GLuint num_groups_x, GLuint num_groups_y,
+                                       GLuint num_groups_z);
+using GlMemoryBarrierProc = void (*)(GLbitfield barriers);
 
 } // namespace
 
@@ -160,40 +353,97 @@ GpuPreviewViewport::GpuPreviewViewport(QWidget *parent) : QOpenGLWidget(parent)
     m_animationTimer = new QTimer(this);
     setTargetAnimationFps(144);
     connect(m_animationTimer, &QTimer::timeout, this, [this]() {
-        if (!m_animationPaused) {
-            // Apply spring damping for 2.5D parallax tilt
+        if (m_animationPaused || !isVisible()) {
+            m_animationTimer->stop();
+            return;
+        }
+        if (m_parallaxEnabled) {
             constexpr float kDamping = 0.14f;
             m_currentTiltX += (m_targetTiltX - m_currentTiltX) * kDamping;
             m_currentTiltY += (m_targetTiltY - m_currentTiltY) * kDamping;
-            update();
         }
+        update();
+        updateAnimationTimerState();
     });
-    m_animationTimer->start();
+    updateAnimationTimerState();
 }
 
 GpuPreviewViewport::~GpuPreviewViewport()
 {
-    if (isValid()) {
-        makeCurrent();
+    if (m_animationTimer) {
+        m_animationTimer->stop();
+    }
+    m_videoLoadGeneration.fetch_add(1, std::memory_order_acq_rel);
+    if (m_videoThumbThread.joinable()) {
+        m_videoThumbThread.request_stop();
+        m_videoThumbThread.join();
+    }
 
-        if (m_currentDmaBufFrame.has_value()) {
-            m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR,
-                                            m_eglDestroySyncKHR);
-            m_currentDmaBufFrame.reset();
+    {
+        GlContextScope glScope(this);
+        if (glScope.isReady()) {
+            std::lock_guard<std::mutex> lock(m_frameMutex);
+            if (m_currentDmaBufFrame.has_value()) {
+                m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR,
+                                                m_eglDestroySyncKHR);
+                m_currentDmaBufFrame.reset();
+            }
+
+            if (m_inProcessImageTex != 0) {
+                glDeleteTextures(1, &m_inProcessImageTex);
+                m_inProcessImageTex = 0;
+            }
+            if (m_neutralPassTex != 0) {
+                glDeleteTextures(1, &m_neutralPassTex);
+                m_neutralPassTex = 0;
+            }
+            if (m_computeOutputTex != 0) {
+                glDeleteTextures(1, &m_computeOutputTex);
+                m_computeOutputTex = 0;
+            }
+
+            m_quadVao.destroy();
+            m_quadVbo.destroy();
+            m_blitProgram.reset();
+            m_shaderProgram.reset();
+            m_computeShaderProgram.reset();
+            for (auto &prog : m_bufferPassPrograms) {
+                prog.reset();
+            }
+            for (auto &pair : m_bufferPassFbos) {
+                pair[0].reset();
+                pair[1].reset();
+            }
+            m_offscreenFbo.reset();
         }
+    }
 
-        if (m_inProcessImageTex != 0) {
-            glDeleteTextures(1, &m_inProcessImageTex);
-            m_inProcessImageTex = 0;
-        }
+    // Always close kernel DMA-BUF FDs even if the QOpenGLWidget was never realized.
+    std::lock_guard<std::mutex> lock(m_frameMutex);
+    if (m_currentDmaBufFrame.has_value()) {
+        m_currentDmaBufFrame->closeFds();
+        m_currentDmaBufFrame.reset();
+    }
+}
 
-        m_quadVao.destroy();
-        m_quadVbo.destroy();
-        m_blitProgram.reset();
-        m_shaderProgram.reset();
-        m_offscreenFbo.reset();
+void GpuPreviewViewport::updateAnimationTimerState()
+{
+    if (!m_animationTimer) {
+        return;
+    }
+    const bool parallaxSettling =
+        m_parallaxEnabled &&
+        (std::abs(m_targetTiltX - m_currentTiltX) > 1e-4f ||
+         std::abs(m_targetTiltY - m_currentTiltY) > 1e-4f);
+    const bool needsTick =
+        isVisible() && !m_animationPaused &&
+        (m_previewMode == PreviewMode::InProcessShader ||
+         m_previewMode == PreviewMode::DmaBufLive || parallaxSettling);
 
-        doneCurrent();
+    if (needsTick && !m_animationTimer->isActive()) {
+        m_animationTimer->start();
+    } else if (!needsTick && m_animationTimer->isActive()) {
+        m_animationTimer->stop();
     }
 }
 
@@ -206,7 +456,11 @@ void GpuPreviewViewport::setTargetAnimationFps(int fps)
     }
 }
 
-void GpuPreviewViewport::pauseAnimation(bool pause) { m_animationPaused = pause; }
+void GpuPreviewViewport::pauseAnimation(bool pause)
+{
+    m_animationPaused = pause;
+    updateAnimationTimerState();
+}
 
 uint32_t GpuPreviewViewport::contentWidth() const noexcept
 {
@@ -216,8 +470,13 @@ uint32_t GpuPreviewViewport::contentWidth() const noexcept
     if (m_previewMode == PreviewMode::InProcessImage) {
         return m_imageWidth;
     }
-    if (m_previewMode == PreviewMode::InProcessShader && m_offscreenFbo) {
-        return static_cast<uint32_t>(m_offscreenFbo->width());
+    if (m_previewMode == PreviewMode::InProcessShader) {
+        if (m_computeShaderProgram && m_computeTexWidth > 0) {
+            return static_cast<uint32_t>(m_computeTexWidth);
+        }
+        if (m_offscreenFbo) {
+            return static_cast<uint32_t>(m_offscreenFbo->width());
+        }
     }
     return static_cast<uint32_t>(width());
 }
@@ -230,8 +489,13 @@ uint32_t GpuPreviewViewport::contentHeight() const noexcept
     if (m_previewMode == PreviewMode::InProcessImage) {
         return m_imageHeight;
     }
-    if (m_previewMode == PreviewMode::InProcessShader && m_offscreenFbo) {
-        return static_cast<uint32_t>(m_offscreenFbo->height());
+    if (m_previewMode == PreviewMode::InProcessShader) {
+        if (m_computeShaderProgram && m_computeTexHeight > 0) {
+            return static_cast<uint32_t>(m_computeTexHeight);
+        }
+        if (m_offscreenFbo) {
+            return static_cast<uint32_t>(m_offscreenFbo->height());
+        }
     }
     return static_cast<uint32_t>(height());
 }
@@ -243,19 +507,27 @@ bool GpuPreviewViewport::hasLiveDmaBuf() const noexcept
 
 void GpuPreviewViewport::clearLiveDmaBuf()
 {
-    makeCurrent();
-    std::lock_guard<std::mutex> lock(m_frameMutex);
-    if (m_currentDmaBufFrame.has_value()) {
-        m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR, m_eglDestroySyncKHR);
-        m_currentDmaBufFrame.reset();
+    {
+        GlContextScope glScope(this);
+        std::lock_guard<std::mutex> lock(m_frameMutex);
+        if (m_currentDmaBufFrame.has_value()) {
+            if (glScope.isReady()) {
+                m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR,
+                                                m_eglDestroySyncKHR);
+            } else {
+                m_currentDmaBufFrame->closeFds();
+            }
+            m_currentDmaBufFrame.reset();
+        }
     }
-    if (m_inProcessImageTex != 0) {
+    if (m_inProcessImageTex != 0 || !m_fallbackImage.isNull()) {
         m_previewMode = PreviewMode::InProcessImage;
-    } else if (m_shaderProgram) {
+    } else if (m_shaderProgram || m_computeShaderProgram || !m_shaderSource.isEmpty()) {
         m_previewMode = PreviewMode::InProcessShader;
     } else {
         m_previewMode = PreviewMode::OfflineEmpty;
     }
+    updateAnimationTimerState();
     update();
 }
 
@@ -317,19 +589,44 @@ void GpuPreviewViewport::setupQuadGeometry()
 
 void GpuPreviewViewport::initBlitShader()
 {
+    const bool isGles =
+        QOpenGLContext::currentContext() && QOpenGLContext::currentContext()->isOpenGLES();
+    const char *vsSrc = isGles ? kBlitVertexShader : kBlitVertexShaderCore;
+    const char *fsSrc = isGles ? kBlitFragmentShader : kBlitFragmentShaderCore;
+
     m_blitProgram = std::make_unique<QOpenGLShaderProgram>(this);
-    if (!m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, kBlitVertexShader)) {
-        qWarning() << "[GpuPreviewViewport] Failed to compile blit vertex shader:"
-                   << m_blitProgram->log();
+    if (!m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, vsSrc) ||
+        !m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, fsSrc) ||
+        !m_blitProgram->link()) {
+        m_blitProgram = std::make_unique<QOpenGLShaderProgram>(this);
+        if (!m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, kBlitVertexShaderCore) ||
+            !m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Fragment,
+                                                    kBlitFragmentShaderCore) ||
+            !m_blitProgram->link()) {
+            qWarning() << "[GpuPreviewViewport] Failed to compile/link blit shader:"
+                       << m_blitProgram->log();
+        }
     }
-    if (!m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, kBlitFragmentShader)) {
-        qWarning() << "[GpuPreviewViewport] Failed to compile blit fragment shader:"
-                   << m_blitProgram->log();
+}
+
+void GpuPreviewViewport::ensureNeutralPassTexture()
+{
+    if (m_neutralPassTex != 0) {
+        return;
     }
-    if (!m_blitProgram->link()) {
-        qWarning() << "[GpuPreviewViewport] Failed to link blit shader program:"
-                   << m_blitProgram->log();
-    }
+    static constexpr uint8_t kNeutralPixel[4] = {28, 34, 48, 255};
+    glGenTextures(1, &m_neutralPassTex);
+    glBindTexture(GL_TEXTURE_2D, m_neutralPassTex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+#ifdef GL_UNPACK_ROW_LENGTH
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, kNeutralPixel);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 void GpuPreviewViewport::initializeGL()
@@ -338,9 +635,14 @@ void GpuPreviewViewport::initializeGL()
     resolveEglExtensions();
     setupQuadGeometry();
     initBlitShader();
+    ensureNeutralPassTexture();
 
     if (!m_fallbackImage.isNull() && m_inProcessImageTex == 0) {
         QImage formatted = m_fallbackImage.convertToFormat(QImage::Format_RGBA8888);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+#ifdef GL_UNPACK_ROW_LENGTH
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
         glGenTextures(1, &m_inProcessImageTex);
         glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0, GL_RGBA,
@@ -350,6 +652,10 @@ void GpuPreviewViewport::initializeGL()
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    if (!m_shaderSource.isEmpty() && !m_shaderProgram && !m_computeShaderProgram) {
+        (void)compileShaderInternal(m_shaderSource, nullptr);
     }
 
     glClearColor(0.07f, 0.07f, 0.09f, 1.0f);
@@ -362,6 +668,7 @@ void GpuPreviewViewport::resizeGL(int w, int h)
     glViewport(0, 0, w, h);
     if (m_previewMode == PreviewMode::InProcessShader) {
         ensureOffscreenFbo(w, h);
+        ensureBufferPassFbos(w, h);
     }
 }
 
@@ -376,6 +683,36 @@ void GpuPreviewViewport::ensureOffscreenFbo(int w, int h)
         fboFmt.setTextureTarget(GL_TEXTURE_2D);
         fboFmt.setInternalTextureFormat(GL_RGBA8);
         m_offscreenFbo = std::make_unique<QOpenGLFramebufferObject>(targetW, targetH, fboFmt);
+    }
+}
+
+void GpuPreviewViewport::ensureBufferPassFbos(int w, int h)
+{
+    const int targetW = std::clamp(w, 64, 7680);
+    const int targetH = std::clamp(h, 64, 4320);
+
+    for (size_t i = 0; i < 4; ++i) {
+        if (!m_bufferPassPrograms[i]) {
+            m_bufferPassFbos[i][0].reset();
+            m_bufferPassFbos[i][1].reset();
+            continue;
+        }
+        for (size_t slot = 0; slot < 2; ++slot) {
+            auto &fbo = m_bufferPassFbos[i][slot];
+            if (!fbo || fbo->size() != QSize(targetW, targetH)) {
+                QOpenGLFramebufferObjectFormat fboFmt;
+                fboFmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
+                fboFmt.setTextureTarget(GL_TEXTURE_2D);
+                fboFmt.setInternalTextureFormat(GL_RGBA8);
+                fbo = std::make_unique<QOpenGLFramebufferObject>(targetW, targetH, fboFmt);
+                if (fbo->bind()) {
+                    glViewport(0, 0, targetW, targetH);
+                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    fbo->release();
+                }
+            }
+        }
     }
 }
 
@@ -399,7 +736,12 @@ bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &des
         return false;
     }
 
-    makeCurrent();
+    GlContextScope glScope(this);
+    if (!glScope.isReady()) {
+        cleanupIncomingFds();
+        emit dmaBufImportFailed(QStringLiteral("OpenGL context is not yet realized"));
+        return false;
+    }
     resolveEglExtensions();
 
     if (!m_eglCreateImageKHR || !m_glEGLImageTargetTexture2DOES) {
@@ -461,17 +803,14 @@ bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &des
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    // Enforce non-blocking GPU fence synchronization
     EGLSyncKHR sync = EGL_NO_SYNC_KHR;
     if (m_eglCreateSyncKHR) {
         sync = m_eglCreateSyncKHR(m_eglDisplay, EGL_SYNC_FENCE_KHR, nullptr);
         if (sync != EGL_NO_SYNC_KHR && m_eglWaitSyncKHR) {
-            // GPU-side wait only: orders GPU command stream without blocking CPU event loop
             m_eglWaitSyncKHR(m_eglDisplay, sync, 0);
         }
     }
 
-    // Prepare new frame
     DmaBufFrame newFrame;
     newFrame.width = desc.width;
     newFrame.height = desc.height;
@@ -494,7 +833,13 @@ bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &des
         }
     }
 
-    // Rotate buffers thread-safely: retire old frame and close old FDs
+    // Close any excess SCM_RIGHTS FDs beyond planesToImport so kernel descriptors never leak.
+    for (size_t extra = planesToImport; extra < num_fds; ++extra) {
+        if (plane_fds[extra] >= 0) {
+            ::close(plane_fds[extra]);
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(m_frameMutex);
         if (m_currentDmaBufFrame.has_value()) {
@@ -506,6 +851,7 @@ bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &des
     }
 
     m_frameCount++;
+    updateAnimationTimerState();
     emit dmaBufFrameRendered(desc.width, desc.height, m_frameCount);
     update();
     return true;
@@ -544,7 +890,7 @@ bool GpuPreviewViewport::requestLiveDmaBuf(int socketFd, const QString &outputNa
         return false;
     }
 
-    if (resp_hdr.opcode != WAYWAL_RESP_OK ||
+    if ((resp_hdr.opcode != WAYWAL_RESP_OK && resp_hdr.opcode != WAYWAL_RESP_DMABUF) ||
         resp_hdr.payload_size < sizeof(waywal_export_dmabuf_resp_t)) {
         for (size_t i = 0; i < num_fds; ++i) {
             if (fds[i] >= 0)
@@ -595,23 +941,29 @@ void GpuPreviewViewport::setPreviewImage(const QImage &image)
     m_imageWidth = static_cast<uint32_t>(formatted.width());
     m_imageHeight = static_cast<uint32_t>(formatted.height());
 
-    if (isValid()) {
-        makeCurrent();
-        if (m_inProcessImageTex == 0) {
-            glGenTextures(1, &m_inProcessImageTex);
+    {
+        GlContextScope glScope(this);
+        if (glScope.isReady()) {
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+#ifdef GL_UNPACK_ROW_LENGTH
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
+            if (m_inProcessImageTex == 0) {
+                glGenTextures(1, &m_inProcessImageTex);
+            }
+            glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, formatted.constBits());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
         }
-        glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0, GL_RGBA,
-                     GL_UNSIGNED_BYTE, formatted.constBits());
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        doneCurrent();
     }
 
     m_previewMode = PreviewMode::InProcessImage;
+    updateAnimationTimerState();
     update();
 }
 
@@ -673,22 +1025,81 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
         }
     }
 
-    // 4. Video wallpaper preview frame extraction via ffmpeg
+    // 4. Video wallpaper preview frame extraction (check disk cache first, then async ffmpeg)
     if (img.isNull() && QFileInfo::exists(targetPath) &&
         (ext == ".mp4" || ext == ".mkv" || ext == ".webm" || ext == ".avi" || ext == ".mov")) {
-        QProcess proc;
-        proc.start(QStringLiteral("ffmpeg"),
-                   {QStringLiteral("-loglevel"), QStringLiteral("error"), QStringLiteral("-ss"),
-                    QStringLiteral("00:00:00.50"), QStringLiteral("-i"), targetPath,
-                    QStringLiteral("-frames:v"), QStringLiteral("1"), QStringLiteral("-vf"),
-                    QStringLiteral("scale=1280:-1"), QStringLiteral("-f"),
-                    QStringLiteral("image2pipe"), QStringLiteral("-vcodec"), QStringLiteral("bmp"),
-                    QStringLiteral("-")});
-        if (proc.waitForFinished(2500) && proc.exitCode() == 0) {
-            QByteArray data = proc.readAllStandardOutput();
-            if (!data.isEmpty()) {
-                img.loadFromData(data, "BMP");
+        const char *xdgCache = std::getenv("XDG_CACHE_HOME");
+        std::filesystem::path cacheDir;
+        if (xdgCache && xdgCache[0] != '\0') {
+            cacheDir = std::filesystem::path(xdgCache) / "wwal" / "thumbnails";
+        } else {
+            const char *home = std::getenv("HOME");
+            cacheDir =
+                std::filesystem::path(home ? home : "/tmp") / ".cache" / "wwal" / "thumbnails";
+        }
+        QByteArray hash = QCryptographicHash::hash(
+            QByteArray::fromRawData(stdPath.data(), static_cast<qsizetype>(stdPath.size())),
+            QCryptographicHash::Sha256);
+        const std::filesystem::path cachedThumb =
+            cacheDir / (hash.toHex().toStdString() + ".webp");
+        std::error_code ec;
+        if (std::filesystem::exists(cachedThumb, ec)) {
+            img.load(QString::fromStdString(cachedThumb.string()));
+        }
+
+        if (img.isNull()) {
+            // Render immediate procedural placeholder and decode video frame off the GUI thread.
+            QImage placeholder(640, 360, QImage::Format_RGBA8888);
+            QPainter pp(&placeholder);
+            QLinearGradient vgrad(0, 0, 640, 360);
+            vgrad.setColorAt(0.0, QColor(24, 32, 48));
+            vgrad.setColorAt(1.0, QColor(14, 18, 28));
+            pp.fillRect(placeholder.rect(), vgrad);
+            pp.end();
+            setPreviewImage(placeholder);
+
+            const uint64_t reqGen =
+                m_videoLoadGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (m_videoThumbThread.joinable()) {
+                m_videoThumbThread.request_stop();
+                m_videoThumbThread.join();
             }
+            QPointer<GpuPreviewViewport> safeSelf(this);
+            m_videoThumbThread = std::jthread([safeSelf, targetPath, reqGen](std::stop_token st) {
+                if (st.stop_requested()) {
+                    return;
+                }
+                QProcess proc;
+                proc.start(QStringLiteral("ffmpeg"),
+                           {QStringLiteral("-loglevel"), QStringLiteral("error"),
+                            QStringLiteral("-ss"), QStringLiteral("00:00:00.50"),
+                            QStringLiteral("-i"), targetPath, QStringLiteral("-frames:v"),
+                            QStringLiteral("1"), QStringLiteral("-vf"),
+                            QStringLiteral("scale=1280:-1"), QStringLiteral("-f"),
+                            QStringLiteral("image2pipe"), QStringLiteral("-vcodec"),
+                            QStringLiteral("bmp"), QStringLiteral("-")});
+                if (!proc.waitForFinished(2500) || proc.exitCode() != 0 || st.stop_requested()) {
+                    return;
+                }
+                const QByteArray data = proc.readAllStandardOutput();
+                QImage decoded;
+                if (!data.isEmpty()) {
+                    decoded.loadFromData(data, "BMP");
+                }
+                if (decoded.isNull() || !safeSelf || !qApp) {
+                    return;
+                }
+                QMetaObject::invokeMethod(
+                    qApp,
+                    [safeSelf, decoded = std::move(decoded), reqGen]() {
+                        if (safeSelf && safeSelf->m_videoLoadGeneration.load(
+                                            std::memory_order_acquire) == reqGen) {
+                            safeSelf->setPreviewImage(decoded);
+                        }
+                    },
+                    Qt::QueuedConnection);
+            });
+            return true;
         }
     }
 
@@ -723,16 +1134,18 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
 
 void GpuPreviewViewport::clearPreviewImage()
 {
+    m_videoLoadGeneration.fetch_add(1, std::memory_order_acq_rel);
     m_fallbackImage = QImage();
-    if (isValid()) {
-        makeCurrent();
-        if (m_inProcessImageTex != 0) {
-            glDeleteTextures(1, &m_inProcessImageTex);
+    {
+        GlContextScope glScope(this);
+        if (glScope.isReady()) {
+            if (m_inProcessImageTex != 0) {
+                glDeleteTextures(1, &m_inProcessImageTex);
+                m_inProcessImageTex = 0;
+            }
+        } else {
             m_inProcessImageTex = 0;
         }
-        doneCurrent();
-    } else {
-        m_inProcessImageTex = 0;
     }
     m_imageWidth = 0;
     m_imageHeight = 0;
@@ -740,85 +1153,262 @@ void GpuPreviewViewport::clearPreviewImage()
     if (m_previewMode == PreviewMode::InProcessImage) {
         if (m_currentDmaBufFrame.has_value()) {
             m_previewMode = PreviewMode::DmaBufLive;
-        } else if (m_shaderProgram || !m_shaderSource.isEmpty()) {
+        } else if (m_shaderProgram || m_computeShaderProgram || !m_shaderSource.isEmpty()) {
             m_previewMode = PreviewMode::InProcessShader;
         } else {
             m_previewMode = PreviewMode::OfflineEmpty;
         }
     }
+    updateAnimationTimerState();
     update();
+}
+
+bool GpuPreviewViewport::compileShaderInternal(const QString &glslSource, QString *outError)
+{
+    const QString trimmed = glslSource.trimmed();
+    if (trimmed.isEmpty()) {
+        if (outError) {
+            *outError = QStringLiteral("Empty GLSL shader source");
+        }
+        return false;
+    }
+
+    const bool isGles =
+        QOpenGLContext::currentContext() && QOpenGLContext::currentContext()->isOpenGLES();
+
+    auto compileLinkedFragmentProgram = [&](const QString &fragSrc, bool graphVaryings,
+                                            QString *errOut) -> std::unique_ptr<QOpenGLShaderProgram> {
+        struct Variant {
+            const char *vs;
+            QString fs;
+        };
+        std::vector<Variant> attempts;
+        if (graphVaryings) {
+            if (isGles) {
+                attempts.push_back({kGraphVertexShaderEs310, fragSrc});
+                attempts.push_back({kGraphVertexShaderEs300, convertEs310ToEs300(fragSrc)});
+            } else {
+                attempts.push_back({kGraphVertexShaderCore330, convertEsFragmentToCore330(fragSrc)});
+                attempts.push_back({kGraphVertexShaderEs310, fragSrc});
+            }
+        } else {
+            if (isGles) {
+                attempts.push_back({kBlitVertexShader, fragSrc});
+                if (fragSrc.contains(QLatin1String("#version 310 es"))) {
+                    attempts.push_back({kGraphVertexShaderEs310, fragSrc});
+                    attempts.push_back({kBlitVertexShader, convertEs310ToEs300(fragSrc)});
+                }
+            } else {
+                attempts.push_back({kBlitVertexShaderCore, convertEsFragmentToCore330(fragSrc)});
+                attempts.push_back({kBlitVertexShader, fragSrc});
+            }
+        }
+
+        QString lastLog;
+        for (const auto &attempt : attempts) {
+            auto prog = std::make_unique<QOpenGLShaderProgram>(this);
+            if (!prog->addShaderFromSourceCode(QOpenGLShader::Vertex, attempt.vs)) {
+                lastLog = prog->log();
+                continue;
+            }
+            if (!prog->addShaderFromSourceCode(QOpenGLShader::Fragment, attempt.fs)) {
+                lastLog = prog->log();
+                continue;
+            }
+            if (!prog->link()) {
+                lastLog = prog->log();
+                continue;
+            }
+            return prog;
+        }
+        if (errOut) {
+            *errOut = lastLog;
+        }
+        return nullptr;
+    };
+
+    // 1. Compute Shader support (e.g. #version 310 es / #version 430 with local_size_x + imageStore)
+    if (trimmed.contains(QLatin1String("local_size_x")) &&
+        trimmed.contains(QLatin1String("imageStore"))) {
+        auto csProg = std::make_unique<QOpenGLShaderProgram>(this);
+        if (!csProg->addShaderFromSourceCode(QOpenGLShader::Compute, trimmed) || !csProg->link()) {
+            if (outError) {
+                *outError = csProg->log();
+            }
+            return false;
+        }
+        m_computeShaderProgram = std::move(csProg);
+        m_shaderProgram.reset();
+        for (auto &bp : m_bufferPassPrograms) {
+            bp.reset();
+        }
+        for (auto &pair : m_bufferPassFbos) {
+            pair[0].reset();
+            pair[1].reset();
+        }
+        m_bufferPingPongIdx = 0;
+        return true;
+    }
+
+    // 2. .wwgraph multi-pass / single-pass #pragma Pass GLSL output
+    if (trimmed.contains(QLatin1String("#pragma Pass"))) {
+        const std::vector<GraphPassSource> passes = parseGraphPasses(trimmed);
+        if (passes.empty()) {
+            if (outError) {
+                *outError = QStringLiteral("No shader passes found after #pragma Pass directive");
+            }
+            return false;
+        }
+
+        std::array<std::unique_ptr<QOpenGLShaderProgram>, 4> nextBufferProgs{};
+        std::unique_ptr<QOpenGLShaderProgram> nextImageProg;
+
+        for (const auto &pass : passes) {
+            QString passErr;
+            auto compiled = compileLinkedFragmentProgram(pass.glsl, /*graphVaryings=*/true, &passErr);
+            if (!compiled) {
+                if (outError) {
+                    *outError = passErr;
+                }
+                return false;
+            }
+            if (pass.passIndex >= 0 && pass.passIndex < 4) {
+                nextBufferProgs[static_cast<size_t>(pass.passIndex)] = std::move(compiled);
+            } else {
+                nextImageProg = std::move(compiled);
+            }
+        }
+
+        if (!nextImageProg) {
+            // If a graph only emitted buffer passes, promote the highest active buffer pass to screen
+            for (int i = 3; i >= 0; --i) {
+                if (nextBufferProgs[static_cast<size_t>(i)]) {
+                    nextImageProg = std::move(nextBufferProgs[static_cast<size_t>(i)]);
+                    break;
+                }
+            }
+        }
+
+        m_computeShaderProgram.reset();
+        m_bufferPassPrograms = std::move(nextBufferProgs);
+        m_shaderProgram = std::move(nextImageProg);
+        m_bufferPingPongIdx = 0;
+        for (size_t i = 0; i < 4; ++i) {
+            for (size_t slot = 0; slot < 2; ++slot) {
+                if (m_bufferPassPrograms[i] && m_bufferPassFbos[i][slot] &&
+                    m_bufferPassFbos[i][slot]->bind()) {
+                    glViewport(0, 0, m_bufferPassFbos[i][slot]->width(),
+                               m_bufferPassFbos[i][slot]->height());
+                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    m_bufferPassFbos[i][slot]->release();
+                }
+            }
+        }
+        ensureNeutralPassTexture();
+        ensureOffscreenFbo(width(), height());
+        ensureBufferPassFbos(width(), height());
+        return true;
+    }
+
+    // 3. Shadertoy (mainImage) or standalone fragment shader
+    QString fullShaderSource;
+    const bool usesGraphVarying = trimmed.contains(QLatin1String("v_TexCoord"));
+    if (trimmed.contains(QLatin1String("mainImage"))) {
+        const char *preamble = isGles ? kShadertoyPreamble : kShadertoyPreambleCore;
+        fullShaderSource =
+            QString::fromUtf8(preamble) + trimmed + QString::fromUtf8(kShadertoyEpilogue);
+    } else if (trimmed.contains(QLatin1String("#version"))) {
+        fullShaderSource = trimmed;
+    } else {
+        const char *preamble = isGles ? kShadertoyPreamble : kShadertoyPreambleCore;
+        fullShaderSource = QString::fromUtf8(preamble) + trimmed;
+    }
+
+    auto program = compileLinkedFragmentProgram(fullShaderSource, usesGraphVarying, outError);
+    if (!program) {
+        return false;
+    }
+
+    m_computeShaderProgram.reset();
+    for (auto &bp : m_bufferPassPrograms) {
+        bp.reset();
+    }
+    for (auto &pair : m_bufferPassFbos) {
+        pair[0].reset();
+        pair[1].reset();
+    }
+    m_bufferPingPongIdx = 0;
+    m_shaderProgram = std::move(program);
+    ensureNeutralPassTexture();
+    ensureOffscreenFbo(width(), height());
+    return true;
 }
 
 bool GpuPreviewViewport::setPreviewShader(const QString &glslSource, QString *outError)
 {
+    if (glslSource.trimmed().isEmpty()) {
+        if (outError) {
+            *outError = QStringLiteral("Empty GLSL shader source");
+        }
+        return false;
+    }
+
     if (!isValid()) {
         m_shaderSource = glslSource;
         m_shaderTimer.restart();
         m_lastFrameTimeNs = 0;
         m_shaderFrameIndex = 0;
         m_previewMode = PreviewMode::InProcessShader;
+        updateAnimationTimerState();
         update();
         return true;
     }
 
-    makeCurrent();
-
-    QString fullShaderSource;
-    if (glslSource.contains(QLatin1String("mainImage"))) {
-        fullShaderSource = QString::fromUtf8(kShadertoyPreamble) + glslSource +
-                           QString::fromUtf8(kShadertoyEpilogue);
-    } else if (glslSource.contains(QLatin1String("#version"))) {
-        fullShaderSource = glslSource;
-    } else {
-        fullShaderSource = QString::fromUtf8(kShadertoyPreamble) + glslSource;
+    {
+        GlContextScope glScope(this);
+        if (!glScope.isReady() || !compileShaderInternal(glslSource, outError)) {
+            return false;
+        }
     }
 
-    auto program = std::make_unique<QOpenGLShaderProgram>(this);
-    if (!program->addShaderFromSourceCode(QOpenGLShader::Vertex, kBlitVertexShader)) {
-        if (outError) {
-            *outError = program->log();
-        }
-        return false;
-    }
-    if (!program->addShaderFromSourceCode(QOpenGLShader::Fragment, fullShaderSource)) {
-        if (outError) {
-            *outError = program->log();
-        }
-        return false;
-    }
-    if (!program->link()) {
-        if (outError) {
-            *outError = program->log();
-        }
-        return false;
-    }
-
-    m_shaderProgram = std::move(program);
     m_shaderSource = glslSource;
     m_shaderTimer.restart();
     m_lastFrameTimeNs = 0;
     m_shaderFrameIndex = 0;
     m_previewMode = PreviewMode::InProcessShader;
-
-    ensureOffscreenFbo(width(), height());
+    updateAnimationTimerState();
     update();
     return true;
 }
 
 void GpuPreviewViewport::clearPreviewShader()
 {
-    m_shaderProgram.reset();
+    {
+        GlContextScope glScope(this);
+        m_shaderProgram.reset();
+        m_computeShaderProgram.reset();
+        for (auto &bp : m_bufferPassPrograms) {
+            bp.reset();
+        }
+        for (auto &pair : m_bufferPassFbos) {
+            pair[0].reset();
+            pair[1].reset();
+        }
+        m_bufferPingPongIdx = 0;
+    }
     m_shaderSource.clear();
 
     if (m_previewMode == PreviewMode::InProcessShader) {
         if (m_currentDmaBufFrame.has_value()) {
             m_previewMode = PreviewMode::DmaBufLive;
-        } else if (m_inProcessImageTex != 0) {
+        } else if (m_inProcessImageTex != 0 || !m_fallbackImage.isNull()) {
             m_previewMode = PreviewMode::InProcessImage;
         } else {
             m_previewMode = PreviewMode::OfflineEmpty;
         }
     }
+    updateAnimationTimerState();
     update();
 }
 
@@ -926,6 +1516,7 @@ void GpuPreviewViewport::setParallaxEnabled(bool enabled)
             m_currentTiltX = 0.0f;
             m_currentTiltY = 0.0f;
         }
+        updateAnimationTimerState();
         emit parallaxToggled(enabled);
         update();
     }
@@ -974,102 +1565,231 @@ void GpuPreviewViewport::setAvailableMonitors(const QStringList &monitors)
     update();
 }
 
-void GpuPreviewViewport::renderInProcessShaderPass()
+void GpuPreviewViewport::applyShaderUniforms(QOpenGLShaderProgram &prog, float fboW, float fboH,
+                                             float timeSec, float timeDeltaSec, int activeWritePass)
 {
-    if (!m_shaderProgram) {
-        return;
-    }
-
-    ensureOffscreenFbo(width(), height());
-    m_offscreenFbo->bind();
-
-    glViewport(0, 0, m_offscreenFbo->width(), m_offscreenFbo->height());
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    m_shaderProgram->bind();
+    const float safeH = std::max(1.0f, fboH);
+    const float safeW = std::max(1.0f, fboW);
 
     // Standard Shadertoy uniforms
-    float fboW = static_cast<float>(m_offscreenFbo->width());
-    float fboH = static_cast<float>(m_offscreenFbo->height());
-    m_shaderProgram->setUniformValue("iResolution", QVector3D(fboW, fboH, fboW / fboH));
+    prog.setUniformValue("iResolution", QVector3D(safeW, safeH, safeW / safeH));
+    prog.setUniformValue("iTime", timeSec);
+    prog.setUniformValue("iTimeDelta", timeDeltaSec);
+    prog.setUniformValue("iFrame", m_shaderFrameIndex);
+    prog.setUniformValue("iMouse",
+                         QVector4D(static_cast<float>(m_mouseGlCoord.x()),
+                                   static_cast<float>(m_mouseGlCoord.y()),
+                                   static_cast<float>(m_mouseClickCoord.x()),
+                                   static_cast<float>(m_mouseClickCoord.y())));
 
-    qint64 nowNs = m_shaderTimer.nsecsElapsed();
-    float timeSec = static_cast<float>(nowNs) / 1e9f;
-    float timeDeltaSec = (m_lastFrameTimeNs > 0)
-                             ? static_cast<float>(nowNs - m_lastFrameTimeNs) / 1e9f
-                             : (1.0f / static_cast<float>(m_targetFps));
-    m_lastFrameTimeNs = nowNs;
+    const QDateTime dt = QDateTime::currentDateTime();
+    const float secOfDay = dt.time().msecsSinceStartOfDay() / 1000.0f;
+    prog.setUniformValue("iDate",
+                         QVector4D(static_cast<float>(dt.date().year()),
+                                   static_cast<float>(dt.date().month()),
+                                   static_cast<float>(dt.date().day()), secOfDay));
 
-    m_shaderProgram->setUniformValue("iTime", timeSec);
-    m_shaderProgram->setUniformValue("iTimeDelta", timeDeltaSec);
-    m_shaderProgram->setUniformValue("iFrame", m_shaderFrameIndex++);
+    // Standard wwald / .wwgraph uniforms
+    prog.setUniformValue("u_Time", timeSec);
+    prog.setUniformValue("u_Resolution", QVector2D(safeW, safeH));
+    const float ptrX =
+        std::clamp(static_cast<float>(m_mouseGlCoord.x()) / std::max(1.0f, static_cast<float>(width())),
+                   0.0f, 1.0f);
+    const float ptrY =
+        std::clamp(static_cast<float>(m_mouseGlCoord.y()) / std::max(1.0f, static_cast<float>(height())),
+                   0.0f, 1.0f);
+    prog.setUniformValue("u_Pointer", QVector2D(ptrX, ptrY));
 
-    m_shaderProgram->setUniformValue("iMouse",
-                                     QVector4D(static_cast<float>(m_mouseGlCoord.x()),
-                                               static_cast<float>(m_mouseGlCoord.y()),
-                                               static_cast<float>(m_mouseClickCoord.x()),
-                                               static_cast<float>(m_mouseClickCoord.y())));
+    static const QVector4D kZeroAudio[4] = {
+        QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
+        QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
+        QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
+        QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
+    };
+    const int audioLoc = prog.uniformLocation("u_AudioBands");
+    if (audioLoc >= 0) {
+        prog.setUniformValueArray(audioLoc, kZeroAudio, 4);
+    }
 
-    QDateTime dt = QDateTime::currentDateTime();
-    float secOfDay = dt.time().msecsSinceStartOfDay() / 1000.0f;
-    m_shaderProgram->setUniformValue("iDate",
-                                     QVector4D(static_cast<float>(dt.date().year()),
-                                               static_cast<float>(dt.date().month()),
-                                               static_cast<float>(dt.date().day()), secOfDay));
+    ensureNeutralPassTexture();
+    const GLuint fallbackSourceTex =
+        (m_inProcessImageTex != 0) ? m_inProcessImageTex : m_neutralPassTex;
+    const int readSlot = m_bufferPingPongIdx & 1;
+    const int writeSlot = 1 - readSlot;
+    GLuint passTex[5] = {
+        fallbackSourceTex, m_neutralPassTex, m_neutralPassTex, m_neutralPassTex, m_neutralPassTex,
+    };
+    for (int u = 0; u < 4; ++u) {
+        const int slot = (u < activeWritePass) ? writeSlot : readSlot;
+        const auto &fbo = m_bufferPassFbos[static_cast<size_t>(u)][static_cast<size_t>(slot)];
+        if (fbo && fbo->texture() != 0) {
+            passTex[u] = fbo->texture();
+        }
+    }
+    static constexpr const char *kPassSamplerNames[5] = {
+        "u_BufferA", "u_BufferB", "u_BufferC", "u_BufferD", "u_DepthMap",
+    };
+    for (int unit = 0; unit < 5; ++unit) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        glBindTexture(GL_TEXTURE_2D, passTex[unit]);
+        prog.setUniformValue(kPassSamplerNames[unit], unit);
+    }
+    glActiveTexture(GL_TEXTURE0);
 
-    // Custom inspector uniforms
+    // Custom inspector & graph node constant uniforms
     for (const auto &[name, val] : m_customUniforms) {
         const char *cName = name.c_str();
         switch (val.type) {
         case ShaderUniformValue::Type::Float:
             if (!val.fVals.empty())
-                m_shaderProgram->setUniformValue(cName, val.fVals[0]);
+                prog.setUniformValue(cName, val.fVals[0]);
             break;
         case ShaderUniformValue::Type::Vec2:
             if (val.fVals.size() >= 2)
-                m_shaderProgram->setUniformValue(cName, QVector2D(val.fVals[0], val.fVals[1]));
+                prog.setUniformValue(cName, QVector2D(val.fVals[0], val.fVals[1]));
             break;
         case ShaderUniformValue::Type::Vec3:
             if (val.fVals.size() >= 3)
-                m_shaderProgram->setUniformValue(
-                    cName, QVector3D(val.fVals[0], val.fVals[1], val.fVals[2]));
+                prog.setUniformValue(cName, QVector3D(val.fVals[0], val.fVals[1], val.fVals[2]));
             break;
         case ShaderUniformValue::Type::Vec4:
             if (val.fVals.size() >= 4)
-                m_shaderProgram->setUniformValue(
+                prog.setUniformValue(
                     cName, QVector4D(val.fVals[0], val.fVals[1], val.fVals[2], val.fVals[3]));
             break;
         case ShaderUniformValue::Type::Int:
             if (!val.iVals.empty())
-                m_shaderProgram->setUniformValue(cName, val.iVals[0]);
+                prog.setUniformValue(cName, val.iVals[0]);
             break;
         case ShaderUniformValue::Type::Mat4:
-            m_shaderProgram->setUniformValue(cName, val.matVal);
+            prog.setUniformValue(cName, val.matVal);
             break;
         }
     }
 
-    // Fullscreen identity quad for offscreen pass
     QMatrix4x4 ident;
-    m_shaderProgram->setUniformValue("u_mvp", ident);
+    prog.setUniformValue("u_mvp", ident);
+}
 
-    m_quadVao.bind();
-    m_quadVbo.bind();
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                          reinterpret_cast<void *>(offsetof(Vertex, x)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                          reinterpret_cast<void *>(offsetof(Vertex, u)));
-    glDrawArrays(GL_TRIANGLES, 0, 6);
-    glDisableVertexAttribArray(1);
-    glDisableVertexAttribArray(0);
-    m_quadVbo.release();
-    m_quadVao.release();
+void GpuPreviewViewport::renderInProcessShaderPass()
+{
+    const qint64 nowNs = m_shaderTimer.nsecsElapsed();
+    const float timeSec = static_cast<float>(nowNs) / 1e9f;
+    const float timeDeltaSec = (m_lastFrameTimeNs > 0)
+                                   ? static_cast<float>(nowNs - m_lastFrameTimeNs) / 1e9f
+                                   : (1.0f / static_cast<float>(std::max(1, m_targetFps)));
+    m_lastFrameTimeNs = nowNs;
 
+    if (m_computeShaderProgram && QOpenGLContext::currentContext()) {
+        QOpenGLContext *ctx = QOpenGLContext::currentContext();
+        auto texStorage2D =
+            reinterpret_cast<GlTexStorage2DProc>(ctx->getProcAddress("glTexStorage2D"));
+        auto bindImageTex =
+            reinterpret_cast<GlBindImageTextureProc>(ctx->getProcAddress("glBindImageTexture"));
+        auto dispatchCompute =
+            reinterpret_cast<GlDispatchComputeProc>(ctx->getProcAddress("glDispatchCompute"));
+        auto memoryBarrier =
+            reinterpret_cast<GlMemoryBarrierProc>(ctx->getProcAddress("glMemoryBarrier"));
+
+        const int targetW = std::clamp(width(), 64, 7680);
+        const int targetH = std::clamp(height(), 64, 4320);
+        if (texStorage2D && bindImageTex && dispatchCompute && memoryBarrier) {
+            if (m_computeOutputTex == 0 || m_computeTexWidth != targetW ||
+                m_computeTexHeight != targetH) {
+                if (m_computeOutputTex != 0) {
+                    glDeleteTextures(1, &m_computeOutputTex);
+                    m_computeOutputTex = 0;
+                }
+                glGenTextures(1, &m_computeOutputTex);
+                glBindTexture(GL_TEXTURE_2D, m_computeOutputTex);
+                texStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, targetW, targetH);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                m_computeTexWidth = targetW;
+                m_computeTexHeight = targetH;
+            }
+
+            m_computeShaderProgram->bind();
+            applyShaderUniforms(*m_computeShaderProgram, static_cast<float>(targetW),
+                                static_cast<float>(targetH), timeSec, timeDeltaSec);
+            bindImageTex(1, m_computeOutputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+            dispatchCompute(static_cast<GLuint>((targetW + 15) / 16),
+                            static_cast<GLuint>((targetH + 15) / 16), 1u);
+            memoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+            m_computeShaderProgram->release();
+            m_shaderFrameIndex++;
+        }
+        return;
+    }
+
+    if (!m_shaderProgram) {
+        return;
+    }
+
+    ensureOffscreenFbo(width(), height());
+    ensureBufferPassFbos(width(), height());
+
+    auto drawFullscreenQuad = [this]() {
+        m_quadVao.bind();
+        m_quadVbo.bind();
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+                              reinterpret_cast<void *>(offsetof(Vertex, x)));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+                              reinterpret_cast<void *>(offsetof(Vertex, u)));
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glDisableVertexAttribArray(1);
+        glDisableVertexAttribArray(0);
+        m_quadVbo.release();
+        m_quadVao.release();
+    };
+
+    const int writeSlot = 1 - (m_bufferPingPongIdx & 1);
+
+    // Render BUFFER_A..BUFFER_D into writeSlot while sampling upstream passes from writeSlot and
+    // self/downstream feedback passes from readSlot to prevent FBO feedback loops.
+    for (size_t i = 0; i < 4; ++i) {
+        auto &writeFbo = m_bufferPassFbos[i][static_cast<size_t>(writeSlot)];
+        if (!m_bufferPassPrograms[i] || !writeFbo) {
+            continue;
+        }
+        writeFbo->bind();
+        const float bw = static_cast<float>(writeFbo->width());
+        const float bh = static_cast<float>(writeFbo->height());
+        glViewport(0, 0, writeFbo->width(), writeFbo->height());
+
+        m_bufferPassPrograms[i]->bind();
+        applyShaderUniforms(*m_bufferPassPrograms[i], bw, bh, timeSec, timeDeltaSec,
+                            static_cast<int>(i));
+        drawFullscreenQuad();
+        m_bufferPassPrograms[i]->release();
+        writeFbo->release();
+    }
+
+    m_offscreenFbo->bind();
+    const float fboW = static_cast<float>(m_offscreenFbo->width());
+    const float fboH = static_cast<float>(m_offscreenFbo->height());
+    glViewport(0, 0, m_offscreenFbo->width(), m_offscreenFbo->height());
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    m_shaderProgram->bind();
+    applyShaderUniforms(*m_shaderProgram, fboW, fboH, timeSec, timeDeltaSec, 4);
+    drawFullscreenQuad();
     m_shaderProgram->release();
     m_offscreenFbo->release();
+
+    m_bufferPingPongIdx ^= 1;
+
+    for (int unit = 4; unit >= 0; --unit) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    m_shaderFrameIndex++;
 }
 
 float GpuPreviewViewport::calculateGuideAspect() const noexcept
@@ -1148,6 +1868,10 @@ void GpuPreviewViewport::paintGL()
     if (m_previewMode == PreviewMode::InProcessImage && m_inProcessImageTex == 0 &&
         !m_fallbackImage.isNull()) {
         QImage formatted = m_fallbackImage.convertToFormat(QImage::Format_RGBA8888);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+#ifdef GL_UNPACK_ROW_LENGTH
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
         glGenTextures(1, &m_inProcessImageTex);
         glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0, GL_RGBA,
@@ -1177,8 +1901,14 @@ void GpuPreviewViewport::paintGL()
             }
         }
     } else if (m_previewMode == PreviewMode::InProcessShader) {
+        if (!m_shaderProgram && !m_computeShaderProgram && !m_shaderSource.isEmpty()) {
+            (void)compileShaderInternal(m_shaderSource, nullptr);
+        }
         renderInProcessShaderPass();
-        if (m_offscreenFbo) {
+        if (m_computeShaderProgram && m_computeOutputTex != 0) {
+            activeTex = m_computeOutputTex;
+            flipY = 0;
+        } else if (m_offscreenFbo) {
             activeTex = m_offscreenFbo->texture();
             flipY = 0; // FBO is already in OpenGL bottom-left origin coordinates
         }
@@ -1269,11 +1999,8 @@ void GpuPreviewViewport::paintGL()
 
     QRectF displayRect = computeContentDisplayRect();
 
-    if (activeTex == 0) {
+    if (activeTex == 0 || !m_blitProgram) {
         drawFallbackBackdrop(painter, displayRect);
-    } else if (m_previewMode == PreviewMode::InProcessImage && !m_fallbackImage.isNull() &&
-               !m_parallaxEnabled) {
-        painter.drawImage(displayRect, m_fallbackImage);
     }
 
     if (m_showSafeGuides && m_aspectRatioGuide != AspectRatioGuide::None) {
@@ -1773,6 +2500,7 @@ void GpuPreviewViewport::mouseMoveEvent(QMouseEvent *event)
         if (halfW > 1.0f && halfH > 1.0f) {
             m_targetTiltX = std::clamp((event->position().x() - halfW) / halfW, -1.0, 1.0);
             m_targetTiltY = std::clamp((event->position().y() - halfH) / halfH, -1.0, 1.0);
+            updateAnimationTimerState();
         }
     }
 
@@ -1831,9 +2559,24 @@ void GpuPreviewViewport::leaveEvent(QEvent *event)
     if (m_parallaxEnabled) {
         m_targetTiltX = 0.0f;
         m_targetTiltY = 0.0f;
+        updateAnimationTimerState();
     }
     update();
     QOpenGLWidget::leaveEvent(event);
+}
+
+void GpuPreviewViewport::showEvent(QShowEvent *event)
+{
+    QOpenGLWidget::showEvent(event);
+    updateAnimationTimerState();
+}
+
+void GpuPreviewViewport::hideEvent(QHideEvent *event)
+{
+    if (m_animationTimer && m_animationTimer->isActive()) {
+        m_animationTimer->stop();
+    }
+    QOpenGLWidget::hideEvent(event);
 }
 
 void GpuPreviewViewport::onApplyClicked() { emit applyRequested(m_selectedMonitor); }

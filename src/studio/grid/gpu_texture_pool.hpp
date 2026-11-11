@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <array>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -22,14 +23,16 @@ namespace wwal::studio {
 
 struct PboUploadQueue {
     GLuint pbo_ids[2]{0, 0};
+    std::array<size_t, 2> pbo_capacities{0, 0};
     uint32_t active_pbo{0};
-    size_t buffer_size{384 * 216 * 4}; // 331,776 bytes per thumbnail
+    size_t buffer_size{((384 + 3) / 4) * ((216 + 3) / 4) * 8};
     bool initialized{false};
 
-    void init(QOpenGLExtraFunctions *gl);
+    void init(QOpenGLExtraFunctions *gl, size_t initial_bytes);
     void destroy(QOpenGLExtraFunctions *gl);
-    void uploadAsync(QOpenGLExtraFunctions *gl, const uint8_t *decoded_rgba,
-                     GLuint target_tex_layer, GLuint tex_array_id);
+    void uploadAsync(QOpenGLExtraFunctions *gl, const uint8_t *payload, size_t payload_bytes,
+                     GLuint target_tex_layer, GLuint tex_array_id, bool is_etc2,
+                     GLenum internal_fmt);
 };
 
 struct TexturePoolStats {
@@ -47,11 +50,13 @@ class GpuTexturePool {
     static constexpr uint32_t THUMB_HEIGHT = 216;
     static constexpr size_t BYTES_PER_PIXEL = 4;
     static constexpr size_t FRAME_SIZE_BYTES =
-        THUMB_WIDTH * THUMB_HEIGHT * BYTES_PER_PIXEL;                // 331,776 bytes
+        THUMB_WIDTH * THUMB_HEIGHT * BYTES_PER_PIXEL; // 331,776 bytes
+    static constexpr size_t ETC2_FRAME_SIZE_BYTES =
+        ((THUMB_WIDTH + 3) / 4) * ((THUMB_HEIGHT + 3) / 4) * 8u;     // 41,472 bytes
     static constexpr size_t STAGING_BUFFER_SIZE = 128 * 1024 * 1024; // 128 MB L2 CPU ringbuffer
     static constexpr size_t STAGING_SLOT_COUNT =
         STAGING_BUFFER_SIZE / FRAME_SIZE_BYTES;         // ~404 slots
-    static constexpr int DEFAULT_MAX_VRAM_SLOTS = 1500; // <= 1,540 slots (512 MB VRAM cap)
+    static constexpr int DEFAULT_MAX_VRAM_SLOTS = 1500; // <= 1,540 slots (62.2 MB ETC2 VRAM)
 
     explicit GpuTexturePool(int max_vram_slots = DEFAULT_MAX_VRAM_SLOTS);
     ~GpuTexturePool();
@@ -65,9 +70,12 @@ class GpuTexturePool {
 
     [[nodiscard]] GLuint textureArrayId() const noexcept { return m_texArrayId; }
     [[nodiscard]] bool isInitialized() const noexcept { return m_initialized; }
+    [[nodiscard]] bool isArrayEtc2() const noexcept { return m_arrayUsesEtc2; }
+    [[nodiscard]] GLenum arrayInternalFormat() const noexcept { return m_arrayInternalFormat; }
 
     // Notification callback invoked when a background worker completes decoding a thumbnail
     void setThumbnailReadyCallback(std::function<void()> callback);
+    void shutdownWorkers();
 
     // Request texture for an item.
     // If resident: returns layer index (>= 0) and touches LRU.
@@ -83,6 +91,8 @@ class GpuTexturePool {
     [[nodiscard]] bool isTextureReady(uint32_t item_id) const;
     [[nodiscard]] int getLayerIndex(uint32_t item_id) const;
     [[nodiscard]] QImage getThumbnailImage(uint32_t item_id) const;
+    [[nodiscard]] std::shared_ptr<const std::vector<uint8_t>>
+    getCompressedEtc2Blocks(uint32_t item_id) const;
     void touch(uint32_t item_id);
 
     // Evicts all textures from VRAM and cancels background tasks
@@ -98,6 +108,7 @@ class GpuTexturePool {
         bool decode_queued{false};
         bool ready{false};
         QImage thumbnail;
+        std::shared_ptr<const std::vector<uint8_t>> etc2_blocks;
         LruNode *prev{nullptr};
         LruNode *next{nullptr};
     };
@@ -109,6 +120,7 @@ class GpuTexturePool {
         size_t ring_offset{0};
         bool ready_for_upload{false};
         bool decode_succeeded{true};
+        std::shared_ptr<std::vector<uint8_t>> etc2_blocks;
     };
 
     struct WorkerTask {
@@ -122,6 +134,8 @@ class GpuTexturePool {
     int m_maxVramSlots;
     GLuint m_texArrayId{0};
     bool m_initialized{false};
+    bool m_arrayUsesEtc2{true};
+    GLenum m_arrayInternalFormat{0};
     PboUploadQueue m_pboQueue;
 
     // L2: 128 MB Page-Aligned CPU Staging Ringbuffer
