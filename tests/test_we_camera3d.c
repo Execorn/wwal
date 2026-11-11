@@ -230,6 +230,76 @@ static void test_camera_update_and_coc_performance(void)
     assert(avg_us < cam_budget_us && "we_camera3d_update exceeded CPU budget");
 }
 
+static void test_multi_camera_parallax_isolation_and_25d_ortho(void)
+{
+    printf("[+] Testing multi-camera parallax state isolation, 2.5D top-down ortho & f-stop...\n");
+
+    we_camera3d_t cam_a, cam_b, cam_solo;
+    we_camera3d_init_default(&cam_a, 1920.0f, 1080.0f);
+    we_camera3d_init_default(&cam_b, 1920.0f, 1080.0f);
+    we_camera3d_init_default(&cam_solo, 1920.0f, 1080.0f);
+
+    cam_a.parallax_amount[0] = 2.0f;
+    cam_a.parallax_smoothing = 0.15f;
+    cam_b.parallax_amount[0] = 2.0f;
+    cam_b.parallax_smoothing = 0.15f;
+    cam_solo.parallax_amount[0] = 2.0f;
+    cam_solo.parallax_smoothing = 0.15f;
+
+    for (int f = 0; f < 10; ++f) {
+        double t = (double)f * (1.0 / 60.0);
+        float ptr_a = (f == 0) ? 0.5f : 1.0f;
+        float ptr_b = (f == 0) ? 0.5f : 0.0f;
+        we_camera3d_update(&cam_a, t, ptr_a, 0.5f, 16.0f / 9.0f);
+        we_camera3d_update(&cam_b, t, ptr_b, 0.5f, 16.0f / 9.0f);
+    }
+    for (int f = 0; f < 10; ++f) {
+        double t = (double)f * (1.0 / 60.0);
+        float ptr_solo = (f == 0) ? 0.5f : 1.0f;
+        we_camera3d_update(&cam_solo, t, ptr_solo, 0.5f, 16.0f / 9.0f);
+    }
+
+    // cam_a interleaved with cam_b must match cam_solo updated in isolation
+    assert(fabsf(cam_a.view_matrix[8] - cam_solo.view_matrix[8]) < 1e-6f &&
+           fabsf(cam_a.view_matrix[12] - cam_solo.view_matrix[12]) < 1e-5f &&
+           "Multi-camera parallax smoothing state leaked across instances!");
+    assert(cam_a.view_matrix[8] * cam_b.view_matrix[8] < 0.0f &&
+           fabsf(cam_a.view_matrix[8]) > 1e-4f);
+
+    // 2.5D orthographic mode must use top-down Y sign (proj_matrix[5] < 0) matching scene FBOs
+    we_camera3d_t cam_25d;
+    we_camera3d_init_default(&cam_25d, 1920.0f, 1080.0f);
+    cam_25d.projection_mode = WE_PROJ_DEPTH_PARALLAX_25D;
+    we_camera3d_update(&cam_25d, 0.0, 0.0f, 0.0f, 16.0f / 9.0f);
+    assert(cam_25d.proj_matrix[5] < 0.0f && "2.5D ortho must use top-down FBO Y convention");
+
+    // Keyframe aperture_fstop must modulate dof_bokeh_radius_px when DOF is enabled
+    we_camera3d_t cam_dof;
+    we_camera3d_init_default(&cam_dof, 1920.0f, 1080.0f);
+    cam_dof.dof_enabled = 1.0f;
+    cam_dof.dof_bokeh_radius_px = 0.0f;
+    cam_dof.path_enabled = 1u;
+    cam_dof.path_loop_mode = WE_CAM_PATH_ONCE;
+    cam_dof.keyframe_count = 2u;
+    cam_dof.keyframes[0].time_sec = 0.0f;
+    cam_dof.keyframes[0].position[2] = 5.0f;
+    cam_dof.keyframes[0].orientation_quat[3] = 1.0f;
+    cam_dof.keyframes[0].fov_deg = 60.0f;
+    cam_dof.keyframes[0].focal_distance = 8.0f;
+    cam_dof.keyframes[0].aperture_fstop = 2.8f;
+    cam_dof.keyframes[1] = cam_dof.keyframes[0];
+    cam_dof.keyframes[1].time_sec = 1.0f;
+    cam_dof.keyframes[1].aperture_fstop = 11.2f;
+
+    we_camera3d_update(&cam_dof, 0.0, 0.0f, 0.0f, 16.0f / 9.0f);
+    float bokeh_wide = cam_dof.dof_bokeh_radius_px;
+    we_camera3d_update(&cam_dof, 1.0, 0.0f, 0.0f, 16.0f / 9.0f);
+    float bokeh_narrow = cam_dof.dof_bokeh_radius_px;
+    assert(bokeh_wide > bokeh_narrow && bokeh_narrow > 0.0f);
+
+    printf("    -> Multi-camera parallax isolation, 2.5D ortho & f-stop bokeh verified.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -241,6 +311,7 @@ int main(void)
     test_normal_matrix_cofactor();
     test_std140_ubo_lighting_pack();
     test_camera_update_and_coc_performance();
+    test_multi_camera_parallax_isolation_and_25d_ortho();
 
     printf("==========================================================\n");
     printf("  >>> ALL WE_CAMERA3D TESTS PASSED CLEANLY (100%%) <<<\n");

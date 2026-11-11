@@ -7,6 +7,8 @@
 #include <ctype.h>
 #include <dlfcn.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +25,33 @@
 #include <libavutil/mem.h>
 #include <libavutil/samplefmt.h>
 #endif
+
+static uint32_t safe_f32_to_u32(float v, uint32_t max_val)
+{
+    if (!isfinite(v) || v <= 0.0f) {
+        return 0u;
+    }
+    double dv = (double)v;
+    if (dv >= (double)max_val) {
+        return max_val;
+    }
+    return (uint32_t)dv;
+}
+
+static int32_t safe_f32_to_i32(float v, int32_t def_val)
+{
+    if (!isfinite(v)) {
+        return def_val;
+    }
+    double dv = (double)v;
+    if (dv <= -2147483648.0) {
+        return INT32_MIN;
+    }
+    if (dv >= 2147483647.0) {
+        return INT32_MAX;
+    }
+    return (int32_t)dv;
+}
 
 static we_blend_mode_t parse_blend_mode(const char *str)
 {
@@ -139,7 +168,12 @@ static void parse_pass_json_overrides(we_material_pass_t *pass, const we_jval_t 
         for (size_t i = 0; i < combos->obj.count; i++) {
             const char *ck = combos->obj.entries[i].key;
             float cv = jval_float(combos->obj.entries[i].val, proj, 0.0f, NULL, 0);
-            pass_set_combo(pass, ck, (int32_t)cv);
+            int32_t ci = 0;
+            if (isfinite(cv)) {
+                float clamped = fminf(fmaxf(cv, -1000000.0f), 1000000.0f);
+                ci = (int32_t)clamped;
+            }
+            pass_set_combo(pass, ck, ci);
         }
     }
 
@@ -419,7 +453,7 @@ static void apply_puppet_layers_json(we_puppet_t *puppet, const we_jval_t *lnode
             snprintf(ly->anim_name, sizeof(ly->anim_name), "%s", aname);
             ly->anim_id = -1;
         } else {
-            ly->anim_id = (int32_t)jval_float(anim_node, proj, 0.0f, NULL, 0);
+            ly->anim_id = safe_f32_to_i32(jval_float(anim_node, proj, 0.0f, NULL, 0), 0);
         }
         const char *name_field = jval_str(jobj_get(it, "name"), NULL);
         if (name_field && name_field[0] != '\0' && ly->anim_name[0] == '\0') {
@@ -486,8 +520,9 @@ static void apply_particle_instance_override(we_particle_sys_t *psys, const we_j
         has_color = true;
     }
 
-    if (count_mul > 0.0f && fabsf(count_mul - 1.0f) > 1e-4f) {
-        uint32_t nc = (uint32_t)((float)psys->max_count * count_mul + 0.5f);
+    if (isfinite(count_mul) && count_mul > 0.0f && fabsf(count_mul - 1.0f) > 1e-4f) {
+        uint32_t nc =
+            safe_f32_to_u32((float)psys->max_count * count_mul + 0.5f, WE_PARTICLE_MAX_CAP);
         if (nc < 1u) {
             nc = 1u;
         }
@@ -501,9 +536,12 @@ static void apply_particle_instance_override(we_particle_sys_t *psys, const we_j
         }
     }
     for (uint32_t e = 0; e < psys->emitter_count; e++) {
-        psys->emitters[e].rate *= rate_mul;
-        if (psys->emitters[e].instantaneous > 0 && count_mul > 0.0f) {
-            uint32_t inst = (uint32_t)((float)psys->emitters[e].instantaneous * count_mul + 0.5f);
+        if (isfinite(rate_mul) && rate_mul >= 0.0f) {
+            psys->emitters[e].rate *= rate_mul;
+        }
+        if (psys->emitters[e].instantaneous > 0 && isfinite(count_mul) && count_mul > 0.0f) {
+            uint32_t inst = safe_f32_to_u32(
+                (float)psys->emitters[e].instantaneous * count_mul + 0.5f, WE_PARTICLE_MAX_CAP);
             psys->emitters[e].instantaneous = inst > 0 ? inst : 1u;
         }
     }
@@ -871,8 +909,10 @@ void apply_scene_script_user_properties(we_scene_t *scene)
         return;
     }
     we_script_env_t env;
-    build_script_env(scene, (uint32_t)scene->ortho_width, (uint32_t)scene->ortho_height,
-                     1.0f / 60.0f, 0.0f, NULL, &env);
+    uint32_t env_w = safe_f32_to_u32(scene->ortho_width, 16384u);
+    uint32_t env_h = safe_f32_to_u32(scene->ortho_height, 16384u);
+    build_script_env(scene, env_w > 0u ? env_w : 1920u, env_h > 0u ? env_h : 1080u, 1.0f / 60.0f,
+                     0.0f, NULL, &env);
 
     for (uint32_t i = 0; i < scene->object_count; i++) {
         we_scene_object_t *obj = &scene->objects[i];
@@ -1132,12 +1172,109 @@ static int64_t we_avio_seek(void *opaque, int64_t offset, int whence)
 static void *we_dlopen_any(const char *const *names, size_t count)
 {
     for (size_t i = 0; i < count; ++i) {
-        void *h = dlopen(names[i], RTLD_LAZY | RTLD_LOCAL);
+        void *h = dlopen(names[i], RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
         if (h) {
             return h;
         }
     }
     return NULL;
+}
+
+typedef struct {
+    void *(*av_malloc)(size_t);
+    void (*av_freep)(void *);
+    AVFrame *(*av_frame_alloc)(void);
+    void (*av_frame_free)(AVFrame **);
+    void (*av_frame_unref)(AVFrame *);
+    const AVCodec *(*avcodec_find_decoder)(enum AVCodecID);
+    AVCodecContext *(*avcodec_alloc_context3)(const AVCodec *);
+    void (*avcodec_free_context)(AVCodecContext **);
+    int (*avcodec_parameters_to_context)(AVCodecContext *, const AVCodecParameters *);
+    int (*avcodec_open2)(AVCodecContext *, const AVCodec *, AVDictionary **);
+    int (*avcodec_send_packet)(AVCodecContext *, const AVPacket *);
+    int (*avcodec_receive_frame)(AVCodecContext *, AVFrame *);
+    AVPacket *(*av_packet_alloc)(void);
+    void (*av_packet_free)(AVPacket **);
+    void (*av_packet_unref)(AVPacket *);
+    AVIOContext *(*avio_alloc_context)(unsigned char *, int, int, void *,
+                                       int (*)(void *, uint8_t *, int),
+                                       int (*)(void *, const uint8_t *, int),
+                                       int64_t (*)(void *, int64_t, int));
+    void (*avio_context_free)(AVIOContext **);
+    AVFormatContext *(*avformat_alloc_context)(void);
+    int (*avformat_open_input)(AVFormatContext **, const char *, const AVInputFormat *,
+                               AVDictionary **);
+    int (*avformat_find_stream_info)(AVFormatContext *, AVDictionary **);
+    int (*av_find_best_stream)(AVFormatContext *, enum AVMediaType, int, int, const AVCodec **,
+                               int);
+    int (*av_read_frame)(AVFormatContext *, AVPacket *);
+    void (*avformat_close_input)(AVFormatContext **);
+    bool ready;
+} we_libav_audio_api_t;
+
+static pthread_once_t s_libav_audio_once = PTHREAD_ONCE_INIT;
+static we_libav_audio_api_t s_libav_audio_api;
+
+static void init_libav_audio_api_once(void)
+{
+    static const char *const avformat_names[] = {"libavformat.so.63", "libavformat.so.62",
+                                                 "libavformat.so.61", "libavformat.so.60",
+                                                 "libavformat.so.59", "libavformat.so"};
+    static const char *const avcodec_names[] = {"libavcodec.so.63", "libavcodec.so.62",
+                                                "libavcodec.so.61", "libavcodec.so.60",
+                                                "libavcodec.so.59", "libavcodec.so"};
+    static const char *const avutil_names[] = {"libavutil.so.61", "libavutil.so.60",
+                                               "libavutil.so.59", "libavutil.so.58",
+                                               "libavutil.so.57", "libavutil.so"};
+
+    void *h_avf = we_dlopen_any(avformat_names, sizeof(avformat_names) / sizeof(avformat_names[0]));
+    void *h_avc = we_dlopen_any(avcodec_names, sizeof(avcodec_names) / sizeof(avcodec_names[0]));
+    void *h_avu = we_dlopen_any(avutil_names, sizeof(avutil_names) / sizeof(avutil_names[0]));
+    if (!h_avf || !h_avc || !h_avu) {
+        return;
+    }
+
+    *(void **)(&s_libav_audio_api.av_malloc) = dlsym(h_avu, "av_malloc");
+    *(void **)(&s_libav_audio_api.av_freep) = dlsym(h_avu, "av_freep");
+    *(void **)(&s_libav_audio_api.av_frame_alloc) = dlsym(h_avu, "av_frame_alloc");
+    *(void **)(&s_libav_audio_api.av_frame_free) = dlsym(h_avu, "av_frame_free");
+    *(void **)(&s_libav_audio_api.av_frame_unref) = dlsym(h_avu, "av_frame_unref");
+
+    *(void **)(&s_libav_audio_api.avcodec_find_decoder) = dlsym(h_avc, "avcodec_find_decoder");
+    *(void **)(&s_libav_audio_api.avcodec_alloc_context3) = dlsym(h_avc, "avcodec_alloc_context3");
+    *(void **)(&s_libav_audio_api.avcodec_free_context) = dlsym(h_avc, "avcodec_free_context");
+    *(void **)(&s_libav_audio_api.avcodec_parameters_to_context) =
+        dlsym(h_avc, "avcodec_parameters_to_context");
+    *(void **)(&s_libav_audio_api.avcodec_open2) = dlsym(h_avc, "avcodec_open2");
+    *(void **)(&s_libav_audio_api.avcodec_send_packet) = dlsym(h_avc, "avcodec_send_packet");
+    *(void **)(&s_libav_audio_api.avcodec_receive_frame) = dlsym(h_avc, "avcodec_receive_frame");
+    *(void **)(&s_libav_audio_api.av_packet_alloc) = dlsym(h_avc, "av_packet_alloc");
+    *(void **)(&s_libav_audio_api.av_packet_free) = dlsym(h_avc, "av_packet_free");
+    *(void **)(&s_libav_audio_api.av_packet_unref) = dlsym(h_avc, "av_packet_unref");
+
+    *(void **)(&s_libav_audio_api.avio_alloc_context) = dlsym(h_avf, "avio_alloc_context");
+    *(void **)(&s_libav_audio_api.avio_context_free) = dlsym(h_avf, "avio_context_free");
+    *(void **)(&s_libav_audio_api.avformat_alloc_context) = dlsym(h_avf, "avformat_alloc_context");
+    *(void **)(&s_libav_audio_api.avformat_open_input) = dlsym(h_avf, "avformat_open_input");
+    *(void **)(&s_libav_audio_api.avformat_find_stream_info) =
+        dlsym(h_avf, "avformat_find_stream_info");
+    *(void **)(&s_libav_audio_api.av_find_best_stream) = dlsym(h_avf, "av_find_best_stream");
+    *(void **)(&s_libav_audio_api.av_read_frame) = dlsym(h_avf, "av_read_frame");
+    *(void **)(&s_libav_audio_api.avformat_close_input) = dlsym(h_avf, "avformat_close_input");
+
+    s_libav_audio_api.ready =
+        s_libav_audio_api.av_malloc && s_libav_audio_api.av_freep &&
+        s_libav_audio_api.av_frame_alloc && s_libav_audio_api.av_frame_free &&
+        s_libav_audio_api.av_frame_unref && s_libav_audio_api.avcodec_find_decoder &&
+        s_libav_audio_api.avcodec_alloc_context3 && s_libav_audio_api.avcodec_free_context &&
+        s_libav_audio_api.avcodec_parameters_to_context && s_libav_audio_api.avcodec_open2 &&
+        s_libav_audio_api.avcodec_send_packet && s_libav_audio_api.avcodec_receive_frame &&
+        s_libav_audio_api.av_packet_alloc && s_libav_audio_api.av_packet_free &&
+        s_libav_audio_api.av_packet_unref && s_libav_audio_api.avio_alloc_context &&
+        s_libav_audio_api.avio_context_free && s_libav_audio_api.avformat_alloc_context &&
+        s_libav_audio_api.avformat_open_input && s_libav_audio_api.avformat_find_stream_info &&
+        s_libav_audio_api.av_find_best_stream && s_libav_audio_api.av_read_frame &&
+        s_libav_audio_api.avformat_close_input;
 }
 #endif
 
@@ -1148,94 +1285,46 @@ static bool we_audio_decode_ffmpeg_memory(const uint8_t *data, size_t size, floa
     if (!data || size < 4 || !out_stereo_f32 || !out_frame_count) {
         return false;
     }
-    static const char *const avformat_names[] = {"libavformat.so.61", "libavformat.so.60",
-                                                 "libavformat.so.59", "libavformat.so"};
-    static const char *const avcodec_names[] = {"libavcodec.so.61", "libavcodec.so.60",
-                                                "libavcodec.so.59", "libavcodec.so"};
-    static const char *const avutil_names[] = {"libavutil.so.59", "libavutil.so.58",
-                                               "libavutil.so.57", "libavutil.so"};
-
-    void *h_avf = we_dlopen_any(avformat_names, sizeof(avformat_names) / sizeof(avformat_names[0]));
-    void *h_avc = we_dlopen_any(avcodec_names, sizeof(avcodec_names) / sizeof(avcodec_names[0]));
-    void *h_avu = we_dlopen_any(avutil_names, sizeof(avutil_names) / sizeof(avutil_names[0]));
-    if (!h_avf || !h_avc || !h_avu) {
-        if (h_avf)
-            dlclose(h_avf);
-        if (h_avc)
-            dlclose(h_avc);
-        if (h_avu)
-            dlclose(h_avu);
+    pthread_once(&s_libav_audio_once, init_libav_audio_api_once);
+    if (!s_libav_audio_api.ready) {
         return false;
     }
 
-    void *(*p_av_malloc)(size_t) = NULL;
-    void (*p_av_freep)(void *) = NULL;
-    AVFrame *(*p_av_frame_alloc)(void) = NULL;
-    void (*p_av_frame_free)(AVFrame **) = NULL;
-    void (*p_av_frame_unref)(AVFrame *) = NULL;
-
-    const AVCodec *(*p_avcodec_find_decoder)(enum AVCodecID) = NULL;
-    AVCodecContext *(*p_avcodec_alloc_context3)(const AVCodec *) = NULL;
-    void (*p_avcodec_free_context)(AVCodecContext **) = NULL;
-    int (*p_avcodec_parameters_to_context)(AVCodecContext *, const AVCodecParameters *) = NULL;
-    int (*p_avcodec_open2)(AVCodecContext *, const AVCodec *, AVDictionary **) = NULL;
-    int (*p_avcodec_send_packet)(AVCodecContext *, const AVPacket *) = NULL;
-    int (*p_avcodec_receive_frame)(AVCodecContext *, AVFrame *) = NULL;
-    AVPacket *(*p_av_packet_alloc)(void) = NULL;
-    void (*p_av_packet_free)(AVPacket **) = NULL;
-    void (*p_av_packet_unref)(AVPacket *) = NULL;
-
+    void *(*p_av_malloc)(size_t) = s_libav_audio_api.av_malloc;
+    void (*p_av_freep)(void *) = s_libav_audio_api.av_freep;
+    AVFrame *(*p_av_frame_alloc)(void) = s_libav_audio_api.av_frame_alloc;
+    void (*p_av_frame_free)(AVFrame **) = s_libav_audio_api.av_frame_free;
+    void (*p_av_frame_unref)(AVFrame *) = s_libav_audio_api.av_frame_unref;
+    const AVCodec *(*p_avcodec_find_decoder)(enum AVCodecID) =
+        s_libav_audio_api.avcodec_find_decoder;
+    AVCodecContext *(*p_avcodec_alloc_context3)(const AVCodec *) =
+        s_libav_audio_api.avcodec_alloc_context3;
+    void (*p_avcodec_free_context)(AVCodecContext **) = s_libav_audio_api.avcodec_free_context;
+    int (*p_avcodec_parameters_to_context)(AVCodecContext *, const AVCodecParameters *) =
+        s_libav_audio_api.avcodec_parameters_to_context;
+    int (*p_avcodec_open2)(AVCodecContext *, const AVCodec *, AVDictionary **) =
+        s_libav_audio_api.avcodec_open2;
+    int (*p_avcodec_send_packet)(AVCodecContext *, const AVPacket *) =
+        s_libav_audio_api.avcodec_send_packet;
+    int (*p_avcodec_receive_frame)(AVCodecContext *, AVFrame *) =
+        s_libav_audio_api.avcodec_receive_frame;
+    AVPacket *(*p_av_packet_alloc)(void) = s_libav_audio_api.av_packet_alloc;
+    void (*p_av_packet_free)(AVPacket **) = s_libav_audio_api.av_packet_free;
+    void (*p_av_packet_unref)(AVPacket *) = s_libav_audio_api.av_packet_unref;
     AVIOContext *(*p_avio_alloc_context)(
         unsigned char *, int, int, void *, int (*)(void *, uint8_t *, int),
-        int (*)(void *, const uint8_t *, int), int64_t (*)(void *, int64_t, int)) = NULL;
-    void (*p_avio_context_free)(AVIOContext **) = NULL;
-    AVFormatContext *(*p_avformat_alloc_context)(void) = NULL;
+        int (*)(void *, const uint8_t *, int), int64_t (*)(void *, int64_t, int)) =
+        s_libav_audio_api.avio_alloc_context;
+    void (*p_avio_context_free)(AVIOContext **) = s_libav_audio_api.avio_context_free;
+    AVFormatContext *(*p_avformat_alloc_context)(void) = s_libav_audio_api.avformat_alloc_context;
     int (*p_avformat_open_input)(AVFormatContext **, const char *, const AVInputFormat *,
-                                 AVDictionary **) = NULL;
-    int (*p_avformat_find_stream_info)(AVFormatContext *, AVDictionary **) = NULL;
+                                 AVDictionary **) = s_libav_audio_api.avformat_open_input;
+    int (*p_avformat_find_stream_info)(AVFormatContext *, AVDictionary **) =
+        s_libav_audio_api.avformat_find_stream_info;
     int (*p_av_find_best_stream)(AVFormatContext *, enum AVMediaType, int, int, const AVCodec **,
-                                 int) = NULL;
-    int (*p_av_read_frame)(AVFormatContext *, AVPacket *) = NULL;
-    void (*p_avformat_close_input)(AVFormatContext **) = NULL;
-
-    *(void **)(&p_av_malloc) = dlsym(h_avu, "av_malloc");
-    *(void **)(&p_av_freep) = dlsym(h_avu, "av_freep");
-    *(void **)(&p_av_frame_alloc) = dlsym(h_avu, "av_frame_alloc");
-    *(void **)(&p_av_frame_free) = dlsym(h_avu, "av_frame_free");
-    *(void **)(&p_av_frame_unref) = dlsym(h_avu, "av_frame_unref");
-
-    *(void **)(&p_avcodec_find_decoder) = dlsym(h_avc, "avcodec_find_decoder");
-    *(void **)(&p_avcodec_alloc_context3) = dlsym(h_avc, "avcodec_alloc_context3");
-    *(void **)(&p_avcodec_free_context) = dlsym(h_avc, "avcodec_free_context");
-    *(void **)(&p_avcodec_parameters_to_context) = dlsym(h_avc, "avcodec_parameters_to_context");
-    *(void **)(&p_avcodec_open2) = dlsym(h_avc, "avcodec_open2");
-    *(void **)(&p_avcodec_send_packet) = dlsym(h_avc, "avcodec_send_packet");
-    *(void **)(&p_avcodec_receive_frame) = dlsym(h_avc, "avcodec_receive_frame");
-    *(void **)(&p_av_packet_alloc) = dlsym(h_avc, "av_packet_alloc");
-    *(void **)(&p_av_packet_free) = dlsym(h_avc, "av_packet_free");
-    *(void **)(&p_av_packet_unref) = dlsym(h_avc, "av_packet_unref");
-
-    *(void **)(&p_avio_alloc_context) = dlsym(h_avf, "avio_alloc_context");
-    *(void **)(&p_avio_context_free) = dlsym(h_avf, "avio_context_free");
-    *(void **)(&p_avformat_alloc_context) = dlsym(h_avf, "avformat_alloc_context");
-    *(void **)(&p_avformat_open_input) = dlsym(h_avf, "avformat_open_input");
-    *(void **)(&p_avformat_find_stream_info) = dlsym(h_avf, "avformat_find_stream_info");
-    *(void **)(&p_av_find_best_stream) = dlsym(h_avf, "av_find_best_stream");
-    *(void **)(&p_av_read_frame) = dlsym(h_avf, "av_read_frame");
-    *(void **)(&p_avformat_close_input) = dlsym(h_avf, "avformat_close_input");
-
-    if (!p_av_malloc || !p_av_freep || !p_av_frame_alloc || !p_av_frame_free || !p_av_frame_unref ||
-        !p_avcodec_find_decoder || !p_avcodec_alloc_context3 || !p_avcodec_free_context ||
-        !p_avcodec_parameters_to_context || !p_avcodec_open2 || !p_avcodec_send_packet ||
-        !p_avcodec_receive_frame || !p_av_packet_alloc || !p_av_packet_free || !p_av_packet_unref ||
-        !p_avio_alloc_context || !p_avio_context_free || !p_avformat_alloc_context ||
-        !p_avformat_open_input || !p_avformat_find_stream_info || !p_av_find_best_stream ||
-        !p_av_read_frame || !p_avformat_close_input) {
-        dlclose(h_avf);
-        dlclose(h_avc);
-        dlclose(h_avu);
-        return false;
-    }
+                                 int) = s_libav_audio_api.av_find_best_stream;
+    int (*p_av_read_frame)(AVFormatContext *, AVPacket *) = s_libav_audio_api.av_read_frame;
+    void (*p_avformat_close_input)(AVFormatContext **) = s_libav_audio_api.avformat_close_input;
 
     bool ok = false;
     we_avio_mem_t mem_reader = {.data = data, .size = size, .pos = 0};
@@ -1426,9 +1515,6 @@ cleanup:
         }
         p_avio_context_free(&avio_ctx);
     }
-    dlclose(h_avf);
-    dlclose(h_avc);
-    dlclose(h_avu);
     return ok;
 #else
     (void)data;
@@ -1588,8 +1674,10 @@ static void init_scene_scripts(we_scene_t *scene)
         return;
     }
     we_script_env_t env;
-    build_script_env(scene, (uint32_t)scene->ortho_width, (uint32_t)scene->ortho_height,
-                     1.0f / 60.0f, 0.0f, NULL, &env);
+    uint32_t env_w = safe_f32_to_u32(scene->ortho_width, 16384u);
+    uint32_t env_h = safe_f32_to_u32(scene->ortho_height, 16384u);
+    build_script_env(scene, env_w > 0u ? env_w : 1920u, env_h > 0u ? env_h : 1080u, 1.0f / 60.0f,
+                     0.0f, NULL, &env);
 
     for (uint32_t i = 0; i < scene->object_count; i++) {
         we_scene_object_t *obj = &scene->objects[i];
@@ -1699,12 +1787,14 @@ static void init_scene_scripts(we_scene_t *scene)
                         break;
                     case WE_SCRIPT_PROP_TEXT:
                         break;
-                    case WE_SCRIPT_PROP_POINTSIZE:
-                        if ((int32_t)out_val[0] != obj->text_pointsize && out_val[0] >= 4.0f) {
-                            obj->text_pointsize = (int32_t)out_val[0];
+                    case WE_SCRIPT_PROP_POINTSIZE: {
+                        int32_t new_ps = safe_f32_to_i32(out_val[0], 0);
+                        if (new_ps >= 4 && new_ps <= 512 && new_ps != obj->text_pointsize) {
+                            obj->text_pointsize = new_ps;
                             obj->text_dirty = true;
                         }
                         break;
+                    }
                     case WE_SCRIPT_PROP_VOLUME:
                         obj->sound_volume = fminf(fmaxf(out_val[0], 0.0f), 2.0f);
                         break;
@@ -1724,9 +1814,10 @@ static void init_scene_scripts(we_scene_t *scene)
 static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_scene_object_t *obj)
 {
     memset(obj, 0, sizeof(*obj));
-    obj->id = (int32_t)jval_float(jobj_get(onode, "id"), &scene->project, -1.0f, NULL, 0);
+    obj->id =
+        safe_f32_to_i32(jval_float(jobj_get(onode, "id"), &scene->project, -1.0f, NULL, 0), -1);
     obj->parent_id =
-        (int32_t)jval_float(jobj_get(onode, "parent"), &scene->project, -1.0f, NULL, 0);
+        safe_f32_to_i32(jval_float(jobj_get(onode, "parent"), &scene->project, -1.0f, NULL, 0), -1);
     snprintf(obj->name, sizeof(obj->name), "%s", jval_str(jobj_get(onode, "name"), "layer"));
 
     if (obj->parent_id >= 0) {
@@ -1764,8 +1855,8 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
     jval_floats(jobj_get(onode, "color"), &scene->project, obj->color, 3, obj->color_user_prop,
                 sizeof(obj->color_user_prop));
 
-    obj->color_blend_mode =
-        (int32_t)jval_float(jobj_get(onode, "colorBlendMode"), &scene->project, 0.0f, NULL, 0);
+    obj->color_blend_mode = safe_f32_to_i32(
+        jval_float(jobj_get(onode, "colorBlendMode"), &scene->project, 0.0f, NULL, 0), 0);
     obj->visible = jval_bool_resolved(jobj_get(onode, "visible"), &scene->project, true,
                                       obj->visible_user_prop, sizeof(obj->visible_user_prop));
     obj->copybackground =
@@ -1870,7 +1961,8 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
         }
         float ps = jval_float(ps_node, &scene->project, 32.0f, obj->user_prop_pointsize,
                               sizeof(obj->user_prop_pointsize));
-        obj->text_pointsize = (ps >= 4.0f) ? (int32_t)ps : 32;
+        int32_t ps_i = safe_f32_to_i32(ps, 32);
+        obj->text_pointsize = (ps_i >= 4 && ps_i <= 512) ? ps_i : 32;
 
         const char *ha = jval_str(jobj_get(onode, "horizontalalign"), NULL);
         if (!ha && tnode->type == JVAL_OBJ) {
@@ -1889,8 +1981,9 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
             pad_node = jobj_get(tnode, "padding");
         }
         if (pad_node) {
-            int32_t pad_v = (int32_t)jval_float(pad_node, &scene->project, 2.0f, NULL, 0);
-            obj->text_padding = (pad_v >= 0) ? pad_v : 0;
+            int32_t pad_v =
+                safe_f32_to_i32(jval_float(pad_node, &scene->project, 2.0f, NULL, 0), 2);
+            obj->text_padding = (pad_v >= 0 && pad_v <= 512) ? pad_v : 0;
         }
 
         const we_jval_t *obg_node = jobj_get(onode, "opaquebackground");
@@ -2221,10 +2314,12 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
                             if (fname) {
                                 we_rt_fbo_t *rt = &eff->fbos[eff->fbo_count++];
                                 snprintf(rt->name, sizeof(rt->name), "%s", fname);
-                                rt->scale = (uint32_t)jval_float(jobj_get(fn, "scale"),
-                                                                 &scene->project, 1.0f, NULL, 0);
-                                if (rt->scale == 0) {
-                                    rt->scale = 1;
+                                rt->scale =
+                                    safe_f32_to_u32(jval_float(jobj_get(fn, "scale"),
+                                                               &scene->project, 1.0f, NULL, 0),
+                                                    64u);
+                                if (rt->scale == 0u) {
+                                    rt->scale = 1u;
                                 }
                             }
                         }
@@ -2257,8 +2352,12 @@ static void parse_scene_object(we_scene_t *scene, const we_jval_t *onode, we_sce
                                          b++) {
                                         const we_jval_t *bn = binds->arr.items[b];
                                         const char *bname = jval_str(jobj_get(bn, "name"), NULL);
-                                        int32_t bidx = (int32_t)jval_float(
-                                            jobj_get(bn, "index"), &scene->project, 0.0f, NULL, 0);
+                                        int32_t bidx = safe_f32_to_i32(
+                                            jobj_get(bn, "index")
+                                                ? jval_float(jobj_get(bn, "index"), &scene->project,
+                                                             0.0f, NULL, 0)
+                                                : 0.0f,
+                                            -1);
                                         if (bname && bidx >= 0 &&
                                             bidx < (int32_t)WE_MAX_PASS_TEXTURES) {
                                             snprintf(mp->binds[mp->bind_count].target_name,
@@ -2384,8 +2483,10 @@ static void parse_camera_keyframe_paths(we_scene_t *scene, const we_jval_t *path
         if (!jobj_get(kn, "time")) {
             kf->time_sec = jval_float(jobj_get(kn, "time_sec"), &scene->project, (float)k, NULL, 0);
         }
+        if (!isfinite(kf->time_sec)) {
+            kf->time_sec = (float)k;
+        }
 
-        /* Position */
         const we_jval_t *pos_n = jobj_get(kn, "position");
         if (!pos_n) {
             pos_n = jobj_get(kn, "eye");
@@ -2396,8 +2497,12 @@ static void parse_camera_keyframe_paths(we_scene_t *scene, const we_jval_t *path
         if (pos_n) {
             jval_floats(pos_n, &scene->project, kf->position, 3, NULL, 0);
         }
+        for (int c = 0; c < 3; c++) {
+            if (!isfinite(kf->position[c])) {
+                kf->position[c] = scene->camera.eye_pos[c];
+            }
+        }
 
-        /* Orientation: quaternion or Euler angles */
         const we_jval_t *q_n = jobj_get(kn, "orientation");
         if (!q_n) {
             q_n = jobj_get(kn, "quat");
@@ -2411,7 +2516,19 @@ static void parse_camera_keyframe_paths(we_scene_t *scene, const we_jval_t *path
         } else if (q_n && q_n->type == JVAL_ARR && q_n->arr.count == 3) {
             float angles[3] = {0};
             jval_floats(q_n, &scene->project, angles, 3, NULL, 0);
-            /* Euler intrinsic ZYX to unit quaternion */
+            for (int c = 0; c < 3; c++) {
+                if (!isfinite(angles[c])) {
+                    angles[c] = 0.0f;
+                }
+            }
+            /* Workshop camera keyframes commonly author 3-component rotations in degrees. */
+            if (fabsf(angles[0]) > 6.2831855f || fabsf(angles[1]) > 6.2831855f ||
+                fabsf(angles[2]) > 6.2831855f) {
+                const float deg_to_rad = 3.14159265358979323846f / 180.0f;
+                angles[0] *= deg_to_rad;
+                angles[1] *= deg_to_rad;
+                angles[2] *= deg_to_rad;
+            }
             float p = angles[0] * 0.5f, y = angles[1] * 0.5f, r = angles[2] * 0.5f;
             float cp = cosf(p), sp = sinf(p);
             float cy = cosf(y), sy = sinf(y);
@@ -2425,14 +2542,29 @@ static void parse_camera_keyframe_paths(we_scene_t *scene, const we_jval_t *path
             quat_identity(kf->orientation_quat);
         }
 
-        kf->fov_deg =
+        float fov =
             jval_float(jobj_get(kn, "fov"), &scene->project, scene->camera.fov_y_deg, NULL, 0);
-        kf->focal_distance =
-            jval_float(jobj_get(kn, "focaldistance"), &scene->project, 1000.0f, NULL, 0);
-        kf->aperture_fstop = jval_float(jobj_get(kn, "aperture"), &scene->project, 2.8f, NULL, 0);
-        kf->tension = jval_float(jobj_get(kn, "tension"), &scene->project, 0.5f, NULL, 0);
+        kf->fov_deg = (isfinite(fov) && fov > 0.0f) ? fminf(fmaxf(fov, 10.0f), 140.0f) : 60.0f;
+
+        float focal = jval_float(jobj_get(kn, "focaldistance"), &scene->project, 1000.0f, NULL, 0);
+        kf->focal_distance = (isfinite(focal) && focal > 0.0f) ? focal : 1000.0f;
+
+        float aper = jval_float(jobj_get(kn, "aperture"), &scene->project, 2.8f, NULL, 0);
+        kf->aperture_fstop = (isfinite(aper) && aper > 0.0f) ? aper : 2.8f;
+
+        float ten = jval_float(jobj_get(kn, "tension"), &scene->project, 0.5f, NULL, 0);
+        kf->tension = (isfinite(ten) && ten > 0.0f) ? fminf(fmaxf(ten, 0.01f), 1.0f) : 0.5f;
     }
     if (count > 0) {
+        for (uint32_t k = 1; k < count; k++) {
+            we_camera_kf_t cur = scene->camera.keyframes[k];
+            uint32_t j = k;
+            while (j > 0 && scene->camera.keyframes[j - 1].time_sec > cur.time_sec) {
+                scene->camera.keyframes[j] = scene->camera.keyframes[j - 1];
+                j--;
+            }
+            scene->camera.keyframes[j] = cur;
+        }
         scene->camera.keyframe_count = count;
         scene->camera.path_enabled = 1;
     }
@@ -2474,6 +2606,13 @@ we_scene_t *we_scene_load_cpu(const char *workshop_dir, const char *prop_overrid
     scene->ortho_height = 1080.0f;
     scene->clear_enabled = true;
     scene->camera_up[1] = 1.0f;
+    scene->lighting.ambient_color_rgb[0] = 0.1f;
+    scene->lighting.ambient_color_rgb[1] = 0.1f;
+    scene->lighting.ambient_color_rgb[2] = 0.1f;
+    scene->lighting.sky_color_rgb[0] = 0.2f;
+    scene->lighting.sky_color_rgb[1] = 0.2f;
+    scene->lighting.sky_color_rgb[2] = 0.3f;
+    scene->lighting.normal_map_strength = 1.0f;
     scene->sound_rng_state = 0x9E3779B97F4A7C15ULL;
     scene->last_audio_step_time = -1.0;
 
@@ -2494,11 +2633,15 @@ we_scene_t *we_scene_load_cpu(const char *workshop_dir, const char *prop_overrid
                     jval_float(jobj_get(ortho, "width"), &scene->project, 1920.0f, NULL, 0);
                 scene->ortho_height =
                     jval_float(jobj_get(ortho, "height"), &scene->project, 1080.0f, NULL, 0);
-                if (scene->ortho_width <= 0.0f) {
+                if (!isfinite(scene->ortho_width) || scene->ortho_width <= 0.0f) {
                     scene->ortho_width = 1920.0f;
+                } else if (scene->ortho_width > 16384.0f) {
+                    scene->ortho_width = 16384.0f;
                 }
-                if (scene->ortho_height <= 0.0f) {
+                if (!isfinite(scene->ortho_height) || scene->ortho_height <= 0.0f) {
                     scene->ortho_height = 1080.0f;
+                } else if (scene->ortho_height > 16384.0f) {
+                    scene->ortho_height = 16384.0f;
                 }
             }
             jval_floats(jobj_get(gen, "clearcolor"), &scene->project, scene->clear_color, 3, NULL,
@@ -2545,8 +2688,13 @@ we_scene_t *we_scene_load_cpu(const char *workshop_dir, const char *prop_overrid
                     scene->camera.projection_mode = WE_PROJ_ORTHOGRAPHIC_2D;
                 }
             } else {
-                scene->camera.projection_mode =
-                    (uint32_t)jval_float(proj_node, &scene->project, 0.0f, NULL, 0);
+                uint32_t pmode =
+                    safe_f32_to_u32(jval_float(proj_node, &scene->project, 0.0f, NULL, 0),
+                                    (uint32_t)WE_PROJ_DEPTH_PARALLAX_25D + 1u);
+                if (pmode > (uint32_t)WE_PROJ_DEPTH_PARALLAX_25D) {
+                    pmode = (uint32_t)WE_PROJ_ORTHOGRAPHIC_2D;
+                }
+                scene->camera.projection_mode = pmode;
                 if (scene->camera.projection_mode != WE_PROJ_ORTHOGRAPHIC_2D) {
                     scene->is_3d = true;
                 }
@@ -2625,6 +2773,18 @@ we_scene_t *we_scene_load_cpu(const char *workshop_dir, const char *prop_overrid
                 for (uint32_t i = 0; i < scene->object_count; i++) {
                     if (scene->objects[i].is_text_object && scene->objects[i].text_dirty) {
                         we_scene_update_text_texture(scene, &scene->objects[i]);
+                    }
+                    if (scene->objects[i].has_base_pass &&
+                        scene->objects[i].base_pass.depthtest_enabled) {
+                        scene->has_depth_pass = true;
+                    }
+                    for (uint32_t e = 0; e < scene->objects[i].effect_count; e++) {
+                        const we_effect_t *eff = &scene->objects[i].effects[e];
+                        for (uint32_t p = 0; p < eff->pass_count; p++) {
+                            if (eff->passes[p].depthtest_enabled) {
+                                scene->has_depth_pass = true;
+                            }
+                        }
                     }
                 }
             }

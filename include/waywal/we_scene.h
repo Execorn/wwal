@@ -309,8 +309,12 @@ typedef struct we_scene {
 
     /* 3D camera, depth buffer & multi-light engine */
     bool is_3d;
+    bool has_depth_pass;
+    bool lighting_ipc_override;
     we_camera3d_t camera;
     we_lighting_uniforms_t lighting;
+    uint32_t light_count;
+    uint32_t lighting_ubo;
     uint32_t scene_depth_rbo;
     uint32_t scene_depth_rbo_w;
     uint32_t scene_depth_rbo_h;
@@ -349,7 +353,7 @@ typedef struct we_scene {
     /* Pointer, simulation clock & SceneScript shared store */
     float last_pointer[2];
     float smooth_parallax[2];
-    float sim_time;
+    double sim_time;
     uint64_t frame_counter;
     bool first_frame_done;
     bool uses_audio;
@@ -379,6 +383,9 @@ typedef struct we_scene {
     uint32_t current_fbo;
     uint32_t current_vp_w;
     uint32_t current_vp_h;
+    uint32_t current_tex2d[WE_MAX_PASS_TEXTURES + 1u];
+    uint32_t current_active_unit;
+    uint8_t current_depth_cull_bits;
 } we_scene_t;
 
 /* Parses project.json from memory or directory */

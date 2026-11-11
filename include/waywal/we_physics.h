@@ -93,8 +93,10 @@ typedef struct we_puppet_physics_ctx {
     we_cursor_force_t cursor;
     float time_accumulator_sec;
     double total_sim_time_sec;
+    double last_wall_time_sec;
     uint32_t active_bone_count;
     bool initialized;
+    bool has_last_wall_time;
 
     /* Runtime dynamic cursor and audio inputs */
     float cursor_pos[2];
@@ -121,6 +123,9 @@ bool we_physics_parse_simulation_json(const char *json, we_bone_sim_config_t *ou
 /* Evaluates divergence-free 3D Simplex curl-noise wind velocity at (x, y, z, t) */
 void we_physics_eval_curl_wind_3d(const we_wind_field_t *wind, float x, float y, float z,
                                   double time_sec, float out_vel[3]);
+void we_physics_eval_curl_wind_3d_batch(const we_wind_field_t *wind, const float *xs,
+                                        const float *ys, const float *zs, uint32_t count,
+                                        double time_sec, float (*out_vel)[3]);
 
 /* Evaluates 2D Simplex curl-noise wind velocity at (x, y, t) */
 void we_physics_sample_curl_wind(const we_wind_field_t *wind, float x, float y, double time_sec,
@@ -140,6 +145,12 @@ void we_physics_apply_bone_rotation(const we_puppet_physics_ctx_t *ctx, uint32_t
  * inout_skin_mats[k] = world_mats[k] * R_delta * offset_trans[k] (zero heap allocs). */
 void we_physics_step_puppet(we_puppet_physics_ctx_t *ctx, const we_puppet_t *puppet,
                             float frame_dt_sec, float (*inout_skin_mats)[16]);
+
+uint32_t we_physics_advance_wall_clock(we_puppet_physics_ctx_t *ctx, double wall_time_sec);
+void we_physics_solve_hierarchy_skin_matrices(we_puppet_physics_ctx_t *ctx,
+                                              const we_puppet_t *puppet,
+                                              const float (*anim_local)[16], uint32_t substeps,
+                                              float (*out_skin_mats)[16]);
 
 #ifdef __cplusplus
 }

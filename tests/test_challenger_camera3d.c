@@ -302,6 +302,127 @@ static void test_normal_matrix_orthogonality(void)
     printf("    -> PASS: Cofactor normal matrix provably preserves surface orthogonality.\n");
 }
 
+// 6. Unsorted/Coincident Keyframes, 64-KF O(log K) Lookup, Antipodal Quat, Singular Normal & UBO
+static void test_spline_edge_cases_and_ubo_sanitization(void)
+{
+    printf("[CHALLENGER 1] 6. Testing 64-KF baked LUT, antipodal SQUAD, singular normal & UBO "
+           "sanitization...\n");
+
+    // 6A: Unsorted + coincident hard-cut keyframes + antipodal w -> -1 quaternion
+    we_camera_kf_t kfs[5];
+    memset(kfs, 0, sizeof(kfs));
+    kfs[0].time_sec = 2.0f;
+    kfs[0].position[0] = 20.0f;
+    kfs[0].orientation_quat[2] = 1e-4f;
+    kfs[0].orientation_quat[3] = -0.999999995f;
+    kfs[0].fov_deg = 60.0f;
+
+    kfs[1].time_sec = 0.0f;
+    kfs[1].position[0] = 0.0f;
+    kfs[1].orientation_quat[3] = 1.0f;
+    kfs[1].fov_deg = 60.0f;
+
+    kfs[2].time_sec = 1.0f;
+    kfs[2].position[0] = 10.0f;
+    kfs[2].orientation_quat[3] = 1.0f;
+    kfs[2].fov_deg = 60.0f;
+
+    // Coincident timestamp hard-cut at t = 1.0
+    kfs[3].time_sec = 1.0f;
+    kfs[3].position[0] = 15.0f;
+    kfs[3].orientation_quat[3] = -1.0f;
+    kfs[3].fov_deg = 60.0f;
+
+    kfs[4].time_sec = 3.0f;
+    kfs[4].position[0] = 30.0f;
+    kfs[4].orientation_quat[3] = 1.0f;
+    kfs[4].fov_deg = 60.0f;
+
+    float pos[3], quat[4], fov = 0.0f;
+    // Multi-day uptime (200,000s) LOOP and PINGPONG precision check
+    we_camera3d_eval_spline(kfs, 5, WE_CAM_PATH_LOOP, 200000.5, pos, quat, &fov, NULL, NULL);
+    assert(isfinite(pos[0]) && isfinite(pos[1]) && isfinite(pos[2]));
+    float qlen =
+        sqrtf(quat[0] * quat[0] + quat[1] * quat[1] + quat[2] * quat[2] + quat[3] * quat[3]);
+    assert(fabsf(qlen - 1.0f) < 1e-4f);
+
+    we_camera3d_eval_spline(kfs, 5, WE_CAM_PATH_PINGPONG, 200001.25, pos, quat, &fov, NULL, NULL);
+    assert(isfinite(pos[0]) && isfinite(quat[3]));
+
+    // 6B: 64-keyframe binary search & LUT trajectory
+    we_camera_kf_t dense_kfs[WE_CAMERA_MAX_KEYFRAMES];
+    memset(dense_kfs, 0, sizeof(dense_kfs));
+    for (uint32_t i = 0; i < WE_CAMERA_MAX_KEYFRAMES; ++i) {
+        dense_kfs[i].time_sec = (float)i * 0.5f;
+        dense_kfs[i].position[0] = cosf((float)i * 0.1f) * 10.0f;
+        dense_kfs[i].position[1] = sinf((float)i * 0.1f) * 10.0f;
+        dense_kfs[i].orientation_quat[3] = 1.0f;
+        dense_kfs[i].fov_deg = 60.0f;
+    }
+    we_camera3d_eval_spline(dense_kfs, WE_CAMERA_MAX_KEYFRAMES, WE_CAM_PATH_LOOP, 19.37, pos, quat,
+                            &fov, NULL, NULL);
+    assert(isfinite(pos[0]) && isfinite(pos[1]) && fabsf(fov - 60.0f) < 1e-3f);
+
+    // 6C: Tiny-duration spline (5e-5s normalized onto synthetic [0, 1]) & 180-deg SQUAD sweep
+    we_camera_kf_t tiny_kfs[2];
+    memset(tiny_kfs, 0, sizeof(tiny_kfs));
+    tiny_kfs[0].time_sec = 0.00000f;
+    tiny_kfs[0].position[0] = 0.0f;
+    tiny_kfs[0].orientation_quat[3] = 1.0f;
+    tiny_kfs[0].fov_deg = 50.0f;
+    tiny_kfs[1].time_sec = 0.00005f;
+    tiny_kfs[1].position[0] = 100.0f;
+    tiny_kfs[1].orientation_quat[1] = 1.0f;
+    tiny_kfs[1].fov_deg = 70.0f;
+
+    we_camera3d_eval_spline(tiny_kfs, 2, WE_CAM_PATH_ONCE, 0.5, pos, quat, &fov, NULL, NULL);
+    assert(isfinite(pos[0]) && pos[0] > 20.0f && pos[0] < 80.0f &&
+           "Tiny-duration 50us spline collapsed instead of interpolating!");
+    assert(fabsf(fov - 60.0f) < 2.0f);
+
+    float prev_q[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    for (int s = 1; s <= 16; ++s) {
+        double t_s = (double)s / 16.0;
+        we_camera3d_eval_spline(tiny_kfs, 2, WE_CAM_PATH_ONCE, t_s, pos, quat, &fov, NULL, NULL);
+        float qn =
+            sqrtf(quat[0] * quat[0] + quat[1] * quat[1] + quat[2] * quat[2] + quat[3] * quat[3]);
+        assert(fabsf(qn - 1.0f) < 1e-4f);
+        float d = fabsf(prev_q[0] * quat[0] + prev_q[1] * quat[1] + prev_q[2] * quat[2] +
+                        prev_q[3] * quat[3]);
+        assert(d > 0.90f && "180-deg SQUAD exhibited discontinuous angular whip!");
+        memcpy(prev_q, quat, sizeof(prev_q));
+    }
+
+    // 6D: Singular model matrix (det == 0) must return 3x3 identity normal matrix
+    float singular_m[16] = {0};
+    float N[9] = {0};
+    we_camera3d_compute_normal_matrix(singular_m, N);
+    assert(N[0] == 1.0f && N[4] == 1.0f && N[8] == 1.0f && N[1] == 0.0f && N[3] == 0.0f);
+
+    // 6D: Lighting UBO sanitization (NULL lights, NaN intensity, inverted spotlight cones)
+    we_lighting_uniforms_t ubo;
+    const float bad_amb[3] = {NAN, -5.0f, 0.2f};
+    we_lighting_pack_ubo(NULL, 5, bad_amb, NULL, NAN, &ubo);
+    assert(ubo.active_light_count == 0u);
+    assert(isfinite(ubo.ambient_color_rgb[0]) && ubo.ambient_color_rgb[1] >= 0.0f);
+    assert(isfinite(ubo.normal_map_strength));
+
+    we_scene_light_t spot;
+    memset(&spot, 0, sizeof(spot));
+    spot.light_type = WE_LIGHT_SPOT;
+    spot.intensity = INFINITY;
+    spot.spot_inner_cos = 0.2f; // Inverted: inner < outer
+    spot.spot_outer_cos = 0.8f;
+    we_lighting_pack_ubo(&spot, 1, NULL, NULL, 1.0f, &ubo);
+    assert(ubo.active_light_count == 1u);
+    assert(isfinite(ubo.lights[0].intensity));
+    assert(ubo.lights[0].spot_inner_cos > ubo.lights[0].spot_outer_cos);
+    assert(fabsf(ubo.lights[0].spot_dir[2] + 1.0f) < 1e-4f);
+
+    printf("    -> PASS: 64-KF LUT, antipodal SQUAD, singular normal & UBO sanitization "
+           "verified.\n");
+}
+
 int main(void)
 {
     printf("====================================================================\n");
@@ -313,6 +434,7 @@ int main(void)
     test_squad_unit_norm_and_continuity();
     test_std140_ubo_layout_invariants();
     test_normal_matrix_orthogonality();
+    test_spline_edge_cases_and_ubo_sanitization();
 
     printf("====================================================================\n");
     printf("  >>> ALL 3D CAMERA & LIGHTING CHALLENGE TESTS PASSED CLEANLY (100%%) <<<\n");

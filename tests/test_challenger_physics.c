@@ -345,6 +345,176 @@ static void test_cursor_sdf_edge_cases(void)
     printf("    -> PASS: Cursor SDF is robust against dist=0, dist>R, and extreme velocities.\n");
 }
 
+// 6. Antiparallel 180-Degree SO(3) Bone Rotation & Capsule Mid-Shaft SDF & Asymmetric Cone
+static void test_antiparallel_so3_capsule_and_asymmetric_cone(void)
+{
+    printf("[CHALLENGER 1] 6. Testing 180-deg SO(3) rotation, capsule mid-shaft SDF & asymmetric "
+           "cone...\n");
+
+    we_puppet_physics_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.active_bone_count = 1;
+    ctx.initialized = true;
+    we_physics_apply_preset(&ctx.configs[0], WE_PHYS_PRESET_SILK);
+    ctx.configs[0].flags = WE_BONE_PHYS_ENABLED | WE_BONE_PHYS_CURSOR_COLLIDE;
+    ctx.configs[0].rest_length_px = 100.0f;
+    ctx.configs[0].collision_radius_px = 5.0f;
+    ctx.configs[0].mass_kg = 1.0f;
+    ctx.rest_dir_local[0][1] = -1.0f;
+
+    // 6A: Exact 180-deg antiparallel bone rotation must preserve det(R) == +1
+    ctx.states[0].pos_curr[0] = 0.0f;
+    ctx.states[0].pos_curr[1] = 100.0f;
+    ctx.states[0].pos_curr[2] = 0.0f;
+    float pivot[3] = {0.0f, 0.0f, 0.0f};
+    float W[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    we_physics_apply_bone_rotation(&ctx, 0, pivot, W);
+
+    float det = W[0] * (W[5] * W[10] - W[9] * W[6]) - W[4] * (W[1] * W[10] - W[9] * W[2]) +
+                W[8] * (W[1] * W[6] - W[5] * W[2]);
+    assert(fabsf(det - 1.0f) < 1e-4f && "180-deg bone rotation collapsed SO(3) determinant!");
+    // Rest vector (0, -1, 0) transformed by W must map to (0, +1, 0)
+    assert(fabsf(-W[5] - 1.0f) < 1e-4f);
+
+    // 6B: Mid-shaft capsule SDF repulsion where tip is far outside cursor radius
+    const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    float I[16];
+    memcpy(I, kIdentity, sizeof(I));
+    ctx.states[0].pos_curr[0] = 0.0f;
+    ctx.states[0].pos_curr[1] = -100.0f;
+    ctx.states[0].pos_curr[2] = 0.0f;
+    memset(ctx.states[0].vel, 0, sizeof(ctx.states[0].vel));
+    ctx.cursor.enabled = 1;
+    ctx.cursor.radius_px = 15.0f;
+    ctx.cursor.impulse_strength = 400.0f;
+    ctx.cursor.falloff_power = 2.0f;
+    // Cursor at (8, -50): tip distance is 50.6 > 20, but capsule shaft distance is 8 < 20
+    we_physics_set_cursor(&ctx, 8.0f, -50.0f, 0.0f, 0.0f);
+    we_physics_substep_bone(&ctx, 0, pivot, I, WE_PHYSICS_SUBSTEP_DT, 0.0);
+    assert(ctx.states[0].vel[0] < -1e-3f && "Capsule mid-shaft SDF failed to repel bone!");
+
+    // Disabled radius_px = 0 must exert zero force
+    memcpy(I, kIdentity, sizeof(I));
+    ctx.states[0].pos_curr[0] = 0.0f;
+    ctx.states[0].pos_curr[1] = -100.0f;
+    ctx.states[0].pos_curr[2] = 0.0f;
+    memset(ctx.states[0].vel, 0, sizeof(ctx.states[0].vel));
+    ctx.cursor.radius_px = 0.0f;
+    we_physics_substep_bone(&ctx, 0, pivot, I, WE_PHYSICS_SUBSTEP_DT, 0.0);
+    assert(fabsf(ctx.states[0].vel[0]) < 1e-6f && "Zero cursor radius must disable repulsion!");
+
+    // 6C: Asymmetric angular limits (-0.10 rad left vs +0.60 rad right)
+    memcpy(I, kIdentity, sizeof(I));
+    ctx.cursor.enabled = 0;
+    ctx.configs[0].flags = WE_BONE_PHYS_ENABLED | WE_BONE_PHYS_ANGULAR_LIMIT;
+    ctx.configs[0].angle_limit_min_rad = -0.10f;
+    ctx.configs[0].angle_limit_max_rad = 0.60f;
+    ctx.configs[0].compliance_bend = 1.0f;
+    ctx.states[0].pos_curr[0] = -80.0f;
+    ctx.states[0].pos_curr[1] = -60.0f;
+    ctx.states[0].pos_curr[2] = 0.0f;
+    we_physics_substep_bone(&ctx, 0, pivot, I, WE_PHYSICS_SUBSTEP_DT, 0.0);
+    float ang_neg = atan2f(-ctx.states[0].pos_curr[0], -ctx.states[0].pos_curr[1]);
+    assert(fabsf(ang_neg) <= 0.105f && "Asymmetric negative cone limit violated!");
+
+    printf("    -> PASS: 180-deg SO(3), capsule mid-shaft SDF & asymmetric cone verified.\n");
+}
+
+// 7. Extreme Coordinates, NaN/Inf Sanitization & Multi-Child Hub Rest Direction
+static void test_nan_extreme_coords_and_multichild_hub(void)
+{
+    printf(
+        "[CHALLENGER 1] 7. Fuzzing NaN/Inf/1e20f coordinates & multi-child hub rest vector...\n");
+
+    we_wind_field_t wind = {
+        .enabled = 1,
+        .base_direction_rad = NAN,
+        .base_speed_px_s = INFINITY,
+        .gust_frequency_hz = 2.0f,
+        .gust_amplitude = 3.0f,
+        .curl_spatial_scale = 1.0f,
+    };
+    float v[3];
+    we_physics_eval_curl_wind_3d(&wind, 1.0e20f, -1.0e20f, NAN, 1.0e9, v);
+    assert(isfinite(v[0]) && isfinite(v[1]) && isfinite(v[2]));
+
+    // Multi-day uptime (t = 200,000s) curl-wind temporal continuity check
+    we_wind_field_t clean_wind = {
+        .enabled = 1,
+        .base_direction_rad = 0.4f,
+        .base_speed_px_s = 120.0f,
+        .gust_frequency_hz = 1.5f,
+        .gust_amplitude = 2.0f,
+        .curl_spatial_scale = 0.008f,
+    };
+    float v_day0[3], v_day1[3];
+    we_physics_eval_curl_wind_3d(&clean_wind, 250.0f, 310.0f, 15.0f, 200000.0, v_day0);
+    we_physics_eval_curl_wind_3d(&clean_wind, 250.0f, 310.0f, 15.0f, 200000.0 + (1.0 / 240.0),
+                                 v_day1);
+    float dv_day = hypotf(v_day1[0] - v_day0[0], v_day1[1] - v_day0[1]);
+    assert(dv_day > 1e-4f && dv_day < 20.0f &&
+           "Multi-day curl wind froze or jumped discontinuously!");
+
+    // Multi-child symmetric Y-branch hub: children at (-30, -40, 0) and (+30, -40, 0)
+    we_mdl_bone_t bones[3];
+    memset(bones, 0, sizeof(bones));
+    for (int i = 0; i < 3; ++i) {
+        bones[i].local_trans[0] = 1.0f;
+        bones[i].local_trans[5] = 1.0f;
+        bones[i].local_trans[10] = 1.0f;
+        bones[i].local_trans[15] = 1.0f;
+        bones[i].offset_trans[0] = 1.0f;
+        bones[i].offset_trans[5] = 1.0f;
+        bones[i].offset_trans[10] = 1.0f;
+        bones[i].offset_trans[15] = 1.0f;
+    }
+    bones[0].parent = 0xFFFFFFFFu;
+    snprintf(bones[0].simulation_json, sizeof(bones[0].simulation_json), "{\"stiffness\":0.5}");
+    bones[1].parent = 0u;
+    bones[1].local_trans[12] = -30.0f;
+    bones[1].local_trans[13] = -40.0f;
+    bones[2].parent = 0u;
+    bones[2].local_trans[12] = 30.0f;
+    bones[2].local_trans[13] = -40.0f;
+
+    we_puppet_t puppet;
+    memset(&puppet, 0, sizeof(puppet));
+    puppet.bone_count = 3;
+    puppet.bones = bones;
+
+    we_puppet_physics_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    we_physics_init_from_puppet(&ctx, &puppet);
+    assert(fabsf(ctx.rest_dir_local[0][0]) < 1e-5f && ctx.rest_dir_local[0][1] < -0.99f &&
+           "Multi-child hub rest direction must average all child offsets!");
+
+    // Fuzz dt_s <= 0, NaN compliance, and negative damping without producing NaN matrices
+    float W_fuzz[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    float piv_fuzz[3] = {0.0f, 0.0f, 0.0f};
+    ctx.configs[0].compliance_stretch = -5.0f;
+    ctx.configs[0].compliance_bend = NAN;
+    ctx.configs[0].damping_ratio = -10.0f;
+    we_physics_substep_bone(&ctx, 0, piv_fuzz, W_fuzz, 0.0f, 0.0);
+    we_physics_substep_bone(&ctx, 0, piv_fuzz, W_fuzz, NAN, 0.0);
+    we_physics_substep_bone(&ctx, 0, piv_fuzz, W_fuzz, WE_PHYSICS_SUBSTEP_DT, 0.0);
+    for (int m = 0; m < 16; ++m) {
+        assert(isfinite(W_fuzz[m]) && "NaN/negative compliance or zero dt poisoned bone matrix!");
+    }
+
+    // Wall-clock suspend spike (+7200s) and 240 Hz post-spike recovery
+    we_puppet_physics_ctx_t clk_ctx;
+    memset(&clk_ctx, 0, sizeof(clk_ctx));
+    we_physics_init_from_puppet(&clk_ctx, &puppet);
+    assert(we_physics_advance_wall_clock(&clk_ctx, 50.0) == 4u);
+    clk_ctx.time_accumulator_sec = 0.0f;
+    assert(we_physics_advance_wall_clock(&clk_ctx, 7250.0) == WE_PHYSICS_MAX_SUBSTEPS);
+    // Subsequent 240 Hz frame right after a clamped spike must advance exactly 1 substep (not 4!)
+    clk_ctx.time_accumulator_sec = 0.0f;
+    assert(we_physics_advance_wall_clock(&clk_ctx, 7250.0 + (1.0 / 240.0)) == 1u);
+
+    printf("    -> PASS: NaN/Inf/1e20f fuzzing, suspend clock & multi-child hub verified.\n");
+}
+
 int main(void)
 {
     printf("====================================================================\n");
@@ -356,6 +526,8 @@ int main(void)
     test_xpbd_angular_limits_and_singularities();
     test_curl_noise_monte_carlo();
     test_cursor_sdf_edge_cases();
+    test_antiparallel_so3_capsule_and_asymmetric_cone();
+    test_nan_extreme_coords_and_multichild_hub();
 
     printf("====================================================================\n");
     printf("  >>> ALL XPBD CHALLENGE TESTS PASSED CLEANLY (100%%) <<<\n");
