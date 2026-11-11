@@ -2,8 +2,8 @@
 #pragma once
 
 #include <QWidget>
-#include <memory>
 #include <cstdint>
+#include <memory>
 
 class QLineEdit;
 class QComboBox;

@@ -551,7 +551,7 @@ void CubicBezierEditorWidget::setupUi()
 
     m_sliderDuration = new QSlider(Qt::Horizontal, transGroup);
     m_sliderDuration->setFixedHeight(16);
-    m_sliderDuration->setRange(100, 5000);
+    m_sliderDuration->setRange(100, 10000);
     m_sliderDuration->setMinimumWidth(40);
 
     transLayout->addWidget(makeParamLabel("Duration:", transGroup), 1, 0);

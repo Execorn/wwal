@@ -1,28 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /**
  * @file test_recursive_fs_watcher.cpp
- * @brief High-Throughput Hybrid fanotify / Recursive inotify Watcher Test Suite
- *
- * Verifies:
- * 1. Dual-probe capability detection (fanotify -> recursive inotify fallback on unprivileged
- * desktop).
- * 2. Dynamic recursive subdirectory discovery via epoll + inotify_add_watch.
- * 3. 1,000-write burst coalescing under a 300 ms debounce quiet window with hard flush deadline.
- * 4. Clean shutdown and watch descriptor reclamation with zero fd leaks.
+ * @brief Scoped Recursive inotify / epoll Watcher & Debounce Verification Suite
  */
 
-#include <iostream>
-#include <vector>
-#include <string>
-#include <chrono>
-#include <thread>
-#include <filesystem>
+#include "studio/core/recursive_fs_watcher.hpp"
+
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <mutex>
-
-#include "studio/core/recursive_fs_watcher.hpp"
+#include <string>
+#include <thread>
+#include <vector>
 
 using namespace wwal::studio;
 
@@ -36,12 +29,13 @@ void cleanup_test_dir(const std::filesystem::path &dir)
 
 void test_dual_probe_fallback()
 {
-    std::cout << "[FS Watcher 1/3] Testing dual-probe capability detection & fallback..."
+    std::cout << "[FS Watcher 1/6] Testing watch root registration & scoped watch count..."
               << std::endl;
 
     std::filesystem::path test_dir = "/tmp/test_wwal_watcher_probe";
     cleanup_test_dir(test_dir);
-    std::filesystem::create_directories(test_dir);
+    std::filesystem::create_directories(test_dir / "431960" / "1001" / "deep" / "nested" /
+                                        "assets");
 
     std::atomic<bool> event_received{false};
     RecursiveFsWatcher watcher(
@@ -51,22 +45,18 @@ void test_dual_probe_fallback()
     assert(added && "Adding watch root must succeed");
 
     watcher.start();
-    // In unprivileged environment, it should use inotify fallback
-    std::cout << "  -> Watcher initialized. Engine: "
-              << (watcher.isUsingFanotify() ? "fanotify (privileged)"
-                                            : "recursive inotify (desktop fallback)")
-              << std::endl;
-
-    assert(watcher.totalWatches() >= 1 && "At least one root watch must be registered");
+    // Depth <= 2 watches root (0), 431960 (1), and 1001 (2), skipping deep/nested/assets (>= 3).
+    assert(watcher.totalWatches() == 3 &&
+           "Watches must be bounded to depth <= 2 relative to registered root");
     watcher.stop();
 
     cleanup_test_dir(test_dir);
-    std::cout << "  -> Dual-probe capability detection passed." << std::endl;
+    std::cout << "  -> Scoped depth <= 2 watch registration passed." << std::endl;
 }
 
 void test_dynamic_subdirectory_recursion()
 {
-    std::cout << "[FS Watcher 2/3] Testing dynamic subdirectory recursive attachment..."
+    std::cout << "[FS Watcher 2/6] Testing dynamic subdirectory recursive attachment..."
               << std::endl;
 
     std::filesystem::path test_root = "/tmp/test_wwal_watcher_recurse";
@@ -78,29 +68,24 @@ void test_dynamic_subdirectory_recursion()
         [&](const std::vector<FsWatchEvent> &events) {
             events_count.fetch_add(static_cast<int>(events.size()));
         },
-        150);
+        120);
 
     watcher.addWatchRoot(test_root);
     watcher.start();
 
-    // Create nested subdirectories while running
     std::filesystem::path sub1 = test_root / "subdir1";
     std::filesystem::path sub2 = sub1 / "subdir2";
     std::filesystem::create_directories(sub2);
 
-    // Give inotify epoll thread time to process directory creation events
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // Now write a file deep in the nested directory
     std::filesystem::path deep_file = sub2 / "test.txt";
     {
         std::ofstream ofs(deep_file);
         ofs << "testing dynamic recursion";
     }
 
-    // Wait for 150ms debounce window
-    std::this_thread::sleep_for(std::chrono::milliseconds(350));
-
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
     assert(events_count.load() > 0 &&
            "Events must be captured from dynamically created subdirectories");
     watcher.stop();
@@ -111,8 +96,7 @@ void test_dynamic_subdirectory_recursion()
 
 void test_burst_write_coalescing()
 {
-    std::cout << "[FS Watcher 3/3] Testing 1,000 file write burst coalescing (§7.2)..."
-              << std::endl;
+    std::cout << "[FS Watcher 3/6] Testing 1,000 file write burst coalescing..." << std::endl;
 
     std::filesystem::path test_root = "/tmp/test_wwal_watcher_burst";
     cleanup_test_dir(test_root);
@@ -120,15 +104,12 @@ void test_burst_write_coalescing()
     std::filesystem::create_directories(item_dir);
 
     std::atomic<int> callback_invocations{0};
-    std::atomic<int> total_events_received{0};
     std::vector<FsWatchEvent> received_events;
     std::mutex events_mutex;
 
-    // Use 300 ms debounce window as mandated by §5.3
     RecursiveFsWatcher watcher(
         [&](const std::vector<FsWatchEvent> &events) {
             callback_invocations.fetch_add(1);
-            total_events_received.fetch_add(static_cast<int>(events.size()));
             std::lock_guard<std::mutex> lock(events_mutex);
             for (const auto &ev : events) {
                 received_events.push_back(ev);
@@ -138,16 +119,10 @@ void test_burst_write_coalescing()
 
     watcher.addWatchRoot(test_root);
     watcher.start();
-
-    // Brief stabilization pause
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    std::cout << "  -> Firing rapid burst of 1,000 file writes across 100 ms..." << std::endl;
-    auto burst_start = std::chrono::steady_clock::now();
 
     constexpr int NUM_WRITES = 1000;
     std::filesystem::path target_file = item_dir / "scene.pkg";
-
     for (int i = 0; i < NUM_WRITES; ++i) {
         std::ofstream ofs(target_file, std::ios::app);
         ofs << "chunk_" << i << "\n";
@@ -155,25 +130,13 @@ void test_burst_write_coalescing()
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-    auto burst_end = std::chrono::steady_clock::now();
-    double burst_duration_ms =
-        std::chrono::duration<double, std::milli>(burst_end - burst_start).count();
-    std::cout << "  -> Burst complete in " << burst_duration_ms << " ms." << std::endl;
 
-    // Wait for the 300 ms debounce window to expire (+ safety margin)
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
     watcher.stop();
 
     int invocations = callback_invocations.load();
-    int total_ev = total_events_received.load();
-    std::cout << "  -> Debounce Result: " << invocations << " callback invocation(s), " << total_ev
-              << " coalesced event(s) emitted for 1,000 writes." << std::endl;
-
-    // Verify debounce coalesced 1,000 writes: invocations should be tiny (typically 1 or 2, well
-    // below 50)
     assert(invocations >= 1 && invocations <= 10 &&
-           "1,000 writes must be heavily coalesced by 300ms debounce filter");
+           "1,000 writes must be coalesced by 300ms debounce filter");
 
     bool found_item_id = false;
     {
@@ -191,17 +154,194 @@ void test_burst_write_coalescing()
     std::cout << "  -> 1,000-write burst debouncing passed." << std::endl;
 }
 
+void test_start_before_add_and_restart_after_stop()
+{
+    std::cout << "[FS Watcher 4/6] Testing start()-before-addWatchRoot() & stop()->start() "
+                 "restart..."
+              << std::endl;
+
+    std::filesystem::path test_root = "/tmp/test_wwal_watcher_lifecycle";
+    cleanup_test_dir(test_root);
+    std::filesystem::create_directories(test_root / "431960");
+
+    std::atomic<int> seen_first_run{0};
+    std::atomic<int> seen_second_run{0};
+    std::atomic<bool> second_phase{false};
+
+    RecursiveFsWatcher watcher(
+        [&](const std::vector<FsWatchEvent> &events) {
+            for (const auto &ev : events) {
+                if (ev.published_file_id == 424242ULL || ev.published_file_id == 535353ULL) {
+                    if (second_phase.load()) {
+                        seen_second_run.fetch_add(1);
+                    } else {
+                        seen_first_run.fetch_add(1);
+                    }
+                }
+            }
+        },
+        80);
+
+    // Call start() BEFORE addWatchRoot()
+    watcher.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    assert(watcher.addWatchRoot(test_root));
+    std::filesystem::create_directories(test_root / "431960" / "424242");
+    {
+        std::ofstream ofs(test_root / "431960" / "424242" / "project.json");
+        ofs << "{\"title\":\"First Run\"}";
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(220));
+    assert(seen_first_run.load() >= 1 &&
+           "Watcher must stay alive when start() precedes addWatchRoot()");
+
+    // Stop completely and restart without re-calling addWatchRoot()
+    watcher.stop();
+    second_phase.store(true);
+    watcher.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    std::filesystem::create_directories(test_root / "431960" / "535353");
+    {
+        std::ofstream ofs(test_root / "431960" / "535353" / "project.json");
+        ofs << "{\"title\":\"Second Run\"}";
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(220));
+    watcher.stop();
+
+    assert(seen_second_run.load() >= 1 &&
+           "Watcher must re-open descriptors and resume after stop()->start()");
+
+    cleanup_test_dir(test_root);
+    std::cout << "  -> start()-before-add and stop()->start() restart passed." << std::endl;
+}
+
+void test_child_unlink_vs_item_root_delete()
+{
+    std::cout << "[FS Watcher 5/6] Testing child temp unlink (ItemModified) vs item root delete "
+                 "(ItemDeleted)..."
+              << std::endl;
+
+    std::filesystem::path test_root = "/tmp/test_wwal_watcher_del";
+    cleanup_test_dir(test_root);
+    std::filesystem::path item_dir = test_root / "431960" / "777111";
+    std::filesystem::create_directories(item_dir);
+    {
+        std::ofstream ofs(item_dir / "shader.tmp");
+        ofs << "temp";
+    }
+
+    std::mutex mtx;
+    std::vector<FsWatchEvent> events_log;
+    RecursiveFsWatcher watcher(
+        [&](const std::vector<FsWatchEvent> &events) {
+            std::lock_guard<std::mutex> lk(mtx);
+            for (const auto &ev : events) {
+                events_log.push_back(ev);
+            }
+        },
+        80);
+
+    watcher.addWatchRoot(test_root);
+    watcher.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    // Unlink ONLY a child temp file inside 777111 while 777111 itself remains intact.
+    std::filesystem::remove(item_dir / "shader.tmp");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        assert(!events_log.empty());
+        for (const auto &ev : events_log) {
+            if (ev.published_file_id == 777111ULL) {
+                assert(ev.action != FsWatchAction::ItemDeleted &&
+                       "Unlinking child temp file must NEVER emit ItemDeleted");
+            }
+        }
+        events_log.clear();
+    }
+
+    // Now delete the item root directory 777111 itself -> MUST emit ItemDeleted.
+    std::filesystem::remove_all(item_dir);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    watcher.stop();
+
+    bool saw_root_deleted = false;
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        for (const auto &ev : events_log) {
+            if (ev.published_file_id == 777111ULL && ev.action == FsWatchAction::ItemDeleted) {
+                saw_root_deleted = true;
+            }
+        }
+    }
+    assert(saw_root_deleted && "Deleting item root directory itself must emit ItemDeleted");
+
+    cleanup_test_dir(test_root);
+    std::cout << "  -> Child temp unlink vs item root delete verified." << std::endl;
+}
+
+void test_sibling_prefix_roots_ws_vs_ws2()
+{
+    std::cout << "[FS Watcher 6/6] Testing lexically_relative boundary (/ws vs /ws2)..."
+              << std::endl;
+
+    std::filesystem::path base = "/tmp/test_wwal_watcher_siblings";
+    cleanup_test_dir(base);
+    std::filesystem::path ws1 = base / "ws";
+    std::filesystem::path ws2 = base / "ws2";
+    std::filesystem::create_directories(ws1 / "431960" / "111");
+    std::filesystem::create_directories(ws2 / "431960" / "222");
+
+    std::atomic<bool> saw_ws2_event{false};
+    RecursiveFsWatcher watcher(
+        [&](const std::vector<FsWatchEvent> &events) {
+            for (const auto &ev : events) {
+                if (ev.published_file_id == 222ULL) {
+                    saw_ws2_event.store(true);
+                }
+            }
+        },
+        80);
+
+    watcher.addWatchRoot(ws1);
+    watcher.addWatchRoot(ws2);
+    watcher.start();
+    assert(watcher.totalWatches() == 6);
+
+    // Removing /ws must leave /ws2's 3 watches intact.
+    watcher.removeWatchRoot(ws1);
+    assert(watcher.totalWatches() == 3 && "Removing /ws must not strip sibling /ws2 watches");
+
+    {
+        std::ofstream ofs(ws2 / "431960" / "222" / "project.json");
+        ofs << "{\"title\":\"Sibling Alive\"}";
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    watcher.stop();
+
+    assert(saw_ws2_event.load() && "/ws2 must still emit events after /ws removal");
+
+    cleanup_test_dir(base);
+    std::cout << "  -> Sibling /ws vs /ws2 boundary isolation passed." << std::endl;
+}
+
 } // namespace
 
 int main()
 {
     std::cout << "==========================================================" << std::endl;
-    std::cout << "  Hybrid fanotify / inotify Watcher Test Suite (§7.2)     " << std::endl;
+    std::cout << "  Scoped Recursive inotify / epoll Watcher Test Suite     " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
     test_dual_probe_fallback();
     test_dynamic_subdirectory_recursion();
     test_burst_write_coalescing();
+    test_start_before_add_and_restart_after_stop();
+    test_child_unlink_vs_item_root_delete();
+    test_sibling_prefix_roots_ws_vs_ws2();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  >>> RECURSIVE FS WATCHER TESTS PASSED CLEANLY (100%) <<<" << std::endl;

@@ -2,17 +2,19 @@
 #include "openhub_browser_widget.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <format>
-#include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <QApplication>
@@ -31,6 +33,7 @@
 #include <QMetaObject>
 #include <QPainter>
 #include <QPixmap>
+#include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
@@ -53,15 +56,17 @@ namespace wwal::studio {
 
 namespace {
 
+using WwpkgHandlePtr = std::unique_ptr<wwpkg_package_t, decltype(&wwpkg_close)>;
+
 struct OpenHubRecord {
-    QString id;      // UUID
-    QString slug;    // slug
-    QString name;    // Title
-    QString version; // SemVer
+    QString id;
+    QString slug;
+    QString name;
+    QString version;
     QString author_name;
     QString author_email;
     QString author_pubkey_hex;
-    QString license; // SPDX
+    QString license;
     QString description;
     QStringList tags;
     wwpkg_type_t type{WWPKG_TYPE_SHADER_FRAGMENT};
@@ -69,35 +74,34 @@ struct OpenHubRecord {
     QString download_url;
     QString local_pkg_path;
     QString preview_path;
-    QString cid; // "sha256:<64 hex>"
+    QString cid;
     uint64_t file_size_bytes{0};
     uint64_t timestamp{0};
     uint32_t download_count{0};
-    float rating{5.0f};
+    float rating{0.0f};
 
-    // Cryptographic verification
     bool is_verified{false};
     bool is_trusted{false};
     QString merkle_root_hex;
     QString signature_hex;
 
-    // Capabilities
     bool cap_compute{false};
     bool cap_audio_spectrum{false};
     bool cap_audio_playback{false};
     bool cap_scripting{false};
     bool cap_foreign_toplevel{false};
-    bool cap_network{false};    // Invariant: strictly false
-    bool cap_filesystem{false}; // Invariant: strictly false
+    bool cap_network{false};
+    bool cap_filesystem{false};
 
-    // Resource Budgets
     uint32_t max_vram_mb{128};
     uint32_t max_ram_mb{256};
     uint32_t target_fps{60};
 
-    // Install status
     bool is_installed{false};
     bool is_downloading{false};
+    bool last_download_failed{false};
+    bool last_download_cancelled{false};
+    QString last_error_message;
     float download_pct{0.0f};
     float download_speed_bps{0.0f};
 };
@@ -128,6 +132,156 @@ QString bytesToHex(const uint8_t *data, size_t len)
         hex += QString::asprintf("%02x", data[i]);
     }
     return hex;
+}
+
+bool parseVerifiedPackageFile(const std::filesystem::path &pkgPath, OpenHubRecord &outRec)
+{
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(pkgPath, ec)) {
+        return false;
+    }
+
+    WwpkgHandlePtr pkg(wwpkg_open(pkgPath.string().c_str()), &wwpkg_close);
+    if (!pkg) {
+        return false;
+    }
+
+    const wwpkg_manifest_t *man = wwpkg_get_manifest(pkg.get());
+    const wwpkg_signature_t *sig = wwpkg_get_signature(pkg.get());
+    if (!man) {
+        return false;
+    }
+
+    OpenHubRecord rec;
+    rec.id = QString::fromUtf8(man->id);
+    if (rec.id.isEmpty()) {
+        rec.id = QString::fromStdString(pkgPath.stem().string());
+    }
+    rec.slug = QString::fromUtf8(man->slug);
+    rec.name = QString::fromUtf8(man->name);
+    if (rec.name.isEmpty()) {
+        rec.name = rec.id;
+    }
+    rec.version = QString::fromUtf8(man->version);
+    rec.author_name = QString::fromUtf8(man->author_name);
+    rec.author_email = QString::fromUtf8(man->author_email);
+    rec.author_pubkey_hex = bytesToHex(man->author_pubkey, WWPKG_PUBKEY_BYTES);
+    rec.license = QString::fromUtf8(man->license);
+    rec.description = QString::fromUtf8(man->description);
+    rec.type = man->type;
+
+    for (uint32_t t = 0; t < man->tag_count && t < WWPKG_MAX_TAGS; ++t) {
+        rec.tags.push_back(QString::fromUtf8(man->tags[t]));
+    }
+
+    rec.cap_compute = man->capabilities.compute_shaders;
+    rec.cap_audio_spectrum = man->capabilities.audio_spectrum;
+    rec.cap_audio_playback = man->capabilities.audio_playback;
+    rec.cap_scripting = man->capabilities.scripting;
+    rec.cap_foreign_toplevel = man->capabilities.foreign_toplevel;
+    rec.cap_network = false;
+    rec.cap_filesystem = false;
+
+    rec.max_vram_mb = man->budgets.max_vram_mb > 0 ? man->budgets.max_vram_mb : 128;
+    rec.max_ram_mb = man->budgets.max_ram_mb > 0 ? man->budgets.max_ram_mb : 256;
+    rec.target_fps = man->budgets.target_fps > 0 ? man->budgets.target_fps : 60;
+
+    if (sig) {
+        rec.merkle_root_hex = bytesToHex(sig->merkle_root, WWPKG_MERKLE_ROOT_BYTES);
+        rec.signature_hex = bytesToHex(sig->signature, WWPKG_SIGNATURE_BYTES);
+        rec.timestamp = sig->timestamp;
+        rec.cid = "sha256:" + rec.merkle_root_hex;
+
+        bool is_trusted = false;
+        rec.is_verified = wwpkg_verify_signature(pkg.get(), &is_trusted);
+        rec.is_trusted = is_trusted;
+    } else {
+        rec.cid = "sha256:" + rec.id;
+        rec.is_verified = false;
+        rec.is_trusted = false;
+    }
+
+    rec.local_pkg_path = QString::fromStdString(pkgPath.string());
+    uint64_t sz = std::filesystem::file_size(pkgPath, ec);
+    rec.file_size_bytes = ec ? 0 : sz;
+    rec.is_installed = rec.is_verified;
+    rec.download_count = 0;
+    rec.rating = 0.0f;
+
+    outRec = std::move(rec);
+    return true;
+}
+
+std::vector<OpenHubRecord> scanLocalHubRootsWorker(const std::atomic<bool> &cancelFlag,
+                                                   const std::string &extraDownloadDir)
+{
+    std::vector<std::filesystem::path> roots;
+    std::unordered_set<std::string> seenRoots;
+    auto addRoot = [&](const std::filesystem::path &p) {
+        if (p.empty()) {
+            return;
+        }
+        std::string norm = p.lexically_normal().string();
+        if (seenRoots.insert(norm).second) {
+            roots.push_back(std::filesystem::path(norm));
+        }
+    };
+
+    const char *envDir = std::getenv("WWAL_OPENHUB_DIR");
+    if (envDir && *envDir) {
+        addRoot(std::filesystem::path(envDir));
+    }
+    if (!extraDownloadDir.empty()) {
+        addRoot(std::filesystem::path(extraDownloadDir));
+    }
+
+    QString dataBase = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    if (!dataBase.isEmpty()) {
+        addRoot(std::filesystem::path((dataBase + "/waywal/hub").toStdString()));
+        addRoot(std::filesystem::path((dataBase + "/wwal/hub").toStdString()));
+        addRoot(std::filesystem::path((dataBase + "/waywal/downloads").toStdString()));
+        addRoot(std::filesystem::path((dataBase + "/wwal/downloads").toStdString()));
+    }
+
+    std::vector<OpenHubRecord> records;
+    std::unordered_set<std::string> seenIds;
+    constexpr auto dirOpts = std::filesystem::directory_options::skip_permission_denied;
+
+    for (const auto &root : roots) {
+        if (cancelFlag.load(std::memory_order_relaxed)) {
+            break;
+        }
+        std::error_code ec;
+        if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
+            continue;
+        }
+
+        std::filesystem::directory_iterator dirIt(root, dirOpts, ec);
+        if (ec) {
+            continue;
+        }
+
+        for (const auto &entry : dirIt) {
+            if (cancelFlag.load(std::memory_order_relaxed)) {
+                break;
+            }
+            std::error_code fEc;
+            if (!entry.is_regular_file(fEc) || entry.path().extension() != ".wwpkg") {
+                continue;
+            }
+
+            OpenHubRecord rec;
+            if (parseVerifiedPackageFile(entry.path(), rec)) {
+                std::string key = rec.id.toStdString();
+                if (!seenIds.contains(key)) {
+                    seenIds.insert(std::move(key));
+                    records.push_back(std::move(rec));
+                }
+            }
+        }
+    }
+
+    return records;
 }
 
 constexpr const char *STYLE_PANEL_BG = "background-color: #14171c; color: #f1f5f9;";
@@ -178,32 +332,32 @@ constexpr const char *STYLE_PILL_AIRGAP =
 struct OpenHubBrowserWidget::Impl {
     OpenHubBrowserWidget *owner{nullptr};
 
-    // Feed and package catalog state
     std::vector<OpenHubRecord> allRecords;
     std::vector<OpenHubRecord> filteredRecords;
     std::unordered_map<std::string, size_t> idToIndex;
+    std::unordered_map<std::string, size_t> allIdToIndex;
 
-    // Active filtering
+    std::thread scanThread;
+    std::atomic<bool> scanCancel{false};
+    uint64_t scanGeneration{0};
+
     QString activeQuery;
-    int activeCategoryIndex{0}; // 0=All, 1=Shaders, 2=2D, 3=Puppet, 4=Particles, 5=Video
-    int activeSortIndex{0};     // 0=Trending, 1=Most Downloaded, 2=Recent, 3=Name
+    int activeCategoryIndex{0};
+    int activeSortIndex{0};
 
-    // 150 ms dwell hover tracking
     QTimer *hoverDwellTimer{nullptr};
     int pendingHoverIndex{-1};
     int activeHoverIndex{-1};
 
-    // Debounced search timer
     QTimer *searchDebounceTimer{nullptr};
 
     int selectedItemIndex{-1};
+    QString selectedPackageId;
 
-    // UI Sub-components
     QSplitter *mainSplitter{nullptr};
     QToolButton *wizardLaunchBtn{nullptr};
     QLabel *statusTelemetryLabel{nullptr};
 
-    // Inspector Drawer UI
     QWidget *inspectorDrawer{nullptr};
     QScrollArea *inspectorScrollArea{nullptr};
     QLabel *inspectorTitleLabel{nullptr};
@@ -212,23 +366,19 @@ struct OpenHubBrowserWidget::Impl {
     QLabel *inspectorCidLabel{nullptr};
     QPushButton *copyCidBtn{nullptr};
 
-    // Cryptographic Badge
     QLabel *cryptoBadgeLabel{nullptr};
     QLabel *authorPubkeyLabel{nullptr};
     QLabel *merkleRootLabel{nullptr};
 
-    // Capability Pills Layout
     QWidget *capabilitiesContainer{nullptr};
     QGridLayout *capabilitiesLayout{nullptr};
 
-    // Resource Budgets
     QLabel *vramBudgetLabel{nullptr};
     QProgressBar *vramBudgetBar{nullptr};
     QLabel *ramBudgetLabel{nullptr};
     QProgressBar *ramBudgetBar{nullptr};
     QLabel *targetFpsBadge{nullptr};
 
-    // Download & Install State
     QLabel *installStateBadge{nullptr};
     QWidget *downloadProgressBox{nullptr};
     QProgressBar *downloadProgressBar{nullptr};
@@ -238,185 +388,93 @@ struct OpenHubBrowserWidget::Impl {
     QComboBox *monitorTargetCombo{nullptr};
     QPushButton *applyToMonitorBtn{nullptr};
 
-    void scanLocalHubPackages();
-    void populateCuratedHubFeed();
+    void stopScanThread();
+    void rebuildAllIndex();
+    void launchAsyncScan();
     void executeQuery();
     void applySorting();
     void syncWithGridView();
     void updateInspector(const OpenHubRecord &rec);
+    void handleDownloadProgress(const QString &pkgId, const DownloadProgress &prog);
 };
 
-void OpenHubBrowserWidget::Impl::scanLocalHubPackages()
+void OpenHubBrowserWidget::Impl::stopScanThread()
 {
-    // Search ~/.local/share/waywal/hub/ for compiled .wwpkg packages
+    scanCancel.store(true, std::memory_order_relaxed);
+    if (scanThread.joinable()) {
+        scanThread.join();
+    }
+}
+
+void OpenHubBrowserWidget::Impl::rebuildAllIndex()
+{
+    allIdToIndex.clear();
+    allIdToIndex.reserve(allRecords.size());
+    for (size_t i = 0; i < allRecords.size(); ++i) {
+        allIdToIndex[allRecords[i].id.toStdString()] = i;
+    }
+}
+
+void OpenHubBrowserWidget::Impl::launchAsyncScan()
+{
+    stopScanThread();
+    scanCancel.store(false, std::memory_order_relaxed);
+    const uint64_t gen = ++scanGeneration;
+
     QString hubDir =
         QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "/waywal/hub";
     QDir().mkpath(hubDir);
 
-    std::filesystem::path hubPath(hubDir.toStdString());
-    std::error_code ec;
-    if (!std::filesystem::exists(hubPath, ec) || !std::filesystem::is_directory(hubPath, ec)) {
-        return;
-    }
-
-    for (const auto &entry : std::filesystem::directory_iterator(hubPath, ec)) {
-        if (!entry.is_regular_file(ec) || entry.path().extension() != ".wwpkg") {
-            continue;
+    QPointer<OpenHubBrowserWidget> self(owner);
+    std::string downloadDir =
+        owner->m_downloadMgr ? owner->m_downloadMgr->downloadDirectory() : std::string{};
+    scanThread = std::thread([this, self, gen, downloadDir = std::move(downloadDir)]() {
+        auto discovered = scanLocalHubRootsWorker(scanCancel, downloadDir);
+        if (scanCancel.load(std::memory_order_relaxed) || !self) {
+            return;
         }
 
-        std::string pkgPathStr = entry.path().string();
-        wwpkg_package_t *pkg = wwpkg_open(pkgPathStr.c_str());
-        if (!pkg) {
-            continue;
-        }
+        QMetaObject::invokeMethod(
+            self,
+            [self, gen, records = std::move(discovered)]() mutable {
+                if (!self || gen != self->m_impl->scanGeneration) {
+                    return;
+                }
 
-        const wwpkg_manifest_t *man = wwpkg_get_manifest(pkg);
-        const wwpkg_signature_t *sig = wwpkg_get_signature(pkg);
+                std::unordered_set<std::string> seenIds;
+                seenIds.reserve(records.size());
+                for (auto &incoming : records) {
+                    std::string idKey = incoming.id.toStdString();
+                    seenIds.insert(idKey);
+                    auto prevIt = self->m_impl->allIdToIndex.find(idKey);
+                    if (prevIt != self->m_impl->allIdToIndex.end()) {
+                        const auto &prev = self->m_impl->allRecords[prevIt->second];
+                        if (prev.is_downloading) {
+                            incoming.is_downloading = true;
+                        }
+                        if (incoming.download_url.isEmpty() && !prev.download_url.isEmpty()) {
+                            incoming.download_url = prev.download_url;
+                        }
+                    }
+                }
 
-        if (man) {
-            OpenHubRecord rec;
-            rec.id = QString::fromUtf8(man->id);
-            rec.slug = QString::fromUtf8(man->slug);
-            rec.name = QString::fromUtf8(man->name);
-            rec.version = QString::fromUtf8(man->version);
-            rec.author_name = QString::fromUtf8(man->author_name);
-            rec.author_email = QString::fromUtf8(man->author_email);
-            rec.author_pubkey_hex = bytesToHex(man->author_pubkey, WWPKG_PUBKEY_BYTES);
-            rec.license = QString::fromUtf8(man->license);
-            rec.description = QString::fromUtf8(man->description);
-            rec.type = man->type;
+                // Retain remote or in-flight entries not yet written to local storage.
+                for (const auto &prev : self->m_impl->allRecords) {
+                    std::string idKey = prev.id.toStdString();
+                    if (!seenIds.contains(idKey) &&
+                        (prev.is_downloading ||
+                         (!prev.download_url.isEmpty() && prev.local_pkg_path.isEmpty()))) {
+                        seenIds.insert(std::move(idKey));
+                        records.push_back(prev);
+                    }
+                }
 
-            for (uint32_t t = 0; t < man->tag_count && t < WWPKG_MAX_TAGS; ++t) {
-                rec.tags.push_back(QString::fromUtf8(man->tags[t]));
-            }
-
-            rec.cap_compute = man->capabilities.compute_shaders;
-            rec.cap_audio_spectrum = man->capabilities.audio_spectrum;
-            rec.cap_audio_playback = man->capabilities.audio_playback;
-            rec.cap_scripting = man->capabilities.scripting;
-            rec.cap_foreign_toplevel = man->capabilities.foreign_toplevel;
-            rec.cap_network = false;    // Airgap enforced
-            rec.cap_filesystem = false; // Airgap enforced
-
-            rec.max_vram_mb = man->budgets.max_vram_mb > 0 ? man->budgets.max_vram_mb : 128;
-            rec.max_ram_mb = man->budgets.max_ram_mb > 0 ? man->budgets.max_ram_mb : 256;
-            rec.target_fps = man->budgets.target_fps > 0 ? man->budgets.target_fps : 60;
-
-            if (sig) {
-                rec.merkle_root_hex = bytesToHex(sig->merkle_root, WWPKG_MERKLE_ROOT_BYTES);
-                rec.signature_hex = bytesToHex(sig->signature, WWPKG_SIGNATURE_BYTES);
-                rec.timestamp = sig->timestamp;
-                rec.cid = "sha256:" + rec.merkle_root_hex;
-
-                bool is_trusted = false;
-                rec.is_verified = wwpkg_verify_signature(pkg, &is_trusted);
-                rec.is_trusted = is_trusted;
-            } else {
-                rec.cid = "sha256:" + rec.id;
-            }
-
-            rec.local_pkg_path = QString::fromStdString(pkgPathStr);
-            rec.file_size_bytes = entry.file_size(ec);
-            rec.is_installed = true;
-            rec.download_count = 1200;
-            rec.rating = 4.95f;
-
-            allRecords.push_back(std::move(rec));
-        }
-
-        wwpkg_close(pkg);
-    }
-}
-
-void OpenHubBrowserWidget::Impl::populateCuratedHubFeed()
-{
-    // Curated high-performance Open Hub packages with real cryptographic proofs & airgap tokens
-    struct CuratedBlueprint {
-        const char *id;
-        const char *slug;
-        const char *name;
-        const char *version;
-        const char *author;
-        const char *author_email;
-        const char *pubkey_hex;
-        const char *merkle_hex;
-        const char *license;
-        wwpkg_type_t type;
-        bool compute;
-        bool audio;
-        bool script;
-        uint32_t vram;
-        uint32_t ram;
-        uint32_t fps;
-        uint64_t size_bytes;
-        uint32_t downloads;
-        float rating;
-    };
-
-    const CuratedBlueprint blue[] = {
-        {"d3f82a90-341e-4501-8b29-e58f01b7a001", "aurora-borealis-gles31",
-         "Aurora Borealis GLES 3.1 Compute", "1.4.0", "WayWal Core Graphics Team",
-         "core@waywal.org", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-         "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4", "MIT",
-         WWPKG_TYPE_SHADER_COMPUTE, true, true, false, 128, 256, 144, 8ULL * 1024ULL * 1024ULL,
-         42300, 4.98f},
-        {"a710bc42-901d-482a-a9f3-891048b21002", "cyber-matrix-rain-pro",
-         "Cyber Matrix Rain Pro [Audio FFT]", "2.1.0", "Caelestia Labs", "design@caelestia.org",
-         "a94a8fe5ccb19ba61c4c0873d391e987982fbbd342be3b384ff6f784e0c3d987",
-         "3a52ce780950d4d969792a2559cd519d7ee8c727", "Apache-2.0", WWPKG_TYPE_SHADER_FRAGMENT,
-         false, true, true, 96, 192, 144, 12ULL * 1024ULL * 1024ULL, 89100, 4.96f},
-        {"f2098b11-541a-40a8-b610-d0012845c003", "quantum-vortex-particles",
-         "Quantum Vortex 100k GPU Particles", "1.0.2", "QuantumFX Studio", "contact@quantumfx.io",
-         "c5e7b290d20981a28a301e828471b02938472910839482910384910293840192",
-         "e209182390182309182309182309182309182309182309182309182309182309", "GPL-3.0-or-later",
-         WWPKG_TYPE_SCENE_PARTICLES, true, false, true, 180, 320, 120, 24ULL * 1024ULL * 1024ULL,
-         31400, 4.89f},
-        {"b1928374-1234-4567-89ab-cdef01234567", "neon-drift-lofi-station",
-         "Neon Drift Lo-Fi Highway [4K Video]", "3.0.0", "Outrun Creative", "media@outrun.cc",
-         "7b4a2f8109823049182304918230491823049182304918230491823049182304",
-         "1928301928301928301928301928301928301928301928301928301928301928", "CC-BY-4.0",
-         WWPKG_TYPE_VIDEO_STREAM, false, false, false, 64, 128, 60, 140ULL * 1024ULL * 1024ULL,
-         112000, 4.94f},
-        {"e8291044-6789-4abc-def0-123456789abc", "minimal-clock-weather-hud",
-         "Minimalist Glass HUD Clock", "1.1.0", "CleanDesktops", "hello@cleandesktops.net",
-         "0192830192830192830192830192830192830192830192830192830192830192",
-         "9876543210987654321098765432109876543210987654321098765432109876", "MIT",
-         WWPKG_TYPE_SCENE_2D, false, false, true, 48, 96, 60, 4ULL * 1024ULL * 1024ULL, 67000,
-         4.87f}};
-
-    for (const auto &b : blue) {
-        OpenHubRecord rec;
-        rec.id = QString::fromUtf8(b.id);
-        rec.slug = QString::fromUtf8(b.slug);
-        rec.name = QString::fromUtf8(b.name);
-        rec.version = QString::fromUtf8(b.version);
-        rec.author_name = QString::fromUtf8(b.author);
-        rec.author_email = QString::fromUtf8(b.author_email);
-        rec.author_pubkey_hex = QString::fromUtf8(b.pubkey_hex);
-        rec.merkle_root_hex = QString::fromUtf8(b.merkle_hex);
-        rec.license = QString::fromUtf8(b.license);
-        rec.type = b.type;
-        rec.cap_compute = b.compute;
-        rec.cap_audio_spectrum = b.audio;
-        rec.cap_scripting = b.script;
-        rec.cap_network = false;    // Airgap invariant
-        rec.cap_filesystem = false; // Airgap invariant
-        rec.max_vram_mb = b.vram;
-        rec.max_ram_mb = b.ram;
-        rec.target_fps = b.fps;
-        rec.file_size_bytes = b.size_bytes;
-        rec.download_count = b.downloads;
-        rec.rating = b.rating;
-        rec.timestamp = 1705000000ULL + (b.fps * 1000);
-        rec.cid = "sha256:" + rec.merkle_root_hex;
-        rec.download_url =
-            QString("https://hub.waywal.org/v1/packages/%1/%2").arg(rec.slug).arg(rec.version);
-        rec.is_verified = true;
-        rec.is_trusted = true;
-        rec.is_installed = false;
-
-        allRecords.push_back(std::move(rec));
-    }
+                self->m_impl->allRecords = std::move(records);
+                self->m_impl->rebuildAllIndex();
+                self->m_impl->executeQuery();
+            },
+            Qt::QueuedConnection);
+    });
 }
 
 void OpenHubBrowserWidget::Impl::executeQuery()
@@ -427,7 +485,6 @@ void OpenHubBrowserWidget::Impl::executeQuery()
     QString queryText = activeQuery.trimmed().toLower();
 
     for (const auto &rec : allRecords) {
-        // Category filter
         if (activeCategoryIndex > 0) {
             wwpkg_type_t targetType = WWPKG_TYPE_UNKNOWN;
             switch (activeCategoryIndex) {
@@ -457,7 +514,6 @@ void OpenHubBrowserWidget::Impl::executeQuery()
             }
         }
 
-        // Search text match
         if (!queryText.isEmpty()) {
             bool matches =
                 rec.name.toLower().contains(queryText) || rec.slug.toLower().contains(queryText) ||
@@ -478,25 +534,33 @@ void OpenHubBrowserWidget::Impl::executeQuery()
 void OpenHubBrowserWidget::Impl::applySorting()
 {
     switch (activeSortIndex) {
-    case 0: // Trending (Downloads * Rating)
+    case 0:
         std::sort(filteredRecords.begin(), filteredRecords.end(),
                   [](const OpenHubRecord &a, const OpenHubRecord &b) {
-                      return (a.download_count * a.rating) > (b.download_count * b.rating);
+                      double scoreA = static_cast<double>(a.download_count) * a.rating;
+                      double scoreB = static_cast<double>(b.download_count) * b.rating;
+                      if (std::abs(scoreA - scoreB) > 1e-4) {
+                          return scoreA > scoreB;
+                      }
+                      return a.timestamp > b.timestamp;
                   });
         break;
-    case 1: // Most Downloaded
+    case 1:
         std::sort(filteredRecords.begin(), filteredRecords.end(),
                   [](const OpenHubRecord &a, const OpenHubRecord &b) {
-                      return a.download_count > b.download_count;
+                      if (a.download_count != b.download_count) {
+                          return a.download_count > b.download_count;
+                      }
+                      return a.timestamp > b.timestamp;
                   });
         break;
-    case 2: // Recently Updated / Timestamp
+    case 2:
         std::sort(filteredRecords.begin(), filteredRecords.end(),
                   [](const OpenHubRecord &a, const OpenHubRecord &b) {
                       return a.timestamp > b.timestamp;
                   });
         break;
-    case 3: // Name (A-Z)
+    case 3:
         std::sort(filteredRecords.begin(), filteredRecords.end(),
                   [](const OpenHubRecord &a, const OpenHubRecord &b) {
                       return a.name.compare(b.name, Qt::CaseInsensitive) < 0;
@@ -507,15 +571,21 @@ void OpenHubBrowserWidget::Impl::applySorting()
     }
 
     idToIndex.clear();
+    selectedItemIndex = -1;
     for (size_t i = 0; i < filteredRecords.size(); ++i) {
-        idToIndex[filteredRecords[i].id.toStdString()] = i;
+        std::string key = filteredRecords[i].id.toStdString();
+        idToIndex[key] = i;
+        if (!selectedPackageId.isEmpty() && filteredRecords[i].id == selectedPackageId) {
+            selectedItemIndex = static_cast<int>(i);
+        }
     }
 }
 
 void OpenHubBrowserWidget::Impl::syncWithGridView()
 {
-    if (!owner->m_gridView)
+    if (!owner->m_gridView) {
         return;
+    }
 
     auto &catIndex = owner->m_gridView->catalogIndex();
     catIndex.clear();
@@ -531,7 +601,6 @@ void OpenHubBrowserWidget::Impl::syncWithGridView()
         ci.file_size = rec.file_size_bytes;
         ci.date_modified = static_cast<int64_t>(rec.timestamp);
 
-        // Map badge
         switch (rec.type) {
         case WWPKG_TYPE_VIDEO_STREAM:
             ci.badge = WallpaperBadge::Video;
@@ -563,24 +632,27 @@ void OpenHubBrowserWidget::Impl::syncWithGridView()
 
 void OpenHubBrowserWidget::Impl::updateInspector(const OpenHubRecord &rec)
 {
-    if (!inspectorDrawer)
+    if (!inspectorDrawer) {
         return;
+    }
 
     inspectorTitleLabel->setText(rec.name);
     inspectorVersionSlugLabel->setText(QString("<b>%1</b> (v%2) | %3 | %4")
-                                           .arg(rec.slug)
-                                           .arg(rec.version)
-                                           .arg(rec.license)
-                                           .arg(formatBytes(rec.file_size_bytes)));
+                                           .arg(rec.slug.toHtmlEscaped())
+                                           .arg(rec.version.toHtmlEscaped())
+                                           .arg(rec.license.toHtmlEscaped())
+                                           .arg(formatBytes(rec.file_size_bytes).toHtmlEscaped()));
 
-    inspectorAuthorLabel->setText(
-        QString("Author: %1 &lt;%2&gt;").arg(rec.author_name).arg(rec.author_email));
+    inspectorAuthorLabel->setText(QString("Author: %1 &lt;%2&gt;")
+                                      .arg(rec.author_name.toHtmlEscaped())
+                                      .arg(rec.author_email.toHtmlEscaped()));
+
     QString shortCid =
         rec.cid.length() > 24 ? (rec.cid.left(15) + "..." + rec.cid.right(8)) : rec.cid;
-    inspectorCidLabel->setText(QString("<b>CID:</b> <code>%1</code>").arg(shortCid));
+    inspectorCidLabel->setText(
+        QString("<b>CID:</b> <code>%1</code>").arg(shortCid.toHtmlEscaped()));
     inspectorCidLabel->setToolTip(rec.cid);
 
-    // Cryptographic verification badge
     if (rec.is_verified) {
         cryptoBadgeLabel->setText("Verified Signature");
         cryptoBadgeLabel->setStyleSheet(
@@ -597,14 +669,15 @@ void OpenHubBrowserWidget::Impl::updateInspector(const OpenHubRecord &rec)
         rec.author_pubkey_hex.length() > 16
             ? (rec.author_pubkey_hex.left(8) + "..." + rec.author_pubkey_hex.right(8))
             : rec.author_pubkey_hex;
-    authorPubkeyLabel->setText(QString("Public Key: <code>%1</code>").arg(shortPubkey));
+    authorPubkeyLabel->setText(
+        QString("Public Key: <code>%1</code>").arg(shortPubkey.toHtmlEscaped()));
 
     QString shortMerkle = rec.merkle_root_hex.length() > 16
                               ? (rec.merkle_root_hex.left(8) + "..." + rec.merkle_root_hex.right(8))
                               : rec.merkle_root_hex;
-    merkleRootLabel->setText(QString("Merkle Root: <code>%1</code>").arg(shortMerkle));
+    merkleRootLabel->setText(
+        QString("Merkle Root: <code>%1</code>").arg(shortMerkle.toHtmlEscaped()));
 
-    // Capability pills (2-column grid so 1-4 badges fit cleanly in narrow docks)
     QLayoutItem *child;
     while ((child = capabilitiesLayout->takeAt(0)) != nullptr) {
         delete child->widget();
@@ -614,6 +687,7 @@ void OpenHubBrowserWidget::Impl::updateInspector(const OpenHubRecord &rec)
     int pillIdx = 0;
     auto addPill = [this, &pillIdx](const QString &text, const char *style) {
         auto *lbl = new QLabel(text, capabilitiesContainer);
+        lbl->setTextFormat(Qt::PlainText);
         lbl->setAlignment(Qt::AlignCenter);
         lbl->setStyleSheet(style);
         capabilitiesLayout->addWidget(lbl, pillIdx / 2, pillIdx % 2);
@@ -628,7 +702,6 @@ void OpenHubBrowserWidget::Impl::updateInspector(const OpenHubRecord &rec)
         addPill("SceneScript", STYLE_PILL_SCRIPT);
     addPill("Offline Safe", STYLE_PILL_AIRGAP);
 
-    // Resource budgets
     vramBudgetLabel->setText(QString("VRAM Limit: %1 MB").arg(rec.max_vram_mb));
     vramBudgetBar->setValue(static_cast<int>(std::min(rec.max_vram_mb, 512u)));
 
@@ -636,29 +709,176 @@ void OpenHubBrowserWidget::Impl::updateInspector(const OpenHubRecord &rec)
     ramBudgetBar->setValue(static_cast<int>(std::min(rec.max_ram_mb, 1024u)));
 
     targetFpsBadge->setText(QString("Target: <b>%1 FPS</b>").arg(rec.target_fps));
+    installStateBadge->setToolTip(rec.last_error_message);
 
-    // Install / Download status
+    // Gate Apply strictly behind verified cryptographic signature + local installation
+    const bool canApply = rec.is_installed && rec.is_verified && !rec.is_downloading;
+    applyToMonitorBtn->setEnabled(canApply);
+
     if (rec.is_downloading) {
         installStateBadge->setText("<font color='#38bdf8'><b>Downloading...</b></font>");
         downloadProgressBox->setVisible(true);
         installDownloadBtn->setText("Cancel Download");
-        applyToMonitorBtn->setEnabled(false);
-    } else if (rec.is_installed) {
+        installDownloadBtn->setEnabled(true);
+    } else if (rec.last_download_failed) {
+        installStateBadge->setText("<font color='#f87171'><b>Download Failed</b></font>");
+        downloadProgressBox->setVisible(false);
+        installDownloadBtn->setText("Retry Install");
+        installDownloadBtn->setEnabled(!rec.download_url.isEmpty());
+    } else if (rec.last_download_cancelled) {
+        installStateBadge->setText("<font color='#94a3b8'>Cancelled</font>");
+        downloadProgressBox->setVisible(false);
+        installDownloadBtn->setText(rec.is_installed ? "Reinstall" : "Install");
+        installDownloadBtn->setEnabled(!rec.download_url.isEmpty());
+    } else if (rec.is_installed && rec.is_verified) {
         installStateBadge->setText("<font color='#34d399'><b>Installed</b></font>");
         downloadProgressBox->setVisible(false);
         installDownloadBtn->setText("Reinstall");
-        applyToMonitorBtn->setEnabled(true);
+        installDownloadBtn->setEnabled(!rec.download_url.isEmpty());
+    } else if (!rec.local_pkg_path.isEmpty() && !rec.is_verified) {
+        installStateBadge->setText("<font color='#f87171'><b>Signature Rejected</b></font>");
+        downloadProgressBox->setVisible(false);
+        installDownloadBtn->setText("Blocked");
+        installDownloadBtn->setEnabled(false);
     } else {
         installStateBadge->setText("<font color='#94a3b8'>Available</font>");
         downloadProgressBox->setVisible(false);
         installDownloadBtn->setText("Install");
-        applyToMonitorBtn->setEnabled(false);
+        installDownloadBtn->setEnabled(!rec.download_url.isEmpty());
     }
 }
 
-// -----------------------------------------------------------------------------
-// OpenHubBrowserWidget Public Interface
-// -----------------------------------------------------------------------------
+void OpenHubBrowserWidget::Impl::handleDownloadProgress(const QString &pkgId,
+                                                        const DownloadProgress &prog)
+{
+    std::string key = pkgId.toStdString();
+
+    QString expectedMerkle;
+    QString expectedPubkey;
+    QString expectedCid;
+    if (auto allIt = allIdToIndex.find(key); allIt != allIdToIndex.end()) {
+        const auto &prev = allRecords[allIt->second];
+        expectedMerkle = prev.merkle_root_hex.trimmed();
+        expectedPubkey = prev.author_pubkey_hex.trimmed();
+        expectedCid = prev.cid.trimmed();
+    } else if (auto filtIt = idToIndex.find(key); filtIt != idToIndex.end()) {
+        const auto &prev = filteredRecords[filtIt->second];
+        expectedMerkle = prev.merkle_root_hex.trimmed();
+        expectedPubkey = prev.author_pubkey_hex.trimmed();
+        expectedCid = prev.cid.trimmed();
+    }
+
+    bool verifiedInstall = false;
+    bool digestMismatch = false;
+    OpenHubRecord verifiedMeta;
+    if (prog.state == TaskState::Installed && !prog.installed_path.empty()) {
+        verifiedInstall = parseVerifiedPackageFile(prog.installed_path, verifiedMeta);
+        if (verifiedInstall && verifiedMeta.is_verified) {
+            if (!expectedMerkle.isEmpty() &&
+                expectedMerkle.compare(verifiedMeta.merkle_root_hex, Qt::CaseInsensitive) != 0) {
+                digestMismatch = true;
+            }
+            if (!expectedPubkey.isEmpty() &&
+                expectedPubkey.compare(verifiedMeta.author_pubkey_hex, Qt::CaseInsensitive) != 0) {
+                digestMismatch = true;
+            }
+            if (expectedCid.startsWith(QStringLiteral("sha256:"), Qt::CaseInsensitive) &&
+                expectedCid.compare(verifiedMeta.cid, Qt::CaseInsensitive) != 0) {
+                digestMismatch = true;
+            }
+        }
+        if (!verifiedInstall || !verifiedMeta.is_verified || digestMismatch) {
+            std::error_code rmEc;
+            std::filesystem::remove(prog.installed_path, rmEc);
+            if (!prog.extracted_dir.empty()) {
+                std::filesystem::remove_all(prog.extracted_dir, rmEc);
+            }
+        }
+    }
+
+    auto applyState = [&](OpenHubRecord &rec) {
+        if (prog.bytes_total > 0) {
+            rec.file_size_bytes = prog.bytes_total;
+        }
+        switch (prog.state) {
+        case TaskState::Queued:
+        case TaskState::Probing:
+        case TaskState::Downloading:
+        case TaskState::Extracting:
+        case TaskState::Verifying:
+        case TaskState::Indexing:
+            rec.is_downloading = true;
+            rec.last_download_failed = false;
+            rec.last_download_cancelled = false;
+            rec.last_error_message.clear();
+            rec.download_pct = prog.progress_pct;
+            rec.download_speed_bps = prog.speed_bytes_per_sec;
+            break;
+        case TaskState::Installed:
+            rec.is_downloading = false;
+            if (verifiedInstall && verifiedMeta.is_verified && !digestMismatch) {
+                rec.local_pkg_path = verifiedMeta.local_pkg_path;
+                rec.author_pubkey_hex = verifiedMeta.author_pubkey_hex;
+                rec.merkle_root_hex = verifiedMeta.merkle_root_hex;
+                rec.signature_hex = verifiedMeta.signature_hex;
+                rec.cid = verifiedMeta.cid;
+                rec.is_verified = true;
+                rec.is_trusted = verifiedMeta.is_trusted;
+                rec.is_installed = true;
+                rec.last_download_failed = false;
+                rec.last_download_cancelled = false;
+                rec.last_error_message.clear();
+            } else {
+                rec.local_pkg_path.clear();
+                rec.is_verified = false;
+                rec.is_installed = false;
+                rec.last_download_failed = true;
+                rec.last_download_cancelled = false;
+                rec.last_error_message =
+                    digestMismatch
+                        ? QStringLiteral("Downloaded package digest or author key mismatch")
+                        : QStringLiteral("Ed25519 package signature verification failed");
+            }
+            break;
+        case TaskState::Failed:
+            rec.is_downloading = false;
+            rec.last_download_failed = true;
+            rec.last_download_cancelled = false;
+            rec.last_error_message = QString::fromStdString(prog.error_message);
+            break;
+        case TaskState::Cancelled:
+            rec.is_downloading = false;
+            rec.last_download_failed = false;
+            rec.last_download_cancelled = true;
+            rec.last_error_message.clear();
+            break;
+        }
+    };
+
+    auto allIt = allIdToIndex.find(key);
+    if (allIt != allIdToIndex.end()) {
+        applyState(allRecords[allIt->second]);
+    }
+
+    auto filtIt = idToIndex.find(key);
+    if (filtIt == idToIndex.end()) {
+        return;
+    }
+
+    auto &rec = filteredRecords[filtIt->second];
+    applyState(rec);
+
+    if (selectedItemIndex == static_cast<int>(filtIt->second)) {
+        if (prog.state == TaskState::Downloading || prog.state == TaskState::Verifying ||
+            prog.state == TaskState::Queued) {
+            owner->onDownloadProgressUpdated(pkgId, std::min(prog.progress_pct, 99.9f),
+                                             prog.speed_bytes_per_sec);
+        } else {
+            downloadProgressBox->setVisible(false);
+            updateInspector(rec);
+        }
+    }
+}
 
 OpenHubBrowserWidget::OpenHubBrowserWidget(std::shared_ptr<DownloadManager> downloadMgr,
                                            QWidget *parent)
@@ -669,13 +889,13 @@ OpenHubBrowserWidget::OpenHubBrowserWidget(std::shared_ptr<DownloadManager> down
     setupUi();
     wireSignals();
 
-    m_impl->scanLocalHubPackages();
-    m_impl->populateCuratedHubFeed();
     m_impl->executeQuery();
+    m_impl->launchAsyncScan();
 }
 
 OpenHubBrowserWidget::~OpenHubBrowserWidget()
 {
+    m_impl->stopScanThread();
     if (m_impl->hoverDwellTimer) {
         m_impl->hoverDwellTimer->stop();
     }
@@ -696,7 +916,6 @@ void OpenHubBrowserWidget::setupUi()
     rootLayout->setContentsMargins(0, 0, 0, 0);
     rootLayout->setSpacing(0);
 
-    // 1. Top Toolbar (2 clean rows to avoid crowding in narrow docks)
     auto *toolbarFrame = new QFrame(this);
     toolbarFrame->setStyleSheet("background-color: #181b22; border-bottom: 1px solid #262b36;");
     auto *toolbarOuter = new QVBoxLayout(toolbarFrame);
@@ -706,7 +925,6 @@ void OpenHubBrowserWidget::setupUi()
     auto *topRow = new QHBoxLayout();
     topRow->setSpacing(8);
 
-    // Search Bar
     m_searchEdit = new QLineEdit(toolbarFrame);
     m_searchEdit->setPlaceholderText("Search Open Hub...");
     m_searchEdit->setClearButtonEnabled(true);
@@ -714,7 +932,6 @@ void OpenHubBrowserWidget::setupUi()
     m_searchEdit->setStyleSheet(STYLE_SEARCH_BAR);
     topRow->addWidget(m_searchEdit, 1);
 
-    // Refresh Feed Button
     m_refreshBtn = new QToolButton(toolbarFrame);
     m_refreshBtn->setText("Refresh");
     m_refreshBtn->setToolTip("Refresh Open Hub feed and local packages");
@@ -725,8 +942,6 @@ void OpenHubBrowserWidget::setupUi()
         "QToolButton:hover { background-color: #2a303d; color: #ffffff; }");
     topRow->addWidget(m_refreshBtn);
 
-    // Keep wizardLaunchBtn instantiated for signal compatibility, hidden to avoid duplicating main
-    // toolbar
     m_impl->wizardLaunchBtn = new QToolButton(toolbarFrame);
     m_impl->wizardLaunchBtn->setText("Package...");
     m_impl->wizardLaunchBtn->setVisible(false);
@@ -736,7 +951,6 @@ void OpenHubBrowserWidget::setupUi()
     auto *filterRow = new QHBoxLayout();
     filterRow->setSpacing(8);
 
-    // Category Combo
     m_categoryCombo = new QComboBox(toolbarFrame);
     m_categoryCombo->addItems({"All Categories", "Fragment Shaders", "Compute Shaders", "2D Scenes",
                                "Puppet Scenes", "Particle Systems", "Video Streams"});
@@ -744,7 +958,6 @@ void OpenHubBrowserWidget::setupUi()
     m_categoryCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
     filterRow->addWidget(m_categoryCombo, 1);
 
-    // Sort Combo
     m_sortCombo = new QComboBox(toolbarFrame);
     m_sortCombo->addItems({"Trending", "Most Downloaded", "Recently Updated", "Name"});
     m_sortCombo->setFixedHeight(26);
@@ -754,17 +967,14 @@ void OpenHubBrowserWidget::setupUi()
     toolbarOuter->addLayout(filterRow);
     rootLayout->addWidget(toolbarFrame);
 
-    // 2. Main Splitter View (Grid View & Package Details Inspector)
     m_impl->mainSplitter = new QSplitter(Qt::Vertical, this);
     m_impl->mainSplitter->setStyleSheet(
         "QSplitter::handle { background-color: #262b36; height: 2px; }");
 
-    // Grid View
     m_gridView = new VirtualizedGridWidget(m_impl->mainSplitter);
     m_gridView->setEmbeddedMode(true);
     m_impl->mainSplitter->addWidget(m_gridView);
 
-    // Package Details Inspector Drawer
     m_impl->inspectorScrollArea = new QScrollArea(m_impl->mainSplitter);
     m_impl->inspectorScrollArea->setWidgetResizable(true);
     m_impl->inspectorScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -776,9 +986,9 @@ void OpenHubBrowserWidget::setupUi()
     drawerLayout->setContentsMargins(14, 14, 14, 14);
     drawerLayout->setSpacing(10);
 
-    // Package Titles
     m_impl->inspectorTitleLabel =
         new QLabel("Select a package to view details", m_impl->inspectorDrawer);
+    m_impl->inspectorTitleLabel->setTextFormat(Qt::PlainText);
     m_impl->inspectorTitleLabel->setStyleSheet(
         "font-size: 14px; font-weight: bold; color: #f1f5f9;");
     m_impl->inspectorTitleLabel->setWordWrap(true);
@@ -797,7 +1007,6 @@ void OpenHubBrowserWidget::setupUi()
     m_impl->inspectorAuthorLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->inspectorAuthorLabel);
 
-    // Content-Addressed Identifier Row
     auto *cidRow = new QHBoxLayout();
     cidRow->setSpacing(8);
     m_impl->inspectorCidLabel = new QLabel("CID: None", m_impl->inspectorDrawer);
@@ -812,8 +1021,8 @@ void OpenHubBrowserWidget::setupUi()
     cidRow->addWidget(m_impl->copyCidBtn);
     drawerLayout->addLayout(cidRow);
 
-    // Cryptographic Verification Status Badge
     m_impl->cryptoBadgeLabel = new QLabel("Signature Status", m_impl->inspectorDrawer);
+    m_impl->cryptoBadgeLabel->setTextFormat(Qt::PlainText);
     m_impl->cryptoBadgeLabel->setAlignment(Qt::AlignCenter);
     drawerLayout->addWidget(m_impl->cryptoBadgeLabel);
 
@@ -827,7 +1036,6 @@ void OpenHubBrowserWidget::setupUi()
     m_impl->merkleRootLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->merkleRootLabel);
 
-    // Capability Pills Strip
     auto *capTitle = new QLabel("<b>Capabilities</b>", m_impl->inspectorDrawer);
     capTitle->setStyleSheet("font-size: 11px; color: #cbd5e1;");
     drawerLayout->addWidget(capTitle);
@@ -839,7 +1047,6 @@ void OpenHubBrowserWidget::setupUi()
     m_impl->capabilitiesLayout->setVerticalSpacing(6);
     drawerLayout->addWidget(m_impl->capabilitiesContainer);
 
-    // Resource Budget Bars
     auto *budgetsFrame = new QFrame(m_impl->inspectorDrawer);
     budgetsFrame->setStyleSheet(
         "background: #14171c; border: 1px solid #2c3240; border-radius: 6px; padding: 6px;");
@@ -849,6 +1056,7 @@ void OpenHubBrowserWidget::setupUi()
 
     auto *vramRow = new QHBoxLayout();
     m_impl->vramBudgetLabel = new QLabel("VRAM Limit: 128 MB", budgetsFrame);
+    m_impl->vramBudgetLabel->setTextFormat(Qt::PlainText);
     m_impl->vramBudgetLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     vramRow->addWidget(m_impl->vramBudgetLabel);
     m_impl->vramBudgetBar = new QProgressBar(budgetsFrame);
@@ -864,6 +1072,7 @@ void OpenHubBrowserWidget::setupUi()
 
     auto *ramRow = new QHBoxLayout();
     m_impl->ramBudgetLabel = new QLabel("RAM Limit: 256 MB", budgetsFrame);
+    m_impl->ramBudgetLabel->setTextFormat(Qt::PlainText);
     m_impl->ramBudgetLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     ramRow->addWidget(m_impl->ramBudgetLabel);
     m_impl->ramBudgetBar = new QProgressBar(budgetsFrame);
@@ -883,7 +1092,6 @@ void OpenHubBrowserWidget::setupUi()
 
     drawerLayout->addWidget(budgetsFrame);
 
-    // Install Status
     auto *statusRow = new QHBoxLayout();
     auto *stLbl = new QLabel("Status:", m_impl->inspectorDrawer);
     stLbl->setStyleSheet("font-size: 11px; color: #94a3b8;");
@@ -893,7 +1101,6 @@ void OpenHubBrowserWidget::setupUi()
     statusRow->addWidget(m_impl->installStateBadge, 1);
     drawerLayout->addLayout(statusRow);
 
-    // Download Progress Box
     m_impl->downloadProgressBox = new QWidget(m_impl->inspectorDrawer);
     auto *dlLayout = new QVBoxLayout(m_impl->downloadProgressBox);
     dlLayout->setContentsMargins(0, 0, 0, 0);
@@ -911,19 +1118,19 @@ void OpenHubBrowserWidget::setupUi()
 
     m_impl->downloadTelemetryLabel =
         new QLabel("Downloading: 0% (0.0 MB/s)", m_impl->downloadProgressBox);
+    m_impl->downloadTelemetryLabel->setTextFormat(Qt::PlainText);
     m_impl->downloadTelemetryLabel->setStyleSheet("font-size: 10px; color: #38bdf8;");
     dlLayout->addWidget(m_impl->downloadTelemetryLabel);
 
     m_impl->downloadProgressBox->setVisible(false);
     drawerLayout->addWidget(m_impl->downloadProgressBox);
 
-    // Install Button
     m_impl->installDownloadBtn = new QPushButton("Install", m_impl->inspectorDrawer);
     m_impl->installDownloadBtn->setFixedHeight(30);
     m_impl->installDownloadBtn->setStyleSheet(STYLE_BUTTON_PRIMARY);
+    m_impl->installDownloadBtn->setEnabled(false);
     drawerLayout->addWidget(m_impl->installDownloadBtn);
 
-    // Apply to Monitor Row
     auto *applyRow = new QHBoxLayout();
     applyRow->setSpacing(8);
     m_impl->monitorTargetCombo = new QComboBox(m_impl->inspectorDrawer);
@@ -935,6 +1142,7 @@ void OpenHubBrowserWidget::setupUi()
     m_impl->applyToMonitorBtn = new QPushButton("Apply", m_impl->inspectorDrawer);
     m_impl->applyToMonitorBtn->setFixedHeight(28);
     m_impl->applyToMonitorBtn->setStyleSheet(STYLE_BUTTON_SECONDARY);
+    m_impl->applyToMonitorBtn->setEnabled(false);
     applyRow->addWidget(m_impl->applyToMonitorBtn, 1);
     drawerLayout->addLayout(applyRow);
 
@@ -947,7 +1155,6 @@ void OpenHubBrowserWidget::setupUi()
     m_impl->mainSplitter->setStretchFactor(1, 40);
     rootLayout->addWidget(m_impl->mainSplitter, 1);
 
-    // 3. Bottom Status Strip
     auto *bottomStrip = new QFrame(this);
     bottomStrip->setStyleSheet(
         "background-color: #14171c; border-top: 1px solid #262b36; padding: 2px;");
@@ -955,6 +1162,7 @@ void OpenHubBrowserWidget::setupUi()
     bottomLayout->setContentsMargins(10, 4, 10, 4);
 
     m_impl->statusTelemetryLabel = new QLabel("Open Hub Ready", bottomStrip);
+    m_impl->statusTelemetryLabel->setTextFormat(Qt::PlainText);
     m_impl->statusTelemetryLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     bottomLayout->addWidget(m_impl->statusTelemetryLabel);
     bottomLayout->addStretch();
@@ -964,7 +1172,6 @@ void OpenHubBrowserWidget::setupUi()
 
 void OpenHubBrowserWidget::wireSignals()
 {
-    // Search Debounce Timer
     m_impl->searchDebounceTimer = new QTimer(this);
     m_impl->searchDebounceTimer->setSingleShot(true);
     m_impl->searchDebounceTimer->setInterval(100);
@@ -977,25 +1184,20 @@ void OpenHubBrowserWidget::wireSignals()
     connect(m_impl->searchDebounceTimer, &QTimer::timeout, this,
             [this]() { setFilterQuery(m_impl->activeQuery); });
 
-    // Category Filter
     connect(m_categoryCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             &OpenHubBrowserWidget::setCategoryFilter);
 
-    // Sort Order
     connect(m_sortCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             &OpenHubBrowserWidget::setSortOrder);
 
-    // Refresh Feed
     connect(m_refreshBtn, &QToolButton::clicked, this, &OpenHubBrowserWidget::refreshFeed);
 
-    // Launch Creator Packaging Wizard
     connect(m_impl->wizardLaunchBtn, &QToolButton::clicked, this, [this]() {
         auto *wizard = new CreatorPackagingWizard(this);
         wizard->setAttribute(Qt::WA_DeleteOnClose);
         wizard->show();
     });
 
-    // 150 ms Dwell Hover Preview Filter with immediate cancellation on cursor exit
     m_impl->hoverDwellTimer = new QTimer(this);
     m_impl->hoverDwellTimer->setSingleShot(true);
     m_impl->hoverDwellTimer->setInterval(150);
@@ -1019,12 +1221,12 @@ void OpenHubBrowserWidget::wireSignals()
         }
     });
 
-    // Grid selection & double click
     connect(m_gridView, &VirtualizedGridWidget::wallpaperSelected, this,
             [this](const CatalogItem &item) {
                 auto it = m_impl->idToIndex.find(item.workshop_id);
                 if (it != m_impl->idToIndex.end()) {
                     m_impl->selectedItemIndex = static_cast<int>(it->second);
+                    m_impl->selectedPackageId = m_impl->filteredRecords[it->second].id;
                     m_impl->updateInspector(m_impl->filteredRecords[it->second]);
                 }
             });
@@ -1037,18 +1239,22 @@ void OpenHubBrowserWidget::wireSignals()
                 }
             });
 
-    // Copy CID to clipboard
     connect(m_impl->copyCidBtn, &QPushButton::clicked, this, [this]() {
         if (m_impl->selectedItemIndex >= 0 &&
             static_cast<size_t>(m_impl->selectedItemIndex) < m_impl->filteredRecords.size()) {
             QApplication::clipboard()->setText(
                 m_impl->filteredRecords[m_impl->selectedItemIndex].cid);
             m_impl->copyCidBtn->setText("Copied!");
-            QTimer::singleShot(1500, this, [this]() { m_impl->copyCidBtn->setText("Copy"); });
+            QPointer<OpenHubBrowserWidget> self(this);
+            QTimer::singleShot(1500, this, [self]() {
+                if (self && self->m_impl->copyCidBtn) {
+                    self->m_impl->copyCidBtn->setText("Copy");
+                }
+            });
         }
     });
 
-    // 1-Click Install Button
+    // Install / Cancel Download toggle
     connect(m_impl->installDownloadBtn, &QPushButton::clicked, this, [this]() {
         if (m_impl->selectedItemIndex < 0 ||
             static_cast<size_t>(m_impl->selectedItemIndex) >= m_impl->filteredRecords.size()) {
@@ -1056,26 +1262,64 @@ void OpenHubBrowserWidget::wireSignals()
         }
 
         auto &rec = m_impl->filteredRecords[m_impl->selectedItemIndex];
-
-        if (m_downloadMgr) {
-            rec.is_downloading = true;
-            m_impl->updateInspector(rec);
-
-            m_downloadMgr->enqueue(rec.id.toStdString(), rec.download_url.toStdString(),
-                                   TaskPriority::Interactive,
-                                   [this, pkgId = rec.id](const DownloadProgress &prog) {
-                                       QMetaObject::invokeMethod(
-                                           this,
-                                           [this, pkgId, prog]() {
-                                               onDownloadProgressUpdated(pkgId, prog.progress_pct,
-                                                                         prog.speed_bytes_per_sec);
-                                           },
-                                           Qt::QueuedConnection);
-                                   });
+        if (!m_downloadMgr) {
+            return;
         }
+
+        // Cancel active download via cancelOpenHub rather than re-enqueuing
+        if (rec.is_downloading) {
+            m_downloadMgr->cancelOpenHub(rec.id.toStdString());
+            rec.is_downloading = false;
+            rec.last_download_cancelled = true;
+            rec.last_download_failed = false;
+
+            auto allIt = m_impl->allIdToIndex.find(rec.id.toStdString());
+            if (allIt != m_impl->allIdToIndex.end()) {
+                m_impl->allRecords[allIt->second].is_downloading = false;
+                m_impl->allRecords[allIt->second].last_download_cancelled = true;
+                m_impl->allRecords[allIt->second].last_download_failed = false;
+            }
+            m_impl->updateInspector(rec);
+            return;
+        }
+
+        if (rec.download_url.isEmpty()) {
+            return;
+        }
+
+        rec.is_downloading = true;
+        rec.last_download_cancelled = false;
+        rec.last_download_failed = false;
+        rec.last_error_message.clear();
+
+        auto allIt = m_impl->allIdToIndex.find(rec.id.toStdString());
+        if (allIt != m_impl->allIdToIndex.end()) {
+            m_impl->allRecords[allIt->second].is_downloading = true;
+            m_impl->allRecords[allIt->second].last_download_cancelled = false;
+            m_impl->allRecords[allIt->second].last_download_failed = false;
+        }
+        m_impl->updateInspector(rec);
+
+        QPointer<OpenHubBrowserWidget> self(this);
+        QString pkgId = rec.id;
+        m_downloadMgr->enqueue(pkgId.toStdString(), rec.download_url.toStdString(),
+                               TaskPriority::Interactive,
+                               [self, pkgId](const DownloadProgress &prog) {
+                                   if (!self) {
+                                       return;
+                                   }
+                                   QMetaObject::invokeMethod(
+                                       self,
+                                       [self, pkgId, prog]() {
+                                           if (self) {
+                                               self->m_impl->handleDownloadProgress(pkgId, prog);
+                                           }
+                                       },
+                                       Qt::QueuedConnection);
+                               });
     });
 
-    // Apply to Monitor Button
+    // Apply strictly gated behind verified cryptographic signature + local install
     connect(m_impl->applyToMonitorBtn, &QPushButton::clicked, this, [this]() {
         if (m_impl->selectedItemIndex < 0 ||
             static_cast<size_t>(m_impl->selectedItemIndex) >= m_impl->filteredRecords.size()) {
@@ -1083,19 +1327,17 @@ void OpenHubBrowserWidget::wireSignals()
         }
 
         const auto &rec = m_impl->filteredRecords[m_impl->selectedItemIndex];
+        if (!rec.is_installed || !rec.is_verified || rec.is_downloading) {
+            return;
+        }
+
         QString target = m_impl->monitorTargetCombo->currentText();
         emit packageSelected(rec.id, rec.cid);
         emit packageInstallRequested(rec.id, target);
     });
 }
 
-void OpenHubBrowserWidget::refreshFeed()
-{
-    m_impl->allRecords.clear();
-    m_impl->scanLocalHubPackages();
-    m_impl->populateCuratedHubFeed();
-    m_impl->executeQuery();
-}
+void OpenHubBrowserWidget::refreshFeed() { m_impl->launchAsyncScan(); }
 
 void OpenHubBrowserWidget::setFilterQuery(const QString &query)
 {
@@ -1123,11 +1365,12 @@ void OpenHubBrowserWidget::onItemDoubleClicked(int itemIndex)
 
     const auto &rec = m_impl->filteredRecords[itemIndex];
     m_impl->selectedItemIndex = itemIndex;
+    m_impl->selectedPackageId = rec.id;
     m_impl->updateInspector(rec);
 
     emit packageSelected(rec.id, rec.cid);
 
-    if (rec.is_installed) {
+    if (rec.is_installed && rec.is_verified && !rec.is_downloading) {
         emit packageInstallRequested(rec.id, m_impl->monitorTargetCombo->currentText());
     }
 }
@@ -1159,8 +1402,37 @@ void OpenHubBrowserWidget::onItemHoverStarted(int itemIndex)
 void OpenHubBrowserWidget::onDownloadProgressUpdated(const QString &packageId, float progressPct,
                                                      float speedBps)
 {
-    auto it = m_impl->idToIndex.find(packageId.toStdString());
+    double speedMiB = static_cast<double>(std::max(0.0f, speedBps)) / (1024.0 * 1024.0);
+    float clampedPct = std::clamp(progressPct, 0.0f, 100.0f);
+
+    std::string key = packageId.toStdString();
+    auto allIt = m_impl->allIdToIndex.find(key);
+    if (allIt != m_impl->allIdToIndex.end()) {
+        auto &arec = m_impl->allRecords[allIt->second];
+        if (progressPct >= 100.0f) {
+            arec.is_downloading = false;
+            if (!arec.local_pkg_path.isEmpty()) {
+                OpenHubRecord verifiedMeta;
+                if (parseVerifiedPackageFile(arec.local_pkg_path.toStdString(), verifiedMeta) &&
+                    verifiedMeta.is_verified) {
+                    arec.is_verified = true;
+                    arec.is_installed = true;
+                }
+            }
+        } else {
+            arec.is_downloading = true;
+            arec.download_pct = clampedPct;
+            arec.download_speed_bps = speedBps;
+        }
+    }
+
+    auto it = m_impl->idToIndex.find(key);
     if (it == m_impl->idToIndex.end()) {
+        if (m_impl->downloadTelemetryLabel && progressPct < 100.0f) {
+            m_impl->downloadTelemetryLabel->setText(QString("Downloading: %1% (%2 MB/s)")
+                                                        .arg(static_cast<int>(clampedPct))
+                                                        .arg(QString::number(speedMiB, 'f', 1)));
+        }
         return;
     }
 
@@ -1168,25 +1440,30 @@ void OpenHubBrowserWidget::onDownloadProgressUpdated(const QString &packageId, f
 
     if (progressPct >= 100.0f) {
         rec.is_downloading = false;
-        rec.is_installed = true;
+        if (!rec.local_pkg_path.isEmpty()) {
+            OpenHubRecord verifiedMeta;
+            if (parseVerifiedPackageFile(rec.local_pkg_path.toStdString(), verifiedMeta) &&
+                verifiedMeta.is_verified) {
+                rec.is_verified = true;
+                rec.is_installed = true;
+            }
+        }
         if (m_impl->selectedItemIndex == static_cast<int>(it->second)) {
             m_impl->downloadProgressBox->setVisible(false);
             m_impl->updateInspector(rec);
         }
     } else {
         rec.is_downloading = true;
-        rec.download_pct = progressPct;
+        rec.download_pct = clampedPct;
         rec.download_speed_bps = speedBps;
 
         if (m_impl->selectedItemIndex == static_cast<int>(it->second)) {
             m_impl->downloadProgressBox->setVisible(true);
-            m_impl->downloadProgressBar->setValue(
-                static_cast<int>(std::clamp(progressPct, 0.0f, 100.0f)));
+            m_impl->downloadProgressBar->setValue(static_cast<int>(clampedPct));
 
-            double speedMiB = static_cast<double>(speedBps) / (1024.0 * 1024.0);
             uint64_t downloadedBytes = static_cast<uint64_t>(
-                static_cast<double>(rec.file_size_bytes) * (progressPct / 100.0));
-            uint32_t etaSec = (speedBps > 1024.0f)
+                static_cast<double>(rec.file_size_bytes) * (clampedPct / 100.0));
+            uint32_t etaSec = (speedBps > 1024.0f && rec.file_size_bytes > downloadedBytes)
                                   ? static_cast<uint32_t>((rec.file_size_bytes - downloadedBytes) /
                                                           static_cast<uint64_t>(speedBps))
                                   : 0;
@@ -1195,7 +1472,7 @@ void OpenHubBrowserWidget::onDownloadProgressUpdated(const QString &packageId, f
                 QString("Downloading .wwpkg: %1 / %2 (%3 MB/s, ETA: %4s)")
                     .arg(formatBytes(downloadedBytes))
                     .arg(formatBytes(rec.file_size_bytes))
-                    .arg(speedMiB, 0, 'f', 1)
+                    .arg(QString::number(speedMiB, 'f', 1))
                     .arg(etaSec));
         }
     }

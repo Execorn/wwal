@@ -253,17 +253,21 @@ void ThemeStudioWidget::resizeEvent(QResizeEvent *event)
     QWidget::resizeEvent(event);
     if (m_mainSplitter) {
         Qt::Orientation target = (width() >= 540) ? Qt::Horizontal : Qt::Vertical;
-        if (m_mainSplitter->orientation() != target) {
+        const bool orientationChanged = (m_mainSplitter->orientation() != target);
+        if (orientationChanged) {
             m_mainSplitter->setOrientation(target);
         }
-        if (target == Qt::Vertical && height() > 240) {
-            const int availH = std::max(240, height() - 32);
-            const int bottomH = (availH >= 560) ? 300 : 140;
-            const int topH = std::max(260, availH - bottomH - 4);
-            m_mainSplitter->setSizes({topH, std::max(96, availH - topH)});
-        } else if (target == Qt::Horizontal && width() > 300) {
-            int leftW = static_cast<int>(width() * 0.54);
-            m_mainSplitter->setSizes({leftW, width() - leftW});
+        const bool userMoved = m_mainSplitter->property("wwal_user_moved").toBool();
+        if (!userMoved || orientationChanged) {
+            if (target == Qt::Vertical && height() > 240) {
+                const int availH = std::max(240, height() - 32);
+                const int bottomH = (availH >= 560) ? 300 : 140;
+                const int topH = std::max(260, availH - bottomH - 4);
+                m_mainSplitter->setSizes({topH, std::max(96, availH - topH)});
+            } else if (target == Qt::Horizontal && width() > 300) {
+                int leftW = static_cast<int>(width() * 0.54);
+                m_mainSplitter->setSizes({leftW, width() - leftW});
+            }
         }
     }
 }
@@ -318,6 +322,11 @@ void ThemeStudioWidget::setupUi()
     // narrow)
     m_mainSplitter = new QSplitter(Qt::Horizontal, this);
     m_mainSplitter->setChildrenCollapsible(false);
+    connect(m_mainSplitter, &QSplitter::splitterMoved, this, [this](int, int) {
+        if (m_mainSplitter) {
+            m_mainSplitter->setProperty("wwal_user_moved", true);
+        }
+    });
 
     // Left/Top Pane: Scrollable Interactive Controls & Desktop Mockup Preview
     auto *leftScroll = new QScrollArea(m_mainSplitter);

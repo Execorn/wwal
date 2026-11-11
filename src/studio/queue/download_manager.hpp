@@ -2,9 +2,9 @@
 #pragma once
 
 #include <cstdint>
-#include <string>
-#include <memory>
 #include <functional>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace wwal::studio {
@@ -19,12 +19,13 @@ enum class TaskState {
     Extracting,
     Indexing,
     Installed,
-    Failed
+    Failed,
+    Cancelled
 };
 
 struct DownloadProgress {
     uint64_t published_file_id{0};
-    std::string openhub_package_id; // UUID or CID for Open Hub packages
+    std::string openhub_package_id;
     TaskState state{TaskState::Queued};
     uint64_t bytes_downloaded{0};
     uint64_t bytes_total{0};
@@ -32,6 +33,8 @@ struct DownloadProgress {
     float speed_bytes_per_sec{0.0f};
     uint32_t eta_seconds{0};
     std::string error_message;
+    std::string installed_path;
+    std::string extracted_dir;
 };
 
 using ProgressCallback = std::function<void(const DownloadProgress &)>;
@@ -40,7 +43,7 @@ struct DownloadRequest {
     enum class SourceKind { SteamWorkshop, OpenHubPackage };
     SourceKind kind{SourceKind::SteamWorkshop};
     uint64_t steam_published_file_id{0};
-    std::string openhub_package_id; // UUID string or sha256:... CID
+    std::string openhub_package_id;
     std::string openhub_download_url;
     TaskPriority priority{TaskPriority::Interactive};
 };
@@ -58,7 +61,6 @@ class DownloadManager {
     bool initialize();
     void shutdown();
 
-    // Enqueue overloads for Steam Workshop and WayWal Open Hub
     void enqueue(uint64_t published_file_id, TaskPriority priority, ProgressCallback callback);
     void enqueue(const std::string &package_id_or_cid, const std::string &download_url,
                  TaskPriority priority, ProgressCallback callback);
@@ -75,20 +77,22 @@ class DownloadManager {
     [[nodiscard]] bool isSteamClientRunning() const noexcept;
     [[nodiscard]] size_t activeTransfers() const noexcept;
 
-    // Simulation / testing hooks
     struct SimulationHooks {
-        float drop_at_percent{0.0f};               // 0.0 = disabled, e.g. 0.5 = drop at 50%
-        bool simulate_http_200_on_resume{false};   // respond 200 instead of 206
-        int simulate_rate_limit_count{0};          // return 429 N times
-        bool force_backend_failure_a{false};       // force Backend A to fail
-        bool force_backend_failure_b{false};       // force Backend B to fail
-        bool force_backend_failure_c{false};       // force Backend C to fail
-        bool dry_run_mode{false};                  // stream synthetic data without real network
-        std::string mock_data;                     // mock data payload
-        uint64_t mock_total_size{0};               // synthetic content length
-        uint32_t simulated_drop_count{0};          // telemetry: count of drops executed
-        uint32_t simulated_429_count{0};           // telemetry: count of 429 retries
-        bool simulated_truncation_occurred{false}; // telemetry: whether truncation guard triggered
+        float drop_at_percent{0.0f};
+        bool simulate_http_200_on_resume{false};
+        int simulate_rate_limit_count{0};
+        bool force_backend_failure_a{false};
+        bool force_backend_failure_b{false};
+        bool force_backend_failure_c{false};
+        bool dry_run_mode{false};
+        bool allow_loopback_http{false};
+        uint32_t steamworks_stall_timeout_ms{30000};
+        std::string steamcmd_override_path;
+        std::string mock_data;
+        uint64_t mock_total_size{0};
+        uint32_t simulated_drop_count{0};
+        uint32_t simulated_429_count{0};
+        bool simulated_truncation_occurred{false};
     };
 
     void setSimulationHooks(const SimulationHooks &hooks);

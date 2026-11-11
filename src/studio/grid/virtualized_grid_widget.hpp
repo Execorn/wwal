@@ -2,26 +2,29 @@
 #ifndef WWAL_STUDIO_GRID_VIRTUALIZED_GRID_WIDGET_HPP
 #define WWAL_STUDIO_GRID_VIRTUALIZED_GRID_WIDGET_HPP
 
+#include <array>
 #include <cstdint>
-#include <string>
-#include <vector>
-#include <unordered_set>
+#include <list>
 #include <memory>
 #include <optional>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
-#include <QWidget>
-#include <QOpenGLWidget>
-#include <QOpenGLExtraFunctions>
-#include <QScrollBar>
-#include <QLineEdit>
 #include <QComboBox>
-#include <QPushButton>
-#include <QLabel>
 #include <QHBoxLayout>
-#include <QVBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
 #include <QMouseEvent>
-#include <QWheelEvent>
+#include <QOpenGLExtraFunctions>
+#include <QOpenGLWidget>
 #include <QPainter>
+#include <QPushButton>
+#include <QScrollBar>
+#include <QVBoxLayout>
+#include <QWheelEvent>
+#include <QWidget>
 
 #include "fuzzy_catalog_index.hpp"
 #include "gpu_texture_pool.hpp"
@@ -42,17 +45,21 @@ class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
 
   public:
     static constexpr int ITEM_WIDTH = 280;
-    static constexpr int ITEM_HEIGHT = 158; // 16:9 aspect ratio
+    static constexpr int ITEM_HEIGHT = 158;
     static constexpr int SPACING_X = 16;
     static constexpr int SPACING_Y = 16;
-    static constexpr int ROW_HEIGHT = ITEM_HEIGHT + SPACING_Y; // 174 px
-    static constexpr int OVERSCAN_ROWS = 2;                    // 2-row overscan margin
+    static constexpr int ROW_HEIGHT = ITEM_HEIGHT + SPACING_Y;
+    static constexpr int OVERSCAN_ROWS = 2;
+    static constexpr size_t MAX_COMPRESSED_CARD_TEXTURES = 256;
 
     explicit GridGlCanvas(FuzzyCatalogIndex &index, GpuTexturePool &pool,
                           HoverPreviewController &hover, QWidget *parent = nullptr);
     ~GridGlCanvas() override;
 
-    // Uniform Spatial Indexing (O(1))
+    // Software ETC2 block encoder (0.5 Bpp, 8 bytes per 4x4 block)
+    static void encodeRgbaToEtc2(const uint8_t *rgba, int width, int height,
+                                 std::vector<uint8_t> &outBlocks);
+
     [[nodiscard]] int computeColumns(int container_width) const noexcept;
     [[nodiscard]] int computeTotalRows(size_t total_items, int columns) const noexcept;
     [[nodiscard]] int computeVirtualHeight(size_t total_items, int columns) const noexcept;
@@ -99,6 +106,14 @@ class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
     void wheelEvent(QWheelEvent *event) override;
 
   private:
+    struct CompressedCardEntry {
+        GLuint tex_id{0};
+        int width{0};
+        int height{0};
+        qint64 image_cache_key{0};
+        std::list<uint32_t>::iterator lru_it;
+    };
+
     FuzzyCatalogIndex &m_index;
     GpuTexturePool &m_pool;
     HoverPreviewController &m_hover;
@@ -109,14 +124,32 @@ class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
     std::unordered_set<uint32_t> m_selectedIds;
     std::optional<uint32_t> m_lastSelectedId;
 
-    // Instanced Quad / Shader state
+    // Double-buffered PBO + ETC2 compressed thumbnail pipeline
+    std::array<GLuint, 2> m_pboRing{0, 0};
+    size_t m_pboCapacityBytes{0};
+    int m_pboIndex{0};
+    bool m_supportsEtc2{false};
+    GLenum m_etc2InternalFormat{0};
+    std::list<uint32_t> m_etc2Lru;
+    std::unordered_map<uint32_t, CompressedCardEntry> m_etc2Cache;
+    std::unordered_set<uint32_t> m_glRenderedThisFrame;
+
     GLuint m_cardProgram{0};
     GLuint m_cardVao{0};
     GLuint m_cardVbo{0};
+    GLint m_uViewportLoc{-1};
+    GLint m_uCardRectLoc{-1};
+    GLint m_uTexLoc{-1};
     bool m_glInitialized{false};
+    QMetaObject::Connection m_contextDestroyConn;
     QLabel *m_fallbackCanvas{nullptr};
 
     void initCardShaders();
+    void initPboAndEtc2Support();
+    void destroyCompressedCache();
+    void releaseGlResources();
+    GLuint uploadOrGetCardTexture(uint32_t item_id, const QImage &thumb, int &uploadBudget);
+    void renderGlThumbnails();
     void renderCards(QPainter &painter);
     void drawBadgePill(QPainter &painter, const QRect &card_rect, WallpaperBadge badge);
     void drawCardSelectionIndicator(QPainter &painter, const QRect &card_rect, bool is_selected);
@@ -130,7 +163,6 @@ class VirtualizedGridWidget : public QWidget {
     explicit VirtualizedGridWidget(QWidget *parent = nullptr);
     ~VirtualizedGridWidget() override;
 
-    // Discovers wallpapers and populates catalog
     void scanWallpapers(const std::vector<std::string> &extra_paths = {});
     void populateSampleCatalogIfEmpty(bool force_showcase_cards = false);
     void selectFirstItemIfAvailable();
@@ -140,9 +172,9 @@ class VirtualizedGridWidget : public QWidget {
 
   public slots:
     void openFolderSettingsDialog();
+    void setTagFilter(uint64_t tag_mask);
 
   public:
-    // Accessors
     [[nodiscard]] const FuzzyCatalogIndex &catalogIndex() const noexcept { return m_index; }
     [[nodiscard]] FuzzyCatalogIndex &catalogIndex() noexcept { return m_index; }
     [[nodiscard]] GpuTexturePool &texturePool() noexcept { return m_pool; }
@@ -159,7 +191,6 @@ class VirtualizedGridWidget : public QWidget {
 
   private slots:
     void onSearchTextChanged(const QString &text);
-    void onTagChipClicked(uint64_t tag_mask);
     void onSortChanged(int combo_index);
     void onScrollValueChanged(int value);
     void onVirtualHeightChanged(int virtual_height);
@@ -171,26 +202,22 @@ class VirtualizedGridWidget : public QWidget {
     HoverPreviewController m_hover;
     bool m_embeddedMode{false};
 
-    // UI Widgets
     QWidget *m_headerContainer{nullptr};
     QLineEdit *m_searchEdit{nullptr};
+    QComboBox *m_tagCombo{nullptr};
     QComboBox *m_sortCombo{nullptr};
     QPushButton *m_foldersButton{nullptr};
     QLabel *m_statusLabel{nullptr};
-    QWidget *m_tagChipContainer{nullptr};
-    std::vector<QPushButton *> m_tagChips;
 
     GridGlCanvas *m_canvas{nullptr};
     QScrollBar *m_scrollBar{nullptr};
 
-    // Playlist Bar
     QWidget *m_playlistBar{nullptr};
     QLabel *m_playlistSelectionLabel{nullptr};
     QPushButton *m_playlistAddButton{nullptr};
     QPushButton *m_playlistClearButton{nullptr};
 
     void setupUi();
-    void updateTagChipStyles();
     void updateStatusText();
 };
 
