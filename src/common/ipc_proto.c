@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -356,8 +357,9 @@ bool waywal_ipc_recv_fds(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_fds,
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
 
+    /* Accommodate Linux SCM_MAX_FD (253) so excess ancillary FDs are never truncated and leaked */
     union {
-        char buf[CMSG_SPACE(sizeof(int) * 4) * 2];
+        char buf[CMSG_SPACE(sizeof(int) * 253)];
         struct cmsghdr align;
     } u;
     memset(u.buf, 0, sizeof(u.buf));
@@ -474,13 +476,22 @@ bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached
 /* Workshop, Open Hub & Compatibility IPC Serialization Helpers             */
 /* ========================================================================= */
 
+static inline size_t ipc_bounded_cstr_len(const char *s, size_t max_len)
+{
+    size_t n = 0;
+    while (n < max_len && s[n] != '\0') {
+        ++n;
+    }
+    return n;
+}
+
 bool waywal_ipc_validate_req_workshop_sync(const waywal_ipc_req_workshop_sync_t *req,
                                            size_t payload_size)
 {
     if (!req || payload_size != sizeof(waywal_ipc_req_workshop_sync_t)) {
         return false;
     }
-    if (!memchr(req->custom_root, '\0', sizeof(req->custom_root))) {
+    if (memchr(req->custom_root, '\0', sizeof(req->custom_root)) == NULL) {
         return false;
     }
     return true;
@@ -493,10 +504,17 @@ bool waywal_ipc_serialize_req_workshop_sync(uint32_t flags, const char *custom_r
     if (!out_hdr || !out_req) {
         return false;
     }
+    size_t root_len = 0;
+    if (custom_root) {
+        root_len = ipc_bounded_cstr_len(custom_root, sizeof(out_req->custom_root));
+        if (root_len >= sizeof(out_req->custom_root)) {
+            return false;
+        }
+    }
     memset(out_req, 0, sizeof(*out_req));
     out_req->flags = flags;
-    if (custom_root) {
-        strncpy(out_req->custom_root, custom_root, sizeof(out_req->custom_root) - 1);
+    if (root_len > 0) {
+        memcpy(out_req->custom_root, custom_root, root_len);
     }
     out_hdr->magic = WAYWAL_IPC_MAGIC;
     out_hdr->version = WAYWAL_IPC_VERSION;
@@ -541,7 +559,9 @@ bool waywal_ipc_validate_req_workshop_download(const waywal_ipc_req_workshop_dow
     if (!req || payload_size != sizeof(waywal_ipc_req_workshop_download_t)) {
         return false;
     }
-    if (req->published_file_id == 0) {
+    waywal_ipc_req_workshop_download_t copy;
+    memcpy(&copy, req, sizeof(copy));
+    if (copy.published_file_id == 0) {
         return false;
     }
     return true;
@@ -552,7 +572,7 @@ bool waywal_ipc_serialize_req_workshop_download(uint64_t published_file_id, uint
                                                 waywal_ipc_hdr_t *out_hdr,
                                                 waywal_ipc_req_workshop_download_t *out_req)
 {
-    if (!out_hdr || !out_req) {
+    if (!out_hdr || !out_req || published_file_id == 0) {
         return false;
     }
     memset(out_req, 0, sizeof(*out_req));
@@ -572,7 +592,12 @@ bool waywal_ipc_validate_resp_workshop_download(const waywal_ipc_resp_workshop_d
     if (!resp || payload_size != sizeof(waywal_ipc_resp_workshop_download_t)) {
         return false;
     }
-    if (!memchr(resp->error_msg, '\0', sizeof(resp->error_msg))) {
+    waywal_ipc_resp_workshop_download_t copy;
+    memcpy(&copy, resp, sizeof(copy));
+    if (!isfinite(copy.progress_pct) || !isfinite(copy.speed_bytes_per_sec)) {
+        return false;
+    }
+    if (memchr(copy.error_msg, '\0', sizeof(copy.error_msg)) == NULL) {
         return false;
     }
     return true;
@@ -584,8 +609,15 @@ bool waywal_ipc_serialize_resp_workshop_download(uint64_t published_file_id, uin
                                                  waywal_ipc_hdr_t *out_hdr,
                                                  waywal_ipc_resp_workshop_download_t *out_resp)
 {
-    if (!out_hdr || !out_resp) {
+    if (!out_hdr || !out_resp || !isfinite(progress_pct) || !isfinite(speed_bytes_per_sec)) {
         return false;
+    }
+    size_t err_len = 0;
+    if (error_msg) {
+        err_len = ipc_bounded_cstr_len(error_msg, sizeof(out_resp->error_msg));
+        if (err_len >= sizeof(out_resp->error_msg)) {
+            return false;
+        }
     }
     memset(out_resp, 0, sizeof(*out_resp));
     out_resp->published_file_id = published_file_id;
@@ -593,8 +625,8 @@ bool waywal_ipc_serialize_resp_workshop_download(uint64_t published_file_id, uin
     out_resp->progress_pct = progress_pct;
     out_resp->speed_bytes_per_sec = speed_bytes_per_sec;
     out_resp->eta_seconds = eta_seconds;
-    if (error_msg) {
-        strncpy(out_resp->error_msg, error_msg, sizeof(out_resp->error_msg) - 1);
+    if (err_len > 0) {
+        memcpy(out_resp->error_msg, error_msg, err_len);
     }
     out_hdr->magic = WAYWAL_IPC_MAGIC;
     out_hdr->version = WAYWAL_IPC_VERSION;
@@ -609,13 +641,27 @@ bool waywal_ipc_validate_req_wwpkg_install(const waywal_ipc_req_wwpkg_install_t 
     if (!req || payload_size < sizeof(waywal_ipc_req_wwpkg_install_t)) {
         return false;
     }
-    if (payload_size != sizeof(waywal_ipc_req_wwpkg_install_t) + (size_t)req->target_output_len) {
+    waywal_ipc_req_wwpkg_install_t hdr_copy;
+    memcpy(&hdr_copy, req, sizeof(hdr_copy));
+    if (hdr_copy.target_output_len > WAYWAL_IPC_MAX_TAIL_STR) {
         return false;
     }
+    if (payload_size !=
+        sizeof(waywal_ipc_req_wwpkg_install_t) + (size_t)hdr_copy.target_output_len) {
+        return false;
+    }
+    const char *resolved = "";
+    if (hdr_copy.target_output_len > 0) {
+        const char *tail = (const char *)req + sizeof(waywal_ipc_req_wwpkg_install_t);
+        if (tail[hdr_copy.target_output_len - 1] != '\0' ||
+            ipc_bounded_cstr_len(tail, hdr_copy.target_output_len) !=
+                (size_t)(hdr_copy.target_output_len - 1)) {
+            return false;
+        }
+        resolved = tail;
+    }
     if (out_target_output) {
-        *out_target_output = (req->target_output_len > 0)
-                                 ? ((const char *)req + sizeof(waywal_ipc_req_wwpkg_install_t))
-                                 : NULL;
+        *out_target_output = resolved;
     }
     return true;
 }
@@ -628,15 +674,23 @@ bool waywal_ipc_serialize_req_wwpkg_install(const uint8_t package_uuid[16], uint
     if (!out_hdr) {
         return false;
     }
-    size_t target_len = target_output ? strlen(target_output) : 0;
-    size_t total_len = sizeof(waywal_ipc_req_wwpkg_install_t) + target_len;
+    size_t wire_tail_len = 0;
+    if (target_output && target_output[0] != '\0') {
+        size_t str_len = ipc_bounded_cstr_len(target_output, WAYWAL_IPC_MAX_TAIL_STR);
+        if (str_len >= WAYWAL_IPC_MAX_TAIL_STR) {
+            return false;
+        }
+        /* Wire tail carries the trailing NUL so C-string consumers cannot read past payload_size */
+        wire_tail_len = str_len + 1;
+    }
+    size_t total_len = sizeof(waywal_ipc_req_wwpkg_install_t) + wire_tail_len;
     if (out_total_len) {
         *out_total_len = total_len;
     }
     out_hdr->magic = WAYWAL_IPC_MAGIC;
     out_hdr->version = WAYWAL_IPC_VERSION;
     out_hdr->opcode = WAYWAL_REQ_WWPKG_INSTALL;
-    out_hdr->payload_size = total_len;
+    out_hdr->payload_size = (uint32_t)total_len;
 
     if (out_req) {
         memset(out_req, 0, sizeof(*out_req));
@@ -644,7 +698,7 @@ bool waywal_ipc_serialize_req_wwpkg_install(const uint8_t package_uuid[16], uint
             memcpy(out_req->package_uuid, package_uuid, 16);
         }
         out_req->flags = flags;
-        out_req->target_output_len = (uint32_t)target_len;
+        out_req->target_output_len = (uint32_t)wire_tail_len;
     }
     if (out_buf) {
         if (out_buf_cap < total_len) {
@@ -656,9 +710,9 @@ bool waywal_ipc_serialize_req_wwpkg_install(const uint8_t package_uuid[16], uint
             memcpy(hdr_part->package_uuid, package_uuid, 16);
         }
         hdr_part->flags = flags;
-        hdr_part->target_output_len = (uint32_t)target_len;
-        if (target_len > 0) {
-            memcpy((char *)out_buf + sizeof(*hdr_part), target_output, target_len);
+        hdr_part->target_output_len = (uint32_t)wire_tail_len;
+        if (wire_tail_len > 0) {
+            memcpy((char *)out_buf + sizeof(*hdr_part), target_output, wire_tail_len);
         }
     }
     return true;
@@ -670,13 +724,26 @@ bool waywal_ipc_validate_resp_wwpkg_install(const waywal_ipc_resp_wwpkg_install_
     if (!resp || payload_size < sizeof(waywal_ipc_resp_wwpkg_install_t)) {
         return false;
     }
-    if (payload_size != sizeof(waywal_ipc_resp_wwpkg_install_t) + (size_t)resp->error_msg_len) {
+    waywal_ipc_resp_wwpkg_install_t hdr_copy;
+    memcpy(&hdr_copy, resp, sizeof(hdr_copy));
+    if (hdr_copy.error_msg_len > WAYWAL_IPC_MAX_TAIL_STR) {
         return false;
     }
+    if (payload_size != sizeof(waywal_ipc_resp_wwpkg_install_t) + (size_t)hdr_copy.error_msg_len) {
+        return false;
+    }
+    const char *resolved = "";
+    if (hdr_copy.error_msg_len > 0) {
+        const char *tail = (const char *)resp + sizeof(waywal_ipc_resp_wwpkg_install_t);
+        if (tail[hdr_copy.error_msg_len - 1] != '\0' ||
+            ipc_bounded_cstr_len(tail, hdr_copy.error_msg_len) !=
+                (size_t)(hdr_copy.error_msg_len - 1)) {
+            return false;
+        }
+        resolved = tail;
+    }
     if (out_error_msg) {
-        *out_error_msg = (resp->error_msg_len > 0)
-                             ? ((const char *)resp + sizeof(waywal_ipc_resp_wwpkg_install_t))
-                             : NULL;
+        *out_error_msg = resolved;
     }
     return true;
 }
@@ -690,15 +757,22 @@ bool waywal_ipc_serialize_resp_wwpkg_install(const uint8_t package_uuid[16], uin
     if (!out_hdr) {
         return false;
     }
-    size_t err_len = (status_code != 0 && error_msg) ? strlen(error_msg) : 0;
-    size_t total_len = sizeof(waywal_ipc_resp_wwpkg_install_t) + err_len;
+    size_t wire_tail_len = 0;
+    if (status_code != 0 && error_msg && error_msg[0] != '\0') {
+        size_t str_len = ipc_bounded_cstr_len(error_msg, WAYWAL_IPC_MAX_TAIL_STR);
+        if (str_len >= WAYWAL_IPC_MAX_TAIL_STR) {
+            return false;
+        }
+        wire_tail_len = str_len + 1;
+    }
+    size_t total_len = sizeof(waywal_ipc_resp_wwpkg_install_t) + wire_tail_len;
     if (out_total_len) {
         *out_total_len = total_len;
     }
     out_hdr->magic = WAYWAL_IPC_MAGIC;
     out_hdr->version = WAYWAL_IPC_VERSION;
     out_hdr->opcode = WAYWAL_RESP_WWPKG_INSTALL;
-    out_hdr->payload_size = total_len;
+    out_hdr->payload_size = (uint32_t)total_len;
 
     if (out_resp) {
         memset(out_resp, 0, sizeof(*out_resp));
@@ -706,7 +780,7 @@ bool waywal_ipc_serialize_resp_wwpkg_install(const uint8_t package_uuid[16], uin
             memcpy(out_resp->package_uuid, package_uuid, 16);
         }
         out_resp->status_code = status_code;
-        out_resp->error_msg_len = (uint32_t)err_len;
+        out_resp->error_msg_len = (uint32_t)wire_tail_len;
     }
     if (out_buf) {
         if (out_buf_cap < total_len) {
@@ -718,9 +792,9 @@ bool waywal_ipc_serialize_resp_wwpkg_install(const uint8_t package_uuid[16], uin
             memcpy(hdr_part->package_uuid, package_uuid, 16);
         }
         hdr_part->status_code = status_code;
-        hdr_part->error_msg_len = (uint32_t)err_len;
-        if (err_len > 0) {
-            memcpy((char *)out_buf + sizeof(*hdr_part), error_msg, err_len);
+        hdr_part->error_msg_len = (uint32_t)wire_tail_len;
+        if (wire_tail_len > 0) {
+            memcpy((char *)out_buf + sizeof(*hdr_part), error_msg, wire_tail_len);
         }
     }
     return true;
@@ -732,7 +806,7 @@ bool waywal_ipc_validate_req_scan_compat(const waywal_ipc_req_scan_compat_t *req
     if (!req || payload_size != sizeof(waywal_ipc_req_scan_compat_t)) {
         return false;
     }
-    if (!memchr(req->target_path, '\0', sizeof(req->target_path))) {
+    if (memchr(req->target_path, '\0', sizeof(req->target_path)) == NULL) {
         return false;
     }
     return true;
@@ -745,9 +819,16 @@ bool waywal_ipc_serialize_req_scan_compat(const char *target_path, uint32_t auto
     if (!out_hdr || !out_req) {
         return false;
     }
-    memset(out_req, 0, sizeof(*out_req));
+    size_t path_len = 0;
     if (target_path) {
-        strncpy(out_req->target_path, target_path, sizeof(out_req->target_path) - 1);
+        path_len = ipc_bounded_cstr_len(target_path, sizeof(out_req->target_path));
+        if (path_len >= sizeof(out_req->target_path)) {
+            return false;
+        }
+    }
+    memset(out_req, 0, sizeof(*out_req));
+    if (path_len > 0) {
+        memcpy(out_req->target_path, target_path, path_len);
     }
     out_req->auto_repair_flags = auto_repair_flags;
     out_hdr->magic = WAYWAL_IPC_MAGIC;
@@ -763,7 +844,12 @@ bool waywal_ipc_validate_resp_scan_compat(const waywal_ipc_resp_scan_compat_t *r
     if (!resp || payload_size != sizeof(waywal_ipc_resp_scan_compat_t)) {
         return false;
     }
-    if (!memchr(resp->report_json_path, '\0', sizeof(resp->report_json_path))) {
+    waywal_ipc_resp_scan_compat_t copy;
+    memcpy(&copy, resp, sizeof(copy));
+    if (!isfinite(copy.estimated_vram_mb)) {
+        return false;
+    }
+    if (memchr(copy.report_json_path, '\0', sizeof(copy.report_json_path)) == NULL) {
         return false;
     }
     return true;
@@ -776,8 +862,15 @@ bool waywal_ipc_serialize_resp_scan_compat(uint32_t status_code, uint32_t compat
                                            waywal_ipc_hdr_t *out_hdr,
                                            waywal_ipc_resp_scan_compat_t *out_resp)
 {
-    if (!out_hdr || !out_resp) {
+    if (!out_hdr || !out_resp || !isfinite(estimated_vram_mb)) {
         return false;
+    }
+    size_t report_len = 0;
+    if (report_json_path) {
+        report_len = ipc_bounded_cstr_len(report_json_path, sizeof(out_resp->report_json_path));
+        if (report_len >= sizeof(out_resp->report_json_path)) {
+            return false;
+        }
     }
     memset(out_resp, 0, sizeof(*out_resp));
     out_resp->status_code = status_code;
@@ -787,9 +880,8 @@ bool waywal_ipc_serialize_resp_scan_compat(uint32_t status_code, uint32_t compat
     out_resp->repairs_applied = repairs_applied;
     out_resp->estimated_vram_mb = estimated_vram_mb;
     out_resp->estimated_fps = estimated_fps;
-    if (report_json_path) {
-        strncpy(out_resp->report_json_path, report_json_path,
-                sizeof(out_resp->report_json_path) - 1);
+    if (report_len > 0) {
+        memcpy(out_resp->report_json_path, report_json_path, report_len);
     }
     out_hdr->magic = WAYWAL_IPC_MAGIC;
     out_hdr->version = WAYWAL_IPC_VERSION;

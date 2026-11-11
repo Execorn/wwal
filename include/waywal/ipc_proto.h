@@ -501,11 +501,14 @@ static_assert(sizeof(waywal_ipc_resp_workshop_download_t) == 280, "Must be 280 b
 #define WAYWAL_WWPKG_INSTALL_FLAG_FORCE_OVERWRITE 0x0002u
 #define WAYWAL_WWPKG_INSTALL_FLAG_AUTO_APPLY      0x0004u
 
+/* Bounds variable-length IPC tail strings so untrusted headers cannot trigger large allocations */
+#define WAYWAL_IPC_MAX_TAIL_STR 4096u
+
 typedef struct {
     uint8_t package_uuid[16];
     uint32_t flags; /* 0x1 = Verify only, 0x2 = Force overwrite, 0x4 = Auto-apply */
     uint32_t target_output_len;
-    /* target_output_len bytes of UTF-8 output name follow immediately */
+    /* target_output_len bytes of NUL-terminated UTF-8 output name follow when non-zero */
 } waywal_ipc_req_wwpkg_install_t;
 static_assert(sizeof(waywal_ipc_req_wwpkg_install_t) == 24, "Must be 24 bytes header");
 
@@ -514,7 +517,7 @@ typedef struct {
     uint8_t package_uuid[16];
     uint32_t status_code; /* 0 = OK, non-zero = error */
     uint32_t error_msg_len;
-    /* error_msg_len bytes of UTF-8 error message follow if status_code != 0 */
+    /* error_msg_len bytes of NUL-terminated UTF-8 error message follow if status_code != 0 */
 } waywal_ipc_resp_wwpkg_install_t;
 static_assert(sizeof(waywal_ipc_resp_wwpkg_install_t) == 24, "Must be 24 bytes header");
 
@@ -622,6 +625,14 @@ bool waywal_ipc_send_fds(int socket_fd, const waywal_ipc_hdr_t *hdr, const int *
                          size_t num_fds);
 bool waywal_ipc_recv_fds(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_fds, size_t max_fds,
                          size_t *out_num_fds);
+
+/* Daemon async IPC worker queue lifecycle and completion dispatch */
+struct daemon_state;
+bool daemon_ipc_async_init(struct daemon_state *state);
+void daemon_ipc_async_shutdown(struct daemon_state *state);
+int daemon_ipc_async_get_fd(void);
+void daemon_ipc_async_dispatch(struct daemon_state *state);
+bool daemon_ipc_dispatch_subscriber_fd(struct daemon_state *state, int fd);
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop

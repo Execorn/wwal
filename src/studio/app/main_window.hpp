@@ -8,7 +8,9 @@
 #include <QAction>
 #include <QComboBox>
 #include <QLabel>
+#include <QPushButton>
 #include <memory>
+#include <thread>
 
 namespace wwal::studio {
 class VirtualizedGridWidget;
@@ -121,6 +123,7 @@ class MainWindow : public QMainWindow {
     QAction *playPauseAction() const { return m_playPauseAction; }
     QAction *fullscreenAction() const { return m_fullscreenAction; }
     QAction *packageWizardAction() const { return m_packageWizardAction; }
+    QPushButton *pauseButton() const { return m_pauseBtn; }
 
   public slots:
     void handleUndo();
@@ -145,6 +148,7 @@ class MainWindow : public QMainWindow {
     void wireInterPanelSignals();
     void updateCommandBusHistoryUI();
     void applyWallpaperPath(const QString &path);
+    void installPackageToDaemon(const QString &packageIdOrPath, const QString &targetOutput);
 
     StudioOptions m_options;
     DockLayoutManager *m_layoutManager{nullptr};
@@ -154,6 +158,7 @@ class MainWindow : public QMainWindow {
     std::shared_ptr<CatalogIndexManager> m_catalogIndexMgr;
     std::shared_ptr<DownloadManager> m_downloadMgr;
     std::unique_ptr<RecursiveFsWatcher> m_fsWatcher;
+    std::jthread m_reconcileThread;
 
     // 6+ Studio Dock Panels & Bars
     MonitorTopologyBar *m_topologyBar{nullptr};
@@ -182,6 +187,7 @@ class MainWindow : public QMainWindow {
 
     // Perspective & Status Controls
     QComboBox *m_perspectiveCombo{nullptr};
+    QPushButton *m_pauseBtn{nullptr};
     QLabel *m_statusLabel{nullptr};
     QString m_activeWallpaperPath;
 

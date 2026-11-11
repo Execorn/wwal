@@ -34,7 +34,7 @@ class IpcClient : public QObject, public IIpcClientService {
 
   public:
     explicit IpcClient(QString namespaceStr = QString(), QString socketPath = QString(),
-                       QObject *parent = nullptr);
+                       QObject *parent = nullptr, bool autoStart = true);
     ~IpcClient() override;
 
     // Service Interface Implementation
@@ -62,6 +62,13 @@ class IpcClient : public QObject, public IIpcClientService {
         std::function<void(const waywal_ipc_resp_workshop_download_t &resp)> callback = nullptr);
     void requestWwpkgInstall(
         const uint8_t packageUuid[16], uint32_t flags, const QString &targetOutput,
+        std::function<void(const waywal_ipc_resp_wwpkg_install_t &resp, const QString &errorMsg)>
+            callback = nullptr,
+        int wwpkgFd = -1);
+    void installWwpkg(
+        const QString &packagePath, const QString &targetOutput = QStringLiteral("*"),
+        uint32_t flags = WAYWAL_WWPKG_INSTALL_FLAG_AUTO_APPLY |
+                         WAYWAL_WWPKG_INSTALL_FLAG_FORCE_OVERWRITE,
         std::function<void(const waywal_ipc_resp_wwpkg_install_t &resp, const QString &errorMsg)>
             callback = nullptr);
     void requestScanCompat(
@@ -155,6 +162,8 @@ class IpcClient : public QObject, public IIpcClientService {
     void handleIncomingPacket();
     void flushOutboundQueue();
     void wakeupWorker();
+    bool popPendingForOpcode(uint16_t reqOpcode, PendingRequest &outReq);
+    void failInFlightRequests(const QString &reason);
 
     QString m_namespaceStr;
     QString m_customSocketPath;

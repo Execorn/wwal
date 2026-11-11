@@ -2039,10 +2039,94 @@ static void reconcile_one_video_engine_power(daemon_state_t *state, video_engine
     }
 }
 
+typedef struct {
+    uint32_t global_name;
+    char name[64];
+    bool in_use;
+    bool had_fullscreen_unpresented;
+} fullscreen_remap_slot_t;
+
+static fullscreen_remap_slot_t g_fs_remap_slots[32];
+
+static fullscreen_remap_slot_t *find_or_alloc_fs_remap_slot(const output_node_t *out)
+{
+    if (!out)
+        return NULL;
+    size_t free_idx = sizeof(g_fs_remap_slots) / sizeof(g_fs_remap_slots[0]);
+    for (size_t i = 0; i < sizeof(g_fs_remap_slots) / sizeof(g_fs_remap_slots[0]); ++i) {
+        if (g_fs_remap_slots[i].in_use) {
+            if ((out->global_name != 0 && g_fs_remap_slots[i].global_name == out->global_name) ||
+                (out->name[0] != '\0' && strcmp(g_fs_remap_slots[i].name, out->name) == 0)) {
+                g_fs_remap_slots[i].global_name = out->global_name;
+                if (out->name[0] != '\0') {
+                    snprintf(g_fs_remap_slots[i].name, sizeof(g_fs_remap_slots[i].name), "%s",
+                             out->name);
+                }
+                return &g_fs_remap_slots[i];
+            }
+        } else if (free_idx == sizeof(g_fs_remap_slots) / sizeof(g_fs_remap_slots[0])) {
+            free_idx = i;
+        }
+    }
+    if (free_idx >= sizeof(g_fs_remap_slots) / sizeof(g_fs_remap_slots[0]))
+        return NULL;
+    fullscreen_remap_slot_t *slot = &g_fs_remap_slots[free_idx];
+    memset(slot, 0, sizeof(*slot));
+    slot->in_use = true;
+    slot->global_name = out->global_name;
+    if (out->name[0] != '\0') {
+        snprintf(slot->name, sizeof(slot->name), "%s", out->name);
+    }
+    return slot;
+}
+
+static void record_fullscreen_unpresented_state(const daemon_state_t *state)
+{
+    if (!state || !state->power_gov)
+        return;
+    for (const output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        fullscreen_remap_slot_t *slot = find_or_alloc_fs_remap_slot(out);
+        if (!slot)
+            continue;
+        if (!out->configured || out->pres_sync.pll.frame_seq > 0) {
+            slot->had_fullscreen_unpresented = false;
+            continue;
+        }
+        uint32_t mask = waywal_power_governor_get_output_mask(state->power_gov, out->name);
+        if ((mask & WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN) != 0 || out->wlr_has_fullscreen) {
+            slot->had_fullscreen_unpresented = true;
+        }
+    }
+}
+
+/* Only recreate a layer surface when leaving a fullscreen-occluded workspace where the compositor
+ * never presented the initial commit, preventing repeated surface churn on normal tiled workspaces
+ * where static or occluded surfaces keep frame_seq == 0. */
+static bool consume_fullscreen_remap_needed(const daemon_state_t *state, const output_node_t *out)
+{
+    if (!state || !state->power_gov || !out || !out->configured || !out->pres_sync.wp_pres ||
+        out->pres_sync.pll.frame_seq != 0 || out->pres_sync.pending_feedback) {
+        return false;
+    }
+    fullscreen_remap_slot_t *slot = find_or_alloc_fs_remap_slot(out);
+    if (!slot || !slot->had_fullscreen_unpresented)
+        return false;
+
+    uint32_t mask = waywal_power_governor_get_output_mask(state->power_gov, out->name);
+    if ((mask & (WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN | WAYWAL_PAUSE_DPMS_OR_UNMAPPED |
+                 WAYWAL_PAUSE_SESSION_IDLE)) != 0) {
+        return false;
+    }
+    slot->had_fullscreen_unpresented = false;
+    return true;
+}
+
 void daemon_reconcile_power_state(daemon_state_t *state)
 {
     if (!state)
         return;
+
+    record_fullscreen_unpresented_state(state);
 
     bool pause_all =
         state->power_gov ? waywal_power_governor_should_pause_all(state->power_gov) : false;
@@ -4780,6 +4864,7 @@ static void daemon_handle_power_gov_events(daemon_state_t *state, int fd)
     int inotify_fd = waywal_power_governor_get_inotify_fd(state->power_gov);
 
     if (fd == ipc_fd) {
+        record_fullscreen_unpresented_state(state);
         waywal_power_governor_dispatch_ipc(state->power_gov);
         int new_ipc_fd = waywal_power_governor_get_ipc_fd(state->power_gov);
         bool reconnected = waywal_power_governor_consume_ipc_reconnected(state->power_gov);
@@ -4797,10 +4882,8 @@ static void daemon_handle_power_gov_events(daemon_state_t *state, int fd)
                                                           sizeof(mon))) {
             if (mon[0] != '\0') {
                 for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                    if (strcmp(out->name, mon) == 0 && out->configured && out->pres_sync.wp_pres &&
-                        out->pres_sync.pll.frame_seq == 0 && !out->pres_sync.pending_feedback &&
-                        (waywal_power_governor_get_output_mask(state->power_gov, out->name) &
-                         WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN) == 0) {
+                    if (strcmp(out->name, mon) == 0 &&
+                        consume_fullscreen_remap_needed(state, out)) {
                         output_node_recreate_layer_surface(state, out);
                     }
                 }
@@ -5159,6 +5242,20 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
         break;
     case URING_EV_IPC_ACCEPT:
         daemon_handle_ipc_connection(st);
+        break;
+    case URING_EV_IPC_READ:
+        if (fd == daemon_ipc_async_get_fd()) {
+            if ((res & POLLIN) != 0) {
+                daemon_ipc_async_dispatch(st);
+                if (st->display) {
+                    wl_display_flush(st->display);
+                }
+            }
+        } else if (daemon_ipc_dispatch_subscriber_fd(st, fd)) {
+            if (st->display) {
+                wl_display_flush(st->display);
+            }
+        }
         break;
     case URING_EV_SHADER_INOTIFY:
     case URING_EV_INOTIFY:
@@ -6182,9 +6279,43 @@ int main(int argc, char *argv[])
         WAYWAL_LOG_INFO("Event loop running via epoll fallback");
     }
 
+    /* Ensure package extraction and repair directories exist before Landlock enumerates
+     * ~/.local/share */
+    const char *home_dir = getenv("HOME");
+    if (home_dir && home_dir[0] == '/' && strstr(home_dir, "..") == NULL) {
+        const char *wwal_dirs[] = {
+            ".local",
+            ".local/share",
+            ".local/share/wwal",
+            ".local/share/wwal/packages",
+            ".local/state",
+            ".local/state/wwal",
+            ".local/state/wwal/packages",
+            ".cache",
+            ".cache/wwal",
+            ".cache/wwal/repairs",
+        };
+        char dir_buf[4096];
+        for (size_t di = 0; di < sizeof(wwal_dirs) / sizeof(wwal_dirs[0]); ++di) {
+            int dn = snprintf(dir_buf, sizeof(dir_buf), "%s/%s", home_dir, wwal_dirs[di]);
+            if (dn > 0 && (size_t)dn < sizeof(dir_buf)) {
+                (void)mkdir(dir_buf, 0700);
+            }
+        }
+    }
+
     /* Apply security hardening (PR_SET_NO_NEW_PRIVS & Landlock LSM) */
     security_sandbox_register_config(&state.config);
     security_sandbox_apply(NULL);
+
+    /* Spawn bounded IPC worker threads after sandbox confinement so workers inherit
+     * Landlock/Seccomp */
+    if (daemon_ipc_async_init(&state)) {
+        int ipc_async_fd = daemon_ipc_async_get_fd();
+        if (ipc_async_fd >= 0) {
+            register_fd_in_loops(&state, ipc_async_fd, URING_EV_IPC_READ);
+        }
+    }
 
     state.solar_owns_wallpaper = config_has_solar_or_schedule_paths(&state.config);
     state.on_output_configured = daemon_on_output_configured;
@@ -6241,6 +6372,11 @@ int main(int argc, char *argv[])
                     continue;
                 } else if (ev_fd == state.server_socket_fd) {
                     daemon_handle_ipc_connection(&state);
+                } else if (ev_fd == daemon_ipc_async_get_fd()) {
+                    daemon_ipc_async_dispatch(&state);
+                    wl_display_flush(state.display);
+                } else if (daemon_ipc_dispatch_subscriber_fd(&state, ev_fd)) {
+                    wl_display_flush(state.display);
                 } else if (ev_fd == state.transition_timer_fd) {
                     daemon_pump_wayland_events(&state);
                     transition_engine_dispatch_tick(&state);
@@ -6301,6 +6437,14 @@ int main(int argc, char *argv[])
     }
 
     WAYWAL_LOG_INFO("Shutting down wwald...");
+
+    {
+        int ipc_async_fd = daemon_ipc_async_get_fd();
+        if (ipc_async_fd >= 0) {
+            unregister_fd_from_loops(&state, ipc_async_fd);
+        }
+        daemon_ipc_async_shutdown(&state);
+    }
 
     for (size_t i = 0; i < state.num_subscribers; ++i) {
         if (state.subscriber_fds[i] >= 0) {
