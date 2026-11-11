@@ -1157,6 +1157,26 @@ ws_parse_details_slice(const char *src, size_t slice_lo, size_t slice_hi, size_t
 #undef WS_SLICE_NEXT
 }
 
+__attribute__((target("avx2"))) static size_t ws_count_rbrace_avx2(const char *p, size_t n)
+{
+    const __m256i vr = _mm256_set1_epi8('}');
+    size_t cnt = 0u;
+    size_t i = 0u;
+    for (; i + 64u <= n; i += 64u) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(p + i + 32u));
+        uint32_t m0 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, vr));
+        uint32_t m1 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, vr));
+        cnt += (size_t)__builtin_popcount(m0) + (size_t)__builtin_popcount(m1);
+    }
+    for (; i < n; ++i) {
+        if (p[i] == '}') {
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
 static bool ws_try_parse_parallel(const char *src, size_t sz,
                                   waywal_appworkshop_manifest_t *out_manifest)
 {
@@ -1283,15 +1303,22 @@ static bool ws_try_parse_parallel(const char *src, size_t sz,
         return false;
     }
 
-    size_t est_items = sz / 120u + 64u;
-    size_t min_ht = 64u;
-    if (est_items <= SIZE_MAX / 4u && est_items * 4u > min_ht) {
-        min_ht = est_items * 4u;
+    /* Every completed installed entry closes with '}' inside [inst_lo, inst_hi], and at most one
+     * trailing entry per slice can insert before seeing '}'. Bounding by min(total_sub_cap,
+     * rbrace_count + nchunks) keeps load factor <= 0.5 without blowing L2 cache on verbose items.
+     */
+    size_t max_inst = ws_count_rbrace_avx2(src + inst_lo, inst_hi - inst_lo);
+    if (max_inst > SIZE_MAX - (size_t)nchunks) {
+        return false;
     }
-    /* Keep open-addressing load factor <= 0.5 across the worst-case parallel item capacity. */
-    if (total_sub_cap * 2u > min_ht) {
-        min_ht = total_sub_cap * 2u;
+    max_inst += (size_t)nchunks;
+    if (total_sub_cap < max_inst) {
+        max_inst = total_sub_cap;
     }
+    if (max_inst > SIZE_MAX / 2u) {
+        return false;
+    }
+    size_t min_ht = max_inst * 2u < 64u ? 64u : max_inst * 2u;
 
     unsigned log2_ht = 12u;
     while (((size_t)1u << log2_ht) < min_ht && log2_ht < 27u) {
@@ -1410,8 +1437,6 @@ static bool ws_try_parse_parallel(const char *src, size_t sz,
     memset(part_upd, 0, sizeof(part_upd));
     memset(part_dl, 0, sizeof(part_dl));
 
-    memset(slots, 0, ht_cap * sizeof(uint32_t));
-
     waywal_workshop_item_manifest_t *items = NULL;
     size_t items_alloc_cap = 0u;
     size_t total = 0u;
@@ -1423,6 +1448,11 @@ static bool ws_try_parse_parallel(const char *src, size_t sz,
 #pragma omp parallel num_threads(nth)
     {
         int tid = omp_get_thread_num();
+        int team_sz = omp_get_num_threads();
+        size_t z_lo = (ht_cap * (size_t)tid) / (size_t)team_sz;
+        size_t z_hi = (ht_cap * (size_t)(tid + 1)) / (size_t)team_sz;
+        memset(slots + z_lo, 0, (z_hi - z_lo) * sizeof(uint32_t));
+#pragma omp barrier
 
         for (;;) {
             int ic = __atomic_fetch_add(&next_ic, 1, __ATOMIC_RELAXED);

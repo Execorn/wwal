@@ -910,7 +910,7 @@ if get_option('tests')
     include_directories: inc_dir,
     dependencies: [waywal_core_dep, m_dep]
   )
-  test('we_vdf', test_we_vdf_exe)
+  test('we_vdf', test_we_vdf_exe, is_parallel: false)
 
   test_wwpkg_crypto_exe = executable('test_wwpkg_crypto',
     'tests/test_wwpkg_crypto.c',
