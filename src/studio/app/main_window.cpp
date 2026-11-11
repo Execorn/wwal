@@ -29,8 +29,15 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QMessageBox>
+#include <QPointer>
 #include <QProcess>
+#include <QSignalBlocker>
 #include <QStandardPaths>
+
+#include <cstdio>
+#include <filesystem>
+#include <system_error>
+#include <type_traits>
 
 // Include Core Services & CommandBus
 #if __has_include("studio/core/command_bus.hpp")
@@ -167,8 +174,154 @@ class MonitorTopologyBar : public QWidget {
 #include "studio/inspector/camera_lighting_inspector_widget.hpp"
 #include "studio/inspector/physics_spring_inspector_widget.hpp"
 #include "waywal/we_vdf.h"
+#include "waywal/wwpkg.h"
 
 namespace waywal::studio {
+
+namespace {
+
+QString normalizeTargetOutputSpec(const QString &targetOutput)
+{
+    const QString trimmed = targetOutput.trimmed();
+    if (trimmed.isEmpty() || trimmed == QStringLiteral("*") ||
+        trimmed.compare(QStringLiteral("All Displays"), Qt::CaseInsensitive) == 0 ||
+        trimmed.compare(QStringLiteral("All Monitors"), Qt::CaseInsensitive) == 0) {
+        return QStringLiteral("*");
+    }
+    return trimmed;
+}
+
+QString resolveLocalWwpkgFile(const QString &packageIdOrPath,
+                              const std::shared_ptr<DownloadManager> &downloadMgr)
+{
+    const QString trimmed = packageIdOrPath.trimmed();
+    if (trimmed.isEmpty()) {
+        return {};
+    }
+
+    QFileInfo directInfo(trimmed);
+    if (directInfo.exists() && directInfo.isFile()) {
+        return directInfo.absoluteFilePath();
+    }
+
+    QStringList candidateDirs;
+    const QString xdgHub = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
+                           QStringLiteral("/waywal/hub");
+    if (!xdgHub.isEmpty()) {
+        candidateDirs << xdgHub;
+    }
+    const QString homeHub = QDir::homePath() + QStringLiteral("/.local/share/waywal/hub");
+    if (!candidateDirs.contains(homeHub)) {
+        candidateDirs << homeHub;
+    }
+    if (downloadMgr) {
+        const QString dlDir = QString::fromStdString(downloadMgr->downloadDirectory());
+        if (!dlDir.isEmpty() && !candidateDirs.contains(dlDir)) {
+            candidateDirs << dlDir;
+        }
+    }
+
+    for (const QString &dirStr : candidateDirs) {
+        std::error_code ec;
+        const std::filesystem::path dirPath(dirStr.toStdString());
+        if (!std::filesystem::exists(dirPath, ec) || ec ||
+            !std::filesystem::is_directory(dirPath, ec) || ec) {
+            continue;
+        }
+
+        const QString namedCandidate = QDir(dirStr).filePath(trimmed + QStringLiteral(".wwpkg"));
+        QFileInfo namedInfo(namedCandidate);
+        if (namedInfo.exists() && namedInfo.isFile()) {
+            return namedInfo.absoluteFilePath();
+        }
+
+        for (const auto &entry : std::filesystem::directory_iterator(dirPath, ec)) {
+            if (ec) {
+                break;
+            }
+            std::error_code fileEc;
+            if (!entry.is_regular_file(fileEc) || fileEc || entry.path().extension() != ".wwpkg") {
+                continue;
+            }
+            const std::string pkgPathStd = entry.path().string();
+            wwpkg_package_t *pkg = wwpkg_open(pkgPathStd.c_str());
+            if (!pkg) {
+                continue;
+            }
+            bool matched = false;
+            const wwpkg_manifest_t *man = wwpkg_get_manifest(pkg);
+            if (man) {
+                const QString manId = QString::fromUtf8(man->id);
+                const QString manSlug = QString::fromUtf8(man->slug);
+                if (manId.compare(trimmed, Qt::CaseInsensitive) == 0 ||
+                    manSlug.compare(trimmed, Qt::CaseInsensitive) == 0) {
+                    matched = true;
+                }
+            }
+            wwpkg_close(pkg);
+            if (matched) {
+                return QString::fromStdString(pkgPathStd);
+            }
+        }
+    }
+
+    return {};
+}
+
+QString resolveExtractedEntrypointPath(const uint8_t installedUuid[16],
+                                       const QString &relativeEntrypoint)
+{
+    if (!installedUuid || relativeEntrypoint.isEmpty()) {
+        return {};
+    }
+    char uuidHex[33]{};
+    for (size_t i = 0; i < 16; ++i) {
+        std::snprintf(uuidHex + (i * 2), 3, "%02x", installedUuid[i]);
+    }
+    const QString hexDir = QString::fromLatin1(uuidHex, 32);
+
+    QStringList baseDirs;
+    const QString xdgData = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    if (!xdgData.isEmpty()) {
+        baseDirs << (xdgData + QStringLiteral("/wwal/packages/") + hexDir);
+    }
+    const QString homeData =
+        QDir::homePath() + QStringLiteral("/.local/share/wwal/packages/") + hexDir;
+    if (!baseDirs.contains(homeData)) {
+        baseDirs << homeData;
+    }
+
+    for (const QString &base : baseDirs) {
+        const QString full = QDir(base).filePath(relativeEntrypoint);
+        QFileInfo fi(full);
+        if (fi.exists() && fi.isFile()) {
+            return fi.absoluteFilePath();
+        }
+    }
+    return {};
+}
+
+template <typename WizardT, typename HandlerT>
+void connectWizardInstallSignalIfPresent(MainWindow *self, WizardT *wizard, HandlerT &&handler)
+{
+    if constexpr (requires { &WizardT::packageInstallRequested; }) {
+        using SigPtr = decltype(&WizardT::packageInstallRequested);
+        if constexpr (std::is_invocable_v<SigPtr, WizardT *, QString, QString>) {
+            QObject::connect(wizard, &WizardT::packageInstallRequested, self,
+                             [fn = std::forward<HandlerT>(handler)](const QString &pkgPathOrId,
+                                                                    const QString &targetOutput) {
+                                 fn(pkgPathOrId, targetOutput);
+                             });
+        } else if constexpr (std::is_invocable_v<SigPtr, WizardT *, QString>) {
+            QObject::connect(wizard, &WizardT::packageInstallRequested, self,
+                             [fn = std::forward<HandlerT>(handler)](const QString &pkgPathOrId) {
+                                 fn(pkgPathOrId, QStringLiteral("*"));
+                             });
+        }
+    }
+}
+
+} // namespace
 
 /* ========================================================================= */
 /* MainWindow Implementation                                                 */
@@ -190,9 +343,11 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
     m_commandBus = std::make_unique<CommandBus>(1000, this);
 
     // 3b. Initialize IpcClient
-    m_ipcClient = std::make_unique<IpcClient>(m_options.namespaceStr, m_options.socketPath, this);
+    const bool interactiveMode = !m_options.headlessCheck && !m_options.benchmarkGrid;
+    m_ipcClient =
+        std::make_unique<IpcClient>(m_options.namespaceStr, m_options.socketPath, this, false);
     Services::instance().setIpcClient(m_ipcClient.get());
-    if (!m_options.headlessCheck && !m_options.benchmarkGrid) {
+    if (interactiveMode) {
         m_ipcClient->start();
     }
 
@@ -274,18 +429,22 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
 
     // 12. Setup Recursive Filesystem Watcher for Steam Workshop & Open Hub
     if (!m_options.headlessCheck && !m_options.benchmarkGrid) {
+        QPointer<MainWindow> self(this);
         m_fsWatcher =
-            std::make_unique<RecursiveFsWatcher>([this](const std::vector<FsWatchEvent> &events) {
-                if (events.empty())
+            std::make_unique<RecursiveFsWatcher>([self](const std::vector<FsWatchEvent> &events) {
+                if (events.empty() || !self)
                     return;
                 QMetaObject::invokeMethod(
-                    this,
-                    [this]() {
-                        if (m_workshopBrowser) {
-                            m_workshopBrowser->refreshLibrary();
+                    self.data(),
+                    [self]() {
+                        if (!self) {
+                            return;
                         }
-                        if (m_openHubBrowser) {
-                            m_openHubBrowser->refreshFeed();
+                        if (self->m_workshopBrowser) {
+                            self->m_workshopBrowser->refreshLibrary();
+                        }
+                        if (self->m_openHubBrowser) {
+                            self->m_openHubBrowser->refreshFeed();
                         }
                     },
                     Qt::QueuedConnection);
@@ -295,18 +454,42 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
         size_t libCount = waywal_steam_discover_libraries(libs, 16);
         for (size_t i = 0; i < libCount; ++i) {
             std::string wsDir = std::string(libs[i].path) + "/steamapps/workshop/content/431960";
-            if (std::filesystem::exists(wsDir)) {
+            std::error_code fsEc;
+            if (std::filesystem::exists(wsDir, fsEc) && !fsEc) {
                 m_fsWatcher->addWatchRoot(wsDir);
             }
         }
         QString localHub = QDir::homePath() + QStringLiteral("/.local/share/waywal/hub");
         QDir().mkpath(localHub);
-        m_fsWatcher->addWatchRoot(localHub.toStdString());
+        const std::string localHubStd = localHub.toStdString();
+        std::error_code hubEc;
+        if (std::filesystem::exists(localHubStd, hubEc) && !hubEc) {
+            m_fsWatcher->addWatchRoot(localHubStd);
+        }
         m_fsWatcher->start();
     }
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow()
+{
+    if (m_fsWatcher) {
+        m_fsWatcher->stop();
+        m_fsWatcher.reset();
+    }
+    if (m_reconcileThread.joinable()) {
+        m_reconcileThread.request_stop();
+        m_reconcileThread.join();
+    }
+    if (m_downloadMgr) {
+        m_downloadMgr->shutdown();
+    }
+    if (Services::instance().ipcClient() == m_ipcClient.get()) {
+        Services::instance().setIpcClient(nullptr);
+    }
+    if (m_ipcClient) {
+        m_ipcClient->stop();
+    }
+}
 
 void MainWindow::setupPanels()
 {
@@ -318,6 +501,9 @@ void MainWindow::setupPanels()
     // Catalog & Download Managers
     m_catalogIndexMgr = std::make_shared<CatalogIndexManager>();
     m_downloadMgr = std::make_shared<DownloadManager>();
+    if (!m_options.headlessCheck && !m_options.benchmarkGrid) {
+        (void)m_downloadMgr->initialize();
+    }
 
     // Panel 2 (Left Dock Tab 1): Virtualized Wallpaper Grid
     m_gridWidget = new VirtualizedGridWidget(this);
@@ -333,6 +519,28 @@ void MainWindow::setupPanels()
     m_openHubBrowser = new OpenHubBrowserWidget(m_downloadMgr, this);
     m_layoutManager->registerPanel(QStringLiteral("OpenHubBrowser"), m_openHubBrowser,
                                    QStringLiteral("Open Hub"), Qt::LeftDockWidgetArea);
+
+    if (!m_options.headlessCheck && !m_options.benchmarkGrid && m_catalogIndexMgr) {
+        QPointer<MainWindow> self(this);
+        auto indexMgr = m_catalogIndexMgr;
+        m_reconcileThread = std::jthread([self, indexMgr](std::stop_token st) {
+            if (!indexMgr || st.stop_requested()) {
+                return;
+            }
+            (void)indexMgr->reconcileAllLibraries();
+            if (st.stop_requested() || !self) {
+                return;
+            }
+            QMetaObject::invokeMethod(
+                self.data(),
+                [self]() {
+                    if (self && self->m_workshopBrowser) {
+                        self->m_workshopBrowser->refreshLibrary();
+                    }
+                },
+                Qt::QueuedConnection);
+        });
+    }
 
     // Panel 3 (Center Dock Top): GPU Preview Viewport
     m_previewViewport = new GpuPreviewViewport(this);
@@ -612,14 +820,14 @@ void MainWindow::setupToolBar()
     toolbar->addSeparator();
 
     // Play/Pause button
-    auto *btnPlayPause = new QPushButton(QStringLiteral("Pause"), this);
-    btnPlayPause->setToolTip(QStringLiteral("Pause or resume preview playback (Space)"));
-    btnPlayPause->setFixedHeight(28);
-    connect(btnPlayPause, &QPushButton::clicked, this, [this, btnPlayPause]() {
-        handlePlayPauseToggle();
-        btnPlayPause->setText(m_isPlaying ? QStringLiteral("Pause") : QStringLiteral("Resume"));
-    });
-    toolbar->addWidget(btnPlayPause);
+    m_pauseBtn = new QPushButton(QStringLiteral("Pause"), this);
+    m_pauseBtn->setObjectName(QStringLiteral("PlayPauseButton"));
+    m_pauseBtn->setCheckable(true);
+    m_pauseBtn->setChecked(false);
+    m_pauseBtn->setToolTip(QStringLiteral("Pause or resume preview playback (Space)"));
+    m_pauseBtn->setFixedHeight(28);
+    connect(m_pauseBtn, &QPushButton::clicked, this, &MainWindow::handlePlayPauseToggle);
+    toolbar->addWidget(m_pauseBtn);
 
     // Fullscreen Preview button
     auto *btnFullscreen = new QPushButton(QStringLiteral("Fullscreen"), this);
@@ -923,6 +1131,10 @@ void MainWindow::wireInterPanelSignals()
                         m_statusLabel->setText(QStringLiteral("Selected Hub Package: %1").arg(cid));
                     }
                 });
+        connect(m_openHubBrowser, &OpenHubBrowserWidget::packageInstallRequested, this,
+                [this](const QString &packageId, const QString &targetOutput) {
+                    installPackageToDaemon(packageId, targetOutput);
+                });
     }
 
     if (m_effectLibraryBrowser && m_nodeGraphEditor) {
@@ -1025,6 +1237,71 @@ void MainWindow::applyWallpaperPath(const QString &path)
     }
 }
 
+void MainWindow::installPackageToDaemon(const QString &packageIdOrPath, const QString &targetOutput)
+{
+    const QString resolvedPkgPath = resolveLocalWwpkgFile(packageIdOrPath, m_downloadMgr);
+    if (resolvedPkgPath.isEmpty()) {
+        if (m_statusLabel) {
+            m_statusLabel->setText(
+                QStringLiteral("Package not found locally: %1").arg(packageIdOrPath));
+        }
+        return;
+    }
+
+    QString relativeEntrypoint;
+    {
+        const QByteArray pathUtf8 = resolvedPkgPath.toUtf8();
+        wwpkg_package_t *pkg = wwpkg_open(pathUtf8.constData());
+        if (pkg) {
+            const wwpkg_manifest_t *man = wwpkg_get_manifest(pkg);
+            if (man && man->entrypoint_pipeline[0] != '\0') {
+                relativeEntrypoint = QString::fromUtf8(man->entrypoint_pipeline);
+            }
+            wwpkg_close(pkg);
+        }
+    }
+
+    const QString normalizedTarget = normalizeTargetOutputSpec(targetOutput);
+    const QString pkgFileName = QFileInfo(resolvedPkgPath).fileName();
+    if (m_statusLabel) {
+        m_statusLabel->setText(QStringLiteral("Installing package: %1").arg(pkgFileName));
+    }
+
+    if (!m_ipcClient) {
+        return;
+    }
+
+    QPointer<MainWindow> self(this);
+    m_ipcClient->installWwpkg(
+        resolvedPkgPath, normalizedTarget,
+        WAYWAL_WWPKG_INSTALL_FLAG_AUTO_APPLY | WAYWAL_WWPKG_INSTALL_FLAG_FORCE_OVERWRITE,
+        [self, pkgFileName, relativeEntrypoint](const waywal_ipc_resp_wwpkg_install_t &resp,
+                                                const QString &errorMsg) {
+            if (!self) {
+                return;
+            }
+            if (resp.status_code == 0) {
+                if (self->m_openHubBrowser) {
+                    self->m_openHubBrowser->refreshFeed();
+                }
+                const QString extractedEntry =
+                    resolveExtractedEntrypointPath(resp.package_uuid, relativeEntrypoint);
+                if (!extractedEntry.isEmpty()) {
+                    self->applyWallpaperPath(extractedEntry);
+                }
+                if (self->m_statusLabel) {
+                    self->m_statusLabel->setText(
+                        QStringLiteral("Installed package: %1").arg(pkgFileName));
+                }
+            } else if (self->m_statusLabel) {
+                const QString detail =
+                    errorMsg.isEmpty() ? QStringLiteral("code %1").arg(resp.status_code) : errorMsg;
+                self->m_statusLabel->setText(
+                    QStringLiteral("Package install failed: %1").arg(detail));
+            }
+        });
+}
+
 void MainWindow::handleUndo()
 {
     if (m_commandBus && m_commandBus->canUndo()) {
@@ -1053,6 +1330,14 @@ void MainWindow::handleSearchFocus()
 void MainWindow::handlePlayPauseToggle()
 {
     m_isPlaying = !m_isPlaying;
+    if (m_pauseBtn) {
+        const QSignalBlocker blocker(m_pauseBtn);
+        m_pauseBtn->setChecked(!m_isPlaying);
+        m_pauseBtn->setText(m_isPlaying ? QStringLiteral("Pause") : QStringLiteral("Resume"));
+    }
+    if (m_previewViewport) {
+        m_previewViewport->pauseAnimation(!m_isPlaying);
+    }
     if (m_statusLabel) {
         m_statusLabel->setText(m_isPlaying ? QStringLiteral("Playback Resumed")
                                            : QStringLiteral("Playback Paused"));
@@ -1090,6 +1375,39 @@ void MainWindow::handleOpenPackagingWizard()
     if (!m_activeWallpaperPath.isEmpty()) {
         wizard->setSourcePath(m_activeWallpaperPath);
     }
+
+    auto installedOnce = std::make_shared<bool>(false);
+    QPointer<MainWindow> self(this);
+    connectWizardInstallSignalIfPresent(
+        this, wizard,
+        [self, installedOnce](const QString &pkgPathOrId, const QString &targetOutput) {
+            if (!self || *installedOnce) {
+                return;
+            }
+            *installedOnce = true;
+            if (self->m_openHubBrowser) {
+                self->m_openHubBrowser->refreshFeed();
+            }
+            self->installPackageToDaemon(pkgPathOrId, targetOutput);
+        });
+
+    connect(wizard, &QWizard::accepted, this, [self, wizard, installedOnce]() {
+        if (!self) {
+            return;
+        }
+        if (self->m_openHubBrowser) {
+            self->m_openHubBrowser->refreshFeed();
+        }
+        if (*installedOnce) {
+            return;
+        }
+        const QString pkgPath = wizard->compiledPackagePath();
+        if (!pkgPath.isEmpty() && wizard->context() && wizard->context()->installedToLocalHub) {
+            *installedOnce = true;
+            self->installPackageToDaemon(pkgPath, QStringLiteral("*"));
+        }
+    });
+
     wizard->show();
 }
 

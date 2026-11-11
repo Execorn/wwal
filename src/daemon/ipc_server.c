@@ -4,10 +4,22 @@
 #endif
 #include "daemon_internal.h"
 #include "waywal/ipc_proto_phase3.h"
+#include "waywal/we_appworkshop.h"
+#include "waywal/we_compat_scanner.h"
+#include "waywal/we_vdf.h"
+#include "waywal/wwpkg.h"
 
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/openat2.h>
+#include <pthread.h>
+#include <pwd.h>
+#include <signal.h>
+#include <sys/eventfd.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 
 static uint32_t g_last_render_duration_us = 0;
@@ -389,6 +401,37 @@ size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, c
     return off;
 }
 
+static bool daemon_is_subscriber_fd(const daemon_state_t *state, int fd)
+{
+    if (!state || fd < 0) {
+        return false;
+    }
+    for (size_t i = 0; i < state->num_subscribers; ++i) {
+        if (state->subscriber_fds[i] == fd) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void daemon_remove_subscriber_fd(daemon_state_t *state, int fd)
+{
+    if (!state || fd < 0) {
+        return;
+    }
+    for (size_t i = 0; i < state->num_subscribers; ++i) {
+        if (state->subscriber_fds[i] == fd) {
+            unregister_fd_from_loops(state, fd);
+            close(fd);
+            for (size_t j = i + 1; j < state->num_subscribers; ++j) {
+                state->subscriber_fds[j - 1] = state->subscriber_fds[j];
+            }
+            state->num_subscribers--;
+            return;
+        }
+    }
+}
+
 void daemon_reap_dead_subscribers(daemon_state_t *state)
 {
     if (!state) {
@@ -415,6 +458,7 @@ void daemon_reap_dead_subscribers(daemon_state_t *state)
         }
         if (dead) {
             if (sfd >= 0) {
+                unregister_fd_from_loops(state, sfd);
                 close(sfd);
             }
             for (size_t j = i + 1; j < state->num_subscribers; ++j) {
@@ -470,6 +514,7 @@ void daemon_broadcast_event(daemon_state_t *state, const char *event_name)
         }
         if (!ok) {
             if (sfd >= 0) {
+                unregister_fd_from_loops(state, sfd);
                 close(sfd);
             }
             for (size_t j = i + 1; j < state->num_subscribers; ++j) {
@@ -591,26 +636,1899 @@ static bool extra_has_wildcard(const char *extra_buf, size_t extra_len, uint32_t
     return false;
 }
 
-static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
+/* ========================================================================= */
+/* Non-Blocking Async IPC Worker Queue & Subsystems                          */
+/* ========================================================================= */
+
+#define IPC_ASYNC_QUEUE_CAP      32u
+#define IPC_ASYNC_COMP_CAP       64u
+#define IPC_ASYNC_WORKERS        2u
+#define IPC_DL_TRACKER_CAP       64u
+#define IPC_WWPKG_MAX_ARCHIVE_SZ (512ULL * 1024ULL * 1024ULL)
+#define IPC_WWPKG_MAX_FILES      4096u
+
+typedef struct {
+    const void *src;
+    size_t size;
+    size_t pos;
+} ipc_zstd_in_buf_t;
+
+typedef struct {
+    void *dst;
+    size_t size;
+    size_t pos;
+} ipc_zstd_out_buf_t;
+
+typedef struct {
+    void *(*createDStream)(void);
+    size_t (*freeDStream)(void *zds);
+    size_t (*initDStream)(void *zds);
+    size_t (*decompressStream)(void *zds, ipc_zstd_out_buf_t *output, ipc_zstd_in_buf_t *input);
+    unsigned (*isError)(size_t code);
+    bool available;
+} ipc_zstd_stream_api_t;
+
+static pthread_once_t g_ipc_zstd_once = PTHREAD_ONCE_INIT;
+static ipc_zstd_stream_api_t g_ipc_zstd_api;
+
+static void ipc_zstd_probe_once(void)
 {
-    /* Verify peer credentials (SO_PEERCRED) to prevent unauthorized local hijack */
-    struct ucred cred;
-    socklen_t cred_len = sizeof(cred);
-    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) < 0 ||
-        cred.uid != geteuid()) {
-        WAYWAL_LOG_WARN("Rejected unauthorized IPC connection from UID %u (expected %u)", cred.uid,
-                        geteuid());
-        close(client_fd);
+    memset(&g_ipc_zstd_api, 0, sizeof(g_ipc_zstd_api));
+    void *h = dlopen("libzstd.so.1", RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
+    if (!h) {
+        h = dlopen("libzstd.so", RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
+    }
+    if (!h) {
+        return;
+    }
+    *(void **)(&g_ipc_zstd_api.createDStream) = dlsym(h, "ZSTD_createDStream");
+    *(void **)(&g_ipc_zstd_api.freeDStream) = dlsym(h, "ZSTD_freeDStream");
+    *(void **)(&g_ipc_zstd_api.initDStream) = dlsym(h, "ZSTD_initDStream");
+    *(void **)(&g_ipc_zstd_api.decompressStream) = dlsym(h, "ZSTD_decompressStream");
+    *(void **)(&g_ipc_zstd_api.isError) = dlsym(h, "ZSTD_isError");
+    if (g_ipc_zstd_api.createDStream && g_ipc_zstd_api.freeDStream && g_ipc_zstd_api.initDStream &&
+        g_ipc_zstd_api.decompressStream && g_ipc_zstd_api.isError) {
+        g_ipc_zstd_api.available = true;
+    }
+}
+
+typedef struct {
+    char name[100];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    char size[12];
+    char mtime[12];
+    char chksum[8];
+    char typeflag;
+    char linkname[100];
+    char magic[6];
+    char version[2];
+    char uname[32];
+    char gname[32];
+    char devmajor[8];
+    char devminor[8];
+    char prefix[155];
+    char pad[12];
+} ipc_ustar_hdr_t;
+static_assert(sizeof(ipc_ustar_hdr_t) == 512, "POSIX ustar header must be 512 bytes");
+
+static uint32_t ipc_ustar_checksum(const ipc_ustar_hdr_t *hdr)
+{
+    const uint8_t *raw = (const uint8_t *)hdr;
+    uint32_t sum = 0;
+    for (size_t i = 0; i < 512; ++i) {
+        sum += (i >= 148 && i < 156) ? (uint32_t)' ' : (uint32_t)raw[i];
+    }
+    return sum;
+}
+
+static bool ipc_resolve_user_home(char *buf, size_t cap)
+{
+    const char *home = getenv("HOME");
+    if (home && home[0] == '/') {
+        int n = snprintf(buf, cap, "%s", home);
+        return (n > 0 && (size_t)n < cap);
+    }
+    struct passwd pw;
+    struct passwd *pw_res = NULL;
+    char pw_buf[4096];
+    if (getpwuid_r(geteuid(), &pw, pw_buf, sizeof(pw_buf), &pw_res) == 0 && pw_res &&
+        pw_res->pw_dir && pw_res->pw_dir[0] == '/') {
+        int n = snprintf(buf, cap, "%s", pw_res->pw_dir);
+        return (n > 0 && (size_t)n < cap);
+    }
+    return false;
+}
+
+static bool ipc_mkdir_p_safe(const char *path, mode_t mode)
+{
+    if (!path || path[0] != '/') {
+        return false;
+    }
+    char tmp[PATH_MAX];
+    int n = snprintf(tmp, sizeof(tmp), "%s", path);
+    if (n <= 0 || (size_t)n >= sizeof(tmp)) {
+        return false;
+    }
+    for (char *p = tmp + 1; *p != '\0'; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
+                return false;
+            }
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
+        return false;
+    }
+    struct stat st;
+    if (lstat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return false;
+    }
+    return true;
+}
+
+static bool ipc_sanitize_rel_path(const char *in_path, char *out_path, size_t cap)
+{
+    if (!in_path || !out_path || cap == 0) {
+        return false;
+    }
+    const char *p = in_path;
+    while (p[0] == '.' && p[1] == '/') {
+        p += 2;
+    }
+    if (p[0] == '\0' || p[0] == '/') {
+        return false;
+    }
+
+    size_t w = 0;
+    size_t depth = 0;
+    while (*p != '\0') {
+        const char *slash = strchr(p, '/');
+        size_t clen = slash ? (size_t)(slash - p) : strlen(p);
+        if (clen == 0) {
+            if (!slash) {
+                break;
+            }
+            p = slash + 1;
+            continue;
+        }
+        if ((clen == 1 && p[0] == '.') || (clen == 2 && p[0] == '.' && p[1] == '.') ||
+            memchr(p, '\\', clen) != NULL) {
+            return false;
+        }
+        if (++depth > 16) {
+            return false;
+        }
+        if (w > 0) {
+            if (w + 1 >= cap) {
+                return false;
+            }
+            out_path[w++] = '/';
+        }
+        if (w + clen >= cap) {
+            return false;
+        }
+        memcpy(out_path + w, p, clen);
+        w += clen;
+        if (!slash) {
+            break;
+        }
+        p = slash + 1;
+    }
+    if (w == 0) {
+        return false;
+    }
+    out_path[w] = '\0';
+    return true;
+}
+
+static int ipc_openat_beneath_write(int root_dfd, const char *clean_rel)
+{
+    if (root_dfd < 0 || !clean_rel || clean_rel[0] == '\0') {
+        return -1;
+    }
+
+    /* Ensure intermediate subdirectories exist strictly without following symlinks */
+    char rel_copy[WWPKG_MAX_PATH_LEN];
+    int n = snprintf(rel_copy, sizeof(rel_copy), "%s", clean_rel);
+    if (n <= 0 || (size_t)n >= sizeof(rel_copy)) {
+        return -1;
+    }
+
+    int cur_dfd = dup(root_dfd);
+    if (cur_dfd < 0) {
+        return -1;
+    }
+    (void)fcntl(cur_dfd, F_SETFD, FD_CLOEXEC);
+
+    char *cursor = rel_copy;
+    char *slash = NULL;
+    while ((slash = strchr(cursor, '/')) != NULL) {
+        *slash = '\0';
+        if (mkdirat(cur_dfd, cursor, 0700) != 0 && errno != EEXIST) {
+            close(cur_dfd);
+            return -1;
+        }
+        int next_dfd = openat(cur_dfd, cursor, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        close(cur_dfd);
+        if (next_dfd < 0) {
+            return -1;
+        }
+        cur_dfd = next_dfd;
+        cursor = slash + 1;
+    }
+
+    int file_fd = -1;
+#if defined(__NR_openat2) && defined(RESOLVE_BENEATH)
+    struct open_how how;
+    memset(&how, 0, sizeof(how));
+    how.flags = O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC;
+    how.mode = 0600;
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+    file_fd = (int)syscall(__NR_openat2, root_dfd, clean_rel, &how, sizeof(how));
+    if (file_fd < 0 && (errno == ENOSYS || errno == EPERM)) {
+        file_fd =
+            openat(cur_dfd, cursor, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    }
+#else
+    file_fd = openat(cur_dfd, cursor, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+#endif
+    close(cur_dfd);
+    return file_fd;
+}
+
+static bool ipc_write_all_fd(int fd, const uint8_t *data, size_t len)
+{
+    size_t total = 0;
+    while (total < len) {
+        ssize_t w = write(fd, data + total, len - total);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (w == 0) {
+            return false;
+        }
+        total += (size_t)w;
+    }
+    return true;
+}
+
+static bool ipc_decompress_wwpkg_stream(const uint8_t *raw_data, size_t raw_len,
+                                        uint8_t **out_tar_buf, size_t *out_tar_len)
+{
+    if (!raw_data || raw_len < 4 || !out_tar_buf || !out_tar_len) {
+        return false;
+    }
+    *out_tar_buf = NULL;
+    *out_tar_len = 0;
+
+    uint32_t magic = (uint32_t)raw_data[0] | ((uint32_t)raw_data[1] << 8) |
+                     ((uint32_t)raw_data[2] << 16) | ((uint32_t)raw_data[3] << 24);
+    bool is_zstd = (magic == 0xFD2FB528u) || ((magic & 0xFFFFFFF0u) == 0x184D2A50u);
+
+    if (!is_zstd) {
+        if (raw_len >= 512 && memcmp(raw_data + 257, "ustar", 5) == 0) {
+            uint8_t *copy = (uint8_t *)malloc(raw_len);
+            if (!copy) {
+                return false;
+            }
+            memcpy(copy, raw_data, raw_len);
+            *out_tar_buf = copy;
+            *out_tar_len = raw_len;
+            return true;
+        }
+        return false;
+    }
+
+    pthread_once(&g_ipc_zstd_once, ipc_zstd_probe_once);
+    if (!g_ipc_zstd_api.available) {
+        return false;
+    }
+
+    void *dstream = g_ipc_zstd_api.createDStream();
+    if (!dstream) {
+        return false;
+    }
+    if (g_ipc_zstd_api.isError(g_ipc_zstd_api.initDStream(dstream))) {
+        g_ipc_zstd_api.freeDStream(dstream);
+        return false;
+    }
+
+    size_t cap = 262144u;
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    if (!buf) {
+        g_ipc_zstd_api.freeDStream(dstream);
+        return false;
+    }
+
+    size_t out_total = 0;
+    ipc_zstd_in_buf_t in_b = {.src = raw_data, .size = raw_len, .pos = 0};
+    uint8_t chunk[65536];
+
+    while (in_b.pos < in_b.size) {
+        ipc_zstd_out_buf_t out_b = {.dst = chunk, .size = sizeof(chunk), .pos = 0};
+        size_t rc = g_ipc_zstd_api.decompressStream(dstream, &out_b, &in_b);
+        if (g_ipc_zstd_api.isError(rc)) {
+            free(buf);
+            g_ipc_zstd_api.freeDStream(dstream);
+            return false;
+        }
+        if (out_b.pos > 0) {
+            if (out_total > IPC_WWPKG_MAX_ARCHIVE_SZ - out_b.pos) {
+                free(buf);
+                g_ipc_zstd_api.freeDStream(dstream);
+                return false;
+            }
+            if (out_total + out_b.pos > cap) {
+                size_t new_cap = cap;
+                while (new_cap < out_total + out_b.pos) {
+                    if (new_cap > IPC_WWPKG_MAX_ARCHIVE_SZ / 2) {
+                        new_cap = IPC_WWPKG_MAX_ARCHIVE_SZ;
+                        break;
+                    }
+                    new_cap *= 2;
+                }
+                uint8_t *nb = (uint8_t *)realloc(buf, new_cap);
+                if (!nb) {
+                    free(buf);
+                    g_ipc_zstd_api.freeDStream(dstream);
+                    return false;
+                }
+                buf = nb;
+                cap = new_cap;
+            }
+            memcpy(buf + out_total, chunk, out_b.pos);
+            out_total += out_b.pos;
+        }
+        /* Re-prime stream state between concatenated Zstd frames */
+        if (rc == 0 && in_b.pos < in_b.size) {
+            if (g_ipc_zstd_api.isError(g_ipc_zstd_api.initDStream(dstream))) {
+                free(buf);
+                g_ipc_zstd_api.freeDStream(dstream);
+                return false;
+            }
+        }
+    }
+
+    g_ipc_zstd_api.freeDStream(dstream);
+    *out_tar_buf = buf;
+    *out_tar_len = out_total;
+    return out_total >= 512;
+}
+
+static bool ipc_extract_verified_wwpkg_fd(int pkg_fd, int dest_dfd)
+{
+    struct stat st;
+    if (pkg_fd < 0 || dest_dfd < 0 || fstat(pkg_fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size <= 0 || (uint64_t)st.st_size > IPC_WWPKG_MAX_ARCHIVE_SZ) {
+        return false;
+    }
+
+    size_t raw_len = (size_t)st.st_size;
+    uint8_t *raw_buf = (uint8_t *)malloc(raw_len);
+    if (!raw_buf) {
+        return false;
+    }
+
+    size_t rd = 0;
+    while (rd < raw_len) {
+        ssize_t r = pread(pkg_fd, raw_buf + rd, raw_len - rd, (off_t)rd);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            free(raw_buf);
+            return false;
+        }
+        if (r == 0) {
+            break;
+        }
+        rd += (size_t)r;
+    }
+    if (rd != raw_len) {
+        free(raw_buf);
+        return false;
+    }
+
+    uint8_t *tar_buf = NULL;
+    size_t tar_len = 0;
+    bool decomp_ok = ipc_decompress_wwpkg_stream(raw_buf, raw_len, &tar_buf, &tar_len);
+    free(raw_buf);
+    if (!decomp_ok || !tar_buf) {
+        return false;
+    }
+
+    size_t off = 0;
+    size_t files_written = 0;
+    uint64_t total_written = 0;
+    bool ok = true;
+
+    while (tar_len - off >= 512) {
+        const ipc_ustar_hdr_t *hdr = (const ipc_ustar_hdr_t *)(tar_buf + off);
+        bool all_zero = true;
+        for (size_t i = 0; i < 512; ++i) {
+            if (((const uint8_t *)hdr)[i] != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            off += 512;
+            continue;
+        }
+
+        if (memcmp(hdr->magic, "ustar", 5) != 0) {
+            ok = false;
+            break;
+        }
+        char *endp = NULL;
+        unsigned long stored_sum = strtoul(hdr->chksum, &endp, 8);
+        if (ipc_ustar_checksum(hdr) != (uint32_t)stored_sum) {
+            ok = false;
+            break;
+        }
+
+        unsigned long long fsize_ull = strtoull(hdr->size, NULL, 8);
+        if (fsize_ull > (unsigned long long)(tar_len - off - 512)) {
+            ok = false;
+            break;
+        }
+        size_t fsize = (size_t)fsize_ull;
+
+        if (hdr->typeflag != '0' && hdr->typeflag != '\0' && hdr->typeflag != '5') {
+            ok = false;
+            break;
+        }
+        if (hdr->typeflag == '5' && fsize != 0) {
+            ok = false;
+            break;
+        }
+
+        char raw_rel[WWPKG_MAX_PATH_LEN];
+        if (hdr->prefix[0] != '\0') {
+            snprintf(raw_rel, sizeof(raw_rel), "%.155s/%.100s", hdr->prefix, hdr->name);
+        } else {
+            snprintf(raw_rel, sizeof(raw_rel), "%.100s", hdr->name);
+        }
+
+        char clean_rel[WWPKG_MAX_PATH_LEN];
+        if (!ipc_sanitize_rel_path(raw_rel, clean_rel, sizeof(clean_rel))) {
+            ok = false;
+            break;
+        }
+
+        if (hdr->typeflag != '5') {
+            if (++files_written > IPC_WWPKG_MAX_FILES ||
+                total_written + (uint64_t)fsize > IPC_WWPKG_MAX_ARCHIVE_SZ) {
+                ok = false;
+                break;
+            }
+            int out_fd = ipc_openat_beneath_write(dest_dfd, clean_rel);
+            if (out_fd < 0) {
+                ok = false;
+                break;
+            }
+            bool w_ok = ipc_write_all_fd(out_fd, tar_buf + off + 512, fsize);
+            close(out_fd);
+            if (!w_ok) {
+                ok = false;
+                break;
+            }
+            total_written += (uint64_t)fsize;
+        }
+
+        size_t padded = ((fsize + 511u) / 512u) * 512u;
+        off += 512u + padded;
+    }
+
+    free(tar_buf);
+    return ok && files_written > 0;
+}
+
+static uint64_t ipc_sum_regular_files_bytes(const char *dir_path, int depth)
+{
+    if (!dir_path || dir_path[0] == '\0' || depth > 10) {
+        return 0;
+    }
+    DIR *d = opendir(dir_path);
+    if (!d) {
+        return 0;
+    }
+    uint64_t sum = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        char sub[PATH_MAX];
+        int n = snprintf(sub, sizeof(sub), "%s/%s", dir_path, ent->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(sub)) {
+            continue;
+        }
+        struct stat st;
+        if (lstat(sub, &st) != 0) {
+            continue;
+        }
+        if (S_ISREG(st.st_mode)) {
+            sum += (uint64_t)st.st_size;
+        } else if (S_ISDIR(st.st_mode)) {
+            sum += ipc_sum_regular_files_bytes(sub, depth + 1);
+        }
+    }
+    closedir(d);
+    return sum;
+}
+
+static bool ipc_find_executable_in_path(const char *exe_name, char *out_path, size_t cap)
+{
+    if (!exe_name || exe_name[0] == '\0') {
+        return false;
+    }
+    const char *path_env = getenv("PATH");
+    if (!path_env || path_env[0] == '\0') {
+        path_env = "/usr/local/bin:/usr/bin:/bin";
+    }
+    const char *cur = path_env;
+    while (*cur != '\0') {
+        const char *colon = strchr(cur, ':');
+        size_t dlen = colon ? (size_t)(colon - cur) : strlen(cur);
+        if (dlen > 0 && dlen + 1 + strlen(exe_name) < cap) {
+            memcpy(out_path, cur, dlen);
+            out_path[dlen] = '/';
+            strcpy(out_path + dlen + 1, exe_name);
+            if (access(out_path, X_OK) == 0) {
+                struct stat st;
+                if (stat(out_path, &st) == 0 && S_ISREG(st.st_mode)) {
+                    return true;
+                }
+            }
+        }
+        if (!colon) {
+            break;
+        }
+        cur = colon + 1;
+    }
+    return false;
+}
+
+static bool ipc_workshop_item_is_installed_locally(uint64_t file_id,
+                                                   const char *default_workshop_dir)
+{
+    if (file_id == 0) {
+        return false;
+    }
+    char path[PATH_MAX];
+    struct stat st;
+    if (default_workshop_dir && default_workshop_dir[0] != '\0') {
+        int n = snprintf(path, sizeof(path), "%s/%llu", default_workshop_dir,
+                         (unsigned long long)file_id);
+        if (n > 0 && (size_t)n < sizeof(path) && stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            return true;
+        }
+    }
+
+    waywal_steam_library_t *libs =
+        (waywal_steam_library_t *)calloc(16, sizeof(waywal_steam_library_t));
+    if (!libs) {
+        return false;
+    }
+    size_t nlibs = waywal_steam_discover_libraries(libs, 16);
+    bool found = false;
+    for (size_t i = 0; i < nlibs; ++i) {
+        int n = snprintf(path, sizeof(path), "%s/steamapps/workshop/content/431960/%llu",
+                         libs[i].path, (unsigned long long)file_id);
+        if (n > 0 && (size_t)n < sizeof(path) && stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            found = true;
+            break;
+        }
+    }
+    free(libs);
+    return found;
+}
+
+typedef enum {
+    IPC_JOB_WORKSHOP_SYNC = 1,
+    IPC_JOB_SCAN_COMPAT = 2,
+    IPC_JOB_WWPKG_INSTALL = 3,
+    IPC_JOB_WORKSHOP_DOWNLOAD = 4,
+    IPC_JOB_BG_DOWNLOAD_EVENT = 5,
+} ipc_async_job_kind_t;
+
+typedef struct {
+    ipc_async_job_kind_t kind;
+    int client_fd;
+    int attached_fd;
+    bool gpu_compute_active;
+    char default_workshop_dir[PATH_MAX];
+
+    waywal_ipc_req_workshop_sync_t sync_req;
+    waywal_ipc_resp_workshop_sync_t sync_resp;
+
+    waywal_ipc_req_scan_compat_t scan_req;
+    waywal_ipc_resp_scan_compat_t scan_resp;
+
+    waywal_ipc_req_wwpkg_install_t wwpkg_req;
+    char wwpkg_target_output[WAYWAL_IPC_MAX_TAIL_STR];
+    uint8_t wwpkg_resp_uuid[16];
+    uint32_t wwpkg_status_code;
+    char wwpkg_error_msg[512];
+    wwpkg_type_t wwpkg_type;
+    uint32_t wwpkg_target_fps;
+    char wwpkg_install_dir[PATH_MAX];
+    char wwpkg_entrypoint_abs[PATH_MAX];
+
+    waywal_ipc_req_workshop_download_t dl_req;
+    waywal_ipc_resp_workshop_download_t dl_resp;
+} ipc_async_job_t;
+
+typedef struct {
+    uint64_t published_file_id;
+    uint32_t task_state;
+    float progress_pct;
+    float speed_bytes_per_sec;
+    uint32_t eta_seconds;
+    char error_msg[256];
+    bool in_use;
+} ipc_dl_tracker_entry_t;
+
+static struct {
+    bool initialized;
+    bool stopping;
+    int efd;
+    int dl_cancel_efd;
+    pthread_mutex_t mtx;
+    pthread_cond_t cv;
+    pthread_t workers[IPC_ASYNC_WORKERS];
+
+    ipc_async_job_t *queue[IPC_ASYNC_QUEUE_CAP];
+    size_t q_head;
+    size_t q_tail;
+    size_t q_count;
+
+    ipc_async_job_t *comp[IPC_ASYNC_COMP_CAP];
+    size_t c_head;
+    size_t c_tail;
+    size_t c_count;
+
+    pthread_mutex_t dl_mtx;
+    pthread_cond_t dl_cv;
+    pthread_t dl_thread;
+    bool dl_thread_started;
+    ipc_dl_tracker_entry_t dl_entries[IPC_DL_TRACKER_CAP];
+    char dl_default_ws_dir[PATH_MAX];
+} g_ipc_async = {
+    .initialized = false,
+    .stopping = false,
+    .efd = -1,
+    .dl_cancel_efd = -1,
+};
+
+static void ipc_async_notify_main_loop(void)
+{
+    if (g_ipc_async.efd >= 0) {
+        uint64_t one = 1;
+        (void)write(g_ipc_async.efd, &one, sizeof(one));
+    }
+}
+
+static bool ipc_async_push_completion(ipc_async_job_t *job)
+{
+    pthread_mutex_lock(&g_ipc_async.mtx);
+    if (g_ipc_async.stopping || g_ipc_async.c_count >= IPC_ASYNC_COMP_CAP) {
+        pthread_mutex_unlock(&g_ipc_async.mtx);
+        return false;
+    }
+    g_ipc_async.comp[g_ipc_async.c_tail] = job;
+    g_ipc_async.c_tail = (g_ipc_async.c_tail + 1) % IPC_ASYNC_COMP_CAP;
+    g_ipc_async.c_count++;
+    pthread_mutex_unlock(&g_ipc_async.mtx);
+    ipc_async_notify_main_loop();
+    return true;
+}
+
+static int ipc_run_steamcmd_isolated(const char *steamcmd_bin, uint64_t file_id, int cancel_efd)
+{
+    int status_pipe[2] = {-1, -1};
+    int cancel_pipe[2] = {-1, -1};
+    if (pipe2(status_pipe, O_CLOEXEC) != 0) {
+        return -1;
+    }
+    if (pipe2(cancel_pipe, O_CLOEXEC) != 0) {
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        return -1;
+    }
+
+    /* Subreaper child resets SA_NOCLDWAIT locally so waitpid captures steamcmd's real exit code
+     * without disturbing wwald's global fire-and-forget theme hook disposition. */
+    pid_t helper_pid = fork();
+    if (helper_pid < 0) {
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        close(cancel_pipe[0]);
+        close(cancel_pipe[1]);
+        return -1;
+    }
+
+    if (helper_pid == 0) {
+        close(status_pipe[0]);
+        close(cancel_pipe[1]);
+
+        sigset_t empty_mask;
+        sigemptyset(&empty_mask);
+        (void)sigprocmask(SIG_SETMASK, &empty_mask, NULL);
+
+        struct sigaction sa_dfl;
+        memset(&sa_dfl, 0, sizeof(sa_dfl));
+        sa_dfl.sa_handler = SIG_DFL;
+        (void)sigaction(SIGCHLD, &sa_dfl, NULL);
+
+        pid_t cmd_pid = fork();
+        if (cmd_pid < 0) {
+            int fail_code = 127;
+            (void)write(status_pipe[1], &fail_code, sizeof(fail_code));
+            _exit(0);
+        }
+        if (cmd_pid == 0) {
+            close(status_pipe[1]);
+            close(cancel_pipe[0]);
+            (void)setpgid(0, 0);
+            int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+            if (devnull >= 0) {
+                (void)dup2(devnull, STDIN_FILENO);
+                (void)dup2(devnull, STDOUT_FILENO);
+                (void)dup2(devnull, STDERR_FILENO);
+                if (devnull > STDERR_FILENO) {
+                    close(devnull);
+                }
+            }
+            char id_str[32];
+            snprintf(id_str, sizeof(id_str), "%llu", (unsigned long long)file_id);
+            char *const argv[] = {
+                (char *)"steamcmd",
+                (char *)"+login",
+                (char *)"anonymous",
+                (char *)"+workshop_download_item",
+                (char *)"431960",
+                id_str,
+                (char *)"validate",
+                (char *)"+quit",
+                NULL,
+            };
+            execv(steamcmd_bin, argv);
+            _exit(127);
+        }
+
+        (void)setpgid(cmd_pid, cmd_pid);
+        int exit_code = 1;
+        while (true) {
+            int wstatus = 0;
+            pid_t w = waitpid(cmd_pid, &wstatus, WNOHANG);
+            if (w == cmd_pid) {
+                if (WIFEXITED(wstatus)) {
+                    exit_code = WEXITSTATUS(wstatus);
+                } else if (WIFSIGNALED(wstatus)) {
+                    exit_code = 128 + WTERMSIG(wstatus);
+                }
+                break;
+            }
+            if (w < 0 && errno != EINTR) {
+                exit_code = 1;
+                break;
+            }
+            struct pollfd pfd = {.fd = cancel_pipe[0], .events = POLLIN | POLLHUP};
+            int pr = poll(&pfd, 1, 100);
+            if (pr > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+                (void)kill(-cmd_pid, SIGTERM);
+                for (int k = 0; k < 10; ++k) {
+                    struct timespec ts = {.tv_sec = 0, .tv_nsec = 20000000L};
+                    nanosleep(&ts, NULL);
+                    if (waitpid(cmd_pid, &wstatus, WNOHANG) == cmd_pid) {
+                        cmd_pid = -1;
+                        break;
+                    }
+                }
+                if (cmd_pid > 0) {
+                    (void)kill(-cmd_pid, SIGKILL);
+                    (void)waitpid(cmd_pid, &wstatus, 0);
+                }
+                exit_code = 130;
+                break;
+            }
+        }
+        (void)write(status_pipe[1], &exit_code, sizeof(exit_code));
+        close(status_pipe[1]);
+        close(cancel_pipe[0]);
+        _exit(0);
+    }
+
+    close(status_pipe[1]);
+    close(cancel_pipe[0]);
+
+    int exit_code = -1;
+    int elapsed_ms = 0;
+    while (elapsed_ms < 900000) {
+        struct pollfd pfds[2] = {
+            {.fd = status_pipe[0], .events = POLLIN | POLLHUP},
+            {.fd = cancel_efd, .events = POLLIN},
+        };
+        nfds_t nf = (cancel_efd >= 0) ? 2 : 1;
+        int pr = poll(pfds, nf, 250);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (nf == 2 && (pfds[1].revents & POLLIN)) {
+            /* Closing cancel_pipe[1] wakes the helper immediately to terminate steamcmd */
+            close(cancel_pipe[1]);
+            cancel_pipe[1] = -1;
+            struct pollfd wpfd = {.fd = status_pipe[0], .events = POLLIN | POLLHUP};
+            (void)poll(&wpfd, 1, 500);
+            (void)read(status_pipe[0], &exit_code, sizeof(exit_code));
+            break;
+        }
+        if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+            ssize_t r = read(status_pipe[0], &exit_code, sizeof(exit_code));
+            if (r != (ssize_t)sizeof(exit_code)) {
+                exit_code = 1;
+            }
+            break;
+        }
+        elapsed_ms += 250;
+    }
+
+    if (cancel_pipe[1] >= 0) {
+        close(cancel_pipe[1]);
+    }
+    close(status_pipe[0]);
+    return exit_code;
+}
+
+static void *ipc_download_worker_main(void *arg)
+{
+    (void)arg;
+    while (true) {
+        uint64_t next_id = 0;
+        size_t slot = IPC_DL_TRACKER_CAP;
+        char ws_dir[PATH_MAX] = {0};
+
+        pthread_mutex_lock(&g_ipc_async.dl_mtx);
+        while (!g_ipc_async.stopping) {
+            for (size_t i = 0; i < IPC_DL_TRACKER_CAP; ++i) {
+                if (g_ipc_async.dl_entries[i].in_use &&
+                    g_ipc_async.dl_entries[i].task_state == 0u) {
+                    slot = i;
+                    next_id = g_ipc_async.dl_entries[i].published_file_id;
+                    g_ipc_async.dl_entries[i].task_state = 2u;
+                    g_ipc_async.dl_entries[i].progress_pct = 5.0f;
+                    snprintf(ws_dir, sizeof(ws_dir), "%s", g_ipc_async.dl_default_ws_dir);
+                    break;
+                }
+            }
+            if (slot < IPC_DL_TRACKER_CAP) {
+                break;
+            }
+            pthread_cond_wait(&g_ipc_async.dl_cv, &g_ipc_async.dl_mtx);
+        }
+        if (g_ipc_async.stopping) {
+            pthread_mutex_unlock(&g_ipc_async.dl_mtx);
+            break;
+        }
+        pthread_mutex_unlock(&g_ipc_async.dl_mtx);
+
+        char steamcmd_bin[PATH_MAX];
+        bool ok = false;
+        char err_buf[256] = {0};
+        if (!ipc_find_executable_in_path("steamcmd", steamcmd_bin, sizeof(steamcmd_bin))) {
+            snprintf(err_buf, sizeof(err_buf), "steamcmd executable not found in PATH");
+        } else {
+            int rc = ipc_run_steamcmd_isolated(steamcmd_bin, next_id, g_ipc_async.dl_cancel_efd);
+            if (rc == 0 && ipc_workshop_item_is_installed_locally(next_id, ws_dir)) {
+                ok = true;
+            } else if (rc == 130) {
+                snprintf(err_buf, sizeof(err_buf), "Workshop download cancelled during shutdown");
+            } else {
+                snprintf(err_buf, sizeof(err_buf), "steamcmd exited with status %d for item %llu",
+                         rc, (unsigned long long)next_id);
+            }
+        }
+
+        pthread_mutex_lock(&g_ipc_async.dl_mtx);
+        if (slot < IPC_DL_TRACKER_CAP && g_ipc_async.dl_entries[slot].in_use &&
+            g_ipc_async.dl_entries[slot].published_file_id == next_id) {
+            if (ok) {
+                g_ipc_async.dl_entries[slot].task_state = 6u;
+                g_ipc_async.dl_entries[slot].progress_pct = 100.0f;
+                g_ipc_async.dl_entries[slot].error_msg[0] = '\0';
+            } else {
+                g_ipc_async.dl_entries[slot].task_state = 7u;
+                g_ipc_async.dl_entries[slot].progress_pct = 0.0f;
+                snprintf(g_ipc_async.dl_entries[slot].error_msg,
+                         sizeof(g_ipc_async.dl_entries[slot].error_msg), "%s", err_buf);
+            }
+        }
+        pthread_mutex_unlock(&g_ipc_async.dl_mtx);
+
+        if (ok && !g_ipc_async.stopping) {
+            ipc_async_job_t *ev_job = (ipc_async_job_t *)calloc(1, sizeof(ipc_async_job_t));
+            if (ev_job) {
+                ev_job->kind = IPC_JOB_BG_DOWNLOAD_EVENT;
+                ev_job->client_fd = -1;
+                ev_job->attached_fd = -1;
+                if (!ipc_async_push_completion(ev_job)) {
+                    free(ev_job);
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static void ipc_execute_workshop_sync(ipc_async_job_t *job)
+{
+    memset(&job->sync_resp, 0, sizeof(job->sync_resp));
+    uint32_t libs_found = 0;
+    uint32_t items_indexed = 0;
+    uint64_t total_bytes = 0;
+
+    if (job->sync_req.custom_root[0] != '\0') {
+        struct stat st;
+        if (stat(job->sync_req.custom_root, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            job->sync_resp.status_code = 2;
+            return;
+        }
+        libs_found = 1;
+        char acf_path[PATH_MAX];
+        char content_dir[PATH_MAX];
+        snprintf(acf_path, sizeof(acf_path), "%s/steamapps/workshop/appworkshop_431960.acf",
+                 job->sync_req.custom_root);
+        snprintf(content_dir, sizeof(content_dir), "%s/steamapps/workshop/content/431960",
+                 job->sync_req.custom_root);
+        if (access(acf_path, R_OK) != 0) {
+            snprintf(acf_path, sizeof(acf_path), "%s/../../appworkshop_431960.acf",
+                     job->sync_req.custom_root);
+            snprintf(content_dir, sizeof(content_dir), "%s", job->sync_req.custom_root);
+        }
+
+        waywal_appworkshop_manifest_t manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        if (access(acf_path, R_OK) == 0 && waywal_appworkshop_parse_file(acf_path, &manifest)) {
+            for (size_t i = 0; i < manifest.item_count; ++i) {
+                const waywal_workshop_item_manifest_t *it = &manifest.items[i];
+                if (!it->is_installed && (it->state_flags & WAYWAL_UGC_STATE_INSTALLED) == 0) {
+                    continue;
+                }
+                items_indexed++;
+                if (it->size_bytes > 0) {
+                    total_bytes += it->size_bytes;
+                } else {
+                    char item_dir[PATH_MAX];
+                    snprintf(item_dir, sizeof(item_dir), "%s/%llu", content_dir,
+                             (unsigned long long)it->published_file_id);
+                    total_bytes += ipc_sum_regular_files_bytes(item_dir, 0);
+                }
+            }
+            waywal_appworkshop_free(&manifest);
+        } else {
+            DIR *d = opendir(job->sync_req.custom_root);
+            if (d) {
+                struct dirent *de;
+                while ((de = readdir(d)) != NULL) {
+                    if (de->d_name[0] == '.') {
+                        continue;
+                    }
+                    char sub[PATH_MAX];
+                    int n =
+                        snprintf(sub, sizeof(sub), "%s/%s", job->sync_req.custom_root, de->d_name);
+                    if (n <= 0 || (size_t)n >= sizeof(sub)) {
+                        continue;
+                    }
+                    struct stat ist;
+                    if (lstat(sub, &ist) != 0) {
+                        continue;
+                    }
+                    if (S_ISDIR(ist.st_mode)) {
+                        items_indexed++;
+                        total_bytes += ipc_sum_regular_files_bytes(sub, 0);
+                    } else if (S_ISREG(ist.st_mode)) {
+                        items_indexed++;
+                        total_bytes += (uint64_t)ist.st_size;
+                    }
+                }
+                closedir(d);
+            }
+        }
+    } else {
+        waywal_steam_library_t *libs =
+            (waywal_steam_library_t *)calloc(16, sizeof(waywal_steam_library_t));
+        size_t nlibs = libs ? waywal_steam_discover_libraries(libs, 16) : 0;
+        bool covered_default = false;
+
+        for (size_t l = 0; l < nlibs; ++l) {
+            char acf_path[PATH_MAX];
+            char content_dir[PATH_MAX];
+            snprintf(acf_path, sizeof(acf_path), "%s/steamapps/workshop/appworkshop_431960.acf",
+                     libs[l].path);
+            snprintf(content_dir, sizeof(content_dir), "%s/steamapps/workshop/content/431960",
+                     libs[l].path);
+            if (job->default_workshop_dir[0] != '\0' &&
+                strcmp(content_dir, job->default_workshop_dir) == 0) {
+                covered_default = true;
+            }
+
+            struct stat cst;
+            bool has_content = (stat(content_dir, &cst) == 0 && S_ISDIR(cst.st_mode));
+            bool has_acf = (access(acf_path, R_OK) == 0);
+            if (!has_content && !has_acf) {
+                continue;
+            }
+            libs_found++;
+
+            waywal_appworkshop_manifest_t manifest;
+            memset(&manifest, 0, sizeof(manifest));
+            if (has_acf && waywal_appworkshop_parse_file(acf_path, &manifest)) {
+                for (size_t i = 0; i < manifest.item_count; ++i) {
+                    const waywal_workshop_item_manifest_t *it = &manifest.items[i];
+                    if (!it->is_installed && (it->state_flags & WAYWAL_UGC_STATE_INSTALLED) == 0) {
+                        continue;
+                    }
+                    items_indexed++;
+                    if (it->size_bytes > 0) {
+                        total_bytes += it->size_bytes;
+                    } else if (has_content) {
+                        char item_dir[PATH_MAX];
+                        snprintf(item_dir, sizeof(item_dir), "%s/%llu", content_dir,
+                                 (unsigned long long)it->published_file_id);
+                        total_bytes += ipc_sum_regular_files_bytes(item_dir, 0);
+                    }
+                }
+                waywal_appworkshop_free(&manifest);
+            } else if (has_content) {
+                DIR *d = opendir(content_dir);
+                if (d) {
+                    struct dirent *de;
+                    while ((de = readdir(d)) != NULL) {
+                        if (de->d_name[0] == '.') {
+                            continue;
+                        }
+                        char sub[PATH_MAX];
+                        int n = snprintf(sub, sizeof(sub), "%s/%s", content_dir, de->d_name);
+                        if (n <= 0 || (size_t)n >= sizeof(sub)) {
+                            continue;
+                        }
+                        struct stat ist;
+                        if (lstat(sub, &ist) == 0 && S_ISDIR(ist.st_mode)) {
+                            items_indexed++;
+                            total_bytes += ipc_sum_regular_files_bytes(sub, 0);
+                        }
+                    }
+                    closedir(d);
+                }
+            }
+        }
+        free(libs);
+
+        if (!covered_default && job->default_workshop_dir[0] != '\0') {
+            struct stat dst;
+            if (stat(job->default_workshop_dir, &dst) == 0 && S_ISDIR(dst.st_mode)) {
+                libs_found++;
+                DIR *d = opendir(job->default_workshop_dir);
+                if (d) {
+                    struct dirent *de;
+                    while ((de = readdir(d)) != NULL) {
+                        if (de->d_name[0] == '.') {
+                            continue;
+                        }
+                        char sub[PATH_MAX];
+                        int n = snprintf(sub, sizeof(sub), "%s/%s", job->default_workshop_dir,
+                                         de->d_name);
+                        if (n <= 0 || (size_t)n >= sizeof(sub)) {
+                            continue;
+                        }
+                        struct stat ist;
+                        if (lstat(sub, &ist) == 0 && S_ISDIR(ist.st_mode)) {
+                            items_indexed++;
+                            total_bytes += ipc_sum_regular_files_bytes(sub, 0);
+                        }
+                    }
+                    closedir(d);
+                }
+            }
+        }
+    }
+
+    job->sync_resp.status_code = 0;
+    job->sync_resp.total_libraries_found = libs_found;
+    job->sync_resp.total_items_indexed = items_indexed;
+    job->sync_resp.total_size_bytes = total_bytes;
+}
+
+static void ipc_execute_scan_compat(ipc_async_job_t *job)
+{
+    memset(&job->scan_resp, 0, sizeof(job->scan_resp));
+    if (job->scan_req.target_path[0] == '\0') {
+        job->scan_resp.status_code = 2;
+        job->scan_resp.compat_tier = WE_TIER_4_BLOCKED;
+        return;
+    }
+    struct stat st;
+    if (stat(job->scan_req.target_path, &st) != 0) {
+        job->scan_resp.status_code = 2;
+        job->scan_resp.compat_tier = WE_TIER_4_BLOCKED;
         return;
     }
 
-    /* Set socket timeouts and buffer sizes to optimize IPC throughput */
-    struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    int buf_size = 262144;
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
-    setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    we_compat_scanner_t *scanner = we_compat_scanner_create(job->gpu_compute_active, true);
+    we_compat_report_t *report = we_compat_report_alloc();
+    if (!scanner || !report) {
+        we_compat_report_free(report);
+        we_compat_scanner_destroy(scanner);
+        job->scan_resp.status_code = 3;
+        job->scan_resp.compat_tier = WE_TIER_4_BLOCKED;
+        return;
+    }
+
+    if (!we_compat_scan_directory(scanner, job->scan_req.target_path, report)) {
+        we_compat_report_free(report);
+        we_compat_scanner_destroy(scanner);
+        job->scan_resp.status_code = 3;
+        job->scan_resp.compat_tier = WE_TIER_4_BLOCKED;
+        return;
+    }
+
+    uint32_t repairs_applied = 0;
+    if ((job->scan_req.auto_repair_flags & WAYWAL_SCAN_COMPAT_FLAG_APPLY_REPAIRS) != 0 &&
+        report->repair_count > 0 && S_ISDIR(st.st_mode)) {
+        uint8_t path_digest[32];
+        wwpkg_sha256((const uint8_t *)job->scan_req.target_path, strlen(job->scan_req.target_path),
+                     path_digest);
+        char hex_id[17];
+        for (int i = 0; i < 8; ++i) {
+            snprintf(hex_id + i * 2, 3, "%02x", path_digest[i]);
+        }
+        char home_dir[PATH_MAX];
+        char repair_dir[PATH_MAX] = {0};
+        const char *xdg_cache = getenv("XDG_CACHE_HOME");
+        if (xdg_cache && xdg_cache[0] == '/') {
+            snprintf(repair_dir, sizeof(repair_dir), "%s/wwal/repairs/%s", xdg_cache, hex_id);
+        } else if (ipc_resolve_user_home(home_dir, sizeof(home_dir))) {
+            snprintf(repair_dir, sizeof(repair_dir), "%s/.cache/wwal/repairs/%s", home_dir, hex_id);
+        }
+        if (repair_dir[0] != '\0' && ipc_mkdir_p_safe(repair_dir, 0700)) {
+            if (we_compat_apply_auto_repairs(report, job->scan_req.target_path, repair_dir)) {
+                repairs_applied = report->repair_count;
+            }
+        }
+    }
+
+    char *report_json = we_compat_report_to_json(report);
+    if (report_json) {
+        uint8_t digest[32];
+        wwpkg_sha256((const uint8_t *)job->scan_req.target_path, strlen(job->scan_req.target_path),
+                     digest);
+        char hex_tag[17];
+        for (int i = 0; i < 8; ++i) {
+            snprintf(hex_tag + i * 2, 3, "%02x", digest[i]);
+        }
+        const char *rt_dir = getenv("XDG_RUNTIME_DIR");
+        if (!rt_dir || rt_dir[0] != '/') {
+            rt_dir = "/tmp";
+        }
+        char json_path[PATH_MAX];
+        int n = snprintf(json_path, sizeof(json_path), "%s/waywal-compat-%u-%s.json", rt_dir,
+                         (unsigned)geteuid(), hex_tag);
+        if (n > 0 && (size_t)n < sizeof(job->scan_resp.report_json_path)) {
+            int jfd = open(json_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+            if (jfd >= 0) {
+                if (ipc_write_all_fd(jfd, (const uint8_t *)report_json, strlen(report_json))) {
+                    memcpy(job->scan_resp.report_json_path, json_path, (size_t)n + 1);
+                }
+                close(jfd);
+            }
+        }
+        free(report_json);
+    }
+
+    job->scan_resp.status_code = 0;
+    job->scan_resp.compat_tier = (uint32_t)report->tier;
+    job->scan_resp.compat_score = report->compatibility_score;
+    job->scan_resp.total_issues = report->issue_count;
+    job->scan_resp.repairs_applied = repairs_applied;
+    job->scan_resp.estimated_vram_mb =
+        isfinite(report->summary.estimated_vram_mb) ? report->summary.estimated_vram_mb : 0.0f;
+    job->scan_resp.estimated_fps = report->summary.estimated_fps;
+
+    we_compat_report_free(report);
+    we_compat_scanner_destroy(scanner);
+}
+
+static void ipc_execute_wwpkg_install(ipc_async_job_t *job)
+{
+    memcpy(job->wwpkg_resp_uuid, job->wwpkg_req.package_uuid, 16);
+    job->wwpkg_status_code = 0;
+    job->wwpkg_error_msg[0] = '\0';
+
+    if (job->attached_fd < 0) {
+        job->wwpkg_status_code = 2;
+        snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
+                 "Missing .wwpkg file descriptor in SCM_RIGHTS");
+        return;
+    }
+
+    struct stat st;
+    if (fstat(job->attached_fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (uint64_t)st.st_size > IPC_WWPKG_MAX_ARCHIVE_SZ) {
+        close(job->attached_fd);
+        job->attached_fd = -1;
+        job->wwpkg_status_code = 2;
+        snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
+                 "Invalid or oversized .wwpkg file descriptor");
+        return;
+    }
+
+    char proc_fd_path[64];
+    snprintf(proc_fd_path, sizeof(proc_fd_path), "/proc/self/fd/%d", job->attached_fd);
+    wwpkg_package_t *pkg = wwpkg_open(proc_fd_path);
+    if (!pkg) {
+        close(job->attached_fd);
+        job->attached_fd = -1;
+        job->wwpkg_status_code = 3;
+        snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
+                 "Failed to parse .wwpkg container");
+        return;
+    }
+
+    bool is_trusted = false;
+    if (!wwpkg_verify_signature(pkg, &is_trusted)) {
+        wwpkg_close(pkg);
+        close(job->attached_fd);
+        job->attached_fd = -1;
+        job->wwpkg_status_code = 4;
+        snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
+                 "Cryptographic signature or Merkle verification failed");
+        return;
+    }
+
+    const wwpkg_manifest_t *man = wwpkg_get_manifest(pkg);
+    if (!man || man->capabilities.network || man->capabilities.filesystem) {
+        wwpkg_close(pkg);
+        close(job->attached_fd);
+        job->attached_fd = -1;
+        job->wwpkg_status_code = 4;
+        snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
+                 "Package manifest rejected by air-gap policy");
+        return;
+    }
+
+    bool uuid_nonzero = false;
+    for (int i = 0; i < 16; ++i) {
+        if (job->wwpkg_resp_uuid[i] != 0) {
+            uuid_nonzero = true;
+            break;
+        }
+    }
+    if (!uuid_nonzero) {
+        const wwpkg_signature_t *sig = wwpkg_get_signature(pkg);
+        if (sig) {
+            memcpy(job->wwpkg_resp_uuid, sig->merkle_root, 16);
+        } else {
+            uint8_t digest[32];
+            wwpkg_sha256((const uint8_t *)man->id, strlen(man->id), digest);
+            memcpy(job->wwpkg_resp_uuid, digest, 16);
+        }
+    }
+
+    char uuid_hex[33];
+    for (int i = 0; i < 16; ++i) {
+        snprintf(uuid_hex + i * 2, 3, "%02x", job->wwpkg_resp_uuid[i]);
+    }
+
+    job->wwpkg_type = man->type;
+    job->wwpkg_target_fps = man->budgets.target_fps;
+
+    if ((job->wwpkg_req.flags & WAYWAL_WWPKG_INSTALL_FLAG_VERIFY_ONLY) == 0) {
+        char home_dir[PATH_MAX];
+        char pkg_dir[PATH_MAX] = {0};
+        const char *xdg_data = getenv("XDG_DATA_HOME");
+        if (xdg_data && xdg_data[0] == '/') {
+            snprintf(pkg_dir, sizeof(pkg_dir), "%s/wwal/packages/%s", xdg_data, uuid_hex);
+        } else if (ipc_resolve_user_home(home_dir, sizeof(home_dir))) {
+            snprintf(pkg_dir, sizeof(pkg_dir), "%s/.local/share/wwal/packages/%s", home_dir,
+                     uuid_hex);
+        }
+
+        /* Landlock keeps ~/.local/share read-only in live daemon sessions while granting
+         * read-write to ~/.local/state/wwal; fall back to state packages on EACCES. */
+        bool dir_ok = (pkg_dir[0] != '\0') && ipc_mkdir_p_safe(pkg_dir, 0700);
+        int dest_dfd = dir_ok ? open(pkg_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
+        if (dest_dfd >= 0) {
+            int probe_fd = openat(dest_dfd, ".wwpkg_write_probe",
+                                  O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+            if (probe_fd >= 0) {
+                close(probe_fd);
+                (void)unlinkat(dest_dfd, ".wwpkg_write_probe", 0);
+            } else if (errno == EACCES || errno == EPERM) {
+                close(dest_dfd);
+                dest_dfd = -1;
+                dir_ok = false;
+            }
+        }
+        if (!dir_ok && ipc_resolve_user_home(home_dir, sizeof(home_dir))) {
+            const char *xdg_state = getenv("XDG_STATE_HOME");
+            if (xdg_state && xdg_state[0] == '/') {
+                snprintf(pkg_dir, sizeof(pkg_dir), "%s/wwal/packages/%s", xdg_state, uuid_hex);
+            } else {
+                snprintf(pkg_dir, sizeof(pkg_dir), "%s/.local/state/wwal/packages/%s", home_dir,
+                         uuid_hex);
+            }
+            if (ipc_mkdir_p_safe(pkg_dir, 0700)) {
+                dest_dfd = open(pkg_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            }
+        }
+
+        if (dest_dfd < 0) {
+            wwpkg_close(pkg);
+            close(job->attached_fd);
+            job->attached_fd = -1;
+            job->wwpkg_status_code = 5;
+            snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
+                     "Failed to open destination package directory");
+            return;
+        }
+
+        if ((job->wwpkg_req.flags & WAYWAL_WWPKG_INSTALL_FLAG_FORCE_OVERWRITE) == 0 &&
+            faccessat(dest_dfd, "manifest.json", F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+            close(dest_dfd);
+            wwpkg_close(pkg);
+            close(job->attached_fd);
+            job->attached_fd = -1;
+            job->wwpkg_status_code = 6;
+            snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
+                     "Package already installed without FORCE_OVERWRITE");
+            return;
+        }
+
+        bool extracted = ipc_extract_verified_wwpkg_fd(job->attached_fd, dest_dfd);
+        close(dest_dfd);
+        if (!extracted) {
+            wwpkg_close(pkg);
+            close(job->attached_fd);
+            job->attached_fd = -1;
+            job->wwpkg_status_code = 7;
+            snprintf(job->wwpkg_error_msg, sizeof(job->wwpkg_error_msg),
+                     "Failed to extract verified .wwpkg assets");
+            return;
+        }
+
+        snprintf(job->wwpkg_install_dir, sizeof(job->wwpkg_install_dir), "%s", pkg_dir);
+        char clean_entry[WWPKG_MAX_PATH_LEN];
+        if (man->entrypoint_pipeline[0] != '\0' &&
+            ipc_sanitize_rel_path(man->entrypoint_pipeline, clean_entry, sizeof(clean_entry))) {
+            snprintf(job->wwpkg_entrypoint_abs, sizeof(job->wwpkg_entrypoint_abs), "%s/%s", pkg_dir,
+                     clean_entry);
+        }
+    }
+
+    wwpkg_close(pkg);
+    close(job->attached_fd);
+    job->attached_fd = -1;
+}
+
+static void ipc_execute_workshop_download(ipc_async_job_t *job)
+{
+    memset(&job->dl_resp, 0, sizeof(job->dl_resp));
+    uint64_t fid = job->dl_req.published_file_id;
+    job->dl_resp.published_file_id = fid;
+
+    if (fid == 0) {
+        job->dl_resp.task_state = 7u;
+        snprintf(job->dl_resp.error_msg, sizeof(job->dl_resp.error_msg),
+                 "Invalid Workshop published_file_id");
+        return;
+    }
+
+    if (ipc_workshop_item_is_installed_locally(fid, job->default_workshop_dir)) {
+        job->dl_resp.task_state = 6u;
+        job->dl_resp.progress_pct = 100.0f;
+        return;
+    }
+
+    char steamcmd_bin[PATH_MAX];
+    bool has_steamcmd = ipc_find_executable_in_path("steamcmd", steamcmd_bin, sizeof(steamcmd_bin));
+
+    pthread_mutex_lock(&g_ipc_async.dl_mtx);
+    snprintf(g_ipc_async.dl_default_ws_dir, sizeof(g_ipc_async.dl_default_ws_dir), "%s",
+             job->default_workshop_dir);
+
+    size_t existing = IPC_DL_TRACKER_CAP;
+    size_t free_slot = IPC_DL_TRACKER_CAP;
+    size_t evict_slot = IPC_DL_TRACKER_CAP;
+    for (size_t i = 0; i < IPC_DL_TRACKER_CAP; ++i) {
+        if (g_ipc_async.dl_entries[i].in_use &&
+            g_ipc_async.dl_entries[i].published_file_id == fid) {
+            existing = i;
+            break;
+        }
+        if (!g_ipc_async.dl_entries[i].in_use && free_slot == IPC_DL_TRACKER_CAP) {
+            free_slot = i;
+        } else if (g_ipc_async.dl_entries[i].in_use &&
+                   (g_ipc_async.dl_entries[i].task_state == 6u ||
+                    g_ipc_async.dl_entries[i].task_state == 7u) &&
+                   evict_slot == IPC_DL_TRACKER_CAP) {
+            evict_slot = i;
+        }
+    }
+
+    if (existing < IPC_DL_TRACKER_CAP && (g_ipc_async.dl_entries[existing].task_state == 0u ||
+                                          g_ipc_async.dl_entries[existing].task_state == 2u)) {
+        job->dl_resp.task_state = g_ipc_async.dl_entries[existing].task_state;
+        job->dl_resp.progress_pct = g_ipc_async.dl_entries[existing].progress_pct;
+        job->dl_resp.speed_bytes_per_sec = g_ipc_async.dl_entries[existing].speed_bytes_per_sec;
+        job->dl_resp.eta_seconds = g_ipc_async.dl_entries[existing].eta_seconds;
+        snprintf(job->dl_resp.error_msg, sizeof(job->dl_resp.error_msg), "%s",
+                 g_ipc_async.dl_entries[existing].error_msg);
+        pthread_mutex_unlock(&g_ipc_async.dl_mtx);
+        return;
+    }
+
+    if (!has_steamcmd) {
+        pthread_mutex_unlock(&g_ipc_async.dl_mtx);
+        job->dl_resp.task_state = 7u;
+        snprintf(job->dl_resp.error_msg, sizeof(job->dl_resp.error_msg),
+                 "steamcmd executable not found in PATH");
+        return;
+    }
+
+    size_t target_slot = existing < IPC_DL_TRACKER_CAP
+                             ? existing
+                             : (free_slot < IPC_DL_TRACKER_CAP ? free_slot : evict_slot);
+    if (target_slot >= IPC_DL_TRACKER_CAP) {
+        pthread_mutex_unlock(&g_ipc_async.dl_mtx);
+        job->dl_resp.task_state = 7u;
+        snprintf(job->dl_resp.error_msg, sizeof(job->dl_resp.error_msg),
+                 "Daemon Workshop download queue is full");
+        return;
+    }
+
+    ipc_dl_tracker_entry_t *ent = &g_ipc_async.dl_entries[target_slot];
+    memset(ent, 0, sizeof(*ent));
+    ent->in_use = true;
+    ent->published_file_id = fid;
+    ent->task_state = 0u;
+    ent->progress_pct = 0.0f;
+
+    if (g_ipc_async.initialized && !g_ipc_async.dl_thread_started && !g_ipc_async.stopping) {
+        if (pthread_create(&g_ipc_async.dl_thread, NULL, ipc_download_worker_main, NULL) == 0) {
+            g_ipc_async.dl_thread_started = true;
+        } else {
+            ent->task_state = 7u;
+            snprintf(ent->error_msg, sizeof(ent->error_msg),
+                     "Failed to start background download worker");
+        }
+    }
+    if (ent->task_state == 0u) {
+        pthread_cond_signal(&g_ipc_async.dl_cv);
+    }
+
+    job->dl_resp.task_state = ent->task_state;
+    job->dl_resp.progress_pct = ent->progress_pct;
+    snprintf(job->dl_resp.error_msg, sizeof(job->dl_resp.error_msg), "%s", ent->error_msg);
+    pthread_mutex_unlock(&g_ipc_async.dl_mtx);
+}
+
+static void ipc_async_run_job(ipc_async_job_t *job)
+{
+    switch (job->kind) {
+    case IPC_JOB_WORKSHOP_SYNC:
+        ipc_execute_workshop_sync(job);
+        break;
+    case IPC_JOB_SCAN_COMPAT:
+        ipc_execute_scan_compat(job);
+        break;
+    case IPC_JOB_WWPKG_INSTALL:
+        ipc_execute_wwpkg_install(job);
+        break;
+    case IPC_JOB_WORKSHOP_DOWNLOAD:
+        ipc_execute_workshop_download(job);
+        break;
+    case IPC_JOB_BG_DOWNLOAD_EVENT:
+        break;
+    }
+}
+
+static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_t *job)
+{
+    if (!job) {
+        return;
+    }
+    if (job->attached_fd >= 0) {
+        close(job->attached_fd);
+        job->attached_fd = -1;
+    }
+
+    switch (job->kind) {
+    case IPC_JOB_WORKSHOP_SYNC: {
+        waywal_ipc_hdr_t rhdr;
+        waywal_ipc_resp_workshop_sync_t resp;
+        if (job->client_fd >= 0 &&
+            waywal_ipc_serialize_resp_workshop_sync(
+                job->sync_resp.status_code, job->sync_resp.total_libraries_found,
+                job->sync_resp.total_items_indexed, job->sync_resp.total_size_bytes, &rhdr,
+                &resp)) {
+            if (waywal_ipc_send(job->client_fd, &rhdr, -1)) {
+                (void)write_exact(job->client_fd, &resp, sizeof(resp));
+            }
+        }
+        if (job->client_fd >= 0) {
+            if (!daemon_is_subscriber_fd(state, job->client_fd)) {
+                close(job->client_fd);
+            }
+            job->client_fd = -1;
+        }
+        if (state && job->sync_resp.status_code == 0) {
+            daemon_broadcast_event(state, "workshop_sync");
+        }
+        break;
+    }
+    case IPC_JOB_SCAN_COMPAT: {
+        waywal_ipc_hdr_t rhdr;
+        waywal_ipc_resp_scan_compat_t resp;
+        if (job->client_fd >= 0 &&
+            waywal_ipc_serialize_resp_scan_compat(
+                job->scan_resp.status_code, job->scan_resp.compat_tier, job->scan_resp.compat_score,
+                job->scan_resp.total_issues, job->scan_resp.repairs_applied,
+                job->scan_resp.estimated_vram_mb, job->scan_resp.estimated_fps,
+                job->scan_resp.report_json_path, &rhdr, &resp)) {
+            if (waywal_ipc_send(job->client_fd, &rhdr, -1)) {
+                (void)write_exact(job->client_fd, &resp, sizeof(resp));
+            }
+        }
+        if (job->client_fd >= 0) {
+            if (!daemon_is_subscriber_fd(state, job->client_fd)) {
+                close(job->client_fd);
+            }
+            job->client_fd = -1;
+        }
+        if (state && job->scan_resp.status_code == 0) {
+            daemon_broadcast_event(state, "scan_compat");
+        }
+        break;
+    }
+    case IPC_JOB_WWPKG_INSTALL: {
+        if (state && job->wwpkg_status_code == 0 &&
+            (job->wwpkg_req.flags & WAYWAL_WWPKG_INSTALL_FLAG_AUTO_APPLY) != 0 &&
+            (job->wwpkg_req.flags & WAYWAL_WWPKG_INSTALL_FLAG_VERIFY_ONLY) == 0) {
+            const char *tgt = job->wwpkg_target_output[0] ? job->wwpkg_target_output : "*";
+            if ((job->wwpkg_type == WWPKG_TYPE_SHADER_FRAGMENT ||
+                 job->wwpkg_type == WWPKG_TYPE_SHADER_COMPUTE) &&
+                job->wwpkg_entrypoint_abs[0] != '\0') {
+                waywal_shader_payload_t spay;
+                memset(&spay, 0, sizeof(spay));
+                snprintf(spay.output, sizeof(spay.output), "%s", tgt);
+                snprintf(spay.shader_path, sizeof(spay.shader_path), "%s",
+                         job->wwpkg_entrypoint_abs);
+                spay.fps = job->wwpkg_target_fps > 0 ? job->wwpkg_target_fps : 60u;
+                (void)daemon_activate_shader(state, &spay);
+            } else if (job->wwpkg_type >= WWPKG_TYPE_SCENE_2D &&
+                       job->wwpkg_type <= WWPKG_TYPE_SCENE_PARTICLES &&
+                       job->wwpkg_install_dir[0] != '\0') {
+                waywal_workshop_payload_t wpay;
+                memset(&wpay, 0, sizeof(wpay));
+                snprintf(wpay.output, sizeof(wpay.output), "%s", tgt);
+                snprintf(wpay.workshop_dir, sizeof(wpay.workshop_dir), "%s",
+                         job->wwpkg_install_dir);
+                wpay.fps = job->wwpkg_target_fps > 0 ? job->wwpkg_target_fps : 60u;
+                (void)daemon_activate_workshop(state, &wpay);
+            } else if (job->wwpkg_type == WWPKG_TYPE_VIDEO_STREAM &&
+                       job->wwpkg_entrypoint_abs[0] != '\0') {
+                waywal_output_saved_state_t sv;
+                memset(&sv, 0, sizeof(sv));
+                snprintf(sv.output_name, sizeof(sv.output_name), "%s", tgt);
+                snprintf(sv.media_path, sizeof(sv.media_path), "%s", job->wwpkg_entrypoint_abs);
+                sv.kind = WAYWAL_CONTENT_VIDEO;
+                sv.scaling = WAYWAL_SCALING_FILL;
+                (void)daemon_restore_output_entry(state, &sv, tgt);
+            }
+        }
+
+        uint8_t resp_buf[sizeof(waywal_ipc_resp_wwpkg_install_t) + WAYWAL_IPC_MAX_TAIL_STR];
+        size_t resp_len = 0;
+        waywal_ipc_hdr_t rhdr;
+        if (job->client_fd >= 0 &&
+            waywal_ipc_serialize_resp_wwpkg_install(job->wwpkg_resp_uuid, job->wwpkg_status_code,
+                                                    job->wwpkg_error_msg, &rhdr, NULL, resp_buf,
+                                                    sizeof(resp_buf), &resp_len)) {
+            if (waywal_ipc_send(job->client_fd, &rhdr, -1)) {
+                (void)write_exact(job->client_fd, resp_buf, resp_len);
+            }
+        }
+        if (job->client_fd >= 0) {
+            if (!daemon_is_subscriber_fd(state, job->client_fd)) {
+                close(job->client_fd);
+            }
+            job->client_fd = -1;
+        }
+        if (state && job->wwpkg_status_code == 0) {
+            daemon_broadcast_event(state, "wwpkg_installed");
+        }
+        break;
+    }
+    case IPC_JOB_WORKSHOP_DOWNLOAD: {
+        waywal_ipc_hdr_t rhdr;
+        waywal_ipc_resp_workshop_download_t resp;
+        if (job->client_fd >= 0 &&
+            waywal_ipc_serialize_resp_workshop_download(
+                job->dl_resp.published_file_id, job->dl_resp.task_state, job->dl_resp.progress_pct,
+                job->dl_resp.speed_bytes_per_sec, job->dl_resp.eta_seconds, job->dl_resp.error_msg,
+                &rhdr, &resp)) {
+            if (waywal_ipc_send(job->client_fd, &rhdr, -1)) {
+                (void)write_exact(job->client_fd, &resp, sizeof(resp));
+            }
+        }
+        if (job->client_fd >= 0) {
+            if (!daemon_is_subscriber_fd(state, job->client_fd)) {
+                close(job->client_fd);
+            }
+            job->client_fd = -1;
+        }
+        if (state && job->dl_resp.task_state != 7u) {
+            daemon_broadcast_event(state, "workshop_download");
+        }
+        break;
+    }
+    case IPC_JOB_BG_DOWNLOAD_EVENT:
+        if (state) {
+            daemon_broadcast_event(state, "workshop_download");
+        }
+        break;
+    }
+}
+
+static void *ipc_async_worker_main(void *arg)
+{
+    (void)arg;
+    while (true) {
+        pthread_mutex_lock(&g_ipc_async.mtx);
+        while (!g_ipc_async.stopping && g_ipc_async.q_count == 0) {
+            pthread_cond_wait(&g_ipc_async.cv, &g_ipc_async.mtx);
+        }
+        if (g_ipc_async.stopping && g_ipc_async.q_count == 0) {
+            pthread_mutex_unlock(&g_ipc_async.mtx);
+            break;
+        }
+        ipc_async_job_t *job = g_ipc_async.queue[g_ipc_async.q_head];
+        g_ipc_async.queue[g_ipc_async.q_head] = NULL;
+        g_ipc_async.q_head = (g_ipc_async.q_head + 1) % IPC_ASYNC_QUEUE_CAP;
+        g_ipc_async.q_count--;
+        pthread_mutex_unlock(&g_ipc_async.mtx);
+
+        if (job) {
+            ipc_async_run_job(job);
+            if (!ipc_async_push_completion(job)) {
+                if (job->attached_fd >= 0) {
+                    close(job->attached_fd);
+                }
+                if (job->client_fd >= 0) {
+                    close(job->client_fd);
+                }
+                free(job);
+            }
+        }
+    }
+    return NULL;
+}
+
+static bool ipc_async_submit(daemon_state_t *state, ipc_async_job_t *job)
+{
+    if (!job) {
+        return false;
+    }
+    if (!g_ipc_async.initialized) {
+        ipc_async_run_job(job);
+        ipc_async_complete_job_on_main(state, job);
+        free(job);
+        return true;
+    }
+    pthread_mutex_lock(&g_ipc_async.mtx);
+    if (g_ipc_async.stopping || g_ipc_async.q_count >= IPC_ASYNC_QUEUE_CAP) {
+        pthread_mutex_unlock(&g_ipc_async.mtx);
+        return false;
+    }
+    g_ipc_async.queue[g_ipc_async.q_tail] = job;
+    g_ipc_async.q_tail = (g_ipc_async.q_tail + 1) % IPC_ASYNC_QUEUE_CAP;
+    g_ipc_async.q_count++;
+    pthread_cond_signal(&g_ipc_async.cv);
+    pthread_mutex_unlock(&g_ipc_async.mtx);
+    return true;
+}
+
+bool daemon_ipc_async_init(struct daemon_state *state)
+{
+    (void)state;
+    if (g_ipc_async.initialized) {
+        return true;
+    }
+    int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (efd < 0) {
+        return false;
+    }
+    int cancel_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (cancel_efd < 0) {
+        close(efd);
+        return false;
+    }
+
+    memset(&g_ipc_async, 0, sizeof(g_ipc_async));
+    g_ipc_async.efd = efd;
+    g_ipc_async.dl_cancel_efd = cancel_efd;
+    pthread_mutex_init(&g_ipc_async.mtx, NULL);
+    pthread_cond_init(&g_ipc_async.cv, NULL);
+    pthread_mutex_init(&g_ipc_async.dl_mtx, NULL);
+    pthread_cond_init(&g_ipc_async.dl_cv, NULL);
+
+    size_t started = 0;
+    for (size_t i = 0; i < IPC_ASYNC_WORKERS; ++i) {
+        if (pthread_create(&g_ipc_async.workers[i], NULL, ipc_async_worker_main, NULL) == 0) {
+            started++;
+        } else {
+            break;
+        }
+    }
+    if (started == 0) {
+        close(g_ipc_async.efd);
+        close(g_ipc_async.dl_cancel_efd);
+        g_ipc_async.efd = -1;
+        g_ipc_async.dl_cancel_efd = -1;
+        pthread_mutex_destroy(&g_ipc_async.mtx);
+        pthread_cond_destroy(&g_ipc_async.cv);
+        pthread_mutex_destroy(&g_ipc_async.dl_mtx);
+        pthread_cond_destroy(&g_ipc_async.dl_cv);
+        return false;
+    }
+    for (size_t i = started; i < IPC_ASYNC_WORKERS; ++i) {
+        g_ipc_async.workers[i] = 0;
+    }
+    g_ipc_async.initialized = true;
+    return true;
+}
+
+int daemon_ipc_async_get_fd(void) { return g_ipc_async.initialized ? g_ipc_async.efd : -1; }
+
+void daemon_ipc_async_dispatch(struct daemon_state *state)
+{
+    if (!g_ipc_async.initialized) {
+        return;
+    }
+    uint64_t val = 0;
+    while (read(g_ipc_async.efd, &val, sizeof(val)) > 0) {
+    }
+
+    while (true) {
+        pthread_mutex_lock(&g_ipc_async.mtx);
+        if (g_ipc_async.c_count == 0) {
+            pthread_mutex_unlock(&g_ipc_async.mtx);
+            break;
+        }
+        ipc_async_job_t *job = g_ipc_async.comp[g_ipc_async.c_head];
+        g_ipc_async.comp[g_ipc_async.c_head] = NULL;
+        g_ipc_async.c_head = (g_ipc_async.c_head + 1) % IPC_ASYNC_COMP_CAP;
+        g_ipc_async.c_count--;
+        pthread_mutex_unlock(&g_ipc_async.mtx);
+
+        if (job) {
+            ipc_async_complete_job_on_main(state, job);
+            free(job);
+        }
+    }
+}
+
+void daemon_ipc_async_shutdown(struct daemon_state *state)
+{
+    if (!g_ipc_async.initialized) {
+        return;
+    }
+    if (state && g_ipc_async.efd >= 0) {
+        unregister_fd_from_loops(state, g_ipc_async.efd);
+    }
+
+    pthread_mutex_lock(&g_ipc_async.mtx);
+    g_ipc_async.stopping = true;
+    pthread_cond_broadcast(&g_ipc_async.cv);
+    pthread_mutex_unlock(&g_ipc_async.mtx);
+
+    pthread_mutex_lock(&g_ipc_async.dl_mtx);
+    if (g_ipc_async.dl_cancel_efd >= 0) {
+        uint64_t sig = 1;
+        (void)write(g_ipc_async.dl_cancel_efd, &sig, sizeof(sig));
+    }
+    pthread_cond_broadcast(&g_ipc_async.dl_cv);
+    bool join_dl = g_ipc_async.dl_thread_started;
+    pthread_mutex_unlock(&g_ipc_async.dl_mtx);
+
+    for (size_t i = 0; i < IPC_ASYNC_WORKERS; ++i) {
+        if (g_ipc_async.workers[i] != 0) {
+            (void)pthread_join(g_ipc_async.workers[i], NULL);
+            g_ipc_async.workers[i] = 0;
+        }
+    }
+    if (join_dl) {
+        (void)pthread_join(g_ipc_async.dl_thread, NULL);
+        g_ipc_async.dl_thread_started = false;
+    }
+
+    for (size_t i = 0; i < IPC_ASYNC_QUEUE_CAP; ++i) {
+        ipc_async_job_t *j = g_ipc_async.queue[i];
+        if (j) {
+            if (j->attached_fd >= 0) {
+                close(j->attached_fd);
+            }
+            if (j->client_fd >= 0 && !daemon_is_subscriber_fd(state, j->client_fd)) {
+                close(j->client_fd);
+            }
+            free(j);
+            g_ipc_async.queue[i] = NULL;
+        }
+    }
+    for (size_t i = 0; i < IPC_ASYNC_COMP_CAP; ++i) {
+        ipc_async_job_t *j = g_ipc_async.comp[i];
+        if (j) {
+            if (j->attached_fd >= 0) {
+                close(j->attached_fd);
+            }
+            if (j->client_fd >= 0 && !daemon_is_subscriber_fd(state, j->client_fd)) {
+                close(j->client_fd);
+            }
+            free(j);
+            g_ipc_async.comp[i] = NULL;
+        }
+    }
+
+    if (g_ipc_async.efd >= 0) {
+        close(g_ipc_async.efd);
+        g_ipc_async.efd = -1;
+    }
+    if (g_ipc_async.dl_cancel_efd >= 0) {
+        close(g_ipc_async.dl_cancel_efd);
+        g_ipc_async.dl_cancel_efd = -1;
+    }
+    pthread_mutex_destroy(&g_ipc_async.mtx);
+    pthread_cond_destroy(&g_ipc_async.cv);
+    pthread_mutex_destroy(&g_ipc_async.dl_mtx);
+    pthread_cond_destroy(&g_ipc_async.dl_cv);
+    g_ipc_async.initialized = false;
+}
+
+static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
+{
+    bool is_sub = daemon_is_subscriber_fd(state, client_fd);
+    if (!is_sub) {
+        /* Verify peer credentials (SO_PEERCRED) to prevent unauthorized local hijack */
+        struct ucred cred;
+        socklen_t cred_len = sizeof(cred);
+        if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) < 0 ||
+            cred.uid != geteuid()) {
+            WAYWAL_LOG_WARN("Rejected unauthorized IPC connection from UID %u (expected %u)",
+                            cred.uid, geteuid());
+            close(client_fd);
+            return;
+        }
+
+        /* Set socket timeouts and buffer sizes to optimize IPC throughput */
+        struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        int buf_size = 262144;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    }
 
     waywal_ipc_hdr_t req_hdr;
     int attached_fd = -1;
@@ -618,7 +2536,13 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         if (attached_fd >= 0) {
             close(attached_fd);
         }
-        close(client_fd);
+        if (is_sub) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                daemon_remove_subscriber_fd(state, client_fd);
+            }
+        } else {
+            close(client_fd);
+        }
         return;
     }
 
@@ -630,7 +2554,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     };
 
     if (req_hdr.opcode != WAYWAL_REQ_SET_IMAGE && req_hdr.opcode != WAYWAL_REQ_SET_VIDEO &&
-        attached_fd >= 0) {
+        req_hdr.opcode != WAYWAL_REQ_WWPKG_INSTALL && attached_fd >= 0) {
         close(attached_fd);
         attached_fd = -1;
     }
@@ -3000,14 +4924,18 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 (void)fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
             }
             daemon_reap_dead_subscribers(state);
-            if (state->num_subscribers >= 16) {
-                close(state->subscriber_fds[0]);
-                for (size_t j = 1; j < 16; ++j) {
-                    state->subscriber_fds[j - 1] = state->subscriber_fds[j];
+            if (!daemon_is_subscriber_fd(state, client_fd)) {
+                if (state->num_subscribers >= 16) {
+                    unregister_fd_from_loops(state, state->subscriber_fds[0]);
+                    close(state->subscriber_fds[0]);
+                    for (size_t j = 1; j < 16; ++j) {
+                        state->subscriber_fds[j - 1] = state->subscriber_fds[j];
+                    }
+                    state->num_subscribers = 15;
                 }
-                state->num_subscribers = 15;
+                state->subscriber_fds[state->num_subscribers++] = client_fd;
+                register_fd_in_loops(state, client_fd, URING_EV_IPC_READ);
             }
-            state->subscriber_fds[state->num_subscribers++] = client_fd;
             if (attached_fd >= 0) {
                 close(attached_fd);
             }
@@ -3020,195 +4948,184 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         waywal_ipc_req_workshop_sync_t req;
         memset(&req, 0, sizeof(req));
         bool valid = false;
-        if (req_hdr.payload_size >= sizeof(req)) {
+        if (req_hdr.payload_size == sizeof(req)) {
             if (read_exact(client_fd, &req, sizeof(req))) {
-                if (req_hdr.payload_size > sizeof(req)) {
-                    ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(req));
-                }
                 valid = waywal_ipc_validate_req_workshop_sync(&req, sizeof(req));
             }
         } else if (req_hdr.payload_size > 0) {
             ipc_drain_bytes(client_fd, req_hdr.payload_size);
         }
 
-        waywal_ipc_resp_workshop_sync_t resp;
-        memset(&resp, 0, sizeof(resp));
-
         if (!valid) {
-            resp.status_code = 1;
-        } else {
-            const char *scan_root =
-                req.custom_root[0] != '\0' ? req.custom_root : state->workshop_dir;
-            uint32_t libs_found = 0;
-            uint32_t items_found = 0;
-            uint64_t total_size = 0;
-
-            if (scan_root && scan_root[0] != '\0') {
-                struct stat st;
-                if (stat(scan_root, &st) == 0 && S_ISDIR(st.st_mode)) {
-                    libs_found = 1;
-                    DIR *d = opendir(scan_root);
-                    if (d) {
-                        struct dirent *de;
-                        while ((de = readdir(d)) != NULL) {
-                            if (de->d_name[0] == '.') {
-                                continue;
-                            }
-                            items_found++;
-                            char subpath[PATH_MAX];
-                            snprintf(subpath, sizeof(subpath), "%s/%s", scan_root, de->d_name);
-                            struct stat item_st;
-                            if (stat(subpath, &item_st) == 0) {
-                                total_size += (uint64_t)item_st.st_size;
-                            }
-                        }
-                        closedir(d);
-                    }
-                }
+            waywal_ipc_resp_workshop_sync_t resp;
+            if (waywal_ipc_serialize_resp_workshop_sync(1u, 0u, 0u, 0ULL, &resp_hdr, &resp)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, &resp, sizeof(resp));
             }
-
-            resp.status_code = 0;
-            resp.total_libraries_found = libs_found;
-            resp.total_items_indexed = items_found;
-            resp.total_size_bytes = total_size;
+            break;
         }
 
-        resp_hdr.opcode = WAYWAL_RESP_WORKSHOP_SYNC;
-        resp_hdr.payload_size = sizeof(resp);
-        waywal_ipc_send(client_fd, &resp_hdr, -1);
-        (void)write_exact(client_fd, &resp, sizeof(resp));
-        if (valid && resp.status_code == 0) {
-            daemon_broadcast_event(state, "workshop_sync");
+        ipc_async_job_t *job = (ipc_async_job_t *)calloc(1, sizeof(ipc_async_job_t));
+        if (!job) {
+            waywal_ipc_resp_workshop_sync_t resp;
+            if (waywal_ipc_serialize_resp_workshop_sync(3u, 0u, 0u, 0ULL, &resp_hdr, &resp)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, &resp, sizeof(resp));
+            }
+            break;
         }
-        break;
+        job->kind = IPC_JOB_WORKSHOP_SYNC;
+        job->client_fd = client_fd;
+        job->attached_fd = -1;
+        job->sync_req = req;
+        snprintf(job->default_workshop_dir, sizeof(job->default_workshop_dir), "%s",
+                 state->workshop_dir);
+
+        if (!ipc_async_submit(state, job)) {
+            free(job);
+            waywal_ipc_resp_workshop_sync_t resp;
+            if (waywal_ipc_serialize_resp_workshop_sync(4u, 0u, 0u, 0ULL, &resp_hdr, &resp)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, &resp, sizeof(resp));
+            }
+            break;
+        }
+        return;
     }
 
     case WAYWAL_REQ_WORKSHOP_DOWNLOAD: {
         waywal_ipc_req_workshop_download_t req;
         memset(&req, 0, sizeof(req));
         bool valid = false;
-        if (req_hdr.payload_size >= sizeof(req)) {
+        if (req_hdr.payload_size == sizeof(req)) {
             if (read_exact(client_fd, &req, sizeof(req))) {
-                if (req_hdr.payload_size > sizeof(req)) {
-                    ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(req));
-                }
                 valid = waywal_ipc_validate_req_workshop_download(&req, sizeof(req));
             }
         } else if (req_hdr.payload_size > 0) {
             ipc_drain_bytes(client_fd, req_hdr.payload_size);
         }
 
-        waywal_ipc_resp_workshop_download_t resp;
-        memset(&resp, 0, sizeof(resp));
-
         if (!valid) {
-            resp.task_state = 7; /* Failed */
-            snprintf(resp.error_msg, sizeof(resp.error_msg),
-                     "Invalid workshop download request payload");
-        } else {
-            resp.published_file_id = req.published_file_id;
-            char check_path[PATH_MAX];
-            bool already_installed = false;
-            if (state->workshop_dir[0] != '\0') {
-                snprintf(check_path, sizeof(check_path), "%s/%lu", state->workshop_dir,
-                         (unsigned long)req.published_file_id);
-                struct stat st;
-                if (stat(check_path, &st) == 0 && S_ISDIR(st.st_mode)) {
-                    already_installed = true;
-                }
+            waywal_ipc_resp_workshop_download_t resp;
+            if (waywal_ipc_serialize_resp_workshop_download(
+                    req.published_file_id, 7u, 0.0f, 0.0f, 0u,
+                    "Invalid workshop download request payload", &resp_hdr, &resp)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, &resp, sizeof(resp));
             }
-            if (already_installed) {
-                resp.task_state = 6; /* Installed */
-                resp.progress_pct = 100.0f;
-                resp.speed_bytes_per_sec = 0.0f;
-                resp.eta_seconds = 0;
-            } else {
-                resp.task_state = 0; /* Queued */
-                resp.progress_pct = 0.0f;
-                resp.speed_bytes_per_sec = 0.0f;
-                resp.eta_seconds = 0;
-            }
+            break;
         }
 
-        resp_hdr.opcode = WAYWAL_RESP_WORKSHOP_DOWNLOAD;
-        resp_hdr.payload_size = sizeof(resp);
-        waywal_ipc_send(client_fd, &resp_hdr, -1);
-        (void)write_exact(client_fd, &resp, sizeof(resp));
-        if (valid && resp.task_state != 7) {
-            daemon_broadcast_event(state, "workshop_download");
+        ipc_async_job_t *job = (ipc_async_job_t *)calloc(1, sizeof(ipc_async_job_t));
+        if (!job) {
+            waywal_ipc_resp_workshop_download_t resp;
+            if (waywal_ipc_serialize_resp_workshop_download(
+                    req.published_file_id, 7u, 0.0f, 0.0f, 0u, "Out of memory", &resp_hdr, &resp)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, &resp, sizeof(resp));
+            }
+            break;
         }
-        break;
+        job->kind = IPC_JOB_WORKSHOP_DOWNLOAD;
+        job->client_fd = client_fd;
+        job->attached_fd = -1;
+        job->dl_req = req;
+        snprintf(job->default_workshop_dir, sizeof(job->default_workshop_dir), "%s",
+                 state->workshop_dir);
+
+        if (!ipc_async_submit(state, job)) {
+            free(job);
+            waywal_ipc_resp_workshop_download_t resp;
+            if (waywal_ipc_serialize_resp_workshop_download(req.published_file_id, 7u, 0.0f, 0.0f,
+                                                            0u, "Daemon async worker queue is full",
+                                                            &resp_hdr, &resp)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, &resp, sizeof(resp));
+            }
+            break;
+        }
+        return;
     }
 
     case WAYWAL_REQ_WWPKG_INSTALL: {
-        waywal_ipc_req_wwpkg_install_t req;
-        memset(&req, 0, sizeof(req));
-        char target_output[64] = {0};
+        uint8_t req_buf[sizeof(waywal_ipc_req_wwpkg_install_t) + WAYWAL_IPC_MAX_TAIL_STR];
+        memset(req_buf, 0, sizeof(waywal_ipc_req_wwpkg_install_t));
+        const char *target_out_ptr = "";
         bool valid = false;
 
-        if (req_hdr.payload_size >= sizeof(req)) {
-            if (read_exact(client_fd, &req, sizeof(req))) {
-                size_t tail_len = req_hdr.payload_size - sizeof(req);
-                if (tail_len == (size_t)req.target_output_len) {
-                    if (tail_len > 0 && tail_len < sizeof(target_output)) {
-                        if (read_exact(client_fd, target_output, tail_len)) {
-                            target_output[tail_len] = '\0';
-                            valid = true;
-                        }
-                    } else if (tail_len == 0) {
-                        valid = true;
-                    } else {
-                        ipc_drain_bytes(client_fd, tail_len);
-                    }
-                } else if (tail_len > 0) {
-                    ipc_drain_bytes(client_fd, tail_len);
-                }
+        if (req_hdr.payload_size >= sizeof(waywal_ipc_req_wwpkg_install_t) &&
+            req_hdr.payload_size <= sizeof(req_buf)) {
+            if (read_exact(client_fd, req_buf, req_hdr.payload_size)) {
+                valid = waywal_ipc_validate_req_wwpkg_install(
+                    (const waywal_ipc_req_wwpkg_install_t *)req_buf, req_hdr.payload_size,
+                    &target_out_ptr);
             }
         } else if (req_hdr.payload_size > 0) {
             ipc_drain_bytes(client_fd, req_hdr.payload_size);
         }
 
-        waywal_ipc_resp_wwpkg_install_t resp;
-        memset(&resp, 0, sizeof(resp));
-        memcpy(resp.package_uuid, req.package_uuid, sizeof(resp.package_uuid));
+        waywal_ipc_req_wwpkg_install_t parsed_req;
+        memcpy(&parsed_req, req_buf, sizeof(parsed_req));
 
-        char err_msg[256] = {0};
         if (!valid) {
-            resp.status_code = 1;
-            snprintf(err_msg, sizeof(err_msg), "Invalid wwpkg install request payload");
-            resp.error_msg_len = (uint32_t)strlen(err_msg);
-        } else {
-            if (req.flags & WAYWAL_WWPKG_INSTALL_FLAG_AUTO_APPLY) {
-                if (target_output[0] != '\0') {
-                    bool out_found = false;
-                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                        if (output_matches_target_spec(out, target_output)) {
-                            out_found = true;
-                            break;
-                        }
-                    }
-                    if (!out_found && strcmp(target_output, "*") != 0) {
-                        WAYWAL_LOG_WARN("wwpkg install: target output '%s' not found",
-                                        target_output);
-                    }
-                }
+            if (attached_fd >= 0) {
+                close(attached_fd);
+                attached_fd = -1;
             }
-            resp.status_code = 0;
-            resp.error_msg_len = 0;
+            uint8_t err_buf[sizeof(waywal_ipc_resp_wwpkg_install_t) + 128];
+            size_t err_len = 0;
+            if (waywal_ipc_serialize_resp_wwpkg_install(
+                    parsed_req.package_uuid, 1u, "Invalid wwpkg install request payload", &resp_hdr,
+                    NULL, err_buf, sizeof(err_buf), &err_len)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, err_buf, err_len);
+            }
+            break;
         }
 
-        size_t total_resp_len = sizeof(resp) + resp.error_msg_len;
-        resp_hdr.opcode = WAYWAL_RESP_WWPKG_INSTALL;
-        resp_hdr.payload_size = total_resp_len;
-        waywal_ipc_send(client_fd, &resp_hdr, -1);
-        (void)write_exact(client_fd, &resp, sizeof(resp));
-        if (resp.error_msg_len > 0) {
-            (void)write_exact(client_fd, err_msg, resp.error_msg_len);
+        ipc_async_job_t *job = (ipc_async_job_t *)calloc(1, sizeof(ipc_async_job_t));
+        if (!job) {
+            if (attached_fd >= 0) {
+                close(attached_fd);
+                attached_fd = -1;
+            }
+            uint8_t err_buf[sizeof(waywal_ipc_resp_wwpkg_install_t) + 128];
+            size_t err_len = 0;
+            if (waywal_ipc_serialize_resp_wwpkg_install(parsed_req.package_uuid, 3u,
+                                                        "Out of memory", &resp_hdr, NULL, err_buf,
+                                                        sizeof(err_buf), &err_len)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, err_buf, err_len);
+            }
+            break;
         }
-        if (valid && resp.status_code == 0) {
-            daemon_broadcast_event(state, "wwpkg_installed");
+
+        job->kind = IPC_JOB_WWPKG_INSTALL;
+        job->client_fd = client_fd;
+        job->attached_fd = attached_fd;
+        job->wwpkg_req = parsed_req;
+        if (target_out_ptr && target_out_ptr[0] != '\0') {
+            snprintf(job->wwpkg_target_output, sizeof(job->wwpkg_target_output), "%s",
+                     target_out_ptr);
         }
-        break;
+
+        if (!ipc_async_submit(state, job)) {
+            if (attached_fd >= 0) {
+                close(attached_fd);
+                attached_fd = -1;
+            }
+            free(job);
+            uint8_t err_buf[sizeof(waywal_ipc_resp_wwpkg_install_t) + 128];
+            size_t err_len = 0;
+            if (waywal_ipc_serialize_resp_wwpkg_install(
+                    parsed_req.package_uuid, 4u, "Daemon async worker queue is full", &resp_hdr,
+                    NULL, err_buf, sizeof(err_buf), &err_len)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, err_buf, err_len);
+            }
+            break;
+        }
+        return;
     }
 
     case WAYWAL_REQ_SCAN_COMPAT: {
@@ -3216,69 +5133,51 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         memset(&req, 0, sizeof(req));
         bool valid = false;
 
-        if (req_hdr.payload_size >= sizeof(req)) {
+        if (req_hdr.payload_size == sizeof(req)) {
             if (read_exact(client_fd, &req, sizeof(req))) {
-                if (req_hdr.payload_size > sizeof(req)) {
-                    ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(req));
-                }
                 valid = waywal_ipc_validate_req_scan_compat(&req, sizeof(req));
             }
         } else if (req_hdr.payload_size > 0) {
             ipc_drain_bytes(client_fd, req_hdr.payload_size);
         }
 
-        waywal_ipc_resp_scan_compat_t resp;
-        memset(&resp, 0, sizeof(resp));
-
         if (!valid) {
-            resp.status_code = 1; /* Invalid payload */
-            resp.compat_tier = 0; /* Unknown */
-            resp.compat_score = 0;
-        } else {
-            req.target_path[sizeof(req.target_path) - 1] = '\0';
-            struct stat st;
-            if (stat(req.target_path, &st) != 0) {
-                resp.status_code = 2; /* Target not found */
-                resp.compat_tier = 4; /* Blocked */
-                resp.compat_score = 0;
-            } else {
-                resp.status_code = 0;
-                char project_json_path[PATH_MAX];
-                snprintf(project_json_path, sizeof(project_json_path), "%s/project.json",
-                         req.target_path);
-                char scene_pkg_path[PATH_MAX];
-                snprintf(scene_pkg_path, sizeof(scene_pkg_path), "%s/scene.pkg", req.target_path);
-
-                bool has_project = (access(project_json_path, R_OK) == 0);
-                bool has_pkg = (access(scene_pkg_path, R_OK) == 0);
-
-                if (has_project || has_pkg || S_ISDIR(st.st_mode)) {
-                    resp.compat_tier = 1; /* WE_TIER_1_NATIVE default */
-                    resp.compat_score = 95;
-                    resp.total_issues = 0;
-                    resp.repairs_applied =
-                        (req.auto_repair_flags & WAYWAL_SCAN_COMPAT_FLAG_APPLY_REPAIRS) ? 1 : 0;
-                    resp.estimated_vram_mb = 64.0f;
-                    resp.estimated_fps = 60;
-                } else {
-                    resp.compat_tier = 2; /* WE_TIER_2_TRANSPILED */
-                    resp.compat_score = 80;
-                    resp.total_issues = 1;
-                    resp.repairs_applied = 0;
-                    resp.estimated_vram_mb = 128.0f;
-                    resp.estimated_fps = 60;
-                }
+            waywal_ipc_resp_scan_compat_t resp;
+            if (waywal_ipc_serialize_resp_scan_compat(1u, 0u, 0u, 0u, 0u, 0.0f, 0u, "", &resp_hdr,
+                                                      &resp)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, &resp, sizeof(resp));
             }
+            break;
         }
 
-        resp_hdr.opcode = WAYWAL_RESP_SCAN_COMPAT;
-        resp_hdr.payload_size = sizeof(resp);
-        waywal_ipc_send(client_fd, &resp_hdr, -1);
-        (void)write_exact(client_fd, &resp, sizeof(resp));
-        if (valid && resp.status_code == 0) {
-            daemon_broadcast_event(state, "scan_compat");
+        ipc_async_job_t *job = (ipc_async_job_t *)calloc(1, sizeof(ipc_async_job_t));
+        if (!job) {
+            waywal_ipc_resp_scan_compat_t resp;
+            if (waywal_ipc_serialize_resp_scan_compat(3u, (uint32_t)WE_TIER_4_BLOCKED, 0u, 0u, 0u,
+                                                      0.0f, 0u, "", &resp_hdr, &resp)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, &resp, sizeof(resp));
+            }
+            break;
         }
-        break;
+        job->kind = IPC_JOB_SCAN_COMPAT;
+        job->client_fd = client_fd;
+        job->attached_fd = -1;
+        job->gpu_compute_active = state->render_engine.gpu_compute_active;
+        job->scan_req = req;
+
+        if (!ipc_async_submit(state, job)) {
+            free(job);
+            waywal_ipc_resp_scan_compat_t resp;
+            if (waywal_ipc_serialize_resp_scan_compat(4u, (uint32_t)WE_TIER_4_BLOCKED, 0u, 0u, 0u,
+                                                      0.0f, 0u, "", &resp_hdr, &resp)) {
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+                (void)write_exact(client_fd, &resp, sizeof(resp));
+            }
+            break;
+        }
+        return;
     }
 
     case WAYWAL_REQ_KILL: {
@@ -3316,7 +5215,32 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         close(attached_fd);
         attached_fd = -1;
     }
-    close(client_fd);
+    if (!daemon_is_subscriber_fd(state, client_fd)) {
+        close(client_fd);
+    }
+}
+
+bool daemon_ipc_dispatch_subscriber_fd(struct daemon_state *state, int fd)
+{
+    if (!daemon_is_subscriber_fd(state, fd)) {
+        return false;
+    }
+    while (daemon_is_subscriber_fd(state, fd)) {
+        char b = 0;
+        ssize_t r = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+            daemon_remove_subscriber_fd(state, fd);
+            break;
+        }
+        if (r < 0) {
+            break;
+        }
+        daemon_process_ipc_client(state, fd);
+        if (!state->running) {
+            break;
+        }
+    }
+    return true;
 }
 
 void daemon_handle_ipc_connection(daemon_state_t *state)

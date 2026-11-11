@@ -2,28 +2,34 @@
 #include "ipc_client.hpp"
 
 #include "waywal/log.h"
+#include "waywal/wwpkg.h"
 
+#include <QDir>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
+#include <QMetaType>
+#include <QStandardPaths>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 namespace waywal::studio {
 
-/* ========================================================================= */
-/* Helper Functions                                                          */
-/* ========================================================================= */
+namespace {
 
-static bool readExactNonBlocking(int fd, void *buf, size_t count, int timeoutMs)
+bool readExactNonBlocking(int fd, void *buf, size_t count, int timeoutMs)
 {
     uint8_t *ptr = static_cast<uint8_t *>(buf);
     size_t total = 0;
@@ -35,7 +41,7 @@ static bool readExactNonBlocking(int fd, void *buf, size_t count, int timeoutMs)
             continue;
         }
         if (n == 0) {
-            return false; // Remote closed
+            return false;
         }
         if (errno == EINTR) {
             continue;
@@ -48,14 +54,14 @@ static bool readExactNonBlocking(int fd, void *buf, size_t count, int timeoutMs)
             if (pr > 0 && (pfd.revents & POLLIN)) {
                 continue;
             }
-            return false; // Timeout or error
+            return false;
         }
         return false;
     }
     return true;
 }
 
-static bool writeExactNonBlocking(int fd, const void *buf, size_t count, int timeoutMs)
+bool writeExactNonBlocking(int fd, const void *buf, size_t count, int timeoutMs)
 {
     const uint8_t *ptr = static_cast<const uint8_t *>(buf);
     size_t total = 0;
@@ -87,15 +93,168 @@ static bool writeExactNonBlocking(int fd, const void *buf, size_t count, int tim
     return true;
 }
 
-/* ========================================================================= */
-/* IpcClient Implementation                                                  */
-/* ========================================================================= */
+int hexNibble(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F')
+        return 10 + (c - 'A');
+    return -1;
+}
 
-IpcClient::IpcClient(QString namespaceStr, QString socketPath, QObject *parent)
+bool parseUuidString(const char *str, uint8_t outUuid[16])
+{
+    if (!str || !outUuid) {
+        return false;
+    }
+    uint8_t tmp[16]{};
+    size_t nibbles = 0;
+    int hi = -1;
+    for (const char *p = str; *p != '\0'; ++p) {
+        if (*p == '-') {
+            continue;
+        }
+        int v = hexNibble(*p);
+        if (v < 0 || nibbles >= 32) {
+            return false;
+        }
+        if ((nibbles & 1u) == 0u) {
+            hi = v;
+        } else {
+            tmp[nibbles / 2] = static_cast<uint8_t>((hi << 4) | v);
+        }
+        ++nibbles;
+    }
+    if (nibbles != 32) {
+        return false;
+    }
+    std::memcpy(outUuid, tmp, 16);
+    return true;
+}
+
+QString uuidBytesToDashedHex(const uint8_t uuid[16])
+{
+    char buf[37]{};
+    std::snprintf(buf, sizeof(buf),
+                  "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", uuid[0],
+                  uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7], uuid[8], uuid[9],
+                  uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+    return QString::fromLatin1(buf);
+}
+
+bool isAllZeroUuid(const uint8_t uuid[16])
+{
+    if (!uuid)
+        return true;
+    uint8_t acc = 0;
+    for (size_t i = 0; i < 16; ++i) {
+        acc |= uuid[i];
+    }
+    return acc == 0;
+}
+
+int tryOpenHubPackageByUuid(const uint8_t uuid[16])
+{
+    if (!uuid || isAllZeroUuid(uuid)) {
+        return -1;
+    }
+    const QString targetId = uuidBytesToDashedHex(uuid).toLower();
+    QStringList dirs;
+    const QString xdgHub = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
+                           QStringLiteral("/waywal/hub");
+    if (!xdgHub.isEmpty()) {
+        dirs << xdgHub;
+    }
+    const QString homeHub = QDir::homePath() + QStringLiteral("/.local/share/waywal/hub");
+    if (!dirs.contains(homeHub)) {
+        dirs << homeHub;
+    }
+
+    for (const QString &dirStr : dirs) {
+        std::error_code ec;
+        std::filesystem::path dirPath(dirStr.toStdString());
+        if (!std::filesystem::exists(dirPath, ec) || !std::filesystem::is_directory(dirPath, ec)) {
+            continue;
+        }
+        for (const auto &entry : std::filesystem::directory_iterator(dirPath, ec)) {
+            if (!entry.is_regular_file(ec) || entry.path().extension() != ".wwpkg") {
+                continue;
+            }
+            const std::string p = entry.path().string();
+            wwpkg_package_t *pkg = wwpkg_open(p.c_str());
+            if (!pkg) {
+                continue;
+            }
+            const wwpkg_manifest_t *man = wwpkg_get_manifest(pkg);
+            bool matched = false;
+            if (man && QString::fromUtf8(man->id).trimmed().toLower() == targetId) {
+                matched = true;
+            }
+            wwpkg_close(pkg);
+            if (matched) {
+                return ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+            }
+        }
+    }
+    return -1;
+}
+
+int dupCloexec(int fd)
+{
+    if (fd < 0) {
+        return -1;
+    }
+    int duped = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (duped < 0) {
+        duped = ::dup(fd);
+        if (duped >= 0) {
+            int fl = fcntl(duped, F_GETFD, 0);
+            if (fl >= 0) {
+                (void)fcntl(duped, F_SETFD, fl | FD_CLOEXEC);
+            }
+        }
+    }
+    return duped;
+}
+
+struct ScopedFdArrayGuard {
+    int *fds;
+    size_t count;
+    ~ScopedFdArrayGuard()
+    {
+        if (!fds) {
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (fds[i] >= 0) {
+                ::close(fds[i]);
+                fds[i] = -1;
+            }
+        }
+    }
+};
+
+} // namespace
+
+IpcClient::IpcClient(QString namespaceStr, QString socketPath, QObject *parent, bool autoStart)
     : QObject(parent), m_namespaceStr(std::move(namespaceStr)),
       m_customSocketPath(std::move(socketPath)),
       m_lastUniformFlush(std::chrono::steady_clock::now())
 {
+    qRegisterMetaType<TelemetrySnapshot>("TelemetrySnapshot");
+    qRegisterMetaType<waywal_export_dmabuf_resp_t>("waywal_export_dmabuf_resp_t");
+    qRegisterMetaType<waywal_ipc_resp_workshop_sync_t>("waywal_ipc_resp_workshop_sync_t");
+    qRegisterMetaType<waywal_ipc_resp_workshop_download_t>("waywal_ipc_resp_workshop_download_t");
+    qRegisterMetaType<waywal_ipc_resp_wwpkg_install_t>("waywal_ipc_resp_wwpkg_install_t");
+    qRegisterMetaType<waywal_ipc_resp_scan_compat_t>("waywal_ipc_resp_scan_compat_t");
+    qRegisterMetaType<waywal_ipc_resp_compile_shader_graph_t>(
+        "waywal_ipc_resp_compile_shader_graph_t");
+    qRegisterMetaType<waywal_ipc_resp_set_camera_3d_t>("waywal_ipc_resp_set_camera_3d_t");
+    qRegisterMetaType<waywal_ipc_resp_set_physics_params_t>("waywal_ipc_resp_set_physics_params_t");
+    qRegisterMetaType<waywal_ipc_resp_set_scene_lights_t>("waywal_ipc_resp_set_scene_lights_t");
+
     if (m_namespaceStr.isEmpty()) {
         m_namespaceStr = QStringLiteral("default");
     }
@@ -105,14 +264,16 @@ IpcClient::IpcClient(QString namespaceStr, QString socketPath, QObject *parent)
         WAYWAL_LOG_ERR("IpcClient: eventfd creation failed: %s", strerror(errno));
     }
 
-    start();
+    if (autoStart) {
+        start();
+    }
 }
 
 IpcClient::~IpcClient()
 {
     stop();
     if (m_wakeupFd >= 0) {
-        close(m_wakeupFd);
+        ::close(m_wakeupFd);
         m_wakeupFd = -1;
     }
 }
@@ -120,7 +281,7 @@ IpcClient::~IpcClient()
 void IpcClient::start()
 {
     if (m_running.exchange(true)) {
-        return; // Already running
+        return;
     }
 
     m_workerThread = std::thread(&IpcClient::workerLoop, this);
@@ -129,12 +290,33 @@ void IpcClient::start()
 void IpcClient::stop()
 {
     if (!m_running.exchange(false)) {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        for (auto &pkt : m_outQueue) {
+            if (pkt.attachedFd >= 0) {
+                ::close(pkt.attachedFd);
+                pkt.attachedFd = -1;
+            }
+        }
+        m_outQueue.clear();
+        m_pendingUniforms.clear();
         return;
     }
 
     wakeupWorker();
     if (m_workerThread.joinable()) {
         m_workerThread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        for (auto &pkt : m_outQueue) {
+            if (pkt.attachedFd >= 0) {
+                ::close(pkt.attachedFd);
+                pkt.attachedFd = -1;
+            }
+        }
+        m_outQueue.clear();
+        m_pendingUniforms.clear();
     }
 
     closeSocket();
@@ -154,17 +336,66 @@ void IpcClient::wakeupWorker()
 {
     if (m_wakeupFd >= 0) {
         uint64_t val = 1;
-        [[maybe_unused]] ssize_t nw = write(m_wakeupFd, &val, sizeof(val));
+        [[maybe_unused]] ssize_t nw = ::write(m_wakeupFd, &val, sizeof(val));
+    }
+}
+
+void IpcClient::failInFlightRequests(const QString &reason)
+{
+    std::deque<PendingRequest> stale;
+    {
+        std::lock_guard<std::mutex> lock(m_requestsMutex);
+        stale.swap(m_pendingRequests);
+    }
+
+    if (!m_running.load()) {
+        return;
+    }
+
+    for (auto &req : stale) {
+        if (req.wwpkgInstallCallback) {
+            waywal_ipc_resp_wwpkg_install_t resp{};
+            resp.status_code = 1u;
+            QMetaObject::invokeMethod(
+                this,
+                [cb = std::move(req.wwpkgInstallCallback), resp, reason]() { cb(resp, reason); },
+                Qt::QueuedConnection);
+        } else if (req.workshopSyncCallback) {
+            waywal_ipc_resp_workshop_sync_t resp{};
+            resp.status_code = 1u;
+            QMetaObject::invokeMethod(
+                this, [cb = std::move(req.workshopSyncCallback), resp]() { cb(resp); },
+                Qt::QueuedConnection);
+        } else if (req.workshopDownloadCallback) {
+            waywal_ipc_resp_workshop_download_t resp{};
+            resp.task_state = 7u;
+            QByteArray errBa = reason.toUtf8();
+            std::strncpy(resp.error_msg, errBa.constData(), sizeof(resp.error_msg) - 1);
+            QMetaObject::invokeMethod(
+                this, [cb = std::move(req.workshopDownloadCallback), resp]() { cb(resp); },
+                Qt::QueuedConnection);
+        } else if (req.scanCompatCallback) {
+            waywal_ipc_resp_scan_compat_t resp{};
+            resp.status_code = 1u;
+            QMetaObject::invokeMethod(
+                this, [cb = std::move(req.scanCompatCallback), resp]() { cb(resp); },
+                Qt::QueuedConnection);
+        } else if (req.jsonCallback) {
+            QMetaObject::invokeMethod(
+                this, [cb = std::move(req.jsonCallback)]() { cb(QString()); },
+                Qt::QueuedConnection);
+        }
     }
 }
 
 void IpcClient::closeSocket()
 {
     if (m_socketFd >= 0) {
-        close(m_socketFd);
+        ::close(m_socketFd);
         m_socketFd = -1;
     }
-    if (m_connected.exchange(false)) {
+    failInFlightRequests(QStringLiteral("IPC socket disconnected"));
+    if (m_connected.exchange(false) && m_running.load()) {
         QMetaObject::invokeMethod(
             this, [this]() { emit connectionStateChanged(false); }, Qt::QueuedConnection);
     }
@@ -193,7 +424,7 @@ bool IpcClient::connectSocket()
     if (static_cast<size_t>(pathBa.size()) >= sizeof(addr.sun_path)) {
         return false;
     }
-    std::memcpy(addr.sun_path, pathBa.constData(), pathBa.size());
+    std::memcpy(addr.sun_path, pathBa.constData(), static_cast<size_t>(pathBa.size()));
 
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) {
@@ -206,7 +437,7 @@ bool IpcClient::connectSocket()
 
     int res = ::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
     if (res < 0 && errno != EINPROGRESS) {
-        close(fd);
+        ::close(fd);
         return false;
     }
 
@@ -216,13 +447,13 @@ bool IpcClient::connectSocket()
         pfd.events = POLLOUT;
         int pr = poll(&pfd, 1, 150);
         if (pr <= 0) {
-            close(fd);
+            ::close(fd);
             return false;
         }
         int soErr = 0;
         socklen_t len = sizeof(soErr);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &len) < 0 || soErr != 0) {
-            close(fd);
+            ::close(fd);
             return false;
         }
     }
@@ -243,7 +474,6 @@ void IpcClient::workerLoop()
     while (m_running.load()) {
         if (!m_connected.load()) {
             if (!connectSocket()) {
-                // Sleep with backoff waiting on wakeupFd
                 struct pollfd pfd{};
                 pfd.fd = m_wakeupFd;
                 pfd.events = POLLIN;
@@ -256,7 +486,6 @@ void IpcClient::workerLoop()
             }
 
             backoffMs = 50;
-            // Connected! Subscribe to async events
             subscribeEvents();
         }
 
@@ -269,7 +498,6 @@ void IpcClient::workerLoop()
         pfds[1].events = POLLIN;
         pfds[1].revents = 0;
 
-        // Rate-limit uniform flushing to 144 Hz (~6.9 ms)
         int pollTimeoutMs = 7;
         int pr = poll(pfds, 2, pollTimeoutMs);
 
@@ -282,10 +510,13 @@ void IpcClient::workerLoop()
 
         if (pfds[0].revents & POLLIN) {
             uint64_t val = 0;
-            [[maybe_unused]] ssize_t nr = read(m_wakeupFd, &val, sizeof(val));
+            [[maybe_unused]] ssize_t nr = ::read(m_wakeupFd, &val, sizeof(val));
         }
 
         if (pfds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            if (pfds[1].revents & POLLIN) {
+                handleIncomingPacket();
+            }
             closeSocket();
             continue;
         }
@@ -294,7 +525,6 @@ void IpcClient::workerLoop()
             handleIncomingPacket();
         }
 
-        // Flush outbound packets and coalesced uniforms
         flushOutboundQueue();
     }
 }
@@ -305,7 +535,6 @@ void IpcClient::flushOutboundQueue()
         return;
     }
 
-    // 1. Drain & send coalesced uniforms
     std::vector<waywal_set_uniform_payload_t> uniformBatch;
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
@@ -333,56 +562,105 @@ void IpcClient::flushOutboundQueue()
             closeSocket();
             return;
         }
+
+        PendingRequest req{};
+        req.expectedOpcode = WAYWAL_REQ_SET_UNIFORM;
+        req.sentAt = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(m_requestsMutex);
+        m_pendingRequests.push_back(std::move(req));
     }
 
-    // 2. Drain & send generic queued packets
     std::deque<OutboundPacket> packets;
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
         packets.swap(m_outQueue);
     }
 
-    for (auto &pkt : packets) {
+    auto closeRemainingFds = [](std::deque<OutboundPacket> &q) {
+        for (auto &rem : q) {
+            if (rem.attachedFd >= 0) {
+                ::close(rem.attachedFd);
+                rem.attachedFd = -1;
+            }
+        }
+    };
+
+    while (!packets.empty()) {
+        OutboundPacket pkt = std::move(packets.front());
+        packets.pop_front();
+
         bool sentHdr = false;
         if (pkt.attachedFd >= 0) {
             sentHdr = waywal_ipc_send(m_socketFd, &pkt.hdr, pkt.attachedFd);
-            close(pkt.attachedFd);
+            ::close(pkt.attachedFd);
             pkt.attachedFd = -1;
         } else {
             sentHdr = writeExactNonBlocking(m_socketFd, &pkt.hdr, sizeof(pkt.hdr), 200);
         }
 
         if (!sentHdr) {
+            closeRemainingFds(packets);
             closeSocket();
             return;
         }
 
         if (pkt.hdr.payload_size > 0 && !pkt.payload.empty()) {
             if (!writeExactNonBlocking(m_socketFd, pkt.payload.data(), pkt.payload.size(), 500)) {
+                closeRemainingFds(packets);
                 closeSocket();
                 return;
             }
         }
 
-        // Register pending request if callbacks are attached
-        if (pkt.jsonCallback || pkt.telemetryCallback || pkt.dmabufCallback ||
-            pkt.workshopSyncCallback || pkt.workshopDownloadCallback || pkt.wwpkgInstallCallback ||
-            pkt.scanCompatCallback) {
-            PendingRequest req{};
-            req.expectedOpcode = pkt.hdr.opcode;
-            req.jsonCallback = std::move(pkt.jsonCallback);
-            req.telemetryCallback = std::move(pkt.telemetryCallback);
-            req.dmabufCallback = std::move(pkt.dmabufCallback);
-            req.workshopSyncCallback = std::move(pkt.workshopSyncCallback);
-            req.workshopDownloadCallback = std::move(pkt.workshopDownloadCallback);
-            req.wwpkgInstallCallback = std::move(pkt.wwpkgInstallCallback);
-            req.scanCompatCallback = std::move(pkt.scanCompatCallback);
-            req.sentAt = std::chrono::steady_clock::now();
+        /* Track every sent frame in FIFO order so generic WAYWAL_RESP_OK / WAYWAL_RESP_ERR replies
+         * align 1-to-1 with outbound requests and never pop a subsequent RPC's callback. */
+        PendingRequest req{};
+        req.expectedOpcode = pkt.hdr.opcode;
+        req.jsonCallback = std::move(pkt.jsonCallback);
+        req.telemetryCallback = std::move(pkt.telemetryCallback);
+        req.dmabufCallback = std::move(pkt.dmabufCallback);
+        req.workshopSyncCallback = std::move(pkt.workshopSyncCallback);
+        req.workshopDownloadCallback = std::move(pkt.workshopDownloadCallback);
+        req.wwpkgInstallCallback = std::move(pkt.wwpkgInstallCallback);
+        req.scanCompatCallback = std::move(pkt.scanCompatCallback);
+        req.sentAt = std::chrono::steady_clock::now();
 
-            std::lock_guard<std::mutex> lock(m_requestsMutex);
-            m_pendingRequests.push_back(std::move(req));
+        std::lock_guard<std::mutex> lock(m_requestsMutex);
+        m_pendingRequests.push_back(std::move(req));
+    }
+}
+
+bool IpcClient::popPendingForOpcode(uint16_t reqOpcode, PendingRequest &outReq)
+{
+    std::lock_guard<std::mutex> lock(m_requestsMutex);
+    for (size_t idx = 0; idx < m_pendingRequests.size(); ++idx) {
+        if (m_pendingRequests[idx].expectedOpcode == reqOpcode) {
+            outReq = std::move(m_pendingRequests[idx]);
+            m_pendingRequests.erase(m_pendingRequests.begin() + static_cast<std::ptrdiff_t>(idx));
+            /* Drop any earlier callback-less fire-and-forget entries that a mock peer chose not to
+             * acknowledge explicitly before replying to this typed RPC. */
+            size_t scan = 0;
+            while (scan < idx && scan < m_pendingRequests.size()) {
+                const auto &entry = m_pendingRequests[scan];
+                const bool hasCb = static_cast<bool>(entry.jsonCallback) ||
+                                   static_cast<bool>(entry.telemetryCallback) ||
+                                   static_cast<bool>(entry.dmabufCallback) ||
+                                   static_cast<bool>(entry.workshopSyncCallback) ||
+                                   static_cast<bool>(entry.workshopDownloadCallback) ||
+                                   static_cast<bool>(entry.wwpkgInstallCallback) ||
+                                   static_cast<bool>(entry.scanCompatCallback);
+                if (!hasCb) {
+                    m_pendingRequests.erase(m_pendingRequests.begin() +
+                                            static_cast<std::ptrdiff_t>(scan));
+                    --idx;
+                } else {
+                    ++scan;
+                }
+            }
+            return true;
         }
     }
+    return false;
 }
 
 void IpcClient::handleIncomingPacket()
@@ -396,9 +674,13 @@ void IpcClient::handleIncomingPacket()
         return;
     }
 
+    /* Guarantee received SCM_RIGHTS FDs are closed across all return paths unless explicitly
+     * transferred to a validated WAYWAL_RESP_DMABUF consumer. */
+    ScopedFdArrayGuard fdGuard{fds, numFds};
+
     std::vector<uint8_t> payload;
     if (hdr.payload_size > 0) {
-        if (hdr.payload_size > 64 * 1024 * 1024) { // 64 MB security limit
+        if (hdr.payload_size > 64 * 1024 * 1024) {
             WAYWAL_LOG_ERR("IpcClient: Payload size exceeds limit: %lu",
                            static_cast<unsigned long>(hdr.payload_size));
             closeSocket();
@@ -412,7 +694,7 @@ void IpcClient::handleIncomingPacket()
         }
     }
 
-    // Process responses based on opcode
+    /* Unsolicited daemon broadcasts must never touch m_pendingRequests. */
     if (hdr.opcode == WAYWAL_RESP_EVENT) {
         QString jsonStr = QString::fromUtf8(reinterpret_cast<const char *>(payload.data()),
                                             static_cast<qsizetype>(payload.size()));
@@ -429,54 +711,113 @@ void IpcClient::handleIncomingPacket()
         return;
     }
 
-    // Match against in-flight requests
-    PendingRequest req{};
-    bool hasReq = false;
-    {
-        std::lock_guard<std::mutex> lock(m_requestsMutex);
-        if (!m_pendingRequests.empty()) {
-            req = std::move(m_pendingRequests.front());
-            m_pendingRequests.pop_front();
-            hasReq = true;
+    /* Route WAYWAL_RESP_ERR before any binary struct deserialization so text error payloads are
+     * never misinterpreted as fixed binary response structs. */
+    if (hdr.opcode == WAYWAL_RESP_ERR) {
+        QString err = QStringLiteral("Daemon returned error");
+        if (!payload.empty()) {
+            size_t len = strnlen(reinterpret_cast<const char *>(payload.data()), payload.size());
+            err = QString::fromUtf8(reinterpret_cast<const char *>(payload.data()),
+                                    static_cast<qsizetype>(len));
         }
+
+        PendingRequest failedReq{};
+        bool hadFailedReq = false;
+        {
+            std::lock_guard<std::mutex> lock(m_requestsMutex);
+            while (!m_pendingRequests.empty() &&
+                   m_pendingRequests.front().expectedOpcode == WAYWAL_REQ_SUBSCRIBE &&
+                   m_pendingRequests.size() > 1) {
+                m_pendingRequests.pop_front();
+            }
+            if (!m_pendingRequests.empty()) {
+                failedReq = std::move(m_pendingRequests.front());
+                m_pendingRequests.pop_front();
+                hadFailedReq = true;
+            }
+        }
+
+        QMetaObject::invokeMethod(
+            this,
+            [this, err, hadFailedReq, wwpkgCb = std::move(failedReq.wwpkgInstallCallback),
+             syncCb = std::move(failedReq.workshopSyncCallback),
+             dlCb = std::move(failedReq.workshopDownloadCallback),
+             compatCb = std::move(failedReq.scanCompatCallback),
+             jsonCb = std::move(failedReq.jsonCallback)]() {
+                if (hadFailedReq) {
+                    if (wwpkgCb) {
+                        waywal_ipc_resp_wwpkg_install_t resp{};
+                        resp.status_code = 1u;
+                        wwpkgCb(resp, err);
+                    } else if (syncCb) {
+                        waywal_ipc_resp_workshop_sync_t resp{};
+                        resp.status_code = 1u;
+                        syncCb(resp);
+                    } else if (dlCb) {
+                        waywal_ipc_resp_workshop_download_t resp{};
+                        resp.task_state = 7u;
+                        QByteArray errBa = err.toUtf8();
+                        std::strncpy(resp.error_msg, errBa.constData(), sizeof(resp.error_msg) - 1);
+                        dlCb(resp);
+                    } else if (compatCb) {
+                        waywal_ipc_resp_scan_compat_t resp{};
+                        resp.status_code = 1u;
+                        compatCb(resp);
+                    } else if (jsonCb) {
+                        jsonCb(QString());
+                    }
+                }
+                emit errorOccurred(err);
+            },
+            Qt::QueuedConnection);
+        return;
     }
 
-    if (hdr.opcode == WAYWAL_RESP_DMABUF ||
-        (hasReq && req.expectedOpcode == WAYWAL_REQ_EXPORT_OUTPUT_DMABUF &&
-         hdr.opcode == WAYWAL_RESP_OK)) {
-        if (payload.size() >= sizeof(waywal_export_dmabuf_resp_t)) {
+    if (hdr.opcode == WAYWAL_RESP_DMABUF) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_EXPORT_OUTPUT_DMABUF, req);
+        if (payload.size() == sizeof(waywal_export_dmabuf_resp_t)) {
             waywal_export_dmabuf_resp_t desc{};
             std::memcpy(&desc, payload.data(), sizeof(desc));
-
-            QVector<int> qfds;
-            for (size_t i = 0; i < numFds; ++i) {
-                if (fds[i] >= 0) {
-                    qfds.append(fds[i]);
+            if (desc.width > 0 && desc.height > 0 && desc.num_planes <= 4) {
+                QVector<int> qfds;
+                size_t planeLimit = std::min<size_t>(numFds, desc.num_planes);
+                for (size_t i = 0; i < planeLimit; ++i) {
+                    if (fds[i] >= 0) {
+                        qfds.append(fds[i]);
+                        fds[i] = -1;
+                    }
                 }
-            }
 
-            if (req.dmabufCallback) {
-                req.dmabufCallback(desc, qfds);
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, desc, qfds, cb = std::move(req.dmabufCallback)]() {
+                        const bool hasSignalListeners =
+                            receivers(SIGNAL(
+                                dmabufReceived(waywal_export_dmabuf_resp_t, QVector<int>))) > 0;
+                        if (cb) {
+                            cb(desc, qfds);
+                        }
+                        if (hasSignalListeners) {
+                            emit dmabufReceived(desc, qfds);
+                        } else if (!cb) {
+                            for (int leakedFd : qfds) {
+                                if (leakedFd >= 0) {
+                                    ::close(leakedFd);
+                                }
+                            }
+                        }
+                    },
+                    Qt::QueuedConnection);
             }
-
-            QMetaObject::invokeMethod(
-                this, [this, desc, qfds]() { emit dmabufReceived(desc, qfds); },
-                Qt::QueuedConnection);
         }
         return;
     }
 
-    // Free any unextracted file descriptors
-    for (size_t i = 0; i < numFds; ++i) {
-        if (fds[i] >= 0) {
-            close(fds[i]);
-        }
-    }
-
-    if (hdr.opcode == WAYWAL_RESP_TELEMETRY ||
-        (hasReq && req.expectedOpcode == WAYWAL_REQ_GET_TELEMETRY &&
-         hdr.opcode == WAYWAL_RESP_OK)) {
-        if (payload.size() >= sizeof(waywal_telemetry_snapshot_t)) {
+    if (hdr.opcode == WAYWAL_RESP_TELEMETRY) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_GET_TELEMETRY, req);
+        if (payload.size() == sizeof(waywal_telemetry_snapshot_t)) {
             waywal_telemetry_snapshot_t raw{};
             std::memcpy(&raw, payload.data(), sizeof(raw));
 
@@ -503,7 +844,8 @@ void IpcClient::handleIncomingPacket()
             for (uint32_t i = 0; i < outCount; ++i) {
                 const auto &ro = raw.outputs[i];
                 OutputTelemetry ot{};
-                ot.name = QString::fromUtf8(ro.name);
+                size_t nameLen = strnlen(ro.name, sizeof(ro.name));
+                ot.name = QString::fromUtf8(ro.name, static_cast<qsizetype>(nameLen));
                 ot.scanoutFps = ro.scanout_fps;
                 ot.lastRenderUs = ro.last_render_us;
                 ot.vramKiB = ro.vram_kib;
@@ -519,147 +861,224 @@ void IpcClient::handleIncomingPacket()
                 snap.outputs.push_back(ot);
             }
 
-            if (req.telemetryCallback) {
-                req.telemetryCallback(snap);
-            }
-
             QMetaObject::invokeMethod(
-                this, [this, snap]() { emit telemetryReceived(snap); }, Qt::QueuedConnection);
+                this,
+                [this, snap, cb = std::move(req.telemetryCallback)]() {
+                    if (cb) {
+                        cb(snap);
+                    }
+                    emit telemetryReceived(snap);
+                },
+                Qt::QueuedConnection);
         }
         return;
     }
 
-    if (hasReq && req.expectedOpcode == WAYWAL_REQ_QUERY_JSON) {
-        QString jsonStr = QString::fromUtf8(reinterpret_cast<const char *>(payload.data()),
-                                            static_cast<qsizetype>(payload.size()));
-
-        if (req.jsonCallback) {
-            req.jsonCallback(jsonStr);
-        }
-
-        QMetaObject::invokeMethod(
-            this, [this, jsonStr]() { emit outputsJsonReceived(jsonStr); }, Qt::QueuedConnection);
-        return;
-    }
-
-    if (hdr.opcode == WAYWAL_RESP_WORKSHOP_SYNC ||
-        (hasReq && req.expectedOpcode == WAYWAL_REQ_WORKSHOP_SYNC)) {
-        if (payload.size() >= sizeof(waywal_ipc_resp_workshop_sync_t)) {
+    if (hdr.opcode == WAYWAL_RESP_WORKSHOP_SYNC) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_WORKSHOP_SYNC, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_workshop_sync_t)) {
             waywal_ipc_resp_workshop_sync_t resp{};
             std::memcpy(&resp, payload.data(), sizeof(resp));
-            if (req.workshopSyncCallback) {
-                req.workshopSyncCallback(resp);
+            if (waywal_ipc_validate_resp_workshop_sync(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, resp, cb = std::move(req.workshopSyncCallback)]() {
+                        if (cb) {
+                            cb(resp);
+                        }
+                        emit workshopSyncReceived(resp);
+                    },
+                    Qt::QueuedConnection);
+            } else {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this]() {
+                        emit errorOccurred(QStringLiteral("Invalid WAYWAL_RESP_WORKSHOP_SYNC"));
+                    },
+                    Qt::QueuedConnection);
             }
-            QMetaObject::invokeMethod(
-                this, [this, resp]() { emit workshopSyncReceived(resp); }, Qt::QueuedConnection);
         }
         return;
     }
 
-    if (hdr.opcode == WAYWAL_RESP_WORKSHOP_DOWNLOAD ||
-        (hasReq && req.expectedOpcode == WAYWAL_REQ_WORKSHOP_DOWNLOAD)) {
-        if (payload.size() >= sizeof(waywal_ipc_resp_workshop_download_t)) {
+    if (hdr.opcode == WAYWAL_RESP_WORKSHOP_DOWNLOAD) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_WORKSHOP_DOWNLOAD, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_workshop_download_t)) {
             waywal_ipc_resp_workshop_download_t resp{};
             std::memcpy(&resp, payload.data(), sizeof(resp));
-            if (req.workshopDownloadCallback) {
-                req.workshopDownloadCallback(resp);
+            if (waywal_ipc_validate_resp_workshop_download(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, resp, cb = std::move(req.workshopDownloadCallback)]() {
+                        if (cb) {
+                            cb(resp);
+                        }
+                        emit workshopDownloadReceived(resp);
+                    },
+                    Qt::QueuedConnection);
+            } else {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this]() {
+                        emit errorOccurred(QStringLiteral("Invalid WAYWAL_RESP_WORKSHOP_DOWNLOAD"));
+                    },
+                    Qt::QueuedConnection);
             }
-            QMetaObject::invokeMethod(
-                this, [this, resp]() { emit workshopDownloadReceived(resp); },
-                Qt::QueuedConnection);
         }
         return;
     }
 
-    if (hdr.opcode == WAYWAL_RESP_WWPKG_INSTALL ||
-        (hasReq && req.expectedOpcode == WAYWAL_REQ_WWPKG_INSTALL)) {
-        if (payload.size() >= sizeof(waywal_ipc_resp_wwpkg_install_t)) {
+    if (hdr.opcode == WAYWAL_RESP_WWPKG_INSTALL) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_WWPKG_INSTALL, req);
+        const char *tailErr = nullptr;
+        if (payload.size() >= sizeof(waywal_ipc_resp_wwpkg_install_t) &&
+            waywal_ipc_validate_resp_wwpkg_install(
+                reinterpret_cast<const waywal_ipc_resp_wwpkg_install_t *>(payload.data()),
+                payload.size(), &tailErr)) {
             waywal_ipc_resp_wwpkg_install_t resp{};
             std::memcpy(&resp, payload.data(), sizeof(resp));
-            QString errMsg;
-            if (resp.error_msg_len > 0 && payload.size() >= sizeof(resp) + resp.error_msg_len) {
-                errMsg =
-                    QString::fromUtf8(reinterpret_cast<const char *>(payload.data() + sizeof(resp)),
-                                      static_cast<qsizetype>(resp.error_msg_len));
-            }
-            if (req.wwpkgInstallCallback) {
-                req.wwpkgInstallCallback(resp, errMsg);
-            }
+            QString errMsg = tailErr ? QString::fromUtf8(tailErr) : QString();
             QMetaObject::invokeMethod(
-                this, [this, resp, errMsg]() { emit wwpkgInstallReceived(resp, errMsg); },
+                this,
+                [this, resp, errMsg, cb = std::move(req.wwpkgInstallCallback)]() {
+                    if (cb) {
+                        cb(resp, errMsg);
+                    }
+                    emit wwpkgInstallReceived(resp, errMsg);
+                },
+                Qt::QueuedConnection);
+        } else {
+            QString malErr = QStringLiteral("Malformed WAYWAL_RESP_WWPKG_INSTALL payload");
+            QMetaObject::invokeMethod(
+                this,
+                [this, malErr, cb = std::move(req.wwpkgInstallCallback)]() {
+                    if (cb) {
+                        waywal_ipc_resp_wwpkg_install_t resp{};
+                        resp.status_code = 1u;
+                        cb(resp, malErr);
+                    }
+                    emit errorOccurred(malErr);
+                },
                 Qt::QueuedConnection);
         }
         return;
     }
 
-    if (hdr.opcode == WAYWAL_RESP_SCAN_COMPAT ||
-        (hasReq && req.expectedOpcode == WAYWAL_REQ_SCAN_COMPAT)) {
-        if (payload.size() >= sizeof(waywal_ipc_resp_scan_compat_t)) {
+    if (hdr.opcode == WAYWAL_RESP_SCAN_COMPAT) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_SCAN_COMPAT, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_scan_compat_t)) {
             waywal_ipc_resp_scan_compat_t resp{};
             std::memcpy(&resp, payload.data(), sizeof(resp));
-            if (req.scanCompatCallback) {
-                req.scanCompatCallback(resp);
+            if (waywal_ipc_validate_resp_scan_compat(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, resp, cb = std::move(req.scanCompatCallback)]() {
+                        if (cb) {
+                            cb(resp);
+                        }
+                        emit scanCompatReceived(resp);
+                    },
+                    Qt::QueuedConnection);
+            } else {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this]() {
+                        emit errorOccurred(QStringLiteral("Invalid WAYWAL_RESP_SCAN_COMPAT"));
+                    },
+                    Qt::QueuedConnection);
             }
-            QMetaObject::invokeMethod(
-                this, [this, resp]() { emit scanCompatReceived(resp); }, Qt::QueuedConnection);
         }
         return;
     }
 
     if (hdr.opcode == WAYWAL_RESP_COMPILE_SHADER_GRAPH) {
-        if (payload.size() >= sizeof(waywal_ipc_resp_compile_shader_graph_t)) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_COMPILE_SHADER_GRAPH, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_compile_shader_graph_t)) {
             waywal_ipc_resp_compile_shader_graph_t resp{};
             std::memcpy(&resp, payload.data(), sizeof(resp));
-            QMetaObject::invokeMethod(
-                this, [this, resp]() { emit shaderGraphCompiled(resp); }, Qt::QueuedConnection);
+            if (waywal_ipc_validate_resp_compile_shader_graph(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit shaderGraphCompiled(resp); }, Qt::QueuedConnection);
+            }
         }
         return;
     }
 
     if (hdr.opcode == WAYWAL_RESP_SET_CAMERA_3D) {
-        if (payload.size() >= sizeof(waywal_ipc_resp_set_camera_3d_t)) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_SET_CAMERA_3D, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_set_camera_3d_t)) {
             waywal_ipc_resp_set_camera_3d_t resp{};
             std::memcpy(&resp, payload.data(), sizeof(resp));
-            QMetaObject::invokeMethod(
-                this, [this, resp]() { emit camera3DUpdated(resp); }, Qt::QueuedConnection);
+            if (waywal_ipc_validate_resp_set_camera_3d(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit camera3DUpdated(resp); }, Qt::QueuedConnection);
+            }
         }
         return;
     }
 
     if (hdr.opcode == WAYWAL_RESP_SET_PHYSICS_PARAMS) {
-        if (payload.size() >= sizeof(waywal_ipc_resp_set_physics_params_t)) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_SET_PHYSICS_PARAMS, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_set_physics_params_t)) {
             waywal_ipc_resp_set_physics_params_t resp{};
             std::memcpy(&resp, payload.data(), sizeof(resp));
-            QMetaObject::invokeMethod(
-                this, [this, resp]() { emit physicsParamsUpdated(resp); }, Qt::QueuedConnection);
+            if (waywal_ipc_validate_resp_set_physics_params(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit physicsParamsUpdated(resp); },
+                    Qt::QueuedConnection);
+            }
         }
         return;
     }
 
     if (hdr.opcode == WAYWAL_RESP_SET_SCENE_LIGHTS) {
-        if (payload.size() >= sizeof(waywal_ipc_resp_set_scene_lights_t)) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_SET_SCENE_LIGHTS, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_set_scene_lights_t)) {
             waywal_ipc_resp_set_scene_lights_t resp{};
             std::memcpy(&resp, payload.data(), sizeof(resp));
-            QMetaObject::invokeMethod(
-                this, [this, resp]() { emit sceneLightsUpdated(resp); }, Qt::QueuedConnection);
+            if (waywal_ipc_validate_resp_set_scene_lights(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit sceneLightsUpdated(resp); }, Qt::QueuedConnection);
+            }
         }
         return;
     }
 
-    if (hdr.opcode == WAYWAL_RESP_ERR) {
-        QString err = QStringLiteral("Daemon returned error");
-        if (!payload.empty()) {
-            err = QString::fromUtf8(reinterpret_cast<const char *>(payload.data()),
-                                    static_cast<qsizetype>(payload.size()));
+    if (hdr.opcode == WAYWAL_RESP_OK) {
+        PendingRequest req{};
+        bool hasReq = false;
+        {
+            std::lock_guard<std::mutex> lock(m_requestsMutex);
+            if (!m_pendingRequests.empty()) {
+                req = std::move(m_pendingRequests.front());
+                m_pendingRequests.pop_front();
+                hasReq = true;
+            }
         }
-        QMetaObject::invokeMethod(
-            this, [this, err]() { emit errorOccurred(err); }, Qt::QueuedConnection);
+        if (hasReq && req.expectedOpcode == WAYWAL_REQ_QUERY_JSON) {
+            QString jsonStr = QString::fromUtf8(reinterpret_cast<const char *>(payload.data()),
+                                                static_cast<qsizetype>(payload.size()));
+            QMetaObject::invokeMethod(
+                this,
+                [this, jsonStr, cb = std::move(req.jsonCallback)]() {
+                    if (cb) {
+                        cb(jsonStr);
+                    }
+                    emit outputsJsonReceived(jsonStr);
+                },
+                Qt::QueuedConnection);
+        }
+        return;
     }
 }
-
-/* ========================================================================= */
-/* Public API Methods                                                        */
-/* ========================================================================= */
 
 void IpcClient::sendSetUniform(const QString &output, const QString &name, const float *vals,
                                uint32_t count, bool persist)
@@ -673,7 +1092,6 @@ void IpcClient::sendSetUniform(const QString &output, const QString &name, const
     QByteArray outBa = output.toUtf8();
     QByteArray nameBa = name.toUtf8();
 
-    // Standard layout (64/64)
     std::strncpy(payload.output, outBa.constData(), sizeof(payload.output) - 1);
     std::strncpy(payload.name, nameBa.constData(), sizeof(payload.name) - 1);
     payload.num_components = std::min(count, 4U);
@@ -681,7 +1099,6 @@ void IpcClient::sendSetUniform(const QString &output, const QString &name, const
         payload.values[i] = vals[i];
     }
 
-    // Structured layout with persistence flags
     std::strncpy(payload.target_output, outBa.constData(), sizeof(payload.target_output) - 1);
     std::strncpy(payload.uniform_name, nameBa.constData(), sizeof(payload.uniform_name) - 1);
     payload.uniform_components = payload.num_components;
@@ -696,7 +1113,6 @@ void IpcClient::sendSetUniform(const QString &output, const QString &name, const
 
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
-        // Overwrite in-place: coalesces continuous slider/color drags at 144 Hz
         m_pendingUniforms[key] = payload;
     }
 
@@ -716,10 +1132,7 @@ void IpcClient::sendSetImage(const waywal_img_metadata_t &meta, int memfd)
     std::memcpy(pkt.payload.data(), &meta, sizeof(waywal_img_metadata_t));
 
     if (memfd >= 0) {
-        pkt.attachedFd = fcntl(memfd, F_DUPFD_CLOEXEC, 0);
-        if (pkt.attachedFd < 0) {
-            pkt.attachedFd = dup(memfd);
-        }
+        pkt.attachedFd = dupCloexec(memfd);
     }
 
     {
@@ -733,7 +1146,7 @@ void IpcClient::sendSetImage(const waywal_img_metadata_t &meta, int memfd)
 void IpcClient::sendAudioPowerConfig(float volume, int8_t muteOnAudio, int8_t themeFromMedia,
                                      uint8_t batteryPolicy)
 {
-    (void)batteryPolicy; // Reserved for power governor packet extension
+    (void)batteryPolicy;
     waywal_audio_ctrl_payload_t apay{};
     apay.volume = volume;
     apay.mute_on_audio = muteOnAudio;
@@ -840,17 +1253,23 @@ void IpcClient::requestWorkshopSync(
     uint32_t flags, const QString &customRoot,
     std::function<void(const waywal_ipc_resp_workshop_sync_t &resp)> callback)
 {
+    waywal_ipc_hdr_t hdr{};
     waywal_ipc_req_workshop_sync_t req{};
-    req.flags = flags;
     QByteArray rootBa = customRoot.toUtf8();
-    std::strncpy(req.custom_root, rootBa.constData(), sizeof(req.custom_root) - 1);
+    if (!waywal_ipc_serialize_req_workshop_sync(
+            flags, rootBa.isEmpty() ? nullptr : rootBa.constData(), &hdr, &req)) {
+        if (callback) {
+            waywal_ipc_resp_workshop_sync_t resp{};
+            resp.status_code = 1u;
+            QMetaObject::invokeMethod(
+                this, [cb = std::move(callback), resp]() { cb(resp); }, Qt::QueuedConnection);
+        }
+        return;
+    }
 
     OutboundPacket pkt{};
     pkt.type = OutboundPacket::Type::WorkshopSync;
-    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
-    pkt.hdr.version = WAYWAL_IPC_VERSION;
-    pkt.hdr.opcode = WAYWAL_REQ_WORKSHOP_SYNC;
-    pkt.hdr.payload_size = sizeof(req);
+    pkt.hdr = hdr;
     pkt.payload.resize(sizeof(req));
     std::memcpy(pkt.payload.data(), &req, sizeof(req));
     pkt.workshopSyncCallback = std::move(callback);
@@ -867,17 +1286,25 @@ void IpcClient::requestWorkshopDownload(
     uint64_t publishedFileId, uint32_t priority, uint32_t preferredBackend,
     std::function<void(const waywal_ipc_resp_workshop_download_t &resp)> callback)
 {
+    waywal_ipc_hdr_t hdr{};
     waywal_ipc_req_workshop_download_t req{};
-    req.published_file_id = publishedFileId;
-    req.priority = priority;
-    req.preferred_backend = preferredBackend;
+    if (!waywal_ipc_serialize_req_workshop_download(publishedFileId, priority, preferredBackend,
+                                                    &hdr, &req)) {
+        if (callback) {
+            waywal_ipc_resp_workshop_download_t resp{};
+            resp.published_file_id = publishedFileId;
+            resp.task_state = 7u;
+            std::strncpy(resp.error_msg, "Invalid workshop download request",
+                         sizeof(resp.error_msg) - 1);
+            QMetaObject::invokeMethod(
+                this, [cb = std::move(callback), resp]() { cb(resp); }, Qt::QueuedConnection);
+        }
+        return;
+    }
 
     OutboundPacket pkt{};
     pkt.type = OutboundPacket::Type::WorkshopDownload;
-    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
-    pkt.hdr.version = WAYWAL_IPC_VERSION;
-    pkt.hdr.opcode = WAYWAL_REQ_WORKSHOP_DOWNLOAD;
-    pkt.hdr.payload_size = sizeof(req);
+    pkt.hdr = hdr;
     pkt.payload.resize(sizeof(req));
     std::memcpy(pkt.payload.data(), &req, sizeof(req));
     pkt.workshopDownloadCallback = std::move(callback);
@@ -893,27 +1320,52 @@ void IpcClient::requestWorkshopDownload(
 void IpcClient::requestWwpkgInstall(
     const uint8_t packageUuid[16], uint32_t flags, const QString &targetOutput,
     std::function<void(const waywal_ipc_resp_wwpkg_install_t &resp, const QString &errorMsg)>
-        callback)
+        callback,
+    int wwpkgFd)
 {
-    waywal_ipc_req_wwpkg_install_t req{};
-    if (packageUuid) {
-        std::memcpy(req.package_uuid, packageUuid, 16);
-    }
-    req.flags = flags;
+    uint8_t zeroUuid[16]{};
+    const uint8_t *uuidPtr = packageUuid ? packageUuid : zeroUuid;
     QByteArray outBa = targetOutput.toUtf8();
-    req.target_output_len = static_cast<uint32_t>(outBa.size());
+
+    const size_t bufCap =
+        sizeof(waywal_ipc_req_wwpkg_install_t) + static_cast<size_t>(outBa.size()) + 2u;
+    std::vector<uint8_t> payloadBuf(bufCap, 0);
+    size_t totalLen = 0;
+    waywal_ipc_hdr_t hdr{};
+
+    if (!waywal_ipc_serialize_req_wwpkg_install(
+            uuidPtr, flags, outBa.isEmpty() ? nullptr : outBa.constData(), &hdr, nullptr,
+            payloadBuf.data(), payloadBuf.size(), &totalLen)) {
+        QString errMsg = QStringLiteral("Target output exceeds maximum IPC string length");
+        QMetaObject::invokeMethod(
+            this,
+            [this, uuidVec = std::vector<uint8_t>(uuidPtr, uuidPtr + 16), errMsg,
+             cb = std::move(callback)]() {
+                waywal_ipc_resp_wwpkg_install_t resp{};
+                std::memcpy(resp.package_uuid, uuidVec.data(), 16);
+                resp.status_code = 1u;
+                if (cb) {
+                    cb(resp, errMsg);
+                }
+                emit wwpkgInstallReceived(resp, errMsg);
+                emit errorOccurred(errMsg);
+            },
+            Qt::QueuedConnection);
+        return;
+    }
+
+    int attached = -1;
+    if (wwpkgFd >= 0) {
+        attached = dupCloexec(wwpkgFd);
+    } else {
+        attached = tryOpenHubPackageByUuid(uuidPtr);
+    }
 
     OutboundPacket pkt{};
     pkt.type = OutboundPacket::Type::WwpkgInstall;
-    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
-    pkt.hdr.version = WAYWAL_IPC_VERSION;
-    pkt.hdr.opcode = WAYWAL_REQ_WWPKG_INSTALL;
-    pkt.hdr.payload_size = sizeof(req) + req.target_output_len;
-    pkt.payload.resize(pkt.hdr.payload_size);
-    std::memcpy(pkt.payload.data(), &req, sizeof(req));
-    if (req.target_output_len > 0) {
-        std::memcpy(pkt.payload.data() + sizeof(req), outBa.constData(), req.target_output_len);
-    }
+    pkt.hdr = hdr;
+    pkt.payload.assign(payloadBuf.begin(), payloadBuf.begin() + static_cast<ptrdiff_t>(totalLen));
+    pkt.attachedFd = attached;
     pkt.wwpkgInstallCallback = std::move(callback);
 
     {
@@ -924,21 +1376,74 @@ void IpcClient::requestWwpkgInstall(
     wakeupWorker();
 }
 
+void IpcClient::installWwpkg(
+    const QString &packagePath, const QString &targetOutput, uint32_t flags,
+    std::function<void(const waywal_ipc_resp_wwpkg_install_t &resp, const QString &errorMsg)>
+        callback)
+{
+    QByteArray pathBa = packagePath.toUtf8();
+    int fd = pathBa.isEmpty() ? -1 : ::open(pathBa.constData(), O_RDONLY | O_CLOEXEC);
+    struct stat st{};
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        QString errMsg = QStringLiteral("Unable to open .wwpkg file: %1").arg(packagePath);
+        QMetaObject::invokeMethod(
+            this,
+            [this, errMsg, cb = std::move(callback)]() {
+                waywal_ipc_resp_wwpkg_install_t resp{};
+                resp.status_code = 2u;
+                if (cb) {
+                    cb(resp, errMsg);
+                }
+                emit wwpkgInstallReceived(resp, errMsg);
+                emit errorOccurred(errMsg);
+            },
+            Qt::QueuedConnection);
+        return;
+    }
+
+    uint8_t pkgUuid[16]{};
+    wwpkg_package_t *pkg = wwpkg_open(pathBa.constData());
+    if (pkg) {
+        const wwpkg_manifest_t *man = wwpkg_get_manifest(pkg);
+        if (man) {
+            (void)parseUuidString(man->id, pkgUuid);
+        }
+        wwpkg_close(pkg);
+    }
+
+    QString normOutput = targetOutput.trimmed();
+    if (normOutput.isEmpty() ||
+        normOutput.compare(QStringLiteral("All Displays"), Qt::CaseInsensitive) == 0) {
+        normOutput = QStringLiteral("*");
+    }
+
+    requestWwpkgInstall(pkgUuid, flags, normOutput, std::move(callback), fd);
+    ::close(fd);
+}
+
 void IpcClient::requestScanCompat(
     const QString &targetPath, uint32_t autoRepairFlags,
     std::function<void(const waywal_ipc_resp_scan_compat_t &resp)> callback)
 {
+    waywal_ipc_hdr_t hdr{};
     waywal_ipc_req_scan_compat_t req{};
     QByteArray pathBa = targetPath.toUtf8();
-    std::strncpy(req.target_path, pathBa.constData(), sizeof(req.target_path) - 1);
-    req.auto_repair_flags = autoRepairFlags;
+    if (!waywal_ipc_serialize_req_scan_compat(pathBa.constData(), autoRepairFlags, &hdr, &req)) {
+        if (callback) {
+            waywal_ipc_resp_scan_compat_t resp{};
+            resp.status_code = 1u;
+            QMetaObject::invokeMethod(
+                this, [cb = std::move(callback), resp]() { cb(resp); }, Qt::QueuedConnection);
+        }
+        return;
+    }
 
     OutboundPacket pkt{};
     pkt.type = OutboundPacket::Type::ScanCompat;
-    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
-    pkt.hdr.version = WAYWAL_IPC_VERSION;
-    pkt.hdr.opcode = WAYWAL_REQ_SCAN_COMPAT;
-    pkt.hdr.payload_size = sizeof(req);
+    pkt.hdr = hdr;
     pkt.payload.resize(sizeof(req));
     std::memcpy(pkt.payload.data(), &req, sizeof(req));
     pkt.scanCompatCallback = std::move(callback);
@@ -962,7 +1467,7 @@ bool IpcClient::requestCompileShaderGraph(const QString &output, const QString &
     waywal_ipc_hdr_t hdr{};
     waywal_ipc_req_compile_shader_graph_t req{};
 
-    std::vector<uint8_t> sendBuf(sizeof(hdr) + sizeof(req) + jsonBa.size());
+    std::vector<uint8_t> sendBuf(sizeof(hdr) + sizeof(req) + static_cast<size_t>(jsonBa.size()));
     size_t totalLen = 0;
 
     if (!waywal_ipc_serialize_req_compile_shader_graph(
@@ -991,39 +1496,46 @@ bool IpcClient::requestCompileShaderGraph(const QString &output, const QString &
         addr.sun_family = AF_UNIX;
         QByteArray targetBa = targetPath.toUtf8();
         if (static_cast<size_t>(targetBa.size()) >= sizeof(addr.sun_path)) {
-            close(fd);
+            ::close(fd);
             return false;
         }
-        std::memcpy(addr.sun_path, targetBa.constData(), targetBa.size());
+        std::memcpy(addr.sun_path, targetBa.constData(), static_cast<size_t>(targetBa.size()));
 
         if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
-            close(fd);
+            ::close(fd);
             return false;
         }
 
         if (!writeExactNonBlocking(fd, sendBuf.data(), totalLen, 2000)) {
-            close(fd);
+            ::close(fd);
             return false;
         }
 
         waywal_ipc_hdr_t respHdr{};
-        if (!readExactNonBlocking(fd, &respHdr, sizeof(respHdr), 2000)) {
-            close(fd);
+        int extraFds[4] = {-1, -1, -1, -1};
+        size_t numExtraFds = 0;
+        if (!waywal_ipc_recv_fds(fd, &respHdr, extraFds, 4, &numExtraFds)) {
+            ::close(fd);
             return false;
         }
+        ScopedFdArrayGuard extraGuard{extraFds, numExtraFds};
 
         if (respHdr.opcode != WAYWAL_RESP_COMPILE_SHADER_GRAPH ||
-            respHdr.payload_size < sizeof(waywal_ipc_resp_compile_shader_graph_t)) {
-            close(fd);
+            respHdr.payload_size != sizeof(waywal_ipc_resp_compile_shader_graph_t)) {
+            ::close(fd);
             return false;
         }
 
         waywal_ipc_resp_compile_shader_graph_t resp{};
         if (!readExactNonBlocking(fd, &resp, sizeof(resp), 2000)) {
-            close(fd);
+            ::close(fd);
             return false;
         }
-        close(fd);
+        ::close(fd);
+
+        if (!waywal_ipc_validate_resp_compile_shader_graph(&resp, sizeof(resp))) {
+            return false;
+        }
 
         *outResp = resp;
         return (resp.status_code == 0);
