@@ -9,6 +9,7 @@
 #include <QByteArray>
 #include <QImage>
 #include <QList>
+#include <cstring>
 #include <memory>
 
 #include "waywal/wwpkg.h"
@@ -129,6 +130,14 @@ struct CreatorPackagingContext {
     QString cid; // "sha256:<64 hex digits>"
     QString registryIndexJson;
     bool installedToLocalHub{false};
+
+    ~CreatorPackagingContext()
+    {
+        if (!authorPrivKey.isEmpty()) {
+            explicit_bzero(authorPrivKey.data(), static_cast<size_t>(authorPrivKey.size()));
+            authorPrivKey.clear();
+        }
+    }
 };
 
 class CreatorPackagingWizard;
@@ -320,6 +329,9 @@ class HubPublishingExportPage : public QWizardPage {
 
     void initializePage() override;
 
+  signals:
+    void packageInstallRequested(const QString &packagePath, const QString &targetOutput);
+
   private:
     void setupUi();
     void installToLocalHub();
@@ -378,6 +390,9 @@ class CreatorPackagingWizard : public QWizard {
         return m_compilationPage;
     }
     [[nodiscard]] HubPublishingExportPage *hubPublishingExportPage() const { return m_exportPage; }
+
+  signals:
+    void packageInstallRequested(const QString &packagePath, const QString &targetOutput);
 
   private:
     void applyStudioTheme();

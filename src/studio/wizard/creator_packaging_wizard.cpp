@@ -48,6 +48,8 @@
 #include <QUuid>
 #include <QVBoxLayout>
 
+#include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,6 +57,371 @@
 namespace wwal::studio {
 
 namespace {
+
+void wipeByteArray(QByteArray &buf)
+{
+    if (!buf.isEmpty()) {
+        explicit_bzero(buf.data(), static_cast<size_t>(buf.size()));
+        buf.clear();
+    }
+}
+
+bool isAsciiHex(const QByteArray &buf)
+{
+    if (buf.isEmpty()) {
+        return false;
+    }
+    for (char ch : buf) {
+        const bool ok =
+            (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool writeAllFd(int fd, const char *data, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        const ssize_t n = ::write(fd, data + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool isScenePackageType(wwpkg_type_t type)
+{
+    return type == WWPKG_TYPE_SCENE_2D || type == WWPKG_TYPE_SCENE_PUPPET ||
+           type == WWPKG_TYPE_SCENE_PARTICLES;
+}
+
+bool isTranscodableTexturePath(const QString &path)
+{
+    return path.endsWith(QStringLiteral(".png"), Qt::CaseInsensitive) ||
+           path.endsWith(QStringLiteral(".jpg"), Qt::CaseInsensitive) ||
+           path.endsWith(QStringLiteral(".jpeg"), Qt::CaseInsensitive) ||
+           path.endsWith(QStringLiteral(".bmp"), Qt::CaseInsensitive);
+}
+
+bool isDisguisedExecutable(const QString &filePath)
+{
+    QFile f(filePath);
+    if (!f.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    const QByteArray hdr = f.read(512);
+    if (hdr.size() >= 4 && static_cast<uint8_t>(hdr[0]) == 0x7Fu && hdr[1] == 'E' &&
+        hdr[2] == 'L' && hdr[3] == 'F') {
+        return true;
+    }
+    if (hdr.size() >= 64 && hdr[0] == 'M' && hdr[1] == 'Z') {
+        const uint32_t peOff = static_cast<uint32_t>(static_cast<uint8_t>(hdr[0x3c])) |
+                               (static_cast<uint32_t>(static_cast<uint8_t>(hdr[0x3d])) << 8) |
+                               (static_cast<uint32_t>(static_cast<uint8_t>(hdr[0x3e])) << 16) |
+                               (static_cast<uint32_t>(static_cast<uint8_t>(hdr[0x3f])) << 24);
+        if (peOff <= static_cast<uint32_t>(hdr.size()) - 4u) {
+            if (hdr[static_cast<qsizetype>(peOff)] == 'P' &&
+                hdr[static_cast<qsizetype>(peOff + 1u)] == 'E' &&
+                hdr[static_cast<qsizetype>(peOff + 2u)] == '\0' &&
+                hdr[static_cast<qsizetype>(peOff + 3u)] == '\0') {
+                return true;
+            }
+        } else if (peOff <= 64u * 1024u * 1024u && f.seek(static_cast<qint64>(peOff))) {
+            const QByteArray sig = f.read(4);
+            if (sig.size() == 4 && sig[0] == 'P' && sig[1] == 'E' && sig[2] == '\0' &&
+                sig[3] == '\0') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool hasValidVideoContainerHeader(const QString &filePath)
+{
+    QFile f(filePath);
+    if (!f.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    const QByteArray hdr = f.read(256);
+    if (hdr.size() < 12) {
+        return false;
+    }
+    const auto *b = reinterpret_cast<const uint8_t *>(hdr.constData());
+
+    /* Matroska / WebM EBML header */
+    if (b[0] == 0x1Au && b[1] == 0x45u && b[2] == 0xDFu && b[3] == 0xA3u) {
+        return true;
+    }
+    /* Ogg bitstream */
+    if (memcmp(b, "OggS", 4) == 0) {
+        return true;
+    }
+    /* ISO BMFF / MP4 / MOV top-level box */
+    const uint32_t boxSz = (static_cast<uint32_t>(b[0]) << 24) |
+                           (static_cast<uint32_t>(b[1]) << 16) |
+                           (static_cast<uint32_t>(b[2]) << 8) | static_cast<uint32_t>(b[3]);
+    if (boxSz == 0u || boxSz == 1u || boxSz >= 8u) {
+        if (memcmp(b + 4, "ftyp", 4) == 0 || memcmp(b + 4, "moov", 4) == 0 ||
+            memcmp(b + 4, "mdat", 4) == 0 || memcmp(b + 4, "free", 4) == 0 ||
+            memcmp(b + 4, "skip", 4) == 0 || memcmp(b + 4, "wide", 4) == 0) {
+            return true;
+        }
+    }
+    /* MPEG-TS sync byte stride */
+    if (b[0] == 0x47u && hdr.size() >= 189 && b[188] == 0x47u) {
+        return true;
+    }
+    return false;
+}
+
+struct ShaderAuditResult {
+    we_compat_tier_t tier{WE_TIER_1_NATIVE};
+    uint32_t score{100};
+    bool usesAudioUniforms{false};
+    QList<AuditIssueEntry> issues;
+};
+
+ShaderAuditResult auditShaderSource(const QString &absPath, const QString &relPath,
+                                    bool isComputeShader)
+{
+    ShaderAuditResult res;
+    QFile f(absPath);
+    if (!f.exists() || !f.open(QIODevice::ReadOnly)) {
+        res.tier = WE_TIER_4_BLOCKED;
+        res.score = 0;
+        res.issues.append({QStringLiteral("SHADER_ENTRYPOINT_MISSING"), WE_ISSUE_SEV_FATAL,
+                           QStringLiteral("Entrypoint shader file is missing or unreadable."),
+                           relPath, 0,
+                           QStringLiteral("Ensure entrypoint shader exists in stage.")});
+        return res;
+    }
+
+    const qint64 fileSz = f.size();
+    if (fileSz <= 0 || fileSz > 4 * 1024 * 1024) {
+        res.tier = WE_TIER_4_BLOCKED;
+        res.score = 0;
+        res.issues.append({QStringLiteral("SHADER_SIZE_INVALID"), WE_ISSUE_SEV_FATAL,
+                           QStringLiteral("Shader file must be non-empty and at most 4 MiB."),
+                           relPath, 0,
+                           QStringLiteral("Provide a valid GLSL ES 3.10 source file.")});
+        return res;
+    }
+
+    const QByteArray raw = f.readAll();
+    if (raw.contains('\0')) {
+        res.tier = WE_TIER_4_BLOCKED;
+        res.score = 0;
+        res.issues.append({QStringLiteral("SHADER_BINARY_DATA"), WE_ISSUE_SEV_FATAL,
+                           QStringLiteral("Shader file contains embedded NUL bytes."), relPath, 0,
+                           QStringLiteral("Supply UTF-8 GLSL source code, not binary data.")});
+        return res;
+    }
+
+    /* Strip comments while preserving line numbers and verifying delimiter balance */
+    QByteArray stripped;
+    stripped.reserve(raw.size());
+    struct DelimFrame {
+        char expected;
+        uint32_t line;
+    };
+    QList<DelimFrame> stack;
+    uint32_t line = 1;
+    const qsizetype n = raw.size();
+
+    for (qsizetype i = 0; i < n; ++i) {
+        const char c = raw[i];
+        const char next = (i + 1 < n) ? raw[i + 1] : '\0';
+
+        if (c == '\n') {
+            stripped.append('\n');
+            ++line;
+            continue;
+        }
+        if (c == '/' && next == '/') {
+            i += 2;
+            while (i < n && raw[i] != '\n') {
+                ++i;
+            }
+            if (i < n && raw[i] == '\n') {
+                stripped.append('\n');
+                ++line;
+            }
+            continue;
+        }
+        if (c == '/' && next == '*') {
+            const uint32_t startLine = line;
+            i += 2;
+            bool closed = false;
+            while (i < n) {
+                if (raw[i] == '\n') {
+                    stripped.append('\n');
+                    ++line;
+                } else if (raw[i] == '*' && i + 1 < n && raw[i + 1] == '/') {
+                    ++i;
+                    closed = true;
+                    break;
+                }
+                ++i;
+            }
+            if (!closed) {
+                res.tier = WE_TIER_4_BLOCKED;
+                res.score = 0;
+                res.issues.append({QStringLiteral("SHADER_UNTERMINATED_COMMENT"),
+                                   WE_ISSUE_SEV_FATAL,
+                                   QStringLiteral("Unterminated /* block comment in shader."),
+                                   relPath, startLine, QStringLiteral("Close the block comment.")});
+                return res;
+            }
+            stripped.append(' ');
+            continue;
+        }
+        if (c == '"') {
+            stripped.append(' ');
+            ++i;
+            while (i < n && raw[i] != '\n') {
+                if (raw[i] == '\\' && i + 1 < n && raw[i + 1] != '\n') {
+                    i += 2;
+                    continue;
+                }
+                if (raw[i] == '"') {
+                    break;
+                }
+                ++i;
+            }
+            if (i < n && raw[i] == '\n') {
+                stripped.append('\n');
+                ++line;
+            }
+            continue;
+        }
+
+        stripped.append(c);
+        if (c == '{') {
+            stack.append({'}', line});
+        } else if (c == '(') {
+            stack.append({')', line});
+        } else if (c == '[') {
+            stack.append({']', line});
+        } else if (c == '}' || c == ')' || c == ']') {
+            if (stack.isEmpty() || stack.back().expected != c) {
+                res.tier = WE_TIER_4_BLOCKED;
+                res.score = 0;
+                res.issues.append({QStringLiteral("SHADER_SYNTAX_DELIMITER"), WE_ISSUE_SEV_FATAL,
+                                   QStringLiteral("Unmatched '%1' delimiter at line %2.")
+                                       .arg(QLatin1Char(c))
+                                       .arg(line),
+                                   relPath, line,
+                                   QStringLiteral("Fix mismatched braces or parentheses.")});
+                return res;
+            }
+            stack.removeLast();
+        }
+    }
+
+    if (!stack.isEmpty()) {
+        const DelimFrame unclosed = stack.back();
+        res.tier = WE_TIER_4_BLOCKED;
+        res.score = 0;
+        res.issues.append(
+            {QStringLiteral("SHADER_SYNTAX_DELIMITER"), WE_ISSUE_SEV_FATAL,
+             QStringLiteral("Unclosed delimiter before end of shader (opened at line %1).")
+                 .arg(unclosed.line),
+             relPath, unclosed.line, QStringLiteral("Balance all '{', '(', and '[' blocks.")});
+        return res;
+    }
+
+    const QString code = QString::fromUtf8(stripped);
+    static const QRegularExpression mainRe(QStringLiteral(R"(\bvoid\s+(main|mainImage)\s*\()"));
+    if (!mainRe.match(code).hasMatch()) {
+        res.tier = WE_TIER_4_BLOCKED;
+        res.score = 0;
+        res.issues.append(
+            {QStringLiteral("SHADER_MAIN_MISSING"), WE_ISSUE_SEV_FATAL,
+             QStringLiteral("Shader must define 'void main()' or 'void mainImage()'."), relPath, 1,
+             QStringLiteral("Add a GLSL ES 3.10 entry point function.")});
+        return res;
+    }
+
+    if (isComputeShader) {
+        static const QRegularExpression localSizeRe(
+            QStringLiteral(R"(\blocal_size_x\s*=\s*[1-9]\d*)"));
+        if (!localSizeRe.match(code).hasMatch()) {
+            res.tier = WE_TIER_4_BLOCKED;
+            res.score = 0;
+            res.issues.append(
+                {QStringLiteral("COMPUTE_LAYOUT_MISSING"), WE_ISSUE_SEV_FATAL,
+                 QStringLiteral("Compute shader is missing layout(local_size_x = ...) qualifier."),
+                 relPath, 1,
+                 QStringLiteral("Declare layout(local_size_x = 16, local_size_y = 16) in;")});
+            return res;
+        }
+    }
+
+    static const QRegularExpression versionRe(
+        QStringLiteral(R"(^\s*#\s*version\s+(\d+)(?:\s+(\w+))?)"),
+        QRegularExpression::MultilineOption);
+    const QRegularExpressionMatch vm = versionRe.match(code);
+    bool hasEs3 = false;
+    if (vm.hasMatch()) {
+        const int ver = vm.captured(1).toInt();
+        const QString profile = vm.captured(2).toLower();
+        if (profile == QStringLiteral("es") && ver >= 300) {
+            hasEs3 = true;
+        } else if (profile != QStringLiteral("es")) {
+            res.tier = WE_TIER_2_TRANSPILED;
+            res.score = qMin(res.score, 90u);
+            res.issues.append(
+                {QStringLiteral("SHADER_DESKTOP_GLSL"), WE_ISSUE_SEV_WARNING,
+                 QStringLiteral(
+                     "Desktop '#version %1' header will be adapted to '#version 310 es'.")
+                     .arg(ver),
+                 relPath, 1, QStringLiteral("Target '#version 310 es' directly.")});
+        }
+    }
+
+    if (!isComputeShader && hasEs3) {
+        static const QRegularExpression precRe(
+            QStringLiteral(R"(\bprecision\s+(lowp|mediump|highp)\s+float\s*;)"));
+        if (!precRe.match(code).hasMatch()) {
+            res.score = (res.score >= 5u) ? (res.score - 5u) : 0u;
+            res.issues.append({QStringLiteral("SHADER_FLOAT_PRECISION"), WE_ISSUE_SEV_WARNING,
+                               QStringLiteral("GLSL ES 3.x fragment shader lacks default float "
+                                              "precision qualifier."),
+                               relPath, 1, QStringLiteral("Add 'precision highp float;'")});
+        }
+    }
+
+    static const QRegularExpression legacyBuiltinRe(
+        QStringLiteral(R"(\b(gl_FragColor|texture2D)\b)"));
+    static const QRegularExpression mainImageOnlyRe(QStringLiteral(R"(\bvoid\s+mainImage\s*\()"));
+    if (legacyBuiltinRe.match(code).hasMatch() && !mainImageOnlyRe.match(code).hasMatch()) {
+        res.tier = WE_TIER_2_TRANSPILED;
+        res.score = qMin(res.score, 85u);
+        res.issues.append({QStringLiteral("SHADER_LEGACY_BUILTINS"), WE_ISSUE_SEV_WARNING,
+                           QStringLiteral("Legacy gl_FragColor/texture2D calls require ES 3.10 "
+                                          "compatibility defines."),
+                           relPath, 1,
+                           QStringLiteral("Use 'out vec4 fragColor;' and 'texture()'.")});
+    }
+
+    static const QRegularExpression audioRe(
+        QStringLiteral(R"(\b(iAudio|u_audio|audio_spectrum|u_spectrum)\b)"));
+    res.usesAudioUniforms = audioRe.match(code).hasMatch();
+
+    return res;
+}
 
 /* Helper to format byte counts into human-readable strings */
 QString formatBytes(qint64 bytes)
@@ -98,7 +465,6 @@ QString slugify(const QString &title)
     return out;
 }
 
-/* Helper to add pubkey hex to trusted_keys.json */
 void addPubkeyToTrustedKeys(const QString &pubkeyHex)
 {
     const QString home = QDir::homePath();
@@ -106,13 +472,17 @@ void addPubkeyToTrustedKeys(const QString &pubkeyHex)
     QFileInfo fi(trustedPath);
     fi.dir().mkpath(QStringLiteral("."));
 
+    QJsonObject rootObj;
     QJsonArray keysArray;
     QFile readFile(trustedPath);
     if (readFile.open(QIODevice::ReadOnly)) {
         QJsonDocument doc = QJsonDocument::fromJson(readFile.readAll());
         readFile.close();
-        if (doc.isObject() && doc.object().contains(QStringLiteral("trusted_keys"))) {
-            keysArray = doc.object().value(QStringLiteral("trusted_keys")).toArray();
+        if (doc.isObject()) {
+            rootObj = doc.object();
+            if (rootObj.contains(QStringLiteral("trusted_keys"))) {
+                keysArray = rootObj.value(QStringLiteral("trusted_keys")).toArray();
+            }
         } else if (doc.isArray()) {
             keysArray = doc.array();
         }
@@ -120,17 +490,27 @@ void addPubkeyToTrustedKeys(const QString &pubkeyHex)
 
     bool alreadyPresent = false;
     for (const auto &val : keysArray) {
-        if (val.toString().compare(pubkeyHex, Qt::CaseInsensitive) == 0) {
+        if (val.isString() && val.toString().compare(pubkeyHex, Qt::CaseInsensitive) == 0) {
             alreadyPresent = true;
             break;
+        }
+        if (val.isObject()) {
+            const QJsonObject obj = val.toObject();
+            const QString k = obj.contains(QStringLiteral("pubkey"))
+                                  ? obj.value(QStringLiteral("pubkey")).toString()
+                                  : obj.value(QStringLiteral("key")).toString();
+            if (k.compare(pubkeyHex, Qt::CaseInsensitive) == 0 &&
+                !obj.value(QStringLiteral("revoked")).toBool(false)) {
+                alreadyPresent = true;
+                break;
+            }
         }
     }
 
     if (!alreadyPresent) {
         keysArray.append(pubkeyHex.toLower());
-        QJsonObject root;
-        root.insert(QStringLiteral("trusted_keys"), keysArray);
-        QJsonDocument writeDoc(root);
+        rootObj.insert(QStringLiteral("trusted_keys"), keysArray);
+        QJsonDocument writeDoc(rootObj);
         QFile writeFile(trustedPath);
         if (writeFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             writeFile.write(writeDoc.toJson(QJsonDocument::Indented));
@@ -288,6 +668,26 @@ void SourceIntakePage::setupUi()
                 m_ctx->projectTypeStr = QStringLiteral("shader_fragment");
                 break;
             }
+
+            const QFileInfo srcFi(m_ctx->sourcePath);
+            if (srcFi.exists() && srcFi.isFile()) {
+                const QString ext = srcFi.suffix().toLower();
+                if (m_ctx->projectType == WWPKG_TYPE_SHADER_FRAGMENT) {
+                    m_ctx->entrypointPipeline = QStringLiteral("shaders/main.frag");
+                } else if (m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE) {
+                    m_ctx->entrypointPipeline = QStringLiteral("shaders/main.comp");
+                } else if (m_ctx->projectType == WWPKG_TYPE_VIDEO_STREAM) {
+                    m_ctx->entrypointPipeline =
+                        (ext == QStringLiteral("webm") || ext == QStringLiteral("mkv"))
+                            ? (QStringLiteral("assets/video.") + ext)
+                            : QStringLiteral("assets/video.mp4");
+                } else if (isScenePackageType(m_ctx->projectType)) {
+                    m_ctx->entrypointPipeline = QStringLiteral("scene.json");
+                }
+                if (m_entrypointLabel) {
+                    m_entrypointLabel->setText(m_ctx->entrypointPipeline);
+                }
+            }
         }
     });
 }
@@ -312,6 +712,11 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
         return;
 
     m_ctx->sourcePath = path;
+    m_ctx->entrypointPipeline.clear();
+    m_ctx->detectedTitle.clear();
+    m_ctx->detectedAuthor.clear();
+    m_ctx->detectedDescription.clear();
+    m_ctx->detectedLicense.clear();
     QFileInfo info(path);
 
     if (path.isEmpty() || !info.exists()) {
@@ -430,7 +835,10 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
         } else if (ext == QStringLiteral("mp4") || ext == QStringLiteral("webm") ||
                    ext == QStringLiteral("mkv")) {
             m_typeCombo->setCurrentIndex(5); // video_stream
-            m_ctx->entrypointPipeline = QStringLiteral("assets/video.") + ext;
+            m_ctx->entrypointPipeline =
+                (ext == QStringLiteral("webm") || ext == QStringLiteral("mkv"))
+                    ? (QStringLiteral("assets/video.") + ext)
+                    : QStringLiteral("assets/video.mp4");
         } else if (ext == QStringLiteral("json")) {
             m_typeCombo->setCurrentIndex(2); // scene_2d
             m_ctx->entrypointPipeline = QStringLiteral("scene.json");
@@ -513,7 +921,7 @@ void AssetBundlingPage::setupUi()
     optLayout->addWidget(m_pruneCheck);
 
     m_transcodeCheck =
-        new QCheckBox(QStringLiteral("Convert PNG and BMP textures to WebP"), optGroup);
+        new QCheckBox(QStringLiteral("Convert PNG, JPEG, and BMP textures to WebP"), optGroup);
     m_transcodeCheck->setChecked(true);
     optLayout->addWidget(m_transcodeCheck);
 
@@ -587,6 +995,10 @@ void AssetBundlingPage::scanAssets()
                        lower.endsWith(QStringLiteral(".flac")) ||
                        lower.endsWith(QStringLiteral(".mp3"))) {
                 entry.category = QStringLiteral("audio");
+            } else if (lower.endsWith(QStringLiteral(".mp4")) ||
+                       lower.endsWith(QStringLiteral(".webm")) ||
+                       lower.endsWith(QStringLiteral(".mkv"))) {
+                entry.category = QStringLiteral("video");
             } else if (lower.endsWith(QStringLiteral(".js")) ||
                        lower.endsWith(QStringLiteral(".json"))) {
                 entry.category = QStringLiteral("script/data");
@@ -605,8 +1017,7 @@ void AssetBundlingPage::scanAssets()
                 item->setText(3, QStringLiteral("Exclude"));
                 item->setForeground(3, QBrush(QColor(QStringLiteral("#ef4444"))));
             } else if (entry.category == QStringLiteral("texture") &&
-                       (lower.endsWith(QStringLiteral(".png")) ||
-                        lower.endsWith(QStringLiteral(".bmp")))) {
+                       isTranscodableTexturePath(lower)) {
                 item->setText(3, QStringLiteral("Convert to WebP"));
                 item->setForeground(3, QBrush(QColor(QStringLiteral("#38bdf8"))));
             } else {
@@ -615,11 +1026,16 @@ void AssetBundlingPage::scanAssets()
             }
         }
     } else {
-        // Single file
         ScannedAssetEntry entry;
         entry.relativePath = srcInfo.fileName();
         entry.sizeBytes = srcInfo.size();
-        entry.category = QStringLiteral("shader");
+        if (m_ctx->projectType == WWPKG_TYPE_VIDEO_STREAM) {
+            entry.category = QStringLiteral("video");
+        } else if (isScenePackageType(m_ctx->projectType)) {
+            entry.category = QStringLiteral("script/data");
+        } else {
+            entry.category = QStringLiteral("shader");
+        }
         entry.isReferenced = true;
         totalSize += entry.sizeBytes;
 
@@ -629,7 +1045,7 @@ void AssetBundlingPage::scanAssets()
         item->setText(0, entry.relativePath);
         item->setText(1, entry.category);
         item->setText(2, formatBytes(entry.sizeBytes));
-        item->setText(3, QStringLiteral("Include in shaders/"));
+        item->setText(3, QStringLiteral("Stage as %1").arg(m_ctx->entrypointPipeline));
         item->setForeground(3, QBrush(QColor(QStringLiteral("#34d399"))));
     }
 
@@ -647,10 +1063,11 @@ bool AssetBundlingPage::validatePage()
     m_ctx->pruneDeadFiles = m_pruneCheck->isChecked();
     m_ctx->transcodeTextures = m_transcodeCheck->isChecked();
 
-    // Prepare clean temporary staging directory
-    if (m_ctx->stagingDir.isEmpty() || !QDir(m_ctx->stagingDir).exists()) {
+    if (m_ctx->stagingDir.isEmpty()) {
         m_ctx->stagingDir = QDir::tempPath() + QStringLiteral("/wwpkg_stage_") +
                             QUuid::createUuid().toString(QUuid::WithoutBraces);
+    } else if (m_ctx->stagingDir.startsWith(QDir::tempPath())) {
+        QDir(m_ctx->stagingDir).removeRecursively();
     }
     QDir staging(m_ctx->stagingDir);
     staging.mkpath(QStringLiteral("."));
@@ -669,37 +1086,54 @@ bool AssetBundlingPage::validatePage()
             QFile::remove(dstFile);
             QFile::copy(srcFile, dstFile);
 
-            // Optional texture transcoding to WebP
             if (m_ctx->transcodeTextures && asset.category == QStringLiteral("texture") &&
-                (asset.relativePath.endsWith(QStringLiteral(".png"), Qt::CaseInsensitive) ||
-                 asset.relativePath.endsWith(QStringLiteral(".bmp"), Qt::CaseInsensitive))) {
+                isTranscodableTexturePath(asset.relativePath)) {
                 QImage img(dstFile);
                 if (!img.isNull()) {
                     QString webpDst = dstFile;
-                    int dot = webpDst.lastIndexOf(u'.');
-                    if (dot > 0)
+                    const int dot = webpDst.lastIndexOf(u'.');
+                    if (dot > 0) {
                         webpDst.truncate(dot);
+                    }
                     webpDst.append(QStringLiteral(".webp"));
-                    img.save(webpDst, "WEBP", 85);
+                    if (webpDst != dstFile && img.save(webpDst, "WEBP", 85)) {
+                        QFile::remove(dstFile);
+                        if (m_ctx->entrypointPreview.compare(asset.relativePath,
+                                                             Qt::CaseInsensitive) == 0) {
+                            QString relWebp = asset.relativePath;
+                            const int relDot = relWebp.lastIndexOf(u'.');
+                            if (relDot > 0) {
+                                relWebp.truncate(relDot);
+                            }
+                            relWebp.append(QStringLiteral(".webp"));
+                            m_ctx->entrypointPreview = relWebp;
+                        }
+                    }
                 }
             }
         }
     } else {
-        // Single file intake
-        if (m_ctx->projectType == WWPKG_TYPE_SHADER_FRAGMENT ||
-            m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE) {
-            staging.mkpath(QStringLiteral("shaders"));
-            QString dst = staging.filePath(QStringLiteral("shaders/main.frag"));
-            if (m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE) {
-                dst = staging.filePath(QStringLiteral("shaders/main.comp"));
+        QString relDst = m_ctx->entrypointPipeline;
+        if (m_ctx->projectType == WWPKG_TYPE_SHADER_FRAGMENT) {
+            relDst = QStringLiteral("shaders/main.frag");
+        } else if (m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE) {
+            relDst = QStringLiteral("shaders/main.comp");
+        } else if (m_ctx->projectType == WWPKG_TYPE_VIDEO_STREAM) {
+            const QString ext = srcInfo.suffix().toLower();
+            if (!relDst.startsWith(QStringLiteral("assets/"))) {
+                relDst = (ext == QStringLiteral("webm") || ext == QStringLiteral("mkv"))
+                             ? (QStringLiteral("assets/video.") + ext)
+                             : QStringLiteral("assets/video.mp4");
             }
-            QFile::remove(dst);
-            QFile::copy(m_ctx->sourcePath, dst);
-        } else {
-            QString dst = staging.filePath(srcInfo.fileName());
-            QFile::remove(dst);
-            QFile::copy(m_ctx->sourcePath, dst);
+        } else if (relDst.isEmpty()) {
+            relDst = srcInfo.fileName();
         }
+        m_ctx->entrypointPipeline = relDst;
+
+        const QString dst = staging.filePath(relDst);
+        QFileInfo(dst).dir().mkpath(QStringLiteral("."));
+        QFile::remove(dst);
+        QFile::copy(m_ctx->sourcePath, dst);
     }
 
     return true;
@@ -1101,7 +1535,13 @@ bool MetadataPreviewPage::validatePage()
 
         QImage p512 =
             m_ctx->previewImage.scaled(512, 288, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-        p512.save(m_ctx->previewWebpPath, "WEBP", 90);
+        if (p512.save(m_ctx->previewWebpPath, "WEBP", 90)) {
+            for (const QString &stale :
+                 {QStringLiteral("preview.png"), QStringLiteral("preview.jpg"),
+                  QStringLiteral("preview.jpeg"), QStringLiteral("preview.bmp")}) {
+                QFile::remove(stg.filePath(stale));
+            }
+        }
 
         QImage p1280 =
             m_ctx->previewImage.scaled(1280, 720, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
@@ -1242,55 +1682,133 @@ void CapabilityAuditPage::runCompatibilityAudit()
     m_ctx->issues.clear();
     m_ctx->repairs.clear();
 
-    // Create scanner
-    we_compat_scanner_t *scanner = we_compat_scanner_create(true, true);
-    if (!scanner)
-        return;
+    QDir stg(m_ctx->stagingDir);
+    bool blockedByBinary = false;
+    bool detectedAudioUniforms = false;
 
-    // Allocate report on heap per strict invariant (252,280 bytes)
-    we_compat_report_t *report = we_compat_report_alloc();
-    if (!report) {
-        we_compat_scanner_destroy(scanner);
-        return;
+    /* Reject disguised ELF/PE executables in any package type */
+    QDirIterator binIt(m_ctx->stagingDir, QDir::Files | QDir::NoDotAndDotDot,
+                       QDirIterator::Subdirectories);
+    while (binIt.hasNext()) {
+        const QString fPath = binIt.next();
+        if (isDisguisedExecutable(fPath)) {
+            blockedByBinary = true;
+            m_ctx->issues.append(
+                {QStringLiteral("SECURITY_BINARY_PAYLOAD"), WE_ISSUE_SEV_FATAL,
+                 QStringLiteral("Native executable (ELF/PE) binary detected in staging directory."),
+                 stg.relativeFilePath(fPath), 0,
+                 QStringLiteral("Remove native executables from wallpaper assets.")});
+        }
     }
 
-    bool scanned =
-        we_compat_scan_directory(scanner, m_ctx->stagingDir.toUtf8().constData(), report);
+    if (blockedByBinary) {
+        m_ctx->compatTier = WE_TIER_4_BLOCKED;
+        m_ctx->compatScore = 0;
+        m_ctx->estimatedVramMb = 0.0f;
+        m_ctx->estimatedFps = 0;
+    } else if (m_ctx->projectType == WWPKG_TYPE_SHADER_FRAGMENT ||
+               m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE) {
+        const bool isCompute = (m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE);
+        const QString entryPath = stg.filePath(m_ctx->entrypointPipeline);
+        const ShaderAuditResult shaderRes =
+            auditShaderSource(entryPath, m_ctx->entrypointPipeline, isCompute);
 
-    if (scanned && report->tier != WE_TIER_UNKNOWN) {
-        m_ctx->compatTier = report->tier;
-        m_ctx->compatScore = report->compatibility_score;
-        m_ctx->estimatedVramMb = report->summary.estimated_vram_mb;
-        m_ctx->estimatedFps = report->summary.estimated_fps;
+        m_ctx->compatTier = shaderRes.tier;
+        m_ctx->compatScore = shaderRes.score;
+        m_ctx->issues.append(shaderRes.issues);
+        detectedAudioUniforms = shaderRes.usesAudioUniforms;
 
-        for (uint32_t i = 0; i < report->issue_count; i++) {
-            AuditIssueEntry issue;
-            issue.code = QString::fromUtf8(report->issues[i].code);
-            issue.severity = static_cast<int>(report->issues[i].severity);
-            issue.message = QString::fromUtf8(report->issues[i].message);
-            issue.filePath = QString::fromUtf8(report->issues[i].file_path);
-            issue.lineNumber = report->issues[i].line_number;
-            issue.suggestedFix = QString::fromUtf8(report->issues[i].suggested_fix);
-            m_ctx->issues.append(issue);
+        float vramEst = isCompute ? 64.0f : 48.0f;
+        waywal_shader_meta_t meta;
+        waywal_shader_meta_init(&meta);
+        if (QFile::exists(entryPath) &&
+            waywal_shader_parse_file(entryPath.toUtf8().constData(), &meta) &&
+            meta.has_multi_pass) {
+            vramEst += 32.0f;
         }
-
-        for (uint32_t i = 0; i < report->repair_count; i++) {
-            AuditRepairEntry repair;
-            repair.transformationId = QString::fromUtf8(report->repairs[i].transformation_id);
-            repair.targetFile = QString::fromUtf8(report->repairs[i].target_file);
-            repair.description = QString::fromUtf8(report->repairs[i].description);
-            m_ctx->repairs.append(repair);
+        m_ctx->estimatedVramMb = vramEst;
+        m_ctx->estimatedFps = m_ctx->targetFps ? m_ctx->targetFps : 60;
+    } else if (m_ctx->projectType == WWPKG_TYPE_VIDEO_STREAM) {
+        const QString entryPath = stg.filePath(m_ctx->entrypointPipeline);
+        if (!QFileInfo::exists(entryPath)) {
+            m_ctx->compatTier = WE_TIER_4_BLOCKED;
+            m_ctx->compatScore = 0;
+            m_ctx->estimatedVramMb = 0.0f;
+            m_ctx->estimatedFps = 0;
+            m_ctx->issues.append({QStringLiteral("VIDEO_ENTRYPOINT_MISSING"), WE_ISSUE_SEV_FATAL,
+                                  QStringLiteral("Staged video entrypoint '%1' does not exist.")
+                                      .arg(m_ctx->entrypointPipeline),
+                                  m_ctx->entrypointPipeline, 0,
+                                  QStringLiteral("Verify the source video file is readable.")});
+        } else if (!hasValidVideoContainerHeader(entryPath)) {
+            m_ctx->compatTier = WE_TIER_4_BLOCKED;
+            m_ctx->compatScore = 0;
+            m_ctx->estimatedVramMb = 0.0f;
+            m_ctx->estimatedFps = 0;
+            m_ctx->issues.append(
+                {QStringLiteral("VIDEO_HEADER_INVALID"), WE_ISSUE_SEV_FATAL,
+                 QStringLiteral(
+                     "Video stream header is missing a valid MP4/WebM/MKV/Ogg signature."),
+                 m_ctx->entrypointPipeline, 0,
+                 QStringLiteral("Provide a valid H.264/HEVC/AV1/VP9 video container.")});
+        } else {
+            m_ctx->compatTier = WE_TIER_1_NATIVE;
+            m_ctx->compatScore = 100;
+            m_ctx->estimatedVramMb = 64.0f;
+            m_ctx->estimatedFps = m_ctx->targetFps ? m_ctx->targetFps : 60;
         }
     } else {
-        // Pure GLSL native wallpaper or unconstrained pass
-        m_ctx->compatTier = WE_TIER_1_NATIVE;
-        m_ctx->compatScore = 100;
-        m_ctx->estimatedVramMb = 48.0f;
-        m_ctx->estimatedFps = m_ctx->targetFps ? m_ctx->targetFps : 60;
-    }
+        we_compat_scanner_t *scanner = we_compat_scanner_create(true, true);
+        if (!scanner)
+            return;
 
-    we_compat_report_free(report);
-    we_compat_scanner_destroy(scanner);
+        we_compat_report_t *report = we_compat_report_alloc();
+        if (!report) {
+            we_compat_scanner_destroy(scanner);
+            return;
+        }
+
+        const bool scanned =
+            we_compat_scan_directory(scanner, m_ctx->stagingDir.toUtf8().constData(), report);
+
+        if (scanned && report->tier != WE_TIER_UNKNOWN) {
+            m_ctx->compatTier = report->tier;
+            m_ctx->compatScore = report->compatibility_score;
+            m_ctx->estimatedVramMb = report->summary.estimated_vram_mb;
+            m_ctx->estimatedFps = report->summary.estimated_fps;
+
+            for (uint32_t i = 0; i < report->issue_count; i++) {
+                AuditIssueEntry issue;
+                issue.code = QString::fromUtf8(report->issues[i].code);
+                issue.severity = static_cast<int>(report->issues[i].severity);
+                issue.message = QString::fromUtf8(report->issues[i].message);
+                issue.filePath = QString::fromUtf8(report->issues[i].file_path);
+                issue.lineNumber = report->issues[i].line_number;
+                issue.suggestedFix = QString::fromUtf8(report->issues[i].suggested_fix);
+                m_ctx->issues.append(issue);
+            }
+
+            for (uint32_t i = 0; i < report->repair_count; i++) {
+                AuditRepairEntry repair;
+                repair.transformationId = QString::fromUtf8(report->repairs[i].transformation_id);
+                repair.targetFile = QString::fromUtf8(report->repairs[i].target_file);
+                repair.description = QString::fromUtf8(report->repairs[i].description);
+                m_ctx->repairs.append(repair);
+            }
+        } else {
+            m_ctx->compatTier = WE_TIER_4_BLOCKED;
+            m_ctx->compatScore = 0;
+            m_ctx->estimatedVramMb = 0.0f;
+            m_ctx->estimatedFps = 0;
+            m_ctx->issues.append({QStringLiteral("SCENE_SCAN_FAILED"), WE_ISSUE_SEV_FATAL,
+                                  QStringLiteral("Scene compatibility audit failed."),
+                                  m_ctx->entrypointPipeline, 0,
+                                  QStringLiteral("Verify scene.json and project assets.")});
+        }
+
+        we_compat_report_free(report);
+        we_compat_scanner_destroy(scanner);
+    }
 
     // Update UI Badges
     switch (m_ctx->compatTier) {
@@ -1362,22 +1880,25 @@ void CapabilityAuditPage::runCompatibilityAudit()
         item->setText(3, iss.suggestedFix.isEmpty() ? QStringLiteral("None") : iss.suggestedFix);
     }
 
-    // Auto-select capabilities based on detection
     if (m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE) {
         m_capComputeCheck->setChecked(true);
     }
-    QDir stg(m_ctx->stagingDir);
+    if (detectedAudioUniforms) {
+        m_capAudioSpectrumCheck->setChecked(true);
+    }
     if (stg.exists(QStringLiteral("scripts/main.js"))) {
         m_capScriptingCheck->setChecked(true);
     }
 
-    // Repairs
     if (!m_ctx->repairs.isEmpty()) {
         m_repairsSummaryLabel->setText(
             QStringLiteral("%1 automatic fix(es) available.").arg(m_ctx->repairs.size()));
         m_applyRepairsBtn->setEnabled(true);
     } else {
-        m_repairsSummaryLabel->setText(QStringLiteral("No issues detected."));
+        m_repairsSummaryLabel->setText(
+            m_ctx->issues.isEmpty()
+                ? QStringLiteral("No issues detected.")
+                : QStringLiteral("%1 compatibility note(s) recorded.").arg(m_ctx->issues.size()));
         m_applyRepairsBtn->setEnabled(false);
     }
 
@@ -1386,7 +1907,7 @@ void CapabilityAuditPage::runCompatibilityAudit()
 
 void CapabilityAuditPage::applyAutoRepairs()
 {
-    if (!m_ctx || m_ctx->stagingDir.isEmpty())
+    if (!m_ctx || m_ctx->stagingDir.isEmpty() || !isScenePackageType(m_ctx->projectType))
         return;
 
     we_compat_report_t *report = we_compat_report_alloc();
@@ -1570,57 +2091,107 @@ void CompilationSigningPage::checkOrLoadKey()
         m_keyFingerprintLabel->setText(QStringLiteral(
             "Key file not found. Click 'Generate Keypair' to create a signing key."));
         m_keyFingerprintLabel->setStyleSheet(QStringLiteral("color: #f59e0b;"));
-        m_ctx->authorPrivKey.clear();
+        wipeByteArray(m_ctx->authorPrivKey);
         m_ctx->authorPubKey.clear();
         return;
     }
 
-    QByteArray raw = keyFile.readAll().trimmed();
+    QByteArray raw = keyFile.readAll();
     keyFile.close();
 
-    QByteArray privBytes;
-    if (raw.size() == 64) {
-        privBytes = raw;
-    } else if (raw.size() == 128) {
-        privBytes = QByteArray::fromHex(raw);
+    QByteArray trimmed = raw.trimmed();
+    uint8_t pk[32] = {0};
+    uint8_t sk[64] = {0};
+    bool keyValid = false;
+
+    if (trimmed.size() == 128 && isAsciiHex(trimmed)) {
+        QByteArray decoded = QByteArray::fromHex(trimmed);
+        if (decoded.size() == 64 &&
+            wwpkg_ed25519_seed_keypair(
+                pk, sk, reinterpret_cast<const uint8_t *>(decoded.constData())) == 0) {
+            bool tailZero = true;
+            for (int i = 32; i < 64; ++i) {
+                if (decoded[i] != '\0') {
+                    tailZero = false;
+                    break;
+                }
+            }
+            if (tailZero || memcmp(decoded.constData() + 32, pk, 32) == 0) {
+                keyValid = true;
+            }
+        }
+        wipeByteArray(decoded);
+    } else if (trimmed.size() == 64 && isAsciiHex(trimmed)) {
+        QByteArray seed = QByteArray::fromHex(trimmed);
+        if (seed.size() == 32 &&
+            wwpkg_ed25519_seed_keypair(pk, sk,
+                                       reinterpret_cast<const uint8_t *>(seed.constData())) == 0) {
+            keyValid = true;
+        }
+        wipeByteArray(seed);
+    } else if (raw.size() == 64) {
+        if (wwpkg_ed25519_seed_keypair(pk, sk,
+                                       reinterpret_cast<const uint8_t *>(raw.constData())) == 0) {
+            bool tailZero = true;
+            for (int i = 32; i < 64; ++i) {
+                if (raw[i] != '\0') {
+                    tailZero = false;
+                    break;
+                }
+            }
+            if (tailZero || memcmp(raw.constData() + 32, pk, 32) == 0) {
+                keyValid = true;
+            }
+        }
     } else if (raw.size() == 32) {
-        // Derive from 32-byte seed
-        uint8_t pk[32];
-        uint8_t sk[64];
-        memcpy(sk, raw.constData(), 32);
-        wwpkg_ed25519_keypair(pk, sk);
-        privBytes = QByteArray((const char *)sk, 64);
-    } else if (raw.size() == 64 && raw.indexOf(' ') == -1) {
-        QByteArray seed = QByteArray::fromHex(raw);
-        if (seed.size() == 32) {
-            uint8_t pk[32];
-            uint8_t sk[64];
-            memcpy(sk, seed.constData(), 32);
-            wwpkg_ed25519_keypair(pk, sk);
-            privBytes = QByteArray((const char *)sk, 64);
+        if (wwpkg_ed25519_seed_keypair(pk, sk,
+                                       reinterpret_cast<const uint8_t *>(raw.constData())) == 0) {
+            keyValid = true;
         }
     }
 
-    if (privBytes.size() == 64) {
-        m_ctx->authorPrivKey = privBytes;
-        m_ctx->authorPubKey = privBytes.mid(32, 32);
-        QString pubHex = m_ctx->authorPubKey.toHex();
+    wipeByteArray(raw);
+    wipeByteArray(trimmed);
+
+    if (keyValid) {
+        wipeByteArray(m_ctx->authorPrivKey);
+        m_ctx->authorPrivKey = QByteArray(reinterpret_cast<const char *>(sk), 64);
+        m_ctx->authorPubKey = QByteArray(reinterpret_cast<const char *>(pk), 32);
+        const QString pubHex = QString::fromLatin1(m_ctx->authorPubKey.toHex());
         m_keyFingerprintLabel->setText(QStringLiteral("Public Key: %1").arg(pubHex));
         m_keyFingerprintLabel->setStyleSheet(
             QStringLiteral("font-family: monospace; color: #38bdf8; font-weight: bold;"));
         addPubkeyToTrustedKeys(pubHex);
     } else {
-        m_keyFingerprintLabel->setText(
-            QStringLiteral("Invalid key format. Expected a 64-byte Ed25519 private key."));
+        wipeByteArray(m_ctx->authorPrivKey);
+        m_ctx->authorPubKey.clear();
+        m_keyFingerprintLabel->setText(QStringLiteral(
+            "Invalid key format. Expected a 32-byte seed or 64-byte Ed25519 private key."));
         m_keyFingerprintLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
     }
+
+    explicit_bzero(sk, sizeof(sk));
 }
 
 void CompilationSigningPage::generateKeypair()
 {
-    uint8_t pub[32];
-    uint8_t priv[64];
+    uint8_t pub[32] = {0};
+    uint8_t priv[64] = {0};
     wwpkg_generate_keypair(pub, priv);
+    bool pubNonZero = false;
+    for (uint8_t b : pub) {
+        if (b != 0) {
+            pubNonZero = true;
+            break;
+        }
+    }
+    if (!pubNonZero) {
+        explicit_bzero(priv, sizeof(priv));
+        m_keyFingerprintLabel->setText(
+            QStringLiteral("Failed to generate Ed25519 keypair from OS CSPRNG."));
+        m_keyFingerprintLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
+        return;
+    }
 
     QString keyPath = m_keyPathEdit->text().trimmed();
     if (keyPath.isEmpty()) {
@@ -1629,20 +2200,41 @@ void CompilationSigningPage::generateKeypair()
     }
 
     QFileInfo fi(keyPath);
+    const QString keyDirPath = fi.dir().absolutePath();
     fi.dir().mkpath(QStringLiteral("."));
+    (void)::chmod(keyDirPath.toUtf8().constData(), 0700);
 
-    QFile keyFile(keyPath);
-    if (keyFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        QByteArray hex = QByteArray(reinterpret_cast<const char *>(priv), 64).toHex() + '\n';
-        keyFile.write(hex);
-        keyFile.close();
-        chmod(keyPath.toUtf8().constData(), 0600);
+    const QByteArray keyPathUtf8 = keyPath.toUtf8();
+    const int fd = ::open(keyPathUtf8.constData(),
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        explicit_bzero(priv, sizeof(priv));
+        m_keyFingerprintLabel->setText(QStringLiteral(
+            "Refused or failed to open key path securely (check permissions/symlinks)."));
+        m_keyFingerprintLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
+        return;
     }
 
+    (void)::fchmod(fd, 0600);
+    QByteArray hex = QByteArray(reinterpret_cast<const char *>(priv), 64).toHex() + '\n';
+    const bool wroteOk = writeAllFd(fd, hex.constData(), static_cast<size_t>(hex.size()));
+    wipeByteArray(hex);
+    (void)::close(fd);
+
+    if (!wroteOk) {
+        (void)::unlink(keyPathUtf8.constData());
+        explicit_bzero(priv, sizeof(priv));
+        m_keyFingerprintLabel->setText(QStringLiteral("Failed to write Ed25519 key file."));
+        m_keyFingerprintLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
+        return;
+    }
+
+    wipeByteArray(m_ctx->authorPrivKey);
     m_ctx->authorPrivKey = QByteArray(reinterpret_cast<const char *>(priv), 64);
     m_ctx->authorPubKey = QByteArray(reinterpret_cast<const char *>(pub), 32);
+    explicit_bzero(priv, sizeof(priv));
 
-    QString pubHex = m_ctx->authorPubKey.toHex();
+    const QString pubHex = QString::fromLatin1(m_ctx->authorPubKey.toHex());
     m_keyFingerprintLabel->setText(QStringLiteral("Generated Public Key: %1").arg(pubHex));
     m_keyFingerprintLabel->setStyleSheet(
         QStringLiteral("font-family: monospace; color: #10b981; font-weight: bold;"));
@@ -1668,6 +2260,9 @@ void CompilationSigningPage::compileAndSignPackage()
 
     if (m_ctx->authorPrivKey.size() != 64) {
         generateKeypair();
+        if (m_ctx->authorPrivKey.size() != 64) {
+            return;
+        }
     }
 
     QString outPkg = m_outPkgPathEdit->text().trimmed();
@@ -1692,7 +2287,7 @@ void CompilationSigningPage::compileAndSignPackage()
     wwpkg_manifest_t manifest;
     memset(&manifest, 0, sizeof(manifest));
 
-    strncpy(manifest.schema_version, "wwpkg/v1", sizeof(manifest.schema_version) - 1);
+    strncpy(manifest.schema_version, "wwpkg/v2", sizeof(manifest.schema_version) - 1);
     strncpy(manifest.id, m_ctx->packageId.toUtf8().constData(), sizeof(manifest.id) - 1);
     strncpy(manifest.slug, m_ctx->slug.toUtf8().constData(), sizeof(manifest.slug) - 1);
     strncpy(manifest.name, m_ctx->name.toUtf8().constData(), sizeof(manifest.name) - 1);
@@ -1747,8 +2342,9 @@ void CompilationSigningPage::compileAndSignPackage()
     m_progressBar->setValue(75);
 
     if (!buildOk) {
-        m_logEdit->append(
-            QStringLiteral("[ERROR] Failed to build package via wwpkg_build_package()."));
+        const int errCode = wwpkg_get_last_error(nullptr);
+        m_logEdit->append(QStringLiteral("[ERROR] Failed to build package: %1")
+                              .arg(QString::fromUtf8(wwpkg_error_str(errCode))));
         m_verificationBadge->setText(QStringLiteral("Status: Build Failed"));
         m_verificationBadge->setStyleSheet(QStringLiteral("color: #ef4444; font-weight: bold;"));
         m_progressBar->setValue(0);
@@ -2072,6 +2668,7 @@ void HubPublishingExportPage::installToLocalHub()
     m_ctx->installedToLocalHub = true;
     m_installStatusLabel->setText(QStringLiteral("Installed to %1.").arg(dstPkg));
     m_installStatusLabel->setStyleSheet(QStringLiteral("color: #10b981; font-weight: bold;"));
+    emit packageInstallRequested(dstPkg, QStringLiteral("*"));
 }
 
 void HubPublishingExportPage::openContainingFolder()
@@ -2125,11 +2722,16 @@ CreatorPackagingWizard::CreatorPackagingWizard(QWidget *parent) : QWizard(parent
     setPage(Page_CompilationSigning, m_compilationPage);
     setPage(Page_HubPublishingExport, m_exportPage);
 
+    connect(m_exportPage, &HubPublishingExportPage::packageInstallRequested, this,
+            &CreatorPackagingWizard::packageInstallRequested);
+
     applyStudioTheme();
 }
 
 CreatorPackagingWizard::~CreatorPackagingWizard()
 {
+    wipeByteArray(m_context.authorPrivKey);
+
     // Clean up temporary staging directory if located in QDir::tempPath
     if (!m_context.stagingDir.isEmpty() && m_context.stagingDir.startsWith(QDir::tempPath())) {
         QDir stg(m_context.stagingDir);
