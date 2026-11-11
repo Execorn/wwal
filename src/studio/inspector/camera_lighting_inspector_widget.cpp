@@ -8,11 +8,14 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QPointer>
+#include <QScopedValueRollback>
 #include <QScrollArea>
 #include <QVBoxLayout>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace waywal::studio {
 
@@ -23,67 +26,148 @@ CameraLightingInspectorWidget::CameraLightingInspectorWidget(QWidget *parent) : 
     syncUiFromModel();
 }
 
-void CameraLightingInspectorWidget::resetToDefaults()
+void CameraLightingInspectorWidget::populateDefaults(we_camera3d_t &cam,
+                                                     we_lighting_uniforms_t &lights)
 {
-    we_camera3d_init_default(&m_camera, 1920.0f, 1080.0f);
-    m_camera.parallax_amount[0] = 15.0f;
-    m_camera.parallax_amount[1] = 10.0f;
-    m_camera.parallax_smoothing = 0.15f;
-    m_camera.dof_focal_dist = 5.0f;
-    m_camera.dof_focal_region = 2.0f;
-    m_camera.dof_bokeh_radius_px = 6.0f;
+    std::memset(&cam, 0, sizeof(cam));
+    std::memset(&lights, 0, sizeof(lights));
+
+    we_camera3d_init_default(&cam, 1920.0f, 1080.0f);
+    cam.parallax_amount[0] = 15.0f;
+    cam.parallax_amount[1] = 10.0f;
+    cam.parallax_smoothing = 0.15f;
+    cam.dof_focal_dist = 5.0f;
+    cam.dof_focal_region = 2.0f;
+    cam.dof_bokeh_radius_px = 6.0f;
 
     // Ambient & Sky hemisphere defaults
-    m_lighting.ambient_color_rgb[0] = 0.12f;
-    m_lighting.ambient_color_rgb[1] = 0.14f;
-    m_lighting.ambient_color_rgb[2] = 0.18f;
+    lights.ambient_color_rgb[0] = 0.12f;
+    lights.ambient_color_rgb[1] = 0.14f;
+    lights.ambient_color_rgb[2] = 0.18f;
 
-    m_lighting.sky_color_rgb[0] = 0.25f;
-    m_lighting.sky_color_rgb[1] = 0.35f;
-    m_lighting.sky_color_rgb[2] = 0.50f;
+    lights.sky_color_rgb[0] = 0.25f;
+    lights.sky_color_rgb[1] = 0.35f;
+    lights.sky_color_rgb[2] = 0.50f;
 
-    m_lighting.normal_map_strength = 1.0f;
-    m_lighting.active_light_count = 1;
+    lights.normal_map_strength = 1.0f;
+    lights.active_light_count = 1;
 
     // Default Light 0: Point light
-    m_lighting.lights[0].light_type = WE_LIGHT_POINT;
-    m_lighting.lights[0].position_or_dir[0] = 0.0f;
-    m_lighting.lights[0].position_or_dir[1] = 2.5f;
-    m_lighting.lights[0].position_or_dir[2] = 3.0f;
-    m_lighting.lights[0].color_rgb[0] = 1.0f;
-    m_lighting.lights[0].color_rgb[1] = 0.95f;
-    m_lighting.lights[0].color_rgb[2] = 0.85f;
-    m_lighting.lights[0].intensity = 2.5f;
-    m_lighting.lights[0].attenuation_radius = 20.0f;
-    m_lighting.lights[0].specular_power = 32.0f;
+    lights.lights[0].light_type = WE_LIGHT_POINT;
+    lights.lights[0].position_or_dir[0] = 0.0f;
+    lights.lights[0].position_or_dir[1] = 2.5f;
+    lights.lights[0].position_or_dir[2] = 3.0f;
+    lights.lights[0].color_rgb[0] = 1.0f;
+    lights.lights[0].color_rgb[1] = 0.95f;
+    lights.lights[0].color_rgb[2] = 0.85f;
+    lights.lights[0].intensity = 2.5f;
+    lights.lights[0].attenuation_radius = 20.0f;
+    lights.lights[0].specular_power = 32.0f;
 
     // Lights 1..7: Disabled by default
     for (uint32_t i = 1; i < WE_MAX_SCENE_LIGHTS; ++i) {
-        m_lighting.lights[i].light_type = WE_LIGHT_DISABLED;
-        m_lighting.lights[i].position_or_dir[0] = 0.0f;
-        m_lighting.lights[i].position_or_dir[1] = 1.0f;
-        m_lighting.lights[i].position_or_dir[2] = 0.0f;
-        m_lighting.lights[i].color_rgb[0] = 1.0f;
-        m_lighting.lights[i].color_rgb[1] = 1.0f;
-        m_lighting.lights[i].color_rgb[2] = 1.0f;
-        m_lighting.lights[i].intensity = 1.0f;
-        m_lighting.lights[i].attenuation_radius = 10.0f;
-        m_lighting.lights[i].spot_inner_cos = 0.95f;
-        m_lighting.lights[i].spot_outer_cos = 0.80f;
-        m_lighting.lights[i].spot_dir[0] = 0.0f;
-        m_lighting.lights[i].spot_dir[1] = 0.0f;
-        m_lighting.lights[i].spot_dir[2] = -1.0f;
-        m_lighting.lights[i].tube_length = 2.0f;
-        m_lighting.lights[i].specular_power = 32.0f;
+        lights.lights[i].light_type = WE_LIGHT_DISABLED;
+        lights.lights[i].position_or_dir[0] = 0.0f;
+        lights.lights[i].position_or_dir[1] = 1.0f;
+        lights.lights[i].position_or_dir[2] = 0.0f;
+        lights.lights[i].color_rgb[0] = 1.0f;
+        lights.lights[i].color_rgb[1] = 1.0f;
+        lights.lights[i].color_rgb[2] = 1.0f;
+        lights.lights[i].intensity = 1.0f;
+        lights.lights[i].attenuation_radius = 10.0f;
+        lights.lights[i].spot_inner_cos = 0.95f;
+        lights.lights[i].spot_outer_cos = 0.80f;
+        lights.lights[i].spot_dir[0] = 0.0f;
+        lights.lights[i].spot_dir[1] = 0.0f;
+        lights.lights[i].spot_dir[2] = -1.0f;
+        lights.lights[i].tube_length = 2.0f;
+        lights.lights[i].specular_power = 32.0f;
+    }
+}
+
+void CameraLightingInspectorWidget::sanitizeAndEvaluateCamera(we_camera3d_t &cam)
+{
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(cam.eye_pos[i])) {
+            cam.eye_pos[i] = (i == 2) ? 5.0f : 0.0f;
+        }
+        if (!std::isfinite(cam.target_pos[i])) {
+            cam.target_pos[i] = 0.0f;
+        }
+        if (!std::isfinite(cam.up_vec[i])) {
+            cam.up_vec[i] = (i == 1) ? 1.0f : 0.0f;
+        }
     }
 
+    float fx = cam.target_pos[0] - cam.eye_pos[0];
+    float fy = cam.target_pos[1] - cam.eye_pos[1];
+    float fz = cam.target_pos[2] - cam.eye_pos[2];
+    float flen = std::sqrt(fx * fx + fy * fy + fz * fz);
+    if (!std::isfinite(flen) || flen < 1e-5f) {
+        // Displace target along -Z when eye and target coincide so mat4_look_at remains
+        // non-singular.
+        cam.target_pos[2] = cam.eye_pos[2] - 1.0f;
+        fx = 0.0f;
+        fy = 0.0f;
+        fz = -1.0f;
+        flen = 1.0f;
+    }
+    fx /= flen;
+    fy /= flen;
+    fz /= flen;
+
+    float ulen = std::sqrt(cam.up_vec[0] * cam.up_vec[0] + cam.up_vec[1] * cam.up_vec[1] +
+                           cam.up_vec[2] * cam.up_vec[2]);
+    if (!std::isfinite(ulen) || ulen < 1e-5f) {
+        cam.up_vec[0] = 0.0f;
+        cam.up_vec[1] = 1.0f;
+        cam.up_vec[2] = 0.0f;
+        ulen = 1.0f;
+    }
+
+    const float dotFU =
+        std::fabs((fx * cam.up_vec[0] + fy * cam.up_vec[1] + fz * cam.up_vec[2]) / ulen);
+    if (dotFU > 0.999f) {
+        if (std::fabs(fy) < 0.9f) {
+            cam.up_vec[0] = 0.0f;
+            cam.up_vec[1] = 1.0f;
+            cam.up_vec[2] = 0.0f;
+        } else {
+            cam.up_vec[0] = 0.0f;
+            cam.up_vec[1] = 0.0f;
+            cam.up_vec[2] = (fz >= 0.0f) ? -1.0f : 1.0f;
+        }
+    }
+
+    if (!std::isfinite(cam.fov_y_deg)) {
+        cam.fov_y_deg = 45.0f;
+    }
+    cam.fov_y_deg = std::clamp(cam.fov_y_deg, 1.0f, 179.0f);
+
+    if (!std::isfinite(cam.near_z) || cam.near_z < 0.001f) {
+        cam.near_z = 0.01f;
+    }
+    if (!std::isfinite(cam.far_z) || cam.far_z <= cam.near_z + 0.01f) {
+        cam.far_z = cam.near_z + 100.0f;
+    }
+
+    we_camera3d_evaluate(&cam, 0.0, 0.0f, 0.0f, 16.0f / 9.0f);
+}
+
+void CameraLightingInspectorWidget::resetToDefaults()
+{
+    populateDefaults(m_camera, m_lighting);
     m_selectedLightSlot = 0;
+    if (m_projModeCombo) {
+        syncUiFromModel();
+    }
 }
 
 void CameraLightingInspectorWidget::setCameraAndLights(const we_camera3d_t &cam,
                                                        const we_lighting_uniforms_t &lights)
 {
     m_camera = cam;
+    sanitizeAndEvaluateCamera(m_camera);
     m_lighting = lights;
     syncUiFromModel();
 }
@@ -95,33 +179,36 @@ bool CameraLightingInspectorWidget::addCameraKeyframe(float timeSec)
         return false;
     }
 
+    we_camera3d_t newCam = m_camera;
+
     we_camera_kf_t kf{};
     kf.time_sec = timeSec;
-    kf.position[0] = m_camera.eye_pos[0];
-    kf.position[1] = m_camera.eye_pos[1];
-    kf.position[2] = m_camera.eye_pos[2];
+    kf.position[0] = newCam.eye_pos[0];
+    kf.position[1] = newCam.eye_pos[1];
+    kf.position[2] = newCam.eye_pos[2];
     quat_identity(kf.orientation_quat);
-    kf.fov_deg = m_camera.fov_y_deg;
-    kf.focal_distance = m_camera.dof_focal_dist;
+    kf.fov_deg = newCam.fov_y_deg;
+    kf.focal_distance = newCam.dof_focal_dist;
     kf.aperture_fstop = 2.8f;
     kf.tension = 0.5f;
 
     // Insert sorted by time_sec
-    uint32_t insertIdx = m_camera.keyframe_count;
-    for (uint32_t i = 0; i < m_camera.keyframe_count; ++i) {
-        if (m_camera.keyframes[i].time_sec > timeSec) {
+    uint32_t insertIdx = newCam.keyframe_count;
+    for (uint32_t i = 0; i < newCam.keyframe_count; ++i) {
+        if (newCam.keyframes[i].time_sec > timeSec) {
             insertIdx = i;
             break;
         }
     }
 
-    for (uint32_t i = m_camera.keyframe_count; i > insertIdx; --i) {
-        m_camera.keyframes[i] = m_camera.keyframes[i - 1];
+    for (uint32_t i = newCam.keyframe_count; i > insertIdx; --i) {
+        newCam.keyframes[i] = newCam.keyframes[i - 1];
     }
-    m_camera.keyframes[insertIdx] = kf;
-    ++m_camera.keyframe_count;
+    newCam.keyframes[insertIdx] = kf;
+    ++newCam.keyframe_count;
+    sanitizeAndEvaluateCamera(newCam);
 
-    commitChange(m_camera, m_lighting);
+    commitChange(newCam, m_lighting);
     emit statusMessage(QStringLiteral("Added camera keyframe at %1 s").arg(timeSec, 0, 'f', 2));
     return true;
 }
@@ -132,12 +219,14 @@ bool CameraLightingInspectorWidget::removeCameraKeyframe(uint32_t index)
         return false;
     }
 
-    for (uint32_t i = index; i + 1 < m_camera.keyframe_count; ++i) {
-        m_camera.keyframes[i] = m_camera.keyframes[i + 1];
+    we_camera3d_t newCam = m_camera;
+    for (uint32_t i = index; i + 1 < newCam.keyframe_count; ++i) {
+        newCam.keyframes[i] = newCam.keyframes[i + 1];
     }
-    --m_camera.keyframe_count;
+    --newCam.keyframe_count;
+    sanitizeAndEvaluateCamera(newCam);
 
-    commitChange(m_camera, m_lighting);
+    commitChange(newCam, m_lighting);
     emit statusMessage(QStringLiteral("Removed camera keyframe #%1").arg(index));
     return true;
 }
@@ -149,9 +238,8 @@ void CameraLightingInspectorWidget::setSelectedLightSlot(uint32_t slotIndex)
     }
     m_selectedLightSlot = slotIndex;
     if (m_lightSlotCombo && m_lightSlotCombo->currentIndex() != static_cast<int>(slotIndex)) {
-        m_updatingUi = true;
+        const QScopedValueRollback<bool> guard(m_updatingUi, true);
         m_lightSlotCombo->setCurrentIndex(static_cast<int>(slotIndex));
-        m_updatingUi = false;
     }
     syncLightUiFromSlot(slotIndex);
 }
@@ -166,16 +254,20 @@ void CameraLightingInspectorWidget::commitChange(const we_camera3d_t &newCam,
     if (m_commandBus) {
         we_camera3d_t oldCam = m_camera;
         we_lighting_uniforms_t oldLights = m_lighting;
+        QPointer<CameraLightingInspectorWidget> self(this);
         auto cmd = std::make_unique<SetCamera3DCommand>(
             m_targetOutput, oldCam, newCam, oldLights, newLights,
-            [this](const QString &output, const we_camera3d_t &c, const we_lighting_uniforms_t &l) {
-                m_camera = c;
-                m_lighting = l;
-                syncUiFromModel();
-                sendIpcUpdate(output, c, l);
-                emit cameraOrLightsChanged(output, c, l);
-                emit camera3DChanged(output, c);
-                emit lightingChanged(output, l);
+            [self](const QString &output, const we_camera3d_t &c, const we_lighting_uniforms_t &l) {
+                if (!self) {
+                    return;
+                }
+                self->m_camera = c;
+                self->m_lighting = l;
+                self->syncUiFromModel();
+                self->sendIpcUpdate(output, c, l);
+                emit self->cameraOrLightsChanged(output, c, l);
+                emit self->camera3DChanged(output, c);
+                emit self->lightingChanged(output, l);
             });
         m_commandBus->execute(std::move(cmd));
     } else {
@@ -634,15 +726,19 @@ void CameraLightingInspectorWidget::setupUi()
             &CameraLightingInspectorWidget::onPickSkyColor);
 
     connect(m_resetBtn, &QPushButton::clicked, this, [this]() {
-        resetToDefaults();
-        commitChange(m_camera, m_lighting);
+        we_camera3d_t newCam{};
+        we_lighting_uniforms_t newLights{};
+        populateDefaults(newCam, newLights);
+        m_selectedLightSlot = 0;
+        commitChange(newCam, newLights);
         emit statusMessage(tr("Camera & lighting reset to defaults."));
     });
 }
 
 void CameraLightingInspectorWidget::syncUiFromModel()
 {
-    m_updatingUi = true;
+    // Preserve outer m_updatingUi when nested helper syncs return.
+    const QScopedValueRollback<bool> guard(m_updatingUi, true);
 
     // Camera
     m_projModeCombo->setCurrentIndex(static_cast<int>(m_camera.projection_mode));
@@ -706,8 +802,6 @@ void CameraLightingInspectorWidget::syncUiFromModel()
     // Ambient & Normal
     m_normalMapStrengthSpin->setValue(m_lighting.normal_map_strength);
     updateColorButtonSwatches();
-
-    m_updatingUi = false;
 }
 
 void CameraLightingInspectorWidget::syncLightUiFromSlot(uint32_t slot)
@@ -717,7 +811,7 @@ void CameraLightingInspectorWidget::syncLightUiFromSlot(uint32_t slot)
     }
 
     const auto &l = m_lighting.lights[slot];
-    m_updatingUi = true;
+    const QScopedValueRollback<bool> guard(m_updatingUi, true);
     m_lightTypeCombo->setCurrentIndex(static_cast<int>(l.light_type));
     m_lightIntensitySpin->setValue(l.intensity);
     m_lightRadiusSpin->setValue(l.attenuation_radius);
@@ -735,7 +829,6 @@ void CameraLightingInspectorWidget::syncLightUiFromSlot(uint32_t slot)
     m_spotOuterSpin->setValue(l.spot_outer_cos);
     m_tubeLengthSpin->setValue(l.tube_length);
 
-    m_updatingUi = false;
     updateColorButtonSwatches();
 }
 
@@ -823,7 +916,7 @@ void CameraLightingInspectorWidget::onCameraControlChanged()
     newCam.path_enabled = m_pathEnableCheck->isChecked() ? 1u : 0u;
     newCam.path_loop_mode = static_cast<uint32_t>(m_loopModeCombo->currentIndex());
 
-    we_camera3d_evaluate(&newCam, 0.0, 0.0f, 0.0f, 16.0f / 9.0f);
+    sanitizeAndEvaluateCamera(newCam);
     commitChange(newCam, m_lighting);
 }
 
@@ -883,6 +976,7 @@ void CameraLightingInspectorWidget::onClearKeyframesClicked()
 
     we_camera3d_t newCam = m_camera;
     newCam.keyframe_count = 0;
+    sanitizeAndEvaluateCamera(newCam);
     commitChange(newCam, m_lighting);
     emit statusMessage(tr("All camera keyframes cleared."));
 }

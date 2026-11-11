@@ -16,7 +16,10 @@
 #include "studio/dock/openhub_browser_widget.hpp"
 #include "studio/dock/workshop_browser_widget.hpp"
 #include "studio/wizard/creator_packaging_wizard.hpp"
+#include "studio/graph/effect_library_browser_widget.hpp"
+#include "studio/graph/node_graph_editor_widget.hpp"
 #include "studio/inspector/oklch_color_dialog.hpp"
+#include "studio/inspector/property_inspector_widget.hpp"
 #include "studio/theme/theme_studio_widget.hpp"
 #include "studio/topology/monitor_topology_canvas.hpp"
 
@@ -25,12 +28,15 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QGroupBox>
+#include <QImage>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
 #include <QMouseEvent>
 #include <QPushButton>
 #include <QTabBar>
+#include <QTemporaryDir>
+#include <QWheelEvent>
 #include <QWidget>
 #include <QFile>
 #include <QFileInfo>
@@ -612,6 +618,119 @@ static void test_studio_ui_ergonomics_and_zero_emoji()
               << std::endl;
 }
 
+static void test_property_inspector_oklch_and_topology_zoom()
+{
+    std::cout << "[Inspector] Testing PropertyInspector Undo/Redo, OkLCH Swatch Reset & Topology "
+                 "Zoom..."
+              << std::endl;
+
+    QTemporaryDir tempXdg;
+    assert(tempXdg.isValid());
+    const QByteArray prevXdg = qgetenv("XDG_CONFIG_HOME");
+    qputenv("XDG_CONFIG_HOME", tempXdg.path().toUtf8());
+
+    {
+        CommandBus bus;
+        PropertyInspectorWidget inspector;
+        inspector.setCommandBus(&bus);
+
+        QString savedPath;
+        QObject::connect(
+            &inspector, &PropertyInspectorWidget::presetSaved,
+            [&savedPath](const QString &, const QString &filePath) { savedPath = filePath; });
+        assert(inspector.savePreset(QStringLiteral("unit_check")));
+        assert(savedPath.contains(QStringLiteral("/wwal/presets/")));
+        assert(QFileInfo::exists(savedPath));
+
+        PropertyRowWidget *speedRow = inspector.propertyRow(QStringLiteral("u_speed"));
+        assert(speedRow != nullptr);
+        const std::vector<float> origVals = inspector.propertyValues(QStringLiteral("u_speed"));
+        assert(!origVals.empty() && std::fabs(origVals[0] - 1.0f) < 1e-4f);
+
+        speedRow->updateValues({2.5f});
+        assert(std::fabs(inspector.propertyValues(QStringLiteral("u_speed"))[0] - 2.5f) < 1e-4f);
+        assert(bus.undoCount() == 1);
+
+        bus.undo();
+        assert(std::fabs(inspector.propertyValues(QStringLiteral("u_speed"))[0] - 1.0f) < 1e-4f);
+        assert(std::fabs(speedRow->property().currentValues[0] - 1.0f) < 1e-4f);
+        assert(bus.canRedo());
+
+        bus.redo();
+        assert(std::fabs(inspector.propertyValues(QStringLiteral("u_speed"))[0] - 2.5f) < 1e-4f);
+        assert(std::fabs(speedRow->property().currentValues[0] - 2.5f) < 1e-4f);
+    }
+
+    if (prevXdg.isEmpty()) {
+        qunsetenv("XDG_CONFIG_HOME");
+    } else {
+        qputenv("XDG_CONFIG_HOME", prevXdg);
+    }
+
+    {
+        StudioOptions opts;
+        opts.headlessCheck = true;
+        MainWindow mainWin(opts);
+        auto *browser = mainWin.effectLibraryBrowser();
+        auto *graphEd = mainWin.nodeGraphEditor();
+        assert(browser != nullptr && graphEd != nullptr);
+        const uint32_t countBefore = graphEd->graph().node_count;
+        QMetaObject::invokeMethod(browser, "onAddToGraphClicked", Qt::DirectConnection);
+        assert(graphEd->graph().node_count == countBefore + 1);
+    }
+
+    {
+        const QColor initCol(220, 60, 80);
+        OklchColorDialog dlg(initCol);
+        const QColor expectedReset = dlg.currentColor();
+        dlg.setCurrentColor(QColor(40, 200, 120));
+        assert(dlg.currentColor() != expectedReset);
+
+        auto *initialSwatch = dlg.findChild<QWidget *>(QStringLiteral("oklchSwatchInitial"));
+        assert(initialSwatch != nullptr);
+        QMouseEvent press(QEvent::MouseButtonPress, QPointF(6.0, 6.0), QPointF(6.0, 6.0),
+                          Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(initialSwatch, &press);
+        assert(dlg.currentColor() == expectedReset);
+    }
+
+    {
+        MonitorTopologyCanvas canvas;
+        canvas.resize(640, 320);
+        QJsonObject root;
+        QJsonArray outputs;
+        QJsonObject m1;
+        m1[QStringLiteral("name")] = QStringLiteral("DP-1");
+        m1[QStringLiteral("x")] = 0;
+        m1[QStringLiteral("y")] = 0;
+        m1[QStringLiteral("width")] = 1920;
+        m1[QStringLiteral("height")] = 1080;
+        m1[QStringLiteral("scale")] = 1.0;
+        m1[QStringLiteral("refresh")] = 60000;
+        outputs.append(m1);
+        root[QStringLiteral("outputs")] = outputs;
+        canvas.updateOutputsFromJson(root);
+
+        QImage imgBefore(640, 320, QImage::Format_ARGB32_Premultiplied);
+        imgBefore.fill(Qt::transparent);
+        canvas.render(&imgBefore);
+
+        QWheelEvent wheelOut(QPointF(320.0, 160.0), QPointF(320.0, 160.0), QPoint(0, 0),
+                             QPoint(0, -480), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase,
+                             false);
+        QApplication::sendEvent(&canvas, &wheelOut);
+
+        QImage imgAfter(640, 320, QImage::Format_ARGB32_Premultiplied);
+        imgAfter.fill(Qt::transparent);
+        canvas.render(&imgAfter);
+        assert(imgAfter != imgBefore);
+    }
+
+    std::cout << "  -> PropertyInspector Undo/Redo, /wwal/presets path, OkLCH swatch reset & "
+                 "MonitorTopologyCanvas zoom verified."
+              << std::endl;
+}
+
 int main(int argc, char *argv[])
 {
     qputenv("QT_QPA_PLATFORM", "offscreen");
@@ -628,6 +747,7 @@ int main(int argc, char *argv[])
     test_dock_layout_manager_roundtrip();
     test_monitor_topology_span_math();
     test_studio_ui_ergonomics_and_zero_emoji();
+    test_property_inspector_oklch_and_topology_zoom();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  >>> STUDIO COMMAND & DOCK SUITE PASSED CLEANLY (100%) <<<" << std::endl;

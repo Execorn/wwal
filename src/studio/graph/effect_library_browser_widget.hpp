@@ -63,8 +63,6 @@ class EffectLibraryBrowserWidget : public QWidget {
 
 namespace wwal::studio {
 using EffectLibraryBrowserWidget = waywal::studio::EffectLibraryBrowserWidget;
-}
-
-using waywal::studio::EffectLibraryBrowserWidget;
+} // namespace wwal::studio
 
 #endif // WAYWAL_STUDIO_GRAPH_EFFECT_LIBRARY_BROWSER_WIDGET_HPP

@@ -386,6 +386,9 @@ class OklchColorDialog : public QDialog {
     void colorChanged(const QColor &color);
     void oklchChanged(float l, float c, float h);
 
+  protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
   private slots:
     void onWheelOklchChanged(float l, float c, float h);
     void onWheelHsvChanged(float h, float s, float v);

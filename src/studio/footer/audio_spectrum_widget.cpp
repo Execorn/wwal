@@ -83,7 +83,17 @@ AudioSpectrumWidget::AudioSpectrumWidget(QWidget *parent) : QWidget(parent)
     // 60 FPS physics and rendering timer
     connect(&m_physicsTimer, &QTimer::timeout, this, &AudioSpectrumWidget::onPhysicsTick);
     m_elapsedTimer.start();
-    m_physicsTimer.start(16); // ~60 Hz
+    if (isVisible()) {
+        m_physicsTimer.start(16);
+    }
+}
+
+void AudioSpectrumWidget::wakePhysicsTimer()
+{
+    if (isVisible() && !m_physicsTimer.isActive()) {
+        m_elapsedTimer.restart();
+        m_physicsTimer.start(16);
+    }
 }
 
 void AudioSpectrumWidget::setupUi()
@@ -249,6 +259,8 @@ void AudioSpectrumWidget::updateAudioData(const float bands[NumBands], float rms
                 "border-radius: 4px; font-family: monospace; font-size: 9px; padding: 2px; }");
         }
     }
+
+    wakePhysicsTimer();
 }
 
 void AudioSpectrumWidget::setSensitivityGain(float gain)
@@ -266,6 +278,7 @@ void AudioSpectrumWidget::setSensitivityGain(float gain)
             std::snprintf(buf, sizeof(buf), "%.1fx", gain);
             m_gainValueLabel->setText(buf);
         }
+        wakePhysicsTimer();
         Q_EMIT sensitivityGainChanged(m_sensitivityGain);
     }
 }
@@ -292,6 +305,7 @@ void AudioSpectrumWidget::onGainSliderChanged(int value)
             std::snprintf(buf, sizeof(buf), "%.1fx", newGain);
             m_gainValueLabel->setText(buf);
         }
+        wakePhysicsTimer();
         Q_EMIT sensitivityGainChanged(m_sensitivityGain);
     }
 }
@@ -313,6 +327,18 @@ void AudioSpectrumWidget::onPhysicsTick()
 
     stepPhysics(dt);
     update();
+
+    float maxEnergy =
+        std::max({m_currentRms, clampf(m_targetRms * m_sensitivityGain, 0.0f, 1.0f), m_peakRms,
+                  m_beatGlowIntensity, m_currentBeatPulse, m_targetBeatPulse});
+    for (size_t i = 0; i < NumBands; ++i) {
+        maxEnergy = std::max(maxEnergy, m_currentBands[i]);
+        maxEnergy = std::max(maxEnergy, clampf(m_targetBands[i] * m_sensitivityGain, 0.0f, 1.0f));
+        maxEnergy = std::max(maxEnergy, m_peakCaps[i]);
+    }
+    if (maxEnergy < 1e-4f) {
+        m_physicsTimer.stop();
+    }
 }
 
 void AudioSpectrumWidget::stepPhysics(float dt)
@@ -388,36 +414,44 @@ void AudioSpectrumWidget::stepPhysics(float dt)
         m_beatOnset = false;
     }
 
-    // Update beat badge style
     if (m_beatBadge) {
-        if (m_beatGlowIntensity > 0.15f || m_currentBeatPulse > 0.4f) {
-            int alpha = static_cast<int>(
-                clampf(std::max(m_beatGlowIntensity, m_currentBeatPulse), 0.0f, 1.0f) * 255.0f);
-            char styleBuf[256];
-            std::snprintf(styleBuf, sizeof(styleBuf),
-                          "QLabel {"
-                          "  background-color: rgba(236, 72, 153, %d);"
-                          "  color: #ffffff;"
-                          "  border: 1px solid #f472b6;"
-                          "  border-radius: 4px;"
-                          "  font-family: monospace;"
-                          "  font-size: 9px;"
-                          "  font-weight: bold;"
-                          "  padding: 2px;"
-                          "}",
-                          std::min(alpha, 220));
-            m_beatBadge->setStyleSheet(styleBuf);
-        } else {
-            m_beatBadge->setStyleSheet("QLabel {"
-                                       "  background-color: #1a1e29;"
-                                       "  color: #64748b;"
-                                       "  border: 1px solid #334155;"
-                                       "  border-radius: 4px;"
-                                       "  font-family: monospace;"
-                                       "  font-size: 9px;"
-                                       "  font-weight: bold;"
-                                       "  padding: 2px;"
-                                       "}");
+        const bool active = (m_beatGlowIntensity > 0.15f || m_currentBeatPulse > 0.4f);
+        const int rawAlpha =
+            active ? std::min(220, static_cast<int>(
+                                       clampf(std::max(m_beatGlowIntensity, m_currentBeatPulse),
+                                              0.0f, 1.0f) *
+                                       255.0f))
+                   : 0;
+        const int bucket = active ? std::max(1, (rawAlpha + 7) / 8) : 0;
+        if (bucket != m_lastBeatAlphaBucket) {
+            m_lastBeatAlphaBucket = bucket;
+            if (active) {
+                char styleBuf[256];
+                std::snprintf(styleBuf, sizeof(styleBuf),
+                              "QLabel {"
+                              "  background-color: rgba(236, 72, 153, %d);"
+                              "  color: #ffffff;"
+                              "  border: 1px solid #f472b6;"
+                              "  border-radius: 4px;"
+                              "  font-family: monospace;"
+                              "  font-size: 9px;"
+                              "  font-weight: bold;"
+                              "  padding: 2px;"
+                              "}",
+                              std::min(220, bucket * 8));
+                m_beatBadge->setStyleSheet(styleBuf);
+            } else {
+                m_beatBadge->setStyleSheet("QLabel {"
+                                           "  background-color: #1a1e29;"
+                                           "  color: #64748b;"
+                                           "  border: 1px solid #334155;"
+                                           "  border-radius: 4px;"
+                                           "  font-family: monospace;"
+                                           "  font-size: 9px;"
+                                           "  font-weight: bold;"
+                                           "  padding: 2px;"
+                                           "}");
+            }
         }
     }
 }
@@ -643,6 +677,18 @@ void AudioSpectrumWidget::resizeEvent(QResizeEvent *event)
         m_gainLabel->setVisible(wide);
     if (m_gainValueLabel)
         m_gainValueLabel->setVisible(wide);
+}
+
+void AudioSpectrumWidget::showEvent(QShowEvent *event)
+{
+    QWidget::showEvent(event);
+    wakePhysicsTimer();
+}
+
+void AudioSpectrumWidget::hideEvent(QHideEvent *event)
+{
+    m_physicsTimer.stop();
+    QWidget::hideEvent(event);
 }
 
 } // namespace wwal::studio

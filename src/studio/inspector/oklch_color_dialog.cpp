@@ -493,13 +493,18 @@ void OklchColorDialog::setupUi()
     auto *swatchGroup = new QGroupBox(tr("Color Comparison"), this);
     auto *swatchLayout = new QHBoxLayout(swatchGroup);
     m_swatchCurrent = new QWidget(swatchGroup);
+    m_swatchCurrent->setObjectName(QStringLiteral("oklchSwatchCurrent"));
+    m_swatchCurrent->setAttribute(Qt::WA_StyledBackground, true);
     m_swatchCurrent->setFixedHeight(48);
     m_swatchCurrent->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     m_swatchInitial = new QWidget(swatchGroup);
+    m_swatchInitial->setObjectName(QStringLiteral("oklchSwatchInitial"));
+    m_swatchInitial->setAttribute(Qt::WA_StyledBackground, true);
     m_swatchInitial->setFixedHeight(48);
     m_swatchInitial->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     m_swatchInitial->setToolTip(tr("Click to restore initial color"));
     m_swatchInitial->setCursor(Qt::PointingHandCursor);
+    m_swatchInitial->installEventFilter(this);
 
     auto *btnRestore = new QToolButton(swatchGroup);
     btnRestore->setText(tr("Reset"));
@@ -720,7 +725,19 @@ QColor OklchColorDialog::getColor(const QColor &initial, QWidget *parent, const 
     if (dlg.exec() == QDialog::Accepted) {
         return dlg.currentColor();
     }
-    return initial;
+    return QColor();
+}
+
+bool OklchColorDialog::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_swatchInitial && event->type() == QEvent::MouseButtonPress) {
+        auto *me = static_cast<QMouseEvent *>(event);
+        if (me->button() == Qt::LeftButton) {
+            onResetToInitialClicked();
+            return true;
+        }
+    }
+    return QDialog::eventFilter(watched, event);
 }
 
 void OklchColorDialog::updatePreviewSwatches()

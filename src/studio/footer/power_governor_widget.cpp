@@ -198,9 +198,11 @@ void PowerGovernorWidget::updateFromTelemetry(const waywal_telemetry_snapshot_t 
         }
     }
 
+    const bool pauseMaskChanged = (m_globalPauseMask != snapshot.global_pause_mask);
     m_globalPauseMask = snapshot.global_pause_mask;
 
-    if (onBatteryChanged || true) {
+    if (onBatteryChanged || pauseMaskChanged || m_firstTelemetrySync) {
+        m_firstTelemetrySync = false;
         updateStatusBadges();
     }
 }

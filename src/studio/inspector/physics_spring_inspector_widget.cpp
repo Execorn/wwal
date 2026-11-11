@@ -6,8 +6,11 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QPointer>
 #include <QQueue>
+#include <QScopedValueRollback>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QSplitter>
 #include <QVBoxLayout>
@@ -218,6 +221,12 @@ void PhysicsSpringInspectorWidget::setupUi()
             QStringLiteral("QDoubleSpinBox { background-color: #181825; color: #cdd6f4; border: "
                            "1px solid #313244; border-radius: 3px; padding: 1px 3px; }"));
 
+        if (maxVal > minVal) {
+            const int initPos = static_cast<int>(
+                std::round(((spinOut->value() - minVal) / (maxVal - minVal)) * 1000.0));
+            slider->setValue(std::clamp(initPos, 0, 1000));
+        }
+
         connect(slider, &QSlider::valueChanged, this, [this, spinOut, minVal, maxVal](int val) {
             if (m_updatingUi)
                 return;
@@ -227,14 +236,15 @@ void PhysicsSpringInspectorWidget::setupUi()
 
         connect(spinOut, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
                 [this, slider, minVal, maxVal](double val) {
-                    if (!m_updatingUi && maxVal > minVal) {
-                        int sPos = static_cast<int>(
+                    if (maxVal > minVal) {
+                        const int sPos = static_cast<int>(
                             std::round(((val - minVal) / (maxVal - minVal)) * 1000.0));
-                        slider->blockSignals(true);
+                        const QSignalBlocker blocker(slider);
                         slider->setValue(std::clamp(sPos, 0, 1000));
-                        slider->blockSignals(false);
                     }
-                    onBoneConfigControlChanged();
+                    if (!m_updatingUi) {
+                        onBoneConfigControlChanged();
+                    }
                 });
 
         springLayout->addWidget(lbl, row, 0);
@@ -318,6 +328,12 @@ void PhysicsSpringInspectorWidget::setupUi()
             QStringLiteral("QDoubleSpinBox { background-color: #181825; color: #cdd6f4; border: "
                            "1px solid #313244; border-radius: 3px; padding: 1px 3px; }"));
 
+        if (maxVal > minVal) {
+            const int initPos = static_cast<int>(
+                std::round(((spinOut->value() - minVal) / (maxVal - minVal)) * 1000.0));
+            slider->setValue(std::clamp(initPos, 0, 1000));
+        }
+
         connect(slider, &QSlider::valueChanged, this, [this, spinOut, minVal, maxVal](int val) {
             if (m_updatingUi)
                 return;
@@ -327,14 +343,15 @@ void PhysicsSpringInspectorWidget::setupUi()
 
         connect(spinOut, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
                 [this, slider, minVal, maxVal](double val) {
-                    if (!m_updatingUi && maxVal > minVal) {
-                        int sPos = static_cast<int>(
+                    if (maxVal > minVal) {
+                        const int sPos = static_cast<int>(
                             std::round(((val - minVal) / (maxVal - minVal)) * 1000.0));
-                        slider->blockSignals(true);
+                        const QSignalBlocker blocker(slider);
                         slider->setValue(std::clamp(sPos, 0, 1000));
-                        slider->blockSignals(false);
                     }
-                    onWindControlChanged();
+                    if (!m_updatingUi) {
+                        onWindControlChanged();
+                    }
                 });
 
         windLayout->addWidget(lbl, wrow, 0);
@@ -398,6 +415,12 @@ void PhysicsSpringInspectorWidget::setupUi()
             QStringLiteral("QDoubleSpinBox { background-color: #181825; color: #cdd6f4; border: "
                            "1px solid #313244; border-radius: 3px; padding: 1px 3px; }"));
 
+        if (maxVal > minVal) {
+            const int initPos = static_cast<int>(
+                std::round(((spinOut->value() - minVal) / (maxVal - minVal)) * 1000.0));
+            slider->setValue(std::clamp(initPos, 0, 1000));
+        }
+
         connect(slider, &QSlider::valueChanged, this, [this, spinOut, minVal, maxVal](int val) {
             if (m_updatingUi)
                 return;
@@ -407,14 +430,15 @@ void PhysicsSpringInspectorWidget::setupUi()
 
         connect(spinOut, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
                 [this, slider, minVal, maxVal](double val) {
-                    if (!m_updatingUi && maxVal > minVal) {
-                        int sPos = static_cast<int>(
+                    if (maxVal > minVal) {
+                        const int sPos = static_cast<int>(
                             std::round(((val - minVal) / (maxVal - minVal)) * 1000.0));
-                        slider->blockSignals(true);
+                        const QSignalBlocker blocker(slider);
                         slider->setValue(std::clamp(sPos, 0, 1000));
-                        slider->blockSignals(false);
                     }
-                    onCursorControlChanged();
+                    if (!m_updatingUi) {
+                        onCursorControlChanged();
+                    }
                 });
 
         cursorLayout->addWidget(lbl, crow, 0);
@@ -462,7 +486,7 @@ void PhysicsSpringInspectorWidget::loadPuppetSkeleton(const we_puppet_t *puppet,
 {
     m_objectId = sceneObjectId;
 
-    if (!puppet) {
+    if (!puppet || puppet->bone_count == 0 || !puppet->bones) {
         m_boneNames.clear();
         m_boneParents.clear();
         m_selectedBoneIndex = 0;
@@ -545,6 +569,7 @@ void PhysicsSpringInspectorWidget::populateBoneList(const we_puppet_t *puppet)
         items[i] = item;
     }
 
+    std::vector<int32_t> assignedParent(boneCount, -1);
     for (uint32_t i = 0; i < boneCount; ++i) {
         int32_t parent = -1;
         if (puppet) {
@@ -555,8 +580,20 @@ void PhysicsSpringInspectorWidget::populateBoneList(const we_puppet_t *puppet)
             parent = m_boneParents[i];
         }
 
-        if (parent >= 0 && static_cast<uint32_t>(parent) < boneCount && items[parent]) {
+        bool validParent = (parent >= 0 && static_cast<uint32_t>(parent) < boneCount &&
+                            parent != static_cast<int32_t>(i) && items[parent] != nullptr);
+        if (validParent) {
+            for (int32_t anc = parent; anc >= 0; anc = assignedParent[static_cast<size_t>(anc)]) {
+                if (anc == static_cast<int32_t>(i)) {
+                    validParent = false;
+                    break;
+                }
+            }
+        }
+
+        if (validParent) {
             items[parent]->addChild(items[i]);
+            assignedParent[i] = parent;
         } else {
             m_boneTree->addTopLevelItem(items[i]);
         }
@@ -594,16 +631,40 @@ void PhysicsSpringInspectorWidget::selectBoneIndex(int32_t boneIndex)
 
 const we_bone_sim_config_t &PhysicsSpringInspectorWidget::currentBoneConfig() const noexcept
 {
-    if (m_selectedBoneIndex >= 0 && m_selectedBoneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
-        return m_ctx.configs[m_selectedBoneIndex];
+    return boneConfig(m_selectedBoneIndex);
+}
+
+const we_bone_sim_config_t &
+PhysicsSpringInspectorWidget::boneConfig(int32_t boneIndex) const noexcept
+{
+    if (boneIndex >= 0 && boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+        return m_ctx.configs[boneIndex];
     }
     static const we_bone_sim_config_t s_default{};
     return s_default;
 }
 
+void PhysicsSpringInspectorWidget::refreshBoneTreeStates()
+{
+    if (!m_boneTree) {
+        return;
+    }
+    QTreeWidgetItemIterator it(m_boneTree);
+    while (*it) {
+        const int bIdx = (*it)->data(0, Qt::UserRole).toInt();
+        if (bIdx >= 0 && bIdx < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+            const bool enabled = (m_ctx.configs[bIdx].flags & WE_BONE_PHYS_ENABLED) != 0;
+            (*it)->setText(1, enabled ? QStringLiteral("XPBD Active") : QStringLiteral("Rigid"));
+            (*it)->setForeground(1, enabled ? QBrush(QColor(0xa6, 0xe3, 0xa1))
+                                            : QBrush(QColor(0x93, 0x99, 0xb2)));
+        }
+        ++it;
+    }
+}
+
 void PhysicsSpringInspectorWidget::syncUiFromSelectedBone()
 {
-    m_updatingUi = true;
+    const QScopedValueRollback<bool> guard(m_updatingUi, true);
 
     if (m_selectedBoneIndex >= 0 && m_selectedBoneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
         const we_bone_sim_config_t &cfg = m_ctx.configs[m_selectedBoneIndex];
@@ -679,8 +740,6 @@ void PhysicsSpringInspectorWidget::syncUiFromSelectedBone()
     if (m_cursorFalloffSpin) {
         m_cursorFalloffSpin->setValue(m_ctx.cursor.falloff_power);
     }
-
-    m_updatingUi = false;
 }
 
 /* ========================================================================= */
@@ -842,43 +901,114 @@ void PhysicsSpringInspectorWidget::onApplyPresetToDescendantsClicked()
     if (m_selectedBoneIndex < 0 || m_selectedBoneIndex >= static_cast<int32_t>(WE_MDL_MAX_BONES)) {
         return;
     }
-    if (m_boneParents.empty()) {
+    const size_t boneLimit = std::min<size_t>(m_boneParents.size(), WE_MDL_MAX_BONES);
+    if (boneLimit == 0 || static_cast<size_t>(m_selectedBoneIndex) >= boneLimit) {
         return;
     }
 
-    const we_bone_sim_config_t &srcCfg = m_ctx.configs[m_selectedBoneIndex];
+    const we_bone_sim_config_t srcCfg = m_ctx.configs[m_selectedBoneIndex];
+
+    struct BoneConfigDelta {
+        int32_t boneIndex{0};
+        we_bone_sim_config_t oldCfg{};
+        we_bone_sim_config_t newCfg{};
+    };
+    std::vector<BoneConfigDelta> deltas;
+
+    // Track visited bones so malformed cyclic skeletons terminate in O(N).
+    std::vector<uint8_t> visited(boneLimit, 0);
+    visited[static_cast<size_t>(m_selectedBoneIndex)] = 1;
 
     QQueue<int32_t> queue;
     queue.enqueue(m_selectedBoneIndex);
 
     while (!queue.isEmpty()) {
-        int32_t parent = queue.dequeue();
-        for (size_t i = 0; i < m_boneParents.size(); ++i) {
-            if (m_boneParents[i] == parent && static_cast<int32_t>(i) != parent) {
+        const int32_t parent = queue.dequeue();
+        for (size_t i = 0; i < boneLimit; ++i) {
+            if (m_boneParents[i] == parent && !visited[i]) {
+                visited[i] = 1;
                 we_bone_sim_config_t childCfg = srcCfg;
                 childCfg.bone_index = static_cast<uint32_t>(i);
-                m_ctx.configs[i] = childCfg;
+                deltas.push_back(BoneConfigDelta{
+                    static_cast<int32_t>(i),
+                    m_ctx.configs[i],
+                    childCfg,
+                });
                 queue.enqueue(static_cast<int32_t>(i));
             }
         }
     }
 
-    if (m_boneTree) {
-        QTreeWidgetItemIterator it(m_boneTree);
-        while (*it) {
-            int bIdx = (*it)->data(0, Qt::UserRole).toInt();
-            if (bIdx >= 0 && bIdx < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
-                bool enabled = (m_ctx.configs[bIdx].flags & WE_BONE_PHYS_ENABLED) != 0;
-                (*it)->setText(1,
-                               enabled ? QStringLiteral("XPBD Active") : QStringLiteral("Rigid"));
-                (*it)->setForeground(1, enabled ? QBrush(QColor(0xa6, 0xe3, 0xa1))
-                                                : QBrush(QColor(0x93, 0x99, 0xb2)));
-            }
-            ++it;
-        }
+    if (deltas.empty()) {
+        emit statusMessage(
+            QStringLiteral("No descendant bones under bone %1").arg(m_selectedBoneIndex));
+        return;
     }
 
-    commitPhysicsChange(m_ctx.configs[m_selectedBoneIndex], m_ctx.wind, m_ctx.cursor);
+    class PropagateBonePhysicsCommand final : public ICommand {
+      public:
+        PropagateBonePhysicsCommand(QPointer<PhysicsSpringInspectorWidget> widget, QString output,
+                                    int32_t objectId, int32_t rootBone,
+                                    std::vector<BoneConfigDelta> boneDeltas, we_wind_field_t wind,
+                                    we_cursor_force_t cursor)
+            : m_widget(std::move(widget)), m_output(std::move(output)), m_objectId(objectId),
+              m_rootBone(rootBone), m_deltas(std::move(boneDeltas)), m_wind(wind), m_cursor(cursor)
+        {
+        }
+
+        void execute() override { apply(true); }
+        void undo() override { apply(false); }
+
+        [[nodiscard]] QString describe() const override
+        {
+            return QStringLiteral("Cascade Physics Preset from Bone %1").arg(m_rootBone);
+        }
+
+      private:
+        void apply(bool useNew)
+        {
+            if (!m_widget) {
+                return;
+            }
+            bool selectedModified = false;
+            for (const auto &d : m_deltas) {
+                if (d.boneIndex >= 0 && d.boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+                    m_widget->m_ctx.configs[d.boneIndex] = useNew ? d.newCfg : d.oldCfg;
+                    if (d.boneIndex == m_widget->m_selectedBoneIndex) {
+                        selectedModified = true;
+                    }
+                }
+            }
+            m_widget->refreshBoneTreeStates();
+            if (selectedModified && !m_widget->m_updatingUi) {
+                m_widget->syncUiFromSelectedBone();
+            }
+            for (const auto &d : m_deltas) {
+                const we_bone_sim_config_t &cfg = useNew ? d.newCfg : d.oldCfg;
+                emit m_widget->physicsParamsChanged(m_output, m_objectId, d.boneIndex, cfg, m_wind,
+                                                    m_cursor);
+                m_widget->sendIpcUpdate(m_output, m_objectId, d.boneIndex, cfg, m_wind, m_cursor);
+            }
+        }
+
+        QPointer<PhysicsSpringInspectorWidget> m_widget;
+        QString m_output;
+        int32_t m_objectId{-1};
+        int32_t m_rootBone{0};
+        std::vector<BoneConfigDelta> m_deltas;
+        we_wind_field_t m_wind{};
+        we_cursor_force_t m_cursor{};
+    };
+
+    auto cmd = std::make_unique<PropagateBonePhysicsCommand>(
+        QPointer<PhysicsSpringInspectorWidget>(this), m_targetOutput, m_objectId,
+        m_selectedBoneIndex, std::move(deltas), m_ctx.wind, m_ctx.cursor);
+    if (m_commandBus) {
+        m_commandBus->execute(std::move(cmd));
+    } else {
+        cmd->execute();
+    }
+
     emit statusMessage(QStringLiteral("Applied physics preset to descendants of bone %1")
                            .arg(m_selectedBoneIndex));
 }
@@ -899,39 +1029,25 @@ void PhysicsSpringInspectorWidget::commitPhysicsChange(const we_bone_sim_config_
     we_wind_field_t oldWind = m_ctx.wind;
     we_cursor_force_t oldCursor = m_ctx.cursor;
 
-    m_ctx.configs[m_selectedBoneIndex] = newCfg;
-    m_ctx.wind = newWind;
-    m_ctx.cursor = newCursor;
-
-    if (m_boneTree) {
-        QTreeWidgetItemIterator it(m_boneTree);
-        while (*it) {
-            if ((*it)->data(0, Qt::UserRole).toInt() == m_selectedBoneIndex) {
-                bool enabled = (newCfg.flags & WE_BONE_PHYS_ENABLED) != 0;
-                (*it)->setText(1,
-                               enabled ? QStringLiteral("XPBD Active") : QStringLiteral("Rigid"));
-                (*it)->setForeground(1, enabled ? QBrush(QColor(0xa6, 0xe3, 0xa1))
-                                                : QBrush(QColor(0x93, 0x99, 0xb2)));
-                break;
-            }
-            ++it;
-        }
-    }
-
     if (m_commandBus) {
-        auto applyFn = [this](const QString &output, int32_t objectId, int32_t boneIndex,
+        QPointer<PhysicsSpringInspectorWidget> self(this);
+        auto applyFn = [self](const QString &output, int32_t objectId, int32_t boneIndex,
                               const we_bone_sim_config_t &cfg, const we_wind_field_t &wind,
                               const we_cursor_force_t &cursor) {
+            if (!self) {
+                return;
+            }
             if (boneIndex >= 0 && boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
-                m_ctx.configs[boneIndex] = cfg;
+                self->m_ctx.configs[boneIndex] = cfg;
             }
-            m_ctx.wind = wind;
-            m_ctx.cursor = cursor;
-            if (boneIndex == m_selectedBoneIndex && !m_updatingUi) {
-                syncUiFromSelectedBone();
+            self->m_ctx.wind = wind;
+            self->m_ctx.cursor = cursor;
+            self->refreshBoneTreeStates();
+            if (boneIndex == self->m_selectedBoneIndex && !self->m_updatingUi) {
+                self->syncUiFromSelectedBone();
             }
-            emit physicsParamsChanged(output, objectId, boneIndex, cfg, wind, cursor);
-            sendIpcUpdate(output, objectId, boneIndex, cfg, wind, cursor);
+            emit self->physicsParamsChanged(output, objectId, boneIndex, cfg, wind, cursor);
+            self->sendIpcUpdate(output, objectId, boneIndex, cfg, wind, cursor);
         };
 
         auto cmd = std::make_unique<SetPhysicsSpringCommand>(
@@ -939,6 +1055,10 @@ void PhysicsSpringInspectorWidget::commitPhysicsChange(const we_bone_sim_config_
             oldCursor, newCursor, std::move(applyFn));
         m_commandBus->execute(std::move(cmd));
     } else {
+        m_ctx.configs[m_selectedBoneIndex] = newCfg;
+        m_ctx.wind = newWind;
+        m_ctx.cursor = newCursor;
+        refreshBoneTreeStates();
         syncUiFromSelectedBone();
         emit physicsParamsChanged(m_targetOutput, m_objectId, m_selectedBoneIndex, newCfg, newWind,
                                   newCursor);

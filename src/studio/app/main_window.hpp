@@ -198,7 +198,9 @@ class MainWindow : public QMainWindow {
 
 } // namespace waywal::studio
 
-using waywal::studio::MainWindow;
-using waywal::studio::StudioOptions;
+namespace wwal::studio {
+using MainWindow = waywal::studio::MainWindow;
+using StudioOptions = waywal::studio::StudioOptions;
+} // namespace wwal::studio
 
 #endif // WAYWAL_STUDIO_MAIN_WINDOW_HPP

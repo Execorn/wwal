@@ -392,8 +392,8 @@ void MonitorTopologyCanvas::recalculateLayoutTransform()
     m_virtualBoundingBox = span.boundingBox;
 
     const bool compact = (height() < 150);
-    const qreal padX = compact ? 12.0 : 24.0;
-    const qreal padY = compact ? 6.0 : 16.0;
+    const qreal padX = compact ? std::min(m_padding, 12.0) : m_padding;
+    const qreal padY = compact ? std::min(m_padding * 0.5, 6.0) : m_padding * (2.0 / 3.0);
     const qreal topReserve = compact ? 0.0 : 38.0;
 
     qreal availW = std::max(60.0, static_cast<qreal>(width()) - 2.0 * padX);

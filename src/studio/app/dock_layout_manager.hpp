@@ -185,9 +185,10 @@ class DockLayoutManager : public QObject {
 
 } // namespace waywal::studio
 
-// Expose in global scope for convenience
-using waywal::studio::DockLayoutManager;
-using waywal::studio::StudioDockTitleBar;
-using waywal::studio::StudioDockWidget;
+namespace wwal::studio {
+using DockLayoutManager = waywal::studio::DockLayoutManager;
+using StudioDockTitleBar = waywal::studio::StudioDockTitleBar;
+using StudioDockWidget = waywal::studio::StudioDockWidget;
+} // namespace wwal::studio
 
 #endif // WAYWAL_STUDIO_DOCK_LAYOUT_MANAGER_HPP
