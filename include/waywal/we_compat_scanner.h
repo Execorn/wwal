@@ -87,7 +87,10 @@ void we_compat_scanner_destroy(we_compat_scanner_t *scanner);
 bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop_dir,
                               we_compat_report_t *out_report);
 
-/* Applies recommended auto-repairs into a memory-mapped scratch AST or output directory */
+/* Applies confined in-place auto-repairs strictly beneath target_dir; returns applied count */
+uint32_t we_compat_apply_repairs(const we_compat_report_t *report, const char *target_dir);
+
+/* Copies source_dir to target_dir (skipping symlinks) and applies confined auto-repairs */
 bool we_compat_apply_auto_repairs(const we_compat_report_t *report, const char *source_dir,
                                   const char *target_dir);
 
