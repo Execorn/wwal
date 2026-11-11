@@ -1886,7 +1886,12 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
         }
     }
 
-    out_frame->num_planes = plane_idx > 0 ? plane_idx : prime_desc.num_objects;
+    if (plane_idx == 0) {
+        out_frame->num_planes = 0;
+        return false;
+    }
+
+    out_frame->num_planes = plane_idx;
     return true;
 }
 

@@ -89,7 +89,8 @@ static void shm_buffer_release(void *data, struct wl_buffer *wl_buffer)
         if (node->shm_buffers[i] == wl_buffer) {
             node->shm_buffer_released[i] = true;
             bool video_playing =
-                node->state && node->state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED;
+                (node->video_eng && node->video_eng->state != WAYWAL_VIDEO_STATE_STOPPED) ||
+                (node->state && node->state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED);
             if (!node->transition_active && (i != node->active_buffer_idx || video_playing) &&
                 node->shm_data && node->shm_size >= 8) {
                 size_t frame_sz = node->shm_size / 2;
@@ -209,6 +210,8 @@ static const struct zwlr_layer_surface_v1_listener backdrop_layer_surface_listen
     .closed = backdrop_layer_surface_closed,
 };
 
+static color_rgba_t get_output_fill_color(const daemon_state_t *state, const output_node_t *node);
+
 static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *layer_surface,
                                     uint32_t serial, uint32_t width, uint32_t height)
 {
@@ -237,9 +240,80 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
                      out->height);
 
     if (!was_configured) {
+        int32_t dst_w = out->logical_width > 0 ? (int32_t)out->logical_width : out->width;
+        int32_t dst_h = out->logical_height > 0 ? (int32_t)out->logical_height : out->height;
+        if (out->initial_configure_done) {
+            /* Recreated layer surfaces must preserve active runtime media rather than
+             * flashing solid fallback color or re-applying startup config rules. */
+            video_engine_t *ve =
+                out->video_eng ? out->video_eng : (out->state ? &out->state->video_engine : NULL);
+            if (ve && ve->state != WAYWAL_VIDEO_STATE_STOPPED && ve->redraw_output &&
+                ve->redraw_output(ve, out)) {
+                return;
+            }
+
+            dmabuf_bo_t *restore_bo = NULL;
+            if (out->last_presented_bo && out->last_presented_bo->wl_buffer) {
+                restore_bo = out->last_presented_bo;
+            } else if (out->use_dmabuf && out->dmabuf_ring.initialized &&
+                       out->last_committed_ring_idx >= 0 &&
+                       out->last_committed_ring_idx < WAYWAL_DMABUF_RING_SIZE &&
+                       out->dmabuf_ring.buffers[out->last_committed_ring_idx].wl_buffer) {
+                restore_bo = &out->dmabuf_ring.buffers[out->last_committed_ring_idx];
+            }
+
+            if (restore_bo && out->surface) {
+                if (out->viewport) {
+                    wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1),
+                                           wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                                           wl_fixed_from_int(-1));
+                    output_viewport_update_destination(out, dst_w, dst_h);
+                }
+                restore_bo->in_use = true;
+                wl_surface_attach(out->surface, restore_bo->wl_buffer, 0, 0);
+                wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
+                output_commit_frame(out);
+                if (out->state && out->state->display) {
+                    wl_display_flush(out->state->display);
+                }
+                return;
+            }
+
+            if (!out->displaying_color && out->has_image && out->surface) {
+                if (out->shm_data && out->active_buffer_idx >= 0 && out->active_buffer_idx < 2 &&
+                    out->shm_buffers[out->active_buffer_idx]) {
+                    if (out->viewport) {
+                        wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1),
+                                               wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                                               wl_fixed_from_int(-1));
+                        output_viewport_update_destination(out, dst_w, dst_h);
+                    }
+                    out->shm_buffer_released[out->active_buffer_idx] = false;
+                    wl_surface_attach(out->surface, out->shm_buffers[out->active_buffer_idx], 0, 0);
+                    wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
+                    output_commit_frame(out);
+                    if (out->state && out->state->display) {
+                        wl_display_flush(out->state->display);
+                    }
+                    return;
+                }
+                if (out->state && out->state->wallpaper_rgba) {
+                    output_node_render_image(out->state, out, out->state->wallpaper_rgba,
+                                             out->state->wallpaper_w, out->state->wallpaper_h);
+                    return;
+                }
+            }
+
+            if (out->state) {
+                color_rgba_t col = out->displaying_color ? out->active_color
+                                                         : get_output_fill_color(out->state, out);
+                output_node_render_color(out->state, out, col);
+            }
+            return;
+        }
+
+        out->initial_configure_done = true;
         if (out->last_presented_bo && out->last_presented_bo->wl_buffer && out->surface) {
-            int32_t dst_w = out->logical_width > 0 ? (int32_t)out->logical_width : out->width;
-            int32_t dst_h = out->logical_height > 0 ? (int32_t)out->logical_height : out->height;
             if (out->viewport) {
                 wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                        wl_fixed_from_int(-1), wl_fixed_from_int(-1));
@@ -404,9 +478,24 @@ void output_node_create_surface(daemon_state_t *state, output_node_t *node)
 
     if (state->presentation) {
         presentation_sync_init(&node->pres_sync, state->presentation, node->surface);
+        if (node->refresh_mhz > 0) {
+            node->pres_sync.pll.period_est_ns = 1000000000000LL / (int64_t)node->refresh_mhz;
+        }
         node->pres_sync.pll.clock_id = state->presentation_clock_id;
         node->pres_sync.pll.has_clock_id = true;
     }
+
+    if (state->fifo_mgr && !node->fifo) {
+        node->fifo = waywal_fifo_manager_get_fifo(state->fifo_mgr, node->surface);
+        node->fifo_barrier_pending = false;
+    }
+
+    if (state->commit_timing_mgr && !node->commit_timer) {
+        node->commit_timer =
+            waywal_commit_timing_manager_get_timer(state->commit_timing_mgr, node->surface);
+    }
+
+    node->mapped_while_fullscreen = node->wlr_has_fullscreen;
 
     if (!state->viewporter && node->scale > 1) {
         output_surface_update_buffer_scale(node, node->scale);
@@ -808,12 +897,23 @@ void output_node_destroy_surface(output_node_t *node)
         zwlr_layer_surface_v1_destroy(node->layer_surface);
         node->layer_surface = NULL;
     }
+    if (node->commit_timer) {
+        waywal_commit_timer_destroy(node->commit_timer);
+        node->commit_timer = NULL;
+    }
+    if (node->fifo) {
+        waywal_fifo_destroy(node->fifo);
+        node->fifo = NULL;
+    }
+    node->fifo_barrier_pending = false;
     presentation_sync_destroy(&node->pres_sync);
     if (node->surface) {
         wl_surface_destroy(node->surface);
         node->surface = NULL;
     }
     node->configured = false;
+    node->initial_configure_done = false;
+    node->mapped_while_fullscreen = false;
     node->transition_active = false;
     node->transition_current_frame = 0;
     node->transition_total_frames = 0;
@@ -828,6 +928,16 @@ void output_node_recreate_layer_surface(daemon_state_t *state, output_node_t *no
 {
     if (!state || !node || !node->wl_output)
         return;
+
+    /* Occluded workspaces on tiled desktops leave frame_seq at 0 without being
+     * fullscreen-unmapped; only recreate when the surface was mapped during fullscreen. */
+    if (node->initial_configure_done && node->configured &&
+        (!node->mapped_while_fullscreen || node->pres_sync.pll.frame_seq > 0 ||
+         node->pres_sync.pending_feedback)) {
+        node->mapped_while_fullscreen = false;
+        return;
+    }
+    node->mapped_while_fullscreen = false;
 
     node->backdrop_configured = false;
     if (node->backdrop_viewport) {
@@ -855,6 +965,15 @@ void output_node_recreate_layer_surface(daemon_state_t *state, output_node_t *no
         zwlr_layer_surface_v1_destroy(node->layer_surface);
         node->layer_surface = NULL;
     }
+    if (node->commit_timer) {
+        waywal_commit_timer_destroy(node->commit_timer);
+        node->commit_timer = NULL;
+    }
+    if (node->fifo) {
+        waywal_fifo_destroy(node->fifo);
+        node->fifo = NULL;
+    }
+    node->fifo_barrier_pending = false;
     presentation_sync_destroy(&node->pres_sync);
     if (node->surface) {
         wl_surface_destroy(node->surface);

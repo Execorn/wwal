@@ -73,8 +73,11 @@ jobs:
             systemd-dev \
             qt6-base-dev \
             qt6-base-dev-tools \
+            qt6-wayland \
             libsqlite3-dev \
             libzstd-dev \
+            libsodium-dev \
+            libcurl4-openssl-dev \
             libgl-dev \
             libopengl-dev \
             weston \
@@ -123,13 +126,27 @@ jobs:
 
       - name: Run Meson test suite
         env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          LSAN_OPTIONS: suppressions=/tmp/wwal-lsan.supp:print_suppressions=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: meson test -C build --print-errorlogs
+        run: |
+          printf '%s\n' \
+            'leak:libfontconfig.so' \
+            'leak:libglib-2.0.so' \
+            'leak:libdbus-1.so' \
+            'leak:libQt6Gui.so' \
+            'leak:libQt6Widgets.so' \
+            'leak:libEGL_mesa.so' \
+            'leak:libgallium' \
+            'leak:swrast_dri.so' \
+            'leak:llvmpipe' \
+            > /tmp/wwal-lsan.supp
+          meson test -C build --print-errorlogs
 
       - name: Run standalone fuzz smoke tests
         env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          LSAN_OPTIONS: suppressions=/tmp/wwal-lsan.supp:print_suppressions=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           ./build/fuzz_demuxer
