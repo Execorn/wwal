@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -520,23 +521,130 @@ static void meta_set_combo(we_shader_meta_t *meta, const char *name, int32_t val
     }
 }
 
+static void mask_block_comments_preserve_line_comments(char *buf, size_t len, bool *inout_in_block)
+{
+    size_t i = 0;
+    while (i < len) {
+        if (*inout_in_block) {
+            if (i + 1 < len && buf[i] == '*' && buf[i + 1] == '/') {
+                buf[i] = ' ';
+                buf[i + 1] = ' ';
+                i += 2;
+                *inout_in_block = false;
+            } else {
+                if (buf[i] != '\n' && buf[i] != '\r') {
+                    buf[i] = ' ';
+                }
+                i++;
+            }
+        } else {
+            if (buf[i] == '"') {
+                i++;
+                while (i < len && buf[i] != '"') {
+                    if (buf[i] == '\\' && i + 1 < len) {
+                        i += 2;
+                    } else {
+                        i++;
+                    }
+                }
+                if (i < len) {
+                    i++;
+                }
+            } else if (i + 1 < len && buf[i] == '/' && buf[i + 1] == '/') {
+                while (i < len && buf[i] != '\n') {
+                    i++;
+                }
+            } else if (i + 1 < len && buf[i] == '/' && buf[i + 1] == '*') {
+                buf[i] = ' ';
+                buf[i + 1] = ' ';
+                i += 2;
+                *inout_in_block = true;
+            } else {
+                i++;
+            }
+        }
+    }
+}
+
+static void build_masked_code_view(const char *src, size_t len, char *code_view,
+                                   bool *inout_in_block)
+{
+    memcpy(code_view, src, len);
+    code_view[len] = '\0';
+    size_t i = 0;
+    while (i < len) {
+        if (*inout_in_block) {
+            if (i + 1 < len && src[i] == '*' && src[i + 1] == '/') {
+                code_view[i] = ' ';
+                code_view[i + 1] = ' ';
+                i += 2;
+                *inout_in_block = false;
+            } else {
+                if (code_view[i] != '\n' && code_view[i] != '\r') {
+                    code_view[i] = ' ';
+                }
+                i++;
+            }
+        } else {
+            if (src[i] == '"') {
+                code_view[i++] = ' ';
+                while (i < len && src[i] != '"') {
+                    if (src[i] == '\\' && i + 1 < len) {
+                        code_view[i] = ' ';
+                        code_view[i + 1] = ' ';
+                        i += 2;
+                    } else {
+                        if (code_view[i] != '\n' && code_view[i] != '\r') {
+                            code_view[i] = ' ';
+                        }
+                        i++;
+                    }
+                }
+                if (i < len) {
+                    code_view[i++] = ' ';
+                }
+            } else if (i + 1 < len && src[i] == '/' && src[i + 1] == '/') {
+                while (i < len && src[i] != '\n') {
+                    if (code_view[i] != '\r') {
+                        code_view[i] = ' ';
+                    }
+                    i++;
+                }
+            } else if (i + 1 < len && src[i] == '/' && src[i + 1] == '*') {
+                code_view[i] = ' ';
+                code_view[i + 1] = ' ';
+                i += 2;
+                *inout_in_block = true;
+            } else {
+                i++;
+            }
+        }
+    }
+}
+
 void we_shader_extract_metadata(const char *src, we_shader_meta_t *inout_meta)
 {
     if (!src || !inout_meta) {
         return;
     }
+    bool in_block_comment = false;
     const char *line = src;
     while (*line) {
         const char *eol = strchr(line, '\n');
         size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
 
-        char buf[1024];
-        size_t copy_len = line_len < sizeof(buf) - 1 ? line_len : sizeof(buf) - 1;
-        memcpy(buf, line, copy_len);
-        buf[copy_len] = '\0';
+        char stack_buf[1024];
+        char *buf = (line_len < sizeof(stack_buf)) ? stack_buf : (char *)malloc(line_len + 1);
+        if (!buf) {
+            return;
+        }
+        memcpy(buf, line, line_len);
+        buf[line_len] = '\0';
+        mask_block_comments_preserve_line_comments(buf, line_len, &in_block_comment);
 
         /* Check for // [COMBO] {"combo":"NAME","default":N} */
-        const char *combo_tag = strstr(buf, "[COMBO]");
+        const char *line_comment = strstr(buf, "//");
+        const char *combo_tag = line_comment ? strstr(line_comment, "[COMBO]") : NULL;
         if (combo_tag) {
             const char *json = strchr(combo_tag, '{');
             if (json) {
@@ -645,6 +753,9 @@ void we_shader_extract_metadata(const char *src, we_shader_meta_t *inout_meta)
             }
         }
 
+        if (buf != stack_buf) {
+            free(buf);
+        }
         if (!eol) {
             break;
         }
@@ -661,32 +772,75 @@ typedef struct {
     uint32_t count;
 } we_include_tracker_t;
 
-static bool tracker_has_or_add(we_include_tracker_t *tr, const char *inc_name)
+typedef enum {
+    WE_INC_NEW = 0,
+    WE_INC_ALREADY_SEEN = 1,
+    WE_INC_OVERFLOW = 2,
+} we_inc_status_t;
+
+static void normalize_include_path(const char *inc_name, char *norm, size_t norm_cap)
+{
+    if (!inc_name || !norm || norm_cap == 0) {
+        return;
+    }
+    const char *p = inc_name;
+    while (*p != '\0') {
+        if (*p == '/' || *p == '\\' || *p == ' ' || *p == '\t') {
+            p++;
+        } else if (p[0] == '.' && (p[1] == '/' || p[1] == '\\')) {
+            p += 2;
+        } else {
+            break;
+        }
+    }
+    if (strncasecmp(p, "shaders/", 8) == 0 || strncasecmp(p, "shaders\\", 8) == 0) {
+        p += 8;
+        while (*p == '/' || *p == '\\' || (p[0] == '.' && (p[1] == '/' || p[1] == '\\'))) {
+            if (*p == '.') {
+                p += 2;
+            } else {
+                p++;
+            }
+        }
+    }
+
+    size_t out = 0;
+    bool prev_slash = false;
+    for (; *p != '\0' && out + 1 < norm_cap; ++p) {
+        char c = (*p == '\\') ? '/' : (char)tolower((unsigned char)*p);
+        if (c == '/') {
+            if (prev_slash) {
+                continue;
+            }
+            prev_slash = true;
+        } else {
+            prev_slash = false;
+        }
+        norm[out++] = c;
+    }
+    while (out > 0 && (norm[out - 1] == ' ' || norm[out - 1] == '\t' || norm[out - 1] == '/')) {
+        out--;
+    }
+    norm[out] = '\0';
+}
+
+static we_inc_status_t tracker_check_or_add(we_include_tracker_t *tr, const char *inc_name)
 {
     char norm[128];
-    const char *base = strrchr(inc_name, '/');
-    const char *bslash = strrchr(inc_name, '\\');
-    if (bslash && (!base || bslash > base)) {
-        base = bslash;
+    normalize_include_path(inc_name, norm, sizeof(norm));
+    if (norm[0] == '\0') {
+        return WE_INC_ALREADY_SEEN;
     }
-    base = base ? (base + 1) : inc_name;
-
-    size_t i = 0;
-    for (; base[i] != '\0' && i + 1 < sizeof(norm); i++) {
-        norm[i] = (char)tolower((unsigned char)base[i]);
-    }
-    norm[i] = '\0';
-
     for (uint32_t j = 0; j < tr->count; j++) {
         if (strcmp(tr->included[j], norm) == 0) {
-            return true;
+            return WE_INC_ALREADY_SEEN;
         }
     }
     if (tr->count >= WE_SHADER_MAX_INCLUDES) {
-        return true;
+        return WE_INC_OVERFLOW;
     }
     snprintf(tr->included[tr->count++], sizeof(tr->included[0]), "%s", norm);
-    return false;
+    return WE_INC_NEW;
 }
 
 static bool expand_includes_recursive(const char *src, const we_pkg_t *pkg,
@@ -696,13 +850,31 @@ static bool expand_includes_recursive(const char *src, const we_pkg_t *pkg,
         return true;
     }
 
+    bool in_block_comment = false;
     const char *line = src;
     while (*line) {
         const char *eol = strchr(line, '\n');
         size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
 
-        const char *p = line;
-        const char *line_end = line + line_len;
+        char stack_view[1024];
+        char *code_view =
+            (line_len < sizeof(stack_view)) ? stack_view : (char *)malloc(line_len + 1);
+        if (!code_view) {
+            return false;
+        }
+        bool line_started_in_block = in_block_comment;
+        mask_block_comments_preserve_line_comments(memcpy(code_view, line, line_len), line_len,
+                                                   &in_block_comment);
+        code_view[line_len] = '\0';
+
+        const char *p = code_view;
+        const char *line_end = code_view + line_len;
+        for (const char *c = code_view; c + 1 < line_end; ++c) {
+            if (c[0] == '/' && c[1] == '/') {
+                line_end = c;
+                break;
+            }
+        }
         while (p < line_end && (*p == ' ' || *p == '\t')) {
             p++;
         }
@@ -710,7 +882,7 @@ static bool expand_includes_recursive(const char *src, const we_pkg_t *pkg,
         bool is_include = false;
         bool is_version = false;
         char inc_path[256] = {0};
-        if (p < line_end && *p == '#') {
+        if (!line_started_in_block && p < line_end && *p == '#') {
             p++;
             while (p < line_end && (*p == ' ' || *p == '\t')) {
                 p++;
@@ -724,14 +896,16 @@ static bool expand_includes_recursive(const char *src, const we_pkg_t *pkg,
                        (line_end - p >= 7 && strncmp(p, "require", 7) == 0 &&
                         (p + 7 < line_end &&
                          (p[7] == ' ' || p[7] == '\t' || p[7] == '"' || p[7] == '<')))) {
-                p += 7;
-                const char *q1 = memchr(p, '"', (size_t)(line_end - p));
+                size_t raw_off = (size_t)((p + 7) - code_view);
+                const char *raw_p = line + raw_off;
+                const char *raw_end = line + (size_t)(line_end - code_view);
+                const char *q1 = memchr(raw_p, '"', (size_t)(raw_end - raw_p));
                 if (!q1) {
-                    q1 = memchr(p, '<', (size_t)(line_end - p));
+                    q1 = memchr(raw_p, '<', (size_t)(raw_end - raw_p));
                 }
                 if (q1) {
                     char close_ch = (*q1 == '<') ? '>' : '"';
-                    const char *q2 = memchr(q1 + 1, close_ch, (size_t)(line_end - (q1 + 1)));
+                    const char *q2 = memchr(q1 + 1, close_ch, (size_t)(raw_end - (q1 + 1)));
                     if (q2 && q2 > q1 + 1) {
                         size_t plen = (size_t)(q2 - (q1 + 1));
                         if (plen < sizeof(inc_path)) {
@@ -744,10 +918,18 @@ static bool expand_includes_recursive(const char *src, const we_pkg_t *pkg,
             }
         }
 
+        if (code_view != stack_view) {
+            free(code_view);
+        }
+
         if (is_version) {
             /* Strip embedded #version line so our #version 310 es stays first */
         } else if (is_include) {
-            if (!tracker_has_or_add(tr, inc_path)) {
+            we_inc_status_t st = tracker_check_or_add(tr, inc_path);
+            if (st == WE_INC_OVERFLOW) {
+                return false;
+            }
+            if (st == WE_INC_NEW) {
                 bool owned = false;
                 size_t pkg_sz = 0;
                 const uint8_t *pkg_data = NULL;
@@ -1229,6 +1411,7 @@ static void collect_varyings(const char *src, const we_shader_meta_t *meta, we_v
     uint32_t cond_depth = 0;
     we_shader_combo_t local_defs[64];
     uint32_t local_count = 0;
+    bool in_block_comment = false;
 
     const char *line = src;
     while (*line) {
@@ -1246,15 +1429,16 @@ static void collect_varyings(const char *src, const we_shader_meta_t *meta, we_v
         }
         size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
 
-        const char *p = line;
-        const char *end = line + line_len;
-        /* Strip trailing // comments before parsing directives or declarations */
-        for (const char *c = line; c + 1 < end; c++) {
-            if (c[0] == '/' && c[1] == '/') {
-                end = c;
-                break;
-            }
+        char stack_view[1024];
+        char *code_view =
+            (line_len < sizeof(stack_view)) ? stack_view : (char *)malloc(line_len + 1);
+        if (!code_view) {
+            return;
         }
+        build_masked_code_view(line, line_len, code_view, &in_block_comment);
+
+        const char *p = code_view;
+        const char *end = code_view + line_len;
         while (p < end && (*p == ' ' || *p == '\t')) {
             p++;
         }
@@ -1418,6 +1602,9 @@ static void collect_varyings(const char *src, const we_shader_meta_t *meta, we_v
                 }
             }
         }
+        if (code_view != stack_view) {
+            free(code_view);
+        }
         if (!eol) {
             break;
         }
@@ -1430,91 +1617,103 @@ typedef struct {
     char swiz[8];
 } we_varying_swizzle_t;
 
-static bool append_line_with_varying_swizzles(we_strbuf_t *sb, const char *line, size_t line_len,
+static bool is_glsl_or_hlsl_type_token(const char *tok, size_t len, const char **out_canonical)
+{
+    static const struct {
+        const char *src;
+        const char *dst;
+    } map[] = {
+        {"float", "float"}, {"half", "float"},  {"fixed", "float"}, {"int", "int"},
+        {"uint", "uint"},   {"dword", "uint"},  {"bool", "bool"},   {"vec2", "vec2"},
+        {"vec3", "vec3"},   {"vec4", "vec4"},   {"float2", "vec2"}, {"float3", "vec3"},
+        {"float4", "vec4"}, {"half2", "vec2"},  {"half3", "vec3"},  {"half4", "vec4"},
+        {"fixed2", "vec2"}, {"fixed3", "vec3"}, {"fixed4", "vec4"}, {"ivec2", "ivec2"},
+        {"ivec3", "ivec3"}, {"ivec4", "ivec4"}, {"int2", "ivec2"},  {"int3", "ivec3"},
+        {"int4", "ivec4"},  {"uvec2", "uvec2"}, {"uvec3", "uvec3"}, {"uvec4", "uvec4"},
+        {"uint2", "uvec2"}, {"uint3", "uvec3"}, {"uint4", "uvec4"}, {"bvec2", "bvec2"},
+        {"bvec3", "bvec3"}, {"bvec4", "bvec4"},
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
+        if (strlen(map[i].src) == len && strncmp(tok, map[i].src, len) == 0) {
+            if (out_canonical) {
+                *out_canonical = map[i].dst;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool append_line_with_varying_swizzles(we_strbuf_t *sb, const char *line,
+                                              const char *code_view, size_t line_len,
                                               const we_varying_swizzle_t *swizzles,
                                               uint32_t swizzle_count)
 {
-    const char *end = line + line_len;
-    const char *code_end = end;
-    for (const char *c = line; c + 1 < end; c++) {
-        if (c[0] == '/' && c[1] == '/') {
-            code_end = c;
-            break;
-        }
-    }
-
-    const char *cur = line;
-    const char *seg_start = line;
-    while (cur < code_end) {
-        if (isalpha((unsigned char)*cur) || *cur == '_') {
-            bool after_dot_or_id = (cur > line && (isalnum((unsigned char)cur[-1]) ||
-                                                   cur[-1] == '_' || cur[-1] == '.'));
-            const char *id_start = cur;
-            while (cur < code_end && (isalnum((unsigned char)*cur) || *cur == '_')) {
+    size_t cur = 0;
+    size_t seg_start = 0;
+    while (cur < line_len) {
+        if (isalpha((unsigned char)code_view[cur]) || code_view[cur] == '_') {
+            size_t id_start = cur;
+            while (cur < line_len &&
+                   (isalnum((unsigned char)code_view[cur]) || code_view[cur] == '_')) {
                 cur++;
             }
-            size_t id_len = (size_t)(cur - id_start);
+            size_t id_len = cur - id_start;
 
-            if (!after_dot_or_id) {
-                /* Check for user function definition `float saturate(` to avoid macro expansion */
-                if (id_len == 8 && strncmp(id_start, "saturate", 8) == 0) {
-                    const char *after = cur;
-                    while (after < code_end && (*after == ' ' || *after == '\t')) {
+            size_t before = id_start;
+            while (before > 0 && (code_view[before - 1] == ' ' || code_view[before - 1] == '\t')) {
+                before--;
+            }
+            if (before > 0 && code_view[before - 1] == '.') {
+                continue;
+            }
+
+            size_t prev_end = before;
+            size_t prev_start = prev_end;
+            while (prev_start > 0 && (isalnum((unsigned char)code_view[prev_start - 1]) ||
+                                      code_view[prev_start - 1] == '_')) {
+                prev_start--;
+            }
+            size_t prev_len = prev_end - prev_start;
+            bool preceded_by_type = (prev_len > 0 && is_glsl_or_hlsl_type_token(
+                                                         code_view + prev_start, prev_len, NULL));
+
+            /* Check for user function definition `float saturate(` to avoid macro expansion */
+            if (id_len == 8 && strncmp(code_view + id_start, "saturate", 8) == 0) {
+                size_t after = cur;
+                while (after < line_len && (code_view[after] == ' ' || code_view[after] == '\t')) {
+                    after++;
+                }
+                if (after < line_len && code_view[after] == '(' && preceded_by_type) {
+                    if (!sb_append_len(sb, line + seg_start, id_start - seg_start) ||
+                        !sb_append(sb, "we_user_saturate")) {
+                        return false;
+                    }
+                    seg_start = cur;
+                    continue;
+                }
+            }
+
+            if (preceded_by_type) {
+                continue;
+            }
+
+            for (uint32_t i = 0; i < swizzle_count; i++) {
+                if (swizzles[i].swiz[0] != '\0' && strlen(swizzles[i].name) == id_len &&
+                    strncmp(swizzles[i].name, code_view + id_start, id_len) == 0) {
+                    size_t after = cur;
+                    while (after < line_len &&
+                           (code_view[after] == ' ' || code_view[after] == '\t')) {
                         after++;
                     }
-                    if (after < code_end && *after == '(') {
-                        /* Check if preceded by a GLSL type token on the same line (never `return`)
-                         */
-                        const char *prev_end = id_start;
-                        while (prev_end > line && (prev_end[-1] == ' ' || prev_end[-1] == '\t')) {
-                            prev_end--;
+                    if (after >= line_len || code_view[after] != '.') {
+                        if (!sb_append_len(sb, line + seg_start, cur - seg_start) ||
+                            !sb_append(sb, ".") || !sb_append(sb, swizzles[i].swiz)) {
+                            return false;
                         }
-                        const char *prev_start = prev_end;
-                        while (prev_start > line &&
-                               (isalnum((unsigned char)prev_start[-1]) || prev_start[-1] == '_')) {
-                            prev_start--;
-                        }
-                        size_t tlen = (size_t)(prev_end - prev_start);
-                        bool is_type = (tlen == 5 && strncmp(prev_start, "float", 5) == 0) ||
-                                       (tlen == 4 && (strncmp(prev_start, "vec2", 4) == 0 ||
-                                                      strncmp(prev_start, "vec3", 4) == 0 ||
-                                                      strncmp(prev_start, "vec4", 4) == 0 ||
-                                                      strncmp(prev_start, "half", 4) == 0)) ||
-                                       (tlen == 5 && (strncmp(prev_start, "half2", 5) == 0 ||
-                                                      strncmp(prev_start, "half3", 5) == 0 ||
-                                                      strncmp(prev_start, "half4", 5) == 0)) ||
-                                       (tlen == 6 && (strncmp(prev_start, "float2", 6) == 0 ||
-                                                      strncmp(prev_start, "float3", 6) == 0 ||
-                                                      strncmp(prev_start, "float4", 6) == 0));
-                        if (is_type) {
-                            if (!sb_append_len(sb, seg_start, (size_t)(id_start - seg_start)) ||
-                                !sb_append(sb, "we_user_saturate")) {
-                                return false;
-                            }
-                            seg_start = cur;
-                            continue;
-                        }
+                        seg_start = cur;
                     }
-                }
-
-                for (uint32_t i = 0; i < swizzle_count; i++) {
-                    if (swizzles[i].swiz[0] != '\0' && strlen(swizzles[i].name) == id_len &&
-                        strncmp(swizzles[i].name, id_start, id_len) == 0) {
-                        const char *after = cur;
-                        while (after < code_end && (*after == ' ' || *after == '\t')) {
-                            after++;
-                        }
-                        /* Only append .<swiz> if the shader didn't already write <vname>.<member>
-                         */
-                        if (after >= code_end || *after != '.') {
-                            if (!sb_append_len(sb, seg_start, (size_t)(cur - seg_start)) ||
-                                !sb_append(sb, ".") || !sb_append(sb, swizzles[i].swiz)) {
-                                return false;
-                            }
-                            seg_start = cur;
-                        }
-                        break;
-                    }
+                    break;
                 }
             }
         } else {
@@ -1522,138 +1721,412 @@ static bool append_line_with_varying_swizzles(we_strbuf_t *sb, const char *line,
         }
     }
 
-    return sb_append_len(sb, seg_start, (size_t)(end - seg_start)) && sb_append(sb, "\n");
+    return sb_append_len(sb, line + seg_start, line_len - seg_start) && sb_append(sb, "\n");
 }
 
-static void strip_hlsl_bracket_attributes(char *line)
+static void strip_hlsl_bracket_attributes_masked(char *line, char *code_view, size_t len)
 {
-    char *p = line;
-    while ((p = strchr(p, '[')) != NULL) {
-        char *close = strchr(p, ']');
+    size_t pos = 0;
+    while (pos < len) {
+        char *p = (char *)memchr(code_view + pos, '[', len - pos);
+        if (!p) {
+            break;
+        }
+        size_t open_off = (size_t)(p - code_view);
+        char *close = (char *)memchr(p + 1, ']', len - (open_off + 1));
         if (!close) {
             break;
         }
-        size_t attr_len = (size_t)(close - p + 1);
+        size_t close_off = (size_t)(close - code_view);
+        size_t attr_len = close_off - open_off + 1;
         const char *attr = p + 1;
-        while (*attr == ' ' || *attr == '\t') {
+        while (attr < close && (*attr == ' ' || *attr == '\t')) {
             attr++;
         }
-        if (strncmp(attr, "unroll", 6) == 0 || strncmp(attr, "loop", 4) == 0 ||
-            strncmp(attr, "branch", 6) == 0 || strncmp(attr, "flatten", 7) == 0 ||
-            strncmp(attr, "fastopt", 7) == 0) {
-            memset(p, ' ', attr_len);
-            p = close + 1;
+        size_t rem = (size_t)(close - attr);
+        if ((rem >= 6 && strncmp(attr, "unroll", 6) == 0) ||
+            (rem >= 4 && strncmp(attr, "loop", 4) == 0) ||
+            (rem >= 6 && strncmp(attr, "branch", 6) == 0) ||
+            (rem >= 7 && strncmp(attr, "flatten", 7) == 0) ||
+            (rem >= 7 && strncmp(attr, "fastopt", 7) == 0)) {
+            memset(line + open_off, ' ', attr_len);
+            memset(code_view + open_off, ' ', attr_len);
+            pos = close_off + 1;
         } else {
-            p++;
+            pos = open_off + 1;
         }
     }
 }
 
-static void strip_hlsl_storage(char *line)
+static void strip_hlsl_storage_masked(char *line, char *code_view, size_t len)
 {
-    char *p = line;
+    char *p = code_view;
     while ((p = strstr(p, "static")) != NULL) {
-        bool word_start = (p == line || !(isalnum((unsigned char)p[-1]) || p[-1] == '_'));
-        bool word_end = !(isalnum((unsigned char)p[6]) || p[6] == '_');
+        size_t off = (size_t)(p - code_view);
+        bool word_start = (off == 0 || !(isalnum((unsigned char)code_view[off - 1]) ||
+                                         code_view[off - 1] == '_'));
+        bool word_end = (off + 6 >= len || !(isalnum((unsigned char)code_view[off + 6]) ||
+                                             code_view[off + 6] == '_'));
         if (word_start && word_end) {
-            const char *after = p + 6;
-            while (*after == ' ' || *after == '\t') {
+            size_t after = off + 6;
+            while (after < len && (code_view[after] == ' ' || code_view[after] == '\t')) {
                 after++;
             }
-            if (strncmp(after, "const", 5) == 0 &&
-                !(isalnum((unsigned char)after[5]) || after[5] == '_')) {
-                memset(p, ' ', 6);
-            } else if (p == line || p[-1] == ';' || p[-1] == '{' || p[-1] == '}') {
-                memset(p, ' ', 6);
+            size_t before = off;
+            while (before > 0 && (code_view[before - 1] == ' ' || code_view[before - 1] == '\t')) {
+                before--;
+            }
+            if (after + 5 <= len && strncmp(code_view + after, "const", 5) == 0 &&
+                (after + 5 == len ||
+                 !(isalnum((unsigned char)code_view[after + 5]) || code_view[after + 5] == '_'))) {
+                memset(line + off, ' ', 6);
+                memset(code_view + off, ' ', 6);
+            } else if (before == 0 || code_view[before - 1] == ';' ||
+                       code_view[before - 1] == '{' || code_view[before - 1] == '}') {
+                memset(line + off, ' ', 6);
+                memset(code_view + off, ' ', 6);
             }
         }
         p += 6;
     }
 }
 
-static bool hoist_mul_side_effects(we_strbuf_t *sb, char *line, uint32_t *tmp_counter)
+typedef struct {
+    char name[64];
+    char glsl_type[16];
+} we_var_type_entry_t;
+
+static void record_var_types_from_code_line(const char *code_view, size_t len,
+                                            we_var_type_entry_t *entries, uint32_t *inout_count,
+                                            uint32_t cap)
 {
-    char *p = line;
+    size_t i = 0;
+    while (i < len) {
+        if (!(isalpha((unsigned char)code_view[i]) || code_view[i] == '_')) {
+            i++;
+            continue;
+        }
+        size_t t_start = i;
+        while (i < len && (isalnum((unsigned char)code_view[i]) || code_view[i] == '_')) {
+            i++;
+        }
+        size_t t_len = i - t_start;
+        const char *canon_type = NULL;
+        if (!is_glsl_or_hlsl_type_token(code_view + t_start, t_len, &canon_type)) {
+            continue;
+        }
+        size_t j = i;
+        while (j < len && (code_view[j] == ' ' || code_view[j] == '\t')) {
+            j++;
+        }
+        if (j >= len || !(isalpha((unsigned char)code_view[j]) || code_view[j] == '_')) {
+            continue;
+        }
+        size_t n_start = j;
+        while (j < len && (isalnum((unsigned char)code_view[j]) || code_view[j] == '_')) {
+            j++;
+        }
+        size_t n_len = j - n_start;
+        if (n_len == 0 || n_len >= sizeof(entries[0].name)) {
+            continue;
+        }
+        size_t k = j;
+        while (k < len && (code_view[k] == ' ' || code_view[k] == '\t')) {
+            k++;
+        }
+        if (k < len && code_view[k] == '(') {
+            continue;
+        }
+        char vname[64];
+        memcpy(vname, code_view + n_start, n_len);
+        vname[n_len] = '\0';
+        bool updated = false;
+        for (uint32_t idx = 0; idx < *inout_count; ++idx) {
+            if (strcmp(entries[idx].name, vname) == 0) {
+                snprintf(entries[idx].glsl_type, sizeof(entries[idx].glsl_type), "%s", canon_type);
+                updated = true;
+                break;
+            }
+        }
+        if (!updated && *inout_count < cap) {
+            snprintf(entries[*inout_count].name, sizeof(entries[0].name), "%s", vname);
+            snprintf(entries[*inout_count].glsl_type, sizeof(entries[0].glsl_type), "%s",
+                     canon_type);
+            (*inout_count)++;
+        }
+        i = j;
+    }
+}
+
+static const char *lookup_inferred_var_type(const we_var_type_entry_t *entries, uint32_t count,
+                                            const char *vname, bool inside_subscript)
+{
+    for (uint32_t i = count; i > 0; --i) {
+        if (strcmp(entries[i - 1].name, vname) == 0) {
+            return entries[i - 1].glsl_type;
+        }
+    }
+    return inside_subscript ? "int" : "float";
+}
+
+static bool line_starts_control_or_pp(const char *code_view, size_t len)
+{
+    size_t i = 0;
+    while (i < len && (code_view[i] == ' ' || code_view[i] == '\t')) {
+        i++;
+    }
+    if (i >= len || code_view[i] == '#') {
+        return true;
+    }
+    static const char *const kw[] = {"if", "else", "for", "while", "do", "switch", "case"};
+    for (size_t k = 0; k < sizeof(kw) / sizeof(kw[0]); ++k) {
+        size_t klen = strlen(kw[k]);
+        if (i + klen <= len && strncmp(code_view + i, kw[k], klen) == 0 &&
+            (i + klen == len ||
+             !(isalnum((unsigned char)code_view[i + klen]) || code_view[i + klen] == '_'))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void update_unbraced_control_state(const char *code_view, size_t len,
+                                          bool *inout_expects_unbraced)
+{
+    size_t s = 0;
+    while (s < len && (code_view[s] == ' ' || code_view[s] == '\t' || code_view[s] == '\r')) {
+        s++;
+    }
+    size_t e = len;
+    while (e > s &&
+           (code_view[e - 1] == ' ' || code_view[e - 1] == '\t' || code_view[e - 1] == '\r')) {
+        e--;
+    }
+    if (s == e || code_view[s] == '#') {
+        return;
+    }
+    char last = code_view[e - 1];
+    if (last == '{' || last == '}' || last == ';') {
+        *inout_expects_unbraced = false;
+        return;
+    }
+    if (last == ')' && line_starts_control_or_pp(code_view + s, e - s)) {
+        *inout_expects_unbraced = true;
+        return;
+    }
+    if ((e - s == 4 && strncmp(code_view + s, "else", 4) == 0) ||
+        (e - s == 2 && strncmp(code_view + s, "do", 2) == 0)) {
+        *inout_expects_unbraced = true;
+        return;
+    }
+    if ((e - s > 4 && strncmp(code_view + e - 4, "else", 4) == 0 &&
+         !(isalnum((unsigned char)code_view[e - 5]) || code_view[e - 5] == '_')) ||
+        (e - s > 2 && strncmp(code_view + e - 2, "do", 2) == 0 &&
+         !(isalnum((unsigned char)code_view[e - 3]) || code_view[e - 3] == '_'))) {
+        *inout_expects_unbraced = true;
+        return;
+    }
+    *inout_expects_unbraced = false;
+}
+
+static bool span_contains_standalone_ident(const char *s, const char *end, const char *ident,
+                                           size_t ident_len)
+{
+    const char *p = s;
+    while (p < end) {
+        if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *id_start = p;
+            while (p < end && (isalnum((unsigned char)*p) || *p == '_')) {
+                p++;
+            }
+            size_t len = (size_t)(p - id_start);
+            if (len == ident_len && strncmp(id_start, ident, ident_len) == 0) {
+                const char *b = id_start;
+                while (b > s && (b[-1] == ' ' || b[-1] == '\t')) {
+                    b--;
+                }
+                if (b == s || b[-1] != '.') {
+                    return true;
+                }
+            }
+        } else {
+            p++;
+        }
+    }
+    return false;
+}
+
+static bool hoist_mul_side_effects(we_strbuf_t *sb, const char *line, const char *code_view,
+                                   size_t line_len, uint32_t *tmp_counter,
+                                   bool prev_expects_unbraced, const we_var_type_entry_t *var_types,
+                                   uint32_t var_type_count, char **out_rewritten)
+{
+    *out_rewritten = NULL;
+    if (prev_expects_unbraced || line_starts_control_or_pp(code_view, line_len) ||
+        strstr(code_view, "mul") == NULL) {
+        return true;
+    }
+
+    we_strbuf_t rebuilt;
+    bool any_hoisted = false;
+    size_t emit_off = 0;
+
+    const char *p = code_view;
+    const char *view_end = code_view + line_len;
     while ((p = strstr(p, "mul")) != NULL) {
-        if (p > line && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) {
+        if (p > code_view && (isalnum((unsigned char)p[-1]) || p[-1] == '_' || p[-1] == '.')) {
             p += 3;
             continue;
         }
-        char *open_p = p + 3;
-        while (*open_p == ' ' || *open_p == '\t') {
+        const char *open_p = p + 3;
+        while (open_p < view_end && (*open_p == ' ' || *open_p == '\t')) {
             open_p++;
         }
-        if (*open_p != '(') {
+        if (open_p >= view_end || *open_p != '(') {
             p += 3;
             continue;
         }
-        char *cur = open_p + 1;
-        int depth = 1;
-        while (*cur && depth > 0) {
+
+        const char *cur = open_p + 1;
+        int paren_depth = 1;
+        int bracket_depth = 0;
+        const char *comma_p = NULL;
+        bool multi_comma = false;
+        while (cur < view_end && paren_depth > 0) {
             if (*cur == '(') {
-                depth++;
+                paren_depth++;
             } else if (*cur == ')') {
-                depth--;
+                paren_depth--;
+                if (paren_depth == 0) {
+                    cur++;
+                    break;
+                }
+            } else if (*cur == '[') {
+                bracket_depth++;
+            } else if (*cur == ']' && bracket_depth > 0) {
+                bracket_depth--;
+            } else if (*cur == ',' && paren_depth == 1 && bracket_depth == 0) {
+                if (!comma_p) {
+                    comma_p = cur;
+                } else {
+                    multi_comma = true;
+                }
             }
             cur++;
         }
-        if (depth != 0) {
+        if (paren_depth != 0 || !comma_p || multi_comma) {
             p += 3;
             continue;
         }
-        char *mul_end = cur;
+        const char *mul_close = cur - 1;
 
-        char *inc = open_p + 1;
-        while (inc < mul_end - 1) {
+        int sub_depth = 0;
+        const char *inc = open_p + 1;
+        while (inc + 1 < mul_close) {
+            if (*inc == '[') {
+                sub_depth++;
+                inc++;
+                continue;
+            }
+            if (*inc == ']' && sub_depth > 0) {
+                sub_depth--;
+                inc++;
+                continue;
+            }
             if ((inc[0] == '+' && inc[1] == '+') || (inc[0] == '-' && inc[1] == '-')) {
                 bool is_inc = (inc[0] == '+');
-                if (inc > open_p + 1 && (isalnum((unsigned char)inc[-1]) || inc[-1] == '_')) {
-                    char *v_end = inc;
-                    char *v_start = inc - 1;
+                bool in_first_arg = (inc < comma_p);
+                const char *other_s = in_first_arg ? (comma_p + 1) : (open_p + 1);
+                const char *other_e = in_first_arg ? mul_close : comma_p;
+
+                const char *back = inc;
+                while (back > open_p + 1 && (back[-1] == ' ' || back[-1] == '\t')) {
+                    back--;
+                }
+                if (back > open_p + 1 && (isalnum((unsigned char)back[-1]) || back[-1] == '_')) {
+                    const char *v_end = back;
+                    const char *v_start = back - 1;
                     while (v_start > open_p + 1 &&
                            (isalnum((unsigned char)v_start[-1]) || v_start[-1] == '_')) {
                         v_start--;
                     }
+                    const char *dot_chk = v_start;
+                    while (dot_chk > open_p + 1 && (dot_chk[-1] == ' ' || dot_chk[-1] == '\t')) {
+                        dot_chk--;
+                    }
+                    bool is_member = (dot_chk > open_p + 1 && dot_chk[-1] == '.');
                     size_t v_len = (size_t)(v_end - v_start);
-                    if (v_len > 0 && v_len < 64) {
+                    if (!is_member && v_len > 0 && v_len < 64 &&
+                        span_contains_standalone_ident(other_s, other_e, v_start, v_len)) {
                         char vname[64];
                         memcpy(vname, v_start, v_len);
                         vname[v_len] = '\0';
+                        const char *vtype = lookup_inferred_var_type(var_types, var_type_count,
+                                                                     vname, sub_depth > 0);
                         char tmp_name[32];
                         snprintf(tmp_name, sizeof(tmp_name), "_we_tmp_%u", (*tmp_counter)++);
-                        if (!sb_append(sb, "int ") || !sb_append(sb, tmp_name) ||
-                            !sb_append(sb, " = ") || !sb_append(sb, vname) ||
-                            !sb_append(sb, ";\n") || !sb_append(sb, vname) ||
-                            !sb_append(sb, is_inc ? "++;\n" : "--;\n")) {
+                        if (!sb_append(sb, vtype) || !sb_append(sb, " ") ||
+                            !sb_append(sb, tmp_name) || !sb_append(sb, " = ") ||
+                            !sb_append(sb, vname) || !sb_append(sb, ";\n") ||
+                            !sb_append(sb, vname) || !sb_append(sb, is_inc ? "++;\n" : "--;\n")) {
+                            if (any_hoisted) {
+                                free(rebuilt.buf);
+                            }
                             return false;
                         }
-                        size_t orig_span = (size_t)(inc + 2 - v_start);
-                        size_t t_len = strlen(tmp_name);
-                        if (t_len <= orig_span) {
-                            memcpy(v_start, tmp_name, t_len);
-                            memset(v_start + t_len, ' ', orig_span - t_len);
+                        if (!any_hoisted) {
+                            if (!sb_init(&rebuilt, line_len + 64)) {
+                                return false;
+                            }
+                            any_hoisted = true;
                         }
+                        size_t rep_start = (size_t)(v_start - code_view);
+                        size_t rep_end = (size_t)((inc + 2) - code_view);
+                        if (!sb_append_len(&rebuilt, line + emit_off, rep_start - emit_off) ||
+                            !sb_append(&rebuilt, tmp_name)) {
+                            free(rebuilt.buf);
+                            return false;
+                        }
+                        emit_off = rep_end;
                     }
                     inc += 2;
                 } else {
-                    char *v_start = inc + 2;
-                    while (v_start < mul_end && (*v_start == ' ' || *v_start == '\t')) {
+                    const char *v_start = inc + 2;
+                    while (v_start < mul_close && (*v_start == ' ' || *v_start == '\t')) {
                         v_start++;
                     }
-                    char *v_end = v_start;
-                    while (v_end < mul_end && (isalnum((unsigned char)*v_end) || *v_end == '_')) {
+                    const char *v_end = v_start;
+                    while (v_end < mul_close && (isalnum((unsigned char)*v_end) || *v_end == '_')) {
                         v_end++;
                     }
+                    bool is_member = (v_end < mul_close && *v_end == '.');
                     size_t v_len = (size_t)(v_end - v_start);
-                    if (v_len > 0 && v_len < 64) {
+                    if (!is_member && v_len > 0 && v_len < 64 &&
+                        span_contains_standalone_ident(other_s, other_e, v_start, v_len)) {
                         char vname[64];
                         memcpy(vname, v_start, v_len);
                         vname[v_len] = '\0';
                         if (!sb_append(sb, is_inc ? "++" : "--") || !sb_append(sb, vname) ||
                             !sb_append(sb, ";\n")) {
+                            if (any_hoisted) {
+                                free(rebuilt.buf);
+                            }
                             return false;
                         }
-                        memset(inc, ' ', (size_t)(v_start - inc));
+                        if (!any_hoisted) {
+                            if (!sb_init(&rebuilt, line_len + 64)) {
+                                return false;
+                            }
+                            any_hoisted = true;
+                        }
+                        size_t rep_start = (size_t)(inc - code_view);
+                        size_t rep_end = (size_t)(v_end - code_view);
+                        if (!sb_append_len(&rebuilt, line + emit_off, rep_start - emit_off) ||
+                            !sb_append(&rebuilt, vname)) {
+                            free(rebuilt.buf);
+                            return false;
+                        }
+                        emit_off = rep_end;
                     }
                     inc = v_end;
                 }
@@ -1661,7 +2134,15 @@ static bool hoist_mul_side_effects(we_strbuf_t *sb, char *line, uint32_t *tmp_co
                 inc++;
             }
         }
-        p = mul_end;
+        p = cur;
+    }
+
+    if (any_hoisted) {
+        if (!sb_append_len(&rebuilt, line + emit_off, line_len - emit_off)) {
+            free(rebuilt.buf);
+            return false;
+        }
+        *out_rewritten = rebuilt.buf;
     }
     return true;
 }
@@ -1696,71 +2177,113 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
         }
     }
 
+    we_var_type_entry_t var_types[128];
+    uint32_t var_type_count = 0;
     uint32_t tmp_counter = 0;
+    bool in_block_comment = false;
+    bool prev_expects_unbraced = false;
     const char *line = expanded_src;
     while (*line) {
         const char *eol = strchr(line, '\n');
         size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
 
         char stack_buf[1024];
+        char stack_view[1024];
         char *lbuf = (line_len < sizeof(stack_buf)) ? stack_buf : (char *)malloc(line_len + 1);
-        if (!lbuf) {
+        char *code_view =
+            (line_len < sizeof(stack_view)) ? stack_view : (char *)malloc(line_len + 1);
+        if (!lbuf || !code_view) {
+            if (lbuf && lbuf != stack_buf) {
+                free(lbuf);
+            }
+            if (code_view && code_view != stack_view) {
+                free(code_view);
+            }
             free(sb.buf);
             return NULL;
         }
         memcpy(lbuf, line, line_len);
         lbuf[line_len] = '\0';
+        bool line_start_in_block = in_block_comment;
+        build_masked_code_view(lbuf, line_len, code_view, &in_block_comment);
 
-        strip_hlsl_bracket_attributes(lbuf);
-        strip_hlsl_storage(lbuf);
-        if (!hoist_mul_side_effects(&sb, lbuf, &tmp_counter)) {
+        strip_hlsl_bracket_attributes_masked(lbuf, code_view, line_len);
+        strip_hlsl_storage_masked(lbuf, code_view, line_len);
+        record_var_types_from_code_line(code_view, line_len, var_types, &var_type_count, 128u);
+
+        char *rewritten = NULL;
+        if (!hoist_mul_side_effects(&sb, lbuf, code_view, line_len, &tmp_counter,
+                                    prev_expects_unbraced, var_types, var_type_count, &rewritten)) {
             if (lbuf != stack_buf) {
                 free(lbuf);
+            }
+            if (code_view != stack_view) {
+                free(code_view);
             }
             free(sb.buf);
             return NULL;
         }
-
-        const char *p = lbuf;
-        const char *end = lbuf + strlen(lbuf);
-        while (p < end && (*p == ' ' || *p == '\t')) {
-            p++;
+        if (rewritten) {
+            if (lbuf != stack_buf) {
+                free(lbuf);
+            }
+            if (code_view != stack_view) {
+                free(code_view);
+            }
+            lbuf = rewritten;
+            line_len = strlen(lbuf);
+            code_view = (line_len < sizeof(stack_view)) ? stack_view : (char *)malloc(line_len + 1);
+            if (!code_view) {
+                free(lbuf);
+                free(sb.buf);
+                return NULL;
+            }
+            bool tmp_block = line_start_in_block;
+            build_masked_code_view(lbuf, line_len, code_view, &tmp_block);
         }
 
+        const char *vp = code_view;
+        const char *vend = code_view + line_len;
+        while (vp < vend && (*vp == ' ' || *vp == '\t')) {
+            vp++;
+        }
+        size_t lead_off = (size_t)(vp - code_view);
+
         bool ok = true;
-        if (!is_frag && end - p > 10 && strncmp(p, "attribute", 9) == 0 &&
-            isspace((unsigned char)p[9])) {
-            ok = sb_append_len(&sb, lbuf, (size_t)(p - lbuf)) && sb_append(&sb, "in") &&
-                 sb_append_len(&sb, p + 9, (size_t)(end - (p + 9))) && sb_append(&sb, "\n");
-        } else if (end - p > 0) {
+        if (!is_frag && vend - vp > 10 && strncmp(vp, "attribute", 9) == 0 &&
+            isspace((unsigned char)vp[9])) {
+            ok = sb_append_len(&sb, lbuf, lead_off) && sb_append(&sb, "in") &&
+                 sb_append_len(&sb, lbuf + lead_off + 9, line_len - (lead_off + 9)) &&
+                 sb_append(&sb, "\n");
+        } else if (vend - vp > 0) {
             const char *qual = NULL;
-            const char *cur = p;
-            if (end - cur > 5 && strncmp(cur, "flat", 4) == 0 && isspace((unsigned char)cur[4])) {
+            const char *cur = vp;
+            if (vend - cur > 5 && strncmp(cur, "flat", 4) == 0 && isspace((unsigned char)cur[4])) {
                 qual = "flat";
                 cur += 4;
-                while (cur < end && (*cur == ' ' || *cur == '\t')) {
+                while (cur < vend && (*cur == ' ' || *cur == '\t')) {
                     cur++;
                 }
-            } else if (end - cur > 9 && strncmp(cur, "centroid", 8) == 0 &&
+            } else if (vend - cur > 9 && strncmp(cur, "centroid", 8) == 0 &&
                        isspace((unsigned char)cur[8])) {
                 qual = "centroid";
                 cur += 8;
-                while (cur < end && (*cur == ' ' || *cur == '\t')) {
+                while (cur < vend && (*cur == ' ' || *cur == '\t')) {
                     cur++;
                 }
-            } else if (end - cur > 7 && strncmp(cur, "smooth", 6) == 0 &&
+            } else if (vend - cur > 7 && strncmp(cur, "smooth", 6) == 0 &&
                        isspace((unsigned char)cur[6])) {
                 qual = "smooth";
                 cur += 6;
-                while (cur < end && (*cur == ' ' || *cur == '\t')) {
+                while (cur < vend && (*cur == ' ' || *cur == '\t')) {
                     cur++;
                 }
             }
 
-            if (end - cur > 8 && strncmp(cur, "varying", 7) == 0 &&
+            if (vend - cur > 8 && strncmp(cur, "varying", 7) == 0 &&
                 isspace((unsigned char)cur[7])) {
                 char decl[256];
-                size_t dlen = (size_t)(end - (cur + 7));
+                size_t dlen = (size_t)(vend - (cur + 7));
                 if (dlen >= sizeof(decl)) {
                     dlen = sizeof(decl) - 1;
                 }
@@ -1785,7 +2308,6 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
                     vtype = tok1;
                     vname = tok2;
                 }
-                int orig_width = vtype ? type_to_width(vtype) : 0;
                 const char *interp = qual ? qual : "";
                 if (interp[0] == '\0' && vtype &&
                     (strncmp(vtype, "int", 3) == 0 || strncmp(vtype, "uint", 4) == 0 ||
@@ -1798,9 +2320,6 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
                     for (uint32_t i = 0; i < promoted_count; i++) {
                         if (strcmp(promoted_varyings[i].name, vname) == 0) {
                             promote_to_vec4 = true;
-                            if (promoted_varyings[i].width > 0) {
-                                orig_width = promoted_varyings[i].width;
-                            }
                             if (promoted_varyings[i].interp[0] != '\0') {
                                 interp = promoted_varyings[i].interp;
                             }
@@ -1810,13 +2329,8 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
                 }
 
                 if (promote_to_vec4 && vname) {
-                    const char *swiz = (orig_width == 1)   ? "x"
-                                       : (orig_width == 2) ? "xy"
-                                       : (orig_width == 3) ? "xyz"
-                                                           : "";
-                    ok = sb_append(&sb, "#undef ") && sb_append(&sb, vname) && sb_append(&sb, "\n");
                     if (interp[0] != '\0') {
-                        ok = ok && sb_append(&sb, interp) && sb_append(&sb, " ");
+                        ok = sb_append(&sb, interp) && sb_append(&sb, " ");
                     }
                     ok = ok && sb_append(&sb, is_frag ? "in " : "out ");
                     if (ok && vprec) {
@@ -1824,11 +2338,6 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
                     }
                     ok = ok && sb_append(&sb, "vec4 ") && sb_append(&sb, vname) &&
                          sb_append(&sb, ";\n");
-                    if (ok && swiz[0] != '\0') {
-                        ok = sb_append(&sb, "#define ") && sb_append(&sb, vname) &&
-                             sb_append(&sb, " ") && sb_append(&sb, vname) && sb_append(&sb, ".") &&
-                             sb_append(&sb, swiz) && sb_append(&sb, "\n");
-                    }
                 } else {
                     if (interp[0] != '\0') {
                         ok = sb_append(&sb, interp) && sb_append(&sb, " ");
@@ -1842,32 +2351,37 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
                              sb_append(&sb, vname) && sb_append(&sb, ";\n");
                     }
                 }
-            } else if (p < end && *p == '#') {
-                const char *q = p + 1;
-                while (q < end && (*q == ' ' || *q == '\t')) {
+            } else if (!line_start_in_block && vp < vend && *vp == '#') {
+                const char *q = vp + 1;
+                while (q < vend && (*q == ' ' || *q == '\t')) {
                     q++;
                 }
-                if (end - q > 7 && strncmp(q, "define", 6) == 0 && isspace((unsigned char)q[6])) {
+                if (vend - q > 7 && strncmp(q, "define", 6) == 0 && isspace((unsigned char)q[6])) {
                     q += 6;
-                    while (q < end && (*q == ' ' || *q == '\t')) {
+                    while (q < vend && (*q == ' ' || *q == '\t')) {
                         q++;
                     }
-                    if (end - q >= 8 && strncmp(q, "saturate", 8) == 0 &&
-                        (end - q == 8 || !(isalnum((unsigned char)q[8]) || q[8] == '_'))) {
+                    if (vend - q >= 8 && strncmp(q, "saturate", 8) == 0 &&
+                        (vend - q == 8 || !(isalnum((unsigned char)q[8]) || q[8] == '_'))) {
                         ok = sb_append(&sb, "#undef saturate\n");
                     }
                 }
-                ok = ok && sb_append_len(&sb, lbuf, (size_t)(end - lbuf)) && sb_append(&sb, "\n");
+                ok = ok && sb_append_len(&sb, lbuf, line_len) && sb_append(&sb, "\n");
             } else {
-                ok = append_line_with_varying_swizzles(&sb, lbuf, (size_t)(end - lbuf),
+                ok = append_line_with_varying_swizzles(&sb, lbuf, code_view, line_len,
                                                        active_swizzles, active_swizzle_count);
             }
         } else {
-            ok = sb_append(&sb, "\n");
+            ok = sb_append_len(&sb, lbuf, line_len) && sb_append(&sb, "\n");
         }
+
+        update_unbraced_control_state(code_view, line_len, &prev_expects_unbraced);
 
         if (lbuf != stack_buf) {
             free(lbuf);
+        }
+        if (code_view != stack_view) {
+            free(code_view);
         }
         if (!ok) {
             free(sb.buf);
@@ -2310,16 +2824,60 @@ static bool resolve_we_shader_cache_path(uint64_t hash, char *out_path, size_t c
     return (n > 0 && (size_t)n < cap);
 }
 
+static _Atomic uint32_t s_we_cache_tmp_seq = 0u;
+
+static bool we_read_all_no_eintr(int fd, void *buf, size_t len)
+{
+    uint8_t *dst = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = read(fd, dst + got, len - got);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        got += (size_t)n;
+    }
+    return true;
+}
+
+static bool we_write_all_no_eintr(int fd, const void *buf, size_t len)
+{
+    const uint8_t *src = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, src + sent, len - sent);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        sent += (size_t)n;
+    }
+    return true;
+}
+
 static GLuint try_load_we_cached_program(const char *cache_path)
 {
     int fd = open(cache_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         return 0;
     }
+    struct stat st;
     we_prog_cache_hdr_t hdr;
-    ssize_t r = read(fd, &hdr, sizeof(hdr));
-    if (r != (ssize_t)sizeof(hdr) || hdr.magic != WE_PROG_CACHE_MAGIC || hdr.length == 0 ||
-        hdr.length > 16u * 1024u * 1024u) {
+    if (fstat(fd, &st) != 0 || st.st_size <= (off_t)sizeof(hdr) ||
+        !we_read_all_no_eintr(fd, &hdr, sizeof(hdr)) || hdr.magic != WE_PROG_CACHE_MAGIC ||
+        hdr.length == 0 || hdr.length > 16u * 1024u * 1024u ||
+        st.st_size != (off_t)(sizeof(hdr) + hdr.length)) {
         close(fd);
         return 0;
     }
@@ -2328,22 +2886,9 @@ static GLuint try_load_we_cached_program(const char *cache_path)
         close(fd);
         return 0;
     }
-    size_t got = 0;
-    while (got < hdr.length) {
-        ssize_t n = read(fd, buf + got, hdr.length - got);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-        got += (size_t)n;
-    }
+    bool ok_rd = we_read_all_no_eintr(fd, buf, hdr.length);
     close(fd);
-    if (got != hdr.length) {
+    if (!ok_rd) {
         free(buf);
         return 0;
     }
@@ -2384,8 +2929,9 @@ static void save_we_cached_program(GLuint prog, const char *cache_path)
         free(buf);
         return;
     }
-    char tmp_path[4464];
-    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", cache_path, (int)getpid()) >=
+    char tmp_path[4480];
+    uint32_t seq = atomic_fetch_add_explicit(&s_we_cache_tmp_seq, 1u, memory_order_relaxed);
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d.%u", cache_path, (int)getpid(), seq) >=
         (int)sizeof(tmp_path)) {
         free(buf);
         return;
@@ -2397,12 +2943,12 @@ static void save_we_cached_program(GLuint prog, const char *cache_path)
             .format = (uint32_t)bin_fmt,
             .length = (uint32_t)actual_len,
         };
-        bool ok = (write(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr)) &&
-                  (write(fd, buf, (size_t)actual_len) == (ssize_t)actual_len);
-        close(fd);
-        if (ok) {
-            (void)rename(tmp_path, cache_path);
-        } else {
+        bool ok = we_write_all_no_eintr(fd, &hdr, sizeof(hdr)) &&
+                  we_write_all_no_eintr(fd, buf, (size_t)actual_len);
+        if (close(fd) != 0) {
+            ok = false;
+        }
+        if (!ok || rename(tmp_path, cache_path) != 0) {
             unlink(tmp_path);
         }
     }
@@ -2418,11 +2964,14 @@ uint32_t we_shader_compile_program(const char *vert_glsl, const char *frag_glsl,
 
     char cache_path[4400] = {0};
     uint64_t h = 14695981039346656037ULL;
+    const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
+    const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
+    const char *gl_version = (const char *)glGetString(GL_VERSION);
     h = fnv1a_step_str(h, vert_glsl);
     h = fnv1a_step_str(h, frag_glsl);
-    h = fnv1a_step_str(h, (const char *)glGetString(GL_VENDOR));
-    h = fnv1a_step_str(h, (const char *)glGetString(GL_RENDERER));
-    h = fnv1a_step_str(h, (const char *)glGetString(GL_VERSION));
+    h = fnv1a_step_str(h, gl_vendor ? gl_vendor : "unknown_vendor");
+    h = fnv1a_step_str(h, gl_renderer ? gl_renderer : "unknown_renderer");
+    h = fnv1a_step_str(h, gl_version ? gl_version : "unknown_version");
     bool have_cache_path = resolve_we_shader_cache_path(h, cache_path, sizeof(cache_path));
     if (have_cache_path) {
         GLuint cached_prog = try_load_we_cached_program(cache_path);

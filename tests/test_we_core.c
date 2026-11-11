@@ -27,6 +27,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void)
+{
+    return "leak:<unknown module>\nleak:gbm_create_device\nleak:libgbm\nleak:libEGL\n"
+           "leak:libGLESv2\nleak:dri\nleak:libnvidia\n";
+}
+#endif
+
 /* =========================================================================
  * Binary Serialization Helpers for Synthetic PKGV / TEXV / MDLV Containers
  * ========================================================================= */
@@ -971,9 +983,10 @@ static void test_pkg_tex_shader_and_scene_edge_cases(void)
     /* Verify identifier sanitizer rejected "BAD;INJECT" */
     assert(strstr(prep.vert_glsl, "BAD;INJECT") == NULL);
     /* Verify cross-stage varying promotion upgraded v_TexCoord to vec4 in VS with .xy swizzle */
-    assert(strstr(prep.vert_glsl, "#undef v_TexCoord") != NULL);
     assert(strstr(prep.vert_glsl, "out vec4 v_TexCoord;") != NULL);
-    assert(strstr(prep.vert_glsl, "#define v_TexCoord v_TexCoord.xy") != NULL);
+    assert(strstr(prep.vert_glsl, "v_TexCoord.xy = a_TexCoord;") != NULL);
+    assert(strstr(prep.vert_glsl, "#define v_TexCoord") == NULL);
+    assert(strstr(prep.vert_glsl, "v_TexCoord.xy.xy") == NULL);
     /* Verify preprocessor stripped #version 130 from included header */
     assert(strstr(prep.frag_glsl, "#version 130") == NULL);
     assert(strstr(prep.frag_glsl, "inc_helper") != NULL);
@@ -981,6 +994,105 @@ static void test_pkg_tex_shader_and_scene_edge_cases(void)
     we_shader_preprocessed_free(&prep);
     we_pkg_close(pkg);
     bb_free(&pkg_buf);
+
+    /* HLSL mul() side-effect hoisting, varying .x member safety, block-comment metadata,
+     * and relative-path #include deduplication regression checks */
+    {
+        const char *meta_blk_src =
+            "/*\n"
+            "// [COMBO] {\"combo\":\"DEAD_COMBO\",\"default\":1}\n"
+            "uniform float g_DeadUniform; // {\"material\":\"dead\",\"default\":9.0}\n"
+            "*/\n"
+            "// [COMBO] {\"combo\":\"LIVE_COMBO\",\"default\":1}\n"
+            "uniform float g_LiveUniform; /* inline comment */ // "
+            "{\"material\":\"live\",\"default\":3.5}\n";
+        we_shader_meta_t mblk;
+        memset(&mblk, 0, sizeof(mblk));
+        we_shader_extract_metadata(meta_blk_src, &mblk);
+        assert(mblk.combo_count == 1u && strcmp(mblk.combos[0].name, "LIVE_COMBO") == 0);
+        assert(mblk.uniform_count == 1u && strcmp(mblk.uniforms[0].name, "g_LiveUniform") == 0);
+        assert(fabsf(mblk.uniforms[0].default_val[0] - 3.5f) < 1e-5f);
+
+        const char *vs_fvar = "// Comment mentioning mul(i++, M[i]) at global scope\n"
+                              "/* Multi-line comment\n"
+                              "   varying float v_Dead;\n"
+                              "   mul(k++, M[k])\n"
+                              "*/\n"
+                              "attribute vec3 a_Position;\n"
+                              "varying vec4 v_Data;\n"
+                              "void main() {\n"
+                              "    int i = 0;\n"
+                              "    float f = 1.25;\n"
+                              "    mat4 M = mat4(1.0);\n"
+                              "    vec4 single_op = mul(vec4(float(i++)), M);\n"
+                              "    vec4 dual_op = mul(f++, vec4(f));\n"
+                              "    if (i > 5)\n"
+                              "        single_op = mul(f++, vec4(f));\n"
+                              "    else\n"
+                              "        single_op = vec4(1.0);\n"
+                              "    v_Data = single_op + dual_op;\n"
+                              "    gl_Position = vec4(a_Position, 1.0);\n"
+                              "}\n";
+        const char *fs_fvar = "varying float v_Data;\n"
+                              "struct Holder { float v_Data; };\n"
+                              "void main() {\n"
+                              "    Holder h;\n"
+                              "    h.v_Data = 0.25;\n"
+                              "    float val = v_Data + h.v_Data;\n"
+                              "    gl_FragColor = vec4(val, val, val, 1.0);\n"
+                              "}\n";
+        we_shader_preprocessed_t fprep;
+        assert(we_shader_preprocess_pair(vs_fvar, fs_fvar, NULL, NULL, 0, 0u, false, &fprep));
+        assert(strstr(fprep.vert_glsl, "out float v_Dead") == NULL &&
+               strstr(fprep.vert_glsl, "out vec4 v_Dead") == NULL);
+        assert(strstr(fprep.vert_glsl, "float _we_tmp_0 = f;\nf++;\n") != NULL);
+        assert(strstr(fprep.vert_glsl, "_we_tmp_1") == NULL);
+        assert(strstr(fprep.vert_glsl, "float(i++)") != NULL);
+        assert(strstr(fprep.frag_glsl, "in vec4 v_Data;") != NULL);
+        assert(strstr(fprep.frag_glsl, "v_Data.x + h.v_Data") != NULL);
+        assert(strstr(fprep.frag_glsl, "v_Data.x.x") == NULL);
+        assert(strstr(fprep.frag_glsl, "h.v_Data.x") == NULL);
+        assert(strstr(fprep.frag_glsl, "struct Holder { float v_Data; };") != NULL);
+        we_shader_preprocessed_free(&fprep);
+
+        const char *bloom_common = "float bloom_inc_fn(float x) { return x + 2.0; }\n";
+        const char *water_common = "float water_inc_fn(float x) { return x * 3.0; }\n";
+        const pkg_test_item_t rel_items[] = {
+            {.path = "shaders/effects/bloom/common.h",
+             .data = bloom_common,
+             .len = strlen(bloom_common)},
+            {.path = "shaders/effects/water/common.h",
+             .data = water_common,
+             .len = strlen(water_common)},
+        };
+        byte_buf_t rbuf;
+        build_synthetic_pkg(&rbuf, "PKGV0002", rel_items, 2);
+        we_pkg_t *rpkg = we_pkg_open_mem(rbuf.data, rbuf.len, NULL);
+        assert(rpkg != NULL);
+        const char *rel_frag =
+            "#include \"effects/bloom/common.h\"\n"
+            "#include \"effects/water/common.h\"\n"
+            "void main() { gl_FragColor = vec4(bloom_inc_fn(water_inc_fn(1.0))); }\n";
+        char *rel_out = we_shader_preprocess_stage(rel_frag, true, rpkg, NULL, 0, 0, false, NULL);
+        assert(rel_out != NULL);
+        assert(strstr(rel_out, "bloom_inc_fn") != NULL && strstr(rel_out, "water_inc_fn") != NULL);
+        free(rel_out);
+
+        char many_includes[2048];
+        size_t moff = 0;
+        for (unsigned idx = 0; idx <= WE_SHADER_MAX_INCLUDES; ++idx) {
+            moff += (size_t)snprintf(many_includes + moff, sizeof(many_includes) - moff,
+                                     "#include \"dir_%u/hdr.h\"\n", idx);
+        }
+        snprintf(many_includes + moff, sizeof(many_includes) - moff,
+                 "void main() { gl_FragColor = vec4(1.0); }\n");
+        char *overflow_out =
+            we_shader_preprocess_stage(many_includes, true, rpkg, NULL, 0, 0, false, NULL);
+        assert(overflow_out == NULL);
+
+        we_pkg_close(rpkg);
+        bb_free(&rbuf);
+    }
 
     /* Scene rendering & effect chain regression tests */
     {
