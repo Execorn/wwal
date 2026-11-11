@@ -165,6 +165,7 @@ class IpcClient : public QObject, public IIpcClientService {
     bool popPendingForOpcode(uint16_t reqOpcode, PendingRequest &outReq);
     void failInFlightRequests(const QString &reason);
 
+    mutable std::mutex m_stateMutex;
     QString m_namespaceStr;
     QString m_customSocketPath;
     QString m_resolvedSocketPath;

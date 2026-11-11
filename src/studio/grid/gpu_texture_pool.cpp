@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gpu_texture_pool.hpp"
+#include "etc2_simd_compressor.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -16,6 +17,13 @@
 
 #include <waywal/thumb_cache.h>
 #include <waywal/image_loader.h>
+
+#ifndef GL_COMPRESSED_RGB8_ETC2
+#define GL_COMPRESSED_RGB8_ETC2 0x9274
+#endif
+#ifndef GL_COMPRESSED_SRGB8_ETC2
+#define GL_COMPRESSED_SRGB8_ETC2 0x9275
+#endif
 
 namespace wwal::studio {
 
@@ -154,15 +162,18 @@ void generateShaderThumbnail(const std::string &path, uint8_t *out_rgba, uint32_
 
 } // namespace
 
-void PboUploadQueue::init(QOpenGLExtraFunctions *gl)
+void PboUploadQueue::init(QOpenGLExtraFunctions *gl, size_t initial_bytes)
 {
     if (initialized || !gl)
         return;
 
+    buffer_size = initial_bytes;
     gl->glGenBuffers(2, pbo_ids);
-    for (int i = 0; i < 2; ++i) {
+    for (size_t i = 0; i < 2; ++i) {
         gl->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_ids[i]);
-        gl->glBufferData(GL_PIXEL_UNPACK_BUFFER, buffer_size, nullptr, GL_STREAM_DRAW);
+        gl->glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(buffer_size), nullptr,
+                         GL_STREAM_DRAW);
+        pbo_capacities[i] = buffer_size;
     }
     gl->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
@@ -176,32 +187,66 @@ void PboUploadQueue::destroy(QOpenGLExtraFunctions *gl)
         gl->glDeleteBuffers(2, pbo_ids);
         pbo_ids[0] = 0;
         pbo_ids[1] = 0;
+        pbo_capacities = {0, 0};
         initialized = false;
     }
 }
 
-void PboUploadQueue::uploadAsync(QOpenGLExtraFunctions *gl, const uint8_t *decoded_rgba,
-                                 GLuint target_tex_layer, GLuint tex_array_id)
+void PboUploadQueue::uploadAsync(QOpenGLExtraFunctions *gl, const uint8_t *payload,
+                                 size_t payload_bytes, GLuint target_tex_layer, GLuint tex_array_id,
+                                 bool is_etc2, GLenum internal_fmt)
 {
-    if (!initialized || !gl || !decoded_rgba)
+    if (!initialized || !gl || !payload || payload_bytes == 0 || tex_array_id == 0)
         return;
 
-    // Bind active PBO, orphan buffer storage, map memory, and write CPU pixels
-    gl->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_ids[active_pbo]);
-    void *gpu_ptr = gl->glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, buffer_size,
-                                         GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-    if (gpu_ptr) {
-        std::memcpy(gpu_ptr, decoded_rgba, buffer_size);
-        gl->glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+    // QPainter on QOpenGLWidget mutates unpack row length/skip state on the shared context.
+    gl->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+#ifdef GL_UNPACK_ROW_LENGTH
+    gl->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
+#ifdef GL_UNPACK_SKIP_PIXELS
+    gl->glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+#endif
+#ifdef GL_UNPACK_SKIP_ROWS
+    gl->glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+#endif
+
+    const size_t slot = static_cast<size_t>(active_pbo & 1u);
+    gl->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_ids[slot]);
+    if (payload_bytes > pbo_capacities[slot]) {
+        pbo_capacities[slot] = payload_bytes;
+        gl->glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(payload_bytes), nullptr,
+                         GL_STREAM_DRAW);
     }
 
-    // Trigger DMA transfer from active PBO into target texture layer
-    gl->glBindTexture(GL_TEXTURE_2D_ARRAY, tex_array_id);
-    gl->glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, target_tex_layer, GpuTexturePool::THUMB_WIDTH,
-                        GpuTexturePool::THUMB_HEIGHT, 1, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    void *gpu_ptr =
+        gl->glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, static_cast<GLsizeiptr>(payload_bytes),
+                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    if (gpu_ptr) {
+        std::memcpy(gpu_ptr, payload, payload_bytes);
+        gl->glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+    } else {
+        gl->glBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, static_cast<GLsizeiptr>(payload_bytes),
+                            payload);
+    }
 
+    gl->glBindTexture(GL_TEXTURE_2D_ARRAY, tex_array_id);
+    if (is_etc2) {
+        gl->glCompressedTexSubImage3D(
+            GL_TEXTURE_2D_ARRAY, 0, 0, 0, static_cast<GLint>(target_tex_layer),
+            static_cast<GLsizei>(GpuTexturePool::THUMB_WIDTH),
+            static_cast<GLsizei>(GpuTexturePool::THUMB_HEIGHT), 1, internal_fmt,
+            static_cast<GLsizei>(payload_bytes), nullptr);
+    } else {
+        gl->glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, static_cast<GLint>(target_tex_layer),
+                            static_cast<GLsizei>(GpuTexturePool::THUMB_WIDTH),
+                            static_cast<GLsizei>(GpuTexturePool::THUMB_HEIGHT), 1, GL_RGBA,
+                            GL_UNSIGNED_BYTE, nullptr);
+    }
+
+    gl->glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
     gl->glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-    active_pbo = 1 - active_pbo; // Ping-pong toggle between the two PBOs
+    active_pbo = 1u - slot;
 }
 
 GpuTexturePool::GpuTexturePool(int max_vram_slots) : m_maxVramSlots(std::min(max_vram_slots, 1540))
@@ -209,7 +254,6 @@ GpuTexturePool::GpuTexturePool(int max_vram_slots) : m_maxVramSlots(std::min(max
     initStagingMemory();
     initLru();
 
-    // Spawn background worker threads for L1 -> L2 decode
     unsigned int num_workers = std::clamp(std::thread::hardware_concurrency(), 2u, 6u);
     m_workerThreads.reserve(num_workers);
     for (unsigned int i = 0; i < num_workers; ++i) {
@@ -219,17 +263,24 @@ GpuTexturePool::GpuTexturePool(int max_vram_slots) : m_maxVramSlots(std::min(max
 
 GpuTexturePool::~GpuTexturePool()
 {
-    // Stop worker threads
-    m_stopWorkers = true;
+    shutdownWorkers();
+    freeStagingMemory();
+    destroyLru();
+}
+
+void GpuTexturePool::shutdownWorkers()
+{
+    bool expected = false;
+    if (!m_stopWorkers.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
     m_taskCv.notify_all();
     for (auto &t : m_workerThreads) {
         if (t.joinable()) {
             t.join();
         }
     }
-
-    freeStagingMemory();
-    destroyLru();
+    m_workerThreads.clear();
 }
 
 void GpuTexturePool::setThumbnailReadyCallback(std::function<void()> callback)
@@ -291,7 +342,8 @@ void GpuTexturePool::initLru()
 
     std::lock_guard<std::mutex> slock(m_statsMutex);
     m_stats.max_slots = m_maxVramSlots;
-    m_stats.total_vram_bytes = static_cast<size_t>(m_maxVramSlots) * FRAME_SIZE_BYTES;
+    m_stats.total_vram_bytes = static_cast<size_t>(m_maxVramSlots) *
+                               (m_arrayUsesEtc2 ? ETC2_FRAME_SIZE_BYTES : FRAME_SIZE_BYTES);
 }
 
 void GpuTexturePool::destroyLru()
@@ -369,6 +421,7 @@ int GpuTexturePool::allocateLayerFor(uint32_t item_id)
             node->decode_queued = false;
             node->ready = false;
             node->thumbnail = QImage();
+            node->etc2_blocks.reset();
         } else {
             return -1;
         }
@@ -389,23 +442,79 @@ bool GpuTexturePool::initGl(QOpenGLExtraFunctions *gl)
     if (m_initialized || !gl)
         return false;
 
-    // Allocate 3D Texture Array: GL_TEXTURE_2D_ARRAY (384 x 216 x N_layers RGBA8)
-    gl->glGenTextures(1, &m_texArrayId);
-    gl->glBindTexture(GL_TEXTURE_2D_ARRAY, m_texArrayId);
+    while (gl->glGetError() != GL_NO_ERROR) {
+    }
 
-    gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    auto tryAllocCompressedArray = [&](GLenum internalFmt) -> bool {
+        GLuint tex = 0;
+        gl->glGenTextures(1, &tex);
+        gl->glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl->glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, internalFmt, static_cast<GLsizei>(THUMB_WIDTH),
+                           static_cast<GLsizei>(THUMB_HEIGHT), m_maxVramSlots);
+        if (gl->glGetError() == GL_NO_ERROR) {
+            gl->glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+            m_texArrayId = tex;
+            m_arrayUsesEtc2 = true;
+            m_arrayInternalFormat = internalFmt;
+            return true;
+        }
+        gl->glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+        gl->glDeleteTextures(1, &tex);
+        while (gl->glGetError() != GL_NO_ERROR) {
+        }
 
-    gl->glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, THUMB_WIDTH, THUMB_HEIGHT, m_maxVramSlots, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        gl->glGenTextures(1, &tex);
+        gl->glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        const GLsizei totalBytes =
+            static_cast<GLsizei>(ETC2_FRAME_SIZE_BYTES * static_cast<size_t>(m_maxVramSlots));
+        gl->glCompressedTexImage3D(GL_TEXTURE_2D_ARRAY, 0, internalFmt,
+                                   static_cast<GLsizei>(THUMB_WIDTH),
+                                   static_cast<GLsizei>(THUMB_HEIGHT), m_maxVramSlots, 0,
+                                   totalBytes, nullptr);
+        if (gl->glGetError() == GL_NO_ERROR) {
+            gl->glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+            m_texArrayId = tex;
+            m_arrayUsesEtc2 = true;
+            m_arrayInternalFormat = internalFmt;
+            return true;
+        }
+        gl->glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+        gl->glDeleteTextures(1, &tex);
+        while (gl->glGetError() != GL_NO_ERROR) {
+        }
+        return false;
+    };
 
-    gl->glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+    if (!tryAllocCompressedArray(GL_COMPRESSED_SRGB8_ETC2) &&
+        !tryAllocCompressedArray(GL_COMPRESSED_RGB8_ETC2)) {
+        gl->glGenTextures(1, &m_texArrayId);
+        gl->glBindTexture(GL_TEXTURE_2D_ARRAY, m_texArrayId);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl->glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl->glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, THUMB_WIDTH, THUMB_HEIGHT,
+                         m_maxVramSlots, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        gl->glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+        m_arrayUsesEtc2 = false;
+        m_arrayInternalFormat = GL_RGBA8;
+    }
 
-    // Initialize Dual-PBO Ping-Pong Queue
-    m_pboQueue.init(gl);
+    const size_t perSlotBytes = m_arrayUsesEtc2 ? ETC2_FRAME_SIZE_BYTES : FRAME_SIZE_BYTES;
+    {
+        std::lock_guard<std::mutex> slock(m_statsMutex);
+        m_stats.total_vram_bytes = static_cast<size_t>(m_maxVramSlots) * perSlotBytes;
+    }
 
+    m_pboQueue.init(gl, perSlotBytes);
     m_initialized = true;
     return true;
 }
@@ -443,6 +552,7 @@ int GpuTexturePool::requestTexture(uint32_t item_id, const std::string &media_pa
                 it->second->ready = false;
                 it->second->decode_queued = false;
                 it->second->thumbnail = QImage();
+                it->second->etc2_blocks.reset();
                 layer = it->second->layer_index;
             } else {
                 if (it->second->ready) {
@@ -479,6 +589,7 @@ int GpuTexturePool::requestTexture(uint32_t item_id, const std::string &media_pa
         m_stagingSlots[staging_slot_idx].media_path = media_path;
         m_stagingSlots[staging_slot_idx].ready_for_upload = false;
         m_stagingSlots[staging_slot_idx].decode_succeeded = false;
+        m_stagingSlots[staging_slot_idx].etc2_blocks.reset();
     }
 
     {
@@ -522,6 +633,7 @@ int GpuTexturePool::processPendingUploads(QOpenGLExtraFunctions *gl, int max_upl
         uint32_t item_id = 0;
         std::string slot_media_path;
         bool decode_ok = false;
+        std::shared_ptr<std::vector<uint8_t>> slot_etc2;
         {
             std::lock_guard<std::mutex> lock(m_stagingMutex);
             if (staging_idx < m_stagingSlots.size() &&
@@ -531,32 +643,40 @@ int GpuTexturePool::processPendingUploads(QOpenGLExtraFunctions *gl, int max_upl
                 item_id = m_stagingSlots[staging_idx].item_id;
                 slot_media_path = m_stagingSlots[staging_idx].media_path;
                 decode_ok = m_stagingSlots[staging_idx].decode_succeeded;
+                slot_etc2 = std::move(m_stagingSlots[staging_idx].etc2_blocks);
             }
         }
 
         if (slot_rgba && target_layer >= 0) {
-            QImage thumb_copy;
-            if (decode_ok) {
-                QImage thumb_img(slot_rgba, static_cast<int>(THUMB_WIDTH),
-                                 static_cast<int>(THUMB_HEIGHT),
-                                 static_cast<qsizetype>(THUMB_WIDTH) * 4, QImage::Format_RGBA8888);
-                thumb_copy = thumb_img.copy();
-            }
+            QImage thumb_img(slot_rgba, static_cast<int>(THUMB_WIDTH),
+                             static_cast<int>(THUMB_HEIGHT),
+                             static_cast<qsizetype>(THUMB_WIDTH) * 4, QImage::Format_RGBA8888);
+            QImage thumb_copy = decode_ok ? thumb_img.copy() : QImage();
 
+            bool slot_still_valid = false;
             {
                 std::lock_guard<std::mutex> lock(m_lruMutex);
                 auto it = m_itemToNode.find(item_id);
                 if (it != m_itemToNode.end() && it->second->layer_index == target_layer &&
                     it->second->media_path == slot_media_path) {
                     it->second->thumbnail = std::move(thumb_copy);
+                    it->second->etc2_blocks = slot_etc2;
                     it->second->ready = true;
                     it->second->decode_queued = false;
+                    slot_still_valid = true;
                 }
             }
 
-            if (m_initialized && gl) {
-                m_pboQueue.uploadAsync(gl, slot_rgba, static_cast<GLuint>(target_layer),
-                                       m_texArrayId);
+            if (slot_still_valid && m_initialized && gl && m_texArrayId != 0) {
+                if (m_arrayUsesEtc2 && slot_etc2 && slot_etc2->size() == ETC2_FRAME_SIZE_BYTES) {
+                    m_pboQueue.uploadAsync(gl, slot_etc2->data(), slot_etc2->size(),
+                                           static_cast<GLuint>(target_layer), m_texArrayId, true,
+                                           m_arrayInternalFormat);
+                } else if (!m_arrayUsesEtc2) {
+                    m_pboQueue.uploadAsync(gl, slot_rgba, FRAME_SIZE_BYTES,
+                                           static_cast<GLuint>(target_layer), m_texArrayId, false,
+                                           GL_RGBA8);
+                }
             }
             ++uploaded_count;
         }
@@ -565,6 +685,7 @@ int GpuTexturePool::processPendingUploads(QOpenGLExtraFunctions *gl, int max_upl
         {
             std::lock_guard<std::mutex> lock(m_stagingMutex);
             m_stagingSlots[staging_idx].ready_for_upload = false;
+            m_stagingSlots[staging_idx].etc2_blocks.reset();
             m_freeStagingSlots.push(staging_idx);
         }
     }
@@ -595,6 +716,17 @@ QImage GpuTexturePool::getThumbnailImage(uint32_t item_id) const
     auto it = m_itemToNode.find(item_id);
     if (it != m_itemToNode.end() && it->second->ready) {
         return it->second->thumbnail;
+    }
+    return {};
+}
+
+std::shared_ptr<const std::vector<uint8_t>>
+GpuTexturePool::getCompressedEtc2Blocks(uint32_t item_id) const
+{
+    std::lock_guard<std::mutex> lock(m_lruMutex);
+    auto it = m_itemToNode.find(item_id);
+    if (it != m_itemToNode.end() && it->second->ready) {
+        return it->second->etc2_blocks;
     }
     return {};
 }
@@ -631,6 +763,7 @@ void GpuTexturePool::clear()
         for (size_t idx : reclaimed_slots) {
             if (idx < m_stagingSlots.size()) {
                 m_stagingSlots[idx].ready_for_upload = false;
+                m_stagingSlots[idx].etc2_blocks.reset();
                 m_freeStagingSlots.push(idx);
             }
         }
@@ -768,10 +901,15 @@ void GpuTexturePool::workerLoop()
 
         if (slot_ptr) {
             bool ok = decodeThumbnail(task.media_path, task.preview_path, slot_ptr);
+            auto etc2Buf = std::make_shared<std::vector<uint8_t>>();
+            etc2::encodeRgbaToEtc2Simd(slot_ptr, static_cast<int>(THUMB_WIDTH),
+                                       static_cast<int>(THUMB_HEIGHT),
+                                       static_cast<int>(THUMB_WIDTH * BYTES_PER_PIXEL), *etc2Buf);
 
             {
                 std::lock_guard<std::mutex> lock(m_stagingMutex);
                 m_stagingSlots[task.staging_slot_idx].decode_succeeded = ok;
+                m_stagingSlots[task.staging_slot_idx].etc2_blocks = std::move(etc2Buf);
                 m_stagingSlots[task.staging_slot_idx].ready_for_upload = true;
             }
 

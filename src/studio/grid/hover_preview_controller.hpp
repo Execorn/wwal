@@ -10,10 +10,12 @@
 #include <chrono>
 
 #include <QObject>
+#include <QPointer>
 #include <QTimer>
 #include <QImage>
 #include <QMovie>
 #include <QOpenGLExtraFunctions>
+#include <QOpenGLWidget>
 
 #include "fuzzy_catalog_index.hpp"
 
@@ -34,6 +36,8 @@ class HoverPreviewController : public QObject {
 
     HoverPreviewController(const HoverPreviewController &) = delete;
     HoverPreviewController &operator=(const HoverPreviewController &) = delete;
+
+    void setGlOwner(QOpenGLWidget *owner) noexcept { m_glOwner = owner; }
 
     // OpenGL Initialization / Destruction (must be called with active GL context)
     void initGl(QOpenGLExtraFunctions *gl);
@@ -63,11 +67,15 @@ class HoverPreviewController : public QObject {
     void onPlaybackTick();
 
   private:
+    QPointer<QOpenGLWidget> m_glOwner;
     QOpenGLExtraFunctions *m_gl{nullptr};
     GLuint m_previewTexId{0};
     GLuint m_shaderFbo{0};
     GLuint m_shaderProgram{0};
+    GLuint m_quadVao{0};
+    GLuint m_quadVbo{0};
     QImage m_currentPreviewImage;
+    QImage m_videoBaseImage;
 
     // Timers
     QTimer *m_dwellTimer{nullptr};

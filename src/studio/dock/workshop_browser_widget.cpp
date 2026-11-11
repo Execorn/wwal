@@ -299,24 +299,6 @@ std::vector<std::filesystem::path> collectWorkshopRoots()
     return roots;
 }
 
-std::vector<WorkshopRecord> queryWorkshopRecordsFromIndex(const CatalogIndexManager &indexMgr)
-{
-    CatalogFilter filter{};
-    filter.sort_order = CatalogSortOrder::RecentlyUpdated;
-    filter.limit = 50000;
-    filter.offset = 0;
-
-    auto rows = indexMgr.queryByFilters(filter);
-    std::vector<WorkshopRecord> out;
-    out.reserve(rows.size());
-    for (const auto &item : rows) {
-        if (item.storage_backend == 0 || item.storage_backend == 1) {
-            out.push_back(fromCatalogRecord(item));
-        }
-    }
-    return out;
-}
-
 std::vector<WorkshopRecord> scanWorkshopRootsWorker(const std::atomic<bool> &cancelFlag)
 {
     std::vector<WorkshopRecord> results;
@@ -535,6 +517,11 @@ struct WorkshopBrowserWidget::Impl {
     std::atomic<bool> scanCancel{false};
     uint64_t scanGeneration{0};
 
+    std::thread compatScanThread;
+    uint64_t compatScanGeneration{0};
+    std::unordered_map<uint64_t, WorkshopRecord> compatDetailsCache;
+    std::unordered_map<uint64_t, uint32_t> activeDownloadFlags;
+
     std::mutex dbWriteMutex;
     std::condition_variable dbWriteCv;
     std::queue<WorkshopItemRecord> dbWriteQueue;
@@ -586,13 +573,15 @@ struct WorkshopBrowserWidget::Impl {
     void stopDbWriter();
     void enqueueAsyncUpsert(WorkshopItemRecord item);
     void stopScanThread();
+    void stopCompatThread();
+    void requestAsyncCompatDetails(uint64_t pubId, const std::string &dirPath,
+                                   we_compat_tier_t prevTier, uint32_t prevScore);
     void mergeDiscoveredRecords(std::vector<WorkshopRecord> records);
     void launchAsyncScan();
     void rebuildAllIndex();
     void executeQuery();
     void applySorting();
     void syncWithGridView();
-    void ensureCompatDetailsLoaded(WorkshopRecord &rec);
     void updateInspector(const WorkshopRecord &rec);
     void handleDownloadProgress(const DownloadProgress &prog);
     void applyThemeStyles();
@@ -661,6 +650,81 @@ void WorkshopBrowserWidget::Impl::stopScanThread()
     }
 }
 
+void WorkshopBrowserWidget::Impl::stopCompatThread()
+{
+    ++compatScanGeneration;
+    if (compatScanThread.joinable()) {
+        compatScanThread.join();
+    }
+}
+
+void WorkshopBrowserWidget::Impl::requestAsyncCompatDetails(uint64_t pubId,
+                                                            const std::string &dirPath,
+                                                            we_compat_tier_t prevTier,
+                                                            uint32_t prevScore)
+{
+    stopCompatThread();
+    const uint64_t gen = ++compatScanGeneration;
+    QPointer<WorkshopBrowserWidget> self(owner);
+
+    compatScanThread = std::thread([self, gen, pubId, dirPath, prevTier, prevScore]() {
+        std::error_code ec;
+        std::filesystem::path fsDir(dirPath);
+        if (!std::filesystem::is_directory(fsDir, ec) || !self) {
+            return;
+        }
+
+        WorkshopRecord scanned{};
+        scanned.published_file_id = pubId;
+        scanned.compat_tier = prevTier;
+        scanned.compat_score = prevScore;
+        scanned.compat_details_loaded = true;
+
+        CompatScannerPtr scanner(we_compat_scanner_create(true, true), &we_compat_scanner_destroy);
+        CompatReportPtr rep(we_compat_report_alloc(), &we_compat_report_free);
+        if (scanner && rep &&
+            we_compat_scan_directory(scanner.get(), fsDir.string().c_str(), rep.get())) {
+            populateIssuesFromReport(rep.get(), scanned);
+        }
+
+        if (!self) {
+            return;
+        }
+
+        QMetaObject::invokeMethod(
+            self,
+            [self, gen, scanned = std::move(scanned), prevTier, prevScore]() mutable {
+                if (!self || gen != self->m_impl->compatScanGeneration) {
+                    return;
+                }
+                auto &impl = *self->m_impl;
+                if (impl.compatDetailsCache.size() >= 256) {
+                    impl.compatDetailsCache.clear();
+                }
+                impl.compatDetailsCache[scanned.published_file_id] = scanned;
+
+                auto filtIt = impl.idToIndex.find(scanned.published_file_id);
+                if (filtIt != impl.idToIndex.end()) {
+                    auto &rec = impl.filteredRecords[filtIt->second];
+                    rec.compat_details_loaded = true;
+                    rec.compat_tier = scanned.compat_tier;
+                    rec.compat_score = scanned.compat_score;
+                    rec.estimated_vram_mb = scanned.estimated_vram_mb;
+                    rec.estimated_fps = scanned.estimated_fps;
+                    rec.issue_messages = scanned.issue_messages;
+                    rec.repair_descriptions = scanned.repair_descriptions;
+                    if (scanned.compat_tier != prevTier || scanned.compat_score != prevScore) {
+                        impl.enqueueAsyncUpsert(toCatalogRecord(rec));
+                    }
+                    if (impl.selectedPublishedFileId == scanned.published_file_id) {
+                        impl.updateInspector(rec);
+                    }
+                }
+            },
+            Qt::QueuedConnection);
+    });
+}
+
 void WorkshopBrowserWidget::Impl::rebuildAllIndex()
 {
     allIdToIndex.clear();
@@ -708,23 +772,16 @@ void WorkshopBrowserWidget::Impl::launchAsyncScan()
 
     QPointer<WorkshopBrowserWidget> self(owner);
     std::shared_ptr<CatalogIndexManager> indexMgr = owner->m_indexMgr;
+    if (indexMgr && indexMgr->isOpen()) {
+        // Drop duplicate 50k in-memory cache; query SQLite WAL + RCU pool directly on demand.
+        allRecords.clear();
+        allRecords.shrink_to_fit();
+        allIdToIndex.clear();
+        executeQuery();
+    }
+
     scanThread = std::thread([this, self, gen, indexMgr]() {
         if (indexMgr && indexMgr->isOpen()) {
-            // Post warm SQLite snapshot first so startup renders cached secondary-drive items
-            // before directory delta reconciliation completes.
-            auto cached = queryWorkshopRecordsFromIndex(*indexMgr);
-            if (!cached.empty() && !scanCancel.load(std::memory_order_relaxed) && self) {
-                QMetaObject::invokeMethod(
-                    self,
-                    [self, gen, snap = std::move(cached)]() mutable {
-                        if (!self || gen != self->m_impl->scanGeneration) {
-                            return;
-                        }
-                        self->m_impl->mergeDiscoveredRecords(std::move(snap));
-                    },
-                    Qt::QueuedConnection);
-            }
-
             for (const auto &root : collectWorkshopRoots()) {
                 if (scanCancel.load(std::memory_order_relaxed)) {
                     return;
@@ -738,17 +795,13 @@ void WorkshopBrowserWidget::Impl::launchAsyncScan()
             if (scanCancel.load(std::memory_order_relaxed) || !self) {
                 return;
             }
-            auto reconciled = queryWorkshopRecordsFromIndex(*indexMgr);
-            if (scanCancel.load(std::memory_order_relaxed) || !self) {
-                return;
-            }
             QMetaObject::invokeMethod(
                 self,
-                [self, gen, records = std::move(reconciled)]() mutable {
+                [self, gen]() {
                     if (!self || gen != self->m_impl->scanGeneration) {
                         return;
                     }
-                    self->m_impl->mergeDiscoveredRecords(std::move(records));
+                    self->m_impl->executeQuery();
                 },
                 Qt::QueuedConnection);
             return;
@@ -776,54 +829,141 @@ void WorkshopBrowserWidget::Impl::executeQuery()
     filteredRecords.clear();
     idToIndex.clear();
 
-    const QString queryLower = activeQuery.trimmed().toLower();
-    const QStringList queryTokens = queryLower.split(QChar(' '), Qt::SkipEmptyParts);
+    QString targetType;
+    switch (activeCategoryIndex) {
+    case 1:
+        targetType = QStringLiteral("scene");
+        break;
+    case 2:
+        targetType = QStringLiteral("video");
+        break;
+    case 3:
+        targetType = QStringLiteral("shader");
+        break;
+    case 4:
+        targetType = QStringLiteral("web");
+        break;
+    default:
+        break;
+    }
 
-    for (const auto &rec : allRecords) {
-        if (activeCategoryIndex > 0) {
-            QString targetType;
-            switch (activeCategoryIndex) {
+    we_compat_tier_t targetTier = WE_TIER_UNKNOWN;
+    switch (activeTierIndex) {
+    case 1:
+        targetTier = WE_TIER_1_NATIVE;
+        break;
+    case 2:
+        targetTier = WE_TIER_2_TRANSPILED;
+        break;
+    case 3:
+        targetTier = WE_TIER_3_DEGRADED;
+        break;
+    case 4:
+        targetTier = WE_TIER_4_BLOCKED;
+        break;
+    default:
+        break;
+    }
+
+    const QString trimmedQuery = activeQuery.trimmed();
+    if (owner->m_indexMgr && owner->m_indexMgr->isOpen()) {
+        std::vector<WorkshopItemRecord> dbRows;
+        if (trimmedQuery.isEmpty()) {
+            CatalogFilter filter{};
+            filter.type = targetType.toStdString();
+            filter.compat_tier = static_cast<uint32_t>(targetTier);
+            switch (activeSortIndex) {
+            case 0:
+                filter.sort_order = CatalogSortOrder::SubscriptionsDesc;
+                break;
             case 1:
-                targetType = QStringLiteral("scene");
+                filter.sort_order = CatalogSortOrder::RatingDesc;
                 break;
             case 2:
-                targetType = QStringLiteral("video");
+                filter.sort_order = CatalogSortOrder::RecentlyUpdated;
                 break;
             case 3:
-                targetType = QStringLiteral("shader");
+                filter.sort_order = CatalogSortOrder::CompatibilityScoreDesc;
                 break;
             case 4:
-                targetType = QStringLiteral("web");
+                filter.sort_order = CatalogSortOrder::TitleAsc;
                 break;
             default:
+                filter.sort_order = CatalogSortOrder::SubscriptionsDesc;
                 break;
             }
-            if (!targetType.isEmpty() && rec.type != targetType) {
-                continue;
+            filter.limit = 2000;
+            filter.offset = 0;
+            dbRows = owner->m_indexMgr->queryByFilters(filter);
+        } else {
+            bool isExactId = false;
+            const uint64_t pubId = trimmedQuery.toULongLong(&isExactId);
+            if (isExactId && pubId != 0) {
+                if (auto exact = owner->m_indexMgr->getItem(pubId)) {
+                    dbRows.push_back(std::move(*exact));
+                }
+            }
+            auto searched = owner->m_indexMgr->searchFts5Bm25(trimmedQuery.toStdString(), 500, 0);
+            for (auto &r : searched) {
+                if (!isExactId || r.published_file_id != pubId) {
+                    dbRows.push_back(std::move(r));
+                }
             }
         }
 
-        if (activeTierIndex > 0) {
-            we_compat_tier_t targetTier = WE_TIER_UNKNOWN;
-            switch (activeTierIndex) {
-            case 1:
-                targetTier = WE_TIER_1_NATIVE;
-                break;
-            case 2:
-                targetTier = WE_TIER_2_TRANSPILED;
-                break;
-            case 3:
-                targetTier = WE_TIER_3_DEGRADED;
-                break;
-            case 4:
-                targetTier = WE_TIER_4_BLOCKED;
-                break;
-            default:
-                break;
-            }
-            if (rec.compat_tier != targetTier) {
+        filteredRecords.reserve(dbRows.size());
+        for (const auto &row : dbRows) {
+            if (row.storage_backend != 0 && row.storage_backend != 1) {
                 continue;
             }
+            WorkshopRecord rec = fromCatalogRecord(row);
+            if (!targetType.isEmpty() && rec.type != targetType) {
+                continue;
+            }
+            if (targetTier != WE_TIER_UNKNOWN && rec.compat_tier != targetTier) {
+                continue;
+            }
+            if (auto dlIt = activeDownloadFlags.find(rec.published_file_id);
+                dlIt != activeDownloadFlags.end()) {
+                rec.install_state |= dlIt->second;
+            }
+            if (auto cIt = compatDetailsCache.find(rec.published_file_id);
+                cIt != compatDetailsCache.end()) {
+                rec.compat_details_loaded = true;
+                rec.estimated_vram_mb = cIt->second.estimated_vram_mb;
+                rec.estimated_fps = cIt->second.estimated_fps;
+                rec.issue_messages = cIt->second.issue_messages;
+                rec.repair_descriptions = cIt->second.repair_descriptions;
+            }
+            filteredRecords.push_back(std::move(rec));
+        }
+
+        if (trimmedQuery.isEmpty()) {
+            idToIndex.clear();
+            selectedItemIndex = -1;
+            for (size_t i = 0; i < filteredRecords.size(); ++i) {
+                uint64_t id = filteredRecords[i].published_file_id;
+                idToIndex[id] = i;
+                if (selectedPublishedFileId != 0 && id == selectedPublishedFileId) {
+                    selectedItemIndex = static_cast<int>(i);
+                }
+            }
+        } else {
+            applySorting();
+        }
+        syncWithGridView();
+        return;
+    }
+
+    const QString queryLower = trimmedQuery.toLower();
+    const QStringList queryTokens = queryLower.split(QChar(' '), Qt::SkipEmptyParts);
+
+    for (const auto &rec : allRecords) {
+        if (!targetType.isEmpty() && rec.type != targetType) {
+            continue;
+        }
+        if (targetTier != WE_TIER_UNKNOWN && rec.compat_tier != targetTier) {
+            continue;
         }
 
         if (!queryTokens.isEmpty()) {
@@ -919,7 +1059,7 @@ void WorkshopBrowserWidget::Impl::syncWithGridView()
 
     for (const auto &rec : filteredRecords) {
         CatalogItem ci;
-        ci.id = static_cast<uint32_t>(rec.published_file_id & 0xFFFFFFFFu);
+        ci.id = static_cast<uint32_t>(rec.published_file_id ^ (rec.published_file_id >> 32));
         ci.workshop_id = std::to_string(rec.published_file_id);
         ci.title = rec.title.toStdString();
         ci.path = rec.file_path.toStdString();
@@ -944,10 +1084,14 @@ void WorkshopBrowserWidget::Impl::syncWithGridView()
     }
 
     if (statusTelemetryLabel) {
+        const size_t totalCount =
+            (owner->m_indexMgr && owner->m_indexMgr->isOpen())
+                ? std::max(owner->m_indexMgr->totalItemCount(), filteredRecords.size())
+                : allRecords.size();
         statusTelemetryLabel->setText(
             QString("%1 of %2 items  |  Steam: %3")
                 .arg(filteredRecords.size())
-                .arg(allRecords.size())
+                .arg(totalCount)
                 .arg((owner->m_downloadMgr && owner->m_downloadMgr->isSteamClientRunning())
                          ? "<font color='#34d399'>Connected</font>"
                          : "<font color='#94a3b8'>Web API</font>"));
@@ -957,65 +1101,21 @@ void WorkshopBrowserWidget::Impl::syncWithGridView()
     owner->m_gridView->refreshCatalogView();
 }
 
-void WorkshopBrowserWidget::Impl::ensureCompatDetailsLoaded(WorkshopRecord &rec)
-{
-    if (rec.compat_details_loaded || rec.file_path.isEmpty()) {
-        return;
-    }
-    rec.compat_details_loaded = true;
-
-    std::error_code ec;
-    std::filesystem::path dirPath(rec.file_path.toStdString());
-    if (!std::filesystem::is_directory(dirPath, ec)) {
-        return;
-    }
-
-    const we_compat_tier_t prevTier = rec.compat_tier;
-    const uint32_t prevScore = rec.compat_score;
-
-    CompatScannerPtr scanner(we_compat_scanner_create(true, true), &we_compat_scanner_destroy);
-    CompatReportPtr rep(we_compat_report_alloc(), &we_compat_report_free);
-    if (scanner && rep &&
-        we_compat_scan_directory(scanner.get(), dirPath.string().c_str(), rep.get())) {
-        populateIssuesFromReport(rep.get(), rec);
-    }
-
-    auto allIt = allIdToIndex.find(rec.published_file_id);
-    if (allIt != allIdToIndex.end()) {
-        auto &master = allRecords[allIt->second];
-        master.compat_details_loaded = true;
-        master.compat_tier = rec.compat_tier;
-        master.compat_score = rec.compat_score;
-        master.estimated_vram_mb = rec.estimated_vram_mb;
-        master.estimated_fps = rec.estimated_fps;
-        master.issue_messages = rec.issue_messages;
-        master.repair_descriptions = rec.repair_descriptions;
-        if (rec.compat_tier != prevTier || rec.compat_score != prevScore) {
-            enqueueAsyncUpsert(toCatalogRecord(master));
-        }
-    }
-}
-
 void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &inRec)
 {
     if (!inspectorDrawer) {
         return;
     }
 
-    WorkshopRecord localCopy;
-    const WorkshopRecord *targetPtr = &inRec;
-    if (!inRec.compat_details_loaded && !inRec.file_path.isEmpty()) {
-        auto filtIt = idToIndex.find(inRec.published_file_id);
+    const WorkshopRecord &rec = inRec;
+    if (!rec.compat_details_loaded && !rec.file_path.isEmpty()) {
+        auto filtIt = idToIndex.find(rec.published_file_id);
         if (filtIt != idToIndex.end()) {
-            ensureCompatDetailsLoaded(filteredRecords[filtIt->second]);
-            targetPtr = &filteredRecords[filtIt->second];
-        } else {
-            localCopy = inRec;
-            ensureCompatDetailsLoaded(localCopy);
-            targetPtr = &localCopy;
+            filteredRecords[filtIt->second].compat_details_loaded = true;
         }
+        requestAsyncCompatDetails(rec.published_file_id, rec.file_path.toStdString(),
+                                  rec.compat_tier, rec.compat_score);
     }
-    const WorkshopRecord &rec = *targetPtr;
 
     inspectorTitleLabel->setText(rec.title);
     inspectorIdLabel->setText(QString("ID %1  |  %2  |  %3 subscribers")
@@ -1212,6 +1312,25 @@ void WorkshopBrowserWidget::Impl::handleDownloadProgress(const DownloadProgress 
         }
     };
 
+    switch (prog.state) {
+    case TaskState::Queued:
+    case TaskState::Probing:
+    case TaskState::Downloading:
+    case TaskState::Extracting:
+    case TaskState::Verifying:
+    case TaskState::Indexing:
+        activeDownloadFlags[id] = WAYWAL_UGC_STATE_DOWNLOADING;
+        break;
+    case TaskState::Installed:
+        activeDownloadFlags[id] = WAYWAL_UGC_STATE_INSTALLED | WAYWAL_UGC_STATE_SUBSCRIBED;
+        compatDetailsCache.erase(id);
+        break;
+    case TaskState::Failed:
+    case TaskState::Cancelled:
+        activeDownloadFlags.erase(id);
+        break;
+    }
+
     auto allIt = allIdToIndex.find(id);
     if (allIt != allIdToIndex.end()) {
         applyState(allRecords[allIt->second]);
@@ -1227,6 +1346,9 @@ void WorkshopBrowserWidget::Impl::handleDownloadProgress(const DownloadProgress 
 
     auto &rec = filteredRecords[filtIt->second];
     applyState(rec);
+    if (prog.state == TaskState::Installed && allIt == allIdToIndex.end()) {
+        enqueueAsyncUpsert(toCatalogRecord(rec));
+    }
 
     if (selectedItemIndex == static_cast<int>(filtIt->second)) {
         if (prog.state == TaskState::Downloading || prog.state == TaskState::Verifying ||
@@ -1261,6 +1383,7 @@ WorkshopBrowserWidget::WorkshopBrowserWidget(std::shared_ptr<CatalogIndexManager
 WorkshopBrowserWidget::~WorkshopBrowserWidget()
 {
     m_impl->stopScanThread();
+    m_impl->stopCompatThread();
     m_impl->stopDbWriter();
     if (m_impl->hoverDwellTimer) {
         m_impl->hoverDwellTimer->stop();
@@ -1762,7 +1885,8 @@ void WorkshopBrowserWidget::onItemHoverStarted(int itemIndex)
     auto *canvas = m_gridView->findChild<GridGlCanvas *>();
     if (canvas && m_gridView) {
         m_gridView->hoverController().onCellHoverEntered(
-            static_cast<uint32_t>(rec.published_file_id & 0xFFFFFFFFu), rec.file_path.toStdString(),
+            static_cast<uint32_t>(rec.published_file_id ^ (rec.published_file_id >> 32)),
+            rec.file_path.toStdString(),
             (rec.type == QStringLiteral("video")    ? WallpaperBadge::Video
              : rec.type == QStringLiteral("shader") ? WallpaperBadge::Shader
              : rec.type == QStringLiteral("scene")  ? WallpaperBadge::Scene

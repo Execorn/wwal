@@ -358,8 +358,8 @@ void RecursiveFsWatcher::stop()
         }
     }
 
-    flushDebounceQueue();
-
+    // Drop pending debounced events on teardown instead of invoking m_callback while the
+    // owning object is mid-destruction.
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (m_timerFd >= 0) {
         ::close(m_timerFd);
@@ -419,7 +419,9 @@ void RecursiveFsWatcher::addWatchRecursiveLocked(const std::filesystem::path &pa
         return;
     }
 
-    constexpr uint32_t mask = IN_CREATE | IN_DELETE | IN_MODIFY | IN_MOVED_FROM | IN_MOVED_TO |
+    // Omit IN_MODIFY so chunked multi-hundred-MB downloads do not flood the kernel inotify
+    // queue before IN_CLOSE_WRITE or atomic IN_MOVED_TO signals completion.
+    constexpr uint32_t mask = IN_CREATE | IN_DELETE | IN_ATTRIB | IN_MOVED_FROM | IN_MOVED_TO |
                               IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF | IN_DONT_FOLLOW |
                               IN_ONLYDIR;
     int wd = ::inotify_add_watch(m_inotifyFd, normPath.c_str(), mask);

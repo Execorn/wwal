@@ -126,7 +126,7 @@ class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
 
     // Double-buffered PBO + ETC2 compressed thumbnail pipeline
     std::array<GLuint, 2> m_pboRing{0, 0};
-    size_t m_pboCapacityBytes{0};
+    std::array<size_t, 2> m_pboCapacities{0, 0};
     int m_pboIndex{0};
     bool m_supportsEtc2{false};
     GLenum m_etc2InternalFormat{0};
@@ -135,11 +135,17 @@ class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
     std::unordered_set<uint32_t> m_glRenderedThisFrame;
 
     GLuint m_cardProgram{0};
+    GLuint m_cardArrayProgram{0};
     GLuint m_cardVao{0};
     GLuint m_cardVbo{0};
     GLint m_uViewportLoc{-1};
     GLint m_uCardRectLoc{-1};
     GLint m_uTexLoc{-1};
+    GLint m_uArrayViewportLoc{-1};
+    GLint m_uArrayCardRectLoc{-1};
+    GLint m_uArrayTexLoc{-1};
+    GLint m_uArrayLayerLoc{-1};
+    GLint m_uArraySrgbLoc{-1};
     bool m_glInitialized{false};
     QMetaObject::Connection m_contextDestroyConn;
     QLabel *m_fallbackCanvas{nullptr};

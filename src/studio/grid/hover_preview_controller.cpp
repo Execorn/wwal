@@ -60,7 +60,7 @@ QImage loadPreviewFileRobust(const std::string &path)
     return {};
 }
 
-const char *DEFAULT_VERTEX_SHADER = R"(#version 300 es
+const char *DEFAULT_VERTEX_SHADER_ES = R"(#version 300 es
 precision highp float;
 layout (location = 0) in vec2 a_pos;
 out vec2 v_uv;
@@ -71,7 +71,17 @@ void main() {
 }
 )";
 
-const char *FALLBACK_PREVIEW_SHADER = R"(#version 300 es
+const char *DEFAULT_VERTEX_SHADER_CORE = R"(#version 330 core
+layout (location = 0) in vec2 a_pos;
+out vec2 v_uv;
+
+void main() {
+    v_uv = a_pos * 0.5 + 0.5;
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+)";
+
+const char *FALLBACK_PREVIEW_SHADER_ES = R"(#version 300 es
 precision highp float;
 in vec2 v_uv;
 out vec4 fragColor;
@@ -89,6 +99,75 @@ void main() {
     fragColor = vec4(col, 1.0);
 }
 )";
+
+const char *FALLBACK_PREVIEW_SHADER_CORE = R"(#version 330 core
+in vec2 v_uv;
+out vec4 fragColor;
+
+uniform float iTime;
+uniform vec3 iResolution;
+
+void main() {
+    vec2 p = (2.0 * gl_FragCoord.xy - iResolution.xy) / min(iResolution.x, iResolution.y);
+    float d = length(p);
+    float a = atan(p.y, p.x);
+    float v = sin(10.0 * d - 3.0 * iTime + sin(3.0 * a + iTime));
+    vec3 col = 0.5 + 0.5 * cos(iTime + a + vec3(0.0, 2.0, 4.0));
+    col *= (0.7 + 0.3 * v);
+    fragColor = vec4(col, 1.0);
+}
+)";
+
+class GlOwnerScope {
+  public:
+    explicit GlOwnerScope(QOpenGLWidget *owner) noexcept
+    {
+        if (!owner || !owner->isValid() || !owner->context()) {
+            return;
+        }
+        if (QOpenGLContext::currentContext() == owner->context()) {
+            m_ready = true;
+            return;
+        }
+        owner->makeCurrent();
+        m_owner = owner;
+        m_ready = (QOpenGLContext::currentContext() == owner->context());
+    }
+
+    ~GlOwnerScope()
+    {
+        if (m_owner) {
+            m_owner->doneCurrent();
+        }
+    }
+
+    GlOwnerScope(const GlOwnerScope &) = delete;
+    GlOwnerScope &operator=(const GlOwnerScope &) = delete;
+
+    [[nodiscard]] bool isReady() const noexcept { return m_ready; }
+
+  private:
+    QOpenGLWidget *m_owner{nullptr};
+    bool m_ready{false};
+};
+
+QImage computeVideoZoomFrame(const QImage &baseImg, size_t frameIdx, int outW, int outH)
+{
+    if (baseImg.isNull()) {
+        return {};
+    }
+    const float zoom = 1.0f + 0.08f * std::sin(static_cast<float>(frameIdx % 30) * 0.2f);
+    const int cropW = std::max(1, static_cast<int>(static_cast<float>(baseImg.width()) / zoom));
+    const int cropH = std::max(1, static_cast<int>(static_cast<float>(baseImg.height()) / zoom));
+    const int cropX = (baseImg.width() - cropW) / 2;
+    const int cropY = (baseImg.height() - cropH) / 2;
+    QImage frame = baseImg.copy(cropX, cropY, cropW, cropH)
+                       .scaled(outW, outH, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+    if (frame.width() > outW || frame.height() > outH) {
+        frame = frame.copy((frame.width() - outW) / 2, (frame.height() - outH) / 2, outW, outH);
+    }
+    return frame.convertToFormat(QImage::Format_RGBA8888);
+}
 
 } // namespace
 
@@ -131,6 +210,19 @@ void HoverPreviewController::initGl(QOpenGLExtraFunctions *gl)
                                      m_previewTexId, 0);
         m_gl->glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
+
+    if (m_quadVao == 0) {
+        static constexpr float kQuadVerts[] = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
+        m_gl->glGenVertexArrays(1, &m_quadVao);
+        m_gl->glGenBuffers(1, &m_quadVbo);
+        m_gl->glBindVertexArray(m_quadVao);
+        m_gl->glBindBuffer(GL_ARRAY_BUFFER, m_quadVbo);
+        m_gl->glBufferData(GL_ARRAY_BUFFER, sizeof(kQuadVerts), kQuadVerts, GL_STATIC_DRAW);
+        m_gl->glEnableVertexAttribArray(0);
+        m_gl->glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
+        m_gl->glBindBuffer(GL_ARRAY_BUFFER, 0);
+        m_gl->glBindVertexArray(0);
+    }
 }
 
 void HoverPreviewController::destroyGl(QOpenGLExtraFunctions *gl)
@@ -141,6 +233,14 @@ void HoverPreviewController::destroyGl(QOpenGLExtraFunctions *gl)
         if (m_shaderProgram != 0) {
             gl->glDeleteProgram(m_shaderProgram);
             m_shaderProgram = 0;
+        }
+        if (m_quadVbo != 0) {
+            gl->glDeleteBuffers(1, &m_quadVbo);
+            m_quadVbo = 0;
+        }
+        if (m_quadVao != 0) {
+            gl->glDeleteVertexArrays(1, &m_quadVao);
+            m_quadVao = 0;
         }
         if (m_shaderFbo != 0) {
             gl->glDeleteFramebuffers(1, &m_shaderFbo);
@@ -223,8 +323,11 @@ void HoverPreviewController::startActivePreview()
     std::string preview_file = !m_pendingPreviewPath.empty() ? m_pendingPreviewPath : m_activePath;
 
     if (m_activeBadge == WallpaperBadge::Shader) {
-        if (m_gl && QOpenGLContext::currentContext() != nullptr) {
-            setupOffscreenShader(m_activePath);
+        {
+            GlOwnerScope glScope(m_glOwner);
+            if (m_gl && glScope.isReady()) {
+                setupOffscreenShader(m_activePath);
+            }
         }
         m_shaderTime = 0.0f;
         m_shaderFrame = 0;
@@ -232,31 +335,22 @@ void HoverPreviewController::startActivePreview()
         emit previewFrameReady(m_activeItemId, m_previewTexId);
         m_playbackTimer->start(FRAME_INTERVAL_MS);
     } else if (m_activeBadge == WallpaperBadge::Video) {
-        // First 4 seconds preview: load thumbnail or animated sequence
         QImage initial_img = loadPreviewFileRobust(preview_file);
         if (!initial_img.isNull()) {
-            // Generate simple animated pan/zoom frames or cycle frames
-            m_preloadedFrames.reserve(30);
-            for (int f = 0; f < 30; ++f) {
-                float zoom = 1.0f + 0.08f * std::sin(f * 0.2f);
-                int crop_w = std::max(1, static_cast<int>(initial_img.width() / zoom));
-                int crop_h = std::max(1, static_cast<int>(initial_img.height() / zoom));
-                int crop_x = (initial_img.width() - crop_w) / 2;
-                int crop_y = (initial_img.height() - crop_h) / 2;
-                QImage frame =
-                    initial_img.copy(crop_x, crop_y, crop_w, crop_h)
-                        .scaled(PREVIEW_WIDTH, PREVIEW_HEIGHT, Qt::KeepAspectRatioByExpanding,
-                                Qt::SmoothTransformation);
-                if (frame.width() > static_cast<int>(PREVIEW_WIDTH) ||
-                    frame.height() > static_cast<int>(PREVIEW_HEIGHT)) {
-                    frame = frame.copy((frame.width() - static_cast<int>(PREVIEW_WIDTH)) / 2,
-                                       (frame.height() - static_cast<int>(PREVIEW_HEIGHT)) / 2,
-                                       PREVIEW_WIDTH, PREVIEW_HEIGHT);
-                }
-                m_preloadedFrames.push_back(frame.convertToFormat(QImage::Format_RGBA8888));
+            // Downscale large sources once so per-tick Ken Burns crop stays sub-millisecond
+            if (initial_img.width() > static_cast<int>(PREVIEW_WIDTH * 2) ||
+                initial_img.height() > static_cast<int>(PREVIEW_HEIGHT * 2)) {
+                initial_img =
+                    initial_img.scaled(PREVIEW_WIDTH * 2, PREVIEW_HEIGHT * 2,
+                                       Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
             }
-            if (!m_preloadedFrames.empty()) {
-                m_currentPreviewImage = m_preloadedFrames[0];
+            m_videoBaseImage = initial_img.convertToFormat(QImage::Format_RGBA8888);
+            QImage firstFrame = computeVideoZoomFrame(m_videoBaseImage, 0,
+                                                      static_cast<int>(PREVIEW_WIDTH),
+                                                      static_cast<int>(PREVIEW_HEIGHT));
+            if (!firstFrame.isNull()) {
+                updateTextureWithImage(firstFrame);
+                m_currentFrameIndex = 1;
                 emit previewFrameReady(m_activeItemId, m_previewTexId);
                 m_playbackTimer->start(FRAME_INTERVAL_MS);
             }
@@ -302,20 +396,32 @@ void HoverPreviewController::updateTextureWithImage(const QImage &img)
     if (img.isNull())
         return;
 
-    QImage scaled = img.scaled(PREVIEW_WIDTH, PREVIEW_HEIGHT, Qt::KeepAspectRatioByExpanding,
-                               Qt::SmoothTransformation);
-    if (scaled.width() > static_cast<int>(PREVIEW_WIDTH) ||
-        scaled.height() > static_cast<int>(PREVIEW_HEIGHT)) {
-        scaled = scaled.copy((scaled.width() - static_cast<int>(PREVIEW_WIDTH)) / 2,
-                             (scaled.height() - static_cast<int>(PREVIEW_HEIGHT)) / 2,
-                             PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    QImage rgba;
+    if (img.width() == static_cast<int>(PREVIEW_WIDTH) &&
+        img.height() == static_cast<int>(PREVIEW_HEIGHT) &&
+        img.format() == QImage::Format_RGBA8888) {
+        rgba = img;
+    } else {
+        QImage scaled = img.scaled(PREVIEW_WIDTH, PREVIEW_HEIGHT, Qt::KeepAspectRatioByExpanding,
+                                   Qt::SmoothTransformation);
+        if (scaled.width() > static_cast<int>(PREVIEW_WIDTH) ||
+            scaled.height() > static_cast<int>(PREVIEW_HEIGHT)) {
+            scaled = scaled.copy((scaled.width() - static_cast<int>(PREVIEW_WIDTH)) / 2,
+                                 (scaled.height() - static_cast<int>(PREVIEW_HEIGHT)) / 2,
+                                 PREVIEW_WIDTH, PREVIEW_HEIGHT);
+        }
+        rgba = scaled.convertToFormat(QImage::Format_RGBA8888);
     }
-    QImage rgba = scaled.convertToFormat(QImage::Format_RGBA8888);
     m_currentPreviewImage = rgba;
 
-    if (!m_gl || m_previewTexId == 0 || QOpenGLContext::currentContext() == nullptr)
+    GlOwnerScope glScope(m_glOwner);
+    if (!m_gl || m_previewTexId == 0 || !glScope.isReady())
         return;
 
+    m_gl->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+#ifdef GL_UNPACK_ROW_LENGTH
+    m_gl->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
     m_gl->glBindTexture(GL_TEXTURE_2D, m_previewTexId);
     m_gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT, GL_RGBA,
                           GL_UNSIGNED_BYTE, rgba.constBits());
@@ -327,6 +433,11 @@ void HoverPreviewController::setupOffscreenShader(const std::string &shader_path
     if (!m_gl)
         return;
 
+    const bool isGles =
+        QOpenGLContext::currentContext() && QOpenGLContext::currentContext()->isOpenGLES();
+    const char *vsSrc = isGles ? DEFAULT_VERTEX_SHADER_ES : DEFAULT_VERTEX_SHADER_CORE;
+    const char *fallbackFsSrc = isGles ? FALLBACK_PREVIEW_SHADER_ES : FALLBACK_PREVIEW_SHADER_CORE;
+
     std::string fragment_code;
     std::ifstream file(shader_path);
     if (file.is_open()) {
@@ -336,12 +447,11 @@ void HoverPreviewController::setupOffscreenShader(const std::string &shader_path
     }
 
     if (fragment_code.empty() || fragment_code.find("mainImage") == std::string::npos) {
-        fragment_code = FALLBACK_PREVIEW_SHADER;
+        fragment_code = fallbackFsSrc;
     } else {
-        // Wrap Shadertoy mainImage into ES 3.0 fragment shader
-        std::string wrapper = R"(#version 300 es
-precision highp float;
-in vec2 v_uv;
+        std::string wrapper = isGles ? "#version 300 es\nprecision highp float;\n"
+                                     : "#version 330 core\n";
+        wrapper += R"(in vec2 v_uv;
 out vec4 fragColor;
 
 uniform float iTime;
@@ -354,18 +464,16 @@ uniform int iFrame;
 void main() {
     vec4 col = vec4(0.0);
     mainImage(col, gl_FragCoord.xy);
-    fragColor = vec4(col.rgb, 1.0); // Mandatory opaque alpha invariant
+    fragColor = vec4(col.rgb, 1.0);
 }
 )";
         fragment_code = wrapper;
     }
 
-    // Compile Vertex Shader
     GLuint vs = m_gl->glCreateShader(GL_VERTEX_SHADER);
-    m_gl->glShaderSource(vs, 1, &DEFAULT_VERTEX_SHADER, nullptr);
+    m_gl->glShaderSource(vs, 1, &vsSrc, nullptr);
     m_gl->glCompileShader(vs);
 
-    // Compile Fragment Shader
     const char *fs_src = fragment_code.c_str();
     GLuint fs = m_gl->glCreateShader(GL_FRAGMENT_SHADER);
     m_gl->glShaderSource(fs, 1, &fs_src, nullptr);
@@ -374,10 +482,9 @@ void main() {
     GLint compiled = 0;
     m_gl->glGetShaderiv(fs, GL_COMPILE_STATUS, &compiled);
     if (!compiled) {
-        // Fallback to safe shader
         m_gl->glDeleteShader(fs);
         fs = m_gl->glCreateShader(GL_FRAGMENT_SHADER);
-        m_gl->glShaderSource(fs, 1, &FALLBACK_PREVIEW_SHADER, nullptr);
+        m_gl->glShaderSource(fs, 1, &fallbackFsSrc, nullptr);
         m_gl->glCompileShader(fs);
     }
 
@@ -393,6 +500,15 @@ void main() {
     m_gl->glDeleteShader(vs);
     m_gl->glDeleteShader(fs);
 
+    GLint linked = GL_FALSE;
+    m_gl->glGetProgramiv(m_shaderProgram, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+        m_gl->glDeleteProgram(m_shaderProgram);
+        m_shaderProgram = 0;
+        m_shaderInitialized = false;
+        return;
+    }
+
     m_shaderTime = 0.0f;
     m_shaderFrame = 0;
     m_shaderInitialized = true;
@@ -400,8 +516,9 @@ void main() {
 
 void HoverPreviewController::renderShaderFrame()
 {
+    GlOwnerScope glScope(m_glOwner);
     if (m_gl && m_shaderInitialized && m_shaderProgram != 0 && m_shaderFbo != 0 &&
-        QOpenGLContext::currentContext() != nullptr) {
+        m_quadVao != 0 && glScope.isReady()) {
         m_gl->glBindFramebuffer(GL_FRAMEBUFFER, m_shaderFbo);
         m_gl->glViewport(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
 
@@ -420,21 +537,9 @@ void HoverPreviewController::renderShaderFrame()
         if (u_frame >= 0)
             m_gl->glUniform1i(u_frame, m_shaderFrame);
 
-        static const float quad_verts[] = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
-
-        GLuint vbo = 0;
-        m_gl->glGenBuffers(1, &vbo);
-        m_gl->glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        m_gl->glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_STREAM_DRAW);
-
-        m_gl->glEnableVertexAttribArray(0);
-        m_gl->glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
-
+        m_gl->glBindVertexArray(m_quadVao);
         m_gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-        m_gl->glDisableVertexAttribArray(0);
-        m_gl->glBindBuffer(GL_ARRAY_BUFFER, 0);
-        m_gl->glDeleteBuffers(1, &vbo);
+        m_gl->glBindVertexArray(0);
 
         QImage readback(PREVIEW_WIDTH, PREVIEW_HEIGHT, QImage::Format_RGBA8888);
         m_gl->glReadPixels(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE,
@@ -448,7 +553,7 @@ void HoverPreviewController::renderShaderFrame()
         m_gl->glUseProgram(0);
         m_gl->glBindFramebuffer(GL_FRAMEBUFFER, 0);
     } else {
-        // Generate procedural animated shader preview when GL context is not bound on timer thread
+        // Generate procedural animated shader preview when headless without a realized GL widget
         QImage img(PREVIEW_WIDTH, PREVIEW_HEIGHT, QImage::Format_RGBA8888);
         uint32_t seed = 2166136261u;
         for (char c : m_activePath) {
@@ -491,6 +596,15 @@ void HoverPreviewController::onPlaybackTick()
     if (m_activeBadge == WallpaperBadge::Shader) {
         renderShaderFrame();
         emit previewFrameReady(m_activeItemId, m_previewTexId);
+    } else if (m_activeBadge == WallpaperBadge::Video && !m_videoBaseImage.isNull()) {
+        QImage frame = computeVideoZoomFrame(m_videoBaseImage, m_currentFrameIndex,
+                                             static_cast<int>(PREVIEW_WIDTH),
+                                             static_cast<int>(PREVIEW_HEIGHT));
+        m_currentFrameIndex++;
+        if (!frame.isNull()) {
+            updateTextureWithImage(frame);
+            emit previewFrameReady(m_activeItemId, m_previewTexId);
+        }
     } else if (!m_preloadedFrames.empty()) {
         const auto &frame = m_preloadedFrames[m_currentFrameIndex % m_preloadedFrames.size()];
         updateTextureWithImage(frame);
@@ -506,11 +620,15 @@ void HoverPreviewController::cleanupActivePreview()
     }
     m_movie.reset();
     m_preloadedFrames.clear();
+    m_videoBaseImage = QImage();
     m_currentPreviewImage = QImage();
 
-    if (m_shaderProgram != 0 && m_gl && QOpenGLContext::currentContext() != nullptr) {
-        m_gl->glDeleteProgram(m_shaderProgram);
-        m_shaderProgram = 0;
+    if (m_shaderProgram != 0 && m_gl) {
+        GlOwnerScope glScope(m_glOwner);
+        if (glScope.isReady()) {
+            m_gl->glDeleteProgram(m_shaderProgram);
+            m_shaderProgram = 0;
+        }
     }
     m_shaderInitialized = false;
 

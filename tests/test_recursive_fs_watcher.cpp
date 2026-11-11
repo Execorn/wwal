@@ -6,6 +6,9 @@
 
 #include "studio/core/recursive_fs_watcher.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -328,6 +331,73 @@ void test_sibling_prefix_roots_ws_vs_ws2()
     std::cout << "  -> Sibling /ws vs /ws2 boundary isolation passed." << std::endl;
 }
 
+void test_teardown_discards_pending_and_open_fd_coalescing()
+{
+    std::cout << "[FS Watcher 7/7] Testing silent stop() discard & open-FD streaming silence..."
+              << std::endl;
+
+    std::filesystem::path test_root = "/tmp/test_wwal_watcher_teardown";
+    cleanup_test_dir(test_root);
+    std::filesystem::path item_dir = test_root / "431960" / "888999";
+    std::filesystem::create_directories(item_dir);
+
+    // Part A: Pending debounce events must be discarded without invoking callback on stop()/dtor.
+    std::atomic<int> teardown_callbacks{0};
+    {
+        RecursiveFsWatcher watcher(
+            [&](const std::vector<FsWatchEvent> &) { teardown_callbacks.fetch_add(1); }, 2500);
+        watcher.addWatchRoot(test_root);
+        watcher.start();
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+        {
+            std::ofstream ofs(item_dir / "pending.json");
+            ofs << "{\"title\":\"Pending Before Stop\"}";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        watcher.stop();
+    }
+    assert(teardown_callbacks.load() == 0 &&
+           "stop() and destructor must discard pending debounce events without firing callback");
+
+    // Part B: Streaming write() syscalls on an open FD must not emit intermediate events until
+    // close() triggers IN_CLOSE_WRITE.
+    std::atomic<int> stream_callbacks{0};
+    RecursiveFsWatcher stream_watcher(
+        [&](const std::vector<FsWatchEvent> &) { stream_callbacks.fetch_add(1); }, 40);
+    stream_watcher.addWatchRoot(test_root);
+    stream_watcher.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    std::filesystem::path stream_file = item_dir / "streaming_download.part";
+    int fd = ::open(stream_file.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
+    assert(fd >= 0);
+
+    // Allow initial IN_CREATE event from O_CREAT to flush through the 40 ms debounce window.
+    std::this_thread::sleep_for(std::chrono::milliseconds(140));
+    stream_callbacks.store(0);
+
+    const char chunk[] = "0123456789abcdef";
+    for (int i = 0; i < 10; ++i) {
+        ssize_t w = ::write(fd, chunk, sizeof(chunk) - 1);
+        assert(w == static_cast<ssize_t>(sizeof(chunk) - 1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    assert(stream_callbacks.load() == 0 &&
+           "Streaming write() calls without close() must not trigger intermediate modify storms");
+
+    ::close(fd);
+    std::this_thread::sleep_for(std::chrono::milliseconds(140));
+    stream_watcher.stop();
+    assert(stream_callbacks.load() >= 1 &&
+           "Closing written file descriptor must emit IN_CLOSE_WRITE notification");
+
+    cleanup_test_dir(test_root);
+    std::cout << "  -> Silent stop() discard & open-FD IN_CLOSE_WRITE coalescing passed."
+              << std::endl;
+}
+
 } // namespace
 
 int main()
@@ -342,6 +412,7 @@ int main()
     test_start_before_add_and_restart_after_stop();
     test_child_unlink_vs_item_root_delete();
     test_sibling_prefix_roots_ws_vs_ws2();
+    test_teardown_discards_pending_and_open_fd_coalescing();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  >>> RECURSIVE FS WATCHER TESTS PASSED CLEANLY (100%) <<<" << std::endl;

@@ -3,6 +3,7 @@
 
 #include "waywal/log.h"
 #include "waywal/path.h"
+#include "waywal/shader_graph.h"
 #include "waywal/shader_parser.h"
 #include "waywal/we_compat_scanner.h"
 #include "waywal/we_project.h"
@@ -33,6 +34,7 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -48,9 +50,12 @@
 #include <QUuid>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -112,6 +117,99 @@ bool isTranscodableTexturePath(const QString &path)
            path.endsWith(QStringLiteral(".jpg"), Qt::CaseInsensitive) ||
            path.endsWith(QStringLiteral(".jpeg"), Qt::CaseInsensitive) ||
            path.endsWith(QStringLiteral(".bmp"), Qt::CaseInsensitive);
+}
+
+bool isPathConfinedToRoot(const std::filesystem::path &canonicalRoot, const QString &candidatePath)
+{
+    if (canonicalRoot.empty() || candidatePath.isEmpty()) {
+        return false;
+    }
+    std::error_code ec;
+    const std::filesystem::path candFs(candidatePath.toStdString());
+    const std::filesystem::path resolved = std::filesystem::weakly_canonical(candFs, ec);
+    if (ec || resolved.empty()) {
+        return false;
+    }
+    auto [rootEnd, candIt] =
+        std::mismatch(canonicalRoot.begin(), canonicalRoot.end(), resolved.begin(), resolved.end());
+    (void)candIt;
+    return rootEnd == canonicalRoot.end();
+}
+
+bool isPreviewAssetCandidate(const QString &relPath, const QString &entrypointPreview)
+{
+    if (!entrypointPreview.isEmpty() &&
+        relPath.compare(entrypointPreview, Qt::CaseInsensitive) == 0) {
+        return true;
+    }
+    return relPath.compare(QStringLiteral("preview.png"), Qt::CaseInsensitive) == 0 ||
+           relPath.compare(QStringLiteral("preview.jpg"), Qt::CaseInsensitive) == 0 ||
+           relPath.compare(QStringLiteral("preview.jpeg"), Qt::CaseInsensitive) == 0 ||
+           relPath.compare(QStringLiteral("preview.bmp"), Qt::CaseInsensitive) == 0;
+}
+
+bool compileWwgraphFileToGlsl(const QString &wwgraphPath, QByteArray &outGlsl, QString &outTitle,
+                              QString &outAuthor, bool &outForceCompute, QString &outError)
+{
+    outGlsl.clear();
+    outError.clear();
+    outForceCompute = false;
+
+    QFile f(wwgraphPath);
+    if (!f.exists() || !f.open(QIODevice::ReadOnly)) {
+        outError = QStringLiteral("Shader graph file is missing or unreadable.");
+        return false;
+    }
+    const QByteArray jsonBytes = f.readAll();
+    if (jsonBytes.isEmpty() || jsonBytes.size() > 8 * 1024 * 1024) {
+        outError = QStringLiteral("Shader graph file must be non-empty and at most 8 MiB.");
+        return false;
+    }
+
+    waywal_shader_graph_t *graph = waywal_shader_graph_create();
+    if (!graph) {
+        outError = QStringLiteral("Out of memory allocating shader graph.");
+        return false;
+    }
+
+    char errBuf[256] = {0};
+    if (!waywal_shader_graph_load_json(jsonBytes.constData(),
+                                       static_cast<size_t>(jsonBytes.size()), graph, errBuf)) {
+        waywal_shader_graph_destroy(graph);
+        outError = errBuf[0] != '\0' ? QString::fromUtf8(errBuf)
+                                     : QStringLiteral("Invalid .wwgraph JSON document.");
+        return false;
+    }
+
+    if (graph->graph_name[0] != '\0') {
+        outTitle = QString::fromUtf8(graph->graph_name);
+    }
+    if (graph->author[0] != '\0') {
+        outAuthor = QString::fromUtf8(graph->author);
+    }
+    outForceCompute = (graph->flags & WAYWAL_GRAPH_FLAG_FORCE_COMPUTE) != 0;
+
+    waywal_graph_schedule_t schedule{};
+    if (!waywal_shader_graph_analyze(graph, &schedule) || schedule.has_cycle_error) {
+        outError = schedule.error_msg[0] != '\0'
+                       ? QString::fromUtf8(schedule.error_msg)
+                       : QStringLiteral("Shader graph contains an unlatched cycle or invalid pin.");
+        waywal_shader_graph_destroy(graph);
+        return false;
+    }
+
+    size_t glslLen = 0;
+    char *glsl = waywal_shader_graph_compile_glsl(graph, &schedule, &glslLen);
+    waywal_shader_graph_destroy(graph);
+    if (!glsl || glslLen == 0) {
+        std::free(glsl);
+        outError = QStringLiteral("Failed to generate GLSL ES 3.10 from shader graph.");
+        return false;
+    }
+
+    outGlsl = QByteArray(glsl, static_cast<qsizetype>(glslLen));
+    std::free(glsl);
+    return true;
 }
 
 bool isDisguisedExecutable(const QString &filePath)
@@ -417,7 +515,7 @@ ShaderAuditResult auditShaderSource(const QString &absPath, const QString &relPa
     }
 
     static const QRegularExpression audioRe(
-        QStringLiteral(R"(\b(iAudio|u_audio|audio_spectrum|u_spectrum)\b)"));
+        QStringLiteral(R"(\b(iAudio|u_audio|audio_spectrum|u_spectrum|u_AudioBands)\b)"));
     res.usesAudioUniforms = audioRe.match(code).hasMatch();
 
     return res;
@@ -628,12 +726,14 @@ void SourceIntakePage::setupUi()
 
     connect(m_browseFileBtn, &QPushButton::clicked, this, [this]() {
         QString file = QFileDialog::getOpenFileName(
-            this, QStringLiteral("Select Shader or Scene File"), m_sourcePathEdit->text(),
-            QStringLiteral("All Supported (*.frag *.vert *.comp *.glsl *.json *.mp4 *.webm *.mkv);;"
-                           "GLSL Shaders (*.frag *.vert *.comp *.glsl);;"
-                           "Scene / Project JSON (*.json);;"
-                           "Videos (*.mp4 *.webm *.mkv);;"
-                           "All Files (*)"));
+            this, QStringLiteral("Select Shader, Graph, or Scene File"), m_sourcePathEdit->text(),
+            QStringLiteral(
+                "All Supported (*.frag *.vert *.comp *.glsl *.wwgraph *.json *.mp4 *.webm *.mkv);;"
+                "Shader Graphs (*.wwgraph);;"
+                "GLSL Shaders (*.frag *.vert *.comp *.glsl);;"
+                "Scene / Project JSON (*.json);;"
+                "Videos (*.mp4 *.webm *.mkv);;"
+                "All Files (*)"));
         if (!file.isEmpty()) {
             m_sourcePathEdit->setText(file);
         }
@@ -764,22 +864,49 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
             }
         }
 
-        // 2. Check for GLSL shaders
+        // 2. Check for GLSL shaders and visual shader graphs (.wwgraph)
         if (m_ctx->entrypointPipeline.isEmpty()) {
             if (dir.exists(QStringLiteral("shaders/main.frag"))) {
                 m_ctx->entrypointPipeline = QStringLiteral("shaders/main.frag");
             } else if (dir.exists(QStringLiteral("main.frag"))) {
                 m_ctx->entrypointPipeline = QStringLiteral("main.frag");
+            } else if (dir.exists(QStringLiteral("shaders/main.wwgraph"))) {
+                m_ctx->entrypointPipeline = QStringLiteral("shaders/main.wwgraph");
+            } else if (dir.exists(QStringLiteral("main.wwgraph"))) {
+                m_ctx->entrypointPipeline = QStringLiteral("main.wwgraph");
             } else if (dir.exists(QStringLiteral("shaders/main.comp"))) {
                 m_ctx->entrypointPipeline = QStringLiteral("shaders/main.comp");
                 m_typeCombo->setCurrentIndex(1); // shader_compute
+            } else {
+                const QStringList graphs =
+                    dir.entryList({QStringLiteral("*.wwgraph")}, QDir::Files, QDir::Name);
+                if (!graphs.isEmpty()) {
+                    m_ctx->entrypointPipeline = graphs.front();
+                }
             }
         }
 
-        // Parse shader metadata if present
+        // Parse shader or graph metadata if present
         QString fragCandidate = dir.filePath(m_ctx->entrypointPipeline);
-        if (QFile::exists(fragCandidate) && (fragCandidate.endsWith(QStringLiteral(".frag")) ||
-                                             fragCandidate.endsWith(QStringLiteral(".glsl")))) {
+        if (QFile::exists(fragCandidate) &&
+            fragCandidate.endsWith(QStringLiteral(".wwgraph"), Qt::CaseInsensitive)) {
+            QByteArray glslBytes;
+            QString graphTitle;
+            QString graphAuthor;
+            QString graphErr;
+            bool forceCompute = false;
+            (void)compileWwgraphFileToGlsl(fragCandidate, glslBytes, graphTitle, graphAuthor,
+                                           forceCompute, graphErr);
+            if (m_ctx->detectedTitle.isEmpty() && !graphTitle.isEmpty()) {
+                m_ctx->detectedTitle = graphTitle;
+            }
+            if (!graphAuthor.isEmpty()) {
+                m_ctx->detectedAuthor = graphAuthor;
+            }
+            m_typeCombo->setCurrentIndex(forceCompute ? 1 : 0);
+        } else if (QFile::exists(fragCandidate) &&
+                   (fragCandidate.endsWith(QStringLiteral(".frag")) ||
+                    fragCandidate.endsWith(QStringLiteral(".glsl")))) {
             waywal_shader_meta_t meta;
             waywal_shader_meta_init(&meta);
             if (waywal_shader_parse_file(fragCandidate.toUtf8().constData(), &meta)) {
@@ -801,10 +928,16 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
             }
         }
 
-        // Count files and total size
+        // Count confined files and total size, skipping external symlinks
+        std::error_code rootEc;
+        const std::filesystem::path canonicalRoot =
+            std::filesystem::weakly_canonical(std::filesystem::path(path.toStdString()), rootEc);
         QDirIterator it(path, QDir::Files | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
         while (it.hasNext()) {
-            it.next();
+            const QString fPath = it.next();
+            if (!rootEc && !isPathConfinedToRoot(canonicalRoot, fPath)) {
+                continue;
+            }
             fileCount++;
             totalBytes += it.fileInfo().size();
         }
@@ -814,7 +947,24 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
         totalBytes = info.size();
         const QString ext = info.suffix().toLower();
 
-        if (ext == QStringLiteral("frag") || ext == QStringLiteral("glsl")) {
+        if (ext == QStringLiteral("wwgraph")) {
+            QByteArray glslBytes;
+            QString graphTitle;
+            QString graphAuthor;
+            QString graphErr;
+            bool forceCompute = false;
+            const bool ok = compileWwgraphFileToGlsl(path, glslBytes, graphTitle, graphAuthor,
+                                                     forceCompute, graphErr);
+            m_typeCombo->setCurrentIndex(forceCompute ? 1 : 0);
+            m_ctx->entrypointPipeline =
+                ok ? QStringLiteral("shaders/main.frag") : QStringLiteral("shaders/graph.wwgraph");
+            if (!graphTitle.isEmpty()) {
+                m_ctx->detectedTitle = graphTitle;
+            }
+            if (!graphAuthor.isEmpty()) {
+                m_ctx->detectedAuthor = graphAuthor;
+            }
+        } else if (ext == QStringLiteral("frag") || ext == QStringLiteral("glsl")) {
             m_typeCombo->setCurrentIndex(0); // shader_fragment
             m_ctx->entrypointPipeline = QStringLiteral("shaders/main.frag");
             waywal_shader_meta_t meta;
@@ -951,13 +1101,20 @@ void AssetBundlingPage::scanAssets()
     int deadCount = 0;
 
     if (srcInfo.isDir()) {
+        std::error_code rootEc;
+        const std::filesystem::path canonicalRoot = std::filesystem::weakly_canonical(
+            std::filesystem::path(m_ctx->sourcePath.toStdString()), rootEc);
         QDir baseDir(m_ctx->sourcePath);
         QDirIterator it(m_ctx->sourcePath, QDir::Files | QDir::NoDotAndDotDot,
                         QDirIterator::Subdirectories);
 
         while (it.hasNext()) {
-            it.next();
-            QString relPath = baseDir.relativeFilePath(it.filePath());
+            const QString absPath = it.next();
+            if (!rootEc && !isPathConfinedToRoot(canonicalRoot, absPath)) {
+                deadCount++;
+                continue;
+            }
+            QString relPath = baseDir.relativeFilePath(absPath);
             qint64 sz = it.fileInfo().size();
             totalSize += sz;
 
@@ -976,7 +1133,8 @@ void AssetBundlingPage::scanAssets()
             } else if (lower.endsWith(QStringLiteral(".frag")) ||
                        lower.endsWith(QStringLiteral(".vert")) ||
                        lower.endsWith(QStringLiteral(".comp")) ||
-                       lower.endsWith(QStringLiteral(".glsl"))) {
+                       lower.endsWith(QStringLiteral(".glsl")) ||
+                       lower.endsWith(QStringLiteral(".wwgraph"))) {
                 entry.category = QStringLiteral("shader");
             } else if (lower.endsWith(QStringLiteral(".png")) ||
                        lower.endsWith(QStringLiteral(".jpg")) ||
@@ -1017,8 +1175,9 @@ void AssetBundlingPage::scanAssets()
                 item->setText(3, QStringLiteral("Exclude"));
                 item->setForeground(3, QBrush(QColor(QStringLiteral("#ef4444"))));
             } else if (entry.category == QStringLiteral("texture") &&
-                       isTranscodableTexturePath(lower)) {
-                item->setText(3, QStringLiteral("Convert to WebP"));
+                       isTranscodableTexturePath(lower) &&
+                       isPreviewAssetCandidate(entry.relativePath, m_ctx->entrypointPreview)) {
+                item->setText(3, QStringLiteral("Convert Preview to WebP"));
                 item->setForeground(3, QBrush(QColor(QStringLiteral("#38bdf8"))));
             } else {
                 item->setText(3, QStringLiteral("Include"));
@@ -1074,20 +1233,31 @@ bool AssetBundlingPage::validatePage()
 
     QFileInfo srcInfo(m_ctx->sourcePath);
     if (srcInfo.isDir()) {
+        std::error_code rootEc;
+        const std::filesystem::path canonicalRoot = std::filesystem::weakly_canonical(
+            std::filesystem::path(m_ctx->sourcePath.toStdString()), rootEc);
         QDir srcDir(m_ctx->sourcePath);
+        QString updatedPreviewRel;
+
         for (const auto &asset : m_ctx->scannedAssets) {
             if (m_ctx->pruneDeadFiles && !asset.isReferenced) {
                 continue;
             }
             QString srcFile = srcDir.filePath(asset.relativePath);
+            if (!rootEc && !isPathConfinedToRoot(canonicalRoot, srcFile)) {
+                continue;
+            }
             QString dstFile = staging.filePath(asset.relativePath);
 
             QFileInfo(dstFile).dir().mkpath(QStringLiteral("."));
             QFile::remove(dstFile);
             QFile::copy(srcFile, dstFile);
 
+            // Only transcode standalone preview thumbnails whose manifest/project.json reference
+            // is updated in lockstep; keep referenced scene/shader/graph texture extensions intact.
             if (m_ctx->transcodeTextures && asset.category == QStringLiteral("texture") &&
-                isTranscodableTexturePath(asset.relativePath)) {
+                isTranscodableTexturePath(asset.relativePath) &&
+                isPreviewAssetCandidate(asset.relativePath, m_ctx->entrypointPreview)) {
                 QImage img(dstFile);
                 if (!img.isNull()) {
                     QString webpDst = dstFile;
@@ -1098,28 +1268,93 @@ bool AssetBundlingPage::validatePage()
                     webpDst.append(QStringLiteral(".webp"));
                     if (webpDst != dstFile && img.save(webpDst, "WEBP", 85)) {
                         QFile::remove(dstFile);
-                        if (m_ctx->entrypointPreview.compare(asset.relativePath,
-                                                             Qt::CaseInsensitive) == 0) {
-                            QString relWebp = asset.relativePath;
-                            const int relDot = relWebp.lastIndexOf(u'.');
-                            if (relDot > 0) {
-                                relWebp.truncate(relDot);
-                            }
-                            relWebp.append(QStringLiteral(".webp"));
-                            m_ctx->entrypointPreview = relWebp;
+                        QString relWebp = asset.relativePath;
+                        const int relDot = relWebp.lastIndexOf(u'.');
+                        if (relDot > 0) {
+                            relWebp.truncate(relDot);
                         }
+                        relWebp.append(QStringLiteral(".webp"));
+                        m_ctx->entrypointPreview = relWebp;
+                        updatedPreviewRel = relWebp;
                     }
                 }
             }
         }
+
+        if (!updatedPreviewRel.isEmpty()) {
+            const QString projJsonPath = staging.filePath(QStringLiteral("project.json"));
+            QFile pf(projJsonPath);
+            if (pf.exists() && pf.open(QIODevice::ReadOnly)) {
+                QJsonDocument doc = QJsonDocument::fromJson(pf.readAll());
+                pf.close();
+                if (doc.isObject()) {
+                    QJsonObject obj = doc.object();
+                    obj.insert(QStringLiteral("preview"), updatedPreviewRel);
+                    if (pf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                        pf.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
+                        pf.close();
+                    }
+                }
+            }
+        }
+
+        if (m_ctx->entrypointPipeline.endsWith(QStringLiteral(".wwgraph"), Qt::CaseInsensitive)) {
+            const QString stagedGraph = staging.filePath(m_ctx->entrypointPipeline);
+            QByteArray glslBytes;
+            QString graphTitle;
+            QString graphAuthor;
+            QString graphErr;
+            bool forceCompute = false;
+            if (compileWwgraphFileToGlsl(stagedGraph, glslBytes, graphTitle, graphAuthor,
+                                         forceCompute, graphErr)) {
+                const QString compiledRel = QStringLiteral("shaders/main.frag");
+                const QString compiledDst = staging.filePath(compiledRel);
+                QFileInfo(compiledDst).dir().mkpath(QStringLiteral("."));
+                QFile outFrag(compiledDst);
+                if (outFrag.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                    outFrag.write(glslBytes);
+                    outFrag.close();
+                    m_ctx->entrypointPipeline = compiledRel;
+                }
+            }
+        }
     } else {
+        const QString ext = srcInfo.suffix().toLower();
+        if (ext == QStringLiteral("wwgraph")) {
+            const QString graphDst = staging.filePath(QStringLiteral("shaders/graph.wwgraph"));
+            QFileInfo(graphDst).dir().mkpath(QStringLiteral("."));
+            QFile::remove(graphDst);
+            QFile::copy(m_ctx->sourcePath, graphDst);
+
+            QByteArray glslBytes;
+            QString graphTitle;
+            QString graphAuthor;
+            QString graphErr;
+            bool forceCompute = false;
+            if (compileWwgraphFileToGlsl(graphDst, glslBytes, graphTitle, graphAuthor, forceCompute,
+                                         graphErr)) {
+                const QString compiledRel = QStringLiteral("shaders/main.frag");
+                const QString compiledDst = staging.filePath(compiledRel);
+                QFile outFrag(compiledDst);
+                if (outFrag.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                    outFrag.write(glslBytes);
+                    outFrag.close();
+                    m_ctx->entrypointPipeline = compiledRel;
+                } else {
+                    m_ctx->entrypointPipeline = QStringLiteral("shaders/graph.wwgraph");
+                }
+            } else {
+                m_ctx->entrypointPipeline = QStringLiteral("shaders/graph.wwgraph");
+            }
+            return true;
+        }
+
         QString relDst = m_ctx->entrypointPipeline;
         if (m_ctx->projectType == WWPKG_TYPE_SHADER_FRAGMENT) {
             relDst = QStringLiteral("shaders/main.frag");
         } else if (m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE) {
             relDst = QStringLiteral("shaders/main.comp");
         } else if (m_ctx->projectType == WWPKG_TYPE_VIDEO_STREAM) {
-            const QString ext = srcInfo.suffix().toLower();
             if (!relDst.startsWith(QStringLiteral("assets/"))) {
                 relDst = (ext == QStringLiteral("webm") || ext == QStringLiteral("mkv"))
                              ? (QStringLiteral("assets/video.") + ext)
@@ -1709,25 +1944,57 @@ void CapabilityAuditPage::runCompatibilityAudit()
     } else if (m_ctx->projectType == WWPKG_TYPE_SHADER_FRAGMENT ||
                m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE) {
         const bool isCompute = (m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE);
-        const QString entryPath = stg.filePath(m_ctx->entrypointPipeline);
-        const ShaderAuditResult shaderRes =
-            auditShaderSource(entryPath, m_ctx->entrypointPipeline, isCompute);
-
-        m_ctx->compatTier = shaderRes.tier;
-        m_ctx->compatScore = shaderRes.score;
-        m_ctx->issues.append(shaderRes.issues);
-        detectedAudioUniforms = shaderRes.usesAudioUniforms;
-
-        float vramEst = isCompute ? 64.0f : 48.0f;
-        waywal_shader_meta_t meta;
-        waywal_shader_meta_init(&meta);
-        if (QFile::exists(entryPath) &&
-            waywal_shader_parse_file(entryPath.toUtf8().constData(), &meta) &&
-            meta.has_multi_pass) {
-            vramEst += 32.0f;
+        QString entryPath = stg.filePath(m_ctx->entrypointPipeline);
+        bool graphAuditFailed = false;
+        if (m_ctx->entrypointPipeline.endsWith(QStringLiteral(".wwgraph"), Qt::CaseInsensitive)) {
+            QByteArray glslBytes;
+            QString graphTitle;
+            QString graphAuthor;
+            QString graphErr;
+            bool forceCompute = false;
+            if (compileWwgraphFileToGlsl(entryPath, glslBytes, graphTitle, graphAuthor,
+                                         forceCompute, graphErr)) {
+                const QString compiledRel = QStringLiteral("shaders/main.frag");
+                const QString compiledDst = stg.filePath(compiledRel);
+                QFileInfo(compiledDst).dir().mkpath(QStringLiteral("."));
+                QFile outFrag(compiledDst);
+                if (outFrag.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                    outFrag.write(glslBytes);
+                    outFrag.close();
+                    m_ctx->entrypointPipeline = compiledRel;
+                    entryPath = compiledDst;
+                }
+            } else {
+                graphAuditFailed = true;
+                m_ctx->compatTier = WE_TIER_4_BLOCKED;
+                m_ctx->compatScore = 0;
+                m_ctx->estimatedVramMb = 0.0f;
+                m_ctx->estimatedFps = 0;
+                m_ctx->issues.append({QStringLiteral("SHADER_GRAPH_INVALID"), WE_ISSUE_SEV_FATAL,
+                                      graphErr, m_ctx->entrypointPipeline, 0,
+                                      QStringLiteral("Resolve cycle or pin errors in Graph Editor.")});
+            }
         }
-        m_ctx->estimatedVramMb = vramEst;
-        m_ctx->estimatedFps = m_ctx->targetFps ? m_ctx->targetFps : 60;
+        if (!graphAuditFailed) {
+            const ShaderAuditResult shaderRes =
+                auditShaderSource(entryPath, m_ctx->entrypointPipeline, isCompute);
+
+            m_ctx->compatTier = shaderRes.tier;
+            m_ctx->compatScore = shaderRes.score;
+            m_ctx->issues.append(shaderRes.issues);
+            detectedAudioUniforms = shaderRes.usesAudioUniforms;
+
+            float vramEst = isCompute ? 64.0f : 48.0f;
+            waywal_shader_meta_t meta;
+            waywal_shader_meta_init(&meta);
+            if (QFile::exists(entryPath) &&
+                waywal_shader_parse_file(entryPath.toUtf8().constData(), &meta) &&
+                meta.has_multi_pass) {
+                vramEst += 32.0f;
+            }
+            m_ctx->estimatedVramMb = vramEst;
+            m_ctx->estimatedFps = m_ctx->targetFps ? m_ctx->targetFps : 60;
+        }
     } else if (m_ctx->projectType == WWPKG_TYPE_VIDEO_STREAM) {
         const QString entryPath = stg.filePath(m_ctx->entrypointPipeline);
         if (!QFileInfo::exists(entryPath)) {
@@ -2253,9 +2520,48 @@ void CompilationSigningPage::browseKeyFile()
     }
 }
 
+CompilationSigningPage::~CompilationSigningPage()
+{
+    if (m_buildThread.joinable()) {
+        m_buildThread.join();
+    }
+}
+
+void CompilationSigningPage::setBuildUiBusy(bool busy)
+{
+    m_building.store(busy, std::memory_order_release);
+    if (m_compileBtn) {
+        m_compileBtn->setEnabled(!busy);
+    }
+    if (m_browseKeyBtn) {
+        m_browseKeyBtn->setEnabled(!busy);
+    }
+    if (m_generateKeyBtn) {
+        m_generateKeyBtn->setEnabled(!busy);
+    }
+    if (m_browseOutBtn) {
+        m_browseOutBtn->setEnabled(!busy);
+    }
+    if (m_keyPathEdit) {
+        m_keyPathEdit->setEnabled(!busy);
+    }
+    if (m_outPkgPathEdit) {
+        m_outPkgPathEdit->setEnabled(!busy);
+    }
+    if (auto *wiz = wizard()) {
+        if (auto *backBtn = wiz->button(QWizard::BackButton)) {
+            backBtn->setEnabled(!busy);
+        }
+        if (auto *cancelBtn = wiz->button(QWizard::CancelButton)) {
+            cancelBtn->setEnabled(!busy);
+        }
+    }
+    emit completeChanged();
+}
+
 void CompilationSigningPage::compileAndSignPackage()
 {
-    if (!m_ctx || m_ctx->stagingDir.isEmpty())
+    if (!m_ctx || m_ctx->stagingDir.isEmpty() || m_building.load(std::memory_order_acquire))
         return;
 
     if (m_ctx->authorPrivKey.size() != 64) {
@@ -2276,8 +2582,12 @@ void CompilationSigningPage::compileAndSignPackage()
     QFileInfo outFi(outPkg);
     outFi.dir().mkpath(QStringLiteral("."));
 
+    m_ctx->isCompiled = false;
+    m_ctx->isVerified = false;
     m_logEdit->clear();
     m_progressBar->setValue(10);
+    m_verificationBadge->setText(QStringLiteral("Status: Building..."));
+    m_verificationBadge->setStyleSheet(QStringLiteral("color: #38bdf8; font-weight: bold;"));
     m_logEdit->append(QStringLiteral("[%1] Starting package build...")
                           .arg(QDateTime::currentDateTime().toString(Qt::ISODate)));
     m_logEdit->append(QStringLiteral("Staging Directory: %1").arg(m_ctx->stagingDir));
@@ -2331,81 +2641,137 @@ void CompilationSigningPage::compileAndSignPackage()
     manifest.budgets.target_fps = m_ctx->targetFps;
 
     m_progressBar->setValue(35);
-    m_logEdit->append(QStringLiteral("Writing manifest.json..."));
+    m_logEdit->append(QStringLiteral("Writing manifest.json and compressing Zstd archive..."));
 
-    // Invoke wwpkg_build_package()
-    bool buildOk =
-        wwpkg_build_package(m_ctx->stagingDir.toUtf8().constData(), &manifest,
-                            reinterpret_cast<const uint8_t *>(m_ctx->authorPrivKey.constData()),
-                            outPkg.toUtf8().constData());
-
-    m_progressBar->setValue(75);
-
-    if (!buildOk) {
-        const int errCode = wwpkg_get_last_error(nullptr);
-        m_logEdit->append(QStringLiteral("[ERROR] Failed to build package: %1")
-                              .arg(QString::fromUtf8(wwpkg_error_str(errCode))));
-        m_verificationBadge->setText(QStringLiteral("Status: Build Failed"));
-        m_verificationBadge->setStyleSheet(QStringLiteral("color: #ef4444; font-weight: bold;"));
-        m_progressBar->setValue(0);
-        return;
+    if (m_buildThread.joinable()) {
+        m_buildThread.join();
     }
+    setBuildUiBusy(true);
 
-    m_logEdit->append(QStringLiteral("[OK] Archive compressed with Zstandard (level 12)."));
-    m_logEdit->append(QStringLiteral("Verifying package signature..."));
+    const QByteArray stagingUtf8 = m_ctx->stagingDir.toUtf8();
+    const QByteArray outPkgUtf8 = outPkg.toUtf8();
+    QByteArray privKeyCopy = m_ctx->authorPrivKey;
+    QPointer<CompilationSigningPage> safeSelf(this);
 
-    // Verify self-check
-    wwpkg_package_t *pkg = wwpkg_open(outPkg.toUtf8().constData());
-    if (!pkg) {
-        m_logEdit->append(QStringLiteral("[ERROR] Could not open newly built package."));
-        return;
-    }
+    m_buildThread = std::jthread([safeSelf, manifest, stagingUtf8, outPkgUtf8, outPkg,
+                                  privKeyCopy = std::move(privKeyCopy)]() mutable {
+        struct BuildOutcome {
+            bool buildOk{false};
+            int errCode{0};
+            bool openedPkg{false};
+            bool verified{false};
+            bool isTrusted{false};
+            QByteArray merkleRoot;
+            QByteArray signature;
+        } res;
 
-    bool isTrusted = false;
-    bool verified = wwpkg_verify_signature(pkg, &isTrusted);
-    const wwpkg_signature_t *sig = wwpkg_get_signature(pkg);
+        res.buildOk = wwpkg_build_package(
+            stagingUtf8.constData(), &manifest,
+            reinterpret_cast<const uint8_t *>(privKeyCopy.constData()), outPkgUtf8.constData());
+        wipeByteArray(privKeyCopy);
 
-    if (sig) {
-        m_ctx->merkleRoot = QByteArray(reinterpret_cast<const char *>(sig->merkle_root), 32);
-        m_ctx->signature = QByteArray(reinterpret_cast<const char *>(sig->signature), 64);
-    }
+        if (!res.buildOk) {
+            res.errCode = wwpkg_get_last_error(nullptr);
+        } else {
+            wwpkg_package_t *pkg = wwpkg_open(outPkgUtf8.constData());
+            if (pkg) {
+                res.openedPkg = true;
+                res.verified = wwpkg_verify_signature(pkg, &res.isTrusted);
+                const wwpkg_signature_t *sig = wwpkg_get_signature(pkg);
+                if (sig) {
+                    res.merkleRoot =
+                        QByteArray(reinterpret_cast<const char *>(sig->merkle_root), 32);
+                    res.signature = QByteArray(reinterpret_cast<const char *>(sig->signature), 64);
+                }
+                wwpkg_close(pkg);
+            }
+        }
 
-    wwpkg_close(pkg);
+        if (!qApp) {
+            return;
+        }
+        QMetaObject::invokeMethod(
+            qApp,
+            [safeSelf, outPkg, res = std::move(res)]() {
+                if (!safeSelf || !safeSelf->m_ctx) {
+                    return;
+                }
+                safeSelf->setBuildUiBusy(false);
 
-    m_progressBar->setValue(100);
+                if (!res.buildOk) {
+                    safeSelf->m_logEdit->append(
+                        QStringLiteral("[ERROR] Failed to build package: %1")
+                            .arg(QString::fromUtf8(wwpkg_error_str(res.errCode))));
+                    safeSelf->m_verificationBadge->setText(QStringLiteral("Status: Build Failed"));
+                    safeSelf->m_verificationBadge->setStyleSheet(
+                        QStringLiteral("color: #ef4444; font-weight: bold;"));
+                    safeSelf->m_progressBar->setValue(0);
+                    return;
+                }
 
-    if (verified) {
-        m_ctx->isCompiled = true;
-        m_ctx->isVerified = true;
-        m_ctx->isTrusted = isTrusted;
-        m_ctx->outPkgPath = outPkg;
-        m_ctx->compiledSizeBytes = QFileInfo(outPkg).size();
+                safeSelf->m_progressBar->setValue(75);
+                safeSelf->m_logEdit->append(
+                    QStringLiteral("[OK] Archive compressed with Zstandard (level 12)."));
+                safeSelf->m_logEdit->append(QStringLiteral("Verifying package signature..."));
 
-        m_logEdit->append(QStringLiteral("[OK] Merkle Root: %1")
-                              .arg(QString::fromLatin1(m_ctx->merkleRoot.toHex())));
-        m_logEdit->append(QStringLiteral("[OK] Ed25519 Signature: %1...")
-                              .arg(QString::fromLatin1(m_ctx->signature.toHex().left(32))));
-        m_logEdit->append(
-            QStringLiteral("[OK] Key Trust Status: %1")
-                .arg(isTrusted ? QStringLiteral("Trusted") : QStringLiteral("Untrusted")));
-        m_logEdit->append(QStringLiteral("[OK] Package built and verified: %1 (%2)")
-                              .arg(outPkg)
-                              .arg(formatBytes(m_ctx->compiledSizeBytes)));
+                if (!res.openedPkg) {
+                    safeSelf->m_logEdit->append(
+                        QStringLiteral("[ERROR] Could not open newly built package."));
+                    safeSelf->m_verificationBadge->setText(
+                        QStringLiteral("Status: Verification Failed"));
+                    safeSelf->m_verificationBadge->setStyleSheet(
+                        QStringLiteral("color: #ef4444; font-weight: bold;"));
+                    return;
+                }
 
-        m_verificationBadge->setText(QStringLiteral("Signed & Verified"));
-        m_verificationBadge->setStyleSheet(QStringLiteral("color: #10b981; font-weight: bold;"));
+                safeSelf->m_ctx->merkleRoot = res.merkleRoot;
+                safeSelf->m_ctx->signature = res.signature;
+                safeSelf->m_progressBar->setValue(100);
 
-        emit completeChanged();
-    } else {
-        m_logEdit->append(QStringLiteral("[ERROR] Signature verification failed."));
-        m_verificationBadge->setText(QStringLiteral("Status: Verification Failed"));
-        m_verificationBadge->setStyleSheet(QStringLiteral("color: #ef4444; font-weight: bold;"));
-    }
+                if (res.verified) {
+                    safeSelf->m_ctx->isCompiled = true;
+                    safeSelf->m_ctx->isVerified = true;
+                    safeSelf->m_ctx->isTrusted = res.isTrusted;
+                    safeSelf->m_ctx->outPkgPath = outPkg;
+                    safeSelf->m_ctx->compiledSizeBytes = QFileInfo(outPkg).size();
+
+                    safeSelf->m_logEdit->append(
+                        QStringLiteral("[OK] Merkle Root: %1")
+                            .arg(QString::fromLatin1(safeSelf->m_ctx->merkleRoot.toHex())));
+                    safeSelf->m_logEdit->append(
+                        QStringLiteral("[OK] Ed25519 Signature: %1...")
+                            .arg(QString::fromLatin1(safeSelf->m_ctx->signature.toHex().left(32))));
+                    safeSelf->m_logEdit->append(QStringLiteral("[OK] Key Trust Status: %1")
+                                                    .arg(res.isTrusted
+                                                             ? QStringLiteral("Trusted")
+                                                             : QStringLiteral("Untrusted")));
+                    safeSelf->m_logEdit->append(
+                        QStringLiteral("[OK] Package built and verified: %1 (%2)")
+                            .arg(outPkg)
+                            .arg(formatBytes(safeSelf->m_ctx->compiledSizeBytes)));
+
+                    safeSelf->m_verificationBadge->setText(QStringLiteral("Signed & Verified"));
+                    safeSelf->m_verificationBadge->setStyleSheet(
+                        QStringLiteral("color: #10b981; font-weight: bold;"));
+
+                    emit safeSelf->completeChanged();
+                } else {
+                    safeSelf->m_logEdit->append(
+                        QStringLiteral("[ERROR] Signature verification failed."));
+                    safeSelf->m_verificationBadge->setText(
+                        QStringLiteral("Status: Verification Failed"));
+                    safeSelf->m_verificationBadge->setStyleSheet(
+                        QStringLiteral("color: #ef4444; font-weight: bold;"));
+                }
+            },
+            Qt::QueuedConnection);
+    });
 }
 
 bool CompilationSigningPage::isComplete() const
 {
-    return m_ctx && m_ctx->isCompiled && m_ctx->isVerified;
+    return m_ctx && !m_building.load(std::memory_order_acquire) && m_ctx->isCompiled &&
+           m_ctx->isVerified;
 }
 
 bool CompilationSigningPage::validatePage() { return isComplete(); }

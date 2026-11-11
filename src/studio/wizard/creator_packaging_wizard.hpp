@@ -9,8 +9,10 @@
 #include <QByteArray>
 #include <QImage>
 #include <QList>
+#include <atomic>
 #include <cstring>
 #include <memory>
+#include <thread>
 
 #include "waywal/wwpkg.h"
 #include "waywal/we_compat_scanner.h"
@@ -288,7 +290,7 @@ class CompilationSigningPage : public QWizardPage {
     Q_OBJECT
   public:
     explicit CompilationSigningPage(CreatorPackagingContext *ctx, QWidget *parent = nullptr);
-    ~CompilationSigningPage() override = default;
+    ~CompilationSigningPage() override;
 
     void initializePage() override;
     bool validatePage() override;
@@ -300,8 +302,11 @@ class CompilationSigningPage : public QWizardPage {
     void generateKeypair();
     void browseKeyFile();
     void compileAndSignPackage();
+    void setBuildUiBusy(bool busy);
 
     CreatorPackagingContext *m_ctx{nullptr};
+    std::jthread m_buildThread;
+    std::atomic<bool> m_building{false};
     QLineEdit *m_keyPathEdit{nullptr};
     QLabel *m_keyFingerprintLabel{nullptr};
     QPushButton *m_generateKeyBtn{nullptr};

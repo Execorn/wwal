@@ -22,8 +22,11 @@
 #include <QVector4D>
 #include <QMatrix4x4>
 
+#include <atomic>
 #include <memory>
 #include <array>
+#include <string>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 #include <mutex>
@@ -215,13 +218,21 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
     void leaveEvent(QEvent *event) override;
+    void showEvent(QShowEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
 
   private:
     void resolveEglExtensions();
     void setupQuadGeometry();
     void initBlitShader();
+    void ensureNeutralPassTexture();
     void ensureOffscreenFbo(int w, int h);
+    void ensureBufferPassFbos(int w, int h);
+    bool compileShaderInternal(const QString &glslSource, QString *outError);
+    void applyShaderUniforms(QOpenGLShaderProgram &prog, float fboW, float fboH, float timeSec,
+                             float timeDeltaSec, int activeWritePass = 4);
     void renderInProcessShaderPass();
+    void updateAnimationTimerState();
     void drawFallbackBackdrop(class QPainter &painter, const QRectF &displayRect);
     void drawSafeFrameGuides(class QPainter &painter, const QRectF &displayRect);
     void drawActionBar(class QPainter &painter);
@@ -259,16 +270,26 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
 
     // Path B In-Process Fallback State
     GLuint m_inProcessImageTex{0};
+    GLuint m_neutralPassTex{0};
+    GLuint m_computeOutputTex{0};
+    int m_computeTexWidth{0};
+    int m_computeTexHeight{0};
     QImage m_fallbackImage{};
     uint32_t m_imageWidth{0};
     uint32_t m_imageHeight{0};
     std::unique_ptr<QOpenGLFramebufferObject> m_offscreenFbo{nullptr};
+    std::array<std::array<std::unique_ptr<QOpenGLFramebufferObject>, 2>, 4> m_bufferPassFbos{};
+    int m_bufferPingPongIdx{0};
+    std::array<std::unique_ptr<QOpenGLShaderProgram>, 4> m_bufferPassPrograms{};
     std::unique_ptr<QOpenGLShaderProgram> m_shaderProgram{nullptr};
+    std::unique_ptr<QOpenGLShaderProgram> m_computeShaderProgram{nullptr};
     QString m_shaderSource{};
     std::unordered_map<std::string, ShaderUniformValue> m_customUniforms{};
     QElapsedTimer m_shaderTimer{};
     qint64 m_lastFrameTimeNs{0};
     int m_shaderFrameIndex{0};
+    std::atomic<uint64_t> m_videoLoadGeneration{0};
+    std::jthread m_videoThumbThread{};
 
     // Quad rendering & Blit Program
     QOpenGLVertexArrayObject m_quadVao{};

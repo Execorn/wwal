@@ -260,38 +260,39 @@ int FuzzyCatalogIndex::scoreItemFuzzy(std::string_view text, std::string_view pa
                                       const std::array<uint64_t, 256> &char_mask,
                                       uint64_t pattern_len)
 {
-    if (pattern.empty()) {
+    if (pattern.empty() || pattern_len == 0) {
         return 100;
     }
     const size_t text_len = text.size();
-    if (text_len < pattern_len) {
+    if (text_len == 0 || text_len + 2 < pattern_len) {
         return -1;
     }
 
     const char *p = text.data();
     const uint64_t match_mask = 1ULL << (pattern_len - 1);
 
-    // Fast exact prefix check using precomputed char_mask
-    bool is_prefix = true;
-    for (size_t i = 0; i < pattern_len; ++i) {
-        uint8_t c = static_cast<uint8_t>(p[i]);
-        if (char_mask[c] & (1ULL << i)) {
-            is_prefix = false;
-            break;
+    if (text_len >= pattern_len) {
+        bool is_prefix = true;
+        for (size_t i = 0; i < pattern_len; ++i) {
+            uint8_t c = static_cast<uint8_t>(p[i]);
+            if (char_mask[c] & (1ULL << i)) {
+                is_prefix = false;
+                break;
+            }
+        }
+        if (is_prefix) {
+            return 1000 - static_cast<int>(text_len - pattern_len);
         }
     }
-    if (is_prefix) {
-        return 1000 - static_cast<int>(text_len - pattern_len);
-    }
 
-    // Pass 1: Ultra-fast exact Bitap with pigeonhole character-presence filter
+    // Pass 1: Exact Bitap with pigeonhole character-presence filter
     uint64_t r0 = ~0ULL;
     uint64_t seen_bits = ~0ULL;
     for (size_t i = 0; i < text_len; ++i) {
         uint64_t cm = char_mask[static_cast<uint8_t>(p[i])];
         r0 = (r0 << 1) | cm;
         seen_bits &= cm;
-        if (!(r0 & match_mask)) {
+        if (text_len >= pattern_len && !(r0 & match_mask)) {
             bool word_boundary = false;
             if (i >= pattern_len) {
                 char prev = p[i - pattern_len];
@@ -309,10 +310,10 @@ int FuzzyCatalogIndex::scoreItemFuzzy(std::string_view text, std::string_view pa
         return -1;
     }
 
-    // Pass 2: Fuzzy Bitap (up to 2 errors) - evaluated ONLY if exact match was not found
+    // Pass 2: Active-0 Wu-Manber fuzzy Bitap (up to 2 edits including pattern-char deletions)
     r0 = ~0ULL;
-    uint64_t r1 = ~0ULL;
-    uint64_t r2 = ~0ULL;
+    uint64_t r1 = ~1ULL;
+    uint64_t r2 = ~3ULL;
     bool err1 = false;
     bool err2 = false;
 
@@ -323,8 +324,8 @@ int FuzzyCatalogIndex::scoreItemFuzzy(std::string_view text, std::string_view pa
         uint64_t r1_old = r1;
 
         r0 = ((r0 << 1) | cm);
-        r1 = ((r1 << 1) | cm) & (r0_old << 1) & r0_old & r0;
-        r2 = ((r2 << 1) | cm) & (r1_old << 1) & r1_old & r1;
+        r1 = ((r1 << 1) | cm) & (r0_old << 1) & r0_old & (r0 << 1);
+        r2 = ((r2 << 1) | cm) & (r1_old << 1) & r1_old & (r1 << 1);
 
         if (!(r1 & match_mask)) {
             err1 = true;
@@ -369,10 +370,14 @@ void FuzzyCatalogIndex::refilter()
     for (size_t i = 0; i < m_items.size(); ++i) {
         const auto &item = m_items[i];
 
-        // 1. Badge Mask Filtering
-        uint32_t badge_bit = 1u << static_cast<uint32_t>(item.badge);
-        if ((m_activeBadgeMask & badge_bit) == 0 && m_activeBadgeMask != 0xFFFFFFFFu) {
-            continue;
+        // 1. Badge Mask Filtering (WallpaperBadge enumerators are already bitflags except Image=0)
+        if (m_activeBadgeMask != 0xFFFFFFFFu) {
+            const uint32_t badge_bit = (item.badge == WallpaperBadge::Image)
+                                           ? (1u << 31)
+                                           : static_cast<uint32_t>(item.badge);
+            if ((m_activeBadgeMask & badge_bit) == 0) {
+                continue;
+            }
         }
 
         // 2. Tag Mask Filtering
@@ -487,6 +492,9 @@ double FuzzyCatalogIndex::benchmarkSearch(std::string_view query, size_t iterati
 
     const std::string lower_query = toLowerString(query);
     const uint64_t pat_len = std::min<uint64_t>(lower_query.size(), 64);
+    if (pat_len == 0) {
+        return 0.0;
+    }
     std::array<uint64_t, 256> char_mask{};
     char_mask.fill(~0ULL);
     for (uint64_t i = 0; i < pat_len; ++i) {

@@ -259,8 +259,7 @@ struct ScopedFdArrayGuard {
 
 IpcClient::IpcClient(QString namespaceStr, QString socketPath, QObject *parent, bool autoStart)
     : QObject(parent), m_namespaceStr(std::move(namespaceStr)),
-      m_customSocketPath(std::move(socketPath)),
-      m_lastUniformFlush(std::chrono::steady_clock::now())
+      m_customSocketPath(std::move(socketPath)), m_lastUniformFlush{}
 {
     qRegisterMetaType<TelemetrySnapshot>("TelemetrySnapshot");
     qRegisterMetaType<waywal_export_dmabuf_resp_t>("waywal_export_dmabuf_resp_t");
@@ -345,10 +344,18 @@ bool IpcClient::isConnected() const { return m_connected.load(); }
 
 QString IpcClient::socketPath() const
 {
+    std::lock_guard<std::mutex> lock(m_stateMutex);
     if (!m_customSocketPath.isEmpty()) {
         return m_customSocketPath;
     }
-    return m_resolvedSocketPath;
+    if (!m_resolvedSocketPath.isEmpty()) {
+        return m_resolvedSocketPath;
+    }
+    path_buf_t pb;
+    if (waywal_ipc_resolve_socket_path(&pb, m_namespaceStr.toUtf8().constData())) {
+        return QString::fromUtf8(path_buf_cstr(&pb));
+    }
+    return QString();
 }
 
 void IpcClient::wakeupWorker()
@@ -422,11 +429,16 @@ void IpcClient::closeSocket()
 
 bool IpcClient::connectSocket()
 {
-    QString targetPath = m_customSocketPath;
+    QString targetPath;
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        targetPath = m_customSocketPath;
+    }
     if (targetPath.isEmpty()) {
         path_buf_t pb;
         if (waywal_ipc_resolve_socket_path(&pb, m_namespaceStr.toUtf8().constData())) {
             targetPath = QString::fromUtf8(path_buf_cstr(&pb));
+            std::lock_guard<std::mutex> lock(m_stateMutex);
             m_resolvedSocketPath = targetPath;
         } else {
             return false;
@@ -517,7 +529,20 @@ void IpcClient::workerLoop()
         pfds[1].events = POLLIN;
         pfds[1].revents = 0;
 
-        int pollTimeoutMs = 7;
+        int pollTimeoutMs = 250;
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            if (!m_outQueue.empty()) {
+                pollTimeoutMs = 0;
+            } else if (!m_pendingUniforms.empty()) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - m_lastUniformFlush);
+                pollTimeoutMs = (elapsed >= std::chrono::milliseconds(7))
+                                    ? 0
+                                    : static_cast<int>(7 - elapsed.count());
+            }
+        }
         int pr = poll(pfds, 2, pollTimeoutMs);
 
         if (pr < 0) {
@@ -565,11 +590,16 @@ void IpcClient::flushOutboundQueue()
         std::lock_guard<std::mutex> lock(m_queueMutex);
         packets.swap(m_outQueue);
         if (!m_pendingUniforms.empty()) {
-            uniformBatch.reserve(m_pendingUniforms.size());
-            for (auto &[key, payload] : m_pendingUniforms) {
-                uniformBatch.push_back(payload);
+            const auto now = std::chrono::steady_clock::now();
+            if (m_lastUniformFlush == std::chrono::steady_clock::time_point{} ||
+                now - m_lastUniformFlush >= std::chrono::milliseconds(7)) {
+                uniformBatch.reserve(m_pendingUniforms.size());
+                for (auto &[key, payload] : m_pendingUniforms) {
+                    uniformBatch.push_back(payload);
+                }
+                m_pendingUniforms.clear();
+                m_lastUniformFlush = now;
             }
-            m_pendingUniforms.clear();
         }
     }
 
@@ -1152,28 +1182,42 @@ void IpcClient::sendSetUniform(const QString &output, const QString &name, const
 
     std::string key = output.toStdString() + ":" + name.toStdString();
 
+    bool shouldWake = false;
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
+        shouldWake = m_pendingUniforms.empty();
         m_pendingUniforms[key] = payload;
     }
 
-    wakeupWorker();
+    if (shouldWake) {
+        wakeupWorker();
+    }
 }
 
 void IpcClient::sendSetImage(const waywal_img_metadata_t &meta, int memfd)
 {
+    if (meta.extra_data_len != 0) {
+        emit errorOccurred(
+            QStringLiteral("sendSetImage rejected inconsistent extra_data_len without payload"));
+        return;
+    }
+
     OutboundPacket pkt{};
     pkt.type = OutboundPacket::Type::Raw;
     pkt.hdr.magic = WAYWAL_IPC_MAGIC;
     pkt.hdr.version = WAYWAL_IPC_VERSION;
     pkt.hdr.opcode = WAYWAL_REQ_SET_IMAGE;
-    pkt.hdr.payload_size = sizeof(waywal_img_metadata_t) + meta.extra_data_len;
+    pkt.hdr.payload_size = sizeof(waywal_img_metadata_t);
 
     pkt.payload.resize(pkt.hdr.payload_size);
     std::memcpy(pkt.payload.data(), &meta, sizeof(waywal_img_metadata_t));
 
     if (memfd >= 0) {
         pkt.attachedFd = dupCloexec(memfd);
+        if (pkt.attachedFd < 0) {
+            emit errorOccurred(QStringLiteral("Failed to duplicate image memfd"));
+            return;
+        }
     }
 
     {
@@ -1519,7 +1563,11 @@ bool IpcClient::requestCompileShaderGraph(const QString &output, const QString &
     }
 
     if (outResp) {
-        QString targetPath = m_customSocketPath;
+        QString targetPath;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            targetPath = m_customSocketPath;
+        }
         if (targetPath.isEmpty()) {
             path_buf_t pb;
             if (waywal_ipc_resolve_socket_path(&pb, m_namespaceStr.toUtf8().constData())) {
@@ -1532,6 +1580,10 @@ bool IpcClient::requestCompileShaderGraph(const QString &output, const QString &
         if (fd < 0) {
             return false;
         }
+
+        const timeval tv{.tv_sec = 1, .tv_usec = 500'000};
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         struct sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
