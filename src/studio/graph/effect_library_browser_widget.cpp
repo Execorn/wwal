@@ -17,6 +17,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
+#include <QPixmapCache>
 #include <QPushButton>
 #include <QStyle>
 #include <QStyleOptionViewItem>
@@ -183,6 +184,17 @@ static QPixmap generateProceduralIcon(uint32_t category, int size = 28)
     return pm;
 }
 
+static QPixmap cachedProceduralIcon(uint32_t category, int size = 28)
+{
+    const QString key = QStringLiteral("wwal_eff_cat_%1_%2").arg(category).arg(size);
+    QPixmap pm;
+    if (!QPixmapCache::find(key, &pm)) {
+        pm = generateProceduralIcon(category, size);
+        QPixmapCache::insert(key, pm);
+    }
+    return pm;
+}
+
 class EffectCardDelegate : public QStyledItemDelegate {
   public:
     using QStyledItemDelegate::QStyledItemDelegate;
@@ -230,7 +242,7 @@ class EffectCardDelegate : public QStyledItemDelegate {
         const int iconSize = 26;
         const int iconX = r.left() + 11;
         const int iconY = r.top() + (r.height() - iconSize) / 2;
-        QPixmap iconPm = generateProceduralIcon(category, iconSize);
+        QPixmap iconPm = cachedProceduralIcon(category, iconSize);
         painter->drawPixmap(iconX, iconY, iconPm);
 
         // 4. Badges (right side)
@@ -449,7 +461,7 @@ class EffectListWidget : public QListWidget {
             p.setPen(Qt::NoPen);
             p.drawRoundedRect(QRectF(3, 4, 3.5, dragH - 8), 1.5, 1.5);
 
-            QPixmap iconPm = generateProceduralIcon(category, 22);
+            QPixmap iconPm = cachedProceduralIcon(category, 22);
             p.drawPixmap(10, (dragH - 22) / 2, iconPm);
 
             QFont font = p.font();

@@ -71,6 +71,7 @@ class PowerGovernorWidget : public QWidget {
     bool m_pauseOccluded{true};
     bool m_onBattery{false};
     uint16_t m_globalPauseMask{0};
+    bool m_firstTelemetrySync{true};
 
     // UI Widgets
     QComboBox *m_fpsCombo{nullptr};

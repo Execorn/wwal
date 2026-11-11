@@ -4,6 +4,7 @@
 
 #include "studio/core/command_bus_phase3.hpp"
 #include "studio/core/ipc_client.hpp"
+#include "studio/graph/wire_spatial_and_batch.hpp"
 #include "waywal/shader_graph.h"
 #include "waywal/we_builtin_effects.h"
 
@@ -25,9 +26,13 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace waywal::studio {
+
+class NodeItem;
+class WireItem;
 
 enum class GraphSemanticZoomLod : uint8_t {
     MacroOverview = 0, /* scale < 0.40: Node silhouette + category bar + major pass wires only */
@@ -74,6 +79,9 @@ class NodeGraphEditorWidget : public QWidget {
                      uint32_t dstPinIdx);
     void disconnectWire(uint32_t edgeId);
     void setNodeConstant(uint32_t nodeId, const std::array<float, 4> &val);
+    void moveNodes(const std::vector<MoveNodesCommand::NodeMoveDelta> &deltas);
+    void applyMoveDeltasInPlace(const std::vector<MoveNodesCommand::NodeMoveDelta> &deltas,
+                                bool useNewPos);
 
     /* Compilation & Live Daemon Dispatch */
     bool validateAndSchedule();
@@ -84,6 +92,13 @@ class NodeGraphEditorWidget : public QWidget {
     void setZoomScale(float scale);
     [[nodiscard]] float zoomScale() const noexcept { return m_zoomScale; }
     [[nodiscard]] GraphSemanticZoomLod currentLod() const noexcept;
+    void setSearchFilter(const QString &query);
+    [[nodiscard]] const UniformPinSpatialGrid &pinSpatialGrid() const noexcept
+    {
+        return m_pinSpatialGrid;
+    }
+    [[nodiscard]] QGraphicsScene *scene() const noexcept { return m_scene; }
+    [[nodiscard]] QGraphicsView *canvasView() const noexcept { return m_view; }
     void openQuickConnectPopup(const QPointF &scenePos, int32_t fromNodeId = -1,
                                int32_t fromPinIdx = -1, bool fromOutput = true);
 
@@ -109,6 +124,13 @@ class NodeGraphEditorWidget : public QWidget {
 
     void setupUi();
     void rebuildSceneFromModel();
+    void rebuildPinSpatialGrid();
+    void updateWiresFromLiveItemPositions();
+    void applySearchFilter(const QString &query);
+    bool dispatchGraphJsonHotSwap();
+    uint32_t addNodeInternal(waywal_node_op_t op, const QPointF &scenePos,
+                             const QString &propOrEffectSlug, const QString &titleOverride,
+                             const float *defaultConstVal);
     void applyNodeMutation(const waywal_graph_node_t &node, bool isAdd);
     void applyWireMutation(const waywal_graph_edge_t &edge, bool isConnect);
 
@@ -127,6 +149,14 @@ class NodeGraphEditorWidget : public QWidget {
     QLabel *m_costBadgeLabel{nullptr};
     QPushButton *m_compileBtn{nullptr};
     QMap<uint32_t, QImage> m_nodeThumbnails;
+    std::unordered_map<uint32_t, NodeItem *> m_nodeItems;
+    std::vector<WireItem *> m_wireItems;
+    UniformPinSpatialGrid m_pinSpatialGrid;
+    QString m_activeSearchFilter;
+    bool m_rebuildingScene{false};
+    bool m_applyingMoveInPlace{false};
+    bool m_inCompileToGlsl{false};
+    bool m_hotSwapDispatchedInCurrentCompile{false};
 };
 
 } // namespace waywal::studio

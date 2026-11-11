@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cubic_bezier_editor.hpp"
 
+#include <QEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPaintEvent>
@@ -55,7 +56,37 @@ BezierCurveCanvas::BezierCurveCanvas(QWidget *parent) : QWidget(parent)
 
     setAnimationFps(144);
     m_elapsedTimer.start();
-    m_animTimer.start();
+
+    class VisibilityTimerFilter final : public QObject {
+      public:
+        VisibilityTimerFilter(QTimer *timer, QElapsedTimer *elapsed, QObject *parent)
+            : QObject(parent), m_timer(timer), m_elapsed(elapsed)
+        {
+        }
+
+      protected:
+        bool eventFilter(QObject * /*watched*/, QEvent *event) override
+        {
+            if (event->type() == QEvent::Hide) {
+                m_timer->stop();
+            } else if (event->type() == QEvent::Show) {
+                m_elapsed->restart();
+                if (!m_timer->isActive()) {
+                    m_timer->start();
+                }
+            }
+            return false;
+        }
+
+      private:
+        QTimer *m_timer{nullptr};
+        QElapsedTimer *m_elapsed{nullptr};
+    };
+
+    installEventFilter(new VisibilityTimerFilter(&m_animTimer, &m_elapsedTimer, this));
+    if (isVisible()) {
+        m_animTimer.start();
+    }
 }
 
 BezierCurveCanvas::~BezierCurveCanvas() = default;

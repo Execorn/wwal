@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -81,14 +82,20 @@ class ConnectWireCommand final : public ICommand {
   public:
     using WireFn = std::function<void(const waywal_graph_edge_t &, bool isConnect)>;
 
-    ConnectWireCommand(waywal_graph_edge_t edge, WireFn wireFn);
+    ConnectWireCommand(waywal_graph_edge_t edge, WireFn wireFn,
+                       std::optional<waywal_graph_edge_t> replacedEdge = std::nullopt);
 
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] const std::optional<waywal_graph_edge_t> &replacedEdge() const noexcept
+    {
+        return m_replacedEdge;
+    }
 
   private:
     waywal_graph_edge_t m_edge{};
+    std::optional<waywal_graph_edge_t> m_replacedEdge;
     WireFn m_wireFn;
 };
 

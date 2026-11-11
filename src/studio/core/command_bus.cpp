@@ -431,14 +431,18 @@ bool MoveNodesCommand::mergeWith(const ICommand *other)
     return true;
 }
 
-ConnectWireCommand::ConnectWireCommand(waywal_graph_edge_t edge, WireFn wireFn)
-    : m_edge(edge), m_wireFn(std::move(wireFn))
+ConnectWireCommand::ConnectWireCommand(waywal_graph_edge_t edge, WireFn wireFn,
+                                       std::optional<waywal_graph_edge_t> replacedEdge)
+    : m_edge(edge), m_replacedEdge(replacedEdge), m_wireFn(std::move(wireFn))
 {
 }
 
 void ConnectWireCommand::execute()
 {
     if (m_wireFn) {
+        if (m_replacedEdge.has_value()) {
+            m_wireFn(*m_replacedEdge, false);
+        }
         m_wireFn(m_edge, true);
     }
 }
@@ -447,6 +451,9 @@ void ConnectWireCommand::undo()
 {
     if (m_wireFn) {
         m_wireFn(m_edge, false);
+        if (m_replacedEdge.has_value()) {
+            m_wireFn(*m_replacedEdge, true);
+        }
     }
 }
 

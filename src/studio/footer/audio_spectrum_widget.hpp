@@ -10,6 +10,8 @@
 #include <QtCore/QElapsedTimer>
 #include <QtGui/QPaintEvent>
 #include <QtGui/QMouseEvent>
+#include <QtGui/QShowEvent>
+#include <QtGui/QHideEvent>
 
 #include <array>
 #include <cstdint>
@@ -85,6 +87,8 @@ class AudioSpectrumWidget : public QWidget {
     void mouseMoveEvent(QMouseEvent *event) override;
     void leaveEvent(QEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
+    void showEvent(QShowEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
 
   private Q_SLOTS:
     void onPhysicsTick();
@@ -93,6 +97,7 @@ class AudioSpectrumWidget : public QWidget {
 
   private:
     void setupUi();
+    void wakePhysicsTimer();
     void stepPhysics(float dt);
     void renderSpectrumBars(class QPainter &painter, const QRectF &rect);
     void renderRmsMeter(class QPainter &painter, const QRectF &rect);
@@ -128,6 +133,7 @@ class AudioSpectrumWidget : public QWidget {
 
     // Mouse hover tracking for tooltips
     int m_hoveredBand{-1};
+    int m_lastBeatAlphaBucket{-1};
 
     // Timers & clock
     QTimer m_physicsTimer;

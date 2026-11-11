@@ -42,6 +42,7 @@ class PhysicsSpringInspectorWidget : public QWidget {
     void selectBoneIndex(int32_t boneIndex);
     [[nodiscard]] int32_t selectedBoneIndex() const noexcept { return m_selectedBoneIndex; }
     [[nodiscard]] const we_bone_sim_config_t &currentBoneConfig() const noexcept;
+    [[nodiscard]] const we_bone_sim_config_t &boneConfig(int32_t boneIndex) const noexcept;
     [[nodiscard]] const we_wind_field_t &windField() const noexcept { return m_ctx.wind; }
     [[nodiscard]] const we_cursor_force_t &cursorForce() const noexcept { return m_ctx.cursor; }
 
@@ -49,6 +50,7 @@ class PhysicsSpringInspectorWidget : public QWidget {
 
   public slots:
     void updateSolverTelemetry(uint32_t activeBones, float stepTimeUs);
+    void onPropagateToChildren() { onApplyPresetToDescendantsClicked(); }
 
   signals:
     void physicsParamsChanged(const QString &output, int32_t objectId, int32_t boneIndex,
@@ -68,6 +70,7 @@ class PhysicsSpringInspectorWidget : public QWidget {
   private:
     void setupUi();
     void syncUiFromSelectedBone();
+    void refreshBoneTreeStates();
     void commitPhysicsChange(const we_bone_sim_config_t &newCfg, const we_wind_field_t &newWind,
                              const we_cursor_force_t &newCursor);
     void sendIpcUpdate(const QString &output, int32_t objectId, int32_t boneIndex,

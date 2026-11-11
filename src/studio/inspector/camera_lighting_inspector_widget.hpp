@@ -74,6 +74,8 @@ class CameraLightingInspectorWidget : public QWidget {
     void commitChange(const we_camera3d_t &newCam, const we_lighting_uniforms_t &newLights);
     void sendIpcUpdate(const QString &output, const we_camera3d_t &cam,
                        const we_lighting_uniforms_t &lights);
+    static void populateDefaults(we_camera3d_t &cam, we_lighting_uniforms_t &lights);
+    static void sanitizeAndEvaluateCamera(we_camera3d_t &cam);
 
     QString m_targetOutput;
     we_camera3d_t m_camera{};

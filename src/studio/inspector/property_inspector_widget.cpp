@@ -12,7 +12,9 @@
 #include <QInputDialog>
 #include <QMenu>
 #include <QMessageBox>
+#include <QPointer>
 #include <QRegularExpression>
+#include <QScopedValueRollback>
 #include <QStandardPaths>
 #include <QTextStream>
 
@@ -29,6 +31,22 @@ PropertyRowWidget::PropertyRowWidget(const InspectorProperty &prop, QWidget *par
     : QWidget(parent), m_prop(prop)
 {
     setupUi();
+}
+
+void PropertyRowWidget::componentRange(int index, float &outMin, float &outMax) const noexcept
+{
+    outMin = (m_prop.hasRange && index >= 0 && index < static_cast<int>(m_prop.minValues.size()))
+                 ? m_prop.minValues[static_cast<size_t>(index)]
+                 : 0.0f;
+    const float defVal = (index >= 0 && index < static_cast<int>(m_prop.defaultValues.size()))
+                             ? m_prop.defaultValues[static_cast<size_t>(index)]
+                             : 1.0f;
+    outMax = (m_prop.hasRange && index >= 0 && index < static_cast<int>(m_prop.maxValues.size()))
+                 ? m_prop.maxValues[static_cast<size_t>(index)]
+                 : (defVal > 1.0f ? defVal * 2.0f : 1.0f);
+    if (outMax <= outMin) {
+        outMax = outMin + 1.0f;
+    }
 }
 
 void PropertyRowWidget::setupUi()
@@ -54,13 +72,9 @@ void PropertyRowWidget::setupUi()
 
     switch (m_prop.kind) {
     case InspectorProperty::Kind::Float: {
-        float minVal = m_prop.hasRange ? m_prop.minValues[0] : 0.0f;
-        float maxVal =
-            m_prop.hasRange
-                ? m_prop.maxValues[0]
-                : (m_prop.defaultValues[0] > 1.0f ? m_prop.defaultValues[0] * 2.0f : 1.0f);
-        if (maxVal <= minVal)
-            maxVal = minVal + 1.0f;
+        float minVal = 0.0f;
+        float maxVal = 1.0f;
+        componentRange(0, minVal, maxVal);
 
         float stepVal = m_prop.step > 0.0001f ? m_prop.step : 0.01f;
         int decimals = 2;
@@ -90,18 +104,11 @@ void PropertyRowWidget::setupUi()
         m_sliders.push_back(slider);
         m_spinBoxes.push_back(spin);
 
-        connect(slider, &QSlider::valueChanged, this, [this, minVal, maxVal](int val) {
-            if (m_updating)
-                return;
-            float fval = minVal + (static_cast<float>(val) / 1000.0f) * (maxVal - minVal);
-            syncSliderSpin(0, fval);
-        });
+        connect(slider, &QSlider::valueChanged, this,
+                [this](int val) { onSliderValueChanged(0, val); });
 
-        connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double val) {
-            if (m_updating)
-                return;
-            syncSliderSpin(0, static_cast<float>(val));
-        });
+        connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+                [this](double val) { onSpinValueChanged(0, val); });
 
         controlLayout->addWidget(slider, 1);
         controlLayout->addWidget(spin);
@@ -119,10 +126,9 @@ void PropertyRowWidget::setupUi()
         vecStack->setSpacing(2);
 
         for (uint32_t i = 0; i < count; ++i) {
-            float minVal = m_prop.hasRange ? m_prop.minValues[i] : 0.0f;
-            float maxVal = m_prop.hasRange ? m_prop.maxValues[i] : 1.0f;
-            if (maxVal <= minVal)
-                maxVal = minVal + 1.0f;
+            float minVal = 0.0f;
+            float maxVal = 1.0f;
+            componentRange(static_cast<int>(i), minVal, maxVal);
             float stepVal = m_prop.step > 0.0001f ? m_prop.step : 0.01f;
 
             auto *subLayout = new QHBoxLayout();
@@ -154,19 +160,11 @@ void PropertyRowWidget::setupUi()
             m_spinBoxes.push_back(spin);
 
             int compIdx = static_cast<int>(i);
-            connect(slider, &QSlider::valueChanged, this, [this, compIdx, minVal, maxVal](int val) {
-                if (m_updating)
-                    return;
-                float fval = minVal + (static_cast<float>(val) / 1000.0f) * (maxVal - minVal);
-                syncSliderSpin(compIdx, fval);
-            });
+            connect(slider, &QSlider::valueChanged, this,
+                    [this, compIdx](int val) { onSliderValueChanged(compIdx, val); });
 
             connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
-                    [this, compIdx](double val) {
-                        if (m_updating)
-                            return;
-                        syncSliderSpin(compIdx, static_cast<float>(val));
-                    });
+                    [this, compIdx](double val) { onSpinValueChanged(compIdx, val); });
 
             subLayout->addWidget(cLabel);
             subLayout->addWidget(slider, 1);
@@ -273,40 +271,41 @@ void PropertyRowWidget::setupUi()
     rowLayout->addWidget(m_resetButton);
 }
 
-void PropertyRowWidget::syncSliderSpin(int index, float val)
+void PropertyRowWidget::syncSliderSpin(int index, float val, bool emitSignal)
 {
     if (index < 0 || index >= static_cast<int>(m_prop.currentValues.size()))
         return;
 
-    m_updating = true;
-    m_prop.currentValues[index] = val;
+    float minVal = 0.0f;
+    float maxVal = 1.0f;
+    componentRange(index, minVal, maxVal);
 
-    float minVal = m_prop.hasRange ? m_prop.minValues[index] : 0.0f;
-    float maxVal = m_prop.hasRange ? m_prop.maxValues[index] : 1.0f;
-    if (maxVal <= minVal)
-        maxVal = minVal + 1.0f;
+    {
+        const QScopedValueRollback<bool> guard(m_updating, true);
+        m_prop.currentValues[static_cast<size_t>(index)] = val;
 
-    if (index < static_cast<int>(m_sliders.size())) {
-        int sliderPos =
-            static_cast<int>(std::round(((val - minVal) / (maxVal - minVal)) * 1000.0f));
-        m_sliders[index]->setValue(std::clamp(sliderPos, 0, 1000));
+        if (index < static_cast<int>(m_sliders.size())) {
+            int sliderPos =
+                static_cast<int>(std::round(((val - minVal) / (maxVal - minVal)) * 1000.0f));
+            m_sliders[static_cast<size_t>(index)]->setValue(std::clamp(sliderPos, 0, 1000));
+        }
+        if (index < static_cast<int>(m_spinBoxes.size())) {
+            m_spinBoxes[static_cast<size_t>(index)]->setValue(val);
+        }
     }
-    if (index < static_cast<int>(m_spinBoxes.size())) {
-        m_spinBoxes[index]->setValue(val);
-    }
-    m_updating = false;
 
-    emitChange();
+    if (emitSignal) {
+        emitChange();
+    }
 }
 
 void PropertyRowWidget::onSliderValueChanged(int index, int sliderVal)
 {
     if (m_updating)
         return;
-    float minVal = m_prop.hasRange ? m_prop.minValues[index] : 0.0f;
-    float maxVal = m_prop.hasRange ? m_prop.maxValues[index] : 1.0f;
-    if (maxVal <= minVal)
-        maxVal = minVal + 1.0f;
+    float minVal = 0.0f;
+    float maxVal = 1.0f;
+    componentRange(index, minVal, maxVal);
     float fval = minVal + (static_cast<float>(sliderVal) / 1000.0f) * (maxVal - minVal);
     syncSliderSpin(index, fval);
 }
@@ -435,43 +434,45 @@ void PropertyRowWidget::emitChange()
     emit valueChanged(m_prop.name, m_prop.currentValues, m_prop.numComponents);
 }
 
-void PropertyRowWidget::updateValues(const std::vector<float> &vals)
+void PropertyRowWidget::updateValues(const std::vector<float> &vals, bool emitSignal)
 {
-    m_updating = true;
-    m_prop.currentValues = vals;
+    {
+        const QScopedValueRollback<bool> guard(m_updating, true);
+        m_prop.currentValues = vals;
 
-    if (m_prop.kind == InspectorProperty::Kind::Float && !vals.empty()) {
-        float v = vals[0];
-        syncSliderSpin(0, v);
-    } else if (m_prop.kind == InspectorProperty::Kind::Bool && !vals.empty()) {
-        if (m_checkBox)
-            m_checkBox->setChecked(vals[0] > 0.5f);
-    } else if (m_prop.kind == InspectorProperty::Kind::Int && !vals.empty()) {
-        if (m_intSpinBox)
-            m_intSpinBox->setValue(static_cast<int>(vals[0]));
-    } else if (m_prop.kind == InspectorProperty::Kind::Combo && !vals.empty()) {
-        if (m_comboBox)
-            m_comboBox->setCurrentIndex(static_cast<int>(vals[0]));
-    } else if (m_prop.kind == InspectorProperty::Kind::Color && vals.size() >= 3) {
-        QColor col =
-            QColor::fromRgbF(std::clamp(vals[0], 0.0f, 1.0f), std::clamp(vals[1], 0.0f, 1.0f),
-                             std::clamp(vals[2], 0.0f, 1.0f));
-        if (m_colorSwatchBtn) {
-            m_colorSwatchBtn->setStyleSheet(
-                QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
-                    .arg(col.name(QColor::HexRgb)));
-        }
-        if (m_hexEdit) {
-            m_hexEdit->setText(col.name(QColor::HexRgb).toUpper());
-        }
-    } else {
-        for (size_t i = 0; i < vals.size() && i < m_sliders.size(); ++i) {
-            syncSliderSpin(static_cast<int>(i), vals[i]);
+        if (m_prop.kind == InspectorProperty::Kind::Float && !vals.empty()) {
+            syncSliderSpin(0, vals[0], false);
+        } else if (m_prop.kind == InspectorProperty::Kind::Bool && !vals.empty()) {
+            if (m_checkBox)
+                m_checkBox->setChecked(vals[0] > 0.5f);
+        } else if (m_prop.kind == InspectorProperty::Kind::Int && !vals.empty()) {
+            if (m_intSpinBox)
+                m_intSpinBox->setValue(static_cast<int>(vals[0]));
+        } else if (m_prop.kind == InspectorProperty::Kind::Combo && !vals.empty()) {
+            if (m_comboBox)
+                m_comboBox->setCurrentIndex(static_cast<int>(vals[0]));
+        } else if (m_prop.kind == InspectorProperty::Kind::Color && vals.size() >= 3) {
+            QColor col =
+                QColor::fromRgbF(std::clamp(vals[0], 0.0f, 1.0f), std::clamp(vals[1], 0.0f, 1.0f),
+                                 std::clamp(vals[2], 0.0f, 1.0f));
+            if (m_colorSwatchBtn) {
+                m_colorSwatchBtn->setStyleSheet(
+                    QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
+                        .arg(col.name(QColor::HexRgb)));
+            }
+            if (m_hexEdit) {
+                m_hexEdit->setText(col.name(QColor::HexRgb).toUpper());
+            }
+        } else {
+            for (size_t i = 0; i < vals.size() && i < m_sliders.size(); ++i) {
+                syncSliderSpin(static_cast<int>(i), vals[i], false);
+            }
         }
     }
 
-    m_updating = false;
-    emitChange();
+    if (emitSignal) {
+        emitChange();
+    }
 }
 
 void PropertyRowWidget::resetToDefault() { updateValues(m_prop.defaultValues); }
@@ -970,10 +971,19 @@ void PropertyInspectorWidget::rebuildPropertyUi()
     m_containerLayout->addStretch(1);
 }
 
+std::vector<float> PropertyInspectorWidget::propertyValues(const QString &name) const
+{
+    for (const auto &prop : m_properties) {
+        if (prop.name == name) {
+            return prop.currentValues;
+        }
+    }
+    return {};
+}
+
 void PropertyInspectorWidget::onRowValueChanged(const QString &name,
                                                 const std::vector<float> &values, uint32_t count)
 {
-    // Find previous values
     std::vector<float> oldValues;
     for (auto &prop : m_properties) {
         if (prop.name == name) {
@@ -990,24 +1000,38 @@ void PropertyInspectorWidget::dispatchUniform(const QString &name,
                                               const std::vector<float> &oldVals,
                                               const std::vector<float> &newVals, uint32_t count)
 {
-    // 1. Emit Qt signal so studio viewports and widgets react immediately
-    QVector<float> qvals(newVals.begin(), newVals.end());
-    emit uniformChanged(m_targetOutput, name, qvals, count);
-
-    // 2. Dispatch via CommandBus with micro-drag merging
     if (m_commandBus) {
+        QPointer<PropertyInspectorWidget> self(this);
         auto cmd = std::make_unique<SetUniformCommand>(
             m_targetOutput, name, oldVals, newVals, 0,
-            [this](const QString &out, const QString &nm, const float *vals, uint32_t cnt,
+            [self](const QString &out, const QString &nm, const float *vals, uint32_t cnt,
                    uint32_t) {
-                if (m_ipcClient) {
-                    m_ipcClient->sendSetUniform(out, nm, vals, cnt);
+                if (!self) {
+                    return;
+                }
+                std::vector<float> vec(vals, vals + cnt);
+                for (auto &prop : self->m_properties) {
+                    if (prop.name == nm) {
+                        prop.currentValues = vec;
+                        break;
+                    }
+                }
+                if (auto it = self->m_rowWidgets.find(nm); it != self->m_rowWidgets.end() && *it) {
+                    (*it)->updateValues(vec, false);
+                }
+                QVector<float> qvals(vec.begin(), vec.end());
+                emit self->uniformChanged(out, nm, qvals, cnt);
+                if (self->m_ipcClient) {
+                    self->m_ipcClient->sendSetUniform(out, nm, vals, cnt);
                 }
             });
         m_commandBus->execute(std::move(cmd));
-    } else if (m_ipcClient) {
-        // Direct non-blocking 144 Hz streaming if CommandBus is not wired
-        m_ipcClient->sendSetUniform(m_targetOutput, name, newVals.data(), count);
+    } else {
+        QVector<float> qvals(newVals.begin(), newVals.end());
+        emit uniformChanged(m_targetOutput, name, qvals, count);
+        if (m_ipcClient) {
+            m_ipcClient->sendSetUniform(m_targetOutput, name, newVals.data(), count);
+        }
     }
 }
 
@@ -1029,7 +1053,7 @@ QString PropertyInspectorWidget::resolvePresetDir() const
     if (xdgConfig.isEmpty()) {
         xdgConfig = QDir::homePath() + "/.config";
     }
-    QString dir = xdgConfig + "/waywal/presets";
+    QString dir = xdgConfig + QStringLiteral("/wwal/presets");
     QDir().mkpath(dir);
     return dir;
 }

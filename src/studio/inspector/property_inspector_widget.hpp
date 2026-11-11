@@ -72,7 +72,7 @@ class PropertyRowWidget : public QWidget {
     ~PropertyRowWidget() override = default;
 
     [[nodiscard]] const InspectorProperty &property() const noexcept { return m_prop; }
-    void updateValues(const std::vector<float> &vals);
+    void updateValues(const std::vector<float> &vals, bool emitSignal = true);
     void resetToDefault();
     void setFilterVisible(bool visible);
 
@@ -91,7 +91,8 @@ class PropertyRowWidget : public QWidget {
 
   private:
     void setupUi();
-    void syncSliderSpin(int index, float val);
+    void componentRange(int index, float &outMin, float &outMax) const noexcept;
+    void syncSliderSpin(int index, float val, bool emitSignal = true);
     void emitChange();
 
     InspectorProperty m_prop;
@@ -114,7 +115,7 @@ class PropertyRowWidget : public QWidget {
 /**
  * @brief Dynamic live inspector for Wallpaper Engine scenes and Shadertoy GLSL shaders.
  * Supports auto-generated controls, 60/144 Hz parameter streaming via CommandBus & IpcClient,
- * and preset loading/saving in ~/.config/waywal/presets/<id>.toml.
+ * and preset loading/saving in ~/.config/wwal/presets/<id>.toml.
  */
 class PropertyInspectorWidget : public QWidget {
     Q_OBJECT
@@ -144,6 +145,11 @@ class PropertyInspectorWidget : public QWidget {
     [[nodiscard]] PresetStore *presetStore() const noexcept { return m_presetStore; }
 
     [[nodiscard]] const QString &currentProjectOrShaderId() const noexcept { return m_currentId; }
+    [[nodiscard]] PropertyRowWidget *propertyRow(const QString &name) const noexcept
+    {
+        return m_rowWidgets.value(name, nullptr);
+    }
+    [[nodiscard]] std::vector<float> propertyValues(const QString &name) const;
 
     // --- Preset Actions ---
     bool savePreset(const QString &presetName = QString());

@@ -35,6 +35,7 @@
 #include <QStandardPaths>
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <system_error>
 #include <type_traits>
@@ -1186,9 +1187,9 @@ void MainWindow::wireInterPanelSignals()
                     }
                 });
         connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectActivated, this,
-                [this](we_builtin_effect_id_t effectId, const QString & /*slug*/) {
-                    if (m_nodeGraphEditor) {
-                        m_nodeGraphEditor->addBuiltinEffectNode(effectId, QPointF(100.0, 100.0));
+                [this](we_builtin_effect_id_t /*effectId*/, const QString &slug) {
+                    if (m_statusLabel && !slug.isEmpty()) {
+                        m_statusLabel->setText(QStringLiteral("Effect: %1").arg(slug));
                     }
                 });
     }
@@ -1197,44 +1198,26 @@ void MainWindow::wireInterPanelSignals()
         connect(m_nodeGraphEditor,
                 qOverload<const QString &, uint32_t>(&NodeGraphEditorWidget::graphCompiled), this,
                 [this](const QString &glslCode, uint32_t /*activePassMask*/) {
-                    if (m_previewViewport && !glslCode.isEmpty()) {
+                    if (glslCode.isEmpty()) {
+                        return;
+                    }
+                    if (m_previewViewport) {
                         m_previewViewport->setPreviewShader(glslCode);
                     }
-                    if (m_ipcClient && !glslCode.isEmpty()) {
-                        m_ipcClient->requestCompileShaderGraph(
-                            QStringLiteral("*"), QString(), glslCode, WAYWAL_COMPILE_FLAG_HOT_SWAP);
+                    if (m_nodeGraphEditor) {
+                        m_nodeGraphEditor->compileAndHotSwapDaemon();
                     }
                 });
     }
 
     if (m_cameraLightingInspector) {
         connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::camera3DChanged, this,
-                [this](const QString &output, const we_camera3d_t &cam) {
+                [this](const QString & /*output*/, const we_camera3d_t &cam) {
                     if (m_previewViewport) {
-                        QMatrix4x4 vpMat(cam.view_proj_matrix);
+                        QMatrix4x4 vpMat;
+                        std::memcpy(vpMat.data(), cam.view_proj_matrix, 16 * sizeof(float));
                         m_previewViewport->setShaderUniform(
                             QStringLiteral("g_ViewProjectionMatrix"), vpMat);
-                    }
-                    if (m_ipcClient) {
-                        m_ipcClient->sendSetCamera3D(output, cam);
-                    }
-                });
-        connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::lightingChanged, this,
-                [this](const QString &output, const we_lighting_uniforms_t &lights) {
-                    if (m_ipcClient) {
-                        m_ipcClient->sendSetSceneLights(output, lights);
-                    }
-                });
-    }
-
-    if (m_physicsSpringInspector) {
-        connect(m_physicsSpringInspector, &PhysicsSpringInspectorWidget::physicsParamsChanged, this,
-                [this](const QString &output, int32_t objectId, int32_t boneIndex,
-                       const we_bone_sim_config_t &cfg, const we_wind_field_t &wind,
-                       const we_cursor_force_t &cursor) {
-                    if (m_ipcClient) {
-                        m_ipcClient->sendSetPhysicsParams(output, objectId, boneIndex, cfg, wind,
-                                                          cursor);
                     }
                 });
     }
