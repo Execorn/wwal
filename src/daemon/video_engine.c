@@ -482,6 +482,46 @@ static output_node_t *select_pll_reference_output(const video_engine_t *ve)
     return best_unpaused ? best_unpaused : best_any;
 }
 
+static int64_t get_output_refresh_period_ns(const output_node_t *out)
+{
+    if (!out)
+        return 0;
+    if (out->pres_sync.pll.frame_seq > 0 && out->pres_sync.pll.period_est_ns > 0)
+        return out->pres_sync.pll.period_est_ns;
+    if (out->refresh_mhz > 0)
+        return 1000000000000LL / (int64_t)out->refresh_mhz;
+    return out->pres_sync.pll.period_est_ns;
+}
+
+static int64_t prepare_output_fifo_and_feedback(output_node_t *out,
+                                                const output_node_t *pll_ref_out,
+                                                int64_t frame_interval_ns)
+{
+    if (!out)
+        return 0;
+
+    bool prev_still_pending = out->pres_sync.pending_feedback;
+    if (out->pres_sync.wp_pres && (out == pll_ref_out || out->fifo != NULL)) {
+        presentation_sync_request(&out->pres_sync);
+    }
+
+    int64_t out_period_ns = get_output_refresh_period_ns(out);
+    if (out->fifo && out->pres_sync.wp_pres && out_period_ns > 0 &&
+        frame_interval_ns + (frame_interval_ns / 16) >= out_period_ns) {
+        /* Omit wait_barrier when the previous commit is still awaiting presentation so
+         * in-flight FIFO depth never exceeds one frame and VBlank slips recover cleanly. */
+        if (out->fifo_barrier_pending && !prev_still_pending) {
+            waywal_fifo_wait_barrier(out->fifo);
+        }
+        waywal_fifo_set_barrier(out->fifo);
+        out->fifo_barrier_pending = true;
+    } else {
+        out->fifo_barrier_pending = false;
+    }
+
+    return out_period_ns;
+}
+
 static struct wl_buffer *ensure_shared_video_buffer(video_engine_t *ve, VASurfaceID export_surf,
                                                     uint32_t buf_idx)
 {
@@ -534,6 +574,89 @@ static struct wl_buffer *ensure_shared_video_buffer(video_engine_t *ve, VASurfac
     return wl_buf;
 }
 
+static void configure_output_video_viewport(output_node_t *out, uint32_t vid_w, uint32_t vid_h);
+
+static bool video_engine_redraw_output(video_engine_t *ve, output_node_t *out)
+{
+    if (!ve || !out || !out->surface || ve->state == WAYWAL_VIDEO_STATE_STOPPED ||
+        !is_output_active_for_video(ve, out)) {
+        return false;
+    }
+
+#ifdef HAVE_FFMPEG_SWDEC
+    if (ve->using_swdec && ve->swdec_ctx) {
+        ffmpeg_swdec_t *sw = (ffmpeg_swdec_t *)ve->swdec_ctx;
+        if (sw->has_gbm_ring && sw->last_ready_ring_idx >= 0 &&
+            sw->wl_bufs[sw->last_ready_ring_idx]) {
+            int r_idx = sw->last_ready_ring_idx;
+            configure_output_video_viewport(out, sw->width, sw->height);
+            if (out->pres_sync.wp_pres) {
+                presentation_sync_request(&out->pres_sync);
+            }
+            if (out->fifo) {
+                if (out->fifo_barrier_pending) {
+                    waywal_fifo_wait_barrier(out->fifo);
+                }
+                waywal_fifo_set_barrier(out->fifo);
+                out->fifo_barrier_pending = true;
+            }
+            wl_surface_attach(out->surface, sw->wl_bufs[r_idx], 0, 0);
+            wl_surface_damage_buffer(out->surface, 0, 0, (int32_t)sw->width, (int32_t)sw->height);
+            wl_surface_commit(out->surface);
+            out->has_image = true;
+            sw->buf_busy[r_idx]++;
+            if (ve->daemon_state && ve->daemon_state->display) {
+                wl_display_flush(ve->daemon_state->display);
+            }
+            return true;
+        }
+        if (sw->rgba_buf && sw->width > 0 && sw->height > 0 && ve->daemon_state) {
+            output_node_render_image(ve->daemon_state, out, sw->rgba_buf, sw->width, sw->height);
+            return true;
+        }
+        return false;
+    }
+#endif
+
+    struct wl_buffer *wl_buf = NULL;
+    uint32_t buf_idx = 0;
+    if (ve->last_presented_buf_idx >= 0 &&
+        (uint32_t)ve->last_presented_buf_idx < WAYWAL_VA_SURFACE_POOL_SIZE &&
+        ve->video_wl_buffers[ve->last_presented_buf_idx]) {
+        buf_idx = (uint32_t)ve->last_presented_buf_idx;
+        wl_buf = ve->video_wl_buffers[buf_idx];
+    }
+    if (wl_buf && ve->decoder.width > 0 && ve->decoder.height > 0) {
+        configure_output_video_viewport(out, ve->decoder.width, ve->decoder.height);
+        if (out->pres_sync.wp_pres) {
+            presentation_sync_request(&out->pres_sync);
+        }
+        if (out->fifo) {
+            if (out->fifo_barrier_pending) {
+                waywal_fifo_wait_barrier(out->fifo);
+            }
+            waywal_fifo_set_barrier(out->fifo);
+            out->fifo_barrier_pending = true;
+        }
+        wl_surface_attach(out->surface, wl_buf, 0, 0);
+        wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
+        wl_surface_commit(out->surface);
+        out->has_image = true;
+        ve->video_buffer_in_use[buf_idx]++;
+        if (ve->daemon_state && ve->daemon_state->display) {
+            wl_display_flush(ve->daemon_state->display);
+        }
+        return true;
+    }
+
+    if (ve->state == WAYWAL_VIDEO_STATE_PLAYING && ve->timer_fd >= 0) {
+        struct itimerspec its = {.it_interval = {0, 0},
+                                 .it_value = {.tv_sec = 0, .tv_nsec = 1000000L}};
+        timerfd_settime(ve->timer_fd, 0, &its, NULL);
+    }
+    return false;
+}
+
 bool video_engine_init(video_engine_t *ve, daemon_state_t *state)
 {
     if (!ve || !state)
@@ -546,7 +669,9 @@ bool video_engine_init(video_engine_t *ve, daemon_state_t *state)
     ve->playback_speed = 1.0f;
     ve->loop_count = 0; /* infinite loop */
     ve->seamless_looping = true;
+    ve->last_presented_buf_idx = -1;
     ve->last_export_surf = VA_INVALID_SURFACE;
+    ve->redraw_output = video_engine_redraw_output;
 
     ve->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (ve->timer_fd < 0) {
@@ -781,6 +906,7 @@ static void video_engine_release_wl_buffers(video_engine_t *ve)
         }
         ve->video_buffer_in_use[i] = 0;
     }
+    ve->last_presented_buf_idx = -1;
     if (destroyed_any && ve->daemon_state && ve->daemon_state->display) {
         wl_display_flush(ve->daemon_state->display);
     }
@@ -802,7 +928,15 @@ static void video_engine_prepare_reload(video_engine_t *ve)
     ve->eof_draining = false;
     ve->has_decoded_any = false;
     ve->playback_epoch_ns = 0;
+    ve->last_presented_buf_idx = -1;
     ve->last_export_surf = VA_INVALID_SURFACE;
+    if (ve->daemon_state) {
+        for (output_node_t *out = ve->daemon_state->outputs; out != NULL; out = out->next) {
+            if (is_output_active_for_video(ve, out)) {
+                out->fifo_barrier_pending = false;
+            }
+        }
+    }
     video_engine_release_wl_buffers(ve);
 #ifdef HAVE_FFMPEG_SWDEC
     swdec_destroy(ve);
@@ -987,6 +1121,7 @@ static bool video_engine_start_playback(video_engine_t *ve, output_node_t *out)
     ve->next_present_poc = 0;
     ve->has_decoded_any = false;
     ve->last_vpp_idx = 0;
+    ve->last_presented_buf_idx = -1;
     ve->last_export_surf = VA_INVALID_SURFACE;
     memset(ve->combined_busy_mask, 0, sizeof(ve->combined_busy_mask));
 
@@ -1129,21 +1264,12 @@ static bool reorder_has_ready_frame(video_engine_t *ve)
                 target_depth = 3U;
             }
         } else if (ve->demuxer->codec == WAYWAL_CODEC_H264) {
-            if (ve->decoder.cached_sps.valid && (ve->decoder.cached_sps.profile_idc == 66 ||
-                                                 ve->decoder.cached_sps.constraint_set0_flag != 0 ||
-                                                 ve->decoder.cached_sps.num_ref_frames <= 1 ||
-                                                 ve->decoder.cached_sps.pic_order_cnt_type == 2)) {
-                target_depth = 1U;
-            } else if (ve->decoder.cached_sps.valid &&
-                       ve->decoder.cached_sps.bitstream_restriction_flag) {
-                target_depth = (uint32_t)ve->decoder.cached_sps.max_num_reorder_frames + 1U;
-            } else {
-                target_depth = 4U;
-            }
+            target_depth =
+                vaapi_h264_compute_reorder_depth(&ve->decoder.cached_sps, WAYWAL_VIDEO_REORDER_CAP);
         }
     }
-    if (target_depth > WAYWAL_VIDEO_REORDER_CAP - 1U) {
-        target_depth = WAYWAL_VIDEO_REORDER_CAP - 1U;
+    if (target_depth > WAYWAL_VIDEO_REORDER_CAP) {
+        target_depth = WAYWAL_VIDEO_REORDER_CAP;
     }
     return (ve->reorder_count >= target_depth);
 }
@@ -1200,6 +1326,13 @@ void video_engine_dispatch_frame(video_engine_t *ve)
 
 #ifdef HAVE_FFMPEG_SWDEC
     if (ve->using_swdec && ve->swdec_ctx) {
+        int64_t sw_interval_us = 1000000LL / (int64_t)eff_fps;
+        double sw_speed = (ve->playback_speed > 0.01f) ? (double)ve->playback_speed : 1.0;
+        sw_interval_us = (int64_t)((double)sw_interval_us / sw_speed);
+        if (sw_interval_us < 1000LL)
+            sw_interval_us = 1000LL;
+        int64_t sw_interval_ns = sw_interval_us * 1000LL;
+
         int64_t sw_pts_us = 0;
         bool first_frame = !ve->has_decoded_any;
         if (swdec_decode_and_present(ve, &sw_pts_us)) {
@@ -1220,6 +1353,7 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                         sw->wl_bufs[sw->last_ready_ring_idx]) {
                         int r_idx = sw->last_ready_ring_idx;
                         configure_output_video_viewport(out, sw->width, sw->height);
+                        (void)prepare_output_fifo_and_feedback(out, pll_ref_out, sw_interval_ns);
                         wl_surface_attach(out->surface, sw->wl_bufs[r_idx], 0, 0);
                         wl_surface_damage_buffer(out->surface, 0, 0, (int32_t)sw->width,
                                                  (int32_t)sw->height);
@@ -1227,6 +1361,7 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                         out->has_image = true;
                         sw_attached_count++;
                     } else if (sw->rgba_buf) {
+                        out->fifo_barrier_pending = false;
                         output_node_render_image(ve->daemon_state, out, sw->rgba_buf, sw->width,
                                                  sw->height);
                     }
@@ -1240,12 +1375,6 @@ void video_engine_dispatch_frame(video_engine_t *ve)
         if (ve->state != WAYWAL_VIDEO_STATE_PLAYING)
             return;
 
-        int64_t sw_interval_us = 1000000LL / (int64_t)eff_fps;
-        double sw_speed = (ve->playback_speed > 0.01f) ? (double)ve->playback_speed : 1.0;
-        sw_interval_us = (int64_t)((double)sw_interval_us / sw_speed);
-        if (sw_interval_us < 1000LL)
-            sw_interval_us = 1000LL;
-        int64_t sw_interval_ns = sw_interval_us * 1000LL;
         struct itimerspec sw_its = {.it_interval = {0, 0},
                                     .it_value = {
                                         .tv_sec = sw_interval_ns / 1000000000LL,
@@ -1364,6 +1493,7 @@ void video_engine_dispatch_frame(video_engine_t *ve)
     struct timespec now_ts;
     int64_t now_ns = 0;
     int64_t target_pres_ns = 0;
+    bool used_hw_commit_timer = false;
 
     if (ve->reorder_count > 0) {
         uint32_t best_idx = 0;
@@ -1427,8 +1557,28 @@ void video_engine_dispatch_frame(video_engine_t *ve)
         }
         ve->last_export_surf = export_surf;
 
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        now_ns = (int64_t)now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
+
+        int64_t scaled_pts_ns = (int64_t)((double)(pres.pts_us * 1000LL) / speed);
+        bool reset_epoch = (ve->playback_epoch_ns == 0 || pres.loop_id != ve->presented_loop_id ||
+                            pres.pts_us < ve->last_pts_us);
+        if (reset_epoch) {
+            ve->playback_epoch_ns = now_ns - scaled_pts_ns;
+            ve->presented_loop_id = pres.loop_id;
+        }
+        int64_t this_frame_pres_ns = ve->playback_epoch_ns + scaled_pts_ns;
+        target_pres_ns = this_frame_pres_ns + frame_interval_ns;
+        if (target_pres_ns <= now_ns - 2 * frame_interval_ns) {
+            ve->playback_epoch_ns = now_ns - scaled_pts_ns;
+            this_frame_pres_ns = now_ns;
+            target_pres_ns = now_ns + frame_interval_ns;
+            reset_epoch = true;
+        }
+
         struct wl_buffer *wl_buf = ensure_shared_video_buffer(ve, export_surf, buf_idx);
         if (wl_buf && ve->daemon_state) {
+            ve->last_presented_buf_idx = (int32_t)buf_idx;
             int attached_count = 0;
             for (output_node_t *out = ve->daemon_state->outputs; out != NULL; out = out->next) {
                 if (!is_output_active_for_video(ve, out) || !out->surface)
@@ -1439,8 +1589,40 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                     continue;
                 }
                 configure_output_video_viewport(out, ve->decoder.width, ve->decoder.height);
-                if (out == pll_ref_out && out->pres_sync.wp_pres) {
-                    presentation_sync_request(&out->pres_sync);
+                int64_t out_period_ns =
+                    prepare_output_fifo_and_feedback(out, pll_ref_out, frame_interval_ns);
+                if (out->commit_timer && ve->daemon_state->presentation &&
+                    ve->daemon_state->has_presentation_clock_id) {
+                    used_hw_commit_timer = true;
+                    if (!reset_epoch) {
+                        /* Subtract a quarter-refresh margin because commit-timing-v1 specifies
+                         * a not-before deadline rather than a nearest-vblank target. */
+                        int64_t slop_ns = (out_period_ns > 0) ? (out_period_ns / 4) : 1500000LL;
+                        if (slop_ns < 500000LL)
+                            slop_ns = 500000LL;
+                        if (slop_ns > 4000000LL)
+                            slop_ns = 4000000LL;
+                        if (slop_ns > frame_interval_ns / 4)
+                            slop_ns = frame_interval_ns / 4;
+
+                        int64_t not_before_mono_ns = this_frame_pres_ns - slop_ns;
+                        if (not_before_mono_ns > now_ns) {
+                            int64_t hw_target_ns = not_before_mono_ns;
+                            if (ve->daemon_state->presentation_clock_id != CLOCK_MONOTONIC) {
+                                struct timespec pres_ts;
+                                if (clock_gettime(ve->daemon_state->presentation_clock_id,
+                                                  &pres_ts) == 0) {
+                                    int64_t pres_now_ns =
+                                        (int64_t)pres_ts.tv_sec * 1000000000LL + pres_ts.tv_nsec;
+                                    hw_target_ns = pres_now_ns + (not_before_mono_ns - now_ns);
+                                }
+                            }
+                            if (hw_target_ns > 0) {
+                                waywal_commit_timer_set_timestamp_ns(out->commit_timer,
+                                                                     hw_target_ns);
+                            }
+                        }
+                    }
                 }
                 wl_surface_attach(out->surface, wl_buf, 0, 0);
                 wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
@@ -1484,21 +1666,6 @@ void video_engine_dispatch_frame(video_engine_t *ve)
             }
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &now_ts);
-        now_ns = (int64_t)now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
-
-        int64_t scaled_pts_ns = (int64_t)((double)(pres.pts_us * 1000LL) / speed);
-        if (ve->playback_epoch_ns == 0 || pres.loop_id != ve->presented_loop_id ||
-            pres.pts_us < ve->last_pts_us) {
-            ve->playback_epoch_ns = now_ns - scaled_pts_ns;
-            ve->presented_loop_id = pres.loop_id;
-        }
-        target_pres_ns = ve->playback_epoch_ns + scaled_pts_ns + frame_interval_ns;
-        if (target_pres_ns <= now_ns - 2 * frame_interval_ns) {
-            ve->playback_epoch_ns = now_ns - scaled_pts_ns;
-            target_pres_ns = now_ns + frame_interval_ns;
-        }
-
         ve->last_pts_us = pres.pts_us;
         ve->next_present_gop = pres.gop_id;
         ve->next_present_poc = pres.poc + 1;
@@ -1508,10 +1675,18 @@ void video_engine_dispatch_frame(video_engine_t *ve)
         target_pres_ns = now_ns + frame_interval_ns;
     }
 
-    if (pll_ref_out && pll_ref_out->pres_sync.pll.phase_est_ns > 0 &&
-        pll_ref_out->pres_sync.pll.period_est_ns > 0 &&
-        (!pll_ref_out->pres_sync.pll.has_clock_id ||
-         pll_ref_out->pres_sync.pll.clock_id == CLOCK_MONOTONIC)) {
+    int64_t wake_target_ns = target_pres_ns;
+    if (used_hw_commit_timer) {
+        /* Wake ahead of the next frame's presentation deadline so the decoded buffer and
+         * commit_timer timestamp are queued inside the compositor before latch. */
+        int64_t commit_lead_ns = 4000000LL;
+        if (commit_lead_ns > frame_interval_ns / 2)
+            commit_lead_ns = frame_interval_ns / 2;
+        wake_target_ns = target_pres_ns - commit_lead_ns;
+    } else if (pll_ref_out && pll_ref_out->pres_sync.pll.phase_est_ns > 0 &&
+               pll_ref_out->pres_sync.pll.period_est_ns > 0 &&
+               (!pll_ref_out->pres_sync.pll.has_clock_id ||
+                pll_ref_out->pres_sync.pll.clock_id == CLOCK_MONOTONIC)) {
         int64_t next_vblank_ns = presentation_pll_predict_next_vblank(&pll_ref_out->pres_sync.pll);
         int64_t period_ns = pll_ref_out->pres_sync.pll.period_est_ns;
 
@@ -1541,12 +1716,13 @@ void video_engine_dispatch_frame(video_engine_t *ve)
                         ve->playback_epoch_ns += adj;
                     }
                     target_pres_ns += adj;
+                    wake_target_ns = target_pres_ns;
                 }
             }
         }
     }
 
-    int64_t next_interval_ns = target_pres_ns - now_ns;
+    int64_t next_interval_ns = wake_target_ns - now_ns;
     if (next_interval_ns < 1000000LL)
         next_interval_ns = 1000000LL;
 
@@ -1569,6 +1745,13 @@ void video_engine_pause(video_engine_t *ve)
     while (read(ve->timer_fd, &dummy, sizeof(dummy)) > 0)
         ;
     ve->state = WAYWAL_VIDEO_STATE_PAUSED;
+    if (ve->daemon_state) {
+        for (output_node_t *out = ve->daemon_state->outputs; out != NULL; out = out->next) {
+            if (is_output_active_for_video(ve, out)) {
+                out->fifo_barrier_pending = false;
+            }
+        }
+    }
     WAYWAL_LOG_INFO("Hardware video playback paused (0%% VPU usage)");
 }
 
@@ -1610,6 +1793,7 @@ void video_engine_stop(video_engine_t *ve)
     ve->eof_draining = false;
     ve->has_decoded_any = false;
     ve->playback_epoch_ns = 0;
+    ve->last_presented_buf_idx = -1;
     ve->last_export_surf = VA_INVALID_SURFACE;
     ve->filepath[0] = '\0';
 
@@ -1622,6 +1806,7 @@ void video_engine_stop(video_engine_t *ve)
     if (ve->daemon_state) {
         for (output_node_t *out = ve->daemon_state->outputs; out != NULL; out = out->next) {
             out->vp_configured = false;
+            out->fifo_barrier_pending = false;
             if (out->video_eng == ve) {
                 out->video_eng = NULL;
             }

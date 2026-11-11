@@ -27,6 +27,8 @@ struct waywal_shader_engine;
 struct waywal_anim_decoder;
 struct video_engine;
 struct slideshow_engine;
+struct wp_fifo_v1;
+struct wp_commit_timer_v1;
 typedef struct output_node output_node_t;
 typedef struct output_node output_state_t;
 
@@ -78,6 +80,9 @@ struct output_node {
     struct wp_viewport *viewport;
     struct wp_fractional_scale_v1 *fract_scale;
     struct zxdg_output_v1 *xdg_output;
+    struct wp_fifo_v1 *fifo;
+    struct wp_commit_timer_v1 *commit_timer;
+    bool fifo_barrier_pending;
 
     struct wl_surface *backdrop_surface;
     struct zwlr_layer_surface_v1 *backdrop_layer_surface;
@@ -191,6 +196,8 @@ struct output_node {
     bool has_crop_gravity;
 
     bool configured;
+    bool initial_configure_done;
+    bool mapped_while_fullscreen;
     bool wlr_has_fullscreen;
     struct daemon_state *state;
     struct output_node *next;

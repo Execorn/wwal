@@ -327,6 +327,12 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
 /* Releases exported PRIME file descriptors */
 void vaapi_prime_frame_close(vaapi_prime_frame_t *frame);
 
+/* Parses an H.264 SPS NAL unit (escaped Annex-B/AVCC payload starting at NAL header byte) */
+bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps);
+
+/* Computes required POC reorder buffer depth for an H.264 stream clamped to [1, cap] */
+uint32_t vaapi_h264_compute_reorder_depth(const parsed_sps_t *sps, uint32_t cap);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1207,17 +1207,13 @@ static void test_h264_main_profile_bframe_reordering(void)
     assert(vui0_dec.cached_sps.bitstream_restriction_flag);
     assert(vui0_dec.cached_sps.max_num_reorder_frames == 0);
 
-    /* Main Profile (profile_idc=77, constraint_set1_flag=1, constraint_set0_flag=0) must select
-     * target_depth=4 (NOT 1) so B-frames are reordered into monotonic PTS/POC order. */
-    uint32_t target_depth =
-        (dec.cached_sps.valid &&
-         (dec.cached_sps.profile_idc == 66 || dec.cached_sps.constraint_set0_flag != 0 ||
-          dec.cached_sps.num_ref_frames <= 1 || dec.cached_sps.pic_order_cnt_type == 2))
-            ? 1U
-            : (dec.cached_sps.valid && dec.cached_sps.bitstream_restriction_flag
-                   ? (uint32_t)dec.cached_sps.max_num_reorder_frames + 1U
-                   : 4U);
-    assert(target_depth == 4U);
+    /* Main Profile without bitstream_restriction_flag uses num_ref_frames + 1 (4 + 1 = 5)
+     * so hierarchical B-frames reorder monotonically into PTS/POC presentation order. */
+    uint32_t target_depth = vaapi_h264_compute_reorder_depth(&dec.cached_sps, 17U);
+    assert(target_depth == 5U);
+    assert(vaapi_h264_compute_reorder_depth(&base_dec.cached_sps, 17U) == 1U);
+    assert(vaapi_h264_compute_reorder_depth(&vui4_dec.cached_sps, 17U) == 5U);
+    assert(vaapi_h264_compute_reorder_depth(&vui0_dec.cached_sps, 17U) == 1U);
 
     /* Simulate 2 loops of 2 GOPs of hierarchical B-frame decode order (including POC step 2 in
      * GOP 0 and POC step 1 in GOP 1) and verify:
@@ -1372,6 +1368,268 @@ static void test_h264_main_profile_bframe_reordering(void)
         "  -> H.264 Main Profile constraint_set1_flag SPS & B-frame monotonic reorder: PASSED\n");
 }
 
+typedef struct {
+    uint8_t *buf;
+    size_t cap;
+    size_t bit_pos;
+} test_bw_t;
+
+static void bw_put_bit(test_bw_t *bw, uint32_t b)
+{
+    assert(bw->bit_pos / 8 < bw->cap);
+    size_t byte_idx = bw->bit_pos / 8;
+    uint32_t shift = 7U - (uint32_t)(bw->bit_pos % 8);
+    if (shift == 7U) {
+        bw->buf[byte_idx] = 0;
+    }
+    bw->buf[byte_idx] |= (uint8_t)((b & 1U) << shift);
+    bw->bit_pos++;
+}
+
+static void bw_put_bits(test_bw_t *bw, uint32_t val, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; ++i) {
+        bw_put_bit(bw, (val >> (n - 1U - i)) & 1U);
+    }
+}
+
+static void bw_put_ue(test_bw_t *bw, uint32_t val)
+{
+    uint64_t code = (uint64_t)val + 1ULL;
+    uint32_t zeros = 0;
+    for (uint64_t t = code; t > 1ULL; t >>= 1) {
+        zeros++;
+    }
+    for (uint32_t z = 0; z < zeros; ++z) {
+        bw_put_bit(bw, 0);
+    }
+    for (uint32_t b = 0; b <= zeros; ++b) {
+        bw_put_bit(bw, (uint32_t)((code >> (zeros - b)) & 1ULL));
+    }
+}
+
+static void bw_put_se(test_bw_t *bw, int32_t val)
+{
+    uint32_t mapped = (val <= 0) ? (uint32_t)(-2 * val) : (uint32_t)(2 * val - 1);
+    bw_put_ue(bw, mapped);
+}
+
+static size_t escape_rbsp_to_ebsp(const uint8_t *rbsp, size_t rbsp_len, uint8_t *dst, size_t cap)
+{
+    assert(rbsp_len >= 1 && cap >= rbsp_len);
+    dst[0] = rbsp[0];
+    size_t di = 1;
+    uint32_t zero_run = 0;
+    for (size_t si = 1; si < rbsp_len; ++si) {
+        uint8_t b = rbsp[si];
+        if (zero_run == 2 && b <= 3) {
+            assert(di < cap);
+            dst[di++] = 0x03;
+            zero_run = 0;
+        }
+        assert(di < cap);
+        dst[di++] = b;
+        zero_run = (b == 0) ? (zero_run + 1U) : 0U;
+    }
+    return di;
+}
+
+static size_t build_high_profile_sps_nal(uint8_t *out_nal, size_t out_cap, uint8_t num_ref_frames,
+                                         bool has_bitstream_restriction, uint8_t max_reorder_frames,
+                                         bool extra_poc1_table, uint8_t exp_4x4[6][16],
+                                         uint8_t exp_8x8[2][64])
+{
+    uint8_t rbsp[4096];
+    memset(rbsp, 0, sizeof(rbsp));
+    test_bw_t bw = {.buf = rbsp, .cap = sizeof(rbsp), .bit_pos = 0};
+
+    bw_put_bits(&bw, 0x67, 8); /* NAL type 7 (SPS) */
+    bw_put_bits(&bw, 100, 8);  /* profile_idc = 100 (High) */
+    bw_put_bits(&bw, 0x00, 8); /* constraint flags */
+    bw_put_bits(&bw, 42, 8);   /* level_idc = 4.2 */
+    bw_put_ue(&bw, 0);         /* seq_parameter_set_id */
+
+    bw_put_ue(&bw, 1);  /* chroma_format_idc = 4:2:0 */
+    bw_put_ue(&bw, 0);  /* bit_depth_luma_minus8 */
+    bw_put_ue(&bw, 0);  /* bit_depth_chroma_minus8 */
+    bw_put_bit(&bw, 0); /* qpprime_y_zero_transform_bypass_flag */
+    bw_put_bit(&bw, 1); /* seq_scaling_matrix_present_flag */
+
+    for (uint32_t i = 0; i < 8; ++i) {
+        bw_put_bit(&bw, 1); /* seq_scaling_list_present_flag[i] */
+        uint32_t sz = (i < 6) ? 16U : 64U;
+        int32_t last_scale = 8;
+        for (uint32_t j = 0; j < sz; ++j) {
+            uint8_t target = (i < 6) ? (uint8_t)(10U + ((i * 5U + j) % 45U))
+                                     : (uint8_t)(12U + ((i * 7U + j) % 60U));
+            int32_t delta = (int32_t)target - last_scale;
+            bw_put_se(&bw, delta);
+            last_scale = (int32_t)target;
+            if (i < 6 && exp_4x4) {
+                exp_4x4[i][j] = target;
+            } else if (i >= 6 && exp_8x8) {
+                exp_8x8[i - 6][j] = target;
+            }
+        }
+    }
+
+    bw_put_ue(&bw, 4); /* log2_max_frame_num_minus4 */
+    if (extra_poc1_table) {
+        bw_put_ue(&bw, 1); /* pic_order_cnt_type = 1 */
+        bw_put_bit(&bw, 0);
+        bw_put_se(&bw, 0);
+        bw_put_se(&bw, 0);
+        bw_put_ue(&bw, 220);
+        for (uint32_t r = 0; r < 220; ++r) {
+            bw_put_se(&bw, 0x1FFFFFF0 - (int32_t)r);
+        }
+    } else {
+        bw_put_ue(&bw, 0); /* pic_order_cnt_type = 0 */
+        bw_put_ue(&bw, 4); /* log2_max_pic_order_cnt_lsb_minus4 */
+    }
+
+    bw_put_ue(&bw, num_ref_frames);
+    bw_put_bit(&bw, 0);  /* gaps_in_frame_num_value_allowed_flag */
+    bw_put_ue(&bw, 119); /* pic_width_in_mbs_minus1 (1920) */
+    bw_put_ue(&bw, 67);  /* pic_height_in_map_units_minus1 (1088) */
+    bw_put_bit(&bw, 1);  /* frame_mbs_only_flag */
+    bw_put_bit(&bw, 1);  /* direct_8x8_inference_flag */
+
+    bw_put_bit(&bw, 1); /* frame_cropping_flag */
+    bw_put_ue(&bw, 0);
+    bw_put_ue(&bw, 0);
+    bw_put_ue(&bw, 0);
+    bw_put_ue(&bw, 4);
+
+    bw_put_bit(&bw, 1); /* vui_parameters_present_flag */
+    bw_put_bit(&bw, 1); /* aspect_ratio_info_present_flag */
+    bw_put_bits(&bw, 1, 8);
+    bw_put_bit(&bw, 0); /* overscan_info_present_flag */
+    bw_put_bit(&bw, 1); /* video_signal_type_present_flag */
+    bw_put_bits(&bw, 5, 3);
+    bw_put_bit(&bw, 1); /* video_full_range_flag */
+    bw_put_bit(&bw, 1); /* colour_description_present_flag */
+    bw_put_bits(&bw, 1, 8);
+    bw_put_bits(&bw, 1, 8);
+    bw_put_bits(&bw, 1, 8);
+    bw_put_bit(&bw, 0); /* chroma_loc_info_present_flag */
+    bw_put_bit(&bw, 1); /* timing_info_present_flag */
+    bw_put_bits(&bw, 1001, 32);
+    bw_put_bits(&bw, 60000, 32);
+    bw_put_bit(&bw, 1); /* fixed_frame_rate_flag */
+
+    /* Emit both NAL HRD and VCL HRD with 32 CPB entries each so RBSP exceeds 1100 bytes */
+    for (int hrd = 0; hrd < 2; ++hrd) {
+        bw_put_bit(&bw, 1);
+        bw_put_ue(&bw, 31); /* cpb_cnt_minus1 = 31 */
+        bw_put_bits(&bw, 4, 4);
+        bw_put_bits(&bw, 4, 4);
+        for (uint32_t k = 0; k < 32; ++k) {
+            bw_put_ue(&bw, 0x3FFFFFF0U + k);
+            bw_put_ue(&bw, 0x3FFFFF00U + k);
+            bw_put_bit(&bw, k & 1U);
+        }
+        bw_put_bits(&bw, 23, 5);
+        bw_put_bits(&bw, 23, 5);
+        bw_put_bits(&bw, 23, 5);
+        bw_put_bits(&bw, 24, 5);
+    }
+    bw_put_bit(&bw, 0); /* low_delay_hrd_flag */
+    bw_put_bit(&bw, 0); /* pic_struct_present_flag */
+
+    if (has_bitstream_restriction) {
+        bw_put_bit(&bw, 1); /* bitstream_restriction_flag */
+        bw_put_bit(&bw, 1); /* motion_vectors_over_pic_boundaries_flag */
+        bw_put_ue(&bw, 0);
+        bw_put_ue(&bw, 0);
+        bw_put_ue(&bw, 11);
+        bw_put_ue(&bw, 11);
+        bw_put_ue(&bw, max_reorder_frames);
+        bw_put_ue(&bw, num_ref_frames > max_reorder_frames ? num_ref_frames : max_reorder_frames);
+    } else {
+        bw_put_bit(&bw, 0); /* bitstream_restriction_flag = 0 */
+    }
+
+    /* RBSP stop bit */
+    bw_put_bit(&bw, 1);
+    while ((bw.bit_pos % 8) != 0) {
+        bw_put_bit(&bw, 0);
+    }
+
+    size_t rbsp_len = bw.bit_pos / 8;
+    return escape_rbsp_to_ebsp(rbsp, rbsp_len, out_nal, out_cap);
+}
+
+static void test_h264_high_profile_large_sps_and_reorder_fallback(void)
+{
+    printf("[TEST] Running test_h264_high_profile_large_sps_and_reorder_fallback...\n");
+
+    uint8_t nal[6144];
+    uint8_t exp_4x4[6][16];
+    uint8_t exp_8x8[2][64];
+
+    /* 1. >600-byte High Profile SPS with scaling matrices + dual HRD + bitstream_restriction=1 */
+    size_t nal_len =
+        build_high_profile_sps_nal(nal, sizeof(nal), 8, true, 6, false, exp_4x4, exp_8x8);
+    assert(nal_len > 600);
+
+    parsed_sps_t sps;
+    memset(&sps, 0, sizeof(sps));
+    assert(parse_h264_sps(nal, nal_len, &sps));
+    assert(sps.valid);
+    assert(sps.profile_idc == 100);
+    assert(sps.seq_scaling_matrix_present_flag);
+    assert(memcmp(sps.scaling_list_4x4, exp_4x4, sizeof(exp_4x4)) == 0);
+    assert(memcmp(sps.scaling_list_8x8, exp_8x8, sizeof(exp_8x8)) == 0);
+    assert(sps.num_ref_frames == 8);
+    assert(sps.video_full_range_flag);
+    assert(sps.colour_primaries == 1);
+    assert(sps.bitstream_restriction_flag);
+    assert(sps.max_num_reorder_frames == 6);
+    assert(vaapi_h264_compute_reorder_depth(&sps, 17U) == 7U);
+
+    /* Also verify 1-ref stream with explicit max_num_reorder_frames=1 is respected */
+    size_t nal_1ref_len =
+        build_high_profile_sps_nal(nal, sizeof(nal), 1, true, 1, false, NULL, NULL);
+    assert(nal_1ref_len > 600);
+    memset(&sps, 0, sizeof(sps));
+    assert(parse_h264_sps(nal, nal_1ref_len, &sps));
+    assert(sps.valid && sps.bitstream_restriction_flag && sps.max_num_reorder_frames == 1);
+    assert(vaapi_h264_compute_reorder_depth(&sps, 17U) == 2U);
+
+    /* 2. >600-byte High Profile SPS with bitstream_restriction_flag=0:
+     * must clamp(num_ref_frames + 1, 1, WAYWAL_VIDEO_REORDER_CAP) */
+    size_t nal_no_vui_restr =
+        build_high_profile_sps_nal(nal, sizeof(nal), 8, false, 0, false, NULL, NULL);
+    assert(nal_no_vui_restr > 600);
+    memset(&sps, 0, sizeof(sps));
+    assert(parse_h264_sps(nal, nal_no_vui_restr, &sps));
+    assert(sps.valid);
+    assert(!sps.bitstream_restriction_flag);
+    assert(sps.num_ref_frames == 8);
+    assert(vaapi_h264_compute_reorder_depth(&sps, 17U) == 9U);
+
+    /* Clamp upper bound at cap (num_ref_frames = 16 -> 17) and intra-only (num_ref_frames = 0 -> 1)
+     */
+    sps.num_ref_frames = 16;
+    assert(vaapi_h264_compute_reorder_depth(&sps, 17U) == 17U);
+    sps.num_ref_frames = 0;
+    assert(vaapi_h264_compute_reorder_depth(&sps, 17U) == 1U);
+
+    /* 3. >2048-byte High Profile SPS exercising dynamic heap RBSP fallback without leaks */
+    size_t huge_nal_len =
+        build_high_profile_sps_nal(nal, sizeof(nal), 10, true, 5, true, NULL, NULL);
+    assert(huge_nal_len > 2048);
+    memset(&sps, 0, sizeof(sps));
+    assert(parse_h264_sps(nal, huge_nal_len, &sps));
+    assert(sps.valid);
+    assert(sps.bitstream_restriction_flag);
+    assert(sps.max_num_reorder_frames == 5);
+    assert(vaapi_h264_compute_reorder_depth(&sps, 17U) == 6U);
+
+    printf("  -> High Profile >600B & >2KiB SPS scaling/HRD + reorder fallback: PASSED\n");
+}
+
 int main(void)
 {
     printf("=========================================\n");
@@ -1383,6 +1641,7 @@ int main(void)
     test_webm_duration_and_lacing();
     test_mp4_ctts_v0_and_v1();
     test_h264_main_profile_bframe_reordering();
+    test_h264_high_profile_large_sps_and_reorder_fallback();
     test_real_mp4_demuxing();
     test_vaapi_decoder_and_prime_export();
     test_high_precision_monotonic_timer();

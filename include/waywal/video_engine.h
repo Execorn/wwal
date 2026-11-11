@@ -55,7 +55,10 @@ typedef struct video_engine {
     int video_buffer_in_use[WAYWAL_VA_SURFACE_POOL_SIZE];
     bool combined_busy_mask[WAYWAL_VA_SURFACE_POOL_SIZE];
     uint32_t last_vpp_idx;
+    int32_t last_presented_buf_idx;
     VASurfaceID last_export_surf;
+
+    bool (*redraw_output)(struct video_engine *ve, struct output_node *out);
 
     struct output_node *target_output; /* NULL = all or filtered outputs */
     bool has_target_filter;

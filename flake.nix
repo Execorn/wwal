@@ -15,12 +15,32 @@
       packages = forAllSystems (system:
         let
           pkgs = pkgsFor system;
+          daemonRuntimeLibs = with pkgs; [
+            libwebp
+            libavif
+            libjxl
+            librsvg
+            pipewire
+            dbus
+            lz4
+            ffmpeg
+            zstd
+            libsodium
+            curl
+          ];
+          pkgRuntimeLibs = with pkgs; [
+            zstd
+            libsodium
+            curl
+          ];
         in
         rec {
           wwal = pkgs.stdenv.mkDerivation {
             pname = "wwal";
             version = "3.0.0";
             src = self;
+
+            dontWrapQtApps = true;
 
             nativeBuildInputs = with pkgs; [
               meson
@@ -30,6 +50,7 @@
               wayland-scanner
               scdoc
               makeWrapper
+              qt6.wrapQtAppsHook
             ];
 
             buildInputs = with pkgs; [
@@ -42,17 +63,13 @@
               libseccomp
               libpng
               libjpeg_turbo
-              libwebp
-              libavif
-              libjxl
-              librsvg
-              pipewire
-              dbus
-              lz4
-              ffmpeg
-            ];
+              sqlite
+              qt6.qtbase
+              qt6.qtwayland
+            ] ++ daemonRuntimeLibs;
 
             mesonFlags = [
+              "-Dstudio=enabled"
               "-Denable_vaapi=true"
               "-Denable_io_uring=true"
               "-Denable_simd=true"
@@ -63,7 +80,11 @@
 
             postInstall = ''
               wrapProgram $out/bin/wwald \
-                --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath buildInputs}
+                --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath daemonRuntimeLibs}
+              wrapProgram $out/bin/wwal \
+                --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath pkgRuntimeLibs}
+              wrapQtApp $out/bin/wwal-studio \
+                --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath pkgRuntimeLibs}
             '';
 
             meta = with pkgs.lib; {

@@ -320,6 +320,20 @@ static void ensure_idle_notification(daemon_state_t *state)
     }
 }
 
+static bool output_is_currently_fullscreen(const daemon_state_t *state, const output_node_t *out)
+{
+    if (!out)
+        return false;
+    if (out->wlr_has_fullscreen)
+        return true;
+    if (state && state->power_gov && out->name[0] != '\0') {
+        uint32_t mask = waywal_power_governor_get_output_mask(state->power_gov, out->name);
+        if ((mask & WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN) != 0)
+            return true;
+    }
+    return false;
+}
+
 static void recompute_wlr_toplevel_power_state(daemon_state_t *state)
 {
     if (!state || !state->power_gov)
@@ -375,8 +389,13 @@ static void recompute_wlr_toplevel_power_state(daemon_state_t *state)
         uint32_t new_mask = waywal_power_governor_get_output_mask(state->power_gov, out->name);
         if (prev_mask != new_mask)
             changed = true;
-        if (was_fs && !any_fs && out->configured && out->pres_sync.wp_pres &&
+        if ((any_fs || (new_mask & WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN) != 0) &&
             out->pres_sync.pll.frame_seq == 0) {
+            out->mapped_while_fullscreen = true;
+        }
+        if (was_fs && !any_fs && out->configured && out->mapped_while_fullscreen &&
+            out->pres_sync.wp_pres && out->pres_sync.pll.frame_seq == 0 &&
+            !out->pres_sync.pending_feedback) {
             output_node_recreate_layer_surface(state, out);
         }
     }
@@ -663,6 +682,7 @@ static void presentation_handle_clock_id(void *data, struct wp_presentation *pre
     clockid_t clock = (clockid_t)clk_id;
     if (state) {
         state->presentation_clock_id = clock;
+        state->has_presentation_clock_id = true;
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
             out->pres_sync.pll.clock_id = clock;
             out->pres_sync.pll.has_clock_id = true;
@@ -760,6 +780,16 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         }
         state->output_mgr.wp_pres = state->presentation;
         WAYWAL_LOG_INFO("Bound wp_presentation interface");
+    } else if (strcmp(interface, waywal_wp_commit_timing_manager_v1_interface.name) == 0) {
+        uint32_t ver = (version < 1) ? version : 1;
+        state->commit_timing_mgr = (struct wp_commit_timing_manager_v1 *)wl_registry_bind(
+            registry, name, &waywal_wp_commit_timing_manager_v1_interface, ver);
+        WAYWAL_LOG_INFO("Bound wp_commit_timing_manager_v1");
+    } else if (strcmp(interface, waywal_wp_fifo_manager_v1_interface.name) == 0) {
+        uint32_t ver = (version < 1) ? version : 1;
+        state->fifo_mgr = (struct wp_fifo_manager_v1 *)wl_registry_bind(
+            registry, name, &waywal_wp_fifo_manager_v1_interface, ver);
+        WAYWAL_LOG_INFO("Bound wp_fifo_manager_v1");
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
         uint32_t ver = version >= 5 ? 5 : version;
         state->seat = (struct wl_seat *)wl_registry_bind(registry, name, &wl_seat_interface, ver);
@@ -778,6 +808,9 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
              * has negotiated the compositor's DRM device and format modifiers. */
             if (state->layer_shell && state->dmabuf_ctx.default_feedback) {
                 output_node_create_surface(state, node);
+                if (output_is_currently_fullscreen(state, node)) {
+                    node->mapped_while_fullscreen = true;
+                }
             }
         }
     }
@@ -830,6 +863,7 @@ bool daemon_wayland_init(daemon_state_t *state)
 
     state->cursor_ipc_fd = -1;
     state->presentation_clock_id = CLOCK_MONOTONIC;
+    state->has_presentation_clock_id = false;
     state->display = wl_display_connect(NULL);
     if (!state->display) {
         WAYWAL_LOG_ERR(
@@ -974,6 +1008,9 @@ bool daemon_wayland_init(daemon_state_t *state)
     /* Create layer surfaces for all discovered outputs */
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         output_node_create_surface(state, out);
+        if (output_is_currently_fullscreen(state, out)) {
+            out->mapped_while_fullscreen = true;
+        }
     }
 
     /* Roundtrip to receive initial configure events from compositor */
@@ -1091,6 +1128,14 @@ void daemon_wayland_destroy(daemon_state_t *state)
     if (state->presentation) {
         wp_presentation_destroy(state->presentation);
         state->presentation = NULL;
+    }
+    if (state->commit_timing_mgr) {
+        waywal_commit_timing_manager_destroy(state->commit_timing_mgr);
+        state->commit_timing_mgr = NULL;
+    }
+    if (state->fifo_mgr) {
+        waywal_fifo_manager_destroy(state->fifo_mgr);
+        state->fifo_mgr = NULL;
     }
     if (state->fract_manager) {
         wp_fractional_scale_manager_v1_destroy(state->fract_manager);

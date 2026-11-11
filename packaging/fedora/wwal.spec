@@ -8,6 +8,7 @@ URL:            https://github.com/Execorn/wwal
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildRequires:  gcc >= 13
+BuildRequires:  gcc-c++ >= 13
 BuildRequires:  meson >= 0.61.0
 BuildRequires:  ninja-build
 BuildRequires:  pkgconfig(wayland-client) >= 1.20
@@ -24,9 +25,18 @@ BuildRequires:  pkgconfig(libseccomp)
 BuildRequires:  pkgconfig(libpng)
 BuildRequires:  pkgconfig(libturbojpeg)
 BuildRequires:  pkgconfig(systemd)
+BuildRequires:  pkgconfig(Qt6Core)
+BuildRequires:  pkgconfig(Qt6Gui)
+BuildRequires:  pkgconfig(Qt6Widgets)
+BuildRequires:  pkgconfig(Qt6OpenGLWidgets)
+BuildRequires:  pkgconfig(sqlite3)
+BuildRequires:  pkgconfig(libzstd)
+BuildRequires:  pkgconfig(libsodium)
+BuildRequires:  pkgconfig(libcurl)
 BuildRequires:  scdoc
 BuildRequires:  python3
 
+Recommends:     %{name}-studio = %{version}-%{release}
 Recommends:     libwebp
 Recommends:     libavif
 Recommends:     libjxl
@@ -34,6 +44,9 @@ Recommends:     librsvg2
 Recommends:     pipewire-libs
 Recommends:     dbus-libs
 Recommends:     lz4-libs
+Recommends:     libzstd
+Recommends:     libsodium
+Recommends:     libcurl
 Recommends:     ffmpeg-free
 Recommends:     (rofi or fuzzel)
 
@@ -48,13 +61,26 @@ and sub-millisecond OKLab/CAM16/HCT Material Design 3 color theme engine.
 Includes drop-in swww and awww CLI compatibility symlinks and built-in
 procedural shader presets.
 
+%package studio
+Summary:        Qt6 desktop GUI for WayWal (wwal-studio)
+Requires:       %{name}%{?_isa} = %{version}-%{release}
+Recommends:     qt6-qtwayland
+Recommends:     libzstd
+Recommends:     libsodium
+Recommends:     libcurl
+
+%description studio
+WayWal Studio (wwal-studio) provides the graphical wallpaper browser, Steam
+Workshop and Open Hub catalog manager, visual GLSL shader graph editor, and
+Material You theme studio for the WayWal daemon.
+
 %prep
 %autosetup -n %{name}-%{version}
 
 %build
 %meson \
     -Dtests=false \
-    -Dstudio=disabled \
+    -Dstudio=enabled \
     -Denable_vaapi=true \
     -Denable_io_uring=true \
     -Denable_simd=true \
@@ -85,6 +111,10 @@ procedural shader presets.
 %{_datadir}/fish/vendor_completions.d/wwal.fish
 %{_datadir}/wwal/
 %{_datadir}/doc/wwal/config.toml.example
+
+%files studio
+%license LICENSE
+%{_bindir}/wwal-studio
 
 %changelog
 * Mon Nov 09 2026 Biryukov Nikita <n.biryukov.04@gmail.com> - 3.0.0-1

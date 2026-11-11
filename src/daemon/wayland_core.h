@@ -42,6 +42,108 @@ struct waywal_shader_engine;
 struct waywal_audio_fft;
 struct waywal_anim_decoder;
 struct waywal_mpris;
+struct wp_commit_timing_manager_v1;
+struct wp_commit_timer_v1;
+struct wp_fifo_manager_v1;
+struct wp_fifo_v1;
+
+extern const struct wl_interface waywal_wp_commit_timing_manager_v1_interface;
+extern const struct wl_interface waywal_wp_commit_timer_v1_interface;
+extern const struct wl_interface waywal_wp_fifo_manager_v1_interface;
+extern const struct wl_interface waywal_wp_fifo_v1_interface;
+
+static inline void waywal_commit_timing_manager_destroy(struct wp_commit_timing_manager_v1 *mgr)
+{
+    if (!mgr)
+        return;
+    wl_proxy_marshal_flags((struct wl_proxy *)mgr, 0, NULL,
+                           wl_proxy_get_version((struct wl_proxy *)mgr), WL_MARSHAL_FLAG_DESTROY);
+}
+
+static inline struct wp_commit_timer_v1 *
+waywal_commit_timing_manager_get_timer(struct wp_commit_timing_manager_v1 *mgr,
+                                       struct wl_surface *surface)
+{
+    if (!mgr || !surface)
+        return NULL;
+    struct wl_proxy *id =
+        wl_proxy_marshal_flags((struct wl_proxy *)mgr, 1, &waywal_wp_commit_timer_v1_interface,
+                               wl_proxy_get_version((struct wl_proxy *)mgr), 0, NULL, surface);
+    return (struct wp_commit_timer_v1 *)id;
+}
+
+static inline void waywal_commit_timer_set_timestamp(struct wp_commit_timer_v1 *timer,
+                                                     uint32_t tv_sec_hi, uint32_t tv_sec_lo,
+                                                     uint32_t tv_nsec)
+{
+    if (!timer || tv_nsec >= 1000000000U)
+        return;
+    wl_proxy_marshal_flags((struct wl_proxy *)timer, 0, NULL,
+                           wl_proxy_get_version((struct wl_proxy *)timer), 0, tv_sec_hi, tv_sec_lo,
+                           tv_nsec);
+}
+
+static inline void waywal_commit_timer_set_timestamp_ns(struct wp_commit_timer_v1 *timer,
+                                                        int64_t target_ns)
+{
+    if (!timer || target_ns <= 0)
+        return;
+    uint64_t sec = (uint64_t)target_ns / 1000000000ULL;
+    uint32_t nsec = (uint32_t)((uint64_t)target_ns % 1000000000ULL);
+    waywal_commit_timer_set_timestamp(timer, (uint32_t)(sec >> 32), (uint32_t)(sec & 0xFFFFFFFFU),
+                                      nsec);
+}
+
+static inline void waywal_commit_timer_destroy(struct wp_commit_timer_v1 *timer)
+{
+    if (!timer)
+        return;
+    wl_proxy_marshal_flags((struct wl_proxy *)timer, 1, NULL,
+                           wl_proxy_get_version((struct wl_proxy *)timer), WL_MARSHAL_FLAG_DESTROY);
+}
+
+static inline void waywal_fifo_manager_destroy(struct wp_fifo_manager_v1 *mgr)
+{
+    if (!mgr)
+        return;
+    wl_proxy_marshal_flags((struct wl_proxy *)mgr, 0, NULL,
+                           wl_proxy_get_version((struct wl_proxy *)mgr), WL_MARSHAL_FLAG_DESTROY);
+}
+
+static inline struct wp_fifo_v1 *waywal_fifo_manager_get_fifo(struct wp_fifo_manager_v1 *mgr,
+                                                              struct wl_surface *surface)
+{
+    if (!mgr || !surface)
+        return NULL;
+    struct wl_proxy *id =
+        wl_proxy_marshal_flags((struct wl_proxy *)mgr, 1, &waywal_wp_fifo_v1_interface,
+                               wl_proxy_get_version((struct wl_proxy *)mgr), 0, NULL, surface);
+    return (struct wp_fifo_v1 *)id;
+}
+
+static inline void waywal_fifo_set_barrier(struct wp_fifo_v1 *fifo)
+{
+    if (!fifo)
+        return;
+    wl_proxy_marshal_flags((struct wl_proxy *)fifo, 0, NULL,
+                           wl_proxy_get_version((struct wl_proxy *)fifo), 0);
+}
+
+static inline void waywal_fifo_wait_barrier(struct wp_fifo_v1 *fifo)
+{
+    if (!fifo)
+        return;
+    wl_proxy_marshal_flags((struct wl_proxy *)fifo, 1, NULL,
+                           wl_proxy_get_version((struct wl_proxy *)fifo), 0);
+}
+
+static inline void waywal_fifo_destroy(struct wp_fifo_v1 *fifo)
+{
+    if (!fifo)
+        return;
+    wl_proxy_marshal_flags((struct wl_proxy *)fifo, 2, NULL,
+                           wl_proxy_get_version((struct wl_proxy *)fifo), WL_MARSHAL_FLAG_DESTROY);
+}
 
 typedef struct daemon_state {
     arena_t frame_arena;
@@ -57,6 +159,9 @@ typedef struct daemon_state {
     struct wp_fractional_scale_manager_v1 *fract_manager;
     struct wp_presentation *presentation;
     clockid_t presentation_clock_id;
+    bool has_presentation_clock_id;
+    struct wp_commit_timing_manager_v1 *commit_timing_mgr;
+    struct wp_fifo_manager_v1 *fifo_mgr;
     struct wp_single_pixel_buffer_manager_v1 *single_pixel_mgr;
     struct wp_linux_drm_syncobj_manager_v1 *syncobj_mgr;
     struct ext_idle_notifier_v1 *idle_notifier;

@@ -76,12 +76,8 @@ static void skip_h264_hrd_parameters(bit_reader_t *br)
     read_bits(br, 5); /* time_offset_length */
 }
 
-bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps)
+static bool parse_h264_sps_rbsp(const uint8_t *rbsp, size_t rbsp_len, parsed_sps_t *sps)
 {
-    if (nal_len < 4)
-        return false;
-    uint8_t rbsp[512];
-    size_t rbsp_len = unescape_rbsp(nal, nal_len, rbsp, sizeof(rbsp));
     bit_reader_t br;
     bit_reader_init(&br, rbsp, rbsp_len);
 
@@ -243,11 +239,59 @@ bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps)
     return true;
 }
 
+bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps)
+{
+    if (!nal || !sps || nal_len < 4)
+        return false;
+
+    /* High Profile SPS NALs with 4x4/8x8 scaling matrices and dual VUI HRD tables
+     * exceed 512 bytes; use a 2 KiB stack buffer with bounded heap fallback. */
+    uint8_t rbsp_stack[2048];
+    uint8_t *rbsp = rbsp_stack;
+    uint8_t *rbsp_heap = NULL;
+    size_t rbsp_cap = sizeof(rbsp_stack);
+    if (nal_len > sizeof(rbsp_stack)) {
+        rbsp_cap = (nal_len <= 65536U) ? nal_len : 65536U;
+        rbsp_heap = (uint8_t *)malloc(rbsp_cap);
+        if (!rbsp_heap)
+            return false;
+        rbsp = rbsp_heap;
+    }
+
+    size_t rbsp_len = unescape_rbsp(nal, nal_len, rbsp, rbsp_cap);
+    bool ok = parse_h264_sps_rbsp(rbsp, rbsp_len, sps);
+    free(rbsp_heap);
+    return ok;
+}
+
+uint32_t vaapi_h264_compute_reorder_depth(const parsed_sps_t *sps, uint32_t cap)
+{
+    if (cap == 0)
+        return 1U;
+
+    uint32_t target_depth = 4U;
+    if (sps && sps->valid) {
+        if (sps->profile_idc == 66 || sps->constraint_set0_flag != 0 ||
+            sps->pic_order_cnt_type == 2 || sps->num_ref_frames == 0) {
+            target_depth = 1U;
+        } else if (sps->bitstream_restriction_flag) {
+            target_depth = (uint32_t)sps->max_num_reorder_frames + 1U;
+        } else {
+            target_depth = (uint32_t)sps->num_ref_frames + 1U;
+        }
+    }
+    if (target_depth < 1U)
+        target_depth = 1U;
+    if (target_depth > cap)
+        target_depth = cap;
+    return target_depth;
+}
+
 bool parse_h264_pps(const uint8_t *nal, size_t nal_len, const parsed_sps_t *sps, parsed_pps_t *pps)
 {
-    if (nal_len < 2)
+    if (!nal || !pps || nal_len < 2)
         return false;
-    uint8_t rbsp[512];
+    uint8_t rbsp[2048];
     size_t rbsp_len = unescape_rbsp(nal, nal_len, rbsp, sizeof(rbsp));
     bit_reader_t br;
     bit_reader_init(&br, rbsp, rbsp_len);

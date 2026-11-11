@@ -10,6 +10,58 @@
 
 static clockid_t g_presentation_clock_id = CLOCK_MONOTONIC;
 
+/* Self-contained wire descriptors for staging commit-timing-v1 and fifo-v1 so
+ * older distro wayland-protocols packages build without scanner XML updates. */
+extern const struct wl_interface wl_surface_interface;
+extern const struct wl_interface waywal_wp_commit_timer_v1_interface;
+extern const struct wl_interface waywal_wp_fifo_v1_interface;
+
+static const struct wl_interface *g_commit_timing_v1_types[] = {
+    NULL, NULL, NULL, &waywal_wp_commit_timer_v1_interface, &wl_surface_interface,
+};
+
+static const struct wl_message g_wp_commit_timing_manager_v1_requests[] = {
+    {"destroy", "", g_commit_timing_v1_types + 0},
+    {"get_timer", "no", g_commit_timing_v1_types + 3},
+};
+
+const struct wl_interface waywal_wp_commit_timing_manager_v1_interface = {
+    "wp_commit_timing_manager_v1", 1, 2, g_wp_commit_timing_manager_v1_requests, 0, NULL,
+};
+
+static const struct wl_message g_wp_commit_timer_v1_requests[] = {
+    {"set_timestamp", "uuu", g_commit_timing_v1_types + 0},
+    {"destroy", "", g_commit_timing_v1_types + 0},
+};
+
+const struct wl_interface waywal_wp_commit_timer_v1_interface = {
+    "wp_commit_timer_v1", 1, 2, g_wp_commit_timer_v1_requests, 0, NULL,
+};
+
+static const struct wl_interface *g_fifo_v1_types[] = {
+    &waywal_wp_fifo_v1_interface,
+    &wl_surface_interface,
+};
+
+static const struct wl_message g_wp_fifo_manager_v1_requests[] = {
+    {"destroy", "", g_fifo_v1_types + 0},
+    {"get_fifo", "no", g_fifo_v1_types + 0},
+};
+
+const struct wl_interface waywal_wp_fifo_manager_v1_interface = {
+    "wp_fifo_manager_v1", 1, 2, g_wp_fifo_manager_v1_requests, 0, NULL,
+};
+
+static const struct wl_message g_wp_fifo_v1_requests[] = {
+    {"set_barrier", "", g_fifo_v1_types + 0},
+    {"wait_barrier", "", g_fifo_v1_types + 0},
+    {"destroy", "", g_fifo_v1_types + 0},
+};
+
+const struct wl_interface waywal_wp_fifo_v1_interface = {
+    "wp_fifo_v1", 1, 3, g_wp_fifo_v1_requests, 0, NULL,
+};
+
 void presentation_set_clock_id(clockid_t clk_id) { g_presentation_clock_id = clk_id; }
 
 clockid_t presentation_get_clock_id(void) { return g_presentation_clock_id; }
