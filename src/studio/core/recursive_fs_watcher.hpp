@@ -44,16 +44,19 @@ class RecursiveFsWatcher {
     [[nodiscard]] size_t totalWatches() const noexcept;
 
   private:
+    bool ensureCoreFdsLocked();
     void workerThreadLoop();
     void processInotifyEvents();
     void processFanotifyEvents();
     void flushDebounceQueue();
-    void addWatchRecursive(const std::filesystem::path &path);
-    void removeWatchRecursive(int wd);
+    void addWatchRecursiveLocked(const std::filesystem::path &path,
+                                 const std::filesystem::path &rootPath, size_t maxDepth = 2);
+    void removeWatchLocked(int wd);
 
     FsWatchCallback m_callback;
     uint32_t m_debounceMs;
     bool m_usingFanotify{false};
+    bool m_overflowPending{false};
 
     int m_epollFd{-1};
     int m_inotifyFd{-1};
