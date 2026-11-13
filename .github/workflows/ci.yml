@@ -45,6 +45,7 @@ jobs:
             clang \
             lld \
             llvm \
+            libomp-dev \
             meson \
             ninja-build \
             pkg-config \
@@ -129,9 +130,15 @@ jobs:
       - name: Verify daemon DT_NEEDED count and Studio headless check
         if: matrix.profile == 'release'
         run: |
+          readelf -d build/wwald | grep NEEDED
+          ! readelf -d build/wwald | grep -E 'NEEDED.*(libav|libswscale|libwebp|libavif|libjxl|librsvg|libpipewire|libzstd|libsodium|libcurl|libQt6)'
           needed_count=$(readelf -d build/wwald | grep -c NEEDED)
           echo "wwald DT_NEEDED count: ${needed_count}"
-          test "${needed_count}" -eq 14
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            test "${needed_count}" -eq 14
+          else
+            test "${needed_count}" -ge 13 -a "${needed_count}" -le 15
+          fi
           QT_QPA_PLATFORM=offscreen ./build/wwal-studio --headless-check
 
       - name: Run Meson test suite

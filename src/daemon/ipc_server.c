@@ -1126,7 +1126,8 @@ static void ipc_async_notify_main_loop(void)
 {
     if (g_ipc_async.efd >= 0) {
         uint64_t one = 1;
-        (void)write(g_ipc_async.efd, &one, sizeof(one));
+        ssize_t io_rc = write(g_ipc_async.efd, &one, sizeof(one));
+        (void)io_rc;
     }
 }
 
@@ -1201,7 +1202,8 @@ static int ipc_run_steamcmd_isolated(const char *steamcmd_bin, uint64_t file_id,
         pid_t cmd_pid = fork();
         if (cmd_pid < 0) {
             int fail_code = 127;
-            (void)write(status_pipe[1], &fail_code, sizeof(fail_code));
+            ssize_t io_rc = write(status_pipe[1], &fail_code, sizeof(fail_code));
+            (void)io_rc;
             _exit(0);
         }
         if (cmd_pid == 0) {
@@ -1271,7 +1273,8 @@ static int ipc_run_steamcmd_isolated(const char *steamcmd_bin, uint64_t file_id,
                 break;
             }
         }
-        (void)write(status_pipe[1], &exit_code, sizeof(exit_code));
+        ssize_t st_rc = write(status_pipe[1], &exit_code, sizeof(exit_code));
+        (void)st_rc;
         close(status_pipe[1]);
         close(cancel_pipe[0]);
         _exit(0);
@@ -1345,7 +1348,8 @@ static int ipc_run_steamcmd_isolated(const char *steamcmd_bin, uint64_t file_id,
             wait_rem_ms -= 50;
         }
         int helper_rc = 0;
-        (void)read(status_pipe[0], &helper_rc, sizeof(helper_rc));
+        ssize_t hr_rc = read(status_pipe[0], &helper_rc, sizeof(helper_rc));
+        (void)hr_rc;
         if (elapsed_ms >= 900000) {
             exit_code = 124;
         }
@@ -2428,7 +2432,8 @@ void daemon_ipc_async_shutdown(struct daemon_state *state)
     pthread_mutex_lock(&g_ipc_async.dl_mtx);
     if (g_ipc_async.dl_cancel_efd >= 0) {
         uint64_t sig = 1;
-        (void)write(g_ipc_async.dl_cancel_efd, &sig, sizeof(sig));
+        ssize_t io_rc = write(g_ipc_async.dl_cancel_efd, &sig, sizeof(sig));
+        (void)io_rc;
     }
     pthread_cond_broadcast(&g_ipc_async.dl_cv);
     bool join_dl = g_ipc_async.dl_thread_started;

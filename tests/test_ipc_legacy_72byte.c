@@ -153,7 +153,7 @@ static int try_connect_socket(const char *sock_path)
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
 
     if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(s);

@@ -18,6 +18,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef WWAL_ALIGNAS
+#ifdef __cplusplus
+#define WWAL_ALIGNAS(x) alignas(x)
+#else
+#define WWAL_ALIGNAS(x) _Alignas(x)
+#endif
+#endif
+
 #if __has_include("waywal/ipc_proto_authoring.h")
 #include "waywal/ipc_proto_authoring.h"
 #endif
@@ -468,7 +476,7 @@ typedef struct we_scene {
     double last_audio_step_time;
 
     /* Native audio-reactive bindings (zero-allocation per-frame evaluator) */
-    alignas(8) we_audio_binding_t audio_bindings[WE_MAX_AUDIO_BINDINGS];
+    WWAL_ALIGNAS(8) we_audio_binding_t audio_bindings[WE_MAX_AUDIO_BINDINGS];
     uint32_t audio_binding_count;
     uint32_t last_audio_bindings_eval_ns;
 

@@ -409,8 +409,10 @@ QString resolveExtractedEntrypointPath(const uint8_t installedUuid[16],
     if (envXdgState.startsWith(QLatin1Char('/'))) {
         appendUniquePkgBase(baseDirs, envXdgState);
     }
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
     appendUniquePkgBase(baseDirs,
                         QStandardPaths::writableLocation(QStandardPaths::GenericStateLocation));
+#endif
     appendUniquePkgBase(baseDirs, QDir::homePath() + QStringLiteral("/.local/state"));
     const QString envWwalState = qEnvironmentVariable("WWAL_STATE_DIR");
     if (envWwalState.startsWith(QLatin1Char('/'))) {

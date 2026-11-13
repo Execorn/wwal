@@ -44,6 +44,7 @@ extra_c_args = cc.get_supported_arguments([
   '-Winit-self',
   '-Wimplicit-fallthrough',
   '-Wno-unused-parameter',
+  '-Wno-format-truncation',
   '-fstack-protector-strong',
   '-ffunction-sections',
   '-fdata-sections',
@@ -76,6 +77,7 @@ extra_cpp_args = cpp.get_supported_arguments([
   '-Winit-self',
   '-Wimplicit-fallthrough',
   '-Wno-unused-parameter',
+  '-Wno-format-truncation',
   '-fstack-protector-strong',
   '-ffunction-sections',
   '-fdata-sections',
@@ -484,7 +486,7 @@ endif
 
 qt6_opt = get_option('studio')
 have_qt6 = false
-qt6_dep = dependency('qt6', modules: ['Core', 'Gui', 'Widgets', 'OpenGLWidgets'], required: qt6_opt)
+qt6_dep = dependency('qt6', modules: ['Core', 'Gui', 'Widgets', 'OpenGLWidgets'], required: qt6_opt, include_type: 'system')
 sqlite3_dep = dependency('sqlite3', required: qt6_opt)
 if qt6_dep.found() and sqlite3_dep.found()
   qt6 = import('qt6')

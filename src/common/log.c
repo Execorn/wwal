@@ -92,5 +92,6 @@ void waywal_log(waywal_log_level_t level, const char *file, int line, const char
                            {.iov_base = msg_buf, .iov_len = msg_len},
                            {.iov_base = (void *)newline, .iov_len = 1}};
 
-    (void)writev(STDERR_FILENO, iov, 3);
+    ssize_t wr = writev(STDERR_FILENO, iov, 3);
+    (void)wr;
 }

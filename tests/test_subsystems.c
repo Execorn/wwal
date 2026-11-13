@@ -2528,7 +2528,8 @@ static void test_template_security_and_edge_cases(void)
                                                         "../../../.ssh/authorized_keys"));
             assert(!waywal_palette_render_template_file(&pal, &pal, &pal_sep, tpl_in,
                                                         "../../.ssh/authorized_keys"));
-            (void)chdir(orig_cwd);
+            int chdir_rc = chdir(orig_cwd);
+            (void)chdir_rc;
         }
     }
 

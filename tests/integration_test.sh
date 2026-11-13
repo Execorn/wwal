@@ -3,7 +3,11 @@
 set -euo pipefail
 
 NAMESPACE="test_integ_$$"
-BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build" && pwd)"
+if [ -x "${PWD}/wwal" ] && [ -x "${PWD}/wwald" ]; then
+    BUILD_DIR="${PWD}"
+else
+    BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build" && pwd)"
+fi
 ORIG_HOME="${HOME:-}"
 TMP_INTEG_STATE="$(mktemp -d /tmp/wwal_integ_state_XXXXXX)"
 TMP_INTEG_CACHE="$(mktemp -d /tmp/wwal_integ_cache_XXXXXX)"
@@ -324,11 +328,15 @@ fi
 sleep 0.08
 
 echo "[34c] Testing per-output multi-engine concurrency (shader, video, slideshow isolation)..."
+TMP_MULTI_SLIDE_DIR="${TMP_INTEG_CACHE}/multi_slides"
+mkdir -p "${TMP_MULTI_SLIDE_DIR}"
+cp "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" "${TMP_MULTI_SLIDE_DIR}/slide_a.png"
+cp "$(dirname "${BASH_SOURCE[0]}")/test_pattern.png" "${TMP_MULTI_SLIDE_DIR}/slide_b.png"
 mapfile -t OUT_NAMES < <("${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" query | awk -F': ' '{print $2}')
 if [ "${#OUT_NAMES[@]}" -ge 1 ]; then
     FIRST_OUT="${OUT_NAMES[0]}"
     "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" query -o "${FIRST_OUT}" | grep -q ": ${FIRST_OUT}:"
-    if "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow "$(dirname "${BASH_SOURCE[0]}")" -o "NONEXISTENT_OUTPUT_XYZ" 2>/dev/null; then
+    if "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow "${TMP_MULTI_SLIDE_DIR}" -o "NONEXISTENT_OUTPUT_XYZ" 2>/dev/null; then
         echo "FAIL: slideshow targeting NONEXISTENT_OUTPUT_XYZ unexpectedly succeeded"
         exit 1
     fi
@@ -342,7 +350,7 @@ fi
 if [ "${#OUT_NAMES[@]}" -ge 2 ]; then
     OUT_A="${OUT_NAMES[0]}"
     OUT_B="${OUT_NAMES[1]}"
-    "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow "$(dirname "${BASH_SOURCE[0]}")" -o "${OUT_A},${OUT_B}" -d 5m --no-recursive --transition-type none
+    "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow "${TMP_MULTI_SLIDE_DIR}" -o "${OUT_A},${OUT_B}" -d 5m --no-recursive --transition-type none
     "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow stop -o "${OUT_A}"
     "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" slideshow stop -o "${OUT_A}"
     "${BUILD_DIR}/wwal" --namespace "${NAMESPACE}" next -o "${OUT_B}"

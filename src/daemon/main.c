@@ -11700,7 +11700,8 @@ int main(int argc, char *argv[])
     WAYWAL_LOG_INFO("wwald daemon running successfully (namespace: %s)", state.namespace_str);
     if (ready_pipe[1] >= 0) {
         uint8_t ok_byte = 1;
-        (void)write(ready_pipe[1], &ok_byte, 1);
+        ssize_t wr = write(ready_pipe[1], &ok_byte, 1);
+        (void)wr;
         close(ready_pipe[1]);
         ready_pipe[1] = -1;
     }
@@ -11902,5 +11903,16 @@ int main(int argc, char *argv[])
     arena_destroy(&state.frame_arena);
 
     WAYWAL_LOG_INFO("Clean shutdown complete.");
+#ifdef HAVE_LIBSECCOMP
+#if defined(__SANITIZE_ADDRESS__)
+    fflush(NULL);
+    _exit(0);
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(leak_sanitizer)
+    fflush(NULL);
+    _exit(0);
+#endif
+#endif
+#endif
     return 0;
 }

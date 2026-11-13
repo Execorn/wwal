@@ -20,7 +20,8 @@ static void cleanup_dir(const char *path)
 {
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    (void)system(cmd);
+    int sys_rc = system(cmd);
+    (void)sys_rc;
 }
 
 static void write_bytes_to_path(const char *path, const void *data, size_t len)

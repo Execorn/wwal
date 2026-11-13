@@ -8,10 +8,14 @@
 
 #include <dlfcn.h>
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC push_options
 #pragma GCC target("avx2,fma")
+#endif
 #include <immintrin.h>
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC pop_options
+#endif
 #define WAYWAL_HAVE_X86_AVX2_TARGET 1
 #endif
 #include <math.h>
@@ -695,7 +699,9 @@ static void execute_complex_fft_1024(const waywal_audio_fft_t *fft, float *restr
         const float *w_im = &s_twiddle_im[half];
 
         for (uint32_t k = 0; k < COMPLEX_FFT_N; k += m) {
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC ivdep
+#endif
             for (uint32_t j = 0; j < half; ++j) {
                 float wr = w_re[j];
                 float wi = w_im[j];

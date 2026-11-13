@@ -85,6 +85,7 @@ typedef struct {
     unsigned ht_shift;
 } ws_item_table_t;
 
+#ifdef HAVE_OPENMP
 /* Reusable workspace avoids repeated kernel VMA mmap/munmap page-table churn on >128 KiB buffers.
  * Guarded by lock-free test-and-set so concurrent callers fall back to heap allocation safely. */
 static atomic_flag g_ws_scratch_lock = ATOMIC_FLAG_INIT;
@@ -94,6 +95,7 @@ static uint32_t *g_ws_slots_buf = NULL;
 static size_t g_ws_slots_cap = 0;
 static uint8_t *g_ws_claim_buf = NULL;
 static size_t g_ws_claim_cap = 0;
+#endif
 
 static atomic_flag g_ws_item_cache_lock = ATOMIC_FLAG_INIT;
 static waywal_workshop_item_manifest_t *g_ws_cached_items = NULL;
@@ -105,6 +107,7 @@ static size_t g_ws_io_cap = 0;
 
 __attribute__((destructor)) static void ws_global_scratch_cleanup(void)
 {
+#ifdef HAVE_OPENMP
     free(g_ws_sub_buf);
     g_ws_sub_buf = NULL;
     g_ws_sub_cap = 0;
@@ -116,6 +119,7 @@ __attribute__((destructor)) static void ws_global_scratch_cleanup(void)
     free(g_ws_claim_buf);
     g_ws_claim_buf = NULL;
     g_ws_claim_cap = 0;
+#endif
 
     if (g_ws_cached_items) {
         WS_ASAN_UNPOISON(g_ws_cached_items,

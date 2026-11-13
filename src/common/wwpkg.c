@@ -1268,7 +1268,7 @@ typedef struct jcs_arena_chunk {
     struct jcs_arena_chunk *next;
     size_t used;
     size_t cap;
-    alignas(8) uint8_t data[];
+    _Alignas(8) uint8_t data[];
 } jcs_arena_chunk_t;
 
 typedef struct {
@@ -1278,7 +1278,7 @@ typedef struct {
     size_t fast_used;
 } jcs_arena_t;
 
-static _Thread_local alignas(8) uint8_t tls_jcs_arena_buf[16384];
+static _Thread_local _Alignas(8) uint8_t tls_jcs_arena_buf[16384];
 static _Thread_local bool tls_jcs_arena_busy = false;
 
 static inline void jcs_arena_init(jcs_arena_t *arena)

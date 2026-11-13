@@ -7,6 +7,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef WWAL_ALIGNAS
+#ifdef __cplusplus
+#define WWAL_ALIGNAS(x) alignas(x)
+#else
+#define WWAL_ALIGNAS(x) _Alignas(x)
+#endif
+#endif
+
 #if __has_include("waywal/ipc_proto_authoring.h")
 #include "waywal/ipc_proto_authoring.h"
 #endif
@@ -190,7 +198,7 @@ typedef struct {
     float turb_scale;
     float turb_speed;
     float turb_timescale;
-    alignas(16) we_particle_ramp_lut_t ramp_lut;
+    WWAL_ALIGNAS(16) we_particle_ramp_lut_t ramp_lut;
     bool use_ramp_lut;
 } we_particle_operator_t;
 

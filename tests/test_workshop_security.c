@@ -405,7 +405,8 @@ static void test_malware_quarantine_pe_disguised(void)
 
     we_compat_report_free(report);
     we_compat_scanner_destroy(scanner);
-    system("rm -rf /tmp/wwal_test_pe_quarantine");
+    int sys_rc = system("rm -rf /tmp/wwal_test_pe_quarantine");
+    (void)sys_rc;
     printf("  -> PE binary camouflage tests passed (100%% quarantine).\n");
 }
 
@@ -464,7 +465,8 @@ static void test_malware_quarantine_elf_disguised(void)
 
     we_compat_report_free(report);
     we_compat_scanner_destroy(scanner);
-    system("rm -rf /tmp/wwal_test_elf_quarantine");
+    int sys_rc = system("rm -rf /tmp/wwal_test_elf_quarantine");
+    (void)sys_rc;
     printf("  -> ELF binary camouflage tests passed (100%% quarantine).\n");
 }
 
@@ -531,7 +533,8 @@ static void test_ast_sandbox_forbidden_globals(void)
         TEST_ASSERT(found_violation, "SECURITY_SCRIPT_VIOLATION recorded for forbidden API");
 
         we_compat_report_free(report);
-        system("rm -rf /tmp/wwal_test_ast_forbidden");
+        int sys_rc = system("rm -rf /tmp/wwal_test_ast_forbidden");
+        (void)sys_rc;
     }
 
     /* Test token boundary false positive resistance:
@@ -568,7 +571,8 @@ static void test_ast_sandbox_forbidden_globals(void)
                     "Benign substring tokens NOT falsely blocked as Tier 4");
 
         we_compat_report_free(report);
-        system("rm -rf /tmp/wwal_test_ast_benign");
+        int sys_rc = system("rm -rf /tmp/wwal_test_ast_benign");
+        (void)sys_rc;
     }
 
     we_compat_scanner_destroy(scanner);
@@ -632,7 +636,8 @@ static void test_ast_sandbox_infinite_loops(void)
         TEST_ASSERT(found_repair, "REPAIR_STUB_SCRIPT auto-repair proposed");
 
         we_compat_report_free(report);
-        system("rm -rf /tmp/wwal_test_ast_loop");
+        int sys_rc = system("rm -rf /tmp/wwal_test_ast_loop");
+        (void)sys_rc;
     }
 
     we_compat_scanner_destroy(scanner);

@@ -609,7 +609,9 @@ static void apply_landlock_sandbox(const char *runtime_dir)
     if (g_sandbox_cfg) {
         char real_home[4096] = {0};
         if (home && home[0]) {
-            (void)realpath(home, real_home);
+            if (!realpath(home, real_home)) {
+                real_home[0] = '\0';
+            }
         }
         for (size_t i = 0; i < g_sandbox_cfg->template_count; ++i) {
             const waywal_template_rule_t *tr = &g_sandbox_cfg->templates[i];

@@ -132,7 +132,8 @@ static void test_uring_callback(uring_event_type_t type, int fd, uint32_t res, v
         if (g_uring_readd_in_cb && user_data) {
             uring_loop_t *lp = (uring_loop_t *)user_data;
             char tmp;
-            (void)read(fd, &tmp, 1);
+            ssize_t rd_rc = read(fd, &tmp, 1);
+            (void)rd_rc;
             assert(uring_loop_remove_poll(lp, fd));
             assert(uring_loop_add_poll(lp, fd, POLLIN, URING_EV_WAYLAND_READ, lp));
         }
@@ -175,7 +176,7 @@ static void test_io_uring_event_loop(void)
 
     /* Drain pipe */
     char rbuf;
-    read(fds[0], &rbuf, 1);
+    assert(read(fds[0], &rbuf, 1) == 1);
 
     /* Write a second byte without calling uring_loop_add_poll again to verify continuation */
     w = write(fds[1], &byte, 1);
@@ -183,7 +184,7 @@ static void test_io_uring_event_loop(void)
     dispatched = uring_loop_dispatch(&loop, test_uring_callback);
     assert(dispatched >= 1);
     assert(g_uring_cb_count == 2);
-    read(fds[0], &rbuf, 1);
+    assert(read(fds[0], &rbuf, 1) == 1);
 
     /* Test remove + re-add of same fd inside dispatch callback (power_governor reconnect pattern)
      */
@@ -202,7 +203,7 @@ static void test_io_uring_event_loop(void)
     dispatched = uring_loop_dispatch(&loop, test_uring_callback);
     assert(dispatched >= 1);
     assert(g_uring_cb_count == 4);
-    read(fds[0], &rbuf, 1);
+    assert(read(fds[0], &rbuf, 1) == 1);
 
     /* Verify URING_EV_WAYLAND_READ is dispatched before URING_EV_TRANSITION_TIMER in the same CQE
      * batch even when the timer pipe is written to first */
@@ -217,8 +218,8 @@ static void test_io_uring_event_loop(void)
     assert(g_uring_order_len >= 2);
     assert(g_uring_order[0] == URING_EV_WAYLAND_READ);
     assert(g_uring_order[1] == URING_EV_TRANSITION_TIMER);
-    read(fds[0], &rbuf, 1);
-    read(tfds[0], &rbuf, 1);
+    assert(read(fds[0], &rbuf, 1) == 1);
+    assert(read(tfds[0], &rbuf, 1) == 1);
 
     /* Verify a timer CQE arriving mid-pass-0 (inside URING_EV_WAYLAND_READ callback) is bounded by
      * pass 0's CQE count and never double-dispatched */
@@ -226,7 +227,7 @@ static void test_io_uring_event_loop(void)
     g_uring_write_tfd_in_cb = tfds[1];
     assert(write(fds[1], &byte, 1) == 1);
     dispatched = uring_loop_dispatch(&loop, test_uring_callback);
-    read(fds[0], &rbuf, 1);
+    assert(read(fds[0], &rbuf, 1) == 1);
     if (dispatched == 1) {
         assert(g_uring_order_len == 1);
         assert(g_uring_order[0] == URING_EV_WAYLAND_READ);
@@ -236,7 +237,7 @@ static void test_io_uring_event_loop(void)
     assert(g_uring_order_len == 2);
     assert(g_uring_order[0] == URING_EV_WAYLAND_READ);
     assert(g_uring_order[1] == URING_EV_TRANSITION_TIMER);
-    read(tfds[0], &rbuf, 1);
+    assert(read(tfds[0], &rbuf, 1) == 1);
 
     close(tfds[0]);
     close(tfds[1]);
@@ -415,7 +416,8 @@ static void test_security_hardening(void)
             _exit(8);
 
         char ok_byte = 'K';
-        (void)write(confirm_pfd[1], &ok_byte, 1);
+        ssize_t wr_rc = write(confirm_pfd[1], &ok_byte, 1);
+        (void)wr_rc;
         close(confirm_pfd[1]);
 
         /* Verify denied syscall triggers SCMP_ACT_KILL_PROCESS on ptrace */
@@ -424,7 +426,8 @@ static void test_security_hardening(void)
         _exit(4);
 #else
         char ok_byte = 'K';
-        (void)write(confirm_pfd[1], &ok_byte, 1);
+        ssize_t wr_rc = write(confirm_pfd[1], &ok_byte, 1);
+        (void)wr_rc;
         close(confirm_pfd[1]);
         _exit(0);
 #endif

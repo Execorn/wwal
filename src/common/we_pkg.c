@@ -145,8 +145,8 @@ static void populate_steam_assets_dir(we_pkg_t *pkg, const char *workshop_dir)
     static const char *const candidates[] = {
         ".local/share/Steam/steamapps/common/wallpaper_engine/assets",
         ".steam/steam/steamapps/common/wallpaper_engine/assets",
-        ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/wallpaper_engine/"
-        "assets",
+        (".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/wallpaper_engine/"
+         "assets"),
     };
 
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {

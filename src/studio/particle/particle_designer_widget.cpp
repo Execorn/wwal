@@ -32,14 +32,10 @@ namespace waywal::studio {
 namespace {
 
 constexpr QColor kBgCanvas(0x0b, 0x0c, 0x10);
-constexpr QColor kBgChrome(0x12, 0x14, 0x1a);
 constexpr QColor kBgElevated(0x18, 0x1b, 0x22);
 constexpr QColor kBorderSubtle(0x2a, 0x2f, 0x3d);
 constexpr QColor kTextPrimary(0xf1, 0xf5, 0xf9);
-constexpr QColor kTextSecondary(0x94, 0xa3, 0xb8);
 constexpr QColor kAccentSky(0x38, 0xbd, 0xf8);
-constexpr QColor kSemanticWarn(0xf5, 0x9e, 0x0b);
-constexpr QColor kSemanticOk(0x22, 0xc5, 0x5e);
 
 constexpr int kCanvasPadX = 12;
 constexpr int kCanvasPadY = 10;
@@ -136,14 +132,16 @@ void computeHermiteTangents(const std::vector<we_particle_curve_knot_t> &knots,
                             std::vector<float> &outTangents)
 {
     const size_t n = knots.size();
-    outTangents.assign(n, 0.0f);
-    if (n < 2) {
+    if (n < 2 || n > 65536) {
+        outTangents.assign(n < 2 ? n : 0, 0.0f);
         return;
     }
 
-    std::vector<float> h(n - 1, 0.0f);
-    std::vector<float> delta(n - 1, 0.0f);
-    for (size_t i = 0; i < n - 1; ++i) {
+    outTangents.assign(n, 0.0f);
+    const size_t segs = n - 1;
+    std::vector<float> h(segs, 0.0f);
+    std::vector<float> delta(segs, 0.0f);
+    for (size_t i = 0; i < segs; ++i) {
         h[i] = std::max(1e-5f, knots[i + 1].t - knots[i].t);
         delta[i] = (knots[i + 1].y - knots[i].y) / h[i];
     }

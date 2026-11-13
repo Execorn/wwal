@@ -2912,7 +2912,7 @@ bool waywal_shader_engine_poll_hot_reload(waywal_shader_engine_t *eng)
         return false;
     }
 
-    alignas(struct inotify_event) uint8_t buf[4096];
+    _Alignas(struct inotify_event) uint8_t buf[4096];
     bool triggered = false;
 
     for (;;) {

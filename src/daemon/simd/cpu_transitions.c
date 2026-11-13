@@ -917,21 +917,6 @@ light_leak_span_avx2(uint32_t *restrict dst_row, const uint32_t *restrict a_row,
 }
 #endif
 
-static inline float value_noise2(float x, float y)
-{
-    float ix = floorf(x);
-    float iy = floorf(y);
-    float fx = x - ix;
-    float fy = y - iy;
-    fx = fx * fx * (3.0f - 2.0f * fx);
-    fy = fy * fy * (3.0f - 2.0f * fy);
-    float a = hash21(ix, iy);
-    float b = hash21(ix + 1.0f, iy);
-    float c = hash21(ix, iy + 1.0f);
-    float d = hash21(ix + 1.0f, iy + 1.0f);
-    return (a * (1.0f - fx) + b * fx) * (1.0f - fy) + (c * (1.0f - fx) + d * fx) * fy;
-}
-
 static float s_unit_sine_lut[1024];
 static pthread_once_t s_sine_lut_once = PTHREAD_ONCE_INIT;
 

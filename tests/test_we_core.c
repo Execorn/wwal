@@ -3428,7 +3428,8 @@ static void test_workshop_preview_bridge(void)
     rmdir(item2);
     char rm_cmd[4200];
     snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", tmp_ws);
-    (void)system(rm_cmd);
+    int sys_rc = system(rm_cmd);
+    (void)sys_rc;
 }
 
 static void build_synthetic_wav_pcm16(byte_buf_t *bb, uint32_t sample_rate, uint16_t channels,

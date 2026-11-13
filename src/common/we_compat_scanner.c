@@ -1695,7 +1695,7 @@ static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const
                             char msg[256];
                             snprintf(
                                 msg, sizeof(msg),
-                                "Varying '%s' width mismatch between .vert (%u) and .frag (%u)",
+                                "Varying '%.128s' width mismatch between .vert (%u) and .frag (%u)",
                                 v_vars[vi].name, v_vars[vi].width, f_vars[fi].width);
                             report_add_issue(out_report, "SHADER_VARYING_MISMATCH",
                                              WE_ISSUE_SEV_WARNING, msg, rel_path, v_vars[vi].line,
