@@ -147,10 +147,12 @@ jobs:
             'leak:libdbus-1.so' \
             'leak:libQt6Gui.so' \
             'leak:libQt6Widgets.so' \
+            'leak:libQt6OpenGLWidgets.so' \
             'leak:libEGL_mesa.so' \
             'leak:libgallium' \
             'leak:swrast_dri.so' \
             'leak:llvmpipe' \
+            'leak:libnvidia-glcore.so' \
             > /tmp/wwal-lsan.supp
           meson test -C build --print-errorlogs
 
@@ -164,4 +166,6 @@ jobs:
           ./build/fuzz_bitstream
           ./build/fuzz_config_cli
           ./build/fuzz_workshop_parsers
+          ./build/fuzz_rigging_parsers
           ./build/test_ipc_authoring_wire
+          ./build/test_ipc_rigging_wire

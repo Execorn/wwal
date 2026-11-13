@@ -3,6 +3,7 @@
 
 #include "waywal/dmabuf.h"
 #include "waywal/log.h"
+#include "waywal/we_mesh_rig.h"
 #include "waywal/we_physics.h"
 
 #include <EGL/egl.h>
@@ -3809,8 +3810,14 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
 
         if (obj->puppet) {
             we_puppet_t *p = obj->puppet;
-            we_puppet_eval_skin_matrices(p, p->layers, p->layer_count, (double)time_sec,
-                                         p->skin_mats);
+            double eval_time = p->playback_paused ? p->preview_time_sec : (double)time_sec;
+            if (p->rig_ctx || p->playback_paused) {
+                we_puppet_eval_skin_matrices_ex(p, p->layers, p->layer_count,
+                                                (const we_rig_pose_ctx_t *)p->rig_ctx, eval_time,
+                                                p->skin_mats);
+            } else {
+                we_puppet_eval_skin_matrices(p, p->layers, p->layer_count, eval_time, p->skin_mats);
+            }
             we_puppet_skin_vertices_cpu(p, p->skin_mats, p->skinned_verts);
 
             float world_node[16];
@@ -4305,6 +4312,7 @@ void we_scene_destroy(we_scene_t *scene)
                 s_we_shared_refcount--;
             }
             if (s_we_shared_refcount == 0) {
+                we_gpu_weight_brush_destroy();
                 eglMakeCurrent(scene->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
                 eglDestroyContext(scene->egl_display, scene->egl_context);
 #if !(defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer))
@@ -4316,6 +4324,8 @@ void we_scene_destroy(we_scene_t *scene)
                 s_we_shared_dpy = EGL_NO_DISPLAY;
                 s_we_shared_ctx = EGL_NO_CONTEXT;
             }
+        } else if (!scene->owns_egl && eglGetCurrentContext() != EGL_NO_CONTEXT) {
+            we_gpu_weight_brush_destroy();
         }
     }
 

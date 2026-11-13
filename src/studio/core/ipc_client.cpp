@@ -4,6 +4,7 @@
 #include "waywal/log.h"
 #include "waywal/wwpkg.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -15,6 +16,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -31,38 +33,16 @@ namespace {
 
 bool expectsGenericOkReply(uint16_t reqOpcode) noexcept
 {
-    // Allowlist only opcodes whose wire contract returns WAYWAL_RESP_OK so
-    // unrecognized or dedicated-response opcodes never desync the pending queue.
+    return IpcClient::expectsGenericOkForOpcode(reqOpcode);
+}
+
+bool isFireAndForgetNoReplyOpcode(uint16_t reqOpcode) noexcept
+{
     switch (reqOpcode) {
-    case WAYWAL_REQ_CLEAR:
-    case WAYWAL_REQ_SET_IMAGE:
-    case WAYWAL_REQ_SET_VIDEO:
-    case WAYWAL_REQ_TOGGLE:
-    case WAYWAL_REQ_PAUSE:
-    case WAYWAL_REQ_UNPAUSE:
-    case WAYWAL_REQ_KILL:
-    case WAYWAL_REQ_SLIDESHOW:
-    case WAYWAL_REQ_SHADER:
-    case WAYWAL_REQ_RESTORE:
-    case WAYWAL_REQ_SLIDESHOW_CTRL:
-    case WAYWAL_REQ_WORKSHOP:
-    case WAYWAL_REQ_SET_UNIFORM:
     case WAYWAL_REQ_SUBSCRIBE:
-    case WAYWAL_REQ_AUDIO_CTRL:
-    case WAYWAL_REQ_SLIDESHOW_NEXT:
-    case WAYWAL_REQ_SLIDESHOW_PREV:
-    case WAYWAL_REQ_SET_SHADER_PARAM:
+    case WAYWAL_REQ_SET_UNIFORM:
+    case WAYWAL_REQ_PUPPET_SCRUB_TIME:
         return true;
-    case WAYWAL_REQ_SCENE_MUTATE:
-    case WAYWAL_REQ_HOT_RELOAD_CODE:
-    case WAYWAL_REQ_QUERY_SCENE_TREE:
-    case WAYWAL_REQ_SET_SHADER_COMBO:
-    case WAYWAL_REQ_BRUSH_STROKE:
-    case WAYWAL_REQ_PARTICLE_CONFIG:
-    case WAYWAL_REQ_SET_AUDIO_BINDINGS:
-    case WAYWAL_REQ_EXPORT_SCENE_PKG:
-    case WAYWAL_REQ_LINT_SCENESCRIPT:
-    case WAYWAL_REQ_READBACK_TEXTURE:
     default:
         return false;
     }
@@ -292,6 +272,13 @@ IpcClient::IpcClient(QString namespaceStr, QString socketPath, QObject *parent, 
     qRegisterMetaType<waywal_ipc_resp_set_camera_3d_t>("waywal_ipc_resp_set_camera_3d_t");
     qRegisterMetaType<waywal_ipc_resp_set_physics_params_t>("waywal_ipc_resp_set_physics_params_t");
     qRegisterMetaType<waywal_ipc_resp_set_scene_lights_t>("waywal_ipc_resp_set_scene_lights_t");
+    qRegisterMetaType<waywal_ipc_puppet_mesh_ack_t>("waywal_ipc_puppet_mesh_ack_t");
+    qRegisterMetaType<waywal_ipc_puppet_weights_resp_t>("waywal_ipc_puppet_weights_resp_t");
+    qRegisterMetaType<std::vector<waywal_ipc_vertex_weight_t>>(
+        "std::vector<waywal_ipc_vertex_weight_t>");
+    qRegisterMetaType<waywal_ipc_puppet_ik_pose_resp_t>("waywal_ipc_puppet_ik_pose_resp_t");
+    qRegisterMetaType<std::vector<waywal_ipc_bone_trs_t>>("std::vector<waywal_ipc_bone_trs_t>");
+    qRegisterMetaType<waywal_ipc_export_puppet_mdl_resp_t>("waywal_ipc_export_puppet_mdl_resp_t");
 
     if (m_namespaceStr.isEmpty()) {
         m_namespaceStr = QStringLiteral("default");
@@ -386,6 +373,50 @@ void IpcClient::wakeupWorker()
     }
 }
 
+void IpcClient::dispatchRequestFailure(PendingRequest &&req, const QString &reason,
+                                       bool emitErrorSignal)
+{
+    if (!m_running.load()) {
+        return;
+    }
+
+    if (req.wwpkgInstallCallback || req.workshopSyncCallback || req.workshopDownloadCallback ||
+        req.scanCompatCallback || req.jsonCallback || emitErrorSignal) {
+        QMetaObject::invokeMethod(
+            this,
+            [this, reason, emitErrorSignal, wwpkgCb = std::move(req.wwpkgInstallCallback),
+             syncCb = std::move(req.workshopSyncCallback),
+             dlCb = std::move(req.workshopDownloadCallback),
+             compatCb = std::move(req.scanCompatCallback), jsonCb = std::move(req.jsonCallback)]() {
+                if (wwpkgCb) {
+                    waywal_ipc_resp_wwpkg_install_t resp{};
+                    resp.status_code = 1u;
+                    wwpkgCb(resp, reason);
+                } else if (syncCb) {
+                    waywal_ipc_resp_workshop_sync_t resp{};
+                    resp.status_code = 1u;
+                    syncCb(resp);
+                } else if (dlCb) {
+                    waywal_ipc_resp_workshop_download_t resp{};
+                    resp.task_state = 7u;
+                    QByteArray errBa = reason.toUtf8();
+                    std::strncpy(resp.error_msg, errBa.constData(), sizeof(resp.error_msg) - 1);
+                    dlCb(resp);
+                } else if (compatCb) {
+                    waywal_ipc_resp_scan_compat_t resp{};
+                    resp.status_code = 1u;
+                    compatCb(resp);
+                } else if (jsonCb) {
+                    jsonCb(QString());
+                }
+                if (emitErrorSignal) {
+                    emit errorOccurred(reason);
+                }
+            },
+            Qt::QueuedConnection);
+    }
+}
+
 void IpcClient::failInFlightRequests(const QString &reason)
 {
     std::deque<PendingRequest> stale;
@@ -399,38 +430,42 @@ void IpcClient::failInFlightRequests(const QString &reason)
     }
 
     for (auto &req : stale) {
-        if (req.wwpkgInstallCallback) {
-            waywal_ipc_resp_wwpkg_install_t resp{};
-            resp.status_code = 1u;
-            QMetaObject::invokeMethod(
-                this,
-                [cb = std::move(req.wwpkgInstallCallback), resp, reason]() { cb(resp, reason); },
-                Qt::QueuedConnection);
-        } else if (req.workshopSyncCallback) {
-            waywal_ipc_resp_workshop_sync_t resp{};
-            resp.status_code = 1u;
-            QMetaObject::invokeMethod(
-                this, [cb = std::move(req.workshopSyncCallback), resp]() { cb(resp); },
-                Qt::QueuedConnection);
-        } else if (req.workshopDownloadCallback) {
-            waywal_ipc_resp_workshop_download_t resp{};
-            resp.task_state = 7u;
-            QByteArray errBa = reason.toUtf8();
-            std::strncpy(resp.error_msg, errBa.constData(), sizeof(resp.error_msg) - 1);
-            QMetaObject::invokeMethod(
-                this, [cb = std::move(req.workshopDownloadCallback), resp]() { cb(resp); },
-                Qt::QueuedConnection);
-        } else if (req.scanCompatCallback) {
-            waywal_ipc_resp_scan_compat_t resp{};
-            resp.status_code = 1u;
-            QMetaObject::invokeMethod(
-                this, [cb = std::move(req.scanCompatCallback), resp]() { cb(resp); },
-                Qt::QueuedConnection);
-        } else if (req.jsonCallback) {
-            QMetaObject::invokeMethod(
-                this, [cb = std::move(req.jsonCallback)]() { cb(QString()); },
-                Qt::QueuedConnection);
+        dispatchRequestFailure(std::move(req), reason, false);
+    }
+}
+
+void IpcClient::sweepExpiredRequests()
+{
+    const int timeoutMs = m_requestTimeoutMs.load();
+    if (timeoutMs <= 0) {
+        return;
+    }
+
+    const auto deadline = std::chrono::milliseconds(timeoutMs);
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<PendingRequest> expired;
+    {
+        std::lock_guard<std::mutex> lock(m_requestsMutex);
+        auto it = m_pendingRequests.begin();
+        while (it != m_pendingRequests.end()) {
+            if (now - it->sentAt >= deadline) {
+                expired.push_back(std::move(*it));
+                it = m_pendingRequests.erase(it);
+            } else {
+                ++it;
+            }
         }
+    }
+
+    if (expired.empty() || !m_running.load()) {
+        return;
+    }
+
+    for (auto &req : expired) {
+        const QString reason = QStringLiteral("IPC request 0x%1 timed out after %2 ms")
+                                   .arg(req.expectedOpcode, 4, 16, QLatin1Char('0'))
+                                   .arg(timeoutMs);
+        dispatchRequestFailure(std::move(req), reason, true);
     }
 }
 
@@ -551,6 +586,15 @@ void IpcClient::workerLoop()
 
         int pollTimeoutMs = 250;
         {
+            std::lock_guard<std::mutex> lock(m_requestsMutex);
+            if (!m_pendingRequests.empty()) {
+                const int reqTimeout = m_requestTimeoutMs.load();
+                if (reqTimeout > 0) {
+                    pollTimeoutMs = std::min(pollTimeoutMs, std::max(10, reqTimeout));
+                }
+            }
+        }
+        {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             if (!m_outQueue.empty()) {
                 pollTimeoutMs = 0;
@@ -558,9 +602,10 @@ void IpcClient::workerLoop()
                 const auto now = std::chrono::steady_clock::now();
                 const auto elapsed =
                     std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastUniformFlush);
-                pollTimeoutMs = (elapsed >= std::chrono::milliseconds(7))
-                                    ? 0
-                                    : static_cast<int>(7 - elapsed.count());
+                const int uniformWait = (elapsed >= std::chrono::milliseconds(7))
+                                            ? 0
+                                            : static_cast<int>(7 - elapsed.count());
+                pollTimeoutMs = std::min(pollTimeoutMs, uniformWait);
             }
         }
         int pr = poll(pfds, 2, pollTimeoutMs);
@@ -595,6 +640,7 @@ void IpcClient::workerLoop()
         }
 
         flushOutboundQueue();
+        sweepExpiredRequests();
     }
 }
 
@@ -797,10 +843,22 @@ void IpcClient::handleIncomingPacket()
         bool hadFailedReq = false;
         {
             std::lock_guard<std::mutex> lock(m_requestsMutex);
-            while (!m_pendingRequests.empty() &&
-                   m_pendingRequests.front().expectedOpcode == WAYWAL_REQ_SUBSCRIBE &&
-                   m_pendingRequests.size() > 1) {
-                m_pendingRequests.pop_front();
+            // Skip earlier callback-less fire-and-forget writes that a peer may not reply to
+            // individually so an error packet lands on the subsequent RPC in flight.
+            while (m_pendingRequests.size() > 1) {
+                const auto &front = m_pendingRequests.front();
+                const bool hasCb = static_cast<bool>(front.jsonCallback) ||
+                                   static_cast<bool>(front.telemetryCallback) ||
+                                   static_cast<bool>(front.dmabufCallback) ||
+                                   static_cast<bool>(front.workshopSyncCallback) ||
+                                   static_cast<bool>(front.workshopDownloadCallback) ||
+                                   static_cast<bool>(front.wwpkgInstallCallback) ||
+                                   static_cast<bool>(front.scanCompatCallback);
+                if (!hasCb && isFireAndForgetNoReplyOpcode(front.expectedOpcode)) {
+                    m_pendingRequests.pop_front();
+                } else {
+                    break;
+                }
             }
             if (!m_pendingRequests.empty()) {
                 failedReq = std::move(m_pendingRequests.front());
@@ -809,39 +867,12 @@ void IpcClient::handleIncomingPacket()
             }
         }
 
-        QMetaObject::invokeMethod(
-            this,
-            [this, err, hadFailedReq, wwpkgCb = std::move(failedReq.wwpkgInstallCallback),
-             syncCb = std::move(failedReq.workshopSyncCallback),
-             dlCb = std::move(failedReq.workshopDownloadCallback),
-             compatCb = std::move(failedReq.scanCompatCallback),
-             jsonCb = std::move(failedReq.jsonCallback)]() {
-                if (hadFailedReq) {
-                    if (wwpkgCb) {
-                        waywal_ipc_resp_wwpkg_install_t resp{};
-                        resp.status_code = 1u;
-                        wwpkgCb(resp, err);
-                    } else if (syncCb) {
-                        waywal_ipc_resp_workshop_sync_t resp{};
-                        resp.status_code = 1u;
-                        syncCb(resp);
-                    } else if (dlCb) {
-                        waywal_ipc_resp_workshop_download_t resp{};
-                        resp.task_state = 7u;
-                        QByteArray errBa = err.toUtf8();
-                        std::strncpy(resp.error_msg, errBa.constData(), sizeof(resp.error_msg) - 1);
-                        dlCb(resp);
-                    } else if (compatCb) {
-                        waywal_ipc_resp_scan_compat_t resp{};
-                        resp.status_code = 1u;
-                        compatCb(resp);
-                    } else if (jsonCb) {
-                        jsonCb(QString());
-                    }
-                }
-                emit errorOccurred(err);
-            },
-            Qt::QueuedConnection);
+        if (hadFailedReq) {
+            dispatchRequestFailure(std::move(failedReq), err, true);
+        } else {
+            QMetaObject::invokeMethod(
+                this, [this, err]() { emit errorOccurred(err); }, Qt::QueuedConnection);
+        }
         return;
     }
 
@@ -1302,6 +1333,101 @@ void IpcClient::handleIncomingPacket()
                 }
                 QMetaObject::invokeMethod(
                     this, [this, resp, bytes]() { emit textureReadbackReceived(resp, bytes); },
+                    Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_PUPPET_MESH_ACK) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_PUPPET_SET_MESH, req);
+        if (payload.size() == sizeof(waywal_ipc_puppet_mesh_ack_t)) {
+            waywal_ipc_puppet_mesh_ack_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            QMetaObject::invokeMethod(
+                this, [this, resp]() { emit puppetMeshAckReceived(resp); }, Qt::QueuedConnection);
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_PUPPET_WEIGHTS) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_PUPPET_SOLVE_WEIGHTS, req);
+        if (payload.size() >= sizeof(waywal_ipc_puppet_weights_resp_t)) {
+            waywal_ipc_puppet_weights_resp_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            const size_t tailBytes = payload.size() - sizeof(waywal_ipc_puppet_weights_resp_t);
+            const uint64_t expectedTail =
+                static_cast<uint64_t>(resp.entry_count) * sizeof(waywal_ipc_vertex_weight_t);
+            if (resp.entry_count <= WAYWAL_IPC_RIGGING_MAX_VERTICES &&
+                expectedTail == static_cast<uint64_t>(tailBytes)) {
+                std::vector<waywal_ipc_vertex_weight_t> entries(resp.entry_count);
+                if (resp.entry_count > 0) {
+                    std::memcpy(entries.data(),
+                                payload.data() + sizeof(waywal_ipc_puppet_weights_resp_t),
+                                static_cast<size_t>(expectedTail));
+                }
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, resp, entries = std::move(entries)]() {
+                        emit puppetWeightsSolved(resp, entries);
+                    },
+                    Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_PUPPET_IK_POSE) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_PUPPET_PREVIEW_IK, req);
+        if (payload.size() >= sizeof(waywal_ipc_puppet_ik_pose_resp_t)) {
+            waywal_ipc_puppet_ik_pose_resp_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            const size_t tailBytes = payload.size() - sizeof(waywal_ipc_puppet_ik_pose_resp_t);
+            const uint64_t expectedTail =
+                static_cast<uint64_t>(resp.bone_count) * sizeof(waywal_ipc_bone_trs_t);
+            if (resp.bone_count <= WAYWAL_IPC_RIGGING_MAX_BONES &&
+                expectedTail == static_cast<uint64_t>(tailBytes)) {
+                std::vector<waywal_ipc_bone_trs_t> bones(resp.bone_count);
+                if (resp.bone_count > 0) {
+                    std::memcpy(bones.data(),
+                                payload.data() + sizeof(waywal_ipc_puppet_ik_pose_resp_t),
+                                static_cast<size_t>(expectedTail));
+                }
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, resp, bones = std::move(bones)]() {
+                        emit puppetIkPoseReceived(resp, bones);
+                    },
+                    Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_EXPORT_PUPPET_MDL) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_EXPORT_PUPPET_MDL, req);
+        if (payload.size() >= sizeof(waywal_ipc_export_puppet_mdl_resp_t)) {
+            waywal_ipc_export_puppet_mdl_resp_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            const size_t tailBytes = payload.size() - sizeof(waywal_ipc_export_puppet_mdl_resp_t);
+            const bool inlineMatches = resp.mdl_byte_size <= WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES &&
+                                       static_cast<size_t>(resp.mdl_byte_size) == tailBytes;
+            const bool diskOnlyOrError =
+                (tailBytes == 0u) && (resp.status != 0 || resp.mdl_byte_size > 0u);
+            if (inlineMatches || diskOnlyOrError) {
+                QByteArray mdlBytes;
+                if (tailBytes > 0u && static_cast<size_t>(resp.mdl_byte_size) == tailBytes) {
+                    mdlBytes = QByteArray(
+                        reinterpret_cast<const char *>(payload.data() +
+                                                       sizeof(waywal_ipc_export_puppet_mdl_resp_t)),
+                        static_cast<qsizetype>(tailBytes));
+                }
+                QMetaObject::invokeMethod(
+                    this, [this, resp, mdlBytes]() { emit puppetMdlExported(resp, mdlBytes); },
                     Qt::QueuedConnection);
             }
         }
@@ -2116,6 +2242,587 @@ bool IpcClient::sendReadbackTexture(const QString &output, int32_t objectId, uin
                                                    &pkt.hdr, &req)) {
         return false;
     }
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+QString IpcClient::stagePuppetMdlExportPath(const QString &fileHint)
+{
+    QString cacheRoot = qEnvironmentVariable("XDG_CACHE_HOME");
+    if (cacheRoot.isEmpty()) {
+        cacheRoot = QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation);
+    }
+    if (cacheRoot.isEmpty()) {
+        cacheRoot = QDir::homePath() + QStringLiteral("/.cache");
+    }
+    const QString exportStageRoot = cacheRoot + QStringLiteral("/wwal/exports");
+    if (!QDir().mkpath(exportStageRoot)) {
+        return {};
+    }
+
+    static std::atomic<uint64_t> s_mdlExportSeq{0};
+    QString safeLeaf = QFileInfo(fileHint).fileName();
+    safeLeaf.replace(QLatin1Char('/'), QLatin1Char('_'));
+    safeLeaf.replace(QLatin1Char('\\'), QLatin1Char('_'));
+    safeLeaf.replace(QLatin1Char(':'), QLatin1Char('_'));
+    safeLeaf.remove(QStringLiteral(".."));
+    if (safeLeaf.isEmpty()) {
+        safeLeaf = QStringLiteral("puppet_%1_%2.mdl")
+                       .arg(QCoreApplication::applicationPid())
+                       .arg(++s_mdlExportSeq);
+    } else if (!safeLeaf.endsWith(QStringLiteral(".mdl"), Qt::CaseInsensitive)) {
+        safeLeaf += QStringLiteral(".mdl");
+    }
+
+    const QString candidate = exportStageRoot + QLatin1Char('/') + safeLeaf;
+    const QByteArray candidateUtf8 = candidate.toUtf8();
+    char resolved[512] = {};
+    if (!waywal_ipc_export_path_is_allowed(candidateUtf8.constData(), resolved, sizeof(resolved))) {
+        return {};
+    }
+    return QString::fromUtf8(resolved);
+}
+
+bool IpcClient::sendPuppetSetMesh(uint32_t objectId, uint32_t flags,
+                                  const std::vector<waywal_ipc_mdl_vertex_t> &vertices,
+                                  const std::vector<uint16_t> &indices)
+{
+    const bool clearMesh = vertices.empty() && indices.empty();
+    if (!clearMesh) {
+        if (vertices.size() < 3 || vertices.size() > WAYWAL_IPC_RIGGING_MAX_VERTICES) {
+            return false;
+        }
+        if (indices.size() < 3 || (indices.size() % 3) != 0) {
+            return false;
+        }
+    }
+
+    const uint32_t vertCount = static_cast<uint32_t>(vertices.size());
+    const uint32_t triCount = static_cast<uint32_t>(indices.size() / 3);
+    if (triCount > WAYWAL_IPC_RIGGING_MAX_TRIANGLES) {
+        return false;
+    }
+
+    size_t totalBytes = sizeof(waywal_ipc_puppet_set_mesh_t);
+    if (!clearMesh) {
+        if (!waywal_ipc_rigging_calc_mesh_bytes(vertCount, triCount, &totalBytes) ||
+            totalBytes > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES) {
+            return false;
+        }
+    }
+
+    for (const auto &v : vertices) {
+        for (int k = 0; k < 3; ++k) {
+            if (!std::isfinite(v.pos[k])) {
+                return false;
+            }
+        }
+        for (int k = 0; k < 4; ++k) {
+            if (!std::isfinite(v.weight[k])) {
+                return false;
+            }
+        }
+        if (!std::isfinite(v.texcoord[0]) || !std::isfinite(v.texcoord[1])) {
+            return false;
+        }
+    }
+    for (uint16_t idx : indices) {
+        if (idx >= vertCount) {
+            return false;
+        }
+    }
+
+    waywal_ipc_puppet_set_mesh_t req{};
+    req.object_id = objectId;
+    req.vertex_count = vertCount;
+    req.triangle_count = triCount;
+    req.flags = flags;
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_PUPPET_SET_MESH;
+    pkt.hdr.payload_size = static_cast<uint32_t>(totalBytes);
+    pkt.payload.resize(totalBytes);
+
+    uint8_t *dst = pkt.payload.data();
+    std::memcpy(dst, &req, sizeof(req));
+    dst += sizeof(req);
+    if (!clearMesh) {
+        const size_t vBytes = static_cast<size_t>(vertCount) * sizeof(waywal_ipc_mdl_vertex_t);
+        std::memcpy(dst, vertices.data(), vBytes);
+        dst += vBytes;
+        const size_t iBytes = static_cast<size_t>(triCount) * 3u * sizeof(uint16_t);
+        std::memcpy(dst, indices.data(), iBytes);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendPuppetSetMesh(uint32_t objectId, const std::vector<we_mdl_vertex_t> &vertices,
+                                  const std::vector<uint16_t> &indices, uint32_t flags)
+{
+    std::vector<waywal_ipc_mdl_vertex_t> wireVerts(vertices.size());
+    for (size_t i = 0; i < vertices.size(); ++i) {
+        const auto &src = vertices[i];
+        auto &dst = wireVerts[i];
+        for (int k = 0; k < 3; ++k) {
+            dst.pos[k] = src.pos[k];
+        }
+        for (int k = 0; k < 4; ++k) {
+            dst.blend_indices[k] = src.blend_indices[k];
+            dst.weight[k] = src.weight[k];
+        }
+        dst.texcoord[0] = src.texcoord[0];
+        dst.texcoord[1] = src.texcoord[1];
+    }
+    return sendPuppetSetMesh(objectId, flags, wireVerts, indices);
+}
+
+bool IpcClient::sendPuppetSetSkeleton(uint32_t objectId, uint32_t flags,
+                                      const std::vector<waywal_ipc_mdl_bone_t> &bones)
+{
+    if (bones.size() > WAYWAL_IPC_RIGGING_MAX_BONES) {
+        return false;
+    }
+
+    const size_t boneBytes = bones.size() * sizeof(waywal_ipc_mdl_bone_t);
+    const size_t totalBytes = sizeof(waywal_ipc_puppet_set_skeleton_t) + boneBytes;
+    if (totalBytes > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES) {
+        return false;
+    }
+
+    for (size_t i = 0; i < bones.size(); ++i) {
+        const auto &b = bones[i];
+        if (i == 0 && b.parent != 0xFFFFFFFFu) {
+            return false;
+        }
+        if (i > 0 && b.parent != 0xFFFFFFFFu && b.parent >= i) {
+            return false;
+        }
+        if (std::memchr(b.name, '\0', sizeof(b.name)) == nullptr ||
+            std::memchr(b.simulation_json, '\0', sizeof(b.simulation_json)) == nullptr) {
+            return false;
+        }
+        for (float f : b.local_trans) {
+            if (!std::isfinite(f)) {
+                return false;
+            }
+        }
+    }
+
+    waywal_ipc_puppet_set_skeleton_t req{};
+    req.object_id = objectId;
+    req.bone_count = static_cast<uint32_t>(bones.size());
+    req.flags = flags;
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_PUPPET_SET_SKELETON;
+    pkt.hdr.payload_size = static_cast<uint32_t>(totalBytes);
+    pkt.payload.resize(totalBytes);
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+    if (boneBytes > 0) {
+        std::memcpy(pkt.payload.data() + sizeof(req), bones.data(), boneBytes);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendPuppetSetSkeleton(const waywal_ipc_puppet_set_skeleton_t &req,
+                                      const std::vector<waywal_ipc_mdl_bone_t> &bones)
+{
+    return sendPuppetSetSkeleton(req.object_id, req.flags, bones);
+}
+
+bool IpcClient::sendPuppetSetSkeleton(uint32_t objectId,
+                                      const std::vector<waywal_ipc_mdl_bone_t> &bones,
+                                      uint32_t flags)
+{
+    return sendPuppetSetSkeleton(objectId, flags, bones);
+}
+
+bool IpcClient::sendPuppetSolveWeights(const waywal_ipc_puppet_solve_weights_t &req,
+                                       const std::vector<uint64_t> &lockedVertexBitset)
+{
+    if (!std::isfinite(req.falloff_power) || !std::isfinite(req.smoothness) ||
+        req.max_influences < 1u || req.max_influences > 4u || req.locked_vert_word_count > 1024u) {
+        return false;
+    }
+    if ((req.flags & 0x2u) != 0u) {
+        if (lockedVertexBitset.size() != req.locked_vert_word_count) {
+            return false;
+        }
+    } else if (req.locked_vert_word_count != 0u || !lockedVertexBitset.empty()) {
+        return false;
+    }
+
+    const size_t tailBytes = lockedVertexBitset.size() * sizeof(uint64_t);
+    const size_t totalBytes = sizeof(waywal_ipc_puppet_solve_weights_t) + tailBytes;
+    if (totalBytes > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES) {
+        return false;
+    }
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_PUPPET_SOLVE_WEIGHTS;
+    pkt.hdr.payload_size = static_cast<uint32_t>(totalBytes);
+    pkt.payload.resize(totalBytes);
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+    if (tailBytes > 0) {
+        std::memcpy(pkt.payload.data() + sizeof(req), lockedVertexBitset.data(), tailBytes);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendPuppetPaintWeights(uint32_t objectId, uint32_t flags,
+                                       const std::vector<waywal_ipc_vertex_weight_t> &entries)
+{
+    if (entries.empty() || entries.size() > WAYWAL_IPC_RIGGING_MAX_VERTICES) {
+        return false;
+    }
+
+    const size_t entryBytes = entries.size() * sizeof(waywal_ipc_vertex_weight_t);
+    const size_t totalBytes = sizeof(waywal_ipc_puppet_paint_weights_t) + entryBytes;
+    if (totalBytes > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES) {
+        return false;
+    }
+
+    for (const auto &e : entries) {
+        for (float w : e.weight) {
+            if (!std::isfinite(w)) {
+                return false;
+            }
+        }
+    }
+
+    waywal_ipc_puppet_paint_weights_t req{};
+    req.object_id = objectId;
+    req.entry_count = static_cast<uint32_t>(entries.size());
+    req.flags = flags;
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_PUPPET_PAINT_WEIGHTS;
+    pkt.hdr.payload_size = static_cast<uint32_t>(totalBytes);
+    pkt.payload.resize(totalBytes);
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+    std::memcpy(pkt.payload.data() + sizeof(req), entries.data(), entryBytes);
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendPuppetHeatmapMode(uint32_t objectId, bool enabled, uint16_t palette,
+                                      uint32_t activeBoneIdx, float opacity)
+{
+    if (palette > 2u || !std::isfinite(opacity)) {
+        return false;
+    }
+
+    waywal_ipc_puppet_heatmap_mode_t req{};
+    req.object_id = objectId;
+    req.enabled = enabled ? 1u : 0u;
+    req.palette = palette;
+    req.active_bone_idx = activeBoneIdx;
+    req.opacity = std::clamp(opacity, 0.0f, 1.0f);
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_PUPPET_SET_HEATMAP_MODE;
+    pkt.hdr.payload_size = sizeof(req);
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendPuppetHeatmapMode(const waywal_ipc_puppet_heatmap_mode_t &req)
+{
+    return sendPuppetHeatmapMode(req.object_id, req.enabled != 0u, req.palette, req.active_bone_idx,
+                                 req.opacity);
+}
+
+bool IpcClient::sendPuppetHeatmapMode(uint32_t objectId, bool enabled, uint32_t activeBoneIdx,
+                                      float opacity, we_heatmap_palette_t palette)
+{
+    return sendPuppetHeatmapMode(objectId, enabled, static_cast<uint16_t>(palette), activeBoneIdx,
+                                 opacity);
+}
+
+bool IpcClient::sendPuppetPreviewIk(const waywal_ipc_puppet_preview_ik_t &req,
+                                    const std::vector<waywal_ipc_bone_trs_t> &overrides)
+{
+    if (overrides.size() != req.override_count ||
+        req.override_count > WAYWAL_IPC_RIGGING_MAX_BONES) {
+        return false;
+    }
+    for (float f : req.target_world) {
+        if (!std::isfinite(f)) {
+            return false;
+        }
+    }
+    for (const auto &ov : overrides) {
+        for (int k = 0; k < 3; ++k) {
+            if (!std::isfinite(ov.local_pos[k]) || !std::isfinite(ov.local_angle[k]) ||
+                !std::isfinite(ov.local_scale[k])) {
+                return false;
+            }
+        }
+    }
+
+    const size_t tailBytes = overrides.size() * sizeof(waywal_ipc_bone_trs_t);
+    const size_t totalBytes = sizeof(waywal_ipc_puppet_preview_ik_t) + tailBytes;
+    if (totalBytes > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES) {
+        return false;
+    }
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_PUPPET_PREVIEW_IK;
+    pkt.hdr.payload_size = static_cast<uint32_t>(totalBytes);
+    pkt.payload.resize(totalBytes);
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+    if (tailBytes > 0) {
+        std::memcpy(pkt.payload.data() + sizeof(req), overrides.data(), tailBytes);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendPuppetSetAnimTracks(uint32_t objectId, uint32_t flags,
+                                        const std::vector<PuppetAnimClipData> &clips)
+{
+    if (clips.size() > WAYWAL_IPC_RIGGING_MAX_ANIMS) {
+        return false;
+    }
+
+    size_t totalBytes = sizeof(waywal_ipc_puppet_set_anim_tracks_t);
+    size_t totalKeyframes = 0;
+    for (const auto &clip : clips) {
+        if (std::memchr(clip.desc.name, '\0', sizeof(clip.desc.name)) == nullptr ||
+            std::memchr(clip.desc.mode_str, '\0', sizeof(clip.desc.mode_str)) == nullptr ||
+            !std::isfinite(clip.desc.fps) || !std::isfinite(clip.desc.layer_blend) ||
+            !std::isfinite(clip.desc.layer_rate)) {
+            return false;
+        }
+        totalBytes += sizeof(waywal_ipc_anim_clip_desc_t);
+        for (const auto &track : clip.tracks) {
+            totalBytes += sizeof(waywal_ipc_anim_track_desc_t);
+            totalKeyframes += track.keyframes.size();
+            if (totalKeyframes > WAYWAL_IPC_RIGGING_MAX_KEYFRAMES) {
+                return false;
+            }
+            for (const auto &kf : track.keyframes) {
+                for (int k = 0; k < 3; ++k) {
+                    if (!std::isfinite(kf.pos[k]) || !std::isfinite(kf.angle[k]) ||
+                        !std::isfinite(kf.scale[k])) {
+                        return false;
+                    }
+                }
+            }
+            totalBytes += track.keyframes.size() * sizeof(waywal_ipc_mdl_keyframe_t);
+            if (totalBytes > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES) {
+                return false;
+            }
+        }
+    }
+
+    waywal_ipc_puppet_set_anim_tracks_t req{};
+    req.object_id = objectId;
+    req.clip_count = static_cast<uint32_t>(clips.size());
+    req.flags = flags;
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_PUPPET_SET_ANIM_TRACKS;
+    pkt.hdr.payload_size = static_cast<uint32_t>(totalBytes);
+    pkt.payload.resize(totalBytes);
+
+    uint8_t *dst = pkt.payload.data();
+    std::memcpy(dst, &req, sizeof(req));
+    dst += sizeof(req);
+    for (const auto &clip : clips) {
+        waywal_ipc_anim_clip_desc_t clipDesc = clip.desc;
+        clipDesc.track_count = static_cast<uint32_t>(clip.tracks.size());
+        std::memcpy(dst, &clipDesc, sizeof(clipDesc));
+        dst += sizeof(clipDesc);
+        for (const auto &track : clip.tracks) {
+            waywal_ipc_anim_track_desc_t trackDesc = track.desc;
+            trackDesc.keyframe_count = static_cast<uint32_t>(track.keyframes.size());
+            std::memcpy(dst, &trackDesc, sizeof(trackDesc));
+            dst += sizeof(trackDesc);
+            if (!track.keyframes.empty()) {
+                const size_t kfBytes = track.keyframes.size() * sizeof(waywal_ipc_mdl_keyframe_t);
+                std::memcpy(dst, track.keyframes.data(), kfBytes);
+                dst += kfBytes;
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendPuppetScrubTime(uint32_t objectId, float timeSec, bool pausePlayback,
+                                    uint32_t flags)
+{
+    if (!std::isfinite(timeSec)) {
+        return false;
+    }
+
+    waywal_ipc_puppet_scrub_t req{};
+    req.object_id = objectId;
+    req.time_sec = timeSec;
+    req.pause_playback = pausePlayback ? 1u : 0u;
+    req.flags = flags;
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_PUPPET_SCRUB_TIME;
+    pkt.hdr.payload_size = sizeof(req);
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::expectsGenericOkForOpcode(uint16_t reqOpcode) noexcept
+{
+    // Allowlist only opcodes whose wire contract returns WAYWAL_RESP_OK so
+    // unrecognized or dedicated-response opcodes never desync the pending queue.
+    switch (reqOpcode) {
+    case WAYWAL_REQ_CLEAR:
+    case WAYWAL_REQ_SET_IMAGE:
+    case WAYWAL_REQ_SET_VIDEO:
+    case WAYWAL_REQ_TOGGLE:
+    case WAYWAL_REQ_PAUSE:
+    case WAYWAL_REQ_UNPAUSE:
+    case WAYWAL_REQ_KILL:
+    case WAYWAL_REQ_SLIDESHOW:
+    case WAYWAL_REQ_SHADER:
+    case WAYWAL_REQ_RESTORE:
+    case WAYWAL_REQ_SLIDESHOW_CTRL:
+    case WAYWAL_REQ_WORKSHOP:
+    case WAYWAL_REQ_SET_UNIFORM:
+    case WAYWAL_REQ_SUBSCRIBE:
+    case WAYWAL_REQ_AUDIO_CTRL:
+    case WAYWAL_REQ_SLIDESHOW_NEXT:
+    case WAYWAL_REQ_SLIDESHOW_PREV:
+    case WAYWAL_REQ_SET_SHADER_PARAM:
+    case WAYWAL_REQ_PUPPET_SET_SKELETON:
+    case WAYWAL_REQ_PUPPET_PAINT_WEIGHTS:
+    case WAYWAL_REQ_PUPPET_SET_HEATMAP_MODE:
+    case WAYWAL_REQ_PUPPET_SET_ANIM_TRACKS:
+    case WAYWAL_REQ_PUPPET_SCRUB_TIME:
+        return true;
+    case WAYWAL_REQ_SCENE_MUTATE:
+    case WAYWAL_REQ_HOT_RELOAD_CODE:
+    case WAYWAL_REQ_QUERY_SCENE_TREE:
+    case WAYWAL_REQ_SET_SHADER_COMBO:
+    case WAYWAL_REQ_BRUSH_STROKE:
+    case WAYWAL_REQ_PARTICLE_CONFIG:
+    case WAYWAL_REQ_SET_AUDIO_BINDINGS:
+    case WAYWAL_REQ_EXPORT_SCENE_PKG:
+    case WAYWAL_REQ_LINT_SCENESCRIPT:
+    case WAYWAL_REQ_READBACK_TEXTURE:
+    case WAYWAL_REQ_PUPPET_SET_MESH:
+    case WAYWAL_REQ_PUPPET_SOLVE_WEIGHTS:
+    case WAYWAL_REQ_PUPPET_PREVIEW_IK:
+    case WAYWAL_REQ_EXPORT_PUPPET_MDL:
+    default:
+        return false;
+    }
+}
+
+bool IpcClient::sendExportPuppetMdl(uint32_t objectId, uint32_t flags, const QString &outPath)
+{
+    waywal_ipc_export_puppet_mdl_t req{};
+    req.object_id = objectId;
+    req.flags = flags;
+
+    if ((flags & 0x2u) != 0u) {
+        const QString effectivePath = outPath.isEmpty() ? stagePuppetMdlExportPath() : outPath;
+        const QByteArray pathBa = effectivePath.toUtf8();
+        char resolved[sizeof(req.out_path)] = {};
+        if (effectivePath.isEmpty() || static_cast<size_t>(pathBa.size()) >= sizeof(req.out_path) ||
+            !waywal_ipc_export_path_is_allowed(pathBa.constData(), resolved, sizeof(resolved))) {
+            emit errorOccurred(
+                QStringLiteral("Rejected puppet .mdl export path outside Landlock staging root"));
+            return false;
+        }
+        const size_t resolvedLen = strnlen(resolved, sizeof(req.out_path) - 1u);
+        std::memcpy(req.out_path, resolved, resolvedLen);
+        req.out_path[resolvedLen] = '\0';
+    }
+
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.hdr.magic = WAYWAL_IPC_MAGIC;
+    pkt.hdr.version = WAYWAL_IPC_VERSION;
+    pkt.hdr.opcode = WAYWAL_REQ_EXPORT_PUPPET_MDL;
+    pkt.hdr.payload_size = sizeof(req);
     pkt.payload.resize(sizeof(req));
     std::memcpy(pkt.payload.data(), &req, sizeof(req));
 

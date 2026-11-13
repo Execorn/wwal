@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef WAYWAL_IPC_PROTO_H
 #define WAYWAL_IPC_PROTO_H
+#define WAYWAL_IPC_PROTO_IN_GUARD 1
 
 #include "waywal/bezier.h"
 #include "waywal/path.h"
@@ -694,5 +695,171 @@ bool daemon_ipc_dispatch_subscriber_fd(struct daemon_state *state, int fd);
 
 #include "waywal/ipc_proto_phase3.h"
 #include "waywal/ipc_proto_authoring.h"
+#ifndef WAYWAL_IPC_PROTO_RIGGING_H
+#include "waywal/ipc_proto_rigging.h"
+#define WAYWAL_IPC_RIGGING_STRUCTS_DEFINED 1
+#endif
+#undef WAYWAL_IPC_PROTO_IN_GUARD
 
 #endif /* WAYWAL_IPC_PROTO_H */
+
+#if defined(WAYWAL_IPC_PROTO_RIGGING_H) && !defined(WAYWAL_IPC_PROTO_IN_GUARD) &&                  \
+    !defined(WAYWAL_IPC_RIGGING_API_H)
+#if defined(WAYWAL_IPC_RIGGING_STRUCTS_DEFINED)
+#define WAYWAL_IPC_RIGGING_API_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+bool waywal_ipc_serialize_req_puppet_set_mesh(uint32_t object_id, uint32_t flags,
+                                              const waywal_ipc_mdl_vertex_t *vertices,
+                                              uint32_t vertex_count, const uint16_t *indices,
+                                              uint32_t triangle_count, waywal_ipc_hdr_t *out_hdr,
+                                              void *out_buf, size_t out_buf_cap,
+                                              size_t *out_total_len);
+bool waywal_ipc_validate_req_puppet_set_mesh(const void *payload, size_t payload_len,
+                                             const waywal_ipc_puppet_set_mesh_t **out_req,
+                                             const waywal_ipc_mdl_vertex_t **out_verts,
+                                             const uint16_t **out_indices);
+
+bool waywal_ipc_serialize_req_puppet_set_skeleton(uint32_t object_id, uint32_t flags,
+                                                  const waywal_ipc_mdl_bone_t *bones,
+                                                  uint32_t bone_count, waywal_ipc_hdr_t *out_hdr,
+                                                  void *out_buf, size_t out_buf_cap,
+                                                  size_t *out_total_len);
+bool waywal_ipc_validate_req_puppet_set_skeleton(const void *payload, size_t payload_len,
+                                                 const waywal_ipc_puppet_set_skeleton_t **out_req,
+                                                 const waywal_ipc_mdl_bone_t **out_bones);
+
+bool waywal_ipc_serialize_req_puppet_solve_weights(const waywal_ipc_puppet_solve_weights_t *params,
+                                                   const uint64_t *locked_vert_bs,
+                                                   waywal_ipc_hdr_t *out_hdr, void *out_buf,
+                                                   size_t out_buf_cap, size_t *out_total_len);
+bool waywal_ipc_validate_req_puppet_solve_weights(const void *payload, size_t payload_len,
+                                                  const waywal_ipc_puppet_solve_weights_t **out_req,
+                                                  const uint64_t **out_locked_bs);
+
+bool waywal_ipc_serialize_req_puppet_paint_weights(uint32_t object_id, uint32_t flags,
+                                                   const waywal_ipc_vertex_weight_t *entries,
+                                                   uint32_t entry_count, waywal_ipc_hdr_t *out_hdr,
+                                                   void *out_buf, size_t out_buf_cap,
+                                                   size_t *out_total_len);
+bool waywal_ipc_validate_req_puppet_paint_weights(const void *payload, size_t payload_len,
+                                                  const waywal_ipc_puppet_paint_weights_t **out_req,
+                                                  const waywal_ipc_vertex_weight_t **out_entries);
+
+bool waywal_ipc_serialize_req_puppet_heatmap_mode(const waywal_ipc_puppet_heatmap_mode_t *mode,
+                                                  waywal_ipc_hdr_t *out_hdr,
+                                                  waywal_ipc_puppet_heatmap_mode_t *out_payload);
+bool waywal_ipc_validate_req_puppet_heatmap_mode(const void *payload, size_t payload_len,
+                                                 const waywal_ipc_puppet_heatmap_mode_t **out_req);
+
+bool waywal_ipc_serialize_req_puppet_preview_ik(const waywal_ipc_puppet_preview_ik_t *params,
+                                                const waywal_ipc_bone_trs_t *overrides,
+                                                waywal_ipc_hdr_t *out_hdr, void *out_buf,
+                                                size_t out_buf_cap, size_t *out_total_len);
+bool waywal_ipc_validate_req_puppet_preview_ik(const void *payload, size_t payload_len,
+                                               const waywal_ipc_puppet_preview_ik_t **out_req,
+                                               const waywal_ipc_bone_trs_t **out_overrides);
+
+bool waywal_ipc_serialize_req_puppet_set_anim_tracks(uint32_t object_id, uint32_t clip_count,
+                                                     uint32_t flags, const void *clips_blob,
+                                                     size_t clips_blob_len,
+                                                     waywal_ipc_hdr_t *out_hdr, void *out_buf,
+                                                     size_t out_buf_cap, size_t *out_total_len);
+bool waywal_ipc_validate_req_puppet_set_anim_tracks(
+    const void *payload, size_t payload_len, const waywal_ipc_puppet_set_anim_tracks_t **out_req,
+    const uint8_t **out_clips_blob, size_t *out_clips_blob_len);
+
+bool waywal_ipc_serialize_req_puppet_scrub_time(const waywal_ipc_puppet_scrub_t *scrub,
+                                                waywal_ipc_hdr_t *out_hdr,
+                                                waywal_ipc_puppet_scrub_t *out_payload);
+bool waywal_ipc_validate_req_puppet_scrub_time(const void *payload, size_t payload_len,
+                                               const waywal_ipc_puppet_scrub_t **out_req);
+
+bool waywal_ipc_serialize_req_export_puppet_mdl(uint32_t object_id, uint32_t flags,
+                                                const char *out_path, waywal_ipc_hdr_t *out_hdr,
+                                                waywal_ipc_export_puppet_mdl_t *out_payload);
+bool waywal_ipc_validate_req_export_puppet_mdl(const void *payload, size_t payload_len,
+                                               const waywal_ipc_export_puppet_mdl_t **out_req);
+
+bool waywal_ipc_serialize_resp_puppet_mesh_ack(int32_t status, uint32_t object_id,
+                                               uint32_t vertex_count, uint32_t triangle_count,
+                                               waywal_ipc_hdr_t *out_hdr,
+                                               waywal_ipc_puppet_mesh_ack_t *out_resp);
+bool waywal_ipc_validate_resp_puppet_mesh_ack(const void *payload, size_t payload_len,
+                                              const waywal_ipc_puppet_mesh_ack_t **out_resp);
+
+bool waywal_ipc_serialize_resp_puppet_weights(int32_t status, uint32_t object_id,
+                                              const waywal_ipc_vertex_weight_t *entries,
+                                              uint32_t entry_count, waywal_ipc_hdr_t *out_hdr,
+                                              void *out_buf, size_t out_buf_cap,
+                                              size_t *out_total_len);
+bool waywal_ipc_validate_resp_puppet_weights(const void *payload, size_t payload_len,
+                                             const waywal_ipc_puppet_weights_resp_t **out_resp,
+                                             const waywal_ipc_vertex_weight_t **out_entries);
+
+bool waywal_ipc_serialize_resp_puppet_ik_pose(int32_t status, uint32_t object_id,
+                                              const waywal_ipc_bone_trs_t *bones,
+                                              uint32_t bone_count, waywal_ipc_hdr_t *out_hdr,
+                                              void *out_buf, size_t out_buf_cap,
+                                              size_t *out_total_len);
+bool waywal_ipc_validate_resp_puppet_ik_pose(const void *payload, size_t payload_len,
+                                             const waywal_ipc_puppet_ik_pose_resp_t **out_resp,
+                                             const waywal_ipc_bone_trs_t **out_bones);
+
+bool waywal_ipc_serialize_resp_export_puppet_mdl(int32_t status, uint32_t object_id,
+                                                 const void *mdl_blob, uint32_t mdl_byte_size,
+                                                 waywal_ipc_hdr_t *out_hdr, void *out_buf,
+                                                 size_t out_buf_cap, size_t *out_total_len);
+bool waywal_ipc_validate_resp_export_puppet_mdl(
+    const void *payload, size_t payload_len, const waywal_ipc_export_puppet_mdl_resp_t **out_resp,
+    const uint8_t **out_mdl_blob);
+
+struct daemon_state;
+bool daemon_dispatch_rigging_ipc(struct daemon_state *state, int client_fd,
+                                 const waywal_ipc_hdr_t *hdr, int attached_fd);
+bool daemon_dispatch_ipc_req_puppet_set_mesh(struct daemon_state *state,
+                                             const waywal_ipc_puppet_set_mesh_t *req,
+                                             const waywal_ipc_mdl_vertex_t *verts,
+                                             const uint16_t *indices,
+                                             waywal_ipc_puppet_mesh_ack_t *resp);
+bool daemon_dispatch_ipc_req_puppet_set_skeleton(struct daemon_state *state,
+                                                 const waywal_ipc_puppet_set_skeleton_t *req,
+                                                 const waywal_ipc_mdl_bone_t *bones);
+bool daemon_dispatch_ipc_req_puppet_solve_weights(struct daemon_state *state,
+                                                  const waywal_ipc_puppet_solve_weights_t *req,
+                                                  const uint64_t *locked_bs,
+                                                  waywal_ipc_puppet_weights_resp_t *resp,
+                                                  waywal_ipc_vertex_weight_t **out_entries,
+                                                  uint32_t *out_entry_count);
+bool daemon_dispatch_ipc_req_puppet_paint_weights(struct daemon_state *state,
+                                                  const waywal_ipc_puppet_paint_weights_t *req,
+                                                  const waywal_ipc_vertex_weight_t *entries);
+bool daemon_dispatch_ipc_req_puppet_set_heatmap_mode(struct daemon_state *state,
+                                                     const waywal_ipc_puppet_heatmap_mode_t *req);
+bool daemon_dispatch_ipc_req_puppet_preview_ik(struct daemon_state *state,
+                                               const waywal_ipc_puppet_preview_ik_t *req,
+                                               const waywal_ipc_bone_trs_t *overrides,
+                                               waywal_ipc_puppet_ik_pose_resp_t *resp,
+                                               waywal_ipc_bone_trs_t **out_bones,
+                                               uint32_t *out_bone_count);
+bool daemon_dispatch_ipc_req_puppet_set_anim_tracks(struct daemon_state *state,
+                                                    const waywal_ipc_puppet_set_anim_tracks_t *req,
+                                                    const uint8_t *clips_blob,
+                                                    size_t clips_blob_len);
+bool daemon_dispatch_ipc_req_puppet_scrub_time(struct daemon_state *state,
+                                               const waywal_ipc_puppet_scrub_t *req);
+bool daemon_dispatch_ipc_req_export_puppet_mdl(struct daemon_state *state,
+                                               const waywal_ipc_export_puppet_mdl_t *req,
+                                               waywal_ipc_export_puppet_mdl_resp_t *resp,
+                                               uint8_t **out_mdl_blob, uint32_t *out_mdl_size);
+
+#ifdef __cplusplus
+}
+#endif
+#else
+#define WAYWAL_IPC_RIGGING_STRUCTS_DEFINED 1
+#endif
+#endif

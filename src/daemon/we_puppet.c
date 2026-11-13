@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/we_puppet.h"
+#include "waywal/we_mesh_rig.h"
 #include "waywal/we_physics.h"
 
 #include "waywal/log.h"
@@ -1670,8 +1671,15 @@ void we_puppet_draw_gl(we_puppet_t *puppet, uint32_t gl_prog, double time_sec)
     }
 
     if (puppet->bone_count > 0u && puppet->skin_mats) {
-        we_puppet_eval_skin_matrices(puppet, puppet->layers, puppet->layer_count, time_sec,
-                                     puppet->skin_mats);
+        double eval_time = puppet->playback_paused ? puppet->preview_time_sec : time_sec;
+        if (puppet->rig_ctx || puppet->playback_paused) {
+            we_puppet_eval_skin_matrices_ex(puppet, puppet->layers, puppet->layer_count,
+                                            (const we_rig_pose_ctx_t *)puppet->rig_ctx, eval_time,
+                                            puppet->skin_mats);
+        } else {
+            we_puppet_eval_skin_matrices(puppet, puppet->layers, puppet->layer_count, eval_time,
+                                         puppet->skin_mats);
+        }
         uint32_t bcnt = puppet->bone_count;
         if (bcnt > WE_MDL_MAX_BONES) {
             bcnt = WE_MDL_MAX_BONES;
@@ -1752,6 +1760,13 @@ void we_puppet_draw_gl(we_puppet_t *puppet, uint32_t gl_prog, double time_sec)
     }
 
     glDrawElements(GL_TRIANGLES, (GLsizei)puppet->index_count, GL_UNSIGNED_SHORT, (const void *)0);
+
+    if (puppet->heatmap_mode != 0u) {
+        we_mesh_rig_draw_heatmap_gl(
+            puppet, puppet->skin_mats ? (const float (*)[16])puppet->skin_mats : NULL,
+            puppet->heatmap_mode, puppet->heatmap_palette, puppet->heatmap_active_bone,
+            puppet->heatmap_opacity);
+    }
 }
 
 void we_puppet_destroy(we_puppet_t *puppet)
@@ -1791,6 +1806,10 @@ void we_puppet_destroy(we_puppet_t *puppet)
     if (puppet->physics_ctx) {
         free(puppet->physics_ctx);
         puppet->physics_ctx = NULL;
+    }
+    if (puppet->rig_ctx) {
+        free(puppet->rig_ctx);
+        puppet->rig_ctx = NULL;
     }
     free(puppet->bones);
     free(puppet->skin_mats);

@@ -32,9 +32,12 @@
 #include <QMessageBox>
 #include <QPointer>
 #include <QProcess>
+#include <QSaveFile>
+#include <QScopedValueRollback>
 #include <QSignalBlocker>
 #include <QStandardPaths>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -182,6 +185,11 @@ class MonitorTopologyBar : public QWidget {
 #include "studio/audio/audio_binding_wizard.hpp"
 #include "studio/editor/glsl_scenescript_editor_widget.hpp"
 #include "studio/core/command_bus_authoring.hpp"
+#include "studio/core/rigging_commands.hpp"
+#include "studio/rigging/puppet_mesh_panel.hpp"
+#include "studio/rigging/bone_rigging_panel.hpp"
+#include "studio/rigging/weight_paint_panel.hpp"
+#include "studio/rigging/dope_sheet_timeline_widget.hpp"
 #include "waywal/we_pkg.h"
 #include "waywal/we_vdf.h"
 #include "waywal/wwpkg.h"
@@ -204,6 +212,86 @@ QString normalizeTargetOutputSpec(const QString &targetOutput)
         return QStringLiteral("*");
     }
     return trimmed;
+}
+
+void composeBoneLocalMat4(const float pos[3], const float angle[3], const float scale[3],
+                          float out[16]) noexcept
+{
+    const float cx = std::cos(angle[0]);
+    const float sx = std::sin(angle[0]);
+    const float cy = std::cos(angle[1]);
+    const float sy = std::sin(angle[1]);
+    const float cz = std::cos(angle[2]);
+    const float sz = std::sin(angle[2]);
+
+    out[0] = (cz * cy) * scale[0];
+    out[1] = (sz * cy) * scale[0];
+    out[2] = (-sy) * scale[0];
+    out[3] = 0.0f;
+
+    out[4] = (cz * sy * sx - sz * cx) * scale[1];
+    out[5] = (sz * sy * sx + cz * cx) * scale[1];
+    out[6] = (cy * sx) * scale[1];
+    out[7] = 0.0f;
+
+    out[8] = (cz * sy * cx + sz * sx) * scale[2];
+    out[9] = (sz * sy * cx - cz * sx) * scale[2];
+    out[10] = (cy * cx) * scale[2];
+    out[11] = 0.0f;
+
+    out[12] = pos[0];
+    out[13] = pos[1];
+    out[14] = pos[2];
+    out[15] = 1.0f;
+}
+
+std::vector<std::array<float, 16>>
+resolveBoneWorldMatrices(const std::vector<we_mdl_bone_t> &bones,
+                         const std::vector<std::array<float, 16>> &localMats)
+{
+    const size_t boneCount = std::min(bones.size(), localMats.size());
+    std::vector<std::array<float, 16>> worldMats(boneCount);
+    auto mulColMajor = [](const float *a, const float *b, float *out) {
+        for (int col = 0; col < 4; ++col) {
+            for (int row = 0; row < 4; ++row) {
+                out[col * 4 + row] =
+                    a[0 * 4 + row] * b[col * 4 + 0] + a[1 * 4 + row] * b[col * 4 + 1] +
+                    a[2 * 4 + row] * b[col * 4 + 2] + a[3 * 4 + row] * b[col * 4 + 3];
+            }
+        }
+    };
+
+    std::vector<uint8_t> visitState(boneCount, 0u);
+    std::vector<size_t> stack;
+    stack.reserve(boneCount);
+    for (size_t i = 0; i < boneCount; ++i) {
+        if (visitState[i] == 2u) {
+            continue;
+        }
+        stack.clear();
+        size_t cur = i;
+        while (cur < boneCount && visitState[cur] == 0u) {
+            visitState[cur] = 1u;
+            stack.push_back(cur);
+            const uint32_t p = bones[cur].parent;
+            if (p == 0xFFFFFFFFu || p >= boneCount) {
+                break;
+            }
+            cur = static_cast<size_t>(p);
+        }
+        while (!stack.empty()) {
+            const size_t idx = stack.back();
+            stack.pop_back();
+            const uint32_t p = bones[idx].parent;
+            if (p != 0xFFFFFFFFu && p < boneCount && visitState[p] == 2u) {
+                mulColMajor(worldMats[p].data(), localMats[idx].data(), worldMats[idx].data());
+            } else {
+                worldMats[idx] = localMats[idx];
+            }
+            visitState[idx] = 2u;
+        }
+    }
+    return worldMats;
 }
 
 QString resolveLocalWwpkgFile(const QString &packageIdOrPath,
@@ -573,6 +661,10 @@ GpuBrushPainterWidget *MainWindow::brushPainter() const { return m_brushPainter;
 ParticleDesignerWidget *MainWindow::particleDesigner() const { return m_particleDesigner; }
 AudioBindingWizard *MainWindow::audioBindingWizard() const { return m_audioBindingWizard; }
 GlslSceneScriptEditorWidget *MainWindow::codeEditor() const { return m_codeEditor; }
+PuppetMeshPanel *MainWindow::puppetMeshPanel() const { return m_puppetMeshPanel; }
+BoneRiggingPanel *MainWindow::boneRiggingPanel() const { return m_boneRiggingPanel; }
+WeightPaintPanel *MainWindow::weightPaintPanel() const { return m_weightPaintPanel; }
+DopeSheetTimelineWidget *MainWindow::dopeSheetTimeline() const { return m_dopeSheetTimeline; }
 
 void MainWindow::setupPanels()
 {
@@ -690,12 +782,28 @@ void MainWindow::setupPanels()
                 tree->loadFromSceneJson(m_lastSceneTreeJson);
             }
             connect(tree, &SceneLayerTreeWidget::objectSelected, this,
-                    [this, tree](int32_t objectId, we_scene_node_kind_t /*kind*/) {
+                    [this, tree](int32_t objectId, we_scene_node_kind_t kind) {
                         if (m_previewViewport) {
                             m_previewViewport->setGizmoActiveNode(tree->selectedNode());
                         }
                         if (m_propertyInspector) {
                             m_propertyInspector->setTargetObjectId(objectId, 0);
+                        }
+                        if (objectId >= 0 && kind == WE_NODE_IMAGE) {
+                            const auto *node = tree->selectedNode();
+                            const uint32_t texW =
+                                (node && node->size[0] >= 1.0f)
+                                    ? static_cast<uint32_t>(std::lround(node->size[0]))
+                                    : (m_previewViewport && m_previewViewport->contentWidth() > 0u
+                                           ? m_previewViewport->contentWidth()
+                                           : 512u);
+                            const uint32_t texH =
+                                (node && node->size[1] >= 1.0f)
+                                    ? static_cast<uint32_t>(std::lround(node->size[1]))
+                                    : (m_previewViewport && m_previewViewport->contentHeight() > 0u
+                                           ? m_previewViewport->contentHeight()
+                                           : 512u);
+                            setActivePuppetObjectContext(objectId, texW, texH);
                         }
                     });
             connect(tree, &SceneLayerTreeWidget::statusMessage, this, [this](const QString &msg) {
@@ -819,6 +927,267 @@ void MainWindow::setupPanels()
             }
             m_codeEditor = editor;
             return editor;
+        },
+        Qt::BottomDockWidgetArea);
+
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("PuppetMeshPanel"), QStringLiteral("Puppet Mesh"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *panel = new PuppetMeshPanel(parent);
+            panel->setCommandBus(m_commandBus.get());
+            panel->setIpcClient(m_ipcClient.get());
+            connect(panel, &PuppetMeshPanel::meshGenerated, this,
+                    [this, panel](int32_t objectId, uint32_t /*vertexCount*/,
+                                  uint32_t /*triangleCount*/, float /*minAngleDeg*/) {
+                        if (objectId >= 0) {
+                            m_activePuppetObjectId = objectId;
+                            m_cachedPuppetMesh = PuppetMeshSnapshot{};
+                            m_cachedPuppetMesh.objectId = objectId;
+                            const auto &res = panel->lastResult();
+                            if (res.vertices && res.vertex_count > 0u) {
+                                m_cachedPuppetMesh.vertices.assign(res.vertices,
+                                                                   res.vertices + res.vertex_count);
+                            }
+                            if (res.indices && res.triangle_count > 0u) {
+                                m_cachedPuppetMesh.indices.assign(
+                                    res.indices,
+                                    res.indices + static_cast<size_t>(res.triangle_count) * 3u);
+                            }
+                            m_cachedPuppetMesh.pins = panel->pins();
+                        }
+                        if (m_previewViewport) {
+                            m_previewViewport->setPuppetObjectId(objectId);
+                            m_previewViewport->setPuppetMeshWireframe(panel->isWireframeVisible(),
+                                                                      panel->lastResult());
+                            m_previewViewport->setPuppetContourPins(panel->pins(), -1);
+                        }
+                        if (m_weightPaintPanel) {
+                            hydrateWeightPaintPanel(m_weightPaintPanel);
+                        }
+                    });
+            connect(panel, &PuppetMeshPanel::wireframeOverlayRequested, this,
+                    [this](bool visible, const we_mesh_gen_result_t &mesh) {
+                        if (m_previewViewport) {
+                            m_previewViewport->setPuppetMeshWireframe(visible, mesh);
+                        }
+                    });
+            connect(panel, &PuppetMeshPanel::contourPinsChanged, this,
+                    [this](int32_t objectId, const std::vector<we_cdt_pin_t> &pins) {
+                        if (objectId >= 0 && m_cachedPuppetMesh.objectId == objectId) {
+                            m_cachedPuppetMesh.pins = pins;
+                        }
+                        if (m_previewViewport && m_previewViewport->puppetObjectId() == objectId) {
+                            m_previewViewport->setPuppetContourPins(pins, -1);
+                        }
+                    });
+            connect(
+                panel, &PuppetMeshPanel::exportMdlRequested, this,
+                [this](int32_t objectId, const QString &destPath) {
+                    if (!m_ipcClient || objectId < 0 || destPath.isEmpty()) {
+                        return;
+                    }
+                    m_pendingMdlExportPaths[objectId] = destPath;
+                    char resolved[512] = {};
+                    const QByteArray pathBa = destPath.toUtf8();
+                    const bool inAllowedDir =
+                        static_cast<size_t>(pathBa.size()) < sizeof(resolved) &&
+                        waywal_ipc_export_path_is_allowed(pathBa.constData(), resolved,
+                                                          sizeof(resolved));
+                    const uint32_t flags = inAllowedDir ? 0x3u : 0x1u;
+                    if (!m_ipcClient->sendExportPuppetMdl(static_cast<uint32_t>(objectId), flags,
+                                                          inAllowedDir ? destPath : QString())) {
+                        m_pendingMdlExportPaths.erase(objectId);
+                    }
+                });
+            connect(panel, &PuppetMeshPanel::statusMessage, this, [this](const QString &msg) {
+                if (m_statusLabel) {
+                    m_statusLabel->setText(msg);
+                }
+            });
+            if (m_activePuppetObjectId >= 0) {
+                panel->setTargetObjectId(m_activePuppetObjectId, m_activePuppetTexWidth,
+                                         m_activePuppetTexHeight);
+            }
+            m_puppetMeshPanel = panel;
+            return panel;
+        },
+        Qt::LeftDockWidgetArea);
+
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("BoneRiggingPanel"), QStringLiteral("Bone Rigging"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *panel = new BoneRiggingPanel(parent);
+            panel->setCommandBus(m_commandBus.get());
+            panel->setIpcClient(m_ipcClient.get());
+            connect(panel, &BoneRiggingPanel::boneSelected, this, [this](int32_t boneIndex) {
+                if (m_previewViewport) {
+                    m_previewViewport->setSelectedPuppetBone(boneIndex);
+                }
+                if (m_weightPaintPanel) {
+                    m_weightPaintPanel->setActiveBone(boneIndex);
+                }
+                if (m_physicsSpringInspector) {
+                    m_physicsSpringInspector->selectBoneIndex(boneIndex);
+                }
+            });
+            connect(
+                panel, &BoneRiggingPanel::skeletonUpdated, this,
+                [this, panel](int32_t objectId, const BoneHierarchySnapshot &snapshot) {
+                    if (objectId >= 0) {
+                        m_activePuppetObjectId = objectId;
+                    }
+                    m_cachedPuppetRig = snapshot;
+                    m_hasCachedPuppetRig = true;
+
+                    if (m_previewViewport) {
+                        m_previewViewport->setPuppetObjectId(objectId);
+                        m_previewViewport->setPuppetSkeleton(snapshot, panel->selectedBoneIndex());
+                    }
+                    if (m_physicsSpringInspector && !m_syncingBoneDriveMode) {
+                        const QScopedValueRollback<bool> guard(m_syncingBoneDriveMode, true);
+                        std::vector<QString> names;
+                        std::vector<int32_t> parents;
+                        names.reserve(snapshot.bones.size());
+                        parents.reserve(snapshot.bones.size());
+                        for (size_t i = 0; i < snapshot.bones.size(); ++i) {
+                            QString bName = QString::fromUtf8(snapshot.bones[i].name).trimmed();
+                            if (bName.isEmpty()) {
+                                bName = QStringLiteral("Bone %1").arg(i);
+                            }
+                            names.push_back(bName);
+                            parents.push_back(snapshot.bones[i].parent == 0xFFFFFFFFu
+                                                  ? -1
+                                                  : static_cast<int32_t>(snapshot.bones[i].parent));
+                        }
+                        m_physicsSpringInspector->setBoneList(names, parents, objectId);
+                        m_physicsSpringInspector->setBoneDriveModes(snapshot.driveModes);
+                    }
+                    if (m_weightPaintPanel) {
+                        hydrateWeightPaintPanel(m_weightPaintPanel);
+                    }
+                    if (m_dopeSheetTimeline) {
+                        hydrateDopeSheetTimeline(m_dopeSheetTimeline);
+                    }
+                    if (m_onionSkinEnabled) {
+                        refreshOnionSkinFrames();
+                    }
+                });
+            connect(panel, &BoneRiggingPanel::ikPreviewRequested, this,
+                    [this](int32_t objectId, const we_ik_chain_t &chain) {
+                        if (m_ipcClient && objectId >= 0) {
+                            waywal_ipc_puppet_preview_ik_t req{};
+                            req.object_id = static_cast<uint32_t>(objectId);
+                            req.root_bone = chain.root_bone;
+                            req.mid_bone = chain.mid_bone;
+                            req.end_bone = chain.end_bone;
+                            req.pole_flip = (chain.bend_sign < 0) ? 1u : 0u;
+                            req.target_world[0] = chain.target_world[0];
+                            req.target_world[1] = chain.target_world[1];
+                            req.target_world[2] = chain.target_world[2];
+                            req.mode_flags = 1u;
+                            m_ipcClient->sendPuppetPreviewIk(req);
+                        }
+                    });
+            connect(panel, &BoneRiggingPanel::statusMessage, this, [this](const QString &msg) {
+                if (m_statusLabel) {
+                    m_statusLabel->setText(msg);
+                }
+            });
+            if (m_hasCachedPuppetRig && (m_activePuppetObjectId < 0 ||
+                                         m_cachedPuppetRig.objectId == m_activePuppetObjectId)) {
+                we_puppet_t puppet{};
+                std::vector<we_mdl_bone_t> bones = m_cachedPuppetRig.bones;
+                puppet.bone_count = static_cast<uint32_t>(bones.size());
+                puppet.bones = bones.empty() ? nullptr : bones.data();
+                panel->loadPuppetRig(&puppet, m_cachedPuppetRig.objectId);
+            } else if (m_activePuppetObjectId >= 0) {
+                panel->loadPuppetRig(nullptr, m_activePuppetObjectId);
+            }
+            const int32_t rigObjectId = panel->rigSnapshot().objectId;
+            if (const auto pendIt = m_pendingDriveModes.find(rigObjectId);
+                pendIt != m_pendingDriveModes.end()) {
+                const QScopedValueRollback<bool> guard(m_syncingBoneDriveMode, true);
+                for (const auto &[boneIdx, mode] : pendIt->second) {
+                    panel->setBoneDriveMode(rigObjectId, boneIdx, mode);
+                }
+                m_pendingDriveModes.erase(pendIt);
+            }
+            m_boneRiggingPanel = panel;
+            return panel;
+        },
+        Qt::LeftDockWidgetArea);
+
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("WeightPaintPanel"), QStringLiteral("Weight Paint"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *panel = new WeightPaintPanel(parent);
+            panel->setCommandBus(m_commandBus.get());
+            panel->setIpcClient(m_ipcClient.get());
+            connect(panel, &WeightPaintPanel::heatmapModeChanged, this,
+                    [this](int32_t /*objectId*/, bool enabled, uint32_t activeBoneIdx,
+                           float opacity, we_heatmap_palette_t palette) {
+                        if (m_previewViewport) {
+                            m_previewViewport->setWeightHeatmapMode(enabled, activeBoneIdx, opacity,
+                                                                    palette);
+                        }
+                    });
+            connect(panel, &WeightPaintPanel::normalizeAllWeightsRequested, this,
+                    [this](int32_t objectId, uint64_t lockMaskLo, uint64_t lockMaskHi) {
+                        if (m_previewViewport && objectId >= 0) {
+                            m_previewViewport->normalizeAllVertexWeights(
+                                objectId, std::array<uint64_t, 2>{lockMaskLo, lockMaskHi});
+                        }
+                    });
+            connect(panel, &WeightPaintPanel::brushParamsChanged, this, [this, panel]() {
+                if (m_previewViewport) {
+                    m_previewViewport->setWeightBrushParameters(
+                        panel->activeBrushOp(), panel->brushRadiusPx(), panel->brushStrength(),
+                        panel->targetWeightValue(), panel->lockedBoneMask());
+                }
+            });
+            connect(panel, &WeightPaintPanel::statusMessage, this, [this](const QString &msg) {
+                if (m_statusLabel) {
+                    m_statusLabel->setText(msg);
+                }
+            });
+            hydrateWeightPaintPanel(panel);
+            m_weightPaintPanel = panel;
+            return panel;
+        },
+        Qt::RightDockWidgetArea);
+
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("DopeSheetTimelineWidget"), QStringLiteral("Timeline / Dope-Sheet"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *timeline = new DopeSheetTimelineWidget(parent);
+            timeline->setCommandBus(m_commandBus.get());
+            timeline->setIpcClient(m_ipcClient.get());
+            connect(timeline, &DopeSheetTimelineWidget::frameChanged, this,
+                    [this](double /*frame*/, double /*timeSec*/) {
+                        if (m_onionSkinEnabled) {
+                            refreshOnionSkinFrames();
+                        }
+                    });
+            connect(timeline, &DopeSheetTimelineWidget::onionSkinChanged, this,
+                    [this](bool enabled, int beforeFrames, int afterFrames, float opacity) {
+                        m_onionSkinEnabled = enabled;
+                        m_onionBeforeFrames = std::clamp(beforeFrames, 0, 8);
+                        m_onionAfterFrames = std::clamp(afterFrames, 0, 8);
+                        m_onionOpacity = std::clamp(opacity, 0.05f, 1.0f);
+                        if (m_previewViewport) {
+                            m_previewViewport->setOnionSkinEnabled(enabled);
+                            refreshOnionSkinFrames();
+                        }
+                    });
+            connect(timeline, &DopeSheetTimelineWidget::statusMessage, this,
+                    [this](const QString &msg) {
+                        if (m_statusLabel) {
+                            m_statusLabel->setText(msg);
+                        }
+                    });
+            hydrateDopeSheetTimeline(timeline);
+            m_dopeSheetTimeline = timeline;
+            return timeline;
         },
         Qt::BottomDockWidgetArea);
 
@@ -1000,6 +1369,11 @@ void MainWindow::setupMenuBar()
     connect(monitorPerspAction, &QAction::triggered, this,
             [this]() { handlePerspectiveSelected(QStringLiteral("Multi-Monitor")); });
 
+    auto *riggingPerspAction = perspsMenu->addAction(QStringLiteral("&7 Rigging && Animation"));
+    riggingPerspAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+7")));
+    connect(riggingPerspAction, &QAction::triggered, this,
+            [this]() { handlePerspectiveSelected(QStringLiteral("Rigging & Animation")); });
+
     perspsMenu->addSeparator();
 
     auto *resetLayoutAction = perspsMenu->addAction(QStringLiteral("&Reset Layout"));
@@ -1069,7 +1443,8 @@ void MainWindow::setupToolBar()
     m_perspectiveCombo->addItems({QStringLiteral("Default"), QStringLiteral("Shader Coding"),
                                   QStringLiteral("Scene Composer"),
                                   QStringLiteral("Particle & Audio"),
-                                  QStringLiteral("Theme Studio"), QStringLiteral("Multi-Monitor")});
+                                  QStringLiteral("Theme Studio"), QStringLiteral("Multi-Monitor"),
+                                  QStringLiteral("Rigging & Animation")});
     connect(m_perspectiveCombo, &QComboBox::currentTextChanged, this, [this](const QString &text) {
         if (!m_updatingPerspectiveCombo) {
             handlePerspectiveSelected(text);
@@ -1091,7 +1466,9 @@ void MainWindow::setupToolBar()
     m_toolModeCombo->addItems(
         {QStringLiteral("Navigate"), QStringLiteral("Select"), QStringLiteral("Translate"),
          QStringLiteral("Rotate"), QStringLiteral("Scale"), QStringLiteral("Brush: Mask"),
-         QStringLiteral("Brush: Flow"), QStringLiteral("Brush: Blur/Smudge")});
+         QStringLiteral("Brush: Flow"), QStringLiteral("Brush: Blur/Smudge"),
+         QStringLiteral("Rig: Contour Pin"), QStringLiteral("Rig: Bone Place"),
+         QStringLiteral("Rig: IK Drag"), QStringLiteral("Rig: Weight Brush")});
     connect(m_toolModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             &MainWindow::handleViewportToolModeChanged);
     toolbar->addWidget(m_toolModeCombo);
@@ -1709,6 +2086,353 @@ void MainWindow::wireInterPanelSignals()
                 }
             });
     }
+
+    if (m_physicsSpringInspector) {
+        connect(m_physicsSpringInspector, &PhysicsSpringInspectorWidget::boneDriveModeChanged, this,
+                [this](int32_t objectId, int32_t boneIndex, we_bone_drive_mode_t mode) {
+                    if (m_syncingBoneDriveMode) {
+                        return;
+                    }
+                    const QScopedValueRollback<bool> guard(m_syncingBoneDriveMode, true);
+                    if (m_hasCachedPuppetRig && m_cachedPuppetRig.objectId == objectId &&
+                        boneIndex >= 0 && boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+                        m_cachedPuppetRig.driveModes[static_cast<size_t>(boneIndex)] = mode;
+                    }
+                    if (m_boneRiggingPanel) {
+                        m_boneRiggingPanel->setBoneDriveMode(objectId, boneIndex, mode);
+                    } else if (objectId >= 0 && boneIndex >= 0 &&
+                               boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+                        m_pendingDriveModes[objectId][boneIndex] = mode;
+                    }
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(QStringLiteral("Bone %1 drive mode: %2")
+                                                   .arg(boneIndex)
+                                                   .arg(mode == WE_BONE_DRIVE_XPBD
+                                                            ? QStringLiteral("XPBD Active")
+                                                            : QStringLiteral("FK/Rigid")));
+                    }
+                });
+    }
+
+    if (m_previewViewport) {
+        connect(m_previewViewport, &GpuPreviewViewport::contourPinAdded, this,
+                [this](int32_t /*objectId*/, double px, double py) {
+                    if (m_layoutManager && !m_puppetMeshPanel) {
+                        m_layoutManager->realizeLazyPanel(QStringLiteral("PuppetMeshPanel"));
+                    }
+                    if (m_puppetMeshPanel) {
+                        m_puppetMeshPanel->addConstraintPin(px, py);
+                        m_previewViewport->setPuppetContourPins(
+                            m_puppetMeshPanel->pins(),
+                            static_cast<int32_t>(m_puppetMeshPanel->pins().size()) - 1);
+                    }
+                });
+
+        connect(m_previewViewport, &GpuPreviewViewport::puppetBoneSelected, this,
+                [this](int32_t boneIndex) {
+                    if (m_boneRiggingPanel) {
+                        m_boneRiggingPanel->selectBone(boneIndex);
+                    }
+                    if (m_weightPaintPanel) {
+                        m_weightPaintPanel->setActiveBone(boneIndex);
+                    }
+                    if (m_physicsSpringInspector) {
+                        m_physicsSpringInspector->selectBoneIndex(boneIndex);
+                    }
+                });
+
+        connect(m_previewViewport, &GpuPreviewViewport::puppetBoneCreated, this,
+                [this](int32_t /*objectId*/, int32_t parentBoneIndex, const QPointF &headCanvas,
+                       const QPointF & /*tailCanvas*/, float angleZRad) {
+                    if (m_layoutManager && !m_boneRiggingPanel) {
+                        m_layoutManager->realizeLazyPanel(QStringLiteral("BoneRiggingPanel"));
+                    }
+                    if (m_boneRiggingPanel) {
+                        const float localPos[3] = {static_cast<float>(headCanvas.x()),
+                                                   static_cast<float>(headCanvas.y()), 0.0f};
+                        const QString name = QStringLiteral("Bone %1").arg(
+                            m_boneRiggingPanel->rigSnapshot().bones.size());
+                        m_boneRiggingPanel->addBone(name, parentBoneIndex, localPos, angleZRad);
+                    }
+                });
+
+        connect(m_previewViewport, &GpuPreviewViewport::puppetBoneReparented, this,
+                [this](int32_t /*objectId*/, int32_t childBoneIndex, int32_t newParentIndex) {
+                    if (m_boneRiggingPanel) {
+                        m_boneRiggingPanel->reparentBone(childBoneIndex, newParentIndex);
+                    }
+                });
+
+        connect(m_previewViewport, &GpuPreviewViewport::puppetIkTargetChanged, this,
+                [this](int32_t objectId, int32_t chainIndex, const QVector3D &targetWorld,
+                       bool committed) {
+                    if (m_ipcClient && objectId >= 0 && chainIndex >= 0) {
+                        waywal_ipc_puppet_preview_ik_t req{};
+                        req.object_id = static_cast<uint32_t>(objectId);
+                        req.root_bone = 0xFFFFu;
+                        req.mid_bone = 0xFFFFu;
+                        req.end_bone = 0xFFFFu;
+                        if (m_boneRiggingPanel) {
+                            const auto &chains = m_boneRiggingPanel->rigSnapshot().ikChains;
+                            if (static_cast<size_t>(chainIndex) < chains.size()) {
+                                const auto &ch = chains[static_cast<size_t>(chainIndex)];
+                                req.root_bone = ch.root_bone;
+                                req.mid_bone = ch.mid_bone;
+                                req.end_bone = ch.end_bone;
+                                req.pole_flip = (ch.bend_sign < 0) ? 1u : 0u;
+                            }
+                        }
+                        req.target_world[0] = targetWorld.x();
+                        req.target_world[1] = targetWorld.y();
+                        req.target_world[2] = targetWorld.z();
+                        req.mode_flags = committed ? 5u : 1u;
+                        m_ipcClient->sendPuppetPreviewIk(req);
+                    }
+                    if (committed && m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("IK chain %1 target updated").arg(chainIndex));
+                    }
+                });
+
+        connect(m_previewViewport, &GpuPreviewViewport::puppetIkPoleChanged, this,
+                [this](int32_t objectId, int32_t chainIndex, const QVector3D & /*poleWorld*/,
+                       bool poleFlip, bool committed) {
+                    if (m_ipcClient && objectId >= 0 && chainIndex >= 0) {
+                        waywal_ipc_puppet_preview_ik_t req{};
+                        req.object_id = static_cast<uint32_t>(objectId);
+                        req.root_bone = 0xFFFFu;
+                        req.mid_bone = 0xFFFFu;
+                        req.end_bone = 0xFFFFu;
+                        if (m_boneRiggingPanel) {
+                            const auto &chains = m_boneRiggingPanel->rigSnapshot().ikChains;
+                            if (static_cast<size_t>(chainIndex) < chains.size()) {
+                                const auto &ch = chains[static_cast<size_t>(chainIndex)];
+                                req.root_bone = ch.root_bone;
+                                req.mid_bone = ch.mid_bone;
+                                req.end_bone = ch.end_bone;
+                                req.target_world[0] = ch.target_world[0];
+                                req.target_world[1] = ch.target_world[1];
+                                req.target_world[2] = ch.target_world[2];
+                            }
+                        }
+                        req.pole_flip = poleFlip ? 1u : 0u;
+                        req.mode_flags = committed ? 5u : 1u;
+                        m_ipcClient->sendPuppetPreviewIk(req);
+                    }
+                    if (committed && m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("IK chain %1 pole updated").arg(chainIndex));
+                    }
+                });
+
+        connect(m_previewViewport, &GpuPreviewViewport::weightBrushDabBatchReady, this,
+                [this](int32_t objectId, const std::vector<WeightBrushDab> &dabs) {
+                    if (!m_ipcClient || objectId < 0 || dabs.empty()) {
+                        return;
+                    }
+                    if (m_previewViewport && m_previewViewport->puppetObjectId() == objectId) {
+                        const auto &verts =
+                            m_previewViewport->gizmoOverlay().meshWireframe().vertices;
+                        if (!verts.empty()) {
+                            const float cw = static_cast<float>(
+                                std::max<uint32_t>(1u, m_previewViewport->contentWidth()));
+                            const float ch = static_cast<float>(
+                                std::max<uint32_t>(1u, m_previewViewport->contentHeight()));
+                            std::vector<waywal_ipc_vertex_weight_t> syncEntries;
+                            for (size_t i = 0; i < verts.size(); ++i) {
+                                const float vx = verts[i].pos[0];
+                                const float vy = verts[i].pos[1];
+                                bool touched = false;
+                                for (const auto &dab : dabs) {
+                                    const float lx = dab.texelX - 0.5f * cw;
+                                    const float ly = 0.5f * ch - dab.texelY;
+                                    const float dx = vx - lx;
+                                    const float dy = vy - ly;
+                                    const float r = std::max(1.0f, dab.radiusPx) + 1.0f;
+                                    if (dx * dx + dy * dy <= r * r) {
+                                        touched = true;
+                                        break;
+                                    }
+                                }
+                                if (touched) {
+                                    waywal_ipc_vertex_weight_t vw{};
+                                    vw.vertex_index = static_cast<uint32_t>(i);
+                                    std::memcpy(vw.blend_indices, verts[i].blend_indices,
+                                                sizeof(vw.blend_indices));
+                                    std::memcpy(vw.weight, verts[i].weight, sizeof(vw.weight));
+                                    syncEntries.push_back(vw);
+                                }
+                            }
+                            if (!syncEntries.empty()) {
+                                m_ipcClient->sendPuppetPaintWeights(static_cast<uint32_t>(objectId),
+                                                                    1u, syncEntries);
+                            }
+                        }
+                    }
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Weight brush stroke: %1 dabs").arg(dabs.size()));
+                    }
+                });
+
+        connect(
+            m_previewViewport, &GpuPreviewViewport::weightPaintStrokeCommitted, this,
+            [this](int32_t objectId, const std::vector<VertexWeightBlockSnapshot> &preBlocks,
+                   const std::vector<VertexWeightBlockSnapshot> &postBlocks,
+                   const std::vector<waywal_ipc_vertex_weight_t> &dirtyEntries) {
+                if (m_commandBus && (!preBlocks.empty() || !postBlocks.empty())) {
+                    QPointer<GpuPreviewViewport> viewportPtr(m_previewViewport);
+                    auto cmd = std::make_unique<WeightPaintStrokeCommand>(
+                        objectId, QStringLiteral("Weight Paint Stroke"), preBlocks, postBlocks,
+                        [this, viewportPtr](int32_t oid,
+                                            const std::vector<VertexWeightBlockSnapshot> &blocks) {
+                            if (!viewportPtr || oid < 0 || viewportPtr->puppetObjectId() != oid) {
+                                return;
+                            }
+                            viewportPtr->applyVertexWeightBlocks(oid, blocks);
+                            if (!m_ipcClient) {
+                                return;
+                            }
+                            std::vector<waywal_ipc_vertex_weight_t> syncEntries;
+                            for (const auto &blk : blocks) {
+                                const uint32_t base = blk.blockIndex * 256u;
+                                for (size_t i = 0; i < blk.slice.size(); ++i) {
+                                    waywal_ipc_vertex_weight_t vw{};
+                                    vw.vertex_index = base + static_cast<uint32_t>(i);
+                                    std::memcpy(vw.blend_indices, blk.slice[i].blend_indices,
+                                                sizeof(vw.blend_indices));
+                                    std::memcpy(vw.weight, blk.slice[i].weight, sizeof(vw.weight));
+                                    syncEntries.push_back(vw);
+                                }
+                            }
+                            if (!syncEntries.empty()) {
+                                m_ipcClient->sendPuppetPaintWeights(static_cast<uint32_t>(oid), 1u,
+                                                                    syncEntries);
+                            }
+                        });
+                    m_commandBus->execute(std::move(cmd));
+                } else if (m_ipcClient && objectId >= 0 && !dirtyEntries.empty()) {
+                    m_ipcClient->sendPuppetPaintWeights(static_cast<uint32_t>(objectId), 1u,
+                                                        dirtyEntries);
+                }
+            });
+    }
+
+    if (m_ipcClient) {
+        connect(m_ipcClient.get(), &IpcClient::puppetMeshAckReceived, this,
+                [this](const waywal_ipc_puppet_mesh_ack_t &resp) {
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Puppet mesh synced: %1 verts, %2 tris")
+                                .arg(resp.vertex_count)
+                                .arg(resp.triangle_count));
+                    }
+                });
+        connect(m_ipcClient.get(), &IpcClient::puppetWeightsSolved, this,
+                [this](const waywal_ipc_puppet_weights_resp_t &resp,
+                       const std::vector<waywal_ipc_vertex_weight_t> &entries) {
+                    if (resp.status == 0 && m_previewViewport && !entries.empty()) {
+                        m_previewViewport->applySolvedVertexWeights(
+                            static_cast<int32_t>(resp.object_id), entries);
+                    }
+                    if (m_weightPaintPanel) {
+                        const uint32_t boneCount =
+                            (m_hasCachedPuppetRig &&
+                             m_cachedPuppetRig.objectId == static_cast<int32_t>(resp.object_id))
+                                ? static_cast<uint32_t>(m_cachedPuppetRig.bones.size())
+                                : 0u;
+                        m_weightPaintPanel->setSolveTelemetry(resp.entry_count, boneCount, 0.0f,
+                                                              resp.status != 0);
+                    }
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Solved heat weights (%1 entries, status=%2)")
+                                .arg(resp.entry_count)
+                                .arg(resp.status));
+                    }
+                });
+        connect(m_ipcClient.get(), &IpcClient::puppetIkPoseReceived, this,
+                [this](const waywal_ipc_puppet_ik_pose_resp_t &resp,
+                       const std::vector<waywal_ipc_bone_trs_t> &bones) {
+                    const int32_t oid = static_cast<int32_t>(resp.object_id);
+                    if (resp.status == 0 && !bones.empty() && m_hasCachedPuppetRig &&
+                        m_cachedPuppetRig.objectId == oid) {
+                        BoneHierarchySnapshot posedRig = m_cachedPuppetRig;
+                        for (const auto &b : bones) {
+                            if (b.bone_index >= posedRig.bones.size()) {
+                                continue;
+                            }
+                            auto &dst = posedRig.bones[b.bone_index];
+                            for (int k = 0; k < 3; ++k) {
+                                dst.bind_pos[k] = std::isfinite(b.local_pos[k]) ? b.local_pos[k]
+                                                                                : dst.bind_pos[k];
+                                dst.bind_angle[k] = std::isfinite(b.local_angle[k])
+                                                        ? b.local_angle[k]
+                                                        : dst.bind_angle[k];
+                                dst.bind_scale[k] = std::isfinite(b.local_scale[k])
+                                                        ? b.local_scale[k]
+                                                        : dst.bind_scale[k];
+                            }
+                            composeBoneLocalMat4(dst.bind_pos, dst.bind_angle, dst.bind_scale,
+                                                 dst.local_trans);
+                        }
+                        if (m_previewViewport && m_previewViewport->puppetObjectId() == oid) {
+                            const int32_t selBone =
+                                m_boneRiggingPanel ? m_boneRiggingPanel->selectedBoneIndex() : -1;
+                            m_previewViewport->setPuppetSkeleton(posedRig, selBone);
+                        }
+                    }
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("IK pose updated (%1 bones)").arg(resp.bone_count));
+                    }
+                });
+        connect(
+            m_ipcClient.get(), &IpcClient::puppetMdlExported, this,
+            [this](const waywal_ipc_export_puppet_mdl_resp_t &resp, const QByteArray &mdlBytes) {
+                QString destPath;
+                const auto it = m_pendingMdlExportPaths.find(static_cast<int32_t>(resp.object_id));
+                if (it != m_pendingMdlExportPaths.end()) {
+                    destPath = it->second;
+                    m_pendingMdlExportPaths.erase(it);
+                }
+                if (resp.status != 0) {
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Puppet MDL export failed (object %1, status=%2)")
+                                .arg(resp.object_id)
+                                .arg(resp.status));
+                    }
+                    return;
+                }
+                if (!destPath.isEmpty() && !mdlBytes.isEmpty()) {
+                    const QFileInfo destInfo(destPath);
+                    destInfo.dir().mkpath(QStringLiteral("."));
+                    QSaveFile out(destPath);
+                    if (!out.open(QIODevice::WriteOnly) || out.write(mdlBytes) != mdlBytes.size() ||
+                        !out.commit()) {
+                        if (m_statusLabel) {
+                            m_statusLabel->setText(
+                                QStringLiteral("Failed to write puppet MDL to %1").arg(destPath));
+                        }
+                        return;
+                    }
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Exported puppet MDL to %1 (%2 bytes)")
+                                .arg(destPath)
+                                .arg(mdlBytes.size()));
+                    }
+                    return;
+                }
+                if (m_statusLabel) {
+                    m_statusLabel->setText(
+                        QStringLiteral("Exported puppet MDL (object %1, %2 bytes)")
+                            .arg(resp.object_id)
+                            .arg(resp.mdl_byte_size));
+                }
+            });
+    }
 }
 
 void MainWindow::applyWallpaperPath(const QString &path)
@@ -2003,14 +2727,240 @@ void MainWindow::handleExportScenePackage()
 
 void MainWindow::handleViewportToolModeChanged(int index)
 {
-    if (!m_previewViewport || index < 0 || index > 7) {
+    if (!m_previewViewport || index < 0 || index > 11) {
         return;
     }
     const auto mode = static_cast<ViewportToolMode>(index);
     m_previewViewport->setToolMode(mode);
-    if (index >= static_cast<int>(ViewportToolMode::BrushMask) && m_layoutManager) {
-        m_layoutManager->realizeLazyPanel(QStringLiteral("GpuBrushPainter"));
+    if (!m_layoutManager) {
+        return;
     }
+    if (index >= static_cast<int>(ViewportToolMode::BrushMask) &&
+        index <= static_cast<int>(ViewportToolMode::BrushBlurSmudge)) {
+        m_layoutManager->realizeLazyPanel(QStringLiteral("GpuBrushPainter"));
+    } else if (mode == ViewportToolMode::ContourPin) {
+        m_layoutManager->realizeLazyPanel(QStringLiteral("PuppetMeshPanel"));
+    } else if (mode == ViewportToolMode::BonePlace || mode == ViewportToolMode::IkDrag) {
+        m_layoutManager->realizeLazyPanel(QStringLiteral("BoneRiggingPanel"));
+    } else if (mode == ViewportToolMode::WeightBrush) {
+        m_layoutManager->realizeLazyPanel(QStringLiteral("WeightPaintPanel"));
+    }
+}
+
+void MainWindow::setActivePuppetObjectContext(int32_t objectId, uint32_t texWidth,
+                                              uint32_t texHeight)
+{
+    if (objectId < 0) {
+        return;
+    }
+    const bool objectChanged = (m_activePuppetObjectId != objectId);
+    m_activePuppetObjectId = objectId;
+    if (texWidth > 0u) {
+        m_activePuppetTexWidth = texWidth;
+    }
+    if (texHeight > 0u) {
+        m_activePuppetTexHeight = texHeight;
+    }
+    if (m_previewViewport) {
+        m_previewViewport->setPuppetObjectId(objectId);
+    }
+    if (m_puppetMeshPanel) {
+        m_puppetMeshPanel->setTargetObjectId(objectId, m_activePuppetTexWidth,
+                                             m_activePuppetTexHeight);
+    }
+    if (objectChanged) {
+        m_timelineHydratedObjectId = -1;
+        if (m_weightPaintPanel) {
+            hydrateWeightPaintPanel(m_weightPaintPanel);
+        }
+        if (m_dopeSheetTimeline) {
+            hydrateDopeSheetTimeline(m_dopeSheetTimeline);
+        }
+    }
+}
+
+void MainWindow::hydrateWeightPaintPanel(WeightPaintPanel *panel) const
+{
+    if (!panel || m_activePuppetObjectId < 0) {
+        return;
+    }
+
+    std::vector<we_mdl_vertex_t> verts;
+    std::vector<uint16_t> indices;
+    if (m_previewViewport && m_previewViewport->puppetObjectId() == m_activePuppetObjectId &&
+        !m_previewViewport->gizmoOverlay().meshWireframe().vertices.empty()) {
+        verts = m_previewViewport->gizmoOverlay().meshWireframe().vertices;
+        indices = m_previewViewport->gizmoOverlay().meshWireframe().indices;
+    } else if (m_cachedPuppetMesh.objectId == m_activePuppetObjectId) {
+        verts = m_cachedPuppetMesh.vertices;
+        indices = m_cachedPuppetMesh.indices;
+    }
+
+    we_puppet_t puppet{};
+    puppet.vertex_count = static_cast<uint32_t>(verts.size());
+    puppet.vertices = verts.empty() ? nullptr : verts.data();
+    puppet.triangle_count = static_cast<uint32_t>(indices.size() / 3u);
+    puppet.indices = indices.empty() ? nullptr : indices.data();
+
+    std::vector<we_mdl_bone_t> bones;
+    if (m_hasCachedPuppetRig && m_cachedPuppetRig.objectId == m_activePuppetObjectId) {
+        bones = m_cachedPuppetRig.bones;
+        puppet.bone_count = static_cast<uint32_t>(bones.size());
+        puppet.bones = bones.empty() ? nullptr : bones.data();
+    }
+
+    panel->setPuppetContext(m_activePuppetObjectId, &puppet);
+    if (m_boneRiggingPanel &&
+        m_boneRiggingPanel->rigSnapshot().objectId == m_activePuppetObjectId &&
+        m_boneRiggingPanel->selectedBoneIndex() >= 0) {
+        panel->setActiveBone(m_boneRiggingPanel->selectedBoneIndex());
+    } else if (puppet.bone_count > 0u) {
+        panel->setActiveBone(0);
+    }
+}
+
+void MainWindow::hydrateDopeSheetTimeline(DopeSheetTimelineWidget *timeline)
+{
+    if (!timeline || m_activePuppetObjectId < 0) {
+        return;
+    }
+
+    const bool sameObject = (m_timelineHydratedObjectId == m_activePuppetObjectId);
+    const auto &existingClips = timeline->clips();
+    const bool hasEditedChannels =
+        sameObject && std::any_of(existingClips.begin(), existingClips.end(),
+                                  [](const TimelineAnimClip &c) { return !c.channels.empty(); });
+    if (hasEditedChannels) {
+        return;
+    }
+
+    we_puppet_t puppet{};
+    std::vector<we_mdl_bone_t> bones;
+    if (m_hasCachedPuppetRig && m_cachedPuppetRig.objectId == m_activePuppetObjectId) {
+        bones = m_cachedPuppetRig.bones;
+        puppet.bone_count = static_cast<uint32_t>(bones.size());
+        puppet.bones = bones.empty() ? nullptr : bones.data();
+    }
+    timeline->loadPuppetAnimations(&puppet, m_activePuppetObjectId);
+    m_timelineHydratedObjectId = m_activePuppetObjectId;
+}
+
+void MainWindow::refreshOnionSkinFrames()
+{
+    if (!m_previewViewport) {
+        return;
+    }
+    if (!m_onionSkinEnabled || !m_dopeSheetTimeline || !m_hasCachedPuppetRig ||
+        m_cachedPuppetRig.bones.empty() || m_dopeSheetTimeline->clips().empty()) {
+        m_previewViewport->setOnionSkinFrames({});
+        return;
+    }
+
+    const auto &clips = m_dopeSheetTimeline->clips();
+    const TimelineAnimClip *activeClip = &clips.front();
+    for (const auto &c : clips) {
+        if (c.layerVisible && !c.channels.empty()) {
+            activeClip = &c;
+            break;
+        }
+    }
+
+    const int32_t lenFrames = std::max(1, activeClip->lengthFrames);
+    const double maxFrame = static_cast<double>(lenFrames - 1);
+    const double curFrame = m_dopeSheetTimeline->currentFrame();
+    const size_t boneCount = m_cachedPuppetRig.bones.size();
+
+    auto wrapSampleFrame = [activeClip, lenFrames, maxFrame](double f) -> double {
+        if (maxFrame <= 0.0) {
+            return 0.0;
+        }
+        if (activeClip->mode == WE_ANIM_LOOP) {
+            double wrapped = std::fmod(f, static_cast<double>(lenFrames));
+            if (wrapped < 0.0) {
+                wrapped += static_cast<double>(lenFrames);
+            }
+            return std::clamp(wrapped, 0.0, maxFrame);
+        }
+        if (activeClip->mode == WE_ANIM_MIRROR) {
+            const double span = maxFrame * 2.0;
+            double wrapped = std::fmod(f, span);
+            if (wrapped < 0.0) {
+                wrapped += span;
+            }
+            return (wrapped > maxFrame) ? (span - wrapped) : wrapped;
+        }
+        return std::clamp(f, 0.0, maxFrame);
+    };
+
+    std::vector<GizmoOnionGhostFrame> frames;
+    frames.reserve(static_cast<size_t>(m_onionBeforeFrames + m_onionAfterFrames));
+    for (int delta = -m_onionBeforeFrames; delta <= m_onionAfterFrames; ++delta) {
+        if (delta == 0) {
+            continue;
+        }
+        const double sampleFrame = wrapSampleFrame(curFrame + static_cast<double>(delta));
+        std::vector<std::array<float, 16>> localMats(boneCount);
+        for (size_t bIdx = 0; bIdx < boneCount; ++bIdx) {
+            const auto &srcBone = m_cachedPuppetRig.bones[bIdx];
+            float pos[3] = {srcBone.bind_pos[0], srcBone.bind_pos[1], srcBone.bind_pos[2]};
+            float angle[3] = {srcBone.bind_angle[0], srcBone.bind_angle[1], srcBone.bind_angle[2]};
+            float scale[3] = {srcBone.bind_scale[0], srcBone.bind_scale[1], srcBone.bind_scale[2]};
+            for (const auto &ch : activeClip->channels) {
+                if (ch.boneIndex != static_cast<int32_t>(bIdx)) {
+                    continue;
+                }
+                const double val = DopeSheetTimelineWidget::evaluateChannelAtFrame(ch, sampleFrame);
+                if (activeClip->blendMode == WE_ANIM_BLEND_ADDITIVE) {
+                    if (ch.channelIndex < 3u) {
+                        pos[ch.channelIndex] += static_cast<float>(val);
+                    } else if (ch.channelIndex < 6u) {
+                        angle[ch.channelIndex - 3u] += static_cast<float>(val);
+                    } else if (ch.channelIndex < 9u) {
+                        scale[ch.channelIndex - 6u] *= static_cast<float>(val);
+                    }
+                } else {
+                    if (ch.channelIndex < 3u) {
+                        pos[ch.channelIndex] = static_cast<float>(val);
+                    } else if (ch.channelIndex < 6u) {
+                        angle[ch.channelIndex - 3u] = static_cast<float>(val);
+                    } else if (ch.channelIndex < 9u) {
+                        scale[ch.channelIndex - 6u] = static_cast<float>(val);
+                    }
+                }
+            }
+            composeBoneLocalMat4(pos, angle, scale, localMats[bIdx].data());
+        }
+
+        const auto worldMats = resolveBoneWorldMatrices(m_cachedPuppetRig.bones, localMats);
+        std::vector<std::pair<QVector3D, QVector3D>> segments(boneCount);
+        std::vector<bool> hasChild(boneCount, false);
+        for (size_t i = 0; i < boneCount; ++i) {
+            segments[i].first = QVector3D(worldMats[i][12], worldMats[i][13], worldMats[i][14]);
+        }
+        for (size_t i = 0; i < boneCount; ++i) {
+            const uint32_t p = m_cachedPuppetRig.bones[i].parent;
+            if (p != 0xFFFFFFFFu && p < boneCount) {
+                hasChild[p] = true;
+                segments[p].second = segments[i].first;
+            }
+        }
+        for (size_t i = 0; i < boneCount; ++i) {
+            if (!hasChild[i]) {
+                const QVector3D axisX(worldMats[i][0], worldMats[i][1], worldMats[i][2]);
+                const QVector3D dir = (axisX.lengthSquared() > 1e-5f) ? axisX.normalized()
+                                                                      : QVector3D(1.0f, 0.0f, 0.0f);
+                segments[i].second = segments[i].first + dir * 28.0f;
+            }
+        }
+
+        GizmoOnionGhostFrame ghost{};
+        ghost.frameDelta = delta;
+        ghost.opacity =
+            std::clamp(m_onionOpacity / static_cast<float>(std::abs(delta)), 0.08f, 0.85f);
+        ghost.boneSegments = std::move(segments);
+        frames.push_back(std::move(ghost));
+    }
+    m_previewViewport->setOnionSkinFrames(std::move(frames));
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)

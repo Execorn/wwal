@@ -79,6 +79,7 @@ PhysicsSpringInspectorWidget::PhysicsSpringInspectorWidget(QWidget *parent) : QW
     for (uint32_t i = 0; i < WE_MDL_MAX_BONES; ++i) {
         m_ctx.configs[i].bone_index = i;
         we_physics_apply_preset(&m_ctx.configs[i], WE_PHYS_PRESET_CUSTOM);
+        m_driveModes[i] = WE_BONE_DRIVE_FK;
     }
 
     setupUi();
@@ -467,8 +468,15 @@ void PhysicsSpringInspectorWidget::setupUi()
     mainLayout->addWidget(splitter, 1);
 
     // -------------------------------------------------------------------------
-    // Bottom Status: 240 Hz Solver Telemetry Badge
+    // Bottom Status: Drive Mode & 240 Hz Solver Telemetry Badges
     // -------------------------------------------------------------------------
+    m_driveBadgeLabel = new QLabel(tr("Bone Drive: Rigid / FK"), this);
+    m_driveBadgeLabel->setStyleSheet(QStringLiteral(
+        "QLabel { background-color: #181825; color: #9399b2; font-family: monospace; font-size: "
+        "11px; padding: 4px 8px; border: 1px solid #313244; border-radius: 4px; }"));
+    m_driveBadgeLabel->setAlignment(Qt::AlignCenter);
+    mainLayout->addWidget(m_driveBadgeLabel);
+
     m_telemetryLabel = new QLabel(tr("240 Hz Solver: 0 active bones | 0.0 us / step"), this);
     m_telemetryLabel->setStyleSheet(QStringLiteral(
         "QLabel { background-color: #11111b; color: #a6e3a1; font-family: monospace; font-size: "
@@ -520,6 +528,12 @@ void PhysicsSpringInspectorWidget::loadPuppetSkeleton(const we_puppet_t *puppet,
         we_physics_init_from_puppet(&m_ctx, puppet);
     }
 
+    for (uint32_t i = 0; i < WE_MDL_MAX_BONES; ++i) {
+        m_driveModes[i] = ((m_ctx.configs[i].flags & WE_BONE_PHYS_ENABLED) != 0)
+                              ? WE_BONE_DRIVE_XPBD
+                              : WE_BONE_DRIVE_FK;
+    }
+
     populateBoneList(puppet);
 
     int32_t firstSelect = 0;
@@ -530,6 +544,97 @@ void PhysicsSpringInspectorWidget::loadPuppetSkeleton(const we_puppet_t *puppet,
         }
     }
     selectBoneIndex(firstSelect);
+}
+
+void PhysicsSpringInspectorWidget::setBoneList(const std::vector<QString> &names,
+                                               const std::vector<int32_t> &parents,
+                                               int32_t sceneObjectId)
+{
+    m_objectId = sceneObjectId;
+    m_boneNames = names;
+    m_boneParents = parents;
+    if (m_boneNames.size() > WE_MDL_MAX_BONES) {
+        m_boneNames.resize(WE_MDL_MAX_BONES);
+    }
+    if (m_boneParents.size() > WE_MDL_MAX_BONES) {
+        m_boneParents.resize(WE_MDL_MAX_BONES);
+    }
+    populateBoneList(nullptr);
+    if (!m_boneNames.empty()) {
+        if (m_selectedBoneIndex < 0 ||
+            static_cast<size_t>(m_selectedBoneIndex) >= m_boneNames.size()) {
+            m_selectedBoneIndex = 0;
+        }
+        selectBoneIndex(m_selectedBoneIndex);
+    }
+}
+
+void PhysicsSpringInspectorWidget::setBoneDriveMode(int32_t boneIndex, we_bone_drive_mode_t mode)
+{
+    if (boneIndex < 0 || boneIndex >= static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+        return;
+    }
+    m_driveModes[static_cast<size_t>(boneIndex)] = mode;
+    if (mode == WE_BONE_DRIVE_XPBD) {
+        m_ctx.configs[boneIndex].flags |= WE_BONE_PHYS_ENABLED;
+    } else if (mode == WE_BONE_DRIVE_IK || mode == WE_BONE_DRIVE_AIM) {
+        m_ctx.configs[boneIndex].flags &= ~WE_BONE_PHYS_ENABLED;
+    }
+    refreshBoneTreeStates();
+    if (boneIndex == m_selectedBoneIndex) {
+        syncUiFromSelectedBone();
+    }
+}
+
+void PhysicsSpringInspectorWidget::setBoneDriveModes(
+    const std::array<we_bone_drive_mode_t, WE_MDL_MAX_BONES> &modes)
+{
+    m_driveModes = modes;
+    for (uint32_t i = 0; i < WE_MDL_MAX_BONES; ++i) {
+        if (m_driveModes[i] == WE_BONE_DRIVE_XPBD) {
+            m_ctx.configs[i].flags |= WE_BONE_PHYS_ENABLED;
+        } else if (m_driveModes[i] == WE_BONE_DRIVE_IK || m_driveModes[i] == WE_BONE_DRIVE_AIM) {
+            m_ctx.configs[i].flags &= ~WE_BONE_PHYS_ENABLED;
+        }
+    }
+    refreshBoneTreeStates();
+    syncUiFromSelectedBone();
+}
+
+we_bone_drive_mode_t PhysicsSpringInspectorWidget::boneDriveMode(int32_t boneIndex) const noexcept
+{
+    if (boneIndex < 0 || boneIndex >= static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+        return WE_BONE_DRIVE_FK;
+    }
+    return m_driveModes[static_cast<size_t>(boneIndex)];
+}
+
+QString PhysicsSpringInspectorWidget::boneDriveBadgeText(int32_t boneIndex, QColor &color) const
+{
+    if (boneIndex < 0 || boneIndex >= static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+        color = QColor(0x93, 0x99, 0xb2);
+        return QStringLiteral("Rigid");
+    }
+    const bool xpbdEnabled = (m_ctx.configs[boneIndex].flags & WE_BONE_PHYS_ENABLED) != 0;
+    const we_bone_drive_mode_t mode = m_driveModes[static_cast<size_t>(boneIndex)];
+    if (xpbdEnabled) {
+        if (mode == WE_BONE_DRIVE_IK || mode == WE_BONE_DRIVE_AIM) {
+            color = QColor(0xfa, 0xb3, 0x87);
+            return QStringLiteral("XPBD Active (Overrides IK/Aim)");
+        }
+        color = QColor(0xa6, 0xe3, 0xa1);
+        return QStringLiteral("XPBD Active");
+    }
+    if (mode == WE_BONE_DRIVE_IK) {
+        color = QColor(0x89, 0xb4, 0xfa);
+        return QStringLiteral("IK Active");
+    }
+    if (mode == WE_BONE_DRIVE_AIM) {
+        color = QColor(0xcb, 0xa6, 0xf7);
+        return QStringLiteral("Aim Active");
+    }
+    color = QColor(0x93, 0x99, 0xb2);
+    return QStringLiteral("Rigid");
 }
 
 void PhysicsSpringInspectorWidget::populateBoneList(const we_puppet_t *puppet)
@@ -562,10 +667,9 @@ void PhysicsSpringInspectorWidget::populateBoneList(const we_puppet_t *puppet)
         item->setText(0, QStringLiteral("[%1] %2").arg(i).arg(name));
         item->setData(0, Qt::UserRole, static_cast<int>(i));
 
-        bool enabled = (m_ctx.configs[i].flags & WE_BONE_PHYS_ENABLED) != 0;
-        item->setText(1, enabled ? QStringLiteral("XPBD Active") : QStringLiteral("Rigid"));
-        item->setForeground(1, enabled ? QBrush(QColor(0xa6, 0xe3, 0xa1))
-                                       : QBrush(QColor(0x93, 0x99, 0xb2)));
+        QColor badgeColor;
+        item->setText(1, boneDriveBadgeText(static_cast<int32_t>(i), badgeColor));
+        item->setForeground(1, QBrush(badgeColor));
         items[i] = item;
     }
 
@@ -653,10 +757,9 @@ void PhysicsSpringInspectorWidget::refreshBoneTreeStates()
     while (*it) {
         const int bIdx = (*it)->data(0, Qt::UserRole).toInt();
         if (bIdx >= 0 && bIdx < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
-            const bool enabled = (m_ctx.configs[bIdx].flags & WE_BONE_PHYS_ENABLED) != 0;
-            (*it)->setText(1, enabled ? QStringLiteral("XPBD Active") : QStringLiteral("Rigid"));
-            (*it)->setForeground(1, enabled ? QBrush(QColor(0xa6, 0xe3, 0xa1))
-                                            : QBrush(QColor(0x93, 0x99, 0xb2)));
+            QColor badgeColor;
+            (*it)->setText(1, boneDriveBadgeText(static_cast<int32_t>(bIdx), badgeColor));
+            (*it)->setForeground(1, QBrush(badgeColor));
         }
         ++it;
     }
@@ -706,6 +809,17 @@ void PhysicsSpringInspectorWidget::syncUiFromSelectedBone()
         if (m_presetCombo) {
             we_physics_preset_t detected = detectPreset(cfg);
             m_presetCombo->setCurrentIndex(static_cast<int>(detected));
+        }
+        if (m_driveBadgeLabel) {
+            QColor badgeColor;
+            const QString stateText = boneDriveBadgeText(m_selectedBoneIndex, badgeColor);
+            m_driveBadgeLabel->setText(
+                QStringLiteral("Bone [%1] Drive: %2").arg(m_selectedBoneIndex).arg(stateText));
+            m_driveBadgeLabel->setStyleSheet(
+                QStringLiteral("QLabel { background-color: #181825; color: %1; font-family: "
+                               "monospace; font-size: 11px; padding: 4px 8px; border: 1px solid "
+                               "#313244; border-radius: 4px; }")
+                    .arg(badgeColor.name()));
         }
     }
 
@@ -1038,7 +1152,16 @@ void PhysicsSpringInspectorWidget::commitPhysicsChange(const we_bone_sim_config_
                 return;
             }
             if (boneIndex >= 0 && boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+                const bool prevXpbd =
+                    (self->m_ctx.configs[boneIndex].flags & WE_BONE_PHYS_ENABLED) != 0;
+                const bool nowXpbd = (cfg.flags & WE_BONE_PHYS_ENABLED) != 0;
                 self->m_ctx.configs[boneIndex] = cfg;
+                if (nowXpbd != prevXpbd) {
+                    const we_bone_drive_mode_t nextMode =
+                        nowXpbd ? WE_BONE_DRIVE_XPBD : WE_BONE_DRIVE_FK;
+                    self->m_driveModes[static_cast<size_t>(boneIndex)] = nextMode;
+                    emit self->boneDriveModeChanged(objectId, boneIndex, nextMode);
+                }
             }
             self->m_ctx.wind = wind;
             self->m_ctx.cursor = cursor;
@@ -1055,9 +1178,16 @@ void PhysicsSpringInspectorWidget::commitPhysicsChange(const we_bone_sim_config_
             oldCursor, newCursor, std::move(applyFn));
         m_commandBus->execute(std::move(cmd));
     } else {
+        const bool prevXpbd = (oldCfg.flags & WE_BONE_PHYS_ENABLED) != 0;
+        const bool nowXpbd = (newCfg.flags & WE_BONE_PHYS_ENABLED) != 0;
         m_ctx.configs[m_selectedBoneIndex] = newCfg;
         m_ctx.wind = newWind;
         m_ctx.cursor = newCursor;
+        if (nowXpbd != prevXpbd) {
+            const we_bone_drive_mode_t nextMode = nowXpbd ? WE_BONE_DRIVE_XPBD : WE_BONE_DRIVE_FK;
+            m_driveModes[static_cast<size_t>(m_selectedBoneIndex)] = nextMode;
+            emit boneDriveModeChanged(m_objectId, m_selectedBoneIndex, nextMode);
+        }
         refreshBoneTreeStates();
         syncUiFromSelectedBone();
         emit physicsParamsChanged(m_targetOutput, m_objectId, m_selectedBoneIndex, newCfg, newWind,

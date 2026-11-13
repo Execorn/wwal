@@ -71,8 +71,10 @@ Recommends:     libcurl
 
 %description studio
 WayWal Studio (wwal-studio) provides the graphical wallpaper browser, Steam
-Workshop and Open Hub catalog manager, visual GLSL shader graph editor, and
-Material You theme studio for the WayWal daemon.
+Workshop and Open Hub catalog manager, WYSIWYG scene composer, visual GLSL
+shader graph editor, 2D puppet CDT meshing, harmonic heat-diffusion rigging,
+weight painting, keyframe animation timeline, and Material You theme studio
+for the WayWal daemon.
 
 %prep
 %autosetup -n %{name}-%{version}

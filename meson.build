@@ -323,6 +323,9 @@ engine_sources = files(
   'src/daemon/we_tex_writer.c',
   'src/daemon/we_scene_writer.c',
   'src/daemon/we_gpu_brush.c',
+  'src/daemon/we_mesh_cdt.c',
+  'src/daemon/we_mesh_rig.c',
+  'src/daemon/we_mdl_writer.c',
 )
 
 engine_inc_dirs = [inc_dir, include_directories('src/daemon')]
@@ -368,6 +371,21 @@ waywal_engine_dep = declare_dependency(
 )
 
 
+# Shared media/audio runtime helpers (demuxer + PipeWire FFT) shared across wwald and engine tests
+waywal_media_lib = static_library('waywal_media',
+  ['src/daemon/demuxer.c', 'src/daemon/audio_fft.c'],
+  include_directories: inc_dir,
+  dependencies: [waywal_core_dep, threads_dep, m_dep, dl_dep],
+  pic: true,
+  install: false,
+)
+
+waywal_media_dep = declare_dependency(
+  link_with: waywal_media_lib,
+  include_directories: inc_dir,
+  dependencies: [waywal_core_dep, threads_dep, m_dep, dl_dep],
+)
+
 # Daemon executable (wwald)
 daemon_sources = files(
   'src/daemon/main.c',
@@ -384,7 +402,6 @@ daemon_sources = files(
   'src/daemon/simd/blend_avx512.c',
   'src/daemon/simd/blend_neon.c',
   'src/daemon/simd/cpu_transitions.c',
-  'src/daemon/demuxer.c',
   'src/daemon/video_vaapi.c',
   'src/daemon/vaapi_h264.c',
   'src/daemon/vaapi_hevc.c',
@@ -398,13 +415,13 @@ daemon_sources = files(
   'src/daemon/slideshow.c',
   'src/daemon/anim_engine.c',
   'src/daemon/power_governor.c',
-  'src/daemon/audio_fft.c',
   'src/daemon/mpris.c',
   'src/daemon/shader_engine.c',
 )
 
 daemon_deps = [
   waywal_engine_dep,
+  waywal_media_dep,
   waywal_core_dep,
   proto_dep,
   shaders_dep,
@@ -505,6 +522,10 @@ if qt6_dep.found() and sqlite3_dep.found()
     'src/studio/particle/particle_designer_widget.hpp',
     'src/studio/audio/audio_binding_wizard.hpp',
     'src/studio/editor/glsl_scenescript_editor_widget.hpp',
+    'src/studio/rigging/puppet_mesh_panel.hpp',
+    'src/studio/rigging/bone_rigging_panel.hpp',
+    'src/studio/rigging/weight_paint_panel.hpp',
+    'src/studio/rigging/dope_sheet_timeline_widget.hpp',
   )
 
   studio_inc_dirs = [inc_dir, include_directories('src', 'src/studio')]
@@ -555,6 +576,11 @@ if qt6_dep.found() and sqlite3_dep.found()
     'src/studio/particle/particle_designer_widget.cpp',
     'src/studio/audio/audio_binding_wizard.cpp',
     'src/studio/editor/glsl_scenescript_editor_widget.cpp',
+    'src/studio/core/rigging_commands.cpp',
+    'src/studio/rigging/puppet_mesh_panel.cpp',
+    'src/studio/rigging/bone_rigging_panel.cpp',
+    'src/studio/rigging/weight_paint_panel.cpp',
+    'src/studio/rigging/dope_sheet_timeline_widget.cpp',
   ) + studio_mocs
 
   studio_deps = [
@@ -736,7 +762,6 @@ if get_option('tests')
 
   test_video_exe = executable('test_video',
     'tests/test_video.c',
-    'src/daemon/demuxer.c',
     'src/daemon/video_vaapi.c',
     'src/daemon/vaapi_h264.c',
     'src/daemon/vaapi_hevc.c',
@@ -747,6 +772,7 @@ if get_option('tests')
     include_directories: inc_dir,
     dependencies: [
       common_dep,
+      waywal_media_dep,
       proto_dep,
       wayland_client_dep,
       libdrm_dep,
@@ -873,7 +899,6 @@ if get_option('tests')
     'src/client/cli_parser.c',
     'src/daemon/anim_engine.c',
     'src/daemon/power_governor.c',
-    'src/daemon/audio_fft.c',
     'src/daemon/mpris.c',
     'src/daemon/shader_engine.c',
     'src/daemon/slideshow.c',
@@ -881,7 +906,7 @@ if get_option('tests')
     'src/daemon/dmabuf_alloc.c',
     'src/daemon/dmabuf_feedback.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: test_subsystems_deps
+    dependencies: test_subsystems_deps + [waywal_media_dep]
   )
 
   test('subsystems', test_subsystems_exe, workdir: meson.project_source_root())
@@ -889,25 +914,22 @@ if get_option('tests')
   test_we_core_exe = executable('test_we_core',
     'tests/test_we_core.c',
     'src/client/cli_parser.c',
-    'src/daemon/demuxer.c',
-    'src/daemon/audio_fft.c',
     'src/daemon/mpris.c',
     'src/daemon/shader_engine.c',
     'src/daemon/gpu_compute.c',
     'src/daemon/dmabuf_alloc.c',
     'src/daemon/dmabuf_feedback.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: test_subsystems_deps + [waywal_engine_dep]
+    dependencies: test_subsystems_deps + [waywal_engine_dep, waywal_media_dep]
   )
 
   test('we_core', test_we_core_exe, depends: [wwal, wwald], timeout: 120)
 
   fuzz_demuxer_exe = executable('fuzz_demuxer',
     'tests/fuzz/fuzz_demuxer.c',
-    'src/daemon/demuxer.c',
     c_args: ['-DWWAL_FUZZ_STANDALONE'],
     include_directories: inc_dir,
-    dependencies: [common_dep, m_dep]
+    dependencies: [common_dep, waywal_media_dep, m_dep]
   )
 
   fuzz_bitstream_exe = executable('fuzz_bitstream',
@@ -985,12 +1007,19 @@ if get_option('tests')
 
   fuzz_workshop_parsers_exe = executable('fuzz_workshop_parsers',
     'tests/fuzz/fuzz_workshop_parsers.c',
-    'src/daemon/demuxer.c',
     c_args: ['-DWWAL_FUZZ_STANDALONE'],
     include_directories: inc_dir,
-    dependencies: [waywal_engine_dep, waywal_core_dep, m_dep, dl_dep]
+    dependencies: [waywal_engine_dep, waywal_media_dep, waywal_core_dep, m_dep, dl_dep]
   )
   test('fuzz_workshop_parsers', fuzz_workshop_parsers_exe, timeout: 60)
+
+  fuzz_rigging_parsers_exe = executable('fuzz_rigging_parsers',
+    'tests/fuzz/fuzz_rigging_parsers.c',
+    c_args: ['-DWWAL_FUZZ_STANDALONE'],
+    include_directories: inc_dir,
+    dependencies: [waywal_engine_dep, waywal_media_dep, waywal_core_dep, m_dep, dl_dep]
+  )
+  test('fuzz_rigging_parsers', fuzz_rigging_parsers_exe, timeout: 60)
 
   test_workshop_security_exe = executable('test_workshop_security',
     'tests/test_workshop_security.c',
@@ -1065,27 +1094,22 @@ if get_option('tests')
 
   test_we_asset_writer_exe = executable('test_we_asset_writer',
     'tests/test_we_asset_writer.c',
-    'src/daemon/demuxer.c',
-    'src/daemon/audio_fft.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: test_subsystems_deps + [waywal_engine_dep]
+    dependencies: test_subsystems_deps + [waywal_engine_dep, waywal_media_dep]
   )
   test('we_asset_writer', test_we_asset_writer_exe, timeout: 60)
 
   test_we_gpu_brush_exe = executable('test_we_gpu_brush',
     'tests/test_we_gpu_brush.c',
-    'src/daemon/demuxer.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: test_subsystems_deps + [waywal_engine_dep]
+    dependencies: test_subsystems_deps + [waywal_engine_dep, waywal_media_dep]
   )
   test('we_gpu_brush', test_we_gpu_brush_exe, timeout: 60)
 
   test_we_particle_audio_exe = executable('test_we_particle_audio',
     'tests/test_we_particle_audio.c',
-    'src/daemon/demuxer.c',
-    'src/daemon/audio_fft.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: test_subsystems_deps + [waywal_engine_dep]
+    dependencies: test_subsystems_deps + [waywal_engine_dep, waywal_media_dep]
   )
   test('we_particle_audio', test_we_particle_audio_exe, timeout: 60)
 
@@ -1098,12 +1122,45 @@ if get_option('tests')
 
   test_challenger_authoring_exe = executable('test_challenger_authoring',
     'tests/test_challenger_authoring.c',
-    'src/daemon/demuxer.c',
-    'src/daemon/audio_fft.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: test_subsystems_deps + [waywal_engine_dep, waywal_media_dep]
+  )
+  test('challenger_authoring', test_challenger_authoring_exe, timeout: 60)
+
+  test_we_mesh_cdt_exe = executable('test_we_mesh_cdt',
+    'tests/test_we_mesh_cdt.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_engine_dep, waywal_core_dep, m_dep]
+  )
+  test('we_mesh_cdt', test_we_mesh_cdt_exe, timeout: 60)
+
+  test_we_mesh_rig_exe = executable('test_we_mesh_rig',
+    'tests/test_we_mesh_rig.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
     dependencies: test_subsystems_deps + [waywal_engine_dep]
   )
-  test('challenger_authoring', test_challenger_authoring_exe, timeout: 60)
+  test('we_mesh_rig', test_we_mesh_rig_exe, timeout: 60)
+
+  test_we_mdl_writer_exe = executable('test_we_mdl_writer',
+    'tests/test_we_mdl_writer.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: test_subsystems_deps + [waywal_engine_dep, waywal_media_dep]
+  )
+  test('we_mdl_writer', test_we_mdl_writer_exe, timeout: 60)
+
+  test_ipc_rigging_wire_exe = executable('test_ipc_rigging_wire',
+    'tests/test_ipc_rigging_wire.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('ipc_rigging_wire', test_ipc_rigging_wire_exe)
+
+  test_challenger_rigging_exe = executable('test_challenger_rigging',
+    'tests/test_challenger_rigging.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_engine_dep, waywal_core_dep, m_dep]
+  )
+  test('challenger_rigging', test_challenger_rigging_exe, timeout: 60)
 
   if have_qt6
     test_studio_command_and_dock_exe = executable('test_studio_command_and_dock',
@@ -1154,6 +1211,14 @@ if get_option('tests')
       dependencies: [waywal_studio_dep],
     )
     test('studio_authoring_integration', test_studio_authoring_integration_exe,
+         timeout: 60, is_parallel: false)
+
+    test_studio_rigging_integration_exe = executable('test_studio_rigging_integration',
+      'tests/test_studio_rigging_integration.cpp',
+      include_directories: studio_inc_dirs,
+      dependencies: [waywal_studio_dep],
+    )
+    test('studio_rigging_integration', test_studio_rigging_integration_exe,
          timeout: 60, is_parallel: false)
   endif
 endif

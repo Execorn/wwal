@@ -5,6 +5,7 @@
 #include "daemon_internal.h"
 #include "waywal/ipc_proto_authoring.h"
 #include "waywal/ipc_proto_phase3.h"
+#include "waywal/ipc_proto_rigging.h"
 #include "waywal/we_appworkshop.h"
 #include "waywal/we_compat_scanner.h"
 #include "waywal/we_vdf.h"
@@ -5154,6 +5155,19 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     case WAYWAL_REQ_LINT_SCENESCRIPT:
     case WAYWAL_REQ_READBACK_TEXTURE:
         keep_open = daemon_dispatch_authoring_ipc(state, client_fd, &req_hdr, attached_fd);
+        attached_fd = -1;
+        break;
+
+    case WAYWAL_REQ_PUPPET_SET_MESH:
+    case WAYWAL_REQ_PUPPET_SET_SKELETON:
+    case WAYWAL_REQ_PUPPET_SOLVE_WEIGHTS:
+    case WAYWAL_REQ_PUPPET_PAINT_WEIGHTS:
+    case WAYWAL_REQ_PUPPET_SET_HEATMAP_MODE:
+    case WAYWAL_REQ_PUPPET_PREVIEW_IK:
+    case WAYWAL_REQ_PUPPET_SET_ANIM_TRACKS:
+    case WAYWAL_REQ_PUPPET_SCRUB_TIME:
+    case WAYWAL_REQ_EXPORT_PUPPET_MDL:
+        keep_open = daemon_dispatch_rigging_ipc(state, client_fd, &req_hdr, attached_fd);
         attached_fd = -1;
         break;
 

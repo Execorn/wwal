@@ -53,10 +53,27 @@
 #define DRM_FORMAT_MOD_LINEAR 0ULL
 #endif
 
-#include "waywal/ipc_proto.h"
+#include "studio/core/rigging_commands.hpp"
 #include "studio/viewport/viewport_gizmo_overlay.hpp"
+#include "waywal/ipc_proto.h"
+#include "waywal/ipc_proto_rigging.h"
+#include "waywal/we_mesh_cdt.h"
+#include "waywal/we_mesh_rig.h"
+#include "waywal/we_puppet.h"
 
 namespace waywal::studio {
+
+struct WeightBrushDab {
+    float texelX{0.0f};
+    float texelY{0.0f};
+    float radiusPx{32.0f};
+    float strength{0.5f};
+    float targetWeight{1.0f};
+    float pressure{1.0f};
+    uint32_t activeBoneIndex{0};
+    we_weight_brush_op_t op{WE_WEIGHT_OP_ADD};
+    double timestampSec{0.0};
+};
 
 enum class PreviewMode { OfflineEmpty, DmaBufLive, InProcessImage, InProcessShader };
 
@@ -204,6 +221,37 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     }
     void setSceneViewProj(const QMatrix4x4 &viewProj, bool hasCustomViewProj = true);
     [[nodiscard]] ViewportGizmoOverlay &gizmoOverlay() noexcept { return m_gizmoOverlay; }
+    [[nodiscard]] QPointF mapWidgetToContentTexel(const QPointF &widgetPos) const noexcept;
+    [[nodiscard]] static bool isBrushToolMode(ViewportToolMode mode) noexcept;
+
+    // --- Puppet Rigging, Wireframe, IK, Onion Skin & Weight Paint Overlays ---
+    void setPuppetObjectId(int32_t objectId) noexcept { m_puppetObjectId = objectId; }
+    [[nodiscard]] int32_t puppetObjectId() const noexcept { return m_puppetObjectId; }
+    void setPuppetMeshWireframe(bool visible, const we_mesh_gen_result_t &mesh);
+    void setPuppetMeshData(bool wireframeVisible, std::vector<we_mdl_vertex_t> vertices,
+                           std::vector<uint16_t> indices);
+    void setPuppetWireframeVisible(bool visible);
+    [[nodiscard]] bool isPuppetWireframeVisible() const noexcept
+    {
+        return m_gizmoOverlay.meshWireframe().visible;
+    }
+    void setPuppetContourPins(std::vector<we_cdt_pin_t> pins, int32_t selectedPin = -1);
+    void setPuppetSkeleton(const BoneHierarchySnapshot &rig, int32_t selectedBoneIndex = -1);
+    void setSelectedPuppetBone(int32_t boneIndex);
+    void setPuppetIkHandles(std::vector<GizmoIkHandleData> chains);
+    void setOnionSkinEnabled(bool enabled);
+    void setOnionSkinFrames(std::vector<GizmoOnionGhostFrame> frames);
+    void setWeightHeatmapMode(bool enabled, uint32_t activeBoneIdx, float opacity,
+                              we_heatmap_palette_t palette);
+    void setWeightBrushParameters(we_weight_brush_op_t op, float radiusPx, float strength,
+                                  float targetWeight,
+                                  const std::array<uint64_t, 2> &lockedBones = {0ull, 0ull});
+    void applyWeightBrushDab(const WeightBrushDab &dab);
+    void applyVertexWeightBlocks(int32_t objectId,
+                                 const std::vector<VertexWeightBlockSnapshot> &blocks);
+    void applySolvedVertexWeights(int32_t objectId,
+                                  const std::vector<waywal_ipc_vertex_weight_t> &entries);
+    void normalizeAllVertexWeights(int32_t objectId, const std::array<uint64_t, 2> &lockedBones);
 
   signals:
     void applyRequested(const QString &monitorSpec);
@@ -224,6 +272,25 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     void brushPointerPressed(const QPointF &texelPos, float pressure, double timestampSec);
     void brushPointerMoved(const QPointF &texelPos, float pressure, double timestampSec);
     void brushPointerReleased(const QPointF &texelPos, float pressure, double timestampSec);
+
+    void contourPinAdded(int32_t objectId, double px, double py);
+    void contourPinMoved(int32_t objectId, uint32_t pinIndex, double px, double py);
+    void contourPinSelected(int32_t objectId, int32_t pinIndex);
+    void puppetBoneSelected(int32_t boneIndex);
+    void puppetBoneCreated(int32_t objectId, int32_t parentBoneIndex, const QPointF &headCanvas,
+                           const QPointF &tailCanvas, float angleZRad);
+    void puppetBoneReparented(int32_t objectId, int32_t childBoneIndex, int32_t newParentIndex);
+    void puppetBonePivotChanged(int32_t objectId, int32_t boneIndex, const QPointF &newLocalPos,
+                                float newAngleZRad, bool committed);
+    void puppetIkTargetChanged(int32_t objectId, int32_t chainIndex, const QVector3D &targetWorld,
+                               bool committed);
+    void puppetIkPoleChanged(int32_t objectId, int32_t chainIndex, const QVector3D &poleWorld,
+                             bool poleFlip, bool committed);
+    void weightBrushDabBatchReady(int32_t objectId, const std::vector<WeightBrushDab> &dabs);
+    void weightPaintStrokeCommitted(int32_t objectId,
+                                    const std::vector<VertexWeightBlockSnapshot> &preBlocks,
+                                    const std::vector<VertexWeightBlockSnapshot> &postBlocks,
+                                    const std::vector<waywal_ipc_vertex_weight_t> &dirtyEntries);
 
   public slots:
     void onApplyClicked();
@@ -254,12 +321,20 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     void setupQuadGeometry();
     void initBlitShader();
     void ensureGizmoGlInitialized();
+    void ensureGizmoVboCapacity(size_t requiredBytes);
     void renderGizmoOverlayPass(uint32_t contentW, uint32_t contentH);
     [[nodiscard]] QMatrix4x4 computeBlitMvp(uint32_t contentW, uint32_t contentH) const noexcept;
     [[nodiscard]] QMatrix4x4 computeGizmoViewProj(uint32_t contentW,
                                                   uint32_t contentH) const noexcept;
-    [[nodiscard]] QPointF mapWidgetToContentTexel(const QPointF &widgetPos) const noexcept;
-    [[nodiscard]] static bool isBrushToolMode(ViewportToolMode mode) noexcept;
+    [[nodiscard]] QPointF mapTexelToCanvasWorld(const QPointF &texel) const noexcept;
+    [[nodiscard]] QPointF mapTexelToPuppetLocal(const QPointF &texel) const noexcept;
+    void beginWeightPaintStroke();
+    void recordWeightBrushDab(const QPointF &texel, float pressure, double tsSec);
+    void flushWeightBrushDabBatch();
+    void finishWeightPaintStroke();
+    [[nodiscard]] bool tryBeginRiggingDrag(const QPointF &widgetPos, Qt::KeyboardModifiers mods);
+    void updateRiggingDrag(const QPointF &widgetPos, Qt::KeyboardModifiers mods);
+    void finishRiggingDrag(const QPointF &widgetPos, Qt::KeyboardModifiers mods);
     [[nodiscard]] QSize physicalSizeFor(int logicalW, int logicalH) const noexcept;
     [[nodiscard]] QSize physicalFramebufferSize() const noexcept;
     void ensureNeutralPassTexture();
@@ -380,8 +455,10 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     ViewportGizmoOverlay m_gizmoOverlay{};
     QOpenGLVertexArrayObject m_gizmoVao{};
     QOpenGLBuffer m_gizmoVbo{QOpenGLBuffer::VertexBuffer};
+    size_t m_gizmoVboCapacityBytes{0};
     std::unique_ptr<QOpenGLShaderProgram> m_gizmoProgram{nullptr};
     std::vector<GizmoVertex> m_gizmoVertices{};
+    std::vector<GizmoVertex> m_heatmapVertices{};
     bool m_hasCustomSceneViewProj{false};
     QMatrix4x4 m_customSceneViewProj{};
     int32_t m_activeGizmoNodeId{-1};
@@ -391,6 +468,34 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     bool m_hasGizmoEmittersOrLights{false};
     bool m_brushStrokeActive{false};
     QElapsedTimer m_brushClock{};
+
+    enum class RigDragKind : uint8_t {
+        None = 0,
+        ContourPinMove,
+        BoneCreate,
+        BoneJointMoveOrReparent,
+        BonePivotRotate,
+        IkTargetMove,
+        IkPoleMove,
+    };
+
+    int32_t m_puppetObjectId{-1};
+    RigDragKind m_rigDragKind{RigDragKind::None};
+    int32_t m_rigDragIndex{-1};
+    QVector3D m_rigDragStartWorld{0.0f, 0.0f, 0.0f};
+    QVector3D m_rigDragInitialBoneHead{0.0f, 0.0f, 0.0f};
+    QVector3D m_rigDragInitialBoneTail{0.0f, 0.0f, 0.0f};
+    float m_rigDragStartAngleRad{0.0f};
+    float m_rigDragInitialBoneAngleRad{0.0f};
+
+    we_weight_brush_op_t m_weightBrushOp{WE_WEIGHT_OP_ADD};
+    float m_weightBrushRadiusPx{32.0f};
+    float m_weightBrushStrength{0.5f};
+    float m_weightTargetValue{1.0f};
+    std::array<uint64_t, 2> m_lockedBoneMask{0ull, 0ull};
+    std::vector<WeightBrushDab> m_pendingWeightDabs{};
+    std::unordered_map<uint32_t, VertexWeightBlockSnapshot> m_weightPreBlocks{};
+    std::vector<uint32_t> m_weightDirtyVertices{};
 };
 
 } // namespace waywal::studio

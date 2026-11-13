@@ -12,7 +12,7 @@
 
 Most Wayland setups are held together with duct tape. You end up installing five or six separate tools (`swww` or `awww`, `mpvpaper`, `linux-wallpaperengine`, `glpaper`, `wpaperd`, plus `matugen` or `pywal`) just to get wallpapers, video loops, Steam Workshop scenes, music bars, and matching system colors.
 
-**WayWal** replaces the whole pile with one tiny C23 binary (`1.66 MB` total). Drop in a photo, a 4K video, a live shader, or a Steam Wallpaper Engine scene, and your whole desktop updates its color theme in half a millisecond. And the instant a window covers your screen, WayWal drops to `0.0%` CPU and GPU so your battery stays untouched.
+**WayWal** replaces the whole pile with tiny C23 binaries (`2.91 MiB` total stripped). Drop in a photo, a 4K video, a live shader, or a Steam Wallpaper Engine scene, and your whole desktop updates its color theme in half a millisecond. And the instant a window covers your screen, WayWal drops to `0.0%` CPU and GPU so your battery stays untouched.
 
 ---
 
@@ -25,7 +25,7 @@ Most Wayland setups are held together with duct tape. You end up installing five
 - **Sun-tracked day and night wallpapers**: Give it your location (or a GNOME timed wallpaper) and your desktop shifts from dawn to noon to night with the real sun, flipping your apps between light and dark mode along the way.
 - **Zero wasted battery (`0.0%` when covered)**: Still images use `0.0%` CPU and `0.0%` GPU once drawn. Videos use hardware VA-API decoding (`~0.3%` CPU). Open a window full screen or launch a game, and WayWal pauses right away. It mutes background sound too, then wakes back up when you can see your desktop again.
 - **Drop-in replacement for `swww`, `awww`, and `wpaperd`**: Keep your old scripts and keybinds. WayWal reads `swww` and `awww` CLI flags directly, loads `wpaperd` configs, and includes `wwal pick` so you can browse thumbnails in `rofi`, `fuzzel`, or `walker` in under `1 ms`.
-- **WayWal Studio GUI (`wwal-studio`)**: Includes an optional Wayland GUI workstation across 6 workspace perspectives (`Default`, `Shader Coding`, `Scene Composer`, `Particle & Audio`, `Theme Studio`, `Multi-Monitor`) to browse local wallpapers, Steam Workshop (`431960`), and WayWal Open Hub packages; compose WYSIWYG layers with `SceneLayerTreeWidget` and interactive viewport gizmos; paint GPU masks, flow maps, blur, and smudge via `we_gpu_brush`; author particle emitters and PipeWire audio bindings; edit GLSL ES 3.10 and SceneScript with live `we_script_lint` diagnostics; compose multi-pass shaders in a visual node graph editor with 50 drag-and-drop effects; tune 3D cameras, lights, and spring-bone physics; preview Material You color themes; arrange multi-monitor spans; and export `PKGV0022`/`TEXV0005` scenes or Ed25519-signed `.wwpkg` packages.
+- **WayWal Studio GUI (`wwal-studio`)**: Includes an optional Wayland GUI workstation across 7 workspace perspectives (`Default`, `Shader Coding`, `Scene Composer`, `Particle & Audio`, `Rigging & Animation`, `Theme Studio`, `Multi-Monitor`) and 22 dockable panels to browse local wallpapers, Steam Workshop (`431960`), and WayWal Open Hub packages; compose WYSIWYG layers with `SceneLayerTreeWidget` and interactive viewport gizmos; paint GPU masks, flow maps, blur, and smudge via `we_gpu_brush`; generate 2D puppet meshes via Constrained Delaunay Triangulation (`we_mesh_cdt`), bind bones with harmonic heat-diffusion skinning and a GLES 3.1 GPU weight brush, pose 2-bone IK & Aim constraints, and keyframe animations in `DopeSheetTimelineWidget` with `studio_rig_<id>.json` sidecars; author particle emitters and PipeWire audio bindings; edit GLSL ES 3.10 and SceneScript with live `we_script_lint` diagnostics; compose multi-pass shaders in a visual node graph editor with 50 drag-and-drop effects; tune 3D cameras, lights, and spring-bone physics; preview Material You color themes; arrange multi-monitor spans; and export `MDLV0023` puppets, `PKGV0022`/`TEXV0005` scenes, or Ed25519-signed `.wwpkg` packages.
 
 ---
 
@@ -33,7 +33,7 @@ Most Wayland setups are held together with duct tape. You end up installing five
 
 WayWal is written in C23 and talks directly to Wayland, DRM/KMS, and your GPU:
 
-- **Binary size**: **`1.34 MB`** daemon (`wwald`) + **`0.32 MB`** client (`wwal`) stripped.
+- **Binary size**: **`2.50 MiB`** (`2,623,592 B`) daemon (`wwald`) + **`414 KiB`** (`424,000 B`) client (`wwal`), **`2.91 MiB`** total stripped.
 - **Still pictures**: **`0.00%` CPU and `0.00%` GPU** once the frame is on screen.
 - **Covered by a window**: **`0.00%` CPU, `0.00%` GPU**, and **`0` wakeups/sec**.
 - **4K video loops**: **`~0.3%` CPU** via hardware VA-API decoding.

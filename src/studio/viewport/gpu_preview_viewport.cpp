@@ -22,6 +22,7 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QDebug>
+#include <QtMath>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +34,7 @@
 #include <sys/socket.h>
 #include <algorithm>
 #include <limits>
+#include <unordered_set>
 
 extern "C" {
 #include <waywal/image_loader.h>
@@ -2530,6 +2532,14 @@ void GpuPreviewViewport::mousePressEvent(QMouseEvent *event)
             m_brushStrokeActive = true;
             const QPointF texel = mapWidgetToContentTexel(event->position());
             const double tsSec = static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9;
+            if (mode == ViewportToolMode::WeightBrush) {
+                m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+                m_gizmoOverlay.setWeightBrushCursor(mapTexelToCanvasWorld(texel), true);
+                beginWeightPaintStroke();
+                recordWeightBrushDab(texel, 1.0f, tsSec);
+                flushWeightBrushDabBatch();
+                update();
+            }
             emit brushPointerPressed(texel, 1.0f, tsSec);
             event->accept();
             return;
@@ -2539,12 +2549,20 @@ void GpuPreviewViewport::mousePressEvent(QMouseEvent *event)
             const uint32_t cW = contentWidth();
             const uint32_t cH = contentHeight();
             const QMatrix4x4 vp = computeGizmoViewProj(cW, cH);
-            if (m_gizmoOverlay.beginDrag(event->position(), size(), vp)) {
+            const bool preferSceneGizmo =
+                (mode == ViewportToolMode::SelectBBox || mode == ViewportToolMode::Translate ||
+                 mode == ViewportToolMode::Rotate || mode == ViewportToolMode::Scale);
+            if (preferSceneGizmo && m_gizmoOverlay.beginDrag(event->position(), size(), vp)) {
                 m_dragStartTransform = m_gizmoOverlay.dragInitialTransform();
                 m_dragCurrentTransform = m_gizmoOverlay.updateDrag(
                     event->position(), size(), vp, event->modifiers().testFlag(Qt::ControlModifier),
                     event->modifiers().testFlag(Qt::ShiftModifier));
                 setCursor(Qt::SizeAllCursor);
+                update();
+                event->accept();
+                return;
+            }
+            if (tryBeginRiggingDrag(event->position(), event->modifiers())) {
                 update();
                 event->accept();
                 return;
@@ -2583,11 +2601,34 @@ void GpuPreviewViewport::mouseMoveEvent(QMouseEvent *event)
         return;
     }
 
+    if (m_gizmoOverlay.toolMode() == ViewportToolMode::WeightBrush) {
+        m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+        const QPointF hoverTexel = mapWidgetToContentTexel(event->position());
+        m_gizmoOverlay.setWeightBrushCursor(mapTexelToCanvasWorld(hoverTexel), true);
+        if (!m_brushStrokeActive) {
+            update();
+        }
+    }
+
     if (m_brushStrokeActive && isBrushToolMode(m_gizmoOverlay.toolMode())) {
         const QPointF texel = mapWidgetToContentTexel(event->position());
         const double tsSec =
             m_brushClock.isValid() ? static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9 : 0.0;
+        if (m_gizmoOverlay.toolMode() == ViewportToolMode::WeightBrush) {
+            recordWeightBrushDab(texel, 1.0f, tsSec);
+            if (m_pendingWeightDabs.size() >= 8) {
+                flushWeightBrushDabBatch();
+            }
+            update();
+        }
         emit brushPointerMoved(texel, 1.0f, tsSec);
+        event->accept();
+        return;
+    }
+
+    if (m_rigDragKind != RigDragKind::None) {
+        updateRiggingDrag(event->position(), event->modifiers());
+        update();
         event->accept();
         return;
     }
@@ -2606,11 +2647,18 @@ void GpuPreviewViewport::mouseMoveEvent(QMouseEvent *event)
     }
 
     const ViewportToolMode mode = m_gizmoOverlay.toolMode();
-    if (mode != ViewportToolMode::Navigate && !isBrushToolMode(mode) && m_activeGizmoNodeId >= 0) {
-        const QMatrix4x4 vp = computeGizmoViewProj(contentWidth(), contentHeight());
-        const GizmoAxisHandle hovered = m_gizmoOverlay.pickHandle(event->position(), size(), vp);
+    if (mode != ViewportToolMode::Navigate && !isBrushToolMode(mode)) {
+        const uint32_t cW = contentWidth();
+        const uint32_t cH = contentHeight();
+        m_gizmoOverlay.setContentSize(cW, cH);
+        const QMatrix4x4 vp = computeGizmoViewProj(cW, cH);
+        const GizmoAxisHandle hovered =
+            (m_activeGizmoNodeId >= 0) ? m_gizmoOverlay.pickHandle(event->position(), size(), vp)
+                                       : GizmoAxisHandle::None;
+        const RigPickResult rigHovered =
+            m_gizmoOverlay.pickRiggingHandle(event->position(), size(), vp);
         if (m_hoveredButton == ActionBarButton::None) {
-            if (hovered != GizmoAxisHandle::None) {
+            if (hovered != GizmoAxisHandle::None || rigHovered.handle != GizmoAxisHandle::None) {
                 setCursor(Qt::OpenHandCursor);
             } else {
                 unsetCursor();
@@ -2644,7 +2692,18 @@ void GpuPreviewViewport::mouseReleaseEvent(QMouseEvent *event)
         const QPointF texel = mapWidgetToContentTexel(event->position());
         const double tsSec =
             m_brushClock.isValid() ? static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9 : 0.0;
+        if (m_gizmoOverlay.toolMode() == ViewportToolMode::WeightBrush) {
+            finishWeightPaintStroke();
+            update();
+        }
         emit brushPointerReleased(texel, 0.0f, tsSec);
+        event->accept();
+        return;
+    }
+    if (event->button() == Qt::LeftButton && m_rigDragKind != RigDragKind::None) {
+        finishRiggingDrag(event->position(), event->modifiers());
+        unsetCursor();
+        update();
         event->accept();
         return;
     }
@@ -2716,7 +2775,16 @@ void GpuPreviewViewport::tabletEvent(QTabletEvent *event)
         }
         m_brushStrokeActive = true;
         const double tsSec = static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9;
-        emit brushPointerPressed(texel, pressure > 0.0f ? pressure : 1.0f, tsSec);
+        const float effPressure = pressure > 0.0f ? pressure : 1.0f;
+        if (mode == ViewportToolMode::WeightBrush) {
+            m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+            m_gizmoOverlay.setWeightBrushCursor(mapTexelToCanvasWorld(texel), true);
+            beginWeightPaintStroke();
+            recordWeightBrushDab(texel, effPressure, tsSec);
+            flushWeightBrushDabBatch();
+            update();
+        }
+        emit brushPointerPressed(texel, effPressure, tsSec);
         event->accept();
         return;
     }
@@ -2725,6 +2793,15 @@ void GpuPreviewViewport::tabletEvent(QTabletEvent *event)
             const double tsSec = m_brushClock.isValid()
                                      ? static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9
                                      : 0.0;
+            if (mode == ViewportToolMode::WeightBrush) {
+                m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+                m_gizmoOverlay.setWeightBrushCursor(mapTexelToCanvasWorld(texel), true);
+                recordWeightBrushDab(texel, pressure > 0.0f ? pressure : 1.0f, tsSec);
+                if (m_pendingWeightDabs.size() >= 8) {
+                    flushWeightBrushDabBatch();
+                }
+                update();
+            }
             emit brushPointerMoved(texel, pressure, tsSec);
             event->accept();
             return;
@@ -2736,6 +2813,10 @@ void GpuPreviewViewport::tabletEvent(QTabletEvent *event)
             const double tsSec = m_brushClock.isValid()
                                      ? static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9
                                      : 0.0;
+            if (mode == ViewportToolMode::WeightBrush) {
+                finishWeightPaintStroke();
+                update();
+            }
             emit brushPointerReleased(texel, pressure, tsSec);
             event->accept();
             return;
@@ -2750,6 +2831,7 @@ void GpuPreviewViewport::tabletEvent(QTabletEvent *event)
 
 void GpuPreviewViewport::leaveEvent(QEvent *event)
 {
+    m_gizmoOverlay.setWeightBrushCursor(QPointF(0.0, 0.0), false);
     if (m_hoveredButton != ActionBarButton::None) {
         m_hoveredButton = ActionBarButton::None;
         unsetCursor();
@@ -2862,6 +2944,9 @@ void GpuPreviewViewport::setToolMode(ViewportToolMode mode)
     }
     m_gizmoOverlay.setToolMode(mode);
     m_brushStrokeActive = false;
+    m_rigDragKind = RigDragKind::None;
+    m_rigDragIndex = -1;
+    m_gizmoOverlay.setBoneCreatePreview(false, QVector3D(), QVector3D());
     emit toolModeChanged(mode);
     update();
 }
@@ -2911,7 +2996,7 @@ void GpuPreviewViewport::keyPressEvent(QKeyEvent *event)
 bool GpuPreviewViewport::isBrushToolMode(ViewportToolMode mode) noexcept
 {
     return mode == ViewportToolMode::BrushMask || mode == ViewportToolMode::BrushFlow ||
-           mode == ViewportToolMode::BrushBlurSmudge;
+           mode == ViewportToolMode::BrushBlurSmudge || mode == ViewportToolMode::WeightBrush;
 }
 
 QPointF GpuPreviewViewport::mapWidgetToContentTexel(const QPointF &widgetPos) const noexcept
@@ -3007,6 +3092,19 @@ QMatrix4x4 GpuPreviewViewport::computeGizmoViewProj(uint32_t contentW,
     return blitMvp * canvasToQuad;
 }
 
+QPointF GpuPreviewViewport::mapTexelToCanvasWorld(const QPointF &texel) const noexcept
+{
+    const double ch = static_cast<double>(std::max<uint32_t>(1u, contentHeight()));
+    return QPointF(texel.x(), ch - texel.y());
+}
+
+QPointF GpuPreviewViewport::mapTexelToPuppetLocal(const QPointF &texel) const noexcept
+{
+    const double cw = static_cast<double>(std::max<uint32_t>(1u, contentWidth()));
+    const double ch = static_cast<double>(std::max<uint32_t>(1u, contentHeight()));
+    return QPointF(texel.x() - 0.5 * cw, 0.5 * ch - texel.y());
+}
+
 void GpuPreviewViewport::ensureGizmoGlInitialized()
 {
     if (m_gizmoProgram) {
@@ -3043,8 +3141,8 @@ void GpuPreviewViewport::ensureGizmoGlInitialized()
     }
     m_gizmoVbo.bind();
     m_gizmoVbo.setUsagePattern(QOpenGLBuffer::DynamicDraw);
-    m_gizmoVbo.allocate(
-        static_cast<int>(ViewportGizmoOverlay::kMaxDynamicVertices * sizeof(GizmoVertex)));
+    m_gizmoVboCapacityBytes = 4096u * sizeof(GizmoVertex);
+    m_gizmoVbo.allocate(static_cast<int>(m_gizmoVboCapacityBytes));
 
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GizmoVertex),
@@ -3057,9 +3155,31 @@ void GpuPreviewViewport::ensureGizmoGlInitialized()
     m_gizmoVao.release();
 }
 
+void GpuPreviewViewport::ensureGizmoVboCapacity(size_t requiredBytes)
+{
+    if (!m_gizmoVbo.isCreated() || requiredBytes <= m_gizmoVboCapacityBytes) {
+        return;
+    }
+    const size_t maxBytes = ViewportGizmoOverlay::kMaxDynamicVertices * sizeof(GizmoVertex);
+    const size_t clampedReq = std::min(requiredBytes, maxBytes);
+    if (clampedReq <= m_gizmoVboCapacityBytes) {
+        return;
+    }
+    size_t newCap = std::max<size_t>(m_gizmoVboCapacityBytes * 2u, 4096u * sizeof(GizmoVertex));
+    while (newCap < clampedReq && newCap < maxBytes) {
+        newCap = std::min(newCap * 2u, maxBytes);
+    }
+    m_gizmoVbo.bind();
+    m_gizmoVbo.allocate(static_cast<int>(newCap));
+    m_gizmoVboCapacityBytes = newCap;
+    m_gizmoVbo.release();
+}
+
 void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t contentH)
 {
-    if (m_gizmoOverlay.toolMode() == ViewportToolMode::Navigate && !m_hasGizmoEmittersOrLights) {
+    m_gizmoOverlay.setContentSize(contentW, contentH);
+    if (m_gizmoOverlay.toolMode() == ViewportToolMode::Navigate && !m_hasGizmoEmittersOrLights &&
+        !m_gizmoOverlay.hasVisibleRiggingOverlay()) {
         return;
     }
 
@@ -3071,9 +3191,10 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
     const QVector3D camEye(cam.eye_pos[0], cam.eye_pos[1], cam.eye_pos[2]);
     const float fovYDeg = (cam.fov_y_deg > 1.0f) ? cam.fov_y_deg : 60.0f;
 
+    m_gizmoOverlay.buildHeatmapTriangleVertices(m_heatmapVertices);
     m_gizmoOverlay.buildRenderVertices(size(), viewProj, camEye, fovYDeg, orthoZoom,
                                        m_hasCustomSceneViewProj, m_gizmoVertices);
-    if (m_gizmoVertices.empty()) {
+    if (m_heatmapVertices.empty() && m_gizmoVertices.empty()) {
         return;
     }
 
@@ -3081,6 +3202,12 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
     if (!m_gizmoProgram || !m_gizmoProgram->isLinked() || !m_gizmoVao.isCreated()) {
         return;
     }
+
+    const size_t maxVerts = ViewportGizmoOverlay::kMaxDynamicVertices;
+    const size_t heatCount = std::min(m_heatmapVertices.size(), maxVerts);
+    const size_t lineCount = std::min(m_gizmoVertices.size(), maxVerts);
+    const size_t maxBytesNeeded = std::max(heatCount, lineCount) * sizeof(GizmoVertex);
+    ensureGizmoVboCapacity(maxBytesNeeded);
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -3092,15 +3219,922 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
 
     m_gizmoVao.bind();
     m_gizmoVbo.bind();
-    const size_t vertCount =
-        std::min(m_gizmoVertices.size(), ViewportGizmoOverlay::kMaxDynamicVertices);
-    m_gizmoVbo.write(0, m_gizmoVertices.data(), static_cast<int>(vertCount * sizeof(GizmoVertex)));
-    glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(vertCount));
+    if (heatCount >= 3u) {
+        m_gizmoVbo.write(0, m_heatmapVertices.data(),
+                         static_cast<int>(heatCount * sizeof(GizmoVertex)));
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(heatCount));
+    }
+    if (lineCount >= 2u) {
+        m_gizmoVbo.write(0, m_gizmoVertices.data(),
+                         static_cast<int>(lineCount * sizeof(GizmoVertex)));
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(lineCount));
+    }
     m_gizmoVbo.release();
     m_gizmoVao.release();
 
     m_gizmoProgram->release();
     glDisable(GL_BLEND);
+}
+
+void GpuPreviewViewport::setPuppetMeshWireframe(bool visible, const we_mesh_gen_result_t &mesh)
+{
+    std::vector<we_mdl_vertex_t> verts;
+    std::vector<uint16_t> indices;
+    if (mesh.vertices && mesh.vertex_count > 0) {
+        verts.assign(mesh.vertices, mesh.vertices + mesh.vertex_count);
+    }
+    if (mesh.indices && mesh.triangle_count > 0) {
+        indices.assign(mesh.indices, mesh.indices + static_cast<size_t>(mesh.triangle_count) * 3u);
+    }
+    setPuppetMeshData(visible, std::move(verts), std::move(indices));
+}
+
+void GpuPreviewViewport::setPuppetMeshData(bool wireframeVisible,
+                                           std::vector<we_mdl_vertex_t> vertices,
+                                           std::vector<uint16_t> indices)
+{
+    m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    m_gizmoOverlay.setMeshWireframe(wireframeVisible, std::move(vertices), std::move(indices));
+    update();
+}
+
+void GpuPreviewViewport::setPuppetWireframeVisible(bool visible)
+{
+    m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    m_gizmoOverlay.setMeshWireframeVisible(visible);
+    update();
+}
+
+void GpuPreviewViewport::setPuppetContourPins(std::vector<we_cdt_pin_t> pins, int32_t selectedPin)
+{
+    m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    m_gizmoOverlay.setMeshPins(std::move(pins), selectedPin);
+    update();
+}
+
+void GpuPreviewViewport::setPuppetSkeleton(const BoneHierarchySnapshot &rig,
+                                           int32_t selectedBoneIndex)
+{
+    m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    m_puppetObjectId = rig.objectId;
+    const size_t boneCount = rig.bones.size();
+    std::vector<std::array<float, 16>> worldMats(boneCount);
+    auto mulColMajor = [](const float *a, const float *b, float *out) {
+        for (int col = 0; col < 4; ++col) {
+            for (int row = 0; row < 4; ++row) {
+                out[col * 4 + row] =
+                    a[0 * 4 + row] * b[col * 4 + 0] + a[1 * 4 + row] * b[col * 4 + 1] +
+                    a[2 * 4 + row] * b[col * 4 + 2] + a[3 * 4 + row] * b[col * 4 + 3];
+            }
+        }
+    };
+
+    // Visit states: 0 = unvisited, 1 = on current ancestor path, 2 = resolved.
+    std::vector<uint8_t> visitState(boneCount, 0u);
+    std::vector<size_t> chainStack;
+    chainStack.reserve(boneCount);
+    for (size_t i = 0; i < boneCount; ++i) {
+        if (visitState[i] == 2u) {
+            continue;
+        }
+        chainStack.clear();
+        size_t cur = i;
+        while (cur < boneCount && visitState[cur] == 0u) {
+            visitState[cur] = 1u;
+            chainStack.push_back(cur);
+            const uint32_t p = rig.bones[cur].parent;
+            if (p == 0xFFFFFFFFu || p >= boneCount) {
+                break;
+            }
+            cur = static_cast<size_t>(p);
+        }
+        while (!chainStack.empty()) {
+            const size_t idx = chainStack.back();
+            chainStack.pop_back();
+            const auto &src = rig.bones[idx];
+            if (src.parent != 0xFFFFFFFFu && src.parent < boneCount &&
+                visitState[src.parent] == 2u) {
+                mulColMajor(worldMats[src.parent].data(), src.local_trans, worldMats[idx].data());
+            } else {
+                std::memcpy(worldMats[idx].data(), src.local_trans, sizeof(src.local_trans));
+            }
+            visitState[idx] = 2u;
+        }
+    }
+
+    std::vector<GizmoBoneNode> nodes(boneCount);
+    std::vector<bool> hasChild(boneCount, false);
+    for (size_t i = 0; i < boneCount; ++i) {
+        const auto &src = rig.bones[i];
+        auto &dst = nodes[i];
+        dst.index = static_cast<uint32_t>(i);
+        dst.parentIndex = src.parent;
+        dst.headWorld = QVector3D(worldMats[i][12], worldMats[i][13], worldMats[i][14]);
+        dst.localPos = {src.local_trans[12], src.local_trans[13], src.local_trans[14]};
+        dst.localAngleRad = std::atan2(src.local_trans[1], src.local_trans[0]);
+        dst.driveMode = (i < WE_MDL_MAX_BONES) ? rig.driveModes[i] : WE_BONE_DRIVE_FK;
+        dst.selected = (static_cast<int32_t>(i) == selectedBoneIndex);
+        if (src.parent != 0xFFFFFFFFu && src.parent < boneCount) {
+            hasChild[src.parent] = true;
+            nodes[src.parent].tailWorld = dst.headWorld;
+        }
+    }
+    for (size_t i = 0; i < boneCount; ++i) {
+        if (!hasChild[i]) {
+            const QVector3D axisX(worldMats[i][0], worldMats[i][1], worldMats[i][2]);
+            const QVector3D dir =
+                (axisX.lengthSquared() > 1e-5f) ? axisX.normalized() : QVector3D(1.0f, 0.0f, 0.0f);
+            nodes[i].tailWorld = nodes[i].headWorld + dir * 28.0f;
+        }
+    }
+    m_gizmoOverlay.setPuppetBones(std::move(nodes), selectedBoneIndex);
+
+    std::vector<GizmoIkHandleData> ikHandles;
+    ikHandles.reserve(rig.ikChains.size());
+    for (size_t c = 0; c < rig.ikChains.size(); ++c) {
+        const auto &ch = rig.ikChains[c];
+        if (ch.root_bone >= boneCount || ch.mid_bone >= boneCount || ch.end_bone >= boneCount) {
+            continue;
+        }
+        GizmoIkHandleData handle{};
+        handle.chainIndex = static_cast<int32_t>(c);
+        handle.chain = ch;
+        handle.rootWorld = m_gizmoOverlay.puppetBones()[ch.root_bone].headWorld;
+        handle.midWorld = m_gizmoOverlay.puppetBones()[ch.mid_bone].headWorld;
+        handle.endWorld = m_gizmoOverlay.puppetBones()[ch.end_bone].headWorld;
+        handle.targetWorld = QVector3D(ch.target_world[0], ch.target_world[1], ch.target_world[2]);
+        if (handle.targetWorld.lengthSquared() < 1e-6f) {
+            handle.targetWorld = handle.endWorld;
+        }
+        const QVector3D poleFromChain(ch.pole_world[0], ch.pole_world[1], ch.pole_world[2]);
+        if (poleFromChain.lengthSquared() > 1e-6f) {
+            handle.poleWorld = poleFromChain;
+        } else {
+            const QVector3D baseDir = handle.endWorld - handle.rootWorld;
+            const QVector3D perp = (baseDir.lengthSquared() > 1e-4f)
+                                       ? QVector3D(-baseDir.y(), baseDir.x(), 0.0f).normalized()
+                                       : QVector3D(0.0f, 1.0f, 0.0f);
+            const float poleSign = (ch.bend_sign < 0) ? -1.0f : 1.0f;
+            handle.poleWorld = handle.midWorld + perp * (36.0f * poleSign);
+        }
+        ikHandles.push_back(handle);
+    }
+    m_gizmoOverlay.setIkHandles(std::move(ikHandles));
+    update();
+}
+
+void GpuPreviewViewport::setSelectedPuppetBone(int32_t boneIndex)
+{
+    m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    m_gizmoOverlay.setSelectedBoneIndex(boneIndex);
+    update();
+}
+
+void GpuPreviewViewport::setPuppetIkHandles(std::vector<GizmoIkHandleData> chains)
+{
+    m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    m_gizmoOverlay.setIkHandles(std::move(chains));
+    update();
+}
+
+void GpuPreviewViewport::setOnionSkinEnabled(bool enabled)
+{
+    m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    m_gizmoOverlay.setOnionSkinEnabled(enabled);
+    update();
+}
+
+void GpuPreviewViewport::setOnionSkinFrames(std::vector<GizmoOnionGhostFrame> frames)
+{
+    m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    m_gizmoOverlay.setOnionSkinFrames(std::move(frames));
+    update();
+}
+
+void GpuPreviewViewport::setWeightHeatmapMode(bool enabled, uint32_t activeBoneIdx, float opacity,
+                                              we_heatmap_palette_t palette)
+{
+    m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    m_gizmoOverlay.setWeightHeatmapEnabled(enabled, activeBoneIdx, opacity, palette);
+    update();
+}
+
+void GpuPreviewViewport::setWeightBrushParameters(we_weight_brush_op_t op, float radiusPx,
+                                                  float strength, float targetWeight,
+                                                  const std::array<uint64_t, 2> &lockedBones)
+{
+    m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    m_weightBrushOp = op;
+    m_weightBrushRadiusPx = std::max(1.0f, radiusPx);
+    m_weightBrushStrength = std::clamp(strength, 0.0f, 1.0f);
+    m_weightTargetValue = std::clamp(targetWeight, 0.0f, 1.0f);
+    m_lockedBoneMask = lockedBones;
+
+    auto state = m_gizmoOverlay.weightBrushState();
+    state.op = m_weightBrushOp;
+    state.radiusPx = m_weightBrushRadiusPx;
+    state.strength = m_weightBrushStrength;
+    m_gizmoOverlay.setWeightBrushState(state);
+    update();
+}
+
+void GpuPreviewViewport::beginWeightPaintStroke()
+{
+    m_pendingWeightDabs.clear();
+    m_weightPreBlocks.clear();
+    m_weightDirtyVertices.clear();
+}
+
+void GpuPreviewViewport::applyWeightBrushDab(const WeightBrushDab &dab)
+{
+    auto &verts = m_gizmoOverlay.mutableMeshWireframe().vertices;
+    if (verts.empty() || dab.radiusPx <= 0.0f) {
+        return;
+    }
+
+    auto isBoneLocked = [&](uint32_t boneIdx) -> bool {
+        if (boneIdx >= 128u) {
+            return false;
+        }
+        return (m_lockedBoneMask[boneIdx >> 6u] & (1ull << (boneIdx & 63u))) != 0ull;
+    };
+
+    if (isBoneLocked(dab.activeBoneIndex) && dab.op != WE_WEIGHT_OP_NORMALIZE) {
+        return;
+    }
+
+    const float cw = static_cast<float>(std::max<uint32_t>(1u, contentWidth()));
+    const float ch = static_cast<float>(std::max<uint32_t>(1u, contentHeight()));
+    const float dabLocalX = dab.texelX - 0.5f * cw;
+    const float dabLocalY = 0.5f * ch - dab.texelY;
+    const float radiusSq = dab.radiusPx * dab.radiusPx;
+    const size_t totalVerts = verts.size();
+
+    float neighborAvg = 0.0f;
+    float neighborW = 0.0f;
+    if (dab.op == WE_WEIGHT_OP_SMOOTH) {
+        for (size_t i = 0; i < totalVerts; ++i) {
+            const float dx = verts[i].pos[0] - dabLocalX;
+            const float dy = verts[i].pos[1] - dabLocalY;
+            const float d2 = dx * dx + dy * dy;
+            if (d2 <= radiusSq) {
+                float w = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    if (verts[i].blend_indices[k] == dab.activeBoneIndex) {
+                        w += verts[i].weight[k];
+                    }
+                }
+                const float g = 1.0f - std::sqrt(d2) / dab.radiusPx;
+                neighborAvg += w * g;
+                neighborW += g;
+            }
+        }
+        if (neighborW > 1e-6f) {
+            neighborAvg /= neighborW;
+        }
+    }
+
+    for (size_t i = 0; i < totalVerts; ++i) {
+        const float dx = verts[i].pos[0] - dabLocalX;
+        const float dy = verts[i].pos[1] - dabLocalY;
+        const float distSq = dx * dx + dy * dy;
+        if (distSq > radiusSq) {
+            continue;
+        }
+
+        const uint32_t blockIdx = static_cast<uint32_t>(i / 256u);
+        if (!m_weightPreBlocks.contains(blockIdx)) {
+            const size_t bStart = static_cast<size_t>(blockIdx) * 256u;
+            const size_t bEnd = std::min(bStart + 256u, totalVerts);
+            VertexWeightBlockSnapshot snap{};
+            snap.blockIndex = blockIdx;
+            snap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
+                              verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
+            m_weightPreBlocks.emplace(blockIdx, std::move(snap));
+        }
+
+        const float dist = std::sqrt(distSq);
+        const float falloff =
+            0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * dist / dab.radiusPx));
+        const float alpha = std::clamp(dab.strength * dab.pressure * falloff, 0.0f, 1.0f);
+
+        auto &v = verts[i];
+        int targetSlot = -1;
+        int weakestSlot = 0;
+        float minW = v.weight[0];
+        for (int k = 0; k < 4; ++k) {
+            if (v.blend_indices[k] == dab.activeBoneIndex) {
+                targetSlot = k;
+                break;
+            }
+            if (v.weight[k] < minW) {
+                minW = v.weight[k];
+                weakestSlot = k;
+            }
+        }
+        if (targetSlot < 0 && dab.op != WE_WEIGHT_OP_NORMALIZE && dab.op != WE_WEIGHT_OP_SUBTRACT) {
+            targetSlot = weakestSlot;
+            v.blend_indices[targetSlot] = dab.activeBoneIndex;
+            v.weight[targetSlot] = 0.0f;
+        }
+
+        if (targetSlot >= 0) {
+            const float curW = v.weight[targetSlot];
+            float nextW = curW;
+            switch (dab.op) {
+            case WE_WEIGHT_OP_ADD:
+                nextW = std::clamp(curW + alpha, 0.0f, 1.0f);
+                break;
+            case WE_WEIGHT_OP_SUBTRACT:
+                nextW = std::clamp(curW - alpha, 0.0f, 1.0f);
+                break;
+            case WE_WEIGHT_OP_REPLACE:
+                nextW = curW + (dab.targetWeight - curW) * alpha;
+                break;
+            case WE_WEIGHT_OP_SMOOTH:
+                nextW = curW + (neighborAvg - curW) * alpha;
+                break;
+            case WE_WEIGHT_OP_NORMALIZE:
+                break;
+            }
+            v.weight[targetSlot] = std::clamp(nextW, 0.0f, 1.0f);
+        }
+
+        float lockedSum = 0.0f;
+        float freeSum = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            if (isBoneLocked(v.blend_indices[k])) {
+                lockedSum += std::max(0.0f, v.weight[k]);
+            } else {
+                freeSum += std::max(0.0f, v.weight[k]);
+            }
+        }
+        const float targetFree = std::max(0.0f, 1.0f - lockedSum);
+        if (freeSum > 1e-6f) {
+            const float scale = targetFree / freeSum;
+            for (int k = 0; k < 4; ++k) {
+                if (!isBoneLocked(v.blend_indices[k])) {
+                    v.weight[k] = std::max(0.0f, v.weight[k]) * scale;
+                }
+            }
+        }
+
+        m_weightDirtyVertices.push_back(static_cast<uint32_t>(i));
+    }
+}
+
+void GpuPreviewViewport::recordWeightBrushDab(const QPointF &texel, float pressure, double tsSec)
+{
+    WeightBrushDab dab{};
+    dab.texelX = static_cast<float>(texel.x());
+    dab.texelY = static_cast<float>(texel.y());
+    dab.radiusPx = m_weightBrushRadiusPx;
+    dab.strength = m_weightBrushStrength;
+    dab.targetWeight = m_weightTargetValue;
+    dab.pressure = std::clamp(pressure, 0.0f, 1.0f);
+    dab.activeBoneIndex = m_gizmoOverlay.weightBrushState().activeBoneIndex;
+    dab.op = m_weightBrushOp;
+    dab.timestampSec = tsSec;
+
+    applyWeightBrushDab(dab);
+    m_pendingWeightDabs.push_back(dab);
+}
+
+void GpuPreviewViewport::flushWeightBrushDabBatch()
+{
+    if (m_pendingWeightDabs.empty()) {
+        return;
+    }
+    emit weightBrushDabBatchReady(m_puppetObjectId, m_pendingWeightDabs);
+    m_pendingWeightDabs.clear();
+}
+
+void GpuPreviewViewport::finishWeightPaintStroke()
+{
+    flushWeightBrushDabBatch();
+    if (m_weightPreBlocks.empty()) {
+        m_weightDirtyVertices.clear();
+        return;
+    }
+
+    const auto &verts = m_gizmoOverlay.meshWireframe().vertices;
+    const size_t totalVerts = verts.size();
+
+    std::vector<VertexWeightBlockSnapshot> preBlocks;
+    std::vector<VertexWeightBlockSnapshot> postBlocks;
+    preBlocks.reserve(m_weightPreBlocks.size());
+    postBlocks.reserve(m_weightPreBlocks.size());
+    for (auto &[blockIdx, preSnap] : m_weightPreBlocks) {
+        const size_t bStart = static_cast<size_t>(blockIdx) * 256u;
+        const size_t bEnd = std::min(bStart + 256u, totalVerts);
+        if (bStart < bEnd) {
+            VertexWeightBlockSnapshot postSnap{};
+            postSnap.blockIndex = blockIdx;
+            postSnap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
+                                  verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
+            preBlocks.push_back(std::move(preSnap));
+            postBlocks.push_back(std::move(postSnap));
+        }
+    }
+
+    std::sort(m_weightDirtyVertices.begin(), m_weightDirtyVertices.end());
+    m_weightDirtyVertices.erase(
+        std::unique(m_weightDirtyVertices.begin(), m_weightDirtyVertices.end()),
+        m_weightDirtyVertices.end());
+
+    std::vector<waywal_ipc_vertex_weight_t> dirtyEntries;
+    dirtyEntries.reserve(m_weightDirtyVertices.size());
+    for (uint32_t vIdx : m_weightDirtyVertices) {
+        if (vIdx >= totalVerts) {
+            continue;
+        }
+        waywal_ipc_vertex_weight_t vw{};
+        vw.vertex_index = vIdx;
+        for (int k = 0; k < 4; ++k) {
+            vw.blend_indices[k] = verts[vIdx].blend_indices[k];
+            vw.weight[k] = verts[vIdx].weight[k];
+        }
+        dirtyEntries.push_back(vw);
+    }
+
+    m_weightPreBlocks.clear();
+    m_weightDirtyVertices.clear();
+    emit weightPaintStrokeCommitted(m_puppetObjectId, preBlocks, postBlocks, dirtyEntries);
+}
+
+void GpuPreviewViewport::applyVertexWeightBlocks(
+    int32_t objectId, const std::vector<VertexWeightBlockSnapshot> &blocks)
+{
+    if (objectId < 0 || m_puppetObjectId != objectId || blocks.empty()) {
+        return;
+    }
+    auto &verts = m_gizmoOverlay.mutableMeshWireframe().vertices;
+    if (verts.empty()) {
+        return;
+    }
+
+    bool anyApplied = false;
+    for (const auto &blk : blocks) {
+        const size_t base = static_cast<size_t>(blk.blockIndex) * 256u;
+        if (base >= verts.size()) {
+            continue;
+        }
+        const size_t count = std::min(blk.slice.size(), verts.size() - base);
+        for (size_t i = 0; i < count; ++i) {
+            std::memcpy(verts[base + i].blend_indices, blk.slice[i].blend_indices,
+                        sizeof(verts[base + i].blend_indices));
+            std::memcpy(verts[base + i].weight, blk.slice[i].weight,
+                        sizeof(verts[base + i].weight));
+            anyApplied = true;
+        }
+    }
+    if (anyApplied) {
+        update();
+    }
+}
+
+void GpuPreviewViewport::applySolvedVertexWeights(
+    int32_t objectId, const std::vector<waywal_ipc_vertex_weight_t> &entries)
+{
+    if (objectId < 0 || m_puppetObjectId != objectId || entries.empty()) {
+        return;
+    }
+    auto &verts = m_gizmoOverlay.mutableMeshWireframe().vertices;
+    if (verts.empty()) {
+        return;
+    }
+
+    bool anyApplied = false;
+    for (const auto &entry : entries) {
+        if (entry.vertex_index >= verts.size()) {
+            continue;
+        }
+        auto &v = verts[entry.vertex_index];
+        for (int k = 0; k < 4; ++k) {
+            v.blend_indices[k] = entry.blend_indices[k];
+            v.weight[k] =
+                std::isfinite(entry.weight[k]) ? std::clamp(entry.weight[k], 0.0f, 1.0f) : 0.0f;
+        }
+        anyApplied = true;
+    }
+    if (anyApplied) {
+        update();
+    }
+}
+
+void GpuPreviewViewport::normalizeAllVertexWeights(int32_t objectId,
+                                                   const std::array<uint64_t, 2> &lockedBones)
+{
+    if (objectId < 0 || m_puppetObjectId != objectId) {
+        return;
+    }
+    auto &verts = m_gizmoOverlay.mutableMeshWireframe().vertices;
+    if (verts.empty()) {
+        return;
+    }
+
+    auto isBoneLocked = [&lockedBones](uint32_t boneIdx) -> bool {
+        if (boneIdx >= 128u) {
+            return false;
+        }
+        return (lockedBones[boneIdx >> 6u] & (1ull << (boneIdx & 63u))) != 0ull;
+    };
+
+    const size_t totalVerts = verts.size();
+    std::vector<VertexWeightBlockSnapshot> preBlocks;
+    std::vector<VertexWeightBlockSnapshot> postBlocks;
+    std::vector<waywal_ipc_vertex_weight_t> dirtyEntries;
+
+    for (size_t bStart = 0; bStart < totalVerts; bStart += 256u) {
+        const size_t bEnd = std::min(bStart + 256u, totalVerts);
+        bool blockDirty = false;
+        VertexWeightBlockSnapshot preSnap{};
+        preSnap.blockIndex = static_cast<uint32_t>(bStart / 256u);
+
+        for (size_t i = bStart; i < bEnd; ++i) {
+            auto &v = verts[i];
+            float lockedSum = 0.0f;
+            float freeSum = 0.0f;
+            std::array<float, 4> cleanW{};
+            for (int k = 0; k < 4; ++k) {
+                const float w = std::isfinite(v.weight[k]) ? std::max(0.0f, v.weight[k]) : 0.0f;
+                cleanW[k] = w;
+                if (isBoneLocked(v.blend_indices[k])) {
+                    lockedSum += w;
+                } else {
+                    freeSum += w;
+                }
+            }
+
+            const float targetFree = std::max(0.0f, 1.0f - lockedSum);
+            std::array<float, 4> nextW = cleanW;
+            if (freeSum > 1e-6f) {
+                const float scale = targetFree / freeSum;
+                for (int k = 0; k < 4; ++k) {
+                    if (!isBoneLocked(v.blend_indices[k])) {
+                        nextW[k] = cleanW[k] * scale;
+                    }
+                }
+            }
+
+            bool vertChanged = false;
+            for (int k = 0; k < 4; ++k) {
+                if (!std::isfinite(v.weight[k]) || std::fabs(v.weight[k] - nextW[k]) > 1e-6f) {
+                    vertChanged = true;
+                    break;
+                }
+            }
+            if (vertChanged) {
+                if (!blockDirty) {
+                    blockDirty = true;
+                    preSnap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
+                                         verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
+                }
+                for (int k = 0; k < 4; ++k) {
+                    v.weight[k] = nextW[k];
+                }
+                waywal_ipc_vertex_weight_t vw{};
+                vw.vertex_index = static_cast<uint32_t>(i);
+                std::memcpy(vw.blend_indices, v.blend_indices, sizeof(vw.blend_indices));
+                std::memcpy(vw.weight, v.weight, sizeof(vw.weight));
+                dirtyEntries.push_back(vw);
+            }
+        }
+
+        if (blockDirty) {
+            VertexWeightBlockSnapshot postSnap{};
+            postSnap.blockIndex = preSnap.blockIndex;
+            postSnap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
+                                  verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
+            preBlocks.push_back(std::move(preSnap));
+            postBlocks.push_back(std::move(postSnap));
+        }
+    }
+
+    if (!dirtyEntries.empty()) {
+        update();
+        emit weightPaintStrokeCommitted(m_puppetObjectId, preBlocks, postBlocks, dirtyEntries);
+    }
+}
+
+bool GpuPreviewViewport::tryBeginRiggingDrag(const QPointF &widgetPos, Qt::KeyboardModifiers mods)
+{
+    (void)mods;
+    const ViewportToolMode mode = m_gizmoOverlay.toolMode();
+    const uint32_t cW = contentWidth();
+    const uint32_t cH = contentHeight();
+    m_gizmoOverlay.setContentSize(cW, cH);
+    const QMatrix4x4 vp = computeGizmoViewProj(cW, cH);
+    const RigPickResult hit = m_gizmoOverlay.pickRiggingHandle(widgetPos, size(), vp);
+    const QPointF texel = mapWidgetToContentTexel(widgetPos);
+    const QPointF localPt = mapTexelToPuppetLocal(texel);
+    const QVector3D curLocal(static_cast<float>(localPt.x()), static_cast<float>(localPt.y()),
+                             0.0f);
+
+    if (mode == ViewportToolMode::ContourPin) {
+        if (hit.handle == GizmoAxisHandle::ContourPinHandle && hit.index >= 0) {
+            m_gizmoOverlay.mutableMeshWireframe().selectedPinIndex = hit.index;
+            m_rigDragKind = RigDragKind::ContourPinMove;
+            m_rigDragIndex = hit.index;
+            emit contourPinSelected(m_puppetObjectId, hit.index);
+            setCursor(Qt::ClosedHandCursor);
+            return true;
+        }
+        we_cdt_pin_t pin{};
+        pin.px = texel.x();
+        pin.py = texel.y();
+        pin.flags = 1u;
+        auto &pins = m_gizmoOverlay.mutableMeshWireframe().pins;
+        pins.push_back(pin);
+        m_gizmoOverlay.mutableMeshWireframe().selectedPinIndex =
+            static_cast<int32_t>(pins.size()) - 1;
+        emit contourPinAdded(m_puppetObjectId, pin.px, pin.py);
+        return true;
+    }
+
+    if (mode == ViewportToolMode::BonePlace) {
+        if (hit.handle == GizmoAxisHandle::BonePivotRotate && hit.index >= 0 &&
+            static_cast<size_t>(hit.index) < m_gizmoOverlay.puppetBones().size()) {
+            const auto &bone = m_gizmoOverlay.puppetBones()[static_cast<size_t>(hit.index)];
+            m_rigDragKind = RigDragKind::BonePivotRotate;
+            m_rigDragIndex = hit.index;
+            m_rigDragStartWorld = curLocal;
+            m_rigDragInitialBoneHead = bone.headWorld;
+            m_rigDragInitialBoneTail = bone.tailWorld;
+            m_rigDragInitialBoneAngleRad = bone.localAngleRad;
+            m_rigDragStartAngleRad =
+                std::atan2(curLocal.y() - bone.headWorld.y(), curLocal.x() - bone.headWorld.x());
+            setCursor(Qt::SizeAllCursor);
+            return true;
+        }
+        if ((hit.handle == GizmoAxisHandle::BoneJoint || hit.handle == GizmoAxisHandle::BoneBody) &&
+            hit.index >= 0 &&
+            static_cast<size_t>(hit.index) < m_gizmoOverlay.puppetBones().size()) {
+            m_gizmoOverlay.setSelectedBoneIndex(hit.index);
+            emit puppetBoneSelected(hit.index);
+            const auto &bone = m_gizmoOverlay.puppetBones()[static_cast<size_t>(hit.index)];
+            m_rigDragKind = RigDragKind::BoneJointMoveOrReparent;
+            m_rigDragIndex = hit.index;
+            m_rigDragStartWorld = curLocal;
+            m_rigDragInitialBoneHead = bone.headWorld;
+            m_rigDragInitialBoneTail = bone.tailWorld;
+            setCursor(Qt::ClosedHandCursor);
+            return true;
+        }
+        m_rigDragKind = RigDragKind::BoneCreate;
+        m_rigDragIndex = m_gizmoOverlay.selectedBoneIndex();
+        m_rigDragStartWorld = curLocal;
+        m_gizmoOverlay.setBoneCreatePreview(true, m_rigDragStartWorld, m_rigDragStartWorld);
+        setCursor(Qt::CrossCursor);
+        return true;
+    }
+
+    if (mode == ViewportToolMode::IkDrag) {
+        if (hit.handle == GizmoAxisHandle::IkTarget && hit.index >= 0) {
+            m_rigDragKind = RigDragKind::IkTargetMove;
+            m_rigDragIndex = hit.index;
+            setCursor(Qt::ClosedHandCursor);
+            return true;
+        }
+        if (hit.handle == GizmoAxisHandle::IkPole && hit.index >= 0) {
+            m_rigDragKind = RigDragKind::IkPoleMove;
+            m_rigDragIndex = hit.index;
+            setCursor(Qt::ClosedHandCursor);
+            return true;
+        }
+        if ((hit.handle == GizmoAxisHandle::BoneJoint || hit.handle == GizmoAxisHandle::BoneBody) &&
+            hit.index >= 0) {
+            m_gizmoOverlay.setSelectedBoneIndex(hit.index);
+            emit puppetBoneSelected(hit.index);
+            return true;
+        }
+        return false;
+    }
+
+    if ((mode == ViewportToolMode::Rotate || mode == ViewportToolMode::Translate) &&
+        hit.index >= 0) {
+        if (hit.handle == GizmoAxisHandle::BonePivotRotate &&
+            static_cast<size_t>(hit.index) < m_gizmoOverlay.puppetBones().size()) {
+            const auto &bone = m_gizmoOverlay.puppetBones()[static_cast<size_t>(hit.index)];
+            m_rigDragKind = RigDragKind::BonePivotRotate;
+            m_rigDragIndex = hit.index;
+            m_rigDragStartWorld = curLocal;
+            m_rigDragInitialBoneHead = bone.headWorld;
+            m_rigDragInitialBoneTail = bone.tailWorld;
+            m_rigDragInitialBoneAngleRad = bone.localAngleRad;
+            m_rigDragStartAngleRad =
+                std::atan2(curLocal.y() - bone.headWorld.y(), curLocal.x() - bone.headWorld.x());
+            setCursor(Qt::SizeAllCursor);
+            return true;
+        }
+        if (hit.handle == GizmoAxisHandle::BoneJoint &&
+            static_cast<size_t>(hit.index) < m_gizmoOverlay.puppetBones().size()) {
+            m_gizmoOverlay.setSelectedBoneIndex(hit.index);
+            emit puppetBoneSelected(hit.index);
+            const auto &bone = m_gizmoOverlay.puppetBones()[static_cast<size_t>(hit.index)];
+            m_rigDragKind = RigDragKind::BoneJointMoveOrReparent;
+            m_rigDragIndex = hit.index;
+            m_rigDragStartWorld = curLocal;
+            m_rigDragInitialBoneHead = bone.headWorld;
+            m_rigDragInitialBoneTail = bone.tailWorld;
+            setCursor(Qt::ClosedHandCursor);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void GpuPreviewViewport::updateRiggingDrag(const QPointF &widgetPos, Qt::KeyboardModifiers mods)
+{
+    const QPointF texel = mapWidgetToContentTexel(widgetPos);
+    const QPointF localPt = mapTexelToPuppetLocal(texel);
+    const QVector3D curWorld(static_cast<float>(localPt.x()), static_cast<float>(localPt.y()),
+                             0.0f);
+
+    switch (m_rigDragKind) {
+    case RigDragKind::ContourPinMove: {
+        auto &pins = m_gizmoOverlay.mutableMeshWireframe().pins;
+        if (m_rigDragIndex >= 0 && static_cast<size_t>(m_rigDragIndex) < pins.size()) {
+            pins[static_cast<size_t>(m_rigDragIndex)].px = texel.x();
+            pins[static_cast<size_t>(m_rigDragIndex)].py = texel.y();
+        }
+        break;
+    }
+    case RigDragKind::BoneCreate:
+        m_gizmoOverlay.setBoneCreatePreview(true, m_rigDragStartWorld, curWorld);
+        break;
+    case RigDragKind::BoneJointMoveOrReparent: {
+        auto &bones = m_gizmoOverlay.mutablePuppetBones();
+        if (!mods.testFlag(Qt::AltModifier) && m_rigDragIndex >= 0 &&
+            static_cast<size_t>(m_rigDragIndex) < bones.size()) {
+            const QVector3D delta = curWorld - m_rigDragStartWorld;
+            const QVector3D seg = m_rigDragInitialBoneTail - m_rigDragInitialBoneHead;
+            auto &b = bones[static_cast<size_t>(m_rigDragIndex)];
+            b.headWorld = m_rigDragInitialBoneHead + delta;
+            b.tailWorld = b.headWorld + seg;
+            emit puppetBonePivotChanged(m_puppetObjectId, m_rigDragIndex,
+                                        QPointF(b.headWorld.x(), b.headWorld.y()), b.localAngleRad,
+                                        false);
+        }
+        break;
+    }
+    case RigDragKind::BonePivotRotate: {
+        auto &bones = m_gizmoOverlay.mutablePuppetBones();
+        if (m_rigDragIndex >= 0 && static_cast<size_t>(m_rigDragIndex) < bones.size()) {
+            auto &b = bones[static_cast<size_t>(m_rigDragIndex)];
+            const float curAngle = std::atan2(curWorld.y() - m_rigDragInitialBoneHead.y(),
+                                              curWorld.x() - m_rigDragInitialBoneHead.x());
+            float deltaAng = curAngle - m_rigDragStartAngleRad;
+            if (mods.testFlag(Qt::ControlModifier)) {
+                const float stepRad =
+                    qDegreesToRadians(std::max(1.0f, m_gizmoOverlay.snapConfig().angleStepDeg));
+                deltaAng = std::round(deltaAng / stepRad) * stepRad;
+            }
+            const float c = std::cos(deltaAng);
+            const float s = std::sin(deltaAng);
+            const QVector3D seg = m_rigDragInitialBoneTail - m_rigDragInitialBoneHead;
+            b.tailWorld = m_rigDragInitialBoneHead +
+                          QVector3D(seg.x() * c - seg.y() * s, seg.x() * s + seg.y() * c, seg.z());
+            b.localAngleRad = m_rigDragInitialBoneAngleRad + deltaAng;
+            emit puppetBonePivotChanged(m_puppetObjectId, m_rigDragIndex,
+                                        QPointF(b.headWorld.x(), b.headWorld.y()), b.localAngleRad,
+                                        false);
+        }
+        break;
+    }
+    case RigDragKind::IkTargetMove: {
+        auto &chains = m_gizmoOverlay.mutableIkHandles();
+        if (m_rigDragIndex >= 0 && static_cast<size_t>(m_rigDragIndex) < chains.size()) {
+            auto &ik = chains[static_cast<size_t>(m_rigDragIndex)];
+            ik.targetWorld = curWorld;
+            const QVector3D toTarget = curWorld - ik.rootWorld;
+            const float l1 = std::max(1.0f, (ik.midWorld - ik.rootWorld).length());
+            const float l2 = std::max(1.0f, (ik.endWorld - ik.midWorld).length());
+            const float d = std::clamp(toTarget.length(), 1e-3f, l1 + l2 - 1e-3f);
+            const QVector3D dir = (toTarget.lengthSquared() > 1e-5f) ? toTarget.normalized()
+                                                                     : QVector3D(1.0f, 0.0f, 0.0f);
+            const float cosA =
+                std::clamp((l1 * l1 + d * d - l2 * l2) / (2.0f * l1 * d), -1.0f, 1.0f);
+            const float sinA = std::sqrt(std::max(0.0f, 1.0f - cosA * cosA));
+            const QVector3D perp(-dir.y(), dir.x(), 0.0f);
+            const float flip = (ik.chain.bend_sign < 0) ? -1.0f : 1.0f;
+            ik.midWorld = ik.rootWorld + dir * (l1 * cosA) + perp * (l1 * sinA * flip);
+            ik.endWorld = ik.rootWorld + dir * d;
+            ik.chain.target_world[0] = curWorld.x();
+            ik.chain.target_world[1] = curWorld.y();
+            ik.chain.target_world[2] = curWorld.z();
+            emit puppetIkTargetChanged(m_puppetObjectId, m_rigDragIndex, curWorld, false);
+        }
+        break;
+    }
+    case RigDragKind::IkPoleMove: {
+        auto &chains = m_gizmoOverlay.mutableIkHandles();
+        if (m_rigDragIndex >= 0 && static_cast<size_t>(m_rigDragIndex) < chains.size()) {
+            auto &ik = chains[static_cast<size_t>(m_rigDragIndex)];
+            ik.poleWorld = curWorld;
+            ik.chain.pole_world[0] = curWorld.x();
+            ik.chain.pole_world[1] = curWorld.y();
+            ik.chain.pole_world[2] = curWorld.z();
+            const QVector3D span = ik.endWorld - ik.rootWorld;
+            const QVector3D toPole = curWorld - ik.rootWorld;
+            const float crossZ = span.x() * toPole.y() - span.y() * toPole.x();
+            const bool poleFlip = (crossZ < 0.0f);
+            ik.chain.bend_sign = poleFlip ? -1 : 1;
+            emit puppetIkPoleChanged(m_puppetObjectId, m_rigDragIndex, curWorld, poleFlip, false);
+        }
+        break;
+    }
+    case RigDragKind::None:
+        break;
+    }
+}
+
+void GpuPreviewViewport::finishRiggingDrag(const QPointF &widgetPos, Qt::KeyboardModifiers mods)
+{
+    updateRiggingDrag(widgetPos, mods);
+    const QPointF texel = mapWidgetToContentTexel(widgetPos);
+    const QPointF localPt = mapTexelToPuppetLocal(texel);
+
+    switch (m_rigDragKind) {
+    case RigDragKind::ContourPinMove: {
+        const auto &pins = m_gizmoOverlay.meshWireframe().pins;
+        if (m_rigDragIndex >= 0 && static_cast<size_t>(m_rigDragIndex) < pins.size()) {
+            const auto &pin = pins[static_cast<size_t>(m_rigDragIndex)];
+            emit contourPinMoved(m_puppetObjectId, static_cast<uint32_t>(m_rigDragIndex), pin.px,
+                                 pin.py);
+        }
+        break;
+    }
+    case RigDragKind::BoneCreate: {
+        m_gizmoOverlay.setBoneCreatePreview(false, QVector3D(), QVector3D());
+        const QPointF headLocal(m_rigDragStartWorld.x(), m_rigDragStartWorld.y());
+        const QPointF tailLocal = localPt;
+        const float dx = static_cast<float>(tailLocal.x() - headLocal.x());
+        const float dy = static_cast<float>(tailLocal.y() - headLocal.y());
+        if (std::hypot(dx, dy) >= 4.0f) {
+            const float angleZRad = std::atan2(dy, dx);
+            emit puppetBoneCreated(m_puppetObjectId, m_rigDragIndex, headLocal, tailLocal,
+                                   angleZRad);
+        }
+        break;
+    }
+    case RigDragKind::BoneJointMoveOrReparent: {
+        const uint32_t cW = contentWidth();
+        const uint32_t cH = contentHeight();
+        m_gizmoOverlay.setContentSize(cW, cH);
+        const QMatrix4x4 vp = computeGizmoViewProj(cW, cH);
+        const RigPickResult dropHit = m_gizmoOverlay.pickRiggingHandle(widgetPos, size(), vp);
+        if (mods.testFlag(Qt::AltModifier)) {
+            int32_t newParent = -1;
+            if ((dropHit.handle == GizmoAxisHandle::BoneJoint ||
+                 dropHit.handle == GizmoAxisHandle::BoneBody) &&
+                dropHit.index != m_rigDragIndex) {
+                newParent = dropHit.index;
+            }
+            emit puppetBoneReparented(m_puppetObjectId, m_rigDragIndex, newParent);
+        } else if (m_rigDragIndex >= 0 &&
+                   static_cast<size_t>(m_rigDragIndex) < m_gizmoOverlay.puppetBones().size()) {
+            const auto &b = m_gizmoOverlay.puppetBones()[static_cast<size_t>(m_rigDragIndex)];
+            emit puppetBonePivotChanged(m_puppetObjectId, m_rigDragIndex,
+                                        QPointF(b.headWorld.x(), b.headWorld.y()), b.localAngleRad,
+                                        true);
+        }
+        break;
+    }
+    case RigDragKind::BonePivotRotate: {
+        if (m_rigDragIndex >= 0 &&
+            static_cast<size_t>(m_rigDragIndex) < m_gizmoOverlay.puppetBones().size()) {
+            const auto &b = m_gizmoOverlay.puppetBones()[static_cast<size_t>(m_rigDragIndex)];
+            emit puppetBonePivotChanged(m_puppetObjectId, m_rigDragIndex,
+                                        QPointF(b.headWorld.x(), b.headWorld.y()), b.localAngleRad,
+                                        true);
+        }
+        break;
+    }
+    case RigDragKind::IkTargetMove: {
+        if (m_rigDragIndex >= 0 &&
+            static_cast<size_t>(m_rigDragIndex) < m_gizmoOverlay.ikHandles().size()) {
+            const auto &ik = m_gizmoOverlay.ikHandles()[static_cast<size_t>(m_rigDragIndex)];
+            emit puppetIkTargetChanged(m_puppetObjectId, m_rigDragIndex, ik.targetWorld, true);
+        }
+        break;
+    }
+    case RigDragKind::IkPoleMove: {
+        if (m_rigDragIndex >= 0 &&
+            static_cast<size_t>(m_rigDragIndex) < m_gizmoOverlay.ikHandles().size()) {
+            const auto &ik = m_gizmoOverlay.ikHandles()[static_cast<size_t>(m_rigDragIndex)];
+            emit puppetIkPoleChanged(m_puppetObjectId, m_rigDragIndex, ik.poleWorld,
+                                     ik.chain.bend_sign < 0, true);
+        }
+        break;
+    }
+    case RigDragKind::None:
+        break;
+    }
+
+    m_rigDragKind = RigDragKind::None;
+    m_rigDragIndex = -1;
 }
 
 } // namespace waywal::studio

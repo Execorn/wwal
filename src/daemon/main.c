@@ -24,7 +24,10 @@
 #include "waywal/we_json.h"
 #include "waywal/ipc_proto_phase3.h"
 #include "waywal/ipc_proto_authoring.h"
+#include "waywal/ipc_proto_rigging.h"
 #include "waywal/shader_graph.h"
+#include "waywal/we_mdl_writer.h"
+#include "waywal/we_mesh_rig.h"
 #if __has_include("waywal/we_asset_writer.h")
 #include "waywal/we_asset_writer.h"
 #define WAYWAL_HAVE_ASSET_WRITER 1
@@ -72,6 +75,9 @@ bool waywal_shader_engine_uses_wallpaper(const waywal_shader_engine_t *eng);
 bool waywal_shader_engine_uses_album_art(const waywal_shader_engine_t *eng);
 void waywal_audio_fft_set_capture_active(waywal_audio_fft_t *fft, bool active);
 void dmabuf_ring_trim_idle(dmabuf_ring_t *ring);
+
+static void rig_invalidate_scene_slots(const we_scene_t *sc);
+static void rig_clear_all_slots(void);
 
 static void authoring_invalidate_scene(const we_scene_t *sc);
 static void daemon_authoring_cleanup(void);
@@ -6319,6 +6325,17 @@ bool daemon_dispatch_phase3_ipc(daemon_state_t *state, int client_fd, const wayw
     case WAYWAL_REQ_READBACK_TEXTURE:
         return daemon_dispatch_authoring_ipc(state, client_fd, hdr, attached_fd);
 
+    case WAYWAL_REQ_PUPPET_SET_MESH:
+    case WAYWAL_REQ_PUPPET_SET_SKELETON:
+    case WAYWAL_REQ_PUPPET_SOLVE_WEIGHTS:
+    case WAYWAL_REQ_PUPPET_PAINT_WEIGHTS:
+    case WAYWAL_REQ_PUPPET_SET_HEATMAP_MODE:
+    case WAYWAL_REQ_PUPPET_PREVIEW_IK:
+    case WAYWAL_REQ_PUPPET_SET_ANIM_TRACKS:
+    case WAYWAL_REQ_PUPPET_SCRUB_TIME:
+    case WAYWAL_REQ_EXPORT_PUPPET_MDL:
+        return daemon_dispatch_rigging_ipc(state, client_fd, hdr, attached_fd);
+
     default:
         break;
     }
@@ -6630,6 +6647,7 @@ static void authoring_invalidate_scene(const we_scene_t *sc)
             memset(&g_authoring_slots[i], 0, sizeof(g_authoring_slots[i]));
         }
     }
+    rig_invalidate_scene_slots(sc);
 #if WAYWAL_HAVE_GPU_BRUSH
     if (g_authoring_brush_ctx) {
         authoring_ensure_scene_egl(sc);
@@ -6641,6 +6659,7 @@ static void authoring_invalidate_scene(const we_scene_t *sc)
 static void daemon_authoring_cleanup(void)
 {
     memset(g_authoring_slots, 0, sizeof(g_authoring_slots));
+    rig_clear_all_slots();
 #if WAYWAL_HAVE_GPU_BRUSH
     if (g_authoring_brush_ctx) {
         we_gpu_brush_destroy(g_authoring_brush_ctx);
@@ -9243,6 +9262,1928 @@ static bool authoring_ipc_handle_readback(daemon_state_t *state, int client_fd,
     return sent;
 }
 
+#define RIG_MAX_PUPPET_SLOTS 128u
+
+typedef struct {
+    bool in_use;
+    const we_scene_t *scene;
+    uint32_t object_id;
+    uint64_t last_used_seq;
+    waywal_ipc_puppet_heatmap_mode_t heatmap;
+    we_rig_pose_ctx_t rig_ctx;
+    bool preview_active;
+    double preview_time_sec;
+    bool playback_paused;
+} rig_puppet_slot_t;
+
+static rig_puppet_slot_t g_rig_slots[RIG_MAX_PUPPET_SLOTS];
+static uint64_t g_rig_lru_seq = 0u;
+
+static void rig_reset_slot_state(rig_puppet_slot_t *slot, uint32_t object_id)
+{
+    if (!slot) {
+        return;
+    }
+    memset(&slot->heatmap, 0, sizeof(slot->heatmap));
+    slot->heatmap.object_id = object_id;
+    slot->heatmap.active_bone_idx = UINT32_MAX;
+    slot->heatmap.opacity = 0.65f;
+    memset(&slot->rig_ctx, 0, sizeof(slot->rig_ctx));
+    slot->preview_active = false;
+    slot->preview_time_sec = 0.0;
+    slot->playback_paused = false;
+}
+
+static void rig_invalidate_scene_slots(const we_scene_t *sc)
+{
+    if (!sc) {
+        return;
+    }
+    for (size_t i = 0u; i < RIG_MAX_PUPPET_SLOTS; ++i) {
+        if (g_rig_slots[i].in_use && g_rig_slots[i].scene == sc) {
+            memset(&g_rig_slots[i], 0, sizeof(g_rig_slots[i]));
+        }
+    }
+}
+
+static void rig_clear_all_slots(void)
+{
+    memset(g_rig_slots, 0, sizeof(g_rig_slots));
+    g_rig_lru_seq = 0u;
+}
+
+static rig_puppet_slot_t *rig_get_puppet_slot(const we_scene_t *scene, uint32_t object_id,
+                                              bool create_if_missing)
+{
+    rig_puppet_slot_t *free_slot = NULL;
+    rig_puppet_slot_t *lru_slot = &g_rig_slots[0];
+    for (size_t i = 0u; i < RIG_MAX_PUPPET_SLOTS; ++i) {
+        if (g_rig_slots[i].in_use) {
+            if (g_rig_slots[i].scene == scene && g_rig_slots[i].object_id == object_id) {
+                g_rig_slots[i].last_used_seq = ++g_rig_lru_seq;
+                return &g_rig_slots[i];
+            }
+            if (!lru_slot->in_use || g_rig_slots[i].last_used_seq < lru_slot->last_used_seq) {
+                lru_slot = &g_rig_slots[i];
+            }
+        } else if (!free_slot) {
+            free_slot = &g_rig_slots[i];
+        }
+    }
+    if (!create_if_missing) {
+        return NULL;
+    }
+    if (!free_slot) {
+        free_slot = lru_slot;
+    }
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->in_use = true;
+    free_slot->scene = scene;
+    free_slot->object_id = object_id;
+    free_slot->last_used_seq = ++g_rig_lru_seq;
+    rig_reset_slot_state(free_slot, object_id);
+    return free_slot;
+}
+
+static void rig_sync_slot_to_puppet(we_puppet_t *puppet, const rig_puppet_slot_t *slot)
+{
+    if (!puppet || !slot) {
+        return;
+    }
+    if (!puppet->rig_ctx) {
+        puppet->rig_ctx = calloc(1u, sizeof(we_rig_pose_ctx_t));
+    }
+    if (puppet->rig_ctx) {
+        memcpy(puppet->rig_ctx, &slot->rig_ctx, sizeof(we_rig_pose_ctx_t));
+    }
+    puppet->heatmap_mode = (uint8_t)slot->heatmap.enabled;
+    puppet->heatmap_palette = (uint8_t)slot->heatmap.palette;
+    puppet->heatmap_active_bone = (slot->heatmap.active_bone_idx <= 0xFFFFu)
+                                      ? (uint16_t)slot->heatmap.active_bone_idx
+                                      : UINT16_MAX;
+    puppet->heatmap_opacity = slot->heatmap.opacity;
+    puppet->playback_paused = slot->playback_paused;
+    puppet->preview_time_sec = slot->preview_time_sec;
+}
+
+static void rig_mat4_identity(float out[16])
+{
+    memset(out, 0, sizeof(float) * 16u);
+    out[0] = 1.0f;
+    out[5] = 1.0f;
+    out[10] = 1.0f;
+    out[15] = 1.0f;
+}
+
+static void rig_mat4_from_trs(const float pos[3], const float angle[3], const float scale[3],
+                              float out[16])
+{
+    float cx = cosf(angle[0]), sx = sinf(angle[0]);
+    float cy = cosf(angle[1]), sy = sinf(angle[1]);
+    float cz = cosf(angle[2]), sz = sinf(angle[2]);
+
+    float scx = scale[0], scy = scale[1], scz = scale[2];
+
+    out[0] = (cz * cy) * scx;
+    out[1] = (sz * cy) * scx;
+    out[2] = (-sy) * scx;
+    out[3] = 0.0f;
+
+    out[4] = (cz * sy * sx - sz * cx) * scy;
+    out[5] = (sz * sy * sx + cz * cx) * scy;
+    out[6] = (cy * sx) * scy;
+    out[7] = 0.0f;
+
+    out[8] = (cz * sy * cx + sz * sx) * scz;
+    out[9] = (sz * sy * cx - cz * sx) * scz;
+    out[10] = (cy * cx) * scz;
+    out[11] = 0.0f;
+
+    out[12] = pos[0];
+    out[13] = pos[1];
+    out[14] = pos[2];
+    out[15] = 1.0f;
+}
+
+static void rig_mat4_decompose_trs(const float m[16], float out_pos[3], float out_angle[3],
+                                   float out_scale[3])
+{
+    out_pos[0] = m[12];
+    out_pos[1] = m[13];
+    out_pos[2] = m[14];
+
+    float sx = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+    float sy = sqrtf(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+    float sz = sqrtf(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
+
+    float det3 = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) +
+                 m[8] * (m[1] * m[6] - m[2] * m[5]);
+    if (det3 < 0.0f) {
+        sx = -sx;
+    }
+
+    out_scale[0] = fabsf(sx) > 1e-6f ? sx : 1.0f;
+    out_scale[1] = sy > 1e-6f ? sy : 1.0f;
+    out_scale[2] = sz > 1e-6f ? sz : 1.0f;
+
+    float r00 = m[0] / out_scale[0], r10 = m[1] / out_scale[0], r20 = m[2] / out_scale[0];
+    float r11 = m[5] / out_scale[1], r21 = m[6] / out_scale[1];
+    float r12 = m[9] / out_scale[2], r22 = m[10] / out_scale[2];
+
+    float sy_rot = -r20;
+    if (sy_rot < -1.0f) {
+        sy_rot = -1.0f;
+    } else if (sy_rot > 1.0f) {
+        sy_rot = 1.0f;
+    }
+    out_angle[1] = asinf(sy_rot);
+    if (fabsf(r20) < 0.9999f) {
+        out_angle[0] = atan2f(r21, r22);
+        out_angle[2] = atan2f(r10, r00);
+    } else {
+        out_angle[0] = atan2f(-r12, r11);
+        out_angle[2] = 0.0f;
+    }
+}
+
+static void rig_invalidate_puppet_gl(const we_scene_t *sc, we_puppet_t *puppet)
+{
+    if (!puppet || !puppet->gl_uploaded) {
+        return;
+    }
+    if (sc && sc->gl_initialized) {
+        authoring_ensure_scene_egl(sc);
+        if (puppet->gl_ebo) {
+            glDeleteBuffers(1, &puppet->gl_ebo);
+            puppet->gl_ebo = 0u;
+        }
+        if (puppet->gl_vbo_skin) {
+            glDeleteBuffers(1, &puppet->gl_vbo_skin);
+            puppet->gl_vbo_skin = 0u;
+        }
+        if (puppet->gl_vbo_dyn) {
+            glDeleteBuffers(1, &puppet->gl_vbo_dyn);
+            puppet->gl_vbo_dyn = 0u;
+        }
+        if (puppet->gl_vao) {
+            glDeleteVertexArrays(1, &puppet->gl_vao);
+            puppet->gl_vao = 0u;
+        }
+    }
+    puppet->gl_uploaded = false;
+    puppet->vbo_has_bind_pose = false;
+    puppet->cached_gl_prog = 0u;
+}
+
+static void rig_free_anim_clip(we_mdl_anim_t *anim)
+{
+    if (!anim) {
+        return;
+    }
+    if (anim->tracks) {
+        for (uint32_t t = 0u; t < anim->track_count; ++t) {
+            free(anim->tracks[t].keyframes);
+        }
+        free(anim->tracks);
+    }
+    memset(anim, 0, sizeof(*anim));
+}
+
+static void rig_clear_puppet_anims(we_puppet_t *puppet)
+{
+    if (!puppet) {
+        return;
+    }
+    if (puppet->anims) {
+        for (uint32_t a = 0u; a < puppet->anim_count; ++a) {
+            rig_free_anim_clip(&puppet->anims[a]);
+        }
+        free(puppet->anims);
+        puppet->anims = NULL;
+    }
+    puppet->anim_count = 0u;
+    puppet->layer_count = 0u;
+    memset(puppet->layers, 0, sizeof(puppet->layers));
+}
+
+typedef struct {
+    we_scene_t *scenes[64];
+    we_scene_object_t *objects[64];
+    size_t count;
+} rig_target_list_t;
+
+static void rig_collect_targets(daemon_state_t *state, uint32_t object_id, bool require_puppet,
+                                rig_target_list_t *out_list)
+{
+    memset(out_list, 0, sizeof(*out_list));
+    if (!state || object_id > (uint32_t)INT32_MAX) {
+        return;
+    }
+    we_scene_t *visited[64];
+    size_t visited_count = 0u;
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        we_scene_t *sc = out->we_scene;
+        if (!sc || scene_already_visited(visited, visited_count, sc)) {
+            continue;
+        }
+        if (visited_count < 64u) {
+            visited[visited_count++] = sc;
+        }
+        we_scene_object_t *obj = authoring_find_object(sc, (int32_t)object_id, NULL);
+        if (!obj || (require_puppet && !obj->puppet)) {
+            continue;
+        }
+        if (out_list->count < 64u) {
+            out_list->scenes[out_list->count] = sc;
+            out_list->objects[out_list->count] = obj;
+            out_list->count++;
+        }
+    }
+}
+
+static void rig_bump_scene_revision(we_scene_t *sc)
+{
+    authoring_scene_slot_t *slot = authoring_get_scene_slot(sc, true);
+    if (slot) {
+        slot->revision++;
+    }
+}
+
+static void rig_recompute_world_bind(we_puppet_t *puppet)
+{
+    if (!puppet || !puppet->bones || puppet->bone_count == 0u) {
+        return;
+    }
+    for (uint32_t i = 0u; i < puppet->bone_count; ++i) {
+        we_mdl_bone_t *b = &puppet->bones[i];
+        rig_mat4_decompose_trs(b->local_trans, b->bind_pos, b->bind_angle, b->bind_scale);
+        if (b->parent == UINT32_MAX || b->parent >= i) {
+            memcpy(b->world_bind, b->local_trans, sizeof(b->world_bind));
+        } else {
+            we_mat4_mul(puppet->bones[b->parent].world_bind, b->local_trans, b->world_bind);
+        }
+        we_mat4_inverse(b->world_bind, b->offset_trans);
+        if (puppet->skin_mats) {
+            rig_mat4_identity(puppet->skin_mats[i]);
+        }
+    }
+}
+
+static we_mdl_anim_mode_t rig_parse_anim_mode(const char *mode_str)
+{
+    if (mode_str) {
+        if (strcmp(mode_str, "mirror") == 0) {
+            return WE_ANIM_MIRROR;
+        }
+        if (strcmp(mode_str, "single") == 0) {
+            return WE_ANIM_SINGLE;
+        }
+    }
+    return WE_ANIM_LOOP;
+}
+
+static bool rig_send_status_reply(int client_fd, bool ok, const char *err_msg)
+{
+    waywal_ipc_hdr_t rh;
+    memset(&rh, 0, sizeof(rh));
+    rh.magic = WAYWAL_IPC_MAGIC;
+    rh.version = WAYWAL_IPC_VERSION;
+    if (ok) {
+        rh.opcode = WAYWAL_RESP_OK;
+        rh.payload_size = 0u;
+        return authoring_send_msg(client_fd, &rh, NULL, 0u);
+    }
+    rh.opcode = WAYWAL_RESP_ERR;
+    size_t len = err_msg ? strlen(err_msg) : 0u;
+    rh.payload_size = (uint32_t)len;
+    return authoring_send_msg(client_fd, &rh, err_msg, len);
+}
+
+bool daemon_dispatch_ipc_req_puppet_set_mesh(daemon_state_t *state,
+                                             const waywal_ipc_puppet_set_mesh_t *req,
+                                             const waywal_ipc_mdl_vertex_t *verts,
+                                             const uint16_t *indices,
+                                             waywal_ipc_puppet_mesh_ack_t *resp)
+{
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req || (req->flags & ~0x3u) != 0u) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+    bool clear_mesh = (req->vertex_count == 0u && req->triangle_count == 0u);
+    if (!clear_mesh &&
+        (!verts || !indices || req->vertex_count < 3u ||
+         req->vertex_count > WAYWAL_IPC_RIGGING_MAX_VERTICES || req->triangle_count < 1u ||
+         req->triangle_count > WAYWAL_IPC_RIGGING_MAX_TRIANGLES)) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+    resp->object_id = req->object_id;
+    if (!state) {
+        resp->status = (int32_t)WAYWAL_STATUS_OK;
+        resp->vertex_count = req->vertex_count;
+        resp->triangle_count = req->triangle_count;
+        return true;
+    }
+
+    rig_target_list_t targets;
+    rig_collect_targets(state, req->object_id, false, &targets);
+    if (targets.count == 0u) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    typedef struct {
+        we_puppet_t *new_puppet;
+        we_mdl_vertex_t *new_verts;
+        uint16_t *new_indices;
+        we_skinned_vertex_t *new_skinned;
+    } mesh_stage_t;
+
+    size_t idx_count = (size_t)req->triangle_count * 3u;
+    bool preserve_skeleton = (req->flags & 2u) != 0u;
+    bool normalize_weights = (req->flags & 1u) != 0u;
+
+    mesh_stage_t *stages = (mesh_stage_t *)calloc(targets.count, sizeof(mesh_stage_t));
+    if (!stages) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_puppet_t *existing = targets.objects[t]->puppet;
+        if (!existing) {
+            stages[t].new_puppet = (we_puppet_t *)calloc(1u, sizeof(we_puppet_t));
+            if (!stages[t].new_puppet) {
+                goto fail;
+            }
+        }
+        if (!clear_mesh) {
+            stages[t].new_verts =
+                (we_mdl_vertex_t *)calloc(req->vertex_count, sizeof(we_mdl_vertex_t));
+            stages[t].new_indices = (uint16_t *)malloc(idx_count * sizeof(uint16_t));
+            stages[t].new_skinned =
+                (we_skinned_vertex_t *)calloc(req->vertex_count, sizeof(we_skinned_vertex_t));
+            if (!stages[t].new_verts || !stages[t].new_indices || !stages[t].new_skinned) {
+                goto fail;
+            }
+        }
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_scene_t *sc = targets.scenes[t];
+        we_scene_object_t *obj = targets.objects[t];
+        we_puppet_t *puppet = obj->puppet;
+        if (!puppet) {
+            puppet = stages[t].new_puppet;
+            puppet->mdlv_version = 23u;
+            puppet->mdat_version = 1u;
+            puppet->mdls_version = 2u;
+            puppet->mdla_version = 3u;
+            puppet->mdl_flag = 1;
+            obj->puppet = puppet;
+            stages[t].new_puppet = NULL;
+        }
+
+        rig_puppet_slot_t *slot = rig_get_puppet_slot(sc, req->object_id, true);
+        if (!preserve_skeleton) {
+            if (puppet->bone_count > 0u) {
+                rig_clear_puppet_anims(puppet);
+                free(puppet->physics_ctx);
+                puppet->physics_ctx = NULL;
+                free(puppet->bones);
+                puppet->bones = NULL;
+                free(puppet->skin_mats);
+                puppet->skin_mats = NULL;
+                puppet->bone_count = 0u;
+            }
+            if (slot) {
+                rig_reset_slot_state(slot, req->object_id);
+            }
+        }
+
+        float min_p[3] = {0.0f, 0.0f, 0.0f};
+        float max_p[3] = {0.0f, 0.0f, 0.0f};
+        if (!clear_mesh) {
+            min_p[0] = min_p[1] = min_p[2] = 1e30f;
+            max_p[0] = max_p[1] = max_p[2] = -1e30f;
+            for (uint32_t i = 0u; i < req->vertex_count; ++i) {
+                waywal_ipc_mdl_vertex_t src_v;
+                memcpy(&src_v, &verts[i], sizeof(src_v));
+                we_mdl_vertex_t *dv = &stages[t].new_verts[i];
+                memcpy(dv->pos, src_v.pos, sizeof(dv->pos));
+                memcpy(dv->texcoord, src_v.texcoord, sizeof(dv->texcoord));
+                for (int k = 0; k < 3; ++k) {
+                    if (dv->pos[k] < min_p[k]) {
+                        min_p[k] = dv->pos[k];
+                    }
+                    if (dv->pos[k] > max_p[k]) {
+                        max_p[k] = dv->pos[k];
+                    }
+                }
+                float wsum = 0.0f;
+                for (int j = 0; j < 4; ++j) {
+                    uint32_t bi = src_v.blend_indices[j];
+                    float w = src_v.weight[j];
+                    if (puppet->bone_count > 0u && bi >= puppet->bone_count) {
+                        bi = 0u;
+                        w = 0.0f;
+                    } else if (bi == UINT32_MAX) {
+                        bi = 0u;
+                        w = 0.0f;
+                    }
+                    dv->blend_indices[j] = bi;
+                    dv->weight[j] = w;
+                    wsum += w;
+                }
+                if (normalize_weights) {
+                    if (wsum > 1e-6f) {
+                        for (int j = 0; j < 4; ++j) {
+                            dv->weight[j] /= wsum;
+                        }
+                    } else {
+                        dv->blend_indices[0] = 0u;
+                        dv->weight[0] = 1.0f;
+                        dv->weight[1] = dv->weight[2] = dv->weight[3] = 0.0f;
+                    }
+                }
+            }
+            memcpy(stages[t].new_indices, indices, idx_count * sizeof(uint16_t));
+        }
+
+        rig_invalidate_puppet_gl(sc, puppet);
+        free(puppet->vertices);
+        free(puppet->indices);
+        free(puppet->skinned_verts);
+        puppet->vertices = stages[t].new_verts;
+        puppet->vertex_count = req->vertex_count;
+        puppet->indices = stages[t].new_indices;
+        puppet->index_count = (uint32_t)idx_count;
+        puppet->triangle_count = req->triangle_count;
+        puppet->skinned_verts = stages[t].new_skinned;
+        memcpy(puppet->min_pos, min_p, sizeof(min_p));
+        memcpy(puppet->max_pos, max_p, sizeof(max_p));
+        if (slot) {
+            rig_sync_slot_to_puppet(puppet, slot);
+        }
+        rig_bump_scene_revision(sc);
+    }
+
+    free(stages);
+    resp->status = (int32_t)WAYWAL_STATUS_OK;
+    resp->vertex_count = req->vertex_count;
+    resp->triangle_count = req->triangle_count;
+    return true;
+
+fail:
+    for (size_t t = 0u; t < targets.count; ++t) {
+        free(stages[t].new_verts);
+        free(stages[t].new_indices);
+        free(stages[t].new_skinned);
+        free(stages[t].new_puppet);
+    }
+    free(stages);
+    resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+    return false;
+}
+
+bool daemon_dispatch_ipc_req_puppet_set_skeleton(daemon_state_t *state,
+                                                 const waywal_ipc_puppet_set_skeleton_t *req,
+                                                 const waywal_ipc_mdl_bone_t *bones)
+{
+    if (!req || req->bone_count > WAYWAL_IPC_RIGGING_MAX_BONES) {
+        return false;
+    }
+    if (req->bone_count > 0u && !bones) {
+        return false;
+    }
+    if (!state) {
+        return true;
+    }
+
+    rig_target_list_t targets;
+    rig_collect_targets(state, req->object_id, true, &targets);
+    if (targets.count == 0u) {
+        return false;
+    }
+
+    typedef struct {
+        we_mdl_bone_t *new_bones;
+        float (*new_skin)[16];
+        we_puppet_physics_ctx_t *new_phys;
+        bool replace_phys;
+    } skel_stage_t;
+
+    skel_stage_t *stages = (skel_stage_t *)calloc(targets.count, sizeof(skel_stage_t));
+    if (!stages) {
+        return false;
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        if (req->bone_count > 0u) {
+            stages[t].new_bones = (we_mdl_bone_t *)calloc(req->bone_count, sizeof(we_mdl_bone_t));
+            stages[t].new_skin = (float (*)[16])calloc(req->bone_count, sizeof(float[16]));
+            if (!stages[t].new_bones || !stages[t].new_skin) {
+                goto fail;
+            }
+            for (uint32_t i = 0u; i < req->bone_count; ++i) {
+                waywal_ipc_mdl_bone_t sb;
+                memcpy(&sb, &bones[i], sizeof(sb));
+                memcpy(stages[t].new_bones[i].name, sb.name, sizeof(stages[t].new_bones[i].name));
+                stages[t].new_bones[i].name[sizeof(stages[t].new_bones[i].name) - 1u] = '\0';
+                stages[t].new_bones[i].unk = sb.unk;
+                stages[t].new_bones[i].parent = sb.parent;
+                memcpy(stages[t].new_bones[i].local_trans, sb.local_trans,
+                       sizeof(stages[t].new_bones[i].local_trans));
+                memcpy(stages[t].new_bones[i].simulation_json, sb.simulation_json,
+                       sizeof(stages[t].new_bones[i].simulation_json));
+                stages[t]
+                    .new_bones[i]
+                    .simulation_json[sizeof(stages[t].new_bones[i].simulation_json) - 1u] = '\0';
+            }
+        }
+        stages[t].replace_phys = ((req->flags & 1u) != 0u || !puppet->physics_ctx);
+        if (stages[t].replace_phys && req->bone_count > 0u) {
+            stages[t].new_phys =
+                (we_puppet_physics_ctx_t *)calloc(1u, sizeof(we_puppet_physics_ctx_t));
+            if (!stages[t].new_phys) {
+                goto fail;
+            }
+        }
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_scene_t *sc = targets.scenes[t];
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+
+        free(puppet->bones);
+        free(puppet->skin_mats);
+        puppet->bones = stages[t].new_bones;
+        puppet->skin_mats = stages[t].new_skin;
+        puppet->bone_count = req->bone_count;
+
+        if (puppet->vertices && puppet->vertex_count > 0u) {
+            for (uint32_t v = 0u; v < puppet->vertex_count; ++v) {
+                for (int j = 0; j < 4; ++j) {
+                    if (req->bone_count == 0u ||
+                        puppet->vertices[v].blend_indices[j] >= req->bone_count) {
+                        puppet->vertices[v].blend_indices[j] = 0u;
+                        puppet->vertices[v].weight[j] = 0.0f;
+                    }
+                }
+            }
+            rig_invalidate_puppet_gl(sc, puppet);
+        }
+
+        rig_recompute_world_bind(puppet);
+
+        if (stages[t].replace_phys) {
+            free(puppet->physics_ctx);
+            puppet->physics_ctx = stages[t].new_phys;
+            if (puppet->physics_ctx) {
+                we_physics_init_from_puppet(puppet->physics_ctx, puppet);
+            }
+        } else if (puppet->physics_ctx) {
+            we_physics_init_from_puppet(puppet->physics_ctx, puppet);
+        }
+
+        rig_puppet_slot_t *slot = rig_get_puppet_slot(sc, req->object_id, true);
+        if (slot) {
+            memset(&slot->rig_ctx, 0, sizeof(slot->rig_ctx));
+            for (uint32_t i = 0u; i < puppet->bone_count && i < WE_MDL_MAX_BONES; ++i) {
+                slot->rig_ctx.bone_drive_modes[i] = (puppet->bones[i].simulation_json[0] != '\0')
+                                                        ? WE_BONE_DRIVE_XPBD
+                                                        : WE_BONE_DRIVE_FK;
+            }
+            slot->preview_active = false;
+            if (slot->heatmap.active_bone_idx != UINT32_MAX &&
+                slot->heatmap.active_bone_idx >= req->bone_count) {
+                slot->heatmap.active_bone_idx = UINT32_MAX;
+            }
+            rig_sync_slot_to_puppet(puppet, slot);
+        }
+        rig_bump_scene_revision(sc);
+    }
+
+    free(stages);
+    return true;
+
+fail:
+    for (size_t t = 0u; t < targets.count; ++t) {
+        free(stages[t].new_bones);
+        free(stages[t].new_skin);
+        free(stages[t].new_phys);
+    }
+    free(stages);
+    return false;
+}
+
+bool daemon_dispatch_ipc_req_puppet_solve_weights(daemon_state_t *state,
+                                                  const waywal_ipc_puppet_solve_weights_t *req,
+                                                  const uint64_t *locked_bs,
+                                                  waywal_ipc_puppet_weights_resp_t *resp,
+                                                  waywal_ipc_vertex_weight_t **out_entries,
+                                                  uint32_t *out_entry_count)
+{
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (out_entries) {
+        *out_entries = NULL;
+    }
+    if (out_entry_count) {
+        *out_entry_count = 0u;
+    }
+    if (!req) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+    resp->object_id = req->object_id;
+    if (!state) {
+        resp->status = (int32_t)WAYWAL_STATUS_OK;
+        return true;
+    }
+
+    rig_target_list_t targets;
+    rig_collect_targets(state, req->object_id, true, &targets);
+    if (targets.count == 0u) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    bool apply_live = (req->flags & 1u) != 0u;
+    bool respect_locked = (req->flags & 2u) != 0u;
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        if (!puppet->vertices || puppet->vertex_count < 3u || !puppet->indices ||
+            puppet->triangle_count < 1u || !puppet->bones || puppet->bone_count == 0u) {
+            resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+        uint32_t needed_words = (puppet->vertex_count + 63u) / 64u;
+        if (respect_locked && (!locked_bs || req->locked_vert_word_count < needed_words)) {
+            resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+    }
+
+    we_mdl_vertex_t **scratch_verts =
+        (we_mdl_vertex_t **)calloc(targets.count, sizeof(we_mdl_vertex_t *));
+    waywal_ipc_vertex_weight_t *result_entries = NULL;
+    uint32_t result_count = 0u;
+    if (!scratch_verts) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    if (out_entries && out_entry_count) {
+        result_count = targets.objects[0]->puppet->vertex_count;
+        result_entries = (waywal_ipc_vertex_weight_t *)malloc((size_t)result_count *
+                                                              sizeof(waywal_ipc_vertex_weight_t));
+        if (!result_entries) {
+            free(scratch_verts);
+            resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        scratch_verts[t] =
+            (we_mdl_vertex_t *)malloc((size_t)puppet->vertex_count * sizeof(we_mdl_vertex_t));
+        if (!scratch_verts[t]) {
+            goto fail;
+        }
+        memcpy(scratch_verts[t], puppet->vertices,
+               (size_t)puppet->vertex_count * sizeof(we_mdl_vertex_t));
+
+        we_heat_skin_cfg_t cfg;
+        we_heat_skin_cfg_default(&cfg);
+        cfg.falloff_power = req->falloff_power;
+        cfg.smooth_factor = req->smoothness;
+        cfg.max_influences = req->max_influences;
+        cfg.use_visibility_raycast = (req->flags & 4u) != 0u;
+        cfg.use_intrinsic_delaunay = (req->flags & 8u) != 0u;
+        cfg.locked_vert_bs = respect_locked ? locked_bs : NULL;
+
+        we_puppet_t scratch_puppet = *puppet;
+        scratch_puppet.vertices = scratch_verts[t];
+
+        we_heat_solve_stats_t stats;
+        memset(&stats, 0, sizeof(stats));
+        if (!we_mesh_solve_heat_weights(&scratch_puppet, &cfg, &stats)) {
+            goto fail;
+        }
+    }
+
+    if (result_entries) {
+        for (uint32_t v = 0u; v < result_count; ++v) {
+            result_entries[v].vertex_index = v;
+            memcpy(result_entries[v].blend_indices, scratch_verts[0][v].blend_indices,
+                   sizeof(result_entries[v].blend_indices));
+            memcpy(result_entries[v].weight, scratch_verts[0][v].weight,
+                   sizeof(result_entries[v].weight));
+        }
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_scene_t *sc = targets.scenes[t];
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        if (apply_live) {
+            free(puppet->vertices);
+            puppet->vertices = scratch_verts[t];
+            scratch_verts[t] = NULL;
+            rig_invalidate_puppet_gl(sc, puppet);
+            rig_bump_scene_revision(sc);
+        } else {
+            free(scratch_verts[t]);
+            scratch_verts[t] = NULL;
+        }
+    }
+    free(scratch_verts);
+
+    resp->status = (int32_t)WAYWAL_STATUS_OK;
+    resp->entry_count = result_count;
+    if (out_entries) {
+        *out_entries = result_entries;
+    } else {
+        free(result_entries);
+    }
+    if (out_entry_count) {
+        *out_entry_count = result_count;
+    }
+    return true;
+
+fail:
+    for (size_t t = 0u; t < targets.count; ++t) {
+        free(scratch_verts[t]);
+    }
+    free(scratch_verts);
+    free(result_entries);
+    resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+    return false;
+}
+
+bool daemon_dispatch_ipc_req_puppet_paint_weights(daemon_state_t *state,
+                                                  const waywal_ipc_puppet_paint_weights_t *req,
+                                                  const waywal_ipc_vertex_weight_t *entries)
+{
+    if (!req || !entries || req->entry_count < 1u ||
+        req->entry_count > WAYWAL_IPC_RIGGING_MAX_VERTICES) {
+        return false;
+    }
+    if (!state) {
+        return true;
+    }
+
+    rig_target_list_t targets;
+    rig_collect_targets(state, req->object_id, true, &targets);
+    if (targets.count == 0u) {
+        return false;
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        if (!puppet->vertices || puppet->vertex_count == 0u || puppet->bone_count == 0u) {
+            return false;
+        }
+        for (uint32_t i = 0u; i < req->entry_count; ++i) {
+            waywal_ipc_vertex_weight_t e;
+            memcpy(&e, &entries[i], sizeof(e));
+            if (e.vertex_index >= puppet->vertex_count) {
+                return false;
+            }
+            for (int j = 0; j < 4; ++j) {
+                if (!isfinite(e.weight[j]) || e.weight[j] < 0.0f) {
+                    return false;
+                }
+                if (e.blend_indices[j] != UINT32_MAX && e.blend_indices[j] >= puppet->bone_count) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_scene_t *sc = targets.scenes[t];
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        for (uint32_t i = 0u; i < req->entry_count; ++i) {
+            waywal_ipc_vertex_weight_t e;
+            memcpy(&e, &entries[i], sizeof(e));
+
+            /* Deduplicate repeated bone indices per vertex and enforce partition-of-unity. */
+            uint32_t u_bones[4] = {0u, 0u, 0u, 0u};
+            float u_weights[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            int u_count = 0;
+            uint32_t fallback_bone = 0u;
+            bool have_fallback = false;
+            for (int j = 0; j < 4; ++j) {
+                if (e.blend_indices[j] == UINT32_MAX) {
+                    continue;
+                }
+                uint32_t bi = e.blend_indices[j];
+                float w = e.weight[j];
+                if (!have_fallback) {
+                    fallback_bone = bi;
+                    have_fallback = true;
+                }
+                if (w <= 0.0f) {
+                    continue;
+                }
+                int found = -1;
+                for (int k = 0; k < u_count; ++k) {
+                    if (u_bones[k] == bi) {
+                        found = k;
+                        break;
+                    }
+                }
+                if (found >= 0) {
+                    u_weights[found] += w;
+                } else if (u_count < 4) {
+                    u_bones[u_count] = bi;
+                    u_weights[u_count] = w;
+                    u_count++;
+                }
+            }
+
+            we_mdl_vertex_t *dv = &puppet->vertices[e.vertex_index];
+            float sum = 0.0f;
+            for (int k = 0; k < u_count; ++k) {
+                sum += u_weights[k];
+            }
+            if (sum > 1e-6f) {
+                for (int j = 0; j < 4; ++j) {
+                    if (j < u_count) {
+                        dv->blend_indices[j] = u_bones[j];
+                        dv->weight[j] = u_weights[j] / sum;
+                    } else {
+                        dv->blend_indices[j] = 0u;
+                        dv->weight[j] = 0.0f;
+                    }
+                }
+            } else {
+                dv->blend_indices[0] = fallback_bone;
+                dv->weight[0] = 1.0f;
+                for (int j = 1; j < 4; ++j) {
+                    dv->blend_indices[j] = 0u;
+                    dv->weight[j] = 0.0f;
+                }
+            }
+        }
+        rig_invalidate_puppet_gl(sc, puppet);
+        rig_bump_scene_revision(sc);
+    }
+    return true;
+}
+
+bool daemon_dispatch_ipc_req_puppet_set_heatmap_mode(daemon_state_t *state,
+                                                     const waywal_ipc_puppet_heatmap_mode_t *req)
+{
+    if (!req || req->enabled > 1u || req->palette > 2u || !isfinite(req->opacity) ||
+        req->opacity < 0.0f || req->opacity > 1.0f) {
+        return false;
+    }
+    if (!state) {
+        return true;
+    }
+
+    rig_target_list_t targets;
+    rig_collect_targets(state, req->object_id, true, &targets);
+    if (targets.count == 0u) {
+        return false;
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        if (req->active_bone_idx != UINT32_MAX && req->active_bone_idx >= puppet->bone_count) {
+            return false;
+        }
+    }
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        rig_puppet_slot_t *slot = rig_get_puppet_slot(targets.scenes[t], req->object_id, true);
+        if (slot) {
+            slot->heatmap = *req;
+            rig_sync_slot_to_puppet(puppet, slot);
+        }
+        rig_bump_scene_revision(targets.scenes[t]);
+    }
+    return true;
+}
+
+bool daemon_dispatch_ipc_req_puppet_preview_ik(daemon_state_t *state,
+                                               const waywal_ipc_puppet_preview_ik_t *req,
+                                               const waywal_ipc_bone_trs_t *overrides,
+                                               waywal_ipc_puppet_ik_pose_resp_t *resp,
+                                               waywal_ipc_bone_trs_t **out_bones,
+                                               uint32_t *out_bone_count)
+{
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (out_bones) {
+        *out_bones = NULL;
+    }
+    if (out_bone_count) {
+        *out_bone_count = 0u;
+    }
+    if (!req || (req->override_count > 0u && !overrides)) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+    resp->object_id = req->object_id;
+    if (!state) {
+        resp->status = (int32_t)WAYWAL_STATUS_OK;
+        return true;
+    }
+
+    rig_target_list_t targets;
+    rig_collect_targets(state, req->object_id, true, &targets);
+    if (targets.count == 0u) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        if ((req->root_bone != 0xFFFFu && req->root_bone >= puppet->bone_count) ||
+            (req->mid_bone != 0xFFFFu && req->mid_bone >= puppet->bone_count) ||
+            (req->end_bone != 0xFFFFu && req->end_bone >= puppet->bone_count)) {
+            resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+        for (uint32_t k = 0u; k < req->override_count; ++k) {
+            waywal_ipc_bone_trs_t ov;
+            memcpy(&ov, &overrides[k], sizeof(ov));
+            if (ov.bone_index >= puppet->bone_count) {
+                resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+                return false;
+            }
+        }
+    }
+
+    waywal_ipc_bone_trs_t *pose_out = NULL;
+    uint32_t pose_count = 0u;
+    if (out_bones && out_bone_count && targets.objects[0]->puppet->bone_count > 0u) {
+        pose_count = targets.objects[0]->puppet->bone_count;
+        pose_out =
+            (waywal_ipc_bone_trs_t *)malloc((size_t)pose_count * sizeof(waywal_ipc_bone_trs_t));
+        if (!pose_out) {
+            resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_scene_t *sc = targets.scenes[t];
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        rig_puppet_slot_t *slot = rig_get_puppet_slot(sc, req->object_id, true);
+
+        float anim_local[WE_MDL_MAX_BONES][16];
+        for (uint32_t b = 0u; b < puppet->bone_count; ++b) {
+            rig_mat4_from_trs(puppet->bones[b].bind_pos, puppet->bones[b].bind_angle,
+                              puppet->bones[b].bind_scale, anim_local[b]);
+        }
+
+        if ((req->mode_flags & 2u) != 0u) {
+            if (slot) {
+                slot->rig_ctx.ik_chain_count = 0u;
+                slot->rig_ctx.aim_count = 0u;
+                for (uint32_t b = 0u; b < puppet->bone_count && b < WE_MDL_MAX_BONES; ++b) {
+                    slot->rig_ctx.bone_drive_modes[b] =
+                        (puppet->bones[b].simulation_json[0] != '\0') ? WE_BONE_DRIVE_XPBD
+                                                                      : WE_BONE_DRIVE_FK;
+                }
+                slot->preview_active = false;
+            }
+        } else {
+            for (uint32_t k = 0u; k < req->override_count; ++k) {
+                waywal_ipc_bone_trs_t ov;
+                memcpy(&ov, &overrides[k], sizeof(ov));
+                rig_mat4_from_trs(ov.local_pos, ov.local_angle, ov.local_scale,
+                                  anim_local[ov.bone_index]);
+            }
+
+            if ((req->mode_flags & 1u) != 0u) {
+                if (req->root_bone != 0xFFFFu && req->mid_bone != 0xFFFFu &&
+                    req->end_bone != 0xFFFFu) {
+                    we_ik_chain_t chain;
+                    memset(&chain, 0, sizeof(chain));
+                    chain.root_bone = req->root_bone;
+                    chain.mid_bone = req->mid_bone;
+                    chain.end_bone = req->end_bone;
+                    chain.bend_sign = req->pole_flip ? -1 : 1;
+                    chain.enabled = 1u;
+                    memcpy(chain.target_world, req->target_world, sizeof(chain.target_world));
+                    memcpy(chain.pole_world, req->target_world, sizeof(chain.pole_world));
+                    chain.soft_zone_ratio = 0.05f;
+                    chain.max_stretch_ratio = 1.0f;
+                    chain.root_angle_min_rad = -3.14159265f;
+                    chain.root_angle_max_rad = 3.14159265f;
+                    chain.mid_angle_min_rad = -3.14159265f;
+                    chain.mid_angle_max_rad = 3.14159265f;
+                    chain.blend_weight = 1.0f;
+                    (void)we_ik_solve_two_bone(puppet, &chain, anim_local);
+                    if (slot) {
+                        slot->rig_ctx.ik_chains[0] = chain;
+                        slot->rig_ctx.ik_chain_count = 1u;
+                        slot->rig_ctx.aim_count = 0u;
+                        slot->rig_ctx.bone_drive_modes[chain.root_bone] = WE_BONE_DRIVE_IK;
+                        slot->rig_ctx.bone_drive_modes[chain.mid_bone] = WE_BONE_DRIVE_IK;
+                        slot->preview_active = true;
+                    }
+                } else if (req->root_bone != 0xFFFFu && req->mid_bone == 0xFFFFu) {
+                    we_aim_constraint_t aim;
+                    memset(&aim, 0, sizeof(aim));
+                    aim.bone_index = req->root_bone;
+                    aim.enabled = 1u;
+                    aim.aim_axis_local[0] = 1.0f;
+                    memcpy(aim.target_world, req->target_world, sizeof(aim.target_world));
+                    aim.max_cone_rad = 3.14159265f;
+                    aim.blend_weight = 1.0f;
+                    (void)we_ik_solve_aim(puppet, &aim, anim_local);
+                    if (slot) {
+                        slot->rig_ctx.aim_constraints[0] = aim;
+                        slot->rig_ctx.aim_count = 1u;
+                        slot->rig_ctx.ik_chain_count = 0u;
+                        slot->rig_ctx.bone_drive_modes[aim.bone_index] = WE_BONE_DRIVE_AIM;
+                        slot->preview_active = true;
+                    }
+                }
+            }
+            if (slot) {
+                we_rig_apply_constraints(puppet, &slot->rig_ctx, anim_local);
+            }
+        }
+
+        if ((req->mode_flags & 4u) != 0u && puppet->bones) {
+            for (uint32_t b = 0u; b < puppet->bone_count; ++b) {
+                memcpy(puppet->bones[b].local_trans, anim_local[b], sizeof(anim_local[b]));
+                rig_mat4_decompose_trs(anim_local[b], puppet->bones[b].bind_pos,
+                                       puppet->bones[b].bind_angle, puppet->bones[b].bind_scale);
+            }
+        }
+
+        if (puppet->bone_count > 0u && puppet->skin_mats) {
+            double eval_t = (slot && slot->playback_paused) ? slot->preview_time_sec : sc->sim_time;
+            we_puppet_eval_skin_matrices_ex(puppet, puppet->layers, puppet->layer_count,
+                                            slot ? &slot->rig_ctx : NULL, eval_t,
+                                            puppet->skin_mats);
+        }
+
+        if (slot) {
+            rig_sync_slot_to_puppet(puppet, slot);
+        }
+
+        if (t == 0u && pose_out && pose_count > 0u) {
+            for (uint32_t b = 0u; b < pose_count; ++b) {
+                pose_out[b].bone_index = b;
+                rig_mat4_decompose_trs(anim_local[b], pose_out[b].local_pos,
+                                       pose_out[b].local_angle, pose_out[b].local_scale);
+            }
+        }
+        rig_bump_scene_revision(sc);
+    }
+
+    resp->status = (int32_t)WAYWAL_STATUS_OK;
+    resp->bone_count = pose_count;
+    if (out_bones) {
+        *out_bones = pose_out;
+    } else {
+        free(pose_out);
+    }
+    if (out_bone_count) {
+        *out_bone_count = pose_count;
+    }
+    return true;
+}
+
+static bool rig_decode_anim_clips(const waywal_ipc_puppet_set_anim_tracks_t *req,
+                                  const uint8_t *clips_blob, size_t clips_blob_len,
+                                  uint32_t bone_count, we_mdl_anim_t **out_anims,
+                                  we_puppet_layer_t *out_layers,
+                                  we_anim_blend_mode_t *out_blend_modes)
+{
+    *out_anims = NULL;
+    if (req->clip_count == 0u) {
+        return clips_blob_len == 0u;
+    }
+    if (!clips_blob) {
+        return false;
+    }
+    we_mdl_anim_t *anims = (we_mdl_anim_t *)calloc(req->clip_count, sizeof(we_mdl_anim_t));
+    if (!anims) {
+        return false;
+    }
+    size_t cursor = 0u;
+    for (uint32_t c = 0u; c < req->clip_count; ++c) {
+        if (clips_blob_len - cursor < sizeof(waywal_ipc_anim_clip_desc_t)) {
+            goto fail;
+        }
+        waywal_ipc_anim_clip_desc_t cd;
+        memcpy(&cd, clips_blob + cursor, sizeof(cd));
+        cursor += sizeof(cd);
+
+        we_mdl_anim_t *dst = &anims[c];
+        dst->id = cd.id;
+        memcpy(dst->name, cd.name, sizeof(dst->name));
+        dst->name[sizeof(dst->name) - 1u] = '\0';
+        memcpy(dst->mode_str, cd.mode_str, sizeof(dst->mode_str));
+        dst->mode_str[sizeof(dst->mode_str) - 1u] = '\0';
+        dst->mode = rig_parse_anim_mode(dst->mode_str);
+        dst->fps = cd.fps;
+        dst->length = cd.length;
+        dst->track_count = cd.track_count;
+        memset(dst->bone_to_track, -1, sizeof(dst->bone_to_track));
+        dst->bone_lut_valid = true;
+        if (dst->track_count > 0u) {
+            dst->tracks =
+                (we_mdl_bone_track_t *)calloc(dst->track_count, sizeof(we_mdl_bone_track_t));
+            if (!dst->tracks) {
+                goto fail;
+            }
+        }
+        if (out_layers && c < WE_MDL_MAX_LAYERS) {
+            out_layers[c].anim_id = cd.id;
+            memcpy(out_layers[c].anim_name, dst->name, sizeof(out_layers[c].anim_name));
+            out_layers[c].blend = cd.layer_blend;
+            out_layers[c].rate = cd.layer_rate;
+            out_layers[c].visible = (cd.layer_visible != 0u);
+        }
+        if (out_blend_modes && c < WE_MDL_MAX_LAYERS) {
+            out_blend_modes[c] = (we_anim_blend_mode_t)cd.layer_blend_mode;
+        }
+
+        for (uint32_t tr = 0u; tr < cd.track_count; ++tr) {
+            if (clips_blob_len - cursor < sizeof(waywal_ipc_anim_track_desc_t)) {
+                goto fail;
+            }
+            waywal_ipc_anim_track_desc_t td;
+            memcpy(&td, clips_blob + cursor, sizeof(td));
+            cursor += sizeof(td);
+            if (td.bone_index < 0 || (uint32_t)td.bone_index >= bone_count) {
+                goto fail;
+            }
+            size_t kf_bytes = (size_t)td.keyframe_count * sizeof(waywal_ipc_mdl_keyframe_t);
+            if (clips_blob_len - cursor < kf_bytes) {
+                goto fail;
+            }
+            dst->tracks[tr].bone_index = td.bone_index;
+            dst->tracks[tr].kf_count = td.keyframe_count;
+            dst->bone_to_track[td.bone_index] = (int16_t)tr;
+            dst->tracks[tr].keyframes =
+                (we_mdl_keyframe_t *)calloc(td.keyframe_count, sizeof(we_mdl_keyframe_t));
+            if (!dst->tracks[tr].keyframes) {
+                goto fail;
+            }
+            for (uint32_t k = 0u; k < td.keyframe_count; ++k) {
+                waywal_ipc_mdl_keyframe_t skf;
+                memcpy(&skf, clips_blob + cursor, sizeof(skf));
+                cursor += sizeof(skf);
+                memcpy(dst->tracks[tr].keyframes[k].pos, skf.pos, sizeof(skf.pos));
+                memcpy(dst->tracks[tr].keyframes[k].angle, skf.angle, sizeof(skf.angle));
+                memcpy(dst->tracks[tr].keyframes[k].scale, skf.scale, sizeof(skf.scale));
+            }
+        }
+    }
+    if (cursor != clips_blob_len) {
+        goto fail;
+    }
+    *out_anims = anims;
+    return true;
+
+fail:
+    for (uint32_t c = 0u; c < req->clip_count; ++c) {
+        rig_free_anim_clip(&anims[c]);
+    }
+    free(anims);
+    return false;
+}
+
+bool daemon_dispatch_ipc_req_puppet_set_anim_tracks(daemon_state_t *state,
+                                                    const waywal_ipc_puppet_set_anim_tracks_t *req,
+                                                    const uint8_t *clips_blob,
+                                                    size_t clips_blob_len)
+{
+    if (!req || req->clip_count > WAYWAL_IPC_RIGGING_MAX_ANIMS) {
+        return false;
+    }
+    if (!state) {
+        return true;
+    }
+
+    rig_target_list_t targets;
+    rig_collect_targets(state, req->object_id, true, &targets);
+    if (targets.count == 0u) {
+        return false;
+    }
+
+    typedef struct {
+        we_mdl_anim_t *decoded;
+        we_mdl_anim_t *merged;
+        we_puppet_layer_t layers[WE_MDL_MAX_LAYERS];
+        we_anim_blend_mode_t modes[WE_MDL_MAX_LAYERS];
+    } anim_stage_t;
+
+    bool replace_all = (req->flags & 1u) != 0u;
+    bool sync_layers = (req->flags & 2u) != 0u;
+    anim_stage_t *stages = (anim_stage_t *)calloc(targets.count, sizeof(anim_stage_t));
+    if (!stages) {
+        return false;
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        if (!rig_decode_anim_clips(req, clips_blob, clips_blob_len, puppet->bone_count,
+                                   &stages[t].decoded, stages[t].layers, stages[t].modes)) {
+            goto fail;
+        }
+        if (!replace_all) {
+            uint32_t max_new = puppet->anim_count + req->clip_count;
+            if (max_new > 0u) {
+                stages[t].merged = (we_mdl_anim_t *)calloc(max_new, sizeof(we_mdl_anim_t));
+                if (!stages[t].merged) {
+                    goto fail;
+                }
+            }
+        }
+    }
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_scene_t *sc = targets.scenes[t];
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        we_mdl_anim_t *decoded = stages[t].decoded;
+        stages[t].decoded = NULL;
+
+        if (replace_all) {
+            rig_clear_puppet_anims(puppet);
+            puppet->anims = decoded;
+            puppet->anim_count = req->clip_count;
+            if (sync_layers) {
+                uint32_t lc =
+                    req->clip_count < WE_MDL_MAX_LAYERS ? req->clip_count : WE_MDL_MAX_LAYERS;
+                puppet->layer_count = lc;
+                if (lc > 0u) {
+                    memcpy(puppet->layers, stages[t].layers, lc * sizeof(we_puppet_layer_t));
+                }
+            }
+        } else {
+            we_mdl_anim_t *merged = stages[t].merged;
+            stages[t].merged = NULL;
+            uint32_t out_n = puppet->anim_count;
+            if (out_n > 0u && puppet->anims) {
+                memcpy(merged, puppet->anims, (size_t)out_n * sizeof(we_mdl_anim_t));
+            }
+            for (uint32_t c = 0u; c < req->clip_count; ++c) {
+                bool replaced = false;
+                for (uint32_t e = 0u; e < out_n; ++e) {
+                    if ((decoded[c].id != 0 && merged[e].id == decoded[c].id) ||
+                        strcmp(merged[e].name, decoded[c].name) == 0) {
+                        rig_free_anim_clip(&merged[e]);
+                        merged[e] = decoded[c];
+                        memset(&decoded[c], 0, sizeof(decoded[c]));
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced && out_n < WE_MDL_MAX_ANIMS) {
+                    merged[out_n++] = decoded[c];
+                    memset(&decoded[c], 0, sizeof(decoded[c]));
+                } else if (!replaced) {
+                    rig_free_anim_clip(&decoded[c]);
+                }
+            }
+            free(decoded);
+            free(puppet->anims);
+            puppet->anims = merged;
+            puppet->anim_count = out_n;
+            if (sync_layers) {
+                uint32_t lc = out_n < WE_MDL_MAX_LAYERS ? out_n : WE_MDL_MAX_LAYERS;
+                puppet->layer_count = lc;
+                for (uint32_t l = 0u; l < lc; ++l) {
+                    puppet->layers[l].anim_id = puppet->anims[l].id;
+                    memcpy(puppet->layers[l].anim_name, puppet->anims[l].name,
+                           sizeof(puppet->layers[l].anim_name));
+                    if (l < req->clip_count) {
+                        puppet->layers[l].blend = stages[t].layers[l].blend;
+                        puppet->layers[l].rate = stages[t].layers[l].rate;
+                        puppet->layers[l].visible = stages[t].layers[l].visible;
+                    } else if (puppet->layers[l].rate == 0.0f) {
+                        puppet->layers[l].blend = 1.0f;
+                        puppet->layers[l].rate = 1.0f;
+                        puppet->layers[l].visible = true;
+                    }
+                }
+            }
+        }
+
+        rig_puppet_slot_t *slot = rig_get_puppet_slot(sc, req->object_id, true);
+        if (slot) {
+            if (sync_layers) {
+                uint32_t lc =
+                    req->clip_count < WE_MDL_MAX_LAYERS ? req->clip_count : WE_MDL_MAX_LAYERS;
+                if (lc > 0u) {
+                    memcpy(slot->rig_ctx.layer_blend_modes, stages[t].modes,
+                           lc * sizeof(we_anim_blend_mode_t));
+                }
+            }
+            rig_sync_slot_to_puppet(puppet, slot);
+        }
+        rig_bump_scene_revision(sc);
+    }
+
+    free(stages);
+    return true;
+
+fail:
+    for (size_t t = 0u; t < targets.count; ++t) {
+        if (stages[t].decoded) {
+            for (uint32_t c = 0u; c < req->clip_count; ++c) {
+                rig_free_anim_clip(&stages[t].decoded[c]);
+            }
+            free(stages[t].decoded);
+        }
+        free(stages[t].merged);
+    }
+    free(stages);
+    return false;
+}
+
+bool daemon_dispatch_ipc_req_puppet_scrub_time(daemon_state_t *state,
+                                               const waywal_ipc_puppet_scrub_t *req)
+{
+    if (!req || !isfinite(req->time_sec) || req->time_sec < 0.0f || req->pause_playback > 1u) {
+        return false;
+    }
+    if (!state) {
+        return true;
+    }
+
+    rig_target_list_t targets;
+    rig_collect_targets(state, req->object_id, true, &targets);
+    if (targets.count == 0u) {
+        return false;
+    }
+
+    bool reset_phys = (req->flags & 1u) != 0u;
+    bool step_phys = (req->flags & 2u) != 0u;
+
+    for (size_t t = 0u; t < targets.count; ++t) {
+        we_scene_t *sc = targets.scenes[t];
+        we_puppet_t *puppet = targets.objects[t]->puppet;
+        double target_t = (double)req->time_sec;
+        double prev_t = (puppet->physics_ctx && puppet->physics_ctx->has_last_wall_time)
+                            ? puppet->physics_ctx->last_wall_time_sec
+                            : sc->sim_time;
+        bool backward = (target_t + 1e-6 < prev_t);
+
+        sc->sim_time = target_t;
+
+        rig_puppet_slot_t *slot = rig_get_puppet_slot(sc, req->object_id, true);
+        if (slot) {
+            slot->preview_time_sec = target_t;
+            slot->playback_paused = (req->pause_playback != 0u);
+            rig_sync_slot_to_puppet(puppet, slot);
+        }
+
+        if (puppet->physics_ctx && (reset_phys || (step_phys && backward))) {
+            we_physics_init_from_puppet(puppet->physics_ctx, puppet);
+        }
+
+        if (puppet->bone_count > 0u && puppet->skin_mats) {
+            if (!step_phys && puppet->physics_ctx) {
+                bool saved_has = puppet->physics_ctx->has_last_wall_time;
+                double saved_last = puppet->physics_ctx->last_wall_time_sec;
+                float saved_acc = puppet->physics_ctx->time_accumulator_sec;
+                /* Suppress XPBD wall-clock stepping when flags omits step_physics_dt. */
+                puppet->physics_ctx->has_last_wall_time = true;
+                puppet->physics_ctx->last_wall_time_sec = target_t;
+                puppet->physics_ctx->time_accumulator_sec = 0.0f;
+                we_puppet_eval_skin_matrices_ex(puppet, puppet->layers, puppet->layer_count,
+                                                slot ? &slot->rig_ctx : NULL, target_t,
+                                                puppet->skin_mats);
+                if (!reset_phys) {
+                    puppet->physics_ctx->has_last_wall_time = saved_has;
+                    puppet->physics_ctx->last_wall_time_sec = saved_last;
+                    puppet->physics_ctx->time_accumulator_sec = saved_acc;
+                }
+            } else {
+                if (puppet->physics_ctx && (reset_phys || backward)) {
+                    double start_t = (target_t > 2.0) ? (target_t - 2.0) : 0.0;
+                    puppet->physics_ctx->has_last_wall_time = true;
+                    puppet->physics_ctx->last_wall_time_sec = start_t;
+                    puppet->physics_ctx->time_accumulator_sec = 0.0f;
+                    for (double t_step = start_t + (1.0 / 60.0); t_step + 1e-6 < target_t;
+                         t_step += (1.0 / 60.0)) {
+                        we_puppet_eval_skin_matrices_ex(puppet, puppet->layers, puppet->layer_count,
+                                                        slot ? &slot->rig_ctx : NULL, t_step,
+                                                        puppet->skin_mats);
+                    }
+                }
+                we_puppet_eval_skin_matrices_ex(puppet, puppet->layers, puppet->layer_count,
+                                                slot ? &slot->rig_ctx : NULL, target_t,
+                                                puppet->skin_mats);
+            }
+        } else if (puppet->physics_ctx && step_phys) {
+            (void)we_physics_advance_wall_clock(puppet->physics_ctx, target_t);
+        }
+        rig_bump_scene_revision(sc);
+    }
+    return true;
+}
+
+bool daemon_dispatch_ipc_req_export_puppet_mdl(daemon_state_t *state,
+                                               const waywal_ipc_export_puppet_mdl_t *req,
+                                               waywal_ipc_export_puppet_mdl_resp_t *resp,
+                                               uint8_t **out_mdl_blob, uint32_t *out_mdl_size)
+{
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (out_mdl_blob) {
+        *out_mdl_blob = NULL;
+    }
+    if (out_mdl_size) {
+        *out_mdl_size = 0u;
+    }
+    if (!req || (req->flags & 0x3u) == 0u) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+    resp->object_id = req->object_id;
+
+    char resolved_path[PATH_MAX];
+    resolved_path[0] = '\0';
+    if ((req->flags & 0x2u) != 0u) {
+        if (!memchr(req->out_path, '\0', sizeof(req->out_path)) || req->out_path[0] == '\0' ||
+            !waywal_ipc_export_path_is_allowed(req->out_path, resolved_path,
+                                               sizeof(resolved_path))) {
+            resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+        struct stat st;
+        if (lstat(resolved_path, &st) == 0 && S_ISLNK(st.st_mode)) {
+            resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+    }
+
+    if (!state) {
+        resp->status = (int32_t)WAYWAL_STATUS_OK;
+        return true;
+    }
+
+    rig_target_list_t targets;
+    rig_collect_targets(state, req->object_id, true, &targets);
+    if (targets.count == 0u) {
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    we_puppet_t *puppet = targets.objects[0]->puppet;
+    we_mdl_write_opts_t opts;
+    we_mdl_write_opts_default(&opts);
+
+    bool wants_inline = (req->flags & 0x1u) != 0u;
+    uint8_t *mdl_bytes = NULL;
+    size_t mdl_size = 0u;
+    if (!we_mdl_write_mem(puppet, &opts, &mdl_bytes, &mdl_size) || !mdl_bytes || mdl_size == 0u ||
+        mdl_size > (size_t)UINT32_MAX ||
+        (wants_inline && mdl_size > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES - sizeof(*resp))) {
+        we_mdl_write_free(mdl_bytes);
+        resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    if ((req->flags & 0x2u) != 0u) {
+        if (!we_mdl_write_file(puppet, &opts, resolved_path)) {
+            we_mdl_write_free(mdl_bytes);
+            resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+    }
+
+    if ((req->flags & 0x1u) != 0u && out_mdl_blob && out_mdl_size) {
+        uint8_t *copy = (uint8_t *)malloc(mdl_size);
+        if (!copy) {
+            we_mdl_write_free(mdl_bytes);
+            resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+        memcpy(copy, mdl_bytes, mdl_size);
+        *out_mdl_blob = copy;
+        *out_mdl_size = (uint32_t)mdl_size;
+    }
+
+    we_mdl_write_free(mdl_bytes);
+    resp->status = (int32_t)WAYWAL_STATUS_OK;
+    resp->mdl_byte_size = (uint32_t)mdl_size;
+    return true;
+}
+
+static bool rig_ipc_handle_set_mesh(daemon_state_t *state, int client_fd,
+                                    const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    waywal_ipc_puppet_mesh_ack_t resp;
+    waywal_ipc_hdr_t rh;
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_puppet_set_mesh_t),
+                                   WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES, &pkt, &pkt_len)) {
+        waywal_ipc_serialize_resp_puppet_mesh_ack((int32_t)WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, 0u,
+                                                  &rh, &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    const waywal_ipc_puppet_set_mesh_t *req = NULL;
+    const waywal_ipc_mdl_vertex_t *verts = NULL;
+    const uint16_t *indices = NULL;
+    if (!waywal_ipc_validate_req_puppet_set_mesh(pkt, pkt_len, &req, &verts, &indices)) {
+        free(pkt);
+        waywal_ipc_serialize_resp_puppet_mesh_ack((int32_t)WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, 0u,
+                                                  &rh, &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    (void)daemon_dispatch_ipc_req_puppet_set_mesh(state, req, verts, indices, &resp);
+    free(pkt);
+    waywal_ipc_serialize_resp_puppet_mesh_ack(resp.status, resp.object_id, resp.vertex_count,
+                                              resp.triangle_count, &rh, &resp);
+    return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+}
+
+static bool rig_ipc_handle_set_skeleton(daemon_state_t *state, int client_fd,
+                                        const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_puppet_set_skeleton_t),
+                                   WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES, &pkt, &pkt_len)) {
+        return rig_send_status_reply(client_fd, false, "Invalid set_skeleton packet size");
+    }
+    const waywal_ipc_puppet_set_skeleton_t *req = NULL;
+    const waywal_ipc_mdl_bone_t *bones = NULL;
+    if (!waywal_ipc_validate_req_puppet_set_skeleton(pkt, pkt_len, &req, &bones)) {
+        free(pkt);
+        return rig_send_status_reply(client_fd, false, "Invalid set_skeleton payload");
+    }
+    bool ok = daemon_dispatch_ipc_req_puppet_set_skeleton(state, req, bones);
+    free(pkt);
+    return rig_send_status_reply(client_fd, ok, ok ? NULL : "Failed to apply puppet skeleton");
+}
+
+static bool rig_ipc_handle_solve_weights(daemon_state_t *state, int client_fd,
+                                         const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    waywal_ipc_hdr_t rh;
+    waywal_ipc_puppet_weights_resp_t err_resp;
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_puppet_solve_weights_t),
+                                   WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES, &pkt, &pkt_len)) {
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_puppet_weights((int32_t)WAYWAL_STATUS_ERR_SYNTAX, 0u, NULL, 0u,
+                                                 &rh, &err_resp, sizeof(err_resp), &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    const waywal_ipc_puppet_solve_weights_t *req = NULL;
+    const uint64_t *locked_bs = NULL;
+    if (!waywal_ipc_validate_req_puppet_solve_weights(pkt, pkt_len, &req, &locked_bs)) {
+        free(pkt);
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_puppet_weights((int32_t)WAYWAL_STATUS_ERR_SYNTAX, 0u, NULL, 0u,
+                                                 &rh, &err_resp, sizeof(err_resp), &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    waywal_ipc_puppet_weights_resp_t resp;
+    waywal_ipc_vertex_weight_t *entries = NULL;
+    uint32_t entry_count = 0u;
+    (void)daemon_dispatch_ipc_req_puppet_solve_weights(state, req, locked_bs, &resp, &entries,
+                                                       &entry_count);
+    free(pkt);
+
+    size_t out_cap = sizeof(waywal_ipc_puppet_weights_resp_t) +
+                     (size_t)entry_count * sizeof(waywal_ipc_vertex_weight_t);
+    uint8_t *out_buf = (uint8_t *)malloc(out_cap);
+    if (!out_buf) {
+        free(entries);
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_puppet_weights((int32_t)WAYWAL_STATUS_ERR_SYNTAX, resp.object_id,
+                                                 NULL, 0u, &rh, &err_resp, sizeof(err_resp),
+                                                 &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    size_t out_len = 0u;
+    if (!waywal_ipc_serialize_resp_puppet_weights(resp.status, resp.object_id, entries, entry_count,
+                                                  &rh, out_buf, out_cap, &out_len)) {
+        free(out_buf);
+        free(entries);
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_puppet_weights((int32_t)WAYWAL_STATUS_ERR_SYNTAX, resp.object_id,
+                                                 NULL, 0u, &rh, &err_resp, sizeof(err_resp),
+                                                 &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    free(entries);
+    bool sent = authoring_send_msg(client_fd, &rh, out_buf, out_len);
+    free(out_buf);
+    return sent;
+}
+
+static bool rig_ipc_handle_paint_weights(daemon_state_t *state, int client_fd,
+                                         const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_puppet_paint_weights_t),
+                                   WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES, &pkt, &pkt_len)) {
+        return rig_send_status_reply(client_fd, false, "Invalid paint_weights packet size");
+    }
+    const waywal_ipc_puppet_paint_weights_t *req = NULL;
+    const waywal_ipc_vertex_weight_t *entries = NULL;
+    if (!waywal_ipc_validate_req_puppet_paint_weights(pkt, pkt_len, &req, &entries)) {
+        free(pkt);
+        return rig_send_status_reply(client_fd, false, "Invalid paint_weights payload");
+    }
+    bool ok = daemon_dispatch_ipc_req_puppet_paint_weights(state, req, entries);
+    free(pkt);
+    return rig_send_status_reply(client_fd, ok, ok ? NULL : "Failed to paint puppet weights");
+}
+
+static bool rig_ipc_handle_heatmap_mode(daemon_state_t *state, int client_fd,
+                                        const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_puppet_heatmap_mode_t),
+                                   sizeof(waywal_ipc_puppet_heatmap_mode_t), &pkt, &pkt_len)) {
+        return rig_send_status_reply(client_fd, false, "Invalid heatmap_mode packet size");
+    }
+    const waywal_ipc_puppet_heatmap_mode_t *req = NULL;
+    if (!waywal_ipc_validate_req_puppet_heatmap_mode(pkt, pkt_len, &req)) {
+        free(pkt);
+        return rig_send_status_reply(client_fd, false, "Invalid heatmap_mode payload");
+    }
+    bool ok = daemon_dispatch_ipc_req_puppet_set_heatmap_mode(state, req);
+    free(pkt);
+    return rig_send_status_reply(client_fd, ok, ok ? NULL : "Failed to set heatmap mode");
+}
+
+static bool rig_ipc_handle_preview_ik(daemon_state_t *state, int client_fd,
+                                      const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    waywal_ipc_hdr_t rh;
+    waywal_ipc_puppet_ik_pose_resp_t err_resp;
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_puppet_preview_ik_t),
+                                   WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES, &pkt, &pkt_len)) {
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_puppet_ik_pose((int32_t)WAYWAL_STATUS_ERR_SYNTAX, 0u, NULL, 0u,
+                                                 &rh, &err_resp, sizeof(err_resp), &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    const waywal_ipc_puppet_preview_ik_t *req = NULL;
+    const waywal_ipc_bone_trs_t *overrides = NULL;
+    if (!waywal_ipc_validate_req_puppet_preview_ik(pkt, pkt_len, &req, &overrides)) {
+        free(pkt);
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_puppet_ik_pose((int32_t)WAYWAL_STATUS_ERR_SYNTAX, 0u, NULL, 0u,
+                                                 &rh, &err_resp, sizeof(err_resp), &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    waywal_ipc_puppet_ik_pose_resp_t resp;
+    waywal_ipc_bone_trs_t *bones = NULL;
+    uint32_t bone_count = 0u;
+    (void)daemon_dispatch_ipc_req_puppet_preview_ik(state, req, overrides, &resp, &bones,
+                                                    &bone_count);
+    free(pkt);
+
+    size_t out_cap = sizeof(waywal_ipc_puppet_ik_pose_resp_t) +
+                     (size_t)bone_count * sizeof(waywal_ipc_bone_trs_t);
+    uint8_t *out_buf = (uint8_t *)malloc(out_cap);
+    if (!out_buf) {
+        free(bones);
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_puppet_ik_pose((int32_t)WAYWAL_STATUS_ERR_SYNTAX, resp.object_id,
+                                                 NULL, 0u, &rh, &err_resp, sizeof(err_resp),
+                                                 &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    size_t out_len = 0u;
+    if (!waywal_ipc_serialize_resp_puppet_ik_pose(resp.status, resp.object_id, bones, bone_count,
+                                                  &rh, out_buf, out_cap, &out_len)) {
+        free(out_buf);
+        free(bones);
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_puppet_ik_pose((int32_t)WAYWAL_STATUS_ERR_SYNTAX, resp.object_id,
+                                                 NULL, 0u, &rh, &err_resp, sizeof(err_resp),
+                                                 &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    free(bones);
+    bool sent = authoring_send_msg(client_fd, &rh, out_buf, out_len);
+    free(out_buf);
+    return sent;
+}
+
+static bool rig_ipc_handle_set_anim_tracks(daemon_state_t *state, int client_fd,
+                                           const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_puppet_set_anim_tracks_t),
+                                   WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES, &pkt, &pkt_len)) {
+        return rig_send_status_reply(client_fd, false, "Invalid set_anim_tracks packet size");
+    }
+    const waywal_ipc_puppet_set_anim_tracks_t *req = NULL;
+    const uint8_t *clips_blob = NULL;
+    size_t clips_blob_len = 0u;
+    if (!waywal_ipc_validate_req_puppet_set_anim_tracks(pkt, pkt_len, &req, &clips_blob,
+                                                        &clips_blob_len)) {
+        free(pkt);
+        return rig_send_status_reply(client_fd, false, "Invalid set_anim_tracks payload");
+    }
+    bool ok =
+        daemon_dispatch_ipc_req_puppet_set_anim_tracks(state, req, clips_blob, clips_blob_len);
+    free(pkt);
+    return rig_send_status_reply(client_fd, ok, ok ? NULL : "Failed to update puppet animations");
+}
+
+static bool rig_ipc_handle_scrub_time(daemon_state_t *state, int client_fd,
+                                      const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size, sizeof(waywal_ipc_puppet_scrub_t),
+                                   sizeof(waywal_ipc_puppet_scrub_t), &pkt, &pkt_len)) {
+        return rig_send_status_reply(client_fd, false, "Invalid scrub_time packet size");
+    }
+    const waywal_ipc_puppet_scrub_t *req = NULL;
+    if (!waywal_ipc_validate_req_puppet_scrub_time(pkt, pkt_len, &req)) {
+        free(pkt);
+        return rig_send_status_reply(client_fd, false, "Invalid scrub_time payload");
+    }
+    bool ok = daemon_dispatch_ipc_req_puppet_scrub_time(state, req);
+    free(pkt);
+    return rig_send_status_reply(client_fd, ok, ok ? NULL : "Failed to scrub puppet time");
+}
+
+static bool rig_ipc_handle_export_mdl(daemon_state_t *state, int client_fd,
+                                      const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    waywal_ipc_hdr_t rh;
+    waywal_ipc_export_puppet_mdl_resp_t err_resp;
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_export_puppet_mdl_t),
+                                   sizeof(waywal_ipc_export_puppet_mdl_t), &pkt, &pkt_len)) {
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_export_puppet_mdl((int32_t)WAYWAL_STATUS_ERR_SYNTAX, 0u, NULL, 0u,
+                                                    &rh, &err_resp, sizeof(err_resp), &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    const waywal_ipc_export_puppet_mdl_t *req = NULL;
+    if (!waywal_ipc_validate_req_export_puppet_mdl(pkt, pkt_len, &req)) {
+        free(pkt);
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_export_puppet_mdl((int32_t)WAYWAL_STATUS_ERR_SYNTAX, 0u, NULL, 0u,
+                                                    &rh, &err_resp, sizeof(err_resp), &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+
+    waywal_ipc_export_puppet_mdl_resp_t resp;
+    uint8_t *mdl_blob = NULL;
+    uint32_t mdl_size = 0u;
+    (void)daemon_dispatch_ipc_req_export_puppet_mdl(state, req, &resp, &mdl_blob, &mdl_size);
+    free(pkt);
+
+    size_t out_cap =
+        sizeof(waywal_ipc_export_puppet_mdl_resp_t) + (mdl_blob ? (size_t)mdl_size : 0u);
+    uint8_t *out_buf = (uint8_t *)malloc(out_cap);
+    if (!out_buf) {
+        free(mdl_blob);
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_export_puppet_mdl((int32_t)WAYWAL_STATUS_ERR_SYNTAX,
+                                                    resp.object_id, NULL, 0u, &rh, &err_resp,
+                                                    sizeof(err_resp), &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    size_t out_len = 0u;
+    if (!waywal_ipc_serialize_resp_export_puppet_mdl(resp.status, resp.object_id, mdl_blob,
+                                                     mdl_blob ? mdl_size : resp.mdl_byte_size, &rh,
+                                                     out_buf, out_cap, &out_len)) {
+        free(out_buf);
+        free(mdl_blob);
+        size_t err_len = 0u;
+        waywal_ipc_serialize_resp_export_puppet_mdl((int32_t)WAYWAL_STATUS_ERR_SYNTAX,
+                                                    resp.object_id, NULL, 0u, &rh, &err_resp,
+                                                    sizeof(err_resp), &err_len);
+        return authoring_send_msg(client_fd, &rh, &err_resp, err_len);
+    }
+    free(mdl_blob);
+    bool sent = authoring_send_msg(client_fd, &rh, out_buf, out_len);
+    free(out_buf);
+    return sent;
+}
+
+bool daemon_dispatch_rigging_ipc(daemon_state_t *state, int client_fd, const waywal_ipc_hdr_t *hdr,
+                                 int attached_fd)
+{
+    if (attached_fd >= 0) {
+        close(attached_fd);
+    }
+    if (!hdr) {
+        return false;
+    }
+    if (hdr->magic != WAYWAL_IPC_MAGIC || hdr->version != WAYWAL_IPC_VERSION) {
+        (void)shutdown(client_fd, SHUT_RDWR);
+        return false;
+    }
+
+    switch (hdr->opcode) {
+    case WAYWAL_REQ_PUPPET_SET_MESH:
+        return rig_ipc_handle_set_mesh(state, client_fd, hdr);
+    case WAYWAL_REQ_PUPPET_SET_SKELETON:
+        return rig_ipc_handle_set_skeleton(state, client_fd, hdr);
+    case WAYWAL_REQ_PUPPET_SOLVE_WEIGHTS:
+        return rig_ipc_handle_solve_weights(state, client_fd, hdr);
+    case WAYWAL_REQ_PUPPET_PAINT_WEIGHTS:
+        return rig_ipc_handle_paint_weights(state, client_fd, hdr);
+    case WAYWAL_REQ_PUPPET_SET_HEATMAP_MODE:
+        return rig_ipc_handle_heatmap_mode(state, client_fd, hdr);
+    case WAYWAL_REQ_PUPPET_PREVIEW_IK:
+        return rig_ipc_handle_preview_ik(state, client_fd, hdr);
+    case WAYWAL_REQ_PUPPET_SET_ANIM_TRACKS:
+        return rig_ipc_handle_set_anim_tracks(state, client_fd, hdr);
+    case WAYWAL_REQ_PUPPET_SCRUB_TIME:
+        return rig_ipc_handle_scrub_time(state, client_fd, hdr);
+    case WAYWAL_REQ_EXPORT_PUPPET_MDL:
+        return rig_ipc_handle_export_mdl(state, client_fd, hdr);
+    default:
+        break;
+    }
+
+    if (!authoring_drain_payload(client_fd, hdr->payload_size, 500)) {
+        return false;
+    }
+    return false;
+}
+
 bool daemon_dispatch_authoring_ipc(daemon_state_t *state, int client_fd,
                                    const waywal_ipc_hdr_t *hdr, int attached_fd)
 {
@@ -9278,6 +11219,16 @@ bool daemon_dispatch_authoring_ipc(daemon_state_t *state, int client_fd,
         return authoring_ipc_handle_lint_script(state, client_fd, hdr);
     case WAYWAL_REQ_READBACK_TEXTURE:
         return authoring_ipc_handle_readback(state, client_fd, hdr);
+    case WAYWAL_REQ_PUPPET_SET_MESH:
+    case WAYWAL_REQ_PUPPET_SET_SKELETON:
+    case WAYWAL_REQ_PUPPET_SOLVE_WEIGHTS:
+    case WAYWAL_REQ_PUPPET_PAINT_WEIGHTS:
+    case WAYWAL_REQ_PUPPET_SET_HEATMAP_MODE:
+    case WAYWAL_REQ_PUPPET_PREVIEW_IK:
+    case WAYWAL_REQ_PUPPET_SET_ANIM_TRACKS:
+    case WAYWAL_REQ_PUPPET_SCRUB_TIME:
+    case WAYWAL_REQ_EXPORT_PUPPET_MDL:
+        return daemon_dispatch_rigging_ipc(state, client_fd, hdr, -1);
     default:
         break;
     }

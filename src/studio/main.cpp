@@ -66,7 +66,28 @@ static int runHeadlessCheck(const StudioOptions &options)
             return 1;
         }
     }
-    std::cout << "[+] All 6 required panels & footer bars verified and accessible." << std::endl;
+    if (panelIds.size() != 22) {
+        std::cerr << "[-] FAILED: Expected 22 registered panels, got " << panelIds.size()
+                  << std::endl;
+        return 1;
+    }
+    const QStringList lazyRiggingPanels = {
+        QStringLiteral("PuppetMeshPanel"), QStringLiteral("BoneRiggingPanel"),
+        QStringLiteral("WeightPaintPanel"), QStringLiteral("DopeSheetTimelineWidget")};
+    for (const auto &rigPanel : lazyRiggingPanels) {
+        if (!panelIds.contains(rigPanel) || !layoutMgr->dockWidget(rigPanel)) {
+            std::cerr << "[-] FAILED: Missing rigging panel '" << rigPanel.toStdString() << "'!"
+                      << std::endl;
+            return 1;
+        }
+        if (layoutMgr->isPanelRealized(rigPanel)) {
+            std::cerr << "[-] FAILED: Rigging panel '" << rigPanel.toStdString()
+                      << "' should stay lazy before realization!" << std::endl;
+            return 1;
+        }
+    }
+    std::cout << "[+] All 22 registered panels (including 4 deferred rigging panels) verified."
+              << std::endl;
 
     // 3. Validate Available Perspectives
     QStringList perspectives = layoutMgr->availablePerspectives();
@@ -84,12 +105,21 @@ static int runHeadlessCheck(const StudioOptions &options)
             return 1;
         }
     }
-    std::cout << "[+] All 4 required perspectives present in perspective registry." << std::endl;
+    if (!perspectives.contains(QStringLiteral("Rigging & Animation"))) {
+        std::cerr << "[-] FAILED: Missing required perspective: Rigging & Animation" << std::endl;
+        return 1;
+    }
+    std::cout << "[+] All required perspectives (including Rigging & Animation) present."
+              << std::endl;
 
     // 4. Validate JSON Serialization Schema
     QJsonObject layoutJson = layoutMgr->serializeLayout();
     if (layoutJson.value(QStringLiteral("version")).toInt() != 1) {
         std::cerr << "[-] FAILED: JSON serialization 'version' must equal 1!" << std::endl;
+        return 1;
+    }
+    if (layoutJson.value(QStringLiteral("layout_revision")).toInt() != 7) {
+        std::cerr << "[-] FAILED: JSON serialization 'layout_revision' must equal 7!" << std::endl;
         return 1;
     }
     if (layoutJson.value(QStringLiteral("active_perspective")).toString().isEmpty()) {
@@ -433,6 +463,19 @@ static int runHeadlessCheck(const StudioOptions &options)
         layoutMgr->switchPerspective(QStringLiteral("Default"));
         for (int i = 0; i < 8; ++i)
             QCoreApplication::processEvents();
+    }
+
+    if (!layoutMgr->switchPerspective(QStringLiteral("Rigging & Animation")) ||
+        layoutMgr->activePerspective() != QStringLiteral("Rigging & Animation")) {
+        std::cerr << "[-] FAILED to switch to perspective: Rigging & Animation" << std::endl;
+        return 1;
+    }
+    for (int i = 0; i < 8; ++i) {
+        QCoreApplication::processEvents();
+    }
+    layoutMgr->switchPerspective(QStringLiteral("Default"));
+    for (int i = 0; i < 4; ++i) {
+        QCoreApplication::processEvents();
     }
 
     window.hide();

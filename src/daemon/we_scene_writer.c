@@ -5,6 +5,8 @@
 
 #include "waywal/we_asset_writer.h"
 #include "waywal/we_json.h"
+#include "waywal/we_mdl_writer.h"
+#include "waywal/we_mesh_rig.h"
 #include "waywal/wwpkg.h"
 
 #include <ctype.h>
@@ -762,19 +764,123 @@ static bool serialize_object_effects(json_buf_t *jb, const we_scene_object_t *ob
     return ok && jb_ch(jb, ']');
 }
 
-static bool serialize_object(json_buf_t *jb, const we_scene_object_t *obj, uint32_t obj_idx,
-                             const char *image_override)
+static void sanitize_puppet_stem(const we_scene_t *scene, const we_scene_object_t *obj,
+                                 uint32_t obj_idx, char *out_stem, size_t stem_cap)
+{
+    char clean[48];
+    size_t out_len = 0u;
+    const char *src = (obj->name[0] != '\0') ? obj->name : "puppet";
+    for (size_t i = 0u; src[i] != '\0' && out_len + 1u < sizeof(clean); ++i) {
+        unsigned char ch = (unsigned char)src[i];
+        if (isalnum(ch)) {
+            clean[out_len++] = (char)tolower(ch);
+        } else if (out_len > 0u && clean[out_len - 1u] != '_') {
+            clean[out_len++] = '_';
+        }
+    }
+    while (out_len > 0u && clean[out_len - 1u] == '_') {
+        --out_len;
+    }
+    if (out_len == 0u) {
+        snprintf(clean, sizeof(clean), "puppet");
+    } else {
+        clean[out_len] = '\0';
+    }
+
+    bool unique_id = (obj->id > 0);
+    if (unique_id && scene && scene->objects) {
+        for (uint32_t j = 0u; j < scene->object_count; ++j) {
+            if (j != obj_idx && scene->objects[j].id == obj->id) {
+                unique_id = false;
+                break;
+            }
+        }
+    }
+
+    if (unique_id) {
+        snprintf(out_stem, stem_cap, "%s_%d", clean, obj->id);
+    } else {
+        snprintf(out_stem, stem_cap, "%s_%u", clean, (unsigned int)obj_idx);
+    }
+}
+
+static bool build_puppet_mdl_rel(const we_scene_t *scene, const we_scene_object_t *obj,
+                                 uint32_t obj_idx, char *out_rel, size_t cap)
+{
+    char stem[80];
+    sanitize_puppet_stem(scene, obj, obj_idx, stem, sizeof(stem));
+    char raw[128];
+    int n = snprintf(raw, sizeof(raw), "models/%s.mdl", stem);
+    if (n < 0 || (size_t)n >= sizeof(raw)) {
+        return false;
+    }
+    return we_normalize_rel_path(raw, out_rel, cap, NULL);
+}
+
+static bool serialize_puppet_layers(json_buf_t *jb, const we_puppet_t *puppet, bool *first)
+{
+    if (!puppet || puppet->layer_count == 0u) {
+        return true;
+    }
+    bool ok = jb_key(jb, first, "puppet_layers") && jb_ch(jb, '[');
+    uint32_t count =
+        (puppet->layer_count < WE_MDL_MAX_LAYERS) ? puppet->layer_count : WE_MDL_MAX_LAYERS;
+    for (uint32_t i = 0u; ok && i < count; ++i) {
+        const we_puppet_layer_t *ly = &puppet->layers[i];
+        bool lfirst = true;
+        if (i > 0u) {
+            ok = ok && jb_ch(jb, ',');
+        }
+        ok = ok && jb_ch(jb, '{');
+        if (ly->anim_id >= 0) {
+            ok = ok && jb_key(jb, &lfirst, "animation") && jb_i64(jb, ly->anim_id);
+            if (ok && ly->anim_name[0] != '\0') {
+                ok = jb_key(jb, &lfirst, "name") && jb_str(jb, ly->anim_name);
+            }
+        } else {
+            ok = ok && jb_key(jb, &lfirst, "animation") && jb_str(jb, ly->anim_name);
+            if (ok && ly->anim_name[0] != '\0') {
+                ok = jb_key(jb, &lfirst, "name") && jb_str(jb, ly->anim_name);
+            }
+        }
+        ok = ok && jb_key(jb, &lfirst, "rate") && jb_f32(jb, ly->rate);
+        ok = ok && jb_key(jb, &lfirst, "blend") && jb_f32(jb, ly->blend);
+        ok = ok && jb_key(jb, &lfirst, "visible") && jb_cstr(jb, ly->visible ? "true" : "false");
+        ok = ok && jb_ch(jb, '}');
+    }
+    return ok && jb_ch(jb, ']');
+}
+
+static bool serialize_object(json_buf_t *jb, const we_scene_t *scene, const we_scene_object_t *obj,
+                             uint32_t obj_idx, const char *image_override,
+                             const char *puppet_override)
 {
     bool ok = jb_ch(jb, '{');
     bool first = true;
     const char *img_out = image_override ? image_override : obj->image_path;
+    char auto_puppet_rel[160];
+    const char *puppet_out = puppet_override;
+
+    if (!puppet_out && obj->puppet && !obj->is_text_object && !obj->passthrough) {
+        if (!build_puppet_mdl_rel(scene, obj, obj_idx, auto_puppet_rel, sizeof(auto_puppet_rel))) {
+            jb->err = WE_WRITER_ERR_INVALID_PATH;
+            return false;
+        }
+        puppet_out = auto_puppet_rel;
+    }
 
     ok = ok && jb_key(jb, &first, "id") && jb_i64(jb, obj->id);
     if (obj->parent_id >= 0) {
         ok = ok && jb_key(jb, &first, "parent") && jb_i64(jb, obj->parent_id);
     }
     ok = ok && jb_key(jb, &first, "name") && jb_str(jb, obj->name[0] ? obj->name : "layer");
-    if (img_out[0] != '\0') {
+    if (puppet_out && puppet_out[0] != '\0') {
+        /* Omit "image" on puppet layers so scene parser enters direct puppet loading. */
+        ok = ok && jb_key(jb, &first, "puppet") && jb_str(jb, puppet_out);
+        if (ok && obj->puppet && obj->puppet->layer_count > 0u) {
+            ok = serialize_puppet_layers(jb, obj->puppet, &first);
+        }
+    } else if (img_out[0] != '\0') {
         ok = ok && jb_key(jb, &first, "image") && jb_str(jb, img_out);
     }
 
@@ -918,7 +1024,8 @@ static bool serialize_scene_camerapaths(json_buf_t *jb, const we_scene_t *scene,
 }
 
 static bool serialize_scene_with_overrides(const we_scene_t *scene,
-                                           const char *const *image_overrides, char **out_json,
+                                           const char *const *image_overrides,
+                                           const char *const *puppet_overrides, char **out_json,
                                            size_t *out_len, we_asset_writer_err_t *out_err)
 {
     if (!scene || !out_json) {
@@ -963,7 +1070,8 @@ static bool serialize_scene_with_overrides(const we_scene_t *scene,
             ok = ok && jb_ch(&jb, ',');
         }
         const char *ovr = image_overrides ? image_overrides[i] : NULL;
-        ok = ok && serialize_object(&jb, &scene->objects[i], i, ovr);
+        const char *povr = puppet_overrides ? puppet_overrides[i] : NULL;
+        ok = ok && serialize_object(&jb, scene, &scene->objects[i], i, ovr, povr);
     }
     ok = ok && jb_ch(&jb, ']') && jb_ch(&jb, '}');
 
@@ -973,7 +1081,7 @@ static bool serialize_scene_with_overrides(const we_scene_t *scene,
 bool we_scene_serialize_json(const we_scene_t *scene, char **out_json, size_t *out_len,
                              we_asset_writer_err_t *out_err)
 {
-    return serialize_scene_with_overrides(scene, NULL, out_json, out_len, out_err);
+    return serialize_scene_with_overrides(scene, NULL, NULL, out_json, out_len, out_err);
 }
 
 static bool mkdir_p(const char *dir)
@@ -1852,14 +1960,568 @@ static bool export_object_sound_assets(asset_list_t *al, const we_scene_object_t
     return true;
 }
 
-static bool validate_export_paths(const asset_list_t *al, const char *export_dir,
-                                  bool pack_scene_pkg, we_asset_writer_err_t *out_err)
+static bool jb_f32_arr(json_buf_t *jb, const float *vals, size_t n)
+{
+    bool ok = jb_ch(jb, '[');
+    for (size_t i = 0u; ok && i < n; ++i) {
+        if (i > 0u) {
+            ok = ok && jb_ch(jb, ',');
+        }
+        ok = ok && jb_f32(jb, vals[i]);
+    }
+    return ok && jb_ch(jb, ']');
+}
+
+static bool jb_f64(json_buf_t *jb, double v)
+{
+    if (!isfinite(v)) {
+        jb->err = WE_WRITER_ERR_NON_FINITE;
+        return false;
+    }
+    if (v == 0.0) {
+        v = 0.0;
+    }
+    char buf[64];
+    locale_t old_loc = (locale_t)0;
+    if (jb->cloc != (locale_t)0) {
+        old_loc = uselocale(jb->cloc);
+    }
+    int n = snprintf(buf, sizeof(buf), "%.15g", v);
+    if (jb->cloc != (locale_t)0) {
+        uselocale(old_loc);
+    }
+    if (n <= 0 || (size_t)n >= sizeof(buf)) {
+        return false;
+    }
+    return jb_cstr(jb, buf);
+}
+
+static bool jb_jval(json_buf_t *jb, const we_jval_t *v, int depth)
+{
+    if (depth > 32) {
+        return false;
+    }
+    if (!v || v->type == JVAL_NULL) {
+        return jb_cstr(jb, "null");
+    }
+    switch (v->type) {
+    case JVAL_BOOL:
+        return jb_cstr(jb, v->bval ? "true" : "false");
+    case JVAL_NUM:
+        return jb_f64(jb, v->num);
+    case JVAL_STR:
+        return jb_str(jb, v->str ? v->str : "");
+    case JVAL_ARR: {
+        bool ok = jb_ch(jb, '[');
+        for (size_t i = 0u; ok && i < v->arr.count; ++i) {
+            if (i > 0u) {
+                ok = ok && jb_ch(jb, ',');
+            }
+            ok = ok && jb_jval(jb, v->arr.items[i], depth + 1);
+        }
+        return ok && jb_ch(jb, ']');
+    }
+    case JVAL_OBJ: {
+        bool ok = jb_ch(jb, '{');
+        for (size_t i = 0u; ok && i < v->obj.count; ++i) {
+            if (i > 0u) {
+                ok = ok && jb_ch(jb, ',');
+            }
+            ok = ok && jb_str(jb, v->obj.entries[i].key ? v->obj.entries[i].key : "") &&
+                 jb_ch(jb, ':') && jb_jval(jb, v->obj.entries[i].val, depth + 1);
+        }
+        return ok && jb_ch(jb, '}');
+    }
+    default:
+        return false;
+    }
+}
+
+static we_jval_t *load_existing_sidecar_json(const we_scene_t *scene, const char *sidecar_rel)
+{
+    if (!scene || scene->project.workshop_dir[0] == '\0' || !sidecar_rel ||
+        sidecar_rel[0] == '\0' || strchr(sidecar_rel, '/') != NULL) {
+        return NULL;
+    }
+    int dfd = open(scene->project.workshop_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dfd < 0) {
+        return NULL;
+    }
+    int fd = openat(dfd, sidecar_rel, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    close(dfd);
+    if (fd < 0) {
+        return NULL;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size > (off_t)(4u * 1024u * 1024u)) {
+        close(fd);
+        return NULL;
+    }
+    size_t sz = (size_t)st.st_size;
+    char *buf = (char *)malloc(sz + 1u);
+    if (!buf) {
+        close(fd);
+        return NULL;
+    }
+    size_t got = 0u;
+    while (got < sz) {
+        ssize_t r = read(fd, buf + got, sz - got);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            free(buf);
+            close(fd);
+            return NULL;
+        }
+        if (r == 0) {
+            break;
+        }
+        got += (size_t)r;
+    }
+    close(fd);
+    buf[got] = '\0';
+    we_jval_t *root = we_json_parse_root(buf, got);
+    free(buf);
+    return root;
+}
+
+static const char *tangent_mode_str_from_jval(const we_jval_t *tm)
+{
+    if (!tm) {
+        return NULL;
+    }
+    if (tm->type == JVAL_STR && tm->str && tm->str[0] != '\0') {
+        return tm->str;
+    }
+    if (tm->type == JVAL_NUM && isfinite(tm->num)) {
+        int code = (int)tm->num;
+        switch (code) {
+        case 1:
+            return "Aligned";
+        case 2:
+            return "Vector";
+        case 3:
+            return "Stepped";
+        case 0:
+        default:
+            return "Auto";
+        }
+    }
+    return NULL;
+}
+
+static const char *find_existing_tangent_mode(const we_jval_t *prev_root, uint32_t anim_idx,
+                                              int32_t bone_idx, uint32_t kf_idx)
+{
+    const we_jval_t *curves = prev_root ? we_jobj_get(prev_root, "animation_curves") : NULL;
+    if (!curves || curves->type != JVAL_ARR || anim_idx >= curves->arr.count) {
+        return "Auto";
+    }
+    const we_jval_t *cobj = curves->arr.items[anim_idx];
+    if (!cobj || cobj->type != JVAL_OBJ) {
+        return "Auto";
+    }
+
+    const we_jval_t *tracks = we_jobj_get(cobj, "tracks");
+    if (tracks && tracks->type == JVAL_ARR) {
+        for (size_t t = 0u; t < tracks->arr.count; ++t) {
+            const we_jval_t *tobj = tracks->arr.items[t];
+            const we_jval_t *bi = tobj ? we_jobj_get(tobj, "bone_index") : NULL;
+            if (!bi || bi->type != JVAL_NUM || (int32_t)bi->num != bone_idx) {
+                continue;
+            }
+            const we_jval_t *kfs = we_jobj_get(tobj, "keyframes");
+            if (kfs && kfs->type == JVAL_ARR && kf_idx < kfs->arr.count) {
+                const char *s =
+                    tangent_mode_str_from_jval(we_jobj_get(kfs->arr.items[kf_idx], "tangentMode"));
+                if (s) {
+                    return s;
+                }
+            }
+        }
+    }
+
+    const we_jval_t *channels = we_jobj_get(cobj, "channels");
+    if (channels && channels->type == JVAL_ARR) {
+        for (size_t ch = 0u; ch < channels->arr.count; ++ch) {
+            const we_jval_t *chobj = channels->arr.items[ch];
+            const we_jval_t *bi = chobj ? we_jobj_get(chobj, "bone_index") : NULL;
+            if (!bi || bi->type != JVAL_NUM || (int32_t)bi->num != bone_idx) {
+                continue;
+            }
+            const we_jval_t *keys = we_jobj_get(chobj, "keys");
+            if (keys && keys->type == JVAL_ARR && kf_idx < keys->arr.count) {
+                const char *s =
+                    tangent_mode_str_from_jval(we_jobj_get(keys->arr.items[kf_idx], "tangentMode"));
+                if (s) {
+                    return s;
+                }
+            }
+        }
+    }
+    return "Auto";
+}
+
+static bool serialize_puppet_sidecar(const we_scene_t *scene, const we_scene_object_t *obj,
+                                     const char *sidecar_rel, const char *mdl_rel,
+                                     const char *mat_rel, char **out_json, size_t *out_len,
+                                     we_asset_writer_err_t *out_err)
+{
+    const we_puppet_t *p = obj->puppet;
+    const we_rig_pose_ctx_t *rig = (const we_rig_pose_ctx_t *)p->rig_ctx;
+    we_jval_t *prev_root = load_existing_sidecar_json(scene, sidecar_rel);
+    const we_jval_t *prev_contour = prev_root ? we_jobj_get(prev_root, "contour_polygon") : NULL;
+    const we_jval_t *prev_pins = prev_root ? we_jobj_get(prev_root, "pins") : NULL;
+    const we_jval_t *prev_ik = prev_root ? we_jobj_get(prev_root, "ik_chains") : NULL;
+    const we_jval_t *prev_aim = prev_root ? we_jobj_get(prev_root, "aim_constraints") : NULL;
+
+    json_buf_t jb;
+    jb_init(&jb);
+    bool first = true;
+    bool ok = jb_ch(&jb, '{');
+
+    ok = ok && jb_key(&jb, &first, "version") && jb_i64(&jb, 1);
+    ok = ok && jb_key(&jb, &first, "object_id") && jb_i64(&jb, obj->id);
+    ok = ok && jb_key(&jb, &first, "object_name") && jb_str(&jb, obj->name[0] ? obj->name : "");
+    ok = ok && jb_key(&jb, &first, "puppet") && jb_str(&jb, mdl_rel);
+    ok = ok && jb_key(&jb, &first, "material") && jb_str(&jb, mat_rel);
+    ok = ok && jb_key(&jb, &first, "contour_polygon") &&
+         ((prev_contour && prev_contour->type == JVAL_ARR) ? jb_jval(&jb, prev_contour, 0)
+                                                           : jb_cstr(&jb, "[]"));
+    ok = ok && jb_key(&jb, &first, "pins") &&
+         ((prev_pins && prev_pins->type == JVAL_ARR) ? jb_jval(&jb, prev_pins, 0)
+                                                     : jb_cstr(&jb, "[]"));
+
+    ok = ok && jb_key(&jb, &first, "ik_chains");
+    if (rig && rig->ik_chain_count > 0u) {
+        ok = ok && jb_ch(&jb, '[');
+        uint32_t cnt = (rig->ik_chain_count < WE_RIG_MAX_IK_CHAINS) ? rig->ik_chain_count
+                                                                    : WE_RIG_MAX_IK_CHAINS;
+        for (uint32_t c = 0u; ok && c < cnt; ++c) {
+            const we_ik_chain_t *ch = &rig->ik_chains[c];
+            bool cfirst = true;
+            if (c > 0u) {
+                ok = ok && jb_ch(&jb, ',');
+            }
+            ok = ok && jb_ch(&jb, '{');
+            ok = ok && jb_key(&jb, &cfirst, "root_bone") && jb_i64(&jb, ch->root_bone);
+            ok = ok && jb_key(&jb, &cfirst, "mid_bone") && jb_i64(&jb, ch->mid_bone);
+            ok = ok && jb_key(&jb, &cfirst, "end_bone") && jb_i64(&jb, ch->end_bone);
+            ok = ok && jb_key(&jb, &cfirst, "bend_sign") && jb_i64(&jb, ch->bend_sign);
+            ok = ok && jb_key(&jb, &cfirst, "enabled") &&
+                 jb_cstr(&jb, ch->enabled ? "true" : "false");
+            ok =
+                ok && jb_key(&jb, &cfirst, "target_world") && jb_f32_arr(&jb, ch->target_world, 3u);
+            ok = ok && jb_key(&jb, &cfirst, "pole_world") && jb_f32_arr(&jb, ch->pole_world, 3u);
+            ok = ok && jb_key(&jb, &cfirst, "soft_zone_ratio") && jb_f32(&jb, ch->soft_zone_ratio);
+            ok = ok && jb_key(&jb, &cfirst, "max_stretch_ratio") &&
+                 jb_f32(&jb, ch->max_stretch_ratio);
+            ok = ok && jb_key(&jb, &cfirst, "root_angle_min_rad") &&
+                 jb_f32(&jb, ch->root_angle_min_rad);
+            ok = ok && jb_key(&jb, &cfirst, "root_angle_max_rad") &&
+                 jb_f32(&jb, ch->root_angle_max_rad);
+            ok = ok && jb_key(&jb, &cfirst, "mid_angle_min_rad") &&
+                 jb_f32(&jb, ch->mid_angle_min_rad);
+            ok = ok && jb_key(&jb, &cfirst, "mid_angle_max_rad") &&
+                 jb_f32(&jb, ch->mid_angle_max_rad);
+            ok = ok && jb_key(&jb, &cfirst, "blend_weight") && jb_f32(&jb, ch->blend_weight);
+            ok = ok && jb_ch(&jb, '}');
+        }
+        ok = ok && jb_ch(&jb, ']');
+    } else if (prev_ik && prev_ik->type == JVAL_ARR && prev_ik->arr.count > 0u) {
+        ok = ok && jb_jval(&jb, prev_ik, 0);
+    } else {
+        ok = ok && jb_cstr(&jb, "[]");
+    }
+
+    ok = ok && jb_key(&jb, &first, "aim_constraints");
+    if (rig && rig->aim_count > 0u) {
+        ok = ok && jb_ch(&jb, '[');
+        uint32_t cnt = (rig->aim_count < WE_RIG_MAX_AIM_CONSTRAINTS) ? rig->aim_count
+                                                                     : WE_RIG_MAX_AIM_CONSTRAINTS;
+        for (uint32_t a = 0u; ok && a < cnt; ++a) {
+            const we_aim_constraint_t *aim = &rig->aim_constraints[a];
+            bool afirst = true;
+            if (a > 0u) {
+                ok = ok && jb_ch(&jb, ',');
+            }
+            ok = ok && jb_ch(&jb, '{');
+            ok = ok && jb_key(&jb, &afirst, "bone_index") && jb_i64(&jb, aim->bone_index);
+            ok = ok && jb_key(&jb, &afirst, "enabled") &&
+                 jb_cstr(&jb, aim->enabled ? "true" : "false");
+            ok = ok && jb_key(&jb, &afirst, "aim_axis_local") &&
+                 jb_f32_arr(&jb, aim->aim_axis_local, 3u);
+            ok = ok && jb_key(&jb, &afirst, "target_world") &&
+                 jb_f32_arr(&jb, aim->target_world, 3u);
+            ok = ok && jb_key(&jb, &afirst, "max_cone_rad") && jb_f32(&jb, aim->max_cone_rad);
+            ok = ok && jb_key(&jb, &afirst, "blend_weight") && jb_f32(&jb, aim->blend_weight);
+            ok = ok && jb_ch(&jb, '}');
+        }
+        ok = ok && jb_ch(&jb, ']');
+    } else if (prev_aim && prev_aim->type == JVAL_ARR && prev_aim->arr.count > 0u) {
+        ok = ok && jb_jval(&jb, prev_aim, 0);
+    } else {
+        ok = ok && jb_cstr(&jb, "[]");
+    }
+
+    ok = ok && jb_key(&jb, &first, "bone_drive_modes") && jb_ch(&jb, '[');
+    for (uint32_t i = 0u; ok && i < p->bone_count; ++i) {
+        const we_mdl_bone_t *b = &p->bones[i];
+        bool bfirst = true;
+        int64_t parent_id = (b->parent == 0xFFFFFFFFu) ? -1 : (int64_t)b->parent;
+        const char *mode = NULL;
+        if (rig && i < WE_MDL_MAX_BONES) {
+            switch (rig->bone_drive_modes[i]) {
+            case WE_BONE_DRIVE_IK:
+                mode = "IK";
+                break;
+            case WE_BONE_DRIVE_AIM:
+                mode = "Aim";
+                break;
+            case WE_BONE_DRIVE_XPBD:
+                mode = "XPBD";
+                break;
+            case WE_BONE_DRIVE_FK:
+            default:
+                mode = (b->simulation_json[0] != '\0') ? "XPBD" : "FK";
+                break;
+            }
+        } else {
+            mode = (b->simulation_json[0] != '\0') ? "XPBD" : "FK";
+        }
+        if (i > 0u) {
+            ok = ok && jb_ch(&jb, ',');
+        }
+        ok = ok && jb_ch(&jb, '{');
+        ok = ok && jb_key(&jb, &bfirst, "bone_index") && jb_i64(&jb, i);
+        ok = ok && jb_key(&jb, &bfirst, "name") && jb_str(&jb, b->name);
+        ok = ok && jb_key(&jb, &bfirst, "parent") && jb_i64(&jb, parent_id);
+        ok = ok && jb_key(&jb, &bfirst, "drive_mode") && jb_str(&jb, mode);
+        if (ok && b->simulation_json[0] != '\0') {
+            ok = jb_key(&jb, &bfirst, "simulation_json") && jb_str(&jb, b->simulation_json);
+        }
+        ok = ok && jb_ch(&jb, '}');
+    }
+    ok = ok && jb_ch(&jb, ']');
+
+    uint32_t layer_cnt = (p->layer_count > p->anim_count) ? p->layer_count : p->anim_count;
+    if (layer_cnt > WE_MDL_MAX_LAYERS) {
+        layer_cnt = WE_MDL_MAX_LAYERS;
+    }
+    ok = ok && jb_key(&jb, &first, "layer_blend_modes") && jb_ch(&jb, '[');
+    for (uint32_t l = 0u; ok && l < layer_cnt; ++l) {
+        if (l > 0u) {
+            ok = ok && jb_ch(&jb, ',');
+        }
+        int64_t bmode = rig ? (int64_t)rig->layer_blend_modes[l] : 0;
+        ok = ok && jb_i64(&jb, bmode);
+    }
+    ok = ok && jb_ch(&jb, ']');
+
+    ok = ok && jb_key(&jb, &first, "animation_curves") && jb_ch(&jb, '[');
+    for (uint32_t a = 0u; ok && a < p->anim_count; ++a) {
+        const we_mdl_anim_t *anim = &p->anims[a];
+        bool afirst = true;
+        const char *mode_s = (anim->mode == WE_ANIM_MIRROR)
+                                 ? "mirror"
+                                 : ((anim->mode == WE_ANIM_SINGLE) ? "single" : "loop");
+        if (a > 0u) {
+            ok = ok && jb_ch(&jb, ',');
+        }
+        ok = ok && jb_ch(&jb, '{');
+        ok = ok && jb_key(&jb, &afirst, "id") && jb_i64(&jb, anim->id);
+        ok = ok && jb_key(&jb, &afirst, "name") && jb_str(&jb, anim->name);
+        ok = ok && jb_key(&jb, &afirst, "mode") && jb_str(&jb, mode_s);
+        ok = ok && jb_key(&jb, &afirst, "fps") && jb_f32(&jb, anim->fps);
+        ok = ok && jb_key(&jb, &afirst, "length") && jb_i64(&jb, anim->length);
+        ok = ok && jb_key(&jb, &afirst, "tracks") && jb_ch(&jb, '[');
+        for (uint32_t t = 0u; ok && t < anim->track_count; ++t) {
+            const we_mdl_bone_track_t *tr = &anim->tracks[t];
+            bool tfirst = true;
+            if (t > 0u) {
+                ok = ok && jb_ch(&jb, ',');
+            }
+            ok = ok && jb_ch(&jb, '{');
+            ok = ok && jb_key(&jb, &tfirst, "bone_index") && jb_i64(&jb, tr->bone_index);
+            ok = ok && jb_key(&jb, &tfirst, "keyframes") && jb_ch(&jb, '[');
+            for (uint32_t k = 0u; ok && k < tr->kf_count; ++k) {
+                const we_mdl_keyframe_t *kf = &tr->keyframes[k];
+                bool kfirst = true;
+                const char *tmode = find_existing_tangent_mode(prev_root, a, tr->bone_index, k);
+                if (k > 0u) {
+                    ok = ok && jb_ch(&jb, ',');
+                }
+                ok = ok && jb_ch(&jb, '{');
+                ok = ok && jb_key(&jb, &kfirst, "frame") && jb_i64(&jb, k);
+                ok = ok && jb_key(&jb, &kfirst, "pos") && jb_f32_arr(&jb, kf->pos, 3u);
+                ok = ok && jb_key(&jb, &kfirst, "angle") && jb_f32_arr(&jb, kf->angle, 3u);
+                ok = ok && jb_key(&jb, &kfirst, "scale") && jb_f32_arr(&jb, kf->scale, 3u);
+                ok = ok && jb_key(&jb, &kfirst, "tangentMode") && jb_str(&jb, tmode);
+                ok = ok && jb_ch(&jb, '}');
+            }
+            ok = ok && jb_ch(&jb, ']') && jb_ch(&jb, '}');
+        }
+        ok = ok && jb_ch(&jb, ']') && jb_ch(&jb, '}');
+    }
+    ok = ok && jb_ch(&jb, ']') && jb_ch(&jb, '}');
+
+    we_jval_free(prev_root);
+    return finish_jb(&jb, ok, out_json, out_len, out_err);
+}
+
+static bool export_object_puppet_assets(asset_list_t *al, asset_list_t *sidecars,
+                                        const we_scene_t *scene, const we_scene_object_t *obj,
+                                        uint32_t obj_idx, char **out_puppet_override,
+                                        we_asset_writer_err_t *out_err)
+{
+    char stem[80];
+    char raw_mdl[128];
+    char raw_mdl_json[128];
+    char raw_mat[128];
+    char mdl_rel[160];
+    char mdl_json_rel[160];
+    char mat_rel[320];
+
+    sanitize_puppet_stem(scene, obj, obj_idx, stem, sizeof(stem));
+    int mn = snprintf(raw_mdl, sizeof(raw_mdl), "models/%s.mdl", stem);
+    int jn = snprintf(raw_mdl_json, sizeof(raw_mdl_json), "models/%s.json", stem);
+    int tn = snprintf(raw_mat, sizeof(raw_mat), "materials/%s.json", stem);
+    if (mn < 0 || (size_t)mn >= sizeof(raw_mdl) || jn < 0 || (size_t)jn >= sizeof(raw_mdl_json) ||
+        tn < 0 || (size_t)tn >= sizeof(raw_mat)) {
+        set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
+        return false;
+    }
+
+    if (!we_normalize_rel_path(raw_mdl, mdl_rel, sizeof(mdl_rel), NULL) ||
+        !we_normalize_rel_path(raw_mdl_json, mdl_json_rel, sizeof(mdl_json_rel), NULL)) {
+        set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
+        return false;
+    }
+
+    if (obj->puppet->mat_json_file[0] != '\0' &&
+        we_normalize_rel_path(obj->puppet->mat_json_file, mat_rel, sizeof(mat_rel), NULL) &&
+        has_json_ext(mat_rel)) {
+        /* Preserve an already-normalized material JSON path when present. */
+    } else if (!we_normalize_rel_path(raw_mat, mat_rel, sizeof(mat_rel), NULL)) {
+        set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
+        return false;
+    }
+
+    we_material_pass_t pass_copy;
+    if (obj->has_base_pass) {
+        pass_copy = obj->base_pass;
+    } else {
+        memset(&pass_copy, 0, sizeof(pass_copy));
+        pass_copy.blending = WE_BLEND_NORMAL;
+        pass_copy.depthtest_enabled = false;
+        pass_copy.depthwrite_enabled = false;
+        pass_copy.cull_enabled = false;
+        size_t img_len = strlen(obj->image_path);
+        bool is_mdl_path =
+            (img_len > 4u && strcasecmp(obj->image_path + img_len - 4u, ".mdl") == 0);
+        if (obj->image_path[0] != '\0' && !has_json_ext(obj->image_path) && !is_mdl_path) {
+            snprintf(pass_copy.tex_paths[0], sizeof(pass_copy.tex_paths[0]), "%s", obj->image_path);
+        }
+    }
+    if (pass_copy.shader_name[0] == '\0') {
+        snprintf(pass_copy.shader_name, sizeof(pass_copy.shader_name), "genericimage2");
+    }
+
+    if (!export_pass_assets(al, scene, &pass_copy, out_err)) {
+        return false;
+    }
+
+    we_puppet_t pcopy = *obj->puppet;
+    int pn = snprintf(pcopy.mat_json_file, sizeof(pcopy.mat_json_file), "%s", mat_rel);
+    if (pn < 0 || (size_t)pn >= sizeof(pcopy.mat_json_file)) {
+        set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
+        return false;
+    }
+
+    we_mdl_write_opts_t mdl_opts;
+    we_mdl_write_opts_default(&mdl_opts);
+    uint8_t *mdl_bytes = NULL;
+    size_t mdl_sz = 0u;
+    if (!we_mdl_write_mem(&pcopy, &mdl_opts, &mdl_bytes, &mdl_sz)) {
+        set_err(out_err, WE_WRITER_ERR_INVALID_ARG);
+        return false;
+    }
+    if (!asset_list_add_owned(al, mdl_rel, mdl_bytes, mdl_sz, out_err)) {
+        return false;
+    }
+
+    char *mat_json = NULL;
+    size_t mat_len = 0u;
+    if (!serialize_single_pass_material(&pass_copy, NULL, &mat_json, &mat_len, out_err) ||
+        !asset_list_add_owned(al, mat_rel, (uint8_t *)mat_json, mat_len, out_err)) {
+        return false;
+    }
+
+    json_buf_t mb;
+    jb_init(&mb);
+    bool mok = jb_cstr(&mb, "{\"material\":") && jb_str(&mb, mat_rel) &&
+               jb_cstr(&mb, ",\"puppet\":") && jb_str(&mb, mdl_rel) && jb_ch(&mb, '}');
+    char *mjson = NULL;
+    size_t mlen = 0u;
+    if (!finish_jb(&mb, mok, &mjson, &mlen, out_err) ||
+        !asset_list_add_owned(al, mdl_json_rel, (uint8_t *)mjson, mlen, out_err)) {
+        return false;
+    }
+
+    bool unique_id = (obj->id >= 0);
+    if (unique_id && scene && scene->objects) {
+        for (uint32_t j = 0u; j < scene->object_count; ++j) {
+            if (j != obj_idx && scene->objects[j].id == obj->id) {
+                unique_id = false;
+                break;
+            }
+        }
+    }
+    char raw_sidecar[128];
+    char sidecar_rel[160];
+    int sn = unique_id ? snprintf(raw_sidecar, sizeof(raw_sidecar), "studio_rig_%d.json", obj->id)
+                       : snprintf(raw_sidecar, sizeof(raw_sidecar), "studio_rig_%u.json",
+                                  (unsigned int)obj_idx);
+    if (sn < 0 || (size_t)sn >= sizeof(raw_sidecar) ||
+        !we_normalize_rel_path(raw_sidecar, sidecar_rel, sizeof(sidecar_rel), NULL)) {
+        set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
+        return false;
+    }
+
+    char *sc_json = NULL;
+    size_t sc_len = 0u;
+    if (!serialize_puppet_sidecar(scene, obj, sidecar_rel, mdl_rel, mat_rel, &sc_json, &sc_len,
+                                  out_err) ||
+        !asset_list_add_owned(sidecars, sidecar_rel, (uint8_t *)sc_json, sc_len, out_err)) {
+        return false;
+    }
+
+    *out_puppet_override = strdup(mdl_rel);
+    if (!*out_puppet_override) {
+        set_err(out_err, WE_WRITER_ERR_OOM);
+        return false;
+    }
+    return true;
+}
+
+static bool validate_export_paths(const asset_list_t *al, const asset_list_t *sidecars,
+                                  const char *export_dir, bool pack_scene_pkg,
+                                  we_asset_writer_err_t *out_err)
 {
     char probe[PATH_MAX];
     int pn = snprintf(probe, sizeof(probe), "%s/project.json", export_dir);
     if (pn < 0 || (size_t)pn >= sizeof(probe)) {
         set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
         return false;
+    }
+    for (size_t i = 0u; i < sidecars->count; ++i) {
+        pn = snprintf(probe, sizeof(probe), "%s/%s", export_dir, sidecars->items[i].path);
+        if (pn < 0 || (size_t)pn >= sizeof(probe)) {
+            set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
+            return false;
+        }
     }
     if (pack_scene_pkg) {
         pn = snprintf(probe, sizeof(probe), "%s/scene.pkg", export_dir);
@@ -1880,11 +2542,15 @@ static bool validate_export_paths(const asset_list_t *al, const char *export_dir
 }
 
 static bool collect_scene_export_assets(const we_scene_t *scene, const char *scene_rel,
-                                        asset_list_t *al, we_asset_writer_err_t *out_err)
+                                        asset_list_t *al, asset_list_t *sidecars,
+                                        we_asset_writer_err_t *out_err)
 {
-    char **img_overrides =
-        (char **)calloc(scene->object_count ? scene->object_count : 1u, sizeof(char *));
-    if (!img_overrides) {
+    size_t obj_slots = scene->object_count ? scene->object_count : 1u;
+    char **img_overrides = (char **)calloc(obj_slots, sizeof(char *));
+    char **puppet_overrides = (char **)calloc(obj_slots, sizeof(char *));
+    if (!img_overrides || !puppet_overrides) {
+        free(img_overrides);
+        free(puppet_overrides);
         set_err(out_err, WE_WRITER_ERR_OOM);
         return false;
     }
@@ -1892,7 +2558,10 @@ static bool collect_scene_export_assets(const we_scene_t *scene, const char *sce
     bool ok = true;
     for (uint32_t i = 0u; ok && i < scene->object_count; ++i) {
         const we_scene_object_t *obj = &scene->objects[i];
-        if (obj->has_base_pass && !obj->is_text_object && !obj->passthrough) {
+        if (obj->puppet && !obj->is_text_object && !obj->passthrough) {
+            ok = export_object_puppet_assets(al, sidecars, scene, obj, i, &puppet_overrides[i],
+                                             out_err);
+        } else if (obj->has_base_pass && !obj->is_text_object && !obj->passthrough) {
             ok = export_object_material(al, scene, obj, i, &img_overrides[i], out_err);
         }
         if (ok) {
@@ -1906,21 +2575,25 @@ static bool collect_scene_export_assets(const we_scene_t *scene, const char *sce
     if (ok) {
         char *scene_json = NULL;
         size_t scene_len = 0u;
-        ok = serialize_scene_with_overrides(scene, (const char *const *)img_overrides, &scene_json,
+        ok = serialize_scene_with_overrides(scene, (const char *const *)img_overrides,
+                                            (const char *const *)puppet_overrides, &scene_json,
                                             &scene_len, out_err) &&
              asset_list_add_owned(al, scene_rel, (uint8_t *)scene_json, scene_len, out_err);
     }
 
     for (uint32_t i = 0u; i < scene->object_count; ++i) {
         free(img_overrides[i]);
+        free(puppet_overrides[i]);
     }
     free(img_overrides);
+    free(puppet_overrides);
     return ok;
 }
 
 static bool write_export_outputs(const we_scene_t *scene, const char *scene_rel,
-                                 const asset_list_t *al, const char *export_dir,
-                                 bool pack_scene_pkg, we_asset_writer_err_t *out_err)
+                                 const asset_list_t *al, const asset_list_t *sidecars,
+                                 const char *export_dir, bool pack_scene_pkg,
+                                 we_asset_writer_err_t *out_err)
 {
     if (!mkdir_p(export_dir)) {
         set_err(out_err, WE_WRITER_ERR_IO);
@@ -1948,6 +2621,16 @@ static bool write_export_outputs(const we_scene_t *scene, const char *scene_rel,
     free(proj_json);
     if (!ok) {
         return false;
+    }
+
+    for (size_t i = 0u; i < sidecars->count; ++i) {
+        char sdst[PATH_MAX];
+        snprintf(sdst, sizeof(sdst), "%s/%s", export_dir, sidecars->items[i].path);
+        if (!we_write_file_atomic(
+                sdst, sidecars->items[i].data ? sidecars->items[i].data : (const uint8_t *)"",
+                sidecars->items[i].size, out_err)) {
+            return false;
+        }
     }
 
     if (pack_scene_pkg) {
@@ -2014,10 +2697,13 @@ bool we_scene_export_dir(const we_scene_t *scene, const char *export_dir, bool p
     }
 
     asset_list_t al = {0};
-    bool ok = collect_scene_export_assets(scene, scene_rel, &al, out_err) &&
-              validate_export_paths(&al, export_dir, pack_scene_pkg, out_err) &&
-              write_export_outputs(scene, scene_rel, &al, export_dir, pack_scene_pkg, out_err);
+    asset_list_t sidecars = {0};
+    bool ok =
+        collect_scene_export_assets(scene, scene_rel, &al, &sidecars, out_err) &&
+        validate_export_paths(&al, &sidecars, export_dir, pack_scene_pkg, out_err) &&
+        write_export_outputs(scene, scene_rel, &al, &sidecars, export_dir, pack_scene_pkg, out_err);
     asset_list_free(&al);
+    asset_list_free(&sidecars);
     if (ok) {
         set_err(out_err, WE_WRITER_OK);
     }

@@ -71,14 +71,14 @@ double readPrivateRssAnonMiB()
 
 void test_dock_layout_revision6_and_v5_migration()
 {
-    std::cout << "[Studio Authoring] Testing DockLayoutManager revision 6, 6 perspectives & v5->v6 "
+    std::cout << "[Studio Authoring] Testing DockLayoutManager revision 7, perspectives & v5->v7 "
                  "migration...\n";
 
     QMainWindow mw;
     DockLayoutManager mgr(&mw);
 
     const QJsonObject root = mgr.serializeLayout();
-    assert(root.value(QStringLiteral("layout_revision")).toInt() == 6);
+    assert(root.value(QStringLiteral("layout_revision")).toInt() == 7);
 
     const QJsonObject perspectives = root.value(QStringLiteral("perspectives")).toObject();
     const QStringList expectedPerspectives = {
@@ -148,7 +148,7 @@ void test_dock_layout_revision6_and_v5_migration()
 
     assert(mgr.deserializeLayout(v5Root));
     const QJsonObject migrated = mgr.serializeLayout();
-    assert(migrated.value(QStringLiteral("layout_revision")).toInt() == 6);
+    assert(migrated.value(QStringLiteral("layout_revision")).toInt() == 7);
 
     const QJsonObject migratedPersps = migrated.value(QStringLiteral("perspectives")).toObject();
     for (const QString &name : expectedPerspectives) {
@@ -223,8 +223,13 @@ void test_mainwindow_lazy_panels_and_rss_budget()
     assert(mgr->isPanelRealized(QStringLiteral("AudioBindingWizard")));
     assert(win.audioBindingWizard() != nullptr);
 
+#if !WWAL_TEST_WITH_ASAN
     std::cout << "  -> PASS: MainWindow lazy docks & startup RssAnon (" << rssAnonMb
               << " MiB < 80 MiB) verified.\n";
+#else
+    std::cout << "  -> PASS: MainWindow lazy docks & startup RssAnon (ASan shadow; budget skipped, "
+              << rssAnonMb << " MiB) verified.\n";
+#endif
 }
 
 void test_inspector_combo_and_code_editor_sync()

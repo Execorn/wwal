@@ -4,6 +4,7 @@
 
 #include "studio/core/command_bus_phase3.hpp"
 #include "studio/core/ipc_client.hpp"
+#include "waywal/we_mesh_rig.h"
 #include "waywal/we_physics.h"
 #include "waywal/we_puppet.h"
 
@@ -16,6 +17,7 @@
 #include <QTreeWidget>
 #include <QWidget>
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -38,6 +40,11 @@ class PhysicsSpringInspectorWidget : public QWidget {
     [[nodiscard]] QString targetOutput() const noexcept { return m_targetOutput; }
 
     void loadPuppetSkeleton(const we_puppet_t *puppet, int32_t sceneObjectId = -1);
+    void setBoneList(const std::vector<QString> &names, const std::vector<int32_t> &parents,
+                     int32_t sceneObjectId = -1);
+    void setBoneDriveMode(int32_t boneIndex, we_bone_drive_mode_t mode);
+    void setBoneDriveModes(const std::array<we_bone_drive_mode_t, WE_MDL_MAX_BONES> &modes);
+    [[nodiscard]] we_bone_drive_mode_t boneDriveMode(int32_t boneIndex) const noexcept;
     void applyMaterialPreset(we_physics_preset_t preset);
     void selectBoneIndex(int32_t boneIndex);
     [[nodiscard]] int32_t selectedBoneIndex() const noexcept { return m_selectedBoneIndex; }
@@ -56,6 +63,7 @@ class PhysicsSpringInspectorWidget : public QWidget {
     void physicsParamsChanged(const QString &output, int32_t objectId, int32_t boneIndex,
                               const we_bone_sim_config_t &cfg, const we_wind_field_t &wind,
                               const we_cursor_force_t &cursor);
+    void boneDriveModeChanged(int32_t objectId, int32_t boneIndex, we_bone_drive_mode_t mode);
     void statusMessage(const QString &msg);
 
   private slots:
@@ -71,6 +79,7 @@ class PhysicsSpringInspectorWidget : public QWidget {
     void setupUi();
     void syncUiFromSelectedBone();
     void refreshBoneTreeStates();
+    QString boneDriveBadgeText(int32_t boneIndex, QColor &color) const;
     void commitPhysicsChange(const we_bone_sim_config_t &newCfg, const we_wind_field_t &newWind,
                              const we_cursor_force_t &newCursor);
     void sendIpcUpdate(const QString &output, int32_t objectId, int32_t boneIndex,
@@ -81,6 +90,7 @@ class PhysicsSpringInspectorWidget : public QWidget {
     int32_t m_objectId{-1};
     int32_t m_selectedBoneIndex{0};
     we_puppet_physics_ctx_t m_ctx{};
+    std::array<we_bone_drive_mode_t, WE_MDL_MAX_BONES> m_driveModes{};
     bool m_updatingUi{false};
     std::vector<QString> m_boneNames;
     std::vector<int32_t> m_boneParents;
@@ -111,6 +121,7 @@ class PhysicsSpringInspectorWidget : public QWidget {
     QDoubleSpinBox *m_cursorRadiusSpin{nullptr};
     QDoubleSpinBox *m_cursorStrengthSpin{nullptr};
     QDoubleSpinBox *m_cursorFalloffSpin{nullptr};
+    QLabel *m_driveBadgeLabel{nullptr};
     QLabel *m_telemetryLabel{nullptr};
     QPushButton *m_resetBoneBtn{nullptr};
     QPushButton *m_applyDescendantsBtn{nullptr};

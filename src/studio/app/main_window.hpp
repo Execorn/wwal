@@ -2,6 +2,8 @@
 #ifndef WAYWAL_STUDIO_MAIN_WINDOW_HPP
 #define WAYWAL_STUDIO_MAIN_WINDOW_HPP
 
+#include "studio/core/rigging_commands.hpp"
+
 #include <QMainWindow>
 #include <QString>
 #include <QStringList>
@@ -12,6 +14,7 @@
 #include <QPushButton>
 #include <memory>
 #include <thread>
+#include <unordered_map>
 
 namespace wwal::studio {
 class VirtualizedGridWidget;
@@ -56,6 +59,10 @@ class GpuBrushPainterWidget;
 class ParticleDesignerWidget;
 class AudioBindingWizard;
 class GlslSceneScriptEditorWidget;
+class PuppetMeshPanel;
+class BoneRiggingPanel;
+class WeightPaintPanel;
+class DopeSheetTimelineWidget;
 
 /**
  * @brief Startup options parsed from CLI arguments.
@@ -121,6 +128,10 @@ class MainWindow : public QMainWindow {
     ParticleDesignerWidget *particleDesigner() const;
     AudioBindingWizard *audioBindingWizard() const;
     GlslSceneScriptEditorWidget *codeEditor() const;
+    PuppetMeshPanel *puppetMeshPanel() const;
+    BoneRiggingPanel *boneRiggingPanel() const;
+    WeightPaintPanel *weightPaintPanel() const;
+    DopeSheetTimelineWidget *dopeSheetTimeline() const;
 
     // Global Actions
     QAction *undoAction() const { return m_undoAction; }
@@ -158,6 +169,10 @@ class MainWindow : public QMainWindow {
     void updateCommandBusHistoryUI();
     void applyWallpaperPath(const QString &path);
     void installPackageToDaemon(const QString &packageIdOrPath, const QString &targetOutput);
+    void setActivePuppetObjectContext(int32_t objectId, uint32_t texWidth, uint32_t texHeight);
+    void hydrateWeightPaintPanel(WeightPaintPanel *panel) const;
+    void hydrateDopeSheetTimeline(DopeSheetTimelineWidget *timeline);
+    void refreshOnionSkinFrames();
 
     StudioOptions m_options;
     DockLayoutManager *m_layoutManager{nullptr};
@@ -190,6 +205,10 @@ class MainWindow : public QMainWindow {
     QPointer<ParticleDesignerWidget> m_particleDesigner;
     QPointer<AudioBindingWizard> m_audioBindingWizard;
     QPointer<GlslSceneScriptEditorWidget> m_codeEditor;
+    QPointer<PuppetMeshPanel> m_puppetMeshPanel;
+    QPointer<BoneRiggingPanel> m_boneRiggingPanel;
+    QPointer<WeightPaintPanel> m_weightPaintPanel;
+    QPointer<DopeSheetTimelineWidget> m_dopeSheetTimeline;
 
     // Global Actions
     QAction *m_undoAction{nullptr};
@@ -214,6 +233,22 @@ class MainWindow : public QMainWindow {
     bool m_isFullscreenPreview{false};
     bool m_isPlaying{true};
     bool m_updatingPerspectiveCombo{false};
+
+    int32_t m_activePuppetObjectId{-1};
+    uint32_t m_activePuppetTexWidth{0};
+    uint32_t m_activePuppetTexHeight{0};
+    int32_t m_timelineHydratedObjectId{-1};
+    PuppetMeshSnapshot m_cachedPuppetMesh;
+    BoneHierarchySnapshot m_cachedPuppetRig;
+    bool m_hasCachedPuppetRig{false};
+    std::unordered_map<int32_t, std::unordered_map<int32_t, we_bone_drive_mode_t>>
+        m_pendingDriveModes;
+    std::unordered_map<int32_t, QString> m_pendingMdlExportPaths;
+    bool m_syncingBoneDriveMode{false};
+    bool m_onionSkinEnabled{false};
+    int m_onionBeforeFrames{2};
+    int m_onionAfterFrames{2};
+    float m_onionOpacity{0.35f};
 };
 
 } // namespace waywal::studio

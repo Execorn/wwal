@@ -135,6 +135,14 @@ typedef struct we_puppet {
     int32_t cached_loc_bones;
     uint32_t cached_bone_utype;
     uint32_t cached_blend_idx_atype;
+    /* Live rigging / timeline preview state synchronized from daemon slots */
+    void *rig_ctx; /* Optional heap-allocated we_rig_pose_ctx_t owned by we_puppet_t */
+    uint8_t heatmap_mode;
+    uint8_t heatmap_palette;
+    uint16_t heatmap_active_bone;
+    float heatmap_opacity;
+    bool playback_paused;
+    double preview_time_sec;
 } we_puppet_t;
 
 /* Dual-mode magic reader: supports 9-byte NUL-terminated ("MDLV0013\0".."MDLV0023\0",

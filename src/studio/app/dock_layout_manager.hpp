@@ -157,6 +157,7 @@ class DockLayoutManager : public QObject {
     static QJsonObject createParticleAudioPerspectiveTree();
     static QJsonObject createThemeStudioPerspectiveTree();
     static QJsonObject createMultiMonitorPerspectiveTree();
+    static QJsonObject createRiggingAnimationPerspectiveTree();
 
   signals:
     void perspectiveChanged(const QString &perspectiveName);

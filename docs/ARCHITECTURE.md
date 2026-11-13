@@ -8,7 +8,7 @@ For a quick overview, installation instructions, and everyday examples, see the 
 
 ## 1. Subsystem Architecture
 
-WayWal is written in C23 (`gnu2x`) and compiled into two core binaries (`wwald` daemon `1.34 MB` stripped and `wwal` CLI client `0.32 MB` stripped) plus an optional C++23/Qt6 Wayland GUI (`wwal-studio`), all sharing `libwaywal_core.a`:
+WayWal is written in C23 (`gnu2x`) and compiled into two core binaries (`wwald` daemon `2.50 MiB` / `2,623,592 B` stripped and `wwal` CLI client `414 KiB` / `424,000 B` stripped; `2.91 MiB` total) plus an optional C++23/Qt6 Wayland GUI (`wwal-studio`), sharing `libwaywal_core.a` and `libwaywal_engine.a`:
 
 - **Zero-Copy Wayland Direct Scanout (`wayland_core.c`, `layer_shell.c`, `dmabuf_alloc.c`, `dmabuf_feedback.c`)**:
   - Uses `zwp_linux_dmabuf_v1` (v4 surface feedback) to negotiate hardware scanout modifiers directly with the Wayland compositor, including linear, NVIDIA Block-Linear, AMD DCC, Intel CCS, and ARM AFBC formats, plus 10-bit wide-gamut (`XRGB2101010` / `ARGB2101010`).
@@ -23,10 +23,11 @@ WayWal is written in C23 (`gnu2x`) and compiled into two core binaries (`wwald` 
   - Supports live-to-live cross-mode transitions across static images, hardware videos, live shaders, and Steam Workshop scenes.
   - When no GPU is available, falls back to multi-threaded OpenMP + runtime-dispatched AVX-512 (`vbmi2`), AVX2, NEON, and scalar CPU transition kernels.
 
-- **Native Wallpaper Engine Workshop Runtime (`we_pkg.c`, `we_tex.c`, `we_puppet.c`, `we_shader.c`, `we_scene*.c`, `we_particle.c`, `we_script*.c`)**:
+- **Native Wallpaper Engine Workshop Runtime & Authoring Engine (`libwaywal_engine.a`: `we_tex*.c`, `we_puppet.c`, `we_mesh_cdt.c`, `we_mesh_rig.c`, `we_mdl_writer.c`, `we_physics.c`, `we_camera3d.c`, `we_gpu_brush.c`, `we_shader.c`, `we_scene*.c`, `we_particle.c`, `we_script*.c`)**:
   - Memory-maps (`mmap`) Steam Workshop (`431960`) `scene.pkg` (`PKGV0001..22`) archives directly from disk with zero temporary file extraction.
   - Decodes `.tex` (`TEXV0001..0005`, `TEXI`, `TEXB`, `TEXS`) containers supporting hardware compressed `BC1` (`DXT1`), `BC2` (`DXT3`), `BC3` (`DXT5`), `BC7` (`GL_EXT_texture_compression_bptc`), `RG88`, `R8`, `LZ4` mip streams, spritesheets, and embedded MP4 video textures.
-  - Evaluates `.mdl` (`MDLV`/`MDLS`/`MDLA`) 2D Puppet Warp skeletal meshes with AVX2 FMA3 bone skinning and blendshapes.
+  - Evaluates `.mdl` (`MDLV`/`MDLS`/`MDLA`) 2D Puppet Warp skeletal meshes with AVX2 FMA3 bone skinning, 240 Hz XPBD spring-bone physics (`we_physics.c`), 2-bone IK & Aim constraints (`we_mesh_rig.c`), and blendshapes.
+  - Generates cutout puppet meshes from RGBA alpha contours and custom polygons/pins via Constrained Delaunay Triangulation (`we_mesh_cdt.c`), computes harmonic heat-diffusion skinning weights with intrinsic Delaunay flips and a GLES 3.1 GPU weight brush (`we_mesh_rig.c`), and exports canonical `MDLV0023` `.mdl` containers (`we_mdl_writer.c`).
   - Simulates particle systems using an AVX2 Structure-of-Arrays (SoA) integrator with SIMD 3D turbulent curl noise, vortex/attractor control points, and batched quad emission.
   - Renders Workshop `"sound"` multi-track ambient audio layers (looping/random PCM playback with PipeWire auto-ducking) and `"text"` dynamic clock/label layers.
   - Transpiles Wallpaper Engine `.vert`/`.frag` shaders (`#include` trees, `COMBO` directives, HLSL-to-GLSL types/intrinsics, `g_*` uniforms) into GLSL ES 3.00 (`#version 300 es`).
@@ -60,8 +61,8 @@ WayWal is written in C23 (`gnu2x`) and compiled into two core binaries (`wwald` 
   - Runs on a Linux `io_uring` multishot poll event loop (`uring_loop.c`) with `epoll` fallback, hardened after initialization by Landlock v3 filesystem restrictions and a Seccomp-BPF syscall filter (`security.c`).
 
 - **WayWal Studio GUI (`src/studio/`, `wwal-studio`)**:
-  - C++23 / Qt6 Wayland desktop IDE linking directly to `libwaywal_core.a` (`-Dstudio=auto`).
-  - Includes an $O(1)$ virtualized OpenGL wallpaper library with Myers/Bitap bit-parallel fuzzy search and 512 MB LRU texture caching, zero-copy `EGL_EXT_image_dma_buf_import` live preview, dynamic GLSL `@uniform` and Workshop `project.json` property inspector with 1,000-step undo/redo (`CommandBus`), interactive Material You HCT/OkLab theme studio, multi-monitor topology and span canvas, cubic-Bezier transition curve editor, and 60 Hz Bark-scale audio/telemetry HUD.
+  - C++23 / Qt6 Wayland desktop IDE linking directly to `libwaywal_core.a` and `libwaywal_engine.a` (`-Dstudio=auto`) across 7 workspace perspectives (`Default`, `Shader Coding`, `Scene Composer`, `Particle & Audio`, `Rigging & Animation`, `Theme Studio`, `Multi-Monitor`) and 22 dockable panels.
+  - Includes an $O(1)$ virtualized OpenGL wallpaper library with Myers/Bitap bit-parallel fuzzy search and 512 MB LRU texture caching, zero-copy `EGL_EXT_image_dma_buf_import` live preview, dynamic GLSL `@uniform` and Workshop `project.json` property inspector with 1,000-step undo/redo (`CommandBus`), puppet CDT meshing (`PuppetMeshPanel`), bone/IK rigging (`BoneRiggingPanel`), GLES 3.1 weight painting (`WeightPaintPanel`), keyframe & Bezier curve animation (`DopeSheetTimelineWidget` with `studio_rig_<id>.json` sidecars and `0x002B..0x0033` / `0x801A..0x801D` rigging IPC), interactive Material You HCT/OkLab theme studio, multi-monitor topology and span canvas, cubic-Bezier transition curve editor, and 60 Hz Bark-scale audio/telemetry HUD.
 
 ---
 
@@ -204,11 +205,11 @@ wwal/
 ├── scripts/                           # Shader embedding, PGO/LTO/BOLT build, and benchmark scripts
 ├── include/waywal/                    # Subsystem headers (IPC, JSON, image loader, Workshop, MPRIS)
 ├── src/
-│   ├── common/                        # Arena, IPC, Bezier, OKLab/HCT palette & templates, TOML, JSON, image loader, Workshop PKG
-│   ├── daemon/                        # Wayland core, IPC server, GBM/DMA-BUF, VA-API codecs, Shaders, Workshop runtime, MPRIS, Audio
+│   ├── common/                        # libwaywal_core.a: Arena, IPC, Bezier, OKLab/HCT palette & templates, TOML, JSON, image loader, Workshop PKG, shader graph
+│   ├── daemon/                        # Wayland core, IPC server, GBM/DMA-BUF, VA-API codecs, Shaders, libwaywal_engine.a (CDT, Rigging, Physics, Workshop), MPRIS, Audio
 │   ├── client/                        # CLI parser (wwal + swww/awww), unified picker, and client dispatch
-│   └── studio/                        # C++23 / Qt6 Wayland desktop IDE (grid, viewport, inspector, theme studio, topology, HUD)
-└── tests/                             # Unit, subsystem, Workshop scene/script/particle, Studio, LibFuzzer, and E2E suites
+│   └── studio/                        # C++23 / Qt6 Wayland desktop IDE (22 panels, 7 perspectives: grid, viewport, rigging/timeline, inspector, theme studio, topology, HUD)
+└── tests/                             # Unit, subsystem, Workshop scene/script/particle/rigging/CDT, Studio, LibFuzzer, and E2E suites
 ```
 
 ---
@@ -219,7 +220,7 @@ Measured with `OMP_NUM_THREADS=4 ./build/bench_transitions 60` and `python3 scri
 
 | Subsystem / Kernel | Resolution / Workload | Mean / Min / P99 Latency | Throughput / Budget |
 | :--- | :--- | ---: | :--- |
-| **Stripped Binary Footprint (`wwald` + `wwal`)** | `x86_64` LTO `-O3` | `1,375.4 KB + 326.1 KB` | **`1.66 MB` total** (`0` heavy `DT_NEEDED` libs) |
+| **Stripped Binary Footprint (`wwald` + `wwal`)** | `x86_64` LTO `-O3` | `2,623,592 B + 424,000 B` (`2.50 MiB + 414 KiB`) | **`2.91 MiB` total** (`14` `DT_NEEDED` libs on `wwald`) |
 | **GPU Compute Transitions (18 Shaders)** | `1920×1080` | `0.171 – 0.261 ms` | **3,828 – 5,831 FPS** (`0 KB` steady leak) |
 | **GPU Compute Transitions (18 Shaders)** | `3840×2160` (4K) | `0.366 – 0.600 ms` | **1,668 – 2,734 FPS** (`0 KB` leak) |
 | **CPU OpenMP + AVX2 Transitions** | `1280×720` | `0.041 – 0.850 ms` | **1,176 – 24,377 FPS** |

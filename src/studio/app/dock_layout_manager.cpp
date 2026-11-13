@@ -367,6 +367,34 @@ DockLayoutManager::DockLayoutManager(QMainWindow *mainWindow, QObject *parent)
     m_aliases.insert(QStringLiteral("CodeEditor"), QStringLiteral("GlslSceneScriptEditor"));
     m_aliases.insert(QStringLiteral("ShaderEditor"), QStringLiteral("GlslSceneScriptEditor"));
 
+    m_aliases.insert(QStringLiteral("PuppetMeshPanel"), QStringLiteral("PuppetMeshPanel"));
+    m_aliases.insert(QStringLiteral("puppetmesh"), QStringLiteral("PuppetMeshPanel"));
+    m_aliases.insert(QStringLiteral("mesh"), QStringLiteral("PuppetMeshPanel"));
+    m_aliases.insert(QStringLiteral("contour"), QStringLiteral("PuppetMeshPanel"));
+    m_aliases.insert(QStringLiteral("cdt"), QStringLiteral("PuppetMeshPanel"));
+
+    m_aliases.insert(QStringLiteral("BoneRiggingPanel"), QStringLiteral("BoneRiggingPanel"));
+    m_aliases.insert(QStringLiteral("bonerigging"), QStringLiteral("BoneRiggingPanel"));
+    m_aliases.insert(QStringLiteral("bones"), QStringLiteral("BoneRiggingPanel"));
+    m_aliases.insert(QStringLiteral("rig"), QStringLiteral("BoneRiggingPanel"));
+    m_aliases.insert(QStringLiteral("skeleton"), QStringLiteral("BoneRiggingPanel"));
+    m_aliases.insert(QStringLiteral("ik"), QStringLiteral("BoneRiggingPanel"));
+
+    m_aliases.insert(QStringLiteral("WeightPaintPanel"), QStringLiteral("WeightPaintPanel"));
+    m_aliases.insert(QStringLiteral("weightpaint"), QStringLiteral("WeightPaintPanel"));
+    m_aliases.insert(QStringLiteral("weights"), QStringLiteral("WeightPaintPanel"));
+    m_aliases.insert(QStringLiteral("skinning"), QStringLiteral("WeightPaintPanel"));
+    m_aliases.insert(QStringLiteral("heatmap"), QStringLiteral("WeightPaintPanel"));
+
+    m_aliases.insert(QStringLiteral("DopeSheetTimelineWidget"),
+                     QStringLiteral("DopeSheetTimelineWidget"));
+    m_aliases.insert(QStringLiteral("DopeSheetTimeline"),
+                     QStringLiteral("DopeSheetTimelineWidget"));
+    m_aliases.insert(QStringLiteral("timeline"), QStringLiteral("DopeSheetTimelineWidget"));
+    m_aliases.insert(QStringLiteral("dopesheet"), QStringLiteral("DopeSheetTimelineWidget"));
+    m_aliases.insert(QStringLiteral("fcurve"), QStringLiteral("DopeSheetTimelineWidget"));
+    m_aliases.insert(QStringLiteral("keyframes"), QStringLiteral("DopeSheetTimelineWidget"));
+
     // Populate built-in perspectives
     setupDefaultPerspectives();
 }
@@ -458,6 +486,8 @@ void DockLayoutManager::setupDefaultPerspectives()
     m_perspectives.insert(QStringLiteral("Particle & Audio"), createParticleAudioPerspectiveTree());
     m_perspectives.insert(QStringLiteral("Theme Studio"), createThemeStudioPerspectiveTree());
     m_perspectives.insert(QStringLiteral("Multi-Monitor"), createMultiMonitorPerspectiveTree());
+    m_perspectives.insert(QStringLiteral("Rigging & Animation"),
+                          createRiggingAnimationPerspectiveTree());
 }
 
 QString DockLayoutManager::resolvePanelId(const QString &idOrAlias) const
@@ -689,6 +719,8 @@ bool DockLayoutManager::switchPerspective(const QString &name)
             m_perspectives.insert(name, createThemeStudioPerspectiveTree());
         } else if (name == QStringLiteral("Multi-Monitor")) {
             m_perspectives.insert(name, createMultiMonitorPerspectiveTree());
+        } else if (name == QStringLiteral("Rigging & Animation")) {
+            m_perspectives.insert(name, createRiggingAnimationPerspectiveTree());
         } else {
             return false;
         }
@@ -1270,7 +1302,7 @@ QJsonObject DockLayoutManager::serializeLayout() const
 {
     QJsonObject root;
     root.insert(QStringLiteral("version"), 1);
-    root.insert(QStringLiteral("layout_revision"), 6);
+    root.insert(QStringLiteral("layout_revision"), 7);
     root.insert(QStringLiteral("active_perspective"), m_activePerspective);
 
     QJsonObject perspsObj;
@@ -1291,17 +1323,22 @@ bool DockLayoutManager::deserializeLayout(const QJsonObject &root)
     const int revision = root.value(QStringLiteral("layout_revision")).toInt(0);
     QJsonObject perspsObj = root.value(QStringLiteral("perspectives")).toObject();
 
-    if (revision < 6) {
-        // Refresh all 6 built-in perspectives while preserving custom user perspectives.
+    if (revision < 7) {
+        // Populate all 7 built-in perspectives first so "Rigging & Animation" is always present
+        // and pre-v7 "Rigging & Animation" trees refresh cleanly to the v7 layout.
         setupDefaultPerspectives();
         for (auto it = perspsObj.constBegin(); it != perspsObj.constEnd(); ++it) {
-            if (!m_perspectives.contains(it.key())) {
-                m_perspectives.insert(it.key(), normalizeTreeAliases(it.value().toObject()));
+            const QString &key = it.key();
+            if (key == QStringLiteral("Rigging & Animation")) {
+                continue;
+            }
+            if (revision == 6 || !m_perspectives.contains(key)) {
+                m_perspectives.insert(key, normalizeTreeAliases(it.value().toObject()));
             }
         }
     } else {
         for (auto it = perspsObj.constBegin(); it != perspsObj.constEnd(); ++it) {
-            m_perspectives.insert(it.key(), it.value().toObject());
+            m_perspectives.insert(it.key(), normalizeTreeAliases(it.value().toObject()));
         }
     }
 
@@ -1378,7 +1415,7 @@ bool DockLayoutManager::loadLayoutFromFile(const QString &filePath)
     }
 
     QJsonObject rootObj = doc.object();
-    const bool needsMigrationSave = (rootObj.value(QStringLiteral("layout_revision")).toInt(0) < 6);
+    const bool needsMigrationSave = (rootObj.value(QStringLiteral("layout_revision")).toInt(0) < 7);
     if (!deserializeLayout(rootObj)) {
         switchPerspective(m_activePerspective);
         return false;
@@ -1713,6 +1750,55 @@ QJsonObject DockLayoutManager::createParticleAudioPerspectiveTree()
     rightVertical.insert(QStringLiteral("bottom"), rightBottom);
 
     tree.insert(QStringLiteral("right"), rightVertical);
+    return tree;
+}
+
+QJsonObject DockLayoutManager::createRiggingAnimationPerspectiveTree()
+{
+    QJsonObject tree;
+    tree.insert(QStringLiteral("split_direction"), QStringLiteral("Horizontal"));
+    tree.insert(QStringLiteral("split_ratio"), 0.22);
+
+    QJsonObject leftTab;
+    leftTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
+    leftTab.insert(QStringLiteral("active_tab"), QStringLiteral("BoneRiggingPanel"));
+    QJsonArray leftTabs;
+    leftTabs.append(QStringLiteral("BoneRiggingPanel"));
+    leftTabs.append(QStringLiteral("PuppetMeshPanel"));
+    leftTabs.append(QStringLiteral("SceneLayerTree"));
+    leftTab.insert(QStringLiteral("tabs"), leftTabs);
+    tree.insert(QStringLiteral("left"), leftTab);
+
+    QJsonObject rightSplit;
+    rightSplit.insert(QStringLiteral("split_direction"), QStringLiteral("Horizontal"));
+    rightSplit.insert(QStringLiteral("split_ratio"), 0.72);
+
+    QJsonObject centerVertical;
+    centerVertical.insert(QStringLiteral("split_direction"), QStringLiteral("Vertical"));
+    centerVertical.insert(QStringLiteral("split_ratio"), 0.68);
+
+    QJsonObject centerTop;
+    centerTop.insert(QStringLiteral("type"), QStringLiteral("DockNode"));
+    centerTop.insert(QStringLiteral("content"), QStringLiteral("GpuPreviewViewport"));
+    centerVertical.insert(QStringLiteral("top"), centerTop);
+
+    QJsonObject centerBottom;
+    centerBottom.insert(QStringLiteral("type"), QStringLiteral("DockNode"));
+    centerBottom.insert(QStringLiteral("content"), QStringLiteral("DopeSheetTimelineWidget"));
+    centerVertical.insert(QStringLiteral("bottom"), centerBottom);
+    rightSplit.insert(QStringLiteral("left"), centerVertical);
+
+    QJsonObject rightTab;
+    rightTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
+    rightTab.insert(QStringLiteral("active_tab"), QStringLiteral("WeightPaintPanel"));
+    QJsonArray rightTabs;
+    rightTabs.append(QStringLiteral("WeightPaintPanel"));
+    rightTabs.append(QStringLiteral("PhysicsSpringInspectorWidget"));
+    rightTabs.append(QStringLiteral("PropertyInspectorWidget"));
+    rightTab.insert(QStringLiteral("tabs"), rightTabs);
+    rightSplit.insert(QStringLiteral("right"), rightTab);
+
+    tree.insert(QStringLiteral("right"), rightSplit);
     return tree;
 }
 

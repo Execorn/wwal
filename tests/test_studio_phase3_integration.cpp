@@ -134,10 +134,10 @@ static void test_dock_layout_revision5()
     QMainWindow mainWindow;
     DockLayoutManager layoutMgr(&mainWindow);
 
-    // Serialize layout and verify revision 6 in JSON
+    // Serialize layout and verify revision 7 in JSON
     QJsonObject root = layoutMgr.serializeLayout();
     assert(root.contains(QStringLiteral("layout_revision")));
-    assert(root.value(QStringLiteral("layout_revision")).toInt() == 6);
+    assert(root.value(QStringLiteral("layout_revision")).toInt() == 7);
 
     // Check perspectives
     assert(root.contains(QStringLiteral("perspectives")));
@@ -164,7 +164,7 @@ static void test_dock_layout_revision5()
     assert(ok);
 
     std::cout
-        << "  -> PASS: DockLayoutManager layout_revision == 6 and perspective trees verified.\n";
+        << "  -> PASS: DockLayoutManager layout_revision == 7 and perspective trees verified.\n";
 }
 
 /* ========================================================================= */

@@ -233,6 +233,80 @@ void activeNodeBBoxCorners(const SceneLayerNode &node, QVector3D &outMin,
     outMax = QVector3D(center.x() + halfW, center.y() + halfH, center.z());
 }
 
+void pushOctoPrismBone(std::vector<GizmoVertex> &out, const QVector3D &head, const QVector3D &tail,
+                       float r, float g, float b, float a)
+{
+    const QVector3D delta = tail - head;
+    const float len = delta.length();
+    if (len < 1e-3f) {
+        return;
+    }
+    const QVector3D dir = delta / len;
+    QVector3D perp1(-dir.y(), dir.x(), 0.0f);
+    if (perp1.lengthSquared() < 1e-5f) {
+        perp1 = QVector3D::crossProduct(dir, QVector3D(0.0f, 1.0f, 0.0f));
+    }
+    if (perp1.lengthSquared() < 1e-5f) {
+        perp1 = QVector3D::crossProduct(dir, QVector3D(1.0f, 0.0f, 0.0f));
+    }
+    perp1.normalize();
+    const QVector3D perp2 = QVector3D::crossProduct(dir, perp1).normalized();
+
+    const float midDist = 0.20f * len;
+    const float radius = std::clamp(0.085f * len, 3.0f, 16.0f);
+    const QVector3D midCenter = head + dir * midDist;
+    const std::array<QVector3D, 4> ring{{
+        midCenter + perp1 * radius,
+        midCenter + perp2 * radius,
+        midCenter - perp1 * radius,
+        midCenter - perp2 * radius,
+    }};
+
+    for (size_t i = 0; i < 4; ++i) {
+        const QVector3D &curr = ring[i];
+        const QVector3D &next = ring[(i + 1) % 4];
+        pushLine(out, head, curr, r, g, b, a);
+        pushLine(out, curr, next, r, g, b, a);
+        pushLine(out, curr, tail, r, g, b, a);
+    }
+}
+
+void pushDiamond2D(std::vector<GizmoVertex> &out, const QVector3D &center, float radius, float r,
+                   float g, float b, float a)
+{
+    const QVector3D n = center + QVector3D(0.0f, radius, 0.0f);
+    const QVector3D s = center + QVector3D(0.0f, -radius, 0.0f);
+    const QVector3D e = center + QVector3D(radius, 0.0f, 0.0f);
+    const QVector3D w = center + QVector3D(-radius, 0.0f, 0.0f);
+    pushLine(out, n, e, r, g, b, a);
+    pushLine(out, e, s, r, g, b, a);
+    pushLine(out, s, w, r, g, b, a);
+    pushLine(out, w, n, r, g, b, a);
+}
+
+void pushReticle2D(std::vector<GizmoVertex> &out, const QVector3D &center, float radius, float r,
+                   float g, float b, float a)
+{
+    pushCircle(out, center, QVector3D(1.0f, 0.0f, 0.0f), QVector3D(0.0f, 1.0f, 0.0f), radius, 16, r,
+               g, b, a);
+    const float ext = radius * 1.35f;
+    pushLine(out, center - QVector3D(ext, 0.0f, 0.0f), center + QVector3D(ext, 0.0f, 0.0f), r, g, b,
+             a);
+    pushLine(out, center - QVector3D(0.0f, ext, 0.0f), center + QVector3D(0.0f, ext, 0.0f), r, g, b,
+             a);
+}
+
+[[nodiscard]] float evalBoneWeightForVertex(const we_mdl_vertex_t &v, uint32_t boneIdx) noexcept
+{
+    float total = 0.0f;
+    for (int k = 0; k < 4; ++k) {
+        if (v.blend_indices[k] == boneIdx && std::isfinite(v.weight[k])) {
+            total += v.weight[k];
+        }
+    }
+    return std::clamp(total, 0.0f, 1.0f);
+}
+
 } // namespace
 
 void ViewportGizmoOverlay::setActiveNode(const SceneLayerNode *node)
@@ -257,6 +331,95 @@ void ViewportGizmoOverlay::setCameraAndLights(const we_camera3d_t &cam,
 void ViewportGizmoOverlay::setEmitterWireframes(std::vector<GizmoEmitterWireframe> emitters)
 {
     m_emitters = std::move(emitters);
+}
+
+void ViewportGizmoOverlay::setMeshWireframe(bool visible, std::vector<we_mdl_vertex_t> vertices,
+                                            std::vector<uint16_t> indices)
+{
+    m_meshWireframe.visible = visible;
+    m_meshWireframe.vertices = std::move(vertices);
+    m_meshWireframe.indices = std::move(indices);
+}
+
+void ViewportGizmoOverlay::setMeshWireframeVisible(bool visible) noexcept
+{
+    m_meshWireframe.visible = visible;
+}
+
+void ViewportGizmoOverlay::setMeshPins(std::vector<we_cdt_pin_t> pins, int32_t selectedPin)
+{
+    m_meshWireframe.pins = std::move(pins);
+    m_meshWireframe.selectedPinIndex = selectedPin;
+}
+
+void ViewportGizmoOverlay::setPuppetBones(std::vector<GizmoBoneNode> bones,
+                                          int32_t selectedBoneIndex)
+{
+    m_bones = std::move(bones);
+    setSelectedBoneIndex(selectedBoneIndex);
+}
+
+void ViewportGizmoOverlay::setSelectedBoneIndex(int32_t boneIndex) noexcept
+{
+    m_selectedBoneIndex = boneIndex;
+    for (size_t i = 0; i < m_bones.size(); ++i) {
+        m_bones[i].selected = (static_cast<int32_t>(i) == boneIndex);
+    }
+}
+
+void ViewportGizmoOverlay::setIkHandles(std::vector<GizmoIkHandleData> chains)
+{
+    m_ikHandles = std::move(chains);
+}
+
+void ViewportGizmoOverlay::setOnionSkinFrames(std::vector<GizmoOnionGhostFrame> frames)
+{
+    m_onionFrames = std::move(frames);
+}
+
+void ViewportGizmoOverlay::setWeightHeatmapEnabled(bool enabled, uint32_t activeBoneIdx,
+                                                   float opacity,
+                                                   we_heatmap_palette_t palette) noexcept
+{
+    m_weightBrush.heatmapEnabled = enabled;
+    m_weightBrush.activeBoneIndex = activeBoneIdx;
+    m_weightBrush.heatmapOpacity = std::clamp(opacity, 0.0f, 1.0f);
+    m_weightBrush.palette = palette;
+}
+
+void ViewportGizmoOverlay::setWeightBrushCursor(const QPointF &worldPos, bool inside) noexcept
+{
+    m_weightBrush.cursorWorldPos = worldPos;
+    m_weightBrush.cursorInside = inside;
+}
+
+void ViewportGizmoOverlay::setBoneCreatePreview(bool active, const QVector3D &headWorld,
+                                                const QVector3D &tailWorld) noexcept
+{
+    m_boneCreatePreviewActive = active;
+    m_boneCreateHead = headWorld;
+    m_boneCreateTail = tailWorld;
+}
+
+bool ViewportGizmoOverlay::hasVisibleRiggingOverlay() const noexcept
+{
+    if (m_toolMode >= ViewportToolMode::ContourPin) {
+        return true;
+    }
+    if (m_meshWireframe.visible && !m_meshWireframe.indices.empty()) {
+        return true;
+    }
+    if (!m_bones.empty() || !m_ikHandles.empty()) {
+        return true;
+    }
+    if (m_onionSkinEnabled && !m_onionFrames.empty()) {
+        return true;
+    }
+    if (m_weightBrush.heatmapEnabled && !m_meshWireframe.vertices.empty() &&
+        !m_meshWireframe.indices.empty()) {
+        return true;
+    }
+    return false;
 }
 
 float ViewportGizmoOverlay::computeWorldGizmoScale(const QVector3D &gizmoPos,
@@ -359,6 +522,131 @@ GizmoAxisHandle ViewportGizmoOverlay::pickHandle(const QPointF &widgetPos,
         if (dist <= bestDist) {
             bestDist = dist;
             best = handle;
+        }
+    }
+
+    return best;
+}
+
+QVector3D ViewportGizmoOverlay::texelToCanvasWorld(double px, double py,
+                                                   const QSize &viewportSize) const noexcept
+{
+    const uint32_t ch = (m_contentHeight > 0u)
+                            ? m_contentHeight
+                            : static_cast<uint32_t>(std::max(1, viewportSize.height()));
+    return QVector3D(static_cast<float>(px), static_cast<float>(static_cast<double>(ch) - py),
+                     0.0f);
+}
+
+QVector3D ViewportGizmoOverlay::puppetLocalToCanvasWorld(const QVector3D &localPos,
+                                                         const QSize &viewportSize) const noexcept
+{
+    const uint32_t cw = (m_contentWidth > 0u)
+                            ? m_contentWidth
+                            : static_cast<uint32_t>(std::max(0, viewportSize.width()));
+    const uint32_t ch = (m_contentHeight > 0u)
+                            ? m_contentHeight
+                            : static_cast<uint32_t>(std::max(0, viewportSize.height()));
+    return QVector3D(localPos.x() + 0.5f * static_cast<float>(cw),
+                     localPos.y() + 0.5f * static_cast<float>(ch), localPos.z());
+}
+
+RigPickResult ViewportGizmoOverlay::pickRiggingHandle(const QPointF &widgetPos,
+                                                      const QSize &viewportSize,
+                                                      const QMatrix4x4 &viewProj) const noexcept
+{
+    RigPickResult best{};
+    const float jointTol = kPickTolerancePx * 1.35f;
+
+    /* 1. IK Target & Pole-Vector diamond handles */
+    for (const auto &ik : m_ikHandles) {
+        const ProjectedPoint pTarget = projectWorldToWidget(
+            puppetLocalToCanvasWorld(ik.targetWorld, viewportSize), viewportSize, viewProj);
+        if (pTarget.valid) {
+            const float d = distance2D(widgetPos, pTarget.screenPos);
+            if (d <= jointTol && d < best.distancePx) {
+                best = {GizmoAxisHandle::IkTarget, ik.chainIndex, d};
+            }
+        }
+        const ProjectedPoint pPole = projectWorldToWidget(
+            puppetLocalToCanvasWorld(ik.poleWorld, viewportSize), viewportSize, viewProj);
+        if (pPole.valid) {
+            const float d = distance2D(widgetPos, pPole.screenPos);
+            if (d <= jointTol && d < best.distancePx) {
+                best = {GizmoAxisHandle::IkPole, ik.chainIndex, d};
+            }
+        }
+    }
+    if (best.handle != GizmoAxisHandle::None) {
+        return best;
+    }
+
+    /* 2. CDT Contour constraint pins (when ContourPin mode or pins are visible) */
+    if (m_toolMode == ViewportToolMode::ContourPin || m_meshWireframe.visible) {
+        for (size_t i = 0; i < m_meshWireframe.pins.size(); ++i) {
+            const auto &pin = m_meshWireframe.pins[i];
+            const ProjectedPoint pPin = projectWorldToWidget(
+                texelToCanvasWorld(pin.px, pin.py, viewportSize), viewportSize, viewProj);
+            if (pPin.valid) {
+                const float d = distance2D(widgetPos, pPin.screenPos);
+                if (d <= jointTol && d < best.distancePx) {
+                    best = {GizmoAxisHandle::ContourPinHandle, static_cast<int32_t>(i), d};
+                }
+            }
+        }
+        if (best.handle != GizmoAxisHandle::None) {
+            return best;
+        }
+    }
+
+    /* 3. Selected bone pivot rotate ring */
+    if (m_selectedBoneIndex >= 0 && static_cast<size_t>(m_selectedBoneIndex) < m_bones.size() &&
+        (m_toolMode == ViewportToolMode::Rotate || m_toolMode == ViewportToolMode::BonePlace)) {
+        const auto &selBone = m_bones[static_cast<size_t>(m_selectedBoneIndex)];
+        const float ringRadiusWorld =
+            std::clamp((selBone.tailWorld - selBone.headWorld).length() * 0.45f, 16.0f, 64.0f);
+        const QVector3D headCanvas = puppetLocalToCanvasWorld(selBone.headWorld, viewportSize);
+        const ProjectedPoint pHead = projectWorldToWidget(headCanvas, viewportSize, viewProj);
+        const ProjectedPoint pRing = projectWorldToWidget(
+            headCanvas + QVector3D(ringRadiusWorld, 0.0f, 0.0f), viewportSize, viewProj);
+        if (pHead.valid && pRing.valid) {
+            const float ringPx = distance2D(pHead.screenPos, pRing.screenPos);
+            const float cursorPx = distance2D(pHead.screenPos, widgetPos);
+            const float ringDelta = std::abs(cursorPx - ringPx);
+            if (ringDelta <= kPickTolerancePx) {
+                return {GizmoAxisHandle::BonePivotRotate, m_selectedBoneIndex, ringDelta};
+            }
+        }
+    }
+
+    /* 4. Bone joint pivots */
+    for (size_t i = 0; i < m_bones.size(); ++i) {
+        const ProjectedPoint pHead = projectWorldToWidget(
+            puppetLocalToCanvasWorld(m_bones[i].headWorld, viewportSize), viewportSize, viewProj);
+        if (!pHead.valid) {
+            continue;
+        }
+        const float d = distance2D(widgetPos, pHead.screenPos);
+        if (d <= jointTol && d < best.distancePx) {
+            best = {GizmoAxisHandle::BoneJoint, static_cast<int32_t>(i), d};
+        }
+    }
+    if (best.handle != GizmoAxisHandle::None) {
+        return best;
+    }
+
+    /* 5. Bone octo-prism bodies */
+    for (size_t i = 0; i < m_bones.size(); ++i) {
+        const ProjectedPoint pHead = projectWorldToWidget(
+            puppetLocalToCanvasWorld(m_bones[i].headWorld, viewportSize), viewportSize, viewProj);
+        const ProjectedPoint pTail = projectWorldToWidget(
+            puppetLocalToCanvasWorld(m_bones[i].tailWorld, viewportSize), viewportSize, viewProj);
+        if (!pHead.valid || !pTail.valid) {
+            continue;
+        }
+        const float d = distancePointToSegment2D(widgetPos, pHead.screenPos, pTail.screenPos);
+        if (d <= kPickTolerancePx && d < best.distancePx) {
+            best = {GizmoAxisHandle::BoneBody, static_cast<int32_t>(i), d};
         }
     }
 
@@ -834,6 +1122,237 @@ void ViewportGizmoOverlay::buildRenderVertices(const QSize &viewportSize,
                                                                    : QVector3D(1.0f, 0.0f, 0.0f);
             const float halfLen = 0.5f * std::max(8.0f, l.tube_length);
             pushLine(outLineVerts, pos - axis * halfLen, pos + axis * halfLen, r, g, b, 0.85f);
+        }
+    }
+
+    /* CDT Mesh Wireframe + Contour Constraint Pins */
+    if (m_meshWireframe.visible && !m_meshWireframe.vertices.empty() &&
+        m_meshWireframe.indices.size() >= 3) {
+        const size_t vertCount = m_meshWireframe.vertices.size();
+        const size_t triCount = m_meshWireframe.indices.size() / 3;
+        std::vector<uint32_t> packedEdges;
+        packedEdges.reserve(triCount * 3);
+        for (size_t t = 0; t < triCount; ++t) {
+            const uint16_t i0 = m_meshWireframe.indices[t * 3 + 0];
+            const uint16_t i1 = m_meshWireframe.indices[t * 3 + 1];
+            const uint16_t i2 = m_meshWireframe.indices[t * 3 + 2];
+            if (i0 >= vertCount || i1 >= vertCount || i2 >= vertCount) {
+                continue;
+            }
+            const std::array<std::pair<uint16_t, uint16_t>, 3> edges{{
+                {std::min(i0, i1), std::max(i0, i1)},
+                {std::min(i1, i2), std::max(i1, i2)},
+                {std::min(i2, i0), std::max(i2, i0)},
+            }};
+            for (const auto &[a, b] : edges) {
+                packedEdges.push_back((static_cast<uint32_t>(a) << 16) | static_cast<uint32_t>(b));
+            }
+        }
+        std::sort(packedEdges.begin(), packedEdges.end());
+        for (size_t i = 0; i < packedEdges.size();) {
+            size_t j = i + 1;
+            while (j < packedEdges.size() && packedEdges[j] == packedEdges[i]) {
+                ++j;
+            }
+            const uint16_t a = static_cast<uint16_t>(packedEdges[i] >> 16);
+            const uint16_t b = static_cast<uint16_t>(packedEdges[i] & 0xFFFFu);
+            const auto &va = m_meshWireframe.vertices[a];
+            const auto &vb = m_meshWireframe.vertices[b];
+            const bool isBoundary = ((j - i) == 1) && m_meshWireframe.highlightContourEdges;
+            const QVector3D pa =
+                puppetLocalToCanvasWorld(QVector3D(va.pos[0], va.pos[1], va.pos[2]), viewportSize);
+            const QVector3D pb =
+                puppetLocalToCanvasWorld(QVector3D(vb.pos[0], vb.pos[1], vb.pos[2]), viewportSize);
+            if (isBoundary) {
+                pushLine(outLineVerts, pa, pb, 0.220f, 0.741f, 0.973f, 0.85f);
+            } else {
+                pushLine(outLineVerts, pa, pb, 0.580f, 0.639f, 0.722f, 0.45f);
+            }
+            i = j;
+        }
+    }
+
+    if (m_toolMode == ViewportToolMode::ContourPin || m_meshWireframe.visible) {
+        for (size_t i = 0; i < m_meshWireframe.pins.size(); ++i) {
+            const auto &pin = m_meshWireframe.pins[i];
+            const QVector3D p = texelToCanvasWorld(pin.px, pin.py, viewportSize);
+            const bool sel = (static_cast<int32_t>(i) == m_meshWireframe.selectedPinIndex);
+            const float pr = sel ? 10.0f : 7.0f;
+            if (sel) {
+                pushDiamond2D(outLineVerts, p, pr, 0.220f, 0.741f, 0.973f, 0.98f);
+            } else {
+                pushDiamond2D(outLineVerts, p, pr, 0.976f, 0.886f, 0.686f, 0.90f);
+            }
+        }
+    }
+
+    /* Onion-Skinning Ghost Bones (#89b4fa past, #f38ba8 future) */
+    if (m_onionSkinEnabled) {
+        for (const auto &ghost : m_onionFrames) {
+            const float alpha = std::clamp(ghost.opacity, 0.08f, 0.85f);
+            const bool isPast = ghost.frameDelta < 0;
+            const float r = isPast ? 0.537f : 0.953f;
+            const float g = isPast ? 0.706f : 0.545f;
+            const float b = isPast ? 0.980f : 0.659f;
+            for (const auto &[head, tail] : ghost.boneSegments) {
+                pushOctoPrismBone(outLineVerts, puppetLocalToCanvasWorld(head, viewportSize),
+                                  puppetLocalToCanvasWorld(tail, viewportSize), r, g, b, alpha);
+            }
+        }
+    }
+
+    /* Puppet Skeleton Hierarchy (Tapered Octo-Prisms + Joint Pivots) */
+    for (size_t i = 0; i < m_bones.size(); ++i) {
+        const auto &bone = m_bones[i];
+        float r = 0.804f;
+        float g = 0.839f;
+        float b = 0.957f;
+        float a = 0.85f;
+        if (bone.selected) {
+            r = 0.220f;
+            g = 0.741f;
+            b = 0.973f;
+            a = 1.0f;
+        } else if (bone.driveMode == WE_BONE_DRIVE_IK) {
+            r = 0.976f;
+            g = 0.886f;
+            b = 0.686f;
+            a = 0.90f;
+        } else if (bone.driveMode == WE_BONE_DRIVE_XPBD) {
+            r = 0.651f;
+            g = 0.890f;
+            b = 0.631f;
+            a = 0.90f;
+        }
+
+        const QVector3D headCanvas = puppetLocalToCanvasWorld(bone.headWorld, viewportSize);
+        const QVector3D tailCanvas = puppetLocalToCanvasWorld(bone.tailWorld, viewportSize);
+        if (bone.parentIndex != 0xFFFFFFFFu &&
+            static_cast<size_t>(bone.parentIndex) < m_bones.size()) {
+            const auto &parent = m_bones[bone.parentIndex];
+            if ((bone.headWorld - parent.tailWorld).lengthSquared() > 1.0f) {
+                pushLine(outLineVerts, puppetLocalToCanvasWorld(parent.tailWorld, viewportSize),
+                         headCanvas, 0.580f, 0.639f, 0.722f, 0.45f);
+            }
+        }
+
+        pushOctoPrismBone(outLineVerts, headCanvas, tailCanvas, r, g, b, a);
+        const float jointR = bone.selected ? 7.5f : 5.0f;
+        pushCircle(outLineVerts, headCanvas, QVector3D(1.0f, 0.0f, 0.0f),
+                   QVector3D(0.0f, 1.0f, 0.0f), jointR, 12, r, g, b, a);
+
+        if (bone.selected &&
+            (m_toolMode == ViewportToolMode::Rotate || m_toolMode == ViewportToolMode::BonePlace)) {
+            const float pivotRingR =
+                std::clamp((bone.tailWorld - bone.headWorld).length() * 0.45f, 16.0f, 64.0f);
+            pushCircle(outLineVerts, headCanvas, QVector3D(1.0f, 0.0f, 0.0f),
+                       QVector3D(0.0f, 1.0f, 0.0f), pivotRingR, 24, 0.220f, 0.741f, 0.973f, 0.85f);
+        }
+    }
+
+    if (m_boneCreatePreviewActive) {
+        pushOctoPrismBone(outLineVerts, puppetLocalToCanvasWorld(m_boneCreateHead, viewportSize),
+                          puppetLocalToCanvasWorld(m_boneCreateTail, viewportSize), 0.220f, 0.741f,
+                          0.973f, 0.95f);
+    }
+
+    /* 2-Bone IK Target Reticle + Pole-Vector Diamond Handles (#f9e2af) */
+    for (const auto &ik : m_ikHandles) {
+        const QVector3D rootCanvas = puppetLocalToCanvasWorld(ik.rootWorld, viewportSize);
+        const QVector3D midCanvas = puppetLocalToCanvasWorld(ik.midWorld, viewportSize);
+        const QVector3D endCanvas = puppetLocalToCanvasWorld(ik.endWorld, viewportSize);
+        const QVector3D targetCanvas = puppetLocalToCanvasWorld(ik.targetWorld, viewportSize);
+        const QVector3D poleCanvas = puppetLocalToCanvasWorld(ik.poleWorld, viewportSize);
+        pushLine(outLineVerts, rootCanvas, midCanvas, 0.976f, 0.886f, 0.686f, 0.55f);
+        pushLine(outLineVerts, midCanvas, endCanvas, 0.976f, 0.886f, 0.686f, 0.55f);
+        pushLine(outLineVerts, endCanvas, targetCanvas, 0.976f, 0.886f, 0.686f, 0.40f);
+        pushLine(outLineVerts, midCanvas, poleCanvas, 0.976f, 0.886f, 0.686f, 0.35f);
+        pushReticle2D(outLineVerts, targetCanvas, 11.0f, 0.976f, 0.886f, 0.686f, 0.95f);
+        pushDiamond2D(outLineVerts, poleCanvas, 9.0f, 0.976f, 0.886f, 0.686f, 0.95f);
+    }
+
+    /* Weight-Paint Brush Cursor Circle */
+    if (m_toolMode == ViewportToolMode::WeightBrush && m_weightBrush.cursorInside) {
+        const QVector3D c(static_cast<float>(m_weightBrush.cursorWorldPos.x()),
+                          static_cast<float>(m_weightBrush.cursorWorldPos.y()), 0.0f);
+        const float outerR = std::max(2.0f, m_weightBrush.radiusPx);
+        const float innerR =
+            std::max(1.0f, outerR * std::clamp(m_weightBrush.strength, 0.1f, 1.0f));
+        pushCircle(outLineVerts, c, QVector3D(1.0f, 0.0f, 0.0f), QVector3D(0.0f, 1.0f, 0.0f),
+                   outerR, 32, 0.976f, 0.886f, 0.686f, 0.92f);
+        pushCircle(outLineVerts, c, QVector3D(1.0f, 0.0f, 0.0f), QVector3D(0.0f, 1.0f, 0.0f),
+                   innerR, 20, 0.220f, 0.741f, 0.973f, 0.65f);
+    }
+}
+
+void ViewportGizmoOverlay::evaluateHeatmapColor(we_heatmap_palette_t palette, float weight,
+                                                float &outR, float &outG, float &outB) noexcept
+{
+    const float t = std::clamp(weight, 0.0f, 1.0f);
+    if (palette == WE_HEATMAP_PALETTE_VIRIDIS) {
+        const float r = 0.267004f + t * (-0.0049f + t * (1.2656f - t * 0.5357f));
+        const float g = 0.004874f + t * (1.3840f + t * (-0.4910f + t * 0.0080f));
+        const float b = 0.329415f + t * (1.4250f + t * (-2.6810f + t * 1.0710f));
+        outR = std::clamp(r, 0.0f, 1.0f);
+        outG = std::clamp(g, 0.0f, 1.0f);
+        outB = std::clamp(b, 0.0f, 1.0f);
+        return;
+    }
+    if (palette == WE_HEATMAP_PALETTE_INFERNO) {
+        const float r = 0.001462f + t * (1.5800f + t * (0.4800f - t * 1.0700f));
+        const float g = 0.000466f + t * (0.1200f + t * (1.2800f - t * 0.4000f));
+        const float b = 0.013866f + t * (2.3500f + t * (-3.4000f + t * 1.6500f));
+        outR = std::clamp(r, 0.0f, 1.0f);
+        outG = std::clamp(g, 0.0f, 1.0f);
+        outB = std::clamp(b, 0.0f, 1.0f);
+        return;
+    }
+    /* WE_HEATMAP_TURBO */
+    const float r =
+        0.13572f +
+        t * (4.61539f + t * (-42.6603f + t * (132.131f + t * (-152.942f + t * 59.286f))));
+    const float g =
+        0.09140f +
+        t * (2.19419f + t * (4.84297f + t * (-14.1850f + t * (4.27730f + t * 2.82957f))));
+    const float b =
+        0.10667f +
+        t * (12.6419f + t * (-60.5820f + t * (110.363f + t * (-89.9031f + t * 27.3482f))));
+    outR = std::clamp(r, 0.0f, 1.0f);
+    outG = std::clamp(g, 0.0f, 1.0f);
+    outB = std::clamp(b, 0.0f, 1.0f);
+}
+
+void ViewportGizmoOverlay::buildHeatmapTriangleVertices(std::vector<GizmoVertex> &outTriVerts) const
+{
+    outTriVerts.clear();
+    if (!m_weightBrush.heatmapEnabled || m_meshWireframe.vertices.empty() ||
+        m_meshWireframe.indices.size() < 3) {
+        return;
+    }
+
+    const size_t vertCount = m_meshWireframe.vertices.size();
+    const size_t triCount = m_meshWireframe.indices.size() / 3;
+    outTriVerts.reserve(triCount * 3);
+    const float alpha = std::clamp(m_weightBrush.heatmapOpacity, 0.05f, 0.95f);
+
+    for (size_t t = 0; t < triCount; ++t) {
+        const uint16_t i0 = m_meshWireframe.indices[t * 3 + 0];
+        const uint16_t i1 = m_meshWireframe.indices[t * 3 + 1];
+        const uint16_t i2 = m_meshWireframe.indices[t * 3 + 2];
+        if (i0 >= vertCount || i1 >= vertCount || i2 >= vertCount) {
+            continue;
+        }
+        const std::array<uint16_t, 3> tri{i0, i1, i2};
+        for (uint16_t idx : tri) {
+            const auto &v = m_meshWireframe.vertices[idx];
+            const float w = evalBoneWeightForVertex(v, m_weightBrush.activeBoneIndex);
+            float r = 0.0f;
+            float g = 0.0f;
+            float b = 0.0f;
+            evaluateHeatmapColor(m_weightBrush.palette, w, r, g, b);
+            const QVector3D wp =
+                puppetLocalToCanvasWorld(QVector3D(v.pos[0], v.pos[1], v.pos[2]), QSize());
+            outTriVerts.push_back({wp.x(), wp.y(), wp.z(), r, g, b, alpha});
         }
     }
 }

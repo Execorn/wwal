@@ -14,6 +14,7 @@
 #include <QDialog>
 #include <QFileDialog>
 #include <QGridLayout>
+#include <QGuiApplication>
 #include <QLinearGradient>
 #include <QListWidget>
 #include <QMenu>
@@ -28,6 +29,8 @@
 namespace wwal::studio {
 
 namespace {
+
+bool isOffscreenPlatform() { return QGuiApplication::platformName() == QLatin1String("offscreen"); }
 
 #ifndef GL_COMPRESSED_RGB8_ETC2
 #define GL_COMPRESSED_RGB8_ETC2 0x9274
@@ -130,7 +133,7 @@ GridGlCanvas::~GridGlCanvas()
     m_pool.setThumbnailReadyCallback(nullptr);
     m_hover.setGlOwner(nullptr);
     QObject::disconnect(m_contextDestroyConn);
-    if (isValid()) {
+    if (!isOffscreenPlatform() && isValid()) {
         makeCurrent();
         releaseGlResources();
         doneCurrent();
@@ -779,18 +782,17 @@ void GridGlCanvas::renderGlThumbnails()
     glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(m_cardVao);
 
-    const bool canUsePoolArray = (m_cardArrayProgram != 0 && m_pool.isInitialized() &&
-                                  m_pool.textureArrayId() != 0);
+    const bool canUsePoolArray =
+        (m_cardArrayProgram != 0 && m_pool.isInitialized() && m_pool.textureArrayId() != 0);
     if (canUsePoolArray) {
         glUseProgram(m_cardArrayProgram);
         glUniform2f(m_uArrayViewportLoc, static_cast<float>(width()), static_cast<float>(height()));
         glUniform1i(m_uArrayTexLoc, 0);
         if (m_uArraySrgbLoc >= 0) {
-            glUniform1i(
-                m_uArraySrgbLoc,
-                (m_pool.isArrayEtc2() && m_pool.arrayInternalFormat() == GL_COMPRESSED_SRGB8_ETC2)
-                    ? 1
-                    : 0);
+            glUniform1i(m_uArraySrgbLoc, (m_pool.isArrayEtc2() &&
+                                          m_pool.arrayInternalFormat() == GL_COMPRESSED_SRGB8_ETC2)
+                                             ? 1
+                                             : 0);
         }
         glBindTexture(GL_TEXTURE_2D_ARRAY, m_pool.textureArrayId());
 
@@ -879,6 +881,10 @@ void GridGlCanvas::renderGlThumbnails()
 
 void GridGlCanvas::initializeGL()
 {
+    if (isOffscreenPlatform()) {
+        return;
+    }
+
     // Clear any stale handles left over if a previous GL context was torn down on dock/monitor
     // reparenting before initializing resources on the current context.
     m_etc2Cache.clear();
@@ -926,6 +932,11 @@ void GridGlCanvas::initializeGL()
 
 void GridGlCanvas::resizeGL(int w, int h)
 {
+    if (isOffscreenPlatform()) {
+        int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
+        emit virtualHeightChanged(vh);
+        return;
+    }
     glViewport(0, 0, w, h);
     int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
     emit virtualHeightChanged(vh);
@@ -933,6 +944,14 @@ void GridGlCanvas::resizeGL(int w, int h)
 
 void GridGlCanvas::resizeEvent(QResizeEvent *event)
 {
+    if (isOffscreenPlatform()) {
+        // Offscreen QPA lacks a GL backing context; stay on the QPainter card fallback without
+        // letting QOpenGLWidgetPrivate::initialize() allocate and leak a failed QOpenGLContext.
+        QWidget::resizeEvent(event);
+        int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
+        emit virtualHeightChanged(vh);
+        return;
+    }
     QOpenGLWidget::resizeEvent(event);
     int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
     emit virtualHeightChanged(vh);
@@ -940,6 +959,9 @@ void GridGlCanvas::resizeEvent(QResizeEvent *event)
 
 void GridGlCanvas::paintGL()
 {
+    if (isOffscreenPlatform()) {
+        return;
+    }
     if (isValid()) {
         m_pool.processPendingUploads(this, 12);
         const qreal dpr = devicePixelRatioF();
@@ -959,7 +981,7 @@ void GridGlCanvas::paintGL()
 
 void GridGlCanvas::paintEvent(QPaintEvent *event)
 {
-    if (isValid()) {
+    if (!isOffscreenPlatform() && isValid()) {
         if (m_fallbackCanvas && m_fallbackCanvas->isVisible()) {
             m_fallbackCanvas->hide();
         }

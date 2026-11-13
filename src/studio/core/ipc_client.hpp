@@ -6,6 +6,9 @@
 #include "waywal/ipc_proto.h"
 #include "waywal/ipc_proto_authoring.h"
 #include "waywal/ipc_proto_phase3.h"
+#include "waywal/ipc_proto_rigging.h"
+#include "waywal/we_mesh_rig.h"
+#include "waywal/we_puppet.h"
 
 #include <QJsonObject>
 #include <QObject>
@@ -106,9 +109,51 @@ class IpcClient : public QObject, public IIpcClientService {
     bool sendReadbackTexture(const QString &output, int32_t objectId, uint32_t passIndex,
                              uint32_t texSlot, uint32_t formatMode = 0);
 
+    // Rigging & Animation IPC (0x002B..0x0033)
+    struct PuppetAnimTrackData {
+        waywal_ipc_anim_track_desc_t desc{};
+        std::vector<waywal_ipc_mdl_keyframe_t> keyframes;
+    };
+    struct PuppetAnimClipData {
+        waywal_ipc_anim_clip_desc_t desc{};
+        std::vector<PuppetAnimTrackData> tracks;
+    };
+
+    bool sendPuppetSetMesh(uint32_t objectId, uint32_t flags,
+                           const std::vector<waywal_ipc_mdl_vertex_t> &vertices,
+                           const std::vector<uint16_t> &indices);
+    bool sendPuppetSetMesh(uint32_t objectId, const std::vector<we_mdl_vertex_t> &vertices,
+                           const std::vector<uint16_t> &indices, uint32_t flags = 1u);
+    bool sendPuppetSetSkeleton(uint32_t objectId, uint32_t flags,
+                               const std::vector<waywal_ipc_mdl_bone_t> &bones);
+    bool sendPuppetSetSkeleton(const waywal_ipc_puppet_set_skeleton_t &req,
+                               const std::vector<waywal_ipc_mdl_bone_t> &bones);
+    bool sendPuppetSetSkeleton(uint32_t objectId, const std::vector<waywal_ipc_mdl_bone_t> &bones,
+                               uint32_t flags = 0u);
+    bool sendPuppetSolveWeights(const waywal_ipc_puppet_solve_weights_t &req,
+                                const std::vector<uint64_t> &lockedVertexBitset = {});
+    bool sendPuppetPaintWeights(uint32_t objectId, uint32_t flags,
+                                const std::vector<waywal_ipc_vertex_weight_t> &entries);
+    bool sendPuppetHeatmapMode(uint32_t objectId, bool enabled, uint16_t palette,
+                               uint32_t activeBoneIdx, float opacity);
+    bool sendPuppetHeatmapMode(const waywal_ipc_puppet_heatmap_mode_t &req);
+    bool sendPuppetHeatmapMode(uint32_t objectId, bool enabled, uint32_t activeBoneIdx,
+                               float opacity, we_heatmap_palette_t palette);
+    bool sendPuppetPreviewIk(const waywal_ipc_puppet_preview_ik_t &req,
+                             const std::vector<waywal_ipc_bone_trs_t> &overrides = {});
+    bool sendPuppetSetAnimTracks(uint32_t objectId, uint32_t flags,
+                                 const std::vector<PuppetAnimClipData> &clips);
+    bool sendPuppetScrubTime(uint32_t objectId, float timeSec, bool pausePlayback,
+                             uint32_t flags = 0);
+    bool sendExportPuppetMdl(uint32_t objectId, uint32_t flags, const QString &outPath = QString());
+    [[nodiscard]] static QString stagePuppetMdlExportPath(const QString &fileHint = QString());
+    [[nodiscard]] static bool expectsGenericOkForOpcode(uint16_t reqOpcode) noexcept;
+
     // Lifecycle
     void start();
     void stop();
+    void setRequestTimeoutMs(int timeoutMs) noexcept { m_requestTimeoutMs.store(timeoutMs); }
+    [[nodiscard]] int requestTimeoutMs() const noexcept { return m_requestTimeoutMs.load(); }
 
     [[nodiscard]] QString socketPath() const;
     [[nodiscard]] QString namespaceStr() const { return m_namespaceStr; }
@@ -139,6 +184,13 @@ class IpcClient : public QObject, public IIpcClientService {
     void sceneScriptLinted(const waywal_ipc_resp_lint_scenescript_t &resp);
     void textureReadbackReceived(const waywal_ipc_resp_readback_texture_t &resp,
                                  const QByteArray &data);
+    void puppetMeshAckReceived(const waywal_ipc_puppet_mesh_ack_t &resp);
+    void puppetWeightsSolved(const waywal_ipc_puppet_weights_resp_t &resp,
+                             const std::vector<waywal_ipc_vertex_weight_t> &entries);
+    void puppetIkPoseReceived(const waywal_ipc_puppet_ik_pose_resp_t &resp,
+                              const std::vector<waywal_ipc_bone_trs_t> &bones);
+    void puppetMdlExported(const waywal_ipc_export_puppet_mdl_resp_t &resp,
+                           const QByteArray &mdlBytes);
 
   private:
     struct OutboundPacket {
@@ -197,6 +249,8 @@ class IpcClient : public QObject, public IIpcClientService {
     void wakeupWorker();
     bool popPendingForOpcode(uint16_t reqOpcode, PendingRequest &outReq);
     void failInFlightRequests(const QString &reason);
+    void sweepExpiredRequests();
+    void dispatchRequestFailure(PendingRequest &&req, const QString &reason, bool emitErrorSignal);
 
     mutable std::mutex m_stateMutex;
     QString m_namespaceStr;
@@ -219,6 +273,7 @@ class IpcClient : public QObject, public IIpcClientService {
     // Request tracking queue for in-flight queries
     std::mutex m_requestsMutex;
     std::deque<PendingRequest> m_pendingRequests;
+    std::atomic<int> m_requestTimeoutMs{15000};
 
     std::chrono::steady_clock::time_point m_lastUniformFlush;
 };
