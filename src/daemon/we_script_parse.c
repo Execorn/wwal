@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "we_script_internal.h"
 
+#include <time.h>
+
 /* =========================================================================
  * Tokenizer
  * ========================================================================= */
@@ -12,7 +14,109 @@ typedef struct {
     size_t pos;
     uint32_t depth;
     js_token_t cur;
+
+    /* Source location and bounded scratch-arena lint state */
+    uint32_t line;
+    size_t line_start;
+    uint32_t col_offset;
+    uint32_t cur_line;
+    uint32_t cur_col;
+    uint32_t tpl_line;
+    uint32_t tpl_col;
+    bool lint_mode;
+    uint32_t lint_flags;
+    uint8_t *lint_arena;
+    size_t lint_cap;
+    size_t lint_used;
+    bool has_error;
+    bool depth_exceeded;
+    bool aborted;
+    uint32_t err_line;
+    uint32_t err_col;
+    char err_msg[256];
 } js_parser_t;
+
+static inline bool parser_aborted(const js_parser_t *p)
+{
+    return p->aborted || (p->vm && p->vm->aborted);
+}
+
+static void parser_fail(js_parser_t *p, uint32_t line, uint32_t col, const char *msg)
+{
+    if (!p->has_error) {
+        p->has_error = true;
+        p->err_line = line > 0u ? line : 1u;
+        p->err_col = col > 0u ? col : 1u;
+        snprintf(p->err_msg, sizeof(p->err_msg), "%s", msg ? msg : "syntax error");
+    }
+    if (p->vm) {
+        p->vm->parse_error = true;
+    }
+}
+
+static void parser_fail_depth(js_parser_t *p, uint32_t line, uint32_t col, const char *msg)
+{
+    p->depth_exceeded = true;
+    p->aborted = true;
+    parser_fail(p, line, col, msg);
+    if (p->vm) {
+        p->vm->depth_exceeded = true;
+        p->vm->aborted = true;
+    }
+}
+
+static void *parser_alloc(js_parser_t *p, size_t sz)
+{
+    if (p->vm) {
+        return script_arena_alloc(p->vm, sz);
+    }
+    if (!p->lint_arena || sz == 0u) {
+        return NULL;
+    }
+    size_t aligned = (sz + 7u) & ~(size_t)7u;
+    if (p->lint_used + aligned > p->lint_cap) {
+        parser_fail(p, p->cur_line, p->cur_col, "script exceeds 64 KiB parser scratch arena");
+        p->aborted = true;
+        return NULL;
+    }
+    void *ptr = p->lint_arena + p->lint_used;
+    p->lint_used += aligned;
+    memset(ptr, 0, sz);
+    return ptr;
+}
+
+static const char *parser_strdup(js_parser_t *p, const char *s, size_t len)
+{
+    if (p->vm) {
+        return script_arena_strdup(p->vm, s, len);
+    }
+    if (!s || len == 0u) {
+        return "";
+    }
+    if (!p->lint_arena || len > p->lint_cap - 1u || len > SIZE_MAX - 8u) {
+        parser_fail(p, p->cur_line, p->cur_col, "script exceeds 64 KiB parser scratch arena");
+        p->aborted = true;
+        return "";
+    }
+    size_t aligned = (len + 1u + 7u) & ~(size_t)7u;
+    if (aligned > p->lint_cap - p->lint_used) {
+        parser_fail(p, p->cur_line, p->cur_col, "script exceeds 64 KiB parser scratch arena");
+        p->aborted = true;
+        return "";
+    }
+    char *dst = (char *)(p->lint_arena + p->lint_used);
+    p->lint_used += aligned;
+    memcpy(dst, s, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+static inline void lexer_bump_line(js_parser_t *p, size_t new_pos)
+{
+    p->line++;
+    p->line_start = new_pos;
+    p->col_offset = 0u;
+}
 
 static void lexer_skip_ws_and_comments(js_parser_t *p)
 {
@@ -20,17 +124,35 @@ static void lexer_skip_ws_and_comments(js_parser_t *p)
         char c = p->src[p->pos];
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
             p->pos++;
+            if (c == '\n') {
+                lexer_bump_line(p, p->pos);
+            }
         } else if (c == '/' && p->pos + 1 < p->len && p->src[p->pos + 1] == '/') {
             p->pos += 2;
             while (p->pos < p->len && p->src[p->pos] != '\n') {
                 p->pos++;
             }
         } else if (c == '/' && p->pos + 1 < p->len && p->src[p->pos + 1] == '*') {
+            uint32_t cl = p->line > 0u ? p->line : 1u;
+            uint32_t cc = (uint32_t)(p->pos - p->line_start + 1u) + p->col_offset;
             p->pos += 2;
-            while (p->pos + 1 < p->len && !(p->src[p->pos] == '*' && p->src[p->pos + 1] == '/')) {
-                p->pos++;
+            bool closed = false;
+            while (p->pos + 1 < p->len) {
+                if (p->src[p->pos] == '*' && p->src[p->pos + 1] == '/') {
+                    p->pos += 2;
+                    closed = true;
+                    break;
+                }
+                char mc = p->src[p->pos++];
+                if (mc == '\n') {
+                    lexer_bump_line(p, p->pos);
+                }
             }
-            p->pos = (p->pos + 1 < p->len) ? (p->pos + 2) : p->len;
+            if (!closed) {
+                p->pos = p->len;
+                parser_fail(p, cl, cc, "unterminated block comment");
+                break;
+            }
         } else {
             break;
         }
@@ -116,8 +238,13 @@ static void scan_template_body(const char *src, size_t len, size_t *pos, int dep
 
 static void lexer_next(js_parser_t *p)
 {
+    if (p->line == 0u) {
+        p->line = 1u;
+    }
     lexer_skip_ws_and_comments(p);
     memset(&p->cur, 0, sizeof(p->cur));
+    p->cur_line = p->line;
+    p->cur_col = (uint32_t)(p->pos - p->line_start + 1u) + p->col_offset;
     if (p->pos >= p->len) {
         p->cur.type = TOK_EOF;
         return;
@@ -190,7 +317,7 @@ static void lexer_next(js_parser_t *p)
             p->cur.type = TOK_UNDEF;
         } else {
             p->cur.type = TOK_IDENT;
-            p->cur.text = script_arena_strdup(p->vm, s, ilen);
+            p->cur.text = parser_strdup(p, s, ilen);
         }
         return;
     }
@@ -222,31 +349,49 @@ static void lexer_next(js_parser_t *p)
 
     /* Template literals (`...`) */
     if (c == '`') {
+        uint32_t tline = p->cur_line;
+        uint32_t tcol = p->cur_col;
         p->pos++;
         size_t start = p->pos;
         scan_template_body(p->src, p->len, &p->pos, 0);
         size_t raw_len = p->pos - start;
+        for (size_t k = start; k < p->pos; k++) {
+            if (p->src[k] == '\n') {
+                lexer_bump_line(p, k + 1u);
+            }
+        }
         if (p->pos < p->len && p->src[p->pos] == '`') {
             p->pos++;
+        } else {
+            parser_fail(p, tline, tcol, "unterminated template literal");
         }
         p->cur.type = TOK_TEMPLATE;
-        p->cur.text = script_arena_strdup(p->vm, p->src + start, raw_len);
+        p->cur.text = parser_strdup(p, p->src + start, raw_len);
+        p->tpl_line = tline;
+        p->tpl_col = tcol + 1u;
         return;
     }
 
     /* String literals ('...', "...") */
     if (c == '\'' || c == '"') {
         char quote = c;
+        uint32_t sline = p->cur_line;
+        uint32_t scol = p->cur_col;
         p->pos++;
         char stack_tmp[1024];
         stack_tmp[0] = '\0';
         char *buf = stack_tmp;
         size_t cap = sizeof(stack_tmp);
         size_t tlen = 0;
-        while (p->pos < p->len && p->src[p->pos] != quote) {
+        while (p->pos < p->len && p->src[p->pos] != quote && p->src[p->pos] != '\n' &&
+               p->src[p->pos] != '\r') {
             char ch = p->src[p->pos++];
             if (ch == '\\' && p->pos < p->len) {
                 char esc = p->src[p->pos++];
+                if (esc == '\n') {
+                    lexer_bump_line(p, p->pos);
+                    continue;
+                }
                 switch (esc) {
                 case 'n':
                     ch = '\n';
@@ -265,7 +410,7 @@ static void lexer_next(js_parser_t *p)
                     break;
                 }
             }
-            if (tlen + 1 >= cap) {
+            if (!p->lint_mode && tlen + 1 >= cap) {
                 size_t ncap = cap * 2u;
                 char *nbuf = (buf == stack_tmp) ? (char *)malloc(ncap) : (char *)realloc(buf, ncap);
                 if (nbuf) {
@@ -282,10 +427,12 @@ static void lexer_next(js_parser_t *p)
         }
         if (p->pos < p->len && p->src[p->pos] == quote) {
             p->pos++;
+        } else {
+            parser_fail(p, sline, scol, "unterminated string literal");
         }
         buf[tlen] = '\0';
         p->cur.type = TOK_STR;
-        p->cur.text = script_arena_strdup(p->vm, buf, tlen);
+        p->cur.text = parser_strdup(p, buf, tlen);
         if (buf != stack_tmp) {
             free(buf);
         }
@@ -498,7 +645,7 @@ static void lexer_next(js_parser_t *p)
         p->cur.type = TOK_BIT_NOT;
         break;
     default:
-        p->vm->parse_error = true;
+        parser_fail(p, p->cur_line, p->cur_col, "unexpected character");
         p->cur.type = TOK_EOF;
         break;
     }
@@ -510,11 +657,21 @@ static void lexer_next(js_parser_t *p)
 
 static ast_node_t *alloc_node(js_parser_t *p, ast_type_t type)
 {
-    ast_node_t *n = (ast_node_t *)script_arena_alloc(p->vm, sizeof(ast_node_t));
+    ast_node_t *n = (ast_node_t *)parser_alloc(p, sizeof(ast_node_t));
     if (n) {
         n->type = type;
     }
     return n;
+}
+
+static bool parser_expect(js_parser_t *p, js_tok_type_t tok, const char *msg)
+{
+    if (p->cur.type == tok) {
+        lexer_next(p);
+        return true;
+    }
+    parser_fail(p, p->cur_line, p->cur_col, msg);
+    return false;
 }
 
 static ast_node_t *parse_expr(js_parser_t *p);
@@ -548,18 +705,18 @@ static ast_node_t *parse_primary(js_parser_t *p)
     if (t == TOK_TEMPLATE) {
         const char *raw = p->cur.text ? p->cur.text : "";
         size_t rlen = strlen(raw);
+        uint32_t cur_line = p->tpl_line > 0u ? p->tpl_line : 1u;
+        uint32_t cur_col = p->tpl_col > 0u ? p->tpl_col : 1u;
         lexer_next(p);
 
         if (p->depth > 32u) {
-            p->vm->parse_error = true;
-            p->vm->depth_exceeded = true;
-            p->vm->aborted = true;
+            parser_fail_depth(p, cur_line, cur_col, "template nesting depth exceeded");
             p->cur.type = TOK_EOF;
             return alloc_node(p, AST_LITERAL);
         }
 
         ast_node_t *n = alloc_node(p, AST_TEMPLATE);
-        if (!n) {
+        if (!n && !p->lint_mode) {
             return NULL;
         }
         const char *parts[33];
@@ -569,7 +726,7 @@ static ast_node_t *parse_primary(js_parser_t *p)
         char seg[1024];
         size_t slen = 0;
         size_t i = 0;
-        while (i < rlen && !p->vm->aborted) {
+        while (i < rlen && !parser_aborted(p)) {
             if (raw[i] == '\\' && i + 1 < rlen) {
                 char esc = raw[i + 1];
                 char out_c = esc;
@@ -583,50 +740,107 @@ static ast_node_t *parse_primary(js_parser_t *p)
                 if (slen + 1 < sizeof(seg)) {
                     seg[slen++] = out_c;
                 }
+                if (esc == '\n') {
+                    cur_line++;
+                    cur_col = 1u;
+                } else {
+                    cur_col += 2u;
+                }
                 i += 2;
                 continue;
             }
             if (raw[i] == '$' && i + 1 < rlen && raw[i + 1] == '{' && expr_cnt < 32u) {
-                parts[expr_cnt] = script_arena_strdup(p->vm, seg, slen);
+                parts[expr_cnt] = parser_strdup(p, seg, slen);
+                if (parser_aborted(p)) {
+                    break;
+                }
                 slen = 0;
+                uint32_t dollar_line = cur_line;
+                uint32_t dollar_col = cur_col;
+                uint32_t expr_line = cur_line;
+                uint32_t expr_col = cur_col + 2u;
+                cur_col += 2u;
                 i += 2;
                 size_t expr_start = i;
                 scan_template_expr(raw, rlen, &i, 0);
                 size_t expr_len = i - expr_start;
-                if (i < rlen && raw[i] == '}') {
-                    i++;
+                for (size_t k = expr_start; k < i; k++) {
+                    if (raw[k] == '\n') {
+                        cur_line++;
+                        cur_col = 1u;
+                    } else {
+                        cur_col++;
+                    }
                 }
-                const char *expr_src = script_arena_strdup(p->vm, raw + expr_start, expr_len);
+                if (i < rlen && raw[i] == '}') {
+                    cur_col++;
+                    i++;
+                } else {
+                    parser_fail(p, dollar_line, dollar_col,
+                                "unterminated template expression '${...}'");
+                }
+                const char *expr_src = parser_strdup(p, raw + expr_start, expr_len);
+                if (parser_aborted(p)) {
+                    break;
+                }
                 js_parser_t sub = {
                     .vm = p->vm,
                     .src = expr_src ? expr_src : "",
                     .len = expr_src ? expr_len : 0,
                     .pos = 0,
                     .depth = p->depth + 1,
+                    .line = expr_line,
+                    .line_start = 0,
+                    .col_offset = expr_col - 1u,
+                    .lint_mode = p->lint_mode,
+                    .lint_flags = p->lint_flags,
+                    .lint_arena = p->lint_arena,
+                    .lint_cap = p->lint_cap,
+                    .lint_used = p->lint_used,
                 };
                 lexer_next(&sub);
                 exprs[expr_cnt] = parse_expr(&sub);
+                p->lint_used = sub.lint_used;
+                if (sub.aborted) {
+                    p->aborted = true;
+                }
+                if (sub.depth_exceeded) {
+                    p->depth_exceeded = true;
+                }
+                if (sub.has_error) {
+                    if (sub.depth_exceeded) {
+                        parser_fail_depth(p, sub.err_line, sub.err_col, sub.err_msg);
+                    } else {
+                        parser_fail(p, sub.err_line, sub.err_col, sub.err_msg);
+                    }
+                }
                 expr_cnt++;
                 continue;
             }
             if (slen + 1 < sizeof(seg)) {
                 seg[slen++] = raw[i];
             }
+            if (raw[i] == '\n') {
+                cur_line++;
+                cur_col = 1u;
+            } else {
+                cur_col++;
+            }
             i++;
         }
-        parts[expr_cnt] = script_arena_strdup(p->vm, seg, slen);
+        parts[expr_cnt] = parser_aborted(p) ? "" : parser_strdup(p, seg, slen);
 
-        n->tpl.expr_count = expr_cnt;
-        n->tpl.parts =
-            (const char **)script_arena_alloc(p->vm, (expr_cnt + 1u) * sizeof(const char *));
-        if (n->tpl.parts) {
-            memcpy(n->tpl.parts, parts, (expr_cnt + 1u) * sizeof(const char *));
-        }
-        if (expr_cnt > 0) {
-            n->tpl.exprs =
-                (ast_node_t **)script_arena_alloc(p->vm, expr_cnt * sizeof(ast_node_t *));
-            if (n->tpl.exprs) {
-                memcpy(n->tpl.exprs, exprs, expr_cnt * sizeof(ast_node_t *));
+        if (n) {
+            n->tpl.expr_count = expr_cnt;
+            n->tpl.parts = (const char **)parser_alloc(p, (expr_cnt + 1u) * sizeof(const char *));
+            if (n->tpl.parts) {
+                memcpy(n->tpl.parts, parts, (expr_cnt + 1u) * sizeof(const char *));
+            }
+            if (expr_cnt > 0) {
+                n->tpl.exprs = (ast_node_t **)parser_alloc(p, expr_cnt * sizeof(ast_node_t *));
+                if (n->tpl.exprs) {
+                    memcpy(n->tpl.exprs, exprs, expr_cnt * sizeof(ast_node_t *));
+                }
             }
         }
         return n;
@@ -672,9 +886,7 @@ static ast_node_t *parse_primary(js_parser_t *p)
     if (t == TOK_LPAREN) {
         lexer_next(p);
         ast_node_t *e = parse_expr(p);
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_RPAREN, "expected ')'");
         return e;
     }
     if (t == TOK_LBRACK) {
@@ -682,7 +894,7 @@ static ast_node_t *parse_primary(js_parser_t *p)
         ast_node_t *n = alloc_node(p, AST_ARRAY_LIT);
         ast_node_t *items[256];
         uint32_t cnt = 0;
-        while (p->cur.type != TOK_RBRACK && p->cur.type != TOK_EOF) {
+        while (p->cur.type != TOK_RBRACK && p->cur.type != TOK_EOF && !parser_aborted(p)) {
             ast_node_t *elem = parse_expr(p);
             if (cnt < 256u) {
                 items[cnt++] = elem;
@@ -693,11 +905,9 @@ static ast_node_t *parse_primary(js_parser_t *p)
                 break;
             }
         }
-        if (p->cur.type == TOK_RBRACK) {
-            lexer_next(p);
-        }
-        if (n && cnt > 0) {
-            n->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
+        parser_expect(p, TOK_RBRACK, "expected ']'");
+        if (n && cnt > 0 && !p->lint_mode) {
+            n->children = (ast_node_t **)parser_alloc(p, cnt * sizeof(ast_node_t *));
             if (n->children) {
                 memcpy(n->children, items, cnt * sizeof(ast_node_t *));
                 n->child_count = cnt;
@@ -711,7 +921,7 @@ static ast_node_t *parse_primary(js_parser_t *p)
         const char *keys[256];
         ast_node_t *vals[256];
         uint32_t cnt = 0;
-        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF) {
+        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !parser_aborted(p)) {
             const char *k = NULL;
             if (p->cur.type == TOK_IDENT || p->cur.type == TOK_STR) {
                 k = p->cur.text;
@@ -719,14 +929,13 @@ static ast_node_t *parse_primary(js_parser_t *p)
             } else if (p->cur.type == TOK_NUM) {
                 char kbuf[32];
                 snprintf(kbuf, sizeof(kbuf), "%g", p->cur.num);
-                k = script_arena_strdup(p->vm, kbuf, strlen(kbuf));
+                k = parser_strdup(p, kbuf, strlen(kbuf));
                 lexer_next(p);
             } else {
+                parser_fail(p, p->cur_line, p->cur_col, "expected object property name");
                 break;
             }
-            if (p->cur.type == TOK_COLON) {
-                lexer_next(p);
-            }
+            parser_expect(p, TOK_COLON, "expected ':' in object literal");
             ast_node_t *vnode = parse_expr(p);
             if (cnt < 256u) {
                 keys[cnt] = k;
@@ -739,12 +948,10 @@ static ast_node_t *parse_primary(js_parser_t *p)
                 break;
             }
         }
-        if (p->cur.type == TOK_RBRACE) {
-            lexer_next(p);
-        }
-        if (n && cnt > 0) {
-            n->keys = (const char **)script_arena_alloc(p->vm, cnt * sizeof(const char *));
-            n->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
+        parser_expect(p, TOK_RBRACE, "expected '}'");
+        if (n && cnt > 0 && !p->lint_mode) {
+            n->keys = (const char **)parser_alloc(p, cnt * sizeof(const char *));
+            n->children = (ast_node_t **)parser_alloc(p, cnt * sizeof(ast_node_t *));
             if (n->keys && n->children) {
                 memcpy(n->keys, keys, cnt * sizeof(const char *));
                 memcpy(n->children, vals, cnt * sizeof(ast_node_t *));
@@ -756,15 +963,20 @@ static ast_node_t *parse_primary(js_parser_t *p)
     if (t == TOK_NEW) {
         lexer_next(p);
         ast_node_t *n = alloc_node(p, AST_NEW);
-        if (p->cur.type == TOK_IDENT && n) {
-            n->name = p->cur.text;
+        if (p->cur.type == TOK_IDENT) {
+            if (n) {
+                n->name = p->cur.text;
+            }
             lexer_next(p);
+        } else {
+            parser_fail(p, p->cur_line, p->cur_col, "expected constructor name after 'new'");
         }
         if (p->cur.type == TOK_LPAREN) {
             lexer_next(p);
             ast_node_t *args[16];
             uint32_t cnt = 0;
-            while (p->cur.type != TOK_RPAREN && p->cur.type != TOK_EOF && cnt < 16) {
+            while (p->cur.type != TOK_RPAREN && p->cur.type != TOK_EOF && !parser_aborted(p) &&
+                   cnt < 16) {
                 args[cnt++] = parse_expr(p);
                 if (p->cur.type == TOK_COMMA) {
                     lexer_next(p);
@@ -772,11 +984,9 @@ static ast_node_t *parse_primary(js_parser_t *p)
                     break;
                 }
             }
-            if (p->cur.type == TOK_RPAREN) {
-                lexer_next(p);
-            }
-            if (n && cnt > 0) {
-                n->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
+            parser_expect(p, TOK_RPAREN, "expected ')'");
+            if (n && cnt > 0 && !p->lint_mode) {
+                n->children = (ast_node_t **)parser_alloc(p, cnt * sizeof(ast_node_t *));
                 if (n->children) {
                     memcpy(n->children, args, cnt * sizeof(ast_node_t *));
                     n->child_count = cnt;
@@ -786,7 +996,7 @@ static ast_node_t *parse_primary(js_parser_t *p)
         return n;
     }
 
-    p->vm->parse_error = true;
+    parser_fail(p, p->cur_line, p->cur_col, "unexpected token");
     lexer_next(p);
     return alloc_node(p, AST_LITERAL);
 }
@@ -794,9 +1004,7 @@ static ast_node_t *parse_primary(js_parser_t *p)
 static bool parser_step_chain(js_parser_t *p, uint32_t *chain_steps)
 {
     if (++(*chain_steps) > 256u) {
-        p->vm->parse_error = true;
-        p->vm->depth_exceeded = true;
-        p->vm->aborted = true;
+        parser_fail_depth(p, p->cur_line, p->cur_col, "expression chain depth exceeded");
         p->cur.type = TOK_EOF;
         return false;
     }
@@ -807,7 +1015,7 @@ static ast_node_t *parse_postfix(js_parser_t *p)
 {
     ast_node_t *lhs = parse_primary(p);
     uint32_t chain_steps = 0;
-    while (p->cur.type != TOK_EOF) {
+    while (p->cur.type != TOK_EOF && !parser_aborted(p)) {
         if (!parser_step_chain(p, &chain_steps)) {
             break;
         }
@@ -816,6 +1024,8 @@ static ast_node_t *parse_postfix(js_parser_t *p)
             const char *prop = p->cur.text;
             if (p->cur.type == TOK_IDENT) {
                 lexer_next(p);
+            } else {
+                parser_fail(p, p->cur_line, p->cur_col, "expected property name after '.'");
             }
             ast_node_t *m = alloc_node(p, AST_MEMBER);
             if (m) {
@@ -826,9 +1036,7 @@ static ast_node_t *parse_postfix(js_parser_t *p)
         } else if (p->cur.type == TOK_LBRACK) {
             lexer_next(p);
             ast_node_t *idx = parse_expr(p);
-            if (p->cur.type == TOK_RBRACK) {
-                lexer_next(p);
-            }
+            parser_expect(p, TOK_RBRACK, "expected ']'");
             ast_node_t *ix = alloc_node(p, AST_INDEX);
             if (ix) {
                 ix->left = lhs;
@@ -839,7 +1047,8 @@ static ast_node_t *parse_postfix(js_parser_t *p)
             lexer_next(p);
             ast_node_t *args[16];
             uint32_t cnt = 0;
-            while (p->cur.type != TOK_RPAREN && p->cur.type != TOK_EOF && cnt < 16) {
+            while (p->cur.type != TOK_RPAREN && p->cur.type != TOK_EOF && !parser_aborted(p) &&
+                   cnt < 16) {
                 args[cnt++] = parse_expr(p);
                 if (p->cur.type == TOK_COMMA) {
                     lexer_next(p);
@@ -847,15 +1056,12 @@ static ast_node_t *parse_postfix(js_parser_t *p)
                     break;
                 }
             }
-            if (p->cur.type == TOK_RPAREN) {
-                lexer_next(p);
-            }
+            parser_expect(p, TOK_RPAREN, "expected ')'");
             ast_node_t *call = alloc_node(p, AST_CALL);
             if (call) {
                 call->left = lhs;
-                if (cnt > 0) {
-                    call->children =
-                        (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
+                if (cnt > 0 && !p->lint_mode) {
+                    call->children = (ast_node_t **)parser_alloc(p, cnt * sizeof(ast_node_t *));
                     if (call->children) {
                         memcpy(call->children, args, cnt * sizeof(ast_node_t *));
                         call->child_count = cnt;
@@ -884,9 +1090,7 @@ static ast_node_t *parse_unary(js_parser_t *p)
 {
     if (++p->depth > 64u) {
         p->depth--;
-        p->vm->parse_error = true;
-        p->vm->depth_exceeded = true;
-        p->vm->aborted = true;
+        parser_fail_depth(p, p->cur_line, p->cur_col, "expression recursion depth exceeded");
         p->cur.type = TOK_EOF;
         return alloc_node(p, AST_LITERAL);
     }
@@ -1103,9 +1307,7 @@ static ast_node_t *parse_ternary(js_parser_t *p)
     if (p->cur.type == TOK_QUESTION) {
         lexer_next(p);
         ast_node_t *t_br = parse_expr(p);
-        if (p->cur.type == TOK_COLON) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_COLON, "expected ':' in conditional expression");
         ast_node_t *e_br = parse_expr(p);
         ast_node_t *tn = alloc_node(p, AST_TERNARY);
         if (tn) {
@@ -1122,9 +1324,7 @@ static ast_node_t *parse_expr(js_parser_t *p)
 {
     if (++p->depth > 64u) {
         p->depth--;
-        p->vm->parse_error = true;
-        p->vm->depth_exceeded = true;
-        p->vm->aborted = true;
+        parser_fail_depth(p, p->cur_line, p->cur_col, "expression recursion depth exceeded");
         p->cur.type = TOK_EOF;
         return alloc_node(p, AST_LITERAL);
     }
@@ -1173,11 +1373,14 @@ static ast_node_t *parse_var_decl(js_parser_t *p, bool consume_semi)
             break;
         }
     }
+    if (cnt == 0u) {
+        parser_fail(p, p->cur_line, p->cur_col, "expected variable identifier");
+    }
     if (consume_semi && p->cur.type == TOK_SEMI) {
         lexer_next(p);
     }
-    if (n && cnt > 0) {
-        n->decls = (ast_var_item_t *)script_arena_alloc(p->vm, cnt * sizeof(ast_var_item_t));
+    if (n && cnt > 0 && !p->lint_mode) {
+        n->decls = (ast_var_item_t *)parser_alloc(p, cnt * sizeof(ast_var_item_t));
         if (n->decls) {
             memcpy(n->decls, items, cnt * sizeof(ast_var_item_t));
             n->decl_count = cnt;
@@ -1199,8 +1402,7 @@ static ast_node_t *parse_func_decl(js_parser_t *p, bool is_exported)
         }
         lexer_next(p);
     }
-    if (p->cur.type == TOK_LPAREN) {
-        lexer_next(p);
+    if (parser_expect(p, TOK_LPAREN, "expected '(' after function name")) {
         const char *params[16];
         uint32_t cnt = 0;
         while (p->cur.type == TOK_IDENT && cnt < 16) {
@@ -1212,19 +1414,21 @@ static ast_node_t *parse_func_decl(js_parser_t *p, bool is_exported)
                 break;
             }
         }
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
-        if (fn && cnt > 0) {
-            fn->params = (const char **)script_arena_alloc(p->vm, cnt * sizeof(const char *));
+        parser_expect(p, TOK_RPAREN, "expected ')' after parameter list");
+        if (fn && cnt > 0 && !p->lint_mode) {
+            fn->params = (const char **)parser_alloc(p, cnt * sizeof(const char *));
             if (fn->params) {
                 memcpy(fn->params, params, cnt * sizeof(const char *));
                 fn->param_count = cnt;
             }
         }
     }
-    if (fn) {
+    if (p->cur.type != TOK_LBRACE) {
+        parser_fail(p, p->cur_line, p->cur_col, "expected '{' for function body");
+    } else if (fn) {
         fn->body = parse_stmt(p);
+    } else {
+        (void)parse_stmt(p);
     }
     return fn;
 }
@@ -1237,7 +1441,13 @@ static ast_node_t *parse_block(js_parser_t *p)
     ast_node_t *stack_stmts[256];
     ast_node_t **stmts = stack_stmts;
     uint32_t cnt = 0;
-    while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->vm->aborted) {
+    while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !parser_aborted(p)) {
+        if (p->lint_mode) {
+            size_t mark = p->lint_used;
+            (void)parse_stmt(p);
+            p->lint_used = mark;
+            continue;
+        }
         if (cnt >= cap) {
             uint32_t new_cap = cap * 2u;
             if (new_cap > 65536u) {
@@ -1266,11 +1476,9 @@ static ast_node_t *parse_block(js_parser_t *p)
         }
         stmts[cnt++] = parse_stmt(p);
     }
-    if (p->cur.type == TOK_RBRACE) {
-        lexer_next(p);
-    }
-    if (blk && cnt > 0) {
-        blk->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
+    parser_expect(p, TOK_RBRACE, "expected '}'");
+    if (blk && cnt > 0 && !p->lint_mode) {
+        blk->children = (ast_node_t **)parser_alloc(p, cnt * sizeof(ast_node_t *));
         if (blk->children) {
             memcpy(blk->children, stmts, cnt * sizeof(ast_node_t *));
             blk->child_count = cnt;
@@ -1303,6 +1511,8 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
             }
             return vd;
         }
+        parser_fail(p, p->cur_line, p->cur_col, "expected declaration after 'export'");
+        return alloc_node(p, AST_BLOCK);
     }
     if (p->cur.type == TOK_FUNCTION) {
         return parse_func_decl(p, false);
@@ -1312,13 +1522,9 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
     }
     if (p->cur.type == TOK_IF) {
         lexer_next(p);
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_LPAREN, "expected '(' after 'if'");
         ast_node_t *cond = parse_expr(p);
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_RPAREN, "expected ')' after if condition");
         ast_node_t *t_br = parse_stmt(p);
         ast_node_t *e_br = NULL;
         if (p->cur.type == TOK_ELSE) {
@@ -1335,16 +1541,10 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
     }
     if (p->cur.type == TOK_SWITCH) {
         lexer_next(p);
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_LPAREN, "expected '(' after 'switch'");
         ast_node_t *disc = parse_expr(p);
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
-        if (p->cur.type == TOK_LBRACE) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_RPAREN, "expected ')' after switch expression");
+        parser_expect(p, TOK_LBRACE, "expected '{' in switch statement");
         ast_node_t *n = alloc_node(p, AST_SWITCH);
         if (n) {
             n->cond = disc;
@@ -1352,20 +1552,17 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
         ast_node_t *case_exprs[64];
         ast_node_t *case_bodies[64];
         uint32_t case_cnt = 0;
-        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->vm->aborted) {
+        while (p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !parser_aborted(p)) {
             ast_node_t *cexpr = NULL;
             if (p->cur.type == TOK_CASE) {
                 lexer_next(p);
                 cexpr = parse_expr(p);
-                if (p->cur.type == TOK_COLON) {
-                    lexer_next(p);
-                }
+                parser_expect(p, TOK_COLON, "expected ':' after case expression");
             } else if (p->cur.type == TOK_DEFAULT) {
                 lexer_next(p);
-                if (p->cur.type == TOK_COLON) {
-                    lexer_next(p);
-                }
+                parser_expect(p, TOK_COLON, "expected ':' after 'default'");
             } else {
+                parser_fail(p, p->cur_line, p->cur_col, "expected 'case' or 'default'");
                 (void)parse_stmt(p);
                 continue;
             }
@@ -1373,7 +1570,13 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
             ast_node_t *cstmts[128];
             uint32_t scnt = 0;
             while (p->cur.type != TOK_CASE && p->cur.type != TOK_DEFAULT &&
-                   p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !p->vm->aborted) {
+                   p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF && !parser_aborted(p)) {
+                if (p->lint_mode) {
+                    size_t mark = p->lint_used;
+                    (void)parse_stmt(p);
+                    p->lint_used = mark;
+                    continue;
+                }
                 ast_node_t *st = parse_stmt(p);
                 if (scnt < 128u) {
                     cstmts[scnt++] = st;
@@ -1383,27 +1586,23 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
                         128u);
                 }
             }
-            if (cblk && scnt > 0) {
-                cblk->children =
-                    (ast_node_t **)script_arena_alloc(p->vm, scnt * sizeof(ast_node_t *));
+            if (cblk && scnt > 0 && !p->lint_mode) {
+                cblk->children = (ast_node_t **)parser_alloc(p, scnt * sizeof(ast_node_t *));
                 if (cblk->children) {
                     memcpy(cblk->children, cstmts, scnt * sizeof(ast_node_t *));
                     cblk->child_count = scnt;
                 }
             }
-            if (case_cnt < 64u) {
+            if (!p->lint_mode && case_cnt < 64u) {
                 case_exprs[case_cnt] = cexpr;
                 case_bodies[case_cnt] = cblk;
                 case_cnt++;
             }
         }
-        if (p->cur.type == TOK_RBRACE) {
-            lexer_next(p);
-        }
-        if (n && case_cnt > 0) {
-            n->case_exprs =
-                (ast_node_t **)script_arena_alloc(p->vm, case_cnt * sizeof(ast_node_t *));
-            n->children = (ast_node_t **)script_arena_alloc(p->vm, case_cnt * sizeof(ast_node_t *));
+        parser_expect(p, TOK_RBRACE, "expected '}' closing switch");
+        if (n && case_cnt > 0 && !p->lint_mode) {
+            n->case_exprs = (ast_node_t **)parser_alloc(p, case_cnt * sizeof(ast_node_t *));
+            n->children = (ast_node_t **)parser_alloc(p, case_cnt * sizeof(ast_node_t *));
             if (n->case_exprs && n->children) {
                 memcpy(n->case_exprs, case_exprs, case_cnt * sizeof(ast_node_t *));
                 memcpy(n->children, case_bodies, case_cnt * sizeof(ast_node_t *));
@@ -1414,6 +1613,9 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
     }
     if (p->cur.type == TOK_TRY) {
         lexer_next(p);
+        if (p->cur.type != TOK_LBRACE) {
+            parser_fail(p, p->cur_line, p->cur_col, "expected '{' after 'try'");
+        }
         ast_node_t *try_body = parse_stmt(p);
         const char *catch_var = NULL;
         ast_node_t *catch_body = NULL;
@@ -1425,16 +1627,25 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
                 if (p->cur.type == TOK_IDENT) {
                     catch_var = p->cur.text;
                     lexer_next(p);
+                } else {
+                    parser_fail(p, p->cur_line, p->cur_col, "expected catch identifier");
                 }
-                if (p->cur.type == TOK_RPAREN) {
-                    lexer_next(p);
-                }
+                parser_expect(p, TOK_RPAREN, "expected ')' after catch identifier");
+            }
+            if (p->cur.type != TOK_LBRACE) {
+                parser_fail(p, p->cur_line, p->cur_col, "expected '{' for catch body");
             }
             catch_body = parse_stmt(p);
         }
         if (p->cur.type == TOK_FINALLY) {
             lexer_next(p);
+            if (p->cur.type != TOK_LBRACE) {
+                parser_fail(p, p->cur_line, p->cur_col, "expected '{' for finally body");
+            }
             finally_body = parse_stmt(p);
+        }
+        if (!catch_body && !finally_body) {
+            parser_fail(p, p->cur_line, p->cur_col, "expected 'catch' or 'finally' after try");
         }
         ast_node_t *n = alloc_node(p, AST_TRY);
         if (n) {
@@ -1451,6 +1662,8 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
         if (p->cur.type != TOK_SEMI && p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF) {
             if (n) {
                 n->left = parse_expr(p);
+            } else {
+                (void)parse_expr(p);
             }
         }
         if (p->cur.type == TOK_SEMI) {
@@ -1460,13 +1673,9 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
     }
     if (p->cur.type == TOK_WHILE) {
         lexer_next(p);
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_LPAREN, "expected '(' after 'while'");
         ast_node_t *cond = parse_expr(p);
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_RPAREN, "expected ')' after while condition");
         ast_node_t *body = parse_stmt(p);
         ast_node_t *n = alloc_node(p, AST_WHILE);
         if (n) {
@@ -1478,16 +1687,10 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
     if (p->cur.type == TOK_DO) {
         lexer_next(p);
         ast_node_t *body = parse_stmt(p);
-        if (p->cur.type == TOK_WHILE) {
-            lexer_next(p);
-        }
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_WHILE, "expected 'while' after do body");
+        parser_expect(p, TOK_LPAREN, "expected '(' after 'while'");
         ast_node_t *cond = parse_expr(p);
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_RPAREN, "expected ')' after do-while condition");
         if (p->cur.type == TOK_SEMI) {
             lexer_next(p);
         }
@@ -1500,32 +1703,24 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
     }
     if (p->cur.type == TOK_FOR) {
         lexer_next(p);
-        if (p->cur.type == TOK_LPAREN) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_LPAREN, "expected '(' after 'for'");
         ast_node_t *init = NULL;
         if (p->cur.type == TOK_VAR || p->cur.type == TOK_LET || p->cur.type == TOK_CONST) {
             init = parse_var_decl(p, false);
         } else if (p->cur.type != TOK_SEMI) {
             init = parse_expr(p);
         }
-        if (p->cur.type == TOK_SEMI) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_SEMI, "expected ';' after for initializer");
         ast_node_t *cond = NULL;
         if (p->cur.type != TOK_SEMI) {
             cond = parse_expr(p);
         }
-        if (p->cur.type == TOK_SEMI) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_SEMI, "expected ';' after for condition");
         ast_node_t *step = NULL;
         if (p->cur.type != TOK_RPAREN) {
             step = parse_expr(p);
         }
-        if (p->cur.type == TOK_RPAREN) {
-            lexer_next(p);
-        }
+        parser_expect(p, TOK_RPAREN, "expected ')' after for clauses");
         ast_node_t *body = parse_stmt(p);
         ast_node_t *n = alloc_node(p, AST_FOR);
         if (n) {
@@ -1542,6 +1737,8 @@ static ast_node_t *parse_stmt_inner(js_parser_t *p)
         if (p->cur.type != TOK_SEMI && p->cur.type != TOK_RBRACE && p->cur.type != TOK_EOF) {
             if (n) {
                 n->left = parse_expr(p);
+            } else {
+                (void)parse_expr(p);
             }
         }
         if (p->cur.type == TOK_SEMI) {
@@ -1579,9 +1776,7 @@ static ast_node_t *parse_stmt(js_parser_t *p)
 {
     if (++p->depth > 64u) {
         p->depth--;
-        p->vm->parse_error = true;
-        p->vm->depth_exceeded = true;
-        p->vm->aborted = true;
+        parser_fail_depth(p, p->cur_line, p->cur_col, "statement nesting depth exceeded");
         p->cur.type = TOK_EOF;
         return alloc_node(p, AST_BLOCK);
     }
@@ -1597,7 +1792,13 @@ static ast_node_t *parse_program(js_parser_t *p)
     ast_node_t *stack_stmts[256];
     ast_node_t **stmts = stack_stmts;
     uint32_t cnt = 0;
-    while (p->cur.type != TOK_EOF && !p->vm->aborted) {
+    while (p->cur.type != TOK_EOF && !parser_aborted(p)) {
+        if (p->lint_mode) {
+            size_t mark = p->lint_used;
+            (void)parse_stmt(p);
+            p->lint_used = mark;
+            continue;
+        }
         if (cnt >= cap) {
             uint32_t new_cap = cap * 2u;
             if (new_cap > 65536u) {
@@ -1626,8 +1827,8 @@ static ast_node_t *parse_program(js_parser_t *p)
         }
         stmts[cnt++] = parse_stmt(p);
     }
-    if (prog && cnt > 0) {
-        prog->children = (ast_node_t **)script_arena_alloc(p->vm, cnt * sizeof(ast_node_t *));
+    if (prog && cnt > 0 && !p->lint_mode) {
+        prog->children = (ast_node_t **)parser_alloc(p, cnt * sizeof(ast_node_t *));
         if (prog->children) {
             memcpy(prog->children, stmts, cnt * sizeof(ast_node_t *));
             prog->child_count = cnt;
@@ -1647,7 +1848,75 @@ ast_node_t *we_script_parse_program(we_script_t *vm, const char *src, size_t len
         .len = len,
         .pos = 0,
         .depth = 0,
+        .line = 1u,
+        .line_start = 0,
     };
     lexer_next(&parser);
     return parse_program(&parser);
+}
+
+bool we_script_lint(const char *src, size_t len, uint32_t flags, we_script_diag_t *out_diag)
+{
+    we_script_diag_t local_diag;
+    memset(&local_diag, 0, sizeof(local_diag));
+
+    if (!src && len > 0u) {
+        local_diag.status_code = WE_SCRIPT_LINT_SYNTAX_ERR;
+        local_diag.error_line = 1u;
+        local_diag.error_col = 1u;
+        snprintf(local_diag.error_msg, sizeof(local_diag.error_msg), "%s", "null script source");
+        if (out_diag) {
+            *out_diag = local_diag;
+        }
+        return false;
+    }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    /* Bounded 56 KiB scratch buffer keeps total lint stack/arena under 64 KiB */
+    uint8_t scratch_arena[57344];
+    js_parser_t parser = {
+        .vm = NULL,
+        .src = src ? src : "",
+        .len = len,
+        .pos = 0,
+        .depth = 0,
+        .line = 1u,
+        .line_start = 0,
+        .lint_mode = true,
+        .lint_flags = flags,
+        .lint_arena = scratch_arena,
+        .lint_cap = sizeof(scratch_arena),
+        .lint_used = 0,
+    };
+
+    lexer_next(&parser);
+    (void)parse_program(&parser);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    int64_t us = ((int64_t)(t1.tv_sec - t0.tv_sec) * 1000000LL) +
+                 ((int64_t)(t1.tv_nsec - t0.tv_nsec) / 1000LL);
+    local_diag.lint_time_us = (us > 0) ? (uint32_t)us : 0u;
+
+    if (parser.depth_exceeded) {
+        local_diag.status_code = WE_SCRIPT_LINT_DEPTH_EXCEEDED;
+        local_diag.error_line = parser.err_line > 0u ? parser.err_line : 1u;
+        local_diag.error_col = parser.err_col > 0u ? parser.err_col : 1u;
+        snprintf(local_diag.error_msg, sizeof(local_diag.error_msg), "%s",
+                 parser.err_msg[0] ? parser.err_msg : "nesting depth exceeded");
+    } else if (parser.has_error) {
+        local_diag.status_code = WE_SCRIPT_LINT_SYNTAX_ERR;
+        local_diag.error_line = parser.err_line > 0u ? parser.err_line : 1u;
+        local_diag.error_col = parser.err_col > 0u ? parser.err_col : 1u;
+        snprintf(local_diag.error_msg, sizeof(local_diag.error_msg), "%s",
+                 parser.err_msg[0] ? parser.err_msg : "syntax error");
+    } else {
+        local_diag.status_code = WE_SCRIPT_LINT_OK;
+    }
+
+    if (out_diag) {
+        *out_diag = local_diag;
+    }
+    return local_diag.status_code == WE_SCRIPT_LINT_OK;
 }

@@ -10,11 +10,16 @@
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPointer>
 #include <QRegularExpression>
 #include <QScopedValueRollback>
+#include <QScrollBar>
+#include <QSet>
 #include <QStandardPaths>
 #include <QTextStream>
 
@@ -258,6 +263,28 @@ void PropertyRowWidget::setupUi()
 
     rowLayout->addLayout(controlLayout, 1);
 
+    const bool supportsAudioBadge = (m_prop.kind == InspectorProperty::Kind::Float ||
+                                     m_prop.kind == InspectorProperty::Kind::Vec2 ||
+                                     m_prop.kind == InspectorProperty::Kind::Vec3 ||
+                                     m_prop.kind == InspectorProperty::Kind::Vec4 ||
+                                     m_prop.kind == InspectorProperty::Kind::Color);
+    if (supportsAudioBadge) {
+        m_audioBadgeButton = new QToolButton(this);
+        m_audioBadgeButton->setObjectName(QStringLiteral("AudioBadge_%1").arg(m_prop.name));
+        m_audioBadgeButton->setText(tr("Audio"));
+        m_audioBadgeButton->setFixedSize(40, 22);
+        m_audioBadgeButton->setToolTip(tr("Bind this uniform to live PipeWire Bark audio"));
+        setAudioBound(m_audioBound);
+        connect(m_audioBadgeButton, &QToolButton::clicked, this, [this]() {
+            const float baseline =
+                !m_prop.currentValues.empty()
+                    ? m_prop.currentValues[0]
+                    : (!m_prop.defaultValues.empty() ? m_prop.defaultValues[0] : 0.0f);
+            emit audioBindingRequested(m_prop.name, baseline);
+        });
+        rowLayout->addWidget(m_audioBadgeButton);
+    }
+
     // Reset-to-default button
     m_resetButton = new QToolButton(this);
     m_resetButton->setText(tr("Reset"));
@@ -478,6 +505,25 @@ void PropertyRowWidget::updateValues(const std::vector<float> &vals, bool emitSi
 void PropertyRowWidget::resetToDefault() { updateValues(m_prop.defaultValues); }
 
 void PropertyRowWidget::setFilterVisible(bool visible) { setVisible(visible); }
+
+void PropertyRowWidget::setAudioBound(bool bound)
+{
+    m_audioBound = bound;
+    if (!m_audioBadgeButton) {
+        return;
+    }
+    if (bound) {
+        m_audioBadgeButton->setStyleSheet(
+            "QToolButton { color: #12141a; font-size: 9.5px; font-weight: bold; background: "
+            "#38bdf8; border: 1px solid #38bdf8; border-radius: 4px; padding: 1px 4px; } "
+            "QToolButton:hover { background: #7dd3fc; }");
+    } else {
+        m_audioBadgeButton->setStyleSheet(
+            "QToolButton { color: #94a3b8; font-size: 9.5px; background: #181b22; border: 1px "
+            "solid #2c3240; border-radius: 4px; padding: 1px 4px; } "
+            "QToolButton:hover { color: #38bdf8; border-color: #38bdf8; }");
+    }
+}
 
 // =============================================================================
 // PropertyInspectorWidget Implementation
@@ -814,25 +860,23 @@ void PropertyInspectorWidget::setWallpaperEngineProject(const we_project_t &proj
 
 void PropertyInspectorWidget::setShaderMetadata(const waywal_shader_meta_t &meta)
 {
-    clear();
+    setShaderMetadata(meta, QString());
+}
 
-    m_currentTitle = QString::fromUtf8(meta.title);
-    if (m_currentTitle.isEmpty())
-        m_currentTitle = tr("GLSL Shader");
+void PropertyInspectorWidget::setShaderMetadata(const waywal_shader_meta_t &meta,
+                                                const QString &rawComboJson)
+{
+    QString nextTitle = QString::fromUtf8(meta.title);
+    if (nextTitle.isEmpty())
+        nextTitle = tr("GLSL Shader");
 
-    m_currentId = m_currentTitle.toLower().replace(QRegularExpression("[^a-z0-9_]+"), "_");
-    m_currentType = meta.has_multi_pass ? "MULTI-PASS GLSL" : "COMPUTE GLSL";
+    const QString nextId = nextTitle.toLower().replace(QRegularExpression("[^a-z0-9_]+"), "_");
+    const QString nextType =
+        meta.has_multi_pass ? QStringLiteral("MULTI-PASS GLSL") : QStringLiteral("COMPUTE GLSL");
+    const QString author = QString::fromUtf8(meta.author);
 
-    m_titleLabel->setText(m_currentTitle);
-    m_typeBadge->setText(m_currentType);
-    m_typeBadge->setStyleSheet("background: #ef9f76; color: #1e1e2e; font-weight: bold; "
-                               "border-radius: 3px; padding: 2px 6px; font-size: 11px;");
-
-    QString author = QString::fromUtf8(meta.author);
-    if (!author.isEmpty()) {
-        m_authorLabel->setText(tr("Author: %1").arg(author));
-        m_authorLabel->setVisible(true);
-    }
+    std::vector<InspectorProperty> nextProps;
+    nextProps.reserve(std::min<uint32_t>(meta.uniform_count, WAYWAL_MAX_SHADER_UNIFORMS));
 
     for (uint32_t i = 0; i < meta.uniform_count && i < WAYWAL_MAX_SHADER_UNIFORMS; ++i) {
         const waywal_shader_uniform_def_t &u = meta.uniforms[i];
@@ -883,10 +927,185 @@ void PropertyInspectorWidget::setShaderMetadata(const waywal_shader_meta_t &meta
             break;
         }
 
-        m_properties.push_back(prop);
+        nextProps.push_back(std::move(prop));
     }
 
+    if (!rawComboJson.isEmpty()) {
+        const QJsonDocument comboDoc = QJsonDocument::fromJson(rawComboJson.toUtf8());
+        QJsonArray comboArr;
+        if (comboDoc.isArray()) {
+            comboArr = comboDoc.array();
+        } else if (comboDoc.isObject()) {
+            comboArr = comboDoc.object().value(QStringLiteral("combos")).toArray();
+        }
+
+        for (const QJsonValue &val : comboArr) {
+            if (!val.isObject()) {
+                continue;
+            }
+            const QJsonObject obj = val.toObject();
+            QString comboName = obj.value(QStringLiteral("name")).toString();
+            if (comboName.isEmpty()) {
+                comboName = obj.value(QStringLiteral("combo")).toString();
+            }
+            if (comboName.isEmpty()) {
+                continue;
+            }
+
+            const int32_t comboDefault = obj.value(QStringLiteral("default"))
+                                             .toInt(obj.value(QStringLiteral("value")).toInt(0));
+
+            InspectorProperty prop;
+            prop.id = comboName;
+            prop.name = comboName;
+            prop.label = obj.value(QStringLiteral("label")).toString(comboName);
+            prop.category = QStringLiteral("Shader Combos");
+            prop.kind = InspectorProperty::Kind::Combo;
+            prop.numComponents = 1;
+            prop.isShaderCombo = true;
+
+            const QJsonValue optsVal = obj.value(QStringLiteral("options"));
+            if (optsVal.isObject()) {
+                const QJsonObject optsObj = optsVal.toObject();
+                for (auto it = optsObj.constBegin(); it != optsObj.constEnd(); ++it) {
+                    const int32_t v =
+                        it.value().toInt(static_cast<int32_t>(prop.comboValues.size()));
+                    prop.comboOptions.append(QStringLiteral("%1 (%2)").arg(it.key()).arg(v));
+                    prop.comboValues.push_back(v);
+                }
+            } else if (optsVal.isArray()) {
+                const QJsonArray optsArr = optsVal.toArray();
+                for (qsizetype idx = 0; idx < optsArr.size(); ++idx) {
+                    const QJsonValue &optItem = optsArr[idx];
+                    if (optItem.isObject()) {
+                        const QJsonObject optObj = optItem.toObject();
+                        const int32_t v =
+                            optObj.value(QStringLiteral("value")).toInt(static_cast<int32_t>(idx));
+                        QString lbl = optObj.value(QStringLiteral("label")).toString();
+                        if (lbl.isEmpty()) {
+                            lbl = optObj.value(QStringLiteral("name")).toString();
+                        }
+                        if (lbl.isEmpty()) {
+                            lbl = QString::number(v);
+                        }
+                        prop.comboOptions.append(QStringLiteral("%1 (%2)").arg(lbl).arg(v));
+                        prop.comboValues.push_back(v);
+                    } else {
+                        prop.comboOptions.append(optItem.toString());
+                        prop.comboValues.push_back(static_cast<int32_t>(idx));
+                    }
+                }
+            }
+            if (prop.comboOptions.isEmpty()) {
+                const int32_t maxVal = std::max(1, comboDefault);
+                for (int32_t v = 0; v <= maxVal; ++v) {
+                    prop.comboOptions.append(
+                        v == 0 ? QStringLiteral("0 (Off)")
+                               : (v == 1 ? QStringLiteral("1 (On)") : QString::number(v)));
+                    prop.comboValues.push_back(v);
+                }
+            }
+
+            int defaultIdx = 0;
+            for (size_t idx = 0; idx < prop.comboValues.size(); ++idx) {
+                if (prop.comboValues[idx] == comboDefault) {
+                    defaultIdx = static_cast<int>(idx);
+                    break;
+                }
+            }
+            prop.comboIndex = defaultIdx;
+            prop.currentValues = {static_cast<float>(defaultIdx)};
+            prop.defaultValues = {static_cast<float>(defaultIdx)};
+            prop.minValues = {0.0f};
+            prop.maxValues = {
+                static_cast<float>(std::max<qsizetype>(1, prop.comboOptions.size() - 1))};
+            nextProps.push_back(std::move(prop));
+        }
+    }
+
+    auto sameSchema = [](const InspectorProperty &a, const InspectorProperty &b) {
+        return a.id == b.id && a.name == b.name && a.kind == b.kind &&
+               a.numComponents == b.numComponents && a.hasRange == b.hasRange &&
+               a.minValues == b.minValues && a.maxValues == b.maxValues &&
+               std::abs(a.step - b.step) < 1e-6f && a.isShaderCombo == b.isShaderCombo &&
+               a.comboOptions == b.comboOptions && a.comboValues == b.comboValues;
+    };
+
+    if (m_currentId == nextId && m_currentType == nextType &&
+        m_properties.size() == nextProps.size() &&
+        std::ranges::equal(m_properties, nextProps, sameSchema)) {
+        m_currentTitle = nextTitle;
+        m_titleLabel->setText(m_currentTitle);
+        if (!author.isEmpty()) {
+            m_authorLabel->setText(tr("Author: %1").arg(author));
+            m_authorLabel->setVisible(true);
+        } else {
+            m_authorLabel->clear();
+            m_authorLabel->setVisible(false);
+        }
+        for (size_t i = 0; i < m_properties.size(); ++i) {
+            m_properties[i].label = nextProps[i].label;
+            m_properties[i].category = nextProps[i].category;
+            m_properties[i].defaultValues = std::move(nextProps[i].defaultValues);
+        }
+        return;
+    }
+
+    const bool sameShader = (m_currentId == nextId && m_currentType == nextType);
+    QSet<QString> preservedAudio;
+    QHash<QString, std::vector<float>> preservedValues;
+    if (sameShader) {
+        for (const auto &existing : m_properties) {
+            preservedValues.insert(existing.name, existing.currentValues);
+        }
+    }
+    for (auto it = m_rowWidgets.constBegin(); it != m_rowWidgets.constEnd(); ++it) {
+        if (it.value() && it.value()->isAudioBound()) {
+            preservedAudio.insert(it.key());
+        }
+    }
+    const int prevScroll = (m_scrollArea && m_scrollArea->verticalScrollBar())
+                               ? m_scrollArea->verticalScrollBar()->value()
+                               : 0;
+
+    clear();
+
+    m_currentTitle = nextTitle;
+    m_currentId = nextId;
+    m_currentType = nextType;
+
+    m_titleLabel->setText(m_currentTitle);
+    m_typeBadge->setText(m_currentType);
+    m_typeBadge->setStyleSheet("background: #ef9f76; color: #1e1e2e; font-weight: bold; "
+                               "border-radius: 3px; padding: 2px 6px; font-size: 11px;");
+
+    if (!author.isEmpty()) {
+        m_authorLabel->setText(tr("Author: %1").arg(author));
+        m_authorLabel->setVisible(true);
+    }
+
+    if (sameShader) {
+        for (auto &prop : nextProps) {
+            if (preservedValues.contains(prop.name)) {
+                const auto &oldVals = preservedValues.value(prop.name);
+                if (oldVals.size() == prop.currentValues.size()) {
+                    prop.currentValues = oldVals;
+                }
+            }
+        }
+    }
+    m_properties = std::move(nextProps);
+
     rebuildPropertyUi();
+
+    for (const QString &name : preservedAudio) {
+        if (auto *row = m_rowWidgets.value(name, nullptr)) {
+            row->setAudioBound(true);
+        }
+    }
+    if (m_scrollArea && m_scrollArea->verticalScrollBar()) {
+        m_scrollArea->verticalScrollBar()->setValue(prevScroll);
+    }
 }
 
 bool PropertyInspectorWidget::loadWallpaperEngineDir(const QString &workshopDir)
@@ -904,7 +1123,33 @@ bool PropertyInspectorWidget::loadShaderFile(const QString &shaderPath)
     waywal_shader_meta_t meta;
     waywal_shader_meta_init(&meta);
     if (waywal_shader_parse_file(shaderPath.toUtf8().constData(), &meta)) {
-        setShaderMetadata(meta);
+        QJsonArray comboArr;
+        QFile f(shaderPath);
+        if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QTextStream ts(&f);
+            while (!ts.atEnd()) {
+                const QString line = ts.readLine().trimmed();
+                const qsizetype tagPos =
+                    line.indexOf(QStringLiteral("[COMBO]"), 0, Qt::CaseInsensitive);
+                if (tagPos < 0) {
+                    continue;
+                }
+                const qsizetype bracePos = line.indexOf(QLatin1Char('{'), tagPos);
+                const qsizetype endBrace = line.lastIndexOf(QLatin1Char('}'));
+                if (bracePos >= 0 && endBrace > bracePos) {
+                    const QJsonDocument doc = QJsonDocument::fromJson(
+                        line.mid(bracePos, endBrace - bracePos + 1).toUtf8());
+                    if (doc.isObject()) {
+                        comboArr.append(doc.object());
+                    }
+                }
+            }
+        }
+        const QString comboJson =
+            comboArr.isEmpty()
+                ? QString()
+                : QString::fromUtf8(QJsonDocument(comboArr).toJson(QJsonDocument::Compact));
+        setShaderMetadata(meta, comboJson);
         return true;
     }
     return false;
@@ -961,6 +1206,8 @@ void PropertyInspectorWidget::rebuildPropertyUi()
             auto *row = new PropertyRowWidget(p, group);
             connect(row, &PropertyRowWidget::valueChanged, this,
                     &PropertyInspectorWidget::onRowValueChanged);
+            connect(row, &PropertyRowWidget::audioBindingRequested, this,
+                    &PropertyInspectorWidget::audioBindingRequested);
             m_rowWidgets[p.name] = row;
             groupLayout->addWidget(row);
         }
@@ -985,15 +1232,59 @@ void PropertyInspectorWidget::onRowValueChanged(const QString &name,
                                                 const std::vector<float> &values, uint32_t count)
 {
     std::vector<float> oldValues;
+    bool isShaderCombo = false;
+    int32_t comboValue = 0;
+    InspectorProperty::Kind propKind = InspectorProperty::Kind::Float;
+
     for (auto &prop : m_properties) {
         if (prop.name == name) {
             oldValues = prop.currentValues;
             prop.currentValues = values;
+            isShaderCombo = prop.isShaderCombo;
+            propKind = prop.kind;
+            if (isShaderCombo && !values.empty()) {
+                const int idx = static_cast<int>(std::lround(values[0]));
+                prop.comboIndex = idx;
+                if (idx >= 0 && idx < static_cast<int>(prop.comboValues.size())) {
+                    comboValue = prop.comboValues[static_cast<size_t>(idx)];
+                } else {
+                    comboValue = idx;
+                }
+            }
             break;
         }
     }
 
+    if (isShaderCombo) {
+        if (m_ipcClient) {
+            m_ipcClient->sendSetShaderCombo(m_targetOutput, m_targetObjectId, m_targetPassIndex,
+                                            name, comboValue, 0u);
+        }
+        emit shaderComboChanged(m_targetOutput, m_targetObjectId, m_targetPassIndex, name,
+                                comboValue);
+        emit uniformDefaultEdited(name, QString::number(comboValue));
+        return;
+    }
+
     dispatchUniform(name, oldValues, values, count);
+
+    if (!values.empty()) {
+        if (propKind == InspectorProperty::Kind::Bool) {
+            emit uniformDefaultEdited(name, values[0] > 0.5f ? QStringLiteral("true")
+                                                             : QStringLiteral("false"));
+        } else if (propKind == InspectorProperty::Kind::Int) {
+            emit uniformDefaultEdited(name, QString::number(std::lround(values[0])));
+        } else if (values.size() == 1 || count == 1) {
+            emit uniformDefaultEdited(name, QString::number(values[0], 'f', 3));
+        } else {
+            QStringList parts;
+            const size_t n = std::min<size_t>(values.size(), std::max<uint32_t>(1u, count));
+            for (size_t i = 0; i < n; ++i) {
+                parts.append(QString::number(values[i], 'f', 3));
+            }
+            emit uniformDefaultEdited(name, parts.join(QLatin1Char(' ')));
+        }
+    }
 }
 
 void PropertyInspectorWidget::dispatchUniform(const QString &name,

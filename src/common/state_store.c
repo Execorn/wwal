@@ -786,7 +786,10 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
             } else {
                 char cwd[WAYWAL_PATH_MAX];
                 if (getcwd(cwd, sizeof(cwd)) != NULL) {
-                    snprintf(abs_media, sizeof(abs_media), "%s/%s", cwd, media_path);
+                    int n = snprintf(abs_media, sizeof(abs_media), "%s/%s", cwd, media_path);
+                    if (n < 0 || (size_t)n >= sizeof(abs_media)) {
+                        abs_media[0] = '\0';
+                    }
                 } else {
                     snprintf(abs_media, sizeof(abs_media), "%s", media_path);
                 }

@@ -2318,9 +2318,16 @@ static void load_custom_channel_images(waywal_shader_engine_t *eng,
             }
             char resolved[4096];
             if (b->image_path[0] != '/' && base_dir && base_dir[0] != '\0') {
-                snprintf(resolved, sizeof(resolved), "%s/%s", base_dir, b->image_path);
+                int rlen = snprintf(resolved, sizeof(resolved), "%s/%s", base_dir, b->image_path);
+                if (rlen < 0 || (size_t)rlen >= sizeof(resolved)) {
+                    WAYWAL_LOG_WARN("Shader channel %d resolved path exceeds %zu bytes", c,
+                                    sizeof(resolved));
+                    continue;
+                }
             } else {
-                snprintf(resolved, sizeof(resolved), "%s", b->image_path);
+                size_t ilen = strnlen(b->image_path, sizeof(resolved) - 1);
+                memcpy(resolved, b->image_path, ilen);
+                resolved[ilen] = '\0';
             }
             uint8_t *px = NULL;
             uint32_t w = 0, h = 0;
@@ -2841,7 +2848,9 @@ static void setup_file_watches(waywal_shader_engine_t *eng, const char *filepath
         snprintf(eng->watched_base, sizeof(eng->watched_base), "%s", slash + 1);
     } else {
         snprintf(eng->watched_dir, sizeof(eng->watched_dir), ".");
-        snprintf(eng->watched_base, sizeof(eng->watched_base), "%s", filepath);
+        size_t flen = strnlen(filepath, sizeof(eng->watched_base) - 1);
+        memcpy(eng->watched_base, filepath, flen);
+        eng->watched_base[flen] = '\0';
     }
 
     if (eng->inotify_fd < 0) {

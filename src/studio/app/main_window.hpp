@@ -8,6 +8,7 @@
 #include <QAction>
 #include <QComboBox>
 #include <QLabel>
+#include <QPointer>
 #include <QPushButton>
 #include <memory>
 #include <thread>
@@ -50,6 +51,11 @@ class NodeGraphEditorWidget;
 class EffectLibraryBrowserWidget;
 class CameraLightingInspectorWidget;
 class PhysicsSpringInspectorWidget;
+class SceneLayerTreeWidget;
+class GpuBrushPainterWidget;
+class ParticleDesignerWidget;
+class AudioBindingWizard;
+class GlslSceneScriptEditorWidget;
 
 /**
  * @brief Startup options parsed from CLI arguments.
@@ -91,30 +97,30 @@ class MainWindow : public QMainWindow {
     CommandBus *commandBus() const { return m_commandBus.get(); }
     const StudioOptions &options() const { return m_options; }
 
-    // Direct access to core panels
-    MonitorTopologyBar *topologyBar() const { return m_topologyBar; }
-    VirtualizedGridWidget *gridWidget() const { return m_gridWidget; }
-    GpuPreviewViewport *previewViewport() const { return m_previewViewport; }
-    CubicBezierEditorWidget *bezierEditor() const { return m_bezierEditor; }
-    PropertyInspectorWidget *propertyInspector() const { return m_propertyInspector; }
-    ThemeStudioWidget *themeStudio() const { return m_themeStudio; }
-    StudioFooterBar *footerBar() const { return m_footerBar; }
-    WorkshopBrowserWidget *workshopBrowser() const { return m_workshopBrowser; }
-    OpenHubBrowserWidget *openHubBrowser() const { return m_openHubBrowser; }
+    // Direct access to core panels (defined out-of-line so QPointer<T> members stay incomplete-type
+    // safe)
+    MonitorTopologyBar *topologyBar() const;
+    VirtualizedGridWidget *gridWidget() const;
+    GpuPreviewViewport *previewViewport() const;
+    CubicBezierEditorWidget *bezierEditor() const;
+    PropertyInspectorWidget *propertyInspector() const;
+    ThemeStudioWidget *themeStudio() const;
+    StudioFooterBar *footerBar() const;
+    WorkshopBrowserWidget *workshopBrowser() const;
+    OpenHubBrowserWidget *openHubBrowser() const;
     CatalogIndexManager *catalogIndexManager() const { return m_catalogIndexMgr.get(); }
     DownloadManager *downloadManager() const { return m_downloadMgr.get(); }
     RecursiveFsWatcher *fsWatcher() const { return m_fsWatcher.get(); }
     IpcClient *ipcClient() const { return m_ipcClient.get(); }
-    NodeGraphEditorWidget *nodeGraphEditor() const { return m_nodeGraphEditor; }
-    EffectLibraryBrowserWidget *effectLibraryBrowser() const { return m_effectLibraryBrowser; }
-    CameraLightingInspectorWidget *cameraLightingInspector() const
-    {
-        return m_cameraLightingInspector;
-    }
-    PhysicsSpringInspectorWidget *physicsSpringInspector() const
-    {
-        return m_physicsSpringInspector;
-    }
+    NodeGraphEditorWidget *nodeGraphEditor() const;
+    EffectLibraryBrowserWidget *effectLibraryBrowser() const;
+    CameraLightingInspectorWidget *cameraLightingInspector() const;
+    PhysicsSpringInspectorWidget *physicsSpringInspector() const;
+    SceneLayerTreeWidget *sceneLayerTree() const;
+    GpuBrushPainterWidget *brushPainter() const;
+    ParticleDesignerWidget *particleDesigner() const;
+    AudioBindingWizard *audioBindingWizard() const;
+    GlslSceneScriptEditorWidget *codeEditor() const;
 
     // Global Actions
     QAction *undoAction() const { return m_undoAction; }
@@ -123,6 +129,7 @@ class MainWindow : public QMainWindow {
     QAction *playPauseAction() const { return m_playPauseAction; }
     QAction *fullscreenAction() const { return m_fullscreenAction; }
     QAction *packageWizardAction() const { return m_packageWizardAction; }
+    QAction *exportScenePackageAction() const { return m_exportScenePkgAction; }
     QPushButton *pauseButton() const { return m_pauseBtn; }
 
   public slots:
@@ -134,6 +141,8 @@ class MainWindow : public QMainWindow {
     void handlePerspectiveSelected(const QString &perspectiveName);
     void handleResetLayout();
     void handleOpenPackagingWizard();
+    void handleExportScenePackage();
+    void handleViewportToolModeChanged(int index);
 
   protected:
     void closeEvent(QCloseEvent *event) override;
@@ -161,21 +170,26 @@ class MainWindow : public QMainWindow {
     std::jthread m_reconcileThread;
 
     // 6+ Studio Dock Panels & Bars
-    MonitorTopologyBar *m_topologyBar{nullptr};
-    VirtualizedGridWidget *m_gridWidget{nullptr};
-    WorkshopBrowserWidget *m_workshopBrowser{nullptr};
-    OpenHubBrowserWidget *m_openHubBrowser{nullptr};
-    GpuPreviewViewport *m_previewViewport{nullptr};
-    CubicBezierEditorWidget *m_bezierEditor{nullptr};
-    PropertyInspectorWidget *m_propertyInspector{nullptr};
-    ThemeStudioWidget *m_themeStudio{nullptr};
-    StudioFooterBar *m_footerBar{nullptr};
+    QPointer<MonitorTopologyBar> m_topologyBar;
+    QPointer<VirtualizedGridWidget> m_gridWidget;
+    QPointer<WorkshopBrowserWidget> m_workshopBrowser;
+    QPointer<OpenHubBrowserWidget> m_openHubBrowser;
+    QPointer<GpuPreviewViewport> m_previewViewport;
+    QPointer<CubicBezierEditorWidget> m_bezierEditor;
+    QPointer<PropertyInspectorWidget> m_propertyInspector;
+    QPointer<ThemeStudioWidget> m_themeStudio;
+    QPointer<StudioFooterBar> m_footerBar;
 
     std::unique_ptr<IpcClient> m_ipcClient;
-    NodeGraphEditorWidget *m_nodeGraphEditor{nullptr};
-    EffectLibraryBrowserWidget *m_effectLibraryBrowser{nullptr};
-    CameraLightingInspectorWidget *m_cameraLightingInspector{nullptr};
-    PhysicsSpringInspectorWidget *m_physicsSpringInspector{nullptr};
+    QPointer<NodeGraphEditorWidget> m_nodeGraphEditor;
+    QPointer<EffectLibraryBrowserWidget> m_effectLibraryBrowser;
+    QPointer<CameraLightingInspectorWidget> m_cameraLightingInspector;
+    QPointer<PhysicsSpringInspectorWidget> m_physicsSpringInspector;
+    QPointer<SceneLayerTreeWidget> m_sceneLayerTree;
+    QPointer<GpuBrushPainterWidget> m_brushPainter;
+    QPointer<ParticleDesignerWidget> m_particleDesigner;
+    QPointer<AudioBindingWizard> m_audioBindingWizard;
+    QPointer<GlslSceneScriptEditorWidget> m_codeEditor;
 
     // Global Actions
     QAction *m_undoAction{nullptr};
@@ -184,12 +198,18 @@ class MainWindow : public QMainWindow {
     QAction *m_playPauseAction{nullptr};
     QAction *m_fullscreenAction{nullptr};
     QAction *m_packageWizardAction{nullptr};
+    QAction *m_exportScenePkgAction{nullptr};
 
     // Perspective & Status Controls
     QComboBox *m_perspectiveCombo{nullptr};
+    QComboBox *m_toolModeCombo{nullptr};
     QPushButton *m_pauseBtn{nullptr};
     QLabel *m_statusLabel{nullptr};
     QString m_activeWallpaperPath;
+    QString m_lastSceneTreeJson;
+    QString m_pendingExportStagePath;
+    QString m_pendingExportDestPath;
+    bool m_pendingExportIsPkgFile{false};
 
     bool m_isFullscreenPreview{false};
     bool m_isPlaying{true};

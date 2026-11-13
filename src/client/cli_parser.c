@@ -20,6 +20,27 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+static void cli_copy_cstr(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    if (dst == src) {
+        dst[cap - 1] = '\0';
+        return;
+    }
+    size_t i = 0;
+    while (i + 1 < cap && src[i] != '\0') {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
 void cli_print_usage(const char *prog)
 {
     printf("wwal - Modern high-performance Wayland wallpaper client (C23)\n");
@@ -673,11 +694,9 @@ static bool parse_common_flag(int *optind_ptr, int argc, char *argv[], cli_optio
         }
         const char *effective = resolved_ok ? resolved_preset : val;
         if (opts->cmd == CLI_CMD_SHADER) {
-            strncpy(opts->filepath, effective, sizeof(opts->filepath) - 1);
-            opts->filepath[sizeof(opts->filepath) - 1] = '\0';
+            cli_copy_cstr(opts->filepath, sizeof(opts->filepath), effective);
         }
-        strncpy(opts->custom_shader_path, effective, sizeof(opts->custom_shader_path) - 1);
-        opts->custom_shader_path[sizeof(opts->custom_shader_path) - 1] = '\0';
+        cli_copy_cstr(opts->custom_shader_path, sizeof(opts->custom_shader_path), effective);
         if (waywal_shader_is_audio_reactive(val) || waywal_shader_is_audio_reactive(effective)) {
             opts->audio_reactive = true;
         }
@@ -1467,8 +1486,7 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
                     fprintf(stderr, "Error: Invalid shader preset name '%s'\n", arg);
                     return false;
                 }
-                strncpy(opts->shader_preset, arg, sizeof(opts->shader_preset) - 1);
-                opts->shader_preset[sizeof(opts->shader_preset) - 1] = '\0';
+                cli_copy_cstr(opts->shader_preset, sizeof(opts->shader_preset), arg);
                 char query_buf[4200];
                 if (opts->shader_preset_explicit && strncasecmp(arg, "preset:", 7) != 0) {
                     snprintf(query_buf, sizeof(query_buf), "preset:%s", arg);
@@ -1481,10 +1499,9 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
                 const char *effective = resolved_ok
                                             ? resolved_preset
                                             : (opts->shader_preset_explicit ? query_buf : arg);
-                strncpy(opts->filepath, effective, sizeof(opts->filepath) - 1);
-                opts->filepath[sizeof(opts->filepath) - 1] = '\0';
-                strncpy(opts->custom_shader_path, effective, sizeof(opts->custom_shader_path) - 1);
-                opts->custom_shader_path[sizeof(opts->custom_shader_path) - 1] = '\0';
+                cli_copy_cstr(opts->filepath, sizeof(opts->filepath), effective);
+                cli_copy_cstr(opts->custom_shader_path, sizeof(opts->custom_shader_path),
+                              effective);
                 if (opts->shader_preset_explicit && !resolved_ok) {
                     fprintf(stderr,
                             "Error: Shader preset '%s' not found (run 'wwal shader list' to see "
@@ -1869,13 +1886,10 @@ bool cli_parse(int argc, char *argv[], cli_options_t *opts)
             waywal_shader_resolve_path(preset_query, resolved_preset, sizeof(resolved_preset))) {
             opts->cmd = CLI_CMD_SHADER;
             opts->shader_preset_explicit = true;
-            strncpy(opts->shader_preset, cmd_str, sizeof(opts->shader_preset) - 1);
-            opts->shader_preset[sizeof(opts->shader_preset) - 1] = '\0';
-            strncpy(opts->filepath, resolved_preset, sizeof(opts->filepath) - 1);
-            opts->filepath[sizeof(opts->filepath) - 1] = '\0';
-            strncpy(opts->custom_shader_path, resolved_preset,
-                    sizeof(opts->custom_shader_path) - 1);
-            opts->custom_shader_path[sizeof(opts->custom_shader_path) - 1] = '\0';
+            cli_copy_cstr(opts->shader_preset, sizeof(opts->shader_preset), cmd_str);
+            cli_copy_cstr(opts->filepath, sizeof(opts->filepath), resolved_preset);
+            cli_copy_cstr(opts->custom_shader_path, sizeof(opts->custom_shader_path),
+                          resolved_preset);
             if (waywal_shader_is_audio_reactive(preset_query) ||
                 waywal_shader_is_audio_reactive(resolved_preset)) {
                 opts->audio_reactive = true;
@@ -1970,8 +1984,7 @@ bool cli_auto_dispatch_img(cli_options_t *opts)
         if (dir_contains_workshop_marker(resolved)) {
             opts->cmd = CLI_CMD_WORKSHOP;
             opts->workshop_subcmd = WAYWAL_WORKSHOP_APPLY;
-            strncpy(opts->filepath, resolved, sizeof(opts->filepath) - 1);
-            opts->filepath[sizeof(opts->filepath) - 1] = '\0';
+            cli_copy_cstr(opts->filepath, sizeof(opts->filepath), resolved);
             return true;
         }
         opts->cmd = CLI_CMD_SLIDESHOW;
@@ -2003,8 +2016,7 @@ bool cli_auto_dispatch_img(cli_options_t *opts)
                 if (is_ws_entry) {
                     opts->cmd = CLI_CMD_WORKSHOP;
                     opts->workshop_subcmd = WAYWAL_WORKSHOP_APPLY;
-                    strncpy(opts->filepath, ws_dir, sizeof(opts->filepath) - 1);
-                    opts->filepath[sizeof(opts->filepath) - 1] = '\0';
+                    cli_copy_cstr(opts->filepath, sizeof(opts->filepath), ws_dir);
                     return true;
                 }
             }
@@ -2020,8 +2032,7 @@ bool cli_auto_dispatch_img(cli_options_t *opts)
                 strcasecmp(dot, ".avi") == 0 || strcasecmp(dot, ".m4v") == 0) {
                 opts->cmd = CLI_CMD_VIDEO;
                 if (di == 1 && is_symlink) {
-                    strncpy(opts->filepath, resolved, sizeof(opts->filepath) - 1);
-                    opts->filepath[sizeof(opts->filepath) - 1] = '\0';
+                    cli_copy_cstr(opts->filepath, sizeof(opts->filepath), resolved);
                 }
                 return true;
             }
@@ -2042,18 +2053,15 @@ bool cli_auto_dispatch_img(cli_options_t *opts)
                     opts->audio_reactive = true;
                 }
                 if (sh_p != opts->filepath) {
-                    strncpy(opts->filepath, sh_p, sizeof(opts->filepath) - 1);
-                    opts->filepath[sizeof(opts->filepath) - 1] = '\0';
+                    cli_copy_cstr(opts->filepath, sizeof(opts->filepath), sh_p);
                 }
-                strncpy(opts->custom_shader_path, opts->filepath,
-                        sizeof(opts->custom_shader_path) - 1);
-                opts->custom_shader_path[sizeof(opts->custom_shader_path) - 1] = '\0';
+                cli_copy_cstr(opts->custom_shader_path, sizeof(opts->custom_shader_path),
+                              opts->filepath);
                 return true;
             }
             if (strcasecmp(dot, ".xml") == 0 || strcasecmp(dot, ".json") == 0) {
                 if (di == 1 && is_symlink) {
-                    strncpy(opts->filepath, resolved, sizeof(opts->filepath) - 1);
-                    opts->filepath[sizeof(opts->filepath) - 1] = '\0';
+                    cli_copy_cstr(opts->filepath, sizeof(opts->filepath), resolved);
                 }
                 return true;
             }
@@ -2071,11 +2079,9 @@ bool cli_auto_dispatch_img(cli_options_t *opts)
                     waywal_shader_is_audio_reactive(resolved_preset)) {
                     opts->audio_reactive = true;
                 }
-                strncpy(opts->filepath, resolved_preset, sizeof(opts->filepath) - 1);
-                opts->filepath[sizeof(opts->filepath) - 1] = '\0';
-                strncpy(opts->custom_shader_path, resolved_preset,
-                        sizeof(opts->custom_shader_path) - 1);
-                opts->custom_shader_path[sizeof(opts->custom_shader_path) - 1] = '\0';
+                cli_copy_cstr(opts->filepath, sizeof(opts->filepath), resolved_preset);
+                cli_copy_cstr(opts->custom_shader_path, sizeof(opts->custom_shader_path),
+                              resolved_preset);
                 return true;
             }
             if (strncasecmp(opts->filepath, "preset:", 7) == 0) {

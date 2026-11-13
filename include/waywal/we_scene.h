@@ -13,9 +13,112 @@
 #include "waywal/we_shader.h"
 #include "waywal/we_tex.h"
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#if __has_include("waywal/ipc_proto_authoring.h")
+#include "waywal/ipc_proto_authoring.h"
+#endif
+
+#ifndef WAYWAL_IPC_PROTO_AUTHORING_AUDIO_FALLBACK
+#define WAYWAL_IPC_PROTO_AUTHORING_AUDIO_FALLBACK
+#ifndef WAYWAL_IPC_PROTO_AUTHORING_H
+#define WE_MAX_AUDIO_BINDINGS 64u
+
+typedef enum : uint32_t {
+    WE_AUDIO_SRC_BARK_RANGE = 0u,
+    WE_AUDIO_SRC_ENVELOPE = 1u,
+    WE_AUDIO_SRC_BASS_ENERGY = 2u,
+    WE_AUDIO_SRC_BEAT_PULSE = 3u,
+} we_audio_src_kind_t;
+
+typedef enum : uint32_t {
+    WE_AUDIO_AGG_PEAK_WEIGHTED = 0u,
+    WE_AUDIO_AGG_MEAN = 1u,
+    WE_AUDIO_AGG_PEAK = 2u,
+} we_audio_agg_mode_t;
+
+typedef enum : uint32_t {
+    WE_AUDIO_CURVE_LINEAR = 0u,
+    WE_AUDIO_CURVE_QUADRATIC = 1u,
+    WE_AUDIO_CURVE_SQRT = 2u,
+    WE_AUDIO_CURVE_SMOOTHSTEP = 3u,
+    WE_AUDIO_CURVE_TRIG_EDGE = 4u,
+} we_audio_curve_t;
+
+typedef enum : uint32_t {
+    WE_AUDIO_BLEND_ADD = 0u,
+    WE_AUDIO_BLEND_MULTIPLY = 1u,
+    WE_AUDIO_BLEND_REPLACE = 2u,
+} we_audio_blend_t;
+
+typedef enum : uint32_t {
+    WE_AUDIO_TGT_LAYER_ORIGIN_X = 0u,
+    WE_AUDIO_TGT_LAYER_ORIGIN_Y = 1u,
+    WE_AUDIO_TGT_LAYER_SCALE_XY = 2u,
+    WE_AUDIO_TGT_LAYER_ROTATION_Z = 3u,
+    WE_AUDIO_TGT_LAYER_ALPHA = 4u,
+    WE_AUDIO_TGT_LAYER_BRIGHTNESS = 5u,
+    WE_AUDIO_TGT_LAYER_COLOR_RGB = 6u,
+    WE_AUDIO_TGT_PASS_UNIFORM_COMP = 7u,
+    WE_AUDIO_TGT_LIGHT_INTENSITY = 8u,
+    WE_AUDIO_TGT_LIGHT_RADIUS = 9u,
+    WE_AUDIO_TGT_PARTICLE_RATE = 10u,
+    WE_AUDIO_TGT_PARTICLE_SPEED = 11u,
+    WE_AUDIO_TGT_PARTICLE_TURB_SPEED = 12u,
+    WE_AUDIO_TGT_PARTICLE_VORTEX_SPD = 13u,
+    WE_AUDIO_TGT_PARTICLE_BURST_TRIG = 14u,
+} we_audio_target_kind_t;
+
+typedef enum : uint32_t {
+    WE_AUDIO_BIND_OP_REPLACE_ALL = 0u,
+    WE_AUDIO_BIND_OP_UPSERT = 1u,
+    WE_AUDIO_BIND_OP_REMOVE = 2u,
+    WE_AUDIO_BIND_OP_CLEAR = 3u,
+} we_audio_bind_op_t;
+
+#pragma pack(push, 1)
+
+typedef struct {
+    uint32_t binding_id;
+    int32_t target_object_id;
+    uint32_t target_kind;
+    uint32_t target_sub_index;
+    uint32_t target_component;
+    char uniform_name[64];
+
+    uint32_t src_kind;
+    uint32_t agg_mode;
+    uint16_t band_start;
+    uint16_t band_end;
+    float input_gain;
+
+    float threshold_open;
+    float hysteresis;
+    float attack_sec;
+    float release_sec;
+
+    uint32_t curve_shape;
+    uint32_t blend_mode;
+    float out_min;
+    float out_max;
+    float base_value;
+
+    float env_state;
+    float last_output;
+    float cooldown_rem_sec;
+    uint8_t gate_open;
+    uint8_t enabled;
+    uint8_t _pad[2];
+    uint32_t reserved[2];
+} we_audio_binding_t;
+static_assert(sizeof(we_audio_binding_t) == 160, "we_audio_binding_t must be exactly 160 bytes");
+
+#pragma pack(pop)
+#endif /* WAYWAL_IPC_PROTO_AUTHORING_H */
+#endif /* WAYWAL_IPC_PROTO_AUTHORING_AUDIO_FALLBACK */
 
 #ifdef __cplusplus
 extern "C" {
@@ -364,6 +467,11 @@ typedef struct we_scene {
     uint64_t sound_rng_state;
     double last_audio_step_time;
 
+    /* Native audio-reactive bindings (zero-allocation per-frame evaluator) */
+    alignas(8) we_audio_binding_t audio_bindings[WE_MAX_AUDIO_BINDINGS];
+    uint32_t audio_binding_count;
+    uint32_t last_audio_bindings_eval_ns;
+
     /* Imported DMA-BUF BO cache (for waywal_we_scene_forget_bo) */
     struct {
         const dmabuf_bo_t *bo;
@@ -386,6 +494,9 @@ typedef struct we_scene {
     uint32_t current_tex2d[WE_MAX_PASS_TEXTURES + 1u];
     uint32_t current_active_unit;
     uint8_t current_depth_cull_bits;
+
+    uint64_t authoring_revision;
+    void (*on_destroy_cb)(const struct we_scene *scene);
 } we_scene_t;
 
 /* Parses project.json from memory or directory */
@@ -451,6 +562,16 @@ void we_scene_set_media_playing(we_scene_t *scene, float playing);
 /* Binds the daemon's audio engine for "sound" layer playback and steps the scene audio mixer */
 void we_scene_set_audio_output(we_scene_t *scene, waywal_audio_fft_t *audio_fft);
 size_t we_scene_step_audio(we_scene_t *scene, float dt_sec);
+
+/* Applies audio-binding mutations (replace_all, upsert, remove, clear) onto scene state */
+bool we_scene_apply_audio_bindings(we_scene_t *scene, we_audio_bind_op_t op,
+                                   const we_audio_binding_t *bindings, uint32_t count,
+                                   uint32_t remove_id);
+
+/* Evaluates all active audio bindings for the current frame with dt-invariant Giannoulis IIR.
+ * Returns the number of enabled bindings evaluated. */
+uint32_t we_scene_step_audio_bindings(we_scene_t *scene, const waywal_audio_frame_t *audio,
+                                      float dt_sec);
 
 /* Rasterizes a "text" object's string into its base_pass texture (CPU + GLES) */
 void we_scene_update_text_texture(we_scene_t *scene, we_scene_object_t *obj);

@@ -29,6 +29,7 @@
             curl
           ];
           pkgRuntimeLibs = with pkgs; [
+            libwebp
             zstd
             libsodium
             curl

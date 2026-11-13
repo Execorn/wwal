@@ -6,6 +6,7 @@
 #include "waywal/shader_graph.h"
 #include "waywal/shader_parser.h"
 #include "waywal/we_compat_scanner.h"
+#include "waywal/we_pkg.h"
 #include "waywal/we_project.h"
 #include "waywal/wwpkg.h"
 
@@ -173,8 +174,8 @@ bool compileWwgraphFileToGlsl(const QString &wwgraphPath, QByteArray &outGlsl, Q
     }
 
     char errBuf[256] = {0};
-    if (!waywal_shader_graph_load_json(jsonBytes.constData(),
-                                       static_cast<size_t>(jsonBytes.size()), graph, errBuf)) {
+    if (!waywal_shader_graph_load_json(jsonBytes.constData(), static_cast<size_t>(jsonBytes.size()),
+                                       graph, errBuf)) {
         waywal_shader_graph_destroy(graph);
         outError = errBuf[0] != '\0' ? QString::fromUtf8(errBuf)
                                      : QStringLiteral("Invalid .wwgraph JSON document.");
@@ -617,6 +618,152 @@ void addPubkeyToTrustedKeys(const QString &pubkeyHex)
     }
 }
 
+bool inspectPkgSummary(const QString &pkgPath, int &outEntryCount, qint64 &outTotalBytes,
+                       QString &outTitle, QString &outType, QString &outEntrypoint,
+                       QString &outPreview)
+{
+    outEntryCount = 0;
+    outTotalBytes = 0;
+    we_pkg_t *pkg = we_pkg_open_file(pkgPath.toUtf8().constData(), nullptr);
+    if (!pkg) {
+        return false;
+    }
+
+    outEntryCount = static_cast<int>(pkg->entry_count);
+    for (uint32_t i = 0; i < pkg->entry_count; ++i) {
+        outTotalBytes += static_cast<qint64>(pkg->entries[i].length);
+    }
+
+    size_t projSz = 0;
+    if (const uint8_t *projData = we_pkg_find(pkg, "project.json", &projSz);
+        projData && projSz > 0) {
+        const QJsonDocument doc = QJsonDocument::fromJson(
+            QByteArray(reinterpret_cast<const char *>(projData), static_cast<qsizetype>(projSz)));
+        if (doc.isObject()) {
+            const QJsonObject obj = doc.object();
+            if (outTitle.isEmpty()) {
+                outTitle = obj.value(QStringLiteral("title")).toString();
+            }
+            if (outType.isEmpty()) {
+                outType = obj.value(QStringLiteral("type")).toString();
+            }
+            if (outEntrypoint.isEmpty()) {
+                outEntrypoint = obj.value(QStringLiteral("file")).toString();
+            }
+            if (outPreview.isEmpty()) {
+                outPreview = obj.value(QStringLiteral("preview")).toString();
+            }
+        }
+    }
+
+    if (outEntrypoint.isEmpty() && we_pkg_find(pkg, "scene.json", nullptr) != nullptr) {
+        outEntrypoint = QStringLiteral("scene.json");
+    }
+
+    we_pkg_close(pkg);
+    return true;
+}
+
+bool unpackPkgIntoStaging(const QString &pkgPath, const QString &stagingRoot)
+{
+    we_pkg_t *pkg = we_pkg_open_file(pkgPath.toUtf8().constData(), nullptr);
+    if (!pkg) {
+        return false;
+    }
+
+    QDir stagingDir(stagingRoot);
+    stagingDir.mkpath(QStringLiteral("."));
+    std::error_code rootEc;
+    const std::filesystem::path canonicalRoot =
+        std::filesystem::weakly_canonical(std::filesystem::path(stagingRoot.toStdString()), rootEc);
+
+    bool ok = (pkg->entry_count > 0);
+    for (uint32_t i = 0; i < pkg->entry_count; ++i) {
+        const we_pkg_entry_t &e = pkg->entries[i];
+        char normPath[WE_PKG_MAX_PATH_LEN + 1];
+        if (!we_pkg_normalize_path(e.path, std::strlen(e.path), normPath, sizeof(normPath))) {
+            ok = false;
+            continue;
+        }
+        const QString rel = QString::fromUtf8(normPath);
+        if (rel.isEmpty()) {
+            continue;
+        }
+        const QString dstPath = stagingDir.filePath(rel);
+        QFileInfo(dstPath).dir().mkpath(QStringLiteral("."));
+        if (!rootEc && !isPathConfinedToRoot(canonicalRoot, dstPath)) {
+            ok = false;
+            continue;
+        }
+        QFile out(dstPath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            ok = false;
+            continue;
+        }
+        if (e.length > 0 && e.data) {
+            const qint64 written =
+                out.write(reinterpret_cast<const char *>(e.data), static_cast<qint64>(e.length));
+            if (written != static_cast<qint64>(e.length)) {
+                ok = false;
+            }
+        }
+        if (!out.flush() || out.error() != QFileDevice::NoError) {
+            ok = false;
+        }
+        out.close();
+    }
+
+    we_pkg_close(pkg);
+    return ok;
+}
+
+bool writeMinimalSceneWrapper(const QDir &staging, const QString &title, const QString &texRelPath)
+{
+    if (!staging.exists(QStringLiteral("scene.json"))) {
+        if (texRelPath.isEmpty() || !staging.exists(texRelPath)) {
+            return false;
+        }
+        QJsonObject texObj;
+        texObj.insert(QStringLiteral("image"), texRelPath);
+        texObj.insert(QStringLiteral("name"), QStringLiteral("Layer 0"));
+        texObj.insert(QStringLiteral("id"), 1);
+        texObj.insert(QStringLiteral("origin"), QStringLiteral("960 540 0"));
+        texObj.insert(QStringLiteral("scale"), QStringLiteral("1 1 1"));
+        texObj.insert(QStringLiteral("size"), QStringLiteral("1920 1080"));
+        QJsonObject sceneObj;
+        sceneObj.insert(QStringLiteral("general"),
+                        QJsonObject{{QStringLiteral("orthogonalprojection"),
+                                     QJsonObject{{QStringLiteral("width"), 1920},
+                                                 {QStringLiteral("height"), 1080}}}});
+        sceneObj.insert(QStringLiteral("objects"), QJsonArray{texObj});
+        QFile sf(staging.filePath(QStringLiteral("scene.json")));
+        if (!sf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return false;
+        }
+        const QByteArray sceneBytes = QJsonDocument(sceneObj).toJson(QJsonDocument::Indented);
+        if (sf.write(sceneBytes) != sceneBytes.size() || !sf.flush()) {
+            return false;
+        }
+        sf.close();
+    }
+    if (!staging.exists(QStringLiteral("project.json"))) {
+        QJsonObject projObj;
+        projObj.insert(QStringLiteral("title"), title);
+        projObj.insert(QStringLiteral("type"), QStringLiteral("scene"));
+        projObj.insert(QStringLiteral("file"), QStringLiteral("scene.json"));
+        QFile pf(staging.filePath(QStringLiteral("project.json")));
+        if (!pf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return false;
+        }
+        const QByteArray projBytes = QJsonDocument(projObj).toJson(QJsonDocument::Indented);
+        if (pf.write(projBytes) != projBytes.size() || !pf.flush()) {
+            return false;
+        }
+        pf.close();
+    }
+    return true;
+}
+
 } // namespace
 
 /* ========================================================================= */
@@ -727,13 +874,15 @@ void SourceIntakePage::setupUi()
     connect(m_browseFileBtn, &QPushButton::clicked, this, [this]() {
         QString file = QFileDialog::getOpenFileName(
             this, QStringLiteral("Select Shader, Graph, or Scene File"), m_sourcePathEdit->text(),
-            QStringLiteral(
-                "All Supported (*.frag *.vert *.comp *.glsl *.wwgraph *.json *.mp4 *.webm *.mkv);;"
-                "Shader Graphs (*.wwgraph);;"
-                "GLSL Shaders (*.frag *.vert *.comp *.glsl);;"
-                "Scene / Project JSON (*.json);;"
-                "Videos (*.mp4 *.webm *.mkv);;"
-                "All Files (*)"));
+            QStringLiteral("All Supported (*.frag *.vert *.comp *.glsl *.wwgraph *.json *.pkg "
+                           "*.tex *.mp4 *.webm *.mkv);;"
+                           "Shader Graphs (*.wwgraph);;"
+                           "GLSL Shaders (*.frag *.vert *.comp *.glsl);;"
+                           "Scene / Project JSON (*.json);;"
+                           "WE Scene Packages (*.pkg);;"
+                           "WE Textures (*.tex);;"
+                           "Videos (*.mp4 *.webm *.mkv);;"
+                           "All Files (*)"));
         if (!file.isEmpty()) {
             m_sourcePathEdit->setText(file);
         }
@@ -864,6 +1013,18 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
             }
         }
 
+        // 1b. Check packed scene.pkg if loose project.json didn't set a pipeline
+        if (m_ctx->entrypointPipeline.isEmpty() && dir.exists(QStringLiteral("scene.pkg"))) {
+            int pkgEntries = 0;
+            qint64 pkgBytes = 0;
+            QString pkgType;
+            if (inspectPkgSummary(dir.filePath(QStringLiteral("scene.pkg")), pkgEntries, pkgBytes,
+                                  m_ctx->detectedTitle, pkgType, m_ctx->entrypointPipeline,
+                                  m_ctx->entrypointPreview)) {
+                m_typeCombo->setCurrentIndex(2); // scene_2d
+            }
+        }
+
         // 2. Check for GLSL shaders and visual shader graphs (.wwgraph)
         if (m_ctx->entrypointPipeline.isEmpty()) {
             if (dir.exists(QStringLiteral("shaders/main.frag"))) {
@@ -990,6 +1151,20 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
                     ? (QStringLiteral("assets/video.") + ext)
                     : QStringLiteral("assets/video.mp4");
         } else if (ext == QStringLiteral("json")) {
+            m_typeCombo->setCurrentIndex(2); // scene_2d
+            m_ctx->entrypointPipeline = QStringLiteral("scene.json");
+        } else if (ext == QStringLiteral("pkg")) {
+            m_typeCombo->setCurrentIndex(2); // scene_2d
+            m_ctx->entrypointPipeline = QStringLiteral("scene.json");
+            QString pkgType;
+            int pkgCount = 0;
+            qint64 pkgBytes = 0;
+            if (inspectPkgSummary(path, pkgCount, pkgBytes, m_ctx->detectedTitle, pkgType,
+                                  m_ctx->entrypointPipeline, m_ctx->entrypointPreview)) {
+                fileCount = std::max(1, pkgCount);
+                totalBytes = std::max(totalBytes, pkgBytes);
+            }
+        } else if (ext == QStringLiteral("tex")) {
             m_typeCombo->setCurrentIndex(2); // scene_2d
             m_ctx->entrypointPipeline = QStringLiteral("scene.json");
         }
@@ -1141,8 +1316,11 @@ void AssetBundlingPage::scanAssets()
                        lower.endsWith(QStringLiteral(".jpeg")) ||
                        lower.endsWith(QStringLiteral(".webp")) ||
                        lower.endsWith(QStringLiteral(".bmp")) ||
-                       lower.endsWith(QStringLiteral(".tga"))) {
+                       lower.endsWith(QStringLiteral(".tga")) ||
+                       lower.endsWith(QStringLiteral(".tex"))) {
                 entry.category = QStringLiteral("texture");
+            } else if (lower.endsWith(QStringLiteral(".pkg"))) {
+                entry.category = QStringLiteral("scene-package");
             } else if (lower.endsWith(QStringLiteral(".mdl")) ||
                        lower.endsWith(QStringLiteral(".glb")) ||
                        lower.endsWith(QStringLiteral(".gltf")) ||
@@ -1190,6 +1368,10 @@ void AssetBundlingPage::scanAssets()
         entry.sizeBytes = srcInfo.size();
         if (m_ctx->projectType == WWPKG_TYPE_VIDEO_STREAM) {
             entry.category = QStringLiteral("video");
+        } else if (srcInfo.suffix().compare(QStringLiteral("pkg"), Qt::CaseInsensitive) == 0) {
+            entry.category = QStringLiteral("scene-package");
+        } else if (srcInfo.suffix().compare(QStringLiteral("tex"), Qt::CaseInsensitive) == 0) {
+            entry.category = QStringLiteral("texture");
         } else if (isScenePackageType(m_ctx->projectType)) {
             entry.category = QStringLiteral("script/data");
         } else {
@@ -1245,6 +1427,13 @@ bool AssetBundlingPage::validatePage()
             }
             QString srcFile = srcDir.filePath(asset.relativePath);
             if (!rootEc && !isPathConfinedToRoot(canonicalRoot, srcFile)) {
+                continue;
+            }
+            if (asset.category == QStringLiteral("scene-package") &&
+                !srcDir.exists(QStringLiteral("scene.json"))) {
+                if (!unpackPkgIntoStaging(srcFile, m_ctx->stagingDir)) {
+                    return false;
+                }
                 continue;
             }
             QString dstFile = staging.filePath(asset.relativePath);
@@ -1320,6 +1509,50 @@ bool AssetBundlingPage::validatePage()
         }
     } else {
         const QString ext = srcInfo.suffix().toLower();
+        if (ext == QStringLiteral("pkg")) {
+            const bool unpacked = unpackPkgIntoStaging(m_ctx->sourcePath, m_ctx->stagingDir);
+            if (!unpacked) {
+                return false;
+            }
+            if (m_ctx->entrypointPipeline.isEmpty()) {
+                m_ctx->entrypointPipeline = QStringLiteral("scene.json");
+            }
+            QString fallbackTex;
+            if (!staging.exists(QStringLiteral("scene.json"))) {
+                if (staging.exists(QStringLiteral("materials/default.tex"))) {
+                    fallbackTex = QStringLiteral("materials/default.tex");
+                } else {
+                    QDirIterator texIt(m_ctx->stagingDir,
+                                       {QStringLiteral("*.tex"), QStringLiteral("*.png"),
+                                        QStringLiteral("*.jpg"), QStringLiteral("*.webp")},
+                                       QDir::Files, QDirIterator::Subdirectories);
+                    if (texIt.hasNext()) {
+                        fallbackTex = staging.relativeFilePath(texIt.next());
+                    }
+                }
+                if (fallbackTex.isEmpty()) {
+                    return false;
+                }
+            }
+            return writeMinimalSceneWrapper(
+                staging,
+                m_ctx->detectedTitle.isEmpty() ? srcInfo.completeBaseName() : m_ctx->detectedTitle,
+                fallbackTex);
+        }
+        if (ext == QStringLiteral("tex")) {
+            const QString texRel = QStringLiteral("materials/") + srcInfo.fileName();
+            const QString texDst = staging.filePath(texRel);
+            QFileInfo(texDst).dir().mkpath(QStringLiteral("."));
+            QFile::remove(texDst);
+            if (!QFile::copy(m_ctx->sourcePath, texDst)) {
+                return false;
+            }
+            m_ctx->entrypointPipeline = QStringLiteral("scene.json");
+            return writeMinimalSceneWrapper(
+                staging,
+                m_ctx->detectedTitle.isEmpty() ? srcInfo.completeBaseName() : m_ctx->detectedTitle,
+                texRel);
+        }
         if (ext == QStringLiteral("wwgraph")) {
             const QString graphDst = staging.filePath(QStringLiteral("shaders/graph.wwgraph"));
             QFileInfo(graphDst).dir().mkpath(QStringLiteral("."));
@@ -1970,9 +2203,10 @@ void CapabilityAuditPage::runCompatibilityAudit()
                 m_ctx->compatScore = 0;
                 m_ctx->estimatedVramMb = 0.0f;
                 m_ctx->estimatedFps = 0;
-                m_ctx->issues.append({QStringLiteral("SHADER_GRAPH_INVALID"), WE_ISSUE_SEV_FATAL,
-                                      graphErr, m_ctx->entrypointPipeline, 0,
-                                      QStringLiteral("Resolve cycle or pin errors in Graph Editor.")});
+                m_ctx->issues.append(
+                    {QStringLiteral("SHADER_GRAPH_INVALID"), WE_ISSUE_SEV_FATAL, graphErr,
+                     m_ctx->entrypointPipeline, 0,
+                     QStringLiteral("Resolve cycle or pin errors in Graph Editor.")});
             }
         }
         if (!graphAuditFailed) {

@@ -317,7 +317,7 @@ static void test_seed_only_package_signing(const char *base_tmp)
 {
     printf("[WWPKG 3/9] Testing 32-byte seed-only wwpkg_build_package -> verify round-trip...\n");
 
-    char src_dir[256], pkg_path[256], frag_path[256], prev_path[256];
+    char src_dir[256], pkg_path[512], frag_path[512], prev_path[512];
     snprintf(src_dir, sizeof(src_dir), "%s/seed_src", base_tmp);
     snprintf(pkg_path, sizeof(pkg_path), "%s/seed_pkg.wwpkg", base_tmp);
     snprintf(frag_path, sizeof(frag_path), "%s/shader.frag", src_dir);
@@ -410,7 +410,7 @@ static void test_merkle_path_swap_rejection(const char *base_tmp, const uint8_t 
     wwpkg_sha256(node_in, sizeof(node_in), h_node);
     assert(memcmp(h_leaf, h_node, 32) != 0);
 
-    char src_dir[256], pkg_path[256], path_a[256], path_b[256], path_prev[256];
+    char src_dir[256], pkg_path[512], path_a[512], path_b[512], path_prev[512];
     snprintf(src_dir, sizeof(src_dir), "%s/swap_src", base_tmp);
     snprintf(pkg_path, sizeof(pkg_path), "%s/swap_pkg.wwpkg", base_tmp);
     snprintf(path_a, sizeof(path_a), "%s/a.frag", src_dir);
@@ -696,7 +696,7 @@ static void test_tar_hardening_and_symlink_rejection(const char *base_tmp,
     unlink(long_file);
 
     /* 4. Symlink inside source_dir must be rejected (lstat + O_NOFOLLOW) */
-    char frag_path[256], sym_path[256];
+    char frag_path[512], sym_path[512];
     snprintf(frag_path, sizeof(frag_path), "%s/shader.frag", src_dir);
     snprintf(sym_path, sizeof(sym_path), "%s/leak.txt", src_dir);
     write_file_bytes(frag_path, "void main(){}", 13);
@@ -782,7 +782,7 @@ static void test_rfc8785_jcs_hardening_and_locale(const char *base_tmp, const ui
     free(canon);
 
     /* JSON-escaping of special characters inside manifest strings */
-    char src_dir[256], pkg_path[256], frag_path[256], prev_path[256];
+    char src_dir[256], pkg_path[512], frag_path[512], prev_path[512];
     snprintf(src_dir, sizeof(src_dir), "%s/esc_src", base_tmp);
     snprintf(pkg_path, sizeof(pkg_path), "%s/esc_pkg.wwpkg", base_tmp);
     snprintf(frag_path, sizeof(frag_path), "%s/shader.frag", src_dir);
@@ -829,7 +829,7 @@ static void test_trust_store_and_notary(const char *base_tmp)
     bytes_to_hex(author_pk, 32, author_hex);
     bytes_to_hex(notary_pk, 32, notary_hex);
 
-    char src_dir[256], pkg_path[256], frag_path[256], prev_path[256], store_path[256];
+    char src_dir[256], pkg_path[512], frag_path[512], prev_path[512], store_path[512];
     snprintf(src_dir, sizeof(src_dir), "%s/trust_src", base_tmp);
     snprintf(pkg_path, sizeof(pkg_path), "%s/trust_pkg.wwpkg", base_tmp);
     snprintf(frag_path, sizeof(frag_path), "%s/shader.frag", src_dir);
@@ -917,8 +917,8 @@ static void test_dual_frame_metadata_fastpath_and_extract(const char *base_tmp,
 {
     printf("[WWPKG 8/9] Benchmarking Dual-Frame wwpkg_open_metadata_only (< 60 us)...\n");
 
-    char src_dir[256], assets_dir[256], pkg_path[256], frag_path[256], prev_path[256],
-        bulk_path[256], ext_dir[256];
+    char src_dir[256], assets_dir[512], pkg_path[512], frag_path[512], prev_path[512],
+        bulk_path[768], ext_dir[256];
     snprintf(src_dir, sizeof(src_dir), "%s/df_src", base_tmp);
     snprintf(assets_dir, sizeof(assets_dir), "%s/assets", src_dir);
     snprintf(pkg_path, sizeof(pkg_path), "%s/dual_frame_4mb.wwpkg", base_tmp);
@@ -1077,7 +1077,7 @@ static void test_dual_frame_metadata_fastpath_and_extract(const char *base_tmp,
     assert(lseek(fd, 0, SEEK_CUR) >= 0 && "wwpkg_open_fd must not close caller's fd");
     close(fd);
 
-    char ext_frag[256], ext_prev[256], ext_bulk[256], ext_sub[256];
+    char ext_frag[512], ext_prev[512], ext_bulk[512], ext_sub[512];
     snprintf(ext_frag, sizeof(ext_frag), "%s/shader.frag", ext_dir);
     snprintf(ext_prev, sizeof(ext_prev), "%s/preview.webp", ext_dir);
     snprintf(ext_sub, sizeof(ext_sub), "%s/assets", ext_dir);
@@ -1109,7 +1109,7 @@ static void test_cold_open_and_1bit_tamper(const char *base_tmp, const uint8_t p
 {
     printf("[WWPKG 9/9] Benchmarking cold full open & 1-bit payload tamper rejection...\n");
 
-    char src_dir[256], pkg_path[256], frag_path[256], prev_path[256], cfg_path[256];
+    char src_dir[256], pkg_path[512], frag_path[512], prev_path[512], cfg_path[512];
     snprintf(src_dir, sizeof(src_dir), "%s/full_src", base_tmp);
     snprintf(pkg_path, sizeof(pkg_path), "%s/neon_fractal.wwpkg", base_tmp);
     snprintf(frag_path, sizeof(frag_path), "%s/shader.frag", src_dir);
@@ -1198,7 +1198,7 @@ static void test_promotion_retention_toctou_and_confinement(const char *base_tmp
         big_prev[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
     }
 
-    char p1_frag[256], p1_prev[256], p2_frag[256], p2_prev[256];
+    char p1_frag[512], p1_prev[512], p2_frag[512], p2_prev[512];
     snprintf(p1_frag, sizeof(p1_frag), "%s/shader.frag", src1);
     snprintf(p1_prev, sizeof(p1_prev), "%s/preview.webp", src1);
     snprintf(p2_frag, sizeof(p2_frag), "%s/shader.frag", src2);
@@ -1271,7 +1271,7 @@ static void test_promotion_retention_toctou_and_confinement(const char *base_tmp
 
     /* 2b. Large (>64 KiB) preview.webp in Frame 1 tampered after metadata-only open:
      * wwpkg_extract_all must reject and leave dest_dir completely empty. */
-    char f1p_src[256], f1p_frag[256], f1p_prev[256], f1p_pkg_path[256];
+    char f1p_src[256], f1p_frag[512], f1p_prev[512], f1p_pkg_path[512];
     snprintf(f1p_src, sizeof(f1p_src), "%s/f1prev_src", base_tmp);
     snprintf(f1p_frag, sizeof(f1p_frag), "%s/shader.frag", f1p_src);
     snprintf(f1p_prev, sizeof(f1p_prev), "%s/preview.webp", f1p_src);
@@ -1382,7 +1382,7 @@ static void test_promotion_retention_toctou_and_confinement(const char *base_tmp
     unlink(empty_path);
 
     /* 5. Streaming confined wwpkg_extract_all: nested mkdir -p + hardlink & FIFO immunity */
-    char nested_dest[256], victim_path[256], hardlink_dest[256], fifo_dest[256];
+    char nested_dest[256], victim_path[512], hardlink_dest[512], fifo_dest[512];
     snprintf(nested_dest, sizeof(nested_dest), "%s/nested/a/b", base_tmp);
     snprintf(victim_path, sizeof(victim_path), "%s/external_victim.txt", base_tmp);
     const char *orig_victim = "IMMUTABLE_HOST_SECRET";
@@ -1414,7 +1414,7 @@ static void test_promotion_retention_toctou_and_confinement(const char *base_tmp
     struct stat pst;
     assert(lstat(fifo_dest, &pst) == 0 && S_ISREG(pst.st_mode));
 
-    char mf_dest[256], sig_dest[256];
+    char mf_dest[512], sig_dest[512];
     snprintf(mf_dest, sizeof(mf_dest), "%s/manifest.json", nested_dest);
     snprintf(sig_dest, sizeof(sig_dest), "%s/signature.sig", nested_dest);
     assert(unlink(hardlink_dest) == 0);

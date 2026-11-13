@@ -17,6 +17,7 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QMouseEvent>
+#include <functional>
 
 #ifdef HAVE_QT_ADS
 #include <DockManager.h>
@@ -107,8 +108,15 @@ class DockLayoutManager : public QObject {
     ~DockLayoutManager() override;
 
     // Panel Registration
+    using LazyWidgetFactory = std::function<QWidget *(QWidget *parent)>;
+
     void registerPanel(const QString &id, QWidget *widget, const QString &title,
                        Qt::DockWidgetArea defaultArea = Qt::LeftDockWidgetArea);
+    void registerLazyPanel(const QString &id, const QString &title, LazyWidgetFactory factory,
+                           Qt::DockWidgetArea defaultArea = Qt::LeftDockWidgetArea);
+    bool isPanelRealized(const QString &id) const;
+    QWidget *realizeLazyPanel(const QString &id);
+    [[nodiscard]] bool isApplyingLayout() const noexcept { return m_applyingLayout; }
     void unregisterPanel(const QString &id);
     StudioDockWidget *dockWidget(const QString &id) const;
     QWidget *panelWidget(const QString &id) const;
@@ -145,6 +153,8 @@ class DockLayoutManager : public QObject {
     // Built-in Perspective Trees
     static QJsonObject createDefaultPerspectiveTree();
     static QJsonObject createShaderCodingPerspectiveTree();
+    static QJsonObject createSceneComposerPerspectiveTree();
+    static QJsonObject createParticleAudioPerspectiveTree();
     static QJsonObject createThemeStudioPerspectiveTree();
     static QJsonObject createMultiMonitorPerspectiveTree();
 
@@ -152,6 +162,7 @@ class DockLayoutManager : public QObject {
     void perspectiveChanged(const QString &perspectiveName);
     void layoutChanged();
     void panelVisibilityChanged(const QString &panelId, bool visible);
+    void panelRealized(const QString &panelId, QWidget *widget);
 
   protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -166,12 +177,14 @@ class DockLayoutManager : public QObject {
                            QList<QDockWidget *> &horizDocks, QList<int> &horizSizes);
     int computeSubtreeSpan(const QJsonObject &node, Qt::Orientation orient) const;
     void syncLiveRatiosFromGeometry(QJsonObject &node) const;
+    QJsonObject normalizeTreeAliases(const QJsonObject &node) const;
     QDockWidget *layoutSubtree(const QJsonObject &node, Qt::Orientation parentOrientation);
     void collectDocksInTree(const QJsonObject &node, QSet<QString> &outIds);
     void setupDefaultPerspectives();
 
     QMainWindow *m_mainWindow{nullptr};
     QMap<QString, StudioDockWidget *> m_docks;
+    QMap<QString, QWidget *> m_lazyHosts;
     QMap<QString, QString> m_aliases;
     QMap<QString, QJsonObject> m_perspectives;
     QString m_activePerspective{"Default"};

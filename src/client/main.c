@@ -32,6 +32,26 @@
 #include <time.h>
 #include <unistd.h>
 
+static void client_copy_cstr(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0)
+        return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    if (dst == src) {
+        dst[cap - 1] = '\0';
+        return;
+    }
+    size_t i = 0;
+    while (i + 1 < cap && src[i] != '\0') {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
 static bool argv_has_flag(int argc, char *argv[], const char *flag)
 {
     size_t flen = strlen(flag);
@@ -61,8 +81,8 @@ static void apply_config_defaults_to_cli(int argc, char *argv[], const waywal_co
     if (!has_env_ns && !argv_has_flag(argc, argv, "-n") &&
         !argv_has_flag(argc, argv, "--namespace") && cfg->daemon.namespace_str[0] != '\0' &&
         strcmp(cfg->daemon.namespace_str, "waywal") != 0) {
-        strncpy(opts->namespace_str, cfg->daemon.namespace_str, sizeof(opts->namespace_str) - 1);
-        opts->namespace_str[sizeof(opts->namespace_str) - 1] = '\0';
+        client_copy_cstr(opts->namespace_str, sizeof(opts->namespace_str),
+                         cfg->daemon.namespace_str);
     }
 
     if (!opts->has_transition_type && !argv_has_flag(argc, argv, "--transition-type") &&
@@ -260,10 +280,10 @@ static bool extract_palette_from_bgra(const uint8_t *bgra_pixels, uint32_t width
     } else if (wallpaper_path && wallpaper_path[0] != '\0') {
         char resolved_wp[PATH_MAX];
         if (realpath(wallpaper_path, resolved_wp)) {
-            snprintf(out_pal->wallpaper_path, sizeof(out_pal->wallpaper_path), "%s", resolved_wp);
+            client_copy_cstr(out_pal->wallpaper_path, sizeof(out_pal->wallpaper_path), resolved_wp);
         } else {
-            snprintf(out_pal->wallpaper_path, sizeof(out_pal->wallpaper_path), "%s",
-                     wallpaper_path);
+            client_copy_cstr(out_pal->wallpaper_path, sizeof(out_pal->wallpaper_path),
+                             wallpaper_path);
         }
     }
     return true;
@@ -937,8 +957,7 @@ static bool resolve_theme_default_wallpaper(char *out_path, size_t cap)
         for (uint32_t i = 0; i < st.count; ++i) {
             if (st.outputs[i].media_path[0] != '\0' &&
                 access(st.outputs[i].media_path, R_OK) == 0) {
-                strncpy(out_path, st.outputs[i].media_path, cap - 1);
-                out_path[cap - 1] = '\0';
+                client_copy_cstr(out_path, cap, st.outputs[i].media_path);
                 return true;
             }
         }
@@ -949,15 +968,13 @@ static bool resolve_theme_default_wallpaper(char *out_path, size_t cap)
         path_buf_t cur_link = cache_root;
         if (path_buf_push(&cur_link, "current_wallpaper") &&
             access(path_buf_cstr(&cur_link), R_OK) == 0) {
-            strncpy(out_path, path_buf_cstr(&cur_link), cap - 1);
-            out_path[cap - 1] = '\0';
+            client_copy_cstr(out_path, cap, path_buf_cstr(&cur_link));
             return true;
         }
         path_buf_t cur_png = cache_root;
         if (path_buf_push(&cur_png, "current_wallpaper.png") &&
             access(path_buf_cstr(&cur_png), R_OK) == 0) {
-            strncpy(out_path, path_buf_cstr(&cur_png), cap - 1);
-            out_path[cap - 1] = '\0';
+            client_copy_cstr(out_path, cap, path_buf_cstr(&cur_png));
             return true;
         }
     }
@@ -972,8 +989,7 @@ static int handle_cmd_theme(const cli_options_t *opts, const waywal_config_t *cf
     bool has_seed_ovr = (opts && opts->has_seed_color) || (cfg && cfg->theme.has_seed_color);
 
     if (opts->filepath[0] != '\0') {
-        strncpy(target_path, opts->filepath, sizeof(target_path) - 1);
-        target_path[sizeof(target_path) - 1] = '\0';
+        client_copy_cstr(target_path, sizeof(target_path), opts->filepath);
     } else if (!resolve_theme_default_wallpaper(target_path, sizeof(target_path)) &&
                !has_seed_ovr) {
         fprintf(stderr, "Error: No image path specified and no active wallpaper found in state.\n");
@@ -1326,8 +1342,7 @@ static size_t collect_active_namespaces(const cli_options_t *opts, char out_ns[1
         return 0;
     }
     if (!opts->all_namespaces) {
-        strncpy(out_ns[0], opts->namespace_str, 63);
-        out_ns[0][63] = '\0';
+        client_copy_cstr(out_ns[0], 64, opts->namespace_str);
         return 1;
     }
 
@@ -1381,8 +1396,7 @@ static size_t collect_active_namespaces(const cli_options_t *opts, char out_ns[1
                 }
             }
             if (!dup && waywal_ipc_namespace_is_alive(cand)) {
-                strncpy(out_ns[count], cand, 63);
-                out_ns[count][63] = '\0';
+                client_copy_cstr(out_ns[count], 64, cand);
                 count++;
             }
         }
@@ -1390,8 +1404,7 @@ static size_t collect_active_namespaces(const cli_options_t *opts, char out_ns[1
     }
 
     if (count == 0) {
-        strncpy(out_ns[0], opts->namespace_str, 63);
-        out_ns[0][63] = '\0';
+        client_copy_cstr(out_ns[0], 64, opts->namespace_str);
         return 1;
     }
     return count;
@@ -1934,10 +1947,10 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
             for (size_t j = i + 1; j < list.count; ++j) {
                 if (strcmp(list.items[i].display_label, list.items[j].display_label) == 0) {
                     dup_idx++;
-                    char base_label[480];
-                    snprintf(base_label, sizeof(base_label), "%s", list.items[j].display_label);
+                    char base_label[512];
+                    client_copy_cstr(base_label, sizeof(base_label), list.items[j].display_label);
                     snprintf(list.items[j].display_label, sizeof(list.items[j].display_label),
-                             "%s #%zu", base_label, dup_idx);
+                             "%.480s #%zu", base_label, dup_idx);
                 }
             }
         }
@@ -2199,7 +2212,7 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
 
     if (!selected_target) {
         char clean_sel[1024];
-        snprintf(clean_sel, sizeof(clean_sel), "%s", sel_buf);
+        client_copy_cstr(clean_sel, sizeof(clean_sel), sel_buf);
         size_t clen = strlen(clean_sel);
         while (clen > 0 && (clean_sel[clen - 1] == '\n' || clean_sel[clen - 1] == '\r' ||
                             clean_sel[clen - 1] == ' ')) {
@@ -2410,10 +2423,14 @@ int main(int argc, char *argv[])
         }
 
         if (strcasecmp(proj.type, "video") == 0 && proj.file[0] != '\0') {
-            snprintf(opts.filepath, sizeof(opts.filepath), "%s/%s", resolved_dir, proj.file);
+            int n =
+                snprintf(opts.filepath, sizeof(opts.filepath), "%s/%s", resolved_dir, proj.file);
+            if (n < 0 || (size_t)n >= sizeof(opts.filepath)) {
+                opts.filepath[sizeof(opts.filepath) - 1] = '\0';
+            }
             opts.cmd = CLI_CMD_VIDEO;
         } else {
-            snprintf(opts.filepath, sizeof(opts.filepath), "%s", resolved_dir);
+            client_copy_cstr(opts.filepath, sizeof(opts.filepath), resolved_dir);
         }
     }
 
@@ -2493,8 +2510,7 @@ int main(int argc, char *argv[])
         bool vid_ok = false;
         if (opts.no_cache) {
             if (!is_gif) {
-                strncpy(effective_video_path, opts.filepath, sizeof(effective_video_path) - 1);
-                effective_video_path[sizeof(effective_video_path) - 1] = '\0';
+                client_copy_cstr(effective_video_path, sizeof(effective_video_path), opts.filepath);
                 vid_ok = true;
             }
         } else {
@@ -2961,9 +2977,9 @@ int main(int argc, char *argv[])
             vpay->mute_on_audio = (opts.mute_on_audio == 1);
             char resolved_vid[PATH_MAX];
             if (realpath(effective_video_path, resolved_vid)) {
-                strncpy(vpay->filepath, resolved_vid, sizeof(vpay->filepath) - 1);
+                client_copy_cstr(vpay->filepath, sizeof(vpay->filepath), resolved_vid);
             } else {
-                strncpy(vpay->filepath, effective_video_path, sizeof(vpay->filepath) - 1);
+                client_copy_cstr(vpay->filepath, sizeof(vpay->filepath), effective_video_path);
             }
 
             char *optr = (char *)video_buf + sizeof(waywal_video_payload_t);
@@ -3159,21 +3175,21 @@ int main(int argc, char *argv[])
             if (opts.depth_map_path[0] != '\0') {
                 char resolved_dm[PATH_MAX];
                 if (realpath(opts.depth_map_path, resolved_dm)) {
-                    strncpy(meta.depth_map_path, resolved_dm, sizeof(meta.depth_map_path) - 1);
+                    client_copy_cstr(meta.depth_map_path, sizeof(meta.depth_map_path), resolved_dm);
                 } else {
-                    strncpy(meta.depth_map_path, opts.depth_map_path,
-                            sizeof(meta.depth_map_path) - 1);
+                    client_copy_cstr(meta.depth_map_path, sizeof(meta.depth_map_path),
+                                     opts.depth_map_path);
                 }
             }
-            strncpy(meta.backdrop, opts.backdrop, sizeof(meta.backdrop) - 1);
-            strncpy(meta.layer_name, opts.layer_name, sizeof(meta.layer_name) - 1);
-            strncpy(meta.battery_policy, opts.battery_policy, sizeof(meta.battery_policy) - 1);
+            client_copy_cstr(meta.backdrop, sizeof(meta.backdrop), opts.backdrop);
+            client_copy_cstr(meta.layer_name, sizeof(meta.layer_name), opts.layer_name);
+            client_copy_cstr(meta.battery_policy, sizeof(meta.battery_policy), opts.battery_policy);
             if (!opts.read_stdin && !opts.is_solid_color && opts.filepath[0] != '\0') {
                 char resolved_img[PATH_MAX];
                 if (realpath(opts.filepath, resolved_img)) {
-                    strncpy(meta.filepath, resolved_img, sizeof(meta.filepath) - 1);
+                    client_copy_cstr(meta.filepath, sizeof(meta.filepath), resolved_img);
                 } else {
-                    strncpy(meta.filepath, opts.filepath, sizeof(meta.filepath) - 1);
+                    client_copy_cstr(meta.filepath, sizeof(meta.filepath), opts.filepath);
                 }
             }
             meta.depth_strength = opts.depth_strength > 0.0f ? opts.depth_strength : 1.0f;
@@ -3263,8 +3279,8 @@ int main(int argc, char *argv[])
             spay.random_order = opts.slideshow_random;
             spay.num_target_outputs = opts.num_outputs;
             for (uint32_t i = 0; i < opts.num_outputs && i < 16; ++i) {
-                strncpy(spay.target_outputs[i], opts.outputs[i],
-                        sizeof(spay.target_outputs[i]) - 1);
+                client_copy_cstr(spay.target_outputs[i], sizeof(spay.target_outputs[i]),
+                                 opts.outputs[i]);
             }
             spay.scaling_mode = opts.scaling_mode;
             spay.filter_mode = (uint32_t)opts.filter;
@@ -3309,9 +3325,9 @@ int main(int argc, char *argv[])
             spay.solar_longitude = opts.solar_longitude;
             char resolved_ss[PATH_MAX];
             if (realpath(opts.filepath, resolved_ss)) {
-                strncpy(spay.path, resolved_ss, sizeof(spay.path) - 1);
+                client_copy_cstr(spay.path, sizeof(spay.path), resolved_ss);
             } else {
-                strncpy(spay.path, opts.filepath, sizeof(spay.path) - 1);
+                client_copy_cstr(spay.path, sizeof(spay.path), opts.filepath);
             }
 
             req_hdr.opcode = WAYWAL_REQ_SLIDESHOW;
@@ -3353,7 +3369,7 @@ int main(int argc, char *argv[])
                     pos += (size_t)n;
                 }
             } else {
-                strncpy(sctrl.target_output, "*", sizeof(sctrl.target_output) - 1);
+                client_copy_cstr(sctrl.target_output, sizeof(sctrl.target_output), "*");
             }
 
             if (opts.slideshow_action == WAYWAL_SLIDESHOW_NEXT) {
@@ -3424,14 +3440,14 @@ int main(int argc, char *argv[])
                     pos += (size_t)n;
                 }
             } else {
-                strncpy(spay.output, "*", sizeof(spay.output) - 1);
+                client_copy_cstr(spay.output, sizeof(spay.output), "*");
             }
 
             char resolved[PATH_MAX];
             if (realpath(opts.filepath, resolved)) {
-                strncpy(spay.shader_path, resolved, sizeof(spay.shader_path) - 1);
+                client_copy_cstr(spay.shader_path, sizeof(spay.shader_path), resolved);
             } else {
-                strncpy(spay.shader_path, opts.filepath, sizeof(spay.shader_path) - 1);
+                client_copy_cstr(spay.shader_path, sizeof(spay.shader_path), opts.filepath);
             }
             spay.fps = opts.transition_fps > 0 ? opts.transition_fps : 60;
             spay.audio_reactive = opts.audio_reactive;
@@ -3452,8 +3468,7 @@ int main(int argc, char *argv[])
             spay.volume = opts.volume;
             spay.mute_on_audio = (opts.mute_on_audio == 1);
             spay.speed = opts.video_speed;
-            strncpy(spay.backdrop, opts.backdrop, sizeof(spay.backdrop) - 1);
-            spay.backdrop[sizeof(spay.backdrop) - 1] = '\0';
+            client_copy_cstr(spay.backdrop, sizeof(spay.backdrop), opts.backdrop);
 
             req_hdr.opcode = WAYWAL_REQ_SHADER;
             req_hdr.payload_size = sizeof(spay);
@@ -3500,11 +3515,11 @@ int main(int argc, char *argv[])
                     pos += (size_t)n;
                 }
             } else {
-                strncpy(wpay.output, "*", sizeof(wpay.output) - 1);
+                client_copy_cstr(wpay.output, sizeof(wpay.output), "*");
             }
 
-            strncpy(wpay.workshop_dir, opts.filepath, sizeof(wpay.workshop_dir) - 1);
-            strncpy(wpay.prop_overrides, opts.workshop_props, sizeof(wpay.prop_overrides) - 1);
+            client_copy_cstr(wpay.workshop_dir, sizeof(wpay.workshop_dir), opts.filepath);
+            client_copy_cstr(wpay.prop_overrides, sizeof(wpay.prop_overrides), opts.workshop_props);
             wpay.fps = opts.transition_fps > 0 ? opts.transition_fps : 60;
             wpay.audio_reactive = opts.audio_reactive;
             wpay.scaling_mode = opts.scaling_mode;
@@ -3532,10 +3547,8 @@ int main(int argc, char *argv[])
             wpay.seed_color = opts.seed_color;
             wpay.volume = opts.volume;
             wpay.mute_on_audio = (opts.mute_on_audio == 1);
-            strncpy(wpay.backdrop, opts.backdrop, sizeof(wpay.backdrop) - 1);
-            wpay.backdrop[sizeof(wpay.backdrop) - 1] = '\0';
-            strncpy(wpay.layer_name, opts.layer_name, sizeof(wpay.layer_name) - 1);
-            wpay.layer_name[sizeof(wpay.layer_name) - 1] = '\0';
+            client_copy_cstr(wpay.backdrop, sizeof(wpay.backdrop), opts.backdrop);
+            client_copy_cstr(wpay.layer_name, sizeof(wpay.layer_name), opts.layer_name);
 
             req_hdr.opcode = WAYWAL_REQ_WORKSHOP;
             req_hdr.payload_size = sizeof(wpay);
@@ -3607,9 +3620,9 @@ int main(int argc, char *argv[])
                     pos += (size_t)n;
                 }
             } else {
-                strncpy(upay.output, "*", sizeof(upay.output) - 1);
+                client_copy_cstr(upay.output, sizeof(upay.output), "*");
             }
-            strncpy(upay.name, opts.uniform_name, sizeof(upay.name) - 1);
+            client_copy_cstr(upay.name, sizeof(upay.name), opts.uniform_name);
             for (uint32_t i = 0; i < opts.uniform_components && i < 4; ++i) {
                 upay.values[i] = opts.uniform_values[i];
             }

@@ -597,11 +597,12 @@ bool slideshow_rescan(slideshow_engine_t *ss)
     prev_path[0] = '\0';
     if (ss->file_list && ss->current_file_idx < ss->num_files &&
         ss->file_list[ss->current_file_idx]) {
-        strncpy(prev_path, ss->file_list[ss->current_file_idx], sizeof(prev_path) - 1);
-        prev_path[sizeof(prev_path) - 1] = '\0';
+        const char *cur = ss->file_list[ss->current_file_idx];
+        size_t plen = strnlen(cur, sizeof(prev_path) - 1);
+        memcpy(prev_path, cur, plen);
+        prev_path[plen] = '\0';
         if (ss->last_played_path[0] == '\0') {
-            strncpy(ss->last_played_path, prev_path, sizeof(ss->last_played_path) - 1);
-            ss->last_played_path[sizeof(ss->last_played_path) - 1] = '\0';
+            memcpy(ss->last_played_path, prev_path, plen + 1);
         }
     }
 
@@ -642,7 +643,9 @@ bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *p
         return false;
 
     memset(ss->root_path, 0, sizeof(ss->root_path));
-    strncpy(ss->root_path, payload->path, sizeof(ss->root_path) - 1);
+    size_t rlen = strnlen(payload->path, sizeof(ss->root_path) - 1);
+    memcpy(ss->root_path, payload->path, rlen);
+    ss->root_path[rlen] = '\0';
     ss->recursive = (payload->no_recursive == 0);
     ss->random_order = payload->random_order;
     bool explicit_sort =

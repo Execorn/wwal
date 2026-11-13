@@ -17,6 +17,26 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+static void mpris_copy_cstr(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0)
+        return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    if (dst == src) {
+        dst[cap - 1] = '\0';
+        return;
+    }
+    size_t i = 0;
+    while (i + 1 < cap && src[i] != '\0') {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
 typedef struct sd_bus sd_bus;
 typedef struct sd_bus_message sd_bus_message;
 typedef struct sd_bus_slot sd_bus_slot;
@@ -286,8 +306,7 @@ static void update_album_art_from_url(waywal_mpris_t *mpris, const char *new_art
     if (!ok || !raw.data || raw.width == 0 || raw.height == 0)
         return;
 
-    strncpy(mpris->meta.art_local_path, local_path, sizeof(mpris->meta.art_local_path) - 1);
-    mpris->meta.art_local_path[sizeof(mpris->meta.art_local_path) - 1] = '\0';
+    mpris_copy_cstr(mpris->meta.art_local_path, sizeof(mpris->meta.art_local_path), local_path);
     mpris->meta.art_bgra = raw.data;
     mpris->meta.art_rgba = NULL;
     mpris->meta.art_w = raw.width;
@@ -777,14 +796,10 @@ static bool parse_player_properties_dict_into_slot(waywal_mpris_t *mpris, mpris_
             if (parse_mpris_metadata_dict(mpris, m, new_title, new_artist, new_album, new_art_url,
                                           &new_length)) {
                 relevant = true;
-                strncpy(slot->title, new_title, sizeof(slot->title) - 1);
-                slot->title[sizeof(slot->title) - 1] = '\0';
-                strncpy(slot->artist, new_artist, sizeof(slot->artist) - 1);
-                slot->artist[sizeof(slot->artist) - 1] = '\0';
-                strncpy(slot->album, new_album, sizeof(slot->album) - 1);
-                slot->album[sizeof(slot->album) - 1] = '\0';
-                strncpy(slot->art_url, new_art_url, sizeof(slot->art_url) - 1);
-                slot->art_url[sizeof(slot->art_url) - 1] = '\0';
+                mpris_copy_cstr(slot->title, sizeof(slot->title), new_title);
+                mpris_copy_cstr(slot->artist, sizeof(slot->artist), new_artist);
+                mpris_copy_cstr(slot->album, sizeof(slot->album), new_album);
+                mpris_copy_cstr(slot->art_url, sizeof(slot->art_url), new_art_url);
                 slot->length_us = new_length;
             }
         } else {
@@ -1138,26 +1153,15 @@ void waywal_mpris_inject_state_for_test(waywal_mpris_t *mpris, const waywal_mpri
         mpris->meta.status = WAYWAL_MPRIS_STOPPED;
     }
 
-    if (state->playback_status[0] != '\0') {
-        strncpy(mpris->meta.playback_status, state->playback_status,
-                sizeof(mpris->meta.playback_status) - 1);
-    } else {
-        strncpy(mpris->meta.playback_status, mpris->meta.playing ? "Playing" : "Stopped",
-                sizeof(mpris->meta.playback_status) - 1);
-    }
-    mpris->meta.playback_status[sizeof(mpris->meta.playback_status) - 1] = '\0';
+    mpris_copy_cstr(mpris->meta.playback_status, sizeof(mpris->meta.playback_status),
+                    state->playback_status[0] != '\0'
+                        ? state->playback_status
+                        : (mpris->meta.playing ? "Playing" : "Stopped"));
 
-    strncpy(mpris->meta.player_name, state->player_name, sizeof(mpris->meta.player_name) - 1);
-    mpris->meta.player_name[sizeof(mpris->meta.player_name) - 1] = '\0';
-
-    strncpy(mpris->meta.title, state->title, sizeof(mpris->meta.title) - 1);
-    mpris->meta.title[sizeof(mpris->meta.title) - 1] = '\0';
-
-    strncpy(mpris->meta.artist, state->artist, sizeof(mpris->meta.artist) - 1);
-    mpris->meta.artist[sizeof(mpris->meta.artist) - 1] = '\0';
-
-    strncpy(mpris->meta.album, state->album, sizeof(mpris->meta.album) - 1);
-    mpris->meta.album[sizeof(mpris->meta.album) - 1] = '\0';
+    mpris_copy_cstr(mpris->meta.player_name, sizeof(mpris->meta.player_name), state->player_name);
+    mpris_copy_cstr(mpris->meta.title, sizeof(mpris->meta.title), state->title);
+    mpris_copy_cstr(mpris->meta.artist, sizeof(mpris->meta.artist), state->artist);
+    mpris_copy_cstr(mpris->meta.album, sizeof(mpris->meta.album), state->album);
 
     mpris->meta.length_us = state->length_us;
     mpris->metadata_changed = true;
@@ -1222,14 +1226,10 @@ void waywal_mpris_update_player_for_test(waywal_mpris_t *mpris, const char *bus_
         slot->length_us = 0;
     } else if (state->title[0] != '\0' || state->artist[0] != '\0' || state->album[0] != '\0' ||
                state->art_url[0] != '\0' || state->length_us != 0) {
-        strncpy(slot->title, state->title, sizeof(slot->title) - 1);
-        slot->title[sizeof(slot->title) - 1] = '\0';
-        strncpy(slot->artist, state->artist, sizeof(slot->artist) - 1);
-        slot->artist[sizeof(slot->artist) - 1] = '\0';
-        strncpy(slot->album, state->album, sizeof(slot->album) - 1);
-        slot->album[sizeof(slot->album) - 1] = '\0';
-        strncpy(slot->art_url, state->art_url, sizeof(slot->art_url) - 1);
-        slot->art_url[sizeof(slot->art_url) - 1] = '\0';
+        mpris_copy_cstr(slot->title, sizeof(slot->title), state->title);
+        mpris_copy_cstr(slot->artist, sizeof(slot->artist), state->artist);
+        mpris_copy_cstr(slot->album, sizeof(slot->album), state->album);
+        mpris_copy_cstr(slot->art_url, sizeof(slot->art_url), state->art_url);
         slot->length_us = state->length_us;
     }
 

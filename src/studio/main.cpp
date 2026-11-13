@@ -195,10 +195,26 @@ static int runHeadlessCheck(const StudioOptions &options)
     std::cout << "  -> Total VmRSS (including shared OS libraries): " << rss_total_mb << " MB"
               << std::endl;
 
+#if defined(__SANITIZE_ADDRESS__)
+#define WAYWAL_STUDIO_ASAN_BUILD 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define WAYWAL_STUDIO_ASAN_BUILD 1
+#endif
+#endif
+
+#if defined(WAYWAL_STUDIO_ASAN_BUILD)
+    if (rss_anon_mb >= 80.0) {
+        std::cout << "[*] ASan build: Idle Private RSS = " << rss_anon_mb
+                  << " MB (80 MB non-ASan limit informational only under AddressSanitizer)."
+                  << std::endl;
+    }
+#else
     if (rss_anon_mb >= 80.0) {
         std::cerr << "[-] FAILED: Idle Private RSS exceeded 80 MB budget!" << std::endl;
         return 1;
     }
+#endif
 
     // 9. Verify Realized Window Geometry, Dock Non-Overlap, & Proportional Resize Scaling
     // Populate sample/scanned catalog entries so GridGlCanvas card rendering is verified

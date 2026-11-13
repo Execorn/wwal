@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <limits.h>
 #include <pwd.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -476,17 +477,29 @@ static bool try_stat_regular_shader(const char *candidate, char *out_buf, size_t
     return true;
 }
 
-static bool probe_preset_stem(const char *stem, char *out_buf, size_t out_cap)
+static bool try_stat_path_fmt(char *out_buf, size_t out_cap, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+
+static bool try_stat_path_fmt(char *out_buf, size_t out_cap, const char *fmt, ...)
 {
     char cand[WAYWAL_PATH_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(cand, sizeof(cand), fmt, ap);
+    va_end(ap);
+    if (n <= 0 || (size_t)n >= sizeof(cand))
+        return false;
+    return try_stat_regular_shader(cand, out_buf, out_cap);
+}
 
+static bool probe_preset_stem(const char *stem, char *out_buf, size_t out_cap)
+{
     const char *env_preset_dir = getenv("WWAL_SHADER_PRESET_DIR");
     if (env_preset_dir && env_preset_dir[0] != '\0') {
         char exp_dir[WAYWAL_PATH_MAX];
         const char *dir =
             waywal_expand_path(env_preset_dir, exp_dir, sizeof(exp_dir)) ? exp_dir : env_preset_dir;
-        snprintf(cand, sizeof(cand), "%s/%s.frag", dir, stem);
-        if (try_stat_regular_shader(cand, out_buf, out_cap))
+        if (try_stat_path_fmt(out_buf, out_cap, "%s/%s.frag", dir, stem))
             return true;
     }
 
@@ -495,50 +508,41 @@ static bool probe_preset_stem(const char *stem, char *out_buf, size_t out_cap)
         char exp_dir[WAYWAL_PATH_MAX];
         const char *dir =
             waywal_expand_path(env_shader_dir, exp_dir, sizeof(exp_dir)) ? exp_dir : env_shader_dir;
-        snprintf(cand, sizeof(cand), "%s/presets/%s.frag", dir, stem);
-        if (try_stat_regular_shader(cand, out_buf, out_cap))
+        if (try_stat_path_fmt(out_buf, out_cap, "%s/presets/%s.frag", dir, stem))
             return true;
-        snprintf(cand, sizeof(cand), "%s/%s.frag", dir, stem);
-        if (try_stat_regular_shader(cand, out_buf, out_cap))
+        if (try_stat_path_fmt(out_buf, out_cap, "%s/%s.frag", dir, stem))
             return true;
     }
 
     char xdg_cfg[WAYWAL_PATH_MAX];
     if (resolve_env_or_xdg("XDG_CONFIG_HOME", xdg_cfg, sizeof(xdg_cfg))) {
-        snprintf(cand, sizeof(cand), "%s/wwal/shaders/presets/%s.frag", xdg_cfg, stem);
-        if (try_stat_regular_shader(cand, out_buf, out_cap))
+        if (try_stat_path_fmt(out_buf, out_cap, "%s/wwal/shaders/presets/%s.frag", xdg_cfg, stem))
             return true;
-        snprintf(cand, sizeof(cand), "%s/wwal/shaders/%s.frag", xdg_cfg, stem);
-        if (try_stat_regular_shader(cand, out_buf, out_cap))
+        if (try_stat_path_fmt(out_buf, out_cap, "%s/wwal/shaders/%s.frag", xdg_cfg, stem))
             return true;
     }
 
     char home[WAYWAL_PATH_MAX];
     if (resolve_home_dir(home, sizeof(home))) {
-        snprintf(cand, sizeof(cand), "%s/.config/wwal/shaders/presets/%s.frag", home, stem);
-        if (try_stat_regular_shader(cand, out_buf, out_cap))
+        if (try_stat_path_fmt(out_buf, out_cap, "%s/.config/wwal/shaders/presets/%s.frag", home,
+                              stem))
             return true;
-        snprintf(cand, sizeof(cand), "%s/.config/wwal/shaders/%s.frag", home, stem);
-        if (try_stat_regular_shader(cand, out_buf, out_cap))
+        if (try_stat_path_fmt(out_buf, out_cap, "%s/.config/wwal/shaders/%s.frag", home, stem))
             return true;
     }
 
     char xdg_data[WAYWAL_PATH_MAX];
     if (resolve_env_or_xdg("XDG_DATA_HOME", xdg_data, sizeof(xdg_data))) {
-        snprintf(cand, sizeof(cand), "%s/wwal/shaders/presets/%s.frag", xdg_data, stem);
-        if (try_stat_regular_shader(cand, out_buf, out_cap))
+        if (try_stat_path_fmt(out_buf, out_cap, "%s/wwal/shaders/presets/%s.frag", xdg_data, stem))
             return true;
-        snprintf(cand, sizeof(cand), "%s/wwal/shaders/%s.frag", xdg_data, stem);
-        if (try_stat_regular_shader(cand, out_buf, out_cap))
+        if (try_stat_path_fmt(out_buf, out_cap, "%s/wwal/shaders/%s.frag", xdg_data, stem))
             return true;
     }
 
-    snprintf(cand, sizeof(cand), "shaders/presets/%s.frag", stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "shaders/presets/%s.frag", stem))
         return true;
 
-    snprintf(cand, sizeof(cand), "../shaders/presets/%s.frag", stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "../shaders/presets/%s.frag", stem))
         return true;
 
     char exe_path[PATH_MAX];
@@ -548,58 +552,48 @@ static bool probe_preset_stem(const char *stem, char *out_buf, size_t out_cap)
         char *slash = strrchr(exe_path, '/');
         if (slash) {
             *slash = '\0';
-            snprintf(cand, sizeof(cand), "%s/../share/wwal/shaders/presets/%s.frag", exe_path,
-                     stem);
-            if (try_stat_regular_shader(cand, out_buf, out_cap))
+            if (try_stat_path_fmt(out_buf, out_cap, "%s/../share/wwal/shaders/presets/%s.frag",
+                                  exe_path, stem))
                 return true;
-            snprintf(cand, sizeof(cand), "%s/../shaders/presets/%s.frag", exe_path, stem);
-            if (try_stat_regular_shader(cand, out_buf, out_cap))
+            if (try_stat_path_fmt(out_buf, out_cap, "%s/../shaders/presets/%s.frag", exe_path,
+                                  stem))
                 return true;
-            snprintf(cand, sizeof(cand), "%s/../../shaders/presets/%s.frag", exe_path, stem);
-            if (try_stat_regular_shader(cand, out_buf, out_cap))
+            if (try_stat_path_fmt(out_buf, out_cap, "%s/../../shaders/presets/%s.frag", exe_path,
+                                  stem))
                 return true;
-            snprintf(cand, sizeof(cand), "%s/shaders/presets/%s.frag", exe_path, stem);
-            if (try_stat_regular_shader(cand, out_buf, out_cap))
+            if (try_stat_path_fmt(out_buf, out_cap, "%s/shaders/presets/%s.frag", exe_path, stem))
                 return true;
         }
     }
 
 #ifdef WWAL_DATADIR
-    snprintf(cand, sizeof(cand), "%s/wwal/shaders/presets/%s.frag", WWAL_DATADIR, stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "%s/wwal/shaders/presets/%s.frag", WWAL_DATADIR, stem))
         return true;
-    snprintf(cand, sizeof(cand), "%s/waywal/shaders/presets/%s.frag", WWAL_DATADIR, stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "%s/waywal/shaders/presets/%s.frag", WWAL_DATADIR,
+                          stem))
         return true;
-    snprintf(cand, sizeof(cand), "%s/shaders/presets/%s.frag", WWAL_DATADIR, stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "%s/shaders/presets/%s.frag", WWAL_DATADIR, stem))
         return true;
 #endif
 
 #ifdef WWAL_SOURCE_ROOT
-    snprintf(cand, sizeof(cand), "%s/shaders/presets/%s.frag", WWAL_SOURCE_ROOT, stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "%s/shaders/presets/%s.frag", WWAL_SOURCE_ROOT, stem))
         return true;
 #endif
 
-    snprintf(cand, sizeof(cand), "/usr/local/share/wwal/shaders/presets/%s.frag", stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "/usr/local/share/wwal/shaders/presets/%s.frag", stem))
         return true;
 
-    snprintf(cand, sizeof(cand), "/usr/share/wwal/shaders/presets/%s.frag", stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "/usr/share/wwal/shaders/presets/%s.frag", stem))
         return true;
 
-    snprintf(cand, sizeof(cand), "/usr/share/wwal/shaders/%s.frag", stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "/usr/share/wwal/shaders/%s.frag", stem))
         return true;
 
-    snprintf(cand, sizeof(cand), "contrib/shaders/%s.frag", stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "contrib/shaders/%s.frag", stem))
         return true;
 
-    snprintf(cand, sizeof(cand), "../contrib/shaders/%s.frag", stem);
-    if (try_stat_regular_shader(cand, out_buf, out_cap))
+    if (try_stat_path_fmt(out_buf, out_cap, "../contrib/shaders/%s.frag", stem))
         return true;
 
     return false;
@@ -1046,7 +1040,9 @@ static void scan_custom_preset_dir(const char *dir_path, waywal_shader_preset_in
             continue;
 
         char full_cand[WAYWAL_PATH_MAX];
-        snprintf(full_cand, sizeof(full_cand), "%s/%s", dir_path, de->d_name);
+        int cand_len = snprintf(full_cand, sizeof(full_cand), "%s/%s", dir_path, de->d_name);
+        if (cand_len <= 0 || (size_t)cand_len >= sizeof(full_cand))
+            continue;
         char resolved_path[WAYWAL_PATH_MAX];
         if (!try_stat_regular_shader(full_cand, resolved_path, sizeof(resolved_path)))
             continue;
@@ -1056,7 +1052,9 @@ static void scan_custom_preset_dir(const char *dir_path, waywal_shader_preset_in
             memset(dst, 0, sizeof(*dst));
             snprintf(dst->name, sizeof(dst->name), "%s", norm_name);
             snprintf(dst->path, sizeof(dst->path), "%s", resolved_path);
-            snprintf(dst->filename, sizeof(dst->filename), "%s.frag", norm_name);
+            int fn_len = snprintf(dst->filename, sizeof(dst->filename), "%s.frag", norm_name);
+            if (fn_len < 0 || (size_t)fn_len >= sizeof(dst->filename))
+                dst->filename[sizeof(dst->filename) - 1] = '\0';
             snprintf(dst->title, sizeof(dst->title), "%s", norm_name);
             snprintf(dst->description, sizeof(dst->description), "Custom procedural shader preset");
             snprintf(dst->author, sizeof(dst->author), "Custom");
@@ -1127,22 +1125,28 @@ size_t waywal_shader_preset_list(waywal_shader_preset_info_t *out_list, size_t m
         const char *dir =
             waywal_expand_path(env_shader_dir, exp_dir, sizeof(exp_dir)) ? exp_dir : env_shader_dir;
         char sub[WAYWAL_PATH_MAX];
-        snprintf(sub, sizeof(sub), "%s/presets", dir);
-        scan_custom_preset_dir(sub, out_list, max_entries, &count, &overflow);
+        int n = snprintf(sub, sizeof(sub), "%s/presets", dir);
+        if (n > 0 && (size_t)n < sizeof(sub)) {
+            scan_custom_preset_dir(sub, out_list, max_entries, &count, &overflow);
+        }
     }
 
     char xdg_sub[WAYWAL_PATH_MAX] = {0};
     char xdg_cfg[WAYWAL_PATH_MAX];
     if (resolve_env_or_xdg("XDG_CONFIG_HOME", xdg_cfg, sizeof(xdg_cfg))) {
-        snprintf(xdg_sub, sizeof(xdg_sub), "%s/wwal/shaders/presets", xdg_cfg);
-        scan_custom_preset_dir(xdg_sub, out_list, max_entries, &count, &overflow);
+        int n = snprintf(xdg_sub, sizeof(xdg_sub), "%s/wwal/shaders/presets", xdg_cfg);
+        if (n > 0 && (size_t)n < sizeof(xdg_sub)) {
+            scan_custom_preset_dir(xdg_sub, out_list, max_entries, &count, &overflow);
+        } else {
+            xdg_sub[0] = '\0';
+        }
     }
 
     char home[WAYWAL_PATH_MAX];
     if (resolve_home_dir(home, sizeof(home))) {
         char sub[WAYWAL_PATH_MAX];
-        snprintf(sub, sizeof(sub), "%s/.config/wwal/shaders/presets", home);
-        if (strcmp(sub, xdg_sub) != 0) {
+        int n = snprintf(sub, sizeof(sub), "%s/.config/wwal/shaders/presets", home);
+        if (n > 0 && (size_t)n < sizeof(sub) && strcmp(sub, xdg_sub) != 0) {
             scan_custom_preset_dir(sub, out_list, max_entries, &count, &overflow);
         }
     }
@@ -1150,10 +1154,14 @@ size_t waywal_shader_preset_list(waywal_shader_preset_info_t *out_list, size_t m
 #ifdef WWAL_DATADIR
     {
         char sub[WAYWAL_PATH_MAX];
-        snprintf(sub, sizeof(sub), "%s/wwal/shaders/presets", WWAL_DATADIR);
-        scan_custom_preset_dir(sub, out_list, max_entries, &count, &overflow);
-        snprintf(sub, sizeof(sub), "%s/waywal/shaders/presets", WWAL_DATADIR);
-        scan_custom_preset_dir(sub, out_list, max_entries, &count, &overflow);
+        int n = snprintf(sub, sizeof(sub), "%s/wwal/shaders/presets", WWAL_DATADIR);
+        if (n > 0 && (size_t)n < sizeof(sub)) {
+            scan_custom_preset_dir(sub, out_list, max_entries, &count, &overflow);
+        }
+        n = snprintf(sub, sizeof(sub), "%s/waywal/shaders/presets", WWAL_DATADIR);
+        if (n > 0 && (size_t)n < sizeof(sub)) {
+            scan_custom_preset_dir(sub, out_list, max_entries, &count, &overflow);
+        }
     }
 #endif
 

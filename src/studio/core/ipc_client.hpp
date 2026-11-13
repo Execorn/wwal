@@ -4,6 +4,7 @@
 
 #include "services.hpp"
 #include "waywal/ipc_proto.h"
+#include "waywal/ipc_proto_authoring.h"
 #include "waywal/ipc_proto_phase3.h"
 
 #include <QJsonObject>
@@ -84,6 +85,27 @@ class IpcClient : public QObject, public IIpcClientService {
                               const we_cursor_force_t &cursor);
     bool sendSetSceneLights(const QString &output, const we_lighting_uniforms_t &lights);
 
+    // Authoring Scene, Code, Brush, Particle, Audio & Export IPC
+    bool sendSceneMutate(const waywal_ipc_req_scene_mutate_t &req,
+                         const QString &payloadJson = QString());
+    bool sendHotReloadCode(const waywal_ipc_req_hot_reload_code_t &req,
+                           const QByteArray &utf8Source);
+    bool sendQuerySceneTree(const QString &output = QString(), uint32_t flags = 0);
+    bool sendSetShaderCombo(const QString &output, int32_t objectId, uint32_t passIndex,
+                            const QString &comboName, int32_t comboValue, uint32_t flags = 0);
+    bool sendBrushStroke(const waywal_ipc_req_brush_stroke_t &req,
+                         const std::vector<we_brush_dab_t> &dabs);
+    bool sendParticleConfig(const QString &output, int32_t objectId, uint32_t configOp,
+                            uint32_t presetId, uint32_t flags, const void *payload,
+                            uint32_t payloadLen);
+    bool sendAudioBindings(const QString &output, uint32_t bindOp,
+                           const we_audio_binding_t *bindings, uint32_t count,
+                           uint32_t removeId = 0);
+    bool sendExportScenePkg(const QString &output, const QString &destPath, uint32_t flags = 0);
+    bool sendLintScenescript(const QString &sourceText, uint32_t flags = 0);
+    bool sendReadbackTexture(const QString &output, int32_t objectId, uint32_t passIndex,
+                             uint32_t texSlot, uint32_t formatMode = 0);
+
     // Lifecycle
     void start();
     void stop();
@@ -106,6 +128,17 @@ class IpcClient : public QObject, public IIpcClientService {
     void camera3DUpdated(const waywal_ipc_resp_set_camera_3d_t &resp);
     void physicsParamsUpdated(const waywal_ipc_resp_set_physics_params_t &resp);
     void sceneLightsUpdated(const waywal_ipc_resp_set_scene_lights_t &resp);
+    void sceneMutated(const waywal_ipc_resp_scene_mutate_t &resp);
+    void codeHotReloaded(const waywal_ipc_resp_hot_reload_code_t &resp, const QString &metaJson);
+    void sceneTreeQueried(const waywal_ipc_resp_query_scene_tree_t &resp, const QString &treeJson);
+    void shaderComboUpdated(const waywal_ipc_resp_set_shader_combo_t &resp);
+    void brushStrokeCompleted(const waywal_ipc_resp_brush_stroke_t &resp);
+    void particleConfigUpdated(const waywal_ipc_resp_particle_config_t &resp);
+    void audioBindingsUpdated(const waywal_ipc_resp_set_audio_bindings_t &resp);
+    void scenePkgExported(const waywal_ipc_resp_export_scene_pkg_t &resp);
+    void sceneScriptLinted(const waywal_ipc_resp_lint_scenescript_t &resp);
+    void textureReadbackReceived(const waywal_ipc_resp_readback_texture_t &resp,
+                                 const QByteArray &data);
 
   private:
     struct OutboundPacket {

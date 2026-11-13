@@ -7,6 +7,8 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QMouseEvent>
+#include <QKeyEvent>
+#include <QTabletEvent>
 #include <QWheelEvent>
 #include <QShowEvent>
 #include <QHideEvent>
@@ -30,6 +32,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <algorithm>
+#include <limits>
 
 extern "C" {
 #include <waywal/image_loader.h>
@@ -126,6 +129,42 @@ const char *kBlitFragmentShaderCore = "#version 330 core\n"
                                       "    }\n"
                                       "    fragColor = vec4(col.rgb, 1.0);\n"
                                       "}\n";
+
+const char *kGizmoVertexShaderEs310 = "#version 310 es\n"
+                                      "precision highp float;\n"
+                                      "layout (location = 0) in vec3 a_pos;\n"
+                                      "layout (location = 1) in vec4 a_color;\n"
+                                      "uniform mat4 u_mvp;\n"
+                                      "out vec4 v_color;\n"
+                                      "void main() {\n"
+                                      "    v_color = a_color;\n"
+                                      "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+                                      "}\n";
+
+const char *kGizmoFragmentShaderEs310 = "#version 310 es\n"
+                                        "precision highp float;\n"
+                                        "in vec4 v_color;\n"
+                                        "out vec4 fragColor;\n"
+                                        "void main() {\n"
+                                        "    fragColor = v_color;\n"
+                                        "}\n";
+
+const char *kGizmoVertexShaderCore = "#version 330 core\n"
+                                     "layout (location = 0) in vec3 a_pos;\n"
+                                     "layout (location = 1) in vec4 a_color;\n"
+                                     "uniform mat4 u_mvp;\n"
+                                     "out vec4 v_color;\n"
+                                     "void main() {\n"
+                                     "    v_color = a_color;\n"
+                                     "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+                                     "}\n";
+
+const char *kGizmoFragmentShaderCore = "#version 330 core\n"
+                                       "in vec4 v_color;\n"
+                                       "out vec4 fragColor;\n"
+                                       "void main() {\n"
+                                       "    fragColor = v_color;\n"
+                                       "}\n";
 
 const char *kGraphVertexShaderEs310 = "#version 310 es\n"
                                       "precision highp float;\n"
@@ -282,11 +321,11 @@ std::vector<GraphPassSource> parseGraphPasses(const QString &source)
 
     for (size_t i = 0; i < spans.size(); ++i) {
         const qsizetype start = spans[i].bodyStart;
-        const qsizetype end =
-            (i + 1 < spans.size()) ? spans[i + 1].pragmaStart : source.size();
+        const qsizetype end = (i + 1 < spans.size()) ? spans[i + 1].pragmaStart : source.size();
         QString body = source.mid(start, end - start).trimmed();
         if (!body.isEmpty()) {
-            out.push_back(GraphPassSource{.passIndex = spans[i].passIndex, .glsl = std::move(body)});
+            out.push_back(
+                GraphPassSource{.passIndex = spans[i].passIndex, .glsl = std::move(body)});
         }
     }
     return out;
@@ -294,9 +333,8 @@ std::vector<GraphPassSource> parseGraphPasses(const QString &source)
 
 using GlTexStorage2DProc = void (*)(GLenum target, GLsizei levels, GLenum internalformat,
                                     GLsizei width, GLsizei height);
-using GlBindImageTextureProc = void (*)(GLuint unit, GLuint texture, GLint level,
-                                        GLboolean layered, GLint layer, GLenum access,
-                                        GLenum format);
+using GlBindImageTextureProc = void (*)(GLuint unit, GLuint texture, GLint level, GLboolean layered,
+                                        GLint layer, GLenum access, GLenum format);
 using GlDispatchComputeProc = void (*)(GLuint num_groups_x, GLuint num_groups_y,
                                        GLuint num_groups_z);
 using GlMemoryBarrierProc = void (*)(GLbitfield barriers);
@@ -405,6 +443,9 @@ GpuPreviewViewport::~GpuPreviewViewport()
             m_quadVao.destroy();
             m_quadVbo.destroy();
             m_blitProgram.reset();
+            m_gizmoVao.destroy();
+            m_gizmoVbo.destroy();
+            m_gizmoProgram.reset();
             m_shaderProgram.reset();
             m_computeShaderProgram.reset();
             for (auto &prog : m_bufferPassPrograms) {
@@ -432,13 +473,11 @@ void GpuPreviewViewport::updateAnimationTimerState()
         return;
     }
     const bool parallaxSettling =
-        m_parallaxEnabled &&
-        (std::abs(m_targetTiltX - m_currentTiltX) > 1e-4f ||
-         std::abs(m_targetTiltY - m_currentTiltY) > 1e-4f);
-    const bool needsTick =
-        isVisible() && !m_animationPaused &&
-        (m_previewMode == PreviewMode::InProcessShader ||
-         m_previewMode == PreviewMode::DmaBufLive || parallaxSettling);
+        m_parallaxEnabled && (std::abs(m_targetTiltX - m_currentTiltX) > 1e-4f ||
+                              std::abs(m_targetTiltY - m_currentTiltY) > 1e-4f);
+    const bool needsTick = isVisible() && !m_animationPaused &&
+                           (m_previewMode == PreviewMode::InProcessShader ||
+                            m_previewMode == PreviewMode::DmaBufLive || parallaxSettling);
 
     if (needsTick && !m_animationTimer->isActive()) {
         m_animationTimer->start();
@@ -663,12 +702,25 @@ void GpuPreviewViewport::initializeGL()
     glDisable(GL_CULL_FACE);
 }
 
+QSize GpuPreviewViewport::physicalSizeFor(int logicalW, int logicalH) const noexcept
+{
+    const qreal dpr = devicePixelRatioF();
+    return QSize(std::max(1, static_cast<int>(std::lround(static_cast<double>(logicalW) * dpr))),
+                 std::max(1, static_cast<int>(std::lround(static_cast<double>(logicalH) * dpr))));
+}
+
+QSize GpuPreviewViewport::physicalFramebufferSize() const noexcept
+{
+    return physicalSizeFor(width(), height());
+}
+
 void GpuPreviewViewport::resizeGL(int w, int h)
 {
-    glViewport(0, 0, w, h);
+    const QSize fbSize = physicalSizeFor(w, h);
+    glViewport(0, 0, fbSize.width(), fbSize.height());
     if (m_previewMode == PreviewMode::InProcessShader) {
-        ensureOffscreenFbo(w, h);
-        ensureBufferPassFbos(w, h);
+        ensureOffscreenFbo(fbSize.width(), fbSize.height());
+        ensureBufferPassFbos(fbSize.width(), fbSize.height());
     }
 }
 
@@ -1040,8 +1092,7 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
         QByteArray hash = QCryptographicHash::hash(
             QByteArray::fromRawData(stdPath.data(), static_cast<qsizetype>(stdPath.size())),
             QCryptographicHash::Sha256);
-        const std::filesystem::path cachedThumb =
-            cacheDir / (hash.toHex().toStdString() + ".webp");
+        const std::filesystem::path cachedThumb = cacheDir / (hash.toHex().toStdString() + ".webp");
         std::error_code ec;
         if (std::filesystem::exists(cachedThumb, ec)) {
             img.load(QString::fromStdString(cachedThumb.string()));
@@ -1176,8 +1227,9 @@ bool GpuPreviewViewport::compileShaderInternal(const QString &glslSource, QStrin
     const bool isGles =
         QOpenGLContext::currentContext() && QOpenGLContext::currentContext()->isOpenGLES();
 
-    auto compileLinkedFragmentProgram = [&](const QString &fragSrc, bool graphVaryings,
-                                            QString *errOut) -> std::unique_ptr<QOpenGLShaderProgram> {
+    auto compileLinkedFragmentProgram =
+        [&](const QString &fragSrc, bool graphVaryings,
+            QString *errOut) -> std::unique_ptr<QOpenGLShaderProgram> {
         struct Variant {
             const char *vs;
             QString fs;
@@ -1188,7 +1240,8 @@ bool GpuPreviewViewport::compileShaderInternal(const QString &glslSource, QStrin
                 attempts.push_back({kGraphVertexShaderEs310, fragSrc});
                 attempts.push_back({kGraphVertexShaderEs300, convertEs310ToEs300(fragSrc)});
             } else {
-                attempts.push_back({kGraphVertexShaderCore330, convertEsFragmentToCore330(fragSrc)});
+                attempts.push_back(
+                    {kGraphVertexShaderCore330, convertEsFragmentToCore330(fragSrc)});
                 attempts.push_back({kGraphVertexShaderEs310, fragSrc});
             }
         } else {
@@ -1227,7 +1280,8 @@ bool GpuPreviewViewport::compileShaderInternal(const QString &glslSource, QStrin
         return nullptr;
     };
 
-    // 1. Compute Shader support (e.g. #version 310 es / #version 430 with local_size_x + imageStore)
+    // 1. Compute Shader support (e.g. #version 310 es / #version 430 with local_size_x +
+    // imageStore)
     if (trimmed.contains(QLatin1String("local_size_x")) &&
         trimmed.contains(QLatin1String("imageStore"))) {
         auto csProg = std::make_unique<QOpenGLShaderProgram>(this);
@@ -1265,7 +1319,8 @@ bool GpuPreviewViewport::compileShaderInternal(const QString &glslSource, QStrin
 
         for (const auto &pass : passes) {
             QString passErr;
-            auto compiled = compileLinkedFragmentProgram(pass.glsl, /*graphVaryings=*/true, &passErr);
+            auto compiled =
+                compileLinkedFragmentProgram(pass.glsl, /*graphVaryings=*/true, &passErr);
             if (!compiled) {
                 if (outError) {
                     *outError = passErr;
@@ -1280,7 +1335,8 @@ bool GpuPreviewViewport::compileShaderInternal(const QString &glslSource, QStrin
         }
 
         if (!nextImageProg) {
-            // If a graph only emitted buffer passes, promote the highest active buffer pass to screen
+            // If a graph only emitted buffer passes, promote the highest active buffer pass to
+            // screen
             for (int i = 3; i >= 0; --i) {
                 if (nextBufferProgs[static_cast<size_t>(i)]) {
                     nextImageProg = std::move(nextBufferProgs[static_cast<size_t>(i)]);
@@ -1306,8 +1362,9 @@ bool GpuPreviewViewport::compileShaderInternal(const QString &glslSource, QStrin
             }
         }
         ensureNeutralPassTexture();
-        ensureOffscreenFbo(width(), height());
-        ensureBufferPassFbos(width(), height());
+        const QSize fbSize = physicalFramebufferSize();
+        ensureOffscreenFbo(fbSize.width(), fbSize.height());
+        ensureBufferPassFbos(fbSize.width(), fbSize.height());
         return true;
     }
 
@@ -1341,7 +1398,8 @@ bool GpuPreviewViewport::compileShaderInternal(const QString &glslSource, QStrin
     m_bufferPingPongIdx = 0;
     m_shaderProgram = std::move(program);
     ensureNeutralPassTexture();
-    ensureOffscreenFbo(width(), height());
+    const QSize fbSize = physicalFramebufferSize();
+    ensureOffscreenFbo(fbSize.width(), fbSize.height());
     return true;
 }
 
@@ -1576,28 +1634,26 @@ void GpuPreviewViewport::applyShaderUniforms(QOpenGLShaderProgram &prog, float f
     prog.setUniformValue("iTime", timeSec);
     prog.setUniformValue("iTimeDelta", timeDeltaSec);
     prog.setUniformValue("iFrame", m_shaderFrameIndex);
-    prog.setUniformValue("iMouse",
-                         QVector4D(static_cast<float>(m_mouseGlCoord.x()),
-                                   static_cast<float>(m_mouseGlCoord.y()),
-                                   static_cast<float>(m_mouseClickCoord.x()),
-                                   static_cast<float>(m_mouseClickCoord.y())));
+    prog.setUniformValue("iMouse", QVector4D(static_cast<float>(m_mouseGlCoord.x()),
+                                             static_cast<float>(m_mouseGlCoord.y()),
+                                             static_cast<float>(m_mouseClickCoord.x()),
+                                             static_cast<float>(m_mouseClickCoord.y())));
 
     const QDateTime dt = QDateTime::currentDateTime();
     const float secOfDay = dt.time().msecsSinceStartOfDay() / 1000.0f;
-    prog.setUniformValue("iDate",
-                         QVector4D(static_cast<float>(dt.date().year()),
-                                   static_cast<float>(dt.date().month()),
-                                   static_cast<float>(dt.date().day()), secOfDay));
+    prog.setUniformValue("iDate", QVector4D(static_cast<float>(dt.date().year()),
+                                            static_cast<float>(dt.date().month()),
+                                            static_cast<float>(dt.date().day()), secOfDay));
 
     // Standard wwald / .wwgraph uniforms
     prog.setUniformValue("u_Time", timeSec);
     prog.setUniformValue("u_Resolution", QVector2D(safeW, safeH));
-    const float ptrX =
-        std::clamp(static_cast<float>(m_mouseGlCoord.x()) / std::max(1.0f, static_cast<float>(width())),
-                   0.0f, 1.0f);
-    const float ptrY =
-        std::clamp(static_cast<float>(m_mouseGlCoord.y()) / std::max(1.0f, static_cast<float>(height())),
-                   0.0f, 1.0f);
+    const float ptrX = std::clamp(static_cast<float>(m_mouseGlCoord.x()) /
+                                      std::max(1.0f, static_cast<float>(width())),
+                                  0.0f, 1.0f);
+    const float ptrY = std::clamp(static_cast<float>(m_mouseGlCoord.y()) /
+                                      std::max(1.0f, static_cast<float>(height())),
+                                  0.0f, 1.0f);
     prog.setUniformValue("u_Pointer", QVector2D(ptrX, ptrY));
 
     static const QVector4D kZeroAudio[4] = {
@@ -1691,8 +1747,9 @@ void GpuPreviewViewport::renderInProcessShaderPass()
         auto memoryBarrier =
             reinterpret_cast<GlMemoryBarrierProc>(ctx->getProcAddress("glMemoryBarrier"));
 
-        const int targetW = std::clamp(width(), 64, 7680);
-        const int targetH = std::clamp(height(), 64, 4320);
+        const QSize fbSize = physicalFramebufferSize();
+        const int targetW = std::clamp(fbSize.width(), 64, 7680);
+        const int targetH = std::clamp(fbSize.height(), 64, 4320);
         if (texStorage2D && bindImageTex && dispatchCompute && memoryBarrier) {
             if (m_computeOutputTex == 0 || m_computeTexWidth != targetW ||
                 m_computeTexHeight != targetH) {
@@ -1729,8 +1786,9 @@ void GpuPreviewViewport::renderInProcessShaderPass()
         return;
     }
 
-    ensureOffscreenFbo(width(), height());
-    ensureBufferPassFbos(width(), height());
+    const QSize fbSize = physicalFramebufferSize();
+    ensureOffscreenFbo(fbSize.width(), fbSize.height());
+    ensureBufferPassFbos(fbSize.width(), fbSize.height());
 
     auto drawFullscreenQuad = [this]() {
         m_quadVao.bind();
@@ -1814,6 +1872,40 @@ float GpuPreviewViewport::calculateGuideAspect() const noexcept
 
 QRectF GpuPreviewViewport::computeContentDisplayRect() const noexcept
 {
+    if (m_parallaxEnabled && width() > 0 && height() > 0) {
+        const uint32_t cWU = std::max<uint32_t>(1u, contentWidth());
+        const uint32_t cHU = std::max<uint32_t>(1u, contentHeight());
+        const QMatrix4x4 mvp = computeBlitMvp(cWU, cHU);
+        const QVector3D corners[4] = {
+            QVector3D(-1.0f, -1.0f, 0.0f),
+            QVector3D(1.0f, -1.0f, 0.0f),
+            QVector3D(1.0f, 1.0f, 0.0f),
+            QVector3D(-1.0f, 1.0f, 0.0f),
+        };
+        double minX = std::numeric_limits<double>::max();
+        double minY = std::numeric_limits<double>::max();
+        double maxX = std::numeric_limits<double>::lowest();
+        double maxY = std::numeric_limits<double>::lowest();
+        bool anyValid = false;
+        for (const QVector3D &c : corners) {
+            const QVector4D clip = mvp.map(QVector4D(c, 1.0f));
+            if (std::abs(clip.w()) > 1e-6f) {
+                const float invW = 1.0f / clip.w();
+                const double sx = (clip.x() * invW * 0.5 + 0.5) * static_cast<double>(width());
+                const double sy =
+                    (1.0 - (clip.y() * invW * 0.5 + 0.5)) * static_cast<double>(height());
+                minX = std::min(minX, sx);
+                minY = std::min(minY, sy);
+                maxX = std::max(maxX, sx);
+                maxY = std::max(maxY, sy);
+                anyValid = true;
+            }
+        }
+        if (anyValid) {
+            return QRectF(minX, minY, std::max(1.0, maxX - minX), std::max(1.0, maxY - minY));
+        }
+    }
+
     float cW = static_cast<float>(contentWidth());
     float cH = static_cast<float>(contentHeight());
     if (cW <= 0.0f || cH <= 0.0f) {
@@ -1929,41 +2021,7 @@ void GpuPreviewViewport::paintGL()
     if (activeTex != 0 && m_blitProgram) {
         m_blitProgram->bind();
 
-        float vW = static_cast<float>(width());
-        float vH = static_cast<float>(height());
-        float vAspect = vW / std::max(1.0f, vH);
-        float cAspect = static_cast<float>(cW) / std::max(1.0f, static_cast<float>(cH));
-
-        QMatrix4x4 mvp;
-        if (m_parallaxEnabled) {
-            mvp.perspective(45.0f, vAspect, 0.1f, 100.0f);
-            mvp.translate(0.0f, 0.0f, -2.42f);
-            mvp.translate(m_panOffset.x() / (vW * 0.5f), -m_panOffset.y() / (vH * 0.5f), 0.0f);
-            mvp.scale(m_zoom, m_zoom, 1.0f);
-
-            // 2.5D Parallax 3D tilt
-            float tiltAngleX = m_currentTiltX * 14.0f * m_parallaxStrength;
-            float tiltAngleY = -m_currentTiltY * 11.0f * m_parallaxStrength;
-            mvp.rotate(tiltAngleX, 0.0f, 1.0f, 0.0f);
-            mvp.rotate(tiltAngleY, 1.0f, 0.0f, 0.0f);
-
-            if (cAspect >= 1.0f) {
-                mvp.scale(cAspect, 1.0f, 1.0f);
-            } else {
-                mvp.scale(1.0f, 1.0f / cAspect, 1.0f);
-            }
-        } else {
-            mvp.ortho(-vAspect, vAspect, -1.0f, 1.0f, -1.0f, 1.0f);
-            mvp.translate(m_panOffset.x() / (vW * 0.5f) * vAspect, -m_panOffset.y() / (vH * 0.5f),
-                          0.0f);
-            mvp.scale(m_zoom, m_zoom, 1.0f);
-
-            if (cAspect > vAspect) {
-                mvp.scale(vAspect, vAspect / cAspect, 1.0f);
-            } else {
-                mvp.scale(cAspect, 1.0f, 1.0f);
-            }
-        }
+        const QMatrix4x4 mvp = computeBlitMvp(cW, cH);
 
         m_blitProgram->setUniformValue("u_mvp", mvp);
         m_blitProgram->setUniformValue("u_texture", 0);
@@ -1990,6 +2048,8 @@ void GpuPreviewViewport::paintGL()
         glBindTexture(GL_TEXTURE_2D, 0);
         m_blitProgram->release();
     }
+
+    renderGizmoOverlayPass(cW, cH);
 
     // --- Interactive 2D Overlays via QPainter ---
     QPainter painter(this);
@@ -2461,6 +2521,35 @@ void GpuPreviewViewport::mousePressEvent(QMouseEvent *event)
 
     if (event->button() == Qt::LeftButton) {
         m_mouseClickCoord = event->position();
+
+        const ViewportToolMode mode = m_gizmoOverlay.toolMode();
+        if (isBrushToolMode(mode)) {
+            if (!m_brushClock.isValid()) {
+                m_brushClock.start();
+            }
+            m_brushStrokeActive = true;
+            const QPointF texel = mapWidgetToContentTexel(event->position());
+            const double tsSec = static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9;
+            emit brushPointerPressed(texel, 1.0f, tsSec);
+            event->accept();
+            return;
+        }
+
+        if (mode != ViewportToolMode::Navigate) {
+            const uint32_t cW = contentWidth();
+            const uint32_t cH = contentHeight();
+            const QMatrix4x4 vp = computeGizmoViewProj(cW, cH);
+            if (m_gizmoOverlay.beginDrag(event->position(), size(), vp)) {
+                m_dragStartTransform = m_gizmoOverlay.dragInitialTransform();
+                m_dragCurrentTransform = m_gizmoOverlay.updateDrag(
+                    event->position(), size(), vp, event->modifiers().testFlag(Qt::ControlModifier),
+                    event->modifiers().testFlag(Qt::ShiftModifier));
+                setCursor(Qt::SizeAllCursor);
+                update();
+                event->accept();
+                return;
+            }
+        }
     }
 
     QOpenGLWidget::mousePressEvent(event);
@@ -2477,7 +2566,7 @@ void GpuPreviewViewport::mouseMoveEvent(QMouseEvent *event)
             m_hoveredButton = hit;
             if (m_hoveredButton != ActionBarButton::None) {
                 setCursor(Qt::PointingHandCursor);
-            } else if (!m_isPanning) {
+            } else if (!m_isPanning && !m_gizmoOverlay.isDragging()) {
                 unsetCursor();
             }
             update();
@@ -2492,6 +2581,41 @@ void GpuPreviewViewport::mouseMoveEvent(QMouseEvent *event)
         update();
         event->accept();
         return;
+    }
+
+    if (m_brushStrokeActive && isBrushToolMode(m_gizmoOverlay.toolMode())) {
+        const QPointF texel = mapWidgetToContentTexel(event->position());
+        const double tsSec =
+            m_brushClock.isValid() ? static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9 : 0.0;
+        emit brushPointerMoved(texel, 1.0f, tsSec);
+        event->accept();
+        return;
+    }
+
+    if (m_gizmoOverlay.isDragging()) {
+        const QMatrix4x4 vp = computeGizmoViewProj(contentWidth(), contentHeight());
+        m_dragCurrentTransform = m_gizmoOverlay.updateDrag(
+            event->position(), size(), vp, event->modifiers().testFlag(Qt::ControlModifier),
+            event->modifiers().testFlag(Qt::ShiftModifier));
+        if (m_activeGizmoNodeId >= 0) {
+            emit layerTransformPreviewed(m_activeGizmoNodeId, m_dragCurrentTransform);
+        }
+        update();
+        event->accept();
+        return;
+    }
+
+    const ViewportToolMode mode = m_gizmoOverlay.toolMode();
+    if (mode != ViewportToolMode::Navigate && !isBrushToolMode(mode) && m_activeGizmoNodeId >= 0) {
+        const QMatrix4x4 vp = computeGizmoViewProj(contentWidth(), contentHeight());
+        const GizmoAxisHandle hovered = m_gizmoOverlay.pickHandle(event->position(), size(), vp);
+        if (m_hoveredButton == ActionBarButton::None) {
+            if (hovered != GizmoAxisHandle::None) {
+                setCursor(Qt::OpenHandCursor);
+            } else {
+                unsetCursor();
+            }
+        }
     }
 
     if (m_parallaxEnabled) {
@@ -2512,6 +2636,30 @@ void GpuPreviewViewport::mouseReleaseEvent(QMouseEvent *event)
     if (m_isPanning && (event->button() == Qt::MiddleButton || event->button() == Qt::LeftButton)) {
         m_isPanning = false;
         unsetCursor();
+        event->accept();
+        return;
+    }
+    if (event->button() == Qt::LeftButton && m_brushStrokeActive) {
+        m_brushStrokeActive = false;
+        const QPointF texel = mapWidgetToContentTexel(event->position());
+        const double tsSec =
+            m_brushClock.isValid() ? static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9 : 0.0;
+        emit brushPointerReleased(texel, 0.0f, tsSec);
+        event->accept();
+        return;
+    }
+    if (event->button() == Qt::LeftButton && m_gizmoOverlay.isDragging()) {
+        const QMatrix4x4 vp = computeGizmoViewProj(contentWidth(), contentHeight());
+        m_dragCurrentTransform = m_gizmoOverlay.updateDrag(
+            event->position(), size(), vp, event->modifiers().testFlag(Qt::ControlModifier),
+            event->modifiers().testFlag(Qt::ShiftModifier));
+        m_gizmoOverlay.endDrag();
+        unsetCursor();
+        if (m_activeGizmoNodeId >= 0) {
+            const int32_t objId = m_activeGizmoNodeId;
+            emit layerTransformCommitted(objId, m_dragStartTransform, m_dragCurrentTransform);
+        }
+        update();
         event->accept();
         return;
     }
@@ -2548,6 +2696,56 @@ void GpuPreviewViewport::wheelEvent(QWheelEvent *event)
     emit panChanged(m_panOffset);
     update();
     event->accept();
+}
+
+void GpuPreviewViewport::tabletEvent(QTabletEvent *event)
+{
+    const ViewportToolMode mode = m_gizmoOverlay.toolMode();
+    if (!isBrushToolMode(mode)) {
+        QOpenGLWidget::tabletEvent(event);
+        return;
+    }
+
+    const QPointF texel = mapWidgetToContentTexel(event->position());
+    const float pressure = std::clamp(static_cast<float>(event->pressure()), 0.0f, 1.0f);
+
+    switch (event->type()) {
+    case QEvent::TabletPress: {
+        if (!m_brushClock.isValid()) {
+            m_brushClock.start();
+        }
+        m_brushStrokeActive = true;
+        const double tsSec = static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9;
+        emit brushPointerPressed(texel, pressure > 0.0f ? pressure : 1.0f, tsSec);
+        event->accept();
+        return;
+    }
+    case QEvent::TabletMove:
+        if (m_brushStrokeActive) {
+            const double tsSec = m_brushClock.isValid()
+                                     ? static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9
+                                     : 0.0;
+            emit brushPointerMoved(texel, pressure, tsSec);
+            event->accept();
+            return;
+        }
+        break;
+    case QEvent::TabletRelease:
+        if (m_brushStrokeActive) {
+            m_brushStrokeActive = false;
+            const double tsSec = m_brushClock.isValid()
+                                     ? static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9
+                                     : 0.0;
+            emit brushPointerReleased(texel, pressure, tsSec);
+            event->accept();
+            return;
+        }
+        break;
+    default:
+        break;
+    }
+
+    QOpenGLWidget::tabletEvent(event);
 }
 
 void GpuPreviewViewport::leaveEvent(QEvent *event)
@@ -2623,6 +2821,286 @@ void GpuPreviewViewport::onCycleMonitors()
     int idx = m_availableMonitors.indexOf(m_selectedMonitor);
     int nextIdx = (idx + 1) % m_availableMonitors.size();
     setSelectedMonitor(m_availableMonitors.at(nextIdx));
+}
+
+void GpuPreviewViewport::setGizmoActiveNode(const SceneLayerNode *node)
+{
+    m_gizmoOverlay.setActiveNode(node);
+    if (node) {
+        m_activeGizmoNodeId = node->id;
+        m_activeGizmoNodeName = node->name;
+    } else {
+        m_activeGizmoNodeId = -1;
+        m_activeGizmoNodeName.clear();
+    }
+    update();
+}
+
+void GpuPreviewViewport::setGizmoCameraAndLights(const we_camera3d_t &cam,
+                                                 const we_lighting_uniforms_t &lights)
+{
+    m_gizmoOverlay.setCameraAndLights(cam, lights);
+    m_hasGizmoEmittersOrLights = m_hasGizmoEmittersOrLights || (lights.active_light_count > 0u) ||
+                                 (cam.projection_mode != WE_PROJ_ORTHOGRAPHIC_2D) ||
+                                 (cam.dof_enabled > 0.5f);
+    update();
+}
+
+void GpuPreviewViewport::setGizmoEmitterWireframes(std::vector<GizmoEmitterWireframe> emitters)
+{
+    if (!emitters.empty()) {
+        m_hasGizmoEmittersOrLights = true;
+    }
+    m_gizmoOverlay.setEmitterWireframes(std::move(emitters));
+    update();
+}
+
+void GpuPreviewViewport::setToolMode(ViewportToolMode mode)
+{
+    if (m_gizmoOverlay.toolMode() == mode) {
+        return;
+    }
+    m_gizmoOverlay.setToolMode(mode);
+    m_brushStrokeActive = false;
+    emit toolModeChanged(mode);
+    update();
+}
+
+void GpuPreviewViewport::setSnapConfig(const ViewportGizmoSnapConfig &cfg)
+{
+    m_gizmoOverlay.setSnapConfig(cfg);
+    update();
+}
+
+void GpuPreviewViewport::setSceneViewProj(const QMatrix4x4 &viewProj, bool hasCustomViewProj)
+{
+    m_customSceneViewProj = viewProj;
+    m_hasCustomSceneViewProj = hasCustomViewProj;
+    update();
+}
+
+void GpuPreviewViewport::keyPressEvent(QKeyEvent *event)
+{
+    switch (event->key()) {
+    case Qt::Key_Escape:
+        setToolMode(ViewportToolMode::Navigate);
+        event->accept();
+        return;
+    case Qt::Key_Q:
+        setToolMode(ViewportToolMode::SelectBBox);
+        event->accept();
+        return;
+    case Qt::Key_W:
+        setToolMode(ViewportToolMode::Translate);
+        event->accept();
+        return;
+    case Qt::Key_E:
+        setToolMode(ViewportToolMode::Rotate);
+        event->accept();
+        return;
+    case Qt::Key_R:
+        setToolMode(ViewportToolMode::Scale);
+        event->accept();
+        return;
+    default:
+        break;
+    }
+    QOpenGLWidget::keyPressEvent(event);
+}
+
+bool GpuPreviewViewport::isBrushToolMode(ViewportToolMode mode) noexcept
+{
+    return mode == ViewportToolMode::BrushMask || mode == ViewportToolMode::BrushFlow ||
+           mode == ViewportToolMode::BrushBlurSmudge;
+}
+
+QPointF GpuPreviewViewport::mapWidgetToContentTexel(const QPointF &widgetPos) const noexcept
+{
+    const uint32_t cwU = std::max<uint32_t>(1u, contentWidth());
+    const uint32_t chU = std::max<uint32_t>(1u, contentHeight());
+    const double cw = static_cast<double>(cwU);
+    const double ch = static_cast<double>(chU);
+
+    if (m_parallaxEnabled && width() > 0 && height() > 0) {
+        const float ndcX =
+            static_cast<float>(2.0 * widgetPos.x() / static_cast<double>(width()) - 1.0);
+        const float ndcY =
+            static_cast<float>(1.0 - 2.0 * widgetPos.y() / static_cast<double>(height()));
+        bool invertible = false;
+        const QMatrix4x4 invMvp = computeBlitMvp(cwU, chU).inverted(&invertible);
+        if (invertible) {
+            const QVector4D pNear = invMvp.map(QVector4D(ndcX, ndcY, -1.0f, 1.0f));
+            const QVector4D pFar = invMvp.map(QVector4D(ndcX, ndcY, 1.0f, 1.0f));
+            if (std::abs(pNear.w()) > 1e-6f && std::abs(pFar.w()) > 1e-6f) {
+                const QVector3D o = pNear.toVector3DAffine();
+                const QVector3D f = pFar.toVector3DAffine();
+                const float dz = f.z() - o.z();
+                if (std::abs(dz) > 1e-6f) {
+                    const float t = -o.z() / dz;
+                    const QVector3D hit = o + (f - o) * t;
+                    const double u = static_cast<double>(hit.x()) * 0.5 + 0.5;
+                    const double v = 0.5 - static_cast<double>(hit.y()) * 0.5;
+                    return QPointF(std::clamp(u, 0.0, 1.0) * cw, std::clamp(v, 0.0, 1.0) * ch);
+                }
+            }
+        }
+    }
+
+    const QRectF displayRect = computeContentDisplayRect();
+    const double u = (widgetPos.x() - displayRect.left()) / std::max(1.0, displayRect.width());
+    const double v = (widgetPos.y() - displayRect.top()) / std::max(1.0, displayRect.height());
+    return QPointF(std::clamp(u, 0.0, 1.0) * cw, std::clamp(v, 0.0, 1.0) * ch);
+}
+
+QMatrix4x4 GpuPreviewViewport::computeBlitMvp(uint32_t contentW, uint32_t contentH) const noexcept
+{
+    const float vW = static_cast<float>(std::max(1, width()));
+    const float vH = static_cast<float>(std::max(1, height()));
+    const float vAspect = vW / vH;
+    const float cAspect =
+        static_cast<float>(std::max(1u, contentW)) / static_cast<float>(std::max(1u, contentH));
+
+    QMatrix4x4 mvp;
+    if (m_parallaxEnabled) {
+        mvp.perspective(45.0f, vAspect, 0.1f, 100.0f);
+        mvp.translate(0.0f, 0.0f, -2.42f);
+        mvp.translate(static_cast<float>(m_panOffset.x()) / (vW * 0.5f),
+                      -static_cast<float>(m_panOffset.y()) / (vH * 0.5f), 0.0f);
+        mvp.scale(m_zoom, m_zoom, 1.0f);
+
+        const float tiltAngleX = m_currentTiltX * 14.0f * m_parallaxStrength;
+        const float tiltAngleY = -m_currentTiltY * 11.0f * m_parallaxStrength;
+        mvp.rotate(tiltAngleX, 0.0f, 1.0f, 0.0f);
+        mvp.rotate(tiltAngleY, 1.0f, 0.0f, 0.0f);
+
+        if (cAspect >= 1.0f) {
+            mvp.scale(cAspect, 1.0f, 1.0f);
+        } else {
+            mvp.scale(1.0f, 1.0f / cAspect, 1.0f);
+        }
+    } else {
+        mvp.ortho(-vAspect, vAspect, -1.0f, 1.0f, -1.0f, 1.0f);
+        mvp.translate(static_cast<float>(m_panOffset.x()) / (vW * 0.5f) * vAspect,
+                      -static_cast<float>(m_panOffset.y()) / (vH * 0.5f), 0.0f);
+        mvp.scale(m_zoom, m_zoom, 1.0f);
+
+        if (cAspect > vAspect) {
+            mvp.scale(vAspect, vAspect / cAspect, 1.0f);
+        } else {
+            mvp.scale(cAspect, 1.0f, 1.0f);
+        }
+    }
+    return mvp;
+}
+
+QMatrix4x4 GpuPreviewViewport::computeGizmoViewProj(uint32_t contentW,
+                                                    uint32_t contentH) const noexcept
+{
+    if (m_hasCustomSceneViewProj) {
+        return m_customSceneViewProj;
+    }
+    const QMatrix4x4 blitMvp = computeBlitMvp(contentW, contentH);
+    QMatrix4x4 canvasToQuad;
+    canvasToQuad.translate(-1.0f, -1.0f, 0.0f);
+    canvasToQuad.scale(2.0f / static_cast<float>(std::max(1u, contentW)),
+                       2.0f / static_cast<float>(std::max(1u, contentH)), 1.0f);
+    return blitMvp * canvasToQuad;
+}
+
+void GpuPreviewViewport::ensureGizmoGlInitialized()
+{
+    if (m_gizmoProgram) {
+        return;
+    }
+    const bool isGles =
+        QOpenGLContext::currentContext() && QOpenGLContext::currentContext()->isOpenGLES();
+    const char *vsSrc = isGles ? kGizmoVertexShaderEs310 : kGizmoVertexShaderCore;
+    const char *fsSrc = isGles ? kGizmoFragmentShaderEs310 : kGizmoFragmentShaderCore;
+
+    m_gizmoProgram = std::make_unique<QOpenGLShaderProgram>(this);
+    if (!m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, vsSrc) ||
+        !m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, fsSrc) ||
+        !m_gizmoProgram->link()) {
+        m_gizmoProgram = std::make_unique<QOpenGLShaderProgram>(this);
+        if (!m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Vertex,
+                                                     kGizmoVertexShaderCore) ||
+            !m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Fragment,
+                                                     kGizmoFragmentShaderCore) ||
+            !m_gizmoProgram->link()) {
+            qWarning() << "[GpuPreviewViewport] Failed to compile/link gizmo shader:"
+                       << m_gizmoProgram->log();
+            m_gizmoProgram.reset();
+            return;
+        }
+    }
+
+    if (!m_gizmoVao.isCreated()) {
+        m_gizmoVao.create();
+    }
+    m_gizmoVao.bind();
+    if (!m_gizmoVbo.isCreated()) {
+        m_gizmoVbo.create();
+    }
+    m_gizmoVbo.bind();
+    m_gizmoVbo.setUsagePattern(QOpenGLBuffer::DynamicDraw);
+    m_gizmoVbo.allocate(
+        static_cast<int>(ViewportGizmoOverlay::kMaxDynamicVertices * sizeof(GizmoVertex)));
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GizmoVertex),
+                          reinterpret_cast<void *>(offsetof(GizmoVertex, x)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(GizmoVertex),
+                          reinterpret_cast<void *>(offsetof(GizmoVertex, r)));
+
+    m_gizmoVbo.release();
+    m_gizmoVao.release();
+}
+
+void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t contentH)
+{
+    if (m_gizmoOverlay.toolMode() == ViewportToolMode::Navigate && !m_hasGizmoEmittersOrLights) {
+        return;
+    }
+
+    const QMatrix4x4 viewProj = computeGizmoViewProj(contentW, contentH);
+    const QRectF displayRect = computeContentDisplayRect();
+    const float orthoZoom = std::max(0.01f, static_cast<float>(displayRect.height()) /
+                                                static_cast<float>(std::max(1u, contentH)));
+    const we_camera3d_t &cam = m_gizmoOverlay.camera();
+    const QVector3D camEye(cam.eye_pos[0], cam.eye_pos[1], cam.eye_pos[2]);
+    const float fovYDeg = (cam.fov_y_deg > 1.0f) ? cam.fov_y_deg : 60.0f;
+
+    m_gizmoOverlay.buildRenderVertices(size(), viewProj, camEye, fovYDeg, orthoZoom,
+                                       m_hasCustomSceneViewProj, m_gizmoVertices);
+    if (m_gizmoVertices.empty()) {
+        return;
+    }
+
+    ensureGizmoGlInitialized();
+    if (!m_gizmoProgram || !m_gizmoProgram->isLinked() || !m_gizmoVao.isCreated()) {
+        return;
+    }
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    m_gizmoProgram->bind();
+    m_gizmoProgram->setUniformValue("u_mvp", viewProj);
+
+    m_gizmoVao.bind();
+    m_gizmoVbo.bind();
+    const size_t vertCount =
+        std::min(m_gizmoVertices.size(), ViewportGizmoOverlay::kMaxDynamicVertices);
+    m_gizmoVbo.write(0, m_gizmoVertices.data(), static_cast<int>(vertCount * sizeof(GizmoVertex)));
+    glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(vertCount));
+    m_gizmoVbo.release();
+    m_gizmoVao.release();
+
+    m_gizmoProgram->release();
+    glDisable(GL_BLEND);
 }
 
 } // namespace waywal::studio

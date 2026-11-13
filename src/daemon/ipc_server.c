@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 #include "daemon_internal.h"
+#include "waywal/ipc_proto_authoring.h"
 #include "waywal/ipc_proto_phase3.h"
 #include "waywal/we_appworkshop.h"
 #include "waywal/we_compat_scanner.h"
@@ -21,6 +22,26 @@
 #include <time.h>
 
 static uint32_t g_last_render_duration_us = 0;
+
+static void ipc_copy_cstr(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0)
+        return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    if (dst == src) {
+        dst[cap - 1] = '\0';
+        return;
+    }
+    size_t i = 0;
+    while (i + 1 < cap && src[i] != '\0') {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
 
 static const char *scaling_mode_to_str(uint32_t mode)
 {
@@ -1460,9 +1481,11 @@ static void ipc_execute_workshop_sync(ipc_async_job_t *job)
                     total_bytes += it->size_bytes;
                 } else {
                     char item_dir[PATH_MAX];
-                    snprintf(item_dir, sizeof(item_dir), "%s/%llu", content_dir,
-                             (unsigned long long)it->published_file_id);
-                    total_bytes += ipc_sum_regular_files_bytes(item_dir, 0);
+                    int item_n = snprintf(item_dir, sizeof(item_dir), "%s/%llu", content_dir,
+                                          (unsigned long long)it->published_file_id);
+                    if (item_n > 0 && (size_t)item_n < sizeof(item_dir)) {
+                        total_bytes += ipc_sum_regular_files_bytes(item_dir, 0);
+                    }
                 }
             }
             waywal_appworkshop_free(&manifest);
@@ -1534,9 +1557,11 @@ static void ipc_execute_workshop_sync(ipc_async_job_t *job)
                         total_bytes += it->size_bytes;
                     } else if (has_content) {
                         char item_dir[PATH_MAX];
-                        snprintf(item_dir, sizeof(item_dir), "%s/%llu", content_dir,
-                                 (unsigned long long)it->published_file_id);
-                        total_bytes += ipc_sum_regular_files_bytes(item_dir, 0);
+                        int item_n = snprintf(item_dir, sizeof(item_dir), "%s/%llu", content_dir,
+                                              (unsigned long long)it->published_file_id);
+                        if (item_n > 0 && (size_t)item_n < sizeof(item_dir)) {
+                            total_bytes += ipc_sum_regular_files_bytes(item_dir, 0);
+                        }
                     }
                 }
                 waywal_appworkshop_free(&manifest);
@@ -1647,9 +1672,15 @@ static void ipc_execute_scan_compat(ipc_async_job_t *job)
         char repair_dir[PATH_MAX] = {0};
         const char *xdg_cache = getenv("XDG_CACHE_HOME");
         if (xdg_cache && xdg_cache[0] == '/') {
-            snprintf(repair_dir, sizeof(repair_dir), "%s/wwal/repairs/%s", xdg_cache, hex_id);
+            int n =
+                snprintf(repair_dir, sizeof(repair_dir), "%s/wwal/repairs/%s", xdg_cache, hex_id);
+            if (n < 0 || (size_t)n >= sizeof(repair_dir))
+                repair_dir[0] = '\0';
         } else if (ipc_resolve_user_home(home_dir, sizeof(home_dir))) {
-            snprintf(repair_dir, sizeof(repair_dir), "%s/.cache/wwal/repairs/%s", home_dir, hex_id);
+            int n = snprintf(repair_dir, sizeof(repair_dir), "%s/.cache/wwal/repairs/%s", home_dir,
+                             hex_id);
+            if (n < 0 || (size_t)n >= sizeof(repair_dir))
+                repair_dir[0] = '\0';
         }
         if (repair_dir[0] != '\0' && ipc_mkdir_p_safe(repair_dir, 0700)) {
             if (we_compat_apply_auto_repairs(report, job->scan_req.target_path, repair_dir)) {
@@ -1822,10 +1853,14 @@ static void ipc_execute_wwpkg_install(ipc_async_job_t *job)
         char pkg_dir[PATH_MAX] = {0};
         const char *xdg_data = getenv("XDG_DATA_HOME");
         if (xdg_data && xdg_data[0] == '/') {
-            snprintf(pkg_dir, sizeof(pkg_dir), "%s/wwal/packages/%s", xdg_data, uuid_hex);
+            int n = snprintf(pkg_dir, sizeof(pkg_dir), "%s/wwal/packages/%s", xdg_data, uuid_hex);
+            if (n < 0 || (size_t)n >= sizeof(pkg_dir))
+                pkg_dir[0] = '\0';
         } else if (ipc_resolve_user_home(home_dir, sizeof(home_dir))) {
-            snprintf(pkg_dir, sizeof(pkg_dir), "%s/.local/share/wwal/packages/%s", home_dir,
-                     uuid_hex);
+            int n = snprintf(pkg_dir, sizeof(pkg_dir), "%s/.local/share/wwal/packages/%s", home_dir,
+                             uuid_hex);
+            if (n < 0 || (size_t)n >= sizeof(pkg_dir))
+                pkg_dir[0] = '\0';
         }
 
         /* Landlock keeps ~/.local/share read-only in live daemon sessions while granting
@@ -1846,13 +1881,14 @@ static void ipc_execute_wwpkg_install(ipc_async_job_t *job)
         }
         if (!dir_ok && ipc_resolve_user_home(home_dir, sizeof(home_dir))) {
             const char *xdg_state = getenv("XDG_STATE_HOME");
+            int n = -1;
             if (xdg_state && xdg_state[0] == '/') {
-                snprintf(pkg_dir, sizeof(pkg_dir), "%s/wwal/packages/%s", xdg_state, uuid_hex);
+                n = snprintf(pkg_dir, sizeof(pkg_dir), "%s/wwal/packages/%s", xdg_state, uuid_hex);
             } else {
-                snprintf(pkg_dir, sizeof(pkg_dir), "%s/.local/state/wwal/packages/%s", home_dir,
-                         uuid_hex);
+                n = snprintf(pkg_dir, sizeof(pkg_dir), "%s/.local/state/wwal/packages/%s", home_dir,
+                             uuid_hex);
             }
-            if (ipc_mkdir_p_safe(pkg_dir, 0700)) {
+            if (n > 0 && (size_t)n < sizeof(pkg_dir) && ipc_mkdir_p_safe(pkg_dir, 0700)) {
                 dest_dfd = open(pkg_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             }
         }
@@ -2122,9 +2158,9 @@ static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_
                 job->wwpkg_entrypoint_abs[0] != '\0') {
                 waywal_shader_payload_t spay;
                 memset(&spay, 0, sizeof(spay));
-                snprintf(spay.output, sizeof(spay.output), "%s", tgt);
-                snprintf(spay.shader_path, sizeof(spay.shader_path), "%s",
-                         job->wwpkg_entrypoint_abs);
+                ipc_copy_cstr(spay.output, sizeof(spay.output), tgt);
+                ipc_copy_cstr(spay.shader_path, sizeof(spay.shader_path),
+                              job->wwpkg_entrypoint_abs);
                 spay.fps = job->wwpkg_target_fps > 0 ? job->wwpkg_target_fps : 60u;
                 (void)daemon_activate_shader(state, &spay);
             } else if (job->wwpkg_type >= WWPKG_TYPE_SCENE_2D &&
@@ -2132,16 +2168,15 @@ static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_
                        job->wwpkg_install_dir[0] != '\0') {
                 waywal_workshop_payload_t wpay;
                 memset(&wpay, 0, sizeof(wpay));
-                snprintf(wpay.output, sizeof(wpay.output), "%s", tgt);
-                snprintf(wpay.workshop_dir, sizeof(wpay.workshop_dir), "%s",
-                         job->wwpkg_install_dir);
+                ipc_copy_cstr(wpay.output, sizeof(wpay.output), tgt);
+                ipc_copy_cstr(wpay.workshop_dir, sizeof(wpay.workshop_dir), job->wwpkg_install_dir);
                 wpay.fps = job->wwpkg_target_fps > 0 ? job->wwpkg_target_fps : 60u;
                 if (!daemon_activate_workshop(state, &wpay) &&
                     job->wwpkg_entrypoint_abs[0] != '\0') {
                     waywal_output_saved_state_t sv;
                     memset(&sv, 0, sizeof(sv));
-                    snprintf(sv.output_name, sizeof(sv.output_name), "%s", tgt);
-                    snprintf(sv.media_path, sizeof(sv.media_path), "%s", job->wwpkg_entrypoint_abs);
+                    ipc_copy_cstr(sv.output_name, sizeof(sv.output_name), tgt);
+                    ipc_copy_cstr(sv.media_path, sizeof(sv.media_path), job->wwpkg_entrypoint_abs);
                     sv.kind = WAYWAL_CONTENT_STATIC_IMAGE;
                     sv.scaling = WAYWAL_SCALING_FILL;
                     (void)daemon_restore_output_entry(state, &sv, tgt);
@@ -2150,16 +2185,16 @@ static void ipc_async_complete_job_on_main(daemon_state_t *state, ipc_async_job_
                        job->wwpkg_entrypoint_abs[0] != '\0') {
                 waywal_output_saved_state_t sv;
                 memset(&sv, 0, sizeof(sv));
-                snprintf(sv.output_name, sizeof(sv.output_name), "%s", tgt);
-                snprintf(sv.media_path, sizeof(sv.media_path), "%s", job->wwpkg_entrypoint_abs);
+                ipc_copy_cstr(sv.output_name, sizeof(sv.output_name), tgt);
+                ipc_copy_cstr(sv.media_path, sizeof(sv.media_path), job->wwpkg_entrypoint_abs);
                 sv.kind = WAYWAL_CONTENT_VIDEO;
                 sv.scaling = WAYWAL_SCALING_FILL;
                 (void)daemon_restore_output_entry(state, &sv, tgt);
             } else if (job->wwpkg_entrypoint_abs[0] != '\0') {
                 waywal_output_saved_state_t sv;
                 memset(&sv, 0, sizeof(sv));
-                snprintf(sv.output_name, sizeof(sv.output_name), "%s", tgt);
-                snprintf(sv.media_path, sizeof(sv.media_path), "%s", job->wwpkg_entrypoint_abs);
+                ipc_copy_cstr(sv.output_name, sizeof(sv.output_name), tgt);
+                ipc_copy_cstr(sv.media_path, sizeof(sv.media_path), job->wwpkg_entrypoint_abs);
                 sv.kind = WAYWAL_CONTENT_STATIC_IMAGE;
                 sv.scaling = WAYWAL_SCALING_FILL;
                 (void)daemon_restore_output_entry(state, &sv, tgt);
@@ -2507,6 +2542,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         attached_fd = -1;
     }
 
+    bool keep_open = true;
+
     switch (req_hdr.opcode) {
     case WAYWAL_REQ_PING: {
         if (req_hdr.payload_size > 0) {
@@ -2668,9 +2705,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                 stop_engines_on_output(state, out, false, false, false, false);
                                 output_node_render_color(state, out, color);
                                 if (out->name[0] != '\0') {
-                                    memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                                    strncpy(s_entry.output_name, out->name,
-                                            sizeof(s_entry.output_name) - 1);
+                                    ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
+                                                  out->name);
                                     (void)waywal_state_store_update_output(&g_saved_state,
                                                                            &s_entry);
                                     int n = snprintf(matched_outputs + mo_len,
@@ -2684,8 +2720,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                             }
                         }
                         if (!any_matched && ptr[0] != '\0') {
-                            memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                            strncpy(s_entry.output_name, ptr, sizeof(s_entry.output_name) - 1);
+                            ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), ptr);
                             (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                             int n =
                                 snprintf(matched_outputs + mo_len, sizeof(matched_outputs) - mo_len,
@@ -2713,13 +2748,12 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     shader_engine_stop_playback(state);
                     anim_engine_stop_playback(state);
                     daemon_clear_all_outputs(state, color);
-                    strncpy(s_entry.output_name, "*", sizeof(s_entry.output_name) - 1);
+                    ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), "*");
                     (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
                         if (out->name[0] != '\0') {
-                            memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                            strncpy(s_entry.output_name, out->name,
-                                    sizeof(s_entry.output_name) - 1);
+                            ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
+                                          out->name);
                             (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                             int n =
                                 snprintf(matched_outputs + mo_len, sizeof(matched_outputs) - mo_len,
@@ -2910,9 +2944,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                 if (strcasecmp(meta->backdrop, "none") == 0) {
                                     state->backdrop_path[0] = '\0';
                                 } else if (!state->backdrop_auto_blur) {
-                                    strncpy(state->backdrop_path, meta->backdrop,
-                                            sizeof(state->backdrop_path) - 1);
-                                    state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+                                    ipc_copy_cstr(state->backdrop_path,
+                                                  sizeof(state->backdrop_path), meta->backdrop);
                                 }
                             }
                             if (meta->layer_name[0] != '\0') {
@@ -3108,12 +3141,13 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                     s_entry.crop_gravity_y =
                                         meta->has_crop_gravity ? meta->crop_gravity_y : 0.5f;
                                     s_entry.has_crop_gravity = meta->has_crop_gravity ? 1 : 0;
-                                    strncpy(s_entry.depth_map_path, meta->depth_map_path,
-                                            sizeof(s_entry.depth_map_path) - 1);
+                                    ipc_copy_cstr(s_entry.depth_map_path,
+                                                  sizeof(s_entry.depth_map_path),
+                                                  meta->depth_map_path);
                                     s_entry.depth_strength =
                                         meta->depth_strength > 0.0f ? meta->depth_strength : 1.0f;
-                                    strncpy(s_entry.backdrop, meta->backdrop,
-                                            sizeof(s_entry.backdrop) - 1);
+                                    ipc_copy_cstr(s_entry.backdrop, sizeof(s_entry.backdrop),
+                                                  meta->backdrop);
 
                                     if (meta->num_target_outputs > 0 &&
                                         !extra_has_wildcard(
@@ -3127,37 +3161,33 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                                  out = out->next) {
                                                 if (output_matches_target_spec(out, ptr) &&
                                                     out->name[0] != '\0') {
-                                                    memset(s_entry.output_name, 0,
-                                                           sizeof(s_entry.output_name));
-                                                    strncpy(s_entry.output_name, out->name,
-                                                            sizeof(s_entry.output_name) - 1);
+                                                    ipc_copy_cstr(s_entry.output_name,
+                                                                  sizeof(s_entry.output_name),
+                                                                  out->name);
                                                     (void)waywal_state_store_update_output(
                                                         &g_saved_state, &s_entry);
                                                     matched_out = true;
                                                 }
                                             }
                                             if (!matched_out) {
-                                                memset(s_entry.output_name, 0,
-                                                       sizeof(s_entry.output_name));
-                                                strncpy(s_entry.output_name, ptr,
-                                                        sizeof(s_entry.output_name) - 1);
+                                                ipc_copy_cstr(s_entry.output_name,
+                                                              sizeof(s_entry.output_name), ptr);
                                                 (void)waywal_state_store_update_output(
                                                     &g_saved_state, &s_entry);
                                             }
                                             ptr += strlen(ptr) + 1;
                                         }
                                     } else {
-                                        strncpy(s_entry.output_name, "*",
-                                                sizeof(s_entry.output_name) - 1);
+                                        ipc_copy_cstr(s_entry.output_name,
+                                                      sizeof(s_entry.output_name), "*");
                                         (void)waywal_state_store_update_output(&g_saved_state,
                                                                                &s_entry);
                                         for (output_node_t *out = state->outputs; out != NULL;
                                              out = out->next) {
                                             if (out->name[0] != '\0') {
-                                                memset(s_entry.output_name, 0,
-                                                       sizeof(s_entry.output_name));
-                                                strncpy(s_entry.output_name, out->name,
-                                                        sizeof(s_entry.output_name) - 1);
+                                                ipc_copy_cstr(s_entry.output_name,
+                                                              sizeof(s_entry.output_name),
+                                                              out->name);
                                                 (void)waywal_state_store_update_output(
                                                     &g_saved_state, &s_entry);
                                             }
@@ -3525,7 +3555,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 waywal_output_saved_state_t s_entry;
                 memset(&s_entry, 0, sizeof(s_entry));
                 s_entry.kind = WAYWAL_CONTENT_VIDEO;
-                strncpy(s_entry.media_path, vpay.filepath, sizeof(s_entry.media_path) - 1);
+                ipc_copy_cstr(s_entry.media_path, sizeof(s_entry.media_path), vpay.filepath);
                 s_entry.scaling = (waywal_scaling_mode_t)vpay.scaling_mode;
                 s_entry.video_speed = vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
                 s_entry.loop_count = vpay.loop_count;
@@ -3541,16 +3571,14 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         bool matched_out = false;
                         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
                             if (output_matches_target_spec(out, ptr) && out->name[0] != '\0') {
-                                memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                                strncpy(s_entry.output_name, out->name,
-                                        sizeof(s_entry.output_name) - 1);
+                                ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
+                                              out->name);
                                 (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                                 matched_out = true;
                             }
                         }
                         if (!matched_out) {
-                            memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                            strncpy(s_entry.output_name, ptr, sizeof(s_entry.output_name) - 1);
+                            ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), ptr);
                             (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                         }
                         size_t step = (size_t)(end - ptr) + 1;
@@ -3558,7 +3586,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         rem -= step;
                     }
                 } else {
-                    strncpy(s_entry.output_name, "*", sizeof(s_entry.output_name) - 1);
+                    ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), "*");
                     (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                 }
                 (void)waywal_state_store_save(&g_saved_state, NULL);
@@ -3767,7 +3795,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     waywal_output_saved_state_t s_entry;
                     memset(&s_entry, 0, sizeof(s_entry));
                     s_entry.kind = WAYWAL_CONTENT_SLIDESHOW;
-                    strncpy(s_entry.media_path, spay.path, sizeof(s_entry.media_path) - 1);
+                    ipc_copy_cstr(s_entry.media_path, sizeof(s_entry.media_path), spay.path);
                     s_entry.slideshow_interval_sec = spay.interval_s;
                     s_entry.scaling = (waywal_scaling_mode_t)spay.scaling_mode;
                     s_entry.filter = (waywal_filter_mode_t)spay.filter_mode;
@@ -3780,14 +3808,13 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                             spay.num_target_outputs <= 16 ? spay.num_target_outputs : 16;
                         for (uint32_t i = 0; i < max_t; ++i) {
                             if (spay.target_outputs[i][0] != '\0') {
-                                memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                                strncpy(s_entry.output_name, spay.target_outputs[i],
-                                        sizeof(s_entry.output_name) - 1);
+                                ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
+                                              spay.target_outputs[i]);
                                 (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                             }
                         }
                     } else {
-                        strncpy(s_entry.output_name, "*", sizeof(s_entry.output_name) - 1);
+                        ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), "*");
                         (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                     }
                     (void)waywal_state_store_save(&g_saved_state, NULL);
@@ -3913,8 +3940,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         for (output_node_t *o = state->outputs; o != NULL && rem_count < 16;
                              o = o->next) {
                             if (o->slideshow_eng == seen[k] && o->name[0] != '\0') {
-                                strncpy(seen[k]->target_outputs[rem_count], o->name,
-                                        sizeof(seen[k]->target_outputs[rem_count]) - 1);
+                                ipc_copy_cstr(seen[k]->target_outputs[rem_count],
+                                              sizeof(seen[k]->target_outputs[rem_count]), o->name);
                                 rem_count++;
                             }
                         }
@@ -3976,10 +4003,10 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                             output_matches_target_spec(m, target_spec)) {
                                             m->slideshow_eng = cloned;
                                             if (m->name[0] != '\0' && matched_cnt < 16) {
-                                                strncpy(
-                                                    cloned->target_outputs[matched_cnt], m->name,
-                                                    sizeof(cloned->target_outputs[matched_cnt]) -
-                                                        1);
+                                                ipc_copy_cstr(
+                                                    cloned->target_outputs[matched_cnt],
+                                                    sizeof(cloned->target_outputs[matched_cnt]),
+                                                    m->name);
                                                 matched_cnt++;
                                             }
                                         }
@@ -3991,8 +4018,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                     for (output_node_t *u = state->outputs;
                                          u != NULL && rem_cnt < 16; u = u->next) {
                                         if (u->slideshow_eng == ss && u->name[0] != '\0') {
-                                            strncpy(ss->target_outputs[rem_cnt], u->name,
-                                                    sizeof(ss->target_outputs[rem_cnt]) - 1);
+                                            ipc_copy_cstr(ss->target_outputs[rem_cnt],
+                                                          sizeof(ss->target_outputs[rem_cnt]),
+                                                          u->name);
                                             rem_cnt++;
                                         }
                                     }
@@ -4007,8 +4035,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                 for (output_node_t *m = state->outputs;
                                      m != NULL && matched_cnt < 16; m = m->next) {
                                     if (m->slideshow_eng == ss && m->name[0] != '\0') {
-                                        strncpy(ss->target_outputs[matched_cnt], m->name,
-                                                sizeof(ss->target_outputs[matched_cnt]) - 1);
+                                        ipc_copy_cstr(ss->target_outputs[matched_cnt],
+                                                      sizeof(ss->target_outputs[matched_cnt]),
+                                                      m->name);
                                         matched_cnt++;
                                     }
                                 }
@@ -4070,9 +4099,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     if (strcasecmp(spay.backdrop, "none") == 0) {
                         state->backdrop_path[0] = '\0';
                     } else if (!state->backdrop_auto_blur) {
-                        strncpy(state->backdrop_path, spay.backdrop,
-                                sizeof(state->backdrop_path) - 1);
-                        state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+                        ipc_copy_cstr(state->backdrop_path, sizeof(state->backdrop_path),
+                                      spay.backdrop);
                     }
                 }
 
@@ -4087,32 +4115,31 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     s_entry.kind = WAYWAL_CONTENT_SHADER;
                     const char *saved_sh_path =
                         state->shader_path[0] != '\0' ? state->shader_path : spay.shader_path;
-                    strncpy(s_entry.media_path, saved_sh_path, sizeof(s_entry.media_path) - 1);
+                    ipc_copy_cstr(s_entry.media_path, sizeof(s_entry.media_path), saved_sh_path);
                     s_entry.target_fps = spay.fps > 0 ? spay.fps : 60;
                     s_entry.audio_reactive = spay.audio_reactive;
                     s_entry.scaling = (waywal_scaling_mode_t)spay.scaling_mode;
                     s_entry.video_speed = spay.speed > 0.01f ? spay.speed : 1.0f;
                     s_entry.volume = spay.volume;
                     s_entry.mute_on_audio = spay.mute_on_audio;
-                    strncpy(s_entry.backdrop, spay.backdrop, sizeof(s_entry.backdrop) - 1);
+                    ipc_copy_cstr(s_entry.backdrop, sizeof(s_entry.backdrop), spay.backdrop);
                     if (spay.output[0] != '\0' && strchr(spay.output, ',') != NULL) {
                         char out_copy[sizeof(spay.output)];
-                        strncpy(out_copy, spay.output, sizeof(out_copy) - 1);
-                        out_copy[sizeof(out_copy) - 1] = '\0';
+                        ipc_copy_cstr(out_copy, sizeof(out_copy), spay.output);
                         char *saveptr = NULL;
                         for (char *tok = strtok_r(out_copy, ",", &saveptr); tok != NULL;
                              tok = strtok_r(NULL, ",", &saveptr)) {
                             while (*tok == ' ')
                                 tok++;
                             if (*tok != '\0') {
-                                memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                                strncpy(s_entry.output_name, tok, sizeof(s_entry.output_name) - 1);
+                                ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
+                                              tok);
                                 (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                             }
                         }
                     } else {
-                        strncpy(s_entry.output_name, spay.output[0] ? spay.output : "*",
-                                sizeof(s_entry.output_name) - 1);
+                        ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
+                                      spay.output[0] ? spay.output : "*");
                         (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                     }
                     (void)waywal_state_store_save(&g_saved_state, NULL);
@@ -4178,9 +4205,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     if (strcasecmp(wpay.backdrop, "none") == 0) {
                         state->backdrop_path[0] = '\0';
                     } else if (!state->backdrop_auto_blur) {
-                        strncpy(state->backdrop_path, wpay.backdrop,
-                                sizeof(state->backdrop_path) - 1);
-                        state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+                        ipc_copy_cstr(state->backdrop_path, sizeof(state->backdrop_path),
+                                      wpay.backdrop);
                     }
                 }
                 if (wpay.layer_name[0] != '\0') {
@@ -4202,33 +4228,32 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     s_entry.kind = WAYWAL_CONTENT_WORKSHOP;
                     const char *saved_ws_dir =
                         state->workshop_dir[0] != '\0' ? state->workshop_dir : wpay.workshop_dir;
-                    strncpy(s_entry.media_path, saved_ws_dir, sizeof(s_entry.media_path) - 1);
-                    strncpy(s_entry.prop_overrides, wpay.prop_overrides,
-                            sizeof(s_entry.prop_overrides) - 1);
+                    ipc_copy_cstr(s_entry.media_path, sizeof(s_entry.media_path), saved_ws_dir);
+                    ipc_copy_cstr(s_entry.prop_overrides, sizeof(s_entry.prop_overrides),
+                                  wpay.prop_overrides);
                     s_entry.target_fps = wpay.fps > 0 ? wpay.fps : 60;
                     s_entry.audio_reactive = wpay.audio_reactive;
                     s_entry.scaling = (waywal_scaling_mode_t)wpay.scaling_mode;
                     s_entry.volume = wpay.volume;
                     s_entry.mute_on_audio = wpay.mute_on_audio;
-                    strncpy(s_entry.backdrop, wpay.backdrop, sizeof(s_entry.backdrop) - 1);
+                    ipc_copy_cstr(s_entry.backdrop, sizeof(s_entry.backdrop), wpay.backdrop);
                     if (wpay.output[0] != '\0' && strchr(wpay.output, ',') != NULL) {
                         char out_copy[sizeof(wpay.output)];
-                        strncpy(out_copy, wpay.output, sizeof(out_copy) - 1);
-                        out_copy[sizeof(out_copy) - 1] = '\0';
+                        ipc_copy_cstr(out_copy, sizeof(out_copy), wpay.output);
                         char *saveptr = NULL;
                         for (char *tok = strtok_r(out_copy, ",", &saveptr); tok != NULL;
                              tok = strtok_r(NULL, ",", &saveptr)) {
                             while (*tok == ' ')
                                 tok++;
                             if (*tok != '\0') {
-                                memset(s_entry.output_name, 0, sizeof(s_entry.output_name));
-                                strncpy(s_entry.output_name, tok, sizeof(s_entry.output_name) - 1);
+                                ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
+                                              tok);
                                 (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                             }
                         }
                     } else {
-                        strncpy(s_entry.output_name, wpay.output[0] ? wpay.output : "*",
-                                sizeof(s_entry.output_name) - 1);
+                        ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
+                                      wpay.output[0] ? wpay.output : "*");
                         (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
                     }
                     (void)waywal_state_store_save(&g_saved_state, NULL);
@@ -5114,7 +5139,21 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     case WAYWAL_REQ_SET_CAMERA_3D:
     case WAYWAL_REQ_SET_PHYSICS_PARAMS:
     case WAYWAL_REQ_SET_SCENE_LIGHTS:
-        daemon_dispatch_phase3_ipc(state, client_fd, &req_hdr, attached_fd);
+        keep_open = daemon_dispatch_phase3_ipc(state, client_fd, &req_hdr, attached_fd);
+        attached_fd = -1;
+        break;
+
+    case WAYWAL_REQ_SCENE_MUTATE:
+    case WAYWAL_REQ_HOT_RELOAD_CODE:
+    case WAYWAL_REQ_QUERY_SCENE_TREE:
+    case WAYWAL_REQ_SET_SHADER_COMBO:
+    case WAYWAL_REQ_BRUSH_STROKE:
+    case WAYWAL_REQ_PARTICLE_CONFIG:
+    case WAYWAL_REQ_SET_AUDIO_BINDINGS:
+    case WAYWAL_REQ_EXPORT_SCENE_PKG:
+    case WAYWAL_REQ_LINT_SCENESCRIPT:
+    case WAYWAL_REQ_READBACK_TEXTURE:
+        keep_open = daemon_dispatch_authoring_ipc(state, client_fd, &req_hdr, attached_fd);
         attached_fd = -1;
         break;
 
@@ -5131,7 +5170,11 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         close(attached_fd);
         attached_fd = -1;
     }
-    if (!daemon_is_subscriber_fd(state, client_fd)) {
+    if (daemon_is_subscriber_fd(state, client_fd)) {
+        if (!keep_open) {
+            daemon_remove_subscriber_fd(state, client_fd);
+        }
+    } else {
         close(client_fd);
     }
 }

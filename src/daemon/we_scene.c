@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #ifndef __has_feature
 #define __has_feature(x) 0
@@ -2568,6 +2569,11 @@ static void render_scene_to_fbo(we_scene_t *scene, uint32_t target_w, uint32_t t
     float frustum_planes[6][4];
     bool frustum_valid = is_3d && extract_frustum_planes(vp, frustum_planes);
 
+    /* Evaluate native audio bindings before packing lights UBO or drawing passes */
+    if (scene->audio_binding_count > 0u) {
+        (void)we_scene_step_audio_bindings(scene, params ? params->audio : NULL, dt_sec);
+    }
+
     if (!scene->lighting_ipc_override) {
         we_scene_light_t active_lights[WE_MAX_SCENE_LIGHTS];
         uint32_t active_light_count = 0;
@@ -3719,6 +3725,9 @@ bool we_scene_render_rgba8(we_scene_t *scene, uint32_t width, uint32_t height,
         scene->last_audio_step_time = audio_t;
         (void)we_scene_step_audio(scene, dt_sec);
     }
+    if (scene->audio_binding_count > 0u) {
+        (void)we_scene_step_audio_bindings(scene, params ? params->audio : NULL, dt_sec);
+    }
 
     for (uint32_t i = 0; i < scene->object_count; i++) {
         we_scene_object_t *obj = &scene->objects[i];
@@ -4126,6 +4135,9 @@ void we_scene_destroy(we_scene_t *scene)
     if (!scene) {
         return;
     }
+    if (scene->on_destroy_cb) {
+        scene->on_destroy_cb(scene);
+    }
 
     if (scene->audio_out) {
         waywal_audio_clear_playback(scene->audio_out);
@@ -4393,4 +4405,422 @@ void we_scene_set_media_playing(we_scene_t *scene, float playing)
         return;
     }
     scene->media_playing = playing;
+}
+
+/* =========================================================================
+ * Zero-Allocation Native Audio-Binding Evaluator (64-Band Bark + IIR)
+ * ========================================================================= */
+
+bool we_scene_apply_audio_bindings(we_scene_t *scene, we_audio_bind_op_t op,
+                                   const we_audio_binding_t *bindings, uint32_t count,
+                                   uint32_t remove_id)
+{
+    if (!scene) {
+        return false;
+    }
+
+    switch (op) {
+    case WE_AUDIO_BIND_OP_CLEAR:
+        scene->audio_binding_count = 0u;
+        return true;
+
+    case WE_AUDIO_BIND_OP_REPLACE_ALL: {
+        uint32_t n = (bindings && count > 0u)
+                         ? (count <= WE_MAX_AUDIO_BINDINGS ? count : WE_MAX_AUDIO_BINDINGS)
+                         : 0u;
+        if (n > 0u) {
+            memcpy(scene->audio_bindings, bindings, n * sizeof(we_audio_binding_t));
+        }
+        scene->audio_binding_count = n;
+        return true;
+    }
+
+    case WE_AUDIO_BIND_OP_UPSERT: {
+        if (!bindings || count == 0u) {
+            return false;
+        }
+        for (uint32_t k = 0; k < count; k++) {
+            const we_audio_binding_t *in_b = &bindings[k];
+            bool found = false;
+            for (uint32_t i = 0; i < scene->audio_binding_count; i++) {
+                if (scene->audio_bindings[i].binding_id == in_b->binding_id) {
+                    /* Preserve runtime filter state when updating tuning params live */
+                    float prev_env = scene->audio_bindings[i].env_state;
+                    float prev_cd = scene->audio_bindings[i].cooldown_rem_sec;
+                    uint8_t prev_gate = scene->audio_bindings[i].gate_open;
+                    scene->audio_bindings[i] = *in_b;
+                    scene->audio_bindings[i].env_state = prev_env;
+                    scene->audio_bindings[i].cooldown_rem_sec = prev_cd;
+                    scene->audio_bindings[i].gate_open = prev_gate;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && scene->audio_binding_count < WE_MAX_AUDIO_BINDINGS) {
+                scene->audio_bindings[scene->audio_binding_count++] = *in_b;
+            }
+        }
+        return true;
+    }
+
+    case WE_AUDIO_BIND_OP_REMOVE: {
+        uint32_t write_idx = 0u;
+        for (uint32_t i = 0; i < scene->audio_binding_count; i++) {
+            if (scene->audio_bindings[i].binding_id != remove_id) {
+                if (write_idx != i) {
+                    scene->audio_bindings[write_idx] = scene->audio_bindings[i];
+                }
+                write_idx++;
+            }
+        }
+        scene->audio_binding_count = write_idx;
+        return true;
+    }
+
+    default:
+        return false;
+    }
+}
+
+static inline we_material_pass_t *audio_resolve_pass(we_scene_object_t *obj, uint32_t sub_idx)
+{
+    if (sub_idx == UINT32_MAX) {
+        return obj->has_base_pass ? &obj->base_pass : NULL;
+    }
+    uint32_t cursor = 0u;
+    if (obj->effects) {
+        for (uint32_t e = 0; e < obj->effect_count; e++) {
+            we_effect_t *eff = &obj->effects[e];
+            if (!eff->passes) {
+                continue;
+            }
+            if (sub_idx < cursor + eff->pass_count) {
+                return &eff->passes[sub_idx - cursor];
+            }
+            cursor += eff->pass_count;
+        }
+    }
+    if (sub_idx == 0u && obj->has_base_pass) {
+        return &obj->base_pass;
+    }
+    return NULL;
+}
+
+static inline void apply_audio_binding_target(we_scene_object_t *obj, const we_audio_binding_t *b,
+                                              float val, bool burst_fired)
+{
+    switch ((we_audio_target_kind_t)b->target_kind) {
+    case WE_AUDIO_TGT_LAYER_ORIGIN_X:
+        obj->origin[0] = val;
+        break;
+    case WE_AUDIO_TGT_LAYER_ORIGIN_Y:
+        obj->origin[1] = val;
+        break;
+    case WE_AUDIO_TGT_LAYER_SCALE_XY:
+        obj->scale[0] = val;
+        obj->scale[1] = val;
+        break;
+    case WE_AUDIO_TGT_LAYER_ROTATION_Z:
+        obj->angles[2] = val;
+        break;
+    case WE_AUDIO_TGT_LAYER_ALPHA:
+        obj->alpha = fminf(fmaxf(val, 0.0f), 1.0f);
+        break;
+    case WE_AUDIO_TGT_LAYER_BRIGHTNESS:
+        obj->brightness = fmaxf(val, 0.0f);
+        break;
+    case WE_AUDIO_TGT_LAYER_COLOR_RGB: {
+        float c = fmaxf(val, 0.0f);
+        obj->color[0] = c;
+        obj->color[1] = c;
+        obj->color[2] = c;
+        break;
+    }
+    case WE_AUDIO_TGT_PASS_UNIFORM_COMP: {
+        we_material_pass_t *pass = audio_resolve_pass(obj, b->target_sub_index);
+        if (!pass || b->uniform_name[0] == '\0') {
+            break;
+        }
+        uint32_t comp = b->target_component < 4u ? b->target_component : 0u;
+        we_const_val_t *cv = NULL;
+        for (uint32_t i = 0; i < pass->const_val_count; i++) {
+            if (strcmp(pass->const_vals[i].name, b->uniform_name) == 0) {
+                cv = &pass->const_vals[i];
+                break;
+            }
+        }
+        if (!cv && pass->const_val_count < WE_MAX_CONST_VALS) {
+            cv = &pass->const_vals[pass->const_val_count++];
+            memset(cv, 0, sizeof(*cv));
+            snprintf(cv->name, sizeof(cv->name), "%s", b->uniform_name);
+            cv->num_components = 4u;
+        }
+        if (cv) {
+            cv->val[comp] = val;
+        }
+        break;
+    }
+    case WE_AUDIO_TGT_LIGHT_INTENSITY:
+        obj->light_intensity = fmaxf(val, 0.0f);
+        break;
+    case WE_AUDIO_TGT_LIGHT_RADIUS:
+        obj->light_radius = fmaxf(val, 1.0f);
+        break;
+    case WE_AUDIO_TGT_PARTICLE_RATE: {
+        we_particle_sys_t *ps = obj->particle_sys;
+        if (ps && ps->emitter_count > 0u) {
+            uint32_t ei = b->target_sub_index < ps->emitter_count ? b->target_sub_index : 0u;
+            ps->emitters[ei].rate = fmaxf(val, 0.0f);
+        }
+        break;
+    }
+    case WE_AUDIO_TGT_PARTICLE_SPEED: {
+        we_particle_sys_t *ps = obj->particle_sys;
+        if (ps && ps->emitter_count > 0u) {
+            uint32_t ei = b->target_sub_index < ps->emitter_count ? b->target_sub_index : 0u;
+            float spd = fmaxf(val, 0.0f);
+            ps->emitters[ei].speed_min = spd;
+            ps->emitters[ei].speed_max = spd;
+        }
+        break;
+    }
+    case WE_AUDIO_TGT_PARTICLE_TURB_SPEED: {
+        we_particle_sys_t *ps = obj->particle_sys;
+        if (ps) {
+            float spd = fmaxf(val, 0.0f);
+            if (b->target_sub_index < ps->operator_count &&
+                ps->operators[b->target_sub_index].type == WE_OP_TURBULENCE) {
+                ps->operators[b->target_sub_index].turb_speed = spd;
+            } else {
+                for (uint32_t o = 0; o < ps->operator_count; o++) {
+                    if (ps->operators[o].type == WE_OP_TURBULENCE) {
+                        ps->operators[o].turb_speed = spd;
+                        break;
+                    }
+                }
+            }
+        }
+        break;
+    }
+    case WE_AUDIO_TGT_PARTICLE_VORTEX_SPD: {
+        we_particle_sys_t *ps = obj->particle_sys;
+        if (ps) {
+            if (b->target_sub_index < ps->operator_count &&
+                ps->operators[b->target_sub_index].type == WE_OP_VORTEX) {
+                ps->operators[b->target_sub_index].speed_inner = val;
+                ps->operators[b->target_sub_index].speed_outer = val;
+            } else {
+                for (uint32_t o = 0; o < ps->operator_count; o++) {
+                    if (ps->operators[o].type == WE_OP_VORTEX) {
+                        ps->operators[o].speed_inner = val;
+                        ps->operators[o].speed_outer = val;
+                        break;
+                    }
+                }
+            }
+        }
+        break;
+    }
+    case WE_AUDIO_TGT_PARTICLE_BURST_TRIG:
+        if (obj->particle_sys && burst_fired) {
+            float safe_val = isfinite(val) ? fminf(fmaxf(val, 1.0f), 4096.0f) : 1.0f;
+            uint32_t burst_n = (uint32_t)roundf(safe_val);
+            we_particle_trigger_burst(obj->particle_sys, burst_n);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+uint32_t we_scene_step_audio_bindings(we_scene_t *scene, const waywal_audio_frame_t *audio,
+                                      float dt_sec)
+{
+    if (!scene || scene->audio_binding_count == 0u) {
+        return 0u;
+    }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    float dt = (!isfinite(dt_sec) || dt_sec <= 0.0f) ? 0.0f : fminf(dt_sec, 0.25f);
+    uint32_t count = scene->audio_binding_count <= WE_MAX_AUDIO_BINDINGS
+                         ? scene->audio_binding_count
+                         : WE_MAX_AUDIO_BINDINGS;
+    uint32_t evaluated = 0u;
+
+    we_scene_object_t *cached_obj = NULL;
+    int32_t cached_id = INT32_MIN;
+
+    for (uint32_t i = 0; i < count; i++) {
+        we_audio_binding_t *b = &scene->audio_bindings[i];
+        if (!b->enabled) {
+            continue;
+        }
+        evaluated++;
+
+        float x = 0.0f;
+        if (audio) {
+            switch ((we_audio_src_kind_t)b->src_kind) {
+            case WE_AUDIO_SRC_BARK_RANGE: {
+                uint16_t s = b->band_start < 64u ? b->band_start : 63u;
+                uint16_t e = b->band_end < 64u ? b->band_end : 63u;
+                if (e < s) {
+                    uint16_t tmp = s;
+                    s = e;
+                    e = tmp;
+                }
+                float sum = 0.0f;
+                float peak = 0.0f;
+                for (uint16_t k = s; k <= e; k++) {
+                    float v = audio->bands[k];
+                    if (!isfinite(v) || v < 0.0f) {
+                        v = 0.0f;
+                    }
+                    sum += v;
+                    if (v > peak) {
+                        peak = v;
+                    }
+                }
+                float mean = sum / (float)(e - s + 1u);
+                if (b->agg_mode == WE_AUDIO_AGG_MEAN) {
+                    x = mean;
+                } else if (b->agg_mode == WE_AUDIO_AGG_PEAK) {
+                    x = peak;
+                } else {
+                    x = 0.7f * peak + 0.3f * mean;
+                }
+                break;
+            }
+            case WE_AUDIO_SRC_ENVELOPE:
+                x = audio->envelope;
+                break;
+            case WE_AUDIO_SRC_BASS_ENERGY:
+                x = audio->bass_energy;
+                break;
+            case WE_AUDIO_SRC_BEAT_PULSE:
+                x = audio->beat_pulse;
+                break;
+            default:
+                x = 0.0f;
+                break;
+            }
+        }
+        if (!isfinite(x) || x < 0.0f) {
+            x = 0.0f;
+        }
+
+        float thresh = fminf(fmaxf(b->threshold_open, 0.0f), 0.98f);
+        float hyst = fminf(fmaxf(b->hysteresis, 0.0f), 0.25f);
+        float close_thresh = fmaxf(0.0f, thresh - hyst);
+        uint8_t prev_gate = b->gate_open;
+        if (!b->gate_open && x >= thresh) {
+            b->gate_open = 1u;
+        } else if (b->gate_open && x < close_thresh) {
+            b->gate_open = 0u;
+        }
+
+        float gain = fminf(fmaxf(b->input_gain, 0.0f), 10.0f);
+        float gated = b->gate_open ? fminf(fmaxf(x * gain, 0.0f), 1.0f) : 0.0f;
+
+        if (!isfinite(b->env_state)) {
+            b->env_state = 0.0f;
+        }
+        float tau = (gated > b->env_state) ? b->attack_sec : b->release_sec;
+        if (!isfinite(tau) || tau < 0.0f) {
+            tau = 0.0f;
+        }
+        float alpha = (dt <= 0.0f) ? 0.0f : ((tau <= 1e-4f) ? 1.0f : (1.0f - expf(-dt / tau)));
+        b->env_state += alpha * (gated - b->env_state);
+        if (!isfinite(b->env_state)) {
+            b->env_state = 0.0f;
+        }
+        float u = fminf(fmaxf(b->env_state, 0.0f), 1.0f);
+
+        if (!isfinite(b->cooldown_rem_sec) || b->cooldown_rem_sec < 0.0f) {
+            b->cooldown_rem_sec = 0.0f;
+        } else if (b->cooldown_rem_sec > 0.0f && dt > 0.0f) {
+            b->cooldown_rem_sec = fmaxf(0.0f, b->cooldown_rem_sec - dt);
+        }
+
+        bool burst_fired = false;
+        float u_shaped = u;
+        switch ((we_audio_curve_t)b->curve_shape) {
+        case WE_AUDIO_CURVE_LINEAR:
+            u_shaped = u;
+            break;
+        case WE_AUDIO_CURVE_QUADRATIC:
+            u_shaped = u * u;
+            break;
+        case WE_AUDIO_CURVE_SQRT:
+            u_shaped = sqrtf(u);
+            break;
+        case WE_AUDIO_CURVE_SMOOTHSTEP:
+            u_shaped = u * u * (3.0f - 2.0f * u);
+            break;
+        case WE_AUDIO_CURVE_TRIG_EDGE: {
+            bool rising = (!prev_gate && b->gate_open);
+            if (rising && b->cooldown_rem_sec <= 0.0f) {
+                burst_fired = true;
+                b->cooldown_rem_sec = 0.080f;
+                u_shaped = 1.0f;
+            } else {
+                u_shaped = 0.0f;
+            }
+            break;
+        }
+        default:
+            u_shaped = u;
+            break;
+        }
+
+        float out_min = isfinite(b->out_min) ? fminf(fmaxf(b->out_min, -1e6f), 1e6f) : 0.0f;
+        float out_max = isfinite(b->out_max) ? fminf(fmaxf(b->out_max, -1e6f), 1e6f) : 0.0f;
+        float base_val = isfinite(b->base_value) ? fminf(fmaxf(b->base_value, -1e6f), 1e6f) : 0.0f;
+        float mod = out_min + u_shaped * (out_max - out_min);
+        float out_val = mod;
+        if (b->blend_mode == WE_AUDIO_BLEND_ADD) {
+            out_val = base_val + mod;
+        } else if (b->blend_mode == WE_AUDIO_BLEND_MULTIPLY) {
+            out_val = base_val * mod;
+        }
+        if (!isfinite(out_val)) {
+            out_val = 0.0f;
+        } else {
+            out_val = fminf(fmaxf(out_val, -1e6f), 1e6f);
+        }
+        b->last_output = out_val;
+
+        we_scene_object_t *obj = NULL;
+        if (cached_obj && cached_id == b->target_object_id) {
+            obj = cached_obj;
+        } else {
+            for (uint32_t oi = 0; oi < scene->object_count; oi++) {
+                if (scene->objects[oi].id == b->target_object_id) {
+                    obj = &scene->objects[oi];
+                    cached_obj = obj;
+                    cached_id = b->target_object_id;
+                    break;
+                }
+            }
+        }
+        bool rising = (!prev_gate && b->gate_open);
+        bool trig = burst_fired;
+        if (!trig && b->curve_shape != WE_AUDIO_CURVE_TRIG_EDGE && rising &&
+            b->cooldown_rem_sec <= 0.0f) {
+            trig = true;
+            if (b->target_kind == WE_AUDIO_TGT_PARTICLE_BURST_TRIG) {
+                b->cooldown_rem_sec = 0.080f;
+            }
+        }
+        if (obj) {
+            apply_audio_binding_target(obj, b, out_val, trig);
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    int64_t ns =
+        (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000000LL + (int64_t)(t1.tv_nsec - t0.tv_nsec);
+    scene->last_audio_bindings_eval_ns = (ns > 0) ? (uint32_t)ns : 0u;
+    return evaluated;
 }

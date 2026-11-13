@@ -130,6 +130,24 @@ bool we_script_eval_cursor_move(we_script_t *script, const we_script_env_t *env,
 bool we_script_eval_apply_user_properties(we_script_t *script, const we_script_env_t *env,
                                           we_script_layer_state_t *inout_layer);
 
+typedef enum {
+    WE_SCRIPT_LINT_OK = 0,
+    WE_SCRIPT_LINT_SYNTAX_ERR = 1,
+    WE_SCRIPT_LINT_DEPTH_EXCEEDED = 2,
+} we_script_lint_status_t;
+
+typedef struct {
+    uint32_t status_code;
+    uint32_t error_line;
+    uint32_t error_col;
+    uint32_t lint_time_us;
+    char error_msg[256];
+} we_script_diag_t;
+
+/* Runs a <= 64 KiB bounded scratch-arena AST lint pass on SceneScript JS source.
+ * Returns true if syntactically valid (status_code == WE_SCRIPT_LINT_OK). */
+bool we_script_lint(const char *src, size_t len, uint32_t flags, we_script_diag_t *out_diag);
+
 /* Telemetry & watchdog inspection helpers */
 bool we_script_was_aborted(const we_script_t *script);
 uint32_t we_script_last_step_count(const we_script_t *script);

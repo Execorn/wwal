@@ -964,7 +964,7 @@ ws_parse_details_slice(const char *src, size_t slice_lo, size_t slice_hi, size_t
             return out;
         }
 
-        size_t owner_pos;
+        size_t owner_pos = 0;
         if (__builtin_expect(hint_tid < nth &&
                                  sub_base[(size_t)hint_tid * per_cap + hint_k].published_file_id ==
                                      id,

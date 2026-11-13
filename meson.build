@@ -80,9 +80,6 @@ extra_cpp_args = cpp.get_supported_arguments([
   '-ffunction-sections',
   '-fdata-sections',
 ])
-if host_machine.cpu_family() == 'x86_64'
-  extra_cpp_args += cpp.get_supported_arguments(['-mavx2', '-mfma'])
-endif
 add_project_arguments(extra_cpp_args, language: 'cpp')
 
 extra_cpp_link_args = cpp.get_supported_link_arguments([
@@ -238,6 +235,11 @@ proto_dep = declare_dependency(
   dependencies: [wayland_client_dep]
 )
 
+proto_headers_dep = declare_dependency(
+  sources: proto_headers,
+  dependencies: [wayland_client_dep.partial_dependency(compile_args: true, includes: true)],
+)
+
 # Image dependencies for common loader
 png_dep = dependency('libpng', required: false)
 turbojpeg_dep = dependency('libturbojpeg', required: false)
@@ -269,6 +271,7 @@ core_sources = files(
   'src/common/wwpkg.c',
   'src/common/we_compat_scanner.c',
   'src/common/shader_graph.c',
+  'src/common/we_asset_writer.c',
 )
 
 core_deps = [threads_dep, m_dep, dl_dep]
@@ -299,6 +302,70 @@ waywal_core_dep = declare_dependency(
 common_sources = core_sources
 common_lib = waywal_core_lib
 common_dep = waywal_core_dep
+
+# ==============================================================================
+# WayWal Scene & Authoring Engine Static Library (libwaywal_engine.a)
+# Shared between wwald, wwal-studio, and authoring/engine test suites
+# ==============================================================================
+
+engine_sources = files(
+  'src/daemon/we_tex.c',
+  'src/daemon/we_shader.c',
+  'src/daemon/we_puppet.c',
+  'src/daemon/we_particle.c',
+  'src/daemon/we_script_parse.c',
+  'src/daemon/we_script.c',
+  'src/daemon/we_scene_parse.c',
+  'src/daemon/we_scene.c',
+  'src/daemon/we_builtin_effects.c',
+  'src/daemon/we_physics.c',
+  'src/daemon/we_camera3d.c',
+  'src/daemon/we_tex_writer.c',
+  'src/daemon/we_scene_writer.c',
+  'src/daemon/we_gpu_brush.c',
+)
+
+engine_inc_dirs = [inc_dir, include_directories('src/daemon')]
+
+engine_compile_deps = [
+  waywal_core_dep,
+  proto_headers_dep,
+  egl_dep,
+  glesv2_dep,
+  libdrm_dep,
+  threads_dep,
+  m_dep,
+  dl_dep,
+]
+if have_ffmpeg_swdec
+  engine_compile_deps += [
+    avcodec_dep.partial_dependency(compile_args: true, includes: true),
+    avutil_dep.partial_dependency(compile_args: true, includes: true),
+    swscale_dep.partial_dependency(compile_args: true, includes: true),
+  ]
+endif
+
+waywal_engine_lib = static_library('waywal_engine',
+  engine_sources,
+  include_directories: engine_inc_dirs,
+  dependencies: engine_compile_deps,
+  pic: true,
+  install: false,
+)
+
+waywal_engine_dep = declare_dependency(
+  link_with: waywal_engine_lib,
+  include_directories: engine_inc_dirs,
+  dependencies: [
+    waywal_core_dep,
+    egl_dep,
+    glesv2_dep,
+    libdrm_dep,
+    threads_dep,
+    m_dep,
+    dl_dep,
+  ],
+)
 
 
 # Daemon executable (wwald)
@@ -334,20 +401,10 @@ daemon_sources = files(
   'src/daemon/audio_fft.c',
   'src/daemon/mpris.c',
   'src/daemon/shader_engine.c',
-  'src/daemon/we_tex.c',
-  'src/daemon/we_shader.c',
-  'src/daemon/we_puppet.c',
-  'src/daemon/we_particle.c',
-  'src/daemon/we_script_parse.c',
-  'src/daemon/we_script.c',
-  'src/daemon/we_scene_parse.c',
-  'src/daemon/we_scene.c',
-  'src/daemon/we_builtin_effects.c',
-  'src/daemon/we_physics.c',
-  'src/daemon/we_camera3d.c',
 )
 
 daemon_deps = [
+  waywal_engine_dep,
   waywal_core_dep,
   proto_dep,
   shaders_dep,
@@ -443,6 +500,11 @@ if qt6_dep.found() and sqlite3_dep.found()
     'src/studio/graph/effect_library_browser_widget.hpp',
     'src/studio/inspector/camera_lighting_inspector_widget.hpp',
     'src/studio/inspector/physics_spring_inspector_widget.hpp',
+    'src/studio/scene/scene_layer_tree_widget.hpp',
+    'src/studio/brush/gpu_brush_painter_widget.hpp',
+    'src/studio/particle/particle_designer_widget.hpp',
+    'src/studio/audio/audio_binding_wizard.hpp',
+    'src/studio/editor/glsl_scenescript_editor_widget.hpp',
   )
 
   studio_inc_dirs = [inc_dir, include_directories('src', 'src/studio')]
@@ -485,13 +547,19 @@ if qt6_dep.found() and sqlite3_dep.found()
     'src/studio/graph/effect_library_browser_widget.cpp',
     'src/studio/inspector/camera_lighting_inspector_widget.cpp',
     'src/studio/inspector/physics_spring_inspector_widget.cpp',
-    'src/daemon/we_builtin_effects.c',
-    'src/daemon/we_physics.c',
-    'src/daemon/we_camera3d.c',
+    'src/studio/core/command_bus_authoring.cpp',
+    'src/studio/scene/scene_layer_tree_widget.cpp',
+    'src/studio/viewport/viewport_gizmo_overlay.cpp',
+    'src/studio/brush/dirty_tile_undo_stack.cpp',
+    'src/studio/brush/gpu_brush_painter_widget.cpp',
+    'src/studio/particle/particle_designer_widget.cpp',
+    'src/studio/audio/audio_binding_wizard.cpp',
+    'src/studio/editor/glsl_scenescript_editor_widget.cpp',
   ) + studio_mocs
 
   studio_deps = [
     qt6_dep,
+    waywal_engine_dep,
     waywal_core_dep,
     sqlite3_dep,
     threads_dep,
@@ -816,7 +884,7 @@ if get_option('tests')
     dependencies: test_subsystems_deps
   )
 
-  test('subsystems', test_subsystems_exe)
+  test('subsystems', test_subsystems_exe, workdir: meson.project_source_root())
 
   test_we_core_exe = executable('test_we_core',
     'tests/test_we_core.c',
@@ -826,21 +894,10 @@ if get_option('tests')
     'src/daemon/mpris.c',
     'src/daemon/shader_engine.c',
     'src/daemon/gpu_compute.c',
-    'src/daemon/we_tex.c',
-    'src/daemon/we_shader.c',
-    'src/daemon/we_puppet.c',
-    'src/daemon/we_particle.c',
-    'src/daemon/we_script_parse.c',
-    'src/daemon/we_script.c',
-    'src/daemon/we_scene_parse.c',
-    'src/daemon/we_scene.c',
-    'src/daemon/we_builtin_effects.c',
-    'src/daemon/we_physics.c',
-    'src/daemon/we_camera3d.c',
     'src/daemon/dmabuf_alloc.c',
     'src/daemon/dmabuf_feedback.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: test_subsystems_deps
+    dependencies: test_subsystems_deps + [waywal_engine_dep]
   )
 
   test('we_core', test_we_core_exe, depends: [wwal, wwald], timeout: 120)
@@ -928,9 +985,10 @@ if get_option('tests')
 
   fuzz_workshop_parsers_exe = executable('fuzz_workshop_parsers',
     'tests/fuzz/fuzz_workshop_parsers.c',
+    'src/daemon/demuxer.c',
     c_args: ['-DWWAL_FUZZ_STANDALONE'],
     include_directories: inc_dir,
-    dependencies: [waywal_core_dep, m_dep, dl_dep]
+    dependencies: [waywal_engine_dep, waywal_core_dep, m_dep, dl_dep]
   )
   test('fuzz_workshop_parsers', fuzz_workshop_parsers_exe, timeout: 60)
 
@@ -944,26 +1002,22 @@ if get_option('tests')
   # Built-in Effects, Physics, 3D Camera & Shader Graph Test Suites
   test_we_builtin_effects_exe = executable('test_we_builtin_effects',
     'tests/test_we_builtin_effects.c',
-    'src/daemon/we_builtin_effects.c',
-    'src/daemon/we_shader.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: [waywal_core_dep, egl_dep, glesv2_dep, gbm_dep, libdrm_dep, m_dep]
+    dependencies: [waywal_engine_dep, waywal_core_dep, egl_dep, glesv2_dep, gbm_dep, libdrm_dep, m_dep]
   )
   test('we_builtin_effects', test_we_builtin_effects_exe)
 
   test_we_physics_exe = executable('test_we_physics',
     'tests/test_we_physics.c',
-    'src/daemon/we_physics.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: [waywal_core_dep, m_dep]
+    dependencies: [waywal_engine_dep, waywal_core_dep, m_dep]
   )
   test('we_physics', test_we_physics_exe)
 
   test_we_camera3d_exe = executable('test_we_camera3d',
     'tests/test_we_camera3d.c',
-    'src/daemon/we_camera3d.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: [waywal_core_dep, m_dep]
+    dependencies: [waywal_engine_dep, waywal_core_dep, m_dep]
   )
   test('we_camera3d', test_we_camera3d_exe)
 
@@ -983,25 +1037,22 @@ if get_option('tests')
 
   test_challenger_effects_exe = executable('test_challenger_effects',
     'tests/test_challenger_effects.c',
-    'src/daemon/we_builtin_effects.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: [waywal_core_dep, m_dep]
+    dependencies: [waywal_engine_dep, waywal_core_dep, m_dep]
   )
   test('challenger_effects', test_challenger_effects_exe)
 
   test_challenger_physics_exe = executable('test_challenger_physics',
     'tests/test_challenger_physics.c',
-    'src/daemon/we_physics.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: [waywal_core_dep, m_dep]
+    dependencies: [waywal_engine_dep, waywal_core_dep, m_dep]
   )
   test('challenger_physics', test_challenger_physics_exe)
 
   test_challenger_camera3d_exe = executable('test_challenger_camera3d',
     'tests/test_challenger_camera3d.c',
-    'src/daemon/we_camera3d.c',
     include_directories: [inc_dir, include_directories('src/daemon')],
-    dependencies: [waywal_core_dep, m_dep]
+    dependencies: [waywal_engine_dep, waywal_core_dep, m_dep]
   )
   test('challenger_camera3d', test_challenger_camera3d_exe)
 
@@ -1011,6 +1062,48 @@ if get_option('tests')
     dependencies: [waywal_core_dep, m_dep]
   )
   test('challenger_shader_graph', test_challenger_shader_graph_exe)
+
+  test_we_asset_writer_exe = executable('test_we_asset_writer',
+    'tests/test_we_asset_writer.c',
+    'src/daemon/demuxer.c',
+    'src/daemon/audio_fft.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: test_subsystems_deps + [waywal_engine_dep]
+  )
+  test('we_asset_writer', test_we_asset_writer_exe, timeout: 60)
+
+  test_we_gpu_brush_exe = executable('test_we_gpu_brush',
+    'tests/test_we_gpu_brush.c',
+    'src/daemon/demuxer.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: test_subsystems_deps + [waywal_engine_dep]
+  )
+  test('we_gpu_brush', test_we_gpu_brush_exe, timeout: 60)
+
+  test_we_particle_audio_exe = executable('test_we_particle_audio',
+    'tests/test_we_particle_audio.c',
+    'src/daemon/demuxer.c',
+    'src/daemon/audio_fft.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: test_subsystems_deps + [waywal_engine_dep]
+  )
+  test('we_particle_audio', test_we_particle_audio_exe, timeout: 60)
+
+  test_ipc_authoring_wire_exe = executable('test_ipc_authoring_wire',
+    'tests/test_ipc_authoring_wire.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: [waywal_core_dep, m_dep]
+  )
+  test('ipc_authoring_wire', test_ipc_authoring_wire_exe)
+
+  test_challenger_authoring_exe = executable('test_challenger_authoring',
+    'tests/test_challenger_authoring.c',
+    'src/daemon/demuxer.c',
+    'src/daemon/audio_fft.c',
+    include_directories: [inc_dir, include_directories('src/daemon')],
+    dependencies: test_subsystems_deps + [waywal_engine_dep]
+  )
+  test('challenger_authoring', test_challenger_authoring_exe, timeout: 60)
 
   if have_qt6
     test_studio_command_and_dock_exe = executable('test_studio_command_and_dock',
@@ -1054,6 +1147,14 @@ if get_option('tests')
       dependencies: [waywal_studio_dep],
     )
     test('download_manager', test_download_manager_exe, timeout: 30)
+
+    test_studio_authoring_integration_exe = executable('test_studio_authoring_integration',
+      'tests/test_studio_authoring_integration.cpp',
+      include_directories: studio_inc_dirs,
+      dependencies: [waywal_studio_dep],
+    )
+    test('studio_authoring_integration', test_studio_authoring_integration_exe,
+         timeout: 60, is_parallel: false)
   endif
 endif
 

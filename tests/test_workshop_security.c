@@ -393,8 +393,9 @@ static void test_malware_quarantine_pe_disguised(void)
     int r = system(mkdir_cmd);
     (void)r;
 
-    char pe_js[512];
-    snprintf(pe_js, sizeof(pe_js), "%s/helper.js", nested_dir);
+    char pe_js[1024];
+    int pn = snprintf(pe_js, sizeof(pe_js), "%s/helper.js", nested_dir);
+    TEST_ASSERT(pn > 0 && (size_t)pn < sizeof(pe_js), "pe_js path formatted");
     write_file(pe_js, pe_payload, sizeof(pe_payload));
 
     memset(report, 0, sizeof(*report));

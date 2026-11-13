@@ -19,11 +19,14 @@
 #include <sstream>
 #include <system_error>
 
-namespace wwal::studio {
-
-#if defined(__AVX2__)
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
+#define WWAL_HAVE_X86_RUNTIME_AVX2 1
+#else
+#define WWAL_HAVE_X86_RUNTIME_AVX2 0
 #endif
+
+namespace wwal::studio {
 
 namespace {
 
@@ -70,10 +73,10 @@ bool hasExtension(const std::filesystem::path &path, const std::vector<std::stri
     return false;
 }
 
-#if defined(__AVX2__)
-inline void score4ItemsAVX2(const std::string_view texts[4],
-                            const std::array<uint64_t, 256> &char_mask, uint64_t match_mask,
-                            size_t pat_len, int scores[4])
+#if WWAL_HAVE_X86_RUNTIME_AVX2
+__attribute__((target("avx2,fma"))) inline void
+score4ItemsAVX2(const std::string_view texts[4], const std::array<uint64_t, 256> &char_mask,
+                uint64_t match_mask, size_t pat_len, int scores[4])
 {
     for (int k = 0; k < 4; ++k)
         scores[k] = -1;
@@ -113,6 +116,35 @@ inline void score4ItemsAVX2(const std::string_view texts[4],
                 break;
         }
     }
+}
+
+__attribute__((target("avx2,fma"))) int
+countMatchesBatchAVX2(const std::vector<CatalogItem> &items,
+                      const std::array<uint64_t, 256> &char_mask, uint64_t match_mask,
+                      uint64_t pat_len, size_t &out_idx)
+{
+    int matches = 0;
+    const size_t n = items.size();
+    size_t i = 0;
+    int scores[4];
+    std::string_view texts[4];
+    for (; i + 4 <= n; i += 4) {
+        texts[0] = items[i].title;
+        texts[1] = items[i + 1].title;
+        texts[2] = items[i + 2].title;
+        texts[3] = items[i + 3].title;
+        score4ItemsAVX2(texts, char_mask, match_mask, pat_len, scores);
+        if (scores[0] >= 0)
+            ++matches;
+        if (scores[1] >= 0)
+            ++matches;
+        if (scores[2] >= 0)
+            ++matches;
+        if (scores[3] >= 0)
+            ++matches;
+    }
+    out_idx = i;
+    return matches;
 }
 #endif
 
@@ -507,41 +539,31 @@ double FuzzyCatalogIndex::benchmarkSearch(std::string_view query, size_t iterati
     auto start = std::chrono::high_resolution_clock::now();
     volatile int total_matches = 0;
 
-#if defined(__AVX2__)
     const uint64_t match_mask = 1ULL << (pat_len - 1);
-    const size_t n = m_items.size();
+#if WWAL_HAVE_X86_RUNTIME_AVX2
+    const bool use_avx2 = __builtin_cpu_supports("avx2");
 #endif
 
     for (size_t it = 0; it < iterations; ++it) {
         int matches = 0;
-#if defined(__AVX2__)
-        size_t i = 0;
-        int scores[4];
-        std::string_view texts[4];
-        for (; i + 4 <= n; i += 4) {
-            texts[0] = m_items[i].title;
-            texts[1] = m_items[i + 1].title;
-            texts[2] = m_items[i + 2].title;
-            texts[3] = m_items[i + 3].title;
-            score4ItemsAVX2(texts, char_mask, match_mask, pat_len, scores);
-            if (scores[0] >= 0)
-                ++matches;
-            if (scores[1] >= 0)
-                ++matches;
-            if (scores[2] >= 0)
-                ++matches;
-            if (scores[3] >= 0)
-                ++matches;
-        }
-        for (; i < n; ++i) {
-            int s = scoreItemFuzzy(m_items[i].title, lower_query, char_mask, pat_len);
-            if (s >= 0)
-                ++matches;
+#if WWAL_HAVE_X86_RUNTIME_AVX2
+        if (use_avx2) {
+            size_t tail_idx = 0;
+            matches = countMatchesBatchAVX2(m_items, char_mask, match_mask, pat_len, tail_idx);
+            for (size_t i = tail_idx; i < m_items.size(); ++i) {
+                if (scoreItemFuzzy(m_items[i].title, lower_query, char_mask, pat_len) >= 0)
+                    ++matches;
+            }
+        } else {
+            for (const auto &item : m_items) {
+                if (scoreItemFuzzy(item.title, lower_query, char_mask, pat_len) >= 0)
+                    ++matches;
+            }
         }
 #else
+        (void)match_mask;
         for (const auto &item : m_items) {
-            int s = scoreItemFuzzy(item.title, lower_query, char_mask, pat_len);
-            if (s >= 0)
+            if (scoreItemFuzzy(item.title, lower_query, char_mask, pat_len) >= 0)
                 ++matches;
         }
 #endif

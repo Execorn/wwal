@@ -20,18 +20,39 @@
 #endif
 #include "waywal/uring_loop.h"
 #include "waywal/we_scene.h"
+#include "waywal/we_script.h"
+#include "waywal/we_json.h"
 #include "waywal/ipc_proto_phase3.h"
+#include "waywal/ipc_proto_authoring.h"
 #include "waywal/shader_graph.h"
+#if __has_include("waywal/we_asset_writer.h")
+#include "waywal/we_asset_writer.h"
+#define WAYWAL_HAVE_ASSET_WRITER 1
+#else
+#define WAYWAL_HAVE_ASSET_WRITER 0
+#endif
+#if __has_include("waywal/we_gpu_brush.h")
+#include "waywal/we_gpu_brush.h"
+#define WAYWAL_HAVE_GPU_BRUSH 1
+#else
+#define WAYWAL_HAVE_GPU_BRUSH 0
+#endif
 
+#include <EGL/egl.h>
+#include <GLES3/gl31.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +72,29 @@ bool waywal_shader_engine_uses_wallpaper(const waywal_shader_engine_t *eng);
 bool waywal_shader_engine_uses_album_art(const waywal_shader_engine_t *eng);
 void waywal_audio_fft_set_capture_active(waywal_audio_fft_t *fft, bool active);
 void dmabuf_ring_trim_idle(dmabuf_ring_t *ring);
+
+static void authoring_invalidate_scene(const we_scene_t *sc);
+static void daemon_authoring_cleanup(void);
+
+static void daemon_copy_cstr(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0)
+        return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    if (dst == src) {
+        dst[cap - 1] = '\0';
+        return;
+    }
+    size_t i = 0;
+    while (i + 1 < cap && src[i] != '\0') {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
 
 waywal_state_store_t g_saved_state;
 
@@ -470,6 +514,7 @@ static void destroy_output_we_scene(daemon_state_t *state, output_node_t *out)
         if (state && state->dmabuf_ctx.available) {
             render_engine_make_current(&state->render_engine);
         }
+        authoring_invalidate_scene(ws);
         we_scene_destroy(ws);
     }
 }
@@ -605,8 +650,8 @@ void stop_engines_on_output(daemon_state_t *state, output_node_t *out, bool keep
                 memset(ss->target_outputs, 0, sizeof(ss->target_outputs));
                 for (output_node_t *o = state->outputs; o != NULL && rem_count < 16; o = o->next) {
                     if (o->slideshow_eng == ss && o->name[0] != '\0') {
-                        strncpy(ss->target_outputs[rem_count], o->name,
-                                sizeof(ss->target_outputs[rem_count]) - 1);
+                        daemon_copy_cstr(ss->target_outputs[rem_count],
+                                         sizeof(ss->target_outputs[rem_count]), o->name);
                         rem_count++;
                     }
                 }
@@ -660,6 +705,7 @@ void shader_engine_stop_playback(daemon_state_t *state)
         if (state->dmabuf_ctx.available) {
             render_engine_make_current(&state->render_engine);
         }
+        authoring_invalidate_scene(state->we_scene);
         we_scene_destroy(state->we_scene);
         state->we_scene = NULL;
     }
@@ -990,7 +1036,7 @@ bool try_start_native_animation(daemon_state_t *state, const char *filepath,
 
     state->anim_target_output[0] = '\0';
     if (target_out && target_out[0] != '\0') {
-        strncpy(state->anim_target_output, target_out, sizeof(state->anim_target_output) - 1);
+        daemon_copy_cstr(state->anim_target_output, sizeof(state->anim_target_output), target_out);
     }
     reconcile_global_engine_flags(state);
 
@@ -1455,8 +1501,8 @@ void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t *bgra_
                 extracted_pal.wallpaper_path[0] = '\0';
             }
         } else if (meta && meta->filepath[0] != '\0') {
-            snprintf(extracted_pal.wallpaper_path, sizeof(extracted_pal.wallpaper_path), "%s",
-                     meta->filepath);
+            daemon_copy_cstr(extracted_pal.wallpaper_path, sizeof(extracted_pal.wallpaper_path),
+                             meta->filepath);
         }
         if (!is_no_cache) {
             state->saved_wallpaper_palette = extracted_pal;
@@ -1586,9 +1632,8 @@ bool daemon_activate_depth_parallax(daemon_state_t *state, const uint8_t *bgra_p
     if (!any_ok)
         return false;
 
-    memset(state->shader_target_output, 0, sizeof(state->shader_target_output));
-    strncpy(state->shader_target_output, (target_output && target_output[0]) ? target_output : "*",
-            sizeof(state->shader_target_output) - 1);
+    daemon_copy_cstr(state->shader_target_output, sizeof(state->shader_target_output),
+                     (target_output && target_output[0]) ? target_output : "*");
     reconcile_global_engine_flags(state);
     if (state->mpris) {
         daemon_apply_mpris_album_art_and_theme(state, waywal_mpris_get_state(state->mpris), true);
@@ -2276,8 +2321,7 @@ void upsert_workshop_prop_kv(char *props_buf, size_t cap, const char *key, const
         buf_appendf(new_buf, sizeof(new_buf), &out_off, "%s%s", (out_off > 0) ? ";" : "", kv_pair);
     }
 
-    strncpy(props_buf, new_buf, cap - 1);
-    props_buf[cap - 1] = '\0';
+    daemon_copy_cstr(props_buf, cap, new_buf);
 }
 
 bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t *spay)
@@ -2293,6 +2337,7 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
 
     if (!state->outputs) {
         if (state->we_scene) {
+            authoring_invalidate_scene(state->we_scene);
             we_scene_destroy(state->we_scene);
             state->we_scene = NULL;
         }
@@ -2322,11 +2367,9 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
         uint32_t hint_fps =
             state->shader_eng ? waywal_shader_engine_get_target_fps(state->shader_eng) : 60U;
         state->shader_fps = spay->fps > 0 ? spay->fps : (hint_fps > 0 ? hint_fps : 60U);
-        memset(state->shader_target_output, 0, sizeof(state->shader_target_output));
-        strncpy(state->shader_target_output, spay->output[0] ? spay->output : "*",
-                sizeof(state->shader_target_output) - 1);
-        memset(state->shader_path, 0, sizeof(state->shader_path));
-        strncpy(state->shader_path, shader_file, sizeof(state->shader_path) - 1);
+        daemon_copy_cstr(state->shader_target_output, sizeof(state->shader_target_output),
+                         spay->output[0] ? spay->output : "*");
+        daemon_copy_cstr(state->shader_path, sizeof(state->shader_path), shader_file);
         if (state->mpris) {
             daemon_apply_mpris_album_art_and_theme(state, waywal_mpris_get_state(state->mpris),
                                                    true);
@@ -2457,9 +2500,8 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
         out->shader_last_ns = t_now;
         out->scaling_mode = spay->scaling_mode;
         out->displaying_color = false;
-        snprintf(out->active_media_path, sizeof(out->active_media_path), "%s", shader_file);
-        memset(out->shader_path, 0, sizeof(out->shader_path));
-        strncpy(out->shader_path, shader_file, sizeof(out->shader_path) - 1);
+        daemon_copy_cstr(out->active_media_path, sizeof(out->active_media_path), shader_file);
+        daemon_copy_cstr(out->shader_path, sizeof(out->shader_path), shader_file);
 
         if (has_transition && out->has_source_old_bo && out->width > 0 && out->height > 0 &&
             layer_shell_ensure_dmabuf_ring(state, out, out->width, out->height) &&
@@ -2570,12 +2612,9 @@ bool daemon_activate_shader(daemon_state_t *state, const waywal_shader_payload_t
         return false;
     }
 
-    memset(state->shader_target_output, 0, sizeof(state->shader_target_output));
-    strncpy(state->shader_target_output, spay->output[0] ? spay->output : "*",
-            sizeof(state->shader_target_output) - 1);
-    memset(state->shader_path, 0, sizeof(state->shader_path));
-    strncpy(state->shader_path, shader_file, sizeof(state->shader_path) - 1);
-
+    daemon_copy_cstr(state->shader_target_output, sizeof(state->shader_target_output),
+                     spay->output[0] ? spay->output : "*");
+    daemon_copy_cstr(state->shader_path, sizeof(state->shader_path), shader_file);
     reconcile_global_engine_flags(state);
     if (state->mpris) {
         daemon_apply_mpris_album_art_and_theme(state, waywal_mpris_get_state(state->mpris), true);
@@ -2708,7 +2747,7 @@ static bool daemon_render_image_on_target_ex(daemon_state_t *state, const char *
     meta->ten_bit = ten_bit;
     meta->num_target_outputs = num_targets;
     meta->extra_data_len = (uint32_t)extra_len;
-    strncpy(meta->filepath, filepath, sizeof(meta->filepath) - 1);
+    daemon_copy_cstr(meta->filepath, sizeof(meta->filepath), filepath);
     if (num_targets == 1 && extra_len <= 64) {
         memcpy(meta_storage + sizeof(waywal_img_metadata_t), target_output, extra_len);
     }
@@ -3129,8 +3168,8 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
         if ((stat(probe_pkg, &st) == 0 && S_ISREG(st.st_mode)) ||
             (stat(probe_gifpkg, &st) == 0 && S_ISREG(st.st_mode)) ||
             (stat(probe_json, &st) == 0 && S_ISREG(st.st_mode))) {
-            strncpy(proj.type, "scene", sizeof(proj.type) - 1);
-            strncpy(proj.file, "scene.json", sizeof(proj.file) - 1);
+            daemon_copy_cstr(proj.type, sizeof(proj.type), "scene");
+            daemon_copy_cstr(proj.file, sizeof(proj.file), "scene.json");
         } else {
             return false;
         }
@@ -3138,7 +3177,7 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
 
     waywal_img_metadata_t ws_meta;
     memset(&ws_meta, 0, sizeof(ws_meta));
-    snprintf(ws_meta.filepath, sizeof(ws_meta.filepath), "%s", ws_dir);
+    daemon_copy_cstr(ws_meta.filepath, sizeof(ws_meta.filepath), ws_dir);
     ws_meta.no_cache = wpay->no_cache ? 1 : 0;
     ws_meta.extract_theme = wpay->extract_theme ? true : false;
     ws_meta.no_theme = wpay->no_theme ? true : false;
@@ -3158,7 +3197,7 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
         if (image_load(prev_path, &ws_preview_px, &ws_preview_w, &ws_preview_h) && ws_preview_px &&
             ws_preview_w > 0 && ws_preview_h > 0) {
             ws_preview_from_image_load = true;
-            snprintf(ws_meta.filepath, sizeof(ws_meta.filepath), "%s", prev_path);
+            daemon_copy_cstr(ws_meta.filepath, sizeof(ws_meta.filepath), prev_path);
             daemon_update_palette_from_bgra(state, ws_preview_px, ws_preview_w, ws_preview_h,
                                             &ws_meta, true);
         } else if (ws_preview_px) {
@@ -3186,6 +3225,7 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
 
     if (!state->outputs) {
         if (state->we_scene) {
+            authoring_invalidate_scene(state->we_scene);
             we_scene_destroy(state->we_scene);
             state->we_scene = NULL;
         }
@@ -3194,6 +3234,13 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
             state->we_scene = we_scene_create(&state->dmabuf_ctx, ws_dir, wpay->prop_overrides);
         } else {
             state->we_scene = we_scene_load_cpu(ws_dir, wpay->prop_overrides);
+        }
+        if (state->we_scene) {
+            static uint64_t s_authoring_scene_seq = 1u;
+            if (state->we_scene->authoring_revision == 0u) {
+                state->we_scene->authoring_revision = s_authoring_scene_seq++;
+            }
+            state->we_scene->on_destroy_cb = authoring_invalidate_scene;
         }
         if (!state->we_scene) {
             if (ws_preview_px) {
@@ -3279,13 +3326,11 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
         state->shader_active = true;
         state->workshop_active = true;
         state->shader_fps = wpay->fps > 0 ? wpay->fps : 60U;
-        memset(state->shader_target_output, 0, sizeof(state->shader_target_output));
-        strncpy(state->shader_target_output, wpay->output[0] ? wpay->output : "*",
-                sizeof(state->shader_target_output) - 1);
-        memset(state->workshop_dir, 0, sizeof(state->workshop_dir));
-        strncpy(state->workshop_dir, ws_dir, sizeof(state->workshop_dir) - 1);
-        memset(state->workshop_props, 0, sizeof(state->workshop_props));
-        strncpy(state->workshop_props, wpay->prop_overrides, sizeof(state->workshop_props) - 1);
+        daemon_copy_cstr(state->shader_target_output, sizeof(state->shader_target_output),
+                         wpay->output[0] ? wpay->output : "*");
+        daemon_copy_cstr(state->workshop_dir, sizeof(state->workshop_dir), ws_dir);
+        daemon_copy_cstr(state->workshop_props, sizeof(state->workshop_props),
+                         wpay->prop_overrides);
         if (state->mpris) {
             daemon_apply_mpris_album_art_and_theme(state, waywal_mpris_get_state(state->mpris),
                                                    true);
@@ -3349,6 +3394,13 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
         } else {
             out->we_scene = we_scene_load_cpu(ws_dir, wpay->prop_overrides);
         }
+        if (out->we_scene) {
+            static uint64_t s_out_scene_seq = 1000000u;
+            if (out->we_scene->authoring_revision == 0u) {
+                out->we_scene->authoring_revision = s_out_scene_seq++;
+            }
+            out->we_scene->on_destroy_cb = authoring_invalidate_scene;
+        }
         if (!state->we_scene && out->we_scene) {
             state->we_scene = out->we_scene;
         }
@@ -3370,11 +3422,9 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
         out->shader_last_ns = t_now;
         out->scaling_mode = wpay->scaling_mode;
         out->displaying_color = false;
-        snprintf(out->active_media_path, sizeof(out->active_media_path), "%s", ws_dir);
-        memset(out->workshop_dir, 0, sizeof(out->workshop_dir));
-        strncpy(out->workshop_dir, ws_dir, sizeof(out->workshop_dir) - 1);
-        memset(out->workshop_props, 0, sizeof(out->workshop_props));
-        strncpy(out->workshop_props, wpay->prop_overrides, sizeof(out->workshop_props) - 1);
+        daemon_copy_cstr(out->active_media_path, sizeof(out->active_media_path), ws_dir);
+        daemon_copy_cstr(out->workshop_dir, sizeof(out->workshop_dir), ws_dir);
+        daemon_copy_cstr(out->workshop_props, sizeof(out->workshop_props), wpay->prop_overrides);
 
         if (has_transition && out->has_source_old_bo && out->width > 0 && out->height > 0 &&
             layer_shell_ensure_dmabuf_ring(state, out, out->width, out->height) &&
@@ -3534,14 +3584,10 @@ bool daemon_activate_workshop(daemon_state_t *state, const waywal_workshop_paylo
         }
     }
 
-    memset(state->shader_target_output, 0, sizeof(state->shader_target_output));
-    strncpy(state->shader_target_output, wpay->output[0] ? wpay->output : "*",
-            sizeof(state->shader_target_output) - 1);
-    memset(state->workshop_dir, 0, sizeof(state->workshop_dir));
-    strncpy(state->workshop_dir, ws_dir, sizeof(state->workshop_dir) - 1);
-    memset(state->workshop_props, 0, sizeof(state->workshop_props));
-    strncpy(state->workshop_props, wpay->prop_overrides, sizeof(state->workshop_props) - 1);
-
+    daemon_copy_cstr(state->shader_target_output, sizeof(state->shader_target_output),
+                     wpay->output[0] ? wpay->output : "*");
+    daemon_copy_cstr(state->workshop_dir, sizeof(state->workshop_dir), ws_dir);
+    daemon_copy_cstr(state->workshop_props, sizeof(state->workshop_props), wpay->prop_overrides);
     reconcile_global_engine_flags(state);
     if (state->mpris) {
         daemon_apply_mpris_album_art_and_theme(state, waywal_mpris_get_state(state->mpris), true);
@@ -3662,8 +3708,8 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
             if (strcasecmp(saved->backdrop, "none") == 0) {
                 state->backdrop_path[0] = '\0';
             } else if (!state->backdrop_auto_blur) {
-                strncpy(state->backdrop_path, saved->backdrop, sizeof(state->backdrop_path) - 1);
-                state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+                daemon_copy_cstr(state->backdrop_path, sizeof(state->backdrop_path),
+                                 saved->backdrop);
             }
         }
         if (saved->kind == WAYWAL_CONTENT_STATIC_IMAGE && saved->depth_map_path[0] != '\0' &&
@@ -3681,11 +3727,11 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
                 meta.crop_gravity_x = saved->has_crop_gravity ? saved->crop_gravity_x : 0.5f;
                 meta.crop_gravity_y = saved->has_crop_gravity ? saved->crop_gravity_y : 0.5f;
                 meta.has_crop_gravity = saved->has_crop_gravity ? 1 : 0;
-                strncpy(meta.filepath, saved->media_path, sizeof(meta.filepath) - 1);
-                strncpy(meta.depth_map_path, saved->depth_map_path,
-                        sizeof(meta.depth_map_path) - 1);
+                daemon_copy_cstr(meta.filepath, sizeof(meta.filepath), saved->media_path);
+                daemon_copy_cstr(meta.depth_map_path, sizeof(meta.depth_map_path),
+                                 saved->depth_map_path);
                 meta.depth_strength = saved->depth_strength > 0.0f ? saved->depth_strength : 1.0f;
-                strncpy(meta.backdrop, saved->backdrop, sizeof(meta.backdrop) - 1);
+                daemon_copy_cstr(meta.backdrop, sizeof(meta.backdrop), saved->backdrop);
 
                 for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
                     if (output_matches_target_spec(out, target)) {
@@ -3756,9 +3802,9 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
         }
         if (strcmp(target, "*") != 0) {
             spay.num_target_outputs = 1;
-            strncpy(spay.target_outputs[0], target, sizeof(spay.target_outputs[0]) - 1);
+            daemon_copy_cstr(spay.target_outputs[0], sizeof(spay.target_outputs[0]), target);
         }
-        strncpy(spay.path, saved->media_path, sizeof(spay.path) - 1);
+        daemon_copy_cstr(spay.path, sizeof(spay.path), saved->media_path);
         return daemon_start_slideshow_isolated(state, &spay);
     }
     case WAYWAL_CONTENT_VIDEO: {
@@ -3813,14 +3859,14 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
             if (strcasecmp(saved->backdrop, "none") == 0) {
                 state->backdrop_path[0] = '\0';
             } else if (!state->backdrop_auto_blur) {
-                strncpy(state->backdrop_path, saved->backdrop, sizeof(state->backdrop_path) - 1);
-                state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+                daemon_copy_cstr(state->backdrop_path, sizeof(state->backdrop_path),
+                                 saved->backdrop);
             }
         }
         waywal_shader_payload_t spay;
         memset(&spay, 0, sizeof(spay));
-        strncpy(spay.output, target, sizeof(spay.output) - 1);
-        strncpy(spay.shader_path, saved->media_path, sizeof(spay.shader_path) - 1);
+        daemon_copy_cstr(spay.output, sizeof(spay.output), target);
+        daemon_copy_cstr(spay.shader_path, sizeof(spay.shader_path), saved->media_path);
         spay.fps = saved->target_fps > 0 ? saved->target_fps : 60;
         spay.audio_reactive = saved->audio_reactive;
         spay.scaling_mode = (uint32_t)saved->scaling;
@@ -3828,7 +3874,7 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
         spay.volume = saved->volume;
         spay.mute_on_audio = saved->mute_on_audio;
         spay.speed = saved->video_speed > 0.01f ? saved->video_speed : 1.0f;
-        strncpy(spay.backdrop, saved->backdrop, sizeof(spay.backdrop) - 1);
+        daemon_copy_cstr(spay.backdrop, sizeof(spay.backdrop), saved->backdrop);
         return daemon_activate_shader(state, &spay);
     }
     case WAYWAL_CONTENT_WORKSHOP: {
@@ -3852,22 +3898,22 @@ bool daemon_restore_output_entry(daemon_state_t *state, const waywal_output_save
             if (strcasecmp(saved->backdrop, "none") == 0) {
                 state->backdrop_path[0] = '\0';
             } else if (!state->backdrop_auto_blur) {
-                strncpy(state->backdrop_path, saved->backdrop, sizeof(state->backdrop_path) - 1);
-                state->backdrop_path[sizeof(state->backdrop_path) - 1] = '\0';
+                daemon_copy_cstr(state->backdrop_path, sizeof(state->backdrop_path),
+                                 saved->backdrop);
             }
         }
         waywal_workshop_payload_t wpay;
         memset(&wpay, 0, sizeof(wpay));
-        strncpy(wpay.output, target, sizeof(wpay.output) - 1);
-        strncpy(wpay.workshop_dir, saved->media_path, sizeof(wpay.workshop_dir) - 1);
-        strncpy(wpay.prop_overrides, saved->prop_overrides, sizeof(wpay.prop_overrides) - 1);
+        daemon_copy_cstr(wpay.output, sizeof(wpay.output), target);
+        daemon_copy_cstr(wpay.workshop_dir, sizeof(wpay.workshop_dir), saved->media_path);
+        daemon_copy_cstr(wpay.prop_overrides, sizeof(wpay.prop_overrides), saved->prop_overrides);
         wpay.fps = saved->target_fps > 0 ? saved->target_fps : 60;
         wpay.audio_reactive = saved->audio_reactive;
         wpay.scaling_mode = (uint32_t)saved->scaling;
         wpay.invert_y = state->config.transition.invert_y ? 1 : 0;
         wpay.volume = saved->volume;
         wpay.mute_on_audio = saved->mute_on_audio;
-        strncpy(wpay.backdrop, saved->backdrop, sizeof(wpay.backdrop) - 1);
+        daemon_copy_cstr(wpay.backdrop, sizeof(wpay.backdrop), saved->backdrop);
         return daemon_activate_workshop(state, &wpay);
     }
     default:
@@ -3993,7 +4039,7 @@ bool daemon_slideshow_present_media(daemon_state_t *state, slideshow_engine_t *s
 
     char target_spec[256] = {0};
     if (ss->num_target_outputs == 0) {
-        strncpy(target_spec, "*", sizeof(target_spec) - 1);
+        daemon_copy_cstr(target_spec, sizeof(target_spec), "*");
     } else {
         size_t off = 0;
         for (uint8_t i = 0; i < ss->num_target_outputs; ++i) {
@@ -4003,7 +4049,7 @@ bool daemon_slideshow_present_media(daemon_state_t *state, slideshow_engine_t *s
                         ss->target_outputs[i]);
         }
         if (target_spec[0] == '\0') {
-            strncpy(target_spec, "*", sizeof(target_spec) - 1);
+            daemon_copy_cstr(target_spec, sizeof(target_spec), "*");
         }
     }
 
@@ -4016,8 +4062,8 @@ bool daemon_slideshow_present_media(daemon_state_t *state, slideshow_engine_t *s
     if (stat(filepath, &st) == 0 && S_ISDIR(st.st_mode)) {
         waywal_workshop_payload_t wpay;
         memset(&wpay, 0, sizeof(wpay));
-        strncpy(wpay.output, target_spec, sizeof(wpay.output) - 1);
-        strncpy(wpay.workshop_dir, filepath, sizeof(wpay.workshop_dir) - 1);
+        daemon_copy_cstr(wpay.output, sizeof(wpay.output), target_spec);
+        daemon_copy_cstr(wpay.workshop_dir, sizeof(wpay.workshop_dir), filepath);
         wpay.fps = ss->transition_fps > 0 ? ss->transition_fps : 60;
         wpay.scaling_mode = ss->scaling_mode;
         wpay.invert_y = ss->invert_y;
@@ -4048,8 +4094,8 @@ bool daemon_slideshow_present_media(daemon_state_t *state, slideshow_engine_t *s
                     strcasecmp(ext, ".comp") == 0 || strcasecmp(ext, ".shader") == 0)) {
             waywal_shader_payload_t spay;
             memset(&spay, 0, sizeof(spay));
-            strncpy(spay.output, target_spec, sizeof(spay.output) - 1);
-            strncpy(spay.shader_path, filepath, sizeof(spay.shader_path) - 1);
+            daemon_copy_cstr(spay.output, sizeof(spay.output), target_spec);
+            daemon_copy_cstr(spay.shader_path, sizeof(spay.shader_path), filepath);
             spay.fps = ss->transition_fps > 0 ? ss->transition_fps : 60;
             spay.audio_reactive = waywal_shader_is_audio_reactive(filepath);
             spay.scaling_mode = ss->scaling_mode;
@@ -4115,8 +4161,8 @@ static bool daemon_apply_output_config_rule(daemon_state_t *state, const waywal_
     if (strcasecmp(rule->mode, "shader") == 0) {
         waywal_shader_payload_t spay;
         memset(&spay, 0, sizeof(spay));
-        strncpy(spay.output, target, sizeof(spay.output) - 1);
-        strncpy(spay.shader_path, rule->path, sizeof(spay.shader_path) - 1);
+        daemon_copy_cstr(spay.output, sizeof(spay.output), target);
+        daemon_copy_cstr(spay.shader_path, sizeof(spay.shader_path), rule->path);
         spay.fps = rule->fps > 0 ? rule->fps : 60;
         spay.audio_reactive =
             rule->has_audio ? rule->audio : waywal_shader_is_audio_reactive(rule->path);
@@ -4128,8 +4174,8 @@ static bool daemon_apply_output_config_rule(daemon_state_t *state, const waywal_
     if (strcasecmp(rule->mode, "workshop") == 0) {
         waywal_workshop_payload_t wpay;
         memset(&wpay, 0, sizeof(wpay));
-        strncpy(wpay.output, target, sizeof(wpay.output) - 1);
-        strncpy(wpay.workshop_dir, rule->path, sizeof(wpay.workshop_dir) - 1);
+        daemon_copy_cstr(wpay.output, sizeof(wpay.output), target);
+        daemon_copy_cstr(wpay.workshop_dir, sizeof(wpay.workshop_dir), rule->path);
         wpay.fps = rule->fps > 0 ? rule->fps : 60;
         wpay.audio_reactive = rule->audio;
         wpay.scaling_mode = (uint32_t)rule->scaling;
@@ -4195,9 +4241,9 @@ static bool daemon_apply_output_config_rule(daemon_state_t *state, const waywal_
         }
         if (strcmp(target, "*") != 0) {
             spay.num_target_outputs = 1;
-            strncpy(spay.target_outputs[0], target, sizeof(spay.target_outputs[0]) - 1);
+            daemon_copy_cstr(spay.target_outputs[0], sizeof(spay.target_outputs[0]), target);
         }
-        strncpy(spay.path, rule->path, sizeof(spay.path) - 1);
+        daemon_copy_cstr(spay.path, sizeof(spay.path), rule->path);
         return daemon_start_slideshow_isolated(state, &spay);
     }
     return daemon_render_image_on_target_ex(
@@ -4582,8 +4628,7 @@ static void daemon_on_output_configured(daemon_state_t *state, output_node_t *ou
     if (rule && (rule->path[0] != '\0' || rule->has_color)) {
         waywal_output_rule_t scoped = *rule;
         if (scoped.output_name[0] == '\0' || strcmp(scoped.output_name, "*") == 0) {
-            strncpy(scoped.output_name, out->name, sizeof(scoped.output_name) - 1);
-            scoped.output_name[sizeof(scoped.output_name) - 1] = '\0';
+            daemon_copy_cstr(scoped.output_name, sizeof(scoped.output_name), out->name);
         }
         (void)daemon_apply_output_config_rule(state, &scoped);
         return;
@@ -4741,8 +4786,8 @@ static bool daemon_apply_workspace_rule(daemon_state_t *state, const waywal_work
     if (strcasecmp(wrule->mode, "shader") == 0) {
         waywal_shader_payload_t spay;
         memset(&spay, 0, sizeof(spay));
-        strncpy(spay.output, target, sizeof(spay.output) - 1);
-        strncpy(spay.shader_path, wrule->path, sizeof(spay.shader_path) - 1);
+        daemon_copy_cstr(spay.output, sizeof(spay.output), target);
+        daemon_copy_cstr(spay.shader_path, sizeof(spay.shader_path), wrule->path);
         spay.fps = rule_fps;
         spay.audio_reactive =
             wrule->has_audio ? wrule->audio : waywal_shader_is_audio_reactive(wrule->path);
@@ -4767,9 +4812,9 @@ static bool daemon_apply_workspace_rule(daemon_state_t *state, const waywal_work
     if (strcasecmp(wrule->mode, "workshop") == 0) {
         waywal_workshop_payload_t wpay;
         memset(&wpay, 0, sizeof(wpay));
-        strncpy(wpay.output, target, sizeof(wpay.output) - 1);
-        strncpy(wpay.workshop_dir, wrule->path, sizeof(wpay.workshop_dir) - 1);
-        strncpy(wpay.prop_overrides, wrule->prop_overrides, sizeof(wpay.prop_overrides) - 1);
+        daemon_copy_cstr(wpay.output, sizeof(wpay.output), target);
+        daemon_copy_cstr(wpay.workshop_dir, sizeof(wpay.workshop_dir), wrule->path);
+        daemon_copy_cstr(wpay.prop_overrides, sizeof(wpay.prop_overrides), wrule->prop_overrides);
         wpay.fps = rule_fps;
         wpay.audio_reactive = wrule->audio;
         wpay.scaling_mode = (uint32_t)wrule->scaling;
@@ -4844,9 +4889,9 @@ static bool daemon_apply_workspace_rule(daemon_state_t *state, const waywal_work
         }
         if (strcmp(target, "*") != 0) {
             spay.num_target_outputs = 1;
-            strncpy(spay.target_outputs[0], target, sizeof(spay.target_outputs[0]) - 1);
+            daemon_copy_cstr(spay.target_outputs[0], sizeof(spay.target_outputs[0]), target);
         }
-        strncpy(spay.path, wrule->path, sizeof(spay.path) - 1);
+        daemon_copy_cstr(spay.path, sizeof(spay.path), wrule->path);
         return daemon_start_slideshow_isolated(state, &spay);
     }
     return daemon_render_image_on_target_ex(
@@ -4891,8 +4936,7 @@ static void daemon_handle_power_gov_events(daemon_state_t *state, int fd)
             if (ws[0] != '\0' && strcmp(state->last_workspace_name, ws) == 0) {
                 continue;
             }
-            strncpy(state->last_workspace_name, ws, sizeof(state->last_workspace_name) - 1);
-            state->last_workspace_name[sizeof(state->last_workspace_name) - 1] = '\0';
+            daemon_copy_cstr(state->last_workspace_name, sizeof(state->last_workspace_name), ws);
             int ws_idx = atoi(ws);
             int delta = (ws_idx > 0 && state->last_workspace_id > 0)
                             ? (ws_idx - state->last_workspace_id)
@@ -5005,8 +5049,7 @@ static void daemon_apply_all_output_config_rules(daemon_state_t *st, bool *out_s
                         continue;
                     if (waywal_config_match_output(&st->config, out->name) == rule) {
                         waywal_output_rule_t scoped = *rule;
-                        strncpy(scoped.output_name, out->name, sizeof(scoped.output_name) - 1);
-                        scoped.output_name[sizeof(scoped.output_name) - 1] = '\0';
+                        daemon_copy_cstr(scoped.output_name, sizeof(scoped.output_name), out->name);
                         if (strcasecmp(scoped.mode, "slideshow") == 0 && out_slideshow_applied) {
                             *out_slideshow_applied = true;
                         }
@@ -5575,7 +5618,8 @@ bool daemon_dispatch_ipc_req_compile_shader_graph(daemon_state_t *state,
             }
             resp_local.status_code = WAYWAL_STATUS_ERR_SYNTAX;
             snprintf(resp_local.error_msg, sizeof(resp_local.error_msg),
-                     "Cannot open regular graph JSON file at path: %s", req_local.graph_json_path);
+                     "Cannot open regular graph JSON file at path: %.200s",
+                     req_local.graph_json_path);
             resp_local.compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
             memcpy(resp, &resp_local, sizeof(resp_local));
             return true;
@@ -5619,7 +5663,7 @@ bool daemon_dispatch_ipc_req_compile_shader_graph(daemon_state_t *state,
             free(file_json);
             resp_local.status_code = WAYWAL_STATUS_ERR_SYNTAX;
             snprintf(resp_local.error_msg, sizeof(resp_local.error_msg),
-                     "Failed to read graph JSON from: %s", req_local.graph_json_path);
+                     "Failed to read graph JSON from: %.200s", req_local.graph_json_path);
             resp_local.compile_time_ms = (float)(now_ns() - t_start) / 1000000.0f;
             memcpy(resp, &resp_local, sizeof(resp_local));
             return true;
@@ -6263,9 +6307,17 @@ bool daemon_dispatch_phase3_ipc(daemon_state_t *state, int client_fd, const wayw
         return true;
     }
 
-    case WAYWAL_REQ_SET_IMAGE: {
-        return daemon_validate_set_image_header(hdr);
-    }
+    case WAYWAL_REQ_SCENE_MUTATE:
+    case WAYWAL_REQ_HOT_RELOAD_CODE:
+    case WAYWAL_REQ_QUERY_SCENE_TREE:
+    case WAYWAL_REQ_SET_SHADER_COMBO:
+    case WAYWAL_REQ_BRUSH_STROKE:
+    case WAYWAL_REQ_PARTICLE_CONFIG:
+    case WAYWAL_REQ_SET_AUDIO_BINDINGS:
+    case WAYWAL_REQ_EXPORT_SCENE_PKG:
+    case WAYWAL_REQ_LINT_SCENESCRIPT:
+    case WAYWAL_REQ_READBACK_TEXTURE:
+        return daemon_dispatch_authoring_ipc(state, client_fd, hdr, attached_fd);
 
     default:
         break;
@@ -6275,6 +6327,2962 @@ bool daemon_dispatch_phase3_ipc(daemon_state_t *state, int client_fd, const wayw
         close(attached_fd);
     }
     if (!ipc_drain_phase3_payload(client_fd, hdr->payload_size, 500)) {
+        return false;
+    }
+    return false;
+}
+
+/* ========================================================================= */
+/* Authoring IPC Dispatch Helpers & Handlers (0x0021..0x002A)                */
+/* ========================================================================= */
+
+#define WAYWAL_AUTHORING_SCENE_SLOTS 16u
+#define WAYWAL_AUTHORING_MAX_OBJECTS 1024u
+
+typedef struct {
+    const we_scene_t *scene;
+    uint64_t authoring_revision;
+    uint32_t revision;
+} authoring_scene_slot_t;
+
+static authoring_scene_slot_t g_authoring_slots[WAYWAL_AUTHORING_SCENE_SLOTS];
+static uint32_t g_authoring_slot_cursor = 0u;
+#if WAYWAL_HAVE_GPU_BRUSH
+static we_gpu_brush_ctx_t *g_authoring_brush_ctx = NULL;
+#endif
+
+static bool authoring_matches_target(const output_node_t *out, const char *target_spec)
+{
+    if (!out) {
+        return false;
+    }
+    if (!target_spec || target_spec[0] == '\0' || strcmp(target_spec, "*") == 0 ||
+        strcasecmp(target_spec, "all") == 0) {
+        return true;
+    }
+    return output_matches_target_spec(out, target_spec);
+}
+
+static bool authoring_drain_payload(int fd, uint64_t rem_bytes, int timeout_ms)
+{
+    if (rem_bytes == 0u) {
+        return true;
+    }
+    if (rem_bytes > WAYWAL_MAX_PHASE3_DRAIN_BYTES) {
+        (void)shutdown(fd, SHUT_RDWR);
+        return false;
+    }
+    uint8_t scratch[4096];
+    uint64_t left = rem_bytes;
+    while (left > 0u) {
+        size_t chunk = left < sizeof(scratch) ? (size_t)left : sizeof(scratch);
+        if (!ipc_dispatch_read_full(fd, scratch, chunk, timeout_ms)) {
+            (void)shutdown(fd, SHUT_RDWR);
+            return false;
+        }
+        left -= chunk;
+    }
+    return true;
+}
+
+static authoring_scene_slot_t *authoring_get_scene_slot(const we_scene_t *sc, bool create)
+{
+    if (!sc) {
+        return NULL;
+    }
+    for (size_t i = 0; i < WAYWAL_AUTHORING_SCENE_SLOTS; ++i) {
+        if (g_authoring_slots[i].scene == sc &&
+            g_authoring_slots[i].authoring_revision == sc->authoring_revision) {
+            return &g_authoring_slots[i];
+        }
+        if (g_authoring_slots[i].scene == sc) {
+            memset(&g_authoring_slots[i], 0, sizeof(g_authoring_slots[i]));
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    for (size_t i = 0; i < WAYWAL_AUTHORING_SCENE_SLOTS; ++i) {
+        if (!g_authoring_slots[i].scene) {
+            memset(&g_authoring_slots[i], 0, sizeof(g_authoring_slots[i]));
+            g_authoring_slots[i].scene = sc;
+            g_authoring_slots[i].authoring_revision = sc->authoring_revision;
+            g_authoring_slots[i].revision = 1u;
+            return &g_authoring_slots[i];
+        }
+    }
+    authoring_scene_slot_t *slot = &g_authoring_slots[g_authoring_slot_cursor];
+    g_authoring_slot_cursor = (g_authoring_slot_cursor + 1u) % WAYWAL_AUTHORING_SCENE_SLOTS;
+    memset(slot, 0, sizeof(*slot));
+    slot->scene = sc;
+    slot->authoring_revision = sc->authoring_revision;
+    slot->revision = 1u;
+    return slot;
+}
+
+static void authoring_copy_cstr(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0u) {
+        return;
+    }
+    memset(dst, 0, cap);
+    if (!src) {
+        return;
+    }
+    for (size_t i = 0u; i + 1u < cap && src[i] != '\0'; ++i) {
+        dst[i] = src[i];
+    }
+}
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+    bool oom;
+} authoring_strbuf_t;
+
+static bool authoring_sb_reserve(authoring_strbuf_t *sb, size_t extra)
+{
+    if (sb->oom) {
+        return false;
+    }
+    if (extra > SIZE_MAX - sb->len - 1u) {
+        sb->oom = true;
+        return false;
+    }
+    size_t needed = sb->len + extra + 1u;
+    if (needed <= sb->cap) {
+        return true;
+    }
+    size_t new_cap = sb->cap ? sb->cap : 512u;
+    while (new_cap < needed) {
+        if (new_cap > SIZE_MAX / 2u) {
+            new_cap = needed;
+            break;
+        }
+        new_cap *= 2u;
+    }
+    char *grown = (char *)realloc(sb->data, new_cap);
+    if (!grown) {
+        sb->oom = true;
+        return false;
+    }
+    sb->data = grown;
+    sb->cap = new_cap;
+    return true;
+}
+
+static void authoring_sb_append_raw(authoring_strbuf_t *sb, const char *s, size_t n)
+{
+    if (!s || n == 0u || !authoring_sb_reserve(sb, n)) {
+        return;
+    }
+    memcpy(sb->data + sb->len, s, n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+}
+
+static void authoring_sb_append_cstr(authoring_strbuf_t *sb, const char *s)
+{
+    if (s) {
+        authoring_sb_append_raw(sb, s, strlen(s));
+    }
+}
+
+static void authoring_sb_appendf(authoring_strbuf_t *sb, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static void authoring_sb_appendf(authoring_strbuf_t *sb, const char *fmt, ...)
+{
+    if (sb->oom || !fmt) {
+        return;
+    }
+    char stack_buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(stack_buf, sizeof(stack_buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        return;
+    }
+    if ((size_t)n < sizeof(stack_buf)) {
+        authoring_sb_append_raw(sb, stack_buf, (size_t)n);
+        return;
+    }
+    if (!authoring_sb_reserve(sb, (size_t)n)) {
+        return;
+    }
+    va_list ap2;
+    va_start(ap2, fmt);
+    (void)vsnprintf(sb->data + sb->len, (size_t)n + 1u, fmt, ap2);
+    va_end(ap2);
+    sb->len += (size_t)n;
+}
+
+static void authoring_sb_append_json_str(authoring_strbuf_t *sb, const char *s)
+{
+    authoring_sb_append_raw(sb, "\"", 1u);
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; ++p) {
+            unsigned char ch = *p;
+            if (ch == '"') {
+                authoring_sb_append_raw(sb, "\\\"", 2u);
+            } else if (ch == '\\') {
+                authoring_sb_append_raw(sb, "\\\\", 2u);
+            } else if (ch == '\n') {
+                authoring_sb_append_raw(sb, "\\n", 2u);
+            } else if (ch == '\r') {
+                authoring_sb_append_raw(sb, "\\r", 2u);
+            } else if (ch == '\t') {
+                authoring_sb_append_raw(sb, "\\t", 2u);
+            } else if (ch < 0x20u) {
+                authoring_sb_appendf(sb, "\\u%04x", (unsigned)ch);
+            } else {
+                authoring_sb_append_raw(sb, (const char *)p, 1u);
+            }
+        }
+    }
+    authoring_sb_append_raw(sb, "\"", 1u);
+}
+
+static we_scene_object_t *authoring_find_object(we_scene_t *sc, int32_t object_id, size_t *out_idx)
+{
+    if (!sc || !sc->objects) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < sc->object_count; ++i) {
+        if (sc->objects[i].id == object_id) {
+            if (out_idx) {
+                *out_idx = i;
+            }
+            return &sc->objects[i];
+        }
+    }
+    return NULL;
+}
+
+static bool authoring_reparent_creates_cycle(const we_scene_t *sc, int32_t object_id,
+                                             int32_t new_parent_id)
+{
+    if (!sc || new_parent_id < 0) {
+        return false;
+    }
+    if (new_parent_id == object_id) {
+        return true;
+    }
+    int32_t cur = new_parent_id;
+    for (uint32_t hop = 0; hop < sc->object_count; ++hop) {
+        const we_scene_object_t *parent_obj = NULL;
+        for (uint32_t i = 0; i < sc->object_count; ++i) {
+            if (sc->objects[i].id == cur) {
+                parent_obj = &sc->objects[i];
+                break;
+            }
+        }
+        if (!parent_obj || parent_obj->parent_id < 0) {
+            return false;
+        }
+        if (parent_obj->parent_id == object_id) {
+            return true;
+        }
+        cur = parent_obj->parent_id;
+    }
+    return true;
+}
+
+static we_material_pass_t *authoring_resolve_pass(we_scene_object_t *obj, uint32_t pass_index)
+{
+    if (!obj) {
+        return NULL;
+    }
+    if (pass_index == UINT32_MAX) {
+        return obj->has_base_pass ? &obj->base_pass : NULL;
+    }
+    uint32_t cursor = 0u;
+    for (uint32_t e = 0; e < obj->effect_count; ++e) {
+        we_effect_t *eff = &obj->effects[e];
+        if (!eff->passes) {
+            continue;
+        }
+        if (pass_index < cursor + eff->pass_count) {
+            return &eff->passes[pass_index - cursor];
+        }
+        cursor += eff->pass_count;
+    }
+    return NULL;
+}
+
+static void authoring_ensure_scene_egl(const we_scene_t *sc)
+{
+    if (sc && sc->gl_initialized && sc->egl_display && sc->egl_context &&
+        eglGetCurrentContext() != sc->egl_context) {
+        (void)eglMakeCurrent(sc->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, sc->egl_context);
+    }
+}
+
+static void authoring_invalidate_scene(const we_scene_t *sc)
+{
+    if (!sc) {
+        return;
+    }
+    for (size_t i = 0; i < WAYWAL_AUTHORING_SCENE_SLOTS; ++i) {
+        if (g_authoring_slots[i].scene == sc) {
+            memset(&g_authoring_slots[i], 0, sizeof(g_authoring_slots[i]));
+        }
+    }
+#if WAYWAL_HAVE_GPU_BRUSH
+    if (g_authoring_brush_ctx) {
+        authoring_ensure_scene_egl(sc);
+        we_gpu_brush_unbind_scene(g_authoring_brush_ctx, sc);
+    }
+#endif
+}
+
+static void daemon_authoring_cleanup(void)
+{
+    memset(g_authoring_slots, 0, sizeof(g_authoring_slots));
+#if WAYWAL_HAVE_GPU_BRUSH
+    if (g_authoring_brush_ctx) {
+        we_gpu_brush_destroy(g_authoring_brush_ctx);
+        g_authoring_brush_ctx = NULL;
+    }
+#endif
+}
+
+static void authoring_free_material_pass(we_material_pass_t *pass, bool gl_init)
+{
+    if (!pass) {
+        return;
+    }
+    for (uint32_t i = 0; i < WE_MAX_PASS_TEXTURES; ++i) {
+        if (pass->textures[i]) {
+            we_tex_destroy(pass->textures[i]);
+            pass->textures[i] = NULL;
+        }
+    }
+    for (uint32_t i = 0; i < pass->const_val_count; ++i) {
+        free(pass->const_vals[i].script_src);
+        pass->const_vals[i].script_src = NULL;
+    }
+    we_shader_preprocessed_free(&pass->prep);
+    if (gl_init && pass->gl_prog != 0u) {
+        glDeleteProgram(pass->gl_prog);
+        pass->gl_prog = 0u;
+    }
+}
+
+static void authoring_free_object_resources(const we_scene_t *sc, we_scene_object_t *obj)
+{
+    if (!obj) {
+        return;
+    }
+    bool gl_init = (sc && sc->gl_initialized);
+    if (gl_init) {
+        authoring_ensure_scene_egl(sc);
+    }
+    if (obj->has_base_pass) {
+        authoring_free_material_pass(&obj->base_pass, gl_init);
+    }
+    if (obj->effects) {
+        for (uint32_t e = 0; e < obj->effect_count; ++e) {
+            we_effect_t *eff = &obj->effects[e];
+            if (eff->passes) {
+                for (uint32_t p = 0; p < eff->pass_count; ++p) {
+                    authoring_free_material_pass(&eff->passes[p], gl_init);
+                }
+                free(eff->passes);
+                eff->passes = NULL;
+            }
+            for (uint32_t f = 0; f < eff->fbo_count; ++f) {
+                if (gl_init && eff->fbos[f].gl_fbo != 0u) {
+                    glDeleteFramebuffers(1, &eff->fbos[f].gl_fbo);
+                }
+                if (gl_init && eff->fbos[f].gl_tex != 0u) {
+                    glDeleteTextures(1, &eff->fbos[f].gl_tex);
+                }
+                eff->fbos[f].gl_fbo = 0u;
+                eff->fbos[f].gl_tex = 0u;
+            }
+        }
+        free(obj->effects);
+        obj->effects = NULL;
+    }
+    if (obj->puppet) {
+        we_puppet_destroy(obj->puppet);
+        obj->puppet = NULL;
+    }
+    if (obj->particle_sys) {
+        we_particle_destroy(obj->particle_sys);
+        obj->particle_sys = NULL;
+    }
+    for (uint32_t s = 0; s < obj->script_count; ++s) {
+        if (obj->scripts[s].vm) {
+            we_script_destroy(obj->scripts[s].vm);
+            obj->scripts[s].vm = NULL;
+        }
+    }
+    for (uint32_t t = 0; t < obj->sound_track_count; ++t) {
+        free(obj->sound_tracks_pcm[t]);
+        obj->sound_tracks_pcm[t] = NULL;
+    }
+}
+
+static bool authoring_apply_text_json(we_scene_object_t *obj, const char *payload_json)
+{
+    if (!obj || !payload_json || payload_json[0] == '\0') {
+        return true;
+    }
+    we_jval_t *root = we_json_parse_root(payload_json, strlen(payload_json));
+    if (!root || root->type != JVAL_OBJ) {
+        we_jval_free(root);
+        return false;
+    }
+    const char *text = we_jval_str(we_jobj_get(root, "text"), NULL);
+    if (text) {
+        authoring_copy_cstr(obj->text_str, sizeof(obj->text_str), text);
+    }
+    const char *font = we_jval_str(we_jobj_get(root, "font"), NULL);
+    if (font) {
+        authoring_copy_cstr(obj->text_font, sizeof(obj->text_font), font);
+    }
+    const char *halign = we_jval_str(we_jobj_get(root, "halign"), NULL);
+    if (halign) {
+        authoring_copy_cstr(obj->text_halign, sizeof(obj->text_halign), halign);
+    }
+    const char *valign = we_jval_str(we_jobj_get(root, "valign"), NULL);
+    if (valign) {
+        authoring_copy_cstr(obj->text_valign, sizeof(obj->text_valign), valign);
+    }
+    const we_jval_t *ps = we_jobj_get(root, "pointsize");
+    if (ps && ps->type == JVAL_NUM && isfinite(ps->num) && ps->num > 0.0) {
+        double clamped = ps->num < 1.0 ? 1.0 : (ps->num > 4096.0 ? 4096.0 : ps->num);
+        obj->text_pointsize = (int32_t)clamped;
+    }
+    const we_jval_t *pad = we_jobj_get(root, "padding");
+    if (pad && pad->type == JVAL_NUM && isfinite(pad->num) && pad->num >= 0.0) {
+        double clamped = pad->num > 4096.0 ? 4096.0 : pad->num;
+        obj->text_padding = (int32_t)clamped;
+    }
+    const we_jval_t *opbg = we_jobj_get(root, "opaquebackground");
+    if (opbg && opbg->type == JVAL_BOOL) {
+        obj->text_opaque_bg = opbg->bval;
+    }
+    obj->is_text_object = true;
+    obj->text_dirty = true;
+    we_jval_free(root);
+    return true;
+}
+
+static bool authoring_apply_sound_json(we_scene_object_t *obj, const char *payload_json)
+{
+    if (!obj || !payload_json || payload_json[0] == '\0') {
+        return true;
+    }
+    we_jval_t *root = we_json_parse_root(payload_json, strlen(payload_json));
+    if (!root || root->type != JVAL_OBJ) {
+        we_jval_free(root);
+        return false;
+    }
+    const we_jval_t *vol = we_jobj_get(root, "volume");
+    if (vol && vol->type == JVAL_NUM && isfinite(vol->num)) {
+        float v = (float)vol->num;
+        obj->sound_volume = v < 0.0f ? 0.0f : (v > 2.0f ? 2.0f : v);
+    }
+    const we_jval_t *mint = we_jobj_get(root, "mintime");
+    if (mint && mint->type == JVAL_NUM && isfinite(mint->num) && mint->num >= 0.0) {
+        obj->sound_mintime = (float)mint->num;
+    }
+    const we_jval_t *maxt = we_jobj_get(root, "maxtime");
+    if (maxt && maxt->type == JVAL_NUM && isfinite(maxt->num) && maxt->num >= 0.0) {
+        obj->sound_maxtime = (float)maxt->num;
+    }
+    const we_jval_t *ss = we_jobj_get(root, "startsilent");
+    if (ss && ss->type == JVAL_BOOL) {
+        obj->sound_startsilent = ss->bval;
+    }
+    const we_jval_t *paused = we_jobj_get(root, "paused");
+    if (paused && paused->type == JVAL_BOOL) {
+        obj->sound_paused = paused->bval;
+    }
+    const char *mode = we_jval_str(we_jobj_get(root, "mode"), NULL);
+    if (mode) {
+        if (strcasecmp(mode, "single") == 0) {
+            obj->sound_mode = WE_SOUND_MODE_SINGLE;
+        } else if (strcasecmp(mode, "random") == 0) {
+            obj->sound_mode = WE_SOUND_MODE_RANDOM;
+        } else {
+            obj->sound_mode = WE_SOUND_MODE_LOOP;
+        }
+    }
+    obj->is_sound_object = true;
+    we_jval_free(root);
+    return true;
+}
+
+#define WE_SCENE_MAX_PARENT_DEPTH 16u
+
+static uint32_t authoring_parent_chain_depth(const we_scene_t *sc, int32_t parent_id)
+{
+    if (!sc || parent_id < 0) {
+        return 0u;
+    }
+    uint32_t depth = 0u;
+    int32_t cur = parent_id;
+    while (cur >= 0 && depth <= WE_SCENE_MAX_PARENT_DEPTH + 1u) {
+        const we_scene_object_t *p = NULL;
+        for (uint32_t i = 0; i < sc->object_count; ++i) {
+            if (sc->objects[i].id == cur) {
+                p = &sc->objects[i];
+                break;
+            }
+        }
+        if (!p) {
+            break;
+        }
+        depth++;
+        cur = p->parent_id;
+    }
+    return depth;
+}
+
+static uint32_t authoring_subtree_depth(const we_scene_t *sc, int32_t root_id, uint32_t depth)
+{
+    if (!sc || depth > WE_SCENE_MAX_PARENT_DEPTH) {
+        return depth;
+    }
+    uint32_t max_d = depth;
+    for (uint32_t i = 0; i < sc->object_count; ++i) {
+        if (sc->objects[i].parent_id == root_id && sc->objects[i].id != root_id) {
+            uint32_t d = authoring_subtree_depth(sc, sc->objects[i].id, depth + 1u);
+            if (d > max_d) {
+                max_d = d;
+            }
+        }
+    }
+    return max_d;
+}
+
+static bool authoring_mutate_scene(we_scene_t *sc, const waywal_ipc_req_scene_mutate_t *r,
+                                   const char *payload_json, uint32_t *out_status,
+                                   int32_t *out_obj_id, char *err_buf, size_t err_cap)
+{
+    authoring_scene_slot_t *slot = authoring_get_scene_slot(sc, true);
+
+    if (r->mutate_op == WE_MUTATE_ADD_OBJECT) {
+        if (sc->object_count >= WAYWAL_AUTHORING_MAX_OBJECTS) {
+            *out_status = 3u;
+            authoring_copy_cstr(err_buf, err_cap, "Scene object limit exceeded");
+            return false;
+        }
+        if (r->blend_mode > (uint32_t)WE_BLEND_DISABLED) {
+            *out_status = 1u;
+            authoring_copy_cstr(err_buf, err_cap, "Invalid blend mode");
+            return false;
+        }
+        int32_t new_id = r->object_id;
+        if (new_id <= 0 || authoring_find_object(sc, new_id, NULL) != NULL) {
+            int32_t max_id = 0;
+            for (uint32_t i = 0; i < sc->object_count; ++i) {
+                if (sc->objects[i].id > max_id) {
+                    max_id = sc->objects[i].id;
+                }
+            }
+            new_id = max_id + 1;
+        }
+        if (r->parent_id >= 0) {
+            if (r->parent_id == new_id) {
+                *out_status = 2u;
+                authoring_copy_cstr(err_buf, err_cap, "Parent cycle detected");
+                return false;
+            }
+            if (!authoring_find_object(sc, r->parent_id, NULL)) {
+                *out_status = 1u;
+                authoring_copy_cstr(err_buf, err_cap, "Parent scene object not found");
+                return false;
+            }
+            if (authoring_parent_chain_depth(sc, r->parent_id) > WE_SCENE_MAX_PARENT_DEPTH) {
+                *out_status = 2u;
+                authoring_copy_cstr(err_buf, err_cap, "Parent hierarchy depth exceeds maximum");
+                return false;
+            }
+        }
+        we_scene_object_t *grown = (we_scene_object_t *)realloc(
+            sc->objects, ((size_t)sc->object_count + 1u) * sizeof(we_scene_object_t));
+        if (!grown) {
+            *out_status = 3u;
+            authoring_copy_cstr(err_buf, err_cap, "Out of memory appending scene object");
+            return false;
+        }
+        sc->objects = grown;
+        we_scene_object_t *obj = &sc->objects[sc->object_count];
+        memset(obj, 0, sizeof(*obj));
+        obj->id = new_id;
+        obj->parent_id = r->parent_id;
+        authoring_copy_cstr(obj->name, sizeof(obj->name), r->name);
+        memcpy(obj->origin, r->origin, sizeof(obj->origin));
+        memcpy(obj->scale, r->scale, sizeof(obj->scale));
+        memcpy(obj->angles, r->angles, sizeof(obj->angles));
+        memcpy(obj->size, r->size, sizeof(obj->size));
+        memcpy(obj->parallax_depth, r->parallax_depth, sizeof(obj->parallax_depth));
+        obj->color[0] = r->color[0];
+        obj->color[1] = r->color[1];
+        obj->color[2] = r->color[2];
+        obj->alpha = r->color[3];
+        obj->brightness = 1.0f;
+        obj->color_blend_mode = (int32_t)r->blend_mode;
+        obj->visible = (r->flags & 0x1u) != 0u;
+        obj->fullscreen = (r->flags & 0x4u) != 0u;
+        obj->passthrough = (r->flags & 0x8u) != 0u;
+        obj->is_sound_object = (r->node_kind == WE_NODE_SOUND);
+        obj->is_text_object = (r->node_kind == WE_NODE_TEXT);
+        obj->is_light_object = (r->node_kind == WE_NODE_LIGHT);
+        if (obj->is_light_object) {
+            obj->light_type = 0u;
+            obj->light_radius = 400.0f;
+            obj->light_intensity = 1.0f;
+            obj->light_specular_power = 16.0f;
+        }
+        bool payload_ok = true;
+        if (obj->is_text_object) {
+            obj->text_dirty = true;
+            obj->text_pointsize = 24;
+            authoring_copy_cstr(obj->text_halign, sizeof(obj->text_halign), "center");
+            authoring_copy_cstr(obj->text_valign, sizeof(obj->text_valign), "center");
+            payload_ok = authoring_apply_text_json(obj, payload_json);
+        } else if (obj->is_sound_object) {
+            obj->sound_volume = 1.0f;
+            payload_ok = authoring_apply_sound_json(obj, payload_json);
+        } else if (payload_json && payload_json[0] != '\0') {
+            we_jval_t *probe = we_json_parse_root(payload_json, strlen(payload_json));
+            payload_ok = (probe != NULL && probe->type == JVAL_OBJ);
+            we_jval_free(probe);
+        }
+        if (!payload_ok) {
+            authoring_free_object_resources(sc, obj);
+            memset(obj, 0, sizeof(*obj));
+            *out_status = 1u;
+            authoring_copy_cstr(err_buf, err_cap, "Invalid object payload JSON");
+            return false;
+        }
+        sc->object_count++;
+        if (slot) {
+            slot->revision++;
+        }
+        *out_obj_id = new_id;
+        return true;
+    }
+
+    size_t idx = 0u;
+    we_scene_object_t *obj = authoring_find_object(sc, r->object_id, &idx);
+    if (!obj) {
+        *out_status = 1u;
+        authoring_copy_cstr(err_buf, err_cap, "Scene object not found");
+        return false;
+    }
+
+    switch (r->mutate_op) {
+    case WE_MUTATE_REMOVE_OBJECT: {
+        int32_t removed_id = obj->id;
+        for (uint32_t i = 0; i < sc->object_count; ++i) {
+            if (sc->objects[i].parent_id == removed_id) {
+                sc->objects[i].parent_id = -1;
+            }
+        }
+        authoring_free_object_resources(sc, obj);
+        if (idx + 1u < sc->object_count) {
+            memmove(&sc->objects[idx], &sc->objects[idx + 1u],
+                    (size_t)(sc->object_count - idx - 1u) * sizeof(we_scene_object_t));
+        }
+        sc->object_count--;
+        break;
+    }
+    case WE_MUTATE_REORDER_Z: {
+        if (r->target_z_index < 0 || (uint32_t)r->target_z_index >= sc->object_count) {
+            *out_status = 3u;
+            authoring_copy_cstr(err_buf, err_cap, "Target Z index out of range");
+            return false;
+        }
+        size_t dst_idx = (size_t)r->target_z_index;
+        if (dst_idx != idx) {
+            we_scene_object_t moved = sc->objects[idx];
+            if (dst_idx < idx) {
+                memmove(&sc->objects[dst_idx + 1u], &sc->objects[dst_idx],
+                        (idx - dst_idx) * sizeof(we_scene_object_t));
+            } else {
+                memmove(&sc->objects[idx], &sc->objects[idx + 1u],
+                        (dst_idx - idx) * sizeof(we_scene_object_t));
+            }
+            sc->objects[dst_idx] = moved;
+        }
+        break;
+    }
+    case WE_MUTATE_REPARENT: {
+        if (r->parent_id >= 0 && !authoring_find_object(sc, r->parent_id, NULL)) {
+            *out_status = 1u;
+            authoring_copy_cstr(err_buf, err_cap, "Parent scene object not found");
+            return false;
+        }
+        if (authoring_reparent_creates_cycle(sc, obj->id, r->parent_id)) {
+            *out_status = 2u;
+            authoring_copy_cstr(err_buf, err_cap, "Reparent rejected: hierarchy cycle detected");
+            return false;
+        }
+        if (r->parent_id >= 0) {
+            uint32_t parent_hops = authoring_parent_chain_depth(sc, r->parent_id);
+            uint32_t sub_depth = authoring_subtree_depth(sc, obj->id, 0u);
+            if (parent_hops + sub_depth > WE_SCENE_MAX_PARENT_DEPTH) {
+                *out_status = 2u;
+                authoring_copy_cstr(err_buf, err_cap,
+                                    "Reparent rejected: hierarchy depth exceeds maximum");
+                return false;
+            }
+        }
+        obj->parent_id = r->parent_id;
+        break;
+    }
+    case WE_MUTATE_SET_TRANSFORM:
+        memcpy(obj->origin, r->origin, sizeof(obj->origin));
+        memcpy(obj->scale, r->scale, sizeof(obj->scale));
+        memcpy(obj->angles, r->angles, sizeof(obj->angles));
+        memcpy(obj->size, r->size, sizeof(obj->size));
+        memcpy(obj->parallax_depth, r->parallax_depth, sizeof(obj->parallax_depth));
+        break;
+    case WE_MUTATE_SET_BLEND_VIS:
+        if (r->blend_mode > (uint32_t)WE_BLEND_DISABLED) {
+            *out_status = 1u;
+            authoring_copy_cstr(err_buf, err_cap, "Invalid blend mode");
+            return false;
+        }
+        obj->color_blend_mode = (int32_t)r->blend_mode;
+        obj->visible = (r->flags & 0x1u) != 0u;
+        obj->fullscreen = (r->flags & 0x4u) != 0u;
+        obj->passthrough = (r->flags & 0x8u) != 0u;
+        obj->color[0] = r->color[0];
+        obj->color[1] = r->color[1];
+        obj->color[2] = r->color[2];
+        obj->alpha = r->color[3];
+        if (obj->has_base_pass) {
+            obj->base_pass.blending = (we_blend_mode_t)r->blend_mode;
+        }
+        break;
+    case WE_MUTATE_SET_TEXT_PROPS:
+        if (!authoring_apply_text_json(obj, payload_json)) {
+            *out_status = 1u;
+            authoring_copy_cstr(err_buf, err_cap, "Invalid JSON payload for text properties");
+            return false;
+        }
+        break;
+    case WE_MUTATE_SET_SOUND_PROPS:
+        if (!authoring_apply_sound_json(obj, payload_json)) {
+            *out_status = 1u;
+            authoring_copy_cstr(err_buf, err_cap, "Invalid JSON payload for sound properties");
+            return false;
+        }
+        break;
+    default:
+        *out_status = 1u;
+        authoring_copy_cstr(err_buf, err_cap, "Unsupported scene mutation opcode");
+        return false;
+    }
+
+    if (slot) {
+        slot->revision++;
+    }
+    *out_obj_id = r->object_id;
+    return true;
+}
+
+bool daemon_dispatch_ipc_req_scene_mutate(daemon_state_t *state,
+                                          const waywal_ipc_req_scene_mutate_t *req,
+                                          const char *payload_json,
+                                          waywal_ipc_resp_scene_mutate_t *resp)
+{
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), "NULL scene mutate request");
+        return false;
+    }
+
+    waywal_ipc_req_scene_mutate_t r;
+    memcpy(&r, req, sizeof(r));
+    if (r.mutate_op > (uint32_t)WE_MUTATE_SET_SOUND_PROPS ||
+        r.node_kind > (uint32_t)WE_NODE_CAMERA3D ||
+        !memchr(r.target_output, '\0', sizeof(r.target_output)) ||
+        !memchr(r.name, '\0', sizeof(r.name))) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                            "Malformed scene mutate args");
+        return false;
+    }
+
+    if (!state) {
+        resp->status_code = WAYWAL_STATUS_OK;
+        resp->object_id = r.object_id;
+        return true;
+    }
+
+    we_scene_t *visited[64];
+    size_t visited_count = 0u;
+    bool found_scene = false;
+    uint32_t last_rev = 0u;
+    uint32_t last_count = 0u;
+    int32_t out_obj_id = r.object_id;
+
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (!authoring_matches_target(out, r.target_output) || !out->we_scene) {
+            continue;
+        }
+        if (scene_already_visited(visited, visited_count, out->we_scene)) {
+            continue;
+        }
+        if (visited_count < 64u) {
+            visited[visited_count++] = out->we_scene;
+        }
+        found_scene = true;
+        uint32_t err_status = 0u;
+        if (!authoring_mutate_scene(out->we_scene, &r, payload_json, &err_status, &out_obj_id,
+                                    resp->error_msg, sizeof(resp->error_msg))) {
+            resp->status_code = err_status ? err_status : WAYWAL_STATUS_ERR_SYNTAX;
+            resp->object_id = r.object_id;
+            return false;
+        }
+        authoring_scene_slot_t *slot = authoring_get_scene_slot(out->we_scene, false);
+        last_rev = slot ? slot->revision : 1u;
+        last_count = out->we_scene->object_count;
+    }
+
+    if (!found_scene) {
+        resp->status_code = 1u;
+        resp->object_id = r.object_id;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                            "No active scene matching target output");
+        return false;
+    }
+
+    resp->status_code = WAYWAL_STATUS_OK;
+    resp->object_id = out_obj_id;
+    resp->scene_revision = last_rev;
+    resp->object_count = last_count;
+    return true;
+}
+
+static char *authoring_build_shader_meta_json(const we_shader_meta_t *meta, size_t *out_len)
+{
+    authoring_strbuf_t sb = {0};
+    authoring_sb_append_cstr(&sb, "{\"uniforms\":[");
+    for (uint32_t i = 0; i < meta->uniform_count; ++i) {
+        const we_shader_uniform_meta_t *u = &meta->uniforms[i];
+        if (i > 0u) {
+            authoring_sb_append_raw(&sb, ",", 1u);
+        }
+        authoring_sb_append_cstr(&sb, "{\"name\":");
+        authoring_sb_append_json_str(&sb, u->name);
+        authoring_sb_append_cstr(&sb, ",\"type\":");
+        authoring_sb_append_json_str(&sb, u->type);
+        authoring_sb_append_cstr(&sb, ",\"material\":");
+        authoring_sb_append_json_str(&sb, u->material_key);
+        authoring_sb_appendf(&sb, ",\"components\":%u,\"sampler_slot\":%d}", u->num_components,
+                             u->sampler_slot);
+    }
+    authoring_sb_append_cstr(&sb, "],\"combos\":[");
+    for (uint32_t i = 0; i < meta->combo_count; ++i) {
+        if (i > 0u) {
+            authoring_sb_append_raw(&sb, ",", 1u);
+        }
+        authoring_sb_append_cstr(&sb, "{\"name\":");
+        authoring_sb_append_json_str(&sb, meta->combos[i].name);
+        authoring_sb_appendf(&sb, ",\"value\":%d}", meta->combos[i].value);
+    }
+    authoring_sb_append_cstr(&sb, "]}");
+    if (sb.oom) {
+        free(sb.data);
+        if (out_len) {
+            *out_len = 0u;
+        }
+        return NULL;
+    }
+    if (out_len) {
+        *out_len = sb.len;
+    }
+    return sb.data;
+}
+
+bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
+                                             const waywal_ipc_req_hot_reload_code_t *req,
+                                             const char *source_utf8,
+                                             waywal_ipc_resp_hot_reload_code_t *resp,
+                                             char **out_meta_json, size_t *out_meta_len)
+{
+    if (out_meta_json) {
+        *out_meta_json = NULL;
+    }
+    if (out_meta_len) {
+        *out_meta_len = 0u;
+    }
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req || req->code_kind > 2u || req->source_len > WAYWAL_IPC_MAX_CODE_BYTES ||
+        !memchr(req->target_output, '\0', sizeof(req->target_output)) ||
+        !memchr(req->uniform_name, '\0', sizeof(req->uniform_name))) {
+        resp->status_code = 1u;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), "Invalid hot-reload header");
+        return false;
+    }
+    if (req->source_len > 0u && !source_utf8) {
+        resp->status_code = 1u;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), "Missing code payload");
+        return false;
+    }
+
+    uint64_t t0 = now_ns();
+    size_t src_len = req->source_len;
+    char *src_copy = (char *)malloc(src_len + 1u);
+    if (!src_copy) {
+        resp->status_code = 1u;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), "Out of memory");
+        return false;
+    }
+    if (src_len > 0u) {
+        memcpy(src_copy, source_utf8, src_len);
+    }
+    src_copy[src_len] = '\0';
+
+    if (req->code_kind == 2u) {
+        we_script_diag_t diag;
+        memset(&diag, 0, sizeof(diag));
+        bool ok = we_script_lint(src_copy, src_len, 1u, &diag);
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), diag.error_msg);
+        if (ok && (req->flags & 0x2u) != 0u && state != NULL) {
+            we_scene_t *visited[64];
+            size_t visited_count = 0u;
+            bool applied = false;
+            for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                if (!authoring_matches_target(out, req->target_output) || !out->we_scene) {
+                    continue;
+                }
+                if (scene_already_visited(visited, visited_count, out->we_scene)) {
+                    continue;
+                }
+                if (visited_count < 64u) {
+                    visited[visited_count++] = out->we_scene;
+                }
+                we_scene_object_t *obj = authoring_find_object(out->we_scene, req->object_id, NULL);
+                if (!obj) {
+                    continue;
+                }
+                we_script_t *vm =
+                    we_script_create(src_copy, src_len, &out->we_scene->script_shared);
+                if (!vm || we_script_was_aborted(vm)) {
+                    if (vm) {
+                        we_script_destroy(vm);
+                    }
+                    free(src_copy);
+                    resp->status_code = 3u;
+                    resp->compile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
+                    authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                        "SceneScript initialization aborted by watchdog");
+                    return false;
+                }
+                if (req->script_slot < WE_MAX_OBJECT_SCRIPTS) {
+                    if (obj->scripts[req->script_slot].vm) {
+                        we_script_destroy(obj->scripts[req->script_slot].vm);
+                    }
+                    obj->scripts[req->script_slot].vm = vm;
+                    if (req->uniform_name[0] != '\0') {
+                        authoring_copy_cstr(obj->scripts[req->script_slot].uniform_name,
+                                            sizeof(obj->scripts[req->script_slot].uniform_name),
+                                            req->uniform_name);
+                    }
+                    if (req->script_slot >= obj->script_count) {
+                        obj->script_count = req->script_slot + 1u;
+                    }
+                } else {
+                    we_script_destroy(vm);
+                }
+                applied = true;
+            }
+            if (!applied) {
+                free(src_copy);
+                resp->status_code = 4u;
+                authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                    "Target scene object not found for script hot-swap");
+                return false;
+            }
+        }
+        free(src_copy);
+        resp->status_code = ok ? WAYWAL_STATUS_OK : (diag.status_code ? diag.status_code : 1u);
+        resp->error_line = diag.error_line;
+        resp->error_col = diag.error_col;
+        resp->compile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
+        return ok;
+    }
+
+    we_shader_meta_t meta;
+    memset(&meta, 0, sizeof(meta));
+    we_shader_extract_metadata(src_copy, &meta);
+    bool is_frag = (req->code_kind == 0u);
+    bool do_hot_swap = (req->flags & 0x2u) != 0u;
+    bool do_validate = (req->flags & 0x1u) != 0u;
+    bool swapped = false;
+    bool validated_pass = false;
+
+    if (state != NULL && (do_hot_swap || do_validate)) {
+        we_scene_t *visited_scenes[64];
+        size_t visited_scene_count = 0u;
+        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            if (!authoring_matches_target(out, req->target_output)) {
+                continue;
+            }
+            if (do_hot_swap && req->object_id < 0 && out->shader_eng && is_frag) {
+                if (waywal_shader_engine_load_source(out->shader_eng, src_copy, "hot_reload")) {
+                    swapped = true;
+                }
+            } else if (out->we_scene && req->object_id >= 0) {
+                if (scene_already_visited(visited_scenes, visited_scene_count, out->we_scene)) {
+                    continue;
+                }
+                if (visited_scene_count < 64u) {
+                    visited_scenes[visited_scene_count++] = out->we_scene;
+                }
+                we_scene_object_t *obj = authoring_find_object(out->we_scene, req->object_id, NULL);
+                we_material_pass_t *pass = authoring_resolve_pass(obj, req->pass_index);
+                if (!pass) {
+                    continue;
+                }
+                we_shader_meta_t pass_meta;
+                memset(&pass_meta, 0, sizeof(pass_meta));
+                we_shader_extract_metadata(src_copy, &pass_meta);
+                bool tex0_is_gif =
+                    (pass->textures[0] && (pass->textures[0]->flags & WE_TEX_FLAG_IS_GIF) != 0u);
+                char *pass_prep = we_shader_preprocess_stage(
+                    src_copy, is_frag, out->we_scene->pkg, pass->combos, pass->combo_count,
+                    pass->bound_tex_mask, tex0_is_gif, &pass_meta);
+                if (!pass_prep) {
+                    free(src_copy);
+                    resp->status_code = 1u;
+                    resp->compile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
+                    authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                        "GLSL preprocessing failed");
+                    return false;
+                }
+
+                if (out->we_scene->gl_initialized) {
+                    static const char k_val_vert_300es[] =
+                        "#version 300 es\nlayout(location=0) in vec2 a_pos;"
+                        "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+                    static const char k_val_frag_300es[] =
+                        "#version 300 es\nprecision mediump float; out vec4 fragColor;"
+                        "void main() { fragColor = vec4(1.0); }\n";
+                    bool have_both_real =
+                        (is_frag ? (pass->prep.vert_glsl != NULL) : (pass->prep.frag_glsl != NULL));
+                    const char *cand_vert =
+                        is_frag ? (pass->prep.vert_glsl ? pass->prep.vert_glsl : k_val_vert_300es)
+                                : pass_prep;
+                    const char *cand_frag =
+                        is_frag ? pass_prep
+                                : (pass->prep.frag_glsl ? pass->prep.frag_glsl : k_val_frag_300es);
+                    authoring_ensure_scene_egl(out->we_scene);
+                    uint32_t prog =
+                        we_shader_compile_program(cand_vert, cand_frag, "hot_reload_pass");
+                    if (prog == 0u) {
+                        free(pass_prep);
+                        free(src_copy);
+                        resp->status_code = 2u;
+                        resp->compile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
+                        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                            "GLSL program link error");
+                        return false;
+                    }
+                    if (do_hot_swap && have_both_real) {
+                        if (pass->gl_prog != 0u) {
+                            glDeleteProgram(pass->gl_prog);
+                        }
+                        pass->gl_prog = prog;
+                        pass->ulocs.initialized = false;
+                    } else {
+                        glDeleteProgram(prog);
+                    }
+                }
+
+                if (do_hot_swap) {
+                    if (is_frag) {
+                        free(pass->prep.frag_glsl);
+                        pass->prep.frag_glsl = pass_prep;
+                    } else {
+                        free(pass->prep.vert_glsl);
+                        pass->prep.vert_glsl = pass_prep;
+                    }
+                    pass->prep.meta = pass_meta;
+                    swapped = true;
+                } else {
+                    free(pass_prep);
+                }
+                meta = pass_meta;
+                validated_pass = true;
+            }
+        }
+        if (do_hot_swap && !swapped) {
+            free(src_copy);
+            resp->status_code = 4u;
+            authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                "Target shader pass not found");
+            return false;
+        }
+    }
+
+    if (!validated_pass) {
+        char *prep =
+            we_shader_preprocess_stage(src_copy, is_frag, NULL, NULL, 0u, 0u, false, &meta);
+        if (!prep) {
+            free(src_copy);
+            resp->status_code = 1u;
+            resp->compile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
+            authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                "GLSL preprocessing failed");
+            return false;
+        }
+        free(prep);
+    }
+
+    free(src_copy);
+
+    if ((req->flags & 0x4u) != 0u && out_meta_json && out_meta_len) {
+        size_t mlen = 0u;
+        char *mjs = authoring_build_shader_meta_json(&meta, &mlen);
+        if (mjs && mlen <= WAYWAL_IPC_MAX_META_JSON_BYTES) {
+            *out_meta_json = mjs;
+            *out_meta_len = mlen;
+            resp->meta_json_len = (uint32_t)mlen;
+        } else {
+            free(mjs);
+        }
+    }
+
+    resp->status_code = WAYWAL_STATUS_OK;
+    resp->uniform_count = meta.uniform_count;
+    resp->combo_count = meta.combo_count;
+    resp->compile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
+    return true;
+}
+
+bool daemon_dispatch_ipc_req_query_scene_tree(daemon_state_t *state,
+                                              const waywal_ipc_req_query_scene_tree_t *req,
+                                              waywal_ipc_resp_query_scene_tree_t *resp,
+                                              char **out_json, size_t *out_json_len)
+{
+    if (out_json) {
+        *out_json = NULL;
+    }
+    if (out_json_len) {
+        *out_json_len = 0u;
+    }
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req || !memchr(req->target_output, '\0', sizeof(req->target_output))) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    we_scene_t *sc = NULL;
+    if (state) {
+        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            if (authoring_matches_target(out, req->target_output) && out->we_scene) {
+                sc = out->we_scene;
+                break;
+            }
+        }
+    }
+
+    authoring_scene_slot_t *slot = sc ? authoring_get_scene_slot(sc, true) : NULL;
+    uint32_t rev = slot ? slot->revision : 0u;
+    uint32_t obj_count = sc ? sc->object_count : 0u;
+
+    authoring_strbuf_t sb = {0};
+    authoring_sb_appendf(&sb, "{\"scene_revision\":%u,\"object_count\":%u,\"objects\":[", rev,
+                         obj_count);
+
+    if (sc && sc->objects) {
+        for (uint32_t i = 0; i < sc->object_count; ++i) {
+            const we_scene_object_t *o = &sc->objects[i];
+            if (i > 0u) {
+                authoring_sb_append_raw(&sb, ",", 1u);
+            }
+            const char *kind =
+                o->is_text_object
+                    ? "text"
+                    : (o->is_sound_object
+                           ? "sound"
+                           : (o->is_light_object ? "light"
+                                                 : (o->particle_sys ? "particle" : "image")));
+            authoring_sb_appendf(&sb,
+                                 "{\"id\":%d,\"parent_id\":%d,\"kind\":\"%s\",\"name\":", o->id,
+                                 o->parent_id, kind);
+            authoring_sb_append_json_str(&sb, o->name);
+            authoring_sb_appendf(
+                &sb,
+                ",\"visible\":%s,\"blend_mode\":%d,\"alpha\":%.6g,"
+                "\"origin\":[%.6g,%.6g,%.6g],\"scale\":[%.6g,%.6g,%.6g],\"size\":[%.6g,%.6g]",
+                o->visible ? "true" : "false", o->color_blend_mode, (double)o->alpha,
+                (double)o->origin[0], (double)o->origin[1], (double)o->origin[2],
+                (double)o->scale[0], (double)o->scale[1], (double)o->scale[2], (double)o->size[0],
+                (double)o->size[1]);
+            if ((req->flags & 0x1u) != 0u && o->has_base_pass) {
+                authoring_sb_appendf(&sb, ",\"combo_count\":%u,\"const_val_count\":%u",
+                                     o->base_pass.combo_count, o->base_pass.const_val_count);
+            }
+            if ((req->flags & 0x2u) != 0u && o->particle_sys) {
+                authoring_sb_appendf(&sb, ",\"particle\":{\"alive\":%u,\"max\":%u}",
+                                     o->particle_sys->alive_count, o->particle_sys->max_count);
+            }
+            if ((req->flags & 0x4u) != 0u) {
+                authoring_sb_appendf(&sb, ",\"script_count\":%u", o->script_count);
+            }
+            if ((req->flags & 0x8u) != 0u && o->is_sound_object) {
+                authoring_sb_appendf(&sb, ",\"sound_volume\":%.6g,\"sound_paused\":%s",
+                                     (double)o->sound_volume, o->sound_paused ? "true" : "false");
+            }
+            authoring_sb_append_raw(&sb, "}", 1u);
+        }
+    }
+
+    if ((req->flags & 0x8u) != 0u && sc) {
+        authoring_sb_appendf(&sb, "],\"audio_binding_count\":%u}", sc->audio_binding_count);
+    } else {
+        authoring_sb_append_cstr(&sb, "]}");
+    }
+
+    if (sb.oom || sb.len > WAYWAL_IPC_MAX_SCENE_JSON) {
+        free(sb.data);
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    if (out_json) {
+        *out_json = sb.data;
+    } else {
+        free(sb.data);
+    }
+    if (out_json_len) {
+        *out_json_len = sb.len;
+    }
+    resp->status_code = WAYWAL_STATUS_OK;
+    resp->scene_revision = rev;
+    resp->object_count = obj_count;
+    resp->json_len = (uint32_t)sb.len;
+    return true;
+}
+
+static bool authoring_combo_name_valid(const char *name)
+{
+    if (!name || name[0] == '\0') {
+        return false;
+    }
+    unsigned char c0 = (unsigned char)name[0];
+    if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_')) {
+        return false;
+    }
+    for (size_t i = 1u; name[i] != '\0'; ++i) {
+        unsigned char c = (unsigned char)name[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static char *authoring_patch_combo_define(const char *stage_glsl, const char *combo_name,
+                                          int32_t combo_value)
+{
+    if (!stage_glsl || !authoring_combo_name_valid(combo_name)) {
+        return NULL;
+    }
+    char def_line[160];
+    int n = snprintf(def_line, sizeof(def_line), "#define %s %d\n", combo_name, combo_value);
+    if (n <= 0 || (size_t)n >= sizeof(def_line)) {
+        return NULL;
+    }
+    size_t def_len = (size_t)n;
+    size_t name_len = strlen(combo_name);
+    size_t src_len = strlen(stage_glsl);
+    size_t cap = src_len + def_len + 64u;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        return NULL;
+    }
+
+    size_t used = 0u;
+    size_t insert_off = 0u;
+    bool saw_version = false;
+    bool replaced = false;
+    const char *p = stage_glsl;
+
+    while (*p != '\0') {
+        const char *nl = strchr(p, '\n');
+        size_t line_len = nl ? (size_t)(nl - p + 1) : strlen(p);
+        const char *q = p;
+        while ((size_t)(q - p) < line_len && (*q == ' ' || *q == '\t')) {
+            q++;
+        }
+        size_t rem = line_len - (size_t)(q - p);
+        bool is_define = false;
+        if (rem >= 8u && strncmp(q, "#define", 7) == 0 && (q[7] == ' ' || q[7] == '\t')) {
+            const char *r = q + 7;
+            while ((size_t)(r - p) < line_len && (*r == ' ' || *r == '\t')) {
+                r++;
+            }
+            size_t r_rem = line_len - (size_t)(r - p);
+            if (r_rem >= name_len && strncmp(r, combo_name, name_len) == 0) {
+                char next_c = (r_rem > name_len) ? r[name_len] : '\0';
+                if (next_c == ' ' || next_c == '\t' || next_c == '\r' || next_c == '\n' ||
+                    next_c == '\0') {
+                    is_define = true;
+                }
+            }
+        }
+        bool is_version = (!saw_version && rem >= 8u && strncmp(q, "#version", 8) == 0);
+        const char *emit = is_define ? def_line : p;
+        size_t emit_len = is_define ? def_len : line_len;
+        if (used + emit_len + def_len + 2u > cap) {
+            size_t new_cap = (used + emit_len + def_len + 64u) * 2u;
+            char *grown = (char *)realloc(out, new_cap);
+            if (!grown) {
+                free(out);
+                return NULL;
+            }
+            out = grown;
+            cap = new_cap;
+        }
+        memcpy(out + used, emit, emit_len);
+        used += emit_len;
+        if (is_define) {
+            replaced = true;
+        }
+        if (is_version) {
+            saw_version = true;
+            insert_off = used;
+        }
+        p += line_len;
+    }
+
+    if (!replaced) {
+        if (used + def_len + 2u > cap) {
+            char *grown = (char *)realloc(out, used + def_len + 2u);
+            if (!grown) {
+                free(out);
+                return NULL;
+            }
+            out = grown;
+        }
+        memmove(out + insert_off + def_len, out + insert_off, used - insert_off);
+        memcpy(out + insert_off, def_line, def_len);
+        used += def_len;
+    }
+
+    if (used > 0u && out[used - 1u] != '\n') {
+        out[used++] = '\n';
+    }
+    out[used] = '\0';
+    return out;
+}
+
+bool daemon_dispatch_ipc_req_set_shader_combo(daemon_state_t *state,
+                                              const waywal_ipc_req_set_shader_combo_t *req,
+                                              waywal_ipc_resp_set_shader_combo_t *resp)
+{
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req || !memchr(req->target_output, '\0', sizeof(req->target_output)) ||
+        !memchr(req->combo_name, '\0', sizeof(req->combo_name)) ||
+        !authoring_combo_name_valid(req->combo_name)) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                            "Invalid shader combo request");
+        return false;
+    }
+
+    if (!state) {
+        resp->status_code = WAYWAL_STATUS_OK;
+        return true;
+    }
+
+    uint64_t t0 = now_ns();
+    we_scene_t *visited[64];
+    size_t visited_count = 0u;
+    bool updated = false;
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (!authoring_matches_target(out, req->target_output) || !out->we_scene) {
+            continue;
+        }
+        if (scene_already_visited(visited, visited_count, out->we_scene)) {
+            continue;
+        }
+        if (visited_count < 64u) {
+            visited[visited_count++] = out->we_scene;
+        }
+        we_scene_object_t *obj = authoring_find_object(out->we_scene, req->object_id, NULL);
+        we_material_pass_t *pass = authoring_resolve_pass(obj, req->pass_index);
+        if (!pass) {
+            continue;
+        }
+        bool found_combo = false;
+        size_t combo_idx = 0u;
+        for (uint32_t c = 0; c < pass->combo_count; ++c) {
+            if (strcmp(pass->combos[c].name, req->combo_name) == 0) {
+                combo_idx = c;
+                found_combo = true;
+                break;
+            }
+        }
+        if (!found_combo && pass->combo_count >= WE_SHADER_MAX_COMBOS) {
+            resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                "Shader combo limit exceeded");
+            return false;
+        }
+
+        char *cand_vert = NULL;
+        char *cand_frag = NULL;
+        if (pass->prep.vert_glsl) {
+            cand_vert = authoring_patch_combo_define(pass->prep.vert_glsl, req->combo_name,
+                                                     req->combo_value);
+            if (!cand_vert) {
+                resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+                authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                    "Out of memory patching vertex shader combo");
+                return false;
+            }
+        }
+        if (pass->prep.frag_glsl) {
+            cand_frag = authoring_patch_combo_define(pass->prep.frag_glsl, req->combo_name,
+                                                     req->combo_value);
+            if (!cand_frag) {
+                free(cand_vert);
+                resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+                authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                    "Out of memory patching fragment shader combo");
+                return false;
+            }
+        }
+
+        if (out->we_scene->gl_initialized && cand_vert && cand_frag) {
+            authoring_ensure_scene_egl(out->we_scene);
+            uint32_t prog = we_shader_compile_program(cand_vert, cand_frag, pass->shader_name);
+            if (prog == 0u) {
+                free(cand_vert);
+                free(cand_frag);
+                resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+                resp->recompile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
+                authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                    "Shader recompile failed");
+                return false;
+            }
+            if (pass->gl_prog != 0u) {
+                glDeleteProgram(pass->gl_prog);
+            }
+            pass->gl_prog = prog;
+            pass->ulocs.initialized = false;
+        }
+
+        if (cand_vert) {
+            free(pass->prep.vert_glsl);
+            pass->prep.vert_glsl = cand_vert;
+        }
+        if (cand_frag) {
+            free(pass->prep.frag_glsl);
+            pass->prep.frag_glsl = cand_frag;
+        }
+        if (found_combo) {
+            pass->combos[combo_idx].value = req->combo_value;
+        } else {
+            authoring_copy_cstr(pass->combos[pass->combo_count].name,
+                                sizeof(pass->combos[pass->combo_count].name), req->combo_name);
+            pass->combos[pass->combo_count].value = req->combo_value;
+            pass->combo_count++;
+        }
+        updated = true;
+    }
+
+    if (!updated) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                            "Target shader pass not found");
+        return false;
+    }
+
+    resp->status_code = WAYWAL_STATUS_OK;
+    resp->recompile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
+    return true;
+}
+
+static int32_t authoring_clamp_double_to_i32(double v)
+{
+    if (!isfinite(v)) {
+        return 0;
+    }
+    if (v <= (double)INT32_MIN) {
+        return INT32_MIN;
+    }
+    if (v >= (double)INT32_MAX) {
+        return INT32_MAX;
+    }
+    return (int32_t)v;
+}
+
+bool daemon_dispatch_ipc_req_brush_stroke(daemon_state_t *state,
+                                          const waywal_ipc_req_brush_stroke_t *req,
+                                          const we_brush_dab_t *dabs,
+                                          waywal_ipc_resp_brush_stroke_t *resp)
+{
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req || req->action > (uint32_t)WE_BRUSH_IPC_REDO_STROKE ||
+        req->dab_count > WE_BRUSH_MAX_STROKE_DABS ||
+        !memchr(req->target_output, '\0', sizeof(req->target_output))) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+    if (req->dab_count > 0u && !dabs) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    resp->stroke_id = req->stroke_id;
+
+    if (!state) {
+        if (req->dab_count > 0u) {
+            double min_x = (double)dabs[0].ax - (double)dabs[0].radius_a;
+            double min_y = (double)dabs[0].ay - (double)dabs[0].radius_a;
+            double max_x = (double)dabs[0].ax + (double)dabs[0].radius_a;
+            double max_y = (double)dabs[0].ay + (double)dabs[0].radius_a;
+            for (uint32_t i = 0; i < req->dab_count; ++i) {
+                double x0 = fmin((double)dabs[i].ax - (double)dabs[i].radius_a,
+                                 (double)dabs[i].bx - (double)dabs[i].radius_b);
+                double y0 = fmin((double)dabs[i].ay - (double)dabs[i].radius_a,
+                                 (double)dabs[i].by - (double)dabs[i].radius_b);
+                double x1 = fmax((double)dabs[i].ax + (double)dabs[i].radius_a,
+                                 (double)dabs[i].bx + (double)dabs[i].radius_b);
+                double y1 = fmax((double)dabs[i].ay + (double)dabs[i].radius_a,
+                                 (double)dabs[i].by + (double)dabs[i].radius_b);
+                if (x0 < min_x)
+                    min_x = x0;
+                if (y0 < min_y)
+                    min_y = y0;
+                if (x1 > max_x)
+                    max_x = x1;
+                if (y1 > max_y)
+                    max_y = y1;
+            }
+            resp->dirty_rect.x = authoring_clamp_double_to_i32(floor(min_x));
+            resp->dirty_rect.y = authoring_clamp_double_to_i32(floor(min_y));
+            double span_w = ceil(max_x - min_x);
+            double span_h = ceil(max_y - min_y);
+            resp->dirty_rect.width = authoring_clamp_double_to_i32(span_w > 0.0 ? span_w : 0.0);
+            resp->dirty_rect.height = authoring_clamp_double_to_i32(span_h > 0.0 ? span_h : 0.0);
+        }
+        resp->status_code = WAYWAL_STATUS_OK;
+        return true;
+    }
+
+#if WAYWAL_HAVE_GPU_BRUSH
+    we_scene_t *target_sc = NULL;
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (authoring_matches_target(out, req->target_output) && out->we_scene) {
+            target_sc = out->we_scene;
+            break;
+        }
+    }
+    if (!target_sc || !target_sc->gl_initialized) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+    authoring_ensure_scene_egl(target_sc);
+    if (!g_authoring_brush_ctx) {
+        g_authoring_brush_ctx = we_gpu_brush_create(WE_BRUSH_POOL_DEFAULT_CAPS);
+        if (!g_authoring_brush_ctx) {
+            resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+    }
+
+    bool ok = false;
+    switch (req->action) {
+    case WE_BRUSH_IPC_BIND_TARGET:
+        ok = we_gpu_brush_bind_target(g_authoring_brush_ctx, target_sc, req->object_id,
+                                      req->pass_index, req->tex_slot);
+        break;
+    case WE_BRUSH_IPC_BEGIN_STROKE:
+        ok = we_gpu_brush_begin_stroke(g_authoring_brush_ctx, req->stroke_id, &req->params);
+        break;
+    case WE_BRUSH_IPC_DAB_BATCH:
+        ok = we_gpu_brush_dispatch_dabs(g_authoring_brush_ctx, dabs, req->dab_count,
+                                        &resp->dirty_rect);
+        break;
+    case WE_BRUSH_IPC_END_STROKE:
+        ok = we_gpu_brush_end_stroke(g_authoring_brush_ctx, &resp->captured_tile_count);
+        break;
+    case WE_BRUSH_IPC_UNDO_STROKE:
+        ok = we_gpu_brush_undo_stroke(g_authoring_brush_ctx, req->stroke_id);
+        break;
+    case WE_BRUSH_IPC_REDO_STROKE:
+        ok = we_gpu_brush_redo_stroke(g_authoring_brush_ctx, req->stroke_id);
+        break;
+    default:
+        ok = false;
+        break;
+    }
+    we_gpu_brush_get_stats(g_authoring_brush_ctx, &resp->stats);
+    resp->status_code = ok ? WAYWAL_STATUS_OK : WAYWAL_STATUS_ERR_SYNTAX;
+    return ok;
+#else
+    resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+    return false;
+#endif
+}
+
+bool daemon_dispatch_ipc_req_particle_config(daemon_state_t *state,
+                                             const waywal_ipc_req_particle_config_t *req,
+                                             const void *payload,
+                                             waywal_ipc_resp_particle_config_t *resp)
+{
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req || req->config_op > (uint32_t)WE_PARTICLE_CFG_PAUSE_TOGGLE ||
+        !memchr(req->target_output, '\0', sizeof(req->target_output))) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+    resp->object_id = req->object_id;
+
+    if (!state) {
+        resp->status_code = WAYWAL_STATUS_OK;
+        return true;
+    }
+
+    uint64_t t0 = now_ns();
+    we_scene_t *visited[64];
+    size_t visited_count = 0u;
+    bool applied = false;
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (!authoring_matches_target(out, req->target_output) || !out->we_scene) {
+            continue;
+        }
+        if (scene_already_visited(visited, visited_count, out->we_scene)) {
+            continue;
+        }
+        if (visited_count < 64u) {
+            visited[visited_count++] = out->we_scene;
+        }
+        we_scene_object_t *obj = authoring_find_object(out->we_scene, req->object_id, NULL);
+        if (!obj) {
+            continue;
+        }
+        if (req->config_op == WE_PARTICLE_CFG_SET_SYSTEM_JSON) {
+            if (!payload || req->payload_len == 0u) {
+                resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+                return false;
+            }
+            we_particle_sys_t *next_ps =
+                we_particle_create_from_json((const char *)payload, req->payload_len);
+            if (!next_ps) {
+                resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+                return false;
+            }
+            if (obj->particle_sys) {
+                we_particle_destroy(obj->particle_sys);
+            }
+            obj->particle_sys = next_ps;
+        } else if (req->config_op == WE_PARTICLE_CFG_APPLY_PRESET) {
+            we_particle_sys_t *next_ps = we_particle_create_preset(
+                (we_particle_preset_id_t)req->preset_id, (req->flags & 0x2u) != 0u);
+            if (!next_ps) {
+                resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+                return false;
+            }
+            next_ps->paused = (req->flags & 0x1u) != 0u;
+            if (obj->particle_sys) {
+                we_particle_destroy(obj->particle_sys);
+            }
+            obj->particle_sys = next_ps;
+        } else {
+            we_particle_sys_t *ps = obj->particle_sys;
+            if (!ps) {
+                continue;
+            }
+            if (req->config_op == WE_PARTICLE_CFG_PAUSE_TOGGLE) {
+                ps->paused = !ps->paused;
+            } else if (req->config_op == WE_PARTICLE_CFG_TRIGGER_BURST) {
+                uint32_t burst_count = req->_pad[0];
+                if (burst_count == 0u) {
+                    burst_count = req->preset_id;
+                }
+                if (burst_count == 0u) {
+                    burst_count = (ps->emitter_count > 0u && ps->emitters[0].instantaneous > 0u)
+                                      ? ps->emitters[0].instantaneous
+                                      : 16u;
+                }
+                if (burst_count > WE_PARTICLE_MAX_CAP) {
+                    burst_count = WE_PARTICLE_MAX_CAP;
+                }
+                we_particle_trigger_burst(ps, burst_count);
+            } else if (req->config_op == WE_PARTICLE_CFG_SET_RAMP_LUT) {
+                if (!payload || req->payload_len != sizeof(we_particle_ramp_lut_t)) {
+                    resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+                    return false;
+                }
+                we_particle_ramp_lut_t lut;
+                memcpy(&lut, payload, sizeof(lut));
+                if (!we_particle_apply_ramp_lut(ps, &lut)) {
+                    resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+                    return false;
+                }
+            }
+        }
+
+        if (obj->particle_sys) {
+            resp->alive_count = obj->particle_sys->alive_count;
+            resp->max_count = obj->particle_sys->max_count;
+        }
+        applied = true;
+    }
+
+    resp->sim_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
+    resp->status_code = applied ? WAYWAL_STATUS_OK : WAYWAL_STATUS_ERR_SYNTAX;
+    return applied;
+}
+
+bool daemon_dispatch_ipc_req_set_audio_bindings(daemon_state_t *state,
+                                                const waywal_ipc_req_set_audio_bindings_t *req,
+                                                const we_audio_binding_t *bindings,
+                                                waywal_ipc_resp_set_audio_bindings_t *resp)
+{
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req || req->bind_op > (uint32_t)WE_AUDIO_BIND_OP_CLEAR ||
+        req->binding_count > WE_MAX_AUDIO_BINDINGS ||
+        !memchr(req->target_output, '\0', sizeof(req->target_output))) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+    if (req->binding_count > 0u && !bindings) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    if (!state) {
+        resp->status_code = WAYWAL_STATUS_OK;
+        resp->active_binding_count = req->binding_count;
+        return true;
+    }
+
+    uint64_t t0 = now_ns();
+    we_scene_t *visited[64];
+    size_t visited_count = 0u;
+    bool found = false;
+    uint32_t last_active = 0u;
+    uint64_t last_eval_ns = 0u;
+
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (!authoring_matches_target(out, req->target_output) || !out->we_scene) {
+            continue;
+        }
+        if (scene_already_visited(visited, visited_count, out->we_scene)) {
+            continue;
+        }
+        if (visited_count < 64u) {
+            visited[visited_count++] = out->we_scene;
+        }
+        we_scene_t *sc = out->we_scene;
+        if (req->bind_op == WE_AUDIO_BIND_OP_UPSERT) {
+            uint32_t new_slots = 0u;
+            for (uint32_t k = 0; k < req->binding_count; ++k) {
+                bool exists = false;
+                for (uint32_t i = 0; i < sc->audio_binding_count; ++i) {
+                    if (sc->audio_bindings[i].binding_id == bindings[k].binding_id) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    for (uint32_t prev = 0; prev < k; ++prev) {
+                        if (bindings[prev].binding_id == bindings[k].binding_id) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                }
+                if (!exists) {
+                    new_slots++;
+                }
+            }
+            if (sc->audio_binding_count + new_slots > WE_MAX_AUDIO_BINDINGS) {
+                resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+                return false;
+            }
+        }
+        if (!we_scene_apply_audio_bindings(sc, (we_audio_bind_op_t)req->bind_op, bindings,
+                                           req->binding_count, req->remove_id)) {
+            resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            return false;
+        }
+        authoring_scene_slot_t *slot = authoring_get_scene_slot(sc, true);
+        if (slot) {
+            slot->revision++;
+        }
+        found = true;
+        last_active = sc->audio_binding_count;
+        last_eval_ns = (uint64_t)sc->last_audio_bindings_eval_ns;
+    }
+
+    uint64_t eval_ns = last_eval_ns ? last_eval_ns : (now_ns() - t0);
+    resp->eval_time_ns = eval_ns > UINT32_MAX ? UINT32_MAX : (uint32_t)eval_ns;
+    resp->active_binding_count = last_active;
+    resp->status_code = found ? WAYWAL_STATUS_OK : WAYWAL_STATUS_ERR_SYNTAX;
+    return found;
+}
+
+#if WAYWAL_HAVE_ASSET_WRITER
+static void authoring_sum_export_dir(const char *dir_path, uint32_t *out_files, uint64_t *out_bytes,
+                                     uint32_t depth)
+{
+    if (!dir_path || depth >= 16u) {
+        return;
+    }
+    DIR *dp = opendir(dir_path);
+    if (!dp) {
+        return;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        char sub[4096];
+        int n = snprintf(sub, sizeof(sub), "%s/%s", dir_path, ent->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(sub)) {
+            continue;
+        }
+        struct stat st;
+        if (lstat(sub, &st) != 0) {
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            authoring_sum_export_dir(sub, out_files, out_bytes, depth + 1u);
+        } else if (S_ISREG(st.st_mode)) {
+            (*out_files)++;
+            if (st.st_size > 0) {
+                *out_bytes += (uint64_t)st.st_size;
+            }
+        }
+    }
+    closedir(dp);
+}
+
+static void authoring_rm_tree(const char *path, uint32_t depth)
+{
+    if (!path || depth >= 16u) {
+        return;
+    }
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        (void)unlink(path);
+        return;
+    }
+    DIR *dp = opendir(path);
+    if (dp) {
+        struct dirent *ent;
+        while ((ent = readdir(dp)) != NULL) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+                continue;
+            }
+            char sub[PATH_MAX];
+            int n = snprintf(sub, sizeof(sub), "%s/%s", path, ent->d_name);
+            if (n > 0 && (size_t)n < sizeof(sub)) {
+                authoring_rm_tree(sub, depth + 1u);
+            }
+        }
+        closedir(dp);
+    }
+    (void)rmdir(path);
+}
+
+static bool authoring_mkdir_p(const char *dir)
+{
+    if (!dir || dir[0] != '/') {
+        return false;
+    }
+    char tmp[PATH_MAX];
+    size_t len = strnlen(dir, sizeof(tmp));
+    if (len <= 1u || len >= sizeof(tmp)) {
+        return false;
+    }
+    memcpy(tmp, dir, len + 1u);
+    while (len > 1u && tmp[len - 1u] == '/') {
+        tmp[--len] = '\0';
+    }
+    for (size_t i = 1u; i <= len; ++i) {
+        if (tmp[i] == '/' || tmp[i] == '\0') {
+            char saved = tmp[i];
+            tmp[i] = '\0';
+            struct stat st;
+            if (lstat(tmp, &st) == 0) {
+                if (!S_ISDIR(st.st_mode)) {
+                    return false;
+                }
+            } else if (errno != ENOENT || mkdir(tmp, 0755) != 0) {
+                if (errno != EEXIST) {
+                    return false;
+                }
+            }
+            tmp[i] = saved;
+        }
+    }
+    return true;
+}
+
+static bool authoring_move_dir_contents(const char *src_dir, const char *dst_dir, uint32_t depth)
+{
+    if (depth >= 16u || !authoring_mkdir_p(dst_dir)) {
+        return false;
+    }
+    DIR *dp = opendir(src_dir);
+    if (!dp) {
+        return false;
+    }
+    bool ok = true;
+    struct dirent *ent;
+    while (ok && (ent = readdir(dp)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        char s_sub[PATH_MAX];
+        char d_sub[PATH_MAX];
+        int sn = snprintf(s_sub, sizeof(s_sub), "%s/%s", src_dir, ent->d_name);
+        int dn = snprintf(d_sub, sizeof(d_sub), "%s/%s", dst_dir, ent->d_name);
+        if (sn <= 0 || (size_t)sn >= sizeof(s_sub) || dn <= 0 || (size_t)dn >= sizeof(d_sub)) {
+            ok = false;
+            break;
+        }
+        struct stat st;
+        if (lstat(s_sub, &st) != 0) {
+            ok = false;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            ok = authoring_move_dir_contents(s_sub, d_sub, depth + 1u);
+        } else if (S_ISREG(st.st_mode)) {
+            if (rename(s_sub, d_sub) != 0) {
+                ok = false;
+            }
+        }
+    }
+    closedir(dp);
+    return ok;
+}
+#endif
+
+bool daemon_dispatch_ipc_req_export_scene_pkg(daemon_state_t *state,
+                                              const waywal_ipc_req_export_scene_pkg_t *req,
+                                              waywal_ipc_resp_export_scene_pkg_t *resp)
+{
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req || req->dest_dir_or_pkg[0] == '\0' ||
+        !memchr(req->target_output, '\0', sizeof(req->target_output)) ||
+        !memchr(req->dest_dir_or_pkg, '\0', sizeof(req->dest_dir_or_pkg))) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), "Invalid export request");
+        return false;
+    }
+    if ((req->flags & WE_EXPORT_PKG_FLAG_DIRECT_PKG_FILE) != 0u &&
+        (req->flags & WE_EXPORT_PKG_FLAG_PACK_SCENE_PKG) == 0u) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                            "Direct package export requires pack flag");
+        return false;
+    }
+    char resolved_dest[PATH_MAX];
+    if (!waywal_ipc_export_path_is_allowed(req->dest_dir_or_pkg, resolved_dest,
+                                           sizeof(resolved_dest))) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                            "Export destination outside allowlisted directory");
+        return false;
+    }
+
+    if (!state) {
+        resp->status_code = WAYWAL_STATUS_OK;
+        return true;
+    }
+
+    uint64_t t0 = now_ns();
+    we_scene_t *sc = NULL;
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (authoring_matches_target(out, req->target_output) && out->we_scene) {
+            sc = out->we_scene;
+            break;
+        }
+    }
+    if (!sc) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                            "No active scene matching target output");
+        return false;
+    }
+
+#if WAYWAL_HAVE_ASSET_WRITER
+    char parent_dir[PATH_MAX];
+    memcpy(parent_dir, resolved_dest, strlen(resolved_dest) + 1u);
+    char *slash = strrchr(parent_dir, '/');
+    if (!slash || slash == parent_dir) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), "Invalid export parent path");
+        return false;
+    }
+    *slash = '\0';
+    if (!authoring_mkdir_p(parent_dir)) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                            "Failed to create export parent directory");
+        return false;
+    }
+
+    char stage_dir[PATH_MAX];
+    int sn = snprintf(stage_dir, sizeof(stage_dir), "%s/.wwal-export-stage-XXXXXX", parent_dir);
+    if (sn <= 0 || (size_t)sn >= sizeof(stage_dir) || !mkdtemp(stage_dir)) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                            "Failed to create staging directory");
+        return false;
+    }
+
+    bool pack_pkg = (req->flags & WE_EXPORT_PKG_FLAG_PACK_SCENE_PKG) != 0u;
+    bool direct_pkg = (req->flags & WE_EXPORT_PKG_FLAG_DIRECT_PKG_FILE) != 0u;
+    we_asset_writer_err_t werr = WE_WRITER_OK;
+    bool ok = we_scene_export_dir(sc, stage_dir, pack_pkg, &werr);
+    resp->export_time_us = (now_ns() - t0) / 1000ULL;
+    if (!ok) {
+        authoring_rm_tree(stage_dir, 0u);
+        resp->status_code = (uint32_t)werr;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                            "Scene package export failed");
+        return false;
+    }
+
+    uint32_t file_count = 0u;
+    uint64_t total_bytes = 0u;
+    authoring_sum_export_dir(stage_dir, &file_count, &total_bytes, 0u);
+    uint32_t entries = file_count;
+    if (direct_pkg) {
+        char stage_pkg[PATH_MAX];
+        int pn = snprintf(stage_pkg, sizeof(stage_pkg), "%s/scene.pkg", stage_dir);
+        struct stat pkg_st;
+        if (pn <= 0 || (size_t)pn >= sizeof(stage_pkg) || lstat(stage_pkg, &pkg_st) != 0 ||
+            !S_ISREG(pkg_st.st_mode)) {
+            authoring_rm_tree(stage_dir, 0u);
+            resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                "Export did not produce scene.pkg");
+            return false;
+        }
+        uint32_t pkg_entries = 1u;
+        we_pkg_t *pkg = we_pkg_open_file(stage_pkg, stage_dir);
+        if (pkg) {
+            pkg_entries = pkg->entry_count > 0u ? pkg->entry_count : 1u;
+            we_pkg_close(pkg);
+        }
+        if (rename(stage_pkg, resolved_dest) != 0) {
+            authoring_rm_tree(stage_dir, 0u);
+            resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                "Failed to finalize exported scene.pkg");
+            return false;
+        }
+        authoring_rm_tree(stage_dir, 0u);
+        resp->status_code = WAYWAL_STATUS_OK;
+        resp->entry_count = pkg_entries;
+        resp->total_bytes = pkg_st.st_size > 0 ? (uint64_t)pkg_st.st_size : 0ULL;
+        return true;
+    }
+
+    if (pack_pkg) {
+        char pkg_path[PATH_MAX];
+        int pn = snprintf(pkg_path, sizeof(pkg_path), "%s/scene.pkg", stage_dir);
+        if (pn > 0 && (size_t)pn < sizeof(pkg_path)) {
+            we_pkg_t *pkg = we_pkg_open_file(pkg_path, stage_dir);
+            if (pkg) {
+                entries = (file_count > 0u ? (file_count - 1u) : 0u) + pkg->entry_count;
+                we_pkg_close(pkg);
+            }
+        }
+    }
+    if (rename(stage_dir, resolved_dest) != 0) {
+        if (!authoring_move_dir_contents(stage_dir, resolved_dest, 0u)) {
+            authoring_rm_tree(stage_dir, 0u);
+            resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                "Failed to finalize export directory");
+            return false;
+        }
+        authoring_rm_tree(stage_dir, 0u);
+    }
+    resp->status_code = WAYWAL_STATUS_OK;
+    resp->entry_count = entries;
+    resp->total_bytes = total_bytes;
+    return true;
+#else
+    (void)t0;
+    resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+    authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), "Asset exporter unavailable");
+    return false;
+#endif
+}
+
+bool daemon_dispatch_ipc_req_lint_scenescript(daemon_state_t *state,
+                                              const waywal_ipc_req_lint_scenescript_t *req,
+                                              const char *source_utf8,
+                                              waywal_ipc_resp_lint_scenescript_t *resp)
+{
+    (void)state;
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req || req->source_len > WAYWAL_IPC_MAX_CODE_BYTES) {
+        resp->status_code = 1u;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), "Invalid lint request size");
+        return false;
+    }
+    if (req->source_len > 0u && !source_utf8) {
+        resp->status_code = 1u;
+        authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), "Missing SceneScript body");
+        return false;
+    }
+
+    uint64_t t0 = now_ns();
+    we_script_diag_t diag;
+    memset(&diag, 0, sizeof(diag));
+    bool ok = we_script_lint(source_utf8 ? source_utf8 : "", req->source_len, req->flags, &diag);
+    resp->status_code = ok ? WAYWAL_STATUS_OK : (diag.status_code ? diag.status_code : 1u);
+    resp->error_line = diag.error_line;
+    resp->error_col = diag.error_col;
+    resp->lint_time_us =
+        diag.lint_time_us ? diag.lint_time_us : (uint32_t)((now_ns() - t0) / 1000ULL);
+    authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), diag.error_msg);
+    return ok;
+}
+
+static uint8_t *authoring_copy_rgba8_unswiz(const we_tex_mip_t *m0, size_t *out_len)
+{
+    if (!m0 || !m0->rgba8 || m0->width == 0u || m0->height == 0u) {
+        return NULL;
+    }
+    size_t w = (size_t)m0->width;
+    if ((size_t)m0->height > SIZE_MAX / w) {
+        return NULL;
+    }
+    size_t npx = w * (size_t)m0->height;
+    if (npx > WAYWAL_IPC_MAX_READBACK_BYTES / 4u) {
+        return NULL;
+    }
+    size_t len = npx * 4u;
+    uint8_t *buf = (uint8_t *)malloc(len);
+    if (!buf) {
+        return NULL;
+    }
+    memcpy(buf, m0->rgba8, len);
+    if (m0->is_bgra_swiz) {
+        for (size_t i = 0u; i + 3u < len; i += 4u) {
+            uint8_t tmp = buf[i];
+            buf[i] = buf[i + 2u];
+            buf[i + 2u] = tmp;
+        }
+    }
+    if (out_len) {
+        *out_len = len;
+    }
+    return buf;
+}
+
+static we_tex_t *authoring_readback_resolve_tex(daemon_state_t *state,
+                                                const waywal_ipc_req_readback_texture_t *req,
+                                                we_scene_t **out_sc)
+{
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (!authoring_matches_target(out, req->target_output) || !out->we_scene) {
+            continue;
+        }
+        we_scene_object_t *obj = authoring_find_object(out->we_scene, req->object_id, NULL);
+        we_material_pass_t *pass = authoring_resolve_pass(obj, req->pass_index);
+        if (pass && req->tex_slot < WE_MAX_PASS_TEXTURES && pass->textures[req->tex_slot]) {
+            if (out_sc) {
+                *out_sc = out->we_scene;
+            }
+            return pass->textures[req->tex_slot];
+        }
+    }
+    return NULL;
+}
+
+static uint8_t *authoring_readback_try_vram(we_scene_t *target_sc, const we_tex_t *tex,
+                                            size_t *out_len, we_tex_format_t *out_fmt,
+                                            uint32_t *out_w, uint32_t *out_h)
+{
+#if WAYWAL_HAVE_GPU_BRUSH
+    if (!g_authoring_brush_ctx || tex->gl_tex == 0u) {
+        return NULL;
+    }
+    we_brush_stats_t bstats;
+    memset(&bstats, 0, sizeof(bstats));
+    we_gpu_brush_get_stats(g_authoring_brush_ctx, &bstats);
+    if (bstats.target_gl_tex != tex->gl_tex) {
+        return NULL;
+    }
+    authoring_ensure_scene_egl(target_sc);
+    uint8_t *vram_px = NULL;
+    size_t vram_len = 0u;
+    if (!we_gpu_brush_readback_texels(g_authoring_brush_ctx, (uint32_t)tex->format, &vram_px,
+                                      &vram_len) ||
+        !vram_px || vram_len == 0u) {
+        return NULL;
+    }
+    uint32_t cw = bstats.canvas_width ? bstats.canvas_width : *out_w;
+    uint32_t ch = bstats.canvas_height ? bstats.canvas_height : *out_h;
+    size_t npix = (size_t)cw * (size_t)ch;
+    if (npix > 0u) {
+        if (vram_len == npix) {
+            *out_fmt = WE_TEX_FMT_R8;
+        } else if (vram_len == npix * 2u) {
+            *out_fmt = WE_TEX_FMT_RG88;
+        } else if (vram_len == npix * 4u) {
+            *out_fmt = WE_TEX_FMT_RGBA8888;
+        }
+    }
+    *out_len = vram_len;
+    *out_w = cw;
+    *out_h = ch;
+    return vram_px;
+#else
+    (void)target_sc;
+    (void)tex;
+    (void)out_len;
+    (void)out_fmt;
+    (void)out_w;
+    (void)out_h;
+    return NULL;
+#endif
+}
+
+static uint8_t *authoring_readback_raw(we_tex_t *tex, const we_tex_mip_t *m0, uint8_t **raw_px,
+                                       size_t raw_len, we_tex_format_t raw_fmt, uint32_t raw_w,
+                                       uint32_t raw_h, waywal_ipc_resp_readback_texture_t *resp,
+                                       size_t *out_len)
+{
+    if (*raw_px) {
+        uint8_t *buf = *raw_px;
+        *raw_px = NULL;
+        *out_len = raw_len;
+        resp->tex_format = (uint32_t)raw_fmt;
+        resp->width = raw_w;
+        resp->height = raw_h;
+        return buf;
+    }
+    if (m0 && m0->rgba8 && m0->width > 0u && m0->height > 0u) {
+        uint8_t *buf = authoring_copy_rgba8_unswiz(m0, out_len);
+        if (buf) {
+            resp->tex_format = (uint32_t)WE_TEX_FMT_RGBA8888;
+            resp->width = m0->width;
+            resp->height = m0->height;
+        }
+        return buf;
+    }
+    uint8_t *dec_buf = NULL;
+    uint32_t dw = 0u;
+    uint32_t dh = 0u;
+    if (we_tex_decode_rgba8(tex, &dec_buf, &dw, &dh) && dec_buf && dw > 0u && dh > 0u) {
+        size_t npx = (size_t)dw * (size_t)dh;
+        if (npx <= WAYWAL_IPC_MAX_READBACK_BYTES / 4u) {
+            *out_len = npx * 4u;
+            resp->tex_format = (uint32_t)WE_TEX_FMT_RGBA8888;
+            resp->width = dw;
+            resp->height = dh;
+            return dec_buf;
+        }
+        free(dec_buf);
+    }
+    return NULL;
+}
+
+static uint8_t *authoring_readback_encode(we_tex_t *tex, const we_tex_mip_t *m0, uint8_t **raw_px,
+                                          size_t raw_len, we_tex_format_t raw_fmt, uint32_t raw_w,
+                                          uint32_t raw_h, waywal_ipc_resp_readback_texture_t *resp,
+                                          size_t *out_len)
+{
+#if WAYWAL_HAVE_ASSET_WRITER
+    const uint8_t *enc_src = NULL;
+    size_t enc_src_len = 0u;
+    uint8_t *owned_src = NULL;
+    we_tex_format_t enc_fmt = WE_TEX_FMT_RGBA8888;
+    uint32_t enc_w = 0u;
+    uint32_t enc_h = 0u;
+
+    if (*raw_px && (raw_fmt == WE_TEX_FMT_RGBA8888 || raw_fmt == WE_TEX_FMT_RG88 ||
+                    raw_fmt == WE_TEX_FMT_R8)) {
+        enc_src = *raw_px;
+        enc_src_len = raw_len;
+        enc_fmt = raw_fmt;
+        enc_w = raw_w;
+        enc_h = raw_h;
+    } else if (m0 &&
+               (tex->format == WE_TEX_FMT_RGBA8888 || tex->format == WE_TEX_FMT_RG88 ||
+                tex->format == WE_TEX_FMT_R8) &&
+               m0->data && m0->data_size > 0u && m0->width > 0u && m0->height > 0u) {
+        size_t bpp =
+            (tex->format == WE_TEX_FMT_R8) ? 1u : (tex->format == WE_TEX_FMT_RG88 ? 2u : 4u);
+        if (m0->data_size == (size_t)m0->width * (size_t)m0->height * bpp) {
+            enc_src = m0->data;
+            enc_src_len = m0->data_size;
+            enc_fmt = tex->format;
+            enc_w = m0->width;
+            enc_h = m0->height;
+        }
+    }
+    if (!enc_src && m0 && m0->rgba8 && m0->width > 0u && m0->height > 0u) {
+        size_t len = 0u;
+        owned_src = authoring_copy_rgba8_unswiz(m0, &len);
+        if (owned_src) {
+            enc_src = owned_src;
+            enc_src_len = len;
+            enc_fmt = WE_TEX_FMT_RGBA8888;
+            enc_w = m0->width;
+            enc_h = m0->height;
+        }
+    }
+    if (!enc_src) {
+        uint8_t *dec_buf = NULL;
+        uint32_t dw = 0u;
+        uint32_t dh = 0u;
+        if (we_tex_decode_rgba8(tex, &dec_buf, &dw, &dh) && dec_buf && dw > 0u && dh > 0u) {
+            owned_src = dec_buf;
+            enc_src = owned_src;
+            enc_src_len = (size_t)dw * (size_t)dh * 4u;
+            enc_fmt = WE_TEX_FMT_RGBA8888;
+            enc_w = dw;
+            enc_h = dh;
+        }
+    }
+    uint8_t *out_buf = NULL;
+    if (enc_src && enc_src_len > 0u && enc_w > 0u && enc_h > 0u) {
+        we_tex_encode_mip_t mip = {
+            .width = enc_w,
+            .height = enc_h,
+            .pixels = enc_src,
+            .byte_size = enc_src_len,
+        };
+        we_tex_encode_image_t img = {.mip_count = 1u, .mips = &mip};
+        we_tex_encode_spec_t spec;
+        memset(&spec, 0, sizeof(spec));
+        spec.format = enc_fmt;
+        spec.flags = tex->flags;
+        if ((spec.flags & WE_TEX_FLAG_IS_GIF) != 0u && (!tex->frames || tex->frame_count == 0u)) {
+            spec.flags &= ~(uint32_t)WE_TEX_FLAG_IS_GIF;
+        }
+        spec.texture_width = enc_w;
+        spec.texture_height = enc_h;
+        spec.image_width =
+            (tex->image_width > 0u && tex->image_width <= enc_w) ? tex->image_width : enc_w;
+        spec.image_height =
+            (tex->image_height > 0u && tex->image_height <= enc_h) ? tex->image_height : enc_h;
+        spec.enable_lz4 = true;
+        spec.image_count = 1u;
+        spec.images = &img;
+        spec.frame_count = tex->frame_count;
+        spec.gif_width = tex->gif_width;
+        spec.gif_height = tex->gif_height;
+        spec.frames = tex->frames;
+        we_asset_writer_err_t werr = WE_WRITER_OK;
+        if (we_tex_encode_v5(&spec, &out_buf, out_len, &werr)) {
+            resp->tex_format = (uint32_t)enc_fmt;
+            resp->width = spec.image_width;
+            resp->height = spec.image_height;
+        }
+    }
+    free(owned_src);
+    return out_buf;
+#else
+    (void)tex;
+    if (*raw_px) {
+        uint8_t *buf = *raw_px;
+        *raw_px = NULL;
+        *out_len = raw_len;
+        resp->tex_format = (uint32_t)raw_fmt;
+        resp->width = raw_w;
+        resp->height = raw_h;
+        return buf;
+    }
+    if (m0 && m0->data && m0->data_size > 0u && m0->data_size <= WAYWAL_IPC_MAX_READBACK_BYTES) {
+        uint8_t *buf = (uint8_t *)malloc(m0->data_size);
+        if (buf) {
+            memcpy(buf, m0->data, m0->data_size);
+            *out_len = m0->data_size;
+        }
+        return buf;
+    }
+    return NULL;
+#endif
+}
+
+bool daemon_dispatch_ipc_req_readback_texture(daemon_state_t *state,
+                                              const waywal_ipc_req_readback_texture_t *req,
+                                              waywal_ipc_resp_readback_texture_t *resp,
+                                              uint8_t **out_data, uint32_t *out_data_len)
+{
+    if (out_data) {
+        *out_data = NULL;
+    }
+    if (out_data_len) {
+        *out_data_len = 0u;
+    }
+    if (!resp) {
+        return false;
+    }
+    memset(resp, 0, sizeof(*resp));
+    if (!req || req->format_mode > 1u ||
+        !memchr(req->target_output, '\0', sizeof(req->target_output))) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+    if (!state) {
+        resp->status_code = WAYWAL_STATUS_OK;
+        return true;
+    }
+
+    we_scene_t *target_sc = NULL;
+    we_tex_t *tex = authoring_readback_resolve_tex(state, req, &target_sc);
+    if (!tex) {
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    resp->tex_format = (uint32_t)tex->format;
+    resp->width = tex->image_width ? tex->image_width : tex->texture_width;
+    resp->height = tex->image_height ? tex->image_height : tex->texture_height;
+    resp->flags = tex->flags;
+
+    size_t raw_len = 0u;
+    we_tex_format_t raw_fmt = tex->format;
+    uint32_t raw_w = resp->width;
+    uint32_t raw_h = resp->height;
+    uint8_t *raw_px =
+        authoring_readback_try_vram(target_sc, tex, &raw_len, &raw_fmt, &raw_w, &raw_h);
+
+    const we_tex_mip_t *m0 = (tex->images && tex->image_count > 0u && tex->images[0].mip_count > 0u)
+                                 ? &tex->images[0].mips[0]
+                                 : NULL;
+
+    size_t out_len = 0u;
+    uint8_t *out_buf = (req->format_mode == 0u)
+                           ? authoring_readback_raw(tex, m0, &raw_px, raw_len, raw_fmt, raw_w,
+                                                    raw_h, resp, &out_len)
+                           : authoring_readback_encode(tex, m0, &raw_px, raw_len, raw_fmt, raw_w,
+                                                       raw_h, resp, &out_len);
+
+    free(raw_px);
+    if (!out_buf || out_len == 0u || out_len > WAYWAL_IPC_MAX_READBACK_BYTES) {
+        free(out_buf);
+        resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        return false;
+    }
+
+    resp->data_len = (uint32_t)out_len;
+    resp->status_code = WAYWAL_STATUS_OK;
+    if (out_data) {
+        *out_data = out_buf;
+    } else {
+        free(out_buf);
+    }
+    if (out_data_len) {
+        *out_data_len = (uint32_t)out_len;
+    }
+    return true;
+}
+
+static bool authoring_send_msg(int client_fd, const waywal_ipc_hdr_t *hdr, const void *payload,
+                               size_t payload_len)
+{
+    if (!ipc_dispatch_write_full(client_fd, hdr, sizeof(*hdr), 500)) {
+        (void)shutdown(client_fd, SHUT_RDWR);
+        return false;
+    }
+    if (payload_len > 0u && !ipc_dispatch_write_full(client_fd, payload, payload_len, 500)) {
+        (void)shutdown(client_fd, SHUT_RDWR);
+        return false;
+    }
+    return true;
+}
+
+static bool authoring_read_var_packet(int client_fd, uint64_t total_payload_size, size_t fixed_size,
+                                      size_t max_total_size, uint8_t **out_buf, size_t *out_len)
+{
+    if (total_payload_size < fixed_size || total_payload_size > max_total_size) {
+        (void)authoring_drain_payload(client_fd, total_payload_size, 500);
+        return false;
+    }
+    size_t len = (size_t)total_payload_size;
+    uint8_t *buf = (uint8_t *)malloc(len);
+    if (!buf) {
+        (void)authoring_drain_payload(client_fd, total_payload_size, 500);
+        return false;
+    }
+    if (!ipc_dispatch_read_full(client_fd, buf, len, 500)) {
+        free(buf);
+        (void)shutdown(client_fd, SHUT_RDWR);
+        return false;
+    }
+    *out_buf = buf;
+    *out_len = len;
+    return true;
+}
+
+static bool authoring_ipc_handle_scene_mutate(daemon_state_t *state, int client_fd,
+                                              const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    waywal_ipc_resp_scene_mutate_t resp;
+    memset(&resp, 0, sizeof(resp));
+    if (!authoring_read_var_packet(
+            client_fd, hdr->payload_size, sizeof(waywal_ipc_req_scene_mutate_t),
+            sizeof(waywal_ipc_req_scene_mutate_t) + WAYWAL_IPC_MAX_MUTATE_PAYLOAD_BYTES, &pkt,
+            &pkt_len)) {
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_scene_mutate(WAYWAL_STATUS_ERR_SYNTAX, 0, 0u, 0u,
+                                               "Invalid scene mutate packet size", &rh, &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    const waywal_ipc_req_scene_mutate_t *req = (const waywal_ipc_req_scene_mutate_t *)pkt;
+    const char *payload_json = NULL;
+    if (!waywal_ipc_validate_req_scene_mutate(req, pkt_len, &payload_json)) {
+        free(pkt);
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_scene_mutate(WAYWAL_STATUS_ERR_SYNTAX, 0, 0u, 0u,
+                                               "Invalid scene mutate payload", &rh, &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    char *json_copy = NULL;
+    if (payload_json && req->payload_len > 0u) {
+        json_copy = (char *)malloc((size_t)req->payload_len + 1u);
+        if (json_copy) {
+            memcpy(json_copy, payload_json, req->payload_len);
+            json_copy[req->payload_len] = '\0';
+        }
+    }
+    daemon_dispatch_ipc_req_scene_mutate(state, req, json_copy, &resp);
+    free(json_copy);
+    free(pkt);
+    waywal_ipc_hdr_t rh;
+    waywal_ipc_serialize_resp_scene_mutate(resp.status_code, resp.object_id, resp.scene_revision,
+                                           resp.object_count, resp.error_msg, &rh, &resp);
+    return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+}
+
+static bool authoring_ipc_handle_hot_reload(daemon_state_t *state, int client_fd,
+                                            const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    waywal_ipc_resp_hot_reload_code_t resp;
+    memset(&resp, 0, sizeof(resp));
+    if (!authoring_read_var_packet(
+            client_fd, hdr->payload_size, sizeof(waywal_ipc_req_hot_reload_code_t),
+            sizeof(waywal_ipc_req_hot_reload_code_t) + WAYWAL_IPC_MAX_CODE_BYTES, &pkt, &pkt_len)) {
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_hot_reload_code(WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, 0u, 0u, 0u,
+                                                  "Invalid hot-reload packet size", NULL, 0u, &rh,
+                                                  &resp, NULL, 0u, NULL);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    const waywal_ipc_req_hot_reload_code_t *req = (const waywal_ipc_req_hot_reload_code_t *)pkt;
+    const char *src_utf8 = NULL;
+    if (!waywal_ipc_validate_req_hot_reload_code(req, pkt_len, &src_utf8)) {
+        free(pkt);
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_hot_reload_code(WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, 0u, 0u, 0u,
+                                                  "Invalid hot-reload payload", NULL, 0u, &rh,
+                                                  &resp, NULL, 0u, NULL);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    char *meta_json = NULL;
+    size_t meta_len = 0u;
+    daemon_dispatch_ipc_req_hot_reload_code(state, req, src_utf8, &resp, &meta_json, &meta_len);
+    free(pkt);
+    size_t out_cap = sizeof(resp) + meta_len;
+    uint8_t *out_buf = (uint8_t *)malloc(out_cap);
+    waywal_ipc_hdr_t rh;
+    size_t out_len = 0u;
+    bool ser_ok =
+        out_buf && waywal_ipc_serialize_resp_hot_reload_code(
+                       resp.status_code, resp.error_line, resp.error_col, resp.uniform_count,
+                       resp.combo_count, resp.compile_time_us, resp.error_msg, meta_json, meta_len,
+                       &rh, &resp, out_buf, out_cap, &out_len);
+    free(meta_json);
+    if (!ser_ok) {
+        free(out_buf);
+        waywal_ipc_serialize_resp_hot_reload_code(WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, 0u, 0u, 0u,
+                                                  "Failed to serialize hot-reload response", NULL,
+                                                  0u, &rh, &resp, NULL, 0u, NULL);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    bool sent = authoring_send_msg(client_fd, &rh, out_buf, out_len);
+    free(out_buf);
+    return sent;
+}
+
+static bool authoring_ipc_handle_query_tree(daemon_state_t *state, int client_fd,
+                                            const waywal_ipc_hdr_t *hdr)
+{
+    waywal_ipc_resp_query_scene_tree_t resp;
+    memset(&resp, 0, sizeof(resp));
+    if (hdr->payload_size != sizeof(waywal_ipc_req_query_scene_tree_t)) {
+        if (!authoring_drain_payload(client_fd, hdr->payload_size, 500)) {
+            return false;
+        }
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_query_scene_tree(WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, NULL, 0u, &rh,
+                                                   &resp, NULL, 0u, NULL);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    waywal_ipc_req_query_scene_tree_t req;
+    if (!ipc_dispatch_read_full(client_fd, &req, sizeof(req), 500)) {
+        (void)shutdown(client_fd, SHUT_RDWR);
+        return false;
+    }
+    char *tree_json = NULL;
+    size_t tree_len = 0u;
+    if (waywal_ipc_validate_req_query_scene_tree(&req, sizeof(req))) {
+        daemon_dispatch_ipc_req_query_scene_tree(state, &req, &resp, &tree_json, &tree_len);
+    } else {
+        resp.status_code = WAYWAL_STATUS_ERR_SYNTAX;
+    }
+    size_t out_cap = sizeof(resp) + tree_len;
+    uint8_t *out_buf = (uint8_t *)malloc(out_cap);
+    waywal_ipc_hdr_t rh;
+    size_t out_len = 0u;
+    bool ser_ok = out_buf && waywal_ipc_serialize_resp_query_scene_tree(
+                                 resp.status_code, resp.scene_revision, resp.object_count,
+                                 tree_json, tree_len, &rh, &resp, out_buf, out_cap, &out_len);
+    free(tree_json);
+    if (!ser_ok) {
+        free(out_buf);
+        waywal_ipc_serialize_resp_query_scene_tree(WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, NULL, 0u, &rh,
+                                                   &resp, NULL, 0u, NULL);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    bool sent = authoring_send_msg(client_fd, &rh, out_buf, out_len);
+    free(out_buf);
+    return sent;
+}
+
+static bool authoring_ipc_handle_shader_combo(daemon_state_t *state, int client_fd,
+                                              const waywal_ipc_hdr_t *hdr)
+{
+    waywal_ipc_resp_set_shader_combo_t resp;
+    memset(&resp, 0, sizeof(resp));
+    if (hdr->payload_size != sizeof(waywal_ipc_req_set_shader_combo_t)) {
+        if (!authoring_drain_payload(client_fd, hdr->payload_size, 500)) {
+            return false;
+        }
+        resp.status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp.error_msg, sizeof(resp.error_msg), "Invalid combo size");
+    } else {
+        waywal_ipc_req_set_shader_combo_t req;
+        if (!ipc_dispatch_read_full(client_fd, &req, sizeof(req), 500)) {
+            (void)shutdown(client_fd, SHUT_RDWR);
+            return false;
+        }
+        if (!waywal_ipc_validate_req_set_shader_combo(&req, sizeof(req))) {
+            resp.status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            authoring_copy_cstr(resp.error_msg, sizeof(resp.error_msg), "Invalid combo payload");
+        } else {
+            daemon_dispatch_ipc_req_set_shader_combo(state, &req, &resp);
+        }
+    }
+    waywal_ipc_hdr_t rh;
+    waywal_ipc_serialize_resp_set_shader_combo(resp.status_code, resp.recompile_time_us,
+                                               resp.error_msg, &rh, &resp);
+    return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+}
+
+static bool authoring_ipc_handle_brush_stroke(daemon_state_t *state, int client_fd,
+                                              const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    waywal_ipc_resp_brush_stroke_t resp;
+    memset(&resp, 0, sizeof(resp));
+    size_t max_sz = sizeof(waywal_ipc_req_brush_stroke_t) +
+                    (size_t)WE_BRUSH_MAX_STROKE_DABS * sizeof(we_brush_dab_t);
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_req_brush_stroke_t), max_sz, &pkt, &pkt_len)) {
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_brush_stroke(WAYWAL_STATUS_ERR_SYNTAX, 0ULL, NULL, NULL, 0u, &rh,
+                                               &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    const waywal_ipc_req_brush_stroke_t *req = (const waywal_ipc_req_brush_stroke_t *)pkt;
+    const we_brush_dab_t *dabs = NULL;
+    uint32_t dab_count = 0u;
+    if (!waywal_ipc_validate_req_brush_stroke(req, pkt_len, &dabs, &dab_count)) {
+        free(pkt);
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_brush_stroke(WAYWAL_STATUS_ERR_SYNTAX, 0ULL, NULL, NULL, 0u, &rh,
+                                               &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    daemon_dispatch_ipc_req_brush_stroke(state, req, dabs, &resp);
+    free(pkt);
+    waywal_ipc_hdr_t rh;
+    waywal_ipc_serialize_resp_brush_stroke(resp.status_code, resp.stroke_id, &resp.dirty_rect,
+                                           &resp.stats, resp.captured_tile_count, &rh, &resp);
+    return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+}
+
+static bool authoring_ipc_handle_particle_config(daemon_state_t *state, int client_fd,
+                                                 const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    waywal_ipc_resp_particle_config_t resp;
+    memset(&resp, 0, sizeof(resp));
+    size_t max_sz = sizeof(waywal_ipc_req_particle_config_t) + WAYWAL_IPC_MAX_SCENE_JSON;
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_req_particle_config_t), max_sz, &pkt,
+                                   &pkt_len)) {
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_particle_config(WAYWAL_STATUS_ERR_SYNTAX, 0, 0u, 0u, 0u, &rh,
+                                                  &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    const waywal_ipc_req_particle_config_t *req = (const waywal_ipc_req_particle_config_t *)pkt;
+    const void *payload = NULL;
+    uint32_t payload_len = 0u;
+    if (!waywal_ipc_validate_req_particle_config(req, pkt_len, &payload, &payload_len)) {
+        free(pkt);
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_particle_config(WAYWAL_STATUS_ERR_SYNTAX, 0, 0u, 0u, 0u, &rh,
+                                                  &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    daemon_dispatch_ipc_req_particle_config(state, req, payload, &resp);
+    free(pkt);
+    waywal_ipc_hdr_t rh;
+    waywal_ipc_serialize_resp_particle_config(resp.status_code, resp.object_id, resp.alive_count,
+                                              resp.max_count, resp.sim_time_us, &rh, &resp);
+    return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+}
+
+static bool authoring_ipc_handle_audio_bindings(daemon_state_t *state, int client_fd,
+                                                const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    waywal_ipc_resp_set_audio_bindings_t resp;
+    memset(&resp, 0, sizeof(resp));
+    size_t max_sz = sizeof(waywal_ipc_req_set_audio_bindings_t) +
+                    (size_t)WE_MAX_AUDIO_BINDINGS * sizeof(we_audio_binding_t);
+    if (!authoring_read_var_packet(client_fd, hdr->payload_size,
+                                   sizeof(waywal_ipc_req_set_audio_bindings_t), max_sz, &pkt,
+                                   &pkt_len)) {
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_set_audio_bindings(WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, &rh, &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    const waywal_ipc_req_set_audio_bindings_t *req =
+        (const waywal_ipc_req_set_audio_bindings_t *)pkt;
+    const we_audio_binding_t *bindings = NULL;
+    uint32_t count = 0u;
+    if (!waywal_ipc_validate_req_set_audio_bindings(req, pkt_len, &bindings, &count)) {
+        free(pkt);
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_set_audio_bindings(WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, &rh, &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    daemon_dispatch_ipc_req_set_audio_bindings(state, req, bindings, &resp);
+    free(pkt);
+    waywal_ipc_hdr_t rh;
+    waywal_ipc_serialize_resp_set_audio_bindings(resp.status_code, resp.active_binding_count,
+                                                 resp.eval_time_ns, &rh, &resp);
+    return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+}
+
+static bool authoring_ipc_handle_export_pkg(daemon_state_t *state, int client_fd,
+                                            const waywal_ipc_hdr_t *hdr)
+{
+    waywal_ipc_resp_export_scene_pkg_t resp;
+    memset(&resp, 0, sizeof(resp));
+    if (hdr->payload_size != sizeof(waywal_ipc_req_export_scene_pkg_t)) {
+        if (!authoring_drain_payload(client_fd, hdr->payload_size, 500)) {
+            return false;
+        }
+        resp.status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        authoring_copy_cstr(resp.error_msg, sizeof(resp.error_msg), "Invalid export size");
+    } else {
+        waywal_ipc_req_export_scene_pkg_t req;
+        if (!ipc_dispatch_read_full(client_fd, &req, sizeof(req), 500)) {
+            (void)shutdown(client_fd, SHUT_RDWR);
+            return false;
+        }
+        if (!waywal_ipc_validate_req_export_scene_pkg(&req, sizeof(req))) {
+            resp.status_code = WAYWAL_STATUS_ERR_SYNTAX;
+            authoring_copy_cstr(resp.error_msg, sizeof(resp.error_msg), "Invalid export payload");
+        } else {
+            daemon_dispatch_ipc_req_export_scene_pkg(state, &req, &resp);
+        }
+    }
+    waywal_ipc_hdr_t rh;
+    waywal_ipc_serialize_resp_export_scene_pkg(resp.status_code, resp.entry_count, resp.total_bytes,
+                                               resp.export_time_us, resp.error_msg, &rh, &resp);
+    return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+}
+
+static bool authoring_ipc_handle_lint_script(daemon_state_t *state, int client_fd,
+                                             const waywal_ipc_hdr_t *hdr)
+{
+    uint8_t *pkt = NULL;
+    size_t pkt_len = 0u;
+    waywal_ipc_resp_lint_scenescript_t resp;
+    memset(&resp, 0, sizeof(resp));
+    if (!authoring_read_var_packet(
+            client_fd, hdr->payload_size, sizeof(waywal_ipc_req_lint_scenescript_t),
+            sizeof(waywal_ipc_req_lint_scenescript_t) + WAYWAL_IPC_MAX_CODE_BYTES, &pkt,
+            &pkt_len)) {
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_lint_scenescript(WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, 0u,
+                                                   "Invalid lint packet size", &rh, &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    const waywal_ipc_req_lint_scenescript_t *req = (const waywal_ipc_req_lint_scenescript_t *)pkt;
+    const char *src_utf8 = NULL;
+    if (!waywal_ipc_validate_req_lint_scenescript(req, pkt_len, &src_utf8)) {
+        free(pkt);
+        waywal_ipc_hdr_t rh;
+        waywal_ipc_serialize_resp_lint_scenescript(WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, 0u,
+                                                   "Invalid lint payload", &rh, &resp);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    daemon_dispatch_ipc_req_lint_scenescript(state, req, src_utf8, &resp);
+    free(pkt);
+    waywal_ipc_hdr_t rh;
+    waywal_ipc_serialize_resp_lint_scenescript(resp.status_code, resp.error_line, resp.error_col,
+                                               resp.lint_time_us, resp.error_msg, &rh, &resp);
+    return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+}
+
+static bool authoring_ipc_handle_readback(daemon_state_t *state, int client_fd,
+                                          const waywal_ipc_hdr_t *hdr)
+{
+    waywal_ipc_resp_readback_texture_t resp;
+    memset(&resp, 0, sizeof(resp));
+    uint8_t *tex_bytes = NULL;
+    uint32_t tex_len = 0u;
+    if (hdr->payload_size != sizeof(waywal_ipc_req_readback_texture_t)) {
+        if (!authoring_drain_payload(client_fd, hdr->payload_size, 500)) {
+            return false;
+        }
+        resp.status_code = WAYWAL_STATUS_ERR_SYNTAX;
+    } else {
+        waywal_ipc_req_readback_texture_t req;
+        if (!ipc_dispatch_read_full(client_fd, &req, sizeof(req), 500)) {
+            (void)shutdown(client_fd, SHUT_RDWR);
+            return false;
+        }
+        if (!waywal_ipc_validate_req_readback_texture(&req, sizeof(req))) {
+            resp.status_code = WAYWAL_STATUS_ERR_SYNTAX;
+        } else {
+            daemon_dispatch_ipc_req_readback_texture(state, &req, &resp, &tex_bytes, &tex_len);
+        }
+    }
+    size_t out_cap = sizeof(resp) + (size_t)tex_len;
+    uint8_t *out_buf = (uint8_t *)malloc(out_cap);
+    waywal_ipc_hdr_t rh;
+    size_t out_len = 0u;
+    bool ser_ok =
+        out_buf && waywal_ipc_serialize_resp_readback_texture(
+                       resp.status_code, resp.tex_format, resp.width, resp.height, resp.flags,
+                       tex_bytes, tex_len, &rh, &resp, out_buf, out_cap, &out_len);
+    free(tex_bytes);
+    if (!ser_ok) {
+        free(out_buf);
+        waywal_ipc_serialize_resp_readback_texture(WAYWAL_STATUS_ERR_SYNTAX, 0u, 0u, 0u, 0u, NULL,
+                                                   0u, &rh, &resp, NULL, 0u, NULL);
+        return authoring_send_msg(client_fd, &rh, &resp, sizeof(resp));
+    }
+    bool sent = authoring_send_msg(client_fd, &rh, out_buf, out_len);
+    free(out_buf);
+    return sent;
+}
+
+bool daemon_dispatch_authoring_ipc(daemon_state_t *state, int client_fd,
+                                   const waywal_ipc_hdr_t *hdr, int attached_fd)
+{
+    if (attached_fd >= 0) {
+        close(attached_fd);
+    }
+    if (!hdr || client_fd < 0) {
+        return false;
+    }
+    if (hdr->magic != WAYWAL_IPC_MAGIC || hdr->version != WAYWAL_IPC_VERSION) {
+        (void)shutdown(client_fd, SHUT_RDWR);
+        return false;
+    }
+
+    switch (hdr->opcode) {
+    case WAYWAL_REQ_SCENE_MUTATE:
+        return authoring_ipc_handle_scene_mutate(state, client_fd, hdr);
+    case WAYWAL_REQ_HOT_RELOAD_CODE:
+        return authoring_ipc_handle_hot_reload(state, client_fd, hdr);
+    case WAYWAL_REQ_QUERY_SCENE_TREE:
+        return authoring_ipc_handle_query_tree(state, client_fd, hdr);
+    case WAYWAL_REQ_SET_SHADER_COMBO:
+        return authoring_ipc_handle_shader_combo(state, client_fd, hdr);
+    case WAYWAL_REQ_BRUSH_STROKE:
+        return authoring_ipc_handle_brush_stroke(state, client_fd, hdr);
+    case WAYWAL_REQ_PARTICLE_CONFIG:
+        return authoring_ipc_handle_particle_config(state, client_fd, hdr);
+    case WAYWAL_REQ_SET_AUDIO_BINDINGS:
+        return authoring_ipc_handle_audio_bindings(state, client_fd, hdr);
+    case WAYWAL_REQ_EXPORT_SCENE_PKG:
+        return authoring_ipc_handle_export_pkg(state, client_fd, hdr);
+    case WAYWAL_REQ_LINT_SCENESCRIPT:
+        return authoring_ipc_handle_lint_script(state, client_fd, hdr);
+    case WAYWAL_REQ_READBACK_TEXTURE:
+        return authoring_ipc_handle_readback(state, client_fd, hdr);
+    default:
+        break;
+    }
+
+    if (!authoring_drain_payload(client_fd, hdr->payload_size, 500)) {
         return false;
     }
     return false;
@@ -6294,7 +9302,7 @@ int main(int argc, char *argv[])
     state.shader_timer_fd = -1;
     state.anim_timer_fd = -1;
     state.solar_timer_fd = -1;
-    strncpy(state.namespace_str, "default", sizeof(state.namespace_str) - 1);
+    daemon_copy_cstr(state.namespace_str, sizeof(state.namespace_str), "default");
     state.current_color = (color_rgba_t){.r = 0, .g = 0, .b = 0, .a = 255};
     state.running = true;
     state.on_power_state_changed = daemon_reconcile_power_state;
@@ -6308,20 +9316,20 @@ int main(int argc, char *argv[])
     state.theme_from_media = state.config.theme.theme_from_media;
     if (state.config.daemon.backdrop[0] != '\0' &&
         strcasecmp(state.config.daemon.backdrop, "none") != 0 && !state.backdrop_auto_blur) {
-        strncpy(state.backdrop_path, state.config.daemon.backdrop, sizeof(state.backdrop_path) - 1);
+        daemon_copy_cstr(state.backdrop_path, sizeof(state.backdrop_path),
+                         state.config.daemon.backdrop);
     }
     if (state.config.daemon.namespace_str[0] != '\0' &&
         strcmp(state.config.daemon.namespace_str, "waywal") != 0) {
-        strncpy(state.namespace_str, state.config.daemon.namespace_str,
-                sizeof(state.namespace_str) - 1);
+        daemon_copy_cstr(state.namespace_str, sizeof(state.namespace_str),
+                         state.config.daemon.namespace_str);
     }
     const char *env_ns = getenv("AWWW_NAMESPACE");
     if (!env_ns || env_ns[0] == '\0') {
         env_ns = getenv("SWWW_NAMESPACE");
     }
     if (env_ns && env_ns[0] != '\0') {
-        strncpy(state.namespace_str, env_ns, sizeof(state.namespace_str) - 1);
-        state.namespace_str[sizeof(state.namespace_str) - 1] = '\0';
+        daemon_copy_cstr(state.namespace_str, sizeof(state.namespace_str), env_ns);
     }
     waywal_battery_policy_t battery_policy = state.config.daemon.battery_policy_mode;
     bool daemonize_bg = false;
@@ -6348,8 +9356,7 @@ int main(int argc, char *argv[])
     while ((opt = getopt_long(argc, argv, "n:df:qvhV", long_options, NULL)) != -1) {
         switch (opt) {
         case 'n':
-            strncpy(state.namespace_str, optarg, sizeof(state.namespace_str) - 1);
-            state.namespace_str[sizeof(state.namespace_str) - 1] = '\0';
+            daemon_copy_cstr(state.namespace_str, sizeof(state.namespace_str), optarg);
             break;
         case 'd':
             daemonize_bg = true;
@@ -6368,7 +9375,7 @@ int main(int argc, char *argv[])
         case 1002:
             state.backdrop_auto_blur = (strcasecmp(optarg, "auto-blur") == 0);
             if (strcasecmp(optarg, "none") != 0 && !state.backdrop_auto_blur) {
-                strncpy(state.backdrop_path, optarg, sizeof(state.backdrop_path) - 1);
+                daemon_copy_cstr(state.backdrop_path, sizeof(state.backdrop_path), optarg);
             }
             break;
         case 1003:
@@ -6887,9 +9894,17 @@ int main(int argc, char *argv[])
         state.shader_eng = NULL;
     }
     if (state.we_scene) {
+        if (state.dmabuf_ctx.available) {
+            render_engine_make_current(&state.render_engine);
+        }
+        authoring_invalidate_scene(state.we_scene);
         we_scene_destroy(state.we_scene);
         state.we_scene = NULL;
     }
+    if (state.dmabuf_ctx.available) {
+        render_engine_make_current(&state.render_engine);
+    }
+    daemon_authoring_cleanup();
     free(state.wallpaper_rgba);
     state.wallpaper_rgba = NULL;
     if (state.audio_fft) {

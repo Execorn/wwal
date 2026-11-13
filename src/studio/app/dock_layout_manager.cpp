@@ -4,19 +4,95 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QDebug>
 #include <QStyle>
 #include <QApplication>
 #include <QSplitter>
+#include <QSplitterHandle>
+#include <QPointer>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTimer>
 #include <QEvent>
+#include <QShowEvent>
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace waywal::studio {
+
+namespace {
+
+/**
+ * @brief Lightweight host widget that defers constructing heavy authoring docks until shown.
+ */
+class LazyPanelHost final : public QWidget {
+  public:
+    using RealizeFn = std::function<QWidget *(QWidget *parent)>;
+
+    LazyPanelHost(RealizeFn realizeFn, const DockLayoutManager *layoutManager,
+                  QWidget *parent = nullptr)
+        : QWidget(parent), m_realizeFn(std::move(realizeFn)), m_layoutManager(layoutManager)
+    {
+        auto *layout = new QVBoxLayout(this);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(0);
+    }
+
+    bool isRealized() const { return m_realizedWidget != nullptr; }
+    QWidget *realizedWidget() const { return m_realizedWidget; }
+
+    QWidget *realizeNow()
+    {
+        if (m_realizedWidget || !m_realizeFn) {
+            return m_realizedWidget;
+        }
+        auto fn = std::exchange(m_realizeFn, {});
+        QWidget *w = fn(this);
+        if (w) {
+            m_realizedWidget = w;
+            if (auto *vbox = qobject_cast<QVBoxLayout *>(layout())) {
+                vbox->addWidget(w);
+            }
+            w->show();
+        }
+        return m_realizedWidget;
+    }
+
+    QSize sizeHint() const override
+    {
+        return m_realizedWidget ? m_realizedWidget->sizeHint() : QSize(240, 180);
+    }
+
+  protected:
+    void showEvent(QShowEvent *event) override
+    {
+        QWidget::showEvent(event);
+        if (m_realizedWidget) {
+            return;
+        }
+        // Defer during layout tree construction so background tabs in a TabGroup stay unrealized.
+        if (m_layoutManager && m_layoutManager->isApplyingLayout()) {
+            QTimer::singleShot(0, this, [this]() {
+                if (!m_realizedWidget && isVisible() &&
+                    !(m_layoutManager && m_layoutManager->isApplyingLayout())) {
+                    realizeNow();
+                }
+            });
+            return;
+        }
+        realizeNow();
+    }
+
+  private:
+    RealizeFn m_realizeFn;
+    QPointer<const DockLayoutManager> m_layoutManager;
+    QWidget *m_realizedWidget{nullptr};
+};
+
+} // namespace
 
 /* ========================================================================= */
 /* StudioDockTitleBar Implementation                                         */
@@ -267,6 +343,30 @@ DockLayoutManager::DockLayoutManager(QMainWindow *mainWindow, QObject *parent)
     m_aliases.insert(QStringLiteral("PuppetPhysics"),
                      QStringLiteral("PhysicsSpringInspectorWidget"));
 
+    m_aliases.insert(QStringLiteral("SceneLayerTree"), QStringLiteral("SceneLayerTree"));
+    m_aliases.insert(QStringLiteral("SceneLayerTreeWidget"), QStringLiteral("SceneLayerTree"));
+    m_aliases.insert(QStringLiteral("SceneHierarchy"), QStringLiteral("SceneLayerTree"));
+    m_aliases.insert(QStringLiteral("Layers"), QStringLiteral("SceneLayerTree"));
+
+    m_aliases.insert(QStringLiteral("GpuBrushPainter"), QStringLiteral("GpuBrushPainter"));
+    m_aliases.insert(QStringLiteral("GpuBrushPainterWidget"), QStringLiteral("GpuBrushPainter"));
+    m_aliases.insert(QStringLiteral("BrushPainter"), QStringLiteral("GpuBrushPainter"));
+    m_aliases.insert(QStringLiteral("PaintBrush"), QStringLiteral("GpuBrushPainter"));
+
+    m_aliases.insert(QStringLiteral("ParticleDesigner"), QStringLiteral("ParticleDesigner"));
+    m_aliases.insert(QStringLiteral("ParticleDesignerWidget"), QStringLiteral("ParticleDesigner"));
+    m_aliases.insert(QStringLiteral("ParticleEditor"), QStringLiteral("ParticleDesigner"));
+
+    m_aliases.insert(QStringLiteral("AudioBindingWizard"), QStringLiteral("AudioBindingWizard"));
+    m_aliases.insert(QStringLiteral("AudioBindings"), QStringLiteral("AudioBindingWizard"));
+
+    m_aliases.insert(QStringLiteral("GlslSceneScriptEditor"),
+                     QStringLiteral("GlslSceneScriptEditor"));
+    m_aliases.insert(QStringLiteral("GlslSceneScriptEditorWidget"),
+                     QStringLiteral("GlslSceneScriptEditor"));
+    m_aliases.insert(QStringLiteral("CodeEditor"), QStringLiteral("GlslSceneScriptEditor"));
+    m_aliases.insert(QStringLiteral("ShaderEditor"), QStringLiteral("GlslSceneScriptEditor"));
+
     // Populate built-in perspectives
     setupDefaultPerspectives();
 }
@@ -284,6 +384,33 @@ DockLayoutManager::~DockLayoutManager()
 
 bool DockLayoutManager::eventFilter(QObject *watched, QEvent *event)
 {
+    if (m_mainWindow && watched && watched->parent() == m_mainWindow) {
+        if (auto *tb = qobject_cast<QTabBar *>(watched)) {
+            if ((event->type() == QEvent::Move || event->type() == QEvent::Show) &&
+                (tb->x() < 0 || tb->y() < 0) && tb->isVisible()) {
+                tb->hide();
+            }
+        }
+    }
+
+    if (m_mainWindow && watched == m_mainWindow && event->type() == QEvent::LayoutRequest) {
+        QTimer::singleShot(0, this, [this]() {
+            if (m_applyingLayout || !m_mainWindow || !m_mainWindow->isVisible())
+                return;
+            const auto tabBars =
+                m_mainWindow->findChildren<QTabBar *>(QString(), Qt::FindDirectChildrenOnly);
+            for (QTabBar *tb : tabBars) {
+                if (!tb)
+                    continue;
+                if (tb->count() <= 1 || tb->x() < 0 || tb->y() < 45) {
+                    tb->hide();
+                } else {
+                    tb->show();
+                }
+            }
+        });
+    }
+
     if (!m_applyingLayout && m_mainWindow) {
         if (watched == m_mainWindow &&
             (event->type() == QEvent::Show || event->type() == QEvent::Resize)) {
@@ -299,10 +426,12 @@ bool DockLayoutManager::eventFilter(QObject *watched, QEvent *event)
             });
         } else if (event->type() == QEvent::MouseButtonRelease && m_mainWindow->isVisible() &&
                    m_perspectives.contains(m_activePerspective)) {
+            auto *splitterHandle = qobject_cast<QSplitterHandle *>(watched);
+            auto *tabBar = qobject_cast<QTabBar *>(watched);
+            QWidget *targetWidget = splitterHandle ? static_cast<QWidget *>(splitterHandle)
+                                                   : static_cast<QWidget *>(tabBar);
             const bool isWithinMainWindow =
-                (watched == m_mainWindow) ||
-                (watched && watched->isWidgetType() &&
-                 m_mainWindow->isAncestorOf(static_cast<QWidget *>(watched)));
+                (targetWidget != nullptr) && m_mainWindow->isAncestorOf(targetWidget);
             if (isWithinMainWindow) {
                 QJsonObject tree = m_perspectives.value(m_activePerspective);
                 syncLiveRatiosFromGeometry(tree);
@@ -325,6 +454,8 @@ void DockLayoutManager::setupDefaultPerspectives()
 {
     m_perspectives.insert(QStringLiteral("Default"), createDefaultPerspectiveTree());
     m_perspectives.insert(QStringLiteral("Shader Coding"), createShaderCodingPerspectiveTree());
+    m_perspectives.insert(QStringLiteral("Scene Composer"), createSceneComposerPerspectiveTree());
+    m_perspectives.insert(QStringLiteral("Particle & Audio"), createParticleAudioPerspectiveTree());
     m_perspectives.insert(QStringLiteral("Theme Studio"), createThemeStudioPerspectiveTree());
     m_perspectives.insert(QStringLiteral("Multi-Monitor"), createMultiMonitorPerspectiveTree());
 }
@@ -402,6 +533,46 @@ void DockLayoutManager::registerPanel(const QString &id, QWidget *widget, const 
     emit layoutChanged();
 }
 
+void DockLayoutManager::registerLazyPanel(const QString &id, const QString &title,
+                                          LazyWidgetFactory factory, Qt::DockWidgetArea defaultArea)
+{
+    if (m_docks.contains(id) || !factory) {
+        return;
+    }
+
+    auto *host = new LazyPanelHost(
+        [this, id, factory = std::move(factory)](QWidget *parent) -> QWidget * {
+            QWidget *created = factory(parent);
+            if (created) {
+                emit panelRealized(id, created);
+            }
+            return created;
+        },
+        this);
+    host->setObjectName(id + QStringLiteral("LazyHost"));
+    m_lazyHosts.insert(id, host);
+
+    registerPanel(id, host, title, defaultArea);
+}
+
+bool DockLayoutManager::isPanelRealized(const QString &id) const
+{
+    QString canonical = resolvePanelId(id);
+    if (auto *rawHost = m_lazyHosts.value(canonical, nullptr)) {
+        return static_cast<LazyPanelHost *>(rawHost)->isRealized();
+    }
+    return m_docks.contains(canonical);
+}
+
+QWidget *DockLayoutManager::realizeLazyPanel(const QString &id)
+{
+    QString canonical = resolvePanelId(id);
+    if (auto *rawHost = m_lazyHosts.value(canonical, nullptr)) {
+        return static_cast<LazyPanelHost *>(rawHost)->realizeNow();
+    }
+    return panelWidget(canonical);
+}
+
 void DockLayoutManager::unregisterPanel(const QString &id)
 {
     QString canonical = resolvePanelId(id);
@@ -409,6 +580,7 @@ void DockLayoutManager::unregisterPanel(const QString &id)
         return;
     }
 
+    m_lazyHosts.remove(canonical);
     auto *dock = m_docks.take(canonical);
     if (m_mainWindow && dock) {
         m_mainWindow->removeDockWidget(dock);
@@ -429,7 +601,11 @@ StudioDockWidget *DockLayoutManager::dockWidget(const QString &id) const { retur
 
 QWidget *DockLayoutManager::panelWidget(const QString &id) const
 {
-    auto *dock = resolveDock(id);
+    QString canonical = resolvePanelId(id);
+    if (auto *rawHost = m_lazyHosts.value(canonical, nullptr)) {
+        return static_cast<LazyPanelHost *>(rawHost)->realizedWidget();
+    }
+    auto *dock = resolveDock(canonical);
     return dock ? dock->contentWidget() : nullptr;
 }
 
@@ -442,6 +618,9 @@ void DockLayoutManager::setPanelVisible(const QString &id, bool visible)
         return;
 
     if (visible) {
+        if (m_lazyHosts.contains(dock->panelId())) {
+            realizeLazyPanel(dock->panelId());
+        }
         dock->lower();
         dock->show();
         dock->raise();
@@ -502,6 +681,10 @@ bool DockLayoutManager::switchPerspective(const QString &name)
             m_perspectives.insert(name, createDefaultPerspectiveTree());
         } else if (name == QStringLiteral("Shader Coding")) {
             m_perspectives.insert(name, createShaderCodingPerspectiveTree());
+        } else if (name == QStringLiteral("Scene Composer")) {
+            m_perspectives.insert(name, createSceneComposerPerspectiveTree());
+        } else if (name == QStringLiteral("Particle & Audio")) {
+            m_perspectives.insert(name, createParticleAudioPerspectiveTree());
         } else if (name == QStringLiteral("Theme Studio")) {
             m_perspectives.insert(name, createThemeStudioPerspectiveTree());
         } else if (name == QStringLiteral("Multi-Monitor")) {
@@ -909,7 +1092,7 @@ void DockLayoutManager::applyCurrentSplitSizes()
         for (QTabBar *tb : tabBars) {
             if (!tb)
                 continue;
-            if (tb->count() <= 1 || tb->y() < 45) {
+            if (tb->count() <= 1 || tb->x() < 0 || tb->y() < 45) {
                 tb->hide();
             } else {
                 tb->show();
@@ -919,7 +1102,7 @@ void DockLayoutManager::applyCurrentSplitSizes()
         for (QTabBar *tb : tabBars) {
             if (!tb)
                 continue;
-            if (tb->count() <= 1) {
+            if (tb->count() <= 1 || tb->x() < 0 || tb->y() < 0) {
                 tb->hide();
             }
         }
@@ -1033,11 +1216,61 @@ bool DockLayoutManager::deserializePerspectiveTree(const QString &perspectiveNam
     return true;
 }
 
+QJsonObject DockLayoutManager::normalizeTreeAliases(const QJsonObject &node) const
+{
+    if (node.isEmpty()) {
+        return node;
+    }
+
+    QJsonObject out = node;
+    auto canonicalize = [this](const QString &name) -> QString {
+        if (m_aliases.contains(name)) {
+            return m_aliases.value(name);
+        }
+        return resolvePanelId(name);
+    };
+
+    const QString type = out.value(QStringLiteral("type")).toString();
+    if (type == QStringLiteral("DockNode")) {
+        out.insert(QStringLiteral("content"),
+                   canonicalize(out.value(QStringLiteral("content")).toString()));
+    } else if (type == QStringLiteral("TabGroup")) {
+        const QString activeTab = out.value(QStringLiteral("active_tab")).toString();
+        if (!activeTab.isEmpty()) {
+            out.insert(QStringLiteral("active_tab"), canonicalize(activeTab));
+        }
+        QJsonArray normalizedTabs;
+        const QJsonArray tabs = out.value(QStringLiteral("tabs")).toArray();
+        for (const auto &tabVal : tabs) {
+            normalizedTabs.append(canonicalize(tabVal.toString()));
+        }
+        out.insert(QStringLiteral("tabs"), normalizedTabs);
+    }
+
+    if (out.contains(QStringLiteral("left"))) {
+        out.insert(QStringLiteral("left"),
+                   normalizeTreeAliases(out.value(QStringLiteral("left")).toObject()));
+    }
+    if (out.contains(QStringLiteral("right"))) {
+        out.insert(QStringLiteral("right"),
+                   normalizeTreeAliases(out.value(QStringLiteral("right")).toObject()));
+    }
+    if (out.contains(QStringLiteral("top"))) {
+        out.insert(QStringLiteral("top"),
+                   normalizeTreeAliases(out.value(QStringLiteral("top")).toObject()));
+    }
+    if (out.contains(QStringLiteral("bottom"))) {
+        out.insert(QStringLiteral("bottom"),
+                   normalizeTreeAliases(out.value(QStringLiteral("bottom")).toObject()));
+    }
+    return out;
+}
+
 QJsonObject DockLayoutManager::serializeLayout() const
 {
     QJsonObject root;
     root.insert(QStringLiteral("version"), 1);
-    root.insert(QStringLiteral("layout_revision"), 5);
+    root.insert(QStringLiteral("layout_revision"), 6);
     root.insert(QStringLiteral("active_perspective"), m_activePerspective);
 
     QJsonObject perspsObj;
@@ -1058,12 +1291,12 @@ bool DockLayoutManager::deserializeLayout(const QJsonObject &root)
     const int revision = root.value(QStringLiteral("layout_revision")).toInt(0);
     QJsonObject perspsObj = root.value(QStringLiteral("perspectives")).toObject();
 
-    if (revision < 5) {
-        // Refresh all 4 built-in perspectives to current canonical layout trees
+    if (revision < 6) {
+        // Refresh all 6 built-in perspectives while preserving custom user perspectives.
         setupDefaultPerspectives();
         for (auto it = perspsObj.constBegin(); it != perspsObj.constEnd(); ++it) {
             if (!m_perspectives.contains(it.key())) {
-                m_perspectives.insert(it.key(), it.value().toObject());
+                m_perspectives.insert(it.key(), normalizeTreeAliases(it.value().toObject()));
             }
         }
     } else {
@@ -1101,14 +1334,17 @@ bool DockLayoutManager::saveLayoutToFile(const QString &filePath)
     QJsonObject root = serializeLayout();
     QJsonDocument doc(root);
 
-    QFile file(targetPath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+    QSaveFile file(targetPath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
         qWarning() << "Failed to open layout file for writing:" << targetPath;
         return false;
     }
 
-    file.write(doc.toJson(QJsonDocument::Indented));
-    file.close();
+    const QByteArray payload = doc.toJson(QJsonDocument::Indented);
+    if (file.write(payload) != payload.size() || !file.commit()) {
+        qWarning() << "Failed to commit layout file atomically:" << targetPath;
+        return false;
+    }
     return true;
 }
 
@@ -1142,7 +1378,7 @@ bool DockLayoutManager::loadLayoutFromFile(const QString &filePath)
     }
 
     QJsonObject rootObj = doc.object();
-    const bool needsMigrationSave = (rootObj.value(QStringLiteral("layout_revision")).toInt(0) < 5);
+    const bool needsMigrationSave = (rootObj.value(QStringLiteral("layout_revision")).toInt(0) < 6);
     if (!deserializeLayout(rootObj)) {
         switchPerspective(m_activePerspective);
         return false;
@@ -1163,12 +1399,13 @@ QJsonObject DockLayoutManager::createDefaultPerspectiveTree()
     tree.insert(QStringLiteral("split_direction"), QStringLiteral("Horizontal"));
     tree.insert(QStringLiteral("split_ratio"), 0.23);
 
-    // Left: Wallpapers, Workshop, Open Hub, and Effect Library
+    // Left: Wallpapers, SceneLayerTree, Workshop, Open Hub, and Effect Library
     QJsonObject leftTab;
     leftTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
     leftTab.insert(QStringLiteral("active_tab"), QStringLiteral("Wallpapers"));
     QJsonArray leftTabs;
     leftTabs.append(QStringLiteral("Wallpapers"));
+    leftTabs.append(QStringLiteral("SceneLayerTree"));
     leftTabs.append(QStringLiteral("WorkshopBrowser"));
     leftTabs.append(QStringLiteral("OpenHubBrowser"));
     leftTabs.append(QStringLiteral("EffectLibraryBrowser"));
@@ -1235,8 +1472,12 @@ QJsonObject DockLayoutManager::createShaderCodingPerspectiveTree()
     leftVertical.insert(QStringLiteral("top"), leftTop);
 
     QJsonObject leftBottom;
-    leftBottom.insert(QStringLiteral("type"), QStringLiteral("DockNode"));
-    leftBottom.insert(QStringLiteral("content"), QStringLiteral("NodeGraphEditor"));
+    leftBottom.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
+    leftBottom.insert(QStringLiteral("active_tab"), QStringLiteral("GlslSceneScriptEditor"));
+    QJsonArray leftBottomTabs;
+    leftBottomTabs.append(QStringLiteral("GlslSceneScriptEditor"));
+    leftBottomTabs.append(QStringLiteral("NodeGraphEditor"));
+    leftBottom.insert(QStringLiteral("tabs"), leftBottomTabs);
     leftVertical.insert(QStringLiteral("bottom"), leftBottom);
 
     tree.insert(QStringLiteral("left"), leftVertical);
@@ -1248,12 +1489,13 @@ QJsonObject DockLayoutManager::createShaderCodingPerspectiveTree()
 
     QJsonObject rightTopTab;
     rightTopTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
-    rightTopTab.insert(QStringLiteral("active_tab"), QStringLiteral("EffectLibraryBrowser"));
+    rightTopTab.insert(QStringLiteral("active_tab"), QStringLiteral("PropertyInspectorWidget"));
     QJsonArray rightTopTabs;
-    rightTopTabs.append(QStringLiteral("EffectLibraryBrowser"));
     rightTopTabs.append(QStringLiteral("PropertyInspectorWidget"));
-    rightTopTabs.append(QStringLiteral("CameraLightingInspector"));
-    rightTopTabs.append(QStringLiteral("PhysicsSpringInspector"));
+    rightTopTabs.append(QStringLiteral("EffectLibraryBrowser"));
+    rightTopTabs.append(QStringLiteral("CameraLightingInspectorWidget"));
+    rightTopTabs.append(QStringLiteral("PhysicsSpringInspectorWidget"));
+    rightTopTabs.append(QStringLiteral("GpuBrushPainter"));
     rightTopTab.insert(QStringLiteral("tabs"), rightTopTabs);
     rightSplit.insert(QStringLiteral("top"), rightTopTab);
 
@@ -1339,6 +1581,7 @@ QJsonObject DockLayoutManager::createMultiMonitorPerspectiveTree()
     leftTab.insert(QStringLiteral("active_tab"), QStringLiteral("Wallpapers"));
     QJsonArray leftTabs;
     leftTabs.append(QStringLiteral("Wallpapers"));
+    leftTabs.append(QStringLiteral("SceneLayerTree"));
     leftTab.insert(QStringLiteral("tabs"), leftTabs);
     bottomSplit.insert(QStringLiteral("left"), leftTab);
 
@@ -1368,12 +1611,108 @@ QJsonObject DockLayoutManager::createMultiMonitorPerspectiveTree()
     QJsonArray inspectorTabs;
     inspectorTabs.append(QStringLiteral("PropertyInspectorWidget"));
     inspectorTabs.append(QStringLiteral("ThemeStudioWidget"));
+    inspectorTabs.append(QStringLiteral("GlslSceneScriptEditor"));
     inspectorTab.insert(QStringLiteral("tabs"), inspectorTabs);
     centerRightSplit.insert(QStringLiteral("right"), inspectorTab);
 
     bottomSplit.insert(QStringLiteral("right"), centerRightSplit);
     tree.insert(QStringLiteral("bottom"), bottomSplit);
 
+    return tree;
+}
+
+QJsonObject DockLayoutManager::createSceneComposerPerspectiveTree()
+{
+    QJsonObject tree;
+    tree.insert(QStringLiteral("split_direction"), QStringLiteral("Horizontal"));
+    tree.insert(QStringLiteral("split_ratio"), 0.22);
+
+    QJsonObject leftTab;
+    leftTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
+    leftTab.insert(QStringLiteral("active_tab"), QStringLiteral("SceneLayerTree"));
+    QJsonArray leftTabs;
+    leftTabs.append(QStringLiteral("SceneLayerTree"));
+    leftTabs.append(QStringLiteral("Wallpapers"));
+    leftTabs.append(QStringLiteral("EffectLibraryBrowser"));
+    leftTab.insert(QStringLiteral("tabs"), leftTabs);
+    tree.insert(QStringLiteral("left"), leftTab);
+
+    QJsonObject rightSplit;
+    rightSplit.insert(QStringLiteral("split_direction"), QStringLiteral("Horizontal"));
+    rightSplit.insert(QStringLiteral("split_ratio"), 0.68);
+
+    QJsonObject centerVertical;
+    centerVertical.insert(QStringLiteral("split_direction"), QStringLiteral("Vertical"));
+    centerVertical.insert(QStringLiteral("split_ratio"), 0.72);
+
+    QJsonObject centerTop;
+    centerTop.insert(QStringLiteral("type"), QStringLiteral("DockNode"));
+    centerTop.insert(QStringLiteral("content"), QStringLiteral("GpuPreviewViewport"));
+    centerVertical.insert(QStringLiteral("top"), centerTop);
+
+    QJsonObject centerBottom;
+    centerBottom.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
+    centerBottom.insert(QStringLiteral("active_tab"), QStringLiteral("Telemetry"));
+    QJsonArray bottomTabs;
+    bottomTabs.append(QStringLiteral("Telemetry"));
+    bottomTabs.append(QStringLiteral("AudioFFT"));
+    bottomTabs.append(QStringLiteral("CubicBezier"));
+    centerBottom.insert(QStringLiteral("tabs"), bottomTabs);
+    centerVertical.insert(QStringLiteral("bottom"), centerBottom);
+
+    rightSplit.insert(QStringLiteral("left"), centerVertical);
+
+    QJsonObject rightTab;
+    rightTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
+    rightTab.insert(QStringLiteral("active_tab"), QStringLiteral("PropertyInspectorWidget"));
+    QJsonArray rightTabs;
+    rightTabs.append(QStringLiteral("PropertyInspectorWidget"));
+    rightTabs.append(QStringLiteral("GpuBrushPainter"));
+    rightTabs.append(QStringLiteral("CameraLightingInspectorWidget"));
+    rightTabs.append(QStringLiteral("PhysicsSpringInspectorWidget"));
+    rightTabs.append(QStringLiteral("GlslSceneScriptEditor"));
+    rightTab.insert(QStringLiteral("tabs"), rightTabs);
+    rightSplit.insert(QStringLiteral("right"), rightTab);
+
+    tree.insert(QStringLiteral("right"), rightSplit);
+    return tree;
+}
+
+QJsonObject DockLayoutManager::createParticleAudioPerspectiveTree()
+{
+    QJsonObject tree;
+    tree.insert(QStringLiteral("split_direction"), QStringLiteral("Horizontal"));
+    tree.insert(QStringLiteral("split_ratio"), 0.32);
+
+    QJsonObject leftTab;
+    leftTab.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
+    leftTab.insert(QStringLiteral("active_tab"), QStringLiteral("ParticleDesigner"));
+    QJsonArray leftTabs;
+    leftTabs.append(QStringLiteral("ParticleDesigner"));
+    leftTabs.append(QStringLiteral("SceneLayerTree"));
+    leftTab.insert(QStringLiteral("tabs"), leftTabs);
+    tree.insert(QStringLiteral("left"), leftTab);
+
+    QJsonObject rightVertical;
+    rightVertical.insert(QStringLiteral("split_direction"), QStringLiteral("Vertical"));
+    rightVertical.insert(QStringLiteral("split_ratio"), 0.60);
+
+    QJsonObject rightTop;
+    rightTop.insert(QStringLiteral("type"), QStringLiteral("DockNode"));
+    rightTop.insert(QStringLiteral("content"), QStringLiteral("GpuPreviewViewport"));
+    rightVertical.insert(QStringLiteral("top"), rightTop);
+
+    QJsonObject rightBottom;
+    rightBottom.insert(QStringLiteral("type"), QStringLiteral("TabGroup"));
+    rightBottom.insert(QStringLiteral("active_tab"), QStringLiteral("AudioBindingWizard"));
+    QJsonArray bottomTabs;
+    bottomTabs.append(QStringLiteral("AudioBindingWizard"));
+    bottomTabs.append(QStringLiteral("AudioFFT"));
+    bottomTabs.append(QStringLiteral("PropertyInspectorWidget"));
+    rightBottom.insert(QStringLiteral("tabs"), bottomTabs);
+    rightVertical.insert(QStringLiteral("bottom"), rightBottom);
+
+    tree.insert(QStringLiteral("right"), rightVertical);
     return tree;
 }
 

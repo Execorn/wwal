@@ -58,7 +58,9 @@ struct InspectorProperty {
     QString textValue;
     QString defaultTextValue;
     QStringList comboOptions;
+    std::vector<int32_t> comboValues;
     int comboIndex{0};
+    bool isShaderCombo{false};
 };
 
 /**
@@ -72,12 +74,15 @@ class PropertyRowWidget : public QWidget {
     ~PropertyRowWidget() override = default;
 
     [[nodiscard]] const InspectorProperty &property() const noexcept { return m_prop; }
+    [[nodiscard]] bool isAudioBound() const noexcept { return m_audioBound; }
     void updateValues(const std::vector<float> &vals, bool emitSignal = true);
     void resetToDefault();
     void setFilterVisible(bool visible);
+    void setAudioBound(bool bound);
 
   signals:
     void valueChanged(const QString &name, const std::vector<float> &values, uint32_t count);
+    void audioBindingRequested(const QString &uniformName, float currentBaseline);
 
   private slots:
     void onSliderValueChanged(int index, int sliderVal);
@@ -99,7 +104,9 @@ class PropertyRowWidget : public QWidget {
     bool m_updating{false};
 
     QLabel *m_labelWidget{nullptr};
+    QToolButton *m_audioBadgeButton{nullptr};
     QToolButton *m_resetButton{nullptr};
+    bool m_audioBound{false};
 
     // Sub-controls
     std::vector<QSlider *> m_sliders;
@@ -127,6 +134,7 @@ class PropertyInspectorWidget : public QWidget {
     // --- Data Loaders ---
     void setWallpaperEngineProject(const we_project_t &proj);
     void setShaderMetadata(const waywal_shader_meta_t &meta);
+    void setShaderMetadata(const waywal_shader_meta_t &meta, const QString &rawComboJson);
     bool loadWallpaperEngineDir(const QString &workshopDir);
     bool loadShaderFile(const QString &shaderPath);
     void clear();
@@ -134,6 +142,14 @@ class PropertyInspectorWidget : public QWidget {
     // --- Configuration & Services ---
     void setTargetOutput(const QString &outputName);
     [[nodiscard]] QString targetOutput() const noexcept { return m_targetOutput; }
+
+    void setTargetObjectId(int32_t objectId, uint32_t passIndex = 0) noexcept
+    {
+        m_targetObjectId = objectId;
+        m_targetPassIndex = passIndex;
+    }
+    [[nodiscard]] int32_t targetObjectId() const noexcept { return m_targetObjectId; }
+    [[nodiscard]] uint32_t targetPassIndex() const noexcept { return m_targetPassIndex; }
 
     void setCommandBus(CommandBus *bus) noexcept { m_commandBus = bus; }
     [[nodiscard]] CommandBus *commandBus() const noexcept { return m_commandBus; }
@@ -160,6 +176,10 @@ class PropertyInspectorWidget : public QWidget {
   signals:
     void uniformChanged(const QString &output, const QString &name, const QVector<float> &values,
                         uint32_t count);
+    void shaderComboChanged(const QString &output, int32_t objectId, uint32_t passIndex,
+                            const QString &comboName, int32_t comboValue);
+    void uniformDefaultEdited(const QString &symbolName, const QString &formattedVal);
+    void audioBindingRequested(const QString &uniformName, float currentBaseline);
     void presetSaved(const QString &presetId, const QString &filePath);
     void presetLoaded(const QString &presetId, const QString &filePath);
     void resetToDefaultsTriggered();
@@ -181,6 +201,8 @@ class PropertyInspectorWidget : public QWidget {
     [[nodiscard]] QString deduceCategory(const QString &name, const QString &label) const;
 
     QString m_targetOutput; // Empty means all outputs
+    int32_t m_targetObjectId{-1};
+    uint32_t m_targetPassIndex{0};
     QString m_currentId{"default"};
     QString m_currentTitle{tr("No Project Loaded")};
     QString m_currentType{tr("None")};

@@ -5,6 +5,7 @@
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLFramebufferObject>
+#include <QTabletEvent>
 #include <QOpenGLVertexArrayObject>
 #include <QOpenGLBuffer>
 #include <QTimer>
@@ -53,6 +54,7 @@
 #endif
 
 #include "waywal/ipc_proto.h"
+#include "studio/viewport/viewport_gizmo_overlay.hpp"
 
 namespace waywal::studio {
 
@@ -188,6 +190,21 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     void pauseAnimation(bool pause);
     bool isAnimationPaused() const noexcept { return m_animationPaused; }
 
+    // --- Interactive Authoring Gizmos & Brush Pointer Routing ---
+    void setCommandBus(CommandBus *bus) noexcept { m_commandBus = bus; }
+    void setGizmoActiveNode(const SceneLayerNode *node);
+    void setGizmoCameraAndLights(const we_camera3d_t &cam, const we_lighting_uniforms_t &lights);
+    void setGizmoEmitterWireframes(std::vector<GizmoEmitterWireframe> emitters);
+    void setToolMode(ViewportToolMode mode);
+    [[nodiscard]] ViewportToolMode toolMode() const noexcept { return m_gizmoOverlay.toolMode(); }
+    void setSnapConfig(const ViewportGizmoSnapConfig &cfg);
+    [[nodiscard]] const ViewportGizmoSnapConfig &snapConfig() const noexcept
+    {
+        return m_gizmoOverlay.snapConfig();
+    }
+    void setSceneViewProj(const QMatrix4x4 &viewProj, bool hasCustomViewProj = true);
+    [[nodiscard]] ViewportGizmoOverlay &gizmoOverlay() noexcept { return m_gizmoOverlay; }
+
   signals:
     void applyRequested(const QString &monitorSpec);
     void monitorSelectionChanged(const QString &monitorName);
@@ -198,6 +215,15 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     void dmaBufImportFailed(const QString &reason);
     void dmaBufFrameRendered(uint32_t width, uint32_t height, uint64_t frameCount);
     void fpsUpdated(float fps);
+    void toolModeChanged(ViewportToolMode mode);
+    void layerTransformPreviewed(int32_t objectId,
+                                 const SetLayerTransformCommand::TransformState &state);
+    void layerTransformCommitted(int32_t objectId,
+                                 const SetLayerTransformCommand::TransformState &oldState,
+                                 const SetLayerTransformCommand::TransformState &newState);
+    void brushPointerPressed(const QPointF &texelPos, float pressure, double timestampSec);
+    void brushPointerMoved(const QPointF &texelPos, float pressure, double timestampSec);
+    void brushPointerReleased(const QPointF &texelPos, float pressure, double timestampSec);
 
   public slots:
     void onApplyClicked();
@@ -217,14 +243,25 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
+    void tabletEvent(QTabletEvent *event) override;
     void leaveEvent(QEvent *event) override;
     void showEvent(QShowEvent *event) override;
     void hideEvent(QHideEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
 
   private:
     void resolveEglExtensions();
     void setupQuadGeometry();
     void initBlitShader();
+    void ensureGizmoGlInitialized();
+    void renderGizmoOverlayPass(uint32_t contentW, uint32_t contentH);
+    [[nodiscard]] QMatrix4x4 computeBlitMvp(uint32_t contentW, uint32_t contentH) const noexcept;
+    [[nodiscard]] QMatrix4x4 computeGizmoViewProj(uint32_t contentW,
+                                                  uint32_t contentH) const noexcept;
+    [[nodiscard]] QPointF mapWidgetToContentTexel(const QPointF &widgetPos) const noexcept;
+    [[nodiscard]] static bool isBrushToolMode(ViewportToolMode mode) noexcept;
+    [[nodiscard]] QSize physicalSizeFor(int logicalW, int logicalH) const noexcept;
+    [[nodiscard]] QSize physicalFramebufferSize() const noexcept;
     void ensureNeutralPassTexture();
     void ensureOffscreenFbo(int w, int h);
     void ensureBufferPassFbos(int w, int h);
@@ -337,6 +374,23 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     uint64_t m_fpsFrameCounter{0};
     QPointF m_mouseGlCoord{0.0, 0.0};
     QPointF m_mouseClickCoord{0.0, 0.0};
+
+    // Authoring Gizmos & Brush Pointer State (lazy GL allocation on first active draw)
+    CommandBus *m_commandBus{nullptr};
+    ViewportGizmoOverlay m_gizmoOverlay{};
+    QOpenGLVertexArrayObject m_gizmoVao{};
+    QOpenGLBuffer m_gizmoVbo{QOpenGLBuffer::VertexBuffer};
+    std::unique_ptr<QOpenGLShaderProgram> m_gizmoProgram{nullptr};
+    std::vector<GizmoVertex> m_gizmoVertices{};
+    bool m_hasCustomSceneViewProj{false};
+    QMatrix4x4 m_customSceneViewProj{};
+    int32_t m_activeGizmoNodeId{-1};
+    QString m_activeGizmoNodeName{};
+    SetLayerTransformCommand::TransformState m_dragStartTransform{};
+    SetLayerTransformCommand::TransformState m_dragCurrentTransform{};
+    bool m_hasGizmoEmittersOrLights{false};
+    bool m_brushStrokeActive{false};
+    QElapsedTimer m_brushClock{};
 };
 
 } // namespace waywal::studio

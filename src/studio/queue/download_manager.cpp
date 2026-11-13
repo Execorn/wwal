@@ -25,7 +25,6 @@
 #include <optional>
 #include <queue>
 #include <random>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -3338,65 +3337,101 @@ struct DownloadManager::Impl {
         std::string lineBuffer;
         char readBuf[1024];
 
-        std::regex reProgressBytes(
-            R"(Update state \(0x[0-9a-fA-F]+\) downloading, progress:\s*([0-9.]+)%\s*\(([0-9]+)\s*\/\s*([0-9]+)\))");
-        std::regex reProgressPct(R"(progress:\s*([0-9.]+)%)");
-        std::regex reSuccess(R"rx(Success\.\s*Downloaded item\s*([0-9]+)\s*to\s*"([^"]+)")rx");
-
-        auto parseFloatSafe = [](const std::string &s, float &out) noexcept -> bool {
-            if (s.empty()) {
+        auto parseFloatPrefix = [](std::string_view sv, float &out, size_t &consumed) noexcept {
+            if (sv.empty()) {
                 return false;
             }
-            const char *first = s.data();
-            const char *last = first + s.size();
+            const char *first = sv.data();
+            const char *last = first + sv.size();
             auto [ptr, ec] = std::from_chars(first, last, out);
-            return ec == std::errc{} && ptr == last && std::isfinite(out);
-        };
-        auto parseU64Safe = [](const std::string &s, uint64_t &out) noexcept -> bool {
-            if (s.empty()) {
+            if (ec != std::errc{} || !std::isfinite(out) || ptr == first) {
                 return false;
             }
-            const char *first = s.data();
-            const char *last = first + s.size();
+            consumed = static_cast<size_t>(ptr - first);
+            return true;
+        };
+        auto parseU64Prefix = [](std::string_view sv, uint64_t &out, size_t &consumed) noexcept {
+            if (sv.empty()) {
+                return false;
+            }
+            const char *first = sv.data();
+            const char *last = first + sv.size();
             auto [ptr, ec] = std::from_chars(first, last, out, 10);
-            return ec == std::errc{} && ptr == last;
+            if (ec != std::errc{} || ptr == first) {
+                return false;
+            }
+            consumed = static_cast<size_t>(ptr - first);
+            return true;
+        };
+        auto skipSpaces = [](std::string_view sv, size_t &pos) noexcept {
+            while (pos < sv.size() && (sv[pos] == ' ' || sv[pos] == '\t')) {
+                ++pos;
+            }
         };
 
         auto handleLine = [&](const std::string &line) {
             if (line.empty()) {
                 return;
             }
-            std::smatch match;
-            if (std::regex_search(line, match, reProgressBytes)) {
+            std::string_view sv(line);
+            const size_t progPos = sv.find("progress:");
+            if (progPos != std::string_view::npos) {
+                size_t p = progPos + 9;
+                skipSpaces(sv, p);
                 float pct = 0.0f;
-                uint64_t cur = 0;
-                uint64_t tot = 0;
-                if (!parseFloatSafe(match[1].str(), pct) || !parseU64Safe(match[2].str(), cur) ||
-                    !parseU64Safe(match[3].str(), tot)) {
+                size_t len = 0;
+                if (parseFloatPrefix(sv.substr(p), pct, len) && p + len < sv.size() &&
+                    sv[p + len] == '%') {
+                    p += len + 1;
+                    skipSpaces(sv, p);
+                    if (sv.find("Update state (0x") != std::string_view::npos &&
+                        sv.find("downloading, progress:") != std::string_view::npos &&
+                        p < sv.size() && sv[p] == '(') {
+                        ++p;
+                        skipSpaces(sv, p);
+                        uint64_t cur = 0;
+                        uint64_t tot = 0;
+                        if (parseU64Prefix(sv.substr(p), cur, len)) {
+                            p += len;
+                            skipSpaces(sv, p);
+                            if (p < sv.size() && sv[p] == '/') {
+                                ++p;
+                                skipSpaces(sv, p);
+                                if (parseU64Prefix(sv.substr(p), tot, len)) {
+                                    {
+                                        std::lock_guard<std::mutex> lk(task->progress_mutex);
+                                        task->bytes_downloaded = cur;
+                                        task->bytes_total = tot;
+                                        task->progress_pct = pct;
+                                        task->speed_estimator.update(
+                                            cur, tot, task->speed_bytes_per_sec, task->eta_seconds);
+                                    }
+                                    task->notifyProgress();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(task->progress_mutex);
+                        task->progress_pct = pct;
+                    }
+                    task->notifyProgress();
                     return;
                 }
-                {
-                    std::lock_guard<std::mutex> lk(task->progress_mutex);
-                    task->bytes_downloaded = cur;
-                    task->bytes_total = tot;
-                    task->progress_pct = pct;
-                    task->speed_estimator.update(cur, tot, task->speed_bytes_per_sec,
-                                                 task->eta_seconds);
+            }
+            if (sv.find("Success.") != std::string_view::npos) {
+                const size_t dlPos = sv.find("Downloaded item");
+                if (dlPos != std::string_view::npos) {
+                    const size_t q1 = sv.find('"', dlPos);
+                    const size_t q2 = (q1 != std::string_view::npos) ? sv.find('"', q1 + 1)
+                                                                     : std::string_view::npos;
+                    if (q1 != std::string_view::npos && q2 != std::string_view::npos &&
+                        q2 > q1 + 1) {
+                        std::lock_guard<std::mutex> lk(task->progress_mutex);
+                        task->installed_path = std::string(sv.substr(q1 + 1, q2 - q1 - 1));
+                    }
                 }
-                task->notifyProgress();
-            } else if (std::regex_search(line, match, reProgressPct)) {
-                float pct = 0.0f;
-                if (!parseFloatSafe(match[1].str(), pct)) {
-                    return;
-                }
-                {
-                    std::lock_guard<std::mutex> lk(task->progress_mutex);
-                    task->progress_pct = pct;
-                }
-                task->notifyProgress();
-            } else if (std::regex_search(line, match, reSuccess)) {
-                std::lock_guard<std::mutex> lk(task->progress_mutex);
-                task->installed_path = match[2].str();
             }
         };
 

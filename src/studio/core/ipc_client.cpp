@@ -31,20 +31,40 @@ namespace {
 
 bool expectsGenericOkReply(uint16_t reqOpcode) noexcept
 {
+    // Allowlist only opcodes whose wire contract returns WAYWAL_RESP_OK so
+    // unrecognized or dedicated-response opcodes never desync the pending queue.
     switch (reqOpcode) {
-    case WAYWAL_REQ_EXPORT_OUTPUT_DMABUF:
-    case WAYWAL_REQ_GET_TELEMETRY:
-    case WAYWAL_REQ_WORKSHOP_SYNC:
-    case WAYWAL_REQ_WORKSHOP_DOWNLOAD:
-    case WAYWAL_REQ_WWPKG_INSTALL:
-    case WAYWAL_REQ_SCAN_COMPAT:
-    case WAYWAL_REQ_COMPILE_SHADER_GRAPH:
-    case WAYWAL_REQ_SET_CAMERA_3D:
-    case WAYWAL_REQ_SET_PHYSICS_PARAMS:
-    case WAYWAL_REQ_SET_SCENE_LIGHTS:
-        return false;
-    default:
+    case WAYWAL_REQ_CLEAR:
+    case WAYWAL_REQ_SET_IMAGE:
+    case WAYWAL_REQ_SET_VIDEO:
+    case WAYWAL_REQ_TOGGLE:
+    case WAYWAL_REQ_PAUSE:
+    case WAYWAL_REQ_UNPAUSE:
+    case WAYWAL_REQ_KILL:
+    case WAYWAL_REQ_SLIDESHOW:
+    case WAYWAL_REQ_SHADER:
+    case WAYWAL_REQ_RESTORE:
+    case WAYWAL_REQ_SLIDESHOW_CTRL:
+    case WAYWAL_REQ_WORKSHOP:
+    case WAYWAL_REQ_SET_UNIFORM:
+    case WAYWAL_REQ_SUBSCRIBE:
+    case WAYWAL_REQ_AUDIO_CTRL:
+    case WAYWAL_REQ_SLIDESHOW_NEXT:
+    case WAYWAL_REQ_SLIDESHOW_PREV:
+    case WAYWAL_REQ_SET_SHADER_PARAM:
         return true;
+    case WAYWAL_REQ_SCENE_MUTATE:
+    case WAYWAL_REQ_HOT_RELOAD_CODE:
+    case WAYWAL_REQ_QUERY_SCENE_TREE:
+    case WAYWAL_REQ_SET_SHADER_COMBO:
+    case WAYWAL_REQ_BRUSH_STROKE:
+    case WAYWAL_REQ_PARTICLE_CONFIG:
+    case WAYWAL_REQ_SET_AUDIO_BINDINGS:
+    case WAYWAL_REQ_EXPORT_SCENE_PKG:
+    case WAYWAL_REQ_LINT_SCENESCRIPT:
+    case WAYWAL_REQ_READBACK_TEXTURE:
+    default:
+        return false;
     }
 }
 
@@ -536,8 +556,8 @@ void IpcClient::workerLoop()
                 pollTimeoutMs = 0;
             } else if (!m_pendingUniforms.empty()) {
                 const auto now = std::chrono::steady_clock::now();
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - m_lastUniformFlush);
+                const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastUniformFlush);
                 pollTimeoutMs = (elapsed >= std::chrono::milliseconds(7))
                                     ? 0
                                     : static_cast<int>(7 - elapsed.count());
@@ -730,7 +750,9 @@ void IpcClient::handleIncomingPacket()
 
     std::vector<uint8_t> payload;
     if (hdr.payload_size > 0) {
-        if (hdr.payload_size > 64 * 1024 * 1024) {
+        const size_t maxAllowed =
+            sizeof(waywal_ipc_resp_readback_texture_t) + WAYWAL_IPC_MAX_READBACK_BYTES;
+        if (hdr.payload_size > maxAllowed) {
             WAYWAL_LOG_ERR("IpcClient: Payload size exceeds limit: %lu",
                            static_cast<unsigned long>(hdr.payload_size));
             closeSocket();
@@ -830,32 +852,47 @@ void IpcClient::handleIncomingPacket()
             waywal_export_dmabuf_resp_t desc{};
             std::memcpy(&desc, payload.data(), sizeof(desc));
             if (desc.width > 0 && desc.height > 0 && desc.num_planes <= 4) {
-                QVector<int> qfds;
+                struct QueuedFdGuard {
+                    QVector<int> fds;
+                    bool handedOff{false};
+                    ~QueuedFdGuard()
+                    {
+                        if (!handedOff) {
+                            for (int fd : fds) {
+                                if (fd >= 0) {
+                                    ::close(fd);
+                                }
+                            }
+                        }
+                    }
+                };
+
+                auto fdGuard = std::make_shared<QueuedFdGuard>();
                 size_t planeLimit = std::min<size_t>(numFds, desc.num_planes);
                 for (size_t i = 0; i < planeLimit; ++i) {
                     if (fds[i] >= 0) {
-                        qfds.append(fds[i]);
+                        fdGuard->fds.append(fds[i]);
                         fds[i] = -1;
                     }
                 }
 
+                // Close queued FDs automatically if IpcClient is destroyed before
+                // the main-thread lambda runs or if no consumer takes ownership.
                 QMetaObject::invokeMethod(
                     this,
-                    [this, desc, qfds, cb = std::move(req.dmabufCallback)]() {
+                    [this, desc, fdGuard, cb = std::move(req.dmabufCallback)]() {
                         const bool hasSignalListeners =
                             receivers(SIGNAL(
                                 dmabufReceived(waywal_export_dmabuf_resp_t, QVector<int>))) > 0;
+                        if (!cb && !hasSignalListeners) {
+                            return;
+                        }
+                        fdGuard->handedOff = true;
                         if (cb) {
-                            cb(desc, qfds);
+                            cb(desc, fdGuard->fds);
                         }
                         if (hasSignalListeners) {
-                            emit dmabufReceived(desc, qfds);
-                        } else if (!cb) {
-                            for (int leakedFd : qfds) {
-                                if (leakedFd >= 0) {
-                                    ::close(leakedFd);
-                                }
-                            }
+                            emit dmabufReceived(desc, fdGuard->fds);
                         }
                     },
                     Qt::QueuedConnection);
@@ -1097,6 +1134,175 @@ void IpcClient::handleIncomingPacket()
             if (waywal_ipc_validate_resp_set_scene_lights(&resp, payload.size())) {
                 QMetaObject::invokeMethod(
                     this, [this, resp]() { emit sceneLightsUpdated(resp); }, Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_SCENE_MUTATE) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_SCENE_MUTATE, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_scene_mutate_t)) {
+            waywal_ipc_resp_scene_mutate_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            if (waywal_ipc_validate_resp_scene_mutate(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit sceneMutated(resp); }, Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_HOT_RELOAD_CODE) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_HOT_RELOAD_CODE, req);
+        if (payload.size() >= sizeof(waywal_ipc_resp_hot_reload_code_t)) {
+            waywal_ipc_resp_hot_reload_code_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            const char *metaPtr = nullptr;
+            if (waywal_ipc_validate_resp_hot_reload_code(
+                    reinterpret_cast<const waywal_ipc_resp_hot_reload_code_t *>(payload.data()),
+                    payload.size(), &metaPtr)) {
+                QString metaJson =
+                    (metaPtr && resp.meta_json_len > 0)
+                        ? QString::fromUtf8(metaPtr, static_cast<qsizetype>(resp.meta_json_len))
+                        : QString();
+                QMetaObject::invokeMethod(
+                    this, [this, resp, metaJson]() { emit codeHotReloaded(resp, metaJson); },
+                    Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_QUERY_SCENE_TREE) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_QUERY_SCENE_TREE, req);
+        if (payload.size() >= sizeof(waywal_ipc_resp_query_scene_tree_t)) {
+            waywal_ipc_resp_query_scene_tree_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            const char *jsonPtr = nullptr;
+            if (waywal_ipc_validate_resp_query_scene_tree(
+                    reinterpret_cast<const waywal_ipc_resp_query_scene_tree_t *>(payload.data()),
+                    payload.size(), &jsonPtr)) {
+                QString treeJson =
+                    (jsonPtr && resp.json_len > 0)
+                        ? QString::fromUtf8(jsonPtr, static_cast<qsizetype>(resp.json_len))
+                        : QString();
+                QMetaObject::invokeMethod(
+                    this, [this, resp, treeJson]() { emit sceneTreeQueried(resp, treeJson); },
+                    Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_SET_SHADER_COMBO) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_SET_SHADER_COMBO, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_set_shader_combo_t)) {
+            waywal_ipc_resp_set_shader_combo_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            if (waywal_ipc_validate_resp_set_shader_combo(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit shaderComboUpdated(resp); }, Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_BRUSH_STROKE) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_BRUSH_STROKE, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_brush_stroke_t)) {
+            waywal_ipc_resp_brush_stroke_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            if (waywal_ipc_validate_resp_brush_stroke(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit brushStrokeCompleted(resp); },
+                    Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_PARTICLE_CONFIG) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_PARTICLE_CONFIG, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_particle_config_t)) {
+            waywal_ipc_resp_particle_config_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            if (waywal_ipc_validate_resp_particle_config(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit particleConfigUpdated(resp); },
+                    Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_SET_AUDIO_BINDINGS) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_SET_AUDIO_BINDINGS, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_set_audio_bindings_t)) {
+            waywal_ipc_resp_set_audio_bindings_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            if (waywal_ipc_validate_resp_set_audio_bindings(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit audioBindingsUpdated(resp); },
+                    Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_EXPORT_SCENE_PKG) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_EXPORT_SCENE_PKG, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_export_scene_pkg_t)) {
+            waywal_ipc_resp_export_scene_pkg_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            if (waywal_ipc_validate_resp_export_scene_pkg(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit scenePkgExported(resp); }, Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_LINT_SCENESCRIPT) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_LINT_SCENESCRIPT, req);
+        if (payload.size() == sizeof(waywal_ipc_resp_lint_scenescript_t)) {
+            waywal_ipc_resp_lint_scenescript_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            if (waywal_ipc_validate_resp_lint_scenescript(&resp, payload.size())) {
+                QMetaObject::invokeMethod(
+                    this, [this, resp]() { emit sceneScriptLinted(resp); }, Qt::QueuedConnection);
+            }
+        }
+        return;
+    }
+
+    if (hdr.opcode == WAYWAL_RESP_READBACK_TEXTURE) {
+        PendingRequest req{};
+        (void)popPendingForOpcode(WAYWAL_REQ_READBACK_TEXTURE, req);
+        if (payload.size() >= sizeof(waywal_ipc_resp_readback_texture_t)) {
+            waywal_ipc_resp_readback_texture_t resp{};
+            std::memcpy(&resp, payload.data(), sizeof(resp));
+            const void *dataPtr = nullptr;
+            uint32_t dataLen = 0;
+            if (waywal_ipc_validate_resp_readback_texture(
+                    reinterpret_cast<const waywal_ipc_resp_readback_texture_t *>(payload.data()),
+                    payload.size(), &dataPtr, &dataLen)) {
+                QByteArray bytes;
+                if (dataPtr && dataLen > 0) {
+                    bytes = QByteArray(static_cast<const char *>(dataPtr),
+                                       static_cast<qsizetype>(dataLen));
+                }
+                QMetaObject::invokeMethod(
+                    this, [this, resp, bytes]() { emit textureReadbackReceived(resp, bytes); },
+                    Qt::QueuedConnection);
             }
         }
         return;
@@ -1562,76 +1768,10 @@ bool IpcClient::requestCompileShaderGraph(const QString &output, const QString &
         return false;
     }
 
+    // Never perform synchronous socket I/O on the UI thread; responses arrive
+    // asynchronously on the worker thread and emit shaderGraphCompiled(resp).
     if (outResp) {
-        QString targetPath;
-        {
-            std::lock_guard<std::mutex> lock(m_stateMutex);
-            targetPath = m_customSocketPath;
-        }
-        if (targetPath.isEmpty()) {
-            path_buf_t pb;
-            if (waywal_ipc_resolve_socket_path(&pb, m_namespaceStr.toUtf8().constData())) {
-                targetPath = QString::fromUtf8(path_buf_cstr(&pb));
-            } else {
-                return false;
-            }
-        }
-        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd < 0) {
-            return false;
-        }
-
-        const timeval tv{.tv_sec = 1, .tv_usec = 500'000};
-        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        struct sockaddr_un addr{};
-        addr.sun_family = AF_UNIX;
-        QByteArray targetBa = targetPath.toUtf8();
-        if (static_cast<size_t>(targetBa.size()) >= sizeof(addr.sun_path)) {
-            ::close(fd);
-            return false;
-        }
-        std::memcpy(addr.sun_path, targetBa.constData(), static_cast<size_t>(targetBa.size()));
-
-        if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
-            ::close(fd);
-            return false;
-        }
-
-        if (!writeExactNonBlocking(fd, sendBuf.data(), totalLen, 2000)) {
-            ::close(fd);
-            return false;
-        }
-
-        waywal_ipc_hdr_t respHdr{};
-        int extraFds[4] = {-1, -1, -1, -1};
-        size_t numExtraFds = 0;
-        if (!waywal_ipc_recv_fds(fd, &respHdr, extraFds, 4, &numExtraFds)) {
-            ::close(fd);
-            return false;
-        }
-        ScopedFdArrayGuard extraGuard{extraFds, numExtraFds};
-
-        if (respHdr.opcode != WAYWAL_RESP_COMPILE_SHADER_GRAPH ||
-            respHdr.payload_size != sizeof(waywal_ipc_resp_compile_shader_graph_t)) {
-            ::close(fd);
-            return false;
-        }
-
-        waywal_ipc_resp_compile_shader_graph_t resp{};
-        if (!readExactNonBlocking(fd, &resp, sizeof(resp), 2000)) {
-            ::close(fd);
-            return false;
-        }
-        ::close(fd);
-
-        if (!waywal_ipc_validate_resp_compile_shader_graph(&resp, sizeof(resp))) {
-            return false;
-        }
-
-        *outResp = resp;
-        return (resp.status_code == 0);
+        std::memset(outResp, 0, sizeof(*outResp));
     }
 
     OutboundPacket pkt{};
@@ -1736,6 +1876,253 @@ bool IpcClient::sendSetSceneLights(const QString &output, const we_lighting_unif
         m_outQueue.push_back(std::move(pkt));
     }
 
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendSceneMutate(const waywal_ipc_req_scene_mutate_t &req,
+                                const QString &payloadJson)
+{
+    const QByteArray jsonBa = payloadJson.toUtf8();
+    const char *jsonPtr = jsonBa.isEmpty() ? nullptr : jsonBa.constData();
+    const size_t cap = sizeof(waywal_ipc_req_scene_mutate_t) + static_cast<size_t>(jsonBa.size());
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.payload.resize(cap);
+    size_t totalLen = 0;
+
+    if (!waywal_ipc_serialize_req_scene_mutate(&req, jsonPtr, &pkt.hdr, nullptr, pkt.payload.data(),
+                                               pkt.payload.size(), &totalLen)) {
+        return false;
+    }
+    pkt.payload.resize(totalLen);
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendHotReloadCode(const waywal_ipc_req_hot_reload_code_t &req,
+                                  const QByteArray &utf8Source)
+{
+    const char *targetOut = req.target_output[0] != '\0' ? req.target_output : "*";
+    const size_t cap =
+        sizeof(waywal_ipc_req_hot_reload_code_t) + static_cast<size_t>(utf8Source.size());
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.payload.resize(cap);
+    size_t totalLen = 0;
+
+    if (!waywal_ipc_serialize_req_hot_reload_code(
+            targetOut, req.code_kind, req.flags, req.object_id, req.pass_index, req.script_slot,
+            req.uniform_name, utf8Source.isEmpty() ? "" : utf8Source.constData(),
+            static_cast<size_t>(utf8Source.size()), &pkt.hdr, nullptr, pkt.payload.data(),
+            pkt.payload.size(), &totalLen)) {
+        return false;
+    }
+    pkt.payload.resize(totalLen);
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendQuerySceneTree(const QString &output, uint32_t flags)
+{
+    waywal_ipc_req_query_scene_tree_t req{};
+    QByteArray outBa = output.toUtf8();
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    if (!waywal_ipc_serialize_req_query_scene_tree(outBa.isEmpty() ? "*" : outBa.constData(), flags,
+                                                   &pkt.hdr, &req)) {
+        return false;
+    }
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendSetShaderCombo(const QString &output, int32_t objectId, uint32_t passIndex,
+                                   const QString &comboName, int32_t comboValue, uint32_t flags)
+{
+    waywal_ipc_req_set_shader_combo_t req{};
+    QByteArray outBa = output.toUtf8();
+    QByteArray comboBa = comboName.toUtf8();
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    if (!waywal_ipc_serialize_req_set_shader_combo(outBa.isEmpty() ? "*" : outBa.constData(),
+                                                   objectId, passIndex, comboBa.constData(),
+                                                   comboValue, flags, &pkt.hdr, &req)) {
+        return false;
+    }
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendBrushStroke(const waywal_ipc_req_brush_stroke_t &req,
+                                const std::vector<we_brush_dab_t> &dabs)
+{
+    const char *targetOut = req.target_output[0] != '\0' ? req.target_output : "*";
+    const size_t cap = sizeof(waywal_ipc_req_brush_stroke_t) + dabs.size() * sizeof(we_brush_dab_t);
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.payload.resize(cap);
+    size_t totalLen = 0;
+
+    if (!waywal_ipc_serialize_req_brush_stroke(
+            targetOut, req.action, req.object_id, req.pass_index, req.tex_slot, req.stroke_id,
+            &req.params, dabs.empty() ? nullptr : dabs.data(), static_cast<uint32_t>(dabs.size()),
+            &pkt.hdr, nullptr, pkt.payload.data(), pkt.payload.size(), &totalLen)) {
+        return false;
+    }
+    pkt.payload.resize(totalLen);
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendParticleConfig(const QString &output, int32_t objectId, uint32_t configOp,
+                                   uint32_t presetId, uint32_t flags, const void *payload,
+                                   uint32_t payloadLen)
+{
+    QByteArray outBa = output.toUtf8();
+    const size_t cap = sizeof(waywal_ipc_req_particle_config_t) + static_cast<size_t>(payloadLen);
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.payload.resize(cap);
+    size_t totalLen = 0;
+
+    if (!waywal_ipc_serialize_req_particle_config(
+            outBa.isEmpty() ? "*" : outBa.constData(), objectId, configOp, presetId, flags, payload,
+            payloadLen, &pkt.hdr, nullptr, pkt.payload.data(), pkt.payload.size(), &totalLen)) {
+        return false;
+    }
+    pkt.payload.resize(totalLen);
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendAudioBindings(const QString &output, uint32_t bindOp,
+                                  const we_audio_binding_t *bindings, uint32_t count,
+                                  uint32_t removeId)
+{
+    QByteArray outBa = output.toUtf8();
+    const size_t cap = sizeof(waywal_ipc_req_set_audio_bindings_t) +
+                       static_cast<size_t>(count) * sizeof(we_audio_binding_t);
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.payload.resize(cap);
+    size_t totalLen = 0;
+
+    if (!waywal_ipc_serialize_req_set_audio_bindings(
+            outBa.isEmpty() ? "*" : outBa.constData(), bindOp, removeId, bindings, count, &pkt.hdr,
+            nullptr, pkt.payload.data(), pkt.payload.size(), &totalLen)) {
+        return false;
+    }
+    pkt.payload.resize(totalLen);
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendExportScenePkg(const QString &output, const QString &destPath, uint32_t flags)
+{
+    waywal_ipc_req_export_scene_pkg_t req{};
+    QByteArray outBa = output.toUtf8();
+    QByteArray dstBa = destPath.toUtf8();
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    if (!waywal_ipc_serialize_req_export_scene_pkg(outBa.isEmpty() ? "*" : outBa.constData(),
+                                                   dstBa.constData(), flags, &pkt.hdr, &req)) {
+        return false;
+    }
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendLintScenescript(const QString &sourceText, uint32_t flags)
+{
+    QByteArray srcBa = sourceText.toUtf8();
+    const size_t cap =
+        sizeof(waywal_ipc_req_lint_scenescript_t) + static_cast<size_t>(srcBa.size());
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    pkt.payload.resize(cap);
+    size_t totalLen = 0;
+
+    if (!waywal_ipc_serialize_req_lint_scenescript(
+            srcBa.isEmpty() ? "" : srcBa.constData(), static_cast<size_t>(srcBa.size()), flags,
+            &pkt.hdr, nullptr, pkt.payload.data(), pkt.payload.size(), &totalLen)) {
+        return false;
+    }
+    pkt.payload.resize(totalLen);
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
+    wakeupWorker();
+    return true;
+}
+
+bool IpcClient::sendReadbackTexture(const QString &output, int32_t objectId, uint32_t passIndex,
+                                    uint32_t texSlot, uint32_t formatMode)
+{
+    waywal_ipc_req_readback_texture_t req{};
+    QByteArray outBa = output.toUtf8();
+    OutboundPacket pkt{};
+    pkt.type = OutboundPacket::Type::Raw;
+    if (!waywal_ipc_serialize_req_readback_texture(outBa.isEmpty() ? "*" : outBa.constData(),
+                                                   objectId, passIndex, texSlot, formatMode,
+                                                   &pkt.hdr, &req)) {
+        return false;
+    }
+    pkt.payload.resize(sizeof(req));
+    std::memcpy(pkt.payload.data(), &req, sizeof(req));
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_outQueue.push_back(std::move(pkt));
+    }
     wakeupWorker();
     return true;
 }

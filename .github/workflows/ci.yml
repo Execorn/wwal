@@ -95,6 +95,7 @@ jobs:
               -Doptimization=3 \
               -Db_lto=true \
               -Db_pie=true \
+              -Dwerror=true \
               -Dstudio=enabled \
               -Denable_vaapi=true \
               -Denable_io_uring=true \
@@ -104,11 +105,12 @@ jobs:
           else
             meson setup build \
               --prefix=/usr \
-              --buildtype=debug \
-              -Doptimization=1 \
+              --buildtype=debugoptimized \
+              -Doptimization=2 \
               -Db_lto=false \
               -Db_lundef=false \
               -Db_sanitize=address,undefined \
+              -Dwerror=true \
               -Dstudio=enabled \
               -Denable_vaapi=true \
               -Denable_io_uring=true \
@@ -124,11 +126,20 @@ jobs:
         if: matrix.profile == 'release'
         run: DESTDIR=/tmp/wwal-stage meson install -C build
 
+      - name: Verify daemon DT_NEEDED count and Studio headless check
+        if: matrix.profile == 'release'
+        run: |
+          needed_count=$(readelf -d build/wwald | grep -c NEEDED)
+          echo "wwald DT_NEEDED count: ${needed_count}"
+          test "${needed_count}" -eq 14
+          QT_QPA_PLATFORM=offscreen ./build/wwal-studio --headless-check
+
       - name: Run Meson test suite
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           LSAN_OPTIONS: suppressions=/tmp/wwal-lsan.supp:print_suppressions=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          QT_QPA_PLATFORM: offscreen
         run: |
           printf '%s\n' \
             'leak:libfontconfig.so' \
@@ -153,3 +164,4 @@ jobs:
           ./build/fuzz_bitstream
           ./build/fuzz_config_cli
           ./build/fuzz_workshop_parsers
+          ./build/test_ipc_authoring_wire

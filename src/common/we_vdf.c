@@ -791,6 +791,27 @@ static bool check_workshop_content_on_disk(const char *base_path)
     return false;
 }
 
+static void vdf_copy_cstr(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    if (dst == src) {
+        dst[cap - 1] = '\0';
+        return;
+    }
+    size_t i = 0;
+    while (i + 1 < cap && src[i] != '\0') {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
 static void add_or_merge_library(waywal_steam_library_t *out_libs, size_t *inout_count,
                                  size_t max_libs, const char *raw_path, const char *label,
                                  uint64_t total_size, uint64_t app_size, bool has_we)
@@ -801,8 +822,7 @@ static void add_or_merge_library(waywal_steam_library_t *out_libs, size_t *inout
 
     char canon[4096];
     if (realpath(raw_path, canon) == NULL) {
-        strncpy(canon, raw_path, sizeof(canon) - 1);
-        canon[sizeof(canon) - 1] = '\0';
+        vdf_copy_cstr(canon, sizeof(canon), raw_path);
     }
 
     size_t clen = strlen(canon);
@@ -826,7 +846,7 @@ static void add_or_merge_library(waywal_steam_library_t *out_libs, size_t *inout
                 out_libs[i].total_size_bytes = total_size;
             }
             if (label && label[0] != '\0' && out_libs[i].label[0] == '\0') {
-                strncpy(out_libs[i].label, label, sizeof(out_libs[i].label) - 1);
+                vdf_copy_cstr(out_libs[i].label, sizeof(out_libs[i].label), label);
             }
             return;
         }
@@ -834,9 +854,9 @@ static void add_or_merge_library(waywal_steam_library_t *out_libs, size_t *inout
 
     waywal_steam_library_t *lib = &out_libs[*inout_count];
     memset(lib, 0, sizeof(*lib));
-    strncpy(lib->path, canon, sizeof(lib->path) - 1);
+    vdf_copy_cstr(lib->path, sizeof(lib->path), canon);
     if (label && label[0] != '\0') {
-        strncpy(lib->label, label, sizeof(lib->label) - 1);
+        vdf_copy_cstr(lib->label, sizeof(lib->label), label);
     }
     lib->total_size_bytes = total_size;
     lib->app_size_bytes = app_size;

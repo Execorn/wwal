@@ -234,11 +234,15 @@ static bool get_compute_shader_cache_path(const char *src, char *out_path, size_
     }
 
     char wwal_dir[PATH_MAX];
-    snprintf(wwal_dir, sizeof(wwal_dir), "%s/wwal", base_dir);
+    int wn = snprintf(wwal_dir, sizeof(wwal_dir), "%s/wwal", base_dir);
+    if (wn < 0 || (size_t)wn >= sizeof(wwal_dir))
+        return false;
     (void)mkdir(wwal_dir, 0700);
 
     char shaders_dir[PATH_MAX];
-    snprintf(shaders_dir, sizeof(shaders_dir), "%s/shaders", wwal_dir);
+    int sn = snprintf(shaders_dir, sizeof(shaders_dir), "%s/shaders", wwal_dir);
+    if (sn < 0 || (size_t)sn >= sizeof(shaders_dir))
+        return false;
     (void)mkdir(shaders_dir, 0700);
 
     uint64_t hash = 14695981039346656037ULL;

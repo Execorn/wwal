@@ -2,9 +2,97 @@
 #ifndef WAYWAL_WE_PARTICLE_H
 #define WAYWAL_WE_PARTICLE_H
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#if __has_include("waywal/ipc_proto_authoring.h")
+#include "waywal/ipc_proto_authoring.h"
+#endif
+
+#ifndef WAYWAL_IPC_PROTO_AUTHORING_PARTICLE_FALLBACK
+#define WAYWAL_IPC_PROTO_AUTHORING_PARTICLE_FALLBACK
+#ifndef WAYWAL_IPC_PROTO_AUTHORING_H
+#define WE_PARTICLE_RAMP_SAMPLES 65u
+#define WE_PARTICLE_MAX_KNOTS    12u
+#define WE_PARTICLE_PRESET_COUNT 8u
+
+typedef enum : uint32_t {
+    WE_PARTICLE_PRESET_RAIN = 0u,
+    WE_PARTICLE_PRESET_SNOW = 1u,
+    WE_PARTICLE_PRESET_EMBERS = 2u,
+    WE_PARTICLE_PRESET_FIREFLIES = 3u,
+    WE_PARTICLE_PRESET_CHERRY_BLOSSOMS = 4u,
+    WE_PARTICLE_PRESET_STARFIELD = 5u,
+    WE_PARTICLE_PRESET_RISING_SMOKE = 6u,
+    WE_PARTICLE_PRESET_MAGIC_DUST = 7u,
+} we_particle_preset_id_t;
+
+typedef enum : uint32_t {
+    WE_KNOT_HANDLE_AUTO_SMOOTH = 0u,
+    WE_KNOT_HANDLE_LINEAR = 1u,
+    WE_KNOT_HANDLE_STEP = 2u,
+    WE_KNOT_HANDLE_FREE_BEZIER = 3u,
+} we_knot_handle_mode_t;
+
+typedef enum : uint32_t {
+    WE_PARTICLE_CFG_APPLY_PRESET = 0u,
+    WE_PARTICLE_CFG_SET_SYSTEM_JSON = 1u,
+    WE_PARTICLE_CFG_SET_RAMP_LUT = 2u,
+    WE_PARTICLE_CFG_TRIGGER_BURST = 3u,
+    WE_PARTICLE_CFG_PAUSE_TOGGLE = 4u,
+} we_particle_cfg_op_t;
+
+#pragma pack(push, 1)
+
+typedef struct {
+    float t;
+    float y;
+    float in_tangent;
+    float out_tangent;
+    uint32_t mode;
+    uint32_t _pad;
+} we_particle_curve_knot_t;
+static_assert(sizeof(we_particle_curve_knot_t) == 24,
+              "we_particle_curve_knot_t must be exactly 24 bytes");
+
+typedef struct {
+    float t;
+    float rgb[3];
+} we_particle_color_stop_t;
+static_assert(sizeof(we_particle_color_stop_t) == 16,
+              "we_particle_color_stop_t must be exactly 16 bytes");
+
+typedef struct {
+    uint32_t operator_index;
+    uint32_t channel_kind;
+    uint32_t knot_count;
+    uint32_t _pad;
+    float scalar_lut[WE_PARTICLE_RAMP_SAMPLES];
+    float color_lut_r[WE_PARTICLE_RAMP_SAMPLES];
+    float color_lut_g[WE_PARTICLE_RAMP_SAMPLES];
+    float color_lut_b[WE_PARTICLE_RAMP_SAMPLES];
+} we_particle_ramp_lut_t;
+static_assert(sizeof(we_particle_ramp_lut_t) == 1056,
+              "we_particle_ramp_lut_t must be exactly 1056 bytes");
+
+typedef struct {
+    uint32_t preset_id;
+    uint32_t max_count;
+    uint32_t renderer_type;
+    uint32_t blending;
+    float start_time_sec;
+    float gravity[3];
+    char slug[32];
+    char display_name[48];
+} we_particle_preset_desc_t;
+static_assert(sizeof(we_particle_preset_desc_t) == 112,
+              "we_particle_preset_desc_t must be exactly 112 bytes");
+
+#pragma pack(pop)
+#endif /* WAYWAL_IPC_PROTO_AUTHORING_H */
+#endif /* WAYWAL_IPC_PROTO_AUTHORING_PARTICLE_FALLBACK */
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,6 +159,7 @@ typedef enum {
     WE_OP_OSCILLATE_POSITION = 7,
     WE_OP_VORTEX = 8,
     WE_OP_TURBULENCE = 9,
+    WE_OP_CONTROL_POINT_ATTRACT = 10,
 } we_operator_type_t;
 
 typedef struct {
@@ -101,6 +190,8 @@ typedef struct {
     float turb_scale;
     float turb_speed;
     float turb_timescale;
+    alignas(16) we_particle_ramp_lut_t ramp_lut;
+    bool use_ramp_lut;
 } we_particle_operator_t;
 
 typedef enum {
@@ -200,6 +291,8 @@ typedef struct we_particle_sys {
     uint32_t gl_ebo;
     uint32_t gl_quad_cap;
     bool gl_uploaded;
+    bool paused;
+    uint32_t preset_blending;
 } we_particle_sys_t;
 
 /* Parses a Wallpaper Engine particle system JSON definition and allocates 32B-aligned SoA arrays */
@@ -226,6 +319,33 @@ bool we_particle_realloc_capacity(we_particle_sys_t *sys, uint32_t new_max_count
 
 /* Resets simulation state and re-runs start_time pre-warm after instance overrides are applied */
 void we_particle_reset_and_prewarm(we_particle_sys_t *sys);
+
+/* Bakes knots into a 65-sample LUT using Fritsch-Carlson monotone cubic Hermite (or
+ * linear/step/bezier) */
+bool we_particle_bake_scalar_lut(const we_particle_curve_knot_t *knots, uint32_t knot_count,
+                                 float out_lut[WE_PARTICLE_RAMP_SAMPLES]);
+
+/* Evaluates a 65-sample ramp LUT at normalized lifetime t in [0, 1] via linear interpolation */
+float we_particle_eval_scalar_lut(const float lut[WE_PARTICLE_RAMP_SAMPLES], float t);
+
+/* Bakes sRGB color stops into 65-sample RGB LUTs interpolated perceptually in OKLab */
+bool we_particle_bake_oklab_lut(const we_particle_color_stop_t *stops, uint32_t stop_count,
+                                float out_r[WE_PARTICLE_RAMP_SAMPLES],
+                                float out_g[WE_PARTICLE_RAMP_SAMPLES],
+                                float out_b[WE_PARTICLE_RAMP_SAMPLES]);
+
+/* Applies a baked ramp LUT to the target operator (or appends one if operator_index == UINT32_MAX)
+ */
+bool we_particle_apply_ramp_lut(we_particle_sys_t *sys, const we_particle_ramp_lut_t *lut);
+
+/* Returns canonical metadata for one of the 8 clean-room particle presets */
+const we_particle_preset_desc_t *we_particle_get_preset_desc(we_particle_preset_id_t preset_id);
+
+/* Instantiates one of the 8 clean-room particle presets and optionally runs start_time pre-warm */
+we_particle_sys_t *we_particle_create_preset(we_particle_preset_id_t preset_id, bool prewarm);
+
+/* Emits an immediate burst of particles from emitter 0 without altering continuous emission */
+void we_particle_trigger_burst(we_particle_sys_t *sys, uint32_t count);
 
 /* Frees all CPU and GPU resources owned by a we_particle_sys_t */
 void we_particle_destroy(we_particle_sys_t *sys);

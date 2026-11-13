@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "studio/app/main_window.hpp"
 #include "studio/app/dock_layout_manager.hpp"
+#include "waywal/ipc_proto_authoring.h"
 
 #include <QApplication>
 #include <QMenuBar>
@@ -39,6 +40,7 @@
 #include <filesystem>
 #include <system_error>
 #include <type_traits>
+#include <utility>
 
 // Include Core Services & CommandBus
 #if __has_include("studio/core/command_bus.hpp")
@@ -174,8 +176,20 @@ class MonitorTopologyBar : public QWidget {
 #include "studio/graph/effect_library_browser_widget.hpp"
 #include "studio/inspector/camera_lighting_inspector_widget.hpp"
 #include "studio/inspector/physics_spring_inspector_widget.hpp"
+#include "studio/scene/scene_layer_tree_widget.hpp"
+#include "studio/brush/gpu_brush_painter_widget.hpp"
+#include "studio/particle/particle_designer_widget.hpp"
+#include "studio/audio/audio_binding_wizard.hpp"
+#include "studio/editor/glsl_scenescript_editor_widget.hpp"
+#include "studio/core/command_bus_authoring.hpp"
+#include "waywal/we_pkg.h"
 #include "waywal/we_vdf.h"
 #include "waywal/wwpkg.h"
+
+#include <QOpenGLContext>
+#include <QSet>
+#include <algorithm>
+#include <array>
 
 namespace waywal::studio {
 
@@ -532,6 +546,34 @@ MainWindow::~MainWindow()
     }
 }
 
+MonitorTopologyBar *MainWindow::topologyBar() const { return m_topologyBar; }
+VirtualizedGridWidget *MainWindow::gridWidget() const { return m_gridWidget; }
+GpuPreviewViewport *MainWindow::previewViewport() const { return m_previewViewport; }
+CubicBezierEditorWidget *MainWindow::bezierEditor() const { return m_bezierEditor; }
+PropertyInspectorWidget *MainWindow::propertyInspector() const { return m_propertyInspector; }
+ThemeStudioWidget *MainWindow::themeStudio() const { return m_themeStudio; }
+StudioFooterBar *MainWindow::footerBar() const { return m_footerBar; }
+WorkshopBrowserWidget *MainWindow::workshopBrowser() const { return m_workshopBrowser; }
+OpenHubBrowserWidget *MainWindow::openHubBrowser() const { return m_openHubBrowser; }
+NodeGraphEditorWidget *MainWindow::nodeGraphEditor() const { return m_nodeGraphEditor; }
+EffectLibraryBrowserWidget *MainWindow::effectLibraryBrowser() const
+{
+    return m_effectLibraryBrowser;
+}
+CameraLightingInspectorWidget *MainWindow::cameraLightingInspector() const
+{
+    return m_cameraLightingInspector;
+}
+PhysicsSpringInspectorWidget *MainWindow::physicsSpringInspector() const
+{
+    return m_physicsSpringInspector;
+}
+SceneLayerTreeWidget *MainWindow::sceneLayerTree() const { return m_sceneLayerTree; }
+GpuBrushPainterWidget *MainWindow::brushPainter() const { return m_brushPainter; }
+ParticleDesignerWidget *MainWindow::particleDesigner() const { return m_particleDesigner; }
+AudioBindingWizard *MainWindow::audioBindingWizard() const { return m_audioBindingWizard; }
+GlslSceneScriptEditorWidget *MainWindow::codeEditor() const { return m_codeEditor; }
+
 void MainWindow::setupPanels()
 {
     // Panel 1 (Top Bar): Monitor Topology & Span Mode
@@ -585,6 +627,7 @@ void MainWindow::setupPanels()
 
     // Panel 3 (Center Dock Top): GPU Preview Viewport
     m_previewViewport = new GpuPreviewViewport(this);
+    m_previewViewport->setCommandBus(m_commandBus.get());
     m_layoutManager->registerPanel(QStringLiteral("GpuPreviewViewport"), m_previewViewport,
                                    QStringLiteral("Preview"), Qt::RightDockWidgetArea);
 
@@ -636,6 +679,149 @@ void MainWindow::setupPanels()
     m_layoutManager->registerPanel(QStringLiteral("StudioFooterBar"), m_footerBar,
                                    QStringLiteral("Telemetry"), Qt::BottomDockWidgetArea);
 
+    // Register authoring panels lazily so startup RssAnon stays within the 80 MB budget.
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("SceneLayerTree"), QStringLiteral("Scene Hierarchy"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *tree = new SceneLayerTreeWidget(parent);
+            tree->setCommandBus(m_commandBus.get());
+            tree->setIpcClient(m_ipcClient.get());
+            if (!m_lastSceneTreeJson.isEmpty()) {
+                tree->loadFromSceneJson(m_lastSceneTreeJson);
+            }
+            connect(tree, &SceneLayerTreeWidget::objectSelected, this,
+                    [this, tree](int32_t objectId, we_scene_node_kind_t /*kind*/) {
+                        if (m_previewViewport) {
+                            m_previewViewport->setGizmoActiveNode(tree->selectedNode());
+                        }
+                        if (m_propertyInspector) {
+                            m_propertyInspector->setTargetObjectId(objectId, 0);
+                        }
+                    });
+            connect(tree, &SceneLayerTreeWidget::statusMessage, this, [this](const QString &msg) {
+                if (m_statusLabel) {
+                    m_statusLabel->setText(msg);
+                }
+            });
+            m_sceneLayerTree = tree;
+            return tree;
+        },
+        Qt::LeftDockWidgetArea);
+
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("GpuBrushPainter"), QStringLiteral("GPU Paint Brush"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *brush = new GpuBrushPainterWidget(parent);
+            brush->setCommandBus(m_commandBus.get());
+            brush->setIpcClient(m_ipcClient.get());
+            connect(brush, &GpuBrushPainterWidget::statusMessage, this, [this](const QString &msg) {
+                if (m_statusLabel) {
+                    m_statusLabel->setText(msg);
+                }
+            });
+            m_brushPainter = brush;
+            return brush;
+        },
+        Qt::RightDockWidgetArea);
+
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("ParticleDesigner"), QStringLiteral("Particle Designer"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *designer = new ParticleDesignerWidget(parent);
+            designer->setCommandBus(m_commandBus.get());
+            designer->setIpcClient(m_ipcClient.get());
+            connect(designer, &ParticleDesignerWidget::statusMessage, this,
+                    [this](const QString &msg) {
+                        if (m_statusLabel) {
+                            m_statusLabel->setText(msg);
+                        }
+                    });
+            m_particleDesigner = designer;
+            return designer;
+        },
+        Qt::LeftDockWidgetArea);
+
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("AudioBindingWizard"), QStringLiteral("Audio Bindings"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *wiz = new AudioBindingWizard(parent);
+            wiz->setCommandBus(m_commandBus.get());
+            wiz->setIpcClient(m_ipcClient.get());
+            connect(wiz, &AudioBindingWizard::bindingsUpdated, this,
+                    [this](const std::vector<we_audio_binding_t> &bindings) {
+                        if (!m_propertyInspector) {
+                            return;
+                        }
+                        for (auto *row : m_propertyInspector->findChildren<PropertyRowWidget *>()) {
+                            row->setAudioBound(false);
+                        }
+                        for (const auto &b : bindings) {
+                            if (b.uniform_name[0] == '\0') {
+                                continue;
+                            }
+                            if (auto *row = m_propertyInspector->propertyRow(
+                                    QString::fromUtf8(b.uniform_name))) {
+                                if (b.enabled != 0) {
+                                    row->setAudioBound(true);
+                                }
+                            }
+                        }
+                    });
+            connect(wiz, &AudioBindingWizard::statusMessage, this, [this](const QString &msg) {
+                if (m_statusLabel) {
+                    m_statusLabel->setText(msg);
+                }
+            });
+            m_audioBindingWizard = wiz;
+            return wiz;
+        },
+        Qt::RightDockWidgetArea);
+
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("GlslSceneScriptEditor"), QStringLiteral("Code Editor"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *editor = new GlslSceneScriptEditorWidget(parent);
+            editor->setIpcClient(m_ipcClient.get());
+            if (m_previewViewport && m_previewViewport->context()) {
+                editor->setSharedOpenGLContext(m_previewViewport->context());
+            }
+            connect(editor, &GlslSceneScriptEditorWidget::shaderMetadataExtracted, this,
+                    [this](const waywal_shader_meta_t &meta, const QString &rawComboJson) {
+                        if (m_propertyInspector) {
+                            m_propertyInspector->setShaderMetadata(meta, rawComboJson);
+                        }
+                    });
+            connect(editor, &GlslSceneScriptEditorWidget::liveHotReloadApplied, this,
+                    [this, editor](bool success, uint32_t /*compileTimeUs*/) {
+                        if (success && m_previewViewport &&
+                            editor->languageMode() == EditorLanguageMode::GlslEs310Fragment) {
+                            m_previewViewport->setPreviewShader(editor->sourceText());
+                        }
+                    });
+            connect(editor, &GlslSceneScriptEditorWidget::statusMessage, this,
+                    [this](const QString &msg) {
+                        if (m_statusLabel) {
+                            m_statusLabel->setText(msg);
+                        }
+                    });
+            if (!m_activeWallpaperPath.isEmpty()) {
+                const QString lower = m_activeWallpaperPath.toLower();
+                if (lower.endsWith(QStringLiteral(".glsl")) ||
+                    lower.endsWith(QStringLiteral(".frag")) ||
+                    lower.endsWith(QStringLiteral(".comp"))) {
+                    QFile f(m_activeWallpaperPath);
+                    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                        editor->openDocument(EditorLanguageMode::GlslEs310Fragment, -1, 0,
+                                             QFileInfo(m_activeWallpaperPath).fileName(),
+                                             QString::fromUtf8(f.readAll()));
+                    }
+                }
+            }
+            m_codeEditor = editor;
+            return editor;
+        },
+        Qt::BottomDockWidgetArea);
+
     // Remove standard status bar to let custom FooterBar shine
     setStatusBar(nullptr);
 }
@@ -671,6 +857,14 @@ void MainWindow::setupMenuBar()
             }
             if (isShader && m_propertyInspector) {
                 m_propertyInspector->loadShaderFile(file);
+            }
+            if (isShader && m_codeEditor) {
+                QFile f(file);
+                if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                    m_codeEditor->openDocument(EditorLanguageMode::GlslEs310Fragment, -1, 0,
+                                               QFileInfo(file).fileName(),
+                                               QString::fromUtf8(f.readAll()));
+                }
             }
             if (!isShader && m_themeStudio) {
                 if (m_previewViewport && !m_previewViewport->previewImage().isNull()) {
@@ -710,6 +904,14 @@ void MainWindow::setupMenuBar()
             if (m_propertyInspector) {
                 m_propertyInspector->loadShaderFile(file);
             }
+            if (m_codeEditor) {
+                QFile f(file);
+                if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                    m_codeEditor->openDocument(EditorLanguageMode::GlslEs310Fragment, -1, 0,
+                                               QFileInfo(file).fileName(),
+                                               QString::fromUtf8(f.readAll()));
+                }
+            }
             if (m_statusLabel) {
                 m_statusLabel->setText(QStringLiteral("Loaded shader: %1").arg(file));
             }
@@ -732,6 +934,11 @@ void MainWindow::setupMenuBar()
     m_packageWizardAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+P")));
     connect(m_packageWizardAction, &QAction::triggered, this,
             &MainWindow::handleOpenPackagingWizard);
+
+    m_exportScenePkgAction = fileMenu->addAction(QStringLiteral("&Export Scene Package..."));
+    m_exportScenePkgAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+E")));
+    connect(m_exportScenePkgAction, &QAction::triggered, this,
+            &MainWindow::handleExportScenePackage);
 
     fileMenu->addSeparator();
 
@@ -773,13 +980,23 @@ void MainWindow::setupMenuBar()
     connect(shaderPerspAction, &QAction::triggered, this,
             [this]() { handlePerspectiveSelected(QStringLiteral("Shader Coding")); });
 
-    auto *themePerspAction = perspsMenu->addAction(QStringLiteral("&3 Theme Studio"));
-    themePerspAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+3")));
+    auto *scenePerspAction = perspsMenu->addAction(QStringLiteral("&3 Scene Composer"));
+    scenePerspAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+3")));
+    connect(scenePerspAction, &QAction::triggered, this,
+            [this]() { handlePerspectiveSelected(QStringLiteral("Scene Composer")); });
+
+    auto *particlePerspAction = perspsMenu->addAction(QStringLiteral("&4 Particle & Audio"));
+    particlePerspAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+4")));
+    connect(particlePerspAction, &QAction::triggered, this,
+            [this]() { handlePerspectiveSelected(QStringLiteral("Particle & Audio")); });
+
+    auto *themePerspAction = perspsMenu->addAction(QStringLiteral("&5 Theme Studio"));
+    themePerspAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+5")));
     connect(themePerspAction, &QAction::triggered, this,
             [this]() { handlePerspectiveSelected(QStringLiteral("Theme Studio")); });
 
-    auto *monitorPerspAction = perspsMenu->addAction(QStringLiteral("&4 Multi-Monitor"));
-    monitorPerspAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+4")));
+    auto *monitorPerspAction = perspsMenu->addAction(QStringLiteral("&6 Multi-Monitor"));
+    monitorPerspAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+6")));
     connect(monitorPerspAction, &QAction::triggered, this,
             [this]() { handlePerspectiveSelected(QStringLiteral("Multi-Monitor")); });
 
@@ -850,6 +1067,8 @@ void MainWindow::setupToolBar()
     m_perspectiveCombo->setFixedWidth(148);
     m_perspectiveCombo->setFixedHeight(28);
     m_perspectiveCombo->addItems({QStringLiteral("Default"), QStringLiteral("Shader Coding"),
+                                  QStringLiteral("Scene Composer"),
+                                  QStringLiteral("Particle & Audio"),
                                   QStringLiteral("Theme Studio"), QStringLiteral("Multi-Monitor")});
     connect(m_perspectiveCombo, &QComboBox::currentTextChanged, this, [this](const QString &text) {
         if (!m_updatingPerspectiveCombo) {
@@ -857,6 +1076,25 @@ void MainWindow::setupToolBar()
         }
     });
     toolbar->addWidget(m_perspectiveCombo);
+
+    toolbar->addSeparator();
+
+    auto *toolLabel = new QLabel(QStringLiteral("Tool"), this);
+    toolLabel->setStyleSheet(
+        QStringLiteral("color: #94a3b8; font-size: 11px; font-weight: 500; padding-left: 4px;"));
+    toolbar->addWidget(toolLabel);
+
+    m_toolModeCombo = new QComboBox(this);
+    m_toolModeCombo->setObjectName(QStringLiteral("ViewportToolModeCombo"));
+    m_toolModeCombo->setFixedWidth(136);
+    m_toolModeCombo->setFixedHeight(28);
+    m_toolModeCombo->addItems(
+        {QStringLiteral("Navigate"), QStringLiteral("Select"), QStringLiteral("Translate"),
+         QStringLiteral("Rotate"), QStringLiteral("Scale"), QStringLiteral("Brush: Mask"),
+         QStringLiteral("Brush: Flow"), QStringLiteral("Brush: Blur/Smudge")});
+    connect(m_toolModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            &MainWindow::handleViewportToolModeChanged);
+    toolbar->addWidget(m_toolModeCombo);
 
     toolbar->addSeparator();
 
@@ -1221,6 +1459,256 @@ void MainWindow::wireInterPanelSignals()
                     }
                 });
     }
+
+    // 5. Connect Viewport Gizmos, Brush Routing, Audio Wizard, Code Editor & Scene Tree
+    if (m_previewViewport) {
+        connect(
+            m_previewViewport, &GpuPreviewViewport::layerTransformCommitted, this,
+            [this](int32_t objectId, const SetLayerTransformCommand::TransformState &oldState,
+                   const SetLayerTransformCommand::TransformState &newState) {
+                auto applyTransform = [this](int32_t objId,
+                                             const SetLayerTransformCommand::TransformState &st) {
+                    if (m_ipcClient) {
+                        waywal_ipc_req_scene_mutate_t req{};
+                        req.mutate_op = WE_MUTATE_SET_TRANSFORM;
+                        req.object_id = objId;
+                        for (size_t i = 0; i < 3; ++i) {
+                            req.origin[i] = st.origin[i];
+                            req.scale[i] = st.scale[i];
+                            req.angles[i] = st.angles[i];
+                        }
+                        req.size[0] = st.size[0];
+                        req.size[1] = st.size[1];
+                        req.parallax_depth[0] = st.parallaxDepth[0];
+                        req.parallax_depth[1] = st.parallaxDepth[1];
+                        m_ipcClient->sendSceneMutate(req);
+                    }
+                    if (m_sceneLayerTree) {
+                        // Update the layer model transform before refreshing the gizmo target
+                        // so the overlay immediately reflects committed state without snapping
+                        // back.
+                        if (auto *model = m_sceneLayerTree->findChild<SceneLayerTreeModel *>()) {
+                            std::vector<SceneLayerNode> updatedNodes = model->nodes();
+                            bool nodeUpdated = false;
+                            for (auto &n : updatedNodes) {
+                                if (n.id == objId) {
+                                    for (size_t i = 0; i < 3; ++i) {
+                                        n.origin[i] = st.origin[i];
+                                        n.scale[i] = st.scale[i];
+                                        n.angles[i] = st.angles[i];
+                                    }
+                                    n.size[0] = st.size[0];
+                                    n.size[1] = st.size[1];
+                                    n.parallaxDepth[0] = st.parallaxDepth[0];
+                                    n.parallaxDepth[1] = st.parallaxDepth[1];
+                                    nodeUpdated = true;
+                                    break;
+                                }
+                            }
+                            if (nodeUpdated) {
+                                const int32_t prevSelId = m_sceneLayerTree->selectedObjectId();
+                                model->setNodes(std::move(updatedNodes));
+                                if (prevSelId >= 0) {
+                                    const QSignalBlocker blocker(m_sceneLayerTree.data());
+                                    m_sceneLayerTree->selectObject(prevSelId);
+                                }
+                            }
+                        }
+                        m_previewViewport->setGizmoActiveNode(m_sceneLayerTree->selectedNode());
+                    }
+                };
+                if (m_commandBus) {
+                    m_commandBus->execute(std::make_unique<SetLayerTransformCommand>(
+                        objectId, QStringLiteral("Layer %1").arg(objectId), oldState, newState,
+                        applyTransform));
+                } else {
+                    applyTransform(objectId, newState);
+                }
+            });
+
+        connect(m_previewViewport, &GpuPreviewViewport::brushPointerPressed, this,
+                [this](const QPointF &texelPos, float pressure, double timestampSec) {
+                    if (!m_brushPainter && m_layoutManager) {
+                        m_layoutManager->realizeLazyPanel(QStringLiteral("GpuBrushPainter"));
+                    }
+                    if (m_brushPainter) {
+                        m_brushPainter->handlePointerPress(texelPos, pressure, timestampSec);
+                    }
+                });
+        connect(m_previewViewport, &GpuPreviewViewport::brushPointerMoved, this,
+                [this](const QPointF &texelPos, float pressure, double timestampSec) {
+                    if (m_brushPainter) {
+                        m_brushPainter->handlePointerMove(texelPos, pressure, timestampSec);
+                    }
+                });
+        connect(m_previewViewport, &GpuPreviewViewport::brushPointerReleased, this,
+                [this](const QPointF &texelPos, float pressure, double timestampSec) {
+                    if (m_brushPainter) {
+                        m_brushPainter->handlePointerRelease(texelPos, pressure, timestampSec);
+                    }
+                });
+        connect(m_previewViewport, &GpuPreviewViewport::toolModeChanged, this,
+                [this](ViewportToolMode mode) {
+                    if (m_toolModeCombo) {
+                        const QSignalBlocker blocker(m_toolModeCombo);
+                        const int idx = static_cast<int>(mode);
+                        if (idx >= 0 && idx < m_toolModeCombo->count()) {
+                            m_toolModeCombo->setCurrentIndex(idx);
+                        }
+                    }
+                });
+    }
+
+    if (m_propertyInspector) {
+        connect(m_propertyInspector, &PropertyInspectorWidget::audioBindingRequested, this,
+                [this](const QString &uniformName, float baseline) {
+                    if (m_layoutManager) {
+                        m_layoutManager->realizeLazyPanel(QStringLiteral("AudioBindingWizard"));
+                        m_layoutManager->setPanelVisible(QStringLiteral("AudioBindingWizard"),
+                                                         true);
+                    }
+                    if (m_audioBindingWizard) {
+                        m_audioBindingWizard->preselectTargetUniform(
+                            m_propertyInspector->targetObjectId(), uniformName, 0, baseline);
+                    }
+                });
+        connect(m_propertyInspector, &PropertyInspectorWidget::uniformDefaultEdited, this,
+                [this](const QString &symbolName, const QString &formattedVal) {
+                    if (m_codeEditor) {
+                        m_codeEditor->patchUniformOrComboDefaultInSource(symbolName, formattedVal);
+                    }
+                });
+        connect(m_propertyInspector, &PropertyInspectorWidget::shaderComboChanged, this,
+                [this](const QString &output, int32_t objectId, uint32_t passIndex,
+                       const QString &comboName, int32_t comboValue) {
+                    if (m_ipcClient) {
+                        m_ipcClient->sendSetShaderCombo(output, objectId, passIndex, comboName,
+                                                        comboValue);
+                    }
+                });
+    }
+
+    if (m_ipcClient) {
+        connect(m_ipcClient.get(), &IpcClient::sceneTreeQueried, this,
+                [this](const waywal_ipc_resp_query_scene_tree_t &resp, const QString &treeJson) {
+                    if (resp.status_code == 0 && !treeJson.isEmpty()) {
+                        m_lastSceneTreeJson = treeJson;
+                        if (m_sceneLayerTree) {
+                            m_sceneLayerTree->loadFromSceneJson(treeJson);
+                        }
+                    }
+                });
+        connect(m_ipcClient.get(), &IpcClient::telemetryReceived, this,
+                [this](const TelemetrySnapshot &snapshot) {
+                    if (!m_audioBindingWizard || !m_audioBindingWizard->isVisible()) {
+                        return;
+                    }
+                    std::array<float, 64> bands{};
+                    const size_t n = std::min<size_t>(snapshot.barkBands.size(), 64);
+                    for (size_t i = 0; i < n; ++i) {
+                        bands[i] = snapshot.barkBands[i];
+                    }
+                    float bassEnergy = 0.0f;
+                    for (size_t i = 0; i < 7; ++i) {
+                        bassEnergy += bands[i];
+                    }
+                    bassEnergy /= 7.0f;
+                    m_audioBindingWizard->updateLiveBarkTelemetry(
+                        bands, snapshot.rmsLevel, bassEnergy, snapshot.beatPulse, 1.0f / 60.0f);
+                });
+        connect(
+            m_ipcClient.get(), &IpcClient::scenePkgExported, this,
+            [this](const waywal_ipc_resp_export_scene_pkg_t &resp) {
+                const QString stagePath = std::exchange(m_pendingExportStagePath, QString());
+                const QString destPath = std::exchange(m_pendingExportDestPath, QString());
+                const bool isPkgFile = std::exchange(m_pendingExportIsPkgFile, false);
+                if (stagePath.isEmpty() || destPath.isEmpty()) {
+                    return;
+                }
+
+                auto cleanupStage = [&stagePath]() {
+                    std::error_code ec;
+                    const std::filesystem::path sp(stagePath.toStdString());
+                    std::filesystem::remove_all(sp, ec);
+                };
+
+                if (resp.status_code != 0) {
+                    cleanupStage();
+                    const QString err = QString::fromUtf8(resp.error_msg);
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Scene export failed: %1")
+                                .arg(err.isEmpty() ? QStringLiteral("daemon error") : err));
+                    }
+                    return;
+                }
+
+                std::error_code ec;
+                if (isPkgFile) {
+                    QString srcFile;
+                    if (QFileInfo(stagePath).isFile()) {
+                        srcFile = stagePath;
+                    } else if (QFileInfo(stagePath + QStringLiteral("/scene.pkg")).isFile()) {
+                        srcFile = stagePath + QStringLiteral("/scene.pkg");
+                    }
+                    if (srcFile.isEmpty()) {
+                        cleanupStage();
+                        if (m_statusLabel) {
+                            m_statusLabel->setText(QStringLiteral(
+                                "Scene export completed, but staged .pkg file was missing."));
+                        }
+                        return;
+                    }
+
+                    const QFileInfo destInfo(destPath);
+                    destInfo.dir().mkpath(QStringLiteral("."));
+                    const std::filesystem::path srcFs(srcFile.toStdString());
+                    const std::filesystem::path dstFs(destPath.toStdString());
+                    // Rename directly when on the same mount, or copy into a sibling temp
+                    // file and rename atomically across filesystems.
+                    std::filesystem::rename(srcFs, dstFs, ec);
+                    if (ec) {
+                        ec.clear();
+                        const std::filesystem::path tmpFs(
+                            (destPath + QStringLiteral(".tmp")).toStdString());
+                        std::filesystem::copy_file(
+                            srcFs, tmpFs, std::filesystem::copy_options::overwrite_existing, ec);
+                        if (!ec) {
+                            std::filesystem::rename(tmpFs, dstFs, ec);
+                        }
+                        if (ec) {
+                            std::error_code rmEc;
+                            std::filesystem::remove(tmpFs, rmEc);
+                        }
+                    }
+                    cleanupStage();
+                } else {
+                    const std::filesystem::path srcDir(stagePath.toStdString());
+                    const std::filesystem::path dstDir(destPath.toStdString());
+                    std::filesystem::create_directories(dstDir, ec);
+                    if (!ec) {
+                        std::filesystem::copy(srcDir, dstDir,
+                                              std::filesystem::copy_options::recursive |
+                                                  std::filesystem::copy_options::overwrite_existing,
+                                              ec);
+                    }
+                    cleanupStage();
+                }
+
+                if (m_statusLabel) {
+                    if (ec) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Failed to move exported scene to %1: %2")
+                                .arg(destPath, QString::fromStdString(ec.message())));
+                    } else {
+                        m_statusLabel->setText(
+                            QStringLiteral("Exported scene package: %1 (%2 bytes)")
+                                .arg(destPath)
+                                .arg(resp.total_bytes));
+                    }
+                }
+            });
+    }
 }
 
 void MainWindow::applyWallpaperPath(const QString &path)
@@ -1432,6 +1920,97 @@ void MainWindow::handleOpenPackagingWizard()
     });
 
     wizard->show();
+}
+
+void MainWindow::handleExportScenePackage()
+{
+    const QString destPath = QFileDialog::getSaveFileName(
+        this, QStringLiteral("Export Scene Package"), m_activeWallpaperPath,
+        QStringLiteral("Scene Packages (*.pkg *.wwpkg);;All Files (*)"));
+    if (destPath.isEmpty()) {
+        return;
+    }
+
+    const QString lowerDest = destPath.toLower();
+    const QFileInfo srcInfo(m_activeWallpaperPath);
+    const QString lowerSrc = m_activeWallpaperPath.toLower();
+
+    // Landlock-confined wwald can only write exports under the cache staging root,
+    // never directly into user wallpaper or config directories.
+    if (!lowerDest.endsWith(QStringLiteral(".wwpkg")) && m_ipcClient &&
+        m_ipcClient->isConnected()) {
+        QString cacheRoot = qEnvironmentVariable("XDG_CACHE_HOME");
+        if (cacheRoot.isEmpty()) {
+            cacheRoot = QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation);
+        }
+        if (cacheRoot.isEmpty()) {
+            cacheRoot = QDir::homePath() + QStringLiteral("/.cache");
+        }
+        const QString exportStageRoot = cacheRoot + QStringLiteral("/wwal/exports");
+        if (!QDir().mkpath(exportStageRoot)) {
+            if (m_statusLabel) {
+                m_statusLabel->setText(
+                    QStringLiteral("Failed to create export staging directory: %1")
+                        .arg(exportStageRoot));
+            }
+            return;
+        }
+
+        static uint64_t s_exportSeq = 0;
+        const bool isPkgFile = lowerDest.endsWith(QStringLiteral(".pkg"));
+        const QString tag = QStringLiteral("scene_%1_%2")
+                                .arg(QCoreApplication::applicationPid())
+                                .arg(++s_exportSeq);
+        const QString stagePath =
+            isPkgFile ? (exportStageRoot + QLatin1Char('/') + tag + QStringLiteral(".pkg"))
+                      : (exportStageRoot + QLatin1Char('/') + tag);
+
+        const uint32_t exportFlags =
+            isPkgFile ? (WE_EXPORT_PKG_FLAG_PACK_SCENE_PKG | WE_EXPORT_PKG_FLAG_DIRECT_PKG_FILE)
+                      : 0u;
+
+        m_pendingExportStagePath = stagePath;
+        m_pendingExportDestPath = destPath;
+        m_pendingExportIsPkgFile = isPkgFile;
+
+        const QString outName =
+            m_previewViewport ? m_previewViewport->selectedMonitor() : QStringLiteral("*");
+        if (!m_ipcClient->sendExportScenePkg(outName, stagePath, exportFlags)) {
+            m_pendingExportStagePath.clear();
+            m_pendingExportDestPath.clear();
+            m_pendingExportIsPkgFile = false;
+            if (m_statusLabel) {
+                m_statusLabel->setText(QStringLiteral("Failed to dispatch scene package export."));
+            }
+            return;
+        }
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Exporting scene package: %1").arg(destPath));
+        }
+        return;
+    }
+
+    auto *wizard = new CreatorPackagingWizard(this);
+    wizard->setAttribute(Qt::WA_DeleteOnClose);
+    if (!m_activeWallpaperPath.isEmpty() &&
+        (srcInfo.isDir() || lowerSrc.endsWith(QStringLiteral(".pkg")) ||
+         lowerSrc.endsWith(QStringLiteral(".tex")) ||
+         lowerSrc.endsWith(QStringLiteral("project.json")))) {
+        wizard->setSourcePath(m_activeWallpaperPath);
+    }
+    wizard->show();
+}
+
+void MainWindow::handleViewportToolModeChanged(int index)
+{
+    if (!m_previewViewport || index < 0 || index > 7) {
+        return;
+    }
+    const auto mode = static_cast<ViewportToolMode>(index);
+    m_previewViewport->setToolMode(mode);
+    if (index >= static_cast<int>(ViewportToolMode::BrushMask) && m_layoutManager) {
+        m_layoutManager->realizeLazyPanel(QStringLiteral("GpuBrushPainter"));
+    }
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)
