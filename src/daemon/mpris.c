@@ -662,10 +662,8 @@ static void reconcile_active_player(waywal_mpris_t *mpris, mpris_player_t *prefe
     if (!win || win->status == WAYWAL_MPRIS_STOPPED) {
         const char *p_name = win ? ((win->bus_name[0] != '\0') ? win->bus_name : win->owner) : "";
         if (win) {
-            strncpy(mpris->active_bus_name, win->bus_name, sizeof(mpris->active_bus_name) - 1);
-            mpris->active_bus_name[sizeof(mpris->active_bus_name) - 1] = '\0';
-            strncpy(mpris->active_sender, win->owner, sizeof(mpris->active_sender) - 1);
-            mpris->active_sender[sizeof(mpris->active_sender) - 1] = '\0';
+            snprintf(mpris->active_bus_name, sizeof(mpris->active_bus_name), "%s", win->bus_name);
+            snprintf(mpris->active_sender, sizeof(mpris->active_sender), "%s", win->owner);
         } else {
             mpris->active_sender[0] = '\0';
             mpris->active_bus_name[0] = '\0';
@@ -677,12 +675,10 @@ static void reconcile_active_player(waywal_mpris_t *mpris, mpris_player_t *prefe
                           mpris->meta.title[0] != '\0' || mpris->meta.artist[0] != '\0' ||
                           mpris->meta.album[0] != '\0' || mpris->meta.length_us != 0);
 
-        strncpy(mpris->meta.player_name, p_name, sizeof(mpris->meta.player_name) - 1);
-        mpris->meta.player_name[sizeof(mpris->meta.player_name) - 1] = '\0';
+        snprintf(mpris->meta.player_name, sizeof(mpris->meta.player_name), "%s", p_name);
         mpris->meta.playing = false;
         mpris->meta.status = WAYWAL_MPRIS_STOPPED;
-        strncpy(mpris->meta.playback_status, "Stopped", sizeof(mpris->meta.playback_status) - 1);
-        mpris->meta.playback_status[sizeof(mpris->meta.playback_status) - 1] = '\0';
+        snprintf(mpris->meta.playback_status, sizeof(mpris->meta.playback_status), "%s", "Stopped");
         mpris->meta.title[0] = '\0';
         mpris->meta.artist[0] = '\0';
         mpris->meta.album[0] = '\0';
@@ -1206,16 +1202,16 @@ void waywal_mpris_update_player_for_test(waywal_mpris_t *mpris, const char *bus_
         (new_status == WAYWAL_MPRIS_PLAYING && prev_status != WAYWAL_MPRIS_PLAYING);
 
     if (state->playback_status[0] != '\0') {
-        strncpy(slot->playback_status, state->playback_status, sizeof(slot->playback_status) - 1);
+        snprintf(slot->playback_status, sizeof(slot->playback_status), "%s",
+                 state->playback_status);
     } else {
         const char *status_str = "Stopped";
         if (new_status == WAYWAL_MPRIS_PLAYING)
             status_str = "Playing";
         else if (new_status == WAYWAL_MPRIS_PAUSED)
             status_str = "Paused";
-        strncpy(slot->playback_status, status_str, sizeof(slot->playback_status) - 1);
+        snprintf(slot->playback_status, sizeof(slot->playback_status), "%s", status_str);
     }
-    slot->playback_status[sizeof(slot->playback_status) - 1] = '\0';
 
     if (new_status == WAYWAL_MPRIS_STOPPED && prev_status != WAYWAL_MPRIS_STOPPED &&
         state->title[0] == '\0') {

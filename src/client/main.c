@@ -1197,7 +1197,13 @@ static void query_max_target_resolution(const cli_options_t *opts, uint32_t *out
     size_t to_read = resp.payload_size < sizeof(buf) - 1 ? resp.payload_size : sizeof(buf) - 1;
     size_t total = 0;
     while (total < to_read) {
-        ssize_t r = read(qfd, buf + total, to_read - total);
+        size_t rem = sizeof(buf) - 1 - total;
+        if (to_read - total < rem) {
+            rem = to_read - total;
+        }
+        if (rem == 0)
+            break;
+        ssize_t r = read(qfd, buf + total, rem);
         if (r < 0) {
             if (errno == EINTR)
                 continue;

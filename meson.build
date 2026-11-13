@@ -49,6 +49,9 @@ extra_c_args = cc.get_supported_arguments([
   '-ffunction-sections',
   '-fdata-sections',
 ])
+if cc.get_id() == 'gcc' and cc.version().version_compare('< 15.0')
+  extra_c_args += cc.get_supported_arguments(['-Wno-array-bounds', '-Wno-stringop-overflow', '-Wno-stringop-truncation'])
+endif
 add_project_arguments(extra_c_args, language: 'c')
 
 extra_link_args = cc.get_supported_link_arguments([

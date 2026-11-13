@@ -1422,7 +1422,12 @@ void VirtualizedGridWidget::setupUi()
     grid_layout->setContentsMargins(0, 0, 0, 0);
     grid_layout->setSpacing(4);
 
-    m_canvas = new GridGlCanvas(m_index, m_pool, m_hover, this);
+#if QT_VERSION < QT_VERSION_CHECK(6, 6, 0)
+    const bool offscreenNoGl = isOffscreenPlatform();
+#else
+    const bool offscreenNoGl = false;
+#endif
+    m_canvas = new GridGlCanvas(m_index, m_pool, m_hover, offscreenNoGl ? nullptr : this);
     m_scrollBar = new QScrollBar(Qt::Vertical, this);
     m_scrollBar->setVisible(false);
     m_scrollBar->setStyleSheet(

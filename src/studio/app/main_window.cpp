@@ -634,6 +634,10 @@ MainWindow::~MainWindow()
     if (m_ipcClient) {
         m_ipcClient->stop();
     }
+    if (m_previewViewport && !m_previewViewport->parent()) {
+        delete m_previewViewport;
+        m_previewViewport = nullptr;
+    }
 }
 
 MonitorTopologyBar *MainWindow::topologyBar() const { return m_topologyBar; }
@@ -720,20 +724,23 @@ void MainWindow::setupPanels()
     }
 
     // Panel 3 (Center Dock Top): GPU Preview Viewport
-    m_previewViewport = new GpuPreviewViewport(this);
-    m_previewViewport->setCommandBus(m_commandBus.get());
 #if QT_VERSION < QT_VERSION_CHECK(6, 6, 0)
     if (QGuiApplication::platformName() == QLatin1String("offscreen")) {
-        m_previewViewport->hide();
+        m_previewViewport = new GpuPreviewViewport(nullptr);
+        m_previewViewport->setCommandBus(m_commandBus.get());
         auto *offscreenPlaceholder = new QWidget(this);
         offscreenPlaceholder->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
         m_layoutManager->registerPanel(QStringLiteral("GpuPreviewViewport"), offscreenPlaceholder,
                                        QStringLiteral("Preview"), Qt::RightDockWidgetArea);
     } else {
+        m_previewViewport = new GpuPreviewViewport(this);
+        m_previewViewport->setCommandBus(m_commandBus.get());
         m_layoutManager->registerPanel(QStringLiteral("GpuPreviewViewport"), m_previewViewport,
                                        QStringLiteral("Preview"), Qt::RightDockWidgetArea);
     }
 #else
+    m_previewViewport = new GpuPreviewViewport(this);
+    m_previewViewport->setCommandBus(m_commandBus.get());
     m_layoutManager->registerPanel(QStringLiteral("GpuPreviewViewport"), m_previewViewport,
                                    QStringLiteral("Preview"), Qt::RightDockWidgetArea);
 #endif
