@@ -272,6 +272,188 @@ static void test_gpu_compute_transitions(void)
     printf("[TEST] test_gpu_compute_transitions PASSED.\n");
 }
 
+static bool cube_pixel_is_void(uint32_t argb)
+{
+    uint32_t r = (argb >> 16) & 0xFFU;
+    uint32_t g = (argb >> 8) & 0xFFU;
+    uint32_t b = argb & 0xFFU;
+    return r <= 16U && g <= 16U && b <= 16U;
+}
+
+static int cube_max_channel_diff(uint32_t p0, uint32_t p1)
+{
+    int dr = abs((int)((p0 >> 16) & 0xFFU) - (int)((p1 >> 16) & 0xFFU));
+    int dg = abs((int)((p0 >> 8) & 0xFFU) - (int)((p1 >> 8) & 0xFFU));
+    int db = abs((int)(p0 & 0xFFU) - (int)(p1 & 0xFFU));
+    int d = dr > dg ? dr : dg;
+    return d > db ? d : db;
+}
+
+static void cube_find_row_span(const uint32_t *buf, uint32_t width, uint32_t y, int *out_x_min,
+                               int *out_x_max, int *out_interior_voids)
+{
+    const uint32_t *row = buf + (size_t)y * width;
+    int x_min = (int)width;
+    int x_max = -1;
+    for (uint32_t x = 0; x < width; ++x) {
+        if (!cube_pixel_is_void(row[x])) {
+            if ((int)x < x_min)
+                x_min = (int)x;
+            x_max = (int)x;
+        }
+    }
+    int voids = 0;
+    for (int x = x_min; x <= x_max; ++x) {
+        if (cube_pixel_is_void(row[x])) {
+            voids++;
+        }
+    }
+    *out_x_min = x_min;
+    *out_x_max = x_max;
+    *out_interior_voids = voids;
+}
+
+static void cube_check_geometry(const uint32_t *buf, uint32_t w, uint32_t h, float progress,
+                                const uint32_t *src_a, const uint32_t *src_b)
+{
+    int x_min = 0, x_max = -1, interior_voids = 0;
+    cube_find_row_span(buf, w, h / 2U, &x_min, &x_max, &interior_voids);
+    assert(x_max >= x_min);
+    assert(interior_voids == 0);
+
+    int span_w = x_max - x_min + 1;
+    if (progress < 0.01f || progress > 0.99f) {
+        assert(span_w >= (int)(0.99f * (float)w));
+        const uint32_t *expected = (progress < 0.5f) ? src_a : src_b;
+        for (uint32_t y = 4U; y + 4U < h; y += 8U) {
+            for (uint32_t x = 4U; x + 4U < w; x += 8U) {
+                assert(cube_max_channel_diff(buf[(size_t)y * w + x], expected[(size_t)y * w + x]) <=
+                       3);
+            }
+        }
+    }
+
+    if (fabsf(progress - 0.50f) < 1e-4f) {
+        float frac = (float)span_w / (float)w;
+        assert(frac >= 0.81f && frac <= 0.85f);
+        assert(abs((int)w - 1 - x_max - x_min) <= 1);
+        assert(cube_pixel_is_void(buf[w / 2U]));
+        assert(cube_pixel_is_void(buf[(size_t)(h - 1U) * w + (w / 2U)]));
+        assert(!cube_pixel_is_void(buf[(size_t)(0.08f * (float)h) * w + (w / 2U)]));
+        assert(!cube_pixel_is_void(buf[(size_t)(0.92f * (float)h) * w + (w / 2U)]));
+    }
+}
+
+static void test_cube_widescreen_geometry_and_gpu_parity(void)
+{
+    printf("[TEST] Running test_cube_widescreen_geometry_and_gpu_parity...\n");
+
+    const struct {
+        uint32_t w;
+        uint32_t h;
+        bool check_gpu;
+    } cases[] = {
+        {640U, 360U, true},  /* 16:9 widescreen */
+        {840U, 360U, true},  /* 21:9 ultrawide */
+        {360U, 360U, false}, /* 1:1 square */
+        {360U, 640U, true},  /* 9:16 portrait */
+    };
+    const float progresses[] = {0.0005f, 0.25f, 0.50f, 0.75f, 0.9995f};
+
+    dmabuf_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    render_engine_t re;
+    memset(&re, 0, sizeof(re));
+    bool has_gpu = dmabuf_context_init(&ctx) && render_engine_init(&re, &ctx) && re.has_gpu_compute;
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+        uint32_t w = cases[c].w;
+        uint32_t h = cases[c].h;
+        size_t n = (size_t)w * h;
+        uint32_t *src_a = (uint32_t *)malloc(n * sizeof(uint32_t));
+        uint32_t *src_b = (uint32_t *)malloc(n * sizeof(uint32_t));
+        uint32_t *dst_cpu = (uint32_t *)malloc(n * sizeof(uint32_t));
+        uint32_t *dst_gpu = (uint32_t *)malloc(n * sizeof(uint32_t));
+        assert(src_a && src_b && dst_cpu && dst_gpu);
+
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                uint8_t ga = (uint8_t)(40U + (180U * x) / (w - 1U));
+                uint8_t ba = (uint8_t)(40U + (80U * y) / (h - 1U));
+                src_a[(size_t)y * w + x] = 0xFF000000U | (200U << 16) | ((uint32_t)ga << 8) | ba;
+
+                uint8_t gb = (uint8_t)(80U + (140U * y) / (h - 1U));
+                uint8_t bb = (uint8_t)(180U + (70U * x) / (w - 1U));
+                src_b[(size_t)y * w + x] = 0xFF000000U | (30U << 16) | ((uint32_t)gb << 8) | bb;
+            }
+        }
+
+        uint32_t tex_old = 0, tex_new = 0, tex_target = 0, fbo = 0, cur_w = 0, cur_h = 0;
+        gpu_compute_ctx_t *gctx = has_gpu ? (gpu_compute_ctx_t *)re.gpu_ctx : NULL;
+        if (has_gpu && cases[c].check_gpu) {
+            assert(gpu_compute_prepare_shm(gctx, &tex_old, &tex_new, &tex_target, &fbo, &cur_w,
+                                           &cur_h, w, h, src_a, src_b));
+        }
+
+        for (size_t p_idx = 0; p_idx < sizeof(progresses) / sizeof(progresses[0]); ++p_idx) {
+            waywal_transition_params_t params = {
+                .type = WAYWAL_TRANSITION_CUBE,
+                .progress = progresses[p_idx],
+                .angle_rad = 0.0f,
+                .wave_freq = 20.0f,
+                .wave_amp = 0.05f,
+                .center_x = 0.5f,
+                .center_y = 0.5f,
+                .bezier = BEZIER_DEFAULT,
+            };
+
+            assert(render_engine_execute_cpu_transition(dst_cpu, src_a, src_b, w, h,
+                                                        w * sizeof(uint32_t), &params));
+            cube_check_geometry(dst_cpu, w, h, progresses[p_idx], src_a, src_b);
+
+            if (has_gpu && cases[c].check_gpu) {
+                assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo,
+                                                           w, h, &params, dst_gpu));
+                cube_check_geometry(dst_gpu, w, h, progresses[p_idx], src_a, src_b);
+
+                int cpu_x0 = 0, cpu_x1 = 0, cpu_voids = 0;
+                int gpu_x0 = 0, gpu_x1 = 0, gpu_voids = 0;
+                cube_find_row_span(dst_cpu, w, h / 2U, &cpu_x0, &cpu_x1, &cpu_voids);
+                cube_find_row_span(dst_gpu, w, h / 2U, &gpu_x0, &gpu_x1, &gpu_voids);
+                assert(abs(cpu_x0 - gpu_x0) <= 2);
+                assert(abs(cpu_x1 - gpu_x1) <= 2);
+
+                size_t close_pixels = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    if (cube_max_channel_diff(dst_cpu[i], dst_gpu[i]) <= 4) {
+                        close_pixels++;
+                    }
+                }
+                assert(close_pixels * 1000ULL >= n * 985ULL);
+            }
+        }
+
+        if (has_gpu && cases[c].check_gpu) {
+            gpu_compute_release_shm_res(gctx, &tex_old, &tex_new, &tex_target, &fbo);
+        }
+
+        free(dst_gpu);
+        free(dst_cpu);
+        free(src_b);
+        free(src_a);
+    }
+
+    if (re.gpu_ctx) {
+        render_engine_destroy(&re);
+    }
+    if (ctx.available) {
+        dmabuf_context_destroy(&ctx);
+    }
+
+    printf("[TEST] test_cube_widescreen_geometry_and_gpu_parity PASSED (gpu=%s).\n",
+           has_gpu ? "verified" : "skipped");
+}
+
 static void test_gpu_compute_nonlinear_and_upload_static(void)
 {
     printf("[TEST] Running test_gpu_compute_nonlinear_and_upload_static...\n");
@@ -844,6 +1026,7 @@ int main(void)
     test_simd_bit_exactness();
     test_cpu_transitions();
     test_gpu_compute_transitions();
+    test_cube_widescreen_geometry_and_gpu_parity();
     test_gpu_compute_nonlinear_and_upload_static();
     test_builtin_shader_presets_gles31();
     test_buffer_gated_transition_tick();

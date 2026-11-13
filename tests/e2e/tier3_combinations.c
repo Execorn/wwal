@@ -204,8 +204,25 @@ void run_tier3_cross_feature(void)
         bool ok = render_engine_execute_cpu_transition(d, a, b, w, h, w * sizeof(uint32_t), &p);
         bool c_ok = e2e_canary_check(d, n);
         bool v_ok = e2e_is_valid_argb_buffer(d, w, h, w);
-        E2E_CHECK(ok && c_ok && v_ok, "T3_07_res_unaligned_1366x768", "ok=%d canary=%d valid=%d",
-                  ok, c_ok, v_ok);
+        int x_min = (int)w, x_max = -1, interior_voids = 0;
+        const uint32_t *mid_row = d + (size_t)(h / 2) * w;
+        for (uint32_t x = 0; x < w; ++x) {
+            if (mid_row[x] != 0xFF08080DU) {
+                if ((int)x < x_min)
+                    x_min = (int)x;
+                x_max = (int)x;
+            }
+        }
+        for (int x = x_min; x <= x_max; ++x) {
+            if (mid_row[x] == 0xFF08080DU) {
+                interior_voids++;
+            }
+        }
+        bool span_ok = (x_max >= x_min) && ((x_max - x_min + 1) >= (int)(w * 80 / 100)) &&
+                       (interior_voids == 0);
+        E2E_CHECK(ok && c_ok && v_ok && span_ok, "T3_07_res_unaligned_1366x768",
+                  "ok=%d canary=%d valid=%d span_ok=%d span_w=%d voids=%d", ok, c_ok, v_ok, span_ok,
+                  x_max >= x_min ? (x_max - x_min + 1) : 0, interior_voids);
         e2e_canary_free(a);
         e2e_canary_free(b);
         e2e_canary_free(d);

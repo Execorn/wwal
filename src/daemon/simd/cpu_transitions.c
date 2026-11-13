@@ -2280,20 +2280,28 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
     }
 
     case WAYWAL_TRANSITION_CUBE: {
+        /* Keep camera focal length, Z-pullback, and culling synchronized with cube.comp. */
         float theta = progress * 1.57079632679f;
-        float zoom = 1.0f + 0.35f * sinf(progress * 3.1415926535f);
         float cos_t = cosf(theta);
         float sin_t = sinf(theta);
-        float d_cam = 2.5f;
+        const float d_cam = 2.5f;
+        const float z_pull = 0.75f;
+        float dist = (d_cam + 1.0f) + z_pull * sinf(progress * 3.14159265359f);
 
-        float ro_rel_z = -d_cam - 1.0f;
-        float ro_cube_x = -ro_rel_z * sin_t;
-        float ro_cube_z = ro_rel_z * cos_t;
+        float ro_cube_x = dist * sin_t;
+        float ro_cube_z = -dist * cos_t;
 
         float shade_front = 0.65f + 0.35f * cos_t;
         float shade_right = 0.65f + 0.35f * sin_t;
-        uint16_t wb_front = (uint16_t)(shade_front * 256.0f);
-        uint16_t wb_right = (uint16_t)(shade_right * 256.0f);
+        uint16_t wb_front = (uint16_t)(shade_front * 256.0f + 0.5f);
+        uint16_t wb_right = (uint16_t)(shade_right * 256.0f + 0.5f);
+        if (wb_front > 256U)
+            wb_front = 256U;
+        if (wb_right > 256U)
+            wb_right = 256U;
+
+        float inv_w = 1.0f / (float)width;
+        float inv_h = 1.0f / (float)height;
 
         int col_sx_stack[4096];
         float col_ky_stack[4096];
@@ -2312,8 +2320,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
         int right_x0 = (int)width, right_x1 = 0;
 
         for (uint32_t x = 0; x < width; ++x) {
-            float px = ((float)x / (float)width - 0.5f) * 2.0f;
-            float rdx = px * zoom;
+            float rdx = (((float)x + 0.5f) * inv_w - 0.5f) * 2.0f;
             float rdz = d_cam;
 
             float rd_cube_x = rdx * cos_t - rdz * sin_t;
@@ -2321,11 +2328,11 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
             float t_f = -1.0f;
             float hx = 0.0f;
-            if (fabsf(rd_cube_z) > 1e-5f) {
+            if (ro_cube_z < -1.0f && rd_cube_z > 1e-6f) {
                 float t = (-1.0f - ro_cube_z) / rd_cube_z;
                 if (t > 0.0f) {
                     hx = ro_cube_x + t * rd_cube_x;
-                    if (fabsf(hx) <= 1.0f) {
+                    if (hx >= -1.0f && hx <= 1.0f + 1e-5f) {
                         t_f = t;
                     }
                 }
@@ -2333,35 +2340,37 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
             float t_r = -1.0f;
             float hz = 0.0f;
-            if (fabsf(rd_cube_x) > 1e-5f) {
+            if (ro_cube_x > 1.0f && rd_cube_x < -1e-6f) {
                 float t = (1.0f - ro_cube_x) / rd_cube_x;
                 if (t > 0.0f) {
                     hz = ro_cube_z + t * rd_cube_z;
-                    if (fabsf(hz) <= 1.0f) {
+                    if (hz >= -1.0f - 1e-5f && hz <= 1.0f) {
                         t_r = t;
                     }
                 }
             }
 
-            if (t_f > 0.0f && (t_r < 0.0f || t_f < t_r)) {
-                int sx = (int)((hx * 0.5f + 0.5f) * (float)width);
+            if (t_f > 0.0f && (t_r < 0.0f || t_f <= t_r)) {
+                float u_f = clampf(hx * 0.5f + 0.5f, 0.0f, 1.0f);
+                int sx = (int)(u_f * (float)width);
                 if (sx < 0)
                     sx = 0;
                 else if (sx >= (int)width)
                     sx = (int)width - 1;
                 col_sx[x] = sx;
-                col_ky[x] = zoom * t_f;
+                col_ky[x] = t_f;
                 if ((int)x < front_x0)
                     front_x0 = (int)x;
                 front_x1 = (int)x + 1;
             } else if (t_r > 0.0f) {
-                int sx = (int)(((hz + 1.0f) * 0.5f) * (float)width);
+                float u_r = clampf(hz * 0.5f + 0.5f, 0.0f, 1.0f);
+                int sx = (int)(u_r * (float)width);
                 if (sx < 0)
                     sx = 0;
                 else if (sx >= (int)width)
                     sx = (int)width - 1;
                 col_sx[x] = sx;
-                col_ky[x] = zoom * t_r;
+                col_ky[x] = t_r;
                 if ((int)x < right_x0)
                     right_x0 = (int)x;
                 right_x1 = (int)x + 1;
@@ -2379,7 +2388,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
 #pragma omp parallel for schedule(static, 8)
         for (uint32_t y = 0; y < height; ++y) {
-            float py = ((float)y / (float)height - 0.5f) * 2.0f;
+            float py = (((float)y + 0.5f) * inv_h - 0.5f) * 2.0f;
             float abs_py = fabsf(py);
             float y_scale = py * 0.5f * (float)height;
             uint32_t *dst_row = dst + (size_t)y * stride_pixels;
@@ -2425,7 +2434,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             int cursor = 0;
             if (xf0 < xf1) {
                 if (xf0 > cursor)
-                    fill_u32_span(dst_row + cursor, 0xFF08080CU, xf0 - cursor);
+                    fill_u32_span(dst_row + cursor, 0xFF08080DU, xf0 - cursor);
                 int x = xf0;
 #if !defined(WWAL_DISABLE_SIMD) && (defined(__x86_64__) || defined(_M_X64))
                 if (has_avx2 && xf1 - x >= 8) {
@@ -2447,7 +2456,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
 
             if (xr0 < xr1) {
                 if (xr0 > cursor)
-                    fill_u32_span(dst_row + cursor, 0xFF08080CU, xr0 - cursor);
+                    fill_u32_span(dst_row + cursor, 0xFF08080DU, xr0 - cursor);
                 int x = xr0;
 #if !defined(WWAL_DISABLE_SIMD) && (defined(__x86_64__) || defined(_M_X64))
                 if (has_avx2 && xr1 - x >= 8) {
@@ -2468,7 +2477,7 @@ bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pix
             }
 
             if (cursor < (int)width) {
-                fill_u32_span(dst_row + cursor, 0xFF08080CU, (int)width - cursor);
+                fill_u32_span(dst_row + cursor, 0xFF08080DU, (int)width - cursor);
             }
         }
 
