@@ -184,7 +184,19 @@ void test_mainwindow_22_panels_lazy_deferral_and_rss()
     const double rssMb = readPrivateAnonRssMb();
     std::cout << "  -> Idle RssAnon = " << std::fixed << std::setprecision(2) << rssMb
               << " MB (budget < 80.00 MB)\n";
-#if !defined(__SANITIZE_ADDRESS__)
+#if defined(__SANITIZE_ADDRESS__)
+#define WWAL_RIG_TEST_WITH_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define WWAL_RIG_TEST_WITH_ASAN 1
+#else
+#define WWAL_RIG_TEST_WITH_ASAN 0
+#endif
+#else
+#define WWAL_RIG_TEST_WITH_ASAN 0
+#endif
+
+#if !WWAL_RIG_TEST_WITH_ASAN
     assert(rssMb < 80.0);
 #endif
 

@@ -253,11 +253,11 @@ bool hasValidVideoContainerHeader(const QString &filePath)
     if (!f.open(QIODevice::ReadOnly)) {
         return false;
     }
-    const QByteArray hdr = f.read(256);
-    if (hdr.size() < 12) {
+    uint8_t b[256]{};
+    const qint64 hdrSize = f.read(reinterpret_cast<char *>(b), sizeof(b));
+    if (hdrSize < 12) {
         return false;
     }
-    const auto *b = reinterpret_cast<const uint8_t *>(hdr.constData());
 
     /* Matroska / WebM EBML header */
     if (b[0] == 0x1Au && b[1] == 0x45u && b[2] == 0xDFu && b[3] == 0xA3u) {
@@ -279,7 +279,7 @@ bool hasValidVideoContainerHeader(const QString &filePath)
         }
     }
     /* MPEG-TS sync byte stride */
-    if (b[0] == 0x47u && hdr.size() >= 189 && b[188] == 0x47u) {
+    if (b[0] == 0x47u && hdrSize >= 189 && b[188] == 0x47u) {
         return true;
     }
     return false;

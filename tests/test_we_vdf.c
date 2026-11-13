@@ -592,7 +592,10 @@ static void test_appworkshop_50k_benchmark(void)
     assert(warm.item_count == item_count);
     waywal_appworkshop_free(&warm);
 
-#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
     const double budget_ms = 100.0;
 #else
     const double budget_ms = 5.0;

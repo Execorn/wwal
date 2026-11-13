@@ -3,11 +3,13 @@
 #include "gpu_preview_viewport.hpp"
 
 #include <QApplication>
+#include <QGuiApplication>
 #include <QCryptographicHash>
 #include <QPainter>
 #include <QPainterPath>
 #include <QMouseEvent>
 #include <QKeyEvent>
+#include <QResizeEvent>
 #include <QTabletEvent>
 #include <QWheelEvent>
 #include <QShowEvent>
@@ -43,6 +45,8 @@ extern "C" {
 namespace waywal::studio {
 
 namespace {
+
+bool isOffscreenPlatform() { return QGuiApplication::platformName() == QLatin1String("offscreen"); }
 
 struct Vertex {
     float x, y;
@@ -230,7 +234,7 @@ class GlContextScope {
   public:
     explicit GlContextScope(GpuPreviewViewport *vp) noexcept
     {
-        if (!vp || !vp->isValid() || !vp->context()) {
+        if (isOffscreenPlatform() || !vp || !vp->isValid() || !vp->context()) {
             return;
         }
         if (QOpenGLContext::currentContext() == vp->context()) {
@@ -672,6 +676,9 @@ void GpuPreviewViewport::ensureNeutralPassTexture()
 
 void GpuPreviewViewport::initializeGL()
 {
+    if (isOffscreenPlatform()) {
+        return;
+    }
     initializeOpenGLFunctions();
     resolveEglExtensions();
     setupQuadGeometry();
@@ -718,12 +725,24 @@ QSize GpuPreviewViewport::physicalFramebufferSize() const noexcept
 
 void GpuPreviewViewport::resizeGL(int w, int h)
 {
+    if (isOffscreenPlatform()) {
+        return;
+    }
     const QSize fbSize = physicalSizeFor(w, h);
     glViewport(0, 0, fbSize.width(), fbSize.height());
     if (m_previewMode == PreviewMode::InProcessShader) {
         ensureOffscreenFbo(fbSize.width(), fbSize.height());
         ensureBufferPassFbos(fbSize.width(), fbSize.height());
     }
+}
+
+void GpuPreviewViewport::resizeEvent(QResizeEvent *event)
+{
+    if (isOffscreenPlatform()) {
+        QWidget::resizeEvent(event);
+        return;
+    }
+    QOpenGLWidget::resizeEvent(event);
 }
 
 void GpuPreviewViewport::ensureOffscreenFbo(int w, int h)
@@ -1476,7 +1495,7 @@ void GpuPreviewViewport::setShaderUniform(const QString &name, float value)
 {
     ShaderUniformValue val;
     val.type = ShaderUniformValue::Type::Float;
-    val.fVals = {value};
+    val.fVals.assign(1, value);
     m_customUniforms[name.toStdString()] = std::move(val);
 }
 
@@ -1524,7 +1543,7 @@ void GpuPreviewViewport::setShaderUniform(const QString &name, int value)
 {
     ShaderUniformValue val;
     val.type = ShaderUniformValue::Type::Int;
-    val.iVals = {value};
+    val.iVals.assign(1, value);
     m_customUniforms[name.toStdString()] = std::move(val);
 }
 
@@ -1952,6 +1971,9 @@ void GpuPreviewViewport::updateFpsTelemetry()
 
 void GpuPreviewViewport::paintGL()
 {
+    if (isOffscreenPlatform()) {
+        return;
+    }
     // Reset any GL state left dirty by QOpenGL2PaintEngineEx (e.g. setClipPath stencil/scissor)
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -2081,7 +2103,7 @@ void GpuPreviewViewport::paintGL()
 
 void GpuPreviewViewport::paintEvent(QPaintEvent *event)
 {
-    if (isValid()) {
+    if (!isOffscreenPlatform() && isValid()) {
         if (m_fallbackCanvas && m_fallbackCanvas->isVisible()) {
             m_fallbackCanvas->hide();
         }
@@ -2847,7 +2869,11 @@ void GpuPreviewViewport::leaveEvent(QEvent *event)
 
 void GpuPreviewViewport::showEvent(QShowEvent *event)
 {
-    QOpenGLWidget::showEvent(event);
+    if (isOffscreenPlatform()) {
+        QWidget::showEvent(event);
+    } else {
+        QOpenGLWidget::showEvent(event);
+    }
     updateAnimationTimerState();
 }
 
@@ -2856,7 +2882,11 @@ void GpuPreviewViewport::hideEvent(QHideEvent *event)
     if (m_animationTimer && m_animationTimer->isActive()) {
         m_animationTimer->stop();
     }
-    QOpenGLWidget::hideEvent(event);
+    if (isOffscreenPlatform()) {
+        QWidget::hideEvent(event);
+    } else {
+        QOpenGLWidget::hideEvent(event);
+    }
 }
 
 void GpuPreviewViewport::onApplyClicked() { emit applyRequested(m_selectedMonitor); }

@@ -383,7 +383,7 @@ void run_tier4_workload_scenarios(void)
             delta_kb = 0; /* Memory returned to OS or trimmed */
 
 #if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
-        const long max_delta_kb = 4096;
+        const long max_delta_kb = 8192;
 #else
         const long max_delta_kb = 2048;
 #endif

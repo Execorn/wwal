@@ -32,7 +32,10 @@ extern char *fuzz_wwpkg_jcs_canonicalize_sym(const char *json_src, size_t len,
                                              size_t *out_len) __asm__("wwpkg_jcs_canonicalize")
     __attribute__((weak));
 
-#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
 __attribute__((visibility("default"))) const char *__asan_default_options(void);
 __attribute__((visibility("default"))) const char *__asan_default_options(void)
 {

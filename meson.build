@@ -82,6 +82,9 @@ extra_cpp_args = cpp.get_supported_arguments([
   '-ffunction-sections',
   '-fdata-sections',
 ])
+if cpp.get_id() == 'gcc' and cpp.version().version_compare('< 15.0')
+  extra_cpp_args += cpp.get_supported_arguments(['-Wno-array-bounds', '-Wno-stringop-overflow'])
+endif
 add_project_arguments(extra_cpp_args, language: 'cpp')
 
 extra_cpp_link_args = cpp.get_supported_link_arguments([

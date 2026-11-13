@@ -302,6 +302,7 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
   protected:
     void initializeGL() override;
     void resizeGL(int w, int h) override;
+    void resizeEvent(QResizeEvent *event) override;
     void paintGL() override;
     void paintEvent(QPaintEvent *event) override;
 

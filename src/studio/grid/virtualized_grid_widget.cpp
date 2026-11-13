@@ -1458,7 +1458,18 @@ void VirtualizedGridWidget::setupUi()
         }
     });
 
+#if QT_VERSION < QT_VERSION_CHECK(6, 6, 0)
+    if (isOffscreenPlatform()) {
+        m_canvas->hide();
+        auto *offscreenPlaceholder = new QWidget(this);
+        offscreenPlaceholder->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        grid_layout->addWidget(offscreenPlaceholder, 1);
+    } else {
+        grid_layout->addWidget(m_canvas, 1);
+    }
+#else
     grid_layout->addWidget(m_canvas, 1);
+#endif
     grid_layout->addWidget(m_scrollBar);
     root_layout->addLayout(grid_layout, 1);
 
