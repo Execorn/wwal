@@ -13,6 +13,8 @@
 #define _GNU_SOURCE
 #endif
 
+#include "waywal/ipc_proto_authoring.h"
+#include "waywal/os_compat.h"
 #include "waywal/we_vdf.h"
 #include "waywal/we_appworkshop.h"
 #include "waywal/we_compat_scanner.h"
@@ -21,11 +23,21 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <linux/landlock.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
 
 #define COLOR_GREEN "\033[32m"
 #define COLOR_RED   "\033[31m"
@@ -672,6 +684,268 @@ static void test_vdf_control_byte_non_whitespace_lanes(void)
 }
 
 /* =========================================================================
+ * Part 4: Export Confinement, Landlock No-Exec & Sanitizer Sandbox Gating
+ * ========================================================================= */
+
+static void test_export_path_and_openat2_confinement(void)
+{
+    printf(COLOR_CYAN "[TEST] Export Allowlist, wall..png & openat2 Confinement..." COLOR_RESET
+                      "\n");
+
+    char root_tmp[128] = "/tmp/wwal_wsec_XXXXXX";
+    char *mk = mkdtemp(root_tmp);
+    TEST_ASSERT(mk != NULL, "mkdtemp for workshop security sandbox fixture failed");
+    if (!mk) {
+        return;
+    }
+
+    char cache_dir[PATH_MAX], wwal_dir[PATH_MAX], exports_dir[PATH_MAX];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", root_tmp);
+    snprintf(wwal_dir, sizeof(wwal_dir), "%s/cache/wwal", root_tmp);
+    snprintf(exports_dir, sizeof(exports_dir), "%s/cache/wwal/exports", root_tmp);
+    TEST_ASSERT(mkdir(cache_dir, 0700) == 0, "mkdir cache_dir");
+    TEST_ASSERT(mkdir(wwal_dir, 0700) == 0, "mkdir wwal_dir");
+    TEST_ASSERT(mkdir(exports_dir, 0700) == 0, "mkdir exports_dir");
+
+    const char *prev_xdg_cache = getenv("XDG_CACHE_HOME");
+    char *saved_xdg = prev_xdg_cache ? strdup(prev_xdg_cache) : NULL;
+    setenv("XDG_CACHE_HOME", cache_dir, 1);
+
+    char resolved[PATH_MAX];
+    char tmp_dot_export[128];
+    snprintf(tmp_dot_export, sizeof(tmp_dot_export), "/tmp/wwal-export-wall..%d.png",
+             (int)getpid());
+    TEST_ASSERT(waywal_ipc_export_path_is_allowed(tmp_dot_export, resolved, sizeof(resolved)),
+                "/tmp/wwal-export-wall..png must not be rejected as traversal");
+
+    char cache_dot_export[PATH_MAX];
+    snprintf(cache_dot_export, sizeof(cache_dot_export), "%s/sub/wall..mdl", exports_dir);
+    TEST_ASSERT(waywal_ipc_export_path_is_allowed(cache_dot_export, resolved, sizeof(resolved)),
+                "$XDG_CACHE_HOME/wwal/exports/sub/wall..mdl must be allowlisted");
+
+    char trav_export[PATH_MAX];
+    snprintf(trav_export, sizeof(trav_export), "%s/../../etc/passwd", exports_dir);
+    TEST_ASSERT(!waywal_ipc_export_path_is_allowed(trav_export, resolved, sizeof(resolved)),
+                "Path traversal outside exports root must fail allowlist validation");
+    TEST_ASSERT(!waywal_ipc_export_path_is_allowed("/etc/passwd", resolved, sizeof(resolved)),
+                "Arbitrary /etc/passwd export destination must fail allowlist validation");
+    TEST_ASSERT(
+        !waywal_ipc_export_path_is_allowed("/tmp/wwal-export-/a.mdl", resolved, sizeof(resolved)),
+        "Empty-suffix /tmp/wwal-export-/a.mdl must fail allowlist validation");
+    TEST_ASSERT(
+        !waywal_ipc_export_path_is_allowed("/tmp/other-dir/a.mdl", resolved, sizeof(resolved)),
+        "Non-export /tmp/other-dir/a.mdl must fail allowlist validation");
+
+    int exp_fd = open(exports_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    TEST_ASSERT(exp_fd >= 0, "open(exports_dir) failed");
+    if (exp_fd >= 0) {
+        int good_fd = wwal_openat2_beneath(exp_fd, "wall..png", O_WRONLY | O_CREAT | O_EXCL, 0644);
+        TEST_ASSERT(good_fd >= 0, "wwal_openat2_beneath must allow filename 'wall..png'");
+        if (good_fd >= 0) {
+            close(good_fd);
+            unlinkat(exp_fd, "wall..png", 0);
+        }
+
+        int esc_fd = wwal_openat2_beneath(exp_fd, "../escape", O_WRONLY | O_CREAT, 0644);
+        TEST_ASSERT(esc_fd < 0, "wwal_openat2_beneath must reject '..' traversal segment");
+        if (esc_fd >= 0) {
+            close(esc_fd);
+        }
+
+        TEST_ASSERT(symlinkat("/etc/passwd", exp_fd, "sym_escape") == 0, "symlinkat fixture");
+        int sym_fd = wwal_openat2_beneath(exp_fd, "sym_escape", O_RDONLY, 0);
+        TEST_ASSERT(sym_fd < 0, "wwal_openat2_beneath must refuse symlinks");
+        if (sym_fd >= 0) {
+            close(sym_fd);
+        }
+        unlinkat(exp_fd, "sym_escape", 0);
+        close(exp_fd);
+    }
+
+    if (saved_xdg) {
+        setenv("XDG_CACHE_HOME", saved_xdg, 1);
+        free(saved_xdg);
+    } else {
+        unsetenv("XDG_CACHE_HOME");
+    }
+    rmdir(exports_dir);
+    rmdir(wwal_dir);
+    rmdir(cache_dir);
+    rmdir(root_tmp);
+    printf("  -> Export path validation & openat2 confinement passed.\n");
+}
+
+static void test_landlock_tmp_noexec_and_export(void)
+{
+    printf(COLOR_CYAN "[TEST] Active Landlock ABI + No-Exec + /tmp Export..." COLOR_RESET "\n");
+
+#ifdef SYS_landlock_create_ruleset
+    int abi = (int)syscall(SYS_landlock_create_ruleset, NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (abi <= 0) {
+        printf("  -> Landlock unsupported on kernel; skipping syscall probe.\n");
+        return;
+    }
+
+    char leaf[96];
+    snprintf(leaf, sizeof(leaf), "wwal-export-ll..%d.mdl", (int)getpid());
+    char abs_path[256];
+    snprintf(abs_path, sizeof(abs_path), "/tmp/%s", leaf);
+    unlink(abs_path);
+
+    pid_t pid = fork();
+    TEST_ASSERT(pid >= 0, "fork for Landlock confinement test");
+    if (pid == 0) {
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+            _exit(1);
+        }
+        struct landlock_ruleset_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE |
+                                 LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_WRITE_FILE |
+                                 LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE;
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+        if (abi >= 3) {
+            attr.handled_access_fs |= LANDLOCK_ACCESS_FS_TRUNCATE;
+        }
+#endif
+        int rs = (int)syscall(SYS_landlock_create_ruleset, &attr, sizeof(attr), 0);
+        if (rs < 0) {
+            _exit(2);
+        }
+        int tmp_dfd = open("/tmp", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (tmp_dfd < 0) {
+            close(rs);
+            _exit(3);
+        }
+        struct landlock_path_beneath_attr pa = {
+            .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
+                              LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_MAKE_REG |
+                              LANDLOCK_ACCESS_FS_REMOVE_FILE,
+            .parent_fd = tmp_dfd,
+        };
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+        if (abi >= 3) {
+            pa.allowed_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+        }
+#endif
+        if (syscall(SYS_landlock_add_rule, rs, LANDLOCK_RULE_PATH_BENEATH, &pa, 0) != 0) {
+            close(tmp_dfd);
+            close(rs);
+            _exit(4);
+        }
+        close(tmp_dfd);
+        if (syscall(SYS_landlock_restrict_self, rs, 0) != 0) {
+            close(rs);
+            _exit(5);
+        }
+        close(rs);
+
+        /* Under Landlock: open("/") fails, openat2 under /tmp succeeds, execve fails EACCES */
+        int root_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (root_fd >= 0) {
+            close(root_fd);
+            _exit(6);
+        }
+        int w_tmp = open("/tmp", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (w_tmp < 0) {
+            _exit(7);
+        }
+        int out_fd = wwal_openat2_beneath(w_tmp, leaf, O_WRONLY | O_CREAT | O_EXCL, 0755);
+        if (out_fd < 0) {
+            close(w_tmp);
+            _exit(8);
+        }
+        static const char k_sh[] = "#!/bin/sh\nexit 0\n";
+        ssize_t wn = write(out_fd, k_sh, sizeof(k_sh) - 1u);
+        close(out_fd);
+        if (wn != (ssize_t)(sizeof(k_sh) - 1u)) {
+            unlinkat(w_tmp, leaf, 0);
+            close(w_tmp);
+            _exit(9);
+        }
+        char *const argv_e[] = {abs_path, NULL};
+        char *const env_e[] = {NULL};
+        execve(abs_path, argv_e, env_e);
+        int ex_err = errno;
+        unlinkat(w_tmp, leaf, 0);
+        close(w_tmp);
+        _exit(ex_err == EACCES ? 0 : 10);
+    }
+
+    int st = 0;
+    TEST_ASSERT(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+                "Active Landlock must allow openat2 /tmp export and deny open(\"/\") + execve");
+    unlink(abs_path);
+    printf("  -> Active Landlock ABI + noexec + /tmp export passed.\n");
+#else
+    printf("  -> SYS_landlock_create_ruleset unavailable in headers; skipped.\n");
+#endif
+}
+
+static void test_wwald_no_sandbox_cli_contract(void)
+{
+    printf(COLOR_CYAN "[TEST] Daemon --no-sandbox Sanitizer Gating..." COLOR_RESET "\n");
+
+    char exe[PATH_MAX];
+    ssize_t elen = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (elen <= 0) {
+        return;
+    }
+    exe[elen] = '\0';
+    char *slash = strrchr(exe, '/');
+    if (!slash) {
+        return;
+    }
+    *slash = '\0';
+
+    char wwald_path[PATH_MAX];
+    const char *cands[2] = {"../wwald", "wwald"};
+    bool found = false;
+    for (size_t i = 0; i < 2; ++i) {
+        int n = snprintf(wwald_path, sizeof(wwald_path), "%s/%s", exe, cands[i]);
+        if (n > 0 && (size_t)n < sizeof(wwald_path) && access(wwald_path, X_OK) == 0) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        printf("  -> wwald binary not co-located; skipping CLI probe.\n");
+        return;
+    }
+
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_LEAK__) ||                                 \
+    __has_feature(address_sanitizer) || __has_feature(leak_sanitizer)
+    const bool expect_allowed = true;
+#else
+    const bool expect_allowed = false;
+#endif
+
+    pid_t pid = fork();
+    TEST_ASSERT(pid >= 0, "fork for wwald --no-sandbox CLI probe");
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        char *const argv_d[] = {wwald_path, "--no-sandbox", "--version", NULL};
+        execv(wwald_path, argv_d);
+        _exit(127);
+    }
+    int st = 0;
+    TEST_ASSERT(waitpid(pid, &st, 0) == pid && WIFEXITED(st), "wwald --no-sandbox waitpid");
+    if (expect_allowed) {
+        TEST_ASSERT(WEXITSTATUS(st) == 0,
+                    "Sanitizer build of wwald must accept --no-sandbox cleanly");
+    } else {
+        TEST_ASSERT(WEXITSTATUS(st) != 0,
+                    "Production/release build of wwald must reject --no-sandbox");
+    }
+    printf("  -> Daemon --no-sandbox CLI gating passed.\n");
+}
+
+/* =========================================================================
  * Main Entry Point
  * ========================================================================= */
 
@@ -697,6 +971,11 @@ int main(void)
     /* Part 3: AST Sandbox & Forbidden Globals Probing */
     test_ast_sandbox_forbidden_globals();
     test_ast_sandbox_infinite_loops();
+
+    /* Part 4: Export Confinement, Landlock No-Exec & Sanitizer Sandbox Gating */
+    test_export_path_and_openat2_confinement();
+    test_landlock_tmp_noexec_and_export();
+    test_wwald_no_sandbox_cli_contract();
 
     printf("==========================================================\n");
     if (g_tests_failed == 0) {

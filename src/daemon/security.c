@@ -58,7 +58,11 @@ static void mkdir_p_mode(const char *path, mode_t mode)
     if (!path || !path[0])
         return;
     char tmp[4096];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    int n = snprintf(tmp, sizeof(tmp), "%s", path);
+    if (n <= 0 || (size_t)n >= sizeof(tmp)) {
+        WAYWAL_LOG_WARN("Security: ignoring oversized directory path during sandbox setup");
+        return;
+    }
     for (char *p = tmp + 1; *p; ++p) {
         if (*p == '/') {
             *p = '\0';
@@ -121,7 +125,9 @@ static bool is_sensitive_target_path(const char *path)
         return true;
 
     char norm_path[4096];
-    snprintf(norm_path, sizeof(norm_path), "%s", path);
+    int pn = snprintf(norm_path, sizeof(norm_path), "%s", path);
+    if (pn <= 0 || (size_t)pn >= sizeof(norm_path))
+        return true;
     waywal_normalize_path(norm_path);
 
     char resolved_buf[4096];
@@ -219,7 +225,9 @@ static bool is_sensitive_ancestor(const char *path)
         return true;
 
     char norm_path[4096];
-    snprintf(norm_path, sizeof(norm_path), "%s", path);
+    int pn = snprintf(norm_path, sizeof(norm_path), "%s", path);
+    if (pn <= 0 || (size_t)pn >= sizeof(norm_path))
+        return true;
     waywal_normalize_path(norm_path);
 
     if (is_sensitive_target_path(norm_path) || is_single_sensitive_ancestor_str(norm_path))
@@ -234,7 +242,9 @@ static bool is_sensitive_ancestor(const char *path)
     } else {
         /* Walk up to nearest existing ancestor to catch symlinked parent directories */
         char probe[4096];
-        snprintf(probe, sizeof(probe), "%s", norm_path);
+        int prn = snprintf(probe, sizeof(probe), "%s", norm_path);
+        if (prn <= 0 || (size_t)prn >= sizeof(probe))
+            return true;
         while (probe[0] == '/' && strcmp(probe, "/") != 0) {
             char *slash = strrchr(probe, '/');
             if (!slash || slash == probe)
@@ -260,45 +270,261 @@ static bool is_sensitive_ancestor(const char *path)
     return false;
 }
 
-static void add_landlock_dir_rule(int ruleset_fd, const char *path, __u64 allowed_access)
+int security_landlock_probe_abi(void)
 {
-    if (ruleset_fd < 0 || !path || !path[0])
-        return;
-    if (is_sensitive_target_path(path))
-        return;
-    int dir_fd = open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
-    if (dir_fd >= 0) {
-        struct landlock_path_beneath_attr path_attr = {
-            .allowed_access = allowed_access,
-            .parent_fd = dir_fd,
-        };
-        landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
-        close(dir_fd);
-    } else {
-        int file_fd = open(path, O_PATH | O_CLOEXEC);
-        if (file_fd >= 0) {
-            struct landlock_path_beneath_attr path_attr = {
-                .allowed_access =
-                    allowed_access & (LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE |
-                                      LANDLOCK_ACCESS_FS_EXECUTE),
-                .parent_fd = file_fd,
-            };
-            if (path_attr.allowed_access != 0) {
-                landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
-            }
-            close(file_fd);
-        }
-    }
+    return landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
 }
 
-static void add_landlock_share_root_excluding_keyrings(int ruleset_fd, const char *share_root,
-                                                       __u64 ro_access)
+uint64_t security_landlock_handled_fs_mask(int abi)
 {
-    if (ruleset_fd < 0 || !share_root || share_root[0] == '\0')
+    if (abi <= 0) {
+        return 0u;
+    }
+    uint64_t mask = (uint64_t)(LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE |
+                               LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
+                               LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+                               LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_DIR |
+                               LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_SOCK |
+                               LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
+                               LANDLOCK_ACCESS_FS_MAKE_SYM);
+#ifdef LANDLOCK_ACCESS_FS_REFER
+    if (abi >= 2) {
+        mask |= (uint64_t)LANDLOCK_ACCESS_FS_REFER;
+    }
+#endif
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+    if (abi >= 3) {
+        mask |= (uint64_t)LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
+#endif
+#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
+    if (abi >= 5) {
+        mask |= (uint64_t)LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    }
+#endif
+    return mask;
+}
+
+uint64_t security_landlock_writable_fs_mask(int abi)
+{
+    if (abi <= 0) {
+        return 0u;
+    }
+    /* Writable cache/config/state/tmp directories must never retain execute permission so staged
+     * payloads cannot be executed directly under confinement. */
+    uint64_t mask = (uint64_t)(LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
+                               LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_REMOVE_DIR |
+                               LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_MAKE_DIR |
+                               LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_SOCK);
+#ifdef LANDLOCK_ACCESS_FS_REFER
+    if (abi >= 2) {
+        mask |= (uint64_t)LANDLOCK_ACCESS_FS_REFER;
+    }
+#endif
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+    if (abi >= 3) {
+        mask |= (uint64_t)LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
+#endif
+    mask &= ~(uint64_t)LANDLOCK_ACCESS_FS_EXECUTE;
+    return mask;
+}
+
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+    __u64 allowed_access;
+    bool is_dir;
+    char path[4096];
+} landlock_rule_entry_t;
+
+typedef struct {
+    landlock_rule_entry_t *items;
+    size_t count;
+    size_t cap;
+    bool failed;
+} landlock_rule_vec_t;
+
+static void landlock_rule_vec_free(landlock_rule_vec_t *vec)
+{
+    if (!vec) {
         return;
-    DIR *sdir = opendir(share_root);
-    if (!sdir)
+    }
+    free(vec->items);
+    vec->items = NULL;
+    vec->count = 0u;
+    vec->cap = 0u;
+}
+
+static bool landlock_rule_vec_upsert(landlock_rule_vec_t *vec, dev_t dev, ino_t ino, __u64 access,
+                                     bool is_dir, const char *norm_path)
+{
+    for (size_t i = 0; i < vec->count; ++i) {
+        if (vec->items[i].dev == dev && vec->items[i].ino == ino) {
+            vec->items[i].allowed_access |= access;
+            return true;
+        }
+    }
+    if (vec->count == vec->cap) {
+        size_t new_cap = vec->cap == 0u ? 64u : vec->cap * 2u;
+        if (new_cap < vec->cap || new_cap > SIZE_MAX / sizeof(landlock_rule_entry_t)) {
+            vec->failed = true;
+            return false;
+        }
+        landlock_rule_entry_t *grown =
+            (landlock_rule_entry_t *)realloc(vec->items, new_cap * sizeof(landlock_rule_entry_t));
+        if (!grown) {
+            vec->failed = true;
+            return false;
+        }
+        vec->items = grown;
+        vec->cap = new_cap;
+    }
+    landlock_rule_entry_t *dst = &vec->items[vec->count++];
+    dst->dev = dev;
+    dst->ino = ino;
+    dst->allowed_access = access;
+    dst->is_dir = is_dir;
+    int pn = snprintf(dst->path, sizeof(dst->path), "%s", norm_path);
+    if (pn <= 0 || (size_t)pn >= sizeof(dst->path)) {
+        vec->count--;
+        vec->failed = true;
+        return false;
+    }
+    return true;
+}
+
+static bool is_system_usrmerge_link(const char *path)
+{
+    return strcmp(path, "/bin") == 0 || strcmp(path, "/sbin") == 0 || strcmp(path, "/lib") == 0 ||
+           strcmp(path, "/lib64") == 0;
+}
+
+static void collect_landlock_rule(landlock_rule_vec_t *vec, const char *path, __u64 allowed_access,
+                                  bool dir_only)
+{
+    if (!vec || vec->failed || !path || !path[0] || allowed_access == 0u)
         return;
+
+    char norm_path[4096];
+    int pn = snprintf(norm_path, sizeof(norm_path), "%s", path);
+    if (pn <= 0 || (size_t)pn >= sizeof(norm_path)) {
+        WAYWAL_LOG_ERR("Security: Landlock rule path exceeds buffer length");
+        vec->failed = true;
+        return;
+    }
+    waywal_normalize_path(norm_path);
+    if (is_sensitive_target_path(norm_path))
+        return;
+
+    bool is_dir = true;
+    __u64 effective_access = allowed_access;
+    int fd = open(norm_path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        int dir_err = errno;
+        if (dir_err == ELOOP) {
+            if (!is_system_usrmerge_link(norm_path)) {
+                WAYWAL_LOG_WARN("Security: refusing symlink Landlock rule target '%s'", norm_path);
+            }
+            return;
+        }
+        if (!dir_only && dir_err == ENOTDIR) {
+            fd = open(norm_path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+            if (fd < 0) {
+                if (errno == ELOOP) {
+                    WAYWAL_LOG_WARN("Security: refusing symlink Landlock file target '%s'",
+                                    norm_path);
+                }
+                return;
+            }
+            struct stat fst;
+            /* O_PATH | O_NOFOLLOW without O_DIRECTORY opens a symlink itself, so enforce
+             * S_ISREG before recording any file rule. */
+            if (fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
+                close(fd);
+                return;
+            }
+            is_dir = false;
+            effective_access =
+                allowed_access & (LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE |
+                                  LANDLOCK_ACCESS_FS_EXECUTE);
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+            effective_access |= (allowed_access & LANDLOCK_ACCESS_FS_TRUNCATE);
+#endif
+            if (effective_access == 0u ||
+                !landlock_rule_vec_upsert(vec, fst.st_dev, fst.st_ino, effective_access, false,
+                                          norm_path)) {
+                close(fd);
+                return;
+            }
+            close(fd);
+            return;
+        }
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        close(fd);
+        return;
+    }
+    (void)landlock_rule_vec_upsert(vec, st.st_dev, st.st_ino, effective_access, is_dir, norm_path);
+    close(fd);
+}
+
+static bool commit_landlock_rules(int ruleset_fd, const landlock_rule_vec_t *vec)
+{
+    if (ruleset_fd < 0 || !vec || vec->failed) {
+        return false;
+    }
+    for (size_t i = 0; i < vec->count; ++i) {
+        const landlock_rule_entry_t *entry = &vec->items[i];
+        int open_flags = entry->is_dir ? (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                                       : (O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        int fd = open(entry->path, open_flags);
+        if (fd < 0) {
+            WAYWAL_LOG_ERR("Security: failed to open Landlock target '%s': %s", entry->path,
+                           strerror(errno));
+            return false;
+        }
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_dev != entry->dev || st.st_ino != entry->ino ||
+            (entry->is_dir ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode))) {
+            WAYWAL_LOG_ERR("Security: Landlock target '%s' changed identity before rule commit",
+                           entry->path);
+            close(fd);
+            return false;
+        }
+        struct landlock_path_beneath_attr path_attr = {
+            .allowed_access = entry->allowed_access,
+            .parent_fd = fd,
+        };
+        int rc = landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
+        int add_err = errno;
+        close(fd);
+        if (rc != 0) {
+            WAYWAL_LOG_ERR("Security: landlock_add_rule failed for '%s': %s", entry->path,
+                           strerror(add_err));
+            return false;
+        }
+    }
+    return true;
+}
+
+static void add_landlock_share_root_excluding_keyrings(landlock_rule_vec_t *vec,
+                                                       const char *share_root, __u64 ro_access,
+                                                       __u64 rw_access)
+{
+    if (!vec || vec->failed || !share_root || share_root[0] == '\0')
+        return;
+    int rfd = open(share_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (rfd < 0)
+        return;
+    DIR *sdir = fdopendir(rfd);
+    if (!sdir) {
+        close(rfd);
+        return;
+    }
     struct dirent *sent;
     char child_path[4096];
     while ((sent = readdir(sdir)) != NULL) {
@@ -306,19 +532,48 @@ static void add_landlock_share_root_excluding_keyrings(int ruleset_fd, const cha
             strcmp(sent->d_name, "keyrings") == 0)
             continue;
         int n = snprintf(child_path, sizeof(child_path), "%s/%s", share_root, sent->d_name);
-        if (n > 0 && (size_t)n < sizeof(child_path)) {
-            add_landlock_dir_rule(ruleset_fd, child_path, ro_access);
+        if (n <= 0 || (size_t)n >= sizeof(child_path)) {
+            WAYWAL_LOG_ERR("Security: oversized XDG_DATA_HOME child path under '%s'", share_root);
+            vec->failed = true;
+            break;
         }
+        __u64 access = (strcmp(sent->d_name, "wwal") == 0) ? rw_access : ro_access;
+        collect_landlock_rule(vec, child_path, access, false);
     }
     closedir(sdir);
 }
 
-static void apply_landlock_sandbox(const char *runtime_dir)
+static bool format_joined_path(char *dst, size_t cap, const char *base, const char *suffix,
+                               landlock_rule_vec_t *vec)
 {
-    int abi = landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
-    if (abi <= 0) {
-        WAYWAL_LOG_DEBUG("Landlock LSM not available on current kernel");
-        return;
+    int n = snprintf(dst, cap, "%s/%s", base, suffix);
+    if (n <= 0 || (size_t)n >= cap) {
+        WAYWAL_LOG_ERR("Security: truncated sandbox path '%s/%s'", base ? base : "",
+                       suffix ? suffix : "");
+        if (vec) {
+            vec->failed = true;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool apply_landlock_sandbox(const char *runtime_dir)
+{
+    int abi = security_landlock_probe_abi();
+    if (abi < 0) {
+        int probe_err = errno;
+        if (probe_err == ENOSYS || probe_err == EOPNOTSUPP) {
+            WAYWAL_LOG_WARN("Security: Landlock LSM unsupported (%s); continuing without Landlock",
+                            strerror(probe_err));
+            return true;
+        }
+        WAYWAL_LOG_ERR("Security: Landlock ABI probe failed: %s", strerror(probe_err));
+        return false;
+    }
+    if (abi == 0) {
+        WAYWAL_LOG_ERR("Security: invalid Landlock ABI version 0");
+        return false;
     }
 
     char home_buf[4096] = {0};
@@ -328,6 +583,8 @@ static void apply_landlock_sandbox(const char *runtime_dir)
         const char *pre_dirs[] = {
             ".cache",
             ".cache/wwal",
+            ".cache/wwal/exports",
+            ".cache/wwal/repairs",
             ".cache/wal",
             ".cache/swww",
             ".cache/awww",
@@ -338,140 +595,124 @@ static void apply_landlock_sandbox(const char *runtime_dir)
             ".local/state/caelestia",
             ".local/state/caelestia/wallpaper",
             ".local/share",
+            ".local/share/wwal",
             ".local/share/wallpapers",
             ".config",
             ".config/wwal",
+            ".config/waywal",
             "Pictures",
             "Videos",
             "Wallpapers",
         };
         for (size_t i = 0; i < sizeof(pre_dirs) / sizeof(pre_dirs[0]); ++i) {
-            snprintf(pre_path, sizeof(pre_path), "%s/%s", home, pre_dirs[i]);
-            mkdir_p_user_dir(pre_path);
+            int pn = snprintf(pre_path, sizeof(pre_path), "%s/%s", home, pre_dirs[i]);
+            if (pn > 0 && (size_t)pn < sizeof(pre_path)) {
+                mkdir_p_user_dir(pre_path);
+            }
         }
     }
 
     struct landlock_ruleset_attr attr;
     memset(&attr, 0, sizeof(attr));
-    attr.handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE |
-                             LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_WRITE_FILE |
-                             LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE;
+    attr.handled_access_fs = (__u64)security_landlock_handled_fs_mask(abi);
+#ifdef LANDLOCK_ACCESS_NET_BIND_TCP
+    if (abi >= 4) {
+        attr.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    }
+#endif
 
     int ruleset_fd = landlock_create_ruleset(&attr, sizeof(attr), 0);
     if (ruleset_fd < 0) {
-        return;
+        WAYWAL_LOG_ERR("Security: landlock_create_ruleset(ABI v%d) failed: %s", abi,
+                       strerror(errno));
+        return false;
     }
 
     const __u64 ro_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
     const __u64 rx_access = ro_access | LANDLOCK_ACCESS_FS_EXECUTE;
-    const __u64 rw_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
-                            LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_MAKE_REG |
-                            LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_EXECUTE;
+    const __u64 rw_access = (__u64)security_landlock_writable_fs_mask(abi);
+    const __u64 cache_rw_access = rw_access | LANDLOCK_ACCESS_FS_MAKE_SYM;
+    __u64 dev_access = rw_access;
+#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
+    if (abi >= 5) {
+        dev_access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    }
+#endif
 
-    /* Allow read+execute on standard system binary/library mounts for DRM/Mesa/VA-API and user
-     * hooks */
+    landlock_rule_vec_t rules = {0};
+
+    /* Standard system binary and library mounts for DRM/Mesa/VA-API and user hooks */
     const char *rx_paths[] = {"/usr", "/bin", "/sbin", "/lib", "/lib64", "/nix", "/opt", NULL};
     for (int i = 0; rx_paths[i] != NULL; ++i) {
-        add_landlock_dir_rule(ruleset_fd, rx_paths[i], rx_access);
+        collect_landlock_rule(&rules, rx_paths[i], rx_access, true);
     }
 
-    /* Allow read-only across standard system and external media mounts required for DRM/Mesa/VA-API
-     * drivers and wallpaper repositories */
-    const char *ro_paths[] = {"/etc",       "/sys",      "/proc", "/mnt", "/media",
-                              "/run/media", "/var/home", "/nix",  "/opt", NULL};
+    /* Read-only system and external media mounts */
+    const char *ro_paths[] = {"/etc",   "/sys",       "/proc",     "/mnt",
+                              "/media", "/run/media", "/var/home", NULL};
     for (int i = 0; ro_paths[i] != NULL; ++i) {
-        add_landlock_dir_rule(ruleset_fd, ro_paths[i], ro_access);
+        collect_landlock_rule(&rules, ro_paths[i], ro_access, true);
     }
 
-    /* Permit read-only access to external media mounts if present at sandbox init */
-    const char *ext_mounts[] = {"/media", "/run/media", "/mnt"};
-    for (size_t i = 0; i < sizeof(ext_mounts) / sizeof(ext_mounts[0]); ++i) {
-        struct stat st_m;
-        if (stat(ext_mounts[i], &st_m) == 0 && S_ISDIR(st_m.st_mode)) {
-            add_landlock_dir_rule(ruleset_fd, ext_mounts[i], ro_access);
-        }
-    }
     const char *cur_user = getenv("USER");
     if (cur_user && cur_user[0] != '\0') {
         char user_media[4096];
-        if (snprintf(user_media, sizeof(user_media), "/run/media/%s", cur_user) <
-            (int)sizeof(user_media)) {
+        if (format_joined_path(user_media, sizeof(user_media), "/run/media", cur_user, &rules)) {
             struct stat st_u;
             if (stat(user_media, &st_u) == 0 && S_ISDIR(st_u.st_mode)) {
-                add_landlock_dir_rule(ruleset_fd, user_media, ro_access);
+                collect_landlock_rule(&rules, user_media, ro_access, true);
             }
         }
     }
 
-    /* Allow read-write strictly for DRI/GPU device nodes (/dev, /dev/dri) and /tmp */
-    const char *rw_paths[] = {"/dev", "/dev/dri", "/tmp", NULL};
-    for (int i = 0; rw_paths[i] != NULL; ++i) {
-        if (strcmp(rw_paths[i], "/tmp") == 0 && home &&
-            strncmp(home, "/tmp/wwal_sbox_test_", 20) == 0) {
-            continue;
-        }
-        int dir_fd = open(rw_paths[i], O_PATH | O_DIRECTORY | O_CLOEXEC);
-        if (dir_fd < 0 && strcmp(rw_paths[i], "/dev/dri") == 0) {
-            dir_fd = open("/dev", O_PATH | O_DIRECTORY | O_CLOEXEC);
-        }
-        if (dir_fd >= 0) {
-            struct landlock_path_beneath_attr path_attr = {
-                .allowed_access = rw_access,
-                .parent_fd = dir_fd,
-            };
-            landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0);
-            close(dir_fd);
-        }
+    /* Allow device ioctls strictly under /dev and /dev/dri, and writable staging under /tmp */
+    collect_landlock_rule(&rules, "/dev", dev_access, true);
+    collect_landlock_rule(&rules, "/dev/dri", dev_access, true);
+    if (!(home && strncmp(home, "/tmp/wwal_sbox_test_", 20) == 0)) {
+        collect_landlock_rule(&rules, "/tmp", rw_access, true);
     }
 
-    /* Allow read-write in runtime directory for IPC socket management */
     const char *rt = runtime_dir ? runtime_dir : getenv("XDG_RUNTIME_DIR");
     if (rt && rt[0]) {
-        add_landlock_dir_rule(ruleset_fd, rt, rw_access);
+        collect_landlock_rule(&rules, rt, rw_access, true);
     }
 
     const char *xdg_cfg = getenv("XDG_CONFIG_HOME");
     if (xdg_cfg && xdg_cfg[0]) {
         mkdir_p_user_dir(xdg_cfg);
-        add_landlock_dir_rule(ruleset_fd, xdg_cfg, rw_access);
+        collect_landlock_rule(&rules, xdg_cfg, ro_access, true);
+        const char *cfg_rw_subdirs[] = {"wwal", "waywal"};
+        for (size_t i = 0; i < sizeof(cfg_rw_subdirs) / sizeof(cfg_rw_subdirs[0]); ++i) {
+            char cfg_sub[4096];
+            if (format_joined_path(cfg_sub, sizeof(cfg_sub), xdg_cfg, cfg_rw_subdirs[i], &rules)) {
+                mkdir_p_user_dir(cfg_sub);
+                collect_landlock_rule(&rules, cfg_sub, rw_access, true);
+            }
+        }
     }
 
     const char *xdg_data = getenv("XDG_DATA_HOME");
     if (xdg_data && xdg_data[0]) {
-        add_landlock_share_root_excluding_keyrings(ruleset_fd, xdg_data, rx_access);
+        add_landlock_share_root_excluding_keyrings(&rules, xdg_data, ro_access, rw_access);
     }
 
-    const char *xdg_pics = getenv("XDG_PICTURES_DIR");
-    if (xdg_pics && xdg_pics[0]) {
-        add_landlock_dir_rule(ruleset_fd, xdg_pics, ro_access);
-    }
-    const char *xdg_vids = getenv("XDG_VIDEOS_DIR");
-    if (xdg_vids && xdg_vids[0]) {
-        add_landlock_dir_rule(ruleset_fd, xdg_vids, ro_access);
-    }
-
-    const char *wwal_ws = getenv("WWAL_WORKSHOP_DIR");
-    if (wwal_ws && wwal_ws[0]) {
-        add_landlock_dir_rule(ruleset_fd, wwal_ws, ro_access);
-    }
-
-    const char *wwal_preset_dir = getenv("WWAL_SHADER_PRESET_DIR");
-    if (wwal_preset_dir && wwal_preset_dir[0]) {
-        add_landlock_dir_rule(ruleset_fd, wwal_preset_dir, ro_access);
-    }
-
-    const char *wwal_shader_dir = getenv("WWAL_SHADER_DIR");
-    if (wwal_shader_dir && wwal_shader_dir[0]) {
-        add_landlock_dir_rule(ruleset_fd, wwal_shader_dir, ro_access);
+    const char *ro_env_dirs[] = {
+        getenv("XDG_PICTURES_DIR"),       getenv("XDG_VIDEOS_DIR"),  getenv("WWAL_WORKSHOP_DIR"),
+        getenv("WWAL_SHADER_PRESET_DIR"), getenv("WWAL_SHADER_DIR"),
+    };
+    for (size_t i = 0; i < sizeof(ro_env_dirs) / sizeof(ro_env_dirs[0]); ++i) {
+        if (ro_env_dirs[i] && ro_env_dirs[i][0]) {
+            collect_landlock_rule(&rules, ro_env_dirs[i], ro_access, false);
+        }
     }
 
 #ifdef WWAL_DATADIR
-    add_landlock_dir_rule(ruleset_fd, WWAL_DATADIR, ro_access);
+    collect_landlock_rule(&rules, WWAL_DATADIR, ro_access, true);
 #endif
 #ifdef WWAL_SOURCE_ROOT
-    add_landlock_dir_rule(ruleset_fd, WWAL_SOURCE_ROOT "/shaders", ro_access);
-    add_landlock_dir_rule(ruleset_fd, WWAL_SOURCE_ROOT "/contrib", ro_access);
-    add_landlock_dir_rule(ruleset_fd, WWAL_SOURCE_ROOT "/tests", ro_access);
+    collect_landlock_rule(&rules, WWAL_SOURCE_ROOT "/shaders", ro_access, true);
+    collect_landlock_rule(&rules, WWAL_SOURCE_ROOT "/contrib", ro_access, true);
+    collect_landlock_rule(&rules, WWAL_SOURCE_ROOT "/tests", ro_access, true);
 #endif
     {
         char exe_buf[4096];
@@ -482,13 +723,12 @@ static void apply_landlock_sandbox(const char *runtime_dir)
             if (slash) {
                 *slash = '\0';
                 char rel_dir[4096];
-                if (snprintf(rel_dir, sizeof(rel_dir), "%s/../shaders", exe_buf) <
-                    (int)sizeof(rel_dir)) {
-                    add_landlock_dir_rule(ruleset_fd, rel_dir, ro_access);
+                if (format_joined_path(rel_dir, sizeof(rel_dir), exe_buf, "../shaders", NULL)) {
+                    collect_landlock_rule(&rules, rel_dir, ro_access, true);
                 }
-                if (snprintf(rel_dir, sizeof(rel_dir), "%s/../share/wwal/shaders", exe_buf) <
-                    (int)sizeof(rel_dir)) {
-                    add_landlock_dir_rule(ruleset_fd, rel_dir, ro_access);
+                if (format_joined_path(rel_dir, sizeof(rel_dir), exe_buf, "../share/wwal/shaders",
+                                       NULL)) {
+                    collect_landlock_rule(&rules, rel_dir, ro_access, true);
                 }
             }
         }
@@ -497,25 +737,30 @@ static void apply_landlock_sandbox(const char *runtime_dir)
     const char *wwal_cache = getenv("WWAL_CACHE_DIR");
     if (wwal_cache && wwal_cache[0]) {
         mkdir_p_user_dir(wwal_cache);
-        add_landlock_dir_rule(ruleset_fd, wwal_cache, rw_access);
+        collect_landlock_rule(&rules, wwal_cache, cache_rw_access, true);
     }
 
     const char *wwal_state = getenv("WWAL_STATE_DIR");
     if (wwal_state && wwal_state[0]) {
         mkdir_p_user_dir(wwal_state);
-        add_landlock_dir_rule(ruleset_fd, wwal_state, rw_access);
+        collect_landlock_rule(&rules, wwal_state, rw_access, true);
     }
 
     const char *xdg_cache = getenv("XDG_CACHE_HOME");
     if (xdg_cache && xdg_cache[0]) {
         mkdir_p_user_dir(xdg_cache);
-        add_landlock_dir_rule(ruleset_fd, xdg_cache, rw_access);
-        const char *cache_subdirs[] = {"wwal", "wal", "swww", "awww"};
+        collect_landlock_rule(&rules, xdg_cache, rw_access, true);
+        const char *cache_subdirs[] = {"wwal", "wwal/exports", "wwal/repairs",
+                                       "wal",  "swww",         "awww"};
         for (size_t i = 0; i < sizeof(cache_subdirs) / sizeof(cache_subdirs[0]); ++i) {
             char cache_sub[4096];
-            snprintf(cache_sub, sizeof(cache_sub), "%s/%s", xdg_cache, cache_subdirs[i]);
-            mkdir_p_user_dir(cache_sub);
-            add_landlock_dir_rule(ruleset_fd, cache_sub, rw_access);
+            if (format_joined_path(cache_sub, sizeof(cache_sub), xdg_cache, cache_subdirs[i],
+                                   &rules)) {
+                mkdir_p_user_dir(cache_sub);
+                if (strcmp(cache_subdirs[i], "wwal") == 0) {
+                    collect_landlock_rule(&rules, cache_sub, cache_rw_access, true);
+                }
+            }
         }
     }
 
@@ -525,57 +770,61 @@ static void apply_landlock_sandbox(const char *runtime_dir)
         const char *state_subdirs[] = {"wwal", "caelestia", "caelestia/wallpaper"};
         for (size_t i = 0; i < sizeof(state_subdirs) / sizeof(state_subdirs[0]); ++i) {
             char state_sub[4096];
-            snprintf(state_sub, sizeof(state_sub), "%s/%s", xdg_state, state_subdirs[i]);
-            mkdir_p_user_dir(state_sub);
-            add_landlock_dir_rule(ruleset_fd, state_sub, rw_access);
+            if (format_joined_path(state_sub, sizeof(state_sub), xdg_state, state_subdirs[i],
+                                   &rules)) {
+                mkdir_p_user_dir(state_sub);
+                collect_landlock_rule(&rules, state_sub, rw_access, true);
+            }
         }
     }
 
     char cwd_buf[4096];
     if (getcwd(cwd_buf, sizeof(cwd_buf)) != NULL) {
         if (!home || strcmp(cwd_buf, home) != 0) {
-            add_landlock_dir_rule(ruleset_fd, cwd_buf, ro_access);
+            collect_landlock_rule(&rules, cwd_buf, ro_access, true);
         }
     }
 
     if (home && home[0]) {
         char path_buf[4096];
 
-        /* Grant read-only access across $HOME entries (excluding sensitive keystores like ~/.ssh)
-         */
-        DIR *hdir = opendir(home);
-        if (hdir) {
-            struct dirent *ent;
-            while ((ent = readdir(hdir)) != NULL) {
-                if (is_sensitive_home_entry(ent->d_name) || strcmp(ent->d_name, ".local") == 0)
-                    continue;
-                int n = snprintf(path_buf, sizeof(path_buf), "%s/%s", home, ent->d_name);
-                if (n > 0 && (size_t)n < sizeof(path_buf)) {
-                    __u64 ent_access =
-                        (strcmp(ent->d_name, "bin") == 0 || strcmp(ent->d_name, ".cargo") == 0)
-                            ? rx_access
-                            : ro_access;
-                    add_landlock_dir_rule(ruleset_fd, path_buf, ent_access);
+        /* Enumerate top-level $HOME entries read-only, skipping sensitive keystores and explicit
+         * XDG subtrees so least-privilege rules below stay authoritative. */
+        int hfd = open(home, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (hfd >= 0) {
+            DIR *hdir = fdopendir(hfd);
+            if (!hdir) {
+                close(hfd);
+            } else {
+                struct dirent *ent;
+                while ((ent = readdir(hdir)) != NULL) {
+                    if (is_sensitive_home_entry(ent->d_name) ||
+                        strcmp(ent->d_name, ".local") == 0 || strcmp(ent->d_name, ".cache") == 0 ||
+                        strcmp(ent->d_name, ".config") == 0) {
+                        continue;
+                    }
+                    if (format_joined_path(path_buf, sizeof(path_buf), home, ent->d_name, &rules)) {
+                        __u64 ent_access =
+                            (strcmp(ent->d_name, "bin") == 0 || strcmp(ent->d_name, ".cargo") == 0)
+                                ? rx_access
+                                : ro_access;
+                        collect_landlock_rule(&rules, path_buf, ent_access, false);
+                    }
                 }
+                closedir(hdir);
             }
-            closedir(hdir);
         }
 
-        /* Enumerate ~/.local/share entries read+execute while excluding ~/.local/share/keyrings */
         char local_share[4096];
-        if (snprintf(local_share, sizeof(local_share), "%s/.local/share", home) <
-            (int)sizeof(local_share)) {
-            add_landlock_share_root_excluding_keyrings(ruleset_fd, local_share, rx_access);
+        if (format_joined_path(local_share, sizeof(local_share), home, ".local/share", &rules)) {
+            add_landlock_share_root_excluding_keyrings(&rules, local_share, ro_access, rw_access);
         }
 
-        const char *home_rx_subdirs[] = {
-            ".local/bin",
-            "bin",
-            ".cargo/bin",
-        };
+        const char *home_rx_subdirs[] = {".local/bin", "bin", ".cargo/bin"};
         for (size_t i = 0; i < sizeof(home_rx_subdirs) / sizeof(home_rx_subdirs[0]); ++i) {
-            snprintf(path_buf, sizeof(path_buf), "%s/%s", home, home_rx_subdirs[i]);
-            add_landlock_dir_rule(ruleset_fd, path_buf, rx_access);
+            if (format_joined_path(path_buf, sizeof(path_buf), home, home_rx_subdirs[i], &rules)) {
+                collect_landlock_rule(&rules, path_buf, rx_access, true);
+            }
         }
 
         const char *home_ro_subdirs[] = {
@@ -584,25 +833,26 @@ static void apply_landlock_sandbox(const char *runtime_dir)
             ".local/share/Steam",
         };
         for (size_t i = 0; i < sizeof(home_ro_subdirs) / sizeof(home_ro_subdirs[0]); ++i) {
-            snprintf(path_buf, sizeof(path_buf), "%s/%s", home, home_ro_subdirs[i]);
-            add_landlock_dir_rule(ruleset_fd, path_buf, ro_access);
+            if (format_joined_path(path_buf, sizeof(path_buf), home, home_ro_subdirs[i], &rules)) {
+                collect_landlock_rule(&rules, path_buf, ro_access, true);
+            }
+        }
+
+        if (format_joined_path(path_buf, sizeof(path_buf), home, ".cache", &rules)) {
+            collect_landlock_rule(&rules, path_buf, rw_access, true);
+        }
+        if (format_joined_path(path_buf, sizeof(path_buf), home, ".cache/wwal", &rules)) {
+            collect_landlock_rule(&rules, path_buf, cache_rw_access, true);
         }
 
         const char *home_rw_subdirs[] = {
-            ".cache",
-            ".cache/wwal",
-            ".cache/wal",
-            ".cache/swww",
-            ".cache/awww",
-            ".local/state/wwal",
-            ".local/state/caelestia",
-            ".local/state/caelestia/wallpaper",
-            ".config",
-            ".config/wwal",
+            ".local/state/wwal", ".local/state/caelestia", ".local/state/caelestia/wallpaper",
+            ".config/wwal",      ".config/waywal",
         };
         for (size_t i = 0; i < sizeof(home_rw_subdirs) / sizeof(home_rw_subdirs[0]); ++i) {
-            snprintf(path_buf, sizeof(path_buf), "%s/%s", home, home_rw_subdirs[i]);
-            add_landlock_dir_rule(ruleset_fd, path_buf, rw_access);
+            if (format_joined_path(path_buf, sizeof(path_buf), home, home_rw_subdirs[i], &rules)) {
+                collect_landlock_rule(&rules, path_buf, rw_access, true);
+            }
         }
     }
 
@@ -619,7 +869,12 @@ static void apply_landlock_sandbox(const char *runtime_dir)
                 continue;
             if (tr->output_path[0] != '\0') {
                 char out_norm[4096];
-                snprintf(out_norm, sizeof(out_norm), "%s", tr->output_path);
+                int on = snprintf(out_norm, sizeof(out_norm), "%s", tr->output_path);
+                if (on <= 0 || (size_t)on >= sizeof(out_norm)) {
+                    WAYWAL_LOG_ERR("Security: oversized template output path '%s'", tr->name);
+                    rules.failed = true;
+                    break;
+                }
                 waywal_normalize_path(out_norm);
                 if (!is_sensitive_target_path(out_norm)) {
                     path_buf_t pb;
@@ -634,14 +889,19 @@ static void apply_landlock_sandbox(const char *runtime_dir)
                                             tr->name, tr->output_path);
                         } else if (!is_sensitive_ancestor(pb.data)) {
                             mkdir_p_mode(pb.data, 0755);
-                            add_landlock_dir_rule(ruleset_fd, pb.data, rw_access);
+                            collect_landlock_rule(&rules, pb.data, rw_access, true);
                         }
                     }
                 }
             }
             if (tr->input_path[0] != '\0') {
                 char in_norm[4096];
-                snprintf(in_norm, sizeof(in_norm), "%s", tr->input_path);
+                int inn = snprintf(in_norm, sizeof(in_norm), "%s", tr->input_path);
+                if (inn <= 0 || (size_t)inn >= sizeof(in_norm)) {
+                    WAYWAL_LOG_ERR("Security: oversized template input path '%s'", tr->name);
+                    rules.failed = true;
+                    break;
+                }
                 waywal_normalize_path(in_norm);
                 if (!is_sensitive_target_path(in_norm)) {
                     path_buf_t pb;
@@ -649,7 +909,7 @@ static void apply_landlock_sandbox(const char *runtime_dir)
                     if (path_buf_parent(&pb) && pb.len > 0) {
                         waywal_normalize_path(pb.data);
                         if (!is_sensitive_ancestor(pb.data)) {
-                            add_landlock_dir_rule(ruleset_fd, pb.data, ro_access);
+                            collect_landlock_rule(&rules, pb.data, ro_access, true);
                         }
                     }
                 }
@@ -687,9 +947,14 @@ static void apply_landlock_sandbox(const char *runtime_dir)
         if (g_sandbox_cfg->solar.manifest_path[0] != '\0')
             ro_cfg_paths[ro_cfg_count++] = g_sandbox_cfg->solar.manifest_path;
 
-        for (size_t i = 0; i < ro_cfg_count; ++i) {
+        for (size_t i = 0; i < ro_cfg_count && !rules.failed; ++i) {
             char p_norm[4096];
-            snprintf(p_norm, sizeof(p_norm), "%s", ro_cfg_paths[i]);
+            int cn = snprintf(p_norm, sizeof(p_norm), "%s", ro_cfg_paths[i]);
+            if (cn <= 0 || (size_t)cn >= sizeof(p_norm)) {
+                WAYWAL_LOG_ERR("Security: oversized configured media path");
+                rules.failed = true;
+                break;
+            }
             waywal_normalize_path(p_norm);
             if (!is_sensitive_target_path(p_norm)) {
                 path_buf_t pb;
@@ -699,378 +964,433 @@ static void apply_landlock_sandbox(const char *runtime_dir)
                     if (!((home && strcmp(pb.data, home) == 0) ||
                           (real_home[0] && strcmp(pb.data, real_home) == 0)) &&
                         !is_sensitive_ancestor(pb.data)) {
-                        add_landlock_dir_rule(ruleset_fd, pb.data, ro_access);
+                        collect_landlock_rule(&rules, pb.data, ro_access, true);
                     }
                 }
             }
         }
     }
 
-    if (landlock_restrict_self(ruleset_fd, 0) == 0) {
-        WAYWAL_LOG_INFO("Security: Landlock LSM filesystem sandbox engaged (ABI v%d)", abi);
+    bool ok = commit_landlock_rules(ruleset_fd, &rules);
+    landlock_rule_vec_free(&rules);
+    if (!ok) {
+        close(ruleset_fd);
+        return false;
     }
+
+    if (landlock_restrict_self(ruleset_fd, 0) != 0) {
+        WAYWAL_LOG_ERR("Security: landlock_restrict_self(ABI v%d) failed: %s", abi,
+                       strerror(errno));
+        close(ruleset_fd);
+        return false;
+    }
+
+    WAYWAL_LOG_INFO("Security: Landlock LSM filesystem sandbox engaged (ABI v%d)", abi);
     close(ruleset_fd);
+    return true;
 }
 
 bool security_sandbox_apply(const char *runtime_dir)
 {
     /* 1. Prevent privilege escalation */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
-        WAYWAL_LOG_WARN("PR_SET_NO_NEW_PRIVS failed: %s", strerror(errno));
-    } else {
-        WAYWAL_LOG_INFO("Security: PR_SET_NO_NEW_PRIVS enforced");
+        WAYWAL_LOG_ERR("Security: PR_SET_NO_NEW_PRIVS failed: %s", strerror(errno));
+        return false;
     }
+    WAYWAL_LOG_INFO("Security: PR_SET_NO_NEW_PRIVS enforced");
 
     /* 2. Landlock LSM filesystem sandboxing */
-    apply_landlock_sandbox(runtime_dir);
+    if (!apply_landlock_sandbox(runtime_dir)) {
+        WAYWAL_LOG_ERR("Security: Landlock LSM sandbox setup failed");
+        return false;
+    }
 
 #ifdef HAVE_LIBSECCOMP
-    /* 3. Seccomp-BPF syscall sandbox */
+    /* 3. Seccomp-BPF syscall sandbox (default deny with EPERM; note shm* and timer_create
+     * remain intentionally excluded from allowed_syscalls) */
     scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ERRNO(EPERM));
-    if (ctx) {
-        /* Immediately terminate process on high-risk kernel/namespace syscalls */
-        const int denied_syscalls[] = {
-            SCMP_SYS(ptrace),        SCMP_SYS(mount),  SCMP_SYS(umount2),    SCMP_SYS(chroot),
-            SCMP_SYS(pivot_root),    SCMP_SYS(reboot), SCMP_SYS(kexec_load), SCMP_SYS(init_module),
-            SCMP_SYS(delete_module), SCMP_SYS(bpf),
-        };
+    if (!ctx) {
+        WAYWAL_LOG_ERR("Security: seccomp_init failed");
+        return false;
+    }
 
-        for (size_t i = 0; i < sizeof(denied_syscalls) / sizeof(denied_syscalls[0]); ++i) {
-            if (denied_syscalls[i] != __NR_SCMP_ERROR) {
-                seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, denied_syscalls[i], 0);
-            }
-        }
+    /* Immediately terminate process on high-risk kernel, namespace, and VM-inspection syscalls */
+    const int denied_syscalls[] = {
+        SCMP_SYS(ptrace),
+#ifdef __NR_process_vm_readv
+        SCMP_SYS(process_vm_readv),
+#endif
+#ifdef __NR_process_vm_writev
+        SCMP_SYS(process_vm_writev),
+#endif
+        SCMP_SYS(mount),
+        SCMP_SYS(umount2),
+        SCMP_SYS(chroot),
+        SCMP_SYS(pivot_root),
+        SCMP_SYS(reboot),
+        SCMP_SYS(kexec_load),
+        SCMP_SYS(init_module),
+        SCMP_SYS(delete_module),
+        SCMP_SYS(bpf),
+    };
 
-        /* Explicitly allowed syscalls for Wayland, DRM/GBM, PipeWire, and user hooks */
-        const int allowed_syscalls[] = {
-            /* Process spawning for user-configured wallpaper/theme hooks */
-            SCMP_SYS(clone),
-            SCMP_SYS(clone3),
-            SCMP_SYS(fork),
-            SCMP_SYS(vfork),
-            SCMP_SYS(execve),
-            SCMP_SYS(execveat),
-            SCMP_SYS(kill),
-            SCMP_SYS(arch_prctl),
-            SCMP_SYS(set_tid_address),
-            SCMP_SYS(getppid),
-            SCMP_SYS(getpgrp),
-            SCMP_SYS(getpgid),
-            SCMP_SYS(setpgid),
-            SCMP_SYS(setsid),
-            SCMP_SYS(getsid),
-#ifdef __NR_pidfd_open
-            SCMP_SYS(pidfd_open),
-#endif
-#ifdef __NR_pidfd_send_signal
-            SCMP_SYS(pidfd_send_signal),
-#endif
-            /* Core I/O, memory, and event loop allowlist */
-            SCMP_SYS(read),
-            SCMP_SYS(write),
-            SCMP_SYS(recvmsg),
-            SCMP_SYS(sendmsg),
-            SCMP_SYS(mmap),
-            SCMP_SYS(munmap),
-            SCMP_SYS(ioctl),
-            SCMP_SYS(epoll_wait),
-            SCMP_SYS(io_uring_enter),
-            SCMP_SYS(timerfd_settime),
-            SCMP_SYS(clock_gettime),
-            SCMP_SYS(close),
-            SCMP_SYS(accept4),
-            SCMP_SYS(poll),
-            SCMP_SYS(sigreturn),
-            SCMP_SYS(rt_sigreturn),
-            SCMP_SYS(exit_group),
-            SCMP_SYS(exit),
-
-            /* Extended async/polling support */
-            SCMP_SYS(ppoll),
-            SCMP_SYS(select),
-            SCMP_SYS(pselect6),
-            SCMP_SYS(epoll_create1),
-            SCMP_SYS(epoll_create),
-            SCMP_SYS(epoll_ctl),
-            SCMP_SYS(epoll_pwait),
-#ifdef __NR_epoll_pwait2
-            SCMP_SYS(epoll_pwait2),
-#endif
-            SCMP_SYS(io_uring_setup),
-            SCMP_SYS(io_uring_register),
-            SCMP_SYS(timerfd_create),
-            SCMP_SYS(timerfd_gettime),
-            SCMP_SYS(eventfd),
-            SCMP_SYS(eventfd2),
-            SCMP_SYS(signalfd),
-            SCMP_SYS(signalfd4),
-#ifdef __NR_inotify_init
-            SCMP_SYS(inotify_init),
-#endif
-            SCMP_SYS(inotify_init1),
-            SCMP_SYS(inotify_add_watch),
-            SCMP_SYS(inotify_rm_watch),
-
-            /* File I/O & Dynamic Driver Loading */
-            SCMP_SYS(readv),
-            SCMP_SYS(writev),
-            SCMP_SYS(preadv),
-            SCMP_SYS(pwritev),
-            SCMP_SYS(pread64),
-            SCMP_SYS(pwrite64),
-#ifdef __NR_preadv2
-            SCMP_SYS(preadv2),
-#endif
-#ifdef __NR_pwritev2
-            SCMP_SYS(pwritev2),
-#endif
-#ifdef __NR_copy_file_range
-            SCMP_SYS(copy_file_range),
-#endif
-            SCMP_SYS(sendfile),
-            SCMP_SYS(splice),
-#ifdef __NR_fadvise64
-            SCMP_SYS(fadvise64),
-#endif
-            SCMP_SYS(lseek),
-            SCMP_SYS(fcntl),
-            SCMP_SYS(dup),
-            SCMP_SYS(dup2),
-            SCMP_SYS(dup3),
-            SCMP_SYS(pipe),
-            SCMP_SYS(pipe2),
-            SCMP_SYS(truncate),
-            SCMP_SYS(ftruncate),
-            SCMP_SYS(fdatasync),
-            SCMP_SYS(fsync),
-#ifdef __NR_chmod
-            SCMP_SYS(chmod),
-#endif
-#ifdef __NR_fchmod
-            SCMP_SYS(fchmod),
-#endif
-            SCMP_SYS(fchmodat),
-#ifdef __NR_fchmodat2
-            SCMP_SYS(fchmodat2),
-#endif
-#ifdef __NR_chown
-            SCMP_SYS(chown),
-#endif
-#ifdef __NR_fchown
-            SCMP_SYS(fchown),
-#endif
-#ifdef __NR_fchownat
-            SCMP_SYS(fchownat),
-#endif
-#ifdef __NR_lchown
-            SCMP_SYS(lchown),
-#endif
-            SCMP_SYS(utimensat),
-#ifdef __NR_futimesat
-            SCMP_SYS(futimesat),
-#endif
-#ifdef __NR_close_range
-            SCMP_SYS(close_range),
-#endif
-            SCMP_SYS(rename),
-            SCMP_SYS(renameat),
-            SCMP_SYS(renameat2),
-#ifdef __NR_link
-            SCMP_SYS(link),
-#endif
-#ifdef __NR_linkat
-            SCMP_SYS(linkat),
-#endif
-            SCMP_SYS(mkdir),
-            SCMP_SYS(mkdirat),
-            SCMP_SYS(rmdir),
-            SCMP_SYS(unlink),
-            SCMP_SYS(unlinkat),
-#ifdef __NR_mknod
-            SCMP_SYS(mknod),
-#endif
-#ifdef __NR_mknodat
-            SCMP_SYS(mknodat),
-#endif
-#ifdef __NR_symlink
-            SCMP_SYS(symlink),
-#endif
-            SCMP_SYS(symlinkat),
-            SCMP_SYS(open),
-            SCMP_SYS(openat),
-#ifdef __NR_openat2
-            SCMP_SYS(openat2),
-#endif
-            SCMP_SYS(access),
-            SCMP_SYS(faccessat),
-            SCMP_SYS(faccessat2),
-            SCMP_SYS(getdents),
-            SCMP_SYS(getdents64),
-            SCMP_SYS(readlink),
-            SCMP_SYS(readlinkat),
-            SCMP_SYS(getcwd),
-            SCMP_SYS(chdir),
-            SCMP_SYS(fchdir),
-            SCMP_SYS(umask),
-
-            /* Sockets & IPC */
-            SCMP_SYS(socket),
-            SCMP_SYS(socketpair),
-            SCMP_SYS(connect),
-            SCMP_SYS(bind),
-            SCMP_SYS(listen),
-            SCMP_SYS(accept),
-            SCMP_SYS(getsockopt),
-            SCMP_SYS(setsockopt),
-            SCMP_SYS(getsockname),
-            SCMP_SYS(getpeername),
-            SCMP_SYS(sendto),
-            SCMP_SYS(recvfrom),
-#ifdef __NR_sendmmsg
-            SCMP_SYS(sendmmsg),
-#endif
-#ifdef __NR_recvmmsg
-            SCMP_SYS(recvmmsg),
-#endif
-            SCMP_SYS(shutdown),
-
-            /* Memory */
-            SCMP_SYS(mprotect),
-            SCMP_SYS(mremap),
-            SCMP_SYS(brk),
-            SCMP_SYS(madvise),
-            SCMP_SYS(mincore),
-            SCMP_SYS(memfd_create),
-            SCMP_SYS(fallocate),
-            SCMP_SYS(flock),
-#ifdef __NR_kcmp
-            SCMP_SYS(kcmp),
-#endif
-#ifdef __NR_membarrier
-            SCMP_SYS(membarrier),
-#endif
-
-            /* Clocks & Timers */
-            SCMP_SYS(clock_getres),
-            SCMP_SYS(clock_nanosleep),
-            SCMP_SYS(nanosleep),
-            SCMP_SYS(gettimeofday),
-            SCMP_SYS(setitimer),
-            SCMP_SYS(getitimer),
-#ifdef __NR_alarm
-            SCMP_SYS(alarm),
-#endif
-
-            /* Process & Signals */
-            SCMP_SYS(prctl),
-            SCMP_SYS(rt_sigaction),
-            SCMP_SYS(rt_sigprocmask),
-            SCMP_SYS(rt_sigpending),
-            SCMP_SYS(rt_sigsuspend),
-            SCMP_SYS(rt_sigtimedwait),
-            SCMP_SYS(sigaltstack),
-            SCMP_SYS(tgkill),
-            SCMP_SYS(tkill),
-            SCMP_SYS(futex),
-#ifdef __NR_futex_waitv
-            SCMP_SYS(futex_waitv),
-#endif
-            SCMP_SYS(set_robust_list),
-            SCMP_SYS(get_robust_list),
-            SCMP_SYS(getpid),
-            SCMP_SYS(gettid),
-            SCMP_SYS(getuid),
-            SCMP_SYS(geteuid),
-            SCMP_SYS(getgid),
-            SCMP_SYS(getegid),
-#ifdef __NR_setuid
-            SCMP_SYS(setuid),
-#endif
-#ifdef __NR_setgid
-            SCMP_SYS(setgid),
-#endif
-#ifdef __NR_setreuid
-            SCMP_SYS(setreuid),
-#endif
-#ifdef __NR_setregid
-            SCMP_SYS(setregid),
-#endif
-#ifdef __NR_setresuid
-            SCMP_SYS(setresuid),
-#endif
-#ifdef __NR_setresgid
-            SCMP_SYS(setresgid),
-#endif
-#ifdef __NR_getresuid
-            SCMP_SYS(getresuid),
-#endif
-#ifdef __NR_getresgid
-            SCMP_SYS(getresgid),
-#endif
-#ifdef __NR_getgroups
-            SCMP_SYS(getgroups),
-#endif
-#ifdef __NR_setgroups
-            SCMP_SYS(setgroups),
-#endif
-#ifdef __NR_capget
-            SCMP_SYS(capget),
-#endif
-#ifdef __NR_capset
-            SCMP_SYS(capset),
-#endif
-            SCMP_SYS(getpriority),
-            SCMP_SYS(setpriority),
-            SCMP_SYS(sched_yield),
-            SCMP_SYS(sched_getaffinity),
-            SCMP_SYS(sched_setaffinity),
-            SCMP_SYS(sched_getparam),
-            SCMP_SYS(sched_setparam),
-            SCMP_SYS(sched_getscheduler),
-            SCMP_SYS(sched_setscheduler),
-#ifdef __NR_sched_setattr
-            SCMP_SYS(sched_setattr),
-#endif
-#ifdef __NR_sched_getattr
-            SCMP_SYS(sched_getattr),
-#endif
-            SCMP_SYS(sched_get_priority_max),
-            SCMP_SYS(sched_get_priority_min),
-            SCMP_SYS(rseq),
-            SCMP_SYS(prlimit64),
-            SCMP_SYS(getrlimit),
-            SCMP_SYS(setrlimit),
-            SCMP_SYS(wait4),
-            SCMP_SYS(waitid),
-            SCMP_SYS(getrandom),
-            SCMP_SYS(sysinfo),
-            SCMP_SYS(uname),
-
-            /* Stat & Filesystem */
-            SCMP_SYS(stat),
-            SCMP_SYS(lstat),
-            SCMP_SYS(fstat),
-            SCMP_SYS(newfstatat),
-            SCMP_SYS(statx),
-            SCMP_SYS(statfs),
-            SCMP_SYS(fstatfs),
-        };
-
-        for (size_t i = 0; i < sizeof(allowed_syscalls) / sizeof(allowed_syscalls[0]); ++i) {
-            if (allowed_syscalls[i] != __NR_SCMP_ERROR) {
-                seccomp_rule_add(ctx, SCMP_ACT_ALLOW, allowed_syscalls[i], 0);
-            }
-        }
-
-        int rc = seccomp_load(ctx);
-        seccomp_release(ctx);
-
-        if (rc < 0) {
-            WAYWAL_LOG_WARN("Failed to load seccomp BPF filter: %s", strerror(-rc));
-        } else {
-            WAYWAL_LOG_INFO("Security: Seccomp-BPF sandbox filter loaded successfully");
+    for (size_t i = 0; i < sizeof(denied_syscalls) / sizeof(denied_syscalls[0]); ++i) {
+        if (denied_syscalls[i] == __NR_SCMP_ERROR)
+            continue;
+        int add_rc = seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, denied_syscalls[i], 0);
+        if (add_rc < 0 && add_rc != -EEXIST) {
+            WAYWAL_LOG_ERR("Security: seccomp_rule_add(KILL, nr=%d) failed: %s", denied_syscalls[i],
+                           strerror(-add_rc));
+            seccomp_release(ctx);
+            return false;
         }
     }
+
+    /* Explicitly allowed syscalls for Wayland, DRM/GBM, PipeWire, and user hooks */
+    const int allowed_syscalls[] = {
+        /* Process spawning for user-configured wallpaper/theme hooks */
+        SCMP_SYS(clone),
+        SCMP_SYS(clone3),
+        SCMP_SYS(fork),
+        SCMP_SYS(vfork),
+        SCMP_SYS(execve),
+        SCMP_SYS(execveat),
+        SCMP_SYS(kill),
+        SCMP_SYS(arch_prctl),
+        SCMP_SYS(set_tid_address),
+        SCMP_SYS(getppid),
+        SCMP_SYS(getpgrp),
+        SCMP_SYS(getpgid),
+        SCMP_SYS(setpgid),
+        SCMP_SYS(setsid),
+        SCMP_SYS(getsid),
+#ifdef __NR_pidfd_open
+        SCMP_SYS(pidfd_open),
+#endif
+#ifdef __NR_pidfd_send_signal
+        SCMP_SYS(pidfd_send_signal),
+#endif
+        /* Core I/O, memory, and event loop allowlist */
+        SCMP_SYS(read),
+        SCMP_SYS(write),
+        SCMP_SYS(recvmsg),
+        SCMP_SYS(sendmsg),
+        SCMP_SYS(mmap),
+        SCMP_SYS(munmap),
+        SCMP_SYS(ioctl),
+        SCMP_SYS(epoll_wait),
+        SCMP_SYS(io_uring_enter),
+        SCMP_SYS(timerfd_settime),
+        SCMP_SYS(clock_gettime),
+        SCMP_SYS(close),
+        SCMP_SYS(accept4),
+        SCMP_SYS(poll),
+        SCMP_SYS(sigreturn),
+        SCMP_SYS(rt_sigreturn),
+        SCMP_SYS(exit_group),
+        SCMP_SYS(exit),
+
+        /* Extended async/polling support */
+        SCMP_SYS(ppoll),
+        SCMP_SYS(select),
+        SCMP_SYS(pselect6),
+        SCMP_SYS(epoll_create1),
+        SCMP_SYS(epoll_create),
+        SCMP_SYS(epoll_ctl),
+        SCMP_SYS(epoll_pwait),
+#ifdef __NR_epoll_pwait2
+        SCMP_SYS(epoll_pwait2),
+#endif
+        SCMP_SYS(io_uring_setup),
+        SCMP_SYS(io_uring_register),
+        SCMP_SYS(timerfd_create),
+        SCMP_SYS(timerfd_gettime),
+        SCMP_SYS(eventfd),
+        SCMP_SYS(eventfd2),
+        SCMP_SYS(signalfd),
+        SCMP_SYS(signalfd4),
+#ifdef __NR_inotify_init
+        SCMP_SYS(inotify_init),
+#endif
+        SCMP_SYS(inotify_init1),
+        SCMP_SYS(inotify_add_watch),
+        SCMP_SYS(inotify_rm_watch),
+
+        /* File I/O & Dynamic Driver Loading */
+        SCMP_SYS(readv),
+        SCMP_SYS(writev),
+        SCMP_SYS(preadv),
+        SCMP_SYS(pwritev),
+        SCMP_SYS(pread64),
+        SCMP_SYS(pwrite64),
+#ifdef __NR_preadv2
+        SCMP_SYS(preadv2),
+#endif
+#ifdef __NR_pwritev2
+        SCMP_SYS(pwritev2),
+#endif
+#ifdef __NR_copy_file_range
+        SCMP_SYS(copy_file_range),
+#endif
+        SCMP_SYS(sendfile),
+        SCMP_SYS(splice),
+#ifdef __NR_fadvise64
+        SCMP_SYS(fadvise64),
+#endif
+        SCMP_SYS(lseek),
+        SCMP_SYS(fcntl),
+        SCMP_SYS(dup),
+        SCMP_SYS(dup2),
+        SCMP_SYS(dup3),
+        SCMP_SYS(pipe),
+        SCMP_SYS(pipe2),
+        SCMP_SYS(truncate),
+        SCMP_SYS(ftruncate),
+        SCMP_SYS(fdatasync),
+        SCMP_SYS(fsync),
+#ifdef __NR_chmod
+        SCMP_SYS(chmod),
+#endif
+#ifdef __NR_fchmod
+        SCMP_SYS(fchmod),
+#endif
+        SCMP_SYS(fchmodat),
+#ifdef __NR_fchmodat2
+        SCMP_SYS(fchmodat2),
+#endif
+#ifdef __NR_chown
+        SCMP_SYS(chown),
+#endif
+#ifdef __NR_fchown
+        SCMP_SYS(fchown),
+#endif
+#ifdef __NR_fchownat
+        SCMP_SYS(fchownat),
+#endif
+#ifdef __NR_lchown
+        SCMP_SYS(lchown),
+#endif
+        SCMP_SYS(utimensat),
+#ifdef __NR_futimesat
+        SCMP_SYS(futimesat),
+#endif
+#ifdef __NR_close_range
+        SCMP_SYS(close_range),
+#endif
+        SCMP_SYS(rename),
+        SCMP_SYS(renameat),
+        SCMP_SYS(renameat2),
+#ifdef __NR_link
+        SCMP_SYS(link),
+#endif
+#ifdef __NR_linkat
+        SCMP_SYS(linkat),
+#endif
+        SCMP_SYS(mkdir),
+        SCMP_SYS(mkdirat),
+        SCMP_SYS(rmdir),
+        SCMP_SYS(unlink),
+        SCMP_SYS(unlinkat),
+#ifdef __NR_mknod
+        SCMP_SYS(mknod),
+#endif
+#ifdef __NR_mknodat
+        SCMP_SYS(mknodat),
+#endif
+#ifdef __NR_symlink
+        SCMP_SYS(symlink),
+#endif
+        SCMP_SYS(symlinkat),
+        SCMP_SYS(open),
+        SCMP_SYS(openat),
+#ifdef __NR_openat2
+        SCMP_SYS(openat2),
+#endif
+        SCMP_SYS(access),
+        SCMP_SYS(faccessat),
+        SCMP_SYS(faccessat2),
+        SCMP_SYS(getdents),
+        SCMP_SYS(getdents64),
+        SCMP_SYS(readlink),
+        SCMP_SYS(readlinkat),
+        SCMP_SYS(getcwd),
+        SCMP_SYS(chdir),
+        SCMP_SYS(fchdir),
+        SCMP_SYS(umask),
+
+        /* Sockets & IPC */
+        SCMP_SYS(socket),
+        SCMP_SYS(socketpair),
+        SCMP_SYS(connect),
+        SCMP_SYS(bind),
+        SCMP_SYS(listen),
+        SCMP_SYS(accept),
+        SCMP_SYS(getsockopt),
+        SCMP_SYS(setsockopt),
+        SCMP_SYS(getsockname),
+        SCMP_SYS(getpeername),
+        SCMP_SYS(sendto),
+        SCMP_SYS(recvfrom),
+#ifdef __NR_sendmmsg
+        SCMP_SYS(sendmmsg),
+#endif
+#ifdef __NR_recvmmsg
+        SCMP_SYS(recvmmsg),
+#endif
+        SCMP_SYS(shutdown),
+
+        /* Memory */
+        SCMP_SYS(mprotect),
+        SCMP_SYS(mremap),
+        SCMP_SYS(brk),
+        SCMP_SYS(madvise),
+        SCMP_SYS(mincore),
+        SCMP_SYS(memfd_create),
+        SCMP_SYS(fallocate),
+        SCMP_SYS(flock),
+#ifdef __NR_kcmp
+        SCMP_SYS(kcmp),
+#endif
+#ifdef __NR_membarrier
+        SCMP_SYS(membarrier),
+#endif
+
+        /* Clocks & Timers */
+        SCMP_SYS(clock_getres),
+        SCMP_SYS(clock_nanosleep),
+        SCMP_SYS(nanosleep),
+        SCMP_SYS(gettimeofday),
+        SCMP_SYS(setitimer),
+        SCMP_SYS(getitimer),
+#ifdef __NR_alarm
+        SCMP_SYS(alarm),
+#endif
+
+        /* Process & Signals */
+        SCMP_SYS(prctl),
+        SCMP_SYS(rt_sigaction),
+        SCMP_SYS(rt_sigprocmask),
+        SCMP_SYS(rt_sigpending),
+        SCMP_SYS(rt_sigsuspend),
+        SCMP_SYS(rt_sigtimedwait),
+        SCMP_SYS(sigaltstack),
+        SCMP_SYS(tgkill),
+        SCMP_SYS(tkill),
+        SCMP_SYS(futex),
+#ifdef __NR_futex_waitv
+        SCMP_SYS(futex_waitv),
+#endif
+        SCMP_SYS(set_robust_list),
+        SCMP_SYS(get_robust_list),
+        SCMP_SYS(getpid),
+        SCMP_SYS(gettid),
+        SCMP_SYS(getuid),
+        SCMP_SYS(geteuid),
+        SCMP_SYS(getgid),
+        SCMP_SYS(getegid),
+#ifdef __NR_setuid
+        SCMP_SYS(setuid),
+#endif
+#ifdef __NR_setgid
+        SCMP_SYS(setgid),
+#endif
+#ifdef __NR_setreuid
+        SCMP_SYS(setreuid),
+#endif
+#ifdef __NR_setregid
+        SCMP_SYS(setregid),
+#endif
+#ifdef __NR_setresuid
+        SCMP_SYS(setresuid),
+#endif
+#ifdef __NR_setresgid
+        SCMP_SYS(setresgid),
+#endif
+#ifdef __NR_getresuid
+        SCMP_SYS(getresuid),
+#endif
+#ifdef __NR_getresgid
+        SCMP_SYS(getresgid),
+#endif
+#ifdef __NR_getgroups
+        SCMP_SYS(getgroups),
+#endif
+#ifdef __NR_setgroups
+        SCMP_SYS(setgroups),
+#endif
+#ifdef __NR_capget
+        SCMP_SYS(capget),
+#endif
+#ifdef __NR_capset
+        SCMP_SYS(capset),
+#endif
+        SCMP_SYS(getpriority),
+        SCMP_SYS(setpriority),
+        SCMP_SYS(sched_yield),
+        SCMP_SYS(sched_getaffinity),
+        SCMP_SYS(sched_setaffinity),
+        SCMP_SYS(sched_getparam),
+        SCMP_SYS(sched_setparam),
+        SCMP_SYS(sched_getscheduler),
+        SCMP_SYS(sched_setscheduler),
+#ifdef __NR_sched_setattr
+        SCMP_SYS(sched_setattr),
+#endif
+#ifdef __NR_sched_getattr
+        SCMP_SYS(sched_getattr),
+#endif
+        SCMP_SYS(sched_get_priority_max),
+        SCMP_SYS(sched_get_priority_min),
+        SCMP_SYS(rseq),
+        SCMP_SYS(prlimit64),
+        SCMP_SYS(getrlimit),
+        SCMP_SYS(setrlimit),
+        SCMP_SYS(wait4),
+        SCMP_SYS(waitid),
+        SCMP_SYS(getrandom),
+        SCMP_SYS(sysinfo),
+        SCMP_SYS(uname),
+
+        /* Stat & Filesystem */
+        SCMP_SYS(stat),
+        SCMP_SYS(lstat),
+        SCMP_SYS(fstat),
+        SCMP_SYS(newfstatat),
+        SCMP_SYS(statx),
+        SCMP_SYS(statfs),
+        SCMP_SYS(fstatfs),
+    };
+
+    for (size_t i = 0; i < sizeof(allowed_syscalls) / sizeof(allowed_syscalls[0]); ++i) {
+        int sc = allowed_syscalls[i];
+        if (sc == __NR_SCMP_ERROR)
+            continue;
+        bool dup = false;
+        for (size_t j = 0; j < i; ++j) {
+            if (allowed_syscalls[j] == sc) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        int add_rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, sc, 0);
+        if (add_rc < 0) {
+            WAYWAL_LOG_ERR("Security: seccomp_rule_add(ALLOW, nr=%d) failed: %s", sc,
+                           strerror(-add_rc));
+            seccomp_release(ctx);
+            return false;
+        }
+    }
+
+    int rc = seccomp_load(ctx);
+    seccomp_release(ctx);
+
+    if (rc < 0) {
+        WAYWAL_LOG_ERR("Security: failed to load seccomp BPF filter: %s", strerror(-rc));
+        return false;
+    }
+    WAYWAL_LOG_INFO("Security: Seccomp-BPF sandbox filter loaded successfully");
 #endif
 
     return true;

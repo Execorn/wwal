@@ -9,6 +9,7 @@
 #include "waywal/ipc_proto.h"
 #include "waywal/log.h"
 #include "waywal/mpris.h"
+#include "waywal/os_compat.h"
 #include "waywal/power_governor.h"
 #include "waywal/security.h"
 #include "waywal/shader_engine.h"
@@ -69,6 +70,31 @@
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_LEAK__)
+#define WWAL_SANITIZER_BUILD 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(leak_sanitizer)
+#define WWAL_SANITIZER_BUILD 1
+#endif
+#endif
+#ifndef WWAL_SANITIZER_BUILD
+#define WWAL_SANITIZER_BUILD 0
+#endif
+
+#if WWAL_SANITIZER_BUILD
+void __lsan_do_leak_check(void) __attribute__((weak));
+__attribute__((visibility("default"), used)) int __lsan_is_turned_off(void);
+
+static bool g_seccomp_sandbox_active = false;
+
+/* LSan StopTheWorld spawns a non-thread tracer calling ptrace, which Seccomp kills with SIGSYS.
+ * Disable LSan's final ptrace scan only when Seccomp is armed so main() still returns normally. */
+__attribute__((visibility("default"), used)) int __lsan_is_turned_off(void)
+{
+    return g_seccomp_sandbox_active ? 1 : 0;
+}
+#endif
 
 float waywal_shader_engine_get_render_scale(const waywal_shader_engine_t *eng);
 uint32_t waywal_shader_engine_get_target_fps(const waywal_shader_engine_t *eng);
@@ -5058,6 +5084,9 @@ static void print_usage(const char *prog)
     printf("      --layer <LAYER>          Layer target: background or bottom\n");
     printf("      --backdrop <MODE>        Backdrop mode: none, auto-blur, or path\n");
     printf("      --battery-policy <POL>   Battery policy: ignore, reduce-fps, pause-video\n");
+#if WWAL_SANITIZER_BUILD
+    printf("      --no-sandbox             Disable sandbox (sanitizer builds only)\n");
+#endif
     printf("  -v, --verbose                Enable debug logging\n");
     printf("  -V, --version                Print version information\n");
     printf("  -h, --help                   Print help information\n");
@@ -8631,6 +8660,273 @@ bool daemon_dispatch_ipc_req_set_audio_bindings(daemon_state_t *state,
     return found;
 }
 
+static bool daemon_path_has_dotdot_segment(const char *path)
+{
+    if (!path) {
+        return false;
+    }
+    const char *p = path;
+    while (*p != '\0') {
+        while (*p == '/') {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        const char *seg = p;
+        while (*p != '\0' && *p != '/') {
+            ++p;
+        }
+        if ((size_t)(p - seg) == 2u && seg[0] == '.' && seg[1] == '.') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool daemon_canonical_dir_exists(const char *raw_dir, char *out_real, size_t out_cap)
+{
+    if (!raw_dir || raw_dir[0] != '/' || !out_real || out_cap < PATH_MAX ||
+        daemon_path_has_dotdot_segment(raw_dir)) {
+        return false;
+    }
+    char *res = realpath(raw_dir, out_real);
+    if (!res) {
+        return false;
+    }
+    struct stat st;
+    if (lstat(out_real, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return false;
+    }
+    return true;
+}
+
+static bool daemon_match_anchor_prefix(const char *resolved_path, const char *anchor_path,
+                                       int *out_anchor_fd, const char **out_rel)
+{
+    size_t alen = strlen(anchor_path);
+    if (alen == 0u || strncmp(resolved_path, anchor_path, alen) != 0) {
+        return false;
+    }
+    if (resolved_path[alen] != '\0' && resolved_path[alen] != '/') {
+        return false;
+    }
+    int afd = open(anchor_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (afd < 0) {
+        return false;
+    }
+    *out_anchor_fd = afd;
+    const char *rel = resolved_path + alen;
+    while (*rel == '/') {
+        ++rel;
+    }
+    *out_rel = rel;
+    return true;
+}
+
+/* Anchors export writes onto a Landlock-allowlisted directory fd (/tmp or cache root) so no path
+ * helper ever falls back to open("/"). */
+static bool daemon_open_allowlisted_export_anchor(const char *resolved_path, int *out_anchor_fd,
+                                                  const char **out_rel)
+{
+    if (!resolved_path || resolved_path[0] != '/' || !out_anchor_fd || !out_rel ||
+        daemon_path_has_dotdot_segment(resolved_path)) {
+        return false;
+    }
+    *out_anchor_fd = -1;
+    *out_rel = NULL;
+
+    char cache_wwal_raw[PATH_MAX];
+    const char *xdg_cache = getenv("XDG_CACHE_HOME");
+    bool have_cache_raw = false;
+    if (xdg_cache && xdg_cache[0] == '/') {
+        int n = snprintf(cache_wwal_raw, sizeof(cache_wwal_raw), "%s/wwal", xdg_cache);
+        have_cache_raw = (n > 0 && (size_t)n < sizeof(cache_wwal_raw));
+    } else {
+        const char *home = getenv("HOME");
+        if (home && home[0] == '/') {
+            int n = snprintf(cache_wwal_raw, sizeof(cache_wwal_raw), "%s/.cache/wwal", home);
+            have_cache_raw = (n > 0 && (size_t)n < sizeof(cache_wwal_raw));
+        }
+    }
+    if (have_cache_raw) {
+        char cache_wwal_real[PATH_MAX];
+        if (daemon_canonical_dir_exists(cache_wwal_raw, cache_wwal_real, sizeof(cache_wwal_real))) {
+            char cache_exports_real[PATH_MAX];
+            int en = snprintf(cache_exports_real, sizeof(cache_exports_real), "%s/exports",
+                              cache_wwal_real);
+            if (en > 0 && (size_t)en < sizeof(cache_exports_real) &&
+                daemon_match_anchor_prefix(resolved_path, cache_exports_real, out_anchor_fd,
+                                           out_rel)) {
+                return true;
+            }
+            if (daemon_match_anchor_prefix(resolved_path, cache_wwal_real, out_anchor_fd,
+                                           out_rel)) {
+                return true;
+            }
+        }
+    }
+
+    char tmp_resolved[PATH_MAX];
+    const char *tmp_base = realpath("/tmp", tmp_resolved) ? tmp_resolved : "/tmp";
+    if (daemon_match_anchor_prefix(resolved_path, tmp_base, out_anchor_fd, out_rel)) {
+        const char *rel = *out_rel;
+        if (rel[0] == '\0' || strncmp(rel, "wwal-export-", 12u) == 0) {
+            return true;
+        }
+        close(*out_anchor_fd);
+        *out_anchor_fd = -1;
+        *out_rel = NULL;
+    }
+    return false;
+}
+
+static bool daemon_ensure_subdir_beneath(int root_fd, const char *rel_dir, int *out_dir_fd)
+{
+    if (root_fd < 0 || !out_dir_fd) {
+        return false;
+    }
+    *out_dir_fd = -1;
+    int cur_fd = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    if (cur_fd < 0) {
+        return false;
+    }
+    if (!rel_dir || rel_dir[0] == '\0') {
+        *out_dir_fd = cur_fd;
+        return true;
+    }
+    const char *p = rel_dir;
+    while (*p != '\0') {
+        while (*p == '/') {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        const char *seg_start = p;
+        while (*p != '\0' && *p != '/') {
+            ++p;
+        }
+        size_t slen = (size_t)(p - seg_start);
+        if (slen == 0u || slen >= NAME_MAX + 1u || (slen == 1u && seg_start[0] == '.') ||
+            (slen == 2u && seg_start[0] == '.' && seg_start[1] == '.')) {
+            close(cur_fd);
+            return false;
+        }
+        char seg[NAME_MAX + 1u];
+        memcpy(seg, seg_start, slen);
+        seg[slen] = '\0';
+        if (mkdirat(cur_fd, seg, 0755) != 0 && errno != EEXIST) {
+            close(cur_fd);
+            return false;
+        }
+        int next_fd = wwal_openat2_beneath(cur_fd, seg, O_RDONLY | O_DIRECTORY, 0);
+        close(cur_fd);
+        if (next_fd < 0) {
+            return false;
+        }
+        cur_fd = next_fd;
+    }
+    *out_dir_fd = cur_fd;
+    return true;
+}
+
+static bool daemon_write_file_beneath_export_anchor(const char *resolved_path, const uint8_t *data,
+                                                    size_t size)
+{
+    if (!resolved_path || (!data && size > 0u)) {
+        return false;
+    }
+    int anchor_fd = -1;
+    const char *rel_path = NULL;
+    if (!daemon_open_allowlisted_export_anchor(resolved_path, &anchor_fd, &rel_path) || !rel_path ||
+        rel_path[0] == '\0') {
+        if (anchor_fd >= 0) {
+            close(anchor_fd);
+        }
+        return false;
+    }
+
+    char rel_parent[PATH_MAX];
+    const char *slash = strrchr(rel_path, '/');
+    const char *leaf = slash ? (slash + 1) : rel_path;
+    if (!leaf || leaf[0] == '\0' || strcmp(leaf, ".") == 0 || strcmp(leaf, "..") == 0 ||
+        strlen(leaf) >= NAME_MAX) {
+        close(anchor_fd);
+        return false;
+    }
+    if (slash) {
+        size_t plen = (size_t)(slash - rel_path);
+        if (plen >= sizeof(rel_parent)) {
+            close(anchor_fd);
+            return false;
+        }
+        memcpy(rel_parent, rel_path, plen);
+        rel_parent[plen] = '\0';
+    } else {
+        rel_parent[0] = '\0';
+    }
+
+    int parent_fd = -1;
+    bool ok_dir = daemon_ensure_subdir_beneath(anchor_fd, rel_parent, &parent_fd);
+    close(anchor_fd);
+    if (!ok_dir || parent_fd < 0) {
+        return false;
+    }
+
+    struct stat existing_st;
+    if (fstatat(parent_fd, leaf, &existing_st, AT_SYMLINK_NOFOLLOW) == 0 &&
+        (S_ISLNK(existing_st.st_mode) || S_ISDIR(existing_st.st_mode))) {
+        close(parent_fd);
+        return false;
+    }
+
+    char tmp_leaf[128];
+    int tn = snprintf(tmp_leaf, sizeof(tmp_leaf), ".wwal_mdl_%ld_%u.tmp", (long)getpid(),
+                      (unsigned)(now_ns() & 0xffffffffu));
+    if (tn <= 0 || (size_t)tn >= sizeof(tmp_leaf)) {
+        close(parent_fd);
+        return false;
+    }
+
+    int wfd = wwal_openat2_beneath(parent_fd, tmp_leaf, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (wfd < 0) {
+        close(parent_fd);
+        return false;
+    }
+
+    size_t written = 0u;
+    bool write_ok = true;
+    while (written < size) {
+        ssize_t n = write(wfd, data + written, size - written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            write_ok = false;
+            break;
+        }
+        if (n == 0) {
+            write_ok = false;
+            break;
+        }
+        written += (size_t)n;
+    }
+    if (write_ok && fsync(wfd) != 0) {
+        write_ok = false;
+    }
+    close(wfd);
+
+    if (!write_ok || renameat(parent_fd, tmp_leaf, parent_fd, leaf) != 0) {
+        (void)unlinkat(parent_fd, tmp_leaf, 0);
+        close(parent_fd);
+        return false;
+    }
+    (void)fsync(parent_fd);
+    close(parent_fd);
+    return true;
+}
+
 #if WAYWAL_HAVE_ASSET_WRITER
 static void authoring_sum_export_dir(const char *dir_path, uint32_t *out_files, uint64_t *out_bytes,
                                      uint32_t depth)
@@ -8701,8 +8997,19 @@ static void authoring_rm_tree(const char *path, uint32_t depth)
 
 static bool authoring_mkdir_p(const char *dir)
 {
-    if (!dir || dir[0] != '/') {
+    if (!dir || dir[0] != '/' || daemon_path_has_dotdot_segment(dir)) {
         return false;
+    }
+    int anchor_fd = -1;
+    const char *rel = NULL;
+    if (daemon_open_allowlisted_export_anchor(dir, &anchor_fd, &rel)) {
+        int out_fd = -1;
+        bool ok = daemon_ensure_subdir_beneath(anchor_fd, rel, &out_fd);
+        close(anchor_fd);
+        if (out_fd >= 0) {
+            close(out_fd);
+        }
+        return ok;
     }
     char tmp[PATH_MAX];
     size_t len = strnlen(dir, sizeof(tmp));
@@ -11383,7 +11690,7 @@ bool daemon_dispatch_ipc_req_export_puppet_mdl(daemon_state_t *state,
     }
 
     if ((req->flags & 0x2u) != 0u) {
-        if (!we_mdl_write_file(puppet, &opts, resolved_path)) {
+        if (!daemon_write_file_beneath_export_anchor(resolved_path, mdl_bytes, mdl_size)) {
             we_mdl_write_free(mdl_bytes);
             resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
             return false;
@@ -11928,6 +12235,8 @@ int main(int argc, char *argv[])
     }
     waywal_battery_policy_t battery_policy = state.config.daemon.battery_policy_mode;
     bool daemonize_bg = false;
+    bool no_sandbox = false;
+    int exit_code = 0;
 
     static const struct option long_options[] = {{"namespace", required_argument, NULL, 'n'},
                                                  {"daemon", no_argument, NULL, 'd'},
@@ -11942,6 +12251,9 @@ int main(int argc, char *argv[])
                                                  {"no-mute-on-audio", no_argument, NULL, 1006},
                                                  {"theme-from-media", no_argument, NULL, 1007},
                                                  {"no-theme-from-media", no_argument, NULL, 1008},
+#if WWAL_SANITIZER_BUILD
+                                                 {"no-sandbox", no_argument, NULL, 1010},
+#endif
                                                  {"verbose", no_argument, NULL, 'v'},
                                                  {"version", no_argument, NULL, 'V'},
                                                  {"help", no_argument, NULL, 'h'},
@@ -12012,6 +12324,11 @@ int main(int argc, char *argv[])
         case 1008:
             state.theme_from_media = false;
             break;
+#if WWAL_SANITIZER_BUILD
+        case 1010:
+            no_sandbox = true;
+            break;
+#endif
         case 'v':
             waywal_log_set_level(WAYWAL_LOG_LEVEL_DEBUG);
             break;
@@ -12255,7 +12572,7 @@ int main(int argc, char *argv[])
     /* Ensure package extraction and repair directories exist before Landlock enumerates
      * ~/.local/share */
     const char *home_dir = getenv("HOME");
-    if (home_dir && home_dir[0] == '/' && strstr(home_dir, "..") == NULL) {
+    if (home_dir && home_dir[0] == '/' && !daemon_path_has_dotdot_segment(home_dir)) {
         const char *wwal_dirs[] = {
             ".local",
             ".local/share",
@@ -12266,6 +12583,7 @@ int main(int argc, char *argv[])
             ".local/state/wwal/packages",
             ".cache",
             ".cache/wwal",
+            ".cache/wwal/exports",
             ".cache/wwal/repairs",
         };
         char dir_buf[4096];
@@ -12279,38 +12597,60 @@ int main(int argc, char *argv[])
 
     /* Apply security hardening (PR_SET_NO_NEW_PRIVS & Landlock LSM) */
     security_sandbox_register_config(&state.config);
-    security_sandbox_apply(NULL);
+#if WWAL_SANITIZER_BUILD
+    if (no_sandbox) {
+        WAYWAL_LOG_WARN("Security: sandbox disabled via --no-sandbox (sanitizer build)");
+    } else
+#else
+    (void)no_sandbox;
+#endif
+        if (!security_sandbox_apply(NULL)) {
+        WAYWAL_LOG_ERR("Security: sandbox initialization failed; aborting startup");
+        exit_code = 1;
+        state.running = false;
+        if (ready_pipe[1] >= 0) {
+            close(ready_pipe[1]);
+            ready_pipe[1] = -1;
+        }
+    }
+#if WWAL_SANITIZER_BUILD && defined(HAVE_LIBSECCOMP)
+    else {
+        g_seccomp_sandbox_active = true;
+    }
+#endif
 
     /* Spawn bounded IPC worker threads after sandbox confinement so workers inherit
      * Landlock/Seccomp */
-    if (daemon_ipc_async_init(&state)) {
+    if (state.running && daemon_ipc_async_init(&state)) {
         int ipc_async_fd = daemon_ipc_async_get_fd();
         if (ipc_async_fd >= 0) {
             register_fd_in_loops(&state, ipc_async_fd, URING_EV_IPC_READ);
         }
     }
 
-    state.solar_owns_wallpaper = config_has_solar_or_schedule_paths(&state.config);
-    state.on_output_configured = daemon_on_output_configured;
-    state.on_wallpaper_loaded = daemon_on_wallpaper_loaded;
-    if (state.config.output_count > 0) {
-        daemon_apply_all_output_config_rules(&state, NULL, NULL);
-    } else if (state.config.daemon.restore_on_start) {
-        for (output_node_t *out = state.outputs; out != NULL; out = out->next) {
-            daemon_on_output_configured(&state, out);
+    if (state.running) {
+        state.solar_owns_wallpaper = config_has_solar_or_schedule_paths(&state.config);
+        state.on_output_configured = daemon_on_output_configured;
+        state.on_wallpaper_loaded = daemon_on_wallpaper_loaded;
+        if (state.config.output_count > 0) {
+            daemon_apply_all_output_config_rules(&state, NULL, NULL);
+        } else if (state.config.daemon.restore_on_start) {
+            for (output_node_t *out = state.outputs; out != NULL; out = out->next) {
+                daemon_on_output_configured(&state, out);
+            }
         }
-    }
-    daemon_tick_solar_and_schedule(&state, true);
+        daemon_tick_solar_and_schedule(&state, true);
 
-    WAYWAL_LOG_INFO("wwald daemon running successfully (namespace: %s)", state.namespace_str);
-    if (ready_pipe[1] >= 0) {
-        uint8_t ok_byte = 1;
-        ssize_t wr = 0;
-        do {
-            wr = write(ready_pipe[1], &ok_byte, 1);
-        } while (wr < 0 && errno == EINTR);
-        close(ready_pipe[1]);
-        ready_pipe[1] = -1;
+        WAYWAL_LOG_INFO("wwald daemon running successfully (namespace: %s)", state.namespace_str);
+        if (ready_pipe[1] >= 0) {
+            uint8_t ok_byte = 1;
+            ssize_t wr = 0;
+            do {
+                wr = write(ready_pipe[1], &ok_byte, 1);
+            } while (wr < 0 && errno == EINTR);
+            close(ready_pipe[1]);
+            ready_pipe[1] = -1;
+        }
     }
 
     /* Main event loop */
@@ -12512,16 +12852,12 @@ int main(int argc, char *argv[])
     arena_destroy(&state.frame_arena);
 
     WAYWAL_LOG_INFO("Clean shutdown complete.");
-#ifdef HAVE_LIBSECCOMP
-#if defined(__SANITIZE_ADDRESS__)
-    fflush(NULL);
-    _exit(0);
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(leak_sanitizer)
-    fflush(NULL);
-    _exit(0);
+#if WWAL_SANITIZER_BUILD
+    /* Only run explicit LSan scan when Seccomp was disabled via --no-sandbox; normal teardown still
+     * returns through libc atexit without bypassing leak detection. */
+    if (no_sandbox && __lsan_do_leak_check) {
+        __lsan_do_leak_check();
+    }
 #endif
-#endif
-#endif
-    return 0;
+    return exit_code;
 }

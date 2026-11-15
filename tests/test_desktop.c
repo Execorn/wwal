@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/log.h"
+#include "waywal/os_compat.h"
 #include "waywal/output_state.h"
 #include "waywal/presentation.h"
 #include "waywal/security.h"
@@ -7,16 +8,21 @@
 #include "waywal/uring_loop.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
+#include <linux/landlock.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+void __gcov_dump(void) __attribute__((weak));
 
 static int rm_rf_cb(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
 {
@@ -291,6 +297,30 @@ static void test_security_hardening(void)
 {
     printf("[TEST] Running test_security_hardening...\n");
 
+    /* Verify Landlock ABI mask negotiation and no-exec invariant across ABI revisions */
+    assert(security_landlock_handled_fs_mask(0) == 0u);
+    assert(security_landlock_writable_fs_mask(0) == 0u);
+    for (int abi = 1; abi <= 11; ++abi) {
+        uint64_t h = security_landlock_handled_fs_mask(abi);
+        uint64_t w = security_landlock_writable_fs_mask(abi);
+        assert((h & LANDLOCK_ACCESS_FS_EXECUTE) != 0u);
+        assert((w & LANDLOCK_ACCESS_FS_EXECUTE) == 0u);
+        assert((w & (LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE |
+                     LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE)) != 0u);
+#ifdef LANDLOCK_ACCESS_FS_REFER
+        assert(((h & LANDLOCK_ACCESS_FS_REFER) != 0u) == (abi >= 2));
+        assert(((w & LANDLOCK_ACCESS_FS_REFER) != 0u) == (abi >= 2));
+#endif
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+        assert(((h & LANDLOCK_ACCESS_FS_TRUNCATE) != 0u) == (abi >= 3));
+        assert(((w & LANDLOCK_ACCESS_FS_TRUNCATE) != 0u) == (abi >= 3));
+#endif
+#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
+        assert(((h & LANDLOCK_ACCESS_FS_IOCTL_DEV) != 0u) == (abi >= 5));
+        assert((w & LANDLOCK_ACCESS_FS_IOCTL_DEV) == 0u);
+#endif
+    }
+
     int confirm_pfd[2];
     assert(pipe2(confirm_pfd, O_CLOEXEC) == 0);
 
@@ -304,9 +334,11 @@ static void test_security_hardening(void)
         close(confirm_pfd[0]);
         char sbox_home[512], sbox_ssh[512], sbox_xcache[512], sbox_xstate[512];
         char sbox_local[512], sbox_lshare[512], sbox_keyrings[512], sbox_lstate[512],
-            sbox_bash_state[512];
+            sbox_bash_state[512], sbox_cfg[512], sbox_cfg_wwal[512];
         snprintf(sbox_home, sizeof(sbox_home), "%s/home", sbox_tmp);
         snprintf(sbox_ssh, sizeof(sbox_ssh), "%s/home/.ssh", sbox_tmp);
+        snprintf(sbox_cfg, sizeof(sbox_cfg), "%s/home/.config", sbox_tmp);
+        snprintf(sbox_cfg_wwal, sizeof(sbox_cfg_wwal), "%s/home/.config/wwal", sbox_tmp);
         snprintf(sbox_local, sizeof(sbox_local), "%s/home/.local", sbox_tmp);
         snprintf(sbox_lshare, sizeof(sbox_lshare), "%s/home/.local/share", sbox_tmp);
         snprintf(sbox_keyrings, sizeof(sbox_keyrings), "%s/home/.local/share/keyrings", sbox_tmp);
@@ -316,6 +348,9 @@ static void test_security_hardening(void)
         snprintf(sbox_xstate, sizeof(sbox_xstate), "%s/state", sbox_tmp);
         mkdir(sbox_home, 0700);
         mkdir(sbox_ssh, 0700);
+        mkdir(sbox_cfg, 0700);
+        /* Plant a symlink ~/.config/wwal -> ~/.ssh to confirm O_NOFOLLOW blocks rule escalation */
+        (void)symlink(sbox_ssh, sbox_cfg_wwal);
         mkdir(sbox_local, 0700);
         mkdir(sbox_lshare, 0700);
         mkdir(sbox_keyrings, 0700);
@@ -401,6 +436,43 @@ static void test_security_hardening(void)
                 close(bfd);
                 _exit(14);
             }
+
+            /* Symlinked ~/.config/wwal -> ~/.ssh must be refused under O_NOFOLLOW */
+            char sym_cfg_probe[4096];
+            snprintf(sym_cfg_probe, sizeof(sym_cfg_probe), "%s/home/.config/wwal", sbox_tmp);
+            int scfd = open(sym_cfg_probe, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (scfd >= 0) {
+                close(scfd);
+                _exit(15);
+            }
+
+            /* Writable cache directories must strip LANDLOCK_ACCESS_FS_EXECUTE */
+            char exec_probe[4096];
+            snprintf(exec_probe, sizeof(exec_probe), "%s/wwal/noexec_probe.sh", sbox_xcache);
+            int exfd = open(exec_probe, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+            if (exfd < 0)
+                _exit(16);
+            static const char k_sh[] = "#!/bin/sh\nexit 0\n";
+            ssize_t wn = write(exfd, k_sh, sizeof(k_sh) - 1u);
+            close(exfd);
+            if (wn != (ssize_t)(sizeof(k_sh) - 1u) || chmod(exec_probe, 0755) != 0)
+                _exit(16);
+
+            pid_t ep = fork();
+            if (ep < 0)
+                _exit(16);
+            if (ep == 0) {
+                char *const argv_e[] = {exec_probe, NULL};
+                char *const env_e[] = {NULL};
+                execve(exec_probe, argv_e, env_e);
+                _exit(errno == EACCES ? 0 : 17);
+            }
+            int est = 0;
+            if (waitpid(ep, &est, 0) != ep || !WIFEXITED(est) || WEXITSTATUS(est) != 0) {
+                unlink(exec_probe);
+                _exit(17);
+            }
+            unlink(exec_probe);
         }
 
 #ifdef HAVE_LIBSECCOMP
@@ -415,11 +487,45 @@ static void test_security_hardening(void)
             WEXITSTATUS(hook_st) != 0)
             _exit(8);
 
+        /* Verify seccomp gaps (shm* and timer_create) fail closed with EPERM */
+#ifdef __NR_shmget
+        errno = 0;
+        if (syscall(SYS_shmget, 0x5757414cL, 4096, 0600) != -1 || errno != EPERM)
+            _exit(18);
+#endif
+#ifdef __NR_timer_create
+        errno = 0;
+        if (syscall(SYS_timer_create, CLOCK_MONOTONIC, NULL, NULL) != -1 || errno != EPERM)
+            _exit(19);
+#endif
+
+#ifdef __NR_process_vm_readv
+        /* Verify process_vm_readv triggers SCMP_ACT_KILL_PROCESS in a sub-child */
+        pid_t vm_pid = fork();
+        if (vm_pid < 0)
+            _exit(20);
+        if (vm_pid == 0) {
+            if (__gcov_dump) {
+                __gcov_dump();
+            }
+            syscall(SYS_process_vm_readv, getpid(), NULL, 0, NULL, 0, 0);
+            _exit(21);
+        }
+        int vm_st = 0;
+        if (waitpid(vm_pid, &vm_st, 0) != vm_pid || !WIFSIGNALED(vm_st) ||
+            (WTERMSIG(vm_st) != SIGSYS && WTERMSIG(vm_st) != SIGKILL))
+            _exit(22);
+#endif
+
         char ok_byte = 'K';
         ssize_t wr_rc = write(confirm_pfd[1], &ok_byte, 1);
         (void)wr_rc;
         close(confirm_pfd[1]);
 
+        /* Flush gcov counters before intentional SCMP_ACT_KILL_PROCESS termination */
+        if (__gcov_dump) {
+            __gcov_dump();
+        }
         /* Verify denied syscall triggers SCMP_ACT_KILL_PROCESS on ptrace */
         syscall(SYS_ptrace, 0, 0, 0, 0);
         /* If not killed by SIGSYS, exit with error code 4 */
@@ -456,6 +562,161 @@ static void test_security_hardening(void)
     printf("[TEST] test_security_hardening PASSED.\n");
 }
 
+static void test_landlock_tmp_export_confinement(void)
+{
+    printf("[TEST] Running test_landlock_tmp_export_confinement...\n");
+
+    char leaf[96];
+    snprintf(leaf, sizeof(leaf), "wwal-export-wall..%d.mdl", (int)getpid());
+    char abs_target[256];
+    snprintf(abs_target, sizeof(abs_target), "/tmp/%s", leaf);
+    unlink(abs_target);
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        /* Set HOME outside /tmp/wwal_sbox_test_* so Landlock enables /tmp rw_noexec_access */
+        setenv("HOME", "/nonexistent_wwal_test_home", 1);
+        unsetenv("XDG_CACHE_HOME");
+        unsetenv("XDG_STATE_HOME");
+        unsetenv("XDG_DATA_HOME");
+        unsetenv("XDG_CONFIG_HOME");
+
+        if (!security_sandbox_apply(NULL)) {
+            _exit(1);
+        }
+
+        int ll_abi = security_landlock_probe_abi();
+        if (ll_abi > 0) {
+            int root_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (root_fd >= 0) {
+                close(root_fd);
+                _exit(2);
+            }
+        }
+
+        int tmp_fd = open("/tmp", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (tmp_fd < 0) {
+            _exit(3);
+        }
+
+        /* Traversal components must be blocked while dot-containing names like wall..mdl succeed */
+        int trav_fd = wwal_openat2_beneath(tmp_fd, "../etc/passwd", O_RDONLY, 0);
+        if (trav_fd >= 0) {
+            close(trav_fd);
+            close(tmp_fd);
+            _exit(4);
+        }
+
+        int out_fd = wwal_openat2_beneath(tmp_fd, leaf, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (out_fd < 0) {
+            close(tmp_fd);
+            _exit(5);
+        }
+        static const char k_payload[] = "MDL_CONFINED_OK";
+        ssize_t wn = write(out_fd, k_payload, sizeof(k_payload) - 1u);
+        close(out_fd);
+        if (wn != (ssize_t)(sizeof(k_payload) - 1u)) {
+            unlinkat(tmp_fd, leaf, 0);
+            close(tmp_fd);
+            _exit(6);
+        }
+
+        int rd_fd = wwal_openat2_beneath(tmp_fd, leaf, O_RDONLY, 0);
+        if (rd_fd < 0) {
+            unlinkat(tmp_fd, leaf, 0);
+            close(tmp_fd);
+            _exit(7);
+        }
+        char buf[32] = {0};
+        ssize_t rn = read(rd_fd, buf, sizeof(buf) - 1u);
+        close(rd_fd);
+        unlinkat(tmp_fd, leaf, 0);
+        close(tmp_fd);
+        if (rn != (ssize_t)(sizeof(k_payload) - 1u) || memcmp(buf, k_payload, (size_t)rn) != 0) {
+            _exit(8);
+        }
+
+        if (__gcov_dump) {
+            __gcov_dump();
+        }
+        _exit(0);
+    }
+
+    int st = 0;
+    assert(waitpid(pid, &st, 0) == pid);
+    unlink(abs_target);
+    assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    printf("  Verified /tmp allowlisted openat2 export (wall..png allowed, open(\"/\") denied)\n");
+    printf("[TEST] test_landlock_tmp_export_confinement PASSED.\n");
+}
+
+static bool find_sibling_wwald(char *out_path, size_t out_cap)
+{
+    char exe[4096];
+    ssize_t elen = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (elen <= 0) {
+        return false;
+    }
+    exe[elen] = '\0';
+    char *slash = strrchr(exe, '/');
+    if (!slash) {
+        return false;
+    }
+    *slash = '\0';
+    const char *cands[2] = {"../wwald", "wwald"};
+    for (size_t i = 0; i < 2; ++i) {
+        int n = snprintf(out_path, out_cap, "%s/%s", exe, cands[i]);
+        if (n > 0 && (size_t)n < out_cap && access(out_path, X_OK) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void test_daemon_no_sandbox_flag_gating(void)
+{
+    printf("[TEST] Running test_daemon_no_sandbox_flag_gating...\n");
+
+    char wwald_path[4096];
+    if (!find_sibling_wwald(wwald_path, sizeof(wwald_path))) {
+        printf("  wwald binary not present alongside test binary; skipping CLI probe\n");
+        return;
+    }
+
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_LEAK__) ||                                 \
+    __has_feature(address_sanitizer) || __has_feature(leak_sanitizer)
+    const bool expect_allowed = true;
+#else
+    const bool expect_allowed = false;
+#endif
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        char *const argv_d[] = {wwald_path, "--no-sandbox", "--version", NULL};
+        execv(wwald_path, argv_d);
+        _exit(127);
+    }
+    int st = 0;
+    assert(waitpid(pid, &st, 0) == pid);
+    assert(WIFEXITED(st));
+    if (expect_allowed) {
+        assert(WEXITSTATUS(st) == 0);
+        printf("  Verified sanitizer wwald accepts --no-sandbox cleanly\n");
+    } else {
+        assert(WEXITSTATUS(st) != 0);
+        printf("  Verified non-sanitizer wwald rejects --no-sandbox cleanly\n");
+    }
+    printf("[TEST] test_daemon_no_sandbox_flag_gating PASSED.\n");
+}
+
 int main(void)
 {
     printf("=========================================\n");
@@ -466,6 +727,8 @@ int main(void)
     test_io_uring_event_loop();
     test_output_manager_lifecycle();
     test_security_hardening();
+    test_landlock_tmp_export_confinement();
+    test_daemon_no_sandbox_flag_gating();
 
     printf("\n>>> ALL DESKTOP UNIT TESTS PASSED SUCCESSFULLY! <<<\n");
     return 0;
