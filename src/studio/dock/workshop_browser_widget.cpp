@@ -51,6 +51,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#include "dock/browser_shared.hpp"
 #include "grid/fuzzy_catalog_index.hpp"
 #include "grid/hover_preview_controller.hpp"
 #include "grid/virtualized_grid_widget.hpp"
@@ -108,25 +109,10 @@ struct WorkshopRecord {
     bool last_download_failed{false};
     bool last_download_cancelled{false};
     QString last_error_message;
+    TaskState active_download_state{TaskState::Queued};
+    float download_pct{0.0f};
+    float download_speed_bps{0.0f};
 };
-
-QString formatBytes(uint64_t bytes)
-{
-    constexpr double KiB = 1024.0;
-    constexpr double MiB = KiB * 1024.0;
-    constexpr double GiB = MiB * 1024.0;
-
-    if (bytes >= GiB) {
-        return QString::asprintf("%.2f GB", static_cast<double>(bytes) / GiB);
-    }
-    if (bytes >= MiB) {
-        return QString::asprintf("%.1f MB", static_cast<double>(bytes) / MiB);
-    }
-    if (bytes >= KiB) {
-        return QString::asprintf("%.1f KB", static_cast<double>(bytes) / KiB);
-    }
-    return QString::asprintf("%llu B", static_cast<unsigned long long>(bytes));
-}
 
 void populateIssuesFromReport(const we_compat_report_t *rep, WorkshopRecord &rec)
 {
@@ -285,6 +271,12 @@ std::vector<std::filesystem::path> collectWorkshopRoots()
             pushUnique(std::filesystem::path(libs[i].path) / "steamapps" / "workshop" / "content" /
                        "431960");
         }
+    }
+
+    const QString xdgData = browser_shared::resolveXdgDataHomeQt();
+    if (!xdgData.isEmpty()) {
+        pushUnique(std::filesystem::path(xdgData.toStdString()) /
+                   "Steam/steamapps/workshop/content/431960");
     }
 
     const char *home = std::getenv("HOME");
@@ -446,8 +438,13 @@ std::vector<WorkshopRecord> scanWorkshopRootsWorker(const std::atomic<bool> &can
                             break;
                         }
                         std::error_code fEc;
-                        if (f.is_regular_file(fEc)) {
-                            uint64_t sz = f.file_size(fEc);
+                        // Skip symlinks so targets outside the workshop root cannot inflate sizes.
+                        const auto symSt = f.symlink_status(fEc);
+                        if (fEc || std::filesystem::is_symlink(symSt)) {
+                            continue;
+                        }
+                        if (std::filesystem::is_regular_file(symSt)) {
+                            uint64_t sz = std::filesystem::file_size(f.path(), fEc);
                             if (!fEc) {
                                 rec.file_size_bytes += sz;
                             }
@@ -476,36 +473,17 @@ std::vector<WorkshopRecord> scanWorkshopRootsWorker(const std::atomic<bool> &can
     return results;
 }
 
-constexpr const char *STYLE_PANEL_BG = "background-color: #14171c; color: #f1f5f9;";
-constexpr const char *STYLE_DRAWER_BG =
-    "background-color: #1a1e26; border-left: 1px solid #2b303c;";
-constexpr const char *STYLE_TOOLBAR_COMBO =
-    "QComboBox { background-color: #1e222b; color: #f1f5f9; border: 1px solid #334155; "
-    "border-radius: 6px; padding: 4px 10px; min-height: 24px; font-size: 12px; }"
-    "QComboBox::drop-down { border: none; width: 20px; }"
-    "QComboBox QAbstractItemView { background-color: #1e222b; color: #f1f5f9; "
-    "selection-background-color: #0284c7; selection-color: #ffffff; border: 1px solid #334155; }";
-
-constexpr const char *STYLE_SEARCH_BAR =
-    "QLineEdit { background-color: #1e222b; color: #f1f5f9; border: 1px solid #334155; "
-    "border-radius: 6px; padding: 4px 10px; font-size: 12px; }"
-    "QLineEdit:focus { border: 1px solid #38bdf8; }";
-
-constexpr const char *STYLE_BUTTON_PRIMARY =
-    "QPushButton { background-color: #0284c7; color: #ffffff; border: none; "
-    "border-radius: 6px; padding: 6px 14px; font-weight: bold; font-size: 12px; }"
-    "QPushButton:hover { background-color: #0369a1; }"
-    "QPushButton:disabled { background-color: #334155; color: #64748b; }";
-
-constexpr const char *STYLE_BUTTON_SECONDARY =
-    "QPushButton { background-color: #2b303c; color: #e2e8f0; border: 1px solid #334155; "
-    "border-radius: 6px; padding: 6px 12px; font-size: 12px; }"
-    "QPushButton:hover { background-color: #384252; color: #ffffff; }"
-    "QPushButton:disabled { background-color: #1e222b; color: #64748b; }";
-
 } // namespace
 
 struct WorkshopBrowserWidget::Impl {
+    struct AsyncCompatWorker {
+        enum class Kind { Details, Repair };
+        Kind kind{Kind::Details};
+        std::shared_ptr<std::atomic<bool>> cancel;
+        std::atomic<bool> done{false};
+        std::thread thread;
+    };
+
     WorkshopBrowserWidget *owner{nullptr};
 
     std::vector<WorkshopRecord> allRecords;
@@ -517,10 +495,15 @@ struct WorkshopBrowserWidget::Impl {
     std::atomic<bool> scanCancel{false};
     uint64_t scanGeneration{0};
 
-    std::thread compatScanThread;
+    std::vector<std::unique_ptr<AsyncCompatWorker>> compatWorkers;
     uint64_t compatScanGeneration{0};
+    uint64_t compatRepairGeneration{0};
+    uint64_t repairInFlightId{0};
     std::unordered_map<uint64_t, WorkshopRecord> compatDetailsCache;
     std::unordered_map<uint64_t, uint32_t> activeDownloadFlags;
+    std::unordered_map<uint64_t, TaskState> activeDownloadStates;
+    std::unordered_map<uint64_t, float> activeDownloadPcts;
+    std::unordered_map<uint64_t, float> activeDownloadSpeeds;
 
     std::mutex dbWriteMutex;
     std::condition_variable dbWriteCv;
@@ -573,7 +556,9 @@ struct WorkshopBrowserWidget::Impl {
     void stopDbWriter();
     void enqueueAsyncUpsert(WorkshopItemRecord item);
     void stopScanThread();
+    void reapFinishedCompatWorkers();
     void stopCompatThread();
+    void shutdownCompatWorkers();
     void requestAsyncCompatDetails(uint64_t pubId, const std::string &dirPath,
                                    we_compat_tier_t prevTier, uint32_t prevScore);
     void mergeDiscoveredRecords(std::vector<WorkshopRecord> records);
@@ -650,12 +635,47 @@ void WorkshopBrowserWidget::Impl::stopScanThread()
     }
 }
 
+void WorkshopBrowserWidget::Impl::reapFinishedCompatWorkers()
+{
+    for (auto it = compatWorkers.begin(); it != compatWorkers.end();) {
+        if ((*it)->done.load(std::memory_order_acquire)) {
+            if ((*it)->thread.joinable()) {
+                (*it)->thread.join();
+            }
+            it = compatWorkers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void WorkshopBrowserWidget::Impl::stopCompatThread()
 {
     ++compatScanGeneration;
-    if (compatScanThread.joinable()) {
-        compatScanThread.join();
+    // Cancel asynchronously so rapid selection changes never stall the UI thread on scan I/O.
+    for (const auto &worker : compatWorkers) {
+        if (worker->kind == AsyncCompatWorker::Kind::Details && worker->cancel) {
+            worker->cancel->store(true, std::memory_order_release);
+        }
     }
+    reapFinishedCompatWorkers();
+}
+
+void WorkshopBrowserWidget::Impl::shutdownCompatWorkers()
+{
+    ++compatScanGeneration;
+    ++compatRepairGeneration;
+    for (const auto &worker : compatWorkers) {
+        if (worker->cancel) {
+            worker->cancel->store(true, std::memory_order_release);
+        }
+    }
+    for (const auto &worker : compatWorkers) {
+        if (worker->thread.joinable()) {
+            worker->thread.join();
+        }
+    }
+    compatWorkers.clear();
 }
 
 void WorkshopBrowserWidget::Impl::requestAsyncCompatDetails(uint64_t pubId,
@@ -667,7 +687,23 @@ void WorkshopBrowserWidget::Impl::requestAsyncCompatDetails(uint64_t pubId,
     const uint64_t gen = ++compatScanGeneration;
     QPointer<WorkshopBrowserWidget> self(owner);
 
-    compatScanThread = std::thread([self, gen, pubId, dirPath, prevTier, prevScore]() {
+    auto worker = std::make_unique<AsyncCompatWorker>();
+    worker->kind = AsyncCompatWorker::Kind::Details;
+    worker->cancel = std::make_shared<std::atomic<bool>>(false);
+    AsyncCompatWorker *workerPtr = worker.get();
+    std::shared_ptr<std::atomic<bool>> cancelFlag = worker->cancel;
+
+    worker->thread = std::thread([self, workerPtr, cancelFlag, gen, pubId, dirPath, prevTier,
+                                  prevScore]() {
+        struct DoneGuard {
+            AsyncCompatWorker *w;
+            ~DoneGuard() { w->done.store(true, std::memory_order_release); }
+        } doneGuard{workerPtr};
+
+        if (cancelFlag->load(std::memory_order_acquire)) {
+            return;
+        }
+
         std::error_code ec;
         std::filesystem::path fsDir(dirPath);
         if (!std::filesystem::is_directory(fsDir, ec) || !self) {
@@ -682,22 +718,26 @@ void WorkshopBrowserWidget::Impl::requestAsyncCompatDetails(uint64_t pubId,
 
         CompatScannerPtr scanner(we_compat_scanner_create(true, true), &we_compat_scanner_destroy);
         CompatReportPtr rep(we_compat_report_alloc(), &we_compat_report_free);
-        if (scanner && rep &&
+        if (!cancelFlag->load(std::memory_order_acquire) && scanner && rep &&
             we_compat_scan_directory(scanner.get(), fsDir.string().c_str(), rep.get())) {
             populateIssuesFromReport(rep.get(), scanned);
         }
 
-        if (!self) {
+        if (cancelFlag->load(std::memory_order_acquire) || !self) {
             return;
         }
 
         QMetaObject::invokeMethod(
             self,
             [self, gen, scanned = std::move(scanned), prevTier, prevScore]() mutable {
-                if (!self || gen != self->m_impl->compatScanGeneration) {
+                if (!self) {
                     return;
                 }
                 auto &impl = *self->m_impl;
+                impl.reapFinishedCompatWorkers();
+                if (gen != impl.compatScanGeneration) {
+                    return;
+                }
                 if (impl.compatDetailsCache.size() >= 256) {
                     impl.compatDetailsCache.clear();
                 }
@@ -723,6 +763,7 @@ void WorkshopBrowserWidget::Impl::requestAsyncCompatDetails(uint64_t pubId,
             },
             Qt::QueuedConnection);
     });
+    compatWorkers.push_back(std::move(worker));
 }
 
 void WorkshopBrowserWidget::Impl::rebuildAllIndex()
@@ -892,9 +933,22 @@ void WorkshopBrowserWidget::Impl::executeQuery()
                 filter.sort_order = CatalogSortOrder::SubscriptionsDesc;
                 break;
             }
-            filter.limit = 2000;
+            constexpr uint32_t kPageSize = 500;
+            filter.limit = kPageSize;
             filter.offset = 0;
-            dbRows = owner->m_indexMgr->queryByFilters(filter);
+            while (true) {
+                auto page = owner->m_indexMgr->queryByFilters(filter);
+                if (page.empty()) {
+                    break;
+                }
+                const size_t got = page.size();
+                dbRows.insert(dbRows.end(), std::make_move_iterator(page.begin()),
+                              std::make_move_iterator(page.end()));
+                if (got < kPageSize) {
+                    break;
+                }
+                filter.offset += static_cast<uint32_t>(got);
+            }
         } else {
             bool isExactId = false;
             const uint64_t pubId = trimmedQuery.toULongLong(&isExactId);
@@ -903,11 +957,24 @@ void WorkshopBrowserWidget::Impl::executeQuery()
                     dbRows.push_back(std::move(*exact));
                 }
             }
-            auto searched = owner->m_indexMgr->searchFts5Bm25(trimmedQuery.toStdString(), 500, 0);
-            for (auto &r : searched) {
-                if (!isExactId || r.published_file_id != pubId) {
-                    dbRows.push_back(std::move(r));
+            constexpr uint32_t kSearchPageSize = 500;
+            uint32_t offset = 0;
+            while (true) {
+                auto searched = owner->m_indexMgr->searchFts5Bm25(trimmedQuery.toStdString(),
+                                                                  kSearchPageSize, offset);
+                if (searched.empty()) {
+                    break;
                 }
+                const size_t got = searched.size();
+                for (auto &r : searched) {
+                    if (!isExactId || r.published_file_id != pubId) {
+                        dbRows.push_back(std::move(r));
+                    }
+                }
+                if (got < kSearchPageSize) {
+                    break;
+                }
+                offset += static_cast<uint32_t>(got);
             }
         }
 
@@ -926,6 +993,18 @@ void WorkshopBrowserWidget::Impl::executeQuery()
             if (auto dlIt = activeDownloadFlags.find(rec.published_file_id);
                 dlIt != activeDownloadFlags.end()) {
                 rec.install_state |= dlIt->second;
+            }
+            if (auto stIt = activeDownloadStates.find(rec.published_file_id);
+                stIt != activeDownloadStates.end()) {
+                rec.active_download_state = stIt->second;
+                if (auto pctIt = activeDownloadPcts.find(rec.published_file_id);
+                    pctIt != activeDownloadPcts.end()) {
+                    rec.download_pct = pctIt->second;
+                }
+                if (auto spdIt = activeDownloadSpeeds.find(rec.published_file_id);
+                    spdIt != activeDownloadSpeeds.end()) {
+                    rec.download_speed_bps = spdIt->second;
+                }
             }
             if (auto cIt = compatDetailsCache.find(rec.published_file_id);
                 cIt != compatDetailsCache.end()) {
@@ -1120,7 +1199,7 @@ void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &inRec)
     inspectorTitleLabel->setText(rec.title);
     inspectorIdLabel->setText(QString("ID %1  |  %2  |  %3 subscribers")
                                   .arg(rec.published_file_id)
-                                  .arg(formatBytes(rec.file_size_bytes))
+                                  .arg(browser_shared::formatBytes(rec.file_size_bytes))
                                   .arg(rec.subscriptions));
 
     QString tierText;
@@ -1171,9 +1250,15 @@ void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &inRec)
             "QProgressBar::chunk { background-color: #ef4444; border-radius: 3px; }");
     }
 
-    vramFpsMetricsLabel->setText(QString("VRAM: <b>%1 MB</b>  |  Target: <b>%2 FPS</b>")
-                                     .arg(QString::number(rec.estimated_vram_mb, 'f', 1))
-                                     .arg(rec.estimated_fps));
+    if (rec.estimated_vram_mb <= 0.0f && rec.estimated_fps == 0 && !rec.compat_details_loaded) {
+        vramFpsMetricsLabel->setText("VRAM: --  |  Target: --");
+    } else {
+        const QString fpsText =
+            rec.estimated_fps > 0 ? QString("%1 FPS").arg(rec.estimated_fps) : QString("--");
+        vramFpsMetricsLabel->setText(QString("VRAM: <b>%1 MB</b>  |  Target: <b>%2</b>")
+                                         .arg(QString::number(rec.estimated_vram_mb, 'f', 1))
+                                         .arg(fpsText));
+    }
 
     issuesListWidget->clear();
     if (rec.issue_messages.empty()) {
@@ -1195,10 +1280,12 @@ void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &inRec)
     }
 
     repairsListWidget->clear();
+    const bool repairingThis = (repairInFlightId == rec.published_file_id);
     if (rec.repair_descriptions.empty()) {
         auto *item = new QListWidgetItem("No shader fixes needed.");
         item->setForeground(QColor(148, 163, 184));
         repairsListWidget->addItem(item);
+        runAutoRepairBtn->setText(repairingThis ? "Repairing..." : "Repair Shader");
         runAutoRepairBtn->setEnabled(false);
     } else {
         for (const auto &desc : rec.repair_descriptions) {
@@ -1206,14 +1293,38 @@ void WorkshopBrowserWidget::Impl::updateInspector(const WorkshopRecord &inRec)
             item->setForeground(QColor(56, 189, 248));
             repairsListWidget->addItem(item);
         }
-        runAutoRepairBtn->setEnabled(!rec.file_path.isEmpty());
+        runAutoRepairBtn->setText(repairingThis ? "Repairing..." : "Repair Shader");
+        runAutoRepairBtn->setEnabled(!repairingThis && !rec.file_path.isEmpty());
     }
 
     installStatusBadge->setToolTip(rec.last_error_message);
 
     if (rec.install_state & WAYWAL_UGC_STATE_DOWNLOADING) {
-        installStatusBadge->setText("<font color='#38bdf8'><b>Downloading...</b></font>");
-        downloadProgressBox->setVisible(true);
+        QString badgeText = QStringLiteral("<font color='#38bdf8'><b>Downloading...</b></font>");
+        switch (rec.active_download_state) {
+        case TaskState::Queued:
+            badgeText = QStringLiteral("<font color='#38bdf8'><b>Queued...</b></font>");
+            break;
+        case TaskState::Probing:
+            badgeText = QStringLiteral("<font color='#38bdf8'><b>Probing...</b></font>");
+            break;
+        case TaskState::Extracting:
+            badgeText = QStringLiteral("<font color='#38bdf8'><b>Extracting...</b></font>");
+            break;
+        case TaskState::Verifying:
+            badgeText = QStringLiteral("<font color='#38bdf8'><b>Verifying...</b></font>");
+            break;
+        case TaskState::Indexing:
+            badgeText = QStringLiteral("<font color='#38bdf8'><b>Indexing...</b></font>");
+            break;
+        default:
+            break;
+        }
+        installStatusBadge->setText(badgeText);
+        browser_shared::updateDownloadProgressWidgets(
+            downloadProgressBox, downloadProgressBar, downloadTelemetryLabel,
+            rec.active_download_state, rec.download_pct, rec.download_speed_bps,
+            rec.file_size_bytes, QStringLiteral("Download"));
         subscribeDownloadBtn->setText("Cancel Download");
         applyToMonitorBtn->setEnabled(false);
     } else if (rec.last_download_failed) {
@@ -1280,6 +1391,9 @@ void WorkshopBrowserWidget::Impl::handleDownloadProgress(const DownloadProgress 
         case TaskState::Verifying:
         case TaskState::Indexing:
             rec.install_state |= WAYWAL_UGC_STATE_DOWNLOADING;
+            rec.active_download_state = prog.state;
+            rec.download_pct = prog.progress_pct;
+            rec.download_speed_bps = prog.speed_bytes_per_sec;
             rec.last_download_failed = false;
             rec.last_download_cancelled = false;
             rec.last_error_message.clear();
@@ -1287,6 +1401,9 @@ void WorkshopBrowserWidget::Impl::handleDownloadProgress(const DownloadProgress 
         case TaskState::Installed:
             rec.install_state &= ~static_cast<uint32_t>(WAYWAL_UGC_STATE_DOWNLOADING);
             rec.install_state |= (WAYWAL_UGC_STATE_INSTALLED | WAYWAL_UGC_STATE_SUBSCRIBED);
+            rec.active_download_state = TaskState::Installed;
+            rec.download_pct = 100.0f;
+            rec.download_speed_bps = 0.0f;
             rec.last_download_failed = false;
             rec.last_download_cancelled = false;
             rec.last_error_message.clear();
@@ -1299,12 +1416,16 @@ void WorkshopBrowserWidget::Impl::handleDownloadProgress(const DownloadProgress 
             break;
         case TaskState::Failed:
             rec.install_state &= ~static_cast<uint32_t>(WAYWAL_UGC_STATE_DOWNLOADING);
+            rec.active_download_state = TaskState::Failed;
+            rec.download_speed_bps = 0.0f;
             rec.last_download_failed = true;
             rec.last_download_cancelled = false;
             rec.last_error_message = QString::fromStdString(prog.error_message);
             break;
         case TaskState::Cancelled:
             rec.install_state &= ~static_cast<uint32_t>(WAYWAL_UGC_STATE_DOWNLOADING);
+            rec.active_download_state = TaskState::Cancelled;
+            rec.download_speed_bps = 0.0f;
             rec.last_download_failed = false;
             rec.last_download_cancelled = true;
             rec.last_error_message.clear();
@@ -1320,14 +1441,23 @@ void WorkshopBrowserWidget::Impl::handleDownloadProgress(const DownloadProgress 
     case TaskState::Verifying:
     case TaskState::Indexing:
         activeDownloadFlags[id] = WAYWAL_UGC_STATE_DOWNLOADING;
+        activeDownloadStates[id] = prog.state;
+        activeDownloadPcts[id] = prog.progress_pct;
+        activeDownloadSpeeds[id] = prog.speed_bytes_per_sec;
         break;
     case TaskState::Installed:
         activeDownloadFlags[id] = WAYWAL_UGC_STATE_INSTALLED | WAYWAL_UGC_STATE_SUBSCRIBED;
+        activeDownloadStates.erase(id);
+        activeDownloadPcts.erase(id);
+        activeDownloadSpeeds.erase(id);
         compatDetailsCache.erase(id);
         break;
     case TaskState::Failed:
     case TaskState::Cancelled:
         activeDownloadFlags.erase(id);
+        activeDownloadStates.erase(id);
+        activeDownloadPcts.erase(id);
+        activeDownloadSpeeds.erase(id);
         break;
     }
 
@@ -1351,18 +1481,14 @@ void WorkshopBrowserWidget::Impl::handleDownloadProgress(const DownloadProgress 
     }
 
     if (selectedItemIndex == static_cast<int>(filtIt->second)) {
-        if (prog.state == TaskState::Downloading || prog.state == TaskState::Verifying ||
-            prog.state == TaskState::Queued) {
-            owner->onDownloadProgressUpdated(id, std::min(prog.progress_pct, 99.9f),
-                                             prog.speed_bytes_per_sec);
-        } else {
-            downloadProgressBox->setVisible(false);
-            updateInspector(rec);
-        }
+        updateInspector(rec);
     }
 }
 
-void WorkshopBrowserWidget::Impl::applyThemeStyles() { owner->setStyleSheet(STYLE_PANEL_BG); }
+void WorkshopBrowserWidget::Impl::applyThemeStyles()
+{
+    owner->setStyleSheet(browser_shared::kStylePanelBg);
+}
 
 WorkshopBrowserWidget::WorkshopBrowserWidget(std::shared_ptr<CatalogIndexManager> indexMgr,
                                              std::shared_ptr<DownloadManager> downloadMgr,
@@ -1383,7 +1509,7 @@ WorkshopBrowserWidget::WorkshopBrowserWidget(std::shared_ptr<CatalogIndexManager
 WorkshopBrowserWidget::~WorkshopBrowserWidget()
 {
     m_impl->stopScanThread();
-    m_impl->stopCompatThread();
+    m_impl->shutdownCompatWorkers();
     m_impl->stopDbWriter();
     if (m_impl->hoverDwellTimer) {
         m_impl->hoverDwellTimer->stop();
@@ -1404,7 +1530,7 @@ void WorkshopBrowserWidget::setupUi()
     rootLayout->setSpacing(0);
 
     auto *toolbarFrame = new QFrame(this);
-    toolbarFrame->setStyleSheet("background-color: #181b22; border-bottom: 1px solid #262b36;");
+    toolbarFrame->setStyleSheet(browser_shared::kStyleToolbarFrame);
     auto *toolbarOuter = new QVBoxLayout(toolbarFrame);
     toolbarOuter->setContentsMargins(10, 8, 10, 8);
     toolbarOuter->setSpacing(8);
@@ -1416,18 +1542,20 @@ void WorkshopBrowserWidget::setupUi()
     m_searchEdit = new QLineEdit(toolbarFrame);
     m_searchEdit->setPlaceholderText("Search Workshop wallpapers...");
     m_searchEdit->setClearButtonEnabled(true);
-    m_searchEdit->setFixedHeight(28);
-    m_searchEdit->setStyleSheet(STYLE_SEARCH_BAR);
+    m_searchEdit->setMinimumHeight(28);
+    m_searchEdit->setStyleSheet(browser_shared::kStyleSearchBar);
     searchRow->addWidget(m_searchEdit, 1);
 
     m_refreshBtn = new QToolButton(toolbarFrame);
     m_refreshBtn->setText("Rescan");
-    m_refreshBtn->setFixedHeight(28);
     m_refreshBtn->setToolTip("Rescan local Steam Workshop folders");
     m_refreshBtn->setStyleSheet(
-        "QToolButton { background-color: #20242e; color: #e2e8f0; border: 1px solid #2e3545; "
+        "QToolButton { background-color: #20242e; color: #e2e8f0; border: 1px solid #334155; "
         "border-radius: 5px; padding: 4px 12px; font-weight: 500; font-size: 11px; }"
-        "QToolButton:hover { background-color: #2a303d; border-color: #38bdf8; color: #ffffff; }");
+        "QToolButton:hover { background-color: #2a303d; border-color: #38bdf8; color: #ffffff; }"
+        "QToolButton:focus { border: 1px solid #38bdf8; }"
+        "QToolButton:disabled { background-color: #181b22; color: #94a3b8; }");
+    browser_shared::sizeButtonFromFontMetrics(m_refreshBtn, 14, 28, true);
     searchRow->addWidget(m_refreshBtn);
     toolbarOuter->addLayout(searchRow);
 
@@ -1436,22 +1564,22 @@ void WorkshopBrowserWidget::setupUi()
     filterRow->setSpacing(8);
 
     m_typeCombo = new QComboBox(toolbarFrame);
-    m_typeCombo->setFixedHeight(26);
+    m_typeCombo->setMinimumHeight(26);
     m_typeCombo->addItems({"All Types", "Scene", "Video", "Shader", "Web"});
-    m_typeCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
+    m_typeCombo->setStyleSheet(browser_shared::kStyleToolbarCombo);
     filterRow->addWidget(m_typeCombo, 1);
 
     m_impl->tierFilterCombo = new QComboBox(toolbarFrame);
-    m_impl->tierFilterCombo->setFixedHeight(26);
+    m_impl->tierFilterCombo->setMinimumHeight(26);
     m_impl->tierFilterCombo->addItems(
         {"All Tiers", "Native", "Transpiled", "Partial", "Unsupported"});
-    m_impl->tierFilterCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
+    m_impl->tierFilterCombo->setStyleSheet(browser_shared::kStyleToolbarCombo);
     filterRow->addWidget(m_impl->tierFilterCombo, 1);
 
     m_sortCombo = new QComboBox(toolbarFrame);
-    m_sortCombo->setFixedHeight(26);
+    m_sortCombo->setMinimumHeight(26);
     m_sortCombo->addItems({"Subscribers", "Rating", "Recent", "Compatibility", "Title"});
-    m_sortCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
+    m_sortCombo->setStyleSheet(browser_shared::kStyleToolbarCombo);
     filterRow->addWidget(m_sortCombo, 1);
     toolbarOuter->addLayout(filterRow);
 
@@ -1468,7 +1596,7 @@ void WorkshopBrowserWidget::setupUi()
     m_impl->inspectorScrollArea = new QScrollArea(m_impl->mainSplitter);
     m_impl->inspectorScrollArea->setWidgetResizable(true);
     m_impl->inspectorScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_impl->inspectorScrollArea->setStyleSheet(STYLE_DRAWER_BG);
+    m_impl->inspectorScrollArea->setStyleSheet(browser_shared::kStyleDrawerBg);
 
     m_impl->inspectorDrawer = new QWidget(m_impl->inspectorScrollArea);
     m_impl->inspectorDrawer->setMinimumWidth(0);
@@ -1495,12 +1623,14 @@ void WorkshopBrowserWidget::setupUi()
     m_impl->tierBadgeLabel = new QLabel("Native (Compatible)", m_impl->inspectorDrawer);
     m_impl->tierBadgeLabel->setTextFormat(Qt::PlainText);
     m_impl->tierBadgeLabel->setAlignment(Qt::AlignCenter);
+    m_impl->tierBadgeLabel->setWordWrap(true);
     drawerLayout->addWidget(m_impl->tierBadgeLabel);
 
     auto *scoreBox = new QHBoxLayout();
     scoreBox->setSpacing(8);
     m_impl->compatScoreLabel = new QLabel("Compatibility: 100%", m_impl->inspectorDrawer);
     m_impl->compatScoreLabel->setTextFormat(Qt::PlainText);
+    m_impl->compatScoreLabel->setWordWrap(true);
     m_impl->compatScoreLabel->setStyleSheet("font-size: 11px; font-weight: 600; color: #e2e8f0;");
     scoreBox->addWidget(m_impl->compatScoreLabel);
 
@@ -1514,14 +1644,15 @@ void WorkshopBrowserWidget::setupUi()
     scoreBox->addWidget(m_impl->compatScoreBar, 1);
     drawerLayout->addLayout(scoreBox);
 
-    m_impl->vramFpsMetricsLabel =
-        new QLabel("VRAM: 64 MB  |  Target: 60 FPS", m_impl->inspectorDrawer);
+    m_impl->vramFpsMetricsLabel = new QLabel("VRAM: --  |  Target: --", m_impl->inspectorDrawer);
+    m_impl->vramFpsMetricsLabel->setWordWrap(true);
     m_impl->vramFpsMetricsLabel->setStyleSheet(
         "font-size: 11px; color: #cbd5e1; background: #20242e; "
         "padding: 6px 10px; border-radius: 5px; border: 1px solid #2e3545;");
     drawerLayout->addWidget(m_impl->vramFpsMetricsLabel);
 
     m_impl->issuesHeaderLabel = new QLabel("<b>Compatibility Notes</b>", m_impl->inspectorDrawer);
+    m_impl->issuesHeaderLabel->setWordWrap(true);
     m_impl->issuesHeaderLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     drawerLayout->addWidget(m_impl->issuesHeaderLabel);
 
@@ -1533,6 +1664,7 @@ void WorkshopBrowserWidget::setupUi()
     drawerLayout->addWidget(m_impl->issuesListWidget);
 
     m_impl->repairsHeaderLabel = new QLabel("<b>Suggested Fixes</b>", m_impl->inspectorDrawer);
+    m_impl->repairsHeaderLabel->setWordWrap(true);
     m_impl->repairsHeaderLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     drawerLayout->addWidget(m_impl->repairsHeaderLabel);
 
@@ -1544,8 +1676,8 @@ void WorkshopBrowserWidget::setupUi()
     drawerLayout->addWidget(m_impl->repairsListWidget);
 
     m_impl->runAutoRepairBtn = new QPushButton("Repair Shader", m_impl->inspectorDrawer);
-    m_impl->runAutoRepairBtn->setFixedHeight(28);
-    m_impl->runAutoRepairBtn->setStyleSheet(STYLE_BUTTON_SECONDARY);
+    m_impl->runAutoRepairBtn->setStyleSheet(browser_shared::kStyleButtonSecondary);
+    browser_shared::sizeButtonFromFontMetrics(m_impl->runAutoRepairBtn, 18, 28, false);
     m_impl->runAutoRepairBtn->setEnabled(false);
     drawerLayout->addWidget(m_impl->runAutoRepairBtn);
 
@@ -1555,6 +1687,7 @@ void WorkshopBrowserWidget::setupUi()
     statusTitle->setStyleSheet("font-size: 11px; color: #94a3b8;");
     statusRow->addWidget(statusTitle);
     m_impl->installStatusBadge = new QLabel("Not Subscribed", m_impl->inspectorDrawer);
+    m_impl->installStatusBadge->setWordWrap(true);
     m_impl->installStatusBadge->setStyleSheet("font-size: 11px;");
     statusRow->addWidget(m_impl->installStatusBadge, 1);
     drawerLayout->addLayout(statusRow);
@@ -1567,15 +1700,13 @@ void WorkshopBrowserWidget::setupUi()
     m_impl->downloadProgressBar = new QProgressBar(m_impl->downloadProgressBox);
     m_impl->downloadProgressBar->setRange(0, 100);
     m_impl->downloadProgressBar->setValue(0);
-    m_impl->downloadProgressBar->setFixedHeight(10);
-    m_impl->downloadProgressBar->setStyleSheet(
-        "QProgressBar { background: #20242e; border: 1px solid #2e3545; border-radius: 4px; "
-        "text-align: center; font-size: 9px; color: white; }"
-        "QProgressBar::chunk { background-color: #0284c7; border-radius: 3px; }");
+    m_impl->downloadProgressBar->setMinimumHeight(14);
+    m_impl->downloadProgressBar->setStyleSheet(browser_shared::kStyleProgressBar);
     dlLayout->addWidget(m_impl->downloadProgressBar);
 
     m_impl->downloadTelemetryLabel = new QLabel("Downloading: 0%", m_impl->downloadProgressBox);
     m_impl->downloadTelemetryLabel->setTextFormat(Qt::PlainText);
+    m_impl->downloadTelemetryLabel->setWordWrap(true);
     m_impl->downloadTelemetryLabel->setStyleSheet("font-size: 11px; color: #38bdf8;");
     dlLayout->addWidget(m_impl->downloadTelemetryLabel);
 
@@ -1583,21 +1714,21 @@ void WorkshopBrowserWidget::setupUi()
     drawerLayout->addWidget(m_impl->downloadProgressBox);
 
     m_impl->subscribeDownloadBtn = new QPushButton("Subscribe & Download", m_impl->inspectorDrawer);
-    m_impl->subscribeDownloadBtn->setFixedHeight(28);
-    m_impl->subscribeDownloadBtn->setStyleSheet(STYLE_BUTTON_SECONDARY);
+    m_impl->subscribeDownloadBtn->setStyleSheet(browser_shared::kStyleButtonSecondary);
+    browser_shared::sizeButtonFromFontMetrics(m_impl->subscribeDownloadBtn, 18, 28, false);
     drawerLayout->addWidget(m_impl->subscribeDownloadBtn);
 
     auto *applyRow = new QHBoxLayout();
     applyRow->setSpacing(8);
     m_impl->monitorTargetCombo = new QComboBox(m_impl->inspectorDrawer);
-    m_impl->monitorTargetCombo->setFixedHeight(28);
-    m_impl->monitorTargetCombo->addItems({"All Displays", "DP-1", "HDMI-A-1"});
-    m_impl->monitorTargetCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
+    m_impl->monitorTargetCombo->setMinimumHeight(28);
+    m_impl->monitorTargetCombo->setStyleSheet(browser_shared::kStyleToolbarCombo);
+    browser_shared::bindMonitorTargetCombo(m_impl->monitorTargetCombo, this);
     applyRow->addWidget(m_impl->monitorTargetCombo, 1);
 
     m_impl->applyToMonitorBtn = new QPushButton("Apply", m_impl->inspectorDrawer);
-    m_impl->applyToMonitorBtn->setFixedHeight(28);
-    m_impl->applyToMonitorBtn->setStyleSheet(STYLE_BUTTON_PRIMARY);
+    m_impl->applyToMonitorBtn->setStyleSheet(browser_shared::kStyleButtonPrimary);
+    browser_shared::sizeButtonFromFontMetrics(m_impl->applyToMonitorBtn, 18, 28, false);
     m_impl->applyToMonitorBtn->setEnabled(false);
     applyRow->addWidget(m_impl->applyToMonitorBtn, 1);
     drawerLayout->addLayout(applyRow);
@@ -1617,6 +1748,7 @@ void WorkshopBrowserWidget::setupUi()
     bottomLayout->setContentsMargins(10, 5, 10, 5);
 
     m_impl->statusTelemetryLabel = new QLabel("0 items", bottomStrip);
+    m_impl->statusTelemetryLabel->setWordWrap(true);
     m_impl->statusTelemetryLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
     bottomLayout->addWidget(m_impl->statusTelemetryLabel);
     bottomLayout->addStretch();
@@ -1758,61 +1890,192 @@ void WorkshopBrowserWidget::wireSignals()
                                });
     });
 
-    // Real shader auto-repair pipeline via we_compat_scan_directory + we_compat_apply_auto_repairs
+    // Async shader auto-repair pipeline via we_compat_scan_directory + we_compat_apply_auto_repairs
     connect(m_impl->runAutoRepairBtn, &QPushButton::clicked, this, [this]() {
         if (m_impl->selectedItemIndex < 0 ||
             static_cast<size_t>(m_impl->selectedItemIndex) >= m_impl->filteredRecords.size()) {
             return;
         }
 
-        auto &rec = m_impl->filteredRecords[m_impl->selectedItemIndex];
-        std::string srcDir = rec.file_path.toStdString();
+        auto &selectedRec = m_impl->filteredRecords[m_impl->selectedItemIndex];
+        const uint64_t pubId = selectedRec.published_file_id;
+        if (m_impl->repairInFlightId == pubId) {
+            return;
+        }
+        const std::string srcDir = selectedRec.file_path.toStdString();
         std::error_code ec;
         if (srcDir.empty() || !std::filesystem::is_directory(srcDir, ec)) {
-            rec.issue_messages.push_back("[ERROR] Repair source directory is unavailable.");
-            m_impl->updateInspector(rec);
+            selectedRec.issue_messages.push_back("[ERROR] Repair source directory is unavailable.");
+            m_impl->updateInspector(selectedRec);
             return;
         }
 
-        CompatScannerPtr scanner(we_compat_scanner_create(true, true), &we_compat_scanner_destroy);
-        CompatReportPtr preRep(we_compat_report_alloc(), &we_compat_report_free);
-        CompatReportPtr postRep(we_compat_report_alloc(), &we_compat_report_free);
-        if (!scanner || !preRep || !postRep) {
-            return;
-        }
+        m_impl->reapFinishedCompatWorkers();
+        m_impl->repairInFlightId = pubId;
+        m_impl->runAutoRepairBtn->setEnabled(false);
+        m_impl->runAutoRepairBtn->setText("Repairing...");
 
-        if (!we_compat_scan_directory(scanner.get(), srcDir.c_str(), preRep.get())) {
-            rec.issue_messages.push_back("[ERROR] Compatibility scan failed on source wallpaper.");
-            m_impl->updateInspector(rec);
-            return;
-        }
+        const QString cacheRoot =
+            QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation) +
+            "/wwal/repaired";
+        const std::string repairedDirStr =
+            (std::filesystem::path(cacheRoot.toStdString()) / std::to_string(pubId)).string();
+        const WorkshopRecord recSnapshot = selectedRec;
+        const uint64_t repairGen = ++m_impl->compatRepairGeneration;
+        QPointer<WorkshopBrowserWidget> self(this);
 
-        QString cacheRoot = QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation) +
-                            "/wwal/repaired";
-        std::filesystem::path repairedDir =
-            std::filesystem::path(cacheRoot.toStdString()) / std::to_string(rec.published_file_id);
-        std::filesystem::create_directories(repairedDir, ec);
+        auto worker = std::make_unique<Impl::AsyncCompatWorker>();
+        worker->kind = Impl::AsyncCompatWorker::Kind::Repair;
+        worker->cancel = std::make_shared<std::atomic<bool>>(false);
+        Impl::AsyncCompatWorker *workerPtr = worker.get();
+        std::shared_ptr<std::atomic<bool>> cancelFlag = worker->cancel;
 
-        if (!we_compat_apply_auto_repairs(preRep.get(), srcDir.c_str(),
-                                          repairedDir.string().c_str())) {
-            rec.issue_messages.push_back("[ERROR] Auto-repair failed to write output shaders.");
-            m_impl->updateInspector(rec);
-            return;
-        }
+        worker->thread = std::thread([self, workerPtr, cancelFlag, repairGen, pubId, srcDir,
+                                      repairedDirStr, recSnapshot]() {
+            struct DoneGuard {
+                Impl::AsyncCompatWorker *w;
+                ~DoneGuard() { w->done.store(true, std::memory_order_release); }
+            } doneGuard{workerPtr};
 
-        if (we_compat_scan_directory(scanner.get(), repairedDir.string().c_str(), postRep.get())) {
-            rec.file_path = QString::fromStdString(repairedDir.string());
-            populateIssuesFromReport(postRep.get(), rec);
-            rec.compat_details_loaded = true;
-        }
+            QString errorMsg;
+            WorkshopRecord updated = recSnapshot;
+            bool postScanned = false;
 
-        auto allIt = m_impl->allIdToIndex.find(rec.published_file_id);
-        if (allIt != m_impl->allIdToIndex.end()) {
-            m_impl->allRecords[allIt->second] = rec;
-            m_impl->enqueueAsyncUpsert(toCatalogRecord(rec));
-        }
+            if (!cancelFlag->load(std::memory_order_acquire)) {
+                CompatScannerPtr scanner(we_compat_scanner_create(true, true),
+                                         &we_compat_scanner_destroy);
+                CompatReportPtr preRep(we_compat_report_alloc(), &we_compat_report_free);
+                CompatReportPtr postRep(we_compat_report_alloc(), &we_compat_report_free);
 
-        m_impl->updateInspector(rec);
+                if (!scanner || !preRep || !postRep) {
+                    errorMsg = QStringLiteral("[ERROR] Compatibility scanner unavailable.");
+                } else if (!we_compat_scan_directory(scanner.get(), srcDir.c_str(), preRep.get())) {
+                    errorMsg =
+                        QStringLiteral("[ERROR] Compatibility scan failed on source wallpaper.");
+                } else if (!cancelFlag->load(std::memory_order_acquire)) {
+                    std::error_code dirEc;
+                    std::filesystem::create_directories(repairedDirStr, dirEc);
+                    if (dirEc) {
+                        errorMsg = QStringLiteral("[ERROR] Failed to create repair output folder.");
+                    } else if (!we_compat_apply_auto_repairs(preRep.get(), srcDir.c_str(),
+                                                             repairedDirStr.c_str())) {
+                        errorMsg =
+                            QStringLiteral("[ERROR] Auto-repair failed to write output shaders.");
+                    } else if (!cancelFlag->load(std::memory_order_acquire) &&
+                               we_compat_scan_directory(scanner.get(), repairedDirStr.c_str(),
+                                                        postRep.get())) {
+                        updated.file_path = QString::fromStdString(repairedDirStr);
+                        populateIssuesFromReport(postRep.get(), updated);
+                        updated.compat_details_loaded = true;
+                        postScanned = true;
+                    }
+                }
+            }
+
+            if (cancelFlag->load(std::memory_order_acquire) || !self) {
+                return;
+            }
+
+            QMetaObject::invokeMethod(
+                self,
+                [self, repairGen, pubId, postScanned, updated = std::move(updated),
+                 errorMsg]() mutable {
+                    if (!self) {
+                        return;
+                    }
+                    auto &impl = *self->m_impl;
+                    impl.reapFinishedCompatWorkers();
+                    if (impl.repairInFlightId == pubId) {
+                        impl.repairInFlightId = 0;
+                    }
+                    if (repairGen != impl.compatRepairGeneration) {
+                        return;
+                    }
+
+                    if (!errorMsg.isEmpty()) {
+                        auto filtIt = impl.idToIndex.find(pubId);
+                        if (filtIt != impl.idToIndex.end()) {
+                            auto &cur = impl.filteredRecords[filtIt->second];
+                            cur.issue_messages.push_back(errorMsg);
+                            if (impl.selectedPublishedFileId == pubId) {
+                                impl.updateInspector(cur);
+                            }
+                        } else if (impl.selectedItemIndex >= 0 &&
+                                   static_cast<size_t>(impl.selectedItemIndex) <
+                                       impl.filteredRecords.size()) {
+                            impl.updateInspector(impl.filteredRecords[impl.selectedItemIndex]);
+                        }
+                        return;
+                    }
+
+                    if (impl.compatDetailsCache.size() >= 256) {
+                        impl.compatDetailsCache.clear();
+                    }
+                    impl.compatDetailsCache[pubId] = updated;
+
+                    // Persist repair updates directly to SQLite even when in-memory allRecords
+                    // is empty (SQLite-backed catalog mode clears allIdToIndex).
+                    WorkshopRecord dbRec = updated;
+                    auto allIt = impl.allIdToIndex.find(pubId);
+                    if (allIt != impl.allIdToIndex.end()) {
+                        auto &allRec = impl.allRecords[allIt->second];
+                        if (postScanned) {
+                            allRec.file_path = updated.file_path;
+                            allRec.compat_tier = updated.compat_tier;
+                            allRec.compat_score = updated.compat_score;
+                            allRec.estimated_vram_mb = updated.estimated_vram_mb;
+                            allRec.estimated_fps = updated.estimated_fps;
+                            allRec.issue_messages = updated.issue_messages;
+                            allRec.repair_descriptions = updated.repair_descriptions;
+                            allRec.compat_details_loaded = true;
+                        }
+                        dbRec = allRec;
+                    } else if (self->m_indexMgr && self->m_indexMgr->isOpen()) {
+                        if (auto existing = self->m_indexMgr->getItem(pubId)) {
+                            WorkshopRecord base = fromCatalogRecord(*existing);
+                            if (postScanned) {
+                                base.file_path = updated.file_path;
+                                base.compat_tier = updated.compat_tier;
+                                base.compat_score = updated.compat_score;
+                                base.estimated_vram_mb = updated.estimated_vram_mb;
+                                base.estimated_fps = updated.estimated_fps;
+                                base.issue_messages = updated.issue_messages;
+                                base.repair_descriptions = updated.repair_descriptions;
+                                base.compat_details_loaded = true;
+                            }
+                            dbRec = std::move(base);
+                        }
+                    }
+
+                    if (self->m_indexMgr && self->m_indexMgr->isOpen()) {
+                        impl.enqueueAsyncUpsert(toCatalogRecord(dbRec));
+                    }
+
+                    auto filtIt = impl.idToIndex.find(pubId);
+                    if (filtIt != impl.idToIndex.end()) {
+                        auto &cur = impl.filteredRecords[filtIt->second];
+                        if (postScanned) {
+                            cur.file_path = updated.file_path;
+                            cur.compat_tier = updated.compat_tier;
+                            cur.compat_score = updated.compat_score;
+                            cur.estimated_vram_mb = updated.estimated_vram_mb;
+                            cur.estimated_fps = updated.estimated_fps;
+                            cur.issue_messages = updated.issue_messages;
+                            cur.repair_descriptions = updated.repair_descriptions;
+                            cur.compat_details_loaded = true;
+                        }
+                        if (impl.selectedPublishedFileId == pubId) {
+                            impl.updateInspector(cur);
+                        }
+                    } else if (impl.selectedItemIndex >= 0 &&
+                               static_cast<size_t>(impl.selectedItemIndex) <
+                                   impl.filteredRecords.size()) {
+                        impl.updateInspector(impl.filteredRecords[impl.selectedItemIndex]);
+                    }
+                },
+                Qt::QueuedConnection);
+        });
+        m_impl->compatWorkers.push_back(std::move(worker));
     });
 
     connect(m_impl->applyToMonitorBtn, &QPushButton::clicked, this, [this]() {
@@ -1898,7 +2161,6 @@ void WorkshopBrowserWidget::onItemHoverStarted(int itemIndex)
 void WorkshopBrowserWidget::onDownloadProgressUpdated(uint64_t publishedFileId, float progressPct,
                                                       float speedBps)
 {
-    double speedMiB = static_cast<double>(std::max(0.0f, speedBps)) / (1024.0 * 1024.0);
     float clampedPct = std::clamp(progressPct, 0.0f, 100.0f);
 
     auto allIt = m_impl->allIdToIndex.find(publishedFileId);
@@ -1906,17 +2168,22 @@ void WorkshopBrowserWidget::onDownloadProgressUpdated(uint64_t publishedFileId, 
         if (progressPct >= 100.0f) {
             m_impl->allRecords[allIt->second].install_state =
                 WAYWAL_UGC_STATE_INSTALLED | WAYWAL_UGC_STATE_SUBSCRIBED;
+            m_impl->allRecords[allIt->second].active_download_state = TaskState::Installed;
         } else {
             m_impl->allRecords[allIt->second].install_state |= WAYWAL_UGC_STATE_DOWNLOADING;
+            m_impl->allRecords[allIt->second].active_download_state = TaskState::Downloading;
+            m_impl->allRecords[allIt->second].download_pct = clampedPct;
+            m_impl->allRecords[allIt->second].download_speed_bps = speedBps;
         }
     }
 
     auto it = m_impl->idToIndex.find(publishedFileId);
     if (it == m_impl->idToIndex.end()) {
         if (m_impl->downloadTelemetryLabel && progressPct < 100.0f) {
-            m_impl->downloadTelemetryLabel->setText(QString("Downloading: %1% (%2 MB/s)")
-                                                        .arg(static_cast<int>(clampedPct))
-                                                        .arg(QString::number(speedMiB, 'f', 1)));
+            browser_shared::updateDownloadProgressWidgets(
+                m_impl->downloadProgressBox, m_impl->downloadProgressBar,
+                m_impl->downloadTelemetryLabel, TaskState::Downloading, clampedPct, speedBps, 0,
+                QStringLiteral("Download"));
         }
         return;
     }
@@ -1925,29 +2192,23 @@ void WorkshopBrowserWidget::onDownloadProgressUpdated(uint64_t publishedFileId, 
 
     if (progressPct >= 100.0f) {
         rec.install_state = WAYWAL_UGC_STATE_INSTALLED | WAYWAL_UGC_STATE_SUBSCRIBED;
+        rec.active_download_state = TaskState::Installed;
+        rec.download_pct = 100.0f;
+        rec.download_speed_bps = 0.0f;
         if (m_impl->selectedItemIndex == static_cast<int>(it->second)) {
             m_impl->downloadProgressBox->setVisible(false);
             m_impl->updateInspector(rec);
         }
     } else {
         rec.install_state |= WAYWAL_UGC_STATE_DOWNLOADING;
+        rec.active_download_state = TaskState::Downloading;
+        rec.download_pct = clampedPct;
+        rec.download_speed_bps = speedBps;
         if (m_impl->selectedItemIndex == static_cast<int>(it->second)) {
-            m_impl->downloadProgressBox->setVisible(true);
-            m_impl->downloadProgressBar->setValue(static_cast<int>(clampedPct));
-
-            uint64_t downloadedBytes = static_cast<uint64_t>(
-                static_cast<double>(rec.file_size_bytes) * (clampedPct / 100.0));
-            uint32_t etaSec = (speedBps > 1024.0f && rec.file_size_bytes > downloadedBytes)
-                                  ? static_cast<uint32_t>((rec.file_size_bytes - downloadedBytes) /
-                                                          static_cast<uint64_t>(speedBps))
-                                  : 0;
-
-            m_impl->downloadTelemetryLabel->setText(
-                QString("Downloading: %1 / %2 (%3 MB/s, ETA: %4s)")
-                    .arg(formatBytes(downloadedBytes))
-                    .arg(formatBytes(rec.file_size_bytes))
-                    .arg(QString::number(speedMiB, 'f', 1))
-                    .arg(etaSec));
+            browser_shared::updateDownloadProgressWidgets(
+                m_impl->downloadProgressBox, m_impl->downloadProgressBar,
+                m_impl->downloadTelemetryLabel, TaskState::Downloading, clampedPct, speedBps,
+                rec.file_size_bytes, QStringLiteral("Download"));
         }
     }
 }

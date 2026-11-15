@@ -51,6 +51,7 @@
 #include "grid/hover_preview_controller.hpp"
 #include "grid/virtualized_grid_widget.hpp"
 #include "queue/download_manager.hpp"
+#include "studio/dock/browser_shared.hpp"
 #include "wizard/creator_packaging_wizard.hpp"
 
 #include <waywal/thumb_cache.h>
@@ -60,6 +61,7 @@ namespace wwal::studio {
 
 namespace {
 
+using browser_shared::formatBytes;
 using WwpkgHandlePtr = std::unique_ptr<wwpkg_package_t, decltype(&wwpkg_close)>;
 
 struct OpenHubRecord {
@@ -103,30 +105,13 @@ struct OpenHubRecord {
 
     bool is_installed{false};
     bool is_downloading{false};
+    TaskState active_download_state{TaskState::Queued};
     bool last_download_failed{false};
     bool last_download_cancelled{false};
     QString last_error_message;
     float download_pct{0.0f};
     float download_speed_bps{0.0f};
 };
-
-QString formatBytes(uint64_t bytes)
-{
-    constexpr double KiB = 1024.0;
-    constexpr double MiB = KiB * 1024.0;
-    constexpr double GiB = MiB * 1024.0;
-
-    if (bytes >= GiB) {
-        return QString::asprintf("%.2f GB", static_cast<double>(bytes) / GiB);
-    }
-    if (bytes >= MiB) {
-        return QString::asprintf("%.1f MB", static_cast<double>(bytes) / MiB);
-    }
-    if (bytes >= KiB) {
-        return QString::asprintf("%.1f KB", static_cast<double>(bytes) / KiB);
-    }
-    return QString::asprintf("%llu B", static_cast<unsigned long long>(bytes));
-}
 
 QString bytesToHex(const uint8_t *data, size_t len)
 {
@@ -215,9 +200,9 @@ bool parseVerifiedPackageFile(const std::filesystem::path &pkgPath, OpenHubRecor
     // Extract preview asset into local cache for verified packages so grid cards display thumbnails
     // before activation.
     if (rec.is_verified) {
-        const char *previewCands[4] = {
-            man->entrypoint_preview[0] != '\0' ? man->entrypoint_preview : nullptr, "preview.webp",
-            "preview.png", "preview.jpg"};
+        const char *previewCands[4] = {man->entrypoint_preview[0] != '\0' ? man->entrypoint_preview
+                                                                          : nullptr,
+                                       "preview.webp", "preview.png", "preview.jpg"};
         for (const char *cand : previewCands) {
             if (!cand || cand[0] == '\0') {
                 continue;
@@ -253,12 +238,8 @@ bool parseVerifiedPackageFile(const std::filesystem::path &pkgPath, OpenHubRecor
                                             ? std::filesystem::file_size(outPreview, ec)
                                             : 0;
             if (ec || existingSz != assetLen) {
-                QFile pf(QString::fromStdString(outPreview.string()));
-                if (pf.open(QIODevice::WriteOnly)) {
-                    pf.write(reinterpret_cast<const char *>(assetBytes),
-                             static_cast<qint64>(assetLen));
-                    pf.close();
-                }
+                (void)browser_shared::atomicWriteBytesWithFsync(outPreview, assetBytes, assetLen,
+                                                                0644);
             }
             if (std::filesystem::is_regular_file(outPreview, ec)) {
                 rec.preview_path = QString::fromStdString(outPreview.string());
@@ -350,11 +331,20 @@ static void parseHubManifestJsonFile(const std::filesystem::path &jsonPath,
             rec.name = rec.id;
         }
         rec.version = obj.value(QStringLiteral("version")).toString(QStringLiteral("1.0.0"));
-        rec.author_name = obj.value(QStringLiteral("author_name")).toString();
-        if (rec.author_name.isEmpty()) {
-            rec.author_name = obj.value(QStringLiteral("author")).toString();
+        const QJsonValue authorVal = obj.value(QStringLiteral("author"));
+        if (authorVal.isObject()) {
+            const QJsonObject authorObj = authorVal.toObject();
+            rec.author_name = authorObj.value(QStringLiteral("name")).toString();
+            rec.author_email = authorObj.value(QStringLiteral("email")).toString();
+            rec.author_pubkey_hex = authorObj.value(QStringLiteral("pubkey")).toString();
+        } else {
+            rec.author_name = obj.value(QStringLiteral("author_name")).toString();
+            if (rec.author_name.isEmpty() && authorVal.isString()) {
+                rec.author_name = authorVal.toString();
+            }
+            rec.author_email = obj.value(QStringLiteral("author_email")).toString();
+            rec.author_pubkey_hex = obj.value(QStringLiteral("author_pubkey")).toString();
         }
-        rec.author_email = obj.value(QStringLiteral("author_email")).toString();
         rec.license = obj.value(QStringLiteral("license")).toString(QStringLiteral("CC-BY-4.0"));
         rec.description = obj.value(QStringLiteral("description")).toString();
         rec.download_url = obj.value(QStringLiteral("download_url")).toString();
@@ -366,27 +356,42 @@ static void parseHubManifestJsonFile(const std::filesystem::path &jsonPath,
             rec.cid = QStringLiteral("sha256:") + rec.id;
         }
         rec.file_size_bytes = static_cast<uint64_t>(
-            obj.value(QStringLiteral("file_size_bytes"))
-                .toVariant()
-                .toULongLong());
+            obj.value(QStringLiteral("file_size_bytes")).toVariant().toULongLong());
         if (rec.file_size_bytes == 0) {
             rec.file_size_bytes =
                 static_cast<uint64_t>(obj.value(QStringLiteral("size")).toVariant().toULongLong());
         }
         rec.timestamp =
             static_cast<uint64_t>(obj.value(QStringLiteral("timestamp")).toVariant().toULongLong());
-        rec.download_count = static_cast<uint32_t>(
-            obj.value(QStringLiteral("download_count")).toInt(
-                obj.value(QStringLiteral("downloads")).toInt(0)));
+        if (rec.timestamp == 0) {
+            const QString pubIso = obj.value(QStringLiteral("published_at")).toString().trimmed();
+            if (!pubIso.isEmpty()) {
+                const QDateTime dt = QDateTime::fromString(pubIso, Qt::ISODate);
+                if (dt.isValid() && dt.toSecsSinceEpoch() > 0) {
+                    rec.timestamp = static_cast<uint64_t>(dt.toSecsSinceEpoch());
+                }
+            }
+        }
+        rec.download_count =
+            static_cast<uint32_t>(obj.value(QStringLiteral("download_count"))
+                                      .toInt(obj.value(QStringLiteral("downloads")).toInt(0)));
         rec.rating = static_cast<float>(obj.value(QStringLiteral("rating")).toDouble(0.0));
 
         const QString typeStr = obj.value(QStringLiteral("type")).toString().trimmed().toLower();
-        if (typeStr == QStringLiteral("video")) {
+        if (typeStr == QStringLiteral("video") || typeStr == QStringLiteral("video_stream")) {
             rec.type = WWPKG_TYPE_VIDEO_STREAM;
-        } else if (typeStr == QStringLiteral("compute")) {
+        } else if (typeStr == QStringLiteral("compute") ||
+                   typeStr == QStringLiteral("shader_compute")) {
             rec.type = WWPKG_TYPE_SHADER_COMPUTE;
-        } else if (typeStr == QStringLiteral("scene")) {
+        } else if (typeStr == QStringLiteral("scene") || typeStr == QStringLiteral("scene_2d")) {
             rec.type = WWPKG_TYPE_SCENE_2D;
+        } else if (typeStr == QStringLiteral("puppet") ||
+                   typeStr == QStringLiteral("scene_puppet")) {
+            rec.type = WWPKG_TYPE_SCENE_PUPPET;
+        } else if (typeStr == QStringLiteral("particles") ||
+                   typeStr == QStringLiteral("particle") ||
+                   typeStr == QStringLiteral("scene_particles")) {
+            rec.type = WWPKG_TYPE_SCENE_PARTICLES;
         } else {
             rec.type = WWPKG_TYPE_SHADER_FRAGMENT;
         }
@@ -402,14 +407,54 @@ static void parseHubManifestJsonFile(const std::filesystem::path &jsonPath,
         if (prevRaw.isEmpty()) {
             prevRaw = obj.value(QStringLiteral("preview")).toString().trimmed();
         }
+        if (prevRaw.isEmpty()) {
+            prevRaw = obj.value(QStringLiteral("preview_card")).toString().trimmed();
+        }
+        if (prevRaw.isEmpty() && obj.value(QStringLiteral("entrypoint")).isObject()) {
+            const QJsonObject ep = obj.value(QStringLiteral("entrypoint")).toObject();
+            prevRaw = ep.value(QStringLiteral("preview")).toString().trimmed();
+            if (prevRaw.isEmpty()) {
+                prevRaw = ep.value(QStringLiteral("preview_card")).toString().trimmed();
+            }
+        }
         if (!prevRaw.isEmpty()) {
             rec.preview_path = resolveConfinedHubAsset(rootDir, prevRaw);
         }
 
         QString pkgRel = obj.value(QStringLiteral("package_path")).toString().trimmed();
+        if (pkgRel.isEmpty()) {
+            pkgRel = obj.value(QStringLiteral("local_package_path")).toString().trimmed();
+        }
         if (!pkgRel.isEmpty()) {
             rec.local_pkg_path = resolveConfinedHubAsset(rootDir, pkgRel);
-            rec.is_installed = !rec.local_pkg_path.isEmpty();
+            if (!rec.local_pkg_path.isEmpty()) {
+                OpenHubRecord pkgMeta;
+                if (parseVerifiedPackageFile(rec.local_pkg_path.toStdString(), pkgMeta)) {
+                    rec.is_verified = pkgMeta.is_verified;
+                    rec.is_trusted = pkgMeta.is_trusted;
+                    rec.is_installed = pkgMeta.is_installed;
+                    if (!pkgMeta.author_pubkey_hex.isEmpty()) {
+                        rec.author_pubkey_hex = pkgMeta.author_pubkey_hex;
+                    }
+                    if (!pkgMeta.merkle_root_hex.isEmpty()) {
+                        rec.merkle_root_hex = pkgMeta.merkle_root_hex;
+                    }
+                    if (!pkgMeta.signature_hex.isEmpty()) {
+                        rec.signature_hex = pkgMeta.signature_hex;
+                    }
+                    if (!pkgMeta.cid.isEmpty()) {
+                        rec.cid = pkgMeta.cid;
+                    }
+                    if (rec.preview_path.isEmpty() && !pkgMeta.preview_path.isEmpty()) {
+                        rec.preview_path = pkgMeta.preview_path;
+                    }
+                    if (rec.file_size_bytes == 0) {
+                        rec.file_size_bytes = pkgMeta.file_size_bytes;
+                    }
+                } else {
+                    rec.is_installed = true;
+                }
+            }
         }
 
         seenIds.insert(std::move(key));
@@ -440,7 +485,7 @@ std::vector<OpenHubRecord> scanLocalHubRootsWorker(const std::atomic<bool> &canc
         addRoot(std::filesystem::path(extraDownloadDir));
     }
 
-    QString dataBase = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    const QString dataBase = browser_shared::resolveXdgDataHomeQt();
     if (!dataBase.isEmpty()) {
         addRoot(std::filesystem::path((dataBase + "/waywal/hub").toStdString()));
         addRoot(std::filesystem::path((dataBase + "/wwal/hub").toStdString()));
@@ -471,7 +516,9 @@ std::vector<OpenHubRecord> scanLocalHubRootsWorker(const std::atomic<bool> &canc
                 break;
             }
             std::error_code fEc;
-            if (!entry.is_regular_file(fEc) || entry.path().extension() != ".wwpkg") {
+            const auto st = entry.symlink_status(fEc);
+            if (fEc || std::filesystem::is_symlink(st) || !std::filesystem::is_regular_file(st) ||
+                entry.path().extension() != ".wwpkg") {
                 continue;
             }
 
@@ -499,48 +546,21 @@ std::vector<OpenHubRecord> scanLocalHubRootsWorker(const std::atomic<bool> &canc
     return records;
 }
 
-constexpr const char *STYLE_PANEL_BG = "background-color: #14171c; color: #f1f5f9;";
-constexpr const char *STYLE_DRAWER_BG =
-    "background-color: #1a1e26; border-left: 1px solid #2b303c;";
-constexpr const char *STYLE_TOOLBAR_COMBO =
-    "QComboBox { background-color: #1e222b; color: #f1f5f9; border: 1px solid #334155; "
-    "border-radius: 6px; padding: 4px 10px; min-height: 24px; font-size: 12px; }"
-    "QComboBox::drop-down { border: none; width: 20px; }"
-    "QComboBox QAbstractItemView { background-color: #1e222b; color: #f1f5f9; "
-    "selection-background-color: #0284c7; selection-color: #ffffff; border: 1px solid #334155; }";
-
-constexpr const char *STYLE_SEARCH_BAR =
-    "QLineEdit { background-color: #1e222b; color: #f1f5f9; border: 1px solid #334155; "
-    "border-radius: 6px; padding: 4px 10px; font-size: 12px; }"
-    "QLineEdit:focus { border: 1px solid #38bdf8; }";
-
-constexpr const char *STYLE_BUTTON_PRIMARY =
-    "QPushButton { background-color: #0284c7; color: #ffffff; border: none; "
-    "border-radius: 6px; padding: 6px 14px; font-weight: bold; font-size: 12px; }"
-    "QPushButton:hover { background-color: #0369a1; }"
-    "QPushButton:disabled { background-color: #334155; color: #64748b; }";
-
-constexpr const char *STYLE_BUTTON_SECONDARY =
-    "QPushButton { background-color: #2b303c; color: #e2e8f0; border: 1px solid #334155; "
-    "border-radius: 6px; padding: 6px 12px; font-size: 12px; }"
-    "QPushButton:hover { background-color: #384252; color: #ffffff; }"
-    "QPushButton:disabled { background-color: #1e222b; color: #64748b; }";
-
 constexpr const char *STYLE_PILL_COMPUTE =
     "background-color: #064e3b; color: #34d399; border: 1px solid #059669; "
-    "border-radius: 10px; padding: 2px 8px; font-size: 10px; font-weight: bold;";
+    "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: bold;";
 
 constexpr const char *STYLE_PILL_AUDIO =
     "background-color: #075985; color: #38bdf8; border: 1px solid #0284c7; "
-    "border-radius: 10px; padding: 2px 8px; font-size: 10px; font-weight: bold;";
+    "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: bold;";
 
 constexpr const char *STYLE_PILL_SCRIPT =
     "background-color: #581c87; color: #c084fc; border: 1px solid #7e22ce; "
-    "border-radius: 10px; padding: 2px 8px; font-size: 10px; font-weight: bold;";
+    "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: bold;";
 
 constexpr const char *STYLE_PILL_AIRGAP =
     "background-color: #164e63; color: #22d3ee; border: 1px solid #0891b2; "
-    "border-radius: 10px; padding: 2px 8px; font-size: 10px; font-weight: bold;";
+    "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: bold;";
 
 } // namespace
 
@@ -636,8 +656,7 @@ void OpenHubBrowserWidget::Impl::launchAsyncScan()
     scanCancel.store(false, std::memory_order_relaxed);
     const uint64_t gen = ++scanGeneration;
 
-    QString hubDir =
-        QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "/waywal/hub";
+    const QString hubDir = browser_shared::resolveWaywalDataDirQt(QStringLiteral("hub"));
     QDir().mkpath(hubDir);
 
     QPointer<OpenHubBrowserWidget> self(owner);
@@ -666,6 +685,17 @@ void OpenHubBrowserWidget::Impl::launchAsyncScan()
                         const auto &prev = self->m_impl->allRecords[prevIt->second];
                         if (prev.is_downloading) {
                             incoming.is_downloading = true;
+                            incoming.active_download_state = prev.active_download_state;
+                            incoming.download_pct = prev.download_pct;
+                            incoming.download_speed_bps = prev.download_speed_bps;
+                        } else {
+                            if (prev.last_download_failed && !incoming.is_installed) {
+                                incoming.last_download_failed = true;
+                                incoming.last_error_message = prev.last_error_message;
+                            }
+                            if (prev.last_download_cancelled && !incoming.is_installed) {
+                                incoming.last_download_cancelled = true;
+                            }
                         }
                         if (incoming.download_url.isEmpty() && !prev.download_url.isEmpty()) {
                             incoming.download_url = prev.download_url;
@@ -677,7 +707,8 @@ void OpenHubBrowserWidget::Impl::launchAsyncScan()
                 for (const auto &prev : self->m_impl->allRecords) {
                     std::string idKey = prev.id.toStdString();
                     if (!seenIds.contains(idKey) &&
-                        (prev.is_downloading ||
+                        (prev.is_downloading || prev.last_download_failed ||
+                         prev.last_download_cancelled ||
                          (!prev.download_url.isEmpty() && prev.local_pkg_path.isEmpty()))) {
                         seenIds.insert(std::move(idKey));
                         records.push_back(prev);
@@ -932,7 +963,10 @@ void OpenHubBrowserWidget::Impl::updateInspector(const OpenHubRecord &rec)
 
     if (rec.is_downloading) {
         installStateBadge->setText("<font color='#38bdf8'><b>Downloading...</b></font>");
-        downloadProgressBox->setVisible(true);
+        browser_shared::updateDownloadProgressWidgets(
+            downloadProgressBox, downloadProgressBar, downloadTelemetryLabel,
+            rec.active_download_state, rec.download_pct, rec.download_speed_bps,
+            rec.file_size_bytes, QStringLiteral("Downloading .wwpkg"));
         installDownloadBtn->setText("Cancel Download");
         installDownloadBtn->setEnabled(true);
     } else if (rec.last_download_failed) {
@@ -1023,6 +1057,7 @@ void OpenHubBrowserWidget::Impl::handleDownloadProgress(const QString &pkgId,
         case TaskState::Verifying:
         case TaskState::Indexing:
             rec.is_downloading = true;
+            rec.active_download_state = prog.state;
             rec.last_download_failed = false;
             rec.last_download_cancelled = false;
             rec.last_error_message.clear();
@@ -1084,10 +1119,11 @@ void OpenHubBrowserWidget::Impl::handleDownloadProgress(const QString &pkgId,
     applyState(rec);
 
     if (selectedItemIndex == static_cast<int>(filtIt->second)) {
-        if (prog.state == TaskState::Downloading || prog.state == TaskState::Verifying ||
-            prog.state == TaskState::Queued) {
-            owner->onDownloadProgressUpdated(pkgId, std::min(prog.progress_pct, 99.9f),
-                                             prog.speed_bytes_per_sec);
+        if (browser_shared::isActiveDownloadPipelineState(prog.state)) {
+            browser_shared::updateDownloadProgressWidgets(
+                downloadProgressBox, downloadProgressBar, downloadTelemetryLabel, prog.state,
+                std::min(prog.progress_pct, 99.9f), prog.speed_bytes_per_sec, rec.file_size_bytes,
+                QStringLiteral("Downloading .wwpkg"));
         } else {
             downloadProgressBox->setVisible(false);
             updateInspector(rec);
@@ -1125,41 +1161,46 @@ QSize OpenHubBrowserWidget::minimumSizeHint() const { return QSize(200, 200); }
 
 void OpenHubBrowserWidget::setupUi()
 {
-    setStyleSheet(STYLE_PANEL_BG);
+    setStyleSheet(browser_shared::kStylePanelBg);
 
     auto *rootLayout = new QVBoxLayout(this);
     rootLayout->setContentsMargins(0, 0, 0, 0);
     rootLayout->setSpacing(0);
 
     auto *toolbarFrame = new QFrame(this);
-    toolbarFrame->setStyleSheet("background-color: #181b22; border-bottom: 1px solid #262b36;");
+    toolbarFrame->setStyleSheet(browser_shared::kStyleToolbarFrame);
     auto *toolbarOuter = new QVBoxLayout(toolbarFrame);
-    toolbarOuter->setContentsMargins(10, 8, 10, 8);
+    toolbarOuter->setContentsMargins(8, 8, 8, 8);
     toolbarOuter->setSpacing(8);
 
     auto *topRow = new QHBoxLayout();
-    topRow->setSpacing(8);
+    topRow->setSpacing(6);
 
     m_searchEdit = new QLineEdit(toolbarFrame);
     m_searchEdit->setPlaceholderText("Search Open Hub...");
     m_searchEdit->setClearButtonEnabled(true);
-    m_searchEdit->setFixedHeight(28);
-    m_searchEdit->setStyleSheet(STYLE_SEARCH_BAR);
+    m_searchEdit->setMinimumWidth(40);
+    m_searchEdit->setMinimumHeight(26);
+    m_searchEdit->setStyleSheet(browser_shared::kStyleSearchBar);
     topRow->addWidget(m_searchEdit, 1);
+
+    const QString compactToolBtnStyle = QString::fromLatin1(browser_shared::kStyleButtonSecondary) +
+                                        QStringLiteral(" QToolButton { padding: 4px 8px; }");
 
     m_refreshBtn = new QToolButton(toolbarFrame);
     m_refreshBtn->setText("Refresh");
     m_refreshBtn->setToolTip("Refresh Open Hub feed and local packages");
-    m_refreshBtn->setFixedHeight(28);
-    m_refreshBtn->setStyleSheet(
-        "QToolButton { background-color: #20242e; color: #f1f5f9; border: 1px solid #2c3240; "
-        "border-radius: 5px; padding: 4px 12px; font-size: 12px; }"
-        "QToolButton:hover { background-color: #2a303d; color: #ffffff; }");
+    m_refreshBtn->setStyleSheet(compactToolBtnStyle);
+    browser_shared::sizeButtonFromFontMetrics(m_refreshBtn, 12, 26);
     topRow->addWidget(m_refreshBtn);
 
     m_impl->wizardLaunchBtn = new QToolButton(toolbarFrame);
     m_impl->wizardLaunchBtn->setText("Package...");
-    m_impl->wizardLaunchBtn->setVisible(false);
+    m_impl->wizardLaunchBtn->setToolTip("Open Creator Packaging Wizard to build a .wwpkg package");
+    m_impl->wizardLaunchBtn->setStyleSheet(compactToolBtnStyle);
+    browser_shared::sizeButtonFromFontMetrics(m_impl->wizardLaunchBtn, 12, 26);
+    m_impl->wizardLaunchBtn->setVisible(true);
+    topRow->addWidget(m_impl->wizardLaunchBtn);
 
     toolbarOuter->addLayout(topRow);
 
@@ -1169,14 +1210,14 @@ void OpenHubBrowserWidget::setupUi()
     m_categoryCombo = new QComboBox(toolbarFrame);
     m_categoryCombo->addItems({"All Categories", "Fragment Shaders", "Compute Shaders", "2D Scenes",
                                "Puppet Scenes", "Particle Systems", "Video Streams"});
-    m_categoryCombo->setFixedHeight(26);
-    m_categoryCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
+    m_categoryCombo->setMinimumHeight(26);
+    m_categoryCombo->setStyleSheet(browser_shared::kStyleToolbarCombo);
     filterRow->addWidget(m_categoryCombo, 1);
 
     m_sortCombo = new QComboBox(toolbarFrame);
     m_sortCombo->addItems({"Trending", "Most Downloaded", "Recently Updated", "Name"});
-    m_sortCombo->setFixedHeight(26);
-    m_sortCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
+    m_sortCombo->setMinimumHeight(26);
+    m_sortCombo->setStyleSheet(browser_shared::kStyleToolbarCombo);
     filterRow->addWidget(m_sortCombo, 1);
 
     toolbarOuter->addLayout(filterRow);
@@ -1193,7 +1234,7 @@ void OpenHubBrowserWidget::setupUi()
     m_impl->inspectorScrollArea = new QScrollArea(m_impl->mainSplitter);
     m_impl->inspectorScrollArea->setWidgetResizable(true);
     m_impl->inspectorScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_impl->inspectorScrollArea->setStyleSheet(STYLE_DRAWER_BG);
+    m_impl->inspectorScrollArea->setStyleSheet(browser_shared::kStyleDrawerBg);
 
     m_impl->inspectorDrawer = new QWidget(m_impl->inspectorScrollArea);
     m_impl->inspectorDrawer->setMinimumWidth(0);
@@ -1231,8 +1272,8 @@ void OpenHubBrowserWidget::setupUi()
     cidRow->addWidget(m_impl->inspectorCidLabel, 1);
 
     m_impl->copyCidBtn = new QPushButton("Copy", m_impl->inspectorDrawer);
-    m_impl->copyCidBtn->setFixedSize(60, 26);
-    m_impl->copyCidBtn->setStyleSheet(STYLE_BUTTON_SECONDARY);
+    m_impl->copyCidBtn->setStyleSheet(browser_shared::kStyleButtonSecondary);
+    browser_shared::sizeButtonFromFontMetrics(m_impl->copyCidBtn, 16, 26);
     cidRow->addWidget(m_impl->copyCidBtn);
     drawerLayout->addLayout(cidRow);
 
@@ -1243,11 +1284,13 @@ void OpenHubBrowserWidget::setupUi()
 
     m_impl->authorPubkeyLabel = new QLabel("Public Key: None", m_impl->inspectorDrawer);
     m_impl->authorPubkeyLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
+    m_impl->authorPubkeyLabel->setWordWrap(true);
     m_impl->authorPubkeyLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->authorPubkeyLabel);
 
     m_impl->merkleRootLabel = new QLabel("Merkle Root: None", m_impl->inspectorDrawer);
     m_impl->merkleRootLabel->setStyleSheet("font-size: 11px; color: #94a3b8;");
+    m_impl->merkleRootLabel->setWordWrap(true);
     m_impl->merkleRootLabel->setMinimumWidth(0);
     drawerLayout->addWidget(m_impl->merkleRootLabel);
 
@@ -1313,6 +1356,7 @@ void OpenHubBrowserWidget::setupUi()
     statusRow->addWidget(stLbl);
     m_impl->installStateBadge = new QLabel("Available", m_impl->inspectorDrawer);
     m_impl->installStateBadge->setStyleSheet("font-size: 11px;");
+    m_impl->installStateBadge->setWordWrap(true);
     statusRow->addWidget(m_impl->installStateBadge, 1);
     drawerLayout->addLayout(statusRow);
 
@@ -1324,39 +1368,37 @@ void OpenHubBrowserWidget::setupUi()
     m_impl->downloadProgressBar = new QProgressBar(m_impl->downloadProgressBox);
     m_impl->downloadProgressBar->setRange(0, 100);
     m_impl->downloadProgressBar->setValue(0);
-    m_impl->downloadProgressBar->setFixedHeight(12);
-    m_impl->downloadProgressBar->setStyleSheet(
-        "QProgressBar { background: #1e222b; border: 1px solid #334155; border-radius: 4px; "
-        "text-align: center; font-size: 9px; color: white; }"
-        "QProgressBar::chunk { background-color: #0284c7; border-radius: 3px; }");
+    m_impl->downloadProgressBar->setMinimumHeight(14);
+    m_impl->downloadProgressBar->setStyleSheet(browser_shared::kStyleProgressBar);
     dlLayout->addWidget(m_impl->downloadProgressBar);
 
     m_impl->downloadTelemetryLabel =
         new QLabel("Downloading: 0% (0.0 MB/s)", m_impl->downloadProgressBox);
     m_impl->downloadTelemetryLabel->setTextFormat(Qt::PlainText);
-    m_impl->downloadTelemetryLabel->setStyleSheet("font-size: 10px; color: #38bdf8;");
+    m_impl->downloadTelemetryLabel->setWordWrap(true);
+    m_impl->downloadTelemetryLabel->setStyleSheet("font-size: 11px; color: #38bdf8;");
     dlLayout->addWidget(m_impl->downloadTelemetryLabel);
 
     m_impl->downloadProgressBox->setVisible(false);
     drawerLayout->addWidget(m_impl->downloadProgressBox);
 
     m_impl->installDownloadBtn = new QPushButton("Install", m_impl->inspectorDrawer);
-    m_impl->installDownloadBtn->setFixedHeight(30);
-    m_impl->installDownloadBtn->setStyleSheet(STYLE_BUTTON_PRIMARY);
+    m_impl->installDownloadBtn->setStyleSheet(browser_shared::kStyleButtonPrimary);
+    browser_shared::sizeButtonFromFontMetrics(m_impl->installDownloadBtn, 20, 30, false);
     m_impl->installDownloadBtn->setEnabled(false);
     drawerLayout->addWidget(m_impl->installDownloadBtn);
 
     auto *applyRow = new QHBoxLayout();
     applyRow->setSpacing(8);
     m_impl->monitorTargetCombo = new QComboBox(m_impl->inspectorDrawer);
-    m_impl->monitorTargetCombo->addItems({"All Displays", "DP-1", "HDMI-A-1"});
-    m_impl->monitorTargetCombo->setFixedHeight(28);
-    m_impl->monitorTargetCombo->setStyleSheet(STYLE_TOOLBAR_COMBO);
+    m_impl->monitorTargetCombo->setMinimumHeight(28);
+    m_impl->monitorTargetCombo->setStyleSheet(browser_shared::kStyleToolbarCombo);
+    browser_shared::bindMonitorTargetCombo(m_impl->monitorTargetCombo, this);
     applyRow->addWidget(m_impl->monitorTargetCombo, 1);
 
     m_impl->applyToMonitorBtn = new QPushButton("Apply", m_impl->inspectorDrawer);
-    m_impl->applyToMonitorBtn->setFixedHeight(28);
-    m_impl->applyToMonitorBtn->setStyleSheet(STYLE_BUTTON_SECONDARY);
+    m_impl->applyToMonitorBtn->setStyleSheet(browser_shared::kStyleButtonSecondary);
+    browser_shared::sizeButtonFromFontMetrics(m_impl->applyToMonitorBtn, 16, 28, false);
     m_impl->applyToMonitorBtn->setEnabled(false);
     applyRow->addWidget(m_impl->applyToMonitorBtn, 1);
     drawerLayout->addLayout(applyRow);
@@ -1410,6 +1452,11 @@ void OpenHubBrowserWidget::wireSignals()
     connect(m_impl->wizardLaunchBtn, &QToolButton::clicked, this, [this]() {
         auto *wizard = new CreatorPackagingWizard(this);
         wizard->setAttribute(Qt::WA_DeleteOnClose);
+        connect(wizard, &CreatorPackagingWizard::packageInstallRequested, this,
+                [this](const QString &packagePath, const QString &targetOutput) {
+                    emit packageInstallRequested(packagePath, targetOutput);
+                    refreshFeed();
+                });
         wizard->show();
     });
 
@@ -1459,13 +1506,8 @@ void OpenHubBrowserWidget::wireSignals()
             static_cast<size_t>(m_impl->selectedItemIndex) < m_impl->filteredRecords.size()) {
             QApplication::clipboard()->setText(
                 m_impl->filteredRecords[m_impl->selectedItemIndex].cid);
-            m_impl->copyCidBtn->setText("Copied!");
-            QPointer<OpenHubBrowserWidget> self(this);
-            QTimer::singleShot(1500, this, [self]() {
-                if (self && self->m_impl->copyCidBtn) {
-                    self->m_impl->copyCidBtn->setText("Copy");
-                }
-            });
+            browser_shared::resetButtonTextLater(m_impl->copyCidBtn, QStringLiteral("Copied!"),
+                                                 QStringLiteral("Copy"), 1500);
         }
     });
 
@@ -1503,6 +1545,7 @@ void OpenHubBrowserWidget::wireSignals()
         }
 
         rec.is_downloading = true;
+        rec.active_download_state = TaskState::Queued;
         rec.last_download_cancelled = false;
         rec.last_download_failed = false;
         rec.last_error_message.clear();
@@ -1510,6 +1553,7 @@ void OpenHubBrowserWidget::wireSignals()
         auto allIt = m_impl->allIdToIndex.find(rec.id.toStdString());
         if (allIt != m_impl->allIdToIndex.end()) {
             m_impl->allRecords[allIt->second].is_downloading = true;
+            m_impl->allRecords[allIt->second].active_download_state = TaskState::Queued;
             m_impl->allRecords[allIt->second].last_download_cancelled = false;
             m_impl->allRecords[allIt->second].last_download_failed = false;
         }
@@ -1626,6 +1670,7 @@ void OpenHubBrowserWidget::onDownloadProgressUpdated(const QString &packageId, f
         auto &arec = m_impl->allRecords[allIt->second];
         if (progressPct >= 100.0f) {
             arec.is_downloading = false;
+            arec.active_download_state = TaskState::Installed;
             if (!arec.local_pkg_path.isEmpty()) {
                 OpenHubRecord verifiedMeta;
                 if (parseVerifiedPackageFile(arec.local_pkg_path.toStdString(), verifiedMeta) &&
@@ -1636,6 +1681,7 @@ void OpenHubBrowserWidget::onDownloadProgressUpdated(const QString &packageId, f
             }
         } else {
             arec.is_downloading = true;
+            arec.active_download_state = TaskState::Downloading;
             arec.download_pct = clampedPct;
             arec.download_speed_bps = speedBps;
         }
@@ -1644,7 +1690,7 @@ void OpenHubBrowserWidget::onDownloadProgressUpdated(const QString &packageId, f
     auto it = m_impl->idToIndex.find(key);
     if (it == m_impl->idToIndex.end()) {
         if (m_impl->downloadTelemetryLabel && progressPct < 100.0f) {
-            m_impl->downloadTelemetryLabel->setText(QString("Downloading: %1% (%2 MB/s)")
+            m_impl->downloadTelemetryLabel->setText(QString("Downloading .wwpkg: %1% (%2 MB/s)")
                                                         .arg(static_cast<int>(clampedPct))
                                                         .arg(QString::number(speedMiB, 'f', 1)));
         }
@@ -1655,6 +1701,7 @@ void OpenHubBrowserWidget::onDownloadProgressUpdated(const QString &packageId, f
 
     if (progressPct >= 100.0f) {
         rec.is_downloading = false;
+        rec.active_download_state = TaskState::Installed;
         if (!rec.local_pkg_path.isEmpty()) {
             OpenHubRecord verifiedMeta;
             if (parseVerifiedPackageFile(rec.local_pkg_path.toStdString(), verifiedMeta) &&
@@ -1669,26 +1716,15 @@ void OpenHubBrowserWidget::onDownloadProgressUpdated(const QString &packageId, f
         }
     } else {
         rec.is_downloading = true;
+        rec.active_download_state = TaskState::Downloading;
         rec.download_pct = clampedPct;
         rec.download_speed_bps = speedBps;
 
         if (m_impl->selectedItemIndex == static_cast<int>(it->second)) {
-            m_impl->downloadProgressBox->setVisible(true);
-            m_impl->downloadProgressBar->setValue(static_cast<int>(clampedPct));
-
-            uint64_t downloadedBytes = static_cast<uint64_t>(
-                static_cast<double>(rec.file_size_bytes) * (clampedPct / 100.0));
-            uint32_t etaSec = (speedBps > 1024.0f && rec.file_size_bytes > downloadedBytes)
-                                  ? static_cast<uint32_t>((rec.file_size_bytes - downloadedBytes) /
-                                                          static_cast<uint64_t>(speedBps))
-                                  : 0;
-
-            m_impl->downloadTelemetryLabel->setText(
-                QString("Downloading .wwpkg: %1 / %2 (%3 MB/s, ETA: %4s)")
-                    .arg(formatBytes(downloadedBytes))
-                    .arg(formatBytes(rec.file_size_bytes))
-                    .arg(QString::number(speedMiB, 'f', 1))
-                    .arg(etaSec));
+            browser_shared::updateDownloadProgressWidgets(
+                m_impl->downloadProgressBox, m_impl->downloadProgressBar,
+                m_impl->downloadTelemetryLabel, TaskState::Downloading, clampedPct, speedBps,
+                rec.file_size_bytes, QStringLiteral("Downloading .wwpkg"));
         }
     }
 }

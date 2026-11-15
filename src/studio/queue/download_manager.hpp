@@ -35,6 +35,7 @@ struct DownloadProgress {
     std::string error_message;
     std::string installed_path;
     std::string extracted_dir;
+    bool is_trusted{false};
 };
 
 using ProgressCallback = std::function<void(const DownloadProgress &)>;

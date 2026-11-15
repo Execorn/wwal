@@ -158,6 +158,7 @@ class SourceIntakePage : public QWizardPage {
     bool validatePage() override;
     bool isComplete() const override;
 
+    void setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx);
     void setSourcePath(const QString &path);
 
   private:
@@ -165,6 +166,8 @@ class SourceIntakePage : public QWizardPage {
     void analyzeSourcePath(const QString &path);
 
     CreatorPackagingContext *m_ctx{nullptr};
+    std::shared_ptr<CreatorPackagingContext> m_sharedCtx;
+    QString m_lastSourcePath;
     QLineEdit *m_sourcePathEdit{nullptr};
     QPushButton *m_browseDirBtn{nullptr};
     QPushButton *m_browseFileBtn{nullptr};
@@ -186,6 +189,7 @@ class AssetBundlingPage : public QWizardPage {
     explicit AssetBundlingPage(CreatorPackagingContext *ctx, QWidget *parent = nullptr);
     ~AssetBundlingPage() override = default;
 
+    void setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx);
     void initializePage() override;
     bool validatePage() override;
 
@@ -194,6 +198,7 @@ class AssetBundlingPage : public QWizardPage {
     void scanAssets();
 
     CreatorPackagingContext *m_ctx{nullptr};
+    std::shared_ptr<CreatorPackagingContext> m_sharedCtx;
     QTreeWidget *m_assetTree{nullptr};
     QCheckBox *m_pruneCheck{nullptr};
     QCheckBox *m_transcodeCheck{nullptr};
@@ -211,6 +216,7 @@ class MetadataPreviewPage : public QWizardPage {
     explicit MetadataPreviewPage(CreatorPackagingContext *ctx, QWidget *parent = nullptr);
     ~MetadataPreviewPage() override = default;
 
+    void setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx);
     void initializePage() override;
     bool validatePage() override;
     bool isComplete() const override;
@@ -223,6 +229,8 @@ class MetadataPreviewPage : public QWizardPage {
     void validateFields();
 
     CreatorPackagingContext *m_ctx{nullptr};
+    std::shared_ptr<CreatorPackagingContext> m_sharedCtx;
+    QString m_initializedForSource;
     QLineEdit *m_idEdit{nullptr};
     QLineEdit *m_slugEdit{nullptr};
     QLabel *m_slugValidationLabel{nullptr};
@@ -252,8 +260,10 @@ class CapabilityAuditPage : public QWizardPage {
     Q_OBJECT
   public:
     explicit CapabilityAuditPage(CreatorPackagingContext *ctx, QWidget *parent = nullptr);
-    ~CapabilityAuditPage() override = default;
+    ~CapabilityAuditPage() override;
 
+    void setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx);
+    void stopAndJoinWorkers();
     void initializePage() override;
     bool validatePage() override;
     bool isComplete() const override;
@@ -264,6 +274,10 @@ class CapabilityAuditPage : public QWizardPage {
     void applyAutoRepairs();
 
     CreatorPackagingContext *m_ctx{nullptr};
+    std::shared_ptr<CreatorPackagingContext> m_sharedCtx;
+    std::thread m_repairThread;
+    std::shared_ptr<std::atomic<bool>> m_repairCancel;
+    std::atomic<bool> m_repairing{false};
     QLabel *m_tierBadge{nullptr};
     QLabel *m_scoreLabel{nullptr};
     QProgressBar *m_scoreBar{nullptr};
@@ -292,6 +306,8 @@ class CompilationSigningPage : public QWizardPage {
     explicit CompilationSigningPage(CreatorPackagingContext *ctx, QWidget *parent = nullptr);
     ~CompilationSigningPage() override;
 
+    void setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx);
+    void stopAndJoinWorkers();
     void initializePage() override;
     bool validatePage() override;
     bool isComplete() const override;
@@ -305,8 +321,11 @@ class CompilationSigningPage : public QWizardPage {
     void setBuildUiBusy(bool busy);
 
     CreatorPackagingContext *m_ctx{nullptr};
+    std::shared_ptr<CreatorPackagingContext> m_sharedCtx;
     std::jthread m_buildThread;
+    std::shared_ptr<std::atomic<bool>> m_buildCancel;
     std::atomic<bool> m_building{false};
+    QString m_lastAutoOutPkgPath;
     QLineEdit *m_keyPathEdit{nullptr};
     QLabel *m_keyFingerprintLabel{nullptr};
     QPushButton *m_generateKeyBtn{nullptr};
@@ -332,6 +351,7 @@ class HubPublishingExportPage : public QWizardPage {
     explicit HubPublishingExportPage(CreatorPackagingContext *ctx, QWidget *parent = nullptr);
     ~HubPublishingExportPage() override = default;
 
+    void setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx);
     void initializePage() override;
 
   signals:
@@ -347,6 +367,7 @@ class HubPublishingExportPage : public QWizardPage {
     void openContainingFolder();
 
     CreatorPackagingContext *m_ctx{nullptr};
+    std::shared_ptr<CreatorPackagingContext> m_sharedCtx;
     QLabel *m_cidLabel{nullptr};
     QPushButton *m_copyCidBtn{nullptr};
     QTextEdit *m_registryJsonEdit{nullptr};
@@ -383,8 +404,8 @@ class CreatorPackagingWizard : public QWizard {
     [[nodiscard]] QString compiledPackagePath() const;
     [[nodiscard]] QString contentIdentifier() const;
 
-    [[nodiscard]] CreatorPackagingContext *context() { return &m_context; }
-    [[nodiscard]] const CreatorPackagingContext *context() const { return &m_context; }
+    [[nodiscard]] CreatorPackagingContext *context() { return m_context.get(); }
+    [[nodiscard]] const CreatorPackagingContext *context() const { return m_context.get(); }
 
     [[nodiscard]] SourceIntakePage *sourceIntakePage() const { return m_intakePage; }
     [[nodiscard]] AssetBundlingPage *assetBundlingPage() const { return m_bundlingPage; }
@@ -402,7 +423,7 @@ class CreatorPackagingWizard : public QWizard {
   private:
     void applyStudioTheme();
 
-    CreatorPackagingContext m_context;
+    std::shared_ptr<CreatorPackagingContext> m_context;
     SourceIntakePage *m_intakePage{nullptr};
     AssetBundlingPage *m_bundlingPage{nullptr};
     MetadataPreviewPage *m_metadataPage{nullptr};

@@ -32,6 +32,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -41,6 +42,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <unordered_set>
 
 #if __has_include(<linux/openat2.h>)
 #include <linux/openat2.h>
@@ -68,57 +70,107 @@ namespace fs = std::filesystem;
 
 namespace {
 
-/* ========================================================================= */
-/* Runtime Zstd Stream Loader for Confined Package Extraction                */
-/* ========================================================================= */
-
-struct ZstdStreamApi {
-    using ZSTD_DStream = void;
-    struct InBuffer {
-        const void *src;
-        size_t size;
-        size_t pos;
-    };
-    struct OutBuffer {
-        void *dst;
-        size_t size;
-        size_t pos;
-    };
-
-    ZSTD_DStream *(*createDStream)(){nullptr};
-    size_t (*freeDStream)(ZSTD_DStream *){nullptr};
-    size_t (*initDStream)(ZSTD_DStream *){nullptr};
-    size_t (*decompressStream)(ZSTD_DStream *, OutBuffer *, InBuffer *){nullptr};
-    unsigned (*isError)(size_t){nullptr};
-    bool available{false};
-
-    static const ZstdStreamApi &instance()
-    {
-        static ZstdStreamApi api;
-        static std::once_flag once;
-        std::call_once(once, []() {
-            void *h = ::dlopen("libzstd.so.1", RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
-            if (!h) {
-                h = ::dlopen("libzstd.so", RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
-            }
-            if (!h) {
-                return;
-            }
-            api.createDStream =
-                reinterpret_cast<decltype(api.createDStream)>(::dlsym(h, "ZSTD_createDStream"));
-            api.freeDStream =
-                reinterpret_cast<decltype(api.freeDStream)>(::dlsym(h, "ZSTD_freeDStream"));
-            api.initDStream =
-                reinterpret_cast<decltype(api.initDStream)>(::dlsym(h, "ZSTD_initDStream"));
-            api.decompressStream = reinterpret_cast<decltype(api.decompressStream)>(
-                ::dlsym(h, "ZSTD_decompressStream"));
-            api.isError = reinterpret_cast<decltype(api.isError)>(::dlsym(h, "ZSTD_isError"));
-            api.available = (api.createDStream && api.freeDStream && api.initDStream &&
-                             api.decompressStream && api.isError);
-        });
-        return api;
+bool parseStrictU64(std::string_view text, uint64_t &out)
+{
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
+        text.remove_prefix(1);
     }
-};
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r' ||
+                             text.back() == '\n')) {
+        text.remove_suffix(1);
+    }
+    if (text.empty()) {
+        return false;
+    }
+
+    uint64_t val = 0;
+    for (char ch : text) {
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        if (__builtin_mul_overflow(val, 10ULL, &val) ||
+            __builtin_add_overflow(val, static_cast<uint64_t>(ch - '0'), &val)) {
+            return false;
+        }
+    }
+    out = val;
+    return true;
+}
+
+bool parseContentRangeHeader(std::string_view val, uint64_t &startOut, uint64_t &endOut,
+                             std::optional<uint64_t> &totalOut)
+{
+    while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) {
+        val.remove_prefix(1);
+    }
+    while (!val.empty() &&
+           (val.back() == ' ' || val.back() == '\t' || val.back() == '\r' || val.back() == '\n')) {
+        val.remove_suffix(1);
+    }
+
+    constexpr std::string_view kBytesPrefix = "bytes";
+    if (val.size() <= kBytesPrefix.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < kBytesPrefix.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(val[i])) != kBytesPrefix[i]) {
+            return false;
+        }
+    }
+    val.remove_prefix(kBytesPrefix.size());
+    if (val.empty() || (val.front() != ' ' && val.front() != '\t')) {
+        return false;
+    }
+    while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) {
+        val.remove_prefix(1);
+    }
+
+    const size_t slashPos = val.find('/');
+    const size_t dashPos = val.find('-');
+    if (dashPos == std::string_view::npos || slashPos == std::string_view::npos ||
+        dashPos >= slashPos) {
+        return false;
+    }
+
+    const std::string_view startSv = val.substr(0, dashPos);
+    const std::string_view endSv = val.substr(dashPos + 1, slashPos - dashPos - 1);
+    const std::string_view totalSv = val.substr(slashPos + 1);
+
+    uint64_t start = 0;
+    uint64_t end = 0;
+    if (!parseStrictU64(startSv, start) || !parseStrictU64(endSv, end) || end < start) {
+        return false;
+    }
+
+    if (totalSv == "*") {
+        totalOut.reset();
+    } else {
+        uint64_t total = 0;
+        if (!parseStrictU64(totalSv, total) || end >= total) {
+            return false;
+        }
+        totalOut = total;
+    }
+
+    startOut = start;
+    endOut = end;
+    return true;
+}
+
+std::string resolveDefaultDownloadDir()
+{
+    const char *xdgData = std::getenv("XDG_DATA_HOME");
+    if (xdgData && xdgData[0] == '/') {
+        return (fs::path(xdgData) / "waywal" / "downloads").lexically_normal().string();
+    }
+    const char *home = std::getenv("HOME");
+    if (home && home[0] != '\0') {
+        return (fs::path(home) / ".local" / "share" / "waywal" / "downloads")
+            .lexically_normal()
+            .string();
+    }
+    return "/tmp/waywal/downloads";
+}
 
 struct UstarHeader {
     char name[100];
@@ -253,10 +305,92 @@ int openConfinedWriteFd(int rootDirFd, const std::vector<std::string> &component
     return outFd;
 }
 
+bool mkdirConfinedDir(int rootDirFd, const std::vector<std::string> &components)
+{
+    int curDirFd = ::dup(rootDirFd);
+    if (curDirFd < 0) {
+        return false;
+    }
+
+    for (const std::string &comp : components) {
+        if (::mkdirat(curDirFd, comp.c_str(), 0755) != 0 && errno != EEXIST) {
+            ::close(curDirFd);
+            return false;
+        }
+        int nextFd =
+            ::openat(curDirFd, comp.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        ::close(curDirFd);
+        if (nextFd < 0) {
+            return false;
+        }
+        curDirFd = nextFd;
+    }
+
+    ::close(curDirFd);
+    return true;
+}
+
+bool parsePaxExtendedHeader(const uint8_t *data, size_t len, std::optional<std::string> &pathOut,
+                            std::optional<uint64_t> &sizeOut)
+{
+    constexpr size_t kMaxPaxBytes = 64ULL * 1024ULL;
+    if (len > kMaxPaxBytes) {
+        return false;
+    }
+
+    std::string_view sv(reinterpret_cast<const char *>(data), len);
+    size_t pos = 0;
+    while (pos < sv.size()) {
+        const size_t sp = sv.find(' ', pos);
+        if (sp == std::string_view::npos || sp == pos) {
+            return false;
+        }
+
+        uint64_t recLen64 = 0;
+        if (!parseStrictU64(sv.substr(pos, sp - pos), recLen64) || recLen64 < 5 ||
+            recLen64 > sv.size() - pos) {
+            return false;
+        }
+        const size_t recLen = static_cast<size_t>(recLen64);
+        const std::string_view rec = sv.substr(pos, recLen);
+        if (rec.back() != '\n') {
+            return false;
+        }
+
+        const size_t kvStart = (sp - pos) + 1;
+        if (kvStart >= rec.size() - 1) {
+            return false;
+        }
+        const std::string_view kv = rec.substr(kvStart, rec.size() - kvStart - 1);
+        const size_t eq = kv.find('=');
+        if (eq == std::string_view::npos) {
+            return false;
+        }
+        const std::string_view key = kv.substr(0, eq);
+        const std::string_view val = kv.substr(eq + 1);
+        if (key == "path") {
+            if (val.size() > 4096) {
+                return false;
+            }
+            pathOut = std::string(val);
+        } else if (key == "size") {
+            uint64_t sz = 0;
+            if (!parseStrictU64(val, sz)) {
+                return false;
+            }
+            sizeOut = sz;
+        }
+
+        pos += recLen;
+    }
+    return true;
+}
+
 bool extractUstarBufferConfined(const uint8_t *tarData, size_t tarLen, const fs::path &destDir)
 {
     constexpr size_t kMaxExtractedBytes = 512ULL * 1024ULL * 1024ULL;
     constexpr size_t kMaxExtractedFiles = 4096;
+    constexpr size_t kMaxGnuLongBytes = 4096;
 
     std::error_code ec;
     fs::create_directories(destDir, ec);
@@ -272,7 +406,14 @@ bool extractUstarBufferConfined(const uint8_t *tarData, size_t tarLen, const fs:
     size_t offset = 0;
     size_t totalBytes = 0;
     size_t fileCount = 0;
+    size_t dirCount = 0;
     bool ok = true;
+
+    std::optional<std::string> paxGlobalPath;
+    std::optional<uint64_t> paxGlobalSize;
+    std::optional<std::string> paxNextPath;
+    std::optional<uint64_t> paxNextSize;
+    std::optional<std::string> gnuLongName;
 
     while (offset + 512 <= tarLen) {
         const uint8_t *blk = tarData + offset;
@@ -288,31 +429,100 @@ bool extractUstarBufferConfined(const uint8_t *tarData, size_t tarLen, const fs:
         }
 
         const auto *hdr = reinterpret_cast<const UstarHeader *>(blk);
-        uint64_t entrySize = 0;
-        if (!parseOctalU64(hdr->size, sizeof(hdr->size), entrySize)) {
+        uint64_t headerSize = 0;
+        if (!parseOctalU64(hdr->size, sizeof(hdr->size), headerSize)) {
             ok = false;
             break;
         }
+
+        const char tf = hdr->typeflag;
+        if (headerSize > tarLen - offset - 512) {
+            ok = false;
+            break;
+        }
+        uint64_t headerRem511 = 0;
+        uint64_t headerBlocks = 0;
+        if (__builtin_add_overflow(headerSize, 511ULL, &headerRem511)) {
+            ok = false;
+            break;
+        }
+        headerBlocks = headerRem511 / 512ULL;
+        uint64_t paddedHeaderPayload = 0;
+        if (__builtin_mul_overflow(headerBlocks, 512ULL, &paddedHeaderPayload) ||
+            paddedHeaderPayload > tarLen - offset - 512) {
+            ok = false;
+            break;
+        }
+
+        const uint8_t *payload = tarData + offset + 512;
+        if (tf == 'x' || tf == 'g') {
+            std::optional<std::string> &targetPath = (tf == 'x') ? paxNextPath : paxGlobalPath;
+            std::optional<uint64_t> &targetSize = (tf == 'x') ? paxNextSize : paxGlobalSize;
+            if (!parsePaxExtendedHeader(payload, static_cast<size_t>(headerSize), targetPath,
+                                        targetSize)) {
+                ok = false;
+                break;
+            }
+            offset += 512 + static_cast<size_t>(paddedHeaderPayload);
+            continue;
+        }
+
+        if (tf == 'L' || tf == 'K') {
+            if (headerSize == 0 || headerSize > kMaxGnuLongBytes) {
+                ok = false;
+                break;
+            }
+            const size_t sz = static_cast<size_t>(headerSize);
+            size_t strLen = ::strnlen(reinterpret_cast<const char *>(payload), sz);
+            if (tf == 'L') {
+                gnuLongName = std::string(reinterpret_cast<const char *>(payload), strLen);
+            }
+            offset += 512 + static_cast<size_t>(paddedHeaderPayload);
+            continue;
+        }
+
+        std::string rawName;
+        if (paxNextPath.has_value()) {
+            rawName = *paxNextPath;
+        } else if (gnuLongName.has_value()) {
+            rawName = *gnuLongName;
+        } else if (paxGlobalPath.has_value()) {
+            rawName = *paxGlobalPath;
+        } else {
+            size_t prefixLen = ::strnlen(hdr->prefix, sizeof(hdr->prefix));
+            size_t nameLen = ::strnlen(hdr->name, sizeof(hdr->name));
+            if (prefixLen > 0) {
+                rawName.assign(hdr->prefix, prefixLen);
+                rawName.push_back('/');
+            }
+            rawName.append(hdr->name, nameLen);
+        }
+
+        const uint64_t entrySize = paxNextSize.value_or(paxGlobalSize.value_or(headerSize));
+
+        paxNextPath.reset();
+        paxNextSize.reset();
+        gnuLongName.reset();
 
         if (entrySize > tarLen - offset - 512) {
             ok = false;
             break;
         }
 
-        std::string rawName;
-        size_t prefixLen = ::strnlen(hdr->prefix, sizeof(hdr->prefix));
-        size_t nameLen = ::strnlen(hdr->name, sizeof(hdr->name));
-        if (prefixLen > 0) {
-            rawName.assign(hdr->prefix, prefixLen);
-            rawName.push_back('/');
-        }
-        rawName.append(hdr->name, nameLen);
-
-        char tf = hdr->typeflag;
         if (tf == '5') {
-            if (entrySize != 0) {
+            if (entrySize != 0 || headerSize != 0) {
                 ok = false;
                 break;
+            }
+            std::vector<std::string> comps;
+            std::string normRel;
+            if (!rawName.empty() && rawName != "." && rawName != "./") {
+                if (!sanitizeRelativeArchivePath(rawName, comps, normRel) ||
+                    !mkdirConfinedDir(rootDirFd, comps)) {
+                    ok = false;
+                    break;
+                }
+                ++dirCount;
             }
             offset += 512;
             continue;
@@ -331,11 +541,14 @@ bool extractUstarBufferConfined(const uint8_t *tarData, size_t tarLen, const fs:
             break;
         }
 
-        if (++fileCount > kMaxExtractedFiles || totalBytes + entrySize > kMaxExtractedBytes) {
+        size_t nextTotalBytes = 0;
+        if (++fileCount > kMaxExtractedFiles || entrySize > kMaxExtractedBytes ||
+            __builtin_add_overflow(totalBytes, static_cast<size_t>(entrySize), &nextTotalBytes) ||
+            nextTotalBytes > kMaxExtractedBytes) {
             ok = false;
             break;
         }
-        totalBytes += static_cast<size_t>(entrySize);
+        totalBytes = nextTotalBytes;
 
         int outFd = openConfinedWriteFd(rootDirFd, comps, normRel);
         if (outFd < 0) {
@@ -343,7 +556,6 @@ bool extractUstarBufferConfined(const uint8_t *tarData, size_t tarLen, const fs:
             break;
         }
 
-        const uint8_t *payload = tarData + offset + 512;
         size_t writtenTotal = 0;
         while (writtenTotal < entrySize) {
             ssize_t w = ::write(outFd, payload + writtenTotal,
@@ -362,119 +574,110 @@ bool extractUstarBufferConfined(const uint8_t *tarData, size_t tarLen, const fs:
             break;
         }
 
-        uint64_t padded = ((entrySize + 511ULL) / 512ULL) * 512ULL;
-        if (padded > tarLen - offset - 512) {
-            ok = false;
-            break;
-        }
-        offset += 512 + static_cast<size_t>(padded);
+        offset += 512 + static_cast<size_t>(paddedHeaderPayload);
     }
 
     ::close(rootDirFd);
-    return ok && fileCount > 0;
+    return ok && (fileCount > 0 || dirCount > 0);
 }
 
-bool extractVerifiedWwpkgAll(wwpkg_package_t *pkg, const std::string &pkgPath,
-                             const fs::path &destDir)
+bool verifyWwpkgSignatureAndTrust(const wwpkg_package_t *pkg, bool &outIsTrusted)
 {
-    using ExtractAllFn = bool (*)(wwpkg_package_t *, const char *);
-    static ExtractAllFn dynamicExtractFn =
-        reinterpret_cast<ExtractAllFn>(::dlsym(RTLD_DEFAULT, "wwpkg_extract_all"));
-    if (dynamicExtractFn) {
+    outIsTrusted = false;
+    if (!pkg) {
+        return false;
+    }
+
+    // Consult $XDG_CONFIG_HOME/waywal/trusted_keys.json when overridden so creator-exported trust
+    // stores work seamlessly under custom XDG environments as well as default ~/.config/waywal.
+    const char *xdgCfg = ::getenv("XDG_CONFIG_HOME");
+    if (xdgCfg && xdgCfg[0] != '\0') {
         std::error_code ec;
-        fs::remove_all(destDir, ec);
-        fs::create_directories(destDir, ec);
-        if (!ec && dynamicExtractFn(pkg, destDir.c_str())) {
+        const fs::path xdgTrustPath = fs::path(xdgCfg) / "waywal" / "trusted_keys.json";
+        if (fs::exists(xdgTrustPath, ec) && !ec) {
+            const wwpkg_trust_level_t lvl =
+                wwpkg_verify_trust_with_store(pkg, xdgTrustPath.c_str());
+            if (lvl == WWPKG_TRUST_INVALID) {
+                return false;
+            }
+            outIsTrusted = (lvl == WWPKG_TRUST_AUTHOR_TRUSTED || lvl == WWPKG_TRUST_NOTARIZED);
             return true;
         }
     }
 
+    return wwpkg_verify_signature(pkg, &outIsTrusted);
+}
+
+enum class VerifyInstallResult {
+    Ok,
+    CorruptContainer,
+    SignatureFailed,
+    ExtractFailed,
+    FinalizeFailed
+};
+
+VerifyInstallResult verifyExtractAndInstallWwpkg(const std::string &partPath,
+                                                 const std::string &finalPath,
+                                                 const fs::path &extractDir, bool &outIsTrusted)
+{
+    outIsTrusted = false;
+
+    const int pkgFd = ::open(partPath.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (pkgFd < 0) {
+        return VerifyInstallResult::CorruptContainer;
+    }
+
+    struct stat openSt{};
+    if (::fstat(pkgFd, &openSt) != 0 || !S_ISREG(openSt.st_mode)) {
+        ::close(pkgFd);
+        return VerifyInstallResult::CorruptContainer;
+    }
+
+    wwpkg_package_t *pkg = wwpkg_open_fd(pkgFd);
+    if (!pkg) {
+        ::close(pkgFd);
+        return VerifyInstallResult::CorruptContainer;
+    }
+
+    bool isTrusted = false;
+    const bool sigValid = verifyWwpkgSignatureAndTrust(pkg, isTrusted);
+    if (!sigValid) {
+        wwpkg_close(pkg);
+        ::close(pkgFd);
+        return VerifyInstallResult::SignatureFailed;
+    }
+
     std::error_code ec;
-    fs::remove_all(destDir, ec);
+    fs::remove_all(extractDir, ec);
+    const bool extractedOk = wwpkg_extract_all(pkg, extractDir.c_str());
+    wwpkg_close(pkg);
 
-    std::ifstream ifs(pkgPath, std::ios::binary | std::ios::ate);
-    if (!ifs) {
-        return false;
-    }
-    auto endPos = ifs.tellg();
-    if (endPos <= 0 || endPos > static_cast<std::streamoff>(256ULL * 1024ULL * 1024ULL)) {
-        return false;
-    }
-    size_t fileLen = static_cast<size_t>(endPos);
-    ifs.seekg(0, std::ios::beg);
-    std::vector<uint8_t> raw(fileLen);
-    if (!ifs.read(reinterpret_cast<char *>(raw.data()), static_cast<std::streamsize>(fileLen))) {
-        return false;
+    if (!extractedOk) {
+        ::close(pkgFd);
+        fs::remove_all(extractDir, ec);
+        return VerifyInstallResult::ExtractFailed;
     }
 
-    // Advance past any outer Zstd skippable frames (0x184D2A50..0x184D2A5F).
-    size_t payloadOff = 0;
-    while (payloadOff + 8 <= raw.size()) {
-        uint32_t magic = static_cast<uint32_t>(raw[payloadOff]) |
-                         (static_cast<uint32_t>(raw[payloadOff + 1]) << 8) |
-                         (static_cast<uint32_t>(raw[payloadOff + 2]) << 16) |
-                         (static_cast<uint32_t>(raw[payloadOff + 3]) << 24);
-        if ((magic & 0xFFFFFFF0u) != 0x184D2A50u) {
-            break;
-        }
-        uint32_t frameLen = static_cast<uint32_t>(raw[payloadOff + 4]) |
-                            (static_cast<uint32_t>(raw[payloadOff + 5]) << 8) |
-                            (static_cast<uint32_t>(raw[payloadOff + 6]) << 16) |
-                            (static_cast<uint32_t>(raw[payloadOff + 7]) << 24);
-        if (frameLen > raw.size() - payloadOff - 8) {
-            return false;
-        }
-        payloadOff += 8 + static_cast<size_t>(frameLen);
+    // Re-check path inode identity under O_NOFOLLOW before finalizing while pkgFd keeps the inode
+    // alive.
+    struct stat curSt{};
+    if (::lstat(partPath.c_str(), &curSt) != 0 || S_ISLNK(curSt.st_mode) ||
+        curSt.st_dev != openSt.st_dev || curSt.st_ino != openSt.st_ino) {
+        ::close(pkgFd);
+        fs::remove_all(extractDir, ec);
+        return VerifyInstallResult::FinalizeFailed;
     }
 
-    if (payloadOff + 512 <= raw.size() &&
-        std::memcmp(raw.data() + payloadOff + 257, "ustar", 5) == 0) {
-        return extractUstarBufferConfined(raw.data() + payloadOff, raw.size() - payloadOff,
-                                          destDir);
+    std::error_code renameEc;
+    fs::rename(partPath, finalPath, renameEc);
+    ::close(pkgFd);
+    if (renameEc) {
+        fs::remove_all(extractDir, ec);
+        return VerifyInstallResult::FinalizeFailed;
     }
 
-    const auto &zstd = ZstdStreamApi::instance();
-    if (!zstd.available || payloadOff + 4 > raw.size()) {
-        return false;
-    }
-
-    constexpr size_t kMaxDecompressed = 512ULL * 1024ULL * 1024ULL;
-    void *dstream = zstd.createDStream();
-    if (!dstream) {
-        return false;
-    }
-    zstd.initDStream(dstream);
-
-    std::vector<uint8_t> tarBuf;
-    tarBuf.reserve(std::min<size_t>(raw.size() * 4, 4 * 1024 * 1024));
-    std::array<uint8_t, 65536> outChunk{};
-
-    ZstdStreamApi::InBuffer inBuf{raw.data() + payloadOff, raw.size() - payloadOff, 0};
-    bool streamOk = true;
-    while (inBuf.pos < inBuf.size) {
-        ZstdStreamApi::OutBuffer outBuf{outChunk.data(), outChunk.size(), 0};
-        size_t rc = zstd.decompressStream(dstream, &outBuf, &inBuf);
-        if (zstd.isError(rc)) {
-            streamOk = false;
-            break;
-        }
-        if (tarBuf.size() + outBuf.pos > kMaxDecompressed) {
-            streamOk = false;
-            break;
-        }
-        tarBuf.insert(tarBuf.end(), outChunk.data(), outChunk.data() + outBuf.pos);
-        if (rc == 0 && inBuf.pos < inBuf.size) {
-            // Re-init for concatenated Zstd frames (e.g. dual-frame metadata + payload archives).
-            zstd.initDStream(dstream);
-        }
-    }
-    zstd.freeDStream(dstream);
-
-    if (!streamOk || tarBuf.size() < 512) {
-        return false;
-    }
-
-    return extractUstarBufferConfined(tarBuf.data(), tarBuf.size(), destDir);
+    outIsTrusted = isTrusted;
+    return VerifyInstallResult::Ok;
 }
 
 bool envLoopbackHttpAllowed()
@@ -485,6 +688,13 @@ bool envLoopbackHttpAllowed()
 
 bool parseSchemeAndHost(std::string_view url, std::string &schemeOut, std::string &hostOut)
 {
+    for (char ch : url) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (uch <= 0x20 || uch == 0x7F || ch == '\\') {
+            return false;
+        }
+    }
+
     auto pos = url.find("://");
     if (pos == std::string_view::npos || pos == 0) {
         return false;
@@ -522,9 +732,102 @@ bool parseSchemeAndHost(std::string_view url, std::string &schemeOut, std::strin
     return !hostOut.empty();
 }
 
-bool isLoopbackHost(std::string_view host)
+bool isPrivateOrReservedIpv4(uint32_t ip, bool &isLoopbackOut)
 {
-    return host == "127.0.0.1" || host == "localhost" || host == "[::1]";
+    isLoopbackOut = ((ip & 0xFF000000u) == 0x7F000000u); // 127.0.0.0/8
+    if (isLoopbackOut) {
+        return true;
+    }
+    if ((ip & 0xFF000000u) == 0x00000000u || // 0.0.0.0/8
+        (ip & 0xFF000000u) == 0x0A000000u || // 10.0.0.0/8
+        (ip & 0xFFC00000u) == 0x64400000u || // 100.64.0.0/10 (CGNAT)
+        (ip & 0xFFFF0000u) == 0xA9FE0000u || // 169.254.0.0/16 (Link-local/IMDS)
+        (ip & 0xFFF00000u) == 0xAC100000u || // 172.16.0.0/12
+        (ip & 0xFFFFFF00u) == 0xC0000000u || // 192.0.0.0/24
+        (ip & 0xFFFFFF00u) == 0xC0000200u || // 192.0.2.0/24
+        (ip & 0xFFFF0000u) == 0xC0A80000u || // 192.168.0.0/16
+        (ip & 0xFFFE0000u) == 0xC6120000u || // 198.18.0.0/15
+        (ip & 0xFFFFFF00u) == 0xC6336400u || // 198.51.100.0/24
+        (ip & 0xFFFFFF00u) == 0xCB007100u || // 203.0.113.0/24
+        (ip & 0xE0000000u) == 0xE0000000u) { // 224.0.0.0/4 + 240.0.0.0/4 + broadcast
+        return true;
+    }
+    return false;
+}
+
+bool isObfuscatedNumericIpv4(std::string_view host)
+{
+    if (host.empty()) {
+        return false;
+    }
+    size_t parts = 0;
+    size_t pos = 0;
+    while (pos <= host.size()) {
+        const size_t dot = host.find('.', pos);
+        const std::string_view seg =
+            (dot == std::string_view::npos) ? host.substr(pos) : host.substr(pos, dot - pos);
+        if (seg.empty()) {
+            return false;
+        }
+        ++parts;
+        if (seg.rfind("0x", 0) == 0) {
+            if (seg.size() <= 2) {
+                return false;
+            }
+            for (char c : seg.substr(2)) {
+                if (!std::isxdigit(static_cast<unsigned char>(c))) {
+                    return false;
+                }
+            }
+        } else {
+            for (char c : seg) {
+                if (!std::isdigit(static_cast<unsigned char>(c))) {
+                    return false;
+                }
+            }
+        }
+        if (dot == std::string_view::npos) {
+            break;
+        }
+        pos = dot + 1;
+    }
+    return parts >= 1 && parts <= 4;
+}
+
+bool isRestrictedIpv6(const struct in6_addr &addr, bool &isLoopbackOut)
+{
+    isLoopbackOut = false;
+    if (IN6_IS_ADDR_UNSPECIFIED(&addr) || IN6_IS_ADDR_LINKLOCAL(&addr) ||
+        IN6_IS_ADDR_MULTICAST(&addr) || (addr.s6_addr[0] & 0xFEu) == 0xFCu) {
+        return true;
+    }
+    if (IN6_IS_ADDR_LOOPBACK(&addr)) {
+        isLoopbackOut = true;
+        return true;
+    }
+    if (IN6_IS_ADDR_V4MAPPED(&addr) || IN6_IS_ADDR_V4COMPAT(&addr)) {
+        const uint32_t v4 = (static_cast<uint32_t>(addr.s6_addr[12]) << 24) |
+                            (static_cast<uint32_t>(addr.s6_addr[13]) << 16) |
+                            (static_cast<uint32_t>(addr.s6_addr[14]) << 8) |
+                            static_cast<uint32_t>(addr.s6_addr[15]);
+        return isPrivateOrReservedIpv4(v4, isLoopbackOut);
+    }
+    // Block Teredo (2001::/32), 6to4 (2002::/16), and NAT64 well-known prefix (64:ff9b::/96).
+    if ((addr.s6_addr[0] == 0x20 && addr.s6_addr[1] == 0x01 && addr.s6_addr[2] == 0x00 &&
+         addr.s6_addr[3] == 0x00) ||
+        (addr.s6_addr[0] == 0x20 && addr.s6_addr[1] == 0x02) ||
+        (addr.s6_addr[0] == 0x00 && addr.s6_addr[1] == 0x64 && addr.s6_addr[2] == 0xff &&
+         addr.s6_addr[3] == 0x9b && addr.s6_addr[4] == 0x00 && addr.s6_addr[5] == 0x00 &&
+         addr.s6_addr[6] == 0x00 && addr.s6_addr[7] == 0x00 && addr.s6_addr[8] == 0x00 &&
+         addr.s6_addr[9] == 0x00 && addr.s6_addr[10] == 0x00 && addr.s6_addr[11] == 0x00)) {
+        return true;
+    }
+    return false;
+}
+
+bool endsWithHostSuffix(std::string_view host, std::string_view suffix)
+{
+    return host.size() > suffix.size() && host.substr(host.size() - suffix.size()) == suffix;
 }
 
 bool isAllowedDownloadUrl(std::string_view url, bool allowLoopbackHttp)
@@ -534,13 +837,88 @@ bool isAllowedDownloadUrl(std::string_view url, bool allowLoopbackHttp)
     if (!parseSchemeAndHost(url, scheme, host)) {
         return false;
     }
-    if (scheme == "https") {
+    if (scheme != "https" && !(scheme == "http" && allowLoopbackHttp)) {
+        return false;
+    }
+
+    std::string_view cleanHost(host);
+    while (!cleanHost.empty() && cleanHost.back() == '.') {
+        cleanHost.remove_suffix(1);
+    }
+    if (cleanHost.empty()) {
+        return false;
+    }
+
+    if (cleanHost.front() == '[' && cleanHost.back() == ']') {
+        std::string_view inner = cleanHost.substr(1, cleanHost.size() - 2);
+        const size_t pct = inner.find('%');
+        if (pct != std::string_view::npos) {
+            inner = inner.substr(0, pct);
+        }
+        std::string innerStr(inner);
+        struct in6_addr addr6{};
+        if (::inet_pton(AF_INET6, innerStr.c_str(), &addr6) != 1) {
+            return false;
+        }
+        bool isLoopback = false;
+        if (isRestrictedIpv6(addr6, isLoopback)) {
+            return allowLoopbackHttp && isLoopback;
+        }
+        return scheme == "https";
+    }
+
+    std::string hostStr(cleanHost);
+    struct in_addr addr4{};
+    if (::inet_pton(AF_INET, hostStr.c_str(), &addr4) == 1) {
+        bool isLoopback = false;
+        if (isPrivateOrReservedIpv4(ntohl(addr4.s_addr), isLoopback)) {
+            return allowLoopbackHttp && isLoopback;
+        }
+        return scheme == "https";
+    }
+
+    if (isObfuscatedNumericIpv4(cleanHost)) {
+        return false;
+    }
+
+    if (cleanHost == "localhost" || endsWithHostSuffix(cleanHost, ".localhost")) {
+        return allowLoopbackHttp;
+    }
+    if (cleanHost == "local" || endsWithHostSuffix(cleanHost, ".local") ||
+        cleanHost == "internal" || endsWithHostSuffix(cleanHost, ".internal")) {
+        return false;
+    }
+
+    return scheme == "https";
+}
+
+bool isAllowedRedirectLocation(std::string_view locRaw, bool allowLoopbackHttp)
+{
+    while (!locRaw.empty() && (locRaw.front() == ' ' || locRaw.front() == '\t')) {
+        locRaw.remove_prefix(1);
+    }
+    while (!locRaw.empty() && (locRaw.back() == ' ' || locRaw.back() == '\t' ||
+                               locRaw.back() == '\r' || locRaw.back() == '\n')) {
+        locRaw.remove_suffix(1);
+    }
+    if (locRaw.empty()) {
+        return false;
+    }
+    for (char ch : locRaw) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (uch <= 0x20 || uch == 0x7F || ch == '\\') {
+            return false;
+        }
+    }
+
+    // Reject protocol-relative network-path redirects (`//host/path`).
+    if (locRaw.size() >= 2 && locRaw[0] == '/' && locRaw[1] == '/') {
+        return false;
+    }
+    if (locRaw.front() == '/') {
         return true;
     }
-    if (scheme == "http" && allowLoopbackHttp && isLoopbackHost(host)) {
-        return true;
-    }
-    return false;
+    return isAllowedDownloadUrl(locRaw, allowLoopbackHttp);
 }
 
 std::string sanitizePackageFilenameStem(std::string id)
@@ -1019,10 +1397,45 @@ struct CurlBinding {
         } data;
     };
 
+    enum class Opt : int {
+        WRITEDATA = 10001,
+        URL = 10002,
+        RANGE = 10007,
+        POSTFIELDS = 10015,
+        USERAGENT = 10018,
+        HTTPHEADER = 10023,
+        HEADERDATA = 10029,
+        PRIVATE = 10103,
+        PROTOCOLS_STR = 10318,
+        REDIR_PROTOCOLS_STR = 10319,
+        WRITEFUNCTION = 20011,
+        HEADERFUNCTION = 20079,
+        TIMEOUT = 13,
+        FOLLOWLOCATION = 52,
+        MAXREDIRS = 68,
+        CONNECTTIMEOUT = 78,
+        HTTP_VERSION = 84,
+        NOSIGNAL = 99,
+        PIPEWAIT = 237
+    };
+
+    enum class Info : int { EFFECTIVE_URL = 1048577, PRIVATE = 1048597, RESPONSE_CODE = 2097154 };
+
+    enum class MultiOpt : int {
+        SOCKETDATA = 10002,
+        TIMERDATA = 10005,
+        PIPELINING = 3,
+        MAX_HOST_CONNECTIONS = 7,
+        MAX_TOTAL_CONNECTIONS = 13,
+        SOCKETFUNCTION = 20001,
+        TIMERFUNCTION = 20004
+    };
+
     using socket_callback_fn = int (*)(CURL *easy, curl_socket_t s, int what, void *userp,
                                        void *socketp);
     using timer_callback_fn = int (*)(CURLM *multi, long timeout_ms, void *userp);
 
+    using global_init_fn = CURLcode (*)(long);
     using easy_init_fn = CURL *(*)();
     using easy_cleanup_fn = void (*)(CURL *);
     using easy_setopt_fn = CURLcode (*)(CURL *, int, ...);
@@ -1042,6 +1455,7 @@ struct CurlBinding {
     using multi_setopt_fn = CURLMcode (*)(CURLM *, int, ...);
 
     void *handle{nullptr};
+    global_init_fn global_init{nullptr};
     easy_init_fn easy_init{nullptr};
     easy_cleanup_fn easy_cleanup{nullptr};
     easy_setopt_fn easy_setopt{nullptr};
@@ -1060,44 +1474,11 @@ struct CurlBinding {
     multi_info_read_fn multi_info_read{nullptr};
     multi_setopt_fn multi_setopt{nullptr};
 
-    // Frozen libcurl option & info identifiers.
-    static constexpr int OPT_WRITEDATA = 10001;
-    static constexpr int OPT_URL = 10002;
-    static constexpr int OPT_RANGE = 10007;
-    static constexpr int OPT_POSTFIELDS = 10015;
-    static constexpr int OPT_USERAGENT = 10018;
-    static constexpr int OPT_HTTPHEADER = 10023;
-    static constexpr int OPT_HEADERDATA = 10029;
-    static constexpr int OPT_PRIVATE = 10103;
-    static constexpr int OPT_PROTOCOLS_STR = 10318;
-    static constexpr int OPT_REDIR_PROTOCOLS_STR = 10319;
-    static constexpr int OPT_WRITEFUNCTION = 20011;
-    static constexpr int OPT_HEADERFUNCTION = 20079;
-    static constexpr int OPT_TIMEOUT = 13;
-    static constexpr int OPT_FOLLOWLOCATION = 52;
-    static constexpr int OPT_MAXREDIRS = 68;
-    static constexpr int OPT_CONNECTTIMEOUT = 78;
-    static constexpr int OPT_HTTP_VERSION = 84;
-    static constexpr int OPT_NOSIGNAL = 99;
-    static constexpr int OPT_PIPEWAIT = 237;
-
+    static constexpr long VAL_GLOBAL_DEFAULT = 3L;
     static constexpr long VAL_HTTP_VERSION_2TLS = 4;
     static constexpr size_t WRITEFUNC_PAUSE = 0x10000001u;
     static constexpr int PAUSE_RECV = (1 << 0);
     static constexpr int PAUSE_CONT = 0;
-
-    static constexpr int INFO_EFFECTIVE_URL = 1048577;
-    static constexpr int INFO_PRIVATE = 1048597;
-    static constexpr int INFO_RESPONSE_CODE = 2097154;
-
-    static constexpr int MOPT_SOCKETDATA = 10002;
-    static constexpr int MOPT_TIMERDATA = 10005;
-    static constexpr int MOPT_PIPELINING = 3;
-    static constexpr int MOPT_MAX_HOST_CONNECTIONS = 7;
-    static constexpr int MOPT_MAX_TOTAL_CONNECTIONS = 13;
-    static constexpr int MOPT_SOCKETFUNCTION = 20001;
-    static constexpr int MOPT_TIMERFUNCTION = 20004;
-
     static constexpr long VAL_PIPE_MULTIPLEX = 2;
 
     static constexpr int POLL_IN = 1;
@@ -1111,6 +1492,23 @@ struct CurlBinding {
 
     static constexpr curl_socket_t SOCKET_TIMEOUT = -1;
     static constexpr int MSG_DONE = 1;
+
+    bool globalInitOk{false};
+
+    template <typename Arg> CURLcode setOpt(CURL *easy, Opt opt, Arg arg) const
+    {
+        return easy_setopt(easy, static_cast<int>(opt), arg);
+    }
+
+    template <typename Arg> CURLcode getInfo(CURL *easy, Info info, Arg arg) const
+    {
+        return easy_getinfo(easy, static_cast<int>(info), arg);
+    }
+
+    template <typename Arg> CURLMcode multiSetOpt(CURLM *multi, MultiOpt opt, Arg arg) const
+    {
+        return multi_setopt(multi, static_cast<int>(opt), arg);
+    }
 
     static const CurlBinding &instance()
     {
@@ -1127,6 +1525,7 @@ struct CurlBinding {
             auto sym = [&](auto &dst, const char *name) {
                 dst = reinterpret_cast<std::decay_t<decltype(dst)>>(::dlsym(binding.handle, name));
             };
+            sym(binding.global_init, "curl_global_init");
             sym(binding.easy_init, "curl_easy_init");
             sym(binding.easy_cleanup, "curl_easy_cleanup");
             sym(binding.easy_setopt, "curl_easy_setopt");
@@ -1143,15 +1542,21 @@ struct CurlBinding {
             sym(binding.multi_socket_action, "curl_multi_socket_action");
             sym(binding.multi_info_read, "curl_multi_info_read");
             sym(binding.multi_setopt, "curl_multi_setopt");
+
+            if (binding.global_init) {
+                binding.globalInitOk = (binding.global_init(VAL_GLOBAL_DEFAULT) == 0);
+            } else {
+                binding.globalInitOk = true;
+            }
         });
         return binding;
     }
 
     [[nodiscard]] bool available() const noexcept
     {
-        return easy_init && easy_cleanup && easy_setopt && easy_getinfo && easy_pause &&
-               multi_init && multi_cleanup && multi_add_handle && multi_remove_handle &&
-               multi_socket_action && multi_info_read && multi_setopt;
+        return globalInitOk && easy_init && easy_cleanup && easy_setopt && easy_getinfo &&
+               easy_pause && multi_init && multi_cleanup && multi_add_handle &&
+               multi_remove_handle && multi_socket_action && multi_info_read && multi_setopt;
     }
 };
 
@@ -1163,6 +1568,7 @@ struct Task {
     DownloadRequest request;
     ProgressCallback callback;
     std::atomic<bool> cancelled{false};
+    std::atomic<bool> immediate_counted{false};
     std::atomic<TaskState> state{TaskState::Queued};
     uint64_t sequence_id{0};
 
@@ -1175,6 +1581,7 @@ struct Task {
     std::string error_message;
     std::string installed_path;
     std::string extracted_dir;
+    bool is_trusted{false};
 
     SpeedEstimator speed_estimator;
 
@@ -1199,6 +1606,7 @@ struct Task {
             prog.error_message = error_message;
             prog.installed_path = installed_path;
             prog.extracted_dir = extracted_dir;
+            prog.is_trusted = is_trusted;
         }
         cb(prog);
     }
@@ -1226,6 +1634,7 @@ struct HttpTransferJob {
     bool retried_416{false};
 
     // Optional synchronous promise for SteamWorkshop Backend B arbitration fallback.
+    std::atomic<bool> preempted{false};
     std::shared_ptr<std::mutex> sync_mtx;
     std::shared_ptr<std::condition_variable> sync_cv;
     std::shared_ptr<bool> sync_done;
@@ -1294,6 +1703,10 @@ struct DownloadManager::Impl {
 
     std::atomic<int> m_currentActivePriority{0};
     std::atomic<bool> m_preemptActiveTask{false};
+    std::atomic<uint32_t> m_pendingImmediateCount{0};
+
+    std::mutex m_partMutex;
+    std::unordered_map<std::string, uint64_t> m_partOwners;
 
     // HTTP/2 curl_multi + epoll 4+1 lane reactor state.
     std::mutex m_httpMutex;
@@ -1319,7 +1732,14 @@ struct DownloadManager::Impl {
         uint64_t initial_offset{0};
         uint64_t current_offset{0};
         uint64_t expected_total{0};
+        uint64_t content_length{0};
+        bool has_content_length{false};
         bool has_authoritative_length{false};
+        bool has_content_range{false};
+        bool content_range_wildcard{false};
+        uint64_t content_range_start{0};
+        uint64_t content_range_end{0};
+        std::optional<uint64_t> content_range_total;
         long last_http_code{0};
         int retry_after_sec{-1};
         size_t discarded_error_bytes{0};
@@ -1330,10 +1750,66 @@ struct DownloadManager::Impl {
         bool drop_triggered{false};
         bool ssrf_rejected{false};
         bool protocol_error{false};
+        std::string protocol_error_msg;
         bool recv_paused{false};
         uint64_t paused_epoch{0};
         std::chrono::steady_clock::time_point throttle_until{};
+
+        void resetResponseHeaders(long statusCode)
+        {
+            last_http_code = statusCode;
+            retry_after_sec = -1;
+            expected_total = 0;
+            content_length = 0;
+            has_content_length = false;
+            has_authoritative_length = false;
+            has_content_range = false;
+            content_range_wildcard = false;
+            content_range_start = 0;
+            content_range_end = 0;
+            content_range_total.reset();
+            protocol_error = false;
+            protocol_error_msg.clear();
+        }
     };
+
+    bool tryClaimPartPath(const std::string &partPath, uint64_t ownerSeq)
+    {
+        if (partPath.empty()) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lk(m_partMutex);
+        auto [it, inserted] = m_partOwners.emplace(partPath, ownerSeq);
+        return inserted || it->second == ownerSeq;
+    }
+
+    void releasePartClaim(const std::string &partPath, uint64_t ownerSeq)
+    {
+        if (partPath.empty()) {
+            return;
+        }
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lk(m_partMutex);
+            auto it = m_partOwners.find(partPath);
+            if (it != m_partOwners.end() && it->second == ownerSeq) {
+                m_partOwners.erase(it);
+                changed = true;
+            }
+        }
+        if (changed) {
+            wakeReactor();
+        }
+    }
+
+    [[nodiscard]] bool shouldPreemptTask(const std::shared_ptr<Task> &task) const noexcept
+    {
+        if (!task || task->request.priority > TaskPriority::BackgroundUpdate) {
+            return false;
+        }
+        return m_preemptActiveTask.load(std::memory_order_acquire) ||
+               m_pendingImmediateCount.load(std::memory_order_acquire) > 0;
+    }
 
     std::unordered_map<CurlBinding::CURL *, std::unique_ptr<ActiveHttpSlot>> m_activeSlots;
     size_t m_activeBulkLanes{0};
@@ -1446,15 +1922,17 @@ struct DownloadManager::Impl {
         {
             std::lock_guard<std::mutex> lk(m_dirMutex);
             if (m_downloadDir.empty()) {
-                const char *home = std::getenv("HOME");
-                if (home) {
-                    m_downloadDir = std::string(home) + "/.local/share/waywal/downloads";
-                } else {
-                    m_downloadDir = "/tmp/waywal/downloads";
-                }
+                m_downloadDir = resolveDefaultDownloadDir();
             }
             std::error_code ec;
             fs::create_directories(m_downloadDir, ec);
+        }
+
+        m_pendingImmediateCount.store(0, std::memory_order_release);
+        m_preemptActiveTask.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> plk(m_partMutex);
+            m_partOwners.clear();
         }
 
         m_tokenBucket.resetForStart();
@@ -1544,6 +2022,13 @@ struct DownloadManager::Impl {
         closeReactorFds();
         m_steamworks.shutdown();
 
+        m_pendingImmediateCount.store(0, std::memory_order_release);
+        m_preemptActiveTask.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> plk(m_partMutex);
+            m_partOwners.clear();
+        }
+
         std::lock_guard<std::mutex> qlk(m_queueMutex);
         m_allTasks.clear();
         m_idleCv.notify_all();
@@ -1605,17 +2090,27 @@ struct DownloadManager::Impl {
             return;
         }
 
+        bool pushed = false;
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
-            m_arbQueue.push(task);
-            if (request.priority == TaskPriority::Immediate) {
-                int activePrio = m_currentActivePriority.load(std::memory_order_relaxed);
-                if (activePrio > 0 &&
-                    activePrio <= static_cast<int>(TaskPriority::BackgroundUpdate)) {
-                    m_preemptActiveTask.store(true, std::memory_order_relaxed);
+            if (m_running.load(std::memory_order_acquire) &&
+                !task->cancelled.load(std::memory_order_acquire)) {
+                if (request.priority == TaskPriority::Immediate) {
+                    task->immediate_counted.store(true, std::memory_order_release);
+                    m_pendingImmediateCount.fetch_add(1, std::memory_order_acq_rel);
+                    const int activePrio = m_currentActivePriority.load(std::memory_order_acquire);
+                    if (activePrio > 0 &&
+                        activePrio <= static_cast<int>(TaskPriority::BackgroundUpdate)) {
+                        m_preemptActiveTask.store(true, std::memory_order_release);
+                    }
                 }
+                m_arbQueue.push(task);
+                m_queueCv.notify_all();
+                pushed = true;
             }
-            m_queueCv.notify_all();
+        }
+        if (!pushed) {
+            markTaskTerminal(task, TaskState::Failed, "Download engine not running");
         }
     }
 
@@ -1627,6 +2122,9 @@ struct DownloadManager::Impl {
                 if (t->request.kind == DownloadRequest::SourceKind::SteamWorkshop &&
                     t->request.steam_published_file_id == publishedFileId) {
                     t->cancelled.store(true, std::memory_order_relaxed);
+                    if (t->immediate_counted.exchange(false, std::memory_order_acq_rel)) {
+                        m_pendingImmediateCount.fetch_sub(1, std::memory_order_acq_rel);
+                    }
                 }
             }
             m_queueCv.notify_all();
@@ -1643,6 +2141,9 @@ struct DownloadManager::Impl {
                 if (t->request.kind == DownloadRequest::SourceKind::OpenHubPackage &&
                     t->request.openhub_package_id == packageIdOrCid) {
                     t->cancelled.store(true, std::memory_order_relaxed);
+                    if (t->immediate_counted.exchange(false, std::memory_order_acq_rel)) {
+                        m_pendingImmediateCount.fetch_sub(1, std::memory_order_acq_rel);
+                    }
                 }
             }
             m_queueCv.notify_all();
@@ -1832,8 +2333,7 @@ struct DownloadManager::Impl {
                     ++sp;
                 }
                 if (code > 0) {
-                    slot->last_http_code = code;
-                    slot->retry_after_sec = -1;
+                    slot->resetResponseHeaders(code);
                 }
             }
             return total;
@@ -1841,14 +2341,9 @@ struct DownloadManager::Impl {
 
         if (startsWithCaseInsensitive(line, "Location:")) {
             std::string_view loc = line.substr(9);
-            while (!loc.empty() && (loc.front() == ' ' || loc.front() == '\t')) {
-                loc.remove_prefix(1);
-            }
-            if (!loc.empty() && loc.front() != '/') {
-                if (!isAllowedDownloadUrl(loc, slot->allow_loopback_http)) {
-                    slot->ssrf_rejected = true;
-                    return 0;
-                }
+            if (!isAllowedRedirectLocation(loc, slot->allow_loopback_http)) {
+                slot->ssrf_rejected = true;
+                return 0;
             }
             return total;
         }
@@ -1874,26 +2369,98 @@ struct DownloadManager::Impl {
             return total;
         }
 
+        if (startsWithCaseInsensitive(line, "Content-Range:")) {
+            if (slot->last_http_code == 206) {
+                if (slot->has_content_range) {
+                    slot->protocol_error = true;
+                    slot->protocol_error_msg = "Duplicate HTTP 206 Content-Range header";
+                    return 0;
+                }
+                std::string_view val = line.substr(14);
+                uint64_t crStart = 0;
+                uint64_t crEnd = 0;
+                std::optional<uint64_t> crTotal;
+                if (!parseContentRangeHeader(val, crStart, crEnd, crTotal) ||
+                    crStart != slot->initial_offset) {
+                    slot->protocol_error = true;
+                    slot->protocol_error_msg =
+                        "Malformed or mismatched HTTP 206 Content-Range header";
+                    return 0;
+                }
+
+                uint64_t rangeSpan = 0;
+                uint64_t rangeEndPlusOne = 0;
+                if (__builtin_add_overflow(crEnd - crStart, uint64_t{1}, &rangeSpan) ||
+                    __builtin_add_overflow(crStart, rangeSpan, &rangeEndPlusOne)) {
+                    slot->protocol_error = true;
+                    slot->protocol_error_msg = "HTTP 206 Content-Range integer overflow";
+                    return 0;
+                }
+                if (slot->has_content_length && slot->content_length != rangeSpan) {
+                    slot->protocol_error = true;
+                    slot->protocol_error_msg =
+                        "HTTP 206 Content-Length does not match Content-Range span";
+                    return 0;
+                }
+
+                slot->has_content_range = true;
+                slot->content_range_start = crStart;
+                slot->content_range_end = crEnd;
+                slot->content_range_total = crTotal;
+                slot->expected_total = crTotal.value_or(rangeEndPlusOne);
+                slot->has_authoritative_length = true;
+                {
+                    std::lock_guard<std::mutex> lk(slot->job->task->progress_mutex);
+                    slot->job->task->bytes_total = slot->expected_total;
+                }
+            }
+            return total;
+        }
+
         if (startsWithCaseInsensitive(line, "Content-Length:")) {
             if (slot->last_http_code == 200 || slot->last_http_code == 206) {
                 std::string_view val = line.substr(15);
-                while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) {
-                    val.remove_prefix(1);
-                }
                 uint64_t contentLen = 0;
-                bool ok = false;
-                for (char ch : val) {
-                    if (std::isdigit(static_cast<unsigned char>(ch))) {
-                        ok = true;
-                        contentLen = contentLen * 10 + static_cast<uint64_t>(ch - '0');
-                    } else {
-                        break;
+                if (!parseStrictU64(val, contentLen)) {
+                    slot->protocol_error = true;
+                    slot->protocol_error_msg = "Malformed or overflowing Content-Length header";
+                    return 0;
+                }
+                if (slot->has_content_length && slot->content_length != contentLen) {
+                    slot->protocol_error = true;
+                    slot->protocol_error_msg = "Conflicting Content-Length headers";
+                    return 0;
+                }
+
+                uint64_t computedTotal = contentLen;
+                if (slot->last_http_code == 206) {
+                    if (__builtin_add_overflow(slot->initial_offset, contentLen, &computedTotal)) {
+                        slot->protocol_error = true;
+                        slot->protocol_error_msg = "HTTP 206 offset + Content-Length overflow";
+                        return 0;
+                    }
+                    if (slot->has_content_range) {
+                        uint64_t rangeSpan = 0;
+                        if (__builtin_add_overflow(slot->content_range_end -
+                                                       slot->content_range_start,
+                                                   uint64_t{1}, &rangeSpan) ||
+                            rangeSpan != contentLen) {
+                            slot->protocol_error = true;
+                            slot->protocol_error_msg =
+                                "HTTP 206 Content-Length does not match Content-Range span";
+                            return 0;
+                        }
+                        if (slot->content_range_total.has_value()) {
+                            computedTotal = *slot->content_range_total;
+                        }
                     }
                 }
-                if (ok) {
-                    uint64_t base = (slot->last_http_code == 206) ? slot->initial_offset : 0;
-                    slot->expected_total = base + contentLen;
-                    slot->has_authoritative_length = true;
+
+                slot->content_length = contentLen;
+                slot->has_content_length = true;
+                slot->expected_total = computedTotal;
+                slot->has_authoritative_length = true;
+                {
                     std::lock_guard<std::mutex> lk(slot->job->task->progress_mutex);
                     slot->job->task->bytes_total = slot->expected_total;
                 }
@@ -1914,6 +2481,7 @@ struct DownloadManager::Impl {
         }
 
         if (slot->job->task->cancelled.load(std::memory_order_relaxed) ||
+            slot->job->preempted.load(std::memory_order_acquire) ||
             !slot->self->m_running.load(std::memory_order_relaxed)) {
             return 0;
         }
@@ -1921,12 +2489,12 @@ struct DownloadManager::Impl {
         const auto &curl = CurlBinding::instance();
         long httpCode = slot->last_http_code;
         if (httpCode == 0) {
-            curl.easy_getinfo(slot->easy, CurlBinding::INFO_RESPONSE_CODE, &httpCode);
+            curl.getInfo(slot->easy, CurlBinding::Info::RESPONSE_CODE, &httpCode);
             slot->last_http_code = httpCode;
         }
 
         const char *effectiveUrl = nullptr;
-        if (curl.easy_getinfo(slot->easy, CurlBinding::INFO_EFFECTIVE_URL, &effectiveUrl) == 0 &&
+        if (curl.getInfo(slot->easy, CurlBinding::Info::EFFECTIVE_URL, &effectiveUrl) == 0 &&
             effectiveUrl != nullptr) {
             if (!isAllowedDownloadUrl(effectiveUrl, slot->allow_loopback_http)) {
                 slot->ssrf_rejected = true;
@@ -1940,9 +2508,27 @@ struct DownloadManager::Impl {
             return (slot->discarded_error_bytes <= 65536) ? bytes : 0;
         }
 
-        if (httpCode == 206 && slot->initial_offset == 0) {
-            slot->protocol_error = true;
-            return 0;
+        if (httpCode == 206) {
+            if (slot->initial_offset == 0) {
+                slot->protocol_error = true;
+                slot->protocol_error_msg = "Unexpected HTTP 206 response without Range request";
+                return 0;
+            }
+            if (!slot->has_content_range) {
+                slot->protocol_error = true;
+                slot->protocol_error_msg = "HTTP 206 response missing valid Content-Range header";
+                return 0;
+            }
+            uint64_t rangeSpan = (slot->content_range_end - slot->content_range_start) + 1;
+            uint64_t alreadyReceived = slot->current_offset - slot->initial_offset;
+            uint64_t nextReceived = 0;
+            if (__builtin_add_overflow(alreadyReceived, static_cast<uint64_t>(bytes),
+                                       &nextReceived) ||
+                nextReceived > rangeSpan) {
+                slot->protocol_error = true;
+                slot->protocol_error_msg = "HTTP 206 payload exceeded declared Content-Range span";
+                return 0;
+            }
         }
 
         if (httpCode == 200 && slot->initial_offset > 0 && !slot->truncated_for_200) {
@@ -1959,10 +2545,13 @@ struct DownloadManager::Impl {
         }
 
         const auto hooks = slot->self->snapshotHooks();
-        if (hooks.drop_at_percent > 0.0f && hooks.simulated_drop_count == 0 &&
+        if (std::isfinite(hooks.drop_at_percent) && hooks.drop_at_percent > 0.0f &&
+            hooks.drop_at_percent <= 1.0f && hooks.simulated_drop_count == 0 &&
             slot->expected_total > 0) {
-            if (slot->current_offset >=
-                static_cast<uint64_t>(slot->expected_total * hooks.drop_at_percent)) {
+            const double threshold = static_cast<double>(slot->expected_total) *
+                                     static_cast<double>(hooks.drop_at_percent);
+            if (std::isfinite(threshold) && threshold >= 0.0 &&
+                static_cast<double>(slot->current_offset) >= threshold) {
                 slot->self->recordDropCount();
                 slot->drop_triggered = true;
                 return 0;
@@ -2004,7 +2593,14 @@ struct DownloadManager::Impl {
             writtenAll += static_cast<size_t>(w);
         }
 
-        slot->current_offset += writtenAll;
+        uint64_t nextOffset = 0;
+        if (__builtin_add_overflow(slot->current_offset, static_cast<uint64_t>(writtenAll),
+                                   &nextOffset)) {
+            slot->protocol_error = true;
+            slot->protocol_error_msg = "HTTP payload offset overflow";
+            return 0;
+        }
+        slot->current_offset = nextOffset;
         {
             std::lock_guard<std::mutex> lk(slot->job->task->progress_mutex);
             slot->job->task->bytes_downloaded = slot->current_offset;
@@ -2035,13 +2631,16 @@ struct DownloadManager::Impl {
             return;
         }
 
+        const uint64_t seqId = job->task->sequence_id;
         if (wasCancelled) {
+            releasePartClaim(job->part_path, seqId);
             markTaskTerminal(job->task, TaskState::Cancelled,
                              errMsg.empty() ? "Download cancelled by user" : errMsg);
             return;
         }
 
         if (!ok) {
+            releasePartClaim(job->part_path, seqId);
             markTaskTerminal(job->task, TaskState::Failed,
                              errMsg.empty() ? "HTTP download failed" : errMsg);
             return;
@@ -2056,6 +2655,7 @@ struct DownloadManager::Impl {
         } else {
             std::error_code ec;
             fs::rename(job->part_path, job->final_path, ec);
+            releasePartClaim(job->part_path, seqId);
             if (ec) {
                 markTaskTerminal(job->task, TaskState::Failed,
                                  "Failed to finalize downloaded file");
@@ -2095,6 +2695,11 @@ struct DownloadManager::Impl {
 
         if (job->task->cancelled.load(std::memory_order_relaxed)) {
             finishHttpJobOutcome(job, false, "Cancelled before transfer", true);
+            return false;
+        }
+
+        if (job->preempted.load(std::memory_order_acquire)) {
+            finishHttpJobOutcome(job, false, "Preempted by immediate task");
             return false;
         }
 
@@ -2155,27 +2760,42 @@ struct DownloadManager::Impl {
                 return std::tolower(static_cast<unsigned char>(a)) == b;
             });
         const char *allowedProtocols = allowLoopback ? "https,http" : "https";
-        curl.easy_setopt(easy, CurlBinding::OPT_URL, job->url.c_str());
-        curl.easy_setopt(easy, CurlBinding::OPT_PROTOCOLS_STR, allowedProtocols);
-        curl.easy_setopt(easy, CurlBinding::OPT_REDIR_PROTOCOLS_STR, allowedProtocols);
-        curl.easy_setopt(easy, CurlBinding::OPT_FOLLOWLOCATION, 1L);
-        curl.easy_setopt(easy, CurlBinding::OPT_MAXREDIRS, 5L);
-        curl.easy_setopt(easy, CurlBinding::OPT_HTTP_VERSION, CurlBinding::VAL_HTTP_VERSION_2TLS);
+
+        bool optOk = true;
+        auto setChecked = [&](CurlBinding::Opt opt, auto value) {
+            if (curl.setOpt(easy, opt, value) != 0) {
+                optOk = false;
+            }
+        };
+
+        setChecked(CurlBinding::Opt::URL, job->url.c_str());
+        setChecked(CurlBinding::Opt::PROTOCOLS_STR, allowedProtocols);
+        setChecked(CurlBinding::Opt::REDIR_PROTOCOLS_STR, allowedProtocols);
+        setChecked(CurlBinding::Opt::FOLLOWLOCATION, 1L);
+        setChecked(CurlBinding::Opt::MAXREDIRS, 5L);
+        setChecked(CurlBinding::Opt::HTTP_VERSION, CurlBinding::VAL_HTTP_VERSION_2TLS);
         // Coalesce bulk HTTPS transfers onto multiplexed HTTP/2 streams, while keeping
         // the dedicated Immediate fast lane and cleartext loopback HTTP free of pipe-wait blocking.
-        curl.easy_setopt(easy, CurlBinding::OPT_PIPEWAIT, (isHttps && !useFastLaneSlot) ? 1L : 0L);
-        curl.easy_setopt(easy, CurlBinding::OPT_NOSIGNAL, 1L);
-        curl.easy_setopt(easy, CurlBinding::OPT_CONNECTTIMEOUT, 15L);
-        curl.easy_setopt(easy, CurlBinding::OPT_TIMEOUT, 300L);
-        curl.easy_setopt(easy, CurlBinding::OPT_USERAGENT, "WayWal-Studio/3.0");
-        curl.easy_setopt(easy, CurlBinding::OPT_HEADERFUNCTION, &Impl::onCurlHeader);
-        curl.easy_setopt(easy, CurlBinding::OPT_HEADERDATA, slot.get());
-        curl.easy_setopt(easy, CurlBinding::OPT_WRITEFUNCTION, &Impl::onCurlWrite);
-        curl.easy_setopt(easy, CurlBinding::OPT_WRITEDATA, slot.get());
+        setChecked(CurlBinding::Opt::PIPEWAIT, (isHttps && !useFastLaneSlot) ? 1L : 0L);
+        setChecked(CurlBinding::Opt::NOSIGNAL, 1L);
+        setChecked(CurlBinding::Opt::CONNECTTIMEOUT, 15L);
+        setChecked(CurlBinding::Opt::TIMEOUT, 300L);
+        setChecked(CurlBinding::Opt::USERAGENT, "WayWal-Studio/3.0");
+        setChecked(CurlBinding::Opt::HEADERFUNCTION, &Impl::onCurlHeader);
+        setChecked(CurlBinding::Opt::HEADERDATA, slot.get());
+        setChecked(CurlBinding::Opt::WRITEFUNCTION, &Impl::onCurlWrite);
+        setChecked(CurlBinding::Opt::WRITEDATA, slot.get());
 
         if (offset > 0) {
             slot->range_header = std::to_string(offset) + "-";
-            curl.easy_setopt(easy, CurlBinding::OPT_RANGE, slot->range_header.c_str());
+            setChecked(CurlBinding::Opt::RANGE, slot->range_header.c_str());
+        }
+
+        if (!optOk) {
+            ::close(fd);
+            curl.easy_cleanup(easy);
+            finishHttpJobOutcome(job, false, "libcurl rejected required HTTPS/transfer option");
+            return false;
         }
 
         if (useFastLaneSlot) {
@@ -2205,17 +2825,38 @@ struct DownloadManager::Impl {
     void dispatchQueuedHttpJobs()
     {
         auto now = std::chrono::steady_clock::now();
+        std::vector<std::shared_ptr<HttpTransferJob>> readyRetries;
         while (!m_retryHeap.empty() && m_retryHeap.top().deadline <= now) {
-            auto readyJob = m_retryHeap.top().job;
+            readyRetries.push_back(m_retryHeap.top().job);
             m_retryHeap.pop();
-            std::lock_guard<std::mutex> hlk(m_httpMutex);
-            if (readyJob->fast_lane) {
-                m_httpFastQueue.push(std::move(readyJob));
-            } else {
-                m_httpBulkQueue.push(std::move(readyJob));
+        }
+        if (!readyRetries.empty()) {
+            std::vector<std::shared_ptr<HttpTransferJob>> cancelledRetries;
+            {
+                std::lock_guard<std::mutex> hlk(m_httpMutex);
+                for (auto &readyJob : readyRetries) {
+                    if (!m_running.load(std::memory_order_acquire) ||
+                        readyJob->task->cancelled.load(std::memory_order_relaxed) ||
+                        readyJob->preempted.load(std::memory_order_acquire)) {
+                        cancelledRetries.push_back(std::move(readyJob));
+                    } else if (readyJob->fast_lane) {
+                        m_httpFastQueue.push(std::move(readyJob));
+                    } else {
+                        m_httpBulkQueue.push(std::move(readyJob));
+                    }
+                }
+            }
+            for (auto &cj : cancelledRetries) {
+                const bool isPreempt = cj->preempted.load(std::memory_order_acquire) &&
+                                       !cj->task->cancelled.load(std::memory_order_relaxed);
+                finishHttpJobOutcome(cj, false,
+                                     isPreempt ? "Preempted by immediate task"
+                                               : "Download cancelled before retry",
+                                     !isPreempt);
             }
         }
 
+        std::vector<std::shared_ptr<HttpTransferJob>> deferred;
         while (true) {
             std::shared_ptr<HttpTransferJob> nextJob;
             bool useFastSlot = false;
@@ -2238,7 +2879,32 @@ struct DownloadManager::Impl {
             if (!nextJob) {
                 break;
             }
+            if (nextJob->task->cancelled.load(std::memory_order_relaxed) ||
+                nextJob->preempted.load(std::memory_order_acquire)) {
+                const bool isPreempt = nextJob->preempted.load(std::memory_order_acquire) &&
+                                       !nextJob->task->cancelled.load(std::memory_order_relaxed);
+                finishHttpJobOutcome(nextJob, false,
+                                     isPreempt ? "Preempted by immediate task"
+                                               : "Download cancelled in queue",
+                                     !isPreempt);
+                continue;
+            }
+            if (!tryClaimPartPath(nextJob->part_path, nextJob->task->sequence_id)) {
+                deferred.push_back(std::move(nextJob));
+                continue;
+            }
             launchHttpSlot(nextJob, useFastSlot);
+        }
+
+        if (!deferred.empty()) {
+            std::lock_guard<std::mutex> hlk(m_httpMutex);
+            for (auto &job : deferred) {
+                if (job->fast_lane) {
+                    m_httpFastQueue.push(std::move(job));
+                } else {
+                    m_httpBulkQueue.push(std::move(job));
+                }
+            }
         }
     }
 
@@ -2247,7 +2913,8 @@ struct DownloadManager::Impl {
         const auto &curl = CurlBinding::instance();
         std::vector<CurlBinding::CURL *> toCancel;
         for (const auto &[easy, slot] : m_activeSlots) {
-            if (slot->job->task->cancelled.load(std::memory_order_relaxed)) {
+            if (slot->job->task->cancelled.load(std::memory_order_relaxed) ||
+                slot->job->preempted.load(std::memory_order_acquire)) {
                 toCancel.push_back(easy);
             }
         }
@@ -2266,7 +2933,12 @@ struct DownloadManager::Impl {
                 slot->fd = -1;
             }
             releaseSlotLane(slot.get());
-            finishHttpJobOutcome(slot->job, false, "Download cancelled by user", true);
+            const bool isPreempt = slot->job->preempted.load(std::memory_order_acquire) &&
+                                   !slot->job->task->cancelled.load(std::memory_order_relaxed);
+            finishHttpJobOutcome(slot->job, false,
+                                 isPreempt ? "Preempted by immediate task"
+                                           : "Download cancelled by user",
+                                 !isPreempt);
         }
     }
 
@@ -2295,10 +2967,10 @@ struct DownloadManager::Impl {
 
             long httpCode = slot->last_http_code;
             if (httpCode == 0) {
-                curl.easy_getinfo(easy, CurlBinding::INFO_RESPONSE_CODE, &httpCode);
+                curl.getInfo(easy, CurlBinding::Info::RESPONSE_CODE, &httpCode);
             }
             const char *effUrl = nullptr;
-            if (curl.easy_getinfo(easy, CurlBinding::INFO_EFFECTIVE_URL, &effUrl) == 0 && effUrl) {
+            if (curl.getInfo(easy, CurlBinding::Info::EFFECTIVE_URL, &effUrl) == 0 && effUrl) {
                 if (!isAllowedDownloadUrl(effUrl, slot->allow_loopback_http)) {
                     slot->ssrf_rejected = true;
                 }
@@ -2318,6 +2990,10 @@ struct DownloadManager::Impl {
                 finishHttpJobOutcome(job, false, "Download cancelled by user", true);
                 continue;
             }
+            if (job->preempted.load(std::memory_order_acquire)) {
+                finishHttpJobOutcome(job, false, "Preempted by immediate task");
+                continue;
+            }
 
             if (slot->ssrf_rejected) {
                 if (slot->initial_offset == 0) {
@@ -2329,9 +3005,22 @@ struct DownloadManager::Impl {
             }
 
             if (slot->protocol_error) {
-                ::unlink(job->part_path.c_str());
+                if (slot->initial_offset == 0) {
+                    ::unlink(job->part_path.c_str());
+                }
                 finishHttpJobOutcome(job, false,
-                                     "Unexpected HTTP 206 response without Range request");
+                                     slot->protocol_error_msg.empty()
+                                         ? "Malformed HTTP protocol framing"
+                                         : slot->protocol_error_msg);
+                continue;
+            }
+
+            if (httpCode == 206 && (!slot->has_content_range || slot->initial_offset == 0)) {
+                if (slot->initial_offset == 0) {
+                    ::unlink(job->part_path.c_str());
+                }
+                finishHttpJobOutcome(job, false,
+                                     "HTTP 206 response missing valid Content-Range header");
                 continue;
             }
 
@@ -2378,11 +3067,16 @@ struct DownloadManager::Impl {
                 continue;
             }
 
-            bool validSuccessCode =
-                (httpCode == 200) || (httpCode == 206 && slot->initial_offset > 0);
-            bool completeBody =
+            const bool validSuccessCode =
+                (httpCode == 200) ||
+                (httpCode == 206 && slot->initial_offset > 0 && slot->has_content_range);
+            const bool rangeSpanComplete =
+                !(httpCode == 206 && slot->has_content_length &&
+                  (slot->current_offset - slot->initial_offset) != slot->content_length);
+            const bool completeBody =
                 (!slot->has_authoritative_length || slot->current_offset == slot->expected_total) &&
-                (slot->expected_total == 0 || slot->current_offset >= slot->expected_total);
+                (slot->expected_total == 0 || slot->current_offset >= slot->expected_total) &&
+                rangeSpanComplete;
             if (curlResult == 0 && !slot->drop_triggered && validSuccessCode && completeBody) {
                 finishHttpJobOutcome(job, true, {});
                 continue;
@@ -2404,9 +3098,14 @@ struct DownloadManager::Impl {
             if (slot->current_offset == 0) {
                 ::unlink(job->part_path.c_str());
             }
-            std::string reason =
-                (httpCode > 0) ? ("HTTP transfer failed with status " + std::to_string(httpCode))
-                               : "HTTP network transfer failed after retries";
+            std::string reason;
+            if ((httpCode == 200 || httpCode == 206) && (!completeBody || curlResult == 18)) {
+                reason = "Unexpected EOF / Content-Length mismatch";
+            } else if (httpCode > 0) {
+                reason = "HTTP transfer failed with status " + std::to_string(httpCode);
+            } else {
+                reason = "HTTP network transfer failed after retries";
+            }
             finishHttpJobOutcome(job, false, reason);
         }
     }
@@ -2460,14 +3159,15 @@ struct DownloadManager::Impl {
         if (curl.available()) {
             m_multi = curl.multi_init();
             if (m_multi) {
-                curl.multi_setopt(m_multi, CurlBinding::MOPT_PIPELINING,
-                                  CurlBinding::VAL_PIPE_MULTIPLEX);
-                curl.multi_setopt(m_multi, CurlBinding::MOPT_MAX_HOST_CONNECTIONS, 6L);
-                curl.multi_setopt(m_multi, CurlBinding::MOPT_MAX_TOTAL_CONNECTIONS, 8L);
-                curl.multi_setopt(m_multi, CurlBinding::MOPT_SOCKETFUNCTION, &Impl::onCurlSocket);
-                curl.multi_setopt(m_multi, CurlBinding::MOPT_SOCKETDATA, this);
-                curl.multi_setopt(m_multi, CurlBinding::MOPT_TIMERFUNCTION, &Impl::onCurlTimer);
-                curl.multi_setopt(m_multi, CurlBinding::MOPT_TIMERDATA, this);
+                curl.multiSetOpt(m_multi, CurlBinding::MultiOpt::PIPELINING,
+                                 CurlBinding::VAL_PIPE_MULTIPLEX);
+                curl.multiSetOpt(m_multi, CurlBinding::MultiOpt::MAX_HOST_CONNECTIONS, 6L);
+                curl.multiSetOpt(m_multi, CurlBinding::MultiOpt::MAX_TOTAL_CONNECTIONS, 8L);
+                curl.multiSetOpt(m_multi, CurlBinding::MultiOpt::SOCKETFUNCTION,
+                                 &Impl::onCurlSocket);
+                curl.multiSetOpt(m_multi, CurlBinding::MultiOpt::SOCKETDATA, this);
+                curl.multiSetOpt(m_multi, CurlBinding::MultiOpt::TIMERFUNCTION, &Impl::onCurlTimer);
+                curl.multiSetOpt(m_multi, CurlBinding::MultiOpt::TIMERDATA, this);
             }
         }
 
@@ -2607,9 +3307,11 @@ struct DownloadManager::Impl {
                 continue;
             }
 
+            const uint64_t ownerSeq = job->task->sequence_id;
             if (job->task->cancelled.load(std::memory_order_relaxed) ||
                 !m_running.load(std::memory_order_acquire)) {
                 ::unlink(job->part_path.c_str());
+                releasePartClaim(job->part_path, ownerSeq);
                 markTaskTerminal(job->task, TaskState::Cancelled, "Verification cancelled");
                 continue;
             }
@@ -2617,48 +3319,24 @@ struct DownloadManager::Impl {
             job->task->state.store(TaskState::Verifying, std::memory_order_relaxed);
             job->task->notifyProgress();
 
-            wwpkg_package_t *pkg = wwpkg_open(job->part_path.c_str());
-            if (!pkg) {
-                ::unlink(job->part_path.c_str());
-                markTaskTerminal(job->task, TaskState::Failed,
-                                 "Invalid or corrupt .wwpkg container");
-                continue;
-            }
-
-            bool isTrusted = false;
-            bool sigValid = wwpkg_verify_signature(pkg, &isTrusted);
-            if (!sigValid) {
-                wwpkg_close(pkg);
-                ::unlink(job->part_path.c_str());
-                markTaskTerminal(job->task, TaskState::Failed,
-                                 "Cryptographic Ed25519 or Merkle verification failed");
-                continue;
-            }
-
-            job->task->state.store(TaskState::Extracting, std::memory_order_relaxed);
-            job->task->notifyProgress();
-
             std::string stem = sanitizePackageFilenameStem(job->task->request.openhub_package_id);
             fs::path extractDir = fs::path(currentDownloadDir()) / "extracted" / stem;
-            bool extractedOk = extractVerifiedWwpkgAll(pkg, job->part_path, extractDir);
-            wwpkg_close(pkg);
+            bool isTrusted = false;
+            const VerifyInstallResult res = verifyExtractAndInstallWwpkg(
+                job->part_path, job->final_path, extractDir, isTrusted);
+            releasePartClaim(job->part_path, ownerSeq);
 
-            if (!extractedOk) {
-                std::error_code ec;
-                fs::remove_all(extractDir, ec);
+            if (res != VerifyInstallResult::Ok) {
                 ::unlink(job->part_path.c_str());
-                markTaskTerminal(job->task, TaskState::Failed, "Confined .wwpkg extraction failed");
-                continue;
-            }
-
-            std::error_code renameEc;
-            fs::rename(job->part_path, job->final_path, renameEc);
-            if (renameEc) {
-                std::error_code ec;
-                fs::remove_all(extractDir, ec);
-                ::unlink(job->part_path.c_str());
-                markTaskTerminal(job->task, TaskState::Failed,
-                                 "Failed to move verified .wwpkg into destination");
+                const char *errMsg = "Invalid or corrupt .wwpkg container";
+                if (res == VerifyInstallResult::SignatureFailed) {
+                    errMsg = "Cryptographic Ed25519 or Merkle verification failed";
+                } else if (res == VerifyInstallResult::ExtractFailed) {
+                    errMsg = "Confined .wwpkg extraction failed";
+                } else if (res == VerifyInstallResult::FinalizeFailed) {
+                    errMsg = "Failed to move verified .wwpkg into destination";
+                }
+                markTaskTerminal(job->task, TaskState::Failed, errMsg);
                 continue;
             }
 
@@ -2666,8 +3344,11 @@ struct DownloadManager::Impl {
                 std::lock_guard<std::mutex> lk(job->task->progress_mutex);
                 job->task->installed_path = job->final_path;
                 job->task->extracted_dir = extractDir.string();
+                job->task->is_trusted = isTrusted;
             }
 
+            job->task->state.store(TaskState::Extracting, std::memory_order_relaxed);
+            job->task->notifyProgress();
             job->task->state.store(TaskState::Indexing, std::memory_order_relaxed);
             job->task->notifyProgress();
 
@@ -2704,6 +3385,10 @@ struct DownloadManager::Impl {
                 continue;
             }
 
+            if (currentTask->immediate_counted.exchange(false, std::memory_order_acq_rel)) {
+                m_pendingImmediateCount.fetch_sub(1, std::memory_order_acq_rel);
+            }
+
             if (currentTask->cancelled.load(std::memory_order_relaxed)) {
                 markTaskTerminal(currentTask, TaskState::Cancelled, "Cancelled before execution");
                 continue;
@@ -2722,10 +3407,15 @@ struct DownloadManager::Impl {
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             while (!m_arbQueue.empty()) {
-                remaining.push_back(m_arbQueue.top());
+                auto t = m_arbQueue.top();
                 m_arbQueue.pop();
+                if (t && t->immediate_counted.exchange(false, std::memory_order_acq_rel)) {
+                    m_pendingImmediateCount.fetch_sub(1, std::memory_order_acq_rel);
+                }
+                remaining.push_back(std::move(t));
             }
         }
+        m_pendingImmediateCount.store(0, std::memory_order_release);
         for (auto &t : remaining) {
             markTaskTerminal(t, TaskState::Cancelled, "Shutdown in progress");
         }
@@ -2734,7 +3424,7 @@ struct DownloadManager::Impl {
     void executeArbitratedTask(const std::shared_ptr<Task> &task)
     {
         m_currentActivePriority.store(static_cast<int>(task->request.priority),
-                                      std::memory_order_relaxed);
+                                      std::memory_order_release);
         task->state.store(TaskState::Probing, std::memory_order_relaxed);
         task->notifyProgress();
 
@@ -2754,12 +3444,14 @@ struct DownloadManager::Impl {
             }
 
             if (!success && !task->cancelled.load(std::memory_order_relaxed) &&
-                m_running.load(std::memory_order_acquire)) {
+                m_running.load(std::memory_order_acquire) && !shouldPreemptTask(task)) {
                 if (!hooks.force_backend_failure_b) {
-                    if (executeBackendB(task)) {
+                    std::string bErr;
+                    if (executeBackendB(task, &bErr)) {
                         success = true;
                     } else {
-                        failureReason += "Backend B failed; ";
+                        failureReason += bErr.empty() ? "Backend B failed; "
+                                                      : ("Backend B failed (" + bErr + "); ");
                     }
                 } else {
                     failureReason += "Backend B skipped; ";
@@ -2767,9 +3459,7 @@ struct DownloadManager::Impl {
             }
 
             if (!success && !task->cancelled.load(std::memory_order_relaxed) &&
-                m_running.load(std::memory_order_acquire) &&
-                !(m_preemptActiveTask.load(std::memory_order_relaxed) &&
-                  task->request.priority <= TaskPriority::BackgroundUpdate)) {
+                m_running.load(std::memory_order_acquire) && !shouldPreemptTask(task)) {
                 if (!hooks.force_backend_failure_c) {
                     if (executeBackendC(task)) {
                         success = true;
@@ -2781,21 +3471,26 @@ struct DownloadManager::Impl {
                 }
             }
         } else {
-            if (executeBackendB(task)) {
+            std::string bErr;
+            if (executeBackendB(task, &bErr)) {
                 success = true;
             } else {
-                failureReason = "Open Hub synthetic download failed";
+                failureReason = bErr.empty() ? "Open Hub download failed" : bErr;
             }
         }
 
+        if (task->request.priority == TaskPriority::Immediate &&
+            m_pendingImmediateCount.load(std::memory_order_acquire) == 0) {
+            m_preemptActiveTask.store(false, std::memory_order_release);
+        }
+
         if (task->cancelled.load(std::memory_order_relaxed)) {
-            m_currentActivePriority.store(0, std::memory_order_relaxed);
+            m_currentActivePriority.store(0, std::memory_order_release);
             markTaskTerminal(task, TaskState::Cancelled, "Download cancelled by user");
             return;
         }
 
-        if (m_preemptActiveTask.load(std::memory_order_relaxed) &&
-            task->request.priority <= TaskPriority::BackgroundUpdate && !success) {
+        if (shouldPreemptTask(task) && !success && m_running.load(std::memory_order_acquire)) {
             task->state.store(TaskState::Queued, std::memory_order_relaxed);
             task->notifyProgress();
             {
@@ -2803,12 +3498,14 @@ struct DownloadManager::Impl {
                 m_arbQueue.push(task);
                 m_queueCv.notify_all();
             }
-            m_preemptActiveTask.store(false, std::memory_order_relaxed);
-            m_currentActivePriority.store(0, std::memory_order_relaxed);
+            if (m_pendingImmediateCount.load(std::memory_order_acquire) == 0) {
+                m_preemptActiveTask.store(false, std::memory_order_release);
+            }
+            m_currentActivePriority.store(0, std::memory_order_release);
             return;
         }
 
-        m_currentActivePriority.store(0, std::memory_order_relaxed);
+        m_currentActivePriority.store(0, std::memory_order_release);
         if (success) {
             task->state.store(TaskState::Verifying, std::memory_order_relaxed);
             task->notifyProgress();
@@ -2853,7 +3550,7 @@ struct DownloadManager::Impl {
         uint64_t lastBytes = 0;
 
         while (m_running.load(std::memory_order_relaxed) &&
-               !task->cancelled.load(std::memory_order_relaxed)) {
+               !task->cancelled.load(std::memory_order_relaxed) && !shouldPreemptTask(task)) {
             if (!m_steamworks.isRunning()) {
                 return false;
             }
@@ -2940,11 +3637,12 @@ struct DownloadManager::Impl {
             }
 
             const auto &curl = CurlBinding::instance();
-            if (!curl.easy_init || !curl.easy_perform) {
+            if (!curl.globalInitOk || !curl.easy_init || !curl.easy_perform || !curl.easy_setopt ||
+                !curl.easy_getinfo || !curl.easy_cleanup) {
                 return false;
             }
 
-            void *easy = curl.easy_init();
+            CurlBinding::CURL *easy = curl.easy_init();
             if (!easy) {
                 return false;
             }
@@ -2961,18 +3659,29 @@ struct DownloadManager::Impl {
                 return total;
             };
 
-            curl.easy_setopt(easy, CurlBinding::OPT_URL, postUrl.c_str());
-            curl.easy_setopt(easy, CurlBinding::OPT_PROTOCOLS_STR, "https");
-            curl.easy_setopt(easy, CurlBinding::OPT_REDIR_PROTOCOLS_STR, "https");
-            curl.easy_setopt(easy, CurlBinding::OPT_POSTFIELDS, postData.c_str());
-            curl.easy_setopt(easy, CurlBinding::OPT_WRITEFUNCTION, writeCallback);
-            curl.easy_setopt(easy, CurlBinding::OPT_WRITEDATA, &responseString);
-            curl.easy_setopt(easy, CurlBinding::OPT_TIMEOUT, 15L);
-            curl.easy_setopt(easy, CurlBinding::OPT_NOSIGNAL, 1L);
+            bool optOk = true;
+            auto setChecked = [&](CurlBinding::Opt opt, auto value) {
+                if (curl.setOpt(easy, opt, value) != 0) {
+                    optOk = false;
+                }
+            };
+            setChecked(CurlBinding::Opt::URL, postUrl.c_str());
+            setChecked(CurlBinding::Opt::PROTOCOLS_STR, "https");
+            setChecked(CurlBinding::Opt::REDIR_PROTOCOLS_STR, "https");
+            setChecked(CurlBinding::Opt::POSTFIELDS, postData.c_str());
+            setChecked(CurlBinding::Opt::WRITEFUNCTION, writeCallback);
+            setChecked(CurlBinding::Opt::WRITEDATA, &responseString);
+            setChecked(CurlBinding::Opt::TIMEOUT, 15L);
+            setChecked(CurlBinding::Opt::NOSIGNAL, 1L);
+
+            if (!optOk) {
+                curl.easy_cleanup(easy);
+                return false;
+            }
 
             int res = curl.easy_perform(easy);
             long httpCode = 0;
-            curl.easy_getinfo(easy, CurlBinding::INFO_RESPONSE_CODE, &httpCode);
+            curl.getInfo(easy, CurlBinding::Info::RESPONSE_CODE, &httpCode);
             curl.easy_cleanup(easy);
 
             if (res == 0 && (httpCode == 429 || httpCode == 503)) {
@@ -3013,8 +3722,12 @@ struct DownloadManager::Impl {
         return false;
     }
 
-    bool executeBackendB(const std::shared_ptr<Task> &task)
+    bool executeBackendB(const std::shared_ptr<Task> &task, std::string *outErr = nullptr)
     {
+        if (shouldPreemptTask(task)) {
+            return false;
+        }
+
         std::string downloadUrl;
         uint64_t estimatedSize = 0;
 
@@ -3029,20 +3742,51 @@ struct DownloadManager::Impl {
             downloadUrl = task->request.openhub_download_url;
         }
 
-        if (downloadUrl.empty()) {
+        if (downloadUrl.empty() || shouldPreemptTask(task)) {
             return false;
         }
 
-        std::string dlDir = currentDownloadDir();
-        std::string filename;
-        if (task->request.kind == DownloadRequest::SourceKind::SteamWorkshop) {
-            filename = std::to_string(task->request.steam_published_file_id) + ".bin";
-        } else {
-            filename = sanitizePackageFilenameStem(task->request.openhub_package_id) + ".wwpkg";
-        }
+        auto urlHasWwpkgSuffix = [](std::string_view url) {
+            const size_t q = url.find_first_of("?#");
+            std::string_view pathPart = (q == std::string_view::npos) ? url : url.substr(0, q);
+            constexpr std::string_view kExt = ".wwpkg";
+            if (pathPart.size() < kExt.size()) {
+                return false;
+            }
+            std::string_view tail = pathPart.substr(pathPart.size() - kExt.size());
+            for (size_t i = 0; i < kExt.size(); ++i) {
+                if (std::tolower(static_cast<unsigned char>(tail[i])) != kExt[i]) {
+                    return false;
+                }
+            }
+            return true;
+        };
 
-        std::string partPath = dlDir + "/" + filename + ".part";
-        std::string finalPath = dlDir + "/" + filename;
+        const std::string dlDir = currentDownloadDir();
+        const std::string stem =
+            (task->request.kind == DownloadRequest::SourceKind::SteamWorkshop)
+                ? std::to_string(task->request.steam_published_file_id)
+                : sanitizePackageFilenameStem(task->request.openhub_package_id);
+        const bool expectWwpkg =
+            (task->request.kind == DownloadRequest::SourceKind::OpenHubPackage) ||
+            urlHasWwpkgSuffix(downloadUrl);
+        const std::string ext = expectWwpkg ? ".wwpkg" : ".bin";
+        const std::string partPath = dlDir + "/" + stem + ext + ".part";
+        const std::string finalPath = dlDir + "/" + stem + ext;
+
+        while (!tryClaimPartPath(partPath, task->sequence_id)) {
+            if (!m_running.load(std::memory_order_acquire) ||
+                task->cancelled.load(std::memory_order_relaxed) || shouldPreemptTask(task)) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        struct PartClaimGuard {
+            Impl *self;
+            std::string path;
+            uint64_t seq;
+            ~PartClaimGuard() { self->releasePartClaim(path, seq); }
+        } claimGuard{this, partPath, task->sequence_id};
 
         const auto hooks = snapshotHooks();
         bool isMock = hooks.dry_run_mode || (downloadUrl.rfind("mock://", 0) == 0) ||
@@ -3083,18 +3827,165 @@ struct DownloadManager::Impl {
             wakeReactor();
 
             std::unique_lock<std::mutex> slk(*job->sync_mtx);
-            job->sync_cv->wait(slk, [&] {
-                return *job->sync_done || !m_reactorAlive.load(std::memory_order_acquire);
-            });
-            if (*job->sync_ok && !task->cancelled.load(std::memory_order_relaxed)) {
+            while (!*job->sync_done && m_reactorAlive.load(std::memory_order_acquire)) {
+                if (shouldPreemptTask(task) || task->cancelled.load(std::memory_order_relaxed) ||
+                    !m_running.load(std::memory_order_acquire)) {
+                    if (!task->cancelled.load(std::memory_order_relaxed) &&
+                        shouldPreemptTask(task)) {
+                        job->preempted.store(true, std::memory_order_release);
+                    }
+                    wakeReactor();
+                    job->sync_cv->wait(slk, [&] {
+                        return *job->sync_done || !m_reactorAlive.load(std::memory_order_acquire);
+                    });
+                    break;
+                }
+                job->sync_cv->wait_for(slk, std::chrono::milliseconds(25));
+            }
+            if (!*job->sync_ok || task->cancelled.load(std::memory_order_relaxed) ||
+                job->preempted.load(std::memory_order_acquire)) {
+                if (outErr && !job->sync_err->empty()) {
+                    *outErr = *job->sync_err;
+                }
+                return false;
+            }
+
+            const int pkgFd = ::open(partPath.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (pkgFd < 0) {
+                return false;
+            }
+            struct stat openSt{};
+            if (::fstat(pkgFd, &openSt) != 0 || !S_ISREG(openSt.st_mode)) {
+                ::close(pkgFd);
+                ::unlink(partPath.c_str());
+                return false;
+            }
+
+            auto verifySameInode = [&]() {
+                struct stat curSt{};
+                return ::lstat(partPath.c_str(), &curSt) == 0 && !S_ISLNK(curSt.st_mode) &&
+                       curSt.st_dev == openSt.st_dev && curSt.st_ino == openSt.st_ino;
+            };
+
+            if (wwpkg_package_t *pkg = wwpkg_open_fd(pkgFd)) {
+                bool isTrusted = false;
+                const bool sigValid = verifyWwpkgSignatureAndTrust(pkg, isTrusted);
+                if (!sigValid) {
+                    wwpkg_close(pkg);
+                    ::close(pkgFd);
+                    ::unlink(partPath.c_str());
+                    if (outErr) {
+                        *outErr = "Cryptographic Ed25519 or Merkle verification failed";
+                    }
+                    return false;
+                }
+
+                fs::path extractDir = fs::path(dlDir) / "extracted" / stem;
                 std::error_code ec;
-                fs::rename(partPath, finalPath, ec);
-                if (!ec) {
+                fs::remove_all(extractDir, ec);
+                const bool extractedOk = wwpkg_extract_all(pkg, extractDir.c_str());
+                wwpkg_close(pkg);
+
+                if (!extractedOk || !verifySameInode()) {
+                    ::close(pkgFd);
+                    fs::remove_all(extractDir, ec);
+                    ::unlink(partPath.c_str());
+                    if (outErr) {
+                        *outErr = "Confined .wwpkg extraction failed";
+                    }
+                    return false;
+                }
+
+                const std::string wwpkgFinal = dlDir + "/" + stem + ".wwpkg";
+                std::error_code renameEc;
+                fs::rename(partPath, wwpkgFinal, renameEc);
+                ::close(pkgFd);
+                if (renameEc) {
+                    fs::remove_all(extractDir, ec);
+                    ::unlink(partPath.c_str());
+                    return false;
+                }
+
+                std::lock_guard<std::mutex> lk(task->progress_mutex);
+                task->installed_path = wwpkgFinal;
+                task->extracted_dir = extractDir.string();
+                task->is_trusted = isTrusted;
+                return true;
+            }
+
+            if (expectWwpkg) {
+                ::close(pkgFd);
+                ::unlink(partPath.c_str());
+                if (outErr) {
+                    *outErr = "Invalid or corrupt .wwpkg container";
+                }
+                return false;
+            }
+
+            if (openSt.st_size >= 512 &&
+                openSt.st_size <= static_cast<off_t>(128ULL * 1024ULL * 1024ULL)) {
+                std::array<uint8_t, 512> hdr{};
+                if (::pread(pkgFd, hdr.data(), hdr.size(), 0) == 512 &&
+                    std::memcmp(hdr.data() + 257, "ustar", 5) == 0) {
+                    const size_t tarSize = static_cast<size_t>(openSt.st_size);
+                    std::vector<uint8_t> tarBuf(tarSize);
+                    size_t got = 0;
+                    bool readOk = true;
+                    while (got < tarSize) {
+                        ssize_t r = ::pread(pkgFd, tarBuf.data() + got, tarSize - got,
+                                            static_cast<off_t>(got));
+                        if (r < 0) {
+                            if (errno == EINTR) {
+                                continue;
+                            }
+                            readOk = false;
+                            break;
+                        }
+                        if (r == 0) {
+                            readOk = false;
+                            break;
+                        }
+                        got += static_cast<size_t>(r);
+                    }
+                    fs::path extractDir = fs::path(dlDir) / "extracted" / stem;
+                    std::error_code ec;
+                    fs::remove_all(extractDir, ec);
+                    const bool okTar = readOk &&
+                                       extractUstarBufferConfined(tarBuf.data(), got, extractDir) &&
+                                       verifySameInode();
+                    const std::string tarFinal = dlDir + "/" + stem + ".tar";
+                    std::error_code renameEc;
+                    if (okTar) {
+                        fs::rename(partPath, tarFinal, renameEc);
+                    }
+                    ::close(pkgFd);
+                    if (!okTar || renameEc) {
+                        fs::remove_all(extractDir, ec);
+                        ::unlink(partPath.c_str());
+                        if (outErr) {
+                            *outErr = "Confined tar archive extraction failed";
+                        }
+                        return false;
+                    }
                     std::lock_guard<std::mutex> lk(task->progress_mutex);
-                    task->installed_path = finalPath;
+                    task->installed_path = tarFinal;
+                    task->extracted_dir = extractDir.string();
                     return true;
                 }
             }
+
+            const bool sameInode = verifySameInode();
+            std::error_code ec;
+            if (sameInode) {
+                fs::rename(partPath, finalPath, ec);
+            }
+            ::close(pkgFd);
+            if (sameInode && !ec) {
+                std::lock_guard<std::mutex> lk(task->progress_mutex);
+                task->installed_path = finalPath;
+                return true;
+            }
+            ::unlink(partPath.c_str());
             return false;
         }
 
@@ -3105,7 +3996,7 @@ struct DownloadManager::Impl {
 
         for (int attempt = 0;
              attempt < kMaxRetries && !task->cancelled.load(std::memory_order_relaxed) &&
-             m_running.load(std::memory_order_relaxed);
+             m_running.load(std::memory_order_relaxed) && !shouldPreemptTask(task);
              ++attempt) {
             uint64_t offset = 0;
             struct stat st{};
@@ -3113,12 +4004,13 @@ struct DownloadManager::Impl {
                 offset = static_cast<uint64_t>(st.st_size);
             }
 
-            int fd = ::open(partPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+            int fd = ::open(partPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
             if (fd < 0) {
                 return false;
             }
-            if (offset > 0) {
-                ::lseek(fd, static_cast<off_t>(offset), SEEK_SET);
+            if (offset > 0 && ::lseek(fd, static_cast<off_t>(offset), SEEK_SET) < 0) {
+                ::close(fd);
+                return false;
             }
 
             {
@@ -3137,9 +4029,7 @@ struct DownloadManager::Impl {
                 break;
             }
 
-            if (task->cancelled.load(std::memory_order_relaxed) ||
-                (m_preemptActiveTask.load(std::memory_order_relaxed) &&
-                 task->request.priority <= TaskPriority::BackgroundUpdate)) {
+            if (task->cancelled.load(std::memory_order_relaxed) || shouldPreemptTask(task)) {
                 break;
             }
 
@@ -3190,14 +4080,17 @@ struct DownloadManager::Impl {
 
         while (offset < totalSize && !task->cancelled.load(std::memory_order_relaxed) &&
                m_running.load(std::memory_order_relaxed)) {
-            if (m_preemptActiveTask.load(std::memory_order_relaxed) &&
-                task->request.priority <= TaskPriority::BackgroundUpdate) {
+            if (shouldPreemptTask(task)) {
                 return false;
             }
 
             const auto hooks = snapshotHooks();
-            if (hooks.drop_at_percent > 0.0f && hooks.simulated_drop_count == 0) {
-                if (offset >= static_cast<uint64_t>(totalSize * hooks.drop_at_percent)) {
+            if (std::isfinite(hooks.drop_at_percent) && hooks.drop_at_percent > 0.0f &&
+                hooks.drop_at_percent <= 1.0f && hooks.simulated_drop_count == 0) {
+                const double threshold =
+                    static_cast<double>(totalSize) * static_cast<double>(hooks.drop_at_percent);
+                if (std::isfinite(threshold) && threshold >= 0.0 &&
+                    static_cast<double>(offset) >= threshold) {
                     recordDropCount();
                     return false;
                 }
@@ -3292,6 +4185,10 @@ struct DownloadManager::Impl {
 
     bool executeBackendC(const std::shared_ptr<Task> &task)
     {
+        if (shouldPreemptTask(task)) {
+            return false;
+        }
+
         std::string steamCmdPath = findSteamCmd();
         if (steamCmdPath.empty()) {
             return false;
@@ -3381,7 +4278,7 @@ struct DownloadManager::Impl {
                 float pct = 0.0f;
                 size_t len = 0;
                 if (parseFloatPrefix(sv.substr(p), pct, len) && p + len < sv.size() &&
-                    sv[p + len] == '%') {
+                    sv[p + len] == '%' && std::isfinite(pct) && pct >= 0.0f && pct <= 100.0f) {
                     p += len + 1;
                     skipSpaces(sv, p);
                     if (sv.find("Update state (0x") != std::string_view::npos &&
@@ -3435,28 +4332,44 @@ struct DownloadManager::Impl {
             }
         };
 
+        constexpr size_t kMaxLineBytes = 16384;
+        constexpr size_t kMaxStdoutBytes = 16ULL * 1024ULL * 1024ULL;
+        size_t totalStdoutBytes = 0;
+        bool dropLongLine = false;
         bool sawEof = false;
         auto drainStdout = [&]() {
             while (!sawEof) {
                 ssize_t n = ::read(pipefd[0], readBuf, sizeof(readBuf));
                 if (n > 0) {
+                    if (totalStdoutBytes >= kMaxStdoutBytes) {
+                        lineBuffer.clear();
+                        continue;
+                    }
+                    totalStdoutBytes += static_cast<size_t>(n);
                     for (ssize_t i = 0; i < n; ++i) {
                         char c = readBuf[i];
                         if (c == '\n' || c == '\r') {
-                            if (!lineBuffer.empty()) {
+                            if (!dropLongLine && !lineBuffer.empty()) {
                                 handleLine(lineBuffer);
+                            }
+                            lineBuffer.clear();
+                            dropLongLine = false;
+                        } else if (!dropLongLine) {
+                            if (lineBuffer.size() < kMaxLineBytes) {
+                                lineBuffer.push_back(c);
+                            } else {
+                                dropLongLine = true;
                                 lineBuffer.clear();
                             }
-                        } else {
-                            lineBuffer.push_back(c);
                         }
                     }
                 } else if (n == 0) {
                     sawEof = true;
-                    if (!lineBuffer.empty()) {
+                    if (!dropLongLine && !lineBuffer.empty()) {
                         handleLine(lineBuffer);
-                        lineBuffer.clear();
                     }
+                    lineBuffer.clear();
+                    dropLongLine = false;
                 } else {
                     if (errno == EINTR) {
                         continue;
@@ -3470,7 +4383,7 @@ struct DownloadManager::Impl {
         int finalStatus = -1;
 
         while (m_running.load(std::memory_order_relaxed) &&
-               !task->cancelled.load(std::memory_order_relaxed)) {
+               !task->cancelled.load(std::memory_order_relaxed) && !shouldPreemptTask(task)) {
             struct pollfd pfd{};
             pfd.fd = pipefd[0];
             pfd.events = POLLIN;
@@ -3533,16 +4446,18 @@ struct DownloadManager::Impl {
             }
         };
 
-        if (!reaped && (!m_running.load(std::memory_order_relaxed) ||
-                        task->cancelled.load(std::memory_order_relaxed))) {
+        if (!reaped &&
+            (!m_running.load(std::memory_order_relaxed) ||
+             task->cancelled.load(std::memory_order_relaxed) || shouldPreemptTask(task))) {
             terminateAndReap();
             ::close(pipefd[0]);
             return false;
         }
 
         if (!reaped) {
-            for (int i = 0; i < 80 && m_running.load(std::memory_order_relaxed) &&
-                            !task->cancelled.load(std::memory_order_relaxed);
+            for (int i = 0;
+                 i < 12 && m_running.load(std::memory_order_relaxed) &&
+                 !task->cancelled.load(std::memory_order_relaxed) && !shouldPreemptTask(task);
                  ++i) {
                 int status = 0;
                 pid_t w = ::waitpid(pid, &status, WNOHANG);
@@ -3554,7 +4469,7 @@ struct DownloadManager::Impl {
                 if (w < 0 && errno != EINTR) {
                     break;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
             if (!reaped) {
                 terminateAndReap();
@@ -3578,8 +4493,23 @@ DownloadManager::DownloadManager() : m_impl(std::make_unique<Impl>(this)) {}
 
 DownloadManager::~DownloadManager() = default;
 
-DownloadManager::DownloadManager(DownloadManager &&) noexcept = default;
-DownloadManager &DownloadManager::operator=(DownloadManager &&) noexcept = default;
+DownloadManager::DownloadManager(DownloadManager &&other) noexcept : m_impl(std::move(other.m_impl))
+{
+    if (m_impl) {
+        m_impl->q_ptr = this;
+    }
+}
+
+DownloadManager &DownloadManager::operator=(DownloadManager &&other) noexcept
+{
+    if (this != &other) {
+        m_impl = std::move(other.m_impl);
+        if (m_impl) {
+            m_impl->q_ptr = this;
+        }
+    }
+    return *this;
+}
 
 bool DownloadManager::initialize() { return m_impl->initialize(); }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "studio/wizard/creator_packaging_wizard.hpp"
 
+#include "dock/browser_shared.hpp"
 #include "waywal/log.h"
 #include "waywal/path.h"
 #include "waywal/shader_graph.h"
@@ -522,20 +523,115 @@ ShaderAuditResult auditShaderSource(const QString &absPath, const QString &relPa
     return res;
 }
 
-/* Helper to format byte counts into human-readable strings */
-QString formatBytes(qint64 bytes)
+QString canonicalProjectTypeStr(wwpkg_type_t type)
 {
-    if (bytes < 1024) {
-        return QStringLiteral("%1 B").arg(bytes);
+    switch (type) {
+    case WWPKG_TYPE_SHADER_FRAGMENT:
+        return QStringLiteral("shader_fragment");
+    case WWPKG_TYPE_SHADER_COMPUTE:
+        return QStringLiteral("shader_compute");
+    case WWPKG_TYPE_SCENE_2D:
+        return QStringLiteral("scene_2d");
+    case WWPKG_TYPE_SCENE_PUPPET:
+        return QStringLiteral("scene_puppet");
+    case WWPKG_TYPE_SCENE_PARTICLES:
+        return QStringLiteral("scene_particles");
+    case WWPKG_TYPE_VIDEO_STREAM:
+        return QStringLiteral("video_stream");
+    default:
+        return QStringLiteral("shader_fragment");
     }
-    if (bytes < 1024 * 1024) {
-        return QStringLiteral("%1 KiB").arg(QString::number(bytes / 1024.0, 'f', 1));
+}
+
+void copyUtf8Bounded(char *dst, size_t dstCap, const QString &text)
+{
+    if (!dst || dstCap == 0) {
+        return;
     }
-    if (bytes < 1024 * 1024 * 1024) {
-        return QStringLiteral("%1 MiB").arg(QString::number(bytes / (1024.0 * 1024.0), 'f', 2));
+    const QByteArray utf8 = text.toUtf8();
+    const size_t maxBytes = dstCap - 1;
+    const size_t rawLen = static_cast<size_t>(utf8.size());
+    size_t copyLen = rawLen;
+    if (copyLen > maxBytes) {
+        size_t i = 0;
+        const char *data = utf8.constData();
+        while (i < rawLen) {
+            const unsigned char b = static_cast<unsigned char>(data[i]);
+            size_t charLen = 1;
+            if ((b & 0x80u) == 0) {
+                charLen = 1;
+            } else if ((b & 0xE0u) == 0xC0u) {
+                charLen = 2;
+            } else if ((b & 0xF0u) == 0xE0u) {
+                charLen = 3;
+            } else if ((b & 0xF8u) == 0xF0u) {
+                charLen = 4;
+            }
+            if (i + charLen > maxBytes || i + charLen > rawLen) {
+                break;
+            }
+            i += charLen;
+        }
+        copyLen = i;
     }
-    return QStringLiteral("%1 GiB").arg(
-        QString::number(bytes / (1024.0 * 1024.0 * 1024.0), 'f', 2));
+    if (copyLen > 0) {
+        std::memcpy(dst, utf8.constData(), copyLen);
+    }
+    dst[copyLen] = '\0';
+}
+
+bool isSameTargetFile(const QString &srcPath, const QString &dstPath)
+{
+    const QFileInfo srcFi(srcPath);
+    const QFileInfo dstFi(dstPath);
+    const QString srcClean = QDir::cleanPath(srcFi.absoluteFilePath());
+    const QString dstClean = QDir::cleanPath(dstFi.absoluteFilePath());
+    if (!srcClean.isEmpty() && srcClean == dstClean) {
+        return true;
+    }
+    if (QFileInfo::exists(dstPath) && QFileInfo::exists(srcPath)) {
+        const QString srcCanon = srcFi.canonicalFilePath();
+        const QString dstCanon = dstFi.canonicalFilePath();
+        if (!srcCanon.isEmpty() && srcCanon == dstCanon) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool copyFileSafely(const QString &srcPath, const QString &dstPath, bool *outAlreadySame = nullptr)
+{
+    if (outAlreadySame) {
+        *outAlreadySame = false;
+    }
+    if (srcPath.isEmpty() || dstPath.isEmpty() || !QFile::exists(srcPath)) {
+        return false;
+    }
+    if (isSameTargetFile(srcPath, dstPath)) {
+        if (outAlreadySame) {
+            *outAlreadySame = true;
+        }
+        return true;
+    }
+
+    QFileInfo dstFi(dstPath);
+    dstFi.dir().mkpath(QStringLiteral("."));
+    const QString tmpPath =
+        dstFi.dir().filePath(QStringLiteral(".tmp_%1_%2")
+                                 .arg(QUuid::createUuid().toString(QUuid::WithoutBraces))
+                                 .arg(dstFi.fileName()));
+    if (!QFile::copy(srcPath, tmpPath)) {
+        QFile::remove(tmpPath);
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(std::filesystem::path(tmpPath.toStdString()),
+                            std::filesystem::path(dstPath.toStdString()), ec);
+    if (ec) {
+        QFile::remove(tmpPath);
+        return false;
+    }
+    return true;
 }
 
 /* Helper to convert title string into canonical RFC-compliant slug */
@@ -566,8 +662,11 @@ QString slugify(const QString &title)
 
 void addPubkeyToTrustedKeys(const QString &pubkeyHex)
 {
-    const QString home = QDir::homePath();
-    const QString trustedPath = home + QStringLiteral("/.config/waywal/trusted_keys.json");
+    const QString cfgDir = browser_shared::resolveWaywalConfigDirQt(QString());
+    if (cfgDir.isEmpty()) {
+        return;
+    }
+    const QString trustedPath = cfgDir + QStringLiteral("/trusted_keys.json");
     QFileInfo fi(trustedPath);
     fi.dir().mkpath(QStringLiteral("."));
 
@@ -610,11 +709,10 @@ void addPubkeyToTrustedKeys(const QString &pubkeyHex)
         keysArray.append(pubkeyHex.toLower());
         rootObj.insert(QStringLiteral("trusted_keys"), keysArray);
         QJsonDocument writeDoc(rootObj);
-        QFile writeFile(trustedPath);
-        if (writeFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            writeFile.write(writeDoc.toJson(QJsonDocument::Indented));
-            writeFile.close();
-        }
+        const QByteArray bytes = writeDoc.toJson(QJsonDocument::Indented);
+        (void)browser_shared::atomicWriteBytesWithFsync(
+            std::filesystem::path(trustedPath.toStdString()), bytes.constData(),
+            static_cast<size_t>(bytes.size()), 0600);
     }
 }
 
@@ -796,9 +894,11 @@ void SourceIntakePage::setupUi()
     rowLayout->addWidget(m_sourcePathEdit, 1);
 
     m_browseDirBtn = new QPushButton(QStringLiteral("Browse Folder..."), pathGroup);
+    browser_shared::sizeButtonFromFontMetrics(m_browseDirBtn, 16, 28);
     rowLayout->addWidget(m_browseDirBtn);
 
     m_browseFileBtn = new QPushButton(QStringLiteral("Browse File..."), pathGroup);
+    browser_shared::sizeButtonFromFontMetrics(m_browseFileBtn, 16, 28);
     rowLayout->addWidget(m_browseFileBtn);
 
     pathLayout->addLayout(rowLayout);
@@ -836,20 +936,24 @@ void SourceIntakePage::setupUi()
 
     analysisLayout->addWidget(new QLabel(QStringLiteral("Title:"), analysisGroup), 0, 0);
     m_detectedTitleLabel = new QLabel(QStringLiteral("None"), analysisGroup);
+    m_detectedTitleLabel->setWordWrap(true);
     m_detectedTitleLabel->setStyleSheet(QStringLiteral("font-weight: bold; color: #38bdf8;"));
     analysisLayout->addWidget(m_detectedTitleLabel, 0, 1);
 
     analysisLayout->addWidget(new QLabel(QStringLiteral("Author:"), analysisGroup), 1, 0);
     m_detectedAuthorLabel = new QLabel(QStringLiteral("None"), analysisGroup);
+    m_detectedAuthorLabel->setWordWrap(true);
     analysisLayout->addWidget(m_detectedAuthorLabel, 1, 1);
 
     analysisLayout->addWidget(new QLabel(QStringLiteral("Entrypoint:"), analysisGroup), 2, 0);
     m_entrypointLabel = new QLabel(QStringLiteral("shaders/main.frag"), analysisGroup);
+    m_entrypointLabel->setWordWrap(true);
     m_entrypointLabel->setStyleSheet(QStringLiteral("font-family: monospace; color: #34d399;"));
     analysisLayout->addWidget(m_entrypointLabel, 2, 1);
 
     analysisLayout->addWidget(new QLabel(QStringLiteral("Files:"), analysisGroup), 3, 0);
     m_fileCountLabel = new QLabel(QStringLiteral("0 files (0 B)"), analysisGroup);
+    m_fileCountLabel->setWordWrap(true);
     analysisLayout->addWidget(m_fileCountLabel, 3, 1);
 
     layout->addWidget(analysisGroup);
@@ -857,6 +961,7 @@ void SourceIntakePage::setupUi()
     // Status message
     m_statusLabel =
         new QLabel(QStringLiteral("Select a project directory or shader file to continue."), this);
+    m_statusLabel->setWordWrap(true);
     m_statusLabel->setStyleSheet(QStringLiteral("color: #94a3b8;"));
     layout->addWidget(m_statusLabel);
 
@@ -948,6 +1053,12 @@ void SourceIntakePage::setSourcePath(const QString &path)
     }
 }
 
+void SourceIntakePage::setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx)
+{
+    m_sharedCtx = std::move(sharedCtx);
+    m_ctx = m_sharedCtx.get();
+}
+
 void SourceIntakePage::initializePage()
 {
     if (m_ctx && !m_ctx->sourcePath.isEmpty()) {
@@ -959,6 +1070,34 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
 {
     if (!m_ctx)
         return;
+
+    const bool sourceChanged = (!m_lastSourcePath.isEmpty() && path != m_lastSourcePath);
+    if (sourceChanged) {
+        // Clear stale staging and downstream package metadata when switching intake sources.
+        if (!m_ctx->stagingDir.isEmpty() && m_ctx->stagingDir.startsWith(QDir::tempPath())) {
+            QDir(m_ctx->stagingDir).removeRecursively();
+        }
+        m_ctx->stagingDir.clear();
+        m_ctx->scannedAssets.clear();
+        m_ctx->entrypointAudio.clear();
+        m_ctx->entrypointPreview = QStringLiteral("preview.webp");
+        m_ctx->packageId.clear();
+        m_ctx->slug.clear();
+        m_ctx->name.clear();
+        m_ctx->description.clear();
+        m_ctx->tags.clear();
+        m_ctx->previewImage = QImage();
+        m_ctx->previewWebpPath.clear();
+        m_ctx->previewCardJpgPath.clear();
+        m_ctx->outPkgPath.clear();
+        m_ctx->cid.clear();
+        m_ctx->registryIndexJson.clear();
+        m_ctx->isCompiled = false;
+        m_ctx->isVerified = false;
+        m_ctx->isTrusted = false;
+        m_ctx->installedToLocalHub = false;
+    }
+    m_lastSourcePath = path;
 
     m_ctx->sourcePath = path;
     m_ctx->entrypointPipeline.clear();
@@ -1009,6 +1148,29 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
                 }
                 if (proj.preview[0] != '\0') {
                     m_ctx->entrypointPreview = QString::fromUtf8(proj.preview);
+                }
+            }
+            QFile pjFile(dir.filePath(QStringLiteral("project.json")));
+            if (pjFile.open(QIODevice::ReadOnly)) {
+                const QJsonDocument pjDoc = QJsonDocument::fromJson(pjFile.read(1024 * 1024));
+                if (pjDoc.isObject()) {
+                    const QJsonObject pjObj = pjDoc.object();
+                    if (m_ctx->detectedTitle.isEmpty()) {
+                        m_ctx->detectedTitle =
+                            pjObj.value(QStringLiteral("title")).toString().trimmed();
+                    }
+                    if (m_ctx->detectedAuthor.isEmpty()) {
+                        m_ctx->detectedAuthor =
+                            pjObj.value(QStringLiteral("author")).toString().trimmed();
+                    }
+                    if (m_ctx->detectedDescription.isEmpty()) {
+                        m_ctx->detectedDescription =
+                            pjObj.value(QStringLiteral("description")).toString().trimmed();
+                    }
+                    if (m_ctx->detectedLicense.isEmpty()) {
+                        m_ctx->detectedLicense =
+                            pjObj.value(QStringLiteral("license")).toString().trimmed();
+                    }
                 }
             }
         }
@@ -1181,8 +1343,10 @@ void SourceIntakePage::analyzeSourcePath(const QString &path)
     m_detectedAuthorLabel->setText(m_ctx->detectedAuthor.isEmpty() ? QStringLiteral("Unknown")
                                                                    : m_ctx->detectedAuthor);
     m_entrypointLabel->setText(m_ctx->entrypointPipeline);
-    m_fileCountLabel->setText(
-        QStringLiteral("%1 files (%2)").arg(fileCount).arg(formatBytes(totalBytes)));
+    m_fileCountLabel->setText(QStringLiteral("%1 files (%2)")
+                                  .arg(fileCount)
+                                  .arg(browser_shared::formatBytes(
+                                      static_cast<uint64_t>(std::max<qint64>(0, totalBytes)))));
 
     m_statusLabel->setText(QStringLiteral("Source ready: %1 file(s) found.").arg(fileCount));
     m_statusLabel->setStyleSheet(QStringLiteral("color: #10b981; font-weight: bold;"));
@@ -1201,6 +1365,7 @@ bool SourceIntakePage::validatePage()
         return false;
     }
     m_ctx->projectType = static_cast<wwpkg_type_t>(m_typeCombo->currentData().toInt());
+    m_ctx->projectTypeStr = canonicalProjectTypeStr(m_ctx->projectType);
     return true;
 }
 
@@ -1216,12 +1381,19 @@ AssetBundlingPage::AssetBundlingPage(CreatorPackagingContext *ctx, QWidget *pare
     setupUi();
 }
 
+void AssetBundlingPage::setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx)
+{
+    m_sharedCtx = std::move(sharedCtx);
+    m_ctx = m_sharedCtx.get();
+}
+
 void AssetBundlingPage::setupUi()
 {
     auto *layout = new QVBoxLayout(this);
     layout->setSpacing(10);
 
     m_summaryLabel = new QLabel(QStringLiteral("Scanning assets..."), this);
+    m_summaryLabel->setWordWrap(true);
     m_summaryLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
     layout->addWidget(m_summaryLabel);
 
@@ -1254,6 +1426,7 @@ void AssetBundlingPage::setupUi()
 
     auto *btnLayout = new QHBoxLayout();
     m_rescanBtn = new QPushButton(QStringLiteral("Rescan Assets"), this);
+    browser_shared::sizeButtonFromFontMetrics(m_rescanBtn, 16, 28);
     btnLayout->addWidget(m_rescanBtn);
     btnLayout->addStretch();
     layout->addLayout(btnLayout);
@@ -1347,7 +1520,8 @@ void AssetBundlingPage::scanAssets()
             auto *item = new QTreeWidgetItem(m_assetTree);
             item->setText(0, entry.relativePath);
             item->setText(1, entry.category);
-            item->setText(2, formatBytes(entry.sizeBytes));
+            item->setText(2, browser_shared::formatBytes(
+                                 static_cast<uint64_t>(std::max<qint64>(0, entry.sizeBytes))));
 
             if (!entry.isReferenced) {
                 item->setText(3, QStringLiteral("Exclude"));
@@ -1385,15 +1559,17 @@ void AssetBundlingPage::scanAssets()
         auto *item = new QTreeWidgetItem(m_assetTree);
         item->setText(0, entry.relativePath);
         item->setText(1, entry.category);
-        item->setText(2, formatBytes(entry.sizeBytes));
+        item->setText(2, browser_shared::formatBytes(
+                             static_cast<uint64_t>(std::max<qint64>(0, entry.sizeBytes))));
         item->setText(3, QStringLiteral("Stage as %1").arg(m_ctx->entrypointPipeline));
         item->setForeground(3, QBrush(QColor(QStringLiteral("#34d399"))));
     }
 
-    m_summaryLabel->setText(QStringLiteral("Found %1 file(s) (%2). %3 marked for exclusion.")
-                                .arg(m_ctx->scannedAssets.size())
-                                .arg(formatBytes(totalSize))
-                                .arg(deadCount));
+    m_summaryLabel->setText(
+        QStringLiteral("Found %1 file(s) (%2). %3 marked for exclusion.")
+            .arg(m_ctx->scannedAssets.size())
+            .arg(browser_shared::formatBytes(static_cast<uint64_t>(std::max<qint64>(0, totalSize))))
+            .arg(deadCount));
 }
 
 bool AssetBundlingPage::validatePage()
@@ -1439,8 +1615,14 @@ bool AssetBundlingPage::validatePage()
             QString dstFile = staging.filePath(asset.relativePath);
 
             QFileInfo(dstFile).dir().mkpath(QStringLiteral("."));
-            QFile::remove(dstFile);
-            QFile::copy(srcFile, dstFile);
+            if (!copyFileSafely(srcFile, dstFile)) {
+                m_summaryLabel->setText(
+                    QStringLiteral("Failed to copy asset '%1' into staging directory.")
+                        .arg(asset.relativePath));
+                m_summaryLabel->setStyleSheet(
+                    QStringLiteral("color: #ef4444; font-size: 11px; font-weight: bold;"));
+                return false;
+            }
 
             // Only transcode standalone preview thumbnails whose manifest/project.json reference
             // is updated in lockstep; keep referenced scene/shader/graph texture extensions intact.
@@ -1473,16 +1655,30 @@ bool AssetBundlingPage::validatePage()
         if (!updatedPreviewRel.isEmpty()) {
             const QString projJsonPath = staging.filePath(QStringLiteral("project.json"));
             QFile pf(projJsonPath);
-            if (pf.exists() && pf.open(QIODevice::ReadOnly)) {
+            if (pf.exists()) {
+                if (!pf.open(QIODevice::ReadOnly)) {
+                    m_summaryLabel->setText(
+                        QStringLiteral("Failed to read staged project.json for preview update."));
+                    m_summaryLabel->setStyleSheet(
+                        QStringLiteral("color: #ef4444; font-size: 11px; font-weight: bold;"));
+                    return false;
+                }
                 QJsonDocument doc = QJsonDocument::fromJson(pf.readAll());
                 pf.close();
                 if (doc.isObject()) {
                     QJsonObject obj = doc.object();
                     obj.insert(QStringLiteral("preview"), updatedPreviewRel);
-                    if (pf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                        pf.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
-                        pf.close();
+                    const QByteArray updatedBytes =
+                        QJsonDocument(obj).toJson(QJsonDocument::Indented);
+                    if (!pf.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+                        pf.write(updatedBytes) != updatedBytes.size() || !pf.flush()) {
+                        m_summaryLabel->setText(
+                            QStringLiteral("Failed to write updated staged project.json."));
+                        m_summaryLabel->setStyleSheet(
+                            QStringLiteral("color: #ef4444; font-size: 11px; font-weight: bold;"));
+                        return false;
                     }
+                    pf.close();
                 }
             }
         }
@@ -1500,11 +1696,16 @@ bool AssetBundlingPage::validatePage()
                 const QString compiledDst = staging.filePath(compiledRel);
                 QFileInfo(compiledDst).dir().mkpath(QStringLiteral("."));
                 QFile outFrag(compiledDst);
-                if (outFrag.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                    outFrag.write(glslBytes);
-                    outFrag.close();
-                    m_ctx->entrypointPipeline = compiledRel;
+                if (!outFrag.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+                    outFrag.write(glslBytes) != glslBytes.size() || !outFrag.flush()) {
+                    m_summaryLabel->setText(
+                        QStringLiteral("Failed to write compiled graph shader into staging."));
+                    m_summaryLabel->setStyleSheet(
+                        QStringLiteral("color: #ef4444; font-size: 11px; font-weight: bold;"));
+                    return false;
                 }
+                outFrag.close();
+                m_ctx->entrypointPipeline = compiledRel;
             }
         }
     } else {
@@ -1543,8 +1744,11 @@ bool AssetBundlingPage::validatePage()
             const QString texRel = QStringLiteral("materials/") + srcInfo.fileName();
             const QString texDst = staging.filePath(texRel);
             QFileInfo(texDst).dir().mkpath(QStringLiteral("."));
-            QFile::remove(texDst);
-            if (!QFile::copy(m_ctx->sourcePath, texDst)) {
+            if (!copyFileSafely(m_ctx->sourcePath, texDst)) {
+                m_summaryLabel->setText(
+                    QStringLiteral("Failed to copy texture file into staging directory."));
+                m_summaryLabel->setStyleSheet(
+                    QStringLiteral("color: #ef4444; font-size: 11px; font-weight: bold;"));
                 return false;
             }
             m_ctx->entrypointPipeline = QStringLiteral("scene.json");
@@ -1556,8 +1760,13 @@ bool AssetBundlingPage::validatePage()
         if (ext == QStringLiteral("wwgraph")) {
             const QString graphDst = staging.filePath(QStringLiteral("shaders/graph.wwgraph"));
             QFileInfo(graphDst).dir().mkpath(QStringLiteral("."));
-            QFile::remove(graphDst);
-            QFile::copy(m_ctx->sourcePath, graphDst);
+            if (!copyFileSafely(m_ctx->sourcePath, graphDst)) {
+                m_summaryLabel->setText(
+                    QStringLiteral("Failed to copy shader graph into staging directory."));
+                m_summaryLabel->setStyleSheet(
+                    QStringLiteral("color: #ef4444; font-size: 11px; font-weight: bold;"));
+                return false;
+            }
 
             QByteArray glslBytes;
             QString graphTitle;
@@ -1569,13 +1778,16 @@ bool AssetBundlingPage::validatePage()
                 const QString compiledRel = QStringLiteral("shaders/main.frag");
                 const QString compiledDst = staging.filePath(compiledRel);
                 QFile outFrag(compiledDst);
-                if (outFrag.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                    outFrag.write(glslBytes);
-                    outFrag.close();
-                    m_ctx->entrypointPipeline = compiledRel;
-                } else {
-                    m_ctx->entrypointPipeline = QStringLiteral("shaders/graph.wwgraph");
+                if (!outFrag.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+                    outFrag.write(glslBytes) != glslBytes.size() || !outFrag.flush()) {
+                    m_summaryLabel->setText(
+                        QStringLiteral("Failed to write compiled graph shader into staging."));
+                    m_summaryLabel->setStyleSheet(
+                        QStringLiteral("color: #ef4444; font-size: 11px; font-weight: bold;"));
+                    return false;
                 }
+                outFrag.close();
+                m_ctx->entrypointPipeline = compiledRel;
             } else {
                 m_ctx->entrypointPipeline = QStringLiteral("shaders/graph.wwgraph");
             }
@@ -1600,8 +1812,14 @@ bool AssetBundlingPage::validatePage()
 
         const QString dst = staging.filePath(relDst);
         QFileInfo(dst).dir().mkpath(QStringLiteral("."));
-        QFile::remove(dst);
-        QFile::copy(m_ctx->sourcePath, dst);
+        if (!copyFileSafely(m_ctx->sourcePath, dst)) {
+            m_summaryLabel->setText(
+                QStringLiteral("Failed to copy entrypoint file '%1' into staging directory.")
+                    .arg(relDst));
+            m_summaryLabel->setStyleSheet(
+                QStringLiteral("color: #ef4444; font-size: 11px; font-weight: bold;"));
+            return false;
+        }
     }
 
     return true;
@@ -1617,6 +1835,12 @@ MetadataPreviewPage::MetadataPreviewPage(CreatorPackagingContext *ctx, QWidget *
     setTitle(QStringLiteral("Step 3: Details & Preview"));
     setSubTitle(QStringLiteral("Set the package name, version, license, and preview image."));
     setupUi();
+}
+
+void MetadataPreviewPage::setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx)
+{
+    m_sharedCtx = std::move(sharedCtx);
+    m_ctx = m_sharedCtx.get();
 }
 
 void MetadataPreviewPage::setupUi()
@@ -1730,14 +1954,17 @@ void MetadataPreviewPage::setupUi()
     previewLayout->addWidget(m_previewDisplay, 0, Qt::AlignCenter);
 
     m_previewInfoLabel = new QLabel(QStringLiteral("512x288 WebP & 1280x720 JPEG"), previewGroup);
+    m_previewInfoLabel->setWordWrap(true);
     m_previewInfoLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
     m_previewInfoLabel->setAlignment(Qt::AlignCenter);
     previewLayout->addWidget(m_previewInfoLabel);
 
     m_captureBtn = new QPushButton(QStringLiteral("Generate Preview"), previewGroup);
+    browser_shared::sizeButtonFromFontMetrics(m_captureBtn, 16, 28);
     previewLayout->addWidget(m_captureBtn);
 
     m_browsePreviewBtn = new QPushButton(QStringLiteral("Load Custom Image..."), previewGroup);
+    browser_shared::sizeButtonFromFontMetrics(m_browsePreviewBtn, 16, 28);
     previewLayout->addWidget(m_browsePreviewBtn);
 
     previewLayout->addStretch();
@@ -1760,6 +1987,18 @@ void MetadataPreviewPage::initializePage()
     if (!m_ctx)
         return;
 
+    const bool sourceChanged =
+        (!m_initializedForSource.isEmpty() && m_ctx->sourcePath != m_initializedForSource);
+    const bool firstInitForSource = (m_ctx->sourcePath != m_initializedForSource);
+    m_initializedForSource = m_ctx->sourcePath;
+
+    if (sourceChanged) {
+        m_nameEdit->clear();
+        m_slugEdit->clear();
+        m_descriptionEdit->clear();
+        m_tagsEdit->clear();
+    }
+
     if (m_ctx->packageId.isEmpty()) {
         m_ctx->packageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     }
@@ -1778,7 +2017,7 @@ void MetadataPreviewPage::initializePage()
         m_versionEdit->setText(QStringLiteral("1.0.0"));
     }
 
-    if (m_authorNameEdit->text().isEmpty()) {
+    if (m_authorNameEdit->text().isEmpty() || sourceChanged) {
         QString author = m_ctx->detectedAuthor;
         if (author.isEmpty()) {
             author = qEnvironmentVariable("USER");
@@ -1795,9 +2034,21 @@ void MetadataPreviewPage::initializePage()
         m_authorEmailEdit->setText(email);
     }
 
+    if (firstInitForSource) {
+        const QString lic =
+            !m_ctx->detectedLicense.isEmpty() ? m_ctx->detectedLicense : QStringLiteral("MIT");
+        if (m_licenseCombo->findText(lic) < 0) {
+            m_licenseCombo->addItem(lic);
+        }
+        m_licenseCombo->setCurrentText(lic);
+    }
+
     if (!m_ctx->detectedDescription.isEmpty() && m_descriptionEdit->toPlainText().isEmpty()) {
         m_descriptionEdit->setText(m_ctx->detectedDescription);
     }
+
+    m_previewInfoLabel->setText(QStringLiteral("512x288 WebP & 1280x720 JPEG"));
+    m_previewInfoLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
 
     // Check if preview already exists in staging
     bool loadedExisting = false;
@@ -1838,7 +2089,7 @@ void MetadataPreviewPage::validateFields()
         m_slugValidationLabel->setStyleSheet(QStringLiteral("color: #10b981; font-weight: bold;"));
     } else {
         m_slugValidationLabel->setText(QStringLiteral("Use lowercase and hyphens"));
-        m_slugValidationLabel->setStyleSheet(QStringLiteral("color: #ef4444; font-size: 10px;"));
+        m_slugValidationLabel->setStyleSheet(QStringLiteral("color: #ef4444; font-size: 11px;"));
     }
 
     const QString version = m_versionEdit->text().trimmed();
@@ -1849,7 +2100,7 @@ void MetadataPreviewPage::validateFields()
             QStringLiteral("color: #10b981; font-weight: bold;"));
     } else {
         m_versionValidationLabel->setText(QStringLiteral("Use X.Y.Z"));
-        m_versionValidationLabel->setStyleSheet(QStringLiteral("color: #ef4444; font-size: 10px;"));
+        m_versionValidationLabel->setStyleSheet(QStringLiteral("color: #ef4444; font-size: 11px;"));
     }
 
     emit completeChanged();
@@ -1927,11 +2178,14 @@ void MetadataPreviewPage::captureOffscreenPreview()
     painter.setBrush(QColor(0x0f, 0x76, 0x6e, 0xa0));
     painter.setPen(QPen(QColor(0x14, 0xb8, 0xa6), 1));
     painter.drawRoundedRect(QRect(186, 240, 140, 22), 11, 11);
-    QFont badgeFont(QStringLiteral("Monospace"), 8, QFont::Bold);
+    QFont badgeFont(QStringLiteral("Monospace"));
+    badgeFont.setPixelSize(11);
+    badgeFont.setBold(true);
     painter.setFont(badgeFont);
     painter.setPen(QColor(0x5e, 0xeb, 0xd3));
+    const uint32_t fpsBadge = (m_ctx && m_ctx->targetFps > 0) ? m_ctx->targetFps : 60u;
     painter.drawText(QRect(186, 240, 140, 22), Qt::AlignCenter,
-                     QStringLiteral("GLES 3.1 | 60 FPS"));
+                     QStringLiteral("GLES 3.1 | %1 FPS").arg(fpsBadge));
 
     painter.end();
 
@@ -1976,9 +2230,17 @@ bool MetadataPreviewPage::validatePage()
     if (!isComplete())
         return false;
 
-    m_ctx->slug = m_slugEdit->text().trimmed();
+    const QString newSlug = m_slugEdit->text().trimmed();
+    const QString newVersion = m_versionEdit->text().trimmed();
+    if (m_ctx->slug != newSlug || m_ctx->version != newVersion) {
+        m_ctx->isCompiled = false;
+        m_ctx->isVerified = false;
+        m_ctx->installedToLocalHub = false;
+    }
+
+    m_ctx->slug = newSlug;
     m_ctx->name = m_nameEdit->text().trimmed();
-    m_ctx->version = m_versionEdit->text().trimmed();
+    m_ctx->version = newVersion;
     m_ctx->authorName = m_authorNameEdit->text().trimmed();
     m_ctx->authorEmail = m_authorEmailEdit->text().trimmed();
     m_ctx->license = m_licenseCombo->currentText().trimmed();
@@ -2003,17 +2265,26 @@ bool MetadataPreviewPage::validatePage()
 
         QImage p512 =
             m_ctx->previewImage.scaled(512, 288, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-        if (p512.save(m_ctx->previewWebpPath, "WEBP", 90)) {
-            for (const QString &stale :
-                 {QStringLiteral("preview.png"), QStringLiteral("preview.jpg"),
-                  QStringLiteral("preview.jpeg"), QStringLiteral("preview.bmp")}) {
-                QFile::remove(stg.filePath(stale));
-            }
+        if (!p512.save(m_ctx->previewWebpPath, "WEBP", 90)) {
+            m_previewInfoLabel->setText(
+                QStringLiteral("Failed to write preview.webp into staging."));
+            m_previewInfoLabel->setStyleSheet(QStringLiteral("color: #ef4444; font-size: 11px;"));
+            return false;
+        }
+        for (const QString &stale :
+             {QStringLiteral("preview.png"), QStringLiteral("preview.jpg"),
+              QStringLiteral("preview.jpeg"), QStringLiteral("preview.bmp")}) {
+            QFile::remove(stg.filePath(stale));
         }
 
         QImage p1280 =
             m_ctx->previewImage.scaled(1280, 720, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-        p1280.save(m_ctx->previewCardJpgPath, "JPEG", 90);
+        if (!p1280.save(m_ctx->previewCardJpgPath, "JPEG", 90)) {
+            m_previewInfoLabel->setText(
+                QStringLiteral("Failed to write preview_card.jpg into staging."));
+            m_previewInfoLabel->setStyleSheet(QStringLiteral("color: #ef4444; font-size: 11px;"));
+            return false;
+        }
     }
 
     return true;
@@ -2029,6 +2300,25 @@ CapabilityAuditPage::CapabilityAuditPage(CreatorPackagingContext *ctx, QWidget *
     setTitle(QStringLiteral("Step 4: Compatibility Check"));
     setSubTitle(QStringLiteral("Review shader compatibility and required permissions."));
     setupUi();
+}
+
+CapabilityAuditPage::~CapabilityAuditPage() { stopAndJoinWorkers(); }
+
+void CapabilityAuditPage::setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx)
+{
+    m_sharedCtx = std::move(sharedCtx);
+    m_ctx = m_sharedCtx.get();
+}
+
+void CapabilityAuditPage::stopAndJoinWorkers()
+{
+    if (m_repairCancel) {
+        m_repairCancel->store(true, std::memory_order_release);
+    }
+    if (m_repairThread.joinable()) {
+        m_repairThread.join();
+    }
+    m_repairing.store(false, std::memory_order_release);
 }
 
 void CapabilityAuditPage::setupUi()
@@ -2047,7 +2337,7 @@ void CapabilityAuditPage::setupUi()
         QStringLiteral("background-color: #10b981; color: white; font-weight: bold; "
                        "padding: 6px 12px; border-radius: 4px; font-size: 13px;"));
     m_tierBadge->setAlignment(Qt::AlignCenter);
-    m_tierBadge->setFixedWidth(180);
+    m_tierBadge->setMinimumWidth(140);
     badgeLayout->addWidget(m_tierBadge, 0, 0);
 
     m_scoreLabel = new QLabel(QStringLiteral("Compatibility Score: 100/100"), badgeBox);
@@ -2060,8 +2350,9 @@ void CapabilityAuditPage::setupUi()
     m_scoreBar->setFixedHeight(16);
     badgeLayout->addWidget(m_scoreBar, 1, 0, 1, 2);
 
-    m_metricsLabel = new QLabel(
-        QStringLiteral("Estimated VRAM: 64.0 MB | Target FPS: 60 | Passes: 6"), badgeBox);
+    m_metricsLabel =
+        new QLabel(QStringLiteral("Estimated VRAM: -- | Target FPS: -- | Notes: 0"), badgeBox);
+    m_metricsLabel->setWordWrap(true);
     m_metricsLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
     badgeLayout->addWidget(m_metricsLabel, 2, 0, 1, 2);
 
@@ -2126,10 +2417,12 @@ void CapabilityAuditPage::setupUi()
     auto *repairRow = new QHBoxLayout();
     repairRow->setSpacing(8);
     m_repairsSummaryLabel = new QLabel(QStringLiteral("No issues detected."), issuesGroup);
+    m_repairsSummaryLabel->setWordWrap(true);
     m_repairsSummaryLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
     repairRow->addWidget(m_repairsSummaryLabel, 1);
 
     m_applyRepairsBtn = new QPushButton(QStringLiteral("Apply Suggested Fixes"), issuesGroup);
+    browser_shared::sizeButtonFromFontMetrics(m_applyRepairsBtn, 16, 28);
     m_applyRepairsBtn->setEnabled(false);
     repairRow->addWidget(m_applyRepairsBtn);
 
@@ -2381,6 +2674,12 @@ void CapabilityAuditPage::runCompatibilityAudit()
         item->setText(3, iss.suggestedFix.isEmpty() ? QStringLiteral("None") : iss.suggestedFix);
     }
 
+    m_capComputeCheck->setChecked(false);
+    m_capAudioSpectrumCheck->setChecked(false);
+    m_capAudioPlaybackCheck->setChecked(false);
+    m_capScriptingCheck->setChecked(false);
+    m_capForeignToplevelCheck->setChecked(false);
+
     if (m_ctx->projectType == WWPKG_TYPE_SHADER_COMPUTE) {
         m_capComputeCheck->setChecked(true);
     }
@@ -2408,29 +2707,67 @@ void CapabilityAuditPage::runCompatibilityAudit()
 
 void CapabilityAuditPage::applyAutoRepairs()
 {
-    if (!m_ctx || m_ctx->stagingDir.isEmpty() || !isScenePackageType(m_ctx->projectType))
+    if (!m_ctx || m_ctx->stagingDir.isEmpty() || !isScenePackageType(m_ctx->projectType) ||
+        m_repairing.load(std::memory_order_acquire)) {
         return;
-
-    we_compat_report_t *report = we_compat_report_alloc();
-    if (!report)
-        return;
-
-    we_compat_scanner_t *scanner = we_compat_scanner_create(true, true);
-    if (scanner) {
-        if (we_compat_scan_directory(scanner, m_ctx->stagingDir.toUtf8().constData(), report)) {
-            we_compat_apply_auto_repairs(report, m_ctx->stagingDir.toUtf8().constData(),
-                                         m_ctx->stagingDir.toUtf8().constData());
-        }
-        we_compat_scanner_destroy(scanner);
     }
-    we_compat_report_free(report);
 
-    runCompatibilityAudit();
+    stopAndJoinWorkers();
+    m_repairCancel = std::make_shared<std::atomic<bool>>(false);
+    m_repairing.store(true, std::memory_order_release);
+    m_applyRepairsBtn->setEnabled(false);
+    m_applyRepairsBtn->setText(QStringLiteral("Applying Fixes..."));
+    m_repairsSummaryLabel->setText(QStringLiteral("Applying automatic shader fixes..."));
+    emit completeChanged();
+
+    const QByteArray stagingUtf8 = m_ctx->stagingDir.toUtf8();
+    std::shared_ptr<CreatorPackagingContext> sharedCtx = m_sharedCtx;
+    std::shared_ptr<std::atomic<bool>> cancelFlag = m_repairCancel;
+    QPointer<CapabilityAuditPage> safeSelf(this);
+
+    m_repairThread = std::thread([safeSelf, sharedCtx, cancelFlag, stagingUtf8]() {
+        bool repairedOk = false;
+        if (!cancelFlag->load(std::memory_order_acquire)) {
+            we_compat_report_t *report = we_compat_report_alloc();
+            if (report) {
+                we_compat_scanner_t *scanner = we_compat_scanner_create(true, true);
+                if (scanner) {
+                    if (!cancelFlag->load(std::memory_order_acquire) &&
+                        we_compat_scan_directory(scanner, stagingUtf8.constData(), report)) {
+                        repairedOk = we_compat_apply_auto_repairs(report, stagingUtf8.constData(),
+                                                                  stagingUtf8.constData());
+                    }
+                    we_compat_scanner_destroy(scanner);
+                }
+                we_compat_report_free(report);
+            }
+        }
+
+        if (cancelFlag->load(std::memory_order_acquire) || !qApp) {
+            return;
+        }
+        QMetaObject::invokeMethod(
+            qApp,
+            [safeSelf, sharedCtx, repairedOk]() {
+                if (!safeSelf) {
+                    return;
+                }
+                safeSelf->m_repairing.store(false, std::memory_order_release);
+                safeSelf->m_applyRepairsBtn->setText(QStringLiteral("Apply Suggested Fixes"));
+                safeSelf->runCompatibilityAudit();
+                if (!repairedOk) {
+                    safeSelf->m_repairsSummaryLabel->setText(
+                        QStringLiteral("Auto-repair could not modify staging shaders."));
+                }
+            },
+            Qt::QueuedConnection);
+    });
 }
 
 bool CapabilityAuditPage::isComplete() const
 {
-    return m_ctx && m_ctx->compatTier != WE_TIER_4_BLOCKED;
+    return m_ctx && !m_repairing.load(std::memory_order_acquire) &&
+           m_ctx->compatTier != WE_TIER_4_BLOCKED;
 }
 
 bool CapabilityAuditPage::validatePage()
@@ -2465,6 +2802,24 @@ CompilationSigningPage::CompilationSigningPage(CreatorPackagingContext *ctx, QWi
     setupUi();
 }
 
+void CompilationSigningPage::setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx)
+{
+    m_sharedCtx = std::move(sharedCtx);
+    m_ctx = m_sharedCtx.get();
+}
+
+void CompilationSigningPage::stopAndJoinWorkers()
+{
+    if (m_buildCancel) {
+        m_buildCancel->store(true, std::memory_order_release);
+    }
+    if (m_buildThread.joinable()) {
+        m_buildThread.request_stop();
+        m_buildThread.join();
+    }
+    m_building.store(false, std::memory_order_release);
+}
+
 void CompilationSigningPage::setupUi()
 {
     auto *layout = new QVBoxLayout(this);
@@ -2481,16 +2836,18 @@ void CompilationSigningPage::setupUi()
     keyRow->addWidget(m_keyPathEdit, 1);
 
     m_browseKeyBtn = new QPushButton(QStringLiteral("Browse Key..."), keyGroup);
+    browser_shared::sizeButtonFromFontMetrics(m_browseKeyBtn, 16, 28);
     keyRow->addWidget(m_browseKeyBtn);
 
     m_generateKeyBtn = new QPushButton(QStringLiteral("Generate Keypair"), keyGroup);
-    m_generateKeyBtn->setStyleSheet(
-        QStringLiteral("background-color: #0284c7; color: white; font-weight: bold;"));
+    m_generateKeyBtn->setStyleSheet(browser_shared::kStyleButtonPrimary);
+    browser_shared::sizeButtonFromFontMetrics(m_generateKeyBtn, 16, 28);
     keyRow->addWidget(m_generateKeyBtn);
 
     keyLayout->addLayout(keyRow);
 
     m_keyFingerprintLabel = new QLabel(QStringLiteral("Public Key: None loaded"), keyGroup);
+    m_keyFingerprintLabel->setWordWrap(true);
     m_keyFingerprintLabel->setStyleSheet(
         QStringLiteral("font-family: monospace; color: #38bdf8; font-size: 11px;"));
     keyLayout->addWidget(m_keyFingerprintLabel);
@@ -2511,19 +2868,19 @@ void CompilationSigningPage::setupUi()
     outRow->addWidget(m_outPkgPathEdit, 1);
 
     m_browseOutBtn = new QPushButton(QStringLiteral("Browse..."), buildGroup);
+    browser_shared::sizeButtonFromFontMetrics(m_browseOutBtn, 16, 28);
     outRow->addWidget(m_browseOutBtn);
     buildLayout->addLayout(outRow);
 
     auto *actRow = new QHBoxLayout();
     actRow->setSpacing(12);
     m_compileBtn = new QPushButton(QStringLiteral("Build & Sign Package"), buildGroup);
-    m_compileBtn->setFixedHeight(32);
-    m_compileBtn->setStyleSheet(
-        QStringLiteral("background-color: #059669; color: white; font-weight: bold; font-size: "
-                       "12px; padding: 6px 16px;"));
+    m_compileBtn->setStyleSheet(browser_shared::kStyleButtonEmerald);
+    browser_shared::sizeButtonFromFontMetrics(m_compileBtn, 18, 32);
     actRow->addWidget(m_compileBtn);
 
     m_verificationBadge = new QLabel(QStringLiteral("Status: Not Built"), buildGroup);
+    m_verificationBadge->setWordWrap(true);
     m_verificationBadge->setStyleSheet(QStringLiteral("color: #94a3b8; font-weight: bold;"));
     actRow->addWidget(m_verificationBadge);
     actRow->addStretch();
@@ -2548,6 +2905,8 @@ void CompilationSigningPage::setupUi()
     layout->addWidget(logGroup, 1);
 
     // Wiring
+    connect(m_keyPathEdit, &QLineEdit::editingFinished, this,
+            &CompilationSigningPage::checkOrLoadKey);
     connect(m_generateKeyBtn, &QPushButton::clicked, this,
             &CompilationSigningPage::generateKeypair);
     connect(m_browseKeyBtn, &QPushButton::clicked, this, &CompilationSigningPage::browseKeyFile);
@@ -2568,16 +2927,25 @@ void CompilationSigningPage::initializePage()
     if (!m_ctx)
         return;
 
-    if (m_keyPathEdit->text().isEmpty()) {
-        m_keyPathEdit->setText(QDir::homePath() +
-                               QStringLiteral("/.config/waywal/keys/author_ed25519.key"));
+    if (m_keyPathEdit->text().trimmed().isEmpty()) {
+        const QString keysDir = browser_shared::resolveWaywalConfigDirQt(QStringLiteral("keys"));
+        m_keyPathEdit->setText(keysDir + QStringLiteral("/author_ed25519.key"));
     }
 
-    if (m_outPkgPathEdit->text().isEmpty()) {
-        QString outDir = QDir::homePath() + QStringLiteral("/waywal_packages");
-        QDir().mkpath(outDir);
-        m_outPkgPathEdit->setText(
-            outDir + QStringLiteral("/%1-%2.wwpkg").arg(m_ctx->slug).arg(m_ctx->version));
+    const QString outDir = QDir::homePath() + QStringLiteral("/waywal_packages");
+    QDir().mkpath(outDir);
+    const QString autoPath =
+        outDir + QStringLiteral("/%1-%2.wwpkg").arg(m_ctx->slug).arg(m_ctx->version);
+    const QString currentPath = m_outPkgPathEdit->text().trimmed();
+    if (currentPath.isEmpty() || currentPath == m_lastAutoOutPkgPath) {
+        m_outPkgPathEdit->setText(autoPath);
+    }
+    m_lastAutoOutPkgPath = autoPath;
+
+    if (!m_ctx->isCompiled) {
+        m_verificationBadge->setText(QStringLiteral("Status: Not Built"));
+        m_verificationBadge->setStyleSheet(QStringLiteral("color: #94a3b8; font-weight: bold;"));
+        m_progressBar->setValue(0);
     }
 
     checkOrLoadKey();
@@ -2585,6 +2953,9 @@ void CompilationSigningPage::initializePage()
 
 void CompilationSigningPage::checkOrLoadKey()
 {
+    if (!m_ctx)
+        return;
+
     QString keyPath = m_keyPathEdit->text().trimmed();
     QFile keyFile(keyPath);
 
@@ -2597,8 +2968,28 @@ void CompilationSigningPage::checkOrLoadKey()
         return;
     }
 
-    QByteArray raw = keyFile.readAll();
+    constexpr qint64 kMaxKeyFileBytes = 4096;
+    if (keyFile.size() > kMaxKeyFileBytes) {
+        keyFile.close();
+        m_keyFingerprintLabel->setText(
+            QStringLiteral("Key file exceeds 4096-byte limit. Select a valid Ed25519 key file."));
+        m_keyFingerprintLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
+        wipeByteArray(m_ctx->authorPrivKey);
+        m_ctx->authorPubKey.clear();
+        return;
+    }
+
+    QByteArray raw = keyFile.read(kMaxKeyFileBytes + 1);
     keyFile.close();
+    if (raw.size() > kMaxKeyFileBytes) {
+        wipeByteArray(raw);
+        m_keyFingerprintLabel->setText(
+            QStringLiteral("Key file exceeds 4096-byte limit. Select a valid Ed25519 key file."));
+        m_keyFingerprintLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
+        wipeByteArray(m_ctx->authorPrivKey);
+        m_ctx->authorPubKey.clear();
+        return;
+    }
 
     QByteArray trimmed = raw.trimmed();
     uint8_t pk[32] = {0};
@@ -2696,7 +3087,8 @@ void CompilationSigningPage::generateKeypair()
 
     QString keyPath = m_keyPathEdit->text().trimmed();
     if (keyPath.isEmpty()) {
-        keyPath = QDir::homePath() + QStringLiteral("/.config/waywal/keys/author_ed25519.key");
+        keyPath = browser_shared::resolveWaywalConfigDirQt(QStringLiteral("keys")) +
+                  QStringLiteral("/author_ed25519.key");
         m_keyPathEdit->setText(keyPath);
     }
 
@@ -2754,12 +3146,7 @@ void CompilationSigningPage::browseKeyFile()
     }
 }
 
-CompilationSigningPage::~CompilationSigningPage()
-{
-    if (m_buildThread.joinable()) {
-        m_buildThread.join();
-    }
-}
+CompilationSigningPage::~CompilationSigningPage() { stopAndJoinWorkers(); }
 
 void CompilationSigningPage::setBuildUiBusy(bool busy)
 {
@@ -2827,41 +3214,40 @@ void CompilationSigningPage::compileAndSignPackage()
     m_logEdit->append(QStringLiteral("Staging Directory: %1").arg(m_ctx->stagingDir));
     m_logEdit->append(QStringLiteral("Output File: %1").arg(outPkg));
 
-    // Construct wwpkg_manifest_t
+    // Construct wwpkg_manifest_t using UTF-8 boundary-safe truncation.
     wwpkg_manifest_t manifest;
     memset(&manifest, 0, sizeof(manifest));
 
-    strncpy(manifest.schema_version, "wwpkg/v2", sizeof(manifest.schema_version) - 1);
-    strncpy(manifest.id, m_ctx->packageId.toUtf8().constData(), sizeof(manifest.id) - 1);
-    strncpy(manifest.slug, m_ctx->slug.toUtf8().constData(), sizeof(manifest.slug) - 1);
-    strncpy(manifest.name, m_ctx->name.toUtf8().constData(), sizeof(manifest.name) - 1);
-    strncpy(manifest.version, m_ctx->version.toUtf8().constData(), sizeof(manifest.version) - 1);
-    strncpy(manifest.author_name, m_ctx->authorName.toUtf8().constData(),
-            sizeof(manifest.author_name) - 1);
-    strncpy(manifest.author_email, m_ctx->authorEmail.toUtf8().constData(),
-            sizeof(manifest.author_email) - 1);
+    copyUtf8Bounded(manifest.schema_version, sizeof(manifest.schema_version),
+                    QStringLiteral("wwpkg/v2"));
+    copyUtf8Bounded(manifest.id, sizeof(manifest.id), m_ctx->packageId);
+    copyUtf8Bounded(manifest.slug, sizeof(manifest.slug), m_ctx->slug);
+    copyUtf8Bounded(manifest.name, sizeof(manifest.name), m_ctx->name);
+    copyUtf8Bounded(manifest.version, sizeof(manifest.version), m_ctx->version);
+    copyUtf8Bounded(manifest.author_name, sizeof(manifest.author_name), m_ctx->authorName);
+    copyUtf8Bounded(manifest.author_email, sizeof(manifest.author_email), m_ctx->authorEmail);
     memcpy(manifest.author_pubkey, m_ctx->authorPubKey.constData(), 32);
-    strncpy(manifest.license, m_ctx->license.toUtf8().constData(), sizeof(manifest.license) - 1);
-    strncpy(manifest.description, m_ctx->description.toUtf8().constData(),
-            sizeof(manifest.description) - 1);
+    copyUtf8Bounded(manifest.license, sizeof(manifest.license), m_ctx->license);
+    copyUtf8Bounded(manifest.description, sizeof(manifest.description), m_ctx->description);
 
     manifest.tag_count =
         static_cast<uint32_t>(qMin(m_ctx->tags.size(), static_cast<qsizetype>(WWPKG_MAX_TAGS)));
     for (uint32_t i = 0; i < manifest.tag_count; i++) {
-        strncpy(manifest.tags[i], m_ctx->tags[i].toUtf8().constData(),
-                sizeof(manifest.tags[i]) - 1);
+        copyUtf8Bounded(manifest.tags[i], sizeof(manifest.tags[i]), m_ctx->tags[i]);
     }
 
     manifest.type = m_ctx->projectType;
-    strncpy(manifest.entrypoint_pipeline, m_ctx->entrypointPipeline.toUtf8().constData(),
-            sizeof(manifest.entrypoint_pipeline) - 1);
-    strncpy(manifest.entrypoint_preview, "preview.webp", sizeof(manifest.entrypoint_preview) - 1);
-    strncpy(manifest.entrypoint_audio, m_ctx->entrypointAudio.toUtf8().constData(),
-            sizeof(manifest.entrypoint_audio) - 1);
+    copyUtf8Bounded(manifest.entrypoint_pipeline, sizeof(manifest.entrypoint_pipeline),
+                    m_ctx->entrypointPipeline);
+    copyUtf8Bounded(manifest.entrypoint_preview, sizeof(manifest.entrypoint_preview),
+                    QStringLiteral("preview.webp"));
+    copyUtf8Bounded(manifest.entrypoint_audio, sizeof(manifest.entrypoint_audio),
+                    m_ctx->entrypointAudio);
 
-    strncpy(manifest.min_wwal_version, "1.0.0", sizeof(manifest.min_wwal_version) - 1);
+    copyUtf8Bounded(manifest.min_wwal_version, sizeof(manifest.min_wwal_version),
+                    QStringLiteral("1.0.0"));
     manifest.abi_version = 1;
-    strncpy(manifest.gl_profile, "gles_31", sizeof(manifest.gl_profile) - 1);
+    copyUtf8Bounded(manifest.gl_profile, sizeof(manifest.gl_profile), QStringLiteral("gles_31"));
 
     manifest.capabilities.compute_shaders = m_ctx->capComputeShaders;
     manifest.capabilities.audio_spectrum = m_ctx->capAudioSpectrum;
@@ -2877,17 +3263,19 @@ void CompilationSigningPage::compileAndSignPackage()
     m_progressBar->setValue(35);
     m_logEdit->append(QStringLiteral("Writing manifest.json and compressing Zstd archive..."));
 
-    if (m_buildThread.joinable()) {
-        m_buildThread.join();
-    }
+    stopAndJoinWorkers();
+    m_buildCancel = std::make_shared<std::atomic<bool>>(false);
     setBuildUiBusy(true);
 
     const QByteArray stagingUtf8 = m_ctx->stagingDir.toUtf8();
     const QByteArray outPkgUtf8 = outPkg.toUtf8();
     QByteArray privKeyCopy = m_ctx->authorPrivKey;
+    std::shared_ptr<CreatorPackagingContext> sharedCtx = m_sharedCtx;
+    std::shared_ptr<std::atomic<bool>> cancelFlag = m_buildCancel;
     QPointer<CompilationSigningPage> safeSelf(this);
 
-    m_buildThread = std::jthread([safeSelf, manifest, stagingUtf8, outPkgUtf8, outPkg,
+    m_buildThread = std::jthread([safeSelf, sharedCtx, cancelFlag, manifest, stagingUtf8,
+                                  outPkgUtf8, outPkg,
                                   privKeyCopy = std::move(privKeyCopy)]() mutable {
         struct BuildOutcome {
             bool buildOk{false};
@@ -2906,7 +3294,7 @@ void CompilationSigningPage::compileAndSignPackage()
 
         if (!res.buildOk) {
             res.errCode = wwpkg_get_last_error(nullptr);
-        } else {
+        } else if (!cancelFlag->load(std::memory_order_acquire)) {
             wwpkg_package_t *pkg = wwpkg_open(outPkgUtf8.constData());
             if (pkg) {
                 res.openedPkg = true;
@@ -2921,12 +3309,12 @@ void CompilationSigningPage::compileAndSignPackage()
             }
         }
 
-        if (!qApp) {
+        if (cancelFlag->load(std::memory_order_acquire) || !qApp) {
             return;
         }
         QMetaObject::invokeMethod(
             qApp,
-            [safeSelf, outPkg, res = std::move(res)]() {
+            [safeSelf, sharedCtx, outPkg, res = std::move(res)]() {
                 if (!safeSelf || !safeSelf->m_ctx) {
                     return;
                 }
@@ -2982,7 +3370,8 @@ void CompilationSigningPage::compileAndSignPackage()
                     safeSelf->m_logEdit->append(
                         QStringLiteral("[OK] Package built and verified: %1 (%2)")
                             .arg(outPkg)
-                            .arg(formatBytes(safeSelf->m_ctx->compiledSizeBytes)));
+                            .arg(browser_shared::formatBytes(static_cast<uint64_t>(
+                                std::max<qint64>(0, safeSelf->m_ctx->compiledSizeBytes)))));
 
                     safeSelf->m_verificationBadge->setText(QStringLiteral("Signed & Verified"));
                     safeSelf->m_verificationBadge->setStyleSheet(
@@ -3022,6 +3411,12 @@ HubPublishingExportPage::HubPublishingExportPage(CreatorPackagingContext *ctx, Q
     setupUi();
 }
 
+void HubPublishingExportPage::setSharedContext(std::shared_ptr<CreatorPackagingContext> sharedCtx)
+{
+    m_sharedCtx = std::move(sharedCtx);
+    m_ctx = m_sharedCtx.get();
+}
+
 void HubPublishingExportPage::setupUi()
 {
     auto *layout = new QVBoxLayout(this);
@@ -3033,12 +3428,14 @@ void HubPublishingExportPage::setupUi()
     cidLayout->setSpacing(8);
 
     m_cidLabel = new QLabel(QStringLiteral("sha256:..."), cidBox);
+    m_cidLabel->setWordWrap(true);
     m_cidLabel->setStyleSheet(QStringLiteral(
         "font-family: monospace; font-size: 12px; font-weight: bold; color: #38bdf8;"));
     m_cidLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     cidLayout->addWidget(m_cidLabel, 1);
 
     m_copyCidBtn = new QPushButton(QStringLiteral("Copy CID"), cidBox);
+    browser_shared::sizeButtonFromFontMetrics(m_copyCidBtn, 16, 28);
     cidLayout->addWidget(m_copyCidBtn);
     layout->addWidget(cidBox);
 
@@ -3056,9 +3453,11 @@ void HubPublishingExportPage::setupUi()
     auto *btnRow = new QHBoxLayout();
     btnRow->setSpacing(8);
     m_copyJsonBtn = new QPushButton(QStringLiteral("Copy JSON"), jsonBox);
+    browser_shared::sizeButtonFromFontMetrics(m_copyJsonBtn, 16, 28);
     btnRow->addWidget(m_copyJsonBtn);
 
     m_saveJsonBtn = new QPushButton(QStringLiteral("Save index.json..."), jsonBox);
+    browser_shared::sizeButtonFromFontMetrics(m_saveJsonBtn, 16, 28);
     btnRow->addWidget(m_saveJsonBtn);
     btnRow->addStretch();
     jsonLayout->addLayout(btnRow);
@@ -3073,24 +3472,23 @@ void HubPublishingExportPage::setupUi()
     auto *installRow = new QHBoxLayout();
     installRow->setSpacing(8);
     m_installLocalBtn = new QPushButton(QStringLiteral("Install to Local Hub"), actGroup);
-    m_installLocalBtn->setFixedHeight(32);
-    m_installLocalBtn->setStyleSheet(
-        QStringLiteral("background-color: #0284c7; color: white; font-weight: bold; font-size: "
-                       "12px; padding: 6px 14px;"));
+    m_installLocalBtn->setStyleSheet(browser_shared::kStyleButtonPrimary);
+    browser_shared::sizeButtonFromFontMetrics(m_installLocalBtn, 18, 32);
     installRow->addWidget(m_installLocalBtn);
 
     m_openFolderBtn = new QPushButton(QStringLiteral("Open Output Folder"), actGroup);
-    m_openFolderBtn->setFixedHeight(32);
+    browser_shared::sizeButtonFromFontMetrics(m_openFolderBtn, 16, 32);
     installRow->addWidget(m_openFolderBtn);
 
     m_exportPkgBtn = new QPushButton(QStringLiteral("Save Package As..."), actGroup);
-    m_exportPkgBtn->setFixedHeight(32);
+    browser_shared::sizeButtonFromFontMetrics(m_exportPkgBtn, 16, 32);
     installRow->addWidget(m_exportPkgBtn);
 
     actLayout->addLayout(installRow);
 
     m_installStatusLabel =
-        new QLabel(QStringLiteral("Ready to install to ~/.local/share/waywal/hub/."), actGroup);
+        new QLabel(QStringLiteral("Ready to install to local Open Hub catalog."), actGroup);
+    m_installStatusLabel->setWordWrap(true);
     m_installStatusLabel->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
     actLayout->addWidget(m_installStatusLabel);
 
@@ -3114,11 +3512,16 @@ void HubPublishingExportPage::initializePage()
     if (!m_ctx)
         return;
 
+    m_ctx->projectTypeStr = canonicalProjectTypeStr(m_ctx->projectType);
+
     // Compute CID from Merkle root
     m_ctx->cid = QStringLiteral("sha256:") + QString::fromLatin1(m_ctx->merkleRoot.toHex());
     m_cidLabel->setText(m_ctx->cid);
 
-    // Construct Open Hub Registry Index Entry JSON
+    const QString authorPubHex = QString::fromLatin1(m_ctx->authorPubKey.toHex());
+    const qint64 nowSec = QDateTime::currentSecsSinceEpoch();
+
+    // Construct Open Hub Registry Index Entry JSON compatible with both registry/hub parsers.
     QJsonObject root;
     root.insert(QStringLiteral("schema_version"), QStringLiteral("openhub/v1"));
     root.insert(QStringLiteral("cid"), m_ctx->cid);
@@ -3130,8 +3533,11 @@ void HubPublishingExportPage::initializePage()
     QJsonObject authorObj;
     authorObj.insert(QStringLiteral("name"), m_ctx->authorName);
     authorObj.insert(QStringLiteral("email"), m_ctx->authorEmail);
-    authorObj.insert(QStringLiteral("pubkey"), QString::fromLatin1(m_ctx->authorPubKey.toHex()));
+    authorObj.insert(QStringLiteral("pubkey"), authorPubHex);
     root.insert(QStringLiteral("author"), authorObj);
+    root.insert(QStringLiteral("author_name"), m_ctx->authorName);
+    root.insert(QStringLiteral("author_email"), m_ctx->authorEmail);
+    root.insert(QStringLiteral("author_pubkey"), authorPubHex);
 
     root.insert(QStringLiteral("license"), m_ctx->license);
     root.insert(QStringLiteral("description"), m_ctx->description);
@@ -3170,7 +3576,8 @@ void HubPublishingExportPage::initializePage()
     root.insert(QStringLiteral("merkle_root"), QString::fromLatin1(m_ctx->merkleRoot.toHex()));
     root.insert(QStringLiteral("signature"), QString::fromLatin1(m_ctx->signature.toHex()));
     root.insert(QStringLiteral("file_size_bytes"), m_ctx->compiledSizeBytes);
-    root.insert(QStringLiteral("published_at"), QDateTime::currentSecsSinceEpoch());
+    root.insert(QStringLiteral("published_at"), nowSec);
+    root.insert(QStringLiteral("timestamp"), nowSec);
 
     QJsonDocument doc(root);
     m_ctx->registryIndexJson = QString::fromUtf8(doc.toJson(QJsonDocument::Indented));
@@ -3181,7 +3588,8 @@ void HubPublishingExportPage::copyCidToClipboard()
 {
     if (m_ctx && !m_ctx->cid.isEmpty()) {
         QGuiApplication::clipboard()->setText(m_ctx->cid);
-        m_copyCidBtn->setText(QStringLiteral("Copied"));
+        browser_shared::resetButtonTextLater(m_copyCidBtn, QStringLiteral("Copied"),
+                                             QStringLiteral("Copy CID"));
     }
 }
 
@@ -3189,7 +3597,8 @@ void HubPublishingExportPage::copyJsonToClipboard()
 {
     if (m_ctx && !m_ctx->registryIndexJson.isEmpty()) {
         QGuiApplication::clipboard()->setText(m_ctx->registryIndexJson);
-        m_copyJsonBtn->setText(QStringLiteral("Copied"));
+        browser_shared::resetButtonTextLater(m_copyJsonBtn, QStringLiteral("Copied"),
+                                             QStringLiteral("Copy JSON"));
     }
 }
 
@@ -3199,12 +3608,15 @@ void HubPublishingExportPage::exportJsonToFile()
                                                 QDir::homePath() + QStringLiteral("/index.json"),
                                                 QStringLiteral("JSON Files (*.json)"));
     if (!path.isEmpty() && m_ctx) {
-        QFile f(path);
-        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            f.write(m_ctx->registryIndexJson.toUtf8());
-            f.close();
+        const QByteArray bytes = m_ctx->registryIndexJson.toUtf8();
+        if (browser_shared::atomicWriteBytesWithFsync(std::filesystem::path(path.toStdString()),
+                                                      bytes.constData(),
+                                                      static_cast<size_t>(bytes.size()), 0644)) {
             QMessageBox::information(this, QStringLiteral("Saved"),
                                      QStringLiteral("Metadata saved to:\n%1").arg(path));
+        } else {
+            QMessageBox::warning(this, QStringLiteral("Save Failed"),
+                                 QStringLiteral("Failed to write metadata file:\n%1").arg(path));
         }
     }
 }
@@ -3215,21 +3627,51 @@ void HubPublishingExportPage::installToLocalHub()
         return;
     }
 
-    const QString hubDir = QDir::homePath() + QStringLiteral("/.local/share/waywal/hub");
-    QDir().mkpath(hubDir);
+    const QString hubDir = browser_shared::resolveWaywalDataDirQt(QStringLiteral("hub"));
+    if (hubDir.isEmpty() || !QDir().mkpath(hubDir)) {
+        m_installStatusLabel->setText(
+            QStringLiteral("Failed to resolve or create local hub directory."));
+        m_installStatusLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
+        return;
+    }
 
     QFileInfo outFi(m_ctx->outPkgPath);
-    QString dstPkg = hubDir + QStringLiteral("/") + outFi.fileName();
+    const QString relPkgName = outFi.fileName();
+    QString dstPkg = hubDir + QStringLiteral("/") + relPkgName;
 
-    QFile::remove(dstPkg);
-    if (!QFile::copy(m_ctx->outPkgPath, dstPkg)) {
+    bool alreadySame = false;
+    if (!copyFileSafely(m_ctx->outPkgPath, dstPkg, &alreadySame)) {
         m_installStatusLabel->setText(
             QStringLiteral("Failed to copy package to local hub directory."));
         m_installStatusLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
         return;
     }
 
-    // Update ~/.local/share/waywal/hub/catalog.json
+    // Export a confined preview thumbnail inside hub/previews/ for catalog grid rendering.
+    QString relPreviewPath;
+    if (!m_ctx->previewWebpPath.isEmpty() && QFile::exists(m_ctx->previewWebpPath)) {
+        const QString previewDir = hubDir + QStringLiteral("/previews");
+        if (QDir().mkpath(previewDir)) {
+            const QString previewName = m_ctx->slug + QStringLiteral(".webp");
+            const QString dstPreview = previewDir + QStringLiteral("/") + previewName;
+            if (copyFileSafely(m_ctx->previewWebpPath, dstPreview)) {
+                relPreviewPath = QStringLiteral("previews/") + previewName;
+            }
+        }
+    } else if (!m_ctx->previewImage.isNull()) {
+        const QString previewDir = hubDir + QStringLiteral("/previews");
+        if (QDir().mkpath(previewDir)) {
+            const QString previewName = m_ctx->slug + QStringLiteral(".webp");
+            const QString dstPreview = previewDir + QStringLiteral("/") + previewName;
+            QImage p512 = m_ctx->previewImage.scaled(512, 288, Qt::IgnoreAspectRatio,
+                                                     Qt::SmoothTransformation);
+            if (p512.save(dstPreview, "WEBP", 90)) {
+                relPreviewPath = QStringLiteral("previews/") + previewName;
+            }
+        }
+    }
+
+    // Update $XDG_DATA_HOME/waywal/hub/catalog.json atomically.
     QString catPath = hubDir + QStringLiteral("/catalog.json");
     QJsonArray catArray;
     QFile readCat(catPath);
@@ -3245,7 +3687,12 @@ void HubPublishingExportPage::installToLocalHub()
     QJsonDocument itemDoc = QJsonDocument::fromJson(m_ctx->registryIndexJson.toUtf8());
     if (itemDoc.isObject()) {
         QJsonObject newObj = itemDoc.object();
+        newObj.insert(QStringLiteral("package_path"), relPkgName);
         newObj.insert(QStringLiteral("local_package_path"), dstPkg);
+        if (!relPreviewPath.isEmpty()) {
+            newObj.insert(QStringLiteral("preview_path"), relPreviewPath);
+            newObj.insert(QStringLiteral("preview"), relPreviewPath);
+        }
         bool found = false;
         for (int i = 0; i < catArray.size(); i++) {
             if (catArray[i].toObject().value(QStringLiteral("slug")).toString() == m_ctx->slug) {
@@ -3258,10 +3705,14 @@ void HubPublishingExportPage::installToLocalHub()
             catArray.append(newObj);
         }
 
-        QFile writeCat(catPath);
-        if (writeCat.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            writeCat.write(QJsonDocument(catArray).toJson(QJsonDocument::Indented));
-            writeCat.close();
+        const QByteArray catBytes = QJsonDocument(catArray).toJson(QJsonDocument::Indented);
+        if (!browser_shared::atomicWriteBytesWithFsync(
+                std::filesystem::path(catPath.toStdString()), catBytes.constData(),
+                static_cast<size_t>(catBytes.size()), 0644)) {
+            m_installStatusLabel->setText(
+                QStringLiteral("Failed to write local hub catalog.json."));
+            m_installStatusLabel->setStyleSheet(QStringLiteral("color: #ef4444;"));
+            return;
         }
     }
 
@@ -3281,18 +3732,23 @@ void HubPublishingExportPage::openContainingFolder()
 
 void HubPublishingExportPage::exportPackageTo()
 {
-    if (!m_ctx || m_ctx->outPkgPath.isEmpty())
+    if (!m_ctx || m_ctx->outPkgPath.isEmpty() || !QFile::exists(m_ctx->outPkgPath))
         return;
 
     QString dst = QFileDialog::getSaveFileName(this, QStringLiteral("Save Package As"),
                                                QFileInfo(m_ctx->outPkgPath).fileName(),
                                                QStringLiteral("WayWal Package (*.wwpkg)"));
     if (!dst.isEmpty()) {
-        QFile::remove(dst);
-        if (QFile::copy(m_ctx->outPkgPath, dst)) {
-            QMessageBox::information(this, QStringLiteral("Export Complete"),
-                                     QStringLiteral("Package saved to:\n%1").arg(dst));
+        bool alreadySame = false;
+        if (!copyFileSafely(m_ctx->outPkgPath, dst, &alreadySame)) {
+            QMessageBox::warning(this, QStringLiteral("Export Failed"),
+                                 QStringLiteral("Failed to copy package to:\n%1").arg(dst));
+            return;
         }
+        QMessageBox::information(this, QStringLiteral("Export Complete"),
+                                 alreadySame
+                                     ? QStringLiteral("Package is already saved at:\n%1").arg(dst)
+                                     : QStringLiteral("Package saved to:\n%1").arg(dst));
     }
 }
 
@@ -3300,20 +3756,28 @@ void HubPublishingExportPage::exportPackageTo()
 /* CreatorPackagingWizard Top-Level Controller                               */
 /* ========================================================================= */
 
-CreatorPackagingWizard::CreatorPackagingWizard(QWidget *parent) : QWizard(parent)
+CreatorPackagingWizard::CreatorPackagingWizard(QWidget *parent)
+    : QWizard(parent), m_context(std::make_shared<CreatorPackagingContext>())
 {
     setObjectName(QStringLiteral("CreatorPackagingWizard"));
     setWindowTitle(QStringLiteral("Package Wallpaper"));
     setWizardStyle(QWizard::ModernStyle);
     resize(920, 680);
 
-    // Instantiate all 6 guided pages
-    m_intakePage = new SourceIntakePage(&m_context, this);
-    m_bundlingPage = new AssetBundlingPage(&m_context, this);
-    m_metadataPage = new MetadataPreviewPage(&m_context, this);
-    m_auditPage = new CapabilityAuditPage(&m_context, this);
-    m_compilationPage = new CompilationSigningPage(&m_context, this);
-    m_exportPage = new HubPublishingExportPage(&m_context, this);
+    // Instantiate all 6 guided pages sharing lifetime of CreatorPackagingContext.
+    m_intakePage = new SourceIntakePage(m_context.get(), this);
+    m_bundlingPage = new AssetBundlingPage(m_context.get(), this);
+    m_metadataPage = new MetadataPreviewPage(m_context.get(), this);
+    m_auditPage = new CapabilityAuditPage(m_context.get(), this);
+    m_compilationPage = new CompilationSigningPage(m_context.get(), this);
+    m_exportPage = new HubPublishingExportPage(m_context.get(), this);
+
+    m_intakePage->setSharedContext(m_context);
+    m_bundlingPage->setSharedContext(m_context);
+    m_metadataPage->setSharedContext(m_context);
+    m_auditPage->setSharedContext(m_context);
+    m_compilationPage->setSharedContext(m_context);
+    m_exportPage->setSharedContext(m_context);
 
     setPage(Page_SourceIntake, m_intakePage);
     setPage(Page_AssetBundling, m_bundlingPage);
@@ -3330,12 +3794,22 @@ CreatorPackagingWizard::CreatorPackagingWizard(QWidget *parent) : QWizard(parent
 
 CreatorPackagingWizard::~CreatorPackagingWizard()
 {
-    wipeByteArray(m_context.authorPrivKey);
+    // Join background workers before wiping key buffers and deleting staging directory.
+    if (m_compilationPage) {
+        m_compilationPage->stopAndJoinWorkers();
+    }
+    if (m_auditPage) {
+        m_auditPage->stopAndJoinWorkers();
+    }
 
-    // Clean up temporary staging directory if located in QDir::tempPath
-    if (!m_context.stagingDir.isEmpty() && m_context.stagingDir.startsWith(QDir::tempPath())) {
-        QDir stg(m_context.stagingDir);
-        stg.removeRecursively();
+    if (m_context) {
+        wipeByteArray(m_context->authorPrivKey);
+
+        if (!m_context->stagingDir.isEmpty() &&
+            m_context->stagingDir.startsWith(QDir::tempPath())) {
+            QDir stg(m_context->stagingDir);
+            stg.removeRecursively();
+        }
     }
 }
 
@@ -3371,32 +3845,46 @@ void CreatorPackagingWizard::applyStudioTheme()
                        "  border-radius: 5px;"
                        "  padding: 5px 8px;"
                        "  color: #f1f5f9;"
+                       "  font-size: 12px;"
                        "}"
                        "QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus {"
                        "  border: 1px solid #38bdf8;"
                        "}"
+                       "QCheckBox:focus {"
+                       "  color: #38bdf8;"
+                       "}"
                        "QPushButton {"
                        "  background-color: #20242e;"
-                       "  border: 1px solid #2c3240;"
+                       "  border: 1px solid #334155;"
                        "  border-radius: 5px;"
                        "  padding: 6px 14px;"
                        "  color: #f1f5f9;"
+                       "  font-size: 12px;"
                        "}"
                        "QPushButton:hover {"
                        "  background-color: #2a303d;"
                        "}"
+                       "QPushButton:focus {"
+                       "  border: 1px solid #38bdf8;"
+                       "}"
                        "QPushButton:pressed {"
                        "  background-color: #12141a;"
+                       "}"
+                       "QPushButton:disabled {"
+                       "  background-color: #181b22;"
+                       "  color: #94a3b8;"
+                       "  border-color: #262b36;"
                        "}"
                        "QTreeWidget {"
                        "  background-color: #12141a;"
                        "  border: 1px solid #2c3240;"
                        "  border-radius: 5px;"
                        "  color: #f1f5f9;"
+                       "  font-size: 12px;"
                        "}"
                        "QHeaderView::section {"
                        "  background-color: #20242e;"
-                       "  color: #94a3b8;"
+                       "  color: #cbd5e1;"
                        "  padding: 5px;"
                        "  border: 1px solid #2c3240;"
                        "}"
@@ -3406,6 +3894,7 @@ void CreatorPackagingWizard::applyStudioTheme()
                        "  border-radius: 4px;"
                        "  text-align: center;"
                        "  color: white;"
+                       "  font-size: 11px;"
                        "}"
                        "QProgressBar::chunk {"
                        "  background-color: #0284c7;"
@@ -3414,16 +3903,16 @@ void CreatorPackagingWizard::applyStudioTheme()
 
 void CreatorPackagingWizard::setSourcePath(const QString &path)
 {
-    m_context.sourcePath = path;
+    m_context->sourcePath = path;
     if (m_intakePage) {
         m_intakePage->setSourcePath(path);
     }
 }
 
-QString CreatorPackagingWizard::sourcePath() const { return m_context.sourcePath; }
+QString CreatorPackagingWizard::sourcePath() const { return m_context->sourcePath; }
 
-QString CreatorPackagingWizard::compiledPackagePath() const { return m_context.outPkgPath; }
+QString CreatorPackagingWizard::compiledPackagePath() const { return m_context->outPkgPath; }
 
-QString CreatorPackagingWizard::contentIdentifier() const { return m_context.cid; }
+QString CreatorPackagingWizard::contentIdentifier() const { return m_context->cid; }
 
 } // namespace wwal::studio
