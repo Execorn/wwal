@@ -15,6 +15,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
+#include <QMatrix4x4>
 #include <QMenu>
 #include <QPainter>
 #include <QPointer>
@@ -26,6 +27,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <queue>
 #include <unordered_set>
@@ -228,6 +230,182 @@ makeBaseMutateReq(const QString &output, we_scene_mutate_op_t op, const SceneLay
     copyTruncatedString(req.name, sizeof(req.name), node.name);
     return req;
 }
+
+// Column-major T * Rz(angles[2]) * Ry(angles[1]) * Rx(angles[0]) * S matching daemon we_scene.c.
+[[nodiscard]] QMatrix4x4 buildLocalTrsMatrix(const SceneLayerNode &node) noexcept
+{
+    const float sx = std::isfinite(node.scale[0]) ? node.scale[0] : 1.0f;
+    const float sy = std::isfinite(node.scale[1]) ? node.scale[1] : 1.0f;
+    const float sz = std::isfinite(node.scale[2]) ? node.scale[2] : 1.0f;
+
+    const float phi = std::isfinite(node.angles[0]) ? node.angles[0] : 0.0f;
+    const float theta = std::isfinite(node.angles[1]) ? node.angles[1] : 0.0f;
+    const float psi = std::isfinite(node.angles[2]) ? node.angles[2] : 0.0f;
+
+    const float cp = std::cos(phi);
+    const float sp = std::sin(phi);
+    const float ct = std::cos(theta);
+    const float st = std::sin(theta);
+    const float cr = std::cos(psi);
+    const float sr = std::sin(psi);
+
+    const float ox = std::isfinite(node.origin[0]) ? node.origin[0] : 0.0f;
+    const float oy = std::isfinite(node.origin[1]) ? node.origin[1] : 0.0f;
+    const float oz = std::isfinite(node.origin[2]) ? node.origin[2] : 0.0f;
+
+    return QMatrix4x4(
+        sx * (cr * ct), sy * (cr * st * sp - sr * cp), sz * (cr * st * cp + sr * sp), ox,
+        sx * (sr * ct), sy * (sr * st * sp + cr * cp), sz * (sr * st * cp - cr * sp), oy,
+        -sx * st, sy * (ct * sp), sz * (ct * cp), oz, 0.0f, 0.0f, 0.0f, 1.0f);
+}
+
+[[nodiscard]] QMatrix4x4 worldTrsMatrixOf(const SceneLayerTreeModel &model, int32_t nodeId) noexcept
+{
+    std::vector<QMatrix4x4> chain;
+    std::unordered_set<int32_t> visited;
+    int32_t cur = nodeId;
+    uint32_t guard = 0u;
+    while (cur != -1 && guard++ <= SceneLayerTreeModel::kMaxParentDepth &&
+           visited.insert(cur).second) {
+        const SceneLayerNode *n = model.findNodeById(cur);
+        if (!n) {
+            break;
+        }
+        chain.push_back(buildLocalTrsMatrix(*n));
+        cur = n->parentId;
+    }
+    QMatrix4x4 world;
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        world = world * (*it);
+    }
+    return world;
+}
+
+void decomposeTrsMatrix(const QMatrix4x4 &m, std::array<float, 3> &outOrigin,
+                        std::array<float, 3> &outScale, std::array<float, 3> &outAngles) noexcept
+{
+    outOrigin = {m(0, 3), m(1, 3), m(2, 3)};
+
+    const QVector3D col0(m(0, 0), m(1, 0), m(2, 0));
+    const QVector3D col1(m(0, 1), m(1, 1), m(2, 1));
+    const QVector3D col2(m(0, 2), m(1, 2), m(2, 2));
+
+    float sx = col0.length();
+    float sy = col1.length();
+    float sz = col2.length();
+
+    const float det3 = QVector3D::dotProduct(col0, QVector3D::crossProduct(col1, col2));
+    if (det3 < 0.0f) {
+        sz = -sz;
+    }
+
+    outScale = {
+        (sx > 1e-6f) ? sx : 1.0f,
+        (sy > 1e-6f) ? sy : 1.0f,
+        (std::abs(sz) > 1e-6f) ? sz : 1.0f,
+    };
+
+    const QVector3D r0 = (sx > 1e-6f) ? (col0 / sx) : QVector3D(1.0f, 0.0f, 0.0f);
+    const QVector3D r1 = (sy > 1e-6f) ? (col1 / sy) : QVector3D(0.0f, 1.0f, 0.0f);
+    const QVector3D r2 = (std::abs(sz) > 1e-6f) ? (col2 / sz) : QVector3D(0.0f, 0.0f, 1.0f);
+
+    const float theta = std::asin(std::clamp(-r0.z(), -1.0f, 1.0f));
+    float phi = 0.0f;
+    float psi = 0.0f;
+    if (std::abs(std::cos(theta)) > 1e-5f) {
+        phi = std::atan2(r1.z(), r2.z());
+        psi = std::atan2(r0.y(), r0.x());
+    } else {
+        phi = std::atan2(-r2.y(), r1.y());
+        psi = 0.0f;
+    }
+    outAngles = {phi, theta, psi};
+}
+
+class MoveSceneLayerCommand final : public ICommand {
+  public:
+    using ApplyMoveFn = std::function<void(const SceneLayerMovePlan &plan, bool isUndo)>;
+
+    MoveSceneLayerCommand(QString layerName, SceneLayerMovePlan plan,
+                          std::array<float, 3> oldOrigin, std::array<float, 3> newOrigin,
+                          std::array<float, 3> oldScale, std::array<float, 3> newScale,
+                          std::array<float, 3> oldAngles, std::array<float, 3> newAngles,
+                          ApplyMoveFn applyFn)
+        : m_layerName(std::move(layerName)), m_plan(std::move(plan)), m_oldOrigin(oldOrigin),
+          m_newOrigin(newOrigin), m_oldScale(oldScale), m_newScale(newScale), m_oldAngles(oldAngles),
+          m_newAngles(newAngles), m_applyFn(std::move(applyFn))
+    {
+    }
+
+    void execute() override
+    {
+        if (m_applyFn && isValid()) {
+            m_applyFn(m_plan, false);
+        }
+    }
+
+    void undo() override
+    {
+        if (m_applyFn && isValid()) {
+            m_applyFn(m_plan, true);
+        }
+    }
+
+    [[nodiscard]] QString describe() const override
+    {
+        const QString label = m_layerName.isEmpty() ? QStringLiteral("Layer #%1").arg(m_plan.objectId)
+                                                    : m_layerName;
+        if (m_plan.oldParentId != m_plan.newParentId && !m_plan.newZOrders.empty()) {
+            return QStringLiteral("Move '%1'").arg(label);
+        }
+        if (m_plan.oldParentId != m_plan.newParentId) {
+            return QStringLiteral("Reparent '%1'").arg(label);
+        }
+        return QStringLiteral("Reorder '%1' Z-order").arg(label);
+    }
+
+    [[nodiscard]] size_t memoryFootprint() const override
+    {
+        return sizeof(*this) + static_cast<size_t>(std::max<qsizetype>(0, m_layerName.capacity())) *
+                                   sizeof(QChar) +
+               (m_plan.oldZOrders.capacity() + m_plan.newZOrders.capacity()) *
+                   sizeof(std::pair<int32_t, uint32_t>);
+    }
+
+    [[nodiscard]] bool isValid() const override
+    {
+        auto allFin = [](const std::array<float, 3> &a) {
+            return std::isfinite(a[0]) && std::isfinite(a[1]) && std::isfinite(a[2]);
+        };
+        return m_plan.objectId >= 0 && allFin(m_oldOrigin) && allFin(m_newOrigin) &&
+               allFin(m_oldScale) && allFin(m_newScale) && allFin(m_oldAngles) &&
+               allFin(m_newAngles);
+    }
+
+    [[nodiscard]] const std::array<float, 3> &originFor(bool isUndo) const noexcept
+    {
+        return isUndo ? m_oldOrigin : m_newOrigin;
+    }
+    [[nodiscard]] const std::array<float, 3> &scaleFor(bool isUndo) const noexcept
+    {
+        return isUndo ? m_oldScale : m_newScale;
+    }
+    [[nodiscard]] const std::array<float, 3> &anglesFor(bool isUndo) const noexcept
+    {
+        return isUndo ? m_oldAngles : m_newAngles;
+    }
+
+  private:
+    QString m_layerName;
+    SceneLayerMovePlan m_plan;
+    std::array<float, 3> m_oldOrigin{};
+    std::array<float, 3> m_newOrigin{};
+    std::array<float, 3> m_oldScale{};
+    std::array<float, 3> m_newScale{};
+    std::array<float, 3> m_oldAngles{};
+    std::array<float, 3> m_newAngles{};
+    ApplyMoveFn m_applyFn;
+};
 
 [[nodiscard]] waywal_ipc_req_scene_mutate_t makeSnapshotMutateReq(const QString &output,
                                                                   we_scene_mutate_op_t op,
@@ -825,8 +1003,15 @@ Qt::ItemFlags SceneLayerTreeModel::flags(const QModelIndex &index) const
     if (!index.isValid()) {
         return Qt::ItemIsDropEnabled;
     }
-    Qt::ItemFlags base = Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsDragEnabled;
-    if (m_viewMode == SceneLayerViewMode::HierarchyTree) {
+    const auto id = static_cast<int32_t>(index.internalId() - 1);
+    const SceneLayerNode *n =
+        (id >= 0 && static_cast<size_t>(id) < m_nodes.size()) ? &m_nodes[static_cast<size_t>(id)]
+                                                              : nullptr;
+    Qt::ItemFlags base = Qt::ItemIsEnabled | Qt::ItemIsSelectable;
+    if (n && !n->locked) {
+        base |= Qt::ItemIsDragEnabled;
+    }
+    if (m_viewMode == SceneLayerViewMode::HierarchyTree && (!n || !n->locked)) {
         base |= Qt::ItemIsDropEnabled;
     }
     return base;
@@ -885,22 +1070,16 @@ bool SceneLayerTreeModel::dropMimeData(const QMimeData *data, Qt::DropAction act
         targetParentId = m_nodes[pSlot].id;
     }
 
-    if (m_viewMode == SceneLayerViewMode::HierarchyTree && row == -1) {
-        for (int32_t id : draggedIds) {
-            if (wouldCreateCycleOrExceedDepth(id, targetParentId)) {
+    if (m_viewMode == SceneLayerViewMode::HierarchyTree) {
+        if (targetParentId != -1) {
+            const SceneLayerNode *targetParent = findNodeById(targetParentId);
+            if (!targetParent || targetParent->locked) {
                 return false;
             }
         }
         for (int32_t id : draggedIds) {
-            emit reparentRequested(id, targetParentId, preserveWorld);
-        }
-        return true;
-    }
-
-    if (m_viewMode == SceneLayerViewMode::HierarchyTree) {
-        for (int32_t id : draggedIds) {
             const SceneLayerNode *dragged = findNodeById(id);
-            if (!dragged) {
+            if (!dragged || dragged->locked) {
                 return false;
             }
             if (dragged->parentId != targetParentId &&
@@ -908,15 +1087,35 @@ bool SceneLayerTreeModel::dropMimeData(const QMimeData *data, Qt::DropAction act
                 return false;
             }
         }
+    } else {
+        for (int32_t id : draggedIds) {
+            const SceneLayerNode *dragged = findNodeById(id);
+            if (!dragged || dragged->locked) {
+                return false;
+            }
+        }
     }
 
     const int32_t primaryId = draggedIds.front();
     const SceneLayerNode *primaryNode = findNodeById(primaryId);
-    uint32_t targetZ = primaryNode ? primaryNode->zOrderIndex : 0u;
+    if (!primaryNode) {
+        return false;
+    }
+    uint32_t targetZ = primaryNode->zOrderIndex;
+    size_t targetAscPos = 0u;
+    bool haveTargetAscPos = false;
+
+    std::vector<SceneLayerNode> sortedAsc = m_nodes;
+    std::sort(sortedAsc.begin(), sortedAsc.end(), [](const SceneLayerNode &a, const SceneLayerNode &b) {
+        if (a.zOrderIndex != b.zOrderIndex) {
+            return a.zOrderIndex < b.zOrderIndex;
+        }
+        return a.id < b.id;
+    });
 
     if (m_viewMode == SceneLayerViewMode::FlatZOrderStack && !m_flatZOrderIds.empty()) {
         const int32_t count = static_cast<int32_t>(m_flatZOrderIds.size());
-        const int32_t rawInsertSlot = std::clamp(row < 0 ? 0 : row, 0, count);
+        const int32_t rawInsertSlot = std::clamp(row < 0 ? count : row, 0, count);
         int32_t oldSlot = -1;
         for (int32_t i = 0; i < count; ++i) {
             if (m_flatZOrderIds[static_cast<size_t>(i)] == primaryId) {
@@ -928,46 +1127,112 @@ bool SceneLayerTreeModel::dropMimeData(const QMimeData *data, Qt::DropAction act
                                       ? (rawInsertSlot - 1)
                                       : std::min(rawInsertSlot, std::max(0, count - 1));
         targetZ = static_cast<uint32_t>(std::max(0, count - 1 - insertIdx));
+        targetAscPos = static_cast<size_t>(std::clamp(count - 1 - insertIdx, 0, count - 1));
+        haveTargetAscPos = true;
     } else if (m_viewMode == SceneLayerViewMode::HierarchyTree) {
         const auto &siblings = childrenOf(targetParentId);
-        if (!siblings.empty() && primaryNode) {
-            const auto ascendingRankWithout = [&](const SceneLayerNode *ref) -> uint32_t {
-                uint32_t rank = 0u;
-                for (const auto &n : m_nodes) {
-                    if (n.id == primaryNode->id || n.id == ref->id) {
-                        continue;
-                    }
-                    if (n.zOrderIndex < ref->zOrderIndex ||
-                        (n.zOrderIndex == ref->zOrderIndex && n.id < ref->id)) {
-                        ++rank;
-                    }
+        auto ascRankWithout = [&](const SceneLayerNode *ref) -> size_t {
+            size_t rank = 0u;
+            for (const auto &n : sortedAsc) {
+                if (n.id == primaryNode->id || n.id == ref->id) {
+                    continue;
                 }
-                return rank;
-            };
+                if (n.zOrderIndex < ref->zOrderIndex ||
+                    (n.zOrderIndex == ref->zOrderIndex && n.id < ref->id)) {
+                    ++rank;
+                }
+            }
+            return rank;
+        };
+
+        if (!siblings.empty()) {
             const int32_t sibCount = static_cast<int32_t>(siblings.size());
-            const int32_t rawInsertSlot = std::clamp(row < 0 ? 0 : row, 0, sibCount);
+            // row == -1 drops onto the parent/root container and appends after existing children.
+            const int32_t rawInsertSlot = (row < 0) ? sibCount : std::clamp(row, 0, sibCount);
             if (rawInsertSlot < sibCount) {
                 const SceneLayerNode *refNode =
                     findNodeById(siblings[static_cast<size_t>(rawInsertSlot)]);
                 if (refNode && refNode->id != primaryNode->id) {
-                    targetZ = ascendingRankWithout(refNode) + 1u;
+                    targetAscPos = ascRankWithout(refNode) + 1u;
+                    targetZ = static_cast<uint32_t>(targetAscPos);
+                    haveTargetAscPos = true;
                 }
             } else {
                 const SceneLayerNode *lastNode = findNodeById(siblings.back());
                 if (lastNode && lastNode->id != primaryNode->id) {
-                    targetZ = ascendingRankWithout(lastNode);
+                    targetAscPos = ascRankWithout(lastNode);
+                    targetZ = static_cast<uint32_t>(targetAscPos);
+                    haveTargetAscPos = true;
                 }
             }
+        } else {
+            // Appending into an empty parent container keeps Z immediately after or at root end.
+            targetAscPos = sortedAsc.size() > 0u ? (sortedAsc.size() - 1u) : 0u;
+            targetZ = static_cast<uint32_t>(targetAscPos);
+            haveTargetAscPos = true;
         }
     }
 
+    auto buildZPlanForId = [&](int32_t id, uint32_t fallbackTargetZ, bool hasPos, size_t ascPos,
+                               std::vector<std::pair<int32_t, uint32_t>> &outOldZ,
+                               std::vector<std::pair<int32_t, uint32_t>> &outNewZ,
+                               uint32_t &outCompatTargetZ) {
+        std::vector<SceneLayerNode> seq = sortedAsc;
+        const auto curIt =
+            std::find_if(seq.begin(), seq.end(), [id](const auto &n) { return n.id == id; });
+        if (curIt == seq.end()) {
+            return;
+        }
+        std::vector<uint32_t> sparsePool;
+        sparsePool.reserve(seq.size());
+        bool strictSparse = true;
+        for (size_t i = 0; i < seq.size(); ++i) {
+            sparsePool.push_back(seq[i].zOrderIndex);
+            if (i > 0u && sparsePool[i] <= sparsePool[i - 1u]) {
+                strictSparse = false;
+            }
+        }
+
+        const SceneLayerNode moved = *curIt;
+        seq.erase(curIt);
+        const size_t insertSlot =
+            hasPos ? std::min<size_t>(ascPos, seq.size()) : std::min<size_t>(fallbackTargetZ, seq.size());
+        seq.insert(seq.begin() + static_cast<ptrdiff_t>(insertSlot), moved);
+
+        for (size_t i = 0; i < seq.size(); ++i) {
+            const uint32_t newZ = strictSparse ? sparsePool[i] : static_cast<uint32_t>(i);
+            if (seq[i].zOrderIndex != newZ) {
+                outOldZ.emplace_back(seq[i].id, seq[i].zOrderIndex);
+                outNewZ.emplace_back(seq[i].id, newZ);
+            }
+            if (seq[i].id == id) {
+                outCompatTargetZ = newZ;
+            }
+        }
+    };
+
     for (int32_t id : draggedIds) {
         const SceneLayerNode *dragged = findNodeById(id);
-        if (m_viewMode == SceneLayerViewMode::HierarchyTree && dragged &&
+        if (!dragged) {
+            continue;
+        }
+        SceneLayerMovePlan plan;
+        plan.objectId = id;
+        plan.oldParentId = dragged->parentId;
+        plan.newParentId =
+            (m_viewMode == SceneLayerViewMode::HierarchyTree) ? targetParentId : dragged->parentId;
+        plan.preserveWorldTransform = preserveWorld;
+
+        uint32_t compatTargetZ = targetZ;
+        buildZPlanForId(id, targetZ, haveTargetAscPos, targetAscPos, plan.oldZOrders,
+                        plan.newZOrders, compatTargetZ);
+
+        emit layerMoveRequested(plan);
+        if (m_viewMode == SceneLayerViewMode::HierarchyTree &&
             dragged->parentId != targetParentId) {
             emit reparentRequested(id, targetParentId, preserveWorld);
         }
-        emit reorderZRequested(id, targetZ);
+        emit reorderZRequested(id, compatTargetZ);
     }
     return true;
 }
@@ -1152,6 +1417,7 @@ void SceneLayerTreeWidget::ensureUiInitialized()
             [this](const QModelIndex &current, const QModelIndex &previous) {
                 (void)previous;
                 if (!current.isValid()) {
+                    m_selectedObjectId = -1;
                     setProperty("wwal_selected_object_id", -1);
                     return;
                 }
@@ -1161,6 +1427,7 @@ void SceneLayerTreeWidget::ensureUiInitialized()
                 }
                 const int32_t id = src.data(kRoleObjectId).toInt();
                 const auto kind = static_cast<we_scene_node_kind_t>(src.data(kRoleKind).toUInt());
+                m_selectedObjectId = id;
                 setProperty("wwal_selected_object_id", id);
                 emit objectSelected(id, kind);
             });
@@ -1226,11 +1493,18 @@ void SceneLayerTreeWidget::ensureUiInitialized()
             });
         }
 
-        if (cur->parentId != -1) {
+        if (cur->parentId != -1 && !cur->locked) {
             QAction *unparentAct = menu.addAction(QStringLiteral("Unparent to Root"));
             connect(unparentAct, &QAction::triggered, this, [this, targetId]() {
                 if (m_model) {
-                    emit m_model->reparentRequested(targetId, -1, true);
+                    SceneLayerMovePlan plan;
+                    if (const SceneLayerNode *n = m_model->findNodeById(targetId)) {
+                        plan.objectId = targetId;
+                        plan.oldParentId = n->parentId;
+                        plan.newParentId = -1;
+                        plan.preserveWorldTransform = true;
+                        emit m_model->layerMoveRequested(plan);
+                    }
                 }
             });
         }
@@ -1238,129 +1512,116 @@ void SceneLayerTreeWidget::ensureUiInitialized()
     });
 
     connect(
-        m_model, &SceneLayerTreeModel::reparentRequested, this,
-        [this](int32_t objectId, int32_t newParentId, bool preserveWorldTransform) {
-            if (m_model->wouldCreateCycleOrExceedDepth(objectId, newParentId)) {
+        m_model, &SceneLayerTreeModel::layerMoveRequested, this,
+        [this](const SceneLayerMovePlan &plan) {
+            const SceneLayerNode *target = m_model->findNodeById(plan.objectId);
+            if (!target) {
+                return;
+            }
+            if (target->locked) {
+                emit statusMessage(
+                    QStringLiteral("Move rejected: layer '%1' is locked").arg(target->name));
+                return;
+            }
+            const bool parentChanged = (plan.oldParentId != plan.newParentId);
+            if (parentChanged &&
+                m_model->wouldCreateCycleOrExceedDepth(plan.objectId, plan.newParentId)) {
                 emit statusMessage(QStringLiteral("Reparent rejected: cycle or parent depth > 16"));
                 return;
             }
-            const SceneLayerNode *child = m_model->findNodeById(objectId);
-            if (!child) {
+            if (parentChanged && plan.newParentId != -1) {
+                const SceneLayerNode *newParentNode = m_model->findNodeById(plan.newParentId);
+                if (!newParentNode || newParentNode->locked) {
+                    emit statusMessage(
+                        QStringLiteral("Reparent rejected: target parent is locked"));
+                    return;
+                }
+            }
+            if (!parentChanged && plan.newZOrders.empty()) {
                 return;
             }
 
-            const auto worldOriginOf = [this](int32_t startId) {
-                std::array<float, 3> sum{0.0f, 0.0f, 0.0f};
-                int32_t cur = startId;
-                uint32_t guard = 0u;
-                while (cur != -1 && guard++ <= SceneLayerTreeModel::kMaxParentDepth) {
-                    const SceneLayerNode *n = m_model->findNodeById(cur);
-                    if (!n) {
-                        break;
-                    }
-                    sum[0] += n->origin[0];
-                    sum[1] += n->origin[1];
-                    sum[2] += n->origin[2];
-                    cur = n->parentId;
-                }
-                return sum;
-            };
-
-            std::array<float, 3> newOrigin = child->origin;
-            std::array<float, 3> newScale = child->scale;
-            std::array<float, 3> newAngles = child->angles;
-            if (preserveWorldTransform) {
-                const auto childWorld = worldOriginOf(child->id);
-                const auto newParentWorld = (newParentId != -1)
-                                                ? worldOriginOf(newParentId)
-                                                : std::array<float, 3>{0.0f, 0.0f, 0.0f};
-                newOrigin[0] = childWorld[0] - newParentWorld[0];
-                newOrigin[1] = childWorld[1] - newParentWorld[1];
-                newOrigin[2] = childWorld[2] - newParentWorld[2];
+            std::array<float, 3> newOrigin = target->origin;
+            std::array<float, 3> newScale = target->scale;
+            std::array<float, 3> newAngles = target->angles;
+            if (parentChanged && plan.preserveWorldTransform) {
+                const QMatrix4x4 childWorld = worldTrsMatrixOf(*m_model, target->id);
+                const QMatrix4x4 parentWorld = (plan.newParentId != -1)
+                                                   ? worldTrsMatrixOf(*m_model, plan.newParentId)
+                                                   : QMatrix4x4();
+                bool invertible = false;
+                const QMatrix4x4 invParent = parentWorld.inverted(&invertible);
+                const QMatrix4x4 nextLocal = invertible ? (invParent * childWorld) : childWorld;
+                decomposeTrsMatrix(nextLocal, newOrigin, newScale, newAngles);
             }
 
             QPointer<SceneLayerTreeWidget> self(this);
-            const auto applyReparent =
-                [self](int32_t id, int32_t pid, const std::array<float, 3> &orig,
-                       const std::array<float, 3> &sc, const std::array<float, 3> &ang) {
-                    if (!self || !self->m_model) {
-                        return;
-                    }
-                    auto nodes = self->m_model->nodes();
-                    for (auto &n : nodes) {
-                        if (n.id == id) {
-                            n.parentId = pid;
-                            n.origin = orig;
-                            n.scale = sc;
-                            n.angles = ang;
-                            const auto req =
-                                makeBaseMutateReq(self->m_targetOutput, WE_MUTATE_REPARENT, n);
-                            self->applyNodesPreservingSelection(std::move(nodes), id);
-                            self->dispatchMutateIpc(req);
-                            emit self->layerMutated(id);
-                            return;
-                        }
-                    }
-                };
-
-            if (m_commandBus) {
-                m_commandBus->execute(std::make_unique<ReparentSceneLayerCommand>(
-                    objectId, child->name, child->parentId, newParentId, child->origin, newOrigin,
-                    child->scale, newScale, child->angles, newAngles, applyReparent));
-            } else {
-                applyReparent(objectId, newParentId, newOrigin, newScale, newAngles);
-            }
-            selectObject(objectId);
-        });
-
-    connect(m_model, &SceneLayerTreeModel::reorderZRequested, this,
-            [this](int32_t objectId, uint32_t newZOrderIndex) {
-                const SceneLayerNode *target = m_model->findNodeById(objectId);
-                if (!target) {
+            const auto applyMove = [self, oldOrigin = target->origin, newOrigin,
+                                    oldScale = target->scale, newScale, oldAngles = target->angles,
+                                    newAngles](const SceneLayerMovePlan &p, bool isUndo) {
+                if (!self || !self->m_model) {
                     return;
                 }
-                const uint32_t oldZ = target->zOrderIndex;
-                QPointer<SceneLayerTreeWidget> self(this);
-                const auto applyReorder = [self](int32_t id, uint32_t targetZ) {
-                    if (!self || !self->m_model) {
-                        return;
-                    }
-                    auto nodes = self->m_model->nodes();
-                    std::sort(nodes.begin(), nodes.end(),
-                              [](const SceneLayerNode &a, const SceneLayerNode &b) {
-                                  if (a.zOrderIndex != b.zOrderIndex) {
-                                      return a.zOrderIndex < b.zOrderIndex;
-                                  }
-                                  return a.id < b.id;
-                              });
-                    const auto it = std::find_if(nodes.begin(), nodes.end(),
-                                                 [id](const auto &n) { return n.id == id; });
-                    if (it == nodes.end()) {
-                        return;
-                    }
-                    SceneLayerNode moved = *it;
-                    nodes.erase(it);
-                    const size_t clamped = std::min<size_t>(targetZ, nodes.size());
-                    nodes.insert(nodes.begin() + static_cast<ptrdiff_t>(clamped), moved);
-                    for (size_t i = 0; i < nodes.size(); ++i) {
-                        nodes[i].zOrderIndex = static_cast<uint32_t>(i);
-                    }
-                    const SceneLayerNode updated = nodes[clamped];
-                    const auto req =
-                        makeBaseMutateReq(self->m_targetOutput, WE_MUTATE_REORDER_Z, updated);
-                    self->applyNodesPreservingSelection(std::move(nodes), id);
-                    self->dispatchMutateIpc(req);
-                    emit self->layerMutated(id);
-                };
-
-                if (m_commandBus) {
-                    m_commandBus->execute(std::make_unique<ReorderSceneLayerCommand>(
-                        objectId, target->name, oldZ, newZOrderIndex, applyReorder));
-                } else {
-                    applyReorder(objectId, newZOrderIndex);
+                auto nodes = self->m_model->nodes();
+                const auto &zUpdates = isUndo ? p.oldZOrders : p.newZOrders;
+                std::unordered_map<int32_t, uint32_t> zById;
+                zById.reserve(zUpdates.size());
+                for (const auto &[id, z] : zUpdates) {
+                    zById[id] = z;
                 }
-                selectObject(objectId);
-            });
+
+                std::vector<waywal_ipc_req_scene_mutate_t> pendingIpc;
+                const bool hasParentChange = (p.oldParentId != p.newParentId);
+                const int32_t nextParent = isUndo ? p.oldParentId : p.newParentId;
+                const auto &nextOrigin = isUndo ? oldOrigin : newOrigin;
+                const auto &nextScale = isUndo ? oldScale : newScale;
+                const auto &nextAngles = isUndo ? oldAngles : newAngles;
+
+                for (auto &n : nodes) {
+                    if (n.id == p.objectId) {
+                        if (hasParentChange) {
+                            n.parentId = nextParent;
+                            n.origin = nextOrigin;
+                            n.scale = nextScale;
+                            n.angles = nextAngles;
+                        }
+                        if (const auto zIt = zById.find(n.id); zIt != zById.end()) {
+                            n.zOrderIndex = zIt->second;
+                        }
+                        if (hasParentChange) {
+                            pendingIpc.push_back(
+                                makeBaseMutateReq(self->m_targetOutput, WE_MUTATE_REPARENT, n));
+                        }
+                        if (zById.contains(n.id)) {
+                            pendingIpc.push_back(
+                                makeBaseMutateReq(self->m_targetOutput, WE_MUTATE_REORDER_Z, n));
+                        }
+                    } else if (const auto zIt = zById.find(n.id); zIt != zById.end()) {
+                        n.zOrderIndex = zIt->second;
+                        pendingIpc.push_back(
+                            makeBaseMutateReq(self->m_targetOutput, WE_MUTATE_REORDER_Z, n));
+                    }
+                }
+
+                self->applyNodesPreservingSelection(std::move(nodes), p.objectId);
+                for (const auto &req : pendingIpc) {
+                    self->dispatchMutateIpc(req);
+                }
+                emit self->layerMutated(p.objectId);
+            };
+
+            if (m_commandBus) {
+                const auto execApply = [applyMove](const SceneLayerMovePlan &p, bool isUndo) {
+                    applyMove(p, isUndo);
+                };
+                m_commandBus->execute(std::make_unique<MoveSceneLayerCommand>(
+                    target->name, plan, target->origin, newOrigin, target->scale, newScale,
+                    target->angles, newAngles, execApply));
+            } else {
+                applyMove(plan, false);
+            }
+            selectObject(plan.objectId);
+        });
 
     connect(m_model, &QAbstractItemModel::modelReset, this, [this]() {
         if (m_treeView && m_model->viewMode() == SceneLayerViewMode::HierarchyTree) {
@@ -1382,7 +1643,7 @@ void SceneLayerTreeWidget::applyNodesPreservingSelection(std::vector<SceneLayerN
         return;
     }
     const int32_t prevSelected = selectedObjectId();
-    const int32_t targetId = (preferredId >= 0) ? preferredId : prevSelected;
+    int32_t targetId = (preferredId >= 0) ? preferredId : prevSelected;
 
     if (m_uiInitialized && m_treeView && m_treeView->selectionModel()) {
         const QSignalBlocker blocker(m_treeView->selectionModel());
@@ -1395,31 +1656,48 @@ void SceneLayerTreeWidget::applyNodesPreservingSelection(std::vector<SceneLayerN
         m_treeView->expandAll();
     }
 
-    if (targetId >= 0 && m_model->findNodeById(targetId)) {
-        setProperty("wwal_selected_object_id", targetId);
+    // Default-select the top visible/root layer on initial population or when the old layer goes away.
+    if ((targetId < 0 || !m_model->findNodeById(targetId)) && !m_model->nodes().empty()) {
+        if (m_proxyModel && m_proxyModel->rowCount() > 0) {
+            const QModelIndex topProxy = m_proxyModel->index(0, 0);
+            const QModelIndex topSrc = m_proxyModel->mapToSource(topProxy);
+            if (topSrc.isValid()) {
+                targetId = topSrc.data(kRoleObjectId).toInt();
+            }
+        }
+        if (targetId < 0 || !m_model->findNodeById(targetId)) {
+            targetId = m_model->nodes().front().id;
+        }
+    }
+
+    if (const SceneLayerNode *n = (targetId >= 0) ? m_model->findNodeById(targetId) : nullptr) {
+        m_selectedObjectId = n->id;
+        setProperty("wwal_selected_object_id", n->id);
         if (m_uiInitialized && m_treeView && m_proxyModel && m_treeView->selectionModel()) {
-            const QModelIndex src = m_model->indexForObjectId(targetId);
+            const QModelIndex src = m_model->indexForObjectId(n->id);
             const QModelIndex proxyIdx =
                 src.isValid() ? m_proxyModel->mapFromSource(src) : QModelIndex();
             if (proxyIdx.isValid()) {
-                if (targetId == prevSelected) {
-                    const QSignalBlocker blocker(m_treeView->selectionModel());
-                    m_treeView->setCurrentIndex(proxyIdx);
-                } else {
-                    m_treeView->setCurrentIndex(proxyIdx);
-                }
+                const QSignalBlocker blocker(m_treeView->selectionModel());
+                m_treeView->selectionModel()->setCurrentIndex(
+                    proxyIdx, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
                 m_treeView->scrollTo(proxyIdx);
-                return;
             }
         }
-        if (targetId != prevSelected) {
-            const SceneLayerNode *n = m_model->findNodeById(targetId);
-            if (n) {
-                emit objectSelected(n->id, n->kind);
-            }
+        if (n->id != prevSelected) {
+            emit objectSelected(n->id, n->kind);
         }
     } else {
+        m_selectedObjectId = -1;
         setProperty("wwal_selected_object_id", -1);
+        if (m_uiInitialized && m_treeView && m_treeView->selectionModel()) {
+            const QSignalBlocker blocker(m_treeView->selectionModel());
+            m_treeView->selectionModel()->clearSelection();
+            m_treeView->selectionModel()->clearCurrentIndex();
+        }
+        if (prevSelected >= 0) {
+            emit objectSelected(-1, WE_NODE_IMAGE);
+        }
     }
 }
 
@@ -1472,9 +1750,7 @@ void SceneLayerTreeWidget::executeFlagEdit(int32_t objectId,
 
 void SceneLayerTreeWidget::loadFromSceneJson(const QString &sceneTreeJson)
 {
-    if (!m_model) {
-        m_model = new SceneLayerTreeModel(this);
-    }
+    ensureUiInitialized();
     std::vector<SceneLayerNode> parsedNodes;
     const QJsonDocument doc = QJsonDocument::fromJson(sceneTreeJson.toUtf8());
     QJsonArray arr;
@@ -1562,23 +1838,38 @@ void SceneLayerTreeWidget::loadFromSceneJson(const QString &sceneTreeJson)
 
 void SceneLayerTreeWidget::selectObject(int32_t objectId)
 {
-    setProperty("wwal_selected_object_id", objectId);
-    if (!m_model) {
+    ensureUiInitialized();
+    const int32_t prevSelected = selectedObjectId();
+    if (objectId < 0) {
+        m_selectedObjectId = -1;
+        setProperty("wwal_selected_object_id", -1);
+        if (m_treeView && m_treeView->selectionModel()) {
+            const QSignalBlocker blocker(m_treeView->selectionModel());
+            m_treeView->selectionModel()->clearSelection();
+            m_treeView->selectionModel()->clearCurrentIndex();
+        }
+        if (prevSelected >= 0) {
+            emit objectSelected(-1, WE_NODE_IMAGE);
+        }
         return;
     }
-    const SceneLayerNode *node = m_model->findNodeById(objectId);
-    if (m_uiInitialized && m_treeView && m_proxyModel) {
+
+    const SceneLayerNode *node = m_model ? m_model->findNodeById(objectId) : nullptr;
+    m_selectedObjectId = node ? node->id : objectId;
+    setProperty("wwal_selected_object_id", m_selectedObjectId);
+    if (m_treeView && m_proxyModel && m_treeView->selectionModel()) {
         const QModelIndex src = m_model->indexForObjectId(objectId);
         if (src.isValid()) {
             const QModelIndex proxyIdx = m_proxyModel->mapFromSource(src);
             if (proxyIdx.isValid()) {
-                m_treeView->setCurrentIndex(proxyIdx);
+                const QSignalBlocker blocker(m_treeView->selectionModel());
+                m_treeView->selectionModel()->setCurrentIndex(
+                    proxyIdx, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
                 m_treeView->scrollTo(proxyIdx);
-                return;
             }
         }
     }
-    if (node) {
+    if (node && (node->id != prevSelected)) {
         emit objectSelected(node->id, node->kind);
     }
 }
@@ -1593,6 +1884,9 @@ int32_t SceneLayerTreeWidget::selectedObjectId() const noexcept
                 return src.data(kRoleObjectId).toInt();
             }
         }
+    }
+    if (m_selectedObjectId >= 0) {
+        return m_selectedObjectId;
     }
     const QVariant stored = property("wwal_selected_object_id");
     return stored.isValid() ? stored.toInt() : -1;
@@ -1632,13 +1926,30 @@ void SceneLayerTreeWidget::keyPressEvent(QKeyEvent *event)
 
     if (key == Qt::Key_Delete) {
         const bool cascadeDelete = event->modifiers().testFlag(Qt::ShiftModifier);
+        if (node->locked) {
+            emit statusMessage(
+                QStringLiteral("Cannot delete locked layer '%1'").arg(node->name));
+            event->accept();
+            return;
+        }
         const SceneLayerSnapshot snap = snapshotFromNode(*node);
         std::vector<int32_t> childIds;
         std::vector<SceneLayerNode> removedSubtree;
+        struct ReparentTrsBackup {
+            int32_t id{-1};
+            int32_t oldParent{-1};
+            std::array<float, 3> oldOrigin{};
+            std::array<float, 3> oldScale{};
+            std::array<float, 3> oldAngles{};
+            std::array<float, 3> newOrigin{};
+            std::array<float, 3> newScale{};
+            std::array<float, 3> newAngles{};
+        };
+        std::vector<ReparentTrsBackup> reparentBackups;
 
         if (cascadeDelete) {
             // Collect subtree in parent-before-child BFS order so undo re-adds parents before
-            // children.
+            // children, and execute removes children before parents.
             std::unordered_set<int32_t> visited{snap.objectId};
             std::queue<int32_t> bfs;
             removedSubtree.push_back(*node);
@@ -1649,6 +1960,14 @@ void SceneLayerTreeWidget::keyPressEvent(QKeyEvent *event)
                 bfs.pop();
                 for (const auto &n : allNodes) {
                     if (n.parentId == pid && visited.insert(n.id).second) {
+                        if (n.locked) {
+                            emit statusMessage(
+                                QStringLiteral("Cannot cascade-delete subtree containing locked "
+                                               "layer '%1'")
+                                    .arg(n.name));
+                            event->accept();
+                            return;
+                        }
                         removedSubtree.push_back(n);
                         childIds.push_back(n.id);
                         bfs.push(n.id);
@@ -1656,15 +1975,36 @@ void SceneLayerTreeWidget::keyPressEvent(QKeyEvent *event)
                 }
             }
         } else {
+            const QMatrix4x4 newParentWorld = (node->parentId != -1)
+                                                  ? worldTrsMatrixOf(*m_model, node->parentId)
+                                                  : QMatrix4x4();
+            bool invOk = false;
+            const QMatrix4x4 invNewParent = newParentWorld.inverted(&invOk);
             for (const auto &n : m_model->nodes()) {
                 if (n.parentId == snap.objectId) {
+                    if (n.locked) {
+                        emit statusMessage(
+                            QStringLiteral("Cannot reparent locked child layer '%1'").arg(n.name));
+                        event->accept();
+                        return;
+                    }
                     childIds.push_back(n.id);
+                    ReparentTrsBackup bk;
+                    bk.id = n.id;
+                    bk.oldParent = n.parentId;
+                    bk.oldOrigin = n.origin;
+                    bk.oldScale = n.scale;
+                    bk.oldAngles = n.angles;
+                    const QMatrix4x4 childWorld = worldTrsMatrixOf(*m_model, n.id);
+                    const QMatrix4x4 localNext = invOk ? (invNewParent * childWorld) : childWorld;
+                    decomposeTrsMatrix(localNext, bk.newOrigin, bk.newScale, bk.newAngles);
+                    reparentBackups.push_back(bk);
                 }
             }
         }
 
         QPointer<SceneLayerTreeWidget> self(this);
-        const auto restoreFn = [self, cascadeDelete, removedSubtree](
+        const auto restoreFn = [self, cascadeDelete, removedSubtree, reparentBackups](
                                    const SceneLayerSnapshot &layer,
                                    const std::vector<int32_t> &reparentedChildren, bool isRestore) {
             if (!self || !self->m_model) {
@@ -1674,31 +2014,48 @@ void SceneLayerTreeWidget::keyPressEvent(QKeyEvent *event)
             if (!isRestore) {
                 std::vector<SceneLayerNode> reparentedNodes;
                 if (cascadeDelete) {
-                    std::unordered_set<int32_t> removeSet{layer.objectId};
-                    removeSet.insert(reparentedChildren.begin(), reparentedChildren.end());
+                    std::unordered_set<int32_t> removeSet;
+                    removeSet.reserve(removedSubtree.size() + 1u);
+                    removeSet.insert(layer.objectId);
+                    for (const auto &sn : removedSubtree) {
+                        removeSet.insert(sn.id);
+                    }
                     std::erase_if(nodes, [&removeSet](const SceneLayerNode &n) {
                         return removeSet.contains(n.id);
                     });
+                    self->applyNodesPreservingSelection(std::move(nodes));
+                    for (auto it = removedSubtree.rbegin(); it != removedSubtree.rend(); ++it) {
+                        self->dispatchMutateIpc(makeSnapshotMutateReq(
+                            self->m_targetOutput, WE_MUTATE_REMOVE_OBJECT, snapshotFromNode(*it)));
+                    }
                 } else {
                     std::unordered_set<int32_t> childSet(reparentedChildren.begin(),
                                                          reparentedChildren.end());
                     for (auto &n : nodes) {
                         if (childSet.contains(n.id)) {
                             n.parentId = layer.parentId;
+                            for (const auto &bk : reparentBackups) {
+                                if (bk.id == n.id) {
+                                    n.origin = bk.newOrigin;
+                                    n.scale = bk.newScale;
+                                    n.angles = bk.newAngles;
+                                    break;
+                                }
+                            }
                             reparentedNodes.push_back(n);
                         }
                     }
                     std::erase_if(nodes, [&layer](const SceneLayerNode &n) {
                         return n.id == layer.objectId;
                     });
+                    self->applyNodesPreservingSelection(std::move(nodes));
+                    for (const auto &rn : reparentedNodes) {
+                        self->dispatchMutateIpc(
+                            makeBaseMutateReq(self->m_targetOutput, WE_MUTATE_REPARENT, rn));
+                    }
+                    self->dispatchMutateIpc(makeSnapshotMutateReq(
+                        self->m_targetOutput, WE_MUTATE_REMOVE_OBJECT, layer));
                 }
-                self->applyNodesPreservingSelection(std::move(nodes));
-                for (const auto &rn : reparentedNodes) {
-                    self->dispatchMutateIpc(
-                        makeBaseMutateReq(self->m_targetOutput, WE_MUTATE_REPARENT, rn));
-                }
-                self->dispatchMutateIpc(
-                    makeSnapshotMutateReq(self->m_targetOutput, WE_MUTATE_REMOVE_OBJECT, layer));
             } else {
                 if (cascadeDelete) {
                     std::unordered_set<int32_t> existingIds;
@@ -1722,6 +2079,14 @@ void SceneLayerTreeWidget::keyPressEvent(QKeyEvent *event)
                     for (auto &n : nodes) {
                         if (childSet.contains(n.id)) {
                             n.parentId = layer.objectId;
+                            for (const auto &bk : reparentBackups) {
+                                if (bk.id == n.id) {
+                                    n.origin = bk.oldOrigin;
+                                    n.scale = bk.oldScale;
+                                    n.angles = bk.oldAngles;
+                                    break;
+                                }
+                            }
                             reparentedNodes.push_back(n);
                         }
                     }

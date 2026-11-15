@@ -5,6 +5,8 @@
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLFramebufferObject>
+#include <QFocusEvent>
+#include <QMetaObject>
 #include <QTabletEvent>
 #include <QOpenGLVertexArrayObject>
 #include <QOpenGLBuffer>
@@ -118,6 +120,163 @@ struct ShaderUniformValue {
     std::vector<float> fVals{};
     std::vector<int> iVals{};
     QMatrix4x4 matVal{};
+};
+
+enum class ActionBarButton {
+    None,
+    MonitorSelector,
+    ApplyButton,
+    ResetButton,
+    GuideButton,
+    ParallaxButton
+};
+
+class GpuPreviewViewport;
+
+/**
+ * @brief Owns EGL extension resolution, atomic DMA-BUF staging import, and SCM_RIGHTS IPC.
+ */
+class DmaBufSwapchain {
+  public:
+    void resolveEglExtensions() noexcept;
+    void releaseGl() noexcept;
+    void closeFds() noexcept;
+    [[nodiscard]] bool hasLiveFrame() const noexcept;
+    [[nodiscard]] uint32_t frameWidth() const noexcept;
+    [[nodiscard]] uint32_t frameHeight() const noexcept;
+    [[nodiscard]] GLuint currentTexture(int &outIsBgr) const noexcept;
+    bool importFrame(GpuPreviewViewport &vp, const waywal_dmabuf_frame_desc_t &desc,
+                     const int *planeFds, size_t numFds);
+    bool requestFromSocket(GpuPreviewViewport &vp, int socketFd, const QString &outputName);
+    bool requestFromNamespace(GpuPreviewViewport &vp, const QString &namespaceStr,
+                              const QString &outputName);
+
+    PFNEGLCREATEIMAGEKHRPROC m_eglCreateImageKHR{nullptr};
+    PFNEGLDESTROYIMAGEKHRPROC m_eglDestroyImageKHR{nullptr};
+    PFNEGLCREATESYNCKHRPROC m_eglCreateSyncKHR{nullptr};
+    PFNEGLDESTROYSYNCKHRPROC m_eglDestroySyncKHR{nullptr};
+    PFNEGLWAITSYNCKHRPROC m_eglWaitSyncKHR{nullptr};
+    PFNEGLCLIENTWAITSYNCKHRPROC m_eglClientWaitSyncKHR{nullptr};
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC m_glEGLImageTargetTexture2DOES{nullptr};
+    EGLDisplay m_eglDisplay{EGL_NO_DISPLAY};
+    bool m_eglInitialized{false};
+    std::optional<DmaBufFrame> m_currentFrame{};
+    mutable std::mutex m_frameMutex{};
+};
+
+/**
+ * @brief Owns GLES/GL shader programs, RGBA16F ping-pong FBOs, compute storage, and gizmo VBOs.
+ */
+class GlSceneRenderer {
+  public:
+    void releaseGl(bool hasCurrentContext) noexcept;
+    void setupQuadGeometry();
+    void initBlitShader(QObject *parent);
+    void ensureNeutralPassTexture();
+    void ensureOffscreenFbo(int w, int h);
+    void ensureBufferPassFbos(int w, int h);
+    void ensureGizmoGlInitialized(QObject *parent);
+    void ensureGizmoVboCapacity(size_t requiredBytes);
+    bool compileShader(QObject *parent, const QString &glslSource, QSize fbSize,
+                       QString *outError);
+    void uploadFallbackImageTexture(const QImage &image);
+    void deleteInProcessImageTexture() noexcept;
+
+    [[nodiscard]] QSize physicalSizeFor(const QWidget &w, int logicalW, int logicalH) const noexcept;
+    [[nodiscard]] QMatrix4x4 computeBlitMvp(const QSize &viewportSize, uint32_t contentW,
+                                            uint32_t contentH, float zoom, const QPointF &panOffset,
+                                            bool parallaxEnabled, float currentTiltX,
+                                            float currentTiltY,
+                                            float parallaxStrength) const noexcept;
+
+    GLuint m_inProcessImageTex{0};
+    GLuint m_neutralPassTex{0};
+    GLuint m_computeOutputTex{0};
+    int m_computeTexWidth{0};
+    int m_computeTexHeight{0};
+    GLenum m_computeInternalFormat{GL_RGBA16F};
+    GLuint m_computeBindingUnit{0};
+    std::unique_ptr<QOpenGLFramebufferObject> m_offscreenFbo{nullptr};
+    std::array<std::array<std::unique_ptr<QOpenGLFramebufferObject>, 2>, 4> m_bufferPassFbos{};
+    int m_bufferPingPongIdx{0};
+    std::array<std::unique_ptr<QOpenGLShaderProgram>, 4> m_bufferPassPrograms{};
+    std::unique_ptr<QOpenGLShaderProgram> m_shaderProgram{nullptr};
+    std::unique_ptr<QOpenGLShaderProgram> m_computeShaderProgram{nullptr};
+
+    QOpenGLVertexArrayObject m_quadVao{};
+    QOpenGLBuffer m_quadVbo{QOpenGLBuffer::VertexBuffer};
+    std::unique_ptr<QOpenGLShaderProgram> m_blitProgram{nullptr};
+
+    QOpenGLVertexArrayObject m_gizmoVao{};
+    QOpenGLBuffer m_gizmoVbo{QOpenGLBuffer::VertexBuffer};
+    size_t m_gizmoVboCapacityBytes{0};
+    std::unique_ptr<QOpenGLShaderProgram> m_gizmoProgram{nullptr};
+    QMetaObject::Connection m_ctxDestroyConn{};
+};
+
+/**
+ * @brief Computes viewport display rects, Action Bar hit zones, and widget-to-texel mappings.
+ */
+class ViewportInputMapper {
+  public:
+    struct ActionBarLayout {
+        QRectF barRect{};
+        QRectF statusRect{};
+        QRectF monitorBtnRect{};
+        QRectF applyBtnRect{};
+        QRectF resetBtnRect{};
+        QRectF guideBtnRect{};
+        QRectF parallaxBtnRect{};
+        bool compact{false};
+        bool ultraCompact{false};
+        float scale{1.0f};
+        float gap{8.0f};
+    };
+
+    void updateLayout(const QSize &widgetSize) noexcept;
+    [[nodiscard]] const ActionBarLayout &layout() const noexcept { return m_layout; }
+    [[nodiscard]] ActionBarButton hitTestActionBar(const QPointF &pos,
+                                                   bool showActionBar) const noexcept;
+    [[nodiscard]] float calculateGuideAspect(AspectRatioGuide guide, const QSize &widgetSize) const noexcept;
+    [[nodiscard]] QRectF computeContentDisplayRect(const QSize &widgetSize, uint32_t contentW,
+                                                   uint32_t contentH, float zoom,
+                                                   const QPointF &panOffset) const noexcept;
+    [[nodiscard]] QPointF mapWidgetToContentTexel(const QPointF &widgetPos, const QSize &widgetSize,
+                                                  uint32_t contentW, uint32_t contentH,
+                                                  float zoom, const QPointF &panOffset,
+                                                  bool parallaxEnabled,
+                                                  const QMatrix4x4 &blitMvp) const noexcept;
+
+  private:
+    ActionBarLayout m_layout{};
+};
+
+/**
+ * @brief Executes weight-brush strokes, partition-of-unity rebalancing, and CoW undo snapshots.
+ */
+class WeightPaintBrushBridge {
+  public:
+    void beginStroke();
+    void applyDab(ViewportGizmoOverlay &overlay, uint32_t contentW, uint32_t contentH,
+                  const WeightBrushDab &dab);
+    void normalizeAllWeights(int32_t objectId, int32_t expectedObjectId,
+                             ViewportGizmoOverlay &overlay,
+                             const std::array<uint64_t, 2> &lockedBones,
+                             std::vector<VertexWeightBlockSnapshot> &outPreBlocks,
+                             std::vector<VertexWeightBlockSnapshot> &outPostBlocks,
+                             std::vector<waywal_ipc_vertex_weight_t> &outDirtyEntries);
+    [[nodiscard]] bool isBoneLocked(uint32_t boneIdx) const noexcept;
+    [[nodiscard]] static bool isBoneLockedInMask(const std::array<uint64_t, 2> &mask,
+                                                 uint32_t boneIdx) noexcept;
+
+    we_weight_brush_op_t m_op{WE_WEIGHT_OP_ADD};
+    float m_radiusPx{32.0f};
+    float m_strength{0.5f};
+    float m_targetValue{1.0f};
+    std::array<uint64_t, 2> m_lockedBoneMask{0ull, 0ull};
+    std::vector<WeightBrushDab> m_pendingDabs{};
+    std::unordered_map<uint32_t, VertexWeightBlockSnapshot> m_preBlocks{};
+    std::vector<uint32_t> m_dirtyVertices{};
 };
 
 class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
@@ -316,8 +475,11 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     void showEvent(QShowEvent *event) override;
     void hideEvent(QHideEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
+    void focusOutEvent(QFocusEvent *event) override;
 
   private:
+    friend class DmaBufSwapchain;
+    void releaseGlResources() noexcept;
     void resolveEglExtensions();
     void setupQuadGeometry();
     void initBlitShader();
@@ -333,6 +495,7 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     void recordWeightBrushDab(const QPointF &texel, float pressure, double tsSec);
     void flushWeightBrushDabBatch();
     void finishWeightPaintStroke();
+    void abortActiveInteractions() noexcept;
     [[nodiscard]] bool tryBeginRiggingDrag(const QPointF &widgetPos, Qt::KeyboardModifiers mods);
     void updateRiggingDrag(const QPointF &widgetPos, Qt::KeyboardModifiers mods);
     void finishRiggingDrag(const QPointF &widgetPos, Qt::KeyboardModifiers mods);
@@ -354,48 +517,18 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     QRectF computeContentDisplayRect() const noexcept;
     void updateFpsTelemetry();
 
-    enum class ActionBarButton {
-        None,
-        MonitorSelector,
-        ApplyButton,
-        ResetButton,
-        GuideButton,
-        ParallaxButton
-    };
     ActionBarButton hitTestActionBar(const QPointF &pos) const noexcept;
 
-    // EGL function pointers
-    PFNEGLCREATEIMAGEKHRPROC m_eglCreateImageKHR{nullptr};
-    PFNEGLDESTROYIMAGEKHRPROC m_eglDestroyImageKHR{nullptr};
-    PFNEGLCREATESYNCKHRPROC m_eglCreateSyncKHR{nullptr};
-    PFNEGLDESTROYSYNCKHRPROC m_eglDestroySyncKHR{nullptr};
-    PFNEGLWAITSYNCKHRPROC m_eglWaitSyncKHR{nullptr};
-    PFNEGLCLIENTWAITSYNCKHRPROC m_eglClientWaitSyncKHR{nullptr};
-    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC m_glEGLImageTargetTexture2DOES{nullptr};
-
-    EGLDisplay m_eglDisplay{EGL_NO_DISPLAY};
-    bool m_eglInitialized{false};
+    DmaBufSwapchain m_swapchain{};
+    GlSceneRenderer m_renderer{};
+    ViewportInputMapper m_inputMapper{};
+    WeightPaintBrushBridge m_weightBridge{};
 
     // State
     PreviewMode m_previewMode{PreviewMode::OfflineEmpty};
-    std::optional<DmaBufFrame> m_currentDmaBufFrame{};
-    std::mutex m_frameMutex{};
-
-    // Path B In-Process Fallback State
-    GLuint m_inProcessImageTex{0};
-    GLuint m_neutralPassTex{0};
-    GLuint m_computeOutputTex{0};
-    int m_computeTexWidth{0};
-    int m_computeTexHeight{0};
     QImage m_fallbackImage{};
     uint32_t m_imageWidth{0};
     uint32_t m_imageHeight{0};
-    std::unique_ptr<QOpenGLFramebufferObject> m_offscreenFbo{nullptr};
-    std::array<std::array<std::unique_ptr<QOpenGLFramebufferObject>, 2>, 4> m_bufferPassFbos{};
-    int m_bufferPingPongIdx{0};
-    std::array<std::unique_ptr<QOpenGLShaderProgram>, 4> m_bufferPassPrograms{};
-    std::unique_ptr<QOpenGLShaderProgram> m_shaderProgram{nullptr};
-    std::unique_ptr<QOpenGLShaderProgram> m_computeShaderProgram{nullptr};
     QString m_shaderSource{};
     std::unordered_map<std::string, ShaderUniformValue> m_customUniforms{};
     QElapsedTimer m_shaderTimer{};
@@ -404,15 +537,11 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     std::atomic<uint64_t> m_videoLoadGeneration{0};
     std::jthread m_videoThumbThread{};
 
-    // Quad rendering & Blit Program
-    QOpenGLVertexArrayObject m_quadVao{};
-    QOpenGLBuffer m_quadVbo{QOpenGLBuffer::VertexBuffer};
-    std::unique_ptr<QOpenGLShaderProgram> m_blitProgram{nullptr};
-
     // Viewport Navigation & 2.5D Parallax
     float m_zoom{1.0f};
     QPointF m_panOffset{0.0, 0.0};
     bool m_isPanning{false};
+    Qt::MouseButton m_panButton{Qt::NoButton};
     QPointF m_lastMousePos{0.0, 0.0};
 
     bool m_parallaxEnabled{false};
@@ -432,13 +561,6 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     QStringList m_availableMonitors{"DP-1", "HDMI-A-1", "All Monitors (Span)"};
     ActionBarButton m_hoveredButton{ActionBarButton::None};
 
-    QRectF m_actionBarRect{};
-    QRectF m_monitorBtnRect{};
-    QRectF m_applyBtnRect{};
-    QRectF m_resetBtnRect{};
-    QRectF m_guideBtnRect{};
-    QRectF m_parallaxBtnRect{};
-
     // Telemetry & Timers
     QLabel *m_fallbackCanvas{nullptr};
     QTimer *m_animationTimer{nullptr};
@@ -454,10 +576,6 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     // Authoring Gizmos & Brush Pointer State (lazy GL allocation on first active draw)
     CommandBus *m_commandBus{nullptr};
     ViewportGizmoOverlay m_gizmoOverlay{};
-    QOpenGLVertexArrayObject m_gizmoVao{};
-    QOpenGLBuffer m_gizmoVbo{QOpenGLBuffer::VertexBuffer};
-    size_t m_gizmoVboCapacityBytes{0};
-    std::unique_ptr<QOpenGLShaderProgram> m_gizmoProgram{nullptr};
     std::vector<GizmoVertex> m_gizmoVertices{};
     std::vector<GizmoVertex> m_heatmapVertices{};
     bool m_hasCustomSceneViewProj{false};
@@ -466,6 +584,8 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     QString m_activeGizmoNodeName{};
     SetLayerTransformCommand::TransformState m_dragStartTransform{};
     SetLayerTransformCommand::TransformState m_dragCurrentTransform{};
+    bool m_hasCameraOrLightsOverlay{false};
+    bool m_hasEmittersOverlay{false};
     bool m_hasGizmoEmittersOrLights{false};
     bool m_brushStrokeActive{false};
     QElapsedTimer m_brushClock{};
@@ -488,15 +608,8 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     QVector3D m_rigDragInitialBoneTail{0.0f, 0.0f, 0.0f};
     float m_rigDragStartAngleRad{0.0f};
     float m_rigDragInitialBoneAngleRad{0.0f};
-
-    we_weight_brush_op_t m_weightBrushOp{WE_WEIGHT_OP_ADD};
-    float m_weightBrushRadiusPx{32.0f};
-    float m_weightBrushStrength{0.5f};
-    float m_weightTargetValue{1.0f};
-    std::array<uint64_t, 2> m_lockedBoneMask{0ull, 0ull};
-    std::vector<WeightBrushDab> m_pendingWeightDabs{};
-    std::unordered_map<uint32_t, VertexWeightBlockSnapshot> m_weightPreBlocks{};
-    std::vector<uint32_t> m_weightDirtyVertices{};
+    float m_rigDragIkL1{0.0f};
+    float m_rigDragIkL2{0.0f};
 };
 
 } // namespace waywal::studio

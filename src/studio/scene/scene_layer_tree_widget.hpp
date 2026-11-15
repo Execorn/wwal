@@ -18,6 +18,7 @@
 #include <array>
 #include <cstdint>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace waywal::studio {
@@ -25,6 +26,15 @@ namespace waywal::studio {
 enum class SceneLayerViewMode : uint8_t {
     HierarchyTree = 0,   /* Parent-child transform hierarchy */
     FlatZOrderStack = 1, /* Pure back-to-front draw order (foreground on top) */
+};
+
+struct SceneLayerMovePlan {
+    int32_t objectId{-1};
+    int32_t oldParentId{-1};
+    int32_t newParentId{-1};
+    bool preserveWorldTransform{true};
+    std::vector<std::pair<int32_t, uint32_t>> oldZOrders;
+    std::vector<std::pair<int32_t, uint32_t>> newZOrders;
 };
 
 struct SceneLayerNode {
@@ -93,6 +103,7 @@ class SceneLayerTreeModel final : public QAbstractItemModel {
   signals:
     void reparentRequested(int32_t objectId, int32_t newParentId, bool preserveWorldTransform);
     void reorderZRequested(int32_t objectId, uint32_t newZOrderIndex);
+    void layerMoveRequested(const waywal::studio::SceneLayerMovePlan &plan);
 
   private:
     void rebuildIndexMaps();
@@ -143,6 +154,7 @@ class SceneLayerTreeWidget : public QWidget {
     void dispatchMutateIpc(const waywal_ipc_req_scene_mutate_t &req);
 
     bool m_uiInitialized{false};
+    int32_t m_selectedObjectId{-1};
     QString m_targetOutput{QStringLiteral("*")};
     CommandBus *m_commandBus{nullptr};
     IpcClient *m_ipcClient{nullptr};

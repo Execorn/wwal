@@ -64,6 +64,8 @@ class MeshEditCommand final : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
   private:
     QString m_description;
@@ -84,6 +86,8 @@ class BoneEditCommand final : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
   private:
     QString m_description;
@@ -107,6 +111,8 @@ class IkPoseCommand final : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
   private:
     int32_t m_objectId{-1};
@@ -132,6 +138,8 @@ class WeightPaintStrokeCommand final : public ICommand {
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
   private:
     int32_t m_objectId{-1};
@@ -154,6 +162,8 @@ class KeyframeEditCommand final : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
   private:
     int32_t m_objectId{-1};

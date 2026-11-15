@@ -28,7 +28,7 @@ struct ProjectedPoint {
         return {};
     }
     const QVector4D clip = viewProj.map(QVector4D(worldPos, 1.0f));
-    if (std::abs(clip.w()) < 1e-6f) {
+    if (!std::isfinite(clip.w()) || std::abs(clip.w()) < 1e-5f) {
         return {};
     }
     const float invW = 1.0f / clip.w();
@@ -36,6 +36,9 @@ struct ProjectedPoint {
     const float ndcY = clip.y() * invW;
     const float sx = (ndcX * 0.5f + 0.5f) * static_cast<float>(viewportSize.width());
     const float sy = (1.0f - (ndcY * 0.5f + 0.5f)) * static_cast<float>(viewportSize.height());
+    if (!std::isfinite(sx) || !std::isfinite(sy)) {
+        return {};
+    }
     return {true, QPointF(sx, sy)};
 }
 
@@ -43,7 +46,8 @@ struct ProjectedPoint {
                                       const QMatrix4x4 &invViewProj, QVector3D &outOrigin,
                                       QVector3D &outDir) noexcept
 {
-    if (viewportSize.width() <= 0 || viewportSize.height() <= 0) {
+    if (viewportSize.width() <= 0 || viewportSize.height() <= 0 ||
+        !std::isfinite(widgetPos.x()) || !std::isfinite(widgetPos.y())) {
         return false;
     }
     const float ndcX =
@@ -54,12 +58,18 @@ struct ProjectedPoint {
 
     const QVector4D nearH = invViewProj.map(QVector4D(ndcX, ndcY, -1.0f, 1.0f));
     const QVector4D farH = invViewProj.map(QVector4D(ndcX, ndcY, 1.0f, 1.0f));
-    if (std::abs(nearH.w()) < 1e-6f || std::abs(farH.w()) < 1e-6f) {
+    if (!std::isfinite(nearH.w()) || !std::isfinite(farH.w()) ||
+        std::abs(nearH.w()) < 1e-5f || std::abs(farH.w()) < 1e-5f) {
         return false;
     }
 
     outOrigin = nearH.toVector3DAffine();
     const QVector3D farPt = farH.toVector3DAffine();
+    if (!std::isfinite(outOrigin.x()) || !std::isfinite(outOrigin.y()) ||
+        !std::isfinite(outOrigin.z()) || !std::isfinite(farPt.x()) ||
+        !std::isfinite(farPt.y()) || !std::isfinite(farPt.z())) {
+        return false;
+    }
     const QVector3D dir = farPt - outOrigin;
     if (dir.lengthSquared() < 1e-9f) {
         return false;
@@ -168,10 +178,16 @@ struct ProjectedPoint {
     return std::clamp(ViewportGizmoOverlay::kHandleScreenRadiusPx / pxPerWorld, 0.05f, 5000.0f);
 }
 
+[[nodiscard]] bool isFiniteVec3(const QVector3D &v) noexcept
+{
+    return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
+}
+
 void pushLine(std::vector<GizmoVertex> &out, const QVector3D &a, const QVector3D &b, float r,
               float g, float bl, float al)
 {
-    if (out.size() + 2u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+    if (!isFiniteVec3(a) || !isFiniteVec3(b) ||
+        out.size() + 2u > ViewportGizmoOverlay::kMaxDynamicVertices) {
         return;
     }
     out.push_back({a.x(), a.y(), a.z(), r, g, bl, al});
@@ -182,7 +198,9 @@ void pushCircle(std::vector<GizmoVertex> &out, const QVector3D &center, const QV
                 const QVector3D &vAxis, float radius, int segments, float r, float g, float b,
                 float a)
 {
-    if (segments < 4 || radius <= 1e-4f) {
+    if (segments < 4 || !std::isfinite(radius) || radius <= 1e-4f ||
+        out.size() + static_cast<size_t>(segments) * 2u >
+            ViewportGizmoOverlay::kMaxDynamicVertices) {
         return;
     }
     QVector3D prev = center + uAxis * radius;
@@ -198,6 +216,9 @@ void pushCircle(std::vector<GizmoVertex> &out, const QVector3D &center, const QV
 void pushBoxWireframe(std::vector<GizmoVertex> &out, const QVector3D &minPt, const QVector3D &maxPt,
                       float r, float g, float b, float a)
 {
+    if (out.size() + 24u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+        return;
+    }
     const QVector3D c000(minPt.x(), minPt.y(), minPt.z());
     const QVector3D c100(maxPt.x(), minPt.y(), minPt.z());
     const QVector3D c110(maxPt.x(), maxPt.y(), minPt.z());
@@ -236,6 +257,10 @@ void activeNodeBBoxCorners(const SceneLayerNode &node, QVector3D &outMin,
 void pushOctoPrismBone(std::vector<GizmoVertex> &out, const QVector3D &head, const QVector3D &tail,
                        float r, float g, float b, float a)
 {
+    if (!isFiniteVec3(head) || !isFiniteVec3(tail) ||
+        out.size() + 24u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+        return;
+    }
     const QVector3D delta = tail - head;
     const float len = delta.length();
     if (len < 1e-3f) {
@@ -274,6 +299,9 @@ void pushOctoPrismBone(std::vector<GizmoVertex> &out, const QVector3D &head, con
 void pushDiamond2D(std::vector<GizmoVertex> &out, const QVector3D &center, float radius, float r,
                    float g, float b, float a)
 {
+    if (out.size() + 8u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+        return;
+    }
     const QVector3D n = center + QVector3D(0.0f, radius, 0.0f);
     const QVector3D s = center + QVector3D(0.0f, -radius, 0.0f);
     const QVector3D e = center + QVector3D(radius, 0.0f, 0.0f);
@@ -287,6 +315,9 @@ void pushDiamond2D(std::vector<GizmoVertex> &out, const QVector3D &center, float
 void pushReticle2D(std::vector<GizmoVertex> &out, const QVector3D &center, float radius, float r,
                    float g, float b, float a)
 {
+    if (out.size() + 36u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+        return;
+    }
     pushCircle(out, center, QVector3D(1.0f, 0.0f, 0.0f), QVector3D(0.0f, 1.0f, 0.0f), radius, 16, r,
                g, b, a);
     const float ext = radius * 1.35f;
@@ -317,8 +348,26 @@ void ViewportGizmoOverlay::setActiveNode(const SceneLayerNode *node)
         m_activeHandle = GizmoAxisHandle::None;
         return;
     }
+    const bool nodeChanged = !m_hasActiveNode || (m_activeNode.id != node->id);
     m_hasActiveNode = true;
     m_activeNode = *node;
+    auto sanitize = [](float v, float fallback) noexcept {
+        return std::isfinite(v) ? v : fallback;
+    };
+    for (int i = 0; i < 3; ++i) {
+        m_activeNode.origin[i] = sanitize(m_activeNode.origin[i], 0.0f);
+        m_activeNode.angles[i] = sanitize(m_activeNode.angles[i], 0.0f);
+        m_activeNode.scale[i] =
+            std::clamp(sanitize(m_activeNode.scale[i], 1.0f), -1000.0f, 1000.0f);
+    }
+    m_activeNode.size[0] = std::clamp(sanitize(m_activeNode.size[0], 0.0f), 0.0f, 65536.0f);
+    m_activeNode.size[1] = std::clamp(sanitize(m_activeNode.size[1], 0.0f), 0.0f, 65536.0f);
+    m_activeNode.parallaxDepth[0] = sanitize(m_activeNode.parallaxDepth[0], 0.0f);
+    m_activeNode.parallaxDepth[1] = sanitize(m_activeNode.parallaxDepth[1], 0.0f);
+    if (nodeChanged || m_activeNode.locked) {
+        m_dragging = false;
+        m_activeHandle = GizmoAxisHandle::None;
+    }
 }
 
 void ViewportGizmoOverlay::setCameraAndLights(const we_camera3d_t &cam,
@@ -656,7 +705,13 @@ RigPickResult ViewportGizmoOverlay::pickRiggingHandle(const QPointF &widgetPos,
 bool ViewportGizmoOverlay::beginDrag(const QPointF &widgetPos, const QSize &viewportSize,
                                      const QMatrix4x4 &viewProj)
 {
-    if (!m_hasActiveNode || m_activeNode.locked) {
+    if (!m_hasActiveNode || m_activeNode.locked || viewportSize.isEmpty() ||
+        !std::isfinite(widgetPos.x()) || !std::isfinite(widgetPos.y())) {
+        return false;
+    }
+    bool invertible = false;
+    (void)viewProj.inverted(&invertible);
+    if (!invertible) {
         return false;
     }
     const GizmoAxisHandle hit = pickHandle(widgetPos, viewportSize, viewProj);
@@ -681,7 +736,14 @@ ViewportGizmoOverlay::updateDrag(const QPointF &widgetPos, const QSize &viewport
                                  bool shiftAspectHeld) const noexcept
 {
     SetLayerTransformCommand::TransformState out = m_dragInitialTransform;
-    if (!m_dragging || m_activeHandle == GizmoAxisHandle::None) {
+    if (!m_dragging || m_activeHandle == GizmoAxisHandle::None || viewportSize.isEmpty() ||
+        !std::isfinite(widgetPos.x()) || !std::isfinite(widgetPos.y())) {
+        return out;
+    }
+
+    bool invertible = false;
+    const QMatrix4x4 invVP = viewProj.inverted(&invertible);
+    if (!invertible) {
         return out;
     }
 
@@ -689,9 +751,6 @@ ViewportGizmoOverlay::updateDrag(const QPointF &widgetPos, const QSize &viewport
     const bool lockAspect = shiftAspectHeld || m_snap.lockAspectRatio;
     const QVector3D origin0(m_dragInitialTransform.origin[0], m_dragInitialTransform.origin[1],
                             m_dragInitialTransform.origin[2]);
-
-    bool invertible = false;
-    const QMatrix4x4 invVP = viewProj.inverted(&invertible);
 
     if (m_toolMode == ViewportToolMode::Rotate || m_activeHandle == GizmoAxisHandle::RotateZ) {
         const ProjectedPoint pivot = projectWorldToWidget(origin0, viewportSize, viewProj);
@@ -831,30 +890,31 @@ ViewportGizmoOverlay::updateDrag(const QPointF &widgetPos, const QSize &viewport
         float factorZ = 1.0f;
 
         if (m_activeHandle == GizmoAxisHandle::AxisX) {
-            factorX =
-                std::max(0.01f, 1.0f + computeAxisDelta(QVector3D(1.0f, 0.0f, 0.0f)) / normDenom);
+            factorX = std::clamp(
+                1.0f + computeAxisDelta(QVector3D(1.0f, 0.0f, 0.0f)) / normDenom, 0.01f, 100.0f);
             if (lockAspect) {
                 factorY = factorX;
                 factorZ = factorX;
             }
         } else if (m_activeHandle == GizmoAxisHandle::AxisY) {
-            factorY =
-                std::max(0.01f, 1.0f + computeAxisDelta(QVector3D(0.0f, 1.0f, 0.0f)) / normDenom);
+            factorY = std::clamp(
+                1.0f + computeAxisDelta(QVector3D(0.0f, 1.0f, 0.0f)) / normDenom, 0.01f, 100.0f);
             if (lockAspect) {
                 factorX = factorY;
                 factorZ = factorY;
             }
         } else if (m_activeHandle == GizmoAxisHandle::AxisZ) {
-            factorZ =
-                std::max(0.01f, 1.0f + computeAxisDelta(QVector3D(0.0f, 0.0f, 1.0f)) / normDenom);
+            factorZ = std::clamp(
+                1.0f + computeAxisDelta(QVector3D(0.0f, 0.0f, 1.0f)) / normDenom, 0.01f, 100.0f);
             if (lockAspect) {
                 factorX = factorZ;
                 factorY = factorZ;
             }
         } else if (m_activeHandle == GizmoAxisHandle::PlaneXY) {
-            const QPointF dPx = widgetPos - m_dragStartWidgetPos;
-            const float uniform = std::max(0.01f, 1.0f + static_cast<float>(dPx.x() - dPx.y()) /
-                                                             kHandleScreenRadiusPx);
+            const QVector3D planeDelta = computeWorldDelta(QVector3D(0.0f, 0.0f, 1.0f));
+            const float uniform =
+                std::clamp(1.0f + 0.5f * (planeDelta.x() + planeDelta.y()) / normDenom, 0.01f,
+                           100.0f);
             factorX = uniform;
             factorY = uniform;
             if (lockAspect) {
@@ -862,14 +922,32 @@ ViewportGizmoOverlay::updateDrag(const QPointF &widgetPos, const QSize &viewport
             }
         }
 
-        out.scale[0] = m_dragInitialTransform.scale[0] * factorX;
-        out.scale[1] = m_dragInitialTransform.scale[1] * factorY;
-        out.scale[2] = m_dragInitialTransform.scale[2] * factorZ;
+        auto clampSignedScale = [](float v) noexcept {
+            if (!std::isfinite(v)) {
+                return 1.0f;
+            }
+            if (v >= 0.0f) {
+                return std::clamp(v, 0.001f, 1000.0f);
+            }
+            return std::clamp(v, -1000.0f, -0.001f);
+        };
+        out.scale[0] = clampSignedScale(m_dragInitialTransform.scale[0] * factorX);
+        out.scale[1] = clampSignedScale(m_dragInitialTransform.scale[1] * factorY);
+        out.scale[2] = clampSignedScale(m_dragInitialTransform.scale[2] * factorZ);
         if (snap) {
             const float step = std::max(0.01f, m_snap.scaleStep);
-            out.scale[0] = std::max(step, snapValue(out.scale[0], step));
-            out.scale[1] = std::max(step, snapValue(out.scale[1], step));
-            out.scale[2] = std::max(step, snapValue(out.scale[2], step));
+            out.scale[0] = std::clamp(snapValue(out.scale[0], step), -1000.0f, 1000.0f);
+            out.scale[1] = std::clamp(snapValue(out.scale[1], step), -1000.0f, 1000.0f);
+            out.scale[2] = std::clamp(snapValue(out.scale[2], step), -1000.0f, 1000.0f);
+            if (std::abs(out.scale[0]) < step) {
+                out.scale[0] = (m_dragInitialTransform.scale[0] < 0.0f) ? -step : step;
+            }
+            if (std::abs(out.scale[1]) < step) {
+                out.scale[1] = (m_dragInitialTransform.scale[1] < 0.0f) ? -step : step;
+            }
+            if (std::abs(out.scale[2]) < step) {
+                out.scale[2] = (m_dragInitialTransform.scale[2] < 0.0f) ? -step : step;
+            }
         }
         return out;
     }
@@ -912,7 +990,9 @@ void ViewportGizmoOverlay::buildRenderVertices(const QSize &viewportSize,
                                                std::vector<GizmoVertex> &outLineVerts) const
 {
     outLineVerts.clear();
-    outLineVerts.reserve(kMaxDynamicVertices);
+    if (outLineVerts.capacity() < 4096u) {
+        outLineVerts.reserve(4096u);
+    }
     (void)viewProj;
 
     const int vh = std::max(1, viewportSize.height());
@@ -988,6 +1068,18 @@ void ViewportGizmoOverlay::buildRenderVertices(const QSize &viewportSize,
             pushBoxWireframe(outLineVerts, yEnd - QVector3D(boxR, boxR, boxR),
                              yEnd + QVector3D(boxR, boxR, boxR), 0.133f, 0.773f, 0.369f, yHi);
             pushLine(outLineVerts, origin, zEnd, 0.220f, 0.741f, 0.973f, zHi);
+
+            const float q0 = 0.12f * s;
+            const float q1 = 0.34f * s;
+            const float pAlpha = (m_activeHandle == GizmoAxisHandle::PlaneXY) ? 1.0f : 0.75f;
+            const QVector3D pq0 = origin + QVector3D(q0, q0, 0.0f);
+            const QVector3D pq1 = origin + QVector3D(q1, q0, 0.0f);
+            const QVector3D pq2 = origin + QVector3D(q1, q1, 0.0f);
+            const QVector3D pq3 = origin + QVector3D(q0, q1, 0.0f);
+            pushLine(outLineVerts, pq0, pq1, 0.961f, 0.620f, 0.043f, pAlpha);
+            pushLine(outLineVerts, pq1, pq2, 0.961f, 0.620f, 0.043f, pAlpha);
+            pushLine(outLineVerts, pq2, pq3, 0.961f, 0.620f, 0.043f, pAlpha);
+            pushLine(outLineVerts, pq3, pq0, 0.961f, 0.620f, 0.043f, pAlpha);
         } else if (m_toolMode == ViewportToolMode::SelectBBox) {
             const float tick = 0.15f * s;
             pushLine(outLineVerts, bMin, bMin + QVector3D(tick, 0.0f, 0.0f), 0.961f, 0.620f, 0.043f,
@@ -1332,10 +1424,14 @@ void ViewportGizmoOverlay::buildHeatmapTriangleVertices(std::vector<GizmoVertex>
 
     const size_t vertCount = m_meshWireframe.vertices.size();
     const size_t triCount = m_meshWireframe.indices.size() / 3;
-    outTriVerts.reserve(triCount * 3);
+    outTriVerts.reserve(std::min<size_t>(triCount * 3, kMaxDynamicVertices));
     const float alpha = std::clamp(m_weightBrush.heatmapOpacity, 0.05f, 0.95f);
+    const QSize contentSize(static_cast<int>(m_contentWidth), static_cast<int>(m_contentHeight));
 
     for (size_t t = 0; t < triCount; ++t) {
+        if (outTriVerts.size() + 3u > kMaxDynamicVertices) {
+            break;
+        }
         const uint16_t i0 = m_meshWireframe.indices[t * 3 + 0];
         const uint16_t i1 = m_meshWireframe.indices[t * 3 + 1];
         const uint16_t i2 = m_meshWireframe.indices[t * 3 + 2];
@@ -1343,17 +1439,29 @@ void ViewportGizmoOverlay::buildHeatmapTriangleVertices(std::vector<GizmoVertex>
             continue;
         }
         const std::array<uint16_t, 3> tri{i0, i1, i2};
-        for (uint16_t idx : tri) {
-            const auto &v = m_meshWireframe.vertices[idx];
+        std::array<GizmoVertex, 3> triVerts{};
+        bool finiteTri = true;
+        for (size_t c = 0; c < 3; ++c) {
+            const auto &v = m_meshWireframe.vertices[tri[c]];
+            const QVector3D wp = puppetLocalToCanvasWorld(
+                QVector3D(v.pos[0], v.pos[1], v.pos[2]), contentSize);
+            if (!isFiniteVec3(wp)) {
+                finiteTri = false;
+                break;
+            }
             const float w = evalBoneWeightForVertex(v, m_weightBrush.activeBoneIndex);
             float r = 0.0f;
             float g = 0.0f;
             float b = 0.0f;
             evaluateHeatmapColor(m_weightBrush.palette, w, r, g, b);
-            const QVector3D wp =
-                puppetLocalToCanvasWorld(QVector3D(v.pos[0], v.pos[1], v.pos[2]), QSize());
-            outTriVerts.push_back({wp.x(), wp.y(), wp.z(), r, g, b, alpha});
+            triVerts[c] = {wp.x(), wp.y(), wp.z(), r, g, b, alpha};
         }
+        if (!finiteTri) {
+            continue;
+        }
+        outTriVerts.push_back(triVerts[0]);
+        outTriVerts.push_back(triVerts[1]);
+        outTriVerts.push_back(triVerts[2]);
     }
 }
 

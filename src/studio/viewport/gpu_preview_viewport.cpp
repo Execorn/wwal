@@ -8,6 +8,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QMouseEvent>
+#include <QFocusEvent>
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QTabletEvent>
@@ -26,10 +27,13 @@
 #include <QDebug>
 #include <QtMath>
 #include <cmath>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <errno.h>
 #include <filesystem>
 #include <fstream>
+#include <poll.h>
 #include <sstream>
 #include <unistd.h>
 #include <fcntl.h>
@@ -40,6 +44,7 @@
 
 extern "C" {
 #include <waywal/image_loader.h>
+#include <waywal/thumb_cache.h>
 }
 
 namespace waywal::studio {
@@ -345,6 +350,181 @@ using GlDispatchComputeProc = void (*)(GLuint num_groups_x, GLuint num_groups_y,
                                        GLuint num_groups_z);
 using GlMemoryBarrierProc = void (*)(GLbitfield barriers);
 
+bool readExactFd(int fd, void *dst, size_t len, int timeoutMs) noexcept
+{
+    uint8_t *out = static_cast<uint8_t *>(dst);
+    size_t offset = 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeoutMs));
+    while (offset < len) {
+        const ssize_t n = ::read(fd, out + offset, len - offset);
+        if (n > 0) {
+            offset += static_cast<size_t>(n);
+            continue;
+        }
+        if (n == 0) {
+            return false;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+        const int remMs = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+        struct pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        const int pr = ::poll(&pfd, 1, std::max(1, remMs));
+        if (pr < 0 && errno == EINTR) {
+            continue;
+        }
+        if (pr <= 0 || (pfd.revents & (POLLERR | POLLNVAL)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool drainFd(int fd, size_t len, int timeoutMs) noexcept
+{
+    std::array<uint8_t, 512> scratch{};
+    size_t remaining = len;
+    while (remaining > 0) {
+        const size_t chunk = std::min(remaining, scratch.size());
+        if (!readExactFd(fd, scratch.data(), chunk, timeoutMs)) {
+            return false;
+        }
+        remaining -= chunk;
+    }
+    return true;
+}
+
+[[nodiscard]] bool isComputeShaderSource(const QString &src)
+{
+    static const QRegularExpression kLocalSizeRe(
+        QStringLiteral(R"(^\s*layout\s*\([^)]*\blocal_size_x\b)"),
+        QRegularExpression::MultilineOption);
+    static const QRegularExpression kImageStoreRe(QStringLiteral(R"(\bimageStore\b)"));
+    return kLocalSizeRe.match(src).hasMatch() && kImageStoreRe.match(src).hasMatch();
+}
+
+void parseComputeMetadata(const QString &src, GLuint &outBinding, GLenum &outFormat)
+{
+    outBinding = 0u;
+    outFormat = GL_RGBA16F;
+    static const QRegularExpression kBindingRe(
+        QStringLiteral(R"(layout\s*\(([^)]*)\)\s*(?:[A-Za-z0-9_]+\s+)*image2D\b)"));
+    static const QRegularExpression kBindNumRe(QStringLiteral(R"(\bbinding\s*=\s*(\d+))"));
+    QRegularExpressionMatchIterator it = kBindingRe.globalMatch(src);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        const QString quals = m.captured(1);
+        const QRegularExpressionMatch bm = kBindNumRe.match(quals);
+        if (bm.hasMatch()) {
+            bool ok = false;
+            const uint unit = bm.captured(1).toUInt(&ok);
+            if (ok && unit < 8u) {
+                outBinding = unit;
+            }
+        }
+        if (quals.contains(QLatin1String("rgba8"), Qt::CaseInsensitive) &&
+            !quals.contains(QLatin1String("rgba16f"), Qt::CaseInsensitive)) {
+            outFormat = GL_RGBA8;
+        } else if (quals.contains(QLatin1String("rgba16f"), Qt::CaseInsensitive)) {
+            outFormat = GL_RGBA16F;
+        }
+        break;
+    }
+}
+
+[[nodiscard]] QString buildShadertoySource(const QString &rawSrc, bool isGles)
+{
+    const char *preamble = isGles ? kShadertoyPreamble : kShadertoyPreambleCore;
+    if (!rawSrc.contains(QLatin1String("#version"))) {
+        return QString::fromUtf8(preamble) + rawSrc + QString::fromUtf8(kShadertoyEpilogue);
+    }
+
+    // Keep user #version and #extension at the top to prevent duplicate #version errors.
+    static const QRegularExpression kVersionOrExtRe(
+        QStringLiteral(R"(^\s*#\s*(version|extension)\b[^\n]*(?:\n|$))"),
+        QRegularExpression::MultilineOption);
+    QString head;
+    QString body = rawSrc;
+    qsizetype offset = 0;
+    while (offset < body.size()) {
+        const QRegularExpressionMatch m = kVersionOrExtRe.match(body, offset);
+        if (m.hasMatch() && m.capturedStart() == offset) {
+            head += m.captured(0);
+            offset = m.capturedEnd();
+        } else if (body.at(offset).isSpace()) {
+            head += body.at(offset);
+            ++offset;
+        } else {
+            break;
+        }
+    }
+    body = body.mid(offset);
+
+    QString uniformBlock = QString::fromUtf8(preamble);
+    const qsizetype verEnd = uniformBlock.indexOf(QLatin1Char('\n'));
+    if (verEnd >= 0) {
+        uniformBlock = uniformBlock.mid(verEnd + 1);
+    }
+    QString assembled = head + QLatin1Char('\n') + uniformBlock + body;
+    if (!isGles) {
+        assembled = convertEsFragmentToCore330(assembled);
+    }
+    return assembled + QString::fromUtf8(kShadertoyEpilogue);
+}
+
+void zeroFillTexture2D(GLuint tex, int width, int height, bool isHalfFloat)
+{
+    auto *ctx = QOpenGLContext::currentContext();
+    if (!ctx || tex == 0 || width <= 0 || height <= 0) {
+        return;
+    }
+    auto *gl = ctx->functions();
+    gl->glBindTexture(GL_TEXTURE_2D, tex);
+    gl->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+#ifdef GL_UNPACK_ROW_LENGTH
+    gl->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
+    const size_t texels = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (isHalfFloat) {
+        std::vector<uint16_t> zeroBuf(texels * 4u, 0u);
+        gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_HALF_FLOAT,
+                            zeroBuf.data());
+    } else {
+        std::vector<uint8_t> zeroBuf(texels * 4u, 0u);
+        gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
+                            zeroBuf.data());
+    }
+    gl->glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+[[nodiscard]] bool validateRgbaImageBounds(uint32_t w, uint32_t h, int &outStride) noexcept
+{
+    if (w == 0u || h == 0u || w > 65536u || h > 65536u) {
+        return false;
+    }
+    const uint64_t stride = static_cast<uint64_t>(w) * 4ull;
+    const uint64_t maxInt = static_cast<uint64_t>(std::numeric_limits<int>::max());
+    if (stride > maxInt || static_cast<uint64_t>(h) > maxInt) {
+        return false;
+    }
+    if (stride > (maxInt / static_cast<uint64_t>(h))) {
+        return false;
+    }
+    outStride = static_cast<int>(stride);
+    return true;
+}
+
 } // namespace
 
 void DmaBufFrame::closeFds() noexcept
@@ -361,7 +541,9 @@ void DmaBufFrame::releaseGl(EGLDisplay dpy, PFNEGLDESTROYIMAGEKHRPROC destroyIma
                             PFNEGLDESTROYSYNCKHRPROC destroySync) noexcept
 {
     if (glTexture != 0) {
-        glDeleteTextures(1, &glTexture);
+        if (auto *ctx = QOpenGLContext::currentContext()) {
+            ctx->functions()->glDeleteTextures(1, &glTexture);
+        }
         glTexture = 0;
     }
     if (eglImage != EGL_NO_IMAGE_KHR && destroyImage && dpy != EGL_NO_DISPLAY) {
@@ -373,6 +555,1424 @@ void DmaBufFrame::releaseGl(EGLDisplay dpy, PFNEGLDESTROYIMAGEKHRPROC destroyIma
         syncFence = EGL_NO_SYNC_KHR;
     }
     closeFds();
+}
+
+void DmaBufSwapchain::resolveEglExtensions() noexcept
+{
+    if (m_eglInitialized) {
+        return;
+    }
+
+    m_eglDisplay = eglGetCurrentDisplay();
+    if (m_eglDisplay == EGL_NO_DISPLAY) {
+        return;
+    }
+
+    auto getProc = [](const char *name) -> void * {
+        void *p = reinterpret_cast<void *>(eglGetProcAddress(name));
+        if (!p && QOpenGLContext::currentContext()) {
+            p = reinterpret_cast<void *>(QOpenGLContext::currentContext()->getProcAddress(name));
+        }
+        return p;
+    };
+
+    m_eglCreateImageKHR = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(getProc("eglCreateImageKHR"));
+    m_eglDestroyImageKHR =
+        reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(getProc("eglDestroyImageKHR"));
+    m_eglCreateSyncKHR = reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(getProc("eglCreateSyncKHR"));
+    m_eglDestroySyncKHR = reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(getProc("eglDestroySyncKHR"));
+    m_eglWaitSyncKHR = reinterpret_cast<PFNEGLWAITSYNCKHRPROC>(getProc("eglWaitSyncKHR"));
+    m_eglClientWaitSyncKHR =
+        reinterpret_cast<PFNEGLCLIENTWAITSYNCKHRPROC>(getProc("eglClientWaitSyncKHR"));
+    m_glEGLImageTargetTexture2DOES = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+        getProc("glEGLImageTargetTexture2DOES"));
+
+    m_eglInitialized =
+        (m_eglCreateImageKHR != nullptr && m_glEGLImageTargetTexture2DOES != nullptr);
+}
+
+void DmaBufSwapchain::releaseGl() noexcept
+{
+    std::lock_guard<std::mutex> lock(m_frameMutex);
+    if (m_currentFrame.has_value()) {
+        m_currentFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR, m_eglDestroySyncKHR);
+        m_currentFrame.reset();
+    }
+    m_eglInitialized = false;
+    m_eglDisplay = EGL_NO_DISPLAY;
+}
+
+void DmaBufSwapchain::closeFds() noexcept
+{
+    std::lock_guard<std::mutex> lock(m_frameMutex);
+    if (m_currentFrame.has_value()) {
+        m_currentFrame->closeFds();
+        m_currentFrame.reset();
+    }
+}
+
+bool DmaBufSwapchain::hasLiveFrame() const noexcept
+{
+    std::lock_guard<std::mutex> lock(m_frameMutex);
+    return m_currentFrame.has_value();
+}
+
+uint32_t DmaBufSwapchain::frameWidth() const noexcept
+{
+    std::lock_guard<std::mutex> lock(m_frameMutex);
+    return m_currentFrame.has_value() ? m_currentFrame->width : 0u;
+}
+
+uint32_t DmaBufSwapchain::frameHeight() const noexcept
+{
+    std::lock_guard<std::mutex> lock(m_frameMutex);
+    return m_currentFrame.has_value() ? m_currentFrame->height : 0u;
+}
+
+GLuint DmaBufSwapchain::currentTexture(int &outIsBgr) const noexcept
+{
+    std::lock_guard<std::mutex> lock(m_frameMutex);
+    if (!m_currentFrame.has_value()) {
+        outIsBgr = 0;
+        return 0u;
+    }
+    const uint32_t fmt = m_currentFrame->drm_format;
+    bool bgr = (fmt == DRM_FORMAT_XBGR8888 || fmt == DRM_FORMAT_ABGR8888);
+#ifdef DRM_FORMAT_XBGR2101010
+    bgr = bgr || (fmt == DRM_FORMAT_XBGR2101010);
+#endif
+#ifdef DRM_FORMAT_ABGR2101010
+    bgr = bgr || (fmt == DRM_FORMAT_ABGR2101010);
+#endif
+#ifdef DRM_FORMAT_XBGR16161616F
+    bgr = bgr || (fmt == DRM_FORMAT_XBGR16161616F);
+#endif
+#ifdef DRM_FORMAT_ABGR16161616F
+    bgr = bgr || (fmt == DRM_FORMAT_ABGR16161616F);
+#endif
+    outIsBgr = bgr ? 1 : 0;
+    return m_currentFrame->glTexture;
+}
+
+bool DmaBufSwapchain::importFrame(GpuPreviewViewport &vp, const waywal_dmabuf_frame_desc_t &desc,
+                                  const int *planeFds, size_t numFds)
+{
+    auto cleanupIncomingFds = [planeFds, numFds]() {
+        if (!planeFds) {
+            return;
+        }
+        for (size_t i = 0; i < numFds; ++i) {
+            if (planeFds[i] >= 0) {
+                ::close(planeFds[i]);
+            }
+        }
+    };
+
+    if (desc.width == 0 || desc.height == 0 || desc.width > 16384u || desc.height > 16384u ||
+        numFds == 0 || !planeFds) {
+        cleanupIncomingFds();
+        emit vp.dmaBufImportFailed(
+            QStringLiteral("Invalid DMA-BUF parameters: dimensions out of bounds or no FDs"));
+        return false;
+    }
+
+    const uint32_t planesToImport =
+        std::min({static_cast<uint32_t>(numFds), desc.num_planes > 0 ? desc.num_planes : 1u, 4u});
+    for (uint32_t p = 0; p < planesToImport; ++p) {
+        if (planeFds[p] < 0 || desc.strides[p] == 0) {
+            cleanupIncomingFds();
+            emit vp.dmaBufImportFailed(
+                QStringLiteral("Invalid DMA-BUF plane descriptor or zero stride"));
+            return false;
+        }
+    }
+
+    GlContextScope glScope(&vp);
+    if (!glScope.isReady() || !QOpenGLContext::currentContext()) {
+        cleanupIncomingFds();
+        emit vp.dmaBufImportFailed(QStringLiteral("OpenGL context is not yet realized"));
+        return false;
+    }
+    resolveEglExtensions();
+
+    if (!m_eglCreateImageKHR || !m_glEGLImageTargetTexture2DOES) {
+        cleanupIncomingFds();
+        emit vp.dmaBufImportFailed(QStringLiteral(
+            "Missing EGL DMA-BUF extensions (eglCreateImageKHR / glEGLImageTargetTexture2DOES)"));
+        return false;
+    }
+
+    std::array<EGLint, 64> attribs{};
+    size_t n = 0;
+    auto pushAttr = [&](EGLint k, EGLint v) -> bool {
+        if (n + 2u >= attribs.size()) {
+            return false;
+        }
+        attribs[n++] = k;
+        attribs[n++] = v;
+        return true;
+    };
+
+    bool attrsOk = pushAttr(EGL_WIDTH, static_cast<EGLint>(desc.width)) &&
+                   pushAttr(EGL_HEIGHT, static_cast<EGLint>(desc.height)) &&
+                   pushAttr(EGL_LINUX_DRM_FOURCC_EXT, static_cast<EGLint>(desc.drm_format));
+
+    for (uint32_t p = 0; attrsOk && p < planesToImport; ++p) {
+        attrsOk = pushAttr(kPlaneFdKeys[p], planeFds[p]) &&
+                  pushAttr(kPlaneOffsetKeys[p], static_cast<EGLint>(desc.offsets[p])) &&
+                  pushAttr(kPlanePitchKeys[p], static_cast<EGLint>(desc.strides[p]));
+        if (attrsOk && desc.modifier != DRM_FORMAT_MOD_INVALID) {
+            attrsOk =
+                pushAttr(kPlaneModLoKeys[p], static_cast<EGLint>(desc.modifier & 0xFFFFFFFFULL)) &&
+                pushAttr(kPlaneModHiKeys[p],
+                         static_cast<EGLint>((desc.modifier >> 32) & 0xFFFFFFFFULL));
+        }
+    }
+    if (!attrsOk || n >= attribs.size()) {
+        cleanupIncomingFds();
+        emit vp.dmaBufImportFailed(QStringLiteral("EGL DMA-BUF attribute list overflow"));
+        return false;
+    }
+    attribs[n] = EGL_NONE;
+
+    EGLImageKHR img = m_eglCreateImageKHR(m_eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
+                                          nullptr, attribs.data());
+    if (img == EGL_NO_IMAGE_KHR) {
+        const EGLint err = eglGetError();
+        cleanupIncomingFds();
+        emit vp.dmaBufImportFailed(
+            QStringLiteral("eglCreateImageKHR failed with error 0x%1").arg(err, 0, 16));
+        return false;
+    }
+
+    auto *gl = QOpenGLContext::currentContext()->functions();
+    while (gl->glGetError() != GL_NO_ERROR) {
+    }
+    GLuint tex = 0;
+    gl->glGenTextures(1, &tex);
+    gl->glBindTexture(GL_TEXTURE_2D, tex);
+    m_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, static_cast<GLeglImageOES>(img));
+    const GLenum targetErr = gl->glGetError();
+    if (targetErr != GL_NO_ERROR) {
+        gl->glBindTexture(GL_TEXTURE_2D, 0);
+        if (tex != 0) {
+            gl->glDeleteTextures(1, &tex);
+        }
+        if (m_eglDestroyImageKHR && m_eglDisplay != EGL_NO_DISPLAY) {
+            m_eglDestroyImageKHR(m_eglDisplay, img);
+        }
+        cleanupIncomingFds();
+        emit vp.dmaBufImportFailed(
+            QStringLiteral("glEGLImageTargetTexture2DOES failed (GL error 0x%1)")
+                .arg(targetErr, 0, 16));
+        return false;
+    }
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl->glBindTexture(GL_TEXTURE_2D, 0);
+
+    DmaBufFrame newFrame;
+    newFrame.width = desc.width;
+    newFrame.height = desc.height;
+    newFrame.drm_format = desc.drm_format;
+    newFrame.modifier = desc.modifier;
+    newFrame.num_planes = planesToImport;
+    newFrame.flags = desc.flags;
+    newFrame.outputName = QString::fromUtf8(desc.output);
+    newFrame.eglImage = img;
+    newFrame.glTexture = tex;
+    newFrame.syncFence = EGL_NO_SYNC_KHR;
+
+    for (uint32_t p = 0; p < 4; ++p) {
+        if (p < planesToImport) {
+            newFrame.planes[p].fd = planeFds[p];
+            newFrame.planes[p].stride = desc.strides[p];
+            newFrame.planes[p].offset = desc.offsets[p];
+        } else {
+            newFrame.planes[p].fd = -1;
+        }
+    }
+
+    for (size_t extra = planesToImport; extra < numFds; ++extra) {
+        if (planeFds[extra] >= 0) {
+            ::close(planeFds[extra]);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_frameMutex);
+        if (m_currentFrame.has_value()) {
+            m_currentFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR, m_eglDestroySyncKHR);
+        }
+        m_currentFrame = std::move(newFrame);
+    }
+
+    vp.m_previewMode = PreviewMode::DmaBufLive;
+    vp.m_frameCount++;
+    vp.updateAnimationTimerState();
+    emit vp.dmaBufFrameRendered(desc.width, desc.height, vp.m_frameCount);
+    vp.update();
+    return true;
+}
+
+bool DmaBufSwapchain::requestFromSocket(GpuPreviewViewport &vp, int socketFd,
+                                        const QString &outputName)
+{
+    if (socketFd < 0) {
+        return false;
+    }
+
+    waywal_ipc_hdr_t reqHdr{};
+    reqHdr.magic = WAYWAL_IPC_MAGIC;
+    reqHdr.version = WAYWAL_IPC_VERSION;
+    reqHdr.opcode = WAYWAL_REQ_EXPORT_OUTPUT_DMABUF;
+    reqHdr.payload_size = sizeof(waywal_export_dmabuf_req_t);
+
+    waywal_export_dmabuf_req_t reqPay{};
+    if (!outputName.isEmpty()) {
+        const QByteArray utf8 = outputName.toUtf8();
+        const size_t n = std::min<size_t>(static_cast<size_t>(utf8.size()),
+                                          sizeof(reqPay.output) - 1u);
+        std::memcpy(reqPay.output, utf8.constData(), n);
+        reqPay.output[n] = '\0';
+    }
+
+    if (!waywal_ipc_send_payload_fds(socketFd, &reqHdr, &reqPay, sizeof(reqPay), nullptr, 0)) {
+        return false;
+    }
+
+    waywal_ipc_hdr_t respHdr{};
+    int fds[4] = {-1, -1, -1, -1};
+    size_t numFds = 0;
+    if (!waywal_ipc_recv_fds(socketFd, &respHdr, fds, 4, &numFds)) {
+        return false;
+    }
+    auto closeAll = [&fds, numFds]() {
+        for (size_t i = 0; i < numFds && i < 4u; ++i) {
+            if (fds[i] >= 0) {
+                ::close(fds[i]);
+                fds[i] = -1;
+            }
+        }
+    };
+
+    if (respHdr.magic != WAYWAL_IPC_MAGIC ||
+        (respHdr.opcode != WAYWAL_RESP_OK && respHdr.opcode != WAYWAL_RESP_DMABUF) ||
+        respHdr.payload_size < sizeof(waywal_export_dmabuf_resp_t) ||
+        respHdr.payload_size > 65536u) {
+        if (respHdr.payload_size > 0u && respHdr.payload_size <= 65536u) {
+            (void)drainFd(socketFd, respHdr.payload_size, 200);
+        }
+        closeAll();
+        return false;
+    }
+
+    waywal_export_dmabuf_resp_t respPay{};
+    if (!readExactFd(socketFd, &respPay, sizeof(respPay), 500)) {
+        closeAll();
+        return false;
+    }
+    if (respHdr.payload_size > sizeof(respPay)) {
+        (void)drainFd(socketFd, respHdr.payload_size - sizeof(respPay), 200);
+    }
+
+    return importFrame(vp, respPay, fds, numFds);
+}
+
+bool DmaBufSwapchain::requestFromNamespace(GpuPreviewViewport &vp, const QString &namespaceStr,
+                                           const QString &outputName)
+{
+    path_buf_t sockPath;
+    if (!waywal_ipc_resolve_socket_path(&sockPath, namespaceStr.toUtf8().constData())) {
+        return false;
+    }
+    const int clientFd = waywal_ipc_client_connect(namespaceStr.toUtf8().constData(), 200);
+    if (clientFd < 0) {
+        return false;
+    }
+    const bool ok = requestFromSocket(vp, clientFd, outputName);
+    ::close(clientFd);
+    return ok;
+}
+
+void GlSceneRenderer::releaseGl(bool hasCurrentContext) noexcept
+{
+    QObject::disconnect(m_ctxDestroyConn);
+    m_ctxDestroyConn = {};
+
+    auto *ctx = QOpenGLContext::currentContext();
+    const bool glAlive = hasCurrentContext && (ctx != nullptr);
+    if (glAlive) {
+        auto *gl = ctx->functions();
+        if (m_inProcessImageTex != 0) {
+            gl->glDeleteTextures(1, &m_inProcessImageTex);
+        }
+        if (m_neutralPassTex != 0) {
+            gl->glDeleteTextures(1, &m_neutralPassTex);
+        }
+        if (m_computeOutputTex != 0) {
+            gl->glDeleteTextures(1, &m_computeOutputTex);
+        }
+        m_quadVao.destroy();
+        m_quadVbo.destroy();
+        m_gizmoVao.destroy();
+        m_gizmoVbo.destroy();
+    }
+
+    m_inProcessImageTex = 0;
+    m_neutralPassTex = 0;
+    m_computeOutputTex = 0;
+    m_computeTexWidth = 0;
+    m_computeTexHeight = 0;
+    m_computeInternalFormat = GL_RGBA16F;
+    m_computeBindingUnit = 0u;
+    m_gizmoVboCapacityBytes = 0;
+    m_bufferPingPongIdx = 0;
+
+    m_blitProgram.reset();
+    m_gizmoProgram.reset();
+    m_shaderProgram.reset();
+    m_computeShaderProgram.reset();
+    for (auto &prog : m_bufferPassPrograms) {
+        prog.reset();
+    }
+    for (auto &pair : m_bufferPassFbos) {
+        pair[0].reset();
+        pair[1].reset();
+    }
+    m_offscreenFbo.reset();
+}
+
+void GlSceneRenderer::deleteInProcessImageTexture() noexcept
+{
+    if (m_inProcessImageTex != 0) {
+        if (auto *ctx = QOpenGLContext::currentContext()) {
+            ctx->functions()->glDeleteTextures(1, &m_inProcessImageTex);
+        }
+        m_inProcessImageTex = 0;
+    }
+}
+
+void GlSceneRenderer::uploadFallbackImageTexture(const QImage &image)
+{
+    auto *ctx = QOpenGLContext::currentContext();
+    if (!ctx || image.isNull()) {
+        return;
+    }
+    const QImage formatted = image.convertToFormat(QImage::Format_RGBA8888);
+    if (formatted.isNull()) {
+        return;
+    }
+    auto *gl = ctx->functions();
+    gl->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+#ifdef GL_UNPACK_ROW_LENGTH
+    gl->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
+    if (m_inProcessImageTex == 0) {
+        gl->glGenTextures(1, &m_inProcessImageTex);
+    }
+    gl->glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
+    gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, formatted.constBits());
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl->glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void GlSceneRenderer::setupQuadGeometry()
+{
+    auto *ctx = QOpenGLContext::currentContext();
+    if (!ctx) {
+        return;
+    }
+    auto *gl = ctx->functions();
+    if (!m_quadVao.isCreated()) {
+        m_quadVao.create();
+    }
+    m_quadVao.bind();
+    if (!m_quadVbo.isCreated()) {
+        m_quadVbo.create();
+    }
+    m_quadVbo.bind();
+    m_quadVbo.allocate(kQuadVertices, sizeof(kQuadVertices));
+
+    gl->glEnableVertexAttribArray(0);
+    gl->glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+                              reinterpret_cast<void *>(offsetof(Vertex, x)));
+    gl->glEnableVertexAttribArray(1);
+    gl->glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+                              reinterpret_cast<void *>(offsetof(Vertex, u)));
+    m_quadVao.release();
+    m_quadVbo.release();
+}
+
+void GlSceneRenderer::initBlitShader(QObject *parent)
+{
+    (void)parent;
+    const bool isGles =
+        QOpenGLContext::currentContext() && QOpenGLContext::currentContext()->isOpenGLES();
+    const char *vsSrc = isGles ? kBlitVertexShader : kBlitVertexShaderCore;
+    const char *fsSrc = isGles ? kBlitFragmentShader : kBlitFragmentShaderCore;
+
+    m_blitProgram = std::make_unique<QOpenGLShaderProgram>();
+    if (!m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, vsSrc) ||
+        !m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, fsSrc) ||
+        !m_blitProgram->link()) {
+        m_blitProgram = std::make_unique<QOpenGLShaderProgram>();
+        if (!m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, kBlitVertexShaderCore) ||
+            !m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Fragment,
+                                                    kBlitFragmentShaderCore) ||
+            !m_blitProgram->link()) {
+            qWarning() << "[GpuPreviewViewport] Failed to compile/link blit shader:"
+                       << m_blitProgram->log();
+        }
+    }
+}
+
+void GlSceneRenderer::ensureNeutralPassTexture()
+{
+    if (m_neutralPassTex != 0) {
+        return;
+    }
+    auto *ctx = QOpenGLContext::currentContext();
+    if (!ctx) {
+        return;
+    }
+    auto *gl = ctx->functions();
+    static constexpr uint8_t kNeutralPixel[4] = {28, 34, 48, 255};
+    gl->glGenTextures(1, &m_neutralPassTex);
+    gl->glBindTexture(GL_TEXTURE_2D, m_neutralPassTex);
+    gl->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+#ifdef GL_UNPACK_ROW_LENGTH
+    gl->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
+    gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, kNeutralPixel);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl->glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void GlSceneRenderer::ensureOffscreenFbo(int w, int h)
+{
+    const int targetW = std::clamp(w, 64, 7680);
+    const int targetH = std::clamp(h, 64, 4320);
+    if (m_offscreenFbo && m_offscreenFbo->size() == QSize(targetW, targetH)) {
+        return;
+    }
+    QOpenGLFramebufferObjectFormat fboFmt;
+    fboFmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
+    fboFmt.setTextureTarget(GL_TEXTURE_2D);
+    fboFmt.setInternalTextureFormat(GL_RGBA16F);
+    auto nextFbo = std::make_unique<QOpenGLFramebufferObject>(targetW, targetH, fboFmt);
+    bool isHalfFloat = true;
+    if (!nextFbo->isValid()) {
+        fboFmt.setInternalTextureFormat(GL_RGBA8);
+        nextFbo = std::make_unique<QOpenGLFramebufferObject>(targetW, targetH, fboFmt);
+        isHalfFloat = false;
+    }
+    if (nextFbo->isValid()) {
+        zeroFillTexture2D(nextFbo->texture(), targetW, targetH, isHalfFloat);
+    }
+    m_offscreenFbo = std::move(nextFbo);
+}
+
+void GlSceneRenderer::ensureBufferPassFbos(int w, int h)
+{
+    const int targetW = std::clamp(w, 64, 7680);
+    const int targetH = std::clamp(h, 64, 4320);
+    auto *ctx = QOpenGLContext::currentContext();
+    auto *gl = ctx ? ctx->functions() : nullptr;
+
+    for (size_t i = 0; i < 4; ++i) {
+        if (!m_bufferPassPrograms[i]) {
+            m_bufferPassFbos[i][0].reset();
+            m_bufferPassFbos[i][1].reset();
+            continue;
+        }
+        for (size_t slot = 0; slot < 2; ++slot) {
+            auto &fbo = m_bufferPassFbos[i][slot];
+            if (!fbo || fbo->size() != QSize(targetW, targetH)) {
+                QOpenGLFramebufferObjectFormat fboFmt;
+                fboFmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
+                fboFmt.setTextureTarget(GL_TEXTURE_2D);
+                fboFmt.setInternalTextureFormat(GL_RGBA16F);
+                auto nextFbo = std::make_unique<QOpenGLFramebufferObject>(targetW, targetH, fboFmt);
+                bool isHalfFloat = true;
+                if (!nextFbo->isValid()) {
+                    fboFmt.setInternalTextureFormat(GL_RGBA8);
+                    nextFbo = std::make_unique<QOpenGLFramebufferObject>(targetW, targetH, fboFmt);
+                    isHalfFloat = false;
+                }
+                if (nextFbo->isValid()) {
+                    // Zero-initialize both ping-pong slots before first feedback read.
+                    zeroFillTexture2D(nextFbo->texture(), targetW, targetH, isHalfFloat);
+                    if (gl && nextFbo->bind()) {
+                        gl->glViewport(0, 0, targetW, targetH);
+                        gl->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                        gl->glClear(GL_COLOR_BUFFER_BIT);
+                        nextFbo->release();
+                    }
+                }
+                fbo = std::move(nextFbo);
+            }
+        }
+    }
+}
+
+void GlSceneRenderer::ensureGizmoGlInitialized(QObject *parent)
+{
+    (void)parent;
+    if (m_gizmoProgram) {
+        return;
+    }
+    auto *ctx = QOpenGLContext::currentContext();
+    if (!ctx) {
+        return;
+    }
+    auto *gl = ctx->functions();
+    const bool isGles = ctx->isOpenGLES();
+    const char *vsSrc = isGles ? kGizmoVertexShaderEs310 : kGizmoVertexShaderCore;
+    const char *fsSrc = isGles ? kGizmoFragmentShaderEs310 : kGizmoFragmentShaderCore;
+
+    m_gizmoProgram = std::make_unique<QOpenGLShaderProgram>();
+    if (!m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, vsSrc) ||
+        !m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, fsSrc) ||
+        !m_gizmoProgram->link()) {
+        m_gizmoProgram = std::make_unique<QOpenGLShaderProgram>();
+        if (!m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Vertex,
+                                                     kGizmoVertexShaderCore) ||
+            !m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Fragment,
+                                                     kGizmoFragmentShaderCore) ||
+            !m_gizmoProgram->link()) {
+            qWarning() << "[GpuPreviewViewport] Failed to compile/link gizmo shader:"
+                       << m_gizmoProgram->log();
+            m_gizmoProgram.reset();
+            return;
+        }
+    }
+
+    if (!m_gizmoVao.isCreated()) {
+        m_gizmoVao.create();
+    }
+    m_gizmoVao.bind();
+    if (!m_gizmoVbo.isCreated()) {
+        m_gizmoVbo.create();
+    }
+    m_gizmoVbo.bind();
+    m_gizmoVbo.setUsagePattern(QOpenGLBuffer::DynamicDraw);
+    m_gizmoVboCapacityBytes = 4096u * sizeof(GizmoVertex);
+    m_gizmoVbo.allocate(static_cast<int>(m_gizmoVboCapacityBytes));
+
+    gl->glEnableVertexAttribArray(0);
+    gl->glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GizmoVertex),
+                              reinterpret_cast<void *>(offsetof(GizmoVertex, x)));
+    gl->glEnableVertexAttribArray(1);
+    gl->glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(GizmoVertex),
+                              reinterpret_cast<void *>(offsetof(GizmoVertex, r)));
+
+    m_gizmoVbo.release();
+    m_gizmoVao.release();
+}
+
+void GlSceneRenderer::ensureGizmoVboCapacity(size_t requiredBytes)
+{
+    if (!m_gizmoVbo.isCreated() || requiredBytes <= m_gizmoVboCapacityBytes) {
+        return;
+    }
+    const size_t maxBytes = ViewportGizmoOverlay::kMaxDynamicVertices * sizeof(GizmoVertex);
+    const size_t clampedReq = std::min(requiredBytes, maxBytes);
+    if (clampedReq <= m_gizmoVboCapacityBytes) {
+        return;
+    }
+    size_t newCap = std::max<size_t>(m_gizmoVboCapacityBytes * 2u, 4096u * sizeof(GizmoVertex));
+    while (newCap < clampedReq && newCap < maxBytes) {
+        newCap = std::min(newCap * 2u, maxBytes);
+    }
+    m_gizmoVbo.bind();
+    m_gizmoVbo.allocate(static_cast<int>(newCap));
+    m_gizmoVboCapacityBytes = newCap;
+    m_gizmoVbo.release();
+}
+
+bool GlSceneRenderer::compileShader(QObject *parent, const QString &glslSource, QSize fbSize,
+                                    QString *outError)
+{
+    (void)parent;
+    const QString trimmed = glslSource.trimmed();
+    if (trimmed.isEmpty()) {
+        if (outError) {
+            *outError = QStringLiteral("Empty GLSL shader source");
+        }
+        return false;
+    }
+
+    const bool isGles =
+        QOpenGLContext::currentContext() && QOpenGLContext::currentContext()->isOpenGLES();
+
+    auto compileLinkedFragmentProgram =
+        [&](const QString &fragSrc, bool graphVaryings,
+            QString *errOut) -> std::unique_ptr<QOpenGLShaderProgram> {
+        struct Variant {
+            const char *vs;
+            QString fs;
+        };
+        std::vector<Variant> attempts;
+        if (graphVaryings) {
+            if (isGles) {
+                attempts.push_back({kGraphVertexShaderEs310, fragSrc});
+                attempts.push_back({kGraphVertexShaderEs300, convertEs310ToEs300(fragSrc)});
+            } else {
+                attempts.push_back(
+                    {kGraphVertexShaderCore330, convertEsFragmentToCore330(fragSrc)});
+                attempts.push_back({kGraphVertexShaderEs310, fragSrc});
+            }
+        } else {
+            if (isGles) {
+                attempts.push_back({kBlitVertexShader, fragSrc});
+                attempts.push_back({kBlitVertexShader, convertEs310ToEs300(fragSrc)});
+                if (fragSrc.contains(QLatin1String("#version 310 es"))) {
+                    attempts.push_back({kGraphVertexShaderEs310, fragSrc});
+                }
+            } else {
+                attempts.push_back({kBlitVertexShaderCore, convertEsFragmentToCore330(fragSrc)});
+                attempts.push_back({kBlitVertexShader, fragSrc});
+            }
+        }
+
+        QString lastLog;
+        for (const auto &attempt : attempts) {
+            auto prog = std::make_unique<QOpenGLShaderProgram>();
+            if (!prog->addShaderFromSourceCode(QOpenGLShader::Vertex, attempt.vs)) {
+                lastLog = prog->log();
+                continue;
+            }
+            if (!prog->addShaderFromSourceCode(QOpenGLShader::Fragment, attempt.fs)) {
+                lastLog = prog->log();
+                continue;
+            }
+            if (!prog->link()) {
+                lastLog = prog->log();
+                continue;
+            }
+            return prog;
+        }
+        if (errOut) {
+            *errOut = lastLog;
+        }
+        return nullptr;
+    };
+
+    if (isComputeShaderSource(trimmed)) {
+        auto csProg = std::make_unique<QOpenGLShaderProgram>();
+        if (!csProg->addShaderFromSourceCode(QOpenGLShader::Compute, trimmed) || !csProg->link()) {
+            if (outError) {
+                *outError = csProg->log();
+            }
+            return false;
+        }
+        parseComputeMetadata(trimmed, m_computeBindingUnit, m_computeInternalFormat);
+        // Reset any previous immutable compute storage so a format change (e.g. rgba16f -> rgba8)
+        // allocates fresh glTexStorage2D backing on the next dispatch.
+        if (m_computeOutputTex != 0) {
+            if (auto *ctx = QOpenGLContext::currentContext()) {
+                ctx->functions()->glDeleteTextures(1, &m_computeOutputTex);
+            }
+            m_computeOutputTex = 0;
+        }
+        m_computeTexWidth = 0;
+        m_computeTexHeight = 0;
+        m_computeShaderProgram = std::move(csProg);
+        m_shaderProgram.reset();
+        for (auto &bp : m_bufferPassPrograms) {
+            bp.reset();
+        }
+        for (auto &pair : m_bufferPassFbos) {
+            pair[0].reset();
+            pair[1].reset();
+        }
+        m_bufferPingPongIdx = 0;
+        return true;
+    }
+
+    if (trimmed.contains(QLatin1String("#pragma Pass"))) {
+        const std::vector<GraphPassSource> passes = parseGraphPasses(trimmed);
+        if (passes.empty()) {
+            if (outError) {
+                *outError = QStringLiteral("No shader passes found after #pragma Pass directive");
+            }
+            return false;
+        }
+
+        std::array<std::unique_ptr<QOpenGLShaderProgram>, 4> nextBufferProgs{};
+        std::array<QString, 4> nextBufferSources{};
+        std::unique_ptr<QOpenGLShaderProgram> nextImageProg;
+
+        for (const auto &pass : passes) {
+            QString passErr;
+            auto compiled =
+                compileLinkedFragmentProgram(pass.glsl, /*graphVaryings=*/true, &passErr);
+            if (!compiled) {
+                if (outError) {
+                    *outError = passErr;
+                }
+                return false;
+            }
+            if (pass.passIndex >= 0 && pass.passIndex < 4) {
+                const size_t idx = static_cast<size_t>(pass.passIndex);
+                nextBufferProgs[idx] = std::move(compiled);
+                nextBufferSources[idx] = pass.glsl;
+            } else {
+                nextImageProg = std::move(compiled);
+            }
+        }
+
+        if (!nextImageProg) {
+            // Keep the promoted buffer pass program alive so self-feedback ping-pong continues.
+            for (int i = 3; i >= 0; --i) {
+                const size_t idx = static_cast<size_t>(i);
+                if (nextBufferProgs[idx]) {
+                    nextImageProg = compileLinkedFragmentProgram(nextBufferSources[idx],
+                                                                 /*graphVaryings=*/true, nullptr);
+                    if (!nextImageProg) {
+                        nextImageProg = std::move(nextBufferProgs[idx]);
+                    }
+                    break;
+                }
+            }
+        }
+
+        m_computeShaderProgram.reset();
+        m_bufferPassPrograms = std::move(nextBufferProgs);
+        m_shaderProgram = std::move(nextImageProg);
+        m_bufferPingPongIdx = 0;
+        ensureNeutralPassTexture();
+        ensureOffscreenFbo(fbSize.width(), fbSize.height());
+        ensureBufferPassFbos(fbSize.width(), fbSize.height());
+        auto *ctx = QOpenGLContext::currentContext();
+        auto *gl = ctx ? ctx->functions() : nullptr;
+        for (size_t i = 0; i < 4; ++i) {
+            for (size_t slot = 0; slot < 2; ++slot) {
+                auto &fbo = m_bufferPassFbos[i][slot];
+                if (m_bufferPassPrograms[i] && fbo && fbo->isValid()) {
+                    const bool halfFloat = (fbo->format().internalTextureFormat() == GL_RGBA16F);
+                    zeroFillTexture2D(fbo->texture(), fbo->width(), fbo->height(), halfFloat);
+                    if (gl && fbo->bind()) {
+                        gl->glViewport(0, 0, fbo->width(), fbo->height());
+                        gl->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                        gl->glClear(GL_COLOR_BUFFER_BIT);
+                        fbo->release();
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    QString fullShaderSource;
+    const bool usesGraphVarying = trimmed.contains(QLatin1String("v_TexCoord"));
+    if (trimmed.contains(QLatin1String("mainImage"))) {
+        fullShaderSource = buildShadertoySource(trimmed, isGles);
+    } else if (trimmed.contains(QLatin1String("#version"))) {
+        fullShaderSource = trimmed;
+    } else {
+        const char *preamble = isGles ? kShadertoyPreamble : kShadertoyPreambleCore;
+        fullShaderSource = QString::fromUtf8(preamble) + trimmed;
+    }
+
+    auto program = compileLinkedFragmentProgram(fullShaderSource, usesGraphVarying, outError);
+    if (!program) {
+        return false;
+    }
+
+    m_computeShaderProgram.reset();
+    for (auto &bp : m_bufferPassPrograms) {
+        bp.reset();
+    }
+    for (auto &pair : m_bufferPassFbos) {
+        pair[0].reset();
+        pair[1].reset();
+    }
+    m_bufferPingPongIdx = 0;
+    m_shaderProgram = std::move(program);
+    ensureNeutralPassTexture();
+    ensureOffscreenFbo(fbSize.width(), fbSize.height());
+    return true;
+}
+
+QSize GlSceneRenderer::physicalSizeFor(const QWidget &w, int logicalW, int logicalH) const noexcept
+{
+    const qreal dpr = w.devicePixelRatioF();
+    return QSize(std::max(1, static_cast<int>(std::lround(static_cast<double>(logicalW) * dpr))),
+                 std::max(1, static_cast<int>(std::lround(static_cast<double>(logicalH) * dpr))));
+}
+
+QMatrix4x4 GlSceneRenderer::computeBlitMvp(const QSize &viewportSize, uint32_t contentW,
+                                           uint32_t contentH, float zoom, const QPointF &panOffset,
+                                           bool parallaxEnabled, float currentTiltX,
+                                           float currentTiltY, float parallaxStrength) const noexcept
+{
+    const float vW = static_cast<float>(std::max(1, viewportSize.width()));
+    const float vH = static_cast<float>(std::max(1, viewportSize.height()));
+    const float vAspect = vW / vH;
+    const float cAspect =
+        static_cast<float>(std::max(1u, contentW)) / static_cast<float>(std::max(1u, contentH));
+
+    QMatrix4x4 mvp;
+    if (parallaxEnabled) {
+        // Place Z=0 plane at exact frustum distance for 45 deg vertical FOV so scale matches ortho.
+        const float dist = 1.0f / std::tan(qDegreesToRadians(22.5f));
+        mvp.perspective(45.0f, vAspect, 0.1f, 100.0f);
+        mvp.translate(0.0f, 0.0f, -dist);
+        mvp.translate(static_cast<float>(panOffset.x()) / (vW * 0.5f) * vAspect,
+                      -static_cast<float>(panOffset.y()) / (vH * 0.5f), 0.0f);
+        mvp.scale(zoom, zoom, 1.0f);
+
+        const float tiltAngleX = currentTiltX * 14.0f * parallaxStrength;
+        const float tiltAngleY = -currentTiltY * 11.0f * parallaxStrength;
+        mvp.rotate(tiltAngleX, 0.0f, 1.0f, 0.0f);
+        mvp.rotate(tiltAngleY, 1.0f, 0.0f, 0.0f);
+
+        if (cAspect > vAspect) {
+            mvp.scale(vAspect, vAspect / cAspect, 1.0f);
+        } else {
+            mvp.scale(cAspect, 1.0f, 1.0f);
+        }
+    } else {
+        mvp.ortho(-vAspect, vAspect, -1.0f, 1.0f, -1.0f, 1.0f);
+        mvp.translate(static_cast<float>(panOffset.x()) / (vW * 0.5f) * vAspect,
+                      -static_cast<float>(panOffset.y()) / (vH * 0.5f), 0.0f);
+        mvp.scale(zoom, zoom, 1.0f);
+
+        if (cAspect > vAspect) {
+            mvp.scale(vAspect, vAspect / cAspect, 1.0f);
+        } else {
+            mvp.scale(cAspect, 1.0f, 1.0f);
+        }
+    }
+    return mvp;
+}
+
+void ViewportInputMapper::updateLayout(const QSize &widgetSize) noexcept
+{
+    const float w = static_cast<float>(std::max(1, widgetSize.width()));
+    const float h = static_cast<float>(std::max(1, widgetSize.height()));
+    const float availW = std::max(200.0f, w - 20.0f);
+    const float barW = std::min(availW, 640.0f);
+    const float barH = 46.0f;
+    const float barX = (w - barW) * 0.5f;
+    const float barY = std::max(8.0f, h - barH - 12.0f);
+
+    m_layout.barRect = QRectF(barX, barY, barW, barH);
+    m_layout.compact = (barW < 520.0f);
+    m_layout.ultraCompact = (barW < 390.0f);
+
+    const float padX = 12.0f;
+    float gap = m_layout.ultraCompact ? 5.0f : 8.0f;
+    const float btnY = barY + 6.0f;
+    const float btnH = barH - 12.0f;
+
+    float wStatus = m_layout.ultraCompact ? 72.0f : (m_layout.compact ? 92.0f : 118.0f);
+    float wMon = m_layout.ultraCompact ? 68.0f : (m_layout.compact ? 86.0f : 108.0f);
+    float wApply = m_layout.ultraCompact ? 72.0f : (m_layout.compact ? 96.0f : 124.0f);
+    float wReset = m_layout.ultraCompact ? 42.0f : 48.0f;
+    float wGuide = m_layout.ultraCompact ? 52.0f : (m_layout.compact ? 60.0f : 68.0f);
+    float wPara = m_layout.ultraCompact ? 46.0f : 52.0f;
+
+    const float rawSum = wStatus + wMon + wApply + wReset + wGuide + wPara + 5.0f * gap + 12.0f;
+    const float innerW = std::max(160.0f, barW - 2.0f * padX);
+    const float scale = std::min(1.0f, innerW / rawSum);
+
+    wStatus *= scale;
+    wMon *= scale;
+    wApply *= scale;
+    wReset *= scale;
+    wGuide *= scale;
+    wPara *= scale;
+    gap *= scale;
+
+    m_layout.scale = scale;
+    m_layout.gap = gap;
+
+    float curX = barX + padX;
+    m_layout.statusRect = QRectF(curX, btnY, wStatus, btnH);
+    curX += wStatus + 12.0f * scale;
+
+    m_layout.monitorBtnRect = QRectF(curX, btnY, wMon, btnH);
+    curX += wMon + gap;
+
+    m_layout.applyBtnRect = QRectF(curX, btnY, wApply, btnH);
+    curX += wApply + gap;
+
+    m_layout.resetBtnRect = QRectF(curX, btnY, wReset, btnH);
+    curX += wReset + gap;
+
+    m_layout.guideBtnRect = QRectF(curX, btnY, wGuide, btnH);
+    curX += wGuide + gap;
+
+    m_layout.parallaxBtnRect = QRectF(curX, btnY, wPara, btnH);
+}
+
+ActionBarButton ViewportInputMapper::hitTestActionBar(const QPointF &pos,
+                                                      bool showActionBar) const noexcept
+{
+    if (!showActionBar || !m_layout.barRect.contains(pos)) {
+        return ActionBarButton::None;
+    }
+    if (m_layout.monitorBtnRect.contains(pos)) {
+        return ActionBarButton::MonitorSelector;
+    }
+    if (m_layout.applyBtnRect.contains(pos)) {
+        return ActionBarButton::ApplyButton;
+    }
+    if (m_layout.resetBtnRect.contains(pos)) {
+        return ActionBarButton::ResetButton;
+    }
+    if (m_layout.guideBtnRect.contains(pos)) {
+        return ActionBarButton::GuideButton;
+    }
+    if (m_layout.parallaxBtnRect.contains(pos)) {
+        return ActionBarButton::ParallaxButton;
+    }
+    return ActionBarButton::None;
+}
+
+float ViewportInputMapper::calculateGuideAspect(AspectRatioGuide guide,
+                                                const QSize &widgetSize) const noexcept
+{
+    switch (guide) {
+    case AspectRatioGuide::Ratio16_9:
+        return 16.0f / 9.0f;
+    case AspectRatioGuide::Ratio16_10:
+        return 16.0f / 10.0f;
+    case AspectRatioGuide::Ratio21_9:
+        return 21.0f / 9.0f;
+    case AspectRatioGuide::Ratio32_9:
+        return 32.0f / 9.0f;
+    case AspectRatioGuide::Ratio4_3:
+        return 4.0f / 3.0f;
+    case AspectRatioGuide::MatchActiveDisplay:
+    case AspectRatioGuide::None:
+    default:
+        return static_cast<float>(std::max(1, widgetSize.width())) /
+               std::max(1.0f, static_cast<float>(widgetSize.height()));
+    }
+}
+
+QRectF ViewportInputMapper::computeContentDisplayRect(const QSize &widgetSize, uint32_t contentW,
+                                                      uint32_t contentH, float zoom,
+                                                      const QPointF &panOffset) const noexcept
+{
+    float cW = static_cast<float>(contentW);
+    float cH = static_cast<float>(contentH);
+    const float vW = static_cast<float>(std::max(1, widgetSize.width()));
+    const float vH = static_cast<float>(std::max(1, widgetSize.height()));
+    if (cW <= 0.0f || cH <= 0.0f) {
+        cW = vW;
+        cH = vH;
+    }
+
+    const float cAspect = cW / cH;
+    const float vAspect = vW / vH;
+    QRectF baseRect;
+    if (cAspect > vAspect) {
+        const float h = vW / cAspect;
+        baseRect = QRectF(0.0f, (vH - h) * 0.5f, vW, h);
+    } else {
+        const float w = vH * cAspect;
+        baseRect = QRectF((vW - w) * 0.5f, 0.0f, w, vH);
+    }
+
+    const QPointF center = baseRect.center() + panOffset;
+    const float scaledW = baseRect.width() * zoom;
+    const float scaledH = baseRect.height() * zoom;
+    return QRectF(center.x() - scaledW * 0.5f, center.y() - scaledH * 0.5f, scaledW, scaledH);
+}
+
+QPointF ViewportInputMapper::mapWidgetToContentTexel(const QPointF &widgetPos,
+                                                     const QSize &widgetSize, uint32_t contentW,
+                                                     uint32_t contentH, float zoom,
+                                                     const QPointF &panOffset,
+                                                     bool parallaxEnabled,
+                                                     const QMatrix4x4 &blitMvp) const noexcept
+{
+    const uint32_t cwU = std::max<uint32_t>(1u, contentW);
+    const uint32_t chU = std::max<uint32_t>(1u, contentH);
+    const double cw = static_cast<double>(cwU);
+    const double ch = static_cast<double>(chU);
+
+    if (parallaxEnabled && widgetSize.width() > 0 && widgetSize.height() > 0) {
+        const float ndcX =
+            static_cast<float>(2.0 * widgetPos.x() / static_cast<double>(widgetSize.width()) - 1.0);
+        const float ndcY =
+            static_cast<float>(1.0 - 2.0 * widgetPos.y() / static_cast<double>(widgetSize.height()));
+        bool invertible = false;
+        const QMatrix4x4 invMvp = blitMvp.inverted(&invertible);
+        if (invertible) {
+            const QVector4D pNear = invMvp.map(QVector4D(ndcX, ndcY, -1.0f, 1.0f));
+            const QVector4D pFar = invMvp.map(QVector4D(ndcX, ndcY, 1.0f, 1.0f));
+            if (std::abs(pNear.w()) > 1e-6f && std::abs(pFar.w()) > 1e-6f) {
+                const QVector3D o = pNear.toVector3DAffine();
+                const QVector3D f = pFar.toVector3DAffine();
+                const float dz = f.z() - o.z();
+                if (std::abs(dz) > 1e-6f) {
+                    const float t = -o.z() / dz;
+                    const QVector3D hit = o + (f - o) * t;
+                    const double u = static_cast<double>(hit.x()) * 0.5 + 0.5;
+                    const double v = 0.5 - static_cast<double>(hit.y()) * 0.5;
+                    return QPointF(std::clamp(u, 0.0, 1.0) * cw, std::clamp(v, 0.0, 1.0) * ch);
+                }
+            }
+        }
+    }
+
+    const QRectF displayRect =
+        computeContentDisplayRect(widgetSize, cwU, chU, zoom, panOffset);
+    const double u = (widgetPos.x() - displayRect.left()) / std::max(1.0, displayRect.width());
+    const double v = (widgetPos.y() - displayRect.top()) / std::max(1.0, displayRect.height());
+    return QPointF(std::clamp(u, 0.0, 1.0) * cw, std::clamp(v, 0.0, 1.0) * ch);
+}
+
+bool WeightPaintBrushBridge::isBoneLockedInMask(const std::array<uint64_t, 2> &mask,
+                                                uint32_t boneIdx) noexcept
+{
+    if (boneIdx >= 128u) {
+        return false;
+    }
+    return (mask[boneIdx >> 6u] & (1ull << (boneIdx & 63u))) != 0ull;
+}
+
+bool WeightPaintBrushBridge::isBoneLocked(uint32_t boneIdx) const noexcept
+{
+    return isBoneLockedInMask(m_lockedBoneMask, boneIdx);
+}
+
+void WeightPaintBrushBridge::beginStroke()
+{
+    m_pendingDabs.clear();
+    m_preBlocks.clear();
+    m_dirtyVertices.clear();
+}
+
+void WeightPaintBrushBridge::applyDab(ViewportGizmoOverlay &overlay, uint32_t contentW,
+                                      uint32_t contentH, const WeightBrushDab &dab)
+{
+    auto &verts = overlay.mutableMeshWireframe().vertices;
+    if (verts.empty() || !std::isfinite(dab.texelX) || !std::isfinite(dab.texelY) ||
+        !std::isfinite(dab.radiusPx) || !std::isfinite(dab.strength) ||
+        !std::isfinite(dab.targetWeight) || !std::isfinite(dab.pressure) ||
+        dab.radiusPx <= 0.0f) {
+        return;
+    }
+    if (isBoneLocked(dab.activeBoneIndex) && dab.op != WE_WEIGHT_OP_NORMALIZE) {
+        return;
+    }
+
+    const float cw = static_cast<float>(std::max<uint32_t>(1u, contentW));
+    const float ch = static_cast<float>(std::max<uint32_t>(1u, contentH));
+    const float dabLocalX = dab.texelX - 0.5f * cw;
+    const float dabLocalY = 0.5f * ch - dab.texelY;
+    const float radiusSq = dab.radiusPx * dab.radiusPx;
+    const size_t totalVerts = verts.size();
+
+    const uint32_t maxBones =
+        std::clamp<uint32_t>(static_cast<uint32_t>(overlay.puppetBones().size()), 1u, 128u);
+    auto findUnlockedFallbackBone = [&](uint32_t avoidBone) -> uint32_t {
+        if (avoidBone != 0u && !isBoneLocked(0u)) {
+            return 0u;
+        }
+        for (uint32_t b = 0u; b < maxBones; ++b) {
+            if (b != avoidBone && !isBoneLocked(b)) {
+                return b;
+            }
+        }
+        if (!isBoneLocked(0u)) {
+            return 0u;
+        }
+        for (uint32_t b = 0u; b < 128u; ++b) {
+            if (!isBoneLocked(b)) {
+                return b;
+            }
+        }
+        return avoidBone;
+    };
+
+    float neighborAvg = 0.0f;
+    float neighborW = 0.0f;
+    if (dab.op == WE_WEIGHT_OP_SMOOTH) {
+        for (size_t i = 0; i < totalVerts; ++i) {
+            if (!std::isfinite(verts[i].pos[0]) || !std::isfinite(verts[i].pos[1])) {
+                continue;
+            }
+            const float dx = verts[i].pos[0] - dabLocalX;
+            const float dy = verts[i].pos[1] - dabLocalY;
+            const float d2 = dx * dx + dy * dy;
+            if (d2 <= radiusSq) {
+                float w = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    if (verts[i].blend_indices[k] == dab.activeBoneIndex &&
+                        std::isfinite(verts[i].weight[k])) {
+                        w += std::max(0.0f, verts[i].weight[k]);
+                    }
+                }
+                const float g = 1.0f - std::sqrt(d2) / dab.radiusPx;
+                neighborAvg += w * g;
+                neighborW += g;
+            }
+        }
+        if (neighborW > 1e-6f) {
+            neighborAvg /= neighborW;
+        }
+    }
+
+    for (size_t i = 0; i < totalVerts; ++i) {
+        if (!std::isfinite(verts[i].pos[0]) || !std::isfinite(verts[i].pos[1])) {
+            continue;
+        }
+        const float dx = verts[i].pos[0] - dabLocalX;
+        const float dy = verts[i].pos[1] - dabLocalY;
+        const float distSq = dx * dx + dy * dy;
+        if (distSq > radiusSq) {
+            continue;
+        }
+
+        const uint32_t blockIdx = static_cast<uint32_t>(i / 256u);
+        if (!m_preBlocks.contains(blockIdx)) {
+            const size_t bStart = static_cast<size_t>(blockIdx) * 256u;
+            const size_t bEnd = std::min(bStart + 256u, totalVerts);
+            VertexWeightBlockSnapshot snap{};
+            snap.blockIndex = blockIdx;
+            snap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
+                              verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
+            m_preBlocks.emplace(blockIdx, std::move(snap));
+        }
+
+        const float dist = std::sqrt(distSq);
+        const float falloff =
+            0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * dist / dab.radiusPx));
+        const float alpha = std::clamp(dab.strength * dab.pressure * falloff, 0.0f, 1.0f);
+
+        auto &v = verts[i];
+        float lockedSum = 0.0f;
+        int targetSlot = -1;
+        int weakestUnlockedSlot = -1;
+        float minUnlockedW = std::numeric_limits<float>::max();
+
+        for (int k = 0; k < 4; ++k) {
+            v.weight[k] = std::isfinite(v.weight[k]) ? std::max(0.0f, v.weight[k]) : 0.0f;
+            const bool locked = isBoneLocked(v.blend_indices[k]);
+            if (locked) {
+                lockedSum += v.weight[k];
+            } else if (v.blend_indices[k] == dab.activeBoneIndex && targetSlot < 0) {
+                targetSlot = k;
+            } else if (v.weight[k] < minUnlockedW) {
+                minUnlockedW = v.weight[k];
+                weakestUnlockedSlot = k;
+            }
+        }
+
+        const float targetFree = std::max(0.0f, 1.0f - lockedSum);
+        if (targetSlot < 0 && dab.op != WE_WEIGHT_OP_NORMALIZE && dab.op != WE_WEIGHT_OP_SUBTRACT &&
+            weakestUnlockedSlot >= 0) {
+            targetSlot = weakestUnlockedSlot;
+            v.blend_indices[targetSlot] = dab.activeBoneIndex;
+            v.weight[targetSlot] = 0.0f;
+        }
+
+        int paintedSlot = -1;
+        if (targetSlot >= 0 && dab.op != WE_WEIGHT_OP_NORMALIZE) {
+            const float curW = v.weight[targetSlot];
+            float nextW = curW;
+            switch (dab.op) {
+            case WE_WEIGHT_OP_ADD:
+                nextW = std::clamp(curW + alpha, 0.0f, targetFree);
+                break;
+            case WE_WEIGHT_OP_SUBTRACT:
+                nextW = std::clamp(curW - alpha, 0.0f, targetFree);
+                break;
+            case WE_WEIGHT_OP_REPLACE:
+                nextW = std::clamp(curW + (dab.targetWeight - curW) * alpha, 0.0f, targetFree);
+                break;
+            case WE_WEIGHT_OP_SMOOTH:
+                nextW = std::clamp(curW + (neighborAvg - curW) * alpha, 0.0f, targetFree);
+                break;
+            case WE_WEIGHT_OP_NORMALIZE:
+                break;
+            }
+            v.weight[targetSlot] = nextW;
+            paintedSlot = targetSlot;
+        }
+
+        // Preserve exact painted slot weight and rebalance only the remaining unlocked slots.
+        float otherFreeSum = 0.0f;
+        int firstOtherUnlocked = -1;
+        for (int k = 0; k < 4; ++k) {
+            if (!isBoneLocked(v.blend_indices[k]) && k != paintedSlot) {
+                otherFreeSum += v.weight[k];
+                if (firstOtherUnlocked < 0) {
+                    firstOtherUnlocked = k;
+                }
+            }
+        }
+
+        if (paintedSlot >= 0) {
+            const float remFree = std::max(0.0f, targetFree - v.weight[paintedSlot]);
+            if (otherFreeSum > 1e-6f) {
+                const float scale = remFree / otherFreeSum;
+                for (int k = 0; k < 4; ++k) {
+                    if (!isBoneLocked(v.blend_indices[k]) && k != paintedSlot) {
+                        v.weight[k] *= scale;
+                    }
+                }
+            } else if (remFree > 1e-6f) {
+                if (firstOtherUnlocked >= 0) {
+                    const uint32_t fbBone = findUnlockedFallbackBone(dab.activeBoneIndex);
+                    if (fbBone != dab.activeBoneIndex) {
+                        v.blend_indices[firstOtherUnlocked] = fbBone;
+                        v.weight[firstOtherUnlocked] = remFree;
+                    } else {
+                        v.weight[paintedSlot] = targetFree;
+                    }
+                } else {
+                    v.weight[paintedSlot] = targetFree;
+                }
+            }
+        } else if (otherFreeSum > 1e-6f) {
+            const float scale = targetFree / otherFreeSum;
+            for (int k = 0; k < 4; ++k) {
+                if (!isBoneLocked(v.blend_indices[k])) {
+                    v.weight[k] *= scale;
+                }
+            }
+        } else if (targetFree > 1e-6f && firstOtherUnlocked >= 0) {
+            v.blend_indices[firstOtherUnlocked] = findUnlockedFallbackBone(UINT32_MAX);
+            v.weight[firstOtherUnlocked] = targetFree;
+        }
+
+        m_dirtyVertices.push_back(static_cast<uint32_t>(i));
+    }
+}
+
+void WeightPaintBrushBridge::normalizeAllWeights(
+    int32_t objectId, int32_t expectedObjectId, ViewportGizmoOverlay &overlay,
+    const std::array<uint64_t, 2> &lockedBones,
+    std::vector<VertexWeightBlockSnapshot> &outPreBlocks,
+    std::vector<VertexWeightBlockSnapshot> &outPostBlocks,
+    std::vector<waywal_ipc_vertex_weight_t> &outDirtyEntries)
+{
+    outPreBlocks.clear();
+    outPostBlocks.clear();
+    outDirtyEntries.clear();
+    if (objectId < 0 || expectedObjectId != objectId) {
+        return;
+    }
+    auto &verts = overlay.mutableMeshWireframe().vertices;
+    if (verts.empty()) {
+        return;
+    }
+
+    const uint32_t maxBones =
+        std::clamp<uint32_t>(static_cast<uint32_t>(overlay.puppetBones().size()), 1u, 128u);
+    auto findFallbackBone = [&]() -> uint32_t {
+        if (!isBoneLockedInMask(lockedBones, 0u)) {
+            return 0u;
+        }
+        for (uint32_t b = 0u; b < maxBones; ++b) {
+            if (!isBoneLockedInMask(lockedBones, b)) {
+                return b;
+            }
+        }
+        for (uint32_t b = 0u; b < 128u; ++b) {
+            if (!isBoneLockedInMask(lockedBones, b)) {
+                return b;
+            }
+        }
+        return 0u;
+    };
+    const uint32_t fallbackBone = findFallbackBone();
+    const size_t totalVerts = verts.size();
+
+    for (size_t bStart = 0; bStart < totalVerts; bStart += 256u) {
+        const size_t bEnd = std::min(bStart + 256u, totalVerts);
+        bool blockDirty = false;
+        VertexWeightBlockSnapshot preSnap{};
+        preSnap.blockIndex = static_cast<uint32_t>(bStart / 256u);
+
+        for (size_t i = bStart; i < bEnd; ++i) {
+            auto &v = verts[i];
+            float lockedSum = 0.0f;
+            float freeSum = 0.0f;
+            int firstUnlockedSlot = -1;
+            std::array<float, 4> cleanW{};
+            std::array<uint32_t, 4> nextIdx{v.blend_indices[0], v.blend_indices[1],
+                                            v.blend_indices[2], v.blend_indices[3]};
+            for (int k = 0; k < 4; ++k) {
+                const float w = std::isfinite(v.weight[k]) ? std::max(0.0f, v.weight[k]) : 0.0f;
+                cleanW[k] = w;
+                if (isBoneLockedInMask(lockedBones, v.blend_indices[k])) {
+                    lockedSum += w;
+                } else {
+                    freeSum += w;
+                    if (firstUnlockedSlot < 0) {
+                        firstUnlockedSlot = k;
+                    }
+                }
+            }
+
+            const float targetFree = std::max(0.0f, 1.0f - lockedSum);
+            std::array<float, 4> nextW = cleanW;
+            if (freeSum > 1e-6f) {
+                const float scale = targetFree / freeSum;
+                for (int k = 0; k < 4; ++k) {
+                    if (!isBoneLockedInMask(lockedBones, v.blend_indices[k])) {
+                        nextW[k] = cleanW[k] * scale;
+                    }
+                }
+            } else if (targetFree > 1e-6f && firstUnlockedSlot >= 0) {
+                nextIdx[firstUnlockedSlot] = fallbackBone;
+                nextW[firstUnlockedSlot] = targetFree;
+            }
+
+            bool vertChanged = false;
+            for (int k = 0; k < 4; ++k) {
+                if (v.blend_indices[k] != nextIdx[k] || !std::isfinite(v.weight[k]) ||
+                    std::fabs(v.weight[k] - nextW[k]) > 1e-6f) {
+                    vertChanged = true;
+                    break;
+                }
+            }
+            if (vertChanged) {
+                if (!blockDirty) {
+                    blockDirty = true;
+                    preSnap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
+                                         verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
+                }
+                for (int k = 0; k < 4; ++k) {
+                    v.blend_indices[k] = nextIdx[k];
+                    v.weight[k] = nextW[k];
+                }
+                waywal_ipc_vertex_weight_t vw{};
+                vw.vertex_index = static_cast<uint32_t>(i);
+                std::memcpy(vw.blend_indices, v.blend_indices, sizeof(vw.blend_indices));
+                std::memcpy(vw.weight, v.weight, sizeof(vw.weight));
+                outDirtyEntries.push_back(vw);
+            }
+        }
+
+        if (blockDirty) {
+            VertexWeightBlockSnapshot postSnap{};
+            postSnap.blockIndex = preSnap.blockIndex;
+            postSnap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
+                                  verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
+            outPreBlocks.push_back(std::move(preSnap));
+            outPostBlocks.push_back(std::move(postSnap));
+        }
+    }
 }
 
 GpuPreviewViewport::GpuPreviewViewport(QWidget *parent) : QOpenGLWidget(parent)
@@ -388,11 +1988,8 @@ GpuPreviewViewport::GpuPreviewViewport(QWidget *parent) : QOpenGLWidget(parent)
     fmt.setSwapInterval(0); // Non-blocking vsync
     setFormat(fmt);
 
-    m_fallbackCanvas = new QLabel(this);
-    m_fallbackCanvas->setAttribute(Qt::WA_TransparentForMouseEvents, true);
-    m_fallbackCanvas->setVisible(false);
-
     m_lastFpsCalcTime = std::chrono::steady_clock::now();
+    m_inputMapper.updateLayout(size());
 
     m_animationTimer = new QTimer(this);
     setTargetAnimationFps(144);
@@ -412,6 +2009,30 @@ GpuPreviewViewport::GpuPreviewViewport(QWidget *parent) : QOpenGLWidget(parent)
     updateAnimationTimerState();
 }
 
+void GpuPreviewViewport::releaseGlResources() noexcept
+{
+    QOpenGLContext *cur = QOpenGLContext::currentContext();
+    bool hasCurrent = (cur != nullptr && cur == context());
+    if (hasCurrent) {
+        m_swapchain.releaseGl();
+        m_renderer.releaseGl(true);
+        return;
+    }
+
+    if (!isOffscreenPlatform() && isValid() && context()) {
+        GlContextScope glScope(this);
+        if (glScope.isReady()) {
+            m_swapchain.releaseGl();
+            m_renderer.releaseGl(true);
+            return;
+        }
+    }
+
+    // Context is already gone or headless; close kernel DMA-BUF FDs without calling GL/EGL.
+    m_swapchain.closeFds();
+    m_renderer.releaseGl(false);
+}
+
 GpuPreviewViewport::~GpuPreviewViewport()
 {
     if (m_animationTimer) {
@@ -423,54 +2044,15 @@ GpuPreviewViewport::~GpuPreviewViewport()
         m_videoThumbThread.join();
     }
 
-    {
-        GlContextScope glScope(this);
-        if (glScope.isReady()) {
-            std::lock_guard<std::mutex> lock(m_frameMutex);
-            if (m_currentDmaBufFrame.has_value()) {
-                m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR,
-                                                m_eglDestroySyncKHR);
-                m_currentDmaBufFrame.reset();
-            }
+    // Clear active input states without emitting signals during widget teardown.
+    m_isPanning = false;
+    m_panButton = Qt::NoButton;
+    m_brushStrokeActive = false;
+    m_rigDragKind = RigDragKind::None;
+    m_rigDragIndex = -1;
+    m_gizmoOverlay.endDrag();
 
-            if (m_inProcessImageTex != 0) {
-                glDeleteTextures(1, &m_inProcessImageTex);
-                m_inProcessImageTex = 0;
-            }
-            if (m_neutralPassTex != 0) {
-                glDeleteTextures(1, &m_neutralPassTex);
-                m_neutralPassTex = 0;
-            }
-            if (m_computeOutputTex != 0) {
-                glDeleteTextures(1, &m_computeOutputTex);
-                m_computeOutputTex = 0;
-            }
-
-            m_quadVao.destroy();
-            m_quadVbo.destroy();
-            m_blitProgram.reset();
-            m_gizmoVao.destroy();
-            m_gizmoVbo.destroy();
-            m_gizmoProgram.reset();
-            m_shaderProgram.reset();
-            m_computeShaderProgram.reset();
-            for (auto &prog : m_bufferPassPrograms) {
-                prog.reset();
-            }
-            for (auto &pair : m_bufferPassFbos) {
-                pair[0].reset();
-                pair[1].reset();
-            }
-            m_offscreenFbo.reset();
-        }
-    }
-
-    // Always close kernel DMA-BUF FDs even if the QOpenGLWidget was never realized.
-    std::lock_guard<std::mutex> lock(m_frameMutex);
-    if (m_currentDmaBufFrame.has_value()) {
-        m_currentDmaBufFrame->closeFds();
-        m_currentDmaBufFrame.reset();
-    }
+    releaseGlResources();
 }
 
 void GpuPreviewViewport::updateAnimationTimerState()
@@ -509,18 +2091,18 @@ void GpuPreviewViewport::pauseAnimation(bool pause)
 
 uint32_t GpuPreviewViewport::contentWidth() const noexcept
 {
-    if (m_previewMode == PreviewMode::DmaBufLive && m_currentDmaBufFrame.has_value()) {
-        return m_currentDmaBufFrame->width;
+    if (m_previewMode == PreviewMode::DmaBufLive && m_swapchain.hasLiveFrame()) {
+        return m_swapchain.frameWidth();
     }
     if (m_previewMode == PreviewMode::InProcessImage) {
         return m_imageWidth;
     }
     if (m_previewMode == PreviewMode::InProcessShader) {
-        if (m_computeShaderProgram && m_computeTexWidth > 0) {
-            return static_cast<uint32_t>(m_computeTexWidth);
+        if (m_renderer.m_computeShaderProgram && m_renderer.m_computeTexWidth > 0) {
+            return static_cast<uint32_t>(m_renderer.m_computeTexWidth);
         }
-        if (m_offscreenFbo) {
-            return static_cast<uint32_t>(m_offscreenFbo->width());
+        if (m_renderer.m_offscreenFbo) {
+            return static_cast<uint32_t>(m_renderer.m_offscreenFbo->width());
         }
     }
     return static_cast<uint32_t>(width());
@@ -528,18 +2110,18 @@ uint32_t GpuPreviewViewport::contentWidth() const noexcept
 
 uint32_t GpuPreviewViewport::contentHeight() const noexcept
 {
-    if (m_previewMode == PreviewMode::DmaBufLive && m_currentDmaBufFrame.has_value()) {
-        return m_currentDmaBufFrame->height;
+    if (m_previewMode == PreviewMode::DmaBufLive && m_swapchain.hasLiveFrame()) {
+        return m_swapchain.frameHeight();
     }
     if (m_previewMode == PreviewMode::InProcessImage) {
         return m_imageHeight;
     }
     if (m_previewMode == PreviewMode::InProcessShader) {
-        if (m_computeShaderProgram && m_computeTexHeight > 0) {
-            return static_cast<uint32_t>(m_computeTexHeight);
+        if (m_renderer.m_computeShaderProgram && m_renderer.m_computeTexHeight > 0) {
+            return static_cast<uint32_t>(m_renderer.m_computeTexHeight);
         }
-        if (m_offscreenFbo) {
-            return static_cast<uint32_t>(m_offscreenFbo->height());
+        if (m_renderer.m_offscreenFbo) {
+            return static_cast<uint32_t>(m_renderer.m_offscreenFbo->height());
         }
     }
     return static_cast<uint32_t>(height());
@@ -547,27 +2129,23 @@ uint32_t GpuPreviewViewport::contentHeight() const noexcept
 
 bool GpuPreviewViewport::hasLiveDmaBuf() const noexcept
 {
-    return m_previewMode == PreviewMode::DmaBufLive && m_currentDmaBufFrame.has_value();
+    return m_previewMode == PreviewMode::DmaBufLive && m_swapchain.hasLiveFrame();
 }
 
 void GpuPreviewViewport::clearLiveDmaBuf()
 {
     {
         GlContextScope glScope(this);
-        std::lock_guard<std::mutex> lock(m_frameMutex);
-        if (m_currentDmaBufFrame.has_value()) {
-            if (glScope.isReady()) {
-                m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR,
-                                                m_eglDestroySyncKHR);
-            } else {
-                m_currentDmaBufFrame->closeFds();
-            }
-            m_currentDmaBufFrame.reset();
+        if (glScope.isReady()) {
+            m_swapchain.releaseGl();
+        } else {
+            m_swapchain.closeFds();
         }
     }
-    if (m_inProcessImageTex != 0 || !m_fallbackImage.isNull()) {
+    if (m_renderer.m_inProcessImageTex != 0 || !m_fallbackImage.isNull()) {
         m_previewMode = PreviewMode::InProcessImage;
-    } else if (m_shaderProgram || m_computeShaderProgram || !m_shaderSource.isEmpty()) {
+    } else if (m_renderer.m_shaderProgram || m_renderer.m_computeShaderProgram ||
+               !m_shaderSource.isEmpty()) {
         m_previewMode = PreviewMode::InProcessShader;
     } else {
         m_previewMode = PreviewMode::OfflineEmpty;
@@ -578,100 +2156,22 @@ void GpuPreviewViewport::clearLiveDmaBuf()
 
 void GpuPreviewViewport::resolveEglExtensions()
 {
-    if (m_eglInitialized) {
-        return;
-    }
-
-    m_eglDisplay = eglGetCurrentDisplay();
-    if (m_eglDisplay == EGL_NO_DISPLAY) {
-        return;
-    }
-
-    auto getProc = [](const char *name) -> void * {
-        void *p = reinterpret_cast<void *>(eglGetProcAddress(name));
-        return p;
-    };
-
-    m_eglCreateImageKHR = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(getProc("eglCreateImageKHR"));
-    m_eglDestroyImageKHR =
-        reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(getProc("eglDestroyImageKHR"));
-    m_eglCreateSyncKHR = reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(getProc("eglCreateSyncKHR"));
-    m_eglDestroySyncKHR = reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(getProc("eglDestroySyncKHR"));
-    m_eglWaitSyncKHR = reinterpret_cast<PFNEGLWAITSYNCKHRPROC>(getProc("eglWaitSyncKHR"));
-    m_eglClientWaitSyncKHR =
-        reinterpret_cast<PFNEGLCLIENTWAITSYNCKHRPROC>(getProc("eglClientWaitSyncKHR"));
-    m_glEGLImageTargetTexture2DOES = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
-        getProc("glEGLImageTargetTexture2DOES"));
-
-    m_eglInitialized =
-        (m_eglCreateImageKHR != nullptr && m_glEGLImageTargetTexture2DOES != nullptr);
+    m_swapchain.resolveEglExtensions();
 }
 
 void GpuPreviewViewport::setupQuadGeometry()
 {
-    if (!m_quadVao.isCreated()) {
-        m_quadVao.create();
-    }
-    m_quadVao.bind();
-
-    if (!m_quadVbo.isCreated()) {
-        m_quadVbo.create();
-    }
-    m_quadVbo.bind();
-    m_quadVbo.allocate(kQuadVertices, sizeof(kQuadVertices));
-
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                          reinterpret_cast<void *>(offsetof(Vertex, x)));
-
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                          reinterpret_cast<void *>(offsetof(Vertex, u)));
-
-    m_quadVao.release();
-    m_quadVbo.release();
+    m_renderer.setupQuadGeometry();
 }
 
 void GpuPreviewViewport::initBlitShader()
 {
-    const bool isGles =
-        QOpenGLContext::currentContext() && QOpenGLContext::currentContext()->isOpenGLES();
-    const char *vsSrc = isGles ? kBlitVertexShader : kBlitVertexShaderCore;
-    const char *fsSrc = isGles ? kBlitFragmentShader : kBlitFragmentShaderCore;
-
-    m_blitProgram = std::make_unique<QOpenGLShaderProgram>(this);
-    if (!m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, vsSrc) ||
-        !m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, fsSrc) ||
-        !m_blitProgram->link()) {
-        m_blitProgram = std::make_unique<QOpenGLShaderProgram>(this);
-        if (!m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, kBlitVertexShaderCore) ||
-            !m_blitProgram->addShaderFromSourceCode(QOpenGLShader::Fragment,
-                                                    kBlitFragmentShaderCore) ||
-            !m_blitProgram->link()) {
-            qWarning() << "[GpuPreviewViewport] Failed to compile/link blit shader:"
-                       << m_blitProgram->log();
-        }
-    }
+    m_renderer.initBlitShader(this);
 }
 
 void GpuPreviewViewport::ensureNeutralPassTexture()
 {
-    if (m_neutralPassTex != 0) {
-        return;
-    }
-    static constexpr uint8_t kNeutralPixel[4] = {28, 34, 48, 255};
-    glGenTextures(1, &m_neutralPassTex);
-    glBindTexture(GL_TEXTURE_2D, m_neutralPassTex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-#ifdef GL_UNPACK_ROW_LENGTH
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-#endif
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, kNeutralPixel);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    m_renderer.ensureNeutralPassTexture();
 }
 
 void GpuPreviewViewport::initializeGL()
@@ -680,29 +2180,26 @@ void GpuPreviewViewport::initializeGL()
         return;
     }
     initializeOpenGLFunctions();
+
+    QObject::disconnect(m_renderer.m_ctxDestroyConn);
+    m_renderer.m_ctxDestroyConn = {};
+    if (QOpenGLContext *ctx = context()) {
+        m_renderer.m_ctxDestroyConn = connect(
+            ctx, &QOpenGLContext::aboutToBeDestroyed, this, [this]() { releaseGlResources(); },
+            Qt::DirectConnection);
+    }
+
     resolveEglExtensions();
     setupQuadGeometry();
     initBlitShader();
     ensureNeutralPassTexture();
 
-    if (!m_fallbackImage.isNull() && m_inProcessImageTex == 0) {
-        QImage formatted = m_fallbackImage.convertToFormat(QImage::Format_RGBA8888);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-#ifdef GL_UNPACK_ROW_LENGTH
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-#endif
-        glGenTextures(1, &m_inProcessImageTex);
-        glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0, GL_RGBA,
-                     GL_UNSIGNED_BYTE, formatted.constBits());
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glBindTexture(GL_TEXTURE_2D, 0);
+    if (!m_fallbackImage.isNull() && m_renderer.m_inProcessImageTex == 0) {
+        m_renderer.uploadFallbackImageTexture(m_fallbackImage);
     }
 
-    if (!m_shaderSource.isEmpty() && !m_shaderProgram && !m_computeShaderProgram) {
+    if (!m_shaderSource.isEmpty() && !m_renderer.m_shaderProgram &&
+        !m_renderer.m_computeShaderProgram) {
         (void)compileShaderInternal(m_shaderSource, nullptr);
     }
 
@@ -713,9 +2210,7 @@ void GpuPreviewViewport::initializeGL()
 
 QSize GpuPreviewViewport::physicalSizeFor(int logicalW, int logicalH) const noexcept
 {
-    const qreal dpr = devicePixelRatioF();
-    return QSize(std::max(1, static_cast<int>(std::lround(static_cast<double>(logicalW) * dpr))),
-                 std::max(1, static_cast<int>(std::lround(static_cast<double>(logicalH) * dpr))));
+    return m_renderer.physicalSizeFor(*this, logicalW, logicalH);
 }
 
 QSize GpuPreviewViewport::physicalFramebufferSize() const noexcept
@@ -738,6 +2233,7 @@ void GpuPreviewViewport::resizeGL(int w, int h)
 
 void GpuPreviewViewport::resizeEvent(QResizeEvent *event)
 {
+    m_inputMapper.updateLayout(size());
     if (isOffscreenPlatform()) {
         QWidget::resizeEvent(event);
         return;
@@ -747,259 +2243,29 @@ void GpuPreviewViewport::resizeEvent(QResizeEvent *event)
 
 void GpuPreviewViewport::ensureOffscreenFbo(int w, int h)
 {
-    int targetW = std::clamp(w, 64, 7680);
-    int targetH = std::clamp(h, 64, 4320);
-
-    if (!m_offscreenFbo || m_offscreenFbo->size() != QSize(targetW, targetH)) {
-        QOpenGLFramebufferObjectFormat fboFmt;
-        fboFmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
-        fboFmt.setTextureTarget(GL_TEXTURE_2D);
-        fboFmt.setInternalTextureFormat(GL_RGBA8);
-        m_offscreenFbo = std::make_unique<QOpenGLFramebufferObject>(targetW, targetH, fboFmt);
-    }
+    m_renderer.ensureOffscreenFbo(w, h);
 }
 
 void GpuPreviewViewport::ensureBufferPassFbos(int w, int h)
 {
-    const int targetW = std::clamp(w, 64, 7680);
-    const int targetH = std::clamp(h, 64, 4320);
-
-    for (size_t i = 0; i < 4; ++i) {
-        if (!m_bufferPassPrograms[i]) {
-            m_bufferPassFbos[i][0].reset();
-            m_bufferPassFbos[i][1].reset();
-            continue;
-        }
-        for (size_t slot = 0; slot < 2; ++slot) {
-            auto &fbo = m_bufferPassFbos[i][slot];
-            if (!fbo || fbo->size() != QSize(targetW, targetH)) {
-                QOpenGLFramebufferObjectFormat fboFmt;
-                fboFmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
-                fboFmt.setTextureTarget(GL_TEXTURE_2D);
-                fboFmt.setInternalTextureFormat(GL_RGBA8);
-                fbo = std::make_unique<QOpenGLFramebufferObject>(targetW, targetH, fboFmt);
-                if (fbo->bind()) {
-                    glViewport(0, 0, targetW, targetH);
-                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-                    glClear(GL_COLOR_BUFFER_BIT);
-                    fbo->release();
-                }
-            }
-        }
-    }
+    m_renderer.ensureBufferPassFbos(w, h);
 }
 
 bool GpuPreviewViewport::importDmaBufFrame(const waywal_dmabuf_frame_desc_t &desc,
                                            const int *plane_fds, size_t num_fds)
 {
-    auto cleanupIncomingFds = [plane_fds, num_fds]() {
-        if (!plane_fds)
-            return;
-        for (size_t i = 0; i < num_fds; ++i) {
-            if (plane_fds[i] >= 0) {
-                ::close(plane_fds[i]);
-            }
-        }
-    };
-
-    if (desc.width == 0 || desc.height == 0 || num_fds == 0 || !plane_fds) {
-        cleanupIncomingFds();
-        emit dmaBufImportFailed(
-            QStringLiteral("Invalid DMA-BUF parameters: dimensions 0 or no FDs"));
-        return false;
-    }
-
-    GlContextScope glScope(this);
-    if (!glScope.isReady()) {
-        cleanupIncomingFds();
-        emit dmaBufImportFailed(QStringLiteral("OpenGL context is not yet realized"));
-        return false;
-    }
-    resolveEglExtensions();
-
-    if (!m_eglCreateImageKHR || !m_glEGLImageTargetTexture2DOES) {
-        cleanupIncomingFds();
-        emit dmaBufImportFailed(QStringLiteral(
-            "Missing EGL DMA-BUF extensions (eglCreateImageKHR / glEGLImageTargetTexture2DOES)"));
-        return false;
-    }
-
-    EGLint attribs[64];
-    int n = 0;
-    attribs[n++] = EGL_WIDTH;
-    attribs[n++] = static_cast<EGLint>(desc.width);
-    attribs[n++] = EGL_HEIGHT;
-    attribs[n++] = static_cast<EGLint>(desc.height);
-    attribs[n++] = EGL_LINUX_DRM_FOURCC_EXT;
-    attribs[n++] = static_cast<EGLint>(desc.drm_format);
-
-    uint32_t planesToImport =
-        std::min({static_cast<uint32_t>(num_fds), desc.num_planes > 0 ? desc.num_planes : 1u, 4u});
-
-    for (uint32_t p = 0; p < planesToImport; ++p) {
-        if (plane_fds[p] < 0) {
-            continue;
-        }
-        attribs[n++] = kPlaneFdKeys[p];
-        attribs[n++] = plane_fds[p];
-        attribs[n++] = kPlaneOffsetKeys[p];
-        attribs[n++] = static_cast<EGLint>(desc.offsets[p]);
-        attribs[n++] = kPlanePitchKeys[p];
-        attribs[n++] = static_cast<EGLint>(desc.strides[p]);
-
-        if (desc.modifier != DRM_FORMAT_MOD_INVALID) {
-            attribs[n++] = kPlaneModLoKeys[p];
-            attribs[n++] = static_cast<EGLint>(desc.modifier & 0xFFFFFFFFULL);
-            attribs[n++] = kPlaneModHiKeys[p];
-            attribs[n++] = static_cast<EGLint>((desc.modifier >> 32) & 0xFFFFFFFFULL);
-        }
-    }
-    attribs[n] = EGL_NONE;
-
-    EGLImageKHR img =
-        m_eglCreateImageKHR(m_eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
-    if (img == EGL_NO_IMAGE_KHR) {
-        EGLint err = eglGetError();
-        cleanupIncomingFds();
-        emit dmaBufImportFailed(
-            QStringLiteral("eglCreateImageKHR failed with error 0x%1").arg(err, 0, 16));
-        return false;
-    }
-
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    m_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, static_cast<GLeglImageOES>(img));
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    EGLSyncKHR sync = EGL_NO_SYNC_KHR;
-    if (m_eglCreateSyncKHR) {
-        sync = m_eglCreateSyncKHR(m_eglDisplay, EGL_SYNC_FENCE_KHR, nullptr);
-        if (sync != EGL_NO_SYNC_KHR && m_eglWaitSyncKHR) {
-            m_eglWaitSyncKHR(m_eglDisplay, sync, 0);
-        }
-    }
-
-    DmaBufFrame newFrame;
-    newFrame.width = desc.width;
-    newFrame.height = desc.height;
-    newFrame.drm_format = desc.drm_format;
-    newFrame.modifier = desc.modifier;
-    newFrame.num_planes = planesToImport;
-    newFrame.flags = desc.flags;
-    newFrame.outputName = QString::fromUtf8(desc.output);
-    newFrame.eglImage = img;
-    newFrame.glTexture = tex;
-    newFrame.syncFence = sync;
-
-    for (uint32_t p = 0; p < 4; ++p) {
-        if (p < planesToImport) {
-            newFrame.planes[p].fd = plane_fds[p];
-            newFrame.planes[p].stride = desc.strides[p];
-            newFrame.planes[p].offset = desc.offsets[p];
-        } else {
-            newFrame.planes[p].fd = -1;
-        }
-    }
-
-    // Close any excess SCM_RIGHTS FDs beyond planesToImport so kernel descriptors never leak.
-    for (size_t extra = planesToImport; extra < num_fds; ++extra) {
-        if (plane_fds[extra] >= 0) {
-            ::close(plane_fds[extra]);
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(m_frameMutex);
-        if (m_currentDmaBufFrame.has_value()) {
-            m_currentDmaBufFrame->releaseGl(m_eglDisplay, m_eglDestroyImageKHR,
-                                            m_eglDestroySyncKHR);
-        }
-        m_currentDmaBufFrame = newFrame;
-        m_previewMode = PreviewMode::DmaBufLive;
-    }
-
-    m_frameCount++;
-    updateAnimationTimerState();
-    emit dmaBufFrameRendered(desc.width, desc.height, m_frameCount);
-    update();
-    return true;
+    return m_swapchain.importFrame(*this, desc, plane_fds, num_fds);
 }
 
 bool GpuPreviewViewport::requestLiveDmaBuf(int socketFd, const QString &outputName)
 {
-    if (socketFd < 0) {
-        return false;
-    }
-
-    waywal_ipc_hdr_t req_hdr;
-    std::memset(&req_hdr, 0, sizeof(req_hdr));
-    req_hdr.magic = WAYWAL_IPC_MAGIC;
-    req_hdr.version = WAYWAL_IPC_VERSION;
-    req_hdr.opcode = WAYWAL_REQ_EXPORT_OUTPUT_DMABUF;
-    req_hdr.payload_size = sizeof(waywal_export_dmabuf_req_t);
-
-    waywal_export_dmabuf_req_t req_pay;
-    std::memset(&req_pay, 0, sizeof(req_pay));
-    if (!outputName.isEmpty()) {
-        std::strncpy(req_pay.output, outputName.toUtf8().constData(), sizeof(req_pay.output) - 1);
-    }
-
-    if (!waywal_ipc_send(socketFd, &req_hdr, -1)) {
-        return false;
-    }
-    if (::write(socketFd, &req_pay, sizeof(req_pay)) != static_cast<ssize_t>(sizeof(req_pay))) {
-        return false;
-    }
-
-    waywal_ipc_hdr_t resp_hdr;
-    int fds[4] = {-1, -1, -1, -1};
-    size_t num_fds = 0;
-    if (!waywal_ipc_recv_fds(socketFd, &resp_hdr, fds, 4, &num_fds)) {
-        return false;
-    }
-
-    if ((resp_hdr.opcode != WAYWAL_RESP_OK && resp_hdr.opcode != WAYWAL_RESP_DMABUF) ||
-        resp_hdr.payload_size < sizeof(waywal_export_dmabuf_resp_t)) {
-        for (size_t i = 0; i < num_fds; ++i) {
-            if (fds[i] >= 0)
-                ::close(fds[i]);
-        }
-        return false;
-    }
-
-    waywal_export_dmabuf_resp_t resp_pay;
-    if (::read(socketFd, &resp_pay, sizeof(resp_pay)) != static_cast<ssize_t>(sizeof(resp_pay))) {
-        for (size_t i = 0; i < num_fds; ++i) {
-            if (fds[i] >= 0)
-                ::close(fds[i]);
-        }
-        return false;
-    }
-
-    return importDmaBufFrame(resp_pay, fds, num_fds);
+    return m_swapchain.requestFromSocket(*this, socketFd, outputName);
 }
 
 bool GpuPreviewViewport::requestLiveDmaBufFromNamespace(const QString &namespaceStr,
                                                         const QString &outputName)
 {
-    path_buf_t sockPath;
-    if (!waywal_ipc_resolve_socket_path(&sockPath, namespaceStr.toUtf8().constData())) {
-        return false;
-    }
-
-    int clientFd = waywal_ipc_client_connect(namespaceStr.toUtf8().constData(), 200);
-    if (clientFd < 0) {
-        return false;
-    }
-
-    bool ok = requestLiveDmaBuf(clientFd, outputName);
-    ::close(clientFd);
-    return ok;
+    return m_swapchain.requestFromNamespace(*this, namespaceStr, outputName);
 }
 
 void GpuPreviewViewport::setPreviewImage(const QImage &image)
@@ -1009,29 +2275,23 @@ void GpuPreviewViewport::setPreviewImage(const QImage &image)
         return;
     }
 
-    m_fallbackImage = image;
     QImage formatted = image.convertToFormat(QImage::Format_RGBA8888);
+    int validatedStride = 0;
+    if (formatted.isNull() || formatted.width() <= 0 || formatted.height() <= 0 ||
+        !validateRgbaImageBounds(static_cast<uint32_t>(formatted.width()),
+                                 static_cast<uint32_t>(formatted.height()), validatedStride)) {
+        clearPreviewImage();
+        return;
+    }
+
+    m_fallbackImage = image;
     m_imageWidth = static_cast<uint32_t>(formatted.width());
     m_imageHeight = static_cast<uint32_t>(formatted.height());
 
     {
         GlContextScope glScope(this);
         if (glScope.isReady()) {
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-#ifdef GL_UNPACK_ROW_LENGTH
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-#endif
-            if (m_inProcessImageTex == 0) {
-                glGenTextures(1, &m_inProcessImageTex);
-            }
-            glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, formatted.constBits());
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glBindTexture(GL_TEXTURE_2D, 0);
+            m_renderer.uploadFallbackImageTexture(formatted);
         }
     }
 
@@ -1087,9 +2347,12 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
     // 3. Fallback to libwaywal_core's image_load_rgba (JXL, AVIF, WebP, SVG, QOI, HDR, etc.)
     if (img.isNull() && QFileInfo::exists(targetPath)) {
         uint8_t *rgba = nullptr;
-        uint32_t w = 0, h = 0;
-        if (image_load_rgba(stdPath.c_str(), &rgba, &w, &h) && rgba && w > 0 && h > 0) {
-            QImage raw(rgba, static_cast<int>(w), static_cast<int>(h), static_cast<int>(w * 4),
+        uint32_t w = 0;
+        uint32_t h = 0;
+        int rgbaStride = 0;
+        if (image_load_rgba(stdPath.c_str(), &rgba, &w, &h) && rgba &&
+            validateRgbaImageBounds(w, h, rgbaStride)) {
+            QImage raw(rgba, static_cast<int>(w), static_cast<int>(h), rgbaStride,
                        QImage::Format_RGBA8888);
             img = raw.copy();
             image_free(rgba);
@@ -1098,29 +2361,18 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
         }
     }
 
-    // 4. Video wallpaper preview frame extraction (check disk cache first, then async ffmpeg)
+    // 4. Video wallpaper preview frame extraction via canonical cache resolver + async ffmpeg
     if (img.isNull() && QFileInfo::exists(targetPath) &&
         (ext == ".mp4" || ext == ".mkv" || ext == ".webm" || ext == ".avi" || ext == ".mov")) {
-        const char *xdgCache = std::getenv("XDG_CACHE_HOME");
-        std::filesystem::path cacheDir;
-        if (xdgCache && xdgCache[0] != '\0') {
-            cacheDir = std::filesystem::path(xdgCache) / "wwal" / "thumbnails";
-        } else {
-            const char *home = std::getenv("HOME");
-            cacheDir =
-                std::filesystem::path(home ? home : "/tmp") / ".cache" / "wwal" / "thumbnails";
-        }
-        QByteArray hash = QCryptographicHash::hash(
-            QByteArray::fromRawData(stdPath.data(), static_cast<qsizetype>(stdPath.size())),
-            QCryptographicHash::Sha256);
-        const std::filesystem::path cachedThumb = cacheDir / (hash.toHex().toStdString() + ".webp");
-        std::error_code ec;
-        if (std::filesystem::exists(cachedThumb, ec)) {
-            img.load(QString::fromStdString(cachedThumb.string()));
+        char thumbPathBuf[PATH_MAX];
+        if (waywal_thumb_resolve_cache_path(stdPath.c_str(), thumbPathBuf, sizeof(thumbPathBuf))) {
+            std::error_code ec;
+            if (std::filesystem::exists(thumbPathBuf, ec)) {
+                img.load(QString::fromUtf8(thumbPathBuf));
+            }
         }
 
         if (img.isNull()) {
-            // Render immediate procedural placeholder and decode video frame off the GUI thread.
             QImage placeholder(640, 360, QImage::Format_RGBA8888);
             QPainter pp(&placeholder);
             QLinearGradient vgrad(0, 0, 640, 360);
@@ -1141,6 +2393,21 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
                 if (st.stop_requested()) {
                     return;
                 }
+                struct VideoProcCancelState {
+                    std::mutex mu;
+                    qint64 pid{0};
+                    bool finished{false};
+                };
+                auto cancelState = std::make_shared<VideoProcCancelState>();
+                // Register stop_callback so viewport teardown terminates blocking ffmpeg
+                // immediately via SIGKILL instead of waiting for the full timeout.
+                std::stop_callback stopCb(st, [cancelState]() noexcept {
+                    std::lock_guard<std::mutex> lock(cancelState->mu);
+                    if (!cancelState->finished && cancelState->pid > 0) {
+                        ::kill(static_cast<pid_t>(cancelState->pid), SIGKILL);
+                    }
+                });
+
                 QProcess proc;
                 proc.start(QStringLiteral("ffmpeg"),
                            {QStringLiteral("-loglevel"), QStringLiteral("error"),
@@ -1150,7 +2417,39 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
                             QStringLiteral("scale=1280:-1"), QStringLiteral("-f"),
                             QStringLiteral("image2pipe"), QStringLiteral("-vcodec"),
                             QStringLiteral("bmp"), QStringLiteral("-")});
-                if (!proc.waitForFinished(2500) || proc.exitCode() != 0 || st.stop_requested()) {
+                if (!proc.waitForStarted(500)) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(cancelState->mu);
+                    cancelState->pid = proc.processId();
+                    if (st.stop_requested() && cancelState->pid > 0) {
+                        ::kill(static_cast<pid_t>(cancelState->pid), SIGKILL);
+                    }
+                }
+                bool exited = false;
+                for (int i = 0; i < 50; ++i) {
+                    if (st.stop_requested()) {
+                        break;
+                    }
+                    if (proc.waitForFinished(50)) {
+                        exited = true;
+                        break;
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(cancelState->mu);
+                    cancelState->finished = true;
+                    cancelState->pid = 0;
+                }
+                if (!exited || st.stop_requested()) {
+                    if (proc.state() != QProcess::NotRunning) {
+                        proc.kill();
+                        proc.waitForFinished(250);
+                    }
+                    return;
+                }
+                if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
                     return;
                 }
                 const QByteArray data = proc.readAllStandardOutput();
@@ -1158,7 +2457,7 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
                 if (!data.isEmpty()) {
                     decoded.loadFromData(data, "BMP");
                 }
-                if (decoded.isNull() || !safeSelf || !qApp) {
+                if (decoded.isNull() || !safeSelf || !qApp || st.stop_requested()) {
                     return;
                 }
                 QMetaObject::invokeMethod(
@@ -1211,21 +2510,19 @@ void GpuPreviewViewport::clearPreviewImage()
     {
         GlContextScope glScope(this);
         if (glScope.isReady()) {
-            if (m_inProcessImageTex != 0) {
-                glDeleteTextures(1, &m_inProcessImageTex);
-                m_inProcessImageTex = 0;
-            }
+            m_renderer.deleteInProcessImageTexture();
         } else {
-            m_inProcessImageTex = 0;
+            m_renderer.m_inProcessImageTex = 0;
         }
     }
     m_imageWidth = 0;
     m_imageHeight = 0;
 
     if (m_previewMode == PreviewMode::InProcessImage) {
-        if (m_currentDmaBufFrame.has_value()) {
+        if (m_swapchain.hasLiveFrame()) {
             m_previewMode = PreviewMode::DmaBufLive;
-        } else if (m_shaderProgram || m_computeShaderProgram || !m_shaderSource.isEmpty()) {
+        } else if (m_renderer.m_shaderProgram || m_renderer.m_computeShaderProgram ||
+                   !m_shaderSource.isEmpty()) {
             m_previewMode = PreviewMode::InProcessShader;
         } else {
             m_previewMode = PreviewMode::OfflineEmpty;
@@ -1237,191 +2534,7 @@ void GpuPreviewViewport::clearPreviewImage()
 
 bool GpuPreviewViewport::compileShaderInternal(const QString &glslSource, QString *outError)
 {
-    const QString trimmed = glslSource.trimmed();
-    if (trimmed.isEmpty()) {
-        if (outError) {
-            *outError = QStringLiteral("Empty GLSL shader source");
-        }
-        return false;
-    }
-
-    const bool isGles =
-        QOpenGLContext::currentContext() && QOpenGLContext::currentContext()->isOpenGLES();
-
-    auto compileLinkedFragmentProgram =
-        [&](const QString &fragSrc, bool graphVaryings,
-            QString *errOut) -> std::unique_ptr<QOpenGLShaderProgram> {
-        struct Variant {
-            const char *vs;
-            QString fs;
-        };
-        std::vector<Variant> attempts;
-        if (graphVaryings) {
-            if (isGles) {
-                attempts.push_back({kGraphVertexShaderEs310, fragSrc});
-                attempts.push_back({kGraphVertexShaderEs300, convertEs310ToEs300(fragSrc)});
-            } else {
-                attempts.push_back(
-                    {kGraphVertexShaderCore330, convertEsFragmentToCore330(fragSrc)});
-                attempts.push_back({kGraphVertexShaderEs310, fragSrc});
-            }
-        } else {
-            if (isGles) {
-                attempts.push_back({kBlitVertexShader, fragSrc});
-                if (fragSrc.contains(QLatin1String("#version 310 es"))) {
-                    attempts.push_back({kGraphVertexShaderEs310, fragSrc});
-                    attempts.push_back({kBlitVertexShader, convertEs310ToEs300(fragSrc)});
-                }
-            } else {
-                attempts.push_back({kBlitVertexShaderCore, convertEsFragmentToCore330(fragSrc)});
-                attempts.push_back({kBlitVertexShader, fragSrc});
-            }
-        }
-
-        QString lastLog;
-        for (const auto &attempt : attempts) {
-            auto prog = std::make_unique<QOpenGLShaderProgram>(this);
-            if (!prog->addShaderFromSourceCode(QOpenGLShader::Vertex, attempt.vs)) {
-                lastLog = prog->log();
-                continue;
-            }
-            if (!prog->addShaderFromSourceCode(QOpenGLShader::Fragment, attempt.fs)) {
-                lastLog = prog->log();
-                continue;
-            }
-            if (!prog->link()) {
-                lastLog = prog->log();
-                continue;
-            }
-            return prog;
-        }
-        if (errOut) {
-            *errOut = lastLog;
-        }
-        return nullptr;
-    };
-
-    // 1. Compute Shader support (e.g. #version 310 es / #version 430 with local_size_x +
-    // imageStore)
-    if (trimmed.contains(QLatin1String("local_size_x")) &&
-        trimmed.contains(QLatin1String("imageStore"))) {
-        auto csProg = std::make_unique<QOpenGLShaderProgram>(this);
-        if (!csProg->addShaderFromSourceCode(QOpenGLShader::Compute, trimmed) || !csProg->link()) {
-            if (outError) {
-                *outError = csProg->log();
-            }
-            return false;
-        }
-        m_computeShaderProgram = std::move(csProg);
-        m_shaderProgram.reset();
-        for (auto &bp : m_bufferPassPrograms) {
-            bp.reset();
-        }
-        for (auto &pair : m_bufferPassFbos) {
-            pair[0].reset();
-            pair[1].reset();
-        }
-        m_bufferPingPongIdx = 0;
-        return true;
-    }
-
-    // 2. .wwgraph multi-pass / single-pass #pragma Pass GLSL output
-    if (trimmed.contains(QLatin1String("#pragma Pass"))) {
-        const std::vector<GraphPassSource> passes = parseGraphPasses(trimmed);
-        if (passes.empty()) {
-            if (outError) {
-                *outError = QStringLiteral("No shader passes found after #pragma Pass directive");
-            }
-            return false;
-        }
-
-        std::array<std::unique_ptr<QOpenGLShaderProgram>, 4> nextBufferProgs{};
-        std::unique_ptr<QOpenGLShaderProgram> nextImageProg;
-
-        for (const auto &pass : passes) {
-            QString passErr;
-            auto compiled =
-                compileLinkedFragmentProgram(pass.glsl, /*graphVaryings=*/true, &passErr);
-            if (!compiled) {
-                if (outError) {
-                    *outError = passErr;
-                }
-                return false;
-            }
-            if (pass.passIndex >= 0 && pass.passIndex < 4) {
-                nextBufferProgs[static_cast<size_t>(pass.passIndex)] = std::move(compiled);
-            } else {
-                nextImageProg = std::move(compiled);
-            }
-        }
-
-        if (!nextImageProg) {
-            // If a graph only emitted buffer passes, promote the highest active buffer pass to
-            // screen
-            for (int i = 3; i >= 0; --i) {
-                if (nextBufferProgs[static_cast<size_t>(i)]) {
-                    nextImageProg = std::move(nextBufferProgs[static_cast<size_t>(i)]);
-                    break;
-                }
-            }
-        }
-
-        m_computeShaderProgram.reset();
-        m_bufferPassPrograms = std::move(nextBufferProgs);
-        m_shaderProgram = std::move(nextImageProg);
-        m_bufferPingPongIdx = 0;
-        for (size_t i = 0; i < 4; ++i) {
-            for (size_t slot = 0; slot < 2; ++slot) {
-                if (m_bufferPassPrograms[i] && m_bufferPassFbos[i][slot] &&
-                    m_bufferPassFbos[i][slot]->bind()) {
-                    glViewport(0, 0, m_bufferPassFbos[i][slot]->width(),
-                               m_bufferPassFbos[i][slot]->height());
-                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-                    glClear(GL_COLOR_BUFFER_BIT);
-                    m_bufferPassFbos[i][slot]->release();
-                }
-            }
-        }
-        ensureNeutralPassTexture();
-        const QSize fbSize = physicalFramebufferSize();
-        ensureOffscreenFbo(fbSize.width(), fbSize.height());
-        ensureBufferPassFbos(fbSize.width(), fbSize.height());
-        return true;
-    }
-
-    // 3. Shadertoy (mainImage) or standalone fragment shader
-    QString fullShaderSource;
-    const bool usesGraphVarying = trimmed.contains(QLatin1String("v_TexCoord"));
-    if (trimmed.contains(QLatin1String("mainImage"))) {
-        const char *preamble = isGles ? kShadertoyPreamble : kShadertoyPreambleCore;
-        fullShaderSource =
-            QString::fromUtf8(preamble) + trimmed + QString::fromUtf8(kShadertoyEpilogue);
-    } else if (trimmed.contains(QLatin1String("#version"))) {
-        fullShaderSource = trimmed;
-    } else {
-        const char *preamble = isGles ? kShadertoyPreamble : kShadertoyPreambleCore;
-        fullShaderSource = QString::fromUtf8(preamble) + trimmed;
-    }
-
-    auto program = compileLinkedFragmentProgram(fullShaderSource, usesGraphVarying, outError);
-    if (!program) {
-        return false;
-    }
-
-    m_computeShaderProgram.reset();
-    for (auto &bp : m_bufferPassPrograms) {
-        bp.reset();
-    }
-    for (auto &pair : m_bufferPassFbos) {
-        pair[0].reset();
-        pair[1].reset();
-    }
-    m_bufferPingPongIdx = 0;
-    m_shaderProgram = std::move(program);
-    ensureNeutralPassTexture();
-    const QSize fbSize = physicalFramebufferSize();
-    ensureOffscreenFbo(fbSize.width(), fbSize.height());
-    return true;
+    return m_renderer.compileShader(this, glslSource, physicalFramebufferSize(), outError);
 }
 
 bool GpuPreviewViewport::setPreviewShader(const QString &glslSource, QString *outError)
@@ -1465,23 +2578,31 @@ void GpuPreviewViewport::clearPreviewShader()
 {
     {
         GlContextScope glScope(this);
-        m_shaderProgram.reset();
-        m_computeShaderProgram.reset();
-        for (auto &bp : m_bufferPassPrograms) {
+        if (glScope.isReady() && m_renderer.m_computeOutputTex != 0) {
+            glDeleteTextures(1, &m_renderer.m_computeOutputTex);
+        }
+        m_renderer.m_computeOutputTex = 0;
+        m_renderer.m_computeTexWidth = 0;
+        m_renderer.m_computeTexHeight = 0;
+        m_renderer.m_computeInternalFormat = GL_RGBA16F;
+        m_renderer.m_computeBindingUnit = 0u;
+        m_renderer.m_shaderProgram.reset();
+        m_renderer.m_computeShaderProgram.reset();
+        for (auto &bp : m_renderer.m_bufferPassPrograms) {
             bp.reset();
         }
-        for (auto &pair : m_bufferPassFbos) {
+        for (auto &pair : m_renderer.m_bufferPassFbos) {
             pair[0].reset();
             pair[1].reset();
         }
-        m_bufferPingPongIdx = 0;
+        m_renderer.m_bufferPingPongIdx = 0;
     }
     m_shaderSource.clear();
 
     if (m_previewMode == PreviewMode::InProcessShader) {
-        if (m_currentDmaBufFrame.has_value()) {
+        if (m_swapchain.hasLiveFrame()) {
             m_previewMode = PreviewMode::DmaBufLive;
-        } else if (m_inProcessImageTex != 0 || !m_fallbackImage.isNull()) {
+        } else if (m_renderer.m_inProcessImageTex != 0 || !m_fallbackImage.isNull()) {
             m_previewMode = PreviewMode::InProcessImage;
         } else {
             m_previewMode = PreviewMode::OfflineEmpty;
@@ -1689,16 +2810,19 @@ void GpuPreviewViewport::applyShaderUniforms(QOpenGLShaderProgram &prog, float f
     }
 
     ensureNeutralPassTexture();
-    const GLuint fallbackSourceTex =
-        (m_inProcessImageTex != 0) ? m_inProcessImageTex : m_neutralPassTex;
-    const int readSlot = m_bufferPingPongIdx & 1;
+    const GLuint fallbackSourceTex = (m_renderer.m_inProcessImageTex != 0)
+                                         ? m_renderer.m_inProcessImageTex
+                                         : m_renderer.m_neutralPassTex;
+    const int readSlot = m_renderer.m_bufferPingPongIdx & 1;
     const int writeSlot = 1 - readSlot;
     GLuint passTex[5] = {
-        fallbackSourceTex, m_neutralPassTex, m_neutralPassTex, m_neutralPassTex, m_neutralPassTex,
+        fallbackSourceTex,          m_renderer.m_neutralPassTex, m_renderer.m_neutralPassTex,
+        m_renderer.m_neutralPassTex, m_renderer.m_neutralPassTex,
     };
     for (int u = 0; u < 4; ++u) {
         const int slot = (u < activeWritePass) ? writeSlot : readSlot;
-        const auto &fbo = m_bufferPassFbos[static_cast<size_t>(u)][static_cast<size_t>(slot)];
+        const auto &fbo =
+            m_renderer.m_bufferPassFbos[static_cast<size_t>(u)][static_cast<size_t>(slot)];
         if (fbo && fbo->texture() != 0) {
             passTex[u] = fbo->texture();
         }
@@ -1757,7 +2881,7 @@ void GpuPreviewViewport::renderInProcessShaderPass()
                                    : (1.0f / static_cast<float>(std::max(1, m_targetFps)));
     m_lastFrameTimeNs = nowNs;
 
-    if (m_computeShaderProgram && QOpenGLContext::currentContext()) {
+    if (m_renderer.m_computeShaderProgram && QOpenGLContext::currentContext()) {
         QOpenGLContext *ctx = QOpenGLContext::currentContext();
         auto texStorage2D =
             reinterpret_cast<GlTexStorage2DProc>(ctx->getProcAddress("glTexStorage2D"));
@@ -1771,39 +2895,52 @@ void GpuPreviewViewport::renderInProcessShaderPass()
         const QSize fbSize = physicalFramebufferSize();
         const int targetW = std::clamp(fbSize.width(), 64, 7680);
         const int targetH = std::clamp(fbSize.height(), 64, 4320);
+        const GLenum imgFmt = (m_renderer.m_computeInternalFormat != 0)
+                                  ? m_renderer.m_computeInternalFormat
+                                  : GL_RGBA16F;
         if (texStorage2D && bindImageTex && dispatchCompute && memoryBarrier) {
-            if (m_computeOutputTex == 0 || m_computeTexWidth != targetW ||
-                m_computeTexHeight != targetH) {
-                if (m_computeOutputTex != 0) {
-                    glDeleteTextures(1, &m_computeOutputTex);
-                    m_computeOutputTex = 0;
+            if (m_renderer.m_computeOutputTex == 0 || m_renderer.m_computeTexWidth != targetW ||
+                m_renderer.m_computeTexHeight != targetH) {
+                if (m_renderer.m_computeOutputTex != 0) {
+                    glDeleteTextures(1, &m_renderer.m_computeOutputTex);
+                    m_renderer.m_computeOutputTex = 0;
                 }
-                glGenTextures(1, &m_computeOutputTex);
-                glBindTexture(GL_TEXTURE_2D, m_computeOutputTex);
-                texStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, targetW, targetH);
+                glGenTextures(1, &m_renderer.m_computeOutputTex);
+                glBindTexture(GL_TEXTURE_2D, m_renderer.m_computeOutputTex);
+                texStorage2D(GL_TEXTURE_2D, 1, imgFmt, targetW, targetH);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                 glBindTexture(GL_TEXTURE_2D, 0);
-                m_computeTexWidth = targetW;
-                m_computeTexHeight = targetH;
+                if (imgFmt == GL_RGBA16F || imgFmt == GL_RGBA8) {
+                    zeroFillTexture2D(m_renderer.m_computeOutputTex, targetW, targetH,
+                                      imgFmt == GL_RGBA16F);
+                }
+                m_renderer.m_computeTexWidth = targetW;
+                m_renderer.m_computeTexHeight = targetH;
             }
 
-            m_computeShaderProgram->bind();
-            applyShaderUniforms(*m_computeShaderProgram, static_cast<float>(targetW),
+            m_renderer.m_computeShaderProgram->bind();
+            applyShaderUniforms(*m_renderer.m_computeShaderProgram, static_cast<float>(targetW),
                                 static_cast<float>(targetH), timeSec, timeDeltaSec);
-            bindImageTex(1, m_computeOutputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+            bindImageTex(m_renderer.m_computeBindingUnit, m_renderer.m_computeOutputTex, 0,
+                         GL_FALSE, 0, GL_WRITE_ONLY, imgFmt);
             dispatchCompute(static_cast<GLuint>((targetW + 15) / 16),
                             static_cast<GLuint>((targetH + 15) / 16), 1u);
             memoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
-            m_computeShaderProgram->release();
+            bindImageTex(m_renderer.m_computeBindingUnit, 0, 0, GL_FALSE, 0, GL_READ_ONLY, imgFmt);
+            m_renderer.m_computeShaderProgram->release();
+            for (int unit = 4; unit >= 0; --unit) {
+                glActiveTexture(GL_TEXTURE0 + unit);
+                glBindTexture(GL_TEXTURE_2D, 0);
+            }
             m_shaderFrameIndex++;
         }
         return;
     }
 
-    if (!m_shaderProgram) {
+    if (!m_renderer.m_shaderProgram) {
         return;
     }
 
@@ -1812,8 +2949,8 @@ void GpuPreviewViewport::renderInProcessShaderPass()
     ensureBufferPassFbos(fbSize.width(), fbSize.height());
 
     auto drawFullscreenQuad = [this]() {
-        m_quadVao.bind();
-        m_quadVbo.bind();
+        m_renderer.m_quadVao.bind();
+        m_renderer.m_quadVbo.bind();
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
                               reinterpret_cast<void *>(offsetof(Vertex, x)));
@@ -1823,17 +2960,17 @@ void GpuPreviewViewport::renderInProcessShaderPass()
         glDrawArrays(GL_TRIANGLES, 0, 6);
         glDisableVertexAttribArray(1);
         glDisableVertexAttribArray(0);
-        m_quadVbo.release();
-        m_quadVao.release();
+        m_renderer.m_quadVbo.release();
+        m_renderer.m_quadVao.release();
     };
 
-    const int writeSlot = 1 - (m_bufferPingPongIdx & 1);
+    const int writeSlot = 1 - (m_renderer.m_bufferPingPongIdx & 1);
 
     // Render BUFFER_A..BUFFER_D into writeSlot while sampling upstream passes from writeSlot and
     // self/downstream feedback passes from readSlot to prevent FBO feedback loops.
     for (size_t i = 0; i < 4; ++i) {
-        auto &writeFbo = m_bufferPassFbos[i][static_cast<size_t>(writeSlot)];
-        if (!m_bufferPassPrograms[i] || !writeFbo) {
+        auto &writeFbo = m_renderer.m_bufferPassFbos[i][static_cast<size_t>(writeSlot)];
+        if (!m_renderer.m_bufferPassPrograms[i] || !writeFbo) {
             continue;
         }
         writeFbo->bind();
@@ -1841,28 +2978,28 @@ void GpuPreviewViewport::renderInProcessShaderPass()
         const float bh = static_cast<float>(writeFbo->height());
         glViewport(0, 0, writeFbo->width(), writeFbo->height());
 
-        m_bufferPassPrograms[i]->bind();
-        applyShaderUniforms(*m_bufferPassPrograms[i], bw, bh, timeSec, timeDeltaSec,
+        m_renderer.m_bufferPassPrograms[i]->bind();
+        applyShaderUniforms(*m_renderer.m_bufferPassPrograms[i], bw, bh, timeSec, timeDeltaSec,
                             static_cast<int>(i));
         drawFullscreenQuad();
-        m_bufferPassPrograms[i]->release();
+        m_renderer.m_bufferPassPrograms[i]->release();
         writeFbo->release();
     }
 
-    m_offscreenFbo->bind();
-    const float fboW = static_cast<float>(m_offscreenFbo->width());
-    const float fboH = static_cast<float>(m_offscreenFbo->height());
-    glViewport(0, 0, m_offscreenFbo->width(), m_offscreenFbo->height());
+    m_renderer.m_offscreenFbo->bind();
+    const float fboW = static_cast<float>(m_renderer.m_offscreenFbo->width());
+    const float fboH = static_cast<float>(m_renderer.m_offscreenFbo->height());
+    glViewport(0, 0, m_renderer.m_offscreenFbo->width(), m_renderer.m_offscreenFbo->height());
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    m_shaderProgram->bind();
-    applyShaderUniforms(*m_shaderProgram, fboW, fboH, timeSec, timeDeltaSec, 4);
+    m_renderer.m_shaderProgram->bind();
+    applyShaderUniforms(*m_renderer.m_shaderProgram, fboW, fboH, timeSec, timeDeltaSec, 4);
     drawFullscreenQuad();
-    m_shaderProgram->release();
-    m_offscreenFbo->release();
+    m_renderer.m_shaderProgram->release();
+    m_renderer.m_offscreenFbo->release();
 
-    m_bufferPingPongIdx ^= 1;
+    m_renderer.m_bufferPingPongIdx ^= 1;
 
     for (int unit = 4; unit >= 0; --unit) {
         glActiveTexture(GL_TEXTURE0 + unit);
@@ -1873,22 +3010,7 @@ void GpuPreviewViewport::renderInProcessShaderPass()
 
 float GpuPreviewViewport::calculateGuideAspect() const noexcept
 {
-    switch (m_aspectRatioGuide) {
-    case AspectRatioGuide::Ratio16_9:
-        return 16.0f / 9.0f;
-    case AspectRatioGuide::Ratio16_10:
-        return 16.0f / 10.0f;
-    case AspectRatioGuide::Ratio21_9:
-        return 21.0f / 9.0f;
-    case AspectRatioGuide::Ratio32_9:
-        return 32.0f / 9.0f;
-    case AspectRatioGuide::Ratio4_3:
-        return 4.0f / 3.0f;
-    case AspectRatioGuide::MatchActiveDisplay:
-    case AspectRatioGuide::None:
-    default:
-        return static_cast<float>(width()) / std::max(1.0f, static_cast<float>(height()));
-    }
+    return m_inputMapper.calculateGuideAspect(m_aspectRatioGuide, size());
 }
 
 QRectF GpuPreviewViewport::computeContentDisplayRect() const noexcept
@@ -1927,31 +3049,8 @@ QRectF GpuPreviewViewport::computeContentDisplayRect() const noexcept
         }
     }
 
-    float cW = static_cast<float>(contentWidth());
-    float cH = static_cast<float>(contentHeight());
-    if (cW <= 0.0f || cH <= 0.0f) {
-        cW = static_cast<float>(width());
-        cH = static_cast<float>(height());
-    }
-
-    float cAspect = cW / cH;
-    float vW = static_cast<float>(width());
-    float vH = static_cast<float>(height());
-    float vAspect = vW / std::max(1.0f, vH);
-
-    QRectF baseRect;
-    if (cAspect > vAspect) {
-        float h = vW / cAspect;
-        baseRect = QRectF(0.0f, (vH - h) * 0.5f, vW, h);
-    } else {
-        float w = vH * cAspect;
-        baseRect = QRectF((vW - w) * 0.5f, 0.0f, w, vH);
-    }
-
-    QPointF center = baseRect.center() + m_panOffset;
-    float scaledW = baseRect.width() * m_zoom;
-    float scaledH = baseRect.height() * m_zoom;
-    return QRectF(center.x() - scaledW * 0.5f, center.y() - scaledH * 0.5f, scaledW, scaledH);
+    return m_inputMapper.computeContentDisplayRect(size(), contentWidth(), contentHeight(), m_zoom,
+                                                   m_panOffset);
 }
 
 void GpuPreviewViewport::updateFpsTelemetry()
@@ -1981,82 +3080,61 @@ void GpuPreviewViewport::paintGL()
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
 
-    if (m_previewMode == PreviewMode::InProcessImage && m_inProcessImageTex == 0 &&
+    if (m_previewMode == PreviewMode::InProcessImage && m_renderer.m_inProcessImageTex == 0 &&
         !m_fallbackImage.isNull()) {
-        QImage formatted = m_fallbackImage.convertToFormat(QImage::Format_RGBA8888);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-#ifdef GL_UNPACK_ROW_LENGTH
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-#endif
-        glGenTextures(1, &m_inProcessImageTex);
-        glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0, GL_RGBA,
-                     GL_UNSIGNED_BYTE, formatted.constBits());
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glBindTexture(GL_TEXTURE_2D, 0);
+        m_renderer.uploadFallbackImageTexture(m_fallbackImage);
     }
 
     GLuint activeTex = 0;
     int flipY = 0;
     int isBgr = 0;
-    uint32_t cW = contentWidth();
-    uint32_t cH = contentHeight();
+    const uint32_t cW = contentWidth();
+    const uint32_t cH = contentHeight();
 
     if (m_previewMode == PreviewMode::DmaBufLive) {
-        std::lock_guard<std::mutex> lock(m_frameMutex);
-        if (m_currentDmaBufFrame.has_value()) {
-            activeTex = m_currentDmaBufFrame->glTexture;
+        activeTex = m_swapchain.currentTexture(isBgr);
+        if (activeTex != 0) {
             flipY = 1; // Wayland DMA-BUF coordinate convention
-            // Check for BGR DRM formats
-            if (m_currentDmaBufFrame->drm_format == DRM_FORMAT_XBGR8888 ||
-                m_currentDmaBufFrame->drm_format == DRM_FORMAT_ABGR8888) {
-                isBgr = 1;
-            }
         }
     } else if (m_previewMode == PreviewMode::InProcessShader) {
-        if (!m_shaderProgram && !m_computeShaderProgram && !m_shaderSource.isEmpty()) {
+        if (!m_renderer.m_shaderProgram && !m_renderer.m_computeShaderProgram &&
+            !m_shaderSource.isEmpty()) {
             (void)compileShaderInternal(m_shaderSource, nullptr);
         }
         renderInProcessShaderPass();
-        if (m_computeShaderProgram && m_computeOutputTex != 0) {
-            activeTex = m_computeOutputTex;
+        if (m_renderer.m_computeShaderProgram && m_renderer.m_computeOutputTex != 0) {
+            activeTex = m_renderer.m_computeOutputTex;
             flipY = 0;
-        } else if (m_offscreenFbo) {
-            activeTex = m_offscreenFbo->texture();
+        } else if (m_renderer.m_offscreenFbo) {
+            activeTex = m_renderer.m_offscreenFbo->texture();
             flipY = 0; // FBO is already in OpenGL bottom-left origin coordinates
         }
     } else if (m_previewMode == PreviewMode::InProcessImage) {
-        activeTex = m_inProcessImageTex;
+        activeTex = m_renderer.m_inProcessImageTex;
         flipY = 1; // QImage::constBits() has row 0 at top-left
     }
 
-    const qreal dpr = devicePixelRatioF();
-    const int fbW = std::max(1, static_cast<int>(std::round(width() * dpr)));
-    const int fbH = std::max(1, static_cast<int>(std::round(height() * dpr)));
-
+    const QSize fbSize = physicalFramebufferSize();
     glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
-    glViewport(0, 0, fbW, fbH);
+    glViewport(0, 0, fbSize.width(), fbSize.height());
     glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    if (activeTex != 0 && m_blitProgram) {
-        m_blitProgram->bind();
+    if (activeTex != 0 && m_renderer.m_blitProgram) {
+        m_renderer.m_blitProgram->bind();
 
         const QMatrix4x4 mvp = computeBlitMvp(cW, cH);
 
-        m_blitProgram->setUniformValue("u_mvp", mvp);
-        m_blitProgram->setUniformValue("u_texture", 0);
-        m_blitProgram->setUniformValue("u_flip_y", flipY);
-        m_blitProgram->setUniformValue("u_is_bgr", isBgr);
+        m_renderer.m_blitProgram->setUniformValue("u_mvp", mvp);
+        m_renderer.m_blitProgram->setUniformValue("u_texture", 0);
+        m_renderer.m_blitProgram->setUniformValue("u_flip_y", flipY);
+        m_renderer.m_blitProgram->setUniformValue("u_is_bgr", isBgr);
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, activeTex);
 
-        m_quadVao.bind();
-        m_quadVbo.bind();
+        m_renderer.m_quadVao.bind();
+        m_renderer.m_quadVbo.bind();
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
                               reinterpret_cast<void *>(offsetof(Vertex, x)));
@@ -2066,11 +3144,11 @@ void GpuPreviewViewport::paintGL()
         glDrawArrays(GL_TRIANGLES, 0, 6);
         glDisableVertexAttribArray(1);
         glDisableVertexAttribArray(0);
-        m_quadVbo.release();
-        m_quadVao.release();
+        m_renderer.m_quadVbo.release();
+        m_renderer.m_quadVao.release();
 
         glBindTexture(GL_TEXTURE_2D, 0);
-        m_blitProgram->release();
+        m_renderer.m_blitProgram->release();
     }
 
     renderGizmoOverlayPass(cW, cH);
@@ -2081,9 +3159,9 @@ void GpuPreviewViewport::paintGL()
     painter.setRenderHint(QPainter::TextAntialiasing);
     painter.setRenderHint(QPainter::SmoothPixmapTransform);
 
-    QRectF displayRect = computeContentDisplayRect();
+    const QRectF displayRect = computeContentDisplayRect();
 
-    if (activeTex == 0 || !m_blitProgram) {
+    if (activeTex == 0 || !m_renderer.m_blitProgram) {
         drawFallbackBackdrop(painter, displayRect);
     }
 
@@ -2104,30 +3182,23 @@ void GpuPreviewViewport::paintGL()
 void GpuPreviewViewport::paintEvent(QPaintEvent *event)
 {
     if (!isOffscreenPlatform() && isValid()) {
-        if (m_fallbackCanvas && m_fallbackCanvas->isVisible()) {
-            m_fallbackCanvas->hide();
-        }
         QOpenGLWidget::paintEvent(event);
         return;
     }
 
-    if (!m_fallbackCanvas || width() <= 0 || height() <= 0) {
+    if (width() <= 0 || height() <= 0) {
         return;
     }
 
-    const qreal dpr = devicePixelRatioF();
-    QImage frame(std::max(1, static_cast<int>(width() * dpr)),
-                 std::max(1, static_cast<int>(height() * dpr)),
-                 QImage::Format_ARGB32_Premultiplied);
-    frame.setDevicePixelRatio(dpr);
-    frame.fill(QColor(15, 16, 22));
-
-    QPainter painter(&frame);
+    // Paint directly onto the widget backing store without mutating child widgets inside
+    // paintEvent, preventing recursive Qt layout/repaint invalidations under offscreen mode.
+    QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     painter.setRenderHint(QPainter::TextAntialiasing);
     painter.setRenderHint(QPainter::SmoothPixmapTransform);
+    painter.fillRect(rect(), QColor(15, 16, 22));
 
-    QRectF displayRect = computeContentDisplayRect();
+    const QRectF displayRect = computeContentDisplayRect();
     drawFallbackBackdrop(painter, displayRect);
 
     if (m_showSafeGuides && m_aspectRatioGuide != AspectRatioGuide::None) {
@@ -2141,11 +3212,6 @@ void GpuPreviewViewport::paintEvent(QPaintEvent *event)
     drawStatusOverlay(painter);
     painter.end();
 
-    m_fallbackCanvas->setGeometry(rect());
-    m_fallbackCanvas->setPixmap(QPixmap::fromImage(frame));
-    if (!m_fallbackCanvas->isVisible()) {
-        m_fallbackCanvas->show();
-    }
     updateFpsTelemetry();
 }
 
@@ -2278,7 +3344,7 @@ void GpuPreviewViewport::drawSafeFrameGuides(QPainter &painter, const QRectF &di
     }
 
     QFont tagFont = painter.font();
-    tagFont.setPixelSize(10);
+    tagFont.setPixelSize(11);
     tagFont.setBold(true);
     painter.setFont(tagFont);
 
@@ -2302,60 +3368,26 @@ void GpuPreviewViewport::drawSafeFrameGuides(QPainter &painter, const QRectF &di
 
 void GpuPreviewViewport::drawActionBar(QPainter &painter)
 {
-    float availW = std::max(200.0f, static_cast<float>(width()) - 20.0f);
-    float barW = std::min(availW, 600.0f);
-    float barH = 42.0f;
-    float barX = (static_cast<float>(width()) - barW) * 0.5f;
-    float barY = static_cast<float>(height()) - barH - 12.0f;
-    m_actionBarRect = QRectF(barX, barY, barW, barH);
-
-    const bool compact = (barW < 520.0f);
-    const bool ultraCompact = (barW < 390.0f);
+    m_inputMapper.updateLayout(size());
+    const auto &lay = m_inputMapper.layout();
 
     painter.save();
 
     // Dark glassmorphism pill background
     QPainterPath barPath;
-    barPath.addRoundedRect(m_actionBarRect, 12.0, 12.0);
+    barPath.addRoundedRect(lay.barRect, 12.0, 12.0);
     painter.setPen(QPen(QColor(255, 255, 255, 38), 1.0));
     painter.setBrush(QColor(22, 23, 28, 228));
     painter.drawPath(barPath);
     painter.setClipPath(barPath);
 
-    float padX = 12.0f;
-    float gap = ultraCompact ? 6.0f : 8.0f;
-    float btnY = barY + 6.0f;
-    float btnH = barH - 12.0f;
-
-    float wStatus = ultraCompact ? 68.0f : (compact ? 90.0f : 116.0f);
-    float wMon = ultraCompact ? 64.0f : (compact ? 84.0f : 104.0f);
-    float wApply = ultraCompact ? 68.0f : (compact ? 94.0f : 122.0f);
-    float wReset = ultraCompact ? 38.0f : 44.0f;
-    float wGuide = ultraCompact ? 46.0f : (compact ? 56.0f : 64.0f);
-    float wPara = ultraCompact ? 42.0f : 50.0f;
-
-    float rawSum = wStatus + wMon + wApply + wReset + wGuide + wPara + 5.0f * gap + 12.0f;
-    float innerW = std::max(160.0f, barW - 2.0f * padX);
-    float scale = std::min(1.0f, innerW / rawSum);
-
-    wStatus *= scale;
-    wMon *= scale;
-    wApply *= scale;
-    wReset *= scale;
-    wGuide *= scale;
-    wPara *= scale;
-    gap *= scale;
-
-    float curX = barX + padX;
-
     // 1. Status Indicator & Mode Pill
-    QRectF statusRect(curX, btnY, wStatus, btnH);
     QColor dotColor(120, 120, 130);
-    QString statusText = ultraCompact ? QStringLiteral("IDLE") : QStringLiteral("OFFLINE");
+    QString statusText = lay.ultraCompact ? QStringLiteral("IDLE") : QStringLiteral("OFFLINE");
 
     if (m_previewMode == PreviewMode::DmaBufLive) {
         dotColor = QColor(16, 185, 129);
-        statusText = ultraCompact ? QStringLiteral("LIVE") : QStringLiteral("LIVE DMA-BUF");
+        statusText = lay.ultraCompact ? QStringLiteral("LIVE") : QStringLiteral("LIVE DMA-BUF");
     } else if (m_previewMode == PreviewMode::InProcessShader) {
         dotColor = QColor(6, 182, 212);
         statusText = QStringLiteral("SHADER");
@@ -2366,90 +3398,81 @@ void GpuPreviewViewport::drawActionBar(QPainter &painter)
 
     painter.setPen(Qt::NoPen);
     painter.setBrush(dotColor);
-    painter.drawEllipse(QPointF(statusRect.left() + 6.0f, statusRect.center().y()), 4.0, 4.0);
+    painter.drawEllipse(QPointF(lay.statusRect.left() + 6.0, lay.statusRect.center().y()), 4.0, 4.0);
 
     QFont statusFont = painter.font();
-    statusFont.setPixelSize(ultraCompact ? 9 : 10);
+    statusFont.setPixelSize(11);
     statusFont.setBold(true);
     painter.setFont(statusFont);
     QFontMetrics fm(statusFont);
     painter.setPen(QColor(230, 230, 235));
-    QRectF statusTextRect(statusRect.left() + 14.0f, statusRect.top(),
-                          std::max(10.0f, static_cast<float>(statusRect.width()) - 16.0f),
-                          statusRect.height());
+    QRectF statusTextRect(lay.statusRect.left() + 14.0, lay.statusRect.top(),
+                          std::max(10.0, lay.statusRect.width() - 16.0), lay.statusRect.height());
     painter.drawText(
         statusTextRect, Qt::AlignVCenter | Qt::AlignLeft,
         fm.elidedText(statusText, Qt::ElideRight, static_cast<int>(statusTextRect.width())));
 
-    curX += wStatus + 6.0f * scale;
-
-    // Vertical Divider
+    const double divX = lay.statusRect.right() + 6.0 * static_cast<double>(lay.scale);
     painter.setPen(QPen(QColor(255, 255, 255, 25), 1.0));
-    painter.drawLine(QPointF(curX, barY + 9.0f), QPointF(curX, barY + barH - 9.0f));
-    curX += 6.0f * scale;
+    painter.drawLine(QPointF(divX, lay.barRect.top() + 9.0),
+                     QPointF(divX, lay.barRect.bottom() - 9.0));
 
     // 2. Monitor Selection Button
-    m_monitorBtnRect = QRectF(curX, btnY, wMon, btnH);
-    bool monitorHovered = (m_hoveredButton == ActionBarButton::MonitorSelector);
+    const bool monitorHovered = (m_hoveredButton == ActionBarButton::MonitorSelector);
     painter.setPen(
         QPen(monitorHovered ? QColor(56, 189, 248, 140) : QColor(255, 255, 255, 25), 1.0));
     painter.setBrush(monitorHovered ? QColor(42, 48, 61, 230) : QColor(32, 36, 46, 210));
-    painter.drawRoundedRect(m_monitorBtnRect, 5.0, 5.0);
+    painter.drawRoundedRect(lay.monitorBtnRect, 5.0, 5.0);
 
     painter.setPen(QColor(220, 225, 235));
-    QString monitorText = m_selectedMonitor;
-    painter.drawText(m_monitorBtnRect, Qt::AlignCenter,
-                     fm.elidedText(monitorText, Qt::ElideRight, static_cast<int>(wMon - 8.0f)));
-    curX += wMon + gap;
+    painter.drawText(
+        lay.monitorBtnRect, Qt::AlignCenter,
+        fm.elidedText(m_selectedMonitor, Qt::ElideRight,
+                      std::max(8, static_cast<int>(lay.monitorBtnRect.width() - 8.0))));
 
     // 3. "Apply to Selected Monitor(s)" Action Button
-    m_applyBtnRect = QRectF(curX, btnY, wApply, btnH);
-    bool applyHovered = (m_hoveredButton == ActionBarButton::ApplyButton);
+    const bool applyHovered = (m_hoveredButton == ActionBarButton::ApplyButton);
     painter.setPen(Qt::NoPen);
     painter.setBrush(applyHovered ? QColor(3, 105, 161) : QColor(2, 132, 199));
-    painter.drawRoundedRect(m_applyBtnRect, 5.0, 5.0);
+    painter.drawRoundedRect(lay.applyBtnRect, 5.0, 5.0);
 
     painter.setPen(Qt::white);
     QString applyText =
-        compact ? QStringLiteral("Apply") : QStringLiteral("Apply to %1").arg(m_selectedMonitor);
-    painter.drawText(m_applyBtnRect, Qt::AlignCenter,
-                     fm.elidedText(applyText, Qt::ElideRight, static_cast<int>(wApply - 8.0f)));
-    curX += wApply + gap;
+        lay.compact ? QStringLiteral("Apply") : QStringLiteral("Apply to %1").arg(m_selectedMonitor);
+    painter.drawText(
+        lay.applyBtnRect, Qt::AlignCenter,
+        fm.elidedText(applyText, Qt::ElideRight,
+                      std::max(8, static_cast<int>(lay.applyBtnRect.width() - 8.0))));
 
     // 4. Quick Action Buttons: Reset, Guide, 2.5D Parallax
-    m_resetBtnRect = QRectF(curX, btnY, wReset, btnH);
-    bool resetHovered = (m_hoveredButton == ActionBarButton::ResetButton);
+    const bool resetHovered = (m_hoveredButton == ActionBarButton::ResetButton);
     painter.setPen(
         QPen(resetHovered ? QColor(255, 255, 255, 100) : QColor(255, 255, 255, 25), 1.0));
     painter.setBrush(resetHovered ? QColor(42, 48, 61, 230) : QColor(32, 36, 46, 210));
-    painter.drawRoundedRect(m_resetBtnRect, 5.0, 5.0);
+    painter.drawRoundedRect(lay.resetBtnRect, 5.0, 5.0);
     painter.setPen(QColor(210, 215, 225));
-    painter.drawText(m_resetBtnRect, Qt::AlignCenter, QStringLiteral("1:1"));
-    curX += wReset + gap;
+    painter.drawText(lay.resetBtnRect, Qt::AlignCenter, QStringLiteral("1:1"));
 
-    m_guideBtnRect = QRectF(curX, btnY, wGuide, btnH);
-    bool guideHovered = (m_hoveredButton == ActionBarButton::GuideButton);
-    bool guideActive = (m_showSafeGuides && m_aspectRatioGuide != AspectRatioGuide::None);
+    const bool guideHovered = (m_hoveredButton == ActionBarButton::GuideButton);
+    const bool guideActive = (m_showSafeGuides && m_aspectRatioGuide != AspectRatioGuide::None);
     painter.setPen(QPen(guideActive ? QColor(56, 189, 248, 180) : QColor(255, 255, 255, 25), 1.0));
     painter.setBrush(guideActive
                          ? QColor(7, 89, 133, 200)
                          : (guideHovered ? QColor(42, 48, 61, 230) : QColor(32, 36, 46, 210)));
-    painter.drawRoundedRect(m_guideBtnRect, 5.0, 5.0);
+    painter.drawRoundedRect(lay.guideBtnRect, 5.0, 5.0);
     painter.setPen(guideActive ? QColor(56, 189, 248) : QColor(210, 215, 225));
-    painter.drawText(m_guideBtnRect, Qt::AlignCenter,
-                     ultraCompact ? QStringLiteral("Grid") : QStringLiteral("Guides"));
-    curX += wGuide + gap;
+    painter.drawText(lay.guideBtnRect, Qt::AlignCenter,
+                     lay.ultraCompact ? QStringLiteral("Grid") : QStringLiteral("Guides"));
 
-    m_parallaxBtnRect = QRectF(curX, btnY, wPara, btnH);
-    bool parallaxHovered = (m_hoveredButton == ActionBarButton::ParallaxButton);
+    const bool parallaxHovered = (m_hoveredButton == ActionBarButton::ParallaxButton);
     painter.setPen(
         QPen(m_parallaxEnabled ? QColor(168, 85, 247, 200) : QColor(255, 255, 255, 25), 1.0));
     painter.setBrush(m_parallaxEnabled
                          ? QColor(107, 33, 168, 200)
                          : (parallaxHovered ? QColor(42, 48, 61, 230) : QColor(32, 36, 46, 210)));
-    painter.drawRoundedRect(m_parallaxBtnRect, 5.0, 5.0);
+    painter.drawRoundedRect(lay.parallaxBtnRect, 5.0, 5.0);
     painter.setPen(m_parallaxEnabled ? QColor(233, 213, 255) : QColor(210, 215, 225));
-    painter.drawText(m_parallaxBtnRect, Qt::AlignCenter, QStringLiteral("2.5D"));
+    painter.drawText(lay.parallaxBtnRect, Qt::AlignCenter, QStringLiteral("2.5D"));
 
     painter.restore();
 }
@@ -2459,7 +3482,7 @@ void GpuPreviewViewport::drawStatusOverlay(QPainter &painter)
     // Top-left telemetry readout
     painter.save();
     QFont hudFont = painter.font();
-    hudFont.setPixelSize(10);
+    hudFont.setPixelSize(11);
     painter.setFont(hudFont);
 
     QString modeStr = (m_previewMode == PreviewMode::DmaBufLive) ? QStringLiteral("LIVE DMA-BUF")
@@ -2490,23 +3513,9 @@ void GpuPreviewViewport::drawStatusOverlay(QPainter &painter)
     painter.restore();
 }
 
-GpuPreviewViewport::ActionBarButton
-GpuPreviewViewport::hitTestActionBar(const QPointF &pos) const noexcept
+ActionBarButton GpuPreviewViewport::hitTestActionBar(const QPointF &pos) const noexcept
 {
-    if (!m_showActionBar || !m_actionBarRect.contains(pos)) {
-        return ActionBarButton::None;
-    }
-    if (m_monitorBtnRect.contains(pos))
-        return ActionBarButton::MonitorSelector;
-    if (m_applyBtnRect.contains(pos))
-        return ActionBarButton::ApplyButton;
-    if (m_resetBtnRect.contains(pos))
-        return ActionBarButton::ResetButton;
-    if (m_guideBtnRect.contains(pos))
-        return ActionBarButton::GuideButton;
-    if (m_parallaxBtnRect.contains(pos))
-        return ActionBarButton::ParallaxButton;
-    return ActionBarButton::None;
+    return m_inputMapper.hitTestActionBar(pos, m_showActionBar);
 }
 
 void GpuPreviewViewport::mousePressEvent(QMouseEvent *event)
@@ -2537,6 +3546,7 @@ void GpuPreviewViewport::mousePressEvent(QMouseEvent *event)
     if (event->button() == Qt::MiddleButton ||
         (event->button() == Qt::LeftButton && (event->modifiers() & Qt::ShiftModifier))) {
         m_isPanning = true;
+        m_panButton = event->button();
         m_lastMousePos = event->position();
         setCursor(Qt::ClosedHandCursor);
         event->accept();
@@ -2638,7 +3648,7 @@ void GpuPreviewViewport::mouseMoveEvent(QMouseEvent *event)
             m_brushClock.isValid() ? static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9 : 0.0;
         if (m_gizmoOverlay.toolMode() == ViewportToolMode::WeightBrush) {
             recordWeightBrushDab(texel, 1.0f, tsSec);
-            if (m_pendingWeightDabs.size() >= 8) {
+            if (m_weightBridge.m_pendingDabs.size() >= 8) {
                 flushWeightBrushDabBatch();
             }
             update();
@@ -2703,8 +3713,9 @@ void GpuPreviewViewport::mouseMoveEvent(QMouseEvent *event)
 
 void GpuPreviewViewport::mouseReleaseEvent(QMouseEvent *event)
 {
-    if (m_isPanning && (event->button() == Qt::MiddleButton || event->button() == Qt::LeftButton)) {
+    if (m_isPanning && event->button() == m_panButton) {
         m_isPanning = false;
+        m_panButton = Qt::NoButton;
         unsetCursor();
         event->accept();
         return;
@@ -2750,6 +3761,10 @@ void GpuPreviewViewport::mouseReleaseEvent(QMouseEvent *event)
 void GpuPreviewViewport::mouseDoubleClickEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton) {
+        if (m_showActionBar && hitTestActionBar(event->position()) != ActionBarButton::None) {
+            event->accept();
+            return;
+        }
         resetView();
         event->accept();
         return;
@@ -2819,7 +3834,7 @@ void GpuPreviewViewport::tabletEvent(QTabletEvent *event)
                 m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
                 m_gizmoOverlay.setWeightBrushCursor(mapTexelToCanvasWorld(texel), true);
                 recordWeightBrushDab(texel, pressure > 0.0f ? pressure : 1.0f, tsSec);
-                if (m_pendingWeightDabs.size() >= 8) {
+                if (m_weightBridge.m_pendingDabs.size() >= 8) {
                     flushWeightBrushDabBatch();
                 }
                 update();
@@ -2952,19 +3967,71 @@ void GpuPreviewViewport::setGizmoCameraAndLights(const we_camera3d_t &cam,
                                                  const we_lighting_uniforms_t &lights)
 {
     m_gizmoOverlay.setCameraAndLights(cam, lights);
-    m_hasGizmoEmittersOrLights = m_hasGizmoEmittersOrLights || (lights.active_light_count > 0u) ||
+    m_hasCameraOrLightsOverlay = (lights.active_light_count > 0u) ||
                                  (cam.projection_mode != WE_PROJ_ORTHOGRAPHIC_2D) ||
                                  (cam.dof_enabled > 0.5f);
+    m_hasGizmoEmittersOrLights = m_hasCameraOrLightsOverlay || m_hasEmittersOverlay;
     update();
 }
 
 void GpuPreviewViewport::setGizmoEmitterWireframes(std::vector<GizmoEmitterWireframe> emitters)
 {
-    if (!emitters.empty()) {
-        m_hasGizmoEmittersOrLights = true;
-    }
+    m_hasEmittersOverlay = !emitters.empty();
+    m_hasGizmoEmittersOrLights = m_hasCameraOrLightsOverlay || m_hasEmittersOverlay;
     m_gizmoOverlay.setEmitterWireframes(std::move(emitters));
     update();
+}
+
+void GpuPreviewViewport::abortActiveInteractions() noexcept
+{
+    bool changed = false;
+    if (m_isPanning) {
+        m_isPanning = false;
+        m_panButton = Qt::NoButton;
+        changed = true;
+    }
+    if (m_brushStrokeActive) {
+        m_brushStrokeActive = false;
+        const QPointF lastWidgetPos(m_mouseGlCoord.x(),
+                                    static_cast<double>(height()) - m_mouseGlCoord.y());
+        const QPointF texel = mapWidgetToContentTexel(lastWidgetPos);
+        const double tsSec =
+            m_brushClock.isValid() ? static_cast<double>(m_brushClock.nsecsElapsed()) * 1e-9 : 0.0;
+        if (m_gizmoOverlay.toolMode() == ViewportToolMode::WeightBrush) {
+            finishWeightPaintStroke();
+        }
+        emit brushPointerReleased(texel, 0.0f, tsSec);
+        changed = true;
+    }
+    if (m_gizmoOverlay.isDragging()) {
+        m_gizmoOverlay.endDrag();
+        m_dragCurrentTransform = m_dragStartTransform;
+        if (m_activeGizmoNodeId >= 0) {
+            emit layerTransformPreviewed(m_activeGizmoNodeId, m_dragStartTransform);
+        }
+        changed = true;
+    }
+    if (m_rigDragKind != RigDragKind::None) {
+        if (m_rigDragKind == RigDragKind::BoneJointMoveOrReparent ||
+            m_rigDragKind == RigDragKind::BonePivotRotate) {
+            auto &bones = m_gizmoOverlay.mutablePuppetBones();
+            if (m_rigDragIndex >= 0 && static_cast<size_t>(m_rigDragIndex) < bones.size()) {
+                auto &b = bones[static_cast<size_t>(m_rigDragIndex)];
+                b.headWorld = m_rigDragInitialBoneHead;
+                b.tailWorld = m_rigDragInitialBoneTail;
+                b.localAngleRad = m_rigDragInitialBoneAngleRad;
+            }
+        }
+        m_gizmoOverlay.setBoneCreatePreview(false, QVector3D(), QVector3D());
+        m_rigDragKind = RigDragKind::None;
+        m_rigDragIndex = -1;
+        m_rigDragIkL1 = 0.0f;
+        m_rigDragIkL2 = 0.0f;
+        changed = true;
+    }
+    if (changed) {
+        unsetCursor();
+    }
 }
 
 void GpuPreviewViewport::setToolMode(ViewportToolMode mode)
@@ -2972,11 +4039,8 @@ void GpuPreviewViewport::setToolMode(ViewportToolMode mode)
     if (m_gizmoOverlay.toolMode() == mode) {
         return;
     }
+    abortActiveInteractions();
     m_gizmoOverlay.setToolMode(mode);
-    m_brushStrokeActive = false;
-    m_rigDragKind = RigDragKind::None;
-    m_rigDragIndex = -1;
-    m_gizmoOverlay.setBoneCreatePreview(false, QVector3D(), QVector3D());
     emit toolModeChanged(mode);
     update();
 }
@@ -2996,31 +4060,43 @@ void GpuPreviewViewport::setSceneViewProj(const QMatrix4x4 &viewProj, bool hasCu
 
 void GpuPreviewViewport::keyPressEvent(QKeyEvent *event)
 {
-    switch (event->key()) {
-    case Qt::Key_Escape:
+    if (event->key() == Qt::Key_Escape) {
         setToolMode(ViewportToolMode::Navigate);
         event->accept();
         return;
-    case Qt::Key_Q:
-        setToolMode(ViewportToolMode::SelectBBox);
-        event->accept();
-        return;
-    case Qt::Key_W:
-        setToolMode(ViewportToolMode::Translate);
-        event->accept();
-        return;
-    case Qt::Key_E:
-        setToolMode(ViewportToolMode::Rotate);
-        event->accept();
-        return;
-    case Qt::Key_R:
-        setToolMode(ViewportToolMode::Scale);
-        event->accept();
-        return;
-    default:
-        break;
+    }
+    const Qt::KeyboardModifiers mods = event->modifiers();
+    if ((mods & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) == Qt::NoModifier) {
+        switch (event->key()) {
+        case Qt::Key_Q:
+            setToolMode(ViewportToolMode::SelectBBox);
+            event->accept();
+            return;
+        case Qt::Key_W:
+            setToolMode(ViewportToolMode::Translate);
+            event->accept();
+            return;
+        case Qt::Key_E:
+            setToolMode(ViewportToolMode::Rotate);
+            event->accept();
+            return;
+        case Qt::Key_R:
+            setToolMode(ViewportToolMode::Scale);
+            event->accept();
+            return;
+        default:
+            break;
+        }
     }
     QOpenGLWidget::keyPressEvent(event);
+}
+
+void GpuPreviewViewport::focusOutEvent(QFocusEvent *event)
+{
+    abortActiveInteractions();
+    m_gizmoOverlay.setWeightBrushCursor(QPointF(0.0, 0.0), false);
+    update();
+    QOpenGLWidget::focusOutEvent(event);
 }
 
 bool GpuPreviewViewport::isBrushToolMode(ViewportToolMode mode) noexcept
@@ -3033,79 +4109,16 @@ QPointF GpuPreviewViewport::mapWidgetToContentTexel(const QPointF &widgetPos) co
 {
     const uint32_t cwU = std::max<uint32_t>(1u, contentWidth());
     const uint32_t chU = std::max<uint32_t>(1u, contentHeight());
-    const double cw = static_cast<double>(cwU);
-    const double ch = static_cast<double>(chU);
-
-    if (m_parallaxEnabled && width() > 0 && height() > 0) {
-        const float ndcX =
-            static_cast<float>(2.0 * widgetPos.x() / static_cast<double>(width()) - 1.0);
-        const float ndcY =
-            static_cast<float>(1.0 - 2.0 * widgetPos.y() / static_cast<double>(height()));
-        bool invertible = false;
-        const QMatrix4x4 invMvp = computeBlitMvp(cwU, chU).inverted(&invertible);
-        if (invertible) {
-            const QVector4D pNear = invMvp.map(QVector4D(ndcX, ndcY, -1.0f, 1.0f));
-            const QVector4D pFar = invMvp.map(QVector4D(ndcX, ndcY, 1.0f, 1.0f));
-            if (std::abs(pNear.w()) > 1e-6f && std::abs(pFar.w()) > 1e-6f) {
-                const QVector3D o = pNear.toVector3DAffine();
-                const QVector3D f = pFar.toVector3DAffine();
-                const float dz = f.z() - o.z();
-                if (std::abs(dz) > 1e-6f) {
-                    const float t = -o.z() / dz;
-                    const QVector3D hit = o + (f - o) * t;
-                    const double u = static_cast<double>(hit.x()) * 0.5 + 0.5;
-                    const double v = 0.5 - static_cast<double>(hit.y()) * 0.5;
-                    return QPointF(std::clamp(u, 0.0, 1.0) * cw, std::clamp(v, 0.0, 1.0) * ch);
-                }
-            }
-        }
-    }
-
-    const QRectF displayRect = computeContentDisplayRect();
-    const double u = (widgetPos.x() - displayRect.left()) / std::max(1.0, displayRect.width());
-    const double v = (widgetPos.y() - displayRect.top()) / std::max(1.0, displayRect.height());
-    return QPointF(std::clamp(u, 0.0, 1.0) * cw, std::clamp(v, 0.0, 1.0) * ch);
+    const QMatrix4x4 blitMvp = m_parallaxEnabled ? computeBlitMvp(cwU, chU) : QMatrix4x4();
+    return m_inputMapper.mapWidgetToContentTexel(widgetPos, size(), cwU, chU, m_zoom, m_panOffset,
+                                                 m_parallaxEnabled, blitMvp);
 }
 
 QMatrix4x4 GpuPreviewViewport::computeBlitMvp(uint32_t contentW, uint32_t contentH) const noexcept
 {
-    const float vW = static_cast<float>(std::max(1, width()));
-    const float vH = static_cast<float>(std::max(1, height()));
-    const float vAspect = vW / vH;
-    const float cAspect =
-        static_cast<float>(std::max(1u, contentW)) / static_cast<float>(std::max(1u, contentH));
-
-    QMatrix4x4 mvp;
-    if (m_parallaxEnabled) {
-        mvp.perspective(45.0f, vAspect, 0.1f, 100.0f);
-        mvp.translate(0.0f, 0.0f, -2.42f);
-        mvp.translate(static_cast<float>(m_panOffset.x()) / (vW * 0.5f),
-                      -static_cast<float>(m_panOffset.y()) / (vH * 0.5f), 0.0f);
-        mvp.scale(m_zoom, m_zoom, 1.0f);
-
-        const float tiltAngleX = m_currentTiltX * 14.0f * m_parallaxStrength;
-        const float tiltAngleY = -m_currentTiltY * 11.0f * m_parallaxStrength;
-        mvp.rotate(tiltAngleX, 0.0f, 1.0f, 0.0f);
-        mvp.rotate(tiltAngleY, 1.0f, 0.0f, 0.0f);
-
-        if (cAspect >= 1.0f) {
-            mvp.scale(cAspect, 1.0f, 1.0f);
-        } else {
-            mvp.scale(1.0f, 1.0f / cAspect, 1.0f);
-        }
-    } else {
-        mvp.ortho(-vAspect, vAspect, -1.0f, 1.0f, -1.0f, 1.0f);
-        mvp.translate(static_cast<float>(m_panOffset.x()) / (vW * 0.5f) * vAspect,
-                      -static_cast<float>(m_panOffset.y()) / (vH * 0.5f), 0.0f);
-        mvp.scale(m_zoom, m_zoom, 1.0f);
-
-        if (cAspect > vAspect) {
-            mvp.scale(vAspect, vAspect / cAspect, 1.0f);
-        } else {
-            mvp.scale(cAspect, 1.0f, 1.0f);
-        }
-    }
-    return mvp;
+    return m_renderer.computeBlitMvp(size(), contentW, contentH, m_zoom, m_panOffset,
+                                     m_parallaxEnabled, m_currentTiltX, m_currentTiltY,
+                                     m_parallaxStrength);
 }
 
 QMatrix4x4 GpuPreviewViewport::computeGizmoViewProj(uint32_t contentW,
@@ -3137,72 +4150,12 @@ QPointF GpuPreviewViewport::mapTexelToPuppetLocal(const QPointF &texel) const no
 
 void GpuPreviewViewport::ensureGizmoGlInitialized()
 {
-    if (m_gizmoProgram) {
-        return;
-    }
-    const bool isGles =
-        QOpenGLContext::currentContext() && QOpenGLContext::currentContext()->isOpenGLES();
-    const char *vsSrc = isGles ? kGizmoVertexShaderEs310 : kGizmoVertexShaderCore;
-    const char *fsSrc = isGles ? kGizmoFragmentShaderEs310 : kGizmoFragmentShaderCore;
-
-    m_gizmoProgram = std::make_unique<QOpenGLShaderProgram>(this);
-    if (!m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, vsSrc) ||
-        !m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, fsSrc) ||
-        !m_gizmoProgram->link()) {
-        m_gizmoProgram = std::make_unique<QOpenGLShaderProgram>(this);
-        if (!m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Vertex,
-                                                     kGizmoVertexShaderCore) ||
-            !m_gizmoProgram->addShaderFromSourceCode(QOpenGLShader::Fragment,
-                                                     kGizmoFragmentShaderCore) ||
-            !m_gizmoProgram->link()) {
-            qWarning() << "[GpuPreviewViewport] Failed to compile/link gizmo shader:"
-                       << m_gizmoProgram->log();
-            m_gizmoProgram.reset();
-            return;
-        }
-    }
-
-    if (!m_gizmoVao.isCreated()) {
-        m_gizmoVao.create();
-    }
-    m_gizmoVao.bind();
-    if (!m_gizmoVbo.isCreated()) {
-        m_gizmoVbo.create();
-    }
-    m_gizmoVbo.bind();
-    m_gizmoVbo.setUsagePattern(QOpenGLBuffer::DynamicDraw);
-    m_gizmoVboCapacityBytes = 4096u * sizeof(GizmoVertex);
-    m_gizmoVbo.allocate(static_cast<int>(m_gizmoVboCapacityBytes));
-
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GizmoVertex),
-                          reinterpret_cast<void *>(offsetof(GizmoVertex, x)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(GizmoVertex),
-                          reinterpret_cast<void *>(offsetof(GizmoVertex, r)));
-
-    m_gizmoVbo.release();
-    m_gizmoVao.release();
+    m_renderer.ensureGizmoGlInitialized(this);
 }
 
 void GpuPreviewViewport::ensureGizmoVboCapacity(size_t requiredBytes)
 {
-    if (!m_gizmoVbo.isCreated() || requiredBytes <= m_gizmoVboCapacityBytes) {
-        return;
-    }
-    const size_t maxBytes = ViewportGizmoOverlay::kMaxDynamicVertices * sizeof(GizmoVertex);
-    const size_t clampedReq = std::min(requiredBytes, maxBytes);
-    if (clampedReq <= m_gizmoVboCapacityBytes) {
-        return;
-    }
-    size_t newCap = std::max<size_t>(m_gizmoVboCapacityBytes * 2u, 4096u * sizeof(GizmoVertex));
-    while (newCap < clampedReq && newCap < maxBytes) {
-        newCap = std::min(newCap * 2u, maxBytes);
-    }
-    m_gizmoVbo.bind();
-    m_gizmoVbo.allocate(static_cast<int>(newCap));
-    m_gizmoVboCapacityBytes = newCap;
-    m_gizmoVbo.release();
+    m_renderer.ensureGizmoVboCapacity(requiredBytes);
 }
 
 void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t contentH)
@@ -3229,7 +4182,8 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
     }
 
     ensureGizmoGlInitialized();
-    if (!m_gizmoProgram || !m_gizmoProgram->isLinked() || !m_gizmoVao.isCreated()) {
+    if (!m_renderer.m_gizmoProgram || !m_renderer.m_gizmoProgram->isLinked() ||
+        !m_renderer.m_gizmoVao.isCreated()) {
         return;
     }
 
@@ -3244,25 +4198,25 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    m_gizmoProgram->bind();
-    m_gizmoProgram->setUniformValue("u_mvp", viewProj);
+    m_renderer.m_gizmoProgram->bind();
+    m_renderer.m_gizmoProgram->setUniformValue("u_mvp", viewProj);
 
-    m_gizmoVao.bind();
-    m_gizmoVbo.bind();
+    m_renderer.m_gizmoVao.bind();
+    m_renderer.m_gizmoVbo.bind();
     if (heatCount >= 3u) {
-        m_gizmoVbo.write(0, m_heatmapVertices.data(),
-                         static_cast<int>(heatCount * sizeof(GizmoVertex)));
+        m_renderer.m_gizmoVbo.write(0, m_heatmapVertices.data(),
+                                    static_cast<int>(heatCount * sizeof(GizmoVertex)));
         glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(heatCount));
     }
     if (lineCount >= 2u) {
-        m_gizmoVbo.write(0, m_gizmoVertices.data(),
-                         static_cast<int>(lineCount * sizeof(GizmoVertex)));
+        m_renderer.m_gizmoVbo.write(0, m_gizmoVertices.data(),
+                                    static_cast<int>(lineCount * sizeof(GizmoVertex)));
         glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(lineCount));
     }
-    m_gizmoVbo.release();
-    m_gizmoVao.release();
+    m_renderer.m_gizmoVbo.release();
+    m_renderer.m_gizmoVao.release();
 
-    m_gizmoProgram->release();
+    m_renderer.m_gizmoProgram->release();
     glDisable(GL_BLEND);
 }
 
@@ -3454,163 +4408,28 @@ void GpuPreviewViewport::setWeightBrushParameters(we_weight_brush_op_t op, float
                                                   const std::array<uint64_t, 2> &lockedBones)
 {
     m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
-    m_weightBrushOp = op;
-    m_weightBrushRadiusPx = std::max(1.0f, radiusPx);
-    m_weightBrushStrength = std::clamp(strength, 0.0f, 1.0f);
-    m_weightTargetValue = std::clamp(targetWeight, 0.0f, 1.0f);
-    m_lockedBoneMask = lockedBones;
+    m_weightBridge.m_op = op;
+    m_weightBridge.m_radiusPx = std::max(1.0f, radiusPx);
+    m_weightBridge.m_strength = std::clamp(strength, 0.0f, 1.0f);
+    m_weightBridge.m_targetValue = std::clamp(targetWeight, 0.0f, 1.0f);
+    m_weightBridge.m_lockedBoneMask = lockedBones;
 
     auto state = m_gizmoOverlay.weightBrushState();
-    state.op = m_weightBrushOp;
-    state.radiusPx = m_weightBrushRadiusPx;
-    state.strength = m_weightBrushStrength;
+    state.op = m_weightBridge.m_op;
+    state.radiusPx = m_weightBridge.m_radiusPx;
+    state.strength = m_weightBridge.m_strength;
     m_gizmoOverlay.setWeightBrushState(state);
     update();
 }
 
 void GpuPreviewViewport::beginWeightPaintStroke()
 {
-    m_pendingWeightDabs.clear();
-    m_weightPreBlocks.clear();
-    m_weightDirtyVertices.clear();
+    m_weightBridge.beginStroke();
 }
 
 void GpuPreviewViewport::applyWeightBrushDab(const WeightBrushDab &dab)
 {
-    auto &verts = m_gizmoOverlay.mutableMeshWireframe().vertices;
-    if (verts.empty() || dab.radiusPx <= 0.0f) {
-        return;
-    }
-
-    auto isBoneLocked = [&](uint32_t boneIdx) -> bool {
-        if (boneIdx >= 128u) {
-            return false;
-        }
-        return (m_lockedBoneMask[boneIdx >> 6u] & (1ull << (boneIdx & 63u))) != 0ull;
-    };
-
-    if (isBoneLocked(dab.activeBoneIndex) && dab.op != WE_WEIGHT_OP_NORMALIZE) {
-        return;
-    }
-
-    const float cw = static_cast<float>(std::max<uint32_t>(1u, contentWidth()));
-    const float ch = static_cast<float>(std::max<uint32_t>(1u, contentHeight()));
-    const float dabLocalX = dab.texelX - 0.5f * cw;
-    const float dabLocalY = 0.5f * ch - dab.texelY;
-    const float radiusSq = dab.radiusPx * dab.radiusPx;
-    const size_t totalVerts = verts.size();
-
-    float neighborAvg = 0.0f;
-    float neighborW = 0.0f;
-    if (dab.op == WE_WEIGHT_OP_SMOOTH) {
-        for (size_t i = 0; i < totalVerts; ++i) {
-            const float dx = verts[i].pos[0] - dabLocalX;
-            const float dy = verts[i].pos[1] - dabLocalY;
-            const float d2 = dx * dx + dy * dy;
-            if (d2 <= radiusSq) {
-                float w = 0.0f;
-                for (int k = 0; k < 4; ++k) {
-                    if (verts[i].blend_indices[k] == dab.activeBoneIndex) {
-                        w += verts[i].weight[k];
-                    }
-                }
-                const float g = 1.0f - std::sqrt(d2) / dab.radiusPx;
-                neighborAvg += w * g;
-                neighborW += g;
-            }
-        }
-        if (neighborW > 1e-6f) {
-            neighborAvg /= neighborW;
-        }
-    }
-
-    for (size_t i = 0; i < totalVerts; ++i) {
-        const float dx = verts[i].pos[0] - dabLocalX;
-        const float dy = verts[i].pos[1] - dabLocalY;
-        const float distSq = dx * dx + dy * dy;
-        if (distSq > radiusSq) {
-            continue;
-        }
-
-        const uint32_t blockIdx = static_cast<uint32_t>(i / 256u);
-        if (!m_weightPreBlocks.contains(blockIdx)) {
-            const size_t bStart = static_cast<size_t>(blockIdx) * 256u;
-            const size_t bEnd = std::min(bStart + 256u, totalVerts);
-            VertexWeightBlockSnapshot snap{};
-            snap.blockIndex = blockIdx;
-            snap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
-                              verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
-            m_weightPreBlocks.emplace(blockIdx, std::move(snap));
-        }
-
-        const float dist = std::sqrt(distSq);
-        const float falloff =
-            0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * dist / dab.radiusPx));
-        const float alpha = std::clamp(dab.strength * dab.pressure * falloff, 0.0f, 1.0f);
-
-        auto &v = verts[i];
-        int targetSlot = -1;
-        int weakestSlot = 0;
-        float minW = v.weight[0];
-        for (int k = 0; k < 4; ++k) {
-            if (v.blend_indices[k] == dab.activeBoneIndex) {
-                targetSlot = k;
-                break;
-            }
-            if (v.weight[k] < minW) {
-                minW = v.weight[k];
-                weakestSlot = k;
-            }
-        }
-        if (targetSlot < 0 && dab.op != WE_WEIGHT_OP_NORMALIZE && dab.op != WE_WEIGHT_OP_SUBTRACT) {
-            targetSlot = weakestSlot;
-            v.blend_indices[targetSlot] = dab.activeBoneIndex;
-            v.weight[targetSlot] = 0.0f;
-        }
-
-        if (targetSlot >= 0) {
-            const float curW = v.weight[targetSlot];
-            float nextW = curW;
-            switch (dab.op) {
-            case WE_WEIGHT_OP_ADD:
-                nextW = std::clamp(curW + alpha, 0.0f, 1.0f);
-                break;
-            case WE_WEIGHT_OP_SUBTRACT:
-                nextW = std::clamp(curW - alpha, 0.0f, 1.0f);
-                break;
-            case WE_WEIGHT_OP_REPLACE:
-                nextW = curW + (dab.targetWeight - curW) * alpha;
-                break;
-            case WE_WEIGHT_OP_SMOOTH:
-                nextW = curW + (neighborAvg - curW) * alpha;
-                break;
-            case WE_WEIGHT_OP_NORMALIZE:
-                break;
-            }
-            v.weight[targetSlot] = std::clamp(nextW, 0.0f, 1.0f);
-        }
-
-        float lockedSum = 0.0f;
-        float freeSum = 0.0f;
-        for (int k = 0; k < 4; ++k) {
-            if (isBoneLocked(v.blend_indices[k])) {
-                lockedSum += std::max(0.0f, v.weight[k]);
-            } else {
-                freeSum += std::max(0.0f, v.weight[k]);
-            }
-        }
-        const float targetFree = std::max(0.0f, 1.0f - lockedSum);
-        if (freeSum > 1e-6f) {
-            const float scale = targetFree / freeSum;
-            for (int k = 0; k < 4; ++k) {
-                if (!isBoneLocked(v.blend_indices[k])) {
-                    v.weight[k] = std::max(0.0f, v.weight[k]) * scale;
-                }
-            }
-        }
-
-        m_weightDirtyVertices.push_back(static_cast<uint32_t>(i));
-    }
+    m_weightBridge.applyDab(m_gizmoOverlay, contentWidth(), contentHeight(), dab);
 }
 
 void GpuPreviewViewport::recordWeightBrushDab(const QPointF &texel, float pressure, double tsSec)
@@ -3618,32 +4437,32 @@ void GpuPreviewViewport::recordWeightBrushDab(const QPointF &texel, float pressu
     WeightBrushDab dab{};
     dab.texelX = static_cast<float>(texel.x());
     dab.texelY = static_cast<float>(texel.y());
-    dab.radiusPx = m_weightBrushRadiusPx;
-    dab.strength = m_weightBrushStrength;
-    dab.targetWeight = m_weightTargetValue;
+    dab.radiusPx = m_weightBridge.m_radiusPx;
+    dab.strength = m_weightBridge.m_strength;
+    dab.targetWeight = m_weightBridge.m_targetValue;
     dab.pressure = std::clamp(pressure, 0.0f, 1.0f);
     dab.activeBoneIndex = m_gizmoOverlay.weightBrushState().activeBoneIndex;
-    dab.op = m_weightBrushOp;
+    dab.op = m_weightBridge.m_op;
     dab.timestampSec = tsSec;
 
     applyWeightBrushDab(dab);
-    m_pendingWeightDabs.push_back(dab);
+    m_weightBridge.m_pendingDabs.push_back(dab);
 }
 
 void GpuPreviewViewport::flushWeightBrushDabBatch()
 {
-    if (m_pendingWeightDabs.empty()) {
+    if (m_weightBridge.m_pendingDabs.empty()) {
         return;
     }
-    emit weightBrushDabBatchReady(m_puppetObjectId, m_pendingWeightDabs);
-    m_pendingWeightDabs.clear();
+    emit weightBrushDabBatchReady(m_puppetObjectId, m_weightBridge.m_pendingDabs);
+    m_weightBridge.m_pendingDabs.clear();
 }
 
 void GpuPreviewViewport::finishWeightPaintStroke()
 {
     flushWeightBrushDabBatch();
-    if (m_weightPreBlocks.empty()) {
-        m_weightDirtyVertices.clear();
+    if (m_weightBridge.m_preBlocks.empty()) {
+        m_weightBridge.m_dirtyVertices.clear();
         return;
     }
 
@@ -3652,9 +4471,9 @@ void GpuPreviewViewport::finishWeightPaintStroke()
 
     std::vector<VertexWeightBlockSnapshot> preBlocks;
     std::vector<VertexWeightBlockSnapshot> postBlocks;
-    preBlocks.reserve(m_weightPreBlocks.size());
-    postBlocks.reserve(m_weightPreBlocks.size());
-    for (auto &[blockIdx, preSnap] : m_weightPreBlocks) {
+    preBlocks.reserve(m_weightBridge.m_preBlocks.size());
+    postBlocks.reserve(m_weightBridge.m_preBlocks.size());
+    for (auto &[blockIdx, preSnap] : m_weightBridge.m_preBlocks) {
         const size_t bStart = static_cast<size_t>(blockIdx) * 256u;
         const size_t bEnd = std::min(bStart + 256u, totalVerts);
         if (bStart < bEnd) {
@@ -3667,14 +4486,14 @@ void GpuPreviewViewport::finishWeightPaintStroke()
         }
     }
 
-    std::sort(m_weightDirtyVertices.begin(), m_weightDirtyVertices.end());
-    m_weightDirtyVertices.erase(
-        std::unique(m_weightDirtyVertices.begin(), m_weightDirtyVertices.end()),
-        m_weightDirtyVertices.end());
+    std::sort(m_weightBridge.m_dirtyVertices.begin(), m_weightBridge.m_dirtyVertices.end());
+    m_weightBridge.m_dirtyVertices.erase(
+        std::unique(m_weightBridge.m_dirtyVertices.begin(), m_weightBridge.m_dirtyVertices.end()),
+        m_weightBridge.m_dirtyVertices.end());
 
     std::vector<waywal_ipc_vertex_weight_t> dirtyEntries;
-    dirtyEntries.reserve(m_weightDirtyVertices.size());
-    for (uint32_t vIdx : m_weightDirtyVertices) {
+    dirtyEntries.reserve(m_weightBridge.m_dirtyVertices.size());
+    for (uint32_t vIdx : m_weightBridge.m_dirtyVertices) {
         if (vIdx >= totalVerts) {
             continue;
         }
@@ -3687,8 +4506,8 @@ void GpuPreviewViewport::finishWeightPaintStroke()
         dirtyEntries.push_back(vw);
     }
 
-    m_weightPreBlocks.clear();
-    m_weightDirtyVertices.clear();
+    m_weightBridge.m_preBlocks.clear();
+    m_weightBridge.m_dirtyVertices.clear();
     emit weightPaintStrokeCommitted(m_puppetObjectId, preBlocks, postBlocks, dirtyEntries);
 }
 
@@ -3755,92 +4574,11 @@ void GpuPreviewViewport::applySolvedVertexWeights(
 void GpuPreviewViewport::normalizeAllVertexWeights(int32_t objectId,
                                                    const std::array<uint64_t, 2> &lockedBones)
 {
-    if (objectId < 0 || m_puppetObjectId != objectId) {
-        return;
-    }
-    auto &verts = m_gizmoOverlay.mutableMeshWireframe().vertices;
-    if (verts.empty()) {
-        return;
-    }
-
-    auto isBoneLocked = [&lockedBones](uint32_t boneIdx) -> bool {
-        if (boneIdx >= 128u) {
-            return false;
-        }
-        return (lockedBones[boneIdx >> 6u] & (1ull << (boneIdx & 63u))) != 0ull;
-    };
-
-    const size_t totalVerts = verts.size();
     std::vector<VertexWeightBlockSnapshot> preBlocks;
     std::vector<VertexWeightBlockSnapshot> postBlocks;
     std::vector<waywal_ipc_vertex_weight_t> dirtyEntries;
-
-    for (size_t bStart = 0; bStart < totalVerts; bStart += 256u) {
-        const size_t bEnd = std::min(bStart + 256u, totalVerts);
-        bool blockDirty = false;
-        VertexWeightBlockSnapshot preSnap{};
-        preSnap.blockIndex = static_cast<uint32_t>(bStart / 256u);
-
-        for (size_t i = bStart; i < bEnd; ++i) {
-            auto &v = verts[i];
-            float lockedSum = 0.0f;
-            float freeSum = 0.0f;
-            std::array<float, 4> cleanW{};
-            for (int k = 0; k < 4; ++k) {
-                const float w = std::isfinite(v.weight[k]) ? std::max(0.0f, v.weight[k]) : 0.0f;
-                cleanW[k] = w;
-                if (isBoneLocked(v.blend_indices[k])) {
-                    lockedSum += w;
-                } else {
-                    freeSum += w;
-                }
-            }
-
-            const float targetFree = std::max(0.0f, 1.0f - lockedSum);
-            std::array<float, 4> nextW = cleanW;
-            if (freeSum > 1e-6f) {
-                const float scale = targetFree / freeSum;
-                for (int k = 0; k < 4; ++k) {
-                    if (!isBoneLocked(v.blend_indices[k])) {
-                        nextW[k] = cleanW[k] * scale;
-                    }
-                }
-            }
-
-            bool vertChanged = false;
-            for (int k = 0; k < 4; ++k) {
-                if (!std::isfinite(v.weight[k]) || std::fabs(v.weight[k] - nextW[k]) > 1e-6f) {
-                    vertChanged = true;
-                    break;
-                }
-            }
-            if (vertChanged) {
-                if (!blockDirty) {
-                    blockDirty = true;
-                    preSnap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
-                                         verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
-                }
-                for (int k = 0; k < 4; ++k) {
-                    v.weight[k] = nextW[k];
-                }
-                waywal_ipc_vertex_weight_t vw{};
-                vw.vertex_index = static_cast<uint32_t>(i);
-                std::memcpy(vw.blend_indices, v.blend_indices, sizeof(vw.blend_indices));
-                std::memcpy(vw.weight, v.weight, sizeof(vw.weight));
-                dirtyEntries.push_back(vw);
-            }
-        }
-
-        if (blockDirty) {
-            VertexWeightBlockSnapshot postSnap{};
-            postSnap.blockIndex = preSnap.blockIndex;
-            postSnap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
-                                  verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
-            preBlocks.push_back(std::move(preSnap));
-            postBlocks.push_back(std::move(postSnap));
-        }
-    }
-
+    m_weightBridge.normalizeAllWeights(objectId, m_puppetObjectId, m_gizmoOverlay, lockedBones,
+                                       preBlocks, postBlocks, dirtyEntries);
     if (!dirtyEntries.empty()) {
         update();
         emit weightPaintStrokeCommitted(m_puppetObjectId, preBlocks, postBlocks, dirtyEntries);
@@ -3871,14 +4609,15 @@ bool GpuPreviewViewport::tryBeginRiggingDrag(const QPointF &widgetPos, Qt::Keybo
             return true;
         }
         we_cdt_pin_t pin{};
-        pin.px = texel.x();
-        pin.py = texel.y();
+        pin.px = std::clamp(texel.x(), 0.0, static_cast<double>(std::max(1u, cW)));
+        pin.py = std::clamp(texel.y(), 0.0, static_cast<double>(std::max(1u, cH)));
         pin.flags = 1u;
         auto &pins = m_gizmoOverlay.mutableMeshWireframe().pins;
         pins.push_back(pin);
-        m_gizmoOverlay.mutableMeshWireframe().selectedPinIndex =
-            static_cast<int32_t>(pins.size()) - 1;
+        const int32_t newPinIdx = static_cast<int32_t>(pins.size()) - 1;
+        m_gizmoOverlay.mutableMeshWireframe().selectedPinIndex = newPinIdx;
         emit contourPinAdded(m_puppetObjectId, pin.px, pin.py);
+        emit contourPinSelected(m_puppetObjectId, newPinIdx);
         return true;
     }
 
@@ -3920,13 +4659,18 @@ bool GpuPreviewViewport::tryBeginRiggingDrag(const QPointF &widgetPos, Qt::Keybo
     }
 
     if (mode == ViewportToolMode::IkDrag) {
-        if (hit.handle == GizmoAxisHandle::IkTarget && hit.index >= 0) {
+        if (hit.handle == GizmoAxisHandle::IkTarget && hit.index >= 0 &&
+            static_cast<size_t>(hit.index) < m_gizmoOverlay.ikHandles().size()) {
+            const auto &ik = m_gizmoOverlay.ikHandles()[static_cast<size_t>(hit.index)];
             m_rigDragKind = RigDragKind::IkTargetMove;
             m_rigDragIndex = hit.index;
+            m_rigDragIkL1 = std::max(1.0f, (ik.midWorld - ik.rootWorld).length());
+            m_rigDragIkL2 = std::max(1.0f, (ik.endWorld - ik.midWorld).length());
             setCursor(Qt::ClosedHandCursor);
             return true;
         }
-        if (hit.handle == GizmoAxisHandle::IkPole && hit.index >= 0) {
+        if (hit.handle == GizmoAxisHandle::IkPole && hit.index >= 0 &&
+            static_cast<size_t>(hit.index) < m_gizmoOverlay.ikHandles().size()) {
             m_rigDragKind = RigDragKind::IkPoleMove;
             m_rigDragIndex = hit.index;
             setCursor(Qt::ClosedHandCursor);
@@ -3977,6 +4721,8 @@ bool GpuPreviewViewport::tryBeginRiggingDrag(const QPointF &widgetPos, Qt::Keybo
 
 void GpuPreviewViewport::updateRiggingDrag(const QPointF &widgetPos, Qt::KeyboardModifiers mods)
 {
+    const uint32_t cW = std::max<uint32_t>(1u, contentWidth());
+    const uint32_t cH = std::max<uint32_t>(1u, contentHeight());
     const QPointF texel = mapWidgetToContentTexel(widgetPos);
     const QPointF localPt = mapTexelToPuppetLocal(texel);
     const QVector3D curWorld(static_cast<float>(localPt.x()), static_cast<float>(localPt.y()),
@@ -3986,8 +4732,10 @@ void GpuPreviewViewport::updateRiggingDrag(const QPointF &widgetPos, Qt::Keyboar
     case RigDragKind::ContourPinMove: {
         auto &pins = m_gizmoOverlay.mutableMeshWireframe().pins;
         if (m_rigDragIndex >= 0 && static_cast<size_t>(m_rigDragIndex) < pins.size()) {
-            pins[static_cast<size_t>(m_rigDragIndex)].px = texel.x();
-            pins[static_cast<size_t>(m_rigDragIndex)].py = texel.y();
+            pins[static_cast<size_t>(m_rigDragIndex)].px =
+                std::clamp(texel.x(), 0.0, static_cast<double>(cW));
+            pins[static_cast<size_t>(m_rigDragIndex)].py =
+                std::clamp(texel.y(), 0.0, static_cast<double>(cH));
         }
         break;
     }
@@ -3996,16 +4744,20 @@ void GpuPreviewViewport::updateRiggingDrag(const QPointF &widgetPos, Qt::Keyboar
         break;
     case RigDragKind::BoneJointMoveOrReparent: {
         auto &bones = m_gizmoOverlay.mutablePuppetBones();
-        if (!mods.testFlag(Qt::AltModifier) && m_rigDragIndex >= 0 &&
-            static_cast<size_t>(m_rigDragIndex) < bones.size()) {
-            const QVector3D delta = curWorld - m_rigDragStartWorld;
-            const QVector3D seg = m_rigDragInitialBoneTail - m_rigDragInitialBoneHead;
+        if (m_rigDragIndex >= 0 && static_cast<size_t>(m_rigDragIndex) < bones.size()) {
             auto &b = bones[static_cast<size_t>(m_rigDragIndex)];
-            b.headWorld = m_rigDragInitialBoneHead + delta;
-            b.tailWorld = b.headWorld + seg;
-            emit puppetBonePivotChanged(m_puppetObjectId, m_rigDragIndex,
-                                        QPointF(b.headWorld.x(), b.headWorld.y()), b.localAngleRad,
-                                        false);
+            if (mods.testFlag(Qt::AltModifier)) {
+                b.headWorld = m_rigDragInitialBoneHead;
+                b.tailWorld = m_rigDragInitialBoneTail;
+            } else {
+                const QVector3D delta = curWorld - m_rigDragStartWorld;
+                const QVector3D seg = m_rigDragInitialBoneTail - m_rigDragInitialBoneHead;
+                b.headWorld = m_rigDragInitialBoneHead + delta;
+                b.tailWorld = b.headWorld + seg;
+                emit puppetBonePivotChanged(m_puppetObjectId, m_rigDragIndex,
+                                            QPointF(b.headWorld.x(), b.headWorld.y()),
+                                            b.localAngleRad, false);
+            }
         }
         break;
     }
@@ -4039,8 +4791,13 @@ void GpuPreviewViewport::updateRiggingDrag(const QPointF &widgetPos, Qt::Keyboar
             auto &ik = chains[static_cast<size_t>(m_rigDragIndex)];
             ik.targetWorld = curWorld;
             const QVector3D toTarget = curWorld - ik.rootWorld;
-            const float l1 = std::max(1.0f, (ik.midWorld - ik.rootWorld).length());
-            const float l2 = std::max(1.0f, (ik.endWorld - ik.midWorld).length());
+            // Use segment lengths captured at drag start so 2-bone IK never drifts radially.
+            const float l1 = (m_rigDragIkL1 > 0.0f)
+                                 ? m_rigDragIkL1
+                                 : std::max(1.0f, (ik.midWorld - ik.rootWorld).length());
+            const float l2 = (m_rigDragIkL2 > 0.0f)
+                                 ? m_rigDragIkL2
+                                 : std::max(1.0f, (ik.endWorld - ik.midWorld).length());
             const float d = std::clamp(toTarget.length(), 1e-3f, l1 + l2 - 1e-3f);
             const QVector3D dir = (toTarget.lengthSquared() > 1e-5f) ? toTarget.normalized()
                                                                      : QVector3D(1.0f, 0.0f, 0.0f);
@@ -4054,6 +4811,23 @@ void GpuPreviewViewport::updateRiggingDrag(const QPointF &widgetPos, Qt::Keyboar
             ik.chain.target_world[0] = curWorld.x();
             ik.chain.target_world[1] = curWorld.y();
             ik.chain.target_world[2] = curWorld.z();
+
+            auto &bones = m_gizmoOverlay.mutablePuppetBones();
+            if (ik.chain.root_bone < bones.size()) {
+                bones[ik.chain.root_bone].headWorld = ik.rootWorld;
+                bones[ik.chain.root_bone].tailWorld = ik.midWorld;
+            }
+            if (ik.chain.mid_bone < bones.size()) {
+                bones[ik.chain.mid_bone].headWorld = ik.midWorld;
+                bones[ik.chain.mid_bone].tailWorld = ik.endWorld;
+            }
+            if (ik.chain.end_bone < bones.size()) {
+                const QVector3D endSeg =
+                    bones[ik.chain.end_bone].tailWorld - bones[ik.chain.end_bone].headWorld;
+                bones[ik.chain.end_bone].headWorld = ik.endWorld;
+                bones[ik.chain.end_bone].tailWorld = ik.endWorld + endSeg;
+            }
+
             emit puppetIkTargetChanged(m_puppetObjectId, m_rigDragIndex, curWorld, false);
         }
         break;
@@ -4117,12 +4891,32 @@ void GpuPreviewViewport::finishRiggingDrag(const QPointF &widgetPos, Qt::Keyboar
         const RigPickResult dropHit = m_gizmoOverlay.pickRiggingHandle(widgetPos, size(), vp);
         if (mods.testFlag(Qt::AltModifier)) {
             int32_t newParent = -1;
+            bool shouldEmit = (dropHit.handle == GizmoAxisHandle::None);
             if ((dropHit.handle == GizmoAxisHandle::BoneJoint ||
                  dropHit.handle == GizmoAxisHandle::BoneBody) &&
-                dropHit.index != m_rigDragIndex) {
-                newParent = dropHit.index;
+                dropHit.index >= 0 && dropHit.index != m_rigDragIndex) {
+                const auto &bones = m_gizmoOverlay.puppetBones();
+                bool createsCycle = false;
+                int32_t probe = dropHit.index;
+                // Walk ancestors from proposed parent to forbid reparenting onto a descendant.
+                for (size_t step = 0;
+                     step < bones.size() && probe >= 0 && static_cast<size_t>(probe) < bones.size();
+                     ++step) {
+                    if (probe == m_rigDragIndex) {
+                        createsCycle = true;
+                        break;
+                    }
+                    const uint32_t nextP = bones[static_cast<size_t>(probe)].parentIndex;
+                    probe = (nextP < bones.size()) ? static_cast<int32_t>(nextP) : -1;
+                }
+                if (!createsCycle) {
+                    newParent = dropHit.index;
+                    shouldEmit = true;
+                }
             }
-            emit puppetBoneReparented(m_puppetObjectId, m_rigDragIndex, newParent);
+            if (shouldEmit) {
+                emit puppetBoneReparented(m_puppetObjectId, m_rigDragIndex, newParent);
+            }
         } else if (m_rigDragIndex >= 0 &&
                    static_cast<size_t>(m_rigDragIndex) < m_gizmoOverlay.puppetBones().size()) {
             const auto &b = m_gizmoOverlay.puppetBones()[static_cast<size_t>(m_rigDragIndex)];
@@ -4165,6 +4959,8 @@ void GpuPreviewViewport::finishRiggingDrag(const QPointF &widgetPos, Qt::Keyboar
 
     m_rigDragKind = RigDragKind::None;
     m_rigDragIndex = -1;
+    m_rigDragIkL1 = 0.0f;
+    m_rigDragIkL2 = 0.0f;
 }
 
 } // namespace waywal::studio
