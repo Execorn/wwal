@@ -57,6 +57,21 @@ demuxer_t *demuxer_open_mem(const uint8_t *data, size_t size);
 /* Convenience helper to open and map a file path */
 demuxer_t *demuxer_open_file(const char *filepath);
 
+enum { WAYWAL_DEMUXER_MAX_SAMPLES = 1000000u };
+
+/* Validate ISO BMFF box bounds via subtraction to avoid unsigned wrap on 64-bit box sizes. */
+static inline bool wwal_box_bounds_valid(size_t offset, size_t hdr_len, uint64_t box_size,
+                                         size_t total_size)
+{
+    if (offset > total_size || hdr_len > total_size - offset) {
+        return false;
+    }
+    if (box_size < (uint64_t)hdr_len) {
+        return false;
+    }
+    return box_size <= (uint64_t)(total_size - offset);
+}
+
 #ifdef __cplusplus
 }
 #endif
