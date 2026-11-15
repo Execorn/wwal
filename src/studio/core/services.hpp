@@ -4,6 +4,8 @@
 
 #include "waywal/ipc_proto.h"
 #include "waywal/bezier.h"
+#include "waywal/state_store.h"
+#include "waywal/types.h"
 
 #include <QString>
 #include <QStringList>
@@ -12,7 +14,10 @@
 #include <QJsonObject>
 #include <QObject>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -143,6 +148,42 @@ struct UniformValue {
         return true;
     }
 
+    static constexpr float FLOAT_COMPARE_EPSILON = 1e-6f;
+
+    [[nodiscard]] static bool floatNearlyEqual(float a, float b,
+                                               float eps = FLOAT_COMPARE_EPSILON) noexcept
+    {
+        // Preset INI persistence rounds floats to 6 decimals, so exact inequality
+        // triggers false dirty states and misses NaN identity during undo checks.
+        if (std::isnan(a) || std::isnan(b))
+            return std::isnan(a) && std::isnan(b);
+        if (std::isinf(a) || std::isinf(b))
+            return a == b;
+        const float scale = std::max(1.0f, std::max(std::fabs(a), std::fabs(b)));
+        return std::fabs(a - b) <= eps * scale;
+    }
+
+    [[nodiscard]] bool isFinite() const noexcept
+    {
+        switch (type) {
+        case Type::Float:
+        case Type::Vec2:
+        case Type::Vec3:
+        case Type::Vec4:
+        case Type::Color:
+            for (uint32_t i = 0; i < getFloatCount(); ++i) {
+                if (!std::isfinite(floats[i]))
+                    return false;
+            }
+            return true;
+        case Type::Int:
+        case Type::Bool:
+        case Type::String:
+            return true;
+        }
+        return false;
+    }
+
     bool operator==(const UniformValue &other) const
     {
         if (type != other.type)
@@ -154,7 +195,7 @@ struct UniformValue {
         case Type::Vec4:
         case Type::Color:
             for (uint32_t i = 0; i < getFloatCount(); ++i) {
-                if (floats[i] != other.floats[i])
+                if (!floatNearlyEqual(floats[i], other.floats[i]))
                     return false;
             }
             return true;
@@ -256,6 +297,115 @@ struct WallpaperCatalogEntry {
 /* Decoupled Service Interfaces                                              */
 /* ========================================================================= */
 
+struct WallpaperApplyOptions {
+    QString filepath;
+    QStringList targetOutputs;
+    QString customShaderGlsl;
+    QString depthMapPath;
+    QString backdrop;
+    QString layerName;
+    QString batteryPolicy;
+    uint32_t scaling_mode{WAYWAL_SCALING_FILL};
+    uint32_t filter_mode{WAYWAL_FILTER_LANCZOS3};
+    uint32_t transition_type{WAYWAL_TRANSITION_NONE};
+    uint32_t transition_duration_ms{0};
+    uint32_t transition_fps{60};
+    float transition_angle_rad{0.0f};
+    float transition_wave_freq{20.0f};
+    float transition_wave_amp{0.05f};
+    float transition_center_x{0.5f};
+    float transition_center_y{0.5f};
+    bezier_curve_t bezier{0.25f, 0.1f, 0.25f, 1.0f};
+    bool has_custom_bezier{false};
+    float crop_gravity_x{0.5f};
+    float crop_gravity_y{0.5f};
+    bool has_crop_gravity{false};
+    float depth_strength{1.0f};
+    uint32_t sync_mode{0};
+    uint32_t stagger_delay_ms{0};
+    bool ten_bit{false};
+    bool invert_y{false};
+    bool pos_y_inverted{false};
+    bool no_cache{false};
+    bool extract_theme{false};
+    bool no_theme{false};
+    bool has_theme_mode{false};
+    bool theme_light_mode{false};
+    bool is_solid_color{false};
+    uint8_t color[4]{0, 0, 0, 255};
+    bool has_seed_color{false};
+    uint32_t seed_color{0};
+    bool has_source_color_index{false};
+    uint8_t source_color_index{0};
+    bool has_auto_day_night{false};
+    bool auto_day_night{false};
+    bool has_solar_coords{false};
+    double solar_latitude{0.0};
+    double solar_longitude{0.0};
+
+    [[nodiscard]] waywal_img_metadata_t toMetadata() const
+    {
+        waywal_img_metadata_t meta{};
+        meta.pixel_format = ten_bit ? WAYWAL_FORMAT_XRGB2101010 : WAYWAL_FORMAT_ARGB8888;
+        meta.transition_type = transition_type;
+        meta.transition_duration_ms = transition_duration_ms;
+        meta.transition_fps = transition_fps;
+        meta.transition_angle_rad = transition_angle_rad;
+        meta.transition_wave_freq = transition_wave_freq;
+        meta.transition_wave_amp = transition_wave_amp;
+        meta.transition_center_x = transition_center_x;
+        meta.transition_center_y = transition_center_y;
+        std::memcpy(meta.color, color, sizeof(meta.color));
+        meta.sync_mode = sync_mode;
+        meta.stagger_delay_ms = stagger_delay_ms;
+        meta.scaling_mode = scaling_mode;
+        meta.filter_mode = filter_mode;
+        meta.bezier = bezier;
+        meta.has_custom_bezier = has_custom_bezier;
+        meta.ten_bit = ten_bit;
+        meta.extract_theme = extract_theme;
+        meta.no_theme = no_theme;
+        meta.theme_light_mode = theme_light_mode;
+
+        auto copyUtf8 = [](char *dst, size_t cap, const QString &src) {
+            if (cap == 0)
+                return;
+            const QByteArray ba = src.toUtf8();
+            const size_t n = std::min(static_cast<size_t>(ba.size()), cap - 1u);
+            if (n > 0)
+                std::memcpy(dst, ba.constData(), n);
+            dst[n] = '\0';
+        };
+        copyUtf8(meta.depth_map_path, sizeof(meta.depth_map_path), depthMapPath);
+        copyUtf8(meta.backdrop, sizeof(meta.backdrop), backdrop);
+        copyUtf8(meta.layer_name, sizeof(meta.layer_name), layerName);
+        copyUtf8(meta.battery_policy, sizeof(meta.battery_policy), batteryPolicy);
+        copyUtf8(meta.filepath, sizeof(meta.filepath), filepath);
+
+        meta.depth_strength = (std::isfinite(depth_strength) && depth_strength > 0.0f)
+                                  ? depth_strength
+                                  : 1.0f;
+        meta.crop_gravity_x = std::isfinite(crop_gravity_x) ? crop_gravity_x : 0.5f;
+        meta.crop_gravity_y = std::isfinite(crop_gravity_y) ? crop_gravity_y : 0.5f;
+        meta.has_crop_gravity = has_crop_gravity ? 1u : 0u;
+        meta.invert_y = invert_y ? 1u : 0u;
+        meta.no_cache = no_cache ? 1u : 0u;
+        meta.is_solid_color = is_solid_color ? 1u : 0u;
+        meta.pos_y_inverted = pos_y_inverted ? 1u : 0u;
+        meta.source_color_index = source_color_index;
+        meta.has_source_color_index = has_source_color_index ? 1u : 0u;
+        meta.has_seed_color = has_seed_color ? 1u : 0u;
+        meta.seed_color = seed_color;
+        meta.has_theme_mode = has_theme_mode ? 1u : 0u;
+        meta.has_auto_day_night = has_auto_day_night ? 1u : 0u;
+        meta.auto_day_night = auto_day_night ? 1u : 0u;
+        meta.has_solar_coords = has_solar_coords ? 1u : 0u;
+        meta.solar_latitude = std::isfinite(solar_latitude) ? solar_latitude : 0.0;
+        meta.solar_longitude = std::isfinite(solar_longitude) ? solar_longitude : 0.0;
+        return meta;
+    }
+};
+
 class IIpcClientService {
   public:
     virtual ~IIpcClientService() = default;
@@ -264,6 +414,18 @@ class IIpcClientService {
     virtual void sendSetUniform(const QString &output, const QString &name, const float *vals,
                                 uint32_t count, bool persist = false) = 0;
     virtual void sendSetImage(const waywal_img_metadata_t &meta, int memfd = -1) = 0;
+    virtual void sendSetImageWithExtra(const waywal_img_metadata_t &meta,
+                                       const QStringList &targetOutputs,
+                                       const QString &customShaderGlsl = {}, int memfd = -1)
+    {
+        (void)targetOutputs;
+        (void)customShaderGlsl;
+        sendSetImage(meta, memfd);
+    }
+    virtual void setWallpaper(const WallpaperApplyOptions &opts)
+    {
+        sendSetImageWithExtra(opts.toMetadata(), opts.targetOutputs, opts.customShaderGlsl, -1);
+    }
     virtual void sendAudioPowerConfig(float volume, int8_t muteOnAudio, int8_t themeFromMedia,
                                       uint8_t batteryPolicy = 0) = 0;
     virtual void
@@ -324,6 +486,13 @@ class Services {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_ipcClient = svc;
+    }
+
+    void clearIpcClientIf(IIpcClientService *svc)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_ipcClient == svc)
+            m_ipcClient = nullptr;
     }
 
     IIpcClientService *ipcClient() const
