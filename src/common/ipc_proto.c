@@ -13,7 +13,36 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
+
+static int poll_fd_retry(int fd, short events, int timeout_ms)
+{
+    struct timespec start;
+    if (timeout_ms > 0) {
+        clock_gettime(CLOCK_MONOTONIC, &start);
+    }
+    for (;;) {
+        int rem = timeout_ms;
+        if (timeout_ms > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t elapsed_ms = (int64_t)(now.tv_sec - start.tv_sec) * 1000 +
+                                 (int64_t)(now.tv_nsec - start.tv_nsec) / 1000000;
+            if (elapsed_ms >= timeout_ms) {
+                errno = ETIMEDOUT;
+                return 0;
+            }
+            rem = (int)(timeout_ms - elapsed_ms);
+        }
+        struct pollfd pfd = {.fd = fd, .events = events};
+        int pr = poll(&pfd, 1, rem);
+        if (pr < 0 && errno == EINTR) {
+            continue;
+        }
+        return pr;
+    }
+}
 
 static bool g_socket_activated = false;
 
@@ -155,7 +184,7 @@ static int connect_unix_socket_path(const char *sock_path, int timeout_ms)
     if (strlen(sock_path) >= sizeof(addr.sun_path)) {
         return -1;
     }
-    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    memcpy(addr.sun_path, sock_path, strlen(sock_path) + 1);
 
     int cfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (cfd < 0) {
@@ -192,8 +221,7 @@ static int connect_unix_socket_path(const char *sock_path, int timeout_ms)
         return cfd;
     }
 
-    struct pollfd pfd = {.fd = cfd, .events = POLLOUT};
-    int poll_res = poll(&pfd, 1, timeout_ms);
+    int poll_res = poll_fd_retry(cfd, POLLOUT, timeout_ms);
     if (poll_res <= 0) {
         close(cfd);
         errno = ETIMEDOUT;
@@ -238,9 +266,8 @@ bool waywal_ipc_namespace_is_alive(const char *namespace_str)
     };
     bool alive = false;
     if (waywal_ipc_send(cfd, &ping_hdr, -1)) {
-        struct pollfd pfd = {.fd = cfd, .events = POLLIN};
-        int pr = poll(&pfd, 1, 1000);
-        if (pr > 0 && (pfd.revents & POLLIN)) {
+        int pr = poll_fd_retry(cfd, POLLIN, 1000);
+        if (pr > 0) {
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
             if (waywal_ipc_recv(cfd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_PONG) {
@@ -291,43 +318,96 @@ int waywal_ipc_client_connect(const char *namespace_str, int timeout_ms)
     return -1;
 }
 
-bool waywal_ipc_send_fds(int socket_fd, const waywal_ipc_hdr_t *hdr, const int *fds, size_t num_fds)
+bool waywal_ipc_send_payload_fds(int socket_fd, const waywal_ipc_hdr_t *hdr, const void *payload,
+                                 size_t payload_len, const int *fds, size_t num_fds)
 {
-    if (socket_fd < 0 || !hdr)
+    if (socket_fd < 0 || !hdr) {
         return false;
+    }
+    if (payload_len > 0 && !payload) {
+        return false;
+    }
+    if (num_fds > 4 || (num_fds > 0 && !fds)) {
+        return false;
+    }
+    for (size_t i = 0; i < num_fds; ++i) {
+        if (fds[i] < 0) {
+            return false;
+        }
+    }
 
-    struct msghdr msg = {0};
-
-    struct iovec iov = {.iov_base = (void *)hdr, .iov_len = sizeof(waywal_ipc_hdr_t)};
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
+    struct iovec iov[2];
+    iov[0].iov_base = (void *)hdr;
+    iov[0].iov_len = sizeof(waywal_ipc_hdr_t);
+    size_t iov_cnt = 1;
+    if (payload_len > 0) {
+        iov[1].iov_base = (void *)payload;
+        iov[1].iov_len = payload_len;
+        iov_cnt = 2;
+    }
 
     union {
         char buf[CMSG_SPACE(sizeof(int) * 4)];
         struct cmsghdr align;
     } u;
-
-    if (fds && num_fds > 0) {
-        if (num_fds > 4) {
-            num_fds = 4;
-        }
-        memset(u.buf, 0, sizeof(u.buf));
-        msg.msg_control = u.buf;
-        msg.msg_controllen = CMSG_SPACE(sizeof(int) * num_fds);
-
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type = SCM_RIGHTS;
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int) * num_fds);
-        memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * num_fds);
+    size_t ctrl_len = 0;
+    if (num_fds > 0) {
+        memset(u.buf, 0, CMSG_SPACE(sizeof(int) * num_fds));
+        ctrl_len = CMSG_SPACE(sizeof(int) * num_fds);
     }
 
-    ssize_t sent;
-    do {
-        sent = sendmsg(socket_fd, &msg, MSG_NOSIGNAL);
-    } while (sent < 0 && errno == EINTR);
+    size_t iov_idx = 0;
+    bool ancillary_sent = (num_fds == 0);
+    while (iov_idx < iov_cnt) {
+        struct msghdr msg = {0};
+        msg.msg_iov = &iov[iov_idx];
+        msg.msg_iovlen = iov_cnt - iov_idx;
 
-    return (sent == (ssize_t)sizeof(waywal_ipc_hdr_t));
+        if (!ancillary_sent) {
+            msg.msg_control = u.buf;
+            msg.msg_controllen = ctrl_len;
+            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type = SCM_RIGHTS;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(int) * num_fds);
+            memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * num_fds);
+        }
+
+        ssize_t sent = sendmsg(socket_fd, &msg, MSG_NOSIGNAL);
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (poll_fd_retry(socket_fd, POLLOUT, 1000) > 0) {
+                    continue;
+                }
+            }
+            return false;
+        }
+        if (sent == 0) {
+            return false;
+        }
+
+        ancillary_sent = true;
+        size_t adv = (size_t)sent;
+        while (iov_idx < iov_cnt && adv >= iov[iov_idx].iov_len) {
+            adv -= iov[iov_idx].iov_len;
+            iov[iov_idx].iov_len = 0;
+            iov_idx++;
+        }
+        if (iov_idx < iov_cnt && adv > 0) {
+            iov[iov_idx].iov_base = (uint8_t *)iov[iov_idx].iov_base + adv;
+            iov[iov_idx].iov_len -= adv;
+        }
+    }
+
+    return true;
+}
+
+bool waywal_ipc_send_fds(int socket_fd, const waywal_ipc_hdr_t *hdr, const int *fds, size_t num_fds)
+{
+    return waywal_ipc_send_payload_fds(socket_fd, hdr, NULL, 0, fds, num_fds);
 }
 
 bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd)
@@ -336,6 +416,19 @@ bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd
         return waywal_ipc_send_fds(socket_fd, hdr, &attached_fd, 1);
     }
     return waywal_ipc_send_fds(socket_fd, hdr, NULL, 0);
+}
+
+static void close_fd_array(int *fds, size_t count)
+{
+    if (!fds) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (fds[i] >= 0) {
+            close(fds[i]);
+            fds[i] = -1;
+        }
+    }
 }
 
 bool waywal_ipc_recv_fds(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_fds, size_t max_fds,
@@ -357,12 +450,11 @@ bool waywal_ipc_recv_fds(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_fds,
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
 
-    /* Accommodate Linux SCM_MAX_FD (253) so excess ancillary FDs are never truncated and leaked */
+    /* Accommodate Linux SCM_MAX_FD (253) without full 1 KiB memset before kernel fills cmsg. */
     union {
         char buf[CMSG_SPACE(sizeof(int) * 253)];
         struct cmsghdr align;
     } u;
-    memset(u.buf, 0, sizeof(u.buf));
     msg.msg_control = u.buf;
     msg.msg_controllen = sizeof(u.buf);
 
@@ -376,23 +468,30 @@ bool waywal_ipc_recv_fds(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_fds,
     }
 
     size_t extracted = 0;
-    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
-            cmsg->cmsg_len >= CMSG_LEN(0)) {
-            size_t fd_count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-            const unsigned char *data = CMSG_DATA(cmsg);
-            for (size_t i = 0; i < fd_count; ++i) {
-                int fd = -1;
-                memcpy(&fd, data + i * sizeof(int), sizeof(int));
-                if (fd >= 0) {
-                    if (out_fds && extracted < max_fds) {
-                        out_fds[extracted++] = fd;
-                    } else {
-                        close(fd);
+    if (msg.msg_controllen >= sizeof(struct cmsghdr)) {
+        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+                cmsg->cmsg_len >= CMSG_LEN(0)) {
+                size_t fd_count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                const unsigned char *data = CMSG_DATA(cmsg);
+                for (size_t i = 0; i < fd_count; ++i) {
+                    int fd = -1;
+                    memcpy(&fd, data + i * sizeof(int), sizeof(int));
+                    if (fd >= 0) {
+                        if (out_fds && extracted < max_fds && (msg.msg_flags & MSG_CTRUNC) == 0) {
+                            out_fds[extracted++] = fd;
+                        } else {
+                            close(fd);
+                        }
                     }
                 }
             }
         }
+    }
+    if ((msg.msg_flags & MSG_CTRUNC) != 0) {
+        close_fd_array(out_fds, extracted);
+        return false;
     }
     if (out_num_fds) {
         *out_num_fds = extracted;
@@ -408,31 +507,16 @@ bool waywal_ipc_recv_fds(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_fds,
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd = {.fd = socket_fd, .events = POLLIN};
-                if (poll(&pfd, 1, 100) > 0)
+                if (poll_fd_retry(socket_fd, POLLIN, 500) > 0)
                     continue;
             }
-            if (out_fds) {
-                for (size_t i = 0; i < extracted; ++i) {
-                    if (out_fds[i] >= 0) {
-                        close(out_fds[i]);
-                        out_fds[i] = -1;
-                    }
-                }
-            }
+            close_fd_array(out_fds, extracted);
             if (out_num_fds)
                 *out_num_fds = 0;
             return false;
         }
         if (rem == 0) {
-            if (out_fds) {
-                for (size_t i = 0; i < extracted; ++i) {
-                    if (out_fds[i] >= 0) {
-                        close(out_fds[i]);
-                        out_fds[i] = -1;
-                    }
-                }
-            }
+            close_fd_array(out_fds, extracted);
             if (out_num_fds)
                 *out_num_fds = 0;
             return false;
@@ -443,14 +527,7 @@ bool waywal_ipc_recv_fds(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_fds,
     if (out_hdr->magic != WAYWAL_IPC_MAGIC || out_hdr->version != WAYWAL_IPC_VERSION) {
         WAYWAL_LOG_ERR("IPC header magic/version mismatch: magic=0x%08x ver=%u", out_hdr->magic,
                        out_hdr->version);
-        if (out_fds) {
-            for (size_t i = 0; i < extracted; ++i) {
-                if (out_fds[i] >= 0) {
-                    close(out_fds[i]);
-                    out_fds[i] = -1;
-                }
-            }
-        }
+        close_fd_array(out_fds, extracted);
         if (out_num_fds)
             *out_num_fds = 0;
         return false;
@@ -687,10 +764,13 @@ bool waywal_ipc_serialize_req_wwpkg_install(const uint8_t package_uuid[16], uint
     if (out_total_len) {
         *out_total_len = total_len;
     }
+    if (out_buf && out_buf_cap < total_len) {
+        return false;
+    }
     out_hdr->magic = WAYWAL_IPC_MAGIC;
     out_hdr->version = WAYWAL_IPC_VERSION;
     out_hdr->opcode = WAYWAL_REQ_WWPKG_INSTALL;
-    out_hdr->payload_size = (uint32_t)total_len;
+    out_hdr->payload_size = (uint64_t)total_len;
 
     if (out_req) {
         memset(out_req, 0, sizeof(*out_req));
@@ -701,9 +781,6 @@ bool waywal_ipc_serialize_req_wwpkg_install(const uint8_t package_uuid[16], uint
         out_req->target_output_len = (uint32_t)wire_tail_len;
     }
     if (out_buf) {
-        if (out_buf_cap < total_len) {
-            return false;
-        }
         waywal_ipc_req_wwpkg_install_t *hdr_part = (waywal_ipc_req_wwpkg_install_t *)out_buf;
         memset(hdr_part, 0, sizeof(*hdr_part));
         if (package_uuid) {
@@ -769,10 +846,13 @@ bool waywal_ipc_serialize_resp_wwpkg_install(const uint8_t package_uuid[16], uin
     if (out_total_len) {
         *out_total_len = total_len;
     }
+    if (out_buf && out_buf_cap < total_len) {
+        return false;
+    }
     out_hdr->magic = WAYWAL_IPC_MAGIC;
     out_hdr->version = WAYWAL_IPC_VERSION;
     out_hdr->opcode = WAYWAL_RESP_WWPKG_INSTALL;
-    out_hdr->payload_size = (uint32_t)total_len;
+    out_hdr->payload_size = (uint64_t)total_len;
 
     if (out_resp) {
         memset(out_resp, 0, sizeof(*out_resp));
@@ -783,9 +863,6 @@ bool waywal_ipc_serialize_resp_wwpkg_install(const uint8_t package_uuid[16], uin
         out_resp->error_msg_len = (uint32_t)wire_tail_len;
     }
     if (out_buf) {
-        if (out_buf_cap < total_len) {
-            return false;
-        }
         waywal_ipc_resp_wwpkg_install_t *hdr_part = (waywal_ipc_resp_wwpkg_install_t *)out_buf;
         memset(hdr_part, 0, sizeof(*hdr_part));
         if (package_uuid) {

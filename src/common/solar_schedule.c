@@ -213,13 +213,21 @@ void waywal_solar_compute(double latitude_deg, double longitude_deg, time_t utc_
         out_state->sunrise_min = wrap_1440(sr_utc_min + tz_off_min);
         out_state->sunset_min = wrap_1440(ss_utc_min + tz_off_min);
 
-        double omega_civ_deg = rad_to_deg(acos(clamp_d(cos_omega_civ, -1.0, 1.0)));
-        double dawn_utc_min = noon_utc_min - 4.0 * omega_civ_deg;
-        double dusk_utc_min = noon_utc_min + 4.0 * omega_civ_deg;
-        out_state->dawn_utc = utc_day_start + (time_t)llround(dawn_utc_min * 60.0);
-        out_state->dusk_utc = utc_day_start + (time_t)llround(dusk_utc_min * 60.0);
-        out_state->civil_dawn_min = wrap_1440(dawn_utc_min + tz_off_min);
-        out_state->civil_dusk_min = wrap_1440(dusk_utc_min + tz_off_min);
+        if (cos_omega_civ < -1.0 || cos_omega_civ > 1.0) {
+            /* High-latitude white nights or perpetual dark twilight never cross -6 deg. */
+            out_state->dawn_utc = 0;
+            out_state->dusk_utc = 0;
+            out_state->civil_dawn_min = -1.0;
+            out_state->civil_dusk_min = -1.0;
+        } else {
+            double omega_civ_deg = rad_to_deg(acos(cos_omega_civ));
+            double dawn_utc_min = noon_utc_min - 4.0 * omega_civ_deg;
+            double dusk_utc_min = noon_utc_min + 4.0 * omega_civ_deg;
+            out_state->dawn_utc = utc_day_start + (time_t)llround(dawn_utc_min * 60.0);
+            out_state->dusk_utc = utc_day_start + (time_t)llround(dusk_utc_min * 60.0);
+            out_state->civil_dawn_min = wrap_1440(dawn_utc_min + tz_off_min);
+            out_state->civil_dusk_min = wrap_1440(dusk_utc_min + tz_off_min);
+        }
 
         out_state->is_daylight = (elevation_deg >= -0.833);
     }
@@ -586,7 +594,7 @@ static bool resolve_manifest_frame_path(const char *raw_path, const char *base_d
         int rn = snprintf(rel_in, sizeof(rel_in), "./%s", trimmed);
         if (rn < 0 || (size_t)rn >= sizeof(rel_in))
             return false;
-        if (!waywal_expand_path(rel_in, rel_exp, sizeof(rel_exp)) || rel_exp[0] != '.' ||
+        if (!waywal_expand_path_ex(rel_in, rel_exp, sizeof(rel_exp), true) || rel_exp[0] != '.' ||
             rel_exp[1] != '/') {
             return false;
         }
@@ -1205,6 +1213,16 @@ static bool fine_subphase_matches(waywal_solar_phase_t entry_phase,
     return false;
 }
 
+static int64_t civil_days_since_epoch(int y, int m, int d)
+{
+    y -= (m <= 2) ? 1 : 0;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    uint64_t yoe = (uint64_t)(y - era * 400);
+    uint64_t doy = (153u * (uint64_t)(m + (m > 2 ? -3 : 9)) + 2u) / 5u + (uint64_t)d - 1u;
+    uint64_t doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return era * 146097LL + (int64_t)doe - 719468LL;
+}
+
 bool waywal_dynwall_resolve(const waywal_dynwall_manifest_t *manifest, time_t utc_now,
                             const struct tm *local_tm, const waywal_solar_state_t *solar_opt,
                             waywal_dynwall_resolved_t *out_resolved)
@@ -1228,15 +1246,29 @@ bool waywal_dynwall_resolve(const waywal_dynwall_manifest_t *manifest, time_t ut
         double now_tod = (double)local_tm->tm_hour * 3600.0 + (double)local_tm->tm_min * 60.0 +
                          (double)local_tm->tm_sec;
         double start_tod = 0.0;
+        double elapsed = now_tod;
         if (manifest->has_start_tm) {
             start_tod = (double)manifest->start_tm.tm_hour * 3600.0 +
                         (double)manifest->start_tm.tm_min * 60.0 +
                         (double)manifest->start_tm.tm_sec;
+            if (manifest->start_tm.tm_mday >= 1 && manifest->start_tm.tm_mon >= 0 &&
+                manifest->start_tm.tm_year >= 0 && local_tm->tm_mday >= 1 &&
+                local_tm->tm_mon >= 0) {
+                /* Civil day delta keeps multi-day schedules free of DST hour jumps. */
+                int64_t day_delta =
+                    civil_days_since_epoch(local_tm->tm_year + 1900, local_tm->tm_mon + 1,
+                                           local_tm->tm_mday) -
+                    civil_days_since_epoch(manifest->start_tm.tm_year + 1900,
+                                           manifest->start_tm.tm_mon + 1,
+                                           manifest->start_tm.tm_mday);
+                double day_phase = fmod((double)day_delta * 86400.0, total);
+                elapsed = day_phase + (now_tod - start_tod);
+            } else {
+                elapsed = now_tod - start_tod;
+                if (elapsed < 0.0)
+                    elapsed += 86400.0;
+            }
         }
-
-        double elapsed = now_tod - start_tod;
-        if (elapsed < 0.0)
-            elapsed += 86400.0;
         double cycle_pos = fmod(elapsed, total);
         if (cycle_pos < 0.0)
             cycle_pos += total;

@@ -268,7 +268,8 @@ static bool resolve_env_or_xdg(const char *var_name, char *val_buf, size_t val_c
     return false;
 }
 
-bool waywal_expand_path(const char *raw_path, char *out_buf, size_t out_cap)
+bool waywal_expand_path_ex(const char *raw_path, char *out_buf, size_t out_cap,
+                           bool allow_unset_literal)
 {
     if (!raw_path || !out_buf || out_cap == 0) {
         if (out_buf && out_cap > 0)
@@ -301,6 +302,16 @@ bool waywal_expand_path(const char *raw_path, char *out_buf, size_t out_cap)
     }
 
     while (*p != '\0') {
+        if (*p == '\\' && p[1] == '$') {
+            if (pos + 1 >= sizeof(tmp)) {
+                out_buf[0] = '\0';
+                return false;
+            }
+            tmp[pos++] = '$';
+            p += 2;
+            continue;
+        }
+
         if (*p == '$') {
             const char *var_start = p + 1;
             const char *var_end = var_start;
@@ -326,8 +337,13 @@ bool waywal_expand_path(const char *raw_path, char *out_buf, size_t out_cap)
                     var_end++;
                 next_p = var_end;
             } else {
-                out_buf[0] = '\0';
-                return false;
+                /* Preserve non-variable '$' in literal filenames like cost$5.png or trailing '$'. */
+                if (pos + 1 >= sizeof(tmp)) {
+                    out_buf[0] = '\0';
+                    return false;
+                }
+                tmp[pos++] = *p++;
+                continue;
             }
 
             if (!next_p || var_end <= var_start || (size_t)(var_end - var_start) >= 128) {
@@ -342,8 +358,19 @@ bool waywal_expand_path(const char *raw_path, char *out_buf, size_t out_cap)
 
             char resolved[4096];
             if (!resolve_env_or_xdg(var_name, resolved, sizeof(resolved))) {
-                out_buf[0] = '\0';
-                return false;
+                if (!allow_unset_literal) {
+                    out_buf[0] = '\0';
+                    return false;
+                }
+                size_t raw_tok_len = (size_t)(next_p - p);
+                if (pos + raw_tok_len >= sizeof(tmp)) {
+                    out_buf[0] = '\0';
+                    return false;
+                }
+                memcpy(&tmp[pos], p, raw_tok_len);
+                pos += raw_tok_len;
+                p = next_p;
+                continue;
             }
 
             size_t rlen = strlen(resolved);
@@ -377,6 +404,11 @@ bool waywal_expand_path(const char *raw_path, char *out_buf, size_t out_cap)
 
     memcpy(out_buf, tmp, pos + 1);
     return true;
+}
+
+bool waywal_expand_path(const char *raw_path, char *out_buf, size_t out_cap)
+{
+    return waywal_expand_path_ex(raw_path, out_buf, out_cap, false);
 }
 
 typedef struct {

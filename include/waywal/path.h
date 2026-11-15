@@ -36,6 +36,10 @@ void waywal_normalize_path(char *path);
 /* Expands leading '~/' and environment variables ($HOME, $XDG_CONFIG_HOME, ${VAR}, etc.) */
 bool waywal_expand_path(const char *raw_path, char *out_buf, size_t out_cap);
 
+/* Same as waywal_expand_path(), optionally preserving unset $VAR/${VAR} tokens literally. */
+bool waywal_expand_path_ex(const char *raw_path, char *out_buf, size_t out_cap,
+                           bool allow_unset_literal);
+
 typedef struct {
     char name[64];
     char path[WAYWAL_PATH_MAX];

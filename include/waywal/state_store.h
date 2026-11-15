@@ -3,15 +3,7 @@
 #define WAYWAL_STATE_STORE_H
 
 #include "waywal/path.h"
-
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
 #include "waywal/types.h"
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -22,14 +14,10 @@ extern "C" {
 #endif
 
 #define WAYWAL_STATE_MAGIC       0x57575354U
-#define WAYWAL_STATE_VERSION     5U
+#define WAYWAL_STATE_VERSION     6U
 #define WAYWAL_STATE_MAX_OUTPUTS 16U
 
-#ifdef __cplusplus
-typedef enum : uint32_t {
-#else
-typedef enum {
-#endif
+typedef enum WWAL_ENUM_U32 {
     WAYWAL_CONTENT_STATIC_IMAGE = 0,
     WAYWAL_CONTENT_SOLID_COLOR = 1,
     WAYWAL_CONTENT_VIDEO = 2,
@@ -49,11 +37,7 @@ typedef enum {
 
 #ifndef WAYWAL_FILTER_MODE_DEFINED
 #define WAYWAL_FILTER_MODE_DEFINED
-#ifdef __cplusplus
-typedef enum : uint32_t {
-#else
-typedef enum {
-#endif
+typedef enum WWAL_ENUM_U32 {
     WAYWAL_FILTER_LANCZOS3 = 0,
     WAYWAL_FILTER_MITCHELL = 1,
     WAYWAL_FILTER_BILINEAR = 2,

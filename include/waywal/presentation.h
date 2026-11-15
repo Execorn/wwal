@@ -13,6 +13,14 @@
 extern "C" {
 #endif
 
+/* Fallback to int when strict ISO C omits POSIX clockid_t; ABI-equivalent on Linux. */
+#if defined(_POSIX_C_SOURCE) || defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) ||                  \
+    defined(__clockid_t_defined) || defined(__USE_POSIX199309) || defined(__cplusplus)
+typedef clockid_t waywal_clockid_t;
+#else
+typedef int waywal_clockid_t;
+#endif
+
 typedef struct {
     /* PLL state variables */
     int64_t phase_est_ns;       /* Estimated time of next VBlank in presentation clock ns */
@@ -28,7 +36,7 @@ typedef struct {
     bool has_hw_clock;
     bool is_zero_copy;
     int64_t jitter_ns;
-    clockid_t clock_id;
+    waywal_clockid_t clock_id;
     bool has_clock_id;
 } waywal_pll_t;
 
@@ -44,8 +52,8 @@ void presentation_pll_init(waywal_pll_t *pll, uint32_t default_refresh_hz);
 void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t refresh_ns,
                              uint32_t flags);
 int64_t presentation_pll_predict_next_vblank(const waywal_pll_t *pll);
-void presentation_set_clock_id(clockid_t clk_id);
-clockid_t presentation_get_clock_id(void);
+void presentation_set_clock_id(waywal_clockid_t clk_id);
+waywal_clockid_t presentation_get_clock_id(void);
 
 bool presentation_sync_init(presentation_sync_t *ps, struct wp_presentation *pres,
                             struct wl_surface *surface);

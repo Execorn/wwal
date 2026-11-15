@@ -20,6 +20,33 @@
 
 #define WAYWAL_MAX_INLINE_GRAPH_JSON_BYTES (16u * 1024u * 1024u)
 
+static bool ipc_copy_cstr_checked(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0 || !src) {
+        return false;
+    }
+    size_t len = strnlen(src, cap);
+    if (len >= cap) {
+        return false;
+    }
+    memcpy(dst, src, len + 1u);
+    return true;
+}
+
+static void ipc_copy_cstr_bounded(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t len = strnlen(src, cap - 1u);
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
 static bool bone_sim_config_floats_finite(const we_bone_sim_config_t *cfg)
 {
     return isfinite(cfg->compliance_stretch) && isfinite(cfg->compliance_bend) &&
@@ -122,43 +149,49 @@ bool waywal_ipc_serialize_req_compile_shader_graph(
 
     size_t total_payload = sizeof(waywal_ipc_req_compile_shader_graph_t) + (size_t)inline_len;
 
-    out_hdr->magic = WAYWAL_IPC_MAGIC;
-    out_hdr->version = WAYWAL_IPC_VERSION;
-    out_hdr->opcode = WAYWAL_REQ_COMPILE_SHADER_GRAPH;
-    out_hdr->payload_size = (uint64_t)total_payload;
-
     waywal_ipc_req_compile_shader_graph_t req_data;
     memset(&req_data, 0, sizeof(req_data));
 
     if (target_output) {
-        strncpy(req_data.target_output, target_output, sizeof(req_data.target_output) - 1);
+        if (!ipc_copy_cstr_checked(req_data.target_output, sizeof(req_data.target_output),
+                                   target_output)) {
+            return false;
+        }
     } else {
         req_data.target_output[0] = '*';
     }
 
     if (graph_json_path) {
-        strncpy(req_data.graph_json_path, graph_json_path, sizeof(req_data.graph_json_path) - 1);
+        if (!ipc_copy_cstr_checked(req_data.graph_json_path, sizeof(req_data.graph_json_path),
+                                   graph_json_path)) {
+            return false;
+        }
     }
 
     req_data.inline_json_len = inline_len;
     req_data.flags = flags;
+
+    if (out_total_len) {
+        *out_total_len = total_payload;
+    }
+    if (out_buf && out_buf_cap < total_payload) {
+        return false;
+    }
+
+    out_hdr->magic = WAYWAL_IPC_MAGIC;
+    out_hdr->version = WAYWAL_IPC_VERSION;
+    out_hdr->opcode = WAYWAL_REQ_COMPILE_SHADER_GRAPH;
+    out_hdr->payload_size = (uint64_t)total_payload;
 
     if (out_req) {
         memcpy(out_req, &req_data, sizeof(req_data));
     }
 
     if (out_buf) {
-        if (out_buf_cap < total_payload) {
-            return false;
-        }
         memcpy(out_buf, &req_data, sizeof(req_data));
         if (inline_len > 0 && inline_json) {
             memcpy((uint8_t *)out_buf + sizeof(req_data), inline_json, inline_len);
         }
-    }
-
-    if (out_total_len) {
-        *out_total_len = total_payload;
     }
 
     return true;
@@ -205,7 +238,7 @@ bool waywal_ipc_serialize_resp_compile_shader_graph(
     resp_data.offending_node_id = offending_node_id;
 
     if (error_msg) {
-        strncpy(resp_data.error_msg, error_msg, sizeof(resp_data.error_msg) - 1);
+        ipc_copy_cstr_bounded(resp_data.error_msg, sizeof(resp_data.error_msg), error_msg);
     }
     memcpy(out_resp, &resp_data, sizeof(resp_data));
 
@@ -269,7 +302,10 @@ bool waywal_ipc_serialize_req_set_camera_3d(
     waywal_ipc_req_set_camera_3d_t req_data;
     memset(&req_data, 0, sizeof(req_data));
     if (target_output) {
-        strncpy(req_data.target_output, target_output, sizeof(req_data.target_output) - 1);
+        if (!ipc_copy_cstr_checked(req_data.target_output, sizeof(req_data.target_output),
+                                   target_output)) {
+            return false;
+        }
     } else {
         req_data.target_output[0] = '*';
     }
@@ -400,7 +436,10 @@ bool waywal_ipc_serialize_req_set_physics_params(const char *target_output, int3
     waywal_ipc_req_set_physics_params_t req_data;
     memset(&req_data, 0, sizeof(req_data));
     if (target_output) {
-        strncpy(req_data.target_output, target_output, sizeof(req_data.target_output) - 1);
+        if (!ipc_copy_cstr_checked(req_data.target_output, sizeof(req_data.target_output),
+                                   target_output)) {
+            return false;
+        }
     } else {
         req_data.target_output[0] = '*';
     }
@@ -513,7 +552,10 @@ bool waywal_ipc_serialize_req_set_scene_lights(const char *target_output,
     waywal_ipc_req_set_scene_lights_t req_data;
     memset(&req_data, 0, sizeof(req_data));
     if (target_output) {
-        strncpy(req_data.target_output, target_output, sizeof(req_data.target_output) - 1);
+        if (!ipc_copy_cstr_checked(req_data.target_output, sizeof(req_data.target_output),
+                                   target_output)) {
+            return false;
+        }
     } else {
         req_data.target_output[0] = '*';
     }
@@ -600,9 +642,9 @@ static void ipc_copy_bounded_str(char *dst, size_t dst_cap, const char *src)
     if (!src) {
         return;
     }
-    size_t len = strnlen(src, dst_cap - 1u);
-    memcpy(dst, src, len);
-    dst[len] = '\0';
+    for (size_t i = 0u; i + 1u < dst_cap && src[i] != '\0'; ++i) {
+        dst[i] = src[i];
+    }
 }
 
 static void ipc_copy_target_output(char *dst, size_t dst_cap, const char *target_output)
@@ -645,11 +687,14 @@ static bool ipc_brush_params_valid(const we_brush_params_t *params)
 
 static bool ipc_brush_dab_valid(const we_brush_dab_t *dab)
 {
-    if (!ipc_packed_floats_finite(dab, 11u)) {
-        return false;
-    }
     we_brush_dab_t d;
     memcpy(&d, dab, sizeof(d));
+    if (!isfinite(d.ax) || !isfinite(d.ay) || !isfinite(d.bx) || !isfinite(d.by) ||
+        !isfinite(d.radius_a) || !isfinite(d.radius_b) || !isfinite(d.opacity_eff) ||
+        !isfinite(d.flow_dir_x) || !isfinite(d.flow_dir_y) || !isfinite(d.drag_dx_px) ||
+        !isfinite(d.drag_dy_px) || (d.flags & ~0x1u) != 0u) {
+        return false;
+    }
     if (d.radius_a < 0.0f || d.radius_b < 0.0f || d.radius_a > 4096.0f || d.radius_b > 4096.0f ||
         d.opacity_eff < 0.0f || d.opacity_eff > 1.0f || fabsf(d.ax) > 1e6f || fabsf(d.ay) > 1e6f ||
         fabsf(d.bx) > 1e6f || fabsf(d.by) > 1e6f) {
@@ -662,12 +707,17 @@ static bool ipc_particle_ramp_lut_valid(const we_particle_ramp_lut_t *lut)
 {
     we_particle_ramp_lut_t l;
     memcpy(&l, lut, sizeof(l));
-    if (l.channel_kind > 2u || l.knot_count < 2u || l.knot_count > WE_PARTICLE_MAX_KNOTS) {
+    if (l.operator_index >= WE_PARTICLE_MAX_OPERATORS || l.channel_kind > 2u || l.knot_count < 2u ||
+        l.knot_count > WE_PARTICLE_MAX_KNOTS) {
         return false;
     }
-    return ipc_packed_floats_finite((const uint8_t *)&l +
-                                        offsetof(we_particle_ramp_lut_t, scalar_lut),
-                                    (size_t)WE_PARTICLE_RAMP_SAMPLES * 4u);
+    for (size_t i = 0; i < (size_t)WE_PARTICLE_RAMP_SAMPLES; ++i) {
+        if (!isfinite(l.scalar_lut[i]) || !isfinite(l.color_lut_r[i]) ||
+            !isfinite(l.color_lut_g[i]) || !isfinite(l.color_lut_b[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool ipc_audio_binding_valid(const we_audio_binding_t *binding)
@@ -713,6 +763,9 @@ static bool ipc_serialize_var_msg(uint16_t opcode, const void *fixed_hdr, size_t
         return false;
     }
     size_t total_payload = fixed_size + tail_size;
+    if (out_total_len) {
+        *out_total_len = total_payload;
+    }
     if (out_buf && out_buf_cap < total_payload) {
         return false;
     }
@@ -726,9 +779,6 @@ static bool ipc_serialize_var_msg(uint16_t opcode, const void *fixed_hdr, size_t
         if (tail_size > 0u) {
             memcpy((uint8_t *)out_buf + fixed_size, tail, tail_size);
         }
-    }
-    if (out_total_len) {
-        *out_total_len = total_payload;
     }
     return true;
 }
@@ -2288,6 +2338,108 @@ bool waywal_ipc_validate_req_puppet_solve_weights(const void *payload, size_t pa
     return true;
 }
 
+static bool ipc_rig_validate_solve_weights_ext(const waywal_ipc_puppet_solve_weights_ext_t *ext)
+{
+    if (!ext) {
+        return false;
+    }
+    return isfinite(ext->conductivity_scale) && ext->conductivity_scale >= 0.0f &&
+           ext->conductivity_scale <= 100.0f;
+}
+
+bool waywal_ipc_serialize_req_puppet_solve_weights_ext(
+    const waywal_ipc_puppet_solve_weights_t *params, const uint64_t *locked_vert_bs,
+    const waywal_ipc_puppet_solve_weights_ext_t *ext, waywal_ipc_hdr_t *out_hdr, void *out_buf,
+    size_t out_buf_cap, size_t *out_total_len)
+{
+    if (!params || !out_hdr) {
+        return false;
+    }
+    waywal_ipc_puppet_solve_weights_t base = *params;
+    base.flags &= ~WAYWAL_IPC_SOLVE_WEIGHTS_FLAG_EXT;
+    if (!ipc_rig_validate_solve_weights_hdr(&base)) {
+        return false;
+    }
+    if (base.locked_vert_word_count > 0u && !locked_vert_bs) {
+        return false;
+    }
+    if (ext) {
+        if (!ipc_rig_validate_solve_weights_ext(ext)) {
+            return false;
+        }
+        base.flags |= WAYWAL_IPC_SOLVE_WEIGHTS_FLAG_EXT;
+    }
+    size_t bs_len = (size_t)base.locked_vert_word_count * sizeof(uint64_t);
+    size_t ext_len = ext ? sizeof(*ext) : 0u;
+    size_t total_len = sizeof(base) + bs_len + ext_len;
+    if (total_len > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES) {
+        return false;
+    }
+    if (out_total_len) {
+        *out_total_len = total_len;
+    }
+    if (out_buf && out_buf_cap < total_len) {
+        return false;
+    }
+    ipc_fill_hdr(out_hdr, WAYWAL_REQ_PUPPET_SOLVE_WEIGHTS, total_len);
+    if (out_buf) {
+        uint8_t *dst = (uint8_t *)out_buf;
+        memcpy(dst, &base, sizeof(base));
+        if (bs_len > 0u) {
+            memcpy(dst + sizeof(base), locked_vert_bs, bs_len);
+        }
+        if (ext) {
+            memcpy(dst + sizeof(base) + bs_len, ext, sizeof(*ext));
+        }
+    }
+    return true;
+}
+
+bool waywal_ipc_validate_req_puppet_solve_weights_ext(
+    const void *payload, size_t payload_len, const waywal_ipc_puppet_solve_weights_t **out_req,
+    const uint64_t **out_locked_bs, const waywal_ipc_puppet_solve_weights_ext_t **out_ext)
+{
+    if (!payload || payload_len < sizeof(waywal_ipc_puppet_solve_weights_t) ||
+        payload_len > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES) {
+        return false;
+    }
+    waywal_ipc_puppet_solve_weights_t r;
+    memcpy(&r, payload, sizeof(r));
+    bool has_ext = (r.flags & WAYWAL_IPC_SOLVE_WEIGHTS_FLAG_EXT) != 0u;
+    waywal_ipc_puppet_solve_weights_t base = r;
+    base.flags &= ~WAYWAL_IPC_SOLVE_WEIGHTS_FLAG_EXT;
+    if (!ipc_rig_validate_solve_weights_hdr(&base)) {
+        return false;
+    }
+    size_t bs_len = (size_t)r.locked_vert_word_count * sizeof(uint64_t);
+    size_t ext_len = has_ext ? sizeof(waywal_ipc_puppet_solve_weights_ext_t) : 0u;
+    if (payload_len != sizeof(r) + bs_len + ext_len) {
+        return false;
+    }
+    const waywal_ipc_puppet_solve_weights_ext_t *ext_ptr = NULL;
+    if (has_ext) {
+        waywal_ipc_puppet_solve_weights_ext_t ext_copy;
+        memcpy(&ext_copy, (const uint8_t *)payload + sizeof(r) + bs_len, sizeof(ext_copy));
+        if (!ipc_rig_validate_solve_weights_ext(&ext_copy)) {
+            return false;
+        }
+        ext_ptr = (const waywal_ipc_puppet_solve_weights_ext_t *)((const uint8_t *)payload +
+                                                                  sizeof(r) + bs_len);
+    }
+    if (out_req) {
+        *out_req = (const waywal_ipc_puppet_solve_weights_t *)payload;
+    }
+    if (out_locked_bs) {
+        *out_locked_bs = r.locked_vert_word_count > 0u
+                             ? (const uint64_t *)((const uint8_t *)payload + sizeof(r))
+                             : NULL;
+    }
+    if (out_ext) {
+        *out_ext = ext_ptr;
+    }
+    return true;
+}
+
 bool waywal_ipc_serialize_req_puppet_paint_weights(uint32_t object_id, uint32_t flags,
                                                    const waywal_ipc_vertex_weight_t *entries,
                                                    uint32_t entry_count, waywal_ipc_hdr_t *out_hdr,
@@ -2428,6 +2580,135 @@ bool waywal_ipc_validate_req_puppet_preview_ik(const void *payload, size_t paylo
     }
     if (out_overrides) {
         *out_overrides = r.override_count > 0u ? (const waywal_ipc_bone_trs_t *)op : NULL;
+    }
+    return true;
+}
+
+static bool ipc_rig_validate_preview_ik_ext(const waywal_ipc_puppet_preview_ik_ext_t *ext)
+{
+    if (!ext || (ext->ext_flags & ~0x1Fu) != 0u) {
+        return false;
+    }
+    if (!ipc_rig_floats_finite(ext->pole_world, 3u) ||
+        !ipc_rig_floats_finite(ext->aim_axis_local, 3u) || !isfinite(ext->soft_zone_ratio) ||
+        !isfinite(ext->max_stretch_ratio) || !isfinite(ext->root_angle_min_rad) ||
+        !isfinite(ext->root_angle_max_rad) || !isfinite(ext->mid_angle_min_rad) ||
+        !isfinite(ext->mid_angle_max_rad) || !isfinite(ext->aim_max_cone_rad) ||
+        !isfinite(ext->aim_blend_weight) || !isfinite(ext->ik_blend_weight)) {
+        return false;
+    }
+    if (ext->soft_zone_ratio < 0.0f || ext->soft_zone_ratio > 1.0f ||
+        ext->max_stretch_ratio < 1.0f || ext->max_stretch_ratio > 4.0f ||
+        ext->root_angle_min_rad > ext->root_angle_max_rad ||
+        ext->mid_angle_min_rad > ext->mid_angle_max_rad || ext->aim_max_cone_rad < 0.0f ||
+        ext->aim_max_cone_rad > 3.141593f || ext->aim_blend_weight < 0.0f ||
+        ext->aim_blend_weight > 1.0f || ext->ik_blend_weight < 0.0f ||
+        ext->ik_blend_weight > 1.0f) {
+        return false;
+    }
+    return true;
+}
+
+bool waywal_ipc_serialize_req_puppet_preview_ik_ext(
+    const waywal_ipc_puppet_preview_ik_t *params, const waywal_ipc_bone_trs_t *overrides,
+    const waywal_ipc_puppet_preview_ik_ext_t *ext, waywal_ipc_hdr_t *out_hdr, void *out_buf,
+    size_t out_buf_cap, size_t *out_total_len)
+{
+    if (!params || !out_hdr) {
+        return false;
+    }
+    waywal_ipc_puppet_preview_ik_t base = *params;
+    base.mode_flags &= ~WAYWAL_IPC_IK_FLAG_HAS_POLE_EXT;
+    if (!ipc_rig_validate_preview_ik_hdr(&base)) {
+        return false;
+    }
+    if (base.override_count > 0u && !overrides) {
+        return false;
+    }
+    for (uint32_t i = 0u; i < base.override_count; ++i) {
+        if (!ipc_rig_validate_bone_trs(&overrides[i])) {
+            return false;
+        }
+    }
+    if (ext) {
+        if (!ipc_rig_validate_preview_ik_ext(ext)) {
+            return false;
+        }
+        base.mode_flags |= WAYWAL_IPC_IK_FLAG_HAS_POLE_EXT;
+    }
+    size_t ov_len = (size_t)base.override_count * sizeof(waywal_ipc_bone_trs_t);
+    size_t ext_len = ext ? sizeof(*ext) : 0u;
+    size_t total_len = sizeof(base) + ov_len + ext_len;
+    if (total_len > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES) {
+        return false;
+    }
+    if (out_total_len) {
+        *out_total_len = total_len;
+    }
+    if (out_buf && out_buf_cap < total_len) {
+        return false;
+    }
+    ipc_fill_hdr(out_hdr, WAYWAL_REQ_PUPPET_PREVIEW_IK, total_len);
+    if (out_buf) {
+        uint8_t *dst = (uint8_t *)out_buf;
+        memcpy(dst, &base, sizeof(base));
+        if (ov_len > 0u) {
+            memcpy(dst + sizeof(base), overrides, ov_len);
+        }
+        if (ext) {
+            memcpy(dst + sizeof(base) + ov_len, ext, sizeof(*ext));
+        }
+    }
+    return true;
+}
+
+bool waywal_ipc_validate_req_puppet_preview_ik_ext(
+    const void *payload, size_t payload_len, const waywal_ipc_puppet_preview_ik_t **out_req,
+    const waywal_ipc_bone_trs_t **out_overrides,
+    const waywal_ipc_puppet_preview_ik_ext_t **out_ext)
+{
+    if (!payload || payload_len < sizeof(waywal_ipc_puppet_preview_ik_t) ||
+        payload_len > WAYWAL_IPC_RIGGING_MAX_PAYLOAD_BYTES) {
+        return false;
+    }
+    waywal_ipc_puppet_preview_ik_t r;
+    memcpy(&r, payload, sizeof(r));
+    bool has_ext = (r.mode_flags & WAYWAL_IPC_IK_FLAG_HAS_POLE_EXT) != 0u;
+    waywal_ipc_puppet_preview_ik_t base = r;
+    base.mode_flags &= ~WAYWAL_IPC_IK_FLAG_HAS_POLE_EXT;
+    if (!ipc_rig_validate_preview_ik_hdr(&base)) {
+        return false;
+    }
+    size_t ov_len = (size_t)r.override_count * sizeof(waywal_ipc_bone_trs_t);
+    size_t ext_len = has_ext ? sizeof(waywal_ipc_puppet_preview_ik_ext_t) : 0u;
+    if (payload_len != sizeof(r) + ov_len + ext_len) {
+        return false;
+    }
+    const uint8_t *op = (const uint8_t *)payload + sizeof(r);
+    for (uint32_t i = 0u; i < r.override_count; ++i) {
+        waywal_ipc_bone_trs_t o;
+        memcpy(&o, op + (size_t)i * sizeof(o), sizeof(o));
+        if (!ipc_rig_validate_bone_trs(&o)) {
+            return false;
+        }
+    }
+    const waywal_ipc_puppet_preview_ik_ext_t *ext_ptr = NULL;
+    if (has_ext) {
+        waywal_ipc_puppet_preview_ik_ext_t ext_copy;
+        memcpy(&ext_copy, op + ov_len, sizeof(ext_copy));
+        if (!ipc_rig_validate_preview_ik_ext(&ext_copy)) {
+            return false;
+        }
+        ext_ptr = (const waywal_ipc_puppet_preview_ik_ext_t *)(op + ov_len);
+    }
+    if (out_req) {
+        *out_req = (const waywal_ipc_puppet_preview_ik_t *)payload;
+    }
+    if (out_overrides) {
+        *out_overrides = r.override_count > 0u ? (const waywal_ipc_bone_trs_t *)op : NULL;
+    }
+    if (out_ext) {
+        *out_ext = ext_ptr;
     }
     return true;
 }

@@ -29,12 +29,15 @@ extern "C" {
 #define WE_BRUSH_MAX_STROKE_DABS   256u
 #define WE_BRUSH_FLOW_NEUTRAL_U8   128u
 
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
+#ifndef WWAL_ENUM_U32
+#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)
+#define WWAL_ENUM_U32 : uint32_t
+#else
+#define WWAL_ENUM_U32
+#endif
 #endif
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_BRUSH_CHAN_MASK_R8 = 0u,
     WE_BRUSH_CHAN_FLOW_RG88 = 1u,
     WE_BRUSH_CHAN_COLOR_RGBA8 = 2u,
@@ -42,7 +45,7 @@ typedef enum : uint32_t {
     WE_BRUSH_CHAN_SMUDGE = 4u,
 } we_brush_channel_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_BRUSH_OP_ADD_BUILDUP = 0u,
     WE_BRUSH_OP_MAX_CAP = 1u,
     WE_BRUSH_OP_SUBTRACT = 2u,
@@ -54,11 +57,6 @@ typedef enum : uint32_t {
     WE_BRUSH_OP_SMUDGE_ADV = 8u,
 } we_brush_op_mode_t;
 
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
-
-#pragma pack(push, 1)
 typedef struct {
     uint32_t channel;
     uint32_t op_mode;
@@ -113,7 +111,6 @@ typedef struct {
     uint32_t target_gl_tex;
     uint32_t target_tex_format;
 } we_brush_stats_t;
-#pragma pack(pop)
 #endif /* WAYWAL_WE_GPU_BRUSH_H */
 
 static_assert(sizeof(we_brush_params_t) == 64, "we_brush_params_t must be exactly 64 bytes");
@@ -194,17 +191,15 @@ static_assert(sizeof(we_brush_stats_t) == 32, "we_brush_stats_t must be exactly 
 #define WAYWAL_IPC_MAX_META_JSON_BYTES      65536u
 #define WE_PARTICLE_RAMP_SAMPLES            65u
 #define WE_PARTICLE_MAX_KNOTS               12u
+#ifndef WE_PARTICLE_MAX_OPERATORS
+#define WE_PARTICLE_MAX_OPERATORS           16u
+#endif
 #define WE_PARTICLE_PRESET_COUNT            8u
 #define WE_MAX_AUDIO_BINDINGS               64u
 
 /* Domain Enums & Packed Wire / Engine Contracts */
 
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_MUTATE_ADD_OBJECT = 0u,
     WE_MUTATE_REMOVE_OBJECT = 1u,
     WE_MUTATE_REORDER_Z = 2u,
@@ -215,7 +210,7 @@ typedef enum : uint32_t {
     WE_MUTATE_SET_SOUND_PROPS = 7u,
 } we_scene_mutate_op_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_NODE_IMAGE = 0u,
     WE_NODE_PARTICLE = 1u,
     WE_NODE_SOUND = 2u,
@@ -224,7 +219,7 @@ typedef enum : uint32_t {
     WE_NODE_CAMERA3D = 5u,
 } we_scene_node_kind_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_BRUSH_IPC_BIND_TARGET = 0u,
     WE_BRUSH_IPC_BEGIN_STROKE = 1u,
     WE_BRUSH_IPC_DAB_BATCH = 2u,
@@ -233,7 +228,7 @@ typedef enum : uint32_t {
     WE_BRUSH_IPC_REDO_STROKE = 5u,
 } we_brush_ipc_action_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_PARTICLE_PRESET_RAIN = 0u,
     WE_PARTICLE_PRESET_SNOW = 1u,
     WE_PARTICLE_PRESET_EMBERS = 2u,
@@ -244,14 +239,14 @@ typedef enum : uint32_t {
     WE_PARTICLE_PRESET_MAGIC_DUST = 7u,
 } we_particle_preset_id_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_KNOT_HANDLE_AUTO_SMOOTH = 0u, /* Fritsch-Carlson monotone cubic Hermite */
     WE_KNOT_HANDLE_LINEAR = 1u,
     WE_KNOT_HANDLE_STEP = 2u,
     WE_KNOT_HANDLE_FREE_BEZIER = 3u,
 } we_knot_handle_mode_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_PARTICLE_CFG_APPLY_PRESET = 0u,
     WE_PARTICLE_CFG_SET_SYSTEM_JSON = 1u,
     WE_PARTICLE_CFG_SET_RAMP_LUT = 2u,
@@ -259,20 +254,20 @@ typedef enum : uint32_t {
     WE_PARTICLE_CFG_PAUSE_TOGGLE = 4u,
 } we_particle_cfg_op_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_AUDIO_SRC_BARK_RANGE = 0u,  /* Bands [band_start .. band_end] */
     WE_AUDIO_SRC_ENVELOPE = 1u,    /* Global 64-band RMS envelope */
     WE_AUDIO_SRC_BASS_ENERGY = 2u, /* Sub-bass/bass bin energy */
     WE_AUDIO_SRC_BEAT_PULSE = 3u,  /* Spectral-flux beat onset pulse */
 } we_audio_src_kind_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_AUDIO_AGG_PEAK_WEIGHTED = 0u, /* 0.7 * peak + 0.3 * mean */
     WE_AUDIO_AGG_MEAN = 1u,
     WE_AUDIO_AGG_PEAK = 2u,
 } we_audio_agg_mode_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_AUDIO_CURVE_LINEAR = 0u,
     WE_AUDIO_CURVE_QUADRATIC = 1u,
     WE_AUDIO_CURVE_SQRT = 2u,
@@ -280,13 +275,13 @@ typedef enum : uint32_t {
     WE_AUDIO_CURVE_TRIG_EDGE = 4u, /* Rising-edge one-shot burst trigger */
 } we_audio_curve_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_AUDIO_BLEND_ADD = 0u,
     WE_AUDIO_BLEND_MULTIPLY = 1u,
     WE_AUDIO_BLEND_REPLACE = 2u,
 } we_audio_blend_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_AUDIO_TGT_LAYER_ORIGIN_X = 0u,
     WE_AUDIO_TGT_LAYER_ORIGIN_Y = 1u,
     WE_AUDIO_TGT_LAYER_SCALE_XY = 2u,
@@ -304,18 +299,12 @@ typedef enum : uint32_t {
     WE_AUDIO_TGT_PARTICLE_BURST_TRIG = 14u,
 } we_audio_target_kind_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WE_AUDIO_BIND_OP_REPLACE_ALL = 0u,
     WE_AUDIO_BIND_OP_UPSERT = 1u,
     WE_AUDIO_BIND_OP_REMOVE = 2u,
     WE_AUDIO_BIND_OP_CLEAR = 3u,
 } we_audio_bind_op_t;
-
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
-
-#pragma pack(push, 1)
 
 /* Particle Curve, OKLab Ramp & Preset Contracts */
 
@@ -399,6 +388,8 @@ typedef struct {
     uint32_t reserved[2];
 } we_audio_binding_t;
 static_assert(sizeof(we_audio_binding_t) == 160, "we_audio_binding_t must be exactly 160 bytes");
+
+#pragma pack(push, 1)
 
 /* Authoring IPC Wire Structs (0x0021..0x002A / 0x8010..0x8019) */
 

@@ -197,6 +197,37 @@ typedef struct {
     char out_path[512];
 } waywal_ipc_export_puppet_mdl_t;
 
+#define WAYWAL_IPC_IK_FLAG_ENABLE              (1u << 0)
+#define WAYWAL_IPC_IK_FLAG_CLEAR_PREVIEW       (1u << 1)
+#define WAYWAL_IPC_IK_FLAG_COMMIT_POSE         (1u << 2)
+#define WAYWAL_IPC_IK_FLAG_HAS_POLE_EXT        (1u << 3)
+#define WAYWAL_IPC_SOLVE_WEIGHTS_FLAG_EXT      (1u << 4)
+#define WAYWAL_IPC_IK_EXT_USE_POLE             (1u << 0)
+#define WAYWAL_IPC_IK_EXT_SOFT_IK              (1u << 1)
+#define WAYWAL_IPC_IK_EXT_ALLOW_STRETCH        (1u << 2)
+#define WAYWAL_IPC_IK_EXT_LIMIT_ANGLES         (1u << 3)
+#define WAYWAL_IPC_IK_EXT_AIM_ENABLED          (1u << 4)
+
+typedef struct {
+    float conductivity_scale; /* Geodesic diffusivity multiplier (<= 0.0 -> 1.0) */
+    float reserved[3];
+} waywal_ipc_puppet_solve_weights_ext_t;
+
+typedef struct {
+    float pole_world[3];
+    float soft_zone_ratio;
+    float max_stretch_ratio;
+    float root_angle_min_rad;
+    float root_angle_max_rad;
+    float mid_angle_min_rad;
+    float mid_angle_max_rad;
+    float aim_axis_local[3];
+    float aim_max_cone_rad;
+    float aim_blend_weight;
+    float ik_blend_weight;
+    uint32_t ext_flags;
+} waywal_ipc_puppet_preview_ik_ext_t;
+
 typedef struct {
     int32_t status;
     uint32_t object_id;
@@ -245,6 +276,10 @@ static_assert(sizeof(waywal_ipc_export_puppet_mdl_t) == 520,
               "waywal_ipc_export_puppet_mdl_t must be exactly 520 bytes");
 static_assert(sizeof(waywal_ipc_export_puppet_mdl_resp_t) == 16,
               "waywal_ipc_export_puppet_mdl_resp_t must be exactly 16 bytes");
+static_assert(sizeof(waywal_ipc_puppet_solve_weights_ext_t) == 16,
+              "waywal_ipc_puppet_solve_weights_ext_t must be exactly 16 bytes");
+static_assert(sizeof(waywal_ipc_puppet_preview_ik_ext_t) == 64,
+              "waywal_ipc_puppet_preview_ik_ext_t must be exactly 64 bytes");
 
 static inline bool waywal_ipc_rigging_calc_mesh_bytes(uint32_t vertex_count,
                                                       uint32_t triangle_count,

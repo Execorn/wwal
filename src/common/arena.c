@@ -4,6 +4,7 @@
 #endif
 #include "waywal/arena.h"
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -11,10 +12,15 @@
 
 static size_t get_page_size(void)
 {
-    static size_t page_size = 0;
+    static _Atomic size_t s_page_size = 0;
+    size_t page_size = atomic_load_explicit(&s_page_size, memory_order_relaxed);
     if (page_size == 0) {
         long res = sysconf(_SC_PAGESIZE);
         page_size = (res > 0) ? (size_t)res : 4096;
+        if ((page_size & (page_size - 1)) != 0) {
+            page_size = 4096;
+        }
+        atomic_store_explicit(&s_page_size, page_size, memory_order_relaxed);
     }
     return page_size;
 }
@@ -28,7 +34,13 @@ bool arena_init(arena_t *arena, size_t reserve_capacity)
     if (reserve_capacity == 0) {
         reserve_capacity = 4 * 1024 * 1024; /* 4 MB default */
     }
+    if (reserve_capacity > SIZE_MAX - (page_size - 1)) {
+        return false;
+    }
     reserve_capacity = (reserve_capacity + page_size - 1) & ~(page_size - 1);
+    if (reserve_capacity == 0) {
+        return false;
+    }
 
     void *buf =
         mmap(NULL, reserve_capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -72,6 +84,9 @@ void *arena_alloc(arena_t *arena, size_t size, size_t alignment)
     }
 
     uintptr_t curr = (uintptr_t)(arena->buffer + arena->offset);
+    if (curr > UINTPTR_MAX - (alignment - 1)) {
+        return NULL;
+    }
     uintptr_t aligned = (curr + (alignment - 1)) & ~(uintptr_t)(alignment - 1);
     if (aligned < (uintptr_t)arena->buffer) {
         return NULL;

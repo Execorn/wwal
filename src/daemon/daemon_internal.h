@@ -38,25 +38,26 @@
 
 extern waywal_state_store_t g_saved_state;
 
-__attribute__((format(printf, 4, 5))) static inline void
+__attribute__((format(printf, 4, 5))) static inline bool
 buf_appendf(char *buf, size_t cap, size_t *off, const char *fmt, ...)
 {
     if (!buf || !off || *off + 1 >= cap) {
-        return;
+        return false;
     }
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf + *off, cap - *off, fmt, ap);
     va_end(ap);
-    if (n <= 0) {
-        return;
+    if (n < 0) {
+        return false;
     }
     if ((size_t)n >= cap - *off) {
         *off = cap - 1;
         buf[*off] = '\0';
-    } else {
-        *off += (size_t)n;
+        return false;
     }
+    *off += (size_t)n;
+    return true;
 }
 
 void disarm_timer_fd(int timer_fd);

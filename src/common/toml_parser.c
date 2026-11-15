@@ -1165,11 +1165,18 @@ static void apply_pos_string(waywal_transition_config_t *tr)
         return;
     } else {
         float px = 0.5f, py = 0.5f;
-        if (sscanf(s, "%f , %f", &px, &py) == 2 && isfinite(px) && isfinite(py) && px >= 0.0f &&
-            py >= 0.0f) {
-            tr->pos_x = px;
-            tr->pos_y = py;
-            tr->pos_y_inverted = false;
+        int consumed = 0;
+        if (sscanf(s, "%f , %f%n", &px, &py, &consumed) == 2 && consumed > 0 && isfinite(px) &&
+            isfinite(py) && px >= 0.0f && px <= 1.0f && py >= 0.0f && py <= 1.0f) {
+            const char *tail = s + consumed;
+            while (*tail == ' ' || *tail == '\t') {
+                tail++;
+            }
+            if (*tail == '\0') {
+                tr->pos_x = px;
+                tr->pos_y = py;
+                tr->pos_y_inverted = false;
+            }
         }
     }
 }
@@ -1805,6 +1812,10 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
             } else if (strcmp(key, "fps") == 0) {
                 if (!parse_uint32_val(&lex, &out_cfg->transition.fps))
                     return false;
+                if (out_cfg->transition.fps == 0) {
+                    set_error(&lex, "transition.fps must be >= 1");
+                    return false;
+                }
             } else if (strcmp(key, "bezier") == 0) {
                 if (!parse_float_array(&lex, out_cfg->transition.bezier, 4))
                     return false;
@@ -1927,6 +1938,10 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                 }
             } else if (strcmp(key, "fps") == 0) {
                 if (!parse_uint32_val(&lex, &cur_output->fps)) {
+                    return false;
+                }
+                if (cur_output->fps == 0) {
+                    set_error(&lex, "output.fps must be >= 1");
                     return false;
                 }
                 cur_output->has_fps = true;
@@ -2086,6 +2101,10 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                 cur_workspace->has_recursive = true;
             } else if (strcmp(key, "fps") == 0) {
                 if (!parse_uint32_val(&lex, &cur_workspace->fps)) {
+                    return false;
+                }
+                if (cur_workspace->fps == 0) {
+                    set_error(&lex, "workspace.fps must be >= 1");
                     return false;
                 }
                 cur_workspace->has_fps = true;
@@ -2372,6 +2391,9 @@ bool waywal_config_parse_string(const char *toml_src, waywal_config_t *out_cfg, 
                         copy_str_safe(cur_schedule->theme_mode, sizeof(cur_schedule->theme_mode),
                                       "auto");
                         cur_schedule->has_theme_mode = false;
+                    } else {
+                        set_error(&lex, "invalid schedule.mode '%s'", cur_schedule->mode);
+                        return false;
                     }
                 } else if (strcmp(key, "output") == 0 || strcmp(key, "output_name") == 0) {
                     if (!parse_quoted_string(&lex, cur_schedule->output,

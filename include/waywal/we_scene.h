@@ -87,8 +87,6 @@ typedef enum : uint32_t {
     WE_AUDIO_BIND_OP_CLEAR = 3u,
 } we_audio_bind_op_t;
 
-#pragma pack(push, 1)
-
 typedef struct {
     uint32_t binding_id;
     int32_t target_object_id;
@@ -124,7 +122,6 @@ typedef struct {
 } we_audio_binding_t;
 static_assert(sizeof(we_audio_binding_t) == 160, "we_audio_binding_t must be exactly 160 bytes");
 
-#pragma pack(pop)
 #endif /* WAYWAL_IPC_PROTO_AUTHORING_H */
 #endif /* WAYWAL_IPC_PROTO_AUTHORING_AUDIO_FALLBACK */
 

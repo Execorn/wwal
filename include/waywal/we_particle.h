@@ -52,8 +52,6 @@ typedef enum : uint32_t {
     WE_PARTICLE_CFG_PAUSE_TOGGLE = 4u,
 } we_particle_cfg_op_t;
 
-#pragma pack(push, 1)
-
 typedef struct {
     float t;
     float y;
@@ -98,7 +96,6 @@ typedef struct {
 static_assert(sizeof(we_particle_preset_desc_t) == 112,
               "we_particle_preset_desc_t must be exactly 112 bytes");
 
-#pragma pack(pop)
 #endif /* WAYWAL_IPC_PROTO_AUTHORING_H */
 #endif /* WAYWAL_IPC_PROTO_AUTHORING_PARTICLE_FALLBACK */
 

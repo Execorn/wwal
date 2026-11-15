@@ -186,11 +186,214 @@ static bool resolve_state_file_with_name(path_buf_t *out_path, const char *overr
     return path_buf_push(out_path, filename);
 }
 
+#define WAYWAL_STATE_V6_HDR_SIZE 16U
+#define WAYWAL_STATE_V6_REC_SIZE 10620U
+
+static void put_u32_le(uint8_t *dst, uint32_t v)
+{
+    dst[0] = (uint8_t)(v & 0xFFU);
+    dst[1] = (uint8_t)((v >> 8) & 0xFFU);
+    dst[2] = (uint8_t)((v >> 16) & 0xFFU);
+    dst[3] = (uint8_t)((v >> 24) & 0xFFU);
+}
+
+static uint32_t get_u32_le(const uint8_t *src)
+{
+    return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) |
+           ((uint32_t)src[3] << 24);
+}
+
+static void put_u64_le(uint8_t *dst, uint64_t v)
+{
+    put_u32_le(dst, (uint32_t)(v & 0xFFFFFFFFULL));
+    put_u32_le(dst + 4, (uint32_t)(v >> 32));
+}
+
+static uint64_t get_u64_le(const uint8_t *src)
+{
+    return (uint64_t)get_u32_le(src) | ((uint64_t)get_u32_le(src + 4) << 32);
+}
+
+static void put_f32_le(uint8_t *dst, float v)
+{
+    uint32_t bits = 0;
+    memcpy(&bits, &v, sizeof(bits));
+    put_u32_le(dst, bits);
+}
+
+static float get_f32_le(const uint8_t *src)
+{
+    uint32_t bits = get_u32_le(src);
+    float v = 0.0f;
+    memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+static void write_fixed_cstr(uint8_t *dst, size_t cap, const char *src)
+{
+    memset(dst, 0, cap);
+    if (!src || cap == 0) {
+        return;
+    }
+    size_t len = strnlen(src, cap - 1);
+    if (len > 0) {
+        memcpy(dst, src, len);
+    }
+}
+
+static void read_fixed_cstr(char *dst, size_t cap, const uint8_t *src)
+{
+    if (cap == 0) {
+        return;
+    }
+    memcpy(dst, src, cap);
+    dst[cap - 1] = '\0';
+}
+
+static void sanitize_bool_byte(bool *field)
+{
+    uint8_t b = 0;
+    memcpy(&b, field, 1);
+    *field = (b != 0);
+}
+
+static void sanitize_saved_state(waywal_output_saved_state_t *st)
+{
+    st->output_name[sizeof(st->output_name) - 1] = '\0';
+    st->media_path[sizeof(st->media_path) - 1] = '\0';
+    st->prop_overrides[sizeof(st->prop_overrides) - 1] = '\0';
+    st->depth_map_path[sizeof(st->depth_map_path) - 1] = '\0';
+    st->backdrop[sizeof(st->backdrop) - 1] = '\0';
+
+    if ((uint32_t)st->kind > WAYWAL_CONTENT_WORKSHOP) {
+        st->kind = WAYWAL_CONTENT_STATIC_IMAGE;
+    }
+    if ((uint32_t)st->scaling > WAYWAL_SCALING_SPAN) {
+        st->scaling = WAYWAL_SCALING_FILL;
+    }
+    if ((uint32_t)st->filter > WAYWAL_FILTER_NEAREST) {
+        st->filter = WAYWAL_FILTER_LANCZOS3;
+    }
+
+    if (!isfinite(st->crop_gravity_x) || !isfinite(st->crop_gravity_y)) {
+        st->crop_gravity_x = 0.5f;
+        st->crop_gravity_y = 0.5f;
+        st->has_crop_gravity = false;
+    }
+    if (!isfinite(st->depth_strength)) {
+        st->depth_strength = 1.0f;
+    }
+    if (!isfinite(st->video_speed) || st->video_speed <= 0.0f) {
+        st->video_speed = 1.0f;
+    }
+    if (!isfinite(st->volume) || st->volume < 0.0f) {
+        st->volume = 1.0f;
+    } else if (st->volume > 2.0f) {
+        st->volume = 2.0f;
+    }
+}
+
+static void encode_v6_record(uint8_t *dst, const waywal_output_saved_state_t *src)
+{
+    size_t off = 0;
+    write_fixed_cstr(dst + off, sizeof(src->output_name), src->output_name);
+    off += sizeof(src->output_name);
+    put_u32_le(dst + off, (uint32_t)src->kind);
+    off += 4;
+    write_fixed_cstr(dst + off, sizeof(src->media_path), src->media_path);
+    off += sizeof(src->media_path);
+    put_u32_le(dst + off, src->solid_color);
+    off += 4;
+    put_u32_le(dst + off, (uint32_t)src->scaling);
+    off += 4;
+    put_u32_le(dst + off, (uint32_t)src->filter);
+    off += 4;
+    dst[off++] = src->ten_bit ? 1U : 0U;
+    dst[off++] = src->audio_reactive ? 1U : 0U;
+    dst[off++] = src->has_crop_gravity ? 1U : 0U;
+    dst[off++] = src->mute_on_audio ? 1U : 0U;
+    put_u32_le(dst + off, src->target_fps);
+    off += 4;
+    put_u32_le(dst + off, src->slideshow_interval_sec);
+    off += 4;
+    write_fixed_cstr(dst + off, sizeof(src->prop_overrides), src->prop_overrides);
+    off += sizeof(src->prop_overrides);
+    put_f32_le(dst + off, src->crop_gravity_x);
+    off += 4;
+    put_f32_le(dst + off, src->crop_gravity_y);
+    off += 4;
+    write_fixed_cstr(dst + off, sizeof(src->depth_map_path), src->depth_map_path);
+    off += sizeof(src->depth_map_path);
+    put_f32_le(dst + off, src->depth_strength);
+    off += 4;
+    write_fixed_cstr(dst + off, sizeof(src->backdrop), src->backdrop);
+    off += sizeof(src->backdrop);
+    put_f32_le(dst + off, src->video_speed);
+    off += 4;
+    put_u64_le(dst + off, src->loop_count);
+    off += 8;
+    put_f32_le(dst + off, src->volume);
+    off += 4;
+    put_u32_le(dst + off, 0U);
+    off += 4;
+    (void)off;
+}
+
+static void decode_v6_record(waywal_output_saved_state_t *dst, const uint8_t *src)
+{
+    memset(dst, 0, sizeof(*dst));
+    size_t off = 0;
+    read_fixed_cstr(dst->output_name, sizeof(dst->output_name), src + off);
+    off += sizeof(dst->output_name);
+    dst->kind = (waywal_content_kind_t)get_u32_le(src + off);
+    off += 4;
+    read_fixed_cstr(dst->media_path, sizeof(dst->media_path), src + off);
+    off += sizeof(dst->media_path);
+    dst->solid_color = get_u32_le(src + off);
+    off += 4;
+    dst->scaling = (waywal_scaling_mode_t)get_u32_le(src + off);
+    off += 4;
+    dst->filter = (waywal_filter_mode_t)get_u32_le(src + off);
+    off += 4;
+    dst->ten_bit = (src[off++] != 0U);
+    dst->audio_reactive = (src[off++] != 0U);
+    dst->has_crop_gravity = (src[off++] != 0U);
+    dst->mute_on_audio = (src[off++] != 0U);
+    dst->target_fps = get_u32_le(src + off);
+    off += 4;
+    dst->slideshow_interval_sec = get_u32_le(src + off);
+    off += 4;
+    read_fixed_cstr(dst->prop_overrides, sizeof(dst->prop_overrides), src + off);
+    off += sizeof(dst->prop_overrides);
+    dst->crop_gravity_x = get_f32_le(src + off);
+    off += 4;
+    dst->crop_gravity_y = get_f32_le(src + off);
+    off += 4;
+    read_fixed_cstr(dst->depth_map_path, sizeof(dst->depth_map_path), src + off);
+    off += sizeof(dst->depth_map_path);
+    dst->depth_strength = get_f32_le(src + off);
+    off += 4;
+    read_fixed_cstr(dst->backdrop, sizeof(dst->backdrop), src + off);
+    off += sizeof(dst->backdrop);
+    dst->video_speed = get_f32_le(src + off);
+    off += 4;
+    dst->loop_count = get_u64_le(src + off);
+    off += 8;
+    dst->volume = get_f32_le(src + off);
+    off += 4;
+    off += 4;
+    (void)off;
+    sanitize_saved_state(dst);
+}
+
 bool waywal_state_store_resolve_path(path_buf_t *out_path, const char *override_dir)
 {
     char filename[128] = "state.bin";
     if (g_state_namespace[0] != '\0' && strcmp(g_state_namespace, "default") != 0) {
-        snprintf(filename, sizeof(filename), "state-%s.bin", g_state_namespace);
+        int n = snprintf(filename, sizeof(filename), "state-%s.bin", g_state_namespace);
+        if (n < 0 || (size_t)n >= sizeof(filename)) {
+            return false;
+        }
     }
     return resolve_state_file_with_name(out_path, override_dir, filename);
 }
@@ -214,27 +417,35 @@ bool waywal_state_store_save_at(const waywal_state_store_t *store, const char *f
         return false;
     }
 
-    waywal_state_store_t *snapshot = calloc(1, sizeof(*snapshot));
-    if (!snapshot) {
+    size_t wire_size =
+        WAYWAL_STATE_V6_HDR_SIZE + (size_t)store->count * (size_t)WAYWAL_STATE_V6_REC_SIZE;
+    uint8_t *wire_buf = calloc(1, wire_size);
+    if (!wire_buf) {
         return false;
     }
-    *snapshot = *store;
-    snapshot->magic = WAYWAL_STATE_MAGIC;
-    snapshot->version = WAYWAL_STATE_VERSION;
-    snapshot->reserved = 0;
+
+    put_u32_le(wire_buf + 0, WAYWAL_STATE_MAGIC);
+    put_u32_le(wire_buf + 4, WAYWAL_STATE_VERSION);
+    put_u32_le(wire_buf + 8, store->count);
+    put_u32_le(wire_buf + 12, 0U);
+    for (uint32_t i = 0; i < store->count; ++i) {
+        encode_v6_record(wire_buf + WAYWAL_STATE_V6_HDR_SIZE +
+                             (size_t)i * (size_t)WAYWAL_STATE_V6_REC_SIZE,
+                         &store->outputs[i]);
+    }
 
     int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
-        free(snapshot);
+        free(wire_buf);
         return false;
     }
 
-    bool ok = write_all_bytes(fd, snapshot, sizeof(*snapshot));
+    bool ok = write_all_bytes(fd, wire_buf, wire_size);
     if (ok && fsync(fd) != 0) {
         ok = false;
     }
     close(fd);
-    free(snapshot);
+    free(wire_buf);
 
     if (!ok) {
         unlink(tmp_path);
@@ -259,13 +470,24 @@ bool waywal_state_store_load_at(waywal_state_store_t *store, const char *file_pa
         return false;
     }
 
-    uint32_t hdr[4] = {0};
-    if (!read_all_bytes(fd, hdr, sizeof(hdr))) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
         close(fd);
         return false;
     }
 
-    if (hdr[0] != WAYWAL_STATE_MAGIC || hdr[2] > WAYWAL_STATE_MAX_OUTPUTS) {
+    uint8_t raw_hdr[WAYWAL_STATE_V6_HDR_SIZE] = {0};
+    if (!read_all_bytes(fd, raw_hdr, sizeof(raw_hdr))) {
+        close(fd);
+        return false;
+    }
+
+    uint32_t magic = get_u32_le(raw_hdr + 0);
+    uint32_t version = get_u32_le(raw_hdr + 4);
+    uint32_t count = get_u32_le(raw_hdr + 8);
+    uint32_t reserved = get_u32_le(raw_hdr + 12);
+
+    if (magic != WAYWAL_STATE_MAGIC || count > WAYWAL_STATE_MAX_OUTPUTS) {
         close(fd);
         return false;
     }
@@ -276,27 +498,65 @@ bool waywal_state_store_load_at(waywal_state_store_t *store, const char *file_pa
         return false;
     }
 
-    loaded->magic = hdr[0];
+    loaded->magic = magic;
     loaded->version = WAYWAL_STATE_VERSION;
-    loaded->count = hdr[2];
-    loaded->reserved = hdr[3];
+    loaded->count = count;
+    loaded->reserved = reserved;
 
-    if (hdr[1] == WAYWAL_STATE_VERSION) {
+    if (version == WAYWAL_STATE_VERSION) {
+        size_t expected_rec_bytes = (size_t)count * (size_t)WAYWAL_STATE_V6_REC_SIZE;
+        if ((uint64_t)st.st_size != (uint64_t)WAYWAL_STATE_V6_HDR_SIZE + expected_rec_bytes) {
+            free(loaded);
+            close(fd);
+            return false;
+        }
+        if (expected_rec_bytes > 0) {
+            uint8_t *rec_buf = malloc(expected_rec_bytes);
+            if (!rec_buf || !read_all_bytes(fd, rec_buf, expected_rec_bytes)) {
+                free(rec_buf);
+                free(loaded);
+                close(fd);
+                return false;
+            }
+            for (uint32_t i = 0; i < count; ++i) {
+                decode_v6_record(&loaded->outputs[i],
+                                 rec_buf + (size_t)i * (size_t)WAYWAL_STATE_V6_REC_SIZE);
+            }
+            free(rec_buf);
+        }
+    } else if (version == 5U) {
+        if ((uint64_t)st.st_size !=
+            (uint64_t)WAYWAL_STATE_V6_HDR_SIZE + sizeof(loaded->outputs)) {
+            free(loaded);
+            close(fd);
+            return false;
+        }
         if (!read_all_bytes(fd, loaded->outputs, sizeof(loaded->outputs))) {
             free(loaded);
             close(fd);
             return false;
         }
-    } else if (hdr[1] == 4U) {
+        for (uint32_t i = 0; i < count; ++i) {
+            sanitize_bool_byte(&loaded->outputs[i].ten_bit);
+            sanitize_bool_byte(&loaded->outputs[i].audio_reactive);
+            sanitize_bool_byte(&loaded->outputs[i].has_crop_gravity);
+            sanitize_bool_byte(&loaded->outputs[i].mute_on_audio);
+            sanitize_saved_state(&loaded->outputs[i]);
+        }
+    } else if (version == 4U) {
         waywal_output_saved_state_v4_t v4_outs[WAYWAL_STATE_MAX_OUTPUTS];
         memset(v4_outs, 0, sizeof(v4_outs));
-        if (!read_all_bytes(fd, v4_outs, sizeof(v4_outs))) {
+        if ((uint64_t)st.st_size != (uint64_t)WAYWAL_STATE_V6_HDR_SIZE + sizeof(v4_outs) ||
+            !read_all_bytes(fd, v4_outs, sizeof(v4_outs))) {
             free(loaded);
             close(fd);
             return false;
         }
 
         for (uint32_t i = 0; i < loaded->count; ++i) {
+            sanitize_bool_byte(&v4_outs[i].ten_bit);
+            sanitize_bool_byte(&v4_outs[i].audio_reactive);
+            sanitize_bool_byte(&v4_outs[i].has_crop_gravity);
             memcpy(loaded->outputs[i].output_name, v4_outs[i].output_name,
                    sizeof(loaded->outputs[i].output_name));
             loaded->outputs[i].kind = v4_outs[i].kind;
@@ -321,6 +581,7 @@ bool waywal_state_store_load_at(waywal_state_store_t *store, const char *file_pa
             loaded->outputs[i].loop_count = 0;
             loaded->outputs[i].volume = 1.0f;
             loaded->outputs[i].mute_on_audio = false;
+            sanitize_saved_state(&loaded->outputs[i]);
         }
     } else {
         free(loaded);
@@ -329,14 +590,6 @@ bool waywal_state_store_load_at(waywal_state_store_t *store, const char *file_pa
     }
 
     close(fd);
-
-    for (uint32_t i = 0; i < loaded->count; ++i) {
-        loaded->outputs[i].output_name[sizeof(loaded->outputs[i].output_name) - 1] = '\0';
-        loaded->outputs[i].media_path[sizeof(loaded->outputs[i].media_path) - 1] = '\0';
-        loaded->outputs[i].prop_overrides[sizeof(loaded->outputs[i].prop_overrides) - 1] = '\0';
-        loaded->outputs[i].depth_map_path[sizeof(loaded->outputs[i].depth_map_path) - 1] = '\0';
-        loaded->outputs[i].backdrop[sizeof(loaded->outputs[i].backdrop) - 1] = '\0';
-    }
 
     *store = *loaded;
     free(loaded);
@@ -765,24 +1018,34 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
     const char *wwal_cache_env = getenv("WWAL_CACHE_DIR");
 
     char wwal_cache_dir[WAYWAL_PATH_MAX] = {0};
+    int dir_n = -1;
     if (wwal_cache_env && wwal_cache_env[0] != '\0') {
-        snprintf(wwal_cache_dir, sizeof(wwal_cache_dir), "%s", wwal_cache_env);
+        dir_n = snprintf(wwal_cache_dir, sizeof(wwal_cache_dir), "%s", wwal_cache_env);
     } else if (xdg_cache && xdg_cache[0] != '\0') {
-        snprintf(wwal_cache_dir, sizeof(wwal_cache_dir), "%s/wwal", xdg_cache);
+        dir_n = snprintf(wwal_cache_dir, sizeof(wwal_cache_dir), "%s/wwal", xdg_cache);
     } else if (home && home[0] != '\0') {
-        snprintf(wwal_cache_dir, sizeof(wwal_cache_dir), "%s/.cache/wwal", home);
+        dir_n = snprintf(wwal_cache_dir, sizeof(wwal_cache_dir), "%s/.cache/wwal", home);
     } else {
+        return false;
+    }
+    if (dir_n < 0 || (size_t)dir_n >= sizeof(wwal_cache_dir)) {
         return false;
     }
 
     char link_path[WAYWAL_PATH_MAX];
-    snprintf(link_path, sizeof(link_path), "%s/current_wallpaper", wwal_cache_dir);
+    int link_n = snprintf(link_path, sizeof(link_path), "%s/current_wallpaper", wwal_cache_dir);
+    if (link_n < 0 || (size_t)link_n >= sizeof(link_path)) {
+        return false;
+    }
 
     char abs_media[WAYWAL_PATH_MAX] = {0};
     if (media_path && media_path[0] != '\0' && strcmp(media_path, "-") != 0) {
         if (realpath(media_path, abs_media) == NULL) {
             if (media_path[0] == '/') {
-                snprintf(abs_media, sizeof(abs_media), "%s", media_path);
+                int mn = snprintf(abs_media, sizeof(abs_media), "%s", media_path);
+                if (mn < 0 || (size_t)mn >= sizeof(abs_media)) {
+                    abs_media[0] = '\0';
+                }
             } else {
                 char cwd[WAYWAL_PATH_MAX];
                 if (getcwd(cwd, sizeof(cwd)) != NULL) {
@@ -791,7 +1054,10 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
                         abs_media[0] = '\0';
                     }
                 } else {
-                    snprintf(abs_media, sizeof(abs_media), "%s", media_path);
+                    int mn = snprintf(abs_media, sizeof(abs_media), "%s", media_path);
+                    if (mn < 0 || (size_t)mn >= sizeof(abs_media)) {
+                        abs_media[0] = '\0';
+                    }
                 }
             }
         }
@@ -801,7 +1067,10 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
     }
 
     char png_path[WAYWAL_PATH_MAX];
-    snprintf(png_path, sizeof(png_path), "%s/current_wallpaper.png", wwal_cache_dir);
+    int png_n = snprintf(png_path, sizeof(png_path), "%s/current_wallpaper.png", wwal_cache_dir);
+    if (png_n < 0 || (size_t)png_n >= sizeof(png_path)) {
+        return false;
+    }
     (void)ensure_parent_dirs(png_path);
 
     bool png_written = false;
@@ -913,9 +1182,14 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
             char ws_prev[WAYWAL_PATH_MAX];
             if (we_workshop_find_preview_file(abs_media, ws_prev, sizeof(ws_prev))) {
                 if (realpath(ws_prev, resolved_ws_preview) == NULL) {
-                    snprintf(resolved_ws_preview, sizeof(resolved_ws_preview), "%s", ws_prev);
+                    int rn = snprintf(resolved_ws_preview, sizeof(resolved_ws_preview), "%s",
+                                      ws_prev);
+                    if (rn < 0 || (size_t)rn >= sizeof(resolved_ws_preview)) {
+                        resolved_ws_preview[0] = '\0';
+                    }
                 }
-                effective_file_target = resolved_ws_preview;
+                effective_file_target =
+                    (resolved_ws_preview[0] != '\0') ? resolved_ws_preview : png_path;
             } else {
                 effective_file_target = png_path;
             }
@@ -927,12 +1201,14 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
     const char *symlink_target = effective_file_target;
     if (symlink_target[0] != '\0') {
         char tmp_link[WAYWAL_PATH_MAX];
-        snprintf(tmp_link, sizeof(tmp_link), "%s/current_wallpaper.tmp.%d", wwal_cache_dir,
-                 (int)getpid());
-        unlink(tmp_link);
-        if (symlink(symlink_target, tmp_link) == 0) {
-            if (rename(tmp_link, link_path) != 0) {
-                unlink(tmp_link);
+        int tl_n = snprintf(tmp_link, sizeof(tmp_link), "%s/current_wallpaper.tmp.%d",
+                            wwal_cache_dir, (int)getpid());
+        if (tl_n >= 0 && (size_t)tl_n < sizeof(tmp_link)) {
+            unlink(tmp_link);
+            if (symlink(symlink_target, tmp_link) == 0) {
+                if (rename(tmp_link, link_path) != 0) {
+                    unlink(tmp_link);
+                }
             }
         }
     }
@@ -944,36 +1220,44 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
         int plen = snprintf(payload, sizeof(payload), "%s\n%s\n", filt, target);
         if (plen > 0 && (size_t)plen < sizeof(payload)) {
             char cache_base[WAYWAL_PATH_MAX] = {0};
+            int cbn = -1;
             if (xdg_cache && xdg_cache[0] != '\0') {
-                snprintf(cache_base, sizeof(cache_base), "%s", xdg_cache);
+                cbn = snprintf(cache_base, sizeof(cache_base), "%s", xdg_cache);
             } else if (home && home[0] != '\0') {
-                snprintf(cache_base, sizeof(cache_base), "%s/.cache", home);
+                cbn = snprintf(cache_base, sizeof(cache_base), "%s/.cache", home);
+            }
+            if (cbn < 0 || (size_t)cbn >= sizeof(cache_base)) {
+                cache_base[0] = '\0';
             }
             if (cache_base[0] != '\0') {
                 char out_list[256];
-                snprintf(out_list, sizeof(out_list), "%s", output_name);
-                char *saveptr = NULL;
-                for (char *tok = strtok_r(out_list, ",", &saveptr); tok != NULL;
-                     tok = strtok_r(NULL, ",", &saveptr)) {
-                    while (*tok == ' ') {
-                        tok++;
-                    }
-                    size_t tlen = strlen(tok);
-                    while (tlen > 0 && tok[tlen - 1] == ' ') {
-                        tok[--tlen] = '\0';
-                    }
-                    if (!is_valid_swww_output_name(tok)) {
-                        continue;
-                    }
-                    char swww_file[WAYWAL_PATH_MAX];
-                    char awww_file[WAYWAL_PATH_MAX];
-                    if (snprintf(swww_file, sizeof(swww_file), "%s/swww/%s", cache_base, tok) <
-                        (int)sizeof(swww_file)) {
-                        (void)write_text_file_atomic(swww_file, payload, (size_t)plen);
-                    }
-                    if (snprintf(awww_file, sizeof(awww_file), "%s/awww/%s", cache_base, tok) <
-                        (int)sizeof(awww_file)) {
-                        (void)write_text_file_atomic(awww_file, payload, (size_t)plen);
+                int oln = snprintf(out_list, sizeof(out_list), "%s", output_name);
+                if (oln >= 0 && (size_t)oln < sizeof(out_list)) {
+                    char *saveptr = NULL;
+                    for (char *tok = strtok_r(out_list, ",", &saveptr); tok != NULL;
+                         tok = strtok_r(NULL, ",", &saveptr)) {
+                        while (*tok == ' ') {
+                            tok++;
+                        }
+                        size_t tlen = strlen(tok);
+                        while (tlen > 0 && tok[tlen - 1] == ' ') {
+                            tok[--tlen] = '\0';
+                        }
+                        if (!is_valid_swww_output_name(tok)) {
+                            continue;
+                        }
+                        char swww_file[WAYWAL_PATH_MAX];
+                        char awww_file[WAYWAL_PATH_MAX];
+                        int sn = snprintf(swww_file, sizeof(swww_file), "%s/swww/%s", cache_base,
+                                          tok);
+                        if (sn >= 0 && (size_t)sn < sizeof(swww_file)) {
+                            (void)write_text_file_atomic(swww_file, payload, (size_t)plen);
+                        }
+                        int an = snprintf(awww_file, sizeof(awww_file), "%s/awww/%s", cache_base,
+                                          tok);
+                        if (an >= 0 && (size_t)an < sizeof(awww_file)) {
+                            (void)write_text_file_atomic(awww_file, payload, (size_t)plen);
+                        }
                     }
                 }
             }
@@ -983,11 +1267,16 @@ bool waywal_ecosystem_cache_sync(const char *output_name, const char *media_path
     if (caelestia_sync && symlink_target[0] != '\0') {
         const char *xdg_state = getenv("XDG_STATE_HOME");
         char cael_file[WAYWAL_PATH_MAX] = {0};
+        int cn = -1;
         if (xdg_state && xdg_state[0] != '\0') {
-            snprintf(cael_file, sizeof(cael_file), "%s/caelestia/wallpaper/path.txt", xdg_state);
+            cn = snprintf(cael_file, sizeof(cael_file), "%s/caelestia/wallpaper/path.txt",
+                          xdg_state);
         } else if (home && home[0] != '\0') {
-            snprintf(cael_file, sizeof(cael_file), "%s/.local/state/caelestia/wallpaper/path.txt",
-                     home);
+            cn = snprintf(cael_file, sizeof(cael_file),
+                          "%s/.local/state/caelestia/wallpaper/path.txt", home);
+        }
+        if (cn < 0 || (size_t)cn >= sizeof(cael_file)) {
+            cael_file[0] = '\0';
         }
         if (cael_file[0] != '\0') {
             bool already_matches = false;

@@ -7,24 +7,37 @@
 #include "waywal/path.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
+#ifndef WWAL_ENUM_U32
+#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)
+#define WWAL_ENUM_U32 : uint32_t
+#else
+#define WWAL_ENUM_U32
+#endif
+#endif
+
+#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)
+#define WWAL_ENUM_U16 : uint16_t
+#define WWAL_ENUM_U8  : uint8_t
+#else
+#define WWAL_ENUM_U16
+#define WWAL_ENUM_U8
 #endif
 
 #define WAYWAL_IPC_MAGIC                                                                           \
     0x4C415757U /* "WWAL" in little-endian ASCII: 'W' | 'W'<<8 | 'A'<<16 | 'L'<<24 */
 #define WAYWAL_IPC_VERSION 1
 
-typedef enum : uint16_t {
+typedef enum WWAL_ENUM_U16 {
     WAYWAL_REQ_PING = 0x0001,
     WAYWAL_REQ_QUERY = 0x0002,
     WAYWAL_REQ_CLEAR = 0x0003,
@@ -214,6 +227,9 @@ typedef struct {
     uint8_t no_cache;
     union {
         uint8_t _pad_flags;
+#ifdef __cplusplus
+        __extension__
+#endif
         struct {
             uint8_t is_solid_color : 1;
             uint8_t pos_y_inverted : 1;
@@ -239,6 +255,8 @@ typedef waywal_img_metadata_t waywal_ipc_img_meta_t;
 static_assert(offsetof(waywal_img_metadata_t, filter_mode) == 72,
               "Legacy 72-byte prefix of waywal_img_metadata_t must remain frozen at offset 72");
 
+#define WWAL_MAX_EXTRA_IPC_BYTES (1048576u)
+
 typedef struct {
     uint8_t color[4];
     uint32_t num_target_outputs;
@@ -256,7 +274,7 @@ typedef struct {
     bool mute_on_audio;
 } waywal_video_payload_t;
 
-typedef enum : uint32_t {
+typedef enum WWAL_ENUM_U32 {
     WAYWAL_SLIDESHOW_STOP = 0,
     WAYWAL_SLIDESHOW_PAUSE = 1,
     WAYWAL_SLIDESHOW_RESUME = 2,
@@ -376,11 +394,29 @@ typedef struct {
     char layer_name[32];
 } waywal_workshop_payload_t;
 
-#define WAYWAL_UNIFORM_FLAG_PERSIST 0x0001U
+#define WAYWAL_UNIFORM_FLAG_PERSIST    0x0001U
+#define WAYWAL_UNIFORM_FLAG_STRUCTURED 0x0002U
+#define WAYWAL_UNIFORM_FLAG_VALID_MASK                                                             \
+    (WAYWAL_UNIFORM_FLAG_PERSIST | WAYWAL_UNIFORM_FLAG_STRUCTURED)
+
+typedef struct {
+    char target_output[32];
+    char uniform_name[64];
+    uint32_t uniform_components; /* 1..4 */
+    float uniform_values[4];
+    uint32_t flags;       /* WAYWAL_UNIFORM_FLAG_PERSIST | WAYWAL_UNIFORM_FLAG_STRUCTURED */
+    uint32_t struct_size; /* sizeof(waywal_set_uniform_structured_t) == 148 when explicit */
+    uint8_t _reserved[24];
+} waywal_set_uniform_structured_t;
+static_assert(sizeof(waywal_set_uniform_structured_t) == 148,
+              "waywal_set_uniform_structured_t must be 148 bytes");
 
 typedef struct {
     union {
         /* Standard 64/64 layout (CLI, daemon, legacy) */
+#ifdef __cplusplus
+        __extension__
+#endif
         struct {
             char output[64];         /* Empty string "" = apply to all outputs */
             char name[64];           /* GLSL uniform name or WE property key */
@@ -388,14 +424,19 @@ typedef struct {
             float values[4];
         };
         /* Structured 32/64 layout with explicit persistence flags */
+#ifdef __cplusplus
+        __extension__
+#endif
         struct {
             char target_output[32];
             char uniform_name[64];
             uint32_t uniform_components;
             float uniform_values[4];
-            uint32_t flags; /* Bit 0: WAYWAL_UNIFORM_FLAG_PERSIST */
-            uint8_t _reserved[28];
+            uint32_t flags; /* WAYWAL_UNIFORM_FLAG_PERSIST | WAYWAL_UNIFORM_FLAG_STRUCTURED */
+            uint32_t struct_size;
+            uint8_t _reserved[24];
         };
+        waywal_set_uniform_structured_t structured;
         uint8_t raw[148];
     };
 } waywal_set_uniform_payload_t;
@@ -414,7 +455,7 @@ static_assert(sizeof(waywal_audio_ctrl_payload_t) == 8,
 
 #define WAYWAL_MAX_TELEMETRY_OUTPUTS 8
 
-typedef enum : uint8_t {
+typedef enum WWAL_ENUM_U8 {
     WAYWAL_BO_STATE_FREE = 0,
     WAYWAL_BO_STATE_RENDERING = 1,
     WAYWAL_BO_STATE_COMMITTED = 2,
@@ -674,8 +715,154 @@ bool waywal_ipc_send(int socket_fd, const waywal_ipc_hdr_t *hdr, int attached_fd
 bool waywal_ipc_recv(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached_fd);
 bool waywal_ipc_send_fds(int socket_fd, const waywal_ipc_hdr_t *hdr, const int *fds,
                          size_t num_fds);
+bool waywal_ipc_send_payload_fds(int socket_fd, const waywal_ipc_hdr_t *hdr, const void *payload,
+                                 size_t payload_len, const int *fds, size_t num_fds);
 bool waywal_ipc_recv_fds(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_fds, size_t max_fds,
                          size_t *out_num_fds);
+
+static inline bool waywal_validate_img_metadata(const waywal_img_metadata_t *meta,
+                                                uint64_t shm_size, uint64_t *out_pixel_bytes)
+{
+    if (!meta || meta->extra_data_len > WWAL_MAX_EXTRA_IPC_BYTES ||
+        meta->custom_shader_len > meta->extra_data_len) {
+        return false;
+    }
+    if (meta->is_solid_color) {
+        if (out_pixel_bytes) {
+            *out_pixel_bytes = 0;
+        }
+        return true;
+    }
+    if (meta->width == 0 || meta->height == 0 || meta->width > (UINT32_MAX / 4u)) {
+        return false;
+    }
+    uint64_t row_bytes = (uint64_t)meta->width * 4ull;
+    if ((uint64_t)meta->height > (UINT64_MAX / row_bytes)) {
+        return false;
+    }
+    uint64_t pixel_bytes = row_bytes * (uint64_t)meta->height;
+    if (shm_size < pixel_bytes) {
+        return false;
+    }
+    if (out_pixel_bytes) {
+        *out_pixel_bytes = pixel_bytes;
+    }
+    return true;
+}
+
+static inline size_t waywal_ipc_strnlen(const char *s, size_t max_len)
+{
+    if (!s || max_len == 0U) {
+        return 0U;
+    }
+    const char *end = (const char *)memchr(s, '\0', max_len);
+    return end ? (size_t)(end - s) : max_len;
+}
+
+static inline bool waywal_validate_set_uniform_structured(const waywal_set_uniform_structured_t *s)
+{
+    if (!s || s->struct_size != sizeof(*s)) {
+        return false;
+    }
+    if ((s->flags & ~WAYWAL_UNIFORM_FLAG_VALID_MASK) != 0U) {
+        return false;
+    }
+    if (s->uniform_components < 1U || s->uniform_components > 4U) {
+        return false;
+    }
+    if (waywal_ipc_strnlen(s->target_output, sizeof(s->target_output)) >=
+        sizeof(s->target_output)) {
+        return false;
+    }
+    size_t nlen = waywal_ipc_strnlen(s->uniform_name, sizeof(s->uniform_name));
+    if (nlen == 0 || nlen >= sizeof(s->uniform_name)) {
+        return false;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        if (!isfinite(s->uniform_values[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline bool waywal_decode_set_uniform_payload(const waywal_set_uniform_payload_t *pay,
+                                                     char *out_target, size_t out_target_cap,
+                                                     char *out_name, size_t out_name_cap,
+                                                     uint32_t *out_components,
+                                                     float out_values[4], uint32_t *out_flags)
+{
+    if (!pay || !out_target || out_target_cap == 0 || !out_name || out_name_cap == 0 ||
+        !out_components || !out_values || !out_flags) {
+        return false;
+    }
+
+    const waywal_set_uniform_structured_t *st = &pay->structured;
+    if (st->struct_size == sizeof(*st)) {
+        if ((st->flags & WAYWAL_UNIFORM_FLAG_STRUCTURED) == 0U ||
+            !waywal_validate_set_uniform_structured(st)) {
+            return false;
+        }
+        size_t tlen = waywal_ipc_strnlen(st->target_output, sizeof(st->target_output));
+        size_t nlen = waywal_ipc_strnlen(st->uniform_name, sizeof(st->uniform_name));
+        if (tlen >= out_target_cap || nlen >= out_name_cap) {
+            return false;
+        }
+        memcpy(out_target, st->target_output, tlen);
+        out_target[tlen] = '\0';
+        memcpy(out_name, st->uniform_name, nlen);
+        out_name[nlen] = '\0';
+        *out_components = st->uniform_components;
+        for (size_t i = 0; i < 4; ++i) {
+            out_values[i] = st->uniform_values[i];
+        }
+        *out_flags = st->flags;
+        return true;
+    }
+
+    if (st->struct_size != 0U && pay->num_components == 0U) {
+        return false;
+    }
+
+    /* Compatibility path for legacy CLI (64/64) and un-tagged Studio dual-populated payloads. */
+    if (pay->num_components < 1U || pay->num_components > 4U) {
+        return false;
+    }
+    size_t olen = waywal_ipc_strnlen(pay->output, sizeof(pay->output));
+    size_t ulen = waywal_ipc_strnlen(pay->name, sizeof(pay->name));
+    if (olen >= sizeof(pay->output) || ulen == 0 || ulen >= sizeof(pay->name) ||
+        olen >= out_target_cap || ulen >= out_name_cap) {
+        return false;
+    }
+    for (size_t i = 0; i < pay->num_components; ++i) {
+        if (!isfinite(pay->values[i])) {
+            return false;
+        }
+    }
+
+    uint32_t decoded_flags = 0U;
+    if (pay->uniform_components == pay->num_components &&
+        waywal_ipc_strnlen(pay->uniform_name, sizeof(pay->uniform_name)) == ulen &&
+        memcmp(pay->uniform_name, pay->name, ulen) == 0 &&
+        waywal_ipc_strnlen(pay->target_output, sizeof(pay->target_output)) <
+            sizeof(pay->target_output) &&
+        strncmp(pay->target_output, pay->output, sizeof(pay->target_output) - 1) == 0 &&
+        memcmp(pay->uniform_values, pay->values, (size_t)pay->num_components * sizeof(float)) == 0 &&
+        (pay->flags & ~WAYWAL_UNIFORM_FLAG_PERSIST) == 0U) {
+        decoded_flags = pay->flags;
+    }
+
+    memcpy(out_target, pay->output, olen);
+    out_target[olen] = '\0';
+    memcpy(out_name, pay->name, ulen);
+    out_name[ulen] = '\0';
+    *out_components = pay->num_components;
+    for (size_t i = 0; i < 4; ++i) {
+        out_values[i] = (i < pay->num_components) ? pay->values[i] : 0.0f;
+    }
+    *out_flags = decoded_flags;
+    return true;
+}
 
 /* Daemon async IPC worker queue lifecycle and completion dispatch */
 struct daemon_state;
@@ -684,10 +871,6 @@ void daemon_ipc_async_shutdown(struct daemon_state *state);
 int daemon_ipc_async_get_fd(void);
 void daemon_ipc_async_dispatch(struct daemon_state *state);
 bool daemon_ipc_dispatch_subscriber_fd(struct daemon_state *state, int fd);
-
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 
 #ifdef __cplusplus
 }
@@ -739,6 +922,13 @@ bool waywal_ipc_serialize_req_puppet_solve_weights(const waywal_ipc_puppet_solve
 bool waywal_ipc_validate_req_puppet_solve_weights(const void *payload, size_t payload_len,
                                                   const waywal_ipc_puppet_solve_weights_t **out_req,
                                                   const uint64_t **out_locked_bs);
+bool waywal_ipc_serialize_req_puppet_solve_weights_ext(
+    const waywal_ipc_puppet_solve_weights_t *params, const uint64_t *locked_vert_bs,
+    const waywal_ipc_puppet_solve_weights_ext_t *ext, waywal_ipc_hdr_t *out_hdr, void *out_buf,
+    size_t out_buf_cap, size_t *out_total_len);
+bool waywal_ipc_validate_req_puppet_solve_weights_ext(
+    const void *payload, size_t payload_len, const waywal_ipc_puppet_solve_weights_t **out_req,
+    const uint64_t **out_locked_bs, const waywal_ipc_puppet_solve_weights_ext_t **out_ext);
 
 bool waywal_ipc_serialize_req_puppet_paint_weights(uint32_t object_id, uint32_t flags,
                                                    const waywal_ipc_vertex_weight_t *entries,
@@ -762,6 +952,14 @@ bool waywal_ipc_serialize_req_puppet_preview_ik(const waywal_ipc_puppet_preview_
 bool waywal_ipc_validate_req_puppet_preview_ik(const void *payload, size_t payload_len,
                                                const waywal_ipc_puppet_preview_ik_t **out_req,
                                                const waywal_ipc_bone_trs_t **out_overrides);
+bool waywal_ipc_serialize_req_puppet_preview_ik_ext(
+    const waywal_ipc_puppet_preview_ik_t *params, const waywal_ipc_bone_trs_t *overrides,
+    const waywal_ipc_puppet_preview_ik_ext_t *ext, waywal_ipc_hdr_t *out_hdr, void *out_buf,
+    size_t out_buf_cap, size_t *out_total_len);
+bool waywal_ipc_validate_req_puppet_preview_ik_ext(
+    const void *payload, size_t payload_len, const waywal_ipc_puppet_preview_ik_t **out_req,
+    const waywal_ipc_bone_trs_t **out_overrides,
+    const waywal_ipc_puppet_preview_ik_ext_t **out_ext);
 
 bool waywal_ipc_serialize_req_puppet_set_anim_tracks(uint32_t object_id, uint32_t clip_count,
                                                      uint32_t flags, const void *clips_blob,

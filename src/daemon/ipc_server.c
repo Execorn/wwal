@@ -14,9 +14,12 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <stdatomic.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -92,50 +95,43 @@ static void get_process_memory_kib(unsigned long *out_rss_kib, unsigned long *ou
         *out_pss_kib = pss;
 }
 
-static uint32_t calculate_output_vram_kib(const output_node_t *out)
+static uint64_t bo_plane0_bytes(const dmabuf_bo_t *bo, const output_node_t *out)
 {
-    if (!out)
+    if (!bo || !out) {
         return 0;
-    uint32_t total_bytes = 0;
-    if (out->use_dmabuf) {
-        for (int i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
-            const dmabuf_bo_t *bo = &out->dmabuf_ring.buffers[i];
-            if (bo->gbm_bo || bo->fd[0] >= 0) {
-                uint32_t b_w = bo->width > 0 ? bo->width : (uint32_t)out->width;
-                uint32_t b_h = bo->height > 0 ? bo->height : (uint32_t)out->height;
-                uint32_t stride = bo->stride[0] > 0 ? bo->stride[0] : (b_w * 4);
-                total_bytes += stride * b_h;
-            }
-        }
-        if (out->has_backdrop_bo && out->backdrop_bo.fd[0] >= 0) {
-            uint32_t b_w =
-                out->backdrop_bo.width > 0 ? out->backdrop_bo.width : (uint32_t)out->width;
-            uint32_t b_h =
-                out->backdrop_bo.height > 0 ? out->backdrop_bo.height : (uint32_t)out->height;
-            uint32_t stride =
-                out->backdrop_bo.stride[0] > 0 ? out->backdrop_bo.stride[0] : (b_w * 4);
-            total_bytes += stride * b_h;
-        }
-        if (out->has_source_old_bo && out->source_old_bo.fd[0] >= 0) {
-            uint32_t b_w =
-                out->source_old_bo.width > 0 ? out->source_old_bo.width : (uint32_t)out->width;
-            uint32_t b_h =
-                out->source_old_bo.height > 0 ? out->source_old_bo.height : (uint32_t)out->height;
-            uint32_t stride =
-                out->source_old_bo.stride[0] > 0 ? out->source_old_bo.stride[0] : (b_w * 4);
-            total_bytes += stride * b_h;
-        }
-        if (out->has_source_new_bo && out->source_new_bo.fd[0] >= 0) {
-            uint32_t b_w =
-                out->source_new_bo.width > 0 ? out->source_new_bo.width : (uint32_t)out->width;
-            uint32_t b_h =
-                out->source_new_bo.height > 0 ? out->source_new_bo.height : (uint32_t)out->height;
-            uint32_t stride =
-                out->source_new_bo.stride[0] > 0 ? out->source_new_bo.stride[0] : (b_w * 4);
-            total_bytes += stride * b_h;
+    }
+    uint64_t b_w = bo->width > 0 ? (uint64_t)bo->width : (uint64_t)(out->width > 0 ? out->width : 0);
+    uint64_t b_h =
+        bo->height > 0 ? (uint64_t)bo->height : (uint64_t)(out->height > 0 ? out->height : 0);
+    uint64_t stride = bo->stride[0] > 0 ? (uint64_t)bo->stride[0] : (b_w * 4ULL);
+    if (b_h == 0 || stride > (UINT64_MAX / b_h)) {
+        return 0;
+    }
+    return stride * b_h;
+}
+
+static uint64_t calculate_output_vram_kib_u64(const output_node_t *out)
+{
+    if (!out || !out->use_dmabuf) {
+        return 0;
+    }
+    uint64_t total_bytes = 0;
+    for (int i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
+        const dmabuf_bo_t *bo = &out->dmabuf_ring.buffers[i];
+        if (bo->gbm_bo || bo->fd[0] >= 0) {
+            total_bytes += bo_plane0_bytes(bo, out);
         }
     }
-    return total_bytes / 1024U;
+    if (out->has_backdrop_bo && out->backdrop_bo.fd[0] >= 0) {
+        total_bytes += bo_plane0_bytes(&out->backdrop_bo, out);
+    }
+    if (out->has_source_old_bo && out->source_old_bo.fd[0] >= 0) {
+        total_bytes += bo_plane0_bytes(&out->source_old_bo, out);
+    }
+    if (out->has_source_new_bo && out->source_new_bo.fd[0] >= 0) {
+        total_bytes += bo_plane0_bytes(&out->source_new_bo, out);
+    }
+    return total_bytes / 1024ULL;
 }
 
 static void get_output_bo_slot_states(const output_node_t *out, uint8_t bo_states[4])
@@ -177,18 +173,131 @@ static const char *bo_slot_state_to_str(uint8_t state)
     }
 }
 
-size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, char *buf,
-                                size_t cap)
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+    bool owns_heap;
+    bool failed;
+} ipc_dyn_buf_t;
+
+static void ipc_dyn_init_heap(ipc_dyn_buf_t *db, size_t initial_cap)
 {
-    if (!state || !buf || cap == 0) {
-        return 0;
+    memset(db, 0, sizeof(*db));
+    db->owns_heap = true;
+    size_t cap = initial_cap > 0 ? initial_cap : 8192u;
+    db->data = (char *)malloc(cap);
+    if (!db->data) {
+        db->failed = true;
+        return;
+    }
+    db->cap = cap;
+    db->data[0] = '\0';
+}
+
+static void ipc_dyn_init_fixed(ipc_dyn_buf_t *db, char *buf, size_t cap)
+{
+    memset(db, 0, sizeof(*db));
+    db->data = buf;
+    db->cap = cap;
+    db->owns_heap = false;
+    if (!buf || cap == 0) {
+        db->failed = true;
+    } else {
+        buf[0] = '\0';
+    }
+}
+
+static void ipc_dyn_free(ipc_dyn_buf_t *db)
+{
+    if (db && db->owns_heap) {
+        free(db->data);
+        db->data = NULL;
+    }
+}
+
+static bool ipc_dyn_appendf(ipc_dyn_buf_t *db, const char *fmt, ...)
+{
+    if (!db || db->failed || !db->data || db->cap == 0) {
+        return false;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap_copy;
+    va_copy(ap_copy, ap);
+    size_t avail = db->cap - db->len;
+    int n = vsnprintf(db->data + db->len, avail, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        va_end(ap_copy);
+        db->failed = true;
+        return false;
+    }
+    size_t needed = (size_t)n;
+    if (needed < avail) {
+        va_end(ap_copy);
+        db->len += needed;
+        return true;
+    }
+    if (!db->owns_heap) {
+        va_end(ap_copy);
+        if (avail > 0) {
+            db->len = db->cap - 1;
+            db->data[db->len] = '\0';
+        }
+        db->failed = true;
+        return false;
+    }
+    const size_t max_dyn_bytes = 16u * 1024u * 1024u;
+    if (needed >= max_dyn_bytes || db->len > max_dyn_bytes - needed - 1) {
+        va_end(ap_copy);
+        db->failed = true;
+        return false;
+    }
+    size_t req_cap = db->len + needed + 1;
+    size_t new_cap = db->cap;
+    while (new_cap < req_cap) {
+        if (new_cap > max_dyn_bytes / 2u) {
+            new_cap = max_dyn_bytes;
+            break;
+        }
+        new_cap *= 2u;
+    }
+    if (new_cap < req_cap) {
+        va_end(ap_copy);
+        db->failed = true;
+        return false;
+    }
+    char *grown = (char *)realloc(db->data, new_cap);
+    if (!grown) {
+        va_end(ap_copy);
+        db->failed = true;
+        return false;
+    }
+    db->data = grown;
+    db->cap = new_cap;
+    int n2 = vsnprintf(db->data + db->len, db->cap - db->len, fmt, ap_copy);
+    va_end(ap_copy);
+    if (n2 < 0 || (size_t)n2 >= db->cap - db->len) {
+        db->failed = true;
+        return false;
+    }
+    db->len += (size_t)n2;
+    return true;
+}
+
+static bool daemon_build_status_json_into(daemon_state_t *state, const char *event_name,
+                                          ipc_dyn_buf_t *db)
+{
+    if (!state || !db || db->failed) {
+        return false;
     }
 
     unsigned long rss_kib = 0, pss_kib = 0;
     get_process_memory_kib(&rss_kib, &pss_kib);
-    uint32_t total_vram_kib = 0;
+    uint64_t total_vram_kib = 0;
     for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
-        total_vram_kib += calculate_output_vram_kib(o);
+        total_vram_kib += calculate_output_vram_kib_u64(o);
     }
 
     char esc_ns[128];
@@ -274,48 +383,47 @@ size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, c
         has_art_tex = ms->has_art_pixels;
     }
 
-    size_t off = 0;
-    buf[0] = '\0';
     if (event_name && event_name[0] != '\0') {
         char esc_ev[128];
         waywal_json_escape_string(event_name, esc_ev, sizeof(esc_ev));
-        buf_appendf(buf, cap, &off, "{\"event\":\"%s\",", esc_ev);
+        (void)ipc_dyn_appendf(db, "{\"event\":\"%s\",", esc_ev);
     } else {
-        buf_appendf(buf, cap, &off, "{");
+        (void)ipc_dyn_appendf(db, "{");
     }
 
-    buf_appendf(buf, cap, &off,
-                "\"pid\":%d,"
-                "\"namespace\":\"%s\","
-                "\"gpu_compute\":%s,"
-                "\"dmabuf_scanout\":%s,"
-                "\"ten_bit\":%s,"
-                "\"nv12\":%s,"
-                "\"rss_kib\":%lu,"
-                "\"pss_kib\":%lu,"
-                "\"vram_kib\":%lu,"
-                "\"power\":{\"on_battery\":%s,\"battery_policy\":\"%s\",\"global_pause_mask\":%u},"
-                "\"audio\":{\"pipewire_active\":%s,\"volume\":%.4f,\"effective_gain\":%.4f,"
-                "\"mute_on_audio\":%s,\"external_active\":%s,\"external_audio_active\":%s,"
-                "\"envelope\":%.4f,\"rms_level\":%.4f,\"beat\":%.4f,\"beat_pulse\":%.4f,"
-                "\"beat_onset\":%s,\"bark_bands\":[",
-                (int)getpid(), esc_ns, state->render_engine.gpu_compute_active ? "true" : "false",
-                state->dmabuf_ctx.available ? "true" : "false",
-                state->dmabuf_ctx.has_10bit ? "true" : "false",
-                state->dmabuf_ctx.has_nv12 ? "true" : "false", rss_kib, pss_kib,
-                (unsigned long)total_vram_kib, on_battery ? "true" : "false", bpol_str,
-                global_pmask, pw_active ? "true" : "false", json_safe_float(vol),
-                json_safe_float(eff_gain), mute_on ? "true" : "false", ext_audio ? "true" : "false",
-                ext_audio ? "true" : "false", json_safe_float(env), json_safe_float(env),
-                json_safe_float(beat), json_safe_float(beat), (beat > 0.6f) ? "true" : "false");
+    (void)ipc_dyn_appendf(
+        db,
+        "\"pid\":%d,"
+        "\"namespace\":\"%s\","
+        "\"gpu_compute\":%s,"
+        "\"dmabuf_scanout\":%s,"
+        "\"ten_bit\":%s,"
+        "\"nv12\":%s,"
+        "\"rss_kib\":%lu,"
+        "\"pss_kib\":%lu,"
+        "\"vram_kib\":%llu,"
+        "\"power\":{\"on_battery\":%s,\"battery_policy\":\"%s\",\"global_pause_mask\":%u},"
+        "\"audio\":{\"pipewire_active\":%s,\"volume\":%.4f,\"effective_gain\":%.4f,"
+        "\"mute_on_audio\":%s,\"external_active\":%s,\"external_audio_active\":%s,"
+        "\"envelope\":%.4f,\"rms_level\":%.4f,\"beat\":%.4f,\"beat_pulse\":%.4f,"
+        "\"beat_onset\":%s,\"bark_bands\":[",
+        (int)getpid(), esc_ns, state->render_engine.gpu_compute_active ? "true" : "false",
+        state->dmabuf_ctx.available ? "true" : "false",
+        state->dmabuf_ctx.has_10bit ? "true" : "false",
+        state->dmabuf_ctx.has_nv12 ? "true" : "false", rss_kib, pss_kib,
+        (unsigned long long)total_vram_kib, on_battery ? "true" : "false", bpol_str, global_pmask,
+        pw_active ? "true" : "false", json_safe_float(vol), json_safe_float(eff_gain),
+        mute_on ? "true" : "false", ext_audio ? "true" : "false", ext_audio ? "true" : "false",
+        json_safe_float(env), json_safe_float(env), json_safe_float(beat), json_safe_float(beat),
+        (beat > 0.6f) ? "true" : "false");
 
-    for (int b = 0; b < 64; ++b) {
+    for (int b = 0; b < 64 && !db->failed; ++b) {
         float bv = (af && b < (int)WAYWAL_AUDIO_BARK_BANDS) ? af->bands[b] : 0.0f;
-        buf_appendf(buf, cap, &off, "%s%.4f", (b > 0) ? "," : "", (double)bv);
+        (void)ipc_dyn_appendf(db, "%s%.4f", (b > 0) ? "," : "", (double)bv);
     }
 
-    buf_appendf(
-        buf, cap, &off,
+    (void)ipc_dyn_appendf(
+        db,
         "]},"
         "\"palette\":{\"active\":%s,\"theme_from_media\":%s,\"primary\":\"%s\","
         "\"secondary\":\"%s\",\"tertiary\":\"%s\",\"background\":\"%s\",\"foreground\":\"%s\"},"
@@ -329,10 +437,7 @@ size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, c
         (long long)mlen_us, state->theme_from_media ? "true" : "false");
 
     bool first_out = true;
-    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-        if (off + 64 >= cap) {
-            break;
-        }
+    for (output_node_t *out = state->outputs; out != NULL && !db->failed; out = out->next) {
         uint32_t pmask = state->power_gov
                              ? waywal_power_governor_get_output_mask(state->power_gov, out->name)
                              : 0;
@@ -373,7 +478,7 @@ size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, c
         }
         char esc_oname[128];
         char esc_odesc[256];
-        char esc_mpath[4096];
+        char esc_mpath[8192];
         waywal_json_escape_string(out->name[0] ? out->name : "unknown", esc_oname,
                                   sizeof(esc_oname));
         waywal_json_escape_string(out->description[0] ? out->description : "unknown", esc_odesc,
@@ -383,42 +488,79 @@ size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, c
         double scale_val = json_safe_float(fscale > 0 ? ((float)fscale / 120.0f) : 1.0f);
         uint8_t bo_states[4];
         get_output_bo_slot_states(out, bo_states);
-        uint32_t out_vram = calculate_output_vram_kib(out);
+        uint64_t out_vram = calculate_output_vram_kib_u64(out);
         float scanout_fps =
             (out->pres_sync.pll.period_est_ns > 0)
                 ? (1000000000.0f / (float)out->pres_sync.pll.period_est_ns)
                 : (out->refresh_mhz > 0 ? (float)out->refresh_mhz / 1000.0f : 60.0f);
         uint32_t render_dur = g_last_render_duration_us > 0 ? g_last_render_duration_us : 250U;
 
-        char out_entry[6144];
-        size_t entry_off = 0;
-        buf_appendf(out_entry, sizeof(out_entry), &entry_off,
-                    "%s{\"name\":\"%s\",\"description\":\"%s\",\"width\":%d,\"height\":%d,"
-                    "\"logical_width\":%u,\"logical_height\":%u,\"scale\":%.4f,\"scale_120\":%d,"
-                    "\"vblank_ns\":%lld,\"scanout_fps\":%.2f,\"last_render_us\":%u,\"vram_kib\":%u,"
-                    "\"paused\":%s,\"pause_mask\":%u,\"engine\":\"%s\","
-                    "\"asset\":\"%s\",\"media_path\":\"%s\",\"fps\":%u,\"scaling\":\"%s\","
-                    "\"bo_states\":[%u,%u,%u,%u],"
-                    "\"bo_slots\":[\"%s\",\"%s\",\"%s\",\"%s\"]}",
-                    first_out ? "" : ",", esc_oname, esc_odesc, out->width, out->height,
-                    out->logical_width, out->logical_height, scale_val, fscale,
-                    (long long)out->pres_sync.pll.period_est_ns, (double)scanout_fps, render_dur,
-                    out_vram, (pmask != 0) ? "true" : "false", pmask, eng_kind, esc_mpath,
-                    esc_mpath, fps, scaling_mode_to_str(out->scaling_mode), (unsigned)bo_states[0],
-                    (unsigned)bo_states[1], (unsigned)bo_states[2], (unsigned)bo_states[3],
-                    bo_slot_state_to_str(bo_states[0]), bo_slot_state_to_str(bo_states[1]),
-                    bo_slot_state_to_str(bo_states[2]), bo_slot_state_to_str(bo_states[3]));
-        if (entry_off + 1 >= sizeof(out_entry) || off + entry_off + 4 >= cap) {
-            break;
+        size_t entry_start = db->len;
+        bool appended = ipc_dyn_appendf(
+            db,
+            "%s{\"name\":\"%s\",\"description\":\"%s\",\"width\":%d,\"height\":%d,"
+            "\"logical_width\":%u,\"logical_height\":%u,\"scale\":%.4f,\"scale_120\":%d,"
+            "\"vblank_ns\":%lld,\"scanout_fps\":%.2f,\"last_render_us\":%u,\"vram_kib\":%llu,"
+            "\"paused\":%s,\"pause_mask\":%u,\"engine\":\"%s\","
+            "\"asset\":\"%s\",\"media_path\":\"%s\",\"fps\":%u,\"scaling\":\"%s\","
+            "\"bo_states\":[%u,%u,%u,%u],"
+            "\"bo_slots\":[\"%s\",\"%s\",\"%s\",\"%s\"]}",
+            first_out ? "" : ",", esc_oname, esc_odesc, out->width, out->height,
+            out->logical_width, out->logical_height, scale_val, fscale,
+            (long long)out->pres_sync.pll.period_est_ns, (double)scanout_fps, render_dur,
+            (unsigned long long)out_vram, (pmask != 0) ? "true" : "false", pmask, eng_kind,
+            esc_mpath, esc_mpath, fps, scaling_mode_to_str(out->scaling_mode),
+            (unsigned)bo_states[0], (unsigned)bo_states[1], (unsigned)bo_states[2],
+            (unsigned)bo_states[3], bo_slot_state_to_str(bo_states[0]),
+            bo_slot_state_to_str(bo_states[1]), bo_slot_state_to_str(bo_states[2]),
+            bo_slot_state_to_str(bo_states[3]));
+        if (!appended && !db->owns_heap) {
+            /* Roll back partial entry when writing to a caller-supplied fixed buffer so JSON stays
+             * well-formed; skip only the oversized output instead of corrupting earlier ones. */
+            db->len = entry_start;
+            db->data[db->len] = '\0';
+            db->failed = false;
+            continue;
         }
-        memcpy(buf + off, out_entry, entry_off);
-        off += entry_off;
-        buf[off] = '\0';
+        if (db->failed) {
+            return false;
+        }
         first_out = false;
     }
 
-    buf_appendf(buf, cap, &off, "]}\n");
-    return off;
+    (void)ipc_dyn_appendf(db, "]}\n");
+    return !db->failed;
+}
+
+static char *daemon_build_status_json_alloc(daemon_state_t *state, const char *event_name,
+                                            size_t *out_len)
+{
+    if (out_len) {
+        *out_len = 0;
+    }
+    ipc_dyn_buf_t db;
+    ipc_dyn_init_heap(&db, 16384u);
+    if (!daemon_build_status_json_into(state, event_name, &db) || !db.data ||
+        db.len > UINT32_MAX) {
+        ipc_dyn_free(&db);
+        return NULL;
+    }
+    if (out_len) {
+        *out_len = db.len;
+    }
+    return db.data;
+}
+
+size_t daemon_build_status_json(daemon_state_t *state, const char *event_name, char *buf,
+                                size_t cap)
+{
+    if (!state || !buf || cap == 0) {
+        return 0;
+    }
+    ipc_dyn_buf_t db;
+    ipc_dyn_init_fixed(&db, buf, cap);
+    (void)daemon_build_status_json_into(state, event_name, &db);
+    return db.len;
 }
 
 typedef struct {
@@ -594,88 +736,81 @@ void daemon_reap_dead_subscribers(daemon_state_t *state)
     }
 }
 
-void daemon_broadcast_event(daemon_state_t *state, const char *event_name)
+static bool poll_fd_ready(int fd, short events, int timeout_ms)
 {
-    if (!state) {
-        return;
+    if (fd < 0) {
+        return false;
     }
-    daemon_reap_dead_subscribers(state);
-    if (state->num_subscribers == 0) {
-        return;
-    }
-    char json_buf[16384];
-    size_t len = daemon_build_status_json(state, event_name ? event_name : "update", json_buf,
-                                          sizeof(json_buf));
-    if (len == 0) {
-        return;
-    }
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    const int64_t deadline_ns = (int64_t)timeout_ms * 1000000LL;
 
-    waywal_ipc_hdr_t hdr = {
-        .magic = WAYWAL_IPC_MAGIC,
-        .version = WAYWAL_IPC_VERSION,
-        .opcode = WAYWAL_RESP_EVENT,
-        .payload_size = (uint32_t)len,
-    };
-
-    const size_t frame_bytes = sizeof(hdr) + len;
-    size_t i = 0;
-    while (i < state->num_subscribers) {
-        int sfd = state->subscriber_fds[i];
-        if (sfd < 0) {
-            daemon_close_subscriber_at(state, i);
-            continue;
+    while (true) {
+        int remaining_ms = timeout_ms;
+        if (timeout_ms > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t elapsed_ns = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000LL +
+                                 (int64_t)(now.tv_nsec - start.tv_nsec);
+            if (elapsed_ns >= deadline_ns) {
+                errno = ETIMEDOUT;
+                return false;
+            }
+            int64_t rem_ns = deadline_ns - elapsed_ns;
+            remaining_ms = (int)((rem_ns + 999999LL) / 1000000LL);
+            if (remaining_ms < 1) {
+                remaining_ms = 1;
+            }
         }
-
-        /* Skip congested subscribers before sendmsg can partially enqueue an skb and
-         * desynchronize stream framing while a client is paused on an async request. */
-        int sndbuf = 0;
-        socklen_t optlen = sizeof(sndbuf);
-        int outq = 0;
-        if (getsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) == 0 && sndbuf > 0 &&
-            ioctl(sfd, TIOCOUTQ, &outq) == 0 && outq > 0 &&
-            (size_t)outq + frame_bytes + 4096u >= (size_t)sndbuf) {
-            ++i;
-            continue;
+        struct pollfd pfd = {.fd = fd, .events = events};
+        int rc = poll(&pfd, 1, remaining_ms);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
         }
-
-        struct iovec iov[2] = {
-            {.iov_base = &hdr, .iov_len = sizeof(hdr)},
-            {.iov_base = json_buf, .iov_len = len},
-        };
-        struct msghdr msg;
-        memset(&msg, 0, sizeof(msg));
-        msg.msg_iov = iov;
-        msg.msg_iovlen = 2;
-        ssize_t w = sendmsg(sfd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (w == (ssize_t)frame_bytes) {
-            ++i;
-        } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-            ++i;
-        } else {
-            daemon_close_subscriber_at(state, i);
+        if (rc == 0) {
+            errno = ETIMEDOUT;
+            return false;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            if (!(pfd.revents & events)) {
+                return false;
+            }
+        }
+        if (pfd.revents & events) {
+            return true;
         }
     }
 }
 
 static bool read_exact(int fd, void *buf, size_t len)
 {
+    if (len == 0) {
+        return true;
+    }
+    if (fd < 0 || !buf) {
+        return false;
+    }
     size_t total = 0;
     uint8_t *p = (uint8_t *)buf;
     while (total < len) {
         ssize_t r = read(fd, p + total, len - total);
         if (r < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR) {
                 continue;
+            }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd = {.fd = fd, .events = POLLIN};
-                if (poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLIN)) {
+                if (poll_fd_ready(fd, POLLIN, 1000)) {
                     continue;
                 }
             }
             return false;
         }
-        if (r == 0)
+        if (r == 0) {
             return false;
+        }
         total += (size_t)r;
     }
     return true;
@@ -683,6 +818,12 @@ static bool read_exact(int fd, void *buf, size_t len)
 
 static bool write_exact(int fd, const void *buf, size_t len)
 {
+    if (len == 0) {
+        return true;
+    }
+    if (fd < 0 || !buf) {
+        return false;
+    }
     size_t total = 0;
     const uint8_t *p = (const uint8_t *)buf;
     while (total < len) {
@@ -691,14 +832,17 @@ static bool write_exact(int fd, const void *buf, size_t len)
             w = write(fd, p + total, len - total);
         }
         if (w < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR) {
                 continue;
+            }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-                if (poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLOUT)) {
+                if (poll_fd_ready(fd, POLLOUT, 1000)) {
                     continue;
                 }
             }
+            return false;
+        }
+        if (w == 0) {
             return false;
         }
         total += (size_t)w;
@@ -726,15 +870,18 @@ static bool ipc_send_response_iov(int fd, const waywal_ipc_hdr_t *hdr, const voi
     msg.msg_iovlen = 2;
 
     const size_t total = sizeof(*hdr) + payload_len;
-    ssize_t w = sendmsg(fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    ssize_t w;
+    do {
+        w = sendmsg(fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    } while (w < 0 && errno == EINTR);
+
     if (w == (ssize_t)total) {
         return true;
     }
 
     size_t written = 0;
     if (w < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR && errno != ENOTSOCK &&
-            errno != EOPNOTSUPP) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOTSOCK && errno != EOPNOTSUPP) {
             return false;
         }
     } else {
@@ -751,17 +898,113 @@ static bool ipc_send_response_iov(int fd, const waywal_ipc_hdr_t *hdr, const voi
     return write_exact(fd, (const uint8_t *)payload + pay_off, payload_len - pay_off);
 }
 
-static void ipc_drain_bytes(int fd, size_t n)
+void daemon_broadcast_event(daemon_state_t *state, const char *event_name)
 {
+    if (!state) {
+        return;
+    }
+    daemon_reap_dead_subscribers(state);
+    if (state->num_subscribers == 0) {
+        return;
+    }
+    size_t len = 0;
+    char *json_buf = daemon_build_status_json_alloc(state, event_name ? event_name : "update", &len);
+    if (!json_buf || len == 0) {
+        free(json_buf);
+        return;
+    }
+
+    waywal_ipc_hdr_t hdr = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_RESP_EVENT,
+        .payload_size = (uint32_t)len,
+    };
+
+    const size_t frame_bytes = sizeof(hdr) + len;
+    size_t i = 0;
+    while (i < state->num_subscribers) {
+        int sfd = state->subscriber_fds[i];
+        if (sfd < 0) {
+            daemon_close_subscriber_at(state, i);
+            continue;
+        }
+
+        /* Never write event frames while a paused async worker owns a dup of this socket. */
+        if (ipc_subscriber_is_paused(sfd)) {
+            ++i;
+            continue;
+        }
+
+        /* Skip congested subscribers before sendmsg can partially enqueue an skb and
+         * require blocking on a slow reader. */
+        int sndbuf = 0;
+        socklen_t optlen = sizeof(sndbuf);
+        int outq = 0;
+        if (getsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) == 0 && sndbuf > 0 &&
+            ioctl(sfd, TIOCOUTQ, &outq) == 0 && outq > 0 &&
+            (size_t)outq + frame_bytes + 4096u >= (size_t)sndbuf) {
+            ++i;
+            continue;
+        }
+
+        struct iovec iov[2] = {
+            {.iov_base = &hdr, .iov_len = sizeof(hdr)},
+            {.iov_base = json_buf, .iov_len = len},
+        };
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = iov;
+        msg.msg_iovlen = 2;
+
+        ssize_t w;
+        do {
+            w = sendmsg(sfd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+        } while (w < 0 && errno == EINTR);
+
+        if (w == (ssize_t)frame_bytes) {
+            ++i;
+        } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            ++i;
+        } else if (w >= 0 && (size_t)w < frame_bytes) {
+            /* Once bytes enter the stream, complete the frame to preserve boundary framing. */
+            size_t written = (size_t)w;
+            bool flushed = true;
+            if (written < sizeof(hdr)) {
+                flushed = write_exact(sfd, (const uint8_t *)&hdr + written, sizeof(hdr) - written);
+                written = sizeof(hdr);
+            }
+            if (flushed) {
+                size_t pay_off = written - sizeof(hdr);
+                flushed = write_exact(sfd, json_buf + pay_off, len - pay_off);
+            }
+            if (flushed) {
+                ++i;
+            } else {
+                daemon_close_subscriber_at(state, i);
+            }
+        } else {
+            daemon_close_subscriber_at(state, i);
+        }
+    }
+    free(json_buf);
+}
+
+static bool ipc_drain_bytes(int fd, size_t n)
+{
+    if (n > WWAL_MAX_EXTRA_IPC_BYTES) {
+        return false;
+    }
     uint8_t drain[1024];
     size_t rem = n;
     while (rem > 0) {
         size_t chunk = rem > sizeof(drain) ? sizeof(drain) : rem;
         if (!read_exact(fd, drain, chunk)) {
-            break;
+            return false;
         }
         rem -= chunk;
     }
+    return true;
 }
 
 static bool output_matches_extra(const output_node_t *out, const char *extra_buf, size_t extra_len,
@@ -1093,7 +1336,7 @@ typedef struct {
 
 static struct {
     bool initialized;
-    bool stopping;
+    _Atomic bool stopping;
     int efd;
     int dl_cancel_efd;
     pthread_mutex_t mtx;
@@ -1134,7 +1377,8 @@ static void ipc_async_notify_main_loop(void)
 static bool ipc_async_push_completion(ipc_async_job_t *job)
 {
     pthread_mutex_lock(&g_ipc_async.mtx);
-    if (g_ipc_async.stopping || g_ipc_async.done_count >= IPC_ASYNC_COMP_CAP) {
+    if (atomic_load_explicit(&g_ipc_async.stopping, memory_order_acquire) ||
+        g_ipc_async.done_count >= IPC_ASYNC_COMP_CAP) {
         pthread_mutex_unlock(&g_ipc_async.mtx);
         return false;
     }
@@ -1373,7 +1617,8 @@ static void *ipc_download_worker_main(void *arg)
         char ws_dir[PATH_MAX] = {0};
 
         pthread_mutex_lock(&g_ipc_async.dl_mtx);
-        while (!g_ipc_async.stopping) {
+        int cancel_efd = -1;
+        while (!atomic_load_explicit(&g_ipc_async.stopping, memory_order_acquire)) {
             for (size_t i = 0; i < IPC_DL_TRACKER_CAP; ++i) {
                 if (g_ipc_async.dl_entries[i].in_use &&
                     g_ipc_async.dl_entries[i].task_state == 0u) {
@@ -1382,6 +1627,7 @@ static void *ipc_download_worker_main(void *arg)
                     g_ipc_async.dl_entries[i].task_state = 2u;
                     g_ipc_async.dl_entries[i].progress_pct = 5.0f;
                     snprintf(ws_dir, sizeof(ws_dir), "%s", g_ipc_async.dl_default_ws_dir);
+                    cancel_efd = g_ipc_async.dl_cancel_efd;
                     break;
                 }
             }
@@ -1390,7 +1636,7 @@ static void *ipc_download_worker_main(void *arg)
             }
             pthread_cond_wait(&g_ipc_async.dl_cv, &g_ipc_async.dl_mtx);
         }
-        if (g_ipc_async.stopping) {
+        if (atomic_load_explicit(&g_ipc_async.stopping, memory_order_acquire)) {
             pthread_mutex_unlock(&g_ipc_async.dl_mtx);
             break;
         }
@@ -1402,7 +1648,7 @@ static void *ipc_download_worker_main(void *arg)
         if (!ipc_find_executable_in_path("steamcmd", steamcmd_bin, sizeof(steamcmd_bin))) {
             snprintf(err_buf, sizeof(err_buf), "steamcmd executable not found in PATH");
         } else {
-            int rc = ipc_run_steamcmd_isolated(steamcmd_bin, next_id, g_ipc_async.dl_cancel_efd);
+            int rc = ipc_run_steamcmd_isolated(steamcmd_bin, next_id, cancel_efd);
             if (rc == 0 && ipc_workshop_item_is_installed_locally(next_id, ws_dir)) {
                 ok = true;
             } else if (rc == 130) {
@@ -1430,9 +1676,10 @@ static void *ipc_download_worker_main(void *arg)
                          sizeof(g_ipc_async.dl_entries[slot].error_msg), "%s", err_buf);
             }
         }
+        bool still_running = !atomic_load_explicit(&g_ipc_async.stopping, memory_order_acquire);
         pthread_mutex_unlock(&g_ipc_async.dl_mtx);
 
-        if (ok && !g_ipc_async.stopping) {
+        if (ok && still_running) {
             ipc_async_job_t *ev_job = (ipc_async_job_t *)calloc(1, sizeof(ipc_async_job_t));
             if (ev_job) {
                 ev_job->kind = IPC_JOB_BG_DOWNLOAD_EVENT;
@@ -2020,7 +2267,8 @@ static void ipc_execute_workshop_download(ipc_async_job_t *job)
     ent->task_state = 0u;
     ent->progress_pct = 0.0f;
 
-    if (g_ipc_async.initialized && !g_ipc_async.dl_thread_started && !g_ipc_async.stopping) {
+    if (g_ipc_async.initialized && !g_ipc_async.dl_thread_started &&
+        !atomic_load_explicit(&g_ipc_async.stopping, memory_order_acquire)) {
         if (pthread_create(&g_ipc_async.dl_thread, NULL, ipc_download_worker_main, NULL) == 0) {
             g_ipc_async.dl_thread_started = true;
         } else {
@@ -2090,8 +2338,9 @@ static void ipc_async_resume_subscriber_if_needed(daemon_state_t *state, ipc_asy
         return;
     }
     if (state->running) {
+        /* Re-arm level-triggered polling so any buffered bytes dispatch on the next tick
+         * without synchronous recursion into daemon_ipc_async_dispatch. */
         register_fd_in_loops(state, sfd, URING_EV_IPC_READ);
-        (void)daemon_ipc_dispatch_subscriber_fd(state, sfd);
     }
 }
 
@@ -2264,10 +2513,12 @@ static void *ipc_async_worker_main(void *arg)
     (void)arg;
     while (true) {
         pthread_mutex_lock(&g_ipc_async.mtx);
-        while (!g_ipc_async.stopping && g_ipc_async.q_count == 0) {
+        while (!atomic_load_explicit(&g_ipc_async.stopping, memory_order_acquire) &&
+               g_ipc_async.q_count == 0) {
             pthread_cond_wait(&g_ipc_async.cv, &g_ipc_async.mtx);
         }
-        if (g_ipc_async.stopping && g_ipc_async.q_count == 0) {
+        if (atomic_load_explicit(&g_ipc_async.stopping, memory_order_acquire) &&
+            g_ipc_async.q_count == 0) {
             pthread_mutex_unlock(&g_ipc_async.mtx);
             break;
         }
@@ -2318,7 +2569,8 @@ static bool ipc_async_submit(daemon_state_t *state, ipc_async_job_t *job)
         return true;
     }
     pthread_mutex_lock(&g_ipc_async.mtx);
-    if (g_ipc_async.stopping || g_ipc_async.q_count >= IPC_ASYNC_QUEUE_CAP) {
+    if (atomic_load_explicit(&g_ipc_async.stopping, memory_order_acquire) ||
+        g_ipc_async.q_count >= IPC_ASYNC_QUEUE_CAP) {
         pthread_mutex_unlock(&g_ipc_async.mtx);
         return false;
     }
@@ -2361,6 +2613,7 @@ bool daemon_ipc_async_init(struct daemon_state *state)
     }
 
     memset(&g_ipc_async, 0, sizeof(g_ipc_async));
+    atomic_init(&g_ipc_async.stopping, false);
     g_ipc_async.efd = efd;
     g_ipc_async.dl_cancel_efd = cancel_efd;
     pthread_mutex_init(&g_ipc_async.mtx, NULL);
@@ -2425,11 +2678,12 @@ void daemon_ipc_async_shutdown(struct daemon_state *state)
     }
 
     pthread_mutex_lock(&g_ipc_async.mtx);
-    g_ipc_async.stopping = true;
+    atomic_store_explicit(&g_ipc_async.stopping, true, memory_order_release);
     pthread_cond_broadcast(&g_ipc_async.cv);
     pthread_mutex_unlock(&g_ipc_async.mtx);
 
     pthread_mutex_lock(&g_ipc_async.dl_mtx);
+    atomic_store_explicit(&g_ipc_async.stopping, true, memory_order_release);
     if (g_ipc_async.dl_cancel_efd >= 0) {
         uint64_t sig = 1;
         ssize_t io_rc = write(g_ipc_async.dl_cancel_efd, &sig, sizeof(sig));
@@ -2510,13 +2764,16 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             return;
         }
 
-        /* Set socket timeouts and buffer sizes to optimize IPC throughput */
-        struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        /* Bound non-blocking sockets with explicit poll deadlines instead of blocking timeouts. */
         int buf_size = 262144;
         setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
         setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+
+        /* Sockets accepted with SOCK_NONBLOCK may race ahead of the client's first write(). */
+        if (!poll_fd_ready(client_fd, POLLIN, 500)) {
+            close(client_fd);
+            return;
+        }
     }
 
     waywal_ipc_hdr_t req_hdr;
@@ -2552,8 +2809,11 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
     switch (req_hdr.opcode) {
     case WAYWAL_REQ_PING: {
-        if (req_hdr.payload_size > 0) {
-            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+        if (req_hdr.payload_size > 0 && !ipc_drain_bytes(client_fd, req_hdr.payload_size)) {
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+            keep_open = false;
+            break;
         }
         resp_hdr.opcode = WAYWAL_RESP_PONG;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
@@ -2569,6 +2829,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 if (!read_exact(client_fd, filter_buf, req_hdr.payload_size)) {
                     resp_hdr.opcode = WAYWAL_RESP_ERR;
                     waywal_ipc_send(client_fd, &resp_hdr, -1);
+                    keep_open = false;
                     break;
                 }
                 filter_len = req_hdr.payload_size + 1;
@@ -2586,18 +2847,21 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     rem -= step;
                 }
             } else {
-                ipc_drain_bytes(client_fd, req_hdr.payload_size);
+                if (!ipc_drain_bytes(client_fd, req_hdr.payload_size)) {
+                    keep_open = false;
+                }
                 resp_hdr.opcode = WAYWAL_RESP_ERR;
                 waywal_ipc_send(client_fd, &resp_hdr, -1);
                 break;
             }
         }
 
-        char query_buf[8192];
-        size_t off = 0;
+        ipc_dyn_buf_t query_buf;
+        ipc_dyn_init_heap(&query_buf, 8192u);
         const char *ns = state->namespace_str[0] != '\0' ? state->namespace_str : "default";
 
-        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        for (output_node_t *out = state->outputs; out != NULL && !query_buf.failed;
+             out = out->next) {
             const char *oname = out->name[0] ? out->name : "unknown";
             if (num_targets > 0 &&
                 !output_matches_extra(out, filter_buf, filter_len, num_targets)) {
@@ -2632,24 +2896,31 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             }
 
             if (!out->displaying_color && media_path && media_path[0] != '\0') {
-                buf_appendf(query_buf, sizeof(query_buf), &off,
-                            "%s: %s: %dx%d, scale: %d, currently displaying: image: %s\n", ns,
-                            oname, out->width, out->height, sc, media_path);
+                (void)ipc_dyn_appendf(&query_buf,
+                                      "%s: %s: %dx%d, scale: %d, currently displaying: image: %s\n",
+                                      ns, oname, out->width, out->height, sc, media_path);
             } else {
                 color_rgba_t c =
                     out->displaying_color
                         ? out->active_color
                         : (out->has_fill_color ? out->fill_color : state->current_color);
-                buf_appendf(
-                    query_buf, sizeof(query_buf), &off,
+                (void)ipc_dyn_appendf(
+                    &query_buf,
                     "%s: %s: %dx%d, scale: %d, currently displaying: color: #%02x%02x%02x\n", ns,
                     oname, out->width, out->height, sc, c.r, c.g, c.b);
             }
         }
 
-        resp_hdr.opcode = WAYWAL_RESP_INFO;
-        resp_hdr.payload_size = (uint32_t)off;
-        (void)ipc_send_response_iov(client_fd, &resp_hdr, query_buf, off);
+        if (query_buf.failed || !query_buf.data || query_buf.len > UINT32_MAX) {
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            resp_hdr.payload_size = 0;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+        } else {
+            resp_hdr.opcode = WAYWAL_RESP_INFO;
+            resp_hdr.payload_size = (uint32_t)query_buf.len;
+            (void)ipc_send_response_iov(client_fd, &resp_hdr, query_buf.data, query_buf.len);
+        }
+        ipc_dyn_free(&query_buf);
         break;
     }
 
@@ -2792,29 +3063,48 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     case WAYWAL_REQ_SET_IMAGE: {
         struct stat st;
         const size_t min_hdr_size = 72u; /* Legacy v0.x metadata header prefix */
-        if (attached_fd >= 0 && fstat(attached_fd, &st) == 0 &&
-            (size_t)st.st_size >= min_hdr_size && req_hdr.payload_size >= min_hdr_size &&
-            (size_t)st.st_size >= req_hdr.payload_size) {
+        int seals = -1;
+        if (attached_fd >= 0 && fstat(attached_fd, &st) == 0 && S_ISREG(st.st_mode) &&
+            st.st_size >= 0 && (uint64_t)st.st_size >= min_hdr_size &&
+            req_hdr.payload_size >= min_hdr_size &&
+            (uint64_t)req_hdr.payload_size <= (uint64_t)st.st_size &&
+            (seals = fcntl(attached_fd, F_GET_SEALS)) >= 0 && (seals & F_SEAL_SHRINK) != 0) {
             void *mapped = mmap(NULL, req_hdr.payload_size, PROT_READ | PROT_WRITE, MAP_PRIVATE,
                                 attached_fd, 0);
             if (mapped != MAP_FAILED) {
                 const waywal_img_metadata_t *raw_meta = (const waywal_img_metadata_t *)mapped;
-                uint64_t pixel_bytes =
-                    (uint64_t)raw_meta->width * (uint64_t)raw_meta->height * 4ULL;
-                uint64_t tail_bytes = (uint64_t)raw_meta->extra_data_len + pixel_bytes;
+                const uint64_t total_payload = (uint64_t)req_hdr.payload_size;
+                uint64_t pixel_bytes = 0;
+                uint64_t tail_bytes = 0;
                 size_t hdr_size = sizeof(waywal_img_metadata_t);
-                if (req_hdr.payload_size >= tail_bytes) {
-                    uint64_t inferred_hdr = req_hdr.payload_size - tail_bytes;
-                    if (inferred_hdr >= min_hdr_size &&
-                        inferred_hdr < sizeof(waywal_img_metadata_t)) {
-                        hdr_size = (size_t)inferred_hdr;
+                bool bounds_ok = false;
+
+                if (raw_meta->width > 0 && raw_meta->height > 0 && raw_meta->width <= 16384u &&
+                    raw_meta->height <= 16384u && raw_meta->num_target_outputs <= 64u &&
+                    raw_meta->extra_data_len <= WWAL_MAX_EXTRA_IPC_BYTES &&
+                    raw_meta->custom_shader_len <= raw_meta->extra_data_len &&
+                    raw_meta->pixel_format <= 16u && raw_meta->scaling_mode <= 8u &&
+                    raw_meta->transition_type <= 32u) {
+                    pixel_bytes = (uint64_t)raw_meta->width * (uint64_t)raw_meta->height * 4ULL;
+                    const uint64_t extra_len = (uint64_t)raw_meta->extra_data_len;
+                    if (extra_len <= total_payload && pixel_bytes <= total_payload - extra_len) {
+                        tail_bytes = extra_len + pixel_bytes;
+                        uint64_t rem_hdr = total_payload - tail_bytes;
+                        if (rem_hdr >= sizeof(waywal_img_metadata_t)) {
+                            hdr_size = sizeof(waywal_img_metadata_t);
+                            bounds_ok = true;
+                        } else if (rem_hdr >= min_hdr_size) {
+                            /* Legacy <= sizeof(waywal_img_metadata_t) prefixes have no trailing
+                             * padding tolerance so pixel offsets cannot drift. */
+                            hdr_size = (size_t)rem_hdr;
+                            bounds_ok = true;
+                        }
                     }
                 }
+
                 uint64_t expected_size = (uint64_t)hdr_size + tail_bytes;
                 bool ok = false;
-                if (raw_meta->width > 0 && raw_meta->height > 0 && raw_meta->width <= 16384 &&
-                    raw_meta->height <= 16384 && req_hdr.payload_size >= expected_size &&
-                    (size_t)st.st_size >= expected_size) {
+                if (bounds_ok) {
                     uint8_t *compat_buf = NULL;
                     waywal_img_metadata_t *meta = (waywal_img_metadata_t *)mapped;
                     bool valid_strings = true;
@@ -2837,6 +3127,13 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                    (const uint8_t *)mapped + hdr_size, raw_meta->extra_data_len);
                         }
                         meta = (waywal_img_metadata_t *)compat_buf;
+                    }
+
+                    const uint64_t shm_avail =
+                        (uint64_t)st.st_size - (uint64_t)hdr_size - (uint64_t)meta->extra_data_len;
+                    if (meta->filter_mode > 8u ||
+                        !waywal_validate_img_metadata(meta, shm_avail, NULL)) {
+                        valid_strings = false;
                     }
 
                     /* Enforce null termination on all untrusted struct-embedded string buffers */
@@ -3252,11 +3549,14 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         waywal_video_payload_t vpay;
         memset(&vpay, 0, sizeof(vpay));
         bool has_vpay = false;
+        bool req_valid = false;
         output_node_t *target_out = NULL;
         char extra_buf[4097];
         size_t extra_len = 0;
         bool has_extra_targets = false;
         uint32_t matched_count = 0;
+        struct stat vid_st;
+        size_t vid_mem_size = 0;
 
         const size_t min_vpay = offsetof(waywal_video_payload_t, volume);
         if (req_hdr.payload_size >= min_vpay) {
@@ -3270,73 +3570,110 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             if (read_exact(client_fd, &vpay, vpay_size_to_read)) {
                 vpay.filepath[sizeof(vpay.filepath) - 1] = '\0';
                 has_vpay = true;
-
-                if (isfinite(vpay.volume) && vpay.volume >= 0.0f) {
-                    float clamped = vpay.volume > 1.0f ? 1.0f : vpay.volume;
-                    state->audio_volume = clamped;
-                    if (state->audio_fft) {
-                        waywal_audio_fft_set_volume(state->audio_fft, clamped);
-                    }
-                }
-                if (vpay.mute_on_audio) {
-                    state->mute_on_audio = true;
-                    if (state->audio_fft) {
-                        waywal_audio_fft_set_mute_on_audio(state->audio_fft, true);
-                    }
-                }
+                req_valid = true;
 
                 size_t raw_extra_len = req_hdr.payload_size - vpay_size_to_read;
-                if (vpay.num_target_outputs > 0 && vpay.num_target_outputs <= 64 &&
-                    raw_extra_len > 0 && raw_extra_len <= 4096) {
-                    if (read_exact(client_fd, extra_buf, raw_extra_len)) {
-                        extra_buf[raw_extra_len] = '\0';
-                        extra_len = raw_extra_len + 1;
-                        if (!extra_has_wildcard(extra_buf, extra_len, vpay.num_target_outputs)) {
-                            has_extra_targets = true;
-                            const char *ptr = extra_buf;
-                            size_t remaining = extra_len;
-                            output_node_t *last_matched = NULL;
-                            for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0;
-                                 ++i) {
-                                const char *end = (const char *)memchr(ptr, '\0', remaining);
-                                if (!end)
-                                    break;
-                                for (output_node_t *out = state->outputs; out != NULL;
-                                     out = out->next) {
-                                    if (output_matches_target_spec(out, ptr)) {
-                                        last_matched = out;
-                                        matched_count++;
+                if (vpay.num_target_outputs > 0) {
+                    if (vpay.num_target_outputs <= 64u && raw_extra_len > 0 &&
+                        raw_extra_len <= 4096u) {
+                        if (read_exact(client_fd, extra_buf, raw_extra_len)) {
+                            extra_buf[raw_extra_len] = '\0';
+                            extra_len = raw_extra_len + 1;
+                            if (!extra_has_wildcard(extra_buf, extra_len,
+                                                    vpay.num_target_outputs)) {
+                                has_extra_targets = true;
+                                const char *ptr = extra_buf;
+                                size_t remaining = extra_len;
+                                output_node_t *last_matched = NULL;
+                                for (uint32_t i = 0; i < vpay.num_target_outputs && remaining > 0;
+                                     ++i) {
+                                    const char *end = (const char *)memchr(ptr, '\0', remaining);
+                                    if (!end)
+                                        break;
+                                    for (output_node_t *out = state->outputs; out != NULL;
+                                         out = out->next) {
+                                        if (output_matches_target_spec(out, ptr)) {
+                                            last_matched = out;
+                                            matched_count++;
+                                        }
                                     }
+                                    size_t step = (size_t)(end - ptr) + 1;
+                                    ptr += step;
+                                    remaining -= step;
                                 }
-                                size_t step = (size_t)(end - ptr) + 1;
-                                ptr += step;
-                                remaining -= step;
+                                if (matched_count == 1) {
+                                    target_out = last_matched;
+                                }
                             }
-                            if (matched_count == 1) {
-                                target_out = last_matched;
-                            }
+                        } else {
+                            req_valid = false;
+                            keep_open = false;
                         }
+                    } else {
+                        if (raw_extra_len > 0 && !ipc_drain_bytes(client_fd, raw_extra_len)) {
+                            keep_open = false;
+                        }
+                        req_valid = false;
                     }
                 } else if (raw_extra_len > 0) {
-                    ipc_drain_bytes(client_fd, raw_extra_len);
+                    if (!ipc_drain_bytes(client_fd, raw_extra_len)) {
+                        req_valid = false;
+                        keep_open = false;
+                    }
                 }
+            } else {
+                keep_open = false;
             }
         } else if (req_hdr.payload_size > 0) {
-            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+            if (!ipc_drain_bytes(client_fd, req_hdr.payload_size)) {
+                keep_open = false;
+            }
         }
 
-        if (state->outputs != NULL && has_extra_targets && matched_count == 0) {
+        if (req_valid && state->outputs != NULL && has_extra_targets && matched_count == 0) {
+            req_valid = false;
+        }
+
+        bool shared_existing_ve =
+            (req_valid && has_extra_targets && has_vpay &&
+             state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED &&
+             state->video_engine.filepath[0] != '\0' && vpay.filepath[0] != '\0' &&
+             strcmp(state->video_engine.filepath, vpay.filepath) == 0);
+
+        /* Validate the FD/file source before stopping any currently running output engine. */
+        if (req_valid && !shared_existing_ve) {
+            if (attached_fd >= 0) {
+                if (fstat(attached_fd, &vid_st) == 0 && S_ISREG(vid_st.st_mode) &&
+                    vid_st.st_size > 0 && (uint64_t)vid_st.st_size <= (uint64_t)SIZE_MAX) {
+                    vid_mem_size = (size_t)vid_st.st_size;
+                } else {
+                    req_valid = false;
+                }
+            } else if (!has_vpay || vpay.filepath[0] == '\0' || access(vpay.filepath, R_OK) != 0) {
+                req_valid = false;
+            }
+        }
+
+        if (!req_valid) {
             if (attached_fd >= 0) {
                 close(attached_fd);
                 attached_fd = -1;
             }
             ok = false;
         } else {
-            bool shared_existing_ve =
-                (has_extra_targets && has_vpay &&
-                 state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED &&
-                 state->video_engine.filepath[0] != '\0' && vpay.filepath[0] != '\0' &&
-                 strcmp(state->video_engine.filepath, vpay.filepath) == 0);
+            if (isfinite(vpay.volume) && vpay.volume >= 0.0f) {
+                float clamped = vpay.volume > 1.0f ? 1.0f : vpay.volume;
+                state->audio_volume = clamped;
+                if (state->audio_fft) {
+                    waywal_audio_fft_set_volume(state->audio_fft, clamped);
+                }
+            }
+            if (vpay.mute_on_audio) {
+                state->mute_on_audio = true;
+                if (state->audio_fft) {
+                    waywal_audio_fft_set_mute_on_audio(state->audio_fft, true);
+                }
+            }
 
             if (shared_existing_ve) {
                 if (attached_fd >= 0) {
@@ -3365,7 +3702,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 }
                 state->video_engine.loop_count = vpay.loop_count;
                 state->video_engine.playback_speed =
-                    vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
+                    (isfinite(vpay.playback_speed) && vpay.playback_speed > 0.01f)
+                        ? vpay.playback_speed
+                        : 1.0f;
                 if (state->video_engine.target_output != target_out) {
                     state->video_engine.target_output = NULL;
                 }
@@ -3424,7 +3763,10 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
                 if (has_vpay) {
                     ve->loop_count = vpay.loop_count;
-                    ve->playback_speed = vpay.playback_speed > 0.01f ? vpay.playback_speed : 1.0f;
+                    ve->playback_speed =
+                        (isfinite(vpay.playback_speed) && vpay.playback_speed > 0.01f)
+                            ? vpay.playback_speed
+                            : 1.0f;
                 }
                 ve->has_target_filter = has_extra_targets;
                 if (ve == &state->video_engine) {
@@ -3489,16 +3831,10 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 }
 
                 if (attached_fd >= 0) {
-                    struct stat st;
-                    if (fstat(attached_fd, &st) == 0 && st.st_size > 0) {
-                        ok = video_engine_load_mem(ve, attached_fd, (size_t)st.st_size, target_out);
-                        attached_fd = -1;
-                        if (ok && has_vpay && vpay.filepath[0] != '\0') {
-                            snprintf(ve->filepath, sizeof(ve->filepath), "%s", vpay.filepath);
-                        }
-                    } else {
-                        close(attached_fd);
-                        attached_fd = -1;
+                    ok = video_engine_load_mem(ve, attached_fd, vid_mem_size, target_out);
+                    attached_fd = -1;
+                    if (ok && has_vpay && vpay.filepath[0] != '\0') {
+                        snprintf(ve->filepath, sizeof(ve->filepath), "%s", vpay.filepath);
                     }
                 } else if (has_vpay) {
                     ok = video_engine_load_file(ve, vpay.filepath, target_out);
@@ -4286,38 +4622,39 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     }
 
     case WAYWAL_REQ_STATS: {
-        if (req_hdr.payload_size > 0) {
-            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+        if (req_hdr.payload_size > 0 && !ipc_drain_bytes(client_fd, req_hdr.payload_size)) {
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+            keep_open = false;
+            break;
         }
         unsigned long rss_kib = 0, pss_kib = 0;
         get_process_memory_kib(&rss_kib, &pss_kib);
-        uint32_t total_vram_kib = 0;
+        uint64_t total_vram_kib = 0;
         for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
-            total_vram_kib += calculate_output_vram_kib(o);
+            total_vram_kib += calculate_output_vram_kib_u64(o);
         }
 
-        char stats_buf[4096];
-        size_t off = 0;
-        buf_appendf(stats_buf, sizeof(stats_buf), &off,
-                    "=== WayWal Daemon Telemetry ===\n"
-                    "Memory RSS:     %lu KiB (%.2f MiB)\n"
-                    "Memory PSS:     %lu KiB (%.2f MiB)\n"
-                    "VRAM Footprint: %lu KiB (%.2f MiB)\n"
-                    "GPU Compute:    %s (last=%u us)\n"
-                    "DMA-BUF Scanout:%s (modifier=0x%016lx, 10bit=%s, nv12=%s)\n"
-                    "Outputs (%zu):\n",
-                    rss_kib, (double)rss_kib / 1024.0, pss_kib, (double)pss_kib / 1024.0,
-                    (unsigned long)total_vram_kib, (double)total_vram_kib / 1024.0,
-                    state->render_engine.gpu_compute_active ? "active" : "cpu-simd-fallback",
-                    g_last_render_duration_us,
-                    state->dmabuf_ctx.available ? "enabled" : "shm-fallback",
-                    (unsigned long)state->dmabuf_ctx.preferred_modifier,
-                    state->dmabuf_ctx.has_10bit ? "yes" : "no",
-                    state->dmabuf_ctx.has_nv12 ? "yes" : "no", state->num_outputs);
+        ipc_dyn_buf_t stats_buf;
+        ipc_dyn_init_heap(&stats_buf, 8192u);
+        (void)ipc_dyn_appendf(
+            &stats_buf,
+            "=== WayWal Daemon Telemetry ===\n"
+            "Memory RSS:     %lu KiB (%.2f MiB)\n"
+            "Memory PSS:     %lu KiB (%.2f MiB)\n"
+            "VRAM Footprint: %llu KiB (%.2f MiB)\n"
+            "GPU Compute:    %s (last=%u us)\n"
+            "DMA-BUF Scanout:%s (modifier=0x%016lx, 10bit=%s, nv12=%s)\n"
+            "Outputs (%zu):\n",
+            rss_kib, (double)rss_kib / 1024.0, pss_kib, (double)pss_kib / 1024.0,
+            (unsigned long long)total_vram_kib, (double)total_vram_kib / 1024.0,
+            state->render_engine.gpu_compute_active ? "active" : "cpu-simd-fallback",
+            g_last_render_duration_us, state->dmabuf_ctx.available ? "enabled" : "shm-fallback",
+            (unsigned long)state->dmabuf_ctx.preferred_modifier,
+            state->dmabuf_ctx.has_10bit ? "yes" : "no", state->dmabuf_ctx.has_nv12 ? "yes" : "no",
+            state->num_outputs);
 
-        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-            if (off + 1 >= sizeof(stats_buf))
-                break;
+        for (output_node_t *out = state->outputs; out != NULL && !stats_buf.failed; out = out->next) {
             uint32_t pmask =
                 state->power_gov
                     ? waywal_power_governor_get_output_mask(state->power_gov, out->name)
@@ -4340,19 +4677,27 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 (out->pres_sync.pll.period_est_ns > 0)
                     ? (1000000000.0f / (float)out->pres_sync.pll.period_est_ns)
                     : (out->refresh_mhz > 0 ? (float)out->refresh_mhz / 1000.0f : 60.0f);
-            buf_appendf(stats_buf, sizeof(stats_buf), &off,
-                        "  - %s: physical=%dx%d logical=%ux%u scale=%d/120 fps=%.1f "
-                        "vblank_period=%lldns pause_mask=0x%02x engine=%s slots=[%s,%s,%s,%s]\n",
-                        out->name[0] ? out->name : "unknown", out->width, out->height,
-                        out->logical_width, out->logical_height, fscale, (double)scanout_fps,
-                        (long long)out->pres_sync.pll.period_est_ns, pmask, eng_kind,
-                        bo_slot_state_to_str(bo_states[0]), bo_slot_state_to_str(bo_states[1]),
-                        bo_slot_state_to_str(bo_states[2]), bo_slot_state_to_str(bo_states[3]));
+            (void)ipc_dyn_appendf(
+                &stats_buf,
+                "  - %s: physical=%dx%d logical=%ux%u scale=%d/120 fps=%.1f "
+                "vblank_period=%lldns pause_mask=0x%02x engine=%s slots=[%s,%s,%s,%s]\n",
+                out->name[0] ? out->name : "unknown", out->width, out->height, out->logical_width,
+                out->logical_height, fscale, (double)scanout_fps,
+                (long long)out->pres_sync.pll.period_est_ns, pmask, eng_kind,
+                bo_slot_state_to_str(bo_states[0]), bo_slot_state_to_str(bo_states[1]),
+                bo_slot_state_to_str(bo_states[2]), bo_slot_state_to_str(bo_states[3]));
         }
 
-        resp_hdr.opcode = WAYWAL_RESP_OK;
-        resp_hdr.payload_size = (uint32_t)off;
-        (void)ipc_send_response_iov(client_fd, &resp_hdr, stats_buf, off);
+        if (stats_buf.failed || !stats_buf.data || stats_buf.len > UINT32_MAX) {
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            resp_hdr.payload_size = 0;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+        } else {
+            resp_hdr.opcode = WAYWAL_RESP_OK;
+            resp_hdr.payload_size = (uint32_t)stats_buf.len;
+            (void)ipc_send_response_iov(client_fd, &resp_hdr, stats_buf.data, stats_buf.len);
+        }
+        ipc_dyn_free(&stats_buf);
         break;
     }
 
@@ -4395,14 +4740,24 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     }
 
     case WAYWAL_REQ_QUERY_JSON: {
-        if (req_hdr.payload_size > 0) {
-            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+        if (req_hdr.payload_size > 0 && !ipc_drain_bytes(client_fd, req_hdr.payload_size)) {
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+            keep_open = false;
+            break;
         }
-        char json_buf[16384];
-        size_t len = daemon_build_status_json(state, NULL, json_buf, sizeof(json_buf));
+        size_t len = 0;
+        char *json_buf = daemon_build_status_json_alloc(state, NULL, &len);
+        if (!json_buf || len == 0) {
+            free(json_buf);
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+            break;
+        }
         resp_hdr.opcode = WAYWAL_RESP_INFO;
-        resp_hdr.payload_size = len;
+        resp_hdr.payload_size = (uint32_t)len;
         (void)ipc_send_response_iov(client_fd, &resp_hdr, json_buf, len);
+        free(json_buf);
         break;
     }
 
@@ -4412,8 +4767,12 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         bool ok = false;
         if (req_hdr.payload_size >= sizeof(upay)) {
             if (read_exact(client_fd, &upay, sizeof(upay))) {
+                bool drain_ok = true;
                 if (req_hdr.payload_size > sizeof(upay)) {
-                    ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(upay));
+                    drain_ok = ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(upay));
+                    if (!drain_ok) {
+                        keep_open = false;
+                    }
                 }
 
                 char target_out[64] = "";
@@ -4422,124 +4781,97 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 float u_vals[4] = {0};
                 uint32_t u_flags = 0;
 
-                if (upay.num_components >= 1 && upay.num_components <= 4 && upay.name[0] != '\0') {
-                    // Standard 64/64 layout
-                    snprintf(target_out, sizeof(target_out), "%.*s", (int)sizeof(upay.output),
-                             upay.output);
-                    snprintf(uniform_name, sizeof(uniform_name), "%.*s", (int)sizeof(upay.name),
-                             upay.name);
-                    num_comp = upay.num_components;
-                    for (uint32_t i = 0; i < num_comp && i < 4; ++i) {
-                        u_vals[i] = upay.values[i];
-                    }
-                    u_flags = 0;
-                } else if (upay.uniform_components >= 1 && upay.uniform_components <= 4 &&
-                           upay.uniform_name[0] != '\0') {
-                    // Structured 32/64 uniform layout with persistence flags
-                    snprintf(target_out, sizeof(target_out), "%.*s",
-                             (int)sizeof(upay.target_output), upay.target_output);
-                    snprintf(uniform_name, sizeof(uniform_name), "%.*s",
-                             (int)sizeof(upay.uniform_name), upay.uniform_name);
-                    num_comp = upay.uniform_components;
-                    for (uint32_t i = 0; i < num_comp && i < 4; ++i) {
-                        u_vals[i] = upay.uniform_values[i];
-                    }
-                    u_flags = upay.flags;
-                }
-
-                if (uniform_name[0] != '\0' && num_comp >= 1 && num_comp <= 4) {
-                    bool valid_floats = true;
+                if (drain_ok &&
+                    waywal_decode_set_uniform_payload(&upay, target_out, sizeof(target_out),
+                                                      uniform_name, sizeof(uniform_name),
+                                                      &num_comp, u_vals, &u_flags)) {
+                    char prop_kv[160];
+                    size_t kv_off = 0;
+                    buf_appendf(prop_kv, sizeof(prop_kv), &kv_off, "%s=", uniform_name);
                     for (uint32_t i = 0; i < num_comp; ++i) {
-                        if (!isfinite(u_vals[i])) {
-                            valid_floats = false;
-                            break;
+                        buf_appendf(prop_kv, sizeof(prop_kv), &kv_off, "%s%.6g",
+                                    (i > 0) ? "," : "", (double)u_vals[i]);
+                    }
+
+                    bool apply_global =
+                        (!state->outputs || target_out[0] == '\0' || strcmp(target_out, "*") == 0);
+                    if (apply_global) {
+                        if (!state->shader_eng && !state->we_scene) {
+                            if (state->dmabuf_ctx.available) {
+                                render_engine_make_current(&state->render_engine);
+                                state->shader_eng =
+                                    waywal_shader_engine_create(&state->dmabuf_ctx);
+                            } else {
+                                state->shader_eng = waywal_shader_engine_create(NULL);
+                            }
+                        }
+                        if (state->shader_eng) {
+                            if (waywal_shader_engine_set_custom_uniform(
+                                    state->shader_eng, uniform_name, u_vals, num_comp)) {
+                                ok = true;
+                            }
+                        }
+                        if (state->we_scene) {
+                            if (we_scene_set_uniform_override(state->we_scene, uniform_name, u_vals,
+                                                              num_comp)) {
+                                ok = true;
+                                upsert_workshop_prop_kv(state->workshop_props,
+                                                        sizeof(state->workshop_props), uniform_name,
+                                                        prop_kv);
+                            }
                         }
                     }
-                    if (valid_floats) {
-                        char prop_kv[160];
-                        size_t kv_off = 0;
-                        buf_appendf(prop_kv, sizeof(prop_kv), &kv_off, "%s=", uniform_name);
-                        for (uint32_t i = 0; i < num_comp; ++i) {
-                            buf_appendf(prop_kv, sizeof(prop_kv), &kv_off, "%s%.6g",
-                                        (i > 0) ? "," : "", (double)u_vals[i]);
+                    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                        if (!output_matches_target_spec(out, target_out)) {
+                            continue;
                         }
-
-                        bool apply_global = (!state->outputs || target_out[0] == '\0' ||
-                                             strcmp(target_out, "*") == 0);
-                        if (apply_global) {
-                            if (!state->shader_eng && !state->we_scene) {
-                                if (state->dmabuf_ctx.available) {
-                                    render_engine_make_current(&state->render_engine);
-                                    state->shader_eng =
-                                        waywal_shader_engine_create(&state->dmabuf_ctx);
-                                } else {
-                                    state->shader_eng = waywal_shader_engine_create(NULL);
-                                }
-                            }
-                            if (state->shader_eng) {
-                                if (waywal_shader_engine_set_custom_uniform(
-                                        state->shader_eng, uniform_name, u_vals, num_comp)) {
-                                    ok = true;
-                                }
-                            }
-                            if (state->we_scene) {
-                                if (we_scene_set_uniform_override(state->we_scene, uniform_name,
-                                                                  u_vals, num_comp)) {
-                                    ok = true;
-                                    upsert_workshop_prop_kv(state->workshop_props,
-                                                            sizeof(state->workshop_props),
-                                                            uniform_name, prop_kv);
-                                }
+                        if (out->shader_eng &&
+                            (!apply_global || out->shader_eng != state->shader_eng)) {
+                            if (waywal_shader_engine_set_custom_uniform(
+                                    out->shader_eng, uniform_name, u_vals, num_comp)) {
+                                ok = true;
                             }
                         }
-                        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-                            if (!output_matches_target_spec(out, target_out)) {
+                        if (out->we_scene) {
+                            bool scene_ok = true;
+                            if (!apply_global || out->we_scene != state->we_scene) {
+                                scene_ok = we_scene_set_uniform_override(
+                                    out->we_scene, uniform_name, u_vals, num_comp);
+                            }
+                            if (scene_ok) {
+                                ok = true;
+                                upsert_workshop_prop_kv(out->workshop_props,
+                                                        sizeof(out->workshop_props), uniform_name,
+                                                        prop_kv);
+                            }
+                        }
+                    }
+                    if (ok && (u_flags & WAYWAL_UNIFORM_FLAG_PERSIST)) {
+                        bool saved_dirty = false;
+                        for (size_t k = 0; k < g_saved_state.count; ++k) {
+                            waywal_output_saved_state_t *se = &g_saved_state.outputs[k];
+                            if (se->kind != WAYWAL_CONTENT_WORKSHOP)
                                 continue;
-                            }
-                            if (out->shader_eng &&
-                                (!apply_global || out->shader_eng != state->shader_eng)) {
-                                if (waywal_shader_engine_set_custom_uniform(
-                                        out->shader_eng, uniform_name, u_vals, num_comp)) {
-                                    ok = true;
-                                }
-                            }
-                            if (out->we_scene) {
-                                bool scene_ok = true;
-                                if (!apply_global || out->we_scene != state->we_scene) {
-                                    scene_ok = we_scene_set_uniform_override(
-                                        out->we_scene, uniform_name, u_vals, num_comp);
-                                }
-                                if (scene_ok) {
-                                    ok = true;
-                                    upsert_workshop_prop_kv(out->workshop_props,
-                                                            sizeof(out->workshop_props),
-                                                            uniform_name, prop_kv);
-                                }
+                            if (apply_global || strcmp(se->output_name, target_out) == 0 ||
+                                strcmp(se->output_name, "*") == 0) {
+                                upsert_workshop_prop_kv(se->prop_overrides,
+                                                        sizeof(se->prop_overrides), uniform_name,
+                                                        prop_kv);
+                                saved_dirty = true;
                             }
                         }
-                        if (ok && (u_flags & WAYWAL_UNIFORM_FLAG_PERSIST)) {
-                            bool saved_dirty = false;
-                            for (size_t k = 0; k < g_saved_state.count; ++k) {
-                                waywal_output_saved_state_t *se = &g_saved_state.outputs[k];
-                                if (se->kind != WAYWAL_CONTENT_WORKSHOP)
-                                    continue;
-                                if (apply_global || strcmp(se->output_name, target_out) == 0 ||
-                                    strcmp(se->output_name, "*") == 0) {
-                                    upsert_workshop_prop_kv(se->prop_overrides,
-                                                            sizeof(se->prop_overrides),
-                                                            uniform_name, prop_kv);
-                                    saved_dirty = true;
-                                }
-                            }
-                            if (saved_dirty) {
-                                (void)waywal_state_store_save(&g_saved_state, NULL);
-                            }
+                        if (saved_dirty) {
+                            (void)waywal_state_store_save(&g_saved_state, NULL);
                         }
                     }
                 }
+            } else {
+                keep_open = false;
             }
         } else if (req_hdr.payload_size > 0) {
-            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+            if (!ipc_drain_bytes(client_fd, req_hdr.payload_size)) {
+                keep_open = false;
+            }
         }
         resp_hdr.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
@@ -4562,22 +4894,44 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
     case WAYWAL_REQ_GET_TELEMETRY: {
         uint32_t req_format = WAYWAL_TELEMETRY_FORMAT_BINARY;
+        bool req_ok = true;
         if (req_hdr.payload_size >= sizeof(uint32_t)) {
             if (read_exact(client_fd, &req_format, sizeof(uint32_t))) {
-                if (req_hdr.payload_size > sizeof(uint32_t)) {
-                    ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(uint32_t));
+                if (req_hdr.payload_size > sizeof(uint32_t) &&
+                    !ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(uint32_t))) {
+                    req_ok = false;
+                    keep_open = false;
                 }
+            } else {
+                req_ok = false;
+                keep_open = false;
             }
         } else if (req_hdr.payload_size > 0) {
-            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+            if (!ipc_drain_bytes(client_fd, req_hdr.payload_size)) {
+                req_ok = false;
+                keep_open = false;
+            }
+        }
+
+        if (!req_ok) {
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+            break;
         }
 
         if (req_format == WAYWAL_TELEMETRY_FORMAT_JSON) {
-            char json_buf[16384];
-            size_t len = daemon_build_status_json(state, NULL, json_buf, sizeof(json_buf));
-            resp_hdr.opcode = WAYWAL_RESP_INFO;
-            resp_hdr.payload_size = len;
-            (void)ipc_send_response_iov(client_fd, &resp_hdr, json_buf, len);
+            size_t len = 0;
+            char *json_buf = daemon_build_status_json_alloc(state, NULL, &len);
+            if (!json_buf || len == 0) {
+                free(json_buf);
+                resp_hdr.opcode = WAYWAL_RESP_ERR;
+                waywal_ipc_send(client_fd, &resp_hdr, -1);
+            } else {
+                resp_hdr.opcode = WAYWAL_RESP_INFO;
+                resp_hdr.payload_size = (uint32_t)len;
+                (void)ipc_send_response_iov(client_fd, &resp_hdr, json_buf, len);
+                free(json_buf);
+            }
         } else {
             waywal_telemetry_snapshot_t snap;
             memset(&snap, 0, sizeof(snap));
@@ -4590,8 +4944,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
             unsigned long rss = 0, pss = 0;
             get_process_memory_kib(&rss, &pss);
-            snap.rss_kib = (uint32_t)rss;
-            snap.pss_kib = (uint32_t)pss;
+            snap.rss_kib = rss > UINT32_MAX ? UINT32_MAX : (uint32_t)rss;
+            snap.pss_kib = pss > UINT32_MAX ? UINT32_MAX : (uint32_t)pss;
             snap.gpu_active = state->render_engine.gpu_compute_active ? 1 : 0;
 
             if (state->power_gov) {
@@ -4621,7 +4975,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 snap.mute_on_audio = state->mute_on_audio ? 1 : 0;
             }
 
-            uint32_t total_vram = 0;
+            uint64_t total_vram = 0;
             uint32_t out_idx = 0;
             for (output_node_t *out = state->outputs;
                  out != NULL && out_idx < WAYWAL_MAX_TELEMETRY_OUTPUTS;
@@ -4645,8 +4999,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
 
                 ot->last_render_us =
                     g_last_render_duration_us > 0 ? g_last_render_duration_us : 250U;
-                ot->vram_kib = calculate_output_vram_kib(out);
-                total_vram += ot->vram_kib;
+                uint64_t out_vram_u64 = calculate_output_vram_kib_u64(out);
+                ot->vram_kib = out_vram_u64 > UINT32_MAX ? UINT32_MAX : (uint32_t)out_vram_u64;
+                total_vram += out_vram_u64;
 
                 get_output_bo_slot_states(out, ot->bo_states);
 
@@ -4672,11 +5027,11 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 ot->is_paused = (pmask != 0) ? 1 : 0;
             }
             snap.num_outputs = out_idx;
-            snap.total_vram_kib = total_vram;
+            snap.total_vram_kib = total_vram > UINT32_MAX ? UINT32_MAX : (uint32_t)total_vram;
 
-            resp_hdr.opcode = WAYWAL_RESP_OK;
+            resp_hdr.opcode = WAYWAL_RESP_TELEMETRY;
             resp_hdr.payload_size = sizeof(snap);
-            (void)ipc_send_response_iov(client_fd, &resp_hdr, &snap, sizeof(snap));
+            (void)waywal_ipc_send_payload_fds(client_fd, &resp_hdr, &snap, sizeof(snap), NULL, 0);
         }
         break;
     }
@@ -4684,16 +5039,32 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     case WAYWAL_REQ_EXPORT_OUTPUT_DMABUF: {
         waywal_export_dmabuf_req_t exp_req;
         memset(&exp_req, 0, sizeof(exp_req));
+        bool req_ok = true;
         if (req_hdr.payload_size >= sizeof(exp_req)) {
             if (read_exact(client_fd, &exp_req, sizeof(exp_req))) {
-                if (req_hdr.payload_size > sizeof(exp_req)) {
-                    ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(exp_req));
+                if (req_hdr.payload_size > sizeof(exp_req) &&
+                    !ipc_drain_bytes(client_fd, req_hdr.payload_size - sizeof(exp_req))) {
+                    req_ok = false;
+                    keep_open = false;
                 }
+            } else {
+                req_ok = false;
+                keep_open = false;
             }
         } else if (req_hdr.payload_size > 0) {
-            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+            if (!ipc_drain_bytes(client_fd, req_hdr.payload_size)) {
+                req_ok = false;
+                keep_open = false;
+            }
         }
         exp_req.output[sizeof(exp_req.output) - 1] = '\0';
+
+        if (!req_ok) {
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            resp_hdr.payload_size = 0;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+            break;
+        }
 
         output_node_t *target_out = NULL;
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
@@ -4702,10 +5073,12 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 break;
             }
         }
-        if (!target_out) {
+        /* Reject explicitly named unknown outputs instead of silently exporting another monitor. */
+        if (!target_out && exp_req.output[0] == '\0') {
             target_out = state->outputs;
         }
 
+        bool exported_prime = false;
         if (target_out && !target_out->shader_active && !target_out->anim_active &&
             !target_out->workshop_active) {
             video_engine_t *ve = NULL;
@@ -4738,9 +5111,13 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         if (resp_pay.num_planes > 4) {
                             resp_pay.num_planes = 4;
                         }
+                        bool prime_fds_ok = true;
                         for (uint32_t p = 0; p < resp_pay.num_planes; ++p) {
                             resp_pay.strides[p] = prime_frame.strides[p];
                             resp_pay.offsets[p] = prime_frame.offsets[p];
+                            if (prime_frame.fds[p] < 0) {
+                                prime_fds_ok = false;
+                            }
                         }
                         snprintf(resp_pay.output, sizeof(resp_pay.output), "%s", target_out->name);
                         resp_pay.flags = (prime_frame.drm_format == DRM_FORMAT_P010 ||
@@ -4749,15 +5126,18 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                              ? 1
                                              : 0;
 
-                        resp_hdr.opcode = WAYWAL_RESP_OK;
-                        resp_hdr.payload_size = sizeof(resp_pay);
-                        bool sent = waywal_ipc_send_fds(client_fd, &resp_hdr, prime_frame.fds,
-                                                        resp_pay.num_planes);
-                        vaapi_prime_frame_close(&prime_frame);
-                        if (sent) {
-                            (void)write_exact(client_fd, &resp_pay, sizeof(resp_pay));
+                        if (prime_fds_ok) {
+                            resp_hdr.opcode = WAYWAL_RESP_DMABUF;
+                            resp_hdr.payload_size = sizeof(resp_pay);
+                            (void)waywal_ipc_send_payload_fds(client_fd, &resp_hdr, &resp_pay,
+                                                              sizeof(resp_pay), prime_frame.fds,
+                                                              resp_pay.num_planes);
+                            exported_prime = true;
                         }
-                        break;
+                        vaapi_prime_frame_close(&prime_frame);
+                        if (exported_prime) {
+                            break;
+                        }
                     }
                 } else if (ve->using_swdec) {
                     (void)video_engine_snapshot_output(ve, target_out);
@@ -4779,7 +5159,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             }
         }
 
-        if (!src_bo || src_bo->fd[0] < 0) {
+        if (!target_out || !src_bo || src_bo->fd[0] < 0) {
             resp_hdr.opcode = WAYWAL_RESP_ERR;
             resp_hdr.payload_size = 0;
             waywal_ipc_send(client_fd, &resp_hdr, -1);
@@ -4804,26 +5184,39 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         resp_pay.flags = src_bo->is_10bit ? 1 : 0;
 
         int dup_fds[4] = {-1, -1, -1, -1};
+        bool dup_ok = true;
         for (uint32_t p = 0; p < resp_pay.num_planes; ++p) {
-            if (src_bo->fd[p] >= 0) {
-                dup_fds[p] = fcntl(src_bo->fd[p], F_DUPFD_CLOEXEC, 0);
-                if (dup_fds[p] < 0) {
-                    dup_fds[p] = dup(src_bo->fd[p]);
-                }
+            if (src_bo->fd[p] < 0) {
+                dup_ok = false;
+                break;
+            }
+            dup_fds[p] = fcntl(src_bo->fd[p], F_DUPFD_CLOEXEC, 0);
+            if (dup_fds[p] < 0) {
+                dup_ok = false;
+                break;
             }
         }
 
-        resp_hdr.opcode = WAYWAL_RESP_OK;
-        resp_hdr.payload_size = sizeof(resp_pay);
+        if (!dup_ok) {
+            for (uint32_t p = 0; p < resp_pay.num_planes; ++p) {
+                if (dup_fds[p] >= 0) {
+                    close(dup_fds[p]);
+                }
+            }
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            resp_hdr.payload_size = 0;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+            break;
+        }
 
-        bool sent = waywal_ipc_send_fds(client_fd, &resp_hdr, dup_fds, resp_pay.num_planes);
+        resp_hdr.opcode = WAYWAL_RESP_DMABUF;
+        resp_hdr.payload_size = sizeof(resp_pay);
+        (void)waywal_ipc_send_payload_fds(client_fd, &resp_hdr, &resp_pay, sizeof(resp_pay),
+                                          dup_fds, resp_pay.num_planes);
         for (uint32_t p = 0; p < resp_pay.num_planes; ++p) {
             if (dup_fds[p] >= 0) {
                 close(dup_fds[p]);
             }
-        }
-        if (sent) {
-            (void)write_exact(client_fd, &resp_pay, sizeof(resp_pay));
         }
         break;
     }
@@ -4875,14 +5268,25 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
     }
 
     case WAYWAL_REQ_SUBSCRIBE: {
-        if (req_hdr.payload_size > 0) {
-            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+        if (req_hdr.payload_size > 0 && !ipc_drain_bytes(client_fd, req_hdr.payload_size)) {
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+            keep_open = false;
+            break;
         }
-        char json_buf[16384];
-        size_t len = daemon_build_status_json(state, "initial", json_buf, sizeof(json_buf));
+        size_t len = 0;
+        char *json_buf = daemon_build_status_json_alloc(state, "initial", &len);
+        if (!json_buf || len == 0) {
+            free(json_buf);
+            resp_hdr.opcode = WAYWAL_RESP_ERR;
+            waywal_ipc_send(client_fd, &resp_hdr, -1);
+            break;
+        }
         resp_hdr.opcode = WAYWAL_RESP_OK;
         resp_hdr.payload_size = (uint32_t)len;
-        if (ipc_send_response_iov(client_fd, &resp_hdr, json_buf, len)) {
+        bool sent = ipc_send_response_iov(client_fd, &resp_hdr, json_buf, len);
+        free(json_buf);
+        if (sent) {
             int flags = fcntl(client_fd, F_GETFL, 0);
             if (flags >= 0) {
                 (void)fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
@@ -5177,8 +5581,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         break;
 
     default:
-        if (req_hdr.payload_size > 0) {
-            ipc_drain_bytes(client_fd, req_hdr.payload_size);
+        if (req_hdr.payload_size > 0 && !ipc_drain_bytes(client_fd, req_hdr.payload_size)) {
+            keep_open = false;
         }
         resp_hdr.opcode = WAYWAL_RESP_ERR;
         waywal_ipc_send(client_fd, &resp_hdr, -1);
@@ -5203,7 +5607,8 @@ bool daemon_ipc_dispatch_subscriber_fd(struct daemon_state *state, int fd)
     if (!daemon_is_subscriber_fd(state, fd)) {
         return false;
     }
-    while (daemon_is_subscriber_fd(state, fd) && !ipc_subscriber_is_paused(fd)) {
+    unsigned int budget = 32u;
+    while (budget-- > 0 && daemon_is_subscriber_fd(state, fd) && !ipc_subscriber_is_paused(fd)) {
         char b = 0;
         ssize_t r = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
         if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
@@ -5227,7 +5632,8 @@ void daemon_handle_ipc_connection(daemon_state_t *state)
         return;
 
     while (true) {
-        int client_fd = accept4(state->server_socket_fd, NULL, NULL, SOCK_CLOEXEC);
+        int client_fd =
+            accept4(state->server_socket_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;

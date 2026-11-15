@@ -2,16 +2,28 @@
 #ifndef WAYWAL_URING_LOOP_H
 #define WAYWAL_URING_LOOP_H
 
-#include <liburing.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)
+#define WWAL_URING_ALIGN16 alignas(16)
+#else
+#define WWAL_URING_ALIGN16 _Alignas(16)
+#endif
+
 #define WAYWAL_URING_QUEUE_DEPTH  128
 #define WAYWAL_URING_MAX_HANDLERS 128
+
+/* Opaque backing for struct io_uring so ISO C23 headers avoid pulling
+ * POSIX/GNU-only definitions (sigset_t, idtype_t) from <liburing.h>. */
+typedef struct {
+    WWAL_URING_ALIGN16 uint8_t opaque[320];
+} waywal_io_uring_storage_t;
 
 typedef enum {
     URING_EV_WAYLAND_READ = 1,
@@ -45,9 +57,14 @@ typedef struct {
 } uring_slot_t;
 
 typedef struct {
-    struct io_uring ring;
+    waywal_io_uring_storage_t ring;
     uring_slot_t slots[WAYWAL_URING_MAX_HANDLERS];
     size_t num_slots;
+    uint32_t queue_depth;
+    uint64_t owner_tid;
+    bool owner_bound;
+    bool single_issuer;
+    bool poll_first_send_supported;
     bool initialized;
     bool running;
     union {
@@ -77,6 +94,11 @@ void uring_loop_stop(uring_loop_t *loop);
 
 /* Explicitly flushes/submits any queued SQEs */
 int uring_loop_submit(waywal_uring_loop_t *loop);
+
+bool uring_loop_check_owner_thread(const uring_loop_t *loop);
+bool uring_loop_poll_first_send_supported(const uring_loop_t *loop);
+int uring_loop_submit_send_multishot(uring_loop_t *loop, int fd, const void *buf, size_t len,
+                                     int msg_flags, uint64_t tag);
 
 #ifdef __cplusplus
 }

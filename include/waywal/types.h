@@ -10,6 +10,12 @@
 extern "C" {
 #endif
 
+#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)
+#define WWAL_ENUM_U32 : uint32_t
+#else
+#define WWAL_ENUM_U32
+#endif
+
 typedef struct {
     int32_t x;
     int32_t y;
@@ -23,7 +29,10 @@ typedef struct {
 } rect_t;
 
 typedef union {
-    __extension__ struct {
+#ifdef __cplusplus
+    __extension__
+#endif
+    struct {
         uint8_t r;
         uint8_t g;
         uint8_t b;
@@ -32,7 +41,7 @@ typedef union {
     uint32_t u32;
 } color_rgba_t;
 
-typedef enum {
+typedef enum WWAL_ENUM_U32 {
     WAYWAL_FORMAT_INVALID = 0,
     WAYWAL_FORMAT_ARGB8888 = 1,
     WAYWAL_FORMAT_XRGB8888 = 2,
@@ -40,7 +49,7 @@ typedef enum {
     WAYWAL_FORMAT_ARGB2101010 = 4,
 } waywal_pixel_format_t;
 
-typedef enum {
+typedef enum WWAL_ENUM_U32 {
     WAYWAL_SCALING_FILL = 0,    /* Crop to fill / cover preserving aspect ratio (default) */
     WAYWAL_SCALING_FIT = 1,     /* Fit entire image with letterbox / pillarbox */
     WAYWAL_SCALING_STRETCH = 2, /* Stretch to exact destination dimensions */
@@ -51,7 +60,7 @@ typedef enum {
 
 #ifndef WAYWAL_SORT_MODE_DEFINED
 #define WAYWAL_SORT_MODE_DEFINED
-typedef enum {
+typedef enum WWAL_ENUM_U32 {
     WAYWAL_SORT_RANDOM = 0,
     WAYWAL_SORT_ASCENDING = 1,
     WAYWAL_SORT_DESCENDING = 2,
@@ -62,7 +71,7 @@ typedef waywal_sort_mode_t waywal_slideshow_sort_t;
 
 #ifndef WAYWAL_TRANSITION_TYPE_DEFINED
 #define WAYWAL_TRANSITION_TYPE_DEFINED
-typedef enum {
+typedef enum WWAL_ENUM_U32 {
     WAYWAL_TRANSITION_NONE = 0,
     WAYWAL_TRANSITION_SIMPLE = 1,
     WAYWAL_TRANSITION_FADE = 2,
