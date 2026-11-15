@@ -10369,12 +10369,11 @@ fail:
     return false;
 }
 
-bool daemon_dispatch_ipc_req_puppet_solve_weights(daemon_state_t *state,
-                                                  const waywal_ipc_puppet_solve_weights_t *req,
-                                                  const uint64_t *locked_bs,
-                                                  waywal_ipc_puppet_weights_resp_t *resp,
-                                                  waywal_ipc_vertex_weight_t **out_entries,
-                                                  uint32_t *out_entry_count)
+static bool daemon_dispatch_puppet_solve_weights_impl(
+    daemon_state_t *state, const waywal_ipc_puppet_solve_weights_t *req,
+    const uint64_t *locked_bs, const waywal_ipc_puppet_solve_weights_ext_t *ext,
+    waywal_ipc_puppet_weights_resp_t *resp, waywal_ipc_vertex_weight_t **out_entries,
+    uint32_t *out_entry_count)
 {
     if (!resp) {
         return false;
@@ -10452,6 +10451,9 @@ bool daemon_dispatch_ipc_req_puppet_solve_weights(daemon_state_t *state,
 
         we_heat_skin_cfg_t cfg;
         we_heat_skin_cfg_default(&cfg);
+        if (ext && isfinite(ext->conductivity_scale) && ext->conductivity_scale > 0.0f) {
+            cfg.conductivity_scale = ext->conductivity_scale;
+        }
         cfg.falloff_power = req->falloff_power;
         cfg.smooth_factor = req->smoothness;
         cfg.max_influences = req->max_influences;
@@ -10515,6 +10517,17 @@ fail:
     free(result_entries);
     resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
     return false;
+}
+
+bool daemon_dispatch_ipc_req_puppet_solve_weights(daemon_state_t *state,
+                                                  const waywal_ipc_puppet_solve_weights_t *req,
+                                                  const uint64_t *locked_bs,
+                                                  waywal_ipc_puppet_weights_resp_t *resp,
+                                                  waywal_ipc_vertex_weight_t **out_entries,
+                                                  uint32_t *out_entry_count)
+{
+    return daemon_dispatch_puppet_solve_weights_impl(state, req, locked_bs, NULL, resp, out_entries,
+                                                     out_entry_count);
 }
 
 bool daemon_dispatch_ipc_req_puppet_paint_weights(daemon_state_t *state,
@@ -10664,12 +10677,101 @@ bool daemon_dispatch_ipc_req_puppet_set_heatmap_mode(daemon_state_t *state,
     return true;
 }
 
-bool daemon_dispatch_ipc_req_puppet_preview_ik(daemon_state_t *state,
-                                               const waywal_ipc_puppet_preview_ik_t *req,
-                                               const waywal_ipc_bone_trs_t *overrides,
-                                               waywal_ipc_puppet_ik_pose_resp_t *resp,
-                                               waywal_ipc_bone_trs_t **out_bones,
-                                               uint32_t *out_bone_count)
+static float rig_clampf(float v, float lo, float hi)
+{
+    if (!isfinite(v)) {
+        return lo;
+    }
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static void rig_reset_preview_drive_modes(const we_puppet_t *puppet, rig_puppet_slot_t *slot)
+{
+    if (!puppet || !slot) {
+        return;
+    }
+    for (uint32_t b = 0u; b < puppet->bone_count && b < WE_MDL_MAX_BONES; ++b) {
+        slot->rig_ctx.bone_drive_modes[b] =
+            (puppet->bones[b].simulation_json[0] != '\0') ? WE_BONE_DRIVE_XPBD : WE_BONE_DRIVE_FK;
+    }
+}
+
+static void rig_build_two_bone_ik_chain(const waywal_ipc_puppet_preview_ik_t *req,
+                                        const waywal_ipc_puppet_preview_ik_ext_t *ext,
+                                        we_ik_chain_t *out_chain)
+{
+    memset(out_chain, 0, sizeof(*out_chain));
+    out_chain->root_bone = req->root_bone;
+    out_chain->mid_bone = req->mid_bone;
+    out_chain->end_bone = req->end_bone;
+    out_chain->bend_sign = req->pole_flip ? -1 : 1;
+    memcpy(out_chain->target_world, req->target_world, sizeof(out_chain->target_world));
+    out_chain->enabled = 1u;
+    out_chain->soft_zone_ratio = 0.05f;
+    out_chain->max_stretch_ratio = 1.0f;
+    out_chain->root_angle_min_rad = -3.14159265f;
+    out_chain->root_angle_max_rad = 3.14159265f;
+    out_chain->mid_angle_min_rad = -3.14159265f;
+    out_chain->mid_angle_max_rad = 3.14159265f;
+    out_chain->blend_weight = 1.0f;
+    if (!ext) {
+        return;
+    }
+    if ((ext->ext_flags & WAYWAL_IPC_IK_EXT_USE_POLE) != 0u) {
+        memcpy(out_chain->pole_world, ext->pole_world, sizeof(out_chain->pole_world));
+    }
+    out_chain->soft_zone_ratio = (ext->ext_flags & WAYWAL_IPC_IK_EXT_SOFT_IK) != 0u
+                                     ? rig_clampf(ext->soft_zone_ratio, 0.0f, 0.25f)
+                                     : 0.0f;
+    out_chain->max_stretch_ratio = (ext->ext_flags & WAYWAL_IPC_IK_EXT_ALLOW_STRETCH) != 0u
+                                       ? rig_clampf(ext->max_stretch_ratio, 1.0f, 1.5f)
+                                       : 1.0f;
+    if ((ext->ext_flags & WAYWAL_IPC_IK_EXT_LIMIT_ANGLES) != 0u) {
+        /* Bit 1 opts into strict [0, 0] angle locking inside we_ik_solve_two_bone. */
+        out_chain->enabled = 0x3u;
+        if (isfinite(ext->root_angle_min_rad) && isfinite(ext->root_angle_max_rad) &&
+            ext->root_angle_min_rad <= ext->root_angle_max_rad) {
+            out_chain->root_angle_min_rad = ext->root_angle_min_rad;
+            out_chain->root_angle_max_rad = ext->root_angle_max_rad;
+        }
+        if (isfinite(ext->mid_angle_min_rad) && isfinite(ext->mid_angle_max_rad) &&
+            ext->mid_angle_min_rad <= ext->mid_angle_max_rad) {
+            out_chain->mid_angle_min_rad = ext->mid_angle_min_rad;
+            out_chain->mid_angle_max_rad = ext->mid_angle_max_rad;
+        }
+    }
+    out_chain->blend_weight = rig_clampf(ext->ik_blend_weight, 0.0f, 1.0f);
+}
+
+static void rig_build_aim_constraint(const waywal_ipc_puppet_preview_ik_t *req,
+                                     const waywal_ipc_puppet_preview_ik_ext_t *ext,
+                                     we_aim_constraint_t *out_aim)
+{
+    memset(out_aim, 0, sizeof(*out_aim));
+    out_aim->bone_index = req->root_bone;
+    out_aim->enabled = 1u;
+    out_aim->aim_axis_local[0] = 1.0f;
+    memcpy(out_aim->target_world, req->target_world, sizeof(out_aim->target_world));
+    out_aim->max_cone_rad = 3.14159265f;
+    out_aim->blend_weight = 1.0f;
+    if (!ext) {
+        return;
+    }
+    float ax_sq = ext->aim_axis_local[0] * ext->aim_axis_local[0] +
+                  ext->aim_axis_local[1] * ext->aim_axis_local[1] +
+                  ext->aim_axis_local[2] * ext->aim_axis_local[2];
+    if (isfinite(ax_sq) && ax_sq > 1e-10f) {
+        memcpy(out_aim->aim_axis_local, ext->aim_axis_local, sizeof(out_aim->aim_axis_local));
+    }
+    out_aim->max_cone_rad = rig_clampf(ext->aim_max_cone_rad, 0.0f, 3.141593f);
+    out_aim->blend_weight = rig_clampf(ext->aim_blend_weight, 0.0f, 1.0f);
+}
+
+static bool daemon_dispatch_puppet_preview_ik_impl(
+    daemon_state_t *state, const waywal_ipc_puppet_preview_ik_t *req,
+    const waywal_ipc_bone_trs_t *overrides, const waywal_ipc_puppet_preview_ik_ext_t *ext,
+    waywal_ipc_puppet_ik_pose_resp_t *resp, waywal_ipc_bone_trs_t **out_bones,
+    uint32_t *out_bone_count)
 {
     if (!resp) {
         return false;
@@ -10743,11 +10845,7 @@ bool daemon_dispatch_ipc_req_puppet_preview_ik(daemon_state_t *state,
             if (slot) {
                 slot->rig_ctx.ik_chain_count = 0u;
                 slot->rig_ctx.aim_count = 0u;
-                for (uint32_t b = 0u; b < puppet->bone_count && b < WE_MDL_MAX_BONES; ++b) {
-                    slot->rig_ctx.bone_drive_modes[b] =
-                        (puppet->bones[b].simulation_json[0] != '\0') ? WE_BONE_DRIVE_XPBD
-                                                                      : WE_BONE_DRIVE_FK;
-                }
+                rig_reset_preview_drive_modes(puppet, slot);
                 slot->preview_active = false;
             }
         } else {
@@ -10762,46 +10860,41 @@ bool daemon_dispatch_ipc_req_puppet_preview_ik(daemon_state_t *state,
                 if (req->root_bone != 0xFFFFu && req->mid_bone != 0xFFFFu &&
                     req->end_bone != 0xFFFFu) {
                     we_ik_chain_t chain;
-                    memset(&chain, 0, sizeof(chain));
-                    chain.root_bone = req->root_bone;
-                    chain.mid_bone = req->mid_bone;
-                    chain.end_bone = req->end_bone;
-                    chain.bend_sign = req->pole_flip ? -1 : 1;
-                    chain.enabled = 1u;
-                    memcpy(chain.target_world, req->target_world, sizeof(chain.target_world));
-                    memcpy(chain.pole_world, req->target_world, sizeof(chain.pole_world));
-                    chain.soft_zone_ratio = 0.05f;
-                    chain.max_stretch_ratio = 1.0f;
-                    chain.root_angle_min_rad = -3.14159265f;
-                    chain.root_angle_max_rad = 3.14159265f;
-                    chain.mid_angle_min_rad = -3.14159265f;
-                    chain.mid_angle_max_rad = 3.14159265f;
-                    chain.blend_weight = 1.0f;
-                    (void)we_ik_solve_two_bone(puppet, &chain, anim_local);
+                    rig_build_two_bone_ik_chain(req, ext, &chain);
                     if (slot) {
+                        rig_reset_preview_drive_modes(puppet, slot);
                         slot->rig_ctx.ik_chains[0] = chain;
                         slot->rig_ctx.ik_chain_count = 1u;
                         slot->rig_ctx.aim_count = 0u;
                         slot->rig_ctx.bone_drive_modes[chain.root_bone] = WE_BONE_DRIVE_IK;
                         slot->rig_ctx.bone_drive_modes[chain.mid_bone] = WE_BONE_DRIVE_IK;
                         slot->preview_active = true;
+                    } else {
+                        (void)we_ik_solve_two_bone(puppet, &chain, anim_local);
                     }
                 } else if (req->root_bone != 0xFFFFu && req->mid_bone == 0xFFFFu) {
-                    we_aim_constraint_t aim;
-                    memset(&aim, 0, sizeof(aim));
-                    aim.bone_index = req->root_bone;
-                    aim.enabled = 1u;
-                    aim.aim_axis_local[0] = 1.0f;
-                    memcpy(aim.target_world, req->target_world, sizeof(aim.target_world));
-                    aim.max_cone_rad = 3.14159265f;
-                    aim.blend_weight = 1.0f;
-                    (void)we_ik_solve_aim(puppet, &aim, anim_local);
-                    if (slot) {
-                        slot->rig_ctx.aim_constraints[0] = aim;
-                        slot->rig_ctx.aim_count = 1u;
-                        slot->rig_ctx.ik_chain_count = 0u;
-                        slot->rig_ctx.bone_drive_modes[aim.bone_index] = WE_BONE_DRIVE_AIM;
-                        slot->preview_active = true;
+                    bool aim_enabled =
+                        !ext || (ext->ext_flags & WAYWAL_IPC_IK_EXT_AIM_ENABLED) != 0u;
+                    if (!aim_enabled) {
+                        if (slot) {
+                            slot->rig_ctx.aim_count = 0u;
+                            slot->rig_ctx.ik_chain_count = 0u;
+                            rig_reset_preview_drive_modes(puppet, slot);
+                            slot->preview_active = false;
+                        }
+                    } else {
+                        we_aim_constraint_t aim;
+                        rig_build_aim_constraint(req, ext, &aim);
+                        if (slot) {
+                            rig_reset_preview_drive_modes(puppet, slot);
+                            slot->rig_ctx.aim_constraints[0] = aim;
+                            slot->rig_ctx.aim_count = 1u;
+                            slot->rig_ctx.ik_chain_count = 0u;
+                            slot->rig_ctx.bone_drive_modes[aim.bone_index] = WE_BONE_DRIVE_AIM;
+                            slot->preview_active = true;
+                        } else {
+                            (void)we_ik_solve_aim(puppet, &aim, anim_local);
+                        }
                     }
                 }
             }
@@ -10850,6 +10943,17 @@ bool daemon_dispatch_ipc_req_puppet_preview_ik(daemon_state_t *state,
         *out_bone_count = pose_count;
     }
     return true;
+}
+
+bool daemon_dispatch_ipc_req_puppet_preview_ik(daemon_state_t *state,
+                                               const waywal_ipc_puppet_preview_ik_t *req,
+                                               const waywal_ipc_bone_trs_t *overrides,
+                                               waywal_ipc_puppet_ik_pose_resp_t *resp,
+                                               waywal_ipc_bone_trs_t **out_bones,
+                                               uint32_t *out_bone_count)
+{
+    return daemon_dispatch_puppet_preview_ik_impl(state, req, overrides, NULL, resp, out_bones,
+                                                  out_bone_count);
 }
 
 static bool rig_decode_anim_clips(const waywal_ipc_puppet_set_anim_tracks_t *req,
@@ -11372,7 +11476,8 @@ static bool rig_ipc_handle_solve_weights(daemon_state_t *state, int client_fd,
     }
     const waywal_ipc_puppet_solve_weights_t *req = NULL;
     const uint64_t *locked_bs = NULL;
-    if (!waywal_ipc_validate_req_puppet_solve_weights(pkt, pkt_len, &req, &locked_bs)) {
+    const waywal_ipc_puppet_solve_weights_ext_t *ext = NULL;
+    if (!waywal_ipc_validate_req_puppet_solve_weights_ext(pkt, pkt_len, &req, &locked_bs, &ext)) {
         free(pkt);
         size_t err_len = 0u;
         waywal_ipc_serialize_resp_puppet_weights((int32_t)WAYWAL_STATUS_ERR_SYNTAX, 0u, NULL, 0u,
@@ -11382,8 +11487,8 @@ static bool rig_ipc_handle_solve_weights(daemon_state_t *state, int client_fd,
     waywal_ipc_puppet_weights_resp_t resp;
     waywal_ipc_vertex_weight_t *entries = NULL;
     uint32_t entry_count = 0u;
-    (void)daemon_dispatch_ipc_req_puppet_solve_weights(state, req, locked_bs, &resp, &entries,
-                                                       &entry_count);
+    (void)daemon_dispatch_puppet_solve_weights_impl(state, req, locked_bs, ext, &resp, &entries,
+                                                    &entry_count);
     free(pkt);
 
     size_t out_cap = sizeof(waywal_ipc_puppet_weights_resp_t) +
@@ -11472,7 +11577,8 @@ static bool rig_ipc_handle_preview_ik(daemon_state_t *state, int client_fd,
     }
     const waywal_ipc_puppet_preview_ik_t *req = NULL;
     const waywal_ipc_bone_trs_t *overrides = NULL;
-    if (!waywal_ipc_validate_req_puppet_preview_ik(pkt, pkt_len, &req, &overrides)) {
+    const waywal_ipc_puppet_preview_ik_ext_t *ext = NULL;
+    if (!waywal_ipc_validate_req_puppet_preview_ik_ext(pkt, pkt_len, &req, &overrides, &ext)) {
         free(pkt);
         size_t err_len = 0u;
         waywal_ipc_serialize_resp_puppet_ik_pose((int32_t)WAYWAL_STATUS_ERR_SYNTAX, 0u, NULL, 0u,
@@ -11482,8 +11588,8 @@ static bool rig_ipc_handle_preview_ik(daemon_state_t *state, int client_fd,
     waywal_ipc_puppet_ik_pose_resp_t resp;
     waywal_ipc_bone_trs_t *bones = NULL;
     uint32_t bone_count = 0u;
-    (void)daemon_dispatch_ipc_req_puppet_preview_ik(state, req, overrides, &resp, &bones,
-                                                    &bone_count);
+    (void)daemon_dispatch_puppet_preview_ik_impl(state, req, overrides, ext, &resp, &bones,
+                                                 &bone_count);
     free(pkt);
 
     size_t out_cap = sizeof(waywal_ipc_puppet_ik_pose_resp_t) +

@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include "waywal/ipc_proto_authoring.h"
 #include "waywal/ipc_proto_rigging.h"
 #include "waywal/ipc_proto.h"
 
@@ -6,14 +10,19 @@
 #undef NDEBUG
 #endif
 #include <assert.h>
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -440,6 +449,146 @@ static void test_ik_anim_scrub_export_wire(void)
                                                         sizeof(buf), &total));
 }
 
+static void test_rigging_ext_wire(void)
+{
+    uint8_t buf[1024];
+    waywal_ipc_hdr_t hdr;
+    size_t total = 0u;
+
+    /* SOLVE_WEIGHTS_EXT: legacy path returns *out_ext == NULL */
+    waywal_ipc_puppet_solve_weights_t sw = {.object_id = 7u,
+                                            .falloff_power = 2.0f,
+                                            .smoothness = 0.25f,
+                                            .max_influences = 4u,
+                                            .flags = 0x1u | WAYWAL_IPC_SOLVE_WEIGHTS_FLAG_EXT,
+                                            .locked_vert_word_count = 0u};
+    const waywal_ipc_puppet_solve_weights_t *out_sw = NULL;
+    const uint64_t *out_bs = NULL;
+    const waywal_ipc_puppet_solve_weights_ext_t *out_sw_ext = NULL;
+    assert(waywal_ipc_serialize_req_puppet_solve_weights_ext(&sw, NULL, NULL, &hdr, buf,
+                                                             sizeof(buf), &total));
+    assert(total == sizeof(waywal_ipc_puppet_solve_weights_t));
+    assert(waywal_ipc_validate_req_puppet_solve_weights_ext(buf, total, &out_sw, &out_bs,
+                                                            &out_sw_ext));
+    assert((out_sw->flags & WAYWAL_IPC_SOLVE_WEIGHTS_FLAG_EXT) == 0u);
+    assert(out_sw_ext == NULL);
+
+    /* SOLVE_WEIGHTS_EXT: _ext block + locked bitmap round-trip */
+    sw.flags = 0x2u | 0x4u;
+    sw.locked_vert_word_count = 1u;
+    uint64_t locked_mask = 0x55AAu;
+    waywal_ipc_puppet_solve_weights_ext_t sw_ext = {.conductivity_scale = 3.25f};
+    assert(waywal_ipc_serialize_req_puppet_solve_weights_ext(&sw, &locked_mask, &sw_ext, &hdr, buf,
+                                                             sizeof(buf), &total));
+    assert(total == sizeof(waywal_ipc_puppet_solve_weights_t) + sizeof(uint64_t) +
+                        sizeof(waywal_ipc_puppet_solve_weights_ext_t));
+    assert(!waywal_ipc_validate_req_puppet_solve_weights(buf, total, &out_sw, &out_bs));
+    assert(waywal_ipc_validate_req_puppet_solve_weights_ext(buf, total, &out_sw, &out_bs,
+                                                            &out_sw_ext));
+    assert((out_sw->flags & WAYWAL_IPC_SOLVE_WEIGHTS_FLAG_EXT) != 0u);
+    assert(out_bs && out_bs[0] == 0x55AAu);
+    assert(out_sw_ext != NULL && fabsf(out_sw_ext->conductivity_scale - 3.25f) < 1e-6f);
+
+    /* Reject truncated _ext, bad flag pairing, and out-of-range conductivity */
+    assert(!waywal_ipc_validate_req_puppet_solve_weights_ext(buf, total - 1u, &out_sw, &out_bs,
+                                                             &out_sw_ext));
+    buf[total] = 0u;
+    assert(!waywal_ipc_validate_req_puppet_solve_weights_ext(buf, total + 1u, &out_sw, &out_bs,
+                                                             &out_sw_ext));
+    sw_ext.conductivity_scale = -0.1f;
+    assert(!waywal_ipc_serialize_req_puppet_solve_weights_ext(&sw, &locked_mask, &sw_ext, &hdr, buf,
+                                                              sizeof(buf), &total));
+    sw_ext.conductivity_scale = 101.0f;
+    assert(!waywal_ipc_serialize_req_puppet_solve_weights_ext(&sw, &locked_mask, &sw_ext, &hdr, buf,
+                                                              sizeof(buf), &total));
+    sw_ext.conductivity_scale = NAN;
+    assert(!waywal_ipc_serialize_req_puppet_solve_weights_ext(&sw, &locked_mask, &sw_ext, &hdr, buf,
+                                                              sizeof(buf), &total));
+
+    /* PREVIEW_IK_EXT: legacy path returns *out_ext == NULL */
+    waywal_ipc_puppet_preview_ik_t ik = {.object_id = 5u,
+                                         .root_bone = 1u,
+                                         .mid_bone = 2u,
+                                         .end_bone = 3u,
+                                         .pole_flip = 0u,
+                                         .target_world = {20.0f, 10.0f, 0.0f},
+                                         .override_count = 1u,
+                                         .mode_flags =
+                                             WAYWAL_IPC_IK_FLAG_ENABLE |
+                                             WAYWAL_IPC_IK_FLAG_HAS_POLE_EXT};
+    waywal_ipc_bone_trs_t trs = {.bone_index = 0u,
+                                 .local_pos = {0.0f, 0.0f, 0.0f},
+                                 .local_angle = {0.0f, 0.0f, 0.2f},
+                                 .local_scale = {1.0f, 1.0f, 1.0f}};
+    const waywal_ipc_puppet_preview_ik_t *out_ik = NULL;
+    const waywal_ipc_bone_trs_t *out_ov = NULL;
+    const waywal_ipc_puppet_preview_ik_ext_t *out_ik_ext = NULL;
+    assert(
+        waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik, &trs, NULL, &hdr, buf, sizeof(buf),
+                                                       &total));
+    assert(total == sizeof(ik) + sizeof(trs));
+    assert(waywal_ipc_validate_req_puppet_preview_ik_ext(buf, total, &out_ik, &out_ov, &out_ik_ext));
+    assert((out_ik->mode_flags & WAYWAL_IPC_IK_FLAG_HAS_POLE_EXT) == 0u);
+    assert(out_ik_ext == NULL);
+
+    /* PREVIEW_IK_EXT: full _ext block round-trip + rejection checks */
+    waywal_ipc_puppet_preview_ik_ext_t ik_ext = {
+        .pole_world = {-12.0f, 34.0f, 5.0f},
+        .soft_zone_ratio = 0.20f,
+        .max_stretch_ratio = 1.40f,
+        .root_angle_min_rad = -0.6f,
+        .root_angle_max_rad = 0.8f,
+        .mid_angle_min_rad = -1.2f,
+        .mid_angle_max_rad = 0.3f,
+        .aim_axis_local = {0.0f, 1.0f, 0.0f},
+        .aim_max_cone_rad = 0.5f,
+        .aim_blend_weight = 0.75f,
+        .ik_blend_weight = 0.85f,
+        .ext_flags = WAYWAL_IPC_IK_EXT_USE_POLE | WAYWAL_IPC_IK_EXT_SOFT_IK |
+                     WAYWAL_IPC_IK_EXT_ALLOW_STRETCH | WAYWAL_IPC_IK_EXT_LIMIT_ANGLES |
+                     WAYWAL_IPC_IK_EXT_AIM_ENABLED,
+    };
+    ik.mode_flags = WAYWAL_IPC_IK_FLAG_ENABLE;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik, &trs, &ik_ext, &hdr, buf,
+                                                          sizeof(buf), &total));
+    assert(total == sizeof(ik) + sizeof(trs) + sizeof(ik_ext));
+    assert(!waywal_ipc_validate_req_puppet_preview_ik(buf, total, &out_ik, &out_ov));
+    assert(waywal_ipc_validate_req_puppet_preview_ik_ext(buf, total, &out_ik, &out_ov, &out_ik_ext));
+    assert((out_ik->mode_flags & WAYWAL_IPC_IK_FLAG_HAS_POLE_EXT) != 0u);
+    assert(out_ik_ext != NULL);
+    assert(fabsf(out_ik_ext->pole_world[0] - (-12.0f)) < 1e-6f);
+    assert(fabsf(out_ik_ext->pole_world[1] - 34.0f) < 1e-6f);
+    assert(fabsf(out_ik_ext->soft_zone_ratio - 0.20f) < 1e-6f);
+    assert(fabsf(out_ik_ext->max_stretch_ratio - 1.40f) < 1e-6f);
+    assert(fabsf(out_ik_ext->root_angle_min_rad - (-0.6f)) < 1e-6f);
+    assert(fabsf(out_ik_ext->mid_angle_max_rad - 0.3f) < 1e-6f);
+    assert(fabsf(out_ik_ext->aim_axis_local[1] - 1.0f) < 1e-6f);
+    assert(fabsf(out_ik_ext->aim_max_cone_rad - 0.5f) < 1e-6f);
+    assert(fabsf(out_ik_ext->aim_blend_weight - 0.75f) < 1e-6f);
+    assert(fabsf(out_ik_ext->ik_blend_weight - 0.85f) < 1e-6f);
+    assert(out_ik_ext->ext_flags == ik_ext.ext_flags);
+
+    assert(!waywal_ipc_validate_req_puppet_preview_ik_ext(buf, total - 4u, &out_ik, &out_ov,
+                                                          &out_ik_ext));
+    waywal_ipc_puppet_preview_ik_ext_t bad_ext = ik_ext;
+    bad_ext.ext_flags = 0x20u;
+    assert(!waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik, &trs, &bad_ext, &hdr, buf,
+                                                           sizeof(buf), &total));
+    bad_ext = ik_ext;
+    bad_ext.root_angle_min_rad = 1.0f;
+    bad_ext.root_angle_max_rad = -1.0f;
+    assert(!waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik, &trs, &bad_ext, &hdr, buf,
+                                                           sizeof(buf), &total));
+    bad_ext = ik_ext;
+    bad_ext.max_stretch_ratio = 0.5f;
+    assert(!waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik, &trs, &bad_ext, &hdr, buf,
+                                                           sizeof(buf), &total));
+    bad_ext = ik_ext;
+    bad_ext.aim_max_cone_rad = 3.5f;
+    assert(!waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik, &trs, &bad_ext, &hdr, buf,
+                                                           sizeof(buf), &total));
+}
+
 static bool wire_read_exact(int fd, void *buf, size_t len)
 {
     uint8_t *p = (uint8_t *)buf;
@@ -512,7 +661,7 @@ static void run_mock_rig_server(int fd)
 {
     uint8_t req_buf[8192];
     uint8_t resp_buf[8192];
-    for (int step = 0; step < 9; ++step) {
+    for (int step = 0; step < 11; ++step) {
         waywal_ipc_hdr_t hdr;
         if (!wire_recv_packet(fd, &hdr, req_buf, sizeof(req_buf))) {
             _exit(2);
@@ -545,12 +694,15 @@ static void run_mock_rig_server(int fd)
         case WAYWAL_REQ_PUPPET_SOLVE_WEIGHTS: {
             const waywal_ipc_puppet_solve_weights_t *r = NULL;
             const uint64_t *bs = NULL;
-            ok = waywal_ipc_validate_req_puppet_solve_weights(req_buf, hdr.payload_size, &r, &bs);
+            const waywal_ipc_puppet_solve_weights_ext_t *ext = NULL;
+            ok = waywal_ipc_validate_req_puppet_solve_weights_ext(req_buf, hdr.payload_size, &r,
+                                                                 &bs, &ext);
             if (ok) {
+                float w0 = (ext && ext->conductivity_scale > 1.5f) ? 0.25f : 1.0f;
                 waywal_ipc_vertex_weight_t ent = {
                     .vertex_index = 0u,
-                    .blend_indices = {0u, 0u, 0u, 0u},
-                    .weight = {1.0f, 0.0f, 0.0f, 0.0f},
+                    .blend_indices = {0u, 1u, 0u, 0u},
+                    .weight = {w0, 1.0f - w0, 0.0f, 0.0f},
                 };
                 ok = waywal_ipc_serialize_resp_puppet_weights(0, r->object_id, &ent, 1u, &rh,
                                                               resp_buf, sizeof(resp_buf), &rlen);
@@ -571,9 +723,14 @@ static void run_mock_rig_server(int fd)
         case WAYWAL_REQ_PUPPET_PREVIEW_IK: {
             const waywal_ipc_puppet_preview_ik_t *r = NULL;
             const waywal_ipc_bone_trs_t *ov = NULL;
-            ok = waywal_ipc_validate_req_puppet_preview_ik(req_buf, hdr.payload_size, &r, &ov);
+            const waywal_ipc_puppet_preview_ik_ext_t *ext = NULL;
+            ok = waywal_ipc_validate_req_puppet_preview_ik_ext(req_buf, hdr.payload_size, &r, &ov,
+                                                             &ext);
             if (ok) {
                 waywal_ipc_bone_trs_t pose = {.bone_index = 0u, .local_scale = {1.0f, 1.0f, 1.0f}};
+                if (ext && (ext->ext_flags & WAYWAL_IPC_IK_EXT_USE_POLE) != 0u) {
+                    memcpy(pose.local_pos, ext->pole_world, sizeof(pose.local_pos));
+                }
                 ok = waywal_ipc_serialize_resp_puppet_ik_pose(0, r->object_id, &pose, 1u, &rh,
                                                               resp_buf, sizeof(resp_buf), &rlen);
             }
@@ -676,7 +833,7 @@ static void test_unix_socketpair_rigging_roundtrip(void)
     assert(wire_recv_packet(cfd, &rhdr, rx, sizeof(rx)));
     assert(rhdr.opcode == WAYWAL_RESP_OK);
 
-    /* 0x002D SOLVE_WEIGHTS -> 0x801B */
+    /* 0x002D SOLVE_WEIGHTS (legacy) -> 0x801B */
     waywal_ipc_puppet_solve_weights_t sw = {.object_id = 7u,
                                             .falloff_power = 2.0f,
                                             .smoothness = 0.25f,
@@ -690,6 +847,18 @@ static void test_unix_socketpair_rigging_roundtrip(void)
     const waywal_ipc_vertex_weight_t *we = NULL;
     assert(waywal_ipc_validate_resp_puppet_weights(rx, rhdr.payload_size, &wr, &we));
     assert(wr->object_id == 7u && wr->entry_count == 1u);
+    assert(fabsf(we[0].weight[0] - 1.0f) < 1e-6f);
+
+    /* 0x002D SOLVE_WEIGHTS (_ext) -> 0x801B */
+    waywal_ipc_puppet_solve_weights_ext_t sw_ext = {.conductivity_scale = 2.0f};
+    assert(waywal_ipc_serialize_req_puppet_solve_weights_ext(&sw, NULL, &sw_ext, &hdr, tx,
+                                                             sizeof(tx), &total));
+    assert(wire_send_packet(cfd, &hdr, tx, total));
+    assert(wire_recv_packet(cfd, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_PUPPET_WEIGHTS);
+    assert(waywal_ipc_validate_resp_puppet_weights(rx, rhdr.payload_size, &wr, &we));
+    assert(wr->object_id == 7u && wr->entry_count == 1u);
+    assert(fabsf(we[0].weight[0] - 0.25f) < 1e-6f);
 
     /* 0x002E PAINT_WEIGHTS -> RESP_OK */
     waywal_ipc_vertex_weight_t paint = {
@@ -709,7 +878,7 @@ static void test_unix_socketpair_rigging_roundtrip(void)
     assert(wire_recv_packet(cfd, &rhdr, rx, sizeof(rx)));
     assert(rhdr.opcode == WAYWAL_RESP_OK);
 
-    /* 0x0030 PREVIEW_IK -> 0x801C */
+    /* 0x0030 PREVIEW_IK (legacy) -> 0x801C */
     waywal_ipc_puppet_preview_ik_t ik = {.object_id = 7u,
                                          .root_bone = 0u,
                                          .mid_bone = 0xFFFFu,
@@ -723,6 +892,25 @@ static void test_unix_socketpair_rigging_roundtrip(void)
     const waywal_ipc_bone_trs_t *ikb = NULL;
     assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
     assert(ikr->object_id == 7u && ikr->bone_count == 1u);
+
+    /* 0x0030 PREVIEW_IK (_ext) -> 0x801C */
+    waywal_ipc_puppet_preview_ik_ext_t ik_ext = {
+        .pole_world = {-10.0f, 25.0f, 0.0f},
+        .soft_zone_ratio = 0.1f,
+        .max_stretch_ratio = 1.2f,
+        .ik_blend_weight = 1.0f,
+        .ext_flags = WAYWAL_IPC_IK_EXT_USE_POLE | WAYWAL_IPC_IK_EXT_SOFT_IK |
+                     WAYWAL_IPC_IK_EXT_ALLOW_STRETCH,
+    };
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik, NULL, &ik_ext, &hdr, tx, sizeof(tx),
+                                                          &total));
+    assert(wire_send_packet(cfd, &hdr, tx, total));
+    assert(wire_recv_packet(cfd, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_PUPPET_IK_POSE);
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->object_id == 7u && ikr->bone_count == 1u);
+    assert(fabsf(ikb[0].local_pos[0] - (-10.0f)) < 1e-6f);
+    assert(fabsf(ikb[0].local_pos[1] - 25.0f) < 1e-6f);
 
     /* 0x0031 SET_ANIM_TRACKS -> RESP_OK */
     assert(waywal_ipc_serialize_req_puppet_set_anim_tracks(7u, 0u, 1u, NULL, 0u, &hdr, tx,
@@ -951,6 +1139,509 @@ static void test_scrub_time_error_parity_no_desync(void)
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static void rig_remove_tree(const char *path)
+{
+    DIR *dir = opendir(path);
+    if (!dir) {
+        (void)unlink(path);
+        return;
+    }
+    struct dirent *ent;
+    char child[4096];
+    while ((ent = readdir(dir)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        int n = snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+        if (n > 0 && (size_t)n < sizeof(child)) {
+            struct stat st;
+            if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+                rig_remove_tree(child);
+            } else {
+                (void)unlink(child);
+            }
+        }
+    }
+    closedir(dir);
+    (void)rmdir(path);
+}
+
+static int rig_try_connect_unix(const char *sock_path)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (strlen(sock_path) >= sizeof(addr.sun_path)) {
+        close(fd);
+        return -1;
+    }
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
+    if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool rig_daemon_roundtrip(const char *sock_path, const waywal_ipc_hdr_t *hdr,
+                                 const void *payload, size_t payload_len,
+                                 waywal_ipc_hdr_t *out_rhdr, uint8_t *out_rx, size_t rx_cap)
+{
+    int fd = rig_try_connect_unix(sock_path);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = wire_send_packet(fd, hdr, payload, payload_len) &&
+              wire_recv_packet(fd, out_rhdr, out_rx, rx_cap);
+    close(fd);
+    return ok;
+}
+
+static waywal_ipc_puppet_preview_ik_ext_t rig_default_ik_ext(void)
+{
+    waywal_ipc_puppet_preview_ik_ext_t ext;
+    memset(&ext, 0, sizeof(ext));
+    /* Wire validator rejects stretch ratios outside [1.0, 4.0]. */
+    ext.max_stretch_ratio = 1.0f;
+    return ext;
+}
+
+static void rig_fill_bone(waywal_ipc_mdl_bone_t *b, const char *name, uint32_t parent, float tx,
+                          float ty)
+{
+    memset(b, 0, sizeof(*b));
+    snprintf(b->name, sizeof(b->name), "%s", name);
+    b->parent = parent;
+    fill_identity_mat4(b->local_trans);
+    b->local_trans[12] = tx;
+    b->local_trans[13] = ty;
+}
+
+static void test_live_daemon_rigging_ext_dispatch(void)
+{
+    if (getenv("WAYLAND_DISPLAY") == NULL) {
+        printf("[TEST] Notice: Headless environment without WAYLAND_DISPLAY. Skipping live daemon "
+               "rigging dispatch test.\n");
+        return;
+    }
+    const char *candidates[] = {"./wwald",
+                                "build_worker/wwald",
+                                "build/wwald",
+                                "build/src/daemon/wwald",
+                                "../build/wwald",
+                                NULL};
+    const char *daemon_bin = NULL;
+    for (int i = 0; candidates[i]; ++i) {
+        if (access(candidates[i], X_OK) == 0) {
+            daemon_bin = candidates[i];
+            break;
+        }
+    }
+    if (!daemon_bin) {
+        printf("[TEST] Notice: wwald binary not found. Skipping live daemon rigging dispatch "
+               "test.\n");
+        return;
+    }
+
+    char tmp_template[] = "/tmp/wwal_rig_wire_XXXXXX";
+    char *tmp_root = mkdtemp(tmp_template);
+    assert(tmp_root != NULL);
+
+    char cache_dir[4096], state_dir[4096], proj_path[4096], scene_path[4096];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmp_root);
+    snprintf(state_dir, sizeof(state_dir), "%s/state", tmp_root);
+    snprintf(proj_path, sizeof(proj_path), "%s/project.json", tmp_root);
+    snprintf(scene_path, sizeof(scene_path), "%s/scene.json", tmp_root);
+    assert(mkdir(cache_dir, 0755) == 0);
+    assert(mkdir(state_dir, 0755) == 0);
+
+    FILE *fp = fopen(proj_path, "wb");
+    assert(fp != NULL);
+    fputs("{\"title\":\"RigWireTest\",\"type\":\"scene\",\"file\":\"scene.json\"}\n", fp);
+    fclose(fp);
+    fp = fopen(scene_path, "wb");
+    assert(fp != NULL);
+    fputs("{\"general\":{\"orthogonalprojection\":{\"width\":128,\"height\":128}},"
+          "\"objects\":[]}\n",
+          fp);
+    fclose(fp);
+
+    char ns[64];
+    snprintf(ns, sizeof(ns), "rigwire_%d", (int)getpid());
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (!runtime_dir) {
+        runtime_dir = "/tmp";
+    }
+    const char *wl_disp = getenv("WAYLAND_DISPLAY");
+    char sock_path[1024];
+    snprintf(sock_path, sizeof(sock_path), "%s/%s-wwald.%s.sock", runtime_dir, wl_disp, ns);
+    (void)unlink(sock_path);
+
+    pid_t parent_pid = getpid();
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        (void)prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (getppid() != parent_pid) {
+            _exit(0);
+        }
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDOUT_FILENO);
+            (void)dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) {
+                close(devnull);
+            }
+        }
+        setenv("WWAL_WORKSHOP_DIR", tmp_root, 1);
+        setenv("WWAL_CACHE_DIR", cache_dir, 1);
+        setenv("WWAL_STATE_DIR", state_dir, 1);
+        setenv("XDG_CACHE_HOME", cache_dir, 1);
+        setenv("XDG_STATE_HOME", state_dir, 1);
+        execl(daemon_bin, daemon_bin, "--namespace", ns, "-q", (char *)NULL);
+        _exit(127);
+    }
+
+    bool sock_ready = false;
+    for (int i = 0; i < 60; ++i) {
+        usleep(50000);
+        int s = rig_try_connect_unix(sock_path);
+        if (s >= 0) {
+            close(s);
+            sock_ready = true;
+            break;
+        }
+        int status = 0;
+        if (waitpid(pid, &status, WNOHANG) > 0) {
+            break;
+        }
+    }
+    if (!sock_ready) {
+        kill(pid, SIGTERM);
+        int status = 0;
+        (void)waitpid(pid, &status, 0);
+        rig_remove_tree(tmp_root);
+        assert(false && "Failed to start wwald daemon for live rigging dispatch test");
+    }
+
+    uint8_t tx[16384];
+    uint8_t rx[16384];
+    waywal_ipc_hdr_t hdr, rhdr;
+    size_t total = 0u;
+
+    /* 1. Load minimal scene workspace so outputs hold an active we_scene_t */
+    waywal_workshop_payload_t wpay;
+    memset(&wpay, 0, sizeof(wpay));
+    snprintf(wpay.output, sizeof(wpay.output), "*");
+    snprintf(wpay.workshop_dir, sizeof(wpay.workshop_dir), "%s", tmp_root);
+    wpay.fps = 30u;
+    wpay.no_cache = 1u;
+    wpay.no_theme = 1u;
+    wpay.volume = -1.0f;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = WAYWAL_IPC_MAGIC;
+    hdr.version = WAYWAL_IPC_VERSION;
+    hdr.opcode = WAYWAL_REQ_WORKSHOP;
+    hdr.payload_size = sizeof(wpay);
+    assert(rig_daemon_roundtrip(sock_path, &hdr, &wpay, sizeof(wpay), &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_OK);
+
+    /* 2. Add object_id=1 to the live scene */
+    waywal_ipc_req_scene_mutate_t mut;
+    memset(&mut, 0, sizeof(mut));
+    snprintf(mut.target_output, sizeof(mut.target_output), "*");
+    mut.mutate_op = WE_MUTATE_ADD_OBJECT;
+    mut.node_kind = WE_NODE_IMAGE;
+    mut.object_id = 1;
+    mut.parent_id = -1;
+    mut.flags = 0x1u;
+    mut.scale[0] = 1.0f;
+    mut.scale[1] = 1.0f;
+    mut.scale[2] = 1.0f;
+    mut.size[0] = 64.0f;
+    mut.size[1] = 64.0f;
+    mut.color[0] = 1.0f;
+    mut.color[1] = 1.0f;
+    mut.color[2] = 1.0f;
+    mut.color[3] = 1.0f;
+    snprintf(mut.name, sizeof(mut.name), "rig_puppet");
+    assert(waywal_ipc_serialize_req_scene_mutate(&mut, NULL, &hdr, NULL, tx, sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_SCENE_MUTATE);
+    waywal_ipc_resp_scene_mutate_t mut_resp;
+    memcpy(&mut_resp, rx, sizeof(mut_resp));
+    assert(waywal_ipc_validate_resp_scene_mutate(&mut_resp, rhdr.payload_size));
+    assert(mut_resp.status_code == WAYWAL_STATUS_OK && mut_resp.object_id == 1);
+
+    /* 3. Upload 10-vertex / 8-triangle strip mesh spanning X=[0..40], Y=[-4..4] */
+    static const float k_x[5] = {0.0f, 10.0f, 20.0f, 30.0f, 40.0f};
+    waywal_ipc_mdl_vertex_t verts[10];
+    memset(verts, 0, sizeof(verts));
+    for (uint32_t c = 0u; c < 5u; ++c) {
+        verts[c * 2u + 0u].pos[0] = k_x[c];
+        verts[c * 2u + 0u].pos[1] = -4.0f;
+        verts[c * 2u + 0u].texcoord[0] = k_x[c] / 40.0f;
+        verts[c * 2u + 0u].texcoord[1] = 0.0f;
+        verts[c * 2u + 0u].weight[0] = 1.0f;
+
+        verts[c * 2u + 1u].pos[0] = k_x[c];
+        verts[c * 2u + 1u].pos[1] = 4.0f;
+        verts[c * 2u + 1u].texcoord[0] = k_x[c] / 40.0f;
+        verts[c * 2u + 1u].texcoord[1] = 1.0f;
+        verts[c * 2u + 1u].weight[0] = 1.0f;
+    }
+    uint16_t indices[24];
+    for (uint16_t seg = 0u; seg < 4u; ++seg) {
+        uint16_t v0 = (uint16_t)(seg * 2u);
+        uint16_t v1 = (uint16_t)(v0 + 1u);
+        uint16_t v2 = (uint16_t)(v0 + 2u);
+        uint16_t v3 = (uint16_t)(v0 + 3u);
+        indices[seg * 6u + 0u] = v0;
+        indices[seg * 6u + 1u] = v2;
+        indices[seg * 6u + 2u] = v3;
+        indices[seg * 6u + 3u] = v0;
+        indices[seg * 6u + 4u] = v3;
+        indices[seg * 6u + 5u] = v1;
+    }
+    assert(waywal_ipc_serialize_req_puppet_set_mesh(1u, 1u, verts, 10u, indices, 8u, &hdr, tx,
+                                                    sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_PUPPET_MESH_ACK);
+    const waywal_ipc_puppet_mesh_ack_t *ack = NULL;
+    assert(waywal_ipc_validate_resp_puppet_mesh_ack(rx, rhdr.payload_size, &ack));
+    assert(ack->status == (int32_t)WAYWAL_STATUS_OK && ack->vertex_count == 10u);
+
+    /* 4. Upload 4-bone arm chain: 0(pelvis)->1(arm_root 0,0)->2(arm_mid +20,0)->3(arm_end +20,0) */
+    waywal_ipc_mdl_bone_t bones[4];
+    rig_fill_bone(&bones[0], "pelvis", UINT32_MAX, 0.0f, 0.0f);
+    rig_fill_bone(&bones[1], "arm_root", 0u, 0.0f, 0.0f);
+    rig_fill_bone(&bones[2], "arm_mid", 1u, 20.0f, 0.0f);
+    rig_fill_bone(&bones[3], "arm_end", 2u, 20.0f, 0.0f);
+    assert(waywal_ipc_serialize_req_puppet_set_skeleton(1u, 1u, bones, 4u, &hdr, tx, sizeof(tx),
+                                                        &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_OK);
+
+    /* 5. SOLVE_WEIGHTS: legacy & _ext conductivity_scale differentiation */
+    waywal_ipc_puppet_solve_weights_t sw_req = {.object_id = 1u,
+                                                .falloff_power = 2.0f,
+                                                .smoothness = 0.0f,
+                                                .max_influences = 4u,
+                                                .flags = 0x1u | 0x4u | 0x8u};
+    assert(waywal_ipc_serialize_req_puppet_solve_weights(&sw_req, NULL, &hdr, tx, sizeof(tx),
+                                                         &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_PUPPET_WEIGHTS);
+    const waywal_ipc_puppet_weights_resp_t *wr = NULL;
+    const waywal_ipc_vertex_weight_t *w_ent = NULL;
+    assert(waywal_ipc_validate_resp_puppet_weights(rx, rhdr.payload_size, &wr, &w_ent));
+    assert(wr->status == (int32_t)WAYWAL_STATUS_OK && wr->entry_count == 10u);
+
+    float w_low[10] = {0};
+    waywal_ipc_puppet_solve_weights_ext_t sw_low = {.conductivity_scale = 0.02f};
+    assert(waywal_ipc_serialize_req_puppet_solve_weights_ext(&sw_req, NULL, &sw_low, &hdr, tx,
+                                                             sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_PUPPET_WEIGHTS);
+    assert(waywal_ipc_validate_resp_puppet_weights(rx, rhdr.payload_size, &wr, &w_ent));
+    assert(wr->status == (int32_t)WAYWAL_STATUS_OK && wr->entry_count == 10u);
+    for (uint32_t v = 0u; v < 10u; ++v) {
+        for (uint32_t k = 0u; k < 4u; ++k) {
+            if (w_ent[v].blend_indices[k] == 1u) {
+                w_low[v] += w_ent[v].weight[k];
+            }
+        }
+    }
+
+    float max_diff = 0.0f;
+    waywal_ipc_puppet_solve_weights_ext_t sw_high = {.conductivity_scale = 80.0f};
+    assert(waywal_ipc_serialize_req_puppet_solve_weights_ext(&sw_req, NULL, &sw_high, &hdr, tx,
+                                                             sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_PUPPET_WEIGHTS);
+    assert(waywal_ipc_validate_resp_puppet_weights(rx, rhdr.payload_size, &wr, &w_ent));
+    assert(wr->status == (int32_t)WAYWAL_STATUS_OK && wr->entry_count == 10u);
+    for (uint32_t v = 0u; v < 10u; ++v) {
+        float wh = 0.0f;
+        for (uint32_t k = 0u; k < 4u; ++k) {
+            if (w_ent[v].blend_indices[k] == 1u) {
+                wh += w_ent[v].weight[k];
+            }
+        }
+        float d = fabsf(wh - w_low[v]);
+        if (d > max_diff) {
+            max_diff = d;
+        }
+    }
+    assert(max_diff > 1e-3f);
+
+    /* 6. PREVIEW_IK: legacy path */
+    waywal_ipc_puppet_preview_ik_t ik_req = {.object_id = 1u,
+                                             .root_bone = 1u,
+                                             .mid_bone = 2u,
+                                             .end_bone = 3u,
+                                             .pole_flip = 0u,
+                                             .target_world = {20.0f, 20.0f, 0.0f},
+                                             .override_count = 0u,
+                                             .mode_flags = WAYWAL_IPC_IK_FLAG_ENABLE};
+    assert(waywal_ipc_serialize_req_puppet_preview_ik(&ik_req, NULL, &hdr, tx, sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_PUPPET_IK_POSE);
+    const waywal_ipc_puppet_ik_pose_resp_t *ikr = NULL;
+    const waywal_ipc_bone_trs_t *ikb = NULL;
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK && ikr->bone_count == 4u);
+    assert(fabsf(ikb[1].local_angle[2]) > 0.1f || fabsf(ikb[2].local_angle[2]) > 0.1f);
+
+    /* 7. PREVIEW_IK_EXT: pole_world (!= target_world) flips bend plane */
+    ik_req.target_world[0] = 20.0f;
+    ik_req.target_world[1] = 0.0f;
+    waywal_ipc_puppet_preview_ik_ext_t ik_ext = rig_default_ik_ext();
+    ik_ext.pole_world[0] = 10.0f;
+    ik_ext.pole_world[1] = 30.0f;
+    ik_ext.ik_blend_weight = 1.0f;
+    ik_ext.ext_flags = WAYWAL_IPC_IK_EXT_USE_POLE;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik_req, NULL, &ik_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK && ikr->bone_count == 4u);
+    float root_ang_pos_pole = ikb[1].local_angle[2];
+
+    ik_ext.pole_world[1] = -30.0f;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik_req, NULL, &ik_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK && ikr->bone_count == 4u);
+    float root_ang_neg_pole = ikb[1].local_angle[2];
+    assert(root_ang_pos_pole > 0.5f && root_ang_neg_pole < -0.5f);
+
+    /* 8. PREVIEW_IK_EXT: soft_zone_ratio softens near-max reach vs hard clamp */
+    ik_req.target_world[0] = 39.5f;
+    ik_req.target_world[1] = 0.0f;
+    ik_ext = rig_default_ik_ext();
+    ik_ext.pole_world[0] = 20.0f;
+    ik_ext.pole_world[1] = 30.0f;
+    ik_ext.soft_zone_ratio = 0.0f;
+    ik_ext.ik_blend_weight = 1.0f;
+    ik_ext.ext_flags = WAYWAL_IPC_IK_EXT_USE_POLE;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik_req, NULL, &ik_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK);
+    float hard_mid_abs = fabsf(ikb[2].local_angle[2]);
+
+    ik_ext.soft_zone_ratio = 0.25f;
+    ik_ext.ext_flags = WAYWAL_IPC_IK_EXT_USE_POLE | WAYWAL_IPC_IK_EXT_SOFT_IK;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik_req, NULL, &ik_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK);
+    float soft_mid_abs = fabsf(ikb[2].local_angle[2]);
+    assert(soft_mid_abs > hard_mid_abs + 0.1f);
+
+    /* 9. PREVIEW_IK_EXT: max_stretch_ratio elongates segments on over-extended target */
+    ik_req.target_world[0] = 56.0f;
+    ik_req.target_world[1] = 0.0f;
+    ik_ext = rig_default_ik_ext();
+    ik_ext.max_stretch_ratio = 1.5f;
+    ik_ext.soft_zone_ratio = 0.2f;
+    ik_ext.ik_blend_weight = 1.0f;
+    ik_ext.ext_flags = WAYWAL_IPC_IK_EXT_ALLOW_STRETCH | WAYWAL_IPC_IK_EXT_SOFT_IK;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik_req, NULL, &ik_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK);
+    assert(ikb[2].local_pos[0] > 23.0f);
+
+    /* 10. PREVIEW_IK_EXT: joint angle limits (bounded + strict [0, 0] lock) */
+    ik_req.target_world[0] = 0.0f;
+    ik_req.target_world[1] = 20.0f;
+    ik_ext = rig_default_ik_ext();
+    ik_ext.root_angle_min_rad = -0.30f;
+    ik_ext.root_angle_max_rad = 0.30f;
+    ik_ext.mid_angle_min_rad = -0.20f;
+    ik_ext.mid_angle_max_rad = 0.20f;
+    ik_ext.ik_blend_weight = 1.0f;
+    ik_ext.ext_flags = WAYWAL_IPC_IK_EXT_LIMIT_ANGLES;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik_req, NULL, &ik_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK);
+    assert(fabsf(ikb[1].local_angle[2]) <= 0.305f && fabsf(ikb[2].local_angle[2]) <= 0.205f);
+
+    ik_ext.root_angle_min_rad = 0.0f;
+    ik_ext.root_angle_max_rad = 0.0f;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&ik_req, NULL, &ik_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK);
+    assert(fabsf(ikb[1].local_angle[2]) < 1e-4f);
+
+    /* 11. PREVIEW_IK_EXT: 1-bone Aim (aim_axis_local, aim_max_cone_rad, aim_blend_weight, disabled) */
+    waywal_ipc_puppet_preview_ik_t aim_req = {.object_id = 1u,
+                                              .root_bone = 1u,
+                                              .mid_bone = 0xFFFFu,
+                                              .end_bone = 0xFFFFu,
+                                              .target_world = {0.0f, 20.0f, 0.0f},
+                                              .mode_flags = WAYWAL_IPC_IK_FLAG_ENABLE};
+    waywal_ipc_puppet_preview_ik_ext_t aim_ext = rig_default_ik_ext();
+    aim_ext.aim_axis_local[0] = 1.0f;
+    aim_ext.aim_max_cone_rad = 0.25f;
+    aim_ext.aim_blend_weight = 1.0f;
+    aim_ext.ext_flags = WAYWAL_IPC_IK_EXT_AIM_ENABLED;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&aim_req, NULL, &aim_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK);
+    assert(fabsf(ikb[1].local_angle[2] - 0.25f) < 0.02f);
+
+    aim_ext.aim_axis_local[0] = 0.0f;
+    aim_ext.aim_axis_local[1] = 1.0f;
+    aim_ext.aim_max_cone_rad = 3.14f;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&aim_req, NULL, &aim_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK);
+    assert(fabsf(ikb[1].local_angle[2]) < 0.02f);
+
+    aim_ext.aim_axis_local[0] = 1.0f;
+    aim_ext.aim_axis_local[1] = 0.0f;
+    aim_ext.aim_blend_weight = 0.5f;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&aim_req, NULL, &aim_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK);
+    assert(fabsf(ikb[1].local_angle[2] - 0.785398f) < 0.02f);
+
+    aim_ext.ext_flags = 0u;
+    assert(waywal_ipc_serialize_req_puppet_preview_ik_ext(&aim_req, NULL, &aim_ext, &hdr, tx,
+                                                          sizeof(tx), &total));
+    assert(rig_daemon_roundtrip(sock_path, &hdr, tx, total, &rhdr, rx, sizeof(rx)));
+    assert(waywal_ipc_validate_resp_puppet_ik_pose(rx, rhdr.payload_size, &ikr, &ikb));
+    assert(ikr->status == (int32_t)WAYWAL_STATUS_OK);
+    assert(fabsf(ikb[1].local_angle[2]) < 1e-4f);
+
+    kill(pid, SIGTERM);
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    (void)unlink(sock_path);
+    rig_remove_tree(tmp_root);
+}
+
 int main(void)
 {
     test_legacy_and_helpers();
@@ -958,8 +1649,10 @@ int main(void)
     test_set_skeleton_wire();
     test_weights_and_heatmap_wire();
     test_ik_anim_scrub_export_wire();
+    test_rigging_ext_wire();
     test_unix_socketpair_rigging_roundtrip();
     test_scrub_time_error_parity_no_desync();
+    test_live_daemon_rigging_ext_dispatch();
     printf("test_ipc_rigging_wire: PASS\n");
     return 0;
 }

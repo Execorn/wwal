@@ -1395,6 +1395,11 @@ bool waywal_ipc_serialize_resp_particle_config(uint32_t status_code, int32_t obj
     return true;
 }
 
+/* Prevent GCC LTO from inlining caller stack buffers into the variable-tail validator,
+ * where __asan_memcpy obscures binding_count and triggers false -Wstringop-overread. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noipa))
+#endif
 bool waywal_ipc_validate_req_set_audio_bindings(const waywal_ipc_req_set_audio_bindings_t *req,
                                                 size_t payload_size,
                                                 const we_audio_binding_t **out_bindings,
