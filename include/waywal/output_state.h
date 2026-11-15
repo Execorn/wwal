@@ -131,12 +131,18 @@ struct output_node {
 
     /* SHM ping-pong double-buffer (eliminates compositor/CPU write races) */
     struct wl_buffer *shm_buffers[2]; /* [0]=front (compositor), [1]=back (CPU) */
+    struct wl_shm_pool *shm_pools[2];
+    void *shm_slot_data[2]; /* independent page-aligned mmap per slot */
+    size_t shm_slot_sizes[2];
+    int shm_fds[2];
+    size_t shm_frame_bytes;
+    /* Legacy single-pool fields preserved for external test_transitions/video_engine callers */
     struct wl_shm_pool *shm_pool;
-    void *shm_data;        /* double-sized mmap: frame_size * 2 bytes */
+    void *shm_data;
     void *shm_old_data;    /* CPU staging: previous frame pixels */
     void *shm_new_data;    /* CPU staging: target frame pixels */
     size_t shm_buffer_cap; /* capacity of shm_old_data / shm_new_data */
-    size_t shm_size;       /* total mmap size = frame_size * 2 */
+    size_t shm_size;
     int shm_fd;
     int active_buffer_idx;       /* 0 or 1: index currently committed to compositor */
     bool shm_buffer_released[2]; /* release listener: true when compositor released */
@@ -195,10 +201,14 @@ struct output_node {
     float crop_gravity_y;
     bool has_crop_gravity;
 
+    int32_t committed_buf_w;
+    int32_t committed_buf_h;
+    bool dims_dirty;
     bool configured;
     bool initial_configure_done;
     bool mapped_while_fullscreen;
     bool wlr_has_fullscreen;
+    void (*on_geometry_change)(struct output_node *node);
     struct daemon_state *state;
     struct output_node *next;
 };

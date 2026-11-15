@@ -177,10 +177,19 @@ typedef struct daemon_state {
     void *wlr_toplevels;
 
     int cursor_ipc_fd;
+    bool cursor_ipc_connecting;
+    uint8_t cursor_ipc_sent;
+    uint16_t cursor_ipc_recv_len;
+    uint64_t cursor_ipc_start_ns;
     uint64_t last_cursor_ipc_ns;
     double cached_ipc_cursor_x;
     double cached_ipc_cursor_y;
     bool has_cached_ipc_cursor;
+    bool has_cursor_ipc_addr;
+    bool surfaces_ready;
+    char cursor_ipc_his[512];
+    char cursor_ipc_path[108];
+    char cursor_ipc_buf[256];
 
     /* Hardware Direct Scanout context */
     dmabuf_context_t dmabuf_ctx;
@@ -296,7 +305,6 @@ typedef struct daemon_state {
 } daemon_state_t;
 
 bool daemon_wayland_init(daemon_state_t *state);
-void daemon_wayland_dispatch(daemon_state_t *state);
 void daemon_wayland_destroy(daemon_state_t *state);
 bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *out_x,
                              double *out_y);

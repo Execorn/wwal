@@ -34,20 +34,63 @@ static void output_handle_geometry(void *data, struct wl_output *output, int32_t
     }
 }
 
+static void output_recompute_geometry(output_state_t *st)
+{
+    if (!st)
+        return;
+
+    int32_t old_w = st->width;
+    int32_t old_h = st->height;
+
+    if (st->fractional_scale > 0 && st->logical_width > 0 && st->logical_height > 0) {
+        uint64_t fw = ((uint64_t)st->logical_width * (uint64_t)st->fractional_scale + 60ULL) / 120ULL;
+        uint64_t fh =
+            ((uint64_t)st->logical_height * (uint64_t)st->fractional_scale + 60ULL) / 120ULL;
+        if (fw > 0 && fw <= (uint64_t)INT32_MAX && fh > 0 && fh <= (uint64_t)INT32_MAX) {
+            st->width = (int32_t)fw;
+            st->height = (int32_t)fh;
+        }
+    } else if (st->scale > 1 && st->logical_width > 0 && st->logical_height > 0) {
+        uint64_t sw = (uint64_t)st->logical_width * (uint64_t)st->scale;
+        uint64_t sh = (uint64_t)st->logical_height * (uint64_t)st->scale;
+        if (sw > 0 && sw <= (uint64_t)INT32_MAX && sh > 0 && sh <= (uint64_t)INT32_MAX) {
+            st->width = (int32_t)sw;
+            st->height = (int32_t)sh;
+        }
+    } else if (st->mode_width > 0 && st->mode_height > 0) {
+        bool rotated = (st->transform == WL_OUTPUT_TRANSFORM_90 ||
+                        st->transform == WL_OUTPUT_TRANSFORM_270 ||
+                        st->transform == WL_OUTPUT_TRANSFORM_FLIPPED_90 ||
+                        st->transform == WL_OUTPUT_TRANSFORM_FLIPPED_270);
+        st->width = rotated ? st->mode_height : st->mode_width;
+        st->height = rotated ? st->mode_width : st->mode_height;
+    }
+
+    if (st->width != old_w || st->height != old_h) {
+        st->dims_dirty = true;
+    }
+}
+
 static void output_handle_mode(void *data, struct wl_output *output, uint32_t flags, int32_t width,
                                int32_t height, int32_t refresh)
 {
-    (void)output;
     output_state_t *st = (output_state_t *)data;
     if (st && (flags & WL_OUTPUT_MODE_CURRENT)) {
         if (width > 0 && height > 0) {
             st->mode_width = width;
             st->mode_height = height;
-            st->width = width;
-            st->height = height;
+            output_recompute_geometry(st);
         }
         if (refresh > 0) {
             st->refresh_mhz = (uint32_t)refresh;
+            int64_t mode_period_ns = 1000000000000LL / (int64_t)refresh;
+            if (mode_period_ns > 0) {
+                st->pres_sync.pll.period_est_ns = mode_period_ns;
+            }
+        }
+        if (output && wl_output_get_version(output) < WL_OUTPUT_DONE_SINCE_VERSION &&
+            st->dims_dirty && st->configured && st->on_geometry_change) {
+            st->on_geometry_change(st);
         }
     }
 }
@@ -57,19 +100,31 @@ static void output_handle_done(void *data, struct wl_output *output)
     (void)output;
     output_state_t *st = (output_state_t *)data;
     if (st) {
+        output_recompute_geometry(st);
         WAYWAL_LOG_DEBUG("Output %s (%s) geometry resolved: %ux%u @ %u mHz",
                          st->name[0] ? st->name : "unnamed",
                          st->description[0] ? st->description : "unknown", st->width, st->height,
                          st->refresh_mhz);
+        if (st->dims_dirty && st->configured && st->on_geometry_change) {
+            st->on_geometry_change(st);
+        }
     }
 }
 
 static void output_handle_scale(void *data, struct wl_output *output, int32_t factor)
 {
-    (void)output;
     output_state_t *st = (output_state_t *)data;
-    if (st) {
+    if (!st || factor <= 0) {
+        return;
+    }
+    if (st->scale != factor) {
         st->scale = factor;
+        st->dims_dirty = true;
+        output_recompute_geometry(st);
+        if (output && wl_output_get_version(output) < WL_OUTPUT_DONE_SINCE_VERSION &&
+            st->configured && st->on_geometry_change) {
+            st->on_geometry_change(st);
+        }
     }
 }
 
@@ -180,6 +235,8 @@ output_state_t *output_manager_add(output_manager_t *om, struct wl_registry *reg
     st->pres_sync.pll.clock_id = presentation_get_clock_id();
     st->pres_sync.pll.has_clock_id = true;
     st->shm_fd = -1;
+    st->shm_fds[0] = -1;
+    st->shm_fds[1] = -1;
     st->last_committed_ring_idx = -1;
 
     uint32_t bind_ver = (version > 4) ? 4 : version;

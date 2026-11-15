@@ -17,8 +17,31 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <poll.h>
 #include <time.h>
 #include <unistd.h>
+
+static bool drm_devt_matches_fd(int drm_fd, dev_t target_dev)
+{
+    struct stat st;
+    if (drm_fd < 0 || fstat(drm_fd, &st) != 0)
+        return false;
+    if (st.st_rdev == target_dev)
+        return true;
+
+    drmDevicePtr cur_dev = NULL;
+    drmDevicePtr target_drm = NULL;
+    if (drmGetDeviceFromDevId(st.st_rdev, 0, &cur_dev) != 0 || !cur_dev)
+        return false;
+
+    bool same = false;
+    if (drmGetDeviceFromDevId(target_dev, 0, &target_drm) == 0 && target_drm) {
+        same = drmDevicesEqual(cur_dev, target_drm) != 0;
+        drmFreeDevice(&target_drm);
+    }
+    drmFreeDevice(&cur_dev);
+    return same;
+}
 
 /* Declared in dmabuf_alloc.c to match the compositor dev_t against /dev/dri/renderD* */
 int open_drm_node_by_devt(dev_t target_dev);
@@ -64,14 +87,17 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     (void)pointer;
     (void)serial;
     daemon_state_t *state = (daemon_state_t *)data;
-    if (!state || !surface)
+    if (!state)
         return;
 
+    /* Compositors may pass NULL when destroying a focused surface (AUD-105). */
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-        if (out->surface == surface) {
+        if (!surface || out->surface == surface) {
             out->has_cursor = false;
             out->button_down = false;
-            break;
+            out->click_pulse = false;
+            if (surface)
+                break;
         }
     }
 }
@@ -183,6 +209,11 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabil
                 wp_cursor_shape_manager_v1_get_pointer(state->cursor_shape_mgr, state->pointer);
         }
     } else if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) && state->pointer) {
+        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+            out->has_cursor = false;
+            out->button_down = false;
+            out->click_pulse = false;
+        }
         if (state->cursor_shape_dev) {
             wp_cursor_shape_device_v1_destroy(state->cursor_shape_dev);
             state->cursor_shape_dev = NULL;
@@ -569,92 +600,17 @@ static const struct zwlr_foreign_toplevel_manager_v1_listener wlr_toplevel_mgr_l
     .finished = wlr_toplevel_mgr_handle_finished,
 };
 
-typedef struct ext_toplevel_entry {
-    struct ext_foreign_toplevel_handle_v1 *handle;
-    daemon_state_t *state;
-    struct ext_toplevel_entry *next;
-} ext_toplevel_entry_t;
-
-static ext_toplevel_entry_t *g_ext_toplevels = NULL;
-
-static void foreign_toplevel_handle_closed(void *data,
-                                           struct ext_foreign_toplevel_handle_v1 *toplevel)
-{
-    ext_toplevel_entry_t *target = (ext_toplevel_entry_t *)data;
-    ext_toplevel_entry_t **pp = &g_ext_toplevels;
-    while (*pp) {
-        if (*pp == target || (*pp)->handle == toplevel) {
-            ext_toplevel_entry_t *victim = *pp;
-            *pp = victim->next;
-            free(victim);
-            break;
-        }
-        pp = &(*pp)->next;
-    }
-    if (toplevel) {
-        ext_foreign_toplevel_handle_v1_destroy(toplevel);
-    }
-}
-
-static void foreign_toplevel_handle_done(void *data,
-                                         struct ext_foreign_toplevel_handle_v1 *toplevel)
-{
-    (void)data;
-    (void)toplevel;
-}
-
-static void foreign_toplevel_handle_title(void *data,
-                                          struct ext_foreign_toplevel_handle_v1 *toplevel,
-                                          const char *title)
-{
-    (void)data;
-    (void)toplevel;
-    (void)title;
-}
-
-static void foreign_toplevel_handle_app_id(void *data,
-                                           struct ext_foreign_toplevel_handle_v1 *toplevel,
-                                           const char *app_id)
-{
-    (void)data;
-    (void)toplevel;
-    (void)app_id;
-}
-
-static void foreign_toplevel_handle_identifier(void *data,
-                                               struct ext_foreign_toplevel_handle_v1 *toplevel,
-                                               const char *identifier)
-{
-    (void)data;
-    (void)toplevel;
-    (void)identifier;
-}
-
-static const struct ext_foreign_toplevel_handle_v1_listener foreign_toplevel_handle_listener = {
-    .closed = foreign_toplevel_handle_closed,
-    .done = foreign_toplevel_handle_done,
-    .title = foreign_toplevel_handle_title,
-    .app_id = foreign_toplevel_handle_app_id,
-    .identifier = foreign_toplevel_handle_identifier,
-};
-
 static void foreign_toplevel_list_handle_toplevel(void *data,
                                                   struct ext_foreign_toplevel_list_v1 *list,
                                                   struct ext_foreign_toplevel_handle_v1 *toplevel)
 {
+    (void)data;
     (void)list;
-    if (!toplevel)
-        return;
-    ext_toplevel_entry_t *e = (ext_toplevel_entry_t *)calloc(1, sizeof(*e));
-    if (!e) {
+    /* Nothing consumes per-toplevel metadata; release the handle immediately
+     * instead of allocating and scanning an unused tracking list (PERF-018). */
+    if (toplevel) {
         ext_foreign_toplevel_handle_v1_destroy(toplevel);
-        return;
     }
-    e->handle = toplevel;
-    e->state = (daemon_state_t *)data;
-    e->next = g_ext_toplevels;
-    g_ext_toplevels = e;
-    ext_foreign_toplevel_handle_v1_add_listener(toplevel, &foreign_toplevel_handle_listener, e);
 }
 
 static void foreign_toplevel_list_handle_finished(void *data,
@@ -805,8 +761,9 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
             bind_xdg_output_for_node(state, node);
             WAYWAL_LOG_INFO("Discovered Wayland output id %u", name);
             /* Defer surface creation during initial startup until dmabuf_feedback_init
-             * has negotiated the compositor's DRM device and format modifiers. */
-            if (state->layer_shell && state->dmabuf_ctx.default_feedback) {
+             * negotiates formats; hotplugged outputs after init still need surfaces even
+             * on SHM-only compositors without dmabuf feedback (AUD-404). */
+            if (state->layer_shell && (state->surfaces_ready || state->dmabuf_ctx.default_feedback)) {
                 output_node_create_surface(state, node);
                 if (output_is_currently_fullscreen(state, node)) {
                     node->mapped_while_fullscreen = true;
@@ -838,7 +795,6 @@ static void registry_global_remove(void *data, struct wl_registry *registry, uin
                 }
             }
         }
-        recompute_wlr_toplevel_power_state(state);
         if (state->power_gov && node->name[0] != '\0') {
             waywal_power_governor_remove_output(state->power_gov, node->name);
         }
@@ -925,69 +881,40 @@ bool daemon_wayland_init(daemon_state_t *state)
          * device we opened earlier (via sysfs) doesn't match (e.g. we got
          * renderD129/NVIDIA instead of renderD128/AMD), reinitialize on the
          * correct node to avoid cross-device EGL_BAD_ALLOC. */
-        if (state->dmabuf_ctx.has_compositor_dev && state->dmabuf_ctx.drm_fd >= 0) {
+        if (state->dmabuf_ctx.has_compositor_dev && state->dmabuf_ctx.drm_fd >= 0 &&
+            !drm_devt_matches_fd(state->dmabuf_ctx.drm_fd, state->dmabuf_ctx.compositor_dev)) {
             struct stat st;
-            if (fstat(state->dmabuf_ctx.drm_fd, &st) == 0 &&
-                st.st_rdev != state->dmabuf_ctx.compositor_dev) {
+            if (fstat(state->dmabuf_ctx.drm_fd, &st) == 0) {
                 WAYWAL_LOG_INFO(
-                    "GBM device mismatch (have %u:%u, compositor wants %u:%u); reinitializing",
+                    "GBM device mismatch (have %u:%u, compositor wants %u:%u); opening target node",
                     (unsigned)major(st.st_rdev), (unsigned)minor(st.st_rdev),
                     (unsigned)major(state->dmabuf_ctx.compositor_dev),
                     (unsigned)minor(state->dmabuf_ctx.compositor_dev));
+            }
 
-                /* Preserve protocol objects across GBM tear-down */
-                struct zwp_linux_dmabuf_v1 *saved_proto = state->dmabuf_ctx.dmabuf_proto;
-                struct zwp_linux_dmabuf_feedback_v1 *saved_fb = state->dmabuf_ctx.default_feedback;
-                uint64_t saved_mod = state->dmabuf_ctx.preferred_modifier;
-                uint32_t saved_fmt = state->dmabuf_ctx.preferred_format;
-                dev_t saved_dev = state->dmabuf_ctx.compositor_dev;
-                bool saved_hdev = state->dmabuf_ctx.has_compositor_dev;
-                bool saved_10 = state->dmabuf_ctx.has_10bit;
-                uint32_t saved_f10 = state->dmabuf_ctx.format_10bit;
-                uint64_t saved_m10 = state->dmabuf_ctx.modifier_10bit;
-                bool saved_nv12 = state->dmabuf_ctx.has_nv12;
-                bool saved_p010 = state->dmabuf_ctx.has_p010;
-
-                /* Destroy old GBM only (not protocol objects) */
-                if (state->dmabuf_ctx.gbm)
-                    gbm_device_destroy(state->dmabuf_ctx.gbm);
-                if (state->dmabuf_ctx.drm_fd >= 0)
-                    close(state->dmabuf_ctx.drm_fd);
-                state->dmabuf_ctx.gbm = NULL;
-                state->dmabuf_ctx.drm_fd = -1;
-
-                /* Open compositor's actual render node */
-                int new_fd = open_drm_node_by_devt(saved_dev);
-                if (new_fd >= 0) {
-                    struct gbm_device *new_gbm = gbm_create_device(new_fd);
-                    if (new_gbm) {
-                        state->dmabuf_ctx.drm_fd = new_fd;
-                        state->dmabuf_ctx.gbm = new_gbm;
-                        WAYWAL_LOG_INFO("GBM reinitialized on compositor device %u:%u",
-                                        (unsigned)major(saved_dev), (unsigned)minor(saved_dev));
-                    } else {
-                        WAYWAL_LOG_WARN(
-                            "gbm_create_device failed on compositor node, staying on fallback");
-                        close(new_fd);
-                    }
+            /* Open and initialize replacement node before tearing down the working fallback. */
+            int new_fd = open_drm_node_by_devt(state->dmabuf_ctx.compositor_dev);
+            if (new_fd >= 0) {
+                struct gbm_device *new_gbm = gbm_create_device(new_fd);
+                if (new_gbm) {
+                    if (state->dmabuf_ctx.gbm)
+                        gbm_device_destroy(state->dmabuf_ctx.gbm);
+                    if (state->dmabuf_ctx.drm_fd >= 0)
+                        close(state->dmabuf_ctx.drm_fd);
+                    state->dmabuf_ctx.drm_fd = new_fd;
+                    state->dmabuf_ctx.gbm = new_gbm;
+                    state->dmabuf_ctx.available = true;
+                    state->dmabuf_ctx.map_supported = dmabuf_probe_map_support(&state->dmabuf_ctx);
+                    WAYWAL_LOG_INFO("GBM reinitialized on compositor device %u:%u",
+                                    (unsigned)major(state->dmabuf_ctx.compositor_dev),
+                                    (unsigned)minor(state->dmabuf_ctx.compositor_dev));
                 } else {
-                    WAYWAL_LOG_WARN("Could not open compositor DRM node for GBM reinit");
+                    WAYWAL_LOG_WARN(
+                        "gbm_create_device failed on compositor node, keeping existing fallback");
+                    close(new_fd);
                 }
-
-                /* Restore protocol/modifier state */
-                state->dmabuf_ctx.dmabuf_proto = saved_proto;
-                state->dmabuf_ctx.default_feedback = saved_fb;
-                state->dmabuf_ctx.preferred_modifier = saved_mod;
-                state->dmabuf_ctx.preferred_format = saved_fmt;
-                state->dmabuf_ctx.compositor_dev = saved_dev;
-                state->dmabuf_ctx.has_compositor_dev = saved_hdev;
-                state->dmabuf_ctx.has_10bit = saved_10;
-                state->dmabuf_ctx.format_10bit = saved_f10;
-                state->dmabuf_ctx.modifier_10bit = saved_m10;
-                state->dmabuf_ctx.has_nv12 = saved_nv12;
-                state->dmabuf_ctx.has_p010 = saved_p010;
-                state->dmabuf_ctx.available = (state->dmabuf_ctx.gbm != NULL);
-                state->dmabuf_ctx.map_supported = dmabuf_probe_map_support(&state->dmabuf_ctx);
+            } else {
+                WAYWAL_LOG_WARN("Could not open compositor DRM node; keeping existing fallback");
             }
         }
     }
@@ -1012,6 +939,7 @@ bool daemon_wayland_init(daemon_state_t *state)
             out->mapped_while_fullscreen = true;
         }
     }
+    state->surfaces_ready = true;
 
     /* Roundtrip to receive initial configure events from compositor */
     if (wl_display_roundtrip(state->display) < 0) {
@@ -1043,20 +971,6 @@ void daemon_wayland_destroy(daemon_state_t *state)
             zwlr_foreign_toplevel_handle_v1_destroy(e->handle);
         }
         free(e);
-    }
-
-    ext_toplevel_entry_t **pp = &g_ext_toplevels;
-    while (*pp) {
-        ext_toplevel_entry_t *e = *pp;
-        if (e->state == state) {
-            *pp = e->next;
-            if (e->handle) {
-                ext_foreign_toplevel_handle_v1_destroy(e->handle);
-            }
-            free(e);
-        } else {
-            pp = &e->next;
-        }
     }
 
     state->outputs = NULL;
@@ -1142,7 +1056,12 @@ void daemon_wayland_destroy(daemon_state_t *state)
         state->fract_manager = NULL;
     }
     if (state->layer_shell) {
-        zwlr_layer_shell_v1_destroy(state->layer_shell);
+        if (zwlr_layer_shell_v1_get_version(state->layer_shell) >=
+            ZWLR_LAYER_SHELL_V1_DESTROY_SINCE_VERSION) {
+            zwlr_layer_shell_v1_destroy(state->layer_shell);
+        } else {
+            wl_proxy_destroy((struct wl_proxy *)state->layer_shell);
+        }
         state->layer_shell = NULL;
     }
     if (state->shm) {
@@ -1163,103 +1082,214 @@ void daemon_wayland_destroy(daemon_state_t *state)
     }
 }
 
+static void cursor_ipc_reset_conn(daemon_state_t *state)
+{
+    if (!state)
+        return;
+    if (state->cursor_ipc_fd >= 0) {
+        close(state->cursor_ipc_fd);
+        state->cursor_ipc_fd = -1;
+    }
+    state->cursor_ipc_connecting = false;
+    state->cursor_ipc_sent = 0;
+    state->cursor_ipc_recv_len = 0;
+}
+
+static bool cursor_ipc_finish_parse(daemon_state_t *state, uint64_t now_ns, double *gx, double *gy)
+{
+    int x = 0, y = 0;
+    if (sscanf(state->cursor_ipc_buf, "%d, %d", &x, &y) != 2) {
+        return false;
+    }
+    cursor_ipc_reset_conn(state);
+    state->cached_ipc_cursor_x = (double)x;
+    state->cached_ipc_cursor_y = (double)y;
+    state->has_cached_ipc_cursor = true;
+    state->last_cursor_ipc_ns = now_ns;
+    *gx = state->cached_ipc_cursor_x;
+    *gy = state->cached_ipc_cursor_y;
+    return true;
+}
+
+static bool cursor_ipc_pump(daemon_state_t *state, uint64_t now_ns, double *gx, double *gy)
+{
+    if (state->cursor_ipc_fd < 0)
+        return false;
+
+    if (state->cursor_ipc_connecting) {
+        struct pollfd pfd = {.fd = state->cursor_ipc_fd, .events = POLLOUT};
+        int pr = poll(&pfd, 1, 0);
+        if (pr == 0 || (pr < 0 && errno == EINTR))
+            return false;
+        if (pr < 0) {
+            cursor_ipc_reset_conn(state);
+            return false;
+        }
+        int err = 0;
+        socklen_t len = sizeof(err);
+        if (getsockopt(state->cursor_ipc_fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0 ||
+            (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            cursor_ipc_reset_conn(state);
+            state->has_cursor_ipc_addr = false;
+            return false;
+        }
+        state->cursor_ipc_connecting = false;
+    }
+
+    static const char cmd[] = "cursorpos";
+    while (state->cursor_ipc_sent < 9u) {
+        ssize_t w = send(state->cursor_ipc_fd, cmd + state->cursor_ipc_sent,
+                         9u - state->cursor_ipc_sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w > 0) {
+            state->cursor_ipc_sent = (uint8_t)(state->cursor_ipc_sent + (uint8_t)w);
+        } else if (w < 0 && errno == EINTR) {
+            continue;
+        } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return false;
+        } else {
+            cursor_ipc_reset_conn(state);
+            return false;
+        }
+    }
+
+    for (;;) {
+        if (state->cursor_ipc_recv_len >= sizeof(state->cursor_ipc_buf) - 1u) {
+            bool ok = cursor_ipc_finish_parse(state, now_ns, gx, gy);
+            if (!ok)
+                cursor_ipc_reset_conn(state);
+            return ok;
+        }
+        ssize_t n = recv(state->cursor_ipc_fd,
+                         state->cursor_ipc_buf + state->cursor_ipc_recv_len,
+                         sizeof(state->cursor_ipc_buf) - 1u - state->cursor_ipc_recv_len,
+                         MSG_DONTWAIT);
+        if (n > 0) {
+            state->cursor_ipc_recv_len = (uint16_t)(state->cursor_ipc_recv_len + (uint16_t)n);
+            state->cursor_ipc_buf[state->cursor_ipc_recv_len] = '\0';
+            if (memchr(state->cursor_ipc_buf, '\n', state->cursor_ipc_recv_len) != NULL &&
+                cursor_ipc_finish_parse(state, now_ns, gx, gy)) {
+                return true;
+            }
+        } else if (n == 0) {
+            bool ok = cursor_ipc_finish_parse(state, now_ns, gx, gy);
+            if (!ok)
+                cursor_ipc_reset_conn(state);
+            return ok;
+        } else if (errno == EINTR) {
+            continue;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return false;
+        } else {
+            cursor_ipc_reset_conn(state);
+            return false;
+        }
+    }
+}
+
+static bool cursor_ipc_start_connect(daemon_state_t *state, const char *path, const char *his,
+                                     uint64_t now_ns)
+{
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path) >= (int)sizeof(addr.sun_path))
+        return false;
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return false;
+
+    int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (rc == 0 || (rc < 0 && errno == EINPROGRESS)) {
+        state->cursor_ipc_fd = fd;
+        state->cursor_ipc_connecting = (rc < 0);
+        state->cursor_ipc_sent = 0;
+        state->cursor_ipc_recv_len = 0;
+        state->cursor_ipc_start_ns = now_ns;
+        snprintf(state->cursor_ipc_path, sizeof(state->cursor_ipc_path), "%s", path);
+        snprintf(state->cursor_ipc_his, sizeof(state->cursor_ipc_his), "%s", his);
+        state->has_cursor_ipc_addr = true;
+        return true;
+    }
+
+    close(fd);
+    return false;
+}
+
 static bool query_hyprland_cursor_global(daemon_state_t *state, double *gx, double *gy)
 {
-    struct timespec ts;
+    struct timespec ts = {0};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
+    /* Pump any in-flight non-blocking request first so the main thread never stalls. */
+    if (state->cursor_ipc_fd >= 0) {
+        if ((now_ns - state->cursor_ipc_start_ns) > 100000000ULL) {
+            cursor_ipc_reset_conn(state);
+        } else if (cursor_ipc_pump(state, now_ns, gx, gy)) {
+            return true;
+        } else {
+            if (state->has_cached_ipc_cursor) {
+                *gx = state->cached_ipc_cursor_x;
+                *gy = state->cached_ipc_cursor_y;
+                return true;
+            }
+            return false;
+        }
+    }
+
     /* Throttle IPC query to 60Hz (~16.6ms) */
-    if (state->has_cached_ipc_cursor && state->last_cursor_ipc_ns > 0 &&
-        (now_ns - state->last_cursor_ipc_ns) < 16666666ULL) {
-        *gx = state->cached_ipc_cursor_x;
-        *gy = state->cached_ipc_cursor_y;
-        return true;
+    if (state->last_cursor_ipc_ns > 0 && (now_ns - state->last_cursor_ipc_ns) < 16666666ULL) {
+        if (state->has_cached_ipc_cursor) {
+            *gx = state->cached_ipc_cursor_x;
+            *gy = state->cached_ipc_cursor_y;
+            return true;
+        }
+        return false;
     }
 
     const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
     if (!his || !his[0])
         return false;
-    const char *xrd = getenv("XDG_RUNTIME_DIR");
 
-    static struct sockaddr_un s_cached_addr;
-    static char s_cached_his[128];
-    static bool s_has_cached_addr = false;
-
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd < 0)
-            return false;
-        struct timeval tv = {.tv_sec = 0, .tv_usec = 10000};
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-        bool connected = false;
-        if (s_has_cached_addr && strcmp(s_cached_his, his) == 0) {
-            if (connect(fd, (struct sockaddr *)&s_cached_addr, sizeof(s_cached_addr)) == 0) {
-                connected = true;
-            } else {
-                s_has_cached_addr = false;
-            }
-        }
-
-        if (!connected) {
-            struct sockaddr_un addr = {0};
-            addr.sun_family = AF_UNIX;
-            if (xrd && xrd[0]) {
-                int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
-                                        "%s/hypr/%s/.socket.sock", xrd, his);
-                if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
-                    connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-                    connected = true;
-                }
-            }
-            if (!connected) {
-                memset(&addr, 0, sizeof(addr));
-                addr.sun_family = AF_UNIX;
-                int path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
-                                        "/tmp/hypr/%s/.socket.sock", his);
-                if (path_len > 0 && (size_t)path_len < sizeof(addr.sun_path) &&
-                    connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-                    connected = true;
-                }
-            }
-            if (connected) {
-                s_cached_addr = addr;
-                snprintf(s_cached_his, sizeof(s_cached_his), "%s", his);
-                s_has_cached_addr = true;
-            }
-        }
-
-        if (!connected) {
-            close(fd);
-            continue;
-        }
-
-        ssize_t w = send(fd, "cursorpos", 9, MSG_NOSIGNAL);
-        if (w == 9) {
-            char buf[128] = {0};
-            ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-            if (n > 0) {
-                buf[n] = '\0';
-                int x = 0, y = 0;
-                if (sscanf(buf, "%d, %d", &x, &y) == 2) {
-                    close(fd);
-                    state->cursor_ipc_fd = -1;
-                    state->cached_ipc_cursor_x = (double)x;
-                    state->cached_ipc_cursor_y = (double)y;
-                    state->has_cached_ipc_cursor = true;
-                    state->last_cursor_ipc_ns = now_ns;
-                    *gx = (double)x;
-                    *gy = (double)y;
-                    return true;
-                }
-            }
-        }
-        close(fd);
-        state->cursor_ipc_fd = -1;
+    if (state->has_cursor_ipc_addr && strcmp(state->cursor_ipc_his, his) != 0) {
+        state->has_cursor_ipc_addr = false;
     }
 
+    bool started = false;
+    if (state->has_cursor_ipc_addr && state->cursor_ipc_path[0] != '\0') {
+        started = cursor_ipc_start_connect(state, state->cursor_ipc_path, his, now_ns);
+        if (!started)
+            state->has_cursor_ipc_addr = false;
+    }
+
+    if (!started) {
+        const char *xrd = getenv("XDG_RUNTIME_DIR");
+        char cand[108];
+        if (xrd && xrd[0]) {
+            int n = snprintf(cand, sizeof(cand), "%s/hypr/%s/.socket.sock", xrd, his);
+            if (n > 0 && (size_t)n < sizeof(cand)) {
+                started = cursor_ipc_start_connect(state, cand, his, now_ns);
+            }
+        }
+        if (!started) {
+            int n = snprintf(cand, sizeof(cand), "/tmp/hypr/%s/.socket.sock", his);
+            if (n > 0 && (size_t)n < sizeof(cand)) {
+                started = cursor_ipc_start_connect(state, cand, his, now_ns);
+            }
+        }
+    }
+
+    if (started && cursor_ipc_pump(state, now_ns, gx, gy)) {
+        return true;
+    }
+    if (!started) {
+        state->last_cursor_ipc_ns = now_ns;
+    }
+    if (state->has_cached_ipc_cursor) {
+        *gx = state->cached_ipc_cursor_x;
+        *gy = state->cached_ipc_cursor_y;
+        return true;
+    }
     return false;
 }
 

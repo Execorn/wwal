@@ -109,6 +109,9 @@ void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t ref
         pll->phase_est_ns = hw_time_ns + pll->period_est_ns;
         pll->last_hardware_time = hw_time_ns;
         pll->jitter_ns = 0;
+        pll->frame_seq++;
+        pll->has_hw_clock = (flags & WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK) != 0;
+        pll->is_zero_copy = (flags & WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY) != 0;
         return;
     }
 
@@ -119,6 +122,9 @@ void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t ref
         pll->phase_est_ns = hw_time_ns + pll->period_est_ns;
         pll->last_hardware_time = hw_time_ns;
         pll->jitter_ns = 0;
+        pll->frame_seq++;
+        pll->has_hw_clock = (flags & WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK) != 0;
+        pll->is_zero_copy = (flags & WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY) != 0;
         return;
     }
 
@@ -131,6 +137,9 @@ void presentation_pll_update(waywal_pll_t *pll, int64_t hw_time_ns, uint32_t ref
                 pll->phase_est_ns = hw_time_ns + pll->period_est_ns;
                 pll->last_hardware_time = hw_time_ns;
                 pll->jitter_ns = 0;
+                pll->frame_seq++;
+                pll->has_hw_clock = (flags & WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK) != 0;
+                pll->is_zero_copy = (flags & WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY) != 0;
                 return;
             }
         }
@@ -175,8 +184,12 @@ int64_t presentation_pll_predict_next_vblank(const waywal_pll_t *pll)
         return 0;
 
     clockid_t clk = (pll->has_clock_id) ? pll->clock_id : presentation_get_clock_id();
-    struct timespec now;
-    clock_gettime(clk, &now);
+    struct timespec now = {0};
+    if (clock_gettime(clk, &now) != 0) {
+        if (clk == CLOCK_MONOTONIC || clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            return pll->phase_est_ns;
+        }
+    }
     int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
 
     int64_t period = (pll->period_est_ns > 0) ? pll->period_est_ns : 16666667LL;

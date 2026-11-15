@@ -15,6 +15,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <malloc.h>
 #include <spawn.h>
@@ -79,6 +80,30 @@ static inline void output_surface_update_buffer_scale(output_node_t *node, int32
     }
 }
 
+static size_t shm_slot_bytes_for_frame(size_t frame_sz)
+{
+    long pg = sysconf(_SC_PAGESIZE);
+    size_t page_sz = (pg > 0) ? (size_t)pg : 4096u;
+    if (frame_sz == 0)
+        return page_sz;
+    if (frame_sz > SIZE_MAX - (page_sz - 1u))
+        return 0;
+    return ((frame_sz + page_sz - 1u) / page_sz) * page_sz;
+}
+
+static inline void *shm_get_slot_ptr(const output_node_t *node, int idx)
+{
+    if (!node || idx < 0 || idx > 1)
+        return NULL;
+    if (node->shm_slot_data[idx])
+        return node->shm_slot_data[idx];
+    if (node->shm_data && node->shm_size >= 8u) {
+        size_t half = node->shm_size / 2u;
+        return (uint8_t *)node->shm_data + (size_t)idx * half;
+    }
+    return NULL;
+}
+
 /* SHM ping-pong buffer release listener: tracks when compositor releases a buffer */
 static void shm_buffer_release(void *data, struct wl_buffer *wl_buffer)
 {
@@ -91,11 +116,11 @@ static void shm_buffer_release(void *data, struct wl_buffer *wl_buffer)
             bool video_playing =
                 (node->video_eng && node->video_eng->state != WAYWAL_VIDEO_STATE_STOPPED) ||
                 (node->state && node->state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED);
+            /* Only punch pages on disjoint page-aligned memfd slots so MADV_REMOVE
+             * can never zero pages shared with the peer slot (AUD-009). */
             if (!node->transition_active && (i != node->active_buffer_idx || video_playing) &&
-                node->shm_data && node->shm_size >= 8) {
-                size_t frame_sz = node->shm_size / 2;
-                void *inactive_ptr = (uint8_t *)node->shm_data + (size_t)i * frame_sz;
-                madvise(inactive_ptr, frame_sz, MADV_REMOVE);
+                node->shm_slot_data[i] && node->shm_slot_sizes[i] > 0) {
+                madvise(node->shm_slot_data[i], node->shm_slot_sizes[i], MADV_REMOVE);
             }
             break;
         }
@@ -117,11 +142,21 @@ static bool recompute_output_dimensions(output_node_t *out)
     uint32_t phys_w = out->logical_width;
     uint32_t phys_h = out->logical_height;
     if (out->fractional_scale > 0) {
-        phys_w = (out->logical_width * (uint32_t)out->fractional_scale + 60u) / 120u;
-        phys_h = (out->logical_height * (uint32_t)out->fractional_scale + 60u) / 120u;
+        uint64_t fw = ((uint64_t)out->logical_width * (uint64_t)out->fractional_scale + 60ULL) /
+                      120ULL;
+        uint64_t fh = ((uint64_t)out->logical_height * (uint64_t)out->fractional_scale + 60ULL) /
+                      120ULL;
+        if (fw > 0 && fw <= (uint64_t)INT32_MAX && fh > 0 && fh <= (uint64_t)INT32_MAX) {
+            phys_w = (uint32_t)fw;
+            phys_h = (uint32_t)fh;
+        }
     } else if (out->scale > 1) {
-        phys_w = out->logical_width * (uint32_t)out->scale;
-        phys_h = out->logical_height * (uint32_t)out->scale;
+        uint64_t sw = (uint64_t)out->logical_width * (uint64_t)out->scale;
+        uint64_t sh = (uint64_t)out->logical_height * (uint64_t)out->scale;
+        if (sw > 0 && sw <= (uint64_t)INT32_MAX && sh > 0 && sh <= (uint64_t)INT32_MAX) {
+            phys_w = (uint32_t)sw;
+            phys_h = (uint32_t)sh;
+        }
     } else if (out->mode_width > 0 && out->mode_height > 0) {
         bool rotated = (out->transform == WL_OUTPUT_TRANSFORM_90 ||
                         out->transform == WL_OUTPUT_TRANSFORM_270 ||
@@ -140,6 +175,56 @@ static bool recompute_output_dimensions(output_node_t *out)
     return (out->width != old_w || out->height != old_h);
 }
 
+static void output_reapply_geometry_and_commit(output_node_t *out)
+{
+    if (!out || !out->surface)
+        return;
+
+    if (out->viewport && out->logical_width > 0 && out->logical_height > 0) {
+        output_surface_update_buffer_scale(out, 1);
+        output_viewport_update_destination(out, (int32_t)out->logical_width,
+                                           (int32_t)out->logical_height);
+    } else {
+        int32_t target_scale = (out->fractional_scale > 0) ? 1 : (out->scale > 0 ? out->scale : 1);
+        output_surface_update_buffer_scale(out, target_scale);
+    }
+
+    if (!out->configured || !out->state || out->width <= 0 || out->height <= 0)
+        return;
+
+    bool size_changed =
+        out->dims_dirty || out->width != out->committed_buf_w || out->height != out->committed_buf_h;
+    bool anim_active =
+        out->transition_active || out->shader_active || out->anim_active || out->workshop_active ||
+        (out->video_eng && out->video_eng->state != WAYWAL_VIDEO_STATE_STOPPED) ||
+        (out->state->shader_active || out->state->anim_active || out->state->workshop_active ||
+         out->state->video_engine.state != WAYWAL_VIDEO_STATE_STOPPED);
+
+    if (size_changed && !anim_active) {
+        if (out->has_image && out->state->wallpaper_rgba) {
+            output_node_render_image(out->state, out, out->state->wallpaper_rgba,
+                                     out->state->wallpaper_w, out->state->wallpaper_h);
+        } else if (out->displaying_color) {
+            output_node_render_color(out->state, out, out->active_color);
+        } else {
+            color_rgba_t col =
+                out->has_fill_color ? out->fill_color : out->state->current_color;
+            output_node_render_color(out->state, out, col);
+        }
+        out->committed_buf_w = out->width;
+        out->committed_buf_h = out->height;
+        out->dims_dirty = false;
+    } else {
+        output_commit_frame(out);
+        if (!size_changed)
+            out->dims_dirty = false;
+    }
+
+    if (out->state->display) {
+        wl_display_flush(out->state->display);
+    }
+}
+
 static void fractional_scale_preferred_scale(void *data,
                                              struct wp_fractional_scale_v1 *wp_fractional_scale_v1,
                                              uint32_t scale)
@@ -150,14 +235,25 @@ static void fractional_scale_preferred_scale(void *data,
         return;
 
     out->fractional_scale = (int32_t)scale;
-    if (recompute_output_dimensions(out)) {
-        out->vp_configured = false;
+    /* Wait until configured to commit physical pixels so configure's delta check is
+     * never masked by a pre-configure dimension mutation (AUD-082). */
+    if (!out->configured) {
+        out->dims_dirty = true;
+        return;
     }
+    if (recompute_output_dimensions(out)) {
+        out->dims_dirty = true;
+    }
+    output_reapply_geometry_and_commit(out);
 }
 
 static const struct wp_fractional_scale_v1_listener fractional_scale_listener = {
     .preferred_scale = fractional_scale_preferred_scale,
 };
+
+static void release_output_bo_refs(daemon_state_t *state, output_node_t *node, dmabuf_bo_t *bo);
+static uint32_t pack_color_argb(color_rgba_t c);
+static void teardown_shm_slots(output_node_t *node);
 
 static void backdrop_layer_surface_configure(void *data,
                                              struct zwlr_layer_surface_v1 *layer_surface,
@@ -178,7 +274,11 @@ static void backdrop_layer_surface_configure(void *data,
                 output_backdrop_viewport_update_destination(node, dst_w, dst_h);
             }
             wl_surface_attach(node->backdrop_surface, node->backdrop_bo.wl_buffer, 0, 0);
-            wl_surface_damage_buffer(node->backdrop_surface, 0, 0, node->width, node->height);
+            int32_t dmg_w =
+                node->backdrop_bo.width > 0 ? (int32_t)node->backdrop_bo.width : node->width;
+            int32_t dmg_h =
+                node->backdrop_bo.height > 0 ? (int32_t)node->backdrop_bo.height : node->height;
+            wl_surface_damage_buffer(node->backdrop_surface, 0, 0, dmg_w, dmg_h);
             wl_surface_commit(node->backdrop_surface);
         }
     }
@@ -191,6 +291,13 @@ static void backdrop_layer_surface_closed(void *data, struct zwlr_layer_surface_
     if (!node)
         return;
     node->backdrop_configured = false;
+    node->backdrop_vp_dst_w = 0;
+    node->backdrop_vp_dst_h = 0;
+    if (node->has_backdrop_bo) {
+        release_output_bo_refs(node->state, node, &node->backdrop_bo);
+        dmabuf_bo_free(&node->backdrop_bo);
+        node->has_backdrop_bo = false;
+    }
     if (node->backdrop_viewport) {
         wp_viewport_destroy(node->backdrop_viewport);
         node->backdrop_viewport = NULL;
@@ -216,7 +323,11 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
                                     uint32_t serial, uint32_t width, uint32_t height)
 {
     output_node_t *out = (output_node_t *)data;
-    zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
+    if (layer_surface) {
+        zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
+    }
+    if (!out)
+        return;
 
     bool was_configured = out->configured;
     int32_t old_w = out->width;
@@ -227,13 +338,19 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
         (void)recompute_output_dimensions(out);
     }
     if (out->viewport && out->logical_width > 0 && out->logical_height > 0) {
+        output_surface_update_buffer_scale(out, 1);
         output_viewport_update_destination(out, (int32_t)out->logical_width,
                                            (int32_t)out->logical_height);
-    } else if (out->surface && out->scale > 1) {
-        output_surface_update_buffer_scale(out, out->scale);
+    } else if (out->surface) {
+        int32_t target_scale = (out->fractional_scale > 0) ? 1 : (out->scale > 0 ? out->scale : 1);
+        output_surface_update_buffer_scale(out, target_scale);
     }
     out->configured = true;
-    out->vp_configured = false;
+
+    bool dims_changed = (out->width != old_w || out->height != old_h || out->dims_dirty ||
+                         (out->committed_buf_w > 0 &&
+                          (out->width != out->committed_buf_w ||
+                           out->height != out->committed_buf_h)));
 
     WAYWAL_LOG_DEBUG("Output %s (%s) configured: logical=%ux%u physical=%dx%d", out->name,
                      out->description, out->logical_width, out->logical_height, out->width,
@@ -249,6 +366,9 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
                 out->video_eng ? out->video_eng : (out->state ? &out->state->video_engine : NULL);
             if (ve && ve->state != WAYWAL_VIDEO_STATE_STOPPED && ve->redraw_output &&
                 ve->redraw_output(ve, out)) {
+                out->committed_buf_w = out->width;
+                out->committed_buf_h = out->height;
+                out->dims_dirty = false;
                 return;
             }
 
@@ -262,44 +382,103 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
                 restore_bo = &out->dmabuf_ring.buffers[out->last_committed_ring_idx];
             }
 
-            if (restore_bo && out->surface) {
-                if (out->viewport) {
-                    wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1),
-                                           wl_fixed_from_int(-1), wl_fixed_from_int(-1),
-                                           wl_fixed_from_int(-1));
-                    output_viewport_update_destination(out, dst_w, dst_h);
+            if (restore_bo && out->surface && (int32_t)restore_bo->width == out->width &&
+                (int32_t)restore_bo->height == out->height) {
+                /* Avoid re-attaching an already-in-flight BO across surface recreate because
+                 * delayed wl_buffer.release from the destroyed surface clears in_use (AUD-105). */
+                if (restore_bo->in_use && out->state && out->use_dmabuf &&
+                    out->dmabuf_ring.initialized) {
+                    dmabuf_bo_t *fresh_bo = dmabuf_ring_acquire(&out->dmabuf_ring);
+                    if (fresh_bo && fresh_bo != restore_bo && fresh_bo->wl_buffer &&
+                        fresh_bo->width == restore_bo->width &&
+                        fresh_bo->height == restore_bo->height) {
+                        uint32_t clear_col =
+                            pack_color_argb(get_output_fill_color(out->state, out));
+                        if (render_engine_copy_bo(&out->state->render_engine, fresh_bo, restore_bo,
+                                                  WAYWAL_SCALING_STRETCH, clear_col, false)) {
+                            restore_bo = fresh_bo;
+                            out->last_presented_bo = fresh_bo;
+                            out->last_committed_ring_idx =
+                                (int)(fresh_bo - out->dmabuf_ring.buffers);
+                        } else {
+                            fresh_bo->in_use = false;
+                            fresh_bo = NULL;
+                        }
+                    } else if (fresh_bo) {
+                        fresh_bo->in_use = false;
+                        fresh_bo = NULL;
+                    }
+                    if (!fresh_bo && !out->displaying_color && out->has_image &&
+                        out->state->wallpaper_rgba) {
+                        restore_bo = NULL;
+                    }
                 }
-                restore_bo->in_use = true;
-                wl_surface_attach(out->surface, restore_bo->wl_buffer, 0, 0);
-                wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
-                output_commit_frame(out);
-                if (out->state && out->state->display) {
-                    wl_display_flush(out->state->display);
-                }
-                return;
-            }
-
-            if (!out->displaying_color && out->has_image && out->surface) {
-                if (out->shm_data && out->active_buffer_idx >= 0 && out->active_buffer_idx < 2 &&
-                    out->shm_buffers[out->active_buffer_idx]) {
+                if (restore_bo) {
                     if (out->viewport) {
                         wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1),
                                                wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                                wl_fixed_from_int(-1));
                         output_viewport_update_destination(out, dst_w, dst_h);
                     }
-                    out->shm_buffer_released[out->active_buffer_idx] = false;
-                    wl_surface_attach(out->surface, out->shm_buffers[out->active_buffer_idx], 0, 0);
+                    restore_bo->in_use = true;
+                    wl_surface_attach(out->surface, restore_bo->wl_buffer, 0, 0);
                     wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
                     output_commit_frame(out);
+                    out->committed_buf_w = out->width;
+                    out->committed_buf_h = out->height;
+                    out->dims_dirty = false;
                     if (out->state && out->state->display) {
                         wl_display_flush(out->state->display);
                     }
                     return;
                 }
+            }
+
+            if (!out->displaying_color && out->has_image && out->surface) {
+                int cur_idx = out->active_buffer_idx;
+                void *cur_ptr = (cur_idx >= 0 && cur_idx < 2) ? shm_get_slot_ptr(out, cur_idx)
+                                                              : NULL;
+                if (cur_ptr && out->shm_buffers[cur_idx] && out->shm_width == out->width &&
+                    out->shm_height == out->height) {
+                    int commit_idx = cur_idx;
+                    if (!out->shm_buffer_released[cur_idx]) {
+                        int peer_idx = 1 - cur_idx;
+                        void *peer_ptr = shm_get_slot_ptr(out, peer_idx);
+                        if (out->shm_buffer_released[peer_idx] && peer_ptr &&
+                            out->shm_buffers[peer_idx] && out->shm_frame_bytes > 0) {
+                            memcpy(peer_ptr, cur_ptr, out->shm_frame_bytes);
+                            commit_idx = peer_idx;
+                            out->active_buffer_idx = peer_idx;
+                        } else {
+                            commit_idx = -1;
+                        }
+                    }
+                    if (commit_idx >= 0) {
+                        if (out->viewport) {
+                            wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1),
+                                                   wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                                                   wl_fixed_from_int(-1));
+                            output_viewport_update_destination(out, dst_w, dst_h);
+                        }
+                        out->shm_buffer_released[commit_idx] = false;
+                        wl_surface_attach(out->surface, out->shm_buffers[commit_idx], 0, 0);
+                        wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
+                        output_commit_frame(out);
+                        out->committed_buf_w = out->width;
+                        out->committed_buf_h = out->height;
+                        out->dims_dirty = false;
+                        if (out->state && out->state->display) {
+                            wl_display_flush(out->state->display);
+                        }
+                        return;
+                    }
+                }
                 if (out->state && out->state->wallpaper_rgba) {
                     output_node_render_image(out->state, out, out->state->wallpaper_rgba,
                                              out->state->wallpaper_w, out->state->wallpaper_h);
+                    out->committed_buf_w = out->width;
+                    out->committed_buf_h = out->height;
+                    out->dims_dirty = false;
                     return;
                 }
             }
@@ -308,31 +487,42 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
                 color_rgba_t col = out->displaying_color ? out->active_color
                                                          : get_output_fill_color(out->state, out);
                 output_node_render_color(out->state, out, col);
+                out->committed_buf_w = out->width;
+                out->committed_buf_h = out->height;
+                out->dims_dirty = false;
             }
             return;
         }
 
         out->initial_configure_done = true;
-        if (out->last_presented_bo && out->last_presented_bo->wl_buffer && out->surface) {
+        if (out->last_presented_bo && out->last_presented_bo->wl_buffer && out->surface &&
+            (int32_t)out->last_presented_bo->width == out->width &&
+            (int32_t)out->last_presented_bo->height == out->height) {
             if (out->viewport) {
                 wp_viewport_set_source(out->viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
                                        wl_fixed_from_int(-1), wl_fixed_from_int(-1));
                 output_viewport_update_destination(out, dst_w, dst_h);
             }
+            out->last_presented_bo->in_use = true;
             wl_surface_attach(out->surface, out->last_presented_bo->wl_buffer, 0, 0);
             wl_surface_damage_buffer(out->surface, 0, 0, INT32_MAX, INT32_MAX);
             output_commit_frame(out);
+            out->committed_buf_w = out->width;
+            out->committed_buf_h = out->height;
+            out->dims_dirty = false;
             if (out->state && out->state->display) {
                 wl_display_flush(out->state->display);
             }
-        } else {
+        } else if (out->state) {
             output_node_render_color(out->state, out, out->state->current_color);
-            if (out->state && out->state->on_output_configured) {
+            if (out->state->on_output_configured) {
                 out->state->on_output_configured(out->state, out);
             }
+            out->committed_buf_w = out->width;
+            out->committed_buf_h = out->height;
+            out->dims_dirty = false;
         }
     } else {
-        bool dims_changed = (out->width != old_w || out->height != old_h);
         bool anim_active =
             out->transition_active || out->shader_active || out->anim_active ||
             out->workshop_active ||
@@ -356,8 +546,13 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
             } else {
                 output_commit_frame(out);
             }
+            out->committed_buf_w = out->width;
+            out->committed_buf_h = out->height;
+            out->dims_dirty = false;
         } else {
             output_commit_frame(out);
+            if (!dims_changed)
+                out->dims_dirty = false;
         }
         if (out->state && out->state->display) {
             wl_display_flush(out->state->display);
@@ -496,9 +691,10 @@ void output_node_create_surface(daemon_state_t *state, output_node_t *node)
     }
 
     node->mapped_while_fullscreen = node->wlr_has_fullscreen;
+    node->on_geometry_change = output_reapply_geometry_and_commit;
 
-    if (!state->viewporter && node->scale > 1) {
-        output_surface_update_buffer_scale(node, node->scale);
+    if (!state->viewporter) {
+        output_surface_update_buffer_scale(node, node->scale > 0 ? node->scale : 1);
     }
 
     wl_surface_commit(node->surface);
@@ -848,30 +1044,11 @@ void output_node_destroy_surface(output_node_t *node)
     node->staging_width = 0;
     node->staging_height = 0;
 
-    for (int i = 0; i < 2; ++i) {
-        if (node->shm_buffers[i]) {
-            wl_buffer_destroy(node->shm_buffers[i]);
-            node->shm_buffers[i] = NULL;
-        }
-        node->shm_buffer_released[i] = true;
-    }
-    if (node->shm_pool) {
-        wl_shm_pool_destroy(node->shm_pool);
-        node->shm_pool = NULL;
-    }
-    if (node->shm_data) {
-        munmap(node->shm_data, node->shm_size);
-        node->shm_data = NULL;
-        node->shm_size = 0;
-    }
-    node->shm_width = 0;
-    node->shm_height = 0;
-    if (node->shm_fd >= 0) {
-        close(node->shm_fd);
-        node->shm_fd = -1;
-    }
+    teardown_shm_slots(node);
 
     node->backdrop_configured = false;
+    node->backdrop_vp_dst_w = 0;
+    node->backdrop_vp_dst_h = 0;
     if (node->backdrop_viewport) {
         wp_viewport_destroy(node->backdrop_viewport);
         node->backdrop_viewport = NULL;
@@ -914,6 +1091,17 @@ void output_node_destroy_surface(output_node_t *node)
     node->configured = false;
     node->initial_configure_done = false;
     node->mapped_while_fullscreen = false;
+    node->has_cursor = false;
+    node->button_down = false;
+    node->click_pulse = false;
+    node->vp_dst_w = 0;
+    node->vp_dst_h = 0;
+    node->vp_configured = false;
+    node->last_buffer_scale = 0;
+    node->committed_buf_w = 0;
+    node->committed_buf_h = 0;
+    node->dims_dirty = false;
+    node->on_geometry_change = NULL;
     node->transition_active = false;
     node->transition_current_frame = 0;
     node->transition_total_frames = 0;
@@ -940,6 +1128,11 @@ void output_node_recreate_layer_surface(daemon_state_t *state, output_node_t *no
     node->mapped_while_fullscreen = false;
 
     node->backdrop_configured = false;
+    if (node->has_backdrop_bo) {
+        release_output_bo_refs(state, node, &node->backdrop_bo);
+        dmabuf_bo_free(&node->backdrop_bo);
+        node->has_backdrop_bo = false;
+    }
     if (node->backdrop_viewport) {
         wp_viewport_destroy(node->backdrop_viewport);
         node->backdrop_viewport = NULL;
@@ -980,10 +1173,17 @@ void output_node_recreate_layer_surface(daemon_state_t *state, output_node_t *no
         node->surface = NULL;
     }
     node->configured = false;
+    node->has_cursor = false;
+    node->button_down = false;
+    node->click_pulse = false;
+    node->vp_dst_w = 0;
+    node->vp_dst_h = 0;
     node->vp_configured = false;
     node->backdrop_vp_dst_w = 0;
     node->backdrop_vp_dst_h = 0;
     node->last_buffer_scale = 0;
+    node->committed_buf_w = 0;
+    node->committed_buf_h = 0;
 
     output_node_create_surface(state, node);
 }
@@ -1064,10 +1264,10 @@ static bool ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, int32
 
     uint32_t drm_format = DRM_FORMAT_ARGB8888;
     uint64_t modifier = gpu_ok ? state->dmabuf_ctx.preferred_modifier : DRM_FORMAT_MOD_LINEAR;
-    if (node->ten_bit && state->dmabuf_ctx.has_10bit) {
+    if (gpu_ok && node->ten_bit && state->dmabuf_ctx.has_10bit) {
         drm_format = state->dmabuf_ctx.format_10bit ? state->dmabuf_ctx.format_10bit
                                                     : DRM_FORMAT_ARGB2101010;
-        modifier = gpu_ok ? state->dmabuf_ctx.modifier_10bit : DRM_FORMAT_MOD_LINEAR;
+        modifier = state->dmabuf_ctx.modifier_10bit;
     }
 
     if (node->use_dmabuf && (int32_t)node->dmabuf_ring.width == width &&
@@ -1117,33 +1317,27 @@ bool layer_shell_ensure_dmabuf_ring(daemon_state_t *state, output_node_t *node, 
     return ensure_dmabuf_ring(state, node, width, height);
 }
 
-static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_t width,
-                              int32_t height)
+static void teardown_shm_slots(output_node_t *node)
 {
-    if (width <= 0 || height <= 0)
-        return false;
-    size_t stride = (size_t)width * 4;
-    size_t frame_sz = stride * (size_t)height;
-    size_t total_sz = frame_sz * 2; /* double-sized: two frames back-to-back */
-
-    /* Guard: wl_shm_create_pool takes int32_t size; ensure no overflow.
-     * For reference: 8K double-buf = 253MB, well below 2GB limit. */
-    if (total_sz > (size_t)INT32_MAX) {
-        WAYWAL_LOG_ERR("Output %s: SHM double-buffer too large (%zu bytes > INT32_MAX)", node->name,
-                       total_sz);
-        return false;
-    }
-
-    if (node->shm_data && node->shm_size == total_sz && node->shm_width == width &&
-        node->shm_height == height && node->shm_buffers[0] && node->shm_buffers[1]) {
-        return true;
-    }
-
-    /* Tear down existing resources */
+    if (!node)
+        return;
     for (int i = 0; i < 2; ++i) {
         if (node->shm_buffers[i]) {
             wl_buffer_destroy(node->shm_buffers[i]);
             node->shm_buffers[i] = NULL;
+        }
+        if (node->shm_pools[i]) {
+            wl_shm_pool_destroy(node->shm_pools[i]);
+            node->shm_pools[i] = NULL;
+        }
+        if (node->shm_slot_data[i]) {
+            munmap(node->shm_slot_data[i], node->shm_slot_sizes[i]);
+            node->shm_slot_data[i] = NULL;
+        }
+        node->shm_slot_sizes[i] = 0;
+        if (node->shm_fds[i] >= 0) {
+            close(node->shm_fds[i]);
+            node->shm_fds[i] = -1;
         }
         node->shm_buffer_released[i] = true;
     }
@@ -1154,8 +1348,9 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
     if (node->shm_data) {
         munmap(node->shm_data, node->shm_size);
         node->shm_data = NULL;
+        node->shm_size = 0;
     }
-    node->shm_size = 0;
+    node->shm_frame_bytes = 0;
     node->shm_width = 0;
     node->shm_height = 0;
     if (node->shm_fd >= 0) {
@@ -1163,69 +1358,76 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
         node->shm_fd = -1;
     }
     node->active_buffer_idx = 0;
+}
 
-    /* Allocate double-sized memfd */
-    node->shm_fd = waywal_create_memfd("waywal-shm-buf", total_sz, 0);
-    if (node->shm_fd < 0) {
-        WAYWAL_LOG_ERR("Failed to create memfd for output %s buffer", node->name);
+static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_t width,
+                              int32_t height)
+{
+    if (!state || !node || !state->shm || width <= 0 || height <= 0)
+        return false;
+    if ((size_t)width > SIZE_MAX / 4u)
+        return false;
+    size_t stride = (size_t)width * 4u;
+    if (stride > (size_t)INT32_MAX || (size_t)height > SIZE_MAX / stride)
+        return false;
+    size_t frame_sz = stride * (size_t)height;
+    size_t slot_sz = shm_slot_bytes_for_frame(frame_sz);
+
+    /* Guard: wl_shm_create_pool takes int32_t size; ensure no overflow. */
+    if (slot_sz == 0 || slot_sz > (size_t)INT32_MAX) {
+        WAYWAL_LOG_ERR("Output %s: SHM slot too large (%zu bytes > INT32_MAX)", node->name,
+                       slot_sz);
         return false;
     }
 
-    node->shm_data = mmap(NULL, total_sz, PROT_READ | PROT_WRITE, MAP_SHARED, node->shm_fd, 0);
-    if (node->shm_data == MAP_FAILED) {
-        WAYWAL_LOG_ERR("mmap failed for output %s buffer", node->name);
-        close(node->shm_fd);
-        node->shm_fd = -1;
-        node->shm_data = NULL;
-        return false;
-    }
-    node->shm_size = total_sz;
-
-    /* Create SHM pool over entire double-sized region */
-    node->shm_pool = wl_shm_create_pool(state->shm, node->shm_fd, (int32_t)total_sz);
-    if (!node->shm_pool) {
-        WAYWAL_LOG_ERR("wl_shm_create_pool failed");
-        munmap(node->shm_data, node->shm_size);
-        node->shm_data = NULL;
-        node->shm_size = 0;
-        close(node->shm_fd);
-        node->shm_fd = -1;
-        return false;
+    if (node->shm_slot_data[0] && node->shm_slot_data[1] &&
+        node->shm_slot_sizes[0] == slot_sz && node->shm_slot_sizes[1] == slot_sz &&
+        node->shm_frame_bytes == frame_sz && node->shm_width == width &&
+        node->shm_height == height && node->shm_buffers[0] && node->shm_buffers[1]) {
+        return true;
     }
 
-    /* Create two wl_buffers: buf[0] at offset 0, buf[1] at offset frame_sz */
-    bool buf_ok = true;
+    teardown_shm_slots(node);
+
+    /* Two disjoint page-aligned F_SEAL_SHRINK memfds prevent MADV_REMOVE on the
+     * inactive buffer from hole-punching pages shared with the peer buffer (AUD-009). */
     for (int i = 0; i < 2; ++i) {
-        int32_t offset = (int32_t)(i * frame_sz);
-        node->shm_buffers[i] = wl_shm_pool_create_buffer(node->shm_pool, offset, width, height,
+        node->shm_fds[i] = waywal_create_memfd("waywal-shm-buf", slot_sz, F_SEAL_SHRINK);
+        if (node->shm_fds[i] < 0) {
+            WAYWAL_LOG_ERR("Failed to create memfd[%d] for output %s buffer", i, node->name);
+            teardown_shm_slots(node);
+            return false;
+        }
+
+        void *mapped =
+            mmap(NULL, slot_sz, PROT_READ | PROT_WRITE, MAP_SHARED, node->shm_fds[i], 0);
+        if (mapped == MAP_FAILED) {
+            WAYWAL_LOG_ERR("mmap[%d] failed for output %s buffer", i, node->name);
+            teardown_shm_slots(node);
+            return false;
+        }
+        node->shm_slot_data[i] = mapped;
+        node->shm_slot_sizes[i] = slot_sz;
+
+        node->shm_pools[i] = wl_shm_create_pool(state->shm, node->shm_fds[i], (int32_t)slot_sz);
+        if (!node->shm_pools[i]) {
+            WAYWAL_LOG_ERR("wl_shm_create_pool[%d] failed", i);
+            teardown_shm_slots(node);
+            return false;
+        }
+
+        node->shm_buffers[i] = wl_shm_pool_create_buffer(node->shm_pools[i], 0, width, height,
                                                          (int32_t)stride, WL_SHM_FORMAT_ARGB8888);
         if (!node->shm_buffers[i]) {
             WAYWAL_LOG_ERR("wl_shm_pool_create_buffer[%d] failed", i);
-            buf_ok = false;
-            break;
+            teardown_shm_slots(node);
+            return false;
         }
         wl_buffer_add_listener(node->shm_buffers[i], &shm_buffer_listener, node);
         node->shm_buffer_released[i] = true;
     }
 
-    if (!buf_ok) {
-        /* Partial failure: clean up everything allocated so far */
-        for (int i = 0; i < 2; ++i) {
-            if (node->shm_buffers[i]) {
-                wl_buffer_destroy(node->shm_buffers[i]);
-                node->shm_buffers[i] = NULL;
-            }
-        }
-        wl_shm_pool_destroy(node->shm_pool);
-        node->shm_pool = NULL;
-        munmap(node->shm_data, node->shm_size);
-        node->shm_data = NULL;
-        node->shm_size = 0;
-        close(node->shm_fd);
-        node->shm_fd = -1;
-        return false;
-    }
-
+    node->shm_frame_bytes = frame_sz;
     node->shm_width = width;
     node->shm_height = height;
     return true;
@@ -1283,6 +1485,9 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
             wl_surface_attach(node->surface, sp_buf, 0, 0);
             wl_surface_damage_buffer(node->surface, 0, 0, INT32_MAX, INT32_MAX);
             output_commit_frame(node);
+            node->committed_buf_w = node->width;
+            node->committed_buf_h = node->height;
+            node->dims_dirty = false;
             wl_buffer_destroy(sp_buf);
             trim_output_dmabuf_ring(state, node);
             wl_display_flush(state->display);
@@ -1301,7 +1506,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                 uploaded = render_engine_upload_static(&state->render_engine, NULL, 0, 0, bo,
                                                        WAYWAL_SCALING_FILL, pixel);
             }
-            if (!uploaded && state->dmabuf_ctx.map_supported &&
+            if (!uploaded && state->dmabuf_ctx.map_supported && !bo->is_10bit &&
                 (bo->modifier == DRM_FORMAT_MOD_LINEAR || bo->modifier == DRM_FORMAT_MOD_INVALID)) {
                 uint32_t stride = 0;
                 void *map_data = NULL;
@@ -1339,6 +1544,9 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
                 wl_surface_attach(node->surface, bo->wl_buffer, 0, 0);
                 wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
                 output_commit_frame(node);
+                node->committed_buf_w = node->width;
+                node->committed_buf_h = node->height;
+                node->dims_dirty = false;
                 node->has_image = false;
                 node->last_presented_bo = bo;
                 node->last_committed_ring_idx = (int)(bo - node->dmabuf_ring.buffers);
@@ -1359,10 +1567,16 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
         return;
     }
 
-    /* Ping-pong: write to back buffer (not the one compositor is reading) */
+    /* Ping-pong: write only after compositor releases the back slot (AUD-007). */
     int back_idx = 1 - node->active_buffer_idx;
-    size_t frame_sz = (size_t)node->width * (size_t)node->height * sizeof(uint32_t);
-    uint32_t *pixels = (uint32_t *)((uint8_t *)node->shm_data + back_idx * frame_sz);
+    void *back_ptr = shm_get_slot_ptr(node, back_idx);
+    if (!node->shm_buffer_released[back_idx] || !back_ptr || !node->shm_buffers[back_idx]) {
+        WAYWAL_LOG_DEBUG("Output %s: SHM back slot %d still in use by compositor; skipping write",
+                         node->name, back_idx);
+        return;
+    }
+
+    uint32_t *pixels = (uint32_t *)back_ptr;
     size_t count = (size_t)node->width * (size_t)node->height;
     for (size_t i = 0; i < count; ++i) {
         pixels[i] = pixel;
@@ -1379,11 +1593,14 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
     node->shm_buffer_released[back_idx] = false;
     node->active_buffer_idx = back_idx;
     output_commit_frame(node);
+    node->committed_buf_w = node->width;
+    node->committed_buf_h = node->height;
+    node->dims_dirty = false;
     node->has_image = false;
     int inactive_idx = 1 - back_idx;
-    if (node->shm_buffer_released[inactive_idx]) {
-        void *inactive_ptr = (uint8_t *)node->shm_data + (size_t)inactive_idx * frame_sz;
-        madvise(inactive_ptr, frame_sz, MADV_REMOVE);
+    if (node->shm_buffer_released[inactive_idx] && node->shm_slot_data[inactive_idx] &&
+        node->shm_slot_sizes[inactive_idx] > 0) {
+        madvise(node->shm_slot_data[inactive_idx], node->shm_slot_sizes[inactive_idx], MADV_REMOVE);
     }
     wl_display_flush(state->display);
 }
@@ -1983,6 +2200,8 @@ static void render_backdrop_surface(daemon_state_t *state, output_node_t *node,
 {
     if (!state || !node || !state->backdrop_auto_blur || !node->backdrop_surface || !src_pixels)
         return;
+    if (node->width <= 0 || node->height <= 0 || img_w == 0 || img_h == 0)
+        return;
     if (!state->render_engine.gpu_compute_active || !state->render_engine.gpu_ctx)
         return;
 
@@ -2011,8 +2230,12 @@ static void render_backdrop_surface(daemon_state_t *state, output_node_t *node,
                 output_backdrop_viewport_update_destination(node, dst_w, dst_h);
             }
             if (node->backdrop_configured) {
+                int32_t dmg_w =
+                    node->backdrop_bo.width > 0 ? (int32_t)node->backdrop_bo.width : node->width;
+                int32_t dmg_h =
+                    node->backdrop_bo.height > 0 ? (int32_t)node->backdrop_bo.height : node->height;
                 wl_surface_attach(node->backdrop_surface, node->backdrop_bo.wl_buffer, 0, 0);
-                wl_surface_damage_buffer(node->backdrop_surface, 0, 0, node->width, node->height);
+                wl_surface_damage_buffer(node->backdrop_surface, 0, 0, dmg_w, dmg_h);
                 wl_surface_commit(node->backdrop_surface);
             }
         }
@@ -2065,7 +2288,7 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                 uploaded = render_engine_upload_static(&state->render_engine, src_pixels, img_w,
                                                        img_h, bo, node->scaling_mode, clear_color);
             }
-            if (!uploaded && state->dmabuf_ctx.map_supported &&
+            if (!uploaded && state->dmabuf_ctx.map_supported && !bo->is_10bit &&
                 (bo->modifier == DRM_FORMAT_MOD_LINEAR || bo->modifier == DRM_FORMAT_MOD_INVALID)) {
                 uint32_t stride = 0;
                 void *map_data = NULL;
@@ -2094,6 +2317,9 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
                 wl_surface_attach(node->surface, bo->wl_buffer, 0, 0);
                 wl_surface_damage_buffer(node->surface, 0, 0, node->width, node->height);
                 output_commit_frame(node);
+                node->committed_buf_w = node->width;
+                node->committed_buf_h = node->height;
+                node->dims_dirty = false;
                 node->has_image = true;
                 node->last_presented_bo = bo;
                 node->last_committed_ring_idx = (int)(bo - node->dmabuf_ring.buffers);
@@ -2112,8 +2338,13 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
     /* Fallback SHM rendering path */
     if (ensure_shm_buffer(state, node, node->width, node->height)) {
         int back_idx = 1 - node->active_buffer_idx;
-        size_t frame_sz = (size_t)node->width * (size_t)node->height * sizeof(uint32_t);
-        void *back_ptr = (uint8_t *)node->shm_data + back_idx * frame_sz;
+        void *back_ptr = shm_get_slot_ptr(node, back_idx);
+        if (!node->shm_buffer_released[back_idx] || !back_ptr || !node->shm_buffers[back_idx]) {
+            WAYWAL_LOG_DEBUG(
+                "Output %s: SHM back slot %d still in use by compositor; skipping write",
+                node->name, back_idx);
+            return;
+        }
         copy_or_scale_image_ex(node, (uint32_t *)back_ptr, (uint32_t)node->width,
                                (uint32_t)node->height, (size_t)node->width * sizeof(uint32_t), src,
                                img_w, img_h, node->scaling_mode, node->filter_mode, fill_col);
@@ -2122,11 +2353,15 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
         node->shm_buffer_released[back_idx] = false;
         node->active_buffer_idx = back_idx;
         output_commit_frame(node);
+        node->committed_buf_w = node->width;
+        node->committed_buf_h = node->height;
+        node->dims_dirty = false;
         node->has_image = true;
         int inactive_idx = 1 - back_idx;
-        if (node->shm_buffer_released[inactive_idx]) {
-            void *inactive_ptr = (uint8_t *)node->shm_data + (size_t)inactive_idx * frame_sz;
-            madvise(inactive_ptr, frame_sz, MADV_REMOVE);
+        if (node->shm_buffer_released[inactive_idx] && node->shm_slot_data[inactive_idx] &&
+            node->shm_slot_sizes[inactive_idx] > 0) {
+            madvise(node->shm_slot_data[inactive_idx], node->shm_slot_sizes[inactive_idx],
+                    MADV_REMOVE);
         }
         wl_display_flush(state->display);
     }
@@ -2315,13 +2550,16 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         }
         if (!pout->transition_active)
             continue;
-        /* Copy the currently committed (back) buffer into old staging */
-        if (pout->shm_data && pout->shm_old_data && pout->width > 0 && pout->height > 0) {
+        /* Copy the currently committed (front) buffer into old staging */
+        if (pout->shm_old_data && pout->width > 0 && pout->height > 0) {
             size_t fsz = (size_t)pout->width * (size_t)pout->height * sizeof(uint32_t);
-            if (pout->shm_size == fsz * 2 && pout->shm_buffer_cap >= fsz &&
+            void *displayed = shm_get_slot_ptr(pout, pout->active_buffer_idx);
+            bool slot_valid = (pout->shm_slot_data[pout->active_buffer_idx] != NULL &&
+                               pout->shm_frame_bytes == fsz) ||
+                              (pout->shm_data != NULL && pout->shm_size == fsz * 2u);
+            if (displayed && slot_valid && pout->shm_buffer_cap >= fsz &&
                 pout->shm_width == pout->width && pout->shm_height == pout->height &&
                 pout->staging_width == pout->width && pout->staging_height == pout->height) {
-                void *displayed = (uint8_t *)pout->shm_data + (size_t)pout->active_buffer_idx * fsz;
                 memcpy(pout->shm_old_data, displayed, fsz);
                 pout->has_image = true;
             }
@@ -2372,13 +2610,19 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
     }
 
     uint32_t fps = meta->transition_fps > 0 ? meta->transition_fps : 60;
-    uint32_t num_frames = (meta->transition_duration_ms * fps) / 1000;
-    if (num_frames < 2)
-        num_frames = 2;
+    uint64_t num_frames_u64 = ((uint64_t)meta->transition_duration_ms * (uint64_t)fps) / 1000ULL;
+    if (num_frames_u64 < 2ULL)
+        num_frames_u64 = 2ULL;
+    if (num_frames_u64 > (uint64_t)UINT32_MAX)
+        num_frames_u64 = (uint64_t)UINT32_MAX;
+    uint32_t num_frames = (uint32_t)num_frames_u64;
     uint64_t frame_interval_ns = 1000000000ULL / fps;
 
     uint32_t stagger_delay_ms = meta->stagger_delay_ms > 0 ? meta->stagger_delay_ms : 150;
-    uint32_t stagger_frames = (stagger_delay_ms * fps) / 1000;
+    uint64_t stagger_u64 = ((uint64_t)stagger_delay_ms * (uint64_t)fps) / 1000ULL;
+    if (stagger_u64 > (uint64_t)UINT32_MAX)
+        stagger_u64 = (uint64_t)UINT32_MAX;
+    uint32_t stagger_frames = (uint32_t)stagger_u64;
 
     const uint32_t *src = (const uint32_t *)pixels;
     int started_count = 0;
@@ -2432,7 +2676,9 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
             uint64_t modifier =
                 gpu_ok ? state->dmabuf_ctx.preferred_modifier : DRM_FORMAT_MOD_LINEAR;
             if (!out->has_source_new_bo || out->source_new_bo.width != (uint32_t)out->width ||
-                out->source_new_bo.height != (uint32_t)out->height) {
+                out->source_new_bo.height != (uint32_t)out->height ||
+                out->source_new_bo.drm_format != DRM_FORMAT_ARGB8888 ||
+                out->source_new_bo.modifier != modifier || out->source_new_bo.is_10bit) {
                 if (out->has_source_new_bo) {
                     release_output_bo_refs(state, out, &out->source_new_bo);
                     dmabuf_bo_free(&out->source_new_bo);
@@ -2455,6 +2701,7 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                                                                out->scaling_mode, clear_color);
                 }
                 if (!new_uploaded && state->dmabuf_ctx.map_supported &&
+                    !out->source_new_bo.is_10bit &&
                     (out->source_new_bo.modifier == DRM_FORMAT_MOD_LINEAR ||
                      out->source_new_bo.modifier == DRM_FORMAT_MOD_INVALID)) {
                     uint32_t stride_new = 0;
@@ -2475,10 +2722,15 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                     bool copied_old =
                         (out->has_source_old_bo && out->last_presented_bo == &out->source_old_bo &&
                          out->source_old_bo.width == (uint32_t)out->width &&
-                         out->source_old_bo.height == (uint32_t)out->height);
+                         out->source_old_bo.height == (uint32_t)out->height &&
+                         out->source_old_bo.drm_format == DRM_FORMAT_ARGB8888 &&
+                         !out->source_old_bo.is_10bit);
                     if (!out->has_source_old_bo ||
                         out->source_old_bo.width != (uint32_t)out->width ||
-                        out->source_old_bo.height != (uint32_t)out->height) {
+                        out->source_old_bo.height != (uint32_t)out->height ||
+                        out->source_old_bo.drm_format != DRM_FORMAT_ARGB8888 ||
+                        (!copied_old && out->source_old_bo.modifier != modifier) ||
+                        out->source_old_bo.is_10bit) {
                         if (out->has_source_old_bo) {
                             release_output_bo_refs(state, out, &out->source_old_bo);
                             dmabuf_bo_free(&out->source_old_bo);
@@ -2490,8 +2742,8 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                             out->has_source_old_bo = true;
                         }
                     }
+                    bool old_uploaded = copied_old;
                     if (out->has_source_old_bo && !copied_old) {
-                        bool old_uploaded = false;
                         if ((out->source_old_bo.map_data == NULL ||
                              !state->dmabuf_ctx.map_supported ||
                              out->source_old_bo.modifier != DRM_FORMAT_MOD_LINEAR) &&
@@ -2500,7 +2752,10 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                                 &state->render_engine, NULL, 0, 0, &out->source_old_bo,
                                 WAYWAL_SCALING_FILL, prev_clear_color);
                         }
-                        if (!old_uploaded && state->dmabuf_ctx.map_supported) {
+                        if (!old_uploaded && state->dmabuf_ctx.map_supported &&
+                            !out->source_old_bo.is_10bit &&
+                            (out->source_old_bo.modifier == DRM_FORMAT_MOD_LINEAR ||
+                             out->source_old_bo.modifier == DRM_FORMAT_MOD_INVALID)) {
                             uint32_t stride_old = 0;
                             void *map_data_old = NULL;
                             void *map_old =
@@ -2516,12 +2771,26 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                                     }
                                 }
                                 gbm_bo_unmap(out->source_old_bo.gbm_bo, map_data_old);
+                                old_uploaded = true;
                             }
                         }
                     }
-                    if (out->has_source_old_bo) {
+                    if (out->has_source_old_bo && old_uploaded) {
                         dmabuf_ok = true;
+                    } else {
+                        if (out->has_source_old_bo) {
+                            release_output_bo_refs(state, out, &out->source_old_bo);
+                            dmabuf_bo_free(&out->source_old_bo);
+                            out->has_source_old_bo = false;
+                        }
+                        release_output_bo_refs(state, out, &out->source_new_bo);
+                        dmabuf_bo_free(&out->source_new_bo);
+                        out->has_source_new_bo = false;
                     }
+                } else {
+                    release_output_bo_refs(state, out, &out->source_new_bo);
+                    dmabuf_bo_free(&out->source_new_bo);
+                    out->has_source_new_bo = false;
                 }
             }
         }
@@ -2537,10 +2806,13 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
                 continue;
             }
             size_t fsz = (size_t)out->width * (size_t)out->height * sizeof(uint32_t);
-            if (out->has_image && out->shm_data && out->shm_size == fsz * 2 &&
-                out->shm_width == out->width && out->shm_height == out->height) {
+            void *front_ptr = shm_get_slot_ptr(out, out->active_buffer_idx);
+            bool front_valid = (out->shm_slot_data[out->active_buffer_idx] != NULL &&
+                                out->shm_frame_bytes == fsz) ||
+                               (out->shm_data != NULL && out->shm_size == fsz * 2u);
+            if (out->has_image && front_ptr && front_valid && out->shm_width == out->width &&
+                out->shm_height == out->height) {
                 /* Snapshot the currently committed (front) buffer as the old frame */
-                void *front_ptr = (uint8_t *)out->shm_data + (size_t)out->active_buffer_idx * fsz;
                 memcpy(out->shm_old_data, front_ptr, fsz);
             } else {
                 uint32_t *old_u32 = (uint32_t *)out->shm_old_data;
@@ -2690,12 +2962,17 @@ static void transition_engine_step(daemon_state_t *state)
                 }
             }
         } else {
+            bool has_disjoint_shm =
+                (out->shm_slot_data[0] != NULL && out->shm_slot_data[1] != NULL &&
+                 out->shm_slot_sizes[0] >= frame_sz && out->shm_slot_sizes[1] >= frame_sz &&
+                 out->shm_frame_bytes == frame_sz);
+            bool has_legacy_shm = (out->shm_data != NULL && out->shm_size == frame_sz * 2u);
             if (out->width <= 0 || out->height <= 0 ||
                 (out->surface && (!out->shm_buffers[0] || !out->shm_buffers[1])) ||
-                !out->shm_data || !out->shm_old_data || !out->shm_new_data ||
-                out->shm_size != frame_sz * 2 || out->shm_buffer_cap < frame_sz ||
-                out->shm_width != out->width || out->shm_height != out->height ||
-                out->staging_width != out->width || out->staging_height != out->height) {
+                (!has_disjoint_shm && !has_legacy_shm) || !out->shm_old_data || !out->shm_new_data ||
+                out->shm_buffer_cap < frame_sz || out->shm_width != out->width ||
+                out->shm_height != out->height || out->staging_width != out->width ||
+                out->staging_height != out->height) {
                 abort_invalid = true;
             } else {
                 back_idx = 1 - out->active_buffer_idx;
@@ -2731,6 +3008,20 @@ static void transition_engine_step(daemon_state_t *state)
                 out->shm_buffer_cap = 0;
                 out->staging_width = 0;
                 out->staging_height = 0;
+            }
+            if (out->surface && out->configured && out->width > 0 && out->height > 0) {
+                if (!out->displaying_color && state->wallpaper_rgba && state->wallpaper_w > 0 &&
+                    state->wallpaper_h > 0) {
+                    output_node_render_image(state, out, state->wallpaper_rgba,
+                                             state->wallpaper_w, state->wallpaper_h);
+                } else if (out->displaying_color) {
+                    output_node_render_color(state, out, out->active_color);
+                } else {
+                    output_node_render_color(state, out, get_output_fill_color(state, out));
+                }
+                out->committed_buf_w = out->width;
+                out->committed_buf_h = out->height;
+                out->dims_dirty = false;
             }
             continue;
         }
@@ -2795,7 +3086,11 @@ static void transition_engine_step(daemon_state_t *state)
             struct timespec ts0, ts1;
             clock_gettime(CLOCK_MONOTONIC, &ts0);
 
-            void *back_ptr = (uint8_t *)out->shm_data + (size_t)back_idx * frame_sz;
+            void *back_ptr = shm_get_slot_ptr(out, back_idx);
+            if (!back_ptr) {
+                active_count++;
+                continue;
+            }
 
             /* OpenMP-parallelized CPU transition (16 threads, ~5–18ms for complex effects) */
             if (render_engine_execute_cpu_transition(
@@ -2858,10 +3153,10 @@ static void transition_engine_step(daemon_state_t *state)
                 out->staging_width = 0;
                 out->staging_height = 0;
                 int inactive_idx = 1 - out->active_buffer_idx;
-                if (out->shm_buffer_released[inactive_idx] && out->shm_data && out->shm_size >= 8) {
-                    size_t half_sz = out->shm_size / 2;
-                    void *inactive_ptr = (uint8_t *)out->shm_data + (size_t)inactive_idx * half_sz;
-                    madvise(inactive_ptr, half_sz, MADV_REMOVE);
+                if (out->shm_buffer_released[inactive_idx] && out->shm_slot_data[inactive_idx] &&
+                    out->shm_slot_sizes[inactive_idx] > 0) {
+                    madvise(out->shm_slot_data[inactive_idx], out->shm_slot_sizes[inactive_idx],
+                            MADV_REMOVE);
                 }
             }
         } else {
