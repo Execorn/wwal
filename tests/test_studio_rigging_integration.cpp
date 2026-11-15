@@ -22,8 +22,10 @@
 #include "waywal/we_puppet.h"
 
 #include <QApplication>
+#include <QColor>
 #include <QDir>
 #include <QFile>
+#include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -31,6 +33,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <thread>
@@ -51,6 +54,16 @@
 #include <vector>
 
 using namespace waywal::studio;
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+extern "C" __attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+{
+    return "leak:<unknown module>\nleak:libnvidia\nleak:libEGL\nleak:libGLESv2\nleak:dri\n";
+}
+#endif
 
 namespace {
 
@@ -445,6 +458,62 @@ bool writeExactFd(int fd, const void *buf, size_t n)
     return true;
 }
 
+bool recvExactHdrWithFds(int fd, waywal_ipc_hdr_t &outHdr, std::vector<int> &outFds)
+{
+    outFds.clear();
+    auto *p = reinterpret_cast<uint8_t *>(&outHdr);
+    size_t got = 0;
+    while (got < sizeof(outHdr)) {
+        struct iovec iov{};
+        iov.iov_base = p + got;
+        iov.iov_len = sizeof(outHdr) - got;
+
+        alignas(struct cmsghdr) char ctrlBuf[CMSG_SPACE(sizeof(int) * 4)]{};
+        struct msghdr msg{};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = ctrlBuf;
+        msg.msg_controllen = sizeof(ctrlBuf);
+
+        const ssize_t r = ::recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            for (int rfd : outFds) {
+                if (rfd >= 0) {
+                    ::close(rfd);
+                }
+            }
+            outFds.clear();
+            return false;
+        }
+        if (r == 0) {
+            for (int rfd : outFds) {
+                if (rfd >= 0) {
+                    ::close(rfd);
+                }
+            }
+            outFds.clear();
+            return false;
+        }
+        for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr;
+             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+                const size_t dataLen = cmsg->cmsg_len - CMSG_LEN(0);
+                const size_t count = dataLen / sizeof(int);
+                for (size_t i = 0; i < count; ++i) {
+                    int rfd = -1;
+                    std::memcpy(&rfd, CMSG_DATA(cmsg) + i * sizeof(int), sizeof(int));
+                    outFds.push_back(rfd);
+                }
+            }
+        }
+        got += static_cast<size_t>(r);
+    }
+    return true;
+}
+
 void test_mainwindow_rigging_wiring_export_weights_ik_and_lazy_hydration()
 {
     std::cout << "[Studio Rigging] Testing MainWindow .mdl export, weight undo/redo, "
@@ -530,8 +599,7 @@ void test_mainwindow_rigging_wiring_export_weights_ik_and_lazy_hydration()
                 (void)writeExactFd(connFd, &resp, sizeof(resp));
                 (void)writeExactFd(connFd, syntheticMdl.constData(),
                                    static_cast<size_t>(syntheticMdl.size()));
-            } else if (hdr.opcode != WAYWAL_REQ_SUBSCRIBE && hdr.opcode != WAYWAL_REQ_SET_UNIFORM &&
-                       hdr.opcode != WAYWAL_REQ_PUPPET_SCRUB_TIME) {
+            } else if (hdr.opcode != WAYWAL_REQ_SET_UNIFORM) {
                 waywal_ipc_hdr_t rhdr{};
                 rhdr.magic = WAYWAL_IPC_MAGIC;
                 rhdr.version = WAYWAL_IPC_VERSION;
@@ -689,6 +757,280 @@ void test_mainwindow_rigging_wiring_export_weights_ik_and_lazy_hydration()
                  "preservation & lazy hydration verified.\n";
 }
 
+void test_ipc_client_set_wallpaper_and_puppet_scrub_sync_wire()
+{
+    std::cout << "[Studio Rigging] Testing real IpcClient::setWallpaper (SCM_RIGHTS memfd) & "
+                 "WAYWAL_REQ_PUPPET_SCRUB_TIME sync reply discipline (E2E-F07)...\n";
+
+    QTemporaryDir tmpDir;
+    assert(tmpDir.isValid());
+    const QString sockPath = tmpDir.filePath(QStringLiteral("rigging-ipc-e2e.sock"));
+    const QString imgPath = tmpDir.filePath(QStringLiteral("test_wall.png"));
+
+    QImage img(6, 4, QImage::Format_RGBA8888);
+    img.fill(QColor(220, 45, 30, 255));
+    assert(img.save(imgPath, "PNG"));
+
+    const int listenFd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    assert(listenFd >= 0);
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    const QByteArray sockBa = sockPath.toUtf8();
+    assert(static_cast<size_t>(sockBa.size()) < sizeof(addr.sun_path));
+    std::memcpy(addr.sun_path, sockBa.constData(), static_cast<size_t>(sockBa.size()) + 1u);
+    ::unlink(addr.sun_path);
+    assert(::bind(listenFd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) == 0);
+    assert(::listen(listenFd, 4) == 0);
+
+    std::atomic<bool> stopServer{false};
+    std::atomic<bool> sawSetImageOk{false};
+    std::atomic<int> scrubCount{0};
+    std::atomic<int> exportCount{0};
+    std::atomic<uint32_t> observedScrubObj{0};
+    std::atomic<uint8_t> observedScrubPause{0};
+    std::atomic<double> observedScrubTime{0.0};
+
+    std::jthread serverThread([&](std::stop_token st) {
+        const int connFd = ::accept(listenFd, nullptr, nullptr);
+        if (connFd < 0) {
+            return;
+        }
+        while (!st.stop_requested() && !stopServer.load()) {
+            waywal_ipc_hdr_t hdr{};
+            std::vector<int> fds;
+            if (!recvExactHdrWithFds(connFd, hdr, fds)) {
+                break;
+            }
+            if (hdr.magic != WAYWAL_IPC_MAGIC) {
+                for (int rfd : fds) {
+                    if (rfd >= 0) {
+                        ::close(rfd);
+                    }
+                }
+                break;
+            }
+
+            if (hdr.opcode == WAYWAL_REQ_SET_IMAGE && !fds.empty()) {
+                const int memfd = fds.front();
+                for (size_t i = 1; i < fds.size(); ++i) {
+                    if (fds[i] >= 0) {
+                        ::close(fds[i]);
+                    }
+                }
+                const int seals = ::fcntl(memfd, F_GET_SEALS);
+                const bool hasShrinkSeal = (seals >= 0) && ((seals & F_SEAL_SHRINK) != 0);
+                std::vector<uint8_t> memBytes(static_cast<size_t>(hdr.payload_size));
+                const bool seeksOk = (::lseek(memfd, 0, SEEK_SET) == 0);
+                const bool readMemOk =
+                    seeksOk && readExactFd(memfd, memBytes.data(), memBytes.size());
+                ::close(memfd);
+
+                bool metaOk = false;
+                if (hasShrinkSeal && readMemOk &&
+                    memBytes.size() >= sizeof(waywal_img_metadata_t)) {
+                    waywal_img_metadata_t meta{};
+                    std::memcpy(&meta, memBytes.data(), sizeof(meta));
+                    const size_t expectedTotal =
+                        sizeof(waywal_img_metadata_t) + static_cast<size_t>(meta.extra_data_len) +
+                        static_cast<size_t>(meta.width) * static_cast<size_t>(meta.height) * 4u;
+                    const bool outputsMatch = [&]() {
+                        if (meta.num_target_outputs != 2u ||
+                            sizeof(waywal_img_metadata_t) + meta.extra_data_len > memBytes.size()) {
+                            return false;
+                        }
+                        const char *p = reinterpret_cast<const char *>(
+                            memBytes.data() + sizeof(waywal_img_metadata_t));
+                        const size_t maxExtra = static_cast<size_t>(meta.extra_data_len);
+                        const size_t len0 = ::strnlen(p, maxExtra);
+                        if (len0 >= maxExtra) {
+                            return false;
+                        }
+                        const QByteArray out0(p, static_cast<qsizetype>(len0));
+                        const size_t off1 = len0 + 1u;
+                        const size_t len1 = ::strnlen(p + off1, maxExtra - off1);
+                        if (off1 + len1 >= maxExtra) {
+                            return false;
+                        }
+                        const QByteArray out1(p + off1, static_cast<qsizetype>(len1));
+                        return out0 == QByteArrayLiteral("DP-1") &&
+                               out1 == QByteArrayLiteral("HDMI-A-1");
+                    }();
+
+                    metaOk = (meta.width == 6u) && (meta.height == 4u) &&
+                             (memBytes.size() == expectedTotal) &&
+                             (meta.scaling_mode == WAYWAL_SCALING_CENTER) &&
+                             (meta.transition_type == WAYWAL_TRANSITION_WIPE) &&
+                             (meta.transition_duration_ms == 850u) &&
+                             (meta.transition_fps == 120u) && (meta.has_crop_gravity == 1u) &&
+                             (std::fabs(meta.crop_gravity_x - 0.25f) < 1e-4f) &&
+                             (std::fabs(meta.crop_gravity_y - 0.75f) < 1e-4f) &&
+                             meta.has_custom_bezier &&
+                             (std::fabs(meta.bezier.p1x - 0.12f) < 1e-4f) &&
+                             (std::fabs(meta.bezier.p1y - 0.88f) < 1e-4f) &&
+                             (std::strcmp(meta.backdrop, "blur") == 0) &&
+                             (std::strcmp(meta.layer_name, "overlay") == 0) &&
+                             (std::strcmp(meta.battery_policy, "reduce-fps") == 0) && outputsMatch;
+                }
+                sawSetImageOk.store(metaOk);
+
+                waywal_ipc_hdr_t rhdr{};
+                rhdr.magic = WAYWAL_IPC_MAGIC;
+                rhdr.version = WAYWAL_IPC_VERSION;
+                rhdr.opcode = WAYWAL_RESP_OK;
+                rhdr.payload_size = 0;
+                (void)writeExactFd(connFd, &rhdr, sizeof(rhdr));
+                continue;
+            }
+
+            for (int rfd : fds) {
+                if (rfd >= 0) {
+                    ::close(rfd);
+                }
+            }
+
+            std::vector<uint8_t> payload(static_cast<size_t>(hdr.payload_size));
+            if (hdr.payload_size > 0 && !readExactFd(connFd, payload.data(), payload.size())) {
+                break;
+            }
+
+            if (hdr.opcode == WAYWAL_REQ_PUPPET_SCRUB_TIME &&
+                payload.size() == sizeof(waywal_ipc_puppet_scrub_t)) {
+                waywal_ipc_puppet_scrub_t scrubReq{};
+                std::memcpy(&scrubReq, payload.data(), sizeof(scrubReq));
+                const int callNo = scrubCount.fetch_add(1) + 1;
+                if (callNo == 1) {
+                    observedScrubObj.store(scrubReq.object_id);
+                    observedScrubPause.store(scrubReq.pause_playback);
+                    observedScrubTime.store(scrubReq.time_sec);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    waywal_ipc_hdr_t rhdr{};
+                    rhdr.magic = WAYWAL_IPC_MAGIC;
+                    rhdr.version = WAYWAL_IPC_VERSION;
+                    rhdr.opcode = WAYWAL_RESP_OK;
+                    rhdr.payload_size = 0;
+                    (void)writeExactFd(connFd, &rhdr, sizeof(rhdr));
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    const QByteArray errText("scrub_sync_err");
+                    waywal_ipc_hdr_t rhdr{};
+                    rhdr.magic = WAYWAL_IPC_MAGIC;
+                    rhdr.version = WAYWAL_IPC_VERSION;
+                    rhdr.opcode = WAYWAL_RESP_ERR;
+                    rhdr.payload_size = static_cast<uint64_t>(errText.size());
+                    (void)writeExactFd(connFd, &rhdr, sizeof(rhdr));
+                    (void)writeExactFd(connFd, errText.constData(),
+                                       static_cast<size_t>(errText.size()));
+                }
+            } else if (hdr.opcode == WAYWAL_REQ_EXPORT_PUPPET_MDL &&
+                       payload.size() >= sizeof(waywal_ipc_export_puppet_mdl_t)) {
+                waywal_ipc_export_puppet_mdl_t expReq{};
+                std::memcpy(&expReq, payload.data(), sizeof(expReq));
+                const int expNo = exportCount.fetch_add(1) + 1;
+                const QByteArray tag = QStringLiteral("SYNC_MDL_OK_v%1").arg(expNo).toUtf8();
+
+                waywal_ipc_export_puppet_mdl_resp_t resp{};
+                resp.status = 0;
+                resp.object_id = expReq.object_id;
+                resp.mdl_byte_size = static_cast<uint32_t>(tag.size());
+
+                waywal_ipc_hdr_t rhdr{};
+                rhdr.magic = WAYWAL_IPC_MAGIC;
+                rhdr.version = WAYWAL_IPC_VERSION;
+                rhdr.opcode = WAYWAL_RESP_EXPORT_PUPPET_MDL;
+                rhdr.payload_size = sizeof(resp) + static_cast<uint64_t>(tag.size());
+                (void)writeExactFd(connFd, &rhdr, sizeof(rhdr));
+                (void)writeExactFd(connFd, &resp, sizeof(resp));
+                (void)writeExactFd(connFd, tag.constData(), static_cast<size_t>(tag.size()));
+            } else if (hdr.opcode != WAYWAL_REQ_SET_UNIFORM) {
+                waywal_ipc_hdr_t rhdr{};
+                rhdr.magic = WAYWAL_IPC_MAGIC;
+                rhdr.version = WAYWAL_IPC_VERSION;
+                rhdr.opcode = WAYWAL_RESP_OK;
+                rhdr.payload_size = 0;
+                (void)writeExactFd(connFd, &rhdr, sizeof(rhdr));
+            }
+        }
+        ::close(connFd);
+    });
+
+    IpcClient client(QStringLiteral("default"), sockPath, nullptr, false);
+    QStringList receivedErrors;
+    QVector<QPair<int32_t, QByteArray>> receivedMdls;
+    QObject::connect(&client, &IpcClient::errorOccurred,
+                     [&](const QString &msg) { receivedErrors.push_back(msg); });
+    QObject::connect(&client, &IpcClient::puppetMdlExported,
+                     [&](const waywal_ipc_export_puppet_mdl_resp_t &resp, const QByteArray &bytes) {
+                         receivedMdls.push_back({resp.status, bytes});
+                     });
+
+    client.start();
+
+    const auto pumpUntil = [&](auto &&pred, int maxMs = 2000) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(maxMs);
+        while (!pred() && std::chrono::steady_clock::now() < deadline) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    };
+
+    pumpUntil([&]() { return client.isConnected(); });
+    assert(client.isConnected());
+
+    /* 1. Real IpcClient::setWallpaper sends sealed memfd + full metadata + outputs */
+    WallpaperApplyOptions wallOpts;
+    wallOpts.filepath = imgPath;
+    wallOpts.targetOutputs = {QStringLiteral("DP-1"), QStringLiteral("HDMI-A-1")};
+    wallOpts.backdrop = QStringLiteral("blur");
+    wallOpts.layerName = QStringLiteral("overlay");
+    wallOpts.batteryPolicy = QStringLiteral("reduce-fps");
+    wallOpts.scaling_mode = WAYWAL_SCALING_CENTER;
+    wallOpts.transition_type = WAYWAL_TRANSITION_WIPE;
+    wallOpts.transition_duration_ms = 850u;
+    wallOpts.transition_fps = 120u;
+    wallOpts.has_crop_gravity = true;
+    wallOpts.crop_gravity_x = 0.25f;
+    wallOpts.crop_gravity_y = 0.75f;
+    wallOpts.has_custom_bezier = true;
+    wallOpts.bezier = bezier_curve_t{0.12f, 0.88f, 0.74f, 0.96f};
+    client.setWallpaper(wallOpts);
+
+    pumpUntil([&]() { return sawSetImageOk.load(); });
+    assert(sawSetImageOk.load());
+
+    /* 2. E2E-F07: PUPPET_SCRUB_TIME waits for WAYWAL_RESP_OK and keeps follow-up RPC aligned */
+    assert(client.sendPuppetScrubTime(7u, 1.25f, true, 0u));
+    assert(client.sendExportPuppetMdl(7u, 0x1u));
+    pumpUntil([&]() { return receivedMdls.size() == 1; });
+    assert(scrubCount.load() == 1);
+    assert(observedScrubObj.load() == 7u);
+    assert(observedScrubPause.load() == 1u);
+    assert(std::fabs(observedScrubTime.load() - 1.25) < 1e-4);
+    assert(receivedErrors.isEmpty());
+    assert(receivedMdls[0].first == 0);
+    assert(receivedMdls[0].second == QByteArrayLiteral("SYNC_MDL_OK_v1"));
+
+    /* 3. Error on PUPPET_SCRUB_TIME stays bound to scrub and does not corrupt subsequent export */
+    assert(client.sendPuppetScrubTime(7u, 2.50f, false, 0u));
+    assert(client.sendExportPuppetMdl(7u, 0x1u));
+    pumpUntil([&]() { return receivedErrors.size() == 1 && receivedMdls.size() == 2; });
+    assert(scrubCount.load() == 2);
+    assert(receivedErrors.size() == 1);
+    assert(receivedErrors[0].contains(QStringLiteral("scrub_sync_err")));
+    assert(receivedMdls.size() == 2);
+    assert(receivedMdls[1].first == 0);
+    assert(receivedMdls[1].second == QByteArrayLiteral("SYNC_MDL_OK_v2"));
+
+    stopServer.store(true);
+    client.stop();
+    ::shutdown(listenFd, SHUT_RDWR);
+    ::close(listenFd);
+    serverThread.request_stop();
+
+    std::cout << "  -> PASS: IpcClient::setWallpaper (SCM_RIGHTS memfd) & PUPPET_SCRUB_TIME sync "
+                 "wire protocol verified.\n";
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -708,6 +1050,7 @@ int main(int argc, char *argv[])
     test_bone_rig_cycle_guard_and_xpbd_drive_linkage();
     test_timeline_fcurve_bake_and_visibility_gating();
     test_mainwindow_rigging_wiring_export_weights_ik_and_lazy_hydration();
+    test_ipc_client_set_wallpaper_and_puppet_scrub_sync_wire();
 
     std::cout << "=================================================================\n";
     std::cout << "All Studio Rigging Integration Tests PASSED!\n";

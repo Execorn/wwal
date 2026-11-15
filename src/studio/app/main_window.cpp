@@ -1610,10 +1610,13 @@ void MainWindow::syncThemeStateToIpcOrActiveWallpaper(bool includeApplyHint)
     if (!m_themeStudio) {
         return;
     }
-    if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+    IIpcClientService *ipc =
+        m_session ? m_session->activeIpcService() : Services::instance().ipcClient();
+    if (ipc && ipc->isConnected()) {
         ipc->sendAudioPowerConfig(m_audioVolume, m_muteOnAudio ? 1 : 0, 0, m_batteryPolicy);
     }
-    if (includeApplyHint && !m_activeWallpaperPath.isEmpty() && QFileInfo::exists(m_activeWallpaperPath)) {
+    if (includeApplyHint && !m_activeWallpaperPath.isEmpty() &&
+        QFileInfo::exists(m_activeWallpaperPath)) {
         applyWallpaperPath(m_activeWallpaperPath, resolveSelectedOutputsCsv());
     }
 }
@@ -1952,6 +1955,7 @@ void MainWindow::setupToolBar()
 
     // Status label
     m_statusLabel = new QLabel(QStringLiteral("Ready"), this);
+    m_statusLabel->setObjectName(QStringLiteral("studioStatusLabel"));
     m_statusLabel->setStyleSheet(
         QStringLiteral("color: #cbd5e1; font-size: 11px; padding-right: 8px;"));
     toolbar->addWidget(m_statusLabel);
@@ -3606,15 +3610,23 @@ void MainWindow::applyWallpaperPath(const QString &path, const QString &explicit
         req.hasSourceColorIndex = true;
         req.sourceColorIndex = m_themeStudio->seedIndex();
     }
+    req.batteryPolicy = StudioSessionContext::batteryPolicyCliName(m_batteryPolicy);
 
     const WallpaperApplyRequest oldReq =
         m_session ? m_session->lastAppliedRequest() : WallpaperApplyRequest{};
     const waywal_img_metadata_t oldMeta = StudioSessionContext::buildImgMetadata(oldReq);
     const waywal_img_metadata_t newMeta = StudioSessionContext::buildImgMetadata(req);
 
-    auto applyFn = [this, prevActivePath](const QString &outSpec,
-                                          const waywal_img_metadata_t &meta,
-                                          const QString &targetPath) {
+    const QString oldOutSpec = oldReq.targetOutputsCsv;
+    const QString oldPath = oldReq.path;
+    const uint32_t oldScaling = oldMeta.scaling_mode;
+    const uint32_t oldTrans = oldMeta.transition_type;
+    const uint32_t newScaling = newMeta.scaling_mode;
+    const uint32_t newTrans = newMeta.transition_type;
+
+    auto applyFn = [this, prevActivePath, oldOutSpec, oldPath, oldScaling, oldTrans, newScaling,
+                    newTrans, path](const QString &outSpec, const waywal_img_metadata_t &meta,
+                                    const QString &targetPath) {
         if (targetPath.isEmpty()) {
             m_activeWallpaperPath.clear();
             if (m_statusLabel) {
@@ -3622,11 +3634,35 @@ void MainWindow::applyWallpaperPath(const QString &path, const QString &explicit
             }
             return;
         }
+        // ApplyWallpaperCommand stores a single m_output string; restore the prior target
+        // display routing on undo when scaling, transition, or path differs from redo state.
+        const bool isUndoState =
+            !oldOutSpec.isEmpty() && targetPath == oldPath && meta.scaling_mode == oldScaling &&
+            meta.transition_type == oldTrans &&
+            (oldPath != path || oldScaling != newScaling || oldTrans != newTrans);
+        const QString effectiveOutSpec = isUndoState ? oldOutSpec : outSpec;
         const WallpaperApplyRequest effReq = StudioSessionContext::requestFromMetadata(
-            m_options.namespaceStr, outSpec, meta, targetPath);
+            m_options.namespaceStr, effectiveOutSpec, meta, targetPath);
         const bool pathChanged = (targetPath != prevActivePath);
-        const bool dispatched = StudioSessionContext::dispatchWwalCli(
-            StudioSessionContext::buildWallpaperApplyArgs(effReq));
+
+        IIpcClientService *activeIpc =
+            m_session ? m_session->activeIpcService() : Services::instance().ipcClient();
+        const bool useCliFallback =
+            (activeIpc == nullptr) ||
+            StudioSessionContext::requiresCliFallbackMediaPath(targetPath);
+
+        bool dispatchedViaIpc = false;
+        bool dispatchedViaCli = false;
+        if (!useCliFallback && activeIpc != nullptr) {
+            const WallpaperApplyOptions opts =
+                StudioSessionContext::toWallpaperApplyOptions(effReq);
+            activeIpc->setWallpaper(opts);
+            dispatchedViaIpc = true;
+        } else {
+            // Non-image assets (video/shader/workshop) and IPC-less contexts dispatch via CLI.
+            dispatchedViaCli = StudioSessionContext::dispatchWwalCli(
+                StudioSessionContext::buildWallpaperApplyArgs(effReq));
+        }
 
         if (m_session) {
             m_session->setLastAppliedRequest(effReq);
@@ -3649,17 +3685,19 @@ void MainWindow::applyWallpaperPath(const QString &path, const QString &explicit
             }
         }
         if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
-            ipc->sendQuerySceneTree(normalizeTargetOutputSpec(outSpec));
+            ipc->sendQuerySceneTree(normalizeTargetOutputSpec(effectiveOutSpec));
         }
         if (m_statusLabel) {
             const QString fileName = QFileInfo(targetPath).fileName();
-            m_statusLabel->setText(
-                dispatched
-                    ? QStringLiteral("Applied Wallpaper (%1): %2")
-                          .arg(StudioSessionContext::scalingModeCliName(effReq.scalingMode),
-                               fileName)
-                    : QStringLiteral("wwal CLI unavailable; updated preview for %1")
-                          .arg(fileName));
+            const QString modeName = StudioSessionContext::scalingModeCliName(effReq.scalingMode);
+            if (dispatchedViaIpc || dispatchedViaCli) {
+                m_statusLabel->setText(
+                    QStringLiteral("Applied Wallpaper (%1): %2").arg(modeName, fileName));
+            } else {
+                m_statusLabel->setText(
+                    QStringLiteral("wwal CLI unavailable; updated preview for %1")
+                        .arg(fileName));
+            }
         }
     };
 

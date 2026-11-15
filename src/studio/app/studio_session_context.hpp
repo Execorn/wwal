@@ -29,8 +29,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -50,6 +52,11 @@ struct WallpaperApplyRequest {
     QString namespaceStr;
     QString path;
     QString targetOutputsCsv;
+    QString backdrop;
+    QString layerName;
+    QString batteryPolicy;
+    QString depthMapPath;
+    QString customShaderGlsl;
     uint32_t transitionType{WAYWAL_TRANSITION_FADE};
     uint32_t transitionDurationMs{1000};
     uint32_t transitionFps{144};
@@ -61,13 +68,32 @@ struct WallpaperApplyRequest {
     bezier_curve_t bezier{{0.25f}, {0.1f}, {0.25f}, {1.0f}};
     bool hasCustomBezier{true};
     uint32_t scalingMode{WAYWAL_SCALING_FILL};
+    uint32_t filterMode{WAYWAL_FILTER_LANCZOS3};
     float cropGravityX{0.5f};
     float cropGravityY{0.5f};
     bool hasCropGravity{false};
+    float depthStrength{1.0f};
+    uint32_t syncMode{0};
+    uint32_t staggerDelayMs{0};
+    bool tenBit{false};
+    bool invertY{false};
+    bool posYInverted{false};
+    bool noCache{false};
+    bool extractTheme{false};
+    bool noTheme{false};
     bool hasThemeMode{false};
     bool themeLightMode{false};
+    bool isSolidColor{false};
+    uint8_t color[4]{0, 0, 0, 255};
+    bool hasSeedColor{false};
+    uint32_t seedColor{0};
     bool hasSourceColorIndex{false};
     uint8_t sourceColorIndex{0};
+    bool hasAutoDayNight{false};
+    bool autoDayNight{false};
+    bool hasSolarCoords{false};
+    double solarLatitude{0.0};
+    double solarLongitude{0.0};
 };
 
 /**
@@ -193,6 +219,8 @@ class StudioSessionContext {
         if (Services::instance().ipcClient() == m_ipcClient.get()) {
             Services::instance().setIpcClient(nullptr);
         }
+        m_hasIpcOverride = false;
+        m_ipcOverride = nullptr;
         if (m_ipcClient) {
             m_ipcClient->stop();
         }
@@ -201,6 +229,20 @@ class StudioSessionContext {
 
     [[nodiscard]] CommandBus *commandBus() const noexcept { return m_commandBus.get(); }
     [[nodiscard]] IpcClient *ipcClient() const noexcept { return m_ipcClient.get(); }
+    [[nodiscard]] IIpcClientService *activeIpcService() const noexcept
+    {
+        return m_hasIpcOverride ? m_ipcOverride : Services::instance().ipcClient();
+    }
+    void setIpcServiceOverride(IIpcClientService *svc) noexcept
+    {
+        m_ipcOverride = svc;
+        m_hasIpcOverride = true;
+    }
+    void clearIpcServiceOverride() noexcept
+    {
+        m_ipcOverride = nullptr;
+        m_hasIpcOverride = false;
+    }
     [[nodiscard]] PresetStore *presetStore() const noexcept { return m_presetStore.get(); }
     [[nodiscard]] const std::shared_ptr<CatalogIndexManager> &catalogIndexManager() const noexcept
     {
@@ -344,39 +386,135 @@ class StudioSessionContext {
         return QStringLiteral("fade");
     }
 
-    [[nodiscard]] static waywal_img_metadata_t
-    buildImgMetadata(const WallpaperApplyRequest &req) noexcept
+    enum class MediaDispatchKind {
+        Image,
+        Video,
+        Shader,
+        Workshop,
+    };
+
+    [[nodiscard]] static QString batteryPolicyCliName(uint8_t policy)
     {
-        waywal_img_metadata_t meta{};
-        meta.transition_type = req.transitionType;
-        meta.transition_duration_ms = std::clamp(req.transitionDurationMs, 0u, 3600000u);
-        meta.transition_fps = std::clamp(req.transitionFps, 15u, 360u);
-        meta.transition_angle_rad = req.angleDeg * 0.017453292519943295f;
-        meta.transition_wave_freq = req.waveFreq;
-        meta.transition_wave_amp = req.waveAmp;
-        meta.transition_center_x = std::clamp(req.centerX, 0.0f, 1.0f);
-        meta.transition_center_y = std::clamp(req.centerY, 0.0f, 1.0f);
-        meta.bezier = req.bezier;
-        meta.has_custom_bezier = req.hasCustomBezier;
-        meta.scaling_mode = req.scalingMode <= WAYWAL_SCALING_SPAN
+        switch (policy) {
+        case 1:
+            return QStringLiteral("reduce-fps");
+        case 2:
+            return QStringLiteral("pause-video");
+        default:
+            return QStringLiteral("ignore");
+        }
+    }
+
+    [[nodiscard]] static QStringList parseTargetOutputsCsv(const QString &targetOutputsCsv)
+    {
+        QStringList outputs;
+        const QStringList parts = targetOutputsCsv.split(QLatin1Char(','), Qt::SkipEmptyParts);
+        for (const QString &raw : parts) {
+            const QString trimmed = raw.trimmed();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (trimmed == QStringLiteral("*") ||
+                trimmed.compare(QStringLiteral("All Displays"), Qt::CaseInsensitive) == 0) {
+                return {};
+            }
+            outputs.push_back(trimmed);
+        }
+        return outputs;
+    }
+
+    [[nodiscard]] static MediaDispatchKind classifyMediaPath(const QString &path)
+    {
+        const QFileInfo fi(path);
+        const QString fileName = fi.fileName().toLower();
+        const QString lowerPath = path.toLower();
+        if (fi.isDir() || fileName == QStringLiteral("scene.json") ||
+            fileName == QStringLiteral("project.json")) {
+            return MediaDispatchKind::Workshop;
+        }
+        if (lowerPath.endsWith(QStringLiteral(".frag")) ||
+            lowerPath.endsWith(QStringLiteral(".glsl")) ||
+            lowerPath.endsWith(QStringLiteral(".shader")) ||
+            lowerPath.endsWith(QStringLiteral(".comp")) ||
+            lowerPath.endsWith(QStringLiteral(".hlsl"))) {
+            return MediaDispatchKind::Shader;
+        }
+        if (lowerPath.endsWith(QStringLiteral(".mp4")) ||
+            lowerPath.endsWith(QStringLiteral(".mkv")) ||
+            lowerPath.endsWith(QStringLiteral(".webm")) ||
+            lowerPath.endsWith(QStringLiteral(".mov")) ||
+            lowerPath.endsWith(QStringLiteral(".avi")) ||
+            lowerPath.endsWith(QStringLiteral(".m4v"))) {
+            return MediaDispatchKind::Video;
+        }
+        return MediaDispatchKind::Image;
+    }
+
+    [[nodiscard]] static bool requiresCliFallbackMediaPath(const QString &path)
+    {
+        // IpcClient::setWallpaper encodes images via WAYWAL_REQ_SET_IMAGE; video/shader/workshop paths require CLI.
+        return classifyMediaPath(path) != MediaDispatchKind::Image;
+    }
+
+    [[nodiscard]] static WallpaperApplyOptions
+    toWallpaperApplyOptions(const WallpaperApplyRequest &req)
+    {
+        WallpaperApplyOptions opts;
+        opts.filepath = req.path;
+        opts.targetOutputs = parseTargetOutputsCsv(req.targetOutputsCsv);
+        opts.customShaderGlsl = req.customShaderGlsl;
+        opts.depthMapPath = req.depthMapPath;
+        opts.backdrop = req.backdrop;
+        opts.layerName = req.layerName;
+        opts.batteryPolicy = req.batteryPolicy;
+        opts.scaling_mode = req.scalingMode <= WAYWAL_SCALING_SPAN
                                 ? req.scalingMode
                                 : static_cast<uint32_t>(WAYWAL_SCALING_FILL);
-        meta.crop_gravity_x = std::clamp(req.cropGravityX, 0.0f, 1.0f);
-        meta.crop_gravity_y = std::clamp(req.cropGravityY, 0.0f, 1.0f);
-        meta.has_crop_gravity = req.hasCropGravity ? 1u : 0u;
-        meta.has_theme_mode = req.hasThemeMode ? 1u : 0u;
-        meta.theme_light_mode = req.themeLightMode;
-        meta.has_source_color_index = req.hasSourceColorIndex ? 1u : 0u;
-        meta.source_color_index = req.sourceColorIndex;
+        opts.filter_mode = req.filterMode;
+        opts.transition_type = req.transitionType;
+        opts.transition_duration_ms = std::clamp(req.transitionDurationMs, 0u, 3600000u);
+        opts.transition_fps = std::clamp(req.transitionFps, 15u, 360u);
+        opts.transition_angle_rad = req.angleDeg * 0.017453292519943295f;
+        opts.transition_wave_freq = req.waveFreq;
+        opts.transition_wave_amp = req.waveAmp;
+        opts.transition_center_x = std::clamp(req.centerX, 0.0f, 1.0f);
+        opts.transition_center_y = std::clamp(req.centerY, 0.0f, 1.0f);
+        opts.bezier = req.bezier;
+        opts.has_custom_bezier = req.hasCustomBezier;
+        opts.crop_gravity_x = std::clamp(req.cropGravityX, 0.0f, 1.0f);
+        opts.crop_gravity_y = std::clamp(req.cropGravityY, 0.0f, 1.0f);
+        opts.has_crop_gravity = req.hasCropGravity;
+        opts.depth_strength = (std::isfinite(req.depthStrength) && req.depthStrength > 0.0f)
+                                  ? req.depthStrength
+                                  : 1.0f;
+        opts.sync_mode = req.syncMode;
+        opts.stagger_delay_ms = req.staggerDelayMs;
+        opts.ten_bit = req.tenBit;
+        opts.invert_y = req.invertY;
+        opts.pos_y_inverted = req.posYInverted;
+        opts.no_cache = req.noCache;
+        opts.extract_theme = req.extractTheme;
+        opts.no_theme = req.noTheme;
+        opts.has_theme_mode = req.hasThemeMode;
+        opts.theme_light_mode = req.themeLightMode;
+        opts.is_solid_color = req.isSolidColor;
+        std::memcpy(opts.color, req.color, sizeof(opts.color));
+        opts.has_seed_color = req.hasSeedColor;
+        opts.seed_color = req.seedColor;
+        opts.has_source_color_index = req.hasSourceColorIndex;
+        opts.source_color_index = req.sourceColorIndex;
+        opts.has_auto_day_night = req.hasAutoDayNight;
+        opts.auto_day_night = req.autoDayNight;
+        opts.has_solar_coords = req.hasSolarCoords;
+        opts.solar_latitude = std::isfinite(req.solarLatitude) ? req.solarLatitude : 0.0;
+        opts.solar_longitude = std::isfinite(req.solarLongitude) ? req.solarLongitude : 0.0;
+        return opts;
+    }
 
-        const QByteArray pathUtf8 = req.path.toUtf8();
-        const size_t copyLen = std::min<size_t>(static_cast<size_t>(pathUtf8.size()),
-                                                sizeof(meta.filepath) - 1u);
-        if (copyLen > 0) {
-            std::copy_n(pathUtf8.constData(), copyLen, meta.filepath);
-        }
-        meta.filepath[copyLen] = '\0';
-        return meta;
+    [[nodiscard]] static waywal_img_metadata_t
+    buildImgMetadata(const WallpaperApplyRequest &req)
+    {
+        return toWallpaperApplyOptions(req).toMetadata();
     }
 
     [[nodiscard]] static WallpaperApplyRequest
@@ -387,6 +525,10 @@ class StudioSessionContext {
         req.namespaceStr = namespaceStr;
         req.path = path.isEmpty() ? QString::fromUtf8(meta.filepath) : path;
         req.targetOutputsCsv = targetOutputsCsv;
+        req.backdrop = QString::fromUtf8(meta.backdrop);
+        req.layerName = QString::fromUtf8(meta.layer_name);
+        req.batteryPolicy = QString::fromUtf8(meta.battery_policy);
+        req.depthMapPath = QString::fromUtf8(meta.depth_map_path);
         req.transitionType = meta.transition_type;
         req.transitionDurationMs = meta.transition_duration_ms;
         req.transitionFps = meta.transition_fps > 0u ? meta.transition_fps : 144u;
@@ -395,16 +537,39 @@ class StudioSessionContext {
         req.waveAmp = meta.transition_wave_amp;
         req.centerX = meta.transition_center_x;
         req.centerY = meta.transition_center_y;
-        req.bezier = meta.bezier;
+        // waywal_img_metadata_t is #pragma pack(1); copy bezier bytes to avoid misaligned ref binding.
+        std::memcpy(&req.bezier,
+                    reinterpret_cast<const char *>(&meta) +
+                        offsetof(waywal_img_metadata_t, bezier),
+                    sizeof(req.bezier));
         req.hasCustomBezier = meta.has_custom_bezier;
         req.scalingMode = meta.scaling_mode;
+        req.filterMode = meta.filter_mode;
         req.cropGravityX = meta.crop_gravity_x;
         req.cropGravityY = meta.crop_gravity_y;
         req.hasCropGravity = (meta.has_crop_gravity != 0u);
+        req.depthStrength = meta.depth_strength;
+        req.syncMode = meta.sync_mode;
+        req.staggerDelayMs = meta.stagger_delay_ms;
+        req.tenBit = meta.ten_bit || (meta.pixel_format == WAYWAL_FORMAT_XRGB2101010);
+        req.invertY = (meta.invert_y != 0u);
+        req.posYInverted = (meta.pos_y_inverted != 0u);
+        req.noCache = (meta.no_cache != 0u);
+        req.extractTheme = meta.extract_theme;
+        req.noTheme = meta.no_theme;
         req.hasThemeMode = (meta.has_theme_mode != 0u);
         req.themeLightMode = meta.theme_light_mode;
+        req.isSolidColor = (meta.is_solid_color != 0u);
+        std::memcpy(req.color, meta.color, sizeof(req.color));
+        req.hasSeedColor = (meta.has_seed_color != 0u);
+        req.seedColor = meta.seed_color;
         req.hasSourceColorIndex = (meta.has_source_color_index != 0u);
         req.sourceColorIndex = meta.source_color_index;
+        req.hasAutoDayNight = (meta.has_auto_day_night != 0u);
+        req.autoDayNight = (meta.auto_day_night != 0u);
+        req.hasSolarCoords = (meta.has_solar_coords != 0u);
+        req.solarLatitude = meta.solar_latitude;
+        req.solarLongitude = meta.solar_longitude;
         return req;
     }
 
@@ -416,31 +581,24 @@ class StudioSessionContext {
         }
 
         const QFileInfo fi(req.path);
-        const QString fileName = fi.fileName().toLower();
-        const QString lowerPath = req.path.toLower();
         QString effectiveTarget = req.path;
 
-        if (fi.isDir() || fileName == QStringLiteral("scene.json") ||
-            fileName == QStringLiteral("project.json")) {
+        switch (classifyMediaPath(req.path)) {
+        case MediaDispatchKind::Workshop:
             args << QStringLiteral("workshop");
             if (!fi.isDir()) {
                 effectiveTarget = fi.absolutePath();
             }
-        } else if (lowerPath.endsWith(QStringLiteral(".frag")) ||
-                   lowerPath.endsWith(QStringLiteral(".glsl")) ||
-                   lowerPath.endsWith(QStringLiteral(".shader")) ||
-                   lowerPath.endsWith(QStringLiteral(".comp")) ||
-                   lowerPath.endsWith(QStringLiteral(".hlsl"))) {
+            break;
+        case MediaDispatchKind::Shader:
             args << QStringLiteral("shader");
-        } else if (lowerPath.endsWith(QStringLiteral(".mp4")) ||
-                   lowerPath.endsWith(QStringLiteral(".mkv")) ||
-                   lowerPath.endsWith(QStringLiteral(".webm")) ||
-                   lowerPath.endsWith(QStringLiteral(".mov")) ||
-                   lowerPath.endsWith(QStringLiteral(".avi")) ||
-                   lowerPath.endsWith(QStringLiteral(".m4v"))) {
+            break;
+        case MediaDispatchKind::Video:
             args << QStringLiteral("video");
-        } else {
+            break;
+        case MediaDispatchKind::Image:
             args << QStringLiteral("img");
+            break;
         }
 
         args << effectiveTarget;
@@ -520,6 +678,8 @@ class StudioSessionContext {
     std::unique_ptr<CommandBus> m_commandBus;
     std::unique_ptr<PresetStore> m_presetStore;
     std::unique_ptr<IpcClient> m_ipcClient;
+    IIpcClientService *m_ipcOverride{nullptr};
+    bool m_hasIpcOverride{false};
     std::shared_ptr<CatalogIndexManager> m_catalogIndexMgr;
     std::shared_ptr<DownloadManager> m_downloadMgr;
     std::unique_ptr<RecursiveFsWatcher> m_fsWatcher;

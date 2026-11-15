@@ -11,8 +11,10 @@
  */
 
 #include "studio/core/command_bus.hpp"
+#include "studio/core/services.hpp"
 #include "studio/app/dock_layout_manager.hpp"
 #include "studio/app/main_window.hpp"
+#include "studio/app/studio_session_context.hpp"
 #include "studio/dock/openhub_browser_widget.hpp"
 #include "studio/dock/workshop_browser_widget.hpp"
 #include "studio/wizard/creator_packaging_wizard.hpp"
@@ -21,7 +23,9 @@
 #include "studio/inspector/oklch_color_dialog.hpp"
 #include "studio/inspector/property_inspector_widget.hpp"
 #include "studio/theme/theme_studio_widget.hpp"
+#include "studio/topology/cubic_bezier_editor.hpp"
 #include "studio/topology/monitor_topology_canvas.hpp"
+#include "studio/viewport/gpu_preview_viewport.hpp"
 
 #include <QAbstractButton>
 #include <QAction>
@@ -43,14 +47,26 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QSignalBlocker>
 
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <vector>
 
 using namespace waywal::studio;
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+extern "C" __attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+{
+    return "leak:<unknown module>\nleak:libnvidia\nleak:libEGL\nleak:libGLESv2\nleak:dri\n";
+}
+#endif
 
 namespace {
 
@@ -731,6 +747,340 @@ static void test_property_inspector_oklch_and_topology_zoom()
               << std::endl;
 }
 
+namespace {
+
+class MockIpcClientService final : public IIpcClientService {
+  public:
+    struct AudioPowerCall {
+        float volume{0.0f};
+        int8_t muteOnAudio{0};
+        int8_t themeFromMedia{0};
+        uint8_t batteryPolicy{0};
+    };
+
+    bool connected{true};
+    std::vector<WallpaperApplyOptions> setWallpaperCalls;
+    std::vector<waywal_img_metadata_t> sendImageCalls;
+    std::vector<AudioPowerCall> audioPowerCalls;
+
+    bool isConnected() const override { return connected; }
+    void sendSetUniform(const QString &, const QString &, const float *, uint32_t, bool) override {}
+    void sendSetImage(const waywal_img_metadata_t &meta, int) override
+    {
+        sendImageCalls.push_back(meta);
+    }
+    void setWallpaper(const WallpaperApplyOptions &opts) override
+    {
+        setWallpaperCalls.push_back(opts);
+    }
+    void sendAudioPowerConfig(float volume, int8_t muteOnAudio, int8_t themeFromMedia,
+                              uint8_t batteryPolicy = 0) override
+    {
+        audioPowerCalls.push_back({volume, muteOnAudio, themeFromMedia, batteryPolicy});
+    }
+    void requestOutputsJson(std::function<void(const QString &json)>) override {}
+    void requestTelemetry(std::function<void(const TelemetrySnapshot &snapshot)>) override {}
+    void requestOutputDmabuf(
+        const QString &,
+        std::function<void(const waywal_export_dmabuf_resp_t &desc, const QVector<int> &fds)>)
+        override
+    {
+    }
+    void subscribeEvents() override {}
+};
+
+class ScopedServicesIpcGuard {
+  public:
+    explicit ScopedServicesIpcGuard(IIpcClientService *svc)
+    {
+        Services::instance().setIpcClient(svc);
+    }
+    ~ScopedServicesIpcGuard() { Services::instance().setIpcClient(nullptr); }
+    ScopedServicesIpcGuard(const ScopedServicesIpcGuard &) = delete;
+    ScopedServicesIpcGuard &operator=(const ScopedServicesIpcGuard &) = delete;
+};
+
+} // namespace
+
+static void test_mainwindow_apply_wallpaper_ipc_integration_and_command_bus_fallback()
+{
+    std::cout << "[E2E] Testing MainWindow::applyWallpaperPath -> IpcClient::setWallpaper & "
+                 "ApplyWallpaperCommand fallback (E2E-F03/F04, AUD-151/420)..."
+              << std::endl;
+
+    QTemporaryDir tmpDir;
+    assert(tmpDir.isValid());
+
+    const QString pathA = tmpDir.filePath(QStringLiteral("center_wall.png"));
+    const QString pathB = tmpDir.filePath(QStringLiteral("span_wall.png"));
+    QImage imgA(8, 8, QImage::Format_RGBA8888);
+    imgA.fill(QColor(30, 120, 210, 255));
+    assert(imgA.save(pathA, "PNG"));
+    QImage imgB(8, 8, QImage::Format_RGBA8888);
+    imgB.fill(QColor(210, 90, 40, 255));
+    assert(imgB.save(pathB, "PNG"));
+
+    /* 1. CommandBus ApplyWallpaperCommand null-applyFunc fallback preserves m_output & path */
+    {
+        MockIpcClientService cmdMock;
+        ScopedServicesIpcGuard guard(&cmdMock);
+        CommandBus bus(64);
+
+        waywal_img_metadata_t oldMeta{};
+        oldMeta.scaling_mode = WAYWAL_SCALING_CENTER;
+        waywal_img_metadata_t newMeta{};
+        newMeta.scaling_mode = WAYWAL_SCALING_FIT;
+        newMeta.transition_type = WAYWAL_TRANSITION_WIPE;
+
+        bus.execute(std::make_unique<ApplyWallpaperCommand>(
+            QStringLiteral("DP-1, HDMI-A-1"), oldMeta, newMeta, pathA, pathB, nullptr));
+        assert(cmdMock.sendImageCalls.empty());
+        assert(cmdMock.setWallpaperCalls.size() == 1u);
+        assert((cmdMock.setWallpaperCalls[0].targetOutputs ==
+                QStringList{QStringLiteral("DP-1"), QStringLiteral("HDMI-A-1")}));
+        assert(cmdMock.setWallpaperCalls[0].filepath == pathB);
+        assert(cmdMock.setWallpaperCalls[0].scaling_mode == WAYWAL_SCALING_FIT);
+
+        bus.undo();
+        assert(cmdMock.setWallpaperCalls.size() == 2u);
+        assert((cmdMock.setWallpaperCalls[1].targetOutputs ==
+                QStringList{QStringLiteral("DP-1"), QStringLiteral("HDMI-A-1")}));
+        assert(cmdMock.setWallpaperCalls[1].filepath == pathA);
+        assert(cmdMock.setWallpaperCalls[1].scaling_mode == WAYWAL_SCALING_CENTER);
+
+        bus.redo();
+        assert(cmdMock.setWallpaperCalls.size() == 3u);
+        assert(cmdMock.setWallpaperCalls[2].filepath == pathB);
+
+        bus.execute(std::make_unique<ApplyWallpaperCommand>(QStringLiteral("*"), oldMeta, newMeta,
+                                                            pathA, pathB, nullptr));
+        assert(cmdMock.setWallpaperCalls.size() == 4u);
+        assert(cmdMock.setWallpaperCalls[3].targetOutputs.isEmpty());
+    }
+
+    /* 2. StudioSessionContext media classification & CLI fallback predicate */
+    assert(!StudioSessionContext::requiresCliFallbackMediaPath(pathA));
+    assert(StudioSessionContext::requiresCliFallbackMediaPath(
+        tmpDir.filePath(QStringLiteral("loop.mp4"))));
+    assert(StudioSessionContext::requiresCliFallbackMediaPath(
+        tmpDir.filePath(QStringLiteral("fx.glsl"))));
+    assert(StudioSessionContext::requiresCliFallbackMediaPath(tmpDir.path()));
+
+    /* 3. Live MainWindow::applyWallpaperPath -> IIpcClientService::setWallpaper (Center vs Span) */
+    MockIpcClientService mockIpc;
+    StudioOptions opts;
+    opts.headlessCheck = true;
+    MainWindow win(opts);
+    ScopedServicesIpcGuard guard(&mockIpc);
+
+    assert(win.sessionContext() != nullptr);
+    assert(win.sessionContext()->activeIpcService() == &mockIpc);
+
+    auto *canvas = win.findChild<MonitorTopologyCanvas *>();
+    assert(canvas != nullptr);
+
+    const QJsonObject outputsObj{
+        {QStringLiteral("outputs"),
+         QJsonArray{QJsonObject{{QStringLiteral("name"), QStringLiteral("DP-1")},
+                                {QStringLiteral("x"), 0},
+                                {QStringLiteral("y"), 0},
+                                {QStringLiteral("width"), 1920},
+                                {QStringLiteral("height"), 1080},
+                                {QStringLiteral("scale"), 1.0},
+                                {QStringLiteral("primary"), true}},
+                    QJsonObject{{QStringLiteral("name"), QStringLiteral("HDMI-A-1")},
+                                {QStringLiteral("x"), 1920},
+                                {QStringLiteral("y"), 0},
+                                {QStringLiteral("width"), 1920},
+                                {QStringLiteral("height"), 1080},
+                                {QStringLiteral("scale"), 1.0},
+                                {QStringLiteral("primary"), false}}}}};
+    canvas->updateOutputsFromJson(outputsObj);
+
+    {
+        const QSignalBlocker blocker(canvas);
+        canvas->setSelectedMonitors({QStringLiteral("DP-1")});
+        canvas->setDesktopSpanMode(false);
+        canvas->setScalingMode(WAYWAL_SCALING_CENTER);
+        canvas->setCropGravity(QStringLiteral("DP-1"), QPointF(0.20, 0.80));
+    }
+
+    assert(win.bezierEditor() != nullptr);
+    TransitionConfig tcfg;
+    tcfg.type = WAYWAL_TRANSITION_WIPE;
+    tcfg.durationMs = 750u;
+    tcfg.fps = 120u;
+    tcfg.angleDeg = 45.0f;
+    tcfg.waveFreq = 14.0f;
+    tcfg.waveAmp = 0.25f;
+    tcfg.centerX = 0.30f;
+    tcfg.centerY = 0.70f;
+    tcfg.hasCustomBezier = true;
+    tcfg.bezier = bezier_curve_t{0.15f, 0.85f, 0.70f, 0.95f};
+    win.bezierEditor()->setTransitionConfig(tcfg);
+
+    assert(win.themeStudio() != nullptr);
+    win.themeStudio()->setThemeMode(WAYWAL_THEME_LIGHT);
+    win.themeStudio()->setSeedIndex(2u);
+
+    /* Apply via MonitorTopologyCanvas wallpaper drop signal -> Center scaling + per-monitor DP-1 */
+    emit canvas->wallpaperDropped({QStringLiteral("DP-1")}, pathA);
+    assert(mockIpc.setWallpaperCalls.size() == 1u);
+    {
+        const WallpaperApplyOptions &c = mockIpc.setWallpaperCalls[0];
+        assert(c.filepath == pathA);
+        assert((c.targetOutputs == QStringList{QStringLiteral("DP-1")}));
+        assert(c.scaling_mode == WAYWAL_SCALING_CENTER);
+        assert(c.transition_type == WAYWAL_TRANSITION_WIPE);
+        assert(c.transition_duration_ms == 750u);
+        assert(c.transition_fps == 120u);
+        assert(c.has_crop_gravity);
+        assert(std::fabs(c.crop_gravity_x - 0.20f) < 1e-4f);
+        assert(std::fabs(c.crop_gravity_y - 0.80f) < 1e-4f);
+        assert(c.has_custom_bezier);
+        assert(std::fabs(c.bezier.p1x - 0.15f) < 1e-4f);
+        assert(std::fabs(c.bezier.p1y - 0.85f) < 1e-4f);
+        assert(std::fabs(c.bezier.p2x - 0.70f) < 1e-4f);
+        assert(std::fabs(c.bezier.p2y - 0.95f) < 1e-4f);
+        assert(c.has_theme_mode && c.theme_light_mode);
+        assert(c.has_source_color_index && c.source_color_index == 2u);
+        assert(c.batteryPolicy == QStringLiteral("ignore"));
+    }
+
+    /* Toggle Desktop Span mode -> Span scaling + wildcard outputs (empty targetOutputs) */
+    canvas->setDesktopSpanMode(true);
+    assert(mockIpc.setWallpaperCalls.size() == 2u);
+    assert(mockIpc.setWallpaperCalls[1].scaling_mode == WAYWAL_SCALING_SPAN);
+    assert(mockIpc.setWallpaperCalls[1].targetOutputs.isEmpty());
+    assert(mockIpc.setWallpaperCalls[1].filepath == pathA);
+
+    /* Undo/Redo through MainWindow CommandBus restores Center/DP-1 and re-applies Span */
+    win.handleUndo();
+    assert(mockIpc.setWallpaperCalls.size() == 3u);
+    assert(mockIpc.setWallpaperCalls[2].scaling_mode == WAYWAL_SCALING_CENTER);
+    assert((mockIpc.setWallpaperCalls[2].targetOutputs == QStringList{QStringLiteral("DP-1")}));
+
+    win.handleRedo();
+    assert(mockIpc.setWallpaperCalls.size() == 4u);
+    assert(mockIpc.setWallpaperCalls[3].scaling_mode == WAYWAL_SCALING_SPAN);
+    assert(mockIpc.setWallpaperCalls[3].targetOutputs.isEmpty());
+
+    /* Exit span mode and re-apply explicitly to HDMI-A-1 via GpuPreviewViewport */
+    {
+        const QSignalBlocker blocker(canvas);
+        canvas->setDesktopSpanMode(false);
+        canvas->setScalingMode(WAYWAL_SCALING_FIT);
+    }
+    assert(win.previewViewport() != nullptr);
+    emit win.previewViewport()->applyRequested(QStringLiteral("HDMI-A-1"));
+    assert(mockIpc.setWallpaperCalls.size() == 5u);
+    assert(mockIpc.setWallpaperCalls[4].scaling_mode == WAYWAL_SCALING_FIT);
+    assert((mockIpc.setWallpaperCalls[4].targetOutputs == QStringList{QStringLiteral("HDMI-A-1")}));
+
+    std::cout << "  -> MainWindow::applyWallpaperPath IPC integration & CommandBus fallback "
+                 "verified cleanly."
+              << std::endl;
+}
+
+static void test_theme_studio_to_mainwindow_live_signal_execution()
+{
+    std::cout << "[E2E] Testing live ThemeStudioWidget -> MainWindow signal execution (E2E-F08)..."
+              << std::endl;
+
+    QTemporaryDir tmpDir;
+    assert(tmpDir.isValid());
+    const QString wallPath = tmpDir.filePath(QStringLiteral("theme_source.png"));
+    QImage wallImg(16, 16, QImage::Format_RGBA8888);
+    for (int y = 0; y < 16; ++y) {
+        for (int x = 0; x < 16; ++x) {
+            wallImg.setPixelColor(x, y, QColor(40 + x * 10, 90 + y * 8, 220 - x * 6, 255));
+        }
+    }
+    assert(wallImg.save(wallPath, "PNG"));
+
+    MockIpcClientService mockIpc;
+    StudioOptions opts;
+    opts.headlessCheck = true;
+    MainWindow win(opts);
+    ScopedServicesIpcGuard guard(&mockIpc);
+
+    ThemeStudioWidget *theme = win.themeStudio();
+    assert(theme != nullptr);
+    auto *canvas = win.findChild<MonitorTopologyCanvas *>();
+    assert(canvas != nullptr);
+    auto *statusLabel = win.findChild<QLabel *>(QStringLiteral("studioStatusLabel"));
+    assert(statusLabel != nullptr);
+
+    int paletteCount = 0;
+    waywal_palette_t lastPalette{};
+    std::vector<waywal_theme_mode_t> observedModes;
+    std::vector<waywal_scheme_variant_t> observedVariants;
+    std::vector<float> observedContrasts;
+    std::vector<uint8_t> observedSeeds;
+    QStringList statusMessages;
+
+    QObject::connect(theme, &ThemeStudioWidget::paletteChanged, [&](const waywal_palette_t &p) {
+        ++paletteCount;
+        lastPalette = p;
+    });
+    QObject::connect(theme, &ThemeStudioWidget::modeChanged,
+                     [&](waywal_theme_mode_t m) { observedModes.push_back(m); });
+    QObject::connect(theme, &ThemeStudioWidget::variantChanged,
+                     [&](waywal_scheme_variant_t v) { observedVariants.push_back(v); });
+    QObject::connect(theme, &ThemeStudioWidget::contrastChanged,
+                     [&](float c) { observedContrasts.push_back(c); });
+    QObject::connect(theme, &ThemeStudioWidget::seedIndexChanged,
+                     [&](uint8_t idx) { observedSeeds.push_back(idx); });
+    QObject::connect(theme, &ThemeStudioWidget::statusMessageRequested,
+                     [&](const QString &msg) { statusMessages.push_back(msg); });
+
+    /* Activate a wallpaper on MainWindow so theme mutations re-sync active IPC state */
+    emit canvas->wallpaperDropped({QStringLiteral("DP-1")}, wallPath);
+    assert(mockIpc.setWallpaperCalls.size() == 1u);
+
+    theme->setWallpaperImage(wallImg, wallPath);
+    assert(paletteCount >= 1);
+
+    auto *swatchChip = theme->findChild<ColorSwatchChip *>();
+    assert(swatchChip != nullptr);
+    emit swatchChip->copiedToClipboard(QStringLiteral("primary"), QStringLiteral("#4488ff"));
+    assert(!statusMessages.isEmpty());
+    assert(statusLabel->text() == QStringLiteral("Copied #4488ff (primary) to clipboard!"));
+
+    theme->setThemeMode(WAYWAL_THEME_LIGHT);
+    assert(!observedModes.empty() && observedModes.back() == WAYWAL_THEME_LIGHT);
+    assert(statusLabel->text() == QStringLiteral("Theme Mode: Light"));
+    assert(mockIpc.audioPowerCalls.size() >= 1u);
+    assert(mockIpc.setWallpaperCalls.size() >= 2u);
+    assert(mockIpc.setWallpaperCalls.back().has_theme_mode);
+    assert(mockIpc.setWallpaperCalls.back().theme_light_mode);
+
+    theme->setSchemeVariant(WAYWAL_SCHEME_VIBRANT);
+    assert(!observedVariants.empty() && observedVariants.back() == WAYWAL_SCHEME_VIBRANT);
+    assert(statusLabel->text() ==
+           QStringLiteral("Theme Variant: %1").arg(static_cast<int>(WAYWAL_SCHEME_VIBRANT)));
+    const size_t audioCountAfterVariant = mockIpc.audioPowerCalls.size();
+    assert(audioCountAfterVariant >= 2u);
+
+    theme->setContrast(0.45f);
+    assert(!observedContrasts.empty() && std::fabs(observedContrasts.back() - 0.45f) < 1e-4f);
+    assert(statusLabel->text() == QStringLiteral("Theme Contrast: 0.45"));
+    assert(mockIpc.audioPowerCalls.size() > audioCountAfterVariant);
+
+    const size_t wallpaperCountBeforeSeed = mockIpc.setWallpaperCalls.size();
+    theme->setSeedIndex(3u);
+    assert(!observedSeeds.empty() && observedSeeds.back() == 3u);
+    assert(statusLabel->text() == QStringLiteral("Theme Seed Index: 3"));
+    assert(mockIpc.setWallpaperCalls.size() > wallpaperCountBeforeSeed);
+    assert(mockIpc.setWallpaperCalls.back().has_source_color_index);
+    assert(mockIpc.setWallpaperCalls.back().source_color_index == 3u);
+    assert(lastPalette.source_color_index == 3u);
+
+    std::cout << "  -> Live ThemeStudioWidget -> MainWindow signal execution (E2E-F08) verified "
+                 "cleanly."
+              << std::endl;
+}
+
 int main(int argc, char *argv[])
 {
     qputenv("QT_QPA_PLATFORM", "offscreen");
@@ -748,6 +1098,8 @@ int main(int argc, char *argv[])
     test_monitor_topology_span_math();
     test_studio_ui_ergonomics_and_zero_emoji();
     test_property_inspector_oklch_and_topology_zoom();
+    test_mainwindow_apply_wallpaper_ipc_integration_and_command_bus_fallback();
+    test_theme_studio_to_mainwindow_live_signal_execution();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  >>> STUDIO COMMAND & DOCK SUITE PASSED CLEANLY (100%) <<<" << std::endl;

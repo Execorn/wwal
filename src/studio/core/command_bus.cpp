@@ -3,9 +3,12 @@
 
 #include <QFileInfo>
 #include <QPointer>
+#include <QStringList>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstring>
 #include <exception>
 
 namespace waywal::studio {
@@ -54,6 +57,80 @@ template <typename Stack>
         }
     }
     return total;
+}
+
+[[nodiscard]] QStringList parseTargetOutputsSpec(const QString &outputSpec)
+{
+    QStringList outputs;
+    const QStringList parts = outputSpec.split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString &raw : parts) {
+        const QString trimmed = raw.trimmed();
+        if (trimmed.isEmpty()) {
+            continue;
+        }
+        if (trimmed == QStringLiteral("*") ||
+            trimmed.compare(QStringLiteral("All Displays"), Qt::CaseInsensitive) == 0) {
+            // Wildcard output spec targets all connected displays in the IPC protocol.
+            return {};
+        }
+        outputs.push_back(trimmed);
+    }
+    return outputs;
+}
+
+[[nodiscard]] WallpaperApplyOptions
+wallpaperOptionsFromMetadata(const QString &outputSpec, const waywal_img_metadata_t &meta,
+                               const QString &path)
+{
+    WallpaperApplyOptions opts;
+    opts.targetOutputs = parseTargetOutputsSpec(outputSpec);
+    const QString trimmedPath = path.trimmed();
+    opts.filepath = !trimmedPath.isEmpty() ? trimmedPath : QString::fromUtf8(meta.filepath);
+    opts.depthMapPath = QString::fromUtf8(meta.depth_map_path);
+    opts.backdrop = QString::fromUtf8(meta.backdrop);
+    opts.layerName = QString::fromUtf8(meta.layer_name);
+    opts.batteryPolicy = QString::fromUtf8(meta.battery_policy);
+    opts.scaling_mode = meta.scaling_mode;
+    opts.filter_mode = meta.filter_mode;
+    opts.transition_type = meta.transition_type;
+    opts.transition_duration_ms = meta.transition_duration_ms;
+    opts.transition_fps = meta.transition_fps;
+    opts.transition_angle_rad = meta.transition_angle_rad;
+    opts.transition_wave_freq = meta.transition_wave_freq;
+    opts.transition_wave_amp = meta.transition_wave_amp;
+    opts.transition_center_x = meta.transition_center_x;
+    opts.transition_center_y = meta.transition_center_y;
+    // waywal_img_metadata_t is #pragma pack(1); copy bezier bytes to avoid misaligned ref binding.
+    std::memcpy(&opts.bezier,
+                reinterpret_cast<const char *>(&meta) + offsetof(waywal_img_metadata_t, bezier),
+                sizeof(opts.bezier));
+    opts.has_custom_bezier = meta.has_custom_bezier;
+    opts.crop_gravity_x = meta.crop_gravity_x;
+    opts.crop_gravity_y = meta.crop_gravity_y;
+    opts.has_crop_gravity = (meta.has_crop_gravity != 0u);
+    opts.depth_strength = meta.depth_strength;
+    opts.sync_mode = meta.sync_mode;
+    opts.stagger_delay_ms = meta.stagger_delay_ms;
+    opts.ten_bit = meta.ten_bit || (meta.pixel_format == WAYWAL_FORMAT_XRGB2101010);
+    opts.invert_y = (meta.invert_y != 0u);
+    opts.pos_y_inverted = (meta.pos_y_inverted != 0u);
+    opts.no_cache = (meta.no_cache != 0u);
+    opts.extract_theme = meta.extract_theme;
+    opts.no_theme = meta.no_theme;
+    opts.has_theme_mode = (meta.has_theme_mode != 0u);
+    opts.theme_light_mode = meta.theme_light_mode;
+    opts.is_solid_color = (meta.is_solid_color != 0u);
+    std::memcpy(opts.color, meta.color, sizeof(opts.color));
+    opts.has_seed_color = (meta.has_seed_color != 0u);
+    opts.seed_color = meta.seed_color;
+    opts.has_source_color_index = (meta.has_source_color_index != 0u);
+    opts.source_color_index = meta.source_color_index;
+    opts.has_auto_day_night = (meta.has_auto_day_night != 0u);
+    opts.auto_day_night = (meta.auto_day_night != 0u);
+    opts.has_solar_coords = (meta.has_solar_coords != 0u);
+    opts.solar_latitude = meta.solar_latitude;
+    opts.solar_longitude = meta.solar_longitude;
+    return opts;
 }
 
 } // namespace
@@ -549,7 +626,8 @@ void ApplyWallpaperCommand::execute()
     if (m_applyFunc) {
         m_applyFunc(m_output, m_newMeta, m_newPath);
     } else if (auto *ipc = Services::instance().ipcClient()) {
-        ipc->sendSetImage(m_newMeta, -1);
+        // Fallback dispatch must preserve target monitor routing and explicit path via WallpaperApplyOptions.
+        ipc->setWallpaper(wallpaperOptionsFromMetadata(m_output, m_newMeta, m_newPath));
     }
 }
 
@@ -558,7 +636,7 @@ void ApplyWallpaperCommand::undo()
     if (m_applyFunc) {
         m_applyFunc(m_output, m_oldMeta, m_oldPath);
     } else if (auto *ipc = Services::instance().ipcClient()) {
-        ipc->sendSetImage(m_oldMeta, -1);
+        ipc->setWallpaper(wallpaperOptionsFromMetadata(m_output, m_oldMeta, m_oldPath));
     }
 }
 
