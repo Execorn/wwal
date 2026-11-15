@@ -3,17 +3,22 @@
 #include "etc2_simd_compressor.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
-#include <cstring>
+#include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
+#include <limits>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <QFile>
 #include <QImage>
-#include <QDir>
+#include <QImageReader>
+#include <QImageWriter>
 #include <QProcess>
-#include <QCryptographicHash>
 
 #include <waywal/thumb_cache.h>
 #include <waywal/image_loader.h>
@@ -29,30 +34,91 @@ namespace wwal::studio {
 
 namespace {
 
-std::string computeSha256Hex(const std::string &input)
-{
-    QByteArray hash = QCryptographicHash::hash(
-        QByteArray::fromRawData(input.data(), static_cast<qsizetype>(input.size())),
-        QCryptographicHash::Sha256);
-    return hash.toHex().toStdString();
-}
-
 std::string resolveDiskCachePath(const std::string &media_path)
 {
-    const char *xdg_cache = std::getenv("XDG_CACHE_HOME");
-    std::filesystem::path cache_dir;
-    if (xdg_cache && xdg_cache[0] != '\0') {
-        cache_dir = std::filesystem::path(xdg_cache) / "wwal" / "thumbnails";
-    } else {
-        const char *home = std::getenv("HOME");
-        cache_dir = std::filesystem::path(home ? home : "/tmp") / ".cache" / "wwal" / "thumbnails";
+    char out_path[4096];
+    if (!waywal_thumb_resolve_cache_path(media_path.c_str(), out_path, sizeof(out_path))) {
+        return {};
     }
+    return std::string(out_path);
+}
 
+void ensureCacheDirectoryOnce(const std::filesystem::path &cache_dir)
+{
+    static std::mutex s_dirMutex;
+    static std::filesystem::path s_createdDir;
+
+    std::lock_guard<std::mutex> lock(s_dirMutex);
+    if (s_createdDir == cache_dir) {
+        return;
+    }
     std::error_code ec;
     std::filesystem::create_directories(cache_dir, ec);
+    if (!ec) {
+        s_createdDir = cache_dir;
+    }
+}
 
-    std::string hash_hex = computeSha256Hex(media_path);
-    return (cache_dir / (hash_hex + ".webp")).string();
+bool webpWritingSupported()
+{
+    static const bool supported = []() {
+        const auto formats = QImageWriter::supportedImageFormats();
+        for (const QByteArray &fmt : formats) {
+            if (fmt.compare("webp", Qt::CaseInsensitive) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    return supported;
+}
+
+bool isDiskCacheFresh(const std::string &candidate_path, const std::string &source_file)
+{
+    if (candidate_path.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(candidate_path, ec) || ec) {
+        return false;
+    }
+    const auto cached_size = std::filesystem::file_size(candidate_path, ec);
+    if (ec || cached_size == 0) {
+        return false;
+    }
+    if (source_file.empty() || !std::filesystem::exists(source_file, ec) || ec) {
+        return true;
+    }
+    const auto cache_mtime = std::filesystem::last_write_time(candidate_path, ec);
+    if (ec) {
+        return false;
+    }
+    const auto src_mtime = std::filesystem::last_write_time(source_file, ec);
+    if (ec) {
+        return false;
+    }
+    if (cache_mtime < src_mtime) {
+        return false;
+    }
+
+    const std::string stamp_path = candidate_path + ".stamp";
+    if (std::filesystem::is_regular_file(stamp_path, ec) && !ec) {
+        std::ifstream sf(stamp_path, std::ios::binary);
+        uint64_t stamped_size = 0;
+        int64_t stamped_mtime = 0;
+        sf.read(reinterpret_cast<char *>(&stamped_size), sizeof(stamped_size));
+        sf.read(reinterpret_cast<char *>(&stamped_mtime), sizeof(stamped_mtime));
+        if (sf.good()) {
+            const auto src_size = std::filesystem::file_size(source_file, ec);
+            if (!ec) {
+                const auto src_ticks = static_cast<int64_t>(src_mtime.time_since_epoch().count());
+                if (stamped_size != src_size || stamped_mtime != src_ticks) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 std::string toLowerExt(const std::filesystem::path &p)
@@ -92,9 +158,27 @@ std::string resolveGnomeXmlFirstImage(const std::string &xml_path)
     return {};
 }
 
-QImage loadQImageWithCoreFallback(const std::string &path)
+QImage loadQImageWithCoreFallback(const std::string &path, uint32_t target_w = 0, uint32_t target_h = 0)
 {
-    QImage img(QString::fromStdString(path));
+    QImageReader reader(QString::fromStdString(path));
+    reader.setAutoTransform(true);
+    reader.setDecideFormatFromContent(true);
+
+    if (target_w > 0 && target_h > 0) {
+        const QSize src_size = reader.size();
+        if (src_size.isValid() && src_size.width() > 0 && src_size.height() > 0 &&
+            (src_size.width() > static_cast<int>(target_w) ||
+             src_size.height() > static_cast<int>(target_h))) {
+            QSize scaled = src_size.scaled(static_cast<int>(target_w), static_cast<int>(target_h),
+                                           Qt::KeepAspectRatioByExpanding);
+            if (scaled.isValid() && scaled.width() > 0 && scaled.height() > 0 &&
+                scaled.width() <= 8192 && scaled.height() <= 8192) {
+                reader.setScaledSize(scaled);
+            }
+        }
+    }
+
+    QImage img = reader.read();
     if (!img.isNull()) {
         return img;
     }
@@ -103,11 +187,17 @@ QImage loadQImageWithCoreFallback(const std::string &path)
     uint32_t w = 0;
     uint32_t h = 0;
     if (image_load_rgba(path.c_str(), &pixels, &w, &h) && pixels && w > 0 && h > 0) {
-        QImage raw_wrap(pixels, static_cast<int>(w), static_cast<int>(h),
-                        static_cast<qsizetype>(w) * 4, QImage::Format_RGBA8888);
-        QImage copy = raw_wrap.copy();
-        image_free(pixels);
-        return copy;
+        const qsizetype stride = static_cast<qsizetype>(w) * 4;
+        const bool dims_valid = w <= static_cast<uint32_t>(std::numeric_limits<int>::max()) &&
+                                h <= static_cast<uint32_t>(std::numeric_limits<int>::max()) &&
+                                stride <= std::numeric_limits<int>::max();
+        if (dims_valid) {
+            QImage raw_wrap(pixels, static_cast<int>(w), static_cast<int>(h), stride,
+                            QImage::Format_RGBA8888);
+            QImage copy = raw_wrap.copy();
+            image_free(pixels);
+            return copy;
+        }
     }
     if (pixels) {
         image_free(pixels);
@@ -158,6 +248,174 @@ void generateShaderThumbnail(const std::string &path, uint8_t *out_rgba, uint32_
             out_rgba[idx + 3] = 255;
         }
     }
+}
+
+bool writeThumbnailAtomically(const QImage &rgba, const std::string &dest_path, const char *format,
+                              int quality, const std::string &source_file)
+{
+    static std::atomic<uint64_t> s_tmpSeq{0};
+    const std::filesystem::path dest(dest_path);
+    ensureCacheDirectoryOnce(dest.parent_path());
+
+    const uint64_t seq = s_tmpSeq.fetch_add(1, std::memory_order_relaxed);
+    const std::string tmp_path =
+        dest_path + ".tmp." + std::to_string(static_cast<long long>(::getpid())) + "." +
+        std::to_string(seq);
+
+    QFile out_file(QString::fromStdString(tmp_path));
+    if (!out_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return false;
+    }
+
+    QImageWriter writer(&out_file, format);
+    if (quality >= 0) {
+        writer.setQuality(quality);
+    }
+    const bool wrote = writer.write(rgba) && out_file.flush();
+    out_file.close();
+
+    std::error_code ec;
+    if (!wrote) {
+        std::filesystem::remove(tmp_path, ec);
+        return false;
+    }
+
+    std::filesystem::rename(tmp_path, dest_path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp_path, ec);
+        return false;
+    }
+
+    if (!source_file.empty() && std::filesystem::exists(source_file, ec) && !ec) {
+        const auto src_size = std::filesystem::file_size(source_file, ec);
+        if (!ec) {
+            const auto src_mtime = std::filesystem::last_write_time(source_file, ec);
+            if (!ec) {
+                const std::string stamp_tmp = tmp_path + ".stamp";
+                const std::string stamp_dest = dest_path + ".stamp";
+                {
+                    std::ofstream sf(stamp_tmp, std::ios::binary | std::ios::trunc);
+                    const uint64_t sz = src_size;
+                    const int64_t ticks = static_cast<int64_t>(src_mtime.time_since_epoch().count());
+                    sf.write(reinterpret_cast<const char *>(&sz), sizeof(sz));
+                    sf.write(reinterpret_cast<const char *>(&ticks), sizeof(ticks));
+                }
+                std::filesystem::rename(stamp_tmp, stamp_dest, ec);
+                if (ec) {
+                    std::filesystem::remove(stamp_tmp, ec);
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+QImage extractVideoFrameBounded(const std::string &source_file, std::stop_token stop_token,
+                                const std::atomic<uint64_t> &live_epoch, uint64_t expected_epoch)
+{
+    auto shouldAbort = [&]() {
+        return stop_token.stop_requested() ||
+               live_epoch.load(std::memory_order_acquire) != expected_epoch;
+    };
+
+    auto runOnce = [&](const char *seek_pos, int budget_ms) -> std::pair<bool, QByteArray> {
+        if (shouldAbort()) {
+            return {false, {}};
+        }
+
+        QProcess proc;
+        QStringList args;
+        if (seek_pos != nullptr) {
+            args << QStringLiteral("-ss") << QString::fromLatin1(seek_pos);
+        }
+        args << QStringLiteral("-loglevel") << QStringLiteral("error") << QStringLiteral("-i")
+             << QString::fromStdString(source_file) << QStringLiteral("-frames:v")
+             << QStringLiteral("1") << QStringLiteral("-vf")
+             << QStringLiteral("scale=384:216:force_original_aspect_ratio=increase,crop=384:216")
+             << QStringLiteral("-f") << QStringLiteral("image2pipe") << QStringLiteral("-vcodec")
+             << QStringLiteral("png") << QStringLiteral("-");
+
+        proc.start(QStringLiteral("ffmpeg"), args);
+        if (!proc.waitForStarted(500)) {
+            return {false, {}};
+        }
+
+        std::mutex pidfd_mutex;
+        int pidfd = -1;
+#ifdef SYS_pidfd_open
+        if (const qint64 pid = proc.processId(); pid > 0) {
+            pidfd = static_cast<int>(::syscall(SYS_pidfd_open, static_cast<pid_t>(pid), 0u));
+        }
+#endif
+        std::stop_callback stop_cb(stop_token, [&]() {
+            std::lock_guard<std::mutex> lk(pidfd_mutex);
+#ifdef SYS_pidfd_send_signal
+            if (pidfd >= 0) {
+                ::syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, nullptr, 0u);
+            }
+#endif
+        });
+
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
+        bool finished = false;
+        while (!finished) {
+            if (shouldAbort()) {
+                break;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                break;
+            }
+            const auto rem_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            const int slice_ms = static_cast<int>(std::clamp<int64_t>(rem_ms, 1, 100));
+            finished = proc.waitForFinished(slice_ms);
+        }
+
+        if (!finished && proc.state() != QProcess::NotRunning) {
+            proc.kill();
+            proc.waitForFinished(500);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(pidfd_mutex);
+            if (pidfd >= 0) {
+                ::close(pidfd);
+                pidfd = -1;
+            }
+        }
+
+        if (!finished || shouldAbort()) {
+            return {false, {}};
+        }
+        return {proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0,
+                proc.readAllStandardOutput()};
+    };
+
+    const auto start_tp = std::chrono::steady_clock::now();
+    // Seek past black fade-in frames first; fall back to frame 0 for ultra-short clips.
+    auto [ok, png_bytes] = runOnce("00:00:00.50", 1600);
+    if (!shouldAbort() && png_bytes.isEmpty()) {
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - start_tp)
+                                    .count();
+        const int rem = static_cast<int>(2500 - elapsed_ms);
+        if (rem >= 300) {
+            auto retry = runOnce(nullptr, rem);
+            ok = retry.first;
+            png_bytes = std::move(retry.second);
+        }
+    }
+
+    if (!ok || png_bytes.isEmpty() || shouldAbort()) {
+        return {};
+    }
+
+    QImage img;
+    img.loadFromData(png_bytes, "PNG");
+    return img;
 }
 
 } // namespace
@@ -249,7 +507,8 @@ void PboUploadQueue::uploadAsync(QOpenGLExtraFunctions *gl, const uint8_t *paylo
     active_pbo = 1u - slot;
 }
 
-GpuTexturePool::GpuTexturePool(int max_vram_slots) : m_maxVramSlots(std::min(max_vram_slots, 1540))
+GpuTexturePool::GpuTexturePool(int max_vram_slots)
+    : m_maxVramSlots(std::clamp(max_vram_slots, 1, 1540))
 {
     initStagingMemory();
     initLru();
@@ -270,11 +529,9 @@ GpuTexturePool::~GpuTexturePool()
 
 void GpuTexturePool::shutdownWorkers()
 {
-    bool expected = false;
-    if (!m_stopWorkers.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        return;
-    }
+    m_shutdownGate.beginShutdown();
     m_taskCv.notify_all();
+    m_shutdownGate.waitForDrain();
     for (auto &t : m_workerThreads) {
         if (t.joinable()) {
             t.join();
@@ -294,21 +551,28 @@ void GpuTexturePool::initStagingMemory()
     std::lock_guard<std::mutex> lock(m_stagingMutex);
 
     // 128 MB Page-Aligned (4096-byte) Memory Allocation via MAP_ANONYMOUS (Lazy commit)
-    m_stagingBuffer = static_cast<uint8_t *>(mmap(
-        nullptr, STAGING_BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (m_stagingBuffer == MAP_FAILED) {
-        m_stagingBuffer = nullptr;
+    void *mapped = mmap(nullptr, STAGING_BUFFER_SIZE, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    while (!m_freeStagingSlots.empty()) {
+        m_freeStagingSlots.pop();
     }
+    if (mapped == MAP_FAILED) {
+        m_stagingBuffer = nullptr;
+        m_stagingSlots.clear();
+        std::lock_guard<std::mutex> slock(m_statsMutex);
+        m_stats.staging_buffer_bytes = 0;
+        return;
+    }
+    m_stagingBuffer = static_cast<uint8_t *>(mapped);
 
     m_stagingSlots.resize(STAGING_SLOT_COUNT);
-    while (!m_freeStagingSlots.empty())
-        m_freeStagingSlots.pop();
-
     for (size_t i = 0; i < STAGING_SLOT_COUNT; ++i) {
         m_stagingSlots[i].ring_offset = i * FRAME_SIZE_BYTES;
         m_stagingSlots[i].item_id = 0;
         m_stagingSlots[i].target_layer = -1;
         m_stagingSlots[i].ready_for_upload = false;
+        m_stagingSlots[i].decode_succeeded = false;
+        m_stagingSlots[i].etc2_blocks.reset();
         m_freeStagingSlots.push(i);
     }
 
@@ -324,12 +588,15 @@ void GpuTexturePool::freeStagingMemory()
         m_stagingBuffer = nullptr;
     }
     m_stagingSlots.clear();
+    while (!m_freeStagingSlots.empty()) {
+        m_freeStagingSlots.pop();
+    }
 }
 
-void GpuTexturePool::initLru()
+void GpuTexturePool::initLruLocked()
 {
-    std::lock_guard<std::mutex> lock(m_lruMutex);
-    m_freeLayers.reserve(m_maxVramSlots);
+    m_freeLayers.clear();
+    m_freeLayers.reserve(static_cast<size_t>(m_maxVramSlots));
     for (int i = 0; i < m_maxVramSlots; ++i) {
         m_freeLayers.push_back(i);
     }
@@ -339,16 +606,10 @@ void GpuTexturePool::initLru()
     m_lruTail = new LruNode();
     m_lruHead->next = m_lruTail;
     m_lruTail->prev = m_lruHead;
-
-    std::lock_guard<std::mutex> slock(m_statsMutex);
-    m_stats.max_slots = m_maxVramSlots;
-    m_stats.total_vram_bytes = static_cast<size_t>(m_maxVramSlots) *
-                               (m_arrayUsesEtc2 ? ETC2_FRAME_SIZE_BYTES : FRAME_SIZE_BYTES);
 }
 
-void GpuTexturePool::destroyLru()
+void GpuTexturePool::destroyLruLocked()
 {
-    std::lock_guard<std::mutex> lock(m_lruMutex);
     for (auto &pair : m_itemToNode) {
         delete pair.second;
     }
@@ -360,6 +621,23 @@ void GpuTexturePool::destroyLru()
     delete m_lruTail;
     m_lruHead = nullptr;
     m_lruTail = nullptr;
+}
+
+void GpuTexturePool::initLru()
+{
+    std::scoped_lock lock(m_lruMutex, m_statsMutex);
+    initLruLocked();
+    m_stats.max_slots = static_cast<size_t>(m_maxVramSlots);
+    m_stats.total_vram_bytes = static_cast<size_t>(m_maxVramSlots) *
+                               (m_arrayUsesEtc2 ? ETC2_FRAME_SIZE_BYTES : FRAME_SIZE_BYTES);
+    m_stats.active_slots = 0;
+}
+
+void GpuTexturePool::destroyLru()
+{
+    std::scoped_lock lock(m_lruMutex, m_statsMutex);
+    destroyLruLocked();
+    m_stats.active_slots = 0;
 }
 
 void GpuTexturePool::detachLruNode(LruNode *node)
@@ -374,7 +652,7 @@ void GpuTexturePool::detachLruNode(LruNode *node)
 
 void GpuTexturePool::insertLruHead(LruNode *node)
 {
-    if (!node || !m_lruHead)
+    if (!node || !m_lruHead || !m_lruTail)
         return;
     node->next = m_lruHead->next;
     node->prev = m_lruHead;
@@ -382,16 +660,18 @@ void GpuTexturePool::insertLruHead(LruNode *node)
     m_lruHead->next = node;
 }
 
-int GpuTexturePool::allocateLayerFor(uint32_t item_id)
+int GpuTexturePool::allocateLayerLocked(uint32_t item_id)
 {
-    std::lock_guard<std::mutex> lock(m_lruMutex);
-
     // If already exists in LRU
     auto it = m_itemToNode.find(item_id);
     if (it != m_itemToNode.end()) {
         detachLruNode(it->second);
         insertLruHead(it->second);
         return it->second->layer_index;
+    }
+
+    if (!m_lruHead || !m_lruTail) {
+        return -1;
     }
 
     int assigned_layer = -1;
@@ -405,6 +685,7 @@ int GpuTexturePool::allocateLayerFor(uint32_t item_id)
         node->item_id = item_id;
         node->layer_index = assigned_layer;
         node->decode_queued = false;
+        node->cpu_ready = false;
         node->ready = false;
     } else {
         // Evict LRU from tail (O(1))
@@ -419,6 +700,7 @@ int GpuTexturePool::allocateLayerFor(uint32_t item_id)
             node->item_id = item_id;
             node->layer_index = assigned_layer;
             node->decode_queued = false;
+            node->cpu_ready = false;
             node->ready = false;
             node->thumbnail = QImage();
             node->etc2_blocks.reset();
@@ -435,6 +717,12 @@ int GpuTexturePool::allocateLayerFor(uint32_t item_id)
     m_stats.active_slots = m_itemToNode.size();
 
     return assigned_layer;
+}
+
+int GpuTexturePool::allocateLayerFor(uint32_t item_id)
+{
+    std::lock_guard<std::mutex> lock(m_lruMutex);
+    return allocateLayerLocked(item_id);
 }
 
 bool GpuTexturePool::initGl(QOpenGLExtraFunctions *gl)
@@ -531,57 +819,90 @@ void GpuTexturePool::destroyGl(QOpenGLExtraFunctions *gl)
         m_texArrayId = 0;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(m_lruMutex);
+        for (auto &pair : m_itemToNode) {
+            pair.second->ready = false;
+        }
+    }
+
     m_initialized = false;
 }
 
 int GpuTexturePool::requestTexture(uint32_t item_id, const std::string &media_path,
                                    const std::string &preview_path)
 {
-    int layer = -1;
+    if (m_shutdownGate.closing.load(std::memory_order_acquire)) {
+        return -1;
+    }
 
-    // 1. Check if already in LRU
+    // Fast path for already resident or pending entries
     {
         std::lock_guard<std::mutex> lock(m_lruMutex);
         auto it = m_itemToNode.find(item_id);
         if (it != m_itemToNode.end()) {
             detachLruNode(it->second);
             insertLruHead(it->second);
-            if (it->second->media_path != media_path) {
-                // Item ID was reassigned to a different wallpaper after a catalog rescan
-                it->second->media_path = media_path;
-                it->second->ready = false;
-                it->second->decode_queued = false;
-                it->second->thumbnail = QImage();
-                it->second->etc2_blocks.reset();
-                layer = it->second->layer_index;
-            } else {
+            if (it->second->media_path == media_path) {
                 if (it->second->ready) {
                     return it->second->layer_index;
                 }
-                if (it->second->decode_queued) {
-                    return -1; // Decode already in flight
+                if (it->second->decode_queued || it->second->cpu_ready) {
+                    return -1;
                 }
-                layer = it->second->layer_index;
             }
         }
     }
 
-    // 2. Allocate an LRU VRAM layer slot if not yet allocated
-    if (layer < 0) {
-        layer = allocateLayerFor(item_id);
-        if (layer < 0)
-            return -1;
-    }
-
-    // 3. Acquire an L2 staging ringbuffer slot
-    size_t staging_slot_idx = 0;
+    bool notify_worker = false;
     {
-        std::lock_guard<std::mutex> lock(m_stagingMutex);
-        if (m_freeStagingSlots.empty()) {
-            // Staging buffer temporarily full; will retry next frame
+        std::scoped_lock lock(m_taskMutex, m_stagingMutex, m_lruMutex);
+        if (m_shutdownGate.closing.load(std::memory_order_acquire) || !m_stagingBuffer) {
             return -1;
         }
-        staging_slot_idx = m_freeStagingSlots.front();
+
+        int layer = -1;
+        auto it = m_itemToNode.find(item_id);
+        if (it != m_itemToNode.end()) {
+            detachLruNode(it->second);
+            insertLruHead(it->second);
+            if (it->second->media_path == media_path) {
+                if (it->second->ready) {
+                    return it->second->layer_index;
+                }
+                if (it->second->decode_queued || it->second->cpu_ready) {
+                    return -1;
+                }
+                layer = it->second->layer_index;
+            } else {
+                // Item ID was reassigned to a different wallpaper after a catalog rescan
+                it->second->media_path = media_path;
+                it->second->ready = false;
+                it->second->cpu_ready = false;
+                it->second->decode_queued = false;
+                it->second->thumbnail = QImage();
+                it->second->etc2_blocks.reset();
+                layer = it->second->layer_index;
+            }
+        }
+
+        // Avoid evicting resident VRAM LRU slots when staging is full; unused layers can still
+        // be claimed until the pool reaches capacity.
+        if (m_freeStagingSlots.empty()) {
+            if (layer < 0 && !m_freeLayers.empty()) {
+                allocateLayerLocked(item_id);
+            }
+            return -1;
+        }
+
+        if (layer < 0) {
+            layer = allocateLayerLocked(item_id);
+            if (layer < 0) {
+                return -1;
+            }
+        }
+
+        const size_t staging_slot_idx = m_freeStagingSlots.front();
         m_freeStagingSlots.pop();
 
         m_stagingSlots[staging_slot_idx].item_id = item_id;
@@ -590,34 +911,39 @@ int GpuTexturePool::requestTexture(uint32_t item_id, const std::string &media_pa
         m_stagingSlots[staging_slot_idx].ready_for_upload = false;
         m_stagingSlots[staging_slot_idx].decode_succeeded = false;
         m_stagingSlots[staging_slot_idx].etc2_blocks.reset();
-    }
 
-    {
-        std::lock_guard<std::mutex> lock(m_lruMutex);
-        auto it = m_itemToNode.find(item_id);
-        if (it != m_itemToNode.end()) {
-            it->second->media_path = media_path;
-            it->second->decode_queued = true;
+        auto node_it = m_itemToNode.find(item_id);
+        if (node_it != m_itemToNode.end()) {
+            node_it->second->media_path = media_path;
+            node_it->second->decode_queued = true;
         }
-    }
 
-    // 4. Enqueue background decode task
-    {
-        std::lock_guard<std::mutex> lock(m_taskMutex);
+        const uint64_t current_epoch = m_shutdownGate.epoch.load(std::memory_order_acquire);
         m_taskQueue.push(WorkerTask{.item_id = item_id,
                                     .target_layer = layer,
+                                    .epoch = current_epoch,
                                     .media_path = media_path,
                                     .preview_path = preview_path,
                                     .staging_slot_idx = staging_slot_idx});
+        notify_worker = true;
     }
-    m_taskCv.notify_one();
 
-    return -1; // Upload pending
+    if (notify_worker) {
+        m_taskCv.notify_one();
+    }
+
+    return -1;
 }
 
 int GpuTexturePool::processPendingUploads(QOpenGLExtraFunctions *gl, int max_uploads_per_frame)
 {
+    if (max_uploads_per_frame <= 0) {
+        return 0;
+    }
+
+    const bool gl_upload_ready = (m_initialized && gl != nullptr && m_texArrayId != 0);
     int uploaded_count = 0;
+
     while (uploaded_count < max_uploads_per_frame) {
         size_t staging_idx = 0;
         {
@@ -636,7 +962,7 @@ int GpuTexturePool::processPendingUploads(QOpenGLExtraFunctions *gl, int max_upl
         std::shared_ptr<std::vector<uint8_t>> slot_etc2;
         {
             std::lock_guard<std::mutex> lock(m_stagingMutex);
-            if (staging_idx < m_stagingSlots.size() &&
+            if (m_stagingBuffer != nullptr && staging_idx < m_stagingSlots.size() &&
                 m_stagingSlots[staging_idx].ready_for_upload) {
                 slot_rgba = m_stagingBuffer + m_stagingSlots[staging_idx].ring_offset;
                 target_layer = m_stagingSlots[staging_idx].target_layer;
@@ -661,13 +987,15 @@ int GpuTexturePool::processPendingUploads(QOpenGLExtraFunctions *gl, int max_upl
                     it->second->media_path == slot_media_path) {
                     it->second->thumbnail = std::move(thumb_copy);
                     it->second->etc2_blocks = slot_etc2;
-                    it->second->ready = true;
+                    it->second->cpu_ready = true;
+                    // Only mark VRAM resident when a live GL context uploaded the layer.
+                    it->second->ready = gl_upload_ready;
                     it->second->decode_queued = false;
                     slot_still_valid = true;
                 }
             }
 
-            if (slot_still_valid && m_initialized && gl && m_texArrayId != 0) {
+            if (slot_still_valid && gl_upload_ready) {
                 if (m_arrayUsesEtc2 && slot_etc2 && slot_etc2->size() == ETC2_FRAME_SIZE_BYTES) {
                     m_pboQueue.uploadAsync(gl, slot_etc2->data(), slot_etc2->size(),
                                            static_cast<GLuint>(target_layer), m_texArrayId, true,
@@ -684,9 +1012,68 @@ int GpuTexturePool::processPendingUploads(QOpenGLExtraFunctions *gl, int max_upl
         // Return staging slot to free ring queue
         {
             std::lock_guard<std::mutex> lock(m_stagingMutex);
-            m_stagingSlots[staging_idx].ready_for_upload = false;
-            m_stagingSlots[staging_idx].etc2_blocks.reset();
-            m_freeStagingSlots.push(staging_idx);
+            if (staging_idx < m_stagingSlots.size()) {
+                m_stagingSlots[staging_idx].ready_for_upload = false;
+                m_stagingSlots[staging_idx].etc2_blocks.reset();
+                m_freeStagingSlots.push(staging_idx);
+            }
+        }
+    }
+
+    // Promote CPU-decoded nodes to VRAM once an OpenGL context becomes available.
+    if (gl_upload_ready && uploaded_count < max_uploads_per_frame) {
+        struct PendingVramUpload {
+            uint32_t item_id;
+            int layer_index;
+            std::string media_path;
+            QImage thumbnail;
+            std::shared_ptr<const std::vector<uint8_t>> etc2_blocks;
+        };
+        std::vector<PendingVramUpload> deferred;
+        deferred.reserve(static_cast<size_t>(max_uploads_per_frame - uploaded_count));
+
+        {
+            std::lock_guard<std::mutex> lock(m_lruMutex);
+            for (LruNode *cur = m_lruHead ? m_lruHead->next : nullptr;
+                 cur != nullptr && cur != m_lruTail &&
+                 static_cast<int>(deferred.size()) < (max_uploads_per_frame - uploaded_count);
+                 cur = cur->next) {
+                if (cur->cpu_ready && !cur->ready && !cur->decode_queued && cur->layer_index >= 0) {
+                    deferred.push_back(PendingVramUpload{.item_id = cur->item_id,
+                                                         .layer_index = cur->layer_index,
+                                                         .media_path = cur->media_path,
+                                                         .thumbnail = cur->thumbnail,
+                                                         .etc2_blocks = cur->etc2_blocks});
+                }
+            }
+        }
+
+        for (const auto &pending : deferred) {
+            bool uploaded = false;
+            if (m_arrayUsesEtc2 && pending.etc2_blocks &&
+                pending.etc2_blocks->size() == ETC2_FRAME_SIZE_BYTES) {
+                m_pboQueue.uploadAsync(gl, pending.etc2_blocks->data(),
+                                       pending.etc2_blocks->size(),
+                                       static_cast<GLuint>(pending.layer_index), m_texArrayId,
+                                       true, m_arrayInternalFormat);
+                uploaded = true;
+            } else if (!m_arrayUsesEtc2 && !pending.thumbnail.isNull()) {
+                QImage rgba = pending.thumbnail.convertToFormat(QImage::Format_RGBA8888);
+                if (static_cast<size_t>(rgba.sizeInBytes()) >= FRAME_SIZE_BYTES) {
+                    m_pboQueue.uploadAsync(gl, rgba.constBits(), FRAME_SIZE_BYTES,
+                                           static_cast<GLuint>(pending.layer_index), m_texArrayId,
+                                           false, GL_RGBA8);
+                    uploaded = true;
+                }
+            }
+
+            std::lock_guard<std::mutex> lock(m_lruMutex);
+            auto it = m_itemToNode.find(pending.item_id);
+            if (it != m_itemToNode.end() && it->second->layer_index == pending.layer_index &&
+                it->second->media_path == pending.media_path) {
+                it->second->ready = uploaded;
+            }
+            ++uploaded_count;
         }
     }
 
@@ -714,7 +1101,7 @@ QImage GpuTexturePool::getThumbnailImage(uint32_t item_id) const
 {
     std::lock_guard<std::mutex> lock(m_lruMutex);
     auto it = m_itemToNode.find(item_id);
-    if (it != m_itemToNode.end() && it->second->ready) {
+    if (it != m_itemToNode.end() && it->second->cpu_ready) {
         return it->second->thumbnail;
     }
     return {};
@@ -725,7 +1112,7 @@ GpuTexturePool::getCompressedEtc2Blocks(uint32_t item_id) const
 {
     std::lock_guard<std::mutex> lock(m_lruMutex);
     auto it = m_itemToNode.find(item_id);
-    if (it != m_itemToNode.end() && it->second->ready) {
+    if (it != m_itemToNode.end() && it->second->cpu_ready) {
         return it->second->etc2_blocks;
     }
     return {};
@@ -743,33 +1130,29 @@ void GpuTexturePool::touch(uint32_t item_id)
 
 void GpuTexturePool::clear()
 {
+    std::scoped_lock lock(m_taskMutex, m_uploadMutex, m_stagingMutex, m_lruMutex, m_statsMutex);
+    m_shutdownGate.epoch.fetch_add(1, std::memory_order_acq_rel);
+
     std::vector<size_t> reclaimed_slots;
-    {
-        std::lock_guard<std::mutex> lock(m_taskMutex);
-        while (!m_taskQueue.empty()) {
-            reclaimed_slots.push_back(m_taskQueue.front().staging_slot_idx);
-            m_taskQueue.pop();
+    while (!m_taskQueue.empty()) {
+        reclaimed_slots.push_back(m_taskQueue.front().staging_slot_idx);
+        m_taskQueue.pop();
+    }
+    while (!m_uploadQueue.empty()) {
+        reclaimed_slots.push_back(m_uploadQueue.front());
+        m_uploadQueue.pop();
+    }
+    for (size_t idx : reclaimed_slots) {
+        if (idx < m_stagingSlots.size()) {
+            m_stagingSlots[idx].ready_for_upload = false;
+            m_stagingSlots[idx].etc2_blocks.reset();
+            m_freeStagingSlots.push(idx);
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(m_uploadMutex);
-        while (!m_uploadQueue.empty()) {
-            reclaimed_slots.push_back(m_uploadQueue.front());
-            m_uploadQueue.pop();
-        }
-    }
-    if (!reclaimed_slots.empty()) {
-        std::lock_guard<std::mutex> lock(m_stagingMutex);
-        for (size_t idx : reclaimed_slots) {
-            if (idx < m_stagingSlots.size()) {
-                m_stagingSlots[idx].ready_for_upload = false;
-                m_stagingSlots[idx].etc2_blocks.reset();
-                m_freeStagingSlots.push(idx);
-            }
-        }
-    }
-    destroyLru();
-    initLru();
+
+    destroyLruLocked();
+    initLruLocked();
+    m_stats.active_slots = 0;
 }
 
 TexturePoolStats GpuTexturePool::stats() const
@@ -779,17 +1162,33 @@ TexturePoolStats GpuTexturePool::stats() const
 }
 
 bool GpuTexturePool::decodeThumbnail(const std::string &path, const std::string &preview,
-                                     uint8_t *out_rgba)
+                                     uint8_t *out_rgba, std::stop_token stop_token,
+                                     uint64_t expected_epoch)
 {
     if (!out_rgba)
         return false;
 
-    std::string cache_path = resolveDiskCachePath(path);
+    auto isCancelled = [&]() {
+        return stop_token.stop_requested() ||
+               m_shutdownGate.epoch.load(std::memory_order_acquire) != expected_epoch;
+    };
+    if (isCancelled()) {
+        return false;
+    }
+
+    const std::string source_file = !preview.empty() ? preview : path;
+    const std::string cache_path = resolveDiskCachePath(path);
+    const bool use_webp = webpWritingSupported();
+    const std::string active_cache = use_webp ? cache_path : (cache_path + ".png");
 
     // L1: Check Disk Cache (~/.cache/wwal/thumbnails/<sha256>.webp)
-    std::error_code ec;
-    if (std::filesystem::exists(cache_path, ec)) {
-        QImage cached_img = loadQImageWithCoreFallback(cache_path);
+    const std::string hit_path =
+        isDiskCacheFresh(cache_path, source_file)
+            ? cache_path
+            : (!use_webp && isDiskCacheFresh(active_cache, source_file) ? active_cache
+                                                                        : std::string{});
+    if (!hit_path.empty()) {
+        QImage cached_img = loadQImageWithCoreFallback(hit_path, THUMB_WIDTH, THUMB_HEIGHT);
         if (!cached_img.isNull() && cached_img.width() == static_cast<int>(THUMB_WIDTH) &&
             cached_img.height() == static_cast<int>(THUMB_HEIGHT)) {
             QImage rgba = cached_img.convertToFormat(QImage::Format_RGBA8888);
@@ -806,70 +1205,59 @@ bool GpuTexturePool::decodeThumbnail(const std::string &path, const std::string 
         m_stats.disk_misses++;
     }
 
-    std::string source_file = !preview.empty() ? preview : path;
-    std::string ext = toLowerExt(source_file);
+    if (isCancelled()) {
+        return false;
+    }
+
+    std::string resolved_source = source_file;
+    std::string ext = toLowerExt(resolved_source);
 
     // Handle shader files with procedural shader thumbnail
     if (ext == ".glsl" || ext == ".frag" || ext == ".shadertoy" || ext == ".comp") {
-        generateShaderThumbnail(source_file, out_rgba, THUMB_WIDTH, THUMB_HEIGHT);
+        generateShaderThumbnail(resolved_source, out_rgba, THUMB_WIDTH, THUMB_HEIGHT);
         return true;
     }
 
     // Handle Gnome timed wallpaper XML files by resolving their first referenced image
-    if (ext == ".xml" && std::filesystem::exists(source_file, ec)) {
-        std::string xml_img = resolveGnomeXmlFirstImage(source_file);
+    std::error_code ec;
+    if (ext == ".xml" && std::filesystem::exists(resolved_source, ec)) {
+        std::string xml_img = resolveGnomeXmlFirstImage(resolved_source);
         if (!xml_img.empty()) {
-            source_file = xml_img;
-            ext = toLowerExt(source_file);
+            resolved_source = xml_img;
+            ext = toLowerExt(resolved_source);
         }
     }
 
     QImage src_img;
-    if (std::filesystem::exists(source_file, ec)) {
-        src_img = loadQImageWithCoreFallback(source_file);
+    if (std::filesystem::exists(resolved_source, ec)) {
+        src_img = loadQImageWithCoreFallback(resolved_source, THUMB_WIDTH, THUMB_HEIGHT);
 
-        // If video file and not yet decoded, extract a frame via ffmpeg
+        // If video file and not yet decoded, extract a bounded frame via ffmpeg
         if (src_img.isNull() &&
             (ext == ".mp4" || ext == ".mkv" || ext == ".webm" || ext == ".avi" || ext == ".mov")) {
-            QProcess proc;
-            QStringList args = {
-                QStringLiteral("-loglevel"),
-                QStringLiteral("error"),
-                QStringLiteral("-i"),
-                QString::fromStdString(source_file),
-                QStringLiteral("-frames:v"),
-                QStringLiteral("1"),
-                QStringLiteral("-vf"),
-                QStringLiteral("scale=384:216:force_original_aspect_ratio=increase,crop=384:216"),
-                QStringLiteral("-f"),
-                QStringLiteral("image2pipe"),
-                QStringLiteral("-vcodec"),
-                QStringLiteral("png"),
-                QStringLiteral("-")};
-            proc.start(QStringLiteral("ffmpeg"), args);
-            if (proc.waitForFinished(2500)) {
-                QByteArray png_bytes = proc.readAllStandardOutput();
-                if (!png_bytes.isEmpty()) {
-                    src_img.loadFromData(png_bytes, "PNG");
-                }
-            }
+            src_img = extractVideoFrameBounded(resolved_source, stop_token, m_shutdownGate.epoch,
+                                               expected_epoch);
         }
     }
 
-    if (src_img.isNull()) {
-        // Fallback: generate subtle gradient thumbnail so even synthetic/missing items have a valid
-        // buffer
-        generateShaderThumbnail(source_file, out_rgba, THUMB_WIDTH, THUMB_HEIGHT);
+    if (isCancelled()) {
         return false;
     }
 
-    // Downscale & center-crop to 384x216 with high quality smooth filtering
+    if (src_img.isNull()) {
+        generateShaderThumbnail(resolved_source, out_rgba, THUMB_WIDTH, THUMB_HEIGHT);
+        return false;
+    }
+
     QImage rgba = scaleAndCenterCrop(src_img, THUMB_WIDTH, THUMB_HEIGHT);
     std::memcpy(out_rgba, rgba.constBits(), FRAME_SIZE_BYTES);
 
-    // Save lossy WebP quality 85 to disk cache (fallback to PNG if Qt WebP writer plugin is absent)
-    if (!rgba.save(QString::fromStdString(cache_path), "WEBP", 85)) {
-        rgba.save(QString::fromStdString(cache_path), "PNG");
+    if (!active_cache.empty()) {
+        if (use_webp) {
+            writeThumbnailAtomically(rgba, active_cache, "WEBP", 85, source_file);
+        } else {
+            writeThumbnailAtomically(rgba, active_cache, "PNG", -1, source_file);
+        }
     }
 
     return true;
@@ -877,13 +1265,18 @@ bool GpuTexturePool::decodeThumbnail(const std::string &path, const std::string 
 
 void GpuTexturePool::workerLoop()
 {
-    while (!m_stopWorkers) {
+    const std::stop_token stop_token = m_shutdownGate.stop_source.get_token();
+
+    while (!m_shutdownGate.closing.load(std::memory_order_acquire)) {
         WorkerTask task;
         {
             std::unique_lock<std::mutex> lock(m_taskMutex);
-            m_taskCv.wait(lock, [this] { return m_stopWorkers || !m_taskQueue.empty(); });
+            m_taskCv.wait(lock, [this] {
+                return m_shutdownGate.closing.load(std::memory_order_acquire) ||
+                       !m_taskQueue.empty();
+            });
 
-            if (m_stopWorkers && m_taskQueue.empty()) {
+            if (m_shutdownGate.closing.load(std::memory_order_acquire) && m_taskQueue.empty()) {
                 return;
             }
 
@@ -891,33 +1284,73 @@ void GpuTexturePool::workerLoop()
             m_taskQueue.pop();
         }
 
+        PoolShutdownGate::ReaderGuard reader_guard(m_shutdownGate);
+        if (!reader_guard.engaged()) {
+            return;
+        }
+
+        auto returnStagingSlot = [&]() {
+            std::lock_guard<std::mutex> lock(m_stagingMutex);
+            if (task.staging_slot_idx < m_stagingSlots.size()) {
+                m_stagingSlots[task.staging_slot_idx].ready_for_upload = false;
+                m_stagingSlots[task.staging_slot_idx].etc2_blocks.reset();
+                m_freeStagingSlots.push(task.staging_slot_idx);
+            }
+        };
+
+        if (task.epoch != m_shutdownGate.epoch.load(std::memory_order_acquire)) {
+            returnStagingSlot();
+            continue;
+        }
+
         uint8_t *slot_ptr = nullptr;
         {
             std::lock_guard<std::mutex> lock(m_stagingMutex);
-            if (task.staging_slot_idx < m_stagingSlots.size()) {
+            if (m_stagingBuffer != nullptr && task.staging_slot_idx < m_stagingSlots.size()) {
                 slot_ptr = m_stagingBuffer + m_stagingSlots[task.staging_slot_idx].ring_offset;
             }
         }
 
-        if (slot_ptr) {
-            bool ok = decodeThumbnail(task.media_path, task.preview_path, slot_ptr);
-            auto etc2Buf = std::make_shared<std::vector<uint8_t>>();
-            etc2::encodeRgbaToEtc2Simd(slot_ptr, static_cast<int>(THUMB_WIDTH),
-                                       static_cast<int>(THUMB_HEIGHT),
-                                       static_cast<int>(THUMB_WIDTH * BYTES_PER_PIXEL), *etc2Buf);
+        if (!slot_ptr) {
+            returnStagingSlot();
+            continue;
+        }
 
-            {
-                std::lock_guard<std::mutex> lock(m_stagingMutex);
+        bool ok = decodeThumbnail(task.media_path, task.preview_path, slot_ptr, stop_token,
+                                  task.epoch);
+        const bool cancelled =
+            m_shutdownGate.closing.load(std::memory_order_acquire) ||
+            stop_token.stop_requested() ||
+            task.epoch != m_shutdownGate.epoch.load(std::memory_order_acquire);
+        if (cancelled) {
+            returnStagingSlot();
+            continue;
+        }
+
+        auto etc2Buf = std::make_shared<std::vector<uint8_t>>();
+        etc2::encodeRgbaToEtc2Simd(slot_ptr, static_cast<int>(THUMB_WIDTH),
+                                   static_cast<int>(THUMB_HEIGHT),
+                                   static_cast<int>(THUMB_WIDTH * BYTES_PER_PIXEL), *etc2Buf);
+
+        bool published = false;
+        {
+            std::scoped_lock lock(m_uploadMutex, m_stagingMutex);
+            if (!m_shutdownGate.closing.load(std::memory_order_acquire) &&
+                task.epoch == m_shutdownGate.epoch.load(std::memory_order_acquire) &&
+                task.staging_slot_idx < m_stagingSlots.size()) {
                 m_stagingSlots[task.staging_slot_idx].decode_succeeded = ok;
                 m_stagingSlots[task.staging_slot_idx].etc2_blocks = std::move(etc2Buf);
                 m_stagingSlots[task.staging_slot_idx].ready_for_upload = true;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(m_uploadMutex);
                 m_uploadQueue.push(task.staging_slot_idx);
+                published = true;
+            } else if (task.staging_slot_idx < m_stagingSlots.size()) {
+                m_stagingSlots[task.staging_slot_idx].ready_for_upload = false;
+                m_stagingSlots[task.staging_slot_idx].etc2_blocks.reset();
+                m_freeStagingSlots.push(task.staging_slot_idx);
             }
+        }
 
+        if (published) {
             std::function<void()> cb;
             {
                 std::lock_guard<std::mutex> lock(m_callbackMutex);

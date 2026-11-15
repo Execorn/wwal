@@ -45,6 +45,7 @@ class AddSceneLayerCommand final : public ICommand {
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] size_t memoryFootprint() const override;
     [[nodiscard]] int32_t objectId() const noexcept { return m_layer.objectId; }
 
   private:
@@ -64,6 +65,7 @@ class RemoveSceneLayerCommand final : public ICommand {
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] size_t memoryFootprint() const override;
 
   private:
     SceneLayerSnapshot m_removedLayer;
@@ -81,6 +83,7 @@ class ReorderSceneLayerCommand final : public ICommand {
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] size_t memoryFootprint() const override;
 
   private:
     int32_t m_objectId{-1};
@@ -105,6 +108,8 @@ class ReparentSceneLayerCommand final : public ICommand {
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
   private:
     int32_t m_objectId{-1};
@@ -138,6 +143,8 @@ class SetLayerTransformCommand final : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override; /* Coalesces gizmo drags within 500 ms */
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
     [[nodiscard]] int32_t objectId() const noexcept { return m_objectId; }
     [[nodiscard]] const TransformState &newState() const noexcept { return m_newState; }
@@ -168,6 +175,8 @@ class SetLayerFlagsCommand final : public ICommand {
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
   private:
     int32_t m_objectId{-1};
@@ -209,6 +218,8 @@ class EditParticleSystemCommand final : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override; /* Coalesces curve/slider drags within 250 ms */
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
     [[nodiscard]] int32_t objectId() const noexcept { return m_objectId; }
     [[nodiscard]] const QString &paramGroup() const noexcept { return m_paramGroup; }

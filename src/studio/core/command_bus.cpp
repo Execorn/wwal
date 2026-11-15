@@ -2,8 +2,81 @@
 #include "command_bus.hpp"
 
 #include <QFileInfo>
+#include <QPointer>
+
+#include <algorithm>
+#include <cmath>
+#include <exception>
 
 namespace waywal::studio {
+
+namespace {
+
+[[nodiscard]] bool allFiniteVec(const std::vector<float> &vals) noexcept
+{
+    for (float v : vals) {
+        if (!std::isfinite(v)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool allFiniteArr4(const std::array<float, 4> &vals) noexcept
+{
+    for (float v : vals) {
+        if (!std::isfinite(v)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool isValidBezierCurve(const bezier_curve_t &curve) noexcept
+{
+    return std::isfinite(curve.p1x) && std::isfinite(curve.p1y) && std::isfinite(curve.p2x) &&
+           std::isfinite(curve.p2y) && curve.p1x >= 0.0f && curve.p1x <= 1.0f &&
+           curve.p2x >= 0.0f && curve.p2x <= 1.0f;
+}
+
+[[nodiscard]] size_t qStringHeapBytes(const QString &s) noexcept
+{
+    return static_cast<size_t>(std::max<qsizetype>(0, s.capacity())) * sizeof(QChar);
+}
+
+template <typename Stack>
+[[nodiscard]] size_t recalculateStackBytes(const Stack &stack)
+{
+    size_t total = 0;
+    for (const auto &entry : stack) {
+        if (entry) {
+            total += std::max<size_t>(sizeof(ICommand), entry->memoryFootprint());
+        }
+    }
+    return total;
+}
+
+} // namespace
+
+struct CommandBus::DispatchGuard {
+    explicit DispatchGuard(CommandBus *owner) : m_owner(owner)
+    {
+        if (m_owner) {
+            m_owner->m_dispatching = true;
+        }
+    }
+    ~DispatchGuard()
+    {
+        if (m_owner) {
+            m_owner->m_dispatching = false;
+        }
+    }
+    DispatchGuard(const DispatchGuard &) = delete;
+    DispatchGuard &operator=(const DispatchGuard &) = delete;
+
+  private:
+    QPointer<CommandBus> m_owner;
+};
 
 /* ========================================================================= */
 /* CommandBus Implementation                                                 */
@@ -14,65 +87,261 @@ CommandBus::CommandBus(size_t maxHistory, QObject *parent)
 {
 }
 
-void CommandBus::execute(std::unique_ptr<ICommand> cmd)
+size_t CommandBus::commandFootprint(const ICommand &cmd) const
 {
-    if (!cmd)
-        return;
+    return std::max<size_t>(sizeof(ICommand), cmd.memoryFootprint());
+}
 
-    if (!m_undoStack.empty() && m_undoStack.back()->mergeWith(cmd.get())) {
-        // Coalesced micro-drag action (e.g. continuous slider or bezier drag)
-        m_undoStack.back()->execute();
+bool CommandBus::evictExcessHistory()
+{
+    bool evicted = false;
+    while (m_undoStack.size() > m_maxHistory ||
+           (!m_undoStack.empty() && m_undoBytes > m_maxHistoryBytes)) {
+        const size_t frontBytes = commandFootprint(*m_undoStack.front());
+        m_undoStack.pop_front();
+        m_undoBytes =
+            (m_undoBytes >= frontBytes) ? (m_undoBytes - frontBytes)
+                                        : recalculateStackBytes(m_undoStack);
+        evicted = true;
+    }
+    return evicted;
+}
+
+void CommandBus::setMaxHistoryBytes(size_t maxBytes)
+{
+    m_maxHistoryBytes = maxBytes > 0 ? maxBytes : DEFAULT_MAX_HISTORY_BYTES;
+    bool changed = evictExcessHistory();
+    while (!m_redoStack.empty() && m_redoBytes > m_maxHistoryBytes) {
+        const size_t frontBytes = commandFootprint(*m_redoStack.front());
+        m_redoStack.erase(m_redoStack.begin());
+        m_redoBytes =
+            (m_redoBytes >= frontBytes) ? (m_redoBytes - frontBytes)
+                                        : recalculateStackBytes(m_redoStack);
+        changed = true;
+    }
+    if (changed) {
         notifyHistoryChanged();
         emit stateChanged();
-        return;
+    }
+}
+
+void CommandBus::execute(std::unique_ptr<ICommand> cmd) { (void)tryExecute(std::move(cmd)); }
+
+void CommandBus::undo() { (void)tryUndo(); }
+
+void CommandBus::redo() { (void)tryRedo(); }
+
+bool CommandBus::tryExecute(std::unique_ptr<ICommand> cmd)
+{
+    if (!cmd)
+        return false;
+
+    if (m_dispatching) {
+        emit commandFailed(QStringLiteral("CommandBus::execute() re-entrant dispatch rejected"));
+        return false;
     }
 
-    cmd->execute();
+    if (!cmd->isValid()) {
+        emit commandFailed(
+            QStringLiteral("CommandBus rejected invalid command: %1").arg(cmd->describe()));
+        return false;
+    }
+
+    QPointer<CommandBus> self(this);
+    QString errorReason;
+
+    if (!m_undoStack.empty()) {
+        ICommand *tail = m_undoStack.back().get();
+        const size_t oldTailBytes = commandFootprint(*tail);
+        if (tail->mergeWith(cmd.get())) {
+            {
+                DispatchGuard guard(this);
+                try {
+                    tail->execute();
+                } catch (const std::exception &ex) {
+                    errorReason = QString::fromUtf8(ex.what());
+                } catch (...) {
+                    errorReason = QStringLiteral("Unknown exception during coalesced execute()");
+                }
+            }
+            if (!self) {
+                return false;
+            }
+            // A coalesced edit starts a fresh future branch just like an unmerged execute().
+            m_redoStack.clear();
+            m_redoBytes = 0;
+
+            const size_t newTailBytes = commandFootprint(*tail);
+            m_undoBytes =
+                (m_undoBytes >= oldTailBytes ? m_undoBytes - oldTailBytes : 0) + newTailBytes;
+            evictExcessHistory();
+
+            if (!errorReason.isEmpty()) {
+                emit commandFailed(errorReason);
+                notifyHistoryChanged();
+                emit stateChanged();
+                return false;
+            }
+            notifyHistoryChanged();
+            emit stateChanged();
+            return true;
+        }
+    }
+
+    {
+        DispatchGuard guard(this);
+        try {
+            cmd->execute();
+        } catch (const std::exception &ex) {
+            errorReason = QString::fromUtf8(ex.what());
+        } catch (...) {
+            errorReason = QStringLiteral("Unknown exception during command execute()");
+        }
+    }
+
+    if (!self) {
+        return false;
+    }
+
+    if (!errorReason.isEmpty()) {
+        emit commandFailed(errorReason);
+        return false;
+    }
+
+    const size_t cmdBytes = commandFootprint(*cmd);
     m_undoStack.push_back(std::move(cmd));
+    m_undoBytes += cmdBytes;
     m_redoStack.clear();
+    m_redoBytes = 0;
 
-    if (m_undoStack.size() > m_maxHistory) {
-        m_undoStack.pop_front();
-    }
+    evictExcessHistory();
 
     notifyHistoryChanged();
     emit stateChanged();
+    return true;
 }
 
-void CommandBus::undo()
+bool CommandBus::tryUndo()
 {
+    if (m_dispatching) {
+        emit commandFailed(QStringLiteral("CommandBus::undo() re-entrant dispatch rejected"));
+        return false;
+    }
     if (m_undoStack.empty())
-        return;
+        return false;
 
     auto cmd = std::move(m_undoStack.back());
     m_undoStack.pop_back();
+    const size_t cmdBytes = commandFootprint(*cmd);
+    m_undoBytes = (m_undoBytes >= cmdBytes) ? (m_undoBytes - cmdBytes)
+                                            : recalculateStackBytes(m_undoStack);
 
-    cmd->undo();
+    // Move onto destination stack before invoking callbacks so listeners see consistent stacks.
+    ICommand *rawCmd = cmd.get();
     m_redoStack.push_back(std::move(cmd));
+    m_redoBytes += cmdBytes;
+
+    QPointer<CommandBus> self(this);
+    QString errorReason;
+    {
+        DispatchGuard guard(this);
+        try {
+            rawCmd->undo();
+        } catch (const std::exception &ex) {
+            errorReason = QString::fromUtf8(ex.what());
+        } catch (...) {
+            errorReason = QStringLiteral("Unknown exception during command undo()");
+        }
+    }
+
+    if (!self) {
+        return false;
+    }
+
+    if (!errorReason.isEmpty()) {
+        if (!m_redoStack.empty() && m_redoStack.back().get() == rawCmd) {
+            auto failed = std::move(m_redoStack.back());
+            m_redoStack.pop_back();
+            m_redoBytes = (m_redoBytes >= cmdBytes) ? (m_redoBytes - cmdBytes)
+                                                    : recalculateStackBytes(m_redoStack);
+            m_undoStack.push_back(std::move(failed));
+            m_undoBytes += cmdBytes;
+        }
+        emit commandFailed(errorReason);
+        return false;
+    }
 
     notifyHistoryChanged();
     emit stateChanged();
+    return true;
 }
 
-void CommandBus::redo()
+bool CommandBus::tryRedo()
 {
+    if (m_dispatching) {
+        emit commandFailed(QStringLiteral("CommandBus::redo() re-entrant dispatch rejected"));
+        return false;
+    }
     if (m_redoStack.empty())
-        return;
+        return false;
 
     auto cmd = std::move(m_redoStack.back());
     m_redoStack.pop_back();
+    const size_t cmdBytes = commandFootprint(*cmd);
+    m_redoBytes = (m_redoBytes >= cmdBytes) ? (m_redoBytes - cmdBytes)
+                                            : recalculateStackBytes(m_redoStack);
 
-    cmd->redo();
+    // Move onto destination stack before invoking callbacks so listeners see consistent stacks.
+    ICommand *rawCmd = cmd.get();
     m_undoStack.push_back(std::move(cmd));
+    m_undoBytes += cmdBytes;
 
+    QPointer<CommandBus> self(this);
+    QString errorReason;
+    {
+        DispatchGuard guard(this);
+        try {
+            rawCmd->redo();
+        } catch (const std::exception &ex) {
+            errorReason = QString::fromUtf8(ex.what());
+        } catch (...) {
+            errorReason = QStringLiteral("Unknown exception during command redo()");
+        }
+    }
+
+    if (!self) {
+        return false;
+    }
+
+    if (!errorReason.isEmpty()) {
+        if (!m_undoStack.empty() && m_undoStack.back().get() == rawCmd) {
+            auto failed = std::move(m_undoStack.back());
+            m_undoStack.pop_back();
+            m_undoBytes = (m_undoBytes >= cmdBytes) ? (m_undoBytes - cmdBytes)
+                                                    : recalculateStackBytes(m_undoStack);
+            m_redoStack.push_back(std::move(failed));
+            m_redoBytes += cmdBytes;
+        }
+        emit commandFailed(errorReason);
+        return false;
+    }
+
+    evictExcessHistory();
     notifyHistoryChanged();
     emit stateChanged();
+    return true;
 }
 
 void CommandBus::clear()
 {
+    if (m_dispatching) {
+        emit commandFailed(QStringLiteral("CommandBus::clear() re-entrant call rejected"));
+        return;
+    }
     m_undoStack.clear();
     m_redoStack.clear();
+    m_undoBytes = 0;
+    m_redoBytes = 0;
     notifyHistoryChanged();
     emit stateChanged();
 }
@@ -122,10 +391,12 @@ void SetUniformCommand::execute()
     if (m_applyFunc) {
         m_applyFunc(m_output, m_uniformName, m_newValues.data(),
                     static_cast<uint32_t>(m_newValues.size()), m_flags);
-    } else if (auto *ipc = Services::instance().ipcClient()) {
-        ipc->sendSetUniform(m_output, m_uniformName, m_newValues.data(),
-                            static_cast<uint32_t>(m_newValues.size()),
-                            (m_flags & WAYWAL_UNIFORM_FLAG_PERSIST) != 0);
+    } else if (!m_newValues.empty()) {
+        if (auto *ipc = Services::instance().ipcClient()) {
+            ipc->sendSetUniform(m_output, m_uniformName, m_newValues.data(),
+                                static_cast<uint32_t>(m_newValues.size()),
+                                (m_flags & WAYWAL_UNIFORM_FLAG_PERSIST) != 0);
+        }
     }
 }
 
@@ -134,10 +405,12 @@ void SetUniformCommand::undo()
     if (m_applyFunc) {
         m_applyFunc(m_output, m_uniformName, m_oldValues.data(),
                     static_cast<uint32_t>(m_oldValues.size()), m_flags);
-    } else if (auto *ipc = Services::instance().ipcClient()) {
-        ipc->sendSetUniform(m_output, m_uniformName, m_oldValues.data(),
-                            static_cast<uint32_t>(m_oldValues.size()),
-                            (m_flags & WAYWAL_UNIFORM_FLAG_PERSIST) != 0);
+    } else if (!m_oldValues.empty()) {
+        if (auto *ipc = Services::instance().ipcClient()) {
+            ipc->sendSetUniform(m_output, m_uniformName, m_oldValues.data(),
+                                static_cast<uint32_t>(m_oldValues.size()),
+                                (m_flags & WAYWAL_UNIFORM_FLAG_PERSIST) != 0);
+        }
     }
 }
 
@@ -152,10 +425,11 @@ QString SetUniformCommand::describe() const
 bool SetUniformCommand::mergeWith(const ICommand *other)
 {
     const auto *otherCmd = dynamic_cast<const SetUniformCommand *>(other);
-    if (!otherCmd)
+    if (!otherCmd || !otherCmd->isValid())
         return false;
 
-    if (m_output != otherCmd->m_output || m_uniformName != otherCmd->m_uniformName) {
+    if (m_output != otherCmd->m_output || m_uniformName != otherCmd->m_uniformName ||
+        m_flags != otherCmd->m_flags || m_newValues.size() != otherCmd->m_newValues.size()) {
         return false;
     }
 
@@ -169,9 +443,23 @@ bool SetUniformCommand::mergeWith(const ICommand *other)
     }
 
     m_newValues = otherCmd->m_newValues;
-    m_flags = otherCmd->m_flags;
+    if (otherCmd->m_applyFunc) {
+        m_applyFunc = otherCmd->m_applyFunc;
+    }
     m_timestamp = otherCmd->m_timestamp;
     return true;
+}
+
+size_t SetUniformCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_output) + qStringHeapBytes(m_uniformName) +
+           ((m_oldValues.capacity() + m_newValues.capacity()) * sizeof(float));
+}
+
+bool SetUniformCommand::isValid() const
+{
+    return !m_uniformName.isEmpty() && !m_newValues.empty() && m_newValues.size() <= 16u &&
+           m_oldValues.size() <= 16u && allFiniteVec(m_oldValues) && allFiniteVec(m_newValues);
 }
 
 /* ========================================================================= */
@@ -210,7 +498,7 @@ QString SetBezierCurveCommand::describe() const
 bool SetBezierCurveCommand::mergeWith(const ICommand *other)
 {
     const auto *otherCmd = dynamic_cast<const SetBezierCurveCommand *>(other);
-    if (!otherCmd)
+    if (!otherCmd || !otherCmd->isValid())
         return false;
 
     if (m_output != otherCmd->m_output) {
@@ -226,8 +514,21 @@ bool SetBezierCurveCommand::mergeWith(const ICommand *other)
     }
 
     m_newCurve = otherCmd->m_newCurve;
+    if (otherCmd->m_applyFunc) {
+        m_applyFunc = otherCmd->m_applyFunc;
+    }
     m_timestamp = otherCmd->m_timestamp;
     return true;
+}
+
+size_t SetBezierCurveCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_output);
+}
+
+bool SetBezierCurveCommand::isValid() const
+{
+    return isValidBezierCurve(m_oldCurve) && isValidBezierCurve(m_newCurve);
 }
 
 /* ========================================================================= */
@@ -271,6 +572,17 @@ QString ApplyWallpaperCommand::describe() const
         return QString("Apply wallpaper '%1'").arg(fileName);
     }
     return QString("Apply wallpaper '%1' to %2").arg(fileName, m_output);
+}
+
+size_t ApplyWallpaperCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_output) + qStringHeapBytes(m_oldPath) +
+           qStringHeapBytes(m_newPath);
+}
+
+bool ApplyWallpaperCommand::isValid() const
+{
+    return !m_newPath.isEmpty() || static_cast<bool>(m_applyFunc);
 }
 
 /* ========================================================================= */
@@ -318,6 +630,13 @@ QString SetPowerPolicyCommand::describe() const
     return QString("Set battery policy: %1").arg(policyStr);
 }
 
+size_t SetPowerPolicyCommand::memoryFootprint() const { return sizeof(*this); }
+
+bool SetPowerPolicyCommand::isValid() const
+{
+    return (m_oldPolicy <= 255u && m_newPolicy <= 255u);
+}
+
 /* ========================================================================= */
 /* Shader Graph, 3D Camera & Puppet Physics Commands                         */
 /* ========================================================================= */
@@ -347,6 +666,8 @@ QString AddNodeCommand::describe() const
         .arg(QString::fromUtf8(m_node.title), QString::number(m_node.node_id));
 }
 
+size_t AddNodeCommand::memoryFootprint() const { return sizeof(*this); }
+
 RemoveNodeCommand::RemoveNodeCommand(waywal_graph_node_t removedNode,
                                      std::vector<waywal_graph_edge_t> detachedEdges,
                                      RestoreFn restoreFn)
@@ -373,6 +694,11 @@ QString RemoveNodeCommand::describe() const
 {
     return QStringLiteral("Remove node '%1' (#%2)")
         .arg(QString::fromUtf8(m_removedNode.title), QString::number(m_removedNode.node_id));
+}
+
+size_t RemoveNodeCommand::memoryFootprint() const
+{
+    return sizeof(*this) + (m_detachedEdges.capacity() * sizeof(waywal_graph_edge_t));
 }
 
 MoveNodesCommand::MoveNodesCommand(std::vector<NodeMoveDelta> deltas, ApplyMoveFn applyFn)
@@ -403,7 +729,7 @@ QString MoveNodesCommand::describe() const
 bool MoveNodesCommand::mergeWith(const ICommand *other)
 {
     const auto *otherCmd = dynamic_cast<const MoveNodesCommand *>(other);
-    if (!otherCmd) {
+    if (!otherCmd || !otherCmd->isValid()) {
         return false;
     }
 
@@ -427,7 +753,29 @@ bool MoveNodesCommand::mergeWith(const ICommand *other)
     for (size_t i = 0; i < m_deltas.size(); ++i) {
         m_deltas[i].newPos = otherCmd->m_deltas[i].newPos;
     }
+    if (otherCmd->m_applyFn) {
+        m_applyFn = otherCmd->m_applyFn;
+    }
     m_timestamp = otherCmd->m_timestamp;
+    return true;
+}
+
+size_t MoveNodesCommand::memoryFootprint() const
+{
+    return sizeof(*this) + (m_deltas.capacity() * sizeof(NodeMoveDelta));
+}
+
+bool MoveNodesCommand::isValid() const
+{
+    if (m_deltas.empty()) {
+        return false;
+    }
+    for (const auto &d : m_deltas) {
+        if (!std::isfinite(d.oldPos.x()) || !std::isfinite(d.oldPos.y()) ||
+            !std::isfinite(d.newPos.x()) || !std::isfinite(d.newPos.y())) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -522,7 +870,7 @@ QString SetNodeConstantCommand::describe() const
 bool SetNodeConstantCommand::mergeWith(const ICommand *other)
 {
     const auto *otherCmd = dynamic_cast<const SetNodeConstantCommand *>(other);
-    if (!otherCmd || m_nodeId != otherCmd->m_nodeId) {
+    if (!otherCmd || m_nodeId != otherCmd->m_nodeId || !otherCmd->isValid()) {
         return false;
     }
 
@@ -534,8 +882,21 @@ bool SetNodeConstantCommand::mergeWith(const ICommand *other)
     }
 
     m_newVal = otherCmd->m_newVal;
+    if (otherCmd->m_applyFn) {
+        m_applyFn = otherCmd->m_applyFn;
+    }
     m_timestamp = otherCmd->m_timestamp;
     return true;
+}
+
+size_t SetNodeConstantCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_nodeTitle);
+}
+
+bool SetNodeConstantCommand::isValid() const
+{
+    return allFiniteArr4(m_oldVal) && allFiniteArr4(m_newVal);
 }
 
 SetCamera3DCommand::SetCamera3DCommand(QString output, we_camera3d_t oldCam, we_camera3d_t newCam,
@@ -585,8 +946,16 @@ bool SetCamera3DCommand::mergeWith(const ICommand *other)
 
     m_newCam = otherCmd->m_newCam;
     m_newLights = otherCmd->m_newLights;
+    if (otherCmd->m_applyFn) {
+        m_applyFn = otherCmd->m_applyFn;
+    }
     m_timestamp = otherCmd->m_timestamp;
     return true;
+}
+
+size_t SetCamera3DCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_output);
 }
 
 SetPhysicsSpringCommand::SetPhysicsSpringCommand(QString output, int32_t objectId,
@@ -642,8 +1011,16 @@ bool SetPhysicsSpringCommand::mergeWith(const ICommand *other)
     m_newCfg = otherCmd->m_newCfg;
     m_newWind = otherCmd->m_newWind;
     m_newCursor = otherCmd->m_newCursor;
+    if (otherCmd->m_applyFn) {
+        m_applyFn = otherCmd->m_applyFn;
+    }
     m_timestamp = otherCmd->m_timestamp;
     return true;
+}
+
+size_t SetPhysicsSpringCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_output);
 }
 
 } // namespace waywal::studio

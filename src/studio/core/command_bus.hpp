@@ -10,6 +10,7 @@
 #include <QString>
 
 #include <chrono>
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -34,6 +35,8 @@ class ICommand {
         (void)other;
         return false;
     }
+    [[nodiscard]] virtual size_t memoryFootprint() const { return sizeof(*this); }
+    [[nodiscard]] virtual bool isValid() const { return true; }
 };
 
 /* ========================================================================= */
@@ -44,6 +47,8 @@ class CommandBus : public QObject {
     Q_OBJECT
 
   public:
+    static constexpr size_t DEFAULT_MAX_HISTORY_BYTES = 64u * 1024u * 1024u;
+
     explicit CommandBus(size_t maxHistory = 1000, QObject *parent = nullptr);
     ~CommandBus() override = default;
 
@@ -52,6 +57,10 @@ class CommandBus : public QObject {
     void redo();
     void clear();
 
+    bool tryExecute(std::unique_ptr<ICommand> cmd);
+    bool tryUndo();
+    bool tryRedo();
+
     [[nodiscard]] bool canUndo() const;
     [[nodiscard]] bool canRedo() const;
     [[nodiscard]] QString undoText() const;
@@ -59,18 +68,31 @@ class CommandBus : public QObject {
     [[nodiscard]] size_t undoCount() const;
     [[nodiscard]] size_t redoCount() const;
     [[nodiscard]] size_t maxHistory() const { return m_maxHistory; }
+    [[nodiscard]] size_t maxHistoryBytes() const { return m_maxHistoryBytes; }
+    [[nodiscard]] size_t undoBytes() const { return m_undoBytes; }
+    [[nodiscard]] size_t redoBytes() const { return m_redoBytes; }
+    void setMaxHistoryBytes(size_t maxBytes);
 
   signals:
     void historyChanged(bool canUndo, bool canRedo, const QString &undoText,
                         const QString &redoText);
     void stateChanged();
+    void commandFailed(const QString &reason);
 
   private:
+    struct DispatchGuard;
+
     void notifyHistoryChanged();
+    bool evictExcessHistory();
+    [[nodiscard]] size_t commandFootprint(const ICommand &cmd) const;
 
     std::deque<std::unique_ptr<ICommand>> m_undoStack;
     std::vector<std::unique_ptr<ICommand>> m_redoStack;
     size_t m_maxHistory{1000};
+    size_t m_maxHistoryBytes{DEFAULT_MAX_HISTORY_BYTES};
+    size_t m_undoBytes{0};
+    size_t m_redoBytes{0};
+    bool m_dispatching{false};
 };
 
 /* ========================================================================= */
@@ -90,6 +112,8 @@ class SetUniformCommand : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
     [[nodiscard]] const QString &output() const { return m_output; }
     [[nodiscard]] const QString &uniformName() const { return m_uniformName; }
@@ -117,6 +141,8 @@ class SetBezierCurveCommand : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
     [[nodiscard]] const QString &output() const { return m_output; }
     [[nodiscard]] const bezier_curve_t &oldCurve() const { return m_oldCurve; }
@@ -142,6 +168,8 @@ class ApplyWallpaperCommand : public ICommand {
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
     [[nodiscard]] const QString &output() const { return m_output; }
     [[nodiscard]] const QString &newPath() const { return m_newPath; }
@@ -166,6 +194,8 @@ class SetPowerPolicyCommand : public ICommand {
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
     [[nodiscard]] uint32_t oldPolicy() const { return m_oldPolicy; }
     [[nodiscard]] uint32_t newPolicy() const { return m_newPolicy; }

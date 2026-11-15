@@ -1,11 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "studio/core/command_bus_authoring.hpp"
 
+#include <cmath>
 #include <utility>
 
 namespace waywal::studio {
 
 namespace {
+
+template <size_t N>
+[[nodiscard]] bool allFinite(const std::array<float, N> &values) noexcept
+{
+    for (float v : values) {
+        if (!std::isfinite(v)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] size_t qStringHeapBytes(const QString &s) noexcept
+{
+    return static_cast<size_t>(std::max<qsizetype>(0, s.capacity())) * sizeof(QChar);
+}
 
 [[nodiscard]] QString layerLabel(const QString &name, int32_t objectId)
 {
@@ -58,6 +75,11 @@ QString AddSceneLayerCommand::describe() const
     return QStringLiteral("Add layer '%1'").arg(layerLabel(m_layer.name, m_layer.objectId));
 }
 
+size_t AddSceneLayerCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_layer.name);
+}
+
 RemoveSceneLayerCommand::RemoveSceneLayerCommand(SceneLayerSnapshot removedLayer,
                                                  std::vector<int32_t> childIds, RestoreFn restoreFn)
     : m_removedLayer(std::move(removedLayer)), m_childIds(std::move(childIds)),
@@ -83,6 +105,12 @@ QString RemoveSceneLayerCommand::describe() const
 {
     return QStringLiteral("Remove layer '%1'")
         .arg(layerLabel(m_removedLayer.name, m_removedLayer.objectId));
+}
+
+size_t RemoveSceneLayerCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_removedLayer.name) +
+           (m_childIds.capacity() * sizeof(int32_t));
 }
 
 ReorderSceneLayerCommand::ReorderSceneLayerCommand(int32_t objectId, QString layerName,
@@ -112,6 +140,11 @@ QString ReorderSceneLayerCommand::describe() const
     return QStringLiteral("Reorder '%1' to Z %2")
         .arg(layerLabel(m_layerName, m_objectId))
         .arg(m_newZ);
+}
+
+size_t ReorderSceneLayerCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_layerName);
 }
 
 ReparentSceneLayerCommand::ReparentSceneLayerCommand(
@@ -145,6 +178,17 @@ QString ReparentSceneLayerCommand::describe() const
     return QStringLiteral("Reparent '%1'").arg(layerLabel(m_layerName, m_objectId));
 }
 
+size_t ReparentSceneLayerCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_layerName);
+}
+
+bool ReparentSceneLayerCommand::isValid() const
+{
+    return allFinite(m_oldOrigin) && allFinite(m_newOrigin) && allFinite(m_oldScale) &&
+           allFinite(m_newScale) && allFinite(m_oldAngles) && allFinite(m_newAngles);
+}
+
 SetLayerTransformCommand::SetLayerTransformCommand(int32_t objectId, QString layerName,
                                                    TransformState oldState, TransformState newState,
                                                    ApplyTransformFn applyFn)
@@ -176,7 +220,7 @@ QString SetLayerTransformCommand::describe() const
 bool SetLayerTransformCommand::mergeWith(const ICommand *other)
 {
     const auto *rhs = dynamic_cast<const SetLayerTransformCommand *>(other);
-    if (!rhs || rhs->m_objectId != m_objectId) {
+    if (!rhs || rhs->m_objectId != m_objectId || !rhs->isValid()) {
         return false;
     }
     const auto delta =
@@ -190,6 +234,20 @@ bool SetLayerTransformCommand::mergeWith(const ICommand *other)
         m_applyFn = rhs->m_applyFn;
     }
     return true;
+}
+
+size_t SetLayerTransformCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_layerName);
+}
+
+bool SetLayerTransformCommand::isValid() const
+{
+    return allFinite(m_oldState.origin) && allFinite(m_oldState.scale) &&
+           allFinite(m_oldState.angles) && allFinite(m_oldState.size) &&
+           allFinite(m_oldState.parallaxDepth) && allFinite(m_newState.origin) &&
+           allFinite(m_newState.scale) && allFinite(m_newState.angles) &&
+           allFinite(m_newState.size) && allFinite(m_newState.parallaxDepth);
 }
 
 SetLayerFlagsCommand::SetLayerFlagsCommand(int32_t objectId, QString layerName,
@@ -217,6 +275,17 @@ void SetLayerFlagsCommand::undo()
 QString SetLayerFlagsCommand::describe() const
 {
     return QStringLiteral("Update properties '%1'").arg(layerLabel(m_layerName, m_objectId));
+}
+
+size_t SetLayerFlagsCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_layerName);
+}
+
+bool SetLayerFlagsCommand::isValid() const
+{
+    return std::isfinite(m_oldFlags.alpha) && std::isfinite(m_newFlags.alpha) &&
+           allFinite(m_oldFlags.color) && allFinite(m_newFlags.color);
 }
 
 BrushStrokeCommand::BrushStrokeCommand(uint64_t strokeId, we_brush_channel_t channel,
@@ -293,7 +362,8 @@ QString EditParticleSystemCommand::describe() const
 bool EditParticleSystemCommand::mergeWith(const ICommand *other)
 {
     const auto *rhs = dynamic_cast<const EditParticleSystemCommand *>(other);
-    if (!rhs || rhs->m_objectId != m_objectId || rhs->m_paramGroup != m_paramGroup) {
+    if (!rhs || rhs->m_objectId != m_objectId || rhs->m_paramGroup != m_paramGroup ||
+        !rhs->isValid()) {
         return false;
     }
     const auto delta =
@@ -307,6 +377,17 @@ bool EditParticleSystemCommand::mergeWith(const ICommand *other)
         m_applyFn = rhs->m_applyFn;
     }
     return true;
+}
+
+size_t EditParticleSystemCommand::memoryFootprint() const
+{
+    return sizeof(*this) + qStringHeapBytes(m_paramGroup) + qStringHeapBytes(m_oldJson) +
+           qStringHeapBytes(m_newJson);
+}
+
+bool EditParticleSystemCommand::isValid() const
+{
+    return !m_oldJson.isNull() && !m_newJson.isNull();
 }
 
 SetAudioBindingCommand::SetAudioBindingCommand(std::optional<we_audio_binding_t> oldBinding,

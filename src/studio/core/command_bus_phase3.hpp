@@ -29,6 +29,7 @@ class AddNodeCommand final : public ICommand {
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] size_t memoryFootprint() const override;
     [[nodiscard]] uint32_t nodeId() const noexcept { return m_node.node_id; }
 
   private:
@@ -47,6 +48,7 @@ class RemoveNodeCommand final : public ICommand {
     void execute() override;
     void undo() override;
     [[nodiscard]] QString describe() const override;
+    [[nodiscard]] size_t memoryFootprint() const override;
 
   private:
     waywal_graph_node_t m_removedNode{};
@@ -69,6 +71,8 @@ class MoveNodesCommand final : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override; /* Coalesces drags within 500 ms */
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
     [[nodiscard]] const std::vector<NodeMoveDelta> &deltas() const noexcept { return m_deltas; }
 
@@ -125,6 +129,8 @@ class SetNodeConstantCommand final : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override; /* Coalesces slider drags within 500 ms */
+    [[nodiscard]] size_t memoryFootprint() const override;
+    [[nodiscard]] bool isValid() const override;
 
     [[nodiscard]] uint32_t nodeId() const noexcept { return m_nodeId; }
     [[nodiscard]] const std::array<float, 4> &newVal() const noexcept { return m_newVal; }
@@ -151,6 +157,7 @@ class SetCamera3DCommand final : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override; /* Coalesces 500 ms camera/light scrubs */
+    [[nodiscard]] size_t memoryFootprint() const override;
 
     [[nodiscard]] const QString &output() const noexcept { return m_output; }
     [[nodiscard]] const we_camera3d_t &newCamera() const noexcept { return m_newCam; }
@@ -182,6 +189,7 @@ class SetPhysicsSpringCommand final : public ICommand {
     void undo() override;
     [[nodiscard]] QString describe() const override;
     bool mergeWith(const ICommand *other) override; /* Coalesces 500 ms spring/wind drags */
+    [[nodiscard]] size_t memoryFootprint() const override;
 
     [[nodiscard]] const QString &output() const noexcept { return m_output; }
     [[nodiscard]] int32_t objectId() const noexcept { return m_objectId; }

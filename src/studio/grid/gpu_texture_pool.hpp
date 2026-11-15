@@ -12,6 +12,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <thread>
+#include <stop_token>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -20,6 +21,71 @@
 #include <QOpenGLExtraFunctions>
 
 namespace wwal::studio {
+
+struct PoolShutdownGate {
+    class ReaderGuard {
+      public:
+        explicit ReaderGuard(PoolShutdownGate &gate) noexcept : m_gate(&gate)
+        {
+            // Sequential consistency pairs with beginShutdown() so readers and teardown never pass unseen.
+            m_gate->active_readers.fetch_add(1, std::memory_order_seq_cst);
+            if (m_gate->closing.load(std::memory_order_seq_cst)) {
+                release();
+                return;
+            }
+            m_engaged = true;
+            m_epoch = m_gate->epoch.load(std::memory_order_acquire);
+        }
+
+        ~ReaderGuard() { release(); }
+
+        ReaderGuard(const ReaderGuard &) = delete;
+        ReaderGuard &operator=(const ReaderGuard &) = delete;
+
+        [[nodiscard]] bool engaged() const noexcept { return m_engaged; }
+        [[nodiscard]] uint64_t epoch() const noexcept { return m_epoch; }
+
+      private:
+        void release() noexcept
+        {
+            if (m_gate == nullptr) {
+                return;
+            }
+            if (m_gate->active_readers.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+                std::lock_guard<std::mutex> lock(m_gate->drain_mutex);
+                m_gate->drain_cv.notify_all();
+            }
+            m_gate = nullptr;
+            m_engaged = false;
+        }
+
+        PoolShutdownGate *m_gate{nullptr};
+        uint64_t m_epoch{0};
+        bool m_engaged{false};
+    };
+
+    std::atomic<bool> closing{false};
+    std::atomic<uint32_t> active_readers{0};
+    std::atomic<uint64_t> epoch{1};
+    std::stop_source stop_source;
+    mutable std::mutex drain_mutex;
+    std::condition_variable drain_cv;
+
+    void beginShutdown() noexcept
+    {
+        closing.store(true, std::memory_order_seq_cst);
+        epoch.fetch_add(1, std::memory_order_acq_rel);
+        stop_source.request_stop();
+    }
+
+    void waitForDrain() noexcept
+    {
+        std::unique_lock<std::mutex> lock(drain_mutex);
+        drain_cv.wait(lock, [this] {
+            return active_readers.load(std::memory_order_seq_cst) == 0;
+        });
+    }
+};
 
 struct PboUploadQueue {
     GLuint pbo_ids[2]{0, 0};
@@ -106,6 +172,7 @@ class GpuTexturePool {
         int layer_index{-1};
         std::string media_path;
         bool decode_queued{false};
+        bool cpu_ready{false};
         bool ready{false};
         QImage thumbnail;
         std::shared_ptr<const std::vector<uint8_t>> etc2_blocks;
@@ -126,6 +193,7 @@ class GpuTexturePool {
     struct WorkerTask {
         uint32_t item_id{0};
         int target_layer{-1};
+        uint64_t epoch{0};
         std::string media_path;
         std::string preview_path;
         size_t staging_slot_idx{0};
@@ -161,7 +229,7 @@ class GpuTexturePool {
     std::queue<WorkerTask> m_taskQueue;
     std::mutex m_taskMutex;
     std::condition_variable m_taskCv;
-    std::atomic<bool> m_stopWorkers{false};
+    PoolShutdownGate m_shutdownGate;
 
     mutable std::mutex m_callbackMutex;
     std::function<void()> m_thumbnailReadyCallback;
@@ -175,12 +243,16 @@ class GpuTexturePool {
     void freeStagingMemory();
     void initLru();
     void destroyLru();
+    void initLruLocked();
+    void destroyLruLocked();
     void detachLruNode(LruNode *node);
     void insertLruHead(LruNode *node);
     int allocateLayerFor(uint32_t item_id);
+    int allocateLayerLocked(uint32_t item_id);
 
     void workerLoop();
-    bool decodeThumbnail(const std::string &path, const std::string &preview, uint8_t *out_rgba);
+    bool decodeThumbnail(const std::string &path, const std::string &preview, uint8_t *out_rgba,
+                         std::stop_token stop_token, uint64_t expected_epoch);
 };
 
 } // namespace wwal::studio

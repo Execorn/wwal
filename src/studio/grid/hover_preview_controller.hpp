@@ -8,6 +8,8 @@
 #include <atomic>
 #include <vector>
 #include <chrono>
+#include <thread>
+#include <stop_token>
 
 #include <QObject>
 #include <QPointer>
@@ -37,7 +39,7 @@ class HoverPreviewController : public QObject {
     HoverPreviewController(const HoverPreviewController &) = delete;
     HoverPreviewController &operator=(const HoverPreviewController &) = delete;
 
-    void setGlOwner(QOpenGLWidget *owner) noexcept { m_glOwner = owner; }
+    void setGlOwner(QOpenGLWidget *owner);
 
     // OpenGL Initialization / Destruction (must be called with active GL context)
     void initGl(QOpenGLExtraFunctions *gl);
@@ -68,18 +70,27 @@ class HoverPreviewController : public QObject {
 
   private:
     QPointer<QOpenGLWidget> m_glOwner;
+    QMetaObject::Connection m_glOwnerDestroyedConn;
     QOpenGLExtraFunctions *m_gl{nullptr};
     GLuint m_previewTexId{0};
+    GLuint m_neutralTexId{0};
     GLuint m_shaderFbo{0};
     GLuint m_shaderProgram{0};
     GLuint m_quadVao{0};
     GLuint m_quadVbo{0};
+    GLuint m_readbackPbos[2]{0, 0};
+    bool m_readbackPrimed[2]{false, false};
+    uint32_t m_readbackIdx{0};
     QImage m_currentPreviewImage;
     QImage m_videoBaseImage;
 
     // Timers
     QTimer *m_dwellTimer{nullptr};
     QTimer *m_playbackTimer{nullptr};
+
+    // Background Worker Cancellation (Generation epoch + jthread stop_token)
+    std::atomic<uint64_t> m_epoch{1};
+    std::jthread m_workerThread;
 
     // Hover State
     uint32_t m_pendingItemId{0};
@@ -100,17 +111,20 @@ class HoverPreviewController : public QObject {
     float m_shaderTime{0.0f};
     int m_shaderFrame{0};
     bool m_shaderInitialized{false};
+    std::atomic<bool> m_cpuFrameInFlight{false};
 
     // Video / Frame sequence state
     std::vector<QImage> m_preloadedFrames;
     size_t m_currentFrameIndex{0};
     std::chrono::steady_clock::time_point m_previewStartTime;
 
+    void cancelWorker();
     void startActivePreview();
     void updateTextureWithImage(const QImage &img);
     void setupOffscreenShader(const std::string &shader_path);
     void renderShaderFrame();
-    void cleanupActivePreview();
+    void cleanupActivePreview(bool emit_signal = true);
+    void resetGlIdsLocked() noexcept;
 };
 
 } // namespace wwal::studio
