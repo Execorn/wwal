@@ -6,6 +6,7 @@
 #include "waywal/we_compat_scanner.h"
 
 #include "waywal/log.h"
+#include "waywal/os_compat.h"
 #include "waywal/we_json.h"
 #include "waywal/we_pkg.h"
 #include "waywal/we_project.h"
@@ -15,7 +16,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <linux/openat2.h>
 #include <locale.h>
 #include <math.h>
 #include <pthread.h>
@@ -25,9 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -471,10 +470,18 @@ static int detect_rolling_xor_key(const uint8_t *data, size_t size, uint8_t out_
         }
     }
 
-    /* 5. Period 16: recover k[12..15] from candidate entry_count rather than zeroing entry_count */
-    {
+    /* 5. Period 16: support both 8-byte ("PKGV00xx") and 9-byte ("PKGV00xx\0") headers with
+     * O(1) entry[0] filtering and bounded search so random files reject fast without O(N*M) hangs.
+     */
+    for (uint8_t mlen = 8u; mlen <= 9u; mlen++) {
+        size_t table_cursor = 4u + (size_t)mlen;
+        if (size < table_cursor + 4u + 13u) {
+            continue;
+        }
+
         uint8_t k[16];
-        k[0] = (uint8_t)(data[0] ^ 8u);
+        memset(k, 0, sizeof(k));
+        k[0] = (uint8_t)(data[0] ^ mlen);
         k[1] = data[1];
         k[2] = data[2];
         k[3] = data[3];
@@ -482,96 +489,183 @@ static int detect_rolling_xor_key(const uint8_t *data, size_t size, uint8_t out_
         k[5] = (uint8_t)(data[5] ^ (uint8_t)'K');
         k[6] = (uint8_t)(data[6] ^ (uint8_t)'G');
         k[7] = (uint8_t)(data[7] ^ (uint8_t)'V');
-
-        if (size == 16u) {
-            k[8] = (uint8_t)(data[8] ^ (uint8_t)'0');
-            k[9] = (uint8_t)(data[9] ^ (uint8_t)'0');
-            k[10] = (uint8_t)(data[10] ^ (uint8_t)'0');
-            k[11] = (uint8_t)(data[11] ^ (uint8_t)'1');
+        if (mlen == 9u) {
+            /* Offset 12 is the trailing NUL of "PKGVxxxx\0", fixing k[12] in O(1). */
             k[12] = data[12];
-            k[13] = data[13];
-            k[14] = data[14];
-            k[15] = data[15];
-            memcpy(out_key, k, 16);
-            return 16;
         }
 
-        if (size >= 29u) {
-            /* Offset 16 (path0_len) aligns to 16 % 16 == 0, so k[0..3] decodes it in O(1) */
-            uint32_t path0_len = (uint32_t)(data[16] ^ k[0]) | ((uint32_t)(data[17] ^ k[1]) << 8u) |
-                                 ((uint32_t)(data[18] ^ k[2]) << 16u) |
-                                 ((uint32_t)(data[19] ^ k[3]) << 24u);
+        size_t max_possible = (size - (table_cursor + 4u)) / 13u;
+        if (max_possible > WE_PKG_MAX_ENTRIES) {
+            max_possible = WE_PKG_MAX_ENTRIES;
+        }
+        if (mlen == 9u) {
+            uint8_t ec_b3 = (uint8_t)(data[16] ^ k[0]);
+            if (ec_b3 > (uint8_t)(max_possible >> 24u)) {
+                continue;
+            }
+        }
 
-            if (path0_len >= 1u && path0_len <= WE_PKG_MAX_PATH_LEN &&
-                20u + (size_t)path0_len + 8u <= size) {
-                /* Offset 20..23 aligns to k[4..7]; verify initial path bytes before searching */
-                bool prefix_ok = true;
-                size_t pre_check = path0_len < 4u ? (size_t)path0_len : 4u;
-                for (size_t p = 0; p < pre_check; p++) {
-                    uint8_t ch = (uint8_t)(data[20u + p] ^ k[4u + p]);
-                    if ((ch < 0x20u || ch >= 0x7Fu) && !(ch == '\0' && p + 1u == path0_len)) {
-                        prefix_ok = false;
-                        break;
+        size_t p0_len_off = table_cursor + 4u;
+        uint32_t path0_len = demask_u32_at(data, k, 16u, p0_len_off);
+        size_t p0_str_off = p0_len_off + 4u;
+        if (path0_len < 1u || path0_len > WE_PKG_MAX_PATH_LEN ||
+            p0_str_off + (size_t)path0_len + 8u > size) {
+            continue;
+        }
+
+        /* Bytes up to offset 24 only use already-known key positions k[4..7]. */
+        size_t pre_end = (mlen == 8u) ? 4u : 3u;
+        if (path0_len < pre_end) {
+            pre_end = (size_t)path0_len;
+        }
+        bool prefix_ok = true;
+        for (size_t p = 0u; p < pre_end; p++) {
+            uint8_t ch = demask_byte_at(data, k, 16u, p0_str_off + p);
+            if ((ch < 0x20u || ch >= 0x7Fu) && !(ch == '\0' && p + 1u == path0_len)) {
+                prefix_ok = false;
+                break;
+            }
+        }
+        if (!prefix_ok) {
+            continue;
+        }
+
+        uint8_t fallback_key[16];
+        bool have_fallback = false;
+        uint32_t search_limit = (max_possible < 4096u) ? (uint32_t)max_possible : 4096u;
+
+        for (uint32_t v = 1u; v <= 24u; v++) {
+            k[8] = (uint8_t)(data[8] ^ (uint8_t)'0');
+            k[9] = (uint8_t)(data[9] ^ (uint8_t)'0');
+            k[10] = (uint8_t)(data[10] ^ (uint8_t)('0' + (v / 10u)));
+            k[11] = (uint8_t)(data[11] ^ (uint8_t)('0' + (v % 10u)));
+
+            /* Check path0 bytes at file offsets 24..27 (and 28 if mlen == 9) before testing ec. */
+            size_t tail_start = (mlen == 8u) ? 4u : 3u;
+            size_t tail_end = (mlen == 8u) ? 8u : 8u;
+            if ((size_t)path0_len < tail_end) {
+                tail_end = (size_t)path0_len;
+            }
+            bool v_ok = true;
+            for (size_t p = tail_start; p < tail_end; p++) {
+                uint8_t ch = demask_byte_at(data, k, 16u, p0_str_off + p);
+                if ((ch < 0x20u || ch >= 0x7Fu) && !(ch == '\0' && p + 1u == path0_len)) {
+                    v_ok = false;
+                    break;
+                }
+            }
+            if (!v_ok) {
+                continue;
+            }
+
+            /* Fast path for large archives: entry[0].offset is normally 0, revealing missing key
+             * bytes at (p0_str_off + path0_len) mod 16 in O(1) without scanning ec values.
+             */
+            size_t off0_pos = p0_str_off + (size_t)path0_len;
+            if (off0_pos + 4u <= size) {
+                uint8_t cand_k[16];
+                memcpy(cand_k, k, sizeof(cand_k));
+                uint32_t known_mask = (mlen == 8u) ? 0x0FFFu : 0x1FFFu;
+                if (max_possible <= 0xFFFFu) {
+                    if (mlen == 8u) {
+                        cand_k[14] = data[14];
+                        cand_k[15] = data[15];
+                        known_mask |= 0xC000u;
+                    } else {
+                        cand_k[15] = data[15];
+                        known_mask |= 0x8000u;
                     }
                 }
-
-                if (prefix_ok) {
-                    size_t max_possible = (size - 16u) / 13u;
-                    if (max_possible > WE_PKG_MAX_ENTRIES) {
-                        max_possible = WE_PKG_MAX_ENTRIES;
+                bool off0_consistent = true;
+                for (size_t j = 0u; j < 4u; j++) {
+                    size_t ki = (off0_pos + j) & 15u;
+                    if ((known_mask & (1u << ki)) != 0u) {
+                        if (data[off0_pos + j] != cand_k[ki]) {
+                            off0_consistent = false;
+                            break;
+                        }
+                    } else {
+                        cand_k[ki] = data[off0_pos + j];
+                        known_mask |= (1u << ki);
                     }
-
-                    uint8_t fallback_key[16];
-                    bool have_fallback = false;
-
-                    for (uint32_t v = 1u; v <= 24u; v++) {
-                        k[8] = (uint8_t)(data[8] ^ (uint8_t)'0');
-                        k[9] = (uint8_t)(data[9] ^ (uint8_t)'0');
-                        k[10] = (uint8_t)(data[10] ^ (uint8_t)('0' + (v / 10u)));
-                        k[11] = (uint8_t)(data[11] ^ (uint8_t)('0' + (v % 10u)));
-
-                        if (path0_len > 4u) {
-                            size_t v_end = path0_len < 8u ? (size_t)path0_len : 8u;
-                            bool v_ok = true;
-                            for (size_t p = 4u; p < v_end; p++) {
-                                uint8_t ch = (uint8_t)(data[20u + p] ^ k[4u + p]);
-                                if ((ch < 0x20u || ch >= 0x7Fu) &&
-                                    !(ch == '\0' && p + 1u == path0_len)) {
-                                    v_ok = false;
-                                    break;
-                                }
+                }
+                if (off0_consistent && known_mask == 0xFFFFu) {
+                    uint32_t cand_ec = demask_u32_at(data, cand_k, 16u, table_cursor);
+                    if (cand_ec >= 1u && cand_ec <= (uint32_t)max_possible) {
+                        bool exact_end = false;
+                        if (validate_demasked_pkg_at(data, size, cand_k, 16u, table_cursor,
+                                                     &exact_end)) {
+                            if (exact_end) {
+                                memcpy(out_key, cand_k, 16);
+                                return 16;
                             }
-                            if (!v_ok) {
-                                continue;
+                            if (!have_fallback) {
+                                memcpy(fallback_key, cand_k, 16);
+                                have_fallback = true;
                             }
                         }
-
-                        for (uint32_t ec = 1u; ec <= (uint32_t)max_possible; ec++) {
-                            k[12] = (uint8_t)(data[12] ^ (uint8_t)(ec & 0xFFu));
-                            k[13] = (uint8_t)(data[13] ^ (uint8_t)((ec >> 8u) & 0xFFu));
-                            k[14] = (uint8_t)(data[14] ^ (uint8_t)((ec >> 16u) & 0xFFu));
-                            k[15] = (uint8_t)(data[15] ^ (uint8_t)((ec >> 24u) & 0xFFu));
-
-                            bool exact_end = false;
-                            if (validate_demasked_pkg_at(data, size, k, 16u, 12u, &exact_end)) {
-                                if (exact_end) {
-                                    memcpy(out_key, k, 16);
-                                    return 16;
-                                }
-                                if (!have_fallback) {
-                                    memcpy(fallback_key, k, 16);
-                                    have_fallback = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if (have_fallback) {
-                        memcpy(out_key, fallback_key, 16);
-                        return 16;
                     }
                 }
             }
+
+            for (uint32_t ec = 1u; ec <= search_limit; ec++) {
+                if (mlen == 8u) {
+                    k[12] = (uint8_t)(data[12] ^ (uint8_t)(ec & 0xFFu));
+                    k[13] = (uint8_t)(data[13] ^ (uint8_t)((ec >> 8u) & 0xFFu));
+                    k[14] = (uint8_t)(data[14] ^ (uint8_t)((ec >> 16u) & 0xFFu));
+                    k[15] = (uint8_t)(data[15] ^ (uint8_t)((ec >> 24u) & 0xFFu));
+                } else {
+                    if ((uint8_t)(data[16] ^ k[0]) != (uint8_t)((ec >> 24u) & 0xFFu)) {
+                        continue;
+                    }
+                    k[13] = (uint8_t)(data[13] ^ (uint8_t)(ec & 0xFFu));
+                    k[14] = (uint8_t)(data[14] ^ (uint8_t)((ec >> 8u) & 0xFFu));
+                    k[15] = (uint8_t)(data[15] ^ (uint8_t)((ec >> 16u) & 0xFFu));
+                }
+
+                /* O(1) entry[0] check before walking the entire entry table. */
+                size_t eff0 = (size_t)path0_len;
+                while (eff0 > 0u && demask_byte_at(data, k, 16u, p0_str_off + eff0 - 1u) == '\0') {
+                    eff0--;
+                }
+                if (eff0 == 0u) {
+                    continue;
+                }
+                bool e0_ok = true;
+                for (size_t p = 0u; p < eff0; p++) {
+                    uint8_t ch = demask_byte_at(data, k, 16u, p0_str_off + p);
+                    if (ch < 0x20u || ch >= 0x7Fu) {
+                        e0_ok = false;
+                        break;
+                    }
+                }
+                if (!e0_ok) {
+                    continue;
+                }
+                uint32_t off0 = demask_u32_at(data, k, 16u, off0_pos);
+                uint32_t len0 = demask_u32_at(data, k, 16u, off0_pos + 4u);
+                uint64_t min_data_base = (uint64_t)(off0_pos + 8u) + (uint64_t)(ec - 1u) * 13ULL;
+                if ((uint64_t)off0 + (uint64_t)len0 + min_data_base > (uint64_t)size) {
+                    continue;
+                }
+
+                bool exact_end = false;
+                if (validate_demasked_pkg_at(data, size, k, 16u, table_cursor, &exact_end)) {
+                    if (exact_end) {
+                        memcpy(out_key, k, 16);
+                        return 16;
+                    }
+                    if (!have_fallback) {
+                        memcpy(fallback_key, k, 16);
+                        have_fallback = true;
+                    }
+                }
+            }
+        }
+
+        if (have_fallback) {
+            memcpy(out_key, fallback_key, 16);
+            return 16;
         }
     }
 
@@ -1357,6 +1451,7 @@ static uint32_t parse_varyings_from_stage(const char *src, size_t len,
 
 typedef struct {
     char workshop_dir[4096];
+    int root_dfd;
     we_pkg_t *pkg;
     uint8_t *demasked_buf;
     size_t demasked_size;
@@ -1376,84 +1471,158 @@ static void compat_vfs_close(we_compat_vfs_t *vfs)
         vfs->demasked_buf = NULL;
         vfs->demasked_size = 0;
     }
+    if (vfs->root_dfd >= 0) {
+        close(vfs->root_dfd);
+        vfs->root_dfd = -1;
+    }
+}
+
+static uint8_t *compat_read_fd_bounded(int fd, size_t min_bytes, size_t max_bytes, size_t *out_size)
+{
+    if (out_size) {
+        *out_size = 0u;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uint64_t)st.st_size < (uint64_t)min_bytes || (uint64_t)st.st_size > (uint64_t)max_bytes) {
+        return NULL;
+    }
+    size_t sz = (size_t)st.st_size;
+    uint8_t *buf = (uint8_t *)malloc(sz + 1u);
+    if (!buf) {
+        return NULL;
+    }
+    size_t total = 0u;
+    while (total < sz) {
+        ssize_t rd = read(fd, buf + total, sz - total);
+        if (rd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            free(buf);
+            return NULL;
+        }
+        if (rd == 0) {
+            break;
+        }
+        total += (size_t)rd;
+    }
+    if (total != sz) {
+        free(buf);
+        return NULL;
+    }
+    buf[sz] = '\0';
+    if (out_size) {
+        *out_size = sz;
+    }
+    return buf;
 }
 
 static bool compat_vfs_open(we_compat_vfs_t *vfs, const char *path, we_compat_report_t *report)
 {
     memset(vfs, 0, sizeof(*vfs));
+    vfs->root_dfd = -1;
     if (!path || path[0] == '\0') {
         return false;
     }
     snprintf(vfs->workshop_dir, sizeof(vfs->workshop_dir), "%s", path);
 
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        return false;
-    }
+    int single_pkg_fd = -1;
+    char pkg_label[4096] = {0};
 
-    char candidate_pkg[4096] = {0};
-    if (S_ISREG(st.st_mode)) {
-        snprintf(candidate_pkg, sizeof(candidate_pkg), "%s", path);
-    } else if (S_ISDIR(st.st_mode)) {
-        char p1[4096], p2[4096];
-        snprintf(p1, sizeof(p1), "%s/scene.pkg", path);
-        snprintf(p2, sizeof(p2), "%s/gifscene.pkg", path);
-        if (access(p1, R_OK) == 0) {
-            snprintf(candidate_pkg, sizeof(candidate_pkg), "%s", p1);
-        } else if (access(p2, R_OK) == 0) {
-            snprintf(candidate_pkg, sizeof(candidate_pkg), "%s", p2);
+    vfs->root_dfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (vfs->root_dfd < 0) {
+        if (errno != ENOTDIR) {
+            return false;
+        }
+        single_pkg_fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (single_pkg_fd < 0) {
+            return false;
+        }
+        struct stat st;
+        if (fstat(single_pkg_fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            close(single_pkg_fd);
+            return false;
+        }
+        snprintf(pkg_label, sizeof(pkg_label), "%s", path);
+    } else {
+        int fd = wwal_openat2_beneath(vfs->root_dfd, "scene.pkg", O_RDONLY | O_NONBLOCK, 0);
+        if (fd >= 0) {
+            single_pkg_fd = fd;
+            snprintf(pkg_label, sizeof(pkg_label), "%s/scene.pkg", path);
         } else {
-            DIR *d = opendir(path);
-            if (d) {
-                struct dirent *ent;
-                while ((ent = readdir(d)) != NULL) {
-                    if (ent->d_type == DT_REG || ent->d_type == DT_UNKNOWN) {
-                        size_t nlen = strlen(ent->d_name);
-                        if (has_ext_ci(ent->d_name, nlen, ".pkg")) {
-                            snprintf(candidate_pkg, sizeof(candidate_pkg), "%s/%s", path,
-                                     ent->d_name);
-                            break;
+            fd = wwal_openat2_beneath(vfs->root_dfd, "gifscene.pkg", O_RDONLY | O_NONBLOCK, 0);
+            if (fd >= 0) {
+                single_pkg_fd = fd;
+                snprintf(pkg_label, sizeof(pkg_label), "%s/gifscene.pkg", path);
+            } else {
+                int dup_dfd = openat(vfs->root_dfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                if (dup_dfd >= 0) {
+                    DIR *d = fdopendir(dup_dfd);
+                    if (d) {
+                        struct dirent *ent;
+                        while ((ent = readdir(d)) != NULL) {
+                            size_t nlen = strlen(ent->d_name);
+                            if (!has_ext_ci(ent->d_name, nlen, ".pkg")) {
+                                continue;
+                            }
+                            struct stat est;
+                            if (fstatat(vfs->root_dfd, ent->d_name, &est, AT_SYMLINK_NOFOLLOW) ==
+                                    0 &&
+                                S_ISREG(est.st_mode)) {
+                                fd = wwal_openat2_beneath(vfs->root_dfd, ent->d_name,
+                                                          O_RDONLY | O_NONBLOCK, 0);
+                                if (fd >= 0) {
+                                    single_pkg_fd = fd;
+                                    snprintf(pkg_label, sizeof(pkg_label), "%s/%s", path,
+                                             ent->d_name);
+                                    break;
+                                }
+                            }
                         }
+                        closedir(d);
+                    } else {
+                        close(dup_dfd);
                     }
                 }
-                closedir(d);
             }
         }
     }
 
-    if (candidate_pkg[0] != '\0') {
-        int fd = open(candidate_pkg, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            struct stat pkg_st;
-            if (fstat(fd, &pkg_st) == 0 && S_ISREG(pkg_st.st_mode) && pkg_st.st_size >= 16) {
-                size_t sz = (size_t)pkg_st.st_size;
-                void *mapped = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-                if (mapped != MAP_FAILED) {
-                    uint8_t key[16] = {0};
-                    int period = detect_rolling_xor_key((const uint8_t *)mapped, sz, key);
-                    if (period > 0) {
-                        vfs->demasked_buf = (uint8_t *)malloc(sz);
-                        if (vfs->demasked_buf) {
-                            vfs->demasked_size = sz;
-                            xor_demask_buffer((const uint8_t *)mapped, sz, key, (size_t)period,
-                                              vfs->demasked_buf);
-                            vfs->pkg = we_pkg_open_mem(vfs->demasked_buf, sz, vfs->workshop_dir);
-                            char fix[256];
-                            snprintf(fix, sizeof(fix),
-                                     "De-masked obfuscated container with %d-byte key", period);
-                            report_add_issue(report, "PKG_OBFUSCATION_DEMASKED", WE_ISSUE_SEV_INFO,
-                                             "Rolling XOR de-masking applied to container",
-                                             candidate_pkg, 1, fix);
-                        }
+    if (single_pkg_fd >= 0) {
+        size_t sz = 0u;
+        uint8_t *pkg_buf =
+            compat_read_fd_bounded(single_pkg_fd, 16u, 256ULL * 1024ULL * 1024ULL, &sz);
+        close(single_pkg_fd);
+
+        if (pkg_buf) {
+            uint8_t key[16] = {0};
+            int period = detect_rolling_xor_key(pkg_buf, sz, key);
+            if (period > 0) {
+                vfs->demasked_buf = (uint8_t *)malloc(sz);
+                if (vfs->demasked_buf) {
+                    vfs->demasked_size = sz;
+                    xor_demask_buffer(pkg_buf, sz, key, (size_t)period, vfs->demasked_buf);
+                    vfs->pkg = we_pkg_open_mem(vfs->demasked_buf, sz, vfs->workshop_dir);
+                    if (vfs->pkg) {
+                        char fix[256];
+                        snprintf(fix, sizeof(fix),
+                                 "De-masked obfuscated container with %d-byte key", period);
+                        report_add_issue(report, "PKG_OBFUSCATION_DEMASKED", WE_ISSUE_SEV_INFO,
+                                         "Rolling XOR de-masking applied to container", pkg_label,
+                                         1, fix);
+                    } else {
+                        free(vfs->demasked_buf);
+                        vfs->demasked_buf = NULL;
+                        vfs->demasked_size = 0u;
                     }
-                    munmap(mapped, sz);
                 }
             }
-            close(fd);
+            free(pkg_buf);
+        }
 
-            if (!vfs->pkg) {
-                vfs->pkg = we_pkg_open_file(candidate_pkg, vfs->workshop_dir);
-            }
+        if (!vfs->pkg) {
+            vfs->pkg = we_pkg_open_file(pkg_label, vfs->workshop_dir);
         }
     }
 
@@ -1485,48 +1654,20 @@ static const uint8_t *compat_vfs_read_file(we_compat_vfs_t *vfs, const char *rel
         }
     }
 
-    char full_path[8192];
-    snprintf(full_path, sizeof(full_path), "%s/%s", vfs->workshop_dir, norm);
-    int fd = open(full_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (vfs->root_dfd < 0) {
+        return NULL;
+    }
+
+    int fd = wwal_openat2_beneath(vfs->root_dfd, norm, O_RDONLY | O_NONBLOCK, 0);
     if (fd >= 0) {
-        struct stat st;
-        if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
-            st.st_size <= (256LL * 1024LL * 1024LL)) {
-            size_t sz = (size_t)st.st_size;
-            uint8_t *buf = (uint8_t *)malloc(sz + 1u);
-            if (buf) {
-                size_t total = 0u;
-                bool io_err = false;
-                while (total < sz) {
-                    ssize_t rd = read(fd, buf + total, sz - total);
-                    if (rd < 0) {
-                        if (errno == EINTR) {
-                            continue;
-                        }
-                        io_err = true;
-                        break;
-                    }
-                    if (rd == 0) {
-                        break;
-                    }
-                    total += (size_t)rd;
-                }
-                close(fd);
-                if (!io_err && total == sz) {
-                    buf[sz] = '\0';
-                    if (out_size) {
-                        *out_size = sz;
-                    }
-                    if (out_must_free) {
-                        *out_must_free = true;
-                    }
-                    return buf;
-                }
-                free(buf);
-                return NULL;
-            }
-        }
+        uint8_t *buf = compat_read_fd_bounded(fd, 1u, 256ULL * 1024ULL * 1024ULL, out_size);
         close(fd);
+        if (buf) {
+            if (out_must_free) {
+                *out_must_free = true;
+            }
+            return buf;
+        }
     }
 
     return NULL;
@@ -1536,14 +1677,19 @@ static const uint8_t *compat_vfs_read_file(we_compat_vfs_t *vfs, const char *rel
  * Full Directory Recursion for Loose Executable Malware & Traversal Check
  * ========================================================================= */
 
-static bool scan_loose_directory_malware(const char *dir_path, we_compat_report_t *report,
-                                         int depth)
+static bool scan_loose_directory_malware(int dir_fd, const char *display_base,
+                                         we_compat_report_t *report, int depth)
 {
-    if (!dir_path || depth > 16) {
+    if (dir_fd < 0 || depth > 16) {
         return false;
     }
-    DIR *d = opendir(dir_path);
+    int dup_fd = openat(dir_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dup_fd < 0) {
+        return false;
+    }
+    DIR *d = fdopendir(dup_fd);
     if (!d) {
+        close(dup_fd);
         return false;
     }
 
@@ -1564,23 +1710,26 @@ static bool scan_loose_directory_malware(const char *dir_path, we_compat_report_
         }
 
         char subpath[4096];
-        snprintf(subpath, sizeof(subpath), "%s/%s", dir_path, ent->d_name);
+        snprintf(subpath, sizeof(subpath), "%s/%s", display_base, ent->d_name);
 
         struct stat st;
-        if (lstat(subpath, &st) != 0) {
-            continue;
-        }
-        if (S_ISLNK(st.st_mode)) {
+        if (fstatat(dir_fd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || S_ISLNK(st.st_mode)) {
             continue;
         }
 
         if (S_ISDIR(st.st_mode)) {
-            if (scan_loose_directory_malware(subpath, report, depth + 1)) {
-                malware_found = true;
-                break;
+            int sub_fd =
+                openat(dir_fd, ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (sub_fd >= 0) {
+                bool sub_found = scan_loose_directory_malware(sub_fd, subpath, report, depth + 1);
+                close(sub_fd);
+                if (sub_found) {
+                    malware_found = true;
+                    break;
+                }
             }
         } else if (S_ISREG(st.st_mode)) {
-            int fd = open(subpath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            int fd = openat(dir_fd, ent->d_name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
             if (fd >= 0) {
                 uint8_t hdr[16];
                 size_t total = 0u;
@@ -1620,6 +1769,118 @@ static bool scan_loose_directory_malware(const char *dir_path, we_compat_report_
  * ========================================================================= */
 
 typedef struct {
+    uint64_t hash;
+    char *key;
+} compat_str_slot_t;
+
+typedef struct {
+    compat_str_slot_t *slots;
+    size_t cap;
+    size_t count;
+} compat_str_set_t;
+
+static uint64_t compat_fnv1a_ci(const char *s)
+{
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; ++p) {
+        h ^= (uint64_t)(unsigned char)tolower(*p);
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static void compat_str_set_free(compat_str_set_t *set)
+{
+    if (!set) {
+        return;
+    }
+    for (size_t i = 0u; i < set->cap; i++) {
+        free(set->slots[i].key);
+    }
+    free(set->slots);
+    set->slots = NULL;
+    set->cap = 0u;
+    set->count = 0u;
+}
+
+static bool compat_str_set_rehash(compat_str_set_t *set, size_t new_cap)
+{
+    if (new_cap < 64u) {
+        new_cap = 64u;
+    }
+    if (new_cap > SIZE_MAX / sizeof(compat_str_slot_t)) {
+        return false;
+    }
+    compat_str_slot_t *ns = (compat_str_slot_t *)calloc(new_cap, sizeof(compat_str_slot_t));
+    if (!ns) {
+        return false;
+    }
+    size_t mask = new_cap - 1u;
+    for (size_t i = 0u; i < set->cap; i++) {
+        if (!set->slots[i].key) {
+            continue;
+        }
+        size_t pos = (size_t)(set->slots[i].hash & mask);
+        while (ns[pos].key) {
+            pos = (pos + 1u) & mask;
+        }
+        ns[pos] = set->slots[i];
+    }
+    free(set->slots);
+    set->slots = ns;
+    set->cap = new_cap;
+    return true;
+}
+
+static bool compat_str_set_contains(const compat_str_set_t *set, const char *key)
+{
+    if (!set || !set->slots || set->cap == 0u || !key) {
+        return false;
+    }
+    uint64_t h = compat_fnv1a_ci(key);
+    size_t mask = set->cap - 1u;
+    size_t pos = (size_t)(h & mask);
+    while (set->slots[pos].key) {
+        if (set->slots[pos].hash == h && strcasecmp(set->slots[pos].key, key) == 0) {
+            return true;
+        }
+        pos = (pos + 1u) & mask;
+    }
+    return false;
+}
+
+/* Returns true if inserted newly, false if already present or OOM (check count unchanged). */
+static bool compat_str_set_insert(compat_str_set_t *set, const char *key)
+{
+    if (!set || !key) {
+        return false;
+    }
+    if (set->cap == 0u || (set->count + 1u) * 10u >= set->cap * 7u) {
+        size_t new_cap = (set->cap == 0u) ? 64u : set->cap * 2u;
+        if (!compat_str_set_rehash(set, new_cap)) {
+            return false;
+        }
+    }
+    uint64_t h = compat_fnv1a_ci(key);
+    size_t mask = set->cap - 1u;
+    size_t pos = (size_t)(h & mask);
+    while (set->slots[pos].key) {
+        if (set->slots[pos].hash == h && strcasecmp(set->slots[pos].key, key) == 0) {
+            return false;
+        }
+        pos = (pos + 1u) & mask;
+    }
+    char *dup = strdup(key);
+    if (!dup) {
+        return false;
+    }
+    set->slots[pos].hash = h;
+    set->slots[pos].key = dup;
+    set->count++;
+    return true;
+}
+
+typedef struct {
     bool cycle_detected;
     bool custom_shaders_present;
     bool varying_promoted;
@@ -1636,6 +1897,8 @@ typedef struct {
     bool bc7_fallback;
     bool missing_user_prop;
     bool model3d_degraded;
+    compat_str_set_t audited_paths;
+    compat_str_set_t scene_particle_refs;
 } we_compat_audit_flags_t;
 
 static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const uint8_t *data,
@@ -1748,7 +2011,13 @@ static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const
         has_ext_ci(rel_path, plen, ".json")) {
         we_jval_t *p_json = we_json_parse((const char *)data, length);
         if (p_json) {
-            out_report->summary.particle_systems++;
+            char norm_particle[1024];
+            bool counted_in_scene =
+                we_pkg_normalize_path(rel_path, plen, norm_particle, sizeof(norm_particle)) &&
+                compat_str_set_contains(&flags->scene_particle_refs, norm_particle);
+            if (!counted_in_scene) {
+                out_report->summary.particle_systems++;
+            }
             const we_jval_t *mc = we_jobj_get(p_json, "maxcount");
             if (!mc) {
                 mc = we_jobj_get(p_json, "count");
@@ -1763,15 +2032,16 @@ static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const
                 }
             }
             if (mc && mc->type == JVAL_NUM) {
-                uint32_t cnt = (uint32_t)mc->num;
-                if (cnt > 16384u) {
+                /* Check bounds in double before integer cast; NaN/Inf/1e20 wrap on (uint32_t). */
+                double raw_cnt = mc->num;
+                if (!isfinite(raw_cnt) || raw_cnt < 0.0 || raw_cnt > 16384.0) {
                     flags->particle_overflow = true;
                     report_add_issue(out_report, "PARTICLE_OVERFLOW", WE_ISSUE_SEV_WARNING,
                                      "Particle emitter count exceeds 16384 limit", rel_path, 1,
                                      "Clamp particle max count to 16384");
                     report_add_repair(out_report, "REPAIR_CLAMP_PARTICLES", rel_path,
                                       "Clamp particle max count to 16384");
-                } else if (cnt > 4096u) {
+                } else if (raw_cnt > 4096.0) {
                     flags->particle_advanced = true;
                 }
             }
@@ -1818,17 +2088,21 @@ static void audit_single_asset(we_compat_vfs_t *vfs, const char *rel_path, const
     }
 }
 
-static void scan_loose_assets_recursive(we_compat_vfs_t *vfs, const char *dir_path,
-                                        const char *rel_base, int depth,
-                                        we_compat_scanner_t *scanner,
+static void scan_loose_assets_recursive(we_compat_vfs_t *vfs, int dir_fd, const char *rel_base,
+                                        int depth, we_compat_scanner_t *scanner,
                                         we_compat_report_t *out_report,
                                         we_compat_audit_flags_t *flags)
 {
-    if (!dir_path || depth > 16) {
+    if (dir_fd < 0 || depth > 16) {
         return;
     }
-    DIR *d = opendir(dir_path);
+    int dup_fd = openat(dir_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dup_fd < 0) {
+        return;
+    }
+    DIR *d = fdopendir(dup_fd);
     if (!d) {
+        close(dup_fd);
         return;
     }
 
@@ -1839,60 +2113,56 @@ static void scan_loose_assets_recursive(we_compat_vfs_t *vfs, const char *dir_pa
             continue;
         }
 
-        char subpath[4096];
-        snprintf(subpath, sizeof(subpath), "%s/%s", dir_path, ent->d_name);
         char rel_path[1024];
         if (rel_base[0] != '\0') {
-            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_base, ent->d_name);
+            if (snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_base, ent->d_name) >=
+                (int)sizeof(rel_path)) {
+                continue;
+            }
         } else {
-            snprintf(rel_path, sizeof(rel_path), "%s", ent->d_name);
+            if (snprintf(rel_path, sizeof(rel_path), "%s", ent->d_name) >= (int)sizeof(rel_path)) {
+                continue;
+            }
         }
 
         struct stat st;
-        if (lstat(subpath, &st) != 0 || S_ISLNK(st.st_mode)) {
+        if (fstatat(dir_fd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || S_ISLNK(st.st_mode)) {
             continue;
         }
 
         if (S_ISDIR(st.st_mode)) {
-            scan_loose_assets_recursive(vfs, subpath, rel_path, depth + 1, scanner, out_report,
-                                        flags);
+            int sub_fd =
+                openat(dir_fd, ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (sub_fd >= 0) {
+                scan_loose_assets_recursive(vfs, sub_fd, rel_path, depth + 1, scanner, out_report,
+                                            flags);
+                close(sub_fd);
+            }
         } else if (S_ISREG(st.st_mode)) {
             size_t plen = strlen(ent->d_name);
             if (has_ext_ci(ent->d_name, plen, ".js") || has_ext_ci(ent->d_name, plen, ".mdl") ||
                 has_ext_ci(ent->d_name, plen, ".tex") || has_ext_ci(ent->d_name, plen, ".vert") ||
                 has_ext_ci(ent->d_name, plen, ".frag") || has_ext_ci(ent->d_name, plen, ".hlsl") ||
                 has_ext_ci(ent->d_name, plen, ".glsl") || has_ext_ci(ent->d_name, plen, ".json")) {
-                int fd = open(subpath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+                char norm_rel[1024];
+                if (!we_pkg_normalize_path(rel_path, strlen(rel_path), norm_rel,
+                                           sizeof(norm_rel))) {
+                    continue;
+                }
+                if (compat_str_set_contains(&flags->audited_paths, norm_rel)) {
+                    continue;
+                }
+                int fd =
+                    openat(dir_fd, ent->d_name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
                 if (fd >= 0) {
-                    size_t sz = (size_t)st.st_size;
-                    if (sz > 0u && sz <= (64ULL * 1024ULL * 1024ULL)) {
-                        uint8_t *buf = (uint8_t *)malloc(sz + 1u);
-                        if (buf) {
-                            size_t total = 0u;
-                            bool io_err = false;
-                            while (total < sz) {
-                                ssize_t rd = read(fd, buf + total, sz - total);
-                                if (rd < 0) {
-                                    if (errno == EINTR) {
-                                        continue;
-                                    }
-                                    io_err = true;
-                                    break;
-                                }
-                                if (rd == 0) {
-                                    break;
-                                }
-                                total += (size_t)rd;
-                            }
-                            if (!io_err && total == sz) {
-                                buf[sz] = '\0';
-                                audit_single_asset(vfs, rel_path, buf, sz, scanner, out_report,
-                                                   flags);
-                            }
-                            free(buf);
-                        }
-                    }
+                    size_t sz = 0u;
+                    uint8_t *buf = compat_read_fd_bounded(fd, 1u, 64ULL * 1024ULL * 1024ULL, &sz);
                     close(fd);
+                    if (buf) {
+                        (void)compat_str_set_insert(&flags->audited_paths, norm_rel);
+                        audit_single_asset(vfs, rel_path, buf, sz, scanner, out_report, flags);
+                        free(buf);
+                    }
                 }
             }
         }
@@ -2081,9 +2351,8 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
         }
     }
 
-    struct stat root_st;
-    if (stat(workshop_dir, &root_st) == 0 && S_ISDIR(root_st.st_mode)) {
-        if (scan_loose_directory_malware(workshop_dir, out_report, 0)) {
+    if (vfs.root_dfd >= 0) {
+        if (scan_loose_directory_malware(vfs.root_dfd, workshop_dir, out_report, 0)) {
             compat_vfs_close(&vfs);
             return true;
         }
@@ -2193,19 +2462,36 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
             int32_t parent;
         } obj_node_t;
 
+        typedef struct {
+            int32_t id;
+            size_t idx;
+        } obj_id_slot_t;
+
         size_t n_objs = objs->arr.count;
         obj_node_t *nodes = n_objs > 0u ? (obj_node_t *)calloc(n_objs, sizeof(obj_node_t)) : NULL;
 
         for (size_t i = 0; i < n_objs; i++) {
             const we_jval_t *obj = objs->arr.items[i];
             if (!obj || obj->type != JVAL_OBJ) {
+                if (nodes) {
+                    nodes[i].id = -1;
+                    nodes[i].parent = -1;
+                }
                 continue;
             }
 
             const we_jval_t *id_val = we_jobj_get(obj, "id");
-            int32_t id = (id_val && id_val->type == JVAL_NUM) ? (int32_t)id_val->num : (int32_t)i;
+            int32_t id = (int32_t)i;
+            if (id_val && id_val->type == JVAL_NUM && isfinite(id_val->num) && id_val->num >= 0.0 &&
+                id_val->num <= (double)INT32_MAX) {
+                id = (int32_t)id_val->num;
+            }
             const we_jval_t *par_val = we_jobj_get(obj, "parent");
-            int32_t parent = (par_val && par_val->type == JVAL_NUM) ? (int32_t)par_val->num : -1;
+            int32_t parent = -1;
+            if (par_val && par_val->type == JVAL_NUM && isfinite(par_val->num) &&
+                par_val->num >= -1.0 && par_val->num <= (double)INT32_MAX) {
+                parent = (int32_t)par_val->num;
+            }
 
             if (nodes) {
                 nodes[i].id = id;
@@ -2219,6 +2505,14 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
                 out_report->summary.puppet_meshes++;
             } else if (strcasecmp(type_str, "particle") == 0) {
                 out_report->summary.particle_systems++;
+                const we_jval_t *pref = we_jobj_get(obj, "particle");
+                if (pref && pref->type == JVAL_STR && pref->str && pref->str[0] != '\0') {
+                    char norm_pref[1024];
+                    if (we_pkg_normalize_path(pref->str, strlen(pref->str), norm_pref,
+                                              sizeof(norm_pref))) {
+                        (void)compat_str_set_insert(&flags.scene_particle_refs, norm_pref);
+                    }
+                }
             } else if (strcasecmp(type_str, "sound") == 0) {
                 out_report->summary.sound_layers++;
             } else if (strcasecmp(type_str, "model3d") == 0) {
@@ -2252,53 +2546,105 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
             }
         }
 
-        if (nodes) {
-            for (size_t i = 0; i < n_objs; i++) {
-                int32_t cur = nodes[i].id;
-                size_t steps = 0;
-                while (cur >= 0 && steps <= n_objs) {
-                    int32_t p = -1;
-                    for (size_t k = 0; k < n_objs; k++) {
-                        if (nodes[k].id == cur) {
-                            p = nodes[k].parent;
+        if (nodes && n_objs > 0u) {
+            size_t ht_cap = 16u;
+            while (ht_cap < n_objs * 2u) {
+                ht_cap <<= 1u;
+            }
+            obj_id_slot_t *ht = (obj_id_slot_t *)malloc(ht_cap * sizeof(obj_id_slot_t));
+            uint8_t *color = (uint8_t *)calloc(n_objs, sizeof(uint8_t));
+            size_t *dfs_path = (size_t *)malloc(n_objs * sizeof(size_t));
+            if (ht && color && dfs_path) {
+                for (size_t s = 0u; s < ht_cap; s++) {
+                    ht[s].id = -1;
+                    ht[s].idx = SIZE_MAX;
+                }
+                size_t ht_mask = ht_cap - 1u;
+                for (size_t i = 0u; i < n_objs; i++) {
+                    if (nodes[i].id < 0) {
+                        continue;
+                    }
+                    uint64_t key = (uint64_t)(uint32_t)nodes[i].id * UINT64_C(11400714819323198485);
+                    size_t pos = (size_t)((key >> 32u) & ht_mask);
+                    while (ht[pos].idx != SIZE_MAX) {
+                        if (ht[pos].id == nodes[i].id) {
                             break;
                         }
+                        pos = (pos + 1u) & ht_mask;
                     }
-                    if (p < 0) {
-                        break;
+                    if (ht[pos].idx == SIZE_MAX) {
+                        ht[pos].id = nodes[i].id;
+                        ht[pos].idx = i;
                     }
-                    if (p == nodes[i].id) {
-                        flags.cycle_detected = true;
-                        report_add_issue(out_report, "CYCLE_DETECTED", WE_ISSUE_SEV_ERROR,
-                                         "Circular parent hierarchy loop detected in scene graph",
-                                         scene_filename, 1, "Break circular parent reference");
-                        break;
-                    }
-                    cur = p;
-                    steps++;
                 }
-                if (steps > n_objs) {
-                    flags.cycle_detected = true;
-                }
-                if (flags.cycle_detected) {
-                    break;
+
+                for (size_t i = 0u; i < n_objs && !flags.cycle_detected; i++) {
+                    if (color[i] != 0u || nodes[i].id < 0) {
+                        continue;
+                    }
+                    size_t path_len = 0u;
+                    size_t cur = i;
+                    while (cur != SIZE_MAX) {
+                        if (color[cur] == 2u) {
+                            break;
+                        }
+                        if (color[cur] == 1u) {
+                            flags.cycle_detected = true;
+                            report_add_issue(
+                                out_report, "CYCLE_DETECTED", WE_ISSUE_SEV_ERROR,
+                                "Circular parent hierarchy loop detected in scene graph",
+                                scene_filename, 1, "Break circular parent reference");
+                            break;
+                        }
+                        color[cur] = 1u;
+                        dfs_path[path_len++] = cur;
+
+                        int32_t par = nodes[cur].parent;
+                        if (par < 0) {
+                            cur = SIZE_MAX;
+                            continue;
+                        }
+                        uint64_t key = (uint64_t)(uint32_t)par * UINT64_C(11400714819323198485);
+                        size_t pos = (size_t)((key >> 32u) & ht_mask);
+                        size_t next_idx = SIZE_MAX;
+                        while (ht[pos].idx != SIZE_MAX) {
+                            if (ht[pos].id == par) {
+                                next_idx = ht[pos].idx;
+                                break;
+                            }
+                            pos = (pos + 1u) & ht_mask;
+                        }
+                        cur = next_idx;
+                    }
+                    for (size_t p = 0u; p < path_len; p++) {
+                        color[dfs_path[p]] = 2u;
+                    }
                 }
             }
-            free(nodes);
+            free(dfs_path);
+            free(color);
+            free(ht);
         }
+        free(nodes);
     }
 
     if (vfs.pkg && vfs.pkg->entries) {
         for (uint32_t i = 0; i < vfs.pkg->entry_count; i++) {
             const we_pkg_entry_t *ent = &vfs.pkg->entries[i];
+            char norm_ent[1024];
+            if (ent->path[0] != '\0' &&
+                we_pkg_normalize_path(ent->path, strlen(ent->path), norm_ent, sizeof(norm_ent))) {
+                if (!compat_str_set_insert(&flags.audited_paths, norm_ent)) {
+                    continue;
+                }
+            }
             audit_single_asset(&vfs, ent->path, ent->data, ent->length, scanner, out_report,
                                &flags);
         }
     }
 
-    struct stat ws_st;
-    if (stat(workshop_dir, &ws_st) == 0 && S_ISDIR(ws_st.st_mode)) {
-        scan_loose_assets_recursive(&vfs, workshop_dir, "", 0, scanner, out_report, &flags);
+    if (vfs.root_dfd >= 0) {
+        scan_loose_assets_recursive(&vfs, vfs.root_dfd, "", 0, scanner, out_report, &flags);
     }
 
     if (has_project) {
@@ -2307,6 +2653,8 @@ bool we_compat_scan_directory(we_compat_scanner_t *scanner, const char *workshop
                                        &flags);
     }
 
+    compat_str_set_free(&flags.audited_paths);
+    compat_str_set_free(&flags.scene_particle_refs);
     we_jval_free(scene_root);
     if (scene_free) {
         free((void *)scene_data);
@@ -2411,54 +2759,7 @@ static int open_beneath_confined(int root_dfd, const char *rel_path, int flags, 
         return -1;
     }
 
-    struct open_how how;
-    memset(&how, 0, sizeof(how));
-    how.flags = (uint64_t)(flags | O_CLOEXEC | O_NOFOLLOW);
-    how.mode = (flags & (O_CREAT | O_TMPFILE)) ? (uint64_t)mode : 0u;
-    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
-
-    int fd = (int)syscall(SYS_openat2, root_dfd, rel_path, &how, sizeof(how));
-    if (fd < 0 && (errno == ENOSYS || errno == EPERM)) {
-        int cur_dfd = root_dfd;
-        const char *p = rel_path;
-        while (*p) {
-            const char *slash = strchr(p, '/');
-            if (!slash) {
-                break;
-            }
-            size_t seg_len = (size_t)(slash - p);
-            if (seg_len == 0u || seg_len >= 256u) {
-                if (cur_dfd != root_dfd) {
-                    close(cur_dfd);
-                }
-                errno = EINVAL;
-                return -1;
-            }
-            char comp[256];
-            memcpy(comp, p, seg_len);
-            comp[seg_len] = '\0';
-
-            int next_dfd = openat(cur_dfd, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-            if (cur_dfd != root_dfd) {
-                close(cur_dfd);
-            }
-            if (next_dfd < 0) {
-                return -1;
-            }
-            cur_dfd = next_dfd;
-            p = slash + 1;
-        }
-
-        if (flags & O_CREAT) {
-            fd = openat(cur_dfd, p, flags | O_CLOEXEC | O_NOFOLLOW, mode);
-        } else {
-            fd = openat(cur_dfd, p, flags | O_CLOEXEC | O_NOFOLLOW);
-        }
-        if (cur_dfd != root_dfd) {
-            close(cur_dfd);
-        }
-    }
-
+    int fd = wwal_openat2_beneath(root_dfd, rel_path, flags, mode);
     if (fd >= 0) {
         struct stat st;
         if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
@@ -2490,15 +2791,72 @@ static bool write_all_fd(int fd, const void *data, size_t len)
     return true;
 }
 
-static bool rewrite_fd_contents(int fd, const void *data, size_t len)
+static bool compat_csprng_u64(uint64_t *out)
 {
-    if (lseek(fd, 0, SEEK_SET) < 0) {
+    size_t off = 0u;
+    uint8_t *dst = (uint8_t *)out;
+    while (off < sizeof(*out)) {
+        ssize_t r = getrandom(dst + off, sizeof(*out) - off, 0);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        off += (size_t)r;
+    }
+    if (off == sizeof(*out)) {
+        return true;
+    }
+
+    int ufd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (ufd < 0) {
         return false;
     }
-    if (!write_all_fd(fd, data, len)) {
-        return false;
+    off = 0u;
+    while (off < sizeof(*out)) {
+        ssize_t r = read(ufd, dst + off, sizeof(*out) - off);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(ufd);
+            return false;
+        }
+        if (r == 0) {
+            close(ufd);
+            return false;
+        }
+        off += (size_t)r;
     }
-    if (ftruncate(fd, (off_t)len) != 0) {
+    close(ufd);
+    return true;
+}
+
+static int create_confined_tmp_at(int dir_fd, char tmp_name[64], mode_t mode)
+{
+    for (int attempt = 0; attempt < 16; attempt++) {
+        uint64_t rnd = 0u;
+        if (!compat_csprng_u64(&rnd)) {
+            return -1;
+        }
+        snprintf(tmp_name, 64u, ".wwal_tmp.%016llx", (unsigned long long)rnd);
+        int tfd =
+            openat(dir_fd, tmp_name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
+        if (tfd >= 0) {
+            return tfd;
+        }
+        if (errno != EEXIST) {
+            return -1;
+        }
+    }
+    errno = EEXIST;
+    return -1;
+}
+
+static bool fsync_parent_dir_best_effort(int dir_fd)
+{
+    if (fsync(dir_fd) != 0 && errno != EINVAL && errno != EROFS && errno != ENOTSUP) {
         return false;
     }
     return true;
@@ -2554,19 +2912,77 @@ static char *read_confined_file(int root_dfd, const char *rel_path, size_t max_b
 static bool write_confined_file(int root_dfd, const char *rel_path, const void *data, size_t len,
                                 bool allow_create)
 {
-    int flags = O_WRONLY | O_TRUNC | (allow_create ? O_CREAT : 0);
-    int fd = open_beneath_confined(root_dfd, rel_path, flags, 0644);
-    if (fd < 0) {
+    if (root_dfd < 0 || !is_safe_confined_relpath(rel_path) || (!data && len > 0u)) {
         return false;
     }
-    bool ok = write_all_fd(fd, data, len);
-    close(fd);
-    return ok;
+
+    const char *slash = strrchr(rel_path, '/');
+    const char *base_name = slash ? (slash + 1) : rel_path;
+    if (base_name[0] == '\0' || strcmp(base_name, ".") == 0 || strcmp(base_name, "..") == 0) {
+        return false;
+    }
+
+    int parent_dfd = -1;
+    if (!slash) {
+        parent_dfd = fcntl(root_dfd, F_DUPFD_CLOEXEC, 0);
+    } else {
+        char parent_rel[1024];
+        size_t plen = (size_t)(slash - rel_path);
+        if (plen == 0u || plen >= sizeof(parent_rel)) {
+            return false;
+        }
+        memcpy(parent_rel, rel_path, plen);
+        parent_rel[plen] = '\0';
+        parent_dfd =
+            wwal_openat2_beneath(root_dfd, parent_rel, O_RDONLY | O_DIRECTORY | O_NONBLOCK, 0);
+    }
+    if (parent_dfd < 0) {
+        return false;
+    }
+
+    struct stat existing;
+    int st_rc = fstatat(parent_dfd, base_name, &existing, AT_SYMLINK_NOFOLLOW);
+    if (st_rc == 0) {
+        if (!S_ISREG(existing.st_mode)) {
+            close(parent_dfd);
+            return false;
+        }
+    } else if (!allow_create || errno != ENOENT) {
+        close(parent_dfd);
+        return false;
+    }
+
+    char tmp_name[64];
+    int tfd = create_confined_tmp_at(parent_dfd, tmp_name, 0644);
+    if (tfd < 0) {
+        close(parent_dfd);
+        return false;
+    }
+
+    bool ok = write_all_fd(tfd, data, len);
+    if (ok && fsync(tfd) != 0 && errno != EINVAL) {
+        ok = false;
+    }
+    if (close(tfd) != 0) {
+        ok = false;
+    }
+
+    if (ok) {
+        if (renameat(parent_dfd, tmp_name, parent_dfd, base_name) == 0) {
+            ok = fsync_parent_dir_best_effort(parent_dfd);
+            close(parent_dfd);
+            return ok;
+        }
+    }
+
+    (void)unlinkat(parent_dfd, tmp_name, 0);
+    close(parent_dfd);
+    return false;
 }
 
 static bool copy_file_at_no_symlink(int sdir_fd, int ddir_fd, const char *name)
 {
-    int sfd = openat(sdir_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int sfd = openat(sdir_fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (sfd < 0) {
         return false;
     }
@@ -2576,7 +2992,15 @@ static bool copy_file_at_no_symlink(int sdir_fd, int ddir_fd, const char *name)
         return false;
     }
 
-    int dfd = openat(ddir_fd, name, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+    struct stat dst_existing;
+    if (fstatat(ddir_fd, name, &dst_existing, AT_SYMLINK_NOFOLLOW) == 0 &&
+        !S_ISREG(dst_existing.st_mode)) {
+        close(sfd);
+        return false;
+    }
+
+    char tmp_name[64];
+    int dfd = create_confined_tmp_at(ddir_fd, tmp_name, 0644);
     if (dfd < 0) {
         close(sfd);
         return false;
@@ -2603,21 +3027,98 @@ static bool copy_file_at_no_symlink(int sdir_fd, int ddir_fd, const char *name)
     }
 
     close(sfd);
-    close(dfd);
-    return ok;
+    if (ok && fsync(dfd) != 0 && errno != EINVAL) {
+        ok = false;
+    }
+    if (close(dfd) != 0) {
+        ok = false;
+    }
+
+    if (ok && renameat(ddir_fd, tmp_name, ddir_fd, name) == 0) {
+        return fsync_parent_dir_best_effort(ddir_fd);
+    }
+
+    (void)unlinkat(ddir_fd, tmp_name, 0);
+    return false;
 }
 
-static bool copy_dir_recursive_depth(const char *src, const char *dst, int depth)
+static bool copy_dir_recursive_fd(int sdir_fd, int ddir_fd, int depth)
 {
-    if (!src || !dst || depth > 16) {
+    if (sdir_fd < 0 || ddir_fd < 0 || depth > 16) {
+        return false;
+    }
+    int dup_sfd = openat(sdir_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dup_sfd < 0) {
+        return false;
+    }
+    DIR *d = fdopendir(dup_sfd);
+    if (!d) {
+        close(dup_sfd);
         return false;
     }
 
+    struct dirent *ent;
+    bool ok = true;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        if (has_directory_traversal(ent->d_name)) {
+            ok = false;
+            break;
+        }
+
+        struct stat st;
+        if (fstatat(sdir_fd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || S_ISLNK(st.st_mode)) {
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            if (mkdirat(ddir_fd, ent->d_name, 0755) != 0 && errno != EEXIST) {
+                ok = false;
+                break;
+            }
+            int s_sub =
+                openat(sdir_fd, ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (s_sub < 0) {
+                ok = false;
+                break;
+            }
+            int d_sub =
+                openat(ddir_fd, ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (d_sub < 0) {
+                close(s_sub);
+                ok = false;
+                break;
+            }
+            bool child_ok = copy_dir_recursive_fd(s_sub, d_sub, depth + 1);
+            close(s_sub);
+            close(d_sub);
+            if (!child_ok) {
+                ok = false;
+                break;
+            }
+        } else if (S_ISREG(st.st_mode)) {
+            if (!copy_file_at_no_symlink(sdir_fd, ddir_fd, ent->d_name)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    closedir(d);
+    return ok;
+}
+
+static bool copy_dir_recursive(const char *src, const char *dst)
+{
+    if (!src || !dst) {
+        return false;
+    }
     struct stat src_st;
     if (lstat(src, &src_st) != 0 || !S_ISDIR(src_st.st_mode)) {
         return false;
     }
-
     struct stat dst_st;
     if (lstat(dst, &dst_st) == 0) {
         if (!S_ISDIR(dst_st.st_mode)) {
@@ -2636,57 +3137,10 @@ static bool copy_dir_recursive_depth(const char *src, const char *dst, int depth
         close(sdir_fd);
         return false;
     }
-
-    DIR *d = fdopendir(sdir_fd);
-    if (!d) {
-        close(sdir_fd);
-        close(ddir_fd);
-        return false;
-    }
-
-    struct dirent *ent;
-    bool ok = true;
-    while ((ent = readdir(d)) != NULL) {
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
-            continue;
-        }
-        if (has_directory_traversal(ent->d_name)) {
-            ok = false;
-            break;
-        }
-
-        struct stat st;
-        if (fstatat(sdir_fd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-            continue;
-        }
-        if (S_ISLNK(st.st_mode)) {
-            continue;
-        }
-
-        if (S_ISDIR(st.st_mode)) {
-            char s_sub[4096], d_sub[4096];
-            if (snprintf(s_sub, sizeof(s_sub), "%s/%s", src, ent->d_name) >= (int)sizeof(s_sub) ||
-                snprintf(d_sub, sizeof(d_sub), "%s/%s", dst, ent->d_name) >= (int)sizeof(d_sub) ||
-                !copy_dir_recursive_depth(s_sub, d_sub, depth + 1)) {
-                ok = false;
-                break;
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            if (!copy_file_at_no_symlink(sdir_fd, ddir_fd, ent->d_name)) {
-                ok = false;
-                break;
-            }
-        }
-    }
-
-    closedir(d);
+    bool ok = copy_dir_recursive_fd(sdir_fd, ddir_fd, 0);
+    close(sdir_fd);
     close(ddir_fd);
     return ok;
-}
-
-static bool copy_dir_recursive(const char *src, const char *dst)
-{
-    return copy_dir_recursive_depth(src, dst, 0);
 }
 
 /* =========================================================================
@@ -3255,6 +3709,119 @@ static uint32_t collect_missing_prop_names(const we_compat_report_t *report,
     return n;
 }
 
+static bool is_glsl_ident_char(unsigned char c) { return isalnum(c) || c == '_'; }
+
+static size_t glsl_skip_ws_comments(const char *s, size_t len, size_t i)
+{
+    while (i < len) {
+        if (isspace((unsigned char)s[i])) {
+            i++;
+            continue;
+        }
+        if (s[i] == '/' && i + 1u < len && s[i + 1u] == '/') {
+            i += 2u;
+            while (i < len && s[i] != '\n') {
+                i++;
+            }
+            continue;
+        }
+        if (s[i] == '/' && i + 1u < len && s[i + 1u] == '*') {
+            i += 2u;
+            while (i + 1u < len && !(s[i] == '*' && s[i + 1u] == '/')) {
+                i++;
+            }
+            i = (i + 1u < len) ? (i + 2u) : len;
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
+static bool glsl_has_ident_token(const char *src, size_t slen, const char *ident)
+{
+    size_t ilen = strlen(ident);
+    if (ilen == 0u) {
+        return false;
+    }
+    size_t i = 0u;
+    while (i < slen) {
+        i = glsl_skip_ws_comments(src, slen, i);
+        if (i >= slen) {
+            break;
+        }
+        unsigned char c = (unsigned char)src[i];
+        if (isalpha(c) || c == '_') {
+            size_t start = i;
+            i++;
+            while (i < slen && is_glsl_ident_char((unsigned char)src[i])) {
+                i++;
+            }
+            if (i - start == ilen && memcmp(src + start, ident, ilen) == 0) {
+                return true;
+            }
+            continue;
+        }
+        i++;
+    }
+    return false;
+}
+
+static bool glsl_has_uniform_decl(const char *src, size_t slen, const char *ident)
+{
+    size_t ilen = strlen(ident);
+    if (ilen == 0u) {
+        return false;
+    }
+    size_t i = 0u;
+    while (i < slen) {
+        i = glsl_skip_ws_comments(src, slen, i);
+        if (i >= slen) {
+            break;
+        }
+        unsigned char c = (unsigned char)src[i];
+        if (isalpha(c) || c == '_') {
+            size_t start = i;
+            i++;
+            while (i < slen && is_glsl_ident_char((unsigned char)src[i])) {
+                i++;
+            }
+            if (i - start == 7u && memcmp(src + start, "uniform", 7u) == 0) {
+                /* Scan declaration tokens until ';', '{', or EOF so "uniform float u_speed2;" does
+                 * not suppress injecting "u_speed". */
+                bool saw_type = false;
+                while (i < slen) {
+                    i = glsl_skip_ws_comments(src, slen, i);
+                    if (i >= slen || src[i] == ';' || src[i] == '{') {
+                        break;
+                    }
+                    unsigned char tc = (unsigned char)src[i];
+                    if (isalpha(tc) || tc == '_') {
+                        size_t ts = i;
+                        i++;
+                        while (i < slen && is_glsl_ident_char((unsigned char)src[i])) {
+                            i++;
+                        }
+                        if (saw_type && i - ts == ilen && memcmp(src + ts, ident, ilen) == 0) {
+                            size_t after = glsl_skip_ws_comments(src, slen, i);
+                            if (after < slen && (src[after] == ';' || src[after] == '=' ||
+                                                 src[after] == ',' || src[after] == '[')) {
+                                return true;
+                            }
+                        }
+                        saw_type = true;
+                        continue;
+                    }
+                    i++;
+                }
+            }
+            continue;
+        }
+        i++;
+    }
+    return false;
+}
+
 static bool inject_shader_uniforms_confined(int root_dfd, const char *shader_rel,
                                             char prop_names[32][64], uint32_t prop_count,
                                             bool only_if_referenced)
@@ -3294,6 +3861,9 @@ static bool inject_shader_uniforms_confined(int root_dfd, const char *shader_rel
 
     for (uint32_t i = 0; i < prop_count; i++) {
         const char *p = prop_names[i];
+        if (!is_valid_prop_ident(p)) {
+            continue;
+        }
         char u_name[80];
         if (strncmp(p, "u_", 2) == 0) {
             snprintf(u_name, sizeof(u_name), "%s", p);
@@ -3301,19 +3871,17 @@ static bool inject_shader_uniforms_confined(int root_dfd, const char *shader_rel
             snprintf(u_name, sizeof(u_name), "u_%s", p);
         }
 
-        char decl_probe1[96], decl_probe2[96];
-        snprintf(decl_probe1, sizeof(decl_probe1), "uniform float %s", u_name);
-        snprintf(decl_probe2, sizeof(decl_probe2), "uniform float %s", p);
-        if (strstr(src, decl_probe1) || strstr(src, decl_probe2)) {
+        if (glsl_has_uniform_decl(src, slen, u_name) || glsl_has_uniform_decl(src, slen, p)) {
             continue;
         }
 
-        if (only_if_referenced && !strstr(src, u_name) && !strstr(src, p)) {
+        bool has_u = glsl_has_ident_token(src, slen, u_name);
+        bool has_p = glsl_has_ident_token(src, slen, p);
+        if (only_if_referenced && !has_u && !has_p) {
             continue;
         }
 
-        const char *chosen =
-            (only_if_referenced && strstr(src, p) && !strstr(src, u_name)) ? p : u_name;
+        const char *chosen = (only_if_referenced && has_p && !has_u) ? p : u_name;
         char line_buf[256];
         snprintf(line_buf, sizeof(line_buf),
                  "uniform float %s; // {\"material\":\"%s\",\"default\":1.0}\n", chosen, p);
@@ -3352,46 +3920,9 @@ static void synthesize_shader_props_in_dir(int root_dfd, const char *rel_prefix,
     }
     int dfd = -1;
     if (rel_prefix[0] == '\0') {
-        dfd = fcntl(root_dfd, F_DUPFD_CLOEXEC, 0);
+        dfd = openat(root_dfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     } else if (is_safe_confined_relpath(rel_prefix)) {
-        struct open_how how;
-        memset(&how, 0, sizeof(how));
-        how.flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
-        how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
-        dfd = (int)syscall(SYS_openat2, root_dfd, rel_prefix, &how, sizeof(how));
-        if (dfd < 0 && (errno == ENOSYS || errno == EPERM)) {
-            int cur_dfd = root_dfd;
-            const char *p = rel_prefix;
-            while (*p) {
-                const char *slash = strchr(p, '/');
-                size_t seg_len = slash ? (size_t)(slash - p) : strlen(p);
-                if (seg_len == 0u || seg_len >= 256u) {
-                    if (cur_dfd != root_dfd) {
-                        close(cur_dfd);
-                    }
-                    cur_dfd = -1;
-                    break;
-                }
-                char comp[256];
-                memcpy(comp, p, seg_len);
-                comp[seg_len] = '\0';
-                int next_dfd =
-                    openat(cur_dfd, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-                if (cur_dfd != root_dfd) {
-                    close(cur_dfd);
-                }
-                if (next_dfd < 0) {
-                    cur_dfd = -1;
-                    break;
-                }
-                cur_dfd = next_dfd;
-                if (!slash) {
-                    break;
-                }
-                p = slash + 1;
-            }
-            dfd = (cur_dfd != root_dfd) ? cur_dfd : -1;
-        }
+        dfd = wwal_openat2_beneath(root_dfd, rel_prefix, O_RDONLY | O_DIRECTORY | O_NONBLOCK, 0);
     }
     if (dfd < 0) {
         return;
@@ -3522,51 +4053,17 @@ static bool repair_synthesize_user_prop_confined(int root_dfd, const we_compat_r
 
 static bool repair_clamp_particles_confined(int root_dfd, const char *target_rel)
 {
-    int fd = open_beneath_confined(root_dfd, target_rel, O_RDWR, 0);
-    if (fd < 0) {
-        return false;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > 1024 * 1024) {
-        close(fd);
-        return false;
-    }
-
-    size_t sz = (size_t)st.st_size;
-    char *code = (char *)malloc(sz + 1u);
-    if (!code) {
-        close(fd);
-        return false;
-    }
-    size_t total = 0u;
-    bool io_err = false;
-    while (total < sz) {
-        ssize_t r = read(fd, code + total, sz - total);
-        if (r < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            io_err = true;
-            break;
-        }
-        if (r == 0) {
-            break;
-        }
-        total += (size_t)r;
-    }
-    if (io_err || total != sz) {
+    size_t sz = 0u;
+    char *code = read_confined_file(root_dfd, target_rel, 1024u * 1024u, &sz);
+    if (!code || sz == 0u) {
         free(code);
-        close(fd);
         return false;
     }
-    code[sz] = '\0';
 
     we_jval_t *root = we_json_parse_root(code, sz);
     free(code);
     if (!root || root->type != JVAL_OBJ) {
         we_jval_free(root);
-        close(fd);
         return false;
     }
 
@@ -3583,7 +4080,7 @@ static bool repair_clamp_particles_confined(int root_dfd, const char *target_rel
             }
         }
     }
-    if (mc && mc->type == JVAL_NUM && mc->num > 16384.0) {
+    if (mc && mc->type == JVAL_NUM && (!isfinite(mc->num) || mc->num < 0.0 || mc->num > 16384.0)) {
         mc->num = 16384.0;
     }
 
@@ -3595,10 +4092,9 @@ static bool repair_clamp_particles_confined(int root_dfd, const char *target_rel
 
     bool ok = false;
     if (!sb.oom) {
-        ok = rewrite_fd_contents(fd, sb.buf, sb.len);
+        ok = write_confined_file(root_dfd, target_rel, sb.buf, sb.len, false);
     }
     free(sb.buf);
-    close(fd);
     return ok;
 }
 
@@ -3754,7 +4250,23 @@ bool we_compat_apply_auto_repairs(const we_compat_report_t *report, const char *
         return false;
     }
 
-    if (strcmp(source_dir, target_dir) != 0) {
+    struct stat src_st;
+    if (stat(source_dir, &src_st) != 0 || !S_ISDIR(src_st.st_mode)) {
+        return false;
+    }
+
+    bool same_dir = false;
+    struct stat dst_lst;
+    if (lstat(target_dir, &dst_lst) == 0) {
+        if (!S_ISDIR(dst_lst.st_mode)) {
+            return false;
+        }
+        if (src_st.st_dev == dst_lst.st_dev && src_st.st_ino == dst_lst.st_ino) {
+            same_dir = true;
+        }
+    }
+
+    if (!same_dir) {
         if (!copy_dir_recursive(source_dir, target_dir)) {
             return false;
         }

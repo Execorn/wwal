@@ -43,11 +43,20 @@ typedef struct {
 } vdf_arena_ctx_t;
 
 typedef struct {
+    waywal_vdf_node_t **nodes;
+    size_t count;
+    size_t cap;
+} vdf_ptr_vec_t;
+
+typedef struct {
     const char *src;
     size_t len;
     size_t pos;
     vdf_arena_ctx_t *arena;
     int depth;
+    bool had_error;
+    /* Per-depth scratch avoids 2x bump-arena waste during parse_object_children growth. */
+    vdf_ptr_vec_t depth_bufs[66];
 } vdf_parser_t;
 
 static vdf_slab_t *vdf_slab_create(vdf_arena_ctx_t *ctx, size_t min_cap)
@@ -234,6 +243,7 @@ static void skip_quoted_string(vdf_parser_t *p)
 #if VDF_HAVE_X86_SIMD
     bool use_avx2 = (p->len - p->pos >= 32u) && vdf_cpu_has_avx2();
 #endif
+    bool found_close = false;
     while (p->pos < p->len) {
 #if VDF_HAVE_X86_SIMD
         if (use_avx2 && p->pos + 32u <= p->len) {
@@ -245,11 +255,15 @@ static void skip_quoted_string(vdf_parser_t *p)
 #endif
         char c = p->src[p->pos++];
         if (c == '"') {
+            found_close = true;
             break;
         }
         if (c == '\\' && p->pos < p->len) {
             p->pos++;
         }
+    }
+    if (!found_close) {
+        p->had_error = true;
     }
 }
 
@@ -341,14 +355,20 @@ static char *parse_quoted_string(vdf_parser_t *p)
     }
 
     size_t scan_pos = p->pos;
+    bool found_quote = false;
     while (scan_pos < p->len) {
         char c = p->src[scan_pos++];
         if (c == '"') {
+            found_quote = true;
             break;
         }
         if (c == '\\' && scan_pos < p->len) {
             scan_pos++;
         }
+    }
+    if (!found_quote) {
+        p->had_error = true;
+        return NULL;
     }
 
     size_t token_len = scan_pos - p->pos;
@@ -474,26 +494,22 @@ static char *parse_token_string(vdf_parser_t *p)
     return parse_bare_string(p);
 }
 
-static bool vdf_object_add_child(vdf_arena_ctx_t *arena, waywal_vdf_object_t *obj,
-                                 waywal_vdf_node_t *child)
+static bool vdf_vec_push(vdf_ptr_vec_t *vec, waywal_vdf_node_t *child)
 {
-    if (obj->child_count >= obj->child_capacity) {
-        size_t new_cap = obj->child_capacity == 0 ? 4u : obj->child_capacity * 2u;
+    if (vec->count >= vec->cap) {
+        size_t new_cap = vec->cap == 0 ? 16u : vec->cap * 2u;
         if (new_cap > SIZE_MAX / sizeof(waywal_vdf_node_t *)) {
             return false;
         }
-        waywal_vdf_node_t **new_children = (waywal_vdf_node_t **)vdf_arena_alloc(
-            arena, new_cap * sizeof(waywal_vdf_node_t *), _Alignof(void *));
-        if (!new_children) {
+        waywal_vdf_node_t **next =
+            (waywal_vdf_node_t **)realloc(vec->nodes, new_cap * sizeof(waywal_vdf_node_t *));
+        if (!next) {
             return false;
         }
-        if (obj->child_count > 0 && obj->children) {
-            memcpy(new_children, obj->children, obj->child_count * sizeof(waywal_vdf_node_t *));
-        }
-        obj->children = new_children;
-        obj->child_capacity = new_cap;
+        vec->nodes = next;
+        vec->cap = new_cap;
     }
-    obj->children[obj->child_count++] = child;
+    vec->nodes[vec->count++] = child;
     return true;
 }
 
@@ -518,25 +534,39 @@ static waywal_vdf_node_t *alloc_vdf_node(vdf_arena_ctx_t *arena, char *key, wayw
 
 static bool parse_object_children(vdf_parser_t *p, waywal_vdf_node_t *parent_node)
 {
+    vdf_ptr_vec_t *vec = &p->depth_bufs[p->depth];
+    vec->count = 0;
+
     while (p->pos < p->len) {
         skip_whitespace_and_comments(p);
         if (p->pos >= p->len || p->src[p->pos] == '}') {
             break;
         }
+        if (p->src[p->pos] == '{') {
+            p->had_error = true;
+            return false;
+        }
 
         char *key = parse_token_string(p);
         if (!key) {
+            if (p->had_error) {
+                return false;
+            }
             if (p->pos < p->len && p->src[p->pos] == '}') {
                 break;
             }
-            p->pos++;
-            continue;
+            p->had_error = true;
+            return false;
         }
 
         skip_whitespace_and_comments(p);
         if (p->pos >= p->len) {
+            if (p->depth > 0) {
+                p->had_error = true;
+                return false;
+            }
             waywal_vdf_node_t *node = alloc_vdf_node(p->arena, key, VDF_NODE_STRING);
-            if (!node || !vdf_object_add_child(p->arena, &parent_node->object, node)) {
+            if (!node || !vdf_vec_push(vec, node)) {
                 return false;
             }
             break;
@@ -557,9 +587,11 @@ static bool parse_object_children(vdf_parser_t *p, waywal_vdf_node_t *parent_nod
                 }
                 p->depth--;
                 skip_whitespace_and_comments(p);
-                if (p->pos < p->len && p->src[p->pos] == '}') {
-                    p->pos++;
+                if (p->pos >= p->len || p->src[p->pos] != '}') {
+                    p->had_error = true;
+                    return false;
                 }
+                p->pos++;
             } else {
                 int brace_count = 1;
                 while (p->pos < p->len && brace_count > 0) {
@@ -575,24 +607,34 @@ static bool parse_object_children(vdf_parser_t *p, waywal_vdf_node_t *parent_nod
                         p->pos++;
                     } else if (p->src[p->pos] == '"') {
                         skip_quoted_string(p);
+                        if (p->had_error) {
+                            return false;
+                        }
                     } else {
                         p->pos++;
                     }
                 }
+                if (brace_count != 0) {
+                    p->had_error = true;
+                    return false;
+                }
             }
 
-            if (!vdf_object_add_child(p->arena, &parent_node->object, obj_node)) {
+            if (!vdf_vec_push(vec, obj_node)) {
                 return false;
             }
         } else if (p->src[p->pos] == '}') {
             waywal_vdf_node_t *node = alloc_vdf_node(p->arena, key, VDF_NODE_STRING);
-            if (!node || !vdf_object_add_child(p->arena, &parent_node->object, node)) {
+            if (!node || !vdf_vec_push(vec, node)) {
                 return false;
             }
             break;
         } else {
             char *value = parse_token_string(p);
             if (!value) {
+                if (p->had_error) {
+                    return false;
+                }
                 value = "";
             }
             waywal_vdf_node_t *str_node = alloc_vdf_node(p->arena, key, VDF_NODE_STRING);
@@ -600,10 +642,23 @@ static bool parse_object_children(vdf_parser_t *p, waywal_vdf_node_t *parent_nod
                 return false;
             }
             str_node->string_value = value;
-            if (!vdf_object_add_child(p->arena, &parent_node->object, str_node)) {
+            if (!vdf_vec_push(vec, str_node)) {
                 return false;
             }
         }
+    }
+
+    if (vec->count > 0) {
+        size_t bytes = vec->count * sizeof(waywal_vdf_node_t *);
+        waywal_vdf_node_t **packed =
+            (waywal_vdf_node_t **)vdf_arena_alloc(p->arena, bytes, _Alignof(void *));
+        if (!packed) {
+            return false;
+        }
+        memcpy(packed, vec->nodes, bytes);
+        parent_node->object.children = packed;
+        parent_node->object.child_count = vec->count;
+        parent_node->object.child_capacity = vec->count;
     }
     return true;
 }
@@ -649,7 +704,19 @@ waywal_vdf_doc_t *waywal_vdf_parse(const char *text, size_t length)
         .depth = 0,
     };
 
-    if (!parse_object_children(&parser, container)) {
+    bool ok = parse_object_children(&parser, container);
+    if (ok) {
+        skip_whitespace_and_comments(&parser);
+        if (parser.pos < parser.len || parser.had_error) {
+            ok = false;
+        }
+    }
+
+    for (size_t d = 0; d < sizeof(parser.depth_bufs) / sizeof(parser.depth_bufs[0]); d++) {
+        free(parser.depth_bufs[d].nodes);
+    }
+
+    if (!ok) {
         waywal_vdf_free(doc);
         return NULL;
     }
@@ -717,7 +784,7 @@ static char *read_entire_file_local(const char *path, size_t *out_len)
     }
     *out_len = 0;
 
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         return NULL;
     }
@@ -1015,7 +1082,7 @@ static void parse_workshop_dir_from_toml(const char *toml_path, char *out_dir, s
     }
     out_dir[0] = '\0';
 
-    int fd = open(toml_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int fd = open(toml_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         return;
     }
@@ -1032,6 +1099,7 @@ static void parse_workshop_dir_from_toml(const char *toml_path, char *out_dir, s
         return;
     }
 
+    bool in_daemon_section = false;
     char *line = NULL;
     size_t line_cap = 0;
     while (getline(&line, &line_cap, fp) >= 0) {
@@ -1039,11 +1107,30 @@ static void parse_workshop_dir_from_toml(const char *toml_path, char *out_dir, s
         while (*p && isspace((unsigned char)*p)) {
             p++;
         }
-        if (*p == '#' || *p == ';') {
+        if (*p == '\0' || *p == '#' || *p == ';') {
+            continue;
+        }
+        if (*p == '[') {
+            p++;
+            while (*p && isspace((unsigned char)*p)) {
+                p++;
+            }
+            const char *sec = p;
+            while (*p && *p != ']' && !isspace((unsigned char)*p)) {
+                p++;
+            }
+            size_t slen = (size_t)(p - sec);
+            in_daemon_section = (slen == 6u && strncmp(sec, "daemon", 6u) == 0);
+            continue;
+        }
+        if (!in_daemon_section) {
             continue;
         }
         if (strncmp(p, "workshop_dir", 12) == 0) {
             p += 12;
+            if (*p != '=' && !isspace((unsigned char)*p)) {
+                continue;
+            }
             while (*p && isspace((unsigned char)*p)) {
                 p++;
             }

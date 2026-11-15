@@ -29,6 +29,7 @@ typedef struct we_pkg {
     const uint8_t *base_ptr;
     size_t mmap_size;
     bool is_mmapped;
+    bool owns_base_ptr;
     int fd;
     char version_magic[16];
     uint32_t version_num;

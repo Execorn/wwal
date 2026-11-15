@@ -878,6 +878,419 @@ static void test_struct_field_varying_locale_and_merged_config(we_compat_scanner
     printf("  -> Struct-member varying safety, C-locale JSON & merged compat config passed.\n");
 }
 
+static bool report_has_issue_code(const we_compat_report_t *report, const char *code)
+{
+    for (uint32_t i = 0; i < report->issue_count; i++) {
+        if (strcmp(report->issues[i].code, code) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool report_has_repair_id(const we_compat_report_t *report, const char *id)
+{
+    for (uint32_t i = 0; i < report->repair_count; i++) {
+        if (strcmp(report->repairs[i].transformation_id, id) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cs_write_bytes(const char *path, const void *data, size_t len)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    assert(fd >= 0);
+    const uint8_t *p = (const uint8_t *)data;
+    size_t off = 0u;
+    while (off < len) {
+        ssize_t n = write(fd, p + off, len - off);
+        assert(n > 0);
+        off += (size_t)n;
+    }
+    close(fd);
+}
+
+static void test_scanner_and_report_reuse(we_compat_scanner_t *scanner)
+{
+    printf("[Compat Scanner 11/17] Testing scanner/report multi-scan reuse isolation...\n");
+
+    char tmpl[] = "/dev/shm/wwal_cs_reuse_XXXXXX";
+    char *root = mkdtemp(tmpl);
+    assert(root != NULL);
+
+    char dir_a[512], dir_b[512], p_dir[512], path[1024];
+    snprintf(dir_a, sizeof(dir_a), "%s/111", root);
+    snprintf(dir_b, sizeof(dir_b), "%s/222", root);
+    snprintf(p_dir, sizeof(p_dir), "%s/particles", dir_a);
+    assert(mkdir(dir_a, 0755) == 0);
+    assert(mkdir(p_dir, 0755) == 0);
+    assert(mkdir(dir_b, 0755) == 0);
+
+    snprintf(path, sizeof(path), "%s/project.json", dir_a);
+    const char *pa = "{\"workshopid\":\"111\",\"title\":\"Dirty\",\"type\":\"scene\","
+                     "\"file\":\"scene.json\"}";
+    cs_write_bytes(path, pa, strlen(pa));
+    snprintf(path, sizeof(path), "%s/scene.json", dir_a);
+    const char *sa = "{\"objects\":[{\"id\":1,\"particle\":\"particles/p.json\"}]}";
+    cs_write_bytes(path, sa, strlen(sa));
+    snprintf(path, sizeof(path), "%s/p.json", p_dir);
+    const char *pp = "{\"maxcount\":50000}";
+    cs_write_bytes(path, pp, strlen(pp));
+
+    snprintf(path, sizeof(path), "%s/project.json", dir_b);
+    const char *pb = "{\"workshopid\":\"222\",\"title\":\"Clean\",\"type\":\"scene\","
+                     "\"file\":\"scene.json\"}";
+    cs_write_bytes(path, pb, strlen(pb));
+    snprintf(path, sizeof(path), "%s/scene.json", dir_b);
+    const char *sb = "{\"objects\":[{\"id\":0}]}";
+    cs_write_bytes(path, sb, strlen(sb));
+
+    we_compat_report_t *report = we_compat_report_alloc();
+    assert(report != NULL);
+
+    assert(we_compat_scan_directory(scanner, dir_a, report));
+    assert(strcmp(report->title, "Dirty") == 0);
+    assert(report->issue_count > 0u);
+    assert(report->repair_count > 0u);
+    assert(report->summary.particle_systems == 1u);
+
+    /* Reusing the exact same scanner and report must wipe all prior state. */
+    assert(we_compat_scan_directory(scanner, dir_b, report));
+    assert(strcmp(report->workshop_id, "222") == 0);
+    assert(strcmp(report->title, "Clean") == 0);
+    assert(report->issue_count == 0u);
+    assert(report->repair_count == 0u);
+    assert(report->summary.particle_systems == 0u);
+    assert(report->summary.total_objects == 1u);
+    assert(report->tier == WE_TIER_1_NATIVE);
+
+    we_compat_report_free(report);
+    cleanup_dir(root);
+    printf("  -> Passed.\n");
+}
+
+static void test_period16_mlen9_xor_and_non_pkg_rejection(we_compat_scanner_t *scanner)
+{
+    printf("[Compat Scanner 12/17] Testing Period-16 PKGV0022\\0 (mlen=9) XOR & non-PKG...\n");
+
+    char tmpl[] = "/dev/shm/wwal_cs_mlen9_XXXXXX";
+    char *root = mkdtemp(tmpl);
+    assert(root != NULL);
+
+    char pkg_dir[512], bad_dir[512], path[1024];
+    snprintf(pkg_dir, sizeof(pkg_dir), "%s/mlen9", root);
+    snprintf(bad_dir, sizeof(bad_dir), "%s/badpkg", root);
+    assert(mkdir(pkg_dir, 0755) == 0);
+    assert(mkdir(bad_dir, 0755) == 0);
+
+    const char *proj_json = "{\"title\":\"XOR9\",\"type\":\"scene\",\"file\":\"scene.json\"}";
+    snprintf(path, sizeof(path), "%s/project.json", pkg_dir);
+    cs_write_bytes(path, proj_json, strlen(proj_json));
+
+    uint8_t plain[256];
+    memset(plain, 0, sizeof(plain));
+    size_t c = 0u;
+    uint32_t mlen = 9u;
+    memcpy(plain + c, &mlen, 4u);
+    c += 4u;
+    memcpy(plain + c, "PKGV0022", 8u);
+    c += 8u;
+    plain[c++] = '\0';
+    uint32_t ec = 1u;
+    memcpy(plain + c, &ec, 4u);
+    c += 4u;
+    uint32_t plen = 8u, off = 0u, sz = 64u;
+    memcpy(plain + c, &plen, 4u);
+    c += 4u;
+    memcpy(plain + c, "evil.exe", 8u);
+    c += 8u;
+    memcpy(plain + c, &off, 4u);
+    c += 4u;
+    memcpy(plain + c, &sz, 4u);
+    c += 4u;
+    plain[c] = 'M';
+    plain[c + 1u] = 'Z';
+    plain[c + 2u] = 0x90u;
+    c += sz;
+
+    static const uint8_t key16[16] = {0xA5u, 0x3Cu, 0x7Eu, 0x19u, 0xD2u, 0x48u, 0x81u, 0x5Fu,
+                                      0x2Bu, 0x94u, 0xE3u, 0x67u, 0x11u, 0xC9u, 0x52u, 0x8Au};
+    uint8_t masked[256];
+    for (size_t i = 0; i < c; i++) {
+        masked[i] = (uint8_t)(plain[i] ^ key16[i % 16u]);
+    }
+    snprintf(path, sizeof(path), "%s/scene.pkg", pkg_dir);
+    cs_write_bytes(path, masked, c);
+
+    we_compat_report_t *report = we_compat_report_alloc();
+    assert(report != NULL);
+    assert(we_compat_scan_directory(scanner, pkg_dir, report));
+    assert(report_has_issue_code(report, "PKG_OBFUSCATION_DEMASKED"));
+    assert(report_has_issue_code(report, "SECURITY_ALERT_MALICIOUS"));
+
+    snprintf(path, sizeof(path), "%s/project.json", bad_dir);
+    cs_write_bytes(path, proj_json, strlen(proj_json));
+    uint8_t garbage[128];
+    for (size_t i = 0; i < sizeof(garbage); i++) {
+        garbage[i] = (uint8_t)('A' + (i % 26u));
+    }
+    snprintf(path, sizeof(path), "%s/scene.pkg", bad_dir);
+    cs_write_bytes(path, garbage, sizeof(garbage));
+    assert(we_compat_scan_directory(scanner, bad_dir, report));
+    assert(!report_has_issue_code(report, "PKG_OBFUSCATION_DEMASKED"));
+
+    we_compat_report_free(report);
+    cleanup_dir(root);
+    printf("  -> Passed.\n");
+}
+
+static void test_intermediate_symlink_confinement(we_compat_scanner_t *scanner)
+{
+    printf("[Compat Scanner 13/17] Testing intermediate dir symlink confinement...\n");
+
+    char tmpl[] = "/dev/shm/wwal_cs_sym_XXXXXX";
+    char *root = mkdtemp(tmpl);
+    assert(root != NULL);
+
+    char out_dir[512], ws_dir[512], sym_sub[512], path[1024];
+    snprintf(out_dir, sizeof(out_dir), "%s/outside", root);
+    snprintf(ws_dir, sizeof(ws_dir), "%s/ws", root);
+    snprintf(sym_sub, sizeof(sym_sub), "%s/sub", ws_dir);
+    assert(mkdir(out_dir, 0755) == 0);
+    assert(mkdir(ws_dir, 0755) == 0);
+
+    snprintf(path, sizeof(path), "%s/outside_evil.exe", out_dir);
+    uint8_t pe[64] = {'M', 'Z', 0x90u, 0x00u};
+    cs_write_bytes(path, pe, sizeof(pe));
+    char out_big[1024];
+    snprintf(out_big, sizeof(out_big), "%s/big.json", out_dir);
+    const char *out_big_json = "{\"maxcount\": 50000}";
+    cs_write_bytes(out_big, out_big_json, strlen(out_big_json));
+
+    snprintf(path, sizeof(path), "%s/project.json", ws_dir);
+    const char *pj = "{\"title\":\"SymSub\",\"type\":\"scene\",\"file\":\"scene.json\"}";
+    cs_write_bytes(path, pj, strlen(pj));
+    snprintf(path, sizeof(path), "%s/scene.json", ws_dir);
+    const char *sj = "{\"objects\":[]}";
+    cs_write_bytes(path, sj, strlen(sj));
+    assert(symlink(out_dir, sym_sub) == 0);
+
+    we_compat_report_t *report = we_compat_report_alloc();
+    assert(report != NULL);
+    assert(we_compat_scan_directory(scanner, ws_dir, report));
+    /* Symlink directory sub -> outside_dir must not be followed during scan. */
+    assert(!report_has_issue_code(report, "SECURITY_ALERT_MALICIOUS"));
+
+    /* In-place repair through an intermediate directory symlink must be rejected. */
+    report->repair_count = 1u;
+    snprintf(report->repairs[0].transformation_id, sizeof(report->repairs[0].transformation_id),
+             "REPAIR_CLAMP_PARTICLES");
+    snprintf(report->repairs[0].target_file, sizeof(report->repairs[0].target_file),
+             "sub/big.json");
+    assert(we_compat_apply_repairs(report, ws_dir) == 0u);
+    int check_fd = open(out_big, O_RDONLY | O_CLOEXEC);
+    assert(check_fd >= 0);
+    char check_buf[64] = {0};
+    ssize_t nr = read(check_fd, check_buf, sizeof(check_buf) - 1u);
+    close(check_fd);
+    assert(nr > 0 && strstr(check_buf, "50000") != NULL);
+
+    we_compat_report_free(report);
+    cleanup_dir(root);
+    printf("  -> Passed.\n");
+}
+
+static void test_particle_overflow_nonfinite_and_aliased_repairs(we_compat_scanner_t *scanner)
+{
+    printf("[Compat Scanner 14/17] Testing non-finite/huge particle bounds & aliased repair...\n");
+
+    char tmpl[] = "/dev/shm/wwal_cs_part_XXXXXX";
+    char *root = mkdtemp(tmpl);
+    assert(root != NULL);
+
+    char ws_dir[512], p_dir[512], alias_dir[512], path[1024];
+    snprintf(ws_dir, sizeof(ws_dir), "%s/ws", root);
+    snprintf(p_dir, sizeof(p_dir), "%s/particles", ws_dir);
+    snprintf(alias_dir, sizeof(alias_dir), "%s/ws_alias", root);
+    assert(mkdir(ws_dir, 0755) == 0);
+    assert(mkdir(p_dir, 0755) == 0);
+    assert(symlink(ws_dir, alias_dir) == 0);
+
+    snprintf(path, sizeof(path), "%s/project.json", ws_dir);
+    const char *pj = "{\"title\":\"BigParticle\",\"type\":\"scene\",\"file\":\"scene.json\"}";
+    cs_write_bytes(path, pj, strlen(pj));
+    snprintf(path, sizeof(path), "%s/scene.json", ws_dir);
+    const char *sj = "{\"objects\":[{\"id\":1,\"particle\":\"particles/big.json\"}]}";
+    cs_write_bytes(path, sj, strlen(sj));
+    snprintf(path, sizeof(path), "%s/big.json", p_dir);
+    const char *bigp = "{\"maxcount\": 1e20}";
+    cs_write_bytes(path, bigp, strlen(bigp));
+
+    we_compat_report_t *report = we_compat_report_alloc();
+    assert(report != NULL);
+    assert(we_compat_scan_directory(scanner, ws_dir, report));
+    assert(report_has_issue_code(report, "PARTICLE_OVERFLOW"));
+    assert(report_has_repair_id(report, "REPAIR_CLAMP_PARTICLES"));
+
+    /* Identical and lexical path-aliased source/target paths preserve and repair in-place;
+     * a symlink target_dir must be rejected. */
+    char dot_alias[1024];
+    snprintf(dot_alias, sizeof(dot_alias), "%s/.", ws_dir);
+    assert(we_compat_apply_auto_repairs(report, ws_dir, ws_dir));
+    assert(we_compat_apply_auto_repairs(report, ws_dir, dot_alias));
+    assert(!we_compat_apply_auto_repairs(report, ws_dir, alias_dir));
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    assert(fd >= 0);
+    char rbuf[256] = {0};
+    ssize_t nr = read(fd, rbuf, sizeof(rbuf) - 1u);
+    close(fd);
+    assert(nr > 0 && strstr(rbuf, "16384") != NULL);
+
+    /* Negative finite count must trip particle overflow; non-finite 1e400 JSON fails safely. */
+    const char *negp = "{\"maxcount\": -5.0}";
+    cs_write_bytes(path, negp, strlen(negp));
+    assert(we_compat_scan_directory(scanner, ws_dir, report));
+    assert(report_has_issue_code(report, "PARTICLE_OVERFLOW"));
+
+    const char *infp = "{\"maxcount\": 1e400}";
+    cs_write_bytes(path, infp, strlen(infp));
+    assert(we_compat_scan_directory(scanner, ws_dir, report));
+
+    we_compat_report_free(report);
+    cleanup_dir(root);
+    printf("  -> Passed.\n");
+}
+
+static void test_scene_cycle_detection_linear(we_compat_scanner_t *scanner)
+{
+    printf("[Compat Scanner 15/17] Testing O(N) 3-color DFS scene cycle detection...\n");
+
+    char tmpl[] = "/dev/shm/wwal_cs_cycle_XXXXXX";
+    char *root = mkdtemp(tmpl);
+    assert(root != NULL);
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/project.json", root);
+    const char *pj = "{\"title\":\"Cycle\",\"type\":\"scene\",\"file\":\"scene.json\"}";
+    cs_write_bytes(path, pj, strlen(pj));
+
+    char scene_buf[8192];
+    size_t off = (size_t)snprintf(scene_buf, sizeof(scene_buf), "{\"objects\":[");
+    for (int i = 0; i < 64; i++) {
+        int parent = (i == 0) ? -1 : (i - 1);
+        if (i == 10) {
+            parent = 12; /* Lasso cycle: 10 -> 12 -> 11 -> 10 */
+        }
+        off += (size_t)snprintf(scene_buf + off, sizeof(scene_buf) - off,
+                                "%s{\"id\":%d,\"parent\":%d}", (i == 0) ? "" : ",", i, parent);
+    }
+    off += (size_t)snprintf(scene_buf + off, sizeof(scene_buf) - off, "]}");
+    snprintf(path, sizeof(path), "%s/scene.json", root);
+    cs_write_bytes(path, scene_buf, off);
+
+    we_compat_report_t *report = we_compat_report_alloc();
+    assert(report != NULL);
+    assert(we_compat_scan_directory(scanner, root, report));
+    assert(report_has_issue_code(report, "CYCLE_DETECTED"));
+
+    we_compat_report_free(report);
+    cleanup_dir(root);
+    printf("  -> Passed.\n");
+}
+
+static void test_pkg_loose_dedup_no_double_count(we_compat_scanner_t *scanner)
+{
+    printf("[Compat Scanner 16/17] Testing pkg + loose + scene.json particle dedup...\n");
+
+    char tmpl[] = "/dev/shm/wwal_cs_dedup_XXXXXX";
+    char *root = mkdtemp(tmpl);
+    assert(root != NULL);
+
+    char p_dir[512], path[1024];
+    snprintf(p_dir, sizeof(p_dir), "%s/particles", root);
+    assert(mkdir(p_dir, 0755) == 0);
+
+    snprintf(path, sizeof(path), "%s/project.json", root);
+    const char *pj = "{\"title\":\"DedupPart\",\"type\":\"scene\",\"file\":\"scene.json\"}";
+    cs_write_bytes(path, pj, strlen(pj));
+
+    const char *scene_json = "{\"objects\":[{\"id\":0,\"particle\":\"particles/p1.json\"},"
+                             "{\"id\":1,\"particle\":\"particles/p2.json\"}]}";
+    const char *part_json = "{\"maxcount\":100}";
+
+    uint8_t pkg[512];
+    size_t pkg_sz =
+        build_two_entry_pkg(pkg, sizeof(pkg), "scene.json", scene_json, strlen(scene_json),
+                            "particles/p1.json", part_json, strlen(part_json));
+    snprintf(path, sizeof(path), "%s/scene.pkg", root);
+    cs_write_bytes(path, pkg, pkg_sz);
+
+    snprintf(path, sizeof(path), "%s/p1.json", p_dir);
+    cs_write_bytes(path, part_json, strlen(part_json));
+    snprintf(path, sizeof(path), "%s/p2.json", p_dir);
+    cs_write_bytes(path, part_json, strlen(part_json));
+
+    we_compat_report_t *report = we_compat_report_alloc();
+    assert(report != NULL);
+    assert(we_compat_scan_directory(scanner, root, report));
+    assert(report->summary.particle_systems == 2u);
+
+    we_compat_report_free(report);
+    cleanup_dir(root);
+    printf("  -> Passed.\n");
+}
+
+static void test_glsl_token_boundary_uniform_injection(we_compat_scanner_t *scanner)
+{
+    printf("[Compat Scanner 17/17] Testing GLSL token-boundary uniform synthesis...\n");
+
+    char tmpl[] = "/dev/shm/wwal_cs_glsl_XXXXXX";
+    char *root = mkdtemp(tmpl);
+    assert(root != NULL);
+
+    char src_dir[512], dst_dir[512], s_dir[512], path[1024];
+    snprintf(src_dir, sizeof(src_dir), "%s/src", root);
+    snprintf(dst_dir, sizeof(dst_dir), "%s/dst", root);
+    snprintf(s_dir, sizeof(s_dir), "%s/shaders", src_dir);
+    assert(mkdir(src_dir, 0755) == 0);
+    assert(mkdir(s_dir, 0755) == 0);
+
+    snprintf(path, sizeof(path), "%s/project.json", src_dir);
+    const char *pj = "{\"title\":\"GLSLTok\",\"type\":\"scene\",\"file\":\"scene.json\"}";
+    cs_write_bytes(path, pj, strlen(pj));
+
+    snprintf(path, sizeof(path), "%s/scene.json", src_dir);
+    const char *sj = "{\"objects\":[{\"id\":0,\"user\":\"u_speed\"}]}";
+    cs_write_bytes(path, sj, strlen(sj));
+
+    /* Prefix-overlapping declaration u_speed2 must NOT suppress injecting u_speed. */
+    snprintf(path, sizeof(path), "%s/effect.frag", s_dir);
+    const char *frag = "uniform float u_speed2;\nvoid main() { gl_FragColor = vec4(u_speed, "
+                       "u_speed2, 0.0, 1.0); }\n";
+    cs_write_bytes(path, frag, strlen(frag));
+
+    we_compat_report_t *report = we_compat_report_alloc();
+    assert(report != NULL);
+    assert(we_compat_scan_directory(scanner, src_dir, report));
+    assert(report_has_repair_id(report, "REPAIR_SYNTHESIZE_USER_PROP"));
+    assert(we_compat_apply_auto_repairs(report, src_dir, dst_dir));
+
+    snprintf(path, sizeof(path), "%s/shaders/effect.frag", dst_dir);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    assert(fd >= 0);
+    char out_buf[1024] = {0};
+    ssize_t nr = read(fd, out_buf, sizeof(out_buf) - 1u);
+    close(fd);
+    assert(nr > 0 && strstr(out_buf, "uniform float u_speed;") != NULL);
+
+    we_compat_report_free(report);
+    cleanup_dir(root);
+    printf("  -> Passed.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -898,11 +1311,18 @@ int main(void)
     test_non_nul_pkg_slices(scanner);
     test_report_json_serialization(scanner);
     test_struct_field_varying_locale_and_merged_config(scanner);
+    test_scanner_and_report_reuse(scanner);
+    test_period16_mlen9_xor_and_non_pkg_rejection(scanner);
+    test_intermediate_symlink_confinement(scanner);
+    test_particle_overflow_nonfinite_and_aliased_repairs(scanner);
+    test_scene_cycle_detection_linear(scanner);
+    test_pkg_loose_dedup_no_double_count(scanner);
+    test_glsl_token_boundary_uniform_injection(scanner);
 
     we_compat_scanner_destroy(scanner);
 
     printf("==========================================================\n");
-    printf("  >>> ALL 10 CAPABILITY SCANNER TESTS PASSED (100%%) <<<   \n");
+    printf("  >>> ALL 17 CAPABILITY SCANNER TESTS PASSED (100%%) <<<   \n");
     printf("==========================================================\n");
 
     return 0;

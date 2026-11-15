@@ -9,10 +9,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdatomic.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define WE_LZ4_MIN_COMPRESS 13u
@@ -442,53 +444,178 @@ static bool write_all_fd(int fd, const uint8_t *buf, size_t len)
     return true;
 }
 
-static int open_atomic_tmp(const char *path, char **out_tmp_path, we_asset_writer_err_t *out_err)
+typedef struct {
+    int fd;
+    int dir_fd;
+    const char *base_name;
+    char tmp_name[48];
+} we_atomic_tmp_t;
+
+static bool read_csprng_u64(uint64_t *out)
 {
-    static atomic_uint_fast64_t s_tmp_seq = 0;
-    uint64_t seq = atomic_fetch_add_explicit(&s_tmp_seq, 1u, memory_order_relaxed);
-    size_t tmp_cap = strlen(path) + 64u;
-    char *tmp_path = malloc(tmp_cap);
-    if (!tmp_path) {
-        set_err(out_err, WE_WRITER_ERR_OOM);
-        return -1;
+    uint8_t *dst = (uint8_t *)out;
+    size_t got = 0u;
+    while (got < sizeof(*out)) {
+        ssize_t n = getrandom(dst + got, sizeof(*out) - got, 0);
+        if (n > 0) {
+            got += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
     }
-    int n = snprintf(tmp_path, tmp_cap, "%s.tmp.%ld.%llu", path, (long)getpid(),
-                     (unsigned long long)seq);
-    if (n < 0 || (size_t)n >= tmp_cap) {
-        free(tmp_path);
-        set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
-        return -1;
+    if (got == sizeof(*out)) {
+        return true;
     }
 
-    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
-    if (fd < 0) {
-        free(tmp_path);
-        set_err(out_err, WE_WRITER_ERR_IO);
-        return -1;
+    int ufd = open("/dev/urandom", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (ufd < 0) {
+        return false;
     }
-    *out_tmp_path = tmp_path;
-    return fd;
+    while (got < sizeof(*out)) {
+        ssize_t n = read(ufd, dst + got, sizeof(*out) - got);
+        if (n > 0) {
+            got += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        close(ufd);
+        return false;
+    }
+    close(ufd);
+    return true;
 }
 
-static bool finish_atomic_tmp(int fd, char *tmp_path, const char *dest_path, bool ok,
-                              we_asset_writer_err_t *out_err)
+static bool open_atomic_tmp(const char *path, we_atomic_tmp_t *out, we_asset_writer_err_t *out_err)
 {
-    if (ok && fsync(fd) < 0 && errno != EINVAL) {
-        ok = false;
+    memset(out, 0, sizeof(*out));
+    out->fd = -1;
+    out->dir_fd = -1;
+
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? (slash + 1) : path;
+    size_t blen = strlen(base);
+    if (blen == 0u || blen > NAME_MAX || strcmp(base, ".") == 0 || strcmp(base, "..") == 0) {
+        set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
+        return false;
     }
-    if (close(fd) < 0) {
-        ok = false;
+
+    char dir_stack[4096];
+    const char *dir_path = NULL;
+    char *dir_heap = NULL;
+    if (!slash) {
+        dir_path = ".";
+    } else if (slash == path) {
+        dir_path = "/";
+    } else {
+        size_t dlen = (size_t)(slash - path);
+        if (dlen < sizeof(dir_stack)) {
+            memcpy(dir_stack, path, dlen);
+            dir_stack[dlen] = '\0';
+            dir_path = dir_stack;
+        } else {
+            dir_heap = (char *)malloc(dlen + 1u);
+            if (!dir_heap) {
+                set_err(out_err, WE_WRITER_ERR_OOM);
+                return false;
+            }
+            memcpy(dir_heap, path, dlen);
+            dir_heap[dlen] = '\0';
+            dir_path = dir_heap;
+        }
     }
-    if (ok && rename(tmp_path, dest_path) < 0) {
-        ok = false;
-    }
-    if (!ok) {
-        unlink(tmp_path);
-        free(tmp_path);
+
+    int dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    free(dir_heap);
+    if (dir_fd < 0) {
         set_err(out_err, WE_WRITER_ERR_IO);
         return false;
     }
-    free(tmp_path);
+
+    struct stat dst_st;
+    if (fstatat(dir_fd, base, &dst_st, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISREG(dst_st.st_mode)) {
+        close(dir_fd);
+        set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
+        return false;
+    }
+
+    int fd = -1;
+    char tmp_name[48];
+    for (int attempt = 0; attempt < 16; attempt++) {
+        uint64_t tok = 0u;
+        if (!read_csprng_u64(&tok)) {
+            close(dir_fd);
+            set_err(out_err, WE_WRITER_ERR_IO);
+            return false;
+        }
+        /* Fixed-length hidden name stays well within NAME_MAX regardless of dest filename. */
+        int n = snprintf(tmp_name, sizeof(tmp_name), ".wwal_tmp.%016llx", (unsigned long long)tok);
+        if (n <= 0 || (size_t)n >= sizeof(tmp_name)) {
+            close(dir_fd);
+            set_err(out_err, WE_WRITER_ERR_INVALID_PATH);
+            return false;
+        }
+        fd = openat(dir_fd, tmp_name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (fd >= 0) {
+            break;
+        }
+        if (errno != EEXIST) {
+            close(dir_fd);
+            set_err(out_err, WE_WRITER_ERR_IO);
+            return false;
+        }
+    }
+
+    if (fd < 0) {
+        close(dir_fd);
+        set_err(out_err, WE_WRITER_ERR_IO);
+        return false;
+    }
+
+    out->fd = fd;
+    out->dir_fd = dir_fd;
+    out->base_name = base;
+    memcpy(out->tmp_name, tmp_name, sizeof(tmp_name));
+    return true;
+}
+
+static bool finish_atomic_tmp(we_atomic_tmp_t *tmp, bool ok, we_asset_writer_err_t *out_err)
+{
+    if (ok && fsync(tmp->fd) < 0 && errno != EINVAL && errno != ENOTSUP) {
+        ok = false;
+    }
+    if (close(tmp->fd) < 0) {
+        ok = false;
+    }
+    tmp->fd = -1;
+
+    bool renamed = false;
+    if (ok) {
+        if (renameat(tmp->dir_fd, tmp->tmp_name, tmp->dir_fd, tmp->base_name) == 0) {
+            renamed = true;
+            /* Sync parent directory so rename metadata is durable before reporting success. */
+            if (fsync(tmp->dir_fd) < 0 && errno != EINVAL && errno != ENOTSUP) {
+                ok = false;
+            }
+        } else {
+            ok = false;
+        }
+    }
+
+    if (!renamed) {
+        unlinkat(tmp->dir_fd, tmp->tmp_name, 0);
+    }
+    close(tmp->dir_fd);
+    tmp->dir_fd = -1;
+
+    if (!ok) {
+        set_err(out_err, WE_WRITER_ERR_IO);
+        return false;
+    }
     set_err(out_err, WE_WRITER_OK);
     return true;
 }
@@ -501,14 +628,13 @@ bool we_write_file_atomic(const char *path, const void *data, size_t size,
         return false;
     }
 
-    char *tmp_path = NULL;
-    int fd = open_atomic_tmp(path, &tmp_path, out_err);
-    if (fd < 0) {
+    we_atomic_tmp_t tmp;
+    if (!open_atomic_tmp(path, &tmp, out_err)) {
         return false;
     }
 
-    bool ok = (size == 0u) || write_all_fd(fd, (const uint8_t *)data, size);
-    return finish_atomic_tmp(fd, tmp_path, path, ok, out_err);
+    bool ok = (size == 0u) || write_all_fd(tmp.fd, (const uint8_t *)data, size);
+    return finish_atomic_tmp(&tmp, ok, out_err);
 }
 
 bool we_pkg_write_file(const char *out_path, const we_pkg_write_entry_t *entries,
@@ -535,23 +661,22 @@ bool we_pkg_write_file(const char *out_path, const we_pkg_write_entry_t *entries
     }
     write_pkg_directory(dir_buf, items, entry_count);
 
-    char *tmp_path = NULL;
-    int fd = open_atomic_tmp(out_path, &tmp_path, out_err);
-    if (fd < 0) {
+    we_atomic_tmp_t tmp;
+    if (!open_atomic_tmp(out_path, &tmp, out_err)) {
         free(dir_buf);
         free(items);
         return false;
     }
 
-    bool ok = write_all_fd(fd, dir_buf, (size_t)dir_size);
+    bool ok = write_all_fd(tmp.fd, dir_buf, (size_t)dir_size);
     free(dir_buf);
 
     for (size_t i = 0; ok && i < entry_count; i++) {
         if (items[i].size > 0u) {
-            ok = write_all_fd(fd, items[i].data, items[i].size);
+            ok = write_all_fd(tmp.fd, items[i].data, items[i].size);
         }
     }
 
     free(items);
-    return finish_atomic_tmp(fd, tmp_path, out_path, ok, out_err);
+    return finish_atomic_tmp(&tmp, ok, out_err);
 }

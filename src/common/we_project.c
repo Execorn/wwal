@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include "waywal/os_compat.h"
 #include "waywal/toml_parser.h"
 #include "waywal/we_json.h"
 #include "waywal/we_scene.h"
@@ -11,6 +12,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,11 +21,32 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+static void populate_workshop_dir_and_id(const char *workshop_dir, we_project_t *out_proj)
+{
+    snprintf(out_proj->workshop_dir, sizeof(out_proj->workshop_dir), "%s", workshop_dir);
+
+    size_t dlen = strlen(workshop_dir);
+    while (dlen > 1 && workshop_dir[dlen - 1] == '/') {
+        dlen--;
+    }
+    const char *slash = memrchr(workshop_dir, '/', dlen);
+    const char *id_start = slash ? (slash + 1) : workshop_dir;
+    size_t id_len = dlen - (size_t)(id_start - workshop_dir);
+    if (id_len >= sizeof(out_proj->workshop_id)) {
+        id_len = sizeof(out_proj->workshop_id) - 1;
+    }
+    memcpy(out_proj->workshop_id, id_start, id_len);
+    out_proj->workshop_id[id_len] = '\0';
+}
+
 bool we_project_parse(const char *json_str, size_t len, we_project_t *out_proj)
 {
     if (!json_str || len == 0 || !out_proj) {
         return false;
     }
+    /* Clear caller-owned struct so reusing a stack we_project_t never leaks prior properties. */
+    memset(out_proj, 0, sizeof(*out_proj));
+
     we_jval_t *root = we_json_parse_root(json_str, len);
     if (!root || root->type != JVAL_OBJ) {
         we_jval_free(root);
@@ -95,35 +119,29 @@ bool we_project_load_dir(const char *workshop_dir, we_project_t *out_proj)
         return false;
     }
     memset(out_proj, 0, sizeof(*out_proj));
-    snprintf(out_proj->workshop_dir, sizeof(out_proj->workshop_dir), "%s", workshop_dir);
 
-    size_t dlen = strlen(workshop_dir);
-    while (dlen > 1 && workshop_dir[dlen - 1] == '/') {
-        dlen--;
-    }
-    const char *slash = memrchr(workshop_dir, '/', dlen);
-    const char *id_start = slash ? (slash + 1) : workshop_dir;
-    size_t id_len = dlen - (size_t)(id_start - workshop_dir);
-    if (id_len >= sizeof(out_proj->workshop_id)) {
-        id_len = sizeof(out_proj->workshop_id) - 1;
-    }
-    memcpy(out_proj->workshop_id, id_start, id_len);
-    out_proj->workshop_id[id_len] = '\0';
-
-    char json_path[4096];
-    if (snprintf(json_path, sizeof(json_path), "%s/project.json", workshop_dir) >=
-        (int)sizeof(json_path)) {
+    int ws_dfd = open(workshop_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (ws_dfd < 0) {
         return false;
     }
 
-    int fd = open(json_path, O_RDONLY | O_CLOEXEC);
+    int fd = wwal_openat2_beneath(ws_dfd, "project.json", O_RDONLY | O_NONBLOCK, 0);
     if (fd < 0) {
-        snprintf(json_path, sizeof(json_path), "%s/scene.pkg", workshop_dir);
-        struct stat st;
-        if (stat(json_path, &st) != 0 || !S_ISREG(st.st_mode)) {
-            snprintf(json_path, sizeof(json_path), "%s/gifscene.pkg", workshop_dir);
+        bool has_pkg = false;
+        int pfd = wwal_openat2_beneath(ws_dfd, "scene.pkg", O_RDONLY | O_NONBLOCK, 0);
+        if (pfd < 0) {
+            pfd = wwal_openat2_beneath(ws_dfd, "gifscene.pkg", O_RDONLY | O_NONBLOCK, 0);
         }
-        if (stat(json_path, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (pfd >= 0) {
+            struct stat pst;
+            if (fstat(pfd, &pst) == 0 && S_ISREG(pst.st_mode)) {
+                has_pkg = true;
+            }
+            close(pfd);
+        }
+        close(ws_dfd);
+        if (has_pkg) {
+            populate_workshop_dir_and_id(workshop_dir, out_proj);
             snprintf(out_proj->title, sizeof(out_proj->title), "%s", out_proj->workshop_id);
             snprintf(out_proj->type, sizeof(out_proj->type), "scene");
             snprintf(out_proj->file, sizeof(out_proj->file), "scene.json");
@@ -132,9 +150,11 @@ bool we_project_load_dir(const char *workshop_dir, we_project_t *out_proj)
         }
         return false;
     }
+    close(ws_dfd);
 
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > (16 * 1024 * 1024)) {
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size > (16 * 1024 * 1024)) {
         close(fd);
         return false;
     }
@@ -169,6 +189,9 @@ bool we_project_load_dir(const char *workshop_dir, we_project_t *out_proj)
 
     bool ok = we_project_parse(buf, (size_t)st.st_size, out_proj);
     free(buf);
+    if (ok) {
+        populate_workshop_dir_and_id(workshop_dir, out_proj);
+    }
     return ok;
 }
 
@@ -430,6 +453,148 @@ static int cmp_projects_by_id(const void *a, const void *b)
     return strcmp(pa->workshop_id, pb->workshop_id);
 }
 
+typedef struct {
+    uint64_t hash;
+    size_t idx; /* SIZE_MAX marks an empty slot. */
+} ws_idx_slot_t;
+
+typedef struct {
+    ws_idx_slot_t *slots;
+    size_t cap;
+    size_t count;
+} ws_idx_table_t;
+
+static uint64_t ws_fnv1a64(const char *s)
+{
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; ++p) {
+        h ^= (uint64_t)*p;
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static const char *ws_idx_key(const void *base, size_t stride, size_t key_off, size_t idx)
+{
+    return (const char *)base + idx * stride + key_off;
+}
+
+static void ws_idx_table_free(ws_idx_table_t *ht)
+{
+    free(ht->slots);
+    ht->slots = NULL;
+    ht->cap = 0;
+    ht->count = 0;
+}
+
+static bool ws_idx_table_rehash(ws_idx_table_t *ht, const void *base, size_t stride, size_t key_off,
+                                size_t new_cap)
+{
+    if (new_cap < 64u) {
+        new_cap = 64u;
+    }
+    if (new_cap > SIZE_MAX / sizeof(ws_idx_slot_t)) {
+        return false;
+    }
+    ws_idx_slot_t *ns = malloc(new_cap * sizeof(ws_idx_slot_t));
+    if (!ns) {
+        return false;
+    }
+    for (size_t i = 0; i < new_cap; i++) {
+        ns[i].hash = 0;
+        ns[i].idx = SIZE_MAX;
+    }
+    size_t mask = new_cap - 1u;
+    for (size_t i = 0; i < ht->cap; i++) {
+        if (ht->slots[i].idx == SIZE_MAX) {
+            continue;
+        }
+        size_t pos = (size_t)(ht->slots[i].hash & mask);
+        while (ns[pos].idx != SIZE_MAX) {
+            pos = (pos + 1u) & mask;
+        }
+        ns[pos] = ht->slots[i];
+    }
+    (void)base;
+    (void)stride;
+    (void)key_off;
+    free(ht->slots);
+    ht->slots = ns;
+    ht->cap = new_cap;
+    return true;
+}
+
+static bool ws_idx_table_contains(const ws_idx_table_t *ht, const void *base, size_t stride,
+                                  size_t key_off, const char *key, uint64_t *out_hash)
+{
+    uint64_t h = ws_fnv1a64(key);
+    if (out_hash) {
+        *out_hash = h;
+    }
+    if (ht->cap == 0 || !ht->slots) {
+        return false;
+    }
+    size_t mask = ht->cap - 1u;
+    size_t pos = (size_t)(h & mask);
+    while (ht->slots[pos].idx != SIZE_MAX) {
+        if (ht->slots[pos].hash == h &&
+            strcmp(ws_idx_key(base, stride, key_off, ht->slots[pos].idx), key) == 0) {
+            return true;
+        }
+        pos = (pos + 1u) & mask;
+    }
+    return false;
+}
+
+static bool ws_idx_table_insert(ws_idx_table_t *ht, const void *base, size_t stride, size_t key_off,
+                                size_t idx, uint64_t h)
+{
+    if (ht->cap == 0 || (ht->count + 1u) * 10u >= ht->cap * 7u) {
+        size_t new_cap = ht->cap == 0 ? 64u : ht->cap * 2u;
+        if (!ws_idx_table_rehash(ht, base, stride, key_off, new_cap)) {
+            return false;
+        }
+    }
+    const char *key = ws_idx_key(base, stride, key_off, idx);
+    size_t mask = ht->cap - 1u;
+    size_t pos = (size_t)(h & mask);
+    while (ht->slots[pos].idx != SIZE_MAX) {
+        if (ht->slots[pos].hash == h &&
+            strcmp(ws_idx_key(base, stride, key_off, ht->slots[pos].idx), key) == 0) {
+            return true;
+        }
+        pos = (pos + 1u) & mask;
+    }
+    ht->slots[pos].hash = h;
+    ht->slots[pos].idx = idx;
+    ht->count++;
+    return true;
+}
+
+static bool workshop_append_unique_project(we_project_t **items, size_t *count, size_t *cap,
+                                           ws_idx_table_t *seen_ht, const we_project_t *proj)
+{
+    uint64_t h = 0;
+    if (ws_idx_table_contains(seen_ht, *items, sizeof(we_project_t),
+                              offsetof(we_project_t, workshop_id), proj->workshop_id, &h)) {
+        return true;
+    }
+    if (*count + 1u > *cap) {
+        size_t ncap = *cap == 0 ? 16u : *cap * 2u;
+        we_project_t *ni = realloc(*items, ncap * sizeof(we_project_t));
+        if (!ni) {
+            return false;
+        }
+        *items = ni;
+        *cap = ncap;
+    }
+    size_t new_idx = *count;
+    (*items)[new_idx] = *proj;
+    *count = new_idx + 1u;
+    return ws_idx_table_insert(seen_ht, *items, sizeof(we_project_t),
+                               offsetof(we_project_t, workshop_id), new_idx, h);
+}
+
 bool we_workshop_scan_all(we_project_t **out_items, size_t *out_count)
 {
     if (!out_items || !out_count) {
@@ -444,30 +609,16 @@ bool we_workshop_scan_all(we_project_t **out_items, size_t *out_count)
     size_t cap = 0;
     size_t count = 0;
     we_project_t *items = NULL;
+    ws_idx_table_t seen_ht = {0};
 
     for (size_t r = 0; r < root_count; r++) {
         if (dir_has_workshop_files(roots[r])) {
             we_project_t proj;
             if (we_project_load_dir(roots[r], &proj)) {
-                bool dup = false;
-                for (size_t k = 0; k < count; k++) {
-                    if (strcmp(items[k].workshop_id, proj.workshop_id) == 0) {
-                        dup = true;
-                        break;
-                    }
-                }
-                if (!dup) {
-                    if (count + 1 > cap) {
-                        size_t ncap = cap == 0 ? 16 : cap * 2;
-                        we_project_t *ni = realloc(items, ncap * sizeof(we_project_t));
-                        if (!ni) {
-                            free(items);
-                            return false;
-                        }
-                        items = ni;
-                        cap = ncap;
-                    }
-                    items[count++] = proj;
+                if (!workshop_append_unique_project(&items, &count, &cap, &seen_ht, &proj)) {
+                    ws_idx_table_free(&seen_ht);
+                    free(items);
+                    return false;
                 }
             }
         }
@@ -493,32 +644,17 @@ bool we_workshop_scan_all(we_project_t **out_items, size_t *out_count)
             if (!we_project_load_dir(subdir, &proj)) {
                 continue;
             }
-            bool dup = false;
-            for (size_t k = 0; k < count; k++) {
-                if (strcmp(items[k].workshop_id, proj.workshop_id) == 0) {
-                    dup = true;
-                    break;
-                }
+            if (!workshop_append_unique_project(&items, &count, &cap, &seen_ht, &proj)) {
+                closedir(d);
+                ws_idx_table_free(&seen_ht);
+                free(items);
+                return false;
             }
-            if (dup) {
-                continue;
-            }
-            if (count + 1 > cap) {
-                size_t ncap = cap == 0 ? 16 : cap * 2;
-                we_project_t *ni = realloc(items, ncap * sizeof(we_project_t));
-                if (!ni) {
-                    closedir(d);
-                    free(items);
-                    return false;
-                }
-                items = ni;
-                cap = ncap;
-            }
-            items[count++] = proj;
         }
         closedir(d);
     }
 
+    ws_idx_table_free(&seen_ht);
     if (count > 1) {
         qsort(items, count, sizeof(we_project_t), cmp_projects_by_id);
     }
@@ -562,29 +698,19 @@ static bool candidate_stays_inside_ws_dir(const char *ws_dir, const char *candid
     return real_cand[wlen] == '/' || real_cand[wlen] == '\0';
 }
 
-bool we_workshop_find_preview_file(const char *workshop_dir, char *out_path, size_t out_cap)
+static bool find_preview_from_resolved_project(const char *ws_dir, const we_project_t *proj,
+                                               char *out_path, size_t out_cap)
 {
-    if (!workshop_dir || workshop_dir[0] == '\0' || !out_path || out_cap == 0) {
-        return false;
-    }
-    out_path[0] = '\0';
-
-    char ws_dir[4096];
-    if (!we_workshop_resolve_dir(workshop_dir, ws_dir, sizeof(ws_dir))) {
-        return false;
-    }
-
     struct stat st;
-    we_project_t proj;
-    if (we_project_load_dir(ws_dir, &proj) && proj.preview[0] != '\0' &&
-        strchr(proj.preview, '/') == NULL && strchr(proj.preview, '\\') == NULL &&
-        strcmp(proj.preview, ".") != 0 && strcmp(proj.preview, "..") != 0 &&
-        strcasecmp(proj.preview, "project.json") != 0 &&
-        strcasecmp(proj.preview, "scene.json") != 0 && strcasecmp(proj.preview, "scene.pkg") != 0 &&
-        strcasecmp(proj.preview, "gifscene.pkg") != 0 &&
-        has_supported_preview_image_ext(proj.preview)) {
+    if (proj && proj->preview[0] != '\0' && strchr(proj->preview, '/') == NULL &&
+        strchr(proj->preview, '\\') == NULL && strcmp(proj->preview, ".") != 0 &&
+        strcmp(proj->preview, "..") != 0 && strcasecmp(proj->preview, "project.json") != 0 &&
+        strcasecmp(proj->preview, "scene.json") != 0 &&
+        strcasecmp(proj->preview, "scene.pkg") != 0 &&
+        strcasecmp(proj->preview, "gifscene.pkg") != 0 &&
+        has_supported_preview_image_ext(proj->preview)) {
         char candidate[4096];
-        if (snprintf(candidate, sizeof(candidate), "%s/%s", ws_dir, proj.preview) <
+        if (snprintf(candidate, sizeof(candidate), "%s/%s", ws_dir, proj->preview) <
                 (int)sizeof(candidate) &&
             stat(candidate, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
             candidate_stays_inside_ws_dir(ws_dir, candidate)) {
@@ -608,6 +734,23 @@ bool we_workshop_find_preview_file(const char *workshop_dir, char *out_path, siz
     }
 
     return false;
+}
+
+bool we_workshop_find_preview_file(const char *workshop_dir, char *out_path, size_t out_cap)
+{
+    if (!workshop_dir || workshop_dir[0] == '\0' || !out_path || out_cap == 0) {
+        return false;
+    }
+    out_path[0] = '\0';
+
+    char ws_dir[4096];
+    if (!we_workshop_resolve_dir(workshop_dir, ws_dir, sizeof(ws_dir))) {
+        return false;
+    }
+
+    we_project_t proj;
+    bool has_proj = we_project_load_dir(ws_dir, &proj);
+    return find_preview_from_resolved_project(ws_dir, has_proj ? &proj : NULL, out_path, out_cap);
 }
 
 void we_workshop_sanitize_title(const char *title, char *out_buf, size_t out_cap)
@@ -811,10 +954,13 @@ bool we_workshop_sync_previews(const char *target_dir, size_t *out_synced, size_
         return false;
     }
 
+    ws_idx_table_t link_ht = {0};
     for (size_t i = 0; i < count; ++i) {
+        char ws_dir[4096];
         char preview_file[4096];
-        if (!we_workshop_find_preview_file(items[i].workshop_dir, preview_file,
-                                           sizeof(preview_file))) {
+        if (!we_workshop_resolve_dir(items[i].workshop_dir, ws_dir, sizeof(ws_dir)) ||
+            !find_preview_from_resolved_project(ws_dir, &items[i], preview_file,
+                                                sizeof(preview_file))) {
             continue;
         }
         char abs_preview[4096];
@@ -833,6 +979,14 @@ bool we_workshop_sync_previews(const char *target_dir, size_t *out_synced, size_
                  items[i].workshop_id[0] ? items[i].workshop_id : "0", ext);
         snprintf(entries[i].target_path, sizeof(entries[i].target_path), "%s", abs_preview);
         entries[i].valid = true;
+        uint64_t lh = ws_fnv1a64(entries[i].link_name);
+        if (!ws_idx_table_insert(&link_ht, entries, sizeof(preview_entry_t),
+                                 offsetof(preview_entry_t, link_name), i, lh)) {
+            ws_idx_table_free(&link_ht);
+            free(entries);
+            free(items);
+            return false;
+        }
     }
 
     size_t pruned = 0;
@@ -854,13 +1008,10 @@ bool we_workshop_sync_previews(const char *target_dir, size_t *out_synced, size_
             }
             bool keep = false;
             struct stat tst;
-            if (stat(full_path, &tst) == 0) {
-                for (size_t i = 0; i < count && entries; ++i) {
-                    if (entries[i].valid && strcmp(entries[i].link_name, de->d_name) == 0) {
-                        keep = true;
-                        break;
-                    }
-                }
+            if (stat(full_path, &tst) == 0 && entries) {
+                keep =
+                    ws_idx_table_contains(&link_ht, entries, sizeof(preview_entry_t),
+                                          offsetof(preview_entry_t, link_name), de->d_name, NULL);
             }
             if (!keep) {
                 if (unlink(full_path) == 0) {
@@ -870,6 +1021,7 @@ bool we_workshop_sync_previews(const char *target_dir, size_t *out_synced, size_
         }
         closedir(d);
     }
+    ws_idx_table_free(&link_ht);
 
     size_t synced = 0;
     for (size_t i = 0; i < count && entries; ++i) {

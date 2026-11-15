@@ -11,7 +11,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -515,6 +514,37 @@ static inline uint64_t ws_parse_u64(ws_span_t s)
     return val;
 }
 
+static inline bool ws_parse_u32_flags(ws_span_t s, uint32_t *out)
+{
+    size_t i = 0;
+    while (i < s.len && ws_is_space((unsigned char)s.ptr[i])) {
+        i++;
+    }
+    size_t end = s.len;
+    while (end > i && ws_is_space((unsigned char)s.ptr[end - 1u])) {
+        end--;
+    }
+    if (i < end && s.ptr[i] == '+') {
+        i++;
+    }
+    if (i >= end) {
+        return false;
+    }
+    uint64_t val = 0;
+    for (; i < end; i++) {
+        unsigned int d = (unsigned int)(unsigned char)s.ptr[i] - (unsigned int)'0';
+        if (d > 9u) {
+            return false;
+        }
+        val = val * 10u + (uint64_t)d;
+        if (val > UINT32_MAX) {
+            return false;
+        }
+    }
+    *out = (uint32_t)val;
+    return true;
+}
+
 static inline bool ws_parse_nonzero_int(ws_span_t s)
 {
     size_t i = 0;
@@ -544,18 +574,10 @@ typedef struct {
     bool ok;
 } ws_simd_step64_t;
 
-/* Parses 1..16 ASCII digits ending at end_ptr; caller guarantees end_ptr - src >= 16. */
+/* Parses 2..16 ASCII digits ending at end_ptr; caller guarantees end_ptr - src >= 16. */
 __attribute__((target("avx2,bmi"), always_inline)) static inline uint64_t
-ws_simd_u64_end(const char *end_ptr, size_t slen)
+ws_simd_u64_le16(const char *end_ptr, size_t slen)
 {
-    if (__builtin_expect(slen == 1u, 0)) {
-        unsigned d = (unsigned)(unsigned char)end_ptr[-1] - (unsigned)'0';
-        return d <= 9u ? (uint64_t)d : UINT64_MAX;
-    }
-    if (__builtin_expect((slen - 1u) >= 16u, 0)) {
-        return UINT64_MAX;
-    }
-
     __m128i raw = _mm_loadu_si128((const __m128i *)(const void *)(end_ptr - 16));
     const __m128i ramp = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     __m128i mask = _mm_cmpgt_epi8(_mm_set1_epi8((char)(16u - slen)), ramp);
@@ -577,6 +599,44 @@ ws_simd_u64_end(const char *end_ptr, size_t slen)
     __m128i t3 = _mm_madd_epi16(t2p, m10000);
     uint64_t pair = (uint64_t)_mm_cvtsi128_si64(t3);
     return (pair & 0xFFFFFFFFULL) * 100000000ULL + (pair >> 32u);
+}
+
+/* Parses 1..20 ASCII digits ending at end_ptr; caller guarantees end_ptr - src >= 16 and >= slen.
+ */
+__attribute__((target("avx2,bmi"), always_inline)) static inline uint64_t
+ws_simd_u64_end(const char *end_ptr, size_t slen)
+{
+    if (slen == 1u) {
+        unsigned d = (unsigned)(unsigned char)end_ptr[-1] - (unsigned)'0';
+        return d <= 9u ? (uint64_t)d : UINT64_MAX;
+    }
+    if (__builtin_expect((slen - 1u) < 16u, 1)) {
+        return ws_simd_u64_le16(end_ptr, slen);
+    }
+    if (__builtin_expect(slen > 20u || slen == 0u, 0)) {
+        return UINT64_MAX;
+    }
+
+    size_t ulen = slen - 16u;
+    const char *hi_ptr = end_ptr - slen;
+    uint64_t hi = 0u;
+    for (size_t i = 0u; i < ulen; ++i) {
+        unsigned d = (unsigned)(unsigned char)hi_ptr[i] - (unsigned)'0';
+        if (__builtin_expect(d > 9u, 0)) {
+            return UINT64_MAX;
+        }
+        hi = hi * 10u + (uint64_t)d;
+    }
+    uint64_t lo = ws_simd_u64_le16(end_ptr, 16u);
+    if (__builtin_expect(lo == UINT64_MAX, 0)) {
+        return UINT64_MAX;
+    }
+    const uint64_t pow16 = 10000000000000000ULL;
+    /* Reserve UINT64_MAX exclusively as the error sentinel. */
+    if (__builtin_expect(hi > (UINT64_MAX - 1ULL - lo) / pow16, 0)) {
+        return UINT64_MAX;
+    }
+    return hi * pow16 + lo;
 }
 
 /* Extracts structural quote/brace mask across 64 bytes while rejecting escapes, braces inside
@@ -1063,16 +1123,16 @@ ws_parse_details_slice(const char *src, size_t slice_lo, size_t slice_hi, size_t
                 memcpy(&w, kptr, 4u);
                 uint32_t wl = w | 0x20202020u;
                 unsigned c4 = (unsigned)(unsigned char)kptr[4] | 0x20u;
-                if (wl == WS_PACK4('s', 't', 'a', 't') && c4 == 'e') {
+                if (flags_prio < 3 && wl == WS_PACK4('s', 't', 'a', 't') && c4 == 'e') {
                     uint64_t val = ws_simd_u64_end(src + vp1, vlen);
-                    if (__builtin_expect(val == UINT64_MAX, 0)) {
+                    if (__builtin_expect(val > UINT32_MAX, 0)) {
                         return out;
                     }
                     chosen_flags = (uint32_t)val;
                     flags_prio = 3;
                 } else if (flags_prio < 1 && wl == WS_PACK4('f', 'l', 'a', 'g') && c4 == 's') {
                     uint64_t val = ws_simd_u64_end(src + vp1, vlen);
-                    if (__builtin_expect(val == UINT64_MAX, 0)) {
+                    if (__builtin_expect(val > UINT32_MAX, 0)) {
                         return out;
                     }
                     chosen_flags = (uint32_t)val;
@@ -1095,7 +1155,7 @@ ws_parse_details_slice(const char *src, size_t slice_lo, size_t slice_hi, size_t
                 } else if (flags_prio < 2 &&
                            wl == WS_PACK8('i', 't', 'e', 'm', 's', 't', 'a', 't') && c8 == 'e') {
                     uint64_t val = ws_simd_u64_end(src + vp1, vlen);
-                    if (__builtin_expect(val == UINT64_MAX, 0)) {
+                    if (__builtin_expect(val > UINT32_MAX, 0)) {
                         return out;
                     }
                     chosen_flags = (uint32_t)val;
@@ -1117,13 +1177,23 @@ ws_parse_details_slice(const char *src, size_t slice_lo, size_t slice_hi, size_t
                 uint16_t w1;
                 memcpy(&w0, kptr, 8u);
                 memcpy(&w1, kptr + 8u, 2u);
-                if ((w0 | WS_SWAR_LOWER) == WS_PACK8('m', 'a', 'n', 'i', 'f', 'e', 's', 't') &&
-                    (uint16_t)(w1 | 0x2020u) == (uint16_t)((unsigned)'i' | ((unsigned)'d' << 8u))) {
+                uint64_t wl0 = w0 | WS_SWAR_LOWER;
+                uint16_t wl1 = (uint16_t)(w1 | 0x2020u);
+                if (wl0 == WS_PACK8('m', 'a', 'n', 'i', 'f', 'e', 's', 't') &&
+                    wl1 == (uint16_t)((unsigned)'i' | ((unsigned)'d' << 8u))) {
                     uint64_t val = ws_simd_u64_end(src + vp1, vlen);
                     if (__builtin_expect(val == UINT64_MAX, 0)) {
                         return out;
                     }
                     man_alt = val;
+                } else if (wl0 == WS_PACK8('s', 't', 'a', 't', 'e', 'f', 'l', 'a') &&
+                           wl1 == (uint16_t)((unsigned)'g' | ((unsigned)'s' << 8u))) {
+                    uint64_t val = ws_simd_u64_end(src + vp1, vlen);
+                    if (__builtin_expect(val > UINT32_MAX, 0)) {
+                        return out;
+                    }
+                    chosen_flags = (uint32_t)val;
+                    flags_prio = 4;
                 }
             } else if (klen == 11u) {
                 uint64_t w0;
@@ -1574,6 +1644,7 @@ static bool ws_try_parse_parallel(const char *src, size_t sz,
     }
     out_manifest->needs_download_count = calc_needs_download;
     out_manifest->item_count = total;
+    out_manifest->items_capacity = (total > 0u) ? items_alloc_cap : 0u;
     out_manifest->items = items;
     return true;
 }
@@ -1767,15 +1838,30 @@ static bool parse_details_block(ws_vdf_cursor_t *c, ws_item_table_t *tbl)
                     it->is_installed = true;
                     it->state_flags |= WAYWAL_UGC_STATE_INSTALLED;
                 }
-            } else if (ws_span_ieq(k, "state", 5u)) {
-                chosen_flags = (uint32_t)ws_parse_u64(v);
-                flags_prio = 3;
+            } else if (ws_span_ieq(k, "stateflags", 10u)) {
+                uint32_t parsed_flags = 0u;
+                if (ws_parse_u32_flags(v, &parsed_flags)) {
+                    chosen_flags = parsed_flags;
+                    flags_prio = 4;
+                }
+            } else if (flags_prio < 3 && ws_span_ieq(k, "state", 5u)) {
+                uint32_t parsed_flags = 0u;
+                if (ws_parse_u32_flags(v, &parsed_flags)) {
+                    chosen_flags = parsed_flags;
+                    flags_prio = 3;
+                }
             } else if (flags_prio < 2 && ws_span_ieq(k, "itemstate", 9u)) {
-                chosen_flags = (uint32_t)ws_parse_u64(v);
-                flags_prio = 2;
+                uint32_t parsed_flags = 0u;
+                if (ws_parse_u32_flags(v, &parsed_flags)) {
+                    chosen_flags = parsed_flags;
+                    flags_prio = 2;
+                }
             } else if (flags_prio < 1 && ws_span_ieq(k, "flags", 5u)) {
-                chosen_flags = (uint32_t)ws_parse_u64(v);
-                flags_prio = 1;
+                uint32_t parsed_flags = 0u;
+                if (ws_parse_u32_flags(v, &parsed_flags)) {
+                    chosen_flags = parsed_flags;
+                    flags_prio = 1;
+                }
             }
         }
 
@@ -1889,7 +1975,7 @@ bool waywal_appworkshop_parse_file(const char *manifest_path,
     }
     memset(out_manifest, 0, sizeof(*out_manifest));
 
-    int fd = open(manifest_path, O_RDONLY | O_CLOEXEC);
+    int fd = open(manifest_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         return false;
     }
@@ -1908,7 +1994,6 @@ bool waywal_appworkshop_parse_file(const char *manifest_path,
 
     const char *data = NULL;
     char *heap_buf = NULL;
-    void *mapped = MAP_FAILED;
     bool own_io = false;
 
     if (sz + 1u <= WS_IO_CACHE_MAX_CAP &&
@@ -1964,12 +2049,6 @@ bool waywal_appworkshop_parse_file(const char *manifest_path,
         }
     }
 
-    if (!data && sz >= 65536u) {
-        mapped = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mapped != MAP_FAILED) {
-            data = (const char *)mapped;
-        }
-    }
     if (!data) {
         heap_buf = (char *)malloc(sz + 1u);
         if (!heap_buf) {
@@ -2007,9 +2086,6 @@ bool waywal_appworkshop_parse_file(const char *manifest_path,
         if (own_io) {                                                                              \
             WS_ASAN_POISON(g_ws_io_buf, g_ws_io_cap);                                              \
             atomic_flag_clear_explicit(&g_ws_io_lock, memory_order_release);                       \
-        }                                                                                          \
-        if (mapped != MAP_FAILED) {                                                                \
-            munmap(mapped, (size_t)st.st_size);                                                    \
         }                                                                                          \
         free(heap_buf);                                                                            \
     } while (0)
@@ -2083,8 +2159,10 @@ bool waywal_appworkshop_parse_file(const char *manifest_path,
     if (tbl.count == 0u) {
         ws_release_items(tbl.items, tbl.cap);
         out_manifest->items = NULL;
+        out_manifest->items_capacity = 0u;
     } else {
         out_manifest->items = tbl.items;
+        out_manifest->items_capacity = tbl.cap;
     }
 
     return true;
@@ -2096,8 +2174,12 @@ void waywal_appworkshop_free(waywal_appworkshop_manifest_t *manifest)
         return;
     }
     if (manifest->items) {
-        ws_release_items(manifest->items, manifest->item_count);
+        size_t known_cap = manifest->items_capacity >= manifest->item_count
+                               ? manifest->items_capacity
+                               : manifest->item_count;
+        ws_release_items(manifest->items, known_cap);
         manifest->items = NULL;
     }
     manifest->item_count = 0;
+    manifest->items_capacity = 0;
 }

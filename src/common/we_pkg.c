@@ -5,6 +5,7 @@
 #include "waywal/we_pkg.h"
 
 #include "waywal/log.h"
+#include "waywal/os_compat.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -246,15 +247,15 @@ static bool parse_pkg_table_at(we_pkg_t *pkg, const uint8_t *data, size_t size, 
             uint32_t existing_idx = ht_slots[slot].entry_idx - 1u;
             if (ht_slots[slot].hash == h &&
                 strcmp(entries[existing_idx].path, entries[i].path) == 0) {
-                /* Overwrite duplicate entry with latest occurrence */
-                ht_slots[slot].entry_idx = i + 1u;
-                goto next_entry;
+                /* Reject duplicate normalized paths so iteration matches hash lookups. */
+                free(ht_slots);
+                free(entries);
+                return false;
             }
             slot = (slot + 1u) & mask;
         }
         ht_slots[slot].hash = h;
         ht_slots[slot].entry_idx = i + 1u;
-    next_entry:;
     }
 
     pkg->entry_count = entry_count;
@@ -267,12 +268,12 @@ static bool parse_pkg_table_at(we_pkg_t *pkg, const uint8_t *data, size_t size, 
 
 we_pkg_t *we_pkg_open_mem(const uint8_t *data, size_t size, const char *workshop_dir)
 {
-    if (!data || size < 15u) {
+    if (!data || size < 16u) {
         return NULL;
     }
 
     uint32_t magic_len = read_u32_le(data);
-    if (magic_len < 7u || magic_len > 16u || 4u + (size_t)magic_len + 4u > size) {
+    if ((magic_len != 8u && magic_len != 9u) || 4u + (size_t)magic_len + 4u > size) {
         return NULL;
     }
 
@@ -280,19 +281,15 @@ we_pkg_t *we_pkg_open_mem(const uint8_t *data, size_t size, const char *workshop
     if (memcmp(magic_ptr, "PKGV", 4u) != 0) {
         return NULL;
     }
-
-    char ver_str[16];
-    size_t copy_len = magic_len < 15u ? magic_len : 15u;
-    memcpy(ver_str, magic_ptr, copy_len);
-    ver_str[copy_len] = '\0';
-    while (copy_len > 0 && ver_str[copy_len - 1u] == '\0') {
-        ver_str[--copy_len] = '\0';
-    }
-
-    if (copy_len < 5u) {
+    if (magic_len == 9u && magic_ptr[8] != '\0') {
         return NULL;
     }
-    for (size_t i = 4u; i < copy_len; ++i) {
+
+    char ver_str[16];
+    memcpy(ver_str, magic_ptr, 8u);
+    ver_str[8] = '\0';
+
+    for (size_t i = 4u; i < 8u; ++i) {
         if (!isdigit((unsigned char)ver_str[i])) {
             return NULL;
         }
@@ -309,6 +306,7 @@ we_pkg_t *we_pkg_open_mem(const uint8_t *data, size_t size, const char *workshop
     pkg->base_ptr = data;
     pkg->mmap_size = size;
     pkg->is_mmapped = false;
+    pkg->owns_base_ptr = false;
     pkg->fd = -1;
     snprintf(pkg->version_magic, sizeof(pkg->version_magic), "%s", ver_str);
     pkg->version_num = ver_num;
@@ -316,15 +314,77 @@ we_pkg_t *we_pkg_open_mem(const uint8_t *data, size_t size, const char *workshop
 
     size_t table_cursor = 4u + (size_t)magic_len;
     if (!parse_pkg_table_at(pkg, data, size, table_cursor)) {
-        /* Handle optional trailing '\0' byte immediately after magic[magic_len] */
-        if (table_cursor < size && data[table_cursor] == '\0' &&
-            parse_pkg_table_at(pkg, data, size, table_cursor + 1u)) {
-            return pkg;
-        }
         free(pkg);
         return NULL;
     }
 
+    return pkg;
+}
+
+static we_pkg_t *pkg_open_from_fd(int fd, const char *pkg_path, const char *workshop_dir)
+{
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 16 ||
+        st.st_size > (1024LL * 1024LL * 1024LL)) {
+        close(fd);
+        return NULL;
+    }
+
+    size_t buf_sz = (size_t)st.st_size;
+    /* Copy into heap buffer so concurrent external file truncation cannot trigger SIGBUS. */
+    uint8_t *buf = (uint8_t *)malloc(buf_sz);
+    if (!buf) {
+        close(fd);
+        return NULL;
+    }
+
+    size_t total = 0u;
+    while (total < buf_sz) {
+        ssize_t r = read(fd, buf + total, buf_sz - total);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            free(buf);
+            close(fd);
+            return NULL;
+        }
+        if (r == 0) {
+            free(buf);
+            close(fd);
+            return NULL;
+        }
+        total += (size_t)r;
+    }
+    close(fd);
+
+    char derived_dir[4096] = {0};
+    if (!workshop_dir || workshop_dir[0] == '\0') {
+        if (pkg_path && pkg_path[0] != '\0') {
+            const char *slash = strrchr(pkg_path, '/');
+            if (slash) {
+                size_t dlen = (size_t)(slash - pkg_path);
+                if (dlen == 0) {
+                    dlen = 1u; /* Root "/" */
+                }
+                if (dlen < sizeof(derived_dir)) {
+                    memcpy(derived_dir, pkg_path, dlen);
+                    derived_dir[dlen] = '\0';
+                    workshop_dir = derived_dir;
+                }
+            } else {
+                memcpy(derived_dir, ".", 2u);
+                workshop_dir = derived_dir;
+            }
+        }
+    }
+
+    we_pkg_t *pkg = we_pkg_open_mem(buf, buf_sz, workshop_dir);
+    if (!pkg) {
+        free(buf);
+        return NULL;
+    }
+    pkg->owns_base_ptr = true;
     return pkg;
 }
 
@@ -334,60 +394,11 @@ we_pkg_t *we_pkg_open_file(const char *pkg_path, const char *workshop_dir)
         return NULL;
     }
 
-    int fd = open(pkg_path, O_RDONLY | O_CLOEXEC);
+    int fd = open(pkg_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         return NULL;
     }
-
-    struct stat st;
-    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 15 ||
-        st.st_size > (2LL * 1024LL * 1024LL * 1024LL)) {
-        close(fd);
-        return NULL;
-    }
-
-    size_t mmap_sz = (size_t)st.st_size;
-    void *mapped = mmap(NULL, mmap_sz, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) {
-        close(fd);
-        return NULL;
-    }
-
-    (void)madvise(mapped, mmap_sz, MADV_SEQUENTIAL);
-
-    char derived_dir[4096] = {0};
-    if (!workshop_dir || workshop_dir[0] == '\0') {
-        const char *slash = strrchr(pkg_path, '/');
-        if (slash) {
-            size_t dlen = (size_t)(slash - pkg_path);
-            if (dlen == 0) {
-                dlen = 1u; /* Root "/" */
-            }
-            if (dlen < sizeof(derived_dir)) {
-                memcpy(derived_dir, pkg_path, dlen);
-                derived_dir[dlen] = '\0';
-                workshop_dir = derived_dir;
-            }
-        } else {
-            memcpy(derived_dir, ".", 2u);
-            workshop_dir = derived_dir;
-        }
-    }
-
-    we_pkg_t *pkg = we_pkg_open_mem((const uint8_t *)mapped, mmap_sz, workshop_dir);
-    if (!pkg) {
-        munmap(mapped, mmap_sz);
-        close(fd);
-        return NULL;
-    }
-
-    /* Switch back from MADV_SEQUENTIAL after header table scan to avoid random-access readahead
-     * thrashing across large packed .tex/.mp4 payloads. */
-    (void)madvise(mapped, mmap_sz, MADV_NORMAL);
-
-    pkg->is_mmapped = true;
-    pkg->fd = fd;
-    return pkg;
+    return pkg_open_from_fd(fd, pkg_path, workshop_dir);
 }
 
 we_pkg_t *we_pkg_open_dir(const char *workshop_dir)
@@ -428,16 +439,20 @@ we_pkg_t *we_pkg_open_dir(const char *workshop_dir)
         return NULL;
     }
 
-    static const char *const pkg_names[] = {"scene.pkg", "gifscene.pkg"};
-    for (size_t i = 0; i < sizeof(pkg_names) / sizeof(pkg_names[0]); ++i) {
-        char candidate[4096];
-        int n = snprintf(candidate, sizeof(candidate), "%s/%s", workshop_dir, pkg_names[i]);
-        if (n > 0 && (size_t)n < sizeof(candidate) && access(candidate, R_OK) == 0) {
-            we_pkg_t *pkg = we_pkg_open_file(candidate, workshop_dir);
-            if (pkg) {
-                return pkg;
+    int ws_dfd = open(workshop_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (ws_dfd >= 0) {
+        static const char *const pkg_names[] = {"scene.pkg", "gifscene.pkg"};
+        for (size_t i = 0; i < sizeof(pkg_names) / sizeof(pkg_names[0]); ++i) {
+            int pfd = wwal_openat2_beneath(ws_dfd, pkg_names[i], O_RDONLY | O_NONBLOCK, 0);
+            if (pfd >= 0) {
+                we_pkg_t *pkg = pkg_open_from_fd(pfd, NULL, workshop_dir);
+                if (pkg) {
+                    close(ws_dfd);
+                    return pkg;
+                }
             }
         }
+        close(ws_dfd);
     }
 
     /* Unpacked / loose-file Workshop directory */
@@ -458,7 +473,9 @@ void we_pkg_close(we_pkg_t *pkg)
     }
     free(pkg->entries);
     free(pkg->ht_slots);
-    if (pkg->is_mmapped && pkg->base_ptr && pkg->mmap_size > 0) {
+    if (pkg->owns_base_ptr && pkg->base_ptr) {
+        free((void *)pkg->base_ptr);
+    } else if (pkg->is_mmapped && pkg->base_ptr && pkg->mmap_size > 0) {
         munmap((void *)pkg->base_ptr, pkg->mmap_size);
     }
     if (pkg->fd >= 0) {
@@ -506,68 +523,112 @@ const uint8_t *we_pkg_find(const we_pkg_t *pkg, const char *rel_path, size_t *ou
     return NULL;
 }
 
-static int open_case_insensitive_rel(const char *base_dir, const char *rel_path)
+static int open_case_insensitive_rel(int base_dfd, const char *rel_path)
 {
-    char cur_path[4096];
-    int n = snprintf(cur_path, sizeof(cur_path), "%s", base_dir);
-    if (n <= 0 || (size_t)n >= sizeof(cur_path)) {
+    if (base_dfd < 0 || !rel_path || rel_path[0] == '\0' || rel_path[0] == '/') {
+        return -1;
+    }
+
+    int cur_dfd = fcntl(base_dfd, F_DUPFD_CLOEXEC, 0);
+    if (cur_dfd < 0) {
         return -1;
     }
 
     const char *p = rel_path;
-    while (*p) {
-        while (*p == '/') {
-            p++;
-        }
-        if (!*p) {
-            break;
-        }
+    while (*p != '\0') {
         const char *seg_end = strchr(p, '/');
+        bool is_last = (seg_end == NULL);
         size_t seg_len = seg_end ? (size_t)(seg_end - p) : strlen(p);
-        if (seg_len == 0 || seg_len >= 256u) {
+        if (seg_len == 0u || seg_len >= 256u) {
+            close(cur_dfd);
             return -1;
         }
         char seg[256];
         memcpy(seg, p, seg_len);
         seg[seg_len] = '\0';
 
-        /* Fast exact match check for this component */
-        size_t cur_len = strlen(cur_path);
-        if (cur_len + 1u + seg_len >= sizeof(cur_path)) {
+        if (strcmp(seg, ".") == 0 || strcmp(seg, "..") == 0) {
+            close(cur_dfd);
             return -1;
         }
-        cur_path[cur_len] = '/';
-        memcpy(cur_path + cur_len + 1u, seg, seg_len + 1u);
 
-        if (access(cur_path, F_OK) != 0) {
-            /* Case-insensitive directory scan for component */
-            cur_path[cur_len] = '\0';
-            DIR *d = opendir(cur_path);
-            if (!d) {
+        if (is_last) {
+            int fd = openat(cur_dfd, seg, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+            if (fd >= 0 || errno != ENOENT) {
+                close(cur_dfd);
+                return fd;
+            }
+
+            /* Scan single directory level when exact-case filename is missing (never follows
+             * symlinks). */
+            int scan_dfd = fcntl(cur_dfd, F_DUPFD_CLOEXEC, 0);
+            if (scan_dfd < 0) {
+                close(cur_dfd);
                 return -1;
             }
-            bool matched = false;
+            DIR *d = fdopendir(scan_dfd);
+            if (!d) {
+                close(scan_dfd);
+                close(cur_dfd);
+                return -1;
+            }
             struct dirent *de;
             while ((de = readdir(d)) != NULL) {
+                if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+                    continue;
+                }
                 if (strcasecmp(de->d_name, seg) == 0) {
-                    size_t dname_len = strlen(de->d_name);
-                    if (cur_len + 1u + dname_len < sizeof(cur_path)) {
-                        cur_path[cur_len] = '/';
-                        memcpy(cur_path + cur_len + 1u, de->d_name, dname_len + 1u);
-                        matched = true;
+                    struct stat st;
+                    if (fstatat(cur_dfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                        S_ISREG(st.st_mode)) {
+                        fd = openat(cur_dfd, de->d_name,
+                                    O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
                     }
                     break;
                 }
             }
             closedir(d);
-            if (!matched) {
-                return -1;
+            close(cur_dfd);
+            return fd;
+        }
+
+        int next_dfd = openat(cur_dfd, seg, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next_dfd < 0 && errno == ENOENT) {
+            int scan_dfd = fcntl(cur_dfd, F_DUPFD_CLOEXEC, 0);
+            if (scan_dfd >= 0) {
+                DIR *d = fdopendir(scan_dfd);
+                if (d) {
+                    struct dirent *de;
+                    while ((de = readdir(d)) != NULL) {
+                        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+                            continue;
+                        }
+                        if (strcasecmp(de->d_name, seg) == 0) {
+                            struct stat st;
+                            if (fstatat(cur_dfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                                S_ISDIR(st.st_mode)) {
+                                next_dfd = openat(cur_dfd, de->d_name,
+                                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                            }
+                            break;
+                        }
+                    }
+                    closedir(d);
+                } else {
+                    close(scan_dfd);
+                }
             }
         }
-        p += seg_len;
+        close(cur_dfd);
+        if (next_dfd < 0) {
+            return -1;
+        }
+        cur_dfd = next_dfd;
+        p = seg_end + 1;
     }
 
-    return open(cur_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    close(cur_dfd);
+    return -1;
 }
 
 static uint8_t *read_loose_file_with_case(const char *base_dir, const char *norm_rel,
@@ -577,22 +638,21 @@ static uint8_t *read_loose_file_with_case(const char *base_dir, const char *norm
         return NULL;
     }
 
-    char full_path[4096];
-    int n = snprintf(full_path, sizeof(full_path), "%s/%s", base_dir, norm_rel);
-    if (n <= 0 || (size_t)n >= sizeof(full_path)) {
+    int base_dfd = open(base_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (base_dfd < 0) {
         return NULL;
     }
 
-    int fd = open(full_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0 && case_rel && case_rel[0] != '\0' && strcmp(case_rel, norm_rel) != 0) {
-        n = snprintf(full_path, sizeof(full_path), "%s/%s", base_dir, case_rel);
-        if (n > 0 && (size_t)n < sizeof(full_path)) {
-            fd = open(full_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-        }
+    int fd = wwal_openat2_beneath(base_dfd, norm_rel, O_RDONLY | O_NONBLOCK, 0);
+    if (fd < 0 && (errno == ENOENT || errno == ENOTDIR) && case_rel && case_rel[0] != '\0' &&
+        strcmp(case_rel, norm_rel) != 0) {
+        fd = wwal_openat2_beneath(base_dfd, case_rel, O_RDONLY | O_NONBLOCK, 0);
     }
-    if (fd < 0) {
-        fd = open_case_insensitive_rel(base_dir, case_rel && case_rel[0] ? case_rel : norm_rel);
+    if (fd < 0 && errno == ENOENT) {
+        const char *fallback_rel = (case_rel && case_rel[0] != '\0') ? case_rel : norm_rel;
+        fd = open_case_insensitive_rel(base_dfd, fallback_rel);
     }
+    close(base_dfd);
     if (fd < 0) {
         return NULL;
     }

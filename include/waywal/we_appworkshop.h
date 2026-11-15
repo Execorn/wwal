@@ -43,6 +43,7 @@ typedef struct {
     uint64_t time_last_updated;
     uint64_t time_last_app_check;
     size_t item_count;
+    size_t items_capacity;
     waywal_workshop_item_manifest_t *items;
 } waywal_appworkshop_manifest_t;
 

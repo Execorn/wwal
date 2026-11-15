@@ -4,6 +4,8 @@
 #endif
 
 #include <assert.h>
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,7 +15,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "waywal/os_compat.h"
 #include "waywal/we_appworkshop.h"
+#include "waywal/we_asset_writer.h"
+#include "waywal/we_pkg.h"
+#include "waywal/we_project.h"
 #include "waywal/we_vdf.h"
 
 static void test_vdf_basic_kv(void)
@@ -814,6 +820,533 @@ static void test_vdf_avx2_boundary_spans(void)
     printf("  -> Passed.\n");
 }
 
+static void vdf_test_rm_rf(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) {
+        unlink(path);
+        return;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        char child[4096];
+        snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+        struct stat st;
+        if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+            vdf_test_rm_rf(child);
+        } else {
+            unlink(child);
+        }
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+static void vdf_write_exact(const char *path, const void *buf, size_t len)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    assert(fd >= 0);
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t off = 0u;
+    while (off < len) {
+        ssize_t n = write(fd, p + off, len - off);
+        assert(n > 0);
+        off += (size_t)n;
+    }
+    close(fd);
+}
+
+static void test_os_compat_openat2_beneath(void)
+{
+    printf("[VDF 20/25] Testing wwal_openat2_beneath confinement, mode & rejections...\n");
+
+    char root_tmpl[] = "/dev/shm/wwal_openat2_XXXXXX";
+    char *root = mkdtemp(root_tmpl);
+    assert(root != NULL);
+
+    char out_tmpl[] = "/dev/shm/wwal_openat2_out_XXXXXX";
+    char *outside = mkdtemp(out_tmpl);
+    assert(outside != NULL);
+
+    char sub_dir[512], valid_file[512], out_file[512], link_sub[512], link_esc[512];
+    snprintf(sub_dir, sizeof(sub_dir), "%s/sub", root);
+    snprintf(valid_file, sizeof(valid_file), "%s/sub/wall..png", root);
+    snprintf(out_file, sizeof(out_file), "%s/secret.txt", outside);
+    snprintf(link_sub, sizeof(link_sub), "%s/link_sub", root);
+    snprintf(link_esc, sizeof(link_esc), "%s/link_escape", root);
+
+    assert(mkdir(sub_dir, 0755) == 0);
+    vdf_write_exact(valid_file, "PNG_OK", 6u);
+    vdf_write_exact(out_file, "OUTSIDE", 7u);
+    assert(symlink("sub", link_sub) == 0);
+    assert(symlink(out_file, link_esc) == 0);
+
+    int dfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    assert(dfd >= 0);
+
+    /* Valid relative path with embedded double-dot filename must succeed */
+    int rfd = wwal_openat2_beneath(dfd, "sub/wall..png", O_RDONLY | O_CLOEXEC, 0);
+    assert(rfd >= 0);
+    char rbuf[16] = {0};
+    assert(read(rfd, rbuf, sizeof(rbuf) - 1u) == 6);
+    assert(strcmp(rbuf, "PNG_OK") == 0);
+    close(rfd);
+
+    /* Invalid dirfd, empty/NULL paths, traversal, dot, trailing slash & symlinks must fail */
+    assert(wwal_openat2_beneath(-1, "sub/wall..png", O_RDONLY, 0) < 0 && errno == EBADF);
+    assert(wwal_openat2_beneath(dfd, NULL, O_RDONLY, 0) < 0);
+    assert(wwal_openat2_beneath(dfd, "", O_RDONLY, 0) < 0);
+    assert(wwal_openat2_beneath(dfd, "/etc/hostname", O_RDONLY, 0) < 0);
+    assert(wwal_openat2_beneath(dfd, ".", O_RDONLY | O_DIRECTORY, 0) < 0);
+    assert(wwal_openat2_beneath(dfd, "./sub/wall..png", O_RDONLY, 0) < 0);
+    assert(wwal_openat2_beneath(dfd, "sub/.", O_RDONLY | O_DIRECTORY, 0) < 0);
+    assert(wwal_openat2_beneath(dfd, "../outside", O_RDONLY, 0) < 0);
+    assert(wwal_openat2_beneath(dfd, "sub/../../outside", O_RDONLY, 0) < 0);
+    assert(wwal_openat2_beneath(dfd, "sub/", O_RDONLY | O_DIRECTORY, 0) < 0);
+    assert(wwal_openat2_beneath(dfd, "link_sub/wall..png", O_RDONLY, 0) < 0);
+    assert(wwal_openat2_beneath(dfd, "link_escape", O_RDONLY, 0) < 0);
+
+    /* Explicit mode parameter for O_CREAT */
+    mode_t old_umask = umask(0022);
+    int cfd =
+        wwal_openat2_beneath(dfd, "sub/created.bin", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0640);
+    umask(old_umask);
+    assert(cfd >= 0);
+    struct stat cst;
+    assert(fstat(cfd, &cst) == 0);
+    assert((cst.st_mode & 0777) == 0640);
+    close(cfd);
+
+    /* Explicit mode parameter for O_TMPFILE when supported by /dev/shm tmpfs */
+    int tfd = wwal_openat2_beneath(dfd, "sub", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+    if (tfd >= 0) {
+        struct stat tst;
+        assert(fstat(tfd, &tst) == 0);
+        assert(tst.st_nlink == 0);
+        assert((tst.st_mode & 0700) == 0600);
+        close(tfd);
+    } else {
+        assert(errno == ENOTSUP || errno == EOPNOTSUPP);
+    }
+
+    close(dfd);
+    vdf_test_rm_rf(root);
+    vdf_test_rm_rf(outside);
+    printf("  -> Passed.\n");
+}
+
+static void test_appworkshop_u64_ids_and_stateflags(void)
+{
+    printf("[VDF 21/25] Testing >16-digit IDs/manifests, StateFlags priority & overflow...\n");
+
+    char dir_tmpl[] = "/dev/shm/wwal_ws_u64_XXXXXX";
+    char *dir = mkdtemp(dir_tmpl);
+    assert(dir != NULL);
+
+    char small_path[512];
+    snprintf(small_path, sizeof(small_path), "%s/small.acf", dir);
+    const char *small_acf =
+        "\"AppWorkshop\"\n{\n\t\"appid\"\t\"431960\"\n\t\"WorkshopItemsInstalled\"\n\t{\n"
+        "\t\t\"1844674407370955161\"\n\t\t{\n\t\t\t\"size\"\t\"123\"\n"
+        "\t\t\t\"manifest\"\t\"18446744073709551610\"\n\t\t}\n"
+        "\t\t\"18446744073709551614\"\n\t\t{\n\t\t\t\"size\"\t\"456\"\n"
+        "\t\t\t\"manifest\"\t\"99\"\n\t\t}\n\t}\n"
+        "\t\"WorkshopItemDetails\"\n\t{\n"
+        "\t\t\"1844674407370955161\"\n\t\t{\n\t\t\t\"state\"\t\"4\"\n"
+        "\t\t\t\"StateFlags\"\t\"36\"\n\t\t\t\"itemstate\"\t\"1\"\n\t\t\t\"flags\"\t\"2\"\n"
+        "\t\t}\n"
+        "\t\t\"18446744073709551614\"\n\t\t{\n\t\t\t\"state\"\t\"4\"\n"
+        "\t\t\t\"StateFlags\"\t\"4294967296\"\n\t\t\t\"flags\"\t\"2\"\n\t\t}\n\t}\n}\n";
+    vdf_write_exact(small_path, small_acf, strlen(small_acf));
+
+    waywal_appworkshop_manifest_t sm;
+    assert(waywal_appworkshop_parse_file(small_path, &sm));
+    assert(sm.item_count == 2u);
+    assert(sm.items[0].published_file_id == 1844674407370955161ULL);
+    assert(sm.items[0].manifest_id == 18446744073709551610ULL);
+    assert(sm.items[0].state_flags == 36u);
+    assert(sm.items[1].published_file_id == 18446744073709551614ULL);
+    /* Overflowed StateFlags=4294967296 (>UINT32_MAX) must not overwrite valid state=4. */
+    assert(sm.items[1].state_flags == 4u);
+    waywal_appworkshop_free(&sm);
+
+    /* Parallel SIMD path (> 262 KiB) with 19/20-digit IDs, manifests, and StateFlags priority */
+    const size_t n_items = 2200u;
+    size_t cap = 600u * 1024u;
+    char *big = (char *)malloc(cap);
+    assert(big != NULL);
+    size_t off = (size_t)snprintf(
+        big, cap,
+        "\"AppWorkshop\"\n{\n\t\"appid\"\t\"431960\"\n\t\"WorkshopItemsInstalled\"\n\t{\n");
+    for (size_t i = 0; i < n_items; i++) {
+        uint64_t id = (i == 0u) ? 18446744073709551614ULL : (2800000000ULL + (uint64_t)i * 7919ULL);
+        uint64_t man = (i == 0u) ? 18446744073709551610ULL : (900000000ULL + (uint64_t)i);
+        off += (size_t)snprintf(big + off, cap - off,
+                                "\t\t\"%llu\"\n\t\t{\n\t\t\t\"size\"\t\"512\"\n"
+                                "\t\t\t\"timeupdated\"\t\"1710000000\"\n"
+                                "\t\t\t\"manifest\"\t\"%llu\"\n\t\t}\n",
+                                (unsigned long long)id, (unsigned long long)man);
+    }
+    off += (size_t)snprintf(big + off, cap - off, "\t}\n\t\"WorkshopItemDetails\"\n\t{\n");
+    for (size_t i = 0; i < n_items; i++) {
+        uint64_t id = (i == 0u) ? 18446744073709551614ULL : (2800000000ULL + (uint64_t)i * 7919ULL);
+        if (i == 0u) {
+            off += (size_t)snprintf(big + off, cap - off,
+                                    "\t\t\"%llu\"\n\t\t{\n\t\t\t\"StateFlags\"\t\"36\"\n"
+                                    "\t\t\t\"state\"\t\"4\"\n\t\t\t\"itemstate\"\t\"1\"\n"
+                                    "\t\t\t\"flags\"\t\"2\"\n\t\t}\n",
+                                    (unsigned long long)id);
+        } else {
+            off += (size_t)snprintf(big + off, cap - off,
+                                    "\t\t\"%llu\"\n\t\t{\n\t\t\t\"subscribedbyuser\"\t\"1\"\n"
+                                    "\t\t\t\"state\"\t\"4\"\n\t\t}\n",
+                                    (unsigned long long)id);
+        }
+    }
+    off += (size_t)snprintf(big + off, cap - off, "\t}\n}\n");
+    assert(off > 262144u);
+
+    char big_path[512];
+    snprintf(big_path, sizeof(big_path), "%s/big.acf", dir);
+    vdf_write_exact(big_path, big, off);
+    free(big);
+
+    waywal_appworkshop_manifest_t bm;
+    assert(waywal_appworkshop_parse_file(big_path, &bm));
+    assert(bm.item_count == n_items);
+    bool found_u64 = false;
+    for (size_t i = 0; i < bm.item_count; i++) {
+        if (bm.items[i].published_file_id == 18446744073709551614ULL) {
+            assert(bm.items[i].manifest_id == 18446744073709551610ULL);
+            assert(bm.items[i].state_flags == 36u);
+            found_u64 = true;
+            break;
+        }
+    }
+    assert(found_u64);
+    waywal_appworkshop_free(&bm);
+
+    vdf_test_rm_rf(dir);
+    printf("  -> Passed.\n");
+}
+
+static void test_vdf_malformed_and_toml_sections(void)
+{
+    printf("[VDF 22/25] Testing VDF trailing-brace/unquoted errors & TOML [daemon] gating...\n");
+
+    const char *unterm = "\"Root\"\n{\n\t\"k\"\t\"unterminated\n}\n";
+    assert(waywal_vdf_parse(unterm, strlen(unterm)) == NULL);
+
+    const char *extra_brace = "\"Root\"\n{\n\t\"k\"\t\"v\"\n}\n}\n";
+    assert(waywal_vdf_parse(extra_brace, strlen(extra_brace)) == NULL);
+
+    const char *unclosed = "\"Root\"\n{\n\t\"k\"\t\"v\"\n";
+    assert(waywal_vdf_parse(unclosed, strlen(unclosed)) == NULL);
+
+    char root_tmpl[] = "/dev/shm/wwal_toml_XXXXXX";
+    char *root = mkdtemp(root_tmpl);
+    assert(root != NULL);
+
+    char cfg_home[512], dot_cfg[512], waywal_cfg_dir[512], fake_home[512];
+    char bad1[512], bad2[512], good[512], mk[1024], toml_path[1024];
+    snprintf(cfg_home, sizeof(cfg_home), "%s/cfg", root);
+    snprintf(fake_home, sizeof(fake_home), "%s/home", root);
+    snprintf(dot_cfg, sizeof(dot_cfg), "%s/.config", fake_home);
+    snprintf(waywal_cfg_dir, sizeof(waywal_cfg_dir), "%s/waywal", dot_cfg);
+    snprintf(bad1, sizeof(bad1), "%s/bad_before", root);
+    snprintf(bad2, sizeof(bad2), "%s/bad_after", root);
+    snprintf(good, sizeof(good), "%s/good_lib", root);
+
+    assert(mkdir(cfg_home, 0755) == 0);
+    assert(mkdir(fake_home, 0755) == 0);
+    assert(mkdir(dot_cfg, 0755) == 0);
+    assert(mkdir(waywal_cfg_dir, 0755) == 0);
+    const char *lib_bases[3] = {bad1, bad2, good};
+    for (int i = 0; i < 3; i++) {
+        assert(mkdir(lib_bases[i], 0755) == 0);
+        snprintf(mk, sizeof(mk), "%s/steamapps", lib_bases[i]);
+        assert(mkdir(mk, 0755) == 0);
+        snprintf(mk, sizeof(mk), "%s/steamapps/workshop", lib_bases[i]);
+        assert(mkdir(mk, 0755) == 0);
+        snprintf(mk, sizeof(mk), "%s/steamapps/workshop/content", lib_bases[i]);
+        assert(mkdir(mk, 0755) == 0);
+        snprintf(mk, sizeof(mk), "%s/steamapps/workshop/content/431960", lib_bases[i]);
+        assert(mkdir(mk, 0755) == 0);
+    }
+
+    char toml_buf[2048];
+    snprintf(toml_buf, sizeof(toml_buf),
+             "[other]\nworkshop_dir = \"%s\"\n\n[daemon]\nworkshop_dir = \"%s\"\n\n"
+             "[trailing]\nworkshop_dir = \"%s\"\n",
+             bad1, good, bad2);
+    snprintf(toml_path, sizeof(toml_path), "%s/config.toml", waywal_cfg_dir);
+    vdf_write_exact(toml_path, toml_buf, strlen(toml_buf));
+
+    const char *old_home_env = getenv("HOME");
+    const char *old_xdg_env = getenv("XDG_CONFIG_HOME");
+    char *saved_home = old_home_env ? strdup(old_home_env) : NULL;
+    char *saved_xdg = old_xdg_env ? strdup(old_xdg_env) : NULL;
+
+    assert(setenv("HOME", fake_home, 1) == 0);
+    assert(setenv("XDG_CONFIG_HOME", dot_cfg, 1) == 0);
+
+    waywal_steam_library_t libs[16];
+    memset(libs, 0, sizeof(libs));
+    size_t nlibs = waywal_steam_discover_libraries(libs, 16u);
+    bool saw_good = false;
+    bool saw_bad = false;
+    for (size_t i = 0; i < nlibs; i++) {
+        if (strcmp(libs[i].path, good) == 0) {
+            saw_good = true;
+        }
+        if (strcmp(libs[i].path, bad1) == 0 || strcmp(libs[i].path, bad2) == 0) {
+            saw_bad = true;
+        }
+    }
+
+    if (saved_home) {
+        setenv("HOME", saved_home, 1);
+        free(saved_home);
+    } else {
+        unsetenv("HOME");
+    }
+    if (saved_xdg) {
+        setenv("XDG_CONFIG_HOME", saved_xdg, 1);
+        free(saved_xdg);
+    } else {
+        unsetenv("XDG_CONFIG_HOME");
+    }
+
+    assert(saw_good);
+    assert(!saw_bad);
+    vdf_test_rm_rf(root);
+    printf("  -> Passed.\n");
+}
+
+static void test_project_reuse_and_workshop_hash_dedup(void)
+{
+    printf("[VDF 23/25] Testing we_project_parse reuse & O(N) workshop scan/preview dedup...\n");
+
+    we_project_t proj;
+    snprintf(proj.workshop_id, sizeof(proj.workshop_id), "999999");
+    snprintf(proj.workshop_dir, sizeof(proj.workshop_dir), "/stale/dir");
+    const char *proj_a =
+        "{\"title\":\"Item A\",\"type\":\"web\",\"file\":\"a.html\","
+        "\"preview\":\"prev.png\",\"general\":{\"properties\":{\"gain\":{\"type\":\"slider\","
+        "\"value\":1.5}}}}";
+    assert(we_project_parse(proj_a, strlen(proj_a), &proj));
+    assert(proj.prop_count == 1u);
+    assert(strcmp(proj.preview, "prev.png") == 0);
+    assert(proj.workshop_id[0] == '\0');
+    assert(proj.workshop_dir[0] == '\0');
+
+    snprintf(proj.workshop_id, sizeof(proj.workshop_id), "888888");
+    const char *proj_b = "{\"title\":\"Item B\"}";
+    assert(we_project_parse(proj_b, strlen(proj_b), &proj));
+    assert(strcmp(proj.title, "Item B") == 0);
+    assert(proj.prop_count == 0u);
+    assert(proj.workshop_id[0] == '\0');
+    assert(strcmp(proj.preview, "preview.jpg") == 0);
+    assert(strcmp(proj.file, "scene.json") == 0);
+    assert(strcmp(proj.type, "scene") == 0);
+
+    char root_tmpl[] = "/dev/shm/wwal_ws_dedup_XXXXXX";
+    char *root = mkdtemp(root_tmpl);
+    assert(root != NULL);
+
+    char fake_home[512], fake_cfg[512], sync_dir[512], mk[1024];
+    snprintf(fake_home, sizeof(fake_home), "%s/home", root);
+    snprintf(fake_cfg, sizeof(fake_cfg), "%s/cfg", root);
+    snprintf(sync_dir, sizeof(sync_dir), "%s/previews", root);
+    assert(mkdir(fake_home, 0755) == 0);
+    assert(mkdir(fake_cfg, 0755) == 0);
+    assert(mkdir(sync_dir, 0755) == 0);
+
+    const char *steam_dirs[] = {".local",
+                                ".local/share",
+                                ".local/share/Steam",
+                                ".local/share/Steam/steamapps",
+                                ".local/share/Steam/steamapps/workshop",
+                                ".local/share/Steam/steamapps/workshop/content",
+                                ".local/share/Steam/steamapps/workshop/content/431960",
+                                ".steam"};
+    for (size_t i = 0; i < sizeof(steam_dirs) / sizeof(steam_dirs[0]); i++) {
+        snprintf(mk, sizeof(mk), "%s/%s", fake_home, steam_dirs[i]);
+        assert(mkdir(mk, 0755) == 0);
+    }
+
+    char target_steam[1024], link1[1024], link2[1024];
+    snprintf(target_steam, sizeof(target_steam), "%s/.local/share/Steam", fake_home);
+    snprintf(link1, sizeof(link1), "%s/.steam/steam", fake_home);
+    snprintf(link2, sizeof(link2), "%s/.steam/root", fake_home);
+    assert(symlink(target_steam, link1) == 0);
+    assert(symlink(target_steam, link2) == 0);
+
+    const size_t n_items = 128u;
+    for (size_t i = 0; i < n_items; i++) {
+        char idir[1024], pjson[1024], pprev[1024], body[256];
+        snprintf(idir, sizeof(idir), "%s/steamapps/workshop/content/431960/%zu", target_steam,
+                 100000u + i);
+        assert(mkdir(idir, 0755) == 0);
+        snprintf(pjson, sizeof(pjson), "%s/project.json", idir);
+        snprintf(pprev, sizeof(pprev), "%s/preview.png", idir);
+        snprintf(body, sizeof(body),
+                 "{\"title\":\"Dedup_%zu\",\"type\":\"scene\",\"preview\":\"preview.png\"}", i);
+        vdf_write_exact(pjson, body, strlen(body));
+        vdf_write_exact(pprev, "\x89PNG\r\n\x1a\n", 8u);
+    }
+
+    const char *old_home_env = getenv("HOME");
+    const char *old_xdg_env = getenv("XDG_CONFIG_HOME");
+    char *saved_home = old_home_env ? strdup(old_home_env) : NULL;
+    char *saved_xdg = old_xdg_env ? strdup(old_xdg_env) : NULL;
+    assert(setenv("HOME", fake_home, 1) == 0);
+    assert(setenv("XDG_CONFIG_HOME", fake_cfg, 1) == 0);
+
+    we_project_t *items = NULL;
+    size_t count = 0u;
+    assert(we_workshop_scan_all(&items, &count));
+    assert(count == n_items);
+    free(items);
+
+    size_t synced = 0u, pruned = 0u;
+    assert(we_workshop_sync_previews(sync_dir, &synced, &pruned));
+    assert(synced == n_items);
+    assert(pruned == 0u);
+
+    char del_item[1024], stale_link[1024];
+    snprintf(del_item, sizeof(del_item), "%s/steamapps/workshop/content/431960/100000",
+             target_steam);
+    vdf_test_rm_rf(del_item);
+    snprintf(stale_link, sizeof(stale_link), "%s/stale_orphan.png", sync_dir);
+    assert(symlink("/dev/null/nonexistent_target", stale_link) == 0);
+
+    assert(we_workshop_sync_previews(sync_dir, &synced, &pruned));
+    assert(synced == n_items - 1u);
+    assert(pruned == 2u);
+
+    if (saved_home) {
+        setenv("HOME", saved_home, 1);
+        free(saved_home);
+    } else {
+        unsetenv("HOME");
+    }
+    if (saved_xdg) {
+        setenv("XDG_CONFIG_HOME", saved_xdg, 1);
+        free(saved_xdg);
+    } else {
+        unsetenv("XDG_CONFIG_HOME");
+    }
+
+    vdf_test_rm_rf(root);
+    printf("  -> Passed.\n");
+}
+
+static void test_pkg_duplicate_and_symlink_hardening(void)
+{
+    printf("[VDF 24/25] Testing we_pkg duplicate entry rejection & symlink dir safety...\n");
+
+    uint8_t dup_pkg[128];
+    size_t c = 0u;
+    uint32_t mlen = 8u;
+    memcpy(dup_pkg + c, &mlen, 4u);
+    c += 4u;
+    memcpy(dup_pkg + c, "PKGV0001", 8u);
+    c += 8u;
+    uint32_t ec = 2u;
+    memcpy(dup_pkg + c, &ec, 4u);
+    c += 4u;
+    for (uint32_t e = 0; e < 2u; e++) {
+        uint32_t plen = 10u;
+        uint32_t off = e * 2u;
+        uint32_t sz = 2u;
+        memcpy(dup_pkg + c, &plen, 4u);
+        c += 4u;
+        memcpy(dup_pkg + c, "scene.json", 10u);
+        c += 10u;
+        memcpy(dup_pkg + c, &off, 4u);
+        c += 4u;
+        memcpy(dup_pkg + c, &sz, 4u);
+        c += 4u;
+    }
+    memcpy(dup_pkg + c, "{}", 2u);
+    c += 2u;
+    memcpy(dup_pkg + c, "{}", 2u);
+    c += 2u;
+    assert(we_pkg_open_mem(dup_pkg, c, NULL) == NULL);
+
+    char dir_tmpl[] = "/dev/shm/wwal_pkg_sym_XXXXXX";
+    char *dir = mkdtemp(dir_tmpl);
+    assert(dir != NULL);
+    char real_scene[512], link_evil[512];
+    snprintf(real_scene, sizeof(real_scene), "%s/scene.json", dir);
+    snprintf(link_evil, sizeof(link_evil), "%s/evil.json", dir);
+    vdf_write_exact(real_scene, "{\"ok\":true}", 11u);
+    assert(symlink("/etc/hostname", link_evil) == 0);
+
+    we_pkg_t *pkg = we_pkg_open_dir(dir);
+    assert(pkg != NULL);
+    size_t out_sz = 0u;
+    bool owned = false;
+    const uint8_t *ok_buf = we_pkg_resolve(pkg, "scene.json", &out_sz, &owned);
+    assert(ok_buf != NULL && out_sz == 11u);
+    if (owned) {
+        free((void *)(uintptr_t)ok_buf);
+    }
+    owned = false;
+    assert(we_pkg_resolve(pkg, "evil.json", &out_sz, &owned) == NULL);
+    we_pkg_close(pkg);
+
+    vdf_test_rm_rf(dir);
+    printf("  -> Passed.\n");
+}
+
+static void test_asset_writer_atomic_and_symlink(void)
+{
+    printf("[VDF 25/25] Testing we_write_file_atomic replace & symlink non-following...\n");
+
+    char dir_tmpl[] = "/dev/shm/wwal_atomic_XXXXXX";
+    char *dir = mkdtemp(dir_tmpl);
+    assert(dir != NULL);
+
+    char target[512], victim[512], sym_target[512];
+    snprintf(target, sizeof(target), "%s/output.dat", dir);
+    snprintf(victim, sizeof(victim), "%s/victim.dat", dir);
+    snprintf(sym_target, sizeof(sym_target), "%s/sym_out.dat", dir);
+
+    we_asset_writer_err_t err = WE_WRITER_OK;
+    assert(we_write_file_atomic(target, "FIRST", 5u, &err) && err == WE_WRITER_OK);
+    assert(we_write_file_atomic(target, "SECOND_LONGER", 13u, &err) && err == WE_WRITER_OK);
+
+    int fd = open(target, O_RDONLY | O_CLOEXEC);
+    assert(fd >= 0);
+    char buf[32] = {0};
+    assert(read(fd, buf, sizeof(buf) - 1u) == 13);
+    assert(strcmp(buf, "SECOND_LONGER") == 0);
+    close(fd);
+
+    vdf_write_exact(victim, "PRESERVED", 9u);
+    assert(symlink(victim, sym_target) == 0);
+    assert(!we_write_file_atomic(sym_target, "REPLACED", 8u, &err));
+    assert(err == WE_WRITER_ERR_INVALID_PATH);
+
+    struct stat st;
+    assert(lstat(sym_target, &st) == 0);
+    assert(S_ISLNK(st.st_mode));
+    int vfd = open(victim, O_RDONLY | O_CLOEXEC);
+    assert(vfd >= 0);
+    memset(buf, 0, sizeof(buf));
+    assert(read(vfd, buf, sizeof(buf) - 1u) == 9);
+    assert(strcmp(buf, "PRESERVED") == 0);
+    close(vfd);
+
+    vdf_test_rm_rf(dir);
+    printf("  -> Passed.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -839,9 +1372,15 @@ int main(void)
     test_appworkshop_large_fallback_edges();
     test_appworkshop_compact_parallel_18k_no_hang();
     test_vdf_avx2_boundary_spans();
+    test_os_compat_openat2_beneath();
+    test_appworkshop_u64_ids_and_stateflags();
+    test_vdf_malformed_and_toml_sections();
+    test_project_reuse_and_workshop_hash_dedup();
+    test_pkg_duplicate_and_symlink_hardening();
+    test_asset_writer_atomic_and_symlink();
 
     printf("==========================================================\n");
-    printf("  >>> ALL 19 VDF & MANIFEST TESTS PASSED CLEANLY (100%%) <<<\n");
+    printf("  >>> ALL 25 VDF & MANIFEST TESTS PASSED CLEANLY (100%%) <<<\n");
     printf("==========================================================\n");
 
     return 0;
