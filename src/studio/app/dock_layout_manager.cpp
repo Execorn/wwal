@@ -8,7 +8,6 @@
 #include <QStandardPaths>
 #include <QDebug>
 #include <QStyle>
-#include <QApplication>
 #include <QSplitter>
 #include <QSplitterHandle>
 #include <QPointer>
@@ -16,7 +15,14 @@
 #include <QTabWidget>
 #include <QTimer>
 #include <QEvent>
+#include <QChildEvent>
 #include <QShowEvent>
+#include <QMenuBar>
+#include <QToolBar>
+#include <QStatusBar>
+#include <QFontMetrics>
+#include <QGuiApplication>
+#include <QScreen>
 #include <algorithm>
 #include <cmath>
 #include <utility>
@@ -24,6 +30,21 @@
 namespace waywal::studio {
 
 namespace {
+
+class LayoutApplyGuard {
+  public:
+    explicit LayoutApplyGuard(bool &flag) : m_flag(flag), m_previous(flag) { m_flag = true; }
+    ~LayoutApplyGuard() { m_flag = m_previous; }
+
+    LayoutApplyGuard(const LayoutApplyGuard &) = delete;
+    LayoutApplyGuard &operator=(const LayoutApplyGuard &) = delete;
+
+  private:
+    bool &m_flag;
+    bool m_previous;
+};
+
+} // namespace
 
 /**
  * @brief Lightweight host widget that defers constructing heavy authoring docks until shown.
@@ -92,8 +113,6 @@ class LazyPanelHost final : public QWidget {
     QWidget *m_realizedWidget{nullptr};
 };
 
-} // namespace
-
 /* ========================================================================= */
 /* StudioDockTitleBar Implementation                                         */
 /* ========================================================================= */
@@ -103,11 +122,16 @@ StudioDockTitleBar::StudioDockTitleBar(const QString &title, QDockWidget *parent
     : QWidget(parent), m_parentDock(parentDock)
 {
     setObjectName(QStringLiteral("StudioDockTitleBar"));
-    setFixedHeight(28);
+    setAccessibleName(title);
+
+    const QFontMetrics fm(font());
+    const int btnHeight = std::max(24, fm.height() + 8);
+    const int barHeight = std::max(30, btnHeight + 6);
+    setMinimumHeight(barHeight);
 
     auto *layout = new QHBoxLayout(this);
     layout->setContentsMargins(10, 2, 8, 2);
-    layout->setSpacing(8);
+    layout->setSpacing(6);
 
     // Title label
     m_titleLabel = new QLabel(title, this);
@@ -119,13 +143,16 @@ StudioDockTitleBar::StudioDockTitleBar(const QString &title, QDockWidget *parent
     // Float / Detach button
     m_floatButton = new QToolButton(this);
     m_floatButton->setObjectName(QStringLiteral("DockFloatButton"));
+    m_floatButton->setAccessibleName(QStringLiteral("Toggle floating panel"));
     m_floatButton->setToolTip(QStringLiteral("Detach into floating window"));
     m_floatButton->setText(QStringLiteral("Float"));
-    m_floatButton->setFixedHeight(20);
+    m_floatButton->setFocusPolicy(Qt::StrongFocus);
+    m_floatButton->setMinimumSize(24, btnHeight);
     m_floatButton->setStyleSheet(QStringLiteral(
-        "QToolButton { background: transparent; border: none; color: #94a3b8; font-size: 10px; "
-        "padding: 2px 6px; border-radius: 3px; }"
-        "QToolButton:hover { background: #262c3a; color: #f8fafc; }"));
+        "QToolButton { background: transparent; border: 1px solid transparent; color: #cbd5e1; "
+        "font-size: 11px; padding: 2px 8px; border-radius: 3px; }"
+        "QToolButton:hover { background: #262c3a; color: #f8fafc; }"
+        "QToolButton:focus { border: 1px solid #38bdf8; background: #1e293b; color: #f8fafc; }"));
     connect(m_floatButton, &QToolButton::clicked, this, [this]() {
         if (m_parentDock) {
             m_parentDock->setFloating(!m_parentDock->isFloating());
@@ -137,13 +164,16 @@ StudioDockTitleBar::StudioDockTitleBar(const QString &title, QDockWidget *parent
     // Close button
     m_closeButton = new QToolButton(this);
     m_closeButton->setObjectName(QStringLiteral("DockCloseButton"));
+    m_closeButton->setAccessibleName(QStringLiteral("Hide panel"));
     m_closeButton->setToolTip(QStringLiteral("Hide panel"));
     m_closeButton->setText(QStringLiteral("Hide"));
-    m_closeButton->setFixedHeight(20);
+    m_closeButton->setFocusPolicy(Qt::StrongFocus);
+    m_closeButton->setMinimumSize(24, btnHeight);
     m_closeButton->setStyleSheet(QStringLiteral(
-        "QToolButton { background: transparent; border: none; color: #94a3b8; font-size: 10px; "
-        "padding: 2px 6px; border-radius: 3px; }"
-        "QToolButton:hover { background: #7f1d1d; color: #ffffff; }"));
+        "QToolButton { background: transparent; border: 1px solid transparent; color: #cbd5e1; "
+        "font-size: 11px; padding: 2px 8px; border-radius: 3px; }"
+        "QToolButton:hover { background: #7f1d1d; color: #ffffff; }"
+        "QToolButton:focus { border: 1px solid #f87171; background: #450a0a; color: #ffffff; }"));
     connect(m_closeButton, &QToolButton::clicked, this, [this]() {
         if (m_parentDock) {
             m_parentDock->close();
@@ -255,6 +285,37 @@ void StudioDockWidget::onTopLevelChanged(bool floating)
 DockLayoutManager::DockLayoutManager(QMainWindow *mainWindow, QObject *parent)
     : QObject(parent), m_mainWindow(mainWindow)
 {
+    m_relayoutTimer = new QTimer(this);
+    m_relayoutTimer->setSingleShot(true);
+    m_relayoutTimer->setInterval(0);
+    connect(m_relayoutTimer, &QTimer::timeout, this, [this]() {
+        if (!m_applyingLayout && m_mainWindow) {
+            LayoutApplyGuard guard(m_applyingLayout);
+            applyCurrentSplitSizes();
+        }
+    });
+
+    m_tabCleanupTimer = new QTimer(this);
+    m_tabCleanupTimer->setSingleShot(true);
+    m_tabCleanupTimer->setInterval(0);
+    connect(m_tabCleanupTimer, &QTimer::timeout, this, [this]() {
+        if (!m_applyingLayout && m_mainWindow && m_mainWindow->isVisible()) {
+            reconcileTabBarVisibility();
+        }
+    });
+
+    m_ratioSyncTimer = new QTimer(this);
+    m_ratioSyncTimer->setSingleShot(true);
+    m_ratioSyncTimer->setInterval(0);
+    connect(m_ratioSyncTimer, &QTimer::timeout, this, [this]() {
+        if (!m_applyingLayout && m_mainWindow && m_mainWindow->isVisible() &&
+            m_perspectives.contains(m_activePerspective)) {
+            QJsonObject tree = m_perspectives.value(m_activePerspective);
+            syncLiveRatiosFromGeometry(tree);
+            m_perspectives.insert(m_activePerspective, tree);
+        }
+    });
+
     if (m_mainWindow) {
         // Enable flexible docking features
         m_mainWindow->setDockNestingEnabled(true);
@@ -268,9 +329,7 @@ DockLayoutManager::DockLayoutManager(QMainWindow *mainWindow, QObject *parent)
         m_mainWindow->setCorner(Qt::BottomRightCorner, Qt::BottomDockWidgetArea);
 
         m_mainWindow->installEventFilter(this);
-    }
-    if (qApp) {
-        qApp->installEventFilter(this);
+        attachDockChildFilters();
     }
 
 #ifdef HAVE_QT_ADS
@@ -401,8 +460,17 @@ DockLayoutManager::DockLayoutManager(QMainWindow *mainWindow, QObject *parent)
 
 DockLayoutManager::~DockLayoutManager()
 {
-    if (qApp) {
-        qApp->removeEventFilter(this);
+    if (m_relayoutTimer) {
+        m_relayoutTimer->stop();
+    }
+    if (m_tabCleanupTimer) {
+        m_tabCleanupTimer->stop();
+    }
+    if (m_ratioSyncTimer) {
+        m_ratioSyncTimer->stop();
+    }
+    if (m_mainWindow) {
+        m_mainWindow->removeEventFilter(this);
     }
 #ifdef HAVE_QT_ADS
     delete m_adsManager;
@@ -410,8 +478,143 @@ DockLayoutManager::~DockLayoutManager()
 #endif
 }
 
+void DockLayoutManager::attachDockChildFilters()
+{
+    if (!m_mainWindow) {
+        return;
+    }
+    const auto tabBars =
+        m_mainWindow->findChildren<QTabBar *>(QString(), Qt::FindDirectChildrenOnly);
+    for (QTabBar *tb : tabBars) {
+        if (tb) {
+            tb->removeEventFilter(this);
+            tb->installEventFilter(this);
+        }
+    }
+    const auto splitters = m_mainWindow->findChildren<QSplitterHandle *>();
+    for (QSplitterHandle *handle : splitters) {
+        if (handle) {
+            handle->removeEventFilter(this);
+            handle->installEventFilter(this);
+        }
+    }
+}
+
+void DockLayoutManager::scheduleRelayout()
+{
+    if (m_relayoutTimer && !m_relayoutTimer->isActive()) {
+        m_relayoutTimer->start();
+    }
+}
+
+void DockLayoutManager::scheduleTabBarCleanup()
+{
+    if (m_tabCleanupTimer && !m_tabCleanupTimer->isActive()) {
+        m_tabCleanupTimer->start();
+    }
+}
+
+void DockLayoutManager::scheduleRatioSync()
+{
+    if (m_ratioSyncTimer && !m_ratioSyncTimer->isActive()) {
+        m_ratioSyncTimer->start();
+    }
+}
+
+int DockLayoutManager::computeWorkspaceTopBound() const
+{
+    if (!m_mainWindow) {
+        return 0;
+    }
+    int topBound = 0;
+    if (QMenuBar *mb = m_mainWindow->findChild<QMenuBar *>(QString(), Qt::FindDirectChildrenOnly)) {
+        if (!mb->isHidden()) {
+            topBound = std::max(topBound, mb->geometry().bottom() + 1);
+        }
+    }
+    const auto toolBars =
+        m_mainWindow->findChildren<QToolBar *>(QString(), Qt::FindDirectChildrenOnly);
+    for (QToolBar *bar : toolBars) {
+        if (bar && !bar->isHidden() && !bar->isFloating() &&
+            m_mainWindow->toolBarArea(bar) == Qt::TopToolBarArea) {
+            topBound = std::max(topBound, bar->geometry().bottom() + 1);
+        }
+    }
+    if (auto *topDock = resolveDock(QStringLiteral("MonitorTopologyBar"))) {
+        if (!topDock->isHidden() && !topDock->isFloating()) {
+            const int bottomEdge = topDock->geometry().bottom() + 1;
+            if (bottomEdge > topBound) {
+                topBound = bottomEdge;
+            }
+        }
+    }
+    return topBound;
+}
+
+int DockLayoutManager::computeWindowChromeHeight() const
+{
+    if (!m_mainWindow) {
+        return 0;
+    }
+    int chromeHeight = 0;
+    if (QMenuBar *mb = m_mainWindow->findChild<QMenuBar *>(QString(), Qt::FindDirectChildrenOnly)) {
+        if (!mb->isHidden()) {
+            chromeHeight += mb->height();
+        }
+    }
+    const auto toolBars =
+        m_mainWindow->findChildren<QToolBar *>(QString(), Qt::FindDirectChildrenOnly);
+    for (QToolBar *bar : toolBars) {
+        if (bar && !bar->isHidden() && !bar->isFloating()) {
+            const Qt::ToolBarArea area = m_mainWindow->toolBarArea(bar);
+            if (area == Qt::TopToolBarArea || area == Qt::BottomToolBarArea) {
+                chromeHeight += bar->height();
+            }
+        }
+    }
+    if (QStatusBar *sb = m_mainWindow->findChild<QStatusBar *>(QString(), Qt::FindDirectChildrenOnly)) {
+        if (!sb->isHidden()) {
+            chromeHeight += sb->height();
+        }
+    }
+    return chromeHeight;
+}
+
+void DockLayoutManager::reconcileTabBarVisibility()
+{
+    if (!m_mainWindow) {
+        return;
+    }
+    const int topBound = computeWorkspaceTopBound();
+    const auto tabBars =
+        m_mainWindow->findChildren<QTabBar *>(QString(), Qt::FindDirectChildrenOnly);
+    for (QTabBar *tb : tabBars) {
+        if (!tb) {
+            continue;
+        }
+        // QMainWindowLayout may keep retired internal QTabBars at (0,0) above the dock area;
+        // comparing against dynamic top chrome bounds hides retired bars without fixed pixel magic.
+        const bool parkedAboveWorkspace = (topBound > 0 && tb->y() < topBound);
+        if (tb->count() <= 1 || tb->x() < 0 || tb->y() < 0 || parkedAboveWorkspace) {
+            tb->hide();
+        } else {
+            tb->show();
+        }
+    }
+}
+
 bool DockLayoutManager::eventFilter(QObject *watched, QEvent *event)
 {
+    if (m_mainWindow && watched == m_mainWindow && event->type() == QEvent::ChildPolished) {
+        auto *ce = static_cast<QChildEvent *>(event);
+        if (QObject *child = ce->child()) {
+            if (qobject_cast<QTabBar *>(child) || qobject_cast<QSplitterHandle *>(child)) {
+                child->removeEventFilter(this);
+                child->installEventFilter(this);
+            }
+        }
+    }
+
     if (m_mainWindow && watched && watched->parent() == m_mainWindow) {
         if (auto *tb = qobject_cast<QTabBar *>(watched)) {
             if ((event->type() == QEvent::Move || event->type() == QEvent::Show) &&
@@ -422,36 +625,17 @@ bool DockLayoutManager::eventFilter(QObject *watched, QEvent *event)
     }
 
     if (m_mainWindow && watched == m_mainWindow && event->type() == QEvent::LayoutRequest) {
-        QTimer::singleShot(0, this, [this]() {
-            if (m_applyingLayout || !m_mainWindow || !m_mainWindow->isVisible())
-                return;
-            const auto tabBars =
-                m_mainWindow->findChildren<QTabBar *>(QString(), Qt::FindDirectChildrenOnly);
-            for (QTabBar *tb : tabBars) {
-                if (!tb)
-                    continue;
-                if (tb->count() <= 1 || tb->x() < 0 || tb->y() < 45) {
-                    tb->hide();
-                } else {
-                    tb->show();
-                }
-            }
-        });
+        scheduleTabBarCleanup();
     }
 
     if (!m_applyingLayout && m_mainWindow) {
         if (watched == m_mainWindow &&
             (event->type() == QEvent::Show || event->type() == QEvent::Resize)) {
-            m_applyingLayout = true;
-            applyCurrentSplitSizes();
-            m_applyingLayout = false;
-            QTimer::singleShot(0, this, [this]() {
-                if (!m_applyingLayout) {
-                    m_applyingLayout = true;
-                    applyCurrentSplitSizes();
-                    m_applyingLayout = false;
-                }
-            });
+            {
+                LayoutApplyGuard guard(m_applyingLayout);
+                applyCurrentSplitSizes();
+            }
+            scheduleRelayout();
         } else if (event->type() == QEvent::MouseButtonRelease && m_mainWindow->isVisible() &&
                    m_perspectives.contains(m_activePerspective)) {
             auto *splitterHandle = qobject_cast<QSplitterHandle *>(watched);
@@ -459,19 +643,13 @@ bool DockLayoutManager::eventFilter(QObject *watched, QEvent *event)
             QWidget *targetWidget = splitterHandle ? static_cast<QWidget *>(splitterHandle)
                                                    : static_cast<QWidget *>(tabBar);
             const bool isWithinMainWindow =
-                (targetWidget != nullptr) && m_mainWindow->isAncestorOf(targetWidget);
+                (watched == m_mainWindow) ||
+                ((targetWidget != nullptr) && m_mainWindow->isAncestorOf(targetWidget));
             if (isWithinMainWindow) {
                 QJsonObject tree = m_perspectives.value(m_activePerspective);
                 syncLiveRatiosFromGeometry(tree);
                 m_perspectives.insert(m_activePerspective, tree);
-                QTimer::singleShot(0, this, [this]() {
-                    if (!m_applyingLayout && m_mainWindow && m_mainWindow->isVisible() &&
-                        m_perspectives.contains(m_activePerspective)) {
-                        QJsonObject delayedTree = m_perspectives.value(m_activePerspective);
-                        syncLiveRatiosFromGeometry(delayedTree);
-                        m_perspectives.insert(m_activePerspective, delayedTree);
-                    }
-                });
+                scheduleRatioSync();
             }
         }
     }
@@ -588,8 +766,8 @@ void DockLayoutManager::registerLazyPanel(const QString &id, const QString &titl
 bool DockLayoutManager::isPanelRealized(const QString &id) const
 {
     QString canonical = resolvePanelId(id);
-    if (auto *rawHost = m_lazyHosts.value(canonical, nullptr)) {
-        return static_cast<LazyPanelHost *>(rawHost)->isRealized();
+    if (auto *host = m_lazyHosts.value(canonical, nullptr)) {
+        return host->isRealized();
     }
     return m_docks.contains(canonical);
 }
@@ -597,8 +775,8 @@ bool DockLayoutManager::isPanelRealized(const QString &id) const
 QWidget *DockLayoutManager::realizeLazyPanel(const QString &id)
 {
     QString canonical = resolvePanelId(id);
-    if (auto *rawHost = m_lazyHosts.value(canonical, nullptr)) {
-        return static_cast<LazyPanelHost *>(rawHost)->realizeNow();
+    if (auto *host = m_lazyHosts.value(canonical, nullptr)) {
+        return host->realizeNow();
     }
     return panelWidget(canonical);
 }
@@ -632,8 +810,8 @@ StudioDockWidget *DockLayoutManager::dockWidget(const QString &id) const { retur
 QWidget *DockLayoutManager::panelWidget(const QString &id) const
 {
     QString canonical = resolvePanelId(id);
-    if (auto *rawHost = m_lazyHosts.value(canonical, nullptr)) {
-        return static_cast<LazyPanelHost *>(rawHost)->realizedWidget();
+    if (auto *host = m_lazyHosts.value(canonical, nullptr)) {
+        return host->realizedWidget();
     }
     auto *dock = resolveDock(canonical);
     return dock ? dock->contentWidget() : nullptr;
@@ -804,7 +982,7 @@ StudioDockWidget *DockLayoutManager::findPrimaryDock(const QJsonObject &node) co
         QJsonArray tabs = node.value(QStringLiteral("tabs")).toArray();
         for (const auto &tabVal : tabs) {
             if (auto *dock = resolveDock(tabVal.toString())) {
-                if (!dock->isHidden() && dock->x() >= 0 && dock->y() >= 0 &&
+                if (!dock->isHidden() && !dock->isFloating() && dock->x() >= 0 && dock->y() >= 0 &&
                     (dock->x() > 0 || dock->y() > 0)) {
                     return dock;
                 }
@@ -813,7 +991,8 @@ StudioDockWidget *DockLayoutManager::findPrimaryDock(const QJsonObject &node) co
         QString activeTab = node.value(QStringLiteral("active_tab")).toString();
         if (!activeTab.isEmpty()) {
             if (auto *activeDock = resolveDock(activeTab)) {
-                if (!activeDock->isHidden() && activeDock->x() >= 0 && activeDock->y() >= 0) {
+                if (!activeDock->isHidden() && !activeDock->isFloating() && activeDock->x() >= 0 &&
+                    activeDock->y() >= 0) {
                     return activeDock;
                 }
             }
@@ -923,9 +1102,9 @@ void DockLayoutManager::applySubtreeSizes(const QJsonObject &node, int availW, i
 
     if (!node.contains(QStringLiteral("split_direction"))) {
         if (auto *leafDock = findPrimaryDock(node)) {
-            if (!horizDocks.contains(leafDock)) {
+            if (!leafDock->isFloating() && !horizDocks.contains(leafDock)) {
                 horizDocks.append(leafDock);
-                horizSizes.append(std::max(160, availW));
+                horizSizes.append(std::max(120, availW));
             }
         }
         return;
@@ -948,17 +1127,23 @@ void DockLayoutManager::applySubtreeSizes(const QJsonObject &node, int availW, i
     StudioDockWidget *secondPrimary = findPrimaryDock(secondChild);
 
     if (orient == Qt::Horizontal) {
-        int w1 = std::max(180, static_cast<int>(std::round(availW * ratio)));
-        int w2 = std::max(180, availW - w1);
-        if (firstPrimary && secondPrimary && firstPrimary != secondPrimary) {
+        const int minW = std::min(160, std::max(60, availW / 3));
+        const int w1 = std::clamp(static_cast<int>(std::round(availW * ratio)), minW,
+                                  std::max(minW, availW - minW));
+        const int w2 = std::max(1, availW - w1);
+        if (firstPrimary && secondPrimary && firstPrimary != secondPrimary &&
+            !firstPrimary->isFloating() && !secondPrimary->isFloating()) {
             m_mainWindow->resizeDocks({firstPrimary, secondPrimary}, {w1, w2}, Qt::Horizontal);
         }
         applySubtreeSizes(firstChild, w1, availH, horizDocks, horizSizes);
         applySubtreeSizes(secondChild, w2, availH, horizDocks, horizSizes);
     } else {
-        int h1 = std::max(120, static_cast<int>(std::round(availH * ratio)));
-        int h2 = std::max(120, availH - h1);
-        if (firstPrimary && secondPrimary && firstPrimary != secondPrimary) {
+        const int minH = std::min(110, std::max(48, availH / 3));
+        const int h1 = std::clamp(static_cast<int>(std::round(availH * ratio)), minH,
+                                  std::max(minH, availH - minH));
+        const int h2 = std::max(1, availH - h1);
+        if (firstPrimary && secondPrimary && firstPrimary != secondPrimary &&
+            !firstPrimary->isFloating() && !secondPrimary->isFloating()) {
             m_mainWindow->resizeDocks({firstPrimary, secondPrimary}, {h1, h2}, Qt::Vertical);
         }
         QList<QDockWidget *> topHorizDocks;
@@ -994,7 +1179,7 @@ int DockLayoutManager::computeSubtreeSpan(const QJsonObject &node, Qt::Orientati
 
     if (!node.contains(QStringLiteral("split_direction"))) {
         StudioDockWidget *dock = findPrimaryDock(node);
-        if (!dock || dock->isHidden() || dock->x() < 0 || dock->y() < 0) {
+        if (!dock || dock->isHidden() || dock->isFloating() || dock->x() < 0 || dock->y() < 0) {
             return 0;
         }
         return (orient == Qt::Horizontal) ? dock->width() : dock->height();
@@ -1030,7 +1215,7 @@ void DockLayoutManager::syncLiveRatiosFromGeometry(QJsonObject &node) const
         QJsonArray tabs = node.value(QStringLiteral("tabs")).toArray();
         for (const auto &tabVal : tabs) {
             if (auto *dock = resolveDock(tabVal.toString())) {
-                if (!dock->isHidden() && dock->x() >= 0 && dock->y() >= 0 &&
+                if (!dock->isHidden() && !dock->isFloating() && dock->x() >= 0 && dock->y() >= 0 &&
                     (dock->x() > 0 || dock->y() > 0)) {
                     node.insert(QStringLiteral("active_tab"), dock->panelId());
                     break;
@@ -1078,13 +1263,20 @@ void DockLayoutManager::applyCurrentSplitSizes()
     if (tree.isEmpty())
         return;
 
-    int totalW = (m_mainWindow->width() >= 640) ? m_mainWindow->width() : 1024;
-    int totalH = ((m_mainWindow->height() >= 480) ? m_mainWindow->height() : 720) - 60;
+    const QSize hint = m_mainWindow->sizeHint().expandedTo(QSize(960, 640));
+    const int totalW = (m_mainWindow->width() >= hint.width() / 2) ? m_mainWindow->width()
+                                                                    : std::max(hint.width(), 1024);
+    int totalH = (m_mainWindow->height() >= hint.height() / 2) ? m_mainWindow->height()
+                                                               : std::max(hint.height(), 720);
+    totalH -= computeWindowChromeHeight();
 
     auto *footerDock = resolveDock(QStringLiteral("StudioFooterBar"));
     if (footerDock && !footerDock->isHidden() && !footerDock->isFloating()) {
-        m_mainWindow->resizeDocks({footerDock}, {52}, Qt::Vertical);
-        totalH -= 52;
+        const int hintH = footerDock->contentWidget() ? footerDock->contentWidget()->sizeHint().height() : -1;
+        const int footerH =
+            (hintH > 0) ? std::clamp(hintH, 44, 72) : std::max(48, m_mainWindow->fontMetrics().height() * 3);
+        m_mainWindow->resizeDocks({footerDock}, {footerH}, Qt::Vertical);
+        totalH -= footerH;
     }
 
     QSet<QString> treeIds;
@@ -1093,11 +1285,13 @@ void DockLayoutManager::applyCurrentSplitSizes()
     auto *topDock = resolveDock(QStringLiteral("MonitorTopologyBar"));
     if (topDock && !topDock->isHidden() && !topDock->isFloating() &&
         !treeIds.contains(topDock->panelId())) {
-        m_mainWindow->resizeDocks({topDock}, {100}, Qt::Vertical);
-        totalH -= 100;
+        const int hintH = topDock->contentWidget() ? topDock->contentWidget()->sizeHint().height() : -1;
+        const int topH = (hintH > 0) ? std::clamp(hintH, 84, 140) : 100;
+        m_mainWindow->resizeDocks({topDock}, {topH}, Qt::Vertical);
+        totalH -= topH;
     }
 
-    totalH = std::max(320, totalH);
+    totalH = std::max(280, totalH);
 
     QList<QDockWidget *> horizDocks;
     QList<int> horizSizes;
@@ -1107,11 +1301,6 @@ void DockLayoutManager::applyCurrentSplitSizes()
         m_mainWindow->resizeDocks(horizDocks, horizSizes, Qt::Horizontal);
     }
 
-    // Before show() (!isVisible()), only hide single-tab/empty QTabBars (count <= 1) and
-    // NEVER hide multi-tab QTabBars when y() == 0 before layout.
-    // When visible, ensure multi-tab QTabBars are shown before activating QMainWindowLayout
-    // so QDockAreaLayout computes their true dock coordinates, then hide any retired
-    // unusedTabBars that QMainWindowLayout left parked at y() < 45.
     const auto tabBars =
         m_mainWindow->findChildren<QTabBar *>(QString(), Qt::FindDirectChildrenOnly);
     if (m_mainWindow->isVisible() && m_mainWindow->layout()) {
@@ -1121,15 +1310,7 @@ void DockLayoutManager::applyCurrentSplitSizes()
             }
         }
         m_mainWindow->layout()->activate();
-        for (QTabBar *tb : tabBars) {
-            if (!tb)
-                continue;
-            if (tb->count() <= 1 || tb->x() < 0 || tb->y() < 45) {
-                tb->hide();
-            } else {
-                tb->show();
-            }
-        }
+        reconcileTabBarVisibility();
     } else {
         for (QTabBar *tb : tabBars) {
             if (!tb)
@@ -1156,75 +1337,73 @@ void DockLayoutManager::applyPerspectiveTree(const QJsonObject &tree)
     if (!m_mainWindow || tree.isEmpty())
         return;
 
-    m_applyingLayout = true;
-
-    // 1. Collect all panels included in the target perspective tree
     QSet<QString> activeDockIds;
-    collectDocksInTree(tree, activeDockIds);
+    {
+        LayoutApplyGuard guard(m_applyingLayout);
 
-    // 2. Detach all docks cleanly so QMainWindow's internal QDockAreaLayout starts fresh
-    for (auto *dock : m_docks) {
-        dock->setFloating(false);
-        m_mainWindow->removeDockWidget(dock);
-        dock->hide();
-    }
+        // 1. Collect all panels included in the target perspective tree
+        collectDocksInTree(tree, activeDockIds);
 
-    // 3. Anchor Top Topology Bar in Default perspective (or when not embedded in tree)
-    auto *topDock = resolveDock(QStringLiteral("MonitorTopologyBar"));
-    if (topDock && !activeDockIds.contains(topDock->panelId())) {
-        if (m_activePerspective == QStringLiteral("Default")) {
-            m_mainWindow->addDockWidget(Qt::TopDockWidgetArea, topDock);
-            topDock->show();
-            activeDockIds.insert(topDock->panelId());
+        // 2. Detach all docks cleanly so QMainWindow's internal QDockAreaLayout starts fresh
+        for (auto *dock : m_docks) {
+            dock->setFloating(false);
+            m_mainWindow->removeDockWidget(dock);
+            dock->hide();
         }
-    }
 
-    // 4. Construct main workspace tree top-down in a single unified dock area
-    StudioDockWidget *rootPrimary = findPrimaryDock(tree);
-    if (rootPrimary) {
-        m_mainWindow->addDockWidget(Qt::LeftDockWidgetArea, rootPrimary);
-        rootPrimary->show();
-        buildSubtreeTopDown(tree, rootPrimary);
-    }
-
-    // 5. Always anchor StudioFooterBar at BottomDockWidgetArea
-    auto *footerDock = resolveDock(QStringLiteral("StudioFooterBar"));
-    if (footerDock) {
-        m_mainWindow->addDockWidget(Qt::BottomDockWidgetArea, footerDock);
-        footerDock->show();
-        activeDockIds.insert(footerDock->panelId());
-    }
-
-    // 6. Handle floating panels if declared
-    if (tree.contains(QStringLiteral("floating"))) {
-        QJsonArray floatingArr = tree.value(QStringLiteral("floating")).toArray();
-        for (const auto &itemVal : floatingArr) {
-            QJsonObject fObj = itemVal.toObject();
-            QString id = fObj.value(QStringLiteral("id")).toString();
-            auto *dock = resolveDock(id);
-            if (dock) {
-                m_mainWindow->addDockWidget(Qt::LeftDockWidgetArea, dock);
-                dock->setFloating(true);
-                int x = fObj.value(QStringLiteral("x")).toInt(100);
-                int y = fObj.value(QStringLiteral("y")).toInt(100);
-                int w = fObj.value(QStringLiteral("w")).toInt(600);
-                int h = fObj.value(QStringLiteral("h")).toInt(400);
-                dock->setGeometry(x, y, w, h);
-                dock->show();
-                activeDockIds.insert(dock->panelId());
+        // 3. Anchor Top Topology Bar in Default perspective (or when not embedded in tree)
+        auto *topDock = resolveDock(QStringLiteral("MonitorTopologyBar"));
+        if (topDock && !activeDockIds.contains(topDock->panelId())) {
+            if (m_activePerspective == QStringLiteral("Default")) {
+                m_mainWindow->addDockWidget(Qt::TopDockWidgetArea, topDock);
+                topDock->show();
+                activeDockIds.insert(topDock->panelId());
             }
         }
+
+        // 4. Construct main workspace tree top-down in a single unified dock area
+        StudioDockWidget *rootPrimary = findPrimaryDock(tree);
+        if (rootPrimary) {
+            m_mainWindow->addDockWidget(Qt::LeftDockWidgetArea, rootPrimary);
+            rootPrimary->show();
+            buildSubtreeTopDown(tree, rootPrimary);
+        }
+
+        // 5. Always anchor StudioFooterBar at BottomDockWidgetArea
+        auto *footerDock = resolveDock(QStringLiteral("StudioFooterBar"));
+        if (footerDock) {
+            m_mainWindow->addDockWidget(Qt::BottomDockWidgetArea, footerDock);
+            footerDock->show();
+            activeDockIds.insert(footerDock->panelId());
+        }
+
+        // 6. Handle floating panels if declared
+        if (tree.contains(QStringLiteral("floating"))) {
+            QJsonArray floatingArr = tree.value(QStringLiteral("floating")).toArray();
+            for (const auto &itemVal : floatingArr) {
+                QJsonObject fObj = itemVal.toObject();
+                QString id = fObj.value(QStringLiteral("id")).toString();
+                auto *dock = resolveDock(id);
+                if (dock) {
+                    m_mainWindow->addDockWidget(Qt::LeftDockWidgetArea, dock);
+                    dock->setFloating(true);
+                    int x = fObj.value(QStringLiteral("x")).toInt(100);
+                    int y = fObj.value(QStringLiteral("y")).toInt(100);
+                    int w = fObj.value(QStringLiteral("w")).toInt(600);
+                    int h = fObj.value(QStringLiteral("h")).toInt(400);
+                    dock->setGeometry(x, y, w, h);
+                    dock->show();
+                    activeDockIds.insert(dock->panelId());
+                }
+            }
+        }
+
+        // 7. Apply proportional split sizes now and schedule coalesced post-polish relayout
+        applyCurrentSplitSizes();
+        attachDockChildFilters();
     }
 
-    // 7. Apply proportional split sizes now and on next event loop tick
-    applyCurrentSplitSizes();
-    QTimer::singleShot(0, this, [this]() {
-        m_applyingLayout = true;
-        applyCurrentSplitSizes();
-        m_applyingLayout = false;
-    });
-
-    m_applyingLayout = false;
+    scheduleRelayout();
 
     for (auto *dock : m_docks) {
         emit panelVisibilityChanged(dock->panelId(), activeDockIds.contains(dock->panelId()));
@@ -1320,31 +1499,50 @@ bool DockLayoutManager::deserializeLayout(const QJsonObject &root)
         return false;
     }
 
-    const int revision = root.value(QStringLiteral("layout_revision")).toInt(0);
-    QJsonObject perspsObj = root.value(QStringLiteral("perspectives")).toObject();
+    // Seed all 7 built-in perspectives upfront so missing or empty entries never leave holes.
+    setupDefaultPerspectives();
 
-    if (revision < 7) {
-        // Populate all 7 built-in perspectives first so "Rigging & Animation" is always present
-        // and pre-v7 "Rigging & Animation" trees refresh cleanly to the v7 layout.
-        setupDefaultPerspectives();
-        for (auto it = perspsObj.constBegin(); it != perspsObj.constEnd(); ++it) {
-            const QString &key = it.key();
-            if (key == QStringLiteral("Rigging & Animation")) {
+    const int revision = root.value(QStringLiteral("layout_revision")).toInt(0);
+    const QJsonObject perspsObj = root.value(QStringLiteral("perspectives")).toObject();
+
+    auto isUsableTree = [](const QJsonObject &tree) -> bool {
+        if (tree.isEmpty()) {
+            return false;
+        }
+        if (tree.contains(QStringLiteral("split_direction"))) {
+            return true;
+        }
+        const QString type = tree.value(QStringLiteral("type")).toString();
+        return type == QStringLiteral("DockNode") || type == QStringLiteral("TabGroup");
+    };
+
+    for (auto it = perspsObj.constBegin(); it != perspsObj.constEnd(); ++it) {
+        const QString &key = it.key();
+        if (key.isEmpty()) {
+            continue;
+        }
+        QJsonObject normalized = normalizeTreeAliases(it.value().toObject());
+        if (!isUsableTree(normalized)) {
+            continue;
+        }
+        // Preserve non-empty user trees across revisions while ensuring legacy pre-v7
+        // "Rigging & Animation" placeholders only survive if they include rigging panels.
+        if (revision < 7 && key == QStringLiteral("Rigging & Animation")) {
+            QSet<QString> ids;
+            collectDocksInTree(normalized, ids);
+            if (!ids.contains(QStringLiteral("BoneRiggingPanel")) ||
+                !ids.contains(QStringLiteral("DopeSheetTimelineWidget"))) {
                 continue;
             }
-            if (revision == 6 || !m_perspectives.contains(key)) {
-                m_perspectives.insert(key, normalizeTreeAliases(it.value().toObject()));
-            }
         }
-    } else {
-        for (auto it = perspsObj.constBegin(); it != perspsObj.constEnd(); ++it) {
-            m_perspectives.insert(it.key(), normalizeTreeAliases(it.value().toObject()));
-        }
+        m_perspectives.insert(key, normalized);
     }
 
     QString active =
         root.value(QStringLiteral("active_perspective")).toString(QStringLiteral("Default"));
-    switchPerspective(active);
+    if (!switchPerspective(active)) {
+        return switchPerspective(QStringLiteral("Default"));
+    }
     return true;
 }
 
@@ -1403,8 +1601,21 @@ bool DockLayoutManager::loadLayoutFromFile(const QString &filePath)
         return false;
     }
 
-    QByteArray data = file.readAll();
+    constexpr qint64 kMaxLayoutBytes = 2LL * 1024LL * 1024LL;
+    if (file.size() > kMaxLayoutBytes) {
+        qWarning() << "Layout file exceeds 2 MiB limit:" << targetPath;
+        file.close();
+        switchPerspective(m_activePerspective);
+        return false;
+    }
+
+    QByteArray data = file.read(kMaxLayoutBytes + 1);
     file.close();
+    if (data.size() > kMaxLayoutBytes) {
+        qWarning() << "Layout file exceeded 2 MiB limit during read:" << targetPath;
+        switchPerspective(m_activePerspective);
+        return false;
+    }
 
     QJsonParseError parseError{};
     QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);

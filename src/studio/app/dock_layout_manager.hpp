@@ -6,6 +6,7 @@
 #include <QString>
 #include <QStringList>
 #include <QMap>
+#include <QSet>
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -17,6 +18,7 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QMouseEvent>
+#include <QTimer>
 #include <functional>
 
 #ifdef HAVE_QT_ADS
@@ -26,6 +28,8 @@
 #endif
 
 namespace waywal::studio {
+
+class LazyPanelHost;
 
 /**
  * @brief Sleek custom dark titlebar for dock panels.
@@ -182,14 +186,24 @@ class DockLayoutManager : public QObject {
     QDockWidget *layoutSubtree(const QJsonObject &node, Qt::Orientation parentOrientation);
     void collectDocksInTree(const QJsonObject &node, QSet<QString> &outIds);
     void setupDefaultPerspectives();
+    void attachDockChildFilters();
+    int computeWorkspaceTopBound() const;
+    int computeWindowChromeHeight() const;
+    void reconcileTabBarVisibility();
+    void scheduleRelayout();
+    void scheduleTabBarCleanup();
+    void scheduleRatioSync();
 
     QMainWindow *m_mainWindow{nullptr};
     QMap<QString, StudioDockWidget *> m_docks;
-    QMap<QString, QWidget *> m_lazyHosts;
+    QMap<QString, LazyPanelHost *> m_lazyHosts;
     QMap<QString, QString> m_aliases;
     QMap<QString, QJsonObject> m_perspectives;
     QString m_activePerspective{"Default"};
     bool m_applyingLayout{false};
+    QTimer *m_relayoutTimer{nullptr};
+    QTimer *m_tabCleanupTimer{nullptr};
+    QTimer *m_ratioSyncTimer{nullptr};
 
 #ifdef HAVE_QT_ADS
     ads::CDockManager *m_adsManager{nullptr};

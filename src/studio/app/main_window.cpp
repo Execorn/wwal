@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "studio/app/main_window.hpp"
 #include "studio/app/dock_layout_manager.hpp"
+#include "studio/app/studio_session_context.hpp"
 #include "waywal/ipc_proto_authoring.h"
 
 #include <QApplication>
@@ -85,22 +86,21 @@ class MonitorTopologyBar : public QWidget {
         topBtnRow->setSpacing(8);
 
         auto *btnRefresh = new QPushButton(QStringLiteral("Refresh"), controlsBox);
+        btnRefresh->setAccessibleName(QStringLiteral("Refresh displays"));
         btnRefresh->setToolTip(QStringLiteral("Refresh connected Wayland outputs"));
-        btnRefresh->setFixedHeight(26);
+        btnRefresh->setMinimumHeight(26);
         connect(btnRefresh, &QPushButton::clicked, this, [this]() {
-            if (m_canvas)
+            if (m_canvas) {
                 m_canvas->refreshFromWayland();
+            }
         });
         topBtnRow->addWidget(btnRefresh, 1);
 
         auto *btnSpan = new QPushButton(QStringLiteral("Span"), controlsBox);
+        btnSpan->setAccessibleName(QStringLiteral("Span displays"));
         btnSpan->setCheckable(true);
-        btnSpan->setFixedHeight(26);
+        btnSpan->setMinimumHeight(26);
         btnSpan->setToolTip(QStringLiteral("Span wallpaper across all displays"));
-        connect(btnSpan, &QPushButton::toggled, this, [this](bool checked) {
-            if (m_canvas)
-                m_canvas->setDesktopSpanMode(checked);
-        });
         topBtnRow->addWidget(btnSpan, 1);
         ctrlLayout->addLayout(topBtnRow);
 
@@ -108,19 +108,80 @@ class MonitorTopologyBar : public QWidget {
         scaleRow->setContentsMargins(0, 0, 0, 0);
         scaleRow->setSpacing(8);
         auto *scaleLbl = new QLabel(QStringLiteral("Scale"), controlsBox);
-        scaleLbl->setStyleSheet(QStringLiteral("color: #94a3b8; font-size: 11px;"));
+        scaleLbl->setStyleSheet(QStringLiteral("color: #cbd5e1; font-size: 11px;"));
         scaleRow->addWidget(scaleLbl);
 
         auto *comboScaling = new QComboBox(controlsBox);
-        comboScaling->setFixedHeight(26);
-        comboScaling->addItems({QStringLiteral("Fill"), QStringLiteral("Fit"),
-                                QStringLiteral("Center"), QStringLiteral("Stretch"),
-                                QStringLiteral("Tile")});
+        comboScaling->setAccessibleName(QStringLiteral("Wallpaper scaling mode"));
+        comboScaling->setMinimumHeight(26);
+        comboScaling->addItem(QStringLiteral("Fill"), static_cast<int>(WAYWAL_SCALING_FILL));
+        comboScaling->addItem(QStringLiteral("Fit"), static_cast<int>(WAYWAL_SCALING_FIT));
+        comboScaling->addItem(QStringLiteral("Stretch"), static_cast<int>(WAYWAL_SCALING_STRETCH));
+        comboScaling->addItem(QStringLiteral("Center"), static_cast<int>(WAYWAL_SCALING_CENTER));
+        comboScaling->addItem(QStringLiteral("Tile"), static_cast<int>(WAYWAL_SCALING_TILE));
+        comboScaling->addItem(QStringLiteral("Span"), static_cast<int>(WAYWAL_SCALING_SPAN));
+
+        connect(btnSpan, &QPushButton::toggled, this, [this, comboScaling](bool checked) {
+            if (comboScaling) {
+                const QSignalBlocker blocker(comboScaling);
+                const int targetIdx = comboScaling->findData(static_cast<int>(
+                    checked ? WAYWAL_SCALING_SPAN : WAYWAL_SCALING_FILL));
+                if (targetIdx >= 0) {
+                    comboScaling->setCurrentIndex(targetIdx);
+                }
+            }
+            if (m_canvas) {
+                m_canvas->setDesktopSpanMode(checked);
+            }
+        });
         connect(comboScaling, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-                [this](int idx) {
-                    if (m_canvas)
-                        m_canvas->setScalingMode(idx);
+                [this, comboScaling, btnSpan](int idx) {
+                    const QVariant data = comboScaling->itemData(idx);
+                    if (!data.isValid()) {
+                        return;
+                    }
+                    const int mode = data.toInt();
+                    if (btnSpan) {
+                        const QSignalBlocker blocker(btnSpan);
+                        btnSpan->setChecked(mode == WAYWAL_SCALING_SPAN);
+                    }
+                    if (m_canvas) {
+                        m_canvas->setDesktopSpanMode(mode == WAYWAL_SCALING_SPAN);
+                        m_canvas->setScalingMode(mode);
+                    }
                 });
+        if (m_canvas) {
+            connect(m_canvas, &MonitorTopologyCanvas::desktopSpanModeToggled, this,
+                    [btnSpan, comboScaling](bool spanEnabled) {
+                        if (btnSpan) {
+                            const QSignalBlocker b1(btnSpan);
+                            btnSpan->setChecked(spanEnabled);
+                        }
+                        if (comboScaling) {
+                            const QSignalBlocker b2(comboScaling);
+                            const int idx = comboScaling->findData(static_cast<int>(
+                                spanEnabled ? WAYWAL_SCALING_SPAN : WAYWAL_SCALING_FILL));
+                            if (idx >= 0) {
+                                comboScaling->setCurrentIndex(idx);
+                            }
+                        }
+                    });
+            connect(m_canvas, &MonitorTopologyCanvas::scalingModeChanged, this,
+                    [btnSpan, comboScaling](const QStringList &, int mode) {
+                        if (comboScaling) {
+                            const QSignalBlocker b1(comboScaling);
+                            const int idx = comboScaling->findData(mode);
+                            if (idx >= 0) {
+                                comboScaling->setCurrentIndex(idx);
+                            }
+                        }
+                        if (btnSpan) {
+                            const QSignalBlocker b2(btnSpan);
+                            btnSpan->setChecked(mode == WAYWAL_SCALING_SPAN);
+                        }
+                    });
+        }
+
         scaleRow->addWidget(comboScaling, 1);
         ctrlLayout->addLayout(scaleRow);
         ctrlLayout->addStretch(1);
@@ -195,6 +256,7 @@ class MonitorTopologyBar : public QWidget {
 #include "waywal/wwpkg.h"
 
 #include <QOpenGLContext>
+#include <QMatrix4x4>
 #include <QSet>
 #include <algorithm>
 #include <array>
@@ -446,6 +508,62 @@ QString resolveExtractedEntrypointPath(const uint8_t installedUuid[16],
     return bestPath;
 }
 
+void hydrateBoneRiggingPanelFromSnapshot(BoneRiggingPanel *panel,
+                                         const BoneHierarchySnapshot &rigSnap, CommandBus *bus,
+                                         IpcClient *ipc, bool &syncingDriveMode,
+                                         int32_t selectedBoneIndex = -1)
+{
+    if (!panel) {
+        return;
+    }
+    we_puppet_t puppet{};
+    std::vector<we_mdl_bone_t> bones = rigSnap.bones;
+    puppet.bone_count = static_cast<uint32_t>(bones.size());
+    puppet.bones = bones.empty() ? nullptr : bones.data();
+
+    const QSignalBlocker sigGuard(panel);
+    const QScopedValueRollback<bool> modeGuard(syncingDriveMode, true);
+    panel->setCommandBus(nullptr);
+    panel->setIpcClient(nullptr);
+    panel->loadPuppetRig(&puppet, rigSnap.objectId);
+    for (const we_ik_chain_t &ch : rigSnap.ikChains) {
+        panel->createTwoBoneIkChain(ch.root_bone, ch.mid_bone, ch.end_bone);
+    }
+    const size_t maxBones = std::min<size_t>(rigSnap.bones.size(), rigSnap.driveModes.size());
+    for (size_t b = 0; b < maxBones; ++b) {
+        if (rigSnap.driveModes[b] != WE_BONE_DRIVE_FK) {
+            panel->setBoneDriveMode(rigSnap.objectId, static_cast<int32_t>(b),
+                                    rigSnap.driveModes[b]);
+        }
+    }
+    if (selectedBoneIndex >= 0 && selectedBoneIndex < static_cast<int32_t>(rigSnap.bones.size())) {
+        panel->selectBone(selectedBoneIndex);
+    }
+    panel->setCommandBus(bus);
+    panel->setIpcClient(ipc);
+}
+
+QString formatAspectRatioGuideLabel(AspectRatioGuide guide)
+{
+    switch (guide) {
+    case AspectRatioGuide::None:
+        return QStringLiteral("Off");
+    case AspectRatioGuide::Ratio16_9:
+        return QStringLiteral("16:9");
+    case AspectRatioGuide::Ratio16_10:
+        return QStringLiteral("16:10");
+    case AspectRatioGuide::Ratio21_9:
+        return QStringLiteral("21:9");
+    case AspectRatioGuide::Ratio32_9:
+        return QStringLiteral("32:9");
+    case AspectRatioGuide::Ratio4_3:
+        return QStringLiteral("4:3");
+    case AspectRatioGuide::MatchActiveDisplay:
+        return QStringLiteral("Display");
+    }
+    return QStringLiteral("Off");
+}
+
 template <typename WizardT, typename HandlerT>
 void connectWizardInstallSignalIfPresent(MainWindow *self, WizardT *wizard, HandlerT &&handler)
 {
@@ -484,17 +602,10 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
     // 2. Setup Central Docking Architecture
     m_layoutManager = new DockLayoutManager(this, this);
 
-    // 3. Initialize CommandBus with 1,000-Step History & Drag Coalescing
-    m_commandBus = std::make_unique<CommandBus>(1000, this);
-
-    // 3b. Initialize IpcClient
+    // 3. Initialize Session Context (unparented CommandBus, PresetStore, IpcClient & Catalog)
     const bool interactiveMode = !m_options.headlessCheck && !m_options.benchmarkGrid;
-    m_ipcClient =
-        std::make_unique<IpcClient>(m_options.namespaceStr, m_options.socketPath, this, false);
-    Services::instance().setIpcClient(m_ipcClient.get());
-    if (interactiveMode) {
-        m_ipcClient->start();
-    }
+    m_session = std::make_unique<StudioSessionContext>();
+    m_session->initializeCoreServices(m_options.namespaceStr, m_options.socketPath, interactiveMode);
 
     // 4. Create and Wire all Panels & Bars
     setupPanels();
@@ -511,19 +622,22 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
     wireInterPanelSignals();
 
     // 8. Connect CommandBus Signals
-    connect(m_commandBus.get(), &CommandBus::historyChanged, this,
-            [this](bool canUndo, bool canRedo, const QString &undoText, const QString &redoText) {
-                if (m_undoAction) {
-                    m_undoAction->setEnabled(canUndo);
-                    m_undoAction->setText(canUndo ? QStringLiteral("Undo %1").arg(undoText)
-                                                  : QStringLiteral("Undo"));
-                }
-                if (m_redoAction) {
-                    m_redoAction->setEnabled(canRedo);
-                    m_redoAction->setText(canRedo ? QStringLiteral("Redo %1").arg(redoText)
-                                                  : QStringLiteral("Redo"));
-                }
-            });
+    if (auto *bus = commandBus()) {
+        connect(bus, &CommandBus::historyChanged, this,
+                [this](bool canUndo, bool canRedo, const QString &undoText,
+                       const QString &redoText) {
+                    if (m_undoAction) {
+                        m_undoAction->setEnabled(canUndo);
+                        m_undoAction->setText(canUndo ? QStringLiteral("Undo %1").arg(undoText)
+                                                      : QStringLiteral("Undo"));
+                    }
+                    if (m_redoAction) {
+                        m_redoAction->setEnabled(canRedo);
+                        m_redoAction->setText(canRedo ? QStringLiteral("Redo %1").arg(redoText)
+                                                      : QStringLiteral("Redo"));
+                    }
+                });
+    }
 
     // 9. Synchronize Perspective Switcher
     connect(m_layoutManager, &DockLayoutManager::perspectiveChanged, this,
@@ -572,72 +686,141 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
         });
     }
 
-    // 12. Setup Recursive Filesystem Watcher for Steam Workshop & Open Hub
-    if (!m_options.headlessCheck && !m_options.benchmarkGrid) {
+    // 12. Setup Cooperative Catalog Reconciliation & Recursive FS Watcher
+    if (!m_options.headlessCheck && !m_options.benchmarkGrid && m_session) {
         QPointer<MainWindow> self(this);
-        m_fsWatcher =
-            std::make_unique<RecursiveFsWatcher>([self](const std::vector<FsWatchEvent> &events) {
-                if (events.empty() || !self)
-                    return;
-                QMetaObject::invokeMethod(
-                    self.data(),
-                    [self]() {
-                        if (!self) {
-                            return;
-                        }
-                        if (self->m_workshopBrowser) {
-                            self->m_workshopBrowser->refreshLibrary();
-                        }
-                        if (self->m_openHubBrowser) {
-                            self->m_openHubBrowser->refreshFeed();
-                        }
-                    },
-                    Qt::QueuedConnection);
-            });
-
-        waywal_steam_library_t libs[16];
-        size_t libCount = waywal_steam_discover_libraries(libs, 16);
-        for (size_t i = 0; i < libCount; ++i) {
-            std::string wsDir = std::string(libs[i].path) + "/steamapps/workshop/content/431960";
-            std::error_code fsEc;
-            if (std::filesystem::exists(wsDir, fsEc) && !fsEc) {
-                m_fsWatcher->addWatchRoot(wsDir);
+        m_session->startWatchersAndReconcile([self]() {
+            if (!self) {
+                return;
             }
-        }
-        QString localHub = QDir::homePath() + QStringLiteral("/.local/share/waywal/hub");
-        QDir().mkpath(localHub);
-        const std::string localHubStd = localHub.toStdString();
-        std::error_code hubEc;
-        if (std::filesystem::exists(localHubStd, hubEc) && !hubEc) {
-            m_fsWatcher->addWatchRoot(localHubStd);
-        }
-        m_fsWatcher->start();
+            QMetaObject::invokeMethod(
+                self.data(),
+                [self]() {
+                    if (!self) {
+                        return;
+                    }
+                    if (self->m_workshopBrowser) {
+                        self->m_workshopBrowser->refreshLibrary();
+                    }
+                    if (self->m_openHubBrowser) {
+                        self->m_openHubBrowser->refreshFeed();
+                    }
+                },
+                Qt::QueuedConnection);
+        });
     }
 }
 
 MainWindow::~MainWindow()
 {
-    if (m_fsWatcher) {
-        m_fsWatcher->stop();
-        m_fsWatcher.reset();
+    // Stop background workers and detach raw service pointers before destroying child docks,
+    // ensuring ~CommandBus / ~IpcClient / ~PresetStore strictly outlive every panel (AUD-053).
+    if (m_session) {
+        m_session->shutdownAsyncWorkers();
     }
-    if (m_reconcileThread.joinable()) {
-        m_reconcileThread.request_stop();
-        m_reconcileThread.join();
-    }
-    if (m_downloadMgr) {
-        m_downloadMgr->shutdown();
-    }
-    if (Services::instance().ipcClient() == m_ipcClient.get()) {
-        Services::instance().setIpcClient(nullptr);
-    }
-    if (m_ipcClient) {
-        m_ipcClient->stop();
-    }
+    detachPanelServicePointers();
+
     if (m_previewViewport && !m_previewViewport->parent()) {
         delete m_previewViewport;
         m_previewViewport = nullptr;
     }
+
+    const auto directDocks = findChildren<QDockWidget *>(QString(), Qt::FindDirectChildrenOnly);
+    for (QDockWidget *dock : directDocks) {
+        delete dock;
+    }
+    delete m_layoutManager;
+    m_layoutManager = nullptr;
+
+    m_session.reset();
+}
+
+void MainWindow::detachPanelServicePointers() noexcept
+{
+    if (m_previewViewport) {
+        m_previewViewport->setCommandBus(nullptr);
+    }
+    if (m_bezierEditor) {
+        m_bezierEditor->setCommandBus(nullptr);
+    }
+    if (m_propertyInspector) {
+        m_propertyInspector->setCommandBus(nullptr);
+        m_propertyInspector->setIpcClient(nullptr);
+        m_propertyInspector->setPresetStore(nullptr);
+    }
+    if (m_nodeGraphEditor) {
+        m_nodeGraphEditor->setCommandBus(nullptr);
+        m_nodeGraphEditor->setIpcClient(nullptr);
+    }
+    if (m_cameraLightingInspector) {
+        m_cameraLightingInspector->setCommandBus(nullptr);
+        m_cameraLightingInspector->setIpcClient(nullptr);
+    }
+    if (m_physicsSpringInspector) {
+        m_physicsSpringInspector->setCommandBus(nullptr);
+        m_physicsSpringInspector->setIpcClient(nullptr);
+    }
+    if (m_sceneLayerTree) {
+        m_sceneLayerTree->setCommandBus(nullptr);
+        m_sceneLayerTree->setIpcClient(nullptr);
+    }
+    if (m_brushPainter) {
+        m_brushPainter->setCommandBus(nullptr);
+        m_brushPainter->setIpcClient(nullptr);
+    }
+    if (m_particleDesigner) {
+        m_particleDesigner->setCommandBus(nullptr);
+        m_particleDesigner->setIpcClient(nullptr);
+    }
+    if (m_audioBindingWizard) {
+        m_audioBindingWizard->setCommandBus(nullptr);
+        m_audioBindingWizard->setIpcClient(nullptr);
+    }
+    if (m_codeEditor) {
+        m_codeEditor->setIpcClient(nullptr);
+        m_codeEditor->setSharedOpenGLContext(nullptr);
+    }
+    if (m_puppetMeshPanel) {
+        m_puppetMeshPanel->setCommandBus(nullptr);
+        m_puppetMeshPanel->setIpcClient(nullptr);
+    }
+    if (m_boneRiggingPanel) {
+        m_boneRiggingPanel->setCommandBus(nullptr);
+        m_boneRiggingPanel->setIpcClient(nullptr);
+    }
+    if (m_weightPaintPanel) {
+        m_weightPaintPanel->setCommandBus(nullptr);
+        m_weightPaintPanel->setIpcClient(nullptr);
+    }
+    if (m_dopeSheetTimeline) {
+        m_dopeSheetTimeline->setCommandBus(nullptr);
+        m_dopeSheetTimeline->setIpcClient(nullptr);
+    }
+}
+
+CommandBus *MainWindow::commandBus() const
+{
+    return m_session ? m_session->commandBus() : nullptr;
+}
+PresetStore *MainWindow::presetStore() const
+{
+    return m_session ? m_session->presetStore() : nullptr;
+}
+CatalogIndexManager *MainWindow::catalogIndexManager() const
+{
+    return m_session ? m_session->catalogIndexManager().get() : nullptr;
+}
+DownloadManager *MainWindow::downloadManager() const
+{
+    return m_session ? m_session->downloadManager().get() : nullptr;
+}
+RecursiveFsWatcher *MainWindow::fsWatcher() const
+{
+    return m_session ? m_session->fsWatcher() : nullptr;
+}
+IpcClient *MainWindow::ipcClient() const
+{
+    return m_session ? m_session->ipcClient() : nullptr;
 }
 
 MonitorTopologyBar *MainWindow::topologyBar() const { return m_topologyBar; }
@@ -679,12 +862,10 @@ void MainWindow::setupPanels()
     m_layoutManager->registerPanel(QStringLiteral("MonitorTopologyBar"), m_topologyBar,
                                    QStringLiteral("Displays"), Qt::TopDockWidgetArea);
 
-    // Catalog & Download Managers
-    m_catalogIndexMgr = std::make_shared<CatalogIndexManager>();
-    m_downloadMgr = std::make_shared<DownloadManager>();
-    if (!m_options.headlessCheck && !m_options.benchmarkGrid) {
-        (void)m_downloadMgr->initialize();
-    }
+    const auto catalogMgr = m_session ? m_session->catalogIndexManager()
+                                      : std::shared_ptr<CatalogIndexManager>();
+    const auto dlMgr = m_session ? m_session->downloadManager()
+                                 : std::shared_ptr<DownloadManager>();
 
     // Panel 2 (Left Dock Tab 1): Virtualized Wallpaper Grid
     m_gridWidget = new VirtualizedGridWidget(this);
@@ -692,69 +873,43 @@ void MainWindow::setupPanels()
                                    QStringLiteral("Library"), Qt::LeftDockWidgetArea);
 
     // Panel 2 (Left Dock Tab 2): Steam Workshop Browser
-    m_workshopBrowser = new WorkshopBrowserWidget(m_catalogIndexMgr, m_downloadMgr, this);
+    m_workshopBrowser = new WorkshopBrowserWidget(catalogMgr, dlMgr, this);
     m_layoutManager->registerPanel(QStringLiteral("WorkshopBrowser"), m_workshopBrowser,
                                    QStringLiteral("Workshop"), Qt::LeftDockWidgetArea);
 
     // Panel 2 (Left Dock Tab 3): Open Hub Browser
-    m_openHubBrowser = new OpenHubBrowserWidget(m_downloadMgr, this);
+    m_openHubBrowser = new OpenHubBrowserWidget(dlMgr, this);
     m_layoutManager->registerPanel(QStringLiteral("OpenHubBrowser"), m_openHubBrowser,
                                    QStringLiteral("Open Hub"), Qt::LeftDockWidgetArea);
 
-    if (!m_options.headlessCheck && !m_options.benchmarkGrid && m_catalogIndexMgr) {
-        QPointer<MainWindow> self(this);
-        auto indexMgr = m_catalogIndexMgr;
-        m_reconcileThread = std::jthread([self, indexMgr](std::stop_token st) {
-            if (!indexMgr || st.stop_requested()) {
-                return;
-            }
-            (void)indexMgr->reconcileAllLibraries();
-            if (st.stop_requested() || !self) {
-                return;
-            }
-            QMetaObject::invokeMethod(
-                self.data(),
-                [self]() {
-                    if (self && self->m_workshopBrowser) {
-                        self->m_workshopBrowser->refreshLibrary();
-                    }
-                },
-                Qt::QueuedConnection);
-        });
-    }
-
     // Panel 3 (Center Dock Top): GPU Preview Viewport
-#if QT_VERSION < QT_VERSION_CHECK(6, 6, 0)
+    // Always avoid parenting QOpenGLWidget directly under a dock in headless offscreen mode
+    // across every Qt 6 release, keeping previewViewport() non-null for tests (AUD-184).
     if (QGuiApplication::platformName() == QLatin1String("offscreen")) {
         m_previewViewport = new GpuPreviewViewport(nullptr);
-        m_previewViewport->setCommandBus(m_commandBus.get());
+        m_previewViewport->setCommandBus(commandBus());
         auto *offscreenPlaceholder = new QWidget(this);
         offscreenPlaceholder->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
         m_layoutManager->registerPanel(QStringLiteral("GpuPreviewViewport"), offscreenPlaceholder,
                                        QStringLiteral("Preview"), Qt::RightDockWidgetArea);
     } else {
         m_previewViewport = new GpuPreviewViewport(this);
-        m_previewViewport->setCommandBus(m_commandBus.get());
+        m_previewViewport->setCommandBus(commandBus());
         m_layoutManager->registerPanel(QStringLiteral("GpuPreviewViewport"), m_previewViewport,
                                        QStringLiteral("Preview"), Qt::RightDockWidgetArea);
     }
-#else
-    m_previewViewport = new GpuPreviewViewport(this);
-    m_previewViewport->setCommandBus(m_commandBus.get());
-    m_layoutManager->registerPanel(QStringLiteral("GpuPreviewViewport"), m_previewViewport,
-                                   QStringLiteral("Preview"), Qt::RightDockWidgetArea);
-#endif
 
     // Panel 4 (Center Dock Bottom): Transition Cubic Bezier Editor
     m_bezierEditor = new CubicBezierEditorWidget(this);
-    m_bezierEditor->setCommandBus(m_commandBus.get());
+    m_bezierEditor->setCommandBus(commandBus());
     m_layoutManager->registerPanel(QStringLiteral("CubicBezier"), m_bezierEditor,
                                    QStringLiteral("Transitions"), Qt::RightDockWidgetArea);
 
     // Panel 5 (Right Dock Tab 1): Live Scene & Shader Inspector
     m_propertyInspector = new PropertyInspectorWidget(this);
-    m_propertyInspector->setCommandBus(m_commandBus.get());
-    m_propertyInspector->setIpcClient(m_ipcClient.get());
+    m_propertyInspector->setCommandBus(commandBus());
+    m_propertyInspector->setIpcClient(ipcClient());
+    m_propertyInspector->setPresetStore(presetStore());
     m_layoutManager->registerPanel(QStringLiteral("PropertyInspectorWidget"), m_propertyInspector,
                                    QStringLiteral("Inspector"), Qt::RightDockWidgetArea);
 
@@ -764,8 +919,8 @@ void MainWindow::setupPanels()
                                    QStringLiteral("Theme"), Qt::RightDockWidgetArea);
 
     m_nodeGraphEditor = new NodeGraphEditorWidget(this);
-    m_nodeGraphEditor->setCommandBus(m_commandBus.get());
-    m_nodeGraphEditor->setIpcClient(m_ipcClient.get());
+    m_nodeGraphEditor->setCommandBus(commandBus());
+    m_nodeGraphEditor->setIpcClient(ipcClient());
     m_layoutManager->registerPanel(QStringLiteral("NodeGraphEditorWidget"), m_nodeGraphEditor,
                                    QStringLiteral("Shader Graph"), Qt::RightDockWidgetArea);
 
@@ -775,15 +930,19 @@ void MainWindow::setupPanels()
                                    Qt::LeftDockWidgetArea);
 
     m_cameraLightingInspector = new CameraLightingInspectorWidget(this);
-    m_cameraLightingInspector->setCommandBus(m_commandBus.get());
-    m_cameraLightingInspector->setIpcClient(m_ipcClient.get());
+    m_cameraLightingInspector->setCommandBus(commandBus());
+    m_cameraLightingInspector->setIpcClient(ipcClient());
+    if (m_previewViewport) {
+        m_previewViewport->setGizmoCameraAndLights(m_cameraLightingInspector->camera(),
+                                                   m_cameraLightingInspector->lighting());
+    }
     m_layoutManager->registerPanel(QStringLiteral("CameraLightingInspectorWidget"),
                                    m_cameraLightingInspector, QStringLiteral("Camera & Lights"),
                                    Qt::RightDockWidgetArea);
 
     m_physicsSpringInspector = new PhysicsSpringInspectorWidget(this);
-    m_physicsSpringInspector->setCommandBus(m_commandBus.get());
-    m_physicsSpringInspector->setIpcClient(m_ipcClient.get());
+    m_physicsSpringInspector->setCommandBus(commandBus());
+    m_physicsSpringInspector->setIpcClient(ipcClient());
     m_layoutManager->registerPanel(QStringLiteral("PhysicsSpringInspectorWidget"),
                                    m_physicsSpringInspector, QStringLiteral("Puppet Physics"),
                                    Qt::RightDockWidgetArea);
@@ -798,34 +957,72 @@ void MainWindow::setupPanels()
         QStringLiteral("SceneLayerTree"), QStringLiteral("Scene Hierarchy"),
         [this](QWidget *parent) -> QWidget * {
             auto *tree = new SceneLayerTreeWidget(parent);
-            tree->setCommandBus(m_commandBus.get());
-            tree->setIpcClient(m_ipcClient.get());
+            const QString targetOut = resolveSelectedOutputsCsv();
+            tree->setCommandBus(commandBus());
+            tree->setIpcClient(ipcClient());
+            tree->setTargetOutput(targetOut);
             if (!m_lastSceneTreeJson.isEmpty()) {
                 tree->loadFromSceneJson(m_lastSceneTreeJson);
+            } else if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+                ipc->sendQuerySceneTree(targetOut);
             }
             connect(tree, &SceneLayerTreeWidget::objectSelected, this,
                     [this, tree](int32_t objectId, we_scene_node_kind_t kind) {
+                        const SceneLayerNode *node = tree->selectedNode();
+                        const QString activeOut = resolveSelectedOutputsCsv();
                         if (m_previewViewport) {
-                            m_previewViewport->setGizmoActiveNode(tree->selectedNode());
+                            m_previewViewport->setGizmoActiveNode(node);
                         }
                         if (m_propertyInspector) {
+                            m_propertyInspector->setTargetOutput(activeOut);
                             m_propertyInspector->setTargetObjectId(objectId, 0);
                         }
-                        if (objectId >= 0 && kind == WE_NODE_IMAGE) {
-                            const auto *node = tree->selectedNode();
-                            const uint32_t texW =
-                                (node && node->size[0] >= 1.0f)
-                                    ? static_cast<uint32_t>(std::lround(node->size[0]))
-                                    : (m_previewViewport && m_previewViewport->contentWidth() > 0u
-                                           ? m_previewViewport->contentWidth()
-                                           : 512u);
-                            const uint32_t texH =
-                                (node && node->size[1] >= 1.0f)
-                                    ? static_cast<uint32_t>(std::lround(node->size[1]))
-                                    : (m_previewViewport && m_previewViewport->contentHeight() > 0u
-                                           ? m_previewViewport->contentHeight()
-                                           : 512u);
+                        if (m_audioBindingWizard) {
+                            m_audioBindingWizard->setTargetOutput(activeOut);
+                        }
+                        if (objectId < 0) {
+                            return;
+                        }
+                        const uint32_t texW =
+                            (node && node->size[0] >= 1.0f)
+                                ? static_cast<uint32_t>(std::lround(node->size[0]))
+                                : (m_previewViewport && m_previewViewport->contentWidth() > 0u
+                                       ? m_previewViewport->contentWidth()
+                                       : 512u);
+                        const uint32_t texH =
+                            (node && node->size[1] >= 1.0f)
+                                ? static_cast<uint32_t>(std::lround(node->size[1]))
+                                : (m_previewViewport && m_previewViewport->contentHeight() > 0u
+                                       ? m_previewViewport->contentHeight()
+                                       : 512u);
+                        if (kind == WE_NODE_IMAGE) {
                             setActivePuppetObjectContext(objectId, texW, texH);
+                            if (m_brushPainter) {
+                                m_brushPainter->setTargetOutput(activeOut);
+                                m_brushPainter->setTargetTextureSlot(objectId, 0u, 0u, texW, texH,
+                                                                     0u);
+                            }
+                            if (m_physicsSpringInspector && m_hasCachedPuppetRig &&
+                                m_cachedPuppetRig.objectId == objectId) {
+                                we_puppet_t physPuppet{};
+                                std::vector<we_mdl_bone_t> bones = m_cachedPuppetRig.bones;
+                                physPuppet.bone_count = static_cast<uint32_t>(bones.size());
+                                physPuppet.bones = bones.empty() ? nullptr : bones.data();
+                                m_physicsSpringInspector->setTargetOutput(activeOut);
+                                m_physicsSpringInspector->loadPuppetSkeleton(&physPuppet, objectId);
+                            }
+                        } else if (kind == WE_NODE_PARTICLE) {
+                            if (m_particleDesigner) {
+                                m_particleDesigner->setTargetOutput(activeOut);
+                                m_particleDesigner->loadParticleSystem(objectId, nullptr);
+                            }
+                        } else if (kind == WE_NODE_CAMERA3D || kind == WE_NODE_LIGHT) {
+                            if (m_cameraLightingInspector) {
+                                m_cameraLightingInspector->setTargetOutput(activeOut);
+                                m_cameraLightingInspector->setCameraAndLights(
+                                    m_cameraLightingInspector->camera(),
+                                    m_cameraLightingInspector->lighting());
+                            }
                         }
                     });
             connect(tree, &SceneLayerTreeWidget::statusMessage, this, [this](const QString &msg) {
@@ -842,8 +1039,42 @@ void MainWindow::setupPanels()
         QStringLiteral("GpuBrushPainter"), QStringLiteral("GPU Paint Brush"),
         [this](QWidget *parent) -> QWidget * {
             auto *brush = new GpuBrushPainterWidget(parent);
-            brush->setCommandBus(m_commandBus.get());
-            brush->setIpcClient(m_ipcClient.get());
+            brush->setCommandBus(commandBus());
+            brush->setIpcClient(ipcClient());
+            brush->setTargetOutput(resolveSelectedOutputsCsv());
+            if (m_sceneLayerTree && m_sceneLayerTree->selectedObjectId() >= 0) {
+                const SceneLayerNode *node = m_sceneLayerTree->selectedNode();
+                const uint32_t texW =
+                    (node && node->size[0] >= 1.0f)
+                        ? static_cast<uint32_t>(std::lround(node->size[0]))
+                        : (m_previewViewport && m_previewViewport->contentWidth() > 0u
+                               ? m_previewViewport->contentWidth()
+                               : 512u);
+                const uint32_t texH =
+                    (node && node->size[1] >= 1.0f)
+                        ? static_cast<uint32_t>(std::lround(node->size[1]))
+                        : (m_previewViewport && m_previewViewport->contentHeight() > 0u
+                               ? m_previewViewport->contentHeight()
+                               : 512u);
+                brush->setTargetTextureSlot(m_sceneLayerTree->selectedObjectId(), 0u, 0u, texW,
+                                            texH, 0u);
+            }
+            connect(brush, &GpuBrushPainterWidget::targetChannelOverlayRequested, this,
+                    [this](we_brush_channel_t channel, bool showOverlay) {
+                        if (m_previewViewport) {
+                            m_previewViewport->setShaderUniform(QStringLiteral("u_brushOverlay"),
+                                                                showOverlay ? 1 : 0);
+                            m_previewViewport->setShaderUniform(QStringLiteral("u_brushChannel"),
+                                                                static_cast<int>(channel));
+                        }
+                        if (m_statusLabel) {
+                            m_statusLabel->setText(
+                                QStringLiteral("Brush overlay channel %1 %2")
+                                    .arg(static_cast<int>(channel))
+                                    .arg(showOverlay ? QStringLiteral("enabled")
+                                                     : QStringLiteral("disabled")));
+                        }
+                    });
             connect(brush, &GpuBrushPainterWidget::statusMessage, this, [this](const QString &msg) {
                 if (m_statusLabel) {
                     m_statusLabel->setText(msg);
@@ -858,8 +1089,34 @@ void MainWindow::setupPanels()
         QStringLiteral("ParticleDesigner"), QStringLiteral("Particle Designer"),
         [this](QWidget *parent) -> QWidget * {
             auto *designer = new ParticleDesignerWidget(parent);
-            designer->setCommandBus(m_commandBus.get());
-            designer->setIpcClient(m_ipcClient.get());
+            designer->setCommandBus(commandBus());
+            designer->setIpcClient(ipcClient());
+            designer->setTargetOutput(resolveSelectedOutputsCsv());
+            if (m_sceneLayerTree && m_sceneLayerTree->selectedObjectId() >= 0) {
+                const SceneLayerNode *node = m_sceneLayerTree->selectedNode();
+                if (node && node->kind == WE_NODE_PARTICLE) {
+                    designer->loadParticleSystem(node->id, nullptr);
+                }
+            }
+            connect(designer, &ParticleDesignerWidget::particleSystemModified, this,
+                    [this](int32_t objectId, const QString &jsonDefinition) {
+                        if (m_sceneLayerTree) {
+                            if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+                                ipc->sendQuerySceneTree(resolveSelectedOutputsCsv());
+                            }
+                        }
+                        if (m_statusLabel && !jsonDefinition.isEmpty()) {
+                            m_statusLabel->setText(
+                                QStringLiteral("Updated particle system (object %1)").arg(objectId));
+                        }
+                    });
+            connect(designer, &ParticleDesignerWidget::controlPointOverlayUpdated, this,
+                    [this](int32_t objectId) {
+                        if (m_previewViewport) {
+                            m_previewViewport->setShaderUniform(
+                                QStringLiteral("u_particleControlObjectId"), objectId);
+                        }
+                    });
             connect(designer, &ParticleDesignerWidget::statusMessage, this,
                     [this](const QString &msg) {
                         if (m_statusLabel) {
@@ -875,8 +1132,9 @@ void MainWindow::setupPanels()
         QStringLiteral("AudioBindingWizard"), QStringLiteral("Audio Bindings"),
         [this](QWidget *parent) -> QWidget * {
             auto *wiz = new AudioBindingWizard(parent);
-            wiz->setCommandBus(m_commandBus.get());
-            wiz->setIpcClient(m_ipcClient.get());
+            wiz->setCommandBus(commandBus());
+            wiz->setIpcClient(ipcClient());
+            wiz->setTargetOutput(resolveSelectedOutputsCsv());
             connect(wiz, &AudioBindingWizard::bindingsUpdated, this,
                     [this](const std::vector<we_audio_binding_t> &bindings) {
                         if (!m_propertyInspector) {
@@ -911,10 +1169,9 @@ void MainWindow::setupPanels()
         QStringLiteral("GlslSceneScriptEditor"), QStringLiteral("Code Editor"),
         [this](QWidget *parent) -> QWidget * {
             auto *editor = new GlslSceneScriptEditorWidget(parent);
-            editor->setIpcClient(m_ipcClient.get());
-            if (m_previewViewport && m_previewViewport->context()) {
-                editor->setSharedOpenGLContext(m_previewViewport->context());
-            }
+            editor->setIpcClient(ipcClient());
+            m_codeEditor = editor;
+            updateGpuShaderEditorContext();
             connect(editor, &GlslSceneScriptEditorWidget::shaderMetadataExtracted, this,
                     [this](const waywal_shader_meta_t &meta, const QString &rawComboJson) {
                         if (m_propertyInspector) {
@@ -939,15 +1196,17 @@ void MainWindow::setupPanels()
                 if (lower.endsWith(QStringLiteral(".glsl")) ||
                     lower.endsWith(QStringLiteral(".frag")) ||
                     lower.endsWith(QStringLiteral(".comp"))) {
-                    QFile f(m_activeWallpaperPath);
-                    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                    QString source;
+                    QString readErr;
+                    if (StudioSessionContext::readBoundedUtf8File(m_activeWallpaperPath, source,
+                                                                  readErr)) {
                         editor->openDocument(EditorLanguageMode::GlslEs310Fragment, -1, 0,
-                                             QFileInfo(m_activeWallpaperPath).fileName(),
-                                             QString::fromUtf8(f.readAll()));
+                                             QFileInfo(m_activeWallpaperPath).fileName(), source);
+                    } else if (m_statusLabel && !readErr.isEmpty()) {
+                        m_statusLabel->setText(readErr);
                     }
                 }
             }
-            m_codeEditor = editor;
             return editor;
         },
         Qt::BottomDockWidgetArea);
@@ -956,8 +1215,8 @@ void MainWindow::setupPanels()
         QStringLiteral("PuppetMeshPanel"), QStringLiteral("Puppet Mesh"),
         [this](QWidget *parent) -> QWidget * {
             auto *panel = new PuppetMeshPanel(parent);
-            panel->setCommandBus(m_commandBus.get());
-            panel->setIpcClient(m_ipcClient.get());
+            panel->setCommandBus(commandBus());
+            panel->setIpcClient(ipcClient());
             connect(panel, &PuppetMeshPanel::meshGenerated, this,
                     [this, panel](int32_t objectId, uint32_t /*vertexCount*/,
                                   uint32_t /*triangleCount*/, float /*minAngleDeg*/) {
@@ -1005,7 +1264,8 @@ void MainWindow::setupPanels()
             connect(
                 panel, &PuppetMeshPanel::exportMdlRequested, this,
                 [this](int32_t objectId, const QString &destPath) {
-                    if (!m_ipcClient || objectId < 0 || destPath.isEmpty()) {
+                    auto *ipc = ipcClient();
+                    if (!ipc || objectId < 0 || destPath.isEmpty()) {
                         return;
                     }
                     m_pendingMdlExportPaths[objectId] = destPath;
@@ -1016,8 +1276,8 @@ void MainWindow::setupPanels()
                         waywal_ipc_export_path_is_allowed(pathBa.constData(), resolved,
                                                           sizeof(resolved));
                     const uint32_t flags = inAllowedDir ? 0x3u : 0x1u;
-                    if (!m_ipcClient->sendExportPuppetMdl(static_cast<uint32_t>(objectId), flags,
-                                                          inAllowedDir ? destPath : QString())) {
+                    if (!ipc->sendExportPuppetMdl(static_cast<uint32_t>(objectId), flags,
+                                                  inAllowedDir ? destPath : QString())) {
                         m_pendingMdlExportPaths.erase(objectId);
                     }
                 });
@@ -1039,8 +1299,8 @@ void MainWindow::setupPanels()
         QStringLiteral("BoneRiggingPanel"), QStringLiteral("Bone Rigging"),
         [this](QWidget *parent) -> QWidget * {
             auto *panel = new BoneRiggingPanel(parent);
-            panel->setCommandBus(m_commandBus.get());
-            panel->setIpcClient(m_ipcClient.get());
+            panel->setCommandBus(commandBus());
+            panel->setIpcClient(ipcClient());
             connect(panel, &BoneRiggingPanel::boneSelected, this, [this](int32_t boneIndex) {
                 if (m_previewViewport) {
                     m_previewViewport->setSelectedPuppetBone(boneIndex);
@@ -1067,6 +1327,13 @@ void MainWindow::setupPanels()
                     }
                     if (m_physicsSpringInspector && !m_syncingBoneDriveMode) {
                         const QScopedValueRollback<bool> guard(m_syncingBoneDriveMode, true);
+                        we_puppet_t physPuppet{};
+                        std::vector<we_mdl_bone_t> physBones = snapshot.bones;
+                        physPuppet.bone_count = static_cast<uint32_t>(physBones.size());
+                        physPuppet.bones = physBones.empty() ? nullptr : physBones.data();
+                        m_physicsSpringInspector->setTargetOutput(resolveSelectedOutputsCsv());
+                        m_physicsSpringInspector->loadPuppetSkeleton(&physPuppet, objectId);
+
                         std::vector<QString> names;
                         std::vector<int32_t> parents;
                         names.reserve(snapshot.bones.size());
@@ -1096,7 +1363,8 @@ void MainWindow::setupPanels()
                 });
             connect(panel, &BoneRiggingPanel::ikPreviewRequested, this,
                     [this](int32_t objectId, const we_ik_chain_t &chain) {
-                        if (m_ipcClient && objectId >= 0) {
+                        auto *ipc = ipcClient();
+                        if (ipc && objectId >= 0) {
                             waywal_ipc_puppet_preview_ik_t req{};
                             req.object_id = static_cast<uint32_t>(objectId);
                             req.root_bone = chain.root_bone;
@@ -1107,7 +1375,7 @@ void MainWindow::setupPanels()
                             req.target_world[1] = chain.target_world[1];
                             req.target_world[2] = chain.target_world[2];
                             req.mode_flags = 1u;
-                            m_ipcClient->sendPuppetPreviewIk(req);
+                            ipc->sendPuppetPreviewIk(req);
                         }
                     });
             connect(panel, &BoneRiggingPanel::statusMessage, this, [this](const QString &msg) {
@@ -1117,11 +1385,11 @@ void MainWindow::setupPanels()
             });
             if (m_hasCachedPuppetRig && (m_activePuppetObjectId < 0 ||
                                          m_cachedPuppetRig.objectId == m_activePuppetObjectId)) {
-                we_puppet_t puppet{};
-                std::vector<we_mdl_bone_t> bones = m_cachedPuppetRig.bones;
-                puppet.bone_count = static_cast<uint32_t>(bones.size());
-                puppet.bones = bones.empty() ? nullptr : bones.data();
-                panel->loadPuppetRig(&puppet, m_cachedPuppetRig.objectId);
+                // Hydrate cached bones, IK chains, and non-FK drive modes without generating
+                // synthetic undo entries or clobbering m_cachedPuppetRig (AUD-180).
+                const BoneHierarchySnapshot cachedRig = m_cachedPuppetRig;
+                hydrateBoneRiggingPanelFromSnapshot(panel, cachedRig, commandBus(), ipcClient(),
+                                                    m_syncingBoneDriveMode);
             } else if (m_activePuppetObjectId >= 0) {
                 panel->loadPuppetRig(nullptr, m_activePuppetObjectId);
             }
@@ -1143,8 +1411,8 @@ void MainWindow::setupPanels()
         QStringLiteral("WeightPaintPanel"), QStringLiteral("Weight Paint"),
         [this](QWidget *parent) -> QWidget * {
             auto *panel = new WeightPaintPanel(parent);
-            panel->setCommandBus(m_commandBus.get());
-            panel->setIpcClient(m_ipcClient.get());
+            panel->setCommandBus(commandBus());
+            panel->setIpcClient(ipcClient());
             connect(panel, &WeightPaintPanel::heatmapModeChanged, this,
                     [this](int32_t /*objectId*/, bool enabled, uint32_t activeBoneIdx,
                            float opacity, we_heatmap_palette_t palette) {
@@ -1182,8 +1450,8 @@ void MainWindow::setupPanels()
         QStringLiteral("DopeSheetTimelineWidget"), QStringLiteral("Timeline / Dope-Sheet"),
         [this](QWidget *parent) -> QWidget * {
             auto *timeline = new DopeSheetTimelineWidget(parent);
-            timeline->setCommandBus(m_commandBus.get());
-            timeline->setIpcClient(m_ipcClient.get());
+            timeline->setCommandBus(commandBus());
+            timeline->setIpcClient(ipcClient());
             connect(timeline, &DopeSheetTimelineWidget::frameChanged, this,
                     [this](double /*frame*/, double /*timeSec*/) {
                         if (m_onionSkinEnabled) {
@@ -1208,6 +1476,14 @@ void MainWindow::setupPanels()
                         }
                     });
             hydrateDopeSheetTimeline(timeline);
+            if (auto *clipCombo = timeline->findChild<QComboBox *>(QStringLiteral("timelineClipCombo"))) {
+                connect(clipCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                        [this](int /*idx*/) {
+                            if (m_onionSkinEnabled) {
+                                refreshOnionSkinFrames();
+                            }
+                        });
+            }
             m_dopeSheetTimeline = timeline;
             return timeline;
         },
@@ -1215,6 +1491,131 @@ void MainWindow::setupPanels()
 
     // Remove standard status bar to let custom FooterBar shine
     setStatusBar(nullptr);
+
+    if (m_previewViewport) {
+        QPointer<QOpenGLContext> lastBoundCtx;
+        connect(m_previewViewport, &QOpenGLWidget::frameSwapped, this,
+                [this, lastBoundCtx]() mutable {
+                    if (!m_previewViewport || !m_codeEditor) {
+                        return;
+                    }
+                    QOpenGLContext *cur = m_previewViewport->context();
+                    if (cur != lastBoundCtx.data()) {
+                        lastBoundCtx = cur;
+                        updateGpuShaderEditorContext();
+                    }
+                });
+    }
+    syncMonitorCatalogToPanels();
+}
+
+QString MainWindow::resolveSelectedOutputsCsv() const
+{
+    if (!m_topologyBar || !m_topologyBar->canvas()) {
+        return QStringLiteral("*");
+    }
+    auto *canvas = m_topologyBar->canvas();
+    if (canvas->isDesktopSpanMode()) {
+        return QStringLiteral("*");
+    }
+    const QStringList selected = canvas->selectedMonitorNames();
+    if (selected.isEmpty()) {
+        if (m_previewViewport) {
+            const QString vpSel = m_previewViewport->selectedMonitor().trimmed();
+            if (!vpSel.isEmpty()) {
+                return normalizeTargetOutputSpec(vpSel);
+            }
+        }
+        return QStringLiteral("*");
+    }
+    return selected.join(QLatin1Char(','));
+}
+
+void MainWindow::syncMonitorCatalogToPanels()
+{
+    if (!m_topologyBar || !m_topologyBar->canvas()) {
+        return;
+    }
+    auto *canvas = m_topologyBar->canvas();
+    QStringList names;
+    const auto &monitors = canvas->monitors();
+    names.reserve(monitors.size());
+    for (const MonitorInfo &info : monitors) {
+        if (!info.name.isEmpty()) {
+            names.push_back(info.name);
+        }
+    }
+    if (m_previewViewport) {
+        const QSignalBlocker vpBlocker(m_previewViewport);
+        m_previewViewport->setAvailableMonitors(names);
+        const QStringList selected = canvas->selectedMonitorNames();
+        if (!selected.isEmpty()) {
+            m_previewViewport->setSelectedMonitor(selected.first());
+        } else if (!names.isEmpty()) {
+            m_previewViewport->setSelectedMonitor(names.first());
+        }
+    }
+    const QString targetOut = resolveSelectedOutputsCsv();
+    if (m_propertyInspector) {
+        m_propertyInspector->setTargetOutput(targetOut);
+    }
+    if (m_nodeGraphEditor) {
+        m_nodeGraphEditor->setTargetOutput(targetOut);
+    }
+    if (m_cameraLightingInspector) {
+        m_cameraLightingInspector->setTargetOutput(targetOut);
+    }
+    if (m_physicsSpringInspector) {
+        m_physicsSpringInspector->setTargetOutput(targetOut);
+    }
+    if (m_sceneLayerTree) {
+        m_sceneLayerTree->setTargetOutput(targetOut);
+    }
+    if (m_brushPainter) {
+        m_brushPainter->setTargetOutput(targetOut);
+    }
+    if (m_particleDesigner) {
+        m_particleDesigner->setTargetOutput(targetOut);
+    }
+    if (m_audioBindingWizard) {
+        m_audioBindingWizard->setTargetOutput(targetOut);
+    }
+    if (m_codeEditor) {
+        m_codeEditor->setTargetOutput(targetOut);
+    }
+}
+
+void MainWindow::updateGpuShaderEditorContext()
+{
+    if (!m_previewViewport || !m_codeEditor) {
+        return;
+    }
+    QOpenGLContext *ctx = m_previewViewport->context();
+    m_codeEditor->setSharedOpenGLContext(ctx);
+    if (ctx) {
+        QPointer<GlslSceneScriptEditorWidget> safeEditor(m_codeEditor);
+        connect(
+            ctx, &QOpenGLContext::aboutToBeDestroyed, this,
+            [safeEditor]() {
+                if (safeEditor) {
+                    safeEditor->setSharedOpenGLContext(nullptr);
+                }
+            },
+            Qt::UniqueConnection);
+    }
+}
+
+void MainWindow::syncThemeStateToIpcOrActiveWallpaper(bool includeApplyHint)
+{
+    if (!m_themeStudio) {
+        return;
+    }
+    if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+        ipc->sendAudioPowerConfig(m_audioVolume, m_muteOnAudio ? 1 : 0, 0, m_batteryPolicy);
+    }
+    if (includeApplyHint && !m_activeWallpaperPath.isEmpty() && QFileInfo::exists(m_activeWallpaperPath)) {
+        applyWallpaperPath(m_activeWallpaperPath, resolveSelectedOutputsCsv());
+    }
 }
 
 void MainWindow::setupMenuBar()
@@ -1227,47 +1628,57 @@ void MainWindow::setupMenuBar()
     auto *openWallpaperAction = fileMenu->addAction(QStringLiteral("Open &Wallpaper..."));
     openWallpaperAction->setShortcut(QKeySequence::Open);
     connect(openWallpaperAction, &QAction::triggered, this, [this]() {
-        QString file = QFileDialog::getOpenFileName(
+        auto *dlg = new QFileDialog(
             this, QStringLiteral("Open Wallpaper"), QString(),
             QStringLiteral("Wallpaper Media (*.png *.jpg *.jpeg *.webp *.jxl *.avif *.svg *.mp4 "
                            "*.webm *.gif *.glsl *.frag);;All Files (*)"));
-        if (!file.isEmpty()) {
-            m_activeWallpaperPath = file;
+        dlg->setFileMode(QFileDialog::ExistingFile);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        QPointer<MainWindow> self(this);
+        connect(dlg, &QFileDialog::fileSelected, this, [self](const QString &file) {
+            if (!self || file.isEmpty()) {
+                return;
+            }
+            self->m_activeWallpaperPath = file;
             const QString ext = QFileInfo(file).suffix().toLower();
             const bool isShader = (ext == QStringLiteral("glsl") || ext == QStringLiteral("frag") ||
                                    ext == QStringLiteral("comp"));
-            if (m_previewViewport) {
+            QString boundedSource;
+            QString readErr;
+            if (isShader &&
+                !StudioSessionContext::readBoundedUtf8File(file, boundedSource, readErr)) {
+                if (self->m_statusLabel && !readErr.isEmpty()) {
+                    self->m_statusLabel->setText(readErr);
+                }
+                return;
+            }
+            if (self->m_previewViewport) {
                 if (isShader) {
-                    QFile f(file);
-                    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-                        m_previewViewport->setPreviewShader(QString::fromUtf8(f.readAll()));
-                    }
+                    self->m_previewViewport->setPreviewShader(boundedSource);
                 } else {
-                    m_previewViewport->setPreviewImagePath(file);
+                    self->m_previewViewport->setPreviewImagePath(file);
                 }
             }
-            if (isShader && m_propertyInspector) {
-                m_propertyInspector->loadShaderFile(file);
+            if (isShader && self->m_propertyInspector) {
+                self->m_propertyInspector->loadShaderFile(file);
             }
-            if (isShader && m_codeEditor) {
-                QFile f(file);
-                if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-                    m_codeEditor->openDocument(EditorLanguageMode::GlslEs310Fragment, -1, 0,
-                                               QFileInfo(file).fileName(),
-                                               QString::fromUtf8(f.readAll()));
-                }
+            if (isShader && self->m_codeEditor) {
+                self->m_codeEditor->openDocument(EditorLanguageMode::GlslEs310Fragment, -1, 0,
+                                                 QFileInfo(file).fileName(), boundedSource);
             }
-            if (!isShader && m_themeStudio) {
-                if (m_previewViewport && !m_previewViewport->previewImage().isNull()) {
-                    m_themeStudio->setWallpaperImage(m_previewViewport->previewImage(), file);
+            if (!isShader && self->m_themeStudio) {
+                if (self->m_previewViewport && !self->m_previewViewport->previewImage().isNull()) {
+                    self->m_themeStudio->setWallpaperImage(
+                        self->m_previewViewport->previewImage(), file);
                 } else {
-                    m_themeStudio->loadWallpaper(file);
+                    self->m_themeStudio->loadWallpaper(file);
                 }
             }
-            if (m_statusLabel) {
-                m_statusLabel->setText(QStringLiteral("Loaded: %1").arg(file));
+            if (self->m_statusLabel) {
+                self->m_statusLabel->setText(QStringLiteral("Loaded: %1").arg(file));
             }
-        }
+        });
+        dlg->open();
     });
 
     auto *folderSettingsAction = fileMenu->addAction(QStringLiteral("Wallpaper &Folders..."));
@@ -1281,32 +1692,40 @@ void MainWindow::setupMenuBar()
     auto *openShaderAction = fileMenu->addAction(QStringLiteral("Open &Shader..."));
     openShaderAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+O")));
     connect(openShaderAction, &QAction::triggered, this, [this]() {
-        QString file = QFileDialog::getOpenFileName(
+        auto *dlg = new QFileDialog(
             this, QStringLiteral("Open GLSL Shader"), QString(),
             QStringLiteral("GLSL Shader (*.glsl *.frag *.comp);;All Files (*)"));
-        if (!file.isEmpty()) {
-            m_activeWallpaperPath = file;
-            if (m_previewViewport) {
-                QFile f(file);
-                if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-                    m_previewViewport->setPreviewShader(QString::fromUtf8(f.readAll()));
+        dlg->setFileMode(QFileDialog::ExistingFile);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        QPointer<MainWindow> self(this);
+        connect(dlg, &QFileDialog::fileSelected, this, [self](const QString &file) {
+            if (!self || file.isEmpty()) {
+                return;
+            }
+            QString boundedSource;
+            QString readErr;
+            if (!StudioSessionContext::readBoundedUtf8File(file, boundedSource, readErr)) {
+                if (self->m_statusLabel && !readErr.isEmpty()) {
+                    self->m_statusLabel->setText(readErr);
                 }
+                return;
             }
-            if (m_propertyInspector) {
-                m_propertyInspector->loadShaderFile(file);
+            self->m_activeWallpaperPath = file;
+            if (self->m_previewViewport) {
+                self->m_previewViewport->setPreviewShader(boundedSource);
             }
-            if (m_codeEditor) {
-                QFile f(file);
-                if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-                    m_codeEditor->openDocument(EditorLanguageMode::GlslEs310Fragment, -1, 0,
-                                               QFileInfo(file).fileName(),
-                                               QString::fromUtf8(f.readAll()));
-                }
+            if (self->m_propertyInspector) {
+                self->m_propertyInspector->loadShaderFile(file);
             }
-            if (m_statusLabel) {
-                m_statusLabel->setText(QStringLiteral("Loaded shader: %1").arg(file));
+            if (self->m_codeEditor) {
+                self->m_codeEditor->openDocument(EditorLanguageMode::GlslEs310Fragment, -1, 0,
+                                                 QFileInfo(file).fileName(), boundedSource);
             }
-        }
+            if (self->m_statusLabel) {
+                self->m_statusLabel->setText(QStringLiteral("Loaded shader: %1").arg(file));
+            }
+        });
+        dlg->open();
     });
 
     fileMenu->addSeparator();
@@ -1434,6 +1853,10 @@ void MainWindow::setupMenuBar()
 
     m_playPauseAction = playMenu->addAction(QStringLiteral("&Pause / Resume"));
     m_playPauseAction->setShortcut(QKeySequence(Qt::Key_Space));
+    m_playPauseAction->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+    if (m_previewViewport && m_previewViewport->parent() == this) {
+        m_previewViewport->addAction(m_playPauseAction);
+    }
     connect(m_playPauseAction, &QAction::triggered, this, &MainWindow::handlePlayPauseToggle);
 
     // --- Help Menu ---
@@ -1530,7 +1953,7 @@ void MainWindow::setupToolBar()
     // Status label
     m_statusLabel = new QLabel(QStringLiteral("Ready"), this);
     m_statusLabel->setStyleSheet(
-        QStringLiteral("color: #64748b; font-size: 11px; padding-right: 8px;"));
+        QStringLiteral("color: #cbd5e1; font-size: 11px; padding-right: 8px;"));
     toolbar->addWidget(m_statusLabel);
 }
 
@@ -1557,8 +1980,8 @@ void MainWindow::applyProStudioDarkTheme()
     palette.setColor(QPalette::BrightText, QColor(0xff, 0xff, 0xff));
     palette.setColor(QPalette::Highlight, QColor(0x02, 0x84, 0xc7));
     palette.setColor(QPalette::HighlightedText, QColor(0xff, 0xff, 0xff));
-    palette.setColor(QPalette::Disabled, QPalette::Text, QColor(0x64, 0x74, 0x8b));
-    palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(0x64, 0x74, 0x8b));
+    palette.setColor(QPalette::Disabled, QPalette::Text, QColor(0x94, 0xa3, 0xb8));
+    palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(0x94, 0xa3, 0xb8));
     QApplication::setPalette(palette);
 
     // 2. Unified Studio Stylesheet
@@ -1610,7 +2033,7 @@ void MainWindow::applyProStudioDarkTheme()
                        "}"
                        "QTabBar::tab {"
                        "  background: #14171f;"
-                       "  color: #94a3b8;"
+                       "  color: #cbd5e1;"
                        "  padding: 6px 14px;"
                        "  border: none;"
                        "  border-top-left-radius: 4px;"
@@ -1627,6 +2050,9 @@ void MainWindow::applyProStudioDarkTheme()
                        "  background: #1b1f29;"
                        "  color: #e2e8f0;"
                        "}"
+                       "QTabBar::tab:focus {"
+                       "  outline: 2px solid #38bdf8;"
+                       "}"
                        "QDockWidget {"
                        "  titlebar-close-icon: none;"
                        "  titlebar-normal-icon: none;"
@@ -1642,7 +2068,8 @@ void MainWindow::applyProStudioDarkTheme()
                        "  background: #20242e;"
                        "  border: 1px solid #2e3545;"
                        "  border-radius: 5px;"
-                       "  padding: 5px 12px;"
+                       "  padding: 4px 12px;"
+                       "  min-height: 20px;"
                        "  color: #e2e8f0;"
                        "  font-weight: 500;"
                        "}"
@@ -1650,6 +2077,10 @@ void MainWindow::applyProStudioDarkTheme()
                        "  background: #2a303d;"
                        "  border-color: #38bdf8;"
                        "  color: #ffffff;"
+                       "}"
+                       "QPushButton:focus, QToolButton:focus {"
+                       "  border: 2px solid #38bdf8;"
+                       "  outline: none;"
                        "}"
                        "QPushButton:pressed, QToolButton:pressed {"
                        "  background: #161920;"
@@ -1660,6 +2091,9 @@ void MainWindow::applyProStudioDarkTheme()
                        "  font-weight: 600;"
                        "  border-color: #38bdf8;"
                        "}"
+                       "QCheckBox:focus, QRadioButton:focus {"
+                       "  outline: 1px solid #38bdf8;"
+                       "}"
                        "QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {"
                        "  background: #14171f;"
                        "  border: 1px solid #2e3545;"
@@ -1668,7 +2102,7 @@ void MainWindow::applyProStudioDarkTheme()
                        "  color: #f1f5f9;"
                        "}"
                        "QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {"
-                       "  border: 1px solid #38bdf8;"
+                       "  border: 2px solid #38bdf8;"
                        "}"
                        "QScrollBar:vertical {"
                        "  background: transparent;"
@@ -1685,6 +2119,10 @@ void MainWindow::applyProStudioDarkTheme()
                        "}"
                        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
                        "  height: 0px;"
+                       "}"
+                       "QSlider:focus {"
+                       "  border: 1px solid #38bdf8;"
+                       "  border-radius: 4px;"
                        "}"
                        "QSlider::groove:horizontal {"
                        "  height: 4px;"
@@ -1713,18 +2151,19 @@ void MainWindow::wireInterPanelSignals()
     if (m_gridWidget) {
         connect(m_gridWidget, &VirtualizedGridWidget::wallpaperSelected, this,
                 [this](const wwal::studio::CatalogItem &item) {
-                    QString path = QString::fromStdString(item.path);
+                    const QString path = QString::fromStdString(item.path);
                     m_activeWallpaperPath = path;
                     if (m_statusLabel) {
                         m_statusLabel->setText(QStringLiteral("Selected: %1").arg(path));
                     }
                     if (m_previewViewport) {
                         if (item.badge == wwal::studio::WallpaperBadge::Shader) {
-                            QFile f(path);
-                            if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-                                m_previewViewport->setPreviewShader(QString::fromUtf8(f.readAll()));
-                            } else {
-                                m_previewViewport->setPreviewImagePath(path);
+                            QString shaderSrc;
+                            QString readErr;
+                            if (StudioSessionContext::readBoundedUtf8File(path, shaderSrc, readErr)) {
+                                m_previewViewport->setPreviewShader(shaderSrc);
+                            } else if (m_statusLabel && !readErr.isEmpty()) {
+                                m_statusLabel->setText(readErr);
                             }
                         } else {
                             bool loaded = false;
@@ -1746,9 +2185,9 @@ void MainWindow::wireInterPanelSignals()
                         }
                     }
                     if (m_themeStudio) {
-                        QString previewPath = !item.preview_path.empty()
-                                                  ? QString::fromStdString(item.preview_path)
-                                                  : path;
+                        const QString previewPath =
+                            !item.preview_path.empty() ? QString::fromStdString(item.preview_path)
+                                                       : path;
                         if (m_previewViewport && !m_previewViewport->previewImage().isNull() &&
                             item.badge != wwal::studio::WallpaperBadge::Shader) {
                             m_themeStudio->setWallpaperImage(m_previewViewport->previewImage(),
@@ -1761,19 +2200,160 @@ void MainWindow::wireInterPanelSignals()
 
         connect(m_gridWidget, &VirtualizedGridWidget::wallpaperDoubleClicked, this,
                 [this](const wwal::studio::CatalogItem &item) {
-                    applyWallpaperPath(QString::fromStdString(item.path));
+                    applyWallpaperPath(QString::fromStdString(item.path),
+                                       resolveSelectedOutputsCsv());
                 });
     }
 
     if (m_previewViewport) {
-        connect(m_previewViewport, &GpuPreviewViewport::applyRequested, this, [this]() {
+        connect(m_previewViewport, &GpuPreviewViewport::applyRequested, this,
+                [this](const QString &monitorSpec) {
+                    if (!m_activeWallpaperPath.isEmpty()) {
+                        applyWallpaperPath(m_activeWallpaperPath, monitorSpec);
+                    }
+                });
+        connect(m_previewViewport, &GpuPreviewViewport::monitorSelectionChanged, this,
+                [this](const QString &monitorName) {
+                    if (m_topologyBar && m_topologyBar->canvas() && !monitorName.isEmpty()) {
+                        const QSignalBlocker topoBlocker(m_topologyBar->canvas());
+                        m_topologyBar->canvas()->setSelectedMonitors({monitorName});
+                    }
+                    syncMonitorCatalogToPanels();
+                    if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+                        ipc->sendQuerySceneTree(normalizeTargetOutputSpec(monitorName));
+                    }
+                    if (m_statusLabel && !monitorName.isEmpty()) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Active Output: %1").arg(monitorName));
+                    }
+                });
+        connect(m_previewViewport, &GpuPreviewViewport::zoomChanged, this, [this](float newZoom) {
+            if (m_statusLabel) {
+                m_statusLabel->setText(
+                    QStringLiteral("Viewport Zoom: %1%").arg(qRound(newZoom * 100.0f)));
+            }
+        });
+        connect(m_previewViewport, &GpuPreviewViewport::panChanged, this,
+                [this](const QPointF &newOffset) {
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Viewport Pan: (%1, %2)")
+                                .arg(newOffset.x(), 0, 'f', 0)
+                                .arg(newOffset.y(), 0, 'f', 0));
+                    }
+                });
+        connect(m_previewViewport, &GpuPreviewViewport::parallaxToggled, this,
+                [this](bool enabled) {
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Preview Parallax: %1")
+                                .arg(enabled ? QStringLiteral("Enabled")
+                                             : QStringLiteral("Disabled")));
+                    }
+                });
+        connect(m_previewViewport, &GpuPreviewViewport::aspectRatioGuideChanged, this,
+                [this](AspectRatioGuide guide) {
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Safe Frame Guide: %1")
+                                .arg(formatAspectRatioGuideLabel(guide)));
+                    }
+                });
+    }
+
+    if (m_topologyBar && m_topologyBar->canvas()) {
+        auto *canvas = m_topologyBar->canvas();
+        auto *gravityDebounceTimer = new QTimer(this);
+        gravityDebounceTimer->setSingleShot(true);
+        gravityDebounceTimer->setInterval(120);
+        auto pendingGravityTargets = std::make_shared<QString>();
+        connect(gravityDebounceTimer, &QTimer::timeout, this, [this, pendingGravityTargets]() {
             if (!m_activeWallpaperPath.isEmpty()) {
-                applyWallpaperPath(m_activeWallpaperPath);
+                applyWallpaperPath(m_activeWallpaperPath, *pendingGravityTargets);
+            }
+        });
+
+        connect(canvas, &MonitorTopologyCanvas::monitorSelectionChanged, this,
+                [this](const QStringList &selectedOutputs) {
+                    syncMonitorCatalogToPanels();
+                    if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+                        ipc->sendQuerySceneTree(resolveSelectedOutputsCsv());
+                    }
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            selectedOutputs.isEmpty()
+                                ? QStringLiteral("Target Displays: All")
+                                : QStringLiteral("Target Displays: %1")
+                                      .arg(selectedOutputs.join(QStringLiteral(", "))));
+                    }
+                });
+        connect(canvas, &MonitorTopologyCanvas::wallpaperDropped, this,
+                [this](const QStringList &targetOutputs, const QString &wallpaperPath) {
+                    const QString targetSpec = targetOutputs.isEmpty()
+                                                   ? resolveSelectedOutputsCsv()
+                                                   : targetOutputs.join(QLatin1Char(','));
+                    applyWallpaperPath(wallpaperPath, targetSpec);
+                });
+        connect(canvas, &MonitorTopologyCanvas::scalingModeChanged, this,
+                [this](const QStringList &targetOutputs, int mode) {
+                    const QString targetSpec = targetOutputs.isEmpty()
+                                                   ? resolveSelectedOutputsCsv()
+                                                   : targetOutputs.join(QLatin1Char(','));
+                    if (!m_activeWallpaperPath.isEmpty()) {
+                        applyWallpaperPath(m_activeWallpaperPath, targetSpec);
+                    } else if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Scaling Mode: %1")
+                                .arg(StudioSessionContext::scalingModeCliName(
+                                    static_cast<uint32_t>(std::max(0, mode)))));
+                    }
+                });
+        connect(canvas, &MonitorTopologyCanvas::cropGravityChanged, this,
+                [this, gravityDebounceTimer, pendingGravityTargets](
+                    const QStringList &targetOutputs, float gx, float gy) {
+                    *pendingGravityTargets = targetOutputs.isEmpty()
+                                                 ? resolveSelectedOutputsCsv()
+                                                 : targetOutputs.join(QLatin1Char(','));
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(QStringLiteral("Crop Gravity: (%1, %2)")
+                                                   .arg(gx, 0, 'f', 2)
+                                                   .arg(gy, 0, 'f', 2));
+                    }
+                    if (!m_activeWallpaperPath.isEmpty()) {
+                        gravityDebounceTimer->start();
+                    }
+                });
+        connect(canvas, &MonitorTopologyCanvas::desktopSpanModeToggled, this,
+                [this](bool enabled) {
+                    syncMonitorCatalogToPanels();
+                    if (!m_activeWallpaperPath.isEmpty()) {
+                        applyWallpaperPath(m_activeWallpaperPath,
+                                           enabled ? QStringLiteral("*")
+                                                   : resolveSelectedOutputsCsv());
+                    } else if (m_statusLabel) {
+                        m_statusLabel->setText(QStringLiteral("Desktop Span Mode: %1")
+                                                   .arg(enabled ? QStringLiteral("Enabled")
+                                                                : QStringLiteral("Per-Display")));
+                    }
+                });
+        connect(canvas, &MonitorTopologyCanvas::spanRectsCalculated, this,
+                [this](const QMap<QString, QRectF> &normalizedSpanRects) {
+                    if (m_statusLabel && !normalizedSpanRects.isEmpty() && m_topologyBar &&
+                        m_topologyBar->canvas() && m_topologyBar->canvas()->isDesktopSpanMode()) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Span Geometry: %1 outputs calibrated")
+                                .arg(normalizedSpanRects.size()));
+                    }
+                });
+        connect(canvas, &MonitorTopologyCanvas::outputsRefreshed, this, [this](int count) {
+            syncMonitorCatalogToPanels();
+            if (m_statusLabel) {
+                m_statusLabel->setText(QStringLiteral("Detected %1 display output(s)").arg(count));
             }
         });
     }
 
-    // 2. Connect Cubic Bezier easing changes
+    // 2. Connect Cubic Bezier easing and transition config changes
     if (m_bezierEditor) {
         connect(m_bezierEditor, &CubicBezierEditorWidget::curveChanged, this,
                 [this](float p1x, float p1y, float p2x, float p2y) {
@@ -1785,9 +2365,26 @@ void MainWindow::wireInterPanelSignals()
                                                    .arg(p2y, 0, 'f', 2));
                     }
                 });
+        connect(m_bezierEditor, &CubicBezierEditorWidget::transitionConfigChanged, this,
+                [this](const TransitionConfig &cfg) {
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Transition: %1 (%2 ms @ %3 FPS)")
+                                .arg(StudioSessionContext::transitionTypeCliName(cfg.type))
+                                .arg(cfg.durationMs)
+                                .arg(cfg.fps));
+                    }
+                });
+        connect(m_bezierEditor, &CubicBezierEditorWidget::presetApplied, this,
+                [this](const QString &presetName) {
+                    if (m_statusLabel && !presetName.isEmpty()) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Easing Preset: %1").arg(presetName));
+                    }
+                });
     }
 
-    // 3. Connect Property Inspector uniform updates
+    // 3. Connect Property Inspector & Theme Studio signals
     if (m_propertyInspector) {
         connect(m_propertyInspector, &PropertyInspectorWidget::statusMessage, this,
                 [this](const QString &msg) {
@@ -1796,11 +2393,87 @@ void MainWindow::wireInterPanelSignals()
                     }
                 });
     }
+    if (m_themeStudio) {
+        connect(m_themeStudio, &ThemeStudioWidget::paletteChanged, this,
+                [this](const waywal_palette_t &palette) {
+                    if (m_statusLabel) {
+                        const QString hex =
+                            QStringLiteral("#%1")
+                                .arg(palette.source_color & 0x00FFFFFFu, 6, 16, QLatin1Char('0'))
+                                .toUpper();
+                        m_statusLabel->setText(
+                            QStringLiteral("Theme Palette: source %1 (seed #%2)")
+                                .arg(hex)
+                                .arg(palette.source_color_index));
+                    }
+                });
+        connect(m_themeStudio, &ThemeStudioWidget::modeChanged, this,
+                [this](waywal_theme_mode_t mode) {
+                    syncThemeStateToIpcOrActiveWallpaper(true);
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Theme Mode: %1")
+                                .arg(mode == WAYWAL_THEME_LIGHT ? QStringLiteral("Light")
+                                                                : QStringLiteral("Dark")));
+                    }
+                });
+        connect(m_themeStudio, &ThemeStudioWidget::variantChanged, this,
+                [this](waywal_scheme_variant_t variant) {
+                    syncThemeStateToIpcOrActiveWallpaper(false);
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Theme Variant: %1").arg(static_cast<int>(variant)));
+                    }
+                });
+        connect(m_themeStudio, &ThemeStudioWidget::contrastChanged, this,
+                [this](float contrast) {
+                    syncThemeStateToIpcOrActiveWallpaper(false);
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Theme Contrast: %1").arg(contrast, 0, 'f', 2));
+                    }
+                });
+        connect(m_themeStudio, &ThemeStudioWidget::seedIndexChanged, this, [this](uint8_t index) {
+            syncThemeStateToIpcOrActiveWallpaper(true);
+            if (m_statusLabel) {
+                m_statusLabel->setText(QStringLiteral("Theme Seed Index: %1").arg(index));
+            }
+        });
+        connect(m_themeStudio, &ThemeStudioWidget::statusMessageRequested, this,
+                [this](const QString &msg) {
+                    if (m_statusLabel && !msg.isEmpty()) {
+                        m_statusLabel->setText(msg);
+                    }
+                });
+    }
 
-    // 4. Connect Steam Workshop & Open Hub browser selections
+    // 4. Connect Steam Workshop, Open Hub, Effect Library & Inspectors
     if (m_workshopBrowser) {
         connect(m_workshopBrowser, &WorkshopBrowserWidget::wallpaperSelected, this,
-                [this](uint64_t /*id*/, const QString &filePath) { applyWallpaperPath(filePath); });
+                [this](uint64_t /*id*/, const QString &filePath) {
+                    applyWallpaperPath(filePath, resolveSelectedOutputsCsv());
+                });
+        connect(m_workshopBrowser, &WorkshopBrowserWidget::wallpaperApplyRequested, this,
+                [this](uint64_t publishedFileId, const QString &targetOutput) {
+                    QString path;
+                    if (auto *idxMgr = catalogIndexManager()) {
+                        if (const auto rec = idxMgr->getItem(publishedFileId); rec.has_value()) {
+                            path = QString::fromStdString(rec->file_path);
+                        }
+                    }
+                    if (path.isEmpty()) {
+                        if (m_statusLabel) {
+                            m_statusLabel->setText(
+                                QStringLiteral("Workshop item %1 is not downloaded locally yet")
+                                    .arg(publishedFileId));
+                        }
+                        return;
+                    }
+                    const QString targetSpec =
+                        targetOutput.trimmed().isEmpty() ? resolveSelectedOutputsCsv()
+                                                         : normalizeTargetOutputSpec(targetOutput);
+                    applyWallpaperPath(path, targetSpec);
+                });
     }
     if (m_openHubBrowser) {
         connect(m_openHubBrowser, &OpenHubBrowserWidget::packageSelected, this,
@@ -1815,12 +2488,39 @@ void MainWindow::wireInterPanelSignals()
                 });
     }
 
-    if (m_effectLibraryBrowser && m_nodeGraphEditor) {
-        connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectInsertRequested, this,
-                [this](uint32_t effectId) {
+    if (m_effectLibraryBrowser) {
+        connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectInsertIntoGraphRequested,
+                this, [this](we_builtin_effect_id_t effectId) {
+                    if (!m_nodeGraphEditor && m_layoutManager) {
+                        m_layoutManager->realizeLazyPanel(QStringLiteral("NodeGraphEditor"));
+                    }
                     if (m_nodeGraphEditor) {
-                        m_nodeGraphEditor->addBuiltinEffectNode(
-                            static_cast<we_builtin_effect_id_t>(effectId), QPointF(100.0, 100.0));
+                        m_nodeGraphEditor->addBuiltinEffectNode(effectId, QPointF(100.0, 100.0));
+                    }
+                });
+        connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectInsertRequested, this,
+                [this](uint32_t /*effectId*/) {
+                    if (m_layoutManager) {
+                        m_layoutManager->setPanelVisible(QStringLiteral("NodeGraphEditor"), true);
+                    }
+                });
+        connect(m_effectLibraryBrowser,
+                &EffectLibraryBrowserWidget::effectApplyToActiveSceneRequested, this,
+                [this](we_builtin_effect_id_t effectId) {
+                    if (!m_nodeGraphEditor && m_layoutManager) {
+                        m_layoutManager->realizeLazyPanel(QStringLiteral("NodeGraphEditor"));
+                    }
+                    if (m_nodeGraphEditor) {
+                        m_nodeGraphEditor->addBuiltinEffectNode(effectId, QPointF(140.0, 140.0));
+                        m_nodeGraphEditor->compileAndHotSwapDaemon();
+                    }
+                });
+        connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectAppendToStackRequested,
+                this, [this](uint32_t effectId) {
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Applied built-in effect #%1 to active scene")
+                                .arg(effectId));
                     }
                 });
         connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectActivated, this,
@@ -1848,13 +2548,155 @@ void MainWindow::wireInterPanelSignals()
     }
 
     if (m_cameraLightingInspector) {
-        connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::camera3DChanged, this,
-                [this](const QString & /*output*/, const we_camera3d_t &cam) {
+        connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::cameraOrLightsChanged,
+                this,
+                [this](const QString & /*output*/, const we_camera3d_t &cam,
+                       const we_lighting_uniforms_t &lights) {
                     if (m_previewViewport) {
                         QMatrix4x4 vpMat;
                         std::memcpy(vpMat.data(), cam.view_proj_matrix, 16 * sizeof(float));
                         m_previewViewport->setShaderUniform(
                             QStringLiteral("g_ViewProjectionMatrix"), vpMat);
+                        m_previewViewport->setGizmoCameraAndLights(cam, lights);
+                    }
+                });
+        connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::camera3DChanged, this,
+                [this](const QString & /*output*/, const we_camera3d_t &cam) {
+                    if (m_previewViewport && m_cameraLightingInspector) {
+                        QMatrix4x4 vpMat;
+                        std::memcpy(vpMat.data(), cam.view_proj_matrix, 16 * sizeof(float));
+                        m_previewViewport->setShaderUniform(
+                            QStringLiteral("g_ViewProjectionMatrix"), vpMat);
+                        m_previewViewport->setGizmoCameraAndLights(
+                            cam, m_cameraLightingInspector->lighting());
+                    }
+                });
+        connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::lightingChanged, this,
+                [this](const QString & /*output*/, const we_lighting_uniforms_t &lights) {
+                    if (m_previewViewport && m_cameraLightingInspector) {
+                        m_previewViewport->setGizmoCameraAndLights(
+                            m_cameraLightingInspector->camera(), lights);
+                    }
+                });
+    }
+
+    if (m_physicsSpringInspector) {
+        connect(m_physicsSpringInspector, &PhysicsSpringInspectorWidget::physicsParamsChanged, this,
+                [this](const QString & /*output*/, int32_t /*objectId*/, int32_t boneIndex,
+                       const we_bone_sim_config_t &cfg, const we_wind_field_t & /*wind*/,
+                       const we_cursor_force_t & /*cursor*/) {
+                    if (m_previewViewport && boneIndex >= 0) {
+                        m_previewViewport->setSelectedPuppetBone(boneIndex);
+                    }
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Physics Bone %1 (%2): damping=%3")
+                                .arg(boneIndex)
+                                .arg((cfg.flags & WE_BONE_PHYS_ENABLED) != 0u ? QStringLiteral("XPBD")
+                                                                             : QStringLiteral("Off"))
+                                .arg(cfg.damping_ratio, 0, 'f', 2));
+                    }
+                });
+    }
+
+    if (m_footerBar) {
+        connect(m_footerBar, &StudioFooterBar::audioSensitivityGainChanged, this,
+                [this](float gain) {
+                    m_audioVolume = gain;
+                    if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+                        ipc->sendAudioPowerConfig(m_audioVolume, m_muteOnAudio ? 1 : 0, -1,
+                                                  m_batteryPolicy);
+                    }
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Audio Gain: %1%").arg(qRound(gain * 100.0f)));
+                    }
+                });
+        connect(m_footerBar, &StudioFooterBar::muteOnAudioToggled, this, [this](bool enabled) {
+            m_muteOnAudio = enabled;
+            if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+                ipc->sendAudioPowerConfig(m_audioVolume, m_muteOnAudio ? 1 : 0, -1,
+                                          m_batteryPolicy);
+            }
+            if (m_statusLabel) {
+                m_statusLabel->setText(QStringLiteral("Mute On Audio: %1")
+                                           .arg(enabled ? QStringLiteral("On")
+                                                        : QStringLiteral("Off")));
+            }
+        });
+        connect(m_footerBar, &StudioFooterBar::fpsCapChanged, this, [this](uint32_t fps) {
+            if (m_previewViewport && fps > 0u) {
+                m_previewViewport->setTargetAnimationFps(
+                    static_cast<int>(std::clamp(fps, 15u, 360u)));
+            }
+            if (m_statusLabel) {
+                m_statusLabel->setText(fps == 0u
+                                           ? QStringLiteral("FPS Cap: VSync")
+                                           : QStringLiteral("FPS Cap: %1").arg(fps));
+            }
+        });
+        connect(m_footerBar, &StudioFooterBar::batteryPolicyChanged, this,
+                [this](waywal_battery_policy_t policy) {
+                    const uint32_t oldPolicy = m_batteryPolicy;
+                    const uint32_t newPolicy = static_cast<uint32_t>(policy);
+                    auto applyPolicy = [this](uint32_t pol) {
+                        m_batteryPolicy = static_cast<uint8_t>(std::min<uint32_t>(pol, 2u));
+                        if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+                            ipc->sendAudioPowerConfig(m_audioVolume, m_muteOnAudio ? 1 : 0, -1,
+                                                      m_batteryPolicy);
+                        }
+                        if (m_footerBar && m_footerBar->powerGovernor()) {
+                            const QSignalBlocker blocker(m_footerBar->powerGovernor());
+                            m_footerBar->powerGovernor()->setBatteryPolicy(
+                                static_cast<waywal_battery_policy_t>(m_batteryPolicy));
+                        }
+                        if (m_statusLabel) {
+                            const QString label = m_batteryPolicy == 0u
+                                                      ? QStringLiteral("Ignore")
+                                                  : m_batteryPolicy == 1u
+                                                      ? QStringLiteral("Reduce FPS")
+                                                      : QStringLiteral("Pause Video");
+                            m_statusLabel->setText(QStringLiteral("Battery Policy: %1").arg(label));
+                        }
+                    };
+                    if (auto *bus = commandBus(); bus && oldPolicy != newPolicy) {
+                        bus->execute(std::make_unique<SetPowerPolicyCommand>(oldPolicy, newPolicy,
+                                                                             applyPolicy));
+                    } else {
+                        applyPolicy(newPolicy);
+                    }
+                });
+        connect(m_footerBar, &StudioFooterBar::autoPauseFlagsChanged, this,
+                [this](bool pauseFullscreen, bool pauseMaximized, bool pauseOccluded) {
+                    if (m_statusLabel) {
+                        QStringList active;
+                        if (pauseFullscreen) {
+                            active << QStringLiteral("FS");
+                        }
+                        if (pauseMaximized) {
+                            active << QStringLiteral("Max");
+                        }
+                        if (pauseOccluded) {
+                            active << QStringLiteral("Occl");
+                        }
+                        m_statusLabel->setText(
+                            QStringLiteral("Auto-Pause: %1")
+                                .arg(active.isEmpty() ? QStringLiteral("None")
+                                                      : active.join(QStringLiteral(", "))));
+                    }
+                });
+        connect(m_footerBar, &StudioFooterBar::outputSelected, this,
+                [this](const QString &outputName) {
+                    if (outputName.isEmpty()) {
+                        return;
+                    }
+                    if (m_topologyBar && m_topologyBar->canvas()) {
+                        const QSignalBlocker topoBlocker(m_topologyBar->canvas());
+                        m_topologyBar->canvas()->setSelectedMonitors({outputName});
+                    }
+                    syncMonitorCatalogToPanels();
+                    if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+                        ipc->sendQuerySceneTree(normalizeTargetOutputSpec(outputName));
                     }
                 });
     }
@@ -1867,7 +2709,7 @@ void MainWindow::wireInterPanelSignals()
                    const SetLayerTransformCommand::TransformState &newState) {
                 auto applyTransform = [this](int32_t objId,
                                              const SetLayerTransformCommand::TransformState &st) {
-                    if (m_ipcClient) {
+                    if (auto *ipc = ipcClient()) {
                         waywal_ipc_req_scene_mutate_t req{};
                         req.mutate_op = WE_MUTATE_SET_TRANSFORM;
                         req.object_id = objId;
@@ -1880,7 +2722,7 @@ void MainWindow::wireInterPanelSignals()
                         req.size[1] = st.size[1];
                         req.parallax_depth[0] = st.parallaxDepth[0];
                         req.parallax_depth[1] = st.parallaxDepth[1];
-                        m_ipcClient->sendSceneMutate(req);
+                        ipc->sendSceneMutate(req);
                     }
                     if (m_sceneLayerTree) {
                         // Update the layer model transform before refreshing the gizmo target
@@ -1916,8 +2758,8 @@ void MainWindow::wireInterPanelSignals()
                         m_previewViewport->setGizmoActiveNode(m_sceneLayerTree->selectedNode());
                     }
                 };
-                if (m_commandBus) {
-                    m_commandBus->execute(std::make_unique<SetLayerTransformCommand>(
+                if (auto *bus = commandBus()) {
+                    bus->execute(std::make_unique<SetLayerTransformCommand>(
                         objectId, QStringLiteral("Layer %1").arg(objectId), oldState, newState,
                         applyTransform));
                 } else {
@@ -1980,15 +2822,33 @@ void MainWindow::wireInterPanelSignals()
         connect(m_propertyInspector, &PropertyInspectorWidget::shaderComboChanged, this,
                 [this](const QString &output, int32_t objectId, uint32_t passIndex,
                        const QString &comboName, int32_t comboValue) {
-                    if (m_ipcClient) {
-                        m_ipcClient->sendSetShaderCombo(output, objectId, passIndex, comboName,
-                                                        comboValue);
+                    if (auto *ipc = ipcClient()) {
+                        ipc->sendSetShaderCombo(output, objectId, passIndex, comboName, comboValue);
                     }
                 });
     }
 
-    if (m_ipcClient) {
-        connect(m_ipcClient.get(), &IpcClient::sceneTreeQueried, this,
+    if (auto *ipc = ipcClient()) {
+        connect(ipc, &IpcClient::connectionStateChanged, this, [this](bool connected) {
+            if (connected) {
+                if (auto *activeIpc = ipcClient()) {
+                    activeIpc->subscribeEvents();
+                    activeIpc->requestOutputsJson();
+                    activeIpc->sendQuerySceneTree(resolveSelectedOutputsCsv());
+                }
+            }
+            if (m_statusLabel) {
+                m_statusLabel->setText(connected ? QStringLiteral("Daemon IPC: Connected")
+                                                 : QStringLiteral("Daemon IPC: Disconnected"));
+            }
+        });
+        connect(ipc, &IpcClient::outputsJsonReceived, this, [this](const QString &json) {
+            if (m_topologyBar && m_topologyBar->canvas() && !json.isEmpty()) {
+                m_topologyBar->canvas()->updateOutputsFromJson(json.toUtf8());
+            }
+            syncMonitorCatalogToPanels();
+        });
+        connect(ipc, &IpcClient::sceneTreeQueried, this,
                 [this](const waywal_ipc_resp_query_scene_tree_t &resp, const QString &treeJson) {
                     if (resp.status_code == 0 && !treeJson.isEmpty()) {
                         m_lastSceneTreeJson = treeJson;
@@ -1997,116 +2857,189 @@ void MainWindow::wireInterPanelSignals()
                         }
                     }
                 });
-        connect(m_ipcClient.get(), &IpcClient::telemetryReceived, this,
-                [this](const TelemetrySnapshot &snapshot) {
-                    if (!m_audioBindingWizard || !m_audioBindingWizard->isVisible()) {
-                        return;
+        connect(ipc, &IpcClient::particleConfigUpdated, this,
+                [this](const waywal_ipc_resp_particle_config_t &resp) {
+                    if (m_particleDesigner) {
+                        m_particleDesigner->updateTelemetry(resp.alive_count, resp.max_count,
+                                                            resp.sim_time_us);
                     }
+                });
+        connect(ipc, &IpcClient::physicsParamsUpdated, this,
+                [this](const waywal_ipc_resp_set_physics_params_t &resp) {
+                    if (m_physicsSpringInspector) {
+                        m_physicsSpringInspector->updateSolverTelemetry(resp.active_sim_bones,
+                                                                        resp.last_step_time_us);
+                    }
+                });
+        connect(ipc, &IpcClient::telemetryReceived, this,
+                [this](const TelemetrySnapshot &snapshot) {
+                    waywal_telemetry_snapshot_t cSnap{};
+                    cSnap.version = 1u;
+                    cSnap.flags = WAYWAL_TELEMETRY_FORMAT_BINARY;
+                    cSnap.timestamp_ns = snapshot.timestampNs;
+                    cSnap.rss_kib = snapshot.rssKiB;
+                    cSnap.pss_kib = snapshot.pssKiB;
+                    cSnap.total_vram_kib = snapshot.totalVramKiB;
+                    cSnap.gpu_active = snapshot.gpuActive ? 1u : 0u;
+                    cSnap.on_battery = snapshot.onBattery ? 1u : 0u;
+                    cSnap.battery_policy = snapshot.batteryPolicy;
+                    cSnap.global_pause_mask = snapshot.globalPauseMask;
+
                     std::array<float, 64> bands{};
                     const size_t n = std::min<size_t>(snapshot.barkBands.size(), 64);
                     for (size_t i = 0; i < n; ++i) {
                         bands[i] = snapshot.barkBands[i];
+                        cSnap.bark_bands[i] = snapshot.barkBands[i];
+                    }
+                    cSnap.rms_level = snapshot.rmsLevel;
+                    cSnap.beat_pulse = snapshot.beatPulse;
+                    cSnap.beat_onset = snapshot.beatOnset ? 1u : 0u;
+                    cSnap.audio_active = snapshot.audioActive ? 1u : 0u;
+                    cSnap.pipewire_active = snapshot.pipewireActive ? 1u : 0u;
+                    cSnap.mute_on_audio = snapshot.muteOnAudio ? 1u : 0u;
+                    cSnap.audio_volume = snapshot.audioVolume;
+
+                    const size_t outCount =
+                        std::min<size_t>(snapshot.outputs.size(), WAYWAL_MAX_TELEMETRY_OUTPUTS);
+                    cSnap.num_outputs = static_cast<uint32_t>(outCount);
+                    for (size_t i = 0; i < outCount; ++i) {
+                        const OutputTelemetry &src = snapshot.outputs[i];
+                        waywal_output_telemetry_t &dst = cSnap.outputs[i];
+                        const QByteArray nameUtf8 = src.name.toUtf8();
+                        const size_t copyLen = std::min<size_t>(
+                            static_cast<size_t>(nameUtf8.size()), sizeof(dst.name) - 1u);
+                        if (copyLen > 0) {
+                            std::copy_n(nameUtf8.constData(), copyLen, dst.name);
+                        }
+                        dst.name[copyLen] = '\0';
+                        dst.scanout_fps = src.scanoutFps;
+                        dst.last_render_us = src.lastRenderUs;
+                        dst.vram_kib = src.vramKiB;
+                        for (size_t b = 0; b < 4; ++b) {
+                            dst.bo_states[b] = src.boStates[b];
+                        }
+                        dst.engine_kind = src.engineKind;
+                        dst.is_paused = src.isPaused ? 1u : 0u;
+                        dst.pause_mask = src.pauseMask;
+                        dst.width = src.width;
+                        dst.height = src.height;
+                        dst.logical_width = src.logicalWidth;
+                        dst.logical_height = src.logicalHeight;
+                        dst.scale_120 = static_cast<int32_t>(std::llround(src.scale * 120.0));
+                    }
+
+                    if (m_footerBar) {
+                        m_footerBar->updateTelemetry(cSnap);
+                    }
+                    if (!m_audioBindingWizard) {
+                        return;
                     }
                     float bassEnergy = 0.0f;
                     for (size_t i = 0; i < 7; ++i) {
                         bassEnergy += bands[i];
                     }
                     bassEnergy /= 7.0f;
+                    const float dtSec = m_session ? m_session->sampleAudioTelemetryDeltaSec(
+                                                        snapshot.audioActive ||
+                                                        snapshot.pipewireActive)
+                                                  : (1.0f / 60.0f);
                     m_audioBindingWizard->updateLiveBarkTelemetry(
-                        bands, snapshot.rmsLevel, bassEnergy, snapshot.beatPulse, 1.0f / 60.0f);
+                        bands, snapshot.rmsLevel, bassEnergy, snapshot.beatPulse, dtSec);
                 });
-        connect(
-            m_ipcClient.get(), &IpcClient::scenePkgExported, this,
-            [this](const waywal_ipc_resp_export_scene_pkg_t &resp) {
-                const QString stagePath = std::exchange(m_pendingExportStagePath, QString());
-                const QString destPath = std::exchange(m_pendingExportDestPath, QString());
-                const bool isPkgFile = std::exchange(m_pendingExportIsPkgFile, false);
-                if (stagePath.isEmpty() || destPath.isEmpty()) {
-                    return;
-                }
-
-                auto cleanupStage = [&stagePath]() {
-                    std::error_code ec;
-                    const std::filesystem::path sp(stagePath.toStdString());
-                    std::filesystem::remove_all(sp, ec);
-                };
-
-                if (resp.status_code != 0) {
-                    cleanupStage();
-                    const QString err = QString::fromUtf8(resp.error_msg);
-                    if (m_statusLabel) {
-                        m_statusLabel->setText(
-                            QStringLiteral("Scene export failed: %1")
-                                .arg(err.isEmpty() ? QStringLiteral("daemon error") : err));
+        connect(ipc, &IpcClient::scenePkgExported, this,
+                [this](const waywal_ipc_resp_export_scene_pkg_t &resp) {
+                    PendingSceneExport pending{};
+                    if (!m_session || !m_session->popPendingExport(pending) ||
+                        pending.stagePath.isEmpty() || pending.destPath.isEmpty()) {
+                        return;
                     }
-                    return;
-                }
+                    const QString &stagePath = pending.stagePath;
+                    const QString &destPath = pending.destPath;
+                    const bool isPkgFile = pending.isPkgFile;
 
-                std::error_code ec;
-                if (isPkgFile) {
-                    QString srcFile;
-                    if (QFileInfo(stagePath).isFile()) {
-                        srcFile = stagePath;
-                    } else if (QFileInfo(stagePath + QStringLiteral("/scene.pkg")).isFile()) {
-                        srcFile = stagePath + QStringLiteral("/scene.pkg");
-                    }
-                    if (srcFile.isEmpty()) {
+                    auto cleanupStage = [&stagePath]() {
+                        std::error_code ec;
+                        const std::filesystem::path sp(stagePath.toStdString());
+                        std::filesystem::remove_all(sp, ec);
+                    };
+
+                    if (resp.status_code != 0) {
                         cleanupStage();
+                        const QString err = QString::fromUtf8(resp.error_msg);
                         if (m_statusLabel) {
-                            m_statusLabel->setText(QStringLiteral(
-                                "Scene export completed, but staged .pkg file was missing."));
+                            m_statusLabel->setText(
+                                QStringLiteral("Scene export failed: %1")
+                                    .arg(err.isEmpty() ? QStringLiteral("daemon error") : err));
                         }
                         return;
                     }
 
-                    const QFileInfo destInfo(destPath);
-                    destInfo.dir().mkpath(QStringLiteral("."));
-                    const std::filesystem::path srcFs(srcFile.toStdString());
-                    const std::filesystem::path dstFs(destPath.toStdString());
-                    // Rename directly when on the same mount, or copy into a sibling temp
-                    // file and rename atomically across filesystems.
-                    std::filesystem::rename(srcFs, dstFs, ec);
-                    if (ec) {
-                        ec.clear();
-                        const std::filesystem::path tmpFs(
-                            (destPath + QStringLiteral(".tmp")).toStdString());
-                        std::filesystem::copy_file(
-                            srcFs, tmpFs, std::filesystem::copy_options::overwrite_existing, ec);
-                        if (!ec) {
-                            std::filesystem::rename(tmpFs, dstFs, ec);
+                    std::error_code ec;
+                    if (isPkgFile) {
+                        QString srcFile;
+                        if (QFileInfo(stagePath).isFile()) {
+                            srcFile = stagePath;
+                        } else if (QFileInfo(stagePath + QStringLiteral("/scene.pkg")).isFile()) {
+                            srcFile = stagePath + QStringLiteral("/scene.pkg");
                         }
-                        if (ec) {
-                            std::error_code rmEc;
-                            std::filesystem::remove(tmpFs, rmEc);
+                        if (srcFile.isEmpty()) {
+                            cleanupStage();
+                            if (m_statusLabel) {
+                                m_statusLabel->setText(QStringLiteral(
+                                    "Scene export completed, but staged .pkg file was missing."));
+                            }
+                            return;
                         }
-                    }
-                    cleanupStage();
-                } else {
-                    const std::filesystem::path srcDir(stagePath.toStdString());
-                    const std::filesystem::path dstDir(destPath.toStdString());
-                    std::filesystem::create_directories(dstDir, ec);
-                    if (!ec) {
-                        std::filesystem::copy(srcDir, dstDir,
-                                              std::filesystem::copy_options::recursive |
-                                                  std::filesystem::copy_options::overwrite_existing,
-                                              ec);
-                    }
-                    cleanupStage();
-                }
 
-                if (m_statusLabel) {
-                    if (ec) {
-                        m_statusLabel->setText(
-                            QStringLiteral("Failed to move exported scene to %1: %2")
-                                .arg(destPath, QString::fromStdString(ec.message())));
+                        const QFileInfo destInfo(destPath);
+                        destInfo.dir().mkpath(QStringLiteral("."));
+                        const std::filesystem::path srcFs(srcFile.toStdString());
+                        const std::filesystem::path dstFs(destPath.toStdString());
+                        // Rename directly when on the same mount, or copy into a sibling temp
+                        // file and rename atomically across filesystems.
+                        std::filesystem::rename(srcFs, dstFs, ec);
+                        if (ec) {
+                            ec.clear();
+                            const std::filesystem::path tmpFs(
+                                (destPath + QStringLiteral(".tmp")).toStdString());
+                            std::filesystem::copy_file(
+                                srcFs, tmpFs, std::filesystem::copy_options::overwrite_existing,
+                                ec);
+                            if (!ec) {
+                                std::filesystem::rename(tmpFs, dstFs, ec);
+                            }
+                            if (ec) {
+                                std::error_code rmEc;
+                                std::filesystem::remove(tmpFs, rmEc);
+                            }
+                        }
+                        cleanupStage();
                     } else {
-                        m_statusLabel->setText(
-                            QStringLiteral("Exported scene package: %1 (%2 bytes)")
-                                .arg(destPath)
-                                .arg(resp.total_bytes));
+                        const std::filesystem::path srcDir(stagePath.toStdString());
+                        const std::filesystem::path dstDir(destPath.toStdString());
+                        std::filesystem::create_directories(dstDir, ec);
+                        if (!ec) {
+                            std::filesystem::copy(srcDir, dstDir,
+                                                  std::filesystem::copy_options::recursive |
+                                                      std::filesystem::copy_options::overwrite_existing,
+                                                  ec);
+                        }
+                        cleanupStage();
                     }
-                }
-            });
+
+                    if (m_statusLabel) {
+                        if (ec) {
+                            m_statusLabel->setText(
+                                QStringLiteral("Failed to move exported scene to %1: %2")
+                                    .arg(destPath, QString::fromStdString(ec.message())));
+                        } else {
+                            m_statusLabel->setText(
+                                QStringLiteral("Exported scene package: %1 (%2 bytes)")
+                                    .arg(destPath)
+                                    .arg(resp.total_bytes));
+                        }
+                    }
+                });
     }
 
     if (m_physicsSpringInspector) {
@@ -2149,6 +3082,77 @@ void MainWindow::wireInterPanelSignals()
                             static_cast<int32_t>(m_puppetMeshPanel->pins().size()) - 1);
                     }
                 });
+        connect(m_previewViewport, &GpuPreviewViewport::contourPinMoved, this,
+                [this](int32_t objectId, uint32_t pinIndex, double px, double py) {
+                    if (m_layoutManager && !m_puppetMeshPanel) {
+                        m_layoutManager->realizeLazyPanel(QStringLiteral("PuppetMeshPanel"));
+                    }
+                    if (!m_puppetMeshPanel) {
+                        return;
+                    }
+                    PuppetMeshSnapshot oldSnap = m_cachedPuppetMesh;
+                    oldSnap.objectId = objectId >= 0 ? objectId : m_cachedPuppetMesh.objectId;
+                    oldSnap.pins = m_puppetMeshPanel->pins();
+                    if (pinIndex >= oldSnap.pins.size()) {
+                        return;
+                    }
+                    PuppetMeshSnapshot newSnap = oldSnap;
+                    newSnap.pins[pinIndex].px = px;
+                    newSnap.pins[pinIndex].py = py;
+
+                    auto applyPins = [this, pinIndex](const PuppetMeshSnapshot &snap) {
+                        if (snap.objectId >= 0 && m_cachedPuppetMesh.objectId == snap.objectId) {
+                            m_cachedPuppetMesh.pins = snap.pins;
+                        }
+                        if (m_puppetMeshPanel) {
+                            CommandBus *savedBus = m_puppetMeshPanel->commandBus();
+                            const QSignalBlocker panelBlocker(m_puppetMeshPanel.data());
+                            m_puppetMeshPanel->setCommandBus(nullptr);
+                            m_puppetMeshPanel->onClearPinsClicked();
+                            for (const we_cdt_pin_t &p : snap.pins) {
+                                m_puppetMeshPanel->addConstraintPin(p.px, p.py);
+                            }
+                            m_puppetMeshPanel->setCommandBus(savedBus);
+                        }
+                        if (m_previewViewport &&
+                            (snap.objectId < 0 ||
+                             m_previewViewport->puppetObjectId() == snap.objectId)) {
+                            m_previewViewport->setPuppetContourPins(snap.pins,
+                                                                    static_cast<int32_t>(pinIndex));
+                        }
+                    };
+                    if (auto *bus = commandBus()) {
+                        bus->execute(std::make_unique<MeshEditCommand>(
+                            QStringLiteral("Move Contour Pin #%1").arg(pinIndex),
+                            std::move(oldSnap), std::move(newSnap), std::move(applyPins)));
+                    } else {
+                        applyPins(newSnap);
+                    }
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(QStringLiteral("Moved contour pin #%1 (%2, %3)")
+                                                   .arg(pinIndex)
+                                                   .arg(px, 0, 'f', 1)
+                                                   .arg(py, 0, 'f', 1));
+                    }
+                });
+        connect(m_previewViewport, &GpuPreviewViewport::contourPinSelected, this,
+                [this](int32_t objectId, int32_t pinIndex) {
+                    if (m_puppetMeshPanel) {
+                        if (auto *pinTree = m_puppetMeshPanel->findChild<QTreeWidget *>()) {
+                            if (pinIndex >= 0 && pinIndex < pinTree->topLevelItemCount()) {
+                                const QSignalBlocker treeBlocker(pinTree);
+                                pinTree->setCurrentItem(pinTree->topLevelItem(pinIndex));
+                            } else {
+                                pinTree->clearSelection();
+                            }
+                        }
+                    }
+                    if (m_statusLabel && pinIndex >= 0) {
+                        m_statusLabel->setText(QStringLiteral("Selected contour pin #%1 (object %2)")
+                                                   .arg(pinIndex)
+                                                   .arg(objectId));
+                    }
+                });
 
         connect(m_previewViewport, &GpuPreviewViewport::puppetBoneSelected, this,
                 [this](int32_t boneIndex) {
@@ -2185,10 +3189,83 @@ void MainWindow::wireInterPanelSignals()
                     }
                 });
 
+        connect(
+            m_previewViewport, &GpuPreviewViewport::puppetBonePivotChanged, this,
+            [this](int32_t /*objectId*/, int32_t boneIndex, const QPointF &newLocalPos,
+                   float newAngleZRad, bool committed) {
+                if (!committed) {
+                    if (m_statusLabel && boneIndex >= 0) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Bone #%1 pivot: (%2, %3) @ %4 rad")
+                                .arg(boneIndex)
+                                .arg(newLocalPos.x(), 0, 'f', 1)
+                                .arg(newLocalPos.y(), 0, 'f', 1)
+                                .arg(newAngleZRad, 0, 'f', 2));
+                    }
+                    return;
+                }
+                if (m_layoutManager && !m_boneRiggingPanel) {
+                    m_layoutManager->realizeLazyPanel(QStringLiteral("BoneRiggingPanel"));
+                }
+                if (!m_boneRiggingPanel || boneIndex < 0) {
+                    return;
+                }
+                const BoneHierarchySnapshot &currentRig = m_boneRiggingPanel->rigSnapshot();
+                if (static_cast<size_t>(boneIndex) >= currentRig.bones.size()) {
+                    return;
+                }
+
+                BoneHierarchySnapshot oldRig = currentRig;
+                BoneHierarchySnapshot newRig = currentRig;
+                we_mdl_bone_t &nb = newRig.bones[static_cast<size_t>(boneIndex)];
+                if (nb.parent != 0xFFFFFFFFu && nb.parent < newRig.bones.size()) {
+                    std::vector<std::array<float, 16>> localMats(newRig.bones.size());
+                    for (size_t i = 0; i < newRig.bones.size(); ++i) {
+                        std::copy_n(newRig.bones[i].local_trans, 16, localMats[i].data());
+                    }
+                    const auto worldMats = resolveBoneWorldMatrices(newRig.bones, localMats);
+                    QMatrix4x4 parentMat;
+                    std::memcpy(parentMat.data(), worldMats[nb.parent].data(), 16 * sizeof(float));
+                    const QVector3D localVec = parentMat.inverted().map(
+                        QVector3D(static_cast<float>(newLocalPos.x()),
+                                  static_cast<float>(newLocalPos.y()), nb.bind_pos[2]));
+                    nb.bind_pos[0] = localVec.x();
+                    nb.bind_pos[1] = localVec.y();
+                } else {
+                    nb.bind_pos[0] = static_cast<float>(newLocalPos.x());
+                    nb.bind_pos[1] = static_cast<float>(newLocalPos.y());
+                }
+                nb.bind_angle[2] = newAngleZRad;
+                composeBoneLocalMat4(nb.bind_pos, nb.bind_angle, nb.bind_scale, nb.local_trans);
+
+                auto applyRig = [this, boneIndex](const BoneHierarchySnapshot &snap) {
+                    m_cachedPuppetRig = snap;
+                    m_hasCachedPuppetRig = true;
+                    if (m_boneRiggingPanel) {
+                        hydrateBoneRiggingPanelFromSnapshot(m_boneRiggingPanel, snap, commandBus(),
+                                                            ipcClient(), m_syncingBoneDriveMode,
+                                                            boneIndex);
+                    }
+                    if (m_previewViewport &&
+                        (snap.objectId < 0 ||
+                         m_previewViewport->puppetObjectId() == snap.objectId)) {
+                        m_previewViewport->setPuppetSkeleton(snap, boneIndex);
+                    }
+                };
+                if (auto *bus = commandBus()) {
+                    bus->execute(std::make_unique<BoneEditCommand>(
+                        QStringLiteral("Transform Bone #%1").arg(boneIndex), std::move(oldRig),
+                        std::move(newRig), std::move(applyRig)));
+                } else {
+                    applyRig(newRig);
+                }
+            });
+
         connect(m_previewViewport, &GpuPreviewViewport::puppetIkTargetChanged, this,
                 [this](int32_t objectId, int32_t chainIndex, const QVector3D &targetWorld,
                        bool committed) {
-                    if (m_ipcClient && objectId >= 0 && chainIndex >= 0) {
+                    auto *ipc = ipcClient();
+                    if (ipc && objectId >= 0 && chainIndex >= 0) {
                         waywal_ipc_puppet_preview_ik_t req{};
                         req.object_id = static_cast<uint32_t>(objectId);
                         req.root_bone = 0xFFFFu;
@@ -2208,7 +3285,7 @@ void MainWindow::wireInterPanelSignals()
                         req.target_world[1] = targetWorld.y();
                         req.target_world[2] = targetWorld.z();
                         req.mode_flags = committed ? 5u : 1u;
-                        m_ipcClient->sendPuppetPreviewIk(req);
+                        ipc->sendPuppetPreviewIk(req);
                     }
                     if (committed && m_statusLabel) {
                         m_statusLabel->setText(
@@ -2219,7 +3296,8 @@ void MainWindow::wireInterPanelSignals()
         connect(m_previewViewport, &GpuPreviewViewport::puppetIkPoleChanged, this,
                 [this](int32_t objectId, int32_t chainIndex, const QVector3D & /*poleWorld*/,
                        bool poleFlip, bool committed) {
-                    if (m_ipcClient && objectId >= 0 && chainIndex >= 0) {
+                    auto *ipc = ipcClient();
+                    if (ipc && objectId >= 0 && chainIndex >= 0) {
                         waywal_ipc_puppet_preview_ik_t req{};
                         req.object_id = static_cast<uint32_t>(objectId);
                         req.root_bone = 0xFFFFu;
@@ -2239,7 +3317,7 @@ void MainWindow::wireInterPanelSignals()
                         }
                         req.pole_flip = poleFlip ? 1u : 0u;
                         req.mode_flags = committed ? 5u : 1u;
-                        m_ipcClient->sendPuppetPreviewIk(req);
+                        ipc->sendPuppetPreviewIk(req);
                     }
                     if (committed && m_statusLabel) {
                         m_statusLabel->setText(
@@ -2249,7 +3327,8 @@ void MainWindow::wireInterPanelSignals()
 
         connect(m_previewViewport, &GpuPreviewViewport::weightBrushDabBatchReady, this,
                 [this](int32_t objectId, const std::vector<WeightBrushDab> &dabs) {
-                    if (!m_ipcClient || objectId < 0 || dabs.empty()) {
+                    auto *ipc = ipcClient();
+                    if (!ipc || objectId < 0 || dabs.empty()) {
                         return;
                     }
                     if (m_previewViewport && m_previewViewport->puppetObjectId() == objectId) {
@@ -2286,8 +3365,8 @@ void MainWindow::wireInterPanelSignals()
                                 }
                             }
                             if (!syncEntries.empty()) {
-                                m_ipcClient->sendPuppetPaintWeights(static_cast<uint32_t>(objectId),
-                                                                    1u, syncEntries);
+                                ipc->sendPuppetPaintWeights(static_cast<uint32_t>(objectId), 1u,
+                                                            syncEntries);
                             }
                         }
                     }
@@ -2302,7 +3381,8 @@ void MainWindow::wireInterPanelSignals()
             [this](int32_t objectId, const std::vector<VertexWeightBlockSnapshot> &preBlocks,
                    const std::vector<VertexWeightBlockSnapshot> &postBlocks,
                    const std::vector<waywal_ipc_vertex_weight_t> &dirtyEntries) {
-                if (m_commandBus && (!preBlocks.empty() || !postBlocks.empty())) {
+                auto *bus = commandBus();
+                if (bus && (!preBlocks.empty() || !postBlocks.empty())) {
                     QPointer<GpuPreviewViewport> viewportPtr(m_previewViewport);
                     auto cmd = std::make_unique<WeightPaintStrokeCommand>(
                         objectId, QStringLiteral("Weight Paint Stroke"), preBlocks, postBlocks,
@@ -2312,7 +3392,8 @@ void MainWindow::wireInterPanelSignals()
                                 return;
                             }
                             viewportPtr->applyVertexWeightBlocks(oid, blocks);
-                            if (!m_ipcClient) {
+                            auto *activeIpc = ipcClient();
+                            if (!activeIpc) {
                                 return;
                             }
                             std::vector<waywal_ipc_vertex_weight_t> syncEntries;
@@ -2328,20 +3409,20 @@ void MainWindow::wireInterPanelSignals()
                                 }
                             }
                             if (!syncEntries.empty()) {
-                                m_ipcClient->sendPuppetPaintWeights(static_cast<uint32_t>(oid), 1u,
-                                                                    syncEntries);
+                                activeIpc->sendPuppetPaintWeights(static_cast<uint32_t>(oid), 1u,
+                                                                  syncEntries);
                             }
                         });
-                    m_commandBus->execute(std::move(cmd));
-                } else if (m_ipcClient && objectId >= 0 && !dirtyEntries.empty()) {
-                    m_ipcClient->sendPuppetPaintWeights(static_cast<uint32_t>(objectId), 1u,
-                                                        dirtyEntries);
+                    bus->execute(std::move(cmd));
+                } else if (auto *ipc = ipcClient();
+                           ipc && objectId >= 0 && !dirtyEntries.empty()) {
+                    ipc->sendPuppetPaintWeights(static_cast<uint32_t>(objectId), 1u, dirtyEntries);
                 }
             });
     }
 
-    if (m_ipcClient) {
-        connect(m_ipcClient.get(), &IpcClient::puppetMeshAckReceived, this,
+    if (auto *ipc = ipcClient()) {
+        connect(ipc, &IpcClient::puppetMeshAckReceived, this,
                 [this](const waywal_ipc_puppet_mesh_ack_t &resp) {
                     if (m_statusLabel) {
                         m_statusLabel->setText(
@@ -2350,7 +3431,7 @@ void MainWindow::wireInterPanelSignals()
                                 .arg(resp.triangle_count));
                     }
                 });
-        connect(m_ipcClient.get(), &IpcClient::puppetWeightsSolved, this,
+        connect(ipc, &IpcClient::puppetWeightsSolved, this,
                 [this](const waywal_ipc_puppet_weights_resp_t &resp,
                        const std::vector<waywal_ipc_vertex_weight_t> &entries) {
                     if (resp.status == 0 && m_previewViewport && !entries.empty()) {
@@ -2373,7 +3454,7 @@ void MainWindow::wireInterPanelSignals()
                                 .arg(resp.status));
                     }
                 });
-        connect(m_ipcClient.get(), &IpcClient::puppetIkPoseReceived, this,
+        connect(ipc, &IpcClient::puppetIkPoseReceived, this,
                 [this](const waywal_ipc_puppet_ik_pose_resp_t &resp,
                        const std::vector<waywal_ipc_bone_trs_t> &bones) {
                     const int32_t oid = static_cast<int32_t>(resp.object_id);
@@ -2410,7 +3491,7 @@ void MainWindow::wireInterPanelSignals()
                     }
                 });
         connect(
-            m_ipcClient.get(), &IpcClient::puppetMdlExported, this,
+            ipc, &IpcClient::puppetMdlExported, this,
             [this](const waywal_ipc_export_puppet_mdl_resp_t &resp, const QByteArray &mdlBytes) {
                 QString destPath;
                 const auto it = m_pendingMdlExportPaths.find(static_cast<int32_t>(resp.object_id));
@@ -2457,13 +3538,15 @@ void MainWindow::wireInterPanelSignals()
     }
 }
 
-void MainWindow::applyWallpaperPath(const QString &path)
+void MainWindow::applyWallpaperPath(const QString &path, const QString &explicitMonitorSpec)
 {
-    if (path.isEmpty())
+    if (path.isEmpty()) {
         return;
+    }
+    const QString prevActivePath = m_activeWallpaperPath;
     m_activeWallpaperPath = path;
 
-    QFileInfo fi(path);
+    const QFileInfo fi(path);
     if (!fi.exists()) {
         if (m_statusLabel) {
             m_statusLabel->setText(QStringLiteral("Preview Active: %1").arg(path));
@@ -2471,32 +3554,127 @@ void MainWindow::applyWallpaperPath(const QString &path)
         return;
     }
 
-    QString wwalBin = QStandardPaths::findExecutable(QStringLiteral("wwal"));
-    if (wwalBin.isEmpty()) {
-        QString localBin = QDir::homePath() + QStringLiteral("/.local/bin/wwal");
-        if (QFileInfo::exists(localBin)) {
-            wwalBin = localBin;
-        }
+    WallpaperApplyRequest req;
+    req.namespaceStr = m_options.namespaceStr;
+    req.path = path;
+
+    QString targetOutputs;
+    if (m_topologyBar && m_topologyBar->canvas() &&
+        m_topologyBar->canvas()->isDesktopSpanMode()) {
+        targetOutputs = QStringLiteral("*");
+    } else if (!explicitMonitorSpec.trimmed().isEmpty()) {
+        targetOutputs = normalizeTargetOutputSpec(explicitMonitorSpec);
+    } else {
+        targetOutputs = resolveSelectedOutputsCsv();
+    }
+    req.targetOutputsCsv = targetOutputs;
+
+    if (m_bezierEditor) {
+        const TransitionConfig cfg = m_bezierEditor->transitionConfig();
+        req.transitionType = cfg.type;
+        req.transitionDurationMs = cfg.durationMs;
+        req.transitionFps = cfg.fps;
+        req.angleDeg = cfg.angleDeg;
+        req.waveFreq = cfg.waveFreq;
+        req.waveAmp = cfg.waveAmp;
+        req.centerX = cfg.centerX;
+        req.centerY = cfg.centerY;
+        req.bezier = cfg.bezier;
+        req.hasCustomBezier = cfg.hasCustomBezier;
     }
 
-    if (!wwalBin.isEmpty()) {
-        QStringList args;
-        if (!m_options.namespaceStr.isEmpty() &&
-            m_options.namespaceStr != QStringLiteral("default")) {
-            args << QStringLiteral("--namespace") << m_options.namespaceStr;
+    if (m_topologyBar && m_topologyBar->canvas()) {
+        auto *canvas = m_topologyBar->canvas();
+        req.scalingMode = canvas->isDesktopSpanMode()
+                              ? static_cast<uint32_t>(WAYWAL_SCALING_SPAN)
+                              : static_cast<uint32_t>(canvas->currentScalingMode());
+        QString gravMonitor = (targetOutputs != QStringLiteral("*"))
+                                  ? targetOutputs.section(QLatin1Char(','), 0, 0).trimmed()
+                                  : QString();
+        if (gravMonitor.isEmpty() && !canvas->selectedMonitorNames().isEmpty()) {
+            gravMonitor = canvas->selectedMonitorNames().first();
         }
-        args << QStringLiteral("img") << path;
-        QProcess::startDetached(wwalBin, args);
+        const QPointF grav = canvas->cropGravity(gravMonitor);
+        req.cropGravityX = static_cast<float>(grav.x());
+        req.cropGravityY = static_cast<float>(grav.y());
+        req.hasCropGravity = true;
     }
 
-    if (m_statusLabel) {
-        m_statusLabel->setText(QStringLiteral("Applied Wallpaper: %1").arg(fi.fileName()));
+    if (m_themeStudio) {
+        req.hasThemeMode = true;
+        req.themeLightMode = (m_themeStudio->themeMode() == WAYWAL_THEME_LIGHT);
+        req.hasSourceColorIndex = true;
+        req.sourceColorIndex = m_themeStudio->seedIndex();
+    }
+
+    const WallpaperApplyRequest oldReq =
+        m_session ? m_session->lastAppliedRequest() : WallpaperApplyRequest{};
+    const waywal_img_metadata_t oldMeta = StudioSessionContext::buildImgMetadata(oldReq);
+    const waywal_img_metadata_t newMeta = StudioSessionContext::buildImgMetadata(req);
+
+    auto applyFn = [this, prevActivePath](const QString &outSpec,
+                                          const waywal_img_metadata_t &meta,
+                                          const QString &targetPath) {
+        if (targetPath.isEmpty()) {
+            m_activeWallpaperPath.clear();
+            if (m_statusLabel) {
+                m_statusLabel->setText(QStringLiteral("Cleared active wallpaper selection"));
+            }
+            return;
+        }
+        const WallpaperApplyRequest effReq = StudioSessionContext::requestFromMetadata(
+            m_options.namespaceStr, outSpec, meta, targetPath);
+        const bool pathChanged = (targetPath != prevActivePath);
+        const bool dispatched = StudioSessionContext::dispatchWwalCli(
+            StudioSessionContext::buildWallpaperApplyArgs(effReq));
+
+        if (m_session) {
+            m_session->setLastAppliedRequest(effReq);
+        }
+        m_activeWallpaperPath = targetPath;
+
+        if (pathChanged && m_previewViewport) {
+            const QString lower = targetPath.toLower();
+            if (lower.endsWith(QStringLiteral(".glsl")) ||
+                lower.endsWith(QStringLiteral(".frag")) ||
+                lower.endsWith(QStringLiteral(".comp")) ||
+                lower.endsWith(QStringLiteral(".shader"))) {
+                QString shaderSrc;
+                QString readErr;
+                if (StudioSessionContext::readBoundedUtf8File(targetPath, shaderSrc, readErr)) {
+                    m_previewViewport->setPreviewShader(shaderSrc);
+                }
+            } else {
+                m_previewViewport->setPreviewImagePath(targetPath);
+            }
+        }
+        if (auto *ipc = ipcClient(); ipc && ipc->isConnected()) {
+            ipc->sendQuerySceneTree(normalizeTargetOutputSpec(outSpec));
+        }
+        if (m_statusLabel) {
+            const QString fileName = QFileInfo(targetPath).fileName();
+            m_statusLabel->setText(
+                dispatched
+                    ? QStringLiteral("Applied Wallpaper (%1): %2")
+                          .arg(StudioSessionContext::scalingModeCliName(effReq.scalingMode),
+                               fileName)
+                    : QStringLiteral("wwal CLI unavailable; updated preview for %1")
+                          .arg(fileName));
+        }
+    };
+
+    if (auto *bus = commandBus()) {
+        bus->execute(std::make_unique<ApplyWallpaperCommand>(
+            targetOutputs, oldMeta, newMeta, oldReq.path, path, std::move(applyFn)));
+    } else {
+        applyFn(targetOutputs, newMeta, path);
     }
 }
 
 void MainWindow::installPackageToDaemon(const QString &packageIdOrPath, const QString &targetOutput)
 {
-    const QString resolvedPkgPath = resolveLocalWwpkgFile(packageIdOrPath, m_downloadMgr);
+    const QString resolvedPkgPath =
+        resolveLocalWwpkgFile(packageIdOrPath, m_session ? m_session->downloadManager() : nullptr);
     if (resolvedPkgPath.isEmpty()) {
         if (m_statusLabel) {
             m_statusLabel->setText(
@@ -2524,12 +3702,13 @@ void MainWindow::installPackageToDaemon(const QString &packageIdOrPath, const QS
         m_statusLabel->setText(QStringLiteral("Installing package: %1").arg(pkgFileName));
     }
 
-    if (!m_ipcClient) {
+    auto *ipc = ipcClient();
+    if (!ipc) {
         return;
     }
 
     QPointer<MainWindow> self(this);
-    m_ipcClient->installWwpkg(
+    ipc->installWwpkg(
         resolvedPkgPath, normalizedTarget,
         WAYWAL_WWPKG_INSTALL_FLAG_AUTO_APPLY | WAYWAL_WWPKG_INSTALL_FLAG_FORCE_OVERWRITE,
         [self, pkgFileName, relativeEntrypoint](const waywal_ipc_resp_wwpkg_install_t &resp,
@@ -2561,15 +3740,15 @@ void MainWindow::installPackageToDaemon(const QString &packageIdOrPath, const QS
 
 void MainWindow::handleUndo()
 {
-    if (m_commandBus && m_commandBus->canUndo()) {
-        m_commandBus->undo();
+    if (auto *bus = commandBus(); bus && bus->canUndo()) {
+        bus->undo();
     }
 }
 
 void MainWindow::handleRedo()
 {
-    if (m_commandBus && m_commandBus->canRedo()) {
-        m_commandBus->redo();
+    if (auto *bus = commandBus(); bus && bus->canRedo()) {
+        bus->redo();
     }
 }
 
@@ -2627,8 +3806,15 @@ void MainWindow::handleResetLayout()
 
 void MainWindow::handleOpenPackagingWizard()
 {
+    if (m_activePackagingWizard) {
+        m_activePackagingWizard->raise();
+        m_activePackagingWizard->activateWindow();
+        return;
+    }
+
     auto *wizard = new CreatorPackagingWizard(this);
     wizard->setAttribute(Qt::WA_DeleteOnClose);
+    m_activePackagingWizard = wizard;
     if (!m_activeWallpaperPath.isEmpty()) {
         wizard->setSourcePath(m_activeWallpaperPath);
     }
@@ -2670,9 +3856,22 @@ void MainWindow::handleOpenPackagingWizard()
 
 void MainWindow::handleExportScenePackage()
 {
-    const QString destPath = QFileDialog::getSaveFileName(
-        this, QStringLiteral("Export Scene Package"), m_activeWallpaperPath,
-        QStringLiteral("Scene Packages (*.pkg *.wwpkg);;All Files (*)"));
+    auto *dlg = new QFileDialog(this, QStringLiteral("Export Scene Package"), m_activeWallpaperPath,
+                                QStringLiteral("Scene Packages (*.pkg *.wwpkg);;All Files (*)"));
+    dlg->setAcceptMode(QFileDialog::AcceptSave);
+    dlg->setDefaultSuffix(QStringLiteral("pkg"));
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    QPointer<MainWindow> self(this);
+    connect(dlg, &QFileDialog::fileSelected, this, [self](const QString &destPath) {
+        if (self && !destPath.isEmpty()) {
+            self->dispatchScenePackageExport(destPath);
+        }
+    });
+    dlg->open();
+}
+
+void MainWindow::dispatchScenePackageExport(const QString &destPath)
+{
     if (destPath.isEmpty()) {
         return;
     }
@@ -2680,11 +3879,11 @@ void MainWindow::handleExportScenePackage()
     const QString lowerDest = destPath.toLower();
     const QFileInfo srcInfo(m_activeWallpaperPath);
     const QString lowerSrc = m_activeWallpaperPath.toLower();
+    auto *ipc = ipcClient();
 
     // Landlock-confined wwald can only write exports under the cache staging root,
     // never directly into user wallpaper or config directories.
-    if (!lowerDest.endsWith(QStringLiteral(".wwpkg")) && m_ipcClient &&
-        m_ipcClient->isConnected()) {
+    if (!lowerDest.endsWith(QStringLiteral(".wwpkg")) && ipc && ipc->isConnected() && m_session) {
         QString cacheRoot = qEnvironmentVariable("XDG_CACHE_HOME");
         if (cacheRoot.isEmpty()) {
             cacheRoot = QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation);
@@ -2715,16 +3914,12 @@ void MainWindow::handleExportScenePackage()
             isPkgFile ? (WE_EXPORT_PKG_FLAG_PACK_SCENE_PKG | WE_EXPORT_PKG_FLAG_DIRECT_PKG_FILE)
                       : 0u;
 
-        m_pendingExportStagePath = stagePath;
-        m_pendingExportDestPath = destPath;
-        m_pendingExportIsPkgFile = isPkgFile;
-
         const QString outName =
             m_previewViewport ? m_previewViewport->selectedMonitor() : QStringLiteral("*");
-        if (!m_ipcClient->sendExportScenePkg(outName, stagePath, exportFlags)) {
-            m_pendingExportStagePath.clear();
-            m_pendingExportDestPath.clear();
-            m_pendingExportIsPkgFile = false;
+        m_session->enqueuePendingExport(PendingSceneExport{stagePath, destPath, outName, isPkgFile});
+
+        if (!ipc->sendExportScenePkg(outName, stagePath, exportFlags)) {
+            m_session->discardLastPendingExport();
             if (m_statusLabel) {
                 m_statusLabel->setText(QStringLiteral("Failed to dispatch scene package export."));
             }
@@ -2736,8 +3931,14 @@ void MainWindow::handleExportScenePackage()
         return;
     }
 
+    if (m_activePackagingWizard) {
+        m_activePackagingWizard->raise();
+        m_activePackagingWizard->activateWindow();
+        return;
+    }
     auto *wizard = new CreatorPackagingWizard(this);
     wizard->setAttribute(Qt::WA_DeleteOnClose);
+    m_activePackagingWizard = wizard;
     if (!m_activeWallpaperPath.isEmpty() &&
         (srcInfo.isDir() || lowerSrc.endsWith(QStringLiteral(".pkg")) ||
          lowerSrc.endsWith(QStringLiteral(".tex")) ||
@@ -2880,10 +4081,18 @@ void MainWindow::refreshOnionSkinFrames()
 
     const auto &clips = m_dopeSheetTimeline->clips();
     const TimelineAnimClip *activeClip = &clips.front();
-    for (const auto &c : clips) {
-        if (c.layerVisible && !c.channels.empty()) {
-            activeClip = &c;
-            break;
+    if (auto *clipCombo =
+            m_dopeSheetTimeline->findChild<QComboBox *>(QStringLiteral("timelineClipCombo"))) {
+        const int idx = clipCombo->currentIndex();
+        if (idx >= 0 && static_cast<size_t>(idx) < clips.size()) {
+            activeClip = &clips[static_cast<size_t>(idx)];
+        }
+    } else {
+        for (const auto &c : clips) {
+            if (c.layerVisible && !c.channels.empty()) {
+                activeClip = &c;
+                break;
+            }
         }
     }
 

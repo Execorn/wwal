@@ -271,7 +271,6 @@ static int runHeadlessCheck(const StudioOptions &options)
 
     // Test the EXACT interactive startup sequence: window.show() WITHOUT calling
     // switchPerspective() or applyCurrentSplitSizes() after show()!
-    QApplication::setStyle(QStyleFactory::create(QStringLiteral("Fusion")));
     window.resize(1600, 960);
     window.show();
     for (int i = 0; i < 12; ++i) {
@@ -624,6 +623,7 @@ int main(int argc, char *argv[])
     }
 
     QApplication app(argc, argv);
+    QApplication::setStyle(QStyleFactory::create(QStringLiteral("Fusion")));
     if (qEnvironmentVariableIsEmpty("QT_LOGGING_RULES")) {
         QLoggingCategory::setFilterRules(QStringLiteral("qt.qpa.wayland.textinput.warning=false\n"
                                                         "qt.qpa.wayland.textinput=false"));
@@ -694,8 +694,6 @@ int main(int argc, char *argv[])
     }
 
     // Normal Interactive GUI Mode
-    QApplication::setStyle(QStyleFactory::create(QStringLiteral("Fusion")));
-
     MainWindow window(options);
     window.show();
 

@@ -4,6 +4,8 @@
 
 #include "studio/core/rigging_commands.hpp"
 
+#include <QPointer>
+
 #include <QMainWindow>
 #include <QString>
 #include <QStringList>
@@ -44,6 +46,8 @@ using ::wwal::studio::WorkshopBrowserWidget;
 class DockLayoutManager;
 class CommandBus;
 class IpcClient;
+class PresetStore;
+class StudioSessionContext;
 class GpuPreviewViewport;
 class CubicBezierEditorWidget;
 class PropertyInspectorWidget;
@@ -101,7 +105,9 @@ class MainWindow : public QMainWindow {
     ~MainWindow() override;
 
     DockLayoutManager *dockLayoutManager() const { return m_layoutManager; }
-    CommandBus *commandBus() const { return m_commandBus.get(); }
+    CommandBus *commandBus() const;
+    PresetStore *presetStore() const;
+    StudioSessionContext *sessionContext() const { return m_session.get(); }
     const StudioOptions &options() const { return m_options; }
 
     // Direct access to core panels (defined out-of-line so QPointer<T> members stay incomplete-type
@@ -115,10 +121,10 @@ class MainWindow : public QMainWindow {
     StudioFooterBar *footerBar() const;
     WorkshopBrowserWidget *workshopBrowser() const;
     OpenHubBrowserWidget *openHubBrowser() const;
-    CatalogIndexManager *catalogIndexManager() const { return m_catalogIndexMgr.get(); }
-    DownloadManager *downloadManager() const { return m_downloadMgr.get(); }
-    RecursiveFsWatcher *fsWatcher() const { return m_fsWatcher.get(); }
-    IpcClient *ipcClient() const { return m_ipcClient.get(); }
+    CatalogIndexManager *catalogIndexManager() const;
+    DownloadManager *downloadManager() const;
+    RecursiveFsWatcher *fsWatcher() const;
+    IpcClient *ipcClient() const;
     NodeGraphEditorWidget *nodeGraphEditor() const;
     EffectLibraryBrowserWidget *effectLibraryBrowser() const;
     CameraLightingInspectorWidget *cameraLightingInspector() const;
@@ -167,8 +173,14 @@ class MainWindow : public QMainWindow {
     void applyProStudioDarkTheme();
     void wireInterPanelSignals();
     void updateCommandBusHistoryUI();
-    void applyWallpaperPath(const QString &path);
+    void applyWallpaperPath(const QString &path, const QString &explicitMonitorSpec = QString());
     void installPackageToDaemon(const QString &packageIdOrPath, const QString &targetOutput);
+    [[nodiscard]] QString resolveSelectedOutputsCsv() const;
+    void syncMonitorCatalogToPanels();
+    void updateGpuShaderEditorContext();
+    void syncThemeStateToIpcOrActiveWallpaper(bool includeApplyHint = false);
+    void dispatchScenePackageExport(const QString &destPath);
+    void detachPanelServicePointers() noexcept;
     void setActivePuppetObjectContext(int32_t objectId, uint32_t texWidth, uint32_t texHeight);
     void hydrateWeightPaintPanel(WeightPaintPanel *panel) const;
     void hydrateDopeSheetTimeline(DopeSheetTimelineWidget *timeline);
@@ -176,13 +188,7 @@ class MainWindow : public QMainWindow {
 
     StudioOptions m_options;
     DockLayoutManager *m_layoutManager{nullptr};
-    std::unique_ptr<CommandBus> m_commandBus;
-
-    // Steam Workshop, Open Hub & Catalog Engine
-    std::shared_ptr<CatalogIndexManager> m_catalogIndexMgr;
-    std::shared_ptr<DownloadManager> m_downloadMgr;
-    std::unique_ptr<RecursiveFsWatcher> m_fsWatcher;
-    std::jthread m_reconcileThread;
+    std::unique_ptr<StudioSessionContext> m_session;
 
     // 6+ Studio Dock Panels & Bars
     QPointer<MonitorTopologyBar> m_topologyBar;
@@ -195,7 +201,6 @@ class MainWindow : public QMainWindow {
     QPointer<ThemeStudioWidget> m_themeStudio;
     QPointer<StudioFooterBar> m_footerBar;
 
-    std::unique_ptr<IpcClient> m_ipcClient;
     QPointer<NodeGraphEditorWidget> m_nodeGraphEditor;
     QPointer<EffectLibraryBrowserWidget> m_effectLibraryBrowser;
     QPointer<CameraLightingInspectorWidget> m_cameraLightingInspector;
@@ -226,9 +231,10 @@ class MainWindow : public QMainWindow {
     QLabel *m_statusLabel{nullptr};
     QString m_activeWallpaperPath;
     QString m_lastSceneTreeJson;
-    QString m_pendingExportStagePath;
-    QString m_pendingExportDestPath;
-    bool m_pendingExportIsPkgFile{false};
+    QPointer<CreatorPackagingWizard> m_activePackagingWizard;
+    float m_audioVolume{1.0f};
+    bool m_muteOnAudio{false};
+    uint8_t m_batteryPolicy{0};
 
     bool m_isFullscreenPreview{false};
     bool m_isPlaying{true};
