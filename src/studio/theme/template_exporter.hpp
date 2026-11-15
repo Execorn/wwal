@@ -91,6 +91,7 @@ class TemplateExporter : public QWidget {
     void setupUi();
 
     static QString hexRgb(const color_rgba_t &c);
+    static QString hexRgbBare(const color_rgba_t &c);
     static QString hexRgba(const color_rgba_t &c);
     static QString hyprRgb(const color_rgba_t &c);
 

@@ -13,10 +13,611 @@
 #include <QRandomGenerator>
 #include <QVBoxLayout>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace waywal::studio {
+namespace {
+
+enum class SlotGroup : uint8_t {
+    M3Core,
+    M3Extended,
+    Term,
+    Catppuccin,
+    Kde,
+    SurfaceAlt,
+};
+
+struct PaletteSlot {
+    const char *camelName;
+    const char *snakeName; // Populated only for tokens emitted by Hyprland and Waybar
+    color_rgba_t waywal_palette_t::*member;
+    int termIndex; // >= 0 indexes pal.term[]; avoids pointer-to-anonymous-union-member
+    SlotGroup group;
+};
+
+constexpr std::array<PaletteSlot, 110> kPaletteSlots = {{
+    // Core Material 3 roles (also emitted as Hyprland/Waybar variables)
+    {"primary", "primary", &waywal_palette_t::primary, -1, SlotGroup::M3Core},
+    {"onPrimary", "on_primary", &waywal_palette_t::onPrimary, -1, SlotGroup::M3Core},
+    {"primaryContainer", "primary_container", &waywal_palette_t::primaryContainer, -1,
+     SlotGroup::M3Core},
+    {"onPrimaryContainer", "on_primary_container", &waywal_palette_t::onPrimaryContainer, -1,
+     SlotGroup::M3Core},
+    {"inversePrimary", "inverse_primary", &waywal_palette_t::inversePrimary, -1, SlotGroup::M3Core},
+
+    {"secondary", "secondary", &waywal_palette_t::secondary, -1, SlotGroup::M3Core},
+    {"onSecondary", "on_secondary", &waywal_palette_t::onSecondary, -1, SlotGroup::M3Core},
+    {"secondaryContainer", "secondary_container", &waywal_palette_t::secondaryContainer, -1,
+     SlotGroup::M3Core},
+    {"onSecondaryContainer", "on_secondary_container", &waywal_palette_t::onSecondaryContainer, -1,
+     SlotGroup::M3Core},
+
+    {"tertiary", "tertiary", &waywal_palette_t::tertiary, -1, SlotGroup::M3Core},
+    {"onTertiary", "on_tertiary", &waywal_palette_t::onTertiary, -1, SlotGroup::M3Core},
+    {"tertiaryContainer", "tertiary_container", &waywal_palette_t::tertiaryContainer, -1,
+     SlotGroup::M3Core},
+    {"onTertiaryContainer", "on_tertiary_container", &waywal_palette_t::onTertiaryContainer, -1,
+     SlotGroup::M3Core},
+
+    {"error", "error", &waywal_palette_t::error, -1, SlotGroup::M3Core},
+    {"onError", "on_error", &waywal_palette_t::onError, -1, SlotGroup::M3Core},
+    {"errorContainer", "error_container", &waywal_palette_t::errorContainer, -1, SlotGroup::M3Core},
+    {"onErrorContainer", "on_error_container", &waywal_palette_t::onErrorContainer, -1,
+     SlotGroup::M3Core},
+
+    {"background", "background", &waywal_palette_t::background, -1, SlotGroup::M3Core},
+    {"onBackground", "on_background", &waywal_palette_t::onBackground, -1, SlotGroup::M3Core},
+    {"surface", "surface", &waywal_palette_t::surface, -1, SlotGroup::M3Core},
+    {"onSurface", "on_surface", &waywal_palette_t::onSurface, -1, SlotGroup::M3Core},
+    {"surfaceDim", "surface_dim", &waywal_palette_t::surfaceDim, -1, SlotGroup::M3Core},
+    {"surfaceBright", "surface_bright", &waywal_palette_t::surfaceBright, -1, SlotGroup::M3Core},
+    {"surfaceVariant", "surface_variant", &waywal_palette_t::surfaceVariant, -1, SlotGroup::M3Core},
+    {"onSurfaceVariant", "on_surface_variant", &waywal_palette_t::onSurfaceVariant, -1,
+     SlotGroup::M3Core},
+    {"surfaceContainerLowest", "surface_container_lowest",
+     &waywal_palette_t::surfaceContainerLowest, -1, SlotGroup::M3Core},
+    {"surfaceContainerLow", "surface_container_low", &waywal_palette_t::surfaceContainerLow, -1,
+     SlotGroup::M3Core},
+    {"surfaceContainer", "surface_container", &waywal_palette_t::surfaceContainer, -1,
+     SlotGroup::M3Core},
+    {"surfaceContainerHigh", "surface_container_high", &waywal_palette_t::surfaceContainerHigh, -1,
+     SlotGroup::M3Core},
+    {"surfaceContainerHighest", "surface_container_highest",
+     &waywal_palette_t::surfaceContainerHighest, -1, SlotGroup::M3Core},
+
+    {"outline", "outline", &waywal_palette_t::outline, -1, SlotGroup::M3Core},
+    {"outlineVariant", "outline_variant", &waywal_palette_t::outlineVariant, -1, SlotGroup::M3Core},
+    {"shadow", "shadow", &waywal_palette_t::shadow, -1, SlotGroup::M3Core},
+
+    // Extended Material 3 key, surface, fixed, and semantic roles
+    {"primary_paletteKeyColor", nullptr, &waywal_palette_t::primary_paletteKeyColor, -1,
+     SlotGroup::M3Extended},
+    {"secondary_paletteKeyColor", nullptr, &waywal_palette_t::secondary_paletteKeyColor, -1,
+     SlotGroup::M3Extended},
+    {"tertiary_paletteKeyColor", nullptr, &waywal_palette_t::tertiary_paletteKeyColor, -1,
+     SlotGroup::M3Extended},
+    {"neutral_paletteKeyColor", nullptr, &waywal_palette_t::neutral_paletteKeyColor, -1,
+     SlotGroup::M3Extended},
+    {"neutral_variant_paletteKeyColor", nullptr, &waywal_palette_t::neutral_variant_paletteKeyColor,
+     -1, SlotGroup::M3Extended},
+
+    {"inverseSurface", nullptr, &waywal_palette_t::inverseSurface, -1, SlotGroup::M3Extended},
+    {"inverseOnSurface", nullptr, &waywal_palette_t::inverseOnSurface, -1, SlotGroup::M3Extended},
+    {"scrim", nullptr, &waywal_palette_t::scrim, -1, SlotGroup::M3Extended},
+    {"surfaceTint", nullptr, &waywal_palette_t::surfaceTint, -1, SlotGroup::M3Extended},
+
+    {"primaryFixed", nullptr, &waywal_palette_t::primaryFixed, -1, SlotGroup::M3Extended},
+    {"primaryFixedDim", nullptr, &waywal_palette_t::primaryFixedDim, -1, SlotGroup::M3Extended},
+    {"onPrimaryFixed", nullptr, &waywal_palette_t::onPrimaryFixed, -1, SlotGroup::M3Extended},
+    {"onPrimaryFixedVariant", nullptr, &waywal_palette_t::onPrimaryFixedVariant, -1,
+     SlotGroup::M3Extended},
+    {"secondaryFixed", nullptr, &waywal_palette_t::secondaryFixed, -1, SlotGroup::M3Extended},
+    {"secondaryFixedDim", nullptr, &waywal_palette_t::secondaryFixedDim, -1, SlotGroup::M3Extended},
+    {"onSecondaryFixed", nullptr, &waywal_palette_t::onSecondaryFixed, -1, SlotGroup::M3Extended},
+    {"onSecondaryFixedVariant", nullptr, &waywal_palette_t::onSecondaryFixedVariant, -1,
+     SlotGroup::M3Extended},
+    {"tertiaryFixed", nullptr, &waywal_palette_t::tertiaryFixed, -1, SlotGroup::M3Extended},
+    {"tertiaryFixedDim", nullptr, &waywal_palette_t::tertiaryFixedDim, -1, SlotGroup::M3Extended},
+    {"onTertiaryFixed", nullptr, &waywal_palette_t::onTertiaryFixed, -1, SlotGroup::M3Extended},
+    {"onTertiaryFixedVariant", nullptr, &waywal_palette_t::onTertiaryFixedVariant, -1,
+     SlotGroup::M3Extended},
+
+    {"success", nullptr, &waywal_palette_t::success, -1, SlotGroup::M3Extended},
+    {"onSuccess", nullptr, &waywal_palette_t::onSuccess, -1, SlotGroup::M3Extended},
+    {"successContainer", nullptr, &waywal_palette_t::successContainer, -1, SlotGroup::M3Extended},
+    {"onSuccessContainer", nullptr, &waywal_palette_t::onSuccessContainer, -1,
+     SlotGroup::M3Extended},
+
+    // Terminal ANSI 0-15 slots
+    {"term0", nullptr, nullptr, 0, SlotGroup::Term},
+    {"term1", nullptr, nullptr, 1, SlotGroup::Term},
+    {"term2", nullptr, nullptr, 2, SlotGroup::Term},
+    {"term3", nullptr, nullptr, 3, SlotGroup::Term},
+    {"term4", nullptr, nullptr, 4, SlotGroup::Term},
+    {"term5", nullptr, nullptr, 5, SlotGroup::Term},
+    {"term6", nullptr, nullptr, 6, SlotGroup::Term},
+    {"term7", nullptr, nullptr, 7, SlotGroup::Term},
+    {"term8", nullptr, nullptr, 8, SlotGroup::Term},
+    {"term9", nullptr, nullptr, 9, SlotGroup::Term},
+    {"term10", nullptr, nullptr, 10, SlotGroup::Term},
+    {"term11", nullptr, nullptr, 11, SlotGroup::Term},
+    {"term12", nullptr, nullptr, 12, SlotGroup::Term},
+    {"term13", nullptr, nullptr, 13, SlotGroup::Term},
+    {"term14", nullptr, nullptr, 14, SlotGroup::Term},
+    {"term15", nullptr, nullptr, 15, SlotGroup::Term},
+
+    // Catppuccin palette tokens
+    {"rosewater", nullptr, &waywal_palette_t::rosewater, -1, SlotGroup::Catppuccin},
+    {"flamingo", nullptr, &waywal_palette_t::flamingo, -1, SlotGroup::Catppuccin},
+    {"pink", nullptr, &waywal_palette_t::pink, -1, SlotGroup::Catppuccin},
+    {"mauve", nullptr, &waywal_palette_t::mauve, -1, SlotGroup::Catppuccin},
+    {"red", nullptr, &waywal_palette_t::red, -1, SlotGroup::Catppuccin},
+    {"maroon", nullptr, &waywal_palette_t::maroon, -1, SlotGroup::Catppuccin},
+    {"peach", nullptr, &waywal_palette_t::peach, -1, SlotGroup::Catppuccin},
+    {"yellow", nullptr, &waywal_palette_t::yellow, -1, SlotGroup::Catppuccin},
+    {"green", nullptr, &waywal_palette_t::green, -1, SlotGroup::Catppuccin},
+    {"teal", nullptr, &waywal_palette_t::teal, -1, SlotGroup::Catppuccin},
+    {"sky", nullptr, &waywal_palette_t::sky, -1, SlotGroup::Catppuccin},
+    {"sapphire", nullptr, &waywal_palette_t::sapphire, -1, SlotGroup::Catppuccin},
+    {"blue", nullptr, &waywal_palette_t::blue, -1, SlotGroup::Catppuccin},
+    {"lavender", nullptr, &waywal_palette_t::lavender, -1, SlotGroup::Catppuccin},
+
+    // KDE semantic roles
+    {"klink", nullptr, &waywal_palette_t::klink, -1, SlotGroup::Kde},
+    {"klinkSelection", nullptr, &waywal_palette_t::klinkSelection, -1, SlotGroup::Kde},
+    {"kvisited", nullptr, &waywal_palette_t::kvisited, -1, SlotGroup::Kde},
+    {"kvisitedSelection", nullptr, &waywal_palette_t::kvisitedSelection, -1, SlotGroup::Kde},
+    {"knegative", nullptr, &waywal_palette_t::knegative, -1, SlotGroup::Kde},
+    {"knegativeSelection", nullptr, &waywal_palette_t::knegativeSelection, -1, SlotGroup::Kde},
+    {"kneutral", nullptr, &waywal_palette_t::kneutral, -1, SlotGroup::Kde},
+    {"kneutralSelection", nullptr, &waywal_palette_t::kneutralSelection, -1, SlotGroup::Kde},
+    {"kpositive", nullptr, &waywal_palette_t::kpositive, -1, SlotGroup::Kde},
+    {"kpositiveSelection", nullptr, &waywal_palette_t::kpositiveSelection, -1, SlotGroup::Kde},
+
+    // Catppuccin-style surface hierarchy tokens
+    {"text", nullptr, &waywal_palette_t::text, -1, SlotGroup::SurfaceAlt},
+    {"subtext1", nullptr, &waywal_palette_t::subtext1, -1, SlotGroup::SurfaceAlt},
+    {"subtext0", nullptr, &waywal_palette_t::subtext0, -1, SlotGroup::SurfaceAlt},
+    {"overlay2", nullptr, &waywal_palette_t::overlay2, -1, SlotGroup::SurfaceAlt},
+    {"overlay1", nullptr, &waywal_palette_t::overlay1, -1, SlotGroup::SurfaceAlt},
+    {"overlay0", nullptr, &waywal_palette_t::overlay0, -1, SlotGroup::SurfaceAlt},
+    {"surface2", nullptr, &waywal_palette_t::surface2, -1, SlotGroup::SurfaceAlt},
+    {"surface1", nullptr, &waywal_palette_t::surface1, -1, SlotGroup::SurfaceAlt},
+    {"surface0", nullptr, &waywal_palette_t::surface0, -1, SlotGroup::SurfaceAlt},
+    {"base", nullptr, &waywal_palette_t::base, -1, SlotGroup::SurfaceAlt},
+    {"mantle", nullptr, &waywal_palette_t::mantle, -1, SlotGroup::SurfaceAlt},
+    {"crust", nullptr, &waywal_palette_t::crust, -1, SlotGroup::SurfaceAlt},
+}};
+
+[[nodiscard]] color_rgba_t readSlot(const waywal_palette_t &pal, const PaletteSlot &slot) noexcept
+{
+    if (slot.termIndex >= 0 && slot.termIndex < 16) {
+        return pal.term[slot.termIndex];
+    }
+    return pal.*(slot.member);
+}
+
+[[nodiscard]] const char *caelestiaVariantString(waywal_scheme_variant_t variant) noexcept
+{
+    switch (variant) {
+    case WAYWAL_SCHEME_VIBRANT:
+        return "vibrant";
+    case WAYWAL_SCHEME_EXPRESSIVE:
+        return "expressive";
+    case WAYWAL_SCHEME_CONTENT:
+        return "content";
+    case WAYWAL_SCHEME_FIDELITY:
+        return "fidelity";
+    case WAYWAL_SCHEME_NEUTRAL:
+        return "neutral";
+    case WAYWAL_SCHEME_MONOCHROME:
+        return "monochrome";
+    case WAYWAL_SCHEME_RAINBOW:
+        return "rainbow";
+    case WAYWAL_SCHEME_FRUIT_SALAD:
+        return "fruitsalad";
+    case WAYWAL_SCHEME_TONAL_SPOT:
+    default:
+        return "tonalspot";
+    }
+}
+
+[[nodiscard]] double sanitizeContrast(float rawContrast) noexcept
+{
+    double contrast = static_cast<double>(rawContrast);
+    if (!std::isfinite(contrast)) {
+        return 0.0;
+    }
+    contrast = std::clamp(contrast, -1.0, 1.0);
+    // Avoid serializing -0.0 into JSON outputs.
+    return (contrast == 0.0) ? 0.0 : contrast;
+}
+
+[[nodiscard]] bool writeAllFd(int fd, const char *data, size_t size) noexcept
+{
+    size_t written = 0;
+    while (written < size) {
+        const ssize_t rc = ::write(fd, data + written, size - written);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (rc == 0) {
+            errno = EIO;
+            return false;
+        }
+        written += static_cast<size_t>(rc);
+    }
+    return true;
+}
+
+[[nodiscard]] bool fsyncFd(int fd) noexcept
+{
+    while (::fsync(fd) != 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool closeFd(int fd) noexcept
+{
+    // On Linux close() always releases the file descriptor, so never retry on EINTR.
+    return ::close(fd) == 0 || errno == EINTR;
+}
+
+[[nodiscard]] bool fsyncParentDir(const QString &dirPath, QString *errorOut)
+{
+    const QByteArray dirNative = QFile::encodeName(dirPath);
+    int dirFd = -1;
+    do {
+        dirFd = ::open(dirNative.constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    } while (dirFd < 0 && errno == EINTR);
+
+    if (dirFd < 0) {
+        if (errorOut) {
+            *errorOut = QStringLiteral("Failed to open parent directory for sync: ") + dirPath +
+                        QStringLiteral(" (") + QString::fromLocal8Bit(std::strerror(errno)) +
+                        QStringLiteral(")");
+        }
+        return false;
+    }
+
+    bool ok = true;
+    int savedErr = 0;
+    while (::fsync(dirFd) != 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EINVAL || errno == ENOTSUP) {
+            // Virtual filesystems such as tmpfs/FUSE variants may reject directory fsync.
+            break;
+        }
+        ok = false;
+        savedErr = errno;
+        break;
+    }
+
+    if (!closeFd(dirFd) && ok) {
+        ok = false;
+        savedErr = errno;
+    }
+    if (!ok && errorOut) {
+        *errorOut = QStringLiteral("Directory sync failed for ") + dirPath +
+                    QStringLiteral(" (") + QString::fromLocal8Bit(std::strerror(savedErr)) +
+                    QStringLiteral(")");
+    }
+    return ok;
+}
+
+[[nodiscard]] bool resolveSymlinkTarget(const QString &rawTargetPath, QString &writePathOut,
+                                        QString *errorOut)
+{
+    if (rawTargetPath.isEmpty() || rawTargetPath.endsWith(QLatin1Char('/'))) {
+        if (errorOut) {
+            *errorOut = QStringLiteral("Invalid target file path: ") + rawTargetPath;
+        }
+        return false;
+    }
+
+    QString cur = QDir::cleanPath(QFileInfo(rawTargetPath).absoluteFilePath());
+    for (int depth = 0; depth < 16; ++depth) {
+        const QByteArray curNative = QFile::encodeName(cur);
+        struct stat st {};
+        if (::lstat(curNative.constData(), &st) != 0) {
+            const int err = errno;
+            if (err == ENOENT) {
+                writePathOut = cur;
+                return true;
+            }
+            if (errorOut) {
+                *errorOut = QStringLiteral("Cannot inspect target path ") + cur +
+                            QStringLiteral(" (") + QString::fromLocal8Bit(std::strerror(err)) +
+                            QStringLiteral(")");
+            }
+            return false;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            if (errorOut) {
+                *errorOut = QStringLiteral("Target path is a directory: ") + cur;
+            }
+            return false;
+        }
+
+        if (!S_ISLNK(st.st_mode)) {
+            if (!S_ISREG(st.st_mode)) {
+                if (errorOut) {
+                    *errorOut = QStringLiteral("Target path is not a regular file: ") + cur;
+                }
+                return false;
+            }
+            writePathOut = cur;
+            return true;
+        }
+
+        // Preserve user dotfile symlinks by resolving to their backing regular file before
+        // rename() instead of overwriting the symlink entry itself.
+        if (char *rp = ::realpath(curNative.constData(), nullptr)) {
+            const QString resolved = QFile::decodeName(rp);
+            std::free(rp);
+            struct stat targetSt {};
+            if (::lstat(QFile::encodeName(resolved).constData(), &targetSt) == 0) {
+                if (S_ISDIR(targetSt.st_mode)) {
+                    if (errorOut) {
+                        *errorOut = QStringLiteral("Symlink resolves to a directory: ") + resolved;
+                    }
+                    return false;
+                }
+                if (!S_ISREG(targetSt.st_mode)) {
+                    if (errorOut) {
+                        *errorOut =
+                            QStringLiteral("Symlink resolves to a non-regular file: ") + resolved;
+                    }
+                    return false;
+                }
+            }
+            writePathOut = resolved;
+            return true;
+        }
+
+        std::array<char, 4096> linkBuf{};
+        const ssize_t linkLen = ::readlink(curNative.constData(), linkBuf.data(), linkBuf.size());
+        if (linkLen <= 0 || static_cast<size_t>(linkLen) >= linkBuf.size()) {
+            if (errorOut) {
+                *errorOut = QStringLiteral("Failed to read symlink target: ") + cur;
+            }
+            return false;
+        }
+
+        const QString linkTarget =
+            QFile::decodeName(QByteArray(linkBuf.data(), static_cast<int>(linkLen)));
+        if (QDir::isAbsolutePath(linkTarget)) {
+            cur = QDir::cleanPath(linkTarget);
+        } else {
+            const QString parentPath = QFileInfo(cur).dir().absolutePath();
+            const QByteArray parentNative = QFile::encodeName(parentPath);
+            if (char *parentReal = ::realpath(parentNative.constData(), nullptr)) {
+                const QString realParent = QFile::decodeName(parentReal);
+                std::free(parentReal);
+                cur = QDir::cleanPath(QDir(realParent).filePath(linkTarget));
+            } else {
+                cur = QDir::cleanPath(QDir(parentPath).filePath(linkTarget));
+            }
+        }
+    }
+
+    if (errorOut) {
+        *errorOut = QStringLiteral("Too many levels of symbolic links: ") + rawTargetPath;
+    }
+    return false;
+}
+
+[[nodiscard]] bool createAndWriteTempFile(const QString &writePath, const QByteArray &bytes,
+                                          QString &tempPathOut, QString *errorOut)
+{
+    static std::atomic<quint64> s_seq{0};
+    const qint64 pid = QCoreApplication::applicationPid();
+    const QFileInfo writeInfo(writePath);
+    const QDir parentDir = writeInfo.dir();
+    const bool shortName = (writeInfo.fileName().toUtf8().size() <= 180);
+
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const quint64 seq = s_seq.fetch_add(1, std::memory_order_relaxed);
+        const quint32 rnd = QRandomGenerator::global()->generate();
+        const QString candidate =
+            shortName
+                ? (writePath + QStringLiteral(".tmp.%1.%2.%3").arg(pid).arg(seq).arg(rnd))
+                : parentDir.filePath(
+                      QStringLiteral(".wwal.tmp.%1.%2.%3").arg(pid).arg(seq).arg(rnd));
+        const QByteArray candidateNative = QFile::encodeName(candidate);
+
+        const int fd = ::open(candidateNative.constData(),
+                              O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (fd < 0) {
+            if (errno == EEXIST) {
+                continue;
+            }
+            if (errorOut) {
+                *errorOut = QStringLiteral("Cannot create temporary file ") + candidate +
+                            QStringLiteral(" (") + QString::fromLocal8Bit(std::strerror(errno)) +
+                            QStringLiteral(")");
+            }
+            return false;
+        }
+
+        bool ok = writeAllFd(fd, bytes.constData(), static_cast<size_t>(bytes.size()));
+        int savedErr = ok ? 0 : errno;
+        if (ok && !fsyncFd(fd)) {
+            ok = false;
+            savedErr = errno;
+        }
+        if (!closeFd(fd) && ok) {
+            ok = false;
+            savedErr = errno;
+        }
+
+        if (!ok) {
+            ::unlink(candidateNative.constData());
+            if (errorOut) {
+                *errorOut = QStringLiteral("Failed writing temporary file ") + candidate +
+                            QStringLiteral(" (") + QString::fromLocal8Bit(std::strerror(savedErr)) +
+                            QStringLiteral(")");
+            }
+            return false;
+        }
+
+        tempPathOut = candidate;
+        return true;
+    }
+
+    if (errorOut) {
+        *errorOut = QStringLiteral("Exhausted unique temporary file names for ") + writePath;
+    }
+    return false;
+}
+
+[[nodiscard]] bool exdevFallbackWrite(const QString &writePath, const QByteArray &bytes,
+                                      QString *errorOut)
+{
+    const QByteArray writeNative = QFile::encodeName(writePath);
+    bool hadOriginal = false;
+    QByteArray originalBytes;
+
+    struct stat existingSt {};
+    if (::lstat(writeNative.constData(), &existingSt) == 0) {
+        if (!S_ISREG(existingSt.st_mode)) {
+            if (errorOut) {
+                *errorOut =
+                    QStringLiteral("Cross-device target is not a regular file: ") + writePath;
+            }
+            return false;
+        }
+        if (existingSt.st_size >= 0 && existingSt.st_size <= 4 * 1024 * 1024) {
+            QFile orig(writePath);
+            if (orig.open(QIODevice::ReadOnly)) {
+                originalBytes = orig.readAll();
+                hadOriginal = (originalBytes.size() == existingSt.st_size);
+            }
+        }
+    }
+
+    // Open without O_TRUNC and never unlink the target so bind-mounted dotfiles survive EXDEV.
+    const int dstFd =
+        ::open(writeNative.constData(), O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (dstFd < 0) {
+        if (errorOut) {
+            *errorOut = QStringLiteral("Cross-device fallback open failed for ") + writePath +
+                        QStringLiteral(" (") + QString::fromLocal8Bit(std::strerror(errno)) +
+                        QStringLiteral(")");
+        }
+        return false;
+    }
+
+    bool ok = writeAllFd(dstFd, bytes.constData(), static_cast<size_t>(bytes.size()));
+    int savedErr = ok ? 0 : errno;
+    if (ok && ::ftruncate(dstFd, static_cast<off_t>(bytes.size())) != 0) {
+        ok = false;
+        savedErr = errno;
+    }
+    if (ok && !fsyncFd(dstFd)) {
+        ok = false;
+        savedErr = errno;
+    }
+    if (!ok && hadOriginal) {
+        if (::lseek(dstFd, 0, SEEK_SET) == 0 &&
+            writeAllFd(dstFd, originalBytes.constData(),
+                       static_cast<size_t>(originalBytes.size())) &&
+            ::ftruncate(dstFd, static_cast<off_t>(originalBytes.size())) == 0) {
+            (void)fsyncFd(dstFd);
+        }
+    }
+    if (!closeFd(dstFd) && ok) {
+        ok = false;
+        savedErr = errno;
+    }
+
+    if (!ok) {
+        if (errorOut) {
+            *errorOut = QStringLiteral("Cross-device fallback write failed for ") + writePath +
+                        QStringLiteral(" (") + QString::fromLocal8Bit(std::strerror(savedErr)) +
+                        QStringLiteral(")");
+        }
+        return false;
+    }
+
+    return fsyncParentDir(QFileInfo(writePath).dir().absolutePath(), errorOut);
+}
+
+[[nodiscard]] bool atomicWriteBytes(const QString &targetPath, const QByteArray &bytes,
+                                    QString *errorOut)
+{
+    QString writePath;
+    if (!resolveSymlinkTarget(targetPath, writePath, errorOut)) {
+        return false;
+    }
+
+    const QFileInfo writeInfo(writePath);
+    QDir parentDir = writeInfo.dir();
+    if ((!parentDir.exists() && !parentDir.mkpath(QStringLiteral("."))) ||
+        !QFileInfo(parentDir.absolutePath()).isDir()) {
+        if (errorOut) {
+            *errorOut =
+                QStringLiteral("Failed to create parent directory: ") + parentDir.absolutePath();
+        }
+        return false;
+    }
+
+    QString tempPath;
+    if (!createAndWriteTempFile(writePath, bytes, tempPath, errorOut)) {
+        return false;
+    }
+
+    const QByteArray tempNative = QFile::encodeName(tempPath);
+    const QByteArray writeNative = QFile::encodeName(writePath);
+    if (::rename(tempNative.constData(), writeNative.constData()) == 0) {
+        return fsyncParentDir(parentDir.absolutePath(), errorOut);
+    }
+
+    const int renameErr = errno;
+    ::unlink(tempNative.constData());
+    if (renameErr == EXDEV) {
+        return exdevFallbackWrite(writePath, bytes, errorOut);
+    }
+
+    if (errorOut) {
+        *errorOut = QStringLiteral("Atomic rename failed from ") + tempPath +
+                    QStringLiteral(" to ") + writePath + QStringLiteral(" (") +
+                    QString::fromLocal8Bit(std::strerror(renameErr)) + QStringLiteral(")");
+    }
+    return false;
+}
+
+[[nodiscard]] const TemplateTargetDescriptor *findDescriptor(TemplateTargetId id)
+{
+    for (const auto &desc : TemplateExporter::targetDescriptors()) {
+        if (desc.id == id) {
+            return &desc;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
 
 const QVector<TemplateTargetDescriptor> &TemplateExporter::targetDescriptors()
 {
@@ -151,7 +752,12 @@ void TemplateExporter::setPalette(const waywal_palette_t &palette)
 
 QString TemplateExporter::hexRgb(const color_rgba_t &c)
 {
-    return QString::asprintf("#%02x%02x%02x", c.r, c.g, c.b);
+    return QStringLiteral("#") + hexRgbBare(c);
+}
+
+QString TemplateExporter::hexRgbBare(const color_rgba_t &c)
+{
+    return QString::asprintf("%02x%02x%02x", c.r, c.g, c.b);
 }
 
 QString TemplateExporter::hexRgba(const color_rgba_t &c)
@@ -166,83 +772,32 @@ QString TemplateExporter::hyprRgb(const color_rgba_t &c)
 
 QString TemplateExporter::resolveDestination(const QString &relPath, const QString &overrideBaseDir)
 {
+    if (relPath.isEmpty()) {
+        return QString();
+    }
     if (!overrideBaseDir.isEmpty()) {
-        return QDir(overrideBaseDir).filePath(relPath);
+        return QDir::cleanPath(QDir(overrideBaseDir).filePath(relPath));
     }
 
     QString configHome = qEnvironmentVariable("XDG_CONFIG_HOME");
-    if (configHome.isEmpty()) {
-        configHome = QDir::homePath() + QStringLiteral("/.config");
+    // XDG Base Directory specification mandates ignoring non-absolute XDG_CONFIG_HOME values.
+    if (configHome.isEmpty() || !QDir::isAbsolutePath(configHome)) {
+        QString home = qEnvironmentVariable("HOME");
+        if (home.isEmpty() || !QDir::isAbsolutePath(home)) {
+            home = QDir::homePath();
+        }
+        if (home.isEmpty() || !QDir::isAbsolutePath(home)) {
+            return QString();
+        }
+        configHome = QDir(home).filePath(QStringLiteral(".config"));
     }
-    return QDir(configHome).filePath(relPath);
+    return QDir::cleanPath(QDir(configHome).filePath(relPath));
 }
 
 bool TemplateExporter::atomicWrite(const QString &targetPath, const QString &content,
                                    QString *errorOut)
 {
-    QFileInfo targetInfo(targetPath);
-    QDir parentDir = targetInfo.dir();
-
-    if (!parentDir.exists()) {
-        if (!parentDir.mkpath(QStringLiteral("."))) {
-            if (errorOut) {
-                *errorOut = QStringLiteral("Failed to create parent directory: ") +
-                            parentDir.absolutePath();
-            }
-            return false;
-        }
-    }
-
-    const quint32 randSuffix = QRandomGenerator::global()->generate();
-    const QString tempPath =
-        targetPath +
-        QStringLiteral(".tmp.%1.%2").arg(QCoreApplication::applicationPid()).arg(randSuffix);
-
-    QFile tempFile(tempPath);
-    if (!tempFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-        if (errorOut) {
-            *errorOut = QStringLiteral("Cannot open temporary file for write: ") + tempPath;
-        }
-        return false;
-    }
-
-    const QByteArray utf8 = content.toUtf8();
-    if (tempFile.write(utf8) != utf8.size()) {
-        if (errorOut) {
-            *errorOut = QStringLiteral("Incomplete write to temporary file: ") + tempPath;
-        }
-        tempFile.close();
-        QFile::remove(tempPath);
-        return false;
-    }
-
-    tempFile.flush();
-#if defined(Q_OS_UNIX)
-    const int fd = tempFile.handle();
-    if (fd >= 0) {
-        fsync(fd);
-    }
-#endif
-    tempFile.close();
-
-    // Atomic rename using POSIX rename() to replace existing file atomically
-    const QByteArray oldLocal = tempPath.toLocal8Bit();
-    const QByteArray newLocal = targetPath.toLocal8Bit();
-
-    if (::rename(oldLocal.constData(), newLocal.constData()) != 0) {
-        // Fallback to QFile::rename
-        QFile::remove(targetPath);
-        if (!QFile::rename(tempPath, targetPath)) {
-            if (errorOut) {
-                *errorOut = QStringLiteral("Atomic rename failed from ") + tempPath +
-                            QStringLiteral(" to ") + targetPath;
-            }
-            QFile::remove(tempPath);
-            return false;
-        }
-    }
-
-    return true;
+    return atomicWriteBytes(targetPath, content.toUtf8(), errorOut);
 }
 
 QString TemplateExporter::formatHyprland(const waywal_palette_t &pal)
@@ -252,61 +807,14 @@ QString TemplateExporter::formatHyprland(const waywal_palette_t &pal)
     out += QStringLiteral("# Auto-generated on ") +
            QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
 
-    out += QStringLiteral("$primary = ") + hyprRgb(pal.primary) + QStringLiteral("\n");
-    out += QStringLiteral("$on_primary = ") + hyprRgb(pal.onPrimary) + QStringLiteral("\n");
-    out += QStringLiteral("$primary_container = ") + hyprRgb(pal.primaryContainer) +
-           QStringLiteral("\n");
-    out += QStringLiteral("$on_primary_container = ") + hyprRgb(pal.onPrimaryContainer) +
-           QStringLiteral("\n");
-    out += QStringLiteral("$inverse_primary = ") + hyprRgb(pal.inversePrimary) +
-           QStringLiteral("\n\n");
-
-    out += QStringLiteral("$secondary = ") + hyprRgb(pal.secondary) + QStringLiteral("\n");
-    out += QStringLiteral("$on_secondary = ") + hyprRgb(pal.onSecondary) + QStringLiteral("\n");
-    out += QStringLiteral("$secondary_container = ") + hyprRgb(pal.secondaryContainer) +
-           QStringLiteral("\n");
-    out += QStringLiteral("$on_secondary_container = ") + hyprRgb(pal.onSecondaryContainer) +
-           QStringLiteral("\n\n");
-
-    out += QStringLiteral("$tertiary = ") + hyprRgb(pal.tertiary) + QStringLiteral("\n");
-    out += QStringLiteral("$on_tertiary = ") + hyprRgb(pal.onTertiary) + QStringLiteral("\n");
-    out += QStringLiteral("$tertiary_container = ") + hyprRgb(pal.tertiaryContainer) +
-           QStringLiteral("\n");
-    out += QStringLiteral("$on_tertiary_container = ") + hyprRgb(pal.onTertiaryContainer) +
-           QStringLiteral("\n\n");
-
-    out += QStringLiteral("$error = ") + hyprRgb(pal.error) + QStringLiteral("\n");
-    out += QStringLiteral("$on_error = ") + hyprRgb(pal.onError) + QStringLiteral("\n");
-    out +=
-        QStringLiteral("$error_container = ") + hyprRgb(pal.errorContainer) + QStringLiteral("\n");
-    out += QStringLiteral("$on_error_container = ") + hyprRgb(pal.onErrorContainer) +
-           QStringLiteral("\n\n");
-
-    out += QStringLiteral("$background = ") + hyprRgb(pal.background) + QStringLiteral("\n");
-    out += QStringLiteral("$on_background = ") + hyprRgb(pal.onBackground) + QStringLiteral("\n");
-    out += QStringLiteral("$surface = ") + hyprRgb(pal.surface) + QStringLiteral("\n");
-    out += QStringLiteral("$on_surface = ") + hyprRgb(pal.onSurface) + QStringLiteral("\n");
-    out += QStringLiteral("$surface_dim = ") + hyprRgb(pal.surfaceDim) + QStringLiteral("\n");
-    out += QStringLiteral("$surface_bright = ") + hyprRgb(pal.surfaceBright) + QStringLiteral("\n");
-    out +=
-        QStringLiteral("$surface_variant = ") + hyprRgb(pal.surfaceVariant) + QStringLiteral("\n");
-    out += QStringLiteral("$on_surface_variant = ") + hyprRgb(pal.onSurfaceVariant) +
-           QStringLiteral("\n");
-    out += QStringLiteral("$surface_container_lowest = ") + hyprRgb(pal.surfaceContainerLowest) +
-           QStringLiteral("\n");
-    out += QStringLiteral("$surface_container_low = ") + hyprRgb(pal.surfaceContainerLow) +
-           QStringLiteral("\n");
-    out += QStringLiteral("$surface_container = ") + hyprRgb(pal.surfaceContainer) +
-           QStringLiteral("\n");
-    out += QStringLiteral("$surface_container_high = ") + hyprRgb(pal.surfaceContainerHigh) +
-           QStringLiteral("\n");
-    out += QStringLiteral("$surface_container_highest = ") + hyprRgb(pal.surfaceContainerHighest) +
-           QStringLiteral("\n\n");
-
-    out += QStringLiteral("$outline = ") + hyprRgb(pal.outline) + QStringLiteral("\n");
-    out +=
-        QStringLiteral("$outline_variant = ") + hyprRgb(pal.outlineVariant) + QStringLiteral("\n");
-    out += QStringLiteral("$shadow = ") + hyprRgb(pal.shadow) + QStringLiteral("\n\n");
+    for (const auto &slot : kPaletteSlots) {
+        if (slot.snakeName == nullptr) {
+            continue;
+        }
+        out += QStringLiteral("$") + QString::fromLatin1(slot.snakeName) + QStringLiteral(" = ") +
+               hyprRgb(readSlot(pal, slot)) + QStringLiteral("\n");
+    }
+    out += QStringLiteral("\n");
 
     // Standard Hyprland Active and Inactive Border Gradients
     out += QStringLiteral("$active_border = ") + hyprRgb(pal.primary) + QStringLiteral(" ") +
@@ -324,49 +832,13 @@ QString TemplateExporter::formatWaybar(const waywal_palette_t &pal)
     out += QStringLiteral("/* Auto-generated on ") +
            QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral(" */\n\n");
 
-    const auto addCss = [&](const char *name, const color_rgba_t &c) {
-        out += QString::asprintf("@define-color %s #%02x%02x%02x;\n", name, c.r, c.g, c.b);
-    };
-
-    addCss("primary", pal.primary);
-    addCss("on_primary", pal.onPrimary);
-    addCss("primary_container", pal.primaryContainer);
-    addCss("on_primary_container", pal.onPrimaryContainer);
-    addCss("inverse_primary", pal.inversePrimary);
-
-    addCss("secondary", pal.secondary);
-    addCss("on_secondary", pal.onSecondary);
-    addCss("secondary_container", pal.secondaryContainer);
-    addCss("on_secondary_container", pal.onSecondaryContainer);
-
-    addCss("tertiary", pal.tertiary);
-    addCss("on_tertiary", pal.onTertiary);
-    addCss("tertiary_container", pal.tertiaryContainer);
-    addCss("on_tertiary_container", pal.onTertiaryContainer);
-
-    addCss("error", pal.error);
-    addCss("on_error", pal.onError);
-    addCss("error_container", pal.errorContainer);
-    addCss("on_error_container", pal.onErrorContainer);
-
-    addCss("background", pal.background);
-    addCss("on_background", pal.onBackground);
-    addCss("surface", pal.surface);
-    addCss("on_surface", pal.onSurface);
-    addCss("surface_dim", pal.surfaceDim);
-    addCss("surface_bright", pal.surfaceBright);
-    addCss("surface_variant", pal.surfaceVariant);
-    addCss("on_surface_variant", pal.onSurfaceVariant);
-
-    addCss("surface_container_lowest", pal.surfaceContainerLowest);
-    addCss("surface_container_low", pal.surfaceContainerLow);
-    addCss("surface_container", pal.surfaceContainer);
-    addCss("surface_container_high", pal.surfaceContainerHigh);
-    addCss("surface_container_highest", pal.surfaceContainerHighest);
-
-    addCss("outline", pal.outline);
-    addCss("outline_variant", pal.outlineVariant);
-    addCss("shadow", pal.shadow);
+    for (const auto &slot : kPaletteSlots) {
+        if (slot.snakeName == nullptr) {
+            continue;
+        }
+        out += QStringLiteral("@define-color ") + QString::fromLatin1(slot.snakeName) +
+               QStringLiteral(" ") + hexRgb(readSlot(pal, slot)) + QStringLiteral(";\n");
+    }
 
     return out;
 }
@@ -374,80 +846,40 @@ QString TemplateExporter::formatWaybar(const waywal_palette_t &pal)
 QString TemplateExporter::formatCaelestia(const waywal_palette_t &pal)
 {
     QJsonObject root;
-    root[QStringLiteral("generator")] = QStringLiteral("wwal-studio");
-    root[QStringLiteral("timestamp")] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    root[QStringLiteral("name")] = QStringLiteral("dynamic");
+    root[QStringLiteral("flavour")] = QStringLiteral("default");
     root[QStringLiteral("mode")] =
         (pal.mode == WAYWAL_THEME_LIGHT) ? QStringLiteral("light") : QStringLiteral("dark");
-    root[QStringLiteral("contrast")] = static_cast<double>(pal.contrast);
+    root[QStringLiteral("variant")] = QString::fromLatin1(caelestiaVariantString(pal.variant));
+    root[QStringLiteral("generator")] = QStringLiteral("wwal-studio");
+    root[QStringLiteral("timestamp")] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    root[QStringLiteral("contrast")] = sanitizeContrast(pal.contrast);
 
+    QJsonObject colours;
     QJsonObject colors;
-    colors[QStringLiteral("primary")] = hexRgb(pal.primary);
-    colors[QStringLiteral("onPrimary")] = hexRgb(pal.onPrimary);
-    colors[QStringLiteral("primaryContainer")] = hexRgb(pal.primaryContainer);
-    colors[QStringLiteral("onPrimaryContainer")] = hexRgb(pal.onPrimaryContainer);
-    colors[QStringLiteral("inversePrimary")] = hexRgb(pal.inversePrimary);
-
-    colors[QStringLiteral("secondary")] = hexRgb(pal.secondary);
-    colors[QStringLiteral("onSecondary")] = hexRgb(pal.onSecondary);
-    colors[QStringLiteral("secondaryContainer")] = hexRgb(pal.secondaryContainer);
-    colors[QStringLiteral("onSecondaryContainer")] = hexRgb(pal.onSecondaryContainer);
-
-    colors[QStringLiteral("tertiary")] = hexRgb(pal.tertiary);
-    colors[QStringLiteral("onTertiary")] = hexRgb(pal.onTertiary);
-    colors[QStringLiteral("tertiaryContainer")] = hexRgb(pal.tertiaryContainer);
-    colors[QStringLiteral("onTertiaryContainer")] = hexRgb(pal.onTertiaryContainer);
-
-    colors[QStringLiteral("error")] = hexRgb(pal.error);
-    colors[QStringLiteral("onError")] = hexRgb(pal.onError);
-    colors[QStringLiteral("errorContainer")] = hexRgb(pal.errorContainer);
-    colors[QStringLiteral("onErrorContainer")] = hexRgb(pal.onErrorContainer);
-
-    colors[QStringLiteral("background")] = hexRgb(pal.background);
-    colors[QStringLiteral("onBackground")] = hexRgb(pal.onBackground);
-    colors[QStringLiteral("surface")] = hexRgb(pal.surface);
-    colors[QStringLiteral("onSurface")] = hexRgb(pal.onSurface);
-    colors[QStringLiteral("surfaceDim")] = hexRgb(pal.surfaceDim);
-    colors[QStringLiteral("surfaceBright")] = hexRgb(pal.surfaceBright);
-    colors[QStringLiteral("surfaceVariant")] = hexRgb(pal.surfaceVariant);
-    colors[QStringLiteral("onSurfaceVariant")] = hexRgb(pal.onSurfaceVariant);
-
-    colors[QStringLiteral("surfaceContainerLowest")] = hexRgb(pal.surfaceContainerLowest);
-    colors[QStringLiteral("surfaceContainerLow")] = hexRgb(pal.surfaceContainerLow);
-    colors[QStringLiteral("surfaceContainer")] = hexRgb(pal.surfaceContainer);
-    colors[QStringLiteral("surfaceContainerHigh")] = hexRgb(pal.surfaceContainerHigh);
-    colors[QStringLiteral("surfaceContainerHighest")] = hexRgb(pal.surfaceContainerHighest);
-
-    colors[QStringLiteral("outline")] = hexRgb(pal.outline);
-    colors[QStringLiteral("outlineVariant")] = hexRgb(pal.outlineVariant);
-    colors[QStringLiteral("shadow")] = hexRgb(pal.shadow);
+    QJsonObject catppuccin;
+    for (const auto &slot : kPaletteSlots) {
+        const color_rgba_t c = readSlot(pal, slot);
+        const QString key = QString::fromLatin1(slot.camelName);
+        colours[key] = hexRgbBare(c);
+        const QString prefixed = hexRgb(c);
+        colors[key] = prefixed;
+        if (slot.group == SlotGroup::Catppuccin) {
+            catppuccin[key] = prefixed;
+        }
+    }
+    root[QStringLiteral("colours")] = colours;
     root[QStringLiteral("colors")] = colors;
 
-    // ANSI Terminals
+    // Preserve top-level ANSI array alongside flat term0-15 keys for Studio consumers.
     QJsonArray termArray;
     for (int i = 0; i < 16; ++i) {
         termArray.append(hexRgb(pal.term[i]));
     }
     root[QStringLiteral("term")] = termArray;
-
-    // Catppuccin tokens
-    QJsonObject catppuccin;
-    catppuccin[QStringLiteral("rosewater")] = hexRgb(pal.rosewater);
-    catppuccin[QStringLiteral("flamingo")] = hexRgb(pal.flamingo);
-    catppuccin[QStringLiteral("pink")] = hexRgb(pal.pink);
-    catppuccin[QStringLiteral("mauve")] = hexRgb(pal.mauve);
-    catppuccin[QStringLiteral("red")] = hexRgb(pal.red);
-    catppuccin[QStringLiteral("maroon")] = hexRgb(pal.maroon);
-    catppuccin[QStringLiteral("peach")] = hexRgb(pal.peach);
-    catppuccin[QStringLiteral("yellow")] = hexRgb(pal.yellow);
-    catppuccin[QStringLiteral("green")] = hexRgb(pal.green);
-    catppuccin[QStringLiteral("teal")] = hexRgb(pal.teal);
-    catppuccin[QStringLiteral("sky")] = hexRgb(pal.sky);
-    catppuccin[QStringLiteral("sapphire")] = hexRgb(pal.sapphire);
-    catppuccin[QStringLiteral("blue")] = hexRgb(pal.blue);
-    catppuccin[QStringLiteral("lavender")] = hexRgb(pal.lavender);
     root[QStringLiteral("catppuccin")] = catppuccin;
 
-    QJsonDocument doc(root);
+    const QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Indented));
 }
 
@@ -483,8 +915,8 @@ QString TemplateExporter::formatKitty(const waywal_palette_t &pal)
            QStringLiteral("\n\n");
 
     for (int i = 0; i < 16; ++i) {
-        out += QString::asprintf("color%d #%02x%02x%02x\n", i, pal.term[i].r, pal.term[i].g,
-                                 pal.term[i].b);
+        out += QStringLiteral("color") + QString::number(i) + QStringLiteral(" ") +
+               hexRgb(pal.term[i]) + QStringLiteral("\n");
     }
 
     return out;
@@ -581,20 +1013,19 @@ QString TemplateExporter::formatFuzzel(const waywal_palette_t &pal)
     out += QStringLiteral("# Auto-generated on ") +
            QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral("\n\n");
 
+    const auto addFuzzel = [&](const char *name, const color_rgba_t &c, const char *alphaHex) {
+        out += QString::fromLatin1(name) + QStringLiteral("=") + hexRgbBare(c) +
+               QString::fromLatin1(alphaHex) + QStringLiteral("\n");
+    };
+
     out += QStringLiteral("[colors]\n");
-    out += QString::asprintf("background=%02x%02x%02xfa\n", pal.surfaceContainerLowest.r,
-                             pal.surfaceContainerLowest.g, pal.surfaceContainerLowest.b);
-    out += QString::asprintf("text=%02x%02x%02xff\n", pal.onSurface.r, pal.onSurface.g,
-                             pal.onSurface.b);
-    out += QString::asprintf("match=%02x%02x%02xff\n", pal.primary.r, pal.primary.g, pal.primary.b);
-    out += QString::asprintf("selection=%02x%02x%02xff\n", pal.primaryContainer.r,
-                             pal.primaryContainer.g, pal.primaryContainer.b);
-    out += QString::asprintf("selection-text=%02x%02x%02xff\n", pal.onPrimaryContainer.r,
-                             pal.onPrimaryContainer.g, pal.onPrimaryContainer.b);
-    out += QString::asprintf("selection-match=%02x%02x%02xff\n", pal.tertiary.r, pal.tertiary.g,
-                             pal.tertiary.b);
-    out +=
-        QString::asprintf("border=%02x%02x%02xff\n", pal.primary.r, pal.primary.g, pal.primary.b);
+    addFuzzel("background", pal.surfaceContainerLowest, "fa");
+    addFuzzel("text", pal.onSurface, "ff");
+    addFuzzel("match", pal.primary, "ff");
+    addFuzzel("selection", pal.primaryContainer, "ff");
+    addFuzzel("selection-text", pal.onPrimaryContainer, "ff");
+    addFuzzel("selection-match", pal.tertiary, "ff");
+    addFuzzel("border", pal.primary, "ff");
 
     return out;
 }
@@ -641,7 +1072,8 @@ QString TemplateExporter::formatGtkCss(const waywal_palette_t &pal)
            QDateTime::currentDateTime().toString(Qt::ISODate) + QStringLiteral(" */\n\n");
 
     const auto addCss = [&](const char *name, const color_rgba_t &c) {
-        out += QString::asprintf("@define-color %s #%02x%02x%02x;\n", name, c.r, c.g, c.b);
+        out += QStringLiteral("@define-color ") + QString::fromLatin1(name) + QStringLiteral(" ") +
+               hexRgb(c) + QStringLiteral(";\n");
     };
 
     addCss("accent_color", pal.primary);
@@ -688,66 +1120,120 @@ bool TemplateExporter::exportTarget(TemplateTargetId id, const QString &override
         return false;
     }
 
-    switch (id) {
-    case TemplateTargetId::Hyprland: {
-        const QString path =
-            resolveDestination(QStringLiteral("hypr/colors.conf"), overrideBaseDir);
-        return atomicWrite(path, formatHyprland(m_palette), errorOut);
-    }
-    case TemplateTargetId::Waybar: {
-        const QString path =
-            resolveDestination(QStringLiteral("waybar/colors.css"), overrideBaseDir);
-        return atomicWrite(path, formatWaybar(m_palette), errorOut);
-    }
-    case TemplateTargetId::Caelestia: {
-        const QString path =
-            resolveDestination(QStringLiteral("quickshell/caelestia/colors.json"), overrideBaseDir);
-        return atomicWrite(path, formatCaelestia(m_palette), errorOut);
-    }
-    case TemplateTargetId::Kitty: {
-        const QString path =
-            resolveDestination(QStringLiteral("kitty/kitty-colors.conf"), overrideBaseDir);
-        return atomicWrite(path, formatKitty(m_palette), errorOut);
-    }
-    case TemplateTargetId::Alacritty: {
-        const QString path =
-            resolveDestination(QStringLiteral("alacritty/colors.toml"), overrideBaseDir);
-        return atomicWrite(path, formatAlacritty(m_palette), errorOut);
-    }
-    case TemplateTargetId::RofiFuzzel: {
-        const QString rofiPath =
-            resolveDestination(QStringLiteral("rofi/colors.rasi"), overrideBaseDir);
-        const QString fuzzelPath =
-            resolveDestination(QStringLiteral("fuzzel/colors.ini"), overrideBaseDir);
-        bool ok = atomicWrite(rofiPath, formatRofi(m_palette), errorOut);
-        if (ok) {
-            ok = atomicWrite(fuzzelPath, formatFuzzel(m_palette), errorOut);
+    const TemplateTargetDescriptor *desc = findDescriptor(id);
+    if (!desc) {
+        if (errorOut) {
+            *errorOut = QStringLiteral("Unknown export target ID.");
         }
-        return ok;
-    }
-    case TemplateTargetId::Mako: {
-        const QString path =
-            resolveDestination(QStringLiteral("mako/config-colors"), overrideBaseDir);
-        return atomicWrite(path, formatMako(m_palette), errorOut);
-    }
-    case TemplateTargetId::Gtk3Gtk4: {
-        const QString gtk3Path =
-            resolveDestination(QStringLiteral("gtk-3.0/waywal-colors.css"), overrideBaseDir);
-        const QString gtk4Path =
-            resolveDestination(QStringLiteral("gtk-4.0/waywal-colors.css"), overrideBaseDir);
-        const QString content = formatGtkCss(m_palette);
-        bool ok = atomicWrite(gtk3Path, content, errorOut);
-        if (ok) {
-            ok = atomicWrite(gtk4Path, content, errorOut);
-        }
-        return ok;
-    }
-    default:
-        break;
+        return false;
     }
 
-    if (errorOut) {
-        *errorOut = QStringLiteral("Unknown export target ID.");
+    QString primaryContent;
+    QString secondaryContent;
+    switch (id) {
+    case TemplateTargetId::Hyprland:
+        primaryContent = formatHyprland(m_palette);
+        break;
+    case TemplateTargetId::Waybar:
+        primaryContent = formatWaybar(m_palette);
+        break;
+    case TemplateTargetId::Caelestia:
+        primaryContent = formatCaelestia(m_palette);
+        break;
+    case TemplateTargetId::Kitty:
+        primaryContent = formatKitty(m_palette);
+        break;
+    case TemplateTargetId::Alacritty:
+        primaryContent = formatAlacritty(m_palette);
+        break;
+    case TemplateTargetId::RofiFuzzel:
+        primaryContent = formatRofi(m_palette);
+        secondaryContent = formatFuzzel(m_palette);
+        break;
+    case TemplateTargetId::Mako:
+        primaryContent = formatMako(m_palette);
+        break;
+    case TemplateTargetId::Gtk3Gtk4:
+        primaryContent = formatGtkCss(m_palette);
+        secondaryContent = primaryContent;
+        break;
+    default:
+        if (errorOut) {
+            *errorOut = QStringLiteral("Unknown export target ID.");
+        }
+        return false;
+    }
+
+    const QString primaryPath = resolveDestination(desc->primaryPath, overrideBaseDir);
+    if (primaryPath.isEmpty()) {
+        if (errorOut) {
+            *errorOut = QStringLiteral("Cannot resolve export destination for ") + desc->primaryPath;
+        }
+        return false;
+    }
+
+    if (desc->secondaryPath.isEmpty()) {
+        return atomicWrite(primaryPath, primaryContent, errorOut);
+    }
+
+    const QString secondaryPath = resolveDestination(desc->secondaryPath, overrideBaseDir);
+    if (secondaryPath.isEmpty()) {
+        if (errorOut) {
+            *errorOut =
+                QStringLiteral("Cannot resolve export destination for ") + desc->secondaryPath;
+        }
+        return false;
+    }
+
+    QString primaryWritePath;
+    QString secondaryWritePath;
+    if (!resolveSymlinkTarget(primaryPath, primaryWritePath, errorOut) ||
+        !resolveSymlinkTarget(secondaryPath, secondaryWritePath, errorOut)) {
+        return false;
+    }
+
+    bool primaryExisted = false;
+    QByteArray primaryBackup;
+    struct stat primarySt {};
+    const QByteArray primaryNative = QFile::encodeName(primaryWritePath);
+    if (::lstat(primaryNative.constData(), &primarySt) == 0) {
+        if (primarySt.st_size < 0 || primarySt.st_size > 16 * 1024 * 1024) {
+            if (errorOut) {
+                *errorOut = QStringLiteral("Existing primary target exceeds backup limit: ") +
+                            primaryWritePath;
+            }
+            return false;
+        }
+        QFile origFile(primaryWritePath);
+        if (!origFile.open(QIODevice::ReadOnly)) {
+            if (errorOut) {
+                *errorOut = QStringLiteral("Cannot snapshot existing primary target for rollback: ") +
+                            primaryWritePath;
+            }
+            return false;
+        }
+        primaryBackup = origFile.readAll();
+        if (primaryBackup.size() != primarySt.st_size) {
+            if (errorOut) {
+                *errorOut = QStringLiteral("Incomplete rollback snapshot for: ") + primaryWritePath;
+            }
+            return false;
+        }
+        primaryExisted = true;
+    }
+
+    if (!atomicWrite(primaryPath, primaryContent, errorOut)) {
+        return false;
+    }
+    if (atomicWrite(secondaryPath, secondaryContent, errorOut)) {
+        return true;
+    }
+
+    // Roll back the primary file so multi-file exports stay consistent when secondary fails.
+    if (primaryExisted) {
+        (void)atomicWriteBytes(primaryPath, primaryBackup, nullptr);
+    } else {
+        (void)::unlink(primaryNative.constData());
     }
     return false;
 }
