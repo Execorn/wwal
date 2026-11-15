@@ -45,32 +45,7 @@ struct WorkshopItemRecord {
 
     double search_rank{0.0};
 
-    [[nodiscard]] CatalogItem toCatalogItem() const
-    {
-        CatalogItem item;
-        item.id = static_cast<uint32_t>(published_file_id ^ (published_file_id >> 32));
-        item.workshop_id = std::to_string(published_file_id);
-        item.title = title;
-        item.path = file_path;
-        item.preview_path = preview_path;
-        item.file_size = file_size_bytes;
-        item.date_modified = static_cast<int64_t>(time_updated);
-        item.aspect_ratio = aspect_ratio;
-        item.dominant_color = dominant_color;
-        item.tag_mask = tag_mask;
-        if (type == "video") {
-            item.badge = WallpaperBadge::Video;
-        } else if (type == "scene") {
-            item.badge = WallpaperBadge::Scene;
-        } else if (type == "web") {
-            item.badge = WallpaperBadge::Image;
-        } else if (type.find("shader") != std::string::npos) {
-            item.badge = WallpaperBadge::Shader;
-        } else {
-            item.badge = WallpaperBadge::Image;
-        }
-        return item;
-    }
+    [[nodiscard]] CatalogItem toCatalogItem() const;
 };
 
 using CatalogItemRecord = WorkshopItemRecord;
@@ -128,11 +103,6 @@ class CatalogIndexManager {
 
     [[nodiscard]] std::vector<WorkshopItemRecord> queryByFilters(const CatalogFilter &filter) const;
 
-    [[nodiscard]] std::vector<WorkshopItemRecord>
-    queryByFilters(const std::string &type, uint32_t compat_tier = 0, uint64_t tag_mask = 0,
-                   CatalogSortOrder sort_order = CatalogSortOrder::SubscriptionsDesc,
-                   int limit = 50, int offset = 0) const;
-
     size_t reconcileAllLibraries();
     size_t reconcileDirectory(const std::filesystem::path &workshopDir,
                               uint32_t storageBackend = 0);
@@ -142,8 +112,8 @@ class CatalogIndexManager {
     [[nodiscard]] size_t lastReconcileStatCount() const noexcept;
 
   private:
-    void initSchema();
-    void prepareStatements();
+    bool initSchema();
+    bool prepareStatements();
     void finalizeStatements();
 
     std::filesystem::path m_dbPath;
