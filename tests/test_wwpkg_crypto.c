@@ -4,6 +4,9 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <locale.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "waywal/we_json.h"
 #include "waywal/wwpkg.h"
 
 /* Independent FIPS 180-4 reference SHA-256 for cross-checking runtime SHA-NI */
@@ -1441,6 +1445,796 @@ static void test_promotion_retention_toctou_and_confinement(const char *base_tmp
     printf("  -> Frame 0 retention, TOCTOU defense, skippable frame & confined extract passed.\n");
 }
 
+static void rmtree_posix(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) {
+        unlink(path);
+        return;
+    }
+    struct dirent *ent = nullptr;
+    while ((ent = readdir(d)) != nullptr) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        char sub[PATH_MAX];
+        int n = snprintf(sub, sizeof(sub), "%s/%s", path, ent->d_name);
+        assert(n > 0 && (size_t)n < sizeof(sub));
+        struct stat st;
+        if (lstat(sub, &st) == 0 && S_ISDIR(st.st_mode)) {
+            rmtree_posix(sub);
+        } else {
+            unlink(sub);
+        }
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+static size_t count_dir_entries(const char *path)
+{
+    DIR *d = opendir(path);
+    assert(d != NULL);
+    size_t n = 0;
+    struct dirent *ent = nullptr;
+    while ((ent = readdir(d)) != nullptr) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+
+static void write_ustar_entry(uint8_t *dst, const char *name, const uint8_t *data, size_t size)
+{
+    uint8_t hdr[512];
+    memset(hdr, 0, sizeof(hdr));
+    size_t nlen = strlen(name);
+    assert(nlen < 100);
+    memcpy(hdr, name, nlen);
+    memcpy(hdr + 100, "0000644", 7);
+    memcpy(hdr + 108, "0000000", 7);
+    memcpy(hdr + 116, "0000000", 7);
+    snprintf((char *)(hdr + 124), 12, "%011zo", size);
+    snprintf((char *)(hdr + 136), 12, "%011llo", 1700000000ULL);
+    hdr[156] = '0';
+    memcpy(hdr + 257, "ustar", 5);
+    hdr[262] = '0';
+    hdr[263] = '0';
+    recompute_tar_chksum(hdr);
+    memcpy(dst, hdr, 512);
+    if (size > 0) {
+        memcpy(dst + 512, data, size);
+    }
+}
+
+static void test_preauth_frame0_cap_and_bomb_rejection(const char *base_tmp)
+{
+    printf("[WWPKG 11/15] Testing Frame-0 4 MiB pre-auth cap and Zstd bomb rejection...\n");
+    assert(WWAL_WWPKG_FRAME0_PREAUTH_MAX == 4u * 1024u * 1024u);
+
+    /* 1. Unauthenticated 5 MiB Zstd stream (> 4 MiB Frame-0 pre-auth cap) must be rejected */
+    size_t bomb_plain_sz = WWAL_WWPKG_FRAME0_PREAUTH_MAX + 65536u;
+    uint8_t *bomb_plain = (uint8_t *)calloc(1, bomb_plain_sz);
+    assert(bomb_plain != NULL);
+    /* Write ustar magic so header inspection treats it as a candidate archive */
+    memcpy(bomb_plain, "manifest.json", 13);
+    memcpy(bomb_plain + 257, "ustar", 5);
+
+    size_t bomb_comp_sz = 0;
+    uint8_t *bomb_comp = zstd_compress_buf(bomb_plain, bomb_plain_sz, &bomb_comp_sz);
+    assert(bomb_comp != NULL && bomb_comp_sz < 64u * 1024u);
+
+    assert(wwpkg_open_memory(bomb_comp, bomb_comp_sz) == NULL);
+    assert(wwpkg_get_last_error(NULL) == WWPKG_ERR_DECOMPRESS);
+
+    char bomb_path[256];
+    snprintf(bomb_path, sizeof(bomb_path), "%s/preauth_bomb.wwpkg", base_tmp);
+    write_file_bytes(bomb_path, bomb_comp, bomb_comp_sz);
+    assert(wwpkg_open(bomb_path) == NULL);
+    assert(wwpkg_get_last_error(NULL) == WWPKG_ERR_DECOMPRESS);
+    assert(wwpkg_open_metadata_only(bomb_path) == NULL);
+    assert(wwpkg_get_last_error(NULL) == WWPKG_ERR_DECOMPRESS);
+    unlink(bomb_path);
+    free(bomb_comp);
+    free(bomb_plain);
+
+    /* 2. Forged 192-byte outer envelope ahead of 5 MiB Zstd bomb fails Ed25519 before Zstd */
+    uint8_t forged_bomb[256];
+    memset(forged_bomb, 0, sizeof(forged_bomb));
+    forged_bomb[0] = 0x50;
+    forged_bomb[1] = 0x2A;
+    forged_bomb[2] = 0x4D;
+    forged_bomb[3] = 0x18;
+    forged_bomb[4] = (uint8_t)WWPKG_OUTER_ENV_PAYLOAD;
+    forged_bomb[192 + 0] = 0x28;
+    forged_bomb[192 + 1] = 0xB5;
+    forged_bomb[192 + 2] = 0x2F;
+    forged_bomb[192 + 3] = 0xFD;
+    assert(wwpkg_open_memory(forged_bomb, sizeof(forged_bomb)) == NULL);
+    assert(wwpkg_get_last_error(NULL) == WWPKG_ERR_BAD_SIGNATURE);
+
+    /* 3. Streaming Zstd frame with unknown content size (ZSTD_CONTENTSIZE_UNKNOWN) > 4 MiB */
+    typedef void *(*cstream_create_fn)(void);
+    typedef size_t (*cstream_init_fn)(void *, int);
+    typedef struct {
+        const void *src;
+        size_t size;
+        size_t pos;
+    } z_in_t;
+    typedef struct {
+        void *dst;
+        size_t size;
+        size_t pos;
+    } z_out_t;
+    typedef size_t (*cstream_compress_fn)(void *, z_out_t *, z_in_t *);
+    typedef size_t (*cstream_end_fn)(void *, z_out_t *);
+    typedef size_t (*cstream_free_fn)(void *);
+    void *zh = dlopen("libzstd.so.1", RTLD_LAZY);
+    if (zh) {
+        cstream_create_fn mk = NULL;
+        cstream_init_fn initf = NULL;
+        cstream_compress_fn compf = NULL;
+        cstream_end_fn endf = NULL;
+        cstream_free_fn freef = NULL;
+        void *s1 = dlsym(zh, "ZSTD_createCStream");
+        void *s2 = dlsym(zh, "ZSTD_initCStream");
+        void *s3 = dlsym(zh, "ZSTD_compressStream");
+        void *s4 = dlsym(zh, "ZSTD_endStream");
+        void *s5 = dlsym(zh, "ZSTD_freeCStream");
+        memcpy(&mk, &s1, sizeof(mk));
+        memcpy(&initf, &s2, sizeof(initf));
+        memcpy(&compf, &s3, sizeof(compf));
+        memcpy(&endf, &s4, sizeof(endf));
+        memcpy(&freef, &s5, sizeof(freef));
+        if (mk && initf && compf && endf && freef) {
+            void *cs = mk();
+            assert(cs != NULL);
+            initf(cs, 3);
+            size_t chunk_sz = 1024u * 1024u;
+            uint8_t *zeros = (uint8_t *)calloc(1, chunk_sz);
+            uint8_t *out_comp = (uint8_t *)malloc(128u * 1024u);
+            assert(zeros != NULL && out_comp != NULL);
+            z_out_t zo = {.dst = out_comp, .size = 128u * 1024u, .pos = 0};
+            for (int iter = 0; iter < 5; iter++) {
+                z_in_t zi = {.src = zeros, .size = chunk_sz, .pos = 0};
+                while (zi.pos < zi.size) {
+                    size_t rc = compf(cs, &zo, &zi);
+                    assert(rc < (size_t)-10000);
+                }
+            }
+            size_t rc = endf(cs, &zo);
+            assert(rc == 0);
+            freef(cs);
+            free(zeros);
+
+            assert(wwpkg_open_memory(out_comp, zo.pos) == NULL);
+            assert(wwpkg_get_last_error(NULL) == WWPKG_ERR_DECOMPRESS);
+            free(out_comp);
+        }
+        dlclose(zh);
+    }
+
+    printf("  -> Frame-0 4 MiB pre-auth cap and Zstd bomb checks passed.\n");
+}
+
+static void test_ed25519_small_order_and_noncanonical(const char *base_tmp)
+{
+    printf("[WWPKG 12/15] Testing small-order A/R torsion, field >= p & notary validation...\n");
+
+    uint8_t pk[32] = {0}, sk[64] = {0}, sig[64] = {0};
+    wwpkg_generate_keypair(pk, sk);
+    const uint8_t msg[] = "Ed25519 torsion & canonical encoding check";
+    assert(wwpkg_ed25519_sign(sig, msg, sizeof(msg) - 1, sk) == 0);
+    assert(wwpkg_ed25519_verify(sig, msg, sizeof(msg) - 1, pk) == 0);
+
+    /* Small-order public keys A (orders 1, 2, 4, 8) and non-canonical p / 2^255-1 */
+    static const char *const bad_points_hex[] = {
+        /* Order 1: identity (0, 1) */
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        /* Order 2: (0, -1) */
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        /* Order 4: (sqrt(-1), 0) sign 0 and sign 1 */
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000080",
+        /* Order 8 torsion points */
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+        /* Non-canonical field >= p = 2^255 - 19 */
+        "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    };
+
+    for (size_t i = 0; i < sizeof(bad_points_hex) / sizeof(bad_points_hex[0]); i++) {
+        uint8_t bad_pt[32];
+        hex_to_bytes(bad_points_hex[i], bad_pt, 32);
+
+        /* Reject small-order or non-canonical A */
+        assert(wwpkg_ed25519_verify(sig, msg, sizeof(msg) - 1, bad_pt) != 0);
+
+        /* Reject small-order or non-canonical R even if paired with S = 0 or original S */
+        uint8_t bad_sig[64];
+        memcpy(bad_sig, bad_pt, 32);
+        memset(bad_sig + 32, 0, 32);
+        assert(wwpkg_ed25519_verify(bad_sig, msg, sizeof(msg) - 1, pk) != 0);
+        assert(wwpkg_ed25519_verify(bad_sig, msg, sizeof(msg) - 1, bad_pt) != 0);
+    }
+
+    /* Non-canonical notary R/S on an otherwise valid notarized .wwpkg must fail verification */
+    char src_dir[256], pkg_path[512], frag_path[512], prev_path[512];
+    snprintf(src_dir, sizeof(src_dir), "%s/notary_bad_src", base_tmp);
+    snprintf(pkg_path, sizeof(pkg_path), "%s/notary_bad.wwpkg", base_tmp);
+    snprintf(frag_path, sizeof(frag_path), "%s/shader.frag", src_dir);
+    snprintf(prev_path, sizeof(prev_path), "%s/preview.webp", src_dir);
+    mkdir(src_dir, 0755);
+    write_file_bytes(frag_path, "void main(){}", 13);
+    write_file_bytes(prev_path, "RIFF0000WEBPVP8 ", 16);
+
+    wwpkg_manifest_t mf;
+    init_sample_manifest(&mf, "notary-canonical-check", "shader.frag");
+    assert(wwpkg_build_package(src_dir, &mf, sk, pkg_path));
+
+    uint8_t npk[32] = {0}, nsk[64] = {0};
+    wwpkg_generate_keypair(npk, nsk);
+    assert(wwpkg_notarize_package(pkg_path, nsk));
+
+    /* Corrupt notary_signature inside decompressed Frame 0 to small-order R */
+    wwpkg_package_t *open_ok = wwpkg_open(pkg_path);
+    assert(open_ok != NULL);
+    assert(wwpkg_verify_signature(open_ok, NULL));
+    const wwpkg_signature_t *orig_sig = wwpkg_get_signature(open_ok);
+    const uint8_t *mf_bytes = NULL;
+    size_t mf_len = 0;
+    mf_bytes = wwpkg_read_asset(open_ok, "manifest.json", &mf_len);
+    assert(mf_bytes != NULL && mf_len > 0);
+
+    wwpkg_signature_t bad_notary_sig = *orig_sig;
+    hex_to_bytes("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+                 bad_notary_sig.notary_signature, 32);
+
+    size_t mpad = ((mf_len + 511u) / 512u) * 512u;
+    size_t p_sz = 16u;
+    size_t tar_sz = (512u + mpad) + 1024u + (512u + 512u) + (512u + 512u) + 1024u;
+    uint8_t *tar_buf = (uint8_t *)calloc(1, tar_sz);
+    assert(tar_buf != NULL);
+    size_t off = 0;
+    write_ustar_entry(tar_buf + off, "manifest.json", mf_bytes, mf_len);
+    off += 512u + mpad;
+    write_ustar_entry(tar_buf + off, "signature.sig", (const uint8_t *)&bad_notary_sig,
+                      sizeof(bad_notary_sig));
+    off += 1024u;
+    write_ustar_entry(tar_buf + off, "preview.webp", (const uint8_t *)"RIFF0000WEBPVP8 ", p_sz);
+    off += 1024u;
+    write_ustar_entry(tar_buf + off, "shader.frag", (const uint8_t *)"void main(){}", 13u);
+
+    wwpkg_package_t *bad_npkg = wwpkg_open_memory(tar_buf, tar_sz);
+    assert(bad_npkg != NULL);
+    assert(!wwpkg_verify_signature(bad_npkg, NULL));
+    wwpkg_close(bad_npkg);
+    free(tar_buf);
+    wwpkg_close(open_ok);
+    rmtree_posix(src_dir);
+    unlink(pkg_path);
+
+    printf("  -> Small-order A/R, non-canonical field & notary checks passed.\n");
+}
+
+static void test_ryu_jcs_and_hardened_we_json(void)
+{
+    printf("[WWPKG 13/15] Testing Ryu d2s shortest round-trip, RFC 8785 JCS & we_json hardening...\n");
+
+    struct {
+        double val;
+        const char *expected;
+    } cases[] = {
+        {0.0, "0"},
+        {-0.0, "0"},
+        {5e-324, "5e-324"},
+        {2.2250738585072009e-308, "2.225073858507201e-308"},
+        {2.2250738585072014e-308, "2.2250738585072014e-308"},
+        {1.7976931348623157e+308, "1.7976931348623157e+308"},
+        {1e20, "100000000000000000000"},
+        {1e21, "1e+21"},
+        {1e-6, "0.000001"},
+        {1e-7, "1e-7"},
+        {0.3, "0.3"},
+        {0.1 + 0.2, "0.30000000000000004"},
+        {-1.5, "-1.5"},
+        {10.0, "10"},
+        {9007199254740992.0, "9007199254740992"},
+    };
+
+    char out[64];
+    assert(!we_json_format_double(NAN, out, sizeof(out)));
+    assert(!we_json_format_double(INFINITY, out, sizeof(out)));
+    assert(!we_json_format_double(-INFINITY, out, sizeof(out)));
+
+    static const char *const comma_locales[] = {"de_DE.UTF-8", "fr_FR.UTF-8", "ru_RU.UTF-8",
+                                                "es_ES.UTF-8"};
+    for (size_t i = 0; i < sizeof(comma_locales) / sizeof(comma_locales[0]); i++) {
+        if (setlocale(LC_NUMERIC, comma_locales[i]) != NULL) {
+            break;
+        }
+    }
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        assert(we_json_format_double(cases[i].val, out, sizeof(out)));
+        assert(strcmp(out, cases[i].expected) == 0);
+    }
+
+    /* Programmatic we_jval_t -> canonical JCS serialization (UTF-16 order + Ryu floats) */
+    const char *raw_doc =
+        "{\"z\": 0.30000000000000004, \"\\uE000\": 1e-7, \"\\uD800\\uDC00\": 1e21, \"negz\": -0.0}";
+    we_jval_t *root = we_json_parse_root(raw_doc, strlen(raw_doc));
+    assert(root != NULL);
+    size_t canon_len = 0;
+    char *we_canon = we_jval_to_canonical_json(root, &canon_len);
+    assert(we_canon != NULL);
+    size_t pkg_canon_len = 0;
+    char *pkg_canon = wwpkg_canonicalize_json(raw_doc, strlen(raw_doc), &pkg_canon_len);
+    assert(pkg_canon != NULL);
+    assert(canon_len == pkg_canon_len && memcmp(we_canon, pkg_canon, canon_len) == 0);
+    assert(strcmp(we_canon, "{\"negz\":0,\"z\":0.30000000000000004,"
+                            "\"\xF0\x90\x80\x80\":1e+21,\"\xEE\x80\x80\":1e-7}") == 0);
+    free(we_canon);
+    free(pkg_canon);
+    we_jval_free(root);
+    setlocale(LC_NUMERIC, "C");
+
+    /* Hardened we_json_parse_root and float resolvers under comma locale safety */
+    static const char *const bad_json_inputs[] = {
+        "{\"s\":\"\\u0000\"}",
+        "{\"s\":\"a\x01\"}",
+        "{\"s\":\"\\q\"}",
+        "[1 2]",
+        "[1,]",
+        "{\"a\":1,}",
+        "+1",
+        ".5",
+        "01",
+        "truefalse",
+        "{\"a\":1} trailing",
+    };
+    for (size_t i = 0; i < sizeof(bad_json_inputs) / sizeof(bad_json_inputs[0]); i++) {
+        assert(we_json_parse_root(bad_json_inputs[i], strlen(bad_json_inputs[i])) == NULL);
+    }
+
+    /* Arbitrarily long valid number (> 64 digits) parses cleanly */
+    char long_num_doc[256];
+    int lnd_n = snprintf(
+        long_num_doc, sizeof(long_num_doc),
+        "{\"v\":1.250000000000000000000000000000000000000000000000000000000000000000000000000}");
+    assert(lnd_n > 0);
+    we_jval_t *ln_root = we_json_parse_root(long_num_doc, (size_t)lnd_n);
+    assert(ln_root != NULL);
+    float fv = we_jval_float(we_jobj_get(ln_root, "v"), NULL, -1.0f, NULL, 0);
+    assert(fabsf(fv - 1.25f) < 1e-6f);
+    we_jval_free(ln_root);
+
+    /* Non-finite float cast (1e40) and non-numeric vector elements must not emit garbage */
+    const char *ov_doc = "{\"value\":1e40}";
+    we_jval_t *ov_root = we_json_parse_root(ov_doc, strlen(ov_doc));
+    assert(ov_root != NULL);
+    assert(fabsf(we_jval_float(ov_root, NULL, 7.5f, NULL, 0) - 7.5f) < 1e-6f);
+    we_jval_free(ov_root);
+
+    const char *bad_arr_doc = "{\"value\":[1.0,\"bad\",3.0]}";
+    we_jval_t *bad_arr = we_json_parse_root(bad_arr_doc, strlen(bad_arr_doc));
+    assert(bad_arr != NULL);
+    float v3[3] = {0.0f, 0.0f, 0.0f};
+    assert(we_jval_floats(bad_arr, NULL, v3, 3u, NULL, 0) == 1u);
+    we_jval_free(bad_arr);
+
+    const char *uprop_doc = "{\"value\":42.5,\"user\":\"speed\"}";
+    we_jval_t *uprop_root = we_json_parse_root(uprop_doc, strlen(uprop_doc));
+    assert(uprop_root != NULL);
+    char uprop[64] = {0};
+    fv = we_jval_float(uprop_root, NULL, -1.0f, uprop, sizeof(uprop));
+    assert(fabsf(fv - 42.5f) < 1e-6f && strcmp(uprop, "speed") == 0);
+    we_jval_free(uprop_root);
+
+    printf("  -> Ryu d2s, RFC 8785 JCS & we_json hardening checks passed.\n");
+}
+
+typedef struct {
+    wwpkg_package_t *pkg;
+    pthread_barrier_t *barrier;
+    atomic_int failures;
+    const uint8_t *expected_bulk;
+    size_t expected_bulk_sz;
+} mt_race_ctx_t;
+
+static void *mt_race_worker(void *arg)
+{
+    mt_race_ctx_t *ctx = (mt_race_ctx_t *)arg;
+    pthread_barrier_wait(ctx->barrier);
+    for (int iter = 0; iter < 8; iter++) {
+        size_t bulk_sz = 0;
+        const uint8_t *bulk = wwpkg_read_asset(ctx->pkg, "bulk.bin", &bulk_sz);
+        if (!bulk || bulk_sz != ctx->expected_bulk_sz ||
+            memcmp(bulk, ctx->expected_bulk, ctx->expected_bulk_sz) != 0) {
+            atomic_fetch_add(&ctx->failures, 1);
+        }
+        size_t prev_sz = 0;
+        const uint8_t *prev = wwpkg_read_asset(ctx->pkg, "preview.webp", &prev_sz);
+        if (!prev || prev_sz == 0) {
+            atomic_fetch_add(&ctx->failures, 1);
+        }
+        if (!wwpkg_verify_signature(ctx->pkg, NULL) || !wwpkg_get_manifest(ctx->pkg)) {
+            atomic_fetch_add(&ctx->failures, 1);
+        }
+    }
+    return NULL;
+}
+
+static void test_mt_promotion_rollback_fifo_and_preview_probe(const char *base_tmp,
+                                                            const uint8_t priv_key[64])
+{
+    printf("[WWPKG 14/15] Testing MT promotion, FIFO defense, rollback & preview auto-probe...\n");
+
+    /* 1. Multi-threaded lazy promotion & verification race check + FIFO defense */
+    char src_dir[256], pkg_path[512], frag_path[512], prev_path[512], bulk_path[512];
+    snprintf(src_dir, sizeof(src_dir), "%s/mt_src", base_tmp);
+    snprintf(pkg_path, sizeof(pkg_path), "%s/mt_pkg.wwpkg", base_tmp);
+    snprintf(frag_path, sizeof(frag_path), "%s/shader.frag", src_dir);
+    snprintf(prev_path, sizeof(prev_path), "%s/preview.webp", src_dir);
+    snprintf(bulk_path, sizeof(bulk_path), "%s/bulk.bin", src_dir);
+    mkdir(src_dir, 0755);
+
+    size_t bulk_sz = 96u * 1024u;
+    uint8_t *bulk_data = (uint8_t *)malloc(bulk_sz);
+    assert(bulk_data != NULL);
+    for (size_t i = 0; i < bulk_sz; i++) {
+        bulk_data[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
+    }
+    write_file_bytes(frag_path, "void main(){}", 13);
+    write_file_bytes(prev_path, "RIFF0000WEBPVP8 ", 16);
+    write_file_bytes(bulk_path, bulk_data, bulk_sz);
+
+    wwpkg_manifest_t mf;
+    init_sample_manifest(&mf, "mt-promo-test", "shader.frag");
+    assert(wwpkg_build_package(src_dir, &mf, priv_key, pkg_path));
+
+    wwpkg_package_t *mt_pkg = wwpkg_open_metadata_only(pkg_path);
+    assert(mt_pkg != NULL);
+
+    enum { NTHREADS = 6 };
+    pthread_barrier_t barrier;
+    assert(pthread_barrier_init(&barrier, NULL, NTHREADS) == 0);
+    mt_race_ctx_t rctx = {
+        .pkg = mt_pkg,
+        .barrier = &barrier,
+        .failures = 0,
+        .expected_bulk = bulk_data,
+        .expected_bulk_sz = bulk_sz,
+    };
+    pthread_t tids[NTHREADS];
+    for (int i = 0; i < NTHREADS; i++) {
+        assert(pthread_create(&tids[i], NULL, mt_race_worker, &rctx) == 0);
+    }
+    for (int i = 0; i < NTHREADS; i++) {
+        pthread_join(tids[i], NULL);
+    }
+    pthread_barrier_destroy(&barrier);
+    assert(atomic_load(&rctx.failures) == 0);
+    wwpkg_close(mt_pkg);
+    free(bulk_data);
+
+    /* Replace source_path with a FIFO while still open metadata-only: must fail cleanly */
+    wwpkg_package_t *fifo_pkg = wwpkg_open_metadata_only(pkg_path);
+    assert(fifo_pkg != NULL);
+    assert(unlink(pkg_path) == 0);
+    assert(mkfifo(pkg_path, 0600) == 0);
+    assert(!wwpkg_verify_signature(fifo_pkg, NULL));
+    assert(wwpkg_read_asset(fifo_pkg, "bulk.bin", NULL) == NULL);
+    char fifo_ext[256];
+    snprintf(fifo_ext, sizeof(fifo_ext), "%s/fifo_ext", base_tmp);
+    assert(!wwpkg_extract_all(fifo_pkg, fifo_ext));
+    wwpkg_close(fifo_pkg);
+    unlink(pkg_path);
+    rmdir(fifo_ext);
+
+    /* Rebuild clean package and test atomic rollback on tampered Frame 1 during extract_all */
+    assert(wwpkg_build_package(src_dir, &mf, priv_key, pkg_path));
+    size_t raw_sz = 0;
+    uint8_t *raw_pkg = read_file_bytes(pkg_path, &raw_sz);
+    assert(raw_pkg != NULL && raw_sz > 256u);
+    raw_pkg[raw_sz - 12u] ^= 0xFFu;
+    char tamper_path[256];
+    snprintf(tamper_path, sizeof(tamper_path), "%s/rollback_tamper.wwpkg", base_tmp);
+    write_file_bytes(tamper_path, raw_pkg, raw_sz);
+    free(raw_pkg);
+
+    wwpkg_package_t *rb_pkg = wwpkg_open_metadata_only(tamper_path);
+    assert(rb_pkg != NULL);
+    char rb_dest[256];
+    snprintf(rb_dest, sizeof(rb_dest), "%s/rb_dest", base_tmp);
+    assert(!wwpkg_extract_all(rb_pkg, rb_dest));
+    assert(count_dir_entries(rb_dest) == 0 && "Failed extraction must leave zero staged artifacts");
+    wwpkg_close(rb_pkg);
+    unlink(tamper_path);
+    rmdir(rb_dest);
+
+    /* 2. E2E-F11 preview auto-probing: omitted entrypoint_preview picks preview.png then webp */
+    char probe_src[256], probe_pkg[512], p_frag[512], p_png[512], p_mf[512];
+    snprintf(probe_src, sizeof(probe_src), "%s/probe_src", base_tmp);
+    snprintf(probe_pkg, sizeof(probe_pkg), "%s/probe.wwpkg", base_tmp);
+    snprintf(p_frag, sizeof(p_frag), "%s/shader.frag", probe_src);
+    snprintf(p_png, sizeof(p_png), "%s/preview.png", probe_src);
+    snprintf(p_mf, sizeof(p_mf), "%s/manifest.json", probe_src);
+    mkdir(probe_src, 0755);
+    write_file_bytes(p_frag, "void main(){}", 13);
+    write_file_bytes(p_png, "\x89PNG\r\n\x1a\nPNGDATA", 15);
+
+    wwpkg_manifest_t no_prev_mf;
+    init_sample_manifest(&no_prev_mf, "auto-probe-png", "shader.frag");
+    no_prev_mf.entrypoint_preview[0] = '\0';
+    assert(wwpkg_build_package(probe_src, &no_prev_mf, priv_key, probe_pkg));
+
+    wwpkg_package_t *probed = wwpkg_open_metadata_only(probe_pkg);
+    assert(probed != NULL);
+    const wwpkg_manifest_t *pmf = wwpkg_get_manifest(probed);
+    assert(pmf != NULL && strcmp(pmf->entrypoint_preview, "preview.png") == 0);
+    assert(pmf->has_preview_sha256);
+    assert(wwpkg_verify_signature(probed, NULL));
+    assert(wwpkg_read_asset(probed, "preview.png", NULL) != NULL);
+    wwpkg_close(probed);
+    unlink(probe_pkg);
+
+    /* Draft manifest.json on disk omitting entrypoint.preview also auto-probes preview.png */
+    char draft_pk_hex[65];
+    bytes_to_hex(priv_key + 32, 32, draft_pk_hex);
+    char draft_mf[1024];
+    int dmlen = snprintf(
+        draft_mf, sizeof(draft_mf),
+        "{"
+        "\"schema_version\":\"wwpkg/v2\","
+        "\"id\":\"draft-probe-id\","
+        "\"slug\":\"draft-probe\","
+        "\"name\":\"Draft Probe\","
+        "\"version\":\"1.0.0\","
+        "\"author\":{\"name\":\"tester\",\"pubkey\":\"%s\"},"
+        "\"license\":\"MIT\","
+        "\"type\":\"shader_fragment\","
+        "\"entrypoint\":{\"pipeline\":\"shader.frag\"},"
+        "\"engine_requirements\":{\"min_wwal_version\":\"1.2.0\",\"abi_version\":1,"
+        "\"gl_profile\":\"gles_31\"},"
+        "\"capabilities\":{\"compute_shaders\":false,\"audio_spectrum\":false,"
+        "\"audio_playback\":false,\"scripting\":false,\"foreign_toplevel\":false,"
+        "\"network\":false,\"filesystem\":false},"
+        "\"file_count\":2,\"total_bytes\":28"
+        "}",
+        draft_pk_hex);
+    assert(dmlen > 0 && (size_t)dmlen < sizeof(draft_mf));
+    write_file_bytes(p_mf, draft_mf, (size_t)dmlen);
+    assert(wwpkg_build_package(probe_src, NULL, priv_key, probe_pkg));
+    probed = wwpkg_open_metadata_only(probe_pkg);
+    assert(probed != NULL);
+    pmf = wwpkg_get_manifest(probed);
+    assert(pmf != NULL && strcmp(pmf->entrypoint_preview, "preview.png") == 0);
+    assert(pmf->has_preview_sha256);
+    wwpkg_close(probed);
+
+    unlink(probe_pkg);
+
+    /* Draft manifest omitting entrypoint.preview falls back to preview.webp when present */
+    assert(unlink(p_png) == 0);
+    char p_webp[512];
+    snprintf(p_webp, sizeof(p_webp), "%s/preview.webp", probe_src);
+    write_file_bytes(p_webp, "RIFF0000WEBPVP8 ", 16);
+    assert(wwpkg_build_package(probe_src, NULL, priv_key, probe_pkg));
+    probed = wwpkg_open_metadata_only(probe_pkg);
+    assert(probed != NULL);
+    pmf = wwpkg_get_manifest(probed);
+    assert(pmf != NULL && strcmp(pmf->entrypoint_preview, "preview.webp") == 0);
+    assert(pmf->has_preview_sha256);
+    wwpkg_close(probed);
+
+    unlink(probe_pkg);
+    rmtree_posix(probe_src);
+    rmtree_posix(src_dir);
+    unlink(pkg_path);
+
+    printf("  -> MT promotion, FIFO defense, atomic rollback & preview auto-probe passed.\n");
+}
+
+static void test_4096_hash_indexed_tar_and_notarize_bounds(const char *base_tmp,
+                                                         const uint8_t priv_key[64])
+{
+    printf("[WWPKG 15/15] Testing 4096-payload hash-indexed tar bounds & notarize cap...\n");
+
+    char src_dir[256], pkg_path[512], ext_dir[256];
+    snprintf(src_dir, sizeof(src_dir), "%s/max4096_src", base_tmp);
+    snprintf(pkg_path, sizeof(pkg_path), "%s/max4096.wwpkg", base_tmp);
+    snprintf(ext_dir, sizeof(ext_dir), "%s/max4096_ext", base_tmp);
+    mkdir(src_dir, 0755);
+
+    for (uint32_t i = 0; i < WWPKG_MAX_FILE_COUNT; i++) {
+        char fpath[512], content[32];
+        if (i == 0) {
+            snprintf(fpath, sizeof(fpath), "%s/preview.webp", src_dir);
+        } else {
+            snprintf(fpath, sizeof(fpath), "%s/f%04u.bin", src_dir, i);
+        }
+        int clen = snprintf(content, sizeof(content), "%u", i);
+        write_file_bytes(fpath, content, (size_t)clen);
+    }
+
+    wwpkg_manifest_t mf;
+    init_sample_manifest(&mf, "max-4096-files", "f0001.bin");
+    assert(wwpkg_build_package(src_dir, &mf, priv_key, pkg_path));
+
+    wwpkg_package_t *pkg = wwpkg_open(pkg_path);
+    assert(pkg != NULL);
+    assert(wwpkg_verify_signature(pkg, NULL));
+    assert(wwpkg_get_manifest(pkg)->file_count == WWPKG_MAX_FILE_COUNT);
+
+    size_t vsz = 0;
+    const uint8_t *v_mid = wwpkg_read_asset(pkg, "f2048.bin", &vsz);
+    assert(v_mid != NULL && vsz == 4 && memcmp(v_mid, "2048", 4) == 0);
+    const uint8_t *v_last = wwpkg_read_asset(pkg, "f4095.bin", &vsz);
+    assert(v_last != NULL && vsz == 4 && memcmp(v_last, "4095", 4) == 0);
+    wwpkg_close(pkg);
+
+    wwpkg_package_t *mpkg = wwpkg_open_metadata_only(pkg_path);
+    assert(mpkg != NULL);
+    assert(wwpkg_extract_all(mpkg, ext_dir));
+    wwpkg_close(mpkg);
+
+    char check_file[512];
+    snprintf(check_file, sizeof(check_file), "%s/f4095.bin", ext_dir);
+    size_t csz = 0;
+    uint8_t *cdata = read_file_bytes(check_file, &csz);
+    assert(csz == 4 && memcmp(cdata, "4095", 4) == 0);
+    free(cdata);
+
+    /* 4097th payload file exceeds WWPKG_MAX_FILE_COUNT (4096) and must be rejected */
+    char extra_file[512];
+    snprintf(extra_file, sizeof(extra_file), "%s/f4096_overflow.bin", src_dir);
+    write_file_bytes(extra_file, "x", 1u);
+    assert(!wwpkg_build_package(src_dir, &mf, priv_key, pkg_path));
+    assert(wwpkg_get_last_error(NULL) == WWPKG_ERR_DECOMPRESS);
+
+    rmtree_posix(ext_dir);
+    rmtree_posix(src_dir);
+    unlink(pkg_path);
+
+    /* Construct a synthetic ustar with 4097 zero-byte payload files + manifest + sig (4099) */
+    uint8_t pk[32] = {0}, sk[64] = {0};
+    wwpkg_generate_keypair(pk, sk);
+    size_t n_entries = WWPKG_MAX_FILE_COUNT + 3u;
+    size_t over_tar_sz = (n_entries * 512u) + 1024u + 1024u;
+    uint8_t *over_tar = (uint8_t *)calloc(1, over_tar_sz);
+    assert(over_tar != NULL);
+    wwpkg_signature_t dummy_sig;
+    memset(&dummy_sig, 0, sizeof(dummy_sig));
+    write_ustar_entry(over_tar, "signature.sig", (const uint8_t *)&dummy_sig, sizeof(dummy_sig));
+    size_t tar_off = 1024u;
+    write_ustar_entry(over_tar + tar_off, "manifest.json", (const uint8_t *)"{}", 2u);
+    tar_off += 1024u;
+    for (uint32_t i = 0; i < WWPKG_MAX_FILE_COUNT + 1u; i++) {
+        char ename[32];
+        snprintf(ename, sizeof(ename), "e%04u", i);
+        write_ustar_entry(over_tar + tar_off, ename, NULL, 0u);
+        tar_off += 512u;
+    }
+    assert(wwpkg_open_memory(over_tar, over_tar_sz) == NULL);
+    free(over_tar);
+
+    /* Signed v2 package whose raw Frame 0 exceeds 64 KiB (< 4 MiB pre-auth) fails notarize cap */
+    char ov_path[512];
+    snprintf(ov_path, sizeof(ov_path), "%s/over_notarize.wwpkg", base_tmp);
+    size_t huge_desc_len = WWPKG_FRAME0_MAX_BYTES - 1200u;
+    char *huge_desc = (char *)malloc(huge_desc_len + 1u);
+    assert(huge_desc != NULL);
+    memset(huge_desc, 'A', huge_desc_len);
+    huge_desc[huge_desc_len] = '\0';
+
+    char pk_hex[65];
+    bytes_to_hex(pk, 32, pk_hex);
+    size_t big_cap = WWPKG_FRAME0_MAX_BYTES + 4096u;
+    char *big_json = (char *)malloc(big_cap);
+    assert(big_json != NULL);
+    int blen = snprintf(
+        big_json, big_cap,
+        "{\"author\":{\"name\":\"t\",\"pubkey\":\"%s\"},\"capabilities\":{"
+        "\"audio_playback\":false,\"audio_spectrum\":false,\"compute_shaders\":false,"
+        "\"filesystem\":false,\"foreign_toplevel\":false,\"network\":false,\"scripting\":false},"
+        "\"description\":\"%s\",\"engine_requirements\":{\"abi_version\":1,"
+        "\"gl_profile\":\"gles_31\",\"min_wwal_version\":\"1.2.0\"},"
+        "\"entrypoint\":{\"pipeline\":\"shader.frag\",\"preview\":\"preview.webp\"},"
+        "\"file_count\":1,\"id\":\"big-mf-id\",\"license\":\"MIT\",\"name\":\"Big Manifest\","
+        "\"schema_version\":\"wwpkg/v2\",\"slug\":\"big-mf\",\"total_bytes\":5,"
+        "\"version\":\"1.0.0\"}",
+        pk_hex, huge_desc);
+    free(huge_desc);
+    assert(blen > (int)(WWPKG_FRAME0_MAX_BYTES - 1024u) &&
+           blen <= (int)WWPKG_FRAME0_MAX_BYTES);
+
+    size_t c_len = 0;
+    char *canon_big = wwpkg_canonicalize_json(big_json, (size_t)blen, &c_len);
+    free(big_json);
+    assert(canon_big != NULL);
+
+    uint8_t h_mf[32];
+    ref_sha256((const uint8_t *)canon_big, c_len, h_mf);
+    const char *sh_src = "abcde";
+    size_t mleaf_sz = 1u + 4u + 13u + 8u + c_len;
+    uint8_t *mleaf_buf = (uint8_t *)malloc(mleaf_sz);
+    assert(mleaf_buf != NULL);
+    mleaf_buf[0] = 0x00;
+    mleaf_buf[1] = 13;
+    mleaf_buf[2] = 0;
+    mleaf_buf[3] = 0;
+    mleaf_buf[4] = 0;
+    memcpy(mleaf_buf + 5, "manifest.json", 13);
+    memset(mleaf_buf + 18, 0, 8);
+    for (int b = 0; b < 8; b++) {
+        mleaf_buf[18 + b] = (uint8_t)(((uint64_t)c_len >> (b * 8)) & 0xFFu);
+    }
+    memcpy(mleaf_buf + 26, canon_big, c_len);
+    uint8_t lhash_m[32];
+    ref_sha256(mleaf_buf, mleaf_sz, lhash_m);
+    free(mleaf_buf);
+
+    uint8_t sleaf_buf[1u + 4u + 11u + 8u + 5u];
+    memset(sleaf_buf, 0, sizeof(sleaf_buf));
+    sleaf_buf[0] = 0x00;
+    sleaf_buf[1] = 11;
+    memcpy(sleaf_buf + 5, "shader.frag", 11);
+    sleaf_buf[16] = 5;
+    memcpy(sleaf_buf + 24, sh_src, 5);
+    uint8_t lhash_s[32];
+    ref_sha256(sleaf_buf, sizeof(sleaf_buf), lhash_s);
+
+    uint8_t mnode[65];
+    mnode[0] = 0x01;
+    memcpy(mnode + 1, lhash_m, 32);
+    memcpy(mnode + 33, lhash_s, 32);
+    uint8_t merkle_root[32];
+    ref_sha256(mnode, sizeof(mnode), merkle_root);
+
+    wwpkg_signature_t big_sig;
+    memset(&big_sig, 0, sizeof(big_sig));
+    big_sig.version = 2;
+    big_sig.timestamp = 1700000000ULL;
+    memcpy(big_sig.author_pubkey, pk, 32);
+    memcpy(big_sig.merkle_root, merkle_root, 32);
+    uint8_t spayload[85];
+    memcpy(spayload, "WWPKG-SIG-V2\n", 13);
+    memcpy(spayload + 13, h_mf, 32);
+    memcpy(spayload + 45, merkle_root, 32);
+    for (int b = 0; b < 8; b++) {
+        spayload[77 + b] = (uint8_t)((big_sig.timestamp >> (56 - b * 8)) & 0xFFu);
+    }
+    assert(wwpkg_ed25519_sign(big_sig.signature, spayload, sizeof(spayload), sk) == 0);
+
+    size_t mf_pad = ((c_len + 511u) / 512u) * 512u;
+    size_t s_tar_sz = (512u + mf_pad) + 1024u + 1024u + 1024u;
+    assert(s_tar_sz > WWPKG_FRAME0_MAX_BYTES && s_tar_sz < WWAL_WWPKG_FRAME0_PREAUTH_MAX);
+    uint8_t *s_tar = (uint8_t *)calloc(1, s_tar_sz);
+    assert(s_tar != NULL);
+    write_ustar_entry(s_tar, "manifest.json", (const uint8_t *)canon_big, c_len);
+    write_ustar_entry(s_tar + 512u + mf_pad, "signature.sig", (const uint8_t *)&big_sig,
+                      sizeof(big_sig));
+    write_ustar_entry(s_tar + 512u + mf_pad + 1024u, "shader.frag", (const uint8_t *)sh_src, 5u);
+    free(canon_big);
+
+    size_t ov_comp_sz = 0;
+    uint8_t *ov_comp = zstd_compress_buf(s_tar, s_tar_sz, &ov_comp_sz);
+    free(s_tar);
+    assert(ov_comp != NULL);
+    write_file_bytes(ov_path, ov_comp, ov_comp_sz);
+    free(ov_comp);
+
+    assert(!wwpkg_notarize_package(ov_path, sk));
+    assert(wwpkg_get_last_error(NULL) == WWPKG_ERR_BAD_MANIFEST);
+    unlink(ov_path);
+
+    printf("  -> 4096-payload hash-indexed tar bounds & overflow checks passed.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -1465,11 +2259,16 @@ int main(void)
     test_dual_frame_metadata_fastpath_and_extract(base_tmp, priv_key);
     test_cold_open_and_1bit_tamper(base_tmp, priv_key);
     test_promotion_retention_toctou_and_confinement(base_tmp, priv_key);
+    test_preauth_frame0_cap_and_bomb_rejection(base_tmp);
+    test_ed25519_small_order_and_noncanonical(base_tmp);
+    test_ryu_jcs_and_hardened_we_json();
+    test_mt_promotion_rollback_fifo_and_preview_probe(base_tmp, priv_key);
+    test_4096_hash_indexed_tar_and_notarize_bounds(base_tmp, priv_key);
 
     rmdir(base_tmp);
 
     printf("==========================================================\n");
-    printf("  >>> ALL 10/10 .WWPKG CRYPTOGRAPHIC SUITES PASSED (100%%) <<<\n");
+    printf("  >>> ALL 15/15 .WWPKG CRYPTOGRAPHIC SUITES PASSED (100%%) <<<\n");
     printf("==========================================================\n");
     return 0;
 }

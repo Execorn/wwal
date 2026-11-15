@@ -58,6 +58,18 @@ bool we_jval_bool_resolved(const we_jval_t *v, const we_project_t *proj, bool de
                            char *out_user_prop, size_t prop_cap);
 bool we_project_eval_prop_bool(const we_project_t *proj, const char *prop_expr, bool *out_val);
 
+/*
+ * Format finite IEEE-754 double via Ryu shortest round-trip ECMAScript/RFC 8785 rules.
+ * Independent of process LC_NUMERIC; rejects NaN/Inf and undersized buffers.
+ */
+bool we_json_format_double(double val, char *out, size_t out_cap);
+
+/*
+ * Serialize DOM value as RFC 8785 JCS canonical JSON (caller must free()).
+ * Rejects non-finite numbers, malformed UTF-8 / lone surrogates, and duplicate keys.
+ */
+char *we_jval_to_canonical_json(const we_jval_t *v, size_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

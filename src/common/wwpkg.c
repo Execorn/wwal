@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 #include "waywal/wwpkg.h"
+#include "waywal/we_json.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -1112,10 +1113,34 @@ static int tweetnacl_ed25519_sign(uint8_t sig[64], const uint8_t *m, size_t mlen
     return 0;
 }
 
+/* Reject identity and E[8] cofactor torsion points via 3 doublings ([8]P == O). */
+static bool ed25519_point_has_small_order(const uint8_t enc[32])
+{
+    gf p[4];
+    if (unpackneg(p, enc) != 0) {
+        return true;
+    }
+    add(p, p);
+    add(p, p);
+    add(p, p);
+    return neq25519(p[0], gf0) == 0 && neq25519(p[1], p[2]) == 0;
+}
+
+static bool ed25519_precheck_sig_and_pk(const uint8_t sig[64], const uint8_t pk[32])
+{
+    if (!ed25519_scalar_is_canonical(sig + 32)) {
+        return false;
+    }
+    if (ed25519_point_has_small_order(sig) || ed25519_point_has_small_order(pk)) {
+        return false;
+    }
+    return true;
+}
+
 static int tweetnacl_ed25519_verify(const uint8_t sig[64], const uint8_t *m, size_t mlen,
                                     const uint8_t pk[32])
 {
-    if (!ed25519_field_is_canonical(sig)) {
+    if (!ed25519_precheck_sig_and_pk(sig, pk)) {
         return -1;
     }
 
@@ -1231,7 +1256,7 @@ int wwpkg_ed25519_verify(const uint8_t sig[64], const uint8_t *m, size_t mlen, c
         return -1;
     }
 
-    if (!ed25519_scalar_is_canonical(sig + 32)) {
+    if (!ed25519_precheck_sig_and_pk(sig, pk)) {
         set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
         return -1;
     }
@@ -2089,9 +2114,13 @@ static jcs_val_t *jcs_parse_val(jcs_lexer_t *lx, uint32_t depth)
         }
 
         size_t nlen = lx->pos - start;
-        char numbuf[128];
-        if (nlen >= sizeof(numbuf)) {
-            return nullptr;
+        char stack_buf[128];
+        char *numbuf = stack_buf;
+        if (nlen >= sizeof(stack_buf)) {
+            numbuf = (char *)malloc(nlen + 1u);
+            if (!numbuf) {
+                return nullptr;
+            }
         }
         memcpy(numbuf, lx->src + start, nlen);
         numbuf[nlen] = '\0';
@@ -2101,11 +2130,17 @@ static jcs_val_t *jcs_parse_val(jcs_lexer_t *lx, uint32_t depth)
         char *endp = nullptr;
         double dval = cloc ? strtod_l(numbuf, &endp, cloc) : strtod(numbuf, &endp);
         if (endp != numbuf + nlen || !isfinite(dval)) {
+            if (numbuf != stack_buf) {
+                free(numbuf);
+            }
             return nullptr;
         }
 
         jcs_val_t *v = (jcs_val_t *)jcs_arena_alloc(lx->arena, sizeof(jcs_val_t));
         if (!v) {
+            if (numbuf != stack_buf) {
+                free(numbuf);
+            }
             return nullptr;
         }
         v->type = JCS_TYPE_NUM;
@@ -2130,6 +2165,9 @@ static jcs_val_t *jcs_parse_val(jcs_lexer_t *lx, uint32_t depth)
                     v->is_int = true;
                 }
             }
+        }
+        if (numbuf != stack_buf) {
+            free(numbuf);
         }
         return v;
     }
@@ -2225,113 +2263,10 @@ static inline bool jcs_out_append_cstr(jcs_out_buf_t *b, const char *s)
     return jcs_out_append_str(b, s ? s : "", s ? strlen(s) : 0);
 }
 
-/* Locale-independent RFC 8785 / ECMA-262 IEEE-754 number formatter */
+/* Delegate to shared Ryu shortest round-trip ES6/RFC 8785 serializer in we_json.c. */
 static bool jcs_format_ieee754_double(double val, char *out, size_t out_cap)
 {
-    if (!isfinite(val) || out_cap < 40) {
-        return false;
-    }
-    if (val == 0.0) {
-        out[0] = '0';
-        out[1] = '\0';
-        return true;
-    }
-
-    bool neg = signbit(val) != 0;
-    double abs_v = fabs(val);
-
-    locale_t cloc = get_c_locale();
-    locale_t prev_loc = (locale_t)0;
-    if (cloc != (locale_t)0) {
-        prev_loc = uselocale(cloc);
-    }
-
-    char sci[64] = {0};
-    for (int prec = 15; prec <= 17; prec++) {
-        snprintf(sci, sizeof(sci), "%.*e", prec - 1, abs_v);
-        if (prec == 17) {
-            break;
-        }
-        double rt = cloc ? strtod_l(sci, nullptr, cloc) : strtod(sci, nullptr);
-        if (rt == abs_v) {
-            break;
-        }
-    }
-
-    if (cloc != (locale_t)0) {
-        uselocale(prev_loc);
-    }
-
-    char *epos = strchr(sci, 'e');
-    if (!epos) {
-        epos = strchr(sci, 'E');
-    }
-    if (!epos) {
-        return false;
-    }
-    int exp10 = (int)strtol(epos + 1, nullptr, 10);
-
-    char digits[24];
-    int k = 0;
-    for (char *p = sci; p < epos && k < 20; p++) {
-        if (*p >= '0' && *p <= '9') {
-            digits[k++] = *p;
-        }
-    }
-    while (k > 1 && digits[k - 1] == '0') {
-        k--;
-    }
-    digits[k] = '\0';
-
-    int n = exp10 + 1;
-    size_t pos = 0;
-    if (neg) {
-        out[pos++] = '-';
-    }
-
-    if (k <= n && n <= 21) {
-        memcpy(out + pos, digits, (size_t)k);
-        pos += (size_t)k;
-        memset(out + pos, '0', (size_t)(n - k));
-        pos += (size_t)(n - k);
-        out[pos] = '\0';
-    } else if (0 < n && n < k) {
-        memcpy(out + pos, digits, (size_t)n);
-        pos += (size_t)n;
-        out[pos++] = '.';
-        memcpy(out + pos, digits + n, (size_t)(k - n));
-        pos += (size_t)(k - n);
-        out[pos] = '\0';
-    } else if (-5 <= n && n <= 0) {
-        out[pos++] = '0';
-        out[pos++] = '.';
-        memset(out + pos, '0', (size_t)(-n));
-        pos += (size_t)(-n);
-        memcpy(out + pos, digits, (size_t)k);
-        pos += (size_t)k;
-        out[pos] = '\0';
-    } else {
-        out[pos++] = digits[0];
-        if (k > 1) {
-            out[pos++] = '.';
-            memcpy(out + pos, digits + 1, (size_t)(k - 1));
-            pos += (size_t)(k - 1);
-        }
-        out[pos++] = 'e';
-        int e_val = n - 1;
-        if (e_val >= 0) {
-            out[pos++] = '+';
-        } else {
-            out[pos++] = '-';
-            e_val = -e_val;
-        }
-        int written = snprintf(out + pos, out_cap - pos, "%d", e_val);
-        if (written <= 0) {
-            return false;
-        }
-        pos += (size_t)written;
-    }
-    return true;
+    return we_json_format_double(val, out, out_cap);
 }
 
 static bool jcs_serialize_val(jcs_out_buf_t *b, const jcs_val_t *v)
@@ -2605,7 +2540,8 @@ static bool jcs_get_uint64_field(const jcs_val_t *obj, const char *key, uint64_t
     return true;
 }
 
-static bool parse_manifest_ast(const jcs_val_t *root, wwpkg_manifest_t *m, int *out_err)
+static bool parse_manifest_ast_ex(const jcs_val_t *root, wwpkg_manifest_t *m, int *out_err,
+                                  bool allow_empty_preview)
 {
     if (!root || root->type != JCS_TYPE_OBJ) {
         if (out_err)
@@ -2765,8 +2701,10 @@ static bool parse_manifest_ast(const jcs_val_t *root, wwpkg_manifest_t *m, int *
             *out_err = WWPKG_ERR_BAD_MANIFEST;
         return false;
     }
-    if (!jcs_get_str_field(v_ep, "preview", raw_prev, sizeof(raw_prev), true) ||
-        !sanitize_archive_path(raw_prev, m->entrypoint_preview, sizeof(m->entrypoint_preview))) {
+    if (!jcs_get_str_field(v_ep, "preview", raw_prev, sizeof(raw_prev), !allow_empty_preview) ||
+        (!allow_empty_preview && raw_prev[0] == '\0') ||
+        (raw_prev[0] != '\0' &&
+         !sanitize_archive_path(raw_prev, m->entrypoint_preview, sizeof(m->entrypoint_preview)))) {
         if (out_err)
             *out_err = WWPKG_ERR_BAD_MANIFEST;
         return false;
@@ -2913,7 +2851,6 @@ static bool parse_manifest_ast(const jcs_val_t *root, wwpkg_manifest_t *m, int *
         }
         m->has_preview_sha256 = true;
     }
-
     return true;
 }
 
@@ -2934,8 +2871,9 @@ static void copy_manifest_fast(wwpkg_manifest_t *dst, const wwpkg_manifest_t *sr
     memcpy(dst->tags, src->tags, sizeof(wwpkg_manifest_t) - offsetof(wwpkg_manifest_t, tags));
 }
 
-static bool parse_manifest_from_string_ex(const char *json_str, size_t len, wwpkg_manifest_t *m,
-                                          uint8_t out_sha256[32], int *out_err)
+static bool parse_manifest_from_string_opts(const char *json_str, size_t len, wwpkg_manifest_t *m,
+                                            uint8_t out_sha256[32], int *out_err,
+                                            bool allow_empty_preview)
 {
     if (!json_str || !m) {
         if (out_err)
@@ -2950,19 +2888,22 @@ static bool parse_manifest_from_string_ex(const char *json_str, size_t len, wwpk
     }
 
     uint8_t h_raw[32];
-    wwpkg_sha256((const uint8_t *)json_str, actual_len, h_raw);
-    if (out_sha256) {
-        memcpy(out_sha256, h_raw, 32);
-    }
+    uint32_t mslot = 0;
+    if (!allow_empty_preview) {
+        wwpkg_sha256((const uint8_t *)json_str, actual_len, h_raw);
+        if (out_sha256) {
+            memcpy(out_sha256, h_raw, 32);
+        }
 
-    uint32_t mslot = read_u32_le(h_raw) & 31u;
-    pthread_mutex_lock(&g_mf_cache_mu);
-    if (g_mf_cache[mslot].valid && memcmp(g_mf_cache[mslot].sha256, h_raw, 32) == 0) {
-        copy_manifest_fast(m, &g_mf_cache[mslot].parsed, g_mf_cache[mslot].desc_len);
+        mslot = read_u32_le(h_raw) & 31u;
+        pthread_mutex_lock(&g_mf_cache_mu);
+        if (g_mf_cache[mslot].valid && memcmp(g_mf_cache[mslot].sha256, h_raw, 32) == 0) {
+            copy_manifest_fast(m, &g_mf_cache[mslot].parsed, g_mf_cache[mslot].desc_len);
+            pthread_mutex_unlock(&g_mf_cache_mu);
+            return true;
+        }
         pthread_mutex_unlock(&g_mf_cache_mu);
-        return true;
     }
-    pthread_mutex_unlock(&g_mf_cache_mu);
 
     jcs_arena_t arena;
     jcs_arena_init(&arena);
@@ -2982,9 +2923,9 @@ static bool parse_manifest_from_string_ex(const char *json_str, size_t len, wwpk
         return false;
     }
 
-    bool ok = parse_manifest_ast(root, m, out_err);
+    bool ok = parse_manifest_ast_ex(root, m, out_err, allow_empty_preview);
     jcs_arena_free(&arena);
-    if (ok) {
+    if (ok && !allow_empty_preview) {
         size_t dlen = strlen(m->description);
         pthread_mutex_lock(&g_mf_cache_mu);
         memcpy(g_mf_cache[mslot].sha256, h_raw, 32);
@@ -2994,6 +2935,12 @@ static bool parse_manifest_from_string_ex(const char *json_str, size_t len, wwpk
         pthread_mutex_unlock(&g_mf_cache_mu);
     }
     return ok;
+}
+
+static bool parse_manifest_from_string_ex(const char *json_str, size_t len, wwpkg_manifest_t *m,
+                                          uint8_t out_sha256[32], int *out_err)
+{
+    return parse_manifest_from_string_opts(json_str, len, m, out_sha256, out_err, false);
 }
 
 static bool parse_manifest_from_string(const char *json_str, size_t len, wwpkg_manifest_t *m,
@@ -3621,6 +3568,8 @@ struct wwpkg_package {
     bool outer_auth_verified;
     int last_error;
 
+    int source_fd;
+    struct stat source_st;
     char *source_path;
     uint8_t *decompressed_buf;
     size_t decompressed_size;
@@ -3629,12 +3578,15 @@ struct wwpkg_package {
     pkg_asset_entry_t *assets;
     size_t asset_count;
     size_t asset_cap;
+    uint32_t *asset_ht;
+    size_t asset_ht_cap;
 
     char *raw_manifest_str;
     size_t raw_manifest_len;
     uint8_t raw_manifest_sha256[32];
     bool has_raw_manifest_sha256;
 
+    pthread_mutex_t lock;
     wwpkg_manifest_t manifest;
     pkg_asset_entry_t inline_assets[WWPKG_INLINE_ASSET_CAP];
     char inline_source_path[WWPKG_INLINE_PATH_CAP];
@@ -3666,6 +3618,8 @@ static wwpkg_package_t *alloc_empty_package(void)
         }
     }
     memset(pkg, 0, offsetof(wwpkg_package_t, manifest));
+    pkg->source_fd = -1;
+    pthread_mutex_init(&pkg->lock, nullptr);
     pkg->manifest.schema_version[0] = '\0';
     pkg->assets = pkg->inline_assets;
     pkg->asset_cap = WWPKG_INLINE_ASSET_CAP;
@@ -3711,6 +3665,10 @@ void wwpkg_close(wwpkg_package_t *pkg)
     if (!pkg) {
         return;
     }
+    if (pkg->source_fd >= 0) {
+        close(pkg->source_fd);
+        pkg->source_fd = -1;
+    }
     if (pkg->source_path != pkg->inline_source_path) {
         free(pkg->source_path);
     }
@@ -3721,15 +3679,120 @@ void wwpkg_close(wwpkg_package_t *pkg)
     if (pkg->assets != pkg->inline_assets) {
         free(pkg->assets);
     }
+    free(pkg->asset_ht);
     if (pkg->raw_manifest_str != pkg->inline_manifest_str) {
         free(pkg->raw_manifest_str);
     }
+    pthread_mutex_destroy(&pkg->lock);
     if (pkg >= &g_pkg_pool[0] && pkg < &g_pkg_pool[WWPKG_FAST_PKG_SLOTS]) {
         uint32_t idx = (uint32_t)(pkg - &g_pkg_pool[0]);
         atomic_fetch_and_explicit(&g_pkg_pool_mask, ~(1u << idx), memory_order_release);
         return;
     }
     free(pkg);
+}
+
+typedef const char *(*pkg_ht_name_fn)(const void *ctx, uint32_t idx);
+
+static uint64_t pkg_hash_cstr(const char *s)
+{
+    uint64_t h = 14695981039346656037ULL;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= (uint64_t)*p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint32_t pkg_ht_find(const uint32_t *ht, size_t ht_cap, const char *name,
+                            pkg_ht_name_fn get_name, const void *ctx, uint32_t *out_empty_slot)
+{
+    uint64_t h = pkg_hash_cstr(name);
+    size_t mask = ht_cap - 1u;
+    size_t slot = (size_t)h & mask;
+    for (;;) {
+        uint32_t idx = ht[slot];
+        if (idx == UINT32_MAX) {
+            if (out_empty_slot) {
+                *out_empty_slot = (uint32_t)slot;
+            }
+            return UINT32_MAX;
+        }
+        if (strcmp(get_name(ctx, idx), name) == 0) {
+            return idx;
+        }
+        slot = (slot + 1u) & mask;
+    }
+}
+
+static bool pkg_ht_rehash(uint32_t **ht_ptr, size_t *cap_ptr, size_t count,
+                          pkg_ht_name_fn get_name, const void *ctx)
+{
+    size_t ncap = (*cap_ptr == 0) ? 32u : (*cap_ptr * 2u);
+    while (ncap < count * 2u + 2u) {
+        ncap *= 2u;
+    }
+    uint32_t *nht = (uint32_t *)malloc(ncap * sizeof(uint32_t));
+    if (!nht) {
+        return false;
+    }
+    memset(nht, 0xFF, ncap * sizeof(uint32_t));
+    for (size_t i = 0; i < count; i++) {
+        uint32_t slot = 0;
+        (void)pkg_ht_find(nht, ncap, get_name(ctx, (uint32_t)i), get_name, ctx, &slot);
+        nht[slot] = (uint32_t)i;
+    }
+    free(*ht_ptr);
+    *ht_ptr = nht;
+    *cap_ptr = ncap;
+    return true;
+}
+
+static const char *pkg_asset_get_name(const void *ctx, uint32_t idx)
+{
+    return ((const pkg_asset_entry_t *)ctx)[idx].name;
+}
+
+static const pkg_asset_entry_t *pkg_find_asset_locked(const wwpkg_package_t *pkg, const char *name)
+{
+    if (pkg->asset_ht && pkg->asset_ht_cap > 0) {
+        uint32_t idx = pkg_ht_find(pkg->asset_ht, pkg->asset_ht_cap, name, pkg_asset_get_name,
+                                   pkg->assets, nullptr);
+        return idx != UINT32_MAX ? &pkg->assets[idx] : nullptr;
+    }
+    for (size_t i = 0; i < pkg->asset_count; i++) {
+        if (strcmp(pkg->assets[i].name, name) == 0) {
+            return &pkg->assets[i];
+        }
+    }
+    return nullptr;
+}
+
+static bool stat_identity_unchanged(int fd, const struct stat *before)
+{
+    struct stat after;
+    if (fstat(fd, &after) != 0) {
+        return false;
+    }
+    return after.st_dev == before->st_dev && after.st_ino == before->st_ino &&
+           after.st_size == before->st_size && after.st_mtim.tv_sec == before->st_mtim.tv_sec &&
+           after.st_mtim.tv_nsec == before->st_mtim.tv_nsec;
+}
+
+static bool verify_source_fd_and_path_identity(const wwpkg_package_t *pkg)
+{
+    if (!pkg || pkg->source_fd < 0 || !pkg->source_path ||
+        !stat_identity_unchanged(pkg->source_fd, &pkg->source_st)) {
+        return false;
+    }
+    struct stat lst;
+    if (lstat(pkg->source_path, &lst) != 0 || !S_ISREG(lst.st_mode)) {
+        return false;
+    }
+    return lst.st_dev == pkg->source_st.st_dev && lst.st_ino == pkg->source_st.st_ino &&
+           lst.st_size == pkg->source_st.st_size &&
+           lst.st_mtim.tv_sec == pkg->source_st.st_mtim.tv_sec &&
+           lst.st_mtim.tv_nsec == pkg->source_st.st_mtim.tv_nsec;
 }
 
 static void build_sign_payload(uint32_t sig_version, const uint8_t h_manifest[32],
@@ -3912,12 +3975,10 @@ static bool parse_ustar_into_package(wwpkg_package_t *pkg, const uint8_t *tar_bu
         const uint8_t *entry_data = tar_buf + offset + 512u;
 
         if (hdr->typeflag != '5') {
-            for (size_t i = 0; i < pkg->asset_count; i++) {
-                if (strcmp(pkg->assets[i].name, clean_path) == 0) {
-                    /* Reject duplicate normalized paths inside archive */
-                    pkg->last_error = WWPKG_ERR_CORRUPT;
-                    return false;
-                }
+            if (pkg_find_asset_locked(pkg, clean_path) != nullptr) {
+                /* Reject duplicate normalized paths inside archive */
+                pkg->last_error = WWPKG_ERR_CORRUPT;
+                return false;
             }
 
             if (strcmp(clean_path, "signature.sig") == 0) {
@@ -3967,7 +4028,7 @@ static bool parse_ustar_into_package(wwpkg_package_t *pkg, const uint8_t *tar_bu
                 payload_bytes += fsize_u64;
             }
 
-            if (pkg->asset_count >= WWPKG_MAX_FILE_COUNT) {
+            if (pkg->asset_count >= WWPKG_MAX_FILE_COUNT + 2u) {
                 pkg->last_error = WWPKG_ERR_DECOMPRESS;
                 return false;
             }
@@ -3995,10 +4056,26 @@ static bool parse_ustar_into_package(wwpkg_package_t *pkg, const uint8_t *tar_bu
                 pkg->asset_cap = ncap;
             }
             size_t nlen = strlen(clean_path);
-            memcpy(pkg->assets[pkg->asset_count].name, clean_path, nlen + 1);
-            pkg->assets[pkg->asset_count].data = entry_data;
-            pkg->assets[pkg->asset_count].size = fsize;
+            uint32_t new_idx = (uint32_t)pkg->asset_count;
+            memcpy(pkg->assets[new_idx].name, clean_path, nlen + 1);
+            pkg->assets[new_idx].data = entry_data;
+            pkg->assets[new_idx].size = fsize;
             pkg->asset_count++;
+
+            if (pkg->asset_count >= 8u) {
+                if (!pkg->asset_ht || pkg->asset_count * 2u >= pkg->asset_ht_cap) {
+                    if (!pkg_ht_rehash(&pkg->asset_ht, &pkg->asset_ht_cap, pkg->asset_count,
+                                       pkg_asset_get_name, pkg->assets)) {
+                        pkg->last_error = WWPKG_ERR_IO;
+                        return false;
+                    }
+                } else {
+                    uint32_t slot = 0;
+                    (void)pkg_ht_find(pkg->asset_ht, pkg->asset_ht_cap, clean_path,
+                                      pkg_asset_get_name, pkg->assets, &slot);
+                    pkg->asset_ht[slot] = new_idx;
+                }
+            }
         }
 
         offset += 512u + fsize + pad;
@@ -4018,6 +4095,127 @@ static bool parse_ustar_into_package(wwpkg_package_t *pkg, const uint8_t *tar_bu
     }
 
     return true;
+}
+
+static bool verify_frame0_against_outer_env(const wwpkg_package_t *pkg,
+                                            const wwpkg_outer_envelope_t *env, int *out_err)
+{
+    if (!pkg->has_manifest || !pkg->has_signature || pkg->signature.version < 2 ||
+        pkg->manifest.capabilities.network || pkg->manifest.capabilities.filesystem ||
+        pkg->signature.timestamp != env->timestamp_le ||
+        memcmp(pkg->signature.author_pubkey, env->author_pubkey, 32) != 0 ||
+        memcmp(pkg->manifest.author_pubkey, env->author_pubkey, 32) != 0 ||
+        memcmp(pkg->signature.merkle_root, env->merkle_root, 32) != 0 ||
+        memcmp(pkg->signature.signature, env->signature, 64) != 0) {
+        if (out_err) {
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        }
+        return false;
+    }
+
+    uint8_t h_manifest[32];
+    if (pkg->has_raw_manifest_sha256) {
+        memcpy(h_manifest, pkg->raw_manifest_sha256, 32);
+    } else {
+        wwpkg_sha256((const uint8_t *)pkg->raw_manifest_str, pkg->raw_manifest_len, h_manifest);
+    }
+    if (memcmp(h_manifest, env->manifest_sha256, 32) != 0) {
+        size_t canon_len = 0;
+        char *canon_mf =
+            wwpkg_canonicalize_json(pkg->raw_manifest_str, pkg->raw_manifest_len, &canon_len);
+        if (!canon_mf) {
+            if (out_err) {
+                *out_err = WWPKG_ERR_BAD_MANIFEST;
+            }
+            return false;
+        }
+        wwpkg_sha256((const uint8_t *)canon_mf, canon_len, h_manifest);
+        free(canon_mf);
+
+        if (memcmp(h_manifest, env->manifest_sha256, 32) != 0) {
+            if (out_err) {
+                *out_err = WWPKG_ERR_BAD_SIGNATURE;
+            }
+            return false;
+        }
+    }
+
+    /* Authenticate any preview or auxiliary entry present in Frame 0 before bulk decompression */
+    for (size_t i = 0; i < pkg->asset_count; i++) {
+        const char *aname = pkg->assets[i].name;
+        if (strcmp(aname, "manifest.json") == 0 || strcmp(aname, "signature.sig") == 0) {
+            continue;
+        }
+        if (!pkg->manifest.has_preview_sha256 ||
+            strcmp(aname, pkg->manifest.entrypoint_preview) != 0) {
+            if (out_err) {
+                *out_err = WWPKG_ERR_BAD_SIGNATURE;
+            }
+            return false;
+        }
+        uint8_t actual_prev_sha[32];
+        wwpkg_sha256(pkg->assets[i].data, pkg->assets[i].size, actual_prev_sha);
+        if (memcmp(actual_prev_sha, pkg->manifest.preview_sha256, 32) != 0) {
+            if (out_err) {
+                *out_err = WWPKG_ERR_BAD_SIGNATURE;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool zstd_first_frame_within_cap(const uint8_t *src, size_t src_len, size_t cap,
+                                        size_t *out_csize, int *out_err)
+{
+    zstd_probe();
+    if (!g_zstd_available) {
+        if (out_err) {
+            *out_err = WWPKG_ERR_DECOMPRESS;
+        }
+        return false;
+    }
+    size_t csize = g_zstd.findFrameCompressedSize(src, src_len);
+    if (g_zstd.isError(csize) || csize == 0 || csize > src_len) {
+        if (out_err) {
+            *out_err = WWPKG_ERR_DECOMPRESS;
+        }
+        return false;
+    }
+    unsigned long long content_sz = g_zstd.getFrameContentSize(src, csize);
+    if (content_sz != 0xFFFFFFFFFFFFFFFFULL && content_sz != 0xFFFFFFFFFFFFFFFEULL &&
+        (content_sz == 0 || content_sz > (unsigned long long)cap)) {
+        if (out_err) {
+            *out_err = WWPKG_ERR_DECOMPRESS;
+        }
+        return false;
+    }
+    if (out_csize) {
+        *out_csize = csize;
+    }
+    return true;
+}
+
+static void pkg_reset_parsed_state(wwpkg_package_t *pkg)
+{
+    if (pkg->assets != pkg->inline_assets) {
+        free(pkg->assets);
+    }
+    pkg->assets = pkg->inline_assets;
+    pkg->asset_cap = WWPKG_INLINE_ASSET_CAP;
+    pkg->asset_count = 0;
+    free(pkg->asset_ht);
+    pkg->asset_ht = nullptr;
+    pkg->asset_ht_cap = 0;
+
+    if (pkg->raw_manifest_str != pkg->inline_manifest_str) {
+        free(pkg->raw_manifest_str);
+    }
+    pkg->raw_manifest_str = nullptr;
+    pkg->raw_manifest_len = 0;
+    pkg->has_raw_manifest_sha256 = false;
+    pkg->has_manifest = false;
+    pkg->has_signature = false;
 }
 
 wwpkg_package_t *wwpkg_open_memory(const uint8_t *data, size_t size)
@@ -4059,52 +4257,178 @@ wwpkg_package_t *wwpkg_open_memory(const uint8_t *data, size_t size)
         stream_len -= total_skip;
     }
 
-    uint8_t *tar_buf = nullptr;
-    size_t tar_size = 0;
-
     if (stream_len >= 4 && read_u32_le(stream_ptr) == WWPKG_MAGIC_ZSTD) {
+        if (!has_outer) {
+            /* Pre-auth inputs without a verified outer envelope obey the 4 MiB Frame-0 cap. */
+            int derr = WWPKG_ERR_DECOMPRESS;
+            if (!zstd_first_frame_within_cap(stream_ptr, stream_len, WWAL_WWPKG_FRAME0_PREAUTH_MAX,
+                                             nullptr, &derr)) {
+                set_tls_error(derr);
+                return nullptr;
+            }
+            uint8_t *tar_buf = nullptr;
+            size_t tar_size = 0;
+            if (!zstd_decompress_bounded(stream_ptr, stream_len, WWAL_WWPKG_FRAME0_PREAUTH_MAX,
+                                         &tar_buf, &tar_size, &derr)) {
+                set_tls_error(derr);
+                return nullptr;
+            }
+            wwpkg_package_t *pkg = alloc_empty_package();
+            if (!pkg) {
+                free(tar_buf);
+                set_tls_error(WWPKG_ERR_IO);
+                return nullptr;
+            }
+            pkg->decompressed_buf = tar_buf;
+            pkg->decompressed_size = tar_size;
+            if (!parse_ustar_into_package(pkg, tar_buf, tar_size, false)) {
+                set_tls_error(pkg->last_error ? pkg->last_error : WWPKG_ERR_CORRUPT);
+                wwpkg_close(pkg);
+                return nullptr;
+            }
+            set_tls_error(WWPKG_OK);
+            return pkg;
+        }
+
+        size_t f0_csize = 0;
         int derr = WWPKG_ERR_DECOMPRESS;
-        if (!zstd_decompress_bounded(stream_ptr, stream_len, WWPKG_MAX_ARCHIVE_BYTES, &tar_buf,
-                                     &tar_size, &derr)) {
+        if (!zstd_first_frame_within_cap(stream_ptr, stream_len, WWAL_WWPKG_FRAME0_PREAUTH_MAX,
+                                         &f0_csize, &derr)) {
             set_tls_error(derr);
             return nullptr;
         }
-    } else if (stream_len >= 512 && stream_len <= WWPKG_MAX_ARCHIVE_BYTES &&
-               memcmp(stream_ptr + 257, "ustar", 5) == 0) {
-        tar_buf = (uint8_t *)malloc(stream_len);
+
+        uint8_t *f0_buf = nullptr;
+        size_t f0_len = 0;
+        if (!zstd_decompress_bounded(stream_ptr, f0_csize, WWAL_WWPKG_FRAME0_PREAUTH_MAX, &f0_buf,
+                                     &f0_len, &derr)) {
+            set_tls_error(derr);
+            return nullptr;
+        }
+
+        wwpkg_package_t *pkg = alloc_empty_package();
+        if (!pkg) {
+            free(f0_buf);
+            set_tls_error(WWPKG_ERR_IO);
+            return nullptr;
+        }
+        pkg->decompressed_buf = f0_buf;
+        pkg->decompressed_size = f0_len;
+        pkg->has_outer_env = true;
+        pkg->outer_auth_verified = true;
+        pkg->outer_env = outer_env;
+
+        if (f0_csize == stream_len) {
+            if (!parse_ustar_into_package(pkg, f0_buf, f0_len, false)) {
+                set_tls_error(pkg->last_error ? pkg->last_error : WWPKG_ERR_CORRUPT);
+                wwpkg_close(pkg);
+                return nullptr;
+            }
+            set_tls_error(WWPKG_OK);
+            return pkg;
+        }
+
+        /* Dual/multi-frame archive: verify Frame 0 against the outer envelope BEFORE bulk frames. */
+        if ((f0_len % 512u) != 0 || !parse_ustar_into_package(pkg, f0_buf, f0_len, true)) {
+            set_tls_error(pkg->last_error ? pkg->last_error : WWPKG_ERR_CORRUPT);
+            wwpkg_close(pkg);
+            return nullptr;
+        }
+        int f0_err = WWPKG_ERR_BAD_SIGNATURE;
+        if (!verify_frame0_against_outer_env(pkg, &outer_env, &f0_err)) {
+            wwpkg_close(pkg);
+            set_tls_error(f0_err);
+            return nullptr;
+        }
+
+        uint64_t est_total = pkg->manifest.total_bytes +
+                             ((uint64_t)pkg->manifest.file_count * 1024ULL) +
+                             (2ULL * 1024ULL * 1024ULL);
+        uint64_t hard_cap = (uint64_t)WWPKG_MAX_ARCHIVE_BYTES + (8ULL * 1024ULL * 1024ULL);
+        if (est_total > hard_cap) {
+            est_total = hard_cap;
+        }
+        size_t bulk_max =
+            (est_total > (uint64_t)f0_len) ? (size_t)(est_total - (uint64_t)f0_len) : 65536u;
+
+        uint8_t *bulk_buf = nullptr;
+        size_t bulk_len = 0;
+        if (!zstd_decompress_bounded(stream_ptr + f0_csize, stream_len - f0_csize, bulk_max,
+                                     &bulk_buf, &bulk_len, &derr)) {
+            wwpkg_close(pkg);
+            set_tls_error(derr);
+            return nullptr;
+        }
+
+        if (bulk_len > SIZE_MAX - f0_len) {
+            free(bulk_buf);
+            wwpkg_close(pkg);
+            set_tls_error(WWPKG_ERR_DECOMPRESS);
+            return nullptr;
+        }
+        uint8_t *full_tar = (uint8_t *)malloc(f0_len + bulk_len);
+        if (!full_tar) {
+            free(bulk_buf);
+            wwpkg_close(pkg);
+            set_tls_error(WWPKG_ERR_IO);
+            return nullptr;
+        }
+        memcpy(full_tar, f0_buf, f0_len);
+        if (bulk_len > 0) {
+            memcpy(full_tar + f0_len, bulk_buf, bulk_len);
+        }
+        free(bulk_buf);
+
+        pkg_reset_parsed_state(pkg);
+        free(pkg->decompressed_buf);
+        pkg->decompressed_buf = full_tar;
+        pkg->decompressed_size = f0_len + bulk_len;
+
+        if (!parse_ustar_into_package(pkg, full_tar, pkg->decompressed_size, false)) {
+            set_tls_error(pkg->last_error ? pkg->last_error : WWPKG_ERR_CORRUPT);
+            wwpkg_close(pkg);
+            return nullptr;
+        }
+        set_tls_error(WWPKG_OK);
+        return pkg;
+    }
+
+    size_t raw_cap = has_outer ? WWPKG_MAX_ARCHIVE_BYTES : WWAL_WWPKG_FRAME0_PREAUTH_MAX;
+    if (stream_len >= 512u && stream_len <= raw_cap &&
+        memcmp(stream_ptr + 257, "ustar", 5) == 0) {
+        uint8_t *tar_buf = (uint8_t *)malloc(stream_len);
         if (!tar_buf) {
             set_tls_error(WWPKG_ERR_IO);
             return nullptr;
         }
         memcpy(tar_buf, stream_ptr, stream_len);
-        tar_size = stream_len;
-    } else {
-        set_tls_error(WWPKG_ERR_CORRUPT);
-        return nullptr;
+        wwpkg_package_t *pkg = alloc_empty_package();
+        if (!pkg) {
+            free(tar_buf);
+            set_tls_error(WWPKG_ERR_IO);
+            return nullptr;
+        }
+        pkg->decompressed_buf = tar_buf;
+        pkg->decompressed_size = stream_len;
+        pkg->has_outer_env = has_outer;
+        pkg->outer_auth_verified = has_outer;
+        if (has_outer) {
+            pkg->outer_env = outer_env;
+        }
+        if (!parse_ustar_into_package(pkg, tar_buf, stream_len, false)) {
+            set_tls_error(pkg->last_error ? pkg->last_error : WWPKG_ERR_CORRUPT);
+            wwpkg_close(pkg);
+            return nullptr;
+        }
+        set_tls_error(WWPKG_OK);
+        return pkg;
     }
 
-    wwpkg_package_t *pkg = alloc_empty_package();
-    if (!pkg) {
-        free(tar_buf);
-        set_tls_error(WWPKG_ERR_IO);
-        return nullptr;
-    }
-    pkg->decompressed_buf = tar_buf;
-    pkg->decompressed_size = tar_size;
-    pkg->has_outer_env = has_outer;
-    pkg->outer_auth_verified = has_outer;
-    if (has_outer) {
-        pkg->outer_env = outer_env;
-    }
-
-    if (!parse_ustar_into_package(pkg, tar_buf, tar_size, false)) {
-        set_tls_error(pkg->last_error ? pkg->last_error : WWPKG_ERR_CORRUPT);
-        wwpkg_close(pkg);
-        return nullptr;
-    }
-
-    set_tls_error(WWPKG_OK);
-    return pkg;
+    set_tls_error((stream_len > raw_cap && stream_len >= 512u &&
+                   memcmp(stream_ptr + 257, "ustar", 5) == 0)
+                      ? WWPKG_ERR_DECOMPRESS
+                      : WWPKG_ERR_CORRUPT);
+    return nullptr;
 }
 
 wwpkg_package_t *wwpkg_open_fd(int fd)
@@ -4134,6 +4458,29 @@ wwpkg_package_t *wwpkg_open_fd(int fd)
         wwpkg_package_t *pkg = wwpkg_open_memory((const uint8_t *)mapped, file_size);
         munmap(mapped, file_size);
         return pkg;
+    }
+
+    /* Non-mmap fallback: authenticate outer envelope before allocating > 4 MiB buffers. */
+    if (file_size > WWAL_WWPKG_FRAME0_PREAUTH_MAX) {
+        uint8_t hdr[sizeof(wwpkg_outer_envelope_t)];
+        size_t h_rd = 0;
+        while (h_rd < sizeof(hdr)) {
+            ssize_t r = pread(fd, hdr + h_rd, sizeof(hdr) - h_rd, (off_t)h_rd);
+            if (r <= 0) {
+                if (r < 0 && errno == EINTR) {
+                    continue;
+                }
+                set_tls_error(WWPKG_ERR_IO);
+                return nullptr;
+            }
+            h_rd += (size_t)r;
+        }
+        int env_err = WWPKG_ERR_DECOMPRESS;
+        if (!verify_outer_envelope_bytes(hdr, sizeof(hdr), nullptr, &env_err)) {
+            set_tls_error((read_u32_le(hdr) == WWPKG_MAGIC_SKIPPABLE_ENV) ? env_err
+                                                                          : WWPKG_ERR_DECOMPRESS);
+            return nullptr;
+        }
     }
 
     uint8_t *raw_data = (uint8_t *)malloc(file_size);
@@ -4166,9 +4513,9 @@ wwpkg_package_t *wwpkg_open(const char *pkg_path)
         return nullptr;
     }
 
-    int fd = open(pkg_path, O_RDONLY | O_CLOEXEC);
+    int fd = open(pkg_path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
-        set_tls_error(WWPKG_ERR_IO);
+        set_tls_error((errno == ELOOP) ? WWPKG_ERR_PATH_TRAVERSAL : WWPKG_ERR_IO);
         return nullptr;
     }
     wwpkg_package_t *pkg = wwpkg_open_fd(fd);
@@ -4181,7 +4528,10 @@ wwpkg_package_t *wwpkg_open(const char *pkg_path)
     return pkg;
 }
 
-/* Pre-decompression Ed25519 + Frame 0 (< 64 KiB) fast-path via mmap without touching bulk frames */
+static bool verify_package_crypto_core_unlocked(const wwpkg_package_t *pkg,
+                                                uint8_t out_h_manifest[32]);
+
+/* Pre-decompression Ed25519 + Frame 0 fast-path via mmap without touching bulk frames */
 wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
 {
     if (!pkg_path) {
@@ -4189,9 +4539,9 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
         return nullptr;
     }
 
-    int fd = open(pkg_path, O_RDONLY | O_CLOEXEC);
+    int fd = open(pkg_path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
-        set_tls_error(WWPKG_ERR_IO);
+        set_tls_error((errno == ELOOP) ? WWPKG_ERR_PATH_TRAVERSAL : WWPKG_ERR_IO);
         return nullptr;
     }
 
@@ -4214,7 +4564,8 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
 
     size_t file_size = (size_t)st.st_size;
     const size_t k_init_map = 16384u;
-    const size_t k_fast_map_max = sizeof(wwpkg_outer_envelope_t) + WWPKG_FRAME0_MAX_BYTES + 8192u;
+    const size_t k_fast_map_max =
+        sizeof(wwpkg_outer_envelope_t) + WWAL_WWPKG_FRAME0_PREAUTH_MAX + 8192u;
     size_t map_len = file_size < k_init_map ? file_size : k_init_map;
     const uint8_t *map = (const uint8_t *)mmap(nullptr, map_len, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) {
@@ -4223,7 +4574,40 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
         return nullptr;
     }
 
-    if (file_size < 4 || read_u32_le(map) != WWPKG_MAGIC_SKIPPABLE_ENV) {
+    size_t env_off = 0;
+    while (file_size - env_off >= 8u &&
+           (read_u32_le(map + env_off) & 0xFFFFFFF0u) == 0x184D2A50u &&
+           read_u32_le(map + env_off) != WWPKG_MAGIC_SKIPPABLE_ENV) {
+        uint32_t skip_payload = read_u32_le(map + env_off + 4u);
+        if ((uint64_t)skip_payload > file_size - env_off - 8u) {
+            munmap((void *)map, map_len);
+            close(fd);
+            set_tls_error(WWPKG_ERR_CORRUPT);
+            return nullptr;
+        }
+        size_t total_skip = 8u + (size_t)skip_payload;
+        if (env_off + total_skip > k_fast_map_max) {
+            break;
+        }
+        if (env_off + total_skip > map_len) {
+            size_t big_len = file_size < k_fast_map_max ? file_size : k_fast_map_max;
+            const uint8_t *big_map =
+                (const uint8_t *)mmap(nullptr, big_len, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (big_map == MAP_FAILED) {
+                munmap((void *)map, map_len);
+                close(fd);
+                set_tls_error(WWPKG_ERR_IO);
+                return nullptr;
+            }
+            munmap((void *)map, map_len);
+            map = big_map;
+            map_len = big_len;
+        }
+        env_off += total_skip;
+    }
+
+    if (file_size - env_off < sizeof(wwpkg_outer_envelope_t) ||
+        read_u32_le(map + env_off) != WWPKG_MAGIC_SKIPPABLE_ENV) {
         /* Backward-compatible fallback for single-frame .wwpkg or uncompressed ustar archives */
         munmap((void *)map, map_len);
         wwpkg_package_t *pkg = wwpkg_open_fd(fd);
@@ -4236,7 +4620,7 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
             set_tls_error(WWPKG_ERR_IO);
             return nullptr;
         }
-        if (!wwpkg_verify_signature(pkg, nullptr)) {
+        if (!verify_package_crypto_core_unlocked(pkg, nullptr)) {
             set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
             wwpkg_close(pkg);
             return nullptr;
@@ -4245,9 +4629,24 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
         return pkg;
     }
 
+    if (env_off + sizeof(wwpkg_outer_envelope_t) > map_len) {
+        size_t big_len = file_size < k_fast_map_max ? file_size : k_fast_map_max;
+        const uint8_t *big_map =
+            (const uint8_t *)mmap(nullptr, big_len, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (big_map == MAP_FAILED) {
+            munmap((void *)map, map_len);
+            close(fd);
+            set_tls_error(WWPKG_ERR_IO);
+            return nullptr;
+        }
+        munmap((void *)map, map_len);
+        map = big_map;
+        map_len = big_len;
+    }
+
     wwpkg_outer_envelope_t env;
     int env_err = WWPKG_ERR_BAD_SIGNATURE;
-    if (!verify_outer_envelope_bytes(map, map_len, &env, &env_err)) {
+    if (!verify_outer_envelope_bytes(map + env_off, map_len - env_off, &env, &env_err)) {
         munmap((void *)map, map_len);
         close(fd);
         set_tls_error(env_err);
@@ -4262,8 +4661,9 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
         return nullptr;
     }
 
-    const uint8_t *f0_src = map + sizeof(wwpkg_outer_envelope_t);
-    size_t rem_size = map_len - sizeof(wwpkg_outer_envelope_t);
+    size_t f0_off = env_off + sizeof(wwpkg_outer_envelope_t);
+    const uint8_t *f0_src = map + f0_off;
+    size_t rem_size = map_len - f0_off;
     uint8_t *f0_buf = nullptr;
     size_t f0_len = 0;
 
@@ -4285,22 +4685,23 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
                 munmap((void *)map, map_len);
                 map = big_map;
                 map_len = big_len;
-                f0_src = map + sizeof(wwpkg_outer_envelope_t);
-                rem_size = map_len - sizeof(wwpkg_outer_envelope_t);
+                f0_src = map + f0_off;
+                rem_size = map_len - f0_off;
                 f0_csize = g_zstd.findFrameCompressedSize(f0_src, rem_size);
             }
         }
-        close(fd);
         if (g_zstd.isError(f0_csize) || f0_csize == 0 || f0_csize > rem_size) {
             munmap((void *)map, map_len);
+            close(fd);
             wwpkg_close(pkg);
             set_tls_error(WWPKG_ERR_DECOMPRESS);
             return nullptr;
         }
         unsigned long long content_sz = g_zstd.getFrameContentSize(f0_src, f0_csize);
         if (content_sz != 0xFFFFFFFFFFFFFFFFULL && content_sz != 0xFFFFFFFFFFFFFFFEULL) {
-            if (content_sz == 0 || content_sz > WWPKG_FRAME0_MAX_BYTES) {
+            if (content_sz == 0 || content_sz > WWAL_WWPKG_FRAME0_PREAUTH_MAX) {
                 munmap((void *)map, map_len);
+                close(fd);
                 wwpkg_close(pkg);
                 set_tls_error(WWPKG_ERR_DECOMPRESS);
                 return nullptr;
@@ -4311,6 +4712,7 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
                 f0_buf = (uint8_t *)malloc((size_t)content_sz);
                 if (!f0_buf) {
                     munmap((void *)map, map_len);
+                    close(fd);
                     wwpkg_close(pkg);
                     set_tls_error(WWPKG_ERR_IO);
                     return nullptr;
@@ -4322,6 +4724,7 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
                     free(f0_buf);
                 }
                 munmap((void *)map, map_len);
+                close(fd);
                 wwpkg_close(pkg);
                 set_tls_error(WWPKG_ERR_DECOMPRESS);
                 return nullptr;
@@ -4329,23 +4732,25 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
             f0_len = d_res;
         } else {
             int derr = WWPKG_ERR_DECOMPRESS;
-            if (!zstd_decompress_bounded(f0_src, f0_csize, WWPKG_FRAME0_MAX_BYTES, &f0_buf, &f0_len,
-                                         &derr)) {
+            if (!zstd_decompress_bounded(f0_src, f0_csize, WWAL_WWPKG_FRAME0_PREAUTH_MAX, &f0_buf,
+                                         &f0_len, &derr)) {
                 munmap((void *)map, map_len);
+                close(fd);
                 wwpkg_close(pkg);
                 set_tls_error(derr);
                 return nullptr;
             }
         }
     } else if (rem_size >= 512 && memcmp(f0_src + 257, "ustar", 5) == 0) {
-        close(fd);
-        size_t copy_sz = rem_size < WWPKG_FRAME0_MAX_BYTES ? rem_size : WWPKG_FRAME0_MAX_BYTES;
+        size_t copy_sz = rem_size < WWAL_WWPKG_FRAME0_PREAUTH_MAX ? rem_size
+                                                                  : WWAL_WWPKG_FRAME0_PREAUTH_MAX;
         if (copy_sz <= WWPKG_INLINE_F0_CAP) {
             f0_buf = pkg->inline_f0_buf;
         } else {
             f0_buf = (uint8_t *)malloc(copy_sz);
             if (!f0_buf) {
                 munmap((void *)map, map_len);
+                close(fd);
                 wwpkg_close(pkg);
                 set_tls_error(WWPKG_ERR_IO);
                 return nullptr;
@@ -4354,8 +4759,8 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
         memcpy(f0_buf, f0_src, copy_sz);
         f0_len = copy_sz;
     } else {
-        close(fd);
         munmap((void *)map, map_len);
+        close(fd);
         wwpkg_close(pkg);
         set_tls_error(WWPKG_ERR_CORRUPT);
         return nullptr;
@@ -4363,6 +4768,10 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
 
     munmap((void *)map, map_len);
 
+    /* Pin source_fd across the lifetime of the metadata handle so lazy promotion/extraction
+     * never re-opens source_path (eliminating symlink/FIFO TOCTOU). */
+    pkg->source_fd = fd;
+    pkg->source_st = st;
     pkg->decompressed_buf = f0_buf;
     pkg->decompressed_size = f0_len;
     pkg->outer_env = env;
@@ -4381,68 +4790,18 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
         return nullptr;
     }
 
-    /* Cross-check Frame 0 manifest and signature.sig against the verified outer Ed25519 header */
-    if (pkg->signature.version < 2 || pkg->signature.timestamp != env.timestamp_le ||
-        memcmp(pkg->signature.author_pubkey, env.author_pubkey, 32) != 0 ||
-        memcmp(pkg->manifest.author_pubkey, env.author_pubkey, 32) != 0 ||
-        memcmp(pkg->signature.merkle_root, env.merkle_root, 32) != 0 ||
-        memcmp(pkg->signature.signature, env.signature, 64) != 0) {
-        set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
+    int f0_err = WWPKG_ERR_BAD_SIGNATURE;
+    if (!verify_frame0_against_outer_env(pkg, &env, &f0_err)) {
         wwpkg_close(pkg);
+        set_tls_error(f0_err);
         return nullptr;
     }
 
-    /* Fast-path SHA-NI check when manifest.json is already stored in canonical JCS form */
-    uint8_t h_manifest[32];
-    if (pkg->has_raw_manifest_sha256) {
-        memcpy(h_manifest, pkg->raw_manifest_sha256, 32);
-    } else {
-        wwpkg_sha256((const uint8_t *)pkg->raw_manifest_str, pkg->raw_manifest_len, h_manifest);
-    }
-    if (memcmp(h_manifest, env.manifest_sha256, 32) != 0) {
-        size_t canon_len = 0;
-        char *canon_mf =
-            wwpkg_canonicalize_json(pkg->raw_manifest_str, pkg->raw_manifest_len, &canon_len);
-        if (!canon_mf) {
-            set_tls_error(WWPKG_ERR_BAD_MANIFEST);
-            wwpkg_close(pkg);
-            return nullptr;
-        }
-        wwpkg_sha256((const uint8_t *)canon_mf, canon_len, h_manifest);
-        free(canon_mf);
-
-        if (memcmp(h_manifest, env.manifest_sha256, 32) != 0) {
-            set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
-            wwpkg_close(pkg);
-            return nullptr;
-        }
-    }
-
-    /* Authenticate any preview or auxiliary entry present in Frame 0 before lazy promotion */
-    for (size_t i = 0; i < pkg->asset_count; i++) {
-        const char *aname = pkg->assets[i].name;
-        if (strcmp(aname, "manifest.json") == 0 || strcmp(aname, "signature.sig") == 0) {
-            continue;
-        }
-        if (!pkg->manifest.has_preview_sha256 ||
-            strcmp(aname, pkg->manifest.entrypoint_preview) != 0) {
-            set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
-            wwpkg_close(pkg);
-            return nullptr;
-        }
-        uint8_t actual_prev_sha[32];
-        wwpkg_sha256(pkg->assets[i].data, pkg->assets[i].size, actual_prev_sha);
-        if (memcmp(actual_prev_sha, pkg->manifest.preview_sha256, 32) != 0) {
-            set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
-            wwpkg_close(pkg);
-            return nullptr;
-        }
-    }
-
-    /* Also verify Frame 0 leaf integrity if zero bulk files exist */
     if (pkg->manifest.file_count == 0) {
         pkg->is_metadata_only = false;
-        if (!wwpkg_verify_signature(pkg, nullptr)) {
+        close(pkg->source_fd);
+        pkg->source_fd = -1;
+        if (!verify_package_crypto_core_unlocked(pkg, nullptr)) {
             set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
             wwpkg_close(pkg);
             return nullptr;
@@ -4453,9 +4812,7 @@ wwpkg_package_t *wwpkg_open_metadata_only(const char *pkg_path)
     return pkg;
 }
 
-static bool verify_package_crypto_core(const wwpkg_package_t *pkg, uint8_t out_h_manifest[32]);
-
-static bool wwpkg_promote_metadata_pkg(wwpkg_package_t *pkg)
+static bool wwpkg_promote_metadata_pkg_locked(wwpkg_package_t *pkg)
 {
     if (!pkg) {
         return false;
@@ -4463,23 +4820,26 @@ static bool wwpkg_promote_metadata_pkg(wwpkg_package_t *pkg)
     if (!pkg->is_metadata_only) {
         return true;
     }
-    if (!pkg->source_path) {
-        pkg->last_error = WWPKG_ERR_IO;
-        set_tls_error(WWPKG_ERR_IO);
+    if (!verify_source_fd_and_path_identity(pkg)) {
+        pkg->last_error = WWPKG_ERR_BAD_SIGNATURE;
+        set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
         return false;
     }
 
-    wwpkg_package_t *full = wwpkg_open(pkg->source_path);
+    wwpkg_package_t *full = wwpkg_open_fd(pkg->source_fd);
     if (!full) {
-        pkg->last_error = g_tls_last_error;
+        pkg->last_error = g_tls_last_error ? g_tls_last_error : WWPKG_ERR_BAD_SIGNATURE;
         return false;
     }
 
-    /* Reject path-swap TOCTOU or bulk payload tampering before replacing metadata state. */
-    if (!full->has_manifest || !full->has_signature || full->is_metadata_only ||
-        full->signature.version != pkg->signature.version ||
+    /* Re-verify identity after mmap/pread and confirm Frame 0 matches full archive verbatim. */
+    if (!verify_source_fd_and_path_identity(pkg) || !full->has_manifest || !full->has_signature ||
+        full->is_metadata_only || full->signature.version != pkg->signature.version ||
         full->signature.timestamp != pkg->signature.timestamp ||
+        full->signature.has_notary_countersign != pkg->signature.has_notary_countersign ||
         memcmp(full->signature.signature, pkg->signature.signature, WWPKG_SIGNATURE_BYTES) != 0 ||
+        memcmp(full->signature.notary_signature, pkg->signature.notary_signature,
+               WWPKG_SIGNATURE_BYTES) != 0 ||
         memcmp(full->signature.author_pubkey, pkg->signature.author_pubkey, WWPKG_PUBKEY_BYTES) !=
             0 ||
         memcmp(full->manifest.author_pubkey, pkg->manifest.author_pubkey, WWPKG_PUBKEY_BYTES) !=
@@ -4488,15 +4848,15 @@ static bool wwpkg_promote_metadata_pkg(wwpkg_package_t *pkg)
             0 ||
         full->raw_manifest_len != pkg->raw_manifest_len ||
         memcmp(full->raw_manifest_str, pkg->raw_manifest_str, pkg->raw_manifest_len) != 0 ||
-        !verify_package_crypto_core(full, nullptr)) {
+        !verify_package_crypto_core_unlocked(full, nullptr)) {
         wwpkg_close(full);
         pkg->last_error = WWPKG_ERR_BAD_SIGNATURE;
         set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
         return false;
     }
 
-    /* Retain heap Frame 0 storage until wwpkg_close so prior wwpkg_read_asset pointers stay live.
-     */
+    /* Retain heap Frame 0 storage so prior wwpkg_read_asset pointers stay live; leave
+     * manifest/signature/raw_manifest_str untouched for concurrent readers. */
     if (pkg->decompressed_buf != pkg->inline_f0_buf) {
         free(pkg->retained_f0_buf);
         pkg->retained_f0_buf = pkg->decompressed_buf;
@@ -4504,18 +4864,7 @@ static bool wwpkg_promote_metadata_pkg(wwpkg_package_t *pkg)
     if (pkg->assets != pkg->inline_assets) {
         free(pkg->assets);
     }
-    if (pkg->raw_manifest_str != pkg->inline_manifest_str) {
-        free(pkg->raw_manifest_str);
-    }
-
-    pkg->manifest = full->manifest;
-    pkg->signature = full->signature;
-    pkg->outer_env = full->outer_env;
-    pkg->has_manifest = full->has_manifest;
-    pkg->has_signature = full->has_signature;
-    pkg->has_outer_env = full->has_outer_env;
-    pkg->outer_auth_verified = full->outer_auth_verified;
-    pkg->is_metadata_only = false;
+    free(pkg->asset_ht);
 
     pkg->decompressed_buf = full->decompressed_buf;
     pkg->decompressed_size = full->decompressed_size;
@@ -4534,17 +4883,14 @@ static bool wwpkg_promote_metadata_pkg(wwpkg_package_t *pkg)
         full->assets = full->inline_assets;
     }
     pkg->asset_count = full->asset_count;
+    pkg->asset_ht = full->asset_ht;
+    pkg->asset_ht_cap = full->asset_ht_cap;
+    full->asset_ht = nullptr;
+    full->asset_ht_cap = 0;
 
-    if (full->raw_manifest_str == full->inline_manifest_str) {
-        memcpy(pkg->inline_manifest_str, full->inline_manifest_str, full->raw_manifest_len + 1);
-        pkg->raw_manifest_str = pkg->inline_manifest_str;
-    } else {
-        pkg->raw_manifest_str = full->raw_manifest_str;
-        full->raw_manifest_str = full->inline_manifest_str;
-    }
-    pkg->raw_manifest_len = full->raw_manifest_len;
-    memcpy(pkg->raw_manifest_sha256, full->raw_manifest_sha256, 32);
-    pkg->has_raw_manifest_sha256 = full->has_raw_manifest_sha256;
+    pkg->is_metadata_only = false;
+    close(pkg->source_fd);
+    pkg->source_fd = -1;
 
     wwpkg_close(full);
     return true;
@@ -4552,39 +4898,30 @@ static bool wwpkg_promote_metadata_pkg(wwpkg_package_t *pkg)
 
 const uint8_t *wwpkg_read_asset(wwpkg_package_t *pkg, const char *rel_path, size_t *out_size)
 {
+    if (out_size) {
+        *out_size = 0;
+    }
     if (!pkg || !rel_path) {
-        if (out_size)
-            *out_size = 0;
         return nullptr;
     }
     char clean[WWPKG_MAX_PATH_LEN];
     if (!sanitize_archive_path(rel_path, clean, sizeof(clean))) {
-        if (out_size)
-            *out_size = 0;
         return nullptr;
     }
 
-    for (size_t i = 0; i < pkg->asset_count; i++) {
-        if (strcmp(pkg->assets[i].name, clean) == 0) {
-            if (out_size)
-                *out_size = pkg->assets[i].size;
-            return pkg->assets[i].data;
-        }
+    pthread_mutex_lock(&pkg->lock);
+    const pkg_asset_entry_t *found = pkg_find_asset_locked(pkg, clean);
+    if (!found && pkg->is_metadata_only && wwpkg_promote_metadata_pkg_locked(pkg)) {
+        found = pkg_find_asset_locked(pkg, clean);
     }
+    const uint8_t *ret_data = found ? found->data : nullptr;
+    size_t ret_sz = found ? found->size : 0;
+    pthread_mutex_unlock(&pkg->lock);
 
-    if (pkg->is_metadata_only && wwpkg_promote_metadata_pkg(pkg)) {
-        for (size_t i = 0; i < pkg->asset_count; i++) {
-            if (strcmp(pkg->assets[i].name, clean) == 0) {
-                if (out_size)
-                    *out_size = pkg->assets[i].size;
-                return pkg->assets[i].data;
-            }
-        }
+    if (out_size) {
+        *out_size = ret_sz;
     }
-
-    if (out_size)
-        *out_size = 0;
-    return nullptr;
+    return ret_data;
 }
 
 /* ========================================================================= */
@@ -4885,7 +5222,8 @@ static bool load_trust_store_file(const char *path, parsed_trust_store_t *store)
 static bool wwpkg_stream_metadata_pkg(const wwpkg_package_t *meta_pkg, int extract_dfd,
                                       uint8_t out_h_manifest[32], int *out_err);
 
-static bool verify_package_crypto_core(const wwpkg_package_t *pkg, uint8_t out_h_manifest[32])
+static bool verify_package_crypto_core_unlocked(const wwpkg_package_t *pkg,
+                                                uint8_t out_h_manifest[32])
 {
     if (!pkg || !pkg->has_manifest || !pkg->has_signature) {
         return false;
@@ -5012,17 +5350,9 @@ static bool verify_package_crypto_core(const wwpkg_package_t *pkg, uint8_t out_h
     }
 
     if (pkg->signature.has_notary_countersign == 1u) {
-        if (!ed25519_scalar_is_canonical(pkg->signature.notary_signature + 32)) {
-            return false;
-        }
-        bool all_zero = true;
-        for (int i = 0; i < 64; i++) {
-            if (pkg->signature.notary_signature[i] != 0) {
-                all_zero = false;
-                break;
-            }
-        }
-        if (all_zero) {
+        if (!ed25519_scalar_is_canonical(pkg->signature.notary_signature + 32) ||
+            !ed25519_field_is_canonical(pkg->signature.notary_signature) ||
+            ed25519_point_has_small_order(pkg->signature.notary_signature)) {
             return false;
         }
     }
@@ -5033,11 +5363,11 @@ static bool verify_package_crypto_core(const wwpkg_package_t *pkg, uint8_t out_h
     return true;
 }
 
-wwpkg_trust_level_t wwpkg_verify_trust_with_store(const wwpkg_package_t *pkg,
-                                                  const char *trusted_keys_path)
+static wwpkg_trust_level_t wwpkg_verify_trust_with_store_locked(const wwpkg_package_t *pkg,
+                                                              const char *trusted_keys_path)
 {
     uint8_t h_manifest[32];
-    if (!verify_package_crypto_core(pkg, h_manifest)) {
+    if (!verify_package_crypto_core_unlocked(pkg, h_manifest)) {
         set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
         return WWPKG_TRUST_INVALID;
     }
@@ -5095,6 +5425,19 @@ wwpkg_trust_level_t wwpkg_verify_trust_with_store(const wwpkg_package_t *pkg,
     return WWPKG_TRUST_UNTRUSTED;
 }
 
+wwpkg_trust_level_t wwpkg_verify_trust_with_store(const wwpkg_package_t *pkg,
+                                                  const char *trusted_keys_path)
+{
+    if (!pkg) {
+        set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
+        return WWPKG_TRUST_INVALID;
+    }
+    pthread_mutex_lock(&((wwpkg_package_t *)pkg)->lock);
+    wwpkg_trust_level_t lvl = wwpkg_verify_trust_with_store_locked(pkg, trusted_keys_path);
+    pthread_mutex_unlock(&((wwpkg_package_t *)pkg)->lock);
+    return lvl;
+}
+
 wwpkg_trust_level_t wwpkg_verify_trust(const wwpkg_package_t *pkg)
 {
     return wwpkg_verify_trust_with_store(pkg, nullptr);
@@ -5102,8 +5445,17 @@ wwpkg_trust_level_t wwpkg_verify_trust(const wwpkg_package_t *pkg)
 
 bool wwpkg_verify_signature(const wwpkg_package_t *pkg, bool *out_is_trusted)
 {
+    if (!pkg) {
+        if (out_is_trusted) {
+            *out_is_trusted = false;
+        }
+        set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
+        return false;
+    }
     if (!out_is_trusted) {
-        bool ok = verify_package_crypto_core(pkg, nullptr);
+        pthread_mutex_lock(&((wwpkg_package_t *)pkg)->lock);
+        bool ok = verify_package_crypto_core_unlocked(pkg, nullptr);
+        pthread_mutex_unlock(&((wwpkg_package_t *)pkg)->lock);
         set_tls_error(ok ? WWPKG_OK : WWPKG_ERR_BAD_SIGNATURE);
         return ok;
     }
@@ -5366,10 +5718,17 @@ typedef struct {
     merkle_leaf_node_t *leaves;
     size_t leaf_count;
     size_t leaf_cap;
+    uint32_t *leaf_ht;
+    size_t leaf_ht_cap;
 
     uint32_t payload_files;
     uint64_t payload_bytes;
 } tar_stream_ctx_t;
+
+static const char *tar_leaf_get_name(const void *ctx, uint32_t idx)
+{
+    return ((const merkle_leaf_node_t *)ctx)[idx].name;
+}
 
 static void tar_stream_ctx_cleanup(tar_stream_ctx_t *ts, bool rollback_files)
 {
@@ -5393,13 +5752,21 @@ static void tar_stream_ctx_cleanup(tar_stream_ctx_t *ts, bool rollback_files)
     ts->mf_buf = nullptr;
     free(ts->leaves);
     ts->leaves = nullptr;
+    free(ts->leaf_ht);
+    ts->leaf_ht = nullptr;
+    ts->leaf_ht_cap = 0;
 }
 
 static bool tar_stream_finish_entry(tar_stream_ctx_t *ts)
 {
     if (ts->cur_out_fd >= 0) {
+        bool sync_ok = (fsync(ts->cur_out_fd) == 0);
         close(ts->cur_out_fd);
         ts->cur_out_fd = -1;
+        if (!sync_ok) {
+            ts->err_code = WWPKG_ERR_IO;
+            return false;
+        }
     }
 
     if (ts->cur_is_sig) {
@@ -5425,8 +5792,8 @@ static bool tar_stream_finish_entry(tar_stream_ctx_t *ts)
 
         if (ts->leaf_count >= ts->leaf_cap) {
             size_t ncap = ts->leaf_cap ? ts->leaf_cap * 2u : 16u;
-            if (ncap > WWPKG_MAX_FILE_COUNT + 2u) {
-                ncap = WWPKG_MAX_FILE_COUNT + 2u;
+            if (ncap > WWPKG_MAX_FILE_COUNT + 1u) {
+                ncap = WWPKG_MAX_FILE_COUNT + 1u;
             }
             if (ts->leaf_count >= ncap) {
                 ts->err_code = WWPKG_ERR_DECOMPRESS;
@@ -5443,9 +5810,25 @@ static bool tar_stream_finish_entry(tar_stream_ctx_t *ts)
         }
 
         size_t nlen = strlen(ts->cur_name);
-        memcpy(ts->leaves[ts->leaf_count].name, ts->cur_name, nlen + 1u);
-        sha256_final(&ts->leaf_ctx, ts->leaves[ts->leaf_count].hash);
+        uint32_t new_idx = (uint32_t)ts->leaf_count;
+        memcpy(ts->leaves[new_idx].name, ts->cur_name, nlen + 1u);
+        sha256_final(&ts->leaf_ctx, ts->leaves[new_idx].hash);
         ts->leaf_count++;
+
+        if (ts->leaf_count >= 8u) {
+            if (!ts->leaf_ht || ts->leaf_count * 2u >= ts->leaf_ht_cap) {
+                if (!pkg_ht_rehash(&ts->leaf_ht, &ts->leaf_ht_cap, ts->leaf_count,
+                                   tar_leaf_get_name, ts->leaves)) {
+                    ts->err_code = WWPKG_ERR_IO;
+                    return false;
+                }
+            } else {
+                uint32_t slot = 0;
+                (void)pkg_ht_find(ts->leaf_ht, ts->leaf_ht_cap, ts->cur_name, tar_leaf_get_name,
+                                  ts->leaves, &slot);
+                ts->leaf_ht[slot] = new_idx;
+            }
+        }
     }
 
     ts->cur_name[0] = '\0';
@@ -5566,13 +5949,21 @@ static bool tar_stream_consume(tar_stream_ctx_t *ts, const uint8_t *buf, size_t 
                 ts->cur_is_prev = false;
                 ts->sig_pos = 0;
             } else {
-                for (size_t i = 0; i < ts->leaf_count; i++) {
-                    if (strcmp(ts->leaves[i].name, clean_name) == 0) {
+                if (ts->leaf_ht && ts->leaf_ht_cap > 0) {
+                    if (pkg_ht_find(ts->leaf_ht, ts->leaf_ht_cap, clean_name, tar_leaf_get_name,
+                                    ts->leaves, nullptr) != UINT32_MAX) {
                         ts->err_code = WWPKG_ERR_CORRUPT;
                         return false;
                     }
+                } else {
+                    for (size_t i = 0; i < ts->leaf_count; i++) {
+                        if (strcmp(ts->leaves[i].name, clean_name) == 0) {
+                            ts->err_code = WWPKG_ERR_CORRUPT;
+                            return false;
+                        }
+                    }
                 }
-                if (ts->leaf_count + (ts->saw_sig ? 1u : 0u) >= WWPKG_MAX_FILE_COUNT) {
+                if (ts->leaf_count >= WWPKG_MAX_FILE_COUNT + 1u) {
                     ts->err_code = WWPKG_ERR_DECOMPRESS;
                     return false;
                 }
@@ -5689,15 +6080,55 @@ static bool tar_stream_consume(tar_stream_ctx_t *ts, const uint8_t *buf, size_t 
     return true;
 }
 
-static bool stat_identity_unchanged(int fd, const struct stat *before)
+static bool verify_stream_frame0_auth(const tar_stream_ctx_t *ts, const wwpkg_package_t *meta_pkg,
+                                      const wwpkg_outer_envelope_t *outer_env, int *out_err)
 {
-    struct stat after;
-    if (fstat(fd, &after) != 0) {
+    if (!ts->saw_mf || !ts->saw_sig || ts->sig.version != meta_pkg->signature.version ||
+        ts->sig.timestamp != meta_pkg->signature.timestamp ||
+        ts->sig.has_notary_countersign != meta_pkg->signature.has_notary_countersign ||
+        memcmp(ts->sig.signature, meta_pkg->signature.signature, WWPKG_SIGNATURE_BYTES) != 0 ||
+        memcmp(ts->sig.author_pubkey, meta_pkg->signature.author_pubkey, WWPKG_PUBKEY_BYTES) != 0 ||
+        memcmp(ts->sig.merkle_root, meta_pkg->signature.merkle_root, WWPKG_MERKLE_ROOT_BYTES) != 0 ||
+        memcmp(ts->sig.notary_signature, meta_pkg->signature.notary_signature,
+               WWPKG_SIGNATURE_BYTES) != 0 ||
+        ts->mf_size != meta_pkg->raw_manifest_len ||
+        memcmp(ts->mf_buf, meta_pkg->raw_manifest_str, ts->mf_size) != 0) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
         return false;
     }
-    return after.st_dev == before->st_dev && after.st_ino == before->st_ino &&
-           after.st_size == before->st_size && after.st_mtim.tv_sec == before->st_mtim.tv_sec &&
-           after.st_mtim.tv_nsec == before->st_mtim.tv_nsec;
+
+    size_t canon_len = 0;
+    char *canon = wwpkg_canonicalize_json(ts->mf_buf, ts->mf_size, &canon_len);
+    if (!canon) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_MANIFEST;
+        return false;
+    }
+    uint8_t h_mf[32];
+    wwpkg_sha256((const uint8_t *)canon, canon_len, h_mf);
+    free(canon);
+
+    if (outer_env->timestamp_le != meta_pkg->signature.timestamp ||
+        memcmp(outer_env->author_pubkey, meta_pkg->signature.author_pubkey, 32) != 0 ||
+        memcmp(outer_env->merkle_root, meta_pkg->signature.merkle_root, 32) != 0 ||
+        memcmp(outer_env->manifest_sha256, h_mf, 32) != 0 ||
+        memcmp(outer_env->signature, meta_pkg->signature.signature, 64) != 0) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        return false;
+    }
+
+    uint8_t sign_payload[85];
+    build_sign_payload(meta_pkg->signature.version, h_mf, meta_pkg->signature.merkle_root,
+                       meta_pkg->signature.timestamp, sign_payload);
+    if (wwpkg_ed25519_verify(meta_pkg->signature.signature, sign_payload, sizeof(sign_payload),
+                             meta_pkg->signature.author_pubkey) != 0) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        return false;
+    }
+    return true;
 }
 
 static bool wwpkg_stream_metadata_pkg_bytes(const wwpkg_package_t *meta_pkg,
@@ -5775,11 +6206,13 @@ static bool wwpkg_stream_metadata_pkg_bytes(const wwpkg_package_t *meta_pkg,
     const size_t max_tar_stream = WWPKG_MAX_ARCHIVE_BYTES + (8ULL * 1024ULL * 1024ULL);
 
     if (stream_len >= 4u && read_u32_le(stream_ptr) == WWPKG_MAGIC_ZSTD) {
-        zstd_probe();
-        if (!g_zstd_available) {
+        size_t f0_csize = 0;
+        int f0_err = WWPKG_ERR_DECOMPRESS;
+        if (!zstd_first_frame_within_cap(stream_ptr, stream_len, WWAL_WWPKG_FRAME0_PREAUTH_MAX,
+                                         &f0_csize, &f0_err)) {
             tar_stream_ctx_cleanup(&ts, true);
             if (out_err)
-                *out_err = WWPKG_ERR_DECOMPRESS;
+                *out_err = f0_err;
             return false;
         }
         zstd_dstream_t *dstream = g_zstd.createDStream();
@@ -5800,9 +6233,10 @@ static bool wwpkg_stream_metadata_pkg_bytes(const wwpkg_package_t *meta_pkg,
 
         uint8_t scratch[65536];
         size_t total_out = 0;
-        zstd_in_buffer_t in_buf = {.src = stream_ptr, .size = stream_len, .pos = 0};
+        zstd_in_buffer_t in_buf = {.src = stream_ptr, .size = f0_csize, .pos = 0};
         size_t last_ret = 0;
 
+        /* Cap Frame-0 output at 4 MiB and authenticate it before bulk frames decompress. */
         while (in_buf.pos < in_buf.size || last_ret != 0) {
             size_t prev_in = in_buf.pos;
             zstd_out_buffer_t out_chunk = {.dst = scratch, .size = sizeof(scratch), .pos = 0};
@@ -5815,7 +6249,7 @@ static bool wwpkg_stream_metadata_pkg_bytes(const wwpkg_package_t *meta_pkg,
                 return false;
             }
             if (out_chunk.pos > 0) {
-                if (out_chunk.pos > max_tar_stream - total_out) {
+                if (out_chunk.pos > WWAL_WWPKG_FRAME0_PREAUTH_MAX - total_out) {
                     g_zstd.freeDStream(dstream);
                     tar_stream_ctx_cleanup(&ts, true);
                     if (out_err)
@@ -5840,6 +6274,66 @@ static bool wwpkg_stream_metadata_pkg_bytes(const wwpkg_package_t *meta_pkg,
                     return false;
                 }
                 break;
+            }
+        }
+
+        if (f0_csize < stream_len) {
+            if (!has_outer) {
+                g_zstd.freeDStream(dstream);
+                tar_stream_ctx_cleanup(&ts, true);
+                if (out_err)
+                    *out_err = WWPKG_ERR_DECOMPRESS;
+                return false;
+            }
+            int auth_err = WWPKG_ERR_BAD_SIGNATURE;
+            if (!verify_stream_frame0_auth(&ts, meta_pkg, &outer_env, &auth_err)) {
+                g_zstd.freeDStream(dstream);
+                tar_stream_ctx_cleanup(&ts, true);
+                if (out_err)
+                    *out_err = auth_err;
+                return false;
+            }
+
+            in_buf.size = stream_len;
+            last_ret = 0;
+            while (in_buf.pos < in_buf.size || last_ret != 0) {
+                size_t prev_in = in_buf.pos;
+                zstd_out_buffer_t out_chunk = {.dst = scratch, .size = sizeof(scratch), .pos = 0};
+                last_ret = g_zstd.decompressStream(dstream, &out_chunk, &in_buf);
+                if (g_zstd.isError(last_ret)) {
+                    g_zstd.freeDStream(dstream);
+                    tar_stream_ctx_cleanup(&ts, true);
+                    if (out_err)
+                        *out_err = WWPKG_ERR_DECOMPRESS;
+                    return false;
+                }
+                if (out_chunk.pos > 0) {
+                    if (out_chunk.pos > max_tar_stream - total_out) {
+                        g_zstd.freeDStream(dstream);
+                        tar_stream_ctx_cleanup(&ts, true);
+                        if (out_err)
+                            *out_err = WWPKG_ERR_DECOMPRESS;
+                        return false;
+                    }
+                    total_out += out_chunk.pos;
+                    if (!tar_stream_consume(&ts, scratch, out_chunk.pos)) {
+                        g_zstd.freeDStream(dstream);
+                        if (out_err)
+                            *out_err = ts.err_code;
+                        tar_stream_ctx_cleanup(&ts, true);
+                        return false;
+                    }
+                }
+                if (in_buf.pos == prev_in && out_chunk.pos == 0) {
+                    if (last_ret != 0 || in_buf.pos < in_buf.size) {
+                        g_zstd.freeDStream(dstream);
+                        tar_stream_ctx_cleanup(&ts, true);
+                        if (out_err)
+                            *out_err = WWPKG_ERR_DECOMPRESS;
+                        return false;
+                    }
+                    break;
+                }
             }
         }
         g_zstd.freeDStream(dstream);
@@ -5942,20 +6436,9 @@ static bool wwpkg_stream_metadata_pkg_bytes(const wwpkg_package_t *meta_pkg,
     }
 
     if (meta_pkg->signature.has_notary_countersign == 1u) {
-        if (!ed25519_scalar_is_canonical(meta_pkg->signature.notary_signature + 32)) {
-            if (out_err)
-                *out_err = WWPKG_ERR_BAD_SIGNATURE;
-            tar_stream_ctx_cleanup(&ts, true);
-            return false;
-        }
-        bool all_zero = true;
-        for (int i = 0; i < 64; i++) {
-            if (meta_pkg->signature.notary_signature[i] != 0) {
-                all_zero = false;
-                break;
-            }
-        }
-        if (all_zero) {
+        if (!ed25519_scalar_is_canonical(meta_pkg->signature.notary_signature + 32) ||
+            !ed25519_field_is_canonical(meta_pkg->signature.notary_signature) ||
+            ed25519_point_has_small_order(meta_pkg->signature.notary_signature)) {
             if (out_err)
                 *out_err = WWPKG_ERR_BAD_SIGNATURE;
             tar_stream_ctx_cleanup(&ts, true);
@@ -6016,132 +6499,243 @@ static bool wwpkg_map_or_read_open_fd(int fd, size_t file_size, const uint8_t **
     return true;
 }
 
-static bool wwpkg_stream_metadata_pkg(const wwpkg_package_t *meta_pkg, int extract_dfd,
-                                      uint8_t out_h_manifest[32], int *out_err)
+static bool wwpkg_map_or_read_pinned_pkg(const wwpkg_package_t *pkg, const uint8_t **out_bytes,
+                                         size_t *out_size, void **out_mapped, uint8_t **out_heap,
+                                         int *out_err)
 {
-    if (!meta_pkg || !meta_pkg->source_path) {
+    if (!verify_source_fd_and_path_identity(pkg)) {
         if (out_err)
-            *out_err = WWPKG_ERR_IO;
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
         return false;
     }
-
-    int fd = open(meta_pkg->source_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
+    if (!S_ISREG(pkg->source_st.st_mode) || pkg->source_st.st_size <= 0) {
         if (out_err)
-            *out_err = WWPKG_ERR_IO;
+            *out_err = (S_ISREG(pkg->source_st.st_mode) && pkg->source_st.st_size == 0)
+                           ? WWPKG_ERR_CORRUPT
+                           : WWPKG_ERR_IO;
         return false;
     }
-
-    struct stat st;
-    int fstat_rc = fstat(fd, &st);
-    if (fstat_rc != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
-        close(fd);
-        if (out_err)
-            *out_err = (fstat_rc == 0 && S_ISREG(st.st_mode) && st.st_size == 0) ? WWPKG_ERR_CORRUPT
-                                                                                 : WWPKG_ERR_IO;
-        return false;
-    }
-    if ((uint64_t)st.st_size > WWPKG_MAX_ARCHIVE_BYTES) {
-        close(fd);
+    if ((uint64_t)pkg->source_st.st_size > WWPKG_MAX_ARCHIVE_BYTES) {
         if (out_err)
             *out_err = WWPKG_ERR_DECOMPRESS;
         return false;
     }
-
-    size_t file_size = (size_t)st.st_size;
-    const uint8_t *bytes = nullptr;
-    void *mapped = MAP_FAILED;
-    uint8_t *raw_data = nullptr;
-    if (!wwpkg_map_or_read_open_fd(fd, file_size, &bytes, &mapped, &raw_data, out_err)) {
-        close(fd);
+    size_t file_size = (size_t)pkg->source_st.st_size;
+    if (!wwpkg_map_or_read_open_fd(pkg->source_fd, file_size, out_bytes, out_mapped, out_heap,
+                                   out_err)) {
         return false;
     }
+    *out_size = file_size;
+    return true;
+}
 
-    bool ok = wwpkg_stream_metadata_pkg_bytes(meta_pkg, bytes, file_size, extract_dfd, fd, &st,
-                                              out_h_manifest, out_err);
+static void wwpkg_unmap_pinned_pkg(size_t file_size, void *mapped, uint8_t *heap)
+{
     if (mapped != MAP_FAILED) {
         munmap(mapped, file_size);
     }
-    free(raw_data);
-    close(fd);
+    free(heap);
+}
+
+static bool wwpkg_stream_metadata_pkg(const wwpkg_package_t *meta_pkg, int extract_dfd,
+                                      uint8_t out_h_manifest[32], int *out_err)
+{
+    const uint8_t *bytes = nullptr;
+    size_t file_size = 0;
+    void *mapped = MAP_FAILED;
+    uint8_t *raw_data = nullptr;
+    if (!wwpkg_map_or_read_pinned_pkg(meta_pkg, &bytes, &file_size, &mapped, &raw_data, out_err)) {
+        return false;
+    }
+
+    bool ok = wwpkg_stream_metadata_pkg_bytes(meta_pkg, bytes, file_size, extract_dfd,
+                                              meta_pkg->source_fd, &meta_pkg->source_st,
+                                              out_h_manifest, out_err);
+    if (ok && !verify_source_fd_and_path_identity(meta_pkg)) {
+        if (out_err)
+            *out_err = WWPKG_ERR_BAD_SIGNATURE;
+        ok = false;
+    }
+    wwpkg_unmap_pinned_pkg(file_size, mapped, raw_data);
+    return ok;
+}
+
+static void wwpkg_rmtree_at(int parent_dfd, const char *name, uint32_t depth)
+{
+    if (depth > 64u) {
+        return;
+    }
+    int sub_dfd = openat(parent_dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (sub_dfd < 0) {
+        (void)unlinkat(parent_dfd, name, 0);
+        return;
+    }
+    DIR *d = fdopendir(sub_dfd);
+    if (!d) {
+        close(sub_dfd);
+        return;
+    }
+    struct dirent *ent = nullptr;
+    while ((ent = readdir(d)) != nullptr) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        struct stat st;
+        if (fstatat(sub_dfd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            wwpkg_rmtree_at(sub_dfd, ent->d_name, depth + 1u);
+        } else {
+            (void)unlinkat(sub_dfd, ent->d_name, 0);
+        }
+    }
+    closedir(d);
+    (void)unlinkat(parent_dfd, name, AT_REMOVEDIR);
+}
+
+static int wwpkg_create_stage_dir(int root_dfd, char out_name[64])
+{
+    for (int attempt = 0; attempt < 16; attempt++) {
+        uint32_t rnd = 0;
+        if (secure_random_bytes((uint8_t *)&rnd, sizeof(rnd)) != 0) {
+            rnd = (uint32_t)attempt ^ (uint32_t)getpid();
+        }
+        int n = snprintf(out_name, 64, ".wwpkg-stage.%d.%08x", (int)getpid(), rnd);
+        if (n <= 0 || n >= 64) {
+            return -1;
+        }
+        if (mkdirat(root_dfd, out_name, 0700) == 0) {
+            int stage_dfd =
+                openat(root_dfd, out_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (stage_dfd < 0) {
+                (void)unlinkat(root_dfd, out_name, AT_REMOVEDIR);
+                return -1;
+            }
+            return stage_dfd;
+        }
+        if (errno != EEXIST) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+static bool wwpkg_promote_staged_tree(int src_dfd, int dst_dfd, uint32_t depth)
+{
+    if (depth > 64u) {
+        return false;
+    }
+    int dup_src = fcntl(src_dfd, F_DUPFD_CLOEXEC, 0);
+    if (dup_src < 0) {
+        return false;
+    }
+    DIR *d = fdopendir(dup_src);
+    if (!d) {
+        close(dup_src);
+        return false;
+    }
+
+    bool ok = true;
+    struct dirent *ent = nullptr;
+    while (ok && (ent = readdir(d)) != nullptr) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        struct stat st;
+        if (fstatat(src_dfd, ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            ok = false;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (mkdirat(dst_dfd, ent->d_name, 0755) != 0 && errno != EEXIST) {
+                ok = false;
+                break;
+            }
+            int sub_src =
+                openat(src_dfd, ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            int sub_dst =
+                openat(dst_dfd, ent->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (sub_src < 0 || sub_dst < 0 ||
+                !wwpkg_promote_staged_tree(sub_src, sub_dst, depth + 1u)) {
+                ok = false;
+            }
+            if (sub_src >= 0) {
+                close(sub_src);
+            }
+            if (sub_dst >= 0) {
+                close(sub_dst);
+            }
+            if (ok) {
+                (void)unlinkat(src_dfd, ent->d_name, AT_REMOVEDIR);
+            }
+        } else {
+            if (renameat(src_dfd, ent->d_name, dst_dfd, ent->d_name) != 0) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    closedir(d);
+
+    if (ok && fsync(dst_dfd) != 0 && errno != EINVAL) {
+        ok = false;
+    }
     return ok;
 }
 
 static bool wwpkg_verify_and_extract_metadata_pkg(const wwpkg_package_t *meta_pkg,
                                                   const char *dest_dir, int *out_err)
 {
-    if (!meta_pkg || !meta_pkg->source_path) {
-        if (out_err)
-            *out_err = WWPKG_ERR_IO;
-        return false;
-    }
-
-    int fd = open(meta_pkg->source_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        if (out_err)
-            *out_err = WWPKG_ERR_IO;
-        return false;
-    }
-
-    struct stat st;
-    int fstat_rc = fstat(fd, &st);
-    if (fstat_rc != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
-        close(fd);
-        if (out_err)
-            *out_err = (fstat_rc == 0 && S_ISREG(st.st_mode) && st.st_size == 0) ? WWPKG_ERR_CORRUPT
-                                                                                 : WWPKG_ERR_IO;
-        return false;
-    }
-    if ((uint64_t)st.st_size > WWPKG_MAX_ARCHIVE_BYTES) {
-        close(fd);
-        if (out_err)
-            *out_err = WWPKG_ERR_DECOMPRESS;
-        return false;
-    }
-
-    size_t file_size = (size_t)st.st_size;
     const uint8_t *bytes = nullptr;
+    size_t file_size = 0;
     void *mapped = MAP_FAILED;
     uint8_t *raw_data = nullptr;
-    if (!wwpkg_map_or_read_open_fd(fd, file_size, &bytes, &mapped, &raw_data, out_err)) {
-        close(fd);
-        return false;
-    }
-
-    int verr = WWPKG_ERR_BAD_SIGNATURE;
-    if (!wwpkg_stream_metadata_pkg_bytes(meta_pkg, bytes, file_size, -1, fd, &st, nullptr, &verr)) {
-        if (mapped != MAP_FAILED) {
-            munmap(mapped, file_size);
-        }
-        free(raw_data);
-        close(fd);
-        if (out_err)
-            *out_err = verr;
+    if (!wwpkg_map_or_read_pinned_pkg(meta_pkg, &bytes, &file_size, &mapped, &raw_data, out_err)) {
         return false;
     }
 
     int derr = WWPKG_ERR_IO;
     int root_dfd = wwpkg_mkdir_p_and_open_dfd(dest_dir, &derr);
     if (root_dfd < 0) {
-        if (mapped != MAP_FAILED) {
-            munmap(mapped, file_size);
-        }
-        free(raw_data);
-        close(fd);
+        wwpkg_unmap_pinned_pkg(file_size, mapped, raw_data);
         if (out_err)
             *out_err = derr;
         return false;
     }
 
-    int xerr = WWPKG_ERR_BAD_SIGNATURE;
-    bool ok = wwpkg_stream_metadata_pkg_bytes(meta_pkg, bytes, file_size, root_dfd, fd, &st,
-                                              nullptr, &xerr);
-    close(root_dfd);
-    if (mapped != MAP_FAILED) {
-        munmap(mapped, file_size);
+    char stage_name[64];
+    int stage_dfd = wwpkg_create_stage_dir(root_dfd, stage_name);
+    if (stage_dfd < 0) {
+        close(root_dfd);
+        wwpkg_unmap_pinned_pkg(file_size, mapped, raw_data);
+        if (out_err)
+            *out_err = WWPKG_ERR_IO;
+        return false;
     }
-    free(raw_data);
-    close(fd);
+
+    /* Stream once into a confined sibling stage so unverified/failed runs never leak partial files. */
+    int xerr = WWPKG_ERR_BAD_SIGNATURE;
+    bool ok = wwpkg_stream_metadata_pkg_bytes(meta_pkg, bytes, file_size, stage_dfd,
+                                              meta_pkg->source_fd, &meta_pkg->source_st, nullptr,
+                                              &xerr);
+    wwpkg_unmap_pinned_pkg(file_size, mapped, raw_data);
+
+    if (ok && !verify_source_fd_and_path_identity(meta_pkg)) {
+        xerr = WWPKG_ERR_BAD_SIGNATURE;
+        ok = false;
+    }
+    if (ok && !wwpkg_promote_staged_tree(stage_dfd, root_dfd, 0u)) {
+        xerr = WWPKG_ERR_IO;
+        ok = false;
+    }
+    close(stage_dfd);
+    if (ok) {
+        (void)unlinkat(root_dfd, stage_name, AT_REMOVEDIR);
+    } else {
+        wwpkg_rmtree_at(root_dfd, stage_name, 0u);
+    }
+    close(root_dfd);
     if (out_err)
         *out_err = ok ? WWPKG_OK : xerr;
     return ok;
@@ -6154,14 +6748,17 @@ bool wwpkg_extract_all(wwpkg_package_t *pkg, const char *dest_dir)
         return false;
     }
 
+    pthread_mutex_lock(&pkg->lock);
     if (pkg->is_metadata_only) {
         int xerr = WWPKG_ERR_BAD_SIGNATURE;
         bool ok = wwpkg_verify_and_extract_metadata_pkg(pkg, dest_dir, &xerr);
+        pthread_mutex_unlock(&pkg->lock);
         set_tls_error(ok ? WWPKG_OK : xerr);
         return ok;
     }
 
-    if (!wwpkg_verify_signature(pkg, nullptr)) {
+    if (!verify_package_crypto_core_unlocked(pkg, nullptr)) {
+        pthread_mutex_unlock(&pkg->lock);
         set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
         return false;
     }
@@ -6169,37 +6766,61 @@ bool wwpkg_extract_all(wwpkg_package_t *pkg, const char *dest_dir)
     int derr = WWPKG_ERR_IO;
     int root_dfd = wwpkg_mkdir_p_and_open_dfd(dest_dir, &derr);
     if (root_dfd < 0) {
+        pthread_mutex_unlock(&pkg->lock);
         set_tls_error(derr);
         return false;
     }
 
+    char stage_name[64];
+    int stage_dfd = wwpkg_create_stage_dir(root_dfd, stage_name);
+    if (stage_dfd < 0) {
+        close(root_dfd);
+        pthread_mutex_unlock(&pkg->lock);
+        set_tls_error(WWPKG_ERR_IO);
+        return false;
+    }
+
+    int err = WWPKG_OK;
+    bool ok = true;
     for (size_t i = 0; i < pkg->asset_count; i++) {
         char clean[WWPKG_MAX_PATH_LEN];
         if (!sanitize_archive_path(pkg->assets[i].name, clean, sizeof(clean))) {
-            close(root_dfd);
-            set_tls_error(WWPKG_ERR_PATH_TRAVERSAL);
-            return false;
+            err = WWPKG_ERR_PATH_TRAVERSAL;
+            ok = false;
+            break;
         }
 
-        int out_fd = wwpkg_open_dest_fast(root_dfd, clean);
+        int out_fd = wwpkg_open_dest_fast(stage_dfd, clean);
         if (out_fd < 0) {
-            close(root_dfd);
-            set_tls_error(WWPKG_ERR_PATH_TRAVERSAL);
-            return false;
+            err = WWPKG_ERR_PATH_TRAVERSAL;
+            ok = false;
+            break;
         }
 
-        if (!write_all_fd(out_fd, pkg->assets[i].data, pkg->assets[i].size)) {
-            close(out_fd);
-            close(root_dfd);
-            set_tls_error(WWPKG_ERR_IO);
-            return false;
-        }
+        bool wrote = write_all_fd(out_fd, pkg->assets[i].data, pkg->assets[i].size) &&
+                     (fsync(out_fd) == 0);
         close(out_fd);
+        if (!wrote) {
+            err = WWPKG_ERR_IO;
+            ok = false;
+            break;
+        }
     }
 
+    if (ok && !wwpkg_promote_staged_tree(stage_dfd, root_dfd, 0u)) {
+        err = WWPKG_ERR_IO;
+        ok = false;
+    }
+    close(stage_dfd);
+    if (ok) {
+        (void)unlinkat(root_dfd, stage_name, AT_REMOVEDIR);
+    } else {
+        wwpkg_rmtree_at(root_dfd, stage_name, 0u);
+    }
     close(root_dfd);
-    set_tls_error(WWPKG_OK);
-    return true;
+    pthread_mutex_unlock(&pkg->lock);
+    set_tls_error(err);
+    return ok;
 }
 
 /* ========================================================================= */
@@ -6460,6 +7081,39 @@ static bool collect_source_files(const char *root_dir, const char *rel_dir, uint
     return true;
 }
 
+static bool commit_atomic_temp_file(int out_fd, const char *tmp_path, const char *target_path)
+{
+    bool sync_ok = (fsync(out_fd) == 0);
+    close(out_fd);
+    if (!sync_ok || rename(tmp_path, target_path) != 0) {
+        unlink(tmp_path);
+        return false;
+    }
+
+    const char *slash = strrchr(target_path, '/');
+    char dir_path[PATH_MAX];
+    if (!slash) {
+        memcpy(dir_path, ".", 2u);
+    } else if (slash == target_path) {
+        memcpy(dir_path, "/", 2u);
+    } else {
+        size_t dlen = (size_t)(slash - target_path);
+        if (dlen >= sizeof(dir_path)) {
+            return true;
+        }
+        memcpy(dir_path, target_path, dlen);
+        dir_path[dlen] = '\0';
+    }
+
+    int dfd = open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        return false;
+    }
+    bool dir_ok = (fsync(dfd) == 0 || errno == EINVAL);
+    close(dfd);
+    return dir_ok;
+}
+
 static bool write_dual_frame_archive(const char *out_pkg_path, const wwpkg_outer_envelope_t *env,
                                      const uint8_t *frame0_tar, size_t frame0_tar_len,
                                      const uint8_t *bulk_tar, size_t bulk_tar_len)
@@ -6477,9 +7131,13 @@ static bool write_dual_frame_archive(const char *out_pkg_path, const wwpkg_outer
         /* Uncompressed ustar fallback when libzstd is absent */
         bool ok = write_all_fd(out_fd, frame0_tar, frame0_tar_len) &&
                   (bulk_tar_len == 0 || write_all_fd(out_fd, bulk_tar, bulk_tar_len));
-        close(out_fd);
-        if (!ok || rename(tmp_out_path, out_pkg_path) != 0) {
+        if (!ok) {
+            close(out_fd);
             unlink(tmp_out_path);
+            set_tls_error(WWPKG_ERR_IO);
+            return false;
+        }
+        if (!commit_atomic_temp_file(out_fd, tmp_out_path, out_pkg_path)) {
             set_tls_error(WWPKG_ERR_IO);
             return false;
         }
@@ -6557,10 +7215,7 @@ static bool write_dual_frame_archive(const char *out_pkg_path, const wwpkg_outer
         bulk_off += chunk_len;
     }
     free(chunk_comp);
-    close(out_fd);
-
-    if (rename(tmp_out_path, out_pkg_path) != 0) {
-        unlink(tmp_out_path);
+    if (!commit_atomic_temp_file(out_fd, tmp_out_path, out_pkg_path)) {
         set_tls_error(WWPKG_ERR_IO);
         return false;
     }
@@ -6624,7 +7279,8 @@ bool wwpkg_build_package(const char *source_dir, const wwpkg_manifest_t *manifes
         }
         mbuf[msz] = '\0';
         int mf_err = WWPKG_ERR_BAD_MANIFEST;
-        bool parsed = parse_manifest_from_string(mbuf, msz, &active_manifest, &mf_err);
+        bool parsed = parse_manifest_from_string_opts(mbuf, msz, &active_manifest, nullptr,
+                                                      &mf_err, true);
         free(mbuf);
         if (!parsed) {
             set_tls_error(mf_err);
@@ -6672,9 +7328,25 @@ bool wwpkg_build_package(const char *source_dir, const wwpkg_manifest_t *manifes
     active_manifest.file_count = (uint32_t)payload_list.count;
     active_manifest.total_bytes = payload_list.total_bytes;
 
+    static const char *const preview_candidates[2] = {"preview.png", "preview.webp"};
+    const char *probed_prev = "preview.webp";
+    for (size_t c = 0; c < 2u; c++) {
+        bool found = false;
+        for (size_t i = 0; i < payload_list.count; i++) {
+            if (strcmp(payload_list.entries[i].name, preview_candidates[c]) == 0) {
+                probed_prev = preview_candidates[c];
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            break;
+        }
+    }
+
     char norm_prev[WWPKG_MAX_PATH_LEN] = {0};
     const char *raw_prev =
-        active_manifest.entrypoint_preview[0] ? active_manifest.entrypoint_preview : "preview.webp";
+        active_manifest.entrypoint_preview[0] ? active_manifest.entrypoint_preview : probed_prev;
     if (!sanitize_archive_path(raw_prev, norm_prev, sizeof(norm_prev))) {
         explicit_bzero(effective_sk, sizeof(effective_sk));
         build_list_free(&payload_list);
@@ -6933,7 +7605,7 @@ bool wwpkg_notarize_package(const char *pkg_path, const uint8_t notary_sk[64])
     }
 
     uint8_t h_manifest[32];
-    if (!verify_package_crypto_core(pkg, h_manifest)) {
+    if (!verify_package_crypto_core_unlocked(pkg, h_manifest)) {
         wwpkg_close(pkg);
         set_tls_error(WWPKG_ERR_BAD_SIGNATURE);
         return false;
@@ -6990,6 +7662,11 @@ bool wwpkg_notarize_package(const char *pkg_path, const uint8_t notary_sk[64])
     }
     if (bulk_count == 0) {
         f0_tar_len += 1024u;
+    }
+    if (f0_tar_len > WWPKG_FRAME0_MAX_BYTES) {
+        wwpkg_close(pkg);
+        set_tls_error(WWPKG_ERR_BAD_MANIFEST);
+        return false;
     }
 
     size_t bulk_tar_len = 0;
