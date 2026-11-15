@@ -47,7 +47,7 @@ Fork \fBwwald\fR into the background when invoked with \fBinit\fR, \fBdaemon\fR,
 Keep \fBwwald\fR in the foreground (\fBswww-daemon\fR / \fBawww-daemon\fR compatibility).
 .RE
 .PP
-\fB-f, --format\fR <xrgb|xbgr|rgb|bgr>
+\fB-f, --format\fR <xrgb|argb|xbgr|rgb|bgr>
 .RS 4
 Pixel channel order hint when launching \fBwwald\fR (\fBswww-daemon\fR / \fBawww-daemon\fR compatibility).
 .RE
@@ -76,7 +76,7 @@ Universal wallpaper command. Automatically detects and dispatches static or anim
 .PP
 \fBpick\fR [DIR] [OPTIONS]
 .RS 4
-Launch a unified icon-grid wallpaper picker across static images, videos, shaders, and Steam Workshop scenes. Automatically generates cached \fB128x128\fR / \fB160x90\fR thumbnails in \fB~/.cache/wwal/thumbs/\fR and pipes icon-annotated entries into \fBrofi\fR, \fBfuzzel\fR, \fBwalker\fR, or \fBdmenu\fR. Use \fB--menu <auto|rofi|fuzzel|walker|dmenu|stdout|json>\fR to select the output protocol and \fB--dir <DIR>\fR to add search directories.
+Launch a unified icon-grid wallpaper picker across static images, videos, shaders, and Steam Workshop scenes. Automatically generates cached \fB128x128\fR / \fB160x90\fR thumbnails in \fB~/.cache/wwal/thumbs/\fR and pipes icon-annotated entries into \fBrofi\fR, \fBfuzzel\fR, \fBwalker\fR, or \fBdmenu\fR. Use \fB--menu <auto|rofi|fuzzel|walker|dmenu|stdout|json>\fR (or \fB-j, --json\fR) to select the output protocol and \fB--dir <DIR>\fR to add search directories.
 .RE
 .PP
 \fBvideo\fR <PATH> [OPTIONS]
@@ -86,7 +86,7 @@ Play a hardware-accelerated video wallpaper (MP4, WebM, MKV, MOV, AVI, M4V, GIF)
 .PP
 \fBshader\fR <PATH|list|preset> [NAME] [OPTIONS]
 .RS 4
-Run a live procedural GLSL compute shader (\fB.comp\fR), multi-pass Shadertoy fragment shader (\fB.frag\fR) with automatic \fBinotify\fR(7) hot-reloading, or one of 10 built-in procedural shader presets installed in \fBshaders/presets/*.frag\fR. Use \fBwwal shader list\fR (or \fB--list\fR) to list built-in presets (\fBaurora\fR, \fBcyber_grid\fR, \fBfluid_ink\fR, \fBsynthwave_sun\fR, \fBstarfield\fR, \fBrain_glass\fR, \fBaudio_bars\fR, \fBaudio_ring\fR, \fBcrt_retro\fR, \fBplasma_orb\fR, plus aliases \fBlava_lamp\fR, \fBnorthern_lights\fR, \fBoutrun\fR, \fBcrt\fR) and \fBwwal shader preset <NAME>\fR (or \fB--preset <NAME>\fR) to launch one directly.
+Run a live procedural GLSL compute shader (\fB.comp\fR), multi-pass Shadertoy fragment shader (\fB.frag\fR) with automatic \fBinotify\fR(7) hot-reloading, or one of 10 built-in procedural shader presets installed in \fBshaders/presets/*.frag\fR. Use \fBwwal shader list\fR (or \fB--list\fR) to list built-in presets (\fBaurora\fR, \fBcyber_grid\fR, \fBfluid_ink\fR, \fBsynthwave_sun\fR, \fBstarfield\fR, \fBrain_glass\fR, \fBaudio_bars\fR, \fBaudio_ring\fR, \fBcrt_retro\fR, \fBplasma_orb\fR, plus aliases \fBlava_lamp\fR, \fBnorthern_lights\fR, \fBoutrun\fR, \fBcrt\fR) and \fBwwal shader preset <NAME>\fR (or \fB--preset <NAME>\fR / \fB--shader <PATH|PRESET>\fR) to launch one directly.
 .RE
 .PP
 \fBworkshop\fR <list|info|apply|sync-previews> [ID|PATH] [OPTIONS]
@@ -94,9 +94,9 @@ Run a live procedural GLSL compute shader (\fB.comp\fR), multi-pass Shadertoy fr
 Discover, inspect, render, or export preview symlinks for native Steam Workshop (\fB431960\fR Wallpaper Engine) scenes, videos, web wallpapers, `.pkg` archives, `.tex` textures, `.mdl` Puppet Warp skeletal meshes, AVX2 particle systems, `"sound"` ambient audio layers, `"text"` clock/label layers, and `SceneScript` logic. Use \fB--prop key=val\fR to override user properties, or \fBwwal workshop sync-previews [DIR]\fR to populate human-readable preview symlinks in \fB~/.cache/wwal/workshop-previews/\fR for external GUI pickers (\fBwaypaper\fR, \fBazote\fR).
 .RE
 .PP
-\fBslideshow\fR <DIR|FILE.xml|ACTION> [OPTIONS]
+\fBslideshow\fR [start] <DIR|FILE.xml|ACTION> [OPTIONS]
 .RS 4
-Start a zero-idle-CPU \fBtimerfd\fR mixed-media wallpaper slideshow from \fIDIR\fR or a GNOME timed dynamic wallpaper schedule (\fIFILE.xml\fR), or control an active slideshow using one of the actions: \fBstart\fR, \fBstop\fR, \fBpause\fR, \fBresume\fR, \fBtoggle\fR, \fBnext\fR, \fBprev\fR, \fBprevious\fR.
+Start a zero-idle-CPU \fBtimerfd\fR mixed-media wallpaper slideshow from \fIDIR\fR (or \fB--dir\fR / \fB--path <DIR>\fR) or a GNOME timed dynamic wallpaper schedule (\fIFILE.xml\fR), or control an active slideshow using one of the actions: \fBstart\fR, \fBstop\fR, \fBpause\fR, \fBresume\fR, \fBtoggle\fR, \fBnext\fR, \fBprev\fR, \fBprevious\fR.
 .RE
 .PP
 \fBnext\fR [-o <OUTPUT>]
@@ -126,7 +126,7 @@ Extract simultaneous dark and light OKLab/CAM16/HCT Material Design 3 palettes f
 .PP
 \fBaudio\fR [OPTIONS]
 .RS 4
-Configure live wallpaper audio playback volume (\fB--volume 0.0..1.0\fR) and external application auto-ducking (\fB--mute-on-audio\fR / \fB--no-mute-on-audio\fR).
+Configure live wallpaper audio playback volume (\fB--volume 0.0..1.0\fR), external application auto-ducking (\fB--mute-on-audio\fR / \fB--no-mute-on-audio\fR), and MPRIS2 album-art theme extraction (\fB--theme-from-media\fR / \fB--no-theme-from-media\fR).
 .RE
 .PP
 \fBset-uniform\fR, \fBuniform\fR <NAME> <VALUES...>
@@ -264,9 +264,9 @@ Select transition effect (default: \fBfade\fR). Supported GPU GLES 3.1 compute s
 Duration of the transition in seconds as a floating-point number such as \fB0.5\fR or \fB1.5\fR (default: \fB1.2\fR).
 .RE
 .PP
-\fB--transition-fps\fR <FPS>
+\fB--transition-fps, --fps\fR <FPS>
 .RS 4
-Target transition frame rate (default: \fB60\fR; automatically locks to display VBlank via \fBwp_presentation\fR).
+Target transition frame rate (default: \fB60\fR; automatically locks to display VBlank via \fBwp_presentation\fR). \fB--fps\fR also sets the rendering frame rate for \fBshader\fR and \fBworkshop\fR.
 .RE
 .PP
 \fB--transition-bezier\fR <X1,Y1,X2,Y2>
@@ -304,6 +304,11 @@ Per-frame progress step (\fB1..255\fR) for \fBswww\fR/\fBawww\fR compatibility.
 Path to a custom GLSL ES 3.10 compute shader (\fB.comp\fR) when \fB--transition-type custom\fR is selected.
 .RE
 .PP
+\fB--shader\fR <PATH|PRESET>
+.RS 4
+Apply a live GLSL fragment shader or built-in preset alongside \fBimg\fR or directly when no subcommand is given.
+.RE
+.PP
 \fB-o, --output, --outputs\fR <NAMES>
 .RS 4
 Target specific Wayland output(s) by name (for example, \fBDP-1\fR or \fBDP-1,HDMI-A-1\fR). May be specified multiple times.
@@ -311,7 +316,7 @@ Target specific Wayland output(s) by name (for example, \fBDP-1\fR or \fBDP-1,HD
 .PP
 \fB--sync-mode\fR <simultaneous|staggered>
 .RS 4
-Synchronize transitions across multiple monitors simultaneously or with a cascading delay (default: \fBsimultaneous\fR).
+Synchronize transitions across multiple monitors simultaneously (\fBsimultaneous\fR, alias \fBsync\fR) or with a cascading delay (\fBstaggered\fR, alias \fBcascade\fR) (default: \fBsimultaneous\fR).
 .RE
 .PP
 \fB--stagger-delay\fR <MS>
@@ -363,7 +368,7 @@ Background padding color in 6- or 8-digit hex for \fBfit\fR and \fBcenter\fR mod
 .PP
 \fB-f, --filter\fR <Nearest|Bilinear|CatmullRom|Mitchell|Lanczos3>
 .RS 4
-Sampling filter hint for image scaling (\fBswww\fR/\fBawww\fR compatibility).
+Sampling filter hint for image scaling (\fBswww\fR/\fBawww\fR compatibility). For \fBinit\fR / \fBdaemon\fR or when given a pixel format name (\fBxrgb\fR, \fBargb\fR, \fBxbgr\fR, \fBrgb\fR, \fBbgr\fR), \fB-f\fR behaves as \fB--format\fR.
 .RE
 .PP
 \fB--no-cache\fR
@@ -383,12 +388,12 @@ Request 10-bit wide-gamut scanout (\fBDRM_FORMAT_XRGB2101010\fR / \fBDRM_FORMAT_
 .PP
 \fB--backdrop\fR <none|auto-blur|FILE>
 .RS 4
-Configure a secondary layer-shell surface with namespace \fBwaywal-backdrop\fR for compositors with overview backdrops such as Niri (\fBplace-within-backdrop true\fR). \fBauto-blur\fR renders a 2-pass Dual-Kawase Gaussian blur of the active wallpaper on the GPU at zero extra image-decode cost.
+Configure a secondary layer-shell surface with namespace \fBwaywal-backdrop\fR for compositors with overview backdrops such as Niri (\fBplace-within-backdrop true\fR). \fBauto-blur\fR renders a 2-pass Dual-Kawase Gaussian blur of the active wallpaper on the GPU at zero extra image-decode cost. Also accepted globally with \fBinit\fR and \fBdaemon\fR.
 .RE
 .PP
 \fB--layer\fR <background|bottom>
 .RS 4
-Wayland layer-shell layer placement (default: \fBbackground\fR).
+Wayland layer-shell layer placement (default: \fBbackground\fR). Also accepted globally with \fBinit\fR and \fBdaemon\fR.
 .RE
 .PP
 \fB--theme, --no-theme\fR
@@ -470,10 +475,15 @@ Enable or disable automatic exponential volume ducking when another application 
 .PP
 \fB--battery-policy\fR <ignore|reduce-fps|pause-video>
 .RS 4
-Configure the laptop battery governor policy when discharging or entering power-saver mode.
+Configure the laptop battery governor policy when discharging or entering power-saver mode. Also accepted globally with \fBinit\fR and \fBdaemon\fR.
 .RE
 .PP
 .SH SLIDESHOW OPTIONS
+.PP
+\fB--dir, --path\fR <DIR>
+.RS 4
+Directory path for \fBslideshow\fR traversal (or \fB--dir <DIR>\fR for \fBpick\fR search roots).
+.RE
 .PP
 \fB-d, --interval, --duration\fR <DURATION>
 .RS 4

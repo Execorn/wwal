@@ -4,13 +4,13 @@ _wwal_completion() {
     _init_completion || return
 
     local commands="img pick video shader workshop slideshow next prev previous color clear theme audio set-uniform uniform status subscribe pause resume unpause toggle query stats restore clear-cache init daemon ping kill version help"
-    local global_opts="-j --json -n --namespace -a --all -q --quiet -d --daemon --no-daemon -f --format -v --verbose -V --version -h --help --layer --battery-policy"
+    local global_opts="-j --json -n --namespace -a --all -q --quiet -d --daemon --no-daemon -f --format -v --verbose -V --version -h --help --layer --battery-policy --backdrop"
     local trans_types="none simple fade wipe grow outer wave noise crosszoom slide glitch burn ripple pixelate doom swirl cube luma light_leak page_curl custom random left right top bottom center any"
     local trans_positions="center top bottom left right top-left top-right bottom-left bottom-right tl tr bl br topleft topright bottomleft bottomright cursor mouse"
     local sync_modes="simultaneous staggered"
     local scaling_modes="fill fit fit-border-color stretch center tile span crop cover contain no"
     local filters="Nearest Bilinear CatmullRom Mitchell Lanczos3"
-    local formats="xrgb xbgr rgb bgr"
+    local formats="xrgb argb xbgr rgb bgr"
     local layers="background bottom"
     local battery_policies="ignore reduce-fps pause-video"
     local backdrops="none auto-blur"
@@ -109,6 +109,15 @@ _wwal_completion() {
             _filedir '@(png|jpg|jpeg|webp|avif|heic|jxl|svg|bmp|qoi|ppm|pgm|pnm)'
             return 0
             ;;
+        --path)
+            _filedir -d
+            return 0
+            ;;
+        --shader)
+            COMPREPLY=( $(compgen -W "${shader_presets}" -- "$cur") )
+            _filedir '@(frag|comp|glsl|shader)'
+            return 0
+            ;;
         --transition-shader)
             _filedir '@(comp|glsl|frag|shader)'
             return 0
@@ -122,7 +131,7 @@ _wwal_completion() {
             ;;
     esac
 
-    local trans_opts="-t --transition-type --transition-duration --transition-fps --transition-angle --transition-wave --transition-pos --invert-y --transition-bezier --transition-step --transition-shader -o --output --outputs --sync-mode --stagger-delay --10bit --scaling-mode --mode --resize --no-resize --crop-gravity --fill-color -f --filter --format --no-cache --clear-cache --backdrop --depth-map --depth-strength --layer --battery-policy --theme --no-theme --theme-mode --dark --light --auto-day-night --no-auto-day-night --latitude --longitude --source-color-index --seed-color --theme-from-media --no-theme-from-media --animate"
+    local trans_opts="-t --transition-type --transition-duration --transition-fps --fps --transition-angle --transition-wave --transition-pos --invert-y --transition-bezier --transition-step --transition-shader --shader -o --output --outputs --sync-mode --stagger-delay --10bit --scaling-mode --mode --resize --no-resize --crop-gravity --fill-color -f --filter --format --no-cache --clear-cache --backdrop --depth-map --depth-strength --layer --battery-policy --theme --no-theme --theme-mode --dark --light --auto-day-night --no-auto-day-night --latitude --longitude --source-color-index --seed-color --theme-from-media --no-theme-from-media --animate"
 
     case "$cmd" in
         img)
@@ -141,14 +150,14 @@ _wwal_completion() {
             ;;
         video)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--loop --speed --audio --volume --mute-on-audio --no-mute-on-audio --crop-gravity --battery-policy --layer --backdrop --theme --no-theme --theme-mode --dark --light --auto-day-night --no-auto-day-night --latitude --longitude --source-color-index --seed-color --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--loop --speed --audio --volume --mute-on-audio --no-mute-on-audio --crop-gravity --battery-policy --layer --backdrop --10bit --no-cache --clear-cache --theme --no-theme --theme-mode --dark --light --auto-day-night --no-auto-day-night --latitude --longitude --source-color-index --seed-color --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
             else
                 _filedir '@(mp4|mkv|webm|avi|mov|m4v|gif)'
             fi
             ;;
         shader)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--list --preset --audio --volume --mute-on-audio --no-mute-on-audio --speed --fps --battery-policy --layer --backdrop --10bit --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--list --preset --shader --audio --volume --mute-on-audio --no-mute-on-audio --speed --fps --battery-policy --layer --backdrop --10bit --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
             else
                 COMPREPLY=( $(compgen -W "list preset ${shader_presets}" -- "$cur") )
                 _filedir '@(frag|comp|glsl|shader)'
@@ -156,7 +165,7 @@ _wwal_completion() {
             ;;
         workshop)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-p --prop --audio --volume --mute-on-audio --no-mute-on-audio --fps --battery-policy --layer --backdrop --theme --no-theme --theme-mode --dark --light --auto-day-night --no-auto-day-night --latitude --longitude --source-color-index --seed-color --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
+                COMPREPLY=( $(compgen -W "-p --prop --audio --volume --mute-on-audio --no-mute-on-audio --fps --battery-policy --layer --backdrop --10bit --theme --no-theme --theme-mode --dark --light --auto-day-night --no-auto-day-night --latitude --longitude --source-color-index --seed-color --theme-from-media --no-theme-from-media -o --output --outputs ${global_opts}" -- "$cur") )
             else
                 COMPREPLY=( $(compgen -W "${workshop_actions}" -- "$cur") )
                 _filedir
@@ -184,7 +193,7 @@ _wwal_completion() {
             done
             if [[ -z "$subcmd" ]]; then
                 if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --interval --duration -s --shuffle --random --sort --sorting --recursive --no-recursive ${trans_opts} ${global_opts}" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "-d --interval --duration --dir --path -s --shuffle --random --sort --sorting --recursive --no-recursive ${trans_opts} ${global_opts}" -- "$cur") )
                 else
                     COMPREPLY=( $(compgen -W "${slideshow_actions}" -- "$cur") )
                     _filedir '@(xml)'
@@ -192,7 +201,7 @@ _wwal_completion() {
                 fi
             elif [[ "$subcmd" == "start" ]]; then
                 if [[ "$cur" == -* ]]; then
-                    COMPREPLY=( $(compgen -W "-d --interval --duration -s --shuffle --random --sort --sorting --recursive --no-recursive ${trans_opts} ${global_opts}" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "-d --interval --duration --dir --path -s --shuffle --random --sort --sorting --recursive --no-recursive ${trans_opts} ${global_opts}" -- "$cur") )
                 else
                     _filedir '@(xml)'
                     _filedir -d

@@ -163,11 +163,11 @@ Sets default parameters for GPU compute and CPU SIMD wallpaper transitions.
 *bezier* = [ <x1>, <y1>, <x2>, <y2> ]
 	Four-element float array defining the cubic-bezier easing curve (default: *[ 0.25, 0.1, 0.25, 1.0 ]*).
 
-*sync_mode* = "<simultaneous|staggered>"
-	Multi-monitor transition synchronization mode (default: *"simultaneous"*).
+*sync_mode* = "<independent|simultaneous|staggered>"
+	Multi-monitor transition synchronization mode (config default: *"independent"*, treated as simultaneous unless *"staggered"*; CLI *--sync-mode* default: *"simultaneous"*).
 
-*stagger_delay_ms* = <int>
-	Delay in milliseconds between monitors in *staggered* mode (default: *150*).
+*stagger_delay_ms* (*stagger_delay*, *stagger-delay*) = <int>
+	Delay in milliseconds between monitors in *staggered* mode (config default: *0*; CLI *--stagger-delay* default: *150* when unset in config).
 
 ## [slideshow]
 

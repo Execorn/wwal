@@ -251,14 +251,14 @@ Default crop anchor for transitions (default: \fB"center"\fR).
 Four-element float array defining the cubic-bezier easing curve (default: \fB[ 0.25, 0.1, 0.25, 1.0 ]\fR).
 .RE
 .PP
-\fBsync_mode\fR = "<simultaneous|staggered>"
+\fBsync_mode\fR = "<independent|simultaneous|staggered>"
 .RS 4
-Multi-monitor transition synchronization mode (default: \fB"simultaneous"\fR).
+Multi-monitor transition synchronization mode (config default: \fB"independent"\fR, treated as simultaneous unless \fB"staggered"\fR; CLI \fB--sync-mode\fR default: \fB"simultaneous"\fR).
 .RE
 .PP
-\fBstagger_delay_ms\fR = <int>
+\fBstagger_delay_ms\fR (\fBstagger_delay\fR, \fBstagger-delay\fR) = <int>
 .RS 4
-Delay in milliseconds between monitors in \fBstaggered\fR mode (default: \fB150\fR).
+Delay in milliseconds between monitors in \fBstaggered\fR mode (config default: \fB0\fR; CLI \fB--stagger-delay\fR default: \fB150\fR when unset in config).
 .RE
 .PP
 .SS [slideshow]

@@ -34,7 +34,7 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 *--no-daemon*
 	Keep *wwald* in the foreground (*swww-daemon* / *awww-daemon* compatibility).
 
-*-f, --format* <xrgb|xbgr|rgb|bgr>
+*-f, --format* <xrgb|argb|xbgr|rgb|bgr>
 	Pixel channel order hint when launching *wwald* (*swww-daemon* / *awww-daemon* compatibility).
 
 *-v, --verbose*
@@ -52,19 +52,19 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 	Universal wallpaper command. Automatically detects and dispatches static or animated images (PNG, JPEG, WebP, AVIF, HEIC/HEIF, JPEG-XL, SVG, BMP, GIF, APNG, QOI, PPM/PGM/PNM, TGA), hardware videos (MP4, WebM, MKV, MOV, AVI, M4V), live shaders (*.frag*, *.comp*, *.glsl*, *.shader*), Steam Workshop numeric IDs, Workshop folders, or synced preview symlinks, GNOME dynamic timed wallpaper XML schedules (*.xml*), slideshow directories, and solid hex colors. Pass *-* to read image bytes from standard input. File descriptors are passed to *wwald*(1) via *SCM_RIGHTS* for zero-copy decoding inside the sandbox.
 
 *pick* [DIR] [OPTIONS]
-	Launch a unified icon-grid wallpaper picker across static images, videos, shaders, and Steam Workshop scenes. Automatically generates cached *128x128* / *160x90* thumbnails in *~/.cache/wwal/thumbs/* and pipes icon-annotated entries into *rofi*, *fuzzel*, *walker*, or *dmenu*. Use *--menu <auto|rofi|fuzzel|walker|dmenu|stdout|json>* to select the output protocol and *--dir <DIR>* to add search directories.
+	Launch a unified icon-grid wallpaper picker across static images, videos, shaders, and Steam Workshop scenes. Automatically generates cached *128x128* / *160x90* thumbnails in *~/.cache/wwal/thumbs/* and pipes icon-annotated entries into *rofi*, *fuzzel*, *walker*, or *dmenu*. Use *--menu <auto|rofi|fuzzel|walker|dmenu|stdout|json>* (or *-j, --json*) to select the output protocol and *--dir <DIR>* to add search directories.
 
 *video* <PATH> [OPTIONS]
 	Play a hardware-accelerated video wallpaper (MP4, WebM, MKV, MOV, AVI, M4V, GIF) using the zero-FFmpeg MP4/WebM demuxer and VA-API hardware decode pipeline (H.264, HEVC, VP9, AV1).
 
 *shader* <PATH|list|preset> [NAME] [OPTIONS]
-	Run a live procedural GLSL compute shader (*.comp*), multi-pass Shadertoy fragment shader (*.frag*) with automatic *inotify*(7) hot-reloading, or one of 10 built-in procedural shader presets installed in *shaders/presets/\*.frag*. Use *wwal shader list* (or *--list*) to list built-in presets (*aurora*, *cyber_grid*, *fluid_ink*, *synthwave_sun*, *starfield*, *rain_glass*, *audio_bars*, *audio_ring*, *crt_retro*, *plasma_orb*, plus aliases *lava_lamp*, *northern_lights*, *outrun*, *crt*) and *wwal shader preset <NAME>* (or *--preset <NAME>*) to launch one directly.
+	Run a live procedural GLSL compute shader (*.comp*), multi-pass Shadertoy fragment shader (*.frag*) with automatic *inotify*(7) hot-reloading, or one of 10 built-in procedural shader presets installed in *shaders/presets/\*.frag*. Use *wwal shader list* (or *--list*) to list built-in presets (*aurora*, *cyber_grid*, *fluid_ink*, *synthwave_sun*, *starfield*, *rain_glass*, *audio_bars*, *audio_ring*, *crt_retro*, *plasma_orb*, plus aliases *lava_lamp*, *northern_lights*, *outrun*, *crt*) and *wwal shader preset <NAME>* (or *--preset <NAME>* / *--shader <PATH|PRESET>*) to launch one directly.
 
 *workshop* <list|info|apply|sync-previews> [ID|PATH] [OPTIONS]
 	Discover, inspect, render, or export preview symlinks for native Steam Workshop (*431960* Wallpaper Engine) scenes, videos, web wallpapers, `.pkg` archives, `.tex` textures, `.mdl` Puppet Warp skeletal meshes, AVX2 particle systems, `"sound"` ambient audio layers, `"text"` clock/label layers, and `SceneScript` logic. Use *--prop key=val* to override user properties, or *wwal workshop sync-previews [DIR]* to populate human-readable preview symlinks in *~/.cache/wwal/workshop-previews/* for external GUI pickers (*waypaper*, *azote*).
 
-*slideshow* <DIR|FILE.xml|ACTION> [OPTIONS]
-	Start a zero-idle-CPU *timerfd* mixed-media wallpaper slideshow from _DIR_ or a GNOME timed dynamic wallpaper schedule (_FILE.xml_), or control an active slideshow using one of the actions: *start*, *stop*, *pause*, *resume*, *toggle*, *next*, *prev*, *previous*.
+*slideshow* [start] <DIR|FILE.xml|ACTION> [OPTIONS]
+	Start a zero-idle-CPU *timerfd* mixed-media wallpaper slideshow from _DIR_ (or *--dir* / *--path <DIR>*) or a GNOME timed dynamic wallpaper schedule (_FILE.xml_), or control an active slideshow using one of the actions: *start*, *stop*, *pause*, *resume*, *toggle*, *next*, *prev*, *previous*.
 
 *next* [-o <OUTPUT>]
 	Advance the active slideshow on the target output(s) to the next wallpaper.
@@ -82,7 +82,7 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 	Extract simultaneous dark and light OKLab/CAM16/HCT Material Design 3 palettes from _PATH_ (or via *-i, --img, --image <PATH>*, or the currently active wallpaper if omitted) in under 0.5 ms, render all configured *[template."<name>"]* files (supporting Matugen, Wallust, and Pywal syntax and 7 pipe filters), and write *~/.local/state/caelestia/scheme.json*, *~/.cache/wwal/colors.{json,css,hyprland.conf}*, *~/.cache/wal/{colors.json,colors,colors.sh,colors.css,sequences}*, and terminal OSC 4/10/11 sequences.
 
 *audio* [OPTIONS]
-	Configure live wallpaper audio playback volume (*--volume 0.0..1.0*) and external application auto-ducking (*--mute-on-audio* / *--no-mute-on-audio*).
+	Configure live wallpaper audio playback volume (*--volume 0.0..1.0*), external application auto-ducking (*--mute-on-audio* / *--no-mute-on-audio*), and MPRIS2 album-art theme extraction (*--theme-from-media* / *--no-theme-from-media*).
 
 *set-uniform*, *uniform* <NAME> <VALUES...>
 	Mutate a live shader uniform or Workshop user property (1 to 4 float values) without reloading the active scene.
@@ -161,8 +161,8 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 *--transition-duration* <SECONDS>
 	Duration of the transition in seconds as a floating-point number such as *0.5* or *1.5* (default: *1.2*).
 
-*--transition-fps* <FPS>
-	Target transition frame rate (default: *60*; automatically locks to display VBlank via *wp_presentation*).
+*--transition-fps, --fps* <FPS>
+	Target transition frame rate (default: *60*; automatically locks to display VBlank via *wp_presentation*). *--fps* also sets the rendering frame rate for *shader* and *workshop*.
 
 *--transition-bezier* <X1,Y1,X2,Y2>
 	Cubic Bezier control points for transition progress easing (default: *0.25,0.1,0.25,1.0*; *swww* default: *0.54,0,0.34,0.99*).
@@ -185,11 +185,14 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 *--transition-shader* <FILE>
 	Path to a custom GLSL ES 3.10 compute shader (*.comp*) when *--transition-type custom* is selected.
 
+*--shader* <PATH|PRESET>
+	Apply a live GLSL fragment shader or built-in preset alongside *img* or directly when no subcommand is given.
+
 *-o, --output, --outputs* <NAMES>
 	Target specific Wayland output(s) by name (for example, *DP-1* or *DP-1,HDMI-A-1*). May be specified multiple times.
 
 *--sync-mode* <simultaneous|staggered>
-	Synchronize transitions across multiple monitors simultaneously or with a cascading delay (default: *simultaneous*).
+	Synchronize transitions across multiple monitors simultaneously (*simultaneous*, alias *sync*) or with a cascading delay (*staggered*, alias *cascade*) (default: *simultaneous*).
 
 *--stagger-delay* <MS>
 	Cascading delay in milliseconds between outputs when *--sync-mode staggered* is active (default: *150*).
@@ -219,7 +222,7 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 	Background padding color in 6- or 8-digit hex for *fit* and *center* modes (default: *000000*).
 
 *-f, --filter* <Nearest|Bilinear|CatmullRom|Mitchell|Lanczos3>
-	Sampling filter hint for image scaling (*swww*/*awww* compatibility).
+	Sampling filter hint for image scaling (*swww*/*awww* compatibility). For *init* / *daemon* or when given a pixel format name (*xrgb*, *argb*, *xbgr*, *rgb*, *bgr*), *-f* behaves as *--format*.
 
 *--no-cache*
 	Bypass cached transition/palette artifacts for this invocation.
@@ -231,10 +234,10 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 	Request 10-bit wide-gamut scanout (*DRM_FORMAT_XRGB2101010* / *DRM_FORMAT_ARGB2101010*) and preserve 16-bit PNG/AVIF/JXL channel precision when supported by the compositor.
 
 *--backdrop* <none|auto-blur|FILE>
-	Configure a secondary layer-shell surface with namespace *waywal-backdrop* for compositors with overview backdrops such as Niri (*place-within-backdrop true*). *auto-blur* renders a 2-pass Dual-Kawase Gaussian blur of the active wallpaper on the GPU at zero extra image-decode cost.
+	Configure a secondary layer-shell surface with namespace *waywal-backdrop* for compositors with overview backdrops such as Niri (*place-within-backdrop true*). *auto-blur* renders a 2-pass Dual-Kawase Gaussian blur of the active wallpaper on the GPU at zero extra image-decode cost. Also accepted globally with *init* and *daemon*.
 
 *--layer* <background|bottom>
-	Wayland layer-shell layer placement (default: *background*).
+	Wayland layer-shell layer placement (default: *background*). Also accepted globally with *init* and *daemon*.
 
 *--theme, --no-theme*
 	Enable or disable automatic Material Design 3 OKLab/CAM16/HCT color extraction and *caelestia*/*OSC*/template synchronization on wallpaper change.
@@ -284,9 +287,12 @@ When invoked via a symlink named *swww*, *awww*, *swww-daemon*, or *awww-daemon*
 	Enable or disable automatic exponential volume ducking when another application plays audio via PipeWire.
 
 *--battery-policy* <ignore|reduce-fps|pause-video>
-	Configure the laptop battery governor policy when discharging or entering power-saver mode.
+	Configure the laptop battery governor policy when discharging or entering power-saver mode. Also accepted globally with *init* and *daemon*.
 
 # SLIDESHOW OPTIONS
+
+*--dir, --path* <DIR>
+	Directory path for *slideshow* traversal (or *--dir <DIR>* for *pick* search roots).
 
 *-d, --interval, --duration* <DURATION>
 	Interval between slideshow transitions in seconds or human-readable units such as *30m*, *1h*, or *10m 30s* (default: *300*).

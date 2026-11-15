@@ -20,12 +20,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
@@ -152,7 +155,7 @@ static void apply_config_defaults_to_cli(int argc, char *argv[], const waywal_co
             opts->has_crop_gravity = true;
         }
     }
-    if (!argv_has_flag(argc, argv, "--10bit") && cfg->daemon.ten_bit) {
+    if (!opts->has_10bit && !argv_has_flag(argc, argv, "--10bit") && cfg->daemon.ten_bit) {
         opts->enable_10bit = true;
     }
     if (!opts->has_auto_day_night && !opts->has_theme_mode &&
@@ -162,11 +165,21 @@ static void apply_config_defaults_to_cli(int argc, char *argv[], const waywal_co
     if (cfg->solar.has_coordinates) {
         if (!opts->has_solar_lat) {
             opts->solar_latitude = cfg->solar.latitude;
+            opts->has_solar_lat = true;
         }
         if (!opts->has_solar_lon) {
             opts->solar_longitude = cfg->solar.longitude;
+            opts->has_solar_lon = true;
         }
         opts->has_solar_coords = true;
+    } else if (opts->has_solar_coords && !(opts->has_solar_lat && opts->has_solar_lon)) {
+        fprintf(stderr, "Warning: Ignoring incomplete solar coordinates (both --latitude and "
+                        "--longitude are required)\n");
+        opts->has_solar_coords = false;
+        opts->has_solar_lat = false;
+        opts->has_solar_lon = false;
+        opts->solar_latitude = 0.0;
+        opts->solar_longitude = 0.0;
     }
     g_client_solar_cfg = cfg->solar;
     if (opts->has_solar_coords) {
@@ -194,11 +207,11 @@ static void apply_config_defaults_to_cli(int argc, char *argv[], const waywal_co
         opts->seed_color = cfg->theme.seed_color;
         opts->has_seed_color = true;
     }
-    if (!argv_has_flag(argc, argv, "--sync") && !argv_has_flag(argc, argv, "--sync-mode") &&
+    if (!opts->has_sync_mode && !argv_has_flag(argc, argv, "--sync-mode") &&
         cfg->transition.sync_mode[0] != '\0') {
         opts->sync_mode = (strcasecmp(cfg->transition.sync_mode, "staggered") == 0) ? 1U : 0U;
     }
-    if (!argv_has_flag(argc, argv, "--stagger") && !argv_has_flag(argc, argv, "--stagger-delay") &&
+    if (!opts->has_stagger_delay && !argv_has_flag(argc, argv, "--stagger-delay") &&
         cfg->transition.stagger_delay_ms > 0) {
         opts->stagger_delay_ms = cfg->transition.stagger_delay_ms;
     }
@@ -431,6 +444,158 @@ static bool executable_exists_in_path(const char *bin_name)
     return false;
 }
 
+static bool client_poll_fd(int fd, short events, int timeout_ms)
+{
+    struct timespec start;
+    if (timeout_ms > 0) {
+        (void)clock_gettime(CLOCK_MONOTONIC, &start);
+    }
+    for (;;) {
+        int remaining = timeout_ms;
+        if (timeout_ms > 0) {
+            struct timespec now;
+            (void)clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (long)(now.tv_sec - start.tv_sec) * 1000L +
+                              (now.tv_nsec - start.tv_nsec) / 1000000L;
+            if (elapsed_ms >= timeout_ms) {
+                errno = ETIMEDOUT;
+                return false;
+            }
+            remaining = timeout_ms - (int)elapsed_ms;
+        }
+        struct pollfd pfd = {.fd = fd, .events = events, .revents = 0};
+        int rc = poll(&pfd, 1, remaining);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (rc == 0) {
+            errno = ETIMEDOUT;
+            return false;
+        }
+        return true;
+    }
+}
+
+static bool client_write_exact(int fd, const void *buf, size_t len)
+{
+    size_t total = 0;
+    const uint8_t *p = (const uint8_t *)buf;
+    while (total < len) {
+        ssize_t w = write(fd, p + total, len - total);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (client_poll_fd(fd, POLLOUT, 5000)) {
+                    continue;
+                }
+            }
+            return false;
+        }
+        if (w == 0) {
+            return false;
+        }
+        total += (size_t)w;
+    }
+    return true;
+}
+
+static bool client_read_up_to_eof(int fd, void *buf, size_t cap, size_t *out_read)
+{
+    if (out_read) {
+        *out_read = 0;
+    }
+    size_t total = 0;
+    uint8_t *p = (uint8_t *)buf;
+    while (total < cap) {
+        ssize_t r = read(fd, p + total, cap - total);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (client_poll_fd(fd, POLLIN, 5000)) {
+                    continue;
+                }
+            }
+            if (out_read) {
+                *out_read = total;
+            }
+            return false;
+        }
+        if (r == 0) {
+            break;
+        }
+        total += (size_t)r;
+    }
+    if (out_read) {
+        *out_read = total;
+    }
+    return true;
+}
+
+static bool atomic_write_file_bytes(const char *dst_path, const void *data, size_t len)
+{
+    if (!dst_path || dst_path[0] == '\0' || (len > 0 && !data)) {
+        return false;
+    }
+    char tmp_path[PATH_MAX + 64];
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld.XXXXXX", dst_path, (long)getpid());
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        return false;
+    }
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) {
+        return false;
+    }
+    (void)fchmod(fd, 0600);
+    bool ok = (len == 0 || client_write_exact(fd, data, len)) && (fsync(fd) == 0);
+    if (close(fd) != 0) {
+        ok = false;
+    }
+    if (!ok || rename(tmp_path, dst_path) != 0) {
+        (void)unlink(tmp_path);
+        return false;
+    }
+    return true;
+}
+
+static bool atomic_save_png_bgra(const char *dst_path, const uint8_t *bgra, uint32_t w, uint32_t h)
+{
+    if (!dst_path || dst_path[0] == '\0' || !bgra || w == 0 || h == 0) {
+        return false;
+    }
+    char tmp_path[PATH_MAX + 64];
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld.XXXXXX", dst_path, (long)getpid());
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        return false;
+    }
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) {
+        return false;
+    }
+    (void)close(fd);
+    if (!image_save_png_bgra(tmp_path, bgra, w, h)) {
+        (void)unlink(tmp_path);
+        return false;
+    }
+    (void)chmod(tmp_path, 0600);
+    int rfd = open(tmp_path, O_RDONLY | O_CLOEXEC);
+    if (rfd >= 0) {
+        (void)fsync(rfd);
+        close(rfd);
+    }
+    if (rename(tmp_path, dst_path) != 0) {
+        (void)unlink(tmp_path);
+        return false;
+    }
+    return true;
+}
+
 static bool load_image_or_video_first_frame(const char *path, bool no_cache, uint8_t **out_px,
                                             uint32_t *out_w, uint32_t *out_h,
                                             const waywal_solar_config_t *solar_cfg)
@@ -549,22 +714,12 @@ static bool load_image_or_video_first_frame(const char *path, bool no_cache, uin
                         uint8_t *cached = (uint8_t *)malloc(thumb_bytes);
                         if (cached) {
                             size_t got = 0;
-                            while (got < thumb_bytes) {
-                                ssize_t r = read(cfd, cached + got, thumb_bytes - got);
-                                if (r < 0) {
-                                    if (errno == EINTR)
-                                        continue;
-                                    break;
-                                }
-                                if (r == 0)
-                                    break;
-                                got += (size_t)r;
-                            }
-                            if (got == thumb_bytes) {
+                            if (client_read_up_to_eof(cfd, cached, thumb_bytes, &got) &&
+                                got == thumb_bytes) {
                                 close(cfd);
                                 if (access(path_buf_cstr(&thumb_png_file), R_OK) != 0) {
-                                    (void)image_save_png_bgra(path_buf_cstr(&thumb_png_file),
-                                                              cached, 128U, 128U);
+                                    (void)atomic_save_png_bgra(path_buf_cstr(&thumb_png_file),
+                                                               cached, 128U, 128U);
                                 }
                                 *out_px = cached;
                                 *out_w = 128U;
@@ -625,19 +780,7 @@ static bool load_image_or_video_first_frame(const char *path, bool no_cache, uin
 
     uint8_t *buf = (uint8_t *)malloc(thumb_bytes);
     size_t len = 0;
-    bool read_ok = (buf != NULL);
-    while (read_ok && len < thumb_bytes) {
-        ssize_t n = read(pfd[0], buf + len, thumb_bytes - len);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            read_ok = false;
-            break;
-        }
-        if (n == 0)
-            break;
-        len += (size_t)n;
-    }
+    bool read_ok = (buf != NULL) && client_read_up_to_eof(pfd[0], buf, thumb_bytes, &len);
     close(pfd[0]);
     int status = 0;
     pid_t wres;
@@ -654,18 +797,8 @@ static bool load_image_or_video_first_frame(const char *path, bool no_cache, uin
     if (have_thumb_path) {
         (void)mkdir(path_buf_cstr(&cache_root), 0700);
         (void)mkdir(path_buf_cstr(&thumbs_dir), 0700);
-        int wfd = open(path_buf_cstr(&thumb_file), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (wfd >= 0) {
-            size_t wr = 0;
-            while (wr < thumb_bytes) {
-                ssize_t w = write(wfd, buf + wr, thumb_bytes - wr);
-                if (w <= 0)
-                    break;
-                wr += (size_t)w;
-            }
-            close(wfd);
-        }
-        (void)image_save_png_bgra(path_buf_cstr(&thumb_png_file), buf, 128U, 128U);
+        (void)atomic_write_file_bytes(path_buf_cstr(&thumb_file), buf, thumb_bytes);
+        (void)atomic_save_png_bgra(path_buf_cstr(&thumb_png_file), buf, 128U, 128U);
     }
 
     *out_px = buf;
@@ -715,7 +848,7 @@ static bool ensure_video_thumbnail_png(const char *path, bool no_cache, char *ou
     bool ok = false;
     if (load_image_or_video_first_frame(path, no_cache, &px, &w, &h_px, NULL) && px && w > 0 &&
         h_px > 0) {
-        ok = image_save_png_bgra(path_buf_cstr(&png_file), px, w, h_px);
+        ok = atomic_save_png_bgra(path_buf_cstr(&png_file), px, w, h_px);
         char real_p[PATH_MAX];
         if (ok && realpath(path, real_p) != NULL && strcmp(real_p, path) != 0) {
             uint64_t hr = hash_file_meta_u64(real_p);
@@ -723,7 +856,7 @@ static bool ensure_video_thumbnail_png(const char *path, bool no_cache, char *ou
             snprintf(rfname, sizeof(rfname), "%016llx.png", (unsigned long long)hr);
             path_buf_t rpng = thumbs_dir;
             if (path_buf_push(&rpng, rfname)) {
-                (void)image_save_png_bgra(path_buf_cstr(&rpng), px, w, h_px);
+                (void)atomic_save_png_bgra(path_buf_cstr(&rpng), px, w, h_px);
             }
         }
         image_free(px);
@@ -731,7 +864,7 @@ static bool ensure_video_thumbnail_png(const char *path, bool no_cache, char *ou
         uint8_t *fallback = (uint8_t *)malloc(160U * 90U * 4U);
         if (fallback) {
             if (waywal_render_shader_preview_bgra(path, fallback, 160U, 90U)) {
-                ok = image_save_png_bgra(path_buf_cstr(&png_file), fallback, 160U, 90U);
+                ok = atomic_save_png_bgra(path_buf_cstr(&png_file), fallback, 160U, 90U);
             }
             free(fallback);
         }
@@ -784,7 +917,7 @@ static bool ensure_shader_thumbnail_png(const char *path, bool no_cache, char *o
         return false;
     }
     bool ok = waywal_render_shader_preview_bgra(path, buf, 160U, 90U) &&
-              image_save_png_bgra(path_buf_cstr(&png_file), buf, 160U, 90U);
+              atomic_save_png_bgra(path_buf_cstr(&png_file), buf, 160U, 90U);
     if (ok) {
         char real_p[PATH_MAX];
         if (realpath(path, real_p) != NULL && strcmp(real_p, path) != 0) {
@@ -793,7 +926,7 @@ static bool ensure_shader_thumbnail_png(const char *path, bool no_cache, char *o
             snprintf(rfname, sizeof(rfname), "%016llx.png", (unsigned long long)hr);
             path_buf_t rpng = thumbs_dir;
             if (path_buf_push(&rpng, rfname)) {
-                (void)image_save_png_bgra(path_buf_cstr(&rpng), buf, 160U, 90U);
+                (void)atomic_save_png_bgra(path_buf_cstr(&rpng), buf, 160U, 90U);
             }
         }
     }
@@ -851,7 +984,7 @@ static bool ensure_image_thumbnail_png(const char *path, bool no_cache, char *ou
     if (!image_load(path, &px, &w, &h_px) || !px || w == 0 || h_px == 0) {
         return false;
     }
-    bool ok = image_save_png_bgra(path_buf_cstr(&png_file), px, w, h_px);
+    bool ok = atomic_save_png_bgra(path_buf_cstr(&png_file), px, w, h_px);
     image_free(px);
     if (ok && out_png && out_cap > 0) {
         snprintf(out_png, out_cap, "%s", path_buf_cstr(&png_file));
@@ -875,11 +1008,16 @@ static size_t clear_cache_dir_files(const char *dir_path)
         if (strcmp(ent->d_name, "current_wallpaper.png") == 0)
             continue;
         size_t nlen = strlen(ent->d_name);
-        bool is_cached_ext = (nlen > 4 && (strcasecmp(ent->d_name + nlen - 4, ".mp4") == 0 ||
-                                           strcasecmp(ent->d_name + nlen - 4, ".bin") == 0 ||
-                                           strcasecmp(ent->d_name + nlen - 4, ".png") == 0 ||
-                                           strcasecmp(ent->d_name + nlen - 4, ".jpg") == 0)) ||
-                             (nlen > 5 && strcasecmp(ent->d_name + nlen - 5, ".bgra") == 0);
+        bool is_cached_ext =
+            (nlen > 4 && (strcasecmp(ent->d_name + nlen - 4, ".mp4") == 0 ||
+                          strcasecmp(ent->d_name + nlen - 4, ".bin") == 0 ||
+                          strcasecmp(ent->d_name + nlen - 4, ".png") == 0 ||
+                          strcasecmp(ent->d_name + nlen - 4, ".jpg") == 0)) ||
+            (nlen > 5 && (strcasecmp(ent->d_name + nlen - 5, ".bgra") == 0 ||
+                          strcasecmp(ent->d_name + nlen - 5, ".webp") == 0 ||
+                          strcasecmp(ent->d_name + nlen - 5, ".webm") == 0 ||
+                          strcasecmp(ent->d_name + nlen - 5, ".jpeg") == 0 ||
+                          strcasecmp(ent->d_name + nlen - 5, ".lock") == 0));
         if (!is_cached_ext)
             continue;
 
@@ -1049,24 +1187,6 @@ static int handle_cmd_theme(const cli_options_t *opts, const waywal_config_t *cf
     return 0;
 }
 
-static bool client_write_exact(int fd, const void *buf, size_t len)
-{
-    size_t total = 0;
-    const uint8_t *p = (const uint8_t *)buf;
-    while (total < len) {
-        ssize_t w = write(fd, p + total, len - total);
-        if (w < 0) {
-            if (errno == EINTR)
-                continue;
-            return false;
-        }
-        if (w == 0)
-            return false;
-        total += (size_t)w;
-    }
-    return true;
-}
-
 static bool drain_and_print_reply(int socket_fd, size_t payload_size, bool print_out)
 {
     char buf[4096];
@@ -1075,8 +1195,13 @@ static bool drain_and_print_reply(int socket_fd, size_t payload_size, bool print
         size_t to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
         ssize_t r = read(socket_fd, buf, to_read);
         if (r < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR) {
                 continue;
+            }
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+                client_poll_fd(socket_fd, POLLIN, 5000)) {
+                continue;
+            }
             return false;
         }
         if (r == 0)
@@ -1089,41 +1214,43 @@ static bool drain_and_print_reply(int socket_fd, size_t payload_size, bool print
     return true;
 }
 
-static bool send_audio_ctrl_request(const cli_options_t *opts, const char *ns, bool print_reply)
+static bool cli_ipc_send_framed(int socket_fd, const waywal_ipc_hdr_t *hdr, const void *payload,
+                                size_t payload_len, int attached_fd)
 {
-    if (!opts)
-        return false;
-    int afd = waywal_ipc_client_connect(ns ? ns : opts->namespace_str, 3000);
-    if (afd < 0)
-        return false;
+    return waywal_ipc_send_payload_fds(socket_fd, hdr, payload, payload_len,
+                                       attached_fd >= 0 ? &attached_fd : NULL,
+                                       attached_fd >= 0 ? 1U : 0U);
+}
 
-    waywal_audio_ctrl_payload_t apay;
-    memset(&apay, 0, sizeof(apay));
-    apay.volume = opts->volume;
-    apay.mute_on_audio = opts->mute_on_audio;
-    apay.theme_from_media = opts->theme_from_media;
-
-    waywal_ipc_hdr_t req = {
-        .magic = WAYWAL_IPC_MAGIC,
-        .version = WAYWAL_IPC_VERSION,
-        .opcode = WAYWAL_REQ_AUDIO_CTRL,
-        .payload_size = sizeof(apay),
-    };
-    if (!waywal_ipc_send(afd, &req, -1) || !client_write_exact(afd, &apay, sizeof(apay))) {
-        close(afd);
+static bool cli_recv_reply(int socket_fd, waywal_ipc_hdr_t *out_hdr, int *out_attached_fd)
+{
+    if (!out_hdr || !out_attached_fd) {
         return false;
     }
-
-    waywal_ipc_hdr_t resp;
-    int attached_fd = -1;
-    bool ok = waywal_ipc_recv(afd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK;
-    if (ok && print_reply && resp.payload_size > 0 && resp.payload_size <= 16384) {
-        (void)drain_and_print_reply(afd, (size_t)resp.payload_size, true);
+    for (int iter = 0; iter < 64; ++iter) {
+        waywal_ipc_hdr_t hdr;
+        int afd = -1;
+        if (!waywal_ipc_recv(socket_fd, &hdr, &afd)) {
+            return false;
+        }
+        if (hdr.opcode == WAYWAL_RESP_EVENT) {
+            if (afd >= 0) {
+                close(afd);
+            }
+            if (hdr.payload_size > 65536U) {
+                return false;
+            }
+            if (hdr.payload_size > 0 &&
+                !drain_and_print_reply(socket_fd, (size_t)hdr.payload_size, false)) {
+                return false;
+            }
+            continue;
+        }
+        *out_hdr = hdr;
+        *out_attached_fd = afd;
+        return true;
     }
-    if (attached_fd >= 0)
-        close(attached_fd);
-    close(afd);
-    return ok;
+    return false;
 }
 
 static char *read_shader_file(const char *path, size_t *out_len)
@@ -1159,88 +1286,6 @@ static char *read_shader_file(const char *path, size_t *out_len)
     fclose(f);
     *out_len = read_bytes + 1; /* Include null terminator */
     return buf;
-}
-
-static void query_max_target_resolution(const cli_options_t *opts, uint32_t *out_w, uint32_t *out_h)
-{
-    *out_w = 2560;
-    *out_h = 1440;
-
-    int qfd = waywal_ipc_client_connect(opts->namespace_str, 500);
-    if (qfd < 0)
-        return;
-
-    waywal_ipc_hdr_t req = {
-        .magic = WAYWAL_IPC_MAGIC,
-        .version = WAYWAL_IPC_VERSION,
-        .opcode = WAYWAL_REQ_QUERY,
-        .payload_size = 0,
-    };
-    if (!waywal_ipc_send(qfd, &req, -1)) {
-        close(qfd);
-        return;
-    }
-
-    waywal_ipc_hdr_t resp;
-    int attached_fd = -1;
-    if (!waywal_ipc_recv(qfd, &resp, &attached_fd) || resp.opcode != WAYWAL_RESP_INFO ||
-        resp.payload_size == 0 || resp.payload_size >= 16384) {
-        if (attached_fd >= 0)
-            close(attached_fd);
-        close(qfd);
-        return;
-    }
-    if (attached_fd >= 0)
-        close(attached_fd);
-
-    char buf[4096];
-    size_t to_read = resp.payload_size < sizeof(buf) - 1 ? resp.payload_size : sizeof(buf) - 1;
-    size_t total = 0;
-    while (total < to_read) {
-        size_t rem = sizeof(buf) - 1 - total;
-        if (to_read - total < rem) {
-            rem = to_read - total;
-        }
-        if (rem == 0)
-            break;
-        ssize_t r = read(qfd, buf + total, rem);
-        if (r < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-        if (r == 0)
-            break;
-        total += (size_t)r;
-    }
-    close(qfd);
-    buf[total] = '\0';
-
-    uint32_t max_w = 0;
-    uint32_t max_h = 0;
-    char *saveptr = NULL;
-    for (char *line = strtok_r(buf, "\n", &saveptr); line != NULL;
-         line = strtok_r(NULL, "\n", &saveptr)) {
-        const char *p = line;
-        while ((p = strstr(p, ": ")) != NULL) {
-            p += 2;
-            unsigned int w = 0, h = 0;
-            int consumed = 0;
-            if (sscanf(p, "%ux%u, scale:%n", &w, &h, &consumed) == 2 && consumed > 0 && w > 0 &&
-                h > 0) {
-                if (w > max_w)
-                    max_w = w;
-                if (h > max_h)
-                    max_h = h;
-                break;
-            }
-        }
-    }
-
-    if (max_w > 0 && max_h > 0) {
-        *out_w = max_w;
-        *out_h = max_h;
-    }
 }
 
 static void exec_sibling_or_path_wwald(char *const daemon_argv[])
@@ -1342,7 +1387,276 @@ static int client_connect_or_spawn(const cli_options_t *opts, const char *ns)
     return -1;
 }
 
-static size_t collect_active_namespaces(const cli_options_t *opts, char out_ns[16][64])
+typedef struct {
+    char ns[64];
+    int fd;
+    bool persistent;
+} cli_ipc_slot_t;
+
+typedef struct {
+    cli_ipc_slot_t slots[16];
+    size_t count;
+} cli_ipc_pool_t;
+
+static void cli_ipc_pool_init(cli_ipc_pool_t *pool)
+{
+    if (!pool) {
+        return;
+    }
+    memset(pool, 0, sizeof(*pool));
+    for (size_t i = 0; i < 16U; ++i) {
+        pool->slots[i].fd = -1;
+    }
+}
+
+static void cli_ipc_pool_close_all(cli_ipc_pool_t *pool)
+{
+    if (!pool) {
+        return;
+    }
+    for (size_t i = 0; i < pool->count; ++i) {
+        if (pool->slots[i].fd >= 0) {
+            close(pool->slots[i].fd);
+            pool->slots[i].fd = -1;
+        }
+        pool->slots[i].persistent = false;
+    }
+    pool->count = 0;
+}
+
+static bool cli_ipc_pool_upgrade_persistent(int fd)
+{
+    waywal_ipc_hdr_t sub = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_SUBSCRIBE,
+        .payload_size = 0,
+    };
+    if (!cli_ipc_send_framed(fd, &sub, NULL, 0, -1)) {
+        return false;
+    }
+    waywal_ipc_hdr_t resp;
+    int attached_fd = -1;
+    bool ok = cli_recv_reply(fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK;
+    if (attached_fd >= 0) {
+        close(attached_fd);
+    }
+    if (!ok || resp.payload_size > 65536U) {
+        return false;
+    }
+    if (resp.payload_size > 0 &&
+        !drain_and_print_reply(fd, (size_t)resp.payload_size, false)) {
+        return false;
+    }
+    return true;
+}
+
+static int cli_ipc_pool_acquire(cli_ipc_pool_t *pool, const cli_options_t *opts, const char *ns,
+                                bool allow_spawn, bool want_persistent, int timeout_ms)
+{
+    const char *eff_ns = (ns && ns[0] != '\0') ? ns : (opts ? opts->namespace_str : "waywal");
+    cli_ipc_slot_t *slot = NULL;
+    if (pool) {
+        for (size_t i = 0; i < pool->count; ++i) {
+            if (strcmp(pool->slots[i].ns, eff_ns) == 0) {
+                slot = &pool->slots[i];
+                break;
+            }
+        }
+        if (slot && slot->fd >= 0) {
+            char peek = 0;
+            ssize_t pr = recv(slot->fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (pr == 0 || (pr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                close(slot->fd);
+                slot->fd = -1;
+                slot->persistent = false;
+            } else {
+                if (want_persistent && !slot->persistent) {
+                    if (cli_ipc_pool_upgrade_persistent(slot->fd)) {
+                        slot->persistent = true;
+                    } else {
+                        close(slot->fd);
+                        slot->fd = -1;
+                    }
+                }
+                if (slot->fd >= 0) {
+                    return slot->fd;
+                }
+            }
+        }
+    }
+
+    int fd = allow_spawn ? client_connect_or_spawn(opts, eff_ns)
+                         : waywal_ipc_client_connect(eff_ns, timeout_ms);
+    if (fd < 0) {
+        return -1;
+    }
+
+    bool is_persistent = false;
+    if (want_persistent) {
+        if (cli_ipc_pool_upgrade_persistent(fd)) {
+            is_persistent = true;
+        } else {
+            /* Fall back cleanly to a fresh single-shot connection if peer rejects SUBSCRIBE. */
+            close(fd);
+            fd = allow_spawn ? client_connect_or_spawn(opts, eff_ns)
+                             : waywal_ipc_client_connect(eff_ns, timeout_ms);
+            if (fd < 0) {
+                return -1;
+            }
+        }
+    }
+
+    if (pool) {
+        if (!slot && pool->count < 16U) {
+            slot = &pool->slots[pool->count++];
+            client_copy_cstr(slot->ns, sizeof(slot->ns), eff_ns);
+        }
+        if (slot) {
+            slot->fd = fd;
+            slot->persistent = is_persistent;
+        }
+    }
+    return fd;
+}
+
+static void cli_ipc_pool_release(cli_ipc_pool_t *pool, const char *ns, int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+    if (!pool) {
+        close(fd);
+        return;
+    }
+    const char *eff_ns = (ns && ns[0] != '\0') ? ns : "waywal";
+    for (size_t i = 0; i < pool->count; ++i) {
+        if (strcmp(pool->slots[i].ns, eff_ns) == 0 && pool->slots[i].fd == fd) {
+            if (!pool->slots[i].persistent) {
+                close(pool->slots[i].fd);
+                pool->slots[i].fd = -1;
+            }
+            return;
+        }
+    }
+    close(fd);
+}
+
+static bool send_audio_ctrl_request(cli_ipc_pool_t *pool, const cli_options_t *opts, const char *ns,
+                                    bool persistent, bool print_reply)
+{
+    if (!opts)
+        return false;
+    const char *eff_ns = (ns && ns[0] != '\0') ? ns : opts->namespace_str;
+    int afd = cli_ipc_pool_acquire(pool, opts, eff_ns, false, persistent, 3000);
+    if (afd < 0)
+        return false;
+
+    waywal_audio_ctrl_payload_t apay;
+    memset(&apay, 0, sizeof(apay));
+    apay.volume = opts->volume;
+    apay.mute_on_audio = opts->mute_on_audio;
+    apay.theme_from_media = opts->theme_from_media;
+
+    waywal_ipc_hdr_t req = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_AUDIO_CTRL,
+        .payload_size = sizeof(apay),
+    };
+    if (!cli_ipc_send_framed(afd, &req, &apay, sizeof(apay), -1)) {
+        cli_ipc_pool_release(pool, eff_ns, afd);
+        return false;
+    }
+
+    waywal_ipc_hdr_t resp;
+    int attached_fd = -1;
+    bool ok = cli_recv_reply(afd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK;
+    if (ok && print_reply && resp.payload_size > 0 && resp.payload_size <= 16384U) {
+        (void)drain_and_print_reply(afd, (size_t)resp.payload_size, true);
+    } else if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+        (void)drain_and_print_reply(afd, (size_t)resp.payload_size, false);
+    }
+    if (attached_fd >= 0)
+        close(attached_fd);
+    cli_ipc_pool_release(pool, eff_ns, afd);
+    return ok;
+}
+
+static void query_max_target_resolution(cli_ipc_pool_t *pool, const cli_options_t *opts,
+                                        const char *ns, bool persistent, uint32_t *out_w,
+                                        uint32_t *out_h)
+{
+    *out_w = 2560;
+    *out_h = 1440;
+
+    const char *eff_ns = (ns && ns[0] != '\0') ? ns : opts->namespace_str;
+    int qfd = cli_ipc_pool_acquire(pool, opts, eff_ns, false, persistent, 500);
+    if (qfd < 0)
+        return;
+
+    waywal_ipc_hdr_t req = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_QUERY,
+        .payload_size = 0,
+    };
+    if (!cli_ipc_send_framed(qfd, &req, NULL, 0, -1)) {
+        cli_ipc_pool_release(pool, eff_ns, qfd);
+        return;
+    }
+
+    waywal_ipc_hdr_t resp;
+    int attached_fd = -1;
+    if (!cli_recv_reply(qfd, &resp, &attached_fd) || resp.opcode != WAYWAL_RESP_INFO ||
+        resp.payload_size == 0 || resp.payload_size >= 16384U) {
+        if (attached_fd >= 0)
+            close(attached_fd);
+        cli_ipc_pool_release(pool, eff_ns, qfd);
+        return;
+    }
+    if (attached_fd >= 0)
+        close(attached_fd);
+
+    char buf[4096];
+    size_t to_read = resp.payload_size < sizeof(buf) - 1 ? resp.payload_size : sizeof(buf) - 1;
+    size_t total = 0;
+    (void)client_read_up_to_eof(qfd, buf, to_read, &total);
+    if (resp.payload_size > total) {
+        (void)drain_and_print_reply(qfd, (size_t)resp.payload_size - total, false);
+    }
+    cli_ipc_pool_release(pool, eff_ns, qfd);
+    buf[total] = '\0';
+
+    uint32_t max_w = 0;
+    uint32_t max_h = 0;
+    char *saveptr = NULL;
+    for (char *line = strtok_r(buf, "\n", &saveptr); line != NULL;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        const char *p = line;
+        while ((p = strstr(p, ": ")) != NULL) {
+            p += 2;
+            unsigned int w = 0, h = 0;
+            int consumed = 0;
+            if (sscanf(p, "%ux%u, scale:%n", &w, &h, &consumed) == 2 && consumed > 0 && w > 0 &&
+                h > 0) {
+                if (w > max_w)
+                    max_w = w;
+                if (h > max_h)
+                    max_h = h;
+                break;
+            }
+        }
+    }
+
+    if (max_w > 0 && max_h > 0) {
+        *out_w = max_w;
+        *out_h = max_h;
+    }
+}
+
+static size_t collect_active_namespaces(cli_ipc_pool_t *pool, const cli_options_t *opts,
+                                        bool persistent_probe, char out_ns[16][64])
 {
     if (!opts) {
         return 0;
@@ -1401,9 +1715,18 @@ static size_t collect_active_namespaces(const cli_options_t *opts, char out_ns[1
                     break;
                 }
             }
-            if (!dup && waywal_ipc_namespace_is_alive(cand)) {
-                client_copy_cstr(out_ns[count], 64, cand);
-                count++;
+            if (!dup) {
+                bool alive = false;
+                if (persistent_probe && pool) {
+                    int fd = cli_ipc_pool_acquire(pool, opts, cand, false, true, 150);
+                    alive = (fd >= 0);
+                } else {
+                    alive = waywal_ipc_namespace_is_alive(cand);
+                }
+                if (alive) {
+                    client_copy_cstr(out_ns[count], 64, cand);
+                    count++;
+                }
             }
         }
         closedir(dir);
@@ -1537,10 +1860,160 @@ typedef struct {
 } pick_item_t;
 
 typedef struct {
+    dev_t dev;
+    ino_t ino;
+} pick_dir_id_t;
+
+typedef struct {
     pick_item_t *items;
     size_t count;
     size_t cap;
+    size_t *target_idx_table;
+    size_t target_table_cap;
+    size_t *shader_idx_table;
+    size_t shader_table_cap;
+    pick_dir_id_t *dir_table;
+    uint8_t *dir_used;
+    size_t dir_count;
+    size_t dir_cap;
 } pick_list_t;
+
+static uint64_t pick_fnv1a_64_str(const char *s, bool ascii_lower)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    if (!s) {
+        return h;
+    }
+    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; ++p) {
+        unsigned char c = *p;
+        if (ascii_lower && c >= 'A' && c <= 'Z') {
+            c = (unsigned char)(c - 'A' + 'a');
+        }
+        h ^= c;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static uint64_t pick_fnv1a_64_title_type(const char *title, const char *type_str)
+{
+    uint64_t h = pick_fnv1a_64_str(title, false);
+    h ^= 0xffU;
+    h *= 0x100000001b3ULL;
+    for (const unsigned char *p = (const unsigned char *)(type_str ? type_str : ""); *p != '\0';
+         ++p) {
+        h ^= *p;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static void pick_list_free(pick_list_t *list)
+{
+    if (!list) {
+        return;
+    }
+    free(list->items);
+    free(list->target_idx_table);
+    free(list->shader_idx_table);
+    free(list->dir_table);
+    free(list->dir_used);
+    memset(list, 0, sizeof(*list));
+}
+
+static bool pick_list_mark_dir_visited(pick_list_t *list, dev_t dev, ino_t ino)
+{
+    if (!list) {
+        return true;
+    }
+    if (list->dir_cap == 0 || (list->dir_count + 1U) * 10U >= list->dir_cap * 7U) {
+        size_t new_cap = (list->dir_cap == 0) ? 32U : (list->dir_cap * 2U);
+        pick_dir_id_t *ntab = (pick_dir_id_t *)calloc(new_cap, sizeof(*ntab));
+        uint8_t *nused = (uint8_t *)calloc(new_cap, sizeof(*nused));
+        if (!ntab || !nused) {
+            free(ntab);
+            free(nused);
+            return true;
+        }
+        size_t mask = new_cap - 1U;
+        for (size_t i = 0; i < list->dir_cap; ++i) {
+            if (!list->dir_used[i]) {
+                continue;
+            }
+            uint64_t hv = (uint64_t)list->dir_table[i].dev ^
+                          ((uint64_t)list->dir_table[i].ino * 0x9e3779b97f4a7c15ULL);
+            hv ^= hv >> 30;
+            size_t slot = (size_t)(hv & mask);
+            while (nused[slot]) {
+                slot = (slot + 1U) & mask;
+            }
+            nused[slot] = 1U;
+            ntab[slot] = list->dir_table[i];
+        }
+        free(list->dir_table);
+        free(list->dir_used);
+        list->dir_table = ntab;
+        list->dir_used = nused;
+        list->dir_cap = new_cap;
+    }
+
+    size_t mask = list->dir_cap - 1U;
+    uint64_t hv = (uint64_t)dev ^ ((uint64_t)ino * 0x9e3779b97f4a7c15ULL);
+    hv ^= hv >> 30;
+    size_t slot = (size_t)(hv & mask);
+    while (list->dir_used[slot]) {
+        if (list->dir_table[slot].dev == dev && list->dir_table[slot].ino == ino) {
+            return false;
+        }
+        slot = (slot + 1U) & mask;
+    }
+    list->dir_used[slot] = 1U;
+    list->dir_table[slot].dev = dev;
+    list->dir_table[slot].ino = ino;
+    list->dir_count++;
+    return true;
+}
+
+static bool pick_list_ensure_string_tables(pick_list_t *list)
+{
+    if (list->target_table_cap > 0 &&
+        (list->count + 1U) * 10U < list->target_table_cap * 7U) {
+        return true;
+    }
+    size_t new_cap = (list->target_table_cap == 0) ? 64U : (list->target_table_cap * 2U);
+    size_t *ntarget = (size_t *)calloc(new_cap, sizeof(size_t));
+    size_t *nshader = (size_t *)calloc(new_cap, sizeof(size_t));
+    if (!ntarget || !nshader) {
+        free(ntarget);
+        free(nshader);
+        return false;
+    }
+    size_t mask = new_cap - 1U;
+    for (size_t i = 0; i < list->count; ++i) {
+        uint64_t th = pick_fnv1a_64_str(list->items[i].target_path, false);
+        size_t tslot = (size_t)(th & mask);
+        while (ntarget[tslot] != 0) {
+            tslot = (tslot + 1U) & mask;
+        }
+        ntarget[tslot] = i + 1U;
+
+        if (strcmp(list->items[i].type_str, "shader") == 0) {
+            uint64_t sh = pick_fnv1a_64_str(list->items[i].display_title, true);
+            size_t sslot = (size_t)(sh & mask);
+            while (nshader[sslot] != 0) {
+                sslot = (sslot + 1U) & mask;
+            }
+            nshader[sslot] = i + 1U;
+        }
+    }
+    free(list->target_idx_table);
+    free(list->shader_idx_table);
+    list->target_idx_table = ntarget;
+    list->shader_idx_table = nshader;
+    list->target_table_cap = new_cap;
+    list->shader_table_cap = new_cap;
+    return true;
+}
 
 static void sanitize_pick_title(const char *raw, char *out, size_t out_cap)
 {
@@ -1637,13 +2110,32 @@ static bool pick_list_add(pick_list_t *list, const char *title, const char *type
     char clean_title[256];
     sanitize_pick_title(title, clean_title, sizeof(clean_title));
 
-    for (size_t i = 0; i < list->count; ++i) {
-        if (strcmp(list->items[i].target_path, canon_target) == 0) {
+    if (!pick_list_ensure_string_tables(list)) {
+        return false;
+    }
+    size_t mask = list->target_table_cap - 1U;
+    uint64_t th = pick_fnv1a_64_str(canon_target, false);
+    size_t tslot = (size_t)(th & mask);
+    while (list->target_idx_table[tslot] != 0U) {
+        size_t idx = list->target_idx_table[tslot] - 1U;
+        if (strcmp(list->items[idx].target_path, canon_target) == 0) {
             return false;
         }
-        if (strcmp(type_str, "shader") == 0 && strcmp(list->items[i].type_str, "shader") == 0 &&
-            strcasecmp(list->items[i].display_title, clean_title) == 0) {
-            return false;
+        tslot = (tslot + 1U) & mask;
+    }
+
+    bool is_shader = (strcmp(type_str, "shader") == 0);
+    size_t sslot = 0;
+    if (is_shader) {
+        uint64_t sh = pick_fnv1a_64_str(clean_title, true);
+        sslot = (size_t)(sh & mask);
+        while (list->shader_idx_table[sslot] != 0U) {
+            size_t idx = list->shader_idx_table[sslot] - 1U;
+            if (strcmp(list->items[idx].type_str, "shader") == 0 &&
+                strcasecmp(list->items[idx].display_title, clean_title) == 0) {
+                return false;
+            }
+            sslot = (sslot + 1U) & mask;
         }
     }
 
@@ -1657,7 +2149,8 @@ static bool pick_list_add(pick_list_t *list, const char *title, const char *type
         list->cap = ncap;
     }
 
-    pick_item_t *it = &list->items[list->count++];
+    size_t new_idx = list->count++;
+    pick_item_t *it = &list->items[new_idx];
     memset(it, 0, sizeof(*it));
     snprintf(it->display_title, sizeof(it->display_title), "%s", clean_title);
     snprintf(it->type_str, sizeof(it->type_str), "%s", type_str);
@@ -1673,6 +2166,11 @@ static bool pick_list_add(pick_list_t *list, const char *title, const char *type
         }
     } else {
         snprintf(it->thumb_path, sizeof(it->thumb_path), "%s", canon_target);
+    }
+
+    list->target_idx_table[tslot] = new_idx + 1U;
+    if (is_shader) {
+        list->shader_idx_table[sslot] = new_idx + 1U;
     }
     return true;
 }
@@ -1723,6 +2221,8 @@ static void scan_pick_directory(const char *dir_path, int depth, pick_list_t *li
 
     struct stat dst;
     if (stat(dir_path, &dst) != 0 || !S_ISDIR(dst.st_mode))
+        return;
+    if (!pick_list_mark_dir_visited(list, dst.st_dev, dst.st_ino))
         return;
 
     if (pick_dir_has_workshop_marker(dir_path)) {
@@ -1784,6 +2284,125 @@ static void scan_pick_directory(const char *dir_path, int depth, pick_list_t *li
         }
     }
     closedir(d);
+}
+
+typedef struct {
+    size_t first_idx_plus_one;
+    size_t count;
+} pick_label_slot_t;
+
+static void pick_disambiguate_labels(pick_list_t *list)
+{
+    if (!list || list->count <= 1U) {
+        return;
+    }
+    size_t cap = 16U;
+    while (cap < list->count * 2U) {
+        if (cap > SIZE_MAX / 2U) {
+            return;
+        }
+        cap *= 2U;
+    }
+    pick_label_slot_t *slots = (pick_label_slot_t *)calloc(cap, sizeof(*slots));
+    if (!slots) {
+        return;
+    }
+    size_t mask = cap - 1U;
+
+    for (size_t i = 0; i < list->count; ++i) {
+        uint64_t h = pick_fnv1a_64_title_type(list->items[i].display_title, list->items[i].type_str);
+        size_t s = (size_t)(h & mask);
+        while (slots[s].first_idx_plus_one != 0U) {
+            const pick_item_t *ref = &list->items[slots[s].first_idx_plus_one - 1U];
+            if (strcmp(ref->display_title, list->items[i].display_title) == 0 &&
+                strcmp(ref->type_str, list->items[i].type_str) == 0) {
+                break;
+            }
+            s = (s + 1U) & mask;
+        }
+        if (slots[s].first_idx_plus_one == 0U) {
+            slots[s].first_idx_plus_one = i + 1U;
+        }
+        slots[s].count++;
+    }
+
+    for (size_t i = 0; i < list->count; ++i) {
+        pick_item_t *it = &list->items[i];
+        uint64_t h = pick_fnv1a_64_title_type(it->display_title, it->type_str);
+        size_t s = (size_t)(h & mask);
+        while (slots[s].first_idx_plus_one != 0U) {
+            const pick_item_t *ref = &list->items[slots[s].first_idx_plus_one - 1U];
+            if (strcmp(ref->display_title, it->display_title) == 0 &&
+                strcmp(ref->type_str, it->type_str) == 0) {
+                break;
+            }
+            s = (s + 1U) & mask;
+        }
+        if (slots[s].count <= 1U) {
+            continue;
+        }
+        const char *slash = strrchr(it->target_path, '/');
+        const char *hint = slash ? (slash + 1) : it->target_path;
+        char hint_buf[128];
+        if (strcmp(it->type_str, "workshop") != 0 && slash && slash > it->target_path) {
+            const char *prev = slash - 1;
+            while (prev > it->target_path && *prev != '/') {
+                prev--;
+            }
+            const char *parent_start = (*prev == '/') ? (prev + 1) : prev;
+            if (parent_start < slash) {
+                snprintf(hint_buf, sizeof(hint_buf), "%.*s/%s", (int)(slash - parent_start),
+                         parent_start, slash + 1);
+                hint = hint_buf;
+            }
+        }
+        char clean_hint[128];
+        sanitize_pick_title(hint, clean_hint, sizeof(clean_hint));
+        snprintf(it->display_label, sizeof(it->display_label), "%s [%s - %s]", it->display_title,
+                 it->type_str, clean_hint);
+    }
+
+    memset(slots, 0, cap * sizeof(*slots));
+    for (size_t i = 0; i < list->count; ++i) {
+        pick_item_t *it = &list->items[i];
+        uint64_t h = pick_fnv1a_64_str(it->display_label, false);
+        size_t s = (size_t)(h & mask);
+        while (slots[s].first_idx_plus_one != 0U) {
+            const pick_item_t *ref = &list->items[slots[s].first_idx_plus_one - 1U];
+            if (strcmp(ref->display_label, it->display_label) == 0) {
+                break;
+            }
+            s = (s + 1U) & mask;
+        }
+        if (slots[s].first_idx_plus_one == 0U) {
+            slots[s].first_idx_plus_one = i + 1U;
+            slots[s].count = 1U;
+            continue;
+        }
+        char base_label[512];
+        client_copy_cstr(base_label, sizeof(base_label), it->display_label);
+        size_t dup_idx = ++slots[s].count;
+        for (;;) {
+            snprintf(it->display_label, sizeof(it->display_label), "%.480s #%zu", base_label,
+                     dup_idx);
+            uint64_t dh = pick_fnv1a_64_str(it->display_label, false);
+            size_t ds = (size_t)(dh & mask);
+            while (slots[ds].first_idx_plus_one != 0U) {
+                const pick_item_t *ref = &list->items[slots[ds].first_idx_plus_one - 1U];
+                if (strcmp(ref->display_label, it->display_label) == 0) {
+                    break;
+                }
+                ds = (ds + 1U) & mask;
+            }
+            if (slots[ds].first_idx_plus_one == 0U) {
+                slots[ds].first_idx_plus_one = i + 1U;
+                slots[ds].count = 1U;
+                break;
+            }
+            dup_idx++;
+        }
+    }
+    free(slots);
 }
 
 static int cmp_pick_items(const void *a, const void *b)
@@ -1914,52 +2533,7 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
 
     if (list.count > 1) {
         qsort(list.items, list.count, sizeof(pick_item_t), cmp_pick_items);
-        for (size_t i = 0; i < list.count; ++i) {
-            bool collides = false;
-            for (size_t j = 0; j < list.count; ++j) {
-                if (i != j &&
-                    strcmp(list.items[i].display_title, list.items[j].display_title) == 0 &&
-                    strcmp(list.items[i].type_str, list.items[j].type_str) == 0) {
-                    collides = true;
-                    break;
-                }
-            }
-            if (!collides) {
-                continue;
-            }
-            pick_item_t *it = &list.items[i];
-            const char *slash = strrchr(it->target_path, '/');
-            const char *hint = slash ? (slash + 1) : it->target_path;
-            char hint_buf[128];
-            if (strcmp(it->type_str, "workshop") != 0 && slash && slash > it->target_path) {
-                const char *prev = slash - 1;
-                while (prev > it->target_path && *prev != '/') {
-                    prev--;
-                }
-                const char *parent_start = (*prev == '/') ? (prev + 1) : prev;
-                if (parent_start < slash) {
-                    snprintf(hint_buf, sizeof(hint_buf), "%.*s/%s", (int)(slash - parent_start),
-                             parent_start, slash + 1);
-                    hint = hint_buf;
-                }
-            }
-            char clean_hint[128];
-            sanitize_pick_title(hint, clean_hint, sizeof(clean_hint));
-            snprintf(it->display_label, sizeof(it->display_label), "%s [%s - %s]",
-                     it->display_title, it->type_str, clean_hint);
-        }
-        for (size_t i = 0; i < list.count; ++i) {
-            size_t dup_idx = 1;
-            for (size_t j = i + 1; j < list.count; ++j) {
-                if (strcmp(list.items[i].display_label, list.items[j].display_label) == 0) {
-                    dup_idx++;
-                    char base_label[512];
-                    client_copy_cstr(base_label, sizeof(base_label), list.items[j].display_label);
-                    snprintf(list.items[j].display_label, sizeof(list.items[j].display_label),
-                             "%.480s #%zu", base_label, dup_idx);
-                }
-            }
-        }
+        pick_disambiguate_labels(&list);
     }
 
     waywal_pick_menu_t mode = opts->pick_menu;
@@ -1975,7 +2549,7 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
             fprintf(stdout, "icon\x1f%s\x1finfo\x1f%s\n", it->thumb_path, it->target_path);
         }
         fflush(stdout);
-        free(list.items);
+        pick_list_free(&list);
         return 0;
     }
 
@@ -1997,13 +2571,13 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
         }
         fputs("]\n", stdout);
         fflush(stdout);
-        free(list.items);
+        pick_list_free(&list);
         return 0;
     }
 
     if (list.count == 0) {
         fprintf(stderr, "Error: No wallpapers, Workshop items, videos, or shaders found to pick\n");
-        free(list.items);
+        pick_list_free(&list);
         return 1;
     }
 
@@ -2019,7 +2593,7 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
         } else {
             fprintf(stderr, "Error: No supported launcher (rofi, fuzzel, walker, dmenu) found in "
                             "PATH. Use --menu stdout or --menu json.\n");
-            free(list.items);
+            pick_list_free(&list);
             return 1;
         }
     }
@@ -2037,7 +2611,7 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
     if (pipe(to_child) != 0) {
         sigaction(SIGINT, &old_sa_int, NULL);
         sigaction(SIGTERM, &old_sa_term, NULL);
-        free(list.items);
+        pick_list_free(&list);
         return 1;
     }
     if (pipe(from_child) != 0) {
@@ -2045,7 +2619,7 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
         close(to_child[1]);
         sigaction(SIGINT, &old_sa_int, NULL);
         sigaction(SIGTERM, &old_sa_term, NULL);
-        free(list.items);
+        pick_list_free(&list);
         return 1;
     }
 
@@ -2057,7 +2631,7 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
         close(from_child[1]);
         sigaction(SIGINT, &old_sa_int, NULL);
         sigaction(SIGTERM, &old_sa_term, NULL);
-        free(list.items);
+        pick_list_free(&list);
         return 1;
     }
 
@@ -2158,6 +2732,10 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
                     break;
                 continue;
             }
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+                client_poll_fd(from_child[0], POLLIN, 500)) {
+                continue;
+            }
             break;
         }
         if (r == 0)
@@ -2168,26 +2746,41 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
     sel_buf[sel_len] = '\0';
 
     int status = 0;
-    pid_t wres;
-    do {
-        if (g_pick_child_interrupted) {
-            kill(pid, SIGTERM);
+    pid_t wres = -1;
+    bool reaped = false;
+    bool signaled = false;
+    while (!reaped) {
+        if (g_pick_child_interrupted && !signaled) {
+            (void)kill(pid, SIGTERM);
+            signaled = true;
         }
         wres = waitpid(pid, &status, 0);
-    } while (wres < 0 && errno == EINTR && !g_pick_child_interrupted);
+        if (wres == pid) {
+            reaped = true;
+            break;
+        }
+        if (wres < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
 
     sigaction(SIGINT, &old_sa_int, NULL);
     sigaction(SIGTERM, &old_sa_term, NULL);
 
-    if (g_pick_child_interrupted || wres < 0) {
-        kill(pid, SIGTERM);
-        waitpid(pid, &status, 0);
-        free(list.items);
+    if (g_pick_child_interrupted || !reaped) {
+        if (!reaped) {
+            (void)kill(pid, SIGTERM);
+            do {
+                wres = waitpid(pid, &status, 0);
+            } while (wres < 0 && errno == EINTR);
+        }
+        pick_list_free(&list);
         return 130;
     }
 
-    if (wres != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || sel_len == 0) {
-        free(list.items);
+    if (!reaped || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || sel_len == 0) {
+        pick_list_free(&list);
         return 0;
     }
 
@@ -2254,7 +2847,7 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
 
     if (!selected_target || selected_target[0] == '\0') {
         fprintf(stderr, "Error: Could not resolve selected wallpaper '%s'\n", sel_buf);
-        free(list.items);
+        pick_list_free(&list);
         return 1;
     }
 
@@ -2265,7 +2858,7 @@ static int handle_cmd_pick(cli_options_t *opts, bool *out_should_execute)
     if (out_should_execute) {
         *out_should_execute = true;
     }
-    free(list.items);
+    pick_list_free(&list);
     return 0;
 }
 
@@ -2309,6 +2902,8 @@ static int handle_cmd_shader_list(const cli_options_t *opts)
 
 int main(int argc, char *argv[])
 {
+    signal(SIGPIPE, SIG_IGN);
+
     waywal_config_t cfg;
     (void)waywal_config_load_default(&cfg);
 
@@ -2498,39 +3093,72 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    bool promoted_gif = false;
     if (opts.cmd == CLI_CMD_IMG && !opts.read_stdin && !opts.is_solid_color && opts.animate &&
         is_gif_file(opts.filepath)) {
         opts.cmd = CLI_CMD_VIDEO;
+        promoted_gif = true;
     }
+
+    bool has_audio_override =
+        (opts.cmd != CLI_CMD_AUDIO) &&
+        (opts.volume >= 0.0f || opts.mute_on_audio >= 0 || opts.theme_from_media >= 0);
+    bool want_persistent = (opts.cmd != CLI_CMD_SUBSCRIBE) &&
+                           (opts.all_namespaces || has_audio_override ||
+                            (opts.cmd == CLI_CMD_VIDEO && !opts.no_cache));
+
+    cli_ipc_pool_t ipc_pool;
+    cli_ipc_pool_init(&ipc_pool);
+
+    char target_namespaces[16][64];
+    size_t ns_count = collect_active_namespaces(
+        &ipc_pool, &opts, want_persistent && opts.all_namespaces, target_namespaces);
 
     char effective_video_path[4096];
     effective_video_path[0] = '\0';
     if (opts.cmd == CLI_CMD_VIDEO) {
-        uint32_t max_w = 2560, max_h = 1440;
-        query_max_target_resolution(&opts, &max_w, &max_h);
-        if (max_w == 0 || max_h == 0) {
-            max_w = 2560;
-            max_h = 1440;
-        }
         bool is_gif = is_gif_file(opts.filepath);
         bool vid_ok = false;
         if (opts.no_cache) {
             if (!is_gif) {
                 client_copy_cstr(effective_video_path, sizeof(effective_video_path), opts.filepath);
                 vid_ok = true;
+            } else {
+                fprintf(stderr,
+                        "Note: --no-cache skips cached GIF-to-MP4 video transcoding for '%s'; "
+                        "using uncached native GIF animation playback instead%s.\n",
+                        opts.filepath,
+                        (promoted_gif || opts.video_loop_count > 0 || opts.video_speed != 1.0f)
+                            ? " (--loop/--speed apply only to cached video playback)"
+                            : "");
+                opts.cmd = CLI_CMD_IMG;
             }
         } else {
+            uint32_t max_w = 2560, max_h = 1440;
+            query_max_target_resolution(&ipc_pool, &opts, target_namespaces[0], want_persistent,
+                                        &max_w, &max_h);
+            if (max_w == 0 || max_h == 0) {
+                max_w = 2560;
+                max_h = 1440;
+            }
             vid_ok = video_transcode_optimize(opts.filepath, max_w, max_h, effective_video_path,
                                               sizeof(effective_video_path));
-        }
-        if (!vid_ok) {
-            if (is_gif) {
-                opts.cmd = CLI_CMD_IMG;
-            } else {
-                fprintf(stderr, "Error: Failed to process video/GIF input: %s\n", opts.filepath);
-                return 1;
+            if (!vid_ok) {
+                if (is_gif) {
+                    fprintf(stderr,
+                            "Warning: GIF video transcoding failed for '%s'; falling back to "
+                            "native GIF image playback.\n",
+                            opts.filepath);
+                    opts.cmd = CLI_CMD_IMG;
+                } else {
+                    fprintf(stderr, "Error: Failed to process video/GIF input: %s\n",
+                            opts.filepath);
+                    cli_ipc_pool_close_all(&ipc_pool);
+                    return 1;
+                }
             }
-        } else {
+        }
+        if (vid_ok) {
             if (!opts.no_cache) {
                 char vthumb[4096] = {0};
                 (void)ensure_video_thumbnail_png(opts.filepath, false, vthumb, sizeof(vthumb));
@@ -2550,7 +3178,7 @@ int main(int argc, char *argv[])
                                          (unsigned long long)he);
                                 path_buf_t epng = tdir;
                                 if (path_buf_push(&epng, efname)) {
-                                    (void)image_save_png_bgra(path_buf_cstr(&epng), tpx, tw, th);
+                                    (void)atomic_save_png_bgra(path_buf_cstr(&epng), tpx, tw, th);
                                 }
                                 char real_e[PATH_MAX];
                                 if (realpath(effective_video_path, real_e) != NULL &&
@@ -2560,8 +3188,8 @@ int main(int argc, char *argv[])
                                              (unsigned long long)hre);
                                     path_buf_t repng = tdir;
                                     if (path_buf_push(&repng, efname)) {
-                                        (void)image_save_png_bgra(path_buf_cstr(&repng), tpx, tw,
-                                                                  th);
+                                        (void)atomic_save_png_bgra(path_buf_cstr(&repng), tpx, tw,
+                                                                   th);
                                     }
                                 }
                             }
@@ -2620,6 +3248,7 @@ int main(int argc, char *argv[])
             fprintf(stderr,
                     "Error: Shader preset '%s' not found (run 'wwal shader list' to see presets)\n",
                     opts.filepath);
+            cli_ipc_pool_close_all(&ipc_pool);
             return 1;
         }
         if (waywal_shader_is_audio_reactive(opts.filepath)) {
@@ -2679,6 +3308,7 @@ int main(int argc, char *argv[])
         if (opts.custom_shader_path[0] != '\0') {
             img_shader_src = read_shader_file(opts.custom_shader_path, &img_shader_len);
             if (!img_shader_src) {
+                cli_ipc_pool_close_all(&ipc_pool);
                 return 1;
             }
         }
@@ -2689,6 +3319,7 @@ int main(int argc, char *argv[])
             img_pixels = (uint8_t *)malloc((size_t)img_width * img_height * 4);
             if (!img_pixels) {
                 free(img_shader_src);
+                cli_ipc_pool_close_all(&ipc_pool);
                 return 1;
             }
             for (size_t pi = 0; pi < (size_t)img_width * img_height; ++pi) {
@@ -2703,6 +3334,7 @@ int main(int argc, char *argv[])
             uint8_t *stdin_buf = (uint8_t *)malloc(cap);
             if (!stdin_buf) {
                 free(img_shader_src);
+                cli_ipc_pool_close_all(&ipc_pool);
                 return 1;
             }
             bool read_ok = true;
@@ -2725,6 +3357,10 @@ int main(int argc, char *argv[])
                 if (n < 0) {
                     if (errno == EINTR)
                         continue;
+                    if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+                        client_poll_fd(STDIN_FILENO, POLLIN, 5000)) {
+                        continue;
+                    }
                     read_ok = false;
                     break;
                 }
@@ -2738,6 +3374,7 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "Error: Failed to decode image from stdin\n");
                 free(stdin_buf);
                 free(img_shader_src);
+                cli_ipc_pool_close_all(&ipc_pool);
                 return 1;
             }
             free(stdin_buf);
@@ -2767,6 +3404,7 @@ int main(int argc, char *argv[])
                         "Error: Failed to resolve or decode dynamic wallpaper manifest '%s'\n",
                         opts.filepath);
                 free(img_shader_src);
+                cli_ipc_pool_close_all(&ipc_pool);
                 return 1;
             }
             if (res.has_theme_mode && !opts.has_theme_mode && !opts.auto_day_night) {
@@ -2777,6 +3415,7 @@ int main(int argc, char *argv[])
             if (!image_load(opts.filepath, &img_pixels, &img_width, &img_height)) {
                 fprintf(stderr, "Error: Failed to decode image file '%s'\n", opts.filepath);
                 free(img_shader_src);
+                cli_ipc_pool_close_all(&ipc_pool);
                 return 1;
             }
         }
@@ -2806,14 +3445,12 @@ int main(int argc, char *argv[])
         }
     }
 
-    char target_namespaces[16][64];
-    size_t ns_count = collect_active_namespaces(&opts, target_namespaces);
     int ret_code = 0;
 
-    if (opts.cmd != CLI_CMD_AUDIO &&
-        (opts.volume >= 0.0f || opts.mute_on_audio >= 0 || opts.theme_from_media >= 0)) {
+    if (has_audio_override) {
         for (size_t ns_idx = 0; ns_idx < ns_count; ++ns_idx) {
-            (void)send_audio_ctrl_request(&opts, target_namespaces[ns_idx], false);
+            (void)send_audio_ctrl_request(&ipc_pool, &opts, target_namespaces[ns_idx],
+                                          want_persistent, false);
         }
     }
 
@@ -2822,7 +3459,8 @@ int main(int argc, char *argv[])
 
     for (size_t ns_idx = 0; ns_idx < ns_count; ++ns_idx) {
         const char *active_ns = target_namespaces[ns_idx];
-        int socket_fd = client_connect_or_spawn(&opts, active_ns);
+        int socket_fd =
+            cli_ipc_pool_acquire(&ipc_pool, &opts, active_ns, true, want_persistent, 2500);
         if (socket_fd < 0) {
             fprintf(stderr,
                     "Error: Unable to connect to wwald (namespace: %s).\n"
@@ -2846,7 +3484,7 @@ int main(int argc, char *argv[])
         switch (opts.cmd) {
         case CLI_CMD_PING: {
             req_hdr.opcode = WAYWAL_REQ_PING;
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, NULL, 0, -1)) {
                 fprintf(stderr, "Error: Failed to send ping request\n");
                 ret_code = 1;
                 break;
@@ -2854,10 +3492,15 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) &&
-                resp.opcode == WAYWAL_RESP_PONG) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_PONG) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 printf("wwald is alive (pong)\n");
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Unexpected response from daemon\n");
                 ret_code = 1;
             }
@@ -2876,27 +3519,40 @@ int main(int argc, char *argv[])
                     q_outputs_len += strlen(opts.outputs[i]) + 1;
                 }
             }
+            char *q_outputs_buf = NULL;
+            if (q_outputs_len > 0) {
+                q_outputs_buf = (char *)malloc(q_outputs_len);
+                if (!q_outputs_buf) {
+                    ret_code = 1;
+                    break;
+                }
+                size_t qpos = 0;
+                for (uint32_t i = 0; i < opts.num_outputs; ++i) {
+                    size_t slen = strlen(opts.outputs[i]) + 1;
+                    memcpy(q_outputs_buf + qpos, opts.outputs[i], slen);
+                    qpos += slen;
+                }
+            }
             req_hdr.payload_size = (uint32_t)q_outputs_len;
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            bool sent = cli_ipc_send_framed(socket_fd, &req_hdr, q_outputs_buf, q_outputs_len, -1);
+            free(q_outputs_buf);
+            if (!sent) {
                 fprintf(stderr, "Error: Failed to send query request\n");
                 ret_code = 1;
                 break;
             }
-            if (q_outputs_len > 0) {
-                for (uint32_t i = 0; i < opts.num_outputs; ++i) {
-                    size_t slen = strlen(opts.outputs[i]) + 1;
-                    (void)client_write_exact(socket_fd, opts.outputs[i], slen);
-                }
-            }
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) &&
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) &&
                 (resp.opcode == WAYWAL_RESP_INFO || resp.opcode == WAYWAL_RESP_OK)) {
-                if (resp.payload_size > 0 && resp.payload_size <= 65536) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
                     (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
                 }
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Failed to query outputs from daemon\n");
                 ret_code = 1;
             }
@@ -2933,21 +3589,27 @@ int main(int argc, char *argv[])
             req_hdr.opcode = WAYWAL_REQ_CLEAR;
             req_hdr.payload_size = clear_payload_size;
 
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-                !client_write_exact(socket_fd, clear_buf, clear_payload_size)) {
+            bool sent =
+                cli_ipc_send_framed(socket_fd, &req_hdr, clear_buf, clear_payload_size, -1);
+            free(clear_buf);
+            if (!sent) {
                 fprintf(stderr, "Error: Failed to send clear request\n");
-                free(clear_buf);
                 ret_code = 1;
                 break;
             }
-            free(clear_buf);
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 printf("Wallpaper cleared to #%02x%02x%02x%02x\n", opts.clear_color.r,
                        opts.clear_color.g, opts.clear_color.b, opts.clear_color.a);
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Daemon failed to clear wallpaper\n");
                 ret_code = 1;
             }
@@ -2997,36 +3659,33 @@ int main(int argc, char *argv[])
 
             req_hdr.payload_size = video_payload_size;
 
+            bool sent = cli_ipc_send_framed(socket_fd, &req_hdr, video_buf, video_payload_size,
+                                            video_fd);
             if (video_fd >= 0) {
-                if (!waywal_ipc_send(socket_fd, &req_hdr, video_fd)) {
-                    fprintf(stderr, "Error: Failed to send video fd to daemon\n");
-                    close(video_fd);
-                    free(video_buf);
-                    ret_code = 1;
-                    break;
-                }
                 close(video_fd);
-                (void)client_write_exact(socket_fd, video_buf, video_payload_size);
-            } else {
-                if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-                    !client_write_exact(socket_fd, video_buf, video_payload_size)) {
-                    fprintf(stderr, "Error: Failed to send video request to daemon\n");
-                    free(video_buf);
-                    ret_code = 1;
-                    break;
-                }
             }
             free(video_buf);
+            if (!sent) {
+                fprintf(stderr, "Error: Failed to send video request to daemon\n");
+                ret_code = 1;
+                break;
+            }
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 printf("Playing video wallpaper: %s\n", opts.filepath);
                 if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
                     wallpaper_hook_ran = true;
                     (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
                 }
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(
                     stderr,
                     "Error: Daemon rejected video request (check if video format is supported)\n");
@@ -3039,16 +3698,22 @@ int main(int argc, char *argv[])
 
         case CLI_CMD_PAUSE: {
             req_hdr.opcode = WAYWAL_REQ_PAUSE;
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, NULL, 0, -1)) {
                 fprintf(stderr, "Error: Failed to send pause request\n");
                 ret_code = 1;
                 break;
             }
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 printf("Video playback paused\n");
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Unexpected response to pause request\n");
                 ret_code = 1;
             }
@@ -3059,16 +3724,22 @@ int main(int argc, char *argv[])
 
         case CLI_CMD_UNPAUSE: {
             req_hdr.opcode = WAYWAL_REQ_UNPAUSE;
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, NULL, 0, -1)) {
                 fprintf(stderr, "Error: Failed to send unpause request\n");
                 ret_code = 1;
                 break;
             }
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 printf("Video playback resumed\n");
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Unexpected response to unpause request\n");
                 ret_code = 1;
             }
@@ -3079,16 +3750,22 @@ int main(int argc, char *argv[])
 
         case CLI_CMD_TOGGLE: {
             req_hdr.opcode = WAYWAL_REQ_TOGGLE;
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, NULL, 0, -1)) {
                 fprintf(stderr, "Error: Failed to send toggle request\n");
                 ret_code = 1;
                 break;
             }
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 printf("Video playback toggled\n");
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Unexpected response to toggle request\n");
                 ret_code = 1;
             }
@@ -3099,7 +3776,7 @@ int main(int argc, char *argv[])
 
         case CLI_CMD_KILL: {
             req_hdr.opcode = WAYWAL_REQ_KILL;
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, NULL, 0, -1)) {
                 fprintf(stderr, "Error: Failed to send kill request\n");
                 ret_code = 1;
                 break;
@@ -3107,7 +3784,7 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
                 printf("wwald daemon terminated cleanly\n");
             } else {
                 fprintf(stderr, "Error: Unexpected response to kill command\n");
@@ -3151,8 +3828,23 @@ int main(int argc, char *argv[])
             memset(&meta, 0, sizeof(meta));
             meta.width = img_width;
             meta.height = img_height;
-            meta.pixel_format =
-                opts.enable_10bit ? WAYWAL_FORMAT_XRGB2101010 : WAYWAL_FORMAT_ARGB8888;
+            if (opts.enable_10bit) {
+                meta.pixel_format = WAYWAL_FORMAT_XRGB2101010;
+            } else if (opts.pixel_format[0] != '\0') {
+                if (strcasecmp(opts.pixel_format, "xrgb") == 0 ||
+                    strcasecmp(opts.pixel_format, "xrgb8888") == 0 ||
+                    strcasecmp(opts.pixel_format, "xbgr") == 0) {
+                    meta.pixel_format = WAYWAL_FORMAT_XRGB8888;
+                } else if (strcasecmp(opts.pixel_format, "xrgb2101010") == 0) {
+                    meta.pixel_format = WAYWAL_FORMAT_XRGB2101010;
+                } else if (strcasecmp(opts.pixel_format, "argb2101010") == 0) {
+                    meta.pixel_format = WAYWAL_FORMAT_ARGB2101010;
+                } else {
+                    meta.pixel_format = WAYWAL_FORMAT_ARGB8888;
+                }
+            } else {
+                meta.pixel_format = WAYWAL_FORMAT_ARGB8888;
+            }
             meta.transition_type = opts.transition_type;
             meta.transition_duration_ms = opts.transition_duration_ms;
             meta.transition_fps = opts.transition_fps;
@@ -3240,17 +3932,20 @@ int main(int argc, char *argv[])
             req_hdr.opcode = WAYWAL_REQ_SET_IMAGE;
             req_hdr.payload_size = total_payload_size;
 
-            if (!waywal_ipc_send(socket_fd, &req_hdr, memfd)) {
+            bool sent = cli_ipc_send_framed(socket_fd, &req_hdr, NULL, 0, memfd);
+            close(memfd);
+            if (!sent) {
                 fprintf(stderr, "Error: Failed to send image to daemon via SCM_RIGHTS\n");
-                close(memfd);
                 ret_code = 1;
                 break;
             }
-            close(memfd);
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 if (opts.is_solid_color) {
                     printf("Wallpaper cleared to #%02x%02x%02x%02x\n", opts.clear_color.r,
                            opts.clear_color.g, opts.clear_color.b, opts.clear_color.a);
@@ -3262,6 +3957,9 @@ int main(int argc, char *argv[])
                     (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
                 }
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Daemon rejected image request\n");
                 ret_code = 1;
             }
@@ -3339,8 +4037,7 @@ int main(int argc, char *argv[])
             req_hdr.opcode = WAYWAL_REQ_SLIDESHOW;
             req_hdr.payload_size = sizeof(spay);
 
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-                !client_write_exact(socket_fd, &spay, sizeof(spay))) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, &spay, sizeof(spay), -1)) {
                 fprintf(stderr, "Error: Failed to send slideshow request to daemon\n");
                 ret_code = 1;
                 break;
@@ -3348,10 +4045,16 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 printf("Slideshow started on '%s' (interval: %us, shuffle: %s)\n", opts.filepath,
                        opts.slideshow_interval_s, opts.slideshow_random ? "yes" : "no");
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr,
                         "Error: Daemon rejected slideshow request (check directory path)\n");
                 ret_code = 1;
@@ -3387,8 +4090,7 @@ int main(int argc, char *argv[])
             }
             req_hdr.payload_size = sizeof(sctrl);
 
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-                !client_write_exact(socket_fd, &sctrl, sizeof(sctrl))) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, &sctrl, sizeof(sctrl), -1)) {
                 fprintf(stderr, "Error: Failed to send slideshow control request\n");
                 ret_code = 1;
                 break;
@@ -3396,8 +4098,8 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384U) {
                     (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
                 } else {
                     const char *act_name = "action performed";
@@ -3424,6 +4126,9 @@ int main(int argc, char *argv[])
                     printf("Slideshow %s\n", act_name);
                 }
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Daemon rejected slideshow control request\n");
                 ret_code = 1;
             }
@@ -3479,8 +4184,7 @@ int main(int argc, char *argv[])
             req_hdr.opcode = WAYWAL_REQ_SHADER;
             req_hdr.payload_size = sizeof(spay);
 
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-                !client_write_exact(socket_fd, &spay, sizeof(spay))) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, &spay, sizeof(spay), -1)) {
                 fprintf(stderr, "Error: Failed to send shader request to daemon\n");
                 ret_code = 1;
                 break;
@@ -3488,10 +4192,13 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384U) {
                     (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
                 } else {
+                    if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                        (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                    }
                     printf("Shader wallpaper active: %s\n", spay.shader_path);
                 }
                 if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
@@ -3499,6 +4206,9 @@ int main(int argc, char *argv[])
                     (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
                 }
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Daemon rejected shader request\n");
                 ret_code = 1;
             }
@@ -3559,8 +4269,7 @@ int main(int argc, char *argv[])
             req_hdr.opcode = WAYWAL_REQ_WORKSHOP;
             req_hdr.payload_size = sizeof(wpay);
 
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-                !client_write_exact(socket_fd, &wpay, sizeof(wpay))) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, &wpay, sizeof(wpay), -1)) {
                 fprintf(stderr, "Error: Failed to send workshop request to daemon\n");
                 ret_code = 1;
                 break;
@@ -3568,10 +4277,13 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384U) {
                     (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
                 } else {
+                    if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                        (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                    }
                     printf("Workshop wallpaper active: %s\n", wpay.workshop_dir);
                 }
                 if (!wallpaper_hook_ran && cfg.hooks.on_wallpaper_change[0] != '\0') {
@@ -3579,6 +4291,9 @@ int main(int argc, char *argv[])
                     (void)waywal_palette_run_hook(cfg.hooks.on_wallpaper_change);
                 }
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Daemon rejected workshop request\n");
                 ret_code = 1;
             }
@@ -3591,7 +4306,7 @@ int main(int argc, char *argv[])
             req_hdr.opcode = opts.json_output ? WAYWAL_REQ_QUERY_JSON : WAYWAL_REQ_STATS;
             req_hdr.payload_size = 0;
 
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, NULL, 0, -1)) {
                 fprintf(stderr, "Error: Failed to send stats request to daemon\n");
                 ret_code = 1;
                 break;
@@ -3599,12 +4314,15 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) &&
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) &&
                 (resp.opcode == WAYWAL_RESP_OK || resp.opcode == WAYWAL_RESP_INFO)) {
-                if (resp.payload_size > 0 && resp.payload_size <= 65536) {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
                     (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
                 }
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Failed to query telemetry stats from daemon\n");
                 ret_code = 1;
             }
@@ -3633,11 +4351,24 @@ int main(int argc, char *argv[])
                 upay.values[i] = opts.uniform_values[i];
             }
             upay.num_components = opts.uniform_components;
+            if (strlen(upay.output) < sizeof(upay.structured.target_output) &&
+                strlen(opts.uniform_name) < sizeof(upay.structured.uniform_name) &&
+                opts.uniform_components >= 1U && opts.uniform_components <= 4U) {
+                upay.structured.struct_size = (uint32_t)sizeof(upay.structured);
+                upay.structured.flags = WAYWAL_UNIFORM_FLAG_STRUCTURED;
+                upay.structured.uniform_components = opts.uniform_components;
+                client_copy_cstr(upay.structured.target_output,
+                                 sizeof(upay.structured.target_output), upay.output);
+                client_copy_cstr(upay.structured.uniform_name,
+                                 sizeof(upay.structured.uniform_name), opts.uniform_name);
+                for (uint32_t i = 0; i < opts.uniform_components && i < 4; ++i) {
+                    upay.structured.uniform_values[i] = opts.uniform_values[i];
+                }
+            }
 
             req_hdr.opcode = WAYWAL_REQ_SET_UNIFORM;
             req_hdr.payload_size = sizeof(upay);
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-                !client_write_exact(socket_fd, &upay, sizeof(upay))) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, &upay, sizeof(upay), -1)) {
                 fprintf(stderr, "Error: Failed to send set-uniform request\n");
                 ret_code = 1;
                 break;
@@ -3645,11 +4376,16 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384U) {
                     (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+                } else if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
                 }
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Daemon rejected set-uniform request\n");
                 ret_code = 1;
             }
@@ -3667,8 +4403,7 @@ int main(int argc, char *argv[])
 
             req_hdr.opcode = WAYWAL_REQ_AUDIO_CTRL;
             req_hdr.payload_size = sizeof(apay);
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1) ||
-                !client_write_exact(socket_fd, &apay, sizeof(apay))) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, &apay, sizeof(apay), -1)) {
                 fprintf(stderr, "Error: Failed to send audio control request\n");
                 ret_code = 1;
                 break;
@@ -3676,11 +4411,16 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384U) {
                     (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
+                } else if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
                 }
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Daemon rejected audio control request\n");
                 ret_code = 1;
             }
@@ -3692,7 +4432,7 @@ int main(int argc, char *argv[])
         case CLI_CMD_SUBSCRIBE: {
             req_hdr.opcode = WAYWAL_REQ_SUBSCRIBE;
             req_hdr.payload_size = 0;
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, NULL, 0, -1)) {
                 fprintf(stderr, "Error: Failed to send subscribe request\n");
                 ret_code = 1;
                 break;
@@ -3751,7 +4491,7 @@ int main(int argc, char *argv[])
             req_hdr.opcode = WAYWAL_REQ_RESTORE;
             req_hdr.payload_size = 0;
 
-            if (!waywal_ipc_send(socket_fd, &req_hdr, -1)) {
+            if (!cli_ipc_send_framed(socket_fd, &req_hdr, NULL, 0, -1)) {
                 fprintf(stderr, "Error: Failed to send restore request to daemon\n");
                 ret_code = 1;
                 break;
@@ -3759,13 +4499,19 @@ int main(int argc, char *argv[])
 
             waywal_ipc_hdr_t resp;
             int attached_fd = -1;
-            if (waywal_ipc_recv(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
-                if (resp.payload_size > 0 && resp.payload_size <= 16384) {
+            if (cli_recv_reply(socket_fd, &resp, &attached_fd) && resp.opcode == WAYWAL_RESP_OK) {
+                if (resp.payload_size > 0 && resp.payload_size <= 16384U) {
                     (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, true);
                 } else {
+                    if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                        (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                    }
                     printf("OK: State restored\n");
                 }
             } else {
+                if (resp.payload_size > 0 && resp.payload_size <= 65536U) {
+                    (void)drain_and_print_reply(socket_fd, (size_t)resp.payload_size, false);
+                }
                 fprintf(stderr, "Error: Daemon failed to restore state\n");
                 ret_code = 1;
             }
@@ -3778,8 +4524,10 @@ int main(int argc, char *argv[])
             break;
         }
 
-        close(socket_fd);
+        cli_ipc_pool_release(&ipc_pool, active_ns, socket_fd);
     }
+
+    cli_ipc_pool_close_all(&ipc_pool);
 
     if (img_pixels) {
         if (opts.is_solid_color) {

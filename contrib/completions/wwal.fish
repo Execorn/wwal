@@ -8,7 +8,7 @@ set -l trans_pos "center top bottom left right top-left top-right bottom-left bo
 set -l sync_modes "simultaneous staggered"
 set -l scaling_modes "fill fit fit-border-color stretch center tile span crop cover contain no"
 set -l filters "Nearest Bilinear CatmullRom Mitchell Lanczos3"
-set -l formats "xrgb xbgr rgb bgr"
+set -l formats "xrgb argb xbgr rgb bgr"
 set -l layers "background bottom"
 set -l battery_policies "ignore reduce-fps pause-video"
 set -l backdrops "none auto-blur"
@@ -26,6 +26,7 @@ complete -c wwal -l no-daemon -d "Stay in foreground"
 complete -c wwal -s f -l format -a "$formats" -d "Pixel format hint (swww/awww compatibility)" -r
 complete -c wwal -l layer -a "$layers" -d "Wayland layer-shell layer" -r
 complete -c wwal -l battery-policy -a "$battery_policies" -d "Laptop battery power governor policy" -r
+complete -c wwal -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r -F
 complete -c wwal -s v -l verbose -d "Enable verbose output"
 complete -c wwal -s V -l version -d "Print version information"
 complete -c wwal -s h -l help -d "Display help message"
@@ -103,6 +104,8 @@ for subcmd in img slideshow pick
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l seed-color -d "Override palette extraction with explicit hex seed color" -r
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l theme-from-media -d "Extract Material You palette dynamically from MPRIS2 album art"
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l no-theme-from-media -d "Disable MPRIS2 album art theme extraction"
+    complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l fps -d "Target frame rate" -r
+    complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l shader -a "$shader_presets" -d "Apply live GLSL fragment shader or preset alongside wallpaper" -r -F
     complete -c wwal -n "__fish_seen_subcommand_from $subcmd" -l animate -d "Play animated GIF/WebP/APNG via video engine"
 end
 
@@ -139,8 +142,11 @@ complete -c wwal -n "__fish_seen_subcommand_from video" -l volume -d "Wallpaper 
 complete -c wwal -n "__fish_seen_subcommand_from video" -l mute-on-audio -d "Auto-duck volume when another app plays audio"
 complete -c wwal -n "__fish_seen_subcommand_from video" -l no-mute-on-audio -d "Disable automatic audio ducking"
 complete -c wwal -n "__fish_seen_subcommand_from video" -l crop-gravity -a "$crop_gravities" -d "Crop anchor for fill/crop mode" -r
-complete -c wwal -n "__fish_seen_subcommand_from video" -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r
+complete -c wwal -n "__fish_seen_subcommand_from video" -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r -F
 complete -c wwal -n "__fish_seen_subcommand_from video" -l layer -a "$layers" -d "Wayland layer-shell layer" -r
+complete -c wwal -n "__fish_seen_subcommand_from video" -l 10bit -d "Request 10-bit wide-gamut scanout"
+complete -c wwal -n "__fish_seen_subcommand_from video" -l no-cache -d "Bypass transcoded GIF fallback cache"
+complete -c wwal -n "__fish_seen_subcommand_from video" -l clear-cache -d "Purge cached transcodes and thumbnails before applying"
 complete -c wwal -n "__fish_seen_subcommand_from video" -l theme -d "Extract Material You palette and sync caelestia/OSC"
 complete -c wwal -n "__fish_seen_subcommand_from video" -l no-theme -d "Disable automatic Material You palette extraction"
 complete -c wwal -n "__fish_seen_subcommand_from video" -l theme-mode -a "dark light auto" -d "Target Material Design 3 polarity" -r
@@ -158,6 +164,7 @@ complete -c wwal -n "__fish_seen_subcommand_from video" -l no-theme-from-media -
 complete -c wwal -n "__fish_seen_subcommand_from shader" -a "list preset $shader_presets"
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l list -d "List built-in procedural shader presets"
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l preset -a "$shader_presets" -d "Run a built-in procedural shader preset" -r
+complete -c wwal -n "__fish_seen_subcommand_from shader" -l shader -a "$shader_presets" -d "Shader file path or built-in preset name" -r -F
 complete -c wwal -n "__fish_seen_subcommand_from shader" -F
 complete -c wwal -n "__fish_seen_subcommand_from shader" -s o -l output -d "Target monitor name(s)" -r
 complete -c wwal -n "__fish_seen_subcommand_from shader" -l outputs -d "Target monitor name(s)" -r
@@ -183,8 +190,9 @@ complete -c wwal -n "__fish_seen_subcommand_from workshop" -l volume -d "Wallpap
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l mute-on-audio -d "Auto-duck volume when another app plays audio"
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l no-mute-on-audio -d "Disable automatic audio ducking"
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l fps -d "Target frame rate" -r
-complete -c wwal -n "__fish_seen_subcommand_from workshop" -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l backdrop -a "$backdrops" -d "Overview backdrop mode" -r -F
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l layer -a "$layers" -d "Wayland layer-shell layer" -r
+complete -c wwal -n "__fish_seen_subcommand_from workshop" -l 10bit -d "Request 10-bit wide-gamut scanout"
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l theme -d "Extract Material You palette and sync caelestia/OSC"
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l no-theme -d "Disable automatic Material You palette extraction"
 complete -c wwal -n "__fish_seen_subcommand_from workshop" -l theme-mode -a "dark light auto" -d "Target Material Design 3 polarity" -r
@@ -207,6 +215,7 @@ complete -c wwal -n "__fish_seen_subcommand_from audio" -l no-theme-from-media -
 
 complete -c wwal -n "__fish_seen_subcommand_from slideshow" -a "start stop pause resume toggle next prev previous"
 complete -c wwal -n "__fish_seen_subcommand_from slideshow" -s d -l interval -l duration -d "Slideshow interval (seconds or 30m, 1h)" -r
+complete -c wwal -n "__fish_seen_subcommand_from slideshow" -l dir -l path -d "Slideshow directory path" -r -F
 complete -c wwal -n "__fish_seen_subcommand_from slideshow" -s s -l shuffle -d "Shuffle wallpapers randomly"
 complete -c wwal -n "__fish_seen_subcommand_from slideshow" -l random -d "Shuffle wallpapers randomly"
 complete -c wwal -n "__fish_seen_subcommand_from slideshow" -l sort -l sorting -a "$sort_modes" -d "Slideshow traversal sort order" -r

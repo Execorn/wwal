@@ -235,6 +235,9 @@ typedef struct {
     };
     bool has_solar_lat;
     bool has_solar_lon;
+    bool has_sync_mode;
+    bool has_stagger_delay;
+    bool has_10bit;
 } cli_options_t;
 
 typedef cli_options_t waywal_cli_opts_t;

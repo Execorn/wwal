@@ -77,7 +77,7 @@ At startup, after initializing DRM/GBM and Wayland connections, *wwald* locks it
 *--no-daemon*
 	Stay in the foreground (*swww-daemon* / *awww-daemon* compatibility).
 
-*-f, --format* <xrgb|xbgr|rgb|bgr>
+*-f, --format* <xrgb|argb|xbgr|rgb|bgr>
 	Pixel channel order hint (*swww-daemon* / *awww-daemon* compatibility).
 
 *-q, --quiet*

@@ -45,9 +45,10 @@ _wwal() {
         '(-q --quiet)'{-q,--quiet}'[Suppress non-error output]'
         '(-d --daemon)'{-d,--daemon}'[Fork daemon into background]'
         '--no-daemon[Stay in foreground]'
-        '(-f --format)'{-f,--format}'[Pixel format hint for swww/awww daemon compatibility]:format:(xrgb xbgr rgb bgr)'
+        '(-f --format)'{-f,--format}'[Pixel format hint for swww/awww daemon compatibility]:format:(xrgb argb xbgr rgb bgr)'
         '--layer[Wayland layer-shell layer]:layer:(background bottom)'
         '--battery-policy[Laptop battery power governor policy]:policy:(ignore reduce-fps pause-video)'
+        '--backdrop[Secondary overview backdrop surface mode]:backdrop:_alternative "modes:backdrop:(none auto-blur)" "files:image:_files"'
         '(-v --verbose)'{-v,--verbose}'[Enable verbose output]'
         '(-V --version)'{-V,--version}'[Print version information]'
         '(-h --help)'{-h,--help}'[Print help information]'
@@ -110,12 +111,16 @@ _wwal() {
                     _arguments \
                         $global_opts \
                         $trans_opts \
+                        '--fps[Target frame rate]:fps:' \
+                        '--shader[Apply live GLSL fragment shader or preset alongside image]:shader:_alternative "presets:preset:(aurora cyber_grid fluid_ink synthwave_sun starfield rain_glass audio_bars audio_ring crt_retro plasma_orb lava_lamp northern_lights outrun crt)" "files:shader:_files -g \"*.([fF][rR][aA][gG]|[cC][oO][mM][pP]|[gG][lL][sS][lL]|[sS][hH][aA][dD][eE][rR])\""' \
                         '1:wallpaper file or directory:_files -g "*.([pP][nN][gG]|[jJ][pP][gG]|[jJ][pP][eE][gG]|[wW][eE][bB][pP]|[aA][vV][iI][fF]|[hH][eE][iI][cC]|[hH][eE][iI][fF]|[jJ][xX][lL]|[sS][vV][gG]|[bB][mM][pP]|[gG][iI][fF]|[qQ][oO][iI]|[pP][pP][mM]|[pP][gG][mM]|[pP][nN][mM]|[tT][gG][aA]|[mM][pP]4|[wW][eE][bB][mM]|[mM][kK][vV]|[aA][vV][iI]|[mM][oO][vV]|[mM]4[vV]|[fF][rR][aA][gG]|[cC][oO][mM][pP]|[gG][lL][sS][lL]|[sS][hH][aA][dD][eE][rR]|[xX][mM][lL])"'
                     ;;
                 pick)
                     _arguments \
                         $global_opts \
                         $trans_opts \
+                        '--fps[Target frame rate]:fps:' \
+                        '--shader[Apply live GLSL fragment shader or preset alongside selected wallpaper]:shader:_alternative "presets:preset:(aurora cyber_grid fluid_ink synthwave_sun starfield rain_glass audio_bars audio_ring crt_retro plasma_orb lava_lamp northern_lights outrun crt)" "files:shader:_files -g \"*.([fF][rR][aA][gG]|[cC][oO][mM][pP]|[gG][lL][sS][lL]|[sS][hH][aA][dD][eE][rR])\""' \
                         '--menu[Launcher menu protocol]:menu:(auto rofi fuzzel walker dmenu stdout json)' \
                         '--dir[Add wallpaper search directory]:dir:_files -/' \
                         '1:directory:_files -/'
@@ -132,6 +137,9 @@ _wwal() {
                         '--no-mute-on-audio[Disable automatic audio ducking]' \
                         '--crop-gravity[Crop anchor for fill/crop mode]:gravity:(center top bottom left right top-left top-right bottom-left bottom-right tl tr bl br)' \
                         '--backdrop[Secondary overview backdrop surface mode]:backdrop:(none auto-blur)' \
+                        '--10bit[Request 10-bit wide-gamut scanout]' \
+                        '--no-cache[Bypass transcoded GIF fallback cache]' \
+                        '--clear-cache[Purge cached transcodes and thumbnails before applying]' \
                         '--theme[Extract Material You palette and sync caelestia/OSC]' \
                         '--no-theme[Disable automatic Material You palette extraction]' \
                         '--theme-mode[Target Material Design 3 polarity]:mode:(dark light auto)' \
@@ -180,6 +188,7 @@ _wwal() {
                             $global_opts \
                             '--list[List built-in procedural shader presets]' \
                             '--preset[Run a built-in procedural shader preset]:preset:(aurora cyber_grid fluid_ink synthwave_sun starfield rain_glass audio_bars audio_ring crt_retro plasma_orb lava_lamp northern_lights outrun crt)' \
+                            '--shader[Shader file path or built-in preset name]:shader:_alternative "presets:preset:(aurora cyber_grid fluid_ink synthwave_sun starfield rain_glass audio_bars audio_ring crt_retro plasma_orb lava_lamp northern_lights outrun crt)" "files:shader:_files -g \"*.([fF][rR][aA][gG]|[cC][oO][mM][pP]|[gG][lL][sS][lL]|[sS][hH][aA][dD][eE][rR])\""' \
                             '*'{-o,--output,--outputs}'[Target monitor name(s)]:output:' \
                             '--audio[Enable PipeWire 64-bin Bark FFT audio uniforms]' \
                             '--volume[Wallpaper audio volume (0.0..1.0)]:volume:' \
@@ -215,6 +224,7 @@ _wwal() {
                             '--mute-on-audio[Auto-duck volume when another app plays audio]' \
                             '--no-mute-on-audio[Disable automatic audio ducking]' \
                             '--fps[Target frame rate]:fps:' \
+                            '--10bit[Request 10-bit wide-gamut scanout]' \
                             '--backdrop[Secondary overview backdrop surface mode]:backdrop:(none auto-blur)' \
                             '--theme[Extract Material You palette and sync caelestia/OSC]' \
                             '--no-theme[Disable automatic Material You palette extraction]' \
@@ -287,7 +297,10 @@ _wwal() {
                                 _arguments \
                                     $global_opts \
                                     $trans_opts \
+                                    '--fps[Target frame rate]:fps:' \
+                                    '--shader[Apply live GLSL fragment shader or preset]:shader:_alternative "presets:preset:(aurora cyber_grid fluid_ink synthwave_sun starfield rain_glass audio_bars audio_ring crt_retro plasma_orb lava_lamp northern_lights outrun crt)" "files:shader:_files -g \"*.([fF][rR][aA][gG]|[cC][oO][mM][pP]|[gG][lL][sS][lL]|[sS][hH][aA][dD][eE][rR])\""' \
                                     '(-d --interval --duration)'{-d,--interval,--duration}'[Slideshow interval (seconds or 30m, 1h)]:interval:' \
+                                    '(--dir --path)'{--dir,--path}'[Slideshow directory path]:dir:_files -/' \
                                     '(-s --shuffle --random)'{-s,--shuffle,--random}'[Shuffle wallpapers randomly]' \
                                     '(--sort --sorting)'{--sort,--sorting}'[Slideshow traversal sort order]:sort:(ascending descending name mtime random)' \
                                     '--recursive[Scan slideshow directory recursively]' \
