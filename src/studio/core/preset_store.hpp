@@ -52,7 +52,7 @@ struct WallpaperPreset {
 };
 
 /* ========================================================================= */
-/* Preset Store Management (~/.config/waywal/presets/<id>.toml)              */
+/* Preset Store Management ($XDG_CONFIG_HOME/wwal/presets/<id>.toml)         */
 /* ========================================================================= */
 
 class PresetStore : public QObject {
@@ -81,6 +81,8 @@ class PresetStore : public QObject {
 
   private:
     void ensureDirectoryExists() const;
+    [[nodiscard]] bool loadPresetInternal(const QString &id, WallpaperPreset &outPreset,
+                                          QString *errorOut) const;
     QString m_baseDir;
 };
 
