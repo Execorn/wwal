@@ -23,6 +23,7 @@
 
 #include "waywal/ipc_proto.h"
 #include "waywal/ipc_proto_phase3.h"
+#include "waywal/os_compat.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -35,7 +36,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -498,6 +501,308 @@ static void test_adversarial_nan_enum_and_bounds_fuzz(void)
     printf("  -> PASS: Adversarial NaN/Inf, enum & bounds wire fuzzing verified.\n");
 }
 
+static bool p3_read_exact(int fd, void *buf, size_t len)
+{
+    uint8_t *dst = (uint8_t *)buf;
+    size_t got = 0u;
+    while (got < len) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        if (poll(&pfd, 1, 2000) <= 0) {
+            return false;
+        }
+        ssize_t n = recv(fd, dst + got, len - got, 0);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        got += (size_t)n;
+    }
+    return true;
+}
+
+static void test_structured_uniform_148b_and_legacy_compat(void)
+{
+    printf("[Test] Structured 148 B Uniform & Legacy 64/64 Compat ...\n");
+
+    assert(sizeof(waywal_set_uniform_structured_t) == 148u);
+    assert(sizeof(waywal_set_uniform_payload_t) == 148u);
+
+    waywal_set_uniform_payload_t pay;
+    memset(&pay, 0, sizeof(pay));
+    pay.structured.struct_size = sizeof(waywal_set_uniform_structured_t);
+    pay.structured.flags = WAYWAL_UNIFORM_FLAG_STRUCTURED | WAYWAL_UNIFORM_FLAG_PERSIST;
+    snprintf(pay.structured.target_output, sizeof(pay.structured.target_output), "%s", "DP-1");
+    snprintf(pay.structured.uniform_name, sizeof(pay.structured.uniform_name), "%s", "u_exposure");
+    pay.structured.uniform_components = 3u;
+    pay.structured.uniform_values[0] = 1.25f;
+    pay.structured.uniform_values[1] = 0.50f;
+    pay.structured.uniform_values[2] = 2.00f;
+    pay.structured.uniform_values[3] = 0.00f;
+
+    assert(waywal_validate_set_uniform_structured(&pay.structured));
+
+    char target[64] = {0};
+    char uname[64] = {0};
+    uint32_t comps = 0u;
+    float vals[4] = {0};
+    uint32_t flags = 0u;
+    assert(waywal_decode_set_uniform_payload(&pay, target, sizeof(target), uname, sizeof(uname),
+                                             &comps, vals, &flags));
+    assert(strcmp(target, "DP-1") == 0);
+    assert(strcmp(uname, "u_exposure") == 0);
+    assert(comps == 3u);
+    assert(fabsf(vals[0] - 1.25f) < 1e-6f);
+    assert(fabsf(vals[1] - 0.50f) < 1e-6f);
+    assert(fabsf(vals[2] - 2.00f) < 1e-6f);
+    assert(flags == (WAYWAL_UNIFORM_FLAG_STRUCTURED | WAYWAL_UNIFORM_FLAG_PERSIST));
+
+    /* Missing STRUCTURED flag with struct_size == 148 B must be rejected. */
+    waywal_set_uniform_payload_t bad_pay = pay;
+    bad_pay.structured.flags = WAYWAL_UNIFORM_FLAG_PERSIST;
+    assert(!waywal_decode_set_uniform_payload(&bad_pay, target, sizeof(target), uname,
+                                              sizeof(uname), &comps, vals, &flags));
+
+    /* Unknown flag bits, component bounds, non-finite floats, and unterminated names must fail. */
+    waywal_set_uniform_structured_t bad_st = pay.structured;
+    bad_st.flags |= 0x8000u;
+    assert(!waywal_validate_set_uniform_structured(&bad_st));
+
+    bad_st = pay.structured;
+    bad_st.struct_size = 144u;
+    assert(!waywal_validate_set_uniform_structured(&bad_st));
+
+    bad_st = pay.structured;
+    bad_st.uniform_components = 0u;
+    assert(!waywal_validate_set_uniform_structured(&bad_st));
+
+    bad_st = pay.structured;
+    bad_st.uniform_components = 5u;
+    assert(!waywal_validate_set_uniform_structured(&bad_st));
+
+    bad_st = pay.structured;
+    bad_st.uniform_values[2] = NAN;
+    assert(!waywal_validate_set_uniform_structured(&bad_st));
+
+    bad_st = pay.structured;
+    bad_st.uniform_values[3] = INFINITY;
+    assert(!waywal_validate_set_uniform_structured(&bad_st));
+
+    bad_st = pay.structured;
+    bad_st.uniform_name[0] = '\0';
+    assert(!waywal_validate_set_uniform_structured(&bad_st));
+
+    bad_st = pay.structured;
+    memset(bad_st.target_output, 'X', sizeof(bad_st.target_output));
+    assert(!waywal_validate_set_uniform_structured(&bad_st));
+
+    /* Legacy 64/64 wire form (struct_size == 0) remains compatible. */
+    waywal_set_uniform_payload_t leg;
+    memset(&leg, 0, sizeof(leg));
+    snprintf(leg.output, sizeof(leg.output), "%s", "HDMI-A-1");
+    snprintf(leg.name, sizeof(leg.name), "%s", "u_gamma");
+    leg.num_components = 1u;
+    leg.values[0] = 2.2f;
+    assert(waywal_decode_set_uniform_payload(&leg, target, sizeof(target), uname, sizeof(uname),
+                                             &comps, vals, &flags));
+    assert(strcmp(target, "HDMI-A-1") == 0);
+    assert(strcmp(uname, "u_gamma") == 0);
+    assert(comps == 1u);
+    assert(fabsf(vals[0] - 2.2f) < 1e-6f);
+    assert(flags == 0u);
+
+    printf("  -> PASS: 148 B structured uniform and legacy 64/64 compatibility verified.\n");
+}
+
+static void test_export_0x8006_0x8007_single_sendmsg_framing(void)
+{
+    printf("[Test] Single-sendmsg 0x8006 TELEMETRY & 0x8007 DMABUF + F_SEAL_SHRINK ...\n");
+
+    int sv[2] = {-1, -1};
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0);
+
+    /* 0x8006 telemetry snapshot (1208 B, 0 SCM_RIGHTS FDs) */
+    waywal_telemetry_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.version = 1u;
+    snap.rss_kib = 4096u;
+    snap.num_outputs = 1u;
+    snap.bark_bands[0] = 0.75f;
+
+    waywal_ipc_hdr_t thdr = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_RESP_TELEMETRY,
+        .payload_size = sizeof(snap),
+    };
+    assert(waywal_ipc_send_payload_fds(sv[0], &thdr, &snap, sizeof(snap), NULL, 0u));
+
+    waywal_ipc_hdr_t rhdr = {0};
+    int rx_fds[4] = {-1, -1, -1, -1};
+    size_t rx_nfds = 99u;
+    assert(waywal_ipc_recv_fds(sv[1], &rhdr, rx_fds, 4u, &rx_nfds));
+    assert(rhdr.magic == WAYWAL_IPC_MAGIC);
+    assert(rhdr.version == WAYWAL_IPC_VERSION);
+    assert(rhdr.opcode == WAYWAL_RESP_TELEMETRY);
+    assert(rhdr.payload_size == sizeof(snap));
+    assert(rx_nfds == 0u);
+
+    waywal_telemetry_snapshot_t snap_rx;
+    memset(&snap_rx, 0, sizeof(snap_rx));
+    assert(p3_read_exact(sv[1], &snap_rx, sizeof(snap_rx)));
+    assert(memcmp(&snap_rx, &snap, sizeof(snap)) == 0);
+
+    /* 0x8007 DMABUF export response (128 B + 2 shrink-sealed plane FDs) */
+    int planes[2] = {-1, -1};
+    planes[0] = waywal_create_memfd("waywal-test-plane0", 4096u, F_SEAL_SHRINK);
+    planes[1] = waywal_create_memfd("waywal-test-plane1", 4096u, F_SEAL_SHRINK);
+    assert(planes[0] >= 0 && planes[1] >= 0);
+
+    waywal_export_dmabuf_resp_t dresp;
+    memset(&dresp, 0, sizeof(dresp));
+    dresp.width = 1920u;
+    dresp.height = 1080u;
+    dresp.drm_format = 0x34325241u;
+    dresp.num_planes = 2u;
+    dresp.strides[0] = 7680u;
+    dresp.strides[1] = 3840u;
+    snprintf(dresp.output, sizeof(dresp.output), "%s", "DP-1");
+    dresp.flags = 0x2u;
+
+    waywal_ipc_hdr_t dhdr = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_RESP_DMABUF,
+        .payload_size = sizeof(dresp),
+    };
+    assert(waywal_ipc_send_payload_fds(sv[0], &dhdr, &dresp, sizeof(dresp), planes, 2u));
+    close(planes[0]);
+    close(planes[1]);
+
+    memset(&rhdr, 0, sizeof(rhdr));
+    rx_nfds = 0u;
+    assert(waywal_ipc_recv_fds(sv[1], &rhdr, rx_fds, 4u, &rx_nfds));
+    assert(rhdr.opcode == WAYWAL_RESP_DMABUF);
+    assert(rhdr.payload_size == sizeof(dresp));
+    assert(rx_nfds == 2u);
+    assert(rx_fds[0] >= 0 && rx_fds[1] >= 0);
+
+    for (size_t i = 0; i < rx_nfds; ++i) {
+        int seals = fcntl(rx_fds[i], F_GET_SEALS);
+        assert(seals >= 0 && (seals & F_SEAL_SHRINK) != 0);
+        close(rx_fds[i]);
+    }
+
+    waywal_export_dmabuf_resp_t dresp_rx;
+    memset(&dresp_rx, 0, sizeof(dresp_rx));
+    assert(p3_read_exact(sv[1], &dresp_rx, sizeof(dresp_rx)));
+    assert(memcmp(&dresp_rx, &dresp, sizeof(dresp)) == 0);
+
+    close(sv[0]);
+    close(sv[1]);
+    printf("  -> PASS: 0x8006/0x8007 single-sendmsg framing & F_SEAL_SHRINK verified.\n");
+}
+
+static void test_nonblocking_eagain_and_sigpipe_resilience(void)
+{
+    printf("[Test] Non-blocking SOCK_NONBLOCK EAGAIN & SIGPIPE=SIG_IGN Resilience ...\n");
+
+    struct sigaction sa_ign = {0};
+    struct sigaction sa_prev = {0};
+    sa_ign.sa_handler = SIG_IGN;
+    sigemptyset(&sa_ign.sa_mask);
+    assert(sigaction(SIGPIPE, &sa_ign, &sa_prev) == 0);
+
+    int sv[2] = {-1, -1};
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv) == 0);
+    close(sv[1]);
+
+    /* Disconnected peer must yield EPIPE without killing the process. */
+    const uint8_t probe = 0xAAu;
+    ssize_t dead_w = send(sv[0], &probe, 1u, MSG_NOSIGNAL | MSG_DONTWAIT);
+    assert(dead_w < 0 && errno == EPIPE);
+    close(sv[0]);
+
+    /* Exercise full EAGAIN + short-write completion across a constrained UNIX socket buffer. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv) == 0);
+    int small_buf = 8192;
+    (void)setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small_buf, sizeof(small_buf));
+    (void)setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &small_buf, sizeof(small_buf));
+
+    const size_t total_len = 256u * 1024u;
+    uint8_t *tx_buf = malloc(total_len);
+    assert(tx_buf != NULL);
+    for (size_t i = 0; i < total_len; ++i) {
+        tx_buf[i] = (uint8_t)((i * 131u + 17u) & 0xFFu);
+    }
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        close(sv[0]);
+        uint8_t chunk[2048];
+        size_t got = 0u;
+        while (got < total_len) {
+            struct pollfd pfd = {.fd = sv[1], .events = POLLIN, .revents = 0};
+            if (poll(&pfd, 1, 3000) <= 0) {
+                _exit(2);
+            }
+            ssize_t r = recv(sv[1], chunk, sizeof(chunk), 0);
+            if (r < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                _exit(3);
+            }
+            if (r == 0) {
+                _exit(4);
+            }
+            for (ssize_t k = 0; k < r; ++k) {
+                uint8_t expected = (uint8_t)(((got + (size_t)k) * 131u + 17u) & 0xFFu);
+                if (chunk[k] != expected) {
+                    _exit(5);
+                }
+            }
+            got += (size_t)r;
+        }
+        close(sv[1]);
+        _exit(0);
+    }
+
+    close(sv[1]);
+    size_t sent = 0u;
+    while (sent < total_len) {
+        ssize_t n = send(sv[0], tx_buf + sent, total_len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = {.fd = sv[0], .events = POLLOUT, .revents = 0};
+                assert(poll(&pfd, 1, 3000) > 0);
+                continue;
+            }
+            assert(0 && "Unexpected send failure in non-blocking test");
+        }
+        assert(n > 0);
+        sent += (size_t)n;
+    }
+
+    close(sv[0]);
+    free(tx_buf);
+
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    (void)sigaction(SIGPIPE, &sa_prev, NULL);
+
+    printf("  -> PASS: SOCK_NONBLOCK EAGAIN short-write completion & EPIPE resilience verified.\n");
+}
+
 /* ========================================================================= */
 /* 7. LIVE SOCKET WIRE TEST                                                  */
 /* ========================================================================= */
@@ -539,7 +844,9 @@ static int find_or_spawn_daemon(const char *ns, pid_t *out_pid, char *out_sock_p
         return 0;
     }
 
-    const char *candidates[] = {"build/wwald", "build/src/daemon/wwald", "../build/wwald", NULL};
+    const char *candidates[] = {"./wwald",        "build_worker/wwald",
+                                "build/wwald",    "build/src/daemon/wwald",
+                                "../build/wwald", NULL};
     const char *daemon_bin = NULL;
     for (int i = 0; candidates[i]; ++i) {
         if (access(candidates[i], X_OK) == 0) {
@@ -635,7 +942,9 @@ static void test_live_socket_round_trip(void)
         return;
     }
     if (ready < 0) {
-        if (getenv("WAYLAND_DISPLAY") == NULL && getenv("DISPLAY") == NULL) {
+        /* wwald requires a Wayland compositor; skip live test only when WAYLAND_DISPLAY is absent
+         */
+        if (getenv("WAYLAND_DISPLAY") == NULL) {
             printf("[TEST] Notice: Headless environment without Wayland display. Skipping live "
                    "test.\n");
             return;
@@ -828,6 +1137,9 @@ int main(void)
     test_physics_wire();
     test_scene_lights_wire();
     test_adversarial_nan_enum_and_bounds_fuzz();
+    test_structured_uniform_148b_and_legacy_compat();
+    test_export_0x8006_0x8007_single_sendmsg_framing();
+    test_nonblocking_eagain_and_sigpipe_resilience();
     test_live_socket_round_trip();
 
     printf("=================================================================\n");

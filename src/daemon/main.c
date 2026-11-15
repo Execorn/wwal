@@ -66,6 +66,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -268,17 +269,64 @@ bool output_matches_target_spec(const output_node_t *out, const char *target_spe
     return false;
 }
 
+static void copy_shallow_img_metadata(waywal_img_metadata_t *dst, const waywal_img_metadata_t *src)
+{
+    if (!dst) {
+        return;
+    }
+    if (!src) {
+        memset(dst, 0, sizeof(*dst));
+        return;
+    }
+    *dst = *src;
+    /* Clear variable-length tail counts because shallow copies exclude trailing IPC bytes. */
+    dst->num_target_outputs = 0u;
+    dst->custom_shader_len = 0u;
+    dst->extra_data_len = 0u;
+}
+
+static bool slideshow_is_alive(const daemon_state_t *state, const slideshow_engine_t *ss)
+{
+    if (!state || !ss) {
+        return false;
+    }
+    if (ss == &state->slideshow) {
+        return true;
+    }
+    for (const output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (out->slideshow_eng == ss) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void slideshow_clear_if_stale(daemon_state_t *state)
+{
+    if (!state || !state->g_presenting_slideshow) {
+        return;
+    }
+    if (!slideshow_is_alive(state, state->g_presenting_slideshow)) {
+        state->g_presenting_slideshow = NULL;
+    }
+}
+
 bool output_matches_img_meta(const output_node_t *out, const waywal_img_metadata_t *meta)
 {
     if (!out)
         return false;
     if (!meta || meta->num_target_outputs == 0)
         return true;
+    if (meta->extra_data_len == 0u || meta->extra_data_len > WWAL_MAX_EXTRA_IPC_BYTES ||
+        meta->custom_shader_len > meta->extra_data_len) {
+        return false;
+    }
 
     const char *ptr = (const char *)meta + sizeof(waywal_img_metadata_t);
-    uint32_t remaining = meta->extra_data_len;
-    for (uint32_t i = 0; i < meta->num_target_outputs; ++i) {
-        if (remaining == 0)
+    uint32_t remaining = meta->extra_data_len - meta->custom_shader_len;
+    uint32_t count = meta->num_target_outputs < 64u ? meta->num_target_outputs : 64u;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (remaining == 0u)
             break;
         size_t len = strnlen(ptr, remaining);
         if (len == remaining)
@@ -648,6 +696,9 @@ void stop_engines_on_output(daemon_state_t *state, output_node_t *out, bool keep
                     if (ss->timer_fd >= 0) {
                         unregister_fd_from_loops(state, ss->timer_fd);
                     }
+                    if (state->g_presenting_slideshow == ss) {
+                        state->g_presenting_slideshow = NULL;
+                    }
                     slideshow_destroy(ss);
                     free(ss);
                 }
@@ -926,8 +977,9 @@ bool try_start_native_animation(daemon_state_t *state, const char *filepath,
         anim_engine_stop_playback(state);
         state->anim_dec = dec;
         state->anim_active = true;
-        if (meta)
-            state->anim_meta = *meta;
+        if (meta) {
+            copy_shallow_img_metadata(&state->anim_meta, meta);
+        }
         if (!state->power_gov || !waywal_power_governor_should_pause_all(state->power_gov)) {
             arm_oneshot_timer_ms(state->anim_timer_fd, delay_ms > 0 ? delay_ms : 100);
         }
@@ -994,8 +1046,8 @@ bool try_start_native_animation(daemon_state_t *state, const char *filepath,
             snprintf(out->active_media_path, sizeof(out->active_media_path), "<stdin>");
         }
         if (meta) {
-            out->anim_meta = *meta;
-            state->anim_meta = *meta;
+            copy_shallow_img_metadata(&out->anim_meta, meta);
+            copy_shallow_img_metadata(&state->anim_meta, meta);
         }
 
         if (shared_bgra) {
@@ -1462,7 +1514,7 @@ void daemon_update_palette_from_bgra(daemon_state_t *state, const uint8_t *bgra_
     }
 
     if (meta) {
-        state->active_theme_meta = *meta;
+        copy_shallow_img_metadata(&state->active_theme_meta, meta);
         state->active_theme_meta.client_exported_theme = 0;
         state->has_active_theme_meta = true;
     } else {
@@ -2711,7 +2763,7 @@ static bool daemon_render_image_on_target_ex(daemon_state_t *state, const char *
         num_targets = 1;
     }
 
-    uint8_t meta_storage[sizeof(waywal_img_metadata_t) + 128];
+    uint8_t meta_storage[sizeof(waywal_img_metadata_t) + 256];
     memset(meta_storage, 0, sizeof(meta_storage));
     waywal_img_metadata_t *meta = (waywal_img_metadata_t *)meta_storage;
     if (state->in_solar_tick && state->has_active_theme_meta) {
@@ -2751,10 +2803,11 @@ static bool daemon_render_image_on_target_ex(daemon_state_t *state, const char *
     meta->scaling_mode = (uint32_t)scaling;
     meta->filter_mode = (uint32_t)filter;
     meta->ten_bit = ten_bit;
-    meta->num_target_outputs = num_targets;
-    meta->extra_data_len = (uint32_t)extra_len;
     daemon_copy_cstr(meta->filepath, sizeof(meta->filepath), filepath);
-    if (num_targets == 1 && extra_len <= 64) {
+    const size_t meta_tail_cap = sizeof(meta_storage) - sizeof(waywal_img_metadata_t);
+    if (num_targets == 1 && extra_len > 0 && extra_len <= meta_tail_cap) {
+        meta->num_target_outputs = 1;
+        meta->extra_data_len = (uint32_t)extra_len;
         memcpy(meta_storage + sizeof(waywal_img_metadata_t), target_output, extra_len);
     }
     if (state->config.transition.has_crop_gravity) {
@@ -2974,6 +3027,9 @@ bool daemon_start_slideshow_isolated(daemon_state_t *state, const waywal_slidesh
         if (ss != &state->slideshow) {
             if (ss->timer_fd >= 0) {
                 unregister_fd_from_loops(state, ss->timer_fd);
+            }
+            if (state->g_presenting_slideshow == ss) {
+                state->g_presenting_slideshow = NULL;
             }
             slideshow_destroy(ss);
             free(ss);
@@ -4001,11 +4057,13 @@ void daemon_slideshow_prepare_image_output(daemon_state_t *state, slideshow_engi
 {
     if (!state || !ss)
         return;
+    bool ss_owned_at_entry = slideshow_is_alive(state, ss);
     slideshow_engine_t *prev_pres = state->g_presenting_slideshow;
     state->g_presenting_slideshow = ss;
     uint32_t dur_ms = ss->transition_duration_ms > 0 ? ss->transition_duration_ms : 1000;
     if (state->outputs) {
-        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        for (output_node_t *out = state->outputs, *next_out = NULL; out != NULL; out = next_out) {
+            next_out = out->next;
             bool matches = (ss->num_target_outputs == 0);
             for (uint8_t i = 0; i < ss->num_target_outputs; ++i) {
                 if (output_matches_target_spec(out, ss->target_outputs[i])) {
@@ -4020,6 +4078,11 @@ void daemon_slideshow_prepare_image_output(daemon_state_t *state, slideshow_engi
                     release_output_transition_bos(state, out, true, true);
                 }
                 stop_engines_on_output(state, out, false, false, false, true);
+                if (ss_owned_at_entry && !slideshow_is_alive(state, ss)) {
+                    state->g_presenting_slideshow =
+                        slideshow_is_alive(state, prev_pres) ? prev_pres : NULL;
+                    return;
+                }
                 out->slideshow_eng = ss;
             }
         }
@@ -4034,7 +4097,7 @@ void daemon_slideshow_prepare_image_output(daemon_state_t *state, slideshow_engi
         shader_engine_stop_playback(state);
         anim_engine_stop_playback(state);
     }
-    state->g_presenting_slideshow = prev_pres;
+    state->g_presenting_slideshow = slideshow_is_alive(state, prev_pres) ? prev_pres : NULL;
 }
 
 bool daemon_slideshow_present_media(daemon_state_t *state, slideshow_engine_t *ss,
@@ -4059,6 +4122,7 @@ bool daemon_slideshow_present_media(daemon_state_t *state, slideshow_engine_t *s
         }
     }
 
+    bool ss_owned_at_entry = slideshow_is_alive(state, ss);
     slideshow_engine_t *prev_pres = state->g_presenting_slideshow;
     state->g_presenting_slideshow = ss;
     bool ok = false;
@@ -4128,12 +4192,19 @@ bool daemon_slideshow_present_media(daemon_state_t *state, slideshow_engine_t *s
         }
     }
 
+    if (ss_owned_at_entry && !slideshow_is_alive(state, ss)) {
+        /* Wayland teardown destroyed ss during media activation; clear guard instead of writing
+         * back a freed pointer. */
+        state->g_presenting_slideshow = slideshow_is_alive(state, prev_pres) ? prev_pres : NULL;
+        return false;
+    }
+
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (output_matches_target_spec(out, target_spec)) {
             out->slideshow_eng = ss;
         }
     }
-    state->g_presenting_slideshow = prev_pres;
+    state->g_presenting_slideshow = slideshow_is_alive(state, prev_pres) ? prev_pres : NULL;
     return ok;
 }
 
@@ -4981,7 +5052,8 @@ static void print_usage(const char *prog)
     printf("  -n, --namespace <NAME>       Socket namespace (default: \"default\")\n");
     printf("  -d, --daemon                 Fork into background daemon\n");
     printf("      --no-daemon              Stay in foreground (swww-daemon compatibility)\n");
-    printf("  -f, --format <FMT>           Pixel format override (xrgb, argb, bgr, rgb)\n");
+    printf("  -f, --format <FMT>           Pixel format override (xrgb, argb, xbgr, abgr, bgr, "
+           "rgb)\n");
     printf("  -q, --quiet                  Suppress informational logs\n");
     printf("      --layer <LAYER>          Layer target: background or bottom\n");
     printf("      --backdrop <MODE>        Backdrop mode: none, auto-blur, or path\n");
@@ -5011,6 +5083,7 @@ static bool daemon_pump_wayland_events(daemon_state_t *st)
         wl_display_cancel_read(st->display);
         wl_display_dispatch_pending(st->display);
     }
+    slideshow_clear_if_stale(st);
     if (wl_display_get_error(st->display) != 0) {
         g_daemon_wl_ok = false;
         return false;
@@ -5254,28 +5327,53 @@ static bool daemon_dispatch_per_output_fd(daemon_state_t *st, int fd)
 {
     if (!st || fd < 0)
         return false;
+    enum { PER_OUT_NONE = 0, PER_OUT_SHADER, PER_OUT_VIDEO, PER_OUT_SLIDESHOW } kind = PER_OUT_NONE;
+    void *eng = NULL;
     for (output_node_t *out = st->outputs; out != NULL; out = out->next) {
         if (out->shader_eng && fd == waywal_shader_engine_get_inotify_fd(out->shader_eng)) {
-            daemon_pump_wayland_events(st);
+            kind = PER_OUT_SHADER;
+            eng = out->shader_eng;
+            break;
+        }
+        if (out->video_eng && out->video_eng != &st->video_engine &&
+            fd == out->video_eng->timer_fd) {
+            kind = PER_OUT_VIDEO;
+            eng = out->video_eng;
+            break;
+        }
+        if (out->slideshow_eng && out->slideshow_eng != &st->slideshow &&
+            fd == out->slideshow_eng->timer_fd) {
+            kind = PER_OUT_SLIDESHOW;
+            eng = out->slideshow_eng;
+            break;
+        }
+    }
+    if (kind == PER_OUT_NONE) {
+        return false;
+    }
+
+    /* Pumping Wayland can close outputs and free per-output engines before we dispatch the fd. */
+    daemon_pump_wayland_events(st);
+
+    for (output_node_t *out = st->outputs; out != NULL; out = out->next) {
+        if (kind == PER_OUT_SHADER && out->shader_eng == eng &&
+            fd == waywal_shader_engine_get_inotify_fd(out->shader_eng)) {
             if (waywal_shader_engine_poll_hot_reload(out->shader_eng) && st->shader_active) {
                 daemon_shader_render_once(st);
             }
             return true;
         }
-        if (out->video_eng && out->video_eng != &st->video_engine &&
-            fd == out->video_eng->timer_fd) {
-            daemon_pump_wayland_events(st);
+        if (kind == PER_OUT_VIDEO && out->video_eng == eng && fd == out->video_eng->timer_fd) {
             video_engine_dispatch_frame(out->video_eng);
             return true;
         }
-        if (out->slideshow_eng && out->slideshow_eng != &st->slideshow &&
+        if (kind == PER_OUT_SLIDESHOW && out->slideshow_eng == eng &&
             fd == out->slideshow_eng->timer_fd) {
-            daemon_pump_wayland_events(st);
             slideshow_dispatch_tick(out->slideshow_eng);
             return true;
         }
     }
-    return false;
+    return true;
 }
 
 static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_t res,
@@ -6050,24 +6148,76 @@ bool daemon_dispatch_ipc_req_set_scene_lights(daemon_state_t *state,
     return true;
 }
 
-static bool ipc_dispatch_read_full(int fd, void *buf, size_t count, int timeout_ms)
+static int ipc_compute_rem_ms(bool has_deadline, uint64_t deadline_ns)
 {
-    uint8_t *p = (uint8_t *)buf;
-    size_t total = 0;
-    while (total < count) {
-        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-        int pr = poll(&pfd, 1, timeout_ms);
-        if (pr <= 0) {
+    if (!has_deadline) {
+        return -1;
+    }
+    uint64_t cur = now_ns();
+    if (cur >= deadline_ns) {
+        return 0;
+    }
+    uint64_t diff_ms = (deadline_ns - cur + 999999ULL) / 1000000ULL;
+    return diff_ms > (uint64_t)INT_MAX ? INT_MAX : (int)diff_ms;
+}
+
+static bool ipc_poll_ready(int fd, short events, bool has_deadline, uint64_t deadline_ns)
+{
+    for (;;) {
+        int rem = ipc_compute_rem_ms(has_deadline, deadline_ns);
+        if (rem == 0) {
             return false;
         }
-        ssize_t n = read(fd, p + total, count - total);
-        if (n <= 0) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+        struct pollfd pfd = {.fd = fd, .events = events, .revents = 0};
+        int pr = poll(&pfd, 1, rem);
+        if (pr < 0) {
+            if (errno == EINTR) {
                 continue;
             }
             return false;
         }
-        total += (size_t)n;
+        if (pr == 0) {
+            return false;
+        }
+        if ((pfd.revents & (POLLERR | POLLNVAL)) != 0) {
+            return false;
+        }
+        if ((events & POLLOUT) != 0 && (pfd.revents & POLLHUP) != 0) {
+            return false;
+        }
+        return true;
+    }
+}
+
+static bool ipc_dispatch_read_full(int fd, void *buf, size_t count, int timeout_ms)
+{
+    uint8_t *p = (uint8_t *)buf;
+    size_t total = 0;
+    bool has_deadline = (timeout_ms >= 0);
+    uint64_t deadline_ns = has_deadline ? (now_ns() + (uint64_t)timeout_ms * 1000000ULL) : 0ULL;
+
+    while (total < count) {
+        ssize_t n = recv(fd, p + total, count - total, MSG_DONTWAIT);
+        if (n < 0 && (errno == ENOTSOCK || errno == EOPNOTSUPP)) {
+            n = read(fd, p + total, count - total);
+        }
+        if (n > 0) {
+            total += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
+            return false;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!ipc_poll_ready(fd, POLLIN, has_deadline, deadline_ns)) {
+                return false;
+            }
+            continue;
+        }
+        return false;
     }
     return true;
 }
@@ -6076,20 +6226,104 @@ static bool ipc_dispatch_write_full(int fd, const void *buf, size_t count, int t
 {
     const uint8_t *p = (const uint8_t *)buf;
     size_t total = 0;
+    bool has_deadline = (timeout_ms >= 0);
+    uint64_t deadline_ns = has_deadline ? (now_ns() + (uint64_t)timeout_ms * 1000000ULL) : 0ULL;
+
     while (total < count) {
-        struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
-        int pr = poll(&pfd, 1, timeout_ms);
-        if (pr <= 0) {
+        /* Suppress SIGPIPE per-send on peer disconnect while honoring SOCK_NONBLOCK short writes.
+         */
+        ssize_t n = send(fd, p + total, count - total, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0 && (errno == ENOTSOCK || errno == EOPNOTSUPP)) {
+            n = write(fd, p + total, count - total);
+        }
+        if (n > 0) {
+            total += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
             return false;
         }
-        ssize_t n = write(fd, p + total, count - total);
-        if (n <= 0) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
-                continue;
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!ipc_poll_ready(fd, POLLOUT, has_deadline, deadline_ns)) {
+                return false;
             }
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool ipc_dispatch_send_msg(int client_fd, const waywal_ipc_hdr_t *hdr, const void *payload,
+                                  size_t payload_len)
+{
+    if (!hdr || client_fd < 0) {
+        return false;
+    }
+
+    struct iovec iov[2];
+    size_t iov_cnt = 1u;
+    iov[0].iov_base = (void *)(uintptr_t)hdr;
+    iov[0].iov_len = sizeof(*hdr);
+    if (payload && payload_len > 0u) {
+        iov[1].iov_base = (void *)(uintptr_t)payload;
+        iov[1].iov_len = payload_len;
+        iov_cnt = 2u;
+    }
+
+    uint64_t deadline_ns = now_ns() + 500ULL * 1000000ULL;
+    size_t iov_idx = 0u;
+    while (iov_idx < iov_cnt) {
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov[iov_idx];
+        msg.msg_iovlen = iov_cnt - iov_idx;
+
+        ssize_t n = sendmsg(client_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0 && (errno == ENOTSOCK || errno == EOPNOTSUPP)) {
+            int rem = ipc_compute_rem_ms(true, deadline_ns);
+            for (size_t k = iov_idx; k < iov_cnt; ++k) {
+                if (!ipc_dispatch_write_full(client_fd, iov[k].iov_base, iov[k].iov_len, rem)) {
+                    (void)shutdown(client_fd, SHUT_RDWR);
+                    return false;
+                }
+                rem = ipc_compute_rem_ms(true, deadline_ns);
+            }
+            return true;
+        }
+        if (n > 0) {
+            size_t adv = (size_t)n;
+            while (iov_idx < iov_cnt && adv > 0u) {
+                if (adv < iov[iov_idx].iov_len) {
+                    iov[iov_idx].iov_base = (uint8_t *)iov[iov_idx].iov_base + adv;
+                    iov[iov_idx].iov_len -= adv;
+                    adv = 0u;
+                } else {
+                    adv -= iov[iov_idx].iov_len;
+                    iov_idx++;
+                }
+            }
+            continue;
+        }
+        if (n == 0) {
+            (void)shutdown(client_fd, SHUT_RDWR);
             return false;
         }
-        total += (size_t)n;
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!ipc_poll_ready(client_fd, POLLOUT, true, deadline_ns)) {
+                (void)shutdown(client_fd, SHUT_RDWR);
+                return false;
+            }
+            continue;
+        }
+        (void)shutdown(client_fd, SHUT_RDWR);
+        return false;
     }
     return true;
 }
@@ -6122,12 +6356,7 @@ static bool ipc_send_compile_graph_error(int client_fd, uint32_t status_code, co
     waywal_ipc_resp_compile_shader_graph_t resp;
     waywal_ipc_serialize_resp_compile_shader_graph(status_code, 0u, 0u, 0u, 0.0f, 0u, msg,
                                                    &resp_hdr, &resp);
-    if (!ipc_dispatch_write_full(client_fd, &resp_hdr, sizeof(resp_hdr), 500) ||
-        !ipc_dispatch_write_full(client_fd, &resp, sizeof(resp), 500)) {
-        (void)shutdown(client_fd, SHUT_RDWR);
-        return false;
-    }
-    return true;
+    return ipc_dispatch_send_msg(client_fd, &resp_hdr, &resp, sizeof(resp));
 }
 
 bool daemon_dispatch_phase3_ipc(daemon_state_t *state, int client_fd, const waywal_ipc_hdr_t *hdr,
@@ -6209,12 +6438,7 @@ bool daemon_dispatch_phase3_ipc(daemon_state_t *state, int client_fd, const wayw
             resp.estimated_alu_ops, resp.compile_time_ms, resp.offending_node_id, resp.error_msg,
             &resp_hdr, &resp);
 
-        if (!ipc_dispatch_write_full(client_fd, &resp_hdr, sizeof(resp_hdr), 500) ||
-            !ipc_dispatch_write_full(client_fd, &resp, sizeof(resp), 500)) {
-            (void)shutdown(client_fd, SHUT_RDWR);
-            return false;
-        }
-        return true;
+        return ipc_dispatch_send_msg(client_fd, &resp_hdr, &resp, sizeof(resp));
     }
 
     case WAYWAL_REQ_SET_CAMERA_3D: {
@@ -6241,12 +6465,7 @@ bool daemon_dispatch_phase3_ipc(daemon_state_t *state, int client_fd, const wayw
         waywal_ipc_serialize_resp_set_camera_3d(resp.status_code, resp.active_view_proj, &resp_hdr,
                                                 &resp);
 
-        if (!ipc_dispatch_write_full(client_fd, &resp_hdr, sizeof(resp_hdr), 500) ||
-            !ipc_dispatch_write_full(client_fd, &resp, sizeof(resp), 500)) {
-            (void)shutdown(client_fd, SHUT_RDWR);
-            return false;
-        }
-        return true;
+        return ipc_dispatch_send_msg(client_fd, &resp_hdr, &resp, sizeof(resp));
     }
 
     case WAYWAL_REQ_SET_PHYSICS_PARAMS: {
@@ -6273,12 +6492,7 @@ bool daemon_dispatch_phase3_ipc(daemon_state_t *state, int client_fd, const wayw
         waywal_ipc_serialize_resp_set_physics_params(resp.status_code, resp.active_sim_bones,
                                                      resp.last_step_time_us, &resp_hdr, &resp);
 
-        if (!ipc_dispatch_write_full(client_fd, &resp_hdr, sizeof(resp_hdr), 500) ||
-            !ipc_dispatch_write_full(client_fd, &resp, sizeof(resp), 500)) {
-            (void)shutdown(client_fd, SHUT_RDWR);
-            return false;
-        }
-        return true;
+        return ipc_dispatch_send_msg(client_fd, &resp_hdr, &resp, sizeof(resp));
     }
 
     case WAYWAL_REQ_SET_SCENE_LIGHTS: {
@@ -6305,12 +6519,7 @@ bool daemon_dispatch_phase3_ipc(daemon_state_t *state, int client_fd, const wayw
         waywal_ipc_serialize_resp_set_scene_lights(resp.status_code, resp.active_lights, &resp_hdr,
                                                    &resp);
 
-        if (!ipc_dispatch_write_full(client_fd, &resp_hdr, sizeof(resp_hdr), 500) ||
-            !ipc_dispatch_write_full(client_fd, &resp, sizeof(resp), 500)) {
-            (void)shutdown(client_fd, SHUT_RDWR);
-            return false;
-        }
-        return true;
+        return ipc_dispatch_send_msg(client_fd, &resp_hdr, &resp, sizeof(resp));
     }
 
     case WAYWAL_REQ_SCENE_MUTATE:
@@ -6382,24 +6591,7 @@ static bool authoring_matches_target(const output_node_t *out, const char *targe
 
 static bool authoring_drain_payload(int fd, uint64_t rem_bytes, int timeout_ms)
 {
-    if (rem_bytes == 0u) {
-        return true;
-    }
-    if (rem_bytes > WAYWAL_MAX_PHASE3_DRAIN_BYTES) {
-        (void)shutdown(fd, SHUT_RDWR);
-        return false;
-    }
-    uint8_t scratch[4096];
-    uint64_t left = rem_bytes;
-    while (left > 0u) {
-        size_t chunk = left < sizeof(scratch) ? (size_t)left : sizeof(scratch);
-        if (!ipc_dispatch_read_full(fd, scratch, chunk, timeout_ms)) {
-            (void)shutdown(fd, SHUT_RDWR);
-            return false;
-        }
-        left -= chunk;
-    }
-    return true;
+    return ipc_drain_phase3_payload(fd, rem_bytes, timeout_ms);
 }
 
 static authoring_scene_slot_t *authoring_get_scene_slot(const we_scene_t *sc, bool create)
@@ -7111,6 +7303,114 @@ static bool authoring_mutate_scene(we_scene_t *sc, const waywal_ipc_req_scene_mu
     return true;
 }
 
+static bool authoring_can_mutate_scene(we_scene_t *sc, const waywal_ipc_req_scene_mutate_t *r,
+                                       uint32_t *out_status, char *err_buf, size_t err_cap)
+{
+    if (r->mutate_op == WE_MUTATE_ADD_OBJECT) {
+        if (sc->object_count >= WAYWAL_AUTHORING_MAX_OBJECTS) {
+            *out_status = 3u;
+            authoring_copy_cstr(err_buf, err_cap, "Scene object limit exceeded");
+            return false;
+        }
+        if (r->blend_mode > (uint32_t)WE_BLEND_DISABLED) {
+            *out_status = 1u;
+            authoring_copy_cstr(err_buf, err_cap, "Invalid blend mode");
+            return false;
+        }
+        int32_t new_id = r->object_id;
+        if (new_id <= 0 || authoring_find_object(sc, new_id, NULL) != NULL) {
+            int32_t max_id = 0;
+            for (uint32_t i = 0; i < sc->object_count; ++i) {
+                if (sc->objects[i].id > max_id) {
+                    max_id = sc->objects[i].id;
+                }
+            }
+            new_id = max_id + 1;
+        }
+        if (r->parent_id >= 0) {
+            if (r->parent_id == new_id) {
+                *out_status = 2u;
+                authoring_copy_cstr(err_buf, err_cap, "Parent cycle detected");
+                return false;
+            }
+            if (!authoring_find_object(sc, r->parent_id, NULL)) {
+                *out_status = 1u;
+                authoring_copy_cstr(err_buf, err_cap, "Parent scene object not found");
+                return false;
+            }
+            if (authoring_parent_chain_depth(sc, r->parent_id) > WE_SCENE_MAX_PARENT_DEPTH) {
+                *out_status = 2u;
+                authoring_copy_cstr(err_buf, err_cap, "Parent hierarchy depth exceeds maximum");
+                return false;
+            }
+        }
+        we_scene_object_t *grown = (we_scene_object_t *)realloc(
+            sc->objects, ((size_t)sc->object_count + 1u) * sizeof(we_scene_object_t));
+        if (!grown) {
+            *out_status = 3u;
+            authoring_copy_cstr(err_buf, err_cap, "Out of memory appending scene object");
+            return false;
+        }
+        sc->objects = grown;
+        return true;
+    }
+
+    const we_scene_object_t *obj = authoring_find_object(sc, r->object_id, NULL);
+    if (!obj) {
+        *out_status = 1u;
+        authoring_copy_cstr(err_buf, err_cap, "Scene object not found");
+        return false;
+    }
+
+    switch (r->mutate_op) {
+    case WE_MUTATE_REMOVE_OBJECT:
+    case WE_MUTATE_SET_TRANSFORM:
+    case WE_MUTATE_SET_TEXT_PROPS:
+    case WE_MUTATE_SET_SOUND_PROPS:
+        return true;
+    case WE_MUTATE_REORDER_Z:
+        if (r->target_z_index < 0 || (uint32_t)r->target_z_index >= sc->object_count) {
+            *out_status = 3u;
+            authoring_copy_cstr(err_buf, err_cap, "Target Z index out of range");
+            return false;
+        }
+        return true;
+    case WE_MUTATE_REPARENT:
+        if (r->parent_id >= 0 && !authoring_find_object(sc, r->parent_id, NULL)) {
+            *out_status = 1u;
+            authoring_copy_cstr(err_buf, err_cap, "Parent scene object not found");
+            return false;
+        }
+        if (authoring_reparent_creates_cycle(sc, obj->id, r->parent_id)) {
+            *out_status = 2u;
+            authoring_copy_cstr(err_buf, err_cap, "Reparent rejected: hierarchy cycle detected");
+            return false;
+        }
+        if (r->parent_id >= 0) {
+            uint32_t parent_hops = authoring_parent_chain_depth(sc, r->parent_id);
+            uint32_t sub_depth = authoring_subtree_depth(sc, obj->id, 0u);
+            if (parent_hops + sub_depth > WE_SCENE_MAX_PARENT_DEPTH) {
+                *out_status = 2u;
+                authoring_copy_cstr(err_buf, err_cap,
+                                    "Reparent rejected: hierarchy depth exceeds maximum");
+                return false;
+            }
+        }
+        return true;
+    case WE_MUTATE_SET_BLEND_VIS:
+        if (r->blend_mode > (uint32_t)WE_BLEND_DISABLED) {
+            *out_status = 1u;
+            authoring_copy_cstr(err_buf, err_cap, "Invalid blend mode");
+            return false;
+        }
+        return true;
+    default:
+        *out_status = 1u;
+        authoring_copy_cstr(err_buf, err_cap, "Unsupported scene mutation opcode");
+        return false;
+    }
+}
+
 bool daemon_dispatch_ipc_req_scene_mutate(daemon_state_t *state,
                                           const waywal_ipc_req_scene_mutate_t *req,
                                           const char *payload_json,
@@ -7138,15 +7438,29 @@ bool daemon_dispatch_ipc_req_scene_mutate(daemon_state_t *state,
         return false;
     }
 
+    if (payload_json && payload_json[0] != '\0' &&
+        (r.mutate_op == WE_MUTATE_ADD_OBJECT || r.mutate_op == WE_MUTATE_SET_TEXT_PROPS ||
+         r.mutate_op == WE_MUTATE_SET_SOUND_PROPS)) {
+        we_jval_t *probe = we_json_parse_root(payload_json, strlen(payload_json));
+        bool json_ok = (probe != NULL && probe->type == JVAL_OBJ);
+        we_jval_free(probe);
+        if (!json_ok) {
+            resp->status_code = 1u;
+            resp->object_id = r.object_id;
+            authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                "Invalid JSON payload for scene mutation");
+            return false;
+        }
+    }
+
     if (!state) {
         resp->status_code = WAYWAL_STATUS_OK;
         resp->object_id = r.object_id;
         return true;
     }
 
-    we_scene_t *visited[64];
-    size_t visited_count = 0u;
-    bool found_scene = false;
+    we_scene_t *targets[64];
+    size_t target_count = 0u;
     uint32_t last_rev = 0u;
     uint32_t last_count = 0u;
     int32_t out_obj_id = r.object_id;
@@ -7155,31 +7469,45 @@ bool daemon_dispatch_ipc_req_scene_mutate(daemon_state_t *state,
         if (!authoring_matches_target(out, r.target_output) || !out->we_scene) {
             continue;
         }
-        if (scene_already_visited(visited, visited_count, out->we_scene)) {
+        if (scene_already_visited(targets, target_count, out->we_scene)) {
             continue;
         }
-        if (visited_count < 64u) {
-            visited[visited_count++] = out->we_scene;
+        if (target_count < 64u) {
+            targets[target_count++] = out->we_scene;
         }
-        found_scene = true;
-        uint32_t err_status = 0u;
-        if (!authoring_mutate_scene(out->we_scene, &r, payload_json, &err_status, &out_obj_id,
-                                    resp->error_msg, sizeof(resp->error_msg))) {
-            resp->status_code = err_status ? err_status : WAYWAL_STATUS_ERR_SYNTAX;
-            resp->object_id = r.object_id;
-            return false;
-        }
-        authoring_scene_slot_t *slot = authoring_get_scene_slot(out->we_scene, false);
-        last_rev = slot ? slot->revision : 1u;
-        last_count = out->we_scene->object_count;
     }
 
-    if (!found_scene) {
+    if (target_count == 0u) {
         resp->status_code = 1u;
         resp->object_id = r.object_id;
         authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
                             "No active scene matching target output");
         return false;
+    }
+
+    /* Validate all target scenes up front so one failure never leaves sibling outputs partially
+     * mutated. */
+    for (size_t i = 0u; i < target_count; ++i) {
+        uint32_t err_status = 0u;
+        if (!authoring_can_mutate_scene(targets[i], &r, &err_status, resp->error_msg,
+                                        sizeof(resp->error_msg))) {
+            resp->status_code = err_status ? err_status : WAYWAL_STATUS_ERR_SYNTAX;
+            resp->object_id = r.object_id;
+            return false;
+        }
+    }
+
+    for (size_t i = 0u; i < target_count; ++i) {
+        uint32_t err_status = 0u;
+        if (!authoring_mutate_scene(targets[i], &r, payload_json, &err_status, &out_obj_id,
+                                    resp->error_msg, sizeof(resp->error_msg))) {
+            resp->status_code = err_status ? err_status : WAYWAL_STATUS_ERR_SYNTAX;
+            resp->object_id = r.object_id;
+            return false;
+        }
+        authoring_scene_slot_t *slot = authoring_get_scene_slot(targets[i], false);
+        last_rev = slot ? slot->revision : 1u;
+        last_count = targets[i]->object_count;
     }
 
     resp->status_code = WAYWAL_STATUS_OK;
@@ -7230,6 +7558,13 @@ static char *authoring_build_shader_meta_json(const we_shader_meta_t *meta, size
     return sb.data;
 }
 
+static const char k_authoring_val_vert_300es[] =
+    "#version 300 es\nlayout(location=0) in vec2 a_pos;"
+    "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+static const char k_authoring_val_frag_300es[] =
+    "#version 300 es\nprecision mediump float; out vec4 fragColor;"
+    "void main() { fragColor = vec4(1.0); }\n";
+
 bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
                                              const waywal_ipc_req_hot_reload_code_t *req,
                                              const char *source_utf8,
@@ -7278,9 +7613,16 @@ bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
         bool ok = we_script_lint(src_copy, src_len, 1u, &diag);
         authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg), diag.error_msg);
         if (ok && (req->flags & 0x2u) != 0u && state != NULL) {
+            typedef struct {
+                we_scene_object_t *obj;
+                we_script_t *vm;
+            } script_stage_t;
+
             we_scene_t *visited[64];
             size_t visited_count = 0u;
-            bool applied = false;
+            script_stage_t stages[64];
+            size_t stage_count = 0u;
+
             for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
                 if (!authoring_matches_target(out, req->target_output) || !out->we_scene) {
                     continue;
@@ -7288,9 +7630,10 @@ bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
                 if (scene_already_visited(visited, visited_count, out->we_scene)) {
                     continue;
                 }
-                if (visited_count < 64u) {
-                    visited[visited_count++] = out->we_scene;
+                if (visited_count >= 64u) {
+                    break;
                 }
+                visited[visited_count++] = out->we_scene;
                 we_scene_object_t *obj = authoring_find_object(out->we_scene, req->object_id, NULL);
                 if (!obj) {
                     continue;
@@ -7301,6 +7644,9 @@ bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
                     if (vm) {
                         we_script_destroy(vm);
                     }
+                    for (size_t k = 0u; k < stage_count; ++k) {
+                        we_script_destroy(stages[k].vm);
+                    }
                     free(src_copy);
                     resp->status_code = 3u;
                     resp->compile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
@@ -7308,6 +7654,20 @@ bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
                                         "SceneScript initialization aborted by watchdog");
                     return false;
                 }
+                stages[stage_count].obj = obj;
+                stages[stage_count].vm = vm;
+                stage_count++;
+            }
+            if (stage_count == 0u) {
+                free(src_copy);
+                resp->status_code = 4u;
+                authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
+                                    "Target scene object not found for script hot-swap");
+                return false;
+            }
+            for (size_t k = 0u; k < stage_count; ++k) {
+                we_scene_object_t *obj = stages[k].obj;
+                we_script_t *vm = stages[k].vm;
                 if (req->script_slot < WE_MAX_OBJECT_SCRIPTS) {
                     if (obj->scripts[req->script_slot].vm) {
                         we_script_destroy(obj->scripts[req->script_slot].vm);
@@ -7324,14 +7684,6 @@ bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
                 } else {
                     we_script_destroy(vm);
                 }
-                applied = true;
-            }
-            if (!applied) {
-                free(src_copy);
-                resp->status_code = 4u;
-                authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
-                                    "Target scene object not found for script hot-swap");
-                return false;
             }
         }
         free(src_copy);
@@ -7352,23 +7704,46 @@ bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
     bool validated_pass = false;
 
     if (state != NULL && (do_hot_swap || do_validate)) {
+        typedef struct {
+            we_scene_t *scene;
+            we_material_pass_t *pass;
+            char *prep_glsl;
+            we_shader_meta_t pass_meta;
+            uint32_t new_prog;
+            bool swap_prog;
+        } glsl_stage_t;
+
         we_scene_t *visited_scenes[64];
         size_t visited_scene_count = 0u;
+        glsl_stage_t glsl_stages[64];
+        size_t glsl_stage_count = 0u;
+        waywal_shader_engine_t *shader_engs[64];
+        size_t shader_eng_count = 0u;
+
+        /* Stage and compile every scene pass before mutating any live GL program or IR cache. */
         for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
             if (!authoring_matches_target(out, req->target_output)) {
                 continue;
             }
             if (do_hot_swap && req->object_id < 0 && out->shader_eng && is_frag) {
-                if (waywal_shader_engine_load_source(out->shader_eng, src_copy, "hot_reload")) {
-                    swapped = true;
+                bool seen = false;
+                for (size_t e = 0u; e < shader_eng_count; ++e) {
+                    if (shader_engs[e] == out->shader_eng) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen && shader_eng_count < 64u) {
+                    shader_engs[shader_eng_count++] = out->shader_eng;
                 }
             } else if (out->we_scene && req->object_id >= 0) {
                 if (scene_already_visited(visited_scenes, visited_scene_count, out->we_scene)) {
                     continue;
                 }
-                if (visited_scene_count < 64u) {
-                    visited_scenes[visited_scene_count++] = out->we_scene;
+                if (visited_scene_count >= 64u) {
+                    break;
                 }
+                visited_scenes[visited_scene_count++] = out->we_scene;
                 we_scene_object_t *obj = authoring_find_object(out->we_scene, req->object_id, NULL);
                 we_material_pass_t *pass = authoring_resolve_pass(obj, req->pass_index);
                 if (!pass) {
@@ -7383,6 +7758,13 @@ bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
                     src_copy, is_frag, out->we_scene->pkg, pass->combos, pass->combo_count,
                     pass->bound_tex_mask, tex0_is_gif, &pass_meta);
                 if (!pass_prep) {
+                    for (size_t k = 0u; k < glsl_stage_count; ++k) {
+                        if (glsl_stages[k].swap_prog && glsl_stages[k].new_prog != 0u) {
+                            authoring_ensure_scene_egl(glsl_stages[k].scene);
+                            glDeleteProgram(glsl_stages[k].new_prog);
+                        }
+                        free(glsl_stages[k].prep_glsl);
+                    }
                     free(src_copy);
                     resp->status_code = 1u;
                     resp->compile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
@@ -7391,26 +7773,31 @@ bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
                     return false;
                 }
 
+                uint32_t new_prog = 0u;
+                bool swap_prog = false;
                 if (out->we_scene->gl_initialized) {
-                    static const char k_val_vert_300es[] =
-                        "#version 300 es\nlayout(location=0) in vec2 a_pos;"
-                        "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
-                    static const char k_val_frag_300es[] =
-                        "#version 300 es\nprecision mediump float; out vec4 fragColor;"
-                        "void main() { fragColor = vec4(1.0); }\n";
                     bool have_both_real =
                         (is_frag ? (pass->prep.vert_glsl != NULL) : (pass->prep.frag_glsl != NULL));
                     const char *cand_vert =
-                        is_frag ? (pass->prep.vert_glsl ? pass->prep.vert_glsl : k_val_vert_300es)
+                        is_frag ? (pass->prep.vert_glsl ? pass->prep.vert_glsl
+                                                        : k_authoring_val_vert_300es)
                                 : pass_prep;
                     const char *cand_frag =
                         is_frag ? pass_prep
-                                : (pass->prep.frag_glsl ? pass->prep.frag_glsl : k_val_frag_300es);
+                                : (pass->prep.frag_glsl ? pass->prep.frag_glsl
+                                                        : k_authoring_val_frag_300es);
                     authoring_ensure_scene_egl(out->we_scene);
                     uint32_t prog =
                         we_shader_compile_program(cand_vert, cand_frag, "hot_reload_pass");
                     if (prog == 0u) {
                         free(pass_prep);
+                        for (size_t k = 0u; k < glsl_stage_count; ++k) {
+                            if (glsl_stages[k].swap_prog && glsl_stages[k].new_prog != 0u) {
+                                authoring_ensure_scene_egl(glsl_stages[k].scene);
+                                glDeleteProgram(glsl_stages[k].new_prog);
+                            }
+                            free(glsl_stages[k].prep_glsl);
+                        }
                         free(src_copy);
                         resp->status_code = 2u;
                         resp->compile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
@@ -7419,32 +7806,55 @@ bool daemon_dispatch_ipc_req_hot_reload_code(daemon_state_t *state,
                         return false;
                     }
                     if (do_hot_swap && have_both_real) {
-                        if (pass->gl_prog != 0u) {
-                            glDeleteProgram(pass->gl_prog);
-                        }
-                        pass->gl_prog = prog;
-                        pass->ulocs.initialized = false;
+                        new_prog = prog;
+                        swap_prog = true;
                     } else {
                         glDeleteProgram(prog);
                     }
                 }
 
-                if (do_hot_swap) {
-                    if (is_frag) {
-                        free(pass->prep.frag_glsl);
-                        pass->prep.frag_glsl = pass_prep;
-                    } else {
-                        free(pass->prep.vert_glsl);
-                        pass->prep.vert_glsl = pass_prep;
-                    }
-                    pass->prep.meta = pass_meta;
-                    swapped = true;
-                } else {
-                    free(pass_prep);
-                }
-                meta = pass_meta;
-                validated_pass = true;
+                glsl_stages[glsl_stage_count++] = (glsl_stage_t){
+                    .scene = out->we_scene,
+                    .pass = pass,
+                    .prep_glsl = pass_prep,
+                    .pass_meta = pass_meta,
+                    .new_prog = new_prog,
+                    .swap_prog = swap_prog,
+                };
             }
+        }
+
+        for (size_t e = 0u; e < shader_eng_count; ++e) {
+            if (waywal_shader_engine_load_source(shader_engs[e], src_copy, "hot_reload")) {
+                swapped = true;
+            }
+        }
+        for (size_t k = 0u; k < glsl_stage_count; ++k) {
+            glsl_stage_t *gs = &glsl_stages[k];
+            we_material_pass_t *pass = gs->pass;
+            if (gs->swap_prog) {
+                authoring_ensure_scene_egl(gs->scene);
+                if (pass->gl_prog != 0u) {
+                    glDeleteProgram(pass->gl_prog);
+                }
+                pass->gl_prog = gs->new_prog;
+                pass->ulocs.initialized = false;
+            }
+            if (do_hot_swap) {
+                if (is_frag) {
+                    free(pass->prep.frag_glsl);
+                    pass->prep.frag_glsl = gs->prep_glsl;
+                } else {
+                    free(pass->prep.vert_glsl);
+                    pass->prep.vert_glsl = gs->prep_glsl;
+                }
+                pass->prep.meta = gs->pass_meta;
+                swapped = true;
+            } else {
+                free(gs->prep_glsl);
+            }
+            meta = gs->pass_meta;
+            validated_pass = true;
         }
         if (do_hot_swap && !swapped) {
             free(src_copy);
@@ -7736,9 +8146,24 @@ bool daemon_dispatch_ipc_req_set_shader_combo(daemon_state_t *state,
     }
 
     uint64_t t0 = now_ns();
+    typedef struct {
+        we_scene_t *scene;
+        we_material_pass_t *pass;
+        size_t combo_idx;
+        bool found_combo;
+        char *cand_vert;
+        char *cand_frag;
+        uint32_t new_prog;
+        bool replace_prog;
+    } combo_stage_t;
+
     we_scene_t *visited[64];
     size_t visited_count = 0u;
-    bool updated = false;
+    combo_stage_t stages[64];
+    size_t stage_count = 0u;
+
+    /* Stage every matching scene first so multi-output combo updates succeed or roll back
+     * atomically. */
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (!authoring_matches_target(out, req->target_output) || !out->we_scene) {
             continue;
@@ -7746,9 +8171,10 @@ bool daemon_dispatch_ipc_req_set_shader_combo(daemon_state_t *state,
         if (scene_already_visited(visited, visited_count, out->we_scene)) {
             continue;
         }
-        if (visited_count < 64u) {
-            visited[visited_count++] = out->we_scene;
+        if (visited_count >= 64u) {
+            break;
         }
+        visited[visited_count++] = out->we_scene;
         we_scene_object_t *obj = authoring_find_object(out->we_scene, req->object_id, NULL);
         we_material_pass_t *pass = authoring_resolve_pass(obj, req->pass_index);
         if (!pass) {
@@ -7767,81 +8193,110 @@ bool daemon_dispatch_ipc_req_set_shader_combo(daemon_state_t *state,
             resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
             authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
                                 "Shader combo limit exceeded");
-            return false;
+            goto fail;
         }
 
-        char *cand_vert = NULL;
-        char *cand_frag = NULL;
+        combo_stage_t *st = &stages[stage_count++];
+        memset(st, 0, sizeof(*st));
+        st->scene = out->we_scene;
+        st->pass = pass;
+        st->combo_idx = combo_idx;
+        st->found_combo = found_combo;
+
         if (pass->prep.vert_glsl) {
-            cand_vert = authoring_patch_combo_define(pass->prep.vert_glsl, req->combo_name,
-                                                     req->combo_value);
-            if (!cand_vert) {
+            st->cand_vert = authoring_patch_combo_define(pass->prep.vert_glsl, req->combo_name,
+                                                         req->combo_value);
+            if (!st->cand_vert) {
                 resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
                 authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
                                     "Out of memory patching vertex shader combo");
-                return false;
+                goto fail;
             }
         }
         if (pass->prep.frag_glsl) {
-            cand_frag = authoring_patch_combo_define(pass->prep.frag_glsl, req->combo_name,
-                                                     req->combo_value);
-            if (!cand_frag) {
-                free(cand_vert);
+            st->cand_frag = authoring_patch_combo_define(pass->prep.frag_glsl, req->combo_name,
+                                                         req->combo_value);
+            if (!st->cand_frag) {
                 resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
                 authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
                                     "Out of memory patching fragment shader combo");
-                return false;
+                goto fail;
             }
         }
 
-        if (out->we_scene->gl_initialized && cand_vert && cand_frag) {
+        if (out->we_scene->gl_initialized && (st->cand_vert || st->cand_frag)) {
+            /* Pair a lone stage with the minimal 300 es stub so GLSL syntax errors still reject
+             * partial passes. */
+            const char *vert_src = st->cand_vert ? st->cand_vert : k_authoring_val_vert_300es;
+            const char *frag_src = st->cand_frag ? st->cand_frag : k_authoring_val_frag_300es;
             authoring_ensure_scene_egl(out->we_scene);
-            uint32_t prog = we_shader_compile_program(cand_vert, cand_frag, pass->shader_name);
+            uint32_t prog = we_shader_compile_program(vert_src, frag_src, pass->shader_name);
             if (prog == 0u) {
-                free(cand_vert);
-                free(cand_frag);
                 resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
                 resp->recompile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
                 authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
                                     "Shader recompile failed");
-                return false;
+                goto fail;
             }
-            if (pass->gl_prog != 0u) {
-                glDeleteProgram(pass->gl_prog);
+            if (st->cand_vert && st->cand_frag) {
+                st->new_prog = prog;
+                st->replace_prog = true;
+            } else {
+                glDeleteProgram(prog);
             }
-            pass->gl_prog = prog;
-            pass->ulocs.initialized = false;
         }
-
-        if (cand_vert) {
-            free(pass->prep.vert_glsl);
-            pass->prep.vert_glsl = cand_vert;
-        }
-        if (cand_frag) {
-            free(pass->prep.frag_glsl);
-            pass->prep.frag_glsl = cand_frag;
-        }
-        if (found_combo) {
-            pass->combos[combo_idx].value = req->combo_value;
-        } else {
-            authoring_copy_cstr(pass->combos[pass->combo_count].name,
-                                sizeof(pass->combos[pass->combo_count].name), req->combo_name);
-            pass->combos[pass->combo_count].value = req->combo_value;
-            pass->combo_count++;
-        }
-        updated = true;
     }
 
-    if (!updated) {
+    if (stage_count == 0u) {
         resp->status_code = WAYWAL_STATUS_ERR_SYNTAX;
         authoring_copy_cstr(resp->error_msg, sizeof(resp->error_msg),
                             "Target shader pass not found");
         return false;
     }
 
+    for (size_t i = 0u; i < stage_count; ++i) {
+        combo_stage_t *st = &stages[i];
+        we_material_pass_t *pass = st->pass;
+        if (st->replace_prog) {
+            authoring_ensure_scene_egl(st->scene);
+            if (pass->gl_prog != 0u) {
+                glDeleteProgram(pass->gl_prog);
+            }
+            pass->gl_prog = st->new_prog;
+            pass->ulocs.initialized = false;
+        }
+        if (st->cand_vert) {
+            free(pass->prep.vert_glsl);
+            pass->prep.vert_glsl = st->cand_vert;
+        }
+        if (st->cand_frag) {
+            free(pass->prep.frag_glsl);
+            pass->prep.frag_glsl = st->cand_frag;
+        }
+        if (st->found_combo) {
+            pass->combos[st->combo_idx].value = req->combo_value;
+        } else {
+            authoring_copy_cstr(pass->combos[pass->combo_count].name,
+                                sizeof(pass->combos[pass->combo_count].name), req->combo_name);
+            pass->combos[pass->combo_count].value = req->combo_value;
+            pass->combo_count++;
+        }
+    }
+
     resp->status_code = WAYWAL_STATUS_OK;
     resp->recompile_time_us = (uint32_t)((now_ns() - t0) / 1000ULL);
     return true;
+
+fail:
+    for (size_t i = 0u; i < stage_count; ++i) {
+        if (stages[i].replace_prog && stages[i].new_prog != 0u) {
+            authoring_ensure_scene_egl(stages[i].scene);
+            glDeleteProgram(stages[i].new_prog);
+        }
+        free(stages[i].cand_vert);
+        free(stages[i].cand_frag);
+    }
+    return false;
 }
 
 static int32_t authoring_clamp_double_to_i32(double v)
@@ -8850,15 +9305,7 @@ bool daemon_dispatch_ipc_req_readback_texture(daemon_state_t *state,
 static bool authoring_send_msg(int client_fd, const waywal_ipc_hdr_t *hdr, const void *payload,
                                size_t payload_len)
 {
-    if (!ipc_dispatch_write_full(client_fd, hdr, sizeof(*hdr), 500)) {
-        (void)shutdown(client_fd, SHUT_RDWR);
-        return false;
-    }
-    if (payload_len > 0u && !ipc_dispatch_write_full(client_fd, payload, payload_len, 500)) {
-        (void)shutdown(client_fd, SHUT_RDWR);
-        return false;
-    }
-    return true;
+    return ipc_dispatch_send_msg(client_fd, hdr, payload, payload_len);
 }
 
 static bool authoring_read_var_packet(int client_fd, uint64_t total_payload_size, size_t fixed_size,
@@ -10562,6 +11009,14 @@ bool daemon_dispatch_ipc_req_puppet_set_anim_tracks(daemon_state_t *state,
         we_mdl_anim_t *decoded = stages[t].decoded;
         stages[t].decoded = NULL;
 
+        /* Map final layer slots back to the request clip index so partial updates do not clobber
+         * earlier layers. */
+        int32_t src_clip_for_slot[WE_MDL_MAX_LAYERS];
+        for (uint32_t l = 0u; l < WE_MDL_MAX_LAYERS; ++l) {
+            src_clip_for_slot[l] = -1;
+        }
+        uint32_t prev_lc = puppet->layer_count;
+
         if (replace_all) {
             rig_clear_puppet_anims(puppet);
             puppet->anims = decoded;
@@ -10572,6 +11027,9 @@ bool daemon_dispatch_ipc_req_puppet_set_anim_tracks(daemon_state_t *state,
                 puppet->layer_count = lc;
                 if (lc > 0u) {
                     memcpy(puppet->layers, stages[t].layers, lc * sizeof(we_puppet_layer_t));
+                    for (uint32_t l = 0u; l < lc; ++l) {
+                        src_clip_for_slot[l] = (int32_t)l;
+                    }
                 }
             }
         } else {
@@ -10589,13 +11047,20 @@ bool daemon_dispatch_ipc_req_puppet_set_anim_tracks(daemon_state_t *state,
                         rig_free_anim_clip(&merged[e]);
                         merged[e] = decoded[c];
                         memset(&decoded[c], 0, sizeof(decoded[c]));
+                        if (e < WE_MDL_MAX_LAYERS) {
+                            src_clip_for_slot[e] = (int32_t)c;
+                        }
                         replaced = true;
                         break;
                     }
                 }
                 if (!replaced && out_n < WE_MDL_MAX_ANIMS) {
-                    merged[out_n++] = decoded[c];
+                    uint32_t dst_idx = out_n++;
+                    merged[dst_idx] = decoded[c];
                     memset(&decoded[c], 0, sizeof(decoded[c]));
+                    if (dst_idx < WE_MDL_MAX_LAYERS) {
+                        src_clip_for_slot[dst_idx] = (int32_t)c;
+                    }
                 } else if (!replaced) {
                     rig_free_anim_clip(&decoded[c]);
                 }
@@ -10608,14 +11073,20 @@ bool daemon_dispatch_ipc_req_puppet_set_anim_tracks(daemon_state_t *state,
                 uint32_t lc = out_n < WE_MDL_MAX_LAYERS ? out_n : WE_MDL_MAX_LAYERS;
                 puppet->layer_count = lc;
                 for (uint32_t l = 0u; l < lc; ++l) {
+                    bool same_slot_clip =
+                        (l < prev_lc) &&
+                        ((puppet->anims[l].id != 0 &&
+                          puppet->layers[l].anim_id == puppet->anims[l].id) ||
+                         strcmp(puppet->layers[l].anim_name, puppet->anims[l].name) == 0);
                     puppet->layers[l].anim_id = puppet->anims[l].id;
                     memcpy(puppet->layers[l].anim_name, puppet->anims[l].name,
                            sizeof(puppet->layers[l].anim_name));
-                    if (l < req->clip_count) {
-                        puppet->layers[l].blend = stages[t].layers[l].blend;
-                        puppet->layers[l].rate = stages[t].layers[l].rate;
-                        puppet->layers[l].visible = stages[t].layers[l].visible;
-                    } else if (puppet->layers[l].rate == 0.0f) {
+                    int32_t c = src_clip_for_slot[l];
+                    if (c >= 0 && (uint32_t)c < WE_MDL_MAX_LAYERS) {
+                        puppet->layers[l].blend = stages[t].layers[c].blend;
+                        puppet->layers[l].rate = stages[t].layers[c].rate;
+                        puppet->layers[l].visible = stages[t].layers[c].visible;
+                    } else if (!same_slot_clip || puppet->layers[l].rate == 0.0f) {
                         puppet->layers[l].blend = 1.0f;
                         puppet->layers[l].rate = 1.0f;
                         puppet->layers[l].visible = true;
@@ -10627,11 +11098,15 @@ bool daemon_dispatch_ipc_req_puppet_set_anim_tracks(daemon_state_t *state,
         rig_puppet_slot_t *slot = rig_get_puppet_slot(sc, req->object_id, true);
         if (slot) {
             if (sync_layers) {
-                uint32_t lc =
-                    req->clip_count < WE_MDL_MAX_LAYERS ? req->clip_count : WE_MDL_MAX_LAYERS;
-                if (lc > 0u) {
-                    memcpy(slot->rig_ctx.layer_blend_modes, stages[t].modes,
-                           lc * sizeof(we_anim_blend_mode_t));
+                uint32_t lc = puppet->layer_count < WE_MDL_MAX_LAYERS ? puppet->layer_count
+                                                                      : WE_MDL_MAX_LAYERS;
+                for (uint32_t l = 0u; l < lc; ++l) {
+                    int32_t c = src_clip_for_slot[l];
+                    if (c >= 0 && (uint32_t)c < WE_MDL_MAX_LAYERS) {
+                        slot->rig_ctx.layer_blend_modes[l] = stages[t].modes[c];
+                    } else if (replace_all || l >= prev_lc) {
+                        slot->rig_ctx.layer_blend_modes[l] = WE_ANIM_BLEND_OVERRIDE;
+                    }
                 }
             }
             rig_sync_slot_to_puppet(puppet, slot);
@@ -11239,6 +11714,61 @@ bool daemon_dispatch_authoring_ipc(daemon_state_t *state, int client_fd,
     return false;
 }
 
+static bool daemon_is_valid_pixel_format(const char *fmt)
+{
+    if (!fmt || fmt[0] == '\0') {
+        return false;
+    }
+    static const char *const k_valid[] = {"xrgb", "argb", "xbgr", "abgr", "bgr", "rgb"};
+    for (size_t i = 0; i < sizeof(k_valid) / sizeof(k_valid[0]); ++i) {
+        if (strcasecmp(fmt, k_valid[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void daemon_cleanup_early_init(daemon_state_t *st, int *ready_write_fd, bool arena_ready)
+{
+    if (!st) {
+        return;
+    }
+    if (st->epoll_fd >= 0) {
+        close(st->epoll_fd);
+        st->epoll_fd = -1;
+    }
+    if (st->server_socket_fd >= 0) {
+        close(st->server_socket_fd);
+        st->server_socket_fd = -1;
+    }
+    /* Wayland teardown checks fd >= 0, so negative sentinel init prevents closing stdin on early
+     * abort. */
+    daemon_wayland_destroy(st);
+    if (st->signal_fd >= 0) {
+        close(st->signal_fd);
+        st->signal_fd = -1;
+    }
+    if (arena_ready) {
+        arena_destroy(&st->frame_arena);
+    }
+    if (ready_write_fd && *ready_write_fd >= 0) {
+        close(*ready_write_fd);
+        *ready_write_fd = -1;
+    }
+    if (st->mpris) {
+        waywal_mpris_destroy(st->mpris);
+        st->mpris = NULL;
+    }
+    if (st->power_gov) {
+        waywal_power_governor_destroy(st->power_gov);
+        st->power_gov = NULL;
+    }
+    if (st->audio_fft) {
+        waywal_audio_fft_destroy(st->audio_fft);
+        st->audio_fft = NULL;
+    }
+}
+
 int main(int argc, char *argv[])
 {
     (void)setenv("CUDA_MODULE_LOADING", "LAZY", 0);
@@ -11250,9 +11780,17 @@ int main(int argc, char *argv[])
 #endif
     daemon_state_t state;
     memset(&state, 0, sizeof(state));
+    state.server_socket_fd = -1;
+    state.epoll_fd = -1;
+    state.signal_fd = -1;
+    state.cursor_ipc_fd = -1;
+    state.dmabuf_ctx.drm_fd = -1;
+    state.transition_timer_fd = -1;
     state.shader_timer_fd = -1;
     state.anim_timer_fd = -1;
     state.solar_timer_fd = -1;
+    state.video_engine.timer_fd = -1;
+    state.slideshow.timer_fd = -1;
     daemon_copy_cstr(state.namespace_str, sizeof(state.namespace_str), "default");
     state.current_color = (color_rgba_t){.r = 0, .g = 0, .b = 0, .a = 255};
     state.running = true;
@@ -11316,6 +11854,13 @@ int main(int argc, char *argv[])
             daemonize_bg = false;
             break;
         case 'f':
+            if (!daemon_is_valid_pixel_format(optarg)) {
+                fprintf(stderr,
+                        "wwald: invalid pixel format '%s' "
+                        "(expected xrgb, argb, xbgr, abgr, bgr, rgb)\n",
+                        optarg ? optarg : "");
+                return 1;
+            }
             break;
         case 'q':
             waywal_log_set_level(WAYWAL_LOG_LEVEL_ERR);
@@ -11438,14 +11983,7 @@ int main(int argc, char *argv[])
 
     if (!arena_init(&state.frame_arena, WAYWAL_FRAME_ARENA_CAPACITY)) {
         fprintf(stderr, "Fatal: failed to initialize frame memory arena\n");
-        if (ready_pipe[1] >= 0)
-            close(ready_pipe[1]);
-        if (state.mpris)
-            waywal_mpris_destroy(state.mpris);
-        if (state.power_gov)
-            waywal_power_governor_destroy(state.power_gov);
-        if (state.audio_fft)
-            waywal_audio_fft_destroy(state.audio_fft);
+        daemon_cleanup_early_init(&state, &ready_pipe[1], false);
         return 1;
     }
 
@@ -11456,89 +11994,50 @@ int main(int argc, char *argv[])
     sigemptyset(&sa_chld.sa_mask);
     (void)sigaction(SIGCHLD, &sa_chld, NULL);
 
+    /* Ignore SIGPIPE synchronously so peer disconnects surface as EPIPE instead of shutting down
+     * via signalfd. */
+    struct sigaction sa_pipe;
+    memset(&sa_pipe, 0, sizeof(sa_pipe));
+    sa_pipe.sa_handler = SIG_IGN;
+    sa_pipe.sa_flags = SA_RESTART;
+    sigemptyset(&sa_pipe.sa_mask);
+    (void)sigaction(SIGPIPE, &sa_pipe, NULL);
+
     sigset_t sigmask;
     sigemptyset(&sigmask);
     sigaddset(&sigmask, SIGINT);
     sigaddset(&sigmask, SIGTERM);
     sigaddset(&sigmask, SIGHUP);
-    sigaddset(&sigmask, SIGPIPE);
-    signal(SIGPIPE, SIG_IGN);
     if (sigprocmask(SIG_BLOCK, &sigmask, NULL) < 0) {
         WAYWAL_LOG_ERR("sigprocmask failed: %s", strerror(errno));
-        arena_destroy(&state.frame_arena);
-        if (ready_pipe[1] >= 0)
-            close(ready_pipe[1]);
-        if (state.mpris)
-            waywal_mpris_destroy(state.mpris);
-        if (state.power_gov)
-            waywal_power_governor_destroy(state.power_gov);
-        if (state.audio_fft)
-            waywal_audio_fft_destroy(state.audio_fft);
+        daemon_cleanup_early_init(&state, &ready_pipe[1], true);
         return 1;
     }
 
     state.signal_fd = signalfd(-1, &sigmask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (state.signal_fd < 0) {
         WAYWAL_LOG_ERR("signalfd failed: %s", strerror(errno));
-        arena_destroy(&state.frame_arena);
-        if (ready_pipe[1] >= 0)
-            close(ready_pipe[1]);
-        if (state.mpris)
-            waywal_mpris_destroy(state.mpris);
-        if (state.power_gov)
-            waywal_power_governor_destroy(state.power_gov);
-        if (state.audio_fft)
-            waywal_audio_fft_destroy(state.audio_fft);
+        daemon_cleanup_early_init(&state, &ready_pipe[1], true);
         return 1;
     }
 
     if (!daemon_wayland_init(&state)) {
         WAYWAL_LOG_ERR("Failed to initialize Wayland subsystem");
-        close(state.signal_fd);
-        arena_destroy(&state.frame_arena);
-        if (ready_pipe[1] >= 0)
-            close(ready_pipe[1]);
-        if (state.mpris)
-            waywal_mpris_destroy(state.mpris);
-        if (state.power_gov)
-            waywal_power_governor_destroy(state.power_gov);
-        if (state.audio_fft)
-            waywal_audio_fft_destroy(state.audio_fft);
+        daemon_cleanup_early_init(&state, &ready_pipe[1], true);
         return 1;
     }
 
     state.server_socket_fd = waywal_ipc_server_create(state.namespace_str);
     if (state.server_socket_fd < 0) {
         WAYWAL_LOG_ERR("Failed to create IPC server socket");
-        daemon_wayland_destroy(&state);
-        close(state.signal_fd);
-        arena_destroy(&state.frame_arena);
-        if (ready_pipe[1] >= 0)
-            close(ready_pipe[1]);
-        if (state.mpris)
-            waywal_mpris_destroy(state.mpris);
-        if (state.power_gov)
-            waywal_power_governor_destroy(state.power_gov);
-        if (state.audio_fft)
-            waywal_audio_fft_destroy(state.audio_fft);
+        daemon_cleanup_early_init(&state, &ready_pipe[1], true);
         return 1;
     }
 
     state.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (state.epoll_fd < 0) {
         WAYWAL_LOG_ERR("epoll_create1 failed: %s", strerror(errno));
-        close(state.server_socket_fd);
-        daemon_wayland_destroy(&state);
-        close(state.signal_fd);
-        arena_destroy(&state.frame_arena);
-        if (ready_pipe[1] >= 0)
-            close(ready_pipe[1]);
-        if (state.mpris)
-            waywal_mpris_destroy(state.mpris);
-        if (state.power_gov)
-            waywal_power_governor_destroy(state.power_gov);
-        if (state.audio_fft)
-            waywal_audio_fft_destroy(state.audio_fft);
+        daemon_cleanup_early_init(&state, &ready_pipe[1], true);
         return 1;
     }
 
@@ -11700,8 +12199,10 @@ int main(int argc, char *argv[])
     WAYWAL_LOG_INFO("wwald daemon running successfully (namespace: %s)", state.namespace_str);
     if (ready_pipe[1] >= 0) {
         uint8_t ok_byte = 1;
-        ssize_t wr = write(ready_pipe[1], &ok_byte, 1);
-        (void)wr;
+        ssize_t wr = 0;
+        do {
+            wr = write(ready_pipe[1], &ok_byte, 1);
+        } while (wr < 0 && errno == EINTR);
         close(ready_pipe[1]);
         ready_pipe[1] = -1;
     }
@@ -11801,6 +12302,7 @@ int main(int argc, char *argv[])
             break;
         }
         wl_display_dispatch_pending(state.display);
+        slideshow_clear_if_stale(&state);
 
         arena_reset(&state.frame_arena);
     }
@@ -11823,6 +12325,7 @@ int main(int argc, char *argv[])
     }
     state.num_subscribers = 0;
 
+    state.g_presenting_slideshow = NULL;
     for (output_node_t *out = state.outputs; out != NULL; out = out->next) {
         stop_engines_on_output(&state, out, false, false, false, false);
         if (out->shader_eng == state.shader_eng) {

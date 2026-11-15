@@ -757,6 +757,200 @@ static void test_unix_socketpair_rigging_roundtrip(void)
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static bool rig_read_exact_nb(int fd, void *buf, size_t len)
+{
+    uint8_t *dst = (uint8_t *)buf;
+    size_t got = 0u;
+    while (got < len) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        if (poll(&pfd, 1, 2000) <= 0) {
+            return false;
+        }
+        ssize_t n = recv(fd, dst + got, len - got, 0);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        got += (size_t)n;
+    }
+    return true;
+}
+
+static bool rig_recv_packet_nb(int fd, waywal_ipc_hdr_t *out_hdr, uint8_t *out_payload,
+                               size_t payload_cap)
+{
+    if (!rig_read_exact_nb(fd, out_hdr, sizeof(*out_hdr))) {
+        return false;
+    }
+    if (out_hdr->magic != WAYWAL_IPC_MAGIC || out_hdr->version != WAYWAL_IPC_VERSION ||
+        out_hdr->payload_size > payload_cap) {
+        return false;
+    }
+    if (out_hdr->payload_size > 0u && !rig_read_exact_nb(fd, out_payload, out_hdr->payload_size)) {
+        return false;
+    }
+    return true;
+}
+
+static void run_scrub_parity_server(int fd)
+{
+    uint8_t req_buf[1024];
+    uint8_t resp_buf[1024];
+    for (int step = 0; step < 5; ++step) {
+        waywal_ipc_hdr_t hdr = {0};
+        if (!rig_recv_packet_nb(fd, &hdr, req_buf, sizeof(req_buf))) {
+            _exit(2);
+        }
+
+        waywal_ipc_hdr_t rh = {
+            .magic = WAYWAL_IPC_MAGIC,
+            .version = WAYWAL_IPC_VERSION,
+            .opcode = WAYWAL_RESP_ERR,
+            .payload_size = 0u,
+        };
+        const void *rpay = NULL;
+        size_t rlen = 0u;
+
+        switch (hdr.opcode) {
+        case WAYWAL_REQ_PUPPET_SET_ANIM_TRACKS: {
+            const waywal_ipc_puppet_set_anim_tracks_t *r = NULL;
+            const uint8_t *blob = NULL;
+            size_t blen = 0u;
+            bool ok = waywal_ipc_validate_req_puppet_set_anim_tracks(req_buf, hdr.payload_size, &r,
+                                                                     &blob, &blen);
+            rh.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
+            if (!ok) {
+                static const char err[] = "Invalid anim tracks";
+                rpay = err;
+                rlen = sizeof(err);
+                rh.payload_size = (uint32_t)rlen;
+            }
+            break;
+        }
+        case WAYWAL_REQ_PUPPET_SCRUB_TIME: {
+            /* Always emit OK/ERR parity (never silent) so client reply queue never desyncs. */
+            const waywal_ipc_puppet_scrub_t *r = NULL;
+            bool valid = waywal_ipc_validate_req_puppet_scrub_time(req_buf, hdr.payload_size, &r);
+            bool found = valid && r->object_id == 7u;
+            if (found) {
+                rh.opcode = WAYWAL_RESP_OK;
+            } else {
+                static const char err_invalid[] = "Invalid scrub_time payload";
+                static const char err_missing[] = "Failed to scrub puppet time";
+                const char *msg = valid ? err_missing : err_invalid;
+                rh.opcode = WAYWAL_RESP_ERR;
+                rpay = msg;
+                rlen = strlen(msg) + 1u;
+                rh.payload_size = (uint32_t)rlen;
+            }
+            break;
+        }
+        case WAYWAL_REQ_EXPORT_PUPPET_MDL: {
+            const waywal_ipc_export_puppet_mdl_t *r = NULL;
+            if (!waywal_ipc_validate_req_export_puppet_mdl(req_buf, hdr.payload_size, &r)) {
+                _exit(3);
+            }
+            static const uint8_t mdl_magic[8] = {'M', 'D', 'L', 'P', 1, 0, 0, 0};
+            if (!waywal_ipc_serialize_resp_export_puppet_mdl(0, r->object_id, mdl_magic,
+                                                             sizeof(mdl_magic), &rh, resp_buf,
+                                                             sizeof(resp_buf), &rlen)) {
+                _exit(4);
+            }
+            rpay = resp_buf;
+            break;
+        }
+        default:
+            _exit(5);
+        }
+
+        if (!waywal_ipc_send_payload_fds(fd, &rh, rpay, rlen, NULL, 0u)) {
+            _exit(6);
+        }
+    }
+    close(fd);
+    _exit(0);
+}
+
+static void test_scrub_time_error_parity_no_desync(void)
+{
+    int sv[2] = {-1, -1};
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv) == 0);
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        close(sv[0]);
+        run_scrub_parity_server(sv[1]);
+    }
+
+    close(sv[1]);
+    int cfd = sv[0];
+    waywal_ipc_hdr_t hdr = {0};
+    waywal_ipc_hdr_t rhdr = {0};
+    uint8_t tx[512];
+    uint8_t rx[512];
+    size_t total = 0u;
+
+    /* 1. !replace_all && sync_layers (flags = 0x2u) anim track sync -> RESP_OK */
+    assert(waywal_ipc_serialize_req_puppet_set_anim_tracks(7u, 0u, 0x2u, NULL, 0u, &hdr, tx,
+                                                           sizeof(tx), &total));
+    assert(waywal_ipc_send_payload_fds(cfd, &hdr, tx, total, NULL, 0u));
+    assert(rig_recv_packet_nb(cfd, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_OK);
+
+    /* 2. Valid 0x0032 SCRUB_TIME -> mandatory WAYWAL_RESP_OK */
+    waywal_ipc_puppet_scrub_t sc_ok = {
+        .object_id = 7u, .time_sec = 0.25f, .pause_playback = 1u, .flags = 1u};
+    waywal_ipc_puppet_scrub_t sc_pay;
+    assert(waywal_ipc_serialize_req_puppet_scrub_time(&sc_ok, &hdr, &sc_pay));
+    assert(waywal_ipc_send_payload_fds(cfd, &hdr, &sc_pay, hdr.payload_size, NULL, 0u));
+    assert(rig_recv_packet_nb(cfd, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_OK);
+
+    /* 3. Wire-invalid 0x0032 SCRUB_TIME (negative time) -> mandatory WAYWAL_RESP_ERR */
+    waywal_ipc_puppet_scrub_t sc_bad = {
+        .object_id = 7u, .time_sec = -1.0f, .pause_playback = 0u, .flags = 0u};
+    waywal_ipc_hdr_t bad_hdr = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_PUPPET_SCRUB_TIME,
+        .payload_size = sizeof(sc_bad),
+    };
+    assert(waywal_ipc_send_payload_fds(cfd, &bad_hdr, &sc_bad, sizeof(sc_bad), NULL, 0u));
+    assert(rig_recv_packet_nb(cfd, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_ERR);
+
+    /* 4. Unknown-object 0x0032 SCRUB_TIME -> mandatory WAYWAL_RESP_ERR (no silent drop) */
+    waywal_ipc_puppet_scrub_t sc_miss = {
+        .object_id = 9999u, .time_sec = 1.0f, .pause_playback = 0u, .flags = 0u};
+    assert(waywal_ipc_serialize_req_puppet_scrub_time(&sc_miss, &hdr, &sc_pay));
+    assert(waywal_ipc_send_payload_fds(cfd, &hdr, &sc_pay, hdr.payload_size, NULL, 0u));
+    assert(rig_recv_packet_nb(cfd, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_ERR);
+
+    /* 5. Subsequent EXPORT_PUPPET_MDL must still receive 0x801D cleanly without desync */
+    waywal_ipc_export_puppet_mdl_t exp_pay;
+    assert(waywal_ipc_serialize_req_export_puppet_mdl(7u, 1u, NULL, &hdr, &exp_pay));
+    assert(waywal_ipc_send_payload_fds(cfd, &hdr, &exp_pay, hdr.payload_size, NULL, 0u));
+    assert(rig_recv_packet_nb(cfd, &rhdr, rx, sizeof(rx)));
+    assert(rhdr.opcode == WAYWAL_RESP_EXPORT_PUPPET_MDL);
+    const waywal_ipc_export_puppet_mdl_resp_t *exp_resp = NULL;
+    const uint8_t *mdl_blob = NULL;
+    assert(waywal_ipc_validate_resp_export_puppet_mdl(rx, rhdr.payload_size, &exp_resp, &mdl_blob));
+    assert(exp_resp->status == 0 && exp_resp->object_id == 7u && exp_resp->mdl_byte_size == 8u);
+    assert(memcmp(mdl_blob, "MDLP\1\0\0\0", 8u) == 0);
+
+    close(cfd);
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 int main(void)
 {
     test_legacy_and_helpers();
@@ -765,6 +959,7 @@ int main(void)
     test_weights_and_heatmap_wire();
     test_ik_anim_scrub_export_wire();
     test_unix_socketpair_rigging_roundtrip();
+    test_scrub_time_error_parity_no_desync();
     printf("test_ipc_rigging_wire: PASS\n");
     return 0;
 }

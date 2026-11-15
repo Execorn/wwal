@@ -11,6 +11,7 @@
  */
 
 #include "waywal/ipc_proto.h"
+#include "waywal/ipc_proto_phase3.h"
 #include "waywal/log.h"
 #include "waywal/os_compat.h"
 #include "waywal/path.h"
@@ -102,12 +103,15 @@ static void test_in_memory_zero_extension(void)
     printf("  -> In-memory zero-extension verified successfully.\n");
 }
 
-static int create_test_legacy_memfd(uint32_t width, uint32_t height)
+static int create_test_memfd_with_seals(uint32_t width, uint32_t height, bool extended_hdr,
+                                        unsigned int seals)
 {
     uint64_t pixel_bytes = (uint64_t)width * (uint64_t)height * 4ULL;
-    uint64_t total_size = sizeof(legacy_img_metadata_72_t) + pixel_bytes;
+    size_t hdr_bytes =
+        extended_hdr ? sizeof(waywal_img_metadata_t) : sizeof(legacy_img_metadata_72_t);
+    uint64_t total_size = (uint64_t)hdr_bytes + pixel_bytes;
 
-    int memfd = waywal_create_memfd("wwal-test-legacy-72", total_size, 0);
+    int memfd = waywal_create_memfd("wwal-test-shm", total_size, seals);
     if (memfd < 0) {
         perror("waywal_create_memfd");
         return -1;
@@ -120,19 +124,28 @@ static int create_test_legacy_memfd(uint32_t width, uint32_t height)
         return -1;
     }
 
-    legacy_img_metadata_72_t *hdr = (legacy_img_metadata_72_t *)ptr;
-    memset(hdr, 0, sizeof(*hdr));
-    hdr->width = width;
-    hdr->height = height;
-    hdr->pixel_format = 0;
-    hdr->transition_type = 0;
-    hdr->transition_duration_ms = 100;
-    hdr->transition_fps = 60;
-    hdr->extra_data_len = 0;
-    hdr->scaling_mode = 0; // FILL
+    if (extended_hdr) {
+        waywal_img_metadata_t *hdr = (waywal_img_metadata_t *)ptr;
+        memset(hdr, 0, sizeof(*hdr));
+        hdr->width = width;
+        hdr->height = height;
+        hdr->transition_fps = 60;
+        hdr->filter_mode = 1;
+        hdr->invert_y = 0;
+    } else {
+        legacy_img_metadata_72_t *hdr = (legacy_img_metadata_72_t *)ptr;
+        memset(hdr, 0, sizeof(*hdr));
+        hdr->width = width;
+        hdr->height = height;
+        hdr->pixel_format = 0;
+        hdr->transition_type = 0;
+        hdr->transition_duration_ms = 100;
+        hdr->transition_fps = 60;
+        hdr->extra_data_len = 0;
+        hdr->scaling_mode = 0; // FILL
+    }
 
-    // Fill with recognizable test pattern (solid green pixels)
-    uint8_t *pixels = (uint8_t *)ptr + sizeof(legacy_img_metadata_72_t);
+    uint8_t *pixels = (uint8_t *)ptr + hdr_bytes;
     for (uint64_t i = 0; i < pixel_bytes; i += 4) {
         pixels[i + 0] = 0x00; // R
         pixels[i + 1] = 0xFF; // G
@@ -142,6 +155,111 @@ static int create_test_legacy_memfd(uint32_t width, uint32_t height)
 
     munmap(ptr, total_size);
     return memfd;
+}
+
+static void test_mixed_72b_and_shrink_sealed_memfd(void)
+{
+    printf("[TEST] Verifying daemon_validate_set_image_header, waywal_validate_img_metadata, "
+           "and F_SEAL_SHRINK memfd framing...\n");
+
+    const uint32_t test_w = 16;
+    const uint32_t test_h = 16;
+    const uint64_t px_bytes = (uint64_t)test_w * test_h * 4ULL;
+
+    /* Exact 72B header and full extended header must pass; truncated (< 72B) must fail. */
+    waywal_ipc_hdr_t h72 = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_SET_IMAGE,
+        .payload_size = 72u + px_bytes,
+    };
+    waywal_ipc_hdr_t hext = h72;
+    hext.payload_size = sizeof(waywal_img_metadata_t) + px_bytes;
+    waywal_ipc_hdr_t hshort = h72;
+    hshort.payload_size = 71u;
+    assert(daemon_validate_set_image_header(&h72));
+    assert(daemon_validate_set_image_header(&hext));
+    assert(!daemon_validate_set_image_header(&hshort));
+
+    waywal_img_metadata_t meta_ok;
+    memset(&meta_ok, 0, sizeof(meta_ok));
+    meta_ok.width = test_w;
+    meta_ok.height = test_h;
+    meta_ok.extra_data_len = 64u;
+    meta_ok.custom_shader_len = 16u;
+    uint64_t out_px = 0;
+    assert(waywal_validate_img_metadata(&meta_ok, px_bytes, &out_px));
+    assert(out_px == px_bytes);
+
+    waywal_img_metadata_t bad_meta = meta_ok;
+    bad_meta.extra_data_len = WWAL_MAX_EXTRA_IPC_BYTES + 1u;
+    assert(!waywal_validate_img_metadata(&bad_meta, px_bytes, NULL));
+    bad_meta = meta_ok;
+    bad_meta.custom_shader_len = bad_meta.extra_data_len + 1u;
+    assert(!waywal_validate_img_metadata(&bad_meta, px_bytes, NULL));
+    bad_meta = meta_ok;
+    bad_meta.width = UINT32_MAX / 4u;
+    bad_meta.height = 2u;
+    assert(!waywal_validate_img_metadata(&bad_meta, px_bytes, NULL));
+    assert(!waywal_validate_img_metadata(&meta_ok, px_bytes - 1u, NULL));
+
+    /* Transmit mixed legacy-72B + extended shrink-sealed memfds over UNIX socketpair. */
+    int sv[2] = {-1, -1};
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0);
+
+    int m72 = create_test_memfd_with_seals(test_w, test_h, false, F_SEAL_SHRINK);
+    int mext = create_test_memfd_with_seals(test_w, test_h, true, F_SEAL_SHRINK);
+    int munsealed = create_test_memfd_with_seals(test_w, test_h, false, 0);
+    assert(m72 >= 0 && mext >= 0 && munsealed >= 0);
+
+    int seals_72 = fcntl(m72, F_GET_SEALS);
+    assert(seals_72 >= 0 && (seals_72 & F_SEAL_SHRINK) != 0);
+    assert(ftruncate(m72, 0) < 0 && errno == EPERM);
+    int seals_unsealed = fcntl(munsealed, F_GET_SEALS);
+    assert(seals_unsealed >= 0 && (seals_unsealed & F_SEAL_SHRINK) == 0);
+
+    assert(waywal_ipc_send(sv[0], &h72, m72));
+    assert(waywal_ipc_send(sv[0], &hext, mext));
+
+    for (int iter = 0; iter < 2; ++iter) {
+        waywal_ipc_hdr_t rh = {0};
+        int rfd = -1;
+        assert(waywal_ipc_recv(sv[1], &rh, &rfd));
+        assert(rfd >= 0);
+        assert(daemon_validate_set_image_header(&rh));
+
+        struct stat st;
+        assert(fstat(rfd, &st) == 0 && S_ISREG(st.st_mode));
+        int seals = fcntl(rfd, F_GET_SEALS);
+        assert(seals >= 0 && (seals & F_SEAL_SHRINK) != 0);
+
+        size_t hdr_bytes = (iter == 0) ? 72u : sizeof(waywal_img_metadata_t);
+        assert((uint64_t)st.st_size == hdr_bytes + px_bytes);
+        void *mapped = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, rfd, 0);
+        assert(mapped != MAP_FAILED);
+
+        waywal_img_metadata_t decoded;
+        memset(&decoded, 0, sizeof(decoded));
+        memcpy(&decoded, mapped, hdr_bytes);
+        uint64_t dec_px = 0;
+        assert(waywal_validate_img_metadata(&decoded, (uint64_t)st.st_size - hdr_bytes, &dec_px));
+        assert(dec_px == px_bytes);
+        assert(decoded.width == test_w && decoded.height == test_h);
+        if (iter == 0) {
+            assert(decoded.filter_mode == 0u);
+        } else {
+            assert(decoded.filter_mode == 1u);
+        }
+        munmap(mapped, (size_t)st.st_size);
+        close(rfd);
+    }
+
+    close(m72);
+    close(mext);
+    close(munsealed);
+    close(sv[0]);
+    close(sv[1]);
+    printf("  -> Mixed legacy-72B, extended, and F_SEAL_SHRINK memfd invariants verified.\n");
 }
 
 static int try_connect_socket(const char *sock_path)
@@ -185,8 +303,10 @@ static int find_or_spawn_daemon(const char *ns, pid_t *out_pid, char *out_sock_p
     }
 
     // Try finding wwald executable to spawn
-    const char *candidates[] = {"build/src/daemon/wwald", "build/wwald",
-                                "../build/src/daemon/wwald", "../build/wwald", NULL};
+    const char *candidates[] = {
+        "./wwald",     "build_worker/wwald",        "build/src/daemon/wwald",
+        "build/wwald", "../build/src/daemon/wwald", "../build/wwald",
+        NULL};
 
     const char *daemon_bin = NULL;
     for (int i = 0; candidates[i]; ++i) {
@@ -240,8 +360,9 @@ int main(int argc, char *argv[])
     printf("  72-Byte Legacy IPC Backward Compatibility Test Suite    \n");
     printf("==========================================================\n");
 
-    // 1. Run pure mathematical & struct layout tests
+    // 1. Run pure mathematical, struct layout & shrink-sealed memfd tests
     test_in_memory_zero_extension();
+    test_mixed_72b_and_shrink_sealed_memfd();
 
     // 2. Parse --namespace argument
     const char *ns = "test_compat";
@@ -264,7 +385,7 @@ int main(int argc, char *argv[])
     }
 
     if (client_fd < 0) {
-        if (getenv("WAYLAND_DISPLAY") == NULL && getenv("DISPLAY") == NULL) {
+        if (getenv("WAYLAND_DISPLAY") == NULL) {
             printf("[TEST] Notice: Headless environment without Wayland compositor socket.\n");
             printf("==========================================================\n");
             printf("  >>> 72-BYTE IPC PROTOCOL INVARIANT VERIFIED CLEANLY <<<\n");
@@ -279,11 +400,11 @@ int main(int argc, char *argv[])
 
     printf("[TEST] Connected to daemon socket: %s\n", sock_path);
 
-    // 3. Create legacy 72-byte payload memfd
+    // 3. Create shrink-sealed legacy 72-byte payload memfd
     const uint32_t test_w = 16;
     const uint32_t test_h = 16;
-    int memfd = create_test_legacy_memfd(test_w, test_h);
-    assert(memfd >= 0 && "create_test_legacy_memfd failed");
+    int memfd = create_test_memfd_with_seals(test_w, test_h, false, F_SEAL_SHRINK);
+    assert(memfd >= 0 && "create_test_memfd_with_seals failed");
 
     uint64_t total_payload = sizeof(legacy_img_metadata_72_t) + ((uint64_t)test_w * test_h * 4);
 
@@ -315,9 +436,44 @@ int main(int argc, char *argv[])
 
     assert(resp_hdr.magic == WAYWAL_IPC_MAGIC && "Invalid response magic");
     assert(resp_hdr.opcode == WAYWAL_RESP_OK &&
-           "Daemon must accept 72-byte legacy packet with WAYWAL_RESP_OK");
+           "Daemon must accept shrink-sealed 72-byte legacy packet with WAYWAL_RESP_OK");
 
     close(client_fd);
+
+    // 6. Verify unsealed SET_IMAGE memfd rejection and extended shrink-sealed acceptance on fresh
+    // sockets.
+    int reject_fd = try_connect_socket(sock_path);
+    if (reject_fd >= 0) {
+        int bad_memfd = create_test_memfd_with_seals(test_w, test_h, false, 0);
+        assert(bad_memfd >= 0);
+        assert(waywal_ipc_send(reject_fd, &req_hdr, bad_memfd));
+        close(bad_memfd);
+        waywal_ipc_hdr_t bad_resp = {0};
+        int bad_rfd = -1;
+        assert(waywal_ipc_recv(reject_fd, &bad_resp, &bad_rfd));
+        if (bad_rfd >= 0)
+            close(bad_rfd);
+        assert(bad_resp.opcode == WAYWAL_RESP_ERR);
+        close(reject_fd);
+    }
+
+    int ext_fd = try_connect_socket(sock_path);
+    if (ext_fd >= 0) {
+        int ext_memfd = create_test_memfd_with_seals(test_w, test_h, true, F_SEAL_SHRINK);
+        assert(ext_memfd >= 0);
+        waywal_ipc_hdr_t ext_hdr = req_hdr;
+        ext_hdr.payload_size =
+            sizeof(waywal_img_metadata_t) + ((uint64_t)test_w * (uint64_t)test_h * 4ULL);
+        assert(waywal_ipc_send(ext_fd, &ext_hdr, ext_memfd));
+        close(ext_memfd);
+        waywal_ipc_hdr_t ext_resp = {0};
+        int ext_rfd = -1;
+        assert(waywal_ipc_recv(ext_fd, &ext_resp, &ext_rfd));
+        if (ext_rfd >= 0)
+            close(ext_rfd);
+        assert(ext_resp.opcode == WAYWAL_RESP_OK);
+        close(ext_fd);
+    }
 
     if (daemon_pid > 0) {
         kill(daemon_pid, SIGTERM);

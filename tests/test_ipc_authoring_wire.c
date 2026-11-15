@@ -1,13 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/ipc_proto.h"
 #include "waywal/ipc_proto_authoring.h"
+#include "waywal/os_compat.h"
 
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 /* Verify ABI / wire contract invariants at compile time */
 static_assert(sizeof(waywal_ipc_hdr_t) == 16, "waywal_ipc_hdr_t must be 16 bytes");
@@ -508,6 +516,236 @@ static void test_authoring_framing_0x0021_to_0x002A(void)
     }
 }
 
+static bool auth_send_msg_nb(int fd, const waywal_ipc_hdr_t *hdr, const void *payload,
+                             size_t payload_len)
+{
+    struct iovec iov[2];
+    iov[0].iov_base = (void *)hdr;
+    iov[0].iov_len = sizeof(*hdr);
+    size_t iov_cnt = 1u;
+    if (payload_len > 0u) {
+        iov[1].iov_base = (void *)payload;
+        iov[1].iov_len = payload_len;
+        iov_cnt = 2u;
+    }
+
+    size_t idx = 0u;
+    while (idx < iov_cnt) {
+        struct msghdr msg = {0};
+        msg.msg_iov = &iov[idx];
+        msg.msg_iovlen = iov_cnt - idx;
+        ssize_t n = sendmsg(fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+                if (poll(&pfd, 1, 2000) <= 0) {
+                    return false;
+                }
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        size_t adv = (size_t)n;
+        while (idx < iov_cnt && adv >= iov[idx].iov_len) {
+            adv -= iov[idx].iov_len;
+            idx++;
+        }
+        if (idx < iov_cnt && adv > 0u) {
+            iov[idx].iov_base = (uint8_t *)iov[idx].iov_base + adv;
+            iov[idx].iov_len -= adv;
+        }
+    }
+    return true;
+}
+
+static bool auth_recv_exact_nb(int fd, void *buf, size_t len)
+{
+    uint8_t *dst = (uint8_t *)buf;
+    size_t got = 0u;
+    while (got < len) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        if (poll(&pfd, 1, 2000) <= 0) {
+            return false;
+        }
+        ssize_t n = recv(fd, dst + got, len - got, 0);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        got += (size_t)n;
+    }
+    return true;
+}
+
+static void test_authoring_wire_dispatch_framing_and_bounds(void)
+{
+    int sv[2] = {-1, -1};
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv) == 0);
+
+    /* Mixed legacy 72 B SET_IMAGE + F_SEAL_SHRINK memfd framing */
+    int shm_fd = waywal_create_memfd("waywal-auth-img", 4096u, F_SEAL_SHRINK);
+    assert(shm_fd >= 0);
+
+    uint8_t leg72[72] = {0};
+    waywal_img_metadata_t leg_meta;
+    memset(&leg_meta, 0, sizeof(leg_meta));
+    leg_meta.width = 16u;
+    leg_meta.height = 16u;
+    memcpy(leg72, &leg_meta, sizeof(leg72));
+
+    waywal_ipc_hdr_t leg_hdr = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_SET_IMAGE,
+        .payload_size = sizeof(leg72),
+    };
+    assert(waywal_ipc_send_payload_fds(sv[0], &leg_hdr, leg72, sizeof(leg72), &shm_fd, 1u));
+    close(shm_fd);
+
+    waywal_ipc_hdr_t rx_hdr = {0};
+    int rx_fd = -1;
+    size_t rx_nfds = 0u;
+    assert(waywal_ipc_recv_fds(sv[1], &rx_hdr, &rx_fd, 1u, &rx_nfds));
+    assert(rx_hdr.opcode == WAYWAL_REQ_SET_IMAGE);
+    assert(rx_hdr.payload_size == 72u);
+    assert(rx_nfds == 1u && rx_fd >= 0);
+    assert((fcntl(rx_fd, F_GET_SEALS) & F_SEAL_SHRINK) != 0);
+    close(rx_fd);
+
+    uint8_t rx_leg72[72] = {0};
+    assert(auth_recv_exact_nb(sv[1], rx_leg72, sizeof(rx_leg72)));
+
+    waywal_img_metadata_t zero_filled;
+    memset(&zero_filled, 0, sizeof(zero_filled));
+    memcpy(&zero_filled, rx_leg72, sizeof(rx_leg72));
+    uint64_t px_bytes = 0u;
+    assert(waywal_validate_img_metadata(&zero_filled, 4096u, &px_bytes));
+    assert(px_bytes == 1024u);
+
+    /* Truncated / inconsistent extended metadata lengths must fail validation */
+    waywal_img_metadata_t bad_meta = zero_filled;
+    bad_meta.extra_data_len = 16u;
+    bad_meta.custom_shader_len = 17u;
+    assert(!waywal_validate_img_metadata(&bad_meta, 4096u, NULL));
+    bad_meta.extra_data_len = WWAL_MAX_EXTRA_IPC_BYTES + 1u;
+    bad_meta.custom_shader_len = 0u;
+    assert(!waywal_validate_img_metadata(&bad_meta, 4096u, NULL));
+
+    /* Structured 148 B uniform wire packet */
+    waywal_set_uniform_payload_t u_pay;
+    memset(&u_pay, 0, sizeof(u_pay));
+    u_pay.structured.struct_size = sizeof(waywal_set_uniform_structured_t);
+    u_pay.structured.flags = WAYWAL_UNIFORM_FLAG_STRUCTURED;
+    snprintf(u_pay.structured.target_output, sizeof(u_pay.structured.target_output), "%s", "DP-1");
+    snprintf(u_pay.structured.uniform_name, sizeof(u_pay.structured.uniform_name), "%s",
+             "u_authoring_time");
+    u_pay.structured.uniform_components = 1u;
+    u_pay.structured.uniform_values[0] = 3.5f;
+
+    waywal_ipc_hdr_t uhdr = {
+        .magic = WAYWAL_IPC_MAGIC,
+        .version = WAYWAL_IPC_VERSION,
+        .opcode = WAYWAL_REQ_SET_UNIFORM,
+        .payload_size = sizeof(u_pay),
+    };
+    assert(auth_send_msg_nb(sv[0], &uhdr, &u_pay, sizeof(u_pay)));
+    assert(auth_recv_exact_nb(sv[1], &rx_hdr, sizeof(rx_hdr)));
+    assert(rx_hdr.opcode == WAYWAL_REQ_SET_UNIFORM);
+    assert(rx_hdr.payload_size == sizeof(waywal_set_uniform_structured_t));
+    waywal_set_uniform_payload_t u_rx;
+    assert(auth_recv_exact_nb(sv[1], &u_rx, sizeof(u_rx)));
+
+    char out_name[64] = {0};
+    char uniform_name[64] = {0};
+    uint32_t comps = 0u;
+    float vals[4] = {0};
+    uint32_t uflags = 0u;
+    assert(waywal_decode_set_uniform_payload(&u_rx, out_name, sizeof(out_name), uniform_name,
+                                             sizeof(uniform_name), &comps, vals, &uflags));
+    assert(strcmp(out_name, "DP-1") == 0 && strcmp(uniform_name, "u_authoring_time") == 0);
+    assert(comps == 1u && fabsf(vals[0] - 3.5f) < 1e-6f);
+
+    /* Single-sendmsg SCENE_MUTATE + HOT_RELOAD_CODE + SET_SHADER_COMBO wire round-trip */
+    waywal_ipc_req_scene_mutate_t mut_params;
+    memset(&mut_params, 0, sizeof(mut_params));
+    snprintf(mut_params.target_output, sizeof(mut_params.target_output), "%s", "DP-1");
+    mut_params.mutate_op = WE_MUTATE_SET_TRANSFORM;
+    mut_params.object_id = 42;
+    mut_params.parent_id = -1;
+    mut_params.scale[0] = 1.0f;
+    mut_params.scale[1] = 1.0f;
+    mut_params.scale[2] = 1.0f;
+    mut_params.color[3] = 1.0f;
+    snprintf(mut_params.name, sizeof(mut_params.name), "%s", "layer_a");
+
+    uint8_t pkt_buf[4096];
+    waywal_ipc_hdr_t mh = {0};
+    waywal_ipc_req_scene_mutate_t mreq = {0};
+    size_t mlen = 0u;
+    assert(waywal_ipc_serialize_req_scene_mutate(&mut_params, "{\"x\":1}", &mh, &mreq, pkt_buf,
+                                                 sizeof(pkt_buf), &mlen));
+    assert(auth_send_msg_nb(sv[0], &mh, pkt_buf, mlen));
+
+    waywal_ipc_hdr_t rx_mh = {0};
+    assert(auth_recv_exact_nb(sv[1], &rx_mh, sizeof(rx_mh)));
+    assert(rx_mh.opcode == WAYWAL_REQ_SCENE_MUTATE && rx_mh.payload_size == mlen);
+    uint8_t rx_buf[4096];
+    assert(rx_mh.payload_size <= sizeof(rx_buf));
+    assert(auth_recv_exact_nb(sv[1], rx_buf, rx_mh.payload_size));
+    const char *mut_json = NULL;
+    assert(waywal_ipc_validate_req_scene_mutate((const waywal_ipc_req_scene_mutate_t *)rx_buf,
+                                                rx_mh.payload_size, &mut_json));
+    assert(mut_json != NULL && strcmp(mut_json, "{\"x\":1}") == 0);
+
+    /* Oversized mutate payload_len mismatch must be rejected deterministically */
+    waywal_ipc_req_scene_mutate_t bad_mut = mreq;
+    bad_mut.payload_len = 128u;
+    assert(!waywal_ipc_validate_req_scene_mutate(&bad_mut, sizeof(bad_mut), &mut_json));
+
+    /* HOT_RELOAD_CODE packet + status reply framing */
+    const char *frag_src = "void main() { gl_FragColor = vec4(1.0); }";
+    waywal_ipc_hdr_t hh = {0};
+    waywal_ipc_req_hot_reload_code_t hreq = {0};
+    size_t hlen = 0u;
+    assert(waywal_ipc_serialize_req_hot_reload_code("DP-1", 0u, 0x2u, 42, 0u, 0u, "", frag_src,
+                                                    strlen(frag_src), &hh, &hreq, pkt_buf,
+                                                    sizeof(pkt_buf), &hlen));
+    assert(auth_send_msg_nb(sv[0], &hh, pkt_buf, hlen));
+    assert(auth_recv_exact_nb(sv[1], &rx_hdr, sizeof(rx_hdr)));
+    assert(rx_hdr.opcode == WAYWAL_REQ_HOT_RELOAD_CODE && rx_hdr.payload_size == hlen);
+    assert(rx_hdr.payload_size <= sizeof(rx_buf));
+    assert(auth_recv_exact_nb(sv[1], rx_buf, rx_hdr.payload_size));
+    const char *rx_src = NULL;
+    assert(waywal_ipc_validate_req_hot_reload_code((const waywal_ipc_req_hot_reload_code_t *)rx_buf,
+                                                   rx_hdr.payload_size, &rx_src));
+    assert(rx_src != NULL && strcmp(rx_src, frag_src) == 0);
+
+    /* SET_SHADER_COMBO packet framing */
+    waywal_ipc_hdr_t ch = {0};
+    waywal_ipc_req_set_shader_combo_t creq = {0};
+    assert(waywal_ipc_serialize_req_set_shader_combo("DP-1", 42, 0u, "QUALITY", 2, 0u, &ch, &creq));
+    assert(auth_send_msg_nb(sv[0], &ch, &creq, sizeof(creq)));
+    assert(auth_recv_exact_nb(sv[1], &rx_hdr, sizeof(rx_hdr)));
+    assert(rx_hdr.opcode == WAYWAL_REQ_SET_SHADER_COMBO && rx_hdr.payload_size == sizeof(creq));
+    waywal_ipc_req_set_shader_combo_t creq_rx;
+    assert(auth_recv_exact_nb(sv[1], &creq_rx, sizeof(creq_rx)));
+    assert(waywal_ipc_validate_req_set_shader_combo(&creq_rx, sizeof(creq_rx)));
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
 int main(void)
 {
     test_legacy_set_image_header();
@@ -516,6 +754,7 @@ int main(void)
     test_query_tree_export_lint_readback_wire();
     test_brush_particle_audio_wire();
     test_authoring_framing_0x0021_to_0x002A();
+    test_authoring_wire_dispatch_framing_and_bounds();
     printf("test_ipc_authoring_wire: all tests passed!\n");
     return 0;
 }
