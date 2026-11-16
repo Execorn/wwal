@@ -606,9 +606,11 @@ void test_concurrent_wal_pool_rcu_and_pruning()
         acf << "\"AppWorkshop\"\n{\n"
             << "  \"appid\" \"431960\"\n"
             << "  \"WorkshopItemsInstalled\"\n  {\n"
-            << "    \"4001\"\n    {\n      \"size\" \"1024\"\n      \"timeupdated\" \"1710001000\"\n"
+            << "    \"4001\"\n    {\n      \"size\" \"1024\"\n      \"timeupdated\" "
+               "\"1710001000\"\n"
             << "      \"manifest\" \"111\"\n    }\n"
-            << "    \"4002\"\n    {\n      \"size\" \"2048\"\n      \"timeupdated\" \"1710002000\"\n"
+            << "    \"4002\"\n    {\n      \"size\" \"2048\"\n      \"timeupdated\" "
+               "\"1710002000\"\n"
             << "      \"manifest\" \"222\"\n    }\n"
             << "  }\n}\n";
     }
@@ -729,6 +731,298 @@ void test_concurrent_wal_pool_rcu_and_pruning()
               << std::endl;
 }
 
+void test_reconcile_path_change_not_skipped_with_matching_timestamp()
+{
+    std::cout
+        << "[Catalog 9/10] Testing reconcile path-change detection when time_updated matches..."
+        << std::endl;
+
+    std::filesystem::path root = "/tmp/test_wwal_cat_move";
+    std::filesystem::path dbPath = "/tmp/test_wwal_cat_move.db";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    cleanup_db_files(dbPath);
+
+    std::filesystem::path libARoot = root / "libA";
+    std::filesystem::path libAContent = libARoot / "content" / "431960";
+    std::filesystem::path libBRoot = root / "libB";
+    std::filesystem::path libBContent = libBRoot / "content" / "431960";
+    std::filesystem::create_directories(libAContent / "5001", ec);
+    std::filesystem::create_directories(libBContent, ec);
+
+    {
+        std::ofstream pf(libAContent / "5001" / "project.json");
+        pf << "{ \"title\": \"Orbital Drift\", \"type\": \"scene\", \"tags\": [\"Space\"] }\n";
+        std::ofstream sf(libAContent / "5001" / "scene.json");
+        sf << "{ \"objects\": [ { \"id\": 1, \"type\": \"sprite\" } ] }\n";
+    }
+
+    auto writeSingleManifest = [](const std::filesystem::path &libRoot, const std::string &idStr,
+                                  uint64_t ts) {
+        std::ofstream acf(libRoot / "appworkshop_431960.acf", std::ios::trunc);
+        acf << "\"AppWorkshop\"\n{\n"
+            << "  \"appid\" \"431960\"\n"
+            << "  \"WorkshopItemsInstalled\"\n  {\n";
+        if (!idStr.empty()) {
+            acf << "    \"" << idStr << "\"\n    {\n"
+                << "      \"size\" \"4096\"\n"
+                << "      \"timeupdated\" \"" << ts << "\"\n"
+                << "      \"manifest\" \"5500112233\"\n"
+                << "    }\n";
+        }
+        acf << "  }\n}\n";
+    };
+
+    constexpr uint64_t kSharedTs = 1710005000ULL;
+    writeSingleManifest(libARoot, "5001", kSharedTs);
+
+    {
+        CatalogIndexManager mgr(dbPath);
+        assert(mgr.isOpen());
+        assert(mgr.reconcileDirectory(libAContent, 0) == 1);
+
+        const std::string oldPath = (libAContent / "5001").string();
+        auto initial = mgr.getItem(5001);
+        assert(initial.has_value());
+        assert(initial->file_path == oldPath);
+        assert(initial->time_updated == kSharedTs);
+        assert(initial->file_clock == 1);
+        assert(mgr.getItemByPath(oldPath).has_value());
+
+        // Move item directory from libA to libB with identical timeupdated in libB's manifest.
+        std::filesystem::rename(libAContent / "5001", libBContent / "5001", ec);
+        assert(!ec);
+        {
+            std::ofstream pf(libBContent / "5001" / "project.json", std::ios::trunc);
+            pf << "{ \"title\": \"Orbital Drift Relocated\", \"type\": \"scene\", "
+                  "\"tags\": [\"Cyberpunk\"] }\n";
+        }
+        writeSingleManifest(libBRoot, "5001", kSharedTs);
+        writeSingleManifest(libARoot, "", 0);
+
+        assert(mgr.reconcileDirectory(libBContent, 0) == 1);
+
+        const std::string newPath = (libBContent / "5001").string();
+        auto moved = mgr.getItem(5001);
+        assert(moved.has_value() && "Moved item must remain indexed");
+        assert(moved->file_path == newPath &&
+               "reconcileDirectory must update file_path when directory moved with same timestamp");
+        assert(moved->file_clock == 2 && "Path change must update SQLite row and bump file_clock");
+        assert(moved->title == "Orbital Drift Relocated");
+        assert(!mgr.getItemByPath(oldPath).has_value());
+        assert(mgr.getItemByPath(newPath).has_value());
+
+        // Verify SoA RCU snapshot and FTS5 updated alongside SQLite.
+        auto fuzzyHits = mgr.searchFuzzy("Orbital Drift Relocated", 0, 10);
+        assert(!fuzzyHits.empty() && fuzzyHits[0].published_file_id == 5001);
+        std::vector<uint64_t> cyberIds;
+        assert(mgr.filterByTagMaskBitmap(WallpaperTags::Cyberpunk, &cyberIds) >= 1);
+        assert(std::find(cyberIds.begin(), cyberIds.end(), 5001ULL) != cyberIds.end());
+
+        // Reconciling the old library afterwards must not prune the moved item.
+        assert(mgr.reconcileDirectory(libAContent, 0) == 0);
+        assert(mgr.getItem(5001).has_value());
+        assert(mgr.getItem(5001)->file_path == newPath);
+
+        // Once path and timestamp match, zero-stat fast path resumes cleanly.
+        assert(mgr.reconcileDirectory(libBContent, 0) == 1);
+        assert(mgr.lastReconcileStatCount() == 0);
+        assert(mgr.getItem(5001)->file_clock == 2);
+
+        // In-directory rename keeping parsed base-10 ID ("0005002" -> "5002") and same timestamp.
+        std::filesystem::create_directories(libBContent / "0005002", ec);
+        {
+            std::ofstream pf(libBContent / "0005002" / "project.json");
+            pf << "{ \"title\": \"Leading Zero Item\", \"type\": \"video\" }\n";
+        }
+        {
+            std::ofstream acf(libBRoot / "appworkshop_431960.acf", std::ios::trunc);
+            acf << "\"AppWorkshop\"\n{\n"
+                << "  \"appid\" \"431960\"\n"
+                << "  \"WorkshopItemsInstalled\"\n  {\n"
+                << "    \"5001\"\n    {\n      \"size\" \"4096\"\n"
+                << "      \"timeupdated\" \"" << kSharedTs << "\"\n      \"manifest\" \"1\"\n"
+                << "    }\n"
+                << "    \"5002\"\n    {\n      \"size\" \"4096\"\n"
+                << "      \"timeupdated\" \"1710006000\"\n      \"manifest\" \"2\"\n"
+                << "    }\n"
+                << "    \"5003\"\n    {\n      \"size\" \"4096\"\n"
+                << "      \"timeupdated\" \"1710007000\"\n      \"manifest\" \"3\"\n"
+                << "    }\n"
+                << "  }\n}\n";
+        }
+        assert(mgr.reconcileDirectory(libBContent, 0) == 2);
+        auto preRename = mgr.getItem(5002);
+        assert(preRename.has_value());
+        assert(preRename->file_path == (libBContent / "0005002").string());
+        assert(preRename->file_clock == 1);
+
+        std::filesystem::rename(libBContent / "0005002", libBContent / "5002", ec);
+        assert(!ec);
+
+        // Pre-seed item 5003 with empty file_path and matching timestamp to verify it is not
+        // skipped.
+        WorkshopItemRecord emptyPathSeed{};
+        emptyPathSeed.published_file_id = 5003;
+        emptyPathSeed.title = "Empty Path Seed";
+        emptyPathSeed.type = "video";
+        emptyPathSeed.file_path = "";
+        emptyPathSeed.time_updated = 1710007000ULL;
+        emptyPathSeed.storage_backend = 0;
+        assert(mgr.upsertItem(emptyPathSeed));
+        std::filesystem::create_directories(libBContent / "5003", ec);
+        {
+            std::ofstream pf(libBContent / "5003" / "project.json");
+            pf << "{ \"title\": \"Populated Path Item\", \"type\": \"video\" }\n";
+        }
+
+        assert(mgr.reconcileDirectory(libBContent, 0) == 3);
+        auto postRename = mgr.getItem(5002);
+        assert(postRename.has_value());
+        assert(postRename->file_path == (libBContent / "5002").string());
+        assert(postRename->file_clock == 2);
+
+        auto populated = mgr.getItem(5003);
+        assert(populated.has_value());
+        assert(populated->file_path == (libBContent / "5003").string());
+        assert(populated->title == "Populated Path Item");
+    }
+
+    std::filesystem::remove_all(root, ec);
+    cleanup_db_files(dbPath);
+    std::cout << "  -> Path-change and empty-path detection with matching timestamp passed."
+              << std::endl;
+}
+
+void test_reconcile_reused_compat_report_no_bleed()
+{
+    std::cout << "[Catalog 10/10] Testing reused compat scanner/report isolation across dirty "
+                 "items..."
+              << std::endl;
+
+    std::filesystem::path root = "/tmp/test_wwal_cat_compat_reuse";
+    std::filesystem::path dbPath = "/tmp/test_wwal_cat_compat_reuse.db";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    cleanup_db_files(dbPath);
+
+    std::filesystem::path wsContent = root / "content" / "431960";
+    for (int id = 6001; id <= 6008; ++id) {
+        std::filesystem::create_directories(wsContent / std::to_string(id), ec);
+    }
+
+    // 6001: Tier 4 Blocked (application)
+    {
+        std::ofstream pf(wsContent / "6001" / "project.json");
+        pf << "{ \"title\": \"Blocked App\", \"type\": \"application\", \"file\": \"app.exe\" }\n";
+    }
+    // 6002: Tier 3 Degraded (model3d object -> score 64)
+    {
+        std::ofstream pf(wsContent / "6002" / "project.json");
+        pf << "{ \"title\": \"Degraded Model3D\", \"type\": \"scene\", \"file\": \"scene.json\" "
+              "}\n";
+        std::ofstream sf(wsContent / "6002" / "scene.json");
+        sf << "{ \"objects\": [ { \"id\": 1, \"type\": \"model3d\" } ] }\n";
+    }
+    // 6003: Tier 1 Native (clean sprite scene -> score 100)
+    {
+        std::ofstream pf(wsContent / "6003" / "project.json");
+        pf << "{ \"title\": \"Clean Scene A\", \"type\": \"scene\", \"file\": \"scene.json\" }\n";
+        std::ofstream sf(wsContent / "6003" / "scene.json");
+        sf << "{ \"objects\": [ { \"id\": 1, \"type\": \"sprite\" } ] }\n";
+    }
+    // 6004: Tier 2 Transpiled (custom .frag shader -> score 92)
+    {
+        std::ofstream pf(wsContent / "6004" / "project.json");
+        pf << "{ \"title\": \"Shader Scene\", \"type\": \"scene\", \"file\": \"scene.json\" }\n";
+        std::ofstream sf(wsContent / "6004" / "scene.json");
+        sf << "{ \"objects\": [ { \"id\": 1, \"type\": \"sprite\" } ] }\n";
+        std::filesystem::create_directories(wsContent / "6004" / "shaders", ec);
+        std::ofstream frag(wsContent / "6004" / "shaders" / "glow.frag");
+        frag << "void main() { gl_FragColor = vec4(1.0); }\n";
+    }
+    // 6005: Tier 4 Blocked (missing scene.json)
+    {
+        std::ofstream pf(wsContent / "6005" / "project.json");
+        pf << "{ \"title\": \"Missing Scene\", \"type\": \"scene\", \"file\": \"missing.json\" }\n";
+    }
+    // 6006: Tier 1 Native (video -> score 100)
+    {
+        std::ofstream pf(wsContent / "6006" / "project.json");
+        pf << "{ \"title\": \"Native Video\", \"type\": \"video\" }\n";
+    }
+    // 6007: Tier 4 Blocked (forbidden JS primitive)
+    {
+        std::ofstream pf(wsContent / "6007" / "project.json");
+        pf << "{ \"title\": \"Script Violation\", \"type\": \"scene\", \"file\": \"scene.json\" "
+              "}\n";
+        std::ofstream sf(wsContent / "6007" / "scene.json");
+        sf << "{ \"objects\": [ { \"id\": 1, \"type\": \"sprite\" } ] }\n";
+        std::filesystem::create_directories(wsContent / "6007" / "scripts", ec);
+        std::ofstream js(wsContent / "6007" / "scripts" / "evil.js");
+        js << "const fs = require('fs');\n";
+    }
+    // 6008: Tier 1 Native (clean sprite scene -> score 100)
+    {
+        std::ofstream pf(wsContent / "6008" / "project.json");
+        pf << "{ \"title\": \"Clean Scene B\", \"type\": \"scene\", \"file\": \"scene.json\" }\n";
+        std::ofstream sf(wsContent / "6008" / "scene.json");
+        sf << "{ \"objects\": [ { \"id\": 1, \"type\": \"sprite\" } ] }\n";
+    }
+
+    // 6009 and 6010 reside outside wsContent so reconcileDirectory indexes 6001..6008 and
+    // reconcileItemDirectory exercises the standalone lazy-alloc path.
+    std::filesystem::path standaloneClean = root / "standalone" / "6009";
+    std::filesystem::path standaloneDegraded = root / "standalone" / "6010";
+    std::filesystem::create_directories(standaloneClean, ec);
+    std::filesystem::create_directories(standaloneDegraded, ec);
+    {
+        std::ofstream pf(standaloneClean / "project.json");
+        pf << "{ \"title\": \"Standalone Clean\", \"type\": \"scene\" }\n";
+        std::ofstream sf(standaloneClean / "scene.json");
+        sf << "{ \"objects\": [ { \"id\": 1, \"type\": \"sprite\" } ] }\n";
+    }
+    {
+        std::ofstream pf(standaloneDegraded / "project.json");
+        pf << "{ \"title\": \"Standalone Degraded\", \"type\": \"scene\" }\n";
+        std::ofstream sf(standaloneDegraded / "scene.json");
+        sf << "{ \"objects\": [ { \"id\": 1, \"type\": \"model3d\" } ] }\n";
+    }
+
+    {
+        CatalogIndexManager mgr(dbPath);
+        assert(mgr.isOpen());
+        assert(mgr.reconcileDirectory(wsContent, 0) == 8);
+
+        auto checkDiag = [&](uint64_t id, uint32_t wantTier, uint32_t wantScore,
+                             const char *wantTitle) {
+            auto item = mgr.getItem(id);
+            assert(item.has_value());
+            assert(item->compat_tier == wantTier);
+            assert(item->compat_score == wantScore);
+            assert(item->title == wantTitle);
+        };
+
+        checkDiag(6001, 4, 0, "Blocked App");
+        checkDiag(6002, 3, 64, "Degraded Model3D");
+        checkDiag(6003, 1, 100, "Clean Scene A");
+        checkDiag(6004, 2, 92, "Shader Scene");
+        checkDiag(6005, 4, 0, "Missing Scene");
+        checkDiag(6006, 1, 100, "Native Video");
+        checkDiag(6007, 4, 0, "Script Violation");
+        checkDiag(6008, 1, 100, "Clean Scene B");
+
+        assert(mgr.reconcileItemDirectory(standaloneClean, 6009, 0));
+        assert(mgr.reconcileItemDirectory(standaloneDegraded, 6010, 0));
+        checkDiag(6009, 1, 100, "Standalone Clean");
+        checkDiag(6010, 3, 64, "Standalone Degraded");
+    }
+
+    std::filesystem::remove_all(root, ec);
+    cleanup_db_files(dbPath);
+    std::cout << "  -> Reused compat scanner/report isolation passed." << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -763,9 +1057,11 @@ int main(int argc, char **argv)
     test_zero_stat_delta_reconciliation();
     test_wwpkg_signature_gate_in_reconcile();
     test_concurrent_wal_pool_rcu_and_pruning();
+    test_reconcile_path_change_not_skipped_with_matching_timestamp();
+    test_reconcile_reused_compat_report_no_bleed();
 
     std::cout << "==========================================================" << std::endl;
-    std::cout << "  >>> CATALOG INDEX SUITE PASSED (8/8 SUITES, 100%) <<<   " << std::endl;
+    std::cout << "  >>> CATALOG INDEX SUITE PASSED (10/10 SUITES, 100%) <<<  " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
     return 0;

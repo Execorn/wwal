@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <sys/mman.h>
@@ -2734,6 +2735,14 @@ size_t CatalogIndexManager::reconcileAllLibraries()
 
 namespace {
 
+using CompatScannerPtr = std::unique_ptr<we_compat_scanner_t, decltype(&we_compat_scanner_destroy)>;
+using CompatReportPtr = std::unique_ptr<we_compat_report_t, decltype(&we_compat_report_free)>;
+
+struct ExistingItemMeta {
+    uint64_t time_updated{0};
+    std::string file_path;
+};
+
 std::string dirBasename(const std::filesystem::path &p)
 {
     std::string norm = p.lexically_normal().string();
@@ -2746,7 +2755,9 @@ std::string dirBasename(const std::filesystem::path &p)
 bool buildLooseItemRecord(const std::filesystem::path &itemDir, uint64_t publishedFileId,
                           uint32_t storageBackend, const waywal_workshop_item_manifest_t *acfEntry,
                           IoUringStatxBatcher &batcher, size_t &statCounter,
-                          WorkshopItemRecord &outRec)
+                          WorkshopItemRecord &outRec,
+                          we_compat_scanner_t *reusableScanner = nullptr,
+                          we_compat_report_t *reusableReport = nullptr)
 {
     const std::string baseName = dirBasename(itemDir);
     if (publishedFileId == 0) {
@@ -2794,9 +2805,20 @@ bool buildLooseItemRecord(const std::filesystem::path &itemDir, uint64_t publish
         }
     }
 
-    we_compat_scanner_t *scanner = we_compat_scanner_create(true, true);
-    we_compat_report_t *report = we_compat_report_alloc();
+    CompatScannerPtr localScanner{nullptr, &we_compat_scanner_destroy};
+    CompatReportPtr localReport{nullptr, &we_compat_report_free};
+    we_compat_scanner_t *scanner = reusableScanner;
+    we_compat_report_t *report = reusableReport;
+    if (!scanner) {
+        localScanner.reset(we_compat_scanner_create(true, true));
+        scanner = localScanner.get();
+    }
+    if (!report) {
+        localReport.reset(we_compat_report_alloc());
+        report = localReport.get();
+    }
     if (scanner && report) {
+        // we_compat_scan_directory zeroes out_report on entry and treats scanner as read-only.
         if (we_compat_scan_directory(scanner, itemDir.string().c_str(), report)) {
             rec.compat_tier = static_cast<uint32_t>(report->tier);
             rec.compat_score = report->compatibility_score;
@@ -2804,12 +2826,6 @@ bool buildLooseItemRecord(const std::filesystem::path &itemDir, uint64_t publish
                 rec.title = report->title;
             }
         }
-    }
-    if (report) {
-        we_compat_report_free(report);
-    }
-    if (scanner) {
-        we_compat_scanner_destroy(scanner);
     }
 
     if (acfEntry && acfEntry->time_updated > 0 && acfEntry->size_bytes > 0) {
@@ -2889,7 +2905,7 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
         dirPrefix.push_back('/');
     }
 
-    std::unordered_map<uint64_t, uint64_t> existingTimestamps;
+    std::unordered_map<uint64_t, ExistingItemMeta> existingItems;
     std::vector<uint64_t> existingScopedIds;
     {
         auto loadExisting = [&](sqlite3 *dbHandle) -> bool {
@@ -2916,10 +2932,13 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
                 const uint64_t id = static_cast<uint64_t>(sqlite3_column_int64(stmt, 0));
                 const uint64_t ts = static_cast<uint64_t>(sqlite3_column_int64(stmt, 1));
                 const auto *fp = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
-                existingTimestamps.emplace(id, ts);
-                if (fp) {
+                const int fpLen = sqlite3_column_bytes(stmt, 2);
+                std::string filePath =
+                    (fp && fpLen > 0) ? std::string(fp, static_cast<size_t>(fpLen)) : std::string{};
+                existingItems.emplace(id, ExistingItemMeta{ts, filePath});
+                if (!filePath.empty()) {
                     const std::string normFp =
-                        std::filesystem::path(fp).lexically_normal().string();
+                        std::filesystem::path(filePath).lexically_normal().string();
                     if (normFp.starts_with(dirPrefix)) {
                         existingScopedIds.push_back(id);
                     }
@@ -2957,6 +2976,10 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
     std::vector<WorkshopItemRecord> dirtyRecords;
     std::unordered_set<uint64_t> seenIds;
     seenIds.reserve(existingScopedIds.size() + 32);
+    // Defer the 246 KB compat report allocation until a loose item actually needs scanning.
+    CompatScannerPtr compatScanner{nullptr, &we_compat_scanner_destroy};
+    CompatReportPtr compatReport{nullptr, &we_compat_report_free};
+    bool compatAllocAttempted = false;
 
     while (struct dirent *ent = ::readdir(topDir)) {
         if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0) {
@@ -2988,18 +3011,28 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
                 acfPtr = &mfIt->second;
             }
 
-            // Zero-stat fast path: unchanged (published_file_id, time_updated) in manifest.
+            const std::string entryPathStr = entryPath.string();
+            // Zero-stat fast path requires identical time_updated and file_path so moved items
+            // still re-index even when their manifest timestamp matches.
             if (acfPtr && acfPtr->time_updated > 0) {
-                auto exIt = existingTimestamps.find(id);
-                if (exIt != existingTimestamps.end() && exIt->second == acfPtr->time_updated) {
+                auto exIt = existingItems.find(id);
+                if (exIt != existingItems.end() &&
+                    exIt->second.time_updated == acfPtr->time_updated &&
+                    !exIt->second.file_path.empty() && exIt->second.file_path == entryPathStr) {
                     ++indexedCount;
                     continue;
                 }
             }
 
+            if (!compatAllocAttempted) {
+                compatScanner.reset(we_compat_scanner_create(true, true));
+                compatReport.reset(we_compat_report_alloc());
+                compatAllocAttempted = true;
+            }
+
             WorkshopItemRecord rec;
             if (buildLooseItemRecord(entryPath, id, storageBackend, acfPtr, statxBatcher, statCalls,
-                                     rec)) {
+                                     rec, compatScanner.get(), compatReport.get())) {
                 dirtyRecords.push_back(std::move(rec));
             }
         } else if (storageBackend == 2 && isReg && entryPath.extension() == ".wwpkg") {
