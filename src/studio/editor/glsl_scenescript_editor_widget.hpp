@@ -159,6 +159,7 @@ class GlslSceneScriptEditorWidget : public QWidget {
                                       uint32_t maxLines, uint32_t elapsedUs);
     void onDaemonHotReloadResponded(const waywal_ipc_resp_hot_reload_code_t &resp,
                                     const QString &metaJson);
+    void onIpcConnectionStateChanged(bool connected);
     void findNextInEditor(bool forward);
     void applyValidationResult(uint64_t generation, std::vector<EditorDiagnostic> diags);
     void rebuildSourceSpans(const QString &src);
@@ -169,17 +170,20 @@ class GlslSceneScriptEditorWidget : public QWidget {
     bool m_syncDefaultsToCode{true};
     bool m_pendingShowValidation{false};
     bool m_sourceSpansDirty{true};
+    bool m_awaitingHotReloadAck{false};
 
     EditorLanguageMode m_languageMode{EditorLanguageMode::GlslEs310Fragment};
     QString m_targetOutput{QStringLiteral("*")};
     int32_t m_objectId{-1};
     uint32_t m_slotIndex{0};
+    uint64_t m_pendingHotReloadGen{0};
     std::atomic<uint64_t> m_editGeneration{0};
     QString m_lastEmittedMetaSig;
     QString m_savedSourceText;
 
     IpcClient *m_ipcClient{nullptr};
     QMetaObject::Connection m_ipcHotReloadConn;
+    QMetaObject::Connection m_ipcConnStateConn;
     QPointer<QOpenGLContext> m_shareContext;
     std::unique_ptr<QOpenGLContext> m_workerGlContext;
     std::unique_ptr<QOffscreenSurface> m_workerSurface;

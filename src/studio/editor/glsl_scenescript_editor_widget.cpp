@@ -186,12 +186,22 @@ static_assert(std::ranges::is_sorted(kJsBuiltins));
     return std::ranges::binary_search(table, sv);
 }
 
-void sendHotReloadCodePacket(IpcClient *client, const QString &targetOutput,
-                             EditorLanguageMode mode, int32_t objectId, uint32_t slotIndex,
-                             const QByteArray &utf8Source)
+[[nodiscard]] bool sendHotReloadCodePacket(IpcClient *client, const QString &targetOutput,
+                                           EditorLanguageMode mode, int32_t objectId,
+                                           uint32_t slotIndex, const QByteArray &utf8Source,
+                                           QString &outError)
 {
-    if (!client || static_cast<size_t>(utf8Source.size()) > WAYWAL_IPC_MAX_CODE_BYTES) {
-        return;
+    if (!client) {
+        outError = QStringLiteral("Hot-reload failed: IPC client is unavailable");
+        return false;
+    }
+    if (utf8Source.size() < 0 ||
+        static_cast<size_t>(utf8Source.size()) > WAYWAL_IPC_MAX_CODE_BYTES) {
+        outError = QStringLiteral("Hot-reload skipped: source size (%1 bytes) exceeds %2-byte "
+                                  "IPC limit")
+                       .arg(utf8Source.size())
+                       .arg(WAYWAL_IPC_MAX_CODE_BYTES);
+        return false;
     }
 
     waywal_ipc_req_hot_reload_code_t req{};
@@ -213,7 +223,14 @@ void sendHotReloadCodePacket(IpcClient *client, const QString &targetOutput,
     }
     req.source_len = static_cast<uint32_t>(utf8Source.size());
 
-    (void)client->sendHotReloadCode(req, utf8Source);
+    if (!client->sendHotReloadCode(req, utf8Source)) {
+        outError =
+            utf8Source.contains('\0')
+                ? QStringLiteral("Hot-reload failed: source contains an embedded NUL byte")
+                : QStringLiteral("Hot-reload failed: IPC packet serialization or enqueue rejected");
+        return false;
+    }
+    return true;
 }
 
 /* Subclass QPlainTextEdit in .cpp so CodeGutterWidget can access protected viewport metrics
@@ -1483,6 +1500,9 @@ GlslSceneScriptEditorWidget::~GlslSceneScriptEditorWidget()
     if (m_ipcHotReloadConn) {
         disconnect(m_ipcHotReloadConn);
     }
+    if (m_ipcConnStateConn) {
+        disconnect(m_ipcConnStateConn);
+    }
     if (m_debounceTimer) {
         m_debounceTimer->stop();
     }
@@ -1503,10 +1523,17 @@ void GlslSceneScriptEditorWidget::setIpcClient(IpcClient *client)
         disconnect(m_ipcHotReloadConn);
         m_ipcHotReloadConn = {};
     }
+    if (m_ipcConnStateConn) {
+        disconnect(m_ipcConnStateConn);
+        m_ipcConnStateConn = {};
+    }
+    m_awaitingHotReloadAck = false;
     m_ipcClient = client;
     if (m_ipcClient) {
         m_ipcHotReloadConn = connect(m_ipcClient, &IpcClient::codeHotReloaded, this,
                                      &GlslSceneScriptEditorWidget::onDaemonHotReloadResponded);
+        m_ipcConnStateConn = connect(m_ipcClient, &IpcClient::connectionStateChanged, this,
+                                     &GlslSceneScriptEditorWidget::onIpcConnectionStateChanged);
     }
 }
 
@@ -1741,8 +1768,12 @@ void GlslSceneScriptEditorWidget::ensureUiInitialized()
                 }
                 triggerImmediateValidation();
             });
-    connect(m_hotReloadCheck, &QCheckBox::toggled, this,
-            [this](bool checked) { m_liveHotReload = checked; });
+    connect(m_hotReloadCheck, &QCheckBox::toggled, this, [this](bool checked) {
+        m_liveHotReload = checked;
+        if (!checked) {
+            m_awaitingHotReloadAck = false;
+        }
+    });
     connect(m_syncDefaultsCheck, &QCheckBox::toggled, this,
             [this](bool checked) { m_syncDefaultsToCode = checked; });
     connect(m_validateBtn, &QPushButton::clicked, this,
@@ -1816,6 +1847,7 @@ void GlslSceneScriptEditorWidget::openDocument(EditorLanguageMode mode, int32_t 
     m_lastEmittedMetaSig.clear();
     m_savedSourceText = sourceText;
     m_sourceSpansDirty = true;
+    m_awaitingHotReloadAck = false;
     m_lastDiagJumpIdx = -1;
 
     if (m_languageCombo) {
@@ -1858,6 +1890,7 @@ void GlslSceneScriptEditorWidget::onEditorTextChanged()
     m_editGeneration.fetch_add(1, std::memory_order_acq_rel);
     if (m_statusPill) {
         m_statusPill->setText(QStringLiteral("Editing..."));
+        m_statusPill->setToolTip(QString());
         m_statusPill->setStyleSheet(QStringLiteral(
             "background: #181b22; color: #94a3b8; border: 1px solid #2a2f3d;"
             "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600;"));
@@ -2145,11 +2178,10 @@ void GlslSceneScriptEditorWidget::finishValidationOnMainThread(
         }
     }
 
-    applyValidationResult(doneGen, std::move(diags));
-    const bool hasErr =
-        std::ranges::any_of(m_diagnostics, [](const EditorDiagnostic &x) { return !x.isWarning; });
+    const bool hasLocalErr =
+        std::ranges::any_of(diags, [](const EditorDiagnostic &x) { return !x.isWarning; });
 
-    if (!hasErr && doneMode != EditorLanguageMode::SceneScriptJs) {
+    if (!hasLocalErr && doneMode != EditorLanguageMode::SceneScriptJs) {
         waywal_shader_meta_t meta{};
         QString rawComboJson;
         mergeShaderMetadata(srcStr, meta, rawComboJson);
@@ -2160,15 +2192,39 @@ void GlslSceneScriptEditorWidget::finishValidationOnMainThread(
         }
     }
 
+    bool hotReloadDispatchFailed = false;
+    bool waitingForDaemonReply = false;
+    QString hotReloadError;
+
+    if (m_liveHotReload && !hasLocalErr && m_ipcClient) {
+        const bool ipcLive = m_ipcClient->isConnected();
+        if (!sendHotReloadCodePacket(m_ipcClient, m_targetOutput, doneMode, m_objectId, m_slotIndex,
+                                     srcBytes, hotReloadError)) {
+            hotReloadDispatchFailed = true;
+            diags.push_back(EditorDiagnostic{1u, 1u, false, hotReloadError});
+        } else if (ipcLive) {
+            waitingForDaemonReply = true;
+        }
+    }
+
+    applyValidationResult(doneGen, std::move(diags));
+
     if (m_liveHotReload) {
-        const bool ipcLive = (m_ipcClient && m_ipcClient->isConnected());
-        if (!hasErr && m_ipcClient) {
-            sendHotReloadCodePacket(m_ipcClient, m_targetOutput, doneMode, m_objectId, m_slotIndex,
-                                    srcBytes);
+        if (hotReloadDispatchFailed) {
+            m_awaitingHotReloadAck = false;
+            emit statusMessage(hotReloadError);
+            emit liveHotReloadApplied(false, elapsedUs);
+        } else if (waitingForDaemonReply) {
+            /* Connected IPC drops pending hot-reload requests on disconnect without emitting
+             * codeHotReloaded. */
+            m_awaitingHotReloadAck = true;
+            m_pendingHotReloadGen = doneGen;
+        } else {
+            m_awaitingHotReloadAck = false;
+            emit liveHotReloadApplied(!hasLocalErr, elapsedUs);
         }
-        if (!ipcLive || hasErr) {
-            emit liveHotReloadApplied(!hasErr, elapsedUs);
-        }
+    } else {
+        m_awaitingHotReloadAck = false;
     }
 }
 
@@ -2176,18 +2232,37 @@ void GlslSceneScriptEditorWidget::onDaemonHotReloadResponded(
     const waywal_ipc_resp_hot_reload_code_t &resp, const QString &metaJson)
 {
     (void)metaJson;
+    m_awaitingHotReloadAck = false;
     const bool ok = (resp.status_code == 0u);
-    if (!ok && resp.error_msg[0] != '\0') {
+    if (!ok) {
         const uint32_t maxLines =
             m_codeEdit ? static_cast<uint32_t>(std::max(1, m_codeEdit->blockCount())) : 1u;
         EditorDiagnostic d;
         d.line = std::clamp(std::max(1u, resp.error_line), 1u, maxLines);
         d.column = std::max(1u, resp.error_col);
         d.isWarning = false;
-        d.message = QString::fromUtf8(resp.error_msg);
+        d.message =
+            (resp.error_msg[0] != '\0')
+                ? QString::fromUtf8(resp.error_msg)
+                : QStringLiteral("Daemon hot-reload failed (status %1)").arg(resp.status_code);
+        const QString errMsg = d.message;
         applyValidationResult(m_editGeneration.load(std::memory_order_acquire), {std::move(d)});
+        emit statusMessage(errMsg);
     }
     emit liveHotReloadApplied(ok, resp.compile_time_us);
+}
+
+void GlslSceneScriptEditorWidget::onIpcConnectionStateChanged(bool connected)
+{
+    if (connected || !m_awaitingHotReloadAck) {
+        return;
+    }
+    m_awaitingHotReloadAck = false;
+    const QString errMsg =
+        QStringLiteral("Hot-reload failed: daemon IPC disconnected before confirmation");
+    applyValidationResult(m_pendingHotReloadGen, {EditorDiagnostic{1u, 1u, false, errMsg}});
+    emit statusMessage(errMsg);
+    emit liveHotReloadApplied(false, 0u);
 }
 
 void GlslSceneScriptEditorWidget::applyValidationResult(uint64_t generation,
@@ -2249,17 +2324,23 @@ void GlslSceneScriptEditorWidget::applyValidationResult(uint64_t generation,
 
     if (m_statusPill) {
         if (errCount > 0) {
+            const auto firstErr = std::ranges::find_if(
+                m_diagnostics, [](const EditorDiagnostic &d) { return !d.isWarning; });
             m_statusPill->setText(QStringLiteral("%1 Err").arg(errCount));
+            m_statusPill->setToolTip(firstErr != m_diagnostics.end() ? firstErr->message
+                                                                     : QString());
             m_statusPill->setStyleSheet(QStringLiteral(
                 "background: #181b22; color: #ef4444; border: 1px solid #ef4444;"
                 "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600;"));
         } else if (warnCount > 0) {
             m_statusPill->setText(QStringLiteral("%1 Warn").arg(warnCount));
+            m_statusPill->setToolTip(m_diagnostics.front().message);
             m_statusPill->setStyleSheet(QStringLiteral(
                 "background: #181b22; color: #f59e0b; border: 1px solid #f59e0b;"
                 "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600;"));
         } else {
             m_statusPill->setText(QStringLiteral("OK"));
+            m_statusPill->setToolTip(QString());
             m_statusPill->setStyleSheet(QStringLiteral(
                 "background: #181b22; color: #22c55e; border: 1px solid #22c55e;"
                 "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600;"));
