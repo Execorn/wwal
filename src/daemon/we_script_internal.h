@@ -10,8 +10,8 @@
 #include "waywal/log.h"
 
 #include <ctype.h>
-#include <dlfcn.h>
 #include <math.h>
+#include <stdckdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -197,6 +197,7 @@ typedef enum {
 typedef struct {
     js_tok_type_t type;
     const char *text;
+    size_t len;
     double num;
 } js_token_t;
 
@@ -268,10 +269,11 @@ struct ast_node {
     } tpl;
 };
 
-#define WE_SCRIPT_MAX_GLOBALS  96u
-#define WE_SCRIPT_MAX_LOCALS   64u
-#define WE_SCRIPT_MAX_PROPS    64u
-#define WE_SCRIPT_SCRATCH_SIZE (256u * 1024u)
+#define WE_SCRIPT_MAX_GLOBALS      96u
+#define WE_SCRIPT_MAX_LOCALS       64u
+#define WE_SCRIPT_MAX_PROPS        64u
+#define WE_SCRIPT_SCRATCH_SIZE     (256u * 1024u)
+#define WE_SCRIPT_MAX_STRING_BYTES (1024u * 1024u)
 
 typedef struct {
     const char *name;
@@ -302,7 +304,6 @@ struct we_script {
     size_t arena_used;
     size_t ast_watermark;
 
-    void *quickjs_dl;
     we_script_shared_t *shared;
     uint64_t rng_state;
 
@@ -345,16 +346,21 @@ struct we_script {
     bool depth_exceeded;
 };
 
-static void *script_arena_alloc(we_script_t *vm, size_t size)
+static inline void *script_arena_alloc(we_script_t *vm, size_t size)
 {
     if (!vm || !vm->arena_base) {
         return NULL;
     }
-    size_t aligned = (size + 7u) & ~(size_t)7u;
-    if (aligned == 0) {
-        aligned = 8u;
+    size_t aligned = 8u;
+    if (size > 0u) {
+        if (ckd_add(&aligned, size, (size_t)7u)) {
+            vm->oom = true;
+            vm->aborted = true;
+            return NULL;
+        }
+        aligned &= ~(size_t)7u;
     }
-    if (vm->arena_used + aligned > vm->arena_cap) {
+    if (aligned > vm->arena_cap || vm->arena_used > vm->arena_cap - aligned) {
         vm->oom = true;
         vm->aborted = true;
         return NULL;
@@ -365,13 +371,21 @@ static void *script_arena_alloc(we_script_t *vm, size_t size)
     return ptr;
 }
 
-static char *script_arena_strdup(we_script_t *vm, const char *s, size_t len)
+static inline char *script_arena_strdup(we_script_t *vm, const char *s, size_t len)
 {
-    char *dst = (char *)script_arena_alloc(vm, len + 1u);
+    size_t alloc_sz = 0u;
+    if (ckd_add(&alloc_sz, len, (size_t)1u)) {
+        if (vm) {
+            vm->oom = true;
+            vm->aborted = true;
+        }
+        return NULL;
+    }
+    char *dst = (char *)script_arena_alloc(vm, alloc_sz);
     if (!dst) {
         return NULL;
     }
-    if (len > 0 && s) {
+    if (len > 0u && s) {
         memcpy(dst, s, len);
     }
     dst[len] = '\0';

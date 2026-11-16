@@ -223,20 +223,20 @@ static bool val_to_bool(js_val_t v)
     }
 }
 
-static void val_to_str_buf(js_val_t v, char *buf, size_t cap)
+static const char *val_to_cstr_view(js_val_t v, char scratch[128], size_t *out_len)
 {
-    if (!buf || cap == 0) {
-        return;
-    }
+    int n = 0;
     switch (v.type) {
-    case VAL_STR:
-        snprintf(buf, cap, "%s", v.u.str ? v.u.str : "");
-        break;
+    case VAL_STR: {
+        const char *s = v.u.str ? v.u.str : "";
+        *out_len = strlen(s);
+        return s;
+    }
     case VAL_NUM:
         if (isnan(v.u.num)) {
-            snprintf(buf, cap, "NaN");
+            n = snprintf(scratch, 128, "NaN");
         } else {
-            snprintf(buf, cap, "%g", isfinite(v.u.num) ? v.u.num : 0.0);
+            n = snprintf(scratch, 128, "%g", isfinite(v.u.num) ? v.u.num : 0.0);
         }
         break;
     case VAL_DATE: {
@@ -255,37 +255,185 @@ static void val_to_str_buf(js_val_t v, char *buf, size_t cap)
             memset(&tmv, 0, sizeof(tmv));
             tmv.tm_mday = 1;
         }
-        snprintf(buf, cap, "%04d-%02d-%02d %02d:%02d:%02d", tmv.tm_year + 1900, tmv.tm_mon + 1,
-                 tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        n = snprintf(scratch, 128, "%04d-%02d-%02d %02d:%02d:%02d", tmv.tm_year + 1900,
+                     tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
         break;
     }
     case VAL_BOOL:
-        snprintf(buf, cap, "%s", v.u.bval ? "true" : "false");
+        n = snprintf(scratch, 128, "%s", v.u.bval ? "true" : "false");
         break;
     case VAL_NULL:
-        snprintf(buf, cap, "null");
+        n = snprintf(scratch, 128, "null");
         break;
     case VAL_UNDEF:
-        snprintf(buf, cap, "undefined");
+        n = snprintf(scratch, 128, "undefined");
         break;
     case VAL_VEC:
         if (v.u.vec) {
             if (v.u.vec->dim == 2) {
-                snprintf(buf, cap, "%g %g", v.u.vec->v[0], v.u.vec->v[1]);
+                n = snprintf(scratch, 128, "%g %g", v.u.vec->v[0], v.u.vec->v[1]);
             } else if (v.u.vec->dim == 3) {
-                snprintf(buf, cap, "%g %g %g", v.u.vec->v[0], v.u.vec->v[1], v.u.vec->v[2]);
+                n = snprintf(scratch, 128, "%g %g %g", v.u.vec->v[0], v.u.vec->v[1], v.u.vec->v[2]);
             } else {
-                snprintf(buf, cap, "%g %g %g %g", v.u.vec->v[0], v.u.vec->v[1], v.u.vec->v[2],
-                         v.u.vec->v[3]);
+                n = snprintf(scratch, 128, "%g %g %g %g", v.u.vec->v[0], v.u.vec->v[1],
+                             v.u.vec->v[2], v.u.vec->v[3]);
             }
         } else {
-            buf[0] = '\0';
+            scratch[0] = '\0';
+            n = 0;
         }
         break;
     default:
-        snprintf(buf, cap, "[object Object]");
+        n = snprintf(scratch, 128, "[object Object]");
         break;
     }
+    *out_len = (n > 0 && n < 128) ? (size_t)n : (n >= 128 ? 127u : 0u);
+    return scratch;
+}
+
+static void val_to_str_buf(js_val_t v, char *buf, size_t cap)
+{
+    if (!buf || cap == 0) {
+        return;
+    }
+    char scratch[128];
+    size_t len = 0;
+    const char *s = val_to_cstr_view(v, scratch, &len);
+    size_t copy_n = len < cap - 1u ? len : cap - 1u;
+    if (copy_n > 0u) {
+        memcpy(buf, s, copy_n);
+    }
+    buf[copy_n] = '\0';
+}
+
+typedef struct {
+    char inline_buf[256];
+    char *data;
+    size_t len;
+    size_t cap;
+} js_strbuf_t;
+
+static void js_strbuf_init(js_strbuf_t *sb)
+{
+    sb->data = sb->inline_buf;
+    sb->len = 0u;
+    sb->cap = sizeof(sb->inline_buf);
+    sb->inline_buf[0] = '\0';
+}
+
+static void js_strbuf_free(js_strbuf_t *sb)
+{
+    if (sb->data && sb->data != sb->inline_buf) {
+        free(sb->data);
+    }
+    sb->data = NULL;
+    sb->len = 0u;
+    sb->cap = 0u;
+}
+
+static bool js_strbuf_append(we_script_t *vm, js_strbuf_t *sb, const char *s, size_t slen)
+{
+    if (!vm || !sb) {
+        return false;
+    }
+    size_t needed = 0u;
+    size_t min_cap = 0u;
+    if (ckd_add(&needed, sb->len, slen) || needed > WE_SCRIPT_MAX_STRING_BYTES ||
+        ckd_add(&min_cap, needed, (size_t)1u)) {
+        vm->oom = true;
+        vm->aborted = true;
+        return false;
+    }
+    if (min_cap > sb->cap) {
+        size_t new_cap = sb->cap;
+        while (new_cap < min_cap) {
+            size_t doubled = 0u;
+            if (ckd_mul(&doubled, new_cap, (size_t)2u) ||
+                doubled > WE_SCRIPT_MAX_STRING_BYTES + 1u) {
+                new_cap = WE_SCRIPT_MAX_STRING_BYTES + 1u;
+                break;
+            }
+            new_cap = doubled;
+        }
+        if (new_cap < min_cap) {
+            new_cap = min_cap;
+        }
+        char *nbuf = NULL;
+        if (sb->data == sb->inline_buf) {
+            nbuf = (char *)malloc(new_cap);
+            if (nbuf && sb->len > 0u) {
+                memcpy(nbuf, sb->inline_buf, sb->len);
+            }
+        } else {
+            nbuf = (char *)realloc(sb->data, new_cap);
+        }
+        if (!nbuf) {
+            vm->oom = true;
+            vm->aborted = true;
+            return false;
+        }
+        sb->data = nbuf;
+        sb->cap = new_cap;
+    }
+    if (slen > 0u && s) {
+        memcpy(sb->data + sb->len, s, slen);
+    }
+    sb->len = needed;
+    sb->data[sb->len] = '\0';
+    return true;
+}
+
+static js_val_t js_strbuf_finish(we_script_t *vm, js_strbuf_t *sb)
+{
+    if (!vm || vm->aborted) {
+        js_strbuf_free(sb);
+        return val_str("");
+    }
+    const char *res = script_arena_strdup(vm, sb->data ? sb->data : "", sb->len);
+    js_strbuf_free(sb);
+    return val_str(res ? res : "");
+}
+
+static js_val_t js_concat_vals(we_script_t *vm, js_val_t lv, js_val_t rv)
+{
+    char s1_tmp[128], s2_tmp[128];
+    size_t l1 = 0u, l2 = 0u;
+    const char *s1 = val_to_cstr_view(lv, s1_tmp, &l1);
+    const char *s2 = val_to_cstr_view(rv, s2_tmp, &l2);
+    size_t total = 0u;
+    size_t alloc_sz = 0u;
+    if (ckd_add(&total, l1, l2) || total > WE_SCRIPT_MAX_STRING_BYTES ||
+        ckd_add(&alloc_sz, total, (size_t)1u)) {
+        vm->oom = true;
+        vm->aborted = true;
+        return val_str("");
+    }
+    char *out = (char *)script_arena_alloc(vm, alloc_sz);
+    if (!out) {
+        return val_str("");
+    }
+    if (l1 > 0u) {
+        memcpy(out, s1, l1);
+    }
+    if (l2 > 0u) {
+        memcpy(out + l1, s2, l2);
+    }
+    out[total] = '\0';
+    return val_str(out);
+}
+
+static js_val_t js_val_to_js_str(we_script_t *vm, js_val_t v)
+{
+    char tmp[128];
+    size_t len = 0u;
+    const char *s = val_to_cstr_view(v, tmp, &len);
+    if (len > WE_SCRIPT_MAX_STRING_BYTES) {
+        vm->oom = true;
+        vm->aborted = true;
+        return val_str("");
+    }
+    const char *dup = script_arena_strdup(vm, s, len);
+    return val_str(dup ? dup : "");
 }
 
 static bool js_val_equals(js_val_t lv, js_val_t rv, bool strict)
@@ -718,6 +866,35 @@ static js_val_t call_vec_method(we_script_t *vm, js_vec_obj_t *vo, const char *m
     return val_undef();
 }
 
+static js_val_t call_layer_audio_method(we_script_layer_state_t *st, const char *method)
+{
+    if (!st || !method) {
+        return val_undef();
+    }
+    if (strcmp(method, "play") == 0) {
+        st->audio_playing = true;
+        st->audio_cmd = 1;
+        st->dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
+        return val_undef();
+    }
+    if (strcmp(method, "stop") == 0) {
+        st->audio_playing = false;
+        st->audio_cmd = 2;
+        st->dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
+        return val_undef();
+    }
+    if (strcmp(method, "pause") == 0) {
+        st->audio_playing = false;
+        st->audio_cmd = 3;
+        st->dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
+        return val_undef();
+    }
+    if (strcmp(method, "isPlaying") == 0) {
+        return val_bool(st->audio_playing);
+    }
+    return val_undef();
+}
+
 static js_val_t call_builtin_method(we_script_t *vm, js_builtin_id_t bid, const char *method,
                                     const js_val_t *args, uint32_t argc)
 {
@@ -968,27 +1145,7 @@ static js_val_t call_builtin_method(we_script_t *vm, js_builtin_id_t bid, const 
             return val_undef();
         }
         if (bid == BUILTIN_THIS_LAYER) {
-            if (strcmp(method, "play") == 0) {
-                vm->layer.audio_playing = true;
-                vm->layer.audio_cmd = 1;
-                vm->layer.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
-                return val_undef();
-            }
-            if (strcmp(method, "stop") == 0) {
-                vm->layer.audio_playing = false;
-                vm->layer.audio_cmd = 2;
-                vm->layer.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
-                return val_undef();
-            }
-            if (strcmp(method, "pause") == 0) {
-                vm->layer.audio_playing = false;
-                vm->layer.audio_cmd = 3;
-                vm->layer.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
-                return val_undef();
-            }
-            if (strcmp(method, "isPlaying") == 0) {
-                return val_bool(vm->layer.audio_playing);
-            }
+            return call_layer_audio_method(&vm->layer, method);
         }
     } else if (bid == BUILTIN_DATE) {
         if (strcmp(method, "now") == 0) {
@@ -1004,6 +1161,99 @@ static js_val_t call_builtin_method(we_script_t *vm, js_builtin_id_t bid, const 
     return val_undef();
 }
 
+static bool eval_layer_state_prop(const we_script_layer_state_t *st, js_vec_obj_t *origin_vec,
+                                  js_vec_obj_t *scale_vec, js_vec_obj_t *angles_vec,
+                                  js_vec_obj_t *color_vec, js_vec_obj_t *size_vec, const char *prop,
+                                  js_val_t *out_val)
+{
+    if (!st || !prop || !out_val) {
+        return false;
+    }
+    switch (prop[0]) {
+    case 'o':
+        if (strcmp(prop, "origin") == 0) {
+            *out_val = (js_val_t){.type = VAL_VEC, .u.vec = origin_vec};
+            return true;
+        }
+        break;
+    case 's':
+        if (strcmp(prop, "scale") == 0) {
+            *out_val = (js_val_t){.type = VAL_VEC, .u.vec = scale_vec};
+            return true;
+        }
+        if (strcmp(prop, "size") == 0) {
+            *out_val = (js_val_t){.type = VAL_VEC, .u.vec = size_vec};
+            return true;
+        }
+        break;
+    case 'a':
+        if (strcmp(prop, "angles") == 0) {
+            *out_val = (js_val_t){.type = VAL_VEC, .u.vec = angles_vec};
+            return true;
+        }
+        if (strcmp(prop, "alpha") == 0) {
+            *out_val = val_num((double)st->alpha);
+            return true;
+        }
+        break;
+    case 'c':
+        if (strcmp(prop, "color") == 0) {
+            *out_val = (js_val_t){.type = VAL_VEC, .u.vec = color_vec};
+            return true;
+        }
+        break;
+    case 'v':
+        if (strcmp(prop, "visible") == 0) {
+            *out_val = val_bool(st->visible);
+            return true;
+        }
+        if (strcmp(prop, "verticalalign") == 0) {
+            *out_val = val_str(st->valign);
+            return true;
+        }
+        if (strcmp(prop, "volume") == 0) {
+            *out_val = val_num((double)st->volume);
+            return true;
+        }
+        break;
+    case 'n':
+        if (strcmp(prop, "name") == 0) {
+            *out_val = val_str(st->name);
+            return true;
+        }
+        break;
+    case 't':
+        if (strcmp(prop, "text") == 0) {
+            *out_val = val_str(st->text);
+            return true;
+        }
+        break;
+    case 'p':
+        if (strcmp(prop, "pointsize") == 0) {
+            *out_val = val_num((double)st->pointsize);
+            return true;
+        }
+        break;
+    case 'h':
+        if (strcmp(prop, "horizontalalign") == 0) {
+            *out_val = val_str(st->halign);
+            return true;
+        }
+        break;
+    case 'i':
+        if (strcmp(prop, "isPlaying") == 0) {
+            *out_val = val_bool(st->audio_playing);
+            return true;
+        }
+        if (strcmp(prop, "id") == 0) {
+            *out_val = val_num((double)st->id);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
 static js_val_t call_scene_layer_method(we_script_t *vm, uint32_t slot, const char *method,
                                         const js_val_t *args, uint32_t argc)
 {
@@ -1014,28 +1264,7 @@ static js_val_t call_scene_layer_method(we_script_t *vm, uint32_t slot, const ch
     }
     we_script_scene_layer_slot_t *sl = &vm->scene_layers[slot];
     sl->accessed = true;
-    if (strcmp(method, "play") == 0) {
-        sl->state.audio_playing = true;
-        sl->state.audio_cmd = 1;
-        sl->state.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
-        return val_undef();
-    }
-    if (strcmp(method, "stop") == 0) {
-        sl->state.audio_playing = false;
-        sl->state.audio_cmd = 2;
-        sl->state.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
-        return val_undef();
-    }
-    if (strcmp(method, "pause") == 0) {
-        sl->state.audio_playing = false;
-        sl->state.audio_cmd = 3;
-        sl->state.dirty_mask |= WE_LAYER_DIRTY_AUDIO_CMD;
-        return val_undef();
-    }
-    if (strcmp(method, "isPlaying") == 0) {
-        return val_bool(sl->state.audio_playing);
-    }
-    return val_undef();
+    return call_layer_audio_method(&sl->state, method);
 }
 
 static js_val_t get_scene_layer_member(we_script_t *vm, uint32_t slot, const char *prop)
@@ -1045,69 +1274,10 @@ static js_val_t get_scene_layer_member(we_script_t *vm, uint32_t slot, const cha
     }
     we_script_scene_layer_slot_t *sl = &vm->scene_layers[slot];
     sl->accessed = true;
-    switch (prop[0]) {
-    case 'o':
-        if (strcmp(prop, "origin") == 0) {
-            js_val_t v = {.type = VAL_VEC, .u.vec = &sl->origin_vec};
-            return v;
-        }
-        break;
-    case 's':
-        if (strcmp(prop, "scale") == 0) {
-            js_val_t v = {.type = VAL_VEC, .u.vec = &sl->scale_vec};
-            return v;
-        }
-        if (strcmp(prop, "size") == 0) {
-            js_val_t v = {.type = VAL_VEC, .u.vec = &sl->size_vec};
-            return v;
-        }
-        break;
-    case 'a':
-        if (strcmp(prop, "angles") == 0) {
-            js_val_t v = {.type = VAL_VEC, .u.vec = &sl->angles_vec};
-            return v;
-        }
-        if (strcmp(prop, "alpha") == 0)
-            return val_num((double)sl->state.alpha);
-        break;
-    case 'c':
-        if (strcmp(prop, "color") == 0) {
-            js_val_t v = {.type = VAL_VEC, .u.vec = &sl->color_vec};
-            return v;
-        }
-        break;
-    case 'v':
-        if (strcmp(prop, "visible") == 0)
-            return val_bool(sl->state.visible);
-        if (strcmp(prop, "verticalalign") == 0)
-            return val_str(sl->state.valign);
-        if (strcmp(prop, "volume") == 0)
-            return val_num((double)sl->state.volume);
-        break;
-    case 'n':
-        if (strcmp(prop, "name") == 0)
-            return val_str(sl->state.name);
-        break;
-    case 't':
-        if (strcmp(prop, "text") == 0)
-            return val_str(sl->state.text);
-        break;
-    case 'p':
-        if (strcmp(prop, "pointsize") == 0)
-            return val_num((double)sl->state.pointsize);
-        break;
-    case 'h':
-        if (strcmp(prop, "horizontalalign") == 0)
-            return val_str(sl->state.halign);
-        break;
-    case 'i':
-        if (strcmp(prop, "isPlaying") == 0)
-            return val_bool(sl->state.audio_playing);
-        if (strcmp(prop, "id") == 0)
-            return val_num((double)sl->state.id);
-        break;
-    }
-    return val_undef();
+    js_val_t out = val_undef();
+    (void)eval_layer_state_prop(&sl->state, &sl->origin_vec, &sl->scale_vec, &sl->angles_vec,
+                                &sl->color_vec, &sl->size_vec, prop, &out);
+    return out;
 }
 
 static js_val_t get_builtin_member(we_script_t *vm, js_builtin_id_t bid, const char *prop)
@@ -1174,67 +1344,11 @@ static js_val_t get_builtin_member(we_script_t *vm, js_builtin_id_t bid, const c
         if (strcmp(prop, "cursorLeftDown") == 0)
             return val_bool(vm->env.cursor_left_down);
     } else if (bid == BUILTIN_THIS_LAYER) {
-        switch (prop[0]) {
-        case 'o':
-            if (strcmp(prop, "origin") == 0) {
-                js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_origin_vec};
-                return v;
-            }
-            break;
-        case 's':
-            if (strcmp(prop, "scale") == 0) {
-                js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_scale_vec};
-                return v;
-            }
-            if (strcmp(prop, "size") == 0) {
-                js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_size_vec};
-                return v;
-            }
-            break;
-        case 'a':
-            if (strcmp(prop, "angles") == 0) {
-                js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_angles_vec};
-                return v;
-            }
-            if (strcmp(prop, "alpha") == 0)
-                return val_num((double)vm->layer.alpha);
-            break;
-        case 'c':
-            if (strcmp(prop, "color") == 0) {
-                js_val_t v = {.type = VAL_VEC, .u.vec = &vm->layer_color_vec};
-                return v;
-            }
-            break;
-        case 'v':
-            if (strcmp(prop, "visible") == 0)
-                return val_bool(vm->layer.visible);
-            if (strcmp(prop, "verticalalign") == 0)
-                return val_str(vm->layer.valign);
-            if (strcmp(prop, "volume") == 0)
-                return val_num((double)vm->layer.volume);
-            break;
-        case 'n':
-            if (strcmp(prop, "name") == 0)
-                return val_str(vm->layer.name);
-            break;
-        case 't':
-            if (strcmp(prop, "text") == 0)
-                return val_str(vm->layer.text);
-            break;
-        case 'p':
-            if (strcmp(prop, "pointsize") == 0)
-                return val_num((double)vm->layer.pointsize);
-            break;
-        case 'h':
-            if (strcmp(prop, "horizontalalign") == 0)
-                return val_str(vm->layer.halign);
-            break;
-        case 'i':
-            if (strcmp(prop, "isPlaying") == 0)
-                return val_bool(vm->layer.audio_playing);
-            if (strcmp(prop, "id") == 0)
-                return val_num((double)vm->layer.id);
-            break;
+        js_val_t layer_v;
+        if (eval_layer_state_prop(&vm->layer, &vm->layer_origin_vec, &vm->layer_scale_vec,
+                                  &vm->layer_angles_vec, &vm->layer_color_vec, &vm->layer_size_vec,
+                                  prop, &layer_v)) {
+            return layer_v;
         }
         char p0 = prop[0];
         for (uint32_t i = 0; i < vm->this_prop_count; i++) {
@@ -1525,13 +1639,7 @@ static js_val_t apply_assign_op(we_script_t *vm, js_tok_type_t op, js_val_t cur,
         return rhs;
     }
     if (op == TOK_PLUS_ASSIGN && (cur.type == VAL_STR || rhs.type == VAL_STR)) {
-        char s1[256];
-        char s2[256];
-        char buf[512];
-        val_to_str_buf(cur, s1, sizeof(s1));
-        val_to_str_buf(rhs, s2, sizeof(s2));
-        snprintf(buf, sizeof(buf), "%s%s", s1, s2);
-        return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+        return js_concat_vals(vm, cur, rhs);
     }
     double a = val_to_num(cur);
     double b = val_to_num(rhs);
@@ -1652,19 +1760,31 @@ static js_val_t eval_lvalue_update(we_script_t *vm, exec_scope_t *scope, const a
             int32_t idx = num_to_i32(val_to_num(idx_v));
             if (idx >= 0 && idx < 4096) {
                 js_arr_t *arr = base.u.arr;
-                if ((uint32_t)idx >= arr->cap) {
+                if ((uint32_t)idx >= arr->cap || !arr->items) {
                     uint32_t ncap = (uint32_t)idx + 8u;
+                    if (ncap > 4096u) {
+                        ncap = 4096u;
+                    }
                     js_val_t *ni = (js_val_t *)script_arena_alloc(vm, ncap * sizeof(js_val_t));
                     if (ni) {
-                        if (arr->count > 0 && arr->items) {
-                            memcpy(ni, arr->items, arr->count * sizeof(js_val_t));
+                        uint32_t copy_cnt = (arr->items && arr->count <= arr->cap)
+                                                ? arr->count
+                                                : (arr->items ? arr->cap : 0u);
+                        if (copy_cnt > 0u) {
+                            memcpy(ni, arr->items, copy_cnt * sizeof(js_val_t));
                         }
                         arr->items = ni;
                         arr->cap = ncap;
+                        if (arr->count > ncap) {
+                            arr->count = ncap;
+                        }
                     }
                 }
-                if ((uint32_t)idx < arr->cap) {
+                if ((uint32_t)idx < arr->cap && arr->items) {
                     if ((uint32_t)idx >= arr->count) {
+                        for (uint32_t z = arr->count; z <= (uint32_t)idx; z++) {
+                            arr->items[z] = val_undef();
+                        }
                         arr->count = (uint32_t)idx + 1u;
                     }
                     js_val_t old_v = arr->items[idx];
@@ -1718,8 +1838,10 @@ static void arr_push_item(we_script_t *vm, js_arr_t *arr, js_val_t item)
         }
         js_val_t *ni = (js_val_t *)script_arena_alloc(vm, ncap * sizeof(js_val_t));
         if (ni) {
-            if (arr->count > 0 && arr->items) {
-                memcpy(ni, arr->items, arr->count * sizeof(js_val_t));
+            uint32_t copy_cnt =
+                (arr->items && arr->count <= arr->cap) ? arr->count : (arr->items ? arr->cap : 0u);
+            if (copy_cnt > 0u) {
+                memcpy(ni, arr->items, copy_cnt * sizeof(js_val_t));
             }
             arr->items = ni;
             arr->cap = ncap;
@@ -1737,6 +1859,7 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
     if (!arr || !method) {
         return val_undef();
     }
+    uint32_t safe_cnt = arr->items ? (arr->count <= arr->cap ? arr->count : arr->cap) : 0u;
     if (strcmp(method, "push") == 0) {
         for (uint32_t i = 0; i < argc; i++) {
             arr_push_item(vm, arr, args[i]);
@@ -1744,21 +1867,26 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
         return val_num((double)arr->count);
     }
     if (strcmp(method, "pop") == 0) {
-        if (arr->count == 0 || !arr->items) {
+        if (safe_cnt == 0u) {
+            arr->count = 0u;
             return val_undef();
         }
-        return arr->items[--arr->count];
+        uint32_t last = safe_cnt - 1u;
+        js_val_t popped = arr->items[last];
+        arr->items[last] = val_undef();
+        arr->count = last;
+        return popped;
     }
     if (strcmp(method, "indexOf") == 0) {
         js_val_t needle = argc >= 1 ? args[0] : val_undef();
         int32_t from = argc >= 2 ? num_to_i32(val_to_num(args[1])) : 0;
         if (from < 0) {
-            from = (int32_t)arr->count + from;
+            from = (int32_t)safe_cnt + from;
             if (from < 0) {
                 from = 0;
             }
         }
-        for (uint32_t i = (uint32_t)from; i < arr->count; i++) {
+        for (uint32_t i = (uint32_t)from; i < safe_cnt; i++) {
             if (js_val_equals(arr->items[i], needle, true)) {
                 return val_num((double)i);
             }
@@ -1767,7 +1895,7 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
     }
     if (strcmp(method, "includes") == 0) {
         js_val_t needle = argc >= 1 ? args[0] : val_undef();
-        for (uint32_t i = 0; i < arr->count; i++) {
+        for (uint32_t i = 0; i < safe_cnt; i++) {
             if (js_val_equals(arr->items[i], needle, true)) {
                 return val_bool(true);
             }
@@ -1775,7 +1903,7 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
         return val_bool(false);
     }
     if (strcmp(method, "slice") == 0) {
-        int32_t len = (int32_t)arr->count;
+        int32_t len = (int32_t)safe_cnt;
         int32_t start = argc >= 1 ? num_to_i32(val_to_num(args[0])) : 0;
         int32_t end =
             (argc >= 2 && args[1].type != VAL_UNDEF) ? num_to_i32(val_to_num(args[1])) : len;
@@ -1801,14 +1929,14 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
         if (!out) {
             return val_undef();
         }
-        for (int32_t i = start; i < end; i++) {
+        for (int32_t i = start; i < end && !vm->aborted; i++) {
             arr_push_item(vm, out, arr->items[i]);
         }
         js_val_t v = {.type = VAL_ARR, .u.arr = out};
         return v;
     }
     if (strcmp(method, "splice") == 0) {
-        int32_t len = (int32_t)arr->count;
+        int32_t len = (int32_t)safe_cnt;
         int32_t start = argc >= 1 ? num_to_i32(val_to_num(args[0])) : len;
         if (start < 0) {
             start = len + start;
@@ -1828,7 +1956,10 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
             del_cnt = len - start;
         }
         js_arr_t *removed = (js_arr_t *)script_arena_alloc(vm, sizeof(js_arr_t));
-        for (int32_t i = 0; i < del_cnt && removed; i++) {
+        if (!removed) {
+            return val_undef();
+        }
+        for (int32_t i = 0; i < del_cnt && !vm->aborted; i++) {
             arr_push_item(vm, removed, arr->items[start + i]);
         }
         uint32_t ins_cnt = argc > 2u ? (argc - 2u) : 0u;
@@ -1861,13 +1992,16 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
         if (!out) {
             return val_undef();
         }
-        for (uint32_t i = 0; i < arr->count; i++) {
+        for (uint32_t i = 0; i < safe_cnt && !vm->aborted; i++) {
             arr_push_item(vm, out, arr->items[i]);
         }
-        for (uint32_t a = 0; a < argc; a++) {
+        for (uint32_t a = 0; a < argc && !vm->aborted; a++) {
             if (args[a].type == VAL_ARR && args[a].u.arr) {
-                for (uint32_t k = 0; k < args[a].u.arr->count; k++) {
-                    arr_push_item(vm, out, args[a].u.arr->items[k]);
+                const js_arr_t *other = args[a].u.arr;
+                uint32_t ocnt =
+                    other->items ? (other->count <= other->cap ? other->count : other->cap) : 0u;
+                for (uint32_t k = 0; k < ocnt && !vm->aborted; k++) {
+                    arr_push_item(vm, out, other->items[k]);
                 }
             } else {
                 arr_push_item(vm, out, args[a]);
@@ -1877,32 +2011,34 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
         return v;
     }
     if (strcmp(method, "join") == 0) {
-        const char *sep =
-            (argc >= 1 && args[0].type == VAL_STR && args[0].u.str) ? args[0].u.str : ",";
-        char buf[1024];
-        size_t pos = 0;
-        buf[0] = '\0';
-        for (uint32_t i = 0; i < arr->count; i++) {
-            if (i > 0 && pos + strlen(sep) + 1u < sizeof(buf)) {
-                size_t sl = strlen(sep);
-                memcpy(buf + pos, sep, sl);
-                pos += sl;
-                buf[pos] = '\0';
+        char sep_tmp[128];
+        const char *sep = ",";
+        size_t sep_len = 1u;
+        if (argc >= 1 && args[0].type != VAL_UNDEF) {
+            sep = val_to_cstr_view(args[0], sep_tmp, &sep_len);
+        }
+        js_strbuf_t sb;
+        js_strbuf_init(&sb);
+        for (uint32_t i = 0; i < safe_cnt; i++) {
+            if (!vm_check_watchdog(vm)) {
+                js_strbuf_free(&sb);
+                return val_undef();
             }
-            char elem_s[256];
-            if (arr->items[i].type == VAL_NULL || arr->items[i].type == VAL_UNDEF) {
-                elem_s[0] = '\0';
-            } else {
-                val_to_str_buf(arr->items[i], elem_s, sizeof(elem_s));
+            if (i > 0 && !js_strbuf_append(vm, &sb, sep, sep_len)) {
+                js_strbuf_free(&sb);
+                return val_str("");
             }
-            size_t el = strlen(elem_s);
-            if (pos + el + 1u < sizeof(buf)) {
-                memcpy(buf + pos, elem_s, el);
-                pos += el;
-                buf[pos] = '\0';
+            if (arr->items[i].type != VAL_NULL && arr->items[i].type != VAL_UNDEF) {
+                char elem_tmp[128];
+                size_t elen = 0u;
+                const char *es = val_to_cstr_view(arr->items[i], elem_tmp, &elen);
+                if (!js_strbuf_append(vm, &sb, es, elen)) {
+                    js_strbuf_free(&sb);
+                    return val_str("");
+                }
             }
         }
-        return val_str(script_arena_strdup(vm, buf, pos));
+        return js_strbuf_finish(vm, &sb);
     }
     if ((strcmp(method, "forEach") == 0 || strcmp(method, "map") == 0 ||
          strcmp(method, "filter") == 0) &&
@@ -1912,11 +2048,15 @@ static js_val_t call_arr_method(we_script_t *vm, exec_scope_t *scope, js_val_t r
         js_arr_t *out = NULL;
         if (is_map || is_filter) {
             out = (js_arr_t *)script_arena_alloc(vm, sizeof(js_arr_t));
+            if (!out) {
+                return val_undef();
+            }
         }
         uint32_t d = scope ? (scope->call_depth + 1u) : 1u;
-        uint32_t snap_count = arr->count;
+        uint32_t snap_count = safe_cnt;
         for (uint32_t i = 0; i < snap_count && !vm->aborted; i++) {
-            js_val_t item = (i < arr->count) ? arr->items[i] : val_undef();
+            js_val_t item =
+                (arr->items && i < arr->count && i < arr->cap) ? arr->items[i] : val_undef();
             js_val_t cb_args[3] = {item, val_num((double)i), recv};
             js_val_t r = invoke_ast_func(vm, args[0].u.func, cb_args, 3, d);
             if (is_map && out) {
@@ -2124,8 +2264,9 @@ static js_val_t call_str_method(we_script_t *vm, js_val_t recv, const char *meth
         if (argc < 1) {
             return val_num(-1.0);
         }
-        char needle[128];
-        val_to_str_buf(args[0], needle, sizeof(needle));
+        char needle_tmp[128];
+        size_t nlen = 0u;
+        const char *needle = val_to_cstr_view(args[0], needle_tmp, &nlen);
         int32_t from = (argc >= 2) ? num_to_i32(val_to_num(args[1])) : 0;
         if (from < 0)
             from = 0;
@@ -2136,84 +2277,98 @@ static js_val_t call_str_method(we_script_t *vm, js_val_t recv, const char *meth
         return found ? val_num((double)(found - s)) : val_num(-1.0);
     }
     if ((strcmp(method, "replace") == 0 || strcmp(method, "replaceAll") == 0) && argc >= 2) {
-        char pat_buf[256];
-        char rep_buf[256];
-        const char *pat = NULL;
-        const char *rep = NULL;
-        if (args[0].type == VAL_STR && args[0].u.str) {
-            pat = args[0].u.str;
-        } else {
-            val_to_str_buf(args[0], pat_buf, sizeof(pat_buf));
-            pat = pat_buf;
-        }
-        if (args[1].type == VAL_STR && args[1].u.str) {
-            rep = args[1].u.str;
-        } else {
-            val_to_str_buf(args[1], rep_buf, sizeof(rep_buf));
-            rep = rep_buf;
-        }
-        size_t plen = strlen(pat);
-        if (plen == 0) {
+        char pat_tmp[128];
+        char rep_tmp[128];
+        size_t plen = 0u;
+        size_t rlen = 0u;
+        const char *pat = val_to_cstr_view(args[0], pat_tmp, &plen);
+        const char *rep = val_to_cstr_view(args[1], rep_tmp, &rlen);
+        if (plen == 0u) {
             return recv;
         }
         const char *hit = strstr(s, pat);
         if (!hit) {
             return recv;
         }
-        size_t rlen = strlen(rep);
         bool is_all = (strcmp(method, "replaceAll") == 0);
         if (!is_all) {
             size_t pre = (size_t)(hit - s);
             size_t post = slen - pre - plen;
-            size_t total_len = pre + rlen + post;
-            char *out = (char *)script_arena_alloc(vm, total_len + 1u);
-            if (!out) {
-                return recv;
+            size_t total_len = 0u;
+            size_t alloc_sz = 0u;
+            if (ckd_add(&total_len, pre, rlen) || ckd_add(&total_len, total_len, post) ||
+                total_len > WE_SCRIPT_MAX_STRING_BYTES ||
+                ckd_add(&alloc_sz, total_len, (size_t)1u)) {
+                vm->oom = true;
+                vm->aborted = true;
+                return val_undef();
             }
-            if (pre > 0) {
+            char *out = (char *)script_arena_alloc(vm, alloc_sz);
+            if (!out) {
+                return val_undef();
+            }
+            if (pre > 0u) {
                 memcpy(out, s, pre);
             }
-            if (rlen > 0) {
+            if (rlen > 0u) {
                 memcpy(out + pre, rep, rlen);
             }
-            if (post > 0) {
+            if (post > 0u) {
                 memcpy(out + pre + rlen, hit + plen, post);
             }
             out[total_len] = '\0';
             return val_str(out);
         } else {
-            size_t count = 0;
+            size_t count = 0u;
             const char *p = s;
             while ((p = strstr(p, pat)) != NULL) {
+                if (!vm_check_watchdog(vm)) {
+                    return val_undef();
+                }
                 count++;
                 p += plen;
             }
-            if (count == 0) {
+            if (count == 0u) {
                 return recv;
             }
-            size_t total_len = slen - (count * plen) + (count * rlen);
-            char *out = (char *)script_arena_alloc(vm, total_len + 1u);
+            size_t matched_bytes = 0u;
+            size_t rep_bytes = 0u;
+            size_t total_len = 0u;
+            size_t alloc_sz = 0u;
+            if (ckd_mul(&matched_bytes, count, plen) || matched_bytes > slen ||
+                ckd_mul(&rep_bytes, count, rlen) ||
+                ckd_add(&total_len, slen - matched_bytes, rep_bytes) ||
+                total_len > WE_SCRIPT_MAX_STRING_BYTES ||
+                ckd_add(&alloc_sz, total_len, (size_t)1u)) {
+                vm->oom = true;
+                vm->aborted = true;
+                return val_undef();
+            }
+            char *out = (char *)script_arena_alloc(vm, alloc_sz);
             if (!out) {
-                return recv;
+                return val_undef();
             }
             p = s;
             char *dst = out;
             while (true) {
+                if (!vm_check_watchdog(vm)) {
+                    return val_undef();
+                }
                 const char *next_hit = strstr(p, pat);
                 if (!next_hit) {
                     size_t rem = strlen(p);
-                    if (rem > 0) {
+                    if (rem > 0u) {
                         memcpy(dst, p, rem);
                         dst += rem;
                     }
                     break;
                 }
                 size_t prefix_len = (size_t)(next_hit - p);
-                if (prefix_len > 0) {
+                if (prefix_len > 0u) {
                     memcpy(dst, p, prefix_len);
                     dst += prefix_len;
                 }
-                if (rlen > 0) {
+                if (rlen > 0u) {
                     memcpy(dst, rep, rlen);
                     dst += rlen;
                 }
@@ -2228,28 +2383,49 @@ static js_val_t call_str_method(we_script_t *vm, js_val_t recv, const char *meth
         if (!arr) {
             return val_undef();
         }
-        char sep[64] = "";
+        char sep_tmp[128];
+        const char *sep = "";
+        size_t sep_len = 0u;
         if (argc >= 1 && args[0].type != VAL_UNDEF) {
-            val_to_str_buf(args[0], sep, sizeof(sep));
+            sep = val_to_cstr_view(args[0], sep_tmp, &sep_len);
         }
-        size_t sep_len = strlen(sep);
         if (argc == 0 || args[0].type == VAL_UNDEF) {
             arr_push_item(vm, arr, recv);
-        } else if (sep_len == 0) {
-            for (size_t i = 0; i < slen && i < 256u; i++) {
-                arr_push_item(vm, arr, val_str(script_arena_strdup(vm, s + i, 1)));
+        } else if (sep_len == 0u) {
+            for (size_t i = 0; i < slen && arr->count < 4096u; i++) {
+                if (!vm_check_watchdog(vm)) {
+                    return val_undef();
+                }
+                const char *ch_s = script_arena_strdup(vm, s + i, 1u);
+                if (!ch_s) {
+                    return val_undef();
+                }
+                arr_push_item(vm, arr, val_str(ch_s));
             }
+        } else if (slen == 0u) {
+            arr_push_item(vm, arr, val_str(""));
         } else {
             const char *cur = s;
-            while (*cur) {
+            while (*cur && arr->count < 4096u) {
+                if (!vm_check_watchdog(vm)) {
+                    return val_undef();
+                }
                 const char *hit = strstr(cur, sep);
                 if (!hit) {
-                    arr_push_item(vm, arr, val_str(script_arena_strdup(vm, cur, strlen(cur))));
+                    const char *tail_s = script_arena_strdup(vm, cur, strlen(cur));
+                    if (!tail_s) {
+                        return val_undef();
+                    }
+                    arr_push_item(vm, arr, val_str(tail_s));
                     break;
                 }
-                arr_push_item(vm, arr, val_str(script_arena_strdup(vm, cur, (size_t)(hit - cur))));
+                const char *part_s = script_arena_strdup(vm, cur, (size_t)(hit - cur));
+                if (!part_s) {
+                    return val_undef();
+                }
+                arr_push_item(vm, arr, val_str(part_s));
                 cur = hit + sep_len;
-                if (*cur == '\0') {
+                if (*cur == '\0' && arr->count < 4096u) {
                     arr_push_item(vm, arr, val_str(""));
                     break;
                 }
@@ -2287,6 +2463,57 @@ static js_val_t call_num_method(we_script_t *vm, js_val_t recv, const char *meth
     return val_undef();
 }
 
+static js_val_t construct_array(we_script_t *vm, const js_val_t *args, uint32_t argc)
+{
+    js_arr_t *arr = (js_arr_t *)script_arena_alloc(vm, sizeof(js_arr_t));
+    if (!arr || vm->oom) {
+        return val_undef();
+    }
+    if (argc == 1 && args[0].type == VAL_NUM) {
+        double dlen = args[0].u.num;
+        if (!isfinite(dlen) || dlen < 0.0 || dlen > (double)UINT32_MAX || floor(dlen) != dlen) {
+            vm->aborted = true;
+            return val_undef();
+        }
+        uint32_t len = (uint32_t)dlen;
+        if (len > 0u) {
+            size_t bytes = 0u;
+            if (ckd_mul(&bytes, (size_t)len, sizeof(js_val_t))) {
+                vm->oom = true;
+                vm->aborted = true;
+                return val_undef();
+            }
+            js_val_t *items = (js_val_t *)script_arena_alloc(vm, bytes);
+            if (!items || vm->oom) {
+                return val_undef();
+            }
+            for (uint32_t i = 0; i < len; i++) {
+                items[i] = val_undef();
+            }
+            arr->items = items;
+            arr->cap = len;
+            arr->count = len;
+        }
+    } else if (argc >= 1) {
+        size_t bytes = 0u;
+        if (ckd_mul(&bytes, (size_t)argc, sizeof(js_val_t))) {
+            vm->oom = true;
+            vm->aborted = true;
+            return val_undef();
+        }
+        js_val_t *items = (js_val_t *)script_arena_alloc(vm, bytes);
+        if (!items || vm->oom) {
+            return val_undef();
+        }
+        memcpy(items, args, bytes);
+        arr->items = items;
+        arr->cap = argc;
+        arr->count = argc;
+    }
+    js_val_t v = {.type = VAL_ARR, .u.arr = arr};
+    return v;
+}
+
 static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_node_t *node)
 {
     switch (node->type) {
@@ -2294,35 +2521,29 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
         return node->lit;
 
     case AST_TEMPLATE: {
-        char out_buf[1024];
-        size_t pos = 0;
-        out_buf[0] = '\0';
+        js_strbuf_t sb;
+        js_strbuf_init(&sb);
         uint32_t ecnt = node->tpl.expr_count;
-        for (uint32_t i = 0; i <= ecnt; i++) {
+        for (uint32_t i = 0; i <= ecnt && !vm->aborted; i++) {
             const char *seg = (node->tpl.parts && node->tpl.parts[i]) ? node->tpl.parts[i] : "";
             size_t slen = strlen(seg);
-            if (slen > 0 && pos + 1 < sizeof(out_buf)) {
-                size_t copy_n =
-                    (pos + slen < sizeof(out_buf) - 1) ? slen : (sizeof(out_buf) - 1 - pos);
-                memcpy(out_buf + pos, seg, copy_n);
-                pos += copy_n;
-                out_buf[pos] = '\0';
+            if (slen > 0u && !js_strbuf_append(vm, &sb, seg, slen)) {
+                break;
             }
             if (i < ecnt && node->tpl.exprs && node->tpl.exprs[i]) {
                 js_val_t ev = eval_node(vm, scope, node->tpl.exprs[i]);
-                char ebuf[256];
-                val_to_str_buf(ev, ebuf, sizeof(ebuf));
-                size_t elen = strlen(ebuf);
-                if (elen > 0 && pos + 1 < sizeof(out_buf)) {
-                    size_t copy_n =
-                        (pos + elen < sizeof(out_buf) - 1) ? elen : (sizeof(out_buf) - 1 - pos);
-                    memcpy(out_buf + pos, ebuf, copy_n);
-                    pos += copy_n;
-                    out_buf[pos] = '\0';
+                if (vm->aborted) {
+                    break;
+                }
+                char etmp[128];
+                size_t elen = 0u;
+                const char *es = val_to_cstr_view(ev, etmp, &elen);
+                if (elen > 0u && !js_strbuf_append(vm, &sb, es, elen)) {
+                    break;
                 }
             }
         }
-        return val_str(script_arena_strdup(vm, out_buf, pos));
+        return js_strbuf_finish(vm, &sb);
     }
 
     case AST_FUNC_DECL: {
@@ -2395,17 +2616,28 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
 
     case AST_ARRAY_LIT: {
         js_arr_t *arr = (js_arr_t *)script_arena_alloc(vm, sizeof(js_arr_t));
-        if (!arr) {
+        if (!arr || vm->oom) {
             return val_undef();
         }
         if (node->child_count > 0) {
+            size_t bytes = 0u;
+            if (ckd_mul(&bytes, (size_t)node->child_count, sizeof(js_val_t))) {
+                vm->oom = true;
+                vm->aborted = true;
+                return val_undef();
+            }
+            js_val_t *items = (js_val_t *)script_arena_alloc(vm, bytes);
+            if (!items || vm->oom) {
+                return val_undef();
+            }
+            arr->items = items;
             arr->cap = node->child_count;
-            arr->items = (js_val_t *)script_arena_alloc(vm, arr->cap * sizeof(js_val_t));
-            if (arr->items) {
-                for (uint32_t i = 0; i < node->child_count; i++) {
-                    arr->items[i] = eval_node(vm, scope, node->children[i]);
-                }
-                arr->count = node->child_count;
+            arr->count = node->child_count;
+            for (uint32_t i = 0; i < node->child_count && !vm->aborted; i++) {
+                arr->items[i] = eval_node(vm, scope, node->children[i]);
+            }
+            if (vm->aborted) {
+                return val_undef();
             }
         }
         js_val_t v = {.type = VAL_ARR, .u.arr = arr};
@@ -2481,19 +2713,13 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
                 return construct_vec(vm, 3, args, argc);
             if (strcmp(node->name, "Vec4") == 0)
                 return construct_vec(vm, 4, args, argc);
-            if (strcmp(node->name, "Array") == 0) {
-                js_arr_t *arr = (js_arr_t *)script_arena_alloc(vm, sizeof(js_arr_t));
-                if (arr && argc == 1 && args[0].type == VAL_NUM && args[0].u.num > 0) {
-                    uint32_t len = (uint32_t)fmin(args[0].u.num, 1024.0);
-                    arr->cap = len;
-                    arr->count = len;
-                    arr->items = (js_val_t *)script_arena_alloc(vm, len * sizeof(js_val_t));
-                }
-                js_val_t v = {.type = VAL_ARR, .u.arr = arr};
-                return v;
-            }
+            if (strcmp(node->name, "Array") == 0)
+                return construct_array(vm, args, argc);
             if (strcmp(node->name, "Object") == 0) {
                 js_obj_t *obj = (js_obj_t *)script_arena_alloc(vm, sizeof(js_obj_t));
+                if (!obj || vm->oom) {
+                    return val_undef();
+                }
                 js_val_t v = {.type = VAL_OBJ, .u.obj = obj};
                 return v;
             }
@@ -2572,7 +2798,8 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
         }
         if (base.type == VAL_ARR && base.u.arr) {
             int32_t i = num_to_i32(val_to_num(idx_v));
-            if (i >= 0 && (uint32_t)i < base.u.arr->count) {
+            if (i >= 0 && base.u.arr->items && (uint32_t)i < base.u.arr->count &&
+                (uint32_t)i < base.u.arr->cap) {
                 return base.u.arr->items[i];
             }
             return val_undef();
@@ -2660,9 +2887,7 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
                 }
             }
             if (strcmp(method, "toString") == 0) {
-                char buf[128];
-                val_to_str_buf(recv, buf, sizeof(buf));
-                return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+                return js_val_to_js_str(vm, recv);
             }
             return val_undef();
         }
@@ -2675,13 +2900,13 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
                 return construct_vec(vm, 3, args, argc);
             if (strcmp(fname, "Vec4") == 0)
                 return construct_vec(vm, 4, args, argc);
+            if (strcmp(fname, "Array") == 0)
+                return construct_array(vm, args, argc);
             if (strcmp(fname, "String") == 0) {
                 if (argc == 0) {
                     return val_str("");
                 }
-                char buf[512];
-                val_to_str_buf(args[0], buf, sizeof(buf));
-                return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+                return js_val_to_js_str(vm, args[0]);
             }
             if (strcmp(fname, "Boolean") == 0) {
                 return val_bool(argc >= 1 ? val_to_bool(args[0]) : false);
@@ -2861,13 +3086,7 @@ static js_val_t eval_node_inner(we_script_t *vm, exec_scope_t *scope, const ast_
         js_val_t rv = eval_node(vm, scope, node->right);
 
         if (node->op == TOK_PLUS && (lv.type == VAL_STR || rv.type == VAL_STR)) {
-            char s1[256];
-            char s2[256];
-            char buf[512];
-            val_to_str_buf(lv, s1, sizeof(s1));
-            val_to_str_buf(rv, s2, sizeof(s2));
-            snprintf(buf, sizeof(buf), "%s%s", s1, s2);
-            return val_str(script_arena_strdup(vm, buf, strlen(buf)));
+            return js_concat_vals(vm, lv, rv);
         }
 
         if (node->op == TOK_EQ || node->op == TOK_STRICT_EQ || node->op == TOK_NEQ ||
@@ -3232,6 +3451,10 @@ static void sync_layer_to_vm(we_script_t *vm, const we_script_layer_state_t *lay
 
 static void reset_watchdog(we_script_t *vm)
 {
+    if (vm->depth_exceeded || vm->oom || vm->parse_error) {
+        vm->aborted = true;
+        return;
+    }
     vm->step_count = 0;
     vm->aborted = false;
     vm->timed_out = false;
@@ -3271,18 +3494,6 @@ we_script_t *we_script_create(const char *src, size_t len, we_script_shared_t *s
     vm->shared = shared;
     vm->rng_state = 0xD1B54A32D192ED03ULL;
 
-    /* Optional runtime QuickJS dlopen probe with zero DT_NEEDED startup overhead */
-    const char *use_qjs = getenv("WWAL_USE_QUICKJS");
-    if (use_qjs && strcmp(use_qjs, "1") == 0) {
-        vm->quickjs_dl = dlopen("libquickjs.so", RTLD_LAZY | RTLD_LOCAL);
-        if (vm->quickjs_dl) {
-            if (!dlsym(vm->quickjs_dl, "JS_NewRuntime") || !dlsym(vm->quickjs_dl, "JS_Eval")) {
-                dlclose(vm->quickjs_dl);
-                vm->quickjs_dl = NULL;
-            }
-        }
-    }
-
     vm->env.frametime = 1.0f / 60.0f;
     vm->env.screen_resolution[0] = 1920.0f;
     vm->env.screen_resolution[1] = 1080.0f;
@@ -3294,7 +3505,7 @@ we_script_t *we_script_create(const char *src, size_t len, we_script_shared_t *s
     reset_watchdog(vm);
 
     vm->root_ast = we_script_parse_program(vm, src, len);
-    if (!vm->root_ast || vm->oom) {
+    if (!vm->root_ast || vm->oom || vm->depth_exceeded || vm->parse_error) {
         we_script_destroy(vm);
         return NULL;
     }
@@ -3302,13 +3513,15 @@ we_script_t *we_script_create(const char *src, size_t len, we_script_shared_t *s
     /* Execute top-level declarations (functions, global variables, scriptProperties) */
     size_t pre_exec_used = vm->arena_used;
     reset_watchdog(vm);
-    if (vm->depth_exceeded) {
-        vm->aborted = true;
-    } else {
-        exec_stmt(vm, NULL, vm->root_ast);
-    }
+    exec_stmt(vm, NULL, vm->root_ast);
     vm->last_steps = vm->step_count;
     if (vm->aborted) {
+        vm->global_count = 0u;
+        vm->this_prop_count = 0u;
+        vm->fn_init = NULL;
+        vm->fn_update = NULL;
+        vm->fn_cursor_move = NULL;
+        vm->fn_apply_user_props = NULL;
         vm->arena_used = pre_exec_used;
     }
     vm->ast_watermark = vm->arena_used;
@@ -3321,9 +3534,6 @@ void we_script_destroy(we_script_t *script)
     if (!script) {
         return;
     }
-    if (script->quickjs_dl) {
-        dlclose(script->quickjs_dl);
-    }
     if (script->arena_base && script->arena_cap > 0) {
         munmap(script->arena_base, WE_SCRIPT_ARENA_SIZE);
     }
@@ -3335,6 +3545,14 @@ void we_script_set_prop(we_script_t *script, const char *name, const float *val,
 {
     if (!script || !name || name[0] == '\0') {
         return;
+    }
+
+    uint32_t clamped_n = num_components <= 4u ? num_components : 4u;
+    float clean_val[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (val && clamped_n > 0u) {
+        for (uint32_t i = 0; i < clamped_n; i++) {
+            clean_val[i] = sanitize_f(val[i], 0.0f);
+        }
     }
 
     we_script_prop_item_t *target = NULL;
@@ -3350,10 +3568,8 @@ void we_script_set_prop(we_script_t *script, const char *name, const float *val,
         snprintf(target->name, sizeof(target->name), "%s", name);
     }
     if (target) {
-        target->num_components = num_components <= 4u ? num_components : 4u;
-        if (val && target->num_components > 0) {
-            memcpy(target->val, val, target->num_components * sizeof(float));
-        }
+        target->num_components = clamped_n;
+        memcpy(target->val, clean_val, sizeof(target->val));
         if (str_val) {
             snprintf(target->str_val, sizeof(target->str_val), "%s", str_val);
         } else {
@@ -3368,21 +3584,17 @@ void we_script_set_prop(we_script_t *script, const char *name, const float *val,
         if (str_val && str_val[0] != '\0') {
             js_val_t pv = val_str(script_arena_strdup(script, str_val, strlen(str_val)));
             obj_set_prop(script, sp->val.u.obj, name, pv);
-        } else if (num_components >= 2 && val) {
+        } else if (clamped_n >= 2u && val) {
             if (existing.type == VAL_VEC && existing.u.vec) {
-                existing.u.vec->dim = (uint8_t)(num_components <= 4u ? num_components : 4u);
-                existing.u.vec->v[0] = val[0];
-                existing.u.vec->v[1] = val[1];
-                existing.u.vec->v[2] = num_components >= 3 ? val[2] : 0.0f;
-                existing.u.vec->v[3] = num_components >= 4 ? val[3] : 0.0f;
+                existing.u.vec->dim = (uint8_t)clamped_n;
+                memcpy(existing.u.vec->v, clean_val, sizeof(clean_val));
             } else {
-                js_val_t pv = val_new_vec(script, (uint8_t)num_components, val[0], val[1],
-                                          num_components >= 3 ? val[2] : 0.0f,
-                                          num_components >= 4 ? val[3] : 0.0f);
+                js_val_t pv = val_new_vec(script, (uint8_t)clamped_n, clean_val[0], clean_val[1],
+                                          clean_val[2], clean_val[3]);
                 obj_set_prop(script, sp->val.u.obj, name, pv);
             }
-        } else if (val && num_components == 1) {
-            obj_set_prop(script, sp->val.u.obj, name, val_num((double)val[0]));
+        } else if (val && clamped_n == 1u) {
+            obj_set_prop(script, sp->val.u.obj, name, val_num((double)clean_val[0]));
         } else if (str_val) {
             obj_set_prop(script, sp->val.u.obj, name, val_str(""));
         } else {
@@ -3449,326 +3661,550 @@ bool we_script_read_scene_layer(const we_script_t *script, uint32_t slot,
     return true;
 }
 
-#define WE_SCRIPT_MAX_FWD 1024u
+typedef struct gc_chunk {
+    struct gc_chunk *next;
+    uint8_t *base;
+    size_t cap;
+    size_t used;
+} gc_chunk_t;
+
+typedef struct {
+    gc_chunk_t head_inline;
+    gc_chunk_t *tail;
+} gc_scratch_t;
 
 typedef struct {
     const void *old_ptr;
     void *new_ptr;
-} promote_fwd_t;
+} gc_fwd_slot_t;
 
 typedef struct {
-    promote_fwd_t entries[WE_SCRIPT_MAX_FWD];
-    uint32_t count;
-} promote_fwd_table_t;
+    gc_fwd_slot_t *slots;
+    gc_fwd_slot_t inline_slots[128];
+    size_t cap;
+    size_t count;
+} gc_fwd_map_t;
 
-static void *fwd_lookup(const promote_fwd_table_t *tbl, const void *old_ptr)
+typedef struct {
+    uintptr_t *items;
+    uintptr_t inline_items[128];
+    size_t cap;
+    size_t head;
+    size_t count;
+} gc_worklist_t;
+
+static inline size_t gc_ptr_hash(const void *p)
 {
-    if (!tbl || !old_ptr) {
+    uintptr_t x = (uintptr_t)p;
+    x ^= x >> 30;
+    x *= (uintptr_t)0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= (uintptr_t)0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return (size_t)x;
+}
+
+static void gc_fwd_init(gc_fwd_map_t *m)
+{
+    m->slots = m->inline_slots;
+    m->cap = sizeof(m->inline_slots) / sizeof(m->inline_slots[0]);
+    m->count = 0u;
+    memset(m->inline_slots, 0, sizeof(m->inline_slots));
+}
+
+static void gc_fwd_destroy(gc_fwd_map_t *m)
+{
+    if (m->slots && m->slots != m->inline_slots) {
+        free(m->slots);
+    }
+    m->slots = NULL;
+    m->cap = 0u;
+    m->count = 0u;
+}
+
+static void *gc_fwd_lookup(const gc_fwd_map_t *m, const void *old_ptr)
+{
+    if (!m || !old_ptr || m->cap == 0u) {
         return NULL;
     }
-    for (uint32_t i = 0; i < tbl->count; i++) {
-        if (tbl->entries[i].old_ptr == old_ptr) {
-            return tbl->entries[i].new_ptr;
+    size_t mask = m->cap - 1u;
+    size_t idx = gc_ptr_hash(old_ptr) & mask;
+    while (true) {
+        const gc_fwd_slot_t *s = &m->slots[idx];
+        if (!s->old_ptr) {
+            return NULL;
         }
+        if (s->old_ptr == old_ptr) {
+            return s->new_ptr;
+        }
+        idx = (idx + 1u) & mask;
     }
-    return NULL;
 }
 
-static void fwd_record(promote_fwd_table_t *tbl, const void *old_ptr, void *new_ptr)
+static bool gc_fwd_insert(gc_fwd_map_t *m, const void *old_ptr, void *new_ptr)
 {
-    if (!tbl || !old_ptr || !new_ptr || tbl->count >= WE_SCRIPT_MAX_FWD) {
-        return;
+    if (!m || !old_ptr || !new_ptr) {
+        return false;
     }
-    tbl->entries[tbl->count].old_ptr = old_ptr;
-    tbl->entries[tbl->count].new_ptr = new_ptr;
-    tbl->count++;
+    if ((m->count + 1u) * 10u >= m->cap * 7u) {
+        size_t new_cap = 0u;
+        if (ckd_mul(&new_cap, m->cap, (size_t)2u)) {
+            return false;
+        }
+        gc_fwd_slot_t *new_slots = (gc_fwd_slot_t *)calloc(new_cap, sizeof(gc_fwd_slot_t));
+        if (!new_slots) {
+            return false;
+        }
+        size_t new_mask = new_cap - 1u;
+        for (size_t i = 0u; i < m->cap; i++) {
+            const void *k = m->slots[i].old_ptr;
+            if (!k) {
+                continue;
+            }
+            size_t pos = gc_ptr_hash(k) & new_mask;
+            while (new_slots[pos].old_ptr) {
+                pos = (pos + 1u) & new_mask;
+            }
+            new_slots[pos] = m->slots[i];
+        }
+        if (m->slots != m->inline_slots) {
+            free(m->slots);
+        }
+        m->slots = new_slots;
+        m->cap = new_cap;
+    }
+    size_t mask = m->cap - 1u;
+    size_t idx = gc_ptr_hash(old_ptr) & mask;
+    while (m->slots[idx].old_ptr) {
+        if (m->slots[idx].old_ptr == old_ptr) {
+            m->slots[idx].new_ptr = new_ptr;
+            return true;
+        }
+        idx = (idx + 1u) & mask;
+    }
+    m->slots[idx].old_ptr = old_ptr;
+    m->slots[idx].new_ptr = new_ptr;
+    m->count++;
+    return true;
 }
 
-static inline bool ptr_above_watermark(const we_script_t *vm, const void *p)
+static void gc_worklist_init(gc_worklist_t *wl)
 {
-    return p && (const uint8_t *)p >= vm->arena_base + vm->ast_watermark &&
-           (const uint8_t *)p < vm->arena_base + vm->arena_cap;
+    wl->items = wl->inline_items;
+    wl->cap = sizeof(wl->inline_items) / sizeof(wl->inline_items[0]);
+    wl->head = 0u;
+    wl->count = 0u;
 }
 
-static inline bool ptr_in_scratch(const uint8_t *scratch, size_t scratch_used, const void *p)
+static void gc_worklist_destroy(gc_worklist_t *wl)
 {
-    return p && (const uint8_t *)p >= scratch && (const uint8_t *)p < scratch + scratch_used;
+    if (wl->items && wl->items != wl->inline_items) {
+        free(wl->items);
+    }
+    wl->items = NULL;
+    wl->cap = 0u;
+    wl->head = 0u;
+    wl->count = 0u;
 }
 
-static void *scratch_alloc_copy(uint8_t *scratch, size_t scratch_cap, size_t *scratch_used,
-                                const void *src, size_t size)
+static bool gc_worklist_push(gc_worklist_t *wl, void *ptr, bool is_arr)
 {
-    size_t aligned = (size + 7u) & ~(size_t)7u;
-    if (aligned == 0) {
-        aligned = 8u;
+    if (!wl || !ptr) {
+        return false;
     }
-    if (*scratch_used + aligned > scratch_cap) {
-        return NULL;
+    if (wl->count == wl->cap) {
+        size_t new_cap = 0u;
+        size_t alloc_sz = 0u;
+        if (ckd_mul(&new_cap, wl->cap, (size_t)2u) ||
+            ckd_mul(&alloc_sz, new_cap, sizeof(uintptr_t))) {
+            return false;
+        }
+        uintptr_t *new_items = (uintptr_t *)malloc(alloc_sz);
+        if (!new_items) {
+            return false;
+        }
+        size_t first = wl->cap - wl->head;
+        if (first > wl->count) {
+            first = wl->count;
+        }
+        memcpy(new_items, wl->items + wl->head, first * sizeof(uintptr_t));
+        if (wl->count > first) {
+            memcpy(new_items + first, wl->items, (wl->count - first) * sizeof(uintptr_t));
+        }
+        if (wl->items != wl->inline_items) {
+            free(wl->items);
+        }
+        wl->items = new_items;
+        wl->cap = new_cap;
+        wl->head = 0u;
     }
-    void *dst = scratch + *scratch_used;
-    *scratch_used += aligned;
+    size_t tail = (wl->head + wl->count) & (wl->cap - 1u);
+    wl->items[tail] = ((uintptr_t)ptr) | (is_arr ? (uintptr_t)1u : (uintptr_t)0u);
+    wl->count++;
+    return true;
+}
+
+static bool gc_worklist_pop(gc_worklist_t *wl, void **out_ptr, bool *out_is_arr)
+{
+    if (!wl || wl->count == 0u) {
+        return false;
+    }
+    uintptr_t raw = wl->items[wl->head];
+    wl->head = (wl->head + 1u) & (wl->cap - 1u);
+    wl->count--;
+    *out_is_arr = (raw & (uintptr_t)1u) != 0u;
+    *out_ptr = (void *)(raw & ~(uintptr_t)1u);
+    return true;
+}
+
+static void gc_scratch_init(we_script_t *vm, gc_scratch_t *sc)
+{
+    sc->head_inline = (gc_chunk_t){
+        .next = NULL,
+        .base = vm->arena_base + vm->arena_cap,
+        .cap = WE_SCRIPT_SCRATCH_SIZE,
+        .used = 0u,
+    };
+    sc->tail = &sc->head_inline;
+}
+
+static void gc_scratch_destroy(gc_scratch_t *sc)
+{
+    gc_chunk_t *c = sc->head_inline.next;
+    while (c) {
+        gc_chunk_t *nx = c->next;
+        free(c);
+        c = nx;
+    }
+    sc->head_inline.next = NULL;
+    sc->tail = &sc->head_inline;
+}
+
+static void *gc_scratch_alloc_copy(gc_scratch_t *sc, const void *src, size_t size)
+{
+    size_t aligned = 8u;
+    if (size > 0u) {
+        if (ckd_add(&aligned, size, (size_t)7u)) {
+            return NULL;
+        }
+        aligned &= ~(size_t)7u;
+    }
+    if (aligned > sc->tail->cap - sc->tail->used) {
+        size_t ncap = 0u;
+        if (ckd_mul(&ncap, sc->tail->cap, (size_t)2u) || ncap < aligned) {
+            ncap = aligned;
+        }
+        size_t hdr_sz = (sizeof(gc_chunk_t) + 7u) & ~(size_t)7u;
+        size_t total_sz = 0u;
+        if (ckd_add(&total_sz, hdr_sz, ncap)) {
+            return NULL;
+        }
+        gc_chunk_t *nc = (gc_chunk_t *)malloc(total_sz);
+        if (!nc) {
+            return NULL;
+        }
+        nc->next = NULL;
+        nc->base = (uint8_t *)nc + hdr_sz;
+        nc->cap = ncap;
+        nc->used = 0u;
+        sc->tail->next = nc;
+        sc->tail = nc;
+    }
+    void *dst = sc->tail->base + sc->tail->used;
+    sc->tail->used += aligned;
     memset(dst, 0, aligned);
-    if (src && size > 0) {
+    if (src && size > 0u) {
         memcpy(dst, src, size);
     }
     return dst;
 }
 
-static const char *evacuate_str_to_scratch(const we_script_t *vm, const char *s, uint8_t *scratch,
-                                           size_t scratch_cap, size_t *scratch_used)
+static inline bool ptr_above_watermark(const we_script_t *vm, const void *p)
 {
-    if (!ptr_above_watermark(vm, s)) {
-        return s;
-    }
-    size_t len = strlen(s);
-    char *copy = (char *)scratch_alloc_copy(scratch, scratch_cap, scratch_used, s, len + 1u);
-    return copy ? copy : "";
+    return p && (const uint8_t *)p >= vm->arena_base + vm->ast_watermark &&
+           (const uint8_t *)p < vm->arena_base + vm->arena_used;
 }
 
-static void evacuate_val_to_scratch(const we_script_t *vm, js_val_t *v, uint8_t *scratch,
-                                    size_t scratch_cap, size_t *scratch_used, uint32_t depth,
-                                    promote_fwd_table_t *fwd)
+static bool gc_ptr_in_scratch(const gc_scratch_t *sc, const void *p)
 {
-    if (!v || depth > 64u) {
-        return;
+    if (!p) {
+        return false;
+    }
+    for (const gc_chunk_t *c = &sc->head_inline; c != NULL; c = c->next) {
+        if ((const uint8_t *)p >= c->base && (const uint8_t *)p < c->base + c->used) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool gc_is_src_ptr(const we_script_t *vm, const gc_scratch_t *sc, bool to_scratch,
+                                 const void *p)
+{
+    return to_scratch ? ptr_above_watermark(vm, p) : gc_ptr_in_scratch(sc, p);
+}
+
+static bool gc_ptr_max_bytes(const we_script_t *vm, const gc_scratch_t *sc, bool from_scratch,
+                             const void *p, size_t *out_avail)
+{
+    if (!p) {
+        return false;
+    }
+    const uint8_t *bp = (const uint8_t *)p;
+    if (!from_scratch) {
+        const uint8_t *end = vm->arena_base + vm->arena_used;
+        if (bp >= vm->arena_base && bp < end) {
+            *out_avail = (size_t)(end - bp);
+            return true;
+        }
+        return false;
+    }
+    const uint8_t *wm_end = vm->arena_base + vm->ast_watermark;
+    if (bp >= vm->arena_base && bp < wm_end) {
+        *out_avail = (size_t)(wm_end - bp);
+        return true;
+    }
+    for (const gc_chunk_t *c = &sc->head_inline; c != NULL; c = c->next) {
+        const uint8_t *cend = c->base + c->used;
+        if (bp >= c->base && bp < cend) {
+            *out_avail = (size_t)(cend - bp);
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool gc_ptr_region_check(const we_script_t *vm, const gc_scratch_t *sc,
+                                       bool from_scratch, const void *p, size_t byte_len)
+{
+    size_t avail = 0u;
+    return gc_ptr_max_bytes(vm, sc, from_scratch, p, &avail) && byte_len <= avail;
+}
+
+static void *gc_alloc_copy(we_script_t *vm, gc_scratch_t *sc, bool to_scratch, const void *src,
+                           size_t size)
+{
+    if (to_scratch) {
+        return gc_scratch_alloc_copy(sc, src, size);
+    }
+    void *dst = script_arena_alloc(vm, size);
+    if (dst && src && size > 0u) {
+        memcpy(dst, src, size);
+    }
+    return dst;
+}
+
+static const char *gc_copy_str(we_script_t *vm, gc_scratch_t *sc, bool to_scratch,
+                               gc_fwd_map_t *fwd, const char *s, bool *out_ok)
+{
+    if (!gc_is_src_ptr(vm, sc, to_scratch, s)) {
+        return s;
+    }
+    const char *existing = (const char *)gc_fwd_lookup(fwd, s);
+    if (existing) {
+        return existing;
+    }
+    size_t max_avail = 0u;
+    if (!gc_ptr_max_bytes(vm, sc, !to_scratch, s, &max_avail) || max_avail == 0u) {
+        *out_ok = false;
+        return "";
+    }
+    size_t slen = strnlen(s, max_avail);
+    if (slen >= max_avail) {
+        *out_ok = false;
+        return "";
+    }
+    char *copy = (char *)gc_alloc_copy(vm, sc, to_scratch, s, slen + 1u);
+    if (!copy || !gc_fwd_insert(fwd, s, copy)) {
+        *out_ok = false;
+        return "";
+    }
+    return copy;
+}
+
+static bool gc_visit_val(we_script_t *vm, gc_scratch_t *sc, bool to_scratch, gc_fwd_map_t *fwd,
+                         gc_worklist_t *wl, js_val_t *v)
+{
+    if (!v) {
+        return true;
     }
     switch (v->type) {
-    case VAL_STR:
-        v->u.str = evacuate_str_to_scratch(vm, v->u.str, scratch, scratch_cap, scratch_used);
-        break;
+    case VAL_STR: {
+        bool ok = true;
+        v->u.str = gc_copy_str(vm, sc, to_scratch, fwd, v->u.str, &ok);
+        return ok;
+    }
     case VAL_VEC:
         if (v->u.vec) {
             js_vec_obj_t *orig_vec = v->u.vec;
-            js_vec_obj_t *existing = (js_vec_obj_t *)fwd_lookup(fwd, orig_vec);
+            js_vec_obj_t *existing = (js_vec_obj_t *)gc_fwd_lookup(fwd, orig_vec);
             if (existing) {
                 v->u.vec = existing;
-                return;
+                return true;
             }
-            if (ptr_above_watermark(vm, orig_vec)) {
-                js_vec_obj_t *nv = (js_vec_obj_t *)scratch_alloc_copy(
-                    scratch, scratch_cap, scratch_used, orig_vec, sizeof(js_vec_obj_t));
-                if (nv) {
-                    v->u.vec = nv;
-                    fwd_record(fwd, orig_vec, nv);
-                } else {
-                    *v = val_undef();
+            if (gc_is_src_ptr(vm, sc, to_scratch, orig_vec)) {
+                if (!gc_ptr_region_check(vm, sc, !to_scratch, orig_vec, sizeof(js_vec_obj_t))) {
+                    return false;
                 }
+                js_vec_obj_t *nv = (js_vec_obj_t *)gc_alloc_copy(vm, sc, to_scratch, orig_vec,
+                                                                 sizeof(js_vec_obj_t));
+                if (!nv || !gc_fwd_insert(fwd, orig_vec, nv)) {
+                    return false;
+                }
+                v->u.vec = nv;
             }
         }
-        break;
+        return true;
     case VAL_ARR:
         if (v->u.arr) {
             js_arr_t *orig_arr = v->u.arr;
-            js_arr_t *existing = (js_arr_t *)fwd_lookup(fwd, orig_arr);
+            js_arr_t *existing = (js_arr_t *)gc_fwd_lookup(fwd, orig_arr);
             if (existing) {
                 v->u.arr = existing;
-                return;
+                return true;
             }
             js_arr_t *na = orig_arr;
-            if (ptr_above_watermark(vm, orig_arr)) {
-                js_arr_t *copy = (js_arr_t *)scratch_alloc_copy(scratch, scratch_cap, scratch_used,
-                                                                orig_arr, sizeof(js_arr_t));
-                if (!copy) {
-                    *v = val_undef();
-                    return;
+            if (gc_is_src_ptr(vm, sc, to_scratch, orig_arr)) {
+                if (!gc_ptr_region_check(vm, sc, !to_scratch, orig_arr, sizeof(js_arr_t))) {
+                    return false;
                 }
-                na = copy;
+                na = (js_arr_t *)gc_alloc_copy(vm, sc, to_scratch, orig_arr, sizeof(js_arr_t));
+                if (!na) {
+                    return false;
+                }
+            }
+            if (!gc_fwd_insert(fwd, orig_arr, na) || !gc_worklist_push(wl, na, true)) {
+                return false;
             }
             v->u.arr = na;
-            fwd_record(fwd, orig_arr, na);
-            if (na->items && na->cap > 0) {
-                if (ptr_above_watermark(vm, na->items)) {
-                    js_val_t *ni = (js_val_t *)scratch_alloc_copy(
-                        scratch, scratch_cap, scratch_used, na->items, na->cap * sizeof(js_val_t));
-                    if (ni) {
-                        na->items = ni;
-                    } else {
-                        na->items = NULL;
-                        na->count = 0;
-                        na->cap = 0;
-                        return;
-                    }
-                }
-                for (uint32_t i = 0; i < na->count; i++) {
-                    evacuate_val_to_scratch(vm, &na->items[i], scratch, scratch_cap, scratch_used,
-                                            depth + 1u, fwd);
-                }
-            }
         }
-        break;
+        return true;
     case VAL_OBJ:
         if (v->u.obj) {
             js_obj_t *orig_obj = v->u.obj;
-            js_obj_t *existing = (js_obj_t *)fwd_lookup(fwd, orig_obj);
+            js_obj_t *existing = (js_obj_t *)gc_fwd_lookup(fwd, orig_obj);
             if (existing) {
                 v->u.obj = existing;
-                return;
+                return true;
             }
             js_obj_t *no = orig_obj;
-            if (ptr_above_watermark(vm, orig_obj)) {
-                js_obj_t *copy = (js_obj_t *)scratch_alloc_copy(scratch, scratch_cap, scratch_used,
-                                                                orig_obj, sizeof(js_obj_t));
-                if (!copy) {
-                    *v = val_undef();
-                    return;
+            if (gc_is_src_ptr(vm, sc, to_scratch, orig_obj)) {
+                if (!gc_ptr_region_check(vm, sc, !to_scratch, orig_obj, sizeof(js_obj_t))) {
+                    return false;
                 }
-                no = copy;
+                no = (js_obj_t *)gc_alloc_copy(vm, sc, to_scratch, orig_obj, sizeof(js_obj_t));
+                if (!no) {
+                    return false;
+                }
+            }
+            if (!gc_fwd_insert(fwd, orig_obj, no) || !gc_worklist_push(wl, no, false)) {
+                return false;
             }
             v->u.obj = no;
-            fwd_record(fwd, orig_obj, no);
-            if (no->props && no->cap > 0) {
-                if (ptr_above_watermark(vm, no->props)) {
-                    js_prop_t *np = (js_prop_t *)scratch_alloc_copy(
-                        scratch, scratch_cap, scratch_used, no->props, no->cap * sizeof(js_prop_t));
-                    if (np) {
-                        no->props = np;
-                    } else {
-                        no->props = NULL;
-                        no->count = 0;
-                        no->cap = 0;
-                        return;
-                    }
-                }
-                for (uint32_t i = 0; i < no->count; i++) {
-                    no->props[i].key = evacuate_str_to_scratch(vm, no->props[i].key, scratch,
-                                                               scratch_cap, scratch_used);
-                    evacuate_val_to_scratch(vm, &no->props[i].val, scratch, scratch_cap,
-                                            scratch_used, depth + 1u, fwd);
-                }
-            }
         }
-        break;
+        return true;
     default:
-        break;
+        return true;
     }
 }
 
-static const char *promote_str_from_scratch(we_script_t *vm, const char *s, const uint8_t *scratch,
-                                            size_t scratch_used)
+/* Cheney-style iterative BFS copying pass (to_scratch=true evacuates; false promotes back) */
+static bool gc_copy_pass(we_script_t *vm, gc_scratch_t *sc, bool to_scratch)
 {
-    if (!ptr_in_scratch(scratch, scratch_used, s)) {
-        return s;
-    }
-    const char *dup = script_arena_strdup(vm, s, strlen(s));
-    return dup ? dup : "";
-}
+    gc_fwd_map_t fwd;
+    gc_worklist_t wl;
+    gc_fwd_init(&fwd);
+    gc_worklist_init(&wl);
 
-static void promote_val_from_scratch(we_script_t *vm, js_val_t *v, const uint8_t *scratch,
-                                     size_t scratch_used, uint32_t depth, promote_fwd_table_t *fwd)
-{
-    if (!v || depth > 64u) {
-        return;
+    bool ok = true;
+    for (uint32_t i = 0u; i < vm->global_count && ok; i++) {
+        vm->globals[i].name = gc_copy_str(vm, sc, to_scratch, &fwd, vm->globals[i].name, &ok);
+        if (ok) {
+            ok = gc_visit_val(vm, sc, to_scratch, &fwd, &wl, &vm->globals[i].val);
+        }
     }
-    switch (v->type) {
-    case VAL_STR:
-        v->u.str = promote_str_from_scratch(vm, v->u.str, scratch, scratch_used);
-        break;
-    case VAL_VEC:
-        if (v->u.vec) {
-            js_vec_obj_t *orig_vec = v->u.vec;
-            js_vec_obj_t *existing = (js_vec_obj_t *)fwd_lookup(fwd, orig_vec);
-            if (existing) {
-                v->u.vec = existing;
-                return;
-            }
-            if (ptr_in_scratch(scratch, scratch_used, orig_vec)) {
-                js_vec_obj_t *nv = (js_vec_obj_t *)script_arena_alloc(vm, sizeof(js_vec_obj_t));
-                if (nv) {
-                    *nv = *orig_vec;
-                    v->u.vec = nv;
-                    fwd_record(fwd, orig_vec, nv);
-                } else {
-                    *v = val_undef();
-                }
-            }
+    for (uint32_t i = 0u; i < vm->this_prop_count && ok; i++) {
+        vm->this_props[i].name = gc_copy_str(vm, sc, to_scratch, &fwd, vm->this_props[i].name, &ok);
+        if (ok) {
+            ok = gc_visit_val(vm, sc, to_scratch, &fwd, &wl, &vm->this_props[i].val);
         }
-        break;
-    case VAL_ARR:
-        if (v->u.arr) {
-            js_arr_t *orig_arr = v->u.arr;
-            js_arr_t *existing = (js_arr_t *)fwd_lookup(fwd, orig_arr);
-            if (existing) {
-                v->u.arr = existing;
-                return;
-            }
-            js_arr_t *na = orig_arr;
-            if (ptr_in_scratch(scratch, scratch_used, orig_arr)) {
-                js_arr_t *copy = (js_arr_t *)script_arena_alloc(vm, sizeof(js_arr_t));
-                if (!copy) {
-                    *v = val_undef();
-                    return;
-                }
-                *copy = *orig_arr;
-                na = copy;
-            }
-            v->u.arr = na;
-            fwd_record(fwd, orig_arr, na);
-            if (na->items && na->cap > 0) {
-                if (ptr_in_scratch(scratch, scratch_used, na->items)) {
-                    js_val_t *ni = (js_val_t *)script_arena_alloc(vm, na->cap * sizeof(js_val_t));
-                    if (ni) {
-                        memcpy(ni, na->items, na->count * sizeof(js_val_t));
-                        na->items = ni;
-                    } else {
-                        na->items = NULL;
-                        na->count = 0;
-                        na->cap = 0;
-                        return;
-                    }
-                }
-                for (uint32_t i = 0; i < na->count; i++) {
-                    promote_val_from_scratch(vm, &na->items[i], scratch, scratch_used, depth + 1u,
-                                             fwd);
-                }
-            }
-        }
-        break;
-    case VAL_OBJ:
-        if (v->u.obj) {
-            js_obj_t *orig_obj = v->u.obj;
-            js_obj_t *existing = (js_obj_t *)fwd_lookup(fwd, orig_obj);
-            if (existing) {
-                v->u.obj = existing;
-                return;
-            }
-            js_obj_t *no = orig_obj;
-            if (ptr_in_scratch(scratch, scratch_used, orig_obj)) {
-                js_obj_t *copy = (js_obj_t *)script_arena_alloc(vm, sizeof(js_obj_t));
-                if (!copy) {
-                    *v = val_undef();
-                    return;
-                }
-                *copy = *orig_obj;
-                no = copy;
-            }
-            v->u.obj = no;
-            fwd_record(fwd, orig_obj, no);
-            if (no->props && no->cap > 0) {
-                if (ptr_in_scratch(scratch, scratch_used, no->props)) {
-                    js_prop_t *np =
-                        (js_prop_t *)script_arena_alloc(vm, no->cap * sizeof(js_prop_t));
-                    if (np) {
-                        memcpy(np, no->props, no->count * sizeof(js_prop_t));
-                        no->props = np;
-                    } else {
-                        no->props = NULL;
-                        no->count = 0;
-                        no->cap = 0;
-                        return;
-                    }
-                }
-                for (uint32_t i = 0; i < no->count; i++) {
-                    no->props[i].key =
-                        promote_str_from_scratch(vm, no->props[i].key, scratch, scratch_used);
-                    promote_val_from_scratch(vm, &no->props[i].val, scratch, scratch_used,
-                                             depth + 1u, fwd);
-                }
-            }
-        }
-        break;
-    default:
-        break;
     }
+
+    void *item_ptr = NULL;
+    bool is_arr = false;
+    while (ok && gc_worklist_pop(&wl, &item_ptr, &is_arr)) {
+        if (is_arr) {
+            js_arr_t *arr = (js_arr_t *)item_ptr;
+            if (!arr->items || arr->cap == 0u) {
+                arr->items = NULL;
+                arr->count = 0u;
+                arr->cap = 0u;
+                continue;
+            }
+            if (arr->count > arr->cap) {
+                ok = false;
+                break;
+            }
+            size_t cap_bytes = 0u;
+            if (ckd_mul(&cap_bytes, (size_t)arr->cap, sizeof(js_val_t)) ||
+                !gc_ptr_region_check(vm, sc, !to_scratch, arr->items, cap_bytes)) {
+                ok = false;
+                break;
+            }
+            if (gc_is_src_ptr(vm, sc, to_scratch, arr->items)) {
+                js_val_t *ni = (js_val_t *)gc_alloc_copy(vm, sc, to_scratch, arr->items, cap_bytes);
+                if (!ni) {
+                    ok = false;
+                    break;
+                }
+                arr->items = ni;
+            }
+            for (uint32_t i = 0u; i < arr->count; i++) {
+                if (!gc_visit_val(vm, sc, to_scratch, &fwd, &wl, &arr->items[i])) {
+                    ok = false;
+                    break;
+                }
+            }
+        } else {
+            js_obj_t *obj = (js_obj_t *)item_ptr;
+            if (!obj->props || obj->cap == 0u) {
+                obj->props = NULL;
+                obj->count = 0u;
+                obj->cap = 0u;
+                continue;
+            }
+            if (obj->count > obj->cap) {
+                ok = false;
+                break;
+            }
+            size_t cap_bytes = 0u;
+            if (ckd_mul(&cap_bytes, (size_t)obj->cap, sizeof(js_prop_t)) ||
+                !gc_ptr_region_check(vm, sc, !to_scratch, obj->props, cap_bytes)) {
+                ok = false;
+                break;
+            }
+            if (gc_is_src_ptr(vm, sc, to_scratch, obj->props)) {
+                js_prop_t *np =
+                    (js_prop_t *)gc_alloc_copy(vm, sc, to_scratch, obj->props, cap_bytes);
+                if (!np) {
+                    ok = false;
+                    break;
+                }
+                obj->props = np;
+            }
+            for (uint32_t i = 0u; i < obj->count; i++) {
+                obj->props[i].key = gc_copy_str(vm, sc, to_scratch, &fwd, obj->props[i].key, &ok);
+                if (!ok || !gc_visit_val(vm, sc, to_scratch, &fwd, &wl, &obj->props[i].val)) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    gc_worklist_destroy(&wl);
+    gc_fwd_destroy(&fwd);
+    return ok;
 }
 
 static void promote_global_values(we_script_t *vm)
@@ -3777,40 +4213,34 @@ static void promote_global_values(we_script_t *vm)
         return;
     }
 
-    uint8_t *scratch = vm->arena_base + vm->arena_cap;
-    size_t scratch_cap = WE_SCRIPT_SCRATCH_SIZE;
-    size_t scratch_used = 0;
+    gc_scratch_t sc;
+    gc_scratch_init(vm, &sc);
 
-    promote_fwd_table_t evac_fwd = {.count = 0};
-    for (uint32_t i = 0; i < vm->global_count; i++) {
-        vm->globals[i].name =
-            evacuate_str_to_scratch(vm, vm->globals[i].name, scratch, scratch_cap, &scratch_used);
-        evacuate_val_to_scratch(vm, &vm->globals[i].val, scratch, scratch_cap, &scratch_used, 0,
-                                &evac_fwd);
-    }
-    for (uint32_t i = 0; i < vm->this_prop_count; i++) {
-        vm->this_props[i].name = evacuate_str_to_scratch(vm, vm->this_props[i].name, scratch,
-                                                         scratch_cap, &scratch_used);
-        evacuate_val_to_scratch(vm, &vm->this_props[i].val, scratch, scratch_cap, &scratch_used, 0,
-                                &evac_fwd);
+    if (!gc_copy_pass(vm, &sc, true)) {
+        gc_scratch_destroy(&sc);
+        vm->global_count = 0u;
+        vm->this_prop_count = 0u;
+        vm->arena_used = vm->ast_watermark;
+        vm->oom = true;
+        vm->aborted = true;
+        return;
     }
 
     vm->arena_used = vm->ast_watermark;
 
-    if (scratch_used == 0) {
+    if (sc.head_inline.used == 0u && !sc.head_inline.next) {
+        gc_scratch_destroy(&sc);
         return;
     }
 
-    promote_fwd_table_t prom_fwd = {.count = 0};
-    for (uint32_t i = 0; i < vm->global_count; i++) {
-        vm->globals[i].name =
-            promote_str_from_scratch(vm, vm->globals[i].name, scratch, scratch_used);
-        promote_val_from_scratch(vm, &vm->globals[i].val, scratch, scratch_used, 0, &prom_fwd);
-    }
-    for (uint32_t i = 0; i < vm->this_prop_count; i++) {
-        vm->this_props[i].name =
-            promote_str_from_scratch(vm, vm->this_props[i].name, scratch, scratch_used);
-        promote_val_from_scratch(vm, &vm->this_props[i].val, scratch, scratch_used, 0, &prom_fwd);
+    bool ok2 = gc_copy_pass(vm, &sc, false);
+    gc_scratch_destroy(&sc);
+    if (!ok2) {
+        vm->global_count = 0u;
+        vm->this_prop_count = 0u;
+        vm->arena_used = vm->ast_watermark;
+        vm->oom = true;
+        vm->aborted = true;
     }
 }
 
@@ -3824,7 +4254,7 @@ static bool run_value_callback(we_script_t *vm, const ast_node_t *fn, const we_s
     if (!vm || !fn) {
         return false;
     }
-    if (vm->depth_exceeded) {
+    if (vm->depth_exceeded || vm->oom || vm->parse_error) {
         vm->aborted = true;
         return false;
     }
@@ -3919,7 +4349,7 @@ bool we_script_eval_init(we_script_t *script, const we_script_env_t *env,
     if (!script) {
         return false;
     }
-    if (script->depth_exceeded) {
+    if (script->depth_exceeded || script->oom || script->parse_error) {
         script->aborted = true;
         return false;
     }
@@ -3944,7 +4374,7 @@ bool we_script_eval_update(we_script_t *script, const we_script_env_t *env,
     if (!script) {
         return false;
     }
-    if (script->depth_exceeded) {
+    if (script->depth_exceeded || script->oom || script->parse_error) {
         script->aborted = true;
         return false;
     }
@@ -3964,14 +4394,14 @@ bool we_script_eval_cursor_move(we_script_t *script, const we_script_env_t *env,
     if (!script || !script->fn_cursor_move) {
         return false;
     }
-    if (script->depth_exceeded) {
+    if (script->depth_exceeded || script->oom || script->parse_error) {
         script->aborted = true;
         return false;
     }
     if (env) {
         script->env = *env;
     }
-    we_script_layer_state_t saved_layer;
+    we_script_layer_state_t saved_layer = {0};
     if (inout_layer) {
         saved_layer = *inout_layer;
     }
@@ -4011,14 +4441,14 @@ bool we_script_eval_apply_user_properties(we_script_t *script, const we_script_e
     if (!script || !script->fn_apply_user_props) {
         return false;
     }
-    if (script->depth_exceeded) {
+    if (script->depth_exceeded || script->oom || script->parse_error) {
         script->aborted = true;
         return false;
     }
     if (env) {
         script->env = *env;
     }
-    we_script_layer_state_t saved_layer;
+    we_script_layer_state_t saved_layer = {0};
     if (inout_layer) {
         saved_layer = *inout_layer;
     }
