@@ -17,6 +17,7 @@
 #include "waywal/we_puppet.h"
 
 #include <assert.h>
+#include <locale.h>
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -564,6 +565,216 @@ static void test_wall_clock_and_non_compounding_hierarchy_solver(void)
     printf("    -> Non-compounding hierarchy skinning & wall-clock clamping verified.\n");
 }
 
+static void test_preset_table_and_comma_locale_json(void)
+{
+    printf("[+] Testing preset table parity, comma LC_NUMERIC, JSON boundaries & angle "
+           "parsing...\n");
+
+    for (uint32_t p = WE_PHYS_PRESET_SILK; p <= WE_PHYS_PRESET_METALLIC_CHAIN; ++p) {
+        we_bone_sim_config_t preset_cfg;
+        we_bone_sim_config_t direct_cfg;
+        memset(&preset_cfg, 0, sizeof(preset_cfg));
+        memset(&direct_cfg, 0, sizeof(direct_cfg));
+        assert(we_physics_get_preset_config((we_physics_preset_t)p, &preset_cfg));
+        we_physics_apply_preset(&direct_cfg, (we_physics_preset_t)p);
+        assert(fabsf(preset_cfg.compliance_stretch - direct_cfg.compliance_stretch) < 1e-12f);
+        assert(fabsf(preset_cfg.compliance_bend - direct_cfg.compliance_bend) < 1e-12f);
+        assert(fabsf(preset_cfg.damping_ratio - direct_cfg.damping_ratio) < 1e-12f);
+        assert(fabsf(preset_cfg.mass_kg - direct_cfg.mass_kg) < 1e-12f);
+        assert(we_physics_detect_preset(&direct_cfg) == (we_physics_preset_t)p);
+        assert(we_physics_preset_name((we_physics_preset_t)p) != NULL);
+    }
+    we_bone_sim_config_t custom_cfg = {0};
+    we_physics_apply_preset(&custom_cfg, WE_PHYS_PRESET_SILK);
+    custom_cfg.compliance_bend *= 3.5f;
+    assert(we_physics_detect_preset(&custom_cfg) == WE_PHYS_PRESET_CUSTOM);
+
+    const char *prev_loc = setlocale(LC_NUMERIC, NULL);
+    char saved_loc[128] = {0};
+    if (prev_loc) {
+        snprintf(saved_loc, sizeof(saved_loc), "%s", prev_loc);
+    }
+    static const char *const comma_locales[] = {"de_DE.UTF-8", "de_DE.utf8", "ru_RU.UTF-8",
+                                                "ru_RU.utf8", "fr_FR.UTF-8"};
+    const char *active_comma = NULL;
+    for (size_t i = 0; i < sizeof(comma_locales) / sizeof(comma_locales[0]); ++i) {
+        if (setlocale(LC_NUMERIC, comma_locales[i]) != NULL && strtod("0,5", NULL) == 0.5) {
+            active_comma = comma_locales[i];
+            break;
+        }
+    }
+    assert(active_comma != NULL && "Host must have at least one comma-decimal UTF-8 locale");
+
+    /* Decoy substring keys inside string values/nested objects must not spoof top-level fields. */
+    const char *tricky_json = "{\"comment\":\"\\\"stiffness\\\":0.99, maxangle:1.0\", "
+                              "\"nested\":{\"damping\":0.95,\"maxangle\":5.0}, "
+                              "\"sub_stiffness\":0.99, \"stiffness\":0.5, \"damping\":0.25, "
+                              "\"wind\":1.25, \"maxangle\":-45.0}";
+    we_bone_sim_config_t parsed = {0};
+    assert(we_physics_parse_simulation_json(tricky_json, &parsed));
+    assert(fabsf(parsed.compliance_bend - 0.00625f) < 1e-5f);
+    assert(fabsf(parsed.damping_ratio - 0.25f) < 1e-5f);
+    assert(fabsf(parsed.wind_drag_coeff - 1.25f) < 1e-5f);
+    assert(fabsf(parsed.angle_limit_max_rad - (45.0f * 3.14159265f / 180.0f)) < 1e-3f);
+    assert(fabsf(parsed.angle_limit_min_rad + (45.0f * 3.14159265f / 180.0f)) < 1e-3f);
+
+    /* Pi radians (~3.1416) must stay radians instead of misclassifying as ~3.14 degrees. */
+    const char *pi_json = "{\"maxangle\":3.14159, \"stiffness\":1e30, \"damping\":-5.0}";
+    we_bone_sim_config_t pi_cfg = {0};
+    assert(we_physics_parse_simulation_json(pi_json, &pi_cfg));
+    assert(pi_cfg.angle_limit_max_rad > 3.0f && pi_cfg.angle_limit_max_rad <= 3.1415927f);
+    assert(isfinite(pi_cfg.compliance_bend) && pi_cfg.damping_ratio >= 0.0f);
+
+    if (saved_loc[0] != '\0') {
+        setlocale(LC_NUMERIC, saved_loc);
+    }
+    printf("    -> Preset table parity & locale '%s' JSON parsing verified.\n", active_comma);
+}
+
+static void test_small_steps_high_drag_stability(void)
+{
+    printf("[+] Testing Small-Steps XPBD + Bernoulli exponential wind drag under light bone & "
+           "coarse dt...\n");
+
+    we_puppet_physics_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.active_bone_count = 1u;
+    ctx.initialized = true;
+
+    ctx.configs[0].flags = WE_BONE_PHYS_ENABLED;
+    ctx.configs[0].mass_kg = 0.01f;
+    ctx.configs[0].rest_length_px = 40.0f;
+    ctx.configs[0].compliance_stretch = 1e-6f;
+    ctx.configs[0].compliance_bend = 0.02f;
+    ctx.configs[0].damping_ratio = 0.1f;
+    ctx.configs[0].wind_drag_coeff = 20.0f;
+    ctx.configs[0].audio_drag_coeff = 10.0f;
+    ctx.configs[0].gravity_scale = 1.0f;
+    ctx.rest_dir_local[0][1] = -1.0f;
+    ctx.states[0].pos_curr[0] = 0.0f;
+    ctx.states[0].pos_curr[1] = -40.0f;
+
+    ctx.wind.enabled = 1u;
+    ctx.wind.base_speed_px_s = 15000.0f;
+    ctx.wind.base_direction_rad = 0.0f;
+    ctx.wind.gravity_vec[1] = -980.0f;
+
+    float pivot[3] = {0.0f, 0.0f, 0.0f};
+    float W[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+    for (int f = 0; f < 60; ++f) {
+        if ((f % 10) == 0) {
+            ctx.audio_bands[0] = 1.0f;
+            ctx.prev_audio_bass = 0.0f;
+        } else {
+            ctx.prev_audio_bass = 0.125f;
+        }
+        /* Coarse 20 Hz step directly into substep_bone; explicit Euler blew up exponentially here.
+         */
+        we_physics_substep_bone(&ctx, 0u, pivot, W, 0.05f, (double)f * 0.05);
+        for (int c = 0; c < 3; ++c) {
+            assert(isfinite(ctx.states[0].pos_curr[c]));
+            assert(isfinite(ctx.states[0].vel[c]));
+            assert(fabsf(ctx.states[0].vel[c]) <= 30000.0f);
+        }
+    }
+    printf(
+        "    -> Light bone (10g, drag=20, dt=50ms, 15000px/s wind) remained bounded & finite.\n");
+}
+
+static void test_avx2_inf_parity_gradients_and_nonuniform_scale(void)
+{
+    printf("[+] Testing AVX2/scalar Inf parity, 12-way curl gradients & non-uniform bone "
+           "scale...\n");
+
+    we_wind_field_t wind = {
+        .enabled = 1u,
+        .base_direction_rad = 0.4f,
+        .base_speed_px_s = 120.0f,
+        .gust_frequency_hz = 1.0f,
+        .gust_amplitude = 2.0f,
+        .curl_spatial_scale = 0.01f,
+    };
+
+    enum { M = 16 };
+    float xs[M] = {INFINITY, -INFINITY, NAN, -0.0f, 123.4f, 0.0f,  -999.0f, 5.0e6f,
+                   -5.0e6f,  INFINITY,  NAN, 42.0f, 333.3f, 77.0f, -88.0f,  0.5f};
+    float ys[M] = {0.0f,   INFINITY, -INFINITY, NAN,   -456.7f, 10.0f,  888.0f, 12.0f,
+                   -12.0f, NAN,      INFINITY,  -1.0f, 444.4f,  -77.0f, 88.0f,  -0.5f};
+    float zs[M] = {NAN,  0.0f,      INFINITY, -INFINITY, 78.9f,  -10.0f, 222.0f, 0.0f,
+                   0.0f, -INFINITY, NAN,      9.0f,      -55.0f, 11.0f,  -22.0f, 3.0f};
+    float batch[M][3];
+    we_physics_eval_curl_wind_3d_batch(&wind, xs, ys, zs, M, 12.5, batch);
+    for (int i = 0; i < M; ++i) {
+        float ref[3];
+        we_physics_eval_curl_wind_3d(&wind, xs[i], ys[i], zs[i], 12.5, ref);
+        for (int c = 0; c < 3; ++c) {
+            assert(isfinite(batch[i][c]) && isfinite(ref[c]));
+            assert(fabsf(batch[i][c] - ref[c]) <= 1e-3f &&
+                   "AVX2 and scalar must agree on Inf/NaN/large coordinates");
+        }
+    }
+
+    /* Verify curl field exercises both z-and-y gradients across space cleanly. */
+    double sum_abs_vz = 0.0;
+    for (int i = 0; i < 64; ++i) {
+        float v[3];
+        we_physics_eval_curl_wind_3d(&wind, (float)i * 71.3f, (float)i * -53.1f, (float)i * 39.7f,
+                                     1.25, v);
+        sum_abs_vz += fabs((double)v[2]);
+    }
+    assert(sum_abs_vz > 10.0);
+
+    /* Non-uniform scale + rotation on bone 0..1 chain must round-trip exact world rest dir. */
+    we_mdl_bone_t bones[2];
+    memset(bones, 0, sizeof(bones));
+    float c45 = cosf(0.78539816f);
+    float s45 = sinf(0.78539816f);
+    /* Column-major: col0 = 3.0 * (c45, s45, 0), col1 = 0.25 * (-s45, c45, 0), col2 = (0,0,1.5) */
+    bones[0].parent = 0xFFFFFFFFu;
+    bones[0].local_trans[0] = 3.0f * c45;
+    bones[0].local_trans[1] = 3.0f * s45;
+    bones[0].local_trans[4] = -0.25f * s45;
+    bones[0].local_trans[5] = 0.25f * c45;
+    bones[0].local_trans[10] = 1.5f;
+    bones[0].local_trans[15] = 1.0f;
+    bones[0].offset_trans[0] = bones[0].offset_trans[5] = bones[0].offset_trans[10] =
+        bones[0].offset_trans[15] = 1.0f;
+    snprintf(bones[0].simulation_json, sizeof(bones[0].simulation_json),
+             "{\"stiffness\":0.4,\"damping\":0.2,\"wind\":0.5}");
+
+    bones[1].parent = 0u;
+    bones[1].local_trans[0] = 1.0f;
+    bones[1].local_trans[5] = 1.0f;
+    bones[1].local_trans[10] = 1.0f;
+    bones[1].local_trans[12] = 0.0f;
+    bones[1].local_trans[13] = 40.0f;
+    bones[1].local_trans[15] = 1.0f;
+    bones[1].offset_trans[0] = bones[1].offset_trans[5] = bones[1].offset_trans[10] =
+        bones[1].offset_trans[15] = 1.0f;
+
+    we_puppet_t puppet = {.bone_count = 2u, .bones = bones};
+    we_puppet_physics_ctx_t pctx;
+    memset(&pctx, 0, sizeof(pctx));
+    we_physics_init_from_puppet(&pctx, &puppet);
+
+    /* Expected world tip direction for bone 0 -> bone 1: normalize(M * (0, 40, 0)) = col1_unit */
+    float exp_x = -s45;
+    float exp_y = c45;
+    const float *rl = pctx.rest_dir_local[0];
+    float wx = bones[0].local_trans[0] * rl[0] + bones[0].local_trans[4] * rl[1] +
+               bones[0].local_trans[8] * rl[2];
+    float wy = bones[0].local_trans[1] * rl[0] + bones[0].local_trans[5] * rl[1] +
+               bones[0].local_trans[9] * rl[2];
+    float wz = bones[0].local_trans[2] * rl[0] + bones[0].local_trans[6] * rl[1] +
+               bones[0].local_trans[10] * rl[2];
+    float wlen = sqrtf(wx * wx + wy * wy + wz * wz);
+    assert(wlen > 1e-4f);
+    assert(fabsf(wx / wlen - exp_x) < 1e-4f && fabsf(wy / wlen - exp_y) < 1e-4f &&
+           fabsf(wz / wlen) < 1e-4f);
+    printf("    -> Inf/NaN AVX2==scalar & non-uniform scale 3x3 inverse verified.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -578,6 +789,9 @@ int main(void)
     test_128_bone_step_puppet_benchmark();
     test_avx2_curl_wind_batch_equivalence();
     test_wall_clock_and_non_compounding_hierarchy_solver();
+    test_preset_table_and_comma_locale_json();
+    test_small_steps_high_drag_stability();
+    test_avx2_inf_parity_gradients_and_nonuniform_scale();
 
     printf("==========================================================\n");
     printf("  >>> ALL WE_PHYSICS TESTS PASSED CLEANLY (100%%) <<<\n");

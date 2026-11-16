@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "waywal/we_physics.h"
 #include "waywal/we_puppet.h"
 
 #include <ctype.h>
+#include <locale.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -153,59 +158,193 @@ void we_physics_load_preset(we_bone_sim_config_t *cfg, we_physics_preset_t prese
     we_physics_apply_preset(cfg, preset);
 }
 
+bool we_physics_get_preset_config(we_physics_preset_t preset, we_bone_sim_config_t *out_cfg)
+{
+    if (!out_cfg || (uint32_t)preset > (uint32_t)WE_PHYS_PRESET_METALLIC_CHAIN) {
+        return false;
+    }
+    memset(out_cfg, 0, sizeof(*out_cfg));
+    out_cfg->rest_length_px = 30.0f;
+    we_physics_apply_preset(out_cfg, preset);
+    return true;
+}
+
+static inline bool preset_float_close(float a, float b, float abs_tol, float rel_tol)
+{
+    if (!isfinite(a) || !isfinite(b)) {
+        return false;
+    }
+    float diff = fabsf(a - b);
+    float scale = fmaxf(fabsf(a), fabsf(b));
+    return diff <= fmaxf(abs_tol, rel_tol * scale);
+}
+
+we_physics_preset_t we_physics_detect_preset(const we_bone_sim_config_t *cfg)
+{
+    if (!cfg) {
+        return WE_PHYS_PRESET_CUSTOM;
+    }
+    for (uint32_t p = (uint32_t)WE_PHYS_PRESET_SILK; p <= (uint32_t)WE_PHYS_PRESET_METALLIC_CHAIN;
+         ++p) {
+        we_bone_sim_config_t ref;
+        if (!we_physics_get_preset_config((we_physics_preset_t)p, &ref)) {
+            continue;
+        }
+        /* Compare compliance_stretch with sub-1e-8 precision so 1e-6/1e-7/1e-8 presets stay
+         * distinguishable instead of colliding under a coarse fixed epsilon. */
+        if (preset_float_close(cfg->compliance_stretch, ref.compliance_stretch, 1e-10f, 1e-3f) &&
+            preset_float_close(cfg->compliance_bend, ref.compliance_bend, 1e-6f, 1e-3f) &&
+            preset_float_close(cfg->damping_ratio, ref.damping_ratio, 1e-4f, 1e-3f) &&
+            preset_float_close(cfg->mass_kg, ref.mass_kg, 1e-4f, 1e-3f) &&
+            preset_float_close(cfg->gravity_scale, ref.gravity_scale, 1e-4f, 1e-3f) &&
+            preset_float_close(cfg->wind_drag_coeff, ref.wind_drag_coeff, 1e-4f, 1e-3f)) {
+            return (we_physics_preset_t)p;
+        }
+    }
+    return WE_PHYS_PRESET_CUSTOM;
+}
+
+const char *we_physics_preset_name(we_physics_preset_t preset)
+{
+    switch (preset) {
+    case WE_PHYS_PRESET_SILK:
+        return "Silk";
+    case WE_PHYS_PRESET_LONG_HAIR:
+        return "Long Hair";
+    case WE_PHYS_PRESET_HEAVY_CAPE:
+        return "Heavy Cape";
+    case WE_PHYS_PRESET_FOLIAGE_BRANCH:
+        return "Foliage Branch";
+    case WE_PHYS_PRESET_SOFT_RIBBON:
+        return "Soft Ribbon";
+    case WE_PHYS_PRESET_METALLIC_CHAIN:
+        return "Metallic Chain";
+    case WE_PHYS_PRESET_CUSTOM:
+    default:
+        return "Custom";
+    }
+}
+
 /* ========================================================================= */
 /* 2. Simulation JSON Parser                                                 */
 /* ========================================================================= */
 
-static bool parse_json_number(const char *json, const char *key, float *out_val)
-{
-    if (!json || !key || !out_val) {
-        return false;
-    }
-    size_t klen = strlen(key);
-    const char *p = json;
+static locale_t g_phys_c_locale = (locale_t)0;
+static pthread_once_t g_phys_c_locale_once = PTHREAD_ONCE_INIT;
 
-    while ((p = strstr(p, key)) != NULL) {
-        /* Check word boundary before key */
-        if (p > json) {
-            char prev = *(p - 1);
-            if (isalnum((unsigned char)prev) || prev == '_') {
-                p += klen;
+static void init_phys_c_locale(void)
+{
+    g_phys_c_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+}
+
+static inline float phys_strtof_c(const char *s, char **endptr)
+{
+    pthread_once(&g_phys_c_locale_once, init_phys_c_locale);
+    if (g_phys_c_locale != (locale_t)0) {
+        return strtof_l(s, endptr, g_phys_c_locale);
+    }
+    return strtof(s, endptr);
+}
+
+static const char *skip_ws(const char *p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+    }
+    return p;
+}
+
+static const char *skip_json_string(const char *p)
+{
+    if (*p != '"') {
+        return NULL;
+    }
+    p++;
+    while (*p != '\0') {
+        if (*p == '\\') {
+            p++;
+            if (*p == '\0') {
+                return NULL;
+            }
+            p++;
+            continue;
+        }
+        if (*p == '"') {
+            return p + 1;
+        }
+        p++;
+    }
+    return NULL;
+}
+
+static const char *skip_json_value(const char *p)
+{
+    p = skip_ws(p);
+    if (*p == '"') {
+        return skip_json_string(p);
+    }
+    if (*p == '{' || *p == '[') {
+        uint32_t depth = 1u;
+        p++;
+        while (*p != '\0' && depth > 0u) {
+            if (*p == '"') {
+                p = skip_json_string(p);
+                if (!p) {
+                    return NULL;
+                }
                 continue;
             }
+            if (*p == '{' || *p == '[') {
+                depth++;
+            } else if (*p == '}' || *p == ']') {
+                depth--;
+            }
+            p++;
         }
-        /* Check boundary after key */
-        char after = p[klen];
-        if (isalnum((unsigned char)after) || after == '_') {
-            p += klen;
-            continue;
-        }
-
-        const char *cur = p + klen;
-        if (*cur == '"' || *cur == '\'') {
-            cur++;
-        }
-        while (*cur == ' ' || *cur == '\t' || *cur == '\r' || *cur == '\n') {
-            cur++;
-        }
-        if (*cur != ':') {
-            p += klen;
-            continue;
-        }
-        cur++;
-        while (*cur == ' ' || *cur == '\t' || *cur == '\r' || *cur == '\n') {
-            cur++;
-        }
-
-        char *endptr = NULL;
-        float v = strtof(cur, &endptr);
-        if (endptr != cur && isfinite(v)) {
-            *out_val = v;
-            return true;
-        }
-        p += klen;
+        return (depth == 0u) ? p : NULL;
     }
-    return false;
+    while (*p != '\0' && *p != ',' && *p != '}' && *p != ']') {
+        p++;
+    }
+    return p;
+}
+
+static bool parse_json_scalar_float(const char *p, float *out_val, const char **out_next)
+{
+    p = skip_ws(p);
+    bool quoted = false;
+    if (*p == '"') {
+        quoted = true;
+        p++;
+        p = skip_ws(p);
+    }
+    if (*p == '\0' || (!isdigit((unsigned char)*p) && *p != '-' && *p != '+' && *p != '.')) {
+        return false;
+    }
+    char *endptr = NULL;
+    float v = phys_strtof_c(p, &endptr);
+    if (endptr == p || !isfinite(v)) {
+        return false;
+    }
+    const char *tail = skip_ws(endptr);
+    if (quoted) {
+        if (*tail != '"') {
+            return false;
+        }
+        tail = skip_ws(tail + 1);
+    }
+    if (*tail != ',' && *tail != '}' && *tail != '\0') {
+        return false;
+    }
+    *out_val = v;
+    *out_next = tail;
+    return true;
+}
+
+static bool key_equals(const char *k_start, size_t k_len, const char *lit)
+{
+    size_t lit_len = strlen(lit);
+    return k_len == lit_len && memcmp(k_start, lit, lit_len) == 0;
 }
 
 bool we_physics_parse_simulation_json(const char *json, we_bone_sim_config_t *out_cfg)
@@ -214,80 +353,106 @@ bool we_physics_parse_simulation_json(const char *json, we_bone_sim_config_t *ou
         return false;
     }
 
+    const char *p = skip_ws(json);
+    if (*p != '{') {
+        return false;
+    }
+    p++;
+
     bool matched = false;
-    float val = 0.0f;
-
-    if (parse_json_number(json, "stiffness", &val) ||
-        parse_json_number(json, "\"stiffness\"", &val)) {
-        val = fminf(fmaxf(val, 0.0f), 1.0f);
-        /* alpha_bend = (1 - stiffness)^3 * 0.05 */
-        float inv_s = 1.0f - val;
-        out_cfg->compliance_bend = inv_s * inv_s * inv_s * 0.05f;
-        out_cfg->compliance_stretch = inv_s * 1e-6f;
-        out_cfg->flags |= WE_BONE_PHYS_ENABLED;
-        matched = true;
-    }
-
-    if (parse_json_number(json, "damping", &val) || parse_json_number(json, "\"damping\"", &val)) {
-        out_cfg->damping_ratio = fmaxf(val, 0.0f);
-        out_cfg->rayleigh_damping = out_cfg->damping_ratio * 0.05f;
-        out_cfg->flags |= WE_BONE_PHYS_ENABLED;
-        matched = true;
-    }
-
-    if (parse_json_number(json, "gravity", &val) || parse_json_number(json, "\"gravity\"", &val)) {
-        if (fabsf(val) > 2.0f) {
-            out_cfg->gravity_scale = val / 9.8f;
-        } else {
-            out_cfg->gravity_scale = val;
+    while (*p != '\0') {
+        p = skip_ws(p);
+        if (*p == '}') {
+            break;
         }
-        out_cfg->flags |= WE_BONE_PHYS_ENABLED;
-        matched = true;
-    }
-
-    if (parse_json_number(json, "mass", &val) || parse_json_number(json, "\"mass\"", &val)) {
-        out_cfg->mass_kg = fmaxf(val, 0.01f);
-        out_cfg->flags |= WE_BONE_PHYS_ENABLED;
-        matched = true;
-    }
-
-    if (parse_json_number(json, "length", &val) || parse_json_number(json, "\"length\"", &val)) {
-        out_cfg->rest_length_px = fmaxf(val, 1.0f);
-        out_cfg->flags |= WE_BONE_PHYS_ENABLED;
-        matched = true;
-    }
-
-    if (parse_json_number(json, "maxangle", &val) ||
-        parse_json_number(json, "\"maxangle\"", &val) ||
-        parse_json_number(json, "max_angle", &val) ||
-        parse_json_number(json, "\"max_angle\"", &val)) {
-        float ang = val;
-        if (ang > 3.14159f) {
-            ang = ang * (WE_PI / 180.0f);
+        if (*p == ',') {
+            p++;
+            continue;
         }
-        ang = fabsf(ang);
-        out_cfg->angle_limit_max_rad = ang;
-        out_cfg->angle_limit_min_rad = -ang;
-        out_cfg->flags |= (WE_BONE_PHYS_ENABLED | WE_BONE_PHYS_ANGULAR_LIMIT);
-        matched = true;
-    }
+        if (*p != '"') {
+            return false;
+        }
 
-    if (parse_json_number(json, "wind", &val) || parse_json_number(json, "\"wind\"", &val)) {
-        out_cfg->wind_drag_coeff = fmaxf(val, 0.0f);
-        out_cfg->flags |= WE_BONE_PHYS_ENABLED;
-        matched = true;
-    }
+        const char *k_start = p + 1;
+        const char *k_end_quote = skip_json_string(p);
+        if (!k_end_quote) {
+            return false;
+        }
+        const char *k_end = k_end_quote - 1;
+        bool has_escape = memchr(k_start, '\\', (size_t)(k_end - k_start)) != NULL;
+        size_t k_len = (size_t)(k_end - k_start);
 
-    if (parse_json_number(json, "audio", &val) || parse_json_number(json, "\"audio\"", &val)) {
-        out_cfg->audio_drag_coeff = fmaxf(val, 0.0f);
-        out_cfg->flags |= WE_BONE_PHYS_ENABLED;
-        matched = true;
-    }
+        p = skip_ws(k_end_quote);
+        if (*p != ':') {
+            return false;
+        }
+        p = skip_ws(p + 1);
 
-    if (parse_json_number(json, "radius", &val) || parse_json_number(json, "\"radius\"", &val)) {
-        out_cfg->collision_radius_px = fmaxf(val, 1.0f);
-        out_cfg->flags |= (WE_BONE_PHYS_ENABLED | WE_BONE_PHYS_CURSOR_COLLIDE);
-        matched = true;
+        float val = 0.0f;
+        const char *after_val = NULL;
+        bool is_num = (!has_escape) && parse_json_scalar_float(p, &val, &after_val);
+        if (!is_num) {
+            after_val = skip_json_value(p);
+            if (!after_val) {
+                return false;
+            }
+            p = after_val;
+            continue;
+        }
+
+        if (key_equals(k_start, k_len, "stiffness")) {
+            val = fminf(fmaxf(val, 0.0f), 1.0f);
+            float inv_s = 1.0f - val;
+            out_cfg->compliance_bend = inv_s * inv_s * inv_s * 0.05f;
+            out_cfg->compliance_stretch = inv_s * 1e-6f;
+            out_cfg->flags |= WE_BONE_PHYS_ENABLED;
+            matched = true;
+        } else if (key_equals(k_start, k_len, "damping")) {
+            out_cfg->damping_ratio = fminf(fmaxf(val, 0.0f), 10.0f);
+            out_cfg->rayleigh_damping = out_cfg->damping_ratio * 0.05f;
+            out_cfg->flags |= WE_BONE_PHYS_ENABLED;
+            matched = true;
+        } else if (key_equals(k_start, k_len, "gravity")) {
+            float g = (fabsf(val) > 2.0f) ? (val / 9.8f) : val;
+            out_cfg->gravity_scale = fminf(fmaxf(g, -1000.0f), 1000.0f);
+            out_cfg->flags |= WE_BONE_PHYS_ENABLED;
+            matched = true;
+        } else if (key_equals(k_start, k_len, "mass")) {
+            out_cfg->mass_kg = fminf(fmaxf(val, 0.01f), 50.0f);
+            out_cfg->flags |= WE_BONE_PHYS_ENABLED;
+            matched = true;
+        } else if (key_equals(k_start, k_len, "length")) {
+            out_cfg->rest_length_px = fminf(fmaxf(val, 1.0f), 100000.0f);
+            out_cfg->flags |= WE_BONE_PHYS_ENABLED;
+            matched = true;
+        } else if (key_equals(k_start, k_len, "maxangle") ||
+                   key_equals(k_start, k_len, "max_angle")) {
+            /* Take magnitude before degree-vs-radian threshold so negative angles and pi (3.1416)
+             * do not bypass conversion or get shrunk to ~0.055 rad. */
+            float ang = fabsf(val);
+            if (ang > WE_PI + 0.01f) {
+                ang = ang * (WE_PI / 180.0f);
+            }
+            ang = fminf(fmaxf(ang, 0.0f), WE_PI);
+            out_cfg->angle_limit_max_rad = ang;
+            out_cfg->angle_limit_min_rad = -ang;
+            out_cfg->flags |= (WE_BONE_PHYS_ENABLED | WE_BONE_PHYS_ANGULAR_LIMIT);
+            matched = true;
+        } else if (key_equals(k_start, k_len, "wind")) {
+            out_cfg->wind_drag_coeff = fminf(fmaxf(val, 0.0f), 100.0f);
+            out_cfg->flags |= WE_BONE_PHYS_ENABLED;
+            matched = true;
+        } else if (key_equals(k_start, k_len, "audio")) {
+            out_cfg->audio_drag_coeff = fminf(fmaxf(val, 0.0f), 100.0f);
+            out_cfg->flags |= WE_BONE_PHYS_ENABLED;
+            matched = true;
+        } else if (key_equals(k_start, k_len, "radius")) {
+            out_cfg->collision_radius_px = fminf(fmaxf(val, 1.0f), 10000.0f);
+            out_cfg->flags |= (WE_BONE_PHYS_ENABLED | WE_BONE_PHYS_CURSOR_COLLIDE);
+            matched = true;
+        }
+
+        p = after_val;
     }
 
     return matched;
@@ -303,6 +468,13 @@ static inline float sanitize_simplex_coord(float v)
         return 0.0f;
     }
     return fminf(fmaxf(v, -3.0e6f), 3.0e6f);
+}
+
+static inline int hash_grad12(uint32_t ui, uint32_t uj, uint32_t uk)
+{
+    /* Fast range reduction covers all 12 simplex gradients; bitmask & 11u skipped 4..7. */
+    uint32_t h = ui * 1664525u ^ uj * 1013904223u ^ uk * 2654435761u;
+    return (int)(((uint64_t)h * 12ULL) >> 32);
 }
 
 /* Clamps float lattice coordinates before int32_t conversion to prevent signed overflow UB
@@ -394,15 +566,10 @@ static inline float simplex3d_grad(float x_in, float y_in, float z_in, float *gx
     float rz[4] = {z0, z1, z2, z3};
 
     uint32_t ui = (uint32_t)i, uj = (uint32_t)j, uk = (uint32_t)k;
-    int gi[4] = {
-        (int)((ui * 1664525u ^ uj * 1013904223u ^ uk * 2654435761u) & 11u),
-        (int)(((ui + (uint32_t)i1) * 1664525u ^ (uj + (uint32_t)j1) * 1013904223u ^
-               (uk + (uint32_t)k1) * 2654435761u) &
-              11u),
-        (int)(((ui + (uint32_t)i2) * 1664525u ^ (uj + (uint32_t)j2) * 1013904223u ^
-               (uk + (uint32_t)k2) * 2654435761u) &
-              11u),
-        (int)(((ui + 1u) * 1664525u ^ (uj + 1u) * 1013904223u ^ (uk + 1u) * 2654435761u) & 11u)};
+    int gi[4] = {hash_grad12(ui, uj, uk),
+                 hash_grad12(ui + (uint32_t)i1, uj + (uint32_t)j1, uk + (uint32_t)k1),
+                 hash_grad12(ui + (uint32_t)i2, uj + (uint32_t)j2, uk + (uint32_t)k2),
+                 hash_grad12(ui + 1u, uj + 1u, uk + 1u)};
 
     static const float grad3[12][3] = {{1, 1, 0}, {-1, 1, 0}, {1, -1, 0}, {-1, -1, 0},
                                        {1, 0, 1}, {-1, 0, 1}, {1, 0, -1}, {-1, 0, -1},
@@ -441,18 +608,24 @@ static bool we_physics_has_avx2_fma(void)
     return ok;
 }
 
+__attribute__((target("avx2,fma"))) static inline __m256 sanitize_finite_zero_avx2(__m256 v)
+{
+    /* Zero NaN and +-Inf lanes so AVX2 matches scalar isfinite() sanitization. */
+    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 inf_val = _mm256_set1_ps(INFINITY);
+    __m256 is_fin = _mm256_cmp_ps(_mm256_and_ps(v, abs_mask), inf_val, _CMP_LT_OQ);
+    return _mm256_and_ps(is_fin, v);
+}
+
 __attribute__((target("avx2,fma"))) static inline void
 simplex3d_grad_avx2_8x(__m256 x_in, __m256 y_in, __m256 z_in, __m256 *out_gx, __m256 *out_gy,
                        __m256 *out_gz)
 {
     const __m256 min_c = _mm256_set1_ps(-3.0e6f);
     const __m256 max_c = _mm256_set1_ps(3.0e6f);
-    __m256 x = _mm256_min_ps(
-        _mm256_max_ps(_mm256_and_ps(_mm256_cmp_ps(x_in, x_in, _CMP_ORD_Q), x_in), min_c), max_c);
-    __m256 y = _mm256_min_ps(
-        _mm256_max_ps(_mm256_and_ps(_mm256_cmp_ps(y_in, y_in, _CMP_ORD_Q), y_in), min_c), max_c);
-    __m256 z = _mm256_min_ps(
-        _mm256_max_ps(_mm256_and_ps(_mm256_cmp_ps(z_in, z_in, _CMP_ORD_Q), z_in), min_c), max_c);
+    __m256 x = _mm256_min_ps(_mm256_max_ps(sanitize_finite_zero_avx2(x_in), min_c), max_c);
+    __m256 y = _mm256_min_ps(_mm256_max_ps(sanitize_finite_zero_avx2(y_in), min_c), max_c);
+    __m256 z = _mm256_min_ps(_mm256_max_ps(sanitize_finite_zero_avx2(z_in), min_c), max_c);
 
     const __m256 F3 = _mm256_set1_ps(0.333333333333f);
     const __m256 G3 = _mm256_set1_ps(0.166666666667f);
@@ -535,13 +708,14 @@ simplex3d_grad_avx2_8x(__m256 x_in, __m256 y_in, __m256 z_in, __m256 *out_gx, __
     const __m256i m1 = _mm256_set1_epi32((int32_t)1664525u);
     const __m256i m2 = _mm256_set1_epi32((int32_t)1013904223u);
     const __m256i m3 = _mm256_set1_epi32((int32_t)2654435761u);
-    const __m256i mask11 = _mm256_set1_epi32(11);
-    const __m256i mask3 = _mm256_set1_epi32(3);
-    const __m256i mask4 = _mm256_set1_epi32(4);
+    const __m256i c12_64 = _mm256_set1_epi64x(12LL);
+    const __m256i seven = _mm256_set1_epi32(7);
 
-    const __m256 lut_gx = _mm256_setr_ps(1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-    const __m256 lut_gy = _mm256_setr_ps(1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f);
-    const __m256 lut_gz = _mm256_setr_ps(0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, -1.0f, -1.0f);
+    const __m256 lut_lo_gx = _mm256_setr_ps(1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f);
+    const __m256 lut_lo_gy = _mm256_setr_ps(1.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    const __m256 lut_lo_gz = _mm256_setr_ps(0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, -1.0f, -1.0f);
+    const __m256 lut_hi_gy = _mm256_setr_ps(1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    const __m256 lut_hi_gz = _mm256_setr_ps(1.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 
     const __m256 c06 = _mm256_set1_ps(0.6f);
     const __m256 neg8 = _mm256_set1_ps(-8.0f);
@@ -558,13 +732,16 @@ simplex3d_grad_avx2_8x(__m256 x_in, __m256 y_in, __m256 z_in, __m256 *out_gx, __
         __m256i h = _mm256_xor_si256(
             _mm256_xor_si256(_mm256_mullo_epi32(ci[c], m1), _mm256_mullo_epi32(cj[c], m2)),
             _mm256_mullo_epi32(ck[c], m3));
-        __m256i gi = _mm256_and_si256(h, mask11);
-        __m256i idx8 = _mm256_or_si256(_mm256_and_si256(gi, mask3),
-                                       _mm256_and_si256(_mm256_srli_epi32(gi, 1), mask4));
+        __m256i even = _mm256_srli_epi64(_mm256_mul_epu32(h, c12_64), 32);
+        __m256i odd = _mm256_mul_epu32(_mm256_srli_epi64(h, 32), c12_64);
+        __m256i gi = _mm256_blend_epi32(even, odd, 0xAA);
+        __m256 is_hi = _mm256_castsi256_ps(_mm256_cmpgt_epi32(gi, seven));
 
-        __m256 gx_c = _mm256_permutevar8x32_ps(lut_gx, idx8);
-        __m256 gy_c = _mm256_permutevar8x32_ps(lut_gy, idx8);
-        __m256 gz_c = _mm256_permutevar8x32_ps(lut_gz, idx8);
+        __m256 gx_c = _mm256_andnot_ps(is_hi, _mm256_permutevar8x32_ps(lut_lo_gx, gi));
+        __m256 gy_c = _mm256_blendv_ps(_mm256_permutevar8x32_ps(lut_lo_gy, gi),
+                                       _mm256_permutevar8x32_ps(lut_hi_gy, gi), is_hi);
+        __m256 gz_c = _mm256_blendv_ps(_mm256_permutevar8x32_ps(lut_lo_gz, gi),
+                                       _mm256_permutevar8x32_ps(lut_hi_gz, gi), is_hi);
 
         __m256 gdot =
             _mm256_fmadd_ps(gx_c, rx[c], _mm256_fmadd_ps(gy_c, ry[c], _mm256_mul_ps(gz_c, rz[c])));
@@ -595,9 +772,9 @@ eval_curl_wind_3d_avx2_8x(const we_wind_field_t *wind, const float xs[8], const 
     float turb_gain = gust * (v_base * 0.5f + 40.0f);
 
     __m256 vscale = _mm256_set1_ps(scale);
-    __m256 xs_scaled = _mm256_mul_ps(_mm256_loadu_ps(xs), vscale);
-    __m256 sy = _mm256_mul_ps(_mm256_loadu_ps(ys), vscale);
-    __m256 zs_scaled = _mm256_mul_ps(_mm256_loadu_ps(zs), vscale);
+    __m256 xs_scaled = _mm256_mul_ps(sanitize_finite_zero_avx2(_mm256_loadu_ps(xs)), vscale);
+    __m256 sy = _mm256_mul_ps(sanitize_finite_zero_avx2(_mm256_loadu_ps(ys)), vscale);
+    __m256 zs_scaled = _mm256_mul_ps(sanitize_finite_zero_avx2(_mm256_loadu_ps(zs)), vscale);
 #if defined(__GNUC__) || defined(__clang__)
     __asm__("" : "+x"(xs_scaled), "+x"(zs_scaled));
 #endif
@@ -907,7 +1084,7 @@ void we_physics_init_from_puppet(we_puppet_physics_ctx_t *ctx, const we_puppet_t
             float dy = pivot[1] - pwb[13];
             float dz = pivot[2] - pwb[14];
             float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-            if (dist > 1.0f) {
+            if (dist > 1.0e-3f) {
                 tip_dir_world[0] = dx / dist;
                 tip_dir_world[1] = dy / dist;
                 tip_dir_world[2] = dz / dist;
@@ -923,11 +1100,40 @@ void we_physics_init_from_puppet(we_puppet_physics_ctx_t *ctx, const we_puppet_t
         }
         cfg->rest_length_px = rest_len;
 
-        /* Transform world tip direction to local rest direction via transpose of upper-left 3x3 of
-         * world_bind */
-        float rx = wb[0] * tip_dir_world[0] + wb[1] * tip_dir_world[1] + wb[2] * tip_dir_world[2];
-        float ry = wb[4] * tip_dir_world[0] + wb[5] * tip_dir_world[1] + wb[6] * tip_dir_world[2];
-        float rz = wb[8] * tip_dir_world[0] + wb[9] * tip_dir_world[1] + wb[10] * tip_dir_world[2];
+        /* Invert the upper-left 3x3 of column-major world_bind so non-uniform parent/bone scaling
+         * preserves the exact world rest direction when re-transformed by W * rest_dir_local. */
+        double a00 = (double)wb[0], a10 = (double)wb[1], a20 = (double)wb[2];
+        double a01 = (double)wb[4], a11 = (double)wb[5], a21 = (double)wb[6];
+        double a02 = (double)wb[8], a12 = (double)wb[9], a22 = (double)wb[10];
+        double c00 = a11 * a22 - a12 * a21;
+        double c10 = a02 * a21 - a01 * a22;
+        double c20 = a01 * a12 - a02 * a11;
+        double det = a00 * c00 + a10 * c10 + a20 * c20;
+        double norm2 = a00 * a00 + a10 * a10 + a20 * a20 + a01 * a01 + a11 * a11 + a21 * a21 +
+                       a02 * a02 + a12 * a12 + a22 * a22;
+        float rx, ry, rz;
+        if (isfinite(det) && fabs(det) > 1.0e-12 * sqrt(fmax(norm2, 1.0) * norm2 * norm2)) {
+            double c01 = a12 * a20 - a10 * a22;
+            double c11 = a00 * a22 - a02 * a20;
+            double c21 = a02 * a10 - a00 * a12;
+            double c02 = a10 * a21 - a11 * a20;
+            double c12 = a01 * a20 - a00 * a21;
+            double c22 = a00 * a11 - a01 * a10;
+            double inv_det = 1.0 / det;
+            rx =
+                (float)((c00 * tip_dir_world[0] + c10 * tip_dir_world[1] + c20 * tip_dir_world[2]) *
+                        inv_det);
+            ry =
+                (float)((c01 * tip_dir_world[0] + c11 * tip_dir_world[1] + c21 * tip_dir_world[2]) *
+                        inv_det);
+            rz =
+                (float)((c02 * tip_dir_world[0] + c12 * tip_dir_world[1] + c22 * tip_dir_world[2]) *
+                        inv_det);
+        } else {
+            rx = wb[0] * tip_dir_world[0] + wb[1] * tip_dir_world[1] + wb[2] * tip_dir_world[2];
+            ry = wb[4] * tip_dir_world[0] + wb[5] * tip_dir_world[1] + wb[6] * tip_dir_world[2];
+            rz = wb[8] * tip_dir_world[0] + wb[9] * tip_dir_world[1] + wb[10] * tip_dir_world[2];
+        }
         float rlen = sqrtf(rx * rx + ry * ry + rz * rz);
         if (rlen > 1e-5f) {
             ctx->rest_dir_local[k][0] = rx / rlen;
@@ -1107,6 +1313,67 @@ static inline void compute_bone_d0_and_tip(const we_puppet_physics_ctx_t *ctx, u
     out_tip_world[2] = pivot[2] + r_old[2];
 }
 
+static inline float phys_vec3_norm(float x, float y, float z)
+{
+    float s2 = x * x + y * y + z * z;
+    if (__builtin_expect(isfinite(s2), 1)) {
+        return sqrtf(s2);
+    }
+    /* Overflow-safe Euclidean norm fallback for large vectors during fuzzing. */
+    float m = fmaxf(fabsf(x), fmaxf(fabsf(y), fabsf(z)));
+    if (!isfinite(m) || m <= 0.0f) {
+        return 0.0f;
+    }
+    float inv_m = 1.0f / m;
+    float sx = x * inv_m, sy = y * inv_m, sz = z * inv_m;
+    return m * sqrtf(sx * sx + sy * sy + sz * sz);
+}
+
+static inline bool clamp_bone_cone_dir(const float d0[3], float cur_dir[3], float min_lim,
+                                       float max_lim)
+{
+    float vz_sign = d0[0] * cur_dir[1] - d0[1] * cur_dir[0];
+    float active_max = (vz_sign < 0.0f) ? (-min_lim) : max_lim;
+    if (active_max <= 1.0e-4f) {
+        cur_dir[0] = d0[0];
+        cur_dir[1] = d0[1];
+        cur_dir[2] = d0[2];
+        return true;
+    }
+    if (active_max >= WE_PI - 1.0e-4f) {
+        return false;
+    }
+    float cos_theta = cur_dir[0] * d0[0] + cur_dir[1] * d0[1] + cur_dir[2] * d0[2];
+    cos_theta = fminf(fmaxf(cos_theta, -1.0f), 1.0f);
+    float cos_max = cosf(active_max);
+    if (cos_theta >= cos_max) {
+        return false;
+    }
+    float ax = d0[1] * cur_dir[2] - d0[2] * cur_dir[1];
+    float ay = d0[2] * cur_dir[0] - d0[0] * cur_dir[2];
+    float az = d0[0] * cur_dir[1] - d0[1] * cur_dir[0];
+    float a_len = phys_vec3_norm(ax, ay, az);
+    if (a_len > 1e-5f) {
+        ax /= a_len;
+        ay /= a_len;
+        az /= a_len;
+    } else {
+        float u[3];
+        compute_orthogonal_unit_axis(d0, u);
+        ax = u[0];
+        ay = u[1];
+        az = u[2];
+    }
+    float bx = ay * d0[2] - az * d0[1];
+    float by = az * d0[0] - ax * d0[2];
+    float bz = ax * d0[1] - ay * d0[0];
+    float s_max = sinf(active_max);
+    cur_dir[0] = cos_max * d0[0] + s_max * bx;
+    cur_dir[1] = cos_max * d0[1] + s_max * by;
+    cur_dir[2] = cos_max * d0[2] + s_max * bz;
+    return true;
+}
+
 static void substep_bone_ex(we_puppet_physics_ctx_t *ctx, uint32_t k, const float pivot[3],
                             float W[16], float dt_s, double t, const float pre_wind_vel[3])
 {
@@ -1116,8 +1383,8 @@ static void substep_bone_ex(we_puppet_physics_ctx_t *ctx, uint32_t k, const floa
     if (!isfinite(pivot[0]) || !isfinite(pivot[1]) || !isfinite(pivot[2])) {
         return;
     }
-    if (dt_s > 0.05f) {
-        dt_s = 0.05f;
+    if (dt_s > 0.10f) {
+        dt_s = 0.10f;
     }
 
     we_bone_sim_config_t *cfg = &ctx->configs[k];
@@ -1149,28 +1416,23 @@ static void substep_bone_ex(we_puppet_physics_ctx_t *ctx, uint32_t k, const floa
 
     float g_force[3] = {grav_scale * gx_world * mass, grav_scale * gy_world * mass, 0.0f};
 
-    float f_wind[3] = {0.0f, 0.0f, 0.0f};
+    float wind_vel[3] = {0.0f, 0.0f, 0.0f};
     float wind_drag = (isfinite(cfg->wind_drag_coeff) && cfg->wind_drag_coeff > 0.0f)
                           ? cfg->wind_drag_coeff
                           : 0.0f;
-    if (ctx->wind.enabled && wind_drag > 0.0f) {
-        float wind_vel[3];
+    bool wind_active = (ctx->wind.enabled != 0u && wind_drag > 0.0f);
+    if (wind_active) {
         if (pre_wind_vel) {
-            wind_vel[0] = pre_wind_vel[0];
-            wind_vel[1] = pre_wind_vel[1];
-            wind_vel[2] = pre_wind_vel[2];
+            wind_vel[0] = isfinite(pre_wind_vel[0]) ? pre_wind_vel[0] : 0.0f;
+            wind_vel[1] = isfinite(pre_wind_vel[1]) ? pre_wind_vel[1] : 0.0f;
+            wind_vel[2] = isfinite(pre_wind_vel[2]) ? pre_wind_vel[2] : 0.0f;
         } else {
             we_physics_eval_curl_wind_3d(&ctx->wind, tip_world[0], tip_world[1], tip_world[2], t,
                                          wind_vel);
+            wind_vel[0] = isfinite(wind_vel[0]) ? wind_vel[0] : 0.0f;
+            wind_vel[1] = isfinite(wind_vel[1]) ? wind_vel[1] : 0.0f;
+            wind_vel[2] = isfinite(wind_vel[2]) ? wind_vel[2] : 0.0f;
         }
-        float rel_vx = wind_vel[0] - st->vel[0];
-        float rel_vy = wind_vel[1] - st->vel[1];
-        float rel_vz = wind_vel[2] - st->vel[2];
-        float rel_speed = sqrtf(rel_vx * rel_vx + rel_vy * rel_vy + rel_vz * rel_vz);
-        float drag = wind_drag * (rel_speed * 0.05f + 1.0f);
-        f_wind[0] = rel_vx * drag;
-        f_wind[1] = rel_vy * drag;
-        f_wind[2] = rel_vz * drag;
     }
 
     float f_cursor[3] = {0.0f, 0.0f, 0.0f};
@@ -1236,7 +1498,7 @@ static void substep_bone_ex(we_puppet_physics_ctx_t *ctx, uint32_t k, const floa
     if (isfinite(cfg->audio_drag_coeff) && cfg->audio_drag_coeff > 0.0f) {
         float bass = 0.0f;
         for (int b = 0; b < 8; b++) {
-            bass += ctx->audio_bands[b];
+            bass += isfinite(ctx->audio_bands[b]) ? ctx->audio_bands[b] : 0.0f;
         }
         bass *= 0.125f;
         float prev_bass = isfinite(ctx->prev_audio_bass) ? ctx->prev_audio_bass : 0.0f;
@@ -1246,82 +1508,21 @@ static void substep_bone_ex(we_puppet_physics_ctx_t *ctx, uint32_t k, const floa
         f_audio[1] = d0[0] * impulse;
     }
 
-    float f_ext[3] = {g_force[0] + f_wind[0] + f_cursor[0] + f_audio[0],
-                      g_force[1] + f_wind[1] + f_cursor[1] + f_audio[1],
-                      g_force[2] + f_wind[2] + f_cursor[2] + f_audio[2]};
+    float f_const[3] = {g_force[0] + f_cursor[0] + f_audio[0],
+                        g_force[1] + f_cursor[1] + f_audio[1],
+                        g_force[2] + f_cursor[2] + f_audio[2]};
 
     float damp_ratio =
         isfinite(cfg->damping_ratio) ? fminf(fmaxf(cfg->damping_ratio, 0.0f), 10.0f) : 0.15f;
-    float damp = expf(-damp_ratio * dt_s * 10.0f);
-    st->vel[0] = st->vel[0] * damp + dt_s * w * f_ext[0];
-    st->vel[1] = st->vel[1] * damp + dt_s * w * f_ext[1];
-    st->vel[2] = st->vel[2] * damp + dt_s * w * f_ext[2];
-
-    float r[3] = {r_old[0] + dt_s * st->vel[0], r_old[1] + dt_s * st->vel[1],
-                  r_old[2] + dt_s * st->vel[2]};
-
-    st->lambda_stretch = 0.0f;
-    st->lambda_bend = 0.0f;
-
     float comp_stretch = (isfinite(cfg->compliance_stretch) && cfg->compliance_stretch >= 0.0f)
                              ? cfg->compliance_stretch
                              : 0.0f;
     float comp_bend = (isfinite(cfg->compliance_bend) && cfg->compliance_bend >= 0.0f)
                           ? cfg->compliance_bend
                           : 0.0f;
-
-    float inv_dt2 = 1.0f / (dt_s * dt_s);
-    float alpha_tilde_dist = comp_stretch * inv_dt2;
-    float alpha_tilde_bend = comp_bend * inv_dt2;
-
     float rayleigh = (isfinite(cfg->rayleigh_damping) && cfg->rayleigh_damping > 0.0f)
                          ? cfg->rayleigh_damping
                          : (damp_ratio * 0.05f);
-    float gamma = alpha_tilde_bend * rayleigh * dt_s;
-
-    for (uint32_t iter = 0; iter < WE_PHYSICS_SOLVER_ITERS; iter++) {
-        float d_cur = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
-        if (d_cur > 1e-6f) {
-            float c_dist = d_cur - L;
-            float grad_dist[3] = {r[0] / d_cur, r[1] / d_cur, r[2] / d_cur};
-            float dlambda_dist =
-                (-c_dist - alpha_tilde_dist * st->lambda_stretch) / (w + alpha_tilde_dist);
-            st->lambda_stretch += dlambda_dist;
-            r[0] += w * dlambda_dist * grad_dist[0];
-            r[1] += w * dlambda_dist * grad_dist[1];
-            r[2] += w * dlambda_dist * grad_dist[2];
-        }
-
-        float target_r[3] = {d0[0] * L, d0[1] * L, d0[2] * L};
-        float sx = r[0] - target_r[0];
-        float sy = r[1] - target_r[1];
-        float sz = r[2] - target_r[2];
-        float d_spring = sqrtf(sx * sx + sy * sy + sz * sz);
-        if (d_spring > 1e-6f) {
-            float grad_spring[3] = {sx / d_spring, sy / d_spring, sz / d_spring};
-            float v_proj = grad_spring[0] * (r[0] - r_old[0]) + grad_spring[1] * (r[1] - r_old[1]) +
-                           grad_spring[2] * (r[2] - r_old[2]);
-            float denom = (1.0f + gamma) * w + alpha_tilde_bend;
-            float dlambda_bend =
-                (-d_spring - alpha_tilde_bend * st->lambda_bend - gamma * v_proj) / denom;
-            st->lambda_bend += dlambda_bend;
-            r[0] += w * dlambda_bend * grad_spring[0];
-            r[1] += w * dlambda_bend * grad_spring[1];
-            r[2] += w * dlambda_bend * grad_spring[2];
-        }
-    }
-
-    float cur_len = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
-    float cur_dir[3];
-    if (isfinite(cur_len) && cur_len > 1e-5f) {
-        cur_dir[0] = r[0] / cur_len;
-        cur_dir[1] = r[1] / cur_len;
-        cur_dir[2] = r[2] / cur_len;
-    } else {
-        cur_dir[0] = d0[0];
-        cur_dir[1] = d0[1];
-        cur_dir[2] = d0[2];
-    }
 
     float min_lim = isfinite(cfg->angle_limit_min_rad)
                         ? fminf(fmaxf(cfg->angle_limit_min_rad, -WE_PI), 0.0f)
@@ -1336,51 +1537,172 @@ static void substep_bone_ex(we_puppet_physics_ctx_t *ctx, uint32_t k, const floa
         min_lim = -1.04719755f;
     }
 
-    if (has_ang_limit) {
-        float vz_sign = d0[0] * cur_dir[1] - d0[1] * cur_dir[0];
-        float active_max = (vz_sign < 0.0f) ? (-min_lim) : max_lim;
-        if (active_max <= 1.0e-4f) {
-            cur_dir[0] = d0[0];
-            cur_dir[1] = d0[1];
-            cur_dir[2] = d0[2];
-        } else if (active_max < WE_PI - 1.0e-4f) {
-            float cos_theta = cur_dir[0] * d0[0] + cur_dir[1] * d0[1] + cur_dir[2] * d0[2];
-            cos_theta = fminf(fmaxf(cos_theta, -1.0f), 1.0f);
-            float cos_max = cosf(active_max);
-            if (cos_theta < cos_max) {
-                float ax = d0[1] * cur_dir[2] - d0[2] * cur_dir[1];
-                float ay = d0[2] * cur_dir[0] - d0[0] * cur_dir[2];
-                float az = d0[0] * cur_dir[1] - d0[1] * cur_dir[0];
-                float a_len = sqrtf(ax * ax + ay * ay + az * az);
-                if (a_len > 1e-5f) {
-                    ax /= a_len;
-                    ay /= a_len;
-                    az /= a_len;
-                } else {
-                    float u[3];
-                    compute_orthogonal_unit_axis(d0, u);
-                    ax = u[0];
-                    ay = u[1];
-                    az = u[2];
+    /* Macklin et al. (2019) Small-Steps XPBD: N=4+ substeps with 1 Gauss-Seidel solve each
+     * delivers higher effective stiffness and stability at equal sqrt cost, with analytical
+     * exponential Bernoulli drag preventing explicit Euler wind overshoot on light bones. */
+    uint32_t sub_n = WE_PHYSICS_SMALL_STEPS;
+    bool coarse_step = (dt_s > 1.25f * WE_PHYSICS_SUBSTEP_DT);
+    if (coarse_step) {
+        uint32_t needed =
+            (uint32_t)ceilf(dt_s / (WE_PHYSICS_SUBSTEP_DT / (float)WE_PHYSICS_SMALL_STEPS));
+        if (needed > sub_n) {
+            sub_n = (needed <= 48u) ? needed : 48u;
+        }
+    }
+
+    float h = dt_s / (float)sub_n;
+    float inv_h = 1.0f / h;
+    float h_w = h * w;
+    float inv_h2 = inv_h * inv_h;
+    float alpha_tilde_dist = comp_stretch * inv_h2;
+    float alpha_tilde_bend = comp_bend * inv_h2;
+    float gamma = alpha_tilde_bend * rayleigh * h;
+    float damp_h = expf(-damp_ratio * h * 10.0f);
+    float wind_e =
+        wind_active ? expf(-fminf(w * wind_drag * (coarse_step ? h : dt_s), 40.0f)) : 1.0f;
+    float target_r[3] = {d0[0] * L, d0[1] * L, d0[2] * L};
+
+    float r[3] = {r_old[0], r_old[1], r_old[2]};
+    float vx = st->vel[0];
+    float vy = st->vel[1];
+    float vz = st->vel[2];
+    if (wind_active && !coarse_step) {
+        /* Continuous-time Bernoulli wind flow over fine substeps avoids 4x redundant norms. */
+        float rvx = wind_vel[0] - vx;
+        float rvy = wind_vel[1] - vy;
+        float rvz = wind_vel[2] - vz;
+        float rel_speed = phys_vec3_norm(rvx, rvy, rvz);
+        float decay = wind_e / (1.0f + 0.05f * rel_speed * (1.0f - wind_e));
+        float blend = 1.0f - decay;
+        vx += rvx * blend;
+        vy += rvy * blend;
+        vz += rvz * blend;
+    }
+    float last_lambda_dist = 0.0f;
+    float last_lambda_bend = 0.0f;
+
+    for (uint32_t s = 0; s < sub_n; s++) {
+        vx = vx * damp_h + h_w * f_const[0];
+        vy = vy * damp_h + h_w * f_const[1];
+        vz = vz * damp_h + h_w * f_const[2];
+
+        if (wind_active && coarse_step) {
+            float rvx = wind_vel[0] - vx;
+            float rvy = wind_vel[1] - vy;
+            float rvz = wind_vel[2] - vz;
+            float rel_speed = phys_vec3_norm(rvx, rvy, rvz);
+            float decay = wind_e / (1.0f + 0.05f * rel_speed * (1.0f - wind_e));
+            float blend = 1.0f - decay;
+            vx += rvx * blend;
+            vy += rvy * blend;
+            vz += rvz * blend;
+        }
+
+        float r_start[3] = {r[0], r[1], r[2]};
+        r[0] += h * vx;
+        r[1] += h * vy;
+        r[2] += h * vz;
+
+        last_lambda_dist = 0.0f;
+        last_lambda_bend = 0.0f;
+
+        float d_cur = phys_vec3_norm(r[0], r[1], r[2]);
+        if (d_cur > 1e-6f) {
+            float c_dist = d_cur - L;
+            float inv_d = 1.0f / d_cur;
+            float gx = r[0] * inv_d, gy = r[1] * inv_d, gz = r[2] * inv_d;
+            float dlambda_dist = (-c_dist) / (w + alpha_tilde_dist);
+            last_lambda_dist = dlambda_dist;
+            r[0] += w * dlambda_dist * gx;
+            r[1] += w * dlambda_dist * gy;
+            r[2] += w * dlambda_dist * gz;
+        }
+
+        float sx = r[0] - target_r[0];
+        float sy = r[1] - target_r[1];
+        float sz = r[2] - target_r[2];
+        float d_spring = phys_vec3_norm(sx, sy, sz);
+        if (d_spring > 1e-6f) {
+            float inv_s = 1.0f / d_spring;
+            float gsx = sx * inv_s, gsy = sy * inv_s, gsz = sz * inv_s;
+            float v_proj =
+                gsx * (r[0] - r_start[0]) + gsy * (r[1] - r_start[1]) + gsz * (r[2] - r_start[2]);
+            float denom = (1.0f + gamma) * w + alpha_tilde_bend;
+            float dlambda_bend = (-d_spring - gamma * v_proj) / denom;
+            last_lambda_bend = dlambda_bend;
+            r[0] += w * dlambda_bend * gsx;
+            r[1] += w * dlambda_bend * gsy;
+            r[2] += w * dlambda_bend * gsz;
+        }
+
+        float r_pre_x = r[0], r_pre_y = r[1], r_pre_z = r[2];
+        vx = (r_pre_x - r_start[0]) * inv_h;
+        vy = (r_pre_y - r_start[1]) * inv_h;
+        vz = (r_pre_z - r_start[2]) * inv_h;
+
+        if (has_ang_limit) {
+            float l_sub = phys_vec3_norm(r[0], r[1], r[2]);
+            float dir_sub[3];
+            if (isfinite(l_sub) && l_sub > 1e-5f) {
+                float inv_l = 1.0f / l_sub;
+                dir_sub[0] = r[0] * inv_l;
+                dir_sub[1] = r[1] * inv_l;
+                dir_sub[2] = r[2] * inv_l;
+            } else {
+                dir_sub[0] = d0[0];
+                dir_sub[1] = d0[1];
+                dir_sub[2] = d0[2];
+                l_sub = L;
+            }
+            if (clamp_bone_cone_dir(d0, dir_sub, min_lim, max_lim)) {
+                r[0] = dir_sub[0] * l_sub;
+                r[1] = dir_sub[1] * l_sub;
+                r[2] = dir_sub[2] * l_sub;
+                /* Project out only outward velocity into the cone wall; never inject teleport
+                 * energy from snapping an out-of-cone pose back to the limit. */
+                float nx = r[0] - r_pre_x;
+                float ny = r[1] - r_pre_y;
+                float nz = r[2] - r_pre_z;
+                float nlen = phys_vec3_norm(nx, ny, nz);
+                if (nlen > 1e-6f) {
+                    float inv_n = 1.0f / nlen;
+                    nx *= inv_n;
+                    ny *= inv_n;
+                    nz *= inv_n;
+                    float vn = vx * nx + vy * ny + vz * nz;
+                    if (vn < 0.0f) {
+                        vx -= vn * nx;
+                        vy -= vn * ny;
+                        vz -= vn * nz;
+                    }
                 }
-                float bx = ay * d0[2] - az * d0[1];
-                float by = az * d0[0] - ax * d0[2];
-                float bz = ax * d0[1] - ay * d0[0];
-                float s_max = sinf(active_max);
-                cur_dir[0] = cos_max * d0[0] + s_max * bx;
-                cur_dir[1] = cos_max * d0[1] + s_max * by;
-                cur_dir[2] = cos_max * d0[2] + s_max * bz;
             }
         }
+    }
+
+    st->lambda_stretch = last_lambda_dist;
+    st->lambda_bend = last_lambda_bend;
+
+    float cur_len = phys_vec3_norm(r[0], r[1], r[2]);
+    float cur_dir[3];
+    if (isfinite(cur_len) && cur_len > 1e-5f) {
+        float inv_l = 1.0f / cur_len;
+        cur_dir[0] = r[0] * inv_l;
+        cur_dir[1] = r[1] * inv_l;
+        cur_dir[2] = r[2] * inv_l;
+    } else {
+        cur_dir[0] = d0[0];
+        cur_dir[1] = d0[1];
+        cur_dir[2] = d0[2];
     }
 
     r[0] = cur_dir[0] * L;
     r[1] = cur_dir[1] * L;
     r[2] = cur_dir[2] * L;
 
-    st->vel[0] = (r[0] - r_old[0]) / dt_s;
-    st->vel[1] = (r[1] - r_old[1]) / dt_s;
-    st->vel[2] = (r[2] - r_old[2]) / dt_s;
+    st->vel[0] = vx;
+    st->vel[1] = vy;
+    st->vel[2] = vz;
 
     st->pos_prev[0] = pivot[0] + r_old[0];
     st->pos_prev[1] = pivot[1] + r_old[1];

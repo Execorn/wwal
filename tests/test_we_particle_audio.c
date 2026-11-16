@@ -39,7 +39,10 @@ static void test_abi_contracts(void)
     assert(sizeof(we_particle_ramp_lut_t) == 1056u);
     assert(sizeof(we_particle_preset_desc_t) == 112u);
     assert(sizeof(we_audio_binding_t) == 160u);
-    printf("[PASS] ABI struct static_assert sizes (24/16/1056/112/160 bytes)\n");
+    assert(sizeof(we_particle_instance_t) == 24u);
+    assert(WE_PARTICLE_MAX_CAP >= 100000u);
+    printf("[PASS] ABI struct static_assert sizes (24/16/1056/112/160/24 bytes, max_cap=%u)\n",
+           WE_PARTICLE_MAX_CAP);
 }
 
 static void test_fritsch_carlson_and_oklab_luts(void)
@@ -769,6 +772,357 @@ static void test_particle_remediation_regressions(void)
         "GL state)\n");
 }
 
+static bool strict_perf_gates_enabled(void)
+{
+#ifdef WWAL_PERF_GATES
+    return true;
+#else
+    const char *env = getenv("WWAL_STRICT_PERF_ASSERTS");
+    return env != NULL && env[0] == '1';
+#endif
+}
+
+static void test_particle_validation_and_avx2_parity(void)
+{
+    /* 1. Inverted BOXRANDOM ranges, negative lifetime/starttime, additive blending,
+     * drag clamping, and invalid out-of-range operator_index rejection */
+    static const char *audit_json =
+        "{"
+        "\"maxcount\": 256,"
+        "\"starttime\": -5.0,"
+        "\"blending\": \"additive\","
+        "\"emitter\": [{\"name\": \"boxrandom\", \"origin\": [0, 0, 0], "
+        "\"distancemin\": [50, 20, 0], \"distancemax\": [10, 5, 0], \"rate\": 0}],"
+        "\"initializer\": ["
+        "  {\"name\": \"lifetimerandom\", \"min\": -3.0, \"max\": -1.0},"
+        "  {\"name\": \"sizerandom\", \"min\": 24.0, \"max\": 8.0}"
+        "],"
+        "\"operator\": ["
+        "  {\"name\": \"movement\", \"drag\": -500.0, \"gravity\": [0, 10, 0]},"
+        "  {\"name\": \"controlpointattract\", \"scale\": 75.0, \"distanceinner\": 100.0, "
+        "\"distanceouter\": 20.0}"
+        "]"
+        "}";
+    we_particle_sys_t *sys = we_particle_create_from_json(audit_json, strlen(audit_json));
+    assert(sys != NULL);
+    assert(sys->start_time == 0.0f);
+    assert(sys->preset_blending == 1u);
+    assert(sys->initializers[0].min_val[0] >= 0.001f);
+    assert(sys->initializers[0].max_val[0] >= sys->initializers[0].min_val[0]);
+    assert(sys->initializers[1].min_val[0] <= sys->initializers[1].max_val[0]);
+    assert(sys->operators[0].drag >= -10.0f && sys->operators[0].drag <= 100.0f);
+    assert(sys->operators[1].type == WE_OP_CONTROL_POINT_ATTRACT);
+    assert(sys->operators[1].distance_inner <= sys->operators[1].distance_outer);
+
+    /* Out-of-range non-sentinel operator_index must fail cleanly without appending operators */
+    uint32_t prev_ops = sys->operator_count;
+    we_particle_ramp_lut_t bad_lut;
+    memset(&bad_lut, 0, sizeof(bad_lut));
+    bad_lut.operator_index = 99u;
+    bad_lut.channel_kind = 0u;
+    for (uint32_t k = 0; k < WE_PARTICLE_RAMP_SAMPLES; ++k) {
+        bad_lut.scalar_lut[k] = 1.0f;
+    }
+    assert(!we_particle_apply_ramp_lut(sys, &bad_lut));
+    assert(sys->operator_count == prev_ops);
+
+    we_particle_trigger_burst(sys, 64u);
+    assert(sys->alive_count == 64u);
+    for (uint32_t i = 0; i < sys->alive_count; ++i) {
+        assert(sys->pos_x[i] >= 10.0f - 1e-3f && sys->pos_x[i] <= 50.0f + 1e-3f);
+        assert(sys->pos_y[i] >= 5.0f - 1e-3f && sys->pos_y[i] <= 20.0f + 1e-3f);
+        assert(sys->max_life[i] >= 0.001f);
+    }
+
+    /* Extreme negative drag mutated directly on struct must still stay finite across dt=0.25s */
+    sys->operators[0].drag = -500.0f;
+    for (uint32_t i = 0; i < sys->alive_count; ++i) {
+        sys->max_life[i] = 100.0f;
+        sys->vel_y[i] = 10.0f;
+    }
+    we_particle_update(sys, 0.25f);
+    for (uint32_t i = 0; i < sys->alive_count; ++i) {
+        assert(isfinite(sys->vel_y[i]) && isfinite(sys->pos_y[i]));
+    }
+    we_particle_destroy(sys);
+
+    /* 2. AVX2 range-reduction parity for vsin/vcos beyond |x| >= 8192 + 24B instance packing */
+    static const char *trig_json =
+        "{"
+        "\"maxcount\": 32,"
+        "\"operator\": [{\"name\": \"oscillateposition\", \"frequencymin\": 2.0, "
+        "\"frequencymax\": 2.0, \"scalemin\": 10.0, \"scalemax\": 10.0, \"mask\": [1, 0, 0]}]"
+        "}";
+    we_particle_sys_t *trig_sys = we_particle_create_from_json(trig_json, strlen(trig_json));
+    assert(trig_sys != NULL);
+    we_particle_trigger_burst(trig_sys, 16u);
+    float ages[16] = {0.0f,   1.5f,    100.25f,  4500.125f, 9200.75f, 25000.5f, -9500.25f, 3.14159f,
+                      0.125f, 6000.0f, 15000.0f, -20000.0f, 8192.5f,  8191.5f,  42.0f,     1.0f};
+    for (uint32_t i = 0; i < 16u; ++i) {
+        trig_sys->age[i] = ages[i];
+        trig_sys->max_life[i] = 1.0e6f;
+        trig_sys->pos_x[i] = 0.0f;
+        trig_sys->rng_phase[i] = 0.5f;
+        trig_sys->rot_z[i] = ages[i];
+    }
+    float dt = 0.05f;
+    we_particle_update(trig_sys, dt);
+    for (uint32_t i = 0; i < 16u; ++i) {
+        double p0 = (double)ages[i] * 2.0 + 0.5;
+        double p1 = p0 + (double)dt * 2.0;
+        float expected_x = 10.0f * (sinf((float)p1) - sinf((float)p0));
+        assert(isfinite(trig_sys->pos_x[i]));
+        assert(fabsf(trig_sys->pos_x[i] - expected_x) <= 1e-4f);
+    }
+
+    we_particle_instance_t *insts = NULL;
+    uint32_t icnt = we_particle_build_instances(trig_sys, &insts);
+    assert(icnt == 16u && insts != NULL);
+    for (uint32_t i = 0; i < icnt; ++i) {
+        assert(isfinite(insts[i].pos[0]) && isfinite(insts[i].size));
+        assert(insts[i].frame_u16 == 256u);
+    }
+    we_particle_destroy(trig_sys);
+
+    /* 3. Non-owning GL context teardown guard */
+    particle_headless_gl_t gl1, gl2;
+    if (init_particle_headless_gl(&gl1)) {
+        we_particle_sys_t *owned = we_particle_create_preset(WE_PARTICLE_PRESET_EMBERS, false);
+        assert(owned != NULL);
+        we_particle_trigger_burst(owned, 32u);
+        assert(we_particle_upload_gl(owned));
+        assert(owned->gl_owner_ctx == (void *)gl1.ctx);
+
+        if (init_particle_headless_gl(&gl2)) {
+            /* Current context is now gl2; draw must ignore foreign owner, destroy must not glDelete
+             * on gl2 */
+            we_particle_draw_gl(owned, 0u);
+            assert(glGetError() == GL_NO_ERROR);
+            we_particle_destroy(owned);
+            assert(glGetError() == GL_NO_ERROR);
+            destroy_particle_headless_gl(&gl2);
+        } else {
+            eglMakeCurrent(gl1.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            we_particle_destroy(owned);
+        }
+        destroy_particle_headless_gl(&gl1);
+    }
+
+    printf("[PASS] particle validation guards, AVX2 >8192 trig parity & GL owner isolation\n");
+}
+
+static void test_100k_particle_cpu_and_gpu_slos(void)
+{
+    enum { N100K = 100000u };
+
+    /* 1. CPU 100k AVX2 update + 24 B/particle instance build SLO (<= 0.75 ms) */
+    we_particle_sys_t *cpu_sys = we_particle_create_preset(WE_PARTICLE_PRESET_STARFIELD, false);
+    assert(cpu_sys != NULL);
+    assert(we_particle_realloc_capacity(cpu_sys, N100K));
+
+    we_particle_ramp_lut_t alpha_lut;
+    memset(&alpha_lut, 0, sizeof(alpha_lut));
+    alpha_lut.operator_index = UINT32_MAX;
+    alpha_lut.channel_kind = 0u;
+    alpha_lut.knot_count = 3u;
+    we_particle_curve_knot_t ak[3] = {
+        {.t = 0.0f, .y = 0.1f, .mode = WE_KNOT_HANDLE_AUTO_SMOOTH},
+        {.t = 0.5f, .y = 1.0f, .mode = WE_KNOT_HANDLE_AUTO_SMOOTH},
+        {.t = 1.0f, .y = 0.0f, .mode = WE_KNOT_HANDLE_AUTO_SMOOTH},
+    };
+    assert(we_particle_bake_scalar_lut(ak, 3u, alpha_lut.scalar_lut));
+    assert(we_particle_apply_ramp_lut(cpu_sys, &alpha_lut));
+
+    we_particle_trigger_burst(cpu_sys, N100K);
+    assert(cpu_sys->alive_count == N100K);
+    for (uint32_t i = 0; i < N100K; ++i) {
+        cpu_sys->max_life[i] = 100.0f;
+        cpu_sys->age[i] = 10.0f;
+    }
+
+    we_particle_instance_t *insts = NULL;
+    for (int w = 0; w < 5; ++w) {
+        we_particle_update(cpu_sys, 0.016f);
+        assert(we_particle_build_instances(cpu_sys, &insts) == N100K);
+    }
+
+    double best_cpu_ms = 1e9;
+    for (int trial = 0; trial < 3; ++trial) {
+        uint64_t t0 = now_ns();
+        for (int f = 0; f < 40; ++f) {
+            we_particle_update(cpu_sys, 0.016f);
+            uint32_t built = we_particle_build_instances(cpu_sys, &insts);
+            assert(built == N100K);
+        }
+        uint64_t t1 = now_ns();
+        double ms = (double)(t1 - t0) / (40.0 * 1e6);
+        if (ms < best_cpu_ms) {
+            best_cpu_ms = ms;
+        }
+    }
+    printf("[PERF] 100k CPU (we_particle_update + 24B build_instances): %.3f ms/frame "
+           "(budget: <= 0.750 ms)\n",
+           best_cpu_ms);
+    if (strict_perf_gates_enabled()) {
+        assert(best_cpu_ms <= 0.75 && "100k CPU particle update+build exceeded 0.75 ms SLO");
+    }
+    we_particle_destroy(cpu_sys);
+
+    /* 2. GPU GLES 3.1 compute ping-pong SSBO + glDrawArraysIndirect 100k SLO (<= 0.20 ms) */
+    particle_headless_gl_t gl;
+    if (init_particle_headless_gl(&gl)) {
+        GLuint fbo = 0, rtex = 0, ptex = 0;
+        glGenFramebuffers(1, &fbo);
+        glGenTextures(1, &rtex);
+        glBindTexture(GL_TEXTURE_2D, rtex);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 64, 64);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rtex, 0);
+        glViewport(0, 0, 64, 64);
+
+        static const uint8_t white_px[4] = {255, 255, 255, 255};
+        glGenTextures(1, &ptex);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, ptex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white_px);
+
+        /* Correctness check: GPU compute step updates positions and syncs cleanly to CPU */
+        we_particle_sys_t *chk = we_particle_create_preset(WE_PARTICLE_PRESET_RAIN, false);
+        assert(chk != NULL);
+        chk->emitters[0].rate = 0.0f;
+        we_particle_trigger_burst(chk, 32u);
+        for (uint32_t i = 0; i < chk->alive_count; ++i) {
+            chk->pos_y[i] = 500.0f;
+            chk->vel_y[i] = 0.0f;
+            chk->max_life[i] = 10.0f;
+        }
+        assert(we_particle_step_gpu(chk, 0.05f));
+        assert(we_particle_gpu_sync_to_cpu(chk));
+        assert(chk->alive_count == 32u);
+        for (uint32_t i = 0; i < chk->alive_count; ++i) {
+            assert(isfinite(chk->pos_y[i]) && chk->pos_y[i] < 500.0f);
+        }
+        we_particle_destroy(chk);
+
+        /* 100k GPU compute + indirect draw benchmark using realistic 1920x1080 ortho shader */
+        static const char *scene_vs =
+            "#version 310 es\n"
+            "layout(location = 0) in vec3 a_Position;\n"
+            "layout(location = 1) in vec2 a_TexCoord;\n"
+            "layout(location = 2) in vec4 a_Color;\n"
+            "uniform mat4 g_ModelViewProjectionMatrix;\n"
+            "uniform vec2 g_Texture0Translation;\n"
+            "uniform vec4 g_Texture0Rotation;\n"
+            "out vec2 v_TexCoord;\n"
+            "out vec4 v_Color;\n"
+            "void main() {\n"
+            "    gl_Position = g_ModelViewProjectionMatrix * vec4(a_Position, 1.0);\n"
+            "    v_TexCoord = g_Texture0Translation + a_TexCoord.x * g_Texture0Rotation.xy + "
+            "a_TexCoord.y * g_Texture0Rotation.zw;\n"
+            "    v_Color = a_Color;\n"
+            "}\n";
+        static const char *scene_fs =
+            "#version 310 es\n"
+            "precision highp float;\n"
+            "in vec2 v_TexCoord;\n"
+            "in vec4 v_Color;\n"
+            "uniform sampler2D g_Texture0;\n"
+            "uniform vec4 g_Color4;\n"
+            "out vec4 fragColor;\n"
+            "void main() { fragColor = texture(g_Texture0, v_TexCoord) * v_Color * g_Color4; }\n";
+        GLuint svs = glCreateShader(GL_VERTEX_SHADER);
+        GLuint sfs = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(svs, 1, &scene_vs, NULL);
+        glShaderSource(sfs, 1, &scene_fs, NULL);
+        glCompileShader(svs);
+        glCompileShader(sfs);
+        GLuint scene_prog = glCreateProgram();
+        glAttachShader(scene_prog, svs);
+        glAttachShader(scene_prog, sfs);
+        glLinkProgram(scene_prog);
+        glDeleteShader(svs);
+        glDeleteShader(sfs);
+
+        /* Column-major orthographic 1920x1080 -> NDC [-1, 1] */
+        const float ortho_mvp[16] = {
+            2.0f / 1920.0f, 0,     0, 0,   0, 2.0f / 1080.0f, 0, 0, 0, 0, -1.0f, 0,
+            -1.0f,          -1.0f, 0, 1.0f};
+        glUseProgram(scene_prog);
+        glUniformMatrix4fv(glGetUniformLocation(scene_prog, "g_ModelViewProjectionMatrix"), 1,
+                           GL_FALSE, ortho_mvp);
+        glUniform4f(glGetUniformLocation(scene_prog, "g_Color4"), 1, 1, 1, 1);
+        glUniform2f(glGetUniformLocation(scene_prog, "g_Texture0Translation"), 0, 0);
+        glUniform4f(glGetUniformLocation(scene_prog, "g_Texture0Rotation"), 1, 0, 0, 1);
+        glUniform1i(glGetUniformLocation(scene_prog, "g_Texture0"), 0);
+
+        we_particle_sys_t *gpu_sys = we_particle_create_preset(WE_PARTICLE_PRESET_STARFIELD, false);
+        assert(gpu_sys != NULL);
+        assert(we_particle_realloc_capacity(gpu_sys, N100K));
+        assert(we_particle_apply_ramp_lut(gpu_sys, &alpha_lut));
+        we_particle_trigger_burst(gpu_sys, N100K);
+        for (uint32_t i = 0; i < N100K; ++i) {
+            gpu_sys->max_life[i] = 100.0f;
+            gpu_sys->age[i] = 10.0f;
+        }
+
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        assert(we_particle_step_gpu(gpu_sys, 0.016f));
+        we_particle_draw_gl(gpu_sys, scene_prog);
+        uint8_t center_px[64 * 4] = {0};
+        glReadPixels(28, 28, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, center_px);
+        assert(glGetError() == GL_NO_ERROR);
+        bool any_lit = false;
+        for (size_t k = 0; k < sizeof(center_px); k += 4u) {
+            if (center_px[k] != 0u || center_px[k + 1u] != 0u || center_px[k + 2u] != 0u ||
+                center_px[k + 3u] != 0u) {
+                any_lit = true;
+                break;
+            }
+        }
+        assert(any_lit && "glDrawElementsIndirect must rasterize non-zero particle pixels");
+        for (int w = 0; w < 10; ++w) {
+            assert(we_particle_step_gpu(gpu_sys, 0.016f));
+            we_particle_draw_gl(gpu_sys, scene_prog);
+        }
+        glFinish();
+
+        double best_gpu_ms = 1e9;
+        for (int trial = 0; trial < 3; ++trial) {
+            uint64_t t0 = now_ns();
+            for (int f = 0; f < 60; ++f) {
+                assert(we_particle_step_gpu(gpu_sys, 0.016f));
+                we_particle_draw_gl(gpu_sys, scene_prog);
+            }
+            glFinish();
+            uint64_t t1 = now_ns();
+            double ms = (double)(t1 - t0) / (60.0 * 1e6);
+            if (ms < best_gpu_ms) {
+                best_gpu_ms = ms;
+            }
+        }
+        printf("[PERF] 100k GPU (GLES 3.1 compute ping-pong SSBO + glDrawElementsIndirect): "
+               "%.3f ms/frame (budget: <= 0.200 ms)\n",
+               best_gpu_ms);
+        if (strict_perf_gates_enabled()) {
+            assert(best_gpu_ms <= 0.20 &&
+                   "100k GPU compute SSBO + indirect draw exceeded 0.20 ms SLO");
+        }
+
+        glDeleteProgram(scene_prog);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteTextures(1, &ptex);
+        glDeleteTextures(1, &rtex);
+        glDeleteFramebuffers(1, &fbo);
+        we_particle_destroy(gpu_sys);
+        destroy_particle_headless_gl(&gl);
+    }
+}
+
 int main(void)
 {
     test_abi_contracts();
@@ -777,6 +1131,8 @@ int main(void)
     test_audio_bindings();
     test_scenescript_linter();
     test_particle_remediation_regressions();
+    test_particle_validation_and_avx2_parity();
+    test_100k_particle_cpu_and_gpu_slos();
     printf("ALL p4-particle-audio-core TESTS PASSED\n");
     return 0;
 }

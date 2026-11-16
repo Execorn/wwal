@@ -103,7 +103,9 @@ static_assert(sizeof(we_particle_preset_desc_t) == 112,
 extern "C" {
 #endif
 
-#define WE_PARTICLE_MAX_CAP          16384u
+#ifndef WE_PARTICLE_MAX_CAP
+#define WE_PARTICLE_MAX_CAP 131072u
+#endif
 #define WE_PARTICLE_DEFAULT_CAP      256u
 #define WE_PARTICLE_SOA_ARRAYS       31u
 #define WE_PARTICLE_MAX_EMITTERS     8u
@@ -219,6 +221,17 @@ typedef struct {
     float color[4];
 } we_particle_vertex_t;
 
+/* Compact 24 B per-particle instance attribute record for GLES 3.1 instanced / SSBO paths. */
+typedef struct {
+    float pos[3];
+    float size;
+    uint32_t color_u32; /* Packed R8G8B8A8 normalized unorm */
+    uint16_t rot_u16;   /* Rotation Z quantized over [0, 2*pi) */
+    uint16_t frame_u16; /* Q8.8 trail stretch multiplier (256 = 1.0x) */
+} we_particle_instance_t;
+static_assert(sizeof(we_particle_instance_t) == 24,
+              "we_particle_instance_t must be exactly 24 bytes");
+
 typedef struct we_particle_sys {
     uint32_t max_count;
     uint32_t padded_cap;
@@ -298,6 +311,29 @@ typedef struct we_particle_sys {
     bool gl_uploaded;
     bool paused;
     uint32_t preset_blending;
+
+    /* Compact 24 B/particle instance buffer (CPU AVX2 build_instances & instanced upload) */
+    we_particle_instance_t *inst_buf;
+    uint32_t inst_cap;
+    uint32_t inst_count;
+
+    /* GLES 3.1 compute ping-pong SSBO + indirect/instanced draw resources */
+    void *gl_owner_ctx;
+    uint32_t gl_inst_vao;
+    uint32_t gl_inst_vbo;
+    uint32_t gl_ssbo[2];
+    uint32_t gl_indirect_bo;
+    uint32_t gl_op_ssbo;
+    uint32_t gl_ssbo_cap;
+    uint32_t gl_pending_burst;
+    uint32_t cpu_channel_dirty;
+    uint64_t gl_cfg_hash;
+    uint32_t gl_work_bound;
+    uint8_t gl_ping_pong;
+    uint8_t gl_indirect_idx;
+    bool gl_gpu_sim_active;
+    bool gl_gpu_state_dirty;
+    bool gl_gpu_ops_dirty;
 } we_particle_sys_t;
 
 /* Parses a Wallpaper Engine particle system JSON definition and allocates 32B-aligned SoA arrays */
@@ -354,6 +390,17 @@ void we_particle_trigger_burst(we_particle_sys_t *sys, uint32_t count);
 
 /* Frees all CPU and GPU resources owned by a we_particle_sys_t */
 void we_particle_destroy(we_particle_sys_t *sys);
+
+/* Builds compact 24 B/particle instance records via runtime-dispatched AVX2+FMA or scalar.
+ * Returns number of instances generated. */
+uint32_t we_particle_build_instances(we_particle_sys_t *sys, we_particle_instance_t **out_inst);
+
+/* Executes GLES 3.1 compute ping-pong SSBO simulation on GPU when active.
+ * Returns false cleanly if no valid owning GLES 3.1 context or renderer requires CPU path. */
+bool we_particle_step_gpu(we_particle_sys_t *sys, float dt_sec);
+
+/* Synchronizes active GPU ping-pong SSBO state back to CPU SoA arrays. */
+bool we_particle_gpu_sync_to_cpu(we_particle_sys_t *sys);
 
 #ifdef __cplusplus
 }

@@ -16,6 +16,7 @@ extern "C" {
 #define WE_PHYSICS_SUBSTEP_HZ   240.0f
 #define WE_PHYSICS_SUBSTEP_DT   (1.0f / 240.0f)
 #define WE_PHYSICS_FIXED_DT     (1.0f / 240.0f)
+#define WE_PHYSICS_SMALL_STEPS  4u
 #define WE_PHYSICS_MAX_SUBSTEPS 8u
 #define WE_PHYSICS_SOLVER_ITERS 2u
 
@@ -115,6 +116,12 @@ void we_physics_init_from_puppet(we_puppet_physics_ctx_t *ctx, const we_puppet_t
  * MetallicChain) */
 void we_physics_apply_preset(we_bone_sim_config_t *cfg, we_physics_preset_t preset);
 void we_physics_load_preset(we_bone_sim_config_t *cfg, we_physics_preset_t preset);
+
+/* Returns canonical preset parameters (preserving zeroed bone_index and default 30px rest length)
+ * and identifies matching presets against the canonical C table without duplicate UI constants. */
+bool we_physics_get_preset_config(we_physics_preset_t preset, we_bone_sim_config_t *out_cfg);
+we_physics_preset_t we_physics_detect_preset(const we_bone_sim_config_t *cfg);
+const char *we_physics_preset_name(we_physics_preset_t preset);
 
 /* Parses simulation_json from MDL chunk (stiffness, damping, gravity, mass, length, max_angle,
  * wind, audio) */
