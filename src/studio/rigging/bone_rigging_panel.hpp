@@ -18,6 +18,7 @@
 #include <QWidget>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace waywal::studio {
@@ -27,7 +28,7 @@ class BoneRiggingPanel : public QWidget {
 
   public:
     explicit BoneRiggingPanel(QWidget *parent = nullptr);
-    ~BoneRiggingPanel() override = default;
+    ~BoneRiggingPanel() override;
 
     void setCommandBus(CommandBus *bus) noexcept { m_commandBus = bus; }
     [[nodiscard]] CommandBus *commandBus() const noexcept { return m_commandBus; }
@@ -54,6 +55,7 @@ class BoneRiggingPanel : public QWidget {
 
   signals:
     void boneSelected(int32_t boneIndex);
+    void bonesRemapped(int32_t objectId, const std::vector<int32_t> &oldToNew);
     void skeletonUpdated(int32_t objectId, const BoneHierarchySnapshot &snapshot);
     void ikPreviewRequested(int32_t objectId, const we_ik_chain_t &chain);
     void statusMessage(const QString &msg);
@@ -63,11 +65,20 @@ class BoneRiggingPanel : public QWidget {
     void onTransformOrConstraintEdited();
 
   private:
+    struct Impl;
+
     void setupUi();
     void rebuildBoneTree();
     void syncInspectorFromSelectedBone();
     void pushSkeletonToDaemon();
+    void dispatchIkPreview(int32_t objectId, const we_ik_chain_t &chain);
+    void saveActiveObjectState();
+    void switchActiveObject(int32_t objectId);
+    void applySnapshotState(const BoneHierarchySnapshot &snap, int32_t nextSelected,
+                            const std::vector<int32_t> *remapForEmit);
     [[nodiscard]] bool wouldCreateCycle(int32_t childIdx, int32_t parentIdx) const noexcept;
+
+    std::unique_ptr<Impl> m_impl;
 
     int32_t m_selectedBoneIndex{-1};
     bool m_updatingUi{false};

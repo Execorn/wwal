@@ -19,6 +19,8 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 namespace waywal::studio {
 
@@ -27,12 +29,12 @@ class WeightPaintPanel : public QWidget {
 
   public:
     explicit WeightPaintPanel(QWidget *parent = nullptr);
-    ~WeightPaintPanel() override = default;
+    ~WeightPaintPanel() override;
 
     void setCommandBus(CommandBus *bus) noexcept { m_commandBus = bus; }
     [[nodiscard]] CommandBus *commandBus() const noexcept { return m_commandBus; }
 
-    void setIpcClient(IpcClient *client) noexcept { m_ipcClient = client; }
+    void setIpcClient(IpcClient *client);
     [[nodiscard]] IpcClient *ipcClient() const noexcept { return m_ipcClient; }
 
     void setPuppetContext(int32_t objectId, const we_puppet_t *puppet);
@@ -43,11 +45,14 @@ class WeightPaintPanel : public QWidget {
     [[nodiscard]] we_heatmap_palette_t activePalette() const noexcept;
     [[nodiscard]] float brushRadiusPx() const noexcept;
     [[nodiscard]] float brushStrength() const noexcept;
+    [[nodiscard]] float brushFalloff() const noexcept;
     [[nodiscard]] float targetWeightValue() const noexcept;
     [[nodiscard]] const std::array<uint64_t, 2> &lockedBoneMask() const noexcept
     {
         return m_lockedBoneMask;
     }
+    [[nodiscard]] const std::vector<uint64_t> &lockedVertexBits() const noexcept;
+    [[nodiscard]] bool respectLockedVertices() const noexcept;
 
   public slots:
     void onSolveHeatWeightsClicked();
@@ -55,21 +60,32 @@ class WeightPaintPanel : public QWidget {
     void onHeatmapToggleChanged(bool enabled);
     void setSolveTelemetry(uint32_t vertexCount, uint32_t boneCount, float elapsedMs,
                            bool usedIc0Fallback);
+    void remapBoneIndices(int32_t objectId, const std::vector<int32_t> &oldToNew);
 
   signals:
     void heatmapModeChanged(int32_t objectId, bool enabled, uint32_t activeBoneIdx, float opacity,
                             we_heatmap_palette_t palette);
     void heatSolveRequested(int32_t objectId, const we_heat_skin_cfg_t &cfg);
     void normalizeAllWeightsRequested(int32_t objectId, uint64_t lockMaskLo, uint64_t lockMaskHi);
+    void vertexLocksChanged(int32_t objectId, const std::vector<uint64_t> &lockedVertexBitset);
     void brushParamsChanged();
     void statusMessage(const QString &msg);
 
   private:
+    struct Impl;
+
     void setupUi();
     void sendHeatmapModeIpc();
+    void updateVertLockUi();
+    void syncBoneLockControls();
+    void saveActiveObjectState();
+    void onPuppetWeightsSolved(const waywal_ipc_puppet_weights_resp_t &resp,
+                               const std::vector<waywal_ipc_vertex_weight_t> &entries);
+
+    std::unique_ptr<Impl> m_impl;
 
     int32_t m_objectId{-1};
-    int32_t m_activeBoneIndex{0};
+    int32_t m_activeBoneIndex{-1};
     std::array<uint64_t, 2> m_lockedBoneMask{0ull, 0ull};
 
     CommandBus *m_commandBus{nullptr};

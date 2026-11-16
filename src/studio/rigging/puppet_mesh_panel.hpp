@@ -18,16 +18,23 @@
 #include <QWidget>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace waywal::studio {
+
+struct ContourPreviewLoop {
+    std::vector<we_cdt_vec2_t> points;
+    bool isHole{false};
+    double signedAreaPx2{0.0};
+};
 
 class PuppetMeshPanel : public QWidget {
     Q_OBJECT
 
   public:
     explicit PuppetMeshPanel(QWidget *parent = nullptr);
-    ~PuppetMeshPanel() override = default;
+    ~PuppetMeshPanel() override;
 
     void setCommandBus(CommandBus *bus) noexcept { m_commandBus = bus; }
     [[nodiscard]] CommandBus *commandBus() const noexcept { return m_commandBus; }
@@ -45,25 +52,43 @@ class PuppetMeshPanel : public QWidget {
     [[nodiscard]] const we_mesh_gen_result_t &lastResult() const noexcept { return m_lastResult; }
     [[nodiscard]] const std::vector<we_cdt_pin_t> &pins() const noexcept { return m_pins; }
     [[nodiscard]] bool isWireframeVisible() const noexcept;
+    [[nodiscard]] const std::vector<ContourPreviewLoop> &contourPreview() const noexcept;
+    [[nodiscard]] bool isTaskRunning() const noexcept;
 
   public slots:
     void onGenerateCutoutMeshClicked();
     void onExtractContoursClicked();
     void onClearPinsClicked();
     void onExportMdlClicked();
+    void cancelPendingTasks();
+    void remapVertexBlendIndices(int32_t objectId, const std::vector<int32_t> &oldToNew);
 
   signals:
     void meshGenerated(int32_t objectId, uint32_t vertexCount, uint32_t triangleCount,
                        float minAngleDeg);
     void wireframeOverlayRequested(bool visible, const we_mesh_gen_result_t &mesh);
     void contourPinsChanged(int32_t objectId, const std::vector<we_cdt_pin_t> &pins);
+    void contoursExtracted(int32_t objectId, const std::vector<ContourPreviewLoop> &loops);
     void exportMdlRequested(int32_t objectId, const QString &destPath);
     void statusMessage(const QString &msg);
 
   private:
+    struct Impl;
+
     void setupUi();
     void updateMeshStatsLabel();
+    void updateAsyncUiState();
+    void saveActiveObjectState();
+    void restoreObjectState(int32_t objectId, uint32_t texWidth, uint32_t texHeight);
+    void refreshLastResultView(float cdtMinAngle, float cdtMeanQuality, bool hitBudget,
+                               uint32_t generatedVertCount);
+    void applyPinSnapshot(const PuppetMeshSnapshot &snap, size_t expectedPinCount,
+                          const QString &applyMsg);
+    void applyMeshSnapshot(const PuppetMeshSnapshot &snap, float cdtMinAngle, float cdtMeanQuality,
+                           bool hitBudget, uint32_t generatedVertCount);
     void syncMeshToDaemon(const PuppetMeshSnapshot &snapshot);
+
+    std::unique_ptr<Impl> m_impl;
 
     int32_t m_objectId{-1};
     uint32_t m_texWidth{0};

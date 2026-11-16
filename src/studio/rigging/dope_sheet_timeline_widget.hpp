@@ -22,6 +22,7 @@
 #include <QWidget>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace waywal::studio {
@@ -101,6 +102,10 @@ class DopeSheetTimelineWidget : public QWidget {
     void onSetSelectedTangentMode(KeyTangentMode mode);
     void onBakeAndSyncTracks();
     void applyUndoKeySnapshot(uint32_t animId, const std::vector<FCurveKeySnapshot> &keys);
+    void copySelectedKeyframes();
+    void pasteKeyframesAtPlayhead();
+    void duplicateSelectedKeyframes();
+    void remapBoneIndices(int32_t objectId, const std::vector<int32_t> &oldToNew);
 
   signals:
     void frameChanged(double frame, double timeSec);
@@ -116,8 +121,28 @@ class DopeSheetTimelineWidget : public QWidget {
     void onPlayTick();
 
   private:
+    struct Impl;
+    friend class DopeSheetCanvas;
+    friend class FCurveCanvas;
+    friend class TimelineEventFilter;
+
     void setupUi();
     void updatePlaybackTimerState();
+    void syncClipsToDaemon(uint32_t priorityClipIdx, bool forceReplaceAll);
+    void saveActiveObjectState();
+    void restoreObjectState(int32_t objectId);
+    void applyClipDiffPatch(int32_t objectId, int32_t clipId,
+                            const std::vector<FCurveKeySnapshot> &removeKeys,
+                            const std::vector<FCurveKeySnapshot> &insertKeys,
+                            bool suppressTreeRebuild, bool suppressIpc);
+    void commitClipDiffEdit(int32_t clipId, const QString &label,
+                            std::vector<FCurveKeySnapshot> oldDiff,
+                            std::vector<FCurveKeySnapshot> newDiff, bool suppressTreeRebuild);
+    void syncClipAndSelectionControls();
+    void rebuildTrackTree();
+    void updateTrackTreeValues();
+
+    std::unique_ptr<Impl> m_impl;
 
     int32_t m_objectId{-1};
     uint32_t m_boneCount{0};

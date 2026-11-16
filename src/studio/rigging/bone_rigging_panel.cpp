@@ -15,6 +15,7 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMetaMethod>
 #include <QPointer>
 #include <QPushButton>
 #include <QScopedValueRollback>
@@ -25,9 +26,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include <numeric>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace waywal::studio {
@@ -37,6 +41,7 @@ namespace {
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kRadToDeg = 180.0f / kPi;
 constexpr float kDegToRad = kPi / 180.0f;
+constexpr float kMinIkSegmentLen = 1e-4f;
 
 float finiteOr(float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; }
 
@@ -154,11 +159,127 @@ void recomputeWorldAndOffsetTransforms(BoneHierarchySnapshot &rig) noexcept
     }
 }
 
-/* Reorders bones topologically (parent < child) only when an invariant violation exists,
- * so MDL export and daemon IPC always receive valid parent-before-child ordering. */
-void ensureTopologicalOrder(BoneHierarchySnapshot &rig, int32_t &trackedBoneIndex)
+void applyWorldPreservingParent(BoneHierarchySnapshot &rig, size_t boneIdx,
+                                uint32_t newParent) noexcept
+{
+    if (boneIdx >= rig.bones.size()) {
+        return;
+    }
+    we_mdl_bone_t &bone = rig.bones[boneIdx];
+    float desiredWorld[16];
+    std::memcpy(desiredWorld, bone.world_bind, sizeof(desiredWorld));
+    bone.parent = newParent;
+
+    if (newParent == 0xFFFFFFFFu || newParent >= rig.bones.size()) {
+        mat4DecomposeTrs(desiredWorld, bone.bind_pos, bone.bind_angle, bone.bind_scale);
+        return;
+    }
+
+    float parentInv[16];
+    if (we_mat4_inverse(rig.bones[newParent].world_bind, parentInv)) {
+        float newLocal[16];
+        we_mat4_mul(parentInv, desiredWorld, newLocal);
+        mat4DecomposeTrs(newLocal, bone.bind_pos, bone.bind_angle, bone.bind_scale);
+    }
+}
+
+void writeDefaultXpbdSimulationJson(we_mdl_bone_t &bone) noexcept
+{
+    static constexpr const char kDefaultSimJson[] =
+        "{\"stiffness\":0.55,\"damping\":0.15,\"gravity\":1.0,\"mass\":0.5}";
+    std::memset(bone.simulation_json, 0, sizeof(bone.simulation_json));
+    std::memcpy(bone.simulation_json, kDefaultSimJson, sizeof(kDefaultSimJson));
+}
+
+bool boneHasActiveSimulationJson(const char *json) noexcept
+{
+    if (!json || json[0] == '\0') {
+        return false;
+    }
+    we_bone_sim_config_t tmp{};
+    return we_physics_parse_simulation_json(json, &tmp) &&
+           ((tmp.flags & WE_BONE_PHYS_ENABLED) != 0u);
+}
+
+void applyXpbdDriveState(BoneHierarchySnapshot &rig, size_t boneIdx,
+                         we_bone_drive_mode_t mode) noexcept
+{
+    if (boneIdx >= rig.bones.size() || boneIdx >= WE_MDL_MAX_BONES) {
+        return;
+    }
+    rig.driveModes[boneIdx] = mode;
+    we_mdl_bone_t &bone = rig.bones[boneIdx];
+    if (mode == WE_BONE_DRIVE_XPBD) {
+        if (!boneHasActiveSimulationJson(bone.simulation_json)) {
+            writeDefaultXpbdSimulationJson(bone);
+        }
+        for (auto &c : rig.ikChains) {
+            if (c.root_bone == boneIdx || c.mid_bone == boneIdx || c.end_bone == boneIdx) {
+                c.enabled = 0u;
+            }
+        }
+        for (auto &a : rig.aimConstraints) {
+            if (a.bone_index == boneIdx) {
+                a.enabled = 0u;
+            }
+        }
+    } else {
+        std::memset(bone.simulation_json, 0, sizeof(bone.simulation_json));
+        if (mode != WE_BONE_DRIVE_AIM) {
+            for (auto &a : rig.aimConstraints) {
+                if (a.bone_index == boneIdx) {
+                    a.enabled = 0u;
+                }
+            }
+        }
+    }
+}
+
+[[nodiscard]] bool isBoneDescendant(const BoneHierarchySnapshot &rig, uint16_t ancestorIdx,
+                                    uint16_t candidateIdx) noexcept
 {
     const size_t n = rig.bones.size();
+    if (ancestorIdx >= n || candidateIdx >= n || ancestorIdx == candidateIdx) {
+        return false;
+    }
+    std::vector<uint8_t> visited(n, 0u);
+    uint32_t cur = rig.bones[candidateIdx].parent;
+    while (cur != 0xFFFFFFFFu && cur < n) {
+        if (cur == ancestorIdx) {
+            return true;
+        }
+        if (visited[cur] != 0u) {
+            return false;
+        }
+        visited[cur] = 1u;
+        cur = rig.bones[cur].parent;
+    }
+    return false;
+}
+
+[[nodiscard]] float worldBoneDistance(const BoneHierarchySnapshot &rig, uint16_t a,
+                                      uint16_t b) noexcept
+{
+    if (a >= rig.bones.size() || b >= rig.bones.size()) {
+        return 0.0f;
+    }
+    const float dx = rig.bones[b].world_bind[12] - rig.bones[a].world_bind[12];
+    const float dy = rig.bones[b].world_bind[13] - rig.bones[a].world_bind[13];
+    const float dz = rig.bones[b].world_bind[14] - rig.bones[a].world_bind[14];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/* Reorders bones topologically (parent < child) when any parent index exceeds its child index,
+ * emitting oldToNew so downstream weights, timelines, and cached physics state stay aligned. */
+void ensureTopologicalOrder(BoneHierarchySnapshot &rig, int32_t &trackedBoneIndex,
+                            std::vector<int32_t> *outOldToNew = nullptr)
+{
+    const size_t n = rig.bones.size();
+    if (outOldToNew) {
+        outOldToNew->resize(n);
+        std::iota(outOldToNew->begin(), outOldToNew->end(), 0);
+    }
+
     bool needsReorder = false;
     for (size_t i = 0; i < n; ++i) {
         const uint32_t p = rig.bones[i].parent;
@@ -244,6 +365,60 @@ void ensureTopologicalOrder(BoneHierarchySnapshot &rig, int32_t &trackedBoneInde
     rig.bones = std::move(sortedBones);
     rig.driveModes = sortedModes;
     recomputeWorldAndOffsetTransforms(rig);
+    if (outOldToNew) {
+        *outOldToNew = std::move(oldToNew);
+    }
+}
+
+[[nodiscard]] bool isNonIdentityRemap(const std::vector<int32_t> &oldToNew) noexcept
+{
+    for (size_t i = 0u; i < oldToNew.size(); ++i) {
+        if (oldToNew[i] != static_cast<int32_t>(i)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::vector<int32_t> remapAimTargets(const std::vector<int32_t> &prev,
+                                                   const std::vector<int32_t> &oldToNew,
+                                                   size_t newBoneCount)
+{
+    std::vector<int32_t> next(newBoneCount, -1);
+    const size_t limit = std::min(prev.size(), oldToNew.size());
+    for (size_t oldBone = 0u; oldBone < limit; ++oldBone) {
+        const int32_t newBone = oldToNew[oldBone];
+        if (newBone < 0 || static_cast<size_t>(newBone) >= newBoneCount) {
+            continue;
+        }
+        const int32_t oldTarget = prev[oldBone];
+        if (oldTarget >= 0 && static_cast<size_t>(oldTarget) < oldToNew.size()) {
+            const int32_t mappedTarget = oldToNew[static_cast<size_t>(oldTarget)];
+            next[static_cast<size_t>(newBone)] =
+                (mappedTarget != newBone && mappedTarget >= 0) ? mappedTarget : -1;
+        }
+    }
+    return next;
+}
+
+void remapXpbdState(std::array<bool, WE_MDL_MAX_BONES> &pushedXpbd, bool &forceReinit,
+                    const std::vector<int32_t> &oldToNew) noexcept
+{
+    std::array<bool, WE_MDL_MAX_BONES> next{};
+    next.fill(false);
+    const size_t n = std::min<size_t>(oldToNew.size(), WE_MDL_MAX_BONES);
+    for (size_t oldB = 0u; oldB < n; ++oldB) {
+        const int32_t newB = oldToNew[oldB];
+        if (newB >= 0 && newB < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+            next[static_cast<size_t>(newB)] = pushedXpbd[oldB];
+        } else if (pushedXpbd[oldB]) {
+            forceReinit = true;
+        }
+    }
+    if (isNonIdentityRemap(oldToNew)) {
+        forceReinit = true;
+    }
+    pushedXpbd = next;
 }
 
 QString driveModeLabel(we_bone_drive_mode_t mode)
@@ -276,24 +451,6 @@ QColor driveModeColor(we_bone_drive_mode_t mode)
     return QColor(QStringLiteral("#94a3b8"));
 }
 
-bool boneHasActiveSimulationJson(const char *json) noexcept
-{
-    if (!json || json[0] == '\0') {
-        return false;
-    }
-    we_bone_sim_config_t tmp{};
-    return we_physics_parse_simulation_json(json, &tmp) &&
-           ((tmp.flags & WE_BONE_PHYS_ENABLED) != 0u);
-}
-
-void writeDefaultXpbdSimulationJson(we_mdl_bone_t &bone) noexcept
-{
-    static constexpr const char kDefaultSimJson[] =
-        "{\"stiffness\":0.55,\"damping\":0.15,\"gravity\":1.0,\"mass\":0.5}";
-    std::memset(bone.simulation_json, 0, sizeof(bone.simulation_json));
-    std::memcpy(bone.simulation_json, kDefaultSimJson, sizeof(kDefaultSimJson));
-}
-
 QDoubleSpinBox *makeRigSpin(double minVal, double maxVal, double step, int decimals,
                             const QString &suffix, const QString &accessibleName, QWidget *parent)
 {
@@ -307,68 +464,6 @@ QDoubleSpinBox *makeRigSpin(double minVal, double maxVal, double step, int decim
     spin->setKeyboardTracking(false);
     spin->setAccessibleName(accessibleName);
     return spin;
-}
-
-template <typename Client = IpcClient>
-void dispatchSkeletonIpc(Client *client, int32_t objectId,
-                         const std::vector<waywal_ipc_mdl_bone_t> &bones, uint32_t flags)
-{
-    if (!client || objectId < 0) {
-        return;
-    }
-
-    waywal_ipc_puppet_set_skeleton_t req{};
-    req.object_id = static_cast<uint32_t>(objectId);
-    req.bone_count = static_cast<uint32_t>(bones.size());
-    req.flags = flags;
-
-    if constexpr (requires(Client *c) { c->sendPuppetSetSkeleton(req, bones); }) {
-        client->sendPuppetSetSkeleton(req, bones);
-    } else if constexpr (requires(Client *c) {
-                             c->sendPuppetSetSkeleton(static_cast<uint32_t>(objectId), bones,
-                                                      flags);
-                         }) {
-        client->sendPuppetSetSkeleton(static_cast<uint32_t>(objectId), bones, flags);
-    } else if constexpr (requires(Client *c) {
-                             c->sendPuppetSetSkeleton(objectId, bones, flags);
-                         }) {
-        client->sendPuppetSetSkeleton(objectId, bones, flags);
-    } else {
-        (void)req;
-    }
-}
-
-template <typename Client = IpcClient>
-void dispatchIkPreviewIpc(Client *client, int32_t objectId, const we_ik_chain_t &chain)
-{
-    if (!client || objectId < 0) {
-        return;
-    }
-
-    waywal_ipc_puppet_preview_ik_t req{};
-    req.object_id = static_cast<uint32_t>(objectId);
-    req.root_bone = chain.root_bone;
-    req.mid_bone = chain.mid_bone;
-    req.end_bone = chain.end_bone;
-    req.pole_flip = (chain.bend_sign < 0) ? 1u : 0u;
-    req.target_world[0] = chain.target_world[0];
-    req.target_world[1] = chain.target_world[1];
-    req.target_world[2] = chain.target_world[2];
-    req.override_count = 0u;
-    req.mode_flags = (chain.enabled != 0u) ? 1u : 2u;
-
-    const std::vector<waywal_ipc_bone_trs_t> emptyOverrides;
-    if constexpr (requires(Client *c) { c->sendPuppetPreviewIk(req, emptyOverrides); }) {
-        client->sendPuppetPreviewIk(req, emptyOverrides);
-    } else if constexpr (requires(Client *c) { c->sendPuppetPreviewIk(req); }) {
-        client->sendPuppetPreviewIk(req);
-    } else if constexpr (requires(Client *c) {
-                             c->sendPuppetPreviewIk(objectId, chain, emptyOverrides);
-                         }) {
-        client->sendPuppetPreviewIk(objectId, chain, emptyOverrides);
-    } else {
-        (void)req;
-    }
 }
 
 /* Tree widget intercepting internal drag-and-drop so cycle validation runs before mutation. */
@@ -420,62 +515,57 @@ class BoneHierarchyTreeWidget final : public QTreeWidget {
     QPointer<BoneRiggingPanel> m_panel;
 };
 
-class BoneRigAuxState final : public QObject {
-  public:
-    explicit BoneRigAuxState(QObject *parent = nullptr) : QObject(parent)
-    {
-        setObjectName(QStringLiteral("BoneRigAuxState"));
-        lastPushedXpbd.fill(false);
-    }
-
+struct RigObjectState {
+    BoneHierarchySnapshot rig;
+    int32_t selectedBoneIndex{-1};
     std::array<bool, WE_MDL_MAX_BONES> lastPushedXpbd{};
     bool forceReinitPhysics{false};
+    std::vector<int32_t> aimTargetBoneIds;
 };
-
-[[nodiscard]] BoneRigAuxState *ensureBoneAux(BoneRiggingPanel *panel)
-{
-    if (!panel) {
-        return nullptr;
-    }
-    if (auto *existing = panel->findChild<QObject *>(QStringLiteral("BoneRigAuxState"),
-                                                     Qt::FindDirectChildrenOnly)) {
-        return static_cast<BoneRigAuxState *>(existing);
-    }
-    return new BoneRigAuxState(panel);
-}
-
-void sanitizeAndTrackXpbdTransition(const BoneHierarchySnapshot &prevRig,
-                                    BoneHierarchySnapshot &nextRig, BoneRigAuxState *aux)
-{
-    const size_t nextLimit = std::min<size_t>(nextRig.bones.size(), WE_MDL_MAX_BONES);
-    for (size_t i = 0u; i < nextLimit; ++i) {
-        if (nextRig.driveModes[i] != WE_BONE_DRIVE_XPBD) {
-            std::memset(nextRig.bones[i].simulation_json, 0,
-                        sizeof(nextRig.bones[i].simulation_json));
-            const bool wasPrevXpbd =
-                (i < prevRig.bones.size() && prevRig.driveModes[i] == WE_BONE_DRIVE_XPBD);
-            if (aux && (wasPrevXpbd || aux->lastPushedXpbd[i])) {
-                aux->forceReinitPhysics = true;
-            }
-        }
-    }
-    if (aux) {
-        for (size_t i = nextLimit; i < WE_MDL_MAX_BONES; ++i) {
-            if (aux->lastPushedXpbd[i]) {
-                aux->forceReinitPhysics = true;
-            }
-        }
-    }
-}
 
 } // namespace
 
-BoneRiggingPanel::BoneRiggingPanel(QWidget *parent) : QWidget(parent)
+struct BoneRiggingPanel::Impl {
+    std::array<bool, WE_MDL_MAX_BONES> lastPushedXpbd{};
+    bool forceReinitPhysics{false};
+    std::vector<int32_t> aimTargetBoneIds;
+    std::unordered_map<int32_t, RigObjectState> objectStates;
+
+    QPushButton *deleteBoneBtn{nullptr};
+    QPushButton *makeRootBtn{nullptr};
+    QComboBox *parentCombo{nullptr};
+    QComboBox *ikChainCombo{nullptr};
+    QPushButton *deleteIkBtn{nullptr};
+    QComboBox *ikRootCombo{nullptr};
+    QComboBox *ikMidCombo{nullptr};
+    QComboBox *ikEndCombo{nullptr};
+    QDoubleSpinBox *ikTargetXSpin{nullptr};
+    QDoubleSpinBox *ikTargetYSpin{nullptr};
+    QDoubleSpinBox *ikPoleXSpin{nullptr};
+    QDoubleSpinBox *ikPoleYSpin{nullptr};
+    QDoubleSpinBox *ikPoleZSpin{nullptr};
+    QDoubleSpinBox *ikMidMinAngleSpin{nullptr};
+    QDoubleSpinBox *ikMidMaxAngleSpin{nullptr};
+    QDoubleSpinBox *ikBlendSpin{nullptr};
+    QCheckBox *aimEnableCheck{nullptr};
+    QComboBox *aimTargetBoneCombo{nullptr};
+    QComboBox *aimAxisCombo{nullptr};
+    QDoubleSpinBox *aimTargetXSpin{nullptr};
+    QDoubleSpinBox *aimTargetYSpin{nullptr};
+    QDoubleSpinBox *aimConeDegSpin{nullptr};
+    QDoubleSpinBox *aimBlendSpin{nullptr};
+};
+
+BoneRiggingPanel::BoneRiggingPanel(QWidget *parent)
+    : QWidget(parent), m_impl(std::make_unique<Impl>())
 {
     m_rig.driveModes.fill(WE_BONE_DRIVE_FK);
+    m_impl->lastPushedXpbd.fill(false);
     setupUi();
     syncInspectorFromSelectedBone();
 }
+
+BoneRiggingPanel::~BoneRiggingPanel() = default;
 
 void BoneRiggingPanel::setupUi()
 {
@@ -507,9 +597,6 @@ void BoneRiggingPanel::setupUi()
     auto *splitter = new QSplitter(Qt::Vertical, this);
     splitter->setChildrenCollapsible(false);
 
-    // -------------------------------------------------------------------------
-    // Top: Topological Bone Hierarchy Tree
-    // -------------------------------------------------------------------------
     auto *treeGroup = new QGroupBox(tr("Skeleton Hierarchy"), splitter);
     treeGroup->setObjectName(QStringLiteral("rigSectionGroup"));
     auto *treeLayout = new QVBoxLayout(treeGroup);
@@ -539,31 +626,31 @@ void BoneRiggingPanel::setupUi()
     m_addBoneBtn->setToolTip(tr("Add a new bone under the selected bone (or as a root bone)"));
     connect(m_addBoneBtn, &QPushButton::clicked, this, &BoneRiggingPanel::onAddBoneClicked);
 
-    auto *deleteBoneBtn = new QPushButton(tr("Delete Bone"), treeGroup);
-    deleteBoneBtn->setObjectName(QStringLiteral("deleteBoneBtn"));
-    deleteBoneBtn->setAccessibleName(tr("Delete Selected Bone"));
-    deleteBoneBtn->setToolTip(tr("Remove the selected bone and reparent its children safely"));
-    connect(deleteBoneBtn, &QPushButton::clicked, this, &BoneRiggingPanel::onDeleteBoneClicked);
+    m_impl->deleteBoneBtn = new QPushButton(tr("Delete Bone"), treeGroup);
+    m_impl->deleteBoneBtn->setObjectName(QStringLiteral("deleteBoneBtn"));
+    m_impl->deleteBoneBtn->setAccessibleName(tr("Delete Selected Bone"));
+    m_impl->deleteBoneBtn->setToolTip(
+        tr("Remove the selected bone and reparent its children safely"));
+    connect(m_impl->deleteBoneBtn, &QPushButton::clicked, this,
+            &BoneRiggingPanel::onDeleteBoneClicked);
 
-    auto *makeRootBtn = new QPushButton(tr("Unparent"), treeGroup);
-    makeRootBtn->setObjectName(QStringLiteral("makeRootBtn"));
-    makeRootBtn->setAccessibleName(tr("Make Selected Bone Root"));
-    makeRootBtn->setToolTip(tr("Detach the selected bone from its parent to become a root bone"));
-    connect(makeRootBtn, &QPushButton::clicked, this, [this]() {
+    m_impl->makeRootBtn = new QPushButton(tr("Unparent"), treeGroup);
+    m_impl->makeRootBtn->setObjectName(QStringLiteral("makeRootBtn"));
+    m_impl->makeRootBtn->setAccessibleName(tr("Make Selected Bone Root"));
+    m_impl->makeRootBtn->setToolTip(
+        tr("Detach the selected bone from its parent to become a root bone"));
+    connect(m_impl->makeRootBtn, &QPushButton::clicked, this, [this]() {
         if (m_selectedBoneIndex >= 0) {
             reparentBone(m_selectedBoneIndex, -1);
         }
     });
 
     treeBtnRow->addWidget(m_addBoneBtn);
-    treeBtnRow->addWidget(deleteBoneBtn);
-    treeBtnRow->addWidget(makeRootBtn);
+    treeBtnRow->addWidget(m_impl->deleteBoneBtn);
+    treeBtnRow->addWidget(m_impl->makeRootBtn);
     treeLayout->addLayout(treeBtnRow);
     splitter->addWidget(treeGroup);
 
-    // -------------------------------------------------------------------------
-    // Bottom: Scrollable Bind TRS, Drive Mode, 2-Bone IK, and Look-At Aim
-    // -------------------------------------------------------------------------
     auto *scrollArea = new QScrollArea(splitter);
     scrollArea->setWidgetResizable(true);
     scrollArea->setFrameShape(QFrame::NoFrame);
@@ -573,7 +660,6 @@ void BoneRiggingPanel::setupUi()
     contentLayout->setContentsMargins(2, 2, 4, 2);
     contentLayout->setSpacing(8);
 
-    // --- Section 1: Bone Identity, Parent, Drive Mode & Bind TRS ---
     auto *boneGroup = new QGroupBox(tr("Bone Properties & Bind Pose"), scrollContent);
     boneGroup->setObjectName(QStringLiteral("rigSectionGroup"));
     auto *boneGrid = new QGridLayout(boneGroup);
@@ -589,21 +675,21 @@ void BoneRiggingPanel::setupUi()
     boneGrid->addWidget(new QLabel(tr("Name:"), boneGroup), 0, 0);
     boneGrid->addWidget(m_boneNameEdit, 0, 1, 1, 3);
 
-    auto *parentCombo = new QComboBox(boneGroup);
-    parentCombo->setObjectName(QStringLiteral("parentCombo"));
-    parentCombo->setAccessibleName(tr("Parent Bone Selector"));
-    parentCombo->setToolTip(tr("Reparent the selected bone (cycles are rejected)"));
-    connect(parentCombo, qOverload<int>(&QComboBox::activated), this, [this, parentCombo](int idx) {
-        if (m_updatingUi || m_selectedBoneIndex < 0 || idx < 0) {
+    m_impl->parentCombo = new QComboBox(boneGroup);
+    m_impl->parentCombo->setObjectName(QStringLiteral("parentCombo"));
+    m_impl->parentCombo->setAccessibleName(tr("Parent Bone Selector"));
+    m_impl->parentCombo->setToolTip(tr("Reparent the selected bone (cycles are rejected)"));
+    connect(m_impl->parentCombo, qOverload<int>(&QComboBox::activated), this, [this](int idx) {
+        if (m_updatingUi || m_selectedBoneIndex < 0 || idx < 0 || !m_impl->parentCombo) {
             return;
         }
-        const int32_t newParent = parentCombo->itemData(idx).toInt();
+        const int32_t newParent = m_impl->parentCombo->itemData(idx).toInt();
         if (!reparentBone(m_selectedBoneIndex, newParent)) {
             syncInspectorFromSelectedBone();
         }
     });
     boneGrid->addWidget(new QLabel(tr("Parent:"), boneGroup), 1, 0);
-    boneGrid->addWidget(parentCombo, 1, 1, 1, 3);
+    boneGrid->addWidget(m_impl->parentCombo, 1, 1, 1, 3);
 
     m_driveModeCombo = new QComboBox(boneGroup);
     m_driveModeCombo->addItem(tr("FK (Keyframe)"), static_cast<uint32_t>(WE_BONE_DRIVE_FK));
@@ -613,8 +699,18 @@ void BoneRiggingPanel::setupUi()
     m_driveModeCombo->setAccessibleName(tr("Bone Drive Mode"));
     m_driveModeCombo->setToolTip(
         tr("Selects the active solver driving this bone; XPBD links to Physics Spring Inspector"));
-    connect(m_driveModeCombo, qOverload<int>(&QComboBox::activated), this,
-            &BoneRiggingPanel::onTransformOrConstraintEdited);
+    connect(m_driveModeCombo, qOverload<int>(&QComboBox::activated), this, [this](int) {
+        if (m_updatingUi || !m_driveModeCombo) {
+            return;
+        }
+        const auto mode =
+            static_cast<we_bone_drive_mode_t>(m_driveModeCombo->currentData().toUInt());
+        if (m_impl && m_impl->aimEnableCheck) {
+            const QSignalBlocker b(m_impl->aimEnableCheck);
+            m_impl->aimEnableCheck->setChecked(mode == WE_BONE_DRIVE_AIM);
+        }
+        onTransformOrConstraintEdited();
+    });
     boneGrid->addWidget(new QLabel(tr("Drive Mode:"), boneGroup), 2, 0);
     boneGrid->addWidget(m_driveModeCombo, 2, 1, 1, 2);
 
@@ -653,26 +749,28 @@ void BoneRiggingPanel::setupUi()
 
     contentLayout->addWidget(boneGroup);
 
-    // --- Section 2: 2-Bone Analytic IK Chain Controls ---
     auto *ikGroup = new QGroupBox(tr("2-Bone Analytic IK Chain"), scrollContent);
     ikGroup->setObjectName(QStringLiteral("rigSectionGroup"));
     auto *ikGrid = new QGridLayout(ikGroup);
     ikGrid->setContentsMargins(8, 8, 8, 8);
     ikGrid->setSpacing(6);
 
-    auto *ikChainCombo = new QComboBox(ikGroup);
-    ikChainCombo->setObjectName(QStringLiteral("ikChainCombo"));
-    ikChainCombo->setAccessibleName(tr("Active IK Chain Selector"));
-    connect(ikChainCombo, qOverload<int>(&QComboBox::activated), this,
+    m_impl->ikChainCombo = new QComboBox(ikGroup);
+    m_impl->ikChainCombo->setObjectName(QStringLiteral("ikChainCombo"));
+    m_impl->ikChainCombo->setAccessibleName(tr("Active IK Chain Selector"));
+    connect(m_impl->ikChainCombo, qOverload<int>(&QComboBox::activated), this,
             [this](int) { syncInspectorFromSelectedBone(); });
     ikGrid->addWidget(new QLabel(tr("Chain:"), ikGroup), 0, 0);
-    ikGrid->addWidget(ikChainCombo, 0, 1, 1, 2);
+    ikGrid->addWidget(m_impl->ikChainCombo, 0, 1, 1, 2);
 
-    auto *deleteIkBtn = new QPushButton(tr("Remove"), ikGroup);
-    deleteIkBtn->setObjectName(QStringLiteral("deleteIkBtn"));
-    deleteIkBtn->setAccessibleName(tr("Remove Selected IK Chain"));
-    connect(deleteIkBtn, &QPushButton::clicked, this, [this, ikChainCombo]() {
-        const int idx = ikChainCombo->currentData().toInt();
+    m_impl->deleteIkBtn = new QPushButton(tr("Remove"), ikGroup);
+    m_impl->deleteIkBtn->setObjectName(QStringLiteral("deleteIkBtn"));
+    m_impl->deleteIkBtn->setAccessibleName(tr("Remove Selected IK Chain"));
+    connect(m_impl->deleteIkBtn, &QPushButton::clicked, this, [this]() {
+        if (!m_impl->ikChainCombo) {
+            return;
+        }
+        const int idx = m_impl->ikChainCombo->currentData().toInt();
         if (idx < 0 || static_cast<size_t>(idx) >= m_rig.ikChains.size()) {
             return;
         }
@@ -686,18 +784,11 @@ void BoneRiggingPanel::setupUi()
             }
         }
         QPointer<BoneRiggingPanel> self(this);
-        const int32_t targetObjectId = m_rig.objectId;
-        auto applyFn = [self, targetObjectId](const BoneHierarchySnapshot &snap) {
-            if (!self || self->m_rig.objectId != targetObjectId) {
-                return;
+        const int32_t keepSelected = m_selectedBoneIndex;
+        auto applyFn = [self, keepSelected](const BoneHierarchySnapshot &snap) {
+            if (self) {
+                self->applySnapshotState(snap, keepSelected, nullptr);
             }
-            BoneHierarchySnapshot nextRig = snap;
-            sanitizeAndTrackXpbdTransition(self->m_rig, nextRig, ensureBoneAux(self.data()));
-            self->m_rig = std::move(nextRig);
-            self->rebuildBoneTree();
-            self->syncInspectorFromSelectedBone();
-            self->pushSkeletonToDaemon();
-            emit self->skeletonUpdated(self->m_rig.objectId, self->m_rig);
         };
         if (m_commandBus) {
             m_commandBus->execute(std::make_unique<BoneEditCommand>(
@@ -706,24 +797,24 @@ void BoneRiggingPanel::setupUi()
             applyFn(newRig);
         }
     });
-    ikGrid->addWidget(deleteIkBtn, 0, 3);
+    ikGrid->addWidget(m_impl->deleteIkBtn, 0, 3);
 
-    auto *ikRootCombo = new QComboBox(ikGroup);
-    ikRootCombo->setObjectName(QStringLiteral("ikRootCombo"));
-    ikRootCombo->setAccessibleName(tr("IK Root Bone"));
-    auto *ikMidCombo = new QComboBox(ikGroup);
-    ikMidCombo->setObjectName(QStringLiteral("ikMidCombo"));
-    ikMidCombo->setAccessibleName(tr("IK Mid Bone"));
-    auto *ikEndCombo = new QComboBox(ikGroup);
-    ikEndCombo->setObjectName(QStringLiteral("ikEndCombo"));
-    ikEndCombo->setAccessibleName(tr("IK End Bone"));
+    m_impl->ikRootCombo = new QComboBox(ikGroup);
+    m_impl->ikRootCombo->setObjectName(QStringLiteral("ikRootCombo"));
+    m_impl->ikRootCombo->setAccessibleName(tr("IK Root Bone"));
+    m_impl->ikMidCombo = new QComboBox(ikGroup);
+    m_impl->ikMidCombo->setObjectName(QStringLiteral("ikMidCombo"));
+    m_impl->ikMidCombo->setAccessibleName(tr("IK Mid Bone"));
+    m_impl->ikEndCombo = new QComboBox(ikGroup);
+    m_impl->ikEndCombo->setObjectName(QStringLiteral("ikEndCombo"));
+    m_impl->ikEndCombo->setAccessibleName(tr("IK End Bone"));
 
     ikGrid->addWidget(new QLabel(tr("Root:"), ikGroup), 1, 0);
-    ikGrid->addWidget(ikRootCombo, 1, 1);
+    ikGrid->addWidget(m_impl->ikRootCombo, 1, 1);
     ikGrid->addWidget(new QLabel(tr("Mid:"), ikGroup), 1, 2);
-    ikGrid->addWidget(ikMidCombo, 1, 3);
+    ikGrid->addWidget(m_impl->ikMidCombo, 1, 3);
     ikGrid->addWidget(new QLabel(tr("End:"), ikGroup), 2, 0);
-    ikGrid->addWidget(ikEndCombo, 2, 1);
+    ikGrid->addWidget(m_impl->ikEndCombo, 2, 1);
 
     m_createIkBtn = new QPushButton(tr("Create IK Chain"), ikGroup);
     m_createIkBtn->setAccessibleName(tr("Create 2-Bone IK Chain"));
@@ -731,32 +822,37 @@ void BoneRiggingPanel::setupUi()
     connect(m_createIkBtn, &QPushButton::clicked, this, &BoneRiggingPanel::onCreateIkChainClicked);
     ikGrid->addWidget(m_createIkBtn, 2, 2, 1, 2);
 
-    auto *ikTargetXSpin =
+    m_impl->ikTargetXSpin =
         makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"), tr("IK Target X"), ikGroup);
-    ikTargetXSpin->setObjectName(QStringLiteral("ikTargetXSpin"));
-    auto *ikTargetYSpin =
+    m_impl->ikTargetXSpin->setObjectName(QStringLiteral("ikTargetXSpin"));
+    m_impl->ikTargetYSpin =
         makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"), tr("IK Target Y"), ikGroup);
-    ikTargetYSpin->setObjectName(QStringLiteral("ikTargetYSpin"));
+    m_impl->ikTargetYSpin->setObjectName(QStringLiteral("ikTargetYSpin"));
     ikGrid->addWidget(new QLabel(tr("Target X:"), ikGroup), 3, 0);
-    ikGrid->addWidget(ikTargetXSpin, 3, 1);
+    ikGrid->addWidget(m_impl->ikTargetXSpin, 3, 1);
     ikGrid->addWidget(new QLabel(tr("Target Y:"), ikGroup), 3, 2);
-    ikGrid->addWidget(ikTargetYSpin, 3, 3);
+    ikGrid->addWidget(m_impl->ikTargetYSpin, 3, 3);
 
-    auto *ikPoleXSpin = makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"),
-                                    tr("IK Pole Vector X"), ikGroup);
-    ikPoleXSpin->setObjectName(QStringLiteral("ikPoleXSpin"));
-    auto *ikPoleYSpin = makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"),
-                                    tr("IK Pole Vector Y"), ikGroup);
-    ikPoleYSpin->setObjectName(QStringLiteral("ikPoleYSpin"));
+    m_impl->ikPoleXSpin = makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"),
+                                      tr("IK Pole Vector X"), ikGroup);
+    m_impl->ikPoleXSpin->setObjectName(QStringLiteral("ikPoleXSpin"));
+    m_impl->ikPoleYSpin = makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"),
+                                      tr("IK Pole Vector Y"), ikGroup);
+    m_impl->ikPoleYSpin->setObjectName(QStringLiteral("ikPoleYSpin"));
+    m_impl->ikPoleZSpin = makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"),
+                                      tr("IK Pole Vector Z"), ikGroup);
+    m_impl->ikPoleZSpin->setObjectName(QStringLiteral("ikPoleZSpin"));
     ikGrid->addWidget(new QLabel(tr("Pole X:"), ikGroup), 4, 0);
-    ikGrid->addWidget(ikPoleXSpin, 4, 1);
+    ikGrid->addWidget(m_impl->ikPoleXSpin, 4, 1);
     ikGrid->addWidget(new QLabel(tr("Pole Y:"), ikGroup), 4, 2);
-    ikGrid->addWidget(ikPoleYSpin, 4, 3);
+    ikGrid->addWidget(m_impl->ikPoleYSpin, 4, 3);
+    ikGrid->addWidget(new QLabel(tr("Pole Z:"), ikGroup), 5, 0);
+    ikGrid->addWidget(m_impl->ikPoleZSpin, 5, 1);
 
-    m_poleFlipCheck = new QCheckBox(tr("Flip Pole Bend Direction (-1 / +1)"), ikGroup);
+    m_poleFlipCheck = new QCheckBox(tr("Flip Pole Bend (-1 / +1)"), ikGroup);
     m_poleFlipCheck->setAccessibleName(tr("Flip IK Pole Vector Sign"));
     connect(m_poleFlipCheck, &QCheckBox::toggled, this, &BoneRiggingPanel::onTogglePoleFlipClicked);
-    ikGrid->addWidget(m_poleFlipCheck, 5, 0, 1, 4);
+    ikGrid->addWidget(m_poleFlipCheck, 5, 2, 1, 2);
 
     m_ikSoftZoneSpin =
         makeRigSpin(0.0, 0.25, 0.01, 3, QString(), tr("IK Soft Stretch Zone"), ikGroup);
@@ -770,110 +866,153 @@ void BoneRiggingPanel::setupUi()
     ikGrid->addWidget(m_ikMaxStretchSpin, 6, 3);
 
     m_ikMinAngleSpin = makeRigSpin(-180.0, 0.0, 5.0, 1, QStringLiteral(" deg"),
-                                   tr("IK Minimum Joint Limit"), ikGroup);
+                                   tr("IK Root Minimum Joint Limit"), ikGroup);
     m_ikMinAngleSpin->setValue(-180.0);
     m_ikMaxAngleSpin = makeRigSpin(0.0, 180.0, 5.0, 1, QStringLiteral(" deg"),
-                                   tr("IK Maximum Joint Limit"), ikGroup);
+                                   tr("IK Root Maximum Joint Limit"), ikGroup);
     m_ikMaxAngleSpin->setValue(180.0);
-    ikGrid->addWidget(new QLabel(tr("Min Limit:"), ikGroup), 7, 0);
+    ikGrid->addWidget(new QLabel(tr("Root Min:"), ikGroup), 7, 0);
     ikGrid->addWidget(m_ikMinAngleSpin, 7, 1);
-    ikGrid->addWidget(new QLabel(tr("Max Limit:"), ikGroup), 7, 2);
+    ikGrid->addWidget(new QLabel(tr("Root Max:"), ikGroup), 7, 2);
     ikGrid->addWidget(m_ikMaxAngleSpin, 7, 3);
 
-    auto *ikBlendSpin =
+    m_impl->ikMidMinAngleSpin = makeRigSpin(-180.0, 0.0, 5.0, 1, QStringLiteral(" deg"),
+                                            tr("IK Mid Minimum Joint Limit"), ikGroup);
+    m_impl->ikMidMinAngleSpin->setObjectName(QStringLiteral("ikMidMinAngleSpin"));
+    m_impl->ikMidMinAngleSpin->setValue(-180.0);
+    m_impl->ikMidMaxAngleSpin = makeRigSpin(0.0, 180.0, 5.0, 1, QStringLiteral(" deg"),
+                                            tr("IK Mid Maximum Joint Limit"), ikGroup);
+    m_impl->ikMidMaxAngleSpin->setObjectName(QStringLiteral("ikMidMaxAngleSpin"));
+    m_impl->ikMidMaxAngleSpin->setValue(180.0);
+    ikGrid->addWidget(new QLabel(tr("Mid Min:"), ikGroup), 8, 0);
+    ikGrid->addWidget(m_impl->ikMidMinAngleSpin, 8, 1);
+    ikGrid->addWidget(new QLabel(tr("Mid Max:"), ikGroup), 8, 2);
+    ikGrid->addWidget(m_impl->ikMidMaxAngleSpin, 8, 3);
+
+    m_impl->ikBlendSpin =
         makeRigSpin(0.0, 1.0, 0.05, 2, QString(), tr("IK Constraint Blend Weight"), ikGroup);
-    ikBlendSpin->setObjectName(QStringLiteral("ikBlendSpin"));
-    ikBlendSpin->setValue(1.0);
-    ikGrid->addWidget(new QLabel(tr("IK Blend:"), ikGroup), 8, 0);
-    ikGrid->addWidget(ikBlendSpin, 8, 1, 1, 3);
+    m_impl->ikBlendSpin->setObjectName(QStringLiteral("ikBlendSpin"));
+    m_impl->ikBlendSpin->setValue(1.0);
+    ikGrid->addWidget(new QLabel(tr("IK Blend:"), ikGroup), 9, 0);
+    ikGrid->addWidget(m_impl->ikBlendSpin, 9, 1, 1, 3);
 
     for (QDoubleSpinBox *s :
-         {ikTargetXSpin, ikTargetYSpin, ikPoleXSpin, ikPoleYSpin, m_ikSoftZoneSpin,
-          m_ikMaxStretchSpin, m_ikMinAngleSpin, m_ikMaxAngleSpin, ikBlendSpin}) {
+         {m_impl->ikTargetXSpin, m_impl->ikTargetYSpin, m_impl->ikPoleXSpin, m_impl->ikPoleYSpin,
+          m_impl->ikPoleZSpin, m_ikSoftZoneSpin, m_ikMaxStretchSpin, m_ikMinAngleSpin,
+          m_ikMaxAngleSpin, m_impl->ikMidMinAngleSpin, m_impl->ikMidMaxAngleSpin,
+          m_impl->ikBlendSpin}) {
         connect(s, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
                 &BoneRiggingPanel::onTransformOrConstraintEdited);
     }
 
     contentLayout->addWidget(ikGroup);
 
-    // --- Section 3: Single-Bone Look-At / Aim Constraint ---
     auto *aimGroup = new QGroupBox(tr("Single-Bone Look-At / Aim Constraint"), scrollContent);
     aimGroup->setObjectName(QStringLiteral("rigSectionGroup"));
     auto *aimGrid = new QGridLayout(aimGroup);
     aimGrid->setContentsMargins(8, 8, 8, 8);
     aimGrid->setSpacing(6);
 
-    auto *aimEnableCheck = new QCheckBox(tr("Enable Look-At Aim for Selected Bone"), aimGroup);
-    aimEnableCheck->setObjectName(QStringLiteral("aimEnableCheck"));
-    aimEnableCheck->setAccessibleName(tr("Enable Look-At Aim Constraint"));
-    connect(aimEnableCheck, &QCheckBox::toggled, this,
-            &BoneRiggingPanel::onTransformOrConstraintEdited);
-    aimGrid->addWidget(aimEnableCheck, 0, 0, 1, 4);
+    m_impl->aimEnableCheck = new QCheckBox(tr("Enable Look-At Aim for Selected Bone"), aimGroup);
+    m_impl->aimEnableCheck->setObjectName(QStringLiteral("aimEnableCheck"));
+    m_impl->aimEnableCheck->setAccessibleName(tr("Enable Look-At Aim Constraint"));
+    connect(m_impl->aimEnableCheck, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (m_updatingUi) {
+            return;
+        }
+        if (m_driveModeCombo) {
+            const QSignalBlocker b(m_driveModeCombo);
+            const auto cur =
+                static_cast<we_bone_drive_mode_t>(m_driveModeCombo->currentData().toUInt());
+            if (enabled && cur != WE_BONE_DRIVE_XPBD) {
+                const int idx =
+                    m_driveModeCombo->findData(static_cast<uint32_t>(WE_BONE_DRIVE_AIM));
+                if (idx >= 0) {
+                    m_driveModeCombo->setCurrentIndex(idx);
+                }
+            } else if (!enabled && cur == WE_BONE_DRIVE_AIM) {
+                const int idx = m_driveModeCombo->findData(static_cast<uint32_t>(WE_BONE_DRIVE_FK));
+                if (idx >= 0) {
+                    m_driveModeCombo->setCurrentIndex(idx);
+                }
+            }
+        }
+        onTransformOrConstraintEdited();
+    });
+    aimGrid->addWidget(m_impl->aimEnableCheck, 0, 0, 1, 4);
 
-    auto *aimTargetBoneCombo = new QComboBox(aimGroup);
-    aimTargetBoneCombo->setObjectName(QStringLiteral("aimTargetBoneCombo"));
-    aimTargetBoneCombo->setAccessibleName(tr("Aim Target Bone Selector"));
-    aimTargetBoneCombo->setToolTip(
+    m_impl->aimTargetBoneCombo = new QComboBox(aimGroup);
+    m_impl->aimTargetBoneCombo->setObjectName(QStringLiteral("aimTargetBoneCombo"));
+    m_impl->aimTargetBoneCombo->setAccessibleName(tr("Aim Target Bone Selector"));
+    m_impl->aimTargetBoneCombo->setToolTip(
         tr("Select a target bone to track, or Custom World Target for manual coordinates"));
-    connect(aimTargetBoneCombo, qOverload<int>(&QComboBox::activated), this,
-            [this, aimTargetBoneCombo](int idx) {
-                if (m_updatingUi || idx < 0) {
+    connect(m_impl->aimTargetBoneCombo, qOverload<int>(&QComboBox::activated), this,
+            [this](int idx) {
+                if (m_updatingUi || idx < 0 || !m_impl->aimTargetBoneCombo) {
                     return;
                 }
-                const int targetBone = aimTargetBoneCombo->itemData(idx).toInt();
+                const int targetBone = m_impl->aimTargetBoneCombo->itemData(idx).toInt();
+                if (m_selectedBoneIndex >= 0 &&
+                    static_cast<size_t>(m_selectedBoneIndex) < m_rig.bones.size()) {
+                    if (m_impl->aimTargetBoneIds.size() < m_rig.bones.size()) {
+                        m_impl->aimTargetBoneIds.resize(m_rig.bones.size(), -1);
+                    }
+                    m_impl->aimTargetBoneIds[static_cast<size_t>(m_selectedBoneIndex)] = targetBone;
+                }
                 if (targetBone >= 0 && static_cast<size_t>(targetBone) < m_rig.bones.size()) {
                     const we_mdl_bone_t &tb = m_rig.bones[static_cast<size_t>(targetBone)];
-                    if (auto *tx = findChild<QDoubleSpinBox *>(QStringLiteral("aimTargetXSpin"))) {
-                        const QSignalBlocker b(tx);
-                        tx->setValue(static_cast<double>(tb.world_bind[12]));
+                    if (m_impl->aimTargetXSpin) {
+                        const QSignalBlocker b(m_impl->aimTargetXSpin);
+                        m_impl->aimTargetXSpin->setValue(static_cast<double>(tb.world_bind[12]));
                     }
-                    if (auto *ty = findChild<QDoubleSpinBox *>(QStringLiteral("aimTargetYSpin"))) {
-                        const QSignalBlocker b(ty);
-                        ty->setValue(static_cast<double>(tb.world_bind[13]));
+                    if (m_impl->aimTargetYSpin) {
+                        const QSignalBlocker b(m_impl->aimTargetYSpin);
+                        m_impl->aimTargetYSpin->setValue(static_cast<double>(tb.world_bind[13]));
                     }
                 }
                 onTransformOrConstraintEdited();
             });
     aimGrid->addWidget(new QLabel(tr("Target:"), aimGroup), 1, 0);
-    aimGrid->addWidget(aimTargetBoneCombo, 1, 1, 1, 3);
+    aimGrid->addWidget(m_impl->aimTargetBoneCombo, 1, 1, 1, 3);
 
-    auto *aimAxisCombo = new QComboBox(aimGroup);
-    aimAxisCombo->setObjectName(QStringLiteral("aimAxisCombo"));
-    aimAxisCombo->addItem(tr("+X Axis (1, 0)"), 0);
-    aimAxisCombo->addItem(tr("+Y Axis (0, 1)"), 1);
-    aimAxisCombo->addItem(tr("-X Axis (-1, 0)"), 2);
-    aimAxisCombo->addItem(tr("-Y Axis (0, -1)"), 3);
-    aimAxisCombo->setAccessibleName(tr("Local Aim Axis"));
-    connect(aimAxisCombo, qOverload<int>(&QComboBox::activated), this,
+    m_impl->aimAxisCombo = new QComboBox(aimGroup);
+    m_impl->aimAxisCombo->setObjectName(QStringLiteral("aimAxisCombo"));
+    m_impl->aimAxisCombo->addItem(tr("+X Axis (1, 0)"), 0);
+    m_impl->aimAxisCombo->addItem(tr("+Y Axis (0, 1)"), 1);
+    m_impl->aimAxisCombo->addItem(tr("-X Axis (-1, 0)"), 2);
+    m_impl->aimAxisCombo->addItem(tr("-Y Axis (0, -1)"), 3);
+    m_impl->aimAxisCombo->setAccessibleName(tr("Local Aim Axis"));
+    connect(m_impl->aimAxisCombo, qOverload<int>(&QComboBox::activated), this,
             &BoneRiggingPanel::onTransformOrConstraintEdited);
     aimGrid->addWidget(new QLabel(tr("Aim Axis:"), aimGroup), 2, 0);
-    aimGrid->addWidget(aimAxisCombo, 2, 1, 1, 3);
+    aimGrid->addWidget(m_impl->aimAxisCombo, 2, 1, 1, 3);
 
-    auto *aimTargetXSpin = makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"),
-                                       tr("Aim Target World X"), aimGroup);
-    aimTargetXSpin->setObjectName(QStringLiteral("aimTargetXSpin"));
-    auto *aimTargetYSpin = makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"),
-                                       tr("Aim Target World Y"), aimGroup);
-    aimTargetYSpin->setObjectName(QStringLiteral("aimTargetYSpin"));
+    m_impl->aimTargetXSpin = makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"),
+                                         tr("Aim Target World X"), aimGroup);
+    m_impl->aimTargetXSpin->setObjectName(QStringLiteral("aimTargetXSpin"));
+    m_impl->aimTargetYSpin = makeRigSpin(-16384.0, 16384.0, 1.0, 2, QStringLiteral(" px"),
+                                         tr("Aim Target World Y"), aimGroup);
+    m_impl->aimTargetYSpin->setObjectName(QStringLiteral("aimTargetYSpin"));
     aimGrid->addWidget(new QLabel(tr("World X:"), aimGroup), 3, 0);
-    aimGrid->addWidget(aimTargetXSpin, 3, 1);
+    aimGrid->addWidget(m_impl->aimTargetXSpin, 3, 1);
     aimGrid->addWidget(new QLabel(tr("World Y:"), aimGroup), 3, 2);
-    aimGrid->addWidget(aimTargetYSpin, 3, 3);
+    aimGrid->addWidget(m_impl->aimTargetYSpin, 3, 3);
 
-    auto *aimConeDegSpin = makeRigSpin(0.0, 180.0, 5.0, 1, QStringLiteral(" deg"),
-                                       tr("Aim Maximum Cone Angle"), aimGroup);
-    aimConeDegSpin->setObjectName(QStringLiteral("aimConeDegSpin"));
-    aimConeDegSpin->setValue(90.0);
-    auto *aimBlendSpin =
+    m_impl->aimConeDegSpin = makeRigSpin(0.0, 180.0, 5.0, 1, QStringLiteral(" deg"),
+                                         tr("Aim Maximum Cone Angle"), aimGroup);
+    m_impl->aimConeDegSpin->setObjectName(QStringLiteral("aimConeDegSpin"));
+    m_impl->aimConeDegSpin->setValue(90.0);
+    m_impl->aimBlendSpin =
         makeRigSpin(0.0, 1.0, 0.05, 2, QString(), tr("Aim Blend Weight"), aimGroup);
-    aimBlendSpin->setObjectName(QStringLiteral("aimBlendSpin"));
-    aimBlendSpin->setValue(1.0);
+    m_impl->aimBlendSpin->setObjectName(QStringLiteral("aimBlendSpin"));
+    m_impl->aimBlendSpin->setValue(1.0);
     aimGrid->addWidget(new QLabel(tr("Max Cone:"), aimGroup), 4, 0);
-    aimGrid->addWidget(aimConeDegSpin, 4, 1);
+    aimGrid->addWidget(m_impl->aimConeDegSpin, 4, 1);
     aimGrid->addWidget(new QLabel(tr("Blend:"), aimGroup), 4, 2);
-    aimGrid->addWidget(aimBlendSpin, 4, 3);
+    aimGrid->addWidget(m_impl->aimBlendSpin, 4, 3);
 
-    for (QDoubleSpinBox *s : {aimTargetXSpin, aimTargetYSpin, aimConeDegSpin, aimBlendSpin}) {
+    for (QDoubleSpinBox *s : {m_impl->aimTargetXSpin, m_impl->aimTargetYSpin,
+                              m_impl->aimConeDegSpin, m_impl->aimBlendSpin}) {
         connect(s, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
                 &BoneRiggingPanel::onTransformOrConstraintEdited);
     }
@@ -888,21 +1027,147 @@ void BoneRiggingPanel::setupUi()
     mainLayout->addWidget(splitter, 1);
 
     setTabOrder(m_boneTree, m_addBoneBtn);
-    setTabOrder(m_addBoneBtn, deleteBoneBtn);
-    setTabOrder(deleteBoneBtn, makeRootBtn);
-    setTabOrder(makeRootBtn, m_boneNameEdit);
-    setTabOrder(m_boneNameEdit, parentCombo);
-    setTabOrder(parentCombo, m_driveModeCombo);
+    setTabOrder(m_addBoneBtn, m_impl->deleteBoneBtn);
+    setTabOrder(m_impl->deleteBoneBtn, m_impl->makeRootBtn);
+    setTabOrder(m_impl->makeRootBtn, m_boneNameEdit);
+    setTabOrder(m_boneNameEdit, m_impl->parentCombo);
+    setTabOrder(m_impl->parentCombo, m_driveModeCombo);
     setTabOrder(m_driveModeCombo, m_posXSpin);
     setTabOrder(m_posXSpin, m_posYSpin);
     setTabOrder(m_posYSpin, m_angleZSpin);
     setTabOrder(m_angleZSpin, m_scaleXSpin);
     setTabOrder(m_scaleXSpin, m_scaleYSpin);
-    setTabOrder(m_scaleYSpin, m_createIkBtn);
+    setTabOrder(m_scaleYSpin, m_impl->ikChainCombo);
+    setTabOrder(m_impl->ikChainCombo, m_impl->deleteIkBtn);
+    setTabOrder(m_impl->deleteIkBtn, m_impl->ikRootCombo);
+    setTabOrder(m_impl->ikRootCombo, m_impl->ikMidCombo);
+    setTabOrder(m_impl->ikMidCombo, m_impl->ikEndCombo);
+    setTabOrder(m_impl->ikEndCombo, m_createIkBtn);
+    setTabOrder(m_createIkBtn, m_impl->ikTargetXSpin);
+    setTabOrder(m_impl->ikTargetXSpin, m_impl->ikTargetYSpin);
+    setTabOrder(m_impl->ikTargetYSpin, m_impl->ikPoleXSpin);
+    setTabOrder(m_impl->ikPoleXSpin, m_impl->ikPoleYSpin);
+    setTabOrder(m_impl->ikPoleYSpin, m_impl->ikPoleZSpin);
+    setTabOrder(m_impl->ikPoleZSpin, m_poleFlipCheck);
+    setTabOrder(m_poleFlipCheck, m_ikSoftZoneSpin);
+    setTabOrder(m_ikSoftZoneSpin, m_ikMaxStretchSpin);
+    setTabOrder(m_ikMaxStretchSpin, m_ikMinAngleSpin);
+    setTabOrder(m_ikMinAngleSpin, m_ikMaxAngleSpin);
+    setTabOrder(m_ikMaxAngleSpin, m_impl->ikMidMinAngleSpin);
+    setTabOrder(m_impl->ikMidMinAngleSpin, m_impl->ikMidMaxAngleSpin);
+    setTabOrder(m_impl->ikMidMaxAngleSpin, m_impl->ikBlendSpin);
+    setTabOrder(m_impl->ikBlendSpin, m_impl->aimEnableCheck);
+    setTabOrder(m_impl->aimEnableCheck, m_impl->aimTargetBoneCombo);
+    setTabOrder(m_impl->aimTargetBoneCombo, m_impl->aimAxisCombo);
+    setTabOrder(m_impl->aimAxisCombo, m_impl->aimTargetXSpin);
+    setTabOrder(m_impl->aimTargetXSpin, m_impl->aimTargetYSpin);
+    setTabOrder(m_impl->aimTargetYSpin, m_impl->aimConeDegSpin);
+    setTabOrder(m_impl->aimConeDegSpin, m_impl->aimBlendSpin);
+}
+
+void BoneRiggingPanel::saveActiveObjectState()
+{
+    if (!m_impl || m_rig.objectId < 0) {
+        return;
+    }
+    RigObjectState &st = m_impl->objectStates[m_rig.objectId];
+    st.rig = m_rig;
+    st.selectedBoneIndex = m_selectedBoneIndex;
+    st.lastPushedXpbd = m_impl->lastPushedXpbd;
+    st.forceReinitPhysics = m_impl->forceReinitPhysics;
+    st.aimTargetBoneIds = m_impl->aimTargetBoneIds;
+}
+
+void BoneRiggingPanel::switchActiveObject(int32_t objectId)
+{
+    if (!m_impl || objectId == m_rig.objectId) {
+        return;
+    }
+    saveActiveObjectState();
+    const auto it = m_impl->objectStates.find(objectId);
+    if (it != m_impl->objectStates.end()) {
+        m_rig = it->second.rig;
+        m_selectedBoneIndex = it->second.selectedBoneIndex;
+        m_impl->lastPushedXpbd = it->second.lastPushedXpbd;
+        m_impl->forceReinitPhysics = it->second.forceReinitPhysics;
+        m_impl->aimTargetBoneIds = it->second.aimTargetBoneIds;
+    } else {
+        m_rig = BoneHierarchySnapshot{};
+        m_rig.objectId = objectId;
+        m_rig.driveModes.fill(WE_BONE_DRIVE_FK);
+        m_selectedBoneIndex = -1;
+        m_impl->lastPushedXpbd.fill(false);
+        m_impl->forceReinitPhysics = false;
+        m_impl->aimTargetBoneIds.clear();
+    }
+}
+
+void BoneRiggingPanel::applySnapshotState(const BoneHierarchySnapshot &snap, int32_t nextSelected,
+                                          const std::vector<int32_t> *remapForEmit)
+{
+    if (!m_impl) {
+        return;
+    }
+    if (snap.objectId >= 0 && snap.objectId != m_rig.objectId) {
+        switchActiveObject(snap.objectId);
+    }
+
+    BoneHierarchySnapshot nextRig = snap;
+    if (remapForEmit) {
+        remapXpbdState(m_impl->lastPushedXpbd, m_impl->forceReinitPhysics, *remapForEmit);
+        m_impl->aimTargetBoneIds =
+            remapAimTargets(m_impl->aimTargetBoneIds, *remapForEmit, nextRig.bones.size());
+    } else {
+        m_impl->aimTargetBoneIds.resize(nextRig.bones.size(), -1);
+    }
+
+    const size_t nextLimit = std::min<size_t>(nextRig.bones.size(), WE_MDL_MAX_BONES);
+    for (size_t i = 0u; i < nextLimit; ++i) {
+        if (nextRig.driveModes[i] != WE_BONE_DRIVE_XPBD) {
+            std::memset(nextRig.bones[i].simulation_json, 0,
+                        sizeof(nextRig.bones[i].simulation_json));
+            const bool wasPrevXpbd =
+                (i < m_rig.bones.size() && m_rig.driveModes[i] == WE_BONE_DRIVE_XPBD);
+            if (wasPrevXpbd || m_impl->lastPushedXpbd[i]) {
+                m_impl->forceReinitPhysics = true;
+            }
+        }
+    }
+    for (size_t i = nextLimit; i < WE_MDL_MAX_BONES; ++i) {
+        if (m_impl->lastPushedXpbd[i]) {
+            m_impl->forceReinitPhysics = true;
+        }
+    }
+
+    const int32_t prevSelected = m_selectedBoneIndex;
+    m_rig = std::move(nextRig);
+    m_selectedBoneIndex =
+        m_rig.bones.empty()
+            ? -1
+            : ((nextSelected >= 0)
+                   ? std::clamp(nextSelected, 0, static_cast<int32_t>(m_rig.bones.size()) - 1)
+                   : -1);
+
+    rebuildBoneTree();
+    syncInspectorFromSelectedBone();
+    pushSkeletonToDaemon();
+    saveActiveObjectState();
+
+    if (remapForEmit && !remapForEmit->empty()) {
+        emit bonesRemapped(m_rig.objectId, *remapForEmit);
+    }
+    if (m_selectedBoneIndex != prevSelected || remapForEmit) {
+        emit boneSelected(m_selectedBoneIndex);
+    }
+    emit skeletonUpdated(m_rig.objectId, m_rig);
 }
 
 void BoneRiggingPanel::loadPuppetRig(const we_puppet_t *puppet, int32_t sceneObjectId)
 {
+    if (m_impl && m_rig.objectId >= 0 && m_rig.objectId != sceneObjectId) {
+        saveActiveObjectState();
+    }
+
     m_rig.objectId = sceneObjectId;
     m_rig.bones.clear();
     m_rig.ikChains.clear();
@@ -931,21 +1196,27 @@ void BoneRiggingPanel::loadPuppetRig(const we_puppet_t *puppet, int32_t sceneObj
             }
         }
         m_selectedBoneIndex = 0;
-        ensureTopologicalOrder(m_rig, m_selectedBoneIndex);
+        std::vector<int32_t> remap;
+        ensureTopologicalOrder(m_rig, m_selectedBoneIndex, &remap);
+        if (m_impl && isNonIdentityRemap(remap)) {
+            emit bonesRemapped(m_rig.objectId, remap);
+        }
     } else {
         m_selectedBoneIndex = -1;
     }
 
-    if (auto *aux = ensureBoneAux(this)) {
-        aux->forceReinitPhysics = false;
+    if (m_impl) {
+        m_impl->forceReinitPhysics = false;
+        m_impl->aimTargetBoneIds.assign(m_rig.bones.size(), -1);
         for (size_t i = 0u; i < WE_MDL_MAX_BONES; ++i) {
-            aux->lastPushedXpbd[i] =
+            m_impl->lastPushedXpbd[i] =
                 (i < m_rig.bones.size() && m_rig.driveModes[i] == WE_BONE_DRIVE_XPBD);
         }
     }
 
     rebuildBoneTree();
     syncInspectorFromSelectedBone();
+    saveActiveObjectState();
     emit boneSelected(m_selectedBoneIndex);
 }
 
@@ -963,37 +1234,9 @@ void BoneRiggingPanel::setBoneDriveMode(int32_t objectId, int32_t boneIndex,
         return;
     }
 
-    const we_bone_drive_mode_t prevMode = m_rig.driveModes[idx];
-    m_rig.driveModes[idx] = mode;
-
-    we_mdl_bone_t &bone = m_rig.bones[idx];
-    if (mode == WE_BONE_DRIVE_XPBD) {
-        if (!boneHasActiveSimulationJson(bone.simulation_json)) {
-            writeDefaultXpbdSimulationJson(bone);
-        }
-        for (auto &c : m_rig.ikChains) {
-            if (c.root_bone == idx || c.mid_bone == idx || c.end_bone == idx) {
-                c.enabled = 0u;
-            }
-        }
-        for (auto &a : m_rig.aimConstraints) {
-            if (a.bone_index == idx) {
-                a.enabled = 0u;
-            }
-        }
-    } else {
-        std::memset(bone.simulation_json, 0, sizeof(bone.simulation_json));
-        if (prevMode == WE_BONE_DRIVE_XPBD) {
-            if (auto *aux = ensureBoneAux(this)) {
-                aux->forceReinitPhysics = true;
-            }
-        }
-    }
-
-    rebuildBoneTree();
-    syncInspectorFromSelectedBone();
-    pushSkeletonToDaemon();
-    emit skeletonUpdated(m_rig.objectId, m_rig);
+    BoneHierarchySnapshot newRig = m_rig;
+    applyXpbdDriveState(newRig, idx, mode);
+    applySnapshotState(newRig, m_selectedBoneIndex, nullptr);
 }
 
 void BoneRiggingPanel::selectBone(int32_t boneIndex)
@@ -1021,6 +1264,7 @@ void BoneRiggingPanel::selectBone(int32_t boneIndex)
     }
 
     syncInspectorFromSelectedBone();
+    saveActiveObjectState();
     emit boneSelected(m_selectedBoneIndex);
 }
 
@@ -1037,11 +1281,16 @@ bool BoneRiggingPanel::wouldCreateCycle(int32_t childIdx, int32_t parentIdx) con
         return true;
     }
 
+    std::vector<uint8_t> visited(static_cast<size_t>(n), 0u);
     int32_t cur = parentIdx;
-    for (int32_t step = 0; step < n; ++step) {
+    while (cur >= 0 && cur < n) {
         if (cur == childIdx) {
             return true;
         }
+        if (visited[static_cast<size_t>(cur)] != 0u) {
+            return true;
+        }
+        visited[static_cast<size_t>(cur)] = 1u;
         const uint32_t p = m_rig.bones[static_cast<size_t>(cur)].parent;
         if (p == 0xFFFFFFFFu || static_cast<int32_t>(p) >= n) {
             break;
@@ -1100,30 +1349,15 @@ bool BoneRiggingPanel::addBone(const QString &name, int32_t parentIndex, const f
 
     const int32_t newBoneIdx = static_cast<int32_t>(newIdx);
     const int32_t prevSelected = m_selectedBoneIndex;
+    const size_t newSize = newRig.bones.size();
 
     QPointer<BoneRiggingPanel> self(this);
-    const int32_t targetObjectId = m_rig.objectId;
-    auto applyFn = [self, targetObjectId, newBoneIdx,
-                    prevSelected](const BoneHierarchySnapshot &snap) {
-        if (!self || self->m_rig.objectId != targetObjectId) {
+    auto applyFn = [self, newSize, newBoneIdx, prevSelected](const BoneHierarchySnapshot &snap) {
+        if (!self) {
             return;
         }
-        BoneHierarchySnapshot nextRig = snap;
-        sanitizeAndTrackXpbdTransition(self->m_rig, nextRig, ensureBoneAux(self.data()));
-        self->m_rig = std::move(nextRig);
-        if (static_cast<size_t>(newBoneIdx) < self->m_rig.bones.size()) {
-            self->m_selectedBoneIndex = newBoneIdx;
-        } else {
-            self->m_selectedBoneIndex =
-                (prevSelected >= 0 && static_cast<size_t>(prevSelected) < self->m_rig.bones.size())
-                    ? prevSelected
-                    : (self->m_rig.bones.empty() ? -1 : 0);
-        }
-        self->rebuildBoneTree();
-        self->syncInspectorFromSelectedBone();
-        self->pushSkeletonToDaemon();
-        emit self->boneSelected(self->m_selectedBoneIndex);
-        emit self->skeletonUpdated(self->m_rig.objectId, self->m_rig);
+        const int32_t targetSel = (snap.bones.size() == newSize) ? newBoneIdx : prevSelected;
+        self->applySnapshotState(snap, targetSel, nullptr);
     };
 
     if (m_commandBus) {
@@ -1159,48 +1393,45 @@ bool BoneRiggingPanel::reparentBone(int32_t childIndex, int32_t newParentIndex)
     BoneHierarchySnapshot oldRig = m_rig;
     BoneHierarchySnapshot newRig = m_rig;
     recomputeWorldAndOffsetTransforms(newRig);
+    applyWorldPreservingParent(newRig, static_cast<size_t>(childIndex), targetParent);
 
-    we_mdl_bone_t &childBone = newRig.bones[static_cast<size_t>(childIndex)];
-    float desiredWorld[16];
-    std::memcpy(desiredWorld, childBone.world_bind, sizeof(desiredWorld));
-    childBone.parent = targetParent;
+    const int32_t oldSelected = m_selectedBoneIndex;
+    int32_t trackedIdx = childIndex;
+    std::vector<int32_t> forwardMap;
+    ensureTopologicalOrder(newRig, trackedIdx, &forwardMap);
 
-    if (targetParent == 0xFFFFFFFFu) {
-        mat4DecomposeTrs(desiredWorld, childBone.bind_pos, childBone.bind_angle,
-                         childBone.bind_scale);
-    } else {
-        float parentInv[16];
-        if (we_mat4_inverse(newRig.bones[targetParent].world_bind, parentInv)) {
-            float newLocal[16];
-            we_mat4_mul(parentInv, desiredWorld, newLocal);
-            mat4DecomposeTrs(newLocal, childBone.bind_pos, childBone.bind_angle,
-                             childBone.bind_scale);
+    std::vector<int32_t> inverseMap(forwardMap.size(), -1);
+    for (size_t oldI = 0u; oldI < forwardMap.size(); ++oldI) {
+        const int32_t newI = forwardMap[oldI];
+        if (newI >= 0 && static_cast<size_t>(newI) < inverseMap.size()) {
+            inverseMap[static_cast<size_t>(newI)] = static_cast<int32_t>(oldI);
         }
     }
 
-    int32_t trackedIdx = childIndex;
-    ensureTopologicalOrder(newRig, trackedIdx);
+    std::vector<uint32_t> newParents(newRig.bones.size());
+    for (size_t i = 0u; i < newRig.bones.size(); ++i) {
+        newParents[i] = newRig.bones[i].parent;
+    }
+    const bool reordered = isNonIdentityRemap(forwardMap);
 
     QPointer<BoneRiggingPanel> self(this);
-    const int32_t targetObjectId = m_rig.objectId;
-    auto applyFn = [self, targetObjectId, trackedIdx](const BoneHierarchySnapshot &snap) {
-        if (!self || self->m_rig.objectId != targetObjectId) {
+    auto applyFn = [self, trackedIdx, oldSelected, forwardMap, inverseMap, newParents,
+                    reordered](const BoneHierarchySnapshot &snap) {
+        if (!self) {
             return;
         }
-        BoneHierarchySnapshot nextRig = snap;
-        sanitizeAndTrackXpbdTransition(self->m_rig, nextRig, ensureBoneAux(self.data()));
-        self->m_rig = std::move(nextRig);
-        if (self->m_rig.bones.empty()) {
-            self->m_selectedBoneIndex = -1;
-        } else {
-            self->m_selectedBoneIndex =
-                std::clamp(trackedIdx, 0, static_cast<int32_t>(self->m_rig.bones.size()) - 1);
+        bool isForward = (snap.bones.size() == newParents.size());
+        if (isForward) {
+            for (size_t i = 0u; i < newParents.size(); ++i) {
+                if (snap.bones[i].parent != newParents[i]) {
+                    isForward = false;
+                    break;
+                }
+            }
         }
-        self->rebuildBoneTree();
-        self->syncInspectorFromSelectedBone();
-        self->pushSkeletonToDaemon();
-        emit self->boneSelected(self->m_selectedBoneIndex);
-        emit self->skeletonUpdated(self->m_rig.objectId, self->m_rig);
+        const std::vector<int32_t> *remapPtr =
+            reordered ? (isForward ? &forwardMap : &inverseMap) : nullptr;
+        self->applySnapshotState(snap, isForward ? trackedIdx : oldSelected, remapPtr);
     };
 
     if (m_commandBus) {
@@ -1214,6 +1445,29 @@ bool BoneRiggingPanel::reparentBone(int32_t childIndex, int32_t newParentIndex)
     return true;
 }
 
+void BoneRiggingPanel::dispatchIkPreview(int32_t objectId, const we_ik_chain_t &chain)
+{
+    emit ikPreviewRequested(objectId, chain);
+    // MainWindow listens to ikPreviewRequested and sends PREVIEW_IK; only send directly when
+    // no slot is connected to avoid duplicate wire packets.
+    if (m_ipcClient && objectId >= 0 &&
+        !isSignalConnected(QMetaMethod::fromSignal(&BoneRiggingPanel::ikPreviewRequested))) {
+        waywal_ipc_puppet_preview_ik_t req{};
+        req.object_id = static_cast<uint32_t>(objectId);
+        req.root_bone = chain.root_bone;
+        req.mid_bone = chain.mid_bone;
+        req.end_bone = chain.end_bone;
+        req.pole_flip = (chain.bend_sign < 0) ? 1u : 0u;
+        req.target_world[0] = chain.target_world[0];
+        req.target_world[1] = chain.target_world[1];
+        req.target_world[2] = chain.target_world[2];
+        req.override_count = 0u;
+        req.mode_flags = (chain.enabled != 0u) ? 1u : 2u;
+        const std::vector<waywal_ipc_bone_trs_t> emptyOverrides;
+        m_ipcClient->sendPuppetPreviewIk(req, emptyOverrides);
+    }
+}
+
 bool BoneRiggingPanel::createTwoBoneIkChain(uint16_t rootBone, uint16_t midBone, uint16_t endBone)
 {
     const size_t n = m_rig.bones.size();
@@ -1221,6 +1475,12 @@ bool BoneRiggingPanel::createTwoBoneIkChain(uint16_t rootBone, uint16_t midBone,
         return false;
     }
     if (rootBone == midBone || midBone == endBone || rootBone == endBone) {
+        return false;
+    }
+    if (!isBoneDescendant(m_rig, rootBone, midBone) || !isBoneDescendant(m_rig, midBone, endBone)) {
+        emit statusMessage(
+            tr("IK chain rejected: mid bone must descend from root and end bone must descend "
+               "from mid"));
         return false;
     }
 
@@ -1235,6 +1495,17 @@ bool BoneRiggingPanel::createTwoBoneIkChain(uint16_t rootBone, uint16_t midBone,
     BoneHierarchySnapshot oldRig = m_rig;
     BoneHierarchySnapshot newRig = m_rig;
     recomputeWorldAndOffsetTransforms(newRig);
+
+    const float seg1Len = worldBoneDistance(newRig, rootBone, midBone);
+    const float seg2Len = worldBoneDistance(newRig, midBone, endBone);
+    if (seg1Len <= kMinIkSegmentLen || seg2Len <= kMinIkSegmentLen) {
+        emit statusMessage(
+            tr("IK chain rejected: bone segment lengths must be non-zero (root->mid=%1, "
+               "mid->end=%2)")
+                .arg(static_cast<double>(seg1Len), 0, 'f', 3)
+                .arg(static_cast<double>(seg2Len), 0, 'f', 3));
+        return false;
+    }
 
     we_ik_chain_t chain{};
     chain.root_bone = rootBone;
@@ -1259,8 +1530,14 @@ bool BoneRiggingPanel::createTwoBoneIkChain(uint16_t rootBone, uint16_t midBone,
         m_ikMinAngleSpin ? static_cast<float>(m_ikMinAngleSpin->value()) * kDegToRad : -kPi;
     chain.root_angle_max_rad =
         m_ikMaxAngleSpin ? static_cast<float>(m_ikMaxAngleSpin->value()) * kDegToRad : kPi;
-    chain.mid_angle_min_rad = chain.root_angle_min_rad;
-    chain.mid_angle_max_rad = chain.root_angle_max_rad;
+    chain.mid_angle_min_rad =
+        (m_impl && m_impl->ikMidMinAngleSpin)
+            ? static_cast<float>(m_impl->ikMidMinAngleSpin->value()) * kDegToRad
+            : chain.root_angle_min_rad;
+    chain.mid_angle_max_rad =
+        (m_impl && m_impl->ikMidMaxAngleSpin)
+            ? static_cast<float>(m_impl->ikMidMaxAngleSpin->value()) * kDegToRad
+            : chain.root_angle_max_rad;
     chain.blend_weight = 1.0f;
 
     if (existingIt != m_rig.ikChains.end()) {
@@ -1277,19 +1554,15 @@ bool BoneRiggingPanel::createTwoBoneIkChain(uint16_t rootBone, uint16_t midBone,
     }
 
     QPointer<BoneRiggingPanel> self(this);
-    const int32_t targetObjectId = m_rig.objectId;
-    auto applyFn = [self, targetObjectId, chain](const BoneHierarchySnapshot &snap) {
-        if (!self || self->m_rig.objectId != targetObjectId) {
+    const int32_t keepSelected = m_selectedBoneIndex;
+    auto applyFn = [self, keepSelected, chain](const BoneHierarchySnapshot &snap) {
+        if (!self) {
             return;
         }
-        BoneHierarchySnapshot nextRig = snap;
-        sanitizeAndTrackXpbdTransition(self->m_rig, nextRig, ensureBoneAux(self.data()));
-        self->m_rig = std::move(nextRig);
-        self->rebuildBoneTree();
-        self->syncInspectorFromSelectedBone();
-        self->pushSkeletonToDaemon();
-        emit self->skeletonUpdated(self->m_rig.objectId, self->m_rig);
-        emit self->ikPreviewRequested(self->m_rig.objectId, chain);
+        self->applySnapshotState(snap, keepSelected, nullptr);
+        if (chain.enabled != 0u) {
+            self->dispatchIkPreview(self->m_rig.objectId, chain);
+        }
     };
 
     if (m_commandBus) {
@@ -1299,7 +1572,6 @@ bool BoneRiggingPanel::createTwoBoneIkChain(uint16_t rootBone, uint16_t midBone,
         applyFn(newRig);
     }
 
-    dispatchIkPreviewIpc(m_ipcClient, m_rig.objectId, chain);
     emit statusMessage(
         tr("Created 2-bone IK chain (%1 -> %2 -> %3)").arg(rootBone).arg(midBone).arg(endBone));
     return true;
@@ -1332,21 +1604,7 @@ void BoneRiggingPanel::onDeleteBoneClicked()
             continue;
         }
         if (newRig.bones[i].parent == delIdx) {
-            float desiredWorld[16];
-            std::memcpy(desiredWorld, newRig.bones[i].world_bind, sizeof(desiredWorld));
-            newRig.bones[i].parent = inheritedParent;
-            if (inheritedParent == 0xFFFFFFFFu) {
-                mat4DecomposeTrs(desiredWorld, newRig.bones[i].bind_pos, newRig.bones[i].bind_angle,
-                                 newRig.bones[i].bind_scale);
-            } else {
-                float pInv[16];
-                if (we_mat4_inverse(newRig.bones[inheritedParent].world_bind, pInv)) {
-                    float localMat[16];
-                    we_mat4_mul(pInv, desiredWorld, localMat);
-                    mat4DecomposeTrs(localMat, newRig.bones[i].bind_pos, newRig.bones[i].bind_angle,
-                                     newRig.bones[i].bind_scale);
-                }
-            }
+            applyWorldPreservingParent(newRig, i, inheritedParent);
         }
     }
 
@@ -1391,26 +1649,39 @@ void BoneRiggingPanel::onDeleteBoneClicked()
                                ? -1
                                : std::min<int32_t>(static_cast<int32_t>(delIdx),
                                                    static_cast<int32_t>(newRig.bones.size()) - 1);
-    ensureTopologicalOrder(newRig, nextSelected);
+    std::vector<int32_t> topoMap;
+    ensureTopologicalOrder(newRig, nextSelected, &topoMap);
+
+    std::vector<int32_t> forwardMap(n, -1);
+    for (size_t oldI = 0u; oldI < n; ++oldI) {
+        if (oldI == delIdx) {
+            forwardMap[oldI] = -1;
+        } else {
+            const size_t postErase = (oldI < delIdx) ? oldI : (oldI - 1u);
+            forwardMap[oldI] = (postErase < topoMap.size()) ? topoMap[postErase] : -1;
+        }
+    }
+
+    std::vector<int32_t> inverseMap(newRig.bones.size(), -1);
+    for (size_t oldI = 0u; oldI < n; ++oldI) {
+        const int32_t newI = forwardMap[oldI];
+        if (newI >= 0 && static_cast<size_t>(newI) < inverseMap.size()) {
+            inverseMap[static_cast<size_t>(newI)] = static_cast<int32_t>(oldI);
+        }
+    }
+
+    const int32_t oldSelected = m_selectedBoneIndex;
+    const size_t newSize = newRig.bones.size();
 
     QPointer<BoneRiggingPanel> self(this);
-    const int32_t targetObjectId = m_rig.objectId;
-    auto applyFn = [self, targetObjectId, nextSelected](const BoneHierarchySnapshot &snap) {
-        if (!self || self->m_rig.objectId != targetObjectId) {
+    auto applyFn = [self, newSize, nextSelected, oldSelected, forwardMap,
+                    inverseMap](const BoneHierarchySnapshot &snap) {
+        if (!self) {
             return;
         }
-        BoneHierarchySnapshot nextRig = snap;
-        sanitizeAndTrackXpbdTransition(self->m_rig, nextRig, ensureBoneAux(self.data()));
-        self->m_rig = std::move(nextRig);
-        self->m_selectedBoneIndex =
-            self->m_rig.bones.empty()
-                ? -1
-                : std::clamp(nextSelected, 0, static_cast<int32_t>(self->m_rig.bones.size()) - 1);
-        self->rebuildBoneTree();
-        self->syncInspectorFromSelectedBone();
-        self->pushSkeletonToDaemon();
-        emit self->boneSelected(self->m_selectedBoneIndex);
-        emit self->skeletonUpdated(self->m_rig.objectId, self->m_rig);
+        const bool isForward = (snap.bones.size() == newSize);
+        const std::vector<int32_t> &remap = isForward ? forwardMap : inverseMap;
+        self->applySnapshotState(snap, isForward ? nextSelected : oldSelected, &remap);
     };
 
     if (m_commandBus) {
@@ -1434,37 +1705,43 @@ void BoneRiggingPanel::onCreateIkChainClicked()
     int32_t midIdx = -1;
     int32_t endIdx = -1;
 
-    auto *rootCombo = findChild<QComboBox *>(QStringLiteral("ikRootCombo"));
-    auto *midCombo = findChild<QComboBox *>(QStringLiteral("ikMidCombo"));
-    auto *endCombo = findChild<QComboBox *>(QStringLiteral("ikEndCombo"));
-    if (rootCombo && midCombo && endCombo && rootCombo->currentIndex() >= 0 &&
-        midCombo->currentIndex() >= 0 && endCombo->currentIndex() >= 0) {
-        rootIdx = rootCombo->currentData().toInt();
-        midIdx = midCombo->currentData().toInt();
-        endIdx = endCombo->currentData().toInt();
+    if (m_impl && m_impl->ikRootCombo && m_impl->ikMidCombo && m_impl->ikEndCombo &&
+        m_impl->ikRootCombo->currentIndex() >= 0 && m_impl->ikMidCombo->currentIndex() >= 0 &&
+        m_impl->ikEndCombo->currentIndex() >= 0) {
+        rootIdx = m_impl->ikRootCombo->currentData().toInt();
+        midIdx = m_impl->ikMidCombo->currentData().toInt();
+        endIdx = m_impl->ikEndCombo->currentData().toInt();
     }
 
-    if (rootIdx < 0 || midIdx < 0 || endIdx < 0 || rootIdx == midIdx || midIdx == endIdx ||
-        rootIdx == endIdx) {
-        if (m_selectedBoneIndex >= 0 &&
-            static_cast<size_t>(m_selectedBoneIndex) < m_rig.bones.size()) {
-            endIdx = m_selectedBoneIndex;
-            const uint32_t midU = m_rig.bones[static_cast<size_t>(endIdx)].parent;
-            if (midU != 0xFFFFFFFFu && midU < m_rig.bones.size()) {
-                midIdx = static_cast<int32_t>(midU);
-                const uint32_t rootU = m_rig.bones[midU].parent;
-                if (rootU != 0xFFFFFFFFu && rootU < m_rig.bones.size()) {
-                    rootIdx = static_cast<int32_t>(rootU);
-                }
+    const bool comboChainValid =
+        (rootIdx >= 0 && midIdx >= 0 && endIdx >= 0 && rootIdx != midIdx && midIdx != endIdx &&
+         rootIdx != endIdx &&
+         isBoneDescendant(m_rig, static_cast<uint16_t>(rootIdx), static_cast<uint16_t>(midIdx)) &&
+         isBoneDescendant(m_rig, static_cast<uint16_t>(midIdx), static_cast<uint16_t>(endIdx)));
+
+    if (!comboChainValid && m_selectedBoneIndex >= 0 &&
+        static_cast<size_t>(m_selectedBoneIndex) < m_rig.bones.size()) {
+        endIdx = m_selectedBoneIndex;
+        const uint32_t midU = m_rig.bones[static_cast<size_t>(endIdx)].parent;
+        if (midU != 0xFFFFFFFFu && midU < m_rig.bones.size()) {
+            midIdx = static_cast<int32_t>(midU);
+            const uint32_t rootU = m_rig.bones[midU].parent;
+            if (rootU != 0xFFFFFFFFu && rootU < m_rig.bones.size()) {
+                rootIdx = static_cast<int32_t>(rootU);
+            } else {
+                rootIdx = -1;
             }
+        } else {
+            midIdx = -1;
+            rootIdx = -1;
         }
     }
 
     if (rootIdx < 0 || midIdx < 0 || endIdx < 0 || rootIdx == midIdx || midIdx == endIdx ||
         rootIdx == endIdx) {
-        rootIdx = 0;
-        midIdx = 1;
-        endIdx = 2;
+        emit statusMessage(
+            tr("Select a valid 3-bone descendant chain (Root -> Mid -> End) to create IK"));
+        return;
     }
 
     createTwoBoneIkChain(static_cast<uint16_t>(rootIdx), static_cast<uint16_t>(midIdx),
@@ -1492,204 +1769,198 @@ void BoneRiggingPanel::onBoneTreeCurrentItemChanged(QTreeWidgetItem *current,
     }
     m_selectedBoneIndex = nextIdx;
     syncInspectorFromSelectedBone();
+    saveActiveObjectState();
     emit boneSelected(m_selectedBoneIndex);
 }
 
 void BoneRiggingPanel::onTransformOrConstraintEdited()
 {
-    if (m_updatingUi || m_selectedBoneIndex < 0 ||
-        static_cast<size_t>(m_selectedBoneIndex) >= m_rig.bones.size()) {
+    if (m_updatingUi || !m_impl) {
+        return;
+    }
+
+    const bool hasSelectedBone =
+        (m_selectedBoneIndex >= 0 && static_cast<size_t>(m_selectedBoneIndex) < m_rig.bones.size());
+
+    int activeChainIdx = -1;
+    if (m_impl->ikChainCombo && !m_rig.ikChains.empty()) {
+        const int candidate = m_impl->ikChainCombo->currentData().toInt();
+        if (candidate >= 0 && static_cast<size_t>(candidate) < m_rig.ikChains.size()) {
+            activeChainIdx = candidate;
+        }
+    }
+
+    if (!hasSelectedBone && activeChainIdx < 0) {
         return;
     }
 
     BoneHierarchySnapshot oldRig = m_rig;
     BoneHierarchySnapshot newRig = m_rig;
-    const size_t sel = static_cast<size_t>(m_selectedBoneIndex);
-    we_mdl_bone_t &bone = newRig.bones[sel];
+    QString cmdTitle = tr("Edit IK Chain");
 
-    if (m_boneNameEdit) {
-        const QString trimmed = m_boneNameEdit->text().trimmed();
-        if (!trimmed.isEmpty()) {
-            const QByteArray utf8 = trimmed.toUtf8();
-            const size_t len =
-                std::min<size_t>(static_cast<size_t>(utf8.size()), sizeof(bone.name) - 1u);
-            std::memset(bone.name, 0, sizeof(bone.name));
-            std::memcpy(bone.name, utf8.constData(), len);
-        }
-    }
+    if (hasSelectedBone) {
+        const size_t sel = static_cast<size_t>(m_selectedBoneIndex);
+        we_mdl_bone_t &bone = newRig.bones[sel];
 
-    if (m_posXSpin) {
-        bone.bind_pos[0] = static_cast<float>(m_posXSpin->value());
-    }
-    if (m_posYSpin) {
-        bone.bind_pos[1] = static_cast<float>(m_posYSpin->value());
-    }
-    if (m_angleZSpin) {
-        bone.bind_angle[2] = static_cast<float>(m_angleZSpin->value()) * kDegToRad;
-    }
-    if (m_scaleXSpin) {
-        bone.bind_scale[0] = static_cast<float>(m_scaleXSpin->value());
-    }
-    if (m_scaleYSpin) {
-        bone.bind_scale[1] = static_cast<float>(m_scaleYSpin->value());
-    }
-    if (std::fabs(bone.bind_scale[0]) < 1e-5f) {
-        bone.bind_scale[0] = 1.0f;
-    }
-    if (std::fabs(bone.bind_scale[1]) < 1e-5f) {
-        bone.bind_scale[1] = 1.0f;
-    }
-
-    if (m_driveModeCombo && sel < WE_MDL_MAX_BONES) {
-        const auto mode =
-            static_cast<we_bone_drive_mode_t>(m_driveModeCombo->currentData().toUInt());
-        newRig.driveModes[sel] = mode;
-
-        if (mode == WE_BONE_DRIVE_XPBD) {
-            if (!boneHasActiveSimulationJson(bone.simulation_json)) {
-                writeDefaultXpbdSimulationJson(bone);
+        if (m_boneNameEdit) {
+            const QString trimmed = m_boneNameEdit->text().trimmed();
+            if (!trimmed.isEmpty()) {
+                const QByteArray utf8 = trimmed.toUtf8();
+                const size_t len =
+                    std::min<size_t>(static_cast<size_t>(utf8.size()), sizeof(bone.name) - 1u);
+                std::memset(bone.name, 0, sizeof(bone.name));
+                std::memcpy(bone.name, utf8.constData(), len);
             }
-            for (auto &c : newRig.ikChains) {
-                if (c.root_bone == sel || c.mid_bone == sel || c.end_bone == sel) {
-                    c.enabled = 0u;
+        }
+
+        if (m_posXSpin) {
+            bone.bind_pos[0] = static_cast<float>(m_posXSpin->value());
+        }
+        if (m_posYSpin) {
+            bone.bind_pos[1] = static_cast<float>(m_posYSpin->value());
+        }
+        if (m_angleZSpin) {
+            bone.bind_angle[2] = static_cast<float>(m_angleZSpin->value()) * kDegToRad;
+        }
+        if (m_scaleXSpin) {
+            bone.bind_scale[0] = static_cast<float>(m_scaleXSpin->value());
+        }
+        if (m_scaleYSpin) {
+            bone.bind_scale[1] = static_cast<float>(m_scaleYSpin->value());
+        }
+        if (std::fabs(bone.bind_scale[0]) < 1e-5f) {
+            bone.bind_scale[0] = 1.0f;
+        }
+        if (std::fabs(bone.bind_scale[1]) < 1e-5f) {
+            bone.bind_scale[1] = 1.0f;
+        }
+
+        if (m_driveModeCombo && sel < WE_MDL_MAX_BONES) {
+            const auto mode =
+                static_cast<we_bone_drive_mode_t>(m_driveModeCombo->currentData().toUInt());
+            applyXpbdDriveState(newRig, sel, mode);
+        }
+
+        if (m_impl->aimEnableCheck) {
+            auto aimIt =
+                std::find_if(newRig.aimConstraints.begin(), newRig.aimConstraints.end(),
+                             [sel](const we_aim_constraint_t &a) { return a.bone_index == sel; });
+            const bool enabled = m_impl->aimEnableCheck->isChecked();
+            if (enabled && aimIt == newRig.aimConstraints.end() &&
+                newRig.aimConstraints.size() < WE_RIG_MAX_AIM_CONSTRAINTS) {
+                we_aim_constraint_t created{};
+                created.bone_index = static_cast<uint16_t>(sel);
+                created.enabled = 1u;
+                created.aim_axis_local[0] = 1.0f;
+                created.max_cone_rad = 0.5f * kPi;
+                created.blend_weight = 1.0f;
+                newRig.aimConstraints.push_back(created);
+                aimIt = std::prev(newRig.aimConstraints.end());
+            }
+            if (aimIt != newRig.aimConstraints.end()) {
+                aimIt->enabled = enabled ? 1u : 0u;
+                if (m_impl->aimAxisCombo) {
+                    const int axisId = m_impl->aimAxisCombo->currentData().toInt();
+                    aimIt->aim_axis_local[0] = (axisId == 0) ? 1.0f : (axisId == 2 ? -1.0f : 0.0f);
+                    aimIt->aim_axis_local[1] = (axisId == 1) ? 1.0f : (axisId == 3 ? -1.0f : 0.0f);
+                    aimIt->aim_axis_local[2] = 0.0f;
+                }
+                if (m_impl->aimTargetXSpin) {
+                    aimIt->target_world[0] = static_cast<float>(m_impl->aimTargetXSpin->value());
+                }
+                if (m_impl->aimTargetYSpin) {
+                    aimIt->target_world[1] = static_cast<float>(m_impl->aimTargetYSpin->value());
+                }
+                if (m_impl->aimConeDegSpin) {
+                    aimIt->max_cone_rad =
+                        static_cast<float>(m_impl->aimConeDegSpin->value()) * kDegToRad;
+                }
+                if (m_impl->aimBlendSpin) {
+                    aimIt->blend_weight =
+                        std::clamp(static_cast<float>(m_impl->aimBlendSpin->value()), 0.0f, 1.0f);
                 }
             }
-            for (auto &a : newRig.aimConstraints) {
-                if (a.bone_index == sel) {
-                    a.enabled = 0u;
-                }
-            }
-        } else {
-            std::memset(bone.simulation_json, 0, sizeof(bone.simulation_json));
         }
+
+        cmdTitle = tr("Edit Bone %1").arg(QString::fromUtf8(bone.name));
     }
 
-    // Sync active 2-Bone IK chain controls when a chain is selected.
-    int activeChainIdx = -1;
     bool ikChainModified = false;
-    auto *ikChainCombo = findChild<QComboBox *>(QStringLiteral("ikChainCombo"));
-    if (ikChainCombo && !newRig.ikChains.empty()) {
-        const int chainIdx = ikChainCombo->currentData().toInt();
-        if (chainIdx >= 0 && static_cast<size_t>(chainIdx) < newRig.ikChains.size()) {
-            activeChainIdx = chainIdx;
-            we_ik_chain_t &chain = newRig.ikChains[static_cast<size_t>(chainIdx)];
-            if (auto *tx = findChild<QDoubleSpinBox *>(QStringLiteral("ikTargetXSpin"))) {
-                chain.target_world[0] = static_cast<float>(tx->value());
-            }
-            if (auto *ty = findChild<QDoubleSpinBox *>(QStringLiteral("ikTargetYSpin"))) {
-                chain.target_world[1] = static_cast<float>(ty->value());
-            }
-            if (auto *px = findChild<QDoubleSpinBox *>(QStringLiteral("ikPoleXSpin"))) {
-                chain.pole_world[0] = static_cast<float>(px->value());
-            }
-            if (auto *py = findChild<QDoubleSpinBox *>(QStringLiteral("ikPoleYSpin"))) {
-                chain.pole_world[1] = static_cast<float>(py->value());
-            }
-            if (m_poleFlipCheck) {
-                chain.bend_sign = m_poleFlipCheck->isChecked() ? -1 : 1;
-            }
-            if (m_ikSoftZoneSpin) {
-                chain.soft_zone_ratio =
-                    std::clamp(static_cast<float>(m_ikSoftZoneSpin->value()), 0.0f, 0.25f);
-            }
-            if (m_ikMaxStretchSpin) {
-                chain.max_stretch_ratio =
-                    std::clamp(static_cast<float>(m_ikMaxStretchSpin->value()), 1.0f, 1.5f);
-            }
-            if (m_ikMinAngleSpin) {
-                chain.root_angle_min_rad =
-                    static_cast<float>(m_ikMinAngleSpin->value()) * kDegToRad;
-                chain.mid_angle_min_rad = chain.root_angle_min_rad;
-            }
-            if (m_ikMaxAngleSpin) {
-                chain.root_angle_max_rad =
-                    static_cast<float>(m_ikMaxAngleSpin->value()) * kDegToRad;
-                chain.mid_angle_max_rad = chain.root_angle_max_rad;
-            }
-            if (auto *bs = findChild<QDoubleSpinBox *>(QStringLiteral("ikBlendSpin"))) {
-                chain.blend_weight = std::clamp(static_cast<float>(bs->value()), 0.0f, 1.0f);
-            }
-            if (static_cast<size_t>(chainIdx) < oldRig.ikChains.size()) {
-                ikChainModified = (std::memcmp(&oldRig.ikChains[static_cast<size_t>(chainIdx)],
-                                               &chain, sizeof(we_ik_chain_t)) != 0);
-            }
+    if (activeChainIdx >= 0 && static_cast<size_t>(activeChainIdx) < newRig.ikChains.size()) {
+        we_ik_chain_t &chain = newRig.ikChains[static_cast<size_t>(activeChainIdx)];
+        if (m_impl->ikTargetXSpin) {
+            chain.target_world[0] = static_cast<float>(m_impl->ikTargetXSpin->value());
         }
-    }
-
-    // Sync single-bone Look-At / Aim constraint for the selected bone.
-    if (auto *aimEnable = findChild<QCheckBox *>(QStringLiteral("aimEnableCheck"))) {
-        auto aimIt =
-            std::find_if(newRig.aimConstraints.begin(), newRig.aimConstraints.end(),
-                         [sel](const we_aim_constraint_t &a) { return a.bone_index == sel; });
-        const bool enabled = aimEnable->isChecked();
-        if (enabled && aimIt == newRig.aimConstraints.end() &&
-            newRig.aimConstraints.size() < WE_RIG_MAX_AIM_CONSTRAINTS) {
-            we_aim_constraint_t created{};
-            created.bone_index = static_cast<uint16_t>(sel);
-            created.enabled = 1u;
-            created.aim_axis_local[0] = 1.0f;
-            created.max_cone_rad = 0.5f * kPi;
-            created.blend_weight = 1.0f;
-            newRig.aimConstraints.push_back(created);
-            aimIt = std::prev(newRig.aimConstraints.end());
+        if (m_impl->ikTargetYSpin) {
+            chain.target_world[1] = static_cast<float>(m_impl->ikTargetYSpin->value());
         }
-        if (aimIt != newRig.aimConstraints.end()) {
-            aimIt->enabled = enabled ? 1u : 0u;
-            if (auto *axisCombo = findChild<QComboBox *>(QStringLiteral("aimAxisCombo"))) {
-                const int axisId = axisCombo->currentData().toInt();
-                aimIt->aim_axis_local[0] = (axisId == 0) ? 1.0f : (axisId == 2 ? -1.0f : 0.0f);
-                aimIt->aim_axis_local[1] = (axisId == 1) ? 1.0f : (axisId == 3 ? -1.0f : 0.0f);
-                aimIt->aim_axis_local[2] = 0.0f;
-            }
-            if (auto *tx = findChild<QDoubleSpinBox *>(QStringLiteral("aimTargetXSpin"))) {
-                aimIt->target_world[0] = static_cast<float>(tx->value());
-            }
-            if (auto *ty = findChild<QDoubleSpinBox *>(QStringLiteral("aimTargetYSpin"))) {
-                aimIt->target_world[1] = static_cast<float>(ty->value());
-            }
-            if (auto *cone = findChild<QDoubleSpinBox *>(QStringLiteral("aimConeDegSpin"))) {
-                aimIt->max_cone_rad = static_cast<float>(cone->value()) * kDegToRad;
-            }
-            if (auto *blend = findChild<QDoubleSpinBox *>(QStringLiteral("aimBlendSpin"))) {
-                aimIt->blend_weight = std::clamp(static_cast<float>(blend->value()), 0.0f, 1.0f);
-            }
-            if (enabled && sel < WE_MDL_MAX_BONES && newRig.driveModes[sel] != WE_BONE_DRIVE_XPBD) {
-                newRig.driveModes[sel] = WE_BONE_DRIVE_AIM;
-            }
+        if (m_impl->ikPoleXSpin) {
+            chain.pole_world[0] = static_cast<float>(m_impl->ikPoleXSpin->value());
+        }
+        if (m_impl->ikPoleYSpin) {
+            chain.pole_world[1] = static_cast<float>(m_impl->ikPoleYSpin->value());
+        }
+        if (m_impl->ikPoleZSpin) {
+            chain.pole_world[2] = static_cast<float>(m_impl->ikPoleZSpin->value());
+        }
+        if (m_poleFlipCheck) {
+            chain.bend_sign = m_poleFlipCheck->isChecked() ? -1 : 1;
+        }
+        if (m_ikSoftZoneSpin) {
+            chain.soft_zone_ratio =
+                std::clamp(static_cast<float>(m_ikSoftZoneSpin->value()), 0.0f, 0.25f);
+        }
+        if (m_ikMaxStretchSpin) {
+            chain.max_stretch_ratio =
+                std::clamp(static_cast<float>(m_ikMaxStretchSpin->value()), 1.0f, 1.5f);
+        }
+        if (m_ikMinAngleSpin) {
+            chain.root_angle_min_rad = static_cast<float>(m_ikMinAngleSpin->value()) * kDegToRad;
+        }
+        if (m_ikMaxAngleSpin) {
+            chain.root_angle_max_rad = static_cast<float>(m_ikMaxAngleSpin->value()) * kDegToRad;
+        }
+        if (m_impl->ikMidMinAngleSpin) {
+            chain.mid_angle_min_rad =
+                static_cast<float>(m_impl->ikMidMinAngleSpin->value()) * kDegToRad;
+        }
+        if (m_impl->ikMidMaxAngleSpin) {
+            chain.mid_angle_max_rad =
+                static_cast<float>(m_impl->ikMidMaxAngleSpin->value()) * kDegToRad;
+        }
+        if (m_impl->ikBlendSpin) {
+            chain.blend_weight =
+                std::clamp(static_cast<float>(m_impl->ikBlendSpin->value()), 0.0f, 1.0f);
+        }
+        if (static_cast<size_t>(activeChainIdx) < oldRig.ikChains.size()) {
+            ikChainModified = (std::memcmp(&oldRig.ikChains[static_cast<size_t>(activeChainIdx)],
+                                           &chain, sizeof(we_ik_chain_t)) != 0);
         }
     }
 
     recomputeWorldAndOffsetTransforms(newRig);
 
     QPointer<BoneRiggingPanel> self(this);
-    const int32_t targetObjectId = m_rig.objectId;
-    auto applyFn = [self, targetObjectId, activeChainIdx,
+    const int32_t keepSelected = m_selectedBoneIndex;
+    auto applyFn = [self, keepSelected, activeChainIdx,
                     ikChainModified](const BoneHierarchySnapshot &snap) {
-        if (!self || self->m_rig.objectId != targetObjectId) {
+        if (!self) {
             return;
         }
-        BoneHierarchySnapshot nextRig = snap;
-        sanitizeAndTrackXpbdTransition(self->m_rig, nextRig, ensureBoneAux(self.data()));
-        self->m_rig = std::move(nextRig);
-        self->rebuildBoneTree();
-        self->syncInspectorFromSelectedBone();
-        self->pushSkeletonToDaemon();
-        emit self->skeletonUpdated(self->m_rig.objectId, self->m_rig);
+        self->applySnapshotState(snap, keepSelected, nullptr);
         if (ikChainModified && activeChainIdx >= 0 &&
             static_cast<size_t>(activeChainIdx) < self->m_rig.ikChains.size()) {
             const we_ik_chain_t &activeChain =
                 self->m_rig.ikChains[static_cast<size_t>(activeChainIdx)];
             if (activeChain.enabled != 0u) {
-                emit self->ikPreviewRequested(self->m_rig.objectId, activeChain);
-                dispatchIkPreviewIpc(self->m_ipcClient, self->m_rig.objectId, activeChain);
+                self->dispatchIkPreview(self->m_rig.objectId, activeChain);
             }
         }
     };
 
     if (m_commandBus) {
-        m_commandBus->execute(
-            std::make_unique<BoneEditCommand>(tr("Edit Bone %1").arg(QString::fromUtf8(bone.name)),
-                                              std::move(oldRig), std::move(newRig), applyFn));
+        m_commandBus->execute(std::make_unique<BoneEditCommand>(cmdTitle, std::move(oldRig),
+                                                                std::move(newRig), applyFn));
     } else {
         applyFn(newRig);
     }
@@ -1771,35 +2042,18 @@ void BoneRiggingPanel::rebuildBoneTree()
 
 void BoneRiggingPanel::syncInspectorFromSelectedBone()
 {
+    if (!m_impl) {
+        return;
+    }
     const QScopedValueRollback<bool> guard(m_updatingUi, true);
     const size_t n = m_rig.bones.size();
     const bool hasSelection =
         (m_selectedBoneIndex >= 0 && static_cast<size_t>(m_selectedBoneIndex) < n);
 
-    auto *deleteBoneBtn = findChild<QPushButton *>(QStringLiteral("deleteBoneBtn"));
-    auto *makeRootBtn = findChild<QPushButton *>(QStringLiteral("makeRootBtn"));
-    auto *parentCombo = findChild<QComboBox *>(QStringLiteral("parentCombo"));
-    auto *ikChainCombo = findChild<QComboBox *>(QStringLiteral("ikChainCombo"));
-    auto *deleteIkBtn = findChild<QPushButton *>(QStringLiteral("deleteIkBtn"));
-    auto *ikRootCombo = findChild<QComboBox *>(QStringLiteral("ikRootCombo"));
-    auto *ikMidCombo = findChild<QComboBox *>(QStringLiteral("ikMidCombo"));
-    auto *ikEndCombo = findChild<QComboBox *>(QStringLiteral("ikEndCombo"));
-    auto *ikTargetXSpin = findChild<QDoubleSpinBox *>(QStringLiteral("ikTargetXSpin"));
-    auto *ikTargetYSpin = findChild<QDoubleSpinBox *>(QStringLiteral("ikTargetYSpin"));
-    auto *ikPoleXSpin = findChild<QDoubleSpinBox *>(QStringLiteral("ikPoleXSpin"));
-    auto *ikPoleYSpin = findChild<QDoubleSpinBox *>(QStringLiteral("ikPoleYSpin"));
-    auto *ikBlendSpin = findChild<QDoubleSpinBox *>(QStringLiteral("ikBlendSpin"));
-    auto *aimEnableCheck = findChild<QCheckBox *>(QStringLiteral("aimEnableCheck"));
-    auto *aimTargetBoneCombo = findChild<QComboBox *>(QStringLiteral("aimTargetBoneCombo"));
-    auto *aimAxisCombo = findChild<QComboBox *>(QStringLiteral("aimAxisCombo"));
-    auto *aimTargetXSpin = findChild<QDoubleSpinBox *>(QStringLiteral("aimTargetXSpin"));
-    auto *aimTargetYSpin = findChild<QDoubleSpinBox *>(QStringLiteral("aimTargetYSpin"));
-    auto *aimConeDegSpin = findChild<QDoubleSpinBox *>(QStringLiteral("aimConeDegSpin"));
-    auto *aimBlendSpin = findChild<QDoubleSpinBox *>(QStringLiteral("aimBlendSpin"));
-
     for (QWidget *w : std::initializer_list<QWidget *>{
              m_boneNameEdit, m_driveModeCombo, m_posXSpin, m_posYSpin, m_angleZSpin, m_scaleXSpin,
-             m_scaleYSpin, deleteBoneBtn, makeRootBtn, parentCombo, aimEnableCheck}) {
+             m_scaleYSpin, m_impl->deleteBoneBtn, m_impl->makeRootBtn, m_impl->parentCombo,
+             m_impl->aimEnableCheck}) {
         if (w) {
             w->setEnabled(hasSelection);
         }
@@ -1809,10 +2063,10 @@ void BoneRiggingPanel::syncInspectorFromSelectedBone()
         m_addBoneBtn->setEnabled(n < WE_MDL_MAX_BONES);
     }
 
-    if (parentCombo) {
-        const QSignalBlocker blocker(parentCombo);
-        parentCombo->clear();
-        parentCombo->addItem(tr("<Root>"), -1);
+    if (m_impl->parentCombo) {
+        const QSignalBlocker blocker(m_impl->parentCombo);
+        m_impl->parentCombo->clear();
+        m_impl->parentCombo->addItem(tr("<Root>"), -1);
         for (size_t i = 0; i < n; ++i) {
             if (static_cast<int32_t>(i) == m_selectedBoneIndex) {
                 continue;
@@ -1821,7 +2075,8 @@ void BoneRiggingPanel::syncInspectorFromSelectedBone()
             if (bName.isEmpty()) {
                 bName = QStringLiteral("Bone_%1").arg(i);
             }
-            parentCombo->addItem(QStringLiteral("[%1] %2").arg(i).arg(bName), static_cast<int>(i));
+            m_impl->parentCombo->addItem(QStringLiteral("[%1] %2").arg(i).arg(bName),
+                                         static_cast<int>(i));
         }
     }
 
@@ -1844,23 +2099,59 @@ void BoneRiggingPanel::syncInspectorFromSelectedBone()
             combo->setCurrentIndex(found);
         }
     };
-    populateBoneCombo(ikRootCombo);
-    populateBoneCombo(ikMidCombo);
-    populateBoneCombo(ikEndCombo);
-    if (ikRootCombo && ikMidCombo && ikEndCombo && n >= 3u && ikRootCombo->currentIndex() <= 0 &&
-        ikMidCombo->currentIndex() <= 0 && ikEndCombo->currentIndex() <= 0) {
-        ikRootCombo->setCurrentIndex(0);
-        ikMidCombo->setCurrentIndex(1);
-        ikEndCombo->setCurrentIndex(2);
+    populateBoneCombo(m_impl->ikRootCombo);
+    populateBoneCombo(m_impl->ikMidCombo);
+    populateBoneCombo(m_impl->ikEndCombo);
+    if (m_impl->ikRootCombo && m_impl->ikMidCombo && m_impl->ikEndCombo && n >= 3u) {
+        const int r = m_impl->ikRootCombo->currentData().toInt();
+        const int m = m_impl->ikMidCombo->currentData().toInt();
+        const int e = m_impl->ikEndCombo->currentData().toInt();
+        const bool alreadyValid =
+            (r >= 0 && m >= 0 && e >= 0 && r != m && m != e && r != e &&
+             isBoneDescendant(m_rig, static_cast<uint16_t>(r), static_cast<uint16_t>(m)) &&
+             isBoneDescendant(m_rig, static_cast<uint16_t>(m), static_cast<uint16_t>(e)));
+        if (!alreadyValid) {
+            int candEnd = -1;
+            int candMid = -1;
+            int candRoot = -1;
+            auto tryEnd = [&](size_t endCand) {
+                const uint32_t midU = m_rig.bones[endCand].parent;
+                if (midU != 0xFFFFFFFFu && midU < n) {
+                    const uint32_t rootU = m_rig.bones[midU].parent;
+                    if (rootU != 0xFFFFFFFFu && rootU < n && rootU != midU && rootU != endCand) {
+                        candRoot = static_cast<int>(rootU);
+                        candMid = static_cast<int>(midU);
+                        candEnd = static_cast<int>(endCand);
+                        return true;
+                    }
+                }
+                return false;
+            };
+            if (hasSelection) {
+                tryEnd(static_cast<size_t>(m_selectedBoneIndex));
+            }
+            if (candEnd < 0) {
+                for (size_t i = 0u; i < n; ++i) {
+                    if (tryEnd(i)) {
+                        break;
+                    }
+                }
+            }
+            if (candEnd >= 0) {
+                m_impl->ikRootCombo->setCurrentIndex(m_impl->ikRootCombo->findData(candRoot));
+                m_impl->ikMidCombo->setCurrentIndex(m_impl->ikMidCombo->findData(candMid));
+                m_impl->ikEndCombo->setCurrentIndex(m_impl->ikEndCombo->findData(candEnd));
+            }
+        }
     }
     if (m_createIkBtn) {
         m_createIkBtn->setEnabled(n >= 3u && m_rig.ikChains.size() < WE_RIG_MAX_IK_CHAINS);
     }
 
-    if (aimTargetBoneCombo) {
-        const QSignalBlocker blocker(aimTargetBoneCombo);
-        aimTargetBoneCombo->clear();
-        aimTargetBoneCombo->addItem(tr("Custom World Target"), -1);
+    if (m_impl->aimTargetBoneCombo) {
+        const QSignalBlocker blocker(m_impl->aimTargetBoneCombo);
+        m_impl->aimTargetBoneCombo->clear();
+        m_impl->aimTargetBoneCombo->addItem(tr("Custom World Target"), -1);
         for (size_t i = 0; i < n; ++i) {
             if (static_cast<int32_t>(i) == m_selectedBoneIndex) {
                 continue;
@@ -1869,57 +2160,70 @@ void BoneRiggingPanel::syncInspectorFromSelectedBone()
             if (bName.isEmpty()) {
                 bName = QStringLiteral("Bone_%1").arg(i);
             }
-            aimTargetBoneCombo->addItem(QStringLiteral("[%1] %2").arg(i).arg(bName),
-                                        static_cast<int>(i));
+            m_impl->aimTargetBoneCombo->addItem(QStringLiteral("[%1] %2").arg(i).arg(bName),
+                                                static_cast<int>(i));
         }
+        int savedTarget = -1;
+        if (hasSelection &&
+            static_cast<size_t>(m_selectedBoneIndex) < m_impl->aimTargetBoneIds.size()) {
+            savedTarget = m_impl->aimTargetBoneIds[static_cast<size_t>(m_selectedBoneIndex)];
+        }
+        const int foundTarget = m_impl->aimTargetBoneCombo->findData(savedTarget);
+        m_impl->aimTargetBoneCombo->setCurrentIndex(foundTarget >= 0 ? foundTarget : 0);
     }
 
-    if (ikChainCombo) {
-        const int prevChain =
-            ikChainCombo->currentIndex() >= 0 ? ikChainCombo->currentData().toInt() : 0;
-        const QSignalBlocker blocker(ikChainCombo);
-        ikChainCombo->clear();
+    if (m_impl->ikChainCombo) {
+        const int prevChain = m_impl->ikChainCombo->currentIndex() >= 0
+                                  ? m_impl->ikChainCombo->currentData().toInt()
+                                  : 0;
+        const QSignalBlocker blocker(m_impl->ikChainCombo);
+        m_impl->ikChainCombo->clear();
         for (size_t i = 0; i < m_rig.ikChains.size(); ++i) {
             const auto &c = m_rig.ikChains[i];
-            ikChainCombo->addItem(QStringLiteral("#%1 (%2 -> %3 -> %4)")
-                                      .arg(i)
-                                      .arg(c.root_bone)
-                                      .arg(c.mid_bone)
-                                      .arg(c.end_bone),
-                                  static_cast<int>(i));
+            m_impl->ikChainCombo->addItem(QStringLiteral("#%1 (%2 -> %3 -> %4)")
+                                              .arg(i)
+                                              .arg(c.root_bone)
+                                              .arg(c.mid_bone)
+                                              .arg(c.end_bone),
+                                          static_cast<int>(i));
         }
-        if (ikChainCombo->count() == 0) {
-            ikChainCombo->addItem(tr("No IK Chains"), -1);
+        if (m_impl->ikChainCombo->count() == 0) {
+            m_impl->ikChainCombo->addItem(tr("No IK Chains"), -1);
         } else {
-            const int found = ikChainCombo->findData(prevChain);
-            ikChainCombo->setCurrentIndex(found >= 0 ? found : 0);
+            const int found = m_impl->ikChainCombo->findData(prevChain);
+            m_impl->ikChainCombo->setCurrentIndex(found >= 0 ? found : 0);
         }
     }
 
     const bool hasIkChains = !m_rig.ikChains.empty();
     for (QWidget *w : std::initializer_list<QWidget *>{
-             ikChainCombo, deleteIkBtn, ikTargetXSpin, ikTargetYSpin, ikPoleXSpin, ikPoleYSpin,
+             m_impl->ikChainCombo, m_impl->deleteIkBtn, m_impl->ikTargetXSpin,
+             m_impl->ikTargetYSpin, m_impl->ikPoleXSpin, m_impl->ikPoleYSpin, m_impl->ikPoleZSpin,
              m_poleFlipCheck, m_ikSoftZoneSpin, m_ikMaxStretchSpin, m_ikMinAngleSpin,
-             m_ikMaxAngleSpin, ikBlendSpin}) {
+             m_ikMaxAngleSpin, m_impl->ikMidMinAngleSpin, m_impl->ikMidMaxAngleSpin,
+             m_impl->ikBlendSpin}) {
         if (w) {
             w->setEnabled(hasIkChains);
         }
     }
-    if (hasIkChains && ikChainCombo) {
-        const int cIdx = std::clamp(ikChainCombo->currentData().toInt(), 0,
+    if (hasIkChains && m_impl->ikChainCombo) {
+        const int cIdx = std::clamp(m_impl->ikChainCombo->currentData().toInt(), 0,
                                     static_cast<int>(m_rig.ikChains.size()) - 1);
         const we_ik_chain_t &c = m_rig.ikChains[static_cast<size_t>(cIdx)];
-        if (ikTargetXSpin) {
-            ikTargetXSpin->setValue(static_cast<double>(c.target_world[0]));
+        if (m_impl->ikTargetXSpin) {
+            m_impl->ikTargetXSpin->setValue(static_cast<double>(c.target_world[0]));
         }
-        if (ikTargetYSpin) {
-            ikTargetYSpin->setValue(static_cast<double>(c.target_world[1]));
+        if (m_impl->ikTargetYSpin) {
+            m_impl->ikTargetYSpin->setValue(static_cast<double>(c.target_world[1]));
         }
-        if (ikPoleXSpin) {
-            ikPoleXSpin->setValue(static_cast<double>(c.pole_world[0]));
+        if (m_impl->ikPoleXSpin) {
+            m_impl->ikPoleXSpin->setValue(static_cast<double>(c.pole_world[0]));
         }
-        if (ikPoleYSpin) {
-            ikPoleYSpin->setValue(static_cast<double>(c.pole_world[1]));
+        if (m_impl->ikPoleYSpin) {
+            m_impl->ikPoleYSpin->setValue(static_cast<double>(c.pole_world[1]));
+        }
+        if (m_impl->ikPoleZSpin) {
+            m_impl->ikPoleZSpin->setValue(static_cast<double>(c.pole_world[2]));
         }
         if (m_poleFlipCheck) {
             m_poleFlipCheck->setChecked(c.bend_sign < 0);
@@ -1936,8 +2240,16 @@ void BoneRiggingPanel::syncInspectorFromSelectedBone()
         if (m_ikMaxAngleSpin) {
             m_ikMaxAngleSpin->setValue(static_cast<double>(c.root_angle_max_rad * kRadToDeg));
         }
-        if (ikBlendSpin) {
-            ikBlendSpin->setValue(static_cast<double>(c.blend_weight));
+        if (m_impl->ikMidMinAngleSpin) {
+            m_impl->ikMidMinAngleSpin->setValue(
+                static_cast<double>(c.mid_angle_min_rad * kRadToDeg));
+        }
+        if (m_impl->ikMidMaxAngleSpin) {
+            m_impl->ikMidMaxAngleSpin->setValue(
+                static_cast<double>(c.mid_angle_max_rad * kRadToDeg));
+        }
+        if (m_impl->ikBlendSpin) {
+            m_impl->ikBlendSpin->setValue(static_cast<double>(c.blend_weight));
         }
     }
 
@@ -1945,15 +2257,18 @@ void BoneRiggingPanel::syncInspectorFromSelectedBone()
         if (m_boneNameEdit) {
             m_boneNameEdit->clear();
         }
+        if (m_impl->aimEnableCheck) {
+            m_impl->aimEnableCheck->setChecked(false);
+        }
         if (m_conflictBadgeLabel) {
             m_conflictBadgeLabel->setText(tr("No Selection"));
             m_conflictBadgeLabel->setStyleSheet(QStringLiteral(
                 "QLabel { background-color: #181b22; color: #94a3b8; border: 1px solid #2a2f3d; "
                 "border-radius: 4px; padding: 3px 6px; font-weight: 600; }"));
         }
-        for (QWidget *w :
-             std::initializer_list<QWidget *>{aimTargetBoneCombo, aimAxisCombo, aimTargetXSpin,
-                                              aimTargetYSpin, aimConeDegSpin, aimBlendSpin}) {
+        for (QWidget *w : std::initializer_list<QWidget *>{
+                 m_impl->aimTargetBoneCombo, m_impl->aimAxisCombo, m_impl->aimTargetXSpin,
+                 m_impl->aimTargetYSpin, m_impl->aimConeDegSpin, m_impl->aimBlendSpin}) {
             if (w) {
                 w->setEnabled(false);
             }
@@ -1967,13 +2282,13 @@ void BoneRiggingPanel::syncInspectorFromSelectedBone()
     if (m_boneNameEdit) {
         m_boneNameEdit->setText(QString::fromUtf8(bone.name));
     }
-    if (parentCombo) {
+    if (m_impl->parentCombo) {
         const int pVal = (bone.parent == 0xFFFFFFFFu) ? -1 : static_cast<int>(bone.parent);
-        const int idx = parentCombo->findData(pVal);
-        parentCombo->setCurrentIndex(idx >= 0 ? idx : 0);
+        const int idx = m_impl->parentCombo->findData(pVal);
+        m_impl->parentCombo->setCurrentIndex(idx >= 0 ? idx : 0);
     }
-    if (makeRootBtn) {
-        makeRootBtn->setEnabled(bone.parent != 0xFFFFFFFFu);
+    if (m_impl->makeRootBtn) {
+        m_impl->makeRootBtn->setEnabled(bone.parent != 0xFFFFFFFFu);
     }
 
     const we_bone_drive_mode_t mode =
@@ -1999,7 +2314,6 @@ void BoneRiggingPanel::syncInspectorFromSelectedBone()
         m_scaleYSpin->setValue(static_cast<double>(bone.bind_scale[1]));
     }
 
-    // Update conflict & drive mode pill badge.
     if (m_conflictBadgeLabel) {
         bool inIk = false;
         for (const auto &c : m_rig.ikChains) {
@@ -2037,18 +2351,18 @@ void BoneRiggingPanel::syncInspectorFromSelectedBone()
     auto aimIt = std::find_if(m_rig.aimConstraints.begin(), m_rig.aimConstraints.end(),
                               [sel](const we_aim_constraint_t &a) { return a.bone_index == sel; });
     const bool aimActive = (aimIt != m_rig.aimConstraints.end() && aimIt->enabled != 0u);
-    if (aimEnableCheck) {
-        aimEnableCheck->setChecked(aimActive);
+    if (m_impl->aimEnableCheck) {
+        m_impl->aimEnableCheck->setChecked(aimActive);
     }
-    for (QWidget *w :
-         std::initializer_list<QWidget *>{aimTargetBoneCombo, aimAxisCombo, aimTargetXSpin,
-                                          aimTargetYSpin, aimConeDegSpin, aimBlendSpin}) {
+    for (QWidget *w : std::initializer_list<QWidget *>{
+             m_impl->aimTargetBoneCombo, m_impl->aimAxisCombo, m_impl->aimTargetXSpin,
+             m_impl->aimTargetYSpin, m_impl->aimConeDegSpin, m_impl->aimBlendSpin}) {
         if (w) {
             w->setEnabled(aimActive);
         }
     }
     if (aimIt != m_rig.aimConstraints.end()) {
-        if (aimAxisCombo) {
+        if (m_impl->aimAxisCombo) {
             int axisId = 0;
             if (aimIt->aim_axis_local[1] > 0.5f) {
                 axisId = 1;
@@ -2057,35 +2371,34 @@ void BoneRiggingPanel::syncInspectorFromSelectedBone()
             } else if (aimIt->aim_axis_local[1] < -0.5f) {
                 axisId = 3;
             }
-            const int found = aimAxisCombo->findData(axisId);
-            aimAxisCombo->setCurrentIndex(found >= 0 ? found : 0);
+            const int found = m_impl->aimAxisCombo->findData(axisId);
+            m_impl->aimAxisCombo->setCurrentIndex(found >= 0 ? found : 0);
         }
-        if (aimTargetXSpin) {
-            aimTargetXSpin->setValue(static_cast<double>(aimIt->target_world[0]));
+        if (m_impl->aimTargetXSpin) {
+            m_impl->aimTargetXSpin->setValue(static_cast<double>(aimIt->target_world[0]));
         }
-        if (aimTargetYSpin) {
-            aimTargetYSpin->setValue(static_cast<double>(aimIt->target_world[1]));
+        if (m_impl->aimTargetYSpin) {
+            m_impl->aimTargetYSpin->setValue(static_cast<double>(aimIt->target_world[1]));
         }
-        if (aimConeDegSpin) {
-            aimConeDegSpin->setValue(static_cast<double>(aimIt->max_cone_rad * kRadToDeg));
+        if (m_impl->aimConeDegSpin) {
+            m_impl->aimConeDegSpin->setValue(static_cast<double>(aimIt->max_cone_rad * kRadToDeg));
         }
-        if (aimBlendSpin) {
-            aimBlendSpin->setValue(static_cast<double>(aimIt->blend_weight));
+        if (m_impl->aimBlendSpin) {
+            m_impl->aimBlendSpin->setValue(static_cast<double>(aimIt->blend_weight));
         }
     }
 }
 
 void BoneRiggingPanel::pushSkeletonToDaemon()
 {
-    if (!m_ipcClient || m_rig.objectId < 0) {
+    if (!m_ipcClient || m_rig.objectId < 0 || !m_impl) {
         return;
     }
 
-    auto *aux = ensureBoneAux(this);
     std::vector<waywal_ipc_mdl_bone_t> wireBones;
     wireBones.reserve(m_rig.bones.size());
 
-    bool reinitPhysics = aux ? aux->forceReinitPhysics : false;
+    bool reinitPhysics = m_impl->forceReinitPhysics;
     for (size_t i = 0; i < m_rig.bones.size(); ++i) {
         const we_mdl_bone_t &src = m_rig.bones[i];
         waywal_ipc_mdl_bone_t dst{};
@@ -2099,26 +2412,28 @@ void BoneRiggingPanel::pushSkeletonToDaemon()
             std::memcpy(dst.simulation_json, src.simulation_json, sizeof(dst.simulation_json));
             dst.simulation_json[sizeof(dst.simulation_json) - 1u] = '\0';
             reinitPhysics = true;
-        } else if (aux && i < WE_MDL_MAX_BONES && aux->lastPushedXpbd[i]) {
+        } else if (i < WE_MDL_MAX_BONES && m_impl->lastPushedXpbd[i]) {
             reinitPhysics = true;
         }
         wireBones.push_back(dst);
     }
 
-    if (aux) {
-        for (size_t i = m_rig.bones.size(); i < WE_MDL_MAX_BONES; ++i) {
-            if (aux->lastPushedXpbd[i]) {
-                reinitPhysics = true;
-            }
-            aux->lastPushedXpbd[i] = false;
+    for (size_t i = m_rig.bones.size(); i < WE_MDL_MAX_BONES; ++i) {
+        if (m_impl->lastPushedXpbd[i]) {
+            reinitPhysics = true;
         }
-        for (size_t i = 0; i < std::min<size_t>(m_rig.bones.size(), WE_MDL_MAX_BONES); ++i) {
-            aux->lastPushedXpbd[i] = (m_rig.driveModes[i] == WE_BONE_DRIVE_XPBD);
-        }
-        aux->forceReinitPhysics = false;
+        m_impl->lastPushedXpbd[i] = false;
     }
+    for (size_t i = 0; i < std::min<size_t>(m_rig.bones.size(), WE_MDL_MAX_BONES); ++i) {
+        m_impl->lastPushedXpbd[i] = (m_rig.driveModes[i] == WE_BONE_DRIVE_XPBD);
+    }
+    m_impl->forceReinitPhysics = false;
 
-    dispatchSkeletonIpc(m_ipcClient, m_rig.objectId, wireBones, reinitPhysics ? 1u : 0u);
+    waywal_ipc_puppet_set_skeleton_t req{};
+    req.object_id = static_cast<uint32_t>(m_rig.objectId);
+    req.bone_count = static_cast<uint32_t>(wireBones.size());
+    req.flags = reinitPhysics ? 1u : 0u;
+    m_ipcClient->sendPuppetSetSkeleton(req, wireBones);
 }
 
 } // namespace waywal::studio
