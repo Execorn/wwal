@@ -3,18 +3,26 @@
 #define _GNU_SOURCE
 #endif
 
+#include "waywal/image_loader.h"
 #include "waywal/we_asset_writer.h"
+#include "waywal/we_json.h"
+#include "waywal/we_mdl_writer.h"
 #include "waywal/we_particle.h"
 #include "waywal/we_pkg.h"
 #include "waywal/we_project.h"
+#include "waywal/we_puppet.h"
 #include "waywal/we_scene.h"
 #include "waywal/we_script.h"
 #include "waywal/we_shader.h"
 #include "waywal/we_tex.h"
 
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl31.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <gbm.h>
 #include <locale.h>
 #include <math.h>
 #include <stdint.h>
@@ -24,6 +32,18 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+__attribute__((visibility("default"))) const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void)
+{
+    return "leak:<unknown module>\nleak:gbm_create_device\nleak:libgbm\nleak:libEGL\n"
+           "leak:libGLESv2\nleak:dri\nleak:libnvidia\n";
+}
+#endif
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -1361,6 +1381,1054 @@ static void test_audio_binding_clamps_and_cooldown(void)
     we_scene_destroy(sc);
 }
 
+static int cmp_jcs_utf16_keys(const char *a, const char *b)
+{
+    const uint8_t *s1 = (const uint8_t *)(a ? a : "");
+    const uint8_t *s2 = (const uint8_t *)(b ? b : "");
+    while (*s1 && *s2) {
+        uint32_t cp1 = 0u, cp2 = 0u;
+        if (*s1 < 0x80u) {
+            cp1 = *s1++;
+        } else if ((*s1 & 0xE0u) == 0xC0u) {
+            cp1 = ((uint32_t)(s1[0] & 0x1Fu) << 6) | (s1[1] & 0x3Fu);
+            s1 += 2;
+        } else if ((*s1 & 0xF0u) == 0xE0u) {
+            cp1 = ((uint32_t)(s1[0] & 0x0Fu) << 12) | ((uint32_t)(s1[1] & 0x3Fu) << 6) |
+                  (s1[2] & 0x3Fu);
+            s1 += 3;
+        } else {
+            cp1 = ((uint32_t)(s1[0] & 0x07u) << 18) | ((uint32_t)(s1[1] & 0x3Fu) << 12) |
+                  ((uint32_t)(s1[2] & 0x3Fu) << 6) | (s1[3] & 0x3Fu);
+            s1 += 4;
+        }
+        if (*s2 < 0x80u) {
+            cp2 = *s2++;
+        } else if ((*s2 & 0xE0u) == 0xC0u) {
+            cp2 = ((uint32_t)(s2[0] & 0x1Fu) << 6) | (s2[1] & 0x3Fu);
+            s2 += 2;
+        } else if ((*s2 & 0xF0u) == 0xE0u) {
+            cp2 = ((uint32_t)(s2[0] & 0x0Fu) << 12) | ((uint32_t)(s2[1] & 0x3Fu) << 6) |
+                  (s2[2] & 0x3Fu);
+            s2 += 3;
+        } else {
+            cp2 = ((uint32_t)(s2[0] & 0x07u) << 18) | ((uint32_t)(s2[1] & 0x3Fu) << 12) |
+                  ((uint32_t)(s2[2] & 0x3Fu) << 6) | (s2[3] & 0x3Fu);
+            s2 += 4;
+        }
+        uint16_t u1[2], u2[2];
+        size_t n1 = 1u, n2 = 1u;
+        if (cp1 <= 0xFFFFu) {
+            u1[0] = (uint16_t)cp1;
+        } else {
+            u1[0] = (uint16_t)(0xD800u + ((cp1 - 0x10000u) >> 10));
+            u1[1] = (uint16_t)(0xDC00u + ((cp1 - 0x10000u) & 0x3FFu));
+            n1 = 2u;
+        }
+        if (cp2 <= 0xFFFFu) {
+            u2[0] = (uint16_t)cp2;
+        } else {
+            u2[0] = (uint16_t)(0xD800u + ((cp2 - 0x10000u) >> 10));
+            u2[1] = (uint16_t)(0xDC00u + ((cp2 - 0x10000u) & 0x3FFu));
+            n2 = 2u;
+        }
+        size_t mn = n1 < n2 ? n1 : n2;
+        for (size_t i = 0u; i < mn; ++i) {
+            if (u1[i] != u2[i]) {
+                return u1[i] < u2[i] ? -1 : 1;
+            }
+        }
+        if (n1 != n2) {
+            return n1 < n2 ? -1 : 1;
+        }
+    }
+    return *s1 ? 1 : (*s2 ? -1 : 0);
+}
+
+static bool check_json_rfc8785_order_recursive(const we_jval_t *v)
+{
+    if (!v) {
+        return true;
+    }
+    if (v->type == JVAL_ARR) {
+        for (size_t i = 0u; i < v->arr.count; ++i) {
+            if (!check_json_rfc8785_order_recursive(v->arr.items[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (v->type == JVAL_OBJ) {
+        for (size_t i = 0u; i < v->obj.count; ++i) {
+            if (i > 0u &&
+                cmp_jcs_utf16_keys(v->obj.entries[i - 1u].key, v->obj.entries[i].key) >= 0) {
+                return false;
+            }
+            if (!check_json_rfc8785_order_recursive(v->obj.entries[i].val)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool verify_json_file_is_strict_rfc8785(const char *path)
+{
+    size_t len = 0u;
+    char *raw = slurp_text_file(path, &len);
+    if (!raw) {
+        return false;
+    }
+    we_jval_t *root = we_json_parse_root(raw, len);
+    bool ordered = root && check_json_rfc8785_order_recursive(root);
+    size_t clen = 0u;
+    char *canon = root ? we_jval_to_canonical_json(root, &clen) : NULL;
+    bool exact = ordered && canon && clen == len && memcmp(canon, raw, len) == 0;
+    free(canon);
+    we_jval_free(root);
+    free(raw);
+    return exact;
+}
+
+static const char *set_comma_decimal_locale(char *saved_buf, size_t saved_cap)
+{
+    const char *cur = setlocale(LC_NUMERIC, NULL);
+    snprintf(saved_buf, saved_cap, "%s", cur ? cur : "C");
+    static const char *const k_cands[] = {
+        "de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "ru_RU.UTF-8", "ru_RU.utf8",
+    };
+    for (size_t i = 0u; i < sizeof(k_cands) / sizeof(k_cands[0]); ++i) {
+        const char *got = setlocale(LC_NUMERIC, k_cands[i]);
+        if (got) {
+            return got;
+        }
+    }
+    return NULL;
+}
+
+static void test_e2e_f01_scripts_and_script_src_roundtrip(void)
+{
+    static const char *k_orig_js =
+        "var sharedSpeed = 1.5;\n"
+        "export function update(value) {\n"
+        "  var acc = sharedSpeed;\n"
+        "  for (var i = 0; i < 3; i++) { acc += i; }\n"
+        "  switch (i) { case 3: acc = acc + 0.5; break; default: acc = 0; }\n"
+        "  try { if (acc > 0) { return value + new Vec3(acc, 0, 0); } } catch (e) {}\n"
+        "  return value;\n"
+        "}\n";
+    static const char *k_alpha_js =
+        "export function update(v) { return (v * 0.5) > 0.2 ? 0.8 : 0.4; }";
+    static const char *k_vis_js = "export function update(v) { return true; }";
+    static const char *k_text_js = "export function update(v) { var n = 42; return `tick=${n}`; }";
+    static const char *k_ps_js = "export function update(v) { return 28; }";
+    static const char *k_vol_js = "export function update(v) { return 0.75; }";
+    static const char *k_uni_src = "export function update(v) { return v + 0.25; }";
+    static const char *k_rt_uni_js = "export function update(v) { return v * 1.25; }";
+
+    we_scene_t sc = {0};
+    snprintf(sc.project.title, sizeof(sc.project.title), "Script Roundtrip");
+    snprintf(sc.project.type, sizeof(sc.project.type), "scene");
+    snprintf(sc.project.file, sizeof(sc.project.file), "scene.json");
+    sc.ortho_width = 1920.0f;
+    sc.ortho_height = 1080.0f;
+
+    sc.object_count = 3u;
+    sc.objects = (we_scene_object_t *)calloc(3u, sizeof(we_scene_object_t));
+    TEST_CHECK(sc.objects != NULL);
+
+    /* Object 0: image layer with property scripts + constantshadervalues script_src */
+    we_scene_object_t *o0 = &sc.objects[0];
+    o0->id = 11;
+    o0->parent_id = -1;
+    snprintf(o0->name, sizeof(o0->name), "scripted_bg");
+    o0->origin[0] = 100.5f;
+    o0->origin[1] = 200.25f;
+    o0->scale[0] = o0->scale[1] = o0->scale[2] = 1.0f;
+    o0->size[0] = 640.0f;
+    o0->size[1] = 360.0f;
+    o0->alpha = 0.9f;
+    snprintf(o0->alpha_user_prop, sizeof(o0->alpha_user_prop), "opacity");
+    o0->brightness = 1.0f;
+    o0->color[0] = o0->color[1] = o0->color[2] = 1.0f;
+    o0->visible = true;
+    o0->has_base_pass = true;
+    snprintf(o0->base_pass.shader_name, sizeof(o0->base_pass.shader_name), "genericimage2");
+    snprintf(o0->base_pass.tex_paths[0], sizeof(o0->base_pass.tex_paths[0]), "bgtex");
+    o0->base_pass.textures[0] = make_cpu_tex(4u, 4u, 90u);
+    o0->base_pass.const_val_count = 2u;
+    snprintf(o0->base_pass.const_vals[0].name, sizeof(o0->base_pass.const_vals[0].name),
+             "u_scroll");
+    snprintf(o0->base_pass.const_vals[0].user_prop, sizeof(o0->base_pass.const_vals[0].user_prop),
+             "scrollprop");
+    o0->base_pass.const_vals[0].num_components = 1u;
+    o0->base_pass.const_vals[0].val[0] = 0.5f;
+    o0->base_pass.const_vals[0].script_src = strdup(k_uni_src);
+    snprintf(o0->base_pass.const_vals[1].name, sizeof(o0->base_pass.const_vals[1].name), "u_gain");
+    o0->base_pass.const_vals[1].num_components = 1u;
+    o0->base_pass.const_vals[1].val[0] = 1.0f;
+
+    o0->scripts[0].target = WE_SCRIPT_PROP_ORIGIN;
+    o0->scripts[0].vm = we_script_create(k_orig_js, strlen(k_orig_js), &sc.script_shared);
+    float sp_val[4] = {2.5f, 0.0f, 0.0f, 0.0f};
+    we_script_set_prop(o0->scripts[0].vm, "boost", sp_val, 1u, NULL);
+    we_script_set_prop(o0->scripts[0].vm, "tag", sp_val, 0u, "pulse");
+
+    o0->scripts[1].target = WE_SCRIPT_PROP_ALPHA;
+    o0->scripts[1].vm = we_script_create(k_alpha_js, strlen(k_alpha_js), &sc.script_shared);
+    o0->scripts[2].target = WE_SCRIPT_PROP_VISIBLE;
+    o0->scripts[2].vm = we_script_create(k_vis_js, strlen(k_vis_js), &sc.script_shared);
+    o0->scripts[3].target = WE_SCRIPT_PROP_UNIFORM;
+    snprintf(o0->scripts[3].uniform_name, sizeof(o0->scripts[3].uniform_name), "u_gain");
+    o0->scripts[3].vm = we_script_create(k_rt_uni_js, strlen(k_rt_uni_js), &sc.script_shared);
+    o0->script_count = 4u;
+
+    /* Object 1: text layer with text + pointsize scripts */
+    we_scene_object_t *o1 = &sc.objects[1];
+    o1->id = 12;
+    o1->parent_id = -1;
+    snprintf(o1->name, sizeof(o1->name), "scripted_text");
+    o1->scale[0] = o1->scale[1] = o1->scale[2] = 1.0f;
+    o1->size[0] = 300.0f;
+    o1->size[1] = 80.0f;
+    o1->alpha = 1.0f;
+    o1->brightness = 1.0f;
+    o1->color[0] = o1->color[1] = o1->color[2] = 1.0f;
+    o1->visible = true;
+    o1->is_text_object = true;
+    snprintf(o1->text_str, sizeof(o1->text_str), "initial");
+    snprintf(o1->text_font, sizeof(o1->text_font), "monospace");
+    o1->text_pointsize = 24;
+    o1->scripts[0].target = WE_SCRIPT_PROP_TEXT;
+    o1->scripts[0].vm = we_script_create(k_text_js, strlen(k_text_js), &sc.script_shared);
+    o1->scripts[1].target = WE_SCRIPT_PROP_POINTSIZE;
+    o1->scripts[1].vm = we_script_create(k_ps_js, strlen(k_ps_js), &sc.script_shared);
+    o1->script_count = 2u;
+
+    /* Object 2: sound layer with volume script */
+    we_scene_object_t *o2 = &sc.objects[2];
+    o2->id = 13;
+    o2->parent_id = -1;
+    snprintf(o2->name, sizeof(o2->name), "scripted_sound");
+    o2->scale[0] = o2->scale[1] = o2->scale[2] = 1.0f;
+    o2->alpha = 1.0f;
+    o2->brightness = 1.0f;
+    o2->color[0] = o2->color[1] = o2->color[2] = 1.0f;
+    o2->visible = true;
+    o2->is_sound_object = true;
+    o2->sound_volume = 0.5f;
+    o2->scripts[0].target = WE_SCRIPT_PROP_VOLUME;
+    o2->scripts[0].vm = we_script_create(k_vol_js, strlen(k_vol_js), &sc.script_shared);
+    o2->script_count = 1u;
+
+    for (uint32_t oi = 0u; oi < 3u; ++oi) {
+        for (uint32_t si = 0u; si < sc.objects[oi].script_count; ++si) {
+            TEST_CHECK(sc.objects[oi].scripts[si].vm != NULL);
+        }
+    }
+
+    char saved_loc[64];
+    const char *comma_loc = set_comma_decimal_locale(saved_loc, sizeof(saved_loc));
+    we_asset_writer_err_t err = WE_WRITER_OK;
+    char *s_comma = NULL;
+    size_t len_comma = 0u;
+    TEST_CHECK(we_scene_serialize_json(&sc, &s_comma, &len_comma, &err));
+    setlocale(LC_NUMERIC, saved_loc);
+
+    char *s_c = NULL;
+    size_t len_c = 0u;
+    TEST_CHECK(we_scene_serialize_json(&sc, &s_c, &len_c, &err));
+    TEST_CHECK(len_comma == len_c && memcmp(s_comma, s_c, len_c) == 0);
+    TEST_CHECK(comma_loc == NULL || strstr(s_comma, "100,5") == NULL);
+
+    char exp_dir[256];
+    make_tmp_dir(exp_dir, sizeof(exp_dir), "scripts_rt");
+    TEST_CHECK(we_scene_export_dir(&sc, exp_dir, false, &err));
+    TEST_CHECK(err == WE_WRITER_OK);
+
+    we_scene_t *reloaded = we_scene_load_cpu(exp_dir, NULL);
+    TEST_CHECK(reloaded != NULL);
+    TEST_CHECK(reloaded->object_count == 3u);
+    TEST_CHECK(reloaded->objects[0].script_count == 5u);
+    TEST_CHECK(reloaded->objects[0].base_pass.const_val_count == 2u);
+    const we_const_val_t *cv_scroll = NULL;
+    const we_const_val_t *cv_gain = NULL;
+    for (uint32_t c = 0u; c < reloaded->objects[0].base_pass.const_val_count; ++c) {
+        if (strcmp(reloaded->objects[0].base_pass.const_vals[c].name, "u_scroll") == 0) {
+            cv_scroll = &reloaded->objects[0].base_pass.const_vals[c];
+        } else if (strcmp(reloaded->objects[0].base_pass.const_vals[c].name, "u_gain") == 0) {
+            cv_gain = &reloaded->objects[0].base_pass.const_vals[c];
+        }
+    }
+    TEST_CHECK(cv_scroll != NULL && cv_scroll->script_src != NULL);
+    TEST_CHECK(strcmp(cv_scroll->script_src, k_uni_src) == 0);
+    TEST_CHECK(strcmp(cv_scroll->user_prop, "scrollprop") == 0);
+    TEST_CHECK(cv_gain != NULL && cv_gain->script_src != NULL);
+    /* Parser clears alpha_user_prop when attaching WE_SCRIPT_PROP_ALPHA, while serialized JSON
+     * preserves both "script" and "user". */
+    TEST_CHECK(strstr(s_c, "\"user\":\"opacity\"") != NULL);
+    TEST_CHECK(reloaded->objects[1].script_count == 2u);
+    TEST_CHECK(reloaded->objects[2].script_count == 1u);
+
+    /* Re-export from reloaded scene preserves every script without silent loss. */
+    char exp_dir2[256];
+    make_tmp_dir(exp_dir2, sizeof(exp_dir2), "scripts_rt2");
+    TEST_CHECK(we_scene_export_dir(reloaded, exp_dir2, true, &err));
+    we_scene_t *reloaded2 = we_scene_load_cpu(exp_dir2, NULL);
+    TEST_CHECK(reloaded2 != NULL);
+    TEST_CHECK(reloaded2->objects[0].script_count == 5u);
+    TEST_CHECK(reloaded2->objects[1].script_count == 2u);
+    TEST_CHECK(reloaded2->objects[2].script_count == 1u);
+
+    we_scene_destroy(reloaded2);
+    we_scene_destroy(reloaded);
+    rm_rf(exp_dir);
+    rm_rf(exp_dir2);
+    free(s_comma);
+    free(s_c);
+
+    for (uint32_t oi = 0u; oi < 3u; ++oi) {
+        for (uint32_t si = 0u; si < sc.objects[oi].script_count; ++si) {
+            we_script_destroy(sc.objects[oi].scripts[si].vm);
+        }
+    }
+    free(sc.objects[0].base_pass.const_vals[0].script_src);
+    free_synth_scene(&sc);
+}
+
+static void test_e2e_f01_particle_export_with_has_base_pass(void)
+{
+    we_particle_sys_t *ps0 = we_particle_create_preset(WE_PARTICLE_PRESET_EMBERS, false);
+    we_particle_sys_t *ps1 = we_particle_create_preset(WE_PARTICLE_PRESET_FIREFLIES, false);
+    TEST_CHECK(ps0 != NULL && ps1 != NULL);
+    snprintf(ps0->material_path, sizeof(ps0->material_path), "materials/embers_mat.json");
+    ps0->control_point_count = 1u;
+    ps0->control_points[0].id = 0;
+    ps0->control_points[0].offset[0] = 12.0f;
+    ps0->control_points[0].offset[1] = -8.0f;
+    ps0->control_points[0].lock_to_pointer = true;
+
+    we_scene_object_t objs[2] = {0};
+    objs[0].id = 20;
+    objs[0].parent_id = -1;
+    snprintf(objs[0].name, sizeof(objs[0].name), "EmbersLayer");
+    /* Historically triggered material-overwrites-particle bug when has_base_pass == true. */
+    snprintf(objs[0].image_path, sizeof(objs[0].image_path), "particles/embers.json");
+    objs[0].scale[0] = objs[0].scale[1] = objs[0].scale[2] = 1.0f;
+    objs[0].size[0] = 400.0f;
+    objs[0].size[1] = 400.0f;
+    objs[0].alpha = 1.0f;
+    objs[0].brightness = 1.0f;
+    objs[0].color[0] = objs[0].color[1] = objs[0].color[2] = 1.0f;
+    objs[0].visible = true;
+    objs[0].particle_sys = ps0;
+    objs[0].has_base_pass = true;
+    objs[0].base_pass.blending = WE_BLEND_ADDITIVE;
+    snprintf(objs[0].base_pass.shader_name, sizeof(objs[0].base_pass.shader_name), "genericimage2");
+    snprintf(objs[0].base_pass.tex_paths[0], sizeof(objs[0].base_pass.tex_paths[0]), "ember_dot");
+    objs[0].base_pass.textures[0] = make_cpu_tex(8u, 8u, 220u);
+
+    objs[1].id = 21;
+    objs[1].parent_id = -1;
+    snprintf(objs[1].name, sizeof(objs[1].name), "FirefliesLayer");
+    objs[1].scale[0] = objs[1].scale[1] = objs[1].scale[2] = 1.0f;
+    objs[1].size[0] = 300.0f;
+    objs[1].size[1] = 300.0f;
+    objs[1].alpha = 1.0f;
+    objs[1].brightness = 1.0f;
+    objs[1].color[0] = objs[1].color[1] = objs[1].color[2] = 1.0f;
+    objs[1].visible = true;
+    objs[1].particle_sys = ps1;
+    objs[1].has_base_pass = true;
+    objs[1].base_pass.blending = WE_BLEND_NORMAL;
+    snprintf(objs[1].base_pass.shader_name, sizeof(objs[1].base_pass.shader_name), "genericimage2");
+    snprintf(objs[1].base_pass.tex_paths[0], sizeof(objs[1].base_pass.tex_paths[0]), "firefly_dot");
+    objs[1].base_pass.textures[0] = make_cpu_tex(8u, 8u, 150u);
+
+    we_scene_t sc = {0};
+    sc.ortho_width = 1920.0f;
+    sc.ortho_height = 1080.0f;
+    sc.object_count = 2u;
+    sc.objects = objs;
+
+    static const bool modes[2] = {false, true};
+    for (int m = 0; m < 2; ++m) {
+        char exp_dir[256];
+        make_tmp_dir(exp_dir, sizeof(exp_dir), m ? "part_pkg" : "part_loose");
+        we_asset_writer_err_t err = WE_WRITER_OK;
+        TEST_CHECK(we_scene_export_dir(&sc, exp_dir, modes[m], &err));
+        TEST_CHECK(err == WE_WRITER_OK);
+
+        if (!modes[m]) {
+            char p0_path[512], p1_path[512], mat0_path[512], s_path[512];
+            snprintf(p0_path, sizeof(p0_path), "%s/particles/embers.json", exp_dir);
+            snprintf(p1_path, sizeof(p1_path), "%s/particles/particle_21.json", exp_dir);
+            snprintf(mat0_path, sizeof(mat0_path), "%s/materials/embers_mat.json", exp_dir);
+            snprintf(s_path, sizeof(s_path), "%s/scene.json", exp_dir);
+            TEST_CHECK(file_exists(p0_path));
+            TEST_CHECK(file_exists(p1_path));
+            TEST_CHECK(file_exists(mat0_path));
+            TEST_CHECK(verify_json_file_is_strict_rfc8785(p0_path));
+            TEST_CHECK(verify_json_file_is_strict_rfc8785(p1_path));
+            TEST_CHECK(verify_json_file_is_strict_rfc8785(s_path));
+
+            char *p0_txt = slurp_text_file(p0_path, NULL);
+            TEST_CHECK(p0_txt != NULL);
+            TEST_CHECK(strstr(p0_txt, "\"emitter\"") != NULL);
+            TEST_CHECK(strstr(p0_txt, "\"initializer\"") != NULL);
+            TEST_CHECK(strstr(p0_txt, "\"operator\"") != NULL);
+            free(p0_txt);
+        }
+
+        we_scene_t *reloaded = we_scene_load_cpu(exp_dir, NULL);
+        TEST_CHECK(reloaded != NULL);
+        TEST_CHECK(reloaded->object_count == 2u);
+        TEST_CHECK(reloaded->objects[0].particle_sys != NULL);
+        TEST_CHECK(reloaded->objects[0].particle_sys->max_count == ps0->max_count);
+        TEST_CHECK(reloaded->objects[0].particle_sys->emitter_count == ps0->emitter_count);
+        TEST_CHECK(reloaded->objects[0].particle_sys->initializer_count == ps0->initializer_count);
+        TEST_CHECK(reloaded->objects[0].particle_sys->operator_count == ps0->operator_count);
+        TEST_CHECK(reloaded->objects[0].particle_sys->control_points[0].lock_to_pointer);
+        TEST_CHECK(reloaded->objects[0].has_base_pass);
+        TEST_CHECK(reloaded->objects[0].base_pass.blending == WE_BLEND_ADDITIVE);
+        TEST_CHECK(reloaded->objects[0].base_pass.textures[0] != NULL);
+        TEST_CHECK(reloaded->objects[1].particle_sys != NULL);
+        TEST_CHECK(reloaded->objects[1].particle_sys->max_count == ps1->max_count);
+        TEST_CHECK(reloaded->objects[1].particle_sys->emitter_count == ps1->emitter_count);
+        we_particle_update(reloaded->objects[0].particle_sys, 0.016f);
+        we_scene_destroy(reloaded);
+        rm_rf(exp_dir);
+    }
+
+    we_tex_destroy(objs[0].base_pass.textures[0]);
+    we_tex_destroy(objs[1].base_pass.textures[0]);
+    we_particle_destroy(ps0);
+    we_particle_destroy(ps1);
+}
+
+static void test_aud123_combo_shaders_and_large_pass_body(void)
+{
+    we_scene_object_t objs[2] = {0};
+    for (int i = 0; i < 2; ++i) {
+        objs[i].id = 30 + i;
+        objs[i].parent_id = -1;
+        snprintf(objs[i].name, sizeof(objs[i].name), "combo_%d", i);
+        objs[i].scale[0] = objs[i].scale[1] = objs[i].scale[2] = 1.0f;
+        objs[i].size[0] = 256.0f;
+        objs[i].size[1] = 256.0f;
+        objs[i].alpha = 1.0f;
+        objs[i].brightness = 1.0f;
+        objs[i].color[0] = objs[i].color[1] = objs[i].color[2] = 1.0f;
+        objs[i].visible = true;
+        objs[i].has_base_pass = true;
+        snprintf(objs[i].base_pass.shader_name, sizeof(objs[i].base_pass.shader_name),
+                 "genericimage2");
+        objs[i].base_pass.combo_count = 1u;
+        snprintf(objs[i].base_pass.combos[0].name, sizeof(objs[i].base_pass.combos[0].name),
+                 "GRAYSCALE");
+        objs[i].base_pass.combos[0].value = i;
+        snprintf(objs[i].base_pass.tex_paths[0], sizeof(objs[i].base_pass.tex_paths[0]), "tex_%d",
+                 i);
+        objs[i].base_pass.textures[0] = make_cpu_tex(4u, 4u, (uint8_t)(40 + i * 30));
+
+        /* Force pass->prep to hold already-preprocessed GLSL to verify raw source recovery. */
+        const char *vr = we_shader_get_builtin("genericimage2.vert");
+        const char *fr = we_shader_get_builtin("genericimage2.frag");
+        TEST_CHECK(we_shader_preprocess_pair(vr, fr, NULL, objs[i].base_pass.combos, 1u, 0x1u,
+                                             false, &objs[i].base_pass.prep));
+    }
+
+    /* Inject a >36 KiB pass constant shader script to exercise dynamic pass serialization >32 KiB.
+     */
+    size_t big_cap = 38u * 1024u;
+    char *big_js = (char *)malloc(big_cap);
+    TEST_CHECK(big_js != NULL);
+    size_t pos = (size_t)snprintf(big_js, big_cap, "export function update(v) { var s = 0;");
+    while (pos + 24u < big_cap - 48u) {
+        pos += (size_t)snprintf(big_js + pos, big_cap - pos, "s += 0.001;");
+    }
+    snprintf(big_js + pos, big_cap - pos, "return v + s; }");
+    objs[1].base_pass.const_val_count = 1u;
+    snprintf(objs[1].base_pass.const_vals[0].name, sizeof(objs[1].base_pass.const_vals[0].name),
+             "u_big");
+    objs[1].base_pass.const_vals[0].num_components = 1u;
+    objs[1].base_pass.const_vals[0].val[0] = 0.25f;
+    objs[1].base_pass.const_vals[0].script_src = big_js;
+
+    we_scene_t sc = {0};
+    sc.ortho_width = 1920.0f;
+    sc.ortho_height = 1080.0f;
+    sc.object_count = 2u;
+    sc.objects = objs;
+
+    char exp_dir[256];
+    make_tmp_dir(exp_dir, sizeof(exp_dir), "combo_sh");
+    we_asset_writer_err_t err = WE_WRITER_OK;
+    TEST_CHECK(we_scene_export_dir(&sc, exp_dir, false, &err));
+    TEST_CHECK(err == WE_WRITER_OK);
+
+    /* Object 0 keeps shaders/genericimage2.* with un-preprocessed raw source + GRAYSCALE=0. */
+    char f0_path[512], mat1_path[512];
+    snprintf(f0_path, sizeof(f0_path), "%s/shaders/genericimage2.frag", exp_dir);
+    snprintf(mat1_path, sizeof(mat1_path), "%s/materials/layer_1.json", exp_dir);
+    size_t f0_len = 0u, mat1_len = 0u;
+    char *f0_txt = slurp_text_file(f0_path, &f0_len);
+    char *mat1_txt = slurp_text_file(mat1_path, &mat1_len);
+    TEST_CHECK(f0_txt != NULL && mat1_txt != NULL);
+    TEST_CHECK(strstr(f0_txt, "#define GRAYSCALE 0") != NULL);
+    TEST_CHECK(strncmp(f0_txt, "#version 310 es", 15u) != 0);
+    TEST_CHECK(strstr(f0_txt, "varying ") != NULL);
+    TEST_CHECK(mat1_len > 36u * 1024u);
+
+    /* Object 1 gets a disambiguated shader containing GRAYSCALE=1 rather than being dropped. */
+    we_jval_t *m1 = we_json_parse_root(mat1_txt, mat1_len);
+    const we_jval_t *passes = m1 ? we_jobj_get(m1, "passes") : NULL;
+    const char *sh1 = (passes && passes->type == JVAL_ARR && passes->arr.count > 0u)
+                          ? we_jval_str(we_jobj_get(passes->arr.items[0], "shader"), "")
+                          : "";
+    TEST_CHECK(strncmp(sh1, "genericimage2__v_", 17u) == 0);
+    char f1_path[512];
+    snprintf(f1_path, sizeof(f1_path), "%s/shaders/%s.frag", exp_dir, sh1);
+    char *f1_txt = slurp_text_file(f1_path, NULL);
+    TEST_CHECK(f1_txt != NULL && strstr(f1_txt, "#define GRAYSCALE 1") != NULL);
+
+    we_scene_t *reloaded = we_scene_load_cpu(exp_dir, NULL);
+    TEST_CHECK(reloaded != NULL);
+    TEST_CHECK(reloaded->object_count == 2u);
+    TEST_CHECK(reloaded->objects[0].base_pass.combos[0].value == 0);
+    TEST_CHECK(reloaded->objects[1].base_pass.combos[0].value == 1);
+    TEST_CHECK(reloaded->objects[1].base_pass.const_vals[0].script_src != NULL);
+    TEST_CHECK(strlen(reloaded->objects[1].base_pass.const_vals[0].script_src) > 35000u);
+
+    we_scene_destroy(reloaded);
+    we_jval_free(m1);
+    free(f0_txt);
+    free(f1_txt);
+    free(mat1_txt);
+    for (int i = 0; i < 2; ++i) {
+        free(objs[i].base_pass.prep.vert_glsl);
+        free(objs[i].base_pass.prep.frag_glsl);
+        we_tex_destroy(objs[i].base_pass.textures[0]);
+    }
+    free(big_js);
+    rm_rf(exp_dir);
+}
+
+typedef struct {
+    int drm_fd;
+    struct gbm_device *gbm;
+    EGLDisplay dpy;
+    EGLContext ctx;
+} test_gles_t;
+
+static bool init_test_gles(test_gles_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->drm_fd = -1;
+    out->dpy = EGL_NO_DISPLAY;
+    out->ctx = EGL_NO_CONTEXT;
+    static const EGLint attribs[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 1,
+                                     EGL_NONE};
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_dpy =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+
+    if (get_platform_dpy) {
+        EGLDisplay dpy = get_platform_dpy(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+        if (dpy != EGL_NO_DISPLAY) {
+            EGLint maj = 0, min = 0;
+            if (eglInitialize(dpy, &maj, &min) && eglBindAPI(EGL_OPENGL_ES_API)) {
+                EGLContext ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attribs);
+                if (ctx != EGL_NO_CONTEXT &&
+                    eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
+                    out->dpy = dpy;
+                    out->ctx = ctx;
+                    return true;
+                }
+                if (ctx != EGL_NO_CONTEXT) {
+                    eglDestroyContext(dpy, ctx);
+                }
+            }
+            eglTerminate(dpy);
+        }
+    }
+
+    for (int idx = 128; idx < 136; ++idx) {
+        char node_path[64];
+        snprintf(node_path, sizeof(node_path), "/dev/dri/renderD%d", idx);
+        int fd = open(node_path, O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+        struct gbm_device *gbm = gbm_create_device(fd);
+        if (!gbm) {
+            close(fd);
+            continue;
+        }
+        EGLDisplay dpy = get_platform_dpy ? get_platform_dpy(EGL_PLATFORM_GBM_KHR,
+                                                             (EGLNativeDisplayType)gbm, NULL)
+                                          : eglGetDisplay((EGLNativeDisplayType)gbm);
+        if (dpy != EGL_NO_DISPLAY) {
+            EGLint maj = 0, min = 0;
+            if (eglInitialize(dpy, &maj, &min) && eglBindAPI(EGL_OPENGL_ES_API)) {
+                EGLContext ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attribs);
+                if (ctx != EGL_NO_CONTEXT &&
+                    eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
+                    out->drm_fd = fd;
+                    out->gbm = gbm;
+                    out->dpy = dpy;
+                    out->ctx = ctx;
+                    return true;
+                }
+                if (ctx != EGL_NO_CONTEXT) {
+                    eglDestroyContext(dpy, ctx);
+                }
+            }
+            eglTerminate(dpy);
+        }
+        gbm_device_destroy(gbm);
+        close(fd);
+    }
+    return false;
+}
+
+static void destroy_test_gles(test_gles_t *g)
+{
+    if (g->dpy != EGL_NO_DISPLAY) {
+        eglMakeCurrent(g->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (g->ctx != EGL_NO_CONTEXT) {
+            eglDestroyContext(g->dpy, g->ctx);
+        }
+        eglTerminate(g->dpy);
+    }
+    if (g->gbm) {
+        gbm_device_destroy(g->gbm);
+    }
+    if (g->drm_fd >= 0) {
+        close(g->drm_fd);
+    }
+}
+
+static void test_aud025_aud123_vram_and_compressed_texture_export(void)
+{
+    we_asset_writer_err_t err = WE_WRITER_OK;
+
+    /* 1. Compressed DXT5 CPU texture with rgba8 == NULL and pkg == NULL */
+    {
+        we_tex_t *dxt = (we_tex_t *)calloc(1u, sizeof(*dxt));
+        TEST_CHECK(dxt != NULL);
+        dxt->texv_version = 5u;
+        dxt->texi_version = 1u;
+        dxt->texb_version = 3u;
+        dxt->format = WE_TEX_FMT_DXT5;
+        dxt->texture_width = 4u;
+        dxt->texture_height = 4u;
+        dxt->image_width = 4u;
+        dxt->image_height = 4u;
+        dxt->image_count = 1u;
+        dxt->free_image_format = WE_FIF_UNKNOWN;
+        dxt->images = (we_tex_image_t *)calloc(1u, sizeof(we_tex_image_t));
+        dxt->images[0].mip_count = 1u;
+        dxt->images[0].mips = (we_tex_mip_t *)calloc(1u, sizeof(we_tex_mip_t));
+        uint8_t *blk = (uint8_t *)calloc(16u, 1u);
+        blk[0] = 0xFFu;
+        blk[1] = 0xFFu;
+        blk[8] = 0x00u;
+        blk[9] = 0xF8u; /* RGB565 red */
+        blk[10] = 0x00u;
+        blk[11] = 0xF8u;
+        dxt->images[0].mips[0].width = 4u;
+        dxt->images[0].mips[0].height = 4u;
+        dxt->images[0].mips[0].data = blk;
+        dxt->images[0].mips[0].data_size = 16u;
+        dxt->images[0].mips[0].byte_count = 16u;
+        dxt->images[0].mips[0].decomp_size = 16u;
+
+        we_scene_object_t obj = {0};
+        obj.id = 40;
+        obj.parent_id = -1;
+        obj.visible = true;
+        obj.alpha = 1.0f;
+        obj.brightness = 1.0f;
+        obj.scale[0] = obj.scale[1] = obj.scale[2] = 1.0f;
+        obj.size[0] = 4.0f;
+        obj.size[1] = 4.0f;
+        obj.color[0] = obj.color[1] = obj.color[2] = 1.0f;
+        obj.has_base_pass = true;
+        snprintf(obj.base_pass.shader_name, sizeof(obj.base_pass.shader_name), "genericimage2");
+        snprintf(obj.base_pass.tex_paths[0], sizeof(obj.base_pass.tex_paths[0]), "comp_dxt5");
+        obj.base_pass.textures[0] = dxt;
+
+        we_scene_t sc = {0};
+        sc.ortho_width = 64.0f;
+        sc.ortho_height = 64.0f;
+        sc.object_count = 1u;
+        sc.objects = &obj;
+
+        char exp_dir[256];
+        make_tmp_dir(exp_dir, sizeof(exp_dir), "dxt5_nopkg");
+        TEST_CHECK(we_scene_export_dir(&sc, exp_dir, false, &err));
+        TEST_CHECK(err == WE_WRITER_OK);
+
+        char tpath[512];
+        snprintf(tpath, sizeof(tpath), "%s/materials/comp_dxt5.tex", exp_dir);
+        TEST_CHECK(file_exists(tpath));
+        size_t tsz = 0u;
+        char *tbytes = slurp_text_file(tpath, &tsz);
+        we_tex_t *parsed = we_tex_parse_cpu((const uint8_t *)tbytes, tsz);
+        TEST_CHECK(parsed != NULL);
+        uint8_t *rgba = NULL;
+        uint32_t rw = 0u, rh = 0u;
+        TEST_CHECK(we_tex_decode_rgba8(parsed, &rgba, &rw, &rh));
+        TEST_CHECK(rw == 4u && rh == 4u && rgba[0] > 240u && rgba[3] == 255u);
+        free(rgba);
+        we_tex_destroy(parsed);
+        free(tbytes);
+        we_tex_destroy(dxt);
+        rm_rf(exp_dir);
+    }
+
+    /* 2. Non-.tex raw PNG in scene->pkg must be transcoded to valid .tex (never raw PNG bytes),
+     *    and corrupt non-image bytes must fail explicitly. */
+    {
+        char tmp_png_dir[256];
+        make_tmp_dir(tmp_png_dir, sizeof(tmp_png_dir), "png_pkg");
+        char png_path[512];
+        snprintf(png_path, sizeof(png_path), "%s/tiny.png", tmp_png_dir);
+        static const uint8_t k_px[16] = {
+            10, 200, 30, 255, 10, 200, 30, 255, 10, 200, 30, 255, 10, 200, 30, 255,
+        };
+        TEST_CHECK(image_save_png_rgba(png_path, k_px, 2u, 2u));
+        size_t png_sz = 0u;
+        char *png_bytes = slurp_text_file(png_path, &png_sz);
+        TEST_CHECK(png_bytes != NULL && png_sz > 8u);
+
+        we_pkg_write_entry_t entry = {
+            .path = "photo.png", .data = (const uint8_t *)png_bytes, .size = png_sz};
+        uint8_t *pkg_buf = NULL;
+        size_t pkg_sz = 0u;
+        TEST_CHECK(we_pkg_write_mem(&entry, 1u, &pkg_buf, &pkg_sz, &err));
+        we_pkg_t *pkg = we_pkg_open_mem(pkg_buf, pkg_sz, NULL);
+        TEST_CHECK(pkg != NULL);
+
+        we_scene_object_t obj = {0};
+        obj.id = 41;
+        obj.parent_id = -1;
+        obj.visible = true;
+        obj.alpha = 1.0f;
+        obj.brightness = 1.0f;
+        obj.scale[0] = obj.scale[1] = obj.scale[2] = 1.0f;
+        obj.size[0] = 2.0f;
+        obj.size[1] = 2.0f;
+        obj.color[0] = obj.color[1] = obj.color[2] = 1.0f;
+        obj.has_base_pass = true;
+        snprintf(obj.base_pass.shader_name, sizeof(obj.base_pass.shader_name), "genericimage2");
+        snprintf(obj.base_pass.tex_paths[0], sizeof(obj.base_pass.tex_paths[0]), "photo.png");
+
+        we_scene_t sc = {0};
+        sc.pkg = pkg;
+        sc.ortho_width = 64.0f;
+        sc.ortho_height = 64.0f;
+        sc.object_count = 1u;
+        sc.objects = &obj;
+
+        char exp_dir[256];
+        make_tmp_dir(exp_dir, sizeof(exp_dir), "png_exp");
+        TEST_CHECK(we_scene_export_dir(&sc, exp_dir, false, &err));
+        char out_tex[512];
+        snprintf(out_tex, sizeof(out_tex), "%s/materials/photo.png.tex", exp_dir);
+        size_t otsz = 0u;
+        char *otbytes = slurp_text_file(out_tex, &otsz);
+        TEST_CHECK(otbytes != NULL && otsz >= 8u && memcmp(otbytes, "TEXV", 4u) == 0);
+        free(otbytes);
+        we_pkg_close(pkg);
+        free(pkg_buf);
+        free(png_bytes);
+        rm_rf(exp_dir);
+        rm_rf(tmp_png_dir);
+
+        /* Corrupt non-image payload under bad.png must fail with WE_WRITER_ERR_UNSUPPORTED_FMT. */
+        static const uint8_t k_junk[8] = {'N', 'O', 'T', 'I', 'M', 'G', '!', '\0'};
+        we_pkg_write_entry_t bad_entry = {
+            .path = "bad.png", .data = k_junk, .size = sizeof(k_junk)};
+        uint8_t *bad_buf = NULL;
+        size_t bad_sz = 0u;
+        TEST_CHECK(we_pkg_write_mem(&bad_entry, 1u, &bad_buf, &bad_sz, &err));
+        we_pkg_t *bad_pkg = we_pkg_open_mem(bad_buf, bad_sz, NULL);
+        TEST_CHECK(bad_pkg != NULL);
+        sc.pkg = bad_pkg;
+        snprintf(obj.base_pass.tex_paths[0], sizeof(obj.base_pass.tex_paths[0]), "bad.png");
+        make_tmp_dir(exp_dir, sizeof(exp_dir), "bad_png_exp");
+        TEST_CHECK(!we_scene_export_dir(&sc, exp_dir, false, &err));
+        TEST_CHECK(err == WE_WRITER_ERR_UNSUPPORTED_FMT);
+        we_pkg_close(bad_pkg);
+        free(bad_buf);
+        rm_rf(exp_dir);
+    }
+
+    /* 3. VRAM GPU-painted texture readback (after we_tex_upload_gl frees CPU mips) */
+    test_gles_t gles;
+    if (init_test_gles(&gles)) {
+        we_tex_t *gpu_tex = make_cpu_tex(8u, 8u, 0u);
+        TEST_CHECK(gpu_tex != NULL);
+        TEST_CHECK(we_tex_upload_gl(gpu_tex));
+        TEST_CHECK(gpu_tex->gl_tex != 0u);
+        TEST_CHECK(gpu_tex->images[0].mips[0].data == NULL);
+        TEST_CHECK(gpu_tex->images[0].mips[0].rgba8 == NULL);
+
+        /* Simulate GPU brush drawing into tex->gl_tex in VRAM without touching CPU memory. */
+        GLuint fbo = 0u;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                               (GLuint)gpu_tex->gl_tex, 0);
+        TEST_CHECK(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+        glClearColor(42.0f / 255.0f, 173.0f / 255.0f, 219.0f / 255.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glFinish();
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1, &fbo);
+
+        /* Release current context so export_texture_from_gl also verifies scene EGL binding. */
+        eglMakeCurrent(gles.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+        we_scene_object_t obj = {0};
+        obj.id = 42;
+        obj.parent_id = -1;
+        obj.visible = true;
+        obj.alpha = 1.0f;
+        obj.brightness = 1.0f;
+        obj.scale[0] = obj.scale[1] = obj.scale[2] = 1.0f;
+        obj.size[0] = 8.0f;
+        obj.size[1] = 8.0f;
+        obj.color[0] = obj.color[1] = obj.color[2] = 1.0f;
+        obj.has_base_pass = true;
+        snprintf(obj.base_pass.shader_name, sizeof(obj.base_pass.shader_name), "genericimage2");
+        snprintf(obj.base_pass.tex_paths[0], sizeof(obj.base_pass.tex_paths[0]), "painted");
+        obj.base_pass.textures[0] = gpu_tex;
+
+        we_scene_t sc = {0};
+        sc.gl_initialized = true;
+        sc.egl_display = gles.dpy;
+        sc.egl_context = gles.ctx;
+        sc.ortho_width = 64.0f;
+        sc.ortho_height = 64.0f;
+        sc.object_count = 1u;
+        sc.objects = &obj;
+
+        char exp_dir[256];
+        make_tmp_dir(exp_dir, sizeof(exp_dir), "vram_tex");
+        TEST_CHECK(we_scene_export_dir(&sc, exp_dir, false, &err));
+        TEST_CHECK(err == WE_WRITER_OK);
+
+        char tpath[512];
+        snprintf(tpath, sizeof(tpath), "%s/materials/painted.tex", exp_dir);
+        TEST_CHECK(file_exists(tpath));
+        size_t tsz = 0u;
+        char *tbytes = slurp_text_file(tpath, &tsz);
+        we_tex_t *parsed = we_tex_parse_cpu((const uint8_t *)tbytes, tsz);
+        TEST_CHECK(parsed != NULL);
+        uint8_t *rgba = NULL;
+        uint32_t rw = 0u, rh = 0u;
+        TEST_CHECK(we_tex_decode_rgba8(parsed, &rgba, &rw, &rh));
+        TEST_CHECK(rw == 8u && rh == 8u);
+        TEST_CHECK(abs((int)rgba[0] - 42) <= 1 && abs((int)rgba[1] - 173) <= 1 &&
+                   abs((int)rgba[2] - 219) <= 1 && rgba[3] == 255u);
+        free(rgba);
+        we_tex_destroy(parsed);
+        free(tbytes);
+
+        TEST_CHECK(eglMakeCurrent(gles.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, gles.ctx));
+        GLuint gt = (GLuint)gpu_tex->gl_tex;
+        glDeleteTextures(1, &gt);
+        gpu_tex->gl_tex = 0u;
+        we_tex_destroy(gpu_tex);
+        rm_rf(exp_dir);
+        destroy_test_gles(&gles);
+    } else {
+        /* Without GL context or pkg, freed mips with nonzero gl_tex must fail instead of silent
+         * true. */
+        we_tex_t missing_gl = {0};
+        missing_gl.gl_tex = 999u;
+        missing_gl.texture_width = 4u;
+        missing_gl.texture_height = 4u;
+        we_scene_object_t obj = {0};
+        obj.id = 43;
+        obj.parent_id = -1;
+        obj.visible = true;
+        obj.alpha = 1.0f;
+        obj.brightness = 1.0f;
+        obj.scale[0] = obj.scale[1] = obj.scale[2] = 1.0f;
+        obj.color[0] = obj.color[1] = obj.color[2] = 1.0f;
+        obj.has_base_pass = true;
+        snprintf(obj.base_pass.shader_name, sizeof(obj.base_pass.shader_name), "genericimage2");
+        snprintf(obj.base_pass.tex_paths[0], sizeof(obj.base_pass.tex_paths[0]), "painted");
+        obj.base_pass.textures[0] = &missing_gl;
+
+        we_scene_t sc = {0};
+        sc.ortho_width = 64.0f;
+        sc.ortho_height = 64.0f;
+        sc.object_count = 1u;
+        sc.objects = &obj;
+
+        char exp_dir[256];
+        make_tmp_dir(exp_dir, sizeof(exp_dir), "vram_nogl");
+        TEST_CHECK(!we_scene_export_dir(&sc, exp_dir, false, &err));
+        TEST_CHECK(err != WE_WRITER_OK);
+        rm_rf(exp_dir);
+    }
+}
+
+static we_puppet_t *make_test_puppet(const char *mat_json_file)
+{
+    we_puppet_t *p = (we_puppet_t *)calloc(1u, sizeof(*p));
+    if (!p) {
+        return NULL;
+    }
+    p->mdlv_version = 23u;
+    p->mdls_version = 2u;
+    snprintf(p->mat_json_file, sizeof(p->mat_json_file), "%s", mat_json_file);
+    p->vertex_count = 3u;
+    p->vertices = (we_mdl_vertex_t *)calloc(3u, sizeof(we_mdl_vertex_t));
+    p->vertices[0] = (we_mdl_vertex_t){
+        .pos = {0.0f, 0.0f, 0.0f}, .weight = {1.0f, 0.0f, 0.0f, 0.0f}, .texcoord = {0.0f, 0.0f}};
+    p->vertices[1] = (we_mdl_vertex_t){
+        .pos = {100.0f, 0.0f, 0.0f}, .weight = {1.0f, 0.0f, 0.0f, 0.0f}, .texcoord = {1.0f, 0.0f}};
+    p->vertices[2] = (we_mdl_vertex_t){
+        .pos = {0.0f, 100.0f, 0.0f}, .weight = {1.0f, 0.0f, 0.0f, 0.0f}, .texcoord = {0.0f, 1.0f}};
+    p->triangle_count = 1u;
+    p->index_count = 3u;
+    p->indices = (uint16_t *)calloc(3u, sizeof(uint16_t));
+    p->indices[0] = 0u;
+    p->indices[1] = 1u;
+    p->indices[2] = 2u;
+    p->bone_count = 1u;
+    p->bones = (we_mdl_bone_t *)calloc(1u, sizeof(we_mdl_bone_t));
+    snprintf(p->bones[0].name, sizeof(p->bones[0].name), "root");
+    p->bones[0].parent = 0xFFFFFFFFu;
+    p->bones[0].local_trans[0] = 1.0f;
+    p->bones[0].local_trans[5] = 1.0f;
+    p->bones[0].local_trans[10] = 1.0f;
+    p->bones[0].local_trans[15] = 1.0f;
+    memcpy(p->bones[0].world_bind, p->bones[0].local_trans, sizeof(p->bones[0].world_bind));
+    memcpy(p->bones[0].offset_trans, p->bones[0].local_trans, sizeof(p->bones[0].offset_trans));
+    p->bones[0].bind_scale[0] = p->bones[0].bind_scale[1] = p->bones[0].bind_scale[2] = 1.0f;
+    p->max_pos[0] = 100.0f;
+    p->max_pos[1] = 100.0f;
+    return p;
+}
+
+static void free_test_puppet(we_puppet_t *p)
+{
+    if (!p) {
+        return;
+    }
+    free(p->vertices);
+    free(p->indices);
+    free(p->bones);
+    free(p);
+}
+
+static void test_aud303_aud409_rfc8785_puppets_and_64mib_preview(void)
+{
+    we_asset_writer_err_t err = WE_WRITER_OK;
+
+    /* 1. Puppet export preserves shared mat_json_file overrides & emits no orphan models JSON */
+    {
+        we_puppet_t *p0 = make_test_puppet("materials/shared_pup.json");
+        we_puppet_t *p1 = make_test_puppet("materials/shared_pup.json");
+        TEST_CHECK(p0 && p1);
+
+        we_scene_object_t objs[2] = {0};
+        for (int i = 0; i < 2; ++i) {
+            objs[i].id = 50 + i;
+            objs[i].parent_id = -1;
+            snprintf(objs[i].name, sizeof(objs[i].name), "puppet_%d", i);
+            objs[i].scale[0] = objs[i].scale[1] = objs[i].scale[2] = 1.0f;
+            objs[i].size[0] = 100.0f;
+            objs[i].size[1] = 100.0f;
+            objs[i].alpha = 1.0f;
+            objs[i].brightness = 1.0f;
+            objs[i].color[0] = objs[i].color[1] = objs[i].color[2] = 1.0f;
+            objs[i].visible = true;
+            objs[i].puppet = (i == 0) ? p0 : p1;
+            objs[i].has_base_pass = true;
+            snprintf(objs[i].base_pass.shader_name, sizeof(objs[i].base_pass.shader_name),
+                     "genericimage2");
+            objs[i].base_pass.blending = (i == 0) ? WE_BLEND_ADDITIVE : WE_BLEND_MULTIPLY;
+            snprintf(objs[i].base_pass.tex_paths[0], sizeof(objs[i].base_pass.tex_paths[0]),
+                     "pup_%d", i);
+            objs[i].base_pass.textures[0] = make_cpu_tex(4u, 4u, (uint8_t)(20 + i * 80));
+        }
+
+        we_scene_t sc = {0};
+        sc.ortho_width = 1920.0f;
+        sc.ortho_height = 1080.0f;
+        sc.object_count = 2u;
+        sc.objects = objs;
+
+        char exp_dir[256];
+        make_tmp_dir(exp_dir, sizeof(exp_dir), "puppet_shared");
+        TEST_CHECK(we_scene_export_dir(&sc, exp_dir, false, &err));
+        TEST_CHECK(err == WE_WRITER_OK);
+
+        char orphan0[512], orphan1[512], rig0[512], rig1[512], scene_path[512], proj_path[512];
+        snprintf(orphan0, sizeof(orphan0), "%s/models/puppet_0_50.json", exp_dir);
+        snprintf(orphan1, sizeof(orphan1), "%s/models/puppet_1_51.json", exp_dir);
+        snprintf(rig0, sizeof(rig0), "%s/studio_rig_50.json", exp_dir);
+        snprintf(rig1, sizeof(rig1), "%s/studio_rig_51.json", exp_dir);
+        snprintf(scene_path, sizeof(scene_path), "%s/scene.json", exp_dir);
+        snprintf(proj_path, sizeof(proj_path), "%s/project.json", exp_dir);
+        TEST_CHECK(!file_exists(orphan0));
+        TEST_CHECK(!file_exists(orphan1));
+        TEST_CHECK(verify_json_file_is_strict_rfc8785(rig0));
+        TEST_CHECK(verify_json_file_is_strict_rfc8785(rig1));
+        TEST_CHECK(verify_json_file_is_strict_rfc8785(scene_path));
+        TEST_CHECK(verify_json_file_is_strict_rfc8785(proj_path));
+
+        we_scene_t *reloaded = we_scene_load_cpu(exp_dir, NULL);
+        TEST_CHECK(reloaded != NULL && reloaded->object_count == 2u);
+        TEST_CHECK(reloaded->objects[0].base_pass.blending == WE_BLEND_ADDITIVE);
+        TEST_CHECK(reloaded->objects[1].base_pass.blending == WE_BLEND_MULTIPLY);
+        TEST_CHECK(reloaded->objects[0].puppet != NULL && reloaded->objects[1].puppet != NULL);
+        TEST_CHECK(strcmp(reloaded->objects[0].puppet->mat_json_file,
+                          reloaded->objects[1].puppet->mat_json_file) != 0);
+        we_scene_destroy(reloaded);
+        rm_rf(exp_dir);
+        we_tex_destroy(objs[0].base_pass.textures[0]);
+        we_tex_destroy(objs[1].base_pass.textures[0]);
+        free_test_puppet(p0);
+        free_test_puppet(p1);
+    }
+
+    /* 2. Preview > 64 MiB fails explicitly with WE_WRITER_ERR_LIMIT_EXCEEDED (no silent skip) */
+    {
+        char ws_dir[256], exp_dir[256];
+        make_tmp_dir(ws_dir, sizeof(ws_dir), "prev_65m_ws");
+        make_tmp_dir(exp_dir, sizeof(exp_dir), "prev_65m_exp");
+        char proj_path[512];
+        snprintf(proj_path, sizeof(proj_path), "%s/project.json", ws_dir);
+        FILE *pf = fopen(proj_path, "wb");
+        TEST_CHECK(pf != NULL);
+        fputs("{\"file\":\"scene.json\",\"preview\":\"preview.jpg\",\"type\":\"scene\"}", pf);
+        fclose(pf);
+        char prev_path[512];
+        snprintf(prev_path, sizeof(prev_path), "%s/preview.jpg", ws_dir);
+        int fd = open(prev_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        TEST_CHECK(fd >= 0);
+        TEST_CHECK(ftruncate(fd, (off_t)(65u * 1024u * 1024u)) == 0);
+        close(fd);
+
+        we_scene_t sc = {0};
+        sc.ortho_width = 1920.0f;
+        sc.ortho_height = 1080.0f;
+        snprintf(sc.project.workshop_dir, sizeof(sc.project.workshop_dir), "%s", ws_dir);
+        TEST_CHECK(!we_scene_export_dir(&sc, exp_dir, false, &err));
+        TEST_CHECK(err == WE_WRITER_ERR_LIMIT_EXCEEDED);
+        rm_rf(ws_dir);
+        rm_rf(exp_dir);
+    }
+}
+
 int main(void)
 {
     RUN_TEST(test_lz4_bounds_and_invalid);
@@ -1377,6 +2445,11 @@ int main(void)
     RUN_TEST(test_we_script_template_lint_and_abort);
     RUN_TEST(test_scene_destroy_callback_and_revision);
     RUN_TEST(test_audio_binding_clamps_and_cooldown);
+    RUN_TEST(test_e2e_f01_scripts_and_script_src_roundtrip);
+    RUN_TEST(test_e2e_f01_particle_export_with_has_base_pass);
+    RUN_TEST(test_aud123_combo_shaders_and_large_pass_body);
+    RUN_TEST(test_aud025_aud123_vram_and_compressed_texture_export);
+    RUN_TEST(test_aud303_aud409_rfc8785_puppets_and_64mib_preview);
 
     printf("SUMMARY: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
