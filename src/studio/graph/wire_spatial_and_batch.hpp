@@ -17,6 +17,28 @@
 
 namespace waywal::studio {
 
+inline constexpr float kGraphNodeWidth = 200.0f;
+inline constexpr float kGraphHeaderHeight = 28.0f;
+inline constexpr float kGraphPinRowHeight = 24.0f;
+inline constexpr float kGraphPinYOffset = 16.0f;
+
+[[nodiscard]] inline constexpr float
+graphPinCenterY(uint32_t pinIdx, float headerHeight = kGraphHeaderHeight,
+                float pinRowHeight = kGraphPinRowHeight) noexcept
+{
+    return headerHeight + kGraphPinYOffset + static_cast<float>(pinIdx) * pinRowHeight;
+}
+
+[[nodiscard]] inline QPointF graphPinScenePos(const QPointF &nodePos, uint32_t pinIdx,
+                                              bool isOutput, float nodeWidth = kGraphNodeWidth,
+                                              float headerHeight = kGraphHeaderHeight,
+                                              float pinRowHeight = kGraphPinRowHeight) noexcept
+{
+    return QPointF(nodePos.x() + (isOutput ? static_cast<double>(nodeWidth) : 0.0),
+                   nodePos.y() +
+                       static_cast<double>(graphPinCenterY(pinIdx, headerHeight, pinRowHeight)));
+}
+
 struct CachedWireGeometry {
     QPointF p0{};
     QPointF p1{};
@@ -61,6 +83,7 @@ struct PinSpatialEntry {
     uint32_t pinType{0};
     bool isOutput{false};
     QPointF scenePos{};
+    uint32_t pinFlags{0};
 };
 
 class UniformPinSpatialGrid {
@@ -77,54 +100,74 @@ class UniformPinSpatialGrid {
 
     void insert(const PinSpatialEntry &entry)
     {
-        const int32_t cx = static_cast<int32_t>(std::floor(entry.scenePos.x() / kCellSize));
-        const int32_t cy = static_cast<int32_t>(std::floor(entry.scenePos.y() / kCellSize));
+        if (!std::isfinite(entry.scenePos.x()) || !std::isfinite(entry.scenePos.y())) {
+            return;
+        }
+        const int32_t cx = cellCoord(entry.scenePos.x());
+        const int32_t cy = cellCoord(entry.scenePos.y());
         m_cells[packKey(cx, cy)].push_back(entry);
         ++m_pinCount;
     }
 
-    void rebuildFromGraph(const waywal_shader_graph_t &graph, float nodeWidth = 200.0f,
-                          float headerHeight = 28.0f, float pinRowHeight = 24.0f)
+    void rebuildFromGraph(const waywal_shader_graph_t &graph, float nodeWidth = kGraphNodeWidth,
+                          float headerHeight = kGraphHeaderHeight,
+                          float pinRowHeight = kGraphPinRowHeight)
     {
         clear();
-        m_cells.reserve(static_cast<size_t>(graph.node_count) * 2u + 1u);
+        const uint32_t nodeCount = std::min<uint32_t>(graph.node_count, WAYWAL_GRAPH_MAX_NODES);
+        m_cells.reserve(static_cast<size_t>(nodeCount) * 2u + 1u);
 
-        for (uint32_t i = 0; i < graph.node_count; ++i) {
+        for (uint32_t i = 0; i < nodeCount; ++i) {
             const auto &node = graph.nodes[i];
-            const double baseY = static_cast<double>(node.canvas_pos[1] + headerHeight + 16.0f);
+            if ((node.flags & WAYWAL_NODE_FLAG_COLLAPSED) != 0) {
+                continue;
+            }
+            if (!std::isfinite(node.canvas_pos[0]) || !std::isfinite(node.canvas_pos[1])) {
+                continue;
+            }
+            const QPointF nodePos(node.canvas_pos[0], node.canvas_pos[1]);
 
-            for (uint32_t p = 0; p < node.input_pin_count; ++p) {
+            const uint32_t inCount =
+                std::min<uint32_t>(node.input_pin_count, WAYWAL_GRAPH_MAX_PINS_PER_NODE);
+            for (uint32_t p = 0; p < inCount; ++p) {
                 const auto &pin = node.inputs[p];
                 if ((pin.flags & WAYWAL_PIN_FLAG_HIDDEN) != 0) {
                     continue;
                 }
                 insert({node.node_id, p, pin.pin_type, false,
-                        QPointF(node.canvas_pos[0], baseY + p * pinRowHeight)});
+                        graphPinScenePos(nodePos, p, false, nodeWidth, headerHeight, pinRowHeight),
+                        pin.flags});
             }
 
-            for (uint32_t p = 0; p < node.output_pin_count; ++p) {
+            const uint32_t outCount =
+                std::min<uint32_t>(node.output_pin_count, WAYWAL_GRAPH_MAX_PINS_PER_NODE);
+            for (uint32_t p = 0; p < outCount; ++p) {
                 const auto &pin = node.outputs[p];
                 if ((pin.flags & WAYWAL_PIN_FLAG_HIDDEN) != 0) {
                     continue;
                 }
                 insert({node.node_id, p, pin.pin_type, true,
-                        QPointF(node.canvas_pos[0] + nodeWidth, baseY + p * pinRowHeight)});
+                        graphPinScenePos(nodePos, p, true, nodeWidth, headerHeight, pinRowHeight),
+                        pin.flags});
             }
         }
     }
 
     [[nodiscard]] std::optional<PinSpatialEntry>
     findNearestCompatible(const QPointF &cursorPos, bool wantOutputPin, uint32_t draggedPinType,
-                          float snapRadius, uint32_t excludeNodeId = 0) const
+                          float snapRadius, uint32_t excludeNodeId = 0,
+                          uint32_t draggedPinFlags = 0) const
     {
-        if (!std::isfinite(snapRadius) || snapRadius <= 0.0f) {
+        if (!std::isfinite(cursorPos.x()) || !std::isfinite(cursorPos.y()) ||
+            !std::isfinite(snapRadius) || snapRadius <= 0.0f) {
             return std::nullopt;
         }
 
-        const int32_t cx = static_cast<int32_t>(std::floor(cursorPos.x() / kCellSize));
-        const int32_t cy = static_cast<int32_t>(std::floor(cursorPos.y() / kCellSize));
+        const int32_t cx = cellCoord(cursorPos.x());
+        const int32_t cy = cellCoord(cursorPos.y());
+        const double rawSpan = std::ceil(static_cast<double>(snapRadius) / kCellSize);
         const int32_t span =
-            (snapRadius <= kCellSize) ? 1 : static_cast<int32_t>(std::ceil(snapRadius / kCellSize));
+            (snapRadius <= kCellSize) ? 1 : static_cast<int32_t>(std::clamp(rawSpan, 1.0, 64.0));
 
         double bestDistSq = static_cast<double>(snapRadius) * static_cast<double>(snapRadius);
         std::optional<PinSpatialEntry> best;
@@ -139,9 +182,14 @@ class UniformPinSpatialGrid {
                     if (e.isOutput != wantOutputPin || e.nodeId == excludeNodeId) {
                         continue;
                     }
+                    const bool nonCoercible =
+                        ((e.pinFlags | draggedPinFlags) & WAYWAL_PIN_FLAG_NON_COERCIBLE) != 0;
                     const bool compat =
-                        wantOutputPin ? waywal_pin_types_compatible(e.pinType, draggedPinType)
-                                      : waywal_pin_types_compatible(draggedPinType, e.pinType);
+                        nonCoercible
+                            ? (e.pinType == draggedPinType)
+                            : (wantOutputPin
+                                   ? waywal_pin_types_compatible(e.pinType, draggedPinType)
+                                   : waywal_pin_types_compatible(draggedPinType, e.pinType));
                     if (!compat) {
                         continue;
                     }
@@ -159,6 +207,11 @@ class UniformPinSpatialGrid {
     }
 
   private:
+    [[nodiscard]] static int32_t cellCoord(double pos) noexcept
+    {
+        const double scaled = std::clamp(pos / kCellSize, -1000000.0, 1000000.0);
+        return static_cast<int32_t>(std::floor(scaled));
+    }
     [[nodiscard]] static constexpr uint64_t packKey(int32_t x, int32_t y) noexcept
     {
         return (static_cast<uint64_t>(static_cast<uint32_t>(x)) << 32) |

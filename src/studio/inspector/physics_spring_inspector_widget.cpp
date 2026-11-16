@@ -23,47 +23,11 @@
 namespace waywal::studio {
 
 /* ========================================================================= */
-/* Helper Functions                                                          */
-/* ========================================================================= */
-
-static we_physics_preset_t detectPreset(const we_bone_sim_config_t &cfg)
-{
-    auto matches = [](float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; };
-
-    if (matches(cfg.compliance_stretch, 1e-4f) && matches(cfg.compliance_bend, 0.001f) &&
-        matches(cfg.damping_ratio, 0.05f)) {
-        return WE_PHYS_PRESET_SILK;
-    }
-    if (matches(cfg.compliance_stretch, 5e-5f) && matches(cfg.compliance_bend, 0.005f) &&
-        matches(cfg.damping_ratio, 0.10f)) {
-        return WE_PHYS_PRESET_LONG_HAIR;
-    }
-    if (matches(cfg.compliance_stretch, 1e-5f) && matches(cfg.compliance_bend, 0.05f) &&
-        matches(cfg.damping_ratio, 0.30f)) {
-        return WE_PHYS_PRESET_HEAVY_CAPE;
-    }
-    if (matches(cfg.compliance_stretch, 1e-6f) && matches(cfg.compliance_bend, 0.50f) &&
-        matches(cfg.damping_ratio, 0.40f)) {
-        return WE_PHYS_PRESET_FOLIAGE_BRANCH;
-    }
-    if (matches(cfg.compliance_stretch, 1e-7f) && matches(cfg.compliance_bend, 0.002f) &&
-        matches(cfg.damping_ratio, 0.08f)) {
-        return WE_PHYS_PRESET_SOFT_RIBBON;
-    }
-    if (matches(cfg.compliance_stretch, 1e-8f) && matches(cfg.compliance_bend, 0.10f) &&
-        matches(cfg.damping_ratio, 0.20f)) {
-        return WE_PHYS_PRESET_METALLIC_CHAIN;
-    }
-    return WE_PHYS_PRESET_CUSTOM;
-}
-
-/* ========================================================================= */
 /* Construction & Setup                                                      */
 /* ========================================================================= */
 
-PhysicsSpringInspectorWidget::PhysicsSpringInspectorWidget(QWidget *parent) : QWidget(parent)
+void PhysicsSpringInspectorWidget::initDefaultContext()
 {
-    // Initialize default context
     std::memset(&m_ctx, 0, sizeof(m_ctx));
     m_ctx.wind.gravity_vec[0] = 0.0f;
     m_ctx.wind.gravity_vec[1] = -980.0f;
@@ -81,6 +45,11 @@ PhysicsSpringInspectorWidget::PhysicsSpringInspectorWidget(QWidget *parent) : QW
         we_physics_apply_preset(&m_ctx.configs[i], WE_PHYS_PRESET_CUSTOM);
         m_driveModes[i] = WE_BONE_DRIVE_FK;
     }
+}
+
+PhysicsSpringInspectorWidget::PhysicsSpringInspectorWidget(QWidget *parent) : QWidget(parent)
+{
+    initDefaultContext();
 
     setupUi();
     syncUiFromSelectedBone();
@@ -217,7 +186,8 @@ void PhysicsSpringInspectorWidget::setupUi()
         spinOut->setRange(minVal, maxVal);
         spinOut->setSingleStep(step);
         spinOut->setDecimals(decimals);
-        spinOut->setFixedWidth(74);
+        spinOut->setKeyboardTracking(false);
+        spinOut->setFixedWidth(96);
         spinOut->setStyleSheet(
             QStringLiteral("QDoubleSpinBox { background-color: #181825; color: #cdd6f4; border: "
                            "1px solid #313244; border-radius: 3px; padding: 1px 3px; }"));
@@ -256,21 +226,23 @@ void PhysicsSpringInspectorWidget::setupUi()
 
     addControlRow(tr("Stretch Compliance alpha_s (m/N):"),
                   tr("XPBD distance constraint compliance. 0.0 = completely rigid rod."), 0.0,
-                  0.001, 0.00001, 5, m_stretchComplianceSpin);
+                  0.001, 1e-7, 8, m_stretchComplianceSpin);
+    m_stretchComplianceSpin->setStepType(QAbstractSpinBox::AdaptiveDecimalStepType);
 
     addControlRow(tr("Bend Compliance alpha_b (rad/Nm):"),
                   tr("XPBD angular bending constraint compliance. Lower values resist bending."),
-                  0.0, 2.0, 0.001, 3, m_bendComplianceSpin);
+                  0.0, 2.0, 0.0001, 6, m_bendComplianceSpin);
+    m_bendComplianceSpin->setStepType(QAbstractSpinBox::AdaptiveDecimalStepType);
 
     addControlRow(tr("Damping Ratio zeta:"),
                   tr("Rayleigh / XPBD velocity damping. 1.0 = critically damped."), 0.0, 2.0, 0.01,
-                  2, m_dampingSpin);
+                  3, m_dampingSpin);
 
-    addControlRow(tr("Particle Mass (kg):"), tr("Effective tip mass in kg."), 0.01, 20.0, 0.05, 2,
+    addControlRow(tr("Particle Mass (kg):"), tr("Effective tip mass in kg."), 0.01, 50.0, 0.05, 3,
                   m_massSpin);
 
     addControlRow(tr("Gravity Scale:"), tr("Multiplier on scene gravity vector."), -5.0, 5.0, 0.1,
-                  1, m_gravityScaleSpin);
+                  2, m_gravityScaleSpin);
 
     addControlRow(tr("Angle Limit Min (rad):"), tr("Minimum local angular deflection limit."),
                   -3.1416, 0.0, 0.05, 2, m_angleMinSpin);
@@ -288,6 +260,41 @@ void PhysicsSpringInspectorWidget::setupUi()
 
     addControlRow(tr("Rayleigh Damping:"), tr("Kelvin-Voigt high-frequency damping factor."), 0.0,
                   0.5, 0.005, 3, m_rayleighDampingSpin);
+
+    auto *windDragLbl = new QLabel(tr("Wind Drag Coeff:"), springGroup);
+    windDragLbl->setToolTip(tr("Aerodynamic wind coupling coefficient [0.0, 5.0]."));
+    windDragLbl->setStyleSheet(QStringLiteral("color: #cdd6f4; font-size: 11px;"));
+    m_windDragSpin = new QDoubleSpinBox(springGroup);
+    m_windDragSpin->setRange(0.0, 5.0);
+    m_windDragSpin->setSingleStep(0.05);
+    m_windDragSpin->setDecimals(2);
+    m_windDragSpin->setKeyboardTracking(false);
+    m_windDragSpin->setFixedWidth(96);
+    m_windDragSpin->setStyleSheet(
+        QStringLiteral("QDoubleSpinBox { background-color: #181825; color: #cdd6f4; border: "
+                       "1px solid #313244; border-radius: 3px; padding: 1px 3px; }"));
+    connect(m_windDragSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+        if (!m_updatingUi) {
+            onBoneConfigControlChanged();
+        }
+    });
+    springLayout->addWidget(windDragLbl, row, 0);
+    springLayout->addWidget(m_windDragSpin, row, 2);
+    ++row;
+
+    auto *flagsRow = new QHBoxLayout();
+    m_angularLimitCheck = new QCheckBox(tr("Angular Limit"), springGroup);
+    m_cursorCollideCheck = new QCheckBox(tr("Cursor Collide"), springGroup);
+    m_pinnedRootCheck = new QCheckBox(tr("Pinned Root"), springGroup);
+    for (auto *chk : {m_angularLimitCheck, m_cursorCollideCheck, m_pinnedRootCheck}) {
+        chk->setStyleSheet(QStringLiteral("QCheckBox { color: #bac2de; font-size: 11px; }"));
+        connect(chk, &QCheckBox::toggled, this,
+                &PhysicsSpringInspectorWidget::onBoneConfigControlChanged);
+        flagsRow->addWidget(chk);
+    }
+    flagsRow->addStretch(1);
+    springLayout->addLayout(flagsRow, row, 0, 1, 3);
+    ++row;
 
     contentLayout->addWidget(springGroup);
 
@@ -324,7 +331,8 @@ void PhysicsSpringInspectorWidget::setupUi()
         spinOut->setRange(minVal, maxVal);
         spinOut->setSingleStep(step);
         spinOut->setDecimals(decimals);
-        spinOut->setFixedWidth(74);
+        spinOut->setKeyboardTracking(false);
+        spinOut->setFixedWidth(96);
         spinOut->setStyleSheet(
             QStringLiteral("QDoubleSpinBox { background-color: #181825; color: #cdd6f4; border: "
                            "1px solid #313244; border-radius: 3px; padding: 1px 3px; }"));
@@ -374,7 +382,37 @@ void PhysicsSpringInspectorWidget::setupUi()
                0.0, 10.0, 0.1, 1, m_windGustFreqSpin);
 
     addWindRow(tr("Curl Spatial Scale:"), tr("Spatial frequency 1/L of 2D/3D Simplex potential."),
-               0.0001, 0.02, 0.0005, 4, m_windSpatialScaleSpin);
+               0.0001, 0.02, 0.0001, 6, m_windSpatialScaleSpin);
+    m_windSpatialScaleSpin->setStepType(QAbstractSpinBox::AdaptiveDecimalStepType);
+
+    auto *gravLbl = new QLabel(tr("Gravity Vector XY (px/s^2):"), windGroup);
+    gravLbl->setToolTip(tr("World gravity acceleration vector (X, Y) in pixels/sec^2."));
+    gravLbl->setStyleSheet(QStringLiteral("color: #cdd6f4; font-size: 11px;"));
+    auto *gravRow = new QHBoxLayout();
+    auto makeGravSpin = [windGroup, this]() {
+        auto *sp = new QDoubleSpinBox(windGroup);
+        sp->setRange(-5000.0, 5000.0);
+        sp->setSingleStep(10.0);
+        sp->setDecimals(1);
+        sp->setKeyboardTracking(false);
+        sp->setFixedWidth(96);
+        sp->setStyleSheet(
+            QStringLiteral("QDoubleSpinBox { background-color: #181825; color: #cdd6f4; border: "
+                           "1px solid #313244; border-radius: 3px; padding: 1px 3px; }"));
+        connect(sp, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double) {
+            if (!m_updatingUi) {
+                onWindControlChanged();
+            }
+        });
+        return sp;
+    };
+    m_gravityXSpin = makeGravSpin();
+    m_gravityYSpin = makeGravSpin();
+    gravRow->addWidget(m_gravityXSpin);
+    gravRow->addWidget(m_gravityYSpin);
+    windLayout->addWidget(gravLbl, wrow, 0);
+    windLayout->addLayout(gravRow, wrow, 1, 1, 2);
+    ++wrow;
 
     contentLayout->addWidget(windGroup);
 
@@ -411,7 +449,8 @@ void PhysicsSpringInspectorWidget::setupUi()
         spinOut->setRange(minVal, maxVal);
         spinOut->setSingleStep(step);
         spinOut->setDecimals(decimals);
-        spinOut->setFixedWidth(74);
+        spinOut->setKeyboardTracking(false);
+        spinOut->setFixedWidth(96);
         spinOut->setStyleSheet(
             QStringLiteral("QDoubleSpinBox { background-color: #181825; color: #cdd6f4; border: "
                            "1px solid #313244; border-radius: 3px; padding: 1px 3px; }"));
@@ -501,7 +540,7 @@ void PhysicsSpringInspectorWidget::loadPuppetSkeleton(const we_puppet_t *puppet,
         if (m_boneTree) {
             m_boneTree->clear();
         }
-        std::memset(&m_ctx, 0, sizeof(m_ctx));
+        initDefaultContext();
         syncUiFromSelectedBone();
         return;
     }
@@ -529,6 +568,7 @@ void PhysicsSpringInspectorWidget::loadPuppetSkeleton(const we_puppet_t *puppet,
     }
 
     for (uint32_t i = 0; i < WE_MDL_MAX_BONES; ++i) {
+        m_ctx.configs[i].bone_index = i;
         m_driveModes[i] = ((m_ctx.configs[i].flags & WE_BONE_PHYS_ENABLED) != 0)
                               ? WE_BONE_DRIVE_XPBD
                               : WE_BONE_DRIVE_FK;
@@ -577,7 +617,7 @@ void PhysicsSpringInspectorWidget::setBoneDriveMode(int32_t boneIndex, we_bone_d
     m_driveModes[static_cast<size_t>(boneIndex)] = mode;
     if (mode == WE_BONE_DRIVE_XPBD) {
         m_ctx.configs[boneIndex].flags |= WE_BONE_PHYS_ENABLED;
-    } else if (mode == WE_BONE_DRIVE_IK || mode == WE_BONE_DRIVE_AIM) {
+    } else {
         m_ctx.configs[boneIndex].flags &= ~WE_BONE_PHYS_ENABLED;
     }
     refreshBoneTreeStates();
@@ -593,7 +633,7 @@ void PhysicsSpringInspectorWidget::setBoneDriveModes(
     for (uint32_t i = 0; i < WE_MDL_MAX_BONES; ++i) {
         if (m_driveModes[i] == WE_BONE_DRIVE_XPBD) {
             m_ctx.configs[i].flags |= WE_BONE_PHYS_ENABLED;
-        } else if (m_driveModes[i] == WE_BONE_DRIVE_IK || m_driveModes[i] == WE_BONE_DRIVE_AIM) {
+        } else {
             m_ctx.configs[i].flags &= ~WE_BONE_PHYS_ENABLED;
         }
     }
@@ -775,6 +815,15 @@ void PhysicsSpringInspectorWidget::syncUiFromSelectedBone()
         if (m_boneEnableCheck) {
             m_boneEnableCheck->setChecked((cfg.flags & WE_BONE_PHYS_ENABLED) != 0);
         }
+        if (m_angularLimitCheck) {
+            m_angularLimitCheck->setChecked((cfg.flags & WE_BONE_PHYS_ANGULAR_LIMIT) != 0);
+        }
+        if (m_cursorCollideCheck) {
+            m_cursorCollideCheck->setChecked((cfg.flags & WE_BONE_PHYS_CURSOR_COLLIDE) != 0);
+        }
+        if (m_pinnedRootCheck) {
+            m_pinnedRootCheck->setChecked((cfg.flags & WE_BONE_PHYS_PINNED_ROOT) != 0);
+        }
         if (m_stretchComplianceSpin) {
             m_stretchComplianceSpin->setValue(cfg.compliance_stretch);
         }
@@ -789,6 +838,9 @@ void PhysicsSpringInspectorWidget::syncUiFromSelectedBone()
         }
         if (m_gravityScaleSpin) {
             m_gravityScaleSpin->setValue(cfg.gravity_scale);
+        }
+        if (m_windDragSpin) {
+            m_windDragSpin->setValue(cfg.wind_drag_coeff);
         }
         if (m_angleMinSpin) {
             m_angleMinSpin->setValue(cfg.angle_limit_min_rad);
@@ -807,8 +859,9 @@ void PhysicsSpringInspectorWidget::syncUiFromSelectedBone()
         }
 
         if (m_presetCombo) {
-            we_physics_preset_t detected = detectPreset(cfg);
-            m_presetCombo->setCurrentIndex(static_cast<int>(detected));
+            const we_physics_preset_t detected = we_physics_detect_preset(&cfg);
+            const int comboIdx = m_presetCombo->findData(static_cast<int>(detected));
+            m_presetCombo->setCurrentIndex(comboIdx >= 0 ? comboIdx : 0);
         }
         if (m_driveBadgeLabel) {
             QColor badgeColor;
@@ -841,6 +894,12 @@ void PhysicsSpringInspectorWidget::syncUiFromSelectedBone()
     if (m_windSpatialScaleSpin) {
         m_windSpatialScaleSpin->setValue(m_ctx.wind.curl_spatial_scale);
     }
+    if (m_gravityXSpin) {
+        m_gravityXSpin->setValue(m_ctx.wind.gravity_vec[0]);
+    }
+    if (m_gravityYSpin) {
+        m_gravityYSpin->setValue(m_ctx.wind.gravity_vec[1]);
+    }
 
     if (m_cursorEnableCheck) {
         m_cursorEnableCheck->setChecked(m_ctx.cursor.enabled != 0);
@@ -868,7 +927,14 @@ void PhysicsSpringInspectorWidget::applyMaterialPreset(we_physics_preset_t prese
 
     we_bone_sim_config_t newCfg = m_ctx.configs[m_selectedBoneIndex];
     if (preset != WE_PHYS_PRESET_CUSTOM) {
-        we_physics_apply_preset(&newCfg, preset);
+        we_bone_sim_config_t canon{};
+        if (we_physics_get_preset_config(preset, &canon)) {
+            canon.bone_index = newCfg.bone_index;
+            canon.rest_length_px = newCfg.rest_length_px;
+            newCfg = canon;
+        } else {
+            we_physics_apply_preset(&newCfg, preset);
+        }
         newCfg.flags |= WE_BONE_PHYS_ENABLED;
     }
 
@@ -891,7 +957,9 @@ void PhysicsSpringInspectorWidget::onPresetComboActivated(int index)
     if (m_updatingUi) {
         return;
     }
-    applyMaterialPreset(static_cast<we_physics_preset_t>(index));
+    const uint32_t presetVal =
+        m_presetCombo ? m_presetCombo->itemData(index).toUInt() : static_cast<uint32_t>(index);
+    applyMaterialPreset(static_cast<we_physics_preset_t>(presetVal));
 }
 
 void PhysicsSpringInspectorWidget::onBoneConfigControlChanged()
@@ -904,13 +972,20 @@ void PhysicsSpringInspectorWidget::onBoneConfigControlChanged()
     we_bone_sim_config_t newCfg = m_ctx.configs[m_selectedBoneIndex];
     newCfg.bone_index = static_cast<uint32_t>(m_selectedBoneIndex);
 
-    if (m_boneEnableCheck) {
-        if (m_boneEnableCheck->isChecked()) {
-            newCfg.flags |= WE_BONE_PHYS_ENABLED;
-        } else {
-            newCfg.flags &= ~WE_BONE_PHYS_ENABLED;
+    auto applyFlag = [&](QCheckBox *chk, uint32_t bit) {
+        if (!chk) {
+            return;
         }
-    }
+        if (chk->isChecked()) {
+            newCfg.flags |= bit;
+        } else {
+            newCfg.flags &= ~bit;
+        }
+    };
+    applyFlag(m_boneEnableCheck, WE_BONE_PHYS_ENABLED);
+    applyFlag(m_angularLimitCheck, WE_BONE_PHYS_ANGULAR_LIMIT);
+    applyFlag(m_cursorCollideCheck, WE_BONE_PHYS_CURSOR_COLLIDE);
+    applyFlag(m_pinnedRootCheck, WE_BONE_PHYS_PINNED_ROOT);
 
     if (m_stretchComplianceSpin) {
         newCfg.compliance_stretch = static_cast<float>(m_stretchComplianceSpin->value());
@@ -926,6 +1001,9 @@ void PhysicsSpringInspectorWidget::onBoneConfigControlChanged()
     }
     if (m_gravityScaleSpin) {
         newCfg.gravity_scale = static_cast<float>(m_gravityScaleSpin->value());
+    }
+    if (m_windDragSpin) {
+        newCfg.wind_drag_coeff = static_cast<float>(m_windDragSpin->value());
     }
     if (m_angleMinSpin) {
         newCfg.angle_limit_min_rad = static_cast<float>(m_angleMinSpin->value());
@@ -970,6 +1048,12 @@ void PhysicsSpringInspectorWidget::onWindControlChanged()
     }
     if (m_windSpatialScaleSpin) {
         newWind.curl_spatial_scale = static_cast<float>(m_windSpatialScaleSpin->value());
+    }
+    if (m_gravityXSpin) {
+        newWind.gravity_vec[0] = static_cast<float>(m_gravityXSpin->value());
+    }
+    if (m_gravityYSpin) {
+        newWind.gravity_vec[1] = static_cast<float>(m_gravityYSpin->value());
     }
 
     commitPhysicsChange(m_ctx.configs[m_selectedBoneIndex], newWind, m_ctx.cursor);
@@ -1021,11 +1105,15 @@ void PhysicsSpringInspectorWidget::onApplyPresetToDescendantsClicked()
     }
 
     const we_bone_sim_config_t srcCfg = m_ctx.configs[m_selectedBoneIndex];
+    const we_bone_drive_mode_t srcDriveMode =
+        (srcCfg.flags & WE_BONE_PHYS_ENABLED) != 0 ? WE_BONE_DRIVE_XPBD : WE_BONE_DRIVE_FK;
 
     struct BoneConfigDelta {
         int32_t boneIndex{0};
         we_bone_sim_config_t oldCfg{};
         we_bone_sim_config_t newCfg{};
+        we_bone_drive_mode_t oldDriveMode{WE_BONE_DRIVE_FK};
+        we_bone_drive_mode_t newDriveMode{WE_BONE_DRIVE_FK};
     };
     std::vector<BoneConfigDelta> deltas;
 
@@ -1043,10 +1131,14 @@ void PhysicsSpringInspectorWidget::onApplyPresetToDescendantsClicked()
                 visited[i] = 1;
                 we_bone_sim_config_t childCfg = srcCfg;
                 childCfg.bone_index = static_cast<uint32_t>(i);
+                // Keep each descendant bone's bind-pose length instead of cloning the root's.
+                childCfg.rest_length_px = m_ctx.configs[i].rest_length_px;
                 deltas.push_back(BoneConfigDelta{
                     static_cast<int32_t>(i),
                     m_ctx.configs[i],
                     childCfg,
+                    m_driveModes[i],
+                    srcDriveMode,
                 });
                 queue.enqueue(static_cast<int32_t>(i));
             }
@@ -1063,10 +1155,9 @@ void PhysicsSpringInspectorWidget::onApplyPresetToDescendantsClicked()
       public:
         PropagateBonePhysicsCommand(QPointer<PhysicsSpringInspectorWidget> widget, QString output,
                                     int32_t objectId, int32_t rootBone,
-                                    std::vector<BoneConfigDelta> boneDeltas, we_wind_field_t wind,
-                                    we_cursor_force_t cursor)
+                                    std::vector<BoneConfigDelta> boneDeltas)
             : m_widget(std::move(widget)), m_output(std::move(output)), m_objectId(objectId),
-              m_rootBone(rootBone), m_deltas(std::move(boneDeltas)), m_wind(wind), m_cursor(cursor)
+              m_rootBone(rootBone), m_deltas(std::move(boneDeltas))
         {
         }
 
@@ -1085,9 +1176,16 @@ void PhysicsSpringInspectorWidget::onApplyPresetToDescendantsClicked()
                 return;
             }
             bool selectedModified = false;
+            std::vector<std::pair<int32_t, we_bone_drive_mode_t>> modeChanges;
             for (const auto &d : m_deltas) {
                 if (d.boneIndex >= 0 && d.boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
                     m_widget->m_ctx.configs[d.boneIndex] = useNew ? d.newCfg : d.oldCfg;
+                    const we_bone_drive_mode_t targetMode =
+                        useNew ? d.newDriveMode : d.oldDriveMode;
+                    if (m_widget->m_driveModes[static_cast<size_t>(d.boneIndex)] != targetMode) {
+                        m_widget->m_driveModes[static_cast<size_t>(d.boneIndex)] = targetMode;
+                        modeChanges.emplace_back(d.boneIndex, targetMode);
+                    }
                     if (d.boneIndex == m_widget->m_selectedBoneIndex) {
                         selectedModified = true;
                     }
@@ -1097,11 +1195,17 @@ void PhysicsSpringInspectorWidget::onApplyPresetToDescendantsClicked()
             if (selectedModified && !m_widget->m_updatingUi) {
                 m_widget->syncUiFromSelectedBone();
             }
+            for (const auto &mc : modeChanges) {
+                emit m_widget->boneDriveModeChanged(m_objectId, mc.first, mc.second);
+            }
+            const we_wind_field_t &liveWind = m_widget->m_ctx.wind;
+            const we_cursor_force_t &liveCursor = m_widget->m_ctx.cursor;
             for (const auto &d : m_deltas) {
                 const we_bone_sim_config_t &cfg = useNew ? d.newCfg : d.oldCfg;
-                emit m_widget->physicsParamsChanged(m_output, m_objectId, d.boneIndex, cfg, m_wind,
-                                                    m_cursor);
-                m_widget->sendIpcUpdate(m_output, m_objectId, d.boneIndex, cfg, m_wind, m_cursor);
+                emit m_widget->physicsParamsChanged(m_output, m_objectId, d.boneIndex, cfg,
+                                                    liveWind, liveCursor);
+                m_widget->sendIpcUpdate(m_output, m_objectId, d.boneIndex, cfg, liveWind,
+                                        liveCursor);
             }
         }
 
@@ -1110,13 +1214,11 @@ void PhysicsSpringInspectorWidget::onApplyPresetToDescendantsClicked()
         int32_t m_objectId{-1};
         int32_t m_rootBone{0};
         std::vector<BoneConfigDelta> m_deltas;
-        we_wind_field_t m_wind{};
-        we_cursor_force_t m_cursor{};
     };
 
     auto cmd = std::make_unique<PropagateBonePhysicsCommand>(
         QPointer<PhysicsSpringInspectorWidget>(this), m_targetOutput, m_objectId,
-        m_selectedBoneIndex, std::move(deltas), m_ctx.wind, m_ctx.cursor);
+        m_selectedBoneIndex, std::move(deltas));
     if (m_commandBus) {
         m_commandBus->execute(std::move(cmd));
     } else {
@@ -1198,31 +1300,6 @@ void PhysicsSpringInspectorWidget::commitPhysicsChange(const we_bone_sim_config_
     emit statusMessage(QStringLiteral("XPBD bone %1 parameters updated").arg(m_selectedBoneIndex));
 }
 
-template <typename Client = IpcClient>
-static void dispatchPhysicsIpc(Client *client, const QString &output, int32_t objectId,
-                               int32_t boneIndex, const we_bone_sim_config_t &cfg,
-                               const we_wind_field_t &wind, const we_cursor_force_t &cursor)
-{
-    if constexpr (requires(Client *c) {
-                      c->sendSetPhysicsParams(output, objectId, boneIndex, cfg, wind, cursor);
-                  }) {
-        client->sendSetPhysicsParams(output, objectId, boneIndex, cfg, wind, cursor);
-    } else if constexpr (requires(Client *c) {
-                             c->sendSetPhysicsParams(output, objectId, boneIndex, &cfg, &wind,
-                                                     &cursor);
-                         }) {
-        client->sendSetPhysicsParams(output, objectId, boneIndex, &cfg, &wind, &cursor);
-    } else {
-        (void)client;
-        (void)output;
-        (void)objectId;
-        (void)boneIndex;
-        (void)cfg;
-        (void)wind;
-        (void)cursor;
-    }
-}
-
 void PhysicsSpringInspectorWidget::sendIpcUpdate(const QString &output, int32_t objectId,
                                                  int32_t boneIndex, const we_bone_sim_config_t &cfg,
                                                  const we_wind_field_t &wind,
@@ -1232,7 +1309,7 @@ void PhysicsSpringInspectorWidget::sendIpcUpdate(const QString &output, int32_t 
         return;
     }
 
-    dispatchPhysicsIpc(m_ipcClient, output, objectId, boneIndex, cfg, wind, cursor);
+    m_ipcClient->sendSetPhysicsParams(output, objectId, boneIndex, cfg, wind, cursor);
 }
 
 void PhysicsSpringInspectorWidget::updateSolverTelemetry(uint32_t activeBones, float stepTimeUs)

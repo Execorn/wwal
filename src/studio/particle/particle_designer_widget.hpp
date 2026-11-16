@@ -11,8 +11,10 @@
 #include <QColor>
 #include <QComboBox>
 #include <QDoubleSpinBox>
+#include <QElapsedTimer>
 #include <QLabel>
 #include <QListWidget>
+#include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSpinBox>
@@ -41,6 +43,8 @@ class ScalarCurveEditorWidget : public QWidget {
     {
         return m_knots;
     }
+    [[nodiscard]] int selectedKnotIndex() const noexcept { return m_selectedKnot; }
+    void setSelectedKnotHandle(we_knot_handle_mode_t mode, float inTangent, float outTangent);
 
     /* Evaluates piecewise monotone cubic Hermite spline and bakes 65 exact LUT samples. */
     [[nodiscard]] float evaluateAt(float t) const noexcept;
@@ -48,6 +52,8 @@ class ScalarCurveEditorWidget : public QWidget {
 
   signals:
     void curveEdited(const std::vector<we_particle_curve_knot_t> &knots);
+    void curvePreviewEdited(const std::vector<we_particle_curve_knot_t> &knots);
+    void selectedKnotChanged(int knotIndex);
 
   protected:
     void paintEvent(QPaintEvent *event) override;
@@ -59,10 +65,14 @@ class ScalarCurveEditorWidget : public QWidget {
   private:
     void rebuildTangentCache();
 
+    enum class DragKind { None, Knot, InTangent, OutTangent };
+
     float m_minVal{0.0f};
     float m_maxVal{1.0f};
     int m_selectedKnot{-1};
-    bool m_draggingKnot{false};
+    DragKind m_dragKind{DragKind::None};
+    bool m_dragModified{false};
+    QElapsedTimer m_previewThrottleTimer;
     std::vector<we_particle_curve_knot_t> m_knots;
     std::vector<float> m_cachedAutoTangents;
 };
@@ -87,6 +97,7 @@ class OklabColorRampWidget : public QWidget {
 
   signals:
     void rampEdited(const std::vector<we_particle_color_stop_t> &stops);
+    void rampPreviewEdited(const std::vector<we_particle_color_stop_t> &stops);
     void stopColorPickerRequested(int stopIndex, const QColor &initialColor);
 
   protected:
@@ -95,11 +106,20 @@ class OklabColorRampWidget : public QWidget {
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
 
   private:
+    void ensureLutCache() const noexcept;
+
     int m_selectedStop{-1};
     bool m_draggingStop{false};
+    bool m_dragModified{false};
+    QElapsedTimer m_previewThrottleTimer;
     std::vector<we_particle_color_stop_t> m_stops;
+    mutable bool m_lutCacheDirty{true};
+    mutable std::array<float, WE_PARTICLE_RAMP_SAMPLES> m_cachedR{};
+    mutable std::array<float, WE_PARTICLE_RAMP_SAMPLES> m_cachedG{};
+    mutable std::array<float, WE_PARTICLE_RAMP_SAMPLES> m_cachedB{};
 };
 
 class ParticleDesignerWidget : public QWidget {
@@ -145,6 +165,7 @@ class ParticleDesignerWidget : public QWidget {
     void commitSystemEdit(const QString &paramGroup);
     void pushRampLutIpc(uint32_t opIndex, uint32_t channelKind);
     void pushRampLutIpcForObject(int32_t objectId, uint32_t opIndex, uint32_t channelKind);
+    void pushMatchingRampLutsForChannel(int32_t objectId, uint32_t channelKind);
 
     bool m_uiInitialized{false};
     bool m_updatingUi{false};

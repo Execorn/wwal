@@ -46,18 +46,51 @@ QString fmtVec3(const float v[3])
                              static_cast<double>(v[2]));
 }
 
+float sanitizeFloat(double val, float fallback = 0.0f) noexcept
+{
+    if (!std::isfinite(val)) {
+        return fallback;
+    }
+    return static_cast<float>(val);
+}
+
 void parseVec3(const QString &str, float out[3])
 {
     const QStringList parts = str.split(QLatin1Char(' '), Qt::SkipEmptyParts);
     for (int i = 0; i < 3; ++i) {
-        out[i] = (i < parts.size()) ? parts[i].toFloat() : 0.0f;
+        if (i < parts.size()) {
+            bool ok = false;
+            const float f = parts[i].toFloat(&ok);
+            out[i] = (ok && std::isfinite(f)) ? f : 0.0f;
+        } else {
+            out[i] = 0.0f;
+        }
     }
 }
 
-bool isControlPointAttractOp(const we_particle_operator_t &op) noexcept
+we_operator_type_t expectedOpTypeForChannel(uint32_t channelKind) noexcept
 {
-    return op.type == WE_OP_VORTEX && std::abs(op.speed_inner) < 1e-4f &&
-           std::abs(op.speed_outer) < 1e-4f;
+    if (channelKind == 1u) {
+        return WE_OP_SIZE_CHANGE;
+    }
+    if (channelKind == 2u) {
+        return WE_OP_COLOR_CHANGE;
+    }
+    return WE_OP_ALPHA_FADE;
+}
+
+uint32_t channelKindFromJsonOperatorName(const QString &name) noexcept
+{
+    if (name == QLatin1String("alphafade")) {
+        return 0u;
+    }
+    if (name == QLatin1String("sizechange")) {
+        return 1u;
+    }
+    if (name == QLatin1String("colorchange")) {
+        return 2u;
+    }
+    return UINT32_MAX;
 }
 
 QString emitterSummary(size_t index, const we_particle_emitter_t &em)
@@ -88,7 +121,7 @@ QString initializerSummary(size_t index, const we_particle_initializer_t &iz)
 
 QString operatorSummary(size_t index, const we_particle_operator_t &op)
 {
-    if (isControlPointAttractOp(op)) {
+    if (op.type == WE_OP_CONTROL_POINT_ATTRACT) {
         return QStringLiteral("#%1 ControlPointAttract (CP%2, r=%3..%4)")
             .arg(index)
             .arg(op.control_point)
@@ -96,36 +129,13 @@ QString operatorSummary(size_t index, const we_particle_operator_t &op)
             .arg(static_cast<double>(op.distance_outer), 0, 'f', 0);
     }
     static constexpr const char *kNames[] = {
-        "Movement",       "AngularMovement", "AlphaFade",         "SizeChange", "ColorChange",
-        "OscillateAlpha", "OscillateSize",   "OscillatePosition", "Vortex",     "Turbulence",
+        "Movement",    "AngularMovement", "AlphaFade",           "SizeChange",
+        "ColorChange", "OscillateAlpha",  "OscillateSize",       "OscillatePosition",
+        "Vortex",      "Turbulence",      "ControlPointAttract",
     };
     const size_t t = static_cast<size_t>(op.type);
     const char *name = (t < std::size(kNames)) ? kNames[t] : "Operator";
     return QStringLiteral("#%1 %2").arg(index).arg(QLatin1String(name));
-}
-
-template <typename Client = IpcClient>
-void dispatchParticleConfigIpc(Client *client, const QString &output, int32_t objectId,
-                               uint32_t configOp, uint32_t presetId, uint32_t flags,
-                               const void *payload, uint32_t payloadLen)
-{
-    if (!client) {
-        return;
-    }
-
-    if constexpr (requires(Client *c) {
-                      c->sendParticleConfig(output, objectId, configOp, presetId, flags, payload,
-                                            payloadLen);
-                  }) {
-        client->sendParticleConfig(output, objectId, configOp, presetId, flags, payload,
-                                   payloadLen);
-    } else if constexpr (requires(Client *c) {
-                             c->requestParticleConfig(output, objectId, configOp, presetId, flags,
-                                                      payload, payloadLen);
-                         }) {
-        client->requestParticleConfig(output, objectId, configOp, presetId, flags, payload,
-                                      payloadLen);
-    }
 }
 
 void computeHermiteTangents(const std::vector<we_particle_curve_knot_t> &knots,
@@ -213,6 +223,10 @@ bool parseCurveKnotsJson(const QJsonArray &arr, std::vector<we_particle_curve_kn
         const int m = ko.value(QStringLiteral("mode")).toInt(WE_KNOT_HANDLE_AUTO_SMOOTH);
         k.mode = static_cast<we_knot_handle_mode_t>(
             std::clamp(m, 0, static_cast<int>(WE_KNOT_HANDLE_STEP)));
+        const double inTan = ko.value(QStringLiteral("in_tangent")).toDouble(0.0);
+        const double outTan = ko.value(QStringLiteral("out_tangent")).toDouble(0.0);
+        k.in_tangent = std::isfinite(inTan) ? static_cast<float>(inTan) : 0.0f;
+        k.out_tangent = std::isfinite(outTan) ? static_cast<float>(outTan) : 0.0f;
         parsed.push_back(k);
     }
     if (parsed.empty()) {
@@ -280,7 +294,7 @@ void bakeAndSendRampLut(IpcClient *client, const QString &output, int32_t objId,
             sizeWidget->bakeLut(lut.scalar_lut);
         } else {
             ScalarCurveEditorWidget temp;
-            temp.setValueRange(0.0f, 3.0f);
+            temp.setValueRange(0.0f, 4.0f);
             temp.setKnots(sizeKnots);
             temp.bakeLut(lut.scalar_lut);
         }
@@ -295,8 +309,10 @@ void bakeAndSendRampLut(IpcClient *client, const QString &output, int32_t objId,
         }
     }
 
-    dispatchParticleConfigIpc(client, output, objId, WE_PARTICLE_CFG_SET_RAMP_LUT, 0u, 0u, &lut,
-                              static_cast<uint32_t>(sizeof(lut)));
+    if (client) {
+        (void)client->sendParticleConfig(output, objId, WE_PARTICLE_CFG_SET_RAMP_LUT, 0u, 0u, &lut,
+                                         static_cast<uint32_t>(sizeof(lut)));
+    }
 }
 
 QString darkDockStyleSheet()
@@ -537,6 +553,20 @@ void ScalarCurveEditorWidget::paintEvent(QPaintEvent *event)
     for (size_t i = 0; i < m_knots.size(); ++i) {
         const QPointF pt = toScreen(m_knots[i].t, m_knots[i].y);
         if (static_cast<int>(i) == m_selectedKnot) {
+            if (m_knots[i].mode == WE_KNOT_HANDLE_FREE_BEZIER) {
+                constexpr float dtVis = 0.08f;
+                const QPointF inPt = toScreen(std::max(0.0f, m_knots[i].t - dtVis),
+                                              m_knots[i].y - m_knots[i].in_tangent * dtVis);
+                const QPointF outPt = toScreen(std::min(1.0f, m_knots[i].t + dtVis),
+                                               m_knots[i].y + m_knots[i].out_tangent * dtVis);
+                p.setPen(QPen(QColor(0xf9, 0xe2, 0xaf), 1.2, Qt::DashLine));
+                p.drawLine(pt, inPt);
+                p.drawLine(pt, outPt);
+                p.setBrush(QColor(0xf9, 0xe2, 0xaf));
+                p.setPen(QPen(kBgCanvas, 1.0));
+                p.drawEllipse(inPt, 3.5, 3.5);
+                p.drawEllipse(outPt, 3.5, 3.5);
+            }
             /* Selected knot uses an 8px diamond with primary halo so state is shape-coded. */
             QPolygonF diamond;
             diamond << QPointF(pt.x(), pt.y() - 6.0) << QPointF(pt.x() + 6.0, pt.y())
@@ -552,6 +582,25 @@ void ScalarCurveEditorWidget::paintEvent(QPaintEvent *event)
     }
 }
 
+void ScalarCurveEditorWidget::setSelectedKnotHandle(we_knot_handle_mode_t mode, float inTangent,
+                                                    float outTangent)
+{
+    if (m_selectedKnot < 0 || m_selectedKnot >= static_cast<int>(m_knots.size())) {
+        return;
+    }
+    auto &k = m_knots[static_cast<size_t>(m_selectedKnot)];
+    k.mode = mode;
+    if (std::isfinite(inTangent)) {
+        k.in_tangent = std::clamp(inTangent, -20.0f, 20.0f);
+    }
+    if (std::isfinite(outTangent)) {
+        k.out_tangent = std::clamp(outTangent, -20.0f, 20.0f);
+    }
+    rebuildTangentCache();
+    emit curveEdited(m_knots);
+    update();
+}
+
 void ScalarCurveEditorWidget::mousePressEvent(QMouseEvent *event)
 {
     const QRectF plot =
@@ -561,18 +610,43 @@ void ScalarCurveEditorWidget::mousePressEvent(QMouseEvent *event)
     }
 
     const float span = std::max(1e-5f, m_maxVal - m_minVal);
-    auto toScreen = [&](const we_particle_curve_knot_t &k) -> QPointF {
-        const qreal sx = plot.left() + static_cast<qreal>(k.t) * plot.width();
-        const qreal normY = static_cast<qreal>((k.y - m_minVal) / span);
+    auto toScreen = [&](float t, float y) -> QPointF {
+        const qreal sx = plot.left() + static_cast<qreal>(t) * plot.width();
+        const qreal normY = static_cast<qreal>(std::clamp((y - m_minVal) / span, 0.0f, 1.0f));
         const qreal sy = plot.bottom() - normY * plot.height();
         return QPointF(sx, sy);
     };
 
     const QPointF pos = event->position();
+
+    if (event->button() == Qt::LeftButton && m_selectedKnot >= 0 &&
+        m_selectedKnot < static_cast<int>(m_knots.size())) {
+        const auto &selK = m_knots[static_cast<size_t>(m_selectedKnot)];
+        if (selK.mode == WE_KNOT_HANDLE_FREE_BEZIER) {
+            constexpr float dtVis = 0.08f;
+            const QPointF inPt =
+                toScreen(std::max(0.0f, selK.t - dtVis), selK.y - selK.in_tangent * dtVis);
+            const QPointF outPt =
+                toScreen(std::min(1.0f, selK.t + dtVis), selK.y + selK.out_tangent * dtVis);
+            if (QPointF::dotProduct(pos - inPt, pos - inPt) <= 64.0) {
+                m_dragKind = DragKind::InTangent;
+                m_dragModified = false;
+                m_previewThrottleTimer.restart();
+                return;
+            }
+            if (QPointF::dotProduct(pos - outPt, pos - outPt) <= 64.0) {
+                m_dragKind = DragKind::OutTangent;
+                m_dragModified = false;
+                m_previewThrottleTimer.restart();
+                return;
+            }
+        }
+    }
+
     int hitIdx = -1;
     qreal bestDist2 = 100.0;
     for (size_t i = 0; i < m_knots.size(); ++i) {
-        const QPointF d = pos - toScreen(m_knots[i]);
+        const QPointF d = pos - toScreen(m_knots[i].t, m_knots[i].y);
         const qreal dist2 = d.x() * d.x() + d.y() * d.y();
         if (dist2 <= bestDist2) {
             bestDist2 = dist2;
@@ -585,6 +659,7 @@ void ScalarCurveEditorWidget::mousePressEvent(QMouseEvent *event)
             m_knots.erase(m_knots.begin() + hitIdx);
             rebuildTangentCache();
             m_selectedKnot = std::min(hitIdx, static_cast<int>(m_knots.size()) - 1);
+            emit selectedKnotChanged(m_selectedKnot);
             emit curveEdited(m_knots);
             update();
         }
@@ -597,7 +672,10 @@ void ScalarCurveEditorWidget::mousePressEvent(QMouseEvent *event)
 
     if (hitIdx >= 0) {
         m_selectedKnot = hitIdx;
-        m_draggingKnot = true;
+        m_dragKind = DragKind::Knot;
+        m_dragModified = false;
+        m_previewThrottleTimer.restart();
+        emit selectedKnotChanged(m_selectedKnot);
         update();
         return;
     }
@@ -618,7 +696,10 @@ void ScalarCurveEditorWidget::mousePressEvent(QMouseEvent *event)
         m_knots.insert(insIt, nk);
         rebuildTangentCache();
         m_selectedKnot = insIdx;
-        m_draggingKnot = true;
+        m_dragKind = DragKind::Knot;
+        m_dragModified = false;
+        m_previewThrottleTimer.restart();
+        emit selectedKnotChanged(m_selectedKnot);
         emit curveEdited(m_knots);
         update();
     }
@@ -626,7 +707,7 @@ void ScalarCurveEditorWidget::mousePressEvent(QMouseEvent *event)
 
 void ScalarCurveEditorWidget::mouseMoveEvent(QMouseEvent *event)
 {
-    if (!m_draggingKnot || m_selectedKnot < 0 ||
+    if (m_dragKind == DragKind::None || m_selectedKnot < 0 ||
         m_selectedKnot >= static_cast<int>(m_knots.size())) {
         return;
     }
@@ -638,26 +719,50 @@ void ScalarCurveEditorWidget::mouseMoveEvent(QMouseEvent *event)
 
     const QPointF pos = event->position();
     const float span = std::max(1e-5f, m_maxVal - m_minVal);
-    const float normY =
-        std::clamp(static_cast<float>((plot.bottom() - pos.y()) / plot.height()), 0.0f, 1.0f);
-    m_knots[static_cast<size_t>(m_selectedKnot)].y = m_minVal + normY * span;
+    auto &k = m_knots[static_cast<size_t>(m_selectedKnot)];
 
-    if (m_selectedKnot > 0 && m_selectedKnot + 1 < static_cast<int>(m_knots.size())) {
-        const float minT = m_knots[static_cast<size_t>(m_selectedKnot - 1)].t + 0.005f;
-        const float maxT = m_knots[static_cast<size_t>(m_selectedKnot + 1)].t - 0.005f;
-        const float rawT = static_cast<float>((pos.x() - plot.left()) / plot.width());
-        m_knots[static_cast<size_t>(m_selectedKnot)].t =
-            std::clamp(rawT, minT, std::max(minT, maxT));
+    if (m_dragKind == DragKind::InTangent || m_dragKind == DragKind::OutTangent) {
+        const float normY =
+            std::clamp(static_cast<float>((plot.bottom() - pos.y()) / plot.height()), 0.0f, 1.0f);
+        const float targetY = m_minVal + normY * span;
+        constexpr float dtVis = 0.08f;
+        if (m_dragKind == DragKind::InTangent) {
+            k.in_tangent = std::clamp((k.y - targetY) / dtVis, -20.0f, 20.0f);
+        } else {
+            k.out_tangent = std::clamp((targetY - k.y) / dtVis, -20.0f, 20.0f);
+        }
+    } else {
+        const float normY =
+            std::clamp(static_cast<float>((plot.bottom() - pos.y()) / plot.height()), 0.0f, 1.0f);
+        k.y = m_minVal + normY * span;
+
+        if (m_selectedKnot > 0 && m_selectedKnot + 1 < static_cast<int>(m_knots.size())) {
+            const float minT = m_knots[static_cast<size_t>(m_selectedKnot - 1)].t + 0.005f;
+            const float maxT = m_knots[static_cast<size_t>(m_selectedKnot + 1)].t - 0.005f;
+            const float rawT = static_cast<float>((pos.x() - plot.left()) / plot.width());
+            k.t = std::clamp(rawT, minT, std::max(minT, maxT));
+        }
     }
+
     rebuildTangentCache();
-    emit curveEdited(m_knots);
+    m_dragModified = true;
+    if (!m_previewThrottleTimer.isValid() || m_previewThrottleTimer.elapsed() >= 16) {
+        m_previewThrottleTimer.restart();
+        emit curvePreviewEdited(m_knots);
+    }
     update();
 }
 
 void ScalarCurveEditorWidget::mouseReleaseEvent(QMouseEvent *event)
 {
     (void)event;
-    m_draggingKnot = false;
+    const bool commitDrag = (m_dragKind != DragKind::None) && m_dragModified;
+    m_dragKind = DragKind::None;
+    m_dragModified = false;
+    if (commitDrag) {
+        emit selectedKnotChanged(m_selectedKnot);
+        emit curveEdited(m_knots);
+    }
 }
 
 void ScalarCurveEditorWidget::keyPressEvent(QKeyEvent *event)
@@ -788,10 +893,20 @@ void OklabColorRampWidget::setStops(const std::vector<we_particle_color_stop_t> 
     }
 
     m_stops = std::move(cleaned);
+    m_lutCacheDirty = true;
     if (m_selectedStop >= static_cast<int>(m_stops.size())) {
         m_selectedStop = static_cast<int>(m_stops.size()) - 1;
     }
     update();
+}
+
+void OklabColorRampWidget::ensureLutCache() const noexcept
+{
+    if (!m_lutCacheDirty) {
+        return;
+    }
+    bakeOklabRgbLut(m_cachedR.data(), m_cachedG.data(), m_cachedB.data());
+    m_lutCacheDirty = false;
 }
 
 void OklabColorRampWidget::bakeOklabRgbLut(float outR[WE_PARTICLE_RAMP_SAMPLES],
@@ -875,21 +990,20 @@ void OklabColorRampWidget::paintEvent(QPaintEvent *event)
 
     const QRectF fullRect = rect();
     p.fillRect(fullRect, kBgElevated);
+    p.setPen(QPen(hasFocus() ? kAccentSky : kBorderSubtle, hasFocus() ? 2.0 : 1.0));
+    p.drawRoundedRect(fullRect.adjusted(0.5, 0.5, -0.5, -0.5), 4.0, 4.0);
 
     const QRectF barRect = fullRect.adjusted(kCanvasPadX, 6.0, -kCanvasPadX, -18.0);
     if (barRect.width() <= 2.0 || barRect.height() <= 2.0) {
         return;
     }
 
-    float rLut[WE_PARTICLE_RAMP_SAMPLES]{};
-    float gLut[WE_PARTICLE_RAMP_SAMPLES]{};
-    float bLut[WE_PARTICLE_RAMP_SAMPLES]{};
-    bakeOklabRgbLut(rLut, gLut, bLut);
+    ensureLutCache();
 
     QLinearGradient grad(barRect.topLeft(), barRect.topRight());
     for (uint32_t k = 0; k < WE_PARTICLE_RAMP_SAMPLES; ++k) {
         const qreal u = static_cast<qreal>(k) / static_cast<qreal>(WE_PARTICLE_RAMP_SAMPLES - 1u);
-        grad.setColorAt(u, QColor::fromRgbF(rLut[k], gLut[k], bLut[k]));
+        grad.setColorAt(u, QColor::fromRgbF(m_cachedR[k], m_cachedG[k], m_cachedB[k]));
     }
     p.setPen(QPen(kBorderSubtle, 1.0));
     p.setBrush(grad);
@@ -941,6 +1055,7 @@ void OklabColorRampWidget::mousePressEvent(QMouseEvent *event)
         if (hitIdx > 0 && hitIdx + 1 < static_cast<int>(m_stops.size()) && m_stops.size() > 2) {
             m_stops.erase(m_stops.begin() + hitIdx);
             m_selectedStop = std::min(hitIdx, static_cast<int>(m_stops.size()) - 1);
+            m_lutCacheDirty = true;
             emit rampEdited(m_stops);
             update();
         }
@@ -954,6 +1069,8 @@ void OklabColorRampWidget::mousePressEvent(QMouseEvent *event)
     if (hitIdx >= 0) {
         m_selectedStop = hitIdx;
         m_draggingStop = true;
+        m_dragModified = false;
+        m_previewThrottleTimer.restart();
         update();
         return;
     }
@@ -963,15 +1080,13 @@ void OklabColorRampWidget::mousePressEvent(QMouseEvent *event)
         pos.x() <= barRect.right() + 2.0) {
         const float t = std::clamp(static_cast<float>((pos.x() - barRect.left()) / barRect.width()),
                                    0.005f, 0.995f);
-        float rLut[WE_PARTICLE_RAMP_SAMPLES]{};
-        float gLut[WE_PARTICLE_RAMP_SAMPLES]{};
-        float bLut[WE_PARTICLE_RAMP_SAMPLES]{};
-        bakeOklabRgbLut(rLut, gLut, bLut);
+        ensureLutCache();
         const size_t sampleIdx = static_cast<size_t>(
             std::clamp(static_cast<int>(std::lround(t * (WE_PARTICLE_RAMP_SAMPLES - 1))), 0,
                        static_cast<int>(WE_PARTICLE_RAMP_SAMPLES - 1)));
 
-        we_particle_color_stop_t stop{t, {rLut[sampleIdx], gLut[sampleIdx], bLut[sampleIdx]}};
+        we_particle_color_stop_t stop{
+            t, {m_cachedR[sampleIdx], m_cachedG[sampleIdx], m_cachedB[sampleIdx]}};
         const auto insIt = std::lower_bound(
             m_stops.begin(), m_stops.end(), stop.t,
             [](const we_particle_color_stop_t &s, float key) { return s.t < key; });
@@ -979,6 +1094,9 @@ void OklabColorRampWidget::mousePressEvent(QMouseEvent *event)
         m_stops.insert(insIt, stop);
         m_selectedStop = insIdx;
         m_draggingStop = true;
+        m_dragModified = false;
+        m_previewThrottleTimer.restart();
+        m_lutCacheDirty = true;
         emit rampEdited(m_stops);
         update();
     }
@@ -1001,7 +1119,12 @@ void OklabColorRampWidget::mouseMoveEvent(QMouseEvent *event)
         const float maxT = m_stops[static_cast<size_t>(m_selectedStop + 1)].t - 0.005f;
         m_stops[static_cast<size_t>(m_selectedStop)].t =
             std::clamp(rawT, minT, std::max(minT, maxT));
-        emit rampEdited(m_stops);
+        m_lutCacheDirty = true;
+        m_dragModified = true;
+        if (!m_previewThrottleTimer.isValid() || m_previewThrottleTimer.elapsed() >= 16) {
+            m_previewThrottleTimer.restart();
+            emit rampPreviewEdited(m_stops);
+        }
         update();
     }
 }
@@ -1039,7 +1162,61 @@ void OklabColorRampWidget::mouseDoubleClickEvent(QMouseEvent *event)
 void OklabColorRampWidget::mouseReleaseEvent(QMouseEvent *event)
 {
     (void)event;
+    const bool commitDrag = m_draggingStop && m_dragModified;
     m_draggingStop = false;
+    m_dragModified = false;
+    if (commitDrag) {
+        emit rampEdited(m_stops);
+    }
+}
+
+void OklabColorRampWidget::keyPressEvent(QKeyEvent *event)
+{
+    if (m_selectedStop < 0 || m_selectedStop >= static_cast<int>(m_stops.size())) {
+        QWidget::keyPressEvent(event);
+        return;
+    }
+    const size_t idx = static_cast<size_t>(m_selectedStop);
+    switch (event->key()) {
+    case Qt::Key_Delete:
+    case Qt::Key_Backspace:
+        if (idx > 0 && idx + 1 < m_stops.size() && m_stops.size() > 2) {
+            m_stops.erase(m_stops.begin() + static_cast<ptrdiff_t>(idx));
+            m_selectedStop = std::min(m_selectedStop, static_cast<int>(m_stops.size()) - 1);
+            m_lutCacheDirty = true;
+            emit rampEdited(m_stops);
+            update();
+        }
+        return;
+    case Qt::Key_Left:
+        if (idx > 0 && idx + 1 < m_stops.size()) {
+            const float minT = m_stops[idx - 1].t + 0.005f;
+            m_stops[idx].t = std::max(minT, m_stops[idx].t - 0.02f);
+            m_lutCacheDirty = true;
+            emit rampEdited(m_stops);
+            update();
+        }
+        return;
+    case Qt::Key_Right:
+        if (idx > 0 && idx + 1 < m_stops.size()) {
+            const float maxT = m_stops[idx + 1].t - 0.005f;
+            m_stops[idx].t = std::min(maxT, m_stops[idx].t + 0.02f);
+            m_lutCacheDirty = true;
+            emit rampEdited(m_stops);
+            update();
+        }
+        return;
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+    case Qt::Key_Space: {
+        const auto &st = m_stops[idx];
+        emit stopColorPickerRequested(m_selectedStop,
+                                      QColor::fromRgbF(st.rgb[0], st.rgb[1], st.rgb[2]));
+        return;
+    }
+    default:
+        QWidget::keyPressEvent(event);
+    }
 }
 
 /* ========================================================================= */
@@ -1056,6 +1233,14 @@ struct ParticleDesignerWidget::ExtraState {
     std::vector<we_particle_curve_knot_t> sizeKnots;
     std::vector<we_particle_color_stop_t> colorStops;
 
+    QCheckBox *perspectiveCheck{nullptr};
+    QComboBox *alphaHandleModeCombo{nullptr};
+    QDoubleSpinBox *alphaInTanSpin{nullptr};
+    QDoubleSpinBox *alphaOutTanSpin{nullptr};
+    QComboBox *sizeHandleModeCombo{nullptr};
+    QDoubleSpinBox *sizeInTanSpin{nullptr};
+    QDoubleSpinBox *sizeOutTanSpin{nullptr};
+
     QWidget *emitterDetailCard{nullptr};
     QComboBox *emTypeCombo{nullptr};
     QDoubleSpinBox *emOrigX{nullptr};
@@ -1063,8 +1248,13 @@ struct ParticleDesignerWidget::ExtraState {
     QDoubleSpinBox *emOrigZ{nullptr};
     QDoubleSpinBox *emDistMinX{nullptr};
     QDoubleSpinBox *emDistMinY{nullptr};
+    QDoubleSpinBox *emDistMinZ{nullptr};
     QDoubleSpinBox *emDistMaxX{nullptr};
     QDoubleSpinBox *emDistMaxY{nullptr};
+    QDoubleSpinBox *emDistMaxZ{nullptr};
+    QDoubleSpinBox *emDirX{nullptr};
+    QDoubleSpinBox *emDirY{nullptr};
+    QDoubleSpinBox *emDirZ{nullptr};
     QDoubleSpinBox *emRateSpin{nullptr};
     QSpinBox *emBurstSpin{nullptr};
     QDoubleSpinBox *emSpeedMinSpin{nullptr};
@@ -1107,6 +1297,8 @@ struct ParticleDesignerWidget::ExtraState {
     QCheckBox *cpWorldSpaceCheck{nullptr};
     QDoubleSpinBox *cpOffsetX{nullptr};
     QDoubleSpinBox *cpOffsetY{nullptr};
+    QDoubleSpinBox *cpOffsetZ{nullptr};
+    QPointer<OklchColorDialog> activeColorDialog;
 
     uint32_t pendingAlive{0};
     uint32_t pendingMax{WE_PARTICLE_DEFAULT_CAP};
@@ -1225,10 +1417,11 @@ void ParticleDesignerWidget::loadParticleSystem(int32_t objectId, const we_parti
     }
 
     m_maxCount = std::clamp(sys->max_count, 1u, static_cast<uint32_t>(WE_PARTICLE_MAX_CAP));
-    m_startTime = std::clamp(sys->start_time, 0.0f, 30.0f);
+    m_startTime = std::clamp(std::isfinite(sys->start_time) ? sys->start_time : 0.0f, 0.0f, 30.0f);
     m_worldSpace = sys->world_space;
     m_perspective = sys->perspective;
     m_rendererType = sys->renderer_type;
+    m_blending = std::min(sys->preset_blending, 3u);
 
     auto &ex = *m_extra;
     ex.materialPath = QString::fromUtf8(sys->material_path);
@@ -1814,7 +2007,7 @@ void ParticleDesignerWidget::applyCleanRoomPreset(we_particle_preset_id_t preset
         m_operators.push_back(vortex);
 
         we_particle_operator_t attract{};
-        attract.type = WE_OP_VORTEX;
+        attract.type = WE_OP_CONTROL_POINT_ATTRACT;
         attract.control_point = 0;
         attract.axis[2] = 1.0f;
         attract.distance_inner = 40.0f;
@@ -1859,18 +2052,14 @@ void ParticleDesignerWidget::applyCleanRoomPreset(we_particle_preset_id_t preset
     commitSystemEdit(QStringLiteral("preset"));
     emit controlPointOverlayUpdated(m_objectId);
     emit statusMessage(tr("Applied clean-room preset: %1").arg(QLatin1String(desc.display_name)));
-
-    dispatchParticleConfigIpc(m_ipcClient, m_targetOutput, m_objectId, WE_PARTICLE_CFG_APPLY_PRESET,
-                              desc.preset_id, m_simPaused ? 1u : 3u, nullptr, 0u);
-    pushRampLutIpc(0u, 0u);
-    pushRampLutIpc(0u, 1u);
-    pushRampLutIpc(0u, 2u);
 }
 
 void ParticleDesignerWidget::triggerBurst()
 {
-    dispatchParticleConfigIpc(m_ipcClient, m_targetOutput, m_objectId,
-                              WE_PARTICLE_CFG_TRIGGER_BURST, 0u, 0u, nullptr, 0u);
+    if (m_ipcClient) {
+        (void)m_ipcClient->sendParticleConfig(m_targetOutput, m_objectId,
+                                              WE_PARTICLE_CFG_TRIGGER_BURST, 0u, 0u, nullptr, 0u);
+    }
     emit statusMessage(tr("Triggered instantaneous particle burst"));
 }
 
@@ -2069,10 +2258,17 @@ QString ParticleDesignerWidget::exportSystemJson() const
             opObj.insert(QStringLiteral("mask"), fmtVec3(op.mask));
             break;
         case WE_OP_CONTROL_POINT_ATTRACT:
+            opObj.insert(QStringLiteral("name"), QStringLiteral("controlpointattract"));
+            opObj.insert(QStringLiteral("controlpoint"), op.control_point);
+            opObj.insert(QStringLiteral("axis"), fmtVec3(op.axis));
+            opObj.insert(QStringLiteral("offset"), fmtVec3(op.offset));
+            opObj.insert(QStringLiteral("distanceinner"), static_cast<double>(op.distance_inner));
+            opObj.insert(QStringLiteral("distanceouter"), static_cast<double>(op.distance_outer));
+            opObj.insert(QStringLiteral("centerforce"), static_cast<double>(op.center_force));
+            opObj.insert(QStringLiteral("scale"), static_cast<double>(op.center_force));
+            break;
         case WE_OP_VORTEX:
-            opObj.insert(QStringLiteral("name"), isControlPointAttractOp(op)
-                                                     ? QStringLiteral("controlpointattract")
-                                                     : QStringLiteral("vortex"));
+            opObj.insert(QStringLiteral("name"), QStringLiteral("vortex"));
             opObj.insert(QStringLiteral("controlpoint"), op.control_point);
             opObj.insert(QStringLiteral("axis"), fmtVec3(op.axis));
             opObj.insert(QStringLiteral("offset"), fmtVec3(op.offset));
@@ -2101,6 +2297,8 @@ QString ParticleDesignerWidget::exportSystemJson() const
             ko.insert(QStringLiteral("t"), static_cast<double>(k.t));
             ko.insert(QStringLiteral("y"), static_cast<double>(k.y));
             ko.insert(QStringLiteral("mode"), static_cast<int>(k.mode));
+            ko.insert(QStringLiteral("in_tangent"), static_cast<double>(k.in_tangent));
+            ko.insert(QStringLiteral("out_tangent"), static_cast<double>(k.out_tangent));
             arr.append(ko);
         }
         return arr;
@@ -2206,11 +2404,16 @@ void ParticleDesignerWidget::ensureUiInitialized()
     m_worldSpaceCheck = new QCheckBox(tr("Simulate in World Space"), sysGroup);
     m_worldSpaceCheck->setAccessibleName(tr("World Space Simulation"));
 
+    auto &ex = *m_extra;
+    ex.perspectiveCheck = new QCheckBox(tr("3D Perspective Projection"), sysGroup);
+    ex.perspectiveCheck->setAccessibleName(tr("Perspective Projection"));
+
     sysForm->addRow(tr("Max Count:"), m_maxCountSpin);
     sysForm->addRow(tr("Pre-warm:"), m_startTimeSpin);
     sysForm->addRow(tr("Renderer:"), m_rendererCombo);
     sysForm->addRow(tr("Blending:"), m_blendingCombo);
     sysForm->addRow(QString(), m_worldSpaceCheck);
+    sysForm->addRow(QString(), ex.perspectiveCheck);
     root->addWidget(sysGroup);
 
     /* Curves & OKLab Color Ramp */
@@ -2223,18 +2426,37 @@ void ParticleDesignerWidget::ensureUiInitialized()
     m_alphaCurveEditor->setValueRange(0.0f, 1.0f);
     curvesV->addWidget(m_alphaCurveEditor);
 
-    curvesV->addWidget(new QLabel(tr("Size Multiplier over Lifetime [0..3]"), curvesGroup));
+    auto makeCurveHandleRow = [&](QComboBox *&modeCombo, QDoubleSpinBox *&inSpin,
+                                  QDoubleSpinBox *&outSpin) {
+        auto *row = new QHBoxLayout();
+        modeCombo = new QComboBox(curvesGroup);
+        modeCombo->addItem(tr("Auto Smooth"), static_cast<int>(WE_KNOT_HANDLE_AUTO_SMOOTH));
+        modeCombo->addItem(tr("Free Bezier"), static_cast<int>(WE_KNOT_HANDLE_FREE_BEZIER));
+        modeCombo->addItem(tr("Linear"), static_cast<int>(WE_KNOT_HANDLE_LINEAR));
+        modeCombo->addItem(tr("Step"), static_cast<int>(WE_KNOT_HANDLE_STEP));
+        inSpin = makeSpin(-20.0, 20.0, 0.1, 2, curvesGroup);
+        outSpin = makeSpin(-20.0, 20.0, 0.1, 2, curvesGroup);
+        row->addWidget(new QLabel(tr("Knot:"), curvesGroup));
+        row->addWidget(modeCombo, 1);
+        row->addWidget(new QLabel(tr("In:"), curvesGroup));
+        row->addWidget(inSpin);
+        row->addWidget(new QLabel(tr("Out:"), curvesGroup));
+        row->addWidget(outSpin);
+        curvesV->addLayout(row);
+    };
+    makeCurveHandleRow(ex.alphaHandleModeCombo, ex.alphaInTanSpin, ex.alphaOutTanSpin);
+
+    curvesV->addWidget(new QLabel(tr("Size Multiplier over Lifetime [0..4]"), curvesGroup));
     m_sizeCurveEditor = new ScalarCurveEditorWidget(curvesGroup);
-    m_sizeCurveEditor->setValueRange(0.0f, 3.0f);
+    m_sizeCurveEditor->setValueRange(0.0f, 4.0f);
     curvesV->addWidget(m_sizeCurveEditor);
+    makeCurveHandleRow(ex.sizeHandleModeCombo, ex.sizeInTanSpin, ex.sizeOutTanSpin);
 
     curvesV->addWidget(
         new QLabel(tr("OKLab Color Ramp (Double-click stop for OklchColorDialog)"), curvesGroup));
     m_colorRampEditor = new OklabColorRampWidget(curvesGroup);
     curvesV->addWidget(m_colorRampEditor);
     root->addWidget(curvesGroup);
-
-    auto &ex = *m_extra;
 
     /* Emitters */
     auto *emGroup = new QGroupBox(tr("Emitters"), container);
@@ -2266,14 +2488,25 @@ void ParticleDesignerWidget::ensureUiInitialized()
     emOrigRow->addWidget(ex.emOrigZ);
     ex.emDistMinX = makeSpin(-8192, 8192, 5, 1, ex.emitterDetailCard);
     ex.emDistMinY = makeSpin(-8192, 8192, 5, 1, ex.emitterDetailCard);
+    ex.emDistMinZ = makeSpin(-8192, 8192, 5, 1, ex.emitterDetailCard);
     auto *emDMinRow = new QHBoxLayout();
     emDMinRow->addWidget(ex.emDistMinX);
     emDMinRow->addWidget(ex.emDistMinY);
+    emDMinRow->addWidget(ex.emDistMinZ);
     ex.emDistMaxX = makeSpin(-8192, 8192, 5, 1, ex.emitterDetailCard);
     ex.emDistMaxY = makeSpin(-8192, 8192, 5, 1, ex.emitterDetailCard);
+    ex.emDistMaxZ = makeSpin(-8192, 8192, 5, 1, ex.emitterDetailCard);
     auto *emDMaxRow = new QHBoxLayout();
     emDMaxRow->addWidget(ex.emDistMaxX);
     emDMaxRow->addWidget(ex.emDistMaxY);
+    emDMaxRow->addWidget(ex.emDistMaxZ);
+    ex.emDirX = makeSpin(-100, 100, 0.1, 2, ex.emitterDetailCard);
+    ex.emDirY = makeSpin(-100, 100, 0.1, 2, ex.emitterDetailCard);
+    ex.emDirZ = makeSpin(-100, 100, 0.1, 2, ex.emitterDetailCard);
+    auto *emDirRow = new QHBoxLayout();
+    emDirRow->addWidget(ex.emDirX);
+    emDirRow->addWidget(ex.emDirY);
+    emDirRow->addWidget(ex.emDirZ);
     ex.emRateSpin = makeSpin(0.0, 10000.0, 5.0, 1, ex.emitterDetailCard);
     ex.emBurstSpin = makeIntSpin(0, static_cast<int>(WE_PARTICLE_MAX_CAP), ex.emitterDetailCard);
     ex.emSpeedMinSpin = makeSpin(-4000, 4000, 5, 1, ex.emitterDetailCard);
@@ -2282,8 +2515,9 @@ void ParticleDesignerWidget::ensureUiInitialized()
         makeIntSpin(-1, static_cast<int>(WE_PARTICLE_MAX_CONTROL_PTS) - 1, ex.emitterDetailCard);
     emForm->addRow(tr("Shape:"), ex.emTypeCombo);
     emForm->addRow(tr("Origin:"), emOrigRow);
-    emForm->addRow(tr("Dist Min XY:"), emDMinRow);
-    emForm->addRow(tr("Dist Max XY:"), emDMaxRow);
+    emForm->addRow(tr("Dist Min XYZ:"), emDMinRow);
+    emForm->addRow(tr("Dist Max XYZ:"), emDMaxRow);
+    emForm->addRow(tr("Directions:"), emDirRow);
     emForm->addRow(tr("Rate (/s):"), ex.emRateSpin);
     emForm->addRow(tr("Burst:"), ex.emBurstSpin);
     emForm->addRow(tr("Speed Min:"), ex.emSpeedMinSpin);
@@ -2372,7 +2606,8 @@ void ParticleDesignerWidget::ensureUiInitialized()
     ex.opTypeCombo->addItem(tr("OscillatePosition"), static_cast<int>(WE_OP_OSCILLATE_POSITION));
     ex.opTypeCombo->addItem(tr("Vortex"), static_cast<int>(WE_OP_VORTEX));
     ex.opTypeCombo->addItem(tr("Turbulence"), static_cast<int>(WE_OP_TURBULENCE));
-    ex.opTypeCombo->addItem(tr("ControlPointAttract"), 100);
+    ex.opTypeCombo->addItem(tr("ControlPointAttract"),
+                            static_cast<int>(WE_OP_CONTROL_POINT_ATTRACT));
 
     ex.opVec0Label = new QLabel(tr("Vec A:"), ex.opDetailCard);
     ex.opVec0X = makeSpin(-5000, 5000, 1.0, 2, ex.opDetailCard);
@@ -2425,11 +2660,13 @@ void ParticleDesignerWidget::ensureUiInitialized()
     ex.cpWorldSpaceCheck = new QCheckBox(tr("World Space"), cpGroup);
     ex.cpOffsetX = makeSpin(-8192, 8192, 5, 1, cpGroup);
     ex.cpOffsetY = makeSpin(-8192, 8192, 5, 1, cpGroup);
+    ex.cpOffsetZ = makeSpin(-8192, 8192, 5, 1, cpGroup);
     auto *cpOffRow = new QHBoxLayout();
     cpOffRow->addWidget(ex.cpOffsetX);
     cpOffRow->addWidget(ex.cpOffsetY);
+    cpOffRow->addWidget(ex.cpOffsetZ);
     cpForm->addRow(tr("Slot:"), ex.cpIndexCombo);
-    cpForm->addRow(tr("Offset XY:"), cpOffRow);
+    cpForm->addRow(tr("Offset XYZ:"), cpOffRow);
     cpForm->addRow(QString(), ex.cpLockPointerCheck);
     cpForm->addRow(QString(), ex.cpWorldSpaceCheck);
     root->addWidget(cpGroup);
@@ -2458,8 +2695,11 @@ void ParticleDesignerWidget::ensureUiInitialized()
     connect(m_pauseBtn, &QPushButton::toggled, this, [this](bool paused) {
         m_simPaused = paused;
         m_pauseBtn->setText(paused ? tr("Resume") : tr("Pause"));
-        dispatchParticleConfigIpc(m_ipcClient, m_targetOutput, m_objectId,
-                                  WE_PARTICLE_CFG_PAUSE_TOGGLE, 0u, paused ? 1u : 0u, nullptr, 0u);
+        if (m_ipcClient) {
+            (void)m_ipcClient->sendParticleConfig(m_targetOutput, m_objectId,
+                                                  WE_PARTICLE_CFG_PAUSE_TOGGLE, 0u,
+                                                  paused ? 1u : 0u, nullptr, 0u);
+        }
     });
 
     auto onSystemScalarChanged = [this]() {
@@ -2471,6 +2711,9 @@ void ParticleDesignerWidget::ensureUiInitialized()
         m_rendererType = static_cast<we_renderer_type_t>(m_rendererCombo->currentData().toInt());
         m_blending = m_blendingCombo->currentData().toUInt();
         m_worldSpace = m_worldSpaceCheck->isChecked();
+        if (m_extra->perspectiveCheck) {
+            m_perspective = m_extra->perspectiveCheck->isChecked();
+        }
         commitSystemEdit(QStringLiteral("system"));
     };
     connect(m_maxCountSpin, QOverload<int>::of(&QSpinBox::valueChanged), this,
@@ -2482,24 +2725,103 @@ void ParticleDesignerWidget::ensureUiInitialized()
     connect(m_blendingCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             onSystemScalarChanged);
     connect(m_worldSpaceCheck, &QCheckBox::toggled, this, onSystemScalarChanged);
+    connect(ex.perspectiveCheck, &QCheckBox::toggled, this, onSystemScalarChanged);
 
-    connect(m_alphaCurveEditor, &ScalarCurveEditorWidget::curveEdited, this,
+    auto syncCurveHandleControls = [this](ScalarCurveEditorWidget *editor, QComboBox *modeCombo,
+                                          QDoubleSpinBox *inSpin, QDoubleSpinBox *outSpin) {
+        if (!editor || !modeCombo || !inSpin || !outSpin) {
+            return;
+        }
+        const int idx = editor->selectedKnotIndex();
+        const auto &knots = editor->knots();
+        const bool valid = (idx >= 0 && idx < static_cast<int>(knots.size()));
+        modeCombo->setEnabled(valid);
+        inSpin->setEnabled(valid);
+        outSpin->setEnabled(valid);
+        if (!valid) {
+            return;
+        }
+        const auto &k = knots[static_cast<size_t>(idx)];
+        const QSignalBlocker bM(modeCombo);
+        const QSignalBlocker bI(inSpin);
+        const QSignalBlocker bO(outSpin);
+        if (const int fi = modeCombo->findData(static_cast<int>(k.mode)); fi >= 0) {
+            modeCombo->setCurrentIndex(fi);
+        }
+        inSpin->setValue(k.in_tangent);
+        outSpin->setValue(k.out_tangent);
+    };
+
+    auto wireCurveHandleControls = [this, syncCurveHandleControls](
+                                       ScalarCurveEditorWidget *editor, QComboBox *modeCombo,
+                                       QDoubleSpinBox *inSpin, QDoubleSpinBox *outSpin) {
+        connect(editor, &ScalarCurveEditorWidget::selectedKnotChanged, this,
+                [editor, modeCombo, inSpin, outSpin, syncCurveHandleControls](int) {
+                    syncCurveHandleControls(editor, modeCombo, inSpin, outSpin);
+                });
+        auto onHandleUiEdited = [this, editor, modeCombo, inSpin, outSpin]() {
+            if (m_updatingUi) {
+                return;
+            }
+            const auto mode = static_cast<we_knot_handle_mode_t>(modeCombo->currentData().toInt());
+            editor->setSelectedKnotHandle(mode, static_cast<float>(inSpin->value()),
+                                          static_cast<float>(outSpin->value()));
+        };
+        connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                onHandleUiEdited);
+        connect(inSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+                onHandleUiEdited);
+        connect(outSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+                onHandleUiEdited);
+    };
+    wireCurveHandleControls(m_alphaCurveEditor, ex.alphaHandleModeCombo, ex.alphaInTanSpin,
+                            ex.alphaOutTanSpin);
+    wireCurveHandleControls(m_sizeCurveEditor, ex.sizeHandleModeCombo, ex.sizeInTanSpin,
+                            ex.sizeOutTanSpin);
+
+    connect(m_alphaCurveEditor, &ScalarCurveEditorWidget::curvePreviewEdited, this,
             [this](const std::vector<we_particle_curve_knot_t> &knots) {
                 if (m_updatingUi) {
                     return;
                 }
                 m_extra->alphaKnots = knots;
-                pushRampLutIpc(0u, 0u);
+                pushMatchingRampLutsForChannel(m_objectId, 0u);
+            });
+    connect(m_alphaCurveEditor, &ScalarCurveEditorWidget::curveEdited, this,
+            [this, syncCurveHandleControls](const std::vector<we_particle_curve_knot_t> &knots) {
+                if (m_updatingUi) {
+                    return;
+                }
+                m_extra->alphaKnots = knots;
+                syncCurveHandleControls(m_alphaCurveEditor, m_extra->alphaHandleModeCombo,
+                                        m_extra->alphaInTanSpin, m_extra->alphaOutTanSpin);
                 commitSystemEdit(QStringLiteral("alpha_curve"));
             });
-    connect(m_sizeCurveEditor, &ScalarCurveEditorWidget::curveEdited, this,
+    connect(m_sizeCurveEditor, &ScalarCurveEditorWidget::curvePreviewEdited, this,
             [this](const std::vector<we_particle_curve_knot_t> &knots) {
                 if (m_updatingUi) {
                     return;
                 }
                 m_extra->sizeKnots = knots;
-                pushRampLutIpc(0u, 1u);
+                pushMatchingRampLutsForChannel(m_objectId, 1u);
+            });
+    connect(m_sizeCurveEditor, &ScalarCurveEditorWidget::curveEdited, this,
+            [this, syncCurveHandleControls](const std::vector<we_particle_curve_knot_t> &knots) {
+                if (m_updatingUi) {
+                    return;
+                }
+                m_extra->sizeKnots = knots;
+                syncCurveHandleControls(m_sizeCurveEditor, m_extra->sizeHandleModeCombo,
+                                        m_extra->sizeInTanSpin, m_extra->sizeOutTanSpin);
                 commitSystemEdit(QStringLiteral("size_curve"));
+            });
+    connect(m_colorRampEditor, &OklabColorRampWidget::rampPreviewEdited, this,
+            [this](const std::vector<we_particle_color_stop_t> &stops) {
+                if (m_updatingUi) {
+                    return;
+                }
+                m_extra->colorStops = stops;
+                pushMatchingRampLutsForChannel(m_objectId, 2u);
             });
     connect(m_colorRampEditor, &OklabColorRampWidget::rampEdited, this,
             [this](const std::vector<we_particle_color_stop_t> &stops) {
@@ -2507,28 +2829,44 @@ void ParticleDesignerWidget::ensureUiInitialized()
                     return;
                 }
                 m_extra->colorStops = stops;
-                pushRampLutIpc(0u, 2u);
                 commitSystemEdit(QStringLiteral("color_ramp"));
             });
-    connect(
-        m_colorRampEditor, &OklabColorRampWidget::stopColorPickerRequested, this,
-        [this](int stopIndex, const QColor &initialColor) {
-            const QColor chosen =
-                OklchColorDialog::getColor(initialColor, this, tr("Edit Ramp Stop Color"));
-            if (!chosen.isValid()) {
-                return;
-            }
-            auto stops = m_colorRampEditor->stops();
-            if (stopIndex >= 0 && stopIndex < static_cast<int>(stops.size())) {
-                stops[static_cast<size_t>(stopIndex)].rgb[0] = static_cast<float>(chosen.redF());
-                stops[static_cast<size_t>(stopIndex)].rgb[1] = static_cast<float>(chosen.greenF());
-                stops[static_cast<size_t>(stopIndex)].rgb[2] = static_cast<float>(chosen.blueF());
-                m_colorRampEditor->setStops(stops);
-                m_extra->colorStops = m_colorRampEditor->stops();
-                pushRampLutIpc(0u, 2u);
-                commitSystemEdit(QStringLiteral("color_ramp"));
-            }
-        });
+    connect(m_colorRampEditor, &OklabColorRampWidget::stopColorPickerRequested, this,
+            [this](int stopIndex, const QColor &initialColor) {
+                if (m_extra->activeColorDialog) {
+                    m_extra->activeColorDialog->close();
+                }
+                auto *dlg = new OklchColorDialog(initialColor, this);
+                dlg->setWindowTitle(tr("Edit Ramp Stop Color"));
+                dlg->setAttribute(Qt::WA_DeleteOnClose, true);
+                dlg->setModal(false);
+                m_extra->activeColorDialog = dlg;
+
+                QPointer<ParticleDesignerWidget> self(this);
+                QPointer<OklchColorDialog> dlgPtr(dlg);
+                connect(dlg, &QDialog::accepted, this, [self, dlgPtr, stopIndex]() {
+                    if (!self || !dlgPtr) {
+                        return;
+                    }
+                    const QColor chosen = dlgPtr->currentColor();
+                    if (!chosen.isValid()) {
+                        return;
+                    }
+                    auto stops = self->m_colorRampEditor->stops();
+                    if (stopIndex >= 0 && stopIndex < static_cast<int>(stops.size())) {
+                        stops[static_cast<size_t>(stopIndex)].rgb[0] =
+                            static_cast<float>(chosen.redF());
+                        stops[static_cast<size_t>(stopIndex)].rgb[1] =
+                            static_cast<float>(chosen.greenF());
+                        stops[static_cast<size_t>(stopIndex)].rgb[2] =
+                            static_cast<float>(chosen.blueF());
+                        self->m_colorRampEditor->setStops(stops);
+                        self->m_extra->colorStops = self->m_colorRampEditor->stops();
+                        self->commitSystemEdit(QStringLiteral("color_ramp"));
+                    }
+                });
+                dlg->open();
+            });
 
     /* Emitter selection & editing */
     connect(m_emitterList, &QListWidget::currentRowChanged, this, [this](int) {
@@ -2582,13 +2920,28 @@ void ParticleDesignerWidget::ensureUiInitialized()
         em.origin[2] = static_cast<float>(state.emOrigZ->value());
         em.distance_min[0] = static_cast<float>(state.emDistMinX->value());
         em.distance_min[1] = static_cast<float>(state.emDistMinY->value());
+        em.distance_min[2] = static_cast<float>(state.emDistMinZ->value());
         em.distance_max[0] = static_cast<float>(state.emDistMaxX->value());
         em.distance_max[1] = static_cast<float>(state.emDistMaxY->value());
-        em.rate = static_cast<float>(state.emRateSpin->value());
-        em.instantaneous = static_cast<uint32_t>(state.emBurstSpin->value());
+        em.distance_max[2] = static_cast<float>(state.emDistMaxZ->value());
+        for (int c = 0; c < 3; ++c) {
+            if (em.distance_min[c] > em.distance_max[c]) {
+                std::swap(em.distance_min[c], em.distance_max[c]);
+            }
+        }
+        em.directions[0] = static_cast<float>(state.emDirX->value());
+        em.directions[1] = static_cast<float>(state.emDirY->value());
+        em.directions[2] = static_cast<float>(state.emDirZ->value());
+        em.rate = std::max(0.0f, static_cast<float>(state.emRateSpin->value()));
+        em.instantaneous = static_cast<uint32_t>(
+            std::clamp(state.emBurstSpin->value(), 0, static_cast<int>(WE_PARTICLE_MAX_CAP)));
         em.speed_min = static_cast<float>(state.emSpeedMinSpin->value());
         em.speed_max = static_cast<float>(state.emSpeedMaxSpin->value());
-        em.control_point = state.emCpSpin->value();
+        if (em.speed_min > em.speed_max) {
+            std::swap(em.speed_min, em.speed_max);
+        }
+        em.control_point = std::clamp(state.emCpSpin->value(), -1,
+                                      static_cast<int>(WE_PARTICLE_MAX_CONTROL_PTS) - 1);
         m_emitterList->item(row)->setText(emitterSummary(static_cast<size_t>(row), em));
         commitSystemEdit(QStringLiteral("emitter"));
     };
@@ -2604,10 +2957,17 @@ void ParticleDesignerWidget::ensureUiInitialized()
             onEmitterEdited);
     connect(ex.emDistMinY, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             onEmitterEdited);
+    connect(ex.emDistMinZ, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            onEmitterEdited);
     connect(ex.emDistMaxX, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             onEmitterEdited);
     connect(ex.emDistMaxY, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             onEmitterEdited);
+    connect(ex.emDistMaxZ, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            onEmitterEdited);
+    connect(ex.emDirX, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, onEmitterEdited);
+    connect(ex.emDirY, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, onEmitterEdited);
+    connect(ex.emDirZ, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, onEmitterEdited);
     connect(ex.emRateSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             onEmitterEdited);
     connect(ex.emBurstSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, onEmitterEdited);
@@ -2662,6 +3022,11 @@ void ParticleDesignerWidget::ensureUiInitialized()
         iz.max_val[0] = static_cast<float>(state.initMax0->value());
         iz.max_val[1] = static_cast<float>(state.initMax1->value());
         iz.max_val[2] = static_cast<float>(state.initMax2->value());
+        for (int c = 0; c < 3; ++c) {
+            if (iz.min_val[c] > iz.max_val[c]) {
+                std::swap(iz.min_val[c], iz.max_val[c]);
+            }
+        }
         iz.exponent = static_cast<float>(state.initExpSpin->value());
         iz.scale = static_cast<float>(state.initScaleSpin->value());
         m_initializerList->item(row)->setText(initializerSummary(static_cast<size_t>(row), iz));
@@ -2716,10 +3081,9 @@ void ParticleDesignerWidget::ensureUiInitialized()
         }
         auto &op = m_operators[static_cast<size_t>(row)];
         auto &state = *m_extra;
-        const int rawType = state.opTypeCombo->currentData().toInt();
-        const bool isCpAttract = (rawType == 100);
-        op.type = isCpAttract ? WE_OP_VORTEX : static_cast<we_operator_type_t>(rawType);
-        op.control_point = state.opCpSpin->value();
+        op.type = static_cast<we_operator_type_t>(state.opTypeCombo->currentData().toInt());
+        op.control_point = std::clamp(state.opCpSpin->value(), 0,
+                                      static_cast<int>(WE_PARTICLE_MAX_CONTROL_PTS) - 1);
 
         const float v0x = static_cast<float>(state.opVec0X->value());
         const float v0y = static_cast<float>(state.opVec0Y->value());
@@ -2738,27 +3102,27 @@ void ParticleDesignerWidget::ensureUiInitialized()
             op.gravity[0] = v0x;
             op.gravity[1] = v0y;
             op.gravity[2] = v0z;
-            op.drag = s0;
+            op.drag = std::max(0.0f, s0);
             break;
         case WE_OP_ALPHA_FADE:
-            op.fade_in_time = s0;
-            op.fade_out_time = s1;
+            op.fade_in_time = std::max(0.0f, s0);
+            op.fade_out_time = std::max(op.fade_in_time, std::max(0.0f, s1));
             break;
         case WE_OP_SIZE_CHANGE:
-            op.start_time = s0;
-            op.end_time = s1;
-            op.start_val[0] = s2;
-            op.end_val[0] = s3;
+            op.start_time = std::max(0.0f, s0);
+            op.end_time = std::max(op.start_time, s1);
+            op.start_val[0] = std::max(0.0f, s2);
+            op.end_val[0] = std::max(0.0f, s3);
             break;
         case WE_OP_COLOR_CHANGE:
-            op.start_val[0] = v0x;
-            op.start_val[1] = v0y;
-            op.start_val[2] = v0z;
-            op.end_val[0] = v1x;
-            op.end_val[1] = v1y;
-            op.end_val[2] = v1z;
-            op.start_time = s0;
-            op.end_time = s1;
+            op.start_val[0] = std::clamp(v0x, 0.0f, 1.0f);
+            op.start_val[1] = std::clamp(v0y, 0.0f, 1.0f);
+            op.start_val[2] = std::clamp(v0z, 0.0f, 1.0f);
+            op.end_val[0] = std::clamp(v1x, 0.0f, 1.0f);
+            op.end_val[1] = std::clamp(v1y, 0.0f, 1.0f);
+            op.end_val[2] = std::clamp(v1z, 0.0f, 1.0f);
+            op.start_time = std::max(0.0f, s0);
+            op.end_time = std::max(op.start_time, s1);
             break;
         case WE_OP_OSCILLATE_ALPHA:
         case WE_OP_OSCILLATE_SIZE:
@@ -2766,12 +3130,24 @@ void ParticleDesignerWidget::ensureUiInitialized()
             op.mask[0] = v0x;
             op.mask[1] = v0y;
             op.mask[2] = v0z;
-            op.freq_min = s0;
-            op.freq_max = s1;
-            op.scale_min = s2;
-            op.scale_max = s3;
+            op.freq_min = std::max(0.0f, std::min(s0, s1));
+            op.freq_max = std::max(0.0f, std::max(s0, s1));
+            op.scale_min = std::min(s2, s3);
+            op.scale_max = std::max(s2, s3);
             break;
         case WE_OP_CONTROL_POINT_ATTRACT:
+            op.axis[0] = v0x;
+            op.axis[1] = v0y;
+            op.axis[2] = v0z;
+            op.offset[0] = v1x;
+            op.offset[1] = v1y;
+            op.offset[2] = v1z;
+            op.distance_inner = std::max(0.0f, std::min(s0, s1));
+            op.distance_outer = std::max(0.0f, std::max(s0, s1));
+            op.center_force = s2;
+            op.speed_inner = 0.0f;
+            op.speed_outer = 0.0f;
+            break;
         case WE_OP_VORTEX:
             op.axis[0] = v0x;
             op.axis[1] = v0y;
@@ -2779,22 +3155,17 @@ void ParticleDesignerWidget::ensureUiInitialized()
             op.offset[0] = v1x;
             op.offset[1] = v1y;
             op.offset[2] = v1z;
-            op.distance_inner = s0;
-            op.distance_outer = s1;
+            op.distance_inner = std::max(0.0f, std::min(s0, s1));
+            op.distance_outer = std::max(0.0f, std::max(s0, s1));
             op.center_force = s2;
-            if (isCpAttract) {
-                op.speed_inner = 0.0f;
-                op.speed_outer = 0.0f;
-            } else {
-                op.speed_inner = s3;
-                op.speed_outer = s3 * 0.4f;
-            }
+            op.speed_inner = s3;
+            op.speed_outer = s3 * 0.4f;
             break;
         case WE_OP_TURBULENCE:
             op.mask[0] = v0x;
             op.mask[1] = v0y;
             op.mask[2] = v0z;
-            op.turb_scale = s0;
+            op.turb_scale = std::max(1e-5f, s0);
             op.turb_speed = s1;
             op.turb_timescale = s2;
             break;
@@ -2811,11 +3182,9 @@ void ParticleDesignerWidget::ensureUiInitialized()
             return;
         }
         auto &op = m_operators[static_cast<size_t>(row)];
-        const int rawType = m_extra->opTypeCombo->currentData().toInt();
-        const bool isCpAttract = (rawType == 100);
         const int32_t savedCp = op.control_point;
         op = we_particle_operator_t{};
-        op.type = isCpAttract ? WE_OP_VORTEX : static_cast<we_operator_type_t>(rawType);
+        op.type = static_cast<we_operator_type_t>(m_extra->opTypeCombo->currentData().toInt());
         op.control_point = savedCp;
         switch (op.type) {
         case WE_OP_MOVEMENT:
@@ -2847,12 +3216,16 @@ void ParticleDesignerWidget::ensureUiInitialized()
             op.mask[1] = 1.0f;
             break;
         case WE_OP_CONTROL_POINT_ATTRACT:
+            op.axis[2] = 1.0f;
+            op.distance_outer = 300.0f;
+            op.center_force = 200.0f;
+            break;
         case WE_OP_VORTEX:
             op.axis[2] = 1.0f;
             op.distance_outer = 300.0f;
             op.center_force = 200.0f;
-            op.speed_inner = isCpAttract ? 0.0f : 120.0f;
-            op.speed_outer = isCpAttract ? 0.0f : 48.0f;
+            op.speed_inner = 120.0f;
+            op.speed_outer = 48.0f;
             break;
         case WE_OP_TURBULENCE:
             op.turb_scale = 0.01f;
@@ -2901,6 +3274,7 @@ void ParticleDesignerWidget::ensureUiInitialized()
         cp.world_space = state.cpWorldSpaceCheck->isChecked();
         cp.offset[0] = static_cast<float>(state.cpOffsetX->value());
         cp.offset[1] = static_cast<float>(state.cpOffsetY->value());
+        cp.offset[2] = static_cast<float>(state.cpOffsetZ->value());
         emit controlPointOverlayUpdated(m_objectId);
         commitSystemEdit(QStringLiteral("control_point"));
     };
@@ -2908,6 +3282,7 @@ void ParticleDesignerWidget::ensureUiInitialized()
     connect(ex.cpWorldSpaceCheck, &QCheckBox::toggled, this, onCpEdited);
     connect(ex.cpOffsetX, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, onCpEdited);
     connect(ex.cpOffsetY, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, onCpEdited);
+    connect(ex.cpOffsetZ, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, onCpEdited);
 
     syncUiFromModel();
 }
@@ -2933,10 +3308,41 @@ void ParticleDesignerWidget::syncUiFromModel()
         m_blendingCombo->setCurrentIndex(bIdx);
     }
     m_worldSpaceCheck->setChecked(m_worldSpace);
+    if (ex.perspectiveCheck) {
+        ex.perspectiveCheck->setChecked(m_perspective);
+    }
 
     m_alphaCurveEditor->setKnots(ex.alphaKnots);
     m_sizeCurveEditor->setKnots(ex.sizeKnots);
     m_colorRampEditor->setStops(ex.colorStops);
+    auto syncKnotHandleUi = [](ScalarCurveEditorWidget *editor, QComboBox *modeCombo,
+                               QDoubleSpinBox *inSpin, QDoubleSpinBox *outSpin) {
+        if (!editor || !modeCombo || !inSpin || !outSpin) {
+            return;
+        }
+        const int idx = editor->selectedKnotIndex();
+        const auto &knots = editor->knots();
+        const bool valid = (idx >= 0 && idx < static_cast<int>(knots.size()));
+        modeCombo->setEnabled(valid);
+        inSpin->setEnabled(valid);
+        outSpin->setEnabled(valid);
+        if (!valid) {
+            return;
+        }
+        const auto &k = knots[static_cast<size_t>(idx)];
+        const QSignalBlocker bM(modeCombo);
+        const QSignalBlocker bI(inSpin);
+        const QSignalBlocker bO(outSpin);
+        if (const int fi = modeCombo->findData(static_cast<int>(k.mode)); fi >= 0) {
+            modeCombo->setCurrentIndex(fi);
+        }
+        inSpin->setValue(k.in_tangent);
+        outSpin->setValue(k.out_tangent);
+    };
+    syncKnotHandleUi(m_alphaCurveEditor, ex.alphaHandleModeCombo, ex.alphaInTanSpin,
+                     ex.alphaOutTanSpin);
+    syncKnotHandleUi(m_sizeCurveEditor, ex.sizeHandleModeCombo, ex.sizeInTanSpin,
+                     ex.sizeOutTanSpin);
 
     const int prevEmRow = m_emitterList->currentRow();
     m_emitterList->clear();
@@ -2958,8 +3364,13 @@ void ParticleDesignerWidget::syncUiFromModel()
         ex.emOrigZ->setValue(em.origin[2]);
         ex.emDistMinX->setValue(em.distance_min[0]);
         ex.emDistMinY->setValue(em.distance_min[1]);
+        ex.emDistMinZ->setValue(em.distance_min[2]);
         ex.emDistMaxX->setValue(em.distance_max[0]);
         ex.emDistMaxY->setValue(em.distance_max[1]);
+        ex.emDistMaxZ->setValue(em.distance_max[2]);
+        ex.emDirX->setValue(em.directions[0]);
+        ex.emDirY->setValue(em.directions[1]);
+        ex.emDirZ->setValue(em.directions[2]);
         ex.emRateSpin->setValue(em.rate);
         ex.emBurstSpin->setValue(static_cast<int>(em.instantaneous));
         ex.emSpeedMinSpin->setValue(em.speed_min);
@@ -3009,8 +3420,7 @@ void ParticleDesignerWidget::syncUiFromModel()
         m_operatorList->setCurrentRow(opRow);
         const auto &op = m_operators[static_cast<size_t>(opRow)];
         ex.opDetailCard->setEnabled(true);
-        const int typeData = isControlPointAttractOp(op) ? 100 : static_cast<int>(op.type);
-        if (const int ti = ex.opTypeCombo->findData(typeData); ti >= 0) {
+        if (const int ti = ex.opTypeCombo->findData(static_cast<int>(op.type)); ti >= 0) {
             ex.opTypeCombo->setCurrentIndex(ti);
         }
         ex.opCpSpin->setValue(op.control_point);
@@ -3028,7 +3438,7 @@ void ParticleDesignerWidget::syncUiFromModel()
             ex.opScalar3->setEnabled(useS3);
             ex.opCpSpin->setEnabled(useCp);
         };
-        if (isControlPointAttractOp(op)) {
+        if (op.type == WE_OP_CONTROL_POINT_ATTRACT) {
             ex.opVec0Label->setText(tr("Axis:"));
             ex.opVec1Label->setText(tr("Offset:"));
             ex.opFieldLabel0->setText(tr("Inner R:"));
@@ -3156,11 +3566,13 @@ void ParticleDesignerWidget::syncUiFromModel()
         ex.cpWorldSpaceCheck->setChecked(cp.world_space);
         ex.cpOffsetX->setValue(cp.offset[0]);
         ex.cpOffsetY->setValue(cp.offset[1]);
+        ex.cpOffsetZ->setValue(cp.offset[2]);
     } else {
         ex.cpLockPointerCheck->setChecked(false);
         ex.cpWorldSpaceCheck->setChecked(false);
         ex.cpOffsetX->setValue(0.0);
         ex.cpOffsetY->setValue(0.0);
+        ex.cpOffsetZ->setValue(0.0);
     }
 
     if (ex.telemetryDirty) {
@@ -3180,10 +3592,25 @@ bool ParticleDesignerWidget::importSystemJson(const QString &jsonState)
     m_maxCount = static_cast<uint32_t>(
         std::clamp(root.value(QStringLiteral("maxcount")).toInt(static_cast<int>(m_maxCount)), 1,
                    static_cast<int>(WE_PARTICLE_MAX_CAP)));
-    m_startTime = static_cast<float>(root.value(QStringLiteral("starttime")).toDouble(m_startTime));
+    m_startTime = std::clamp(
+        sanitizeFloat(root.value(QStringLiteral("starttime")).toDouble(m_startTime), m_startTime),
+        0.0f, 30.0f);
     ex.materialPath = root.value(QStringLiteral("material")).toString(ex.materialPath);
-    m_blending = static_cast<uint32_t>(
-        root.value(QStringLiteral("blending")).toInt(static_cast<int>(m_blending)));
+    const QJsonValue blVal = root.value(QStringLiteral("blending"));
+    if (blVal.isString()) {
+        const QString bstr = blVal.toString().trimmed().toLower();
+        if (bstr == QLatin1String("additive") || bstr == QLatin1String("add")) {
+            m_blending = 1u;
+        } else if (bstr == QLatin1String("translucent") || bstr == QLatin1String("multiply")) {
+            m_blending = 2u;
+        } else if (bstr == QLatin1String("screen")) {
+            m_blending = 3u;
+        } else {
+            m_blending = 0u;
+        }
+    } else if (blVal.isDouble()) {
+        m_blending = static_cast<uint32_t>(std::clamp(blVal.toInt(0), 0, 3));
+    }
     const int flags = root.value(QStringLiteral("flags")).toInt(0);
     m_worldSpace = (flags & 1) != 0;
     m_perspective = (flags & 4) != 0;
@@ -3199,19 +3626,26 @@ bool ParticleDesignerWidget::importSystemJson(const QString &jsonState)
         } else {
             m_rendererType = WE_RENDERER_SPRITE;
         }
-        ex.trailLength = static_cast<float>(ro.value(QStringLiteral("length")).toDouble(0.05));
-        ex.trailMinLength = static_cast<float>(ro.value(QStringLiteral("minlength")).toDouble(1.0));
+        ex.trailLength =
+            std::max(0.0f, sanitizeFloat(ro.value(QStringLiteral("length")).toDouble(0.05), 0.05f));
+        ex.trailMinLength = std::max(
+            0.0f, sanitizeFloat(ro.value(QStringLiteral("minlength")).toDouble(1.0), 1.0f));
         ex.trailMaxLength =
-            static_cast<float>(ro.value(QStringLiteral("maxlength")).toDouble(100.0));
-        ex.subdivision =
-            static_cast<uint32_t>(std::max(1, ro.value(QStringLiteral("subdivision")).toInt(1)));
+            std::max(ex.trailMinLength,
+                     sanitizeFloat(ro.value(QStringLiteral("maxlength")).toDouble(100.0), 100.0f));
+        ex.subdivision = static_cast<uint32_t>(
+            std::clamp(ro.value(QStringLiteral("subdivision")).toInt(1), 1, 64));
     }
 
     m_controlPoints.clear();
     for (const QJsonValue &v : root.value(QStringLiteral("controlpoint")).toArray()) {
+        if (m_controlPoints.size() >= WE_PARTICLE_MAX_CONTROL_PTS) {
+            break;
+        }
         const QJsonObject o = v.toObject();
         we_particle_cp_t cp{};
-        cp.id = o.value(QStringLiteral("id")).toInt(0);
+        cp.id = std::clamp(o.value(QStringLiteral("id")).toInt(0), 0,
+                           static_cast<int>(WE_PARTICLE_MAX_CONTROL_PTS) - 1);
         parseVec3(o.value(QStringLiteral("offset")).toString(), cp.offset);
         const int cpFlags = o.value(QStringLiteral("flags")).toInt(0);
         cp.lock_to_pointer = (cpFlags & 1) != 0;
@@ -3221,6 +3655,9 @@ bool ParticleDesignerWidget::importSystemJson(const QString &jsonState)
 
     m_emitters.clear();
     for (const QJsonValue &v : root.value(QStringLiteral("emitter")).toArray()) {
+        if (m_emitters.size() >= WE_PARTICLE_MAX_EMITTERS) {
+            break;
+        }
         const QJsonObject o = v.toObject();
         we_particle_emitter_t em{};
         const QString ename = o.value(QStringLiteral("name")).toString();
@@ -3233,35 +3670,55 @@ bool ParticleDesignerWidget::importSystemJson(const QString &jsonState)
         }
         parseVec3(o.value(QStringLiteral("distancemin")).toString(), em.distance_min);
         parseVec3(o.value(QStringLiteral("distancemax")).toString(), em.distance_max);
+        for (int c = 0; c < 3; ++c) {
+            if (em.distance_min[c] > em.distance_max[c]) {
+                std::swap(em.distance_min[c], em.distance_max[c]);
+            }
+        }
         parseVec3(o.value(QStringLiteral("directions")).toString(), em.directions);
         parseVec3(o.value(QStringLiteral("origin")).toString(), em.origin);
-        em.speed_min = static_cast<float>(o.value(QStringLiteral("speedmin")).toDouble(0.0));
-        em.speed_max = static_cast<float>(o.value(QStringLiteral("speedmax")).toDouble(0.0));
-        em.rate = static_cast<float>(o.value(QStringLiteral("rate")).toDouble(0.0));
+        em.speed_min = sanitizeFloat(o.value(QStringLiteral("speedmin")).toDouble(0.0));
+        em.speed_max = sanitizeFloat(o.value(QStringLiteral("speedmax")).toDouble(0.0));
+        if (em.speed_min > em.speed_max) {
+            std::swap(em.speed_min, em.speed_max);
+        }
+        em.rate = std::max(0.0f, sanitizeFloat(o.value(QStringLiteral("rate")).toDouble(0.0)));
         em.instantaneous =
-            static_cast<uint32_t>(std::max(0, o.value(QStringLiteral("instantaneous")).toInt(0)));
-        em.control_point = o.value(QStringLiteral("controlpoint")).toInt(0);
+            static_cast<uint32_t>(std::clamp(o.value(QStringLiteral("instantaneous")).toInt(0), 0,
+                                             static_cast<int>(WE_PARTICLE_MAX_CAP)));
+        em.control_point = std::clamp(o.value(QStringLiteral("controlpoint")).toInt(0), -1,
+                                      static_cast<int>(WE_PARTICLE_MAX_CONTROL_PTS) - 1);
         m_emitters.push_back(em);
     }
 
     m_initializers.clear();
     for (const QJsonValue &v : root.value(QStringLiteral("initializer")).toArray()) {
+        if (m_initializers.size() >= WE_PARTICLE_MAX_INITIALIZERS) {
+            break;
+        }
         const QJsonObject o = v.toObject();
         we_particle_initializer_t iz{};
-        iz.exponent = static_cast<float>(o.value(QStringLiteral("exponent")).toDouble(1.0));
+        iz.exponent =
+            std::max(0.1f, sanitizeFloat(o.value(QStringLiteral("exponent")).toDouble(1.0), 1.0f));
         const QString iname = o.value(QStringLiteral("name")).toString();
         if (iname == QLatin1String("lifetimerandom")) {
             iz.type = WE_INIT_LIFETIME_RANDOM;
-            iz.min_val[0] = static_cast<float>(o.value(QStringLiteral("min")).toDouble(1.0));
-            iz.max_val[0] = static_cast<float>(o.value(QStringLiteral("max")).toDouble(1.0));
+            iz.min_val[0] =
+                std::max(0.0f, sanitizeFloat(o.value(QStringLiteral("min")).toDouble(1.0), 1.0f));
+            iz.max_val[0] =
+                std::max(0.0f, sanitizeFloat(o.value(QStringLiteral("max")).toDouble(1.0), 1.0f));
         } else if (iname == QLatin1String("sizerandom")) {
             iz.type = WE_INIT_SIZE_RANDOM;
-            iz.min_val[0] = static_cast<float>(o.value(QStringLiteral("min")).toDouble(1.0));
-            iz.max_val[0] = static_cast<float>(o.value(QStringLiteral("max")).toDouble(1.0));
+            iz.min_val[0] =
+                std::max(0.0f, sanitizeFloat(o.value(QStringLiteral("min")).toDouble(1.0), 1.0f));
+            iz.max_val[0] =
+                std::max(0.0f, sanitizeFloat(o.value(QStringLiteral("max")).toDouble(1.0), 1.0f));
         } else if (iname == QLatin1String("alpharandom")) {
             iz.type = WE_INIT_ALPHA_RANDOM;
-            iz.min_val[0] = static_cast<float>(o.value(QStringLiteral("min")).toDouble(1.0));
-            iz.max_val[0] = static_cast<float>(o.value(QStringLiteral("max")).toDouble(1.0));
+            iz.min_val[0] = std::clamp(
+                sanitizeFloat(o.value(QStringLiteral("min")).toDouble(1.0), 1.0f), 0.0f, 1.0f);
+            iz.max_val[0] = std::clamp(
+                sanitizeFloat(o.value(QStringLiteral("max")).toDouble(1.0), 1.0f), 0.0f, 1.0f);
         } else if (iname == QLatin1String("colorrandom")) {
             iz.type = WE_INIT_COLOR_RANDOM;
             parseVec3(o.value(QStringLiteral("min")).toString(), iz.min_val);
@@ -3280,89 +3737,142 @@ bool ParticleDesignerWidget::importSystemJson(const QString &jsonState)
             parseVec3(o.value(QStringLiteral("max")).toString(), iz.max_val);
         } else if (iname == QLatin1String("turbulentvelocityrandom")) {
             iz.type = WE_INIT_TURBULENT_VELOCITY_RANDOM;
-            iz.min_val[0] = static_cast<float>(o.value(QStringLiteral("speedmin")).toDouble(0.0));
-            iz.max_val[0] = static_cast<float>(o.value(QStringLiteral("speedmax")).toDouble(0.0));
-            iz.scale = static_cast<float>(o.value(QStringLiteral("scale")).toDouble(1.0));
-            iz.offset = static_cast<float>(o.value(QStringLiteral("offset")).toDouble(0.0));
+            iz.min_val[0] = sanitizeFloat(o.value(QStringLiteral("speedmin")).toDouble(0.0));
+            iz.max_val[0] = sanitizeFloat(o.value(QStringLiteral("speedmax")).toDouble(0.0));
+            iz.scale = std::max(
+                1e-5f, sanitizeFloat(o.value(QStringLiteral("scale")).toDouble(1.0), 1.0f));
+            iz.offset = sanitizeFloat(o.value(QStringLiteral("offset")).toDouble(0.0));
             parseVec3(o.value(QStringLiteral("forward")).toString(), iz.forward);
+        }
+        for (int c = 0; c < 3; ++c) {
+            if (iz.min_val[c] > iz.max_val[c]) {
+                std::swap(iz.min_val[c], iz.max_val[c]);
+            }
         }
         m_initializers.push_back(iz);
     }
 
     m_operators.clear();
     for (const QJsonValue &v : root.value(QStringLiteral("operator")).toArray()) {
+        if (m_operators.size() >= WE_PARTICLE_MAX_OPERATORS) {
+            break;
+        }
         const QJsonObject o = v.toObject();
         we_particle_operator_t op{};
         const QString oname = o.value(QStringLiteral("name")).toString();
         if (oname == QLatin1String("movement")) {
             op.type = WE_OP_MOVEMENT;
             parseVec3(o.value(QStringLiteral("gravity")).toString(), op.gravity);
-            op.drag = static_cast<float>(o.value(QStringLiteral("drag")).toDouble(0.0));
+            op.drag = std::max(0.0f, sanitizeFloat(o.value(QStringLiteral("drag")).toDouble(0.0)));
         } else if (oname == QLatin1String("angularmovement")) {
             op.type = WE_OP_ANGULAR_MOVEMENT;
-            op.drag = static_cast<float>(o.value(QStringLiteral("drag")).toDouble(0.0));
+            op.drag = std::max(0.0f, sanitizeFloat(o.value(QStringLiteral("drag")).toDouble(0.0)));
             parseVec3(o.value(QStringLiteral("force")).toString(), op.gravity);
         } else if (oname == QLatin1String("alphafade")) {
             op.type = WE_OP_ALPHA_FADE;
             op.fade_in_time =
-                static_cast<float>(o.value(QStringLiteral("fadeintime")).toDouble(0.0));
+                std::max(0.0f, sanitizeFloat(o.value(QStringLiteral("fadeintime")).toDouble(0.0)));
             op.fade_out_time =
-                static_cast<float>(o.value(QStringLiteral("fadeouttime")).toDouble(1.0));
+                std::max(op.fade_in_time,
+                         sanitizeFloat(o.value(QStringLiteral("fadeouttime")).toDouble(1.0), 1.0f));
         } else if (oname == QLatin1String("sizechange")) {
             op.type = WE_OP_SIZE_CHANGE;
-            op.start_time = static_cast<float>(o.value(QStringLiteral("starttime")).toDouble(0.0));
-            op.end_time = static_cast<float>(o.value(QStringLiteral("endtime")).toDouble(1.0));
-            op.start_val[0] =
-                static_cast<float>(o.value(QStringLiteral("startvalue")).toDouble(1.0));
-            op.end_val[0] = static_cast<float>(o.value(QStringLiteral("endvalue")).toDouble(1.0));
+            op.start_time =
+                std::max(0.0f, sanitizeFloat(o.value(QStringLiteral("starttime")).toDouble(0.0)));
+            op.end_time =
+                std::max(op.start_time,
+                         sanitizeFloat(o.value(QStringLiteral("endtime")).toDouble(1.0), 1.0f));
+            op.start_val[0] = std::max(
+                0.0f, sanitizeFloat(o.value(QStringLiteral("startvalue")).toDouble(1.0), 1.0f));
+            op.end_val[0] = std::max(
+                0.0f, sanitizeFloat(o.value(QStringLiteral("endvalue")).toDouble(1.0), 1.0f));
         } else if (oname == QLatin1String("colorchange")) {
             op.type = WE_OP_COLOR_CHANGE;
-            op.start_time = static_cast<float>(o.value(QStringLiteral("starttime")).toDouble(0.0));
-            op.end_time = static_cast<float>(o.value(QStringLiteral("endtime")).toDouble(1.0));
+            op.start_time =
+                std::max(0.0f, sanitizeFloat(o.value(QStringLiteral("starttime")).toDouble(0.0)));
+            op.end_time =
+                std::max(op.start_time,
+                         sanitizeFloat(o.value(QStringLiteral("endtime")).toDouble(1.0), 1.0f));
             parseVec3(o.value(QStringLiteral("startvalue")).toString(), op.start_val);
             parseVec3(o.value(QStringLiteral("endvalue")).toString(), op.end_val);
         } else if (oname == QLatin1String("oscillatealpha")) {
             op.type = WE_OP_OSCILLATE_ALPHA;
-            op.freq_min = static_cast<float>(o.value(QStringLiteral("frequencymin")).toDouble(0.0));
-            op.freq_max = static_cast<float>(o.value(QStringLiteral("frequencymax")).toDouble(0.0));
-            op.scale_min = static_cast<float>(o.value(QStringLiteral("scalemin")).toDouble(0.0));
-            op.scale_max = static_cast<float>(o.value(QStringLiteral("scalemax")).toDouble(1.0));
+            op.freq_min = std::max(
+                0.0f, sanitizeFloat(o.value(QStringLiteral("frequencymin")).toDouble(0.0)));
+            op.freq_max = std::max(
+                0.0f, sanitizeFloat(o.value(QStringLiteral("frequencymax")).toDouble(0.0)));
+            if (op.freq_min > op.freq_max) {
+                std::swap(op.freq_min, op.freq_max);
+            }
+            op.scale_min = sanitizeFloat(o.value(QStringLiteral("scalemin")).toDouble(0.0));
+            op.scale_max = sanitizeFloat(o.value(QStringLiteral("scalemax")).toDouble(1.0), 1.0f);
+            if (op.scale_min > op.scale_max) {
+                std::swap(op.scale_min, op.scale_max);
+            }
         } else if (oname == QLatin1String("oscillatesize")) {
             op.type = WE_OP_OSCILLATE_SIZE;
-            op.freq_min = static_cast<float>(o.value(QStringLiteral("frequencymin")).toDouble(0.0));
-            op.freq_max = static_cast<float>(o.value(QStringLiteral("frequencymax")).toDouble(0.0));
-            op.scale_min = static_cast<float>(o.value(QStringLiteral("scalemin")).toDouble(0.0));
-            op.scale_max = static_cast<float>(o.value(QStringLiteral("scalemax")).toDouble(1.0));
+            op.freq_min = std::max(
+                0.0f, sanitizeFloat(o.value(QStringLiteral("frequencymin")).toDouble(0.0)));
+            op.freq_max = std::max(
+                0.0f, sanitizeFloat(o.value(QStringLiteral("frequencymax")).toDouble(0.0)));
+            if (op.freq_min > op.freq_max) {
+                std::swap(op.freq_min, op.freq_max);
+            }
+            op.scale_min = sanitizeFloat(o.value(QStringLiteral("scalemin")).toDouble(0.0));
+            op.scale_max = sanitizeFloat(o.value(QStringLiteral("scalemax")).toDouble(1.0), 1.0f);
+            if (op.scale_min > op.scale_max) {
+                std::swap(op.scale_min, op.scale_max);
+            }
         } else if (oname == QLatin1String("oscillateposition")) {
             op.type = WE_OP_OSCILLATE_POSITION;
-            op.freq_min = static_cast<float>(o.value(QStringLiteral("frequencymin")).toDouble(0.0));
-            op.freq_max = static_cast<float>(o.value(QStringLiteral("frequencymax")).toDouble(0.0));
-            op.scale_min = static_cast<float>(o.value(QStringLiteral("scalemin")).toDouble(0.0));
-            op.scale_max = static_cast<float>(o.value(QStringLiteral("scalemax")).toDouble(1.0));
+            op.freq_min = std::max(
+                0.0f, sanitizeFloat(o.value(QStringLiteral("frequencymin")).toDouble(0.0)));
+            op.freq_max = std::max(
+                0.0f, sanitizeFloat(o.value(QStringLiteral("frequencymax")).toDouble(0.0)));
+            if (op.freq_min > op.freq_max) {
+                std::swap(op.freq_min, op.freq_max);
+            }
+            op.scale_min = sanitizeFloat(o.value(QStringLiteral("scalemin")).toDouble(0.0));
+            op.scale_max = sanitizeFloat(o.value(QStringLiteral("scalemax")).toDouble(1.0), 1.0f);
+            if (op.scale_min > op.scale_max) {
+                std::swap(op.scale_min, op.scale_max);
+            }
             parseVec3(o.value(QStringLiteral("mask")).toString(), op.mask);
         } else if (oname == QLatin1String("vortex") ||
                    oname == QLatin1String("controlpointattract")) {
-            op.type = WE_OP_VORTEX;
-            op.control_point = o.value(QStringLiteral("controlpoint")).toInt(0);
+            const bool isCpAttract = (oname == QLatin1String("controlpointattract"));
+            op.type = isCpAttract ? WE_OP_CONTROL_POINT_ATTRACT : WE_OP_VORTEX;
+            op.control_point = std::clamp(o.value(QStringLiteral("controlpoint")).toInt(0), 0,
+                                          static_cast<int>(WE_PARTICLE_MAX_CONTROL_PTS) - 1);
             parseVec3(o.value(QStringLiteral("axis")).toString(), op.axis);
             parseVec3(o.value(QStringLiteral("offset")).toString(), op.offset);
-            op.distance_inner =
-                static_cast<float>(o.value(QStringLiteral("distanceinner")).toDouble(0.0));
-            op.distance_outer =
-                static_cast<float>(o.value(QStringLiteral("distanceouter")).toDouble(0.0));
+            op.distance_inner = std::max(
+                0.0f, sanitizeFloat(o.value(QStringLiteral("distanceinner")).toDouble(0.0)));
+            op.distance_outer = std::max(
+                0.0f, sanitizeFloat(o.value(QStringLiteral("distanceouter")).toDouble(0.0)));
+            if (op.distance_inner > op.distance_outer) {
+                std::swap(op.distance_inner, op.distance_outer);
+            }
             op.speed_inner =
-                static_cast<float>(o.value(QStringLiteral("speedinner")).toDouble(0.0));
+                isCpAttract ? 0.0f
+                            : sanitizeFloat(o.value(QStringLiteral("speedinner")).toDouble(0.0));
             op.speed_outer =
-                static_cast<float>(o.value(QStringLiteral("speedouter")).toDouble(0.0));
-            op.center_force =
-                static_cast<float>(o.value(QStringLiteral("centerforce")).toDouble(0.0));
+                isCpAttract ? 0.0f
+                            : sanitizeFloat(o.value(QStringLiteral("speedouter")).toDouble(0.0));
+            const double defCf = o.contains(QStringLiteral("centerforce"))
+                                     ? o.value(QStringLiteral("centerforce")).toDouble(0.0)
+                                     : o.value(QStringLiteral("scale")).toDouble(0.0);
+            op.center_force = sanitizeFloat(defCf);
         } else if (oname == QLatin1String("turbulence")) {
             op.type = WE_OP_TURBULENCE;
-            op.turb_scale = static_cast<float>(o.value(QStringLiteral("scale")).toDouble(0.0));
-            op.turb_speed = static_cast<float>(o.value(QStringLiteral("speed")).toDouble(0.0));
+            op.turb_scale = std::max(
+                1e-5f, sanitizeFloat(o.value(QStringLiteral("scale")).toDouble(0.01), 0.01f));
+            op.turb_speed = sanitizeFloat(o.value(QStringLiteral("speed")).toDouble(0.0));
             op.turb_timescale =
-                static_cast<float>(o.value(QStringLiteral("timescale")).toDouble(1.0));
+                sanitizeFloat(o.value(QStringLiteral("timescale")).toDouble(1.0), 1.0f);
             parseVec3(o.value(QStringLiteral("mask")).toString(), op.mask);
+        } else {
+            continue;
         }
         m_operators.push_back(op);
     }
@@ -3374,7 +3884,7 @@ bool ParticleDesignerWidget::importSystemJson(const QString &jsonState)
         k.y = std::clamp(k.y, 0.0f, 1.0f);
     }
     for (auto &k : ex.sizeKnots) {
-        k.y = std::clamp(k.y, 0.0f, 3.0f);
+        k.y = std::clamp(k.y, 0.0f, 4.0f);
     }
 
     syncUiFromModel();
@@ -3395,38 +3905,48 @@ void ParticleDesignerWidget::commitSystemEdit(const QString &paramGroup)
                 (void)self->importSystemJson(jsonState);
             }
             self->m_lastCommittedJson = jsonState;
-            self->pushRampLutIpcForObject(objId, 0u, 0u);
-            self->pushRampLutIpcForObject(objId, 0u, 1u);
-            self->pushRampLutIpcForObject(objId, 0u, 2u);
+        }
+
+        // Send the full particle system JSON first so we_particle_create_from_json constructs
+        // the operators before WE_PARTICLE_CFG_SET_RAMP_LUT patches individual operators.
+        emit self->particleSystemModified(objId, jsonState);
+        if (self->m_ipcClient) {
+            (void)self->m_ipcClient->sendParticleConfig(
+                self->m_targetOutput, objId, WE_PARTICLE_CFG_SET_SYSTEM_JSON, 0u, 2u,
+                utf8.constData(), static_cast<uint32_t>(utf8.size()));
+        }
+
+        if (self->m_objectId == objId) {
+            self->pushMatchingRampLutsForChannel(objId, 0u);
+            self->pushMatchingRampLutsForChannel(objId, 1u);
+            self->pushMatchingRampLutsForChannel(objId, 2u);
         } else {
-            // Active selection differs; bake LUTs for the target object without altering UI state.
             const QJsonDocument doc = QJsonDocument::fromJson(utf8);
             if (doc.isObject()) {
                 const QJsonObject root = doc.object();
                 std::vector<we_particle_curve_knot_t> aKnots;
                 std::vector<we_particle_curve_knot_t> sKnots;
                 std::vector<we_particle_color_stop_t> cStops;
-                if (parseCurveKnotsJson(root.value(QStringLiteral("alphaknots")).toArray(),
-                                        aKnots)) {
-                    bakeAndSendRampLut(self->m_ipcClient, self->m_targetOutput, objId, 0u, 0u,
-                                       aKnots, sKnots, cStops, nullptr, nullptr, nullptr);
-                }
-                if (parseCurveKnotsJson(root.value(QStringLiteral("sizeknots")).toArray(),
-                                        sKnots)) {
-                    bakeAndSendRampLut(self->m_ipcClient, self->m_targetOutput, objId, 0u, 1u,
-                                       aKnots, sKnots, cStops, nullptr, nullptr, nullptr);
-                }
-                if (parseColorStopsJson(root.value(QStringLiteral("colorstops")).toArray(),
-                                        cStops)) {
-                    bakeAndSendRampLut(self->m_ipcClient, self->m_targetOutput, objId, 0u, 2u,
-                                       aKnots, sKnots, cStops, nullptr, nullptr, nullptr);
+                const bool hasAlpha =
+                    parseCurveKnotsJson(root.value(QStringLiteral("alphaknots")).toArray(), aKnots);
+                const bool hasSize =
+                    parseCurveKnotsJson(root.value(QStringLiteral("sizeknots")).toArray(), sKnots);
+                const bool hasColor =
+                    parseColorStopsJson(root.value(QStringLiteral("colorstops")).toArray(), cStops);
+                const QJsonArray opArr = root.value(QStringLiteral("operator")).toArray();
+                for (int i = 0; i < opArr.size() && i < static_cast<int>(WE_PARTICLE_MAX_OPERATORS);
+                     ++i) {
+                    const QString oname =
+                        opArr.at(i).toObject().value(QStringLiteral("name")).toString();
+                    const uint32_t ch = channelKindFromJsonOperatorName(oname);
+                    if ((ch == 0u && hasAlpha) || (ch == 1u && hasSize) || (ch == 2u && hasColor)) {
+                        bakeAndSendRampLut(self->m_ipcClient, self->m_targetOutput, objId,
+                                           static_cast<uint32_t>(i), ch, aKnots, sKnots, cStops,
+                                           nullptr, nullptr, nullptr);
+                    }
                 }
             }
         }
-        emit self->particleSystemModified(objId, jsonState);
-        dispatchParticleConfigIpc(self->m_ipcClient, self->m_targetOutput, objId,
-                                  WE_PARTICLE_CFG_SET_SYSTEM_JSON, 0u, 2u, utf8.constData(),
-                                  static_cast<uint32_t>(utf8.size()));
     };
 
     if (m_commandBus && !m_lastCommittedJson.isEmpty() && newJson != m_lastCommittedJson) {
@@ -3449,6 +3969,16 @@ void ParticleDesignerWidget::pushRampLutIpcForObject(int32_t objectId, uint32_t 
     bakeAndSendRampLut(m_ipcClient, m_targetOutput, objectId, opIndex, channelKind, ex.alphaKnots,
                        ex.sizeKnots, ex.colorStops, m_alphaCurveEditor, m_sizeCurveEditor,
                        m_colorRampEditor);
+}
+
+void ParticleDesignerWidget::pushMatchingRampLutsForChannel(int32_t objectId, uint32_t channelKind)
+{
+    const we_operator_type_t wantType = expectedOpTypeForChannel(channelKind);
+    for (uint32_t i = 0; i < static_cast<uint32_t>(m_operators.size()); ++i) {
+        if (m_operators[i].type == wantType) {
+            pushRampLutIpcForObject(objectId, i, channelKind);
+        }
+    }
 }
 
 } // namespace waywal::studio

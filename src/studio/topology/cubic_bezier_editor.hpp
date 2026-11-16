@@ -2,11 +2,13 @@
 #ifndef WAYWAL_STUDIO_CUBIC_BEZIER_EDITOR_HPP
 #define WAYWAL_STUDIO_CUBIC_BEZIER_EDITOR_HPP
 
-#include <QWidget>
+#include <QElapsedTimer>
+#include <QPainterPath>
 #include <QPointF>
+#include <QSize>
 #include <QString>
 #include <QTimer>
-#include <QElapsedTimer>
+#include <QWidget>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -86,6 +88,10 @@ class CubicBezierEditorWidget : public QWidget {
     const TransitionConfig &transitionConfig() const { return m_config; }
     void setTransitionConfig(const TransitionConfig &config);
 
+    // Curve & preset actions
+    [[nodiscard]] QString cssTimingFunction() const;
+    [[nodiscard]] QString exportTransitionJson() const;
+
     // CommandBus integration
     void setCommandBus(CommandBus *bus) { m_commandBus = bus; }
     CommandBus *commandBus() const { return m_commandBus; }
@@ -105,13 +111,20 @@ class CubicBezierEditorWidget : public QWidget {
     void onWaveAmpChanged(double val);
     void onCenterChanged();
     void onSpinBoxesCurveChanged();
+    void onCopyCssClicked();
+    void onExportJsonClicked();
+    void onSaveCustomPresetClicked();
+    void onSavedPresetActivated(int index);
 
   private:
     void setupUi();
     void updateUiFromConfig();
+    void applyCurveState(const bezier_curve_t &curve);
 
     TransitionConfig m_config;
     CommandBus *m_commandBus{nullptr};
+    bezier_curve_t m_dragStartCurve{{0.25f}, {0.1f}, {0.25f}, {1.0f}};
+    bool m_hasPendingDragBaseline{false};
 
     // Sub-widgets
     BezierCurveCanvas *m_canvas{nullptr};
@@ -124,6 +137,11 @@ class CubicBezierEditorWidget : public QWidget {
     QPushButton *m_btnEaseOut{nullptr};
     QPushButton *m_btnEaseInOut{nullptr};
     QPushButton *m_btnBounce{nullptr};
+    QComboBox *m_savedPresetCombo{nullptr};
+    QPushButton *m_btnSavePreset{nullptr};
+    QPushButton *m_btnCopyCss{nullptr};
+    QPushButton *m_btnExportJson{nullptr};
+    std::vector<std::pair<QString, bezier_curve_t>> m_customPresets;
 
     // Numeric curve inputs
     QDoubleSpinBox *m_spinP1x{nullptr};
@@ -169,31 +187,42 @@ class BezierCurveCanvas : public QWidget {
 
   protected:
     void paintEvent(QPaintEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
 
   private:
+    void wakeAnimationPreview();
+    void syncAnimationState();
+    void rebuildCurvePathIfNeeded();
     QPointF mapToCanvas(float x, float y) const;
     QPointF mapFromCanvas(const QPointF &pt) const;
     QRectF getHandleRect(const QPointF &canvasPt) const;
 
     bezier_curve_t m_curve{{0.25f}, {0.1f}, {0.25f}, {1.0f}};
 
-    // Canvas view bounds (allowing overshoot Y in [-0.5, 1.5])
+    // Canvas view bounds allowing bounce overshoot in [-0.75, 1.75]
     const float m_minX{0.0f};
     const float m_maxX{1.0f};
-    const float m_minY{-0.5f};
-    const float m_maxY{1.5f};
+    const float m_minY{-0.75f};
+    const float m_maxY{1.75f};
 
-    // Drag interaction
+    // Drag and keyboard interaction
     enum class DragTarget { None, HandleP1, HandleP2 };
     DragTarget m_dragTarget{DragTarget::None};
+    DragTarget m_selectedHandle{DragTarget::HandleP1};
     bezier_curve_t m_dragStartCurve;
 
-    // Real-time animation
+    // Real-time animation & cached curve path
     QTimer m_animTimer;
     QElapsedTimer m_elapsedTimer;
+    QElapsedTimer m_activityTimer;
+    QPainterPath m_cachedCurvePath;
+    QSize m_cachedSize;
+    bool m_curvePathDirty{true};
+    bool m_hovered{false};
     uint32_t m_durationMs{1000};
     float m_animProgress{0.0f};
     float m_easedProgress{0.0f};

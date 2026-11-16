@@ -112,6 +112,7 @@ class NodeGraphEditorWidget : public QWidget {
     void nodeConstantScrubbed(uint32_t nodeId, uint32_t pinIdx, float val);
 
   protected:
+    bool focusNextPrevChild(bool next) override;
     void keyPressEvent(QKeyEvent *event) override;
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dragMoveEvent(QDragMoveEvent *event) override;
@@ -140,8 +141,9 @@ class NodeGraphEditorWidget : public QWidget {
     IpcClient *m_ipcClient{nullptr};
     QString m_targetOutput;
     float m_zoomScale{1.0f};
-    uint32_t m_nextNodeId{1};
     uint32_t m_nextEdgeId{1};
+    uint32_t m_cycleHighlightSrcNodeId{0};
+    uint32_t m_cycleHighlightDstNodeId{0};
 
     QGraphicsScene *m_scene{nullptr};
     QGraphicsView *m_view{nullptr};

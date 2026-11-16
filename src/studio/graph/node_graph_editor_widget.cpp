@@ -8,6 +8,7 @@
 #include <QFile>
 #include <QGraphicsPathItem>
 #include <QGraphicsSceneMouseEvent>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
@@ -19,16 +20,20 @@
 #include <QPointer>
 #include <QPushButton>
 #include <QScopedValueRollback>
+#include <QScreen>
 #include <QScrollBar>
 #include <QStyleOptionGraphicsItem>
+#include <QTimer>
 #include <QToolBar>
 #include <QTreeWidget>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <unordered_set>
 
 namespace waywal::studio {
 
@@ -48,9 +53,9 @@ constexpr QColor kColorWireActive(0x22, 0xD3, 0xEE);   // component.nodegraph.wi
 constexpr QColor kColorWireCycleErr(0xF8, 0x71, 0x71); // component.nodegraph.wire.cycle_err
 constexpr QColor kColorSnapHalo(0x4E, 0xCD, 0xC4, 90); // component.nodegraph.snap.halo
 
-constexpr float kNodeWidth = 200.0f;
-constexpr float kHeaderHeight = 28.0f;
-constexpr float kPinRowHeight = 24.0f;
+constexpr float kNodeWidth = kGraphNodeWidth;
+constexpr float kHeaderHeight = kGraphHeaderHeight;
+constexpr float kPinRowHeight = kGraphPinRowHeight;
 constexpr float kPinRadius = 6.0f;
 
 /* ========================================================================= */
@@ -263,16 +268,22 @@ class GraphCanvasView final : public QGraphicsView {
         setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         setDragMode(QGraphicsView::NoDrag);
+        setFocusPolicy(Qt::StrongFocus);
+        setAcceptDrops(false);
+        if (viewport()) {
+            viewport()->setAcceptDrops(false);
+        }
         setMouseTracking(true);
     }
 
-    void startDraggingWire(uint32_t nodeId, uint32_t pinIdx, uint32_t pinType, bool isOutput,
-                           const QPointF &startScenePos)
+    void startDraggingWire(uint32_t nodeId, uint32_t pinIdx, uint32_t pinType, uint32_t pinFlags,
+                           bool isOutput, const QPointF &startScenePos)
     {
         m_wireDragging = true;
         m_dragSrcNodeId = nodeId;
         m_dragSrcPinIdx = pinIdx;
         m_dragPinType = pinType;
+        m_dragPinFlags = pinFlags;
         m_dragIsOutput = isOutput;
         m_dragStartPos = startScenePos;
         m_dragCurrentPos = startScenePos;
@@ -359,14 +370,31 @@ class GraphCanvasView final : public QGraphicsView {
         painter->setPen(pen);
         painter->strokePath(path, pen);
 
-        // Render magnetic snap halo
+        // Render magnetic snap halo scaled consistently in screen space
         if (m_snappedPinValid) {
-            painter->setPen(QPen(QColor(0x4E, 0xCD, 0xC4), 1.5f));
+            const float invScale = 1.0f / std::max(0.15f, m_editor->zoomScale());
+            const qreal haloRadius = 16.0 * static_cast<qreal>(invScale);
+            painter->setPen(QPen(QColor(0x4E, 0xCD, 0xC4), 1.5f * invScale));
             painter->setBrush(QBrush(kColorSnapHalo));
-            painter->drawEllipse(m_snappedPinPos, 16.0, 16.0);
+            painter->drawEllipse(m_snappedPinPos, haloRadius, haloRadius);
         }
 
         painter->restore();
+    }
+
+    bool focusNextPrevChild(bool /*next*/) override { return false; }
+
+    void keyPressEvent(QKeyEvent *event) override
+    {
+        if (m_editor &&
+            ((event->key() == Qt::Key_A && (event->modifiers() & Qt::ShiftModifier)) ||
+             event->key() == Qt::Key_Tab || event->key() == Qt::Key_Space ||
+             event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace ||
+             event->matches(QKeySequence::Undo) || event->matches(QKeySequence::Redo))) {
+            m_editor->keyPressEvent(event);
+            return;
+        }
+        QGraphicsView::keyPressEvent(event);
     }
 
     void wheelEvent(QWheelEvent *event) override
@@ -406,9 +434,11 @@ class GraphCanvasView final : public QGraphicsView {
             m_dragCurrentPos = scenePos;
             m_snappedPinValid = false;
 
+            const float sceneSnapRadius = NodeGraphEditorWidget::kMagneticSnapRadiusPx /
+                                          std::max(0.15f, m_editor->zoomScale());
             const auto nearest = m_editor->pinSpatialGrid().findNearestCompatible(
-                scenePos, !m_dragIsOutput, m_dragPinType,
-                NodeGraphEditorWidget::kMagneticSnapRadiusPx, m_dragSrcNodeId);
+                scenePos, !m_dragIsOutput, m_dragPinType, sceneSnapRadius, m_dragSrcNodeId,
+                m_dragPinFlags);
             if (nearest.has_value()) {
                 m_snappedPinPos = nearest->scenePos;
                 m_dragCurrentPos = nearest->scenePos;
@@ -468,6 +498,7 @@ class GraphCanvasView final : public QGraphicsView {
     uint32_t m_dragSrcNodeId{0};
     uint32_t m_dragSrcPinIdx{0};
     uint32_t m_dragPinType{0};
+    uint32_t m_dragPinFlags{0};
     bool m_dragIsOutput{true};
     QPointF m_dragStartPos;
     QPointF m_dragCurrentPos;
@@ -503,13 +534,17 @@ class NodeItem final : public QGraphicsItem {
 
         setPos(node->canvas_pos[0], node->canvas_pos[1]);
 
-        uint32_t maxPins = std::max(node->input_pin_count, node->output_pin_count);
+        uint32_t maxPins =
+            std::max(std::min<uint32_t>(node->input_pin_count, WAYWAL_GRAPH_MAX_PINS_PER_NODE),
+                     std::min<uint32_t>(node->output_pin_count, WAYWAL_GRAPH_MAX_PINS_PER_NODE));
         if (maxPins == 0) {
             maxPins = 1;
         }
 
-        float h = kHeaderHeight + 16.0f + maxPins * kPinRowHeight + 10.0f;
-        if ((node->flags & WAYWAL_NODE_FLAG_PREVIEW_EXPANDED) &&
+        const bool collapsed = (node->flags & WAYWAL_NODE_FLAG_COLLAPSED) != 0;
+        float h = collapsed ? (kHeaderHeight + 10.0f)
+                            : (kHeaderHeight + 16.0f + maxPins * kPinRowHeight + 10.0f);
+        if (!collapsed && (node->flags & WAYWAL_NODE_FLAG_PREVIEW_EXPANDED) &&
             m_editor->currentLod() == GraphSemanticZoomLod::FullDetail) {
             h += 74.0f; // 64x64 thumbnail + padding
         }
@@ -537,10 +572,19 @@ class NodeItem final : public QGraphicsItem {
         GraphSemanticZoomLod lod = m_editor->currentLod();
         painter->setRenderHint(QPainter::Antialiasing, true);
 
+        const auto &schedule = m_editor->lastSchedule();
+        const bool hasCycleHighlight =
+            (schedule.has_cycle_error != 0 && schedule.cycle_node_id == m_nodeId) ||
+            (m_editor->m_cycleHighlightSrcNodeId != 0 &&
+             (m_nodeId == m_editor->m_cycleHighlightSrcNodeId ||
+              m_nodeId == m_editor->m_cycleHighlightDstNodeId));
+
         // 1. Draw Card Surface
         QRectF cardRect(0.0, 0.0, kNodeWidth, m_height);
         painter->setBrush(QBrush(kColorNodeSurface));
-        QPen borderPen = isSelected() ? QPen(kColorFocusRing, 2.0f) : QPen(kColorNodeHeader, 1.0f);
+        QPen borderPen = hasCycleHighlight ? QPen(kColorWireCycleErr, 2.5f)
+                                           : (isSelected() ? QPen(kColorFocusRing, 2.0f)
+                                                           : QPen(kColorNodeHeader, 1.0f));
         painter->setPen(borderPen);
         painter->drawRoundedRect(cardRect, 8.0, 8.0);
 
@@ -563,8 +607,9 @@ class NodeItem final : public QGraphicsItem {
         painter->drawText(QRectF(12.0, 4.0, kNodeWidth - 24.0, kHeaderHeight),
                           Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8(node->title));
 
-        // In MacroOverview, cull pins and controls
-        if (lod == GraphSemanticZoomLod::MacroOverview) {
+        // Cull pins and preview thumbnails when collapsed or in MacroOverview
+        if ((node->flags & WAYWAL_NODE_FLAG_COLLAPSED) != 0 ||
+            lod == GraphSemanticZoomLod::MacroOverview) {
             return;
         }
 
@@ -573,11 +618,15 @@ class NodeItem final : public QGraphicsItem {
         font.setPointSize(8);
         painter->setFont(font);
 
-        // Draw Inputs
-        for (uint32_t i = 0; i < node->input_pin_count; ++i) {
+        const uint32_t inCount =
+            std::min<uint32_t>(node->input_pin_count, WAYWAL_GRAPH_MAX_PINS_PER_NODE);
+        for (uint32_t i = 0; i < inCount; ++i) {
             const auto &pin = node->inputs[i];
-            QPointF center(0.0, kHeaderHeight + 16.0f + i * kPinRowHeight);
-            bool connected = (pin.flags & WAYWAL_PIN_FLAG_CONNECTED) != 0;
+            if ((pin.flags & WAYWAL_PIN_FLAG_HIDDEN) != 0) {
+                continue;
+            }
+            const QPointF center(0.0, graphPinCenterY(i, kHeaderHeight, kPinRowHeight));
+            const bool connected = (pin.flags & WAYWAL_PIN_FLAG_CONNECTED) != 0;
             drawPinSilhouette(painter, pin.pin_type, center, kPinRadius, pinTypeColor(pin.pin_type),
                               connected);
 
@@ -587,11 +636,15 @@ class NodeItem final : public QGraphicsItem {
                               QString::fromUtf8(pin.label[0] ? pin.label : pin.name));
         }
 
-        // Draw Outputs
-        for (uint32_t i = 0; i < node->output_pin_count; ++i) {
+        const uint32_t outCount =
+            std::min<uint32_t>(node->output_pin_count, WAYWAL_GRAPH_MAX_PINS_PER_NODE);
+        for (uint32_t i = 0; i < outCount; ++i) {
             const auto &pin = node->outputs[i];
-            QPointF center(kNodeWidth, kHeaderHeight + 16.0f + i * kPinRowHeight);
-            bool connected = (pin.flags & WAYWAL_PIN_FLAG_CONNECTED) != 0;
+            if ((pin.flags & WAYWAL_PIN_FLAG_HIDDEN) != 0) {
+                continue;
+            }
+            const QPointF center(kNodeWidth, graphPinCenterY(i, kHeaderHeight, kPinRowHeight));
+            const bool connected = (pin.flags & WAYWAL_PIN_FLAG_CONNECTED) != 0;
             drawPinSilhouette(painter, pin.pin_type, center, kPinRadius, pinTypeColor(pin.pin_type),
                               connected);
 
@@ -604,7 +657,6 @@ class NodeItem final : public QGraphicsItem {
 
         // 5. FullDetail Controls & Live Thumbnail Preview
         if (lod == GraphSemanticZoomLod::FullDetail) {
-            // Live Thumbnail Preview (64x64)
             if (node->flags & WAYWAL_NODE_FLAG_PREVIEW_EXPANDED) {
                 float thumbY = m_height - 70.0f;
                 QRectF thumbRect((kNodeWidth - 64.0f) * 0.5f, thumbY, 64.0f, 64.0f);
@@ -612,8 +664,13 @@ class NodeItem final : public QGraphicsItem {
                 painter->setPen(QPen(QColor(0x31, 0x32, 0x44), 1.0f));
                 painter->drawRect(thumbRect);
 
-                painter->setPen(QColor(0x58, 0x5B, 0x70));
-                painter->drawText(thumbRect, Qt::AlignCenter, QStringLiteral("64x64"));
+                const auto thumbIt = m_editor->m_nodeThumbnails.constFind(m_nodeId);
+                if (thumbIt != m_editor->m_nodeThumbnails.constEnd() && !thumbIt->isNull()) {
+                    painter->drawImage(thumbRect.adjusted(1.0, 1.0, -1.0, -1.0), *thumbIt);
+                } else {
+                    painter->setPen(QColor(0x58, 0x5B, 0x70));
+                    painter->drawText(thumbRect, Qt::AlignCenter, QStringLiteral("64x64"));
+                }
             }
         }
     }
@@ -632,27 +689,40 @@ class NodeItem final : public QGraphicsItem {
     {
         const auto &graph = m_editor->graph();
         const waywal_graph_node_t *node = waywal_shader_graph_find_node_const(&graph, m_nodeId);
-        if (node) {
+        const bool pinsInteractive =
+            node && ((node->flags & WAYWAL_NODE_FLAG_COLLAPSED) == 0) &&
+            (m_editor->currentLod() != GraphSemanticZoomLod::MacroOverview);
+        if (pinsInteractive) {
             const QPointF local = event->pos();
 
-            for (uint32_t i = 0; i < node->input_pin_count; ++i) {
-                const QPointF center(0.0, kHeaderHeight + 16.0f + i * kPinRowHeight);
+            const uint32_t inCount =
+                std::min<uint32_t>(node->input_pin_count, WAYWAL_GRAPH_MAX_PINS_PER_NODE);
+            for (uint32_t i = 0; i < inCount; ++i) {
+                if ((node->inputs[i].flags & WAYWAL_PIN_FLAG_HIDDEN) != 0) {
+                    continue;
+                }
+                const QPointF center(0.0, graphPinCenterY(i, kHeaderHeight, kPinRowHeight));
                 if (std::hypot(local.x() - center.x(), local.y() - center.y()) <= 12.0) {
                     if (auto *view = dynamic_cast<GraphCanvasView *>(scene()->views().value(0))) {
-                        view->startDraggingWire(m_nodeId, i, node->inputs[i].pin_type, false,
-                                                mapToScene(center));
+                        view->startDraggingWire(m_nodeId, i, node->inputs[i].pin_type,
+                                                node->inputs[i].flags, false, mapToScene(center));
                         event->accept();
                         return;
                     }
                 }
             }
 
-            for (uint32_t i = 0; i < node->output_pin_count; ++i) {
-                const QPointF center(kNodeWidth, kHeaderHeight + 16.0f + i * kPinRowHeight);
+            const uint32_t outCount =
+                std::min<uint32_t>(node->output_pin_count, WAYWAL_GRAPH_MAX_PINS_PER_NODE);
+            for (uint32_t i = 0; i < outCount; ++i) {
+                if ((node->outputs[i].flags & WAYWAL_PIN_FLAG_HIDDEN) != 0) {
+                    continue;
+                }
+                const QPointF center(kNodeWidth, graphPinCenterY(i, kHeaderHeight, kPinRowHeight));
                 if (std::hypot(local.x() - center.x(), local.y() - center.y()) <= 12.0) {
                     if (auto *view = dynamic_cast<GraphCanvasView *>(scene()->views().value(0))) {
-                        view->startDraggingWire(m_nodeId, i, node->outputs[i].pin_type, true,
-                                                mapToScene(center));
+                        view->startDraggingWire(m_nodeId, i, node->outputs[i].pin_type,
+                                                node->outputs[i].flags, true, mapToScene(center));
                         event->accept();
                         return;
                     }
@@ -746,6 +816,12 @@ class WireItem final : public QGraphicsPathItem {
         if (!src || !dst) {
             return;
         }
+        if (edge->src_pin_index >= src->output_pin_count ||
+            edge->src_pin_index >= WAYWAL_GRAPH_MAX_PINS_PER_NODE ||
+            edge->dst_pin_index >= dst->input_pin_count ||
+            edge->dst_pin_index >= WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
+            return;
+        }
 
         m_srcNodeId = edge->src_node_id;
         m_dstNodeId = edge->dst_node_id;
@@ -754,10 +830,17 @@ class WireItem final : public QGraphicsPathItem {
         m_srcType = src->outputs[edge->src_pin_index].pin_type;
         m_dstType = dst->inputs[edge->dst_pin_index].pin_type;
 
-        const QPointF p0(src->canvas_pos[0] + kNodeWidth,
-                         src->canvas_pos[1] + kHeaderHeight + 16.0f + m_srcPinIdx * kPinRowHeight);
-        const QPointF p3(dst->canvas_pos[0],
-                         dst->canvas_pos[1] + kHeaderHeight + 16.0f + m_dstPinIdx * kPinRowHeight);
+        const QPointF srcNodePos(src->canvas_pos[0], src->canvas_pos[1]);
+        const QPointF dstNodePos(dst->canvas_pos[0], dst->canvas_pos[1]);
+        const QPointF p0 =
+            (src->flags & WAYWAL_NODE_FLAG_COLLAPSED) != 0
+                ? QPointF(srcNodePos.x() + kNodeWidth, srcNodePos.y() + kHeaderHeight * 0.5 + 2.0)
+                : graphPinScenePos(srcNodePos, m_srcPinIdx, true, kNodeWidth, kHeaderHeight,
+                                   kPinRowHeight);
+        const QPointF p3 = (dst->flags & WAYWAL_NODE_FLAG_COLLAPSED) != 0
+                               ? QPointF(dstNodePos.x(), dstNodePos.y() + kHeaderHeight * 0.5 + 2.0)
+                               : graphPinScenePos(dstNodePos, m_dstPinIdx, false, kNodeWidth,
+                                                  kHeaderHeight, kPinRowHeight);
         commitEndpoints(p0, p3);
     }
 
@@ -769,14 +852,25 @@ class WireItem final : public QGraphicsPathItem {
             !srcIt->second || !dstIt->second) {
             return;
         }
+        const auto &graph = m_editor->graph();
+        const auto *src = waywal_shader_graph_find_node_const(&graph, m_srcNodeId);
+        const auto *dst = waywal_shader_graph_find_node_const(&graph, m_dstNodeId);
         const QPointF srcPos = srcIt->second->pos();
         const QPointF dstPos = dstIt->second->pos();
-        const QPointF p0(srcPos.x() + kNodeWidth,
-                         srcPos.y() + kHeaderHeight + 16.0f + m_srcPinIdx * kPinRowHeight);
-        const QPointF p3(dstPos.x(),
-                         dstPos.y() + kHeaderHeight + 16.0f + m_dstPinIdx * kPinRowHeight);
+        const QPointF p0 =
+            (src && (src->flags & WAYWAL_NODE_FLAG_COLLAPSED) != 0)
+                ? QPointF(srcPos.x() + kNodeWidth, srcPos.y() + kHeaderHeight * 0.5 + 2.0)
+                : graphPinScenePos(srcPos, m_srcPinIdx, true, kNodeWidth, kHeaderHeight,
+                                   kPinRowHeight);
+        const QPointF p3 = (dst && (dst->flags & WAYWAL_NODE_FLAG_COLLAPSED) != 0)
+                               ? QPointF(dstPos.x(), dstPos.y() + kHeaderHeight * 0.5 + 2.0)
+                               : graphPinScenePos(dstPos, m_dstPinIdx, false, kNodeWidth,
+                                                  kHeaderHeight, kPinRowHeight);
         commitEndpoints(p0, p3);
     }
+
+    [[nodiscard]] uint32_t srcNodeId() const noexcept { return m_srcNodeId; }
+    [[nodiscard]] uint32_t dstNodeId() const noexcept { return m_dstNodeId; }
 
     void paint(QPainter *painter, const QStyleOptionGraphicsItem *option, QWidget *widget) override
     {
@@ -788,8 +882,11 @@ class WireItem final : public QGraphicsPathItem {
 
         const auto &schedule = m_editor->lastSchedule();
         const bool isCycleEdge =
-            (schedule.has_cycle_error != 0) &&
-            (m_srcNodeId == schedule.cycle_node_id || m_dstNodeId == schedule.cycle_node_id);
+            ((schedule.has_cycle_error != 0) &&
+             (m_srcNodeId == schedule.cycle_node_id || m_dstNodeId == schedule.cycle_node_id)) ||
+            (m_editor->m_cycleHighlightSrcNodeId != 0 &&
+             m_srcNodeId == m_editor->m_cycleHighlightSrcNodeId &&
+             m_dstNodeId == m_editor->m_cycleHighlightDstNodeId);
 
         if (isCycleEdge) {
             QPen pen(kColorWireCycleErr, 3.0f, Qt::DashLine);
@@ -904,6 +1001,7 @@ NodeGraphEditorWidget::NodeGraphEditorWidget(QWidget *parent)
     : QWidget(parent), m_graph(waywal_shader_graph_create(), &waywal_shader_graph_destroy)
 {
     setAcceptDrops(true);
+    setFocusPolicy(Qt::StrongFocus);
     setupUi();
     newEmptyGraph();
 }
@@ -972,7 +1070,9 @@ void NodeGraphEditorWidget::setupUi()
 void NodeGraphEditorWidget::newEmptyGraph(const QString &name)
 {
     waywal_shader_graph_init(m_graph.get(), name.toUtf8().constData());
-    m_nextNodeId = 1;
+    m_nodeThumbnails.clear();
+    m_cycleHighlightSrcNodeId = 0;
+    m_cycleHighlightDstNodeId = 0;
     m_nextEdgeId = 1;
 
     const int32_t uvRes =
@@ -983,13 +1083,11 @@ void NodeGraphEditorWidget::newEmptyGraph(const QString &name)
         if (auto *n = waywal_shader_graph_find_node(m_graph.get(), static_cast<uint32_t>(uvRes))) {
             std::strncpy(n->prop_or_asset_key, "UV Coordinates", sizeof(n->prop_or_asset_key) - 1);
         }
-        m_nextNodeId = std::max(m_nextNodeId, static_cast<uint32_t>(uvRes) + 1);
     }
     if (outRes > 0) {
         if (auto *n = waywal_shader_graph_find_node(m_graph.get(), static_cast<uint32_t>(outRes))) {
             std::strncpy(n->prop_or_asset_key, "Output Surface", sizeof(n->prop_or_asset_key) - 1);
         }
-        m_nextNodeId = std::max(m_nextNodeId, static_cast<uint32_t>(outRes) + 1);
     }
     if (uvRes > 0 && outRes > 0) {
         const int32_t eid = waywal_shader_graph_connect(m_graph.get(), static_cast<uint32_t>(uvRes),
@@ -1016,25 +1114,25 @@ bool NodeGraphEditorWidget::loadGraphFromFile(const QString &filePath)
 
     QByteArray data = file.readAll();
     char errBuf[256] = {0};
-    waywal_shader_graph_t tempGraph;
-    std::memset(&tempGraph, 0, sizeof(tempGraph));
+    auto tempGraph = std::unique_ptr<waywal_shader_graph_t, void (*)(waywal_shader_graph_t *)>(
+        waywal_shader_graph_create(), &waywal_shader_graph_destroy);
+    if (!tempGraph) {
+        emit statusMessage(QStringLiteral("Out of memory allocating shader graph"));
+        return false;
+    }
 
     if (!waywal_shader_graph_load_json(data.constData(), static_cast<size_t>(data.size()),
-                                       &tempGraph, errBuf)) {
+                                       tempGraph.get(), errBuf)) {
         emit statusMessage(
             QStringLiteral("JSON graph parse error: %1").arg(QString::fromUtf8(errBuf)));
         return false;
     }
 
-    *m_graph = tempGraph;
+    m_graph = std::move(tempGraph);
+    m_nodeThumbnails.clear();
+    m_cycleHighlightSrcNodeId = 0;
+    m_cycleHighlightDstNodeId = 0;
     resyncPinConnectedFlags(m_graph.get());
-
-    m_nextNodeId = 1;
-    for (uint32_t i = 0; i < m_graph->node_count; ++i) {
-        if (m_graph->nodes[i].node_id >= m_nextNodeId) {
-            m_nextNodeId = m_graph->nodes[i].node_id + 1;
-        }
-    }
 
     m_nextEdgeId = 1;
     for (uint32_t i = 0; i < m_graph->edge_count; ++i) {
@@ -1074,45 +1172,49 @@ uint32_t NodeGraphEditorWidget::addNodeInternal(waywal_node_op_t op, const QPoin
                                                 const QString &titleOverride,
                                                 const float *defaultConstVal)
 {
-    const int32_t res = waywal_shader_graph_add_node(m_graph.get(), static_cast<uint32_t>(op), "",
-                                                     static_cast<float>(scenePos.x()),
-                                                     static_cast<float>(scenePos.y()));
+    const float sx = std::isfinite(scenePos.x()) ? static_cast<float>(scenePos.x()) : 0.0f;
+    const float sy = std::isfinite(scenePos.y()) ? static_cast<float>(scenePos.y()) : 0.0f;
+    const uint32_t prevNodeCount = m_graph->node_count;
+    const int32_t res =
+        waywal_shader_graph_add_node(m_graph.get(), static_cast<uint32_t>(op), "", sx, sy);
     if (res < 0) {
         return 0;
     }
 
     const uint32_t nid = static_cast<uint32_t>(res);
-    if (nid >= m_nextNodeId) {
-        m_nextNodeId = nid + 1;
-    }
-
-    waywal_graph_node_t *node = waywal_shader_graph_find_node(m_graph.get(), nid);
-    if (!node) {
+    waywal_graph_node_t *added = waywal_shader_graph_find_node(m_graph.get(), nid);
+    if (!added) {
         return 0;
     }
 
+    waywal_graph_node_t snapshot = *added;
+    // Revert the provisional C insertion so CommandBus::execute owns the sole mutation.
+    m_graph->node_count = prevNodeCount;
+
     if (!propOrEffectSlug.isEmpty()) {
         const QByteArray slugUtf8 = propOrEffectSlug.toUtf8();
-        std::strncpy(node->prop_or_asset_key, slugUtf8.constData(),
-                     sizeof(node->prop_or_asset_key) - 1);
+        std::memset(snapshot.prop_or_asset_key, 0, sizeof(snapshot.prop_or_asset_key));
+        std::strncpy(snapshot.prop_or_asset_key, slugUtf8.constData(),
+                     sizeof(snapshot.prop_or_asset_key) - 1);
     }
     if (!titleOverride.isEmpty()) {
         const QByteArray titleUtf8 = titleOverride.toUtf8();
-        std::strncpy(node->title, titleUtf8.constData(), sizeof(node->title) - 1);
+        std::memset(snapshot.title, 0, sizeof(snapshot.title));
+        std::strncpy(snapshot.title, titleUtf8.constData(), sizeof(snapshot.title) - 1);
     }
     if (defaultConstVal) {
         for (int c = 0; c < 4; ++c) {
-            node->const_val[c] = defaultConstVal[c];
+            snapshot.const_val[c] = std::isfinite(defaultConstVal[c]) ? defaultConstVal[c] : 0.0f;
         }
     }
 
     QPointer<NodeGraphEditorWidget> self(this);
-    auto cmd =
-        std::make_unique<AddNodeCommand>(*node, [self](const waywal_graph_node_t &n, bool isAdd) {
-            if (self) {
-                self->applyNodeMutation(n, isAdd);
-            }
-        });
+    auto cmd = std::make_unique<AddNodeCommand>(snapshot,
+                                                [self](const waywal_graph_node_t &n, bool isAdd) {
+                                                    if (self) {
+                                                        self->applyNodeMutation(n, isAdd);
+                                                    }
+                                                });
     if (m_commandBus) {
         m_commandBus->execute(std::move(cmd));
     } else {
@@ -1151,58 +1253,161 @@ void NodeGraphEditorWidget::removeSelectedNodes()
         }
     }
     std::sort(toRemove.begin(), toRemove.end());
+    if (toRemove.empty()) {
+        return;
+    }
 
+    std::vector<waywal_graph_node_t> removedNodes;
+    std::unordered_set<uint32_t> removedSet;
+    removedNodes.reserve(toRemove.size());
     for (uint32_t nid : toRemove) {
-        waywal_graph_node_t *node = waywal_shader_graph_find_node(m_graph.get(), nid);
-        if (!node) {
-            continue;
+        if (const waywal_graph_node_t *node =
+                waywal_shader_graph_find_node_const(m_graph.get(), nid)) {
+            removedNodes.push_back(*node);
+            removedSet.insert(nid);
+        }
+    }
+    if (removedNodes.empty()) {
+        return;
+    }
+
+    std::vector<waywal_graph_edge_t> detachedEdges;
+    for (uint32_t i = 0; i < m_graph->edge_count; ++i) {
+        const auto &e = m_graph->edges[i];
+        if (removedSet.count(e.src_node_id) || removedSet.count(e.dst_node_id)) {
+            detachedEdges.push_back(e);
+        }
+    }
+
+    class RemoveNodesCompositeCommand final : public ICommand {
+      public:
+        RemoveNodesCompositeCommand(QPointer<NodeGraphEditorWidget> widget,
+                                    std::vector<waywal_graph_node_t> nodes,
+                                    std::vector<waywal_graph_edge_t> edges)
+            : m_widget(std::move(widget)), m_nodes(std::move(nodes)), m_edges(std::move(edges))
+        {
         }
 
-        std::vector<waywal_graph_edge_t> detachedEdges;
-        for (uint32_t i = 0; i < m_graph->edge_count; ++i) {
-            const auto &e = m_graph->edges[i];
-            if (e.src_node_id == nid || e.dst_node_id == nid) {
-                detachedEdges.push_back(e);
+        void execute() override
+        {
+            if (!m_widget) {
+                return;
             }
+            for (const auto &n : m_nodes) {
+                waywal_shader_graph_remove_node(m_widget->m_graph.get(), n.node_id);
+                m_widget->m_nodeThumbnails.remove(n.node_id);
+            }
+            finishMutation();
         }
 
-        QPointer<NodeGraphEditorWidget> self(this);
-        auto cmd = std::make_unique<RemoveNodeCommand>(
-            *node, detachedEdges,
-            [self](const waywal_graph_node_t &n, const std::vector<waywal_graph_edge_t> &edges,
-                   bool isRestore) {
-                if (!self) {
-                    return;
+        void undo() override
+        {
+            if (!m_widget) {
+                return;
+            }
+            for (const auto &n : m_nodes) {
+                if (m_widget->m_graph->node_count < WAYWAL_GRAPH_MAX_NODES &&
+                    !waywal_shader_graph_find_node_const(m_widget->m_graph.get(), n.node_id)) {
+                    m_widget->m_graph->nodes[m_widget->m_graph->node_count++] = n;
                 }
-                if (isRestore) {
-                    if (self->m_graph->node_count < WAYWAL_GRAPH_MAX_NODES) {
-                        self->m_graph->nodes[self->m_graph->node_count++] = n;
-                        for (const auto &e : edges) {
-                            if (self->m_graph->edge_count < WAYWAL_GRAPH_MAX_EDGES) {
-                                self->m_graph->edges[self->m_graph->edge_count++] = e;
-                            }
-                        }
+            }
+            for (const auto &e : m_edges) {
+                bool exists = false;
+                for (uint32_t i = 0; i < m_widget->m_graph->edge_count; ++i) {
+                    if (m_widget->m_graph->edges[i].edge_id == e.edge_id) {
+                        exists = true;
+                        break;
                     }
-                } else {
-                    waywal_shader_graph_remove_node(self->m_graph.get(), n.node_id);
                 }
-                resyncPinConnectedFlags(self->m_graph.get());
-                self->rebuildSceneFromModel();
-                self->validateAndSchedule();
-                emit self->graphModified();
-            });
-
-        if (m_commandBus) {
-            m_commandBus->execute(std::move(cmd));
-        } else {
-            cmd->execute();
+                if (!exists && m_widget->m_graph->edge_count < WAYWAL_GRAPH_MAX_EDGES) {
+                    m_widget->m_graph->edges[m_widget->m_graph->edge_count++] = e;
+                }
+            }
+            finishMutation();
         }
+
+        [[nodiscard]] QString describe() const override
+        {
+            return QStringLiteral("Remove %1 node(s)").arg(m_nodes.size());
+        }
+
+      private:
+        void finishMutation()
+        {
+            resyncPinConnectedFlags(m_widget->m_graph.get());
+            m_widget->rebuildSceneFromModel();
+            m_widget->validateAndSchedule();
+            if (m_widget->m_graph->flags & WAYWAL_GRAPH_FLAG_AUTO_COMPILE) {
+                m_widget->compileToGlslSource();
+            }
+            emit m_widget->graphModified();
+        }
+
+        QPointer<NodeGraphEditorWidget> m_widget;
+        std::vector<waywal_graph_node_t> m_nodes;
+        std::vector<waywal_graph_edge_t> m_edges;
+    };
+
+    auto cmd = std::make_unique<RemoveNodesCompositeCommand>(
+        QPointer<NodeGraphEditorWidget>(this), std::move(removedNodes), std::move(detachedEdges));
+    if (m_commandBus) {
+        m_commandBus->execute(std::move(cmd));
+    } else {
+        cmd->execute();
     }
 }
 
 bool NodeGraphEditorWidget::connectPins(uint32_t srcNodeId, uint32_t srcPinIdx, uint32_t dstNodeId,
                                         uint32_t dstPinIdx)
 {
+    if (srcNodeId == dstNodeId) {
+        emit statusMessage(QStringLiteral("Connection rejected: self-loop not allowed"));
+        return false;
+    }
+
+    const waywal_graph_node_t *src = waywal_shader_graph_find_node_const(m_graph.get(), srcNodeId);
+    const waywal_graph_node_t *dst = waywal_shader_graph_find_node_const(m_graph.get(), dstNodeId);
+    if (!src || !dst) {
+        return false;
+    }
+
+    if (srcPinIdx >= src->output_pin_count || srcPinIdx >= WAYWAL_GRAPH_MAX_PINS_PER_NODE ||
+        dstPinIdx >= dst->input_pin_count || dstPinIdx >= WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
+        emit statusMessage(QStringLiteral("Connection rejected: pin index out of bounds"));
+        return false;
+    }
+
+    const auto &srcPin = src->outputs[srcPinIdx];
+    const auto &dstPin = dst->inputs[dstPinIdx];
+    const bool nonCoercible = ((srcPin.flags | dstPin.flags) & WAYWAL_PIN_FLAG_NON_COERCIBLE) != 0;
+    const bool compat = nonCoercible
+                            ? (srcPin.pin_type == dstPin.pin_type)
+                            : waywal_pin_types_compatible(srcPin.pin_type, dstPin.pin_type);
+    if (!compat) {
+        emit statusMessage(QStringLiteral("Connection rejected: incompatible pin types"));
+        return false;
+    }
+
+    if (waywal_shader_graph_would_create_cycle(m_graph.get(), srcNodeId, dstNodeId)) {
+        m_cycleHighlightSrcNodeId = srcNodeId;
+        m_cycleHighlightDstNodeId = dstNodeId;
+        if (m_scene) {
+            m_scene->update();
+        }
+        QPointer<NodeGraphEditorWidget> self(this);
+        QTimer::singleShot(1200, this, [self]() {
+            if (self) {
+                self->m_cycleHighlightSrcNodeId = 0;
+                self->m_cycleHighlightDstNodeId = 0;
+                if (self->m_scene) {
+                    self->m_scene->update();
+                }
+            }
+        });
+        emit statusMessage(QStringLiteral("Connection rejected: cycle detected"));
+        return false;
+    }
+
     std::optional<waywal_graph_edge_t> replacedEdge;
     for (uint32_t i = 0; i < m_graph->edge_count; ++i) {
         const auto &existing = m_graph->edges[i];
@@ -1212,17 +1417,24 @@ bool NodeGraphEditorWidget::connectPins(uint32_t srcNodeId, uint32_t srcPinIdx, 
         }
     }
 
-    const int32_t edgeId =
-        waywal_shader_graph_connect(m_graph.get(), srcNodeId, srcPinIdx, dstNodeId, dstPinIdx);
-    if (edgeId < 0) {
-        emit statusMessage(QStringLiteral("Connection rejected: cycle detected or type mismatch"));
+    if (!replacedEdge.has_value() && m_graph->edge_count >= WAYWAL_GRAPH_MAX_EDGES) {
+        emit statusMessage(QStringLiteral("Connection rejected: maximum edge count reached"));
         return false;
     }
 
-    const uint32_t eid = static_cast<uint32_t>(edgeId);
-    if (eid >= m_nextEdgeId) {
-        m_nextEdgeId = eid + 1;
+    uint32_t eid = std::max(1u, m_nextEdgeId);
+    auto edgeIdExists = [this](uint32_t candidate) {
+        for (uint32_t i = 0; i < m_graph->edge_count; ++i) {
+            if (m_graph->edges[i].edge_id == candidate) {
+                return true;
+            }
+        }
+        return false;
+    };
+    while (edgeIdExists(eid)) {
+        ++eid;
     }
+    m_nextEdgeId = eid + 1;
 
     waywal_graph_edge_t edge{};
     edge.edge_id = eid;
@@ -1230,12 +1442,6 @@ bool NodeGraphEditorWidget::connectPins(uint32_t srcNodeId, uint32_t srcPinIdx, 
     edge.src_pin_index = srcPinIdx;
     edge.dst_node_id = dstNodeId;
     edge.dst_pin_index = dstPinIdx;
-    for (uint32_t i = 0; i < m_graph->edge_count; ++i) {
-        if (m_graph->edges[i].edge_id == eid) {
-            edge = m_graph->edges[i];
-            break;
-        }
-    }
 
     QPointer<NodeGraphEditorWidget> self(this);
     auto cmd = std::make_unique<ConnectWireCommand>(
@@ -1287,9 +1493,14 @@ void NodeGraphEditorWidget::setNodeConstant(uint32_t nodeId, const std::array<fl
     const std::array<float, 4> oldVal = {node->const_val[0], node->const_val[1], node->const_val[2],
                                          node->const_val[3]};
 
+    std::array<float, 4> safeVal{};
+    for (size_t i = 0; i < 4; ++i) {
+        safeVal[i] = std::isfinite(val[i]) ? val[i] : oldVal[i];
+    }
+
     QPointer<NodeGraphEditorWidget> self(this);
     auto cmd = std::make_unique<SetNodeConstantCommand>(
-        nodeId, QString::fromUtf8(node->title), oldVal, val,
+        nodeId, QString::fromUtf8(node->title), oldVal, safeVal,
         [self](uint32_t nid, const std::array<float, 4> &v) {
             if (!self) {
                 return;
@@ -1300,6 +1511,11 @@ void NodeGraphEditorWidget::setNodeConstant(uint32_t nodeId, const std::array<fl
                 n->const_val[2] = v[2];
                 n->const_val[3] = v[3];
                 emit self->nodeConstantScrubbed(nid, 0, v[0]);
+                self->validateAndSchedule();
+                if (self->m_graph->flags & WAYWAL_GRAPH_FLAG_AUTO_COMPILE) {
+                    self->compileToGlslSource();
+                }
+                emit self->graphModified();
                 self->m_scene->update();
             }
         });
@@ -1493,8 +1709,9 @@ GraphSemanticZoomLod NodeGraphEditorWidget::currentLod() const noexcept
 void NodeGraphEditorWidget::openQuickConnectPopup(const QPointF &scenePos, int32_t fromNodeId,
                                                   int32_t fromPinIdx, bool fromOutput)
 {
-    QDialog popup(this, Qt::Popup);
-    popup.setStyleSheet(QStringLiteral(
+    auto *popup = new QDialog(this, Qt::Popup | Qt::FramelessWindowHint);
+    popup->setAttribute(Qt::WA_DeleteOnClose, true);
+    popup->setStyleSheet(QStringLiteral(
         "QDialog { background: #181B22; border: 1px solid #38BDF8; border-radius: 6px; padding: "
         "4px; }"
         "QLineEdit { background: #12151C; color: #CDD6F4; border: 1px solid #313244; "
@@ -1504,15 +1721,15 @@ void NodeGraphEditorWidget::openQuickConnectPopup(const QPointF &scenePos, int32
         "QListWidget::item { padding: 4px; }"
         "QListWidget::item:selected { background: #38BDF8; color: #0E1117; font-weight: bold; }"));
 
-    auto *layout = new QVBoxLayout(&popup);
+    auto *layout = new QVBoxLayout(popup);
     layout->setContentsMargins(6, 6, 6, 6);
     layout->setSpacing(6);
 
-    auto *searchEdit = new QLineEdit(&popup);
+    auto *searchEdit = new QLineEdit(popup);
     searchEdit->setPlaceholderText(QStringLiteral("Search node or effect..."));
     layout->addWidget(searchEdit);
 
-    auto *listWidget = new QListWidget(&popup);
+    auto *listWidget = new QListWidget(popup);
     layout->addWidget(listWidget);
 
     struct NodeEntry {
@@ -1520,43 +1737,72 @@ void NodeGraphEditorWidget::openQuickConnectPopup(const QPointF &scenePos, int32
         bool isBuiltin;
         uint32_t id;
     };
-    std::vector<NodeEntry> entries;
+    auto entries = std::make_shared<std::vector<NodeEntry>>();
 
-    // Standard Math & Input Opcodes
-    entries.push_back({QStringLiteral("UV Coordinates"), false, WAYWAL_NODE_IN_UV});
-    entries.push_back({QStringLiteral("Time Uniform"), false, WAYWAL_NODE_IN_TIME});
-    entries.push_back({QStringLiteral("Resolution Uniform"), false, WAYWAL_NODE_IN_RESOLUTION});
-    entries.push_back({QStringLiteral("Pointer Coordinates"), false, WAYWAL_NODE_IN_POINTER});
-    entries.push_back({QStringLiteral("Audio FFT Spectrum"), false, WAYWAL_NODE_IN_AUDIO_FFT});
-    entries.push_back({QStringLiteral("Texture2D Asset"), false, WAYWAL_NODE_IN_TEXTURE2D});
-    entries.push_back({QStringLiteral("Previous Frame Buffer"), false, WAYWAL_NODE_IN_PASS_BUFFER});
-    entries.push_back({QStringLiteral("Constant Literal"), false, WAYWAL_NODE_IN_CONSTANT});
-    entries.push_back({QStringLiteral("Math Add"), false, WAYWAL_NODE_MATH_ADD});
-    entries.push_back({QStringLiteral("Math Multiply"), false, WAYWAL_NODE_MATH_MUL});
-    entries.push_back({QStringLiteral("Math Divide"), false, WAYWAL_NODE_MATH_DIV});
-    entries.push_back({QStringLiteral("Math Mix / Lerp"), false, WAYWAL_NODE_MATH_MIX});
-    entries.push_back({QStringLiteral("Math Smoothstep"), false, WAYWAL_NODE_MATH_SMOOTHSTEP});
-    entries.push_back({QStringLiteral("Noise 2D Simplex"), false, WAYWAL_NODE_NOISE_SIMPLEX2D});
-    entries.push_back({QStringLiteral("Noise 2D Curl"), false, WAYWAL_NODE_NOISE_CURL2D});
-    entries.push_back(
-        {QStringLiteral("Color OKLCH to sRGB"), false, WAYWAL_NODE_COLOR_OKLCH_TO_SRGB});
-    entries.push_back(
-        {QStringLiteral("Color sRGB to OKLCH"), false, WAYWAL_NODE_COLOR_SRGB_TO_OKLCH});
-    entries.push_back(
-        {QStringLiteral("Filter Dual Kawase Blur"), false, WAYWAL_NODE_FILTER_DUAL_KAWASE});
+    *entries = {
+        {QStringLiteral("Input: UV Coordinates"), false, WAYWAL_NODE_IN_UV},
+        {QStringLiteral("Input: Time Uniform"), false, WAYWAL_NODE_IN_TIME},
+        {QStringLiteral("Input: Resolution Uniform"), false, WAYWAL_NODE_IN_RESOLUTION},
+        {QStringLiteral("Input: Pointer Coordinates"), false, WAYWAL_NODE_IN_POINTER},
+        {QStringLiteral("Input: Audio FFT Spectrum"), false, WAYWAL_NODE_IN_AUDIO_FFT},
+        {QStringLiteral("Input: Texture2D Asset"), false, WAYWAL_NODE_IN_TEXTURE2D},
+        {QStringLiteral("Input: Previous Frame Buffer"), false, WAYWAL_NODE_IN_PASS_BUFFER},
+        {QStringLiteral("Input: Depth Map"), false, WAYWAL_NODE_IN_DEPTH_MAP},
+        {QStringLiteral("Input: User Property"), false, WAYWAL_NODE_IN_USER_PROP},
+        {QStringLiteral("Input: Constant Literal"), false, WAYWAL_NODE_IN_CONSTANT},
+        {QStringLiteral("Math: Add"), false, WAYWAL_NODE_MATH_ADD},
+        {QStringLiteral("Math: Subtract"), false, WAYWAL_NODE_MATH_SUB},
+        {QStringLiteral("Math: Multiply"), false, WAYWAL_NODE_MATH_MUL},
+        {QStringLiteral("Math: Divide"), false, WAYWAL_NODE_MATH_DIV},
+        {QStringLiteral("Math: FMA"), false, WAYWAL_NODE_MATH_FMA},
+        {QStringLiteral("Math: Mix / Lerp"), false, WAYWAL_NODE_MATH_MIX},
+        {QStringLiteral("Math: Smoothstep"), false, WAYWAL_NODE_MATH_SMOOTHSTEP},
+        {QStringLiteral("Math: Clamp"), false, WAYWAL_NODE_MATH_CLAMP},
+        {QStringLiteral("Math: Sin"), false, WAYWAL_NODE_MATH_SIN},
+        {QStringLiteral("Math: Cos"), false, WAYWAL_NODE_MATH_COS},
+        {QStringLiteral("Math: Pow"), false, WAYWAL_NODE_MATH_POW},
+        {QStringLiteral("Math: Dot"), false, WAYWAL_NODE_MATH_DOT},
+        {QStringLiteral("Math: Cross"), false, WAYWAL_NODE_MATH_CROSS},
+        {QStringLiteral("Math: Normalize"), false, WAYWAL_NODE_MATH_NORMALIZE},
+        {QStringLiteral("Math: Length"), false, WAYWAL_NODE_MATH_LENGTH},
+        {QStringLiteral("Math: Distance"), false, WAYWAL_NODE_MATH_DISTANCE},
+        {QStringLiteral("Math: Fract"), false, WAYWAL_NODE_MATH_FRACT},
+        {QStringLiteral("Math: Floor"), false, WAYWAL_NODE_MATH_FLOOR},
+        {QStringLiteral("Math: Abs"), false, WAYWAL_NODE_MATH_ABS},
+        {QStringLiteral("Vector: Swizzle / Combine"), false, WAYWAL_NODE_VEC_SWIZZLE_COMBINE},
+        {QStringLiteral("Noise: 2D Simplex"), false, WAYWAL_NODE_NOISE_SIMPLEX2D},
+        {QStringLiteral("Noise: 2D Curl"), false, WAYWAL_NODE_NOISE_CURL2D},
+        {QStringLiteral("Noise: 2D Voronoi"), false, WAYWAL_NODE_NOISE_VORONOI2D},
+        {QStringLiteral("Noise: 2D FBM"), false, WAYWAL_NODE_NOISE_FBM2D},
+        {QStringLiteral("SDF: Circle"), false, WAYWAL_NODE_SDF_CIRCLE},
+        {QStringLiteral("SDF: Box"), false, WAYWAL_NODE_SDF_BOX},
+        {QStringLiteral("SDF: Ring"), false, WAYWAL_NODE_SDF_RING},
+        {QStringLiteral("UV: Polar Coordinates"), false, WAYWAL_NODE_UV_POLAR},
+        {QStringLiteral("UV: Twirl"), false, WAYWAL_NODE_UV_TWIRL},
+        {QStringLiteral("UV: Tile"), false, WAYWAL_NODE_UV_TILE},
+        {QStringLiteral("Color: OKLCH to sRGB"), false, WAYWAL_NODE_COLOR_OKLCH_TO_SRGB},
+        {QStringLiteral("Color: sRGB to OKLCH"), false, WAYWAL_NODE_COLOR_SRGB_TO_OKLCH},
+        {QStringLiteral("Color: Hue Shift"), false, WAYWAL_NODE_COLOR_HUE_SHIFT},
+        {QStringLiteral("Color: Contrast & Saturation"), false, WAYWAL_NODE_COLOR_CONTRAST_SAT},
+        {QStringLiteral("Filter: Dual Kawase Blur"), false, WAYWAL_NODE_FILTER_DUAL_KAWASE},
+        {QStringLiteral("Filter: Chromatic Aberration"), false, WAYWAL_NODE_FILTER_CHROMATIC_ABERR},
+        {QStringLiteral("Light: Normal From Height"), false, WAYWAL_NODE_LIGHT_NORMAL_FROM_HEIGHT},
+        {QStringLiteral("Light: Blinn-Phong"), false, WAYWAL_NODE_LIGHT_BLINN_PHONG},
+        {QStringLiteral("Output: Buffer Pass"), false, WAYWAL_NODE_OUT_BUFFER_PASS},
+        {QStringLiteral("Output: Image Pass"), false, WAYWAL_NODE_OUT_IMAGE_PASS},
+    };
 
-    // 50 Clean-room Built-In Effects
     size_t effectCount = 0;
     const we_builtin_effect_desc_t *effects = we_builtin_effects_get_table(&effectCount);
     for (size_t i = 0; i < effectCount; ++i) {
-        entries.push_back(
+        entries->push_back(
             {QStringLiteral("Effect: %1").arg(QString::fromUtf8(effects[i].display_name)), true,
              effects[i].id});
     }
 
-    auto populateList = [&](const QString &filter) {
+    auto populateList = [listWidget, entries](const QString &filter) {
         listWidget->clear();
-        for (const auto &entry : entries) {
+        for (const auto &entry : *entries) {
             if (filter.isEmpty() || entry.title.contains(filter, Qt::CaseInsensitive)) {
                 auto *item = new QListWidgetItem(entry.title, listWidget);
                 item->setData(Qt::UserRole, entry.isBuiltin);
@@ -1570,47 +1816,68 @@ void NodeGraphEditorWidget::openQuickConnectPopup(const QPointF &scenePos, int32
 
     populateList(QString());
 
-    connect(searchEdit, &QLineEdit::textChanged, &popup, populateList);
+    connect(searchEdit, &QLineEdit::textChanged, popup, populateList);
 
-    auto selectCurrent = [&]() {
+    QPointer<NodeGraphEditorWidget> self(this);
+    QPointer<QDialog> popupPtr(popup);
+    auto selectCurrent = [self, popupPtr, listWidget, scenePos, fromNodeId, fromPinIdx,
+                          fromOutput]() {
+        if (!self || !popupPtr) {
+            return;
+        }
         QListWidgetItem *item = listWidget->currentItem();
         if (!item) {
             return;
         }
 
-        bool isBuiltin = item->data(Qt::UserRole).toBool();
-        uint32_t id = item->data(Qt::UserRole + 1).toUInt();
+        const bool isBuiltin = item->data(Qt::UserRole).toBool();
+        const uint32_t id = item->data(Qt::UserRole + 1).toUInt();
 
         uint32_t newId = 0;
         if (isBuiltin) {
-            newId = addBuiltinEffectNode(static_cast<we_builtin_effect_id_t>(id), scenePos);
+            newId = self->addBuiltinEffectNode(static_cast<we_builtin_effect_id_t>(id), scenePos);
         } else {
-            newId = addNode(static_cast<waywal_node_op_t>(id), scenePos);
+            newId = self->addNode(static_cast<waywal_node_op_t>(id), scenePos);
         }
 
-        // Auto-connect first compatible socket
-        if (newId > 0 && fromNodeId >= 0) {
-            const auto &g = graph();
+        if (newId > 0 && fromNodeId >= 0 && fromPinIdx >= 0) {
+            const auto &g = self->graph();
             const auto *fromN =
                 waywal_shader_graph_find_node_const(&g, static_cast<uint32_t>(fromNodeId));
             const auto *toN = waywal_shader_graph_find_node_const(&g, newId);
             if (fromN && toN) {
-                if (fromOutput && fromPinIdx < static_cast<int32_t>(fromN->output_pin_count)) {
-                    uint32_t srcType = fromN->outputs[fromPinIdx].pin_type;
-                    for (uint32_t p = 0; p < toN->input_pin_count; ++p) {
-                        if (waywal_pin_types_compatible(srcType, toN->inputs[p].pin_type)) {
-                            connectPins(static_cast<uint32_t>(fromNodeId),
-                                        static_cast<uint32_t>(fromPinIdx), newId, p);
+                const uint32_t srcIdx = static_cast<uint32_t>(fromPinIdx);
+                if (fromOutput && srcIdx < fromN->output_pin_count &&
+                    srcIdx < WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
+                    const uint32_t srcType = fromN->outputs[srcIdx].pin_type;
+                    const uint32_t srcFlags = fromN->outputs[srcIdx].flags;
+                    const uint32_t dstCount =
+                        std::min<uint32_t>(toN->input_pin_count, WAYWAL_GRAPH_MAX_PINS_PER_NODE);
+                    for (uint32_t p = 0; p < dstCount; ++p) {
+                        const bool nc = ((srcFlags | toN->inputs[p].flags) &
+                                         WAYWAL_PIN_FLAG_NON_COERCIBLE) != 0;
+                        const bool compat =
+                            nc ? (srcType == toN->inputs[p].pin_type)
+                               : waywal_pin_types_compatible(srcType, toN->inputs[p].pin_type);
+                        if (compat) {
+                            self->connectPins(static_cast<uint32_t>(fromNodeId), srcIdx, newId, p);
                             break;
                         }
                     }
-                } else if (!fromOutput &&
-                           fromPinIdx < static_cast<int32_t>(fromN->input_pin_count)) {
-                    uint32_t dstType = fromN->inputs[fromPinIdx].pin_type;
-                    for (uint32_t p = 0; p < toN->output_pin_count; ++p) {
-                        if (waywal_pin_types_compatible(toN->outputs[p].pin_type, dstType)) {
-                            connectPins(newId, p, static_cast<uint32_t>(fromNodeId),
-                                        static_cast<uint32_t>(fromPinIdx));
+                } else if (!fromOutput && srcIdx < fromN->input_pin_count &&
+                           srcIdx < WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
+                    const uint32_t dstType = fromN->inputs[srcIdx].pin_type;
+                    const uint32_t dstFlags = fromN->inputs[srcIdx].flags;
+                    const uint32_t srcCount =
+                        std::min<uint32_t>(toN->output_pin_count, WAYWAL_GRAPH_MAX_PINS_PER_NODE);
+                    for (uint32_t p = 0; p < srcCount; ++p) {
+                        const bool nc = ((dstFlags | toN->outputs[p].flags) &
+                                         WAYWAL_PIN_FLAG_NON_COERCIBLE) != 0;
+                        const bool compat =
+                            nc ? (toN->outputs[p].pin_type == dstType)
+                               : waywal_pin_types_compatible(toN->outputs[p].pin_type, dstType);
+                        if (compat) {
+                            self->connectPins(newId, p, static_cast<uint32_t>(fromNodeId), srcIdx);
                             break;
                         }
                     }
@@ -1618,17 +1885,38 @@ void NodeGraphEditorWidget::openQuickConnectPopup(const QPointF &scenePos, int32
             }
         }
 
-        popup.accept();
+        popupPtr->close();
     };
 
-    connect(searchEdit, &QLineEdit::returnPressed, &popup, selectCurrent);
-    connect(listWidget, &QListWidget::itemDoubleClicked, &popup, selectCurrent);
+    connect(searchEdit, &QLineEdit::returnPressed, popup, selectCurrent);
+    connect(listWidget, &QListWidget::itemDoubleClicked, popup, selectCurrent);
 
+    constexpr int popupW = 260;
+    constexpr int popupH = 300;
     QPoint globalPos = m_view->mapToGlobal(m_view->mapFromScene(scenePos));
-    popup.move(globalPos);
-    popup.resize(260, 300);
+    const QScreen *screen = QGuiApplication::screenAt(globalPos);
+    if (!screen) {
+        screen = QGuiApplication::primaryScreen();
+    }
+    if (screen) {
+        const QRect avail = screen->availableGeometry();
+        globalPos.setX(std::clamp(globalPos.x(), avail.left(),
+                                  std::max(avail.left(), avail.right() - popupW)));
+        globalPos.setY(
+            std::clamp(globalPos.y(), avail.top(), std::max(avail.top(), avail.bottom() - popupH)));
+    }
+    popup->resize(popupW, popupH);
+    popup->move(globalPos);
+    popup->show();
     searchEdit->setFocus();
-    popup.exec();
+}
+
+bool NodeGraphEditorWidget::focusNextPrevChild(bool next)
+{
+    if (hasFocus() || (m_view && m_view->hasFocus())) {
+        return false;
+    }
+    return QWidget::focusNextPrevChild(next);
 }
 
 void NodeGraphEditorWidget::keyPressEvent(QKeyEvent *event)
@@ -1685,25 +1973,78 @@ void NodeGraphEditorWidget::dragMoveEvent(QDragMoveEvent *event)
 
 void NodeGraphEditorWidget::dropEvent(QDropEvent *event)
 {
-    if (event->mimeData()->hasFormat(QStringLiteral("application/x-waywal-effect-id"))) {
-        QByteArray data = event->mimeData()->data(QStringLiteral("application/x-waywal-effect-id"));
+    const QMimeData *mime = event->mimeData();
+    if (!mime) {
+        return;
+    }
+
+    const QPoint viewPos = m_view->viewport()->mapFrom(this, event->position().toPoint());
+    const QPointF scenePos = m_view->mapToScene(viewPos);
+
+    if (mime->hasFormat(QStringLiteral("application/x-waywal-effect-id"))) {
+        const QByteArray data = mime->data(QStringLiteral("application/x-waywal-effect-id"));
         bool ok = false;
         uint32_t effectId = 0;
-        QString text = QString::fromUtf8(data);
-        int colonIdx = text.indexOf(QLatin1Char(':'));
+        const QString text = QString::fromUtf8(data);
+        const int colonIdx = text.indexOf(QLatin1Char(':'));
         if (colonIdx >= 0) {
             effectId = text.left(colonIdx).toUInt(&ok);
         } else {
             effectId = text.toUInt(&ok);
         }
         if (!ok && data.size() >= static_cast<int>(sizeof(uint32_t))) {
-            effectId = *reinterpret_cast<const uint32_t *>(data.constData());
-            ok = true;
+            std::memcpy(&effectId, data.constData(), sizeof(effectId));
+            ok = (we_builtin_effect_get_by_id(static_cast<we_builtin_effect_id_t>(effectId)) !=
+                  nullptr);
         }
-        if (ok) {
-            QPoint viewPos = m_view->viewport()->mapFrom(this, event->position().toPoint());
-            QPointF scenePos = m_view->mapToScene(viewPos);
-            addBuiltinEffectNode(static_cast<we_builtin_effect_id_t>(effectId), scenePos);
+        if (ok &&
+            addBuiltinEffectNode(static_cast<we_builtin_effect_id_t>(effectId), scenePos) > 0) {
+            event->acceptProposedAction();
+            return;
+        }
+    }
+
+    if (mime->hasUrls()) {
+        for (const QUrl &url : mime->urls()) {
+            if (!url.isLocalFile()) {
+                continue;
+            }
+            const QString localPath = url.toLocalFile();
+            if (localPath.endsWith(QStringLiteral(".wwgraph"), Qt::CaseInsensitive) ||
+                localPath.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive)) {
+                if (loadGraphFromFile(localPath)) {
+                    event->acceptProposedAction();
+                    return;
+                }
+            }
+        }
+    }
+
+    if (mime->hasText()) {
+        const QString txt = mime->text().trimmed();
+        bool ok = false;
+        uint32_t effectId = 0;
+        const int colonIdx = txt.indexOf(QLatin1Char(':'));
+        if (colonIdx >= 0) {
+            effectId = txt.left(colonIdx).toUInt(&ok);
+        } else {
+            effectId = txt.toUInt(&ok);
+        }
+        if (!ok || !we_builtin_effect_get_by_id(static_cast<we_builtin_effect_id_t>(effectId))) {
+            size_t count = 0;
+            const we_builtin_effect_desc_t *table = we_builtin_effects_get_table(&count);
+            for (size_t i = 0; i < count; ++i) {
+                if (txt.compare(QString::fromUtf8(table[i].slug), Qt::CaseInsensitive) == 0 ||
+                    txt.compare(QString::fromUtf8(table[i].display_name), Qt::CaseInsensitive) ==
+                        0) {
+                    effectId = table[i].id;
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        if (ok &&
+            addBuiltinEffectNode(static_cast<we_builtin_effect_id_t>(effectId), scenePos) > 0) {
             event->acceptProposedAction();
             return;
         }
@@ -1758,6 +2099,7 @@ void NodeGraphEditorWidget::updateWiresFromLiveItemPositions()
 void NodeGraphEditorWidget::applySearchFilter(const QString &query)
 {
     const QString trimmed = query.trimmed();
+    std::unordered_set<uint32_t> matchedNodes;
     for (const auto &[nid, item] : m_nodeItems) {
         if (!item) {
             continue;
@@ -1774,7 +2116,22 @@ void NodeGraphEditorWidget::applySearchFilter(const QString &query)
                 QString::fromUtf8(node->prop_or_asset_key).contains(trimmed, Qt::CaseInsensitive) ||
                 QString::fromUtf8(node->custom_label).contains(trimmed, Qt::CaseInsensitive);
         }
+        if (matches) {
+            matchedNodes.insert(nid);
+        }
         item->setOpacity(matches ? 1.0 : 0.25);
+    }
+    for (WireItem *wire : m_wireItems) {
+        if (!wire) {
+            continue;
+        }
+        if (trimmed.isEmpty()) {
+            wire->setOpacity(1.0);
+        } else {
+            const bool touchesMatch = matchedNodes.count(wire->srcNodeId()) > 0 ||
+                                      matchedNodes.count(wire->dstNodeId()) > 0;
+            wire->setOpacity(touchesMatch ? 1.0 : 0.18);
+        }
     }
     m_scene->update();
 }
@@ -1795,12 +2152,13 @@ void NodeGraphEditorWidget::applyNodeMutation(const waywal_graph_node_t &node, b
         }
     } else {
         waywal_shader_graph_remove_node(m_graph.get(), node.node_id);
+        m_nodeThumbnails.remove(node.node_id);
     }
 
     resyncPinConnectedFlags(m_graph.get());
     rebuildSceneFromModel();
     validateAndSchedule();
-    if (isAdd && (m_graph->flags & WAYWAL_GRAPH_FLAG_AUTO_COMPILE)) {
+    if (m_graph->flags & WAYWAL_GRAPH_FLAG_AUTO_COMPILE) {
         compileToGlslSource();
     }
     emit graphModified();
@@ -1838,7 +2196,7 @@ void NodeGraphEditorWidget::applyWireMutation(const waywal_graph_edge_t &edge, b
     resyncPinConnectedFlags(m_graph.get());
     rebuildSceneFromModel();
     validateAndSchedule();
-    if (isConnect && (m_graph->flags & WAYWAL_GRAPH_FLAG_AUTO_COMPILE)) {
+    if (m_graph->flags & WAYWAL_GRAPH_FLAG_AUTO_COMPILE) {
         compileToGlslSource();
     }
     emit graphModified();

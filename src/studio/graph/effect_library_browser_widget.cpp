@@ -8,6 +8,7 @@
 #include <QFont>
 #include <QFontMetrics>
 #include <QHBoxLayout>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -19,13 +20,17 @@
 #include <QPixmap>
 #include <QPixmapCache>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QStyle>
 #include <QStyleOptionViewItem>
 #include <QStyledItemDelegate>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <vector>
 
 namespace waywal::studio {
@@ -75,10 +80,13 @@ static inline QString getCategoryName(uint32_t category)
     }
 }
 
-static QPixmap generateProceduralIcon(uint32_t category, int size = 28)
+static QPixmap generateProceduralIcon(uint32_t category, int size = 28, qreal dpr = 1.0)
 {
-    QPixmap pm(size, size);
+    const qreal safeDpr = std::clamp(dpr, 1.0, 4.0);
+    const int pxSize = std::max(1, static_cast<int>(std::ceil(static_cast<qreal>(size) * safeDpr)));
+    QPixmap pm(pxSize, pxSize);
     pm.fill(Qt::transparent);
+    pm.setDevicePixelRatio(safeDpr);
     QPainter p(&pm);
     p.setRenderHint(QPainter::Antialiasing);
 
@@ -184,12 +192,13 @@ static QPixmap generateProceduralIcon(uint32_t category, int size = 28)
     return pm;
 }
 
-static QPixmap cachedProceduralIcon(uint32_t category, int size = 28)
+static QPixmap cachedProceduralIcon(uint32_t category, int size = 28, qreal dpr = 1.0)
 {
-    const QString key = QStringLiteral("wwal_eff_cat_%1_%2").arg(category).arg(size);
+    const int dprKey = static_cast<int>(std::lround(std::clamp(dpr, 1.0, 4.0) * 100.0));
+    const QString key = QStringLiteral("wwal_eff_cat_%1_%2_%3").arg(category).arg(size).arg(dprKey);
     QPixmap pm;
     if (!QPixmapCache::find(key, &pm)) {
-        pm = generateProceduralIcon(category, size);
+        pm = generateProceduralIcon(category, size, dpr);
         QPixmapCache::insert(key, pm);
     }
     return pm;
@@ -209,6 +218,7 @@ class EffectCardDelegate : public QStyledItemDelegate {
 
         const bool isSelected = (option.state & QStyle::State_Selected);
         const bool isHovered = (option.state & QStyle::State_MouseOver);
+        const bool hasFocus = (option.state & QStyle::State_HasFocus);
 
         const uint32_t category = index.data(RoleCategory).toUInt();
         const QString displayName = index.data(RoleDisplayName).toString();
@@ -222,7 +232,7 @@ class EffectCardDelegate : public QStyledItemDelegate {
         // 1. Background fill & border
         if (isSelected) {
             painter->setBrush(QColor(30, 41, 59, 240));       // #1E293B
-            painter->setPen(QPen(QColor(56, 189, 248), 1.5)); // #38BDF8 focus ring
+            painter->setPen(QPen(QColor(56, 189, 248), 1.5)); // #38BDF8
         } else if (isHovered) {
             painter->setBrush(QColor(24, 30, 42, 240));
             painter->setPen(QPen(QColor(56, 189, 248, 120), 1.0));
@@ -232,21 +242,34 @@ class EffectCardDelegate : public QStyledItemDelegate {
         }
         painter->drawRoundedRect(r, 6.0, 6.0);
 
+        if (hasFocus) {
+            QPen focusPen(QColor(125, 211, 252, 220), 1.25, Qt::DotLine);
+            painter->setPen(focusPen);
+            painter->setBrush(Qt::NoBrush);
+            painter->drawRoundedRect(r.adjusted(2, 2, -2, -2), 5.0, 5.0);
+        }
+
         // 2. Left category vertical accent bar
         QRectF accentRect(r.left() + 2.0, r.top() + 6.0, 3.5, r.height() - 12.0);
         painter->setBrush(catColor);
         painter->setPen(Qt::NoPen);
         painter->drawRoundedRect(accentRect, 1.5, 1.5);
 
-        // 3. Category icon (26x26)
+        // 3. Category icon (26x26 HiDPI DPR aware)
         const int iconSize = 26;
         const int iconX = r.left() + 11;
         const int iconY = r.top() + (r.height() - iconSize) / 2;
-        QPixmap iconPm = cachedProceduralIcon(category, iconSize);
-        painter->drawPixmap(iconX, iconY, iconPm);
+        const qreal dpr = option.widget ? option.widget->devicePixelRatioF()
+                                        : painter->device()->devicePixelRatioF();
+        QPixmap iconPm = cachedProceduralIcon(category, iconSize, dpr);
+        painter->drawPixmap(QRect(iconX, iconY, iconSize, iconSize), iconPm);
 
-        // 4. Badges (right side)
-        // ALU badge
+        // 4. Right-aligned badges constrained to preserve readable title/slug columns on narrow
+        // docks.
+        const int textLeft = iconX + iconSize + 10;
+        const int minTitleWidth = 72;
+        const int minPillLeft = textLeft + minTitleWidth + 8;
+
         const QString aluText = QString::asprintf("%u ALU", aluOps);
         QFont badgeFont = painter->font();
         badgeFont.setPixelSize(10);
@@ -258,95 +281,100 @@ class EffectCardDelegate : public QStyledItemDelegate {
         const int aluH = 16;
         const int aluX = r.right() - 8 - aluW;
         const int aluY = r.top() + 8;
-        const QRect aluRect(aluX, aluY, aluW, aluH);
+        int topRowRightX = r.right() - 8;
+        if (aluX >= minPillLeft) {
+            const QRect aluRect(aluX, aluY, aluW, aluH);
 
-        QColor aluColor;
-        if (aluOps < 50) {
-            aluColor = QColor(52, 211, 153); // #34D399 (Green)
-        } else if (aluOps <= 150) {
-            aluColor = QColor(251, 191, 36); // #FBBF24 (Amber)
-        } else {
-            aluColor = QColor(248, 113, 113); // #F87171 (Red)
+            QColor aluColor;
+            if (aluOps < 50) {
+                aluColor = QColor(52, 211, 153);
+            } else if (aluOps <= 150) {
+                aluColor = QColor(251, 191, 36);
+            } else {
+                aluColor = QColor(248, 113, 113);
+            }
+
+            painter->setBrush(QColor(30, 41, 59));
+            painter->setPen(QPen(aluColor.darker(120), 1.0));
+            painter->drawRoundedRect(aluRect, 4.0, 4.0);
+
+            painter->setPen(aluColor);
+            painter->drawText(aluRect, Qt::AlignCenter, aluText);
+            topRowRightX = aluX - 8;
         }
 
-        painter->setBrush(QColor(30, 41, 59));
-        painter->setPen(QPen(aluColor.darker(120), 1.0));
-        painter->drawRoundedRect(aluRect, 4.0, 4.0);
-
-        painter->setPen(aluColor);
-        painter->drawText(aluRect, Qt::AlignCenter, aluText);
-
-        // Passes badge & Flag pills
         const QString passText = (passCount == 1) ? QStringLiteral("1 Pass")
                                                   : QStringLiteral("%1 Passes").arg(passCount);
         const int passW = fmBadge.horizontalAdvance(passText) + 8;
         const int passH = 15;
         const int passX = r.right() - 8 - passW;
         const int passY = r.top() + 28;
-        const QRect passRect(passX, passY, passW, passH);
+        int bottomRowRightX = r.right() - 8;
+        if (passX >= minPillLeft) {
+            const QRect passRect(passX, passY, passW, passH);
 
-        painter->setBrush(QColor(24, 28, 38));
-        painter->setPen(QPen(QColor(167, 139, 250, 160), 1.0)); // Violet
-        painter->drawRoundedRect(passRect, 3.5, 3.5);
+            painter->setBrush(QColor(24, 28, 38));
+            painter->setPen(QPen(QColor(167, 139, 250, 160), 1.0));
+            painter->drawRoundedRect(passRect, 3.5, 3.5);
 
-        painter->setPen(QColor(196, 181, 253));
-        painter->drawText(passRect, Qt::AlignCenter, passText);
+            painter->setPen(QColor(196, 181, 253));
+            painter->drawText(passRect, Qt::AlignCenter, passText);
 
-        int currentRightX = passX - 4;
+            bottomRowRightX = passX - 4;
 
-        // Capability flag badges (FBO, DEPTH, AUDIO, MOUSE)
-        auto drawFlagBadge = [&](const QString &label, const QColor &color) {
-            const int fw = fmBadge.horizontalAdvance(label) + 6;
-            const int fx = currentRightX - fw;
-            const QRect fRect(fx, passY, fw, passH);
-            painter->setBrush(QColor(color.red(), color.green(), color.blue(), 35));
-            painter->setPen(QPen(color, 0.8));
-            painter->drawRoundedRect(fRect, 3.0, 3.0);
-            painter->setPen(color);
-            painter->drawText(fRect, Qt::AlignCenter, label);
-            currentRightX = fx - 4;
-        };
+            auto drawFlagBadge = [&](const QString &label, const QColor &color) {
+                const int fw = fmBadge.horizontalAdvance(label) + 6;
+                const int fx = bottomRowRightX - fw;
+                if (fx < minPillLeft) {
+                    return;
+                }
+                const QRect fRect(fx, passY, fw, passH);
+                painter->setBrush(QColor(color.red(), color.green(), color.blue(), 35));
+                painter->setPen(QPen(color, 0.8));
+                painter->drawRoundedRect(fRect, 3.0, 3.0);
+                painter->setPen(color);
+                painter->drawText(fRect, Qt::AlignCenter, label);
+                bottomRowRightX = fx - 4;
+            };
 
-        if (flags & WE_EFFECT_FLAG_MULTIPASS_FBO) {
-            drawFlagBadge(QStringLiteral("FBO"), QColor(192, 132, 252));
+            if (flags & WE_EFFECT_FLAG_MULTIPASS_FBO) {
+                drawFlagBadge(QStringLiteral("FBO"), QColor(192, 132, 252));
+            }
+            if (flags & WE_EFFECT_FLAG_NEEDS_DEPTH) {
+                drawFlagBadge(QStringLiteral("DEPTH"), QColor(96, 165, 250));
+            }
+            if (flags & WE_EFFECT_FLAG_NEEDS_AUDIO) {
+                drawFlagBadge(QStringLiteral("AUDIO"), QColor(244, 114, 182));
+            }
+            if (flags & WE_EFFECT_FLAG_NEEDS_CURSOR) {
+                drawFlagBadge(QStringLiteral("MOUSE"), QColor(251, 146, 60));
+            }
+            bottomRowRightX -= 4;
         }
-        if (flags & WE_EFFECT_FLAG_NEEDS_DEPTH) {
-            drawFlagBadge(QStringLiteral("DEPTH"), QColor(96, 165, 250));
-        }
-        if (flags & WE_EFFECT_FLAG_NEEDS_AUDIO) {
-            drawFlagBadge(QStringLiteral("AUDIO"), QColor(244, 114, 182));
-        }
-        if (flags & WE_EFFECT_FLAG_NEEDS_CURSOR) {
-            drawFlagBadge(QStringLiteral("MOUSE"), QColor(251, 146, 60));
-        }
 
-        // 5. Title & Slug text
-        const int textLeft = iconX + iconSize + 10;
-        const int textRight = std::min(aluX - 8, currentRightX - 8);
-        const int maxTextW = std::max(60, textRight - textLeft);
+        const int maxTitleW = std::max(40, topRowRightX - textLeft);
+        const int maxSlugW = std::max(40, bottomRowRightX - textLeft);
 
-        // Title
         QFont titleFont = painter->font();
         titleFont.setPixelSize(12);
         titleFont.setBold(true);
         painter->setFont(titleFont);
         QFontMetrics fmTitle(titleFont);
-        const QString elidedTitle = fmTitle.elidedText(displayName, Qt::ElideRight, maxTextW);
+        const QString elidedTitle = fmTitle.elidedText(displayName, Qt::ElideRight, maxTitleW);
 
         painter->setPen(isSelected ? QColor(255, 255, 255) : QColor(241, 245, 249));
-        painter->drawText(QRect(textLeft, r.top() + 8, maxTextW, 18),
+        painter->drawText(QRect(textLeft, r.top() + 8, maxTitleW, 18),
                           Qt::AlignLeft | Qt::AlignVCenter, elidedTitle);
 
-        // Slug
         QFont slugFont = painter->font();
         slugFont.setPixelSize(10);
         slugFont.setBold(false);
         painter->setFont(slugFont);
         QFontMetrics fmSlug(slugFont);
-        const QString elidedSlug = fmSlug.elidedText(slug, Qt::ElideRight, maxTextW);
+        const QString elidedSlug = fmSlug.elidedText(slug, Qt::ElideRight, maxSlugW);
 
         painter->setPen(QColor(148, 163, 184));
-        painter->drawText(QRect(textLeft, r.top() + 27, maxTextW, 16),
+        painter->drawText(QRect(textLeft, r.top() + 27, maxSlugW, 16),
                           Qt::AlignLeft | Qt::AlignVCenter, elidedSlug);
 
         painter->restore();
@@ -361,9 +389,12 @@ class EffectCardDelegate : public QStyledItemDelegate {
 
 class EffectListWidget : public QListWidget {
   public:
-    explicit EffectListWidget(QWidget *parent = nullptr) : QListWidget(parent)
+    explicit EffectListWidget(std::function<void()> onActivate = {}, QWidget *parent = nullptr)
+        : QListWidget(parent), m_onActivate(std::move(onActivate))
     {
         setDragEnabled(true);
+        setDragDropMode(QAbstractItemView::DragOnly);
+        setFocusPolicy(Qt::StrongFocus);
         setViewMode(QListView::ListMode);
         setSelectionMode(QAbstractItemView::SingleSelection);
         setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
@@ -377,8 +408,17 @@ class EffectListWidget : public QListWidget {
     {
         if (event->button() == Qt::LeftButton) {
             m_dragStartPos = event->pos();
+            m_dragTriggeredForPress = false;
         }
         QListWidget::mousePressEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton) {
+            m_dragTriggeredForPress = false;
+        }
+        QListWidget::mouseReleaseEvent(event);
     }
 
     void mouseMoveEvent(QMouseEvent *event) override
@@ -388,8 +428,12 @@ class EffectListWidget : public QListWidget {
             return;
         }
 
+        // Prevent re-entering QDrag::exec after Esc cancels a drag within the same press.
+        if (m_dragTriggeredForPress || m_dragRunning) {
+            return;
+        }
+
         if ((event->pos() - m_dragStartPos).manhattanLength() < QApplication::startDragDistance()) {
-            QListWidget::mouseMoveEvent(event);
             return;
         }
 
@@ -397,8 +441,7 @@ class EffectListWidget : public QListWidget {
         if (!item) {
             item = currentItem();
         }
-        if (!item) {
-            QListWidget::mouseMoveEvent(event);
+        if (!item || item->isHidden()) {
             return;
         }
 
@@ -407,15 +450,32 @@ class EffectListWidget : public QListWidget {
 
     void startDrag(Qt::DropActions supportedActions) override
     {
+        if (m_dragTriggeredForPress || m_dragRunning) {
+            return;
+        }
         QListWidgetItem *item = currentItem();
-        if (item) {
+        if (item && !item->isHidden()) {
             executeDrag(item, supportedActions);
         }
+    }
+
+    void keyPressEvent(QKeyEvent *event) override
+    {
+        if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+            if (m_onActivate && currentItem() && !currentItem()->isHidden()) {
+                m_onActivate();
+                return;
+            }
+        }
+        QListWidget::keyPressEvent(event);
     }
 
   private:
     void executeDrag(QListWidgetItem *item, Qt::DropActions supportedActions = Qt::CopyAction)
     {
+        m_dragTriggeredForPress = true;
+        m_dragRunning = true;
+
         const uint32_t effectId = item->data(RoleEffectId).toUInt();
         const QString slug = item->data(RoleSlug).toString();
         const QString displayName = item->data(RoleDisplayName).toString();
@@ -428,7 +488,7 @@ class EffectListWidget : public QListWidget {
         const QByteArray payloadBytes = payload.toUtf8();
         mime->setData(QStringLiteral("application/x-waywal-effect-id"), payloadBytes);
 
-        // 2. Auxiliary formats for maximum interoperability
+        // Auxiliary formats for maximum interoperability
         mime->setText(payload);
         mime->setData(QStringLiteral("application/x-waywal-effect-slug"), slug.toUtf8());
         mime->setData(QStringLiteral("application/x-waywal-effect-id-raw"),
@@ -443,11 +503,13 @@ class EffectListWidget : public QListWidget {
 
         drag->setMimeData(mime);
 
-        // Visual drag pixmap card
+        const qreal dpr = std::clamp(devicePixelRatioF(), 1.0, 4.0);
         const int dragW = 210;
         const int dragH = 38;
-        QPixmap dragPixmap(dragW, dragH);
+        QPixmap dragPixmap(static_cast<int>(std::ceil(dragW * dpr)),
+                           static_cast<int>(std::ceil(dragH * dpr)));
         dragPixmap.fill(Qt::transparent);
+        dragPixmap.setDevicePixelRatio(dpr);
         {
             QPainter p(&dragPixmap);
             p.setRenderHint(QPainter::Antialiasing);
@@ -461,8 +523,8 @@ class EffectListWidget : public QListWidget {
             p.setPen(Qt::NoPen);
             p.drawRoundedRect(QRectF(3, 4, 3.5, dragH - 8), 1.5, 1.5);
 
-            QPixmap iconPm = cachedProceduralIcon(category, 22);
-            p.drawPixmap(10, (dragH - 22) / 2, iconPm);
+            QPixmap iconPm = cachedProceduralIcon(category, 22, dpr);
+            p.drawPixmap(QRect(10, (dragH - 22) / 2, 22, 22), iconPm);
 
             QFont font = p.font();
             font.setPixelSize(11);
@@ -482,9 +544,13 @@ class EffectListWidget : public QListWidget {
         drag->setHotSpot(QPoint(dragW / 2, dragH / 2));
 
         drag->exec(supportedActions, Qt::CopyAction);
+        m_dragRunning = false;
     }
 
+    std::function<void()> m_onActivate;
     QPoint m_dragStartPos;
+    bool m_dragTriggeredForPress{false};
+    bool m_dragRunning{false};
 };
 
 } // namespace
@@ -510,28 +576,28 @@ void EffectLibraryBrowserWidget::setupUi()
             &EffectLibraryBrowserWidget::onSearchTextChanged);
     rootLayout->addWidget(m_searchEdit);
 
-    // 2. Category Filter Combo
+    // 2. Category Filter Combo (counts populated dynamically from the C effect table)
     m_categoryCombo = new QComboBox(this);
-    m_categoryCombo->addItem(QStringLiteral("All Categories (50)"));
-    m_categoryCombo->addItem(QStringLiteral("Motion & Distortion (16)"));
-    m_categoryCombo->addItem(QStringLiteral("Lighting & Post (16)"));
-    m_categoryCombo->addItem(QStringLiteral("Color & Atmosphere (12)"));
-    m_categoryCombo->addItem(QStringLiteral("Particles & Trails (6)"));
+    m_categoryCombo->addItem(QStringLiteral("All Categories"), -1);
     connect(m_categoryCombo, &QComboBox::currentIndexChanged, this,
             &EffectLibraryBrowserWidget::onCategoryComboChanged);
     rootLayout->addWidget(m_categoryCombo);
 
     // 3. Card List View
-    m_listWidget = new EffectListWidget(this);
+    m_listWidget = new EffectListWidget([this]() { onAddToGraphClicked(); }, this);
     connect(m_listWidget, &QListWidget::itemDoubleClicked, this,
             &EffectLibraryBrowserWidget::onItemDoubleClicked);
-    connect(m_listWidget, &QListWidget::itemSelectionChanged, this, [this]() {
+    auto syncSelectionButtons = [this]() {
         const bool hasSelection = (selectedEffectId() != WE_EFFECT_NONE);
         if (m_btnAddToGraph)
             m_btnAddToGraph->setEnabled(hasSelection);
         if (m_btnApplyToScene)
             m_btnApplyToScene->setEnabled(hasSelection);
-    });
+    };
+    connect(m_listWidget, &QListWidget::itemSelectionChanged, this, syncSelectionButtons);
+    connect(
+        m_listWidget, &QListWidget::currentItemChanged, this,
+        [syncSelectionButtons](QListWidgetItem *, QListWidgetItem *) { syncSelectionButtons(); });
     rootLayout->addWidget(m_listWidget, 1);
 
     // 4. Action Buttons Bar
@@ -657,6 +723,8 @@ void EffectLibraryBrowserWidget::populateEffectList()
         count = WE_BUILTIN_EFFECT_COUNT;
     }
 
+    size_t loadedCount = 0;
+    std::map<uint32_t, size_t> categoryCounts;
     for (size_t i = 0; i < count; ++i) {
         const we_builtin_effect_desc_t *desc = nullptr;
         if (table && i < count) {
@@ -667,6 +735,8 @@ void EffectLibraryBrowserWidget::populateEffectList()
 
         if (!desc)
             continue;
+        ++loadedCount;
+        ++categoryCounts[desc->category];
 
         auto *item = new QListWidgetItem(m_listWidget);
         item->setData(RoleEffectId, desc->id);
@@ -713,6 +783,24 @@ void EffectLibraryBrowserWidget::populateEffectList()
         item->setToolTip(tip);
     }
 
+    if (m_searchEdit) {
+        m_searchEdit->setPlaceholderText(
+            QStringLiteral("Search %1 built-in effects... (e.g. water, bloom)").arg(loadedCount));
+    }
+
+    if (m_categoryCombo) {
+        const QSignalBlocker blocker(m_categoryCombo);
+        m_categoryCombo->clear();
+        m_categoryCombo->addItem(QStringLiteral("All Categories (%1)").arg(loadedCount), -1);
+        for (const auto &[catId, catCount] : categoryCounts) {
+            m_categoryCombo->addItem(
+                QStringLiteral("%1 (%2)").arg(getCategoryName(catId)).arg(catCount),
+                static_cast<int>(catId));
+        }
+        const int targetIdx = m_categoryCombo->findData(m_currentCategory);
+        m_categoryCombo->setCurrentIndex(targetIdx >= 0 ? targetIdx : 0);
+    }
+
     applyFilter();
 }
 
@@ -731,8 +819,9 @@ void EffectLibraryBrowserWidget::setCategoryFilter(int32_t categoryOrNegativeOne
 {
     m_currentCategory = categoryOrNegativeOneForAll;
     int comboIndex = 0;
-    if (categoryOrNegativeOneForAll >= 0 && categoryOrNegativeOneForAll <= 3) {
-        comboIndex = categoryOrNegativeOneForAll + 1;
+    if (m_categoryCombo) {
+        const int found = m_categoryCombo->findData(categoryOrNegativeOneForAll);
+        comboIndex = (found >= 0) ? found : 0;
     }
     if (m_categoryCombo && m_categoryCombo->currentIndex() != comboIndex) {
         m_categoryCombo->blockSignals(true);
@@ -774,10 +863,10 @@ void EffectLibraryBrowserWidget::onSearchTextChanged(const QString &text)
 
 void EffectLibraryBrowserWidget::onCategoryComboChanged(int index)
 {
-    if (index <= 0) {
-        m_currentCategory = -1;
+    if (m_categoryCombo && index >= 0 && index < m_categoryCombo->count()) {
+        m_currentCategory = m_categoryCombo->itemData(index).toInt();
     } else {
-        m_currentCategory = index - 1;
+        m_currentCategory = -1;
     }
     applyFilter();
 }
@@ -849,16 +938,18 @@ void EffectLibraryBrowserWidget::applyFilter()
         item->setHidden(!(matchCat && matchText));
     }
 
-    // Ensure valid selection if current selection became hidden
+    // Keep a valid visible selection, or clear selection cleanly on zero matches.
     QListWidgetItem *cur = m_listWidget->currentItem();
     if (!cur || cur->isHidden()) {
+        QListWidgetItem *firstVisible = nullptr;
         for (int i = 0; i < m_listWidget->count(); ++i) {
             QListWidgetItem *it = m_listWidget->item(i);
-            if (!it->isHidden()) {
-                m_listWidget->setCurrentItem(it);
+            if (it && !it->isHidden()) {
+                firstVisible = it;
                 break;
             }
         }
+        m_listWidget->setCurrentItem(firstVisible);
     }
 
     const bool hasSelection = (selectedEffectId() != WE_EFFECT_NONE);

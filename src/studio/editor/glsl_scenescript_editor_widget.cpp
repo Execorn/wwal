@@ -13,16 +13,20 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeyEvent>
+#include <QKeySequence>
 #include <QMetaObject>
 #include <QMouseEvent>
 #include <QOpenGLFunctions>
 #include <QPainter>
 #include <QPaintEvent>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QResizeEvent>
 #include <QScopedValueRollback>
 #include <QScrollBar>
 #include <QShowEvent>
+#include <QSignalBlocker>
 #include <QSurfaceFormat>
 #include <QTextBlock>
 #include <QTextCursor>
@@ -166,35 +170,20 @@ static_assert(std::ranges::is_sorted(kJsBuiltins));
 
 [[nodiscard]] bool matchesSortedWord(QStringView word, const auto &table) noexcept
 {
-    QByteArray utf8 = word.toUtf8();
-    const std::string_view sv(utf8.constData(), static_cast<size_t>(utf8.size()));
+    const qsizetype wlen = word.size();
+    if (wlen <= 0 || wlen > 32) {
+        return false;
+    }
+    char asciiBuf[32];
+    for (qsizetype k = 0; k < wlen; ++k) {
+        const char16_t u = word[k].unicode();
+        if (u > 127) {
+            return false;
+        }
+        asciiBuf[k] = static_cast<char>(u);
+    }
+    const std::string_view sv(asciiBuf, static_cast<size_t>(wlen));
     return std::ranges::binary_search(table, sv);
-}
-
-template <typename Client = IpcClient>
-void dispatchHotReloadCodeIpc(Client *client, const waywal_ipc_req_hot_reload_code_t &req,
-                              const QByteArray &utf8Source)
-{
-    if (!client) {
-        return;
-    }
-
-    if constexpr (requires(Client *c) { c->sendHotReloadCode(req, utf8Source); }) {
-        client->sendHotReloadCode(req, utf8Source);
-    } else if constexpr (requires(Client *c) {
-                             c->sendHotReloadCode(req, QString::fromUtf8(utf8Source));
-                         }) {
-        client->sendHotReloadCode(req, QString::fromUtf8(utf8Source));
-    } else if constexpr (requires(Client *c) {
-                             c->sendHotReloadCode(req, utf8Source.constData(),
-                                                  static_cast<size_t>(utf8Source.size()));
-                         }) {
-        client->sendHotReloadCode(req, utf8Source.constData(),
-                                  static_cast<size_t>(utf8Source.size()));
-    } else {
-        (void)req;
-        (void)utf8Source;
-    }
 }
 
 void sendHotReloadCodePacket(IpcClient *client, const QString &targetOutput,
@@ -224,7 +213,7 @@ void sendHotReloadCodePacket(IpcClient *client, const QString &targetOutput,
     }
     req.source_len = static_cast<uint32_t>(utf8Source.size());
 
-    dispatchHotReloadCodeIpc(client, req, utf8Source);
+    (void)client->sendHotReloadCode(req, utf8Source);
 }
 
 /* Subclass QPlainTextEdit in .cpp so CodeGutterWidget can access protected viewport metrics
@@ -404,9 +393,15 @@ struct LineMapEntry {
     QString includeName;
 };
 
+struct ExpandedSourceLine {
+    uint32_t userLine{1};
+    QString includeName;
+    QString trimmedText;
+};
+
 void appendExpandedLines(const QString &srcText, uint32_t originUserLine, const QString &incLabel,
-                         std::vector<QString> &seenIncludes, std::vector<LineMapEntry> &map,
-                         bool topLevel)
+                         std::vector<QString> &seenIncludes,
+                         std::vector<ExpandedSourceLine> &expanded, bool topLevel)
 {
     const QStringList lines = srcText.split(QLatin1Char('\n'));
     const int lineCount = (!topLevel && !lines.isEmpty() && lines.last().isEmpty())
@@ -434,29 +429,78 @@ void appendExpandedLines(const QString &srcText, uint32_t originUserLine, const 
                     const char *builtin = we_shader_get_builtin(incBa.constData());
                     if (builtin) {
                         appendExpandedLines(QString::fromUtf8(builtin), uLine, rawInc, seenIncludes,
-                                            map, false);
+                                            expanded, false);
                     }
                 }
             }
             continue;
         }
 
-        map.push_back(LineMapEntry{uLine, incLabel});
+        expanded.push_back(ExpandedSourceLine{uLine, incLabel, trimmed});
     }
 }
 
-std::vector<LineMapEntry> buildPreprocessedLineMap(const QString &rawSrc, bool isFrag,
+std::vector<LineMapEntry> buildPreprocessedLineMap(const QString &rawSrc,
+                                                   const QByteArray &preprocessedGlsl, bool isFrag,
                                                    uint32_t comboCount)
 {
     std::vector<LineMapEntry> map;
     const int preambleLines = basePreambleLines(isFrag) + static_cast<int>(comboCount) * 3;
-    map.reserve(static_cast<size_t>(preambleLines + rawSrc.count(QLatin1Char('\n')) + 64));
-    for (int i = 0; i < preambleLines; ++i) {
+
+    std::vector<QString> seenIncludes;
+    std::vector<ExpandedSourceLine> expLines;
+    expLines.reserve(static_cast<size_t>(rawSrc.count(QLatin1Char('\n')) + 64));
+    appendExpandedLines(rawSrc, 1u, QString(), seenIncludes, expLines, true);
+
+    if (preprocessedGlsl.isEmpty()) {
+        map.reserve(static_cast<size_t>(preambleLines) + expLines.size());
+        for (int i = 0; i < preambleLines; ++i) {
+            map.push_back(LineMapEntry{1u, QString()});
+        }
+        for (const auto &e : expLines) {
+            map.push_back(LineMapEntry{e.userLine, e.includeName});
+        }
+        return map;
+    }
+
+    const QString prepStr = QString::fromUtf8(preprocessedGlsl);
+    const QStringList prepLines = prepStr.split(QLatin1Char('\n'));
+    const int totalPrep = static_cast<int>(prepLines.size());
+    map.reserve(static_cast<size_t>(totalPrep));
+
+    const int clampedPreamble = std::min(preambleLines, totalPrep);
+    for (int i = 0; i < clampedPreamble; ++i) {
         map.push_back(LineMapEntry{1u, QString()});
     }
 
-    std::vector<QString> seenIncludes;
-    appendExpandedLines(rawSrc, 1u, QString(), seenIncludes, map, true);
+    // Align transformed output lines against expanded user lines even when mul()-hoisting
+    // introduces extra temporary lines or strips #define saturate wrappers.
+    size_t expIdx = 0;
+    for (int i = clampedPreamble; i < totalPrep; ++i) {
+        const QString trimmed = prepLines[i].trimmed();
+        while (expIdx < expLines.size() &&
+               expLines[expIdx].trimmedText.startsWith(QLatin1String("#define saturate"))) {
+            ++expIdx;
+        }
+
+        const uint32_t curLine = (expIdx < expLines.size())
+                                     ? expLines[expIdx].userLine
+                                     : (expLines.empty() ? 1u : expLines.back().userLine);
+        const QString curInc =
+            (expIdx < expLines.size()) ? expLines[expIdx].includeName : QString();
+        map.push_back(LineMapEntry{curLine, curInc});
+
+        const bool isHoistedLine = trimmed.contains(QLatin1String("_we_mul_")) &&
+                                   (expIdx < expLines.size() &&
+                                    expLines[expIdx].trimmedText.contains(QLatin1String("mul(")) &&
+                                    !trimmed.startsWith(expLines[expIdx].trimmedText.left(6)));
+        if (isHoistedLine) {
+            continue;
+        }
+        if (expIdx < expLines.size()) {
+            ++expIdx;
+        }
+    }
     return map;
 }
 
@@ -555,12 +599,24 @@ std::vector<EditorDiagnostic> validateGlslStructuralFallback(const QString &src)
     std::vector<BracePos> stack;
     bool inBlockComment = false;
     bool inLineComment = false;
+    bool inDoubleQuote = false;
+    bool inSingleQuote = false;
+    bool escaped = false;
+    uint32_t quoteStartLine = 1;
+    uint32_t quoteStartCol = 1;
     uint32_t line = 1;
     uint32_t col = 1;
 
     for (int i = 0; i < src.size(); ++i) {
         const QChar c = src[i];
         if (c == QLatin1Char('\n')) {
+            if (inDoubleQuote || inSingleQuote) {
+                diags.push_back(EditorDiagnostic{quoteStartLine, quoteStartCol, false,
+                                                 QStringLiteral("Unterminated string literal")});
+                inDoubleQuote = false;
+                inSingleQuote = false;
+                escaped = false;
+            }
             inLineComment = false;
             ++line;
             col = 1;
@@ -580,6 +636,20 @@ std::vector<EditorDiagnostic> validateGlslStructuralFallback(const QString &src)
             ++col;
             continue;
         }
+        if (inDoubleQuote || inSingleQuote) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == QLatin1Char('\\')) {
+                escaped = true;
+            } else if ((inDoubleQuote && c == QLatin1Char('"')) ||
+                       (inSingleQuote && c == QLatin1Char('\''))) {
+                inDoubleQuote = false;
+                inSingleQuote = false;
+            }
+            ++col;
+            continue;
+        }
+
         if (c == QLatin1Char('/') && i + 1 < src.size()) {
             if (src[i + 1] == QLatin1Char('/')) {
                 inLineComment = true;
@@ -594,17 +664,41 @@ std::vector<EditorDiagnostic> validateGlslStructuralFallback(const QString &src)
                 continue;
             }
         }
+        if (c == QLatin1Char('"')) {
+            inDoubleQuote = true;
+            quoteStartLine = line;
+            quoteStartCol = col;
+            ++col;
+            continue;
+        }
+        if (c == QLatin1Char('\'')) {
+            inSingleQuote = true;
+            quoteStartLine = line;
+            quoteStartCol = col;
+            ++col;
+            continue;
+        }
 
-        if (c == QLatin1Char('{') || c == QLatin1Char('(')) {
+        if (c == QLatin1Char('{') || c == QLatin1Char('(') || c == QLatin1Char('[')) {
             stack.push_back(BracePos{c, line, col});
-        } else if (c == QLatin1Char('}') || c == QLatin1Char(')')) {
-            const QChar expected = (c == QLatin1Char('}')) ? QLatin1Char('{') : QLatin1Char('(');
+        } else if (c == QLatin1Char('}') || c == QLatin1Char(')') || c == QLatin1Char(']')) {
+            const QChar expected =
+                (c == QLatin1Char('}'))
+                    ? QLatin1Char('{')
+                    : ((c == QLatin1Char(')')) ? QLatin1Char('(') : QLatin1Char('['));
             if (stack.empty() || stack.back().ch != expected) {
                 diags.push_back(
                     EditorDiagnostic{line, col, false, QStringLiteral("Unmatched '%1'").arg(c)});
-                return diags;
+                // Pop up to matching opener if nested mismatch allows continued error recovery.
+                for (size_t k = stack.size(); k > 0; --k) {
+                    if (stack[k - 1].ch == expected) {
+                        stack.resize(k - 1);
+                        break;
+                    }
+                }
+            } else {
+                stack.pop_back();
             }
-            stack.pop_back();
         }
         ++col;
     }
@@ -612,10 +706,14 @@ std::vector<EditorDiagnostic> validateGlslStructuralFallback(const QString &src)
     if (inBlockComment) {
         diags.push_back(
             EditorDiagnostic{line, col, false, QStringLiteral("Unterminated block comment")});
-    } else if (!stack.empty()) {
-        const auto &top = stack.back();
-        diags.push_back(EditorDiagnostic{top.line, top.col, false,
-                                         QStringLiteral("Unclosed '%1'").arg(top.ch)});
+    }
+    if (inDoubleQuote || inSingleQuote) {
+        diags.push_back(EditorDiagnostic{quoteStartLine, quoteStartCol, false,
+                                         QStringLiteral("Unterminated string literal")});
+    }
+    for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
+        diags.push_back(EditorDiagnostic{it->line, it->col, false,
+                                         QStringLiteral("Unclosed '%1'").arg(it->ch)});
     }
     return diags;
 }
@@ -748,64 +846,112 @@ QString computeShaderMetadataSignature(const waywal_shader_meta_t &meta,
 bool findJsonKeySpan(const QString &src, int jsonStart, int lineEnd, const QString &key,
                      int &outValStart, int &outValEnd)
 {
-    const QString quotedKey = QStringLiteral("\"%1\"").arg(key);
-    const int kPos = src.indexOf(quotedKey, jsonStart);
-    if (kPos < 0 || kPos >= lineEnd) {
-        return false;
-    }
-    int p = kPos + quotedKey.size();
-    while (p < lineEnd && src[p].isSpace()) {
-        ++p;
-    }
-    if (p >= lineEnd || src[p] != QLatin1Char(':')) {
-        return false;
-    }
-    ++p;
-    while (p < lineEnd && src[p].isSpace()) {
-        ++p;
-    }
-    if (p >= lineEnd) {
-        return false;
-    }
-
-    outValStart = p;
-    if (src[p] == QLatin1Char('[')) {
-        int depth = 1;
-        ++p;
-        while (p < lineEnd && depth > 0) {
-            if (src[p] == QLatin1Char('[')) {
-                ++depth;
-            } else if (src[p] == QLatin1Char(']')) {
-                --depth;
-            }
+    int p = jsonStart;
+    int braceDepth = 0;
+    while (p < lineEnd) {
+        const QChar c = src[p];
+        if (c == QLatin1Char('{')) {
+            ++braceDepth;
             ++p;
+            continue;
         }
-        outValEnd = p;
-        return depth == 0;
-    }
-    if (src[p] == QLatin1Char('"')) {
-        ++p;
-        while (p < lineEnd) {
-            if (src[p] == QLatin1Char('\\') && p + 1 < lineEnd) {
-                p += 2;
-                continue;
-            }
-            if (src[p] == QLatin1Char('"')) {
-                ++p;
+        if (c == QLatin1Char('}')) {
+            --braceDepth;
+            if (braceDepth <= 0) {
                 break;
             }
             ++p;
+            continue;
         }
-        outValEnd = p;
-        return outValEnd > outValStart;
-    }
+        if (c == QLatin1Char('"')) {
+            const int strStart = p++;
+            QString decoded;
+            bool esc = false;
+            while (p < lineEnd) {
+                if (esc) {
+                    decoded.append(src[p]);
+                    esc = false;
+                } else if (src[p] == QLatin1Char('\\')) {
+                    esc = true;
+                } else if (src[p] == QLatin1Char('"')) {
+                    ++p;
+                    break;
+                } else {
+                    decoded.append(src[p]);
+                }
+                ++p;
+            }
 
-    while (p < lineEnd && !src[p].isSpace() && src[p] != QLatin1Char(',') &&
-           src[p] != QLatin1Char('}')) {
+            int afterQuote = p;
+            while (afterQuote < lineEnd && src[afterQuote].isSpace()) {
+                ++afterQuote;
+            }
+            if (braceDepth == 1 && afterQuote < lineEnd && src[afterQuote] == QLatin1Char(':') &&
+                decoded == key) {
+                p = afterQuote + 1;
+                while (p < lineEnd && src[p].isSpace()) {
+                    ++p;
+                }
+                if (p >= lineEnd) {
+                    return false;
+                }
+                outValStart = p;
+                if (src[p] == QLatin1Char('[')) {
+                    int arrDepth = 1;
+                    bool inArrStr = false;
+                    bool arrEsc = false;
+                    ++p;
+                    while (p < lineEnd && arrDepth > 0) {
+                        if (inArrStr) {
+                            if (arrEsc) {
+                                arrEsc = false;
+                            } else if (src[p] == QLatin1Char('\\')) {
+                                arrEsc = true;
+                            } else if (src[p] == QLatin1Char('"')) {
+                                inArrStr = false;
+                            }
+                        } else if (src[p] == QLatin1Char('"')) {
+                            inArrStr = true;
+                        } else if (src[p] == QLatin1Char('[')) {
+                            ++arrDepth;
+                        } else if (src[p] == QLatin1Char(']')) {
+                            --arrDepth;
+                        }
+                        ++p;
+                    }
+                    outValEnd = p;
+                    return arrDepth == 0;
+                }
+                if (src[p] == QLatin1Char('"')) {
+                    ++p;
+                    bool valEsc = false;
+                    while (p < lineEnd) {
+                        if (valEsc) {
+                            valEsc = false;
+                        } else if (src[p] == QLatin1Char('\\')) {
+                            valEsc = true;
+                        } else if (src[p] == QLatin1Char('"')) {
+                            ++p;
+                            break;
+                        }
+                        ++p;
+                    }
+                    outValEnd = p;
+                    return outValEnd > outValStart;
+                }
+                while (p < lineEnd && !src[p].isSpace() && src[p] != QLatin1Char(',') &&
+                       src[p] != QLatin1Char('}')) {
+                    ++p;
+                }
+                outValEnd = p;
+                return outValEnd > outValStart;
+            }
+            (void)strStart;
+            continue;
+        }
         ++p;
     }
-    outValEnd = p;
-    return outValEnd > outValStart;
+    return false;
 }
 
 } // namespace
@@ -1334,12 +1480,34 @@ GlslSceneScriptEditorWidget::GlslSceneScriptEditorWidget(QWidget *parent) : QWid
 
 GlslSceneScriptEditorWidget::~GlslSceneScriptEditorWidget()
 {
+    if (m_ipcHotReloadConn) {
+        disconnect(m_ipcHotReloadConn);
+    }
     if (m_debounceTimer) {
         m_debounceTimer->stop();
     }
     stopValidationWorker();
+    if (m_workerGlContext) {
+        m_workerGlContext->doneCurrent();
+    }
     m_workerGlContext.reset();
     m_workerSurface.reset();
+}
+
+void GlslSceneScriptEditorWidget::setIpcClient(IpcClient *client)
+{
+    if (m_ipcClient == client) {
+        return;
+    }
+    if (m_ipcHotReloadConn) {
+        disconnect(m_ipcHotReloadConn);
+        m_ipcHotReloadConn = {};
+    }
+    m_ipcClient = client;
+    if (m_ipcClient) {
+        m_ipcHotReloadConn = connect(m_ipcClient, &IpcClient::codeHotReloaded, this,
+                                     &GlslSceneScriptEditorWidget::onDaemonHotReloadResponded);
+    }
 }
 
 void GlslSceneScriptEditorWidget::stopValidationWorker()
@@ -1358,6 +1526,38 @@ void GlslSceneScriptEditorWidget::showEvent(QShowEvent *event)
 {
     QWidget::showEvent(event);
     ensureUiInitialized();
+    if (m_pendingShowValidation) {
+        m_pendingShowValidation = false;
+        triggerImmediateValidation();
+    }
+}
+
+void GlslSceneScriptEditorWidget::keyPressEvent(QKeyEvent *event)
+{
+    if (event->key() == Qt::Key_F8) {
+        jumpToDiagnostic((event->modifiers() & Qt::ShiftModifier) == 0);
+        event->accept();
+        return;
+    }
+    if ((event->modifiers() & Qt::ControlModifier) && event->key() == Qt::Key_F) {
+        toggleFindBar();
+        event->accept();
+        return;
+    }
+    if ((event->modifiers() & Qt::ControlModifier) && event->key() == Qt::Key_S) {
+        saveDocument();
+        event->accept();
+        return;
+    }
+    if (event->key() == Qt::Key_Escape && m_findBar && m_findBar->isVisible()) {
+        m_findBar->hide();
+        if (m_codeEdit) {
+            m_codeEdit->setFocus();
+        }
+        event->accept();
+        return;
+    }
+    QWidget::keyPressEvent(event);
 }
 
 void GlslSceneScriptEditorWidget::ensureUiInitialized()
@@ -1413,6 +1613,22 @@ void GlslSceneScriptEditorWidget::ensureUiInitialized()
 
     tbLayout->addStretch(1);
 
+    m_nextDiagBtn = new QPushButton(QStringLiteral("Next Err (F8)"), toolbar);
+    m_nextDiagBtn->setAccessibleName(QStringLiteral("Jump to next diagnostic"));
+    tbLayout->addWidget(m_nextDiagBtn);
+
+    m_findBtn = new QPushButton(QStringLiteral("Find"), toolbar);
+    m_findBtn->setAccessibleName(QStringLiteral("Find text in code"));
+    tbLayout->addWidget(m_findBtn);
+
+    m_saveBtn = new QPushButton(QStringLiteral("Save"), toolbar);
+    m_saveBtn->setAccessibleName(QStringLiteral("Save snapshot and apply"));
+    tbLayout->addWidget(m_saveBtn);
+
+    m_revertBtn = new QPushButton(QStringLiteral("Revert"), toolbar);
+    m_revertBtn->setAccessibleName(QStringLiteral("Revert to last saved snapshot"));
+    tbLayout->addWidget(m_revertBtn);
+
     m_validateBtn = new QPushButton(QStringLiteral("Validate"), toolbar);
     m_validateBtn->setAccessibleName(QStringLiteral("Validate code immediately"));
     tbLayout->addWidget(m_validateBtn);
@@ -1425,6 +1641,29 @@ void GlslSceneScriptEditorWidget::ensureUiInitialized()
     tbLayout->addWidget(m_statusPill);
 
     rootLayout->addWidget(toolbar);
+
+    m_findBar = new QWidget(this);
+    m_findBar->setObjectName(QStringLiteral("EditorFindBar"));
+    m_findBar->setStyleSheet(QStringLiteral(
+        "#EditorFindBar { background: #12141a; border-bottom: 1px solid #2a2f3d; }"
+        "QLineEdit { background: #181b22; color: #f1f5f9; border: 1px solid #2a2f3d; "
+        "border-radius: 4px; padding: 2px 6px; font-size: 11px; }"
+        "QPushButton { background: #181b22; color: #f1f5f9; border: 1px solid #2a2f3d; "
+        "border-radius: 4px; padding: 2px 8px; font-size: 11px; }"));
+    auto *findLayout = new QHBoxLayout(m_findBar);
+    findLayout->setContentsMargins(8, 3, 8, 3);
+    findLayout->setSpacing(6);
+    m_findEdit = new QLineEdit(m_findBar);
+    m_findEdit->setPlaceholderText(QStringLiteral("Find in source..."));
+    auto *findPrevBtn = new QPushButton(QStringLiteral("Prev"), m_findBar);
+    auto *findNextBtn = new QPushButton(QStringLiteral("Next"), m_findBar);
+    auto *findCloseBtn = new QPushButton(QStringLiteral("Close"), m_findBar);
+    findLayout->addWidget(m_findEdit, 1);
+    findLayout->addWidget(findPrevBtn);
+    findLayout->addWidget(findNextBtn);
+    findLayout->addWidget(findCloseBtn);
+    m_findBar->hide();
+    rootLayout->addWidget(m_findBar);
 
     auto *editor = new EditorPlainTextEdit(this);
     m_codeEdit = editor;
@@ -1508,6 +1747,21 @@ void GlslSceneScriptEditorWidget::ensureUiInitialized()
             [this](bool checked) { m_syncDefaultsToCode = checked; });
     connect(m_validateBtn, &QPushButton::clicked, this,
             &GlslSceneScriptEditorWidget::triggerImmediateValidation);
+    connect(m_nextDiagBtn, &QPushButton::clicked, this, [this]() { jumpToDiagnostic(true); });
+    connect(m_findBtn, &QPushButton::clicked, this, &GlslSceneScriptEditorWidget::toggleFindBar);
+    connect(m_saveBtn, &QPushButton::clicked, this, &GlslSceneScriptEditorWidget::saveDocument);
+    connect(m_revertBtn, &QPushButton::clicked, this, &GlslSceneScriptEditorWidget::revertDocument);
+    connect(m_findEdit, &QLineEdit::returnPressed, this, [this]() { findNextInEditor(true); });
+    connect(findNextBtn, &QPushButton::clicked, this, [this]() { findNextInEditor(true); });
+    connect(findPrevBtn, &QPushButton::clicked, this, [this]() { findNextInEditor(false); });
+    connect(findCloseBtn, &QPushButton::clicked, this, [this]() {
+        if (m_findBar) {
+            m_findBar->hide();
+        }
+        if (m_codeEdit) {
+            m_codeEdit->setFocus();
+        }
+    });
 }
 
 void GlslSceneScriptEditorWidget::ensureValidationContext()
@@ -1560,6 +1814,9 @@ void GlslSceneScriptEditorWidget::openDocument(EditorLanguageMode mode, int32_t 
     m_objectId = objectId;
     m_slotIndex = passOrScriptSlot;
     m_lastEmittedMetaSig.clear();
+    m_savedSourceText = sourceText;
+    m_sourceSpansDirty = true;
+    m_lastDiagJumpIdx = -1;
 
     if (m_languageCombo) {
         const QSignalBlocker blocker(m_languageCombo);
@@ -1580,7 +1837,11 @@ void GlslSceneScriptEditorWidget::openDocument(EditorLanguageMode mode, int32_t 
     if (!title.isEmpty()) {
         emit statusMessage(tr("Opened %1").arg(title));
     }
-    triggerImmediateValidation();
+    if (isVisible()) {
+        triggerImmediateValidation();
+    } else {
+        m_pendingShowValidation = true;
+    }
 }
 
 QString GlslSceneScriptEditorWidget::sourceText() const
@@ -1593,6 +1854,7 @@ void GlslSceneScriptEditorWidget::onEditorTextChanged()
     if (m_syncingFromInspector) {
         return;
     }
+    m_sourceSpansDirty = true;
     m_editGeneration.fetch_add(1, std::memory_order_acq_rel);
     if (m_statusPill) {
         m_statusPill->setText(QStringLiteral("Editing..."));
@@ -1608,11 +1870,105 @@ void GlslSceneScriptEditorWidget::onEditorTextChanged()
 void GlslSceneScriptEditorWidget::triggerImmediateValidation()
 {
     ensureUiInitialized();
+    m_pendingShowValidation = false;
     if (m_debounceTimer) {
         m_debounceTimer->stop();
     }
     m_editGeneration.fetch_add(1, std::memory_order_acq_rel);
     runDebouncedValidation();
+}
+
+void GlslSceneScriptEditorWidget::jumpToDiagnostic(bool forward)
+{
+    if (m_diagnostics.empty() || !m_codeEdit) {
+        return;
+    }
+    const int n = static_cast<int>(m_diagnostics.size());
+    if (forward) {
+        m_lastDiagJumpIdx = (m_lastDiagJumpIdx + 1) % n;
+    } else {
+        m_lastDiagJumpIdx = (m_lastDiagJumpIdx <= 0) ? (n - 1) : (m_lastDiagJumpIdx - 1);
+    }
+    const EditorDiagnostic &diag = m_diagnostics[static_cast<size_t>(m_lastDiagJumpIdx)];
+    QTextDocument *doc = m_codeEdit->document();
+    const QTextBlock block =
+        doc->findBlockByNumber(static_cast<int>(diag.line > 0 ? diag.line - 1 : 0));
+    if (block.isValid()) {
+        QTextCursor cur(block);
+        if (diag.column > 1) {
+            const int colOff =
+                std::min<int>(static_cast<int>(diag.column - 1), std::max(0, block.length() - 1));
+            cur.movePosition(QTextCursor::Right, QTextCursor::MoveAnchor, colOff);
+        }
+        m_codeEdit->setTextCursor(cur);
+        m_codeEdit->centerCursor();
+        m_codeEdit->setFocus();
+    }
+    emit statusMessage(
+        QStringLiteral("L%1:%2 %3").arg(diag.line).arg(diag.column).arg(diag.message));
+}
+
+void GlslSceneScriptEditorWidget::toggleFindBar()
+{
+    ensureUiInitialized();
+    if (!m_findBar || !m_findEdit) {
+        return;
+    }
+    if (m_findBar->isVisible()) {
+        m_findBar->hide();
+        if (m_codeEdit) {
+            m_codeEdit->setFocus();
+        }
+        return;
+    }
+    m_findBar->show();
+    m_findEdit->setFocus();
+    m_findEdit->selectAll();
+}
+
+void GlslSceneScriptEditorWidget::findNextInEditor(bool forward)
+{
+    if (!m_codeEdit || !m_findEdit) {
+        return;
+    }
+    const QString needle = m_findEdit->text();
+    if (needle.isEmpty()) {
+        return;
+    }
+    QTextDocument::FindFlags flags;
+    if (!forward) {
+        flags |= QTextDocument::FindBackward;
+    }
+    if (!m_codeEdit->find(needle, flags)) {
+        QTextCursor wrapCur = m_codeEdit->textCursor();
+        wrapCur.movePosition(forward ? QTextCursor::Start : QTextCursor::End);
+        m_codeEdit->setTextCursor(wrapCur);
+        (void)m_codeEdit->find(needle, flags);
+    }
+}
+
+void GlslSceneScriptEditorWidget::saveDocument()
+{
+    if (!m_codeEdit) {
+        return;
+    }
+    m_savedSourceText = m_codeEdit->toPlainText();
+    emit statusMessage(tr("Saved snapshot (%1 bytes)").arg(m_savedSourceText.size()));
+    triggerImmediateValidation();
+}
+
+void GlslSceneScriptEditorWidget::revertDocument()
+{
+    if (!m_codeEdit) {
+        return;
+    }
+    {
+        QScopedValueRollback<bool> guard(m_syncingFromInspector, true);
+        m_codeEdit->setPlainText(m_savedSourceText);
+    }
+    m_sourceSpansDirty = true;
+    emit statusMessage(tr("Reverted to last saved snapshot"));
+    triggerImmediateValidation();
 }
 
 void GlslSceneScriptEditorWidget::runDebouncedValidation()
@@ -1624,37 +1980,39 @@ void GlslSceneScriptEditorWidget::runDebouncedValidation()
     const QString src = m_codeEdit->toPlainText();
     const EditorLanguageMode mode = m_languageMode;
 
-    rebuildSourceSpans(src);
+    if (m_sourceSpansDirty) {
+        rebuildSourceSpans(src);
+    }
 
     auto *mailboxObj =
         findChild<QObject *>(QStringLiteral("ValidationMailbox"), Qt::FindDirectChildrenOnly);
     auto *mailbox =
         mailboxObj ? static_cast<ValidationMailbox *>(mailboxObj) : new ValidationMailbox(this);
 
-    if (mode != EditorLanguageMode::SceneScriptJs && (!m_workerGlContext || !m_workerSurface)) {
-        stopValidationWorker();
-        mailbox->reset();
-        ensureValidationContext();
-    }
-
     if (!m_validationThread) {
-        m_validationThread.reset(QThread::create([this, mailbox]() {
+        QPointer<GlslSceneScriptEditorWidget> self(this);
+        m_validationThread.reset(QThread::create([self, mailbox]() {
             ValidationMailbox::Job job;
             while (mailbox->waitNext(job)) {
-                if (job.generation != m_editGeneration.load(std::memory_order_acquire)) {
+                if (!self) {
+                    break;
+                }
+                if (job.generation != self->m_editGeneration.load(std::memory_order_acquire)) {
                     continue;
                 }
 
                 const auto t0 = std::chrono::steady_clock::now();
                 std::vector<EditorDiagnostic> diags;
+                QByteArray preprocessedGlsl;
+                uint32_t prepComboCount = 0;
                 const uint32_t maxLines = static_cast<uint32_t>(
                     std::max<qsizetype>(1, job.source.count(QLatin1Char('\n')) + 1));
 
+                const QByteArray utf8Source = job.source.toUtf8();
                 if (job.mode == EditorLanguageMode::SceneScriptJs) {
-                    const QByteArray utf8 = job.source.toUtf8();
                     we_script_diag_t diag{};
-                    if (!we_script_lint(utf8.constData(), static_cast<size_t>(utf8.size()), 0u,
-                                        &diag)) {
+                    if (!we_script_lint(utf8Source.constData(),
+                                        static_cast<size_t>(utf8Source.size()), 0u, &diag)) {
                         EditorDiagnostic ed;
                         ed.line = std::clamp(diag.error_line, 1u, maxLines);
                         ed.column = std::max(1u, diag.error_col);
@@ -1668,21 +2026,17 @@ void GlslSceneScriptEditorWidget::runDebouncedValidation()
                 } else {
                     const bool isFrag = (job.mode == EditorLanguageMode::GlslEs310Fragment);
                     const bool nativeEs = isStandaloneNativeGles(job.source);
-                    std::vector<LineMapEntry> lineMap;
-                    QByteArray glslSource;
-
                     if (nativeEs) {
-                        glslSource = job.source.toUtf8();
+                        preprocessedGlsl = utf8Source;
                     } else {
-                        const QByteArray rawUtf8 = job.source.toUtf8();
                         we_shader_meta_t prepMeta{};
-                        char *preprocessed = we_shader_preprocess_stage(
-                            rawUtf8.constData(), isFrag, nullptr, nullptr, 0, 0, false, &prepMeta);
+                        char *preprocessed =
+                            we_shader_preprocess_stage(utf8Source.constData(), isFrag, nullptr,
+                                                       nullptr, 0, 0, false, &prepMeta);
+                        prepComboCount = prepMeta.combo_count;
                         if (preprocessed) {
-                            glslSource = QByteArray(preprocessed);
+                            preprocessedGlsl = QByteArray(preprocessed);
                             std::free(preprocessed);
-                            lineMap =
-                                buildPreprocessedLineMap(job.source, isFrag, prepMeta.combo_count);
                         } else {
                             diags.push_back(EditorDiagnostic{
                                 1u, 1u, false,
@@ -1692,50 +2046,7 @@ void GlslSceneScriptEditorWidget::runDebouncedValidation()
                     }
 
                     if (diags.empty()) {
-                        if (m_workerGlContext && m_workerGlContext->isValid() && m_workerSurface &&
-                            m_workerSurface->isValid() &&
-                            m_workerGlContext->makeCurrent(m_workerSurface.get())) {
-                            QOpenGLFunctions *gl = m_workerGlContext->functions();
-                            if (gl) {
-                                const GLenum stage = isFrag ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER;
-                                const GLuint shader = gl->glCreateShader(stage);
-                                if (shader != 0) {
-                                    const char *srcPtr = glslSource.constData();
-                                    const GLint srcLen = static_cast<GLint>(glslSource.size());
-                                    gl->glShaderSource(shader, 1, &srcPtr, &srcLen);
-                                    gl->glCompileShader(shader);
-
-                                    GLint compiled = GL_FALSE;
-                                    gl->glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
-                                    GLint logLen = 0;
-                                    gl->glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLen);
-
-                                    QString logText;
-                                    if (logLen > 1) {
-                                        QByteArray logBuf(logLen, '\0');
-                                        GLsizei written = 0;
-                                        gl->glGetShaderInfoLog(shader, logLen, &written,
-                                                               logBuf.data());
-                                        logText = QString::fromUtf8(logBuf.constData(), written);
-                                    }
-                                    gl->glDeleteShader(shader);
-
-                                    if (!logText.isEmpty()) {
-                                        diags = parseGlslInfoLog(logText, lineMap, maxLines);
-                                    }
-                                    if (compiled == GL_FALSE && diags.empty()) {
-                                        diags.push_back(EditorDiagnostic{
-                                            1u, 1u, false,
-                                            logText.isEmpty()
-                                                ? QStringLiteral("GLSL compilation failed")
-                                                : logText.trimmed()});
-                                    }
-                                }
-                            }
-                            m_workerGlContext->doneCurrent();
-                        } else {
-                            diags = validateGlslStructuralFallback(job.source);
-                        }
+                        diags = validateGlslStructuralFallback(job.source);
                     }
                 }
 
@@ -1745,49 +2056,138 @@ void GlslSceneScriptEditorWidget::runDebouncedValidation()
 
                 const uint64_t doneGen = job.generation;
                 const EditorLanguageMode doneMode = job.mode;
-                QByteArray utf8Source = job.source.toUtf8();
+                if (!self) {
+                    break;
+                }
                 QMetaObject::invokeMethod(
-                    this,
-                    [this, doneGen, doneMode, srcBytes = std::move(utf8Source),
-                     d = std::move(diags), elapsedUs]() mutable {
-                        m_validationBusy.store(false, std::memory_order_release);
-                        applyValidationResult(doneGen, std::move(d));
-                        const bool hasErr = std::ranges::any_of(
-                            m_diagnostics, [](const EditorDiagnostic &x) { return !x.isWarning; });
-                        const bool isCurrent =
-                            (doneGen == m_editGeneration.load(std::memory_order_acquire));
-                        if (isCurrent && !hasErr && doneMode != EditorLanguageMode::SceneScriptJs) {
-                            waywal_shader_meta_t meta{};
-                            QString rawComboJson;
-                            mergeShaderMetadata(QString::fromUtf8(srcBytes), meta, rawComboJson);
-                            const QString sig = computeShaderMetadataSignature(meta, rawComboJson);
-                            if (sig != m_lastEmittedMetaSig) {
-                                m_lastEmittedMetaSig = sig;
-                                emit shaderMetadataExtracted(meta, rawComboJson);
-                            }
-                        }
-                        if (isCurrent && m_liveHotReload) {
-                            if (!hasErr) {
-                                sendHotReloadCodePacket(m_ipcClient, m_targetOutput, doneMode,
-                                                        m_objectId, m_slotIndex, srcBytes);
-                            }
-                            emit liveHotReloadApplied(!hasErr, elapsedUs);
+                    self.data(),
+                    [self, doneGen, doneMode, srcBytes = std::move(utf8Source),
+                     d = std::move(diags), prepGlsl = std::move(preprocessedGlsl), prepComboCount,
+                     maxLines, elapsedUs]() mutable {
+                        if (self) {
+                            self->finishValidationOnMainThread(
+                                doneGen, doneMode, std::move(srcBytes), std::move(d),
+                                std::move(prepGlsl), prepComboCount, maxLines, elapsedUs);
                         }
                     },
                     Qt::QueuedConnection);
             }
-            if (m_workerGlContext) {
-                m_workerGlContext->doneCurrent();
-                m_workerGlContext.reset();
-            }
         }));
-        if (m_workerGlContext && m_workerGlContext->thread() != m_validationThread.get()) {
-            m_workerGlContext->moveToThread(m_validationThread.get());
-        }
         m_validationThread->start();
     }
-    m_validationBusy.store(true, std::memory_order_release);
     mailbox->submit(generation, mode, src);
+}
+
+void GlslSceneScriptEditorWidget::finishValidationOnMainThread(
+    uint64_t doneGen, EditorLanguageMode doneMode, QByteArray srcBytes,
+    std::vector<EditorDiagnostic> diags, QByteArray preprocessedGlsl, uint32_t prepComboCount,
+    uint32_t maxLines, uint32_t elapsedUs)
+{
+    if (doneGen != m_editGeneration.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    const QString srcStr = QString::fromUtf8(srcBytes);
+
+    // Run GLES shader compilation strictly on the GUI thread where QOffscreenSurface affinity
+    // and QOpenGLContext ownership live, avoiding cross-thread QOffscreenSurface races.
+    if (doneMode != EditorLanguageMode::SceneScriptJs && diags.empty() &&
+        !preprocessedGlsl.isEmpty()) {
+        ensureValidationContext();
+        if (m_workerGlContext && m_workerGlContext->isValid() && m_workerSurface &&
+            m_workerSurface->isValid() && m_workerGlContext->makeCurrent(m_workerSurface.get())) {
+            const auto tGl0 = std::chrono::steady_clock::now();
+            QOpenGLFunctions *gl = m_workerGlContext->functions();
+            if (gl) {
+                const bool isFrag = (doneMode == EditorLanguageMode::GlslEs310Fragment);
+                const GLenum stage = isFrag ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER;
+                const GLuint shader = gl->glCreateShader(stage);
+                if (shader != 0) {
+                    const char *srcPtr = preprocessedGlsl.constData();
+                    const GLint srcLen = static_cast<GLint>(preprocessedGlsl.size());
+                    gl->glShaderSource(shader, 1, &srcPtr, &srcLen);
+                    gl->glCompileShader(shader);
+
+                    GLint compiled = GL_FALSE;
+                    gl->glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+                    GLint logLen = 0;
+                    gl->glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLen);
+
+                    QString logText;
+                    if (logLen > 1) {
+                        QByteArray logBuf(logLen, '\0');
+                        GLsizei written = 0;
+                        gl->glGetShaderInfoLog(shader, logLen, &written, logBuf.data());
+                        logText = QString::fromUtf8(logBuf.constData(), written);
+                    }
+                    gl->glDeleteShader(shader);
+
+                    if (!logText.isEmpty()) {
+                        const bool nativeEs = isStandaloneNativeGles(srcStr);
+                        const std::vector<LineMapEntry> lineMap =
+                            nativeEs ? std::vector<LineMapEntry>{}
+                                     : buildPreprocessedLineMap(srcStr, preprocessedGlsl, isFrag,
+                                                                prepComboCount);
+                        diags = parseGlslInfoLog(logText, lineMap, maxLines);
+                    }
+                    if (compiled == GL_FALSE && diags.empty()) {
+                        diags.push_back(EditorDiagnostic{
+                            1u, 1u, false,
+                            logText.isEmpty() ? QStringLiteral("GLSL compilation failed")
+                                              : logText.trimmed()});
+                    }
+                }
+            }
+            m_workerGlContext->doneCurrent();
+            const auto tGl1 = std::chrono::steady_clock::now();
+            elapsedUs += static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(tGl1 - tGl0).count());
+        }
+    }
+
+    applyValidationResult(doneGen, std::move(diags));
+    const bool hasErr =
+        std::ranges::any_of(m_diagnostics, [](const EditorDiagnostic &x) { return !x.isWarning; });
+
+    if (!hasErr && doneMode != EditorLanguageMode::SceneScriptJs) {
+        waywal_shader_meta_t meta{};
+        QString rawComboJson;
+        mergeShaderMetadata(srcStr, meta, rawComboJson);
+        const QString sig = computeShaderMetadataSignature(meta, rawComboJson);
+        if (sig != m_lastEmittedMetaSig) {
+            m_lastEmittedMetaSig = sig;
+            emit shaderMetadataExtracted(meta, rawComboJson);
+        }
+    }
+
+    if (m_liveHotReload) {
+        const bool ipcLive = (m_ipcClient && m_ipcClient->isConnected());
+        if (!hasErr && m_ipcClient) {
+            sendHotReloadCodePacket(m_ipcClient, m_targetOutput, doneMode, m_objectId, m_slotIndex,
+                                    srcBytes);
+        }
+        if (!ipcLive || hasErr) {
+            emit liveHotReloadApplied(!hasErr, elapsedUs);
+        }
+    }
+}
+
+void GlslSceneScriptEditorWidget::onDaemonHotReloadResponded(
+    const waywal_ipc_resp_hot_reload_code_t &resp, const QString &metaJson)
+{
+    (void)metaJson;
+    const bool ok = (resp.status_code == 0u);
+    if (!ok && resp.error_msg[0] != '\0') {
+        const uint32_t maxLines =
+            m_codeEdit ? static_cast<uint32_t>(std::max(1, m_codeEdit->blockCount())) : 1u;
+        EditorDiagnostic d;
+        d.line = std::clamp(std::max(1u, resp.error_line), 1u, maxLines);
+        d.column = std::max(1u, resp.error_col);
+        d.isWarning = false;
+        d.message = QString::fromUtf8(resp.error_msg);
+        applyValidationResult(m_editGeneration.load(std::memory_order_acquire), {std::move(d)});
+    }
+    emit liveHotReloadApplied(ok, resp.compile_time_us);
 }
 
 void GlslSceneScriptEditorWidget::applyValidationResult(uint64_t generation,
@@ -2035,11 +2435,17 @@ void GlslSceneScriptEditorWidget::rebuildSourceSpans(const QString &src)
                     const int eqInDecl = decl.indexOf(QLatin1Char('='));
                     const QString cleanDecl =
                         (eqInDecl >= 0) ? decl.left(eqInDecl).trimmed() : decl;
-                    const QStringList parts = cleanDecl.split(
-                        QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+                    int tokEnd = static_cast<int>(cleanDecl.size());
+                    while (tokEnd > 0 && cleanDecl[tokEnd - 1].isSpace()) {
+                        --tokEnd;
+                    }
+                    int tokStart = tokEnd;
+                    while (tokStart > 0 && !cleanDecl[tokStart - 1].isSpace()) {
+                        --tokStart;
+                    }
                     QString uname;
-                    if (parts.size() >= 2) {
-                        uname = parts.last();
+                    if (tokStart > 0 && tokEnd > tokStart) {
+                        uname = cleanDecl.mid(tokStart, tokEnd - tokStart);
                         const int br = uname.indexOf(QLatin1Char('['));
                         if (br >= 0) {
                             uname = uname.left(br);
@@ -2065,6 +2471,7 @@ void GlslSceneScriptEditorWidget::rebuildSourceSpans(const QString &src)
     }
 
     flushUniformBlock();
+    m_sourceSpansDirty = false;
 }
 
 bool GlslSceneScriptEditorWidget::patchUniformOrComboDefaultInSource(const QString &symbolName,
@@ -2079,7 +2486,9 @@ bool GlslSceneScriptEditorWidget::patchUniformOrComboDefaultInSource(const QStri
     }
 
     const QString fullText = m_codeEdit->toPlainText();
-    rebuildSourceSpans(fullText);
+    if (m_sourceSpansDirty) {
+        rebuildSourceSpans(fullText);
+    }
 
     auto it = std::ranges::find_if(
         m_sourceSpans, [&](const ShaderSourceSpan &sp) { return sp.symbolName == symbolName; });
@@ -2147,6 +2556,11 @@ bool GlslSceneScriptEditorWidget::patchUniformOrComboDefaultInSource(const QStri
             other.startOffset += delta;
             other.endOffset += delta;
         }
+    }
+
+    m_editGeneration.fetch_add(1, std::memory_order_acq_rel);
+    if (isVisible() && m_debounceTimer) {
+        m_debounceTimer->start(kDebounceValidationMs);
     }
 
     return true;

@@ -9,6 +9,8 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QLabel>
+#include <QLineEdit>
+#include <QMetaObject>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QPlainTextEdit>
@@ -108,7 +110,7 @@ class GlslSceneScriptEditorWidget : public QWidget {
     explicit GlslSceneScriptEditorWidget(QWidget *parent = nullptr);
     ~GlslSceneScriptEditorWidget() override;
 
-    void setIpcClient(IpcClient *client) noexcept { m_ipcClient = client; }
+    void setIpcClient(IpcClient *client);
     [[nodiscard]] IpcClient *ipcClient() const noexcept { return m_ipcClient; }
 
     void setTargetOutput(const QString &output) { m_targetOutput = output; }
@@ -130,6 +132,10 @@ class GlslSceneScriptEditorWidget : public QWidget {
 
   public slots:
     void triggerImmediateValidation();
+    void jumpToDiagnostic(bool forward = true);
+    void toggleFindBar();
+    void saveDocument();
+    void revertDocument();
 
   signals:
     void shaderMetadataExtracted(const waywal_shader_meta_t &meta, const QString &rawComboJson);
@@ -139,6 +145,7 @@ class GlslSceneScriptEditorWidget : public QWidget {
 
   protected:
     void showEvent(QShowEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
 
   private:
     void ensureUiInitialized();
@@ -146,6 +153,13 @@ class GlslSceneScriptEditorWidget : public QWidget {
     void ensureValidationContext();
     void onEditorTextChanged();
     void runDebouncedValidation();
+    void finishValidationOnMainThread(uint64_t doneGen, EditorLanguageMode doneMode,
+                                      QByteArray srcBytes, std::vector<EditorDiagnostic> diags,
+                                      QByteArray preprocessedGlsl, uint32_t prepComboCount,
+                                      uint32_t maxLines, uint32_t elapsedUs);
+    void onDaemonHotReloadResponded(const waywal_ipc_resp_hot_reload_code_t &resp,
+                                    const QString &metaJson);
+    void findNextInEditor(bool forward);
     void applyValidationResult(uint64_t generation, std::vector<EditorDiagnostic> diags);
     void rebuildSourceSpans(const QString &src);
 
@@ -153,6 +167,8 @@ class GlslSceneScriptEditorWidget : public QWidget {
     bool m_syncingFromInspector{false};
     bool m_liveHotReload{true};
     bool m_syncDefaultsToCode{true};
+    bool m_pendingShowValidation{false};
+    bool m_sourceSpansDirty{true};
 
     EditorLanguageMode m_languageMode{EditorLanguageMode::GlslEs310Fragment};
     QString m_targetOutput{QStringLiteral("*")};
@@ -160,13 +176,14 @@ class GlslSceneScriptEditorWidget : public QWidget {
     uint32_t m_slotIndex{0};
     std::atomic<uint64_t> m_editGeneration{0};
     QString m_lastEmittedMetaSig;
+    QString m_savedSourceText;
 
     IpcClient *m_ipcClient{nullptr};
+    QMetaObject::Connection m_ipcHotReloadConn;
     QPointer<QOpenGLContext> m_shareContext;
     std::unique_ptr<QOpenGLContext> m_workerGlContext;
     std::unique_ptr<QOffscreenSurface> m_workerSurface;
     std::unique_ptr<QThread> m_validationThread;
-    std::atomic<bool> m_validationBusy{false};
 
     QPlainTextEdit *m_codeEdit{nullptr};
     GlslSceneScriptHighlighter *m_highlighter{nullptr};
@@ -176,8 +193,15 @@ class GlslSceneScriptEditorWidget : public QWidget {
     QCheckBox *m_hotReloadCheck{nullptr};
     QCheckBox *m_syncDefaultsCheck{nullptr};
     QPushButton *m_validateBtn{nullptr};
+    QPushButton *m_nextDiagBtn{nullptr};
+    QPushButton *m_findBtn{nullptr};
+    QPushButton *m_saveBtn{nullptr};
+    QPushButton *m_revertBtn{nullptr};
+    QWidget *m_findBar{nullptr};
+    QLineEdit *m_findEdit{nullptr};
     QLabel *m_statusPill{nullptr};
 
+    int m_lastDiagJumpIdx{-1};
     std::vector<EditorDiagnostic> m_diagnostics;
     std::vector<ShaderSourceSpan> m_sourceSpans;
 };

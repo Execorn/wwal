@@ -1,24 +1,32 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cubic_bezier_editor.hpp"
 
+#include <QClipboard>
+#include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QEvent>
+#include <QFontMetrics>
+#include <QGridLayout>
+#include <QGroupBox>
+#include <QGuiApplication>
+#include <QHBoxLayout>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QLinearGradient>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPaintEvent>
-#include <QMouseEvent>
-#include <QVBoxLayout>
-#include <QHBoxLayout>
-#include <QGridLayout>
-#include <QGroupBox>
-#include <QComboBox>
-#include <QSpinBox>
-#include <QDoubleSpinBox>
-#include <QSlider>
+#include <QPointer>
 #include <QPushButton>
-#include <QLabel>
-#include <QFontMetrics>
-#include <QLinearGradient>
+#include <QResizeEvent>
 #include <QScrollArea>
+#include <QSignalBlocker>
+#include <QSlider>
+#include <QSpinBox>
+#include <QVBoxLayout>
 
 #include <algorithm>
 #include <cmath>
@@ -34,13 +42,26 @@ BezierCurveCanvas::BezierCurveCanvas(QWidget *parent) : QWidget(parent)
     setMinimumSize(100, 60);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     setMouseTracking(true);
+    setFocusPolicy(Qt::StrongFocus);
 
     m_curve = bezier_create(0.25f, 0.1f, 0.25f, 1.0f);
     m_dragStartCurve = m_curve;
 
     connect(&m_animTimer, &QTimer::timeout, this, [this]() {
+        if (!isVisible() || (window() && !window()->isActiveWindow() && !m_hovered && !hasFocus() &&
+                             m_dragTarget == DragTarget::None)) {
+            m_animTimer.stop();
+            return;
+        }
+        if (!m_hovered && !hasFocus() && m_dragTarget == DragTarget::None &&
+            m_activityTimer.isValid() &&
+            m_activityTimer.elapsed() > static_cast<qint64>(m_durationMs) + 1200) {
+            m_animTimer.stop();
+            return;
+        }
+
         qint64 elapsed = m_elapsedTimer.elapsed();
-        qint64 totalLoop = static_cast<qint64>(m_durationMs) + 300; // 300ms pause at end
+        qint64 totalLoop = static_cast<qint64>(m_durationMs) + 300;
         qint64 currentInLoop = elapsed % totalLoop;
 
         if (currentInLoop <= m_durationMs) {
@@ -56,49 +77,117 @@ BezierCurveCanvas::BezierCurveCanvas(QWidget *parent) : QWidget(parent)
 
     setAnimationFps(144);
     m_elapsedTimer.start();
+    m_activityTimer.start();
 
-    class VisibilityTimerFilter final : public QObject {
+    class CanvasLifecycleFilter final : public QObject {
       public:
-        VisibilityTimerFilter(QTimer *timer, QElapsedTimer *elapsed, QObject *parent)
-            : QObject(parent), m_timer(timer), m_elapsed(elapsed)
-        {
-        }
+        explicit CanvasLifecycleFilter(BezierCurveCanvas *owner) : QObject(owner), m_owner(owner) {}
 
       protected:
         bool eventFilter(QObject * /*watched*/, QEvent *event) override
         {
-            if (event->type() == QEvent::Hide) {
-                m_timer->stop();
-            } else if (event->type() == QEvent::Show) {
-                m_elapsed->restart();
-                if (!m_timer->isActive()) {
-                    m_timer->start();
-                }
+            if (!m_owner) {
+                return false;
+            }
+            switch (event->type()) {
+            case QEvent::Hide:
+            case QEvent::WindowDeactivate:
+                m_owner->m_hovered = false;
+                m_owner->m_animTimer.stop();
+                break;
+            case QEvent::Show:
+            case QEvent::FocusIn:
+            case QEvent::WindowActivate:
+                m_owner->wakeAnimationPreview();
+                break;
+            case QEvent::Enter:
+                m_owner->m_hovered = true;
+                m_owner->wakeAnimationPreview();
+                break;
+            case QEvent::Leave:
+                m_owner->m_hovered = false;
+                m_owner->syncAnimationState();
+                break;
+            case QEvent::FocusOut:
+                m_owner->syncAnimationState();
+                break;
+            default:
+                break;
             }
             return false;
         }
 
       private:
-        QTimer *m_timer{nullptr};
-        QElapsedTimer *m_elapsed{nullptr};
+        BezierCurveCanvas *m_owner{nullptr};
     };
 
-    installEventFilter(new VisibilityTimerFilter(&m_animTimer, &m_elapsedTimer, this));
+    installEventFilter(new CanvasLifecycleFilter(this));
     if (isVisible()) {
-        m_animTimer.start();
+        wakeAnimationPreview();
     }
 }
 
 BezierCurveCanvas::~BezierCurveCanvas() = default;
 
+void BezierCurveCanvas::wakeAnimationPreview()
+{
+    m_elapsedTimer.restart();
+    m_activityTimer.restart();
+    syncAnimationState();
+}
+
+void BezierCurveCanvas::syncAnimationState()
+{
+    const bool activeWin = !window() || window()->isActiveWindow();
+    const bool shouldAnimate =
+        isVisible() && (m_hovered || hasFocus() || m_dragTarget != DragTarget::None ||
+                        (activeWin && m_activityTimer.isValid() &&
+                         m_activityTimer.elapsed() <= static_cast<qint64>(m_durationMs) + 1200));
+    if (shouldAnimate) {
+        if (!m_animTimer.isActive()) {
+            m_animTimer.start();
+        }
+    } else {
+        m_animTimer.stop();
+    }
+}
+
+void BezierCurveCanvas::rebuildCurvePathIfNeeded()
+{
+    if (!m_curvePathDirty && m_cachedSize == size()) {
+        return;
+    }
+    m_cachedSize = size();
+    m_curvePathDirty = false;
+    QPainterPath path;
+    constexpr int numSamples = 200;
+    for (int i = 0; i <= numSamples; ++i) {
+        const float x = static_cast<float>(i) / static_cast<float>(numSamples);
+        const float y = bezier_eval(&m_curve, x);
+        const QPointF pt = mapToCanvas(x, y);
+        if (i == 0) {
+            path.moveTo(pt);
+        } else {
+            path.lineTo(pt);
+        }
+    }
+    m_cachedCurvePath = std::move(path);
+}
+
 void BezierCurveCanvas::setCurve(const bezier_curve_t &curve)
 {
     m_curve = bezier_create(curve.p1x, curve.p1y, curve.p2x, curve.p2y);
+    m_curvePathDirty = true;
     m_easedProgress = bezier_eval(&m_curve, m_animProgress);
+    wakeAnimationPreview();
     update();
 }
 
-void BezierCurveCanvas::setDurationMs(uint32_t ms) { m_durationMs = std::max(100u, ms); }
+void BezierCurveCanvas::setDurationMs(uint32_t ms)
+{
+    m_durationMs = std::max(100u, ms);
+    wakeAnimationPreview();
+}
 
 void BezierCurveCanvas::setAnimationFps(uint32_t fps)
 {
@@ -189,28 +278,15 @@ void BezierCurveCanvas::paintEvent(QPaintEvent *event)
     painter.setPen(QPen(QColor(243, 139, 168, 200), 1.5, Qt::SolidLine));
     painter.drawLine(p11, ptP2);
 
-    // Bézier curve rendering (evaluated genuinely via bezier_eval)
-    QPainterPath curvePath;
-    const int numSamples = 200;
-    for (int i = 0; i <= numSamples; ++i) {
-        float x = static_cast<float>(i) / static_cast<float>(numSamples);
-        float y = bezier_eval(&m_curve, x);
-        QPointF pt = mapToCanvas(x, y);
-        if (i == 0) {
-            curvePath.moveTo(pt);
-        } else {
-            curvePath.lineTo(pt);
-        }
-    }
-
-    // Gradient curve stroke
+    // Cached curve stroke (rebuilt only on resize or curve change)
+    rebuildCurvePathIfNeeded();
     QLinearGradient grad(p00, p11);
     grad.setColorAt(0.0, QColor(137, 180, 250)); // Sky blue
     grad.setColorAt(1.0, QColor(166, 227, 161)); // Spring green
 
     painter.setPen(QPen(QBrush(grad), 2.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     painter.setBrush(Qt::NoBrush);
-    painter.drawPath(curvePath);
+    painter.drawPath(m_cachedCurvePath);
 
     // Animated live easing dot moving along the curve
     QPointF animPt = mapToCanvas(m_animProgress, m_easedProgress);
@@ -225,14 +301,26 @@ void BezierCurveCanvas::paintEvent(QPaintEvent *event)
     painter.drawEllipse(animPt, 3.0, 3.0);
 
     // Tangent handle P1 circle
-    painter.setPen(QPen(QColor(255, 255, 255), 1.8));
+    painter.setPen(QPen(hasFocus() && m_selectedHandle == DragTarget::HandleP1
+                            ? QColor(249, 226, 175)
+                            : QColor(255, 255, 255),
+                        hasFocus() && m_selectedHandle == DragTarget::HandleP1 ? 2.4 : 1.8));
     painter.setBrush(QColor(137, 180, 250));
     painter.drawEllipse(ptP1, 5.5, 5.5);
 
     // Tangent handle P2 circle
-    painter.setPen(QPen(QColor(255, 255, 255), 1.8));
+    painter.setPen(QPen(hasFocus() && m_selectedHandle == DragTarget::HandleP2
+                            ? QColor(249, 226, 175)
+                            : QColor(255, 255, 255),
+                        hasFocus() && m_selectedHandle == DragTarget::HandleP2 ? 2.4 : 1.8));
     painter.setBrush(QColor(243, 139, 168));
     painter.drawEllipse(ptP2, 5.5, 5.5);
+
+    if (hasFocus()) {
+        painter.setPen(QPen(QColor(137, 180, 250, 180), 1.5));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawRect(rect().adjusted(1, 1, -2, -2));
+    }
 
     // Labels for control points (smart offset away from the curve path and reference lines)
     QFont font = painter.font();
@@ -258,6 +346,12 @@ void BezierCurveCanvas::paintEvent(QPaintEvent *event)
     painter.drawText(QRectF(p2Lx, p2Ly, 22, 12), Qt::AlignLeft | Qt::AlignVCenter, "P2");
 }
 
+void BezierCurveCanvas::resizeEvent(QResizeEvent *event)
+{
+    m_curvePathDirty = true;
+    QWidget::resizeEvent(event);
+}
+
 void BezierCurveCanvas::mousePressEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton) {
@@ -266,10 +360,14 @@ void BezierCurveCanvas::mousePressEvent(QMouseEvent *event)
 
         if (getHandleRect(ptP1).contains(event->position())) {
             m_dragTarget = DragTarget::HandleP1;
+            m_selectedHandle = DragTarget::HandleP1;
             m_dragStartCurve = m_curve;
+            wakeAnimationPreview();
         } else if (getHandleRect(ptP2).contains(event->position())) {
             m_dragTarget = DragTarget::HandleP2;
+            m_selectedHandle = DragTarget::HandleP2;
             m_dragStartCurve = m_curve;
+            wakeAnimationPreview();
         }
     }
 }
@@ -280,10 +378,12 @@ void BezierCurveCanvas::mouseMoveEvent(QMouseEvent *event)
 
     if (m_dragTarget == DragTarget::HandleP1) {
         QPointF curvePt = mapFromCanvas(canvasPt);
-        float p1x = std::clamp(static_cast<float>(curvePt.x()), 0.0f, 1.0f); // strictly monotonic
-        float p1y = std::clamp(static_cast<float>(curvePt.y()), -0.5f, 1.5f);
+        float p1x = std::clamp(static_cast<float>(curvePt.x()), 0.0f, 1.0f);
+        float p1y = std::clamp(static_cast<float>(curvePt.y()), m_minY, m_maxY);
         m_curve.p1x = p1x;
         m_curve.p1y = p1y;
+        m_curvePathDirty = true;
+        wakeAnimationPreview();
         emit curveModified(m_curve.p1x, m_curve.p1y, m_curve.p2x, m_curve.p2y, true);
         update();
         return;
@@ -291,10 +391,12 @@ void BezierCurveCanvas::mouseMoveEvent(QMouseEvent *event)
 
     if (m_dragTarget == DragTarget::HandleP2) {
         QPointF curvePt = mapFromCanvas(canvasPt);
-        float p2x = std::clamp(static_cast<float>(curvePt.x()), 0.0f, 1.0f); // strictly monotonic
-        float p2y = std::clamp(static_cast<float>(curvePt.y()), -0.5f, 1.5f);
+        float p2x = std::clamp(static_cast<float>(curvePt.x()), 0.0f, 1.0f);
+        float p2y = std::clamp(static_cast<float>(curvePt.y()), m_minY, m_maxY);
         m_curve.p2x = p2x;
         m_curve.p2y = p2y;
+        m_curvePathDirty = true;
+        wakeAnimationPreview();
         emit curveModified(m_curve.p1x, m_curve.p1y, m_curve.p2x, m_curve.p2y, true);
         update();
         return;
@@ -314,8 +416,53 @@ void BezierCurveCanvas::mouseReleaseEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton && m_dragTarget != DragTarget::None) {
         m_dragTarget = DragTarget::None;
+        wakeAnimationPreview();
         emit curveModified(m_curve.p1x, m_curve.p1y, m_curve.p2x, m_curve.p2y, false);
     }
+}
+
+void BezierCurveCanvas::keyPressEvent(QKeyEvent *event)
+{
+    if (event->key() == Qt::Key_Tab || event->key() == Qt::Key_Space) {
+        m_selectedHandle = (m_selectedHandle == DragTarget::HandleP1) ? DragTarget::HandleP2
+                                                                      : DragTarget::HandleP1;
+        wakeAnimationPreview();
+        update();
+        return;
+    }
+
+    const float step = (event->modifiers() & Qt::ShiftModifier) ? 0.005f : 0.02f;
+    float dx = 0.0f;
+    float dy = 0.0f;
+    switch (event->key()) {
+    case Qt::Key_Left:
+        dx = -step;
+        break;
+    case Qt::Key_Right:
+        dx = step;
+        break;
+    case Qt::Key_Up:
+        dy = step;
+        break;
+    case Qt::Key_Down:
+        dy = -step;
+        break;
+    default:
+        QWidget::keyPressEvent(event);
+        return;
+    }
+
+    if (m_selectedHandle == DragTarget::HandleP1) {
+        m_curve.p1x = std::clamp(m_curve.p1x + dx, 0.0f, 1.0f);
+        m_curve.p1y = std::clamp(m_curve.p1y + dy, m_minY, m_maxY);
+    } else {
+        m_curve.p2x = std::clamp(m_curve.p2x + dx, 0.0f, 1.0f);
+        m_curve.p2y = std::clamp(m_curve.p2y + dy, m_minY, m_maxY);
+    }
+    m_curvePathDirty = true;
+    wakeAnimationPreview();
+    emit curveModified(m_curve.p1x, m_curve.p1y, m_curve.p2x, m_curve.p2y, false);
+    update();
 }
 
 /* ========================================================================= */
@@ -433,6 +580,21 @@ void CubicBezierEditorWidget::setupUi()
     presetsGrid->addWidget(m_btnBounce, 1, 2);
     leftCol->addLayout(presetsGrid);
 
+    auto *savedRow = new QHBoxLayout();
+    savedRow->setContentsMargins(0, 0, 0, 0);
+    savedRow->setSpacing(4);
+    m_savedPresetCombo = new QComboBox(this);
+    m_savedPresetCombo->setFixedHeight(20);
+    m_savedPresetCombo->addItem(tr("Saved Presets..."));
+    m_savedPresetCombo->setStyleSheet(
+        "QComboBox { background: #181b22; color: #cbd5e1; border: 1px solid #2c3240; "
+        "border-radius: 3px; padding: 0px 4px; font-size: 9px; }");
+    m_btnSavePreset = makePresetBtn(tr("Save Preset"));
+    m_btnSavePreset->setFixedHeight(20);
+    savedRow->addWidget(m_savedPresetCombo, 1);
+    savedRow->addWidget(m_btnSavePreset);
+    leftCol->addLayout(savedRow);
+
     rootLayout->addLayout(leftCol, 4);
 
     connect(m_btnLinear, &QPushButton::clicked, this, [this]() { applyPreset("Linear"); });
@@ -441,6 +603,10 @@ void CubicBezierEditorWidget::setupUi()
     connect(m_btnEaseOut, &QPushButton::clicked, this, [this]() { applyPreset("Ease-Out"); });
     connect(m_btnEaseInOut, &QPushButton::clicked, this, [this]() { applyPreset("Ease-In-Out"); });
     connect(m_btnBounce, &QPushButton::clicked, this, [this]() { applyPreset("Bounce"); });
+    connect(m_btnSavePreset, &QPushButton::clicked, this,
+            &CubicBezierEditorWidget::onSaveCustomPresetClicked);
+    connect(m_savedPresetCombo, QOverload<int>::of(&QComboBox::activated), this,
+            &CubicBezierEditorWidget::onSavedPresetActivated);
 
     // Right Column: Scrollable Curve Parameters & GPU Transition Settings
     auto *rightScroll = new QScrollArea(this);
@@ -479,9 +645,10 @@ void CubicBezierEditorWidget::setupUi()
         auto *spin = new QDoubleSpinBox(parentWidget);
         spin->setRange(min, max);
         spin->setSingleStep(step);
-        spin->setDecimals(2);
+        spin->setDecimals(3);
+        spin->setKeyboardTracking(false);
         spin->setFixedHeight(20);
-        spin->setMinimumWidth(48);
+        spin->setMinimumWidth(52);
         spin->setStyleSheet(
             "QDoubleSpinBox { background: #181b22; color: #e2e8f0; border: 1px solid #2c3240; "
             "border-radius: 3px; padding: 0px 3px; font-size: 9px; }");
@@ -489,9 +656,9 @@ void CubicBezierEditorWidget::setupUi()
     };
 
     m_spinP1x = makeDoubleSpin(coordsGroup, 0.0, 1.0, 0.02);
-    m_spinP1y = makeDoubleSpin(coordsGroup, -0.5, 1.5, 0.05);
+    m_spinP1y = makeDoubleSpin(coordsGroup, -0.75, 1.75, 0.05);
     m_spinP2x = makeDoubleSpin(coordsGroup, 0.0, 1.0, 0.02);
-    m_spinP2y = makeDoubleSpin(coordsGroup, -0.5, 1.5, 0.05);
+    m_spinP2y = makeDoubleSpin(coordsGroup, -0.75, 1.75, 0.05);
 
     coordsLayout->addWidget(makeParamLabel("P1.x:", coordsGroup), 0, 0);
     coordsLayout->addWidget(m_spinP1x, 0, 1);
@@ -505,11 +672,28 @@ void CubicBezierEditorWidget::setupUi()
 
     m_cssReadoutLabel = new QLabel(coordsGroup);
     m_cssReadoutLabel->setMinimumWidth(80);
-    m_cssReadoutLabel->setFixedHeight(15);
+    m_cssReadoutLabel->setFixedHeight(16);
     m_cssReadoutLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    m_cssReadoutLabel->setTextInteractionFlags(Qt::TextSelectableByMouse |
+                                               Qt::TextSelectableByKeyboard);
     m_cssReadoutLabel->setStyleSheet(
         "color: #38bdf8; font-family: monospace; font-size: 9px; padding: 0px;");
     coordsLayout->addWidget(m_cssReadoutLabel, 2, 0, 1, 4);
+
+    auto *exportRow = new QHBoxLayout();
+    exportRow->setContentsMargins(0, 0, 0, 0);
+    exportRow->setSpacing(4);
+    m_btnCopyCss = makePresetBtn(tr("Copy CSS"));
+    m_btnCopyCss->setFixedHeight(19);
+    m_btnExportJson = makePresetBtn(tr("Export JSON"));
+    m_btnExportJson->setFixedHeight(19);
+    exportRow->addWidget(m_btnCopyCss);
+    exportRow->addWidget(m_btnExportJson);
+    coordsLayout->addLayout(exportRow, 3, 0, 1, 4);
+
+    connect(m_btnCopyCss, &QPushButton::clicked, this, &CubicBezierEditorWidget::onCopyCssClicked);
+    connect(m_btnExportJson, &QPushButton::clicked, this,
+            &CubicBezierEditorWidget::onExportJsonClicked);
 
     rightLayout->addWidget(coordsGroup);
 
@@ -589,12 +773,12 @@ void CubicBezierEditorWidget::setupUi()
     transLayout->addWidget(m_spinDuration, 1, 1);
     transLayout->addWidget(m_sliderDuration, 1, 2, 1, 2);
 
-    // Row 2: Angle Spin + Slider
+    // Row 2: Angle Spin + Slider (0.1 deg slider resolution to preserve decimals)
     m_spinAngle = makeDoubleSpin(transGroup, 0.0, 360.0, 5.0);
     m_spinAngle->setSuffix(" deg");
     m_sliderAngle = new QSlider(Qt::Horizontal, transGroup);
     m_sliderAngle->setFixedHeight(16);
-    m_sliderAngle->setRange(0, 360);
+    m_sliderAngle->setRange(0, 3600);
     m_sliderAngle->setMinimumWidth(40);
 
     transLayout->addWidget(makeParamLabel("Angle:", transGroup), 2, 0);
@@ -647,7 +831,8 @@ void CubicBezierEditorWidget::setupUi()
             &CubicBezierEditorWidget::onFpsChanged);
     connect(m_spinAngle, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             &CubicBezierEditorWidget::onAngleChanged);
-    connect(m_sliderAngle, &QSlider::valueChanged, [this](int val) { m_spinAngle->setValue(val); });
+    connect(m_sliderAngle, &QSlider::valueChanged, this,
+            [this](int val) { m_spinAngle->setValue(static_cast<double>(val) / 10.0); });
     connect(m_spinWaveFreq, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             &CubicBezierEditorWidget::onWaveFreqChanged);
     connect(m_spinWaveAmp, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
@@ -662,6 +847,21 @@ void CubicBezierEditorWidget::updateUiFromConfig()
 {
     m_updatingUi = true;
 
+    const QSignalBlocker blockP1x(m_spinP1x);
+    const QSignalBlocker blockP1y(m_spinP1y);
+    const QSignalBlocker blockP2x(m_spinP2x);
+    const QSignalBlocker blockP2y(m_spinP2y);
+    const QSignalBlocker blockType(m_comboTransitionType);
+    const QSignalBlocker blockDurSpin(m_spinDuration);
+    const QSignalBlocker blockDurSlider(m_sliderDuration);
+    const QSignalBlocker blockFps(m_spinFps);
+    const QSignalBlocker blockAngSpin(m_spinAngle);
+    const QSignalBlocker blockAngSlider(m_sliderAngle);
+    const QSignalBlocker blockFreq(m_spinWaveFreq);
+    const QSignalBlocker blockAmp(m_spinWaveAmp);
+    const QSignalBlocker blockCx(m_spinCenterX);
+    const QSignalBlocker blockCy(m_spinCenterY);
+
     m_canvas->setCurve(m_config.bezier);
     m_canvas->setDurationMs(m_config.durationMs);
     m_canvas->setAnimationFps(m_config.fps);
@@ -671,11 +871,7 @@ void CubicBezierEditorWidget::updateUiFromConfig()
     m_spinP2x->setValue(m_config.bezier.p2x);
     m_spinP2y->setValue(m_config.bezier.p2y);
 
-    m_cssReadoutLabel->setText(QString("CSS: cubic-bezier(%1, %2, %3, %4)")
-                                   .arg(QString::number(m_config.bezier.p1x, 'f', 2))
-                                   .arg(QString::number(m_config.bezier.p1y, 'f', 2))
-                                   .arg(QString::number(m_config.bezier.p2x, 'f', 2))
-                                   .arg(QString::number(m_config.bezier.p2y, 'f', 2)));
+    m_cssReadoutLabel->setText(QStringLiteral("CSS: %1").arg(cssTimingFunction()));
 
     int idx = m_comboTransitionType->findData(m_config.type);
     if (idx >= 0) {
@@ -686,7 +882,7 @@ void CubicBezierEditorWidget::updateUiFromConfig()
     m_sliderDuration->setValue(m_config.durationMs);
     m_spinFps->setValue(m_config.fps);
     m_spinAngle->setValue(m_config.angleDeg);
-    m_sliderAngle->setValue(static_cast<int>(m_config.angleDeg));
+    m_sliderAngle->setValue(static_cast<int>(std::lround(m_config.angleDeg * 10.0f)));
     m_spinWaveFreq->setValue(m_config.waveFreq);
     m_spinWaveAmp->setValue(m_config.waveAmp);
     m_spinCenterX->setValue(m_config.centerX);
@@ -695,27 +891,66 @@ void CubicBezierEditorWidget::updateUiFromConfig()
     m_updatingUi = false;
 }
 
-void CubicBezierEditorWidget::setCurve(const bezier_curve_t &curve, bool dispatchCommand)
+QString CubicBezierEditorWidget::cssTimingFunction() const
 {
-    bezier_curve_t oldCurve = m_config.bezier;
+    return QStringLiteral("cubic-bezier(%1, %2, %3, %4)")
+        .arg(QString::number(m_config.bezier.p1x, 'f', 3))
+        .arg(QString::number(m_config.bezier.p1y, 'f', 3))
+        .arg(QString::number(m_config.bezier.p2x, 'f', 3))
+        .arg(QString::number(m_config.bezier.p2y, 'f', 3));
+}
+
+QString CubicBezierEditorWidget::exportTransitionJson() const
+{
+    QJsonObject obj;
+    obj.insert(QStringLiteral("transition_type"), static_cast<int>(m_config.type));
+    obj.insert(QStringLiteral("duration_ms"), static_cast<int>(m_config.durationMs));
+    obj.insert(QStringLiteral("fps"), static_cast<int>(m_config.fps));
+    obj.insert(QStringLiteral("angle_deg"), static_cast<double>(m_config.angleDeg));
+    obj.insert(QStringLiteral("wave_freq"), static_cast<double>(m_config.waveFreq));
+    obj.insert(QStringLiteral("wave_amp"), static_cast<double>(m_config.waveAmp));
+    obj.insert(QStringLiteral("center_x"), static_cast<double>(m_config.centerX));
+    obj.insert(QStringLiteral("center_y"), static_cast<double>(m_config.centerY));
+    obj.insert(QStringLiteral("css"), cssTimingFunction());
+    QJsonObject bz;
+    bz.insert(QStringLiteral("p1x"), static_cast<double>(m_config.bezier.p1x));
+    bz.insert(QStringLiteral("p1y"), static_cast<double>(m_config.bezier.p1y));
+    bz.insert(QStringLiteral("p2x"), static_cast<double>(m_config.bezier.p2x));
+    bz.insert(QStringLiteral("p2y"), static_cast<double>(m_config.bezier.p2y));
+    obj.insert(QStringLiteral("bezier"), bz);
+    return QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+}
+
+void CubicBezierEditorWidget::applyCurveState(const bezier_curve_t &curve)
+{
     m_config.bezier = bezier_create(curve.p1x, curve.p1y, curve.p2x, curve.p2y);
     m_config.hasCustomBezier = true;
-
     updateUiFromConfig();
-
-    if (dispatchCommand && m_commandBus) {
-        auto cmd = std::make_unique<SetBezierCurveCommand>(
-            "all", oldCurve, m_config.bezier,
-            [this](const QString &output, const bezier_curve_t &c) {
-                (void)output;
-                setCurve(c, false);
-            });
-        m_commandBus->execute(std::move(cmd));
-    }
-
     emit curveChanged(m_config.bezier.p1x, m_config.bezier.p1y, m_config.bezier.p2x,
                       m_config.bezier.p2y);
     emit transitionConfigChanged(m_config);
+}
+
+void CubicBezierEditorWidget::setCurve(const bezier_curve_t &curve, bool dispatchCommand)
+{
+    const bezier_curve_t oldCurve = m_config.bezier;
+    const bezier_curve_t nextCurve = bezier_create(curve.p1x, curve.p1y, curve.p2x, curve.p2y);
+
+    if (dispatchCommand && m_commandBus) {
+        QPointer<CubicBezierEditorWidget> self(this);
+        auto cmd = std::make_unique<SetBezierCurveCommand>(
+            "all", oldCurve, nextCurve, [self](const QString &output, const bezier_curve_t &c) {
+                (void)output;
+                if (!self) {
+                    return;
+                }
+                self->applyCurveState(c);
+            });
+        m_commandBus->execute(std::move(cmd));
+        return;
+    }
+
+    applyCurveState(nextCurve);
 }
 
 void CubicBezierEditorWidget::setCurve(float p1x, float p1y, float p2x, float p2y,
@@ -756,37 +991,85 @@ void CubicBezierEditorWidget::setTransitionConfig(const TransitionConfig &config
 void CubicBezierEditorWidget::onCanvasCurveChanged(float p1x, float p1y, float p2x, float p2y,
                                                    bool isInteractive)
 {
-    bezier_curve_t oldCurve = m_config.bezier;
-    m_config.bezier = bezier_create(p1x, p1y, p2x, p2y);
-    m_config.hasCustomBezier = true;
+    if (!m_hasPendingDragBaseline) {
+        m_dragStartCurve = m_config.bezier;
+        m_hasPendingDragBaseline = true;
+    }
 
-    m_updatingUi = true;
-    m_spinP1x->setValue(p1x);
-    m_spinP1y->setValue(p1y);
-    m_spinP2x->setValue(p2x);
-    m_spinP2y->setValue(p2y);
-    m_cssReadoutLabel->setText(QString("CSS: cubic-bezier(%1, %2, %3, %4)")
-                                   .arg(QString::number(p1x, 'f', 2))
-                                   .arg(QString::number(p1y, 'f', 2))
-                                   .arg(QString::number(p2x, 'f', 2))
-                                   .arg(QString::number(p2y, 'f', 2)));
-    m_updatingUi = false;
+    const bezier_curve_t nextCurve = bezier_create(p1x, p1y, p2x, p2y);
+    if (isInteractive) {
+        m_config.bezier = nextCurve;
+        m_config.hasCustomBezier = true;
 
-    // Drag coalescing with CommandBus
+        m_updatingUi = true;
+        const QSignalBlocker blockP1x(m_spinP1x);
+        const QSignalBlocker blockP1y(m_spinP1y);
+        const QSignalBlocker blockP2x(m_spinP2x);
+        const QSignalBlocker blockP2y(m_spinP2y);
+        m_spinP1x->setValue(nextCurve.p1x);
+        m_spinP1y->setValue(nextCurve.p1y);
+        m_spinP2x->setValue(nextCurve.p2x);
+        m_spinP2y->setValue(nextCurve.p2y);
+        m_cssReadoutLabel->setText(QStringLiteral("CSS: %1").arg(cssTimingFunction()));
+        m_updatingUi = false;
+
+        emit curveChanged(nextCurve.p1x, nextCurve.p1y, nextCurve.p2x, nextCurve.p2y);
+        return;
+    }
+
+    const bezier_curve_t baseline = m_dragStartCurve;
+    m_hasPendingDragBaseline = false;
+
     if (m_commandBus) {
+        QPointer<CubicBezierEditorWidget> self(this);
         auto cmd = std::make_unique<SetBezierCurveCommand>(
-            "all", oldCurve, m_config.bezier,
-            [this](const QString &output, const bezier_curve_t &c) {
+            "all", baseline, nextCurve, [self](const QString &output, const bezier_curve_t &c) {
                 (void)output;
-                setCurve(c, false);
+                if (!self) {
+                    return;
+                }
+                self->applyCurveState(c);
             });
         m_commandBus->execute(std::move(cmd));
+    } else {
+        applyCurveState(nextCurve);
     }
+}
 
-    emit curveChanged(p1x, p1y, p2x, p2y);
-    if (!isInteractive) {
-        emit transitionConfigChanged(m_config);
+void CubicBezierEditorWidget::onCopyCssClicked()
+{
+    if (QClipboard *cb = QGuiApplication::clipboard()) {
+        cb->setText(cssTimingFunction());
     }
+}
+
+void CubicBezierEditorWidget::onExportJsonClicked()
+{
+    if (QClipboard *cb = QGuiApplication::clipboard()) {
+        cb->setText(exportTransitionJson());
+    }
+}
+
+void CubicBezierEditorWidget::onSaveCustomPresetClicked()
+{
+    const QString name =
+        QStringLiteral("Custom %1 (%2)").arg(m_customPresets.size() + 1).arg(cssTimingFunction());
+    m_customPresets.emplace_back(name, m_config.bezier);
+    m_savedPresetCombo->addItem(name, static_cast<int>(m_customPresets.size() - 1));
+    m_savedPresetCombo->setCurrentIndex(m_savedPresetCombo->count() - 1);
+}
+
+void CubicBezierEditorWidget::onSavedPresetActivated(int index)
+{
+    if (index <= 0) {
+        return;
+    }
+    const int customIdx = m_savedPresetCombo->itemData(index).toInt();
+    if (customIdx < 0 || customIdx >= static_cast<int>(m_customPresets.size())) {
+        return;
+    }
+    setCurve(m_customPresets[static_cast<size_t>(customIdx)].second, true);
+    emit presetApplied(m_customPresets[static_cast<size_t>(customIdx)].first);
 }
 
 void CubicBezierEditorWidget::onSpinBoxesCurveChanged()
@@ -815,7 +1098,10 @@ void CubicBezierEditorWidget::onDurationChanged(int val)
     if (m_updatingUi)
         return;
     m_config.durationMs = static_cast<uint32_t>(val);
-    m_sliderDuration->setValue(val);
+    {
+        const QSignalBlocker blocker(m_sliderDuration);
+        m_sliderDuration->setValue(val);
+    }
     m_canvas->setDurationMs(m_config.durationMs);
     emit transitionConfigChanged(m_config);
 }
@@ -834,7 +1120,10 @@ void CubicBezierEditorWidget::onAngleChanged(double val)
     if (m_updatingUi)
         return;
     m_config.angleDeg = static_cast<float>(val);
-    m_sliderAngle->setValue(static_cast<int>(val));
+    {
+        const QSignalBlocker blocker(m_sliderAngle);
+        m_sliderAngle->setValue(static_cast<int>(std::lround(val * 10.0)));
+    }
     emit transitionConfigChanged(m_config);
 }
 

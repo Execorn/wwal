@@ -77,6 +77,7 @@ class PhysicsSpringInspectorWidget : public QWidget {
 
   private:
     void setupUi();
+    void initDefaultContext();
     void syncUiFromSelectedBone();
     void refreshBoneTreeStates();
     QString boneDriveBadgeText(int32_t boneIndex, QColor &color) const;
@@ -101,11 +102,15 @@ class PhysicsSpringInspectorWidget : public QWidget {
     QTreeWidget *m_boneTree{nullptr};
     QComboBox *m_presetCombo{nullptr};
     QCheckBox *m_boneEnableCheck{nullptr};
+    QCheckBox *m_angularLimitCheck{nullptr};
+    QCheckBox *m_cursorCollideCheck{nullptr};
+    QCheckBox *m_pinnedRootCheck{nullptr};
     QDoubleSpinBox *m_stretchComplianceSpin{nullptr};
     QDoubleSpinBox *m_bendComplianceSpin{nullptr};
     QDoubleSpinBox *m_dampingSpin{nullptr};
     QDoubleSpinBox *m_massSpin{nullptr};
     QDoubleSpinBox *m_gravityScaleSpin{nullptr};
+    QDoubleSpinBox *m_windDragSpin{nullptr};
     QDoubleSpinBox *m_angleMinSpin{nullptr};
     QDoubleSpinBox *m_angleMaxSpin{nullptr};
     QDoubleSpinBox *m_collisionRadiusSpin{nullptr};
@@ -117,6 +122,8 @@ class PhysicsSpringInspectorWidget : public QWidget {
     QDoubleSpinBox *m_windGustSpin{nullptr};
     QDoubleSpinBox *m_windGustFreqSpin{nullptr};
     QDoubleSpinBox *m_windSpatialScaleSpin{nullptr};
+    QDoubleSpinBox *m_gravityXSpin{nullptr};
+    QDoubleSpinBox *m_gravityYSpin{nullptr};
     QCheckBox *m_cursorEnableCheck{nullptr};
     QDoubleSpinBox *m_cursorRadiusSpin{nullptr};
     QDoubleSpinBox *m_cursorStrengthSpin{nullptr};
