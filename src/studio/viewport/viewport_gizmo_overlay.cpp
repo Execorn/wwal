@@ -46,8 +46,8 @@ struct ProjectedPoint {
                                       const QMatrix4x4 &invViewProj, QVector3D &outOrigin,
                                       QVector3D &outDir) noexcept
 {
-    if (viewportSize.width() <= 0 || viewportSize.height() <= 0 ||
-        !std::isfinite(widgetPos.x()) || !std::isfinite(widgetPos.y())) {
+    if (viewportSize.width() <= 0 || viewportSize.height() <= 0 || !std::isfinite(widgetPos.x()) ||
+        !std::isfinite(widgetPos.y())) {
         return false;
     }
     const float ndcX =
@@ -58,16 +58,16 @@ struct ProjectedPoint {
 
     const QVector4D nearH = invViewProj.map(QVector4D(ndcX, ndcY, -1.0f, 1.0f));
     const QVector4D farH = invViewProj.map(QVector4D(ndcX, ndcY, 1.0f, 1.0f));
-    if (!std::isfinite(nearH.w()) || !std::isfinite(farH.w()) ||
-        std::abs(nearH.w()) < 1e-5f || std::abs(farH.w()) < 1e-5f) {
+    if (!std::isfinite(nearH.w()) || !std::isfinite(farH.w()) || std::abs(nearH.w()) < 1e-5f ||
+        std::abs(farH.w()) < 1e-5f) {
         return false;
     }
 
     outOrigin = nearH.toVector3DAffine();
     const QVector3D farPt = farH.toVector3DAffine();
     if (!std::isfinite(outOrigin.x()) || !std::isfinite(outOrigin.y()) ||
-        !std::isfinite(outOrigin.z()) || !std::isfinite(farPt.x()) ||
-        !std::isfinite(farPt.y()) || !std::isfinite(farPt.z())) {
+        !std::isfinite(outOrigin.z()) || !std::isfinite(farPt.x()) || !std::isfinite(farPt.y()) ||
+        !std::isfinite(farPt.z())) {
         return false;
     }
     const QVector3D dir = farPt - outOrigin;
@@ -562,13 +562,18 @@ GizmoAxisHandle ViewportGizmoOverlay::pickHandle(const QPointF &widgetPos,
         {GizmoAxisHandle::AxisY, origin + QVector3D(0.0f, s, 0.0f)},
         {GizmoAxisHandle::AxisZ, origin + QVector3D(0.0f, 0.0f, s)},
     }};
+    constexpr float kMinAxisScreenLenPx = 1.0f;
     for (const auto &[handle, endWorld] : axisEnds) {
         const ProjectedPoint pEnd = projectWorldToWidget(endWorld, viewportSize, viewProj);
         if (!pEnd.valid) {
             continue;
         }
+        // Skip axes foreshortened to a point (such as AxisZ in 2D ortho) so they cannot shadow X/Y.
+        if (distance2D(p0.screenPos, pEnd.screenPos) < kMinAxisScreenLenPx) {
+            continue;
+        }
         const float dist = distancePointToSegment2D(widgetPos, p0.screenPos, pEnd.screenPos);
-        if (dist <= bestDist) {
+        if (dist < bestDist || (best == GizmoAxisHandle::None && dist <= bestDist)) {
             bestDist = dist;
             best = handle;
         }
@@ -804,18 +809,28 @@ ViewportGizmoOverlay::updateDrag(const QPointF &widgetPos, const QSize &viewport
     };
 
     const auto computeAxisDelta = [&](const QVector3D &axisDir) -> float {
+        if (axisDir.lengthSquared() < 1e-8f) {
+            return 0.0f;
+        }
+        const QVector3D axisUnit = axisDir.normalized();
         if (raysOk) {
-            QVector3D tangent = QVector3D::crossProduct(axisDir, r0Dir);
-            if (tangent.lengthSquared() < 1e-6f) {
-                tangent = QVector3D::crossProduct(axisDir,
-                                                  QVector3D(axisDir.y(), axisDir.z(), axisDir.x()));
+            const QVector3D tangent = QVector3D::crossProduct(axisUnit, r0Dir);
+            // Any plane containing an axis collinear with the view ray (e.g. AxisZ in 2D ortho)
+            // is edge-on to the camera; degrade cleanly instead of picking an orthogonal normal.
+            if (tangent.lengthSquared() < 1e-4f) {
+                return 0.0f;
             }
-            const QVector3D planeNormal = QVector3D::crossProduct(tangent, axisDir).normalized();
+            const QVector3D planeNormal = QVector3D::crossProduct(tangent, axisUnit).normalized();
+            if (planeNormal.lengthSquared() < 1e-6f ||
+                std::abs(QVector3D::dotProduct(r0Dir, planeNormal)) < 1e-3f) {
+                return 0.0f;
+            }
             const QVector3D d = computeWorldDelta(planeNormal);
-            return QVector3D::dotProduct(d, axisDir);
+            const float proj = QVector3D::dotProduct(d, axisUnit);
+            return std::isfinite(proj) ? proj : 0.0f;
         }
         const ProjectedPoint p0 = projectWorldToWidget(origin0, viewportSize, viewProj);
-        const ProjectedPoint p1 = projectWorldToWidget(origin0 + axisDir, viewportSize, viewProj);
+        const ProjectedPoint p1 = projectWorldToWidget(origin0 + axisUnit, viewportSize, viewProj);
         if (!p0.valid || !p1.valid) {
             return 0.0f;
         }
@@ -826,7 +841,9 @@ ViewportGizmoOverlay::updateDrag(const QPointF &widgetPos, const QSize &viewport
             return 0.0f;
         }
         const QPointF dPx = widgetPos - m_dragStartWidgetPos;
-        return static_cast<float>(dPx.x() * screenAxis.x() + dPx.y() * screenAxis.y()) / pxSq;
+        const float proj =
+            static_cast<float>(dPx.x() * screenAxis.x() + dPx.y() * screenAxis.y()) / pxSq;
+        return std::isfinite(proj) ? proj : 0.0f;
     };
 
     if (m_toolMode == ViewportToolMode::Translate) {
@@ -890,31 +907,30 @@ ViewportGizmoOverlay::updateDrag(const QPointF &widgetPos, const QSize &viewport
         float factorZ = 1.0f;
 
         if (m_activeHandle == GizmoAxisHandle::AxisX) {
-            factorX = std::clamp(
-                1.0f + computeAxisDelta(QVector3D(1.0f, 0.0f, 0.0f)) / normDenom, 0.01f, 100.0f);
+            factorX = std::clamp(1.0f + computeAxisDelta(QVector3D(1.0f, 0.0f, 0.0f)) / normDenom,
+                                 0.01f, 100.0f);
             if (lockAspect) {
                 factorY = factorX;
                 factorZ = factorX;
             }
         } else if (m_activeHandle == GizmoAxisHandle::AxisY) {
-            factorY = std::clamp(
-                1.0f + computeAxisDelta(QVector3D(0.0f, 1.0f, 0.0f)) / normDenom, 0.01f, 100.0f);
+            factorY = std::clamp(1.0f + computeAxisDelta(QVector3D(0.0f, 1.0f, 0.0f)) / normDenom,
+                                 0.01f, 100.0f);
             if (lockAspect) {
                 factorX = factorY;
                 factorZ = factorY;
             }
         } else if (m_activeHandle == GizmoAxisHandle::AxisZ) {
-            factorZ = std::clamp(
-                1.0f + computeAxisDelta(QVector3D(0.0f, 0.0f, 1.0f)) / normDenom, 0.01f, 100.0f);
+            factorZ = std::clamp(1.0f + computeAxisDelta(QVector3D(0.0f, 0.0f, 1.0f)) / normDenom,
+                                 0.01f, 100.0f);
             if (lockAspect) {
                 factorX = factorZ;
                 factorY = factorZ;
             }
         } else if (m_activeHandle == GizmoAxisHandle::PlaneXY) {
             const QVector3D planeDelta = computeWorldDelta(QVector3D(0.0f, 0.0f, 1.0f));
-            const float uniform =
-                std::clamp(1.0f + 0.5f * (planeDelta.x() + planeDelta.y()) / normDenom, 0.01f,
-                           100.0f);
+            const float uniform = std::clamp(
+                1.0f + 0.5f * (planeDelta.x() + planeDelta.y()) / normDenom, 0.01f, 100.0f);
             factorX = uniform;
             factorY = uniform;
             if (lockAspect) {
@@ -1443,8 +1459,8 @@ void ViewportGizmoOverlay::buildHeatmapTriangleVertices(std::vector<GizmoVertex>
         bool finiteTri = true;
         for (size_t c = 0; c < 3; ++c) {
             const auto &v = m_meshWireframe.vertices[tri[c]];
-            const QVector3D wp = puppetLocalToCanvasWorld(
-                QVector3D(v.pos[0], v.pos[1], v.pos[2]), contentSize);
+            const QVector3D wp =
+                puppetLocalToCanvasWorld(QVector3D(v.pos[0], v.pos[1], v.pos[2]), contentSize);
             if (!isFiniteVec3(wp)) {
                 finiteTri = false;
                 break;
