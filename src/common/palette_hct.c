@@ -5,6 +5,7 @@
 #include "waywal/palette_hct.h"
 
 #include "waywal/log.h"
+#include "waywal/os_compat.h"
 #include "waywal/path.h"
 #include "waywal/toml_parser.h"
 
@@ -12,10 +13,12 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#if defined(__x86_64__) && !defined(WWAL_DISABLE_SIMD)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+#include <cpuid.h>
 #include <immintrin.h>
 #endif
 #include <math.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -53,14 +56,18 @@ typedef struct {
     float w, l, a, b, m2, pad[3];
 } wu_bin_t;
 
-typedef struct {
-    wu_bin_t bins[WU_GRID][WU_GRID][WU_GRID] __attribute__((aligned(32)));
+typedef struct wwal_wu_hist {
+    _Alignas(64) wu_bin_t bins[WU_GRID][WU_GRID][WU_GRID];
     uint16_t active_bins[WU_BINS * WU_BINS * WU_BINS];
     uint32_t num_active;
     int min_l, max_l;
     int min_a, max_a;
     int min_b, max_b;
-} wu_hist_t;
+} wwal_wu_hist_t;
+
+_Static_assert(_Alignof(wwal_wu_hist_t) >= 64u, "Histogram must stay 64-byte aligned");
+_Static_assert((sizeof(wwal_wu_hist_t) % 64u) == 0u,
+               "wwal_wu_hist_t size must be a 64-byte multiple for aligned_alloc");
 
 typedef struct {
     float l;
@@ -71,15 +78,18 @@ typedef struct {
 
 static float g_srgb_to_linear[256];
 static uint8_t g_linear_to_srgb_lut[4097];
+static pthread_once_t g_srgb_lut_once = PTHREAD_ONCE_INIT;
 static atomic_bool g_srgb_lut_ready = false;
+
+static pthread_once_t g_wu_tls_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_wu_tls_key;
+static atomic_bool g_wu_tls_key_ready = false;
+static _Thread_local wwal_wu_hist_t *t_wu_hist = NULL;
 
 static inline int clamp_i(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
 
-static void ensure_srgb_lut(void)
+static void init_srgb_lut_once(void)
 {
-    if (atomic_load_explicit(&g_srgb_lut_ready, memory_order_acquire)) {
-        return;
-    }
     for (int i = 0; i < 256; ++i) {
         float s = (float)i * (1.0f / 255.0f);
         if (s <= 0.04045f) {
@@ -98,7 +108,121 @@ static void ensure_srgb_lut(void)
     atomic_store_explicit(&g_srgb_lut_ready, true, memory_order_release);
 }
 
-__attribute__((constructor)) static void init_palette_lut_ctor(void) { ensure_srgb_lut(); }
+static inline void ensure_srgb_lut(void)
+{
+    if (__builtin_expect(!atomic_load_explicit(&g_srgb_lut_ready, memory_order_acquire), 0)) {
+        (void)pthread_once(&g_srgb_lut_once, init_srgb_lut_once);
+    }
+}
+
+static void wu_hist_tls_dtor(void *ptr)
+{
+    if (t_wu_hist == ptr) {
+        t_wu_hist = NULL;
+    }
+    free(ptr);
+}
+
+static void wu_hist_tls_key_init(void)
+{
+    if (pthread_key_create(&g_wu_tls_key, wu_hist_tls_dtor) == 0) {
+        atomic_store_explicit(&g_wu_tls_key_ready, true, memory_order_release);
+    }
+}
+
+static wwal_wu_hist_t *acquire_wu_hist(bool *out_owned)
+{
+    *out_owned = false;
+    if (__builtin_expect(t_wu_hist != NULL, 1)) {
+        return t_wu_hist;
+    }
+
+    (void)pthread_once(&g_wu_tls_key_once, wu_hist_tls_key_init);
+
+    const size_t alloc_sz = (sizeof(wwal_wu_hist_t) + 63u) & ~(size_t)63u;
+    wwal_wu_hist_t *hist = (wwal_wu_hist_t *)aligned_alloc(64u, alloc_sz);
+    if (!hist) {
+        return NULL;
+    }
+
+    if (atomic_load_explicit(&g_wu_tls_key_ready, memory_order_acquire) &&
+        pthread_setspecific(g_wu_tls_key, hist) == 0) {
+        t_wu_hist = hist;
+        return hist;
+    }
+
+    *out_owned = true;
+    return hist;
+}
+
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+static pthread_once_t g_cpu_caps_once = PTHREAD_ONCE_INIT;
+static atomic_bool g_cpu_caps_ready = false;
+static bool g_cpu_has_avx2 = false;
+static bool g_cpu_has_avx2_fma = false;
+
+__attribute__((target("xsave"))) static uint64_t read_xcr0_xsave(void)
+{
+    return (uint64_t)_xgetbv(0);
+}
+
+static void detect_cpu_caps_once(void)
+{
+    if (__get_cpuid_max(0, NULL) < 7u) {
+        atomic_store_explicit(&g_cpu_caps_ready, true, memory_order_release);
+        return;
+    }
+    unsigned int eax1 = 0, ebx1 = 0, ecx1 = 0, edx1 = 0;
+    if (!__get_cpuid(1, &eax1, &ebx1, &ecx1, &edx1)) {
+        atomic_store_explicit(&g_cpu_caps_ready, true, memory_order_release);
+        return;
+    }
+    /* Require OSXSAVE, XSAVE, and AVX before executing XGETBV so older CPUs do not fault. */
+    const unsigned int need_ecx1 = (1u << 26) | (1u << 27) | (1u << 28);
+    if ((ecx1 & need_ecx1) != need_ecx1) {
+        atomic_store_explicit(&g_cpu_caps_ready, true, memory_order_release);
+        return;
+    }
+    /* Verify OS enabled both XMM (bit 1) and YMM (bit 2) register state in XCR0. */
+    if ((read_xcr0_xsave() & 0x6ULL) != 0x6ULL) {
+        atomic_store_explicit(&g_cpu_caps_ready, true, memory_order_release);
+        return;
+    }
+    unsigned int eax7 = 0, ebx7 = 0, ecx7 = 0, edx7 = 0;
+    if (__get_cpuid_count(7, 0, &eax7, &ebx7, &ecx7, &edx7)) {
+        g_cpu_has_avx2 = (ebx7 & (1u << 5)) != 0u;
+        g_cpu_has_avx2_fma = g_cpu_has_avx2 && ((ecx1 & (1u << 12)) != 0u);
+    }
+    atomic_store_explicit(&g_cpu_caps_ready, true, memory_order_release);
+}
+
+static inline void ensure_cpu_caps(void)
+{
+    if (__builtin_expect(!atomic_load_explicit(&g_cpu_caps_ready, memory_order_acquire), 0)) {
+        (void)pthread_once(&g_cpu_caps_once, detect_cpu_caps_once);
+    }
+}
+
+static inline bool cpu_supports_avx2(void)
+{
+    ensure_cpu_caps();
+    return g_cpu_has_avx2;
+}
+
+static inline bool cpu_supports_avx2_fma(void)
+{
+    ensure_cpu_caps();
+    return g_cpu_has_avx2_fma;
+}
+#endif
+
+__attribute__((constructor)) static void init_palette_lut_ctor(void)
+{
+    ensure_srgb_lut();
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+    ensure_cpu_caps();
+#endif
+}
 
 static inline float clamp_f(float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); }
 
@@ -122,7 +246,7 @@ static inline float hue_diff_deg(float h1_deg, float h2_deg)
 
 static inline float fast_cbrtf_scalar(float x)
 {
-    if (x <= 1e-24f) {
+    if (!isfinite(x) || x <= 1e-24f) {
         return 0.0f;
     }
     union {
@@ -140,15 +264,13 @@ static inline float fast_cbrtf_scalar(float x)
 
 static inline uint8_t linear_to_srgb_u8(float c)
 {
-    if (c <= 0.0f) {
+    if (!(c > 0.0f)) {
         return 0;
     }
     if (c >= 1.0f) {
         return 255;
     }
-    if (__builtin_expect(!atomic_load_explicit(&g_srgb_lut_ready, memory_order_relaxed), 0)) {
-        ensure_srgb_lut();
-    }
+    ensure_srgb_lut();
     int idx = (int)(sqrtf(c) * 4096.0f + 0.5f);
     return g_linear_to_srgb_lut[clamp_i(idx, 0, 4096)];
 }
@@ -193,7 +315,7 @@ static inline bool linear_rgb_in_gamut(float r, float g, float b)
             b <= 1.0f + eps);
 }
 
-#if defined(__x86_64__) && !defined(WWAL_DISABLE_SIMD)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
 __attribute__((target("avx2,fma"))) static inline __m256 avx2_cbrt_ps(__m256 x)
 {
     const __m256 eps = _mm256_set1_ps(1e-24f);
@@ -223,7 +345,7 @@ __attribute__((target("avx2,fma"))) static inline __m256 avx2_cbrt_ps(__m256 x)
 }
 #endif
 
-static inline void wu_hist_reset(wu_hist_t *hist)
+static inline void wu_hist_reset(wwal_wu_hist_t *hist)
 {
     memset(hist->bins, 0, sizeof(hist->bins));
     hist->num_active = 0;
@@ -235,7 +357,7 @@ static inline void wu_hist_reset(wu_hist_t *hist)
     hist->max_b = 1;
 }
 
-static inline void wu_accum_pixel(wu_hist_t *hist, float l, float a, float b)
+static inline void wu_accum_pixel(wwal_wu_hist_t *hist, float l, float a, float b)
 {
     int bl = clamp_i((int)(l * (float)WU_BINS) + 1, 1, WU_BINS);
     int ba = clamp_i((int)(((a + 0.4f) * (1.0f / 0.8f)) * (float)WU_BINS) + 1, 1, WU_BINS);
@@ -267,10 +389,10 @@ static inline void wu_accum_pixel(wu_hist_t *hist, float l, float a, float b)
     bin->m2 += (l * l + a * a + b * b);
 }
 
-#if defined(__x86_64__) && !defined(WWAL_DISABLE_SIMD)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
 __attribute__((target("avx2,fma"))) static size_t
-wu_populate_histogram_avx2(wu_hist_t *hist, const uint8_t *pixels, uint32_t width, uint32_t height,
-                           uint32_t stride_bytes, bool is_bgra)
+wu_populate_histogram_avx2(wwal_wu_hist_t *hist, const uint8_t *pixels, uint32_t width,
+                           uint32_t height, uint32_t stride_bytes, bool is_bgra)
 {
     wu_hist_reset(hist);
 
@@ -360,7 +482,7 @@ wu_populate_histogram_avx2(wu_hist_t *hist, const uint8_t *pixels, uint32_t widt
     return valid_samples;
 }
 
-__attribute__((target("avx2,fma"))) static void wu_compute_moments_avx2(wu_hist_t *hist)
+__attribute__((target("avx2"))) static void wu_compute_moments_avx2(wwal_wu_hist_t *hist)
 {
     int l0 = hist->min_l <= hist->max_l ? hist->min_l : 1;
     int l1 = hist->min_l <= hist->max_l ? hist->max_l : WU_BINS;
@@ -389,11 +511,11 @@ __attribute__((target("avx2,fma"))) static void wu_compute_moments_avx2(wu_hist_
 }
 #endif
 
-static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint32_t width,
+static size_t wu_populate_histogram(wwal_wu_hist_t *hist, const uint8_t *pixels, uint32_t width,
                                     uint32_t height, uint32_t stride_bytes, bool is_bgra)
 {
-#if defined(__x86_64__) && !defined(WWAL_DISABLE_SIMD)
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+    if (cpu_supports_avx2_fma()) {
         return wu_populate_histogram_avx2(hist, pixels, width, height, stride_bytes, is_bgra);
     }
 #endif
@@ -430,13 +552,13 @@ static size_t wu_populate_histogram(wu_hist_t *hist, const uint8_t *pixels, uint
     return valid_samples;
 }
 
-static void wu_compute_moments(wu_hist_t *hist)
+static void wu_compute_moments(wwal_wu_hist_t *hist)
 {
     if (hist->num_active <= WU_MAX_BOXES) {
         return;
     }
-#if defined(__x86_64__) && !defined(WWAL_DISABLE_SIMD)
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+    if (cpu_supports_avx2()) {
         wu_compute_moments_avx2(hist);
         return;
     }
@@ -484,10 +606,55 @@ static void wu_compute_moments(wu_hist_t *hist)
     }
 }
 
-static inline wu_bin_t wu_vol_bin(const wu_box_t *box, const wu_hist_t *hist)
+static inline void wu_bottom_ptrs(const wu_box_t *box, int dir, const wwal_wu_hist_t *hist,
+                                  const wu_bin_t **p0, const wu_bin_t **p1, const wu_bin_t **p2,
+                                  const wu_bin_t **p3)
+{
+    if (dir == 0) {
+        *p0 = &hist->bins[box->l0][box->a1][box->b1];
+        *p1 = &hist->bins[box->l0][box->a1][box->b0];
+        *p2 = &hist->bins[box->l0][box->a0][box->b1];
+        *p3 = &hist->bins[box->l0][box->a0][box->b0];
+    } else if (dir == 1) {
+        *p0 = &hist->bins[box->l1][box->a0][box->b1];
+        *p1 = &hist->bins[box->l1][box->a0][box->b0];
+        *p2 = &hist->bins[box->l0][box->a0][box->b1];
+        *p3 = &hist->bins[box->l0][box->a0][box->b0];
+    } else {
+        *p0 = &hist->bins[box->l1][box->a1][box->b0];
+        *p1 = &hist->bins[box->l1][box->a0][box->b0];
+        *p2 = &hist->bins[box->l0][box->a1][box->b0];
+        *p3 = &hist->bins[box->l0][box->a0][box->b0];
+    }
+}
+
+static inline void wu_top_ptrs(const wu_box_t *box, int dir, int pos, const wwal_wu_hist_t *hist,
+                               const wu_bin_t **p0, const wu_bin_t **p1, const wu_bin_t **p2,
+                               const wu_bin_t **p3)
+{
+    if (dir == 0) {
+        *p0 = &hist->bins[pos][box->a1][box->b1];
+        *p1 = &hist->bins[pos][box->a1][box->b0];
+        *p2 = &hist->bins[pos][box->a0][box->b1];
+        *p3 = &hist->bins[pos][box->a0][box->b0];
+    } else if (dir == 1) {
+        *p0 = &hist->bins[box->l1][pos][box->b1];
+        *p1 = &hist->bins[box->l1][pos][box->b0];
+        *p2 = &hist->bins[box->l0][pos][box->b1];
+        *p3 = &hist->bins[box->l0][pos][box->b0];
+    } else {
+        *p0 = &hist->bins[box->l1][box->a1][pos];
+        *p1 = &hist->bins[box->l1][box->a0][pos];
+        *p2 = &hist->bins[box->l0][box->a1][pos];
+        *p3 = &hist->bins[box->l0][box->a0][pos];
+    }
+}
+
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+__attribute__((target("avx2"))) static inline wu_bin_t wu_vol_bin_avx2(const wu_box_t *box,
+                                                                       const wwal_wu_hist_t *hist)
 {
     wu_bin_t out;
-#if defined(__AVX2__) && !defined(WWAL_DISABLE_SIMD)
     __m256 v = _mm256_load_ps(&hist->bins[box->l1][box->a1][box->b1].w);
     v = _mm256_sub_ps(v, _mm256_load_ps(&hist->bins[box->l1][box->a1][box->b0].w));
     v = _mm256_sub_ps(v, _mm256_load_ps(&hist->bins[box->l1][box->a0][box->b1].w));
@@ -497,7 +664,42 @@ static inline wu_bin_t wu_vol_bin(const wu_box_t *box, const wu_hist_t *hist)
     v = _mm256_add_ps(v, _mm256_load_ps(&hist->bins[box->l0][box->a0][box->b1].w));
     v = _mm256_sub_ps(v, _mm256_load_ps(&hist->bins[box->l0][box->a0][box->b0].w));
     _mm256_storeu_ps(&out.w, v);
+    return out;
+}
+
+__attribute__((target("avx2"))) static inline wu_bin_t
+wu_bottom_bin_avx2(const wu_bin_t *p0, const wu_bin_t *p1, const wu_bin_t *p2, const wu_bin_t *p3)
+{
+    wu_bin_t out;
+    __m256 v = _mm256_sub_ps(_mm256_load_ps(&p1->w), _mm256_load_ps(&p0->w));
+    v = _mm256_add_ps(v, _mm256_load_ps(&p2->w));
+    v = _mm256_sub_ps(v, _mm256_load_ps(&p3->w));
+    _mm256_storeu_ps(&out.w, v);
+    return out;
+}
+
+__attribute__((target("avx2"))) static inline wu_bin_t
+wu_top_bin_avx2(const wu_bin_t *p0, const wu_bin_t *p1, const wu_bin_t *p2, const wu_bin_t *p3)
+{
+    wu_bin_t out;
+    __m256 v = _mm256_sub_ps(_mm256_load_ps(&p0->w), _mm256_load_ps(&p1->w));
+    v = _mm256_sub_ps(v, _mm256_load_ps(&p2->w));
+    v = _mm256_add_ps(v, _mm256_load_ps(&p3->w));
+    _mm256_storeu_ps(&out.w, v);
+    return out;
+}
+#endif
+
+__attribute__((always_inline)) static inline wu_bin_t
+wu_vol_bin_dispatch(const wu_box_t *box, const wwal_wu_hist_t *hist, bool use_avx2)
+{
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+    if (use_avx2) {
+        return wu_vol_bin_avx2(box, hist);
+    }
 #else
+    (void)use_avx2;
+#endif
     const wu_bin_t *c111 = &hist->bins[box->l1][box->a1][box->b1];
     const wu_bin_t *c110 = &hist->bins[box->l1][box->a1][box->b0];
     const wu_bin_t *c101 = &hist->bins[box->l1][box->a0][box->b1];
@@ -506,88 +708,68 @@ static inline wu_bin_t wu_vol_bin(const wu_box_t *box, const wu_hist_t *hist)
     const wu_bin_t *c010 = &hist->bins[box->l0][box->a1][box->b0];
     const wu_bin_t *c001 = &hist->bins[box->l0][box->a0][box->b1];
     const wu_bin_t *c000 = &hist->bins[box->l0][box->a0][box->b0];
-    out.w = c111->w - c110->w - c101->w + c100->w - c011->w + c010->w + c001->w - c000->w;
-    out.l = c111->l - c110->l - c101->l + c100->l - c011->l + c010->l + c001->l - c000->l;
-    out.a = c111->a - c110->a - c101->a + c100->a - c011->a + c010->a + c001->a - c000->a;
-    out.b = c111->b - c110->b - c101->b + c100->b - c011->b + c010->b + c001->b - c000->b;
-    out.m2 = c111->m2 - c110->m2 - c101->m2 + c100->m2 - c011->m2 + c010->m2 + c001->m2 - c000->m2;
-#endif
+    wu_bin_t out = {
+        .w = c111->w - c110->w - c101->w + c100->w - c011->w + c010->w + c001->w - c000->w,
+        .l = c111->l - c110->l - c101->l + c100->l - c011->l + c010->l + c001->l - c000->l,
+        .a = c111->a - c110->a - c101->a + c100->a - c011->a + c010->a + c001->a - c000->a,
+        .b = c111->b - c110->b - c101->b + c100->b - c011->b + c010->b + c001->b - c000->b,
+        .m2 = c111->m2 - c110->m2 - c101->m2 + c100->m2 - c011->m2 + c010->m2 + c001->m2 - c000->m2,
+        .pad = {0.0f, 0.0f, 0.0f},
+    };
     return out;
 }
 
-static inline wu_bin_t wu_bottom_bin(const wu_box_t *box, int dir, const wu_hist_t *hist)
+__attribute__((always_inline)) static inline wu_bin_t
+wu_bottom_bin_dispatch(const wu_box_t *box, int dir, const wwal_wu_hist_t *hist, bool use_avx2)
 {
-    wu_bin_t out;
     const wu_bin_t *p0, *p1, *p2, *p3;
-    if (dir == 0) {
-        p0 = &hist->bins[box->l0][box->a1][box->b1];
-        p1 = &hist->bins[box->l0][box->a1][box->b0];
-        p2 = &hist->bins[box->l0][box->a0][box->b1];
-        p3 = &hist->bins[box->l0][box->a0][box->b0];
-    } else if (dir == 1) {
-        p0 = &hist->bins[box->l1][box->a0][box->b1];
-        p1 = &hist->bins[box->l1][box->a0][box->b0];
-        p2 = &hist->bins[box->l0][box->a0][box->b1];
-        p3 = &hist->bins[box->l0][box->a0][box->b0];
-    } else {
-        p0 = &hist->bins[box->l1][box->a1][box->b0];
-        p1 = &hist->bins[box->l1][box->a0][box->b0];
-        p2 = &hist->bins[box->l0][box->a1][box->b0];
-        p3 = &hist->bins[box->l0][box->a0][box->b0];
+    wu_bottom_ptrs(box, dir, hist, &p0, &p1, &p2, &p3);
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+    if (use_avx2) {
+        return wu_bottom_bin_avx2(p0, p1, p2, p3);
     }
-#if defined(__AVX2__) && !defined(WWAL_DISABLE_SIMD)
-    __m256 v = _mm256_sub_ps(_mm256_load_ps(&p1->w), _mm256_load_ps(&p0->w));
-    v = _mm256_add_ps(v, _mm256_load_ps(&p2->w));
-    v = _mm256_sub_ps(v, _mm256_load_ps(&p3->w));
-    _mm256_storeu_ps(&out.w, v);
 #else
-    out.w = -p0->w + p1->w + p2->w - p3->w;
-    out.l = -p0->l + p1->l + p2->l - p3->l;
-    out.a = -p0->a + p1->a + p2->a - p3->a;
-    out.b = -p0->b + p1->b + p2->b - p3->b;
-    out.m2 = -p0->m2 + p1->m2 + p2->m2 - p3->m2;
+    (void)use_avx2;
 #endif
+    wu_bin_t out = {
+        .w = -p0->w + p1->w + p2->w - p3->w,
+        .l = -p0->l + p1->l + p2->l - p3->l,
+        .a = -p0->a + p1->a + p2->a - p3->a,
+        .b = -p0->b + p1->b + p2->b - p3->b,
+        .m2 = -p0->m2 + p1->m2 + p2->m2 - p3->m2,
+        .pad = {0.0f, 0.0f, 0.0f},
+    };
     return out;
 }
 
-static inline wu_bin_t wu_top_bin(const wu_box_t *box, int dir, int pos, const wu_hist_t *hist)
+__attribute__((always_inline)) static inline wu_bin_t
+wu_top_bin_dispatch(const wu_box_t *box, int dir, int pos, const wwal_wu_hist_t *hist,
+                    bool use_avx2)
 {
-    wu_bin_t out;
     const wu_bin_t *p0, *p1, *p2, *p3;
-    if (dir == 0) {
-        p0 = &hist->bins[pos][box->a1][box->b1];
-        p1 = &hist->bins[pos][box->a1][box->b0];
-        p2 = &hist->bins[pos][box->a0][box->b1];
-        p3 = &hist->bins[pos][box->a0][box->b0];
-    } else if (dir == 1) {
-        p0 = &hist->bins[box->l1][pos][box->b1];
-        p1 = &hist->bins[box->l1][pos][box->b0];
-        p2 = &hist->bins[box->l0][pos][box->b1];
-        p3 = &hist->bins[box->l0][pos][box->b0];
-    } else {
-        p0 = &hist->bins[box->l1][box->a1][pos];
-        p1 = &hist->bins[box->l1][box->a0][pos];
-        p2 = &hist->bins[box->l0][box->a1][pos];
-        p3 = &hist->bins[box->l0][box->a0][pos];
+    wu_top_ptrs(box, dir, pos, hist, &p0, &p1, &p2, &p3);
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+    if (use_avx2) {
+        return wu_top_bin_avx2(p0, p1, p2, p3);
     }
-#if defined(__AVX2__) && !defined(WWAL_DISABLE_SIMD)
-    __m256 v = _mm256_sub_ps(_mm256_load_ps(&p0->w), _mm256_load_ps(&p1->w));
-    v = _mm256_sub_ps(v, _mm256_load_ps(&p2->w));
-    v = _mm256_add_ps(v, _mm256_load_ps(&p3->w));
-    _mm256_storeu_ps(&out.w, v);
 #else
-    out.w = p0->w - p1->w - p2->w + p3->w;
-    out.l = p0->l - p1->l - p2->l + p3->l;
-    out.a = p0->a - p1->a - p2->a + p3->a;
-    out.b = p0->b - p1->b - p2->b + p3->b;
-    out.m2 = p0->m2 - p1->m2 - p2->m2 + p3->m2;
+    (void)use_avx2;
 #endif
+    wu_bin_t out = {
+        .w = p0->w - p1->w - p2->w + p3->w,
+        .l = p0->l - p1->l - p2->l + p3->l,
+        .a = p0->a - p1->a - p2->a + p3->a,
+        .b = p0->b - p1->b - p2->b + p3->b,
+        .m2 = p0->m2 - p1->m2 - p2->m2 + p3->m2,
+        .pad = {0.0f, 0.0f, 0.0f},
+    };
     return out;
 }
 
-static float wu_box_variance(const wu_hist_t *hist, const wu_box_t *box)
+__attribute__((always_inline)) static inline float
+wu_box_variance_impl(const wwal_wu_hist_t *hist, const wu_box_t *box, bool use_avx2)
 {
-    wu_bin_t vol = wu_vol_bin(box, hist);
+    wu_bin_t vol = wu_vol_bin_dispatch(box, hist, use_avx2);
     if (vol.w <= 0.0f) {
         return 0.0f;
     }
@@ -595,16 +777,18 @@ static float wu_box_variance(const wu_hist_t *hist, const wu_box_t *box)
     return v > 0.0f ? v : 0.0f;
 }
 
-static float wu_maximize(const wu_hist_t *hist, const wu_box_t *box, int dir, int first, int last,
-                         int *out_cut, float whole_w, float whole_l, float whole_a, float whole_b)
+__attribute__((always_inline)) static inline float
+wu_maximize_impl(const wwal_wu_hist_t *hist, const wu_box_t *box, int dir, int first, int last,
+                 int *out_cut, float whole_w, float whole_l, float whole_a, float whole_b,
+                 bool use_avx2)
 {
-    wu_bin_t base = wu_bottom_bin(box, dir, hist);
+    wu_bin_t base = wu_bottom_bin_dispatch(box, dir, hist, use_avx2);
 
     float max_score = -1.0f;
     *out_cut = -1;
 
     for (int i = first; i < last; ++i) {
-        wu_bin_t top = wu_top_bin(box, dir, i, hist);
+        wu_bin_t top = wu_top_bin_dispatch(box, dir, i, hist, use_avx2);
         float half_w = base.w + top.w;
         if (half_w <= 0.0f) {
             continue;
@@ -634,20 +818,21 @@ static float wu_maximize(const wu_hist_t *hist, const wu_box_t *box, int dir, in
     return max_score;
 }
 
-static bool wu_cut(const wu_hist_t *hist, wu_box_t *set1, wu_box_t *set2)
+__attribute__((always_inline)) static inline bool
+wu_cut_impl(const wwal_wu_hist_t *hist, wu_box_t *set1, wu_box_t *set2, bool use_avx2)
 {
-    wu_bin_t whole = wu_vol_bin(set1, hist);
+    wu_bin_t whole = wu_vol_bin_dispatch(set1, hist, use_avx2);
     if (whole.w <= 0.0f) {
         return false;
     }
 
     int cut_l = -1, cut_a = -1, cut_b = -1;
-    float max_l = wu_maximize(hist, set1, 0, set1->l0 + 1, set1->l1, &cut_l, whole.w, whole.l,
-                              whole.a, whole.b);
-    float max_a = wu_maximize(hist, set1, 1, set1->a0 + 1, set1->a1, &cut_a, whole.w, whole.l,
-                              whole.a, whole.b);
-    float max_b = wu_maximize(hist, set1, 2, set1->b0 + 1, set1->b1, &cut_b, whole.w, whole.l,
-                              whole.a, whole.b);
+    float max_l = wu_maximize_impl(hist, set1, 0, set1->l0 + 1, set1->l1, &cut_l, whole.w, whole.l,
+                                   whole.a, whole.b, use_avx2);
+    float max_a = wu_maximize_impl(hist, set1, 1, set1->a0 + 1, set1->a1, &cut_a, whole.w, whole.l,
+                                   whole.a, whole.b, use_avx2);
+    float max_b = wu_maximize_impl(hist, set1, 2, set1->b0 + 1, set1->b1, &cut_b, whole.w, whole.l,
+                                   whole.a, whole.b, use_avx2);
 
     int dir = 0;
     float best = max_l;
@@ -677,12 +862,15 @@ static bool wu_cut(const wu_hist_t *hist, wu_box_t *set1, wu_box_t *set2)
         set2->b0 = cut_b;
     }
 
-    set1->vol_variance = wu_box_variance(hist, set1);
-    set2->vol_variance = wu_box_variance(hist, set2);
+    set1->vol_variance = wu_box_variance_impl(hist, set1, use_avx2);
+    set2->vol_variance = wu_box_variance_impl(hist, set2, use_avx2);
     return true;
 }
 
-static size_t wu_partition(const wu_hist_t *hist, weighted_point_t *out_points, size_t max_boxes)
+__attribute__((always_inline)) static inline size_t wu_partition_impl(const wwal_wu_hist_t *hist,
+                                                                      weighted_point_t *out_points,
+                                                                      size_t max_boxes,
+                                                                      bool use_avx2)
 {
     if (hist->num_active <= max_boxes) {
         size_t count = 0;
@@ -714,7 +902,7 @@ static size_t wu_partition(const wu_hist_t *hist, weighted_point_t *out_points, 
     boxes[0].a1 = (hist->min_a <= hist->max_a) ? hist->max_a : WU_BINS;
     boxes[0].b0 = (hist->min_b <= hist->max_b) ? (hist->min_b - 1) : 0;
     boxes[0].b1 = (hist->min_b <= hist->max_b) ? hist->max_b : WU_BINS;
-    boxes[0].vol_variance = wu_box_variance(hist, &boxes[0]);
+    boxes[0].vol_variance = wu_box_variance_impl(hist, &boxes[0], use_avx2);
 
     size_t num_boxes = 1;
     while (num_boxes < max_boxes) {
@@ -729,7 +917,7 @@ static size_t wu_partition(const wu_hist_t *hist, weighted_point_t *out_points, 
         if (max_v <= 1e-9f) {
             break;
         }
-        if (wu_cut(hist, &boxes[best_idx], &boxes[num_boxes])) {
+        if (wu_cut_impl(hist, &boxes[best_idx], &boxes[num_boxes], use_avx2)) {
             num_boxes++;
         } else {
             boxes[best_idx].vol_variance = 0.0f;
@@ -738,7 +926,7 @@ static size_t wu_partition(const wu_hist_t *hist, weighted_point_t *out_points, 
 
     size_t count = 0;
     for (size_t i = 0; i < num_boxes; ++i) {
-        wu_bin_t vol = wu_vol_bin(&boxes[i], hist);
+        wu_bin_t vol = wu_vol_bin_dispatch(&boxes[i], hist, use_avx2);
         if (vol.w <= 0.0f) {
             continue;
         }
@@ -750,6 +938,25 @@ static size_t wu_partition(const wu_hist_t *hist, weighted_point_t *out_points, 
         count++;
     }
     return count;
+}
+
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+__attribute__((target("avx2"))) static size_t
+wu_partition_avx2(const wwal_wu_hist_t *hist, weighted_point_t *out_points, size_t max_boxes)
+{
+    return wu_partition_impl(hist, out_points, max_boxes, true);
+}
+#endif
+
+static size_t wu_partition(const wwal_wu_hist_t *hist, weighted_point_t *out_points,
+                           size_t max_boxes)
+{
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+    if (cpu_supports_avx2()) {
+        return wu_partition_avx2(hist, out_points, max_boxes);
+    }
+#endif
+    return wu_partition_impl(hist, out_points, max_boxes, false);
 }
 
 static inline float oklab_dist_sq(float l1, float a1, float b1, float l2, float a2, float b2)
@@ -765,6 +972,9 @@ static size_t weighted_kmeans_pp(const weighted_point_t *pts, size_t n_pts,
 {
     if (n_pts == 0) {
         return 0;
+    }
+    if (n_pts > WU_MAX_BOXES) {
+        n_pts = WU_MAX_BOXES;
     }
     size_t k_target = n_pts < max_k ? n_pts : max_k;
 
@@ -1638,29 +1848,36 @@ static bool extract_dual_impl(const uint8_t *pixels, uint32_t width, uint32_t he
         (!has_seed_override && (!pixels || width == 0U || height == 0U))) {
         return false;
     }
-    if (pixels && width > 0U && stride_bytes < width * 4U) {
-        stride_bytes = width * 4U;
-    }
 
     ensure_srgb_lut();
 
     size_t n_clusters = 0;
     weighted_point_t clusters[KMEANS_K];
     if (pixels && width > 0U && height > 0U) {
-        wu_hist_t *hist = (wu_hist_t *)aligned_alloc(32, sizeof(wu_hist_t));
+        if ((size_t)width > (size_t)UINT32_MAX / 4U) {
+            return false;
+        }
+        if ((size_t)stride_bytes < (size_t)width * 4U) {
+            stride_bytes = width * 4U;
+        }
+        bool free_hist = false;
+        wwal_wu_hist_t *hist = acquire_wu_hist(&free_hist);
         if (!hist) {
             return false;
         }
         size_t valid_samples =
             wu_populate_histogram(hist, pixels, width, height, stride_bytes, is_bgra);
+        weighted_point_t wu_boxes[WU_MAX_BOXES];
+        size_t n_boxes = 0;
         if (valid_samples > 0) {
             wu_compute_moments(hist);
-            weighted_point_t wu_boxes[WU_MAX_BOXES];
-            size_t n_boxes = wu_partition(hist, wu_boxes, WU_MAX_BOXES);
+            n_boxes = wu_partition(hist, wu_boxes, WU_MAX_BOXES);
+        }
+        if (free_hist) {
             free(hist);
+        }
+        if (valid_samples > 0) {
             n_clusters = weighted_kmeans_pp(wu_boxes, n_boxes, clusters, KMEANS_K);
-        } else {
-            free(hist);
         }
     }
 
@@ -3675,24 +3892,79 @@ bool waywal_palette_render_templates(const waywal_palette_t *pal, const char *te
     return true;
 }
 
+#define HOOK_MAX_CONCURRENT_PIDS 4096U
+
+typedef struct {
+    pid_t *pids;
+    size_t count;
+    size_t cap;
+} hook_pid_tracker_t;
+
+static hook_pid_tracker_t g_hook_tracker = {NULL, 0, 0};
+static pthread_mutex_t g_hook_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void hook_tracker_reap_locked(void)
+{
+    size_t i = 0;
+    while (i < g_hook_tracker.count) {
+        pid_t p = g_hook_tracker.pids[i];
+        if (p <= 0) {
+            g_hook_tracker.pids[i] = g_hook_tracker.pids[--g_hook_tracker.count];
+            continue;
+        }
+        pid_t w;
+        do {
+            w = waitpid(p, NULL, WNOHANG);
+        } while (w < 0 && errno == EINTR);
+        if (w == p || (w < 0 && errno != EINTR)) {
+            g_hook_tracker.pids[i] = g_hook_tracker.pids[--g_hook_tracker.count];
+            continue;
+        }
+        ++i;
+    }
+    if (g_hook_tracker.count == 0 && g_hook_tracker.cap > 64U) {
+        free(g_hook_tracker.pids);
+        g_hook_tracker.pids = NULL;
+        g_hook_tracker.cap = 0;
+    }
+}
+
+static bool hook_tracker_push_locked(pid_t pid)
+{
+    if (g_hook_tracker.count >= g_hook_tracker.cap) {
+        if (g_hook_tracker.cap >= HOOK_MAX_CONCURRENT_PIDS) {
+            return false;
+        }
+        size_t new_cap = (g_hook_tracker.cap == 0) ? 64U : (g_hook_tracker.cap * 2U);
+        if (new_cap > HOOK_MAX_CONCURRENT_PIDS) {
+            new_cap = HOOK_MAX_CONCURRENT_PIDS;
+        }
+        pid_t *new_pids = (pid_t *)realloc(g_hook_tracker.pids, new_cap * sizeof(pid_t));
+        if (!new_pids) {
+            return false;
+        }
+        g_hook_tracker.pids = new_pids;
+        g_hook_tracker.cap = new_cap;
+    }
+    g_hook_tracker.pids[g_hook_tracker.count++] = pid;
+    return true;
+}
+
 bool waywal_palette_run_hook(const char *cmd)
 {
     if (!cmd || cmd[0] == '\0') {
         return false;
     }
 
-    static pid_t bg_pids[32];
-    static pthread_mutex_t s_hook_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-    pthread_mutex_lock(&s_hook_mutex);
-    for (size_t i = 0; i < 32; ++i) {
-        if (bg_pids[i] > 0) {
-            if (waitpid(bg_pids[i], NULL, WNOHANG) != 0) {
-                bg_pids[i] = 0;
-            }
-        }
+    pthread_mutex_lock(&g_hook_mutex);
+    hook_tracker_reap_locked();
+    bool at_capacity = (g_hook_tracker.count >= HOOK_MAX_CONCURRENT_PIDS);
+    pthread_mutex_unlock(&g_hook_mutex);
+    if (at_capacity) {
+        WAYWAL_LOG_WARN("Hook process limit (%u) reached; skipping '%s'", HOOK_MAX_CONCURRENT_PIDS,
+                        cmd);
+        return false;
     }
-    pthread_mutex_unlock(&s_hook_mutex);
 
     posix_spawnattr_t attr;
     if (posix_spawnattr_init(&attr) != 0) {
@@ -3700,7 +3972,6 @@ bool waywal_palette_run_hook(const char *cmd)
     }
     sigset_t empty_mask;
     sigemptyset(&empty_mask);
-    posix_spawnattr_setsigmask(&attr, &empty_mask);
 
     sigset_t def_mask;
     sigemptyset(&def_mask);
@@ -3711,20 +3982,31 @@ bool waywal_palette_run_hook(const char *cmd)
     sigaddset(&def_mask, SIGCHLD);
     sigaddset(&def_mask, SIGALRM);
     sigaddset(&def_mask, SIGPIPE);
-    posix_spawnattr_setsigdefault(&attr, &def_mask);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+
+    if (posix_spawnattr_setsigmask(&attr, &empty_mask) != 0 ||
+        posix_spawnattr_setsigdefault(&attr, &def_mask) != 0 ||
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF) != 0) {
+        posix_spawnattr_destroy(&attr);
+        return false;
+    }
 
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) {
         posix_spawnattr_destroy(&attr);
         return false;
     }
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    if (posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) != 0 ||
+        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        posix_spawnattr_destroy(&attr);
+        return false;
+    }
 
     pid_t pid = 0;
     char *const argv[] = {(char *)"sh", (char *)"-c", (char *)cmd, NULL};
-    int rc = posix_spawn(&pid, "/bin/sh", &actions, &attr, argv, environ);
+    char *empty_env[] = {NULL};
+    char **spawn_env = environ ? environ : empty_env;
+    int rc = posix_spawn(&pid, "/bin/sh", &actions, &attr, argv, spawn_env);
 
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attr);
@@ -3734,29 +4016,19 @@ bool waywal_palette_run_hook(const char *cmd)
         return false;
     }
 
-    bool reaped = false;
-    useconds_t sleep_us = 100;
-    useconds_t total_slept_us = 0;
-    while (total_slept_us < 20000) {
-        pid_t w = waitpid(pid, NULL, WNOHANG);
-        if (w == pid || (w < 0 && errno != EINTR)) {
-            reaped = true;
-            break;
-        }
-        usleep(sleep_us);
-        total_slept_us += sleep_us;
-        sleep_us = (sleep_us < 1600) ? (sleep_us * 2) : 2000;
-    }
-
-    if (!reaped && pid > 0) {
-        pthread_mutex_lock(&s_hook_mutex);
-        for (size_t i = 0; i < 32; ++i) {
-            if (bg_pids[i] <= 0) {
-                bg_pids[i] = pid;
-                break;
+    if (pid > 0) {
+        pid_t w;
+        do {
+            w = waitpid(pid, NULL, WNOHANG);
+        } while (w < 0 && errno == EINTR);
+        if (w == 0) {
+            pthread_mutex_lock(&g_hook_mutex);
+            hook_tracker_reap_locked();
+            if (!hook_tracker_push_locked(pid)) {
+                WAYWAL_LOG_WARN("Failed to track hook PID %d for reaping", (int)pid);
             }
+            pthread_mutex_unlock(&g_hook_mutex);
         }
-        pthread_mutex_unlock(&s_hook_mutex);
     }
 
     return true;
@@ -4173,6 +4445,60 @@ static bool is_numeric_name(const char *s)
     return true;
 }
 
+static bool write_pty_bounded(int fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+    int eagain_retries = 0;
+    int eintr_retries = 0;
+    const int64_t deadline_ns = waywal_get_monotonic_ns() + 10000000LL;
+
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w > 0) {
+            off += (size_t)w;
+            eintr_retries = 0;
+            continue;
+        }
+        if (w == 0) {
+            return false;
+        }
+        if (errno == EINTR) {
+            if (++eintr_retries > 64) {
+                return false;
+            }
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (++eagain_retries > 8) {
+                return false;
+            }
+            int64_t rem_ns = deadline_ns - waywal_get_monotonic_ns();
+            if (rem_ns <= 0) {
+                return false;
+            }
+            int timeout_ms = (int)((rem_ns + 999999LL) / 1000000LL);
+            if (timeout_ms < 1) {
+                timeout_ms = 1;
+            }
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+            int pr = poll(&pfd, 1, timeout_ms);
+            if (pr < 0) {
+                if (errno == EINTR && ++eintr_retries <= 64) {
+                    continue;
+                }
+                return false;
+            }
+            if (pr == 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+                (pfd.revents & POLLOUT) == 0) {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 bool waywal_palette_broadcast_tty(const waywal_palette_t *pal)
 {
     if (!pal) {
@@ -4204,20 +4530,42 @@ bool waywal_palette_broadcast_tty(const waywal_palette_t *pal)
         }
 
         struct stat st;
-        if (stat(pty_path, &st) != 0 || st.st_uid != my_uid) {
+        if (stat(pty_path, &st) != 0 || !S_ISCHR(st.st_mode) || st.st_uid != my_uid) {
             continue;
         }
 
-        int fd = open(pty_path, O_WRONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+        int fd = open(pty_path, O_WRONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
         if (fd < 0) {
             continue;
         }
 
-        ssize_t ignored = write(fd, seq_buf, seq_len);
-        (void)ignored;
+        struct stat fst;
+        if (fstat(fd, &fst) == 0 && S_ISCHR(fst.st_mode) && fst.st_uid == my_uid) {
+            (void)write_pty_bounded(fd, seq_buf, seq_len);
+        }
         close(fd);
     }
 
     closedir(dir);
     return true;
+}
+
+__attribute__((destructor)) static void cleanup_palette_resources(void)
+{
+    if (t_wu_hist) {
+        void *ptr = t_wu_hist;
+        t_wu_hist = NULL;
+        if (atomic_load_explicit(&g_wu_tls_key_ready, memory_order_acquire)) {
+            (void)pthread_setspecific(g_wu_tls_key, NULL);
+        }
+        free(ptr);
+    }
+
+    pthread_mutex_lock(&g_hook_mutex);
+    hook_tracker_reap_locked();
+    free(g_hook_tracker.pids);
+    g_hook_tracker.pids = NULL;
+    g_hook_tracker.count = 0;
+    g_hook_tracker.cap = 0;
+    pthread_mutex_unlock(&g_hook_mutex);
 }
