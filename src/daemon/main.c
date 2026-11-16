@@ -94,6 +94,19 @@ __attribute__((visibility("default"), used)) int __lsan_is_turned_off(void)
 {
     return g_seccomp_sandbox_active ? 1 : 0;
 }
+
+/* SA_NOCLDWAIT auto-reaps StopTheWorld's tracer child before LSan's waitpid can observe it. */
+static void daemon_restore_sigchld_for_lsan(void)
+{
+    if (!g_seccomp_sandbox_active) {
+        struct sigaction sa_dfl;
+        memset(&sa_dfl, 0, sizeof(sa_dfl));
+        sa_dfl.sa_handler = SIG_DFL;
+        sa_dfl.sa_flags = 0;
+        sigemptyset(&sa_dfl.sa_mask);
+        (void)sigaction(SIGCHLD, &sa_dfl, NULL);
+    }
+}
 #endif
 
 float waywal_shader_engine_get_render_scale(const waywal_shader_engine_t *eng);
@@ -12180,6 +12193,9 @@ static void daemon_cleanup_early_init(daemon_state_t *st, int *ready_write_fd, b
         waywal_audio_fft_destroy(st->audio_fft);
         st->audio_fft = NULL;
     }
+#if WWAL_SANITIZER_BUILD
+    daemon_restore_sigchld_for_lsan();
+#endif
 }
 
 int main(int argc, char *argv[])
@@ -12853,6 +12869,7 @@ int main(int argc, char *argv[])
 
     WAYWAL_LOG_INFO("Clean shutdown complete.");
 #if WWAL_SANITIZER_BUILD
+    daemon_restore_sigchld_for_lsan();
     /* Only run explicit LSan scan when Seccomp was disabled via --no-sandbox; normal teardown still
      * returns through libc atexit without bypassing leak detection. */
     if (no_sandbox && __lsan_do_leak_check) {
