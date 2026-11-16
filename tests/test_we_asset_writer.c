@@ -1284,7 +1284,10 @@ static void test_we_script_template_lint_and_abort(void)
     TEST_CHECK(diag.error_line == 2u);
     TEST_CHECK(diag.error_col >= 5u);
 
-    /* Exhaust the bounded 64 KiB lint arena via template chunks to verify abort propagation. */
+    /*
+     * Flat template interpolations restore the lint scratch watermark after each sub-expression,
+     * so a 72 KiB script stays within the 56 KiB scratch arena without false OOM.
+     */
     size_t big_cap = 96u * 1024u;
     char *big_src = (char *)malloc(big_cap);
     TEST_CHECK(big_src != NULL);
@@ -1294,9 +1297,58 @@ static void test_we_script_template_lint_and_abort(void)
         pos += (size_t)snprintf(big_src + pos, big_cap - pos, "ab${1+2}");
     }
     pos += (size_t)snprintf(big_src + pos, big_cap - pos, "`;");
-    TEST_CHECK(!we_script_lint(big_src, pos, 0u, &diag));
-    TEST_CHECK(diag.status_code != WE_SCRIPT_LINT_OK);
+    bool flat_ok = we_script_lint(big_src, pos, 0u, &diag);
     free(big_src);
+    TEST_CHECK(flat_ok);
+    TEST_CHECK(diag.status_code == WE_SCRIPT_LINT_OK);
+
+    /*
+     * 12 template nesting levels keep scan_template_body depth <= 32 so lexing succeeds, while
+     * parse_template_lit reaches p->depth > 32 and aborts with WE_SCRIPT_LINT_DEPTH_EXCEEDED.
+     */
+    char deep_tpl[256];
+    size_t dpos = 0u;
+    dpos += (size_t)snprintf(deep_tpl + dpos, sizeof(deep_tpl) - dpos, "let d = `");
+    for (int i = 0; i < 12; ++i) {
+        dpos += (size_t)snprintf(deep_tpl + dpos, sizeof(deep_tpl) - dpos, "${`");
+    }
+    dpos += (size_t)snprintf(deep_tpl + dpos, sizeof(deep_tpl) - dpos, "1");
+    for (int i = 0; i < 12; ++i) {
+        dpos += (size_t)snprintf(deep_tpl + dpos, sizeof(deep_tpl) - dpos, "`}");
+    }
+    dpos += (size_t)snprintf(deep_tpl + dpos, sizeof(deep_tpl) - dpos, "`;");
+    TEST_CHECK(!we_script_lint(deep_tpl, dpos, 0u, &diag));
+    TEST_CHECK(diag.status_code == WE_SCRIPT_LINT_DEPTH_EXCEEDED);
+
+    /* A single oversized token (> 56 KiB lint scratch arena) must abort cleanly. */
+    size_t tok_len = 72u * 1024u;
+    char *oversized_tok = (char *)malloc(tok_len + 16u);
+    TEST_CHECK(oversized_tok != NULL);
+    memcpy(oversized_tok, "let ", 4u);
+    memset(oversized_tok + 4u, 'a', tok_len);
+    memcpy(oversized_tok + 4u + tok_len, " = 1;", 6u);
+    bool tok_ok = we_script_lint(oversized_tok, 4u + tok_len + 5u, 0u, &diag);
+    free(oversized_tok);
+    TEST_CHECK(!tok_ok);
+    TEST_CHECK(diag.status_code != WE_SCRIPT_LINT_OK);
+    TEST_CHECK(diag.error_msg[0] != '\0');
+
+    /* Un-reclaimable parameter identifiers exceeding the 56 KiB lint scratch arena must abort. */
+    size_t fn_cap = 96u * 1024u;
+    char *fn_src = (char *)malloc(fn_cap);
+    TEST_CHECK(fn_src != NULL);
+    size_t fpos = 0u;
+    fpos += (size_t)snprintf(fn_src + fpos, fn_cap - fpos, "function f(");
+    for (uint32_t i = 0u; i < 3000u && fpos + 32u < fn_cap; ++i) {
+        fpos +=
+            (size_t)snprintf(fn_src + fpos, fn_cap - fpos, "%sparam_%016u", i == 0u ? "" : ",", i);
+    }
+    fpos += (size_t)snprintf(fn_src + fpos, fn_cap - fpos, ") {}");
+    bool fn_ok = we_script_lint(fn_src, fpos, 0u, &diag);
+    free(fn_src);
+    TEST_CHECK(!fn_ok);
+    TEST_CHECK(diag.status_code != WE_SCRIPT_LINT_OK);
+    TEST_CHECK(diag.error_msg[0] != '\0');
 }
 
 static int g_destroy_cb_calls = 0;
