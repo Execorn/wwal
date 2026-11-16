@@ -35,10 +35,11 @@ float po_density_fast(vec3 p, float r, float t)
 void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
     vec2 res = max(iResolution.xy, vec2(1.0));
-    vec2 uv = (fragCoord - 0.5 * res) / res.y;
+    float min_dim = min(res.x, res.y);
+    vec2 uv = (fragCoord - 0.5 * res) / min_dim;
 
     vec2 mouse = (u_mouse_smooth.xy / res) - 0.5;
-    vec3 ro = vec3(0.0, 0.0, -2.55);
+    vec3 ro = vec3(0.0, 0.0, -3.05);
     vec3 rd = normalize(vec3(uv - mouse * 0.14, 1.35));
 
     vec3 col_bg = PAL_BG;

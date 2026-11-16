@@ -36,7 +36,8 @@ float sw_palm(vec2 uv, vec2 base, float scale, float lean)
 void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
     vec2 res = max(iResolution.xy, vec2(1.0));
-    vec2 uv = (fragCoord - 0.5 * res) / res.y;
+    float min_dim = min(res.x, res.y);
+    vec2 uv = (fragCoord - 0.5 * res) / min_dim;
 
     vec2 mouse = (u_mouse_smooth.xy / res) - 0.5;
     uv.x += mouse.x * 0.06 + u_workspace_offset.x * 0.03;
@@ -95,9 +96,15 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         col = sea;
     }
 
-    if (abs(uv.x) > 0.28) {
-        float palm = (uv.x < 0.0) ? sw_palm(uv, vec2(-0.52, -0.06), 0.34, 0.24)
-                                  : sw_palm(uv, vec2(0.54, -0.06), 0.30, -0.22);
+    float half_w = 0.5 * res.x / min_dim;
+    float palm_fit = clamp(half_w / 0.68, 0.58, 1.0);
+    float palm_lx = -min(0.52, half_w * 0.74);
+    float palm_rx = min(0.54, half_w * 0.76);
+    float palm_guard = min(abs(palm_lx) - 0.65 * 0.34 * palm_fit,
+                           palm_rx - 0.65 * 0.30 * palm_fit);
+    if (abs(uv.x) > palm_guard && uv.y >= -0.10 && uv.y <= 0.46) {
+        float palm = (uv.x < 0.0) ? sw_palm(uv, vec2(palm_lx, -0.06), 0.34 * palm_fit, 0.24)
+                                  : sw_palm(uv, vec2(palm_rx, -0.06), 0.30 * palm_fit, -0.22);
         col = mix(col, vec3(0.02, 0.005, 0.05), palm);
     }
 

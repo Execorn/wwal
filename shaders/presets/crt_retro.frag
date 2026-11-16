@@ -17,7 +17,7 @@ vec2 crt_curve(vec2 uv)
     return uv * 0.5 + 0.5;
 }
 
-vec3 crt_pattern_ca(vec2 uv, float ca, float t, float t_scroll, float t_sweep)
+vec3 crt_pattern_ca(vec2 uv, vec2 res, float ca, float t, float t_scroll, float t_sweep)
 {
     vec3 c1 = PAL_BG;
     vec3 c2 = PAL_PHOSPHOR;
@@ -36,7 +36,8 @@ vec3 crt_pattern_ca(vec2 uv, float ca, float t, float t_scroll, float t_sweep)
     float wave = sin(uv.x * 10.0 + t * 2.2) * 0.12 + 0.5;
     float beam = exp(-abs(uv.y - wave) * 28.0);
 
-    vec2 p = (uv - 0.5) * vec2(1.777, 1.0);
+    float aspect = res.x / max(res.y, 1.0);
+    vec2 p = (uv - 0.5) * ((aspect >= 1.0) ? vec2(aspect, 1.0) : vec2(1.0, res.y / max(res.x, 1.0)));
     float r2 = dot(p, p);
     float radar = 0.0;
     if (r2 < 0.135) {
@@ -76,7 +77,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
         col.g = texture(iChannel0, vec2(ux.y, uy)).g;
         col.b = texture(iChannel0, vec2(ux.z, uy)).b;
     } else {
-        col = crt_pattern_ca(uv, ca, t, t_scroll, t_sweep);
+        col = crt_pattern_ca(uv, res, ca, t, t_scroll, t_sweep);
     }
 
     float scanline = 0.82 + 0.18 * sin(uv.y * res.y * 1.5 - t * 8.0);

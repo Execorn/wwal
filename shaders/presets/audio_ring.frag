@@ -12,13 +12,18 @@ const vec3 PAL_AR_MAGENTA = vec3(0.94, 0.22, 0.72);
 void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
     vec2 res = max(iResolution.xy, vec2(1.0));
-    vec2 p = (fragCoord - 0.5 * res) / res.y;
+    float min_dim = min(res.x, res.y);
+    vec2 p = (fragCoord - 0.5 * res) / min_dim;
+    if (res.x < res.y) {
+        // Scale portrait coordinates so the r <= 0.72 ring envelope stays inside [-0.5, 0.5] horizontally.
+        p *= 1.45;
+    }
 
     vec2 safe_mouse = (isnan(u_mouse_smooth.x) || isnan(u_mouse_smooth.y) ||
                        isinf(u_mouse_smooth.x) || isinf(u_mouse_smooth.y))
                           ? (0.5 * res)
                           : u_mouse_smooth.xy;
-    vec2 mouse = (safe_mouse / res) - 0.5;
+    vec2 mouse = clamp(safe_mouse / res, 0.0, 1.0) - 0.5;
     p -= mouse * 0.08;
 
     vec3 bg_dark = PAL_AR_BG;

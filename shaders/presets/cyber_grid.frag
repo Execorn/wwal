@@ -37,16 +37,17 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     float dy = uv.y - horizon;
     vec3 col = col_bg;
 
+    // Evaluate perspective coordinates and fwidth outside the branch so quad derivatives stay defined at dy == 0.
+    float z = 0.32 / max(-dy, 0.002);
+    float x = uv.x * z * 2.2;
+    float scroll = mod(iTime * 2.4, 359.03916) + u_audio_envelope * 0.35;
+
+    vec2 g = vec2(x, z + scroll);
+    float terrain = waywal_noise2d(g * vec2(0.35, 0.18)) * smoothstep(0.8, 3.2, abs(x));
+    g.y += terrain * 0.45;
+    vec2 fw = fwidth(g);
+
     if (dy < 0.0) {
-        float z = 0.32 / max(-dy, 0.002);
-        float x = uv.x * z * 2.2;
-        float scroll = mod(iTime * 2.4, 359.03916) + u_audio_envelope * 0.35;
-
-        vec2 g = vec2(x, z + scroll);
-        float terrain = waywal_noise2d(g * vec2(0.35, 0.18)) * smoothstep(0.8, 3.2, abs(x));
-        g.y += terrain * 0.45;
-        vec2 fw = fwidth(g);
-
         vec2 grid_d = abs(fract(g - 0.5) - 0.5);
         vec2 grid_dist = grid_d / max(fw, vec2(0.001));
         float line = 1.0 - min(min(grid_dist.x, grid_dist.y), 1.0);

@@ -4,9 +4,10 @@
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord)
 {
-    vec2 uv = (fragCoord - 0.5 * iResolution.xy) / max(iResolution.y, 1.0);
-    vec2 mouse = (iMouse.xy / max(iResolution.xy, vec2(1.0))) - 0.5;
-    float t = iTime * 0.45;
+    vec2 res = max(iResolution.xy, vec2(1.0));
+    vec2 uv = (fragCoord - 0.5 * res) / min(res.x, res.y);
+    vec2 mouse = (iMouse.xy / res) - 0.5;
+    float t = mod(iTime * 0.45, 628.31853);
 
     vec2 p = uv * 2.6 + mouse * 0.6;
     for (int i = 1; i < 5; ++i) {
@@ -16,6 +17,6 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     }
 
     vec3 col = 0.5 + 0.5 * cos(t + vec3(p.x, p.y, p.x + p.y) + vec3(0.0, 2.1, 4.2));
-    float vig = smoothstep(1.35, 0.25, length(uv));
-    fragColor = vec4(col * vig, 1.0);
+    float vig = 1.0 - smoothstep(0.25, 1.35, length(uv));
+    fragColor = vec4(clamp(col * vig, 0.0, 1.0), 1.0);
 }

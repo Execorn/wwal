@@ -49,7 +49,9 @@ float sf_star_layer(vec2 uv, float flare, vec2 sc_twinkle)
                 star += (1.0 - ray_prod) * flare * smoothstep(0.6, 1.0, size);
             }
             star *= 1.0 - smoothstep(0.15, 0.85, d);
-            vec2 phase_cs = normalize(n - 0.5 + vec2(1e-4));
+            vec2 delta = n - 0.5;
+            float len2 = dot(delta, delta);
+            vec2 phase_cs = (len2 > 1e-6) ? (delta * inversesqrt(len2)) : vec2(1.0, 0.0);
             float twinkle = 0.65 + 0.35 * dot(sc_twinkle, phase_cs);
             acc += star * size * twinkle;
         }
