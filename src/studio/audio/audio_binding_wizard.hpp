@@ -15,7 +15,6 @@
 #include <QPushButton>
 #include <QStackedWidget>
 #include <QString>
-#include <QTimer>
 #include <QWidget>
 
 #include <array>
@@ -25,7 +24,8 @@
 
 namespace waywal::studio {
 
-/* 60 FPS dual-trace oscilloscope plotting raw Bark energy, threshold gate, and IIR envelope. */
+/* Demand-driven dual-trace oscilloscope plotting gained Bark energy, threshold gate, and IIR
+ * envelope. */
 class AudioEnvelopeOscilloscopeWidget : public QWidget {
     Q_OBJECT
 
@@ -47,12 +47,16 @@ class AudioEnvelopeOscilloscopeWidget : public QWidget {
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
 
   private:
+    void updateThresholdFromY(qreal posY);
+
     float m_thresholdOpen{0.15f};
     float m_hysteresis{0.04f};
     bool m_draggingGate{false};
     size_t m_writeIdx{0};
+    size_t m_nonZeroCount{0};
     std::array<float, kHistorySamples> m_rawTrace{};
     std::array<float, kHistorySamples> m_envTrace{};
     std::array<uint8_t, kHistorySamples> m_gateTrace{};
@@ -99,6 +103,12 @@ class AudioBindingWizard : public QWidget {
     void updateLiveBarkTelemetry(const std::array<float, 64> &barkBands, float envelope,
                                  float bassEnergy, float beatPulse, float dtSec);
 
+    void setSampleRateHz(uint32_t sampleRateHz);
+    [[nodiscard]] uint32_t sampleRateHz() const noexcept { return m_sampleRateHz; }
+    [[nodiscard]] int currentStepIndex() const noexcept;
+    [[nodiscard]] const we_audio_binding_t &draft() const noexcept { return m_draft; }
+
+    [[nodiscard]] static float bandCenterHz(size_t band, uint32_t sampleRateHz = 48000u) noexcept;
     [[nodiscard]] static std::pair<uint16_t, uint16_t>
     barkBandSpanForPreset(MusicalBandPreset preset) noexcept;
 
@@ -108,10 +118,11 @@ class AudioBindingWizard : public QWidget {
 
   protected:
     void showEvent(QShowEvent *event) override;
-    void hideEvent(QHideEvent *event) override;
 
   private:
     void ensureUiInitialized();
+    void syncStepUi(int stepIdx);
+    void updateTargetParamUiState();
     void syncIpcBindings(we_audio_bind_op_t op, const we_audio_binding_t *singleOrNull,
                          uint32_t removeId = 0);
     [[nodiscard]] we_audio_binding_t buildDraftFromUi() const;
@@ -120,6 +131,7 @@ class AudioBindingWizard : public QWidget {
     bool m_uiInitialized{false};
     QString m_targetOutput{QStringLiteral("*")};
     uint32_t m_nextBindingId{1};
+    uint32_t m_sampleRateHz{48000u};
     we_audio_binding_t m_draft{};
     std::vector<SceneLayerNode> m_layers;
     std::vector<we_audio_binding_t> m_bindings;
@@ -145,7 +157,6 @@ class AudioBindingWizard : public QWidget {
     QListWidget *m_activeBindingsList{nullptr};
     QPushButton *m_createBtn{nullptr};
     AudioEnvelopeOscilloscopeWidget *m_oscilloscope{nullptr};
-    QTimer *m_idleRenderTimer{nullptr};
 
     struct ExtraState;
     std::unique_ptr<ExtraState> m_extra;

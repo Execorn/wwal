@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "studio/audio/audio_binding_wizard.hpp"
+#include "waywal/we_particle.h"
 
 #include <QCheckBox>
 #include <QFormLayout>
 #include <QFrame>
 #include <QGroupBox>
 #include <QHBoxLayout>
-#include <QHideEvent>
+#include <QKeyEvent>
 #include <QLineEdit>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPaintEvent>
 #include <QPointer>
-#include <QScrollArea>
+#include <QScopedValueRollback>
 #include <QShowEvent>
 #include <QSignalBlocker>
 #include <QSpinBox>
@@ -21,8 +22,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 namespace waywal::studio {
 
@@ -33,6 +36,77 @@ constexpr QColor kBorderSubtle(0x2a, 0x2f, 0x3d);
 constexpr QColor kTextSecondary(0x94, 0xa3, 0xb8);
 constexpr QColor kAccentSky(0x38, 0xbd, 0xf8);
 constexpr QColor kSemanticWarn(0xf5, 0x9e, 0x0b);
+constexpr QColor kBarInactive(0x64, 0x74, 0x8b);
+
+constexpr int kMaxEffectPassSubIndex = 15; /* Matches WE_MAX_EFFECT_PASSES - 1 in we_scene.h */
+constexpr int kMaxEmitterSubIndex = static_cast<int>(WE_PARTICLE_MAX_EMITTERS) - 1;
+constexpr int kMaxOperatorSubIndex = static_cast<int>(WE_PARTICLE_MAX_OPERATORS) - 1;
+constexpr int kMinControlSizePx = 28;
+constexpr int kMinFontSizePx = 11;
+
+[[nodiscard]] float sanitizeFinite(float val, float lo, float hi, float fallback) noexcept
+{
+    const float safeLo = std::min(lo, hi);
+    const float safeHi = std::max(lo, hi);
+    if (!std::isfinite(val)) {
+        return std::clamp(fallback, safeLo, safeHi);
+    }
+    return std::clamp(val, safeLo, safeHi);
+}
+
+[[nodiscard]] uint32_t sanitizeSampleRateHz(uint32_t sampleRateHz) noexcept
+{
+    if (sampleRateHz == 0u) {
+        return 48000u;
+    }
+    return std::clamp(sampleRateHz, 4000u, 384000u);
+}
+
+[[nodiscard]] QString formatNyquistLabel(uint32_t sampleRateHz)
+{
+    const double nyquistHz = 0.5 * static_cast<double>(sanitizeSampleRateHz(sampleRateHz));
+    if (nyquistHz >= 1000.0) {
+        const double khz = nyquistHz / 1000.0;
+        const double roundedKhz = std::round(khz);
+        if (std::fabs(khz - roundedKhz) < 0.05) {
+            return QString::asprintf("%.0f kHz (B63)", roundedKhz);
+        }
+        return QString::asprintf("%.1f kHz (B63)", khz);
+    }
+    return QString::asprintf("%.0f Hz (B63)", nyquistHz);
+}
+
+struct SubIndexBounds {
+    bool enabled{false};
+    int maxIndex{0};
+    const char *hint{""};
+};
+
+[[nodiscard]] SubIndexBounds subIndexBoundsForTarget(uint32_t targetKind) noexcept
+{
+    switch (static_cast<we_audio_target_kind_t>(targetKind)) {
+    case WE_AUDIO_TGT_PASS_UNIFORM_COMP:
+        return {true, kMaxEffectPassSubIndex, "Effect or base shader pass index (0..15)"};
+    case WE_AUDIO_TGT_PARTICLE_RATE:
+    case WE_AUDIO_TGT_PARTICLE_SPEED:
+        return {true, kMaxEmitterSubIndex, "Particle emitter index (0..7)"};
+    case WE_AUDIO_TGT_PARTICLE_TURB_SPEED:
+    case WE_AUDIO_TGT_PARTICLE_VORTEX_SPD:
+        return {true, kMaxOperatorSubIndex, "Particle operator index (0..15)"};
+    case WE_AUDIO_TGT_LAYER_ORIGIN_X:
+    case WE_AUDIO_TGT_LAYER_ORIGIN_Y:
+    case WE_AUDIO_TGT_LAYER_SCALE_XY:
+    case WE_AUDIO_TGT_LAYER_ROTATION_Z:
+    case WE_AUDIO_TGT_LAYER_ALPHA:
+    case WE_AUDIO_TGT_LAYER_BRIGHTNESS:
+    case WE_AUDIO_TGT_LAYER_COLOR_RGB:
+    case WE_AUDIO_TGT_LIGHT_INTENSITY:
+    case WE_AUDIO_TGT_LIGHT_RADIUS:
+    case WE_AUDIO_TGT_PARTICLE_BURST_TRIG:
+    default:
+        return {false, 0, "Sub-index is not used by this target parameter"};
+    }
+}
 
 class BarkRangePickerWidget final : public QWidget {
   public:
@@ -40,25 +114,68 @@ class BarkRangePickerWidget final : public QWidget {
                                    QWidget *parent = nullptr)
         : QWidget(parent), m_onRangeChanged(std::move(onRangeChanged))
     {
-        setMinimumHeight(74);
+        setMinimumSize(140, 80);
         setMouseTracking(true);
         setFocusPolicy(Qt::StrongFocus);
         setAccessibleName(QStringLiteral("64-Band Bark Range Picker"));
         setAccessibleDescription(
-            QStringLiteral("Drag across bands 0 to 63 to select a frequency range."));
+            QStringLiteral("Drag across or press Left and Right arrows on bands 0 to 63 to "
+                           "select a frequency range."));
+    }
+
+    void setSampleRateHz(uint32_t sampleRateHz) noexcept
+    {
+        const uint32_t safeRate = sanitizeSampleRateHz(sampleRateHz);
+        if (m_sampleRateHz == safeRate) {
+            return;
+        }
+        m_sampleRateHz = safeRate;
+        if (isVisible()) {
+            update();
+        }
     }
 
     void setBandRange(uint16_t startBand, uint16_t endBand) noexcept
     {
-        m_bandStart = std::min<uint16_t>(startBand, 63u);
-        m_bandEnd = std::clamp<uint16_t>(endBand, m_bandStart, 63u);
-        update();
+        const uint16_t nextStart = std::min<uint16_t>(startBand, 63u);
+        const uint16_t nextEnd = std::clamp<uint16_t>(endBand, nextStart, 63u);
+        if (nextStart == m_bandStart && nextEnd == m_bandEnd) {
+            return;
+        }
+        m_bandStart = nextStart;
+        m_bandEnd = nextEnd;
+        if (isVisible()) {
+            update();
+        }
     }
 
     void setLiveSpectrum(const std::array<float, 64> &bands) noexcept
     {
-        m_bands = bands;
-        update();
+        bool changed = false;
+        for (size_t b = 0; b < m_bands.size(); ++b) {
+            const float clean = sanitizeFinite(bands[b], 0.0f, 1.0f, 0.0f);
+            if (std::fabs(clean - m_bands[b]) > 1e-4f) {
+                m_bands[b] = clean;
+                changed = true;
+            }
+        }
+        if (changed && isVisible()) {
+            update();
+        }
+    }
+
+    void clearLiveSpectrum() noexcept
+    {
+        bool hadNonZero = false;
+        for (float &v : m_bands) {
+            if (v > 0.0f) {
+                v = 0.0f;
+                hadNonZero = true;
+            }
+        }
+        if (hadNonZero && isVisible()) {
+            update();
+        }
     }
 
   protected:
@@ -70,10 +187,11 @@ class BarkRangePickerWidget final : public QWidget {
 
         const QRectF r = rect();
         p.fillRect(r, kBgCanvas);
-        p.setPen(QPen(hasFocus() ? kAccentSky : kBorderSubtle, hasFocus() ? 2.0 : 1.0));
-        p.drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5));
+        const bool focused = hasFocus();
+        p.setPen(QPen(focused ? kAccentSky : kBorderSubtle, focused ? 2.0 : 1.0));
+        p.drawRect(focused ? r.adjusted(1.0, 1.0, -1.0, -1.0) : r.adjusted(0.5, 0.5, -0.5, -0.5));
 
-        const QRectF plot = r.adjusted(4.0, 4.0, -4.0, -14.0);
+        const QRectF plot = r.adjusted(4.0, 4.0, -4.0, -18.0);
         if (plot.width() <= 4.0 || plot.height() <= 4.0) {
             return;
         }
@@ -87,12 +205,12 @@ class BarkRangePickerWidget final : public QWidget {
                    QColor(0x38, 0xbd, 0xf8, 42));
 
         for (size_t b = 0; b < kNumBands; ++b) {
-            const float mag = std::clamp(std::isfinite(m_bands[b]) ? m_bands[b] : 0.0f, 0.0f, 1.0f);
+            const float mag = sanitizeFinite(m_bands[b], 0.0f, 1.0f, 0.0f);
             const qreal bx = plot.left() + static_cast<qreal>(b) * barW;
             const qreal bh = std::max<qreal>(2.0, static_cast<qreal>(mag) * plot.height());
             const bool inSel = (b >= m_bandStart && b <= m_bandEnd);
             p.fillRect(QRectF(bx + 0.5, plot.bottom() - bh, std::max(1.0, barW - 1.0), bh),
-                       inSel ? kAccentSky : QColor(0x47, 0x55, 0x69));
+                       inSel ? kAccentSky : kBarInactive);
         }
 
         p.setPen(QPen(kAccentSky, 1.5));
@@ -101,13 +219,13 @@ class BarkRangePickerWidget final : public QWidget {
 
         p.setPen(kTextSecondary);
         QFont f = p.font();
-        f.setPointSize(8);
+        f.setPixelSize(kMinFontSizePx);
         p.setFont(f);
-        p.drawText(QRectF(plot.left(), plot.bottom() + 1.0, plot.width() * 0.5, 12.0),
+        p.drawText(QRectF(plot.left(), plot.bottom() + 2.0, plot.width() * 0.5, 16.0),
                    Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("20 Hz (B0)"));
         p.drawText(
-            QRectF(plot.left() + plot.width() * 0.5, plot.bottom() + 1.0, plot.width() * 0.5, 12.0),
-            Qt::AlignRight | Qt::AlignVCenter, QStringLiteral("20 kHz (B63)"));
+            QRectF(plot.left() + plot.width() * 0.5, plot.bottom() + 2.0, plot.width() * 0.5, 16.0),
+            Qt::AlignRight | Qt::AlignVCenter, formatNyquistLabel(m_sampleRateHz));
     }
 
     void mousePressEvent(QMouseEvent *event) override
@@ -135,11 +253,36 @@ class BarkRangePickerWidget final : public QWidget {
         m_dragging = false;
     }
 
+    void keyPressEvent(QKeyEvent *event) override
+    {
+        const int delta = (event->key() == Qt::Key_Left)    ? -1
+                          : (event->key() == Qt::Key_Right) ? 1
+                                                            : 0;
+        if (delta == 0) {
+            QWidget::keyPressEvent(event);
+            return;
+        }
+        const bool adjustEndOnly = (event->modifiers() & Qt::ShiftModifier) != 0;
+        if (adjustEndOnly) {
+            const int nextEnd =
+                std::clamp(static_cast<int>(m_bandEnd) + delta, static_cast<int>(m_bandStart), 63);
+            applySelection(m_bandStart, static_cast<uint16_t>(nextEnd));
+        } else {
+            const int span = static_cast<int>(m_bandEnd) - static_cast<int>(m_bandStart);
+            const int maxStart = 63 - span;
+            const int nextStart = std::clamp(static_cast<int>(m_bandStart) + delta, 0, maxStart);
+            applySelection(static_cast<uint16_t>(nextStart),
+                           static_cast<uint16_t>(nextStart + span));
+        }
+        event->accept();
+    }
+
   private:
     [[nodiscard]] uint16_t bandAtX(qreal x) const noexcept
     {
+        const qreal safeX = std::isfinite(x) ? x : 0.0;
         const qreal w = std::max<qreal>(1.0, width() - 8.0);
-        const qreal norm = std::clamp((x - 4.0) / w, 0.0, 0.9999);
+        const qreal norm = std::clamp((safeX - 4.0) / w, 0.0, 0.9999);
         return static_cast<uint16_t>(std::clamp(static_cast<int>(norm * 64.0), 0, 63));
     }
 
@@ -147,7 +290,9 @@ class BarkRangePickerWidget final : public QWidget {
     {
         m_bandStart = std::min<uint16_t>(s, 63u);
         m_bandEnd = std::clamp<uint16_t>(e, m_bandStart, 63u);
-        update();
+        if (isVisible()) {
+            update();
+        }
         if (m_onRangeChanged) {
             m_onRangeChanged(m_bandStart, m_bandEnd);
         }
@@ -155,6 +300,7 @@ class BarkRangePickerWidget final : public QWidget {
 
     std::function<void(uint16_t, uint16_t)> m_onRangeChanged;
     std::array<float, 64> m_bands{};
+    uint32_t m_sampleRateHz{48000u};
     uint16_t m_bandStart{0};
     uint16_t m_bandEnd{1};
     uint16_t m_anchorBand{0};
@@ -189,6 +335,11 @@ class ClearAudioBindingsCommand final : public ICommand {
         return QStringLiteral("Clear all audio bindings (%1)").arg(m_previous.size());
     }
 
+    [[nodiscard]] size_t memoryFootprint() const override
+    {
+        return sizeof(*this) + m_previous.capacity() * sizeof(we_audio_binding_t);
+    }
+
   private:
     std::vector<we_audio_binding_t> m_previous;
     ApplyFunction m_applyFunc;
@@ -201,13 +352,23 @@ QDoubleSpinBox *makeSpin(double minV, double maxV, double step, int decimals, QW
     spin->setSingleStep(step);
     spin->setDecimals(decimals);
     spin->setKeyboardTracking(false);
+    spin->setMinimumHeight(kMinControlSizePx);
     return spin;
 }
 
-QString formatBandHzSummary(uint16_t startBand, uint16_t endBand)
+QSpinBox *makeIntSpin(int minV, int maxV, QWidget *parent)
 {
-    const float f0 = wwal::studio::AudioSpectrumWidget::bandCenterHz(startBand);
-    const float f1 = wwal::studio::AudioSpectrumWidget::bandCenterHz(endBand);
+    auto *spin = new QSpinBox(parent);
+    spin->setRange(minV, maxV);
+    spin->setKeyboardTracking(false);
+    spin->setMinimumHeight(kMinControlSizePx);
+    return spin;
+}
+
+QString formatBandHzSummary(uint16_t startBand, uint16_t endBand, uint32_t sampleRateHz)
+{
+    const float f0 = AudioBindingWizard::bandCenterHz(startBand, sampleRateHz);
+    const float f1 = AudioBindingWizard::bandCenterHz(endBand, sampleRateHz);
     const float z0 = wwal::studio::AudioSpectrumWidget::hzToBark(f0);
     const float z1 = wwal::studio::AudioSpectrumWidget::hzToBark(f1);
     return QString::asprintf("Bands %u..%u | %.0f Hz - %.0f Hz (%.1f - %.1f Bark)", startBand,
@@ -314,19 +475,26 @@ QString darkWizardStyleSheet()
 {
     return QStringLiteral(
         "QWidget { background-color: #12141a; color: #f1f5f9; font-size: 12px; }"
+        "QLabel { color: #f1f5f9; font-size: 12px; }"
         "QGroupBox { background-color: #181b22; border: 1px solid #2a2f3d; border-radius: 6px; "
-        "margin-top: 8px; padding: 8px; font-weight: 600; color: #f1f5f9; }"
+        "margin-top: 8px; padding: 8px; font-weight: 600; color: #f1f5f9; font-size: 12px; }"
         "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; color: #94a3b8; }"
         "QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit, QListWidget { background-color: #0b0c10; "
-        "border: 1px solid #2a2f3d; border-radius: 4px; padding: 3px 6px; color: #f1f5f9; }"
+        "border: 1px solid #2a2f3d; border-radius: 4px; padding: 3px 6px; color: #f1f5f9; "
+        "min-height: 28px; font-size: 12px; }"
         "QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus, "
-        "QListWidget:focus, "
-        "QPushButton:focus { border: 2px solid #38bdf8; }"
+        "QListWidget:focus, QPushButton:focus, QPushButton:checked:focus, "
+        "QPushButton#createBindingBtn:focus { border: 2px solid #38bdf8; }"
+        "QListWidget::item:selected { background-color: #0369a1; color: #f1f5f9; }"
         "QPushButton { background-color: #181b22; border: 1px solid #2a2f3d; border-radius: 4px; "
-        "padding: 4px 8px; color: #f1f5f9; }"
+        "padding: 4px 10px; color: #f1f5f9; min-height: 28px; min-width: 28px; font-size: 12px; }"
         "QPushButton:hover { background-color: #222631; border-color: #38bdf8; }"
-        "QPushButton:checked { background-color: #222631; border-color: #38bdf8; color: #38bdf8; "
-        "}");
+        "QPushButton:checked { background-color: #222631; border-color: #38bdf8; color: #38bdf8; }"
+        "QPushButton#createBindingBtn { background-color: #0369a1; border: 1px solid #38bdf8; "
+        "color: #f1f5f9; font-weight: 600; }"
+        "QPushButton#createBindingBtn:hover { background-color: #0284c7; border-color: #7dd3fc; }"
+        "QPushButton:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, "
+        "QLineEdit:disabled { background-color: #12141a; border-color: #1e2430; color: #94a3b8; }");
 }
 
 } // namespace
@@ -337,41 +505,73 @@ QString darkWizardStyleSheet()
 
 AudioEnvelopeOscilloscopeWidget::AudioEnvelopeOscilloscopeWidget(QWidget *parent) : QWidget(parent)
 {
-    setMinimumHeight(110);
+    setMinimumSize(140, 110);
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
     setAccessibleName(tr("Audio Envelope Oscilloscope"));
     setAccessibleDescription(
-        tr("Dual-trace live oscilloscope showing raw Bark energy, Giannoulis smoothed envelope, "
-           "and draggable threshold gate."));
+        tr("Dual-trace live oscilloscope showing gained Bark energy, Giannoulis smoothed "
+           "envelope, and draggable threshold gate."));
 }
 
 void AudioEnvelopeOscilloscopeWidget::setThresholdGate(float thresholdOpen,
                                                        float hysteresis) noexcept
 {
-    m_thresholdOpen = std::clamp(std::isfinite(thresholdOpen) ? thresholdOpen : 0.15f, 0.0f, 0.98f);
-    m_hysteresis = std::clamp(std::isfinite(hysteresis) ? hysteresis : 0.04f, 0.0f, 0.25f);
-    update();
+    const float nextThresh = sanitizeFinite(thresholdOpen, 0.0f, 0.98f, 0.15f);
+    const float nextHyst = sanitizeFinite(hysteresis, 0.0f, 0.25f, 0.04f);
+    if (std::fabs(nextThresh - m_thresholdOpen) <= 1e-5f &&
+        std::fabs(nextHyst - m_hysteresis) <= 1e-5f) {
+        return;
+    }
+    m_thresholdOpen = nextThresh;
+    m_hysteresis = nextHyst;
+    if (isVisible()) {
+        update();
+    }
 }
 
 void AudioEnvelopeOscilloscopeWidget::pushSample(float rawEnergy, float smoothedEnvelope,
                                                  bool gateOpen) noexcept
 {
-    m_rawTrace[m_writeIdx] = std::clamp(std::isfinite(rawEnergy) ? rawEnergy : 0.0f, 0.0f, 1.0f);
-    m_envTrace[m_writeIdx] =
-        std::clamp(std::isfinite(smoothedEnvelope) ? smoothedEnvelope : 0.0f, 0.0f, 1.0f);
-    m_gateTrace[m_writeIdx] = gateOpen ? 1u : 0u;
+    const float cleanRaw = sanitizeFinite(rawEnergy, 0.0f, 1.0f, 0.0f);
+    const float cleanEnv = sanitizeFinite(smoothedEnvelope, 0.0f, 1.0f, 0.0f);
+    const uint8_t gateVal = gateOpen ? 1u : 0u;
+
+    const bool hadContentBefore = (m_nonZeroCount > 0u);
+    const bool oldNonZero = (m_rawTrace[m_writeIdx] > 1e-5f || m_envTrace[m_writeIdx] > 1e-5f ||
+                             m_gateTrace[m_writeIdx] != 0u);
+    const bool newNonZero = (cleanRaw > 1e-5f || cleanEnv > 1e-5f || gateVal != 0u);
+
+    if (oldNonZero && !newNonZero && m_nonZeroCount > 0u) {
+        --m_nonZeroCount;
+    } else if (!oldNonZero && newNonZero) {
+        ++m_nonZeroCount;
+    }
+
+    m_rawTrace[m_writeIdx] = cleanRaw;
+    m_envTrace[m_writeIdx] = cleanEnv;
+    m_gateTrace[m_writeIdx] = gateVal;
     m_writeIdx = (m_writeIdx + 1u) % kHistorySamples;
-    update();
+
+    // Skip repaint when hidden or when the full ring buffer is already settled at silence.
+    if ((hadContentBefore || newNonZero) && isVisible()) {
+        update();
+    }
 }
 
 void AudioEnvelopeOscilloscopeWidget::clearHistory() noexcept
 {
+    if (m_nonZeroCount == 0u && m_writeIdx == 0u) {
+        return;
+    }
     m_rawTrace.fill(0.0f);
     m_envTrace.fill(0.0f);
     m_gateTrace.fill(0u);
     m_writeIdx = 0u;
-    update();
+    m_nonZeroCount = 0u;
+    if (isVisible()) {
+        update();
+    }
 }
 
 void AudioEnvelopeOscilloscopeWidget::paintEvent(QPaintEvent *event)
@@ -382,8 +582,11 @@ void AudioEnvelopeOscilloscopeWidget::paintEvent(QPaintEvent *event)
 
     const QRectF fullRect = rect();
     p.fillRect(fullRect, kBgCanvas);
-    p.setPen(QPen(hasFocus() ? kAccentSky : kBorderSubtle, hasFocus() ? 2.0 : 1.0));
-    p.drawRoundedRect(fullRect.adjusted(0.5, 0.5, -0.5, -0.5), 4.0, 4.0);
+    const bool focused = hasFocus();
+    p.setPen(QPen(focused ? kAccentSky : kBorderSubtle, focused ? 2.0 : 1.0));
+    p.drawRoundedRect(focused ? fullRect.adjusted(1.0, 1.0, -1.0, -1.0)
+                              : fullRect.adjusted(0.5, 0.5, -0.5, -0.5),
+                      4.0, 4.0);
 
     const QRectF plot = fullRect.adjusted(8.0, 8.0, -8.0, -8.0);
     if (plot.width() <= 4.0 || plot.height() <= 4.0) {
@@ -440,12 +643,27 @@ void AudioEnvelopeOscilloscopeWidget::paintEvent(QPaintEvent *event)
 
     p.setPen(kSemanticWarn);
     QFont labelFont = p.font();
-    labelFont.setPointSize(8);
+    labelFont.setPixelSize(kMinFontSizePx);
     labelFont.setBold(true);
     p.setFont(labelFont);
-    const qreal labelY = std::max(plot.top() + 10.0, gateOpenY - 3.0);
+    const qreal labelY = std::max(plot.top() + 13.0, gateOpenY - 4.0);
     p.drawText(QPointF(plot.left() + 4.0, labelY),
                QString::asprintf("GATE %.2f", static_cast<double>(m_thresholdOpen)));
+}
+
+void AudioEnvelopeOscilloscopeWidget::updateThresholdFromY(qreal posY)
+{
+    const QRectF plot = QRectF(rect()).adjusted(8.0, 8.0, -8.0, -8.0);
+    if (plot.height() <= 2.0 || !std::isfinite(posY)) {
+        return;
+    }
+    const float val = sanitizeFinite(static_cast<float>((plot.bottom() - posY) / plot.height()),
+                                     0.0f, 0.98f, m_thresholdOpen);
+    if (std::fabs(val - m_thresholdOpen) > 1e-5f) {
+        m_thresholdOpen = val;
+        emit thresholdGateDragged(val);
+        update();
+    }
 }
 
 void AudioEnvelopeOscilloscopeWidget::mousePressEvent(QMouseEvent *event)
@@ -454,15 +672,7 @@ void AudioEnvelopeOscilloscopeWidget::mousePressEvent(QMouseEvent *event)
         return;
     }
     m_draggingGate = true;
-    const QRectF plot = QRectF(rect()).adjusted(8.0, 8.0, -8.0, -8.0);
-    if (plot.height() > 2.0) {
-        const float val =
-            std::clamp(static_cast<float>((plot.bottom() - event->position().y()) / plot.height()),
-                       0.0f, 0.98f);
-        m_thresholdOpen = val;
-        emit thresholdGateDragged(val);
-        update();
-    }
+    updateThresholdFromY(event->position().y());
 }
 
 void AudioEnvelopeOscilloscopeWidget::mouseMoveEvent(QMouseEvent *event)
@@ -470,21 +680,35 @@ void AudioEnvelopeOscilloscopeWidget::mouseMoveEvent(QMouseEvent *event)
     if (!m_draggingGate) {
         return;
     }
-    const QRectF plot = QRectF(rect()).adjusted(8.0, 8.0, -8.0, -8.0);
-    if (plot.height() > 2.0) {
-        const float val =
-            std::clamp(static_cast<float>((plot.bottom() - event->position().y()) / plot.height()),
-                       0.0f, 0.98f);
-        m_thresholdOpen = val;
-        emit thresholdGateDragged(val);
-        update();
-    }
+    updateThresholdFromY(event->position().y());
 }
 
 void AudioEnvelopeOscilloscopeWidget::mouseReleaseEvent(QMouseEvent *event)
 {
     (void)event;
     m_draggingGate = false;
+}
+
+void AudioEnvelopeOscilloscopeWidget::keyPressEvent(QKeyEvent *event)
+{
+    const float step = (event->modifiers() & Qt::ShiftModifier) ? 0.10f : 0.02f;
+    float delta = 0.0f;
+    if (event->key() == Qt::Key_Up || event->key() == Qt::Key_PageUp) {
+        delta = (event->key() == Qt::Key_PageUp) ? 0.10f : step;
+    } else if (event->key() == Qt::Key_Down || event->key() == Qt::Key_PageDown) {
+        delta = (event->key() == Qt::Key_PageDown) ? -0.10f : -step;
+    }
+    if (delta == 0.0f) {
+        QWidget::keyPressEvent(event);
+        return;
+    }
+    const float nextVal = sanitizeFinite(m_thresholdOpen + delta, 0.0f, 0.98f, m_thresholdOpen);
+    if (std::fabs(nextVal - m_thresholdOpen) > 1e-5f) {
+        m_thresholdOpen = nextVal;
+        emit thresholdGateDragged(nextVal);
+        update();
+    }
+    event->accept();
 }
 
 /* ========================================================================= */
@@ -505,10 +729,9 @@ struct AudioBindingWizard::ExtraState {
     QPushButton *nextStepBtn{nullptr};
     std::array<QPushButton *, 3> stepTabBtns{};
     bool updatingUi{false};
-    bool oscNeedsRepaint{false};
-    bool hasLiveTelemetry{false};
     bool hasPreselectedTarget{false};
     bool hasPresetApplied{false};
+    bool curveAutoSetByOnset{false};
 };
 
 AudioBindingWizard::AudioBindingWizard(QWidget *parent)
@@ -540,6 +763,45 @@ AudioBindingWizard::AudioBindingWizard(QWidget *parent)
 
 AudioBindingWizard::~AudioBindingWizard() = default;
 
+float AudioBindingWizard::bandCenterHz(size_t band, uint32_t sampleRateHz) noexcept
+{
+    const size_t clampedBand =
+        std::min<size_t>(band, wwal::studio::AudioSpectrumWidget::NumBands - 1u);
+    const float maxFreq = 0.5f * static_cast<float>(sanitizeSampleRateHz(sampleRateHz));
+    float maxBark = wwal::studio::AudioSpectrumWidget::hzToBark(maxFreq);
+    if (!std::isfinite(maxBark) || maxBark <= 0.1f) {
+        maxBark = 24.0f;
+    }
+    const float zCenter = ((static_cast<float>(clampedBand) + 0.5f) /
+                           static_cast<float>(wwal::studio::AudioSpectrumWidget::NumBands)) *
+                          maxBark;
+    return wwal::studio::AudioSpectrumWidget::barkToHz(zCenter);
+}
+
+void AudioBindingWizard::setSampleRateHz(uint32_t sampleRateHz)
+{
+    const uint32_t safeRate = sanitizeSampleRateHz(sampleRateHz);
+    if (m_sampleRateHz == safeRate) {
+        return;
+    }
+    m_sampleRateHz = safeRate;
+    if (!m_uiInitialized) {
+        return;
+    }
+    if (m_extra->barkPicker) {
+        m_extra->barkPicker->setSampleRateHz(m_sampleRateHz);
+    }
+    if (m_bandRangeHzLabel) {
+        m_bandRangeHzLabel->setText(
+            formatBandHzSummary(m_draft.band_start, m_draft.band_end, m_sampleRateHz));
+    }
+}
+
+int AudioBindingWizard::currentStepIndex() const noexcept
+{
+    return m_stepStack ? m_stepStack->currentIndex() : 0;
+}
+
 std::pair<uint16_t, uint16_t>
 AudioBindingWizard::barkBandSpanForPreset(MusicalBandPreset preset) noexcept
 {
@@ -566,17 +828,6 @@ void AudioBindingWizard::showEvent(QShowEvent *event)
 {
     QWidget::showEvent(event);
     ensureUiInitialized();
-    if (m_idleRenderTimer && m_extra->hasLiveTelemetry && !m_idleRenderTimer->isActive()) {
-        m_idleRenderTimer->start(16);
-    }
-}
-
-void AudioBindingWizard::hideEvent(QHideEvent *event)
-{
-    if (m_idleRenderTimer && m_idleRenderTimer->isActive()) {
-        m_idleRenderTimer->stop();
-    }
-    QWidget::hideEvent(event);
 }
 
 void AudioBindingWizard::setSceneLayers(const std::vector<SceneLayerNode> &layers)
@@ -617,7 +868,9 @@ void AudioBindingWizard::setActiveBindings(std::vector<we_audio_binding_t> bindi
     for (const auto &b : m_bindings) {
         maxId = std::max(maxId, b.binding_id);
     }
-    m_nextBindingId = std::max(m_nextBindingId, maxId + 1u);
+    if (maxId < std::numeric_limits<uint32_t>::max()) {
+        m_nextBindingId = std::max(m_nextBindingId, maxId + 1u);
+    }
 
     if (m_uiInitialized && m_activeBindingsList) {
         m_activeBindingsList->clear();
@@ -634,9 +887,11 @@ void AudioBindingWizard::preselectTargetUniform(int32_t objectId, const QString 
     m_draft.target_object_id = objectId;
     m_draft.target_kind = WE_AUDIO_TGT_PASS_UNIFORM_COMP;
     m_draft.target_component = std::min(componentIdx, 3u);
-    m_draft.base_value = std::isfinite(currentBaseline) ? currentBaseline : 0.0f;
+    m_draft.target_sub_index =
+        std::min<uint32_t>(m_draft.target_sub_index, static_cast<uint32_t>(kMaxEffectPassSubIndex));
+    m_draft.base_value = sanitizeFinite(currentBaseline, -10000.0f, 10000.0f, 0.0f);
     m_draft.out_min = m_draft.base_value;
-    m_draft.out_max = m_draft.base_value + 1.0f;
+    m_draft.out_max = sanitizeFinite(m_draft.base_value + 1.0f, -10000.0f, 10000.0f, 1.0f);
     const QByteArray uname = uniformName.toUtf8();
     std::snprintf(m_draft.uniform_name, sizeof(m_draft.uniform_name), "%s", uname.constData());
 
@@ -645,31 +900,32 @@ void AudioBindingWizard::preselectTargetUniform(int32_t objectId, const QString 
     }
 
     auto &ex = *m_extra;
-    ex.updatingUi = true;
     {
-        QSignalBlocker blockLayer(m_targetLayerCombo);
-        int lIdx = m_targetLayerCombo->findData(objectId);
-        if (lIdx < 0) {
-            m_targetLayerCombo->addItem(tr("Object #%1").arg(objectId), objectId);
-            lIdx = m_targetLayerCombo->count() - 1;
+        const QScopedValueRollback<bool> guard(ex.updatingUi, true);
+        {
+            QSignalBlocker blockLayer(m_targetLayerCombo);
+            int lIdx = m_targetLayerCombo->findData(objectId);
+            if (lIdx < 0) {
+                m_targetLayerCombo->addItem(tr("Object #%1").arg(objectId), objectId);
+                lIdx = m_targetLayerCombo->count() - 1;
+            }
+            m_targetLayerCombo->setCurrentIndex(lIdx);
         }
-        m_targetLayerCombo->setCurrentIndex(lIdx);
+        m_targetCategoryCombo->setCurrentIndex(1);
+        if (const int pIdx =
+                m_targetParamCombo->findData(static_cast<int>(WE_AUDIO_TGT_PASS_UNIFORM_COMP));
+            pIdx >= 0) {
+            m_targetParamCombo->setCurrentIndex(pIdx);
+        }
+        updateTargetParamUiState();
+        ex.uniformNameEdit->setText(uniformName);
+        ex.componentSpin->setValue(static_cast<int>(m_draft.target_component));
+        ex.subIndexSpin->setValue(static_cast<int>(m_draft.target_sub_index));
+        ex.baseValueSpin->setValue(static_cast<double>(m_draft.base_value));
+        m_outMinSpin->setValue(static_cast<double>(m_draft.out_min));
+        m_outMaxSpin->setValue(static_cast<double>(m_draft.out_max));
     }
-    m_targetCategoryCombo->setCurrentIndex(1);
-    if (const int pIdx =
-            m_targetParamCombo->findData(static_cast<int>(WE_AUDIO_TGT_PASS_UNIFORM_COMP));
-        pIdx >= 0) {
-        m_targetParamCombo->setCurrentIndex(pIdx);
-    }
-    ex.uniformNameEdit->setText(uniformName);
-    ex.componentSpin->setValue(static_cast<int>(m_draft.target_component));
-    ex.baseValueSpin->setValue(static_cast<double>(m_draft.base_value));
-    m_outMinSpin->setValue(static_cast<double>(m_draft.out_min));
-    m_outMaxSpin->setValue(static_cast<double>(m_draft.out_max));
-    if (m_stepStack) {
-        m_stepStack->setCurrentIndex(0);
-    }
-    ex.updatingUi = false;
+    syncStepUi(0);
 }
 
 void AudioBindingWizard::applyMusicalBandPreset(MusicalBandPreset preset)
@@ -682,6 +938,10 @@ void AudioBindingWizard::applyMusicalBandPreset(MusicalBandPreset preset)
                                                                      : WE_AUDIO_SRC_BARK_RANGE;
     if (preset == MusicalBandPreset::BeatPulseOnset) {
         m_draft.curve_shape = WE_AUDIO_CURVE_TRIG_EDGE;
+        m_extra->curveAutoSetByOnset = true;
+    } else if (m_draft.curve_shape == WE_AUDIO_CURVE_TRIG_EDGE) {
+        m_draft.curve_shape = WE_AUDIO_CURVE_LINEAR;
+        m_extra->curveAutoSetByOnset = false;
     }
 
     if (!m_uiInitialized) {
@@ -689,7 +949,7 @@ void AudioBindingWizard::applyMusicalBandPreset(MusicalBandPreset preset)
     }
 
     auto &ex = *m_extra;
-    ex.updatingUi = true;
+    const QScopedValueRollback<bool> guard(ex.updatingUi, true);
     if (const int pIdx = m_bandPresetCombo->findData(static_cast<int>(preset)); pIdx >= 0) {
         m_bandPresetCombo->setCurrentIndex(pIdx);
     }
@@ -702,22 +962,27 @@ void AudioBindingWizard::applyMusicalBandPreset(MusicalBandPreset preset)
         ex.barkPicker->setBandRange(m_draft.band_start, m_draft.band_end);
     }
     if (m_bandRangeHzLabel) {
-        m_bandRangeHzLabel->setText(formatBandHzSummary(m_draft.band_start, m_draft.band_end));
+        m_bandRangeHzLabel->setText(
+            formatBandHzSummary(m_draft.band_start, m_draft.band_end, m_sampleRateHz));
     }
     if (const int cIdx = m_curveShapeCombo->findData(static_cast<int>(m_draft.curve_shape));
         cIdx >= 0) {
         m_curveShapeCombo->setCurrentIndex(cIdx);
     }
-    ex.updatingUi = false;
 }
 
 void AudioBindingWizard::updateLiveBarkTelemetry(const std::array<float, 64> &barkBands,
                                                  float envelope, float bassEnergy, float beatPulse,
                                                  float dtSec)
 {
-    const float clampedDt = std::clamp(std::isfinite(dtSec) ? dtSec : (1.0f / 60.0f), 1e-4f, 0.25f);
+    const float clampedDt = sanitizeFinite(dtSec, 1e-4f, 0.25f, 1.0f / 60.0f);
     const uint16_t b0 = std::min<uint16_t>(m_draft.band_start, 63u);
     const uint16_t b1 = std::clamp<uint16_t>(m_draft.band_end, b0, 63u);
+
+    std::array<float, 64> cleanBands{};
+    for (size_t b = 0; b < cleanBands.size(); ++b) {
+        cleanBands[b] = sanitizeFinite(barkBands[b], 0.0f, 1.0f, 0.0f);
+    }
 
     float rawInput = 0.0f;
     switch (static_cast<we_audio_src_kind_t>(m_draft.src_kind)) {
@@ -725,8 +990,7 @@ void AudioBindingWizard::updateLiveBarkTelemetry(const std::array<float, 64> &ba
         float sum = 0.0f;
         float peak = 0.0f;
         for (uint16_t b = b0; b <= b1; ++b) {
-            const float v =
-                std::clamp(std::isfinite(barkBands[b]) ? barkBands[b] : 0.0f, 0.0f, 1.0f);
+            const float v = cleanBands[b];
             sum += v;
             peak = std::max(peak, v);
         }
@@ -741,43 +1005,112 @@ void AudioBindingWizard::updateLiveBarkTelemetry(const std::array<float, 64> &ba
         break;
     }
     case WE_AUDIO_SRC_ENVELOPE:
-        rawInput = std::clamp(envelope, 0.0f, 1.0f);
+        rawInput = sanitizeFinite(envelope, 0.0f, 1.0f, 0.0f);
         break;
     case WE_AUDIO_SRC_BASS_ENERGY:
-        rawInput = std::clamp(bassEnergy, 0.0f, 1.0f);
+        rawInput = sanitizeFinite(bassEnergy, 0.0f, 1.0f, 0.0f);
         break;
     case WE_AUDIO_SRC_BEAT_PULSE:
-        rawInput = std::clamp(beatPulse, 0.0f, 1.0f);
+        rawInput = sanitizeFinite(beatPulse, 0.0f, 1.0f, 0.0f);
         break;
     }
+    rawInput = sanitizeFinite(rawInput, 0.0f, 1.0f, 0.0f);
 
-    if (m_draft.gate_open == 0u && rawInput >= m_draft.threshold_open) {
+    const float gain = sanitizeFinite(m_draft.input_gain, 0.0f, 10.0f, 1.5f);
+    const float thresholdOpen = sanitizeFinite(m_draft.threshold_open, 0.0f, 0.98f, 0.15f);
+    const float hysteresis = sanitizeFinite(m_draft.hysteresis, 0.0f, 0.25f, 0.04f);
+    const float gainedInput = sanitizeFinite(rawInput * gain, 0.0f, 1.0f, 0.0f);
+
+    /* Gate compares the same input_gain-scaled signal plotted on the oscilloscope so threshold
+     * overlay & trigger align. */
+    if (m_draft.gate_open == 0u && gainedInput >= thresholdOpen) {
         m_draft.gate_open = 1u;
     } else if (m_draft.gate_open != 0u &&
-               rawInput < std::max(0.0f, m_draft.threshold_open - m_draft.hysteresis)) {
+               gainedInput < std::max(0.0f, thresholdOpen - hysteresis)) {
         m_draft.gate_open = 0u;
     }
 
-    const float gated = (m_draft.gate_open != 0u) ? (rawInput * m_draft.input_gain) : 0.0f;
-    const float clampedGated = std::clamp(gated, 0.0f, 1.0f);
-    const float tau = (clampedGated > m_draft.env_state) ? m_draft.attack_sec : m_draft.release_sec;
+    const float gated = (m_draft.gate_open != 0u) ? gainedInput : 0.0f;
+    const float attackSec = sanitizeFinite(m_draft.attack_sec, 0.0f, 60.0f, 0.015f);
+    const float releaseSec = sanitizeFinite(m_draft.release_sec, 0.0f, 60.0f, 0.180f);
+    const float prevEnv = sanitizeFinite(m_draft.env_state, 0.0f, 1.0f, 0.0f);
+    const float tau = (gated > prevEnv) ? attackSec : releaseSec;
     const float alpha = (tau <= 1e-4f) ? 1.0f : (1.0f - std::exp(-clampedDt / tau));
-    m_draft.env_state += alpha * (clampedGated - m_draft.env_state);
-    m_draft.last_output = m_draft.env_state;
+    float nextEnv = sanitizeFinite(prevEnv + alpha * (gated - prevEnv), 0.0f, 1.0f, 0.0f);
+    if (gated == 0.0f && nextEnv < 1e-4f) {
+        nextEnv = 0.0f;
+    }
+    m_draft.env_state = nextEnv;
+    m_draft.last_output = nextEnv;
 
-    if (m_uiInitialized) {
-        auto &ex = *m_extra;
-        ex.hasLiveTelemetry = true;
-        if (ex.barkPicker) {
-            ex.barkPicker->setLiveSpectrum(barkBands);
+    if (!m_uiInitialized) {
+        return;
+    }
+
+    auto &ex = *m_extra;
+    if (ex.barkPicker && isVisible() && m_stepStack && m_stepStack->currentIndex() == 0) {
+        ex.barkPicker->setLiveSpectrum(cleanBands);
+    }
+    if (m_oscilloscope) {
+        m_oscilloscope->pushSample(gainedInput, m_draft.env_state, m_draft.gate_open != 0u);
+    }
+}
+
+void AudioBindingWizard::syncStepUi(int stepIdx)
+{
+    if (!m_uiInitialized || !m_stepStack || !m_extra) {
+        return;
+    }
+    auto &st = *m_extra;
+    stepIdx = std::clamp(stepIdx, 0, 2);
+    m_stepStack->setCurrentIndex(stepIdx);
+    if (stepIdx != 0 && st.barkPicker) {
+        st.barkPicker->clearLiveSpectrum();
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (auto *btn = st.stepTabBtns[static_cast<size_t>(i)]) {
+            QSignalBlocker block(btn);
+            btn->setChecked(i == stepIdx);
         }
-        if (m_oscilloscope) {
-            m_oscilloscope->pushSample(std::clamp(rawInput * m_draft.input_gain, 0.0f, 1.0f),
-                                       m_draft.env_state, m_draft.gate_open != 0u);
-            ex.oscNeedsRepaint = true;
+    }
+    if (st.prevStepBtn) {
+        st.prevStepBtn->setEnabled(stepIdx > 0);
+    }
+    if (st.nextStepBtn) {
+        st.nextStepBtn->setEnabled(stepIdx < 2);
+    }
+}
+
+void AudioBindingWizard::updateTargetParamUiState()
+{
+    if (!m_uiInitialized || !m_targetParamCombo || !m_extra) {
+        return;
+    }
+    auto &st = *m_extra;
+    const QVariant paramData = m_targetParamCombo->currentData();
+    const uint32_t targetKind = paramData.isValid() ? paramData.toUInt() : m_draft.target_kind;
+    const SubIndexBounds bounds = subIndexBoundsForTarget(targetKind);
+    const bool isUniformTarget = (targetKind == WE_AUDIO_TGT_PASS_UNIFORM_COMP);
+
+    if (st.subIndexSpin) {
+        QSignalBlocker blockSub(st.subIndexSpin);
+        st.subIndexSpin->setRange(0, bounds.maxIndex);
+        if (!bounds.enabled) {
+            st.subIndexSpin->setValue(0);
+        } else {
+            st.subIndexSpin->setValue(std::clamp(st.subIndexSpin->value(), 0, bounds.maxIndex));
         }
-        if (isVisible() && m_idleRenderTimer && !m_idleRenderTimer->isActive()) {
-            m_idleRenderTimer->start(16);
+        st.subIndexSpin->setEnabled(bounds.enabled);
+        st.subIndexSpin->setToolTip(tr(bounds.hint));
+    }
+    if (st.uniformNameEdit) {
+        st.uniformNameEdit->setEnabled(isUniformTarget);
+    }
+    if (st.componentSpin) {
+        st.componentSpin->setEnabled(isUniformTarget);
+        if (!isUniformTarget) {
+            QSignalBlocker blockComp(st.componentSpin);
+            st.componentSpin->setValue(0);
         }
     }
 }
@@ -807,6 +1140,7 @@ void AudioBindingWizard::ensureUiInitialized()
         auto *btn = new QPushButton(QLatin1String(kStepLabels[i]), this);
         btn->setCheckable(true);
         btn->setChecked(i == 0);
+        btn->setMinimumSize(kMinControlSizePx, kMinControlSizePx);
         ex.stepTabBtns[static_cast<size_t>(i)] = btn;
         stepNavRow->addWidget(btn, 1);
     }
@@ -837,6 +1171,7 @@ void AudioBindingWizard::ensureUiInitialized()
     };
     for (size_t i = 0; i < std::size(kChips); ++i) {
         auto *chipBtn = new QPushButton(QLatin1String(kChips[i].label), step1);
+        chipBtn->setMinimumSize(kMinControlSizePx, kMinControlSizePx);
         const auto preset = kChips[i].preset;
         connect(chipBtn, &QPushButton::clicked, this,
                 [this, preset]() { applyMusicalBandPreset(preset); });
@@ -847,6 +1182,7 @@ void AudioBindingWizard::ensureUiInitialized()
 
     auto *s1Form = new QFormLayout();
     m_bandPresetCombo = new QComboBox(step1);
+    m_bandPresetCombo->setMinimumHeight(kMinControlSizePx);
     m_bandPresetCombo->addItem(tr("Sub-Bass (20-80 Hz)"),
                                static_cast<int>(MusicalBandPreset::SubBass20To80Hz));
     m_bandPresetCombo->addItem(tr("Bass (80-250 Hz)"),
@@ -863,6 +1199,7 @@ void AudioBindingWizard::ensureUiInitialized()
                                static_cast<int>(MusicalBandPreset::BeatPulseOnset));
 
     ex.srcKindCombo = new QComboBox(step1);
+    ex.srcKindCombo->setMinimumHeight(kMinControlSizePx);
     ex.srcKindCombo->addItem(tr("Bark Range [min..max]"),
                              static_cast<int>(WE_AUDIO_SRC_BARK_RANGE));
     ex.srcKindCombo->addItem(tr("Global RMS Envelope"), static_cast<int>(WE_AUDIO_SRC_ENVELOPE));
@@ -870,15 +1207,14 @@ void AudioBindingWizard::ensureUiInitialized()
     ex.srcKindCombo->addItem(tr("Beat Onset Pulse"), static_cast<int>(WE_AUDIO_SRC_BEAT_PULSE));
 
     m_aggModeCombo = new QComboBox(step1);
+    m_aggModeCombo->setMinimumHeight(kMinControlSizePx);
     m_aggModeCombo->addItem(tr("Peak Weighted (0.7*Peak + 0.3*Mean)"),
                             static_cast<int>(WE_AUDIO_AGG_PEAK_WEIGHTED));
     m_aggModeCombo->addItem(tr("Mean"), static_cast<int>(WE_AUDIO_AGG_MEAN));
     m_aggModeCombo->addItem(tr("Peak"), static_cast<int>(WE_AUDIO_AGG_PEAK));
 
-    ex.bandStartSpin = new QSpinBox(step1);
-    ex.bandStartSpin->setRange(0, 63);
-    ex.bandEndSpin = new QSpinBox(step1);
-    ex.bandEndSpin->setRange(0, 63);
+    ex.bandStartSpin = makeIntSpin(0, 63, step1);
+    ex.bandEndSpin = makeIntSpin(0, 63, step1);
     auto *bandRow = new QHBoxLayout();
     bandRow->addWidget(ex.bandStartSpin);
     bandRow->addWidget(new QLabel(tr("to"), step1));
@@ -896,22 +1232,32 @@ void AudioBindingWizard::ensureUiInitialized()
             if (st.updatingUi) {
                 return;
             }
-            st.updatingUi = true;
+            const QScopedValueRollback<bool> guard(st.updatingUi, true);
             m_draft.src_kind = WE_AUDIO_SRC_BARK_RANGE;
             m_draft.band_start = startB;
             m_draft.band_end = endB;
             st.srcKindCombo->setCurrentIndex(0);
             st.bandStartSpin->setValue(startB);
             st.bandEndSpin->setValue(endB);
-            m_bandRangeHzLabel->setText(formatBandHzSummary(startB, endB));
-            st.updatingUi = false;
+            if (st.curveAutoSetByOnset && m_draft.curve_shape == WE_AUDIO_CURVE_TRIG_EDGE) {
+                m_draft.curve_shape = WE_AUDIO_CURVE_LINEAR;
+                st.curveAutoSetByOnset = false;
+                if (const int cIdx =
+                        m_curveShapeCombo->findData(static_cast<int>(m_draft.curve_shape));
+                    cIdx >= 0) {
+                    m_curveShapeCombo->setCurrentIndex(cIdx);
+                }
+            }
+            m_bandRangeHzLabel->setText(formatBandHzSummary(startB, endB, m_sampleRateHz));
         },
         step1);
+    ex.barkPicker->setSampleRateHz(m_sampleRateHz);
     s1Layout->addWidget(ex.barkPicker);
 
-    m_bandRangeHzLabel =
-        new QLabel(formatBandHzSummary(m_draft.band_start, m_draft.band_end), step1);
-    m_bandRangeHzLabel->setStyleSheet(QStringLiteral("color: #38bdf8; font-family: monospace;"));
+    m_bandRangeHzLabel = new QLabel(
+        formatBandHzSummary(m_draft.band_start, m_draft.band_end, m_sampleRateHz), step1);
+    m_bandRangeHzLabel->setStyleSheet(
+        QStringLiteral("color: #38bdf8; font-family: monospace; font-size: 12px;"));
     s1Layout->addWidget(m_bandRangeHzLabel);
     s1Layout->addStretch(1);
     m_stepStack->addWidget(step1);
@@ -922,25 +1268,28 @@ void AudioBindingWizard::ensureUiInitialized()
     s2Form->setSpacing(6);
 
     m_targetLayerCombo = new QComboBox(step2);
+    m_targetLayerCombo->setMinimumHeight(kMinControlSizePx);
     m_targetCategoryCombo = new QComboBox(step2);
+    m_targetCategoryCombo->setMinimumHeight(kMinControlSizePx);
     m_targetCategoryCombo->addItem(tr("Transform & Color"), 0);
     m_targetCategoryCombo->addItem(tr("Shader Uniform"), 1);
     m_targetCategoryCombo->addItem(tr("Scene Light"), 2);
     m_targetCategoryCombo->addItem(tr("Particle System"), 3);
 
     m_targetParamCombo = new QComboBox(step2);
+    m_targetParamCombo->setMinimumHeight(kMinControlSizePx);
     ex.uniformNameEdit = new QLineEdit(step2);
+    ex.uniformNameEdit->setMinimumHeight(kMinControlSizePx);
     ex.uniformNameEdit->setPlaceholderText(QStringLiteral("u_glowIntensity"));
-    ex.componentSpin = new QSpinBox(step2);
-    ex.componentSpin->setRange(0, 3);
-    ex.subIndexSpin = new QSpinBox(step2);
-    ex.subIndexSpin->setRange(0, 15);
+    ex.componentSpin = makeIntSpin(0, 3, step2);
+    ex.subIndexSpin = makeIntSpin(0, 0, step2);
     ex.baseValueSpin = makeSpin(-10000.0, 10000.0, 0.05, 3, step2);
     m_outMinSpin = makeSpin(-10000.0, 10000.0, 0.05, 3, step2);
     m_outMaxSpin = makeSpin(-10000.0, 10000.0, 0.05, 3, step2);
     m_outMaxSpin->setValue(1.0);
 
     m_blendModeCombo = new QComboBox(step2);
+    m_blendModeCombo->setMinimumHeight(kMinControlSizePx);
     m_blendModeCombo->addItem(tr("Add onto Baseline"), static_cast<int>(WE_AUDIO_BLEND_ADD));
     m_blendModeCombo->addItem(tr("Multiply Baseline"), static_cast<int>(WE_AUDIO_BLEND_MULTIPLY));
     m_blendModeCombo->addItem(tr("Replace"), static_cast<int>(WE_AUDIO_BLEND_REPLACE));
@@ -978,6 +1327,7 @@ void AudioBindingWizard::ensureUiInitialized()
     m_releaseMsSpin->setSuffix(QStringLiteral(" ms"));
 
     m_curveShapeCombo = new QComboBox(step3);
+    m_curveShapeCombo->setMinimumHeight(kMinControlSizePx);
     m_curveShapeCombo->addItem(tr("Linear"), static_cast<int>(WE_AUDIO_CURVE_LINEAR));
     m_curveShapeCombo->addItem(tr("Quadratic (Punch x^2)"),
                                static_cast<int>(WE_AUDIO_CURVE_QUADRATIC));
@@ -1005,11 +1355,12 @@ void AudioBindingWizard::ensureUiInitialized()
     /* Wizard Footer Actions */
     auto *navFooter = new QHBoxLayout();
     ex.prevStepBtn = new QPushButton(tr("Back"), this);
+    ex.prevStepBtn->setMinimumSize(kMinControlSizePx, kMinControlSizePx);
     ex.nextStepBtn = new QPushButton(tr("Next"), this);
+    ex.nextStepBtn->setMinimumSize(kMinControlSizePx, kMinControlSizePx);
     m_createBtn = new QPushButton(tr("Create Binding"), this);
-    m_createBtn->setStyleSheet(
-        QStringLiteral("background-color: #0284c7; border-color: #38bdf8; color: #f1f5f9; "
-                       "font-weight: 600;"));
+    m_createBtn->setObjectName(QStringLiteral("createBindingBtn"));
+    m_createBtn->setMinimumSize(kMinControlSizePx, kMinControlSizePx);
     navFooter->addWidget(ex.prevStepBtn);
     navFooter->addWidget(ex.nextStepBtn);
     navFooter->addStretch(1);
@@ -1024,47 +1375,23 @@ void AudioBindingWizard::ensureUiInitialized()
     activeV->addWidget(m_activeBindingsList);
     auto *activeBtns = new QHBoxLayout();
     auto *removeBtn = new QPushButton(tr("Remove Selected"), activeGroup);
+    removeBtn->setMinimumSize(kMinControlSizePx, kMinControlSizePx);
     auto *clearBtn = new QPushButton(tr("Clear All"), activeGroup);
+    clearBtn->setMinimumSize(kMinControlSizePx, kMinControlSizePx);
     activeBtns->addWidget(removeBtn);
     activeBtns->addWidget(clearBtn);
     activeBtns->addStretch(1);
     activeV->addLayout(activeBtns);
     outerLayout->addWidget(activeGroup);
 
-    /* Render at 60 Hz only while Bark telemetry frames are actively arriving. */
-    m_idleRenderTimer = new QTimer(this);
-    m_idleRenderTimer->setInterval(16);
-    connect(m_idleRenderTimer, &QTimer::timeout, this, [this]() {
-        if (m_extra->oscNeedsRepaint) {
-            if (m_oscilloscope) {
-                m_oscilloscope->update();
-            }
-            m_extra->oscNeedsRepaint = false;
-        } else {
-            m_extra->hasLiveTelemetry = false;
-            m_idleRenderTimer->stop();
-        }
-    });
-
-    auto syncStepUi = [this](int stepIdx) {
-        auto &st = *m_extra;
-        stepIdx = std::clamp(stepIdx, 0, 2);
-        m_stepStack->setCurrentIndex(stepIdx);
-        for (int i = 0; i < 3; ++i) {
-            st.stepTabBtns[static_cast<size_t>(i)]->setChecked(i == stepIdx);
-        }
-        st.prevStepBtn->setEnabled(stepIdx > 0);
-        st.nextStepBtn->setEnabled(stepIdx < 2);
-    };
-
     for (int i = 0; i < 3; ++i) {
         connect(ex.stepTabBtns[static_cast<size_t>(i)], &QPushButton::clicked, this,
-                [syncStepUi, i]() { syncStepUi(i); });
+                [this, i]() { syncStepUi(i); });
     }
     connect(ex.prevStepBtn, &QPushButton::clicked, this,
-            [this, syncStepUi]() { syncStepUi(m_stepStack->currentIndex() - 1); });
+            [this]() { syncStepUi(m_stepStack->currentIndex() - 1); });
     connect(ex.nextStepBtn, &QPushButton::clicked, this,
-            [this, syncStepUi]() { syncStepUi(m_stepStack->currentIndex() + 1); });
+            [this]() { syncStepUi(m_stepStack->currentIndex() + 1); });
 
     auto populateCategoryParams = [this](int catIdx) {
         QSignalBlocker block(m_targetParamCombo);
@@ -1108,18 +1435,45 @@ void AudioBindingWizard::ensureUiInitialized()
     connect(m_targetCategoryCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this, populateCategoryParams](int idx) {
                 populateCategoryParams(idx);
+                updateTargetParamUiState();
                 if (!m_extra->updatingUi) {
                     m_draft = buildDraftFromUi();
                 }
             });
+
+    auto onStep2ControlChanged = [this]() {
+        updateTargetParamUiState();
+        if (!m_extra->updatingUi) {
+            m_draft = buildDraftFromUi();
+        }
+    };
+    connect(m_targetParamCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            onStep2ControlChanged);
+    connect(m_targetLayerCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            onStep2ControlChanged);
+    connect(m_blendModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            onStep2ControlChanged);
+    connect(ex.componentSpin, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            onStep2ControlChanged);
+    connect(ex.subIndexSpin, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            onStep2ControlChanged);
+    connect(ex.baseValueSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            onStep2ControlChanged);
+    connect(m_outMinSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            onStep2ControlChanged);
+    connect(m_outMaxSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+            onStep2ControlChanged);
+    connect(ex.uniformNameEdit, &QLineEdit::editingFinished, this, onStep2ControlChanged);
 
     connect(m_bandPresetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int) {
                 if (m_extra->updatingUi) {
                     return;
                 }
-                applyMusicalBandPreset(
-                    static_cast<MusicalBandPreset>(m_bandPresetCombo->currentData().toInt()));
+                const QVariant data = m_bandPresetCombo->currentData();
+                if (data.isValid()) {
+                    applyMusicalBandPreset(static_cast<MusicalBandPreset>(data.toInt()));
+                }
             });
 
     auto onBandSpinChanged = [this]() {
@@ -1127,9 +1481,9 @@ void AudioBindingWizard::ensureUiInitialized()
         if (st.updatingUi) {
             return;
         }
-        st.updatingUi = true;
-        uint16_t b0 = static_cast<uint16_t>(st.bandStartSpin->value());
-        uint16_t b1 = static_cast<uint16_t>(st.bandEndSpin->value());
+        const QScopedValueRollback<bool> guard(st.updatingUi, true);
+        uint16_t b0 = static_cast<uint16_t>(std::clamp(st.bandStartSpin->value(), 0, 63));
+        uint16_t b1 = static_cast<uint16_t>(std::clamp(st.bandEndSpin->value(), 0, 63));
         if (b1 < b0) {
             b1 = b0;
             st.bandEndSpin->setValue(b1);
@@ -1139,19 +1493,35 @@ void AudioBindingWizard::ensureUiInitialized()
         if (st.barkPicker) {
             st.barkPicker->setBandRange(b0, b1);
         }
-        m_bandRangeHzLabel->setText(formatBandHzSummary(b0, b1));
-        st.updatingUi = false;
+        m_bandRangeHzLabel->setText(formatBandHzSummary(b0, b1, m_sampleRateHz));
     };
     connect(ex.bandStartSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, onBandSpinChanged);
     connect(ex.bandEndSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, onBandSpinChanged);
     connect(ex.srcKindCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int) {
-                if (!m_extra->updatingUi) {
-                    m_draft.src_kind = m_extra->srcKindCombo->currentData().toUInt();
+                auto &st = *m_extra;
+                if (st.updatingUi) {
+                    return;
+                }
+                const QVariant data = st.srcKindCombo->currentData();
+                if (!data.isValid()) {
+                    return;
+                }
+                m_draft.src_kind = data.toUInt();
+                if (m_draft.src_kind != WE_AUDIO_SRC_BEAT_PULSE && st.curveAutoSetByOnset &&
+                    m_draft.curve_shape == WE_AUDIO_CURVE_TRIG_EDGE) {
+                    const QScopedValueRollback<bool> guard(st.updatingUi, true);
+                    m_draft.curve_shape = WE_AUDIO_CURVE_LINEAR;
+                    st.curveAutoSetByOnset = false;
+                    if (const int cIdx =
+                            m_curveShapeCombo->findData(static_cast<int>(m_draft.curve_shape));
+                        cIdx >= 0) {
+                        m_curveShapeCombo->setCurrentIndex(cIdx);
+                    }
                 }
             });
     connect(m_aggModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
-        if (!m_extra->updatingUi) {
+        if (!m_extra->updatingUi && m_aggModeCombo->currentData().isValid()) {
             m_draft.agg_mode = m_aggModeCombo->currentData().toUInt();
         }
     });
@@ -1166,7 +1536,10 @@ void AudioBindingWizard::ensureUiInitialized()
         m_draft.hysteresis = static_cast<float>(st.hysteresisSpin->value());
         m_draft.attack_sec = static_cast<float>(m_attackMsSpin->value()) * 0.001f;
         m_draft.release_sec = static_cast<float>(m_releaseMsSpin->value()) * 0.001f;
-        m_draft.curve_shape = m_curveShapeCombo->currentData().toUInt();
+        if (m_curveShapeCombo->currentData().isValid()) {
+            m_draft.curve_shape = m_curveShapeCombo->currentData().toUInt();
+            st.curveAutoSetByOnset = false;
+        }
         if (m_oscilloscope) {
             m_oscilloscope->setThresholdGate(m_draft.threshold_open, m_draft.hysteresis);
         }
@@ -1186,9 +1559,11 @@ void AudioBindingWizard::ensureUiInitialized()
 
     connect(m_oscilloscope, &AudioEnvelopeOscilloscopeWidget::thresholdGateDragged, this,
             [this](float newThresh) {
+                const float cleanThresh =
+                    sanitizeFinite(newThresh, 0.0f, 0.98f, m_draft.threshold_open);
                 QSignalBlocker block(m_gateSpin);
-                m_gateSpin->setValue(static_cast<double>(newThresh));
-                m_draft.threshold_open = newThresh;
+                m_gateSpin->setValue(static_cast<double>(cleanThresh));
+                m_draft.threshold_open = cleanThresh;
             });
 
     connect(m_createBtn, &QPushButton::clicked, this, &AudioBindingWizard::commitDraftBinding);
@@ -1198,15 +1573,35 @@ void AudioBindingWizard::ensureUiInitialized()
         if (row < 0 || row >= static_cast<int>(m_bindings.size())) {
             return;
         }
-        const we_audio_binding_t removed = m_bindings[static_cast<size_t>(row)];
+        const size_t removedRow = static_cast<size_t>(row);
+        const we_audio_binding_t removed = m_bindings[removedRow];
         QPointer<AudioBindingWizard> self(this);
-        auto applyFn = [self](const std::optional<we_audio_binding_t> &binding, uint32_t removeId) {
+        auto applyFn = [self, removedRow](const std::optional<we_audio_binding_t> &binding,
+                                          uint32_t removeId) {
             if (!self) {
                 return;
             }
+            std::optional<size_t> restoredRow;
             if (binding.has_value()) {
-                self->m_bindings.push_back(*binding);
-                self->syncIpcBindings(WE_AUDIO_BIND_OP_UPSERT, &(*binding), 0u);
+                auto existing = std::find_if(self->m_bindings.begin(), self->m_bindings.end(),
+                                             [&binding](const we_audio_binding_t &x) {
+                                                 return x.binding_id == binding->binding_id;
+                                             });
+                if (existing != self->m_bindings.end()) {
+                    *existing = *binding;
+                    restoredRow = static_cast<size_t>(existing - self->m_bindings.begin());
+                    self->syncIpcBindings(WE_AUDIO_BIND_OP_UPSERT, &(*binding), 0u);
+                } else if (self->m_bindings.size() < WE_MAX_AUDIO_BINDINGS) {
+                    const size_t insertPos = std::min(removedRow, self->m_bindings.size());
+                    self->m_bindings.insert(
+                        self->m_bindings.begin() + static_cast<ptrdiff_t>(insertPos), *binding);
+                    restoredRow = insertPos;
+                    if (insertPos + 1u < self->m_bindings.size()) {
+                        self->syncIpcBindings(WE_AUDIO_BIND_OP_REPLACE_ALL, nullptr, 0u);
+                    } else {
+                        self->syncIpcBindings(WE_AUDIO_BIND_OP_UPSERT, &(*binding), 0u);
+                    }
+                }
             } else {
                 self->m_bindings.erase(std::remove_if(self->m_bindings.begin(),
                                                       self->m_bindings.end(),
@@ -1217,6 +1612,10 @@ void AudioBindingWizard::ensureUiInitialized()
                 self->syncIpcBindings(WE_AUDIO_BIND_OP_REMOVE, nullptr, removeId);
             }
             self->setActiveBindings(self->m_bindings);
+            if (restoredRow.has_value() && self->m_activeBindingsList &&
+                *restoredRow < static_cast<size_t>(self->m_activeBindingsList->count())) {
+                self->m_activeBindingsList->setCurrentRow(static_cast<int>(*restoredRow));
+            }
             emit self->bindingsUpdated(self->m_bindings);
         };
         if (m_commandBus) {
@@ -1257,56 +1656,63 @@ void AudioBindingWizard::ensureUiInitialized()
     setSceneLayers(m_layers);
     setActiveBindings(m_bindings);
 
-    ex.updatingUi = true;
-    if (const int sIdx = ex.srcKindCombo->findData(static_cast<int>(m_draft.src_kind)); sIdx >= 0) {
-        ex.srcKindCombo->setCurrentIndex(sIdx);
-    }
-    if (const int aIdx = m_aggModeCombo->findData(static_cast<int>(m_draft.agg_mode)); aIdx >= 0) {
-        m_aggModeCombo->setCurrentIndex(aIdx);
-    }
-    ex.bandStartSpin->setValue(m_draft.band_start);
-    ex.bandEndSpin->setValue(m_draft.band_end);
-    if (ex.barkPicker) {
-        ex.barkPicker->setBandRange(m_draft.band_start, m_draft.band_end);
-    }
-    m_bandRangeHzLabel->setText(formatBandHzSummary(m_draft.band_start, m_draft.band_end));
-    for (int p = 0; p < m_bandPresetCombo->count(); ++p) {
-        const auto preset = static_cast<MusicalBandPreset>(m_bandPresetCombo->itemData(p).toInt());
-        const auto span = barkBandSpanForPreset(preset);
-        if (span.first == m_draft.band_start && span.second == m_draft.band_end &&
-            ((preset == MusicalBandPreset::BeatPulseOnset) ==
-             (m_draft.src_kind == WE_AUDIO_SRC_BEAT_PULSE))) {
-            m_bandPresetCombo->setCurrentIndex(p);
-            break;
+    {
+        const QScopedValueRollback<bool> guard(ex.updatingUi, true);
+        if (const int sIdx = ex.srcKindCombo->findData(static_cast<int>(m_draft.src_kind));
+            sIdx >= 0) {
+            ex.srcKindCombo->setCurrentIndex(sIdx);
         }
+        if (const int aIdx = m_aggModeCombo->findData(static_cast<int>(m_draft.agg_mode));
+            aIdx >= 0) {
+            m_aggModeCombo->setCurrentIndex(aIdx);
+        }
+        ex.bandStartSpin->setValue(m_draft.band_start);
+        ex.bandEndSpin->setValue(m_draft.band_end);
+        if (ex.barkPicker) {
+            ex.barkPicker->setBandRange(m_draft.band_start, m_draft.band_end);
+        }
+        m_bandRangeHzLabel->setText(
+            formatBandHzSummary(m_draft.band_start, m_draft.band_end, m_sampleRateHz));
+        for (int p = 0; p < m_bandPresetCombo->count(); ++p) {
+            const auto preset =
+                static_cast<MusicalBandPreset>(m_bandPresetCombo->itemData(p).toInt());
+            const auto span = barkBandSpanForPreset(preset);
+            if (span.first == m_draft.band_start && span.second == m_draft.band_end &&
+                ((preset == MusicalBandPreset::BeatPulseOnset) ==
+                 (m_draft.src_kind == WE_AUDIO_SRC_BEAT_PULSE))) {
+                m_bandPresetCombo->setCurrentIndex(p);
+                break;
+            }
+        }
+        m_gainSpin->setValue(static_cast<double>(m_draft.input_gain));
+        m_gateSpin->setValue(static_cast<double>(m_draft.threshold_open));
+        ex.hysteresisSpin->setValue(static_cast<double>(m_draft.hysteresis));
+        m_attackMsSpin->setValue(static_cast<double>(m_draft.attack_sec) * 1000.0);
+        m_releaseMsSpin->setValue(static_cast<double>(m_draft.release_sec) * 1000.0);
+        if (const int cIdx = m_curveShapeCombo->findData(static_cast<int>(m_draft.curve_shape));
+            cIdx >= 0) {
+            m_curveShapeCombo->setCurrentIndex(cIdx);
+        }
+        if (const int bIdx = m_blendModeCombo->findData(static_cast<int>(m_draft.blend_mode));
+            bIdx >= 0) {
+            m_blendModeCombo->setCurrentIndex(bIdx);
+        }
+        if (m_oscilloscope) {
+            m_oscilloscope->setThresholdGate(m_draft.threshold_open, m_draft.hysteresis);
+        }
+        ex.baseValueSpin->setValue(static_cast<double>(m_draft.base_value));
+        m_outMinSpin->setValue(static_cast<double>(m_draft.out_min));
+        m_outMaxSpin->setValue(static_cast<double>(m_draft.out_max));
     }
-    m_gainSpin->setValue(static_cast<double>(m_draft.input_gain));
-    m_gateSpin->setValue(static_cast<double>(m_draft.threshold_open));
-    ex.hysteresisSpin->setValue(static_cast<double>(m_draft.hysteresis));
-    m_attackMsSpin->setValue(static_cast<double>(m_draft.attack_sec) * 1000.0);
-    m_releaseMsSpin->setValue(static_cast<double>(m_draft.release_sec) * 1000.0);
-    if (const int cIdx = m_curveShapeCombo->findData(static_cast<int>(m_draft.curve_shape));
-        cIdx >= 0) {
-        m_curveShapeCombo->setCurrentIndex(cIdx);
-    }
-    if (const int bIdx = m_blendModeCombo->findData(static_cast<int>(m_draft.blend_mode));
-        bIdx >= 0) {
-        m_blendModeCombo->setCurrentIndex(bIdx);
-    }
-    if (m_oscilloscope) {
-        m_oscilloscope->setThresholdGate(m_draft.threshold_open, m_draft.hysteresis);
-    }
-    ex.baseValueSpin->setValue(static_cast<double>(m_draft.base_value));
-    m_outMinSpin->setValue(static_cast<double>(m_draft.out_min));
-    m_outMaxSpin->setValue(static_cast<double>(m_draft.out_max));
-    if (m_draft.target_kind == WE_AUDIO_TGT_PASS_UNIFORM_COMP && m_draft.uniform_name[0] != '\0') {
-        ex.updatingUi = false;
+
+    if (ex.hasPreselectedTarget || (m_draft.target_kind == WE_AUDIO_TGT_PASS_UNIFORM_COMP &&
+                                    m_draft.uniform_name[0] != '\0')) {
         preselectTargetUniform(m_draft.target_object_id, QString::fromUtf8(m_draft.uniform_name),
                                m_draft.target_component, m_draft.base_value);
     } else {
-        ex.updatingUi = false;
+        updateTargetParamUiState();
+        syncStepUi(0);
     }
-    syncStepUi(0);
 }
 
 void AudioBindingWizard::syncIpcBindings(we_audio_bind_op_t op,
@@ -1330,29 +1736,57 @@ we_audio_binding_t AudioBindingWizard::buildDraftFromUi() const
     }
 
     const auto &ex = *m_extra;
-    b.src_kind = ex.srcKindCombo->currentData().toUInt();
-    b.agg_mode = m_aggModeCombo->currentData().toUInt();
-    b.band_start = static_cast<uint16_t>(ex.bandStartSpin->value());
-    b.band_end = std::max(b.band_start, static_cast<uint16_t>(ex.bandEndSpin->value()));
+    if (ex.srcKindCombo->currentData().isValid()) {
+        b.src_kind = ex.srcKindCombo->currentData().toUInt();
+    }
+    if (m_aggModeCombo->currentData().isValid()) {
+        b.agg_mode = m_aggModeCombo->currentData().toUInt();
+    }
+    b.band_start = static_cast<uint16_t>(std::clamp(ex.bandStartSpin->value(), 0, 63));
+    b.band_end =
+        std::max(b.band_start, static_cast<uint16_t>(std::clamp(ex.bandEndSpin->value(), 0, 63)));
 
-    b.target_object_id = m_targetLayerCombo->currentData().toInt();
-    b.target_kind = m_targetParamCombo->currentData().toUInt();
-    b.target_sub_index = static_cast<uint32_t>(ex.subIndexSpin->value());
-    b.target_component = static_cast<uint32_t>(ex.componentSpin->value());
-    const QByteArray uname = ex.uniformNameEdit->text().toUtf8();
-    std::snprintf(b.uniform_name, sizeof(b.uniform_name), "%s", uname.constData());
+    if (m_targetLayerCombo->currentData().isValid()) {
+        b.target_object_id = m_targetLayerCombo->currentData().toInt();
+    }
+    if (m_targetParamCombo->currentData().isValid()) {
+        b.target_kind = m_targetParamCombo->currentData().toUInt();
+    }
+    const SubIndexBounds subBounds = subIndexBoundsForTarget(b.target_kind);
+    b.target_sub_index =
+        subBounds.enabled
+            ? static_cast<uint32_t>(std::clamp(ex.subIndexSpin->value(), 0, subBounds.maxIndex))
+            : 0u;
+    if (b.target_kind == WE_AUDIO_TGT_PASS_UNIFORM_COMP) {
+        b.target_component = static_cast<uint32_t>(std::clamp(ex.componentSpin->value(), 0, 3));
+        const QByteArray uname = ex.uniformNameEdit->text().toUtf8();
+        std::snprintf(b.uniform_name, sizeof(b.uniform_name), "%s", uname.constData());
+    } else {
+        b.target_component = 0u;
+        b.uniform_name[0] = '\0';
+    }
 
-    b.base_value = static_cast<float>(ex.baseValueSpin->value());
-    b.out_min = static_cast<float>(m_outMinSpin->value());
-    b.out_max = static_cast<float>(m_outMaxSpin->value());
-    b.blend_mode = m_blendModeCombo->currentData().toUInt();
+    b.base_value = sanitizeFinite(static_cast<float>(ex.baseValueSpin->value()), -1e6f, 1e6f, 0.0f);
+    b.out_min = sanitizeFinite(static_cast<float>(m_outMinSpin->value()), -1e6f, 1e6f, 0.0f);
+    b.out_max = sanitizeFinite(static_cast<float>(m_outMaxSpin->value()), -1e6f, 1e6f, 1.0f);
+    if (m_blendModeCombo->currentData().isValid()) {
+        b.blend_mode = m_blendModeCombo->currentData().toUInt();
+    }
 
-    b.input_gain = static_cast<float>(m_gainSpin->value());
-    b.threshold_open = static_cast<float>(m_gateSpin->value());
-    b.hysteresis = static_cast<float>(ex.hysteresisSpin->value());
-    b.attack_sec = static_cast<float>(m_attackMsSpin->value()) * 0.001f;
-    b.release_sec = static_cast<float>(m_releaseMsSpin->value()) * 0.001f;
-    b.curve_shape = m_curveShapeCombo->currentData().toUInt();
+    b.input_gain = sanitizeFinite(static_cast<float>(m_gainSpin->value()), 0.1f, 10.0f, 1.5f);
+    b.threshold_open = sanitizeFinite(static_cast<float>(m_gateSpin->value()), 0.0f, 0.98f, 0.15f);
+    b.hysteresis =
+        sanitizeFinite(static_cast<float>(ex.hysteresisSpin->value()), 0.0f, 0.25f, 0.04f);
+    b.attack_sec =
+        sanitizeFinite(static_cast<float>(m_attackMsSpin->value()) * 0.001f, 0.001f, 1.0f, 0.015f);
+    b.release_sec =
+        sanitizeFinite(static_cast<float>(m_releaseMsSpin->value()) * 0.001f, 0.005f, 2.0f, 0.180f);
+    if (m_curveShapeCombo->currentData().isValid()) {
+        b.curve_shape = m_curveShapeCombo->currentData().toUInt();
+    }
+    b.env_state = sanitizeFinite(b.env_state, 0.0f, 1.0f, 0.0f);
+    b.last_output = sanitizeFinite(b.last_output, -1e6f, 1e6f, 0.0f);
+    b.cooldown_rem_sec = sanitizeFinite(b.cooldown_rem_sec, 0.0f, 60.0f, 0.0f);
     b.enabled = 1u;
     return b;
 }
@@ -1365,6 +1799,23 @@ void AudioBindingWizard::commitDraftBinding()
     }
 
     we_audio_binding_t created = buildDraftFromUi();
+    created.env_state = 0.0f;
+    created.last_output = 0.0f;
+    created.cooldown_rem_sec = 0.0f;
+    created.gate_open = 0u;
+    if (m_nextBindingId == 0u) {
+        m_nextBindingId = 1u;
+    }
+    auto idInUse = [this](uint32_t id) {
+        return std::any_of(m_bindings.begin(), m_bindings.end(),
+                           [id](const we_audio_binding_t &x) { return x.binding_id == id; });
+    };
+    while (idInUse(m_nextBindingId)) {
+        ++m_nextBindingId;
+        if (m_nextBindingId == 0u) {
+            m_nextBindingId = 1u;
+        }
+    }
     created.binding_id = m_nextBindingId++;
 
     QPointer<AudioBindingWizard> self(this);
