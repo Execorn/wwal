@@ -36,6 +36,8 @@ typedef struct {
     uint32_t abs_diff_pic_num_l1[32];
 } slice_header_meta_t;
 
+void av1_reset_slot_keyframe_state(const vaapi_decoder_t *dec);
+
 static inline void av1_init_default_slot_state(vaapi_decoder_t *dec)
 {
     if (!dec)
@@ -55,31 +57,88 @@ static inline void av1_init_default_slot_state(vaapi_decoder_t *dec)
             dec->wm[s][r].wmmat[5] = 1 << 16;
         }
     }
+    av1_reset_slot_keyframe_state(dec);
 }
 
-typedef struct {
+typedef struct wwal_bitreader {
     const uint8_t *data;
-    size_t size;
+    size_t size_bytes;
     size_t bit_pos;
+    bool overrun;
     size_t end_bit_pos;
-} bit_reader_t;
+} wwal_bitreader_t;
 
-typedef bit_reader_t bs_t;
+typedef wwal_bitreader_t bit_reader_t;
+typedef wwal_bitreader_t bs_t;
+
+[[maybe_unused]] static inline uint32_t wwal_br_read_bits(wwal_bitreader_t *br, uint32_t nbits)
+{
+    if (!br || !br->data || br->overrun || br->size_bytes > SIZE_MAX / 8u || nbits > 32u) {
+        if (br) {
+            br->overrun = true;
+        }
+        return 0u;
+    }
+    if (nbits == 0u) {
+        return 0u;
+    }
+    size_t total_bits = br->size_bytes * 8u;
+    if (br->bit_pos > total_bits || (size_t)nbits > (total_bits - br->bit_pos)) {
+        br->overrun = true;
+        return 0u;
+    }
+    uint32_t val = 0u;
+    for (uint32_t i = 0u; i < nbits; ++i) {
+        size_t p = br->bit_pos++;
+        uint32_t bit = (uint32_t)((br->data[p >> 3u] >> (7u - (p & 7u))) & 1u);
+        val = (val << 1u) | bit;
+    }
+    return val;
+}
+
+[[maybe_unused]] static inline int32_t wwal_av1_read_su(wwal_bitreader_t *br, uint32_t nbits)
+{
+    if (!br || nbits == 0u || nbits > 31u) {
+        if (br) {
+            br->overrun = true;
+        }
+        return 0;
+    }
+    uint32_t raw = wwal_br_read_bits(br, nbits);
+    if (br->overrun) {
+        return 0;
+    }
+    uint32_t sign_mask = 1u << (nbits - 1u);
+    if ((raw & sign_mask) != 0u) {
+        uint32_t full_mask = (1u << nbits) - 1u;
+        uint32_t neg_mag = (~raw + 1u) & full_mask;
+        return -(int32_t)neg_mag;
+    }
+    return (int32_t)raw;
+}
 
 static inline void bit_reader_init_raw(bit_reader_t *br, const uint8_t *data, size_t size)
 {
+    if (!br)
+        return;
     br->data = data;
-    br->size = size;
-    br->bit_pos = 0;
-    br->end_bit_pos = size * 8;
+    br->size_bytes = size;
+    br->bit_pos = 0u;
+    br->overrun = (!data || size > SIZE_MAX / 8u);
+    br->end_bit_pos = br->overrun ? 0u : (size * 8u);
 }
 
 static inline void bit_reader_init_rbsp(bit_reader_t *br, const uint8_t *data, size_t size)
 {
+    if (!br)
+        return;
     br->data = data;
-    br->size = size;
-    br->bit_pos = 0;
-    br->end_bit_pos = size * 8;
+    br->size_bytes = size;
+    br->bit_pos = 0u;
+    br->overrun = (!data || size > SIZE_MAX / 8u);
+    br->end_bit_pos = br->overrun ? 0u : (size * 8u);
+    if (br->overrun)
+        return;
     for (size_t k = size; k > 0; --k) {
         if (data[k - 1] != 0) {
             uint8_t v = data[k - 1];
@@ -87,7 +146,7 @@ static inline void bit_reader_init_rbsp(bit_reader_t *br, const uint8_t *data, s
             while (((v >> tz) & 1U) == 0) {
                 tz++;
             }
-            br->end_bit_pos = (k - 1) * 8 + (7 - tz);
+            br->end_bit_pos = (k - 1) * 8u + (7u - tz);
             break;
         }
     }
@@ -98,57 +157,76 @@ static inline void bit_reader_init(bit_reader_t *br, const uint8_t *data, size_t
     bit_reader_init_rbsp(br, data, size);
 }
 
-static inline bool more_rbsp_data(const bit_reader_t *br) { return br->bit_pos < br->end_bit_pos; }
-
-static inline uint32_t read_bit(bit_reader_t *br)
+static inline bool more_rbsp_data(const bit_reader_t *br)
 {
-    if (br->bit_pos >= br->size * 8)
-        return 0;
-    size_t byte_idx = br->bit_pos / 8;
-    uint32_t bit_idx = 7 - (br->bit_pos % 8);
-    br->bit_pos++;
-    return (br->data[byte_idx] >> bit_idx) & 1;
+    return br && !br->overrun && br->bit_pos < br->end_bit_pos;
 }
 
-static inline uint32_t read_bits(bit_reader_t *br, uint32_t n)
-{
-    uint32_t val = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        val = (val << 1) | read_bit(br);
-    }
-    return val;
-}
+static inline uint32_t read_bit(bit_reader_t *br) { return wwal_br_read_bits(br, 1u); }
+
+static inline uint32_t read_bits(bit_reader_t *br, uint32_t n) { return wwal_br_read_bits(br, n); }
 
 static inline uint32_t read_ue(bit_reader_t *br)
 {
-    uint32_t zeros = 0;
-    while (read_bit(br) == 0 && br->bit_pos < br->size * 8) {
-        zeros++;
-        if (zeros > 31)
-            return 0;
+    if (!br || br->overrun) {
+        if (br) {
+            br->overrun = true;
+        }
+        return 0u;
     }
-    if (zeros == 0)
-        return 0;
+    uint32_t zeros = 0u;
+    while (true) {
+        uint32_t bit = read_bit(br);
+        if (br->overrun) {
+            return 0u;
+        }
+        if (bit != 0u) {
+            break;
+        }
+        zeros++;
+        if (zeros > 31u) {
+            br->overrun = true;
+            return 0u;
+        }
+    }
+    if (zeros == 0u) {
+        return 0u;
+    }
     uint32_t val = read_bits(br, zeros);
-    if (zeros == 31)
+    if (br->overrun) {
+        return 0u;
+    }
+    if (zeros == 31u) {
         return 0x7FFFFFFFU + val;
-    return (1U << zeros) - 1 + val;
+    }
+    return (1U << zeros) - 1U + val;
 }
 
 static inline int32_t read_se(bit_reader_t *br)
 {
     uint32_t ue = read_ue(br);
-    if (ue == 0xFFFFFFFFU)
+    if (!br || br->overrun || ue == 0xFFFFFFFFU) {
+        if (br) {
+            br->overrun = true;
+        }
         return 0;
-    if (ue % 2 == 1) {
-        return (int32_t)((ue + 1) / 2);
-    } else {
-        return -(int32_t)(ue / 2);
     }
+    if ((ue & 1U) != 0U) {
+        uint32_t mag = (ue >> 1U) + 1U;
+        if (mag > (uint32_t)INT32_MAX) {
+            br->overrun = true;
+            return 0;
+        }
+        return (int32_t)mag;
+    }
+    uint32_t mag = ue >> 1U;
+    return -(int32_t)mag;
 }
 
 static inline size_t unescape_rbsp(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len)
 {
+    if (!src || !dst)
+        return 0u;
     size_t si = 0, di = 0;
 #if defined(__AVX2__) && !defined(WWAL_DISABLE_SIMD)
     const __m256i v_zero = _mm256_setzero_si256();
@@ -191,6 +269,8 @@ static inline size_t unescape_rbsp(const uint8_t *src, size_t src_len, uint8_t *
 static inline size_t rbsp_bit_offset_to_ebsp_bits(const uint8_t *ebsp, size_t ebsp_len,
                                                   size_t rbsp_bits)
 {
+    if (!ebsp)
+        return rbsp_bits;
     size_t target_rbsp_bytes = rbsp_bits / 8;
     size_t rem_bits = rbsp_bits % 8;
     size_t si = 0, di = 0, epb_count = 0;

@@ -41,14 +41,22 @@ static const int16_t g_vp9_ac_qlookup[256] = {
 
 static inline int32_t vp9_read_signed(bs_t *br, uint32_t n)
 {
+    if (!br || br->overrun || n > 31U) {
+        if (br)
+            br->overrun = true;
+        return 0;
+    }
     int32_t val = (int32_t)read_bits(br, n);
-    return read_bit(br) ? -val : val;
+    uint32_t sign = read_bit(br);
+    if (br->overrun)
+        return 0;
+    return sign ? -val : val;
 }
 
 uint32_t vp9_split_superframe(const uint8_t *data, size_t size, const uint8_t *sub_ptrs[8],
                               size_t sub_sizes[8])
 {
-    if (!data || size == 0)
+    if (!data || size == 0 || !sub_ptrs || !sub_sizes)
         return 0;
     uint8_t marker = data[size - 1];
     if ((marker & 0xE0U) == 0xC0U) {
@@ -57,6 +65,7 @@ uint32_t vp9_split_superframe(const uint8_t *data, size_t size, const uint8_t *s
         size_t index_size = 2U + (size_t)frames_in_superframe * mag;
         if (size >= index_size && data[size - index_size] == marker) {
             const uint8_t *idx_ptr = data + size - index_size + 1;
+            size_t payload_limit = size - index_size;
             size_t offset = 0;
             uint32_t valid_count = 0;
             for (uint32_t i = 0; i < frames_in_superframe; ++i) {
@@ -64,7 +73,7 @@ uint32_t vp9_split_superframe(const uint8_t *data, size_t size, const uint8_t *s
                 for (uint32_t b = 0; b < mag; ++b) {
                     frame_sz |= (size_t)idx_ptr[i * mag + b] << (8U * b);
                 }
-                if (frame_sz > (size - index_size) - offset) {
+                if (frame_sz == 0 || frame_sz > payload_limit - offset) {
                     valid_count = 0;
                     break;
                 }
@@ -73,7 +82,7 @@ uint32_t vp9_split_superframe(const uint8_t *data, size_t size, const uint8_t *s
                 valid_count++;
                 offset += frame_sz;
             }
-            if (valid_count == frames_in_superframe) {
+            if (valid_count == frames_in_superframe && offset == payload_limit) {
                 return valid_count;
             }
         }
@@ -81,6 +90,57 @@ uint32_t vp9_split_superframe(const uint8_t *data, size_t size, const uint8_t *s
     sub_ptrs[0] = data;
     sub_sizes[0] = size;
     return 1;
+}
+
+typedef struct {
+    uint8_t subsampling_x;
+    uint8_t subsampling_y;
+    uint8_t bit_depth;
+    uint8_t color_space;
+    uint8_t color_range;
+    int8_t ref_deltas[4];
+    int8_t mode_deltas[2];
+    uint8_t mb_segment_tree_probs[7];
+    uint8_t segment_pred_probs[3];
+    bool seg_abs_delta;
+    uint8_t seg_feature_enabled[8][4];
+    int16_t seg_feature_data[8][4];
+} vp9_saved_dec_state_t;
+
+static void vp9_save_dec_state(const vaapi_decoder_t *dec, vp9_saved_dec_state_t *dst)
+{
+    dst->subsampling_x = dec->vp9_subsampling_x;
+    dst->subsampling_y = dec->vp9_subsampling_y;
+    dst->bit_depth = dec->vp9_bit_depth;
+    dst->color_space = dec->vp9_color_space;
+    dst->color_range = dec->vp9_color_range;
+    memcpy(dst->ref_deltas, dec->vp9_ref_deltas, sizeof(dst->ref_deltas));
+    memcpy(dst->mode_deltas, dec->vp9_mode_deltas, sizeof(dst->mode_deltas));
+    memcpy(dst->mb_segment_tree_probs, dec->vp9_mb_segment_tree_probs,
+           sizeof(dst->mb_segment_tree_probs));
+    memcpy(dst->segment_pred_probs, dec->vp9_segment_pred_probs, sizeof(dst->segment_pred_probs));
+    dst->seg_abs_delta = dec->vp9_seg_abs_delta;
+    memcpy(dst->seg_feature_enabled, dec->vp9_seg_feature_enabled,
+           sizeof(dst->seg_feature_enabled));
+    memcpy(dst->seg_feature_data, dec->vp9_seg_feature_data, sizeof(dst->seg_feature_data));
+}
+
+static void vp9_restore_dec_state(vaapi_decoder_t *dec, const vp9_saved_dec_state_t *src)
+{
+    dec->vp9_subsampling_x = src->subsampling_x;
+    dec->vp9_subsampling_y = src->subsampling_y;
+    dec->vp9_bit_depth = src->bit_depth;
+    dec->vp9_color_space = src->color_space;
+    dec->vp9_color_range = src->color_range;
+    memcpy(dec->vp9_ref_deltas, src->ref_deltas, sizeof(src->ref_deltas));
+    memcpy(dec->vp9_mode_deltas, src->mode_deltas, sizeof(src->mode_deltas));
+    memcpy(dec->vp9_mb_segment_tree_probs, src->mb_segment_tree_probs,
+           sizeof(src->mb_segment_tree_probs));
+    memcpy(dec->vp9_segment_pred_probs, src->segment_pred_probs, sizeof(src->segment_pred_probs));
+    dec->vp9_seg_abs_delta = src->seg_abs_delta;
+    memcpy(dec->vp9_seg_feature_enabled, src->seg_feature_enabled,
+           sizeof(src->seg_feature_enabled));
+    memcpy(dec->vp9_seg_feature_data, src->seg_feature_data, sizeof(src->seg_feature_data));
 }
 
 bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, size_t size,
@@ -101,7 +161,7 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
     bit_reader_init_raw(&br, data, size);
 
     uint32_t frame_marker = read_bits(&br, 2);
-    if (frame_marker != 2)
+    if (br.overrun || frame_marker != 2)
         return false;
 
     uint32_t profile_low = read_bit(&br);
@@ -112,16 +172,25 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
     }
 
     uint32_t show_existing = read_bit(&br);
+    if (br.overrun)
+        return false;
     if (show_existing) {
         uint8_t idx = (uint8_t)read_bits(&br, 3);
+        if (br.overrun)
+            return false;
         if (out_show_existing)
             *out_show_existing = true;
         if (out_show_existing_idx)
             *out_show_existing_idx = idx;
-        *out_refresh_flags = 0;
-        *out_is_keyframe = false;
+        if (out_refresh_flags)
+            *out_refresh_flags = 0;
+        if (out_is_keyframe)
+            *out_is_keyframe = false;
         return true;
     }
+
+    vp9_saved_dec_state_t saved_state;
+    vp9_save_dec_state(dec, &saved_state);
 
     uint32_t frame_type = read_bit(&br);
     uint32_t show_frame = read_bit(&br);
@@ -138,8 +207,8 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
 
     if (frame_type == 0) {
         uint32_t sync = read_bits(&br, 24);
-        if (sync != 0x498342U)
-            return false;
+        if (br.overrun || sync != 0x498342U)
+            goto fail;
         if (profile >= 2) {
             dec->vp9_bit_depth = read_bit(&br) ? 12 : 10;
         } else {
@@ -164,8 +233,8 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
                 read_bit(&br);
             }
         }
-        width = read_bits(&br, 16) + 1;
-        height = read_bits(&br, 16) + 1;
+        width = read_bits(&br, 16) + 1U;
+        height = read_bits(&br, 16) + 1U;
         if (read_bit(&br)) {
             read_bits(&br, 32);
         }
@@ -175,8 +244,8 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
         reset_frame_context = error_resilient ? 0 : read_bits(&br, 2);
         if (intra_only) {
             uint32_t sync = read_bits(&br, 24);
-            if (sync != 0x498342U)
-                return false;
+            if (br.overrun || sync != 0x498342U)
+                goto fail;
             if (profile > 0) {
                 if (profile >= 2) {
                     dec->vp9_bit_depth = read_bit(&br) ? 12 : 10;
@@ -208,27 +277,27 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
                 dec->vp9_subsampling_y = 1;
             }
             refresh_frame_flags = (uint8_t)read_bits(&br, 8);
-            width = read_bits(&br, 16) + 1;
-            height = read_bits(&br, 16) + 1;
+            width = read_bits(&br, 16) + 1U;
+            height = read_bits(&br, 16) + 1U;
             if (read_bit(&br)) {
                 read_bits(&br, 32);
             }
         } else {
             refresh_frame_flags = (uint8_t)read_bits(&br, 8);
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < 3 && !br.overrun; ++i) {
                 ref_frame_idx[i] = (uint8_t)read_bits(&br, 3);
                 ref_frame_sign_bias[i] = (uint8_t)read_bit(&br);
             }
             bool found_ref = false;
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < 3 && !br.overrun; ++i) {
                 if (read_bit(&br)) {
                     found_ref = true;
                     break;
                 }
             }
             if (!found_ref) {
-                width = read_bits(&br, 16) + 1;
-                height = read_bits(&br, 16) + 1;
+                width = read_bits(&br, 16) + 1U;
+                height = read_bits(&br, 16) + 1U;
             }
             if (read_bit(&br)) {
                 read_bits(&br, 32);
@@ -241,6 +310,10 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
                 interp_filter = k_filter_map[read_bits(&br, 2)];
             }
         }
+    }
+
+    if (br.overrun || width == 0 || width > UINT16_MAX || height == 0 || height > UINT16_MAX) {
+        goto fail;
     }
 
     if (frame_type == 0 || intra_only || error_resilient) {
@@ -266,12 +339,12 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
     bool mode_ref_delta_enabled = (read_bit(&br) != 0);
     if (mode_ref_delta_enabled) {
         if (read_bit(&br)) {
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 4 && !br.overrun; ++i) {
                 if (read_bit(&br)) {
                     dec->vp9_ref_deltas[i] = (int8_t)vp9_read_signed(&br, 6);
                 }
             }
-            for (int i = 0; i < 2; ++i) {
+            for (int i = 0; i < 2 && !br.overrun; ++i) {
                 if (read_bit(&br)) {
                     dec->vp9_mode_deltas[i] = (int8_t)vp9_read_signed(&br, 6);
                 }
@@ -293,13 +366,13 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
     if (seg_enabled) {
         seg_update_map = read_bit(&br);
         if (seg_update_map) {
-            for (int i = 0; i < 7; ++i) {
+            for (int i = 0; i < 7 && !br.overrun; ++i) {
                 dec->vp9_mb_segment_tree_probs[i] =
                     read_bit(&br) ? (uint8_t)read_bits(&br, 8) : 255;
             }
             seg_temporal_update = read_bit(&br);
             if (seg_temporal_update) {
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < 3 && !br.overrun; ++i) {
                     dec->vp9_segment_pred_probs[i] =
                         read_bit(&br) ? (uint8_t)read_bits(&br, 8) : 255;
                 }
@@ -313,7 +386,7 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
             dec->vp9_seg_abs_delta = (read_bit(&br) != 0);
             memset(dec->vp9_seg_feature_enabled, 0, sizeof(dec->vp9_seg_feature_enabled));
             memset(dec->vp9_seg_feature_data, 0, sizeof(dec->vp9_seg_feature_data));
-            for (int seg = 0; seg < 8; ++seg) {
+            for (int seg = 0; seg < 8 && !br.overrun; ++seg) {
                 if (read_bit(&br)) {
                     dec->vp9_seg_feature_enabled[seg][0] = 1;
                     dec->vp9_seg_feature_data[seg][0] = (int16_t)vp9_read_signed(&br, 8);
@@ -334,24 +407,19 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
         }
     }
 
-    for (int i = 0; i < 7; ++i)
-        pic_param->mb_segment_tree_probs[i] = dec->vp9_mb_segment_tree_probs[i];
-    for (int i = 0; i < 3; ++i)
-        pic_param->segment_pred_probs[i] = dec->vp9_segment_pred_probs[i];
-
-    uint32_t sb64_cols = (width + 63) >> 6;
+    uint32_t sb64_cols = (width + 63U) >> 6;
     uint32_t min_log2_cols = 0;
-    while ((64U << min_log2_cols) < sb64_cols) {
+    while (min_log2_cols < 25U && (64U << min_log2_cols) < sb64_cols) {
         min_log2_cols++;
     }
     uint32_t max_log2_cols = 0;
-    while ((sb64_cols >> (max_log2_cols + 1)) >= 4) {
+    while (max_log2_cols < 30U && (sb64_cols >> (max_log2_cols + 1U)) >= 4U) {
         max_log2_cols++;
     }
-    if (max_log2_cols > 6)
-        max_log2_cols = 6;
+    if (max_log2_cols > 6U)
+        max_log2_cols = 6U;
     uint32_t log2_tile_cols = min_log2_cols;
-    while (log2_tile_cols < max_log2_cols && read_bit(&br)) {
+    while (!br.overrun && log2_tile_cols < max_log2_cols && read_bit(&br)) {
         log2_tile_cols++;
     }
     uint32_t log2_tile_rows = read_bit(&br);
@@ -360,7 +428,15 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
     }
 
     uint16_t first_partition_size = (uint16_t)read_bits(&br, 16);
-    uint8_t uncompressed_hdr_bytes = (uint8_t)((br.bit_pos + 7) / 8);
+    size_t uncompressed_hdr_bytes = (br.bit_pos + 7U) / 8U;
+    if (br.overrun || uncompressed_hdr_bytes > size || uncompressed_hdr_bytes > UINT8_MAX) {
+        goto fail;
+    }
+
+    for (int i = 0; i < 7; ++i)
+        pic_param->mb_segment_tree_probs[i] = dec->vp9_mb_segment_tree_probs[i];
+    for (int i = 0; i < 3; ++i)
+        pic_param->segment_pred_probs[i] = dec->vp9_segment_pred_probs[i];
 
     pic_param->frame_width = (uint16_t)width;
     pic_param->frame_height = (uint16_t)height;
@@ -393,7 +469,7 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
     pic_param->sharpness_level = loop_filter_sharpness;
     pic_param->log2_tile_rows = (uint8_t)log2_tile_rows;
     pic_param->log2_tile_columns = (uint8_t)log2_tile_cols;
-    pic_param->frame_header_length_in_bytes = uncompressed_hdr_bytes;
+    pic_param->frame_header_length_in_bytes = (uint8_t)uncompressed_hdr_bytes;
     pic_param->first_partition_size = first_partition_size;
     pic_param->profile = profile;
     pic_param->bit_depth = dec->vp9_bit_depth;
@@ -453,7 +529,13 @@ bool parse_vp9_uncompressed_header(vaapi_decoder_t *dec, const uint8_t *data, si
         }
     }
 
-    *out_refresh_flags = (frame_type == 0) ? 0xFF : refresh_frame_flags;
-    *out_is_keyframe = (frame_type == 0);
+    if (out_refresh_flags)
+        *out_refresh_flags = (frame_type == 0) ? 0xFF : refresh_frame_flags;
+    if (out_is_keyframe)
+        *out_is_keyframe = (frame_type == 0);
     return true;
+
+fail:
+    vp9_restore_dec_state(dec, &saved_state);
+    return false;
 }

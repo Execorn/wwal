@@ -18,12 +18,19 @@ static const uint8_t g_default_8x8_inter[64] = {
 static void parse_h264_scaling_list(bit_reader_t *br, uint8_t *dst, uint32_t size,
                                     const uint8_t *default_list)
 {
+    if (!br || br->overrun)
+        return;
     int32_t last_scale = 8, next_scale = 8;
     bool use_default = false;
-    for (uint32_t j = 0; j < size; ++j) {
+    for (uint32_t j = 0; j < size && !br->overrun; ++j) {
         if (next_scale != 0) {
             int32_t delta_scale = read_se(br);
-            next_scale = (last_scale + delta_scale + 256) % 256;
+            if (br->overrun)
+                return;
+            int64_t rem = ((int64_t)last_scale + (int64_t)delta_scale) % 256LL;
+            if (rem < 0)
+                rem += 256LL;
+            next_scale = (int32_t)rem;
             if (j == 0 && next_scale == 0) {
                 use_default = true;
             }
@@ -60,12 +67,16 @@ void refresh_cached_h264_iq(vaapi_decoder_t *dec)
 
 static void skip_h264_hrd_parameters(bit_reader_t *br)
 {
+    if (!br || br->overrun)
+        return;
     uint32_t cpb_cnt_minus1 = read_ue(br);
-    if (cpb_cnt_minus1 > 31)
-        cpb_cnt_minus1 = 31;
+    if (br->overrun || cpb_cnt_minus1 > 31U) {
+        br->overrun = true;
+        return;
+    }
     read_bits(br, 4); /* bit_rate_scale */
     read_bits(br, 4); /* cpb_size_scale */
-    for (uint32_t i = 0; i <= cpb_cnt_minus1 && br->bit_pos < br->size * 8; ++i) {
+    for (uint32_t i = 0; i <= cpb_cnt_minus1 && !br->overrun; ++i) {
         read_ue(br);  /* bit_rate_value_minus1 */
         read_ue(br);  /* cpb_size_value_minus1 */
         read_bit(br); /* cbr_flag */
@@ -86,7 +97,7 @@ static bool parse_h264_sps_rbsp(const uint8_t *rbsp, size_t rbsp_len, parsed_sps
     uint32_t nal_type = read_bits(&br, 5);
     (void)forbidden;
     (void)ref_idc;
-    if (nal_type != 7)
+    if (br.overrun || nal_type != 7U)
         return false;
 
     memset(sps, 0, sizeof(*sps));
@@ -97,24 +108,39 @@ static bool parse_h264_sps_rbsp(const uint8_t *rbsp, size_t rbsp_len, parsed_sps
     sps->constraint_set0_flag = (constraint_flags >> 7) & 1U;
     sps->constraint_set1_flag = (constraint_flags >> 6) & 1U;
     sps->level_idc = (uint8_t)read_bits(&br, 8);
-    read_ue(&br); /* seq_parameter_set_id */
+    uint32_t sps_id = read_ue(&br);
+    if (br.overrun || sps_id > 31U) {
+        memset(sps, 0, sizeof(*sps));
+        return false;
+    }
 
     if (sps->profile_idc == 100 || sps->profile_idc == 110 || sps->profile_idc == 122 ||
         sps->profile_idc == 244 || sps->profile_idc == 44 || sps->profile_idc == 83 ||
         sps->profile_idc == 86 || sps->profile_idc == 118 || sps->profile_idc == 128 ||
         sps->profile_idc == 138) {
-        sps->chroma_format_idc = (uint8_t)read_ue(&br);
+        uint32_t chroma_idc = read_ue(&br);
+        if (br.overrun || chroma_idc > 3U) {
+            memset(sps, 0, sizeof(*sps));
+            return false;
+        }
+        sps->chroma_format_idc = (uint8_t)chroma_idc;
         if (sps->chroma_format_idc == 3) {
             sps->residual_colour_transform_flag = read_bit(&br) != 0;
         }
-        sps->bit_depth_luma_minus8 = (uint8_t)read_ue(&br);
-        sps->bit_depth_chroma_minus8 = (uint8_t)read_ue(&br);
+        uint32_t bd_luma = read_ue(&br);
+        uint32_t bd_chroma = read_ue(&br);
+        if (br.overrun || bd_luma > 6U || bd_chroma > 6U) {
+            memset(sps, 0, sizeof(*sps));
+            return false;
+        }
+        sps->bit_depth_luma_minus8 = (uint8_t)bd_luma;
+        sps->bit_depth_chroma_minus8 = (uint8_t)bd_chroma;
         read_bit(&br); /* qpprime_y_zero_transform_bypass_flag */
         uint32_t seq_scaling_matrix_present = read_bit(&br);
         sps->seq_scaling_matrix_present_flag = (seq_scaling_matrix_present != 0);
         if (seq_scaling_matrix_present) {
             uint32_t num_lists = (sps->chroma_format_idc != 3) ? 8 : 12;
-            for (uint32_t i = 0; i < num_lists; ++i) {
+            for (uint32_t i = 0; i < num_lists && !br.overrun; ++i) {
                 uint8_t *dst = (i < 6) ? sps->scaling_list_4x4[i]
                                        : ((i < 8) ? sps->scaling_list_8x8[i - 6] : NULL);
                 const uint8_t *def =
@@ -138,26 +164,44 @@ static bool parse_h264_sps_rbsp(const uint8_t *rbsp, size_t rbsp_len, parsed_sps
     }
 
     uint32_t log2_max_fn_m4 = read_ue(&br);
-    if (log2_max_fn_m4 > 12)
-        log2_max_fn_m4 = 12;
+    if (br.overrun || log2_max_fn_m4 > 12U) {
+        memset(sps, 0, sizeof(*sps));
+        return false;
+    }
     sps->log2_max_frame_num_minus4 = (uint8_t)log2_max_fn_m4;
-    sps->pic_order_cnt_type = (uint8_t)read_ue(&br);
+    uint32_t poc_type = read_ue(&br);
+    if (br.overrun || poc_type > 2U) {
+        memset(sps, 0, sizeof(*sps));
+        return false;
+    }
+    sps->pic_order_cnt_type = (uint8_t)poc_type;
     if (sps->pic_order_cnt_type == 0) {
         uint32_t log2_max_poc_m4 = read_ue(&br);
-        if (log2_max_poc_m4 > 12)
-            log2_max_poc_m4 = 12;
+        if (br.overrun || log2_max_poc_m4 > 12U) {
+            memset(sps, 0, sizeof(*sps));
+            return false;
+        }
         sps->log2_max_pic_order_cnt_lsb_minus4 = (uint8_t)log2_max_poc_m4;
     } else if (sps->pic_order_cnt_type == 1) {
         sps->delta_pic_order_always_zero_flag = read_bit(&br) != 0;
         read_se(&br);
         read_se(&br);
         uint32_t num_ref = read_ue(&br);
-        for (uint32_t i = 0; i < num_ref && i < 256 && br.bit_pos < br.size * 8; ++i) {
+        if (br.overrun || num_ref > 255U) {
+            memset(sps, 0, sizeof(*sps));
+            return false;
+        }
+        for (uint32_t i = 0; i < num_ref && !br.overrun; ++i) {
             read_se(&br);
         }
     }
 
-    sps->num_ref_frames = (uint8_t)read_ue(&br);
+    uint32_t num_ref_frames = read_ue(&br);
+    if (br.overrun || num_ref_frames > 16U) {
+        memset(sps, 0, sizeof(*sps));
+        return false;
+    }
+    sps->num_ref_frames = (uint8_t)num_ref_frames;
     sps->gaps_in_frame_num_value_allowed_flag = read_bit(&br) != 0;
     sps->pic_width_in_mbs_minus1 = read_ue(&br);
     sps->pic_height_in_map_units_minus1 = read_ue(&br);
@@ -166,8 +210,10 @@ static bool parse_h264_sps_rbsp(const uint8_t *rbsp, size_t rbsp_len, parsed_sps
         sps->mb_adaptive_frame_field_flag = read_bit(&br) != 0;
     }
     sps->direct_8x8_inference_flag = read_bit(&br) != 0;
-    if (br.bit_pos > br.size * 8 ||
+    if (br.overrun || sps->pic_width_in_mbs_minus1 > 1023U ||
+        sps->pic_height_in_map_units_minus1 > 1023U ||
         (sps->pic_width_in_mbs_minus1 == 0 && sps->pic_height_in_map_units_minus1 == 0)) {
+        memset(sps, 0, sizeof(*sps));
         return false;
     }
 
@@ -228,11 +274,16 @@ static bool parse_h264_sps_rbsp(const uint8_t *rbsp, size_t rbsp_len, parsed_sps
             read_ue(&br);                           /* log2_max_mv_length_vertical */
             uint32_t max_reorder = read_ue(&br);    /* max_num_reorder_frames */
             read_ue(&br);                           /* max_dec_frame_buffering */
-            if (br.bit_pos <= br.size * 8 && max_reorder <= 16) {
+            if (!br.overrun && max_reorder <= 16U) {
                 sps->bitstream_restriction_flag = true;
                 sps->max_num_reorder_frames = (uint8_t)max_reorder;
             }
         }
+    }
+
+    if (br.overrun) {
+        memset(sps, 0, sizeof(*sps));
+        return false;
     }
 
     sps->valid = true;
@@ -251,7 +302,9 @@ bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps)
     uint8_t *rbsp_heap = NULL;
     size_t rbsp_cap = sizeof(rbsp_stack);
     if (nal_len > sizeof(rbsp_stack)) {
-        rbsp_cap = (nal_len <= 65536U) ? nal_len : 65536U;
+        if (nal_len > 65536U)
+            return false;
+        rbsp_cap = nal_len;
         rbsp_heap = (uint8_t *)malloc(rbsp_cap);
         if (!rbsp_heap)
             return false;
@@ -259,8 +312,11 @@ bool parse_h264_sps(const uint8_t *nal, size_t nal_len, parsed_sps_t *sps)
     }
 
     size_t rbsp_len = unescape_rbsp(nal, nal_len, rbsp, rbsp_cap);
-    bool ok = parse_h264_sps_rbsp(rbsp, rbsp_len, sps);
+    parsed_sps_t tmp;
+    bool ok = parse_h264_sps_rbsp(rbsp, rbsp_len, &tmp);
     free(rbsp_heap);
+    if (ok)
+        *sps = tmp;
     return ok;
 }
 
@@ -287,12 +343,9 @@ uint32_t vaapi_h264_compute_reorder_depth(const parsed_sps_t *sps, uint32_t cap)
     return target_depth;
 }
 
-bool parse_h264_pps(const uint8_t *nal, size_t nal_len, const parsed_sps_t *sps, parsed_pps_t *pps)
+static bool parse_h264_pps_rbsp(const uint8_t *rbsp, size_t rbsp_len, const parsed_sps_t *sps,
+                                parsed_pps_t *pps)
 {
-    if (!nal || !pps || nal_len < 2)
-        return false;
-    uint8_t rbsp[2048];
-    size_t rbsp_len = unescape_rbsp(nal, nal_len, rbsp, sizeof(rbsp));
     bit_reader_t br;
     bit_reader_init(&br, rbsp, rbsp_len);
 
@@ -301,7 +354,7 @@ bool parse_h264_pps(const uint8_t *nal, size_t nal_len, const parsed_sps_t *sps,
     uint32_t nal_type = read_bits(&br, 5);
     (void)forbidden;
     (void)ref_idc;
-    if (nal_type != 8)
+    if (br.overrun || nal_type != 8U)
         return false;
 
     memset(pps, 0, sizeof(*pps));
@@ -312,18 +365,29 @@ bool parse_h264_pps(const uint8_t *nal, size_t nal_len, const parsed_sps_t *sps,
         memset(pps->scaling_list_4x4, 16, sizeof(pps->scaling_list_4x4));
         memset(pps->scaling_list_8x8, 16, sizeof(pps->scaling_list_8x8));
     }
-    read_ue(&br);
-    read_ue(&br);
+    uint32_t pps_id = read_ue(&br);
+    uint32_t sps_id = read_ue(&br);
+    if (br.overrun || pps_id > 255U || sps_id > 31U) {
+        memset(pps, 0, sizeof(*pps));
+        return false;
+    }
     pps->entropy_coding_mode_flag = (uint8_t)read_bit(&br);
     pps->bottom_field_pic_order_in_frame_present_flag = read_bit(&br) != 0;
-    pps->num_slice_groups_minus1 = (uint8_t)read_ue(&br);
-    pps->num_ref_idx_l0_default_active_minus1 = (uint8_t)read_ue(&br);
-    pps->num_ref_idx_l1_default_active_minus1 = (uint8_t)read_ue(&br);
+    uint32_t num_sg_m1 = read_ue(&br);
+    uint32_t l0_def = read_ue(&br);
+    uint32_t l1_def = read_ue(&br);
+    if (br.overrun || num_sg_m1 > 7U || l0_def > 31U || l1_def > 31U) {
+        memset(pps, 0, sizeof(*pps));
+        return false;
+    }
+    pps->num_slice_groups_minus1 = (uint8_t)num_sg_m1;
+    pps->num_ref_idx_l0_default_active_minus1 = (uint8_t)l0_def;
+    pps->num_ref_idx_l1_default_active_minus1 = (uint8_t)l1_def;
     pps->weighted_pred_flag = read_bit(&br) != 0;
     pps->weighted_bipred_idc = (uint8_t)read_bits(&br, 2);
-    pps->pic_init_qp_minus26 = (int8_t)read_se(&br);
-    pps->pic_init_qs_minus26 = (int8_t)read_se(&br);
-    pps->chroma_qp_index_offset = (int8_t)read_se(&br);
+    pps->pic_init_qp_minus26 = (int8_t)clamp_i32(read_se(&br), -128, 127);
+    pps->pic_init_qs_minus26 = (int8_t)clamp_i32(read_se(&br), -128, 127);
+    pps->chroma_qp_index_offset = (int8_t)clamp_i32(read_se(&br), -128, 127);
     pps->deblocking_filter_control_present_flag = read_bit(&br) != 0;
     pps->constrained_intra_pred_flag = read_bit(&br) != 0;
     pps->redundant_pic_cnt_present_flag = read_bit(&br) != 0;
@@ -332,9 +396,10 @@ bool parse_h264_pps(const uint8_t *nal, size_t nal_len, const parsed_sps_t *sps,
         uint32_t pic_scaling_matrix_present = read_bit(&br);
         pps->pic_scaling_matrix_present_flag = (pic_scaling_matrix_present != 0);
         if (pic_scaling_matrix_present) {
-            uint32_t count = 6 + 2 * pps->transform_8x8_mode_flag;
+            uint32_t extra_8x8 = (sps && sps->valid && sps->chroma_format_idc == 3) ? 6U : 2U;
+            uint32_t count = 6U + (pps->transform_8x8_mode_flag ? extra_8x8 : 0U);
             bool has_sps_matrix = (sps && sps->valid && sps->seq_scaling_matrix_present_flag);
-            for (uint32_t i = 0; i < count; ++i) {
+            for (uint32_t i = 0; i < count && !br.overrun; ++i) {
                 uint8_t *dst = (i < 6) ? pps->scaling_list_4x4[i]
                                        : ((i < 8) ? pps->scaling_list_8x8[i - 6] : NULL);
                 const uint8_t *def =
@@ -355,33 +420,72 @@ bool parse_h264_pps(const uint8_t *nal, size_t nal_len, const parsed_sps_t *sps,
                 }
             }
         }
-        pps->second_chroma_qp_index_offset = (int8_t)read_se(&br);
+        pps->second_chroma_qp_index_offset = (int8_t)clamp_i32(read_se(&br), -128, 127);
     } else {
         pps->second_chroma_qp_index_offset = pps->chroma_qp_index_offset;
+    }
+    if (br.overrun) {
+        memset(pps, 0, sizeof(*pps));
+        return false;
     }
     pps->valid = true;
     return true;
 }
 
-bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sps_t *sps,
-                             const parsed_pps_t *pps, VASliceParameterBufferH264 *sp,
-                             slice_header_meta_t *meta)
+bool parse_h264_pps(const uint8_t *nal, size_t nal_len, const parsed_sps_t *sps, parsed_pps_t *pps)
 {
-    if (!nal || nal_len < 2 || !sps || !pps || !sp)
+    if (!nal || !pps || nal_len < 2)
         return false;
+    uint8_t rbsp_stack[2048];
+    uint8_t *rbsp = rbsp_stack;
+    uint8_t *rbsp_heap = NULL;
+    size_t rbsp_cap = sizeof(rbsp_stack);
+    if (nal_len > sizeof(rbsp_stack)) {
+        if (nal_len > 65536U)
+            return false;
+        rbsp_cap = nal_len;
+        rbsp_heap = (uint8_t *)malloc(rbsp_cap);
+        if (!rbsp_heap)
+            return false;
+        rbsp = rbsp_heap;
+    }
 
-    uint8_t rbsp[4096];
-    size_t cap = nal_len - 1 < sizeof(rbsp) ? nal_len - 1 : sizeof(rbsp);
-    size_t rbsp_len = unescape_rbsp(nal + 1, cap, rbsp, sizeof(rbsp));
+    size_t rbsp_len = unescape_rbsp(nal, nal_len, rbsp, rbsp_cap);
+    parsed_pps_t tmp;
+    bool ok = parse_h264_pps_rbsp(rbsp, rbsp_len, sps, &tmp);
+    free(rbsp_heap);
+    if (ok)
+        *pps = tmp;
+    return ok;
+}
+
+static bool parse_h264_slice_header_rbsp(const uint8_t *nal, size_t nal_len, const uint8_t *rbsp,
+                                         size_t rbsp_len, bool full_nal, const parsed_sps_t *sps,
+                                         const parsed_pps_t *pps, VASliceParameterBufferH264 *sp,
+                                         slice_header_meta_t *meta, bool *out_overrun)
+{
+    if (out_overrun)
+        *out_overrun = false;
     bit_reader_t br;
-    bit_reader_init(&br, rbsp, rbsp_len);
+    if (full_nal) {
+        bit_reader_init_rbsp(&br, rbsp, rbsp_len);
+    } else {
+        bit_reader_init_raw(&br, rbsp, rbsp_len);
+    }
 
     uint8_t nal_type = nal[0] & 0x1F;
     uint8_t nal_ref_idc = (nal[0] >> 5) & 3;
 
     sp->first_mb_in_slice = (uint16_t)read_ue(&br);
     uint32_t stype = read_ue(&br);
-    sp->slice_type = (uint8_t)(stype % 5);
+    if (br.overrun) {
+        if (out_overrun)
+            *out_overrun = true;
+        return false;
+    }
+    if (stype > 9U)
+        return false;
+    sp->slice_type = (uint8_t)(stype % 5U);
     read_ue(&br); /* pic_parameter_set_id */
 
     uint32_t log2_max_fn_m4 = sps->valid ? sps->log2_max_frame_num_minus4 : 4;
@@ -433,18 +537,25 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
     }
 
     if (sp->slice_type == 0 || sp->slice_type == 1 || sp->slice_type == 3) { /* P, B, SP */
+        uint32_t l0_m1 = pps->num_ref_idx_l0_default_active_minus1;
+        uint32_t l1_m1 = pps->num_ref_idx_l1_default_active_minus1;
         if (read_bit(&br)) { /* num_ref_idx_active_override_flag */
-            sp->num_ref_idx_l0_active_minus1 = (uint8_t)read_ue(&br);
+            l0_m1 = read_ue(&br);
             if (sp->slice_type == 1)
-                sp->num_ref_idx_l1_active_minus1 = (uint8_t)read_ue(&br);
-        } else {
-            sp->num_ref_idx_l0_active_minus1 = pps->num_ref_idx_l0_default_active_minus1;
-            sp->num_ref_idx_l1_active_minus1 = pps->num_ref_idx_l1_default_active_minus1;
+                l1_m1 = read_ue(&br);
         }
-        if (sp->num_ref_idx_l0_active_minus1 > 31)
-            sp->num_ref_idx_l0_active_minus1 = 31;
-        if (sp->num_ref_idx_l1_active_minus1 > 31)
-            sp->num_ref_idx_l1_active_minus1 = 31;
+        if (l0_m1 > 31U)
+            l0_m1 = 31U;
+        if (l1_m1 > 31U)
+            l1_m1 = 31U;
+        sp->num_ref_idx_l0_active_minus1 = (uint8_t)l0_m1;
+        sp->num_ref_idx_l1_active_minus1 = (uint8_t)l1_m1;
+    }
+
+    if (br.overrun) {
+        if (out_overrun)
+            *out_overrun = true;
+        return false;
     }
 
     /* ref_pic_list_modification() */
@@ -461,15 +572,25 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
             uint32_t mod_idc;
             do {
                 mod_idc = read_ue(&br);
+                if (br.overrun) {
+                    if (out_overrun)
+                        *out_overrun = true;
+                    return false;
+                }
                 if (mod_idc == 0 || mod_idc == 1 || mod_idc == 2) {
                     uint32_t val = read_ue(&br);
+                    if (br.overrun) {
+                        if (out_overrun)
+                            *out_overrun = true;
+                        return false;
+                    }
                     if (meta && meta->num_ref_mod_l0 < 32) {
                         meta->mod_of_pic_nums_idc_l0[meta->num_ref_mod_l0] = (uint8_t)mod_idc;
                         meta->abs_diff_pic_num_l0[meta->num_ref_mod_l0] = val;
                         meta->num_ref_mod_l0++;
                     }
                 }
-            } while (mod_idc != 3 && br.bit_pos < br.size * 8);
+            } while (mod_idc != 3 && !br.overrun);
         }
         if (sp->slice_type == 1) {
             if (read_bit(&br)) { /* ref_pic_list_modification_flag_l1 */
@@ -478,15 +599,25 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
                 uint32_t mod_idc;
                 do {
                     mod_idc = read_ue(&br);
+                    if (br.overrun) {
+                        if (out_overrun)
+                            *out_overrun = true;
+                        return false;
+                    }
                     if (mod_idc == 0 || mod_idc == 1 || mod_idc == 2) {
                         uint32_t val = read_ue(&br);
+                        if (br.overrun) {
+                            if (out_overrun)
+                                *out_overrun = true;
+                            return false;
+                        }
                         if (meta && meta->num_ref_mod_l1 < 32) {
                             meta->mod_of_pic_nums_idc_l1[meta->num_ref_mod_l1] = (uint8_t)mod_idc;
                             meta->abs_diff_pic_num_l1[meta->num_ref_mod_l1] = val;
                             meta->num_ref_mod_l1++;
                         }
                     }
-                } while (mod_idc != 3 && br.bit_pos < br.size * 8);
+                } while (mod_idc != 3 && !br.overrun);
             }
         }
     }
@@ -506,12 +637,15 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
         }
         sp->luma_weight_l0_flag = 0;
         sp->chroma_weight_l0_flag = 0;
-        for (uint32_t i = 0; i <= sp->num_ref_idx_l0_active_minus1; ++i) {
+        uint32_t l0_count = sp->num_ref_idx_l0_active_minus1;
+        if (l0_count > 31U)
+            l0_count = 31U;
+        for (uint32_t i = 0; i <= l0_count && !br.overrun; ++i) {
             uint8_t luma_w_flag = (uint8_t)read_bit(&br);
             sp->luma_weight_l0_flag |= luma_w_flag;
             if (luma_w_flag) {
-                sp->luma_weight_l0[i] = (int16_t)read_se(&br);
-                sp->luma_offset_l0[i] = (int16_t)read_se(&br);
+                sp->luma_weight_l0[i] = (int16_t)clamp_i32(read_se(&br), -128, 127);
+                sp->luma_offset_l0[i] = (int16_t)clamp_i32(read_se(&br), -128, 127);
             } else {
                 sp->luma_weight_l0[i] = (int16_t)(1U << sp->luma_log2_weight_denom);
                 sp->luma_offset_l0[i] = 0;
@@ -520,9 +654,9 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
                 uint8_t chroma_w_flag = (uint8_t)read_bit(&br);
                 sp->chroma_weight_l0_flag |= chroma_w_flag;
                 if (chroma_w_flag) {
-                    for (int j = 0; j < 2; ++j) {
-                        sp->chroma_weight_l0[i][j] = (int16_t)read_se(&br);
-                        sp->chroma_offset_l0[i][j] = (int16_t)read_se(&br);
+                    for (int j = 0; j < 2 && !br.overrun; ++j) {
+                        sp->chroma_weight_l0[i][j] = (int16_t)clamp_i32(read_se(&br), -128, 127);
+                        sp->chroma_offset_l0[i][j] = (int16_t)clamp_i32(read_se(&br), -128, 127);
                     }
                 } else {
                     for (int j = 0; j < 2; ++j) {
@@ -532,15 +666,18 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
                 }
             }
         }
-        if (sp->slice_type == 1) {
+        if (sp->slice_type == 1 && !br.overrun) {
             sp->luma_weight_l1_flag = 0;
             sp->chroma_weight_l1_flag = 0;
-            for (uint32_t i = 0; i <= sp->num_ref_idx_l1_active_minus1; ++i) {
+            uint32_t l1_count = sp->num_ref_idx_l1_active_minus1;
+            if (l1_count > 31U)
+                l1_count = 31U;
+            for (uint32_t i = 0; i <= l1_count && !br.overrun; ++i) {
                 uint8_t luma_w_flag = (uint8_t)read_bit(&br);
                 sp->luma_weight_l1_flag |= luma_w_flag;
                 if (luma_w_flag) {
-                    sp->luma_weight_l1[i] = (int16_t)read_se(&br);
-                    sp->luma_offset_l1[i] = (int16_t)read_se(&br);
+                    sp->luma_weight_l1[i] = (int16_t)clamp_i32(read_se(&br), -128, 127);
+                    sp->luma_offset_l1[i] = (int16_t)clamp_i32(read_se(&br), -128, 127);
                 } else {
                     sp->luma_weight_l1[i] = (int16_t)(1U << sp->luma_log2_weight_denom);
                     sp->luma_offset_l1[i] = 0;
@@ -549,9 +686,11 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
                     uint8_t chroma_w_flag = (uint8_t)read_bit(&br);
                     sp->chroma_weight_l1_flag |= chroma_w_flag;
                     if (chroma_w_flag) {
-                        for (int j = 0; j < 2; ++j) {
-                            sp->chroma_weight_l1[i][j] = (int16_t)read_se(&br);
-                            sp->chroma_offset_l1[i][j] = (int16_t)read_se(&br);
+                        for (int j = 0; j < 2 && !br.overrun; ++j) {
+                            sp->chroma_weight_l1[i][j] =
+                                (int16_t)clamp_i32(read_se(&br), -128, 127);
+                            sp->chroma_offset_l1[i][j] =
+                                (int16_t)clamp_i32(read_se(&br), -128, 127);
                         }
                     } else {
                         for (int j = 0; j < 2; ++j) {
@@ -565,6 +704,12 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
         }
     }
 
+    if (br.overrun) {
+        if (out_overrun)
+            *out_overrun = true;
+        return false;
+    }
+
     /* dec_ref_pic_marking() */
     if (nal_ref_idc != 0) {
         if (nal_type == 5) {
@@ -573,14 +718,24 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
         } else {
             if (read_bit(&br)) { /* adaptive_ref_pic_marking_mode_flag */
                 uint32_t mmco;
-                int32_t max_fn = (int32_t)(1U << fn_bits);
+                uint32_t max_fn = 1U << fn_bits;
                 do {
                     mmco = read_ue(&br);
+                    if (br.overrun) {
+                        if (out_overrun)
+                            *out_overrun = true;
+                        return false;
+                    }
                     if (mmco == 1 || mmco == 3) {
                         uint32_t diff_minus1 = read_ue(&br);
+                        if (br.overrun) {
+                            if (out_overrun)
+                                *out_overrun = true;
+                            return false;
+                        }
                         if (mmco == 1 && meta && meta->num_unmark < 16) {
-                            int32_t pn =
-                                ((int32_t)slice_fn - (int32_t)(diff_minus1 + 1)) & (max_fn - 1);
+                            uint32_t step = (diff_minus1 & 0x7FFFFFFFU) + 1U;
+                            int32_t pn = (int32_t)((slice_fn - step) & (max_fn - 1U));
                             meta->unmark_pic_nums[meta->num_unmark++] = pn;
                         }
                     }
@@ -594,7 +749,7 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
                         meta->mmco_reset = true;
                     if (mmco == 6)
                         read_ue(&br);
-                } while (mmco != 0 && br.bit_pos < br.size * 8);
+                } while (mmco != 0 && !br.overrun);
             }
         }
     }
@@ -603,20 +758,26 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
         sp->cabac_init_idc = (uint8_t)read_ue(&br);
     }
 
-    sp->slice_qp_delta = (int8_t)read_se(&br);
+    sp->slice_qp_delta = (int8_t)clamp_i32(read_se(&br), -128, 127);
 
     if (pps->deblocking_filter_control_present_flag) {
         sp->disable_deblocking_filter_idc = (uint8_t)read_ue(&br);
         if (sp->disable_deblocking_filter_idc != 1) {
-            sp->slice_alpha_c0_offset_div2 = (int8_t)read_se(&br);
-            sp->slice_beta_offset_div2 = (int8_t)read_se(&br);
+            sp->slice_alpha_c0_offset_div2 = (int8_t)clamp_i32(read_se(&br), -128, 127);
+            sp->slice_beta_offset_div2 = (int8_t)clamp_i32(read_se(&br), -128, 127);
         }
     }
 
-    if (pps->entropy_coding_mode_flag && br.bit_pos < br.end_bit_pos) {
-        while ((br.bit_pos & 7u) != 0 && br.bit_pos < br.end_bit_pos) {
+    if (pps->entropy_coding_mode_flag && !br.overrun && br.bit_pos < br.end_bit_pos) {
+        while (!br.overrun && (br.bit_pos & 7u) != 0 && br.bit_pos < br.end_bit_pos) {
             read_bit(&br); /* cabac_alignment_one_bit */
         }
+    }
+
+    if (br.overrun) {
+        if (out_overrun)
+            *out_overrun = true;
+        return false;
     }
 
     /* Calculate raw EBSP bitstream bit offset including emulation_prevention_three_byte */
@@ -625,9 +786,50 @@ bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sp
     return true;
 }
 
+bool parse_h264_slice_header(const uint8_t *nal, size_t nal_len, const parsed_sps_t *sps,
+                             const parsed_pps_t *pps, VASliceParameterBufferH264 *sp,
+                             slice_header_meta_t *meta)
+{
+    if (!nal || nal_len < 2 || !sps || !pps || !sp)
+        return false;
+
+    size_t payload_len = nal_len - 1U;
+    VASliceParameterBufferH264 saved_sp = *sp;
+    slice_header_meta_t saved_meta;
+    if (meta)
+        saved_meta = *meta;
+
+    uint8_t rbsp_stack[4096];
+    size_t cap = payload_len < sizeof(rbsp_stack) ? payload_len : sizeof(rbsp_stack);
+    size_t rbsp_len = unescape_rbsp(nal + 1, cap, rbsp_stack, sizeof(rbsp_stack));
+    bool hit_overrun = false;
+    bool ok = parse_h264_slice_header_rbsp(nal, nal_len, rbsp_stack, rbsp_len,
+                                           payload_len <= sizeof(rbsp_stack), sps, pps, sp, meta,
+                                           &hit_overrun);
+    if (!ok && hit_overrun && payload_len > sizeof(rbsp_stack)) {
+        *sp = saved_sp;
+        if (meta)
+            *meta = saved_meta;
+        size_t heap_cap = (payload_len <= 65536U) ? payload_len : 65536U;
+        uint8_t *rbsp_heap = (uint8_t *)malloc(heap_cap);
+        if (!rbsp_heap)
+            return false;
+        size_t heap_rbsp_len = unescape_rbsp(nal + 1, heap_cap, rbsp_heap, heap_cap);
+        ok = parse_h264_slice_header_rbsp(nal, nal_len, rbsp_heap, heap_rbsp_len,
+                                          heap_cap == payload_len, sps, pps, sp, meta, NULL);
+        free(rbsp_heap);
+    }
+    if (!ok) {
+        *sp = saved_sp;
+        if (meta)
+            *meta = saved_meta;
+    }
+    return ok;
+}
+
 static inline size_t find_annexb_start_code(const uint8_t *data, size_t start, size_t size)
 {
-    if (start + 3 > size)
+    if (!data || start >= size || size - start < 3U)
         return size;
 
     size_t pos = start;
@@ -663,20 +865,20 @@ static inline size_t find_annexb_start_code(const uint8_t *data, size_t start, s
 bool next_h264_nal(const uint8_t *data, size_t size, bool is_avcc, uint8_t nal_len_sz,
                    size_t *scan_off, const uint8_t **out_nal, uint32_t *out_len)
 {
-    if (*scan_off >= size)
+    if (!data || !scan_off || !out_nal || !out_len || *scan_off >= size)
         return false;
 
     if (is_avcc) {
-        if (nal_len_sz == 0)
+        if (nal_len_sz == 0 || nal_len_sz > 4)
             nal_len_sz = 4;
-        if (*scan_off + nal_len_sz > size)
+        if (nal_len_sz > size - *scan_off)
             return false;
         uint32_t len = 0;
         for (uint8_t i = 0; i < nal_len_sz; ++i) {
             len = (len << 8) | data[*scan_off + i];
         }
         *scan_off += nal_len_sz;
-        if (len == 0 || *scan_off + len > size)
+        if (len == 0 || (size_t)len > size - *scan_off)
             return false;
         *out_nal = data + *scan_off;
         *out_len = len;
@@ -686,26 +888,26 @@ bool next_h264_nal(const uint8_t *data, size_t size, bool is_avcc, uint8_t nal_l
 
     /* Annex-B start code or fallback 4-byte length */
     size_t off = *scan_off;
-    if (off + 4 <= size && !(data[off] == 0 && data[off + 1] == 0 &&
-                             (data[off + 2] == 1 || (data[off + 2] == 0 && data[off + 3] == 1)))) {
+    if (size - off >= 4U && !(data[off] == 0 && data[off + 1] == 0 &&
+                              (data[off + 2] == 1 || (data[off + 2] == 0 && data[off + 3] == 1)))) {
         uint32_t len = ((uint32_t)data[off] << 24) | ((uint32_t)data[off + 1] << 16) |
                        ((uint32_t)data[off + 2] << 8) | (uint32_t)data[off + 3];
-        if (len > 0 && len <= size - (off + 4)) {
-            *out_nal = data + off + 4;
+        if (len > 0 && (size_t)len <= size - (off + 4U)) {
+            *out_nal = data + off + 4U;
             *out_len = len;
-            *scan_off = off + 4 + len;
+            *scan_off = off + 4U + len;
             return true;
         }
     }
 
-    while (off + 3 <= size) {
+    while (size - off >= 3U) {
         off = find_annexb_start_code(data, off, size);
-        if (off + 3 > size)
+        if (off >= size || size - off < 3U)
             break;
-        size_t hdr_len = (data[off + 2] == 1) ? 3 : 4;
+        size_t hdr_len = (data[off + 2] == 1) ? 3U : 4U;
         size_t nal_start = off + hdr_len;
         size_t next_sc = find_annexb_start_code(data, nal_start, size);
-        if (next_sc > nal_start) {
+        if (next_sc > nal_start && (next_sc - nal_start) <= UINT32_MAX) {
             *out_nal = data + nal_start;
             *out_len = (uint32_t)(next_sc - nal_start);
             *scan_off = next_sc;
@@ -745,8 +947,9 @@ static void apply_h264_ref_list_mod_single(const h264_dpb_t *dpb, int32_t curr_f
     list[32].picture_id = VA_INVALID_SURFACE;
     list[32].flags = VA_PICTURE_H264_INVALID;
 
-    int32_t pic_num_pred = curr_fn;
+    int64_t pic_num_pred = curr_fn;
     uint32_t ref_idx = 0;
+    size_t dpb_n = dpb->count > 16U ? 16U : dpb->count;
 
     for (uint8_t m = 0; m < num_mods && ref_idx < num_active; ++m) {
         uint8_t idc = mod_idc[m];
@@ -754,28 +957,23 @@ static void apply_h264_ref_list_mod_single(const h264_dpb_t *dpb, int32_t curr_f
         const h264_dpb_entry_t *found = NULL;
 
         if (idc == 0 || idc == 1) {
-            int32_t diff = (int32_t)((val & 0x3FFFFFFFU) + 1U);
-            int32_t pic_num_no_wrap;
-            if (idc == 0) {
-                pic_num_no_wrap = pic_num_pred - diff;
-                if (pic_num_no_wrap < 0)
-                    pic_num_no_wrap += max_fn;
-            } else {
-                pic_num_no_wrap = pic_num_pred + diff;
-                if (pic_num_no_wrap >= max_fn)
-                    pic_num_no_wrap -= max_fn;
-            }
-            pic_num_no_wrap &= (max_fn - 1);
+            int64_t diff = (int64_t)((val & 0x3FFFFFFFU) + 1U);
+            int64_t mod = (int64_t)max_fn;
+            int64_t pic_num_no_wrap = (idc == 0) ? (pic_num_pred - diff) : (pic_num_pred + diff);
+            pic_num_no_wrap %= mod;
+            if (pic_num_no_wrap < 0)
+                pic_num_no_wrap += mod;
             pic_num_pred = pic_num_no_wrap;
 
-            for (size_t d = 0; d < dpb->count; ++d) {
-                if (!dpb->entries[d].is_long_term && dpb->entries[d].frame_num == pic_num_no_wrap) {
+            for (size_t d = 0; d < dpb_n; ++d) {
+                if (!dpb->entries[d].is_long_term &&
+                    dpb->entries[d].frame_num == (int32_t)pic_num_no_wrap) {
                     found = &dpb->entries[d];
                     break;
                 }
             }
         } else if (idc == 2) {
-            for (size_t d = 0; d < dpb->count; ++d) {
+            for (size_t d = 0; d < dpb_n; ++d) {
                 if (dpb->entries[d].is_long_term && dpb->entries[d].frame_num == (int32_t)val) {
                     found = &dpb->entries[d];
                     break;
@@ -829,6 +1027,8 @@ void apply_h264_ref_pic_list_mod(const h264_dpb_t *dpb, int32_t curr_fn, int32_t
 void build_h264_ref_lists(const h264_dpb_t *dpb, uint8_t slice_type, int32_t curr_fn,
                           int32_t max_fn, int32_t curr_poc, VASliceParameterBufferH264 *sp)
 {
+    if (!sp)
+        return;
     for (int i = 0; i < 32; ++i) {
         sp->RefPicList0[i].picture_id = VA_INVALID_SURFACE;
         sp->RefPicList0[i].flags = VA_PICTURE_H264_INVALID;
@@ -836,7 +1036,7 @@ void build_h264_ref_lists(const h264_dpb_t *dpb, uint8_t slice_type, int32_t cur
         sp->RefPicList1[i].flags = VA_PICTURE_H264_INVALID;
     }
 
-    if (dpb->count == 0 || slice_type == 2 || slice_type == 4)
+    if (!dpb || dpb->count == 0 || slice_type == 2 || slice_type == 4)
         return;
 
     if (slice_type == 0 || slice_type == 3) {
@@ -846,10 +1046,12 @@ void build_h264_ref_lists(const h264_dpb_t *dpb, uint8_t slice_type, int32_t cur
         memcpy(sorted, dpb->entries, n * sizeof(h264_dpb_entry_t));
         for (size_t i = 0; i < n; ++i) {
             for (size_t j = i + 1; j < n; ++j) {
-                int32_t pn_i = sorted[i].frame_num > curr_fn ? sorted[i].frame_num - max_fn
-                                                             : sorted[i].frame_num;
-                int32_t pn_j = sorted[j].frame_num > curr_fn ? sorted[j].frame_num - max_fn
-                                                             : sorted[j].frame_num;
+                int64_t pn_i = sorted[i].frame_num > curr_fn
+                                   ? (int64_t)sorted[i].frame_num - (int64_t)max_fn
+                                   : (int64_t)sorted[i].frame_num;
+                int64_t pn_j = sorted[j].frame_num > curr_fn
+                                   ? (int64_t)sorted[j].frame_num - (int64_t)max_fn
+                                   : (int64_t)sorted[j].frame_num;
                 if (pn_j > pn_i) {
                     h264_dpb_entry_t tmp = sorted[i];
                     sorted[i] = sorted[j];

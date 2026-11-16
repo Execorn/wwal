@@ -1,8 +1,154 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vaapi_internal.h"
 
+#include <pthread.h>
+
+#define AV1_KF_TRACK_CAP 64U
+
+typedef struct {
+    const vaapi_decoder_t *dec;
+    VASurfaceID surf[8];
+    bool is_kf[8];
+    uint64_t stamp;
+} av1_kf_track_entry_t;
+
+static pthread_mutex_t g_av1_kf_mu = PTHREAD_MUTEX_INITIALIZER;
+static av1_kf_track_entry_t g_av1_kf_track[AV1_KF_TRACK_CAP];
+static uint64_t g_av1_kf_clock = 0;
+
+static av1_kf_track_entry_t *av1_kf_find_entry(const vaapi_decoder_t *dec, bool create)
+{
+    if (!dec)
+        return NULL;
+    av1_kf_track_entry_t *free_slot = NULL;
+    av1_kf_track_entry_t *oldest_slot = &g_av1_kf_track[0];
+    for (uint32_t i = 0; i < AV1_KF_TRACK_CAP; ++i) {
+        if (g_av1_kf_track[i].dec == dec) {
+            return &g_av1_kf_track[i];
+        }
+        if (!free_slot && g_av1_kf_track[i].dec == NULL) {
+            free_slot = &g_av1_kf_track[i];
+        }
+        if (g_av1_kf_track[i].stamp < oldest_slot->stamp) {
+            oldest_slot = &g_av1_kf_track[i];
+        }
+    }
+    if (!create)
+        return NULL;
+    av1_kf_track_entry_t *slot = free_slot ? free_slot : oldest_slot;
+    slot->dec = dec;
+    for (int r = 0; r < 8; ++r) {
+        slot->surf[r] = VA_INVALID_SURFACE;
+        slot->is_kf[r] = false;
+    }
+    slot->stamp = ++g_av1_kf_clock;
+    return slot;
+}
+
+void av1_reset_slot_keyframe_state(const vaapi_decoder_t *dec)
+{
+    if (!dec)
+        return;
+    pthread_mutex_lock(&g_av1_kf_mu);
+    av1_kf_track_entry_t *entry = av1_kf_find_entry(dec, false);
+    if (entry) {
+        entry->dec = NULL;
+        for (int r = 0; r < 8; ++r) {
+            entry->surf[r] = VA_INVALID_SURFACE;
+            entry->is_kf[r] = false;
+        }
+        entry->stamp = 0;
+    }
+    pthread_mutex_unlock(&g_av1_kf_mu);
+}
+
+static void av1_kf_record_refresh(const vaapi_decoder_t *dec, uint8_t refresh_flags,
+                                  VASurfaceID surf, bool is_kf)
+{
+    if (!dec || refresh_flags == 0U)
+        return;
+    pthread_mutex_lock(&g_av1_kf_mu);
+    av1_kf_track_entry_t *entry = av1_kf_find_entry(dec, true);
+    if (entry) {
+        entry->stamp = ++g_av1_kf_clock;
+        for (int r = 0; r < 8; ++r) {
+            if ((refresh_flags & (1U << r)) != 0U) {
+                entry->surf[r] = surf;
+                entry->is_kf[r] = is_kf;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_av1_kf_mu);
+}
+
+static void av1_kf_evict_surface(const vaapi_decoder_t *dec, VASurfaceID surf)
+{
+    if (!dec || surf == VA_INVALID_SURFACE)
+        return;
+    pthread_mutex_lock(&g_av1_kf_mu);
+    av1_kf_track_entry_t *entry = av1_kf_find_entry(dec, false);
+    if (entry) {
+        for (int r = 0; r < 8; ++r) {
+            if (entry->surf[r] == surf) {
+                entry->surf[r] = VA_INVALID_SURFACE;
+                entry->is_kf[r] = false;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_av1_kf_mu);
+}
+
+static bool av1_kf_slot_is_keyframe(const vaapi_decoder_t *dec, uint8_t idx)
+{
+    if (!dec)
+        return false;
+    uint8_t slot = idx & 7U;
+    VASurfaceID cur = dec->av1_ref_frames[slot];
+    if (cur == VA_INVALID_SURFACE)
+        return false;
+    pthread_mutex_lock(&g_av1_kf_mu);
+    av1_kf_track_entry_t *entry = av1_kf_find_entry(dec, false);
+    bool is_kf = (entry != NULL && entry->is_kf[slot] && entry->surf[slot] == cur);
+    pthread_mutex_unlock(&g_av1_kf_mu);
+    return is_kf;
+}
+
+static void av1_refresh_all_slots_from(vaapi_decoder_t *dec, uint8_t slot, VASurfaceID ref_surf)
+{
+    uint8_t oh = dec->av1_ref_order_hints[slot];
+    VAWarpedMotionParamsAV1 wm_copy[7];
+    int8_t lf_ref[8];
+    int8_t lf_mode[2];
+    int16_t seg_data[8][8];
+    uint8_t seg_mask[8];
+    VAFilmGrainStructAV1 fg = dec->film_grain[slot];
+
+    memcpy(wm_copy, dec->wm[slot], sizeof(wm_copy));
+    memcpy(lf_ref, dec->loop_filter_ref_deltas[slot], sizeof(lf_ref));
+    memcpy(lf_mode, dec->loop_filter_mode_deltas[slot], sizeof(lf_mode));
+    memcpy(seg_data, dec->seg_feature_data[slot], sizeof(seg_data));
+    memcpy(seg_mask, dec->seg_feature_mask[slot], sizeof(seg_mask));
+
+    for (int i = 0; i < 8; ++i) {
+        dec->av1_ref_frames[i] = ref_surf;
+        dec->av1_ref_order_hints[i] = oh;
+        memcpy(dec->wm[i], wm_copy, sizeof(wm_copy));
+        memcpy(dec->loop_filter_ref_deltas[i], lf_ref, sizeof(lf_ref));
+        memcpy(dec->loop_filter_mode_deltas[i], lf_mode, sizeof(lf_mode));
+        memcpy(dec->seg_feature_data[i], seg_data, sizeof(seg_data));
+        memcpy(dec->seg_feature_mask[i], seg_mask, sizeof(seg_mask));
+        dec->film_grain[i] = fg;
+    }
+    av1_kf_record_refresh(dec, 0xFFU, ref_surf, true);
+}
+
 uint64_t av1_read_leb128(const uint8_t *data, size_t size, size_t *out_bytes)
 {
+    if (!data || size == 0U) {
+        if (out_bytes)
+            *out_bytes = 0U;
+        return 0ULL;
+    }
     uint64_t val = 0;
     size_t i = 0;
     for (; i < 8 && i < size; ++i) {
@@ -20,88 +166,145 @@ uint64_t av1_read_leb128(const uint8_t *data, size_t size, size_t *out_bytes)
 
 static uint32_t av1_read_uvlc(bs_t *br)
 {
+    if (!br || br->overrun) {
+        if (br)
+            br->overrun = true;
+        return 0U;
+    }
     uint32_t lz = 0;
-    while (read_bit(br) == 0 && br->bit_pos < br->size * 8) {
+    while (true) {
+        uint32_t bit = read_bit(br);
+        if (br->overrun)
+            return 0U;
+        if (bit != 0U)
+            break;
         lz++;
-        if (lz >= 32)
+        if (lz >= 32U)
             return 0xFFFFFFFFU;
     }
-    if (lz == 0)
-        return 0;
+    if (lz == 0U)
+        return 0U;
     uint32_t v = read_bits(br, lz);
+    if (br->overrun)
+        return 0U;
     return v + (1U << lz) - 1U;
 }
 
-static int32_t av1_read_su(bs_t *br, uint32_t n)
-{
-    uint32_t v = read_bits(br, n);
-    uint32_t sign_mask = 1U << (n - 1);
-    if (v & sign_mask) {
-        return (int32_t)(v - (sign_mask << 1));
-    }
-    return (int32_t)v;
-}
+static int32_t av1_read_su(bs_t *br, uint32_t n) { return wwal_av1_read_su(br, n); }
 
 static uint32_t av1_read_ns(bs_t *br, uint32_t n)
 {
-    if (n <= 1)
-        return 0;
+    if (!br || br->overrun) {
+        if (br)
+            br->overrun = true;
+        return 0U;
+    }
+    if (n <= 1U)
+        return 0U;
     uint32_t w = ceil_log2_u32(n);
-    uint32_t m = (1U << w) - n;
-    uint32_t v = read_bits(br, w - 1);
-    if (v < m)
+    uint64_t m = (1ULL << w) - (uint64_t)n;
+    uint32_t v = read_bits(br, w - 1U);
+    if (br->overrun)
+        return 0U;
+    if ((uint64_t)v < m)
         return v;
-    return (v << 1) - m + read_bit(br);
+    uint32_t extra = read_bit(br);
+    if (br->overrun)
+        return 0U;
+    return (uint32_t)(((uint64_t)v << 1U) - m + (uint64_t)extra);
 }
 
 static int32_t av1_get_relative_dist(int32_t a, int32_t b, const parsed_av1_seq_t *seq)
 {
-    if (!seq->enable_order_hint)
+    if (!seq || !seq->enable_order_hint)
         return 0;
-    int32_t diff = a - b;
-    int32_t m = 1 << seq->order_hint_bits_minus_1;
-    diff = (diff & (m - 1)) - (diff & m);
-    return diff;
+    uint32_t bits_m1 = (uint32_t)seq->order_hint_bits_minus_1 & 7U;
+    uint32_t diff = (uint32_t)a - (uint32_t)b;
+    uint32_t m = 1U << bits_m1;
+    uint32_t low = diff & (m - 1U);
+    uint32_t sign = diff & m;
+    return (int32_t)low - (int32_t)sign;
 }
 
 static uint32_t av1_decode_subexp(bs_t *br, uint32_t num_syms)
 {
+    if (!br || br->overrun || num_syms == 0U) {
+        if (br)
+            br->overrun = true;
+        return 0U;
+    }
     uint32_t i = 0;
-    uint32_t mk = 0;
-    uint32_t k = 3;
+    uint64_t mk = 0;
+    const uint32_t k = 3;
     while (true) {
         uint32_t b2 = i ? (k + i - 1U) : k;
-        uint32_t a = 1U << b2;
-        if (num_syms <= mk + 3U * a) {
-            return av1_read_ns(br, num_syms - mk) + mk;
+        if (b2 >= 32U) {
+            br->overrun = true;
+            return 0U;
         }
-        if (!read_bit(br)) {
-            return read_bits(br, b2) + mk;
+        uint64_t a = 1ULL << b2;
+        if ((uint64_t)num_syms <= mk + 3ULL * a) {
+            uint32_t v = av1_read_ns(br, num_syms - (uint32_t)mk);
+            return br->overrun ? 0U : (uint32_t)(mk + v);
+        }
+        uint32_t bit = read_bit(br);
+        if (br->overrun)
+            return 0U;
+        if (bit == 0U) {
+            uint32_t v = read_bits(br, b2);
+            return br->overrun ? 0U : (uint32_t)(mk + v);
         }
         i++;
         mk += a;
     }
 }
 
+static uint32_t av1_inverse_recenter(uint32_t r, uint32_t v)
+{
+    if ((uint64_t)v > ((uint64_t)r << 1U))
+        return v;
+    if ((v & 1U) != 0U)
+        return r - ((v >> 1U) + 1U);
+    return r + (v >> 1U);
+}
+
 static uint32_t av1_decode_unsigned_subexp_with_ref(bs_t *br, uint32_t mx, uint32_t r)
 {
-    uint32_t v = av1_decode_subexp(br, mx);
-    if ((r << 1) <= mx) {
-        if ((v & 1U) != 0)
-            return r - ((v + 1U) >> 1);
-        return r + (v >> 1);
-    } else {
-        uint32_t inv_r = mx - 1U - r;
-        uint32_t res = ((v & 1U) != 0) ? (inv_r - ((v + 1U) >> 1)) : (inv_r + (v >> 1));
-        return mx - 1U - res;
+    if (!br || br->overrun || mx == 0U) {
+        if (br)
+            br->overrun = true;
+        return 0U;
     }
+    if (r >= mx)
+        r = mx - 1U;
+    uint32_t v = av1_decode_subexp(br, mx);
+    if (br->overrun)
+        return 0U;
+    if (((uint64_t)r << 1U) <= (uint64_t)mx) {
+        return av1_inverse_recenter(r, v);
+    }
+    uint32_t inv_r = mx - 1U - r;
+    uint32_t res = av1_inverse_recenter(inv_r, v);
+    return (res < mx) ? (mx - 1U - res) : 0U;
 }
 
 static int32_t av1_decode_signed_subexp_with_ref(bs_t *br, int32_t low, int32_t high, int32_t r)
 {
-    return (int32_t)av1_decode_unsigned_subexp_with_ref(br, (uint32_t)(high - low),
-                                                        (uint32_t)(r - low)) +
-           low;
+    if (!br || br->overrun || high <= low) {
+        if (br)
+            br->overrun = true;
+        return 0;
+    }
+    if (r < low)
+        r = low;
+    if (r >= high)
+        r = high - 1;
+    uint32_t mx = (uint32_t)((int64_t)high - (int64_t)low);
+    uint32_t r_u = (uint32_t)((int64_t)r - (int64_t)low);
+    uint32_t v = av1_decode_unsigned_subexp_with_ref(br, mx, r_u);
+    if (br->overrun)
+        return 0;
+    return (int32_t)((int64_t)v + (int64_t)low);
 }
 
 static void av1_read_global_param(bs_t *br, VAAV1TransformationType type, int idx,
@@ -118,12 +321,18 @@ static void av1_read_global_param(bs_t *br, VAAV1TransformationType type, int id
             prec_bits = 6;
         }
     }
-    int32_t prec_diff = 16 - (int32_t)prec_bits;
+    uint32_t prec_diff = 16U - prec_bits;
     int32_t round = (idx % 3) == 2 ? (1 << 16) : 0;
-    int32_t sub = (idx % 3) == 2 ? (1 << prec_bits) : 0;
-    int32_t mx = 1 << abs_bits;
-    int32_t r = (wm->wmmat[idx] >> prec_diff) - sub;
-    wm->wmmat[idx] = (av1_decode_signed_subexp_with_ref(br, -mx, mx + 1, r) << prec_diff) + round;
+    int32_t sub = (idx % 3) == 2 ? (int32_t)(1U << prec_bits) : 0;
+    int32_t mx = (int32_t)(1U << abs_bits);
+    uint32_t u = (uint32_t)wm->wmmat[idx];
+    int32_t shifted =
+        (wm->wmmat[idx] < 0) ? (int32_t)(~((~u) >> prec_diff)) : (int32_t)(u >> prec_diff);
+    int32_t r = shifted - sub;
+    int32_t decoded = av1_decode_signed_subexp_with_ref(br, -mx, mx + 1, r);
+    if (br->overrun)
+        return;
+    wm->wmmat[idx] = (int32_t)(((uint32_t)decoded << prec_diff) + (uint32_t)round);
 }
 
 bool parse_av1_sequence_header(const uint8_t *payload, size_t len, parsed_av1_seq_t *seq)
@@ -133,13 +342,14 @@ bool parse_av1_sequence_header(const uint8_t *payload, size_t len, parsed_av1_se
 
     bs_t br;
     bit_reader_init_raw(&br, payload, len);
-    memset(seq, 0, sizeof(*seq));
+    parsed_av1_seq_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
 
-    seq->seq_profile = (uint8_t)read_bits(&br, 3);
-    seq->still_picture = (read_bit(&br) != 0);
-    seq->reduced_still_picture_header = (read_bit(&br) != 0);
+    tmp.seq_profile = (uint8_t)read_bits(&br, 3);
+    tmp.still_picture = (read_bit(&br) != 0);
+    tmp.reduced_still_picture_header = (read_bit(&br) != 0);
 
-    if (seq->reduced_still_picture_header) {
+    if (tmp.reduced_still_picture_header) {
         read_bits(&br, 5);
     } else {
         bool decoder_model_info_present = false;
@@ -163,7 +373,7 @@ bool parse_av1_sequence_header(const uint8_t *payload, size_t len, parsed_av1_se
         }
         bool initial_display_delay_present = (read_bit(&br) != 0);
         uint32_t op_cnt_minus_1 = read_bits(&br, 5);
-        for (uint32_t i = 0; i <= op_cnt_minus_1; ++i) {
+        for (uint32_t i = 0; i <= op_cnt_minus_1 && !br.overrun; ++i) {
             read_bits(&br, 12);
             uint32_t seq_level_idx = read_bits(&br, 5);
             if (seq_level_idx > 7) {
@@ -185,108 +395,113 @@ bool parse_av1_sequence_header(const uint8_t *payload, size_t len, parsed_av1_se
         }
     }
 
-    seq->frame_width_bits_minus_1 = (uint8_t)read_bits(&br, 4);
-    seq->frame_height_bits_minus_1 = (uint8_t)read_bits(&br, 4);
-    seq->max_frame_width_minus_1 =
-        (uint16_t)read_bits(&br, (uint32_t)seq->frame_width_bits_minus_1 + 1);
-    seq->max_frame_height_minus_1 =
-        (uint16_t)read_bits(&br, (uint32_t)seq->frame_height_bits_minus_1 + 1);
+    tmp.frame_width_bits_minus_1 = (uint8_t)read_bits(&br, 4);
+    tmp.frame_height_bits_minus_1 = (uint8_t)read_bits(&br, 4);
+    tmp.max_frame_width_minus_1 =
+        (uint16_t)read_bits(&br, (uint32_t)tmp.frame_width_bits_minus_1 + 1);
+    tmp.max_frame_height_minus_1 =
+        (uint16_t)read_bits(&br, (uint32_t)tmp.frame_height_bits_minus_1 + 1);
 
-    if (!seq->reduced_still_picture_header) {
-        seq->frame_id_numbers_present_flag = (read_bit(&br) != 0);
-        if (seq->frame_id_numbers_present_flag) {
-            seq->delta_frame_id_length_minus_2 = (uint8_t)read_bits(&br, 4);
-            seq->additional_frame_id_length_minus_1 = (uint8_t)read_bits(&br, 3);
+    if (!tmp.reduced_still_picture_header) {
+        tmp.frame_id_numbers_present_flag = (read_bit(&br) != 0);
+        if (tmp.frame_id_numbers_present_flag) {
+            tmp.delta_frame_id_length_minus_2 = (uint8_t)read_bits(&br, 4);
+            tmp.additional_frame_id_length_minus_1 = (uint8_t)read_bits(&br, 3);
         }
     }
 
-    seq->use_128x128_superblock = (read_bit(&br) != 0);
-    seq->enable_filter_intra = (read_bit(&br) != 0);
-    seq->enable_intra_edge_filter = (read_bit(&br) != 0);
+    tmp.use_128x128_superblock = (read_bit(&br) != 0);
+    tmp.enable_filter_intra = (read_bit(&br) != 0);
+    tmp.enable_intra_edge_filter = (read_bit(&br) != 0);
 
-    if (seq->reduced_still_picture_header) {
-        seq->seq_force_screen_content_tools = 2;
-        seq->seq_force_integer_mv = 2;
+    if (tmp.reduced_still_picture_header) {
+        tmp.seq_force_screen_content_tools = 2;
+        tmp.seq_force_integer_mv = 2;
     } else {
-        seq->enable_interintra_compound = (read_bit(&br) != 0);
-        seq->enable_masked_compound = (read_bit(&br) != 0);
-        seq->enable_warped_motion = (read_bit(&br) != 0);
-        seq->enable_dual_filter = (read_bit(&br) != 0);
-        seq->enable_order_hint = (read_bit(&br) != 0);
-        if (seq->enable_order_hint) {
-            seq->enable_jnt_comp = (read_bit(&br) != 0);
-            seq->enable_ref_frame_mvs = (read_bit(&br) != 0);
+        tmp.enable_interintra_compound = (read_bit(&br) != 0);
+        tmp.enable_masked_compound = (read_bit(&br) != 0);
+        tmp.enable_warped_motion = (read_bit(&br) != 0);
+        tmp.enable_dual_filter = (read_bit(&br) != 0);
+        tmp.enable_order_hint = (read_bit(&br) != 0);
+        if (tmp.enable_order_hint) {
+            tmp.enable_jnt_comp = (read_bit(&br) != 0);
+            tmp.enable_ref_frame_mvs = (read_bit(&br) != 0);
         }
-        seq->seq_force_screen_content_tools = read_bit(&br) ? 2 : (uint8_t)read_bit(&br);
-        if (seq->seq_force_screen_content_tools > 0) {
-            seq->seq_force_integer_mv = read_bit(&br) ? 2 : (uint8_t)read_bit(&br);
+        tmp.seq_force_screen_content_tools = read_bit(&br) ? 2 : (uint8_t)read_bit(&br);
+        if (tmp.seq_force_screen_content_tools > 0) {
+            tmp.seq_force_integer_mv = read_bit(&br) ? 2 : (uint8_t)read_bit(&br);
         } else {
-            seq->seq_force_integer_mv = 2;
+            tmp.seq_force_integer_mv = 2;
         }
-        if (seq->enable_order_hint) {
-            seq->order_hint_bits_minus_1 = (uint8_t)read_bits(&br, 3);
+        if (tmp.enable_order_hint) {
+            tmp.order_hint_bits_minus_1 = (uint8_t)read_bits(&br, 3);
         }
     }
 
-    seq->enable_superres = (read_bit(&br) != 0);
-    seq->enable_cdef = (read_bit(&br) != 0);
-    seq->enable_restoration = (read_bit(&br) != 0);
+    tmp.enable_superres = (read_bit(&br) != 0);
+    tmp.enable_cdef = (read_bit(&br) != 0);
+    tmp.enable_restoration = (read_bit(&br) != 0);
 
-    seq->high_bitdepth = (read_bit(&br) != 0);
-    if (seq->seq_profile == 2 && seq->high_bitdepth) {
-        seq->twelve_bit = (read_bit(&br) != 0);
+    tmp.high_bitdepth = (read_bit(&br) != 0);
+    if (tmp.seq_profile == 2 && tmp.high_bitdepth) {
+        tmp.twelve_bit = (read_bit(&br) != 0);
     }
-    if (seq->seq_profile != 1) {
-        seq->mono_chrome = (read_bit(&br) != 0);
+    if (tmp.seq_profile != 1) {
+        tmp.mono_chrome = (read_bit(&br) != 0);
     }
     if (read_bit(&br)) {
-        seq->color_primaries = (uint8_t)read_bits(&br, 8);
-        seq->transfer_characteristics = (uint8_t)read_bits(&br, 8);
-        seq->matrix_coefficients = (uint8_t)read_bits(&br, 8);
+        tmp.color_primaries = (uint8_t)read_bits(&br, 8);
+        tmp.transfer_characteristics = (uint8_t)read_bits(&br, 8);
+        tmp.matrix_coefficients = (uint8_t)read_bits(&br, 8);
     } else {
-        seq->color_primaries = 2;
-        seq->transfer_characteristics = 2;
-        seq->matrix_coefficients = 2;
+        tmp.color_primaries = 2;
+        tmp.transfer_characteristics = 2;
+        tmp.matrix_coefficients = 2;
     }
 
-    if (seq->mono_chrome) {
-        seq->color_range = (read_bit(&br) != 0);
-        seq->subsampling_x = 1;
-        seq->subsampling_y = 1;
-        seq->chroma_sample_position = 0;
-        seq->separate_uv_delta_q = false;
+    if (tmp.mono_chrome) {
+        tmp.color_range = (read_bit(&br) != 0);
+        tmp.subsampling_x = 1;
+        tmp.subsampling_y = 1;
+        tmp.chroma_sample_position = 0;
+        tmp.separate_uv_delta_q = false;
     } else {
-        if (seq->color_primaries == 1 && seq->transfer_characteristics == 13 &&
-            seq->matrix_coefficients == 0) {
-            seq->color_range = true;
-            seq->subsampling_x = 0;
-            seq->subsampling_y = 0;
+        if (tmp.color_primaries == 1 && tmp.transfer_characteristics == 13 &&
+            tmp.matrix_coefficients == 0) {
+            tmp.color_range = true;
+            tmp.subsampling_x = 0;
+            tmp.subsampling_y = 0;
         } else {
-            seq->color_range = (read_bit(&br) != 0);
-            if (seq->seq_profile == 0) {
-                seq->subsampling_x = 1;
-                seq->subsampling_y = 1;
-            } else if (seq->seq_profile == 1) {
-                seq->subsampling_x = 0;
-                seq->subsampling_y = 0;
+            tmp.color_range = (read_bit(&br) != 0);
+            if (tmp.seq_profile == 0) {
+                tmp.subsampling_x = 1;
+                tmp.subsampling_y = 1;
+            } else if (tmp.seq_profile == 1) {
+                tmp.subsampling_x = 0;
+                tmp.subsampling_y = 0;
             } else {
-                if (seq->twelve_bit) {
-                    seq->subsampling_x = (uint8_t)read_bit(&br);
-                    seq->subsampling_y = seq->subsampling_x ? (uint8_t)read_bit(&br) : 0;
+                if (tmp.twelve_bit) {
+                    tmp.subsampling_x = (uint8_t)read_bit(&br);
+                    tmp.subsampling_y = tmp.subsampling_x ? (uint8_t)read_bit(&br) : 0;
                 } else {
-                    seq->subsampling_x = 1;
-                    seq->subsampling_y = 0;
+                    tmp.subsampling_x = 1;
+                    tmp.subsampling_y = 0;
                 }
             }
-            if (seq->subsampling_x && seq->subsampling_y) {
-                seq->chroma_sample_position = (uint8_t)read_bits(&br, 2);
+            if (tmp.subsampling_x && tmp.subsampling_y) {
+                tmp.chroma_sample_position = (uint8_t)read_bits(&br, 2);
             }
         }
-        seq->separate_uv_delta_q = (read_bit(&br) != 0);
+        tmp.separate_uv_delta_q = (read_bit(&br) != 0);
     }
 
-    seq->film_grain_params_present = (read_bit(&br) != 0);
-    seq->valid = true;
+    tmp.film_grain_params_present = (read_bit(&br) != 0);
+    if (br.overrun) {
+        memset(seq, 0, sizeof(*seq));
+        return false;
+    }
+    tmp.valid = true;
+    *seq = tmp;
     return true;
 }
 
@@ -302,6 +517,8 @@ uint32_t parse_av1_tile_group_obu(const uint8_t *obu_data, size_t obu_size, size
         return 0;
     uint32_t tile_cols = pic_param->tile_cols ? pic_param->tile_cols : 1U;
     uint32_t tile_rows = pic_param->tile_rows ? pic_param->tile_rows : 1U;
+    if (tile_cols > 64U || tile_rows > 64U)
+        return 0;
     uint32_t num_tiles = tile_cols * tile_rows;
 
     bs_t br;
@@ -316,32 +533,38 @@ uint32_t parse_av1_tile_group_obu(const uint8_t *obu_data, size_t obu_size, size
             tg_end = read_bits(&br, tile_bits);
         }
     }
-    while ((br.bit_pos & 7U) != 0) {
+    while (!br.overrun && (br.bit_pos & 7U) != 0) {
         (void)read_bit(&br);
     }
+    if (br.overrun || tg_start > tg_end || tg_end >= num_tiles)
+        return 0;
 
     size_t pos = tg_offset + (br.bit_pos / 8U);
-    uint32_t tile_size_bytes = (uint32_t)tile_size_bytes_minus_1 + 1U;
+    uint32_t tile_size_bytes = ((uint32_t)(tile_size_bytes_minus_1 & 3U)) + 1U;
     uint32_t slice_count = 0;
 
     for (uint32_t tile_num = tg_start;
          tile_num <= tg_end && tile_num < num_tiles && slice_count < max_slices; ++tile_num) {
         size_t tile_sz = 0;
         if (tile_num < tg_end) {
-            if (pos + tile_size_bytes > obu_size)
+            if (pos > obu_size || tile_size_bytes > obu_size - pos)
                 break;
             for (uint32_t b = 0; b < tile_size_bytes; ++b) {
                 tile_sz |= (size_t)obu_data[pos + b] << (8U * b);
             }
+            if (tile_sz > SIZE_MAX - 1U)
+                break;
             tile_sz += 1U;
             pos += tile_size_bytes;
-            if (pos + tile_sz > obu_size)
+            if (tile_sz > obu_size - pos)
                 break;
         } else {
-            if (pos > obu_size)
+            if (pos >= obu_size)
                 break;
             tile_sz = obu_size - pos;
         }
+        if (tile_sz > UINT32_MAX || pos > (size_t)(UINT32_MAX - base_obu_offset))
+            break;
 
         VASliceParameterBufferAV1 *sp = &out_slices[slice_count++];
         memset(sp, 0, sizeof(*sp));
@@ -387,12 +610,17 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
     if (!seq->reduced_still_picture_header) {
         if (read_bit(&br)) {
             uint8_t idx = (uint8_t)read_bits(&br, 3);
+            if (br.overrun)
+                return false;
             if (out_show_existing)
                 *out_show_existing = true;
             if (out_show_existing_idx)
                 *out_show_existing_idx = idx;
-            *out_refresh_flags = 0;
-            *out_is_keyframe = false;
+            bool is_kf = av1_kf_slot_is_keyframe(dec, idx);
+            if (out_refresh_flags)
+                *out_refresh_flags = is_kf ? 0xFFU : 0U;
+            if (out_is_keyframe)
+                *out_is_keyframe = is_kf;
             return true;
         }
         frame_type = read_bits(&br, 2);
@@ -407,6 +635,8 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
         }
     }
 
+    VADecPictureParameterBufferAV1 saved_pic = *pic_param;
+
     uint32_t disable_cdf_update = read_bit(&br);
     uint32_t allow_screen_content_tools = (seq->seq_force_screen_content_tools == 2)
                                               ? read_bit(&br)
@@ -418,16 +648,15 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
     }
 
     if (seq->frame_id_numbers_present_flag) {
-        uint32_t id_len = (uint32_t)seq->delta_frame_id_length_minus_2 + 2 +
-                          (uint32_t)seq->additional_frame_id_length_minus_1 + 1;
+        uint32_t id_len = ((uint32_t)seq->delta_frame_id_length_minus_2 & 0x0FU) + 2U +
+                          ((uint32_t)seq->additional_frame_id_length_minus_1 & 0x07U) + 1U;
         read_bits(&br, id_len);
     }
 
     uint32_t frame_size_override =
         (frame_type == 3) ? 1 : (seq->reduced_still_picture_header ? 0 : read_bit(&br));
-    uint8_t order_hint = seq->enable_order_hint
-                             ? (uint8_t)read_bits(&br, (uint32_t)seq->order_hint_bits_minus_1 + 1)
-                             : 0;
+    uint32_t oh_bits = ((uint32_t)seq->order_hint_bits_minus_1 & 7U) + 1U;
+    uint8_t order_hint = seq->enable_order_hint ? (uint8_t)read_bits(&br, oh_bits) : 0;
     uint8_t primary_ref_frame =
         (frame_type == 0 || frame_type == 2 || error_resilient) ? 7 : (uint8_t)read_bits(&br, 3);
 
@@ -439,13 +668,15 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
     }
     if ((!(frame_type == 0 || frame_type == 2) || refresh_frame_flags != 0xFF) && error_resilient &&
         seq->enable_order_hint) {
-        for (int i = 0; i < 8; ++i) {
-            read_bits(&br, (uint32_t)seq->order_hint_bits_minus_1 + 1);
+        for (int i = 0; i < 8 && !br.overrun; ++i) {
+            read_bits(&br, oh_bits);
         }
     }
 
-    uint16_t width_m1 = seq->valid ? seq->max_frame_width_minus_1 : (uint16_t)(dec->width - 1);
-    uint16_t height_m1 = seq->valid ? seq->max_frame_height_minus_1 : (uint16_t)(dec->height - 1);
+    uint16_t width_m1 = seq->valid ? seq->max_frame_width_minus_1
+                                   : (uint16_t)(dec->width > 0 ? dec->width - 1U : 0U);
+    uint16_t height_m1 = seq->valid ? seq->max_frame_height_minus_1
+                                    : (uint16_t)(dec->height > 0 ? dec->height - 1U : 0U);
     uint32_t allow_intrabc = 0;
     uint32_t use_superres = 0;
     uint8_t superres_denom = 8;
@@ -457,8 +688,10 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
 
     if (frame_type == 0 || frame_type == 2) {
         if (frame_size_override && seq->valid) {
-            width_m1 = (uint16_t)read_bits(&br, (uint32_t)seq->frame_width_bits_minus_1 + 1);
-            height_m1 = (uint16_t)read_bits(&br, (uint32_t)seq->frame_height_bits_minus_1 + 1);
+            width_m1 =
+                (uint16_t)read_bits(&br, ((uint32_t)seq->frame_width_bits_minus_1 & 0x0FU) + 1U);
+            height_m1 =
+                (uint16_t)read_bits(&br, ((uint32_t)seq->frame_height_bits_minus_1 & 0x0FU) + 1U);
         }
         if (seq->enable_superres && read_bit(&br)) {
             use_superres = 1;
@@ -479,17 +712,17 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
                 ref_frame_idx[3] = (uint8_t)read_bits(&br, 3);
             }
         }
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < 7 && !br.overrun; ++i) {
             if (!short_signaling) {
                 ref_frame_idx[i] = (uint8_t)read_bits(&br, 3);
             }
             if (seq->frame_id_numbers_present_flag) {
-                read_bits(&br, (uint32_t)seq->delta_frame_id_length_minus_2 + 2);
+                read_bits(&br, ((uint32_t)seq->delta_frame_id_length_minus_2 & 0x0FU) + 2U);
             }
         }
         bool found_ref = false;
         if (frame_size_override && !error_resilient) {
-            for (int i = 0; i < 7; ++i) {
+            for (int i = 0; i < 7 && !br.overrun; ++i) {
                 if (read_bit(&br)) {
                     found_ref = true;
                     break;
@@ -498,8 +731,10 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
         }
         if (!found_ref) {
             if (frame_size_override && seq->valid) {
-                width_m1 = (uint16_t)read_bits(&br, (uint32_t)seq->frame_width_bits_minus_1 + 1);
-                height_m1 = (uint16_t)read_bits(&br, (uint32_t)seq->frame_height_bits_minus_1 + 1);
+                width_m1 = (uint16_t)read_bits(
+                    &br, ((uint32_t)seq->frame_width_bits_minus_1 & 0x0FU) + 1U);
+                height_m1 = (uint16_t)read_bits(
+                    &br, ((uint32_t)seq->frame_height_bits_minus_1 & 0x0FU) + 1U);
             }
             if (seq->enable_superres && read_bit(&br)) {
                 use_superres = 1;
@@ -520,6 +755,10 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
 
     uint32_t disable_frame_end_update_cdf =
         (seq->reduced_still_picture_header || disable_cdf_update) ? 1 : read_bit(&br);
+    if (br.overrun) {
+        *pic_param = saved_pic;
+        return false;
+    }
 
     uint32_t upscaled_width = (uint32_t)width_m1 + 1U;
     uint32_t frame_width = upscaled_width;
@@ -548,7 +787,7 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
     uint32_t tile_rows_log2 = 0;
     if (uniform_tile_spacing) {
         tile_cols_log2 = min_log2_tile_cols;
-        while (tile_cols_log2 < max_log2_tile_cols && read_bit(&br)) {
+        while (!br.overrun && tile_cols_log2 < max_log2_tile_cols && read_bit(&br)) {
             tile_cols_log2++;
         }
         uint32_t tile_w_sb = (sb_cols + (1U << tile_cols_log2) - 1U) >> tile_cols_log2;
@@ -566,7 +805,7 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
             (min_log2_tiles > tile_cols_log2) ? (min_log2_tiles - tile_cols_log2) : 0;
         uint32_t max_log2_rows = ceil_log2_u32(sb_rows < 64 ? sb_rows : 64);
         tile_rows_log2 = min_log2_rows;
-        while (tile_rows_log2 < max_log2_rows && read_bit(&br)) {
+        while (!br.overrun && tile_rows_log2 < max_log2_rows && read_bit(&br)) {
             tile_rows_log2++;
         }
         uint32_t tile_h_sb = (sb_rows + (1U << tile_rows_log2) - 1U) >> tile_rows_log2;
@@ -583,10 +822,12 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
         uint32_t widest_tile_sb = 1;
         uint32_t start_sb = 0;
         uint32_t i = 0;
-        while (start_sb < sb_cols && i < 64) {
+        while (!br.overrun && start_sb < sb_cols && i < 64) {
             uint32_t max_w =
                 (sb_cols - start_sb) < max_tile_width_sb ? (sb_cols - start_sb) : max_tile_width_sb;
             uint32_t size_sb = av1_read_ns(&br, max_w) + 1;
+            if (br.overrun)
+                break;
             if (size_sb > widest_tile_sb)
                 widest_tile_sb = size_sb;
             if (i < 63)
@@ -608,10 +849,12 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
 
         start_sb = 0;
         i = 0;
-        while (start_sb < sb_rows && i < 64) {
+        while (!br.overrun && start_sb < sb_rows && i < 64) {
             uint32_t max_h = (sb_rows - start_sb) < max_tile_height_sb ? (sb_rows - start_sb)
                                                                        : max_tile_height_sb;
             uint32_t size_sb = av1_read_ns(&br, max_h) + 1;
+            if (br.overrun)
+                break;
             if (i < 63)
                 pic_param->height_in_sbs_minus_1[i] = (uint16_t)(size_sb - 1);
             start_sb += size_sb;
@@ -628,8 +871,6 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
         context_update_tile_id = (uint16_t)read_bits(&br, tile_bits);
         tile_size_bytes_minus_1 = (uint8_t)read_bits(&br, 2);
     }
-    if (out_tile_size_bytes_minus_1)
-        *out_tile_size_bytes_minus_1 = tile_size_bytes_minus_1;
 
     uint8_t base_q_idx = (uint8_t)read_bits(&br, 8);
     int8_t y_dc_delta_q = read_bit(&br) ? (int8_t)av1_read_su(&br, 7) : 0;
@@ -680,9 +921,9 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
             static const uint8_t seg_feature_signed[8] = {1, 1, 1, 1, 1, 0, 0, 0};
             static const int16_t seg_feature_max[8] = {255, 63, 63, 63, 63, 7, 0, 0};
             memset(pic_param->seg_info.feature_data, 0, sizeof(pic_param->seg_info.feature_data));
-            for (int i = 0; i < 8; ++i) {
+            for (int i = 0; i < 8 && !br.overrun; ++i) {
                 uint8_t mask = 0;
-                for (int j = 0; j < 8; ++j) {
+                for (int j = 0; j < 8 && !br.overrun; ++j) {
                     if (read_bit(&br)) {
                         mask |= (uint8_t)(1U << j);
                         int16_t val = 0;
@@ -784,12 +1025,12 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
         if (lf_ref_delta_enabled) {
             lf_ref_delta_update = (read_bit(&br) != 0);
             if (lf_ref_delta_update) {
-                for (int i = 0; i < 8; ++i) {
+                for (int i = 0; i < 8 && !br.overrun; ++i) {
                     if (read_bit(&br)) {
                         pic_param->ref_deltas[i] = (int8_t)av1_read_su(&br, 7);
                     }
                 }
-                for (int i = 0; i < 2; ++i) {
+                for (int i = 0; i < 2 && !br.overrun; ++i) {
                     if (read_bit(&br)) {
                         pic_param->mode_deltas[i] = (int8_t)av1_read_su(&br, 7);
                     }
@@ -806,7 +1047,7 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
         pic_param->cdef_damping_minus_3 = (uint8_t)read_bits(&br, 2);
         pic_param->cdef_bits = (uint8_t)read_bits(&br, 2);
         uint32_t num_cdef = 1U << pic_param->cdef_bits;
-        for (uint32_t i = 0; i < num_cdef; ++i) {
+        for (uint32_t i = 0; i < num_cdef && !br.overrun; ++i) {
             uint8_t y_pri = (uint8_t)read_bits(&br, 4);
             uint8_t y_sec = (uint8_t)read_bits(&br, 2);
             pic_param->cdef_y_strengths[i] = (uint8_t)((y_pri << 2) | (y_sec & 0x03U));
@@ -825,7 +1066,7 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
         bool uses_chroma_lr = false;
         uint8_t lr_type[3] = {0, 0, 0};
         int num_planes = seq->mono_chrome ? 1 : 3;
-        for (int i = 0; i < num_planes; ++i) {
+        for (int i = 0; i < num_planes && !br.overrun; ++i) {
             lr_type[i] = remap_lr_type[read_bits(&br, 2)];
             if (lr_type[i] != 0) {
                 uses_lr = true;
@@ -937,7 +1178,7 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
         }
     }
     if (!frame_is_intra) {
-        for (int ref = 0; ref < 7; ++ref) {
+        for (int ref = 0; ref < 7 && !br.overrun; ++ref) {
             VAAV1TransformationType type = VAAV1TransformationIdentity;
             if (read_bit(&br)) {
                 if (read_bit(&br)) {
@@ -1021,7 +1262,7 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
                 if (num_y_points > 14)
                     num_y_points = 14;
                 pic_param->film_grain_info.num_y_points = num_y_points;
-                for (uint8_t i = 0; i < num_y_points; ++i) {
+                for (uint8_t i = 0; i < num_y_points && !br.overrun; ++i) {
                     pic_param->film_grain_info.point_y_value[i] = (uint8_t)read_bits(&br, 8);
                     pic_param->film_grain_info.point_y_scaling[i] = (uint8_t)read_bits(&br, 8);
                 }
@@ -1035,14 +1276,14 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
                     num_cb_points = (uint8_t)read_bits(&br, 4);
                     if (num_cb_points > 10)
                         num_cb_points = 10;
-                    for (uint8_t i = 0; i < num_cb_points; ++i) {
+                    for (uint8_t i = 0; i < num_cb_points && !br.overrun; ++i) {
                         pic_param->film_grain_info.point_cb_value[i] = (uint8_t)read_bits(&br, 8);
                         pic_param->film_grain_info.point_cb_scaling[i] = (uint8_t)read_bits(&br, 8);
                     }
                     num_cr_points = (uint8_t)read_bits(&br, 4);
                     if (num_cr_points > 10)
                         num_cr_points = 10;
-                    for (uint8_t i = 0; i < num_cr_points; ++i) {
+                    for (uint8_t i = 0; i < num_cr_points && !br.overrun; ++i) {
                         pic_param->film_grain_info.point_cr_value[i] = (uint8_t)read_bits(&br, 8);
                         pic_param->film_grain_info.point_cr_scaling[i] = (uint8_t)read_bits(&br, 8);
                     }
@@ -1057,19 +1298,19 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
                 uint32_t num_pos_chroma = num_pos_luma;
                 if (num_y_points > 0) {
                     num_pos_chroma += 1U;
-                    for (uint32_t i = 0; i < num_pos_luma && i < 24; ++i) {
+                    for (uint32_t i = 0; i < num_pos_luma && i < 24 && !br.overrun; ++i) {
                         pic_param->film_grain_info.ar_coeffs_y[i] =
                             (int8_t)((int32_t)read_bits(&br, 8) - 128);
                     }
                 }
                 if (chroma_scaling_from_luma || num_cb_points > 0) {
-                    for (uint32_t i = 0; i < num_pos_chroma && i < 25; ++i) {
+                    for (uint32_t i = 0; i < num_pos_chroma && i < 25 && !br.overrun; ++i) {
                         pic_param->film_grain_info.ar_coeffs_cb[i] =
                             (int8_t)((int32_t)read_bits(&br, 8) - 128);
                     }
                 }
                 if (chroma_scaling_from_luma || num_cr_points > 0) {
-                    for (uint32_t i = 0; i < num_pos_chroma && i < 25; ++i) {
+                    for (uint32_t i = 0; i < num_pos_chroma && i < 25 && !br.overrun; ++i) {
                         pic_param->film_grain_info.ar_coeffs_cr[i] =
                             (int8_t)((int32_t)read_bits(&br, 8) - 128);
                     }
@@ -1095,6 +1336,14 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
             }
         }
     }
+
+    if (br.overrun) {
+        *pic_param = saved_pic;
+        return false;
+    }
+
+    if (out_tile_size_bytes_minus_1)
+        *out_tile_size_bytes_minus_1 = tile_size_bytes_minus_1;
 
     pic_param->profile = seq->seq_profile;
     pic_param->order_hint_bits_minus_1 = seq->order_hint_bits_minus_1;
@@ -1165,8 +1414,10 @@ bool parse_av1_frame_header(vaapi_decoder_t *dec, const uint8_t *payload, size_t
         }
     }
 
-    *out_refresh_flags = refresh_frame_flags;
-    *out_is_keyframe = (frame_type == 0 && show_frame != 0);
+    if (out_refresh_flags)
+        *out_refresh_flags = refresh_frame_flags;
+    if (out_is_keyframe)
+        *out_is_keyframe = (frame_type == 0 && show_frame != 0);
     return true;
 }
 
@@ -1177,15 +1428,25 @@ bool submit_av1_frame_to_va(vaapi_decoder_t *dec, uint32_t pool_size,
                             bool av1_show_existing, uint8_t av1_show_existing_idx,
                             VASurfaceID *io_target)
 {
+    if (!dec || !io_target)
+        return false;
+
     if (av1_show_existing) {
-        VASurfaceID ref_surf = dec->av1_ref_frames[av1_show_existing_idx & 7];
+        uint8_t slot = av1_show_existing_idx & 7U;
+        VASurfaceID ref_surf = dec->av1_ref_frames[slot];
         if (ref_surf != VA_INVALID_SURFACE) {
+            if (av1_kf_slot_is_keyframe(dec, slot) || refresh_flags == 0xFFU) {
+                av1_refresh_all_slots_from(dec, slot, ref_surf);
+            }
             *io_target = ref_surf;
             return true;
         }
         WAYWAL_LOG_WARN("AV1 show_existing references unpopulated slot %u", av1_show_existing_idx);
         return false;
     }
+
+    if (!pic_param || !av1_slices || !pkt || pool_size == 0)
+        return false;
 
     VASurfaceID target = *io_target;
     bool surface_found = false;
@@ -1219,6 +1480,7 @@ bool submit_av1_frame_to_va(vaapi_decoder_t *dec, uint32_t pool_size,
                         dec->av1_ref_frames[r] = VA_INVALID_SURFACE;
                     }
                 }
+                av1_kf_evict_surface(dec, target);
                 surface_found = true;
                 break;
             }
@@ -1295,5 +1557,7 @@ bool submit_av1_frame_to_va(vaapi_decoder_t *dec, uint32_t pool_size,
             dec->film_grain[i] = pic_param->film_grain_info;
         }
     }
+    av1_kf_record_refresh(dec, refresh_flags, target,
+                          pic_param->pic_info_fields.bits.frame_type == 0U);
     return true;
 }
